@@ -1,0 +1,9 @@
+#pragma once
+#ifndef V9_INTERMEDIATE_PROFILING
+#define V9_INTERMEDIATE_PROFILING 1
+#endif
+#if V9_INTERMEDIATE_PROFILING
+#define V9_FETCH_PROFILE(...) __VA_ARGS__
+#else
+#define V9_FETCH_PROFILE(...)
+#endif

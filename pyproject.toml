@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-ascend-kvop"
+version = "0.1.0"
+description = "Standalone Ascend operators and framework data contracts"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+license = {file = "LICENSE"}
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["kvop*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/v9"]
+addopts = "--import-mode=prepend"
