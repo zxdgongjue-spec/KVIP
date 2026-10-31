@@ -255,7 +255,7 @@ class ContractLaunch(RotatingLaunch):
             if index_caches is not None
             else [allocate_cache(torch, geometry, self.device) for _ in range(geometry.batch)]
         )
-        bind_caches(torch, self.tensors, geometry, self.index_caches)
+        bind_caches(torch, self.tensors, geometry, self.index_caches, workspace=self.workspace)
         validate_buffers(geometry, self.tensors, self.workspace)
         self.library = ctypes.CDLL(str(Path(library).resolve(strict=True)))
         validate_transport_library(self.library, owner)

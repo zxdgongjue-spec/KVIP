@@ -1,0 +1,28 @@
+{
+  "date": "2026-10-31",
+  "python": "3.12",
+  "cpu_torch": "2.6.0",
+  "baseline_tests_passed": 42,
+  "candidate_source_tests_passed": 90,
+  "installed_wheel_tests_passed": 90,
+  "framework_host_tests_passed": 88,
+  "skipped_in_these_suites": 0,
+  "identical_host_differential_cases": 44,
+  "device_sources": "unchanged from 2f49ba0",
+  "oracle_build_geometry_packing": "unchanged from 2f49ba0",
+  "low_level_launch_completion_ast": "unchanged from 2f49ba0",
+  "device_abi": 13,
+  "descriptor_bytes": 528,
+  "matched_field_offsets": 74,
+  "five_audit_gap_flags": false,
+  "wheel_sha256": "e80424cd1947c25d1ada86adaa08763bb4eb3bc8455fbee933feb81bf65a3680",
+  "cpu_dispatch_microbenchmark": {
+    "baseline_us": 1.8838625022908673,
+    "session_us": 3.3303103991784155,
+    "additional_us": 1.4464478968875483,
+    "scope": "one CPU-only run; not NPU, network or TPOT evidence"
+  },
+  "hardware_functional_and_performance_equivalence": "not_verified",
+  "production_activated": false,
+  "whole_framework_format_check": "not_run_missing_pre_commit"
+}

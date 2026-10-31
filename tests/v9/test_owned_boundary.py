@@ -43,5 +43,45 @@ def test_owned_handoff_growth_rewrite_and_native_restore():
     original_key[changed] = updated_keys
     original_scale[changed] = updated_scales
     cache.restore_logical()
-    assert torch.equal(t["key"].view(torch.uint8).reshape(-1, 128)[physical], original_key)
+    assert torch.equal(
+        t["key"].view(torch.uint8).reshape(-1, 128)[physical], original_key
+    )
     assert torch.equal(t["key_scale"].reshape(-1)[physical], original_scale)
+
+
+def test_page_replacement_preserves_cold_hot_and_tail_after_checked_completion():
+    torch = pytest.importorskip("torch")
+    g, arrays, _ = make_fixture(candidate=16385)
+    t = to_device(torch, arrays, g, torch.device("cpu"))
+    table = t["index_table"][0]
+    length = 16385
+    tail_end = min(length + 64, table.numel() * 128)
+    tokens = torch.arange(tail_end)
+    physical = table[tokens // 128].long() * 128 + tokens % 128
+    keys = t["key"].view(torch.uint8).reshape(-1, 128)[physical].clone()
+    scales = t["key_scale"].reshape(-1)[physical].clone()
+    cache = OwnedIndexCache(
+        torch,
+        g,
+        t["key"],
+        t["key_scale"],
+        table,
+        pool=int(arrays["pool_rows"][0]),
+        length=length,
+        budget=12288,
+        forward=t["forward"],
+        reverse=t["reverse"],
+    )
+    replacement = table.roll(1)
+    with pytest.raises(ValueError, match="completion"):
+        cache.rebind_pages(replacement, completion_verified=False, exclusive_pages=True)
+    cache.rebind_pages(
+        replacement,
+        completion_verified=True,
+        exclusive_pages=True,
+        logical_length=tail_end,
+    )
+    cache.restore_logical()
+    destinations = replacement[tokens // 128].long() * 128 + tokens % 128
+    assert torch.equal(t["key"].view(torch.uint8).reshape(-1, 128)[destinations], keys)
+    assert torch.equal(t["key_scale"].reshape(-1)[destinations], scales)

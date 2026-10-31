@@ -1,5 +1,7 @@
 """Owned device allocations; token layout is maintained exclusively by kernels."""
 
+from .access import check_writable_ranges, tensor_range
+
 
 def cache_bytes(geometry, *, owned=False):
     # Header, packed keys/scales, IDs, dirty flags and token -> bank position.
@@ -8,24 +10,48 @@ def cache_bytes(geometry, *, owned=False):
 
 
 def allocate_cache(torch, geometry, device, *, owned=False):
-    buffer = torch.zeros(cache_bytes(geometry, owned=owned), dtype=torch.uint8, device=device)
+    buffer = torch.zeros(
+        cache_bytes(geometry, owned=owned), dtype=torch.uint8, device=device
+    )
     if owned:
         buffer[:128].view(torch.int32)[18] = 1
     return buffer
 
 
-def bind_caches(torch, tensors, geometry, buffers):
+def validate_cache_ranges(tensors, buffers, workspace=None):
+    ranges = [tensor_range(name, value) for name, value in tensors.items()]
+    ranges += [
+        tensor_range("workspace." + name, value)
+        for name, value in (workspace or {}).items()
+    ]
+    cache_ranges = [
+        tensor_range(f"index_cache[{i}]", value) for i, value in enumerate(buffers)
+    ]
+    check_writable_ranges(ranges + cache_ranges, {name for name, _, _ in cache_ranges})
+
+
+def bind_caches(torch, tensors, geometry, buffers, *, workspace=None):
     if len(buffers) != geometry.batch:
         raise ValueError("one persistent index cache per request/layer is required")
-    if any(x.numel() not in (cache_bytes(geometry), cache_bytes(geometry, owned=True)) for x in buffers):
+    if any(
+        x.numel() not in (cache_bytes(geometry), cache_bytes(geometry, owned=True))
+        for x in buffers
+    ):
         raise ValueError("index cache capacity mismatch")
     device = tensors["query"].device
     if any(
-        x.dtype != torch.uint8 or x.device != device or not x.is_contiguous() or x.data_ptr() % 128 for x in buffers
+        x.dtype != torch.uint8
+        or x.device != device
+        or not x.is_contiguous()
+        or x.data_ptr() % 128
+        for x in buffers
     ):
-        raise ValueError("index caches must be contiguous aligned uint8 buffers on the query device")
-    if len({x.data_ptr() for x in buffers}) != len(buffers):
-        raise ValueError("requests cannot share a writable index cache")
+        raise ValueError(
+            "index caches must be contiguous aligned uint8 buffers on the query device"
+        )
+    validate_cache_ranges(tensors, buffers, workspace)
     tensors["index_cache"] = torch.tensor(
-        [x.data_ptr() for x in buffers], dtype=torch.int64, device=tensors["query"].device
+        [x.data_ptr() for x in buffers],
+        dtype=torch.int64,
+        device=tensors["query"].device,
     )

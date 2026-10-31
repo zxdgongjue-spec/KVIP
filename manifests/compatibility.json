@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "package_version": "0.2.0",
+  "public_contract_version": "2.0.0",
+  "profile": "v9-fused-selection",
+  "device_abi": 13,
+  "graph_transport_abi": 1,
+  "index_writer_abi": 2,
+  "source_vllm_dsa_revision": "fae4597f7",
+  "source_subtree_revision": "2f49ba0e140311aa8efd40dbb539b1169b959747",
+  "layout": {
+    "name": "dsa-c8-fp8-bf16-scales-v1",
+    "token_bytes": 656,
+    "block_tokens": 128,
+    "topk": 2048
+  },
+  "required_sdk_policy": "runtime and device headers must match; validate prepared binary and lease",
+  "hardware_certified": false,
+  "npu_memory": "pending",
+  "kvaf_eager_graph": "pending",
+  "model_accuracy_tpot": "pending",
+  "production_promotion": "blocked_pending_hardware_and_performance_qualification"
+}

@@ -7,6 +7,9 @@ device-valued validation belongs to init, never to a Python .item() hot path.
 import ctypes
 from dataclasses import dataclass
 from enum import IntEnum
+from numbers import Integral
+
+from .access import FIELD_ACCESS, check_writable_ranges, tensor_range
 
 ABI_VERSION = 13
 TOPK = 2048
@@ -142,9 +145,18 @@ class Geometry:
     score_stride: int
 
     def validate(self):
+        if any(
+            not isinstance(getattr(self, name), Integral)
+            or isinstance(getattr(self, name), bool)
+            for name in GEOMETRY_FIELDS
+        ):
+            raise ValueError("geometry fields must be integers, not bool")
         if not 1 <= self.batch <= 32 or self.queries != MAX_QUERIES:
             raise ValueError("V9 requires B1..32 and fixed MTP3/Q4")
-        if not 256 <= self.candidate_capacity <= 262144 or self.candidate_capacity % 256:
+        if (
+            not 256 <= self.candidate_capacity <= 262144
+            or self.candidate_capacity % 256
+        ):
             raise ValueError("candidate capacity must be 256-aligned in 256..262144")
         if not TOPK <= self.resident_capacity <= 16384 or self.resident_capacity % 256:
             raise ValueError("resident capacity exceeds the slot bitmap")
@@ -167,7 +179,9 @@ class Geometry:
         if self.output_tokens != self.resident_blocks * BLOCK_TOKENS:
             raise ValueError("registered output must cover the physical resident pool")
         if self.score_stride != self.candidate_capacity + BLOCK_TOKENS:
-            raise ValueError("score stride must include one aligned hot/cold boundary tile")
+            raise ValueError(
+                "score stride must include one aligned hot/cold boundary tile"
+            )
         for name in GEOMETRY_FIELDS:
             if not 0 <= getattr(self, name) <= 0xFFFFFFFF:
                 raise ValueError(f"{name} does not fit the ABI")
@@ -266,35 +280,25 @@ def validate_buffers(geometry, tensors, workspace, *, device_type="npu"):
     device = tensors["query"].device
     if device.type != device_type:
         raise ValueError(f"contract requires {device_type} tensors")
-    writable = set(WORKSPACE_FIELDS) | {
-        "forward",
-        "reverse",
-        "cursors",
-        "resident_output",
-        "topk",
-        "destination",
-        "miss_counts",
-        "resident_lengths",
-        "transfers",
-        "status",
-    }
+    writable = set(WORKSPACE_FIELDS) | set(FIELD_ACCESS)
     ranges = []
     for name, (shape, dtype) in expected.items():
         tensor = supplied[name]
         if tuple(tensor.shape) != shape or str(tensor.dtype).split(".")[-1] != dtype:
-            raise ValueError(f"{name}: expected {shape} {dtype}, got {tensor.shape} {tensor.dtype}")
+            raise ValueError(
+                f"{name}: expected {shape} {dtype}, got {tensor.shape} {tensor.dtype}"
+            )
         if tensor.device != device or not tensor.is_contiguous():
             raise ValueError(f"{name}: expected contiguous storage on {device}")
-        begin = tensor.data_ptr()
-        end = begin + tensor.numel() * tensor.element_size()
-        for other, lo, hi in ranges:
-            if begin < hi and lo < end and (name in writable or other in writable):
-                raise ValueError(f"overlapping contract buffers: {other}, {name}")
-        ranges.append((name, begin, end))
+        ranges.append(tensor_range(name, tensor))
+    check_writable_ranges(ranges, writable)
 
 
 def descriptor_bytes(geometry, tensors, workspace):
-    fields = {name: int(value.data_ptr()) for name, value in (dict(tensors) | dict(workspace)).items()}
+    fields = {
+        name: int(value.data_ptr())
+        for name, value in (dict(tensors) | dict(workspace)).items()
+    }
     fields.update({name: getattr(geometry, name) for name in GEOMETRY_FIELDS})
     return bytes(DeviceContract(**fields))
 

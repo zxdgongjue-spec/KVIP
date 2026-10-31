@@ -12,7 +12,20 @@ else:
 
 
 class OwnedIndexCache:
-    def __init__(self, torch, geometry, key, scale, table, *, pool, length, budget, forward, reverse):
+    def __init__(
+        self,
+        torch,
+        geometry,
+        key,
+        scale,
+        table,
+        *,
+        pool,
+        length,
+        budget,
+        forward,
+        reverse,
+    ):
         self.torch, self.g = torch, geometry
         self.key, self.scale = key, scale
         self.table = table.clone()
@@ -22,7 +35,9 @@ class OwnedIndexCache:
         s, c = geometry.resident_capacity, geometry.candidate_capacity
         self.hot_key = self.buffer[128 : 128 + s * 128].reshape(s, 128)
         self.hot_scale = self.buffer[128 + s * 128 : 128 + s * 132].view(torch.float32)
-        self.ids = self.buffer[128 + s * 132 : 128 + s * 132 + (s + c) * 4].view(torch.int32)
+        self.ids = self.buffer[128 + s * 132 : 128 + s * 132 + (s + c) * 4].view(
+            torch.int32
+        )
         begin = 128 + s * 132 + (s + c) * 8
         self.positions = self.buffer[begin : begin + c * 4].view(torch.int32)
         tokens = torch.arange(length, device=key.device, dtype=torch.int64)
@@ -45,17 +60,25 @@ class OwnedIndexCache:
         cold_key, cold_scale = flat_key[cold_source], flat_scale[cold_source]
         self.hot_key[:nh].copy_(hot_key)
         self.hot_scale[:nh].copy_(hot_scale)
-        destinations = self.physical(torch.arange(nc, device=key.device, dtype=torch.int64))
+        destinations = self.physical(
+            torch.arange(nc, device=key.device, dtype=torch.int64)
+        )
         flat_key.index_copy_(0, destinations, cold_key)
         flat_scale.index_copy_(0, destinations, cold_scale)
         self.ids.fill_(-1)
         self.ids[:nh].copy_(hot.to(torch.int32))
         self.ids[s : s + nc].copy_(cold.to(torch.int32))
         self.positions.fill_(-1)
-        self.positions[hot] = -torch.arange(nh, device=key.device, dtype=torch.int32) - 2
+        self.positions[hot] = (
+            -torch.arange(nh, device=key.device, dtype=torch.int32) - 2
+        )
         self.positions[cold] = torch.arange(nc, device=key.device, dtype=torch.int32)
         self.header[:8].copy_(
-            torch.tensor([1, length, nh, nc, pool, geometry.layer_id, budget, 0], dtype=torch.int32, device=key.device)
+            torch.tensor(
+                [1, length, nh, nc, pool, geometry.layer_id, budget, 0],
+                dtype=torch.int32,
+                device=key.device,
+            )
         )
 
     def physical(self, positions):
@@ -70,19 +93,28 @@ class OwnedIndexCache:
         if length == self.length:
             return
         torch = self.torch
-        tokens = torch.arange(self.length, length, device=self.key.device, dtype=torch.int64)
+        tokens = torch.arange(
+            self.length, length, device=self.key.device, dtype=torch.int64
+        )
         source = self.physical(tokens)
         # Clone both planes before writing: a very short/empty hot bank can
         # make the appended cold destination overlap the incoming tail range.
         keys = self.key.view(torch.uint8).reshape(-1, 128)[source]
         scales = self.scale.reshape(-1)[source]
-        positions = torch.arange(length - self.length, device=self.key.device, dtype=torch.int64) + self.header[3]
+        positions = (
+            torch.arange(
+                length - self.length, device=self.key.device, dtype=torch.int64
+            )
+            + self.header[3]
+        )
         physical = self.physical(positions)
         self.key.view(torch.uint8).reshape(-1, 128).index_copy_(0, physical, keys)
         self.scale.reshape(-1).index_copy_(0, physical, scales)
         self.ids[self.g.resident_capacity + positions] = tokens.to(torch.int32)
         self.positions[tokens] = positions.to(torch.int32)
-        self.header[20] = 0  # Invalidate normalized resident/H0 snapshot on layout growth.
+        self.header[20] = (
+            0  # Invalidate normalized resident/H0 snapshot on layout growth.
+        )
         self.header[3].add_(length - self.length)
         self.header[1] = length
         self.length = length
@@ -95,9 +127,70 @@ class OwnedIndexCache:
         hot = pos <= -2
         hp = (-pos - 2).clamp(0, self.g.resident_capacity - 1)
         cp = self.physical(pos.clamp(0, self.g.candidate_capacity - 1))
-        keys = torch.where(hot[:, None], self.hot_key[hp], self.key.view(torch.uint8).reshape(-1, 128)[cp])
+        keys = torch.where(
+            hot[:, None],
+            self.hot_key[hp],
+            self.key.view(torch.uint8).reshape(-1, 128)[cp],
+        )
         scales = torch.where(hot, self.hot_scale[hp], self.scale.reshape(-1)[cp])
         return tokens, keys, scales
+
+    def rebind_pages(
+        self, table, *, completion_verified, exclusive_pages, logical_length=None
+    ):
+        """Boundary-only page replacement after checked completion.
+
+        Retain hot payload/IDs, relocate the cold bank, and preserve the explicit
+        logical tail before overwriting any destination. Caller proves exclusive
+        ownership and valid physical pages. Steady grow/write never calls this.
+        """
+        if completion_verified is not True or exclusive_pages is not True:
+            raise ValueError(
+                "page replacement requires checked completion and exclusive pages"
+            )
+        torch = self.torch
+        end = self.length if logical_length is None else logical_length
+        if (
+            not isinstance(end, int)
+            or isinstance(end, bool)
+            or not self.length <= end <= table.numel() * 128
+        ):
+            raise ValueError("invalid logical tail length")
+        if (
+            table.ndim != 1
+            or table.dtype != torch.int32
+            or table.device != self.table.device
+        ):
+            raise ValueError("replacement page table must be a same-device int32 row")
+        if end > self.table.numel() * 128:
+            raise ValueError("old page table does not cover the logical tail")
+        # An explicit ownership boundary may validate page values on the host;
+        # this method is never called from enqueue or Graph capture/replay.
+        pages = table[: (end + 127) // 128].detach().cpu().tolist()
+        if len(set(pages)) != len(pages) or any(
+            p < 0 or p >= self.g.index_blocks for p in pages
+        ):
+            raise ValueError(
+                "replacement pages must be unique and within the Index pool"
+            )
+        flat_key = self.key.view(torch.uint8).reshape(-1, 128)
+        flat_scale = self.scale.reshape(-1)
+        tokens, keys, scales = self.logical()
+        positions = self.positions[tokens].to(torch.int64)
+        cold = positions >= 0
+        tail = torch.arange(self.length, end, device=self.key.device, dtype=torch.int64)
+        tail_keys = flat_key[self.physical(tail)]
+        tail_scales = flat_scale[self.physical(tail)]
+        # Resolve and validate all destination indices before publishing a new
+        # table or writing. Invalid pages fail without abandoning the old owner.
+        targets = table[positions[cold] // 128].long() * 128 + positions[cold] % 128
+        tail_targets = table[tail // 128].long() * 128 + tail % 128
+        flat_key.index_copy_(0, targets, keys[cold])
+        flat_scale.index_copy_(0, targets, scales[cold])
+        flat_key.index_copy_(0, tail_targets, tail_keys)
+        flat_scale.index_copy_(0, tail_targets, tail_scales)
+        self.table = table.clone()
+        self.header[20] = 0
 
     def restore_logical(self):
         """Complete before a native reader/writer, then discard this owner."""

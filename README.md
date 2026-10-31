@@ -1,8 +1,25 @@
 # KVOP
 
+公开契约实现版本：包 `0.2.0` / 契约 `2.0.0` / 设备 ABI `13`。
+独立仓实现说明见 [公开契约与生命周期](docs/public_contract.md)，原始执行需求见
+[implementation_prompt.md](docs/implementation_prompt.md)，完整处置与验证见
+[implementation_report.md](docs/implementation_report.md)。
+
+本版增加 host 契约、校验和显式 session；设备源码和数值 oracle 保持抽取基线不变。
+当前 `hardware_certified=False`，真实 NPU/KVAF/Graph/TPOT 验收尚未完成；不要将
+host 回归通过或源码一致解读为生产功能/性能已无影响。
+
+```bash
+python -m kvop.v9.contract_info
+PYTHONPATH=. python -m pytest tests/v9 -q
+PYTHONPATH=. python tools/check_contract.py
+PYTHONPATH=. python tools/verify_baseline.py
+```
+
 独立 Ascend 算子仓。当前包含 V9 融合算子，以及性能基线需要的原生 LIDU。
 不依赖 vLLM、vllm_ascend 或模型权重；KVAF 是外部传输依赖，不由本仓修改或构建。
-目录可以整体复制到框架仓之外使用。尚未绑定单独远端，也未创建嵌套 Git 仓。
+本目录已从框架子树创建独立 Git 仓，包含来源历史；框架内镜像仍是普通目录，不含嵌套
+`.git`。代码不依赖原框架 checkout；发布远端由使用方配置，本次不执行远端发布。
 
 ```text
 kvop/v9/                 Python API、ABI 13、缓存、布局适配、构建
@@ -31,7 +48,7 @@ python3 -m pytest tests/v9 -q
 
 ```bash
 python3 -m pip wheel --no-deps --no-build-isolation . -w dist
-python3 -m pip install dist/vllm_ascend_kvop-0.1.0-py3-none-any.whl
+python3 -m pip install dist/vllm_ascend_kvop-0.2.0-py3-none-any.whl
 python3 -c 'from kvop.v9 import ABI_VERSION, native_source; print(ABI_VERSION, native_source())'
 ```
 
