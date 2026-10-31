@@ -29,7 +29,7 @@ class FakeNpuRuntime:
         batch_get_kernel_object_path="test-only",
         batch_put_kernel_object_path="test-only",
         jettys_per_core=2,
-        timing=TimingContext(),
+        timing=None,
         zero_task=False,
     ):
         layout = LayoutSpec()
@@ -40,7 +40,7 @@ class FakeNpuRuntime:
             raise ValueError("fake layout must match the public byte/block contract")
         self.torch = torch
         self.layout = layout
-        self.timing = timing
+        self.timing = TimingContext() if timing is None else timing
         self.zero_task = zero_task
         self.blocks = {}
         self.calls = 0

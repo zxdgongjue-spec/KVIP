@@ -1,5 +1,8 @@
 # 公开契约隔离实现与验证报告
 
+本文记录第一轮 0.2.0/契约 2.0.0 的实现与当时测试结果，后续审计发现的缺口和
+修复以 [3.0 扩展验收报告](extension_report.md) 为准，不能用本文 implemented 状态替代最新验收。
+
 ## 交付边界
 
 独立仓：`/path/to/KVOP`，分支 `codex/public-contract-isolation`。

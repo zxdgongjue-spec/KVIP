@@ -1,9 +1,10 @@
 # KVOP
 
-公开契约实现版本：包 `0.2.0` / 契约 `2.0.0` / 设备 ABI `13`。
+公开契约实现版本：包 `0.3.0` / 契约 `3.0.0` / 设备 ABI `13`。
+3.0 收紧 owner 租约与 Graph 回调协议；迁移和分级验收见 [符合性矩阵](docs/conformance.md)。
 独立仓实现说明见 [公开契约与生命周期](docs/public_contract.md)，原始执行需求见
 [implementation_prompt.md](docs/implementation_prompt.md)，完整处置与验证见
-[implementation_report.md](docs/implementation_report.md)。
+[扩展验收报告](docs/extension_report.md)。[第一轮实现报告](docs/implementation_report.md) 保留历史记录。
 
 本版增加 host 契约、校验和显式 session；设备源码和数值 oracle 保持抽取基线不变。
 当前 `hardware_certified=False`，真实 NPU/KVAF/Graph/TPOT 验收尚未完成；不要将
@@ -11,7 +12,7 @@ host 回归通过或源码一致解读为生产功能/性能已无影响。
 
 ```bash
 python -m kvop.v9.contract_info
-PYTHONPATH=. python -m pytest tests/v9 -q
+python tools/run_conformance.py --tier cpu
 PYTHONPATH=. python tools/check_contract.py
 PYTHONPATH=. python tools/verify_baseline.py
 ```
@@ -35,20 +36,23 @@ V9 计算、预取、最终补取、Index 交换及 KVAF 默认策略保持迁�
 
 ## 安装与构建
 
-Host 测试仅需 Python 3.10+、NumPy、pytest；NPU 需要匹配的 CANN、Torch、Torch-NPU。
+纯 host 测试需要 Python 3.10+、NumPy、pytest；完整 CPU 契约验收还需要支持 FP8
+类型的 CPU Torch 和 C++ 编译器。NPU 执行需要匹配的 CANN、Torch、Torch-NPU。
 先进入本目录：
 
 ```bash
 bash build.sh package
-python3 -m pip install pytest
-python3 -m pytest tests/v9 -q
+python3 -m pip install '.[cpu-test]'
+bash tools/check.sh --tier cpu
+# 仅验证纯 host 子集时显式选择；该入口会阻断 Torch 导入。
+python3 tools/run_conformance.py --tier host
 ```
 
 普通 wheel 包含 V9 设备源文件，不要求保留框架 checkout：
 
 ```bash
 python3 -m pip wheel --no-deps --no-build-isolation . -w dist
-python3 -m pip install dist/vllm_ascend_kvop-0.2.0-py3-none-any.whl
+python3 -m pip install dist/vllm_ascend_kvop-0.3.0-py3-none-any.whl
 python3 -c 'from kvop.v9 import ABI_VERSION, native_source; print(ABI_VERSION, native_source())'
 ```
 

@@ -5,6 +5,8 @@ writes use the device writer; these Torch operations run only on ownership
 transitions. Callers must prove exclusive writable ownership of the pages.
 """
 
+from numbers import Integral
+
 if __package__:
     from .index_cache import allocate_cache
 else:
@@ -25,9 +27,13 @@ class OwnedIndexCache:
         budget,
         forward,
         reverse,
+        page_ids=None,
     ):
         self.torch, self.g = torch, geometry
         self.key, self.scale = key, scale
+        self.active = True
+        self.poisoned = False
+        self.page_ids = self._page_ids(table, page_ids, length)
         self.table = table.clone()
         self.pool, self.length, self.budget = int(pool), int(length), int(budget)
         self.buffer = allocate_cache(torch, geometry, key.device, owned=True)
@@ -84,12 +90,79 @@ class OwnedIndexCache:
     def physical(self, positions):
         return self.table[positions // 128].to(self.torch.int64) * 128 + positions % 128
 
-    def grow(self, length, table=None):
-        """Promote only the newly eligible tail rows to cold; no old-bank scan."""
-        if not self.length <= length <= self.g.candidate_capacity:
+    def _require_active(self):
+        if not self.active or self.poisoned:
+            raise RuntimeError(
+                "owned Index is retired or has an incomplete page transition"
+            )
+
+    def _page_ids(self, table, page_ids, length):
+        """Validate host ownership metadata without reading a device page table."""
+        torch = self.torch
+        if (
+            table.ndim != 1
+            or table.dtype != torch.int32
+            or table.device != self.key.device
+            or not table.is_contiguous()
+            or table.numel() * 128 < length
+        ):
+            raise ValueError(
+                "page table must be a covering contiguous same-device int32 row"
+            )
+        if page_ids is None:
+            if table.device.type != "cpu":
+                return None
+            # CPU fixtures have no separate scheduler metadata. Never do this on NPU.
+            page_ids = table.tolist()
+        if not isinstance(page_ids, (tuple, list)) or any(
+            not isinstance(p, Integral) or isinstance(p, bool) for p in page_ids
+        ):
+            raise ValueError("page_ids must be host integer ownership metadata")
+        pages = tuple(int(p) for p in page_ids)
+        if not (length + 127) // 128 <= len(pages) <= table.numel():
+            raise ValueError("host page metadata does not cover the owned length")
+        if len(set(pages)) != len(pages) or any(
+            p < 0 or p >= self.g.index_blocks for p in pages
+        ):
+            raise ValueError("page IDs must be unique and within the Index pool")
+        if table.device.type == "cpu" and tuple(table[: len(pages)].tolist()) != pages:
+            raise ValueError("host page metadata differs from the CPU table")
+        return pages
+
+    def grow(self, length, table=None, *, page_ids=None):
+        """Append eligible rows; existing physical page mappings are immutable.
+
+        NPU table refresh requires scheduler-owned CPU page_ids. A page replacement
+        must use rebind_pages at an explicit checked ownership boundary instead.
+        """
+        self._require_active()
+        if (
+            not isinstance(length, Integral)
+            or isinstance(length, bool)
+            or not self.length <= length <= self.g.candidate_capacity
+        ):
             raise ValueError("Index growth is outside the owned candidate capacity")
         if table is not None:
-            self.table = table.clone()
+            pages = self._page_ids(table, page_ids, length)
+            if self.page_ids is None or pages is None:
+                raise ValueError(
+                    "table refresh requires host page_ids from the ownership boundary"
+                )
+            if pages[: len(self.page_ids)] != self.page_ids:
+                raise ValueError(
+                    "grow cannot replace existing pages; use checked rebind_pages"
+                )
+            if pages != self.page_ids:
+                # Stable metadata already owns an identical private page table.
+                # Do not add a device copy for same-length checks or in-page growth.
+                self.table = table.clone()
+                self.page_ids = pages
+        elif page_ids is not None:
+            raise ValueError("page_ids requires a refreshed page table")
+        elif length > self.table.numel() * 128 or (
+            self.page_ids is not None and length > len(self.page_ids) * 128
+        ):
+            raise ValueError("existing page table does not cover Index growth")
         if length == self.length:
             return
         torch = self.torch
@@ -108,19 +181,23 @@ class OwnedIndexCache:
             + self.header[3]
         )
         physical = self.physical(positions)
-        self.key.view(torch.uint8).reshape(-1, 128).index_copy_(0, physical, keys)
-        self.scale.reshape(-1).index_copy_(0, physical, scales)
-        self.ids[self.g.resident_capacity + positions] = tokens.to(torch.int32)
-        self.positions[tokens] = positions.to(torch.int32)
-        self.header[20] = (
-            0  # Invalidate normalized resident/H0 snapshot on layout growth.
-        )
-        self.header[3].add_(length - self.length)
-        self.header[1] = length
-        self.length = length
+        try:
+            self.key.view(torch.uint8).reshape(-1, 128).index_copy_(0, physical, keys)
+            self.scale.reshape(-1).index_copy_(0, physical, scales)
+            self.ids[self.g.resident_capacity + positions] = tokens.to(torch.int32)
+            self.positions[tokens] = positions.to(torch.int32)
+            self.header[20] = 0
+            self.header[3].add_(length - self.length)
+            self.header[1] = length
+            self.length = length
+        except BaseException:
+            self.poisoned = True
+            self.header[20] = 0
+            raise
 
     def logical(self):
         """Temporary logical snapshot; callers must not retain it as a mirror."""
+        self._require_active()
         torch = self.torch
         tokens = torch.arange(self.length, device=self.key.device, dtype=torch.int64)
         pos = self.positions[: self.length].to(torch.int64)
@@ -144,6 +221,11 @@ class OwnedIndexCache:
         logical tail before overwriting any destination. Caller proves exclusive
         ownership and valid physical pages. Steady grow/write never calls this.
         """
+        self._require_active()
+        npu = getattr(self.torch, "npu", None)
+        capturing = getattr(npu, "is_current_stream_capturing", None)
+        if self.key.device.type != "cpu" and callable(capturing) and capturing():
+            raise RuntimeError("page replacement is forbidden during capture")
         if completion_verified is not True or exclusive_pages is not True:
             raise ValueError(
                 "page replacement requires checked completion and exclusive pages"
@@ -185,31 +267,54 @@ class OwnedIndexCache:
         # table or writing. Invalid pages fail without abandoning the old owner.
         targets = table[positions[cold] // 128].long() * 128 + positions[cold] % 128
         tail_targets = table[tail // 128].long() * 128 + tail % 128
-        flat_key.index_copy_(0, targets, keys[cold])
-        flat_scale.index_copy_(0, targets, scales[cold])
-        flat_key.index_copy_(0, tail_targets, tail_keys)
-        flat_scale.index_copy_(0, tail_targets, tail_scales)
+        try:
+            flat_key.index_copy_(0, targets, keys[cold])
+            flat_scale.index_copy_(0, targets, scales[cold])
+            flat_key.index_copy_(0, tail_targets, tail_keys)
+            flat_scale.index_copy_(0, tail_targets, tail_scales)
+        except BaseException:
+            # Writes may already have happened. Never expose this as rollback.
+            self.poisoned = True
+            self.header[20] = 0
+            raise
         self.table = table.clone()
+        self.page_ids = tuple(pages)
         self.header[20] = 0
 
     def restore_logical(self):
         """Complete before a native reader/writer, then discard this owner."""
         tokens, keys, scales = self.logical()
         physical = self.physical(tokens)
-        self.key.view(self.torch.uint8).reshape(-1, 128).index_copy_(0, physical, keys)
-        self.scale.reshape(-1).index_copy_(0, physical, scales)
-        self.header[20] = 0
-        self.header[0] = 0
+        try:
+            self.key.view(self.torch.uint8).reshape(-1, 128).index_copy_(
+                0, physical, keys
+            )
+            self.scale.reshape(-1).index_copy_(0, physical, scales)
+            self.header[20] = 0
+            self.header[0] = 0
+            self.active = False
+        except BaseException:
+            self.poisoned = True
+            self.header[20] = 0
+            raise
 
     def write_logical(self, tokens, keys, scales):
         """Boundary/test writer; production Q4 uses one device routing kernel."""
+        self._require_active()
         torch = self.torch
         tokens = tokens.to(device=self.key.device, dtype=torch.int64)
         pos = self.positions[tokens].to(torch.int64)
         hot = pos <= -2
-        self.hot_key.index_copy_(0, -pos[hot] - 2, keys[hot])
-        self.hot_scale.index_copy_(0, -pos[hot] - 2, scales[hot])
-        cold = ~hot
-        physical = self.physical(pos[cold])
-        self.key.view(torch.uint8).reshape(-1, 128).index_copy_(0, physical, keys[cold])
-        self.scale.reshape(-1).index_copy_(0, physical, scales[cold])
+        try:
+            self.hot_key.index_copy_(0, -pos[hot] - 2, keys[hot])
+            self.hot_scale.index_copy_(0, -pos[hot] - 2, scales[hot])
+            cold = ~hot
+            physical = self.physical(pos[cold])
+            self.key.view(torch.uint8).reshape(-1, 128).index_copy_(
+                0, physical, keys[cold]
+            )
+            self.scale.reshape(-1).index_copy_(0, physical, scales[cold])
+        except BaseException:
+            self.poisoned = True
+            self.header[20] = 0
+            raise

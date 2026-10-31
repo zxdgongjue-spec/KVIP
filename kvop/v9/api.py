@@ -6,8 +6,8 @@ from kvop import __version__
 
 from .contract import ABI_VERSION, BLOCK_TOKENS, TOKEN_BYTES, TOPK
 
-CONTRACT_VERSION = "2.0.0"
-CONTRACT_MAJOR = 2
+CONTRACT_VERSION = "3.0.0"
+CONTRACT_MAJOR = 3
 CONTRACT_MINOR = 0
 GRAPH_TRANSPORT_ABI = 1
 INDEX_WRITER_ABI = 2
@@ -56,6 +56,9 @@ class Capabilities:
             "owned-index",
             "extra-feedback",
             "checked-completion",
+            "exclusive-session-lease",
+            "append-only-pages",
+            "checked-page-rebind",
         }
     )
     transport: str = "kvaf"
@@ -95,11 +98,13 @@ def negotiate_contract(requirements=None, *, provider=None) -> Capabilities:
         (provider.layout == requirements.layout, "layout"),
         (requirements.features <= provider.features, "required capabilities"),
         (
-            provider.graph_transport_abi == requirements.graph_transport_abi,
+            "fixed-q4-graph" not in requirements.features
+            or provider.graph_transport_abi == requirements.graph_transport_abi,
             "Graph transport ABI",
         ),
         (
-            provider.index_writer_abi == requirements.index_writer_abi,
+            "owned-index" not in requirements.features
+            or provider.index_writer_abi == requirements.index_writer_abi,
             "Index writer ABI",
         ),
         (

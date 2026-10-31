@@ -5,7 +5,8 @@ from numbers import Integral
 from .api import GRAPH_TRANSPORT_ABI, LayoutSpec
 
 
-def validate_lease(lease, output, *, layout=LayoutSpec()):
+def validate_lease(lease, output, *, layout=None):
+    layout = LayoutSpec() if layout is None else layout
     expected = dict(
         output_address=output.data_ptr(),
         output_bytes=output.numel() * output.element_size(),

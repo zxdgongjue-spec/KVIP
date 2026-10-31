@@ -532,7 +532,10 @@ def run_npu(a, g, arrays, scores, case, root):
                     previous_owner = owned_pool.get((int(pool), g.layer_id))
                     length = int(arrays["candidate_lens"][b])
                     if previous_owner is not None and length > previous_owner.length:
-                        previous_owner.grow(length, torch.from_numpy(arrays["index_table"][b]).to(device))
+                        previous_owner.grow(
+                            length, torch.from_numpy(arrays["index_table"][b]).to(device),
+                            page_ids=tuple(int(p) for p in arrays["index_table"][b]),
+                        )
             # Only ownership boundaries reconstruct the logical source. Normal
             # stateful steps keep the actual device cold bank from the last call.
             reuse_owned = use_owned and all(
@@ -629,6 +632,7 @@ def run_npu(a, g, arrays, scores, case, root):
                             budget=int(arrays["budgets"][b]),
                             forward=tensors["forward"],
                             reverse=tensors["reverse"],
+                            page_ids=tuple(int(p) for p in arrays["index_table"][b]),
                         )
                         cache_pool[identity] = owned_pool[identity].buffer
                         active_buffers[b] = cache_pool[identity]

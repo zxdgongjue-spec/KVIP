@@ -4,4 +4,4 @@
 其中的缺口和旧版本描述是修改前状态，不作为当前实现已通过或仍缺失的结论。
 
 当前公开规范见 [public_contract.md](../public_contract.md)，当前处置状态和实际验证见
-[implementation_report.md](../implementation_report.md)。原稿中历史外链按原样保留。
+[extension_report.md](../extension_report.md)。原稿中历史外链按原样保留。

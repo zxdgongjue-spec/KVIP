@@ -1,7 +1,9 @@
-# KVOP 2.0 公开接口契约
+# KVOP 3.0 公开接口契约
 
-包版本 0.2.0；公开契约 2.0.0；设备 ABI13；Graph transport ABI1；Index writer ABI2。
+包版本 0.3.0；公开契约 3.0.0；设备 ABI13；Graph transport ABI1；Index writer ABI2。
 来源为 vLLM-DSA `fae4597f7` 的 KVOP 子树，独立 Git 基线 `2f49ba0`。
+3.0 的不兼容变更仅涉及 host owner/Graph 回调与页面交接约束；2.0 consumer 必须
+更新后重新协商，不能仅替换 wheel。设备算法和结构不变。
 
 ## 支持范围与发现
 
@@ -21,10 +23,15 @@ heads、同批等 candidate/logical length 和 budget。Q1..Q3、mixed Q、变�
 LayoutSpec 明确 656 bytes/token、128 tokens/block、TopK2048、Index dim128、kernel
 heads64。公开/包/device/transport/writer 版本分别协商；公开握手不能替代已编译库的
 ABI/size/offset/geometry 检查，也不能推断任意 KVAF runtime 与头文件兼容。
+Graph ABI 仅在请求 fixed-q4-graph 能力时协商，writer ABI 仅在请求 owned-index 时
+协商；eager-only consumer 不受未使用能力的 ABI 变化约束。
 
 `python -m kvop.v9.contract_info` 输出机器可读的完整能力与字段访问规则。
 `Geometry.tensor_spec/workspace_spec` 是当前 shape/dtype 机器规范；
 `tools/check_contract.py` 对实际 C++ header 编译并验证 Python 的全部字段偏移。
+框架稳定依赖仅为 `kvop.v9.__all__`：包含 Geometry、分配 workspace/cache、绑定 cache、
+query_device_resources、final_aivs、validate_lease 和 validate_graph_transport 等公开符号。
+`contract_info` 的 public_symbols 给出机器清单。内部模块路径不承诺兼容。
 
 ## Admission 与准备
 
@@ -88,23 +95,41 @@ PreparedSession 不增加 kernel、拷贝或同步；调用已有 launcher.compl
 未知完成或 release 失败为 QUARANTINED，保留全部异步可见对象并要求 owner 隔离。
 已排空但 status 非 OK 为 RETIRED，不能复用，但可安全 release。Drained 不等于成功。
 
+每个 owner 使用自己的可重入 session_lock，并公开 closed、lease_active、正整数
+lease_generation、显式 lease_stream 和 session_binding。成功 acquire 后递增 generation
+并发布 active/stream；一个租约只能绑定一个 session。enqueue/complete/close 在该锁下
+核验租约和绑定。释放后清 active/binding，close 后 closed=True。旧 session 不得操作
+重新取得的租约。owner.quarantine 必须独立保留全部异步可见对象，直到可靠完成或进程退出。
+
 旧 benchmark owner 的 acquire 可能保守设置 in_flight=True，继续用原低层协议；不能
 未经 idle 状态转换就包入新 session。Graph 使用 frame begin/end、device guard 与
 finish 边界，不捕获 Python eager session 状态机。正常 Graph 路径和二进制保持原实现。
 
-独立 consumer 可使用 `GraphFrameSession(runtime, stream, synchronize=...,
-check_completed=..., quarantine=..., keepalive=...)` 管理同样的帧级 begin/complete/abort。
+独立 consumer 可使用 `GraphFrameSession(runtime, stream, current_stream=...,
+synchronize=..., check_completed=..., quarantine=..., keepalive=...)` 管理帧级边界。
 同步和检查回调在 capture/replay 外执行；该对象不释放 runtime 持有的 layer 注册。
+current_stream 必须返回实际当前 stream；同步和检查必须绑定 acquired stream。
+check_completed 仅用字面 True 声明 DMA 已排空且行状态成功。失败回调为
+quarantine(reason, error, keepalive_tuple)，必须独立保留构造时的资源快照。
 现有框架 Graph boundary 保持原路径，避免在未完成硬件验收前更换 replay 编排。
 
 ## Index 页面交接
 
-原 grow/write/restore 行为保留。更换已有 owned 页表应在 checked completion 后调用
+grow 只能增长候选范围、追加新页，已有有效页前缀不可变。NPU table refresh 必须传
+CPU scheduler 提供的 `page_ids=tuple(...)`，构造 OwnedIndexCache 时也提供该元数据；
+不得以指针相同、长度相同或请求 generation 代替页面证明。CPU 测试可直接读 CPU 表。
+框架每次 forward 从现有 BlockTable host buffer 按 request identity 生成快照，供 eager
+和 Graph prepare 共用，不下载设备页表。无法提供可信元数据或旧页变化时拒绝执行，
+不能在 owned payload 已重排后静默 native 回退。框架未来增加页面搬迁时必须接入显式交接。
+
+更换已有 owned 页表应在 checked completion 后调用
 `rebind_pages(table, completion_verified=True, exclusive_pages=True, logical_length=...)`，
 提供包括 tail 的长度；该边界操作在覆写前采集源 cold/tail，保留 hot/ID，并失效 H0 认证。
 它会在 CPU 校验页号，只适用于图外所有权交接，不在 steady enqueue/Graph 内调用。
 调用方仍须证明独占、先后顺序及请求身份；未知页变更不得用相同 data_ptr 继续认证。
 mapping epoch=0 精确检查，未知 writer/溢出不能错误复用正 epoch。
+非法参数在写入前拒绝；copy 中途失败会 poison owner，不承诺物理回滚，caller 必须
+保留并隔离资源。restore_logical 完成后 owner 退休，不可再次 grow/write/restore。
 
 ## 桩、兼容与性能
 
@@ -118,3 +143,4 @@ DeferredTransport 用于独立 V9 session 的延迟完成/异常测试，不作�
 成本，eager 分配/同步仍存在。本仓不改变设备 kernel、默认窗口、packing、几何或
 完成顺序；真实 NPU/KVAF/Graph/模型性能通过前不得合入生产适配或宣称零回归。
 SDK、SoC 和资格状态见 `manifests/compatibility.json`。
+测试分级、覆盖矩阵和安装包验收见 [conformance.md](conformance.md)。

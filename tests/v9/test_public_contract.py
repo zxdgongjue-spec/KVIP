@@ -1,20 +1,23 @@
 """Consumer-visible contract and regression tests, including the audited gaps."""
 
-import ctypes
 import ast
+import ctypes
 import json
 import subprocess
 import sys
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
+import numpy as np
 import pytest
 from contract_fixture import make_fixture, to_device
+
 from kvop.v9 import (
     ABI_VERSION,
     CONTRACT_VERSION,
     ContractMismatchError,
     ContractRequirements,
+    Geometry,
     LayoutSpec,
     admit_request,
     negotiate_contract,
@@ -57,7 +60,7 @@ def test_machine_manifest_and_public_modules_have_no_reverse_framework_dependenc
 def test_discovery_is_immutable_independent_and_has_no_implicit_certification():
     info = query_capabilities()
     assert (CONTRACT_VERSION, ABI_VERSION, ctypes.sizeof(DeviceContract)) == (
-        "2.0.0",
+        "3.0.0",
         13,
         528,
     )
@@ -93,7 +96,12 @@ def test_discovery_is_immutable_independent_and_has_no_implicit_certification():
 )
 def test_incompatible_public_contract_fails_closed(field, value):
     with pytest.raises(ContractMismatchError):
-        negotiate_contract(replace(ContractRequirements(), **{field: value}))
+        negotiate_contract(
+            replace(
+                ContractRequirements(features=query_capabilities().features),
+                **{field: value},
+            )
+        )
 
 
 def test_required_capability_and_minor_compatibility():
@@ -109,6 +117,36 @@ def test_required_capability_and_minor_compatibility():
     )
     with pytest.raises(ContractMismatchError, match="production transport"):
         negotiate_contract(provider=replace(info, transport="host-contract-test"))
+
+
+@pytest.mark.parametrize("features", [frozenset(), frozenset({"eager"})])
+def test_unused_graph_and_index_writer_abis_do_not_restrict_eager_consumers(features):
+    info = query_capabilities()
+    assert (
+        negotiate_contract(
+            ContractRequirements(
+                features=features, graph_transport_abi=99, index_writer_abi=99
+            ),
+            provider=info,
+        )
+        is info
+    )
+
+
+@pytest.mark.parametrize("feature", ["fixed-q4-graph", "owned-index"])
+def test_each_optional_feature_negotiates_only_its_own_abi(feature):
+    info = query_capabilities()
+    required = ContractRequirements(
+        features=frozenset({feature}),
+        graph_transport_abi=info.graph_transport_abi
+        if feature == "fixed-q4-graph"
+        else 99,
+        index_writer_abi=info.index_writer_abi if feature == "owned-index" else 99,
+    )
+    assert negotiate_contract(required, provider=info) is info
+    field = "graph_transport_abi" if feature == "fixed-q4-graph" else "index_writer_abi"
+    with pytest.raises(ContractMismatchError):
+        negotiate_contract(replace(required, **{field: 99}), provider=info)
 
 
 @pytest.mark.parametrize(
@@ -188,3 +226,126 @@ def test_index_caches_use_full_ranges_and_reject_workspace_aliases():
     w["hot_counts"] = backing[: g.batch * 4].view(torch.int32)
     with pytest.raises(ValueError, match="overlapping"):
         bind_caches(torch, t, g, adjacent, workspace=w)
+
+
+def admission_geometry(batch, candidate, budget, tail):
+    """Construct metadata at large limits without allocating device-sized pools."""
+    candidate_capacity = (candidate + 255) // 256 * 256
+    resident_capacity = (budget + 255) // 256 * 256
+    index_columns = candidate_capacity // 128
+    resident_columns = (resident_capacity + tail + 127) // 128
+    resident_blocks = batch * resident_columns
+    return Geometry(
+        batch=batch,
+        queries=4,
+        candidate_capacity=candidate_capacity,
+        resident_capacity=resident_capacity,
+        pool_capacity=batch + 1,
+        index_columns=index_columns,
+        resident_columns=resident_columns,
+        index_blocks=batch * index_columns,
+        resident_blocks=resident_blocks,
+        layer_id=0,
+        num_layers=1,
+        max_requests=batch,
+        qcap=index_columns,
+        table_capacity=batch * index_columns,
+        output_tokens=resident_blocks * 128,
+        score_stride=candidate_capacity + 128,
+    ).validate()
+
+
+@pytest.mark.parametrize("batch", [1, 32])
+@pytest.mark.parametrize("candidate", [1, 262144])
+@pytest.mark.parametrize("budget", [2048, 16384])
+@pytest.mark.parametrize("tail", [0, 128, 129])
+def test_host_admission_accepts_real_boundary_combinations(
+    batch, candidate, budget, tail
+):
+    g = admission_geometry(batch, candidate, budget, tail)
+    request = dict(
+        queries_per_request=4,
+        candidate_lengths=[candidate] * batch,
+        resident_budgets=[budget] * batch,
+        logical_lengths=[candidate + tail] * batch,
+        pool_rows=list(range(batch)),
+        geometry=g,
+        aic_count=max(1, batch // 2),
+    )
+    result = admit_request(**request)
+    assert result.supported, (result.reason, result.message)
+    validate_request(**request)
+
+
+@pytest.mark.parametrize(
+    "changes,reason",
+    [
+        ({"candidate_lengths": [], "resident_budgets": []}, "batch_outside_v9"),
+        ({"resident_budgets": [2047]}, "invalid_metadata"),
+        ({"resident_budgets": [16385]}, "invalid_metadata"),
+        ({"logical_lengths": [-1]}, "invalid_metadata"),
+        ({"logical_lengths": [2**31]}, "invalid_metadata"),
+        ({"pool_rows": [2**31]}, "invalid_metadata"),
+        ({"pool_rows": [False]}, "invalid_metadata"),
+        ({"aic_count": 33}, "insufficient_aiv"),
+        ({"aic_count": True}, "insufficient_aiv"),
+        ({"candidate_lengths": 16384}, "invalid_metadata"),
+        ({"resident_budgets": []}, "invalid_metadata"),
+        ({"logical_lengths": []}, "invalid_metadata"),
+        ({"pool_rows": []}, "invalid_metadata"),
+    ],
+)
+def test_host_admission_rejects_missing_metadata_and_values_just_outside_limits(
+    changes, reason
+):
+    request = dict(
+        queries_per_request=4, candidate_lengths=[16384], resident_budgets=[12288]
+    )
+    result = admit_request(**(request | changes))
+    assert not result.supported and result.reason == reason
+
+
+@pytest.mark.parametrize(
+    "field", ["candidate_lengths", "resident_budgets", "logical_lengths"]
+)
+def test_host_admission_requires_each_length_and_budget_to_be_uniform(field):
+    request = dict(
+        queries_per_request=4,
+        candidate_lengths=[16384, 16384],
+        resident_budgets=[12288, 12288],
+        logical_lengths=[16513, 16513],
+    )
+    request[field][1] += 1
+    result = admit_request(**request)
+    assert not result.supported and result.reason == "nonuniform"
+
+
+def test_host_admission_resource_threshold_and_prepared_capacity():
+    request = dict(
+        queries_per_request=4,
+        candidate_lengths=[16384] * 3,
+        resident_budgets=[12288] * 3,
+        logical_lengths=[16384] * 3,
+        pool_rows=[0, 1, 2],
+        geometry=admission_geometry(3, 16384, 12288, 0),
+    )
+    assert not admit_request(**request, aic_count=1).supported
+    assert admit_request(**request, aic_count=2).supported
+    assert not admit_request(
+        **(request | {"candidate_lengths": [16385] * 3, "logical_lengths": [16385] * 3})
+    ).supported
+    assert not admit_request(**(request | {"resident_budgets": [12289] * 3})).supported
+    assert not admit_request(**(request | {"logical_lengths": [16385] * 3})).supported
+
+
+def test_numpy_host_scalars_do_not_wrap_tail_capacity_arithmetic():
+    g = admission_geometry(1, 16384, 12288, 0)
+    result = admit_request(
+        queries_per_request=np.int32(4),
+        candidate_lengths=np.array([16384], np.int32),
+        resident_budgets=np.array([12288], np.int32),
+        logical_lengths=np.array([np.iinfo(np.int32).max], np.int32),
+        pool_rows=np.array([0], np.int32),
+        geometry=g,
+    )
+    assert not result.supported and result.reason == "capacity"

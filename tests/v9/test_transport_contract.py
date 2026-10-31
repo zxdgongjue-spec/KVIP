@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+
 from kvop.v9.transport import validate_graph_transport, validate_lease
 
 
