@@ -3,7 +3,7 @@
 import numpy as np
 from contract_payload import payload
 from contract_reference import address, commit_plan, eligible_victims, frozen_hot, plan_row, verify_selection
-from kvop.v9.contract import TOPK, Status
+from kvip.v9.contract import TOPK, Status
 
 
 def snapshot(arrays):

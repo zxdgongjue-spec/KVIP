@@ -1,15 +1,15 @@
-# KVOP 公开契约隔离与独立仓实现 Prompt
+# KVIP 公开契约隔离与独立仓实现 Prompt
 
 ## 目标和基线
 
 你是负责 Ascend V9 融合算子与框架集成的工程师。以 vLLM-DSA 提交 `fae4597f7`
-中的 `third_party/KVOP` 为唯一实现基线，完成公开接口契约的 host 代码、独立桩、
+中的 `third_party/KVIP` 为唯一实现基线，完成公开接口契约的 host 代码、独立桩、
 框架适配、回归验证，并生成可单独构建、测试和版本管理的 Git 仓。
 契约依据为《融合算子接口契约》2.0.0-draft.1 的 C01..C18 和审计 G01..G11。
 
 源仓有用户未提交工作。使用现有最新代码 worktree，禁止覆盖原工作区、stash、reset
 或把旧 `ascend-dsa-fused-ops` 误当生产基线。独立仓目录为
-`/path/to/KVOP`，基线子树提交为
+`/path/to/KVIP`，基线子树提交为
 `2f49ba0e140311aa8efd40dbb539b1169b959747`；不创建远端、不推送或部署。
 
 ## 首先梳理并判定修改合理性
@@ -73,7 +73,7 @@
 
 ## 仓库与交付
 
-- 独立 KVOP Git 仓保留子树基线历史及来源/许可；可构建 source wheel，独立运行测试。
+- 独立 KVIP Git 仓保留子树基线历史及来源/许可；可构建 source wheel，独立运行测试。
 - 主仓对应嵌入目录保持同源，提供薄 adapter 改动及测试；不向旧主工作区合并生产代码。
 - 提交 prompt、未实现项处置表、公开规范、SDK/SoC 兼容与验证状态 manifest、README、
   可执行验证脚本、适配回滚与硬件验收命令。

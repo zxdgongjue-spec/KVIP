@@ -1,12 +1,12 @@
-# KVOP 融合算子实现符合性审计与补齐清单
+# KVIP 融合算子实现符合性审计与补齐清单
 
 审计日期：2026-10-31。实现基线：`fae4597f7`；契约：
 [融合算子接口契约 2.0.0-draft.1](融合算子接口契约.md)。
-远端重新 fetch 后未发现该 KVOP 分支的新提交。
+远端重新 fetch 后未发现该 KVIP 分支的新提交。
 
 ## 1. 判断
 
-KVOP **部分符合**本版契约。它已经形成独立 Python 包、设备 ABI13、计算/取数/发布
+KVIP **部分符合**本版契约。它已经形成独立 Python 包、设备 ABI13、计算/取数/发布
 链路、测试传输隔离和框架生命周期接线；尚未完整实现公开能力协商、统一 host
 admission、全面别名校验与可独立约束的 owner/session 协议。不能将它描述为只有
 目录搬迁，也不能标记为完整契约已生效。
@@ -19,7 +19,7 @@ admission、全面别名校验与可独立约束的 owner/session 协议。不�
 
 | 条款 | 判断 | 实现证据 | 待补内容 |
 |---|---|---|---|
-| C01 profile 和职责 | 部分符合 | `a5_c8_policy.py` 用 v9_result 分支跳过 native prepare/BatchGet；KVOP 独立 import | 正式声明能力组；不要求 V9 全量绑定 legacy/QSFA |
+| C01 profile 和职责 | 部分符合 | `a5_c8_policy.py` 用 v9_result 分支跳过 native prepare/BatchGet；KVIP 独立 import | 正式声明能力组；不要求 V9 全量绑定 legacy/QSFA |
 | C02 版本/发现 | 部分符合 | `ContractLaunch.__init__` 查 ABI=13、结构大小、全部 offset、编译几何 | 包公开 SemVer/capability/layout/SDK manifest，启动协商 G01 |
 | C03 布局常量 | 部分符合 | `contract.py` 656/128；QueueOwner/GraphQueueOwner 校验 lease geometry | 机器 LayoutSpec 和多布局协商，消除散落重复数值 |
 | C04 标识/地址 | 已符合机制 | `contract_access.inc`、`InitResidentState`、`ValidateContractRemote`；resident 全宽表 | NPU 非连续页和真实远端范围验收 |
@@ -42,7 +42,7 @@ admission、全面别名校验与可独立约束的 owner/session 协议。不�
 
 | 阶段 | 入口/关键符号 | 当前执行与风险边界 |
 |---|---|---|
-| 1. 启动与 import | `v9_backend.load_binding` | 从安装的 `kvop.v9` 加载；无 in-tree 自动 fallback。缺公开契约握手，但后续有二进制 ABI 校验 |
+| 1. 启动与 import | `v9_backend.load_binding` | 从安装的 `kvip.v9` 加载；无 in-tree 自动 fallback。缺公开契约握手，但后续有二进制 ABI 校验 |
 | 2. 资源与路由 | `required_workers`、`route`、`v9_config.admission` | 获取 AIC、规划双 jetty 队列；限制 Q4、等长、资源、共享页和 graph 行数 |
 | 3. Index 写入与交接 | `_write_index`、`v9_index_writer.write_q4` | native 路径前恢复逻辑布局；已有 owned cache 时 writer 按 bank 写入；失败 retire |
 | 4. pending restore | `V9Backend.execute` 开头 | 融合写 resident 前完成恢复；policy 后面的同名调用依赖 pending 标记使其无重复搬运 |
@@ -76,7 +76,7 @@ Graph guard 是危险索引防护及错误锁存，不是 rollback。Index 维�
 
 ### G01 公开版本与能力握手缺失 P0
 
-证据：`kvop/v9/__init__.py` 导出 Geometry/ContractLaunch 等，无公开 contract version
+证据：`kvip/v9/__init__.py` 导出 Geometry/ContractLaunch 等，无公开 contract version
 或 query_capabilities；framework load_binding 直接 import。已有 ContractLaunch
 ABI13/size/offset/几何检查应保留，不能用仅包 SemVer 检查替代。
 
@@ -123,7 +123,7 @@ prepare/acquire 的 stream 固定为公开句柄并验证一致性。框架正�
 补齐：公开 QueueOwnerProtocol 与 session 生命周期，规定谁负责 in_flight；将 stream
 显式绑定至 session，或要求调用参数并校验；unknown completion 必须保留库、workspace、
 cache、resident、queue。增加跨 stream 拒绝、重复 enqueue、在途 close、drained 业务失败、
-release 异常等 public API 测试。不是要求 KVOP 接收 framework runtime 私有对象。
+release 异常等 public API 测试。不是要求 KVIP 接收 framework runtime 私有对象。
 
 ### G05 H0 与 legacy miss 规则不同 语义决策 P0
 
@@ -153,13 +153,13 @@ zero-task 只做编排；正确性桩按有效 descriptor 复制 payload 并保�
 ### G08 传统 wrapper 抽取与 timing 尚未实现 P1
 
 原稿提出的 `nanovllm_dsa_a5.contract`、全量函数表、显式 capturing 尚未接入最新
-framework；C8 LIDU 仍读 forward_context 并在非捕获时同步。KVOP 只抽取 V9 和
+framework；C8 LIDU 仍读 forward_context 并在非捕获时同步。KVIP 只抽取 V9 和
 native MTP 对照，QSFA/其他 legacy 留在框架不是 V9 违反职责边界。
 若继续抽取，按能力组和实例函数集合接入；同步修改单独 profile，禁止全局 timing setter。
 
 ### G09 设备、Graph 与真实网络验收未闭环 P0 发布门槛
 
-本机 KVOP host suite 为 40 passed/2 skipped；framework 相关 host suite 为
+本机 KVIP host suite 为 40 passed/2 skipped；framework 相关 host suite 为
 49 passed/5 skipped，其中 Graph host 模块整体因 torch 缺失跳过。这是 pytest
 计数口径，不能解释为“仅五个 Graph 分支没执行、其他 Graph 分支均通过”。
 
@@ -177,8 +177,8 @@ eager execute 创建 row_modes/profile/index_table、输出和 Index pointer/dir
 
 ### G11 发布/事实源尚未统一 P1
 
-KVOP 是可独立 wheel 的普通目录，未配置独立远端；旧 csrc V9 和上一轮本地
-ascend-dsa-fused-ops 不是生产第二入口。以 KVOP 为主线，定义 tag、兼容矩阵、构建
+KVIP 是可独立 wheel 的普通目录，未配置独立远端；旧 csrc V9 和上一轮本地
+ascend-dsa-fused-ops 不是生产第二入口。以 KVIP 为主线，定义 tag、兼容矩阵、构建
 manifest 与不可变 release；历史实现只读或生成镜像。先形成机器规范再生成契约文档，
 避免文档、Python、C++ 结构三处手改；保留现有 schema/offset 运行检查。
 
@@ -194,18 +194,18 @@ manifest 与不可变 release；历史实现只读或生成镜像。先形成机
 ## 6. 本轮验证与复现
 
 ```bash
-PYTHONPATH=third_party/KVOP pytest -q third_party/KVOP/tests/v9
+PYTHONPATH=third_party/KVIP pytest -q third_party/KVIP/tests/v9
 # 40 passed, 2 skipped
 
-PYTHONPATH=third_party/KVOP pytest -q --confcutdir=tests/ut/dsa_offload \
+PYTHONPATH=third_party/KVIP pytest -q --confcutdir=tests/ut/dsa_offload \
   tests/ut/dsa_offload/test_v9_framework_host.py \
   tests/ut/dsa_offload/test_v9_framework_abi13.py \
   tests/ut/dsa_offload/test_v9_graph_host.py \
   tests/ut/dsa_offload/test_v9_qsfa_loader.py
 # 49 passed, 5 skipped
 
-probe=docs/source/developer_guide/Design_Documents/wangyong/contracts_20261031/tools/probe_kvop_contract.py
-PYTHONPATH=third_party/KVOP python3 "$probe"
+probe=docs/source/developer_guide/Design_Documents/wangyong/contracts_20261031/tools/probe_kvip_contract.py
+PYTHONPATH=third_party/KVIP python3 "$probe"
 ```
 
 最后一个脚本调用真实 metadata validator，控制组通过，五项 gap flag 都为 true：

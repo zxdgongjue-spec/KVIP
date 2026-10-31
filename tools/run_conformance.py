@@ -28,6 +28,8 @@ CRITICAL_SUITES = frozenset(
         "test_inputs.py",
         "test_launcher_binding.py",
         "test_conformance_tools.py",
+        "test_demo_cli.py",
+        "test_kvaf_compatibility.py",
     }
 )
 
@@ -181,10 +183,10 @@ def main(argv=None):
             sys.meta_path.insert(0, HostOnlyImports())
         import pytest
 
-        import kvop
+        import kvip
 
-        provider = Path(kvop.__file__).resolve()
-        if args.provider == "installed" and provider.is_relative_to(root / "kvop"):
+        provider = Path(kvip.__file__).resolve()
+        if args.provider == "installed" and provider.is_relative_to(root / "kvip"):
             raise ValueError("installed provider resolves to the source checkout")
         version = require_cpu_torch() if args.tier == "cpu" else "not_required"
         compiler = shutil.which("c++") or shutil.which("g++")

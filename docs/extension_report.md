@@ -1,5 +1,9 @@
 # 契约 3.0 扩展与验收报告
 
+本页保留 0.3 阶段的历史记录。现行 0.4.0 已统一 KVIP/kvip 命名，采用并列 submodule
+和 editable 联调；最新命令见 ../DEVELOPMENT.md，实际结果见 ../manifests/validation.json。
+名称迁移后的保护比较明确记录 namespace 归一化，不再声称全部 Python 文件原始字节相同。
+
 本轮执行需求见 extension_prompt.md，生效规范见 public_contract.md，逐环节覆盖见
 conformance.md。完整命令结果与安装产物状态见 manifests/validation.json；本报告不
 将 CPU 验证转换为硬件认证。第一轮报告保留为 implementation_report.md。
@@ -13,7 +17,7 @@ conformance.md。完整命令结果与安装产物状态见 manifests/validation
 | restore 后旧 owner 仍可用 | restore 完成后退休；拒绝读取、增长、写入及二次恢复 |
 | 同 lease 可绑定多个 session | owner 本地锁、唯一绑定、显式 acquired stream、closed/active 与 generation 校验 |
 | 释放失败后可再次释放未知 lease | 框架直接 owner 路径也 sticky quarantine；保留 lease/资源并拒绝再次释放 |
-| 框架依赖内部 KVOP 模块 | 所有稳定依赖收口到 kvop.v9.__all__；真实导入测试拦截私有模块依赖 |
+| 框架依赖内部 KVIP 模块 | 所有稳定依赖收口到 kvip.v9.__all__；真实导入测试拦截私有模块依赖 |
 | 页表契约只在独立 API 实现 | model_runner metadata hook 从既有 CPU BlockTable 每 forward 按 request ID 快照，eager/Graph prepare 共用 |
 | 只有 AST/事件替身测试 | 新增真实模块导入、owner native packing、CPU GraphLayer+真实 OwnedIndex 接线，以及真实 ContractLaunch C++ shim 绑定 |
 | 边界/packing/consumer 用例不足 | 32/64 heads 数值等价、容量上下界、零/满 descriptor、多目录/非法参数/保护区 |
@@ -36,7 +40,7 @@ CPU 逻辑/接线场景，工具本身另有 5 项回归。C++ descriptor 为 52
 真实 ContractLaunch 测试使用实际 Torch Tensor/schema、实际指针与 geometry packing，
 编译 C++ host shim 并经 ctypes 调用；shim 不计算 LI、执行 DMA 或模拟网络时间。
 框架模块测试仅替换重量级 package 初始化、logger、torch.npu 与外部 native/KVAF 边界；
-测试实际 backend/graph/config/contracts 和公开 KVOP，仍不等于运行完整 vllm serve。
+测试实际 backend/graph/config/contracts 和公开 KVIP，仍不等于运行完整 vllm serve。
 
 新增 CPU 页快照、锁和状态校验有 host 成本。一次 CPU dispatch 对照新增约 6.83 us，
 仅记录本机 Python 开销，不能推断 TPOT；稳定 page_ids 的同长检查及页内增长复用
@@ -49,7 +53,7 @@ model_runner_v1.py 的 6 项全文件 Ruff 问题在 HEAD 基线已有，本轮�
 
 ## 交付位置
 
-独立仓 `/path/to/KVOP`，候选框架
+独立仓 `/path/to/KVIP`，候选框架
 `/path/to/vLLM-DSA`。原主工作区生产代码
 未合入、未启用。独立 Git 保留提取基线、已 sign-off 的本地实现历史及 bundle；远端未发布。
 框架生产启用前必须执行 hardware_qualification.md，不能以本轮 CPU 结果自动认证。

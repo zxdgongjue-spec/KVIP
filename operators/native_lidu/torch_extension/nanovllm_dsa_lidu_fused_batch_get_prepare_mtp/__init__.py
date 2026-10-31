@@ -12,7 +12,7 @@ _OPAPI_LIBS = tuple(
 if len(_OPAPI_LIBS) != 1:
     raise RuntimeError(
         "nanovllm_dsa_lidu_fused_batch_get_prepare_mtp requires one local "
-        "libcust_opapi.so. Run bash build.sh native-lidu from the KVOP repository root"
+        "libcust_opapi.so. Run bash build.sh native-lidu from the KVIP repository root"
     )
 _OPAPI = _OPAPI_LIBS[0]
 _VENDOR = _OPAPI.parents[2]

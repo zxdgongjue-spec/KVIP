@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def gate():
     spec = importlib.util.spec_from_file_location(
-        "kvop_qualification", ROOT / "tools/qualify_performance.py"
+        "kvip_qualification", ROOT / "tools/qualify_performance.py"
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

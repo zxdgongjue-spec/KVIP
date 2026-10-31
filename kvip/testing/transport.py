@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from kvop.v9.api import LayoutSpec
+from kvip.v9.api import LayoutSpec
 
 
 @dataclass(frozen=True)

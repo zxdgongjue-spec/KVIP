@@ -7,3 +7,6 @@ dist/
 results/
 _custom_opp/
 *.so
+.DS_Store
+.venv/
+.ruff_cache/

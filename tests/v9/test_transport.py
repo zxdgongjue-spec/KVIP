@@ -5,7 +5,7 @@ from contract_fixture import make_fixture
 from contract_simulator import Simulator, seed_output
 from contract_verify import snapshot
 from host_transport import HostTransport
-from kvop.v9 import Status, native_source
+from kvip.v9 import Status, native_source
 from memory_build import prepare_source
 
 
@@ -71,7 +71,7 @@ def test_mock_cannot_claim_network_performance():
 def test_transport_marker_rejects_cross_loading():
     from types import SimpleNamespace
 
-    from kvop.v9.launch import validate_transport_library
+    from kvip.v9.launch import validate_transport_library
 
     production = SimpleNamespace()
     test = SimpleNamespace(transport="npu-memory-test")

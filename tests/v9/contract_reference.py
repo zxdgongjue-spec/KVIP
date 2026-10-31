@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 
 import numpy as np
-from kvop.v9.contract import BITMAP_WORDS, BLOCK_TOKENS, MAX_SELECTION, TOKEN_BYTES, TOPK, Status
+from kvip.v9.contract import BITMAP_WORDS, BLOCK_TOKENS, MAX_SELECTION, TOKEN_BYTES, TOPK, Status
 
 
 class ContractError(ValueError):

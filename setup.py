@@ -11,7 +11,7 @@ class BuildPy(build_py):
     def run(self):
         super().run()
         source = Path(__file__).parent / "operators" / "v9"
-        target = Path(self.build_lib) / "kvop" / "v9" / "_native"
+        target = Path(self.build_lib) / "kvip" / "v9" / "_native"
         shutil.copytree(
             source, target, dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__", "build*", "*.pyc")
         )

@@ -6,7 +6,7 @@
 
 ## 3.0 变更和边界
 
-包 0.3.0、host 契约 3.0.0；device ABI13、Graph transport ABI1、writer ABI2 不变。
+包 0.4.0、host 契约 3.0.0；device ABI13、Graph transport ABI1、writer ABI2 不变。
 2.0 的 owner 不能直接包装新 PreparedSession。需要增加 owner 本地 RLock、active/
 closed 状态、单调 lease generation、acquired stream、唯一 session binding，并遵守
 release/close 后置条件。GraphFrameSession 新增 current_stream 回调，quarantine
@@ -40,14 +40,19 @@ contracts，使用显式 CPU 宿主替身；它不加载完整 serving/NPU 环�
 
 ## 两侧独立运行
 
+日常协作采用主仓并列 KVIP/KVAF submodule + KVIP editable；主仓 gitlink 是各自源码
+版本的唯一权威。独立 KVIP 不嵌套 KVAF，NPU demo 用显式 --kvaf-root 外配。完整命令见
+[DEVELOPMENT.md](../DEVELOPMENT.md)。普通源码镜像已由 submodule 替代。
+
 ```bash
-python -m pip install '.[cpu-test]'
+python -m pip install --editable '.[cpu-test]'
 bash tools/check.sh --tier cpu
 python tools/run_conformance.py --tier host
 ```
 
-check.sh 在独立 Git 仓根目录和框架 third_party/KVOP 下均可运行。它分别执行 pytest、
-C++ ABI 和保护源码/44 个 oracle 基线比较。source-baseline 需要对应 Git 历史；源码
+check.sh 在独立 Git 仓根目录和框架 third_party/KVIP 下均可运行。它分别执行 pytest、
+C++ ABI 和保护源码/44 个 oracle 基线比较。名称迁移仅对已识别的历史包 namespace
+归一化；设备 kernel 和其他变动仍严格比较。source-baseline 需要对应 Git 历史；源码
 快照可显式指定 `--baseline-directory`，缺历史不得静默跳过。纯 host 入口主动阻断 Torch，
 预先选择不依赖 Torch 的子集；cpu 入口要求 CPU Torch 和 C++ compiler，关键 suite
 缺失或任何 skip 均失败。NPU 测试另按 hardware_qualification.md 执行。
@@ -57,13 +62,13 @@ C++ ABI 和保护源码/44 个 oracle 基线比较。source-baseline 需要对�
 ```bash
 python -m pip wheel --no-deps --no-build-isolation . -w dist
 # 在独立环境安装 wheel，然后从外部目录执行，清除指向源仓的 PYTHONPATH。
-python /path/to/KVOP/tools/run_conformance.py --tier cpu --root /path/to/KVOP --provider installed
-python /path/to/KVOP/tools/verify_baseline.py --scope installed-package
+python /path/to/KVIP/tools/run_conformance.py --tier cpu --root /path/to/KVIP --provider installed
+python /path/to/KVIP/tools/verify_baseline.py --scope installed-package
 ```
 
 installed-package scope 仅验证已安装公开元数据和打包源 hash；完整测试仍需要外部 tests
 树。不能把这个小检查当完整 CPU 契约验收。完整入口报告实际 provider 路径并拒绝回源。
-框架接线测试可用已安装的 KVOP，不需要把独立仓源码放到 PYTHONPATH。
+框架接线测试可用已安装的 KVIP，不需要把独立仓源码放到 PYTHONPATH。
 
 ## 验收状态
 

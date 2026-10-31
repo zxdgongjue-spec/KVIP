@@ -3,7 +3,7 @@
 import numpy as np
 from contract_payload import payload
 from contract_reference import frozen_hot, verify_selection
-from kvop.v9.contract import TOPK
+from kvip.v9.contract import TOPK
 
 
 class NativeBaseline:

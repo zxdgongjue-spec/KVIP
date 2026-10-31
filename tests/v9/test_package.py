@@ -7,13 +7,13 @@ import sys
 import pytest
 from benchmark_contract import parse_args, run_cpu
 from contract_fixture import CASES, make_fixture
-from kvop.v9 import ABI_VERSION, native_source, validate_request
+from kvip.v9 import ABI_VERSION, native_source, validate_request
 
 
 def test_import_is_independent():
     code = """
 import sys
-from kvop.v9 import ABI_VERSION, native_source, ContractLaunch
+from kvip.v9 import ABI_VERSION, native_source, ContractLaunch
 assert ABI_VERSION == 13
 assert (native_source() / 'CMakeLists.txt').is_file()
 assert not any(n == 'torch' or n.startswith(('vllm', 'torch_npu', 'kvaf')) for n in sys.modules)
@@ -77,7 +77,7 @@ def test_lifecycle_reorder_and_rewrite(tmp_path):
 def test_real_public_buffer_validation():
     torch = pytest.importorskip("torch")
     from contract_fixture import to_device
-    from kvop.v9.contract import allocate_workspace, validate_buffers
+    from kvip.v9.contract import allocate_workspace, validate_buffers
 
     g, arrays, _ = make_fixture()
     tensors = to_device(torch, arrays, g, torch.device("cpu"))

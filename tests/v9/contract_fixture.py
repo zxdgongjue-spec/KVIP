@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, replace
 
 import numpy as np
 from contract_reference import bitmap
-from kvop.v9.contract import TOKEN_BYTES, TOPK, Geometry, align
+from kvip.v9.contract import TOKEN_BYTES, TOPK, Geometry, align
 
 
 @dataclass(frozen=True)

@@ -5,7 +5,7 @@
 
 ## 交付边界
 
-独立仓：`/path/to/KVOP`，分支 `codex/public-contract-isolation`。
+独立仓：`/path/to/KVIP`，分支 `codex/public-contract-isolation`。
 源基线 vLLM-DSA `fae4597f7`，提取子树提交 `2f49ba0e140311aa8efd40dbb539b1169b959747`。
 完整任务 Prompt 见 [implementation_prompt.md](implementation_prompt.md)。
 独立仓的公开规范见 [public_contract.md](public_contract.md)，审计输入与原稿保存在
@@ -37,17 +37,17 @@ C16/C17 的 host 验证已实施，真实设备与端到端性能要求尚未确
 
 ## 具体代码
 
-- `kvop/v9/api.py`：公开版本、layout、能力、需求与协商。
+- `kvip/v9/api.py`：公开版本、layout、能力、需求与协商。
 - `capabilities.py`：结构化 admission，三参数兼容 wrapper 和可选完整 host geometry。
 - `access.py`、`contract.py`、`index_cache.py`：访问模式、完整字节区间、字段/间接缓存校验。
 - `session.py`：typed SelectionResult、CompletionResult、eager/Graph frame 状态机和 owner 协议。
 - `transport.py`：真实 lease 字节量纲、Graph ABI/方法验证；不伪造未知 SDK fingerprint。
 - `owned_index_cache.py::rebind_pages`：仅显式交接边界执行的重定位；不接入 steady hot path。
-- `kvop/testing/`：CPU FakeNpuRuntime、DeferredTransport 和 StubQueueOwner，生产发现不选择它们。
+- `kvip/testing/`：CPU FakeNpuRuntime、DeferredTransport 和 StubQueueOwner，生产发现不选择它们。
 - `contract_info.py`、`manifests/compatibility.json`：可查询机器契约与未验收资格状态。
 - `tools/`：C++/Python ABI、基线差分、host 派发和真实证据性能门槛。
 
-框架仅修改 `v9_backend.py`、`v9_config.py` 及新增 consumer/协商测试，嵌入 KVOP
+框架仅修改 `v9_backend.py`、`v9_config.py` 及新增 consumer/协商测试，嵌入 KVIP
 镜像与独立仓同源。模型文件、model runner、attention API 和 NPU 设备源码未修改。
 
 ## 已确认的功能保持证据

@@ -5,9 +5,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from kvop.testing.owner import DeferredTransport, StubQueueOwner
-from kvop.v9 import PreparedSession, SessionState, Status
-from kvop.v9.access import OUTPUT_FIELDS
+from kvip.testing.owner import DeferredTransport, StubQueueOwner
+from kvip.v9 import PreparedSession, SessionState, Status
+from kvip.v9.access import OUTPUT_FIELDS
 
 
 def session_fixture(*, prepared=True):

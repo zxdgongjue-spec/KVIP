@@ -7,9 +7,9 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from kvop.testing.owner import StubQueueOwner
-from kvop.v9 import PreparedSession
-from kvop.v9.access import OUTPUT_FIELDS
+from kvip.testing.owner import StubQueueOwner
+from kvip.v9 import PreparedSession
+from kvip.v9.access import OUTPUT_FIELDS
 
 
 def main():

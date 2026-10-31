@@ -7,8 +7,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from kvop.v9 import ABI_VERSION, native_source
-from kvop.v9.contract import GEOMETRY_FIELDS, POINTER_FIELDS, DeviceContract
+from kvip.v9 import ABI_VERSION, native_source
+from kvip.v9.contract import GEOMETRY_FIELDS, POINTER_FIELDS, DeviceContract
 
 SOURCE = r"""
 #include <iostream>
@@ -28,7 +28,7 @@ def main():
     compiler = shutil.which("c++") or shutil.which("g++")
     if compiler is None:
         raise SystemExit("a C++ compiler is required for the ABI contract check")
-    with tempfile.TemporaryDirectory(prefix="kvop-abi-") as root:
+    with tempfile.TemporaryDirectory(prefix="kvip-abi-") as root:
         executable = Path(root) / "abi"
         subprocess.run(
             [

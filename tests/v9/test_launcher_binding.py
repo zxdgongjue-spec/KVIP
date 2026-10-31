@@ -14,18 +14,18 @@ from types import SimpleNamespace
 import pytest
 from contract_fixture import make_fixture, to_device
 
-from kvop.testing.owner import StubQueueOwner
-from kvop.v9 import ContractLaunch, PreparedSession, Status, native_source
-from kvop.v9.access import OUTPUT_FIELDS
-from kvop.v9.contract import (
+from kvip.testing.owner import StubQueueOwner
+from kvip.v9 import ContractLaunch, PreparedSession, Status, native_source
+from kvip.v9.access import OUTPUT_FIELDS
+from kvip.v9.contract import (
     GEOMETRY_FIELDS,
     POINTER_FIELDS,
     DeviceContract,
     allocate_workspace,
     validate_buffers,
 )
-from kvop.v9.geometry import final_aivs, li_geometry
-from kvop.v9.index_cache import cache_bytes
+from kvip.v9.geometry import final_aivs, li_geometry
+from kvip.v9.index_cache import cache_bytes
 
 
 @pytest.fixture(scope="module")
@@ -88,7 +88,7 @@ STAGE(init, 1) STAGE(li, 2) STAGE(wait, 3) STAGE(resolve, 4) STAGE(fetch, 5)
 """
         + getters
     )
-    directory = tmp_path_factory.mktemp("kvop-host-shim")
+    directory = tmp_path_factory.mktemp("kvip-host-shim")
     library = directory / ("host.dylib" if sys.platform == "darwin" else "host.so")
     subprocess.run(
         [
@@ -156,7 +156,7 @@ def binding_setup(monkeypatch, host_library):
     # Retain the real metadata/range validator; adapt only its expected device
     # type. No fake Tensor class or weakened output schema is introduced.
     monkeypatch.setattr(
-        "kvop.v9.launch.validate_buffers",
+        "kvip.v9.launch.validate_buffers",
         lambda g, t, w: validate_buffers(g, t, w, device_type="cpu"),
     )
     library = ctypes.CDLL(str(host_library))

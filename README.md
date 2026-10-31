@@ -1,6 +1,9 @@
-# KVOP
+# KVIP
 
-公开契约实现版本：包 `0.3.0` / 契约 `3.0.0` / 设备 ABI `13`。
+独立远端：[CacheOS/KVIP](https://gitcode.com/CacheOS/KVIP)。Python 包为 `kvip`，
+distribution 为 `vllm-ascend-kvip`。本地目录已统一为 `KVIP`。
+公开契约实现版本：包 `0.4.0` / 契约 `3.0.0` / 设备 ABI `13`。
+开发、并列 submodule 与独立 demo 见 [DEVELOPMENT.md](DEVELOPMENT.md)。
 3.0 收紧 owner 租约与 Graph 回调协议；迁移和分级验收见 [符合性矩阵](docs/conformance.md)。
 独立仓实现说明见 [公开契约与生命周期](docs/public_contract.md)，原始执行需求见
 [implementation_prompt.md](docs/implementation_prompt.md)，完整处置与验证见
@@ -11,7 +14,7 @@
 host 回归通过或源码一致解读为生产功能/性能已无影响。
 
 ```bash
-python -m kvop.v9.contract_info
+python -m kvip.v9.contract_info
 python tools/run_conformance.py --tier cpu
 PYTHONPATH=. python tools/check_contract.py
 PYTHONPATH=. python tools/verify_baseline.py
@@ -23,14 +26,14 @@ PYTHONPATH=. python tools/verify_baseline.py
 `.git`。代码不依赖原框架 checkout；发布远端由使用方配置，本次不执行远端发布。
 
 ```text
-kvop/v9/                 Python API、ABI 13、缓存、布局适配、构建
+kvip/v9/                 Python API、ABI 13、缓存、布局适配、构建
 operators/v9/            生产设备源码及代码生成依赖
 operators/native_lidu/   原生 LIDU 的 OPP 和最小 Torch 注册
 tests/v9/                框架契约输入、独立校验、传输桩和 benchmark
 build.sh / env.sh        构建入口和可选 LIDU vendor 环境
 ```
 
-新增算子在 `kvop/`、`operators/`、`tests/` 下各增一个子目录即可。
+新增算子在 `kvip/`、`operators/`、`tests/` 下各增一个子目录即可。
 设备源码来源和迁入时 SHA256 见 `operators/v9/SOURCE.json`。
 V9 计算、预取、最终补取、Index 交换及 KVAF 默认策略保持迁入版本实现。
 
@@ -52,8 +55,8 @@ python3 tools/run_conformance.py --tier host
 
 ```bash
 python3 -m pip wheel --no-deps --no-build-isolation . -w dist
-python3 -m pip install dist/vllm_ascend_kvop-0.3.0-py3-none-any.whl
-python3 -c 'from kvop.v9 import ABI_VERSION, native_source; print(ABI_VERSION, native_source())'
+python3 -m pip install dist/vllm_ascend_kvip-0.4.0-py3-none-any.whl
+python3 -c 'from kvip.v9 import ABI_VERSION, native_source; print(ABI_VERSION, native_source())'
 ```
 
 `build.sh package` 只安装 Python 包。每种 B/Q/容量的设备库可提前构建：
@@ -65,7 +68,7 @@ bash build.sh v9 \
   --windows 4 --soc Ascend950DT_9574 \
   --cann /usr/local/Ascend/cann \
   --kvaf-include /path/to/KVAF/access_operator/demo/aiv_batch_get/include \
-  --build-dir /path/to/kvop-build
+  --build-dir /path/to/kvip-build
 ```
 
 核数取实际设备资源，SoC 按服务器填写。框架仍在图捕获前预构建，并按源文件、KVAF头文件、
@@ -86,7 +89,7 @@ source env.sh
 ## 公开接口和调用责任
 
 ```python
-from kvop.v9 import (
+from kvip.v9 import (
     Geometry, ContractLaunch, OwnedIndexCache, pack_query_heads,
     validate_request, build_library,
 )
@@ -125,7 +128,7 @@ pre-victim slots/bitmap、地址目录/valid、resident KV 输出池。
 ```mermaid
 sequenceDiagram
     participant F as vLLM-DSA
-    participant O as KVOP V9
+    participant O as KVIP V9
     participant T as KVAF
     participant D as QSFA/pre-victim
     F->>O: 预构建、Geometry、固定缓冲与 owned cache
@@ -215,9 +218,9 @@ QSFA 默认不构成本仓独立依赖，逐 token 的下游 payload 校验始�
 
 ## 框架使用
 
-在 vLLM-DSA 环境安装 `python3 -m pip install -e third_party/KVOP`。
-完整安装脚本已加入此步骤。框架的 `v9_backend`/`v9_graph` 改调 `kvop.v9`；
+在 vLLM-DSA 环境安装 `python3 -m pip install -e third_party/KVIP`。
+完整安装脚本已加入此步骤。框架的 `v9_backend`/`v9_graph` 改调 `kvip.v9`；
 请求调度、Graph bucket/边界、native 回退和禁用开关保持原位置。
-关闭 V9 不要求导入 KVOP。不要把本仓 native-lidu 测试扩展额外导入已注册 LIDU 的框架进程。
+关闭 V9 不要求导入 KVIP。不要把本仓 native-lidu 测试扩展额外导入已注册 LIDU 的框架进程。
 
 本地验证只覆盖 Host 与编译；eager/Graph、真实网络及性能必须在服务器复验。

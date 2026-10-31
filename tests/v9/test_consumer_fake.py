@@ -2,7 +2,7 @@ import inspect
 
 import pytest
 
-from kvop.testing.transport import FakeNpuRuntime, TimingContext
+from kvip.testing.transport import FakeNpuRuntime, TimingContext
 
 
 def make_fake(*, zero_task=False):

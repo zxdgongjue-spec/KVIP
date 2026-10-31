@@ -1,7 +1,7 @@
 """Deterministic packed-C8 payload; also usable by the CPU-only lifecycle model."""
 
 import numpy as np
-from kvop.v9.contract import TOKEN_BYTES
+from kvip.v9.contract import TOKEN_BYTES
 
 
 def payload(pool_layer, tokens):

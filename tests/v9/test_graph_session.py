@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from kvop.v9 import GraphFrameSession, SessionState
+from kvip.v9 import GraphFrameSession, SessionState
 
 
 def fixture(**overrides):

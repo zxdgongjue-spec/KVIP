@@ -2,7 +2,7 @@
 
 import pytest
 
-from kvop.v9 import pack_query_heads
+from kvip.v9 import pack_query_heads
 
 
 def inputs(heads, tokens=4):

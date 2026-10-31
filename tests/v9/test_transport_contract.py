@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from kvop.v9.transport import validate_graph_transport, validate_lease
+from kvip.v9.transport import validate_graph_transport, validate_lease
 
 
 def test_layout_uses_output_bytes_and_checks_actual_lease():

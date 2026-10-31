@@ -1,14 +1,16 @@
-# KVOP 3.0 公开接口契约
+# KVIP 3.0 公开接口契约
 
-包版本 0.3.0；公开契约 3.0.0；设备 ABI13；Graph transport ABI1；Index writer ABI2。
-来源为 vLLM-DSA `fae4597f7` 的 KVOP 子树，独立 Git 基线 `2f49ba0`。
+包版本 0.4.0；公开契约 3.0.0；设备 ABI13；Graph transport ABI1；Index writer ABI2。
+当前公开 import 为 kvip.v9，项目与目录统一使用 KVIP。历史提交不改写；名称迁移的
+基线校验单独归一化 Python namespace/品牌文本，设备 kernel 仍逐字节验证。
+来源为 vLLM-DSA `fae4597f7` 的 KVIP 子树，独立 Git 基线 `2f49ba0`。
 3.0 的不兼容变更仅涉及 host owner/Graph 回调与页面交接约束；2.0 consumer 必须
 更新后重新协商，不能仅替换 wheel。设备算法和结构不变。
 
 ## 支持范围与发现
 
 ```python
-from kvop.v9 import ContractRequirements, negotiate_contract, query_capabilities
+from kvip.v9 import ContractRequirements, negotiate_contract, query_capabilities
 
 capabilities = query_capabilities()  # 不 import torch/vllm/torch_npu/kvaf
 negotiate_contract(ContractRequirements(features=frozenset({"owned-index", "fixed-q4-graph"})))
@@ -26,17 +28,17 @@ ABI/size/offset/geometry 检查，也不能推断任意 KVAF runtime 与头文�
 Graph ABI 仅在请求 fixed-q4-graph 能力时协商，writer ABI 仅在请求 owned-index 时
 协商；eager-only consumer 不受未使用能力的 ABI 变化约束。
 
-`python -m kvop.v9.contract_info` 输出机器可读的完整能力与字段访问规则。
+`python -m kvip.v9.contract_info` 输出机器可读的完整能力与字段访问规则。
 `Geometry.tensor_spec/workspace_spec` 是当前 shape/dtype 机器规范；
 `tools/check_contract.py` 对实际 C++ header 编译并验证 Python 的全部字段偏移。
-框架稳定依赖仅为 `kvop.v9.__all__`：包含 Geometry、分配 workspace/cache、绑定 cache、
+框架稳定依赖仅为 `kvip.v9.__all__`：包含 Geometry、分配 workspace/cache、绑定 cache、
 query_device_resources、final_aivs、validate_lease 和 validate_graph_transport 等公开符号。
 `contract_info` 的 public_symbols 给出机器清单。内部模块路径不承诺兼容。
 
 ## Admission 与准备
 
 ```python
-from kvop.v9 import admit_request, validate_request
+from kvip.v9 import admit_request, validate_request
 
 result = admit_request(
     queries_per_request=4, candidate_lengths=[16384], resident_budgets=[12288],
@@ -77,7 +79,7 @@ V9 H0 继续包含正反映射一致的 victim 候选，阈值相等也保护；
 新 consumer 应在取得已校验且 idle 的 lease、构造 launcher 后建立 PreparedSession：
 
 ```python
-from kvop.v9 import PreparedSession
+from kvip.v9 import PreparedSession
 
 session = PreparedSession(launcher, stream=acquired_stream)
 session.enqueue()
@@ -133,7 +135,7 @@ mapping epoch=0 精确检查，未知 writer/溢出不能错误复用正 epoch�
 
 ## 桩、兼容与性能
 
-`kvop.testing.transport.FakeNpuRuntime` 为传统 adapter 的 CPU 九参消费桩，显式注册
+`kvip.testing.transport.FakeNpuRuntime` 为传统 adapter 的 CPU 九参消费桩，显式注册
 测试块、校验全局 descriptor 前缀并只复制有效目的行，保持 hit/tail；capture/NPU
 不允许进入该桩。zero_task 只证明编排，不能证明 payload 正确。`StubQueueOwner` 与
 DeferredTransport 用于独立 V9 session 的延迟完成/异常测试，不作为生产 provider。

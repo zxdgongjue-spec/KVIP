@@ -25,9 +25,9 @@ from contract_timing import (
     summarize_service_stages,
 )
 from contract_verify import score_workspace_diagnostic, snapshot, verify_skipped, verify_success
-from kvop.v9.contract import Status
-from kvop.v9.device_resources import query_device_resources
-from kvop.v9.geometry import final_aivs, li_geometry, native_kvaf_workers
+from kvip.v9.contract import Status
+from kvip.v9.device_resources import query_device_resources
+from kvip.v9.geometry import final_aivs, li_geometry, native_kvaf_workers
 from protocol import replay_contract
 
 
@@ -295,7 +295,7 @@ def run_cpu(a, g, arrays, scores, case, root):
 
 
 def build(a, g, root, resources, helper):
-    from kvop.v9 import native_source
+    from kvip.v9 import native_source
 
     source = native_source()
     if a.transport == "npu-memory":
@@ -343,7 +343,7 @@ def run_npu(a, g, arrays, scores, case, root):
 
     if a.transport == "npu-memory":
         from memory_session import MemorySession as ContractSession
-    from kvop.v9 import ContractLaunch
+    from kvip.v9 import ContractLaunch
 
     torch, registration, _ = helper._load_native_operators("c8_offload")
     if a.qsfa == "required" and getattr(torch.ops._C_ascend, "npu_dsa_a5_sparse_tail_attention_c8", None) is None:
@@ -496,8 +496,8 @@ def run_npu(a, g, arrays, scores, case, root):
         phase_samples = []
         device_samples = []
         lifecycle = Lifecycle(g) if a.state_mode == "stateful" else None
-        from kvop.v9.index_cache import allocate_cache
-        from kvop.v9.owned_index_cache import OwnedIndexCache
+        from kvip.v9.index_cache import allocate_cache
+        from kvip.v9.owned_index_cache import OwnedIndexCache
 
         cache_pool, layouts = {}, {}
         owned_pool, owned_payload_seed = {}, {}

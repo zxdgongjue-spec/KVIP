@@ -13,7 +13,7 @@ from contract_reference import (
     select_topk,
     validate_equal_values,
 )
-from kvop.v9.contract import TOPK, Status
+from kvip.v9.contract import TOPK, Status
 
 
 def seed_output(arrays, g):

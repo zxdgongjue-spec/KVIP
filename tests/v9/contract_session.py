@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 from contract_payload import payload
-from kvop.v9.contract import TOKEN_BYTES, TOPK
+from kvip.v9.contract import TOKEN_BYTES, TOPK
 
 
 def _base_class():

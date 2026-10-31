@@ -16,7 +16,7 @@ def native_source():
     packaged = here / "_native"
     source = packaged if packaged.is_dir() else here.parents[1] / "operators" / "v9"
     if not (source / "CMakeLists.txt").is_file():
-        raise RuntimeError("KVOP device sources are missing; reinstall the complete KVOP wheel")
+        raise RuntimeError("KVIP device sources are missing; reinstall the complete KVIP wheel")
     return source
 
 

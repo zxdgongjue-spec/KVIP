@@ -1,10 +1,16 @@
-# 本地验证记录
+# 当前开发交付
+
+现行包 0.4.0 / import kvip / 公开契约 3.0.0。源码 CPU 349 项、纯 host 252 项通过，
+框架 editable 接线 103 项通过；运行方式见 DEVELOPMENT.md，机器记录见 manifests/validation.json。
+以下内容保留历史上下文；CPU 或 source-only 证据不代替 NPU/KVAF/Graph/模型资格。
+
+## 历史本地验证记录
 
 日期：2026-10-30。此记录不代表 NPU 上板或真实性能验收。
 
 | 检查 | 结果 |
 | --- | --- |
-| 独立 KVOP pytest，WSL CPU Torch | 42 passed |
+| 独立 KVIP pytest，WSL CPU Torch | 42 passed |
 | wheel 安装到框架之外，Windows 无 Torch | 40 passed，2 个 Torch CPU 用例 skipped |
 | 框架原有 eager/Graph/ABI13/QSFA loader Host 回归 | 86 passed |
 | CPU benchmark CLI full suite | 11/11 pass；data_record.md 7666字符 |
@@ -20,7 +26,7 @@
 测试传输库编译 SHA256：
 `4807baa43985155c91aca05e45573f6f151018fa610545c429a5254b99602d98`
 
-交叉编译位于 WSL 的 `/path/to/workspace`，使用 ASCII 源码/构建目录。
+历史交叉编译使用 WSL 的 ASCII 源码/构建目录，原始路径保留在对应 Git 历史中。
 二进制及服务器输出不纳入源码仓。测试库不是生产性能库。
 
 服务器仍需执行 README 中的 NPU 内存桩、真实 KVAF eager/Graph、跨步/跨层/换序/源改写，

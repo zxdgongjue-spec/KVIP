@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from kvop import __version__
+from kvip import __version__
 
 from .contract import ABI_VERSION, BLOCK_TOKENS, TOKEN_BYTES, TOPK
 
@@ -115,5 +115,5 @@ def negotiate_contract(requirements=None, *, provider=None) -> Capabilities:
     )
     for supported, field in checks:
         if not supported:
-            raise ContractMismatchError(f"KVOP incompatible {field}")
+            raise ContractMismatchError(f"KVIP incompatible {field}")
     return provider

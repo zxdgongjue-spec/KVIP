@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "package_version": "0.3.0",
+  "package_version": "0.4.0",
   "public_contract_version": "3.0.0",
   "profile": "v9-fused-selection",
   "device_abi": 13,
@@ -15,6 +15,10 @@
     "topk": 2048
   },
   "required_sdk_policy": "runtime and device headers must match; validate prepared binary and lease",
+  "kvaf_source_candidate": "7c54bd5f9d49fb78943a80ed398764053f52e7d8",
+  "kvaf_repository": "https://gitcode.com/CacheOS/KVAF.git",
+  "source_layout": "framework has parallel KVIP/KVAF submodules; standalone KVIP uses external KVAF",
+  "framework_graph_bridge": "framework-owned patch in a hashed build-source overlay; raw KVAF lacks frame APIs",
   "hardware_certified": false,
   "npu_memory": "pending",
   "kvaf_eager_graph": "pending",

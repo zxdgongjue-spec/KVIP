@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 from contract_fixture import make_fixture, to_device
 
-from kvop.v9 import (
+from kvip.v9 import (
     ABI_VERSION,
     CONTRACT_VERSION,
     ContractMismatchError,
@@ -24,13 +24,13 @@ from kvop.v9 import (
     query_capabilities,
     validate_request,
 )
-from kvop.v9.contract import DeviceContract, allocate_workspace, validate_buffers
-from kvop.v9.index_cache import allocate_cache, bind_caches
+from kvip.v9.contract import DeviceContract, allocate_workspace, validate_buffers
+from kvip.v9.index_cache import allocate_cache, bind_caches
 
 
 def test_machine_manifest_and_public_modules_have_no_reverse_framework_dependency():
-    import kvop
-    from kvop.v9.contract_info import describe_contract
+    import kvip
+    from kvip.v9.contract_info import describe_contract
 
     manifest = json.loads(
         (
@@ -42,7 +42,7 @@ def test_machine_manifest_and_public_modules_have_no_reverse_framework_dependenc
     assert manifest["package_version"] == info["package_version"]
     assert manifest["device_abi"] == info["device_abi"]
     assert manifest["hardware_certified"] is False
-    for path in Path(kvop.__file__).parent.rglob("*.py"):
+    for path in Path(kvip.__file__).parent.rglob("*.py"):
         if "_native" in path.parts:
             continue
         for node in ast.walk(ast.parse(path.read_text())):
@@ -72,7 +72,7 @@ def test_discovery_is_immutable_independent_and_has_no_implicit_certification():
         [
             sys.executable,
             "-c",
-            "from kvop.v9 import query_capabilities; import sys; "
+            "from kvip.v9 import query_capabilities; import sys; "
             "query_capabilities(); assert not any(n == 'torch' or n.startswith(('torch_npu','vllm','kvaf')) "
             "for n in sys.modules)",
         ],

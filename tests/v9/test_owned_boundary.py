@@ -3,7 +3,7 @@
 import pytest
 from contract_fixture import make_fixture, to_device
 
-from kvop.v9 import OwnedIndexCache
+from kvip.v9 import OwnedIndexCache
 
 
 def owned_fixture(length=16380):

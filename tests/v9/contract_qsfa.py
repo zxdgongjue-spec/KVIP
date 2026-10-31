@@ -2,7 +2,7 @@
 
 import numpy as np
 from contract_payload import payload, unpack
-from kvop.v9.contract import TOPK
+from kvip.v9.contract import TOPK
 
 
 def check_qsfa(torch, tensors, geometry, before, after):
