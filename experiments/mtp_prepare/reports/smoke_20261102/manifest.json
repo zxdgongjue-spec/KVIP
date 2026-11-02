@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "scope": "CANN_Ascend950_simulator_only",
+  "warmup": 0,
+  "active": 1,
+  "profile_enabled": 1,
+  "variants": [
+    {
+      "name": "v0_base",
+      "path": "variants/v0_base",
+      "revision": "94968bf38cd89db48b0d433d916354c5ffd83a4d",
+      "description": "Historical V0, kernel byte-identical to current KVIP native baseline",
+      "role": "baseline",
+      "scope": "normal <=2048; known cursor oracle failure above2048",
+      "source_sha256": {
+        "a5_lidu_fused_batch_get_prepare_mtp.cpp": "8c26398faa70f30f2c514593767eec2a16beeb99791b04fe87e9c0bec376894b",
+        "a5_lidu_fused_batch_get_prepare_mtp_tiling.h": "a1067bb34786a6e7d1b7ab8889a5a53a27249f6dc48ecda8e705f60bd6cc830f",
+        "a5_lidu_fused_batch_get_prepare_mtp_vector.h": "39d3ba268478103db039324f7834b2f89c094c2e524cd3d26c1bb9a9baaea057"
+      },
+      "implementation_sha256": "6fd5e74868c9a798fb51dc923e6e37d0dbab21c68aa160e1a8cfb8ad636c81a1",
+      "binary_sha256": "dda75737a8a50aa680a7fa388f779c802ec0cc1499a35c856bd046bba3361d10"
+    },
+    {
+      "name": "v2_low",
+      "path": "variants/v2_low",
+      "revision": "3929ee4eac9bb66b82260b4491bfbeee5692d5a9",
+      "migration_revision": "d179d70e179aa51d8106c034f0297c136fb52433",
+      "description": "Classify/compact fusion plus output/descriptor overlap; low-miss best",
+      "role": "candidate",
+      "scope": "normal <=2048; same kernel payload as latest migrated P2-low",
+      "source_sha256": {
+        "a5_lidu_fused_batch_get_prepare_mtp.cpp": "b697558558c4d34f7fc07c5da05d3d880c182ef71ac7398dce4be0830f5ce882",
+        "a5_lidu_fused_batch_get_prepare_mtp_tiling.h": "a1067bb34786a6e7d1b7ab8889a5a53a27249f6dc48ecda8e705f60bd6cc830f",
+        "a5_lidu_fused_batch_get_prepare_mtp_vector.h": "39d3ba268478103db039324f7834b2f89c094c2e524cd3d26c1bb9a9baaea057"
+      },
+      "implementation_sha256": "8de3ecf5220850532baafde9e990e305422f4b1e411e4647a63348e3d7b50dbf",
+      "binary_sha256": "8989fddc93922d52e974512cc6fcaeff31f69bb5d274a3f9657fda87d491e5ea"
+    }
+  ],
+  "cases": [
+    {
+      "name": "b1_q4_m300",
+      "batch": 1,
+      "query_count": 4,
+      "unique_misses": 300,
+      "source_capacity": 131072,
+      "cache_tokens": 12288,
+      "seed": 20261029,
+      "query_counts": [
+        4
+      ],
+      "miss_counts": [
+        300
+      ],
+      "used_cores": 8,
+      "cores_per_request": 8,
+      "packed_queries": 4,
+      "pool_size": 4,
+      "input_sha256": {
+        "actual_seq_lengths_query.bin": "fb5e512425fc9449316ec95969ebe71e2d576dbab833d61e2a5b9330fd70ee02",
+        "cache_tokens.bin": "9cd7985384eb6927c87e44c0f300203f51fdee284d96f7804d664f21b1f3e074",
+        "candidate_lens.bin": "313588ae36b23498c072b8718f9a3614d9e52b444cdcea74ecd49c93044741b3",
+        "config.txt": "c143ae8484bd4bf718cb8ee32498ebe5c49002ca5918dc4d826c359124ab6ffb",
+        "eviction_cursors.bin": "9931e36a27597d6321f4cbc725e0455d9a4ee01fb3b0a4945a78e29b931f9826",
+        "logical_seq_lengths.bin": "313588ae36b23498c072b8718f9a3614d9e52b444cdcea74ecd49c93044741b3",
+        "miss_slot_bitmap.bin": "587bdc3ce7c23dca28f7d4d5efeff3b305cb63028f112de57227949c219fb40b",
+        "miss_slots.bin": "438a3090df97fbaa9a680437a90d0fbc0af68e5dfff90032650f57cfb9c87df2",
+        "req_pool_entries.bin": "26b25d457597a7b0463f9620f666dd10aa2c4373a505967c7c8d70922a2d6ece",
+        "resident_block_table.bin": "36002996567bd47e4629bf4ed1615bf84a5ec211a7d483f75bead6297768cdf4",
+        "slot_to_token_pool.bin": "8c0cad6edcc832724b0ed77ad0706340159dacbc3aaaa14619ae37612003faa4",
+        "token_to_slot_pool.bin": "5715a362b86e91b5b7e7e13b384c58e1794884f0bc7b25e2a2da622914775e1e",
+        "topk.bin": "9aaa6ad5e241c58bf881e330f561eb5b36c882d84f59d4a6229f7d52f5c3927d"
+      }
+    }
+  ],
+  "bundle_manifest_sha256": "5b03ae816d46af851388728cd788607d322bbdae05d8d234687753a7ca5ede41",
+  "runner_sha256": "d0086b9286fdada7c50842a85a56eed55d2d97bf04f187be5c9277ea9c2b7b12",
+  "case_file_sha256": "76ecf7ee441b77123069f63740f2abbe9277f9dcf54ff98ff986bb7ce3ef4e07",
+  "harness_sha256": {
+    "CMakeLists.txt": "bf8936597c2ac6bf53de6eddefc704afe184853d5d1c6d336e74556c5c7bbbf9",
+    "kernel.cpp": "92bb73746ad7ee2c8c94fffd3d48c920f723c44884f077de67dd233c12053189",
+    "main.cpp": "16c982f12b3fefe8db6b21a97c912fa4f978a3491fb5c3dd94485cb41c5609e1"
+  },
+  "oracle_sha256": "ca50a4b1cccd722055799738850d7e4ea756e4e7af3f4f128e290710418c00be",
+  "container_image": "quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.12",
+  "container_repo_digests": [
+    "quay.io/ascend/cann@sha256:556cd79602b2bd97b1d19652432601b9a18e04133a70731c395d44929fc21b8b"
+  ]
+}

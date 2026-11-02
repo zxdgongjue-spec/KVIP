@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "status": "pass",
+  "scope": "CANN_Ascend950_simulator_only",
+  "physical_npu_executed": false,
+  "network": false,
+  "device_CQ_executed": false,
+  "warmup": 0,
+  "active": 2,
+  "best_variant_by_case": {},
+  "results": [
+    {
+      "variant": "v2_low",
+      "revision": "3929ee4eac9bb66b82260b4491bfbeee5692d5a9",
+      "case": "b1_q4_m1",
+      "correctness": "pass",
+      "error": "",
+      "batch": 1,
+      "query_counts": [
+        4
+      ],
+      "miss_counts": [
+        1
+      ],
+      "verified_samples": 2,
+      "sample_coverage": "all_active_samples",
+      "reference_variant": "v0_base",
+      "improvement_vs_reference_pct": null
+    }
+  ]
+}
