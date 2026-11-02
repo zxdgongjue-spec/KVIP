@@ -5,15 +5,15 @@
 
 ## 交付边界
 
-独立仓：`/path/to/KVIP`，分支 `codex/public-contract-isolation`。
+独立算子实现位于本仓根目录；框架消费路径为 vLLM-DSA 的 `third_party/KVIP`。
 源基线 vLLM-DSA `fae4597f7`，提取子树提交 `2f49ba0e140311aa8efd40dbb539b1169b959747`。
 完整任务 Prompt 见 [implementation_prompt.md](implementation_prompt.md)。
 独立仓的公开规范见 [public_contract.md](public_contract.md)，审计输入与原稿保存在
-`docs/design_reference/`，它们描述修改前基线，当前状态以本报告为准。
+[设计与审计输入](design_reference/README.md)，它们描述修改前基线；后续状态以
+[扩展验收报告](extension_report.md) 和 [机器验证记录](../manifests/validation.json) 为准。
 
-框架适配位于 `/path/to/vLLM-DSA`，
-原 `/path/to/vLLM-DSA` 的分支和生产代码未改动。
-本次代码是可验证的候选实现，尚未合入、启用或发布到生产环境。
+第一轮框架适配以隔离候选实现进行验证，没有自动启用生产配置。
+本文保留该阶段的验收边界；当前获取与联调方式见 [开发说明](../DEVELOPMENT.md)。
 
 ## 未实现项的处置与修改合理性
 
@@ -71,7 +71,7 @@ host suite 88 passed，均无跳过。五项审计 probe gap flag 全为 false�
 
 一次 CPU-only 微基准结果：baseline dispatch 约 1.88 us，强 session 约 3.33 us，
 增量约 1.45 us/次。它不包含真实 tensor、kernel、网络与 TPOT，既不能证明设备回归，
-也不能支持“零开销”。因此未将本次适配应用到原主工作区或生产配置。
+也不能支持“零开销”。该阶段没有据此启用生产配置。
 
 `hardware_certified=False` 和 `production_promotion=blocked_pending_hardware_and_performance_qualification`
 保持明确；要求硬件已认证的 negotiation 会拒绝。完整验收流程见

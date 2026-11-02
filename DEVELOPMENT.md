@@ -2,7 +2,7 @@
 
 远端为 https://gitcode.com/CacheOS/KVIP.git；Python import 为 `kvip`，distribution
 为 `vllm-ascend-kvip`。包版本 0.4.0、公开契约 3.0.0、设备 ABI13。
-现行代码/目录已统一名称，历史 Git 提交与提取基线保留，不重写历史。
+现行代码/目录已统一名称，源码保持验证以仓库内提取基线为准。
 
 ## 独立仓开发
 

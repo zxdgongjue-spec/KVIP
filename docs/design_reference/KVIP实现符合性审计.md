@@ -31,7 +31,7 @@ admission、全面别名校验与可独立约束的 owner/session 协议。不�
 | C10 执行顺序 | 已符合机制 | execute 在 launch 前 mark maps/in_flight；fetch 核验后发布 | 独立 session 强化与真实设备顺序证明 |
 | C11 owner/transport | 部分符合 | 框架 owner/测试 owner 各自实现；注册范围/queue 结构 packer | 正式协议、stream/in_flight 的独立 API 约束 G04 |
 | C12 Index/epoch | 已符合主要机制 | OwnedIndexCache、framework writer、MappingVersions、restore/grow | 页面替换等边界专项覆盖 G06 |
-| C13 Graph | 部分符合，设备待验 | 预构建、固定 bucket、rebind、dummy、guard、begin/end | 本机 Graph host 模块无 Torch 跳过；真实 replay 验收 G09 |
+| C13 Graph | 部分符合，设备待验 | 预构建、固定 bucket、rebind、dummy、guard、begin/end | 审计环境中 Graph host 模块因缺 Torch 跳过；真实 replay 验收 G09 |
 | C14 传统 descriptor | 集成存在；V9 内部不适用 | `ops_nanovllm`、prepare `_out`、`KvafAdapter.execute_batch_get` | 独立 legacy consumer fake/signature 测试 G07 |
 | C15 attention | 框架范围，非 V9 包缺陷 | metadata 只写 slots，QSFA C8 八参 wrapper | timing context 仍是旧行为；单独抽取时再改 G08 |
 | C16 分层测试 | 部分符合 | host oracle/transport、memory 库隔离测试、NPU/真实 KVAF CLI | 真实设备与服务级验收 G09 |
@@ -159,7 +159,7 @@ native MTP 对照，QSFA/其他 legacy 留在框架不是 V9 违反职责边界�
 
 ### G09 设备、Graph 与真实网络验收未闭环 P0 发布门槛
 
-本机 KVIP host suite 为 40 passed/2 skipped；framework 相关 host suite 为
+该阶段审计环境的 KVIP host suite 为 40 passed/2 skipped；framework 相关 host suite 为
 49 passed/5 skipped，其中 Graph host 模块整体因 torch 缺失跳过。这是 pytest
 计数口径，不能解释为“仅五个 Graph 分支没执行、其他 Graph 分支均通过”。
 
@@ -177,8 +177,8 @@ eager execute 创建 row_modes/profile/index_table、输出和 Index pointer/dir
 
 ### G11 发布/事实源尚未统一 P1
 
-KVIP 是可独立 wheel 的普通目录，未配置独立远端；旧 csrc V9 和上一轮本地
-ascend-dsa-fused-ops 不是生产第二入口。以 KVIP 为主线，定义 tag、兼容矩阵、构建
+该阶段 KVIP 是可独立 wheel 的普通目录，尚未配置独立远端；旧 csrc V9 和历史实验目录
+不是生产第二入口。以 KVIP 为主线，定义 tag、兼容矩阵、构建
 manifest 与不可变 release；历史实现只读或生成镜像。先形成机器规范再生成契约文档，
 避免文档、Python、C++ 结构三处手改；保留现有 schema/offset 运行检查。
 
@@ -212,7 +212,7 @@ PYTHONPATH=third_party/KVIP python3 "$probe"
 extra counts alias、extra slots alias、Index cache 区间重叠、零候选长度和 B33。
 脚本不分配设备缓冲，不执行设备 kernel，不修改生产逻辑；未来补齐后对应 flag 应为 false。
 
-完整 `bash format.sh ci` 在本机缺少 pre-commit；文档链接/镜像一致性、探针 Ruff 和
+该阶段审计环境因缺少 pre-commit 未完成 `bash format.sh ci`；文档链接/镜像一致性、探针 Ruff 和
 修改文件空白检查单独进行，不记为全仓格式检查通过。
 
 ## 7. 推荐实施顺序

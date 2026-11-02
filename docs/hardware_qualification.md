@@ -1,6 +1,6 @@
 # 生产合入前的硬件验收
 
-当前主工作区没有激活本次框架适配。以下测试在匹配 SDK/SoC 的 A5 环境完成后才允许
+框架适配须通过生产资格验收。以下测试在匹配 SDK/SoC 的 A5 环境完成后才允许
 声明真实功能/性能无影响。CPU oracle、source diff、memory 桩均不能替代此门槛。
 
 1. 按根 README 构建基线与候选，固定相同 CANN/KVAF/SoC、AIC、B/Q/C/S、窗口、

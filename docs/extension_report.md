@@ -1,11 +1,12 @@
 # 契约 3.0 扩展与验收报告
 
 本页保留 0.3 阶段的历史记录。现行 0.4.0 已统一 KVIP/kvip 命名，采用并列 submodule
-和 editable 联调；最新命令见 ../DEVELOPMENT.md，实际结果见 ../manifests/validation.json。
+和 editable 联调；最新命令见 [开发说明](../DEVELOPMENT.md)，实际结果见
+[机器验证记录](../manifests/validation.json)。
 名称迁移后的保护比较明确记录 namespace 归一化，不再声称全部 Python 文件原始字节相同。
 
 本轮执行需求见 extension_prompt.md，生效规范见 public_contract.md，逐环节覆盖见
-conformance.md。完整命令结果与安装产物状态见 manifests/validation.json；本报告不
+conformance.md。完整命令结果与安装产物状态见 [机器验证记录](../manifests/validation.json)；本报告不
 将 CPU 验证转换为硬件认证。第一轮报告保留为 implementation_report.md。
 
 ## 已补齐的差异
@@ -35,7 +36,7 @@ Graph transport ABI1、Index writer ABI2、设备源码、packing、geometry、b
 框架分别使用镜像源码与非 editable 的 site-packages 安装包执行 103 项
 CPU 逻辑/接线场景，工具本身另有 5 项回归。C++ descriptor 为 528 bytes，全部 74
 字段偏移匹配；源基线 44 host 用例一致。纯 host 明确排除 Torch 依赖后 190 passed、
-4 deselected、0 skipped。最终机器记录见 validation.json。
+4 deselected、0 skipped。最终机器记录见 [validation.json](../manifests/validation.json)。
 
 真实 ContractLaunch 测试使用实际 Torch Tensor/schema、实际指针与 geometry packing，
 编译 C++ host shim 并经 ctypes 调用；shim 不计算 LI、执行 DMA 或模拟网络时间。
@@ -43,17 +44,17 @@ CPU 逻辑/接线场景，工具本身另有 5 项回归。C++ descriptor 为 52
 测试实际 backend/graph/config/contracts 和公开 KVIP，仍不等于运行完整 vllm serve。
 
 新增 CPU 页快照、锁和状态校验有 host 成本。一次 CPU dispatch 对照新增约 6.83 us，
-仅记录本机 Python 开销，不能推断 TPOT；稳定 page_ids 的同长检查及页内增长复用
+仅记录该验证环境的 Python 开销，不能推断 TPOT；稳定 page_ids 的同长检查及页内增长复用
 私有页表，不增加 table.clone 设备拷贝。NPU memory、真实 SDK/SoC 构建、KVAF/SQ/CQ/Graph、跨 rank、
 QSFA/模型 accuracy、端到端 TPOT/尾延迟和 allocator 实际页面交接仍为 hardware-pending。
 
-本机已执行相关 Ruff、空白检查；完整框架 format.sh ci 因缺 pre-commit 失败。
+该阶段已执行相关 Ruff、空白检查；完整框架 format.sh ci 因缺 pre-commit 失败。
 model_runner_v1.py 的 6 项全文件 Ruff 问题在 HEAD 基线已有，本轮新增 metadata hook
 没有增加这些问题；未顺带改写无关代码。不得将完整仓格式检查描述为通过。
 
 ## 交付位置
 
-独立仓 `/path/to/KVIP`，候选框架
-`/path/to/vLLM-DSA`。原主工作区生产代码
-未合入、未启用。独立 Git 保留提取基线、已 sign-off 的本地实现历史及 bundle；远端未发布。
-框架生产启用前必须执行 hardware_qualification.md，不能以本轮 CPU 结果自动认证。
+独立算子实现以本仓为交付根目录，框架通过 `third_party/KVIP` 消费。
+当前源码获取、版本固定和 editable 联调方式见 [开发说明](../DEVELOPMENT.md)；
+历史测试数量以本报告记录的阶段为准，最新结果以机器验证记录为准。
+框架生产启用前必须执行 [硬件验收](hardware_qualification.md)，不能以本轮 CPU 结果自动认证。
