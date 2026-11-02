@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "status": "pass",
+  "scope": "CANN_Ascend950_simulator_only",
+  "physical_npu_executed": false,
+  "network": false,
+  "device_CQ_executed": false,
+  "warmup": 0,
+  "active": 1,
+  "best_variant_by_case": {
+    "b1_q4_m300": "v2_low"
+  },
+  "results": [
+    {
+      "variant": "v0_base",
+      "revision": "94968bf38cd89db48b0d433d916354c5ffd83a4d",
+      "case": "b1_q4_m300",
+      "correctness": "pass",
+      "error": "",
+      "batch": 1,
+      "query_counts": [
+        4
+      ],
+      "miss_counts": [
+        300
+      ],
+      "verified_samples": 1,
+      "sample_coverage": "all_active_samples",
+      "active_total_cycles": [
+        61913
+      ],
+      "median_total_cycles": 61913.0,
+      "min_total_cycles": 61913,
+      "max_total_cycles": 61913,
+      "median_membership_cycles": 50.0,
+      "median_classify_cycles": 16920.0,
+      "median_compact_cycles": 9329.0,
+      "median_dedup_cycles": 4736.0,
+      "median_slot_select_cycles": 0.0,
+      "median_clear_cycles": 5157.0,
+      "median_install_cycles": 3243.0,
+      "median_refill_cycles": 3228.0,
+      "median_descriptor_cycles": 3962.0,
+      "median_unique_miss_count": 300.0,
+      "median_raw_miss_count": 441.0,
+      "host_microseconds_diagnostic": [
+        114028916.553
+      ],
+      "profile_shape": [
+        1,
+        1,
+        8,
+        32
+      ],
+      "trace": "traces/v0_base__b1_q4_m300.json",
+      "reference_variant": "v0_base",
+      "improvement_vs_reference_pct": 0.0
+    },
+    {
+      "variant": "v2_low",
+      "revision": "3929ee4eac9bb66b82260b4491bfbeee5692d5a9",
+      "case": "b1_q4_m300",
+      "correctness": "pass",
+      "error": "",
+      "batch": 1,
+      "query_counts": [
+        4
+      ],
+      "miss_counts": [
+        300
+      ],
+      "verified_samples": 1,
+      "sample_coverage": "all_active_samples",
+      "active_total_cycles": [
+        53920
+      ],
+      "median_total_cycles": 53920.0,
+      "min_total_cycles": 53920,
+      "max_total_cycles": 53920,
+      "median_membership_cycles": 57.0,
+      "median_classify_cycles": 16233.0,
+      "median_compact_cycles": 2560.0,
+      "median_dedup_cycles": 5894.0,
+      "median_slot_select_cycles": 0.0,
+      "median_clear_cycles": 5158.0,
+      "median_install_cycles": 3598.0,
+      "median_refill_cycles": 2635.0,
+      "median_descriptor_cycles": 3250.0,
+      "median_unique_miss_count": 300.0,
+      "median_raw_miss_count": 441.0,
+      "host_microseconds_diagnostic": [
+        104311413.131
+      ],
+      "profile_shape": [
+        1,
+        1,
+        8,
+        32
+      ],
+      "trace": "traces/v2_low__b1_q4_m300.json",
+      "reference_variant": "v0_base",
+      "improvement_vs_reference_pct": 12.910051200878648
+    }
+  ]
+}
