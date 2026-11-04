@@ -32,8 +32,10 @@ constexpr uint32_t TRUNK_LEN_6K = 6144;
 template <typename QLIT>
 class QLIVector {
 public:
+    rotating::RuntimeShape runtimeShape_;
     __aicore__ inline void SetRotationContext(GM_ADDR p) {
         rotationContext_ = p;
+        runtimeShape_ = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(p));
         rotationProgressGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(
             reinterpret_cast<__gm__ rotating::Context*>(p)->progress));
     }
@@ -41,7 +43,7 @@ public:
         // Prefix scores have been published; this 4KB output is dead until final TopK.
         PipeBarrier<PIPE_ALL>();
         rotationProgress_ = scoreOutLocal_.template ReinterpretCast<uint32_t>();
-        rotationProgressBase_ = (SIM_RESIDENT / 128 / 64) * 64;
+        rotationProgressBase_ = (runtimeShape_.resident / 128 / 64) * 64;
         rotating::PrepareProgress(reinterpret_cast<__ubuf__ uint32_t*>(rotationProgress_.GetPhyAddr()), rotationProgressBase_);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
         WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
@@ -49,7 +51,7 @@ public:
     __aicore__ inline void RotateFetch(uint32_t epoch) {
         // Join this producer's hit publication. Other producers remain free.
         PipeBarrier<PIPE_ALL>();
-        rotating::Service(rotationContext_, epoch, blockId_ / 2, blockId_ % 2,
+        rotating::Service(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.splitQ,runtimeShape_.rounds,runtimeShape_.serviceAics,runtimeShape_.serviceLanes,runtimeShape_.tokenBytes,runtimeShape_.postThreads,runtimeShape_.postBank,runtimeShape_.batchedRows,runtimeShape_.scanTokens,rotationContext_, epoch, blockId_ / 2, blockId_ % 2,
             topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_);
     }
 
@@ -67,7 +69,7 @@ public:
     __aicore__ inline void ProcessTopK(const QLICommon::RunInfo &info);
     __aicore__ inline void SetPrefixStorage(GM_ADDR output) { prefixOutput_ = output; }
     __aicore__ inline void ProcessResidentTopK(QLICommon::RunInfo info) {
-        info.actS2Size = SIM_RESIDENT;
+        info.actS2Size = runtimeShape_.resident;
         prefixActive_ = true;
         ProcessTopK(info);
         prefixActive_ = false;
@@ -159,10 +161,10 @@ private:
             GlobalTensor<uint32_t> victims;
             victims.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(context->lruSlots) + batch * 2048);
             GlobalTensor<uint8_t> bitmap;
-            bitmap.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(context->hits) + query * (SIM_HISTORY / 4));
+            bitmap.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(context->hits) + query * (runtimeShape_.history / 4));
             uint32_t validEnd = context->queryEnds ?
-                reinterpret_cast<__gm__ uint32_t*>(context->queryEnds)[query] : SIM_HISTORY;
-            if (validEnd > SIM_RESIDENT) validEnd = SIM_RESIDENT;
+                reinterpret_cast<__gm__ uint32_t*>(context->queryEnds)[query] : runtimeShape_.history;
+            if (validEnd > runtimeShape_.resident) validEnd = runtimeShape_.resident;
             DataCopy(reservedChunk.template ReinterpretCast<uint32_t>(), victims, 2048);
             SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
             Simt::VF_CALL<rotating::GatherVictimScores>(Simt::Dim3{256,1,1},
@@ -185,7 +187,7 @@ private:
         }
         SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
         auto ready = reinterpret_cast<__gm__ uint32_t*>(context->progress)+query*32;
-        ready[0]=SIM_RESIDENT;
+        ready[0]=runtimeShape_.resident;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ready),128);
 
     }
@@ -516,7 +518,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     auto qkBase = resMm1UB_[pingpong * (UB_BANK_STRIDE / sizeof(float))];
     auto qkVLstride = (UB_BANK_DEPTH_STRIDE / sizeof(float)) / 2 * constInfo_.mBaseSize;
 
-    if (curS2Idx >= SIM_RESIDENT) {
+    if (curS2Idx >= runtimeShape_.resident) {
     vector1::BatchClassifyScore(outBase, UB_BANK_DEPTH_STRIDE / sizeof(SCORE_T),
                                         qkBase, qkVLstride, (uint32_t)(gSize_ * UB_BANK_DEPTH_STRIDE / sizeof(float)),
                                         weightBase, UB_BANK_DEPTH_STRIDE / sizeof(W_T), weightFloatBase,
@@ -551,22 +553,22 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     copyOutParams.dstStride = (QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_) - s2BaseSize_) * sizeof(SCORE_T);
     DataCopyPad(scoreGm[vec1OutGmOffset], outBase, copyOutParams);
 #if SIM_CAPTURE_HITS
-    if (curS2Idx >= SIM_RESIDENT) {
+    if (curS2Idx >= runtimeShape_.resident) {
         constexpr uint32_t prefixBytes = SIM_Q * 2048 * 6 + SIM_Q * 256;
         GlobalTensor<uint8_t> outputHits;
-        outputHits.SetGlobalBuffer((__gm__ uint8_t *)(prefixOutput_ + SIM_BATCH * prefixBytes));
+        outputHits.SetGlobalBuffer((__gm__ uint8_t *)(prefixOutput_ + runtimeShape_.batch * prefixBytes));
         DataCopyExtParams hitCopy;
         hitCopy.blockCount = curAivS1ProcNum;
         hitCopy.blockLen = 32;
         hitCopy.srcStride = 7; // classifyUB query stride is 256 bytes.
-        hitCopy.dstStride = SIM_HISTORY / 4 - 32;
-        DataCopyPad(outputHits[(info.bIdx * SIM_Q + curAivS1Idx) * (SIM_HISTORY / 4) + curS2Idx / 4],
+        hitCopy.dstStride = runtimeShape_.history / 4 - 32;
+        DataCopyPad(outputHits[(info.bIdx * SIM_Q + curAivS1Idx) * (runtimeShape_.history / 4) + curS2Idx / 4],
                     classifyUB_[pingpong * 256].template ReinterpretCast<uint8_t>(), hitCopy);
     }
 #endif
 
-    if (curS2Idx >= SIM_RESIDENT && ((info.s2Idx + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
-        rotating::IsTrigger(info.s2Idx + 1))) {
+    if (curS2Idx >= runtimeShape_.resident && ((info.s2Idx + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
+        rotating::IsTrigger(runtimeShape_.history,runtimeShape_.resident,runtimeShape_.rounds,info.s2Idx + 1))) {
         const uint32_t tableBase = (info.s2Idx / 64) * 64;
         if (tableBase != rotationProgressBase_) {
             SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
@@ -631,7 +633,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         validS2Len = constInfo_.attenMaskFlag ? static_cast<int32_t>(i) + cuRealAcSeq : cuRealAcSeq;
         // Causal ProcessTopK derives its bound from actS2SizeOrig, overriding
         // ProcessResidentTopK's actS2Size. Only resident scores exist here.
-        if (prefixActive_) validS2Len = Min(validS2Len, static_cast<int32_t>(SIM_RESIDENT));
+        if (prefixActive_) validS2Len = Min(validS2Len, static_cast<int32_t>(runtimeShape_.resident));
         auto rotationContext = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
         if (rotationContext->queryEnds) {
             uint32_t query = info.bIdx * SIM_Q + curS1Idx + rowIdx;

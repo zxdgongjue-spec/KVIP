@@ -2,11 +2,10 @@
 #if defined(__CCE_AICORE__)
 #include "context.h"
 struct QLITilingData {
-    uint32_t bSize=SIM_BATCH,tSize=SIM_BATCH*4,gSize=INDEX_HEADS,s1Size=4,s2Size=SIM_HISTORY;
-    uint32_t sparseCount=2048,usedCoreNum=rotating::kLiCores,blockSize=128,maxBlockNumPerBatch=SIM_HISTORY/128,sparseMode=0;
+    uint32_t bSize,tSize,gSize,s1Size,s2Size,sparseCount,usedCoreNum,blockSize,maxBlockNumPerBatch,sparseMode;
     uint32_t keyStride0=16384,keyDequantScaleStride0=128;
+    uint32_t resident,splitQ,aicCount;
 };
-#define SIM_STORAGE_HISTORY SIM_HISTORY
 #include "indexer.h"
 #endif
 extern "C" __global__ __aicore__ void v9_li_kernel(GM_ADDR bindings) {
@@ -18,7 +17,10 @@ extern "C" __global__ __aicore__ void v9_li_kernel(GM_ADDR bindings) {
     using Type=QLIType<fp8_e4m3fn_t,fp8_e4m3fn_t,int32_t,true,LI_LAYOUT::BSND,LI_LAYOUT::PA_BSND,
         bfloat16_t,float,float,uint16_t>;
     QLIKernel::QuantLightningIndexerKernel<Type> op;
-    QLITilingData tiling;
+    auto shape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(a[14]));
+    op.runtimeShape_ = shape;
+    QLITilingData tiling{shape.batch,shape.batch*4,shape.indexHeads,4,shape.history,
+        2048,shape.liCores,128,shape.history/128,0,16384,128,shape.resident,shape.splitQ,shape.aicCount};
 #define P(i) reinterpret_cast<GM_ADDR>(a[i])
     op.Init(P(0),P(1),P(2),P(3),P(4),P(5),P(6),P(7),P(9),P(12),&tiling,&pipe);
     if ASCEND_IS_AIV {

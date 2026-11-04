@@ -54,14 +54,14 @@ builds KVAF, LIDU and LIFetch including Index update:
 git clone --branch codex/clean-slate https://gitcode.com/CacheOS/KVIP.git /vllm-workspace/KVIP
 cd /vllm-workspace/KVIP
 source /usr/local/Ascend/cann/set_env.sh
-bash scripts/build.sh --device 5 --batches 8,16 --history 131072 --resident 16384 --index-heads 32 --intermediate-fetches 8
+bash scripts/build.sh
 source scripts/env.sh
 ```
 
 To use the existing KVAF source instead, replace the build command with:
 
 ```bash
-bash scripts/build.sh --kvaf-root /vllm-workspace/vllm-ascend/third_party/KVAF --device 5 --batches 8,16 --history 131072 --resident 16384 --index-heads 32 --intermediate-fetches 8
+bash scripts/build.sh --kvaf-root /vllm-workspace/vllm-ascend/third_party/KVAF
 source scripts/env.sh
 ```
 
@@ -69,8 +69,8 @@ The supported KVAF base is `c4375e13d7a9519d907ab6a5d11227795f207286`.
 Preparation applies the three patches in `scripts/patches`, recognizes an already
 patched tree, and never resets existing edits. A different revision or conflicting
 patch fails explicitly. `--prepare-only` prepares dependencies without compiling;
-`--skip-kvaf-build` is only for an already rebuilt patched KVAF. Both 656-byte and
-2624-byte KV variants are built. Build logs are under `build/lifetch/*/build.log`.
+`--skip-kvaf-build` is only for an already rebuilt patched KVAF. One binary supports both 656-byte and
+2624-byte KV records through runtime parameters. Build logs are under `build/lifetch/*/build.log`.
 The original LIDU build uses its own `csrc/operators/lidu/build` directory.
 
 ## Verify
@@ -115,7 +115,7 @@ python tests/test_abc.py --device 5
 ## Migration evidence and limits
 
 Source baseline: vLLM-DSA commit `dad47855b20cbe8b74bf412f05757043d22ce0a0`.
-LIDU files are byte-identical. Retained LI/Fetch/resolver/update function bodies
+LIDU files are byte-identical. At the initial migration, retained LI/Fetch/resolver/update function bodies
 were compared after removing include paths, comments and whitespace. Both Q2 and
 Q4 materialized LI sources match the prior generation pipeline; the build no
 longer rewrites source files. LI/Fetch and Index update keep their separate
@@ -132,3 +132,34 @@ CANN/NPU, so no new device performance result is claimed.
 
 The imported CANN LI headers retain their original license notices; their license
 is reproduced in `LICENSE-CANN`. Apache-2.0 applies to files so marked.
+
+## Runtime shapes
+
+Installation does not take device, batch, history, resident, heads or window count.
+Host tiling evaluates the original partition/window formulas when a launch object
+is bound, then stores its immutable parameters in the device Context before graph
+capture. No per-shape compilation is required. Index update reads history/resident
+from its bindings. ABI versions are now LIFetch 10 and Index update 2; rebuild both.
+
+Supported runtime dimensions: batch 1–32 (also limited by available AIC count),
+index heads 32/64, 1–32 requested windows, 256-aligned history/resident with
+2048 <= resident < history <= 210944. Existing UB/queue constraints are checked
+before launch. Q4, TopK 2048 and the existing element types remain fixed. These
+limits preserve the original kernel's storage budget; this is not unrestricted
+shape support. Each captured graph still owns its shape-specific buffers and
+launch object. Changing shape requires another binding/capture, not another binary.
+
+To check different batch/history/resident/head/window combinations with one
+compiled library (the runner prints and checks its SHA256):
+
+```bash
+cd /vllm-workspace/KVIP
+source scripts/env.sh
+python tests/test_lifetch.py --device 5 --kvaf-server 127.0.0.1:28885 --runtime-shapes --miss-percent 10 --warmup 4 --iterations 20 --trace-rounds 3
+```
+
+The matrix includes B1/B8/B16, history 65536/131072, resident 8192/16384,
+32/64 heads and 4/8 requested windows, using real 656-byte KV records. Each case
+retains native/fused byte checks, SFA checks, stateful checks and graph timings.
+The runtime conversion changes scalar plumbing and generated code; preserved
+formulas alone do not prove unchanged device performance. A5 validation is required.

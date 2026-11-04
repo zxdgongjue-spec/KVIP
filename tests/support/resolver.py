@@ -32,7 +32,7 @@ def run(torch, args, rotating, owner, topk, selected, reset, verify, folder):
     variants = {"original": "resolve_original", "adapted": "resolve_adapted", "fixed": "resolve"}
     for entry in variants.values():
         function = getattr(rotating.library, "v9_" + entry)
-        function.argtypes, function.restype = [ctypes.c_void_p, ctypes.c_void_p], ctypes.c_uint32
+        function.argtypes, function.restype = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p], ctypes.c_uint32
         rotating.functions[entry] = function
 
     def drain_capture():

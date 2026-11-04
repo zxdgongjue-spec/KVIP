@@ -66,13 +66,7 @@ def main():
     parser.add_argument("--prepare-only", action="store_true", help="prepare patches, without CANN builds")
     parser.add_argument("--skip-kvaf-build", action="store_true", help="use an already rebuilt, patched KVAF")
     parser.add_argument("--cann", type=Path, default=Path("/usr/local/Ascend/cann"))
-    parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--soc", help="default: query selected NPU using ACL")
-    parser.add_argument("--batches", default="16")
-    parser.add_argument("--history", type=int, default=131072)
-    parser.add_argument("--resident", type=int, default=16384)
-    parser.add_argument("--index-heads", type=int, choices=(32, 64), default=32)
-    parser.add_argument("--intermediate-fetches", type=int, default=8)
+    parser.add_argument("--soc", default="Ascend950", help="compile target architecture")
     parser.add_argument("--jobs", type=int, default=2)
     args = parser.parse_args()
     dependency = (args.kvaf_root or ROOT / "third_party/KVAF").resolve()
@@ -95,36 +89,12 @@ def main():
     # Editable install intentionally retains csrc alongside the Python package.
     call([sys.executable, "-m", "pip", "install", "--no-build-isolation", "-e", ROOT])
     sys.path.insert(0, str(ROOT / "python"))
-    import acl
-    import torch
-    import torch_npu  # noqa: F401
-    from kvip._lifetch.device_resources import query_device_resources
     from kvip.fused_build import build_libraries, kvaf_build_paths
 
-    torch.npu.set_device(args.device)
-    soc = args.soc or acl.get_soc_name()
     cann, headers = kvaf_build_paths(dependency / "build-npu")
-    cores = query_device_resources(str(cann), args.device, 0)["effective_aic"]
-    for batch in map(int, args.batches.split(",")):
-        for token_bytes in (656, 2624):
-            print(
-                f"BUILD LIFetch batch={batch} token_bytes={token_bytes}; logs under {ROOT / 'build/lifetch'}",
-                flush=True,
-            )
-            paths = build_libraries(
-                cache_dir=ROOT / "build/lifetch",
-                cann=cann,
-                headers=headers,
-                soc=soc,
-                batch=batch,
-                history=args.history,
-                resident=args.resident,
-                aics=cores,
-                windows=args.intermediate_fetches,
-                token_bytes=token_bytes,
-                index_heads=args.index_heads,
-            )
-            print(f"READY batch={batch} token_bytes={token_bytes}: {paths}", flush=True)
+    print(f"BUILD universal LIFetch; logs under {ROOT / 'build/lifetch'}", flush=True)
+    paths = build_libraries(cache_dir=ROOT / "build/lifetch", cann=cann, headers=headers, soc=args.soc)
+    print(f"READY: {paths}", flush=True)
     print("PASS: KVAF + LIDU + LIFetch/Index update built. Source scripts/env.sh before serving.", flush=True)
 
 

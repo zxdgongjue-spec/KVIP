@@ -1,41 +1,32 @@
 #include "api.h"
-#include <cstdint>
 #include "context.h"
+extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) { return rotating::PrepareShape(shape); }
 #define ENTRY(name, blocks) \
 extern "C" uint32_t aclrtlaunch_v9_##name##_kernel(uint32_t,void*,void*); \
-extern "C" uint32_t v9_##name(void* bindings,void* stream) { \
-    if (!bindings || !stream) return 100000; \
+extern "C" uint32_t v9_##name(void* bindings,void* stream,const rotating::RuntimeShape* shape) { \
+    if (!bindings || !stream || !shape) return 100000; \
     return aclrtlaunch_v9_##name##_kernel(blocks,stream,bindings); }
-ENTRY(init,SIM_BATCH)
-ENTRY(li,rotating::kLiCores)
-ENTRY(wait,SIM_BATCH)
-ENTRY(resolve,rotating::kFinalCores)
-ENTRY(fetch,SIM_BATCH)
-// Probe shares the production SIMD consumer but never rings a network doorbell.
-ENTRY(probe,rotating::kServiceLanes)
-extern "C" uint32_t v9_li_cores() { return rotating::kLiCores; }
-extern "C" uint32_t v9_batch() { return SIM_BATCH; }
-extern "C" uint32_t v9_history() { return SIM_HISTORY; }
-extern "C" uint32_t v9_resident() { return SIM_RESIDENT; }
-extern "C" uint32_t v9_row_bytes() { return sizeof(rotating::Row); }
-extern "C" uint32_t v9_context_bytes() { return sizeof(rotating::Context); }
-extern "C" uint32_t v9_rounds() { return rotating::kRounds; }
-
-extern "C" uint32_t v9_simulation() { return V9_SIMULATION; }
-
-extern "C" uint32_t v9_abi_version() { return 9; }
-
-extern "C" uint32_t v9_aic_count() { return V9_AIC_COUNT; }
-
-extern "C" uint32_t v9_service_lanes() { return rotating::kServiceLanes; }
-
-extern "C" uint32_t v9_final_workers() { return rotating::kFinalWorkers; }
-extern "C" uint32_t v9_final_owner_bytes() { return rotating::kFinalOwnerBytes; }
-
-extern "C" uint32_t v9_final_replicated() { return rotating::kFinalReplicated; }
-
-extern "C" uint32_t v9_token_bytes() { return rotating::kTokenBytes; }
-
+ENTRY(init,shape->batch)
+ENTRY(li,shape->liCores)
+ENTRY(wait,shape->batch)
+ENTRY(resolve,shape->finalCores)
+ENTRY(fetch,shape->batch)
+ENTRY(probe,shape->serviceLanes)
+extern "C" uint32_t v9_li_cores(const rotating::RuntimeShape* shape) { return shape->liCores; }
+extern "C" uint32_t v9_batch(const rotating::RuntimeShape* shape) { return shape->batch; }
+extern "C" uint32_t v9_history(const rotating::RuntimeShape* shape) { return shape->history; }
+extern "C" uint32_t v9_resident(const rotating::RuntimeShape* shape) { return shape->resident; }
+extern "C" uint32_t v9_row_bytes(const rotating::RuntimeShape* shape) { return sizeof(rotating::Row); }
+extern "C" uint32_t v9_context_bytes(const rotating::RuntimeShape* shape) { return sizeof(rotating::Context); }
+extern "C" uint32_t v9_rounds(const rotating::RuntimeShape* shape) { return shape->rounds; }
+extern "C" uint32_t v9_simulation(const rotating::RuntimeShape* shape) { return 0; }
+extern "C" uint32_t v9_abi_version(const rotating::RuntimeShape* shape) { return 10; }
+extern "C" uint32_t v9_aic_count(const rotating::RuntimeShape* shape) { return shape->aicCount; }
+extern "C" uint32_t v9_service_lanes(const rotating::RuntimeShape* shape) { return shape->serviceLanes; }
+extern "C" uint32_t v9_final_workers(const rotating::RuntimeShape* shape) { return shape->finalWorkers; }
+extern "C" uint32_t v9_final_owner_bytes(const rotating::RuntimeShape* shape) { return shape->finalOwnerBytes; }
+extern "C" uint32_t v9_final_replicated(const rotating::RuntimeShape* shape) { return 1; }
+extern "C" uint32_t v9_token_bytes(const rotating::RuntimeShape* shape) { return shape->tokenBytes; }
 extern "C" uint32_t aclrtlaunch_v9_get_kernel(uint32_t, void*, void*);
 extern "C" uint32_t v9_get(void* arguments, void* stream, uint32_t cores) {
     if (!arguments || !stream || !cores || cores > KVAF_AIV_BATCH_GET_MAX_AIV_CORES) return 100000;
@@ -43,8 +34,8 @@ extern "C" uint32_t v9_get(void* arguments, void* stream, uint32_t cores) {
 }
 
 #if V9_RESOLVER_COMPARE
-ENTRY(resolve_original,rotating::kFinalCores)
-ENTRY(resolve_adapted,rotating::kFinalCores)
+ENTRY(resolve_original,shape->finalCores)
+ENTRY(resolve_adapted,shape->finalCores)
 #endif
 
 #include "api.h"
@@ -80,12 +71,12 @@ extern "C" uint32_t refactor_fetch_pack_args(void *output, uint32_t capacity,
 }
 
 extern "C" uint32_t kvop_direct_update_outputs(uint32_t,void*,void*);
-extern "C" uint32_t kvip_lifetch_forward(void* bindings, void* update, void* stream) {
-    if (!bindings || !update || !stream) return 100000;
-    uint32_t result = v9_init(bindings, stream);
-    if (!result) result = v9_li(bindings, stream);
-    if (!result) result = v9_resolve(bindings, stream);
-    if (!result) result = v9_fetch(bindings, stream);
-    if (!result) result = kvop_direct_update_outputs(SIM_BATCH, update, stream);
+extern "C" uint32_t kvip_lifetch_forward(void* bindings, void* update, void* stream,const rotating::RuntimeShape* shape) {
+    if (!bindings || !update || !stream || !shape) return 100000;
+    uint32_t result = v9_init(bindings, stream, shape);
+    if (!result) result = v9_li(bindings, stream, shape);
+    if (!result) result = v9_resolve(bindings, stream, shape);
+    if (!result) result = v9_fetch(bindings, stream, shape);
+    if (!result) result = kvop_direct_update_outputs(shape->batch, update, stream);
     return result;
 }

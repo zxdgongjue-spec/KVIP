@@ -31,29 +31,15 @@ def kvaf_build_paths(build_dir):
     return cann, headers
 
 
-def build_libraries(
-    *, cache_dir, cann, headers, soc, batch, history, resident, aics, windows, token_bytes, index_heads=64
-):
-    """Compile before capture; concurrent workers share a locked build cache."""
+def build_libraries(*, cache_dir, cann, headers, soc):
+    """Build one shape-independent binary per source/toolchain/SoC."""
     root = Path(__file__).resolve().parents[2] / "csrc/operators"
-    geometry = load_original("geometry")
-    shape = geometry.li_geometry(batch, "auto", windows, aics)
-    if shape["logical_aic_tasks"] > aics or not shape["intermediate_fetches"]:
-        raise ValueError("LIFetch requires concurrently resident LI tasks and at least one Fetch window")
     options = dict(
         RUN_MODE="npu",
         ASCEND_CANN_PACKAGE_PATH=str(cann),
         KVAF_INCLUDE=str(headers),
         SOC_VERSION=soc,
-        INDEX_HEADS=index_heads,
-        SIM_BATCH=batch,
-        SIM_HISTORY=history,
-        SIM_RESIDENT=resident,
-        AIC_COUNT=aics,
-        TOKEN_BYTES=token_bytes,
-        LI_TILING="auto",
-        INTERMEDIATE_FETCHES=windows,
-        INTERMEDIATE_PROFILING=0,
+        RESOLVER_COMPARE=0,
     )
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     for relative in (
@@ -74,7 +60,7 @@ def build_libraries(
     directory.mkdir(parents=True, exist_ok=True)
     libraries = directory / "libv9_bridge.so", directory / "libkvop_cache_update.so"
     log = directory / "build.log"
-    logging.getLogger("vllm").info("KVAF LIFetch build: batch=%s token_bytes=%s log=%s", batch, token_bytes, log)
+    logging.getLogger("kvip").info("Universal LIFetch build: soc=%s log=%s", soc, log)
     with (directory / "build.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if not (directory / "complete.json").is_file() or not all(p.is_file() for p in libraries):

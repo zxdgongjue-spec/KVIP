@@ -49,11 +49,10 @@ class DirectIndexUpdate:
             ):
                 raise ValueError(f"LIFetch producer {name} must be contiguous int32 with shape {shape}")
         self.library = ctypes.CDLL(str(library))
-        for name, expected in (("history", keys.shape[1]), ("resident", rotating.hot_valid.shape[1])):
-            query = getattr(self.library, f"kvop_direct_update_{name}")
-            query.argtypes, query.restype = [], ctypes.c_uint32
-            if query() != expected:
-                raise ValueError(f"LIFetch Index update compiled {name} does not match cache storage")
+        version = self.library.kvop_direct_update_abi_version
+        version.argtypes, version.restype = [], ctypes.c_uint32
+        if version() != 2:
+            raise ValueError("Index update requires runtime-shape ABI 2")
         self.status = torch.zeros(self.batch, dtype=torch.int32, device=self.device) if status is None else status
         if (
             self.status.device != self.device
@@ -107,6 +106,8 @@ class DirectIndexUpdate:
                     self.slot_output.data_ptr(),
                 ]
             )
+        pointers.extend([0] * (24 - len(pointers)))
+        pointers.extend([keys.shape[1], rotating.hot_valid.shape[1]])
         self.bindings = torch.tensor(pointers, dtype=torch.int64, device=self.device)
         self.launch = (
             self.library.kvop_direct_update_owned if query_inputs is None else self.library.kvop_direct_update_outputs

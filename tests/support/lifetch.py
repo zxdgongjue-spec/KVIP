@@ -72,13 +72,36 @@ def run(args, run_dir):
             self.support._session_class = lambda: FiniteSession
 
     summaries = []
-    for batch in map(int, args.batches.split(",")):
-        folder = run_dir / f"b{batch}-prototype-graph"
+    original_args = args
+    cases = [
+        (b, args.history, args.resident, args.index_heads, args.intermediate_fetches)
+        for b in map(int, args.batches.split(","))
+    ]
+    if args.runtime_shapes:
+        cases = [
+            (1, 65536, 8192, 64, 4),
+            (8, 131072, 16384, 32, 8),
+            (16, 65536, 8192, 32, 4),
+            (1, 131072, 16384, 32, 8),
+        ]
+    shared_build = run_dir / "universal-build"
+    built_digest = None
+    for case, (batch, history, resident, heads, windows) in enumerate(cases):
+        args = SimpleNamespace(
+            **{
+                **vars(original_args),
+                "history": history,
+                "resident": resident,
+                "index_heads": heads,
+                "intermediate_fetches": windows,
+            }
+        )
+        folder = run_dir / f"case{case}-b{batch}-prototype-graph"
         folder.mkdir()
         stage = "original prototype build"
         progress(run_dir, f"BS={batch}: {stage}; logs={folder}")
         with native_log(folder / "native.log"):
-            common, data, build = (folder / "fixture", folder / "input", folder / "build")
+            common, data, build = (folder / "fixture", folder / "input", shared_build)
             fixture_info = prepare_full_chain_fixture(
                 common, args.history, args.resident, args.miss_percent, index_heads=args.index_heads
             )
@@ -91,21 +114,24 @@ def run(args, run_dir):
                 RESOLVER_COMPARE=int(args.resolver_compare),
                 SOC_VERSION=args.soc,
                 ASCEND_CANN_PACKAGE_PATH=args.cann,
-                INDEX_HEADS=args.index_heads,
-                SIM_BATCH=batch,
-                SIM_HISTORY=args.history,
-                SIM_RESIDENT=args.resident,
-                AIC_COUNT=aics,
-                LI_TILING="auto",
-                INTERMEDIATE_FETCHES=args.intermediate_fetches,
-                INTERMEDIATE_PROFILING=0,
                 KVAF_INCLUDE=find_headers(args.kvaf_root),
             )
-            command(
-                ["cmake", "-S", SOURCE, "-B", build, *[f"-D{k}={v}" for k, v in options.items()]],
-                folder / "configure.log",
+            if not shared_build.exists():
+                command(
+                    ["cmake", "-S", SOURCE, "-B", build, *[f"-D{k}={v}" for k, v in options.items()]],
+                    folder / "configure.log",
+                )
+                command(["cmake", "--build", build, "-j2"], folder / "build.log")
+            import hashlib
+
+            digest = hashlib.sha256((build / "libv9_bridge.so").read_bytes()).hexdigest()
+            if built_digest is not None and digest != built_digest:
+                raise AssertionError("Binary changed between runtime shapes")
+            built_digest = digest
+            progress(
+                run_dir,
+                f"UNIVERSAL binary_sha256={digest} batch={batch} H={history} R={resident} G={heads} windows={windows}",
             )
-            command(["cmake", "--build", build, "-j2"], folder / "build.log")
             workers = (batch * (final_aivs(batch, "auto", aics, 0) + 1) + 1) // 2
             progress(run_dir, f"BS={batch}: DDR Put and transport initialization; logs={folder}")
             owner = Owner.open(
@@ -159,7 +185,7 @@ def run(args, run_dir):
             continue
         times = report["timing"]
         line = (
-            f"BS={batch} prototype PASS index_heads={args.index_heads} windows={geometry['intermediate_fetches']} requested_windows={args.intermediate_fetches} history={args.history} hot={args.resident} topk=2048 Q=4 graph=True\n"
+            f"binary_sha256={built_digest}\nBS={batch} prototype PASS index_heads={args.index_heads} windows={geometry['intermediate_fetches']} requested_windows={args.intermediate_fetches} history={args.history} hot={args.resident} topk=2048 Q=4 graph=True\n"
             + "graph_p50_us="
             + ", ".join((f"{k}:{v['p50_us']:.3f}" for k, v in times.items()))
             + f"\ncore_speedup={times['native_chain']['p50_us'] / times['prototype_core']['p50_us']:.3f}x"

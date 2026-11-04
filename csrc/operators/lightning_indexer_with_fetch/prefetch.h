@@ -20,19 +20,19 @@ constexpr uint32_t kTailTokens = 384;
 __simt_callee__ inline uint32_t OwnerRow(__gm__ Context* ctx,uint32_t b) {
     return ctx->rowOwners ? asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)+b) : b;
 }
-__simt_callee__ inline uint32_t OutputStride(__gm__ Context* ctx) {
-    return ctx->outputStride ? uint32_t(ctx->outputStride) : SIM_RESIDENT+kSlots;
+__simt_callee__ inline uint32_t OutputStride(uint32_t rt_resident,__gm__ Context* ctx) {
+    return ctx->outputStride ? uint32_t(ctx->outputStride) : rt_resident+kSlots;
 }
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
-inline void InitializeTailMappings(__gm__ Context* ctx,uint32_t b) {
+inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm__ Context* ctx,uint32_t b) {
     if(!ctx->tailBounds)return;
     auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds)+b*2;
-    auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*SIM_HISTORY;
+    auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;
     uint32_t begin=asc_ldcg(bounds),end=asc_ldcg(bounds+1);
     for(uint32_t i=threadIdx.x;i<kTailTokens;i+=256) {
         uint32_t token=begin+i;
-        if(token<end && token<SIM_HISTORY)
-            asc_stcg(map+token,SIM_RESIDENT+kSlots+token%kTailTokens);
+        if(token<end && token<rt_history)
+            asc_stcg(map+token,rt_resident+kSlots+token%kTailTokens);
     }
     asc_threadfence();
 }
@@ -41,45 +41,45 @@ __simt_callee__ inline bool IsTailToken(__gm__ Context* ctx,uint32_t b,uint32_t 
     auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds)+b*2;
     return token>=asc_ldcg(bounds) && token<asc_ldcg(bounds+1);
 }
-__simt_callee__ inline uint32_t QueryEnd(__gm__ Context* ctx,uint32_t query) {
-    return ctx->queryEnds ? asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)+query) : SIM_HISTORY;
+__simt_callee__ inline uint32_t QueryEnd(uint32_t rt_history,__gm__ Context* ctx,uint32_t query) {
+    return ctx->queryEnds ? asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)+query) : rt_history;
 }
-__simt_callee__ inline void StoreFallbackSource(__gm__ Context* ctx,uint32_t batch,uint32_t dst,
+__simt_callee__ inline void StoreFallbackSource(uint32_t rt_history,uint32_t rt_tokenBytes,__gm__ Context* ctx,uint32_t batch,uint32_t dst,
     uint32_t token,uint64_t remote,__gm__ int32_t* blocks,__gm__ int32_t* offsets) {
     if(ctx->fallbackAddresses) {
         asc_stcg(reinterpret_cast<__gm__ uint64_t*>(ctx->fallbackAddresses)+dst,remote);
         asc_stcg(blocks+dst,int32_t(dst));asc_stcg(offsets+dst,int32_t(0));
     } else {
-        asc_stcg(blocks+dst,int32_t(batch*(SIM_HISTORY/128)+token/128));
-        asc_stcg(offsets+dst,int32_t((token%128)*kTokenBytes));
+        asc_stcg(blocks+dst,int32_t(batch*(rt_history/128)+token/128));
+        asc_stcg(offsets+dst,int32_t((token%128)*rt_tokenBytes));
     }
 }
-__simt_callee__ inline bool HotValid(__gm__ Context* ctx,uint32_t b,uint32_t token) {
-    return !ctx->hotValid || asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+OwnerRow(ctx,b)*SIM_RESIDENT+token)!=0;
+__simt_callee__ inline bool HotValid(uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,uint32_t token) {
+    return !ctx->hotValid || asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+OwnerRow(ctx,b)*rt_resident+token)!=0;
 }
-__simt_callee__ inline uint32_t PhysicalSlot(__gm__ Context* ctx,uint32_t b,uint32_t slot) {
-    if(ctx->lruSlots && uint32_t(slot-SIM_RESIDENT)<kLruSlots)
-        return asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots+slot-SIM_RESIDENT);
+__simt_callee__ inline uint32_t PhysicalSlot(uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,uint32_t slot) {
+    if(ctx->lruSlots && uint32_t(slot-rt_resident)<kLruSlots)
+        return asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots+slot-rt_resident);
     return slot;
 }
-__simt_callee__ inline void RecordChange(__gm__ Context* ctx,uint32_t b,uint32_t slot,uint32_t token) {
-    if(ctx->changes && uint32_t(slot-SIM_RESIDENT)<kLruSlots)
-        asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+b*kLruSlots+slot-SIM_RESIDENT,token);
+__simt_callee__ inline void RecordChange(uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,uint32_t slot,uint32_t token) {
+    if(ctx->changes && uint32_t(slot-rt_resident)<kLruSlots)
+        asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+b*kLruSlots+slot-rt_resident,token);
 
 }
 // Publish residency only after every prefetch/final queue completed. Resolver
 // workers must all observe the same pre-round validity, not one another's posts.
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
-inline void PublishCompletedResidency(__gm__ Context* ctx,uint32_t b,uint32_t fetched) {
+inline void PublishCompletedResidency(uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,uint32_t fetched) {
     if(!ctx->hotValid)return;
-    auto valid=reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+OwnerRow(ctx,b)*SIM_RESIDENT;
+    auto valid=reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+OwnerRow(ctx,b)*rt_resident;
     // The original resolver already emits exactly the final Fetch destinations.
     // Hits need no publication; do not rescan all four TopK rows.
     auto destinations=reinterpret_cast<__gm__ int32_t*>(ctx->destinations)+b*kSlots;
-    uint32_t ownerBase=OwnerRow(ctx,b)*OutputStride(ctx);
+    uint32_t ownerBase=OwnerRow(ctx,b)*OutputStride(rt_resident,ctx);
     for(uint32_t i=threadIdx.x;i<fetched;i+=256) {
         uint32_t slot=uint32_t(asc_ldcg(destinations+i))-ownerBase;
-        if(slot<SIM_RESIDENT)asc_stcg(valid+slot,uint32_t(1));
+        if(slot<rt_resident)asc_stcg(valid+slot,uint32_t(1));
     }
     if(ctx->changes && ctx->lruSlots) {
         auto changes=reinterpret_cast<__gm__ int32_t*>(ctx->changes)+b*kLruSlots;
@@ -90,27 +90,27 @@ inline void PublishCompletedResidency(__gm__ Context* ctx,uint32_t b,uint32_t fe
     asc_threadfence();
 }
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
-inline void AdaptColdPredicate(__gm__ Context* ctx,uint32_t b,__ubuf__ uint32_t* selected,__ubuf__ uint32_t* predicate) {
-    auto reserved=reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+b*SIM_RESIDENT;
+inline void AdaptColdPredicate(uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,__ubuf__ uint32_t* selected,__ubuf__ uint32_t* predicate) {
+    auto reserved=reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+b*rt_resident;
     for(uint32_t i=threadIdx.x;i<kSlots;i+=512) {
         uint32_t token=selected[i];
-        predicate[i]=(token<SIM_RESIDENT &&
-            (IsTailToken(ctx,b,token) || (!HotValid(ctx,b,token)) || (ctx->reservedHot && asc_ldcg(reserved+token)>=0)))?SIM_RESIDENT:token;
+        predicate[i]=(token<rt_resident &&
+            (IsTailToken(ctx,b,token) || (!HotValid(rt_resident,ctx,b,token)) || (ctx->reservedHot && asc_ldcg(reserved+token)>=0)))?rt_resident:token;
     }
 }
 // Bulk metadata is staged once in UB by the resolver, not fetched per TopK item.
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
-inline void AdaptColdPredicateLocal(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* predicate,
+inline void AdaptColdPredicateLocal(uint32_t rt_resident,__ubuf__ uint32_t* selected,__ubuf__ uint32_t* predicate,
     __ubuf__ uint32_t* valid,__ubuf__ int32_t* reserved,bool hasValid,bool hasReserved,
     uint32_t tailBegin,uint32_t tailEnd) {
     for(uint32_t i=threadIdx.x;i<kSlots;i+=512) {
         uint32_t token=selected[i];
-        predicate[i]=(token<SIM_RESIDENT && ((token>=tailBegin && token<tailEnd) ||
-            (hasValid && !valid[token]) || (hasReserved && reserved[token]>=0)))?SIM_RESIDENT:token;
+        predicate[i]=(token<rt_resident && ((token>=tailBegin && token<tailEnd) ||
+            (hasValid && !valid[token]) || (hasReserved && reserved[token]>=0)))?rt_resident:token;
     }
 }
-__simt_callee__ inline uint32_t ResolvePhysicalSlot(__gm__ uint32_t* lru,uint32_t slot) {
-    return lru && uint32_t(slot-SIM_RESIDENT)<kLruSlots ? asc_ldcg(lru+slot-SIM_RESIDENT) : slot;
+__simt_callee__ inline uint32_t ResolvePhysicalSlot(uint32_t rt_resident,__gm__ uint32_t* lru,uint32_t slot) {
+    return lru && uint32_t(slot-rt_resident)<kLruSlots ? asc_ldcg(lru+slot-rt_resident) : slot;
 }
 
 }
@@ -185,7 +185,7 @@ __simd_callee__ inline void Visible(MicroAPI::RegTensor<uint16_t>& value,
 // Only the address gather and destination slots differ: long histories do not
 // fit in UB, and final repair may safely recycle unreferenced speculative slots.
 namespace rotating {
-__simd_vf__ inline void FinalBuild(__ubuf__ uint32_t* remoteLow, __ubuf__ uint32_t* remoteHigh, __ubuf__ uint32_t* slots, __ubuf__ uint32_t* words,
+__simd_vf__ inline void FinalBuild(uint32_t rt_tokenBytes,__ubuf__ uint32_t* remoteLow, __ubuf__ uint32_t* remoteHigh, __ubuf__ uint32_t* slots, __ubuf__ uint32_t* words,
     __ubuf__ uint32_t* config, uint32_t begin, uint32_t count, uint32_t total) {
     using namespace MicroAPI;
     auto all = CreateMask<uint32_t, MaskPattern::ALL>();
@@ -206,7 +206,7 @@ __simd_vf__ inline void FinalBuild(__ubuf__ uint32_t* remoteLow, __ubuf__ uint32
         RegTensor<uint32_t> slot;
         LoadAlign(slot, slots + begin + j);
         LoadAlign(remoteLo,remoteLow+begin+j);LoadAlign(remoteHi,remoteHigh+begin+j);
-        Muls(delta, slot, uint32_t(kTokenBytes), mask);
+        Muls(delta, slot, uint32_t(rt_tokenBytes), mask);
         Add(localLo, baseLo, delta, mask);
         MaskReg overflow;
         Compare<uint32_t, CMPMODE::LT>(overflow, localLo, baseLo, mask);
@@ -287,7 +287,7 @@ __simd_vf__ inline void FinalBuild(__ubuf__ uint32_t* remoteLow, __ubuf__ uint32
     }
 }
 
-__aicore__ inline bool SubmitWqesAt(uint64_t entityAddress,uint64_t queueAddress,uint64_t output,LocalTensor<uint32_t> slots,LocalTensor<uint32_t> words,
+__aicore__ inline bool SubmitWqesAt(uint32_t rt_tokenBytes,uint64_t entityAddress,uint64_t queueAddress,uint64_t output,LocalTensor<uint32_t> slots,LocalTensor<uint32_t> words,
     LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,LocalTensor<uint32_t> cfg,uint32_t count,uint32_t bankSize,bool final,__gm__ Row* row,uint32_t pending=0) {
     auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(queueAddress);
     // Intermediate service exclusively owns this queue; CQ draining starts
@@ -318,7 +318,7 @@ __aicore__ inline bool SubmitWqesAt(uint64_t entityAddress,uint64_t queueAddress
     cfg.SetValue(3,meta.GetValue(6)&0xfffffU);
     for(uint32_t j=0;j<4;++j)cfg.SetValue(4+j,meta.GetValue(22+j));
     cfg.SetValue(8,meta.GetValue(7));cfg.SetValue(9,0);
-    cfg.SetValue(12,kTokenBytes);cfg.SetValue(13,meta.GetValue(12));
+    cfg.SetValue(12,rt_tokenBytes);cfg.SetValue(13,meta.GetValue(12));
     cfg.SetValue(14,uint32_t(output));cfg.SetValue(15,uint32_t(output>>32));
     cfg.SetValue(16,uint32_t(head));cfg.SetValue(17,sqDepth);
     SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
@@ -327,7 +327,7 @@ __aicore__ inline bool SubmitWqesAt(uint64_t entityAddress,uint64_t queueAddress
     // 1024 WQEs, halving the dispatch/DMA fences for the usual final batch.
     for(uint32_t begin=0;begin<count;begin+=bankSize) {
         uint32_t n=count-begin<bankSize?count-begin:bankSize;
-        FinalBuild(reinterpret_cast<__ubuf__ uint32_t*>(remoteLow.GetPhyAddr()),
+        FinalBuild(rt_tokenBytes,reinterpret_cast<__ubuf__ uint32_t*>(remoteLow.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(remoteHigh.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(slots.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(words.GetPhyAddr()),
@@ -364,13 +364,13 @@ __aicore__ inline bool SubmitWqesAt(uint64_t entityAddress,uint64_t queueAddress
     }
     return true;
 }
-__aicore__ inline bool SubmitWqes(__gm__ Row* row,LocalTensor<uint32_t> slots,LocalTensor<uint32_t> words,
+__aicore__ inline bool SubmitWqes(uint32_t rt_tokenBytes,__gm__ Row* row,LocalTensor<uint32_t> slots,LocalTensor<uint32_t> words,
     LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,LocalTensor<uint32_t> cfg,uint32_t count,uint32_t bankSize=1024,bool final=false) {
-    return SubmitWqesAt(row->entity,row->queue,row->output,slots,words,remoteLow,remoteHigh,cfg,count,bankSize,final,row);
+    return SubmitWqesAt(rt_tokenBytes,row->entity,row->queue,row->output,slots,words,remoteLow,remoteHigh,cfg,count,bankSize,final,row);
 }
-__aicore__ inline void SubmitFinal(__gm__ Row* row,LocalTensor<uint32_t> slots,LocalTensor<uint32_t> words,
+__aicore__ inline void SubmitFinal(uint32_t rt_tokenBytes,__gm__ Row* row,LocalTensor<uint32_t> slots,LocalTensor<uint32_t> words,
     LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,LocalTensor<uint32_t> cfg,uint32_t count) {
-    if(SubmitWqes(row,slots,words,remoteLow,remoteHigh,cfg,count,1024,true))row->finalPending=1;
+    if(SubmitWqes(rt_tokenBytes,row,slots,words,remoteLow,remoteHigh,cfg,count,1024,true))row->finalPending=1;
 }
 }
 
@@ -380,18 +380,13 @@ __aicore__ inline void SubmitFinal(__gm__ Row* row,LocalTensor<uint32_t> slots,L
 namespace rotating {
 // One SIMT task covers every batch assigned to this AIV. Per-batch queues
 // remain independent. locations is dead until final resolve and stages IDs.
-constexpr uint32_t kPostGroups=(SIM_BATCH+kServiceLanes-1)/kServiceLanes;
-constexpr uint32_t kPostThreads=kPostGroups<=1?512:(kPostGroups<=2?256:(kPostGroups<=4?128:64));
-constexpr uint32_t kPostBank=kPostGroups<=1?448:(kPostGroups<=2?240:(kPostGroups<=4?120:56));
-// FinalBuild stores complete 64-WQE vector blocks, including tail padding.
-static_assert(SIM_BATCH>16 || ((kPostGroups-1)*kPostBank+((kPostBank+63)/64)*64)*64<=32000,
-              "Padded WQE banks exceed the smallest borrowed scratch");
+
 template<bool BuildSimt>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
-inline void BatchBuild(__gm__ Context* ctx,uint32_t epoch,uint32_t lane,uint32_t begin,
+inline void BatchBuild(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,__gm__ Context* ctx,uint32_t epoch,uint32_t lane,uint32_t begin,
     __ubuf__ uint64_t* remote,__ubuf__ uint32_t* meta,__ubuf__ uint32_t* inputs,__ubuf__ uint32_t* wqes) {
-    const uint32_t g=threadIdx.x/kPostThreads,t=threadIdx.x%kPostThreads,b=lane+kServiceLanes*g;
-    const bool active=b<SIM_BATCH;
+    const uint32_t g=threadIdx.x/rt_postThreads,t=threadIdx.x%rt_postThreads,b=lane+rt_serviceLanes*g;
+    const bool active=b<rt_batch;
     uint32_t count=0,n=0,slotBase=0,depth=0;uint64_t head=0,output=0;
     __gm__ Row* row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
     __gm__ uint32_t* rowWords=reinterpret_cast<__gm__ uint32_t*>(row);
@@ -408,22 +403,22 @@ inline void BatchBuild(__gm__ Context* ctx,uint32_t epoch,uint32_t lane,uint32_t
             } else {
                 auto addresses=reinterpret_cast<__gm__ uint64_t*>(input64[34]);
                 auto jobs=reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*8192;
-                auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*SIM_HISTORY;
+                auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;
                 slotBase=input[65];
-                n=count>begin?count-begin:0;if(n>kPostBank)n=kPostBank;
-                for(uint32_t i=t;i<n;i+=kPostThreads) {
+                n=count>begin?count-begin:0;if(n>rt_postBank)n=rt_postBank;
+                for(uint32_t i=t;i<n;i+=rt_postThreads) {
                     uint32_t token=asc_ldcg(jobs+begin+i);
                     uint32_t slot=slotBase+begin+i;
                     uint64_t address=asc_ldcg(addresses+token);
-                    if constexpr(BuildSimt)remote[g*kPostBank+i]=address;
+                    if constexpr(BuildSimt)remote[g*rt_postBank+i]=address;
                     else {
                         auto fields=reinterpret_cast<__ubuf__ uint32_t*>(remote);
-                        fields[g*kPostBank+i]=uint32_t(address);
-                        fields[512+g*kPostBank+i]=uint32_t(address>>32);
-                        fields[1024+g*kPostBank+i]=PhysicalSlot(ctx,b,slot);
+                        fields[g*rt_postBank+i]=uint32_t(address);
+                        fields[512+g*rt_postBank+i]=uint32_t(address>>32);
+                        fields[1024+g*rt_postBank+i]=PhysicalSlot(rt_resident,ctx,b,slot);
                     }
                     asc_stcg(map+token,slot);
-                    RecordChange(ctx,b,slot,token);
+                    RecordChange(rt_resident,ctx,b,slot,token);
                 }
                 if(t<16) {
                     uint32_t value=0;
@@ -432,7 +427,7 @@ inline void BatchBuild(__gm__ Context* ctx,uint32_t epoch,uint32_t lane,uint32_t
                     if(t==3)value=entity[6]&0xfffffU;
                     if(t>=4 && t<8)value=entity[22+t-4];
                     if(t==8)value=entity[7];
-                    if(t==12)value=kTokenBytes;
+                    if(t==12)value=rt_tokenBytes;
                     if(t==13)value=entity[12];
                     if(t==14)value=uint32_t(output);
                     if(t==15)value=uint32_t(output>>32);
@@ -444,16 +439,16 @@ inline void BatchBuild(__gm__ Context* ctx,uint32_t epoch,uint32_t lane,uint32_t
     }
     asc_syncthreads();
     if(BuildSimt && active && count) {
-        for(uint32_t i=t;i<n*16;i+=kPostThreads) {
+        for(uint32_t i=t;i<n*16;i+=rt_postThreads) {
             uint32_t token=i/16,field=i%16,value=meta[g*32+field];
             uint32_t slot=slotBase+begin+token;
-            uint64_t address=remote[g*kPostBank+token],local=output+uint64_t(PhysicalSlot(ctx,b,slot))*kTokenBytes;
+            uint64_t address=remote[g*rt_postBank+token],local=output+uint64_t(PhysicalSlot(rt_resident,ctx,b,slot))*rt_tokenBytes;
             if(field==0)value=((begin+token+1==count)?0x30360000U:0x30150000U)|(((head+begin+token)&depth)?0U:0x80000000U);
             if(field==10)value=uint32_t(address);
             if(field==11)value=uint32_t(address>>32);
             if(field==14)value=uint32_t(local);
             if(field==15)value=uint32_t(local>>32);
-            wqes[g*kPostBank*16+i]=value;
+            wqes[g*rt_postBank*16+i]=value;
         }
     }
     asc_threadfence();asc_syncthreads();
@@ -472,10 +467,7 @@ namespace rotating {
 // or map DMA is performed while scanning these masks.
 // Reserve the last 8KiB of the 32000-byte Q4 scratch for candidate IDs
 // when indicesOut holds the complete lane's batch rows.
-constexpr bool kBatchedRows=V9_BATCH_POST && SIM_BATCH<=16;
-constexpr uint32_t kScanTokens=kBatchedRows?23808:28672, kCandidateCapacity=2048;
-static_assert(!kBatchedRows || kScanTokens+4*kCandidateCapacity<=32000,"Candidate scratch overflow");
-static_assert(!kBatchedRows || ((SIM_BATCH+kServiceLanes-1)/kServiceLanes)*sizeof(Row)<=8448,"Row scratch overflow");
+constexpr uint32_t kCandidateCapacity=2048;
 #ifndef V9_PARTIAL_SCAN_SIMD
 #define V9_PARTIAL_SCAN_SIMD 1
 #endif
@@ -652,13 +644,13 @@ __simd_vf__ inline void CompactMisses(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* 
 // V7's direct transport pattern: address lookup/slot assignment only for the
 // compact miss list. FinalBuild/SubmitWqes are shared with final completion.
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
-inline void PrepareCandidateWqes(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* lo,
+inline void PrepareCandidateWqes(uint32_t rt_resident,__ubuf__ uint32_t* ids,__ubuf__ uint32_t* lo,
     __ubuf__ uint32_t* hi,__ubuf__ uint32_t* slots,__gm__ uint32_t* map,
     __gm__ uint64_t* addresses,uint32_t count,uint32_t slotBase,__gm__ Context* ctx,uint32_t batch) {
     for(uint32_t i=threadIdx.x;i<count;i+=256) {
         uint32_t token=ids[i],slot=slotBase+i;uint64_t remote=asc_ldcg(addresses+token);
-        lo[i]=uint32_t(remote);hi[i]=uint32_t(remote>>32);slots[i]=PhysicalSlot(ctx,batch,slot);asc_stcg(map+token,slot);
-        RecordChange(ctx,batch,slot,token);
+        lo[i]=uint32_t(remote);hi[i]=uint32_t(remote>>32);slots[i]=PhysicalSlot(rt_resident,ctx,batch,slot);asc_stcg(map+token,slot);
+        RecordChange(rt_resident,ctx,batch,slot,token);
     }
     asc_threadfence();
 }
@@ -670,13 +662,13 @@ inline void RestoreVictimTokens(__ubuf__ uint32_t* ids,__gm__ uint32_t* victims,
         if(token<kLruSlots)ids[i]=asc_ldcg(victims+token);
     }
 }
-__aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,uint32_t lane,
+__aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer,uint32_t epoch,uint32_t core,uint32_t lane,
     LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids) {
     auto ctx=reinterpret_cast<__gm__ Context*>(pointer);auto events=reinterpret_cast<__gm__ Event*>(ctx->events);
-    auto event=events+epoch*kServiceLanes+lane;event->core=core;event->epoch=epoch;V9_FETCH_PROFILE(event->waitBegin=GetSystemCycle();)
+    auto event=events+epoch*rt_serviceLanes+lane;event->core=core;event->epoch=epoch;V9_FETCH_PROFILE(event->waitBegin=GetSystemCycle();)
     if(epoch) {
-        auto previous=reinterpret_cast<__gm__ volatile Event*>(events)+(epoch-1)*kServiceLanes+lane;
-        do { kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(events+(epoch-1)*kServiceLanes+lane),64); }
+        auto previous=reinterpret_cast<__gm__ volatile Event*>(events)+(epoch-1)*rt_serviceLanes+lane;
+        do { kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(events+(epoch-1)*rt_serviceLanes+lane),64); }
         while(!previous->complete);
     }
     V9_FETCH_PROFILE(event->begin=GetSystemCycle();)
@@ -684,60 +676,59 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
     V9_FETCH_PROFILE(uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0;)
     auto work=flags.ReinterpretCast<uint32_t>();auto cfg=work[4096];
     auto rowStorage=ids;
-    if constexpr(kBatchedRows)ids=scratch[23808/4];
+    if(rt_batchedRows)ids=scratch[23808/4];
     // Freeze every ready snapshot before doing any batch work. Cap to the
     // scheduled boundary so slow service cannot chase newly produced history.
     GlobalTensor<uint32_t> progressGm;
     progressGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress));
-    if(lane<SIM_BATCH) {
-        DataCopyExtParams gather;gather.blockCount=(SIM_BATCH-lane+kServiceLanes-1)/kServiceLanes;
-        gather.blockLen=4*sizeof(Progress);gather.srcStride=(kServiceLanes-1)*4*sizeof(Progress);gather.dstStride=0;
+    if(lane<rt_batch) {
+        DataCopyExtParams gather;gather.blockCount=(rt_batch-lane+rt_serviceLanes-1)/rt_serviceLanes;
+        gather.blockLen=4*sizeof(Progress);gather.srcStride=(rt_serviceLanes-1)*4*sizeof(Progress);gather.dstStride=0;
         DataCopyPadExtParams<uint32_t> padding{false,0,0,0};
         SetFlag<HardEvent::S_MTE2>(EVENT_ID0);WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
         DataCopyPad(work,progressGm[lane*128],gather,padding);
         SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-        for(uint32_t b=lane;b<SIM_BATCH;b+=kServiceLanes)for(uint32_t q=0;q<4;++q) {
-            uint32_t end=work.GetValue((b/kServiceLanes)*128+q*32),cap=Trigger(epoch)*128;
+        for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes)for(uint32_t q=0;q<4;++q) {
+            uint32_t end=work.GetValue((b/rt_serviceLanes)*128+q*32),cap=Trigger(rt_history,rt_resident,rt_rounds,epoch)*128;
             if(ctx->queryEnds) {
                 auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds);
                 uint32_t valid=bounds[b*4+q];
-                if(ctx->lruSlots && valid<SIM_RESIDENT)valid=SIM_RESIDENT;
+                if(ctx->lruSlots && valid<rt_resident)valid=rt_resident;
                 if(cap>valid)cap=valid;
             }
             cfg.SetValue(128+b*4+q,end<cap?end:cap);
         }
     }
     GlobalTensor<uint32_t> allRows;allRows.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->rows));
-    if constexpr(kBatchedRows) {
-        if(lane<SIM_BATCH) {
-            DataCopyExtParams copy;copy.blockCount=(SIM_BATCH-lane+kServiceLanes-1)/kServiceLanes;
-            copy.blockLen=sizeof(Row);copy.srcStride=(kServiceLanes-1)*sizeof(Row);copy.dstStride=0;
+    if(rt_batchedRows) {
+        if(lane<rt_batch) {
+            DataCopyExtParams copy;copy.blockCount=(rt_batch-lane+rt_serviceLanes-1)/rt_serviceLanes;
+            copy.blockLen=sizeof(Row);copy.srcStride=(rt_serviceLanes-1)*sizeof(Row);copy.dstStride=0;
             DataCopyPadExtParams<uint32_t> pad{false,0,0,0};
             DataCopyPad(rowStorage,allRows[lane*256],copy,pad);
             SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
         }
     }
-    for(uint32_t b=lane;b<SIM_BATCH;b+=kServiceLanes) {
+    for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
         // Transfer state as a block. Avoid scalar GM read/modify/write and
         // repeated cache maintenance for every counter/cache line.
-        auto state=kBatchedRows?rowStorage[(b/kServiceLanes)*256]:work[2048];auto state64=state.ReinterpretCast<uint64_t>();
+        auto state=rt_batchedRows?rowStorage[(b/rt_serviceLanes)*256]:work[2048];auto state64=state.ReinterpretCast<uint64_t>();
         GlobalTensor<uint32_t> rowGm;
         rowGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->rows)+b*256);
-        if constexpr(!kBatchedRows) {
+        if(!rt_batchedRows) {
             DataCopy(state,rowGm,256);
             SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
         }
-#if V9_BATCH_POST && SIM_BATCH <= 16
-        auto postInput=cfg[256+(b/kServiceLanes)*80];postInput.SetValue(64,0);
-#endif
+auto postInput=cfg[256+(b/rt_serviceLanes)*80];
+        if (rt_batchedRows) postInput.SetValue(64,0);
         if(state.GetValue(11))continue;
         uint32_t slots=state.GetValue(8),requests=state.GetValue(9),pending=state.GetValue(211);
         uint32_t sequence=state.GetValue(246)+1;
         state.SetValue(246,sequence);state.SetValue(214+epoch,sequence);
         const uint64_t entityAddress=state64.GetValue(0),queueAddress=state64.GetValue(1);
         const uint64_t addresses=state64.GetValue(2),output=state64.GetValue(3);
-        const uint32_t lower=ctx->lruSlots?0:SIM_RESIDENT;
-        uint32_t end[4],first=SIM_HISTORY,last=lower;
+        const uint32_t lower=ctx->lruSlots?0:rt_resident;
+        uint32_t end[4],first=rt_history,last=lower;
         for(uint32_t q=0;q<4;++q) {
             uint32_t saved=cfg.GetValue(128+b*4+q);
             end[q]=saved>state.GetValue(12+q)?saved:state.GetValue(12+q);
@@ -752,15 +743,15 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
             if(consumed!=first || end[q]!=last)aggregate=false;
         }
         GlobalTensor<uint8_t> bitmap;
-        bitmap.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(ctx->hits)+b*SIM_HISTORY);
+        bitmap.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(ctx->hits)+b*rt_history);
         for(uint32_t base=(first/128)*128;first<last && base<last;) {
             // Compact victim coordinates occupy [0,2048); the remaining
             // hot bitmap is not written or read. Cold coordinates are unchanged.
-            if(ctx->lruSlots && base>=kLruSlots && base<SIM_RESIDENT) {
-                base=SIM_RESIDENT;continue;
+            if(ctx->lruSlots && base>=kLruSlots && base<rt_resident) {
+                base=rt_resident;continue;
             }
             uint32_t span=((last-base+127)/128)*128;
-            if(span>kScanTokens)span=kScanTokens;
+            if(span>rt_scanTokens)span=rt_scanTokens;
             if(ctx->lruSlots && base<kLruSlots && span>kLruSlots-base)span=kLruSlots-base;
             if(aggregate) {
                 uint32_t room=((1792-wordCount)/8)*128;
@@ -784,7 +775,7 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
 #endif
             }
             DataCopyExtParams copy;copy.blockCount=4;copy.blockLen=span/4;
-            copy.srcStride=(SIM_HISTORY-span)/4;copy.dstStride=0;
+            copy.srcStride=(rt_history-span)/4;copy.dstStride=0;
             V9_FETCH_PROFILE(bitmapBytes+=span;)
             DataCopyPadExtParams<uint8_t> padding{false,0,0,0};
             DataCopyPad(scratch.ReinterpretCast<uint8_t>(),bitmap[base/4],copy,padding);
@@ -831,7 +822,7 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
         V9_FETCH_PROFILE(uint64_t candidateBegin=GetSystemCycle(),postBegin=0;)
         uint32_t count=0,missing=0;
         if(candidateCount) {
-            auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*SIM_HISTORY;
+            auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;
             uint32_t available=ctx->windowLimit;
             uint32_t room=slots<state.GetValue(208)?state.GetValue(208)-slots:0;if(available>room)available=room;
             room=requests<state.GetValue(209)?state.GetValue(209)-requests:0;if(available>room)available=room;
@@ -853,9 +844,9 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
             V9_FETCH_PROFILE(candidateTicks+=GetSystemCycle()-candidateBegin;)
             if(count) {
                 V9_FETCH_PROFILE(postBegin=GetSystemCycle();)
-#if V9_BATCH_POST && SIM_BATCH <= 16
+if (rt_batchedRows) {
                 auto post64=postInput.ReinterpretCast<uint64_t>();
-                postInput.SetValue(64,count);postInput.SetValue(65,SIM_RESIDENT+slots);
+                postInput.SetValue(64,count);postInput.SetValue(65,rt_resident+slots);
                 postInput.SetValue(66,pending);post64.SetValue(34,addresses);
                 post64.SetValue(35,output);post64.SetValue(36,queueAddress);
                 GlobalTensor<uint32_t> entityGm,queueGm;
@@ -869,18 +860,18 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
                 DataCopy(jobs,ids,((count+7)/8)*8);
                 SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
                 slots+=count;requests+=count;
-#else
+} else {
                 {
-                    Simt::VF_CALL<PrepareCandidateWqes>(Simt::Dim3{256,1,1},
+                    Simt::VF_CALL<PrepareCandidateWqes>(Simt::Dim3{256,1,1},rt_resident,
                         reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),
                         reinterpret_cast<__ubuf__ uint32_t*>(work[512].GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work[1024].GetPhyAddr()),
-                        map,reinterpret_cast<__gm__ uint64_t*>(addresses),count,SIM_RESIDENT+slots,ctx,b);
+                        map,reinterpret_cast<__gm__ uint64_t*>(addresses),count,rt_resident+slots,ctx,b);
                     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-                    if(SubmitWqesAt(entityAddress,queueAddress,output,work[1024],scratch,work,work[512],cfg,count,256,false,nullptr,pending))++pending;
+                    if(SubmitWqesAt(rt_tokenBytes,entityAddress,queueAddress,output,work[1024],scratch,work,work[512],cfg,count,256,false,nullptr,pending))++pending;
                     else state.SetValue(11,kvaf_device::kInvalidArgs);
                     slots+=count;requests+=count;
                 }
-#endif
+}
             }
         }
         V9_FETCH_PROFILE(if(postBegin)postTicks+=GetSystemCycle()-postBegin;)
@@ -893,58 +884,58 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
             if(processed<state.GetValue(12+q))processed=state.GetValue(12+q);
             state.SetValue(80+epoch*4+q,processed);state.SetValue(12+q,processed);
         }
-        if constexpr(!kBatchedRows) {
+        if(!rt_batchedRows) {
             SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
             DataCopy(rowGm,state,256);
             SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
         }
     }
-    if constexpr(kBatchedRows) {
-        if(lane<SIM_BATCH) {
-            DataCopyExtParams copy;copy.blockCount=(SIM_BATCH-lane+kServiceLanes-1)/kServiceLanes;
-            copy.blockLen=sizeof(Row);copy.srcStride=0;copy.dstStride=(kServiceLanes-1)*sizeof(Row);
+    if(rt_batchedRows) {
+        if(lane<rt_batch) {
+            DataCopyExtParams copy;copy.blockCount=(rt_batch-lane+rt_serviceLanes-1)/rt_serviceLanes;
+            copy.blockLen=sizeof(Row);copy.srcStride=0;copy.dstStride=(rt_serviceLanes-1)*sizeof(Row);
             SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
             DataCopyPad(allRows[lane*256],rowStorage,copy);
             SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
         }
     }
-#if V9_BATCH_POST && SIM_BATCH <= 16
+if (rt_batchedRows) {
     if(postedCount) {
         V9_FETCH_PROFILE(uint64_t begin=GetSystemCycle();)
         uint32_t maxCount=0;
-        for(uint32_t b=lane;b<SIM_BATCH;b+=kServiceLanes) {
-            uint32_t n=cfg.GetValue(256+(b/kServiceLanes)*80+64);if(n>maxCount)maxCount=n;
+        for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
+            uint32_t n=cfg.GetValue(256+(b/rt_serviceLanes)*80+64);if(n>maxCount)maxCount=n;
         }
-        for(uint32_t start=0;start<maxCount;start+=kPostBank) {
-            Simt::VF_CALL<BatchBuild<V9_BATCH_POST==1>>(Simt::Dim3{512,1,1},ctx,epoch,lane,start,
+        for(uint32_t start=0;start<maxCount;start+=rt_postBank) {
+            Simt::VF_CALL<BatchBuild<V9_BATCH_POST==1>>(Simt::Dim3{512,1,1},rt_batch,rt_history,rt_resident,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,ctx,epoch,lane,start,
                 reinterpret_cast<__ubuf__ uint64_t*>(work[512].GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(cfg[256].GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()));
             SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
             SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-            for(uint32_t b=lane;b<SIM_BATCH;b+=kServiceLanes) {
-                uint32_t g=b/kServiceLanes;auto input=cfg[256+g*80];auto in64=input.ReinterpretCast<uint64_t>();
+            for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
+                uint32_t g=b/rt_serviceLanes;auto input=cfg[256+g*80];auto in64=input.ReinterpretCast<uint64_t>();
                 uint32_t count=input.GetValue(64);if(count<=start)continue;
-                uint32_t n=count-start;if(n>kPostBank)n=kPostBank;
+                uint32_t n=count-start;if(n>rt_postBank)n=rt_postBank;
                 uint32_t depth=input.GetValue(19),offset=uint32_t(in64.GetValue(25)+start)&(depth-1);
                 uint32_t first=n<depth-offset?n:depth-offset;
 #if V9_BATCH_POST == 2
-                FinalBuild(reinterpret_cast<__ubuf__ uint32_t*>(work[512+g*kPostBank].GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint32_t*>(work[1024+g*kPostBank].GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint32_t*>(work[1536+g*kPostBank].GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint32_t*>(scratch[g*kPostBank*16].GetPhyAddr()),
+                FinalBuild(rt_tokenBytes,reinterpret_cast<__ubuf__ uint32_t*>(work[512+g*rt_postBank].GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ uint32_t*>(work[1024+g*rt_postBank].GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ uint32_t*>(work[1536+g*rt_postBank].GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ uint32_t*>(scratch[g*rt_postBank*16].GetPhyAddr()),
                     reinterpret_cast<__ubuf__ uint32_t*>(work[g*32].GetPhyAddr()),0,n,count-start);
                 SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
 #endif
                 GlobalTensor<uint32_t> sq;sq.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(in64.GetValue(7)));
-                DataCopy(sq[offset*16],scratch[g*kPostBank*16],first*16);
-                if(first<n)DataCopy(sq,scratch[(g*kPostBank+first)*16],(n-first)*16);
+                DataCopy(sq[offset*16],scratch[g*rt_postBank*16],first*16);
+                if(first<n)DataCopy(sq,scratch[(g*rt_postBank+first)*16],(n-first)*16);
             }
             SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
         }
-        for(uint32_t b=lane;b<SIM_BATCH;b+=kServiceLanes) {
-            auto input=cfg[256+(b/kServiceLanes)*80];auto in64=input.ReinterpretCast<uint64_t>();
+        for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
+            auto input=cfg[256+(b/rt_serviceLanes)*80];auto in64=input.ReinterpretCast<uint64_t>();
             uint32_t count=input.GetValue(64);if(!count)continue;
             in64.SetValue(25,in64.GetValue(25)+count);
             GlobalTensor<uint32_t> queue;queue.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(in64.GetValue(36)));
@@ -952,8 +943,8 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
             DataCopy(queue,input[48],16);
         }
         SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
-        for(uint32_t b=lane;b<SIM_BATCH;b+=kServiceLanes) {
-            auto input=cfg[256+(b/kServiceLanes)*80];if(!input.GetValue(64))continue;
+        for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
+            auto input=cfg[256+(b/rt_serviceLanes)*80];if(!input.GetValue(64))continue;
             auto in64=input.ReinterpretCast<uint64_t>();uint64_t db=in64.GetValue(8),head=in64.GetValue(25);
 #if V9_SIMULATION
             *reinterpret_cast<__gm__ uint64_t*>(db)=head;
@@ -964,7 +955,7 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
         }
         V9_FETCH_PROFILE(postTicks+=GetSystemCycle()-begin;)
     }
-#endif
+}
     V9_FETCH_PROFILE(event->scanTicks=scanTicks;event->candidateTicks=candidateTicks;event->postTicks=postTicks;)
     V9_FETCH_PROFILE(event->bitmapBytes=bitmapBytes;event->candidateCount=totalCandidates;event->postedCount=postedCount;)
     V9_FETCH_PROFILE(event->end=GetSystemCycle();)event->complete=1;
@@ -973,9 +964,9 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
 }
 
 namespace rotating {
-__aicore__ inline void Service(GM_ADDR pointer, uint32_t epoch, uint32_t core,
+__aicore__ inline void Service(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_splitQ,uint32_t rt_rounds,uint32_t rt_serviceAics,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer, uint32_t epoch, uint32_t core,
     uint32_t lane, LocalTensor<uint32_t> scratch, LocalTensor<uint16_t> flags,
     LocalTensor<uint32_t> indices) {
-    FastService(pointer, epoch, core, ServiceLane(core,lane), scratch, flags, indices);
+    FastService(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices);
 }
 }

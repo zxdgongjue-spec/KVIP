@@ -38,7 +38,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void Update(__gm__ uint64_t* a, 
     }
   }
   asc_syncthreads();
-  if (!status[0]) BuildUpdatePlan<kThreads>(lru, changes, SIM_HISTORY, SIM_RESIDENT, work, status);
+  if (!status[0]) BuildUpdatePlan<kThreads>(lru, changes, uint32_t(a[24]), uint32_t(a[25]), work, status);
   asc_syncthreads();
   if (!tid) asc_stcg(reinterpret_cast<__gm__ uint32_t*>(a[6]) + b, status[0]);
   auto plan = reinterpret_cast<__gm__ uint32_t*>(a[checkTransport ? 17 : 10]) + uint64_t(b) * kTransferPlanWords;
@@ -47,7 +47,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void Update(__gm__ uint64_t* a, 
     asc_threadfence();
     return;
   }
-  PublishUpdatePlan<kThreads>(work, status, plan, SIM_RESIDENT);
+  PublishUpdatePlan<kThreads>(work, status, plan, uint32_t(a[25]));
   asc_threadfence();
 }
 // Service output adaptation runs before Apply changes logical Index ownership.
@@ -68,7 +68,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PublishOutputs(__gm__ uint6
     uint64_t owner = active ? asc_ldcg(owners + sourceRow / 4) : 0;
     for (uint32_t k = threadIdx.x; k < 2048; k += 512) {
       int32_t token = active ? asc_ldcg(topk + sourceRow * 2048 + k) : -1;
-      int32_t id = token >= 0 ? static_cast<int32_t>(asc_ldcg(logical + owner * SIM_HISTORY + token)) : -1;
+      int32_t id = token >= 0 ? static_cast<int32_t>(asc_ldcg(logical + owner * uint32_t(a[24]) + token)) : -1;
       int32_t slot = active ? asc_ldcg(slots + sourceRow * 2048 + k) : -1;
       asc_stcg(logicalOut + uint64_t(row) * 2048 + k, id);
       asc_stcg(slotsOut + uint64_t(row) * 2048 + k, slot);

@@ -12,7 +12,7 @@
 namespace rotating {
 // The demo's SIMD compaction keeps hot TopK entries out of the SIMT worklist.
 // Runtime work scales with selected cold entries, not all four 2048-entry rows.
-__simd_vf__ inline void ColdPositions(__ubuf__ uint32_t* selected,
+__simd_vf__ inline void ColdPositions(uint32_t rt_history,uint32_t rt_resident,__ubuf__ uint32_t* selected,
     __ubuf__ uint32_t* locations,__ubuf__ uint32_t* positions,__ubuf__ uint32_t* count) {
     using namespace MicroAPI;
     auto all=CreateMask<uint32_t,MaskPattern::ALL>();
@@ -26,11 +26,11 @@ __simd_vf__ inline void ColdPositions(__ubuf__ uint32_t* selected,
         LoadAlign(ids,selected+i);StoreAlign(locations+i,ids,all);
         MaskReg invalid,notPadding,valid;
         CompareScalar<uint32_t,CMPMODE::NE>(notPadding,ids,UINT32_MAX,all);
-        CompareScalar<uint32_t,CMPMODE::GE>(invalid,ids,uint32_t(SIM_HISTORY),all);
+        CompareScalar<uint32_t,CMPMODE::GE>(invalid,ids,uint32_t(rt_history),all);
         MaskAnd(invalid,invalid,notPadding,all);
         Duplicate<uint32_t,MaskMergeMode::ZEROING>(flags,uint32_t(1),invalid);Or(errors,errors,flags,all);
-        MaskReg cold;CompareScalar<uint32_t,CMPMODE::GE>(cold,ids,uint32_t(SIM_RESIDENT),all);
-        CompareScalar<uint32_t,CMPMODE::LT>(valid,ids,uint32_t(SIM_HISTORY),all);
+        MaskReg cold;CompareScalar<uint32_t,CMPMODE::GE>(cold,ids,uint32_t(rt_resident),all);
+        CompareScalar<uint32_t,CMPMODE::LT>(valid,ids,uint32_t(rt_history),all);
         MaskAnd(cold,cold,valid,all);
         Duplicate<uint32_t,MaskMergeMode::ZEROING>(flags,uint32_t(1),cold);
         Add(total,total,flags,all);
@@ -45,13 +45,13 @@ __simd_vf__ inline void ColdPositions(__ubuf__ uint32_t* selected,
 // slots that no final query references. Never overwrite a protected hot slot.
 template<uint32_t Threads>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
-inline void Resolve(__ubuf__ int32_t* selected, __ubuf__ int32_t* locations,
+inline void Resolve(uint32_t rt_history,uint32_t rt_resident,uint32_t rt_tokenBytes,__ubuf__ int32_t* selected, __ubuf__ int32_t* locations,
     __ubuf__ uint32_t* scratch, __ubuf__ uint32_t* positions, uint32_t coldCount, uint32_t usedSlots,
     __gm__ uint32_t* map, __gm__ uint64_t* addresses,
     __gm__ int32_t* blocks, __gm__ int32_t* offsets, __gm__ int32_t* destinations,
     __gm__ uint32_t* total, __gm__ uint32_t* status, uint32_t row) {
     const uint32_t tid=threadIdx.x;
-    constexpr uint32_t seenWords=(SIM_HISTORY+31)/32;
+    const uint32_t seenWords=(rt_history+31)/32;
     auto seen=scratch;
     auto protectedSlots=seen+seenWords;
     auto ids=protectedSlots+kSlots;
@@ -67,15 +67,15 @@ inline void Resolve(__ubuf__ int32_t* selected, __ubuf__ int32_t* locations,
         const uint32_t i=item<coldCount ? positions[item] : 0;
         const int32_t token=item<coldCount ? selected[i] : 0;
         bool fresh=false;
-        if(token<0 || uint32_t(token)>=SIM_HISTORY) {
+        if(token<0 || uint32_t(token)>=rt_history) {
             asc_atomic_or(counters+2,1U);
         } else if(item<coldCount) {
             const uint32_t slot=asc_ldcg(map+token);
             locations[i]=int32_t(slot);
-            if(uint32_t(token)>=SIM_RESIDENT) {
+            if(uint32_t(token)>=rt_resident) {
                 if(slot!=UINT32_MAX) {
-                    if(slot<SIM_RESIDENT || slot>=SIM_RESIDENT+kSlots) asc_atomic_or(counters+2,2U);
-                    else if(!append) asc_atomic_or(protectedSlots+slot-SIM_RESIDENT,1U);
+                    if(slot<rt_resident || slot>=rt_resident+kSlots) asc_atomic_or(counters+2,2U);
+                    else if(!append) asc_atomic_or(protectedSlots+slot-rt_resident,1U);
                 } else {
                     const uint32_t bit=1U<<(uint32_t(token)&31U);
                     fresh=!(asc_atomic_or(seen+(uint32_t(token)>>5),bit)&bit);
@@ -94,7 +94,7 @@ inline void Resolve(__ubuf__ int32_t* selected, __ubuf__ int32_t* locations,
     if(append) {
         // The common case has ample unallocated temporary slots. Avoid
         // scanning/recycling 8192 slots when monotonic allocation suffices.
-        for(uint32_t i=tid;i<counters[0];i+=Threads) freeSlots[i]=SIM_RESIDENT+usedSlots+i;
+        for(uint32_t i=tid;i<counters[0];i+=Threads) freeSlots[i]=rt_resident+usedSlots+i;
         if(!tid)counters[1]=kSlots-usedSlots;
         asc_syncthreads();
     } else {
@@ -127,7 +127,7 @@ inline void Resolve(__ubuf__ int32_t* selected, __ubuf__ int32_t* locations,
         if(tid==Threads-1) counters[1]=begin+localFree;
         asc_syncthreads();
         for(uint32_t slot=tid;slot<kSlots;slot+=Threads)
-            if(!protectedSlots[slot]) freeSlots[begin++]=SIM_RESIDENT+slot;
+            if(!protectedSlots[slot]) freeSlots[begin++]=rt_resident+slot;
         asc_syncthreads();
     }
     if(counters[1]<counters[0] || counters[2]) {
@@ -142,9 +142,9 @@ inline void Resolve(__ubuf__ int32_t* selected, __ubuf__ int32_t* locations,
         const uint64_t remote=asc_ldcg(addresses+token);
         protectedSlots[i]=uint32_t(remote);ids[i]=uint32_t(remote>>32);
         asc_stcg(map+token,slot);
-        asc_stcg(blocks+dst,int32_t(row*(SIM_HISTORY/128)+token/128));
-        asc_stcg(offsets+dst,int32_t((token%128)*kTokenBytes));
-        asc_stcg(destinations+dst,int32_t(row*(SIM_RESIDENT+kSlots)+slot));
+        asc_stcg(blocks+dst,int32_t(row*(rt_history/128)+token/128));
+        asc_stcg(offsets+dst,int32_t((token%128)*rt_tokenBytes));
+        asc_stcg(destinations+dst,int32_t(row*(rt_resident+kSlots)+slot));
     }
     asc_threadfence(); asc_syncthreads();
     for(uint32_t item=tid;item<coldCount;item+=Threads) {
@@ -221,7 +221,7 @@ __simd_vf__ inline void DenseChunk(__ubuf__ uint32_t* selected,__ubuf__ uint32_t
 // This also emits the descriptors needed by the small-SQ transport fallback.
 template<uint32_t Threads>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
-inline void DenseRecords(__ubuf__ uint32_t* tokens,__ubuf__ uint32_t* slots,
+inline void DenseRecords(uint32_t rt_history,uint32_t rt_resident,uint32_t rt_tokenBytes,__ubuf__ uint32_t* tokens,__ubuf__ uint32_t* slots,
     __ubuf__ uint32_t* remoteLow,__ubuf__ uint32_t* remoteHigh,__ubuf__ uint32_t* control,
     __gm__ uint64_t* addresses,__gm__ int32_t* blocks,__gm__ int32_t* offsets,
     __gm__ int32_t* destinations,__gm__ uint32_t* total,__gm__ uint32_t* status,
@@ -234,26 +234,26 @@ inline void DenseRecords(__ubuf__ uint32_t* tokens,__ubuf__ uint32_t* slots,
         const uint64_t remote=asc_ldcg(addresses+token);
         // remoteHigh aliases tokens; each lane reads its token before replacing it.
         remoteLow[i]=uint32_t(remote);remoteHigh[i]=uint32_t(remote>>32);slots[i]=slot;
-        asc_stcg(blocks+dst,int32_t(row*(SIM_HISTORY/128)+token/128));
-        asc_stcg(offsets+dst,int32_t((token%128)*kTokenBytes));
-        asc_stcg(destinations+dst,int32_t(row*(SIM_RESIDENT+kSlots)+slot));
+        asc_stcg(blocks+dst,int32_t(row*(rt_history/128)+token/128));
+        asc_stcg(offsets+dst,int32_t((token%128)*rt_tokenBytes));
+        asc_stcg(destinations+dst,int32_t(row*(rt_resident+kSlots)+slot));
     }
     if(!tid) { asc_stcg(status,0U);asc_stcg(status+1,count);asc_stcg(status+2,control[1]); }
     asc_threadfence();
 }
-__aicore__ inline void DenseFinal(__gm__ Context* ctx,__gm__ Row* row,
+__aicore__ inline void DenseFinal(uint32_t rt_history,uint32_t rt_resident,uint32_t rt_tokenBytes,__gm__ Context* ctx,__gm__ Row* row,
     __gm__ uint32_t* status,LocalTensor<uint32_t> local,uint32_t coldCount,uint32_t b) {
-    constexpr uint32_t seenWords=(SIM_HISTORY+31)/32;
+    const uint32_t seenWords=(rt_history+31)/32;
     auto selected=local;auto locations=local[kSlots];
     auto required=local[2*kSlots];auto mapping=local[3*kSlots];auto tokens=local[4*kSlots];
     auto positions=local[5*kSlots+seenWords+64];auto control=local[5*kSlots+seenWords];
     control.SetValue(0,0);
     SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
     GlobalTensor<uint32_t> map,locationsGm;
-    map.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*SIM_HISTORY);
+    map.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history);
     locationsGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*kSlots);
-    if(coldCount)for(uint32_t base=SIM_RESIDENT;base<SIM_HISTORY;base+=kSlots) {
-        const uint32_t span=SIM_HISTORY-base<kSlots ? SIM_HISTORY-base : kSlots;
+    if(coldCount)for(uint32_t base=rt_resident;base<rt_history;base+=kSlots) {
+        const uint32_t span=rt_history-base<kSlots ? rt_history-base : kSlots;
         DataCopy(mapping,map[base],span);
         SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
         DenseChunk(reinterpret_cast<__ubuf__ uint32_t*>(selected.GetPhyAddr()),
@@ -262,7 +262,7 @@ __aicore__ inline void DenseFinal(__gm__ Context* ctx,__gm__ Row* row,
             reinterpret_cast<__ubuf__ uint32_t*>(mapping.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(tokens.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(locations.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ uint32_t*>(control.GetPhyAddr()),base,span,coldCount,SIM_RESIDENT+row->slots);
+            reinterpret_cast<__ubuf__ uint32_t*>(control.GetPhyAddr()),base,span,coldCount,rt_resident+row->slots);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
         DataCopy(map[base],mapping,span);
         // Next MTE2 load reuses the same UB map; a V-only wait does not protect it.
@@ -275,7 +275,7 @@ __aicore__ inline void DenseFinal(__gm__ Context* ctx,__gm__ Row* row,
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
     uint32_t count=control.GetValue(0);
     if(count) {
-        Simt::VF_CALL<DenseRecords<512>>(Simt::Dim3{512,1,1},
+        Simt::VF_CALL<DenseRecords<512>>(Simt::Dim3{512,1,1},rt_history,rt_resident,rt_tokenBytes,
             reinterpret_cast<__ubuf__ uint32_t*>(tokens.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(mapping.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(required.GetPhyAddr()),
@@ -285,11 +285,11 @@ __aicore__ inline void DenseFinal(__gm__ Context* ctx,__gm__ Row* row,
             reinterpret_cast<__gm__ int32_t*>(ctx->sourceBlocks),
             reinterpret_cast<__gm__ int32_t*>(ctx->sourceOffsets),
             reinterpret_cast<__gm__ int32_t*>(ctx->destinations),
-            reinterpret_cast<__gm__ uint32_t*>(ctx->count),status,count,SIM_RESIDENT+row->slots,b);
+            reinterpret_cast<__gm__ uint32_t*>(ctx->count),status,count,rt_resident+row->slots,b);
         SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
     }
     auto trace=reinterpret_cast<__gm__ uint64_t*>(ctx->owners)+b*16;trace[2]=GetSystemCycle();
-    SubmitFinal(row,mapping,selected,required,tokens,control[8],count);
+    SubmitFinal(rt_tokenBytes,row,mapping,selected,required,tokens,control[8],count);
     status[3]=count && !row->finalPending ? 1U : 0U;
 }
 }
@@ -305,7 +305,7 @@ __simt_callee__ inline uint32_t SparseHash(uint32_t token) {
 }
 template<uint32_t Threads>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
-inline void ResolveSparse(__ubuf__ int32_t* selected,__ubuf__ int32_t* locations,
+inline void ResolveSparse(uint32_t rt_history,uint32_t rt_resident,uint32_t rt_tokenBytes,__ubuf__ int32_t* selected,__ubuf__ int32_t* locations,
     __ubuf__ uint32_t* positions,__ubuf__ uint32_t* table,__ubuf__ uint32_t* ids,
     __ubuf__ uint32_t* slots,__ubuf__ uint32_t* protectedBits,__ubuf__ uint32_t* counters,
     __gm__ uint32_t* map,__gm__ uint64_t* addresses,
@@ -334,8 +334,8 @@ inline void ResolveSparse(__ubuf__ int32_t* selected,__ubuf__ int32_t* locations
                     if(((old&0x7fffffffU)>>13)==token)break;
                     h=(h+1)&(buckets-1);
                 }
-            } else if(!alias && (slot<SIM_RESIDENT || slot>=SIM_RESIDENT+kSlots))asc_atomic_or(counters+2,2U);
-            else if(!alias && !append)asc_atomic_or(protectedBits+(slot-SIM_RESIDENT)/32,1U<<((slot-SIM_RESIDENT)%32));
+            } else if(!alias && (slot<rt_resident || slot>=rt_resident+kSlots))asc_atomic_or(counters+2,2U);
+            else if(!alias && !append)asc_atomic_or(protectedBits+(slot-rt_resident)/32,1U<<((slot-rt_resident)%32));
         }
         uint32_t mask=asc_ballot(fresh),base=0;
         if(!lane && mask)base=asc_atomic_add(counters,uint32_t(__popc(mask)));
@@ -359,7 +359,7 @@ inline void ResolveSparse(__ubuf__ int32_t* selected,__ubuf__ int32_t* locations
             if(!lane && mask)start=asc_atomic_add(counters+3,uint32_t(__popc(mask)));
             start=asc_shfl(start,0);
             uint32_t rank=start+uint32_t(__popc(mask&((1U<<lane)-1U)));
-            if(free && rank<counters[0])slots[rank]=SIM_RESIDENT+slot;
+            if(free && rank<counters[0])slots[rank]=rt_resident+slot;
             asc_syncthreads();
         }
         if(counters[3]<counters[0]) { if(!tid)asc_stcg(status,4U);return; }
@@ -374,7 +374,7 @@ inline void ResolveSparse(__ubuf__ int32_t* selected,__ubuf__ int32_t* locations
         for(uint32_t probe=0;probe<buckets;++probe) {
             const uint32_t word=table[h];
             if(((word&0x7fffffffU)>>13)==token) {
-                locations[position]=int32_t(append ? SIM_RESIDENT+usedSlots+slots[h] : slots[word&8191U]);break;
+                locations[position]=int32_t(append ? rt_resident+usedSlots+slots[h] : slots[word&8191U]);break;
             }
             h=(h+1)&(buckets-1);
         }
@@ -388,14 +388,14 @@ inline void ResolveSparse(__ubuf__ int32_t* selected,__ubuf__ int32_t* locations
     }
     // All lookups finished. The table and IDs now hold packed remote addresses.
     for(uint32_t i=tid;i<counters[0];i+=Threads) {
-        const uint32_t token=ids[i],slot=append?SIM_RESIDENT+usedSlots+i:slots[i],dst=counters[1]+i;
+        const uint32_t token=ids[i],slot=append?rt_resident+usedSlots+i:slots[i],dst=counters[1]+i;
         slots[i]=slot;
         const uint64_t remote=asc_ldcg(addresses+token);
         table[i]=uint32_t(remote);ids[i]=uint32_t(remote>>32);
         asc_stcg(map+token,slot);
-        asc_stcg(blocks+dst,int32_t(row*(SIM_HISTORY/128)+token/128));
-        asc_stcg(offsets+dst,int32_t((token%128)*kTokenBytes));
-        asc_stcg(destinations+dst,int32_t(row*(SIM_RESIDENT+kSlots)+slot));
+        asc_stcg(blocks+dst,int32_t(row*(rt_history/128)+token/128));
+        asc_stcg(offsets+dst,int32_t((token%128)*rt_tokenBytes));
+        asc_stcg(destinations+dst,int32_t(row*(rt_resident+kSlots)+slot));
     }
     if(!tid) { asc_stcg(status,0U);asc_stcg(status+1,counters[0]);asc_stcg(status+2,counters[1]); }
     asc_threadfence();
@@ -407,15 +407,15 @@ inline void ResolveSparse(__ubuf__ int32_t* selected,__ubuf__ int32_t* locations
 namespace rotating {
 __aicore__ inline __ubuf__ uint32_t* FinalPtr(LocalTensor<uint32_t> x) {return reinterpret_cast<__ubuf__ uint32_t*>(x.GetPhyAddr());}
 
-__aicore__ inline __gm__ FinalPost* FinalPostAt(__gm__ Context* ctx,uint32_t core) {
-    return reinterpret_cast<__gm__ FinalPost*>(ctx->owners+kFinalPostOffset)+core;
+__aicore__ inline __gm__ FinalPost* FinalPostAt(uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t core) {
+    return reinterpret_cast<__gm__ FinalPost*>(ctx->owners+rt_finalPostOffset)+core;
 }
-__aicore__ inline void PublishFinalWorker(__gm__ Context* ctx,__gm__ Row* row,
+__aicore__ inline void PublishFinalWorker(uint32_t rt_batch,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,uint32_t rt_tokenBytes,__gm__ Context* ctx,__gm__ Row* row,
     uint32_t b,uint32_t w,uint32_t own,uint32_t batchCount,uint32_t descriptor,uint32_t error,
     LocalTensor<uint32_t> local,LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,
     LocalTensor<uint32_t> slots,LocalTensor<uint32_t> ctl) {
-    auto args=reinterpret_cast<__gm__ KvafExecuteBatchGetKernelArgs*>(ctx->args)+FinalQueue(b,w);
-    auto post=FinalPostAt(ctx,b*kFinalWorkers+w);
+    auto args=reinterpret_cast<__gm__ KvafExecuteBatchGetKernelArgs*>(ctx->args)+FinalQueue(rt_batch,rt_finalWorkers,b,w);
+    auto post=FinalPostAt(rt_finalPostOffset,ctx,b*rt_finalWorkers+w);
     auto cfg=ctl[1024],meta=ctl[1280],queueLocal=ctl[1344];
     GlobalTensor<uint32_t> entityGm,queueGm;
     entityGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(args->channel_entity));
@@ -436,12 +436,12 @@ __aicore__ inline void PublishFinalWorker(__gm__ Context* ctx,__gm__ Row* row,
     if(submit){
         cfg.SetValue(1,6U<<8);cfg.SetValue(2,(meta.GetValue(20)&0xffffffU)|0x1000000U);cfg.SetValue(3,meta.GetValue(6)&0xfffffU);
         for(uint32_t j=0;j<4;++j)cfg.SetValue(4+j,meta.GetValue(22+j));
-        cfg.SetValue(8,meta.GetValue(7));cfg.SetValue(9,0);cfg.SetValue(12,kTokenBytes);cfg.SetValue(13,meta.GetValue(12));
+        cfg.SetValue(8,meta.GetValue(7));cfg.SetValue(9,0);cfg.SetValue(12,rt_tokenBytes);cfg.SetValue(13,meta.GetValue(12));
         cfg.SetValue(14,uint32_t(row->output));cfg.SetValue(15,uint32_t(row->output>>32));cfg.SetValue(16,uint32_t(head));cfg.SetValue(17,depth);
         SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
         GlobalTensor<uint32_t> sq;sq.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(meta64.GetValue(7)));
         for(uint32_t begin=0;begin<own;begin+=1024){uint32_t n=own-begin<1024?own-begin:1024;
-            FinalBuild(FinalPtr(remoteLow),FinalPtr(remoteHigh),FinalPtr(slots),FinalPtr(local),FinalPtr(cfg),begin,n,own);
+            FinalBuild(rt_tokenBytes,FinalPtr(remoteLow),FinalPtr(remoteHigh),FinalPtr(slots),FinalPtr(local),FinalPtr(cfg),begin,n,own);
             SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
             uint32_t start=uint32_t(head+begin)&(depth-1),first=n<depth-start?n:depth-start;
             DataCopy(sq[start*16],local,first*16);if(first<n)DataCopy(sq,local[first*16],(n-first)*16);
@@ -490,7 +490,7 @@ static_assert(V9_USER_UB_BYTES + 6144 <= 229376,
 }
 
 namespace rotating {
-__simd_vf__ inline void OwnedColdPositions(__ubuf__ uint32_t* selected,
+__simd_vf__ inline void OwnedColdPositions(uint32_t rt_history,uint32_t rt_resident,uint32_t rt_finalWorkers,__ubuf__ uint32_t* selected,
     __ubuf__ uint32_t* locations,__ubuf__ uint32_t* positions,__ubuf__ uint32_t* count,uint32_t worker) {
     using namespace MicroAPI;
     auto all=CreateMask<uint32_t,MaskPattern::ALL>();
@@ -499,13 +499,13 @@ __simd_vf__ inline void OwnedColdPositions(__ubuf__ uint32_t* selected,
     RegTensor<int32_t> signedIndex;
     auto& index=reinterpret_cast<RegTensor<uint32_t>&>(signedIndex);
     Arange(signedIndex,int32_t(0));Duplicate(total,uint32_t(0));Duplicate(errors,uint32_t(0));
-    Duplicate(ownedTotal,uint32_t(0));Duplicate(ownerMask,uint32_t(kFinalWorkers-1));
+    Duplicate(ownedTotal,uint32_t(0));Duplicate(ownerMask,uint32_t(rt_finalWorkers-1));
     ClearSpr<SpecialPurposeReg::AR>();UnalignRegForStore store;
     for(uint16_t i=0;i<kSlots;i+=64) {
         LoadAlign(ids,selected+i);StoreAlign(locations+i,ids,all);
-        MaskReg invalid;CompareScalar<uint32_t,CMPMODE::GE>(invalid,ids,uint32_t(SIM_HISTORY),all);
+        MaskReg invalid;CompareScalar<uint32_t,CMPMODE::GE>(invalid,ids,uint32_t(rt_history),all);
         Duplicate<uint32_t,MaskMergeMode::ZEROING>(flags,uint32_t(1),invalid);Or(errors,errors,flags,all);
-        MaskReg cold;CompareScalar<uint32_t,CMPMODE::GE>(cold,ids,uint32_t(SIM_RESIDENT),all);
+        MaskReg cold;CompareScalar<uint32_t,CMPMODE::GE>(cold,ids,uint32_t(rt_resident),all);
         Duplicate<uint32_t,MaskMergeMode::ZEROING>(flags,uint32_t(1),cold);
         Add(total,total,flags,all);
         Muls(hash,ids,uint32_t(0x9e3779b9U),all);ShiftRights(hash,hash,int16_t(16),all);And(hash,hash,ownerMask,all);
@@ -524,12 +524,12 @@ __simd_vf__ inline void OwnedColdPositions(__ubuf__ uint32_t* selected,
 
 // Token ownership keeps all query duplicates on one worker. Only counts and
 // protected-slot bitsets cross workers; the hot path has no global hash atomics.
-__simt_callee__ inline uint32_t FinalOwner(uint32_t token) {
-    return ((token*0x9e3779b9U)>>16)&(kFinalWorkers-1);
+__simt_callee__ inline uint32_t FinalOwner(uint32_t rt_finalWorkers,uint32_t token) {
+    return ((token*0x9e3779b9U)>>16)&(rt_finalWorkers-1);
 }
 template<uint32_t Threads>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
-inline void ParallelCollect(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc,
+inline void ParallelCollect(uint32_t rt_history,uint32_t rt_resident,uint32_t rt_finalWorkers,__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc,
     __ubuf__ uint32_t* positions,uint32_t coldCount,
     __ubuf__ uint32_t* keys,__ubuf__ uint32_t* ranks,__ubuf__ uint16_t* ids,
     __ubuf__ uint32_t* control,__gm__ uint32_t* map,uint32_t worker,uint32_t used,bool protect) {
@@ -543,8 +543,8 @@ inline void ParallelCollect(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc,
         bool fresh=false;uint32_t token=0,h=0;
         if(i<coldCount) {
             uint32_t pos=positions[i];token=selected[pos];
-            if(token>=SIM_HISTORY)asc_atomic_or(control+1,1U);
-            else if(FinalOwner(token)==worker) {
+            if(token>=rt_history)asc_atomic_or(control+1,1U);
+            else if(FinalOwner(rt_finalWorkers,token)==worker) {
                 bool alias=pos>=2*kTop && selected[pos-2*kTop]==token;
                 uint32_t slot=alias?UINT32_MAX-1:(used?asc_ldcg(map+token):UINT32_MAX);
                 loc[pos]=slot;
@@ -557,8 +557,8 @@ inline void ParallelCollect(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc,
                         h=(h+1)&(buckets-1);
                     }
                 } else if(alias){}
-                else if(slot<SIM_RESIDENT || slot>=SIM_RESIDENT+kSlots)asc_atomic_or(control+1,2U);
-                else if(protect)asc_atomic_or(control+32+(slot-SIM_RESIDENT)/32,1U<<((slot-SIM_RESIDENT)%32));
+                else if(slot<rt_resident || slot>=rt_resident+kSlots)asc_atomic_or(control+1,2U);
+                else if(protect)asc_atomic_or(control+32+(slot-rt_resident)/32,1U<<((slot-rt_resident)%32));
             }
         }
         uint32_t mask=asc_ballot(fresh),base=0;
@@ -570,7 +570,7 @@ inline void ParallelCollect(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc,
 }
 template<uint32_t Threads>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
-inline void ParallelEmit(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc,
+inline void ParallelEmit(uint32_t rt_history,uint32_t rt_resident,uint32_t rt_finalWorkers,uint32_t rt_tokenBytes,__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc,
     __ubuf__ uint32_t* positions,uint32_t coldCount,__ubuf__ uint32_t* keys,
     __ubuf__ uint32_t* ranks,__ubuf__ uint16_t* ids,__ubuf__ uint32_t* slots,
     __ubuf__ uint32_t* control,__ubuf__ uint32_t* protections,
@@ -581,11 +581,11 @@ inline void ParallelEmit(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc,
     uint32_t tid=threadIdx.x;
     const uint32_t buckets=coldCount<=1024?2048U:(coldCount<=2048?4096U:8192U);
     if(used+batchCount<=kSlots) {
-        for(uint32_t i=tid;i<ownCount;i+=Threads)slots[i]=SIM_RESIDENT+used+prefix+i;
+        for(uint32_t i=tid;i<ownCount;i+=Threads)slots[i]=rt_resident+used+prefix+i;
     } else {
         if(tid<256) {
             uint32_t bits=0;
-            for(uint32_t w=0;w<kFinalWorkers;++w)bits|=protections[w*256+tid];
+            for(uint32_t w=0;w<rt_finalWorkers;++w)bits|=protections[w*256+tid];
             control[32+tid]=bits;control[288+tid]=uint32_t(__popc(~bits));
         }
         asc_syncthreads();
@@ -604,14 +604,14 @@ inline void ParallelEmit(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc,
         for(uint32_t s=tid;s<kSlots;s+=Threads) {
             uint32_t bits=control[32+s/32],bit=s%32;
             uint32_t rank=control[288+s/32]+uint32_t(__popc((~bits)&((1U<<bit)-1U)));
-            if(!(bits&(1U<<bit)) && rank>=prefix && rank<prefix+ownCount)slots[rank-prefix]=SIM_RESIDENT+s;
+            if(!(bits&(1U<<bit)) && rank>=prefix && rank<prefix+ownCount)slots[rank-prefix]=rt_resident+s;
         }
     }
     asc_syncthreads();
     if(control[1])return;
     for(uint32_t i=tid;i<coldCount;i+=Threads) {
         uint32_t pos=positions[i],token=selected[pos];
-        if(FinalOwner(token)!=worker)continue;
+        if(FinalOwner(rt_finalWorkers,token)!=worker)continue;
         uint32_t slot=loc[pos];
         if(slot==UINT32_MAX-1)slot=loc[pos-2*kTop];
         if(slot==UINT32_MAX){uint32_t h=SparseHash(token)&(buckets-1);while(keys[h]!=token)h=(h+1)&(buckets-1);slot=slots[ranks[h]];}
@@ -624,14 +624,14 @@ inline void ParallelEmit(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc,
         uint64_t remote=asc_ldcg(addresses+token);
         keys[i]=uint32_t(remote);ranks[i]=uint32_t(remote>>32);
         asc_stcg(map+token,slot);
-        asc_stcg(blocks+dst,int32_t(batch*(SIM_HISTORY/128)+token/128));
-        asc_stcg(offsets+dst,int32_t((token%128)*kTokenBytes));
-        asc_stcg(destinations+dst,int32_t(batch*(SIM_RESIDENT+kSlots)+slot));
+        asc_stcg(blocks+dst,int32_t(batch*(rt_history/128)+token/128));
+        asc_stcg(offsets+dst,int32_t((token%128)*rt_tokenBytes));
+        asc_stcg(destinations+dst,int32_t(batch*(rt_resident+kSlots)+slot));
     }
     asc_threadfence();
 }
-__aicore__ inline void ParallelFinal(__gm__ Context* ctx) {
-    const uint32_t core=GetBlockIdx(),b=core/kFinalWorkers,w=core%kFinalWorkers;
+__aicore__ inline void ParallelFinal(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_finalWorkers,uint32_t rt_finalCores,uint32_t rt_finalPostOffset,uint32_t rt_tokenBytes,__gm__ Context* ctx) {
+    const uint32_t core=GetBlockIdx(),b=core/rt_finalWorkers,w=core%rt_finalWorkers;
     auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
     auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
     auto trace=reinterpret_cast<__gm__ uint64_t*>(ctx->owners)+b*16;
@@ -645,14 +645,14 @@ __aicore__ inline void ParallelFinal(__gm__ Context* ctx) {
     GlobalTensor<uint32_t> input,output,shared;
     input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->selected)+b*kSlots);
     output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*kSlots);
-    shared.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->owners)+SIM_BATCH*32);
+    shared.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->owners)+rt_batch*32);
     DataCopy(selected,input,kSlots);
     SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-    OwnedColdPositions(FinalPtr(selected),FinalPtr(loc),FinalPtr(positions),FinalPtr(ctl[2048]),w);
+    OwnedColdPositions(rt_history,rt_resident,rt_finalWorkers,FinalPtr(selected),FinalPtr(loc),FinalPtr(positions),FinalPtr(ctl[2048]),w);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
     uint32_t cold=ctl.GetValue(2048),invalid=ctl.GetValue(2056);
-    Simt::VF_CALL<ParallelCollect<512>>(Simt::Dim3{512,1,1},FinalPtr(selected),FinalPtr(loc),FinalPtr(positions),cold,
-        FinalPtr(keys),FinalPtr(ranks),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(ctl),reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*SIM_HISTORY,w,row->slots,row->slots+ctl.GetValue(2064)>kSlots);
+    Simt::VF_CALL<ParallelCollect<512>>(Simt::Dim3{512,1,1},rt_history,rt_resident,rt_finalWorkers,FinalPtr(selected),FinalPtr(loc),FinalPtr(positions),cold,
+        FinalPtr(keys),FinalPtr(ranks),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(ctl),reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history,w,row->slots,row->slots+ctl.GetValue(2064)>kSlots);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
     uint32_t error=ctl.GetValue(1)|invalid|row->error|(row->slots>kSlots?32U:0U);
 
@@ -660,38 +660,38 @@ __aicore__ inline void ParallelFinal(__gm__ Context* ctx) {
     SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
     DataCopy(shared[core*kFinalStateWords],ctl,kFinalStateWords);
     // Initialize hot locations exactly once; cold overwrites follow the barrier.
-    DataCopy(output[w*(kSlots/kFinalWorkers)],selected[w*(kSlots/kFinalWorkers)],kSlots/kFinalWorkers);
+    DataCopy(output[w*(kSlots/rt_finalWorkers)],selected[w*(kSlots/rt_finalWorkers)],kSlots/rt_finalWorkers);
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     SyncAll<true>();
     auto counts=ctl[1024];
-    DataCopyExtParams cp{uint16_t(kFinalCores),32,uint32_t(kFinalStateWords*4-32),0,0};
+    DataCopyExtParams cp{uint16_t(rt_finalCores),32,uint32_t(kFinalStateWords*4-32),0,0};
     DataCopyPad(counts,shared,cp,DataCopyPadExtParams<uint32_t>{false,0,0,0});
     SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
     uint32_t globalBase=0,batchBase=0,batchCount=0,prefix=0;
-    for(uint32_t c=0;c<kFinalCores;++c){uint32_t n=counts.GetValue(c*8);if(c<core)globalBase+=n;if(c<b*kFinalWorkers)batchBase+=n;if(c/kFinalWorkers==b){batchCount+=n;error|=counts.GetValue(c*8+1);if(c<core)prefix+=n;}}
+    for(uint32_t c=0;c<rt_finalCores;++c){uint32_t n=counts.GetValue(c*8);if(c<core)globalBase+=n;if(c<b*rt_finalWorkers)batchBase+=n;if(c/rt_finalWorkers==b){batchCount+=n;error|=counts.GetValue(c*8+1);if(c<core)prefix+=n;}}
     uint32_t own=counts.GetValue(core*8);
-    if(!core){uint32_t total=0;for(uint32_t c=0;c<kFinalCores;++c)total+=counts.GetValue(c*8);*reinterpret_cast<__gm__ uint32_t*>(ctx->count)=total;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->count),32);}
+    if(!core){uint32_t total=0;for(uint32_t c=0;c<rt_finalCores;++c)total+=counts.GetValue(c*8);*reinterpret_cast<__gm__ uint32_t*>(ctx->count)=total;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->count),32);}
     if(!w){trace[0]=started;trace[1]=GetSystemCycle();}
     // Counts occupy [1024,1536); protection bits occupy [1536,2560).
     auto protect=ctl[1536];
     if(row->slots+batchCount>kSlots){
-        DataCopyExtParams bp{uint16_t(kFinalWorkers),1024,128,0,0};
-        DataCopyPad(protect,shared[b*kFinalWorkers*kFinalStateWords+32],bp,DataCopyPadExtParams<uint32_t>{false,0,0,0});
+        DataCopyExtParams bp{uint16_t(rt_finalWorkers),1024,128,0,0};
+        DataCopyPad(protect,shared[b*rt_finalWorkers*kFinalStateWords+32],bp,DataCopyPadExtParams<uint32_t>{false,0,0,0});
         SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
     }
     ctl.SetValue(1,error);SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
-    if(!error)Simt::VF_CALL<ParallelEmit<512>>(Simt::Dim3{512,1,1},FinalPtr(selected),FinalPtr(loc),FinalPtr(positions),cold,
+    if(!error)Simt::VF_CALL<ParallelEmit<512>>(Simt::Dim3{512,1,1},rt_history,rt_resident,rt_finalWorkers,rt_tokenBytes,FinalPtr(selected),FinalPtr(loc),FinalPtr(positions),cold,
         FinalPtr(keys),FinalPtr(ranks),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(ctl),FinalPtr(protect),
-        reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*SIM_HISTORY,reinterpret_cast<__gm__ uint64_t*>(row->addresses),
+        reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history,reinterpret_cast<__gm__ uint64_t*>(row->addresses),
         reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*kSlots,reinterpret_cast<__gm__ int32_t*>(ctx->sourceBlocks),
         reinterpret_cast<__gm__ int32_t*>(ctx->sourceOffsets),reinterpret_cast<__gm__ int32_t*>(ctx->destinations),
         w,row->slots,own,batchCount,prefix,globalBase,b);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);error=ctl.GetValue(1);
     if(!w)trace[2]=GetSystemCycle();
-    PublishFinalWorker(ctx,row,b,w,own,batchCount,globalBase,error,local,keys,ranks,slots,ctl);
+    PublishFinalWorker(rt_batch,rt_finalWorkers,rt_finalPostOffset,rt_tokenBytes,ctx,row,b,w,own,batchCount,globalBase,error,local,keys,ranks,slots,ctl);
     if(!w){
         status[0]=error;status[1]=batchCount;status[2]=batchBase;status[3]=0;status[4]=0;
-        row->finalBegin=started;row->finalRequests=batchCount;row->finalHead=FinalPostAt(ctx,core)->head;
+        row->finalBegin=started;row->finalRequests=batchCount;row->finalHead=FinalPostAt(rt_finalPostOffset,ctx,core)->head;
         row->finalPending=batchCount?1:0;row->finalEnd=GetSystemCycle();trace[3]=row->finalEnd;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(trace),64);
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),32);
@@ -710,7 +710,7 @@ namespace rotating {
 // Only disjoint location/descriptor/WQE outputs are partitioned across workers.
 template<uint32_t Threads>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
-inline void ReplicatedResolve(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc,
+inline void ReplicatedResolve(uint32_t rt_history,uint32_t rt_resident,uint32_t rt_finalWorkers,uint32_t rt_tokenBytes,__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc,
     __ubuf__ uint32_t* positions,uint32_t coldCount,__ubuf__ uint32_t* keys,
     __ubuf__ uint32_t* ranks,__ubuf__ uint16_t* ids,__ubuf__ uint32_t* slots,
     __ubuf__ uint32_t* cfg,__gm__ uint32_t* mapping,__gm__ uint64_t* addresses,
@@ -718,7 +718,7 @@ inline void ReplicatedResolve(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc
     __gm__ uint32_t* total,uint32_t worker,uint32_t used,uint32_t batch,__gm__ Context* ctx) {
     uint32_t tid=threadIdx.x,lane=tid%warpSize,warp=tid/warpSize;
     auto lru=ctx->lruSlots ? reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+batch*kLruSlots : nullptr;
-    uint32_t outputStride=OutputStride(ctx),ownerBase=OwnerRow(ctx,batch)*outputStride;
+    uint32_t outputStride=OutputStride(rt_resident,ctx),ownerBase=OwnerRow(ctx,batch)*outputStride;
     uint32_t buckets=coldCount<=1024?2048U:(coldCount<=2048?4096U:8192U);
     for(uint32_t i=tid;i<buckets;i+=Threads){keys[i]=UINT32_MAX;ranks[i]=UINT32_MAX;}
     if(tid<256)cfg[32+tid]=0;
@@ -726,15 +726,15 @@ inline void ReplicatedResolve(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc
     asc_syncthreads();
     for(uint32_t i=tid;i<coldCount;i+=Threads){
         uint32_t pos=positions[i],token=selected[pos];
-        if(token>=SIM_HISTORY){asc_atomic_or(cfg+1,1U);continue;}
+        if(token>=rt_history){asc_atomic_or(cfg+1,1U);continue;}
         if(pos>=2*kTop && selected[pos-2*kTop]==token){loc[pos]=UINT32_MAX-2;continue;}
         uint32_t slot=(used || ctx->tailBounds)?asc_ldcg(mapping+token):UINT32_MAX;loc[pos]=slot;
         if(slot==UINT32_MAX){
             uint32_t h=SparseHash(token)&(buckets-1);
             for(uint32_t n=0;n<buckets;++n){uint32_t old=asc_atomic_cas(keys+h,UINT32_MAX,token);
                 if(old==UINT32_MAX || old==token){asc_atomic_min(ranks+h,pos);break;}h=(h+1)&(buckets-1);}
-        } else if(slot<SIM_RESIDENT || slot>=outputStride)asc_atomic_or(cfg+1,2U);
-        else if(slot<SIM_RESIDENT+kSlots && used+coldCount>kSlots)asc_atomic_or(cfg+32+(slot-SIM_RESIDENT)/32,1U<<((slot-SIM_RESIDENT)%32));
+        } else if(slot<rt_resident || slot>=outputStride)asc_atomic_or(cfg+1,2U);
+        else if(slot<rt_resident+kSlots && used+coldCount>kSlots)asc_atomic_or(cfg+32+(slot-rt_resident)/32,1U<<((slot-rt_resident)%32));
     }
     asc_syncthreads();
     // Mark the first occurrence before replacing hash-table positions by ranks.
@@ -758,7 +758,7 @@ inline void ReplicatedResolve(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc
         uint32_t token=selected[pos],h=SparseHash(token)&(buckets-1);while(keys[h]!=token)h=(h+1)&(buckets-1);
         ids[begin]=uint16_t(pos);ranks[h]=begin++;}
     asc_syncthreads();
-    if(used+count<=kSlots){for(uint32_t i=tid;i<count;i+=Threads)slots[i]=SIM_RESIDENT+used+i;}
+    if(used+count<=kSlots){for(uint32_t i=tid;i<count;i+=Threads)slots[i]=rt_resident+used+i;}
     else {
         uint32_t n=tid<256?uint32_t(__popc(~cfg[32+tid])):0,value=n;
         for(uint32_t d=1;d<warpSize;d*=2){uint32_t prior=asc_shfl_up(value,d);if(lane>=d)value+=prior;}
@@ -772,24 +772,24 @@ inline void ReplicatedResolve(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc
         asc_syncthreads();
         for(uint32_t slot=tid;slot<kSlots;slot+=Threads){uint32_t bits=cfg[32+slot/32],bit=slot%32;
             uint32_t rank=cfg[288+slot/32]+uint32_t(__popc((~bits)&((1U<<bit)-1U)));
-            if(!(bits&(1U<<bit)) && rank<count)slots[rank]=SIM_RESIDENT+slot;}
+            if(!(bits&(1U<<bit)) && rank<count)slots[rank]=rt_resident+slot;}
     }
     asc_syncthreads();
     // Only an empty hot row outside the LRU pool retains its own destination.
     // Reserved hot rows are ordinary misses and keep the allocator's slots.
     for(uint32_t i=tid;i<count;i+=Threads) {
         uint32_t token=selected[ids[i]];
-        if(token<SIM_RESIDENT && !IsTailToken(ctx,batch,token)) {
-            int32_t ordinal=ctx->reservedHot ? asc_ldcg(reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+batch*SIM_RESIDENT+token) : -1;
+        if(token<rt_resident && !IsTailToken(ctx,batch,token)) {
+            int32_t ordinal=ctx->reservedHot ? asc_ldcg(reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+batch*rt_resident+token) : -1;
             if(ordinal<0)slots[i]=token;
         }
     }
     asc_syncthreads();
     if(cfg[1])return;
-    uint32_t ownBegin=count*worker/kFinalWorkers,ownEnd=count*(worker+1)/kFinalWorkers;
+    uint32_t ownBegin=count*worker/rt_finalWorkers,ownEnd=count*(worker+1)/rt_finalWorkers;
     if(!tid){cfg[2]=ownBegin;cfg[3]=ownEnd-ownBegin;if(!worker)asc_atomic_add(total,count);}
     for(uint32_t i=tid;i<coldCount;i+=Threads){uint32_t pos=positions[i];
-        if(pos/(kSlots/kFinalWorkers)!=worker)continue;
+        if(pos/(kSlots/rt_finalWorkers)!=worker)continue;
         uint32_t slot=loc[pos],token=selected[pos];
         if(slot==UINT32_MAX-2)slot=loc[pos-2*kTop];
         if(slot>=UINT32_MAX-1){uint32_t h=SparseHash(token)&(buckets-1);while(keys[h]!=token)h=(h+1)&(buckets-1);slot=slots[ranks[h]];}
@@ -800,24 +800,24 @@ inline void ReplicatedResolve(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc
     // adapter shares the original resolver invocation; no extra VF launch.
     for(uint32_t i=tid;i<coldCount;i+=Threads) {
         uint32_t pos=positions[i];
-        if(pos/(kSlots/kFinalWorkers)==worker)
-            loc[pos]=ResolvePhysicalSlot(lru,loc[pos]);
+        if(pos/(kSlots/rt_finalWorkers)==worker)
+            loc[pos]=ResolvePhysicalSlot(rt_resident,lru,loc[pos]);
     }
     asc_syncthreads(); // Join position readers before descriptor scratch reuse.
     for(uint32_t i=tid;i<ownEnd-ownBegin;i+=Threads){uint32_t rank=ownBegin+i,token=selected[ids[rank]],slot=slots[rank],dst=batch*kSlots+rank;
-        uint64_t remote=asc_ldcg(addresses+token);keys[i]=uint32_t(remote);ranks[i]=uint32_t(remote>>32);positions[i]=ResolvePhysicalSlot(lru,slot);
-        RecordChange(ctx,batch,slot,token);
+        uint64_t remote=asc_ldcg(addresses+token);keys[i]=uint32_t(remote);ranks[i]=uint32_t(remote>>32);positions[i]=ResolvePhysicalSlot(rt_resident,lru,slot);
+        RecordChange(rt_resident,ctx,batch,slot,token);
         // Index rows and their token addresses move together. Deriving a DDR
         // block from the *physical Index position* is wrong after a swap.
-        StoreFallbackSource(ctx,batch,dst,token,remote,blocks,offsets);
+        StoreFallbackSource(rt_history,rt_tokenBytes,ctx,batch,dst,token,remote,blocks,offsets);
         asc_stcg(destinations+dst,int32_t(ownerBase+positions[i]));
     }
     // Mapping remains the immutable prefetch snapshot. Final locations and
     // descriptors are authoritative; mutating mapping here races other readers.
     asc_threadfence();
 }
-__aicore__ inline void ReplicatedFinal(__gm__ Context* ctx) {
-    const uint32_t core=GetBlockIdx(),b=core/kFinalWorkers,w=core%kFinalWorkers;
+__aicore__ inline void ReplicatedFinal(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,uint32_t rt_tokenBytes,__gm__ Context* ctx) {
+    const uint32_t core=GetBlockIdx(),b=core/rt_finalWorkers,w=core%rt_finalWorkers;
     auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
     auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
     auto trace=reinterpret_cast<__gm__ uint64_t*>(ctx->owners)+b*16;
@@ -829,19 +829,19 @@ __aicore__ inline void ReplicatedFinal(__gm__ Context* ctx) {
     GlobalTensor<uint32_t> input,output;input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->selected)+b*kSlots);
     output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*kSlots);
     DataCopy(selected,input,kSlots);SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-    if constexpr(SIM_RESIDENT<=2*kSlots) {
+    if(rt_resident<=2*kSlots) {
         static_assert(6*kSlots<=kFinalControlOffset,"metadata staging overlaps resolver control");
         // Hash/ID/slot scratch is not live yet. Reuse it for two dense metadata
         // rows; release it before ColdPositions and the original resolver.
         GlobalTensor<uint32_t> metadata;
         uint32_t owner=ctx->rowOwners ? reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b] : b;
         if(ctx->hotValid) {
-            metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+owner*SIM_RESIDENT);
-            DataCopy(keys,metadata,SIM_RESIDENT);
+            metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+owner*rt_resident);
+            DataCopy(keys,metadata,rt_resident);
         }
         if(ctx->reservedHot) {
-            metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->reservedHot)+b*SIM_RESIDENT);
-            DataCopy(local[4*kSlots],metadata,SIM_RESIDENT);
+            metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->reservedHot)+b*rt_resident);
+            DataCopy(local[4*kSlots],metadata,rt_resident);
         }
         uint32_t begin=0,end=0;
         if(ctx->tailBounds) {
@@ -849,37 +849,37 @@ __aicore__ inline void ReplicatedFinal(__gm__ Context* ctx) {
             begin=bounds[0];end=bounds[1];
         }
         SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-        Simt::VF_CALL<AdaptColdPredicateLocal>(Simt::Dim3{512,1,1},FinalPtr(selected),FinalPtr(loc),
+        Simt::VF_CALL<AdaptColdPredicateLocal>(Simt::Dim3{512,1,1},rt_resident,FinalPtr(selected),FinalPtr(loc),
             FinalPtr(keys),reinterpret_cast<__ubuf__ int32_t*>(local[4*kSlots].GetPhyAddr()),
             ctx->hotValid!=0,ctx->reservedHot!=0,begin,end);
         PipeBarrier<PIPE_V>();
-        ColdPositions(FinalPtr(loc),FinalPtr(loc),FinalPtr(positions),FinalPtr(ctl[2048]));
+        ColdPositions(rt_history,rt_resident,FinalPtr(loc),FinalPtr(loc),FinalPtr(positions),FinalPtr(ctl[2048]));
     } else {
         // Larger supported resident layouts cannot hold both rows in this UB.
-        Simt::VF_CALL<AdaptColdPredicate>(Simt::Dim3{512,1,1},ctx,b,FinalPtr(selected),FinalPtr(keys));
+        Simt::VF_CALL<AdaptColdPredicate>(Simt::Dim3{512,1,1},rt_resident,ctx,b,FinalPtr(selected),FinalPtr(keys));
         PipeBarrier<PIPE_V>();
-        ColdPositions(FinalPtr(keys),FinalPtr(loc),FinalPtr(positions),FinalPtr(ctl[2048]));
+        ColdPositions(rt_history,rt_resident,FinalPtr(keys),FinalPtr(loc),FinalPtr(positions),FinalPtr(ctl[2048]));
     }
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
     uint32_t cold=ctl.GetValue(2048),error=ctl.GetValue(2056)|row->error|(row->slots>kSlots?32U:0U);
 
     if(!w){trace[0]=started;trace[1]=GetSystemCycle();}
-    if(!error)Simt::VF_CALL<ReplicatedResolve<512>>(Simt::Dim3{512,1,1},FinalPtr(selected),FinalPtr(loc),FinalPtr(positions),cold,
+    if(!error)Simt::VF_CALL<ReplicatedResolve<512>>(Simt::Dim3{512,1,1},rt_history,rt_resident,rt_finalWorkers,rt_tokenBytes,FinalPtr(selected),FinalPtr(loc),FinalPtr(positions),cold,
         FinalPtr(keys),FinalPtr(ranks),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(ctl),
-        reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*SIM_HISTORY,reinterpret_cast<__gm__ uint64_t*>(row->addresses),
+        reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history,reinterpret_cast<__gm__ uint64_t*>(row->addresses),
         reinterpret_cast<__gm__ int32_t*>(ctx->sourceBlocks),reinterpret_cast<__gm__ int32_t*>(ctx->sourceOffsets),
         reinterpret_cast<__gm__ int32_t*>(ctx->destinations),reinterpret_cast<__gm__ uint32_t*>(ctx->count),w,row->slots,b,ctx);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
     uint32_t batchCount=error?0:ctl.GetValue(0),prefix=error?0:ctl.GetValue(2),own=error?0:ctl.GetValue(3),batchBase=b*kSlots;
     if(!error)error=ctl.GetValue(1);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-    DataCopy(output[w*(kSlots/kFinalWorkers)],loc[w*(kSlots/kFinalWorkers)],kSlots/kFinalWorkers);
+    DataCopy(output[w*(kSlots/rt_finalWorkers)],loc[w*(kSlots/rt_finalWorkers)],kSlots/rt_finalWorkers);
     SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
     if(!w)trace[2]=GetSystemCycle();
-    PublishFinalWorker(ctx,row,b,w,own,batchCount,batchBase+prefix,error,local,keys,ranks,positions,ctl);
+    PublishFinalWorker(rt_batch,rt_finalWorkers,rt_finalPostOffset,rt_tokenBytes,ctx,row,b,w,own,batchCount,batchBase+prefix,error,local,keys,ranks,positions,ctl);
     if(!w){
         status[0]=error;status[1]=batchCount;status[2]=batchBase;status[3]=0;status[4]=0;
-        row->finalBegin=started;row->finalRequests=batchCount;row->finalHead=FinalPostAt(ctx,core)->head;
+        row->finalBegin=started;row->finalRequests=batchCount;row->finalHead=FinalPostAt(rt_finalPostOffset,ctx,core)->head;
         row->finalPending=batchCount?1:0;row->finalEnd=GetSystemCycle();trace[3]=row->finalEnd;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(trace),64);
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),32);

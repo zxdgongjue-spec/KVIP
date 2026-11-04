@@ -35,13 +35,6 @@ def _bind_selectors(torch, policy, config):
                 cann=setup.cann,
                 headers=setup.headers,
                 soc=setup.soc,
-                batch=setup.batch,
-                history=storage.history,
-                resident=policy.history_capacity,
-                aics=setup.aics,
-                windows=setup.windows,
-                token_bytes=token_bytes,
-                index_heads=workspace.inputs.index_heads,
             )
         library, update_library = libraries[token_bytes]
         runtime = writer.runtimes[layer.geometry]

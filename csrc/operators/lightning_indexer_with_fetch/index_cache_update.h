@@ -132,7 +132,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512)
 inline void Move(__gm__ uint64_t* a, uint32_t owner, uint32_t group, bool owned,
                  __ubuf__ uint32_t* plan, __ubuf__ uint64_t* staged, uint32_t count) {
   uint32_t tid = threadIdx.x;
-  auto keys = reinterpret_cast<__gm__ uint64_t*>(a[0]) + uint64_t(owner) * SIM_HISTORY * 16;
+  auto keys = reinterpret_cast<__gm__ uint64_t*>(a[0]) + uint64_t(owner) * uint32_t(a[24]) * 16;
   for (uint32_t i = tid; i < count * kKeyFieldsPerWorker; i += Threads) {
     uint32_t row = i / kKeyFieldsPerWorker, field = i % kKeyFieldsPerWorker;
     uint32_t src = plan[kTransferHeaderWords + 2 * row + 1];
@@ -148,9 +148,9 @@ inline void Move(__gm__ uint64_t* a, uint32_t owner, uint32_t group, bool owned,
   // workers without overwriting any of their source bytes.
   if (group == kCopyWorkers - 1) {
     asc_syncthreads();
-    auto scales = reinterpret_cast<__gm__ uint32_t*>(a[1]) + uint64_t(owner) * SIM_HISTORY;
+    auto scales = reinterpret_cast<__gm__ uint32_t*>(a[1]) + uint64_t(owner) * uint32_t(a[24]);
     auto addresses = reinterpret_cast<__gm__ uint64_t*>(a[2]) + uint64_t(owner) * a[7];
-    auto logical = reinterpret_cast<__gm__ uint64_t*>(a[3]) + uint64_t(owner) * SIM_HISTORY;
+    auto logical = reinterpret_cast<__gm__ uint64_t*>(a[3]) + uint64_t(owner) * uint32_t(a[24]);
     for (uint32_t i = tid; i < count * kMetadataFields; i += Threads) {
       uint32_t src = plan[kTransferHeaderWords + 2 * (i / kMetadataFields) + 1];
       uint32_t field = i % kMetadataFields;
@@ -167,7 +167,7 @@ inline void Move(__gm__ uint64_t* a, uint32_t owner, uint32_t group, bool owned,
     }
   }
   if (!group) {
-    auto valid = reinterpret_cast<__gm__ uint32_t*>(a[owned ? 16 : 9]) + uint64_t(owner) * SIM_RESIDENT;
+    auto valid = reinterpret_cast<__gm__ uint32_t*>(a[owned ? 16 : 9]) + uint64_t(owner) * uint32_t(a[25]);
     for (uint32_t i = tid; i < count; i += Threads) {
       uint32_t dst = plan[kTransferHeaderWords + 2 * i];
       if (dst & kInvalidateHot) asc_stcg(valid + (dst & ~kInvalidateHot), uint32_t(0));

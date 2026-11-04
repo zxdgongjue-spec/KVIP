@@ -23,9 +23,9 @@ class FusedIndexSelector:
         if logical_ids.ndim != 2 or not logical_ids.is_contiguous() or logical_ids.dtype != torch.int64:
             raise ValueError("LIFetch logical IDs require contiguous int64 owner/history rows")
         if row_owners.shape != (inputs.batch,) or row_owners.dtype != torch.int32:
-            raise ValueError("LIFetch row owners must match the compiled batch")
+            raise ValueError("LIFetch row owners must match the bound batch")
         if rotating.locations.shape != self.topk.shape:
-            raise ValueError("LIFetch locations and TopK must share the compiled shape")
+            raise ValueError("LIFetch locations and TopK must share the bound shape")
         for actual, expected in (
             (rotating.arguments[0], inputs.query),
             (rotating.arguments[2], inputs.weights),

@@ -109,7 +109,7 @@ __aicore__ inline void FillRoundWords(uint64_t address,uint32_t words,
     }
     // Caller joins the whole fill group before reusing the shared UB value.
 }
-__aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
+__aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t b) {
     TPipe pipe;TBuf<TPosition::VECCALC> storage;pipe.InitBuffer(storage,4096*4);
     auto local=storage.Get<uint32_t>();
     Duplicate(local,uint32_t(0),4096);
@@ -117,13 +117,13 @@ __aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
     FillRoundWords(ctx->rows+b*sizeof(Row),sizeof(Row)/4,local);
     FillRoundWords(ctx->progress+b*4*sizeof(Progress),4*sizeof(Progress)/4,local);
     FillRoundWords(ctx->owners+b*128,32,local);
-    FillRoundWords(ctx->owners+SIM_BATCH*128+b*kFinalWorkers*kFinalStateWords*4,kFinalWorkers*kFinalStateWords,local);
-    FillRoundWords(ctx->owners+kFinalPostOffset+b*kFinalWorkers*sizeof(FinalPost),kFinalWorkers*sizeof(FinalPost)/4,local);
+    FillRoundWords(ctx->owners+rt_batch*128+b*rt_finalWorkers*kFinalStateWords*4,rt_finalWorkers*kFinalStateWords,local);
+    FillRoundWords(ctx->owners+rt_finalPostOffset+b*rt_finalWorkers*sizeof(FinalPost),rt_finalWorkers*sizeof(FinalPost)/4,local);
     FillRoundWords(ctx->rowStatus+b*kRowStatusWords*4,kRowStatusWords,local);
     FillRoundWords(ctx->finalStatus+b*2*sizeof(KvafBatchGetCoreStatus),2*sizeof(KvafBatchGetCoreStatus)/4,local);
     // Both hot and cold predicates are overwritten before progress is
     // published. Original per-query snapshot clipping excludes unready bits.
-    for(uint32_t e=b;e<(kRounds?kRounds:1)*kServiceLanes;e+=SIM_BATCH)
+    for(uint32_t e=b;e<(rt_rounds?rt_rounds:1)*rt_serviceLanes;e+=rt_batch)
         FillRoundWords(ctx->events+e*sizeof(Event),sizeof(Event)/4,local);
     if(!b) {
         *reinterpret_cast<__gm__ uint32_t*>(ctx->count)=0;
@@ -132,7 +132,7 @@ __aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
     SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
     Duplicate(local,UINT32_MAX,4096);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-    FillRoundWords(ctx->mapping+uint64_t(b)*SIM_HISTORY*4,SIM_HISTORY,local);
+    FillRoundWords(ctx->mapping+uint64_t(b)*rt_history*4,rt_history,local);
     if(ctx->changes)FillRoundWords(ctx->changes+b*kLruSlots*4,kLruSlots,local);
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     pipe.Destroy();
@@ -140,25 +140,35 @@ __aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
 #endif
 extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
+    auto runtimeShape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(reinterpret_cast<__gm__ uint64_t*>(bindings)[14]));
+    const uint32_t rt_batch = runtimeShape.batch;
+    const uint32_t rt_history = runtimeShape.history;
+    const uint32_t rt_resident = runtimeShape.resident;
+    const uint32_t rt_rounds = runtimeShape.rounds;
+    const uint32_t rt_serviceLanes = runtimeShape.serviceLanes;
+    const uint32_t rt_finalWorkers = runtimeShape.finalWorkers;
+    const uint32_t rt_finalPostOffset = runtimeShape.finalPostOffset;
+    const uint32_t rt_tokenBytes = runtimeShape.tokenBytes;
+
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     if ASCEND_IS_AIV {
-        uint32_t b=GetBlockIdx(); if(b>=SIM_BATCH) return;
+        uint32_t b=GetBlockIdx(); if(b>=rt_batch) return;
         auto ctx=GetContext(bindings);
-        InitializeRound(ctx,b);
+        InitializeRound(rt_batch,rt_history,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b);
         auto args=GetArgs(ctx,b*2);
         auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
         auto entity=reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(args.channel_entity);
         auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args.queue_state);
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
         row->entity=args.channel_entity; row->queue=args.queue_state;
-        constexpr uint64_t prefix=4*2048*6+1024+4*uint64_t(SIM_HISTORY)*2;
-        constexpr uint64_t tail=uint64_t(SIM_HISTORY)*8+8192*64+512;
+        const uint64_t prefix=4*2048*6+1024+4*uint64_t(rt_history)*2;
+        const uint64_t tail=uint64_t(rt_history)*8+8192*64+512;
         auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
         uint32_t owner=ctx->rowOwners ? reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b] : b;
-        uint64_t outputStride=ctx->outputStride ? ctx->outputStride : SIM_RESIDENT+kSlots;
-        row->addresses=ctx->tokenAddresses ? ctx->tokenAddresses+uint64_t(owner)*ctx->addressStride*8 : a[13]+SIM_BATCH*prefix+b*tail;
-        row->output=args.output+uint64_t(owner)*outputStride*kTokenBytes;
-        Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},ctx,b);
+        uint64_t outputStride=ctx->outputStride ? ctx->outputStride : rt_resident+kSlots;
+        row->addresses=ctx->tokenAddresses ? ctx->tokenAddresses+uint64_t(owner)*ctx->addressStride*8 : a[13]+rt_batch*prefix+b*tail;
+        row->output=args.output+uint64_t(owner)*outputStride*rt_tokenBytes;
+        Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},rt_history,rt_resident,ctx,b);
         row->initialHead=queue->sq_producer_index;
         row->limit=kSlots;
         row->prefetchLimit=ctx->prefetchLimit;
@@ -175,15 +185,15 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
             queue->magic=kvaf_device::kQueueMagic; queue->initialized=1;
         }
         if(entity->sq_depth>(1U<<30) || row->initialHead>UINT64_MAX-ctx->prefetchLimit ||
-           args.token_bytes!=kTokenBytes || args.tokens_per_block!=128 ||
+           args.token_bytes!=rt_tokenBytes || args.tokens_per_block!=128 ||
            args.block_count!=1 || args.jettys_per_core!=1)
             row->error=kvaf_device::kInvalidArgs;
         if(entity->magic!=kvaf_device::kEntityMagic || entity->version!=kvaf_device::kEntityVersion ||
            entity->wqe_size!=64 || !entity->cq_va || !entity->cq_db_va ||
            entity->cqe_size<kvaf_device::kCqeProbeBytes || !entity->local_token_id ||
            entity->local_hbm_address!=args.output ||
-           entity->local_hbm_size<(uint64_t(owner)+1)*outputStride*kTokenBytes ||
-           !entity->remote_host_ddr_address || entity->remote_host_ddr_size<kTokenBytes)
+           entity->local_hbm_size<(uint64_t(owner)+1)*outputStride*rt_tokenBytes ||
+           !entity->remote_host_ddr_address || entity->remote_host_ddr_size<rt_tokenBytes)
             row->error=kvaf_device::kInvalidEntity;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
 #endif
@@ -231,18 +241,30 @@ __aicore__ inline void CompletePrefetch(__gm__ Context* ctx,uint32_t b) {
 // Retained for the compute-only diagnostic Graph, which has no final submission.
 extern "C" __global__ __aicore__ void v9_wait_kernel(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
+    auto runtimeShape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(reinterpret_cast<__gm__ uint64_t*>(bindings)[14]));
+    const uint32_t rt_batch = runtimeShape.batch;
+
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     if ASCEND_IS_AIV {
-        uint32_t b=GetBlockIdx();if(b<SIM_BATCH)CompletePrefetch(GetContext(bindings),b);
+        uint32_t b=GetBlockIdx();if(b<rt_batch)CompletePrefetch(GetContext(bindings),b);
     }
 #endif
 }
 extern "C" __global__ __aicore__ void v9_resolve_kernel(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
+    auto runtimeShape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(reinterpret_cast<__gm__ uint64_t*>(bindings)[14]));
+    const uint32_t rt_batch = runtimeShape.batch;
+    const uint32_t rt_history = runtimeShape.history;
+    const uint32_t rt_resident = runtimeShape.resident;
+    const uint32_t rt_finalWorkers = runtimeShape.finalWorkers;
+    const uint32_t rt_finalCores = runtimeShape.finalCores;
+    const uint32_t rt_finalPostOffset = runtimeShape.finalPostOffset;
+    const uint32_t rt_tokenBytes = runtimeShape.tokenBytes;
+
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     if ASCEND_IS_AIV {
-        if constexpr(kFinalReplicated || kFinalWorkers==1)ReplicatedFinal(GetContext(bindings));
-        else ParallelFinal(GetContext(bindings));
+        if(kFinalReplicated || rt_finalWorkers==1)ReplicatedFinal(rt_batch,rt_history,rt_resident,rt_finalWorkers,rt_finalPostOffset,rt_tokenBytes,GetContext(bindings));
+        else ParallelFinal(rt_batch,rt_history,rt_resident,rt_finalWorkers,rt_finalCores,rt_finalPostOffset,rt_tokenBytes,GetContext(bindings));
     }
 #endif
 }
@@ -250,9 +272,15 @@ extern "C" __global__ __aicore__ void v9_resolve_kernel(GM_ADDR bindings) {
 // can be timed without CQ latency. Small queues retain KVAF's bounded fallback.
 extern "C" __global__ __aicore__ void v9_fetch_kernel(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
+    auto runtimeShape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(reinterpret_cast<__gm__ uint64_t*>(bindings)[14]));
+    const uint32_t rt_batch = runtimeShape.batch;
+    const uint32_t rt_resident = runtimeShape.resident;
+    const uint32_t rt_finalWorkers = runtimeShape.finalWorkers;
+    const uint32_t rt_finalPostOffset = runtimeShape.finalPostOffset;
+
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     if ASCEND_IS_AIV {
-        uint32_t b=GetBlockIdx(); if(b>=SIM_BATCH) return;
+        uint32_t b=GetBlockIdx(); if(b>=rt_batch) return;
         auto ctx=GetContext(bindings);
         CompletePrefetch(ctx,b);
         auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
@@ -267,10 +295,10 @@ extern "C" __global__ __aicore__ void v9_fetch_kernel(GM_ADDR bindings) {
         uint64_t error=info[0] ? kvaf_device::kInvalidArgs : row->error;
         uint32_t completed=0,total=0,deferred=0;
         uint64_t lastHead=0,lastCq=0;
-        for(uint32_t w=0;w<kFinalWorkers;++w){
-            auto post=FinalPostAt(ctx,b*kFinalWorkers+w);
+        for(uint32_t w=0;w<rt_finalWorkers;++w){
+            auto post=FinalPostAt(rt_finalPostOffset,ctx,b*rt_finalWorkers+w);
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
-            auto workerArgs=GetArgs(ctx,FinalQueue(b,w));
+            auto workerArgs=GetArgs(ctx,FinalQueue(rt_batch,rt_finalWorkers,b,w));
             auto entity=reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(workerArgs.channel_entity);
             auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(workerArgs.queue_state);
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
@@ -281,11 +309,11 @@ extern "C" __global__ __aicore__ void v9_fetch_kernel(GM_ADDR bindings) {
                 if(!error && !row->pending){
                     workerArgs.indices=ctx->sourceBlocks;workerArgs.offsets=ctx->sourceOffsets;
                     workerArgs.output_indices=ctx->destinations;workerArgs.miss_count=ctx->count;
-                    workerArgs.request_capacity=SIM_BATCH*kSlots;
+                    workerArgs.request_capacity=rt_batch*kSlots;
                     if(ctx->fallbackAddresses) {
                         workerArgs.address_table=ctx->fallbackAddresses;
                         workerArgs.valid_table=ctx->fallbackValid;
-                        workerArgs.table_capacity=SIM_BATCH*kSlots;
+                        workerArgs.table_capacity=rt_batch*kSlots;
                     }
                     kvaf_device::KvafBatchGetDevice(workerArgs,0,post->descriptor,post->count);
                     auto done=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(workerArgs.core_status);
@@ -317,7 +345,7 @@ extern "C" __global__ __aicore__ void v9_fetch_kernel(GM_ADDR bindings) {
         if(row->pending || total!=info[1])error|=kvaf_device::kInvalidArgs;
         info[0]|=uint32_t(error);info[3]=deferred?1:0;info[4]=completed;
         if(!error) {
-            Simt::VF_CALL<PublishCompletedResidency>(Simt::Dim3{256,1,1},ctx,b,total);
+            Simt::VF_CALL<PublishCompletedResidency>(Simt::Dim3{256,1,1},rt_resident,ctx,b,total);
             row->finalPending=0;
         }
         kvaf_device::WriteStatus(status,error,total,completed,lastHead,lastCq,UINT64_MAX,0);
@@ -329,12 +357,26 @@ extern "C" __global__ __aicore__ void v9_fetch_kernel(GM_ADDR bindings) {
 }
 extern "C" __global__ __aicore__ void v9_probe_kernel(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
+    auto runtimeShape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(reinterpret_cast<__gm__ uint64_t*>(bindings)[14]));
+    const uint32_t rt_batch = runtimeShape.batch;
+    const uint32_t rt_history = runtimeShape.history;
+    const uint32_t rt_resident = runtimeShape.resident;
+    const uint32_t rt_splitQ = runtimeShape.splitQ;
+    const uint32_t rt_rounds = runtimeShape.rounds;
+    const uint32_t rt_serviceAics = runtimeShape.serviceAics;
+    const uint32_t rt_serviceLanes = runtimeShape.serviceLanes;
+    const uint32_t rt_tokenBytes = runtimeShape.tokenBytes;
+    const uint32_t rt_postThreads = runtimeShape.postThreads;
+    const uint32_t rt_postBank = runtimeShape.postBank;
+    const uint32_t rt_batchedRows = runtimeShape.batchedRows;
+    const uint32_t rt_scanTokens = runtimeShape.scanTokens;
+
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     if ASCEND_IS_AIV {
-        uint32_t lane=GetBlockIdx(); if(lane>=kServiceLanes) return;
+        uint32_t lane=GetBlockIdx(); if(lane>=rt_serviceLanes) return;
         auto ctx=GetContext(bindings);
         TPipe pipe; TBuf<TPosition::VECCALC> buffer; pipe.InitBuffer(buffer,98304);
-        Service(reinterpret_cast<GM_ADDR>(ctx),V9_PROBE_EPOCH,ServiceCore(V9_PROBE_EPOCH,lane/2),lane%2,
+        Service(rt_batch,rt_history,rt_resident,rt_splitQ,rt_rounds,rt_serviceAics,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,reinterpret_cast<GM_ADDR>(ctx),V9_PROBE_EPOCH,ServiceCore(rt_batch,rt_splitQ,rt_serviceAics,V9_PROBE_EPOCH,lane/2),lane%2,
             buffer.Get<uint32_t>(),buffer.Get<uint16_t>()[24576],buffer.Get<uint32_t>()[20480]);
         pipe.Destroy();
     }
@@ -344,14 +386,30 @@ extern "C" __global__ __aicore__ void v9_probe_kernel(GM_ADDR bindings) {
 #if V9_RESOLVER_COMPARE
 extern "C" __global__ __aicore__ void v9_resolve_original_kernel(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
+    auto runtimeShape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(reinterpret_cast<__gm__ uint64_t*>(bindings)[14]));
+    const uint32_t rt_batch = runtimeShape.batch;
+    const uint32_t rt_history = runtimeShape.history;
+    const uint32_t rt_resident = runtimeShape.resident;
+    const uint32_t rt_finalWorkers = runtimeShape.finalWorkers;
+    const uint32_t rt_finalPostOffset = runtimeShape.finalPostOffset;
+    const uint32_t rt_tokenBytes = runtimeShape.tokenBytes;
+
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    if ASCEND_IS_AIV { resolver_original::original_body::ReplicatedFinal(GetContext(bindings)); }
+    if ASCEND_IS_AIV { resolver_original::original_body::ReplicatedFinal(rt_batch,rt_history,rt_resident,rt_finalWorkers,rt_finalPostOffset,rt_tokenBytes,GetContext(bindings)); }
 #endif
 }
 extern "C" __global__ __aicore__ void v9_resolve_adapted_kernel(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
+    auto runtimeShape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(reinterpret_cast<__gm__ uint64_t*>(bindings)[14]));
+    const uint32_t rt_batch = runtimeShape.batch;
+    const uint32_t rt_history = runtimeShape.history;
+    const uint32_t rt_resident = runtimeShape.resident;
+    const uint32_t rt_finalWorkers = runtimeShape.finalWorkers;
+    const uint32_t rt_finalPostOffset = runtimeShape.finalPostOffset;
+    const uint32_t rt_tokenBytes = runtimeShape.tokenBytes;
+
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    if ASCEND_IS_AIV { resolver_adapted::adapted_body::ReplicatedFinal(GetContext(bindings)); }
+    if ASCEND_IS_AIV { resolver_adapted::adapted_body::ReplicatedFinal(rt_batch,rt_history,rt_resident,rt_finalWorkers,rt_finalPostOffset,rt_tokenBytes,GetContext(bindings)); }
 #endif
 }
 #endif

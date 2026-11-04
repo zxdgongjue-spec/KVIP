@@ -51,7 +51,7 @@ class IndexCacheStorage:
         count = len(page_addresses)
         previous = self.published[owner]
         if count < previous or count * block_size > self.history:
-            raise ValueError("Committed Index address range shrank or exceeds compiled history")
+            raise ValueError("Committed Index address range shrank or exceeds bound history")
         if count == previous:
             return
         pages = self.torch.tensor(page_addresses[previous:], dtype=self.torch.int64, device=self.device)

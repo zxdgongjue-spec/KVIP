@@ -83,6 +83,8 @@ class DirectCacheUpdate:
                 self.output_valid.data_ptr(),
                 self.logical_output.data_ptr(),
                 self.slot_output.data_ptr(),
+                history,
+                hot,
             ],
             dtype=torch.int64,
             device=self.device,

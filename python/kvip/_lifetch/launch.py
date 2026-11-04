@@ -7,8 +7,10 @@ import numpy as np
 
 if __package__:
     from .geometry import final_aivs, li_geometry
+    from .runtime import RuntimeShape
 else:
     from geometry import final_aivs, li_geometry
+    from runtime import RuntimeShape
 
 
 class RotatingLaunch:
@@ -48,12 +50,26 @@ class RotatingLaunch:
             or any(x.device != self.device or not x.is_contiguous() for x in arguments)
         ):
             raise ValueError("V9 requires 14 contiguous input buffers on the same NPU")
+        self.runtime_shape = RuntimeShape.prepare(
+            self.library,
+            batch=batch,
+            history=history,
+            resident=resident,
+            index_heads=arguments[0].numel() // (batch * 4 * 128),
+            aic_count=aic_count,
+            windows=intermediate_fetches,
+            split=li_tiling == "auto",
+            service_aics=service_aics,
+            final_workers=final_workers,
+            token_bytes=token_bytes,
+        )
+        self.shape_pointer = ctypes.byref(self.runtime_shape)
         for name, expected in (
             ("token_bytes", token_bytes),
             ("final_replicated", int(final_strategy == "replicated")),
             ("final_workers", final_aivs(batch, li_tiling, aic_count, final_workers)),
             ("aic_count", aic_count),
-            ("abi_version", 9),
+            ("abi_version", 10),
             (
                 "service_lanes",
                 li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)["service_aivs_per_window"],
@@ -67,12 +83,12 @@ class RotatingLaunch:
             ("history", history),
             ("resident", resident),
             ("simulation", 0),
-            ("context_bytes", 224),
+            ("context_bytes", 304),
             ("row_bytes", 1024),
         ):
             fn = getattr(self.library, "v9_" + name)
-            fn.argtypes, fn.restype = [], ctypes.c_uint32
-            if fn() != expected:
+            fn.argtypes, fn.restype = [ctypes.c_void_p], ctypes.c_uint32
+            if fn(self.shape_pointer) != expected:
                 raise ValueError(f"V9 binary contract mismatch: {name}")
         if not 0 <= prefetch_limit <= 8192 or not 1 <= window_limit <= 480:
             raise ValueError("Invalid V9 admission budgets")
@@ -136,7 +152,7 @@ class RotatingLaunch:
                 or tuple(value.shape) != shape
                 or not value.is_contiguous()
             ):
-                raise ValueError("Shared LIFetch metadata must be contiguous int32 with the compiled shape on this NPU")
+                raise ValueError("Shared LIFetch metadata must be contiguous int32 with the bound shape on this NPU")
             return value
 
         # Shared across layer groups for query bounds; per-group for residency.
@@ -202,13 +218,14 @@ class RotatingLaunch:
                 ).view("u1"),
             )
         )
+        blob = np.concatenate((blob, np.frombuffer(bytes(self.runtime_shape), dtype=np.uint8)))
         self.context = torch.from_numpy(blob.copy()).to(self.device)
         self.arguments = tuple(arguments) + (self.context,)
         self.bindings = torch.tensor([x.data_ptr() for x in self.arguments], dtype=torch.uint64, device=self.device)
         self.functions = {}
         for name in ("init", "li", "wait", "resolve", "fetch", "probe"):
             fn = getattr(self.library, "v9_" + name)
-            fn.argtypes, fn.restype = [ctypes.c_void_p, ctypes.c_void_p], ctypes.c_uint32
+            fn.argtypes, fn.restype = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p], ctypes.c_uint32
             self.functions[name] = fn
         self.reset()
 
@@ -230,7 +247,7 @@ class RotatingLaunch:
 
     def _call(self, name):
         stream = self.torch.npu.current_stream(self.device)
-        result = self.functions[name](self.bindings.data_ptr(), stream.npu_stream)
+        result = self.functions[name](self.bindings.data_ptr(), stream.npu_stream, self.shape_pointer)
         if result:
             raise RuntimeError(f"v9_{name}_launch_failed:{result}")
 

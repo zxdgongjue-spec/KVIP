@@ -91,7 +91,7 @@ class FusedWorkspace:
 
     def arguments(self, storage):
         if storage.history != int(self.block_history):
-            raise ValueError("Index storage differs from the compiled LI workspace")
+            raise ValueError("Index storage differs from the bound LI workspace")
         return (
             self.inputs.query,
             storage.keys,
