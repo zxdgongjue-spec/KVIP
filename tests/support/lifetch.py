@@ -123,6 +123,10 @@ def run(args, run_dir):
                 )
                 command(["cmake", "--build", build, "-j2"], folder / "build.log")
             import hashlib
+            import ctypes
+
+            # Fail before allocating/populating DDR if shared dependencies cannot load.
+            ctypes.CDLL(str((build / "libv9_bridge.so").resolve()))
 
             digest = hashlib.sha256((build / "libv9_bridge.so").read_bytes()).hexdigest()
             if built_digest is not None and digest != built_digest:

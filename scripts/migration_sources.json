@@ -517,7 +517,7 @@
     "csrc/operators/lidu/torch_extension/csrc/lidu_fused_batch_get_prepare_mtp_ops.cpp": "1edb2300d83ce7f44bcc59b6ca994b4602a4c618b2a59c733eedb4d91e769a16",
     "csrc/operators/lidu/torch_extension/nanovllm_dsa_lidu_fused_batch_get_prepare_mtp/__init__.py": "3c0eca925693b7b0afc2d92f12ccb43c96d32d1d8426b779686c423da6949a4b",
     "csrc/operators/lidu/torch_extension/setup.py": "1f30c24149590502e7eb5075322a9afe7bc43da8c84334ea4615b7eefaa2f9db",
-    "csrc/operators/lightning_indexer_with_fetch/CMakeLists.txt": "888f82b73ba219bcfc62fa552815d946701157fb9488fd47b2b1775846696d52",
+    "csrc/operators/lightning_indexer_with_fetch/CMakeLists.txt": "95840579b618a361ab3aaaf3fbe14070a534c0801aaea3fcc5f08fd8646032dd",
     "csrc/operators/lightning_indexer_with_fetch/api.h": "155018ffd5057b00be28d88b2fad3a2058e01ea6cfc909398462f8ac03e9a4d4",
     "csrc/operators/lightning_indexer_with_fetch/context.h": "1f50e529540b3ddc65db8325de9488cd619bd49b8742138380d1ad1b5cc29e1f",
     "csrc/operators/lightning_indexer_with_fetch/index_cache_update.cpp": "f22e77efec82b0f1232242fa5e526794b257a86f8e86d6d37ef84c2afa168ce2",

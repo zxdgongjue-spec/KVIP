@@ -31,3 +31,10 @@ add_library(kvop_cache_update SHARED index_cache_update_host.cpp)
 target_link_libraries(kvop_cache_update PRIVATE kvop_cache_update_kernel host_intf_pub ascendcl)
 
 target_link_libraries(v9_bridge PRIVATE kvop_cache_update)
+
+# CANN may suppress the automatic build RPATH. The two libraries are deployed
+# together; resolve the update dependency relative to the bridge, not the cwd.
+set_target_properties(v9_bridge PROPERTIES
+  SKIP_BUILD_RPATH FALSE
+  BUILD_WITH_INSTALL_RPATH TRUE
+  INSTALL_RPATH "$ORIGIN")

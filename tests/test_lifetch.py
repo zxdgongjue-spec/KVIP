@@ -345,3 +345,23 @@ def test_install_and_cmake_default_to_concrete_a5_target():
     assert default == "Ascend950PR_9599"
     cmake = (ROOT / "csrc/operators/lightning_indexer_with_fetch/CMakeLists.txt").read_text()
     assert f"set(SOC_VERSION {default} CACHE" in cmake
+
+
+def test_bridge_keeps_sibling_rpath_when_toolchain_disables_build_rpath(tmp_path):
+    import re
+    import subprocess
+
+    cmake = (ROOT / "csrc/operators/lightning_indexer_with_fetch/CMakeLists.txt").read_text()
+    properties = re.search(r"set_target_properties\(v9_bridge PROPERTIES.*?\)", cmake, re.S).group()
+    (tmp_path / "empty.cpp").write_text("int placeholder() { return 0; }\n")
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\nproject(rpath_check LANGUAGES CXX)\n"
+        "set(CMAKE_SKIP_BUILD_RPATH TRUE)\nadd_library(v9_bridge SHARED empty.cpp)\n"
+        + properties
+        + '\nfile(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/properties.txt" CONTENT '
+        '"$<TARGET_PROPERTY:v9_bridge,SKIP_BUILD_RPATH>\\n'
+        "$<TARGET_PROPERTY:v9_bridge,BUILD_WITH_INSTALL_RPATH>\\n"
+        '$<TARGET_PROPERTY:v9_bridge,INSTALL_RPATH>")\n'
+    )
+    subprocess.run(["cmake", "-S", str(tmp_path), "-B", str(tmp_path / "build")], check=True, capture_output=True)
+    assert (tmp_path / "build/properties.txt").read_text().splitlines() == ["FALSE", "TRUE", "$ORIGIN"]
