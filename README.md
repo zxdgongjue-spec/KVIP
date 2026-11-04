@@ -7,14 +7,36 @@ the installed Python package because startup builds use its C++ sources.
 
 ## Layout and API
 
-- `csrc/operators/lidu/`: original LIDU host, kernel, Torch extension and build.
-- `csrc/operators/lightning_indexer_with_fetch/`: LI/Fetch, resolver, and mandatory
-  Index update. The update is compiled separately with its original flags and
-  linked into the same launch library.
-- `python/kvip/`: public operators, LRU, ABC, input/workspace and transport adapters.
-- `tests/`: one entry per functional module; `support/` contains shared fixtures,
-  real KVAF setup, correctness checks and timing helpers, not additional test CLIs.
-- `scripts/`: dependency preparation, build, environment and KVAF patches.
+```text
+csrc/operators/
+  lidu/                             # op_host / op_kernel / torch_extension
+  lightning_indexer_with_fetch/
+    include/                        # public ABI, Context and runtime shape
+    op_host/                        # launch entry points and Index-update host binding
+    op_kernel/                      # LI/Fetch lifecycle, prefetch, resolver, Index update
+      indexer/                      # original LI/score/TopK template implementation
+python/kvip/
+  operators/lidu.py
+  operators/lifetch/                 # binding, forward, workspace, tiling, Index update
+  cache/                            # LRU, ABC and persistent Index storage
+  adapters/kvaf.py                   # Runtime lease and shared transport queues
+  adapters/vllm/                     # inputs, selector, startup binding and paged Index import
+  runtime/                          # build cache, library loader, hardware query, integrity
+  _compat.py                        # centralized lazy aliases for legacy kvip imports
+scripts/                            # build, environment and KVAF patches
+tests/
+  operators/lidu/
+  operators/lifetch/                 # single CLI, update tests, support and resolver_reference
+  cache/                            # LRU / ABC
+  adapters/                         # vLLM inputs / KVAF transport
+  runtime/                          # package boundaries and relocation checks
+```
+
+The graph test's Index-update fixture subclasses the production binding; it does
+not build another ABI. Workspace reservation and launch validation use the same
+scratch specification. KVAF and LIFetch use one library loader. Index ingestion
+from vLLM pages belongs to the adapter subclass, not generic persistent storage.
+LIFetch headers containing templates remain headers to preserve compilation.
 
 ```python
 import kvip
@@ -30,18 +52,19 @@ forward = kvip.LIFetch(rotating, update)
 forward()  # round init -> LI/prefetch -> resolver -> Fetch completion -> Index update
 ```
 
-`LIFetch` accepts the existing `RotatingLaunch` and `DirectIndexUpdate` objects;
+`LIFetch` accepts `LIFetchBinding` and `DirectIndexUpdate` objects;
 it is not a new tensor ABI. It retains both objects and uses their preallocated
 bindings. No tensor allocation, synchronization, fixture reset or correctness
 readback is added to `forward()`. Transport/workspace ownership must outlive graph
 replay. Device errors remain available through the existing status/feedback path.
 Individual launch methods remain internal diagnostic interfaces.
 
-`kvip.FusedQueryInputs`, `kvip.FusedWorkspace`, `kvip.IndexCacheStorage`,
+`kvip.QueryInputs`, `kvip.LIFetchWorkspace`, `kvip.IndexCacheStorage`,
 `kvip.build_libraries` and `kvip.bind_selectors` expose the existing service setup.
 `bind_selectors` requires the current vLLM KVAF policy/writer contract; this is not
-an arbitrary vLLM-version plugin. The `kvop` import namespace aliases the same
-package path for existing service imports. Migrating the service installation to
+an arbitrary vLLM-version plugin. The `kvop` package has been removed. External integrations must import `kvip`.
+Legacy `kvip.fused_*` imports resolve lazily to the canonical modules through
+`_compat.py`; there are no duplicate implementation or forwarding files. Migrating the service installation to
 this repository is separate from deleting its existing KVOP checkout.
 
 ## Build
@@ -93,7 +116,7 @@ Graph-mode native/fused comparison using real DDR and the current service LRU:
 ```bash
 cd /vllm-workspace/KVIP
 source scripts/env.sh
-python tests/test_lifetch.py --device 5 --kvaf-server 127.0.0.1:28885 --batches 16 --history 131072 --resident 16384 --index-heads 32 --miss-percent 10 --intermediate-fetches 8 --warmup 4 --iterations 20 --trace-rounds 3
+python tests/operators/lifetch/test_lifetch.py --device 5 --kvaf-server 127.0.0.1:28885 --batches 16 --history 131072 --resident 16384 --index-heads 32 --miss-percent 10 --intermediate-fetches 8 --warmup 4 --iterations 20 --trace-rounds 3
 ```
 
 This uses Q4, TopK 2048, and reports the actual quantized miss fraction. Full-path
@@ -107,14 +130,14 @@ beside it. Snapshot and stateful correctness checks are retained.
 For the original/adapted/fixed resolver comparison, use the same entry:
 
 ```bash
-python tests/test_lifetch.py --device 5 --kvaf-server 127.0.0.1:28885 --batches 8,16 --history 131072 --resident 16384 --index-heads 32 --miss-percent 10 --intermediate-fetches 8 --warmup 4 --iterations 20 --resolver-compare
+python tests/operators/lifetch/test_lifetch.py --device 5 --kvaf-server 127.0.0.1:28885 --batches 8,16 --history 131072 --resident 16384 --index-heads 32 --miss-percent 10 --intermediate-fetches 8 --warmup 4 --iterations 20 --resolver-compare
 ```
 
 Independent LIDU and ABC device checks:
 
 ```bash
-python tests/test_lidu.py --device 5
-python tests/test_abc.py --device 5
+python tests/operators/lidu/test_lidu.py --device 5
+python tests/cache/test_abc.py --device 5
 ```
 
 ## Migration evidence and limits
@@ -160,7 +183,7 @@ compiled library (the runner prints and checks its SHA256):
 ```bash
 cd /vllm-workspace/KVIP
 source scripts/env.sh
-python tests/test_lifetch.py --device 5 --kvaf-server 127.0.0.1:28885 --runtime-shapes --miss-percent 10 --warmup 4 --iterations 20 --trace-rounds 3
+python tests/operators/lifetch/test_lifetch.py --device 5 --kvaf-server 127.0.0.1:28885 --runtime-shapes --miss-percent 10 --warmup 4 --iterations 20 --trace-rounds 3
 ```
 
 The matrix includes B1/B8/B16, history 65536/131072, resident 8192/16384,

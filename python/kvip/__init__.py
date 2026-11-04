@@ -2,10 +2,11 @@
 """Public Python API for KVIP operators and cache state; imports are lazy."""
 
 from importlib import import_module
+from ._compat import install_legacy_imports
 
 __all__ = [
-    "FusedQueryInputs",
-    "FusedWorkspace",
+    "QueryInputs",
+    "LIFetchWorkspace",
     "IndexCacheStorage",
     "LIFetch",
     "SlotLRU",
@@ -15,15 +16,24 @@ __all__ = [
     "update_abc",
 ]
 _EXPORTS = {
-    "FusedQueryInputs": ("fused_inputs", "FusedQueryInputs"),
-    "FusedWorkspace": ("fused_workspace", "FusedWorkspace"),
-    "IndexCacheStorage": ("index_storage", "IndexCacheStorage"),
-    "LIFetch": ("pipeline", "FusedForward"),
-    "SlotLRU": ("lru", "SlotLRU"),
-    "update_abc": ("abc_update", "update_abc"),
-    "bind_selectors": ("fused_service", "bind_selectors"),
-    "build_libraries": ("fused_build", "build_libraries"),
+    "lidu": ("operators.lidu", "lidu"),
+    "QueryInputs": ("adapters.vllm.inputs", "QueryInputs"),
+    "LIFetchWorkspace": ("operators.lifetch.workspace", "LIFetchWorkspace"),
+    "IndexCacheStorage": ("adapters.vllm.index_import", "VllmIndexCacheStorage"),
+    "LIFetch": ("operators.lifetch.forward", "LIFetchForward"),
+    "SlotLRU": ("cache.lru", "SlotLRU"),
+    "update_abc": ("cache.abc", "update_abc"),
+    "bind_selectors": ("adapters.vllm.binding", "bind_selectors"),
+    "build_libraries": ("runtime.build", "build_libraries"),
 }
+
+_EXPORTS.update(
+    {
+        "FusedQueryInputs": ("adapters.vllm.inputs", "QueryInputs"),
+        "FusedWorkspace": ("operators.lifetch.workspace", "LIFetchWorkspace"),
+    }
+)
+install_legacy_imports()
 
 
 def __getattr__(name):
@@ -31,10 +41,3 @@ def __getattr__(name):
         raise AttributeError(name)
     module, symbol = _EXPORTS[name]
     return getattr(import_module(f"{__name__}.{module}"), symbol)
-
-
-def lidu(*args, **kwargs):
-    """Call the original out-parameter LIDU ABI on Torch's current NPU stream."""
-    import nanovllm_dsa_lidu_fused_batch_get_prepare_mtp
-
-    return nanovllm_dsa_lidu_fused_batch_get_prepare_mtp.lidu_fused_batch_get_prepare_mtp_out(*args, **kwargs)

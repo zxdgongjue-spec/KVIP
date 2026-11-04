@@ -2,4 +2,4 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path[:0] = [str(ROOT / "python"), str(ROOT / "tests/support")]
+sys.path[:0] = [str(ROOT / "python"), str(ROOT / "tests/operators/lifetch/support")]

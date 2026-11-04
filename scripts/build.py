@@ -89,7 +89,7 @@ def main():
     # Editable install intentionally retains csrc alongside the Python package.
     call([sys.executable, "-m", "pip", "install", "--no-build-isolation", "-e", ROOT])
     sys.path.insert(0, str(ROOT / "python"))
-    from kvip.fused_build import build_libraries, kvaf_build_paths
+    from kvip.runtime.build import build_libraries, kvaf_build_paths
 
     cann, headers = kvaf_build_paths(dependency / "build-npu")
     print(f"BUILD universal LIFetch; logs under {ROOT / 'build/lifetch'}", flush=True)
