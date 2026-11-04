@@ -31,6 +31,18 @@ def kvaf_build_paths(build_dir):
     return cann, headers
 
 
+def build_failure(log, stage, returncode):
+    """Expose the first diagnostic, not just recursive make's final exit."""
+    lines = log.read_text(errors="replace").splitlines()
+    markers = ("error:", "fatal error:", "cmake error", "error generated", "errors generated")
+    first = next((i for i, line in enumerate(lines) if any(m in line.lower() for m in markers)), None)
+    start = max(0, first - 5) if first is not None else max(0, len(lines) - 35)
+    excerpt = "\n".join(lines[start : start + 35])
+    return RuntimeError(
+        f"LIFetch {stage} failed (exit={returncode}); full log: {log}\n--- build diagnostic ---\n{excerpt}"
+    )
+
+
 def build_libraries(*, cache_dir, cann, headers, soc):
     """Build one shape-independent binary per source/toolchain/SoC."""
     root = Path(__file__).resolve().parents[2] / "csrc/operators"
@@ -74,7 +86,9 @@ def build_libraries(*, cache_dir, cann, headers, soc):
                     output.flush()
                     result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT, check=False)
                     if result.returncode:
-                        raise RuntimeError(f"LIFetch build failed ({result.returncode}); see {log}")
+                        output.flush()
+                        stage = "compile/link" if command[1] == "--build" else "configure"
+                        raise build_failure(log, stage, result.returncode)
             if not all(p.is_file() for p in libraries):
                 raise RuntimeError(f"LIFetch build did not produce the required libraries; see {log}")
             (directory / "complete.json").write_text(json.dumps(options, indent=2) + "\n")

@@ -305,3 +305,21 @@ def test_build_has_no_workload_specialization(tmp_path):
         x in options
         for x in ("SIM_BATCH", "SIM_HISTORY", "SIM_RESIDENT", "INDEX_HEADS", "INTERMEDIATE_FETCHES", "AIC_COUNT")
     )
+
+
+def test_build_failure_reports_first_diagnostic(tmp_path):
+    from kvip.fused_build import build_libraries
+    from unittest.mock import patch
+    from types import SimpleNamespace
+    import pytest
+
+    def fail(command, **kwargs):
+        kwargs["stdout"].write("CMake Error: unsupported target\n" + "detail\n" * 80)
+        return SimpleNamespace(returncode=1)
+
+    with patch("kvip.fused_build.subprocess.run", side_effect=fail):
+        with pytest.raises(RuntimeError, match="configure failed") as error:
+            build_libraries(cache_dir=tmp_path, cann=tmp_path, headers=tmp_path, soc="Ascend950")
+    assert "CMake Error: unsupported target" in str(error.value)
+    assert len(str(error.value).splitlines()) <= 40
+    assert not list(tmp_path.glob("*/complete.json"))
