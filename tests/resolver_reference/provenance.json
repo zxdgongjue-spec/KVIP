@@ -1,0 +1,11 @@
+{
+  "original_source_hashes": {
+    "original": "147d8db042b23039b18ff0285edf5357738159ff25cfadc17c99755e240dcfb3",
+    "adapted": "c26ec435b91e56f511c1583bee72ffcd26f79443d0ec5e39d1f2c05647127f20"
+  },
+  "relocated_hashes": {
+    "original": "7314c196cec7633e891b849f2be556fdc9592486cfa12433e85e9ad6c585c214",
+    "adapted": "7aad1685960bcabd9df31e1a2fe09efcf77b5663f5441c74cdfba6db6e4f79cc"
+  },
+  "change": "Scratch include removed: same declarations are already supplied by resolve.h."
+}

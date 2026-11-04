@@ -1,0 +1,357 @@
+#include "kernel_operator.h"
+#if defined(__CCE_AICORE__)
+#include "context.h"
+
+#include <stdint.h>
+#if defined(__CCE_AICORE__)
+#define V9_CQ_INLINE __aicore__ inline
+#else
+#define V9_CQ_INLINE inline
+#endif
+namespace rotating {
+struct CqDrainResult { uint64_t error; uint32_t completed; uint64_t polls; };
+// Exclusive CQ consumer. Inspect every status; never infer success from the tail.
+// pending < depth ensures no CQ space must be reclaimed before the tail arrives.
+template<class Access>
+V9_CQ_INLINE CqDrainResult DrainCq(Access& access, uint64_t consumer,
+    uint32_t depth, uint32_t pending, uint32_t maxPolls,
+    uint64_t invalid, uint64_t cqError, uint64_t timeout) {
+    CqDrainResult result{0,0,0};
+    if (!pending) return result;
+    if (depth < 2 || pending >= depth) { result.error=invalid; return result; }
+    const uint64_t initial=consumer;
+    for (uint32_t i=0;i<pending;++i) {
+        bool ready=false;
+        for (uint32_t poll=0;poll<maxPolls;++poll) {
+            uint32_t word=access.Read(uint32_t(consumer%depth));
+            ++result.polls;
+            if (((word>>2)&1U)==((consumer/depth)&1U)) continue;
+            ready=true;
+            ++consumer;
+            if ((word>>16)!=0) result.error=cqError;
+            else ++result.completed;
+            break;
+        }
+        if (!ready) result.error=timeout;
+        if (result.error) break;
+    }
+    // Also reclaim an observed error CQE or the successful prefix on timeout.
+    if (consumer!=initial) access.Commit(consumer);
+    return result;
+}
+}
+#undef V9_CQ_INLINE
+
+#include "prefetch.h"
+#include "resolve.h"
+using namespace AscendC;
+using namespace rotating;
+#if V9_RESOLVER_COMPARE
+namespace resolver_original { using namespace rotating;
+#define rotating original_body
+#include "../../../tests/resolver_reference/original.h"
+#undef rotating
+}
+namespace resolver_adapted { using namespace rotating;
+#define rotating adapted_body
+#include "../../../tests/resolver_reference/adapted.h"
+#undef rotating
+}
+#endif
+__aicore__ inline __gm__ Context* GetContext(GM_ADDR bindings) {
+    return reinterpret_cast<__gm__ Context*>(reinterpret_cast<__gm__ uint64_t*>(bindings)[14]);
+}
+__aicore__ inline KvafExecuteBatchGetKernelArgs GetArgs(__gm__ Context* ctx,uint32_t owner) {
+    KvafExecuteBatchGetKernelArgs args{};
+    static_assert(sizeof(args)==14*sizeof(uint64_t),"KVAF argument ABI changed");
+    auto src=reinterpret_cast<__gm__ uint64_t*>(ctx->args)+owner*14;
+    auto dst=reinterpret_cast<uint64_t*>(&args);
+    for(uint32_t i=0;i<14;++i) dst[i]=src[i];
+    return args;
+}
+struct CqAccess {
+    __gm__ uint8_t* base;
+    uint32_t stride;
+    __gm__ uint32_t* doorbell;
+    __gm__ KvafBatchGetQueueState* queue;
+    __aicore__ inline uint32_t Read(uint32_t slot) {
+        auto address=base+uint64_t(slot)*stride;
+        kvaf_device::CleanCacheLines(address,kvaf_device::kCqeProbeBytes);
+        __asm__ __volatile__("");
+        uint32_t word=*reinterpret_cast<__gm__ uint32_t*>(address);
+        __asm__ __volatile__("");
+        return word;
+    }
+    __aicore__ inline void Commit(uint64_t consumer) {
+        queue->cq_consumer_index=consumer;
+        st_dev(uint32_t(consumer)&kvaf_device::kCqConsumerMask,doorbell,0);
+    }
+};
+__aicore__ inline CqDrainResult DrainQueue(
+    __gm__ const KvafBatchGetDirectUrmaEntity* entity,
+    __gm__ KvafBatchGetQueueState* queue,uint32_t pending) {
+    if (!pending) return {0,0,0};
+    CqAccess access{reinterpret_cast<__gm__ uint8_t*>(entity->cq_va),entity->cqe_size,
+        reinterpret_cast<__gm__ uint32_t*>(entity->cq_db_va),queue};
+    auto result=DrainCq(access,queue->cq_consumer_index,entity->cq_depth,pending,
+        kvaf_device::kMaxCqPolls,kvaf_device::kInvalidArgs,kvaf_device::kCqError,kvaf_device::kCqTimeout);
+    queue->completed_batch_count+=result.completed;
+    return result;
+}
+#endif
+#if defined(__CCE_AICORE__)
+__aicore__ inline void FillRoundWords(uint64_t address,uint32_t words,
+    LocalTensor<uint32_t> local) {
+    GlobalTensor<uint32_t> target;target.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(address));
+    for(uint32_t offset=0;offset<words;offset+=4096) {
+        uint32_t count=words-offset;if(count>4096)count=4096;
+        DataCopy(target[offset],local,count);
+    }
+    // Caller joins the whole fill group before reusing the shared UB value.
+}
+__aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
+    TPipe pipe;TBuf<TPosition::VECCALC> storage;pipe.InitBuffer(storage,4096*4);
+    auto local=storage.Get<uint32_t>();
+    Duplicate(local,uint32_t(0),4096);
+    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    FillRoundWords(ctx->rows+b*sizeof(Row),sizeof(Row)/4,local);
+    FillRoundWords(ctx->progress+b*4*sizeof(Progress),4*sizeof(Progress)/4,local);
+    FillRoundWords(ctx->owners+b*128,32,local);
+    FillRoundWords(ctx->owners+SIM_BATCH*128+b*kFinalWorkers*kFinalStateWords*4,kFinalWorkers*kFinalStateWords,local);
+    FillRoundWords(ctx->owners+kFinalPostOffset+b*kFinalWorkers*sizeof(FinalPost),kFinalWorkers*sizeof(FinalPost)/4,local);
+    FillRoundWords(ctx->rowStatus+b*kRowStatusWords*4,kRowStatusWords,local);
+    FillRoundWords(ctx->finalStatus+b*2*sizeof(KvafBatchGetCoreStatus),2*sizeof(KvafBatchGetCoreStatus)/4,local);
+    // Both hot and cold predicates are overwritten before progress is
+    // published. Original per-query snapshot clipping excludes unready bits.
+    for(uint32_t e=b;e<(kRounds?kRounds:1)*kServiceLanes;e+=SIM_BATCH)
+        FillRoundWords(ctx->events+e*sizeof(Event),sizeof(Event)/4,local);
+    if(!b) {
+        *reinterpret_cast<__gm__ uint32_t*>(ctx->count)=0;
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->count),4);
+    }
+    SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+    Duplicate(local,UINT32_MAX,4096);
+    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    FillRoundWords(ctx->mapping+uint64_t(b)*SIM_HISTORY*4,SIM_HISTORY,local);
+    if(ctx->changes)FillRoundWords(ctx->changes+b*kLruSlots*4,kLruSlots,local);
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    pipe.Destroy();
+}
+#endif
+extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV {
+        uint32_t b=GetBlockIdx(); if(b>=SIM_BATCH) return;
+        auto ctx=GetContext(bindings);
+        InitializeRound(ctx,b);
+        auto args=GetArgs(ctx,b*2);
+        auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
+        auto entity=reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(args.channel_entity);
+        auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args.queue_state);
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
+        row->entity=args.channel_entity; row->queue=args.queue_state;
+        constexpr uint64_t prefix=4*2048*6+1024+4*uint64_t(SIM_HISTORY)*2;
+        constexpr uint64_t tail=uint64_t(SIM_HISTORY)*8+8192*64+512;
+        auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
+        uint32_t owner=ctx->rowOwners ? reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b] : b;
+        uint64_t outputStride=ctx->outputStride ? ctx->outputStride : SIM_RESIDENT+kSlots;
+        row->addresses=ctx->tokenAddresses ? ctx->tokenAddresses+uint64_t(owner)*ctx->addressStride*8 : a[13]+SIM_BATCH*prefix+b*tail;
+        row->output=args.output+uint64_t(owner)*outputStride*kTokenBytes;
+        Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},ctx,b);
+        row->initialHead=queue->sq_producer_index;
+        row->limit=kSlots;
+        row->prefetchLimit=ctx->prefetchLimit;
+        row->queueLimit=entity->sq_depth>1 ? entity->sq_depth-1 : 0;
+        row->error=queue->last_error;
+        if(entity->sq_depth<2 || (entity->sq_depth&(entity->sq_depth-1)) || entity->cq_depth<2 ||
+           !entity->sq_va || !entity->sq_db_va || ctx->prefetchLimit>kSlots ||
+           ctx->windowLimit==0 || ctx->windowLimit>480)
+            row->error=kvaf_device::kInvalidArgs;
+#if !V9_SIMULATION
+        if(queue->initialized && queue->magic!=kvaf_device::kQueueMagic)
+            row->error=kvaf_device::kInvalidArgs;
+        if(!queue->initialized) {
+            queue->magic=kvaf_device::kQueueMagic; queue->initialized=1;
+        }
+        if(entity->sq_depth>(1U<<30) || row->initialHead>UINT64_MAX-ctx->prefetchLimit ||
+           args.token_bytes!=kTokenBytes || args.tokens_per_block!=128 ||
+           args.block_count!=1 || args.jettys_per_core!=1)
+            row->error=kvaf_device::kInvalidArgs;
+        if(entity->magic!=kvaf_device::kEntityMagic || entity->version!=kvaf_device::kEntityVersion ||
+           entity->wqe_size!=64 || !entity->cq_va || !entity->cq_db_va ||
+           entity->cqe_size<kvaf_device::kCqeProbeBytes || !entity->local_token_id ||
+           entity->local_hbm_address!=args.output ||
+           entity->local_hbm_size<(uint64_t(owner)+1)*outputStride*kTokenBytes ||
+           !entity->remote_host_ddr_address || entity->remote_host_ddr_size<kTokenBytes)
+            row->error=kvaf_device::kInvalidEntity;
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
+#endif
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),sizeof(*row));
+    }
+#endif
+}
+#if defined(__CCE_AICORE__)
+__aicore__ inline void CompletePrefetch(__gm__ Context* ctx,uint32_t b) {
+        auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
+        // Only the first cache line and the pending field are read/written here.
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),64);
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->pending),sizeof(row->pending));
+        auto args=GetArgs(ctx,b*2);
+        auto entity=reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(row->entity);
+        auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(row->queue);
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
+        uint64_t error=row->error;
+        if(row->pending>=entity->cq_depth) error=kvaf_device::kInvalidArgs;
+        uint32_t completed=0;
+#if !V9_SIMULATION
+        if(!error) {
+            auto result=DrainQueue(entity,queue,row->pending);
+            error=result.error;completed=result.completed;
+        }
+#endif
+        row->error=uint32_t(error);
+        if(!error) row->pending=0;
+        if(error) queue->last_error=error;
+        auto status=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(args.core_status);
+        kvaf_device::WriteStatus(status,error,row->requests,completed,queue->sq_producer_index,
+            queue->cq_consumer_index,UINT64_MAX,0);
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),sizeof(*status));
+        // The odd view is final-owned; its status is not prefetch completion.
+        auto spare=GetArgs(ctx,b*2+1);
+        auto unused=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(spare.core_status);
+        kvaf_device::WriteStatus(unused,0,0,0,0,0,UINT64_MAX,0);
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(unused),sizeof(*unused));
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
+        // Only the first cache line and the pending field are read/written here.
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),64);
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->pending),sizeof(row->pending));
+}
+#endif
+// Retained for the compute-only diagnostic Graph, which has no final submission.
+extern "C" __global__ __aicore__ void v9_wait_kernel(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV {
+        uint32_t b=GetBlockIdx();if(b<SIM_BATCH)CompletePrefetch(GetContext(bindings),b);
+    }
+#endif
+}
+extern "C" __global__ __aicore__ void v9_resolve_kernel(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV {
+        if constexpr(kFinalReplicated || kFinalWorkers==1)ReplicatedFinal(GetContext(bindings));
+        else ParallelFinal(GetContext(bindings));
+    }
+#endif
+}
+// Completion is a separate launch: final resolver + complete SIMD WQE/SQ/post
+// can be timed without CQ latency. Small queues retain KVAF's bounded fallback.
+extern "C" __global__ __aicore__ void v9_fetch_kernel(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV {
+        uint32_t b=GetBlockIdx(); if(b>=SIM_BATCH) return;
+        auto ctx=GetContext(bindings);
+        CompletePrefetch(ctx,b);
+        auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
+        auto info=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),kRowStatusWords*sizeof(uint32_t));
+        auto args=GetArgs(ctx,b*2);
+        args.core_status=ctx->finalStatus+b*2*sizeof(KvafBatchGetCoreStatus);
+        auto status=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(args.core_status);
+        auto spare=status+1;
+        kvaf_device::WriteStatus(spare,0,0,0,0,0,UINT64_MAX,0);
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(spare),sizeof(*spare));
+        uint64_t error=info[0] ? kvaf_device::kInvalidArgs : row->error;
+        uint32_t completed=0,total=0,deferred=0;
+        uint64_t lastHead=0,lastCq=0;
+        for(uint32_t w=0;w<kFinalWorkers;++w){
+            auto post=FinalPostAt(ctx,b*kFinalWorkers+w);
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
+            auto workerArgs=GetArgs(ctx,FinalQueue(b,w));
+            auto entity=reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(workerArgs.channel_entity);
+            auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(workerArgs.queue_state);
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
+            total+=post->count;error|=post->error;
+            if(post->deferred){
+                ++deferred;
+#if !V9_SIMULATION
+                if(!error && !row->pending){
+                    workerArgs.indices=ctx->sourceBlocks;workerArgs.offsets=ctx->sourceOffsets;
+                    workerArgs.output_indices=ctx->destinations;workerArgs.miss_count=ctx->count;
+                    workerArgs.request_capacity=SIM_BATCH*kSlots;
+                    if(ctx->fallbackAddresses) {
+                        workerArgs.address_table=ctx->fallbackAddresses;
+                        workerArgs.valid_table=ctx->fallbackValid;
+                        workerArgs.table_capacity=SIM_BATCH*kSlots;
+                    }
+                    kvaf_device::KvafBatchGetDevice(workerArgs,0,post->descriptor,post->count);
+                    auto done=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(workerArgs.core_status);
+                    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(done),sizeof(*done));
+                    error|=done->result;completed+=done->completed_batch_count;
+                    if(done->magic!=KVAF_AIV_BATCH_GET_STATUS_MAGIC || done->processed_request_count!=post->count)
+                        error|=kvaf_device::kInvalidArgs;
+                    if(!done->result)post->deferred=0;
+                }
+#else
+                error|=kvaf_device::kInvalidArgs; // DMA fallback needs real hardware.
+#endif
+            }
+            if(post->pending){
+#if !V9_SIMULATION
+                auto drained=DrainQueue(entity,queue,post->pending);
+                uint64_t waitError=drained.error;
+                error|=waitError;
+                completed+=drained.completed;
+                if(!waitError){post->pending=0;}
+#else
+                post->pending=0;++completed;
+#endif
+            }
+            lastHead=queue->sq_producer_index;lastCq=queue->cq_consumer_index;
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
+        }
+        if(row->pending || total!=info[1])error|=kvaf_device::kInvalidArgs;
+        info[0]|=uint32_t(error);info[3]=deferred?1:0;info[4]=completed;
+        if(!error) {
+            Simt::VF_CALL<PublishCompletedResidency>(Simt::Dim3{256,1,1},ctx,b,total);
+            row->finalPending=0;
+        }
+        kvaf_device::WriteStatus(status,error,total,completed,lastHead,lastCq,UINT64_MAX,0);
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),sizeof(*status));
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),32);
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row)+960,64);
+    }
+#endif
+}
+extern "C" __global__ __aicore__ void v9_probe_kernel(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV {
+        uint32_t lane=GetBlockIdx(); if(lane>=kServiceLanes) return;
+        auto ctx=GetContext(bindings);
+        TPipe pipe; TBuf<TPosition::VECCALC> buffer; pipe.InitBuffer(buffer,98304);
+        Service(reinterpret_cast<GM_ADDR>(ctx),V9_PROBE_EPOCH,ServiceCore(V9_PROBE_EPOCH,lane/2),lane%2,
+            buffer.Get<uint32_t>(),buffer.Get<uint16_t>()[24576],buffer.Get<uint32_t>()[20480]);
+        pipe.Destroy();
+    }
+#endif
+}
+
+#if V9_RESOLVER_COMPARE
+extern "C" __global__ __aicore__ void v9_resolve_original_kernel(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV { resolver_original::original_body::ReplicatedFinal(GetContext(bindings)); }
+#endif
+}
+extern "C" __global__ __aicore__ void v9_resolve_adapted_kernel(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV { resolver_adapted::adapted_body::ReplicatedFinal(GetContext(bindings)); }
+#endif
+}
+#endif

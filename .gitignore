@@ -1,0 +1,10 @@
+/build/
+/third_party/
+/tests/results/
+**/__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+/csrc/operators/lidu/build/
+/csrc/operators/lidu/_custom_opp/
+/csrc/operators/lidu/torch_extension/build/

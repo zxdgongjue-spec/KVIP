@@ -1,0 +1,284 @@
+diff --git a/access_operator/include/access_operator.h b/access_operator/include/access_operator.h
+index 21260332..974eeed8 100644
+--- a/access_operator/include/access_operator.h
++++ b/access_operator/include/access_operator.h
+@@ -131,6 +131,12 @@ class DefaultAccessOperator final : public AccessOperator {
+   Status AcquireFusedBatchGetContext(
+       void* output, std::uint64_t output_bytes, std::uint32_t token_bytes,
+       std::uint32_t tokens_per_block, FusedBatchGetContext* context);
++  // Setup-only registration of another output using the same exclusive queue
++  // lease. All views share cursors and must execute on the owner's stream.
++  // Release the original context, not a view; it releases all registrations.
++  Status RegisterFusedBatchGetOutput(
++      const FusedBatchGetContext& owner, void* output,
++      std::uint64_t output_bytes, FusedBatchGetContext* view);
+   // Synchronizes the supplied stream and checks the device queue result.
+   // A failed release keeps the lease and registrations alive. In particular,
+   // a CQ timeout cannot be treated as proof that DMA has stopped. Shutdown
+diff --git a/access_operator/src/access_operator.cc b/access_operator/src/access_operator.cc
+index 46f3c251..a1b3e92f 100644
+--- a/access_operator/src/access_operator.cc
++++ b/access_operator/src/access_operator.cc
+@@ -313,6 +313,7 @@ struct DefaultAccessOperator::Impl {
+   std::mutex batch_get_mutex;
+   FusedBatchGetContext fused_context;
+   KvafBatchGetLocalBuffer* fused_local_buffer{nullptr};
++  std::vector<KvafBatchGetLocalBuffer*> fused_output_buffers;
+   bool fused_completion_uncertain{false};
+   std::uint64_t next_fused_lease_id{1};
+ #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
+@@ -621,6 +622,45 @@ Status DefaultAccessOperator::AcquireFusedBatchGetContext(
+   return Status::OK();
+ }
+ 
++Status DefaultAccessOperator::RegisterFusedBatchGetOutput(
++    const FusedBatchGetContext& owner, void* output,
++    std::uint64_t output_bytes, FusedBatchGetContext* view) {
++  std::lock_guard<std::mutex> lock(impl_->batch_get_mutex);
++  const auto& active = impl_->fused_context;
++  if (active.lease_id == 0U || owner.lease_id != active.lease_id ||
++      owner.device_channel_entity != active.device_channel_entity ||
++      owner.device_queue_state != active.device_queue_state ||
++      owner.output_address != active.output_address ||
++      owner.output_bytes != active.output_bytes) {
++    return InvalidArgument("output registration requires the original live fused lease");
++  }
++  if (impl_->fused_completion_uncertain) {
++    return Internal("fused BatchGet context is quarantined");
++  }
++  if (view == nullptr || output == nullptr || output_bytes == 0U ||
++      output_bytes % active.token_bytes != 0U ||
++      output_bytes > std::numeric_limits<std::uint64_t>::max() - PointerValue(output)) {
++    return InvalidArgument("invalid fused output view");
++  }
++  // Reserve before registration so allocation failure cannot orphan a native
++  // reference. Registering HBM does not reset or synchronize leased queues.
++  impl_->fused_output_buffers.reserve(impl_->fused_output_buffers.size() + 1U);
++  KvafBatchGetLocalBuffer* buffer = nullptr;
++  std::uint64_t entity = 0U;
++  if (KvafBatchGetLocalBufferAcquire(impl_->transport, output, output_bytes,
++                                    &buffer, &entity) != KVAF_BATCH_GET_SUCCESS ||
++      buffer == nullptr || entity == 0U) {
++    if (buffer != nullptr) KvafBatchGetLocalBufferRelease(buffer);
++    return Internal("failed to register fused output view");
++  }
++  impl_->fused_output_buffers.push_back(buffer);
++  *view = active;
++  view->device_channel_entity = entity;
++  view->output_address = PointerValue(output);
++  view->output_bytes = output_bytes;
++  return Status::OK();
++}
++
+ Status DefaultAccessOperator::ReleaseFusedBatchGetContext(
+     const FusedBatchGetContext& context, void* stream) {
+   std::lock_guard<std::mutex> lock(impl_->batch_get_mutex);
+@@ -648,6 +688,10 @@ Status DefaultAccessOperator::ReleaseFusedBatchGetContext(
+     return status;
+   }
+   KvafBatchGetLocalBufferRelease(impl_->fused_local_buffer);
++  for (auto* buffer : impl_->fused_output_buffers) {
++    KvafBatchGetLocalBufferRelease(buffer);
++  }
++  impl_->fused_output_buffers.clear();
+   impl_->fused_local_buffer = nullptr;
+   impl_->fused_context = FusedBatchGetContext{};
+   return Status::OK();
+diff --git a/bindings/src/npu_python_runtime.cc b/bindings/src/npu_python_runtime.cc
+index f3e1de33..daf5c639 100644
+--- a/bindings/src/npu_python_runtime.cc
++++ b/bindings/src/npu_python_runtime.cc
+@@ -266,6 +266,7 @@ class NpuPythonRuntime final {
+           "output_and_stream_retained=1 teardown_not_safe=1\n",
+           static_cast<unsigned long long>(fused_context_.lease_id));
+       (void)fused_output_.release();
++      for (auto& output : fused_output_views_) (void)output.release();
+       (void)fused_stream_.release();
+       (void)native_.release();
+     }
+@@ -336,6 +337,37 @@ class NpuPythonRuntime final {
+     return FusedContextDict(fused_context_);
+   }
+ 
++  py::dict RegisterFusedBatchGetOutput(const py::dict& context,
++                                      const py::object& output) {
++    if (fused_context_.lease_id == 0U) {
++      throw py::value_error("output registration requires a live fused lease");
++    }
++    const py::dict expected = FusedContextDict(fused_context_);
++    for (const auto& item : expected) {
++      if (!context.contains(item.first) ||
++          context[item.first].cast<std::uint64_t>() !=
++              item.second.cast<std::uint64_t>()) {
++        throw py::value_error("pass the unmodified original fused lease");
++      }
++    }
++    const auto tensor = GetNpuTensorView(output, "fused output view");
++    const std::string device = "npu:" + std::to_string(DeviceId());
++    if (py::str(output.attr("device")).cast<std::string>() != device ||
++        tensor.shape.size() < 2 || tensor.shape.front() <= 0 ||
++        tensor.bytes % static_cast<std::size_t>(tensor.shape.front()) != 0 ||
++        tensor.bytes / static_cast<std::size_t>(tensor.shape.front()) != BatchGetTokenBytes()) {
++      throw py::value_error("fused output view must have one token_bytes-sized row per slot on the Runtime device");
++    }
++    ThrowIfAclError(aclrtSetDevice(static_cast<int32_t>(DeviceId())),
++                    "aclrtSetDevice before fused output registration");
++    // Retain before native registration; failures cannot free registered HBM.
++    fused_output_views_.push_back(output);
++    FusedBatchGetContext view;
++    ThrowIfError(native_->RegisterFusedBatchGetOutput(
++        fused_context_, tensor.data, tensor.bytes, &view));
++    return FusedContextDict(view);
++  }
++
+   void ReleaseFusedBatchGetContext(const py::dict& context,
+                                    const py::object& stream) {
+     if (fused_context_.lease_id == 0U) {
+@@ -364,6 +396,7 @@ class NpuPythonRuntime final {
+     fused_context_ = FusedBatchGetContext{};
+     fused_acl_stream_ = nullptr;
+     fused_output_ = py::object{};
++    fused_output_views_.clear();
+     fused_stream_ = py::object{};
+   }
+ 
+@@ -628,6 +661,7 @@ class NpuPythonRuntime final {
+   BatchPutRequest batch_put_request_;
+   FusedBatchGetContext fused_context_;
+   py::object fused_output_;
++  std::vector<py::object> fused_output_views_;
+   py::object fused_stream_;
+   aclrtStream fused_acl_stream_{nullptr};
+ };
+@@ -674,6 +708,13 @@ void BindNpuPythonRuntime(py::module_& module) {
+            "must run sequentially on this stream; do not resize/rebind output storage, "
+            "reset queue cursors, or free source DDR while the lease is in use. "
+            "stream=None captures the Runtime device's current torch.npu stream.")
++      .def("register_fused_batch_get_output",
++           &NpuPythonRuntime::RegisterFusedBatchGetOutput,
++           py::arg("context"), py::arg("output"),
++           "Setup-only output registration under the original fused lease. "
++           "Returns a view with shared persistent queues; all launches must use "
++           "the acquire stream sequentially. Register before capture. Release "
++           "the original lease to release all views; do not resize their tensors.")
+       .def("release_fused_batch_get_context",
+            &NpuPythonRuntime::ReleaseFusedBatchGetContext,
+            py::arg("context"), py::arg("stream") = py::none(),
+diff --git a/runtime/include/npu_runtime.h b/runtime/include/npu_runtime.h
+index 4af75a47..fd368de2 100644
+--- a/runtime/include/npu_runtime.h
++++ b/runtime/include/npu_runtime.h
+@@ -80,6 +80,9 @@ class NpuRuntime final : public Runtime {
+   // context must run sequentially on one caller stream.
+   Status AcquireFusedBatchGetContext(void* output, std::uint64_t output_bytes,
+                                     FusedBatchGetContext* context);
++  Status RegisterFusedBatchGetOutput(
++      const FusedBatchGetContext& owner, void* output,
++      std::uint64_t output_bytes, FusedBatchGetContext* view);
+   Status ReleaseFusedBatchGetContext(const FusedBatchGetContext& context,
+                                     void* stream);
+ 
+diff --git a/runtime/src/npu_runtime.cc b/runtime/src/npu_runtime.cc
+index 10ac1229..499a0afb 100644
+--- a/runtime/src/npu_runtime.cc
++++ b/runtime/src/npu_runtime.cc
+@@ -869,6 +869,16 @@ Status NpuRuntime::AcquireFusedBatchGetContext(
+       impl_->options.batch_get_tokens_per_block, context);
+ }
+ 
++Status NpuRuntime::RegisterFusedBatchGetOutput(
++    const FusedBatchGetContext& owner, void* output,
++    std::uint64_t output_bytes, FusedBatchGetContext* view) {
++  if (!initialized() || impl_->access_operator == nullptr) {
++    return Status::NotInitialized("Runtime has no fused BatchGet context");
++  }
++  return impl_->access_operator->RegisterFusedBatchGetOutput(
++      owner, output, output_bytes, view);
++}
++
+ Status NpuRuntime::ReleaseFusedBatchGetContext(
+     const FusedBatchGetContext& context, void* stream) {
+   if (!initialized() || impl_->access_operator == nullptr) {
+diff --git a/tests/fused_batch_get_context_test.cc b/tests/fused_batch_get_context_test.cc
+index 65e35f25..c049c1ce 100644
+--- a/tests/fused_batch_get_context_test.cc
++++ b/tests/fused_batch_get_context_test.cc
+@@ -129,12 +129,20 @@ void TestFailedCompletionRetainsRegistration(bool stream_failure) {
+   kvaf::FusedBatchGetContext context;
+   Require(op->AcquireFusedBatchGetContext(output.data(), output.size(), 656, 128,
+                                          &context).ok(), "failure fixture acquire");
++  std::vector<std::uint8_t> second_output(656 * 8);
++  kvaf::FusedBatchGetContext view;
++  Require(op->RegisterFusedBatchGetOutput(context, second_output.data(),
++                                         second_output.size(), &view).ok(),
++          "failure fixture output view");
+   auto* queues = reinterpret_cast<KvafBatchGetQueueState*>(context.device_queue_state);
+   int stream_marker = 0;
+   if (stream_failure) driver.fail_stream_sync = true;
+   else queues[3].last_error = 7;
+   Require(!op->ReleaseFusedBatchGetContext(context, &stream_marker).ok(),
+           "completion failure must not release context");
++  Require(!op->RegisterFusedBatchGetOutput(context, second_output.data(),
++                                          second_output.size(), &view).ok(),
++          "quarantine rejects new views");
+   driver.fail_stream_sync = false;
+   queues[3].last_error = 0;
+   Require(!op->ReleaseFusedBatchGetContext(context, &stream_marker).ok(),
+@@ -144,6 +152,49 @@ void TestFailedCompletionRetainsRegistration(bool stream_failure) {
+   Require(driver.releases == 0 && driver.destroys == 0,
+           "destructor never deregisters potentially live DMA resources");
+ }
++
++void TestSharedLeaseOutputViews() {
++  driver = {};
++  kvaf::DefaultAccessOperator op(Config());
++  std::vector<std::uint8_t> ddr(4096), first(656 * 4), second(656 * 8);
++  Require(op.Initialize({reinterpret_cast<std::uint64_t>(ddr.data()), ddr.size(),
++                         256, kvaf::DeviceKind::kCpu}).ok(), "view fixture init");
++  kvaf::FusedBatchGetContext owner, view;
++  Require(!op.RegisterFusedBatchGetOutput(owner, second.data(), second.size(), &view).ok(),
++          "reject view without lease");
++  Require(op.AcquireFusedBatchGetContext(first.data(), first.size(), 656, 128, &owner).ok(),
++          "view fixture acquire");
++  auto* queues = reinterpret_cast<KvafBatchGetQueueState*>(owner.device_queue_state);
++  queues[0].sq_producer_index = 73;
++  auto wrong = owner;
++  ++wrong.lease_id;
++  Require(!op.RegisterFusedBatchGetOutput(wrong, second.data(), second.size(), &view).ok(),
++          "reject stale owner");
++  Require(!op.RegisterFusedBatchGetOutput(owner, second.data(), second.size() - 1, &view).ok(),
++          "reject partial token row");
++  driver.fail_acquire = true;
++  Require(!op.RegisterFusedBatchGetOutput(owner, second.data(), second.size(), &view).ok(),
++          "propagate view registration failure");
++  Require(view.lease_id == 0, "failed view not published");
++  driver.fail_acquire = false;
++  Require(op.RegisterFusedBatchGetOutput(owner, second.data(), second.size(), &view).ok(),
++          "register second output");
++  Require(view.lease_id == owner.lease_id &&
++              view.device_queue_state == owner.device_queue_state &&
++              view.device_core_status == owner.device_core_status &&
++              view.output_address == reinterpret_cast<std::uint64_t>(second.data()) &&
++              view.output_bytes == second.size() &&
++              view.device_channel_entity != owner.device_channel_entity &&
++              queues[0].sq_producer_index == 73 && driver.device_syncs == 1,
++          "view shares cursors without synchronization or reset");
++  int stream_marker = 0;
++  Require(!op.ReleaseFusedBatchGetContext(view, &stream_marker).ok(), "view cannot release owner");
++  Require(op.ReleaseFusedBatchGetContext(owner, &stream_marker).ok(), "owner releases all views");
++  Require(driver.releases == 2, "both registrations released once");
++  Require(!op.RegisterFusedBatchGetOutput(owner, second.data(), second.size(), &view).ok(),
++          "released owner cannot register views");
++  Require(op.Shutdown().ok(), "view fixture shutdown");
++}
+ }  // namespace
+ 
+ struct KvafBatchGetLocalBuffer { std::uint64_t entity{0xabc}; };
+@@ -206,6 +257,7 @@ int32_t KvafExecuteBatchGetLaunch(const KvafExecuteBatchGetKernelArgs*, aclrtStr
+ int main() {
+   try {
+     TestLeaseAndRuntimeTeardown();
++    TestSharedLeaseOutputViews();
+     TestFailedCompletionRetainsRegistration(false);
+     TestFailedCompletionRetainsRegistration(true);
+     std::cout << "fused BatchGet host lifecycle tests passed (mock transport only)\n";
