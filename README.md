@@ -65,6 +65,11 @@ bash scripts/build.sh --kvaf-root /vllm-workspace/vllm-ascend/third_party/KVAF
 source scripts/env.sh
 ```
 
+The default CANN target is `Ascend950PR_9599`, matching the original v9 build.
+For another A5 SKU, pass its concrete CANN target with `--soc`; `Ascend950` alone
+is not a valid target for this CANN build API. The NPU test discovers the device
+SoC through ACL unless `--soc` is specified.
+
 The supported KVAF base is `c4375e13d7a9519d907ab6a5d11227795f207286`.
 Preparation applies the three patches in `scripts/patches`, recognizes an already
 patched tree, and never resets existing edits. A different revision or conflicting

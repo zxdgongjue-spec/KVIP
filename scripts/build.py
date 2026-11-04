@@ -66,7 +66,7 @@ def main():
     parser.add_argument("--prepare-only", action="store_true", help="prepare patches, without CANN builds")
     parser.add_argument("--skip-kvaf-build", action="store_true", help="use an already rebuilt, patched KVAF")
     parser.add_argument("--cann", type=Path, default=Path("/usr/local/Ascend/cann"))
-    parser.add_argument("--soc", default="Ascend950", help="compile target architecture")
+    parser.add_argument("--soc", default="Ascend950PR_9599", help="compile target architecture")
     parser.add_argument("--jobs", type=int, default=2)
     args = parser.parse_args()
     dependency = (args.kvaf_root or ROOT / "third_party/KVAF").resolve()

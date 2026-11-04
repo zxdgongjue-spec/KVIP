@@ -296,7 +296,9 @@ def test_build_has_no_workload_specialization(tmp_path):
         return SimpleNamespace(returncode=0)
 
     with patch("kvip.fused_build.subprocess.run", side_effect=build) as commands:
-        args = dict(cache_dir=tmp_path / "cache", cann=tmp_path / "cann", headers=tmp_path / "headers", soc="Ascend950")
+        args = dict(
+            cache_dir=tmp_path / "cache", cann=tmp_path / "cann", headers=tmp_path / "headers", soc="Ascend950PR_9599"
+        )
         first = build_libraries(**args)
         second = build_libraries(**args)
     assert first == second and commands.call_count == 2
@@ -319,7 +321,27 @@ def test_build_failure_reports_first_diagnostic(tmp_path):
 
     with patch("kvip.fused_build.subprocess.run", side_effect=fail):
         with pytest.raises(RuntimeError, match="configure failed") as error:
-            build_libraries(cache_dir=tmp_path, cann=tmp_path, headers=tmp_path, soc="Ascend950")
+            build_libraries(cache_dir=tmp_path, cann=tmp_path, headers=tmp_path, soc="Ascend950PR_9599")
     assert "CMake Error: unsupported target" in str(error.value)
     assert len(str(error.value).splitlines()) <= 40
     assert not list(tmp_path.glob("*/complete.json"))
+
+
+def test_install_and_cmake_default_to_concrete_a5_target():
+    import ast
+
+    tree = ast.parse((ROOT / "scripts/build.py").read_text())
+    soc_option = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "add_argument"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "--soc"
+    )
+    default = next(ast.literal_eval(k.value) for k in soc_option.keywords if k.arg == "default")
+    assert default == "Ascend950PR_9599"
+    cmake = (ROOT / "csrc/operators/lightning_indexer_with_fetch/CMakeLists.txt").read_text()
+    assert f"set(SOC_VERSION {default} CACHE" in cmake
