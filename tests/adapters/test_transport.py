@@ -31,7 +31,7 @@ class TransportTest(unittest.TestCase):
             return 0
 
         self.library.refactor_fetch_pack_args = Function(pack)
-        self.library.v9_get = Function(lambda *args: self.launches.append(args) or 0)
+        self.native_get = Function(lambda *args: self.launches.append(args) or 0)
         self.runtime = Mock()
         self.output = torch.empty((128, 656), dtype=torch.uint8)
         self.context = dict(
@@ -57,7 +57,10 @@ class TransportTest(unittest.TestCase):
             int64=torch.int64,
             uint64=getattr(torch, "uint64", object()),
         )
-        with patch("kvip.adapters.kvaf.load_lifetch_library", return_value=self.library):
+        with (
+            patch("kvip.adapters.kvaf.load_lifetch_library", return_value=self.library),
+            patch("kvip.adapters.kvaf.load_native_get", return_value=(object(), self.native_get)),
+        ):
             self.owner = KvafGetLease(self.torch, self.runtime, "test", self.output, self.stream)
 
     def inputs(self):
@@ -75,17 +78,58 @@ class TransportTest(unittest.TestCase):
         inputs = self.inputs()
         plan = self.owner.prepare_get(*inputs)
         self.assertEqual(self.fields[:7], [t.data_ptr() for t in inputs])
+        self.assertEqual(struct.unpack("=10Q8I", plan.arguments.raw[:112]), tuple(self.fields))
         self.assertEqual(self.fields[7:], [200, 100, 300, 2, 8, 128, 656, 128, 2, 2, 2048])
         with patch.object(self.torch, "tensor", side_effect=AssertionError("replay must not allocate")):
             plan()
             plan()
-        self.assertEqual(self.launches, [(plan.arguments.data_ptr(), 123, 2)] * 2)
+        self.assertEqual(self.launches, [(plan.arguments, 123)] * 2)
         self.runtime.register_fused_batch_get_output.assert_not_called()
         self.owner.close()
         self.owner.close()
         self.runtime.release_fused_batch_get_context.assert_called_once_with(self.context, self.stream)
         with self.assertRaisesRegex(RuntimeError, "released"):
             plan()
+
+    def test_cached_native_launch_reads_current_device_metadata(self):
+        runtime = LeasedRuntime(self.owner)
+        inputs = self.inputs()
+        observed = []
+
+        def launch(arguments, stream):
+            fields = struct.unpack("=10Q8I", arguments.raw[:112])
+            count = ctypes.cast(fields[4], ctypes.POINTER(ctypes.c_int32))[0]
+            index = ctypes.cast(fields[2], ctypes.POINTER(ctypes.c_int32))[0]
+            observed.append((count, index, fields[8], fields[9], stream))
+            return 0
+
+        self.owner.get = launch
+        for count in (4, 8, 2, 0, 8):
+            inputs[4].fill_(count)
+            inputs[2].fill_(count + 10)
+            runtime.batch_get(*inputs)
+        self.assertEqual(observed, [(n, n + 10, 100, 300, 123) for n in (4, 8, 2, 0, 8)])
+        self.assertEqual(len(runtime.bindings), 1)
+        self.owner.close()
+
+    def test_loader_uses_the_runtime_sdk_dependency_scope(self):
+        from kvip.runtime.loader import load_native_get
+
+        native = SimpleNamespace(KvafExecuteBatchGetLaunch=Function(lambda *args: 0))
+        with (
+            patch("kvip.runtime.loader.ctypes.CDLL", return_value=native) as load,
+            patch(
+                "kvip.runtime.loader.importlib.import_module", return_value=SimpleNamespace(__file__="/sdk/_kvaf.so")
+            ) as module,
+        ):
+            library, launch = load_native_get(self.runtime)
+        module.assert_called_once_with(type(self.runtime).__module__)
+        load.assert_called_once_with("/sdk/_kvaf.so")
+        self.assertIs(library, native)
+        self.assertIs(launch, native.KvafExecuteBatchGetLaunch)
+        self.assertEqual(launch.argtypes, [ctypes.c_void_p, ctypes.c_void_p])
+        self.assertIs(launch.restype, ctypes.c_int32)
+        self.owner.close()
 
     def test_output_registration_is_cached_and_shares_owner(self):
         other = torch.empty((256, 656), dtype=torch.uint8)

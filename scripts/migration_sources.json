@@ -517,7 +517,7 @@
     "csrc/operators/lidu/torch_extension/csrc/lidu_fused_batch_get_prepare_mtp_ops.cpp": "1edb2300d83ce7f44bcc59b6ca994b4602a4c618b2a59c733eedb4d91e769a16",
     "csrc/operators/lidu/torch_extension/nanovllm_dsa_lidu_fused_batch_get_prepare_mtp/__init__.py": "3c0eca925693b7b0afc2d92f12ccb43c96d32d1d8426b779686c423da6949a4b",
     "csrc/operators/lidu/torch_extension/setup.py": "1f30c24149590502e7eb5075322a9afe7bc43da8c84334ea4615b7eefaa2f9db",
-    "csrc/operators/lightning_indexer_with_fetch/CMakeLists.txt": "c58c848af6086ea6f60a605eb174ea4e52b26318c8ef9f2538583e1a420d8511",
+    "csrc/operators/lightning_indexer_with_fetch/CMakeLists.txt": "6b1959d9b7b2e53a9b44008ee27c3e2c56a1aea1d3d28c9c92f4f33a6a94f33a",
     "csrc/operators/lightning_indexer_with_fetch/include/api.h": "155018ffd5057b00be28d88b2fad3a2058e01ea6cfc909398462f8ac03e9a4d4",
     "csrc/operators/lightning_indexer_with_fetch/include/context.h": "1f50e529540b3ddc65db8325de9488cd619bd49b8742138380d1ad1b5cc29e1f",
     "csrc/operators/lightning_indexer_with_fetch/op_kernel/index_cache_update.cpp": "f22e77efec82b0f1232242fa5e526794b257a86f8e86d6d37ef84c2afa168ce2",
@@ -529,7 +529,7 @@
     "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_score.h": "36070015466018f9b66b3efeb49c7fc8c8ec3dc5916aa1e4aa4fc470369fb6e1",
     "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_types.h": "76fb6b1dcf00077d3ef7c32a55eef4884eddd431ee24b7ac4059cb3e5e2fea28",
     "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_vector.h": "eea631fac34fe0f7f7038b2639487208d1a86d0c3093f1f47ef545e564c60426",
-    "csrc/operators/lightning_indexer_with_fetch/op_host/launch.cpp": "a039d7489e67bd52919d3d1afd03adb0e6fad7225d9a7d0562c60a4e19500176",
+    "csrc/operators/lightning_indexer_with_fetch/op_host/launch.cpp": "b3d494738b9b1ab28e61a31c34321d33a93bb01992d1dfbffc53e9b9dfe8c8f8",
     "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/li_types.h": "3bcfe5694f3b83eae8ead1a43bd6e45c059c47da8654a3f9086562ef5a931e96",
     "csrc/operators/lightning_indexer_with_fetch/op_kernel/lifecycle.cpp": "66373aa110899a5f07945c856066662d918c01fed7dc33ece3f8961e24be5c1f",
     "csrc/operators/lightning_indexer_with_fetch/op_kernel/prefetch.h": "1ade1d1694322913a6138f7f35eaff660aa5fa4152f47645a0b4460b665047b3",
@@ -537,7 +537,6 @@
     "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/score_common.h": "a7804b5f5de6155f8a129c79b832062b199383831e7d242c9fe807f629c9ad99",
     "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/topk.h": "82367d9610dec3ac2e4659dd621823674ca3cab2437b374e8dd96d7c549251ab",
     "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/topk_common.h": "2c02a2a0b06bec14bca760c8fc912cce837d59ce198c449988e81e889d10860d",
-    "csrc/operators/lightning_indexer_with_fetch/op_kernel/transport.cpp": "9fb86970268e01e08fd92148f1be9ee4d026088c4253c73fc7278d1b2781cf91",
     "csrc/operators/lightning_indexer_with_fetch/include/runtime_shape.h": "cdf09fc43d38ea4e370d253af0f914b493e19a485de83c5426f78c35f600289e"
   },
   "initial_migration_files": {

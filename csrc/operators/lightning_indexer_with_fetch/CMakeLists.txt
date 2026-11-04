@@ -11,7 +11,7 @@ if(NOT EXISTS "${KVAF_INCLUDE}/kvaf_batch_get_device.h")
 endif()
 set(RESOLVER_COMPARE 0 CACHE STRING "Include resolver diagnostic entry points")
 include(${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
-ascendc_library(v9_kernel STATIC op_kernel/indexer.cpp op_kernel/lifecycle.cpp op_kernel/transport.cpp)
+ascendc_library(v9_kernel STATIC op_kernel/indexer.cpp op_kernel/lifecycle.cpp)
 ascendc_include_directories(v9_kernel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel
   ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/indexer ${KVAF_INCLUDE}
   ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)

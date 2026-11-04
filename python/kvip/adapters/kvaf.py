@@ -2,7 +2,7 @@
 """One stream-ordered KVAF lease for fused decode and ordinary Get graphs."""
 
 import ctypes
-from kvip.runtime.loader import load_lifetch_library
+from kvip.runtime.loader import load_lifetch_library, load_native_get
 from contextlib import contextmanager
 
 
@@ -53,7 +53,7 @@ class GetLaunch:
     def __call__(self):
         owner = self.owner
         stream = owner.check_stream()
-        code = owner.get(self.arguments.data_ptr(), stream.npu_stream, owner.context["worker_count"])
+        code = owner.get(self.arguments, stream.npu_stream)
         if code:
             raise RuntimeError(f"Leased BatchGet launch failed: {code}")
 
@@ -77,9 +77,7 @@ class KvafGetLease:
         self.pack = self.library.refactor_fetch_pack_args
         self.pack.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint32]
         self.pack.restype = ctypes.c_uint32
-        self.get = self.library.v9_get
-        self.get.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
-        self.get.restype = ctypes.c_uint32
+        self.native_library, self.get = load_native_get(runtime)
         self.context = runtime.acquire_fused_batch_get_context(output, stream)
         self.device = output.device
         self.outputs = {self.output_key(output): (output, self.context)}
@@ -169,7 +167,12 @@ class KvafGetLease:
             context["jettys_per_core"],
             max_inflight,
         ]
-        arguments = self.torch.tensor(list(self.serialize(fields)), dtype=self.torch.uint8, device=self.device)
+        # Immutable host launch arguments; all mutable counts/descriptors remain
+        # device pointers. ACL copies this struct at enqueue/capture time, so
+        # replay observes current device data without H2D or a host count read.
+        # Use KVAF's compiled kernel and launch attributes, not a recompiled
+        # copy inheriting LI's manual-sync compiler flags.
+        arguments = ctypes.create_string_buffer(self.serialize(fields))
         plan = GetLaunch(self, arguments, tensors)
         self.plans.append(plan)
         return plan

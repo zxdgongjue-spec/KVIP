@@ -27,11 +27,6 @@ extern "C" uint32_t v9_final_workers(const rotating::RuntimeShape* shape) { retu
 extern "C" uint32_t v9_final_owner_bytes(const rotating::RuntimeShape* shape) { return shape->finalOwnerBytes; }
 extern "C" uint32_t v9_final_replicated(const rotating::RuntimeShape* shape) { return 1; }
 extern "C" uint32_t v9_token_bytes(const rotating::RuntimeShape* shape) { return shape->tokenBytes; }
-extern "C" uint32_t aclrtlaunch_v9_get_kernel(uint32_t, void*, void*);
-extern "C" uint32_t v9_get(void* arguments, void* stream, uint32_t cores) {
-    if (!arguments || !stream || !cores || cores > KVAF_AIV_BATCH_GET_MAX_AIV_CORES) return 100000;
-    return aclrtlaunch_v9_get_kernel(cores, stream, arguments);
-}
 
 #if V9_RESOLVER_COMPARE
 ENTRY(resolve_original,shape->finalCores)
