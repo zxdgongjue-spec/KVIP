@@ -1,7 +1,7 @@
 """Graph-safe V9 launches. Allocations/reset/readback stay outside timing."""
 
 import ctypes
-from pathlib import Path
+from kvip.fused_build import load_lifetch_library
 
 import numpy as np
 
@@ -42,7 +42,7 @@ class RotatingLaunch:
         scratch=None,
     ):
         self.torch, self.owner = torch, owner
-        self.library = ctypes.CDLL(str(Path(library).resolve(strict=True)))
+        self.library = load_lifetch_library(library)
         self.device = arguments[0].device
         if (
             len(arguments) != 14

@@ -365,3 +365,35 @@ def test_bridge_keeps_sibling_rpath_when_toolchain_disables_build_rpath(tmp_path
     )
     subprocess.run(["cmake", "-S", str(tmp_path), "-B", str(tmp_path / "build")], check=True, capture_output=True)
     assert (tmp_path / "build/properties.txt").read_text().splitlines() == ["FALSE", "TRUE", "$ORIGIN"]
+
+
+def test_load_bridge_without_rpath(tmp_path):
+    import subprocess
+    import sys
+    from kvip.fused_build import load_lifetch_library
+
+    dependency = tmp_path / "libkvop_cache_update.so"
+    bridge = tmp_path / "libv9_bridge.so"
+    (tmp_path / "update.cpp").write_text('extern "C" int kvip_test_update() { return 42; }')
+    (tmp_path / "bridge.cpp").write_text(
+        'extern "C" int kvip_test_update(); extern "C" int kvip_test_forward() { return kvip_test_update(); }'
+    )
+    identity = (
+        ["-Wl,-install_name,@rpath/libkvop_cache_update.so"]
+        if sys.platform == "darwin"
+        else ["-Wl,-soname,libkvop_cache_update.so"]
+    )
+    subprocess.run(
+        ["c++", "-shared", "-fPIC", str(tmp_path / "update.cpp"), *identity, "-o", str(dependency)], check=True
+    )
+    subprocess.run(
+        ["c++", "-shared", "-fPIC", str(tmp_path / "bridge.cpp"), str(dependency), "-o", str(bridge)], check=True
+    )
+    # Fresh process proves the fixture really fails without the dependency preload.
+    failed = subprocess.run(
+        [sys.executable, "-c", "import ctypes,sys;ctypes.CDLL(sys.argv[1])", str(bridge)], capture_output=True
+    )
+    assert failed.returncode != 0
+    library = load_lifetch_library(bridge)
+    assert library.kvip_test_forward() == 42
+    assert library._kvip_update_dependency is not None

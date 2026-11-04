@@ -9,6 +9,7 @@ import numpy as np
 from device_trace import collect_core, core_summary
 from index_update import DirectCacheUpdate, permutation_records
 from kvip.pipeline import FusedForward
+from kvip.fused_build import load_lifetch_library
 from prefetch_audit import actual_reads
 from runner import progress
 
@@ -123,10 +124,9 @@ def run(args, run_dir):
                 )
                 command(["cmake", "--build", build, "-j2"], folder / "build.log")
             import hashlib
-            import ctypes
 
             # Fail before allocating/populating DDR if shared dependencies cannot load.
-            ctypes.CDLL(str((build / "libv9_bridge.so").resolve()))
+            load_lifetch_library(build / "libv9_bridge.so")
 
             digest = hashlib.sha256((build / "libv9_bridge.so").read_bytes()).hexdigest()
             if built_digest is not None and digest != built_digest:
