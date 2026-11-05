@@ -1,0 +1,577 @@
+{
+  "vllm_commit": "dad47855b20cbe8b74bf412f05757043d22ce0a0",
+  "origin": "https://gitcode.com/xuzewei28/vLLM-DSA-1021.git",
+  "original_manifest": {
+    "source_root": "/Users/doo/Desktop/AiCode/CacheOS/LightningIndexerWithFetch/vLLM-DSA-mtp-v6/csrc/attention/a5_lightning_indexer",
+    "original_files": {
+      "patch.py": {
+        "source": "v9/patch.py",
+        "sha256": "719b95b1a1e90ea8544f427450c20523ba2926fffea13ffe840aba6747f872f6"
+      },
+      "window_fetch.h": {
+        "source": "v9/window_fetch.h",
+        "sha256": "b34d8ad9915a576e0e6b6c371dab3e93050c8c5bbbf6cba7aaf1cc8a178fc665"
+      },
+      "final_parallel.h": {
+        "source": "v9/final_parallel.h",
+        "sha256": "221d79b4760b97303420550f7ad0d1be9a7e4b91703d353df381a974cb1ed2cf"
+      },
+      "CMakeLists.txt": {
+        "source": "v9/CMakeLists.txt",
+        "sha256": "26d89c84e6a701ea57c78ce13fc96cb8edd6f755ce11c5b327088d44877e2a5f"
+      },
+      "kernel.cpp": {
+        "source": "v9/kernel.cpp",
+        "sha256": "1d1e98d2cc8eebe2801fe30557213bb3392c5ff7e268a935a60980e0d87357d9"
+      },
+      "final_replicated.h": {
+        "source": "v9/final_replicated.h",
+        "sha256": "147d8db042b23039b18ff0285edf5357738159ff25cfadc17c99755e240dcfb3"
+      },
+      "protocol.py": {
+        "source": "v9/protocol.py",
+        "sha256": "b068dc5f0ccc383316ef64b561e71881f9a652ebcb21d602b79370edc720261a"
+      },
+      "cq_drain.h": {
+        "source": "v9/cq_drain.h",
+        "sha256": "fa0f26a16c058469e69c74435f0bc9dd5dbaf2ecf930b5a6aaf2a648f8c72027"
+      },
+      "lifecycle.cpp": {
+        "source": "v9/lifecycle.cpp",
+        "sha256": "39ba7230955db9ea967764b21e5a14ece963b9466cc346095377dd0442b0b8b7"
+      },
+      "final_dense.h": {
+        "source": "v9/final_dense.h",
+        "sha256": "bd2a522a87d0c88b19d6f9f816b62363373c84d38b8a679ff1f830813a2cb2f4"
+      },
+      "final_submit.h": {
+        "source": "v9/final_submit.h",
+        "sha256": "73d1b3950688af92e9b323ed8ff72bd1e031839b79f2867ebc942d766ba6f608"
+      },
+      "rotation_abi.h": {
+        "source": "v9/rotation_abi.h",
+        "sha256": "028472e0ed848e154d25a8b400c500b962b9cbfca9410acc13e48733cec8d615"
+      },
+      "benchmark_real_fetch.py": {
+        "source": "v9/benchmark_real_fetch.py",
+        "sha256": "2a094e4ea6564ef2a0b54bf77617bb7015fff95e74c5722ad5d10c7d927878c0"
+      },
+      "final_scratch.h": {
+        "source": "v9/final_scratch.h",
+        "sha256": "cb11fe9c1213e4a1187e147dd5ad7e28da711f83b07db44110969f72545b716d"
+      },
+      "final_sparse.h": {
+        "source": "v9/final_sparse.h",
+        "sha256": "531a66223cfd52ac09b4d81d994fa0acbb4d10c6b8211d56a9cdb52f702e8971"
+      },
+      "simulator_main.cpp": {
+        "source": "v9/simulator_main.cpp",
+        "sha256": "597840df00d2f7c7b6fd999919be25d284887ff43b45a20bcafe5123c505878e"
+      },
+      "final_resolve.h": {
+        "source": "v9/final_resolve.h",
+        "sha256": "7974b4c8b937d9865f5d93107e150160384f29e19805ac82174d2ca065f7f00e"
+      },
+      "launch.py": {
+        "source": "v9/launch.py",
+        "sha256": "ffc97ad582dfb7ad16305e9d0dffa8fa2585d6215968fbed738150cc534915d7"
+      },
+      "bridge.cpp": {
+        "source": "v9/bridge.cpp",
+        "sha256": "bf21c123b067c825df5577815e54994de25a869f324cf35965c9701d7acc2f7b"
+      },
+      "geometry.py": {
+        "source": "v9/geometry.py",
+        "sha256": "23741c8553020340f4289ead4dc538a630a593b147e4fa9e61eac0fc98bf461d"
+      },
+      "device_resources.py": {
+        "source": "v9/device_resources.py",
+        "sha256": "2e5de50793b61cce41606c482cf5d06bd8f6eb059a2af93b569bb45d9ed95943"
+      },
+      "batch_post.h": {
+        "source": "v9/batch_post.h",
+        "sha256": "775adf8113b2d051fd8c48f7889dc455cf12df11c19264b473eaefaed1a81648"
+      },
+      "fetch_profiling.h": {
+        "source": "v9/fetch_profiling.h",
+        "sha256": "9e3b4cc18a6ce0ea72c982aed54a548c3aeaec096d043d621e49a7a5cae450cb"
+      },
+      "rotation_device.h": {
+        "source": "v9/rotation_device.h",
+        "sha256": "910807ab95d1be1b07d90818376696c47d4c9e3ba3070137810c8072b96c673a"
+      },
+      "final_worker_submit.h": {
+        "source": "v9/final_worker_submit.h",
+        "sha256": "5c34ad422846762953d4841dd349a62d24e9c7b9e4877cf01257b7a922adae63"
+      },
+      "base/real_fetch_abi.cpp": {
+        "source": "v9/base/real_fetch_abi.cpp",
+        "sha256": "43030e7769a8ca67c8934ae4c1bde543849a3f7fa86590eabfe2342cfe666bdb"
+      },
+      "base/patch_installed_classify.py": {
+        "source": "v9/base/patch_installed_classify.py",
+        "sha256": "92705bd49fa4e34b78b6bff7a716c6d87ad3ca7d5b31171e04c18e550f203b3b"
+      },
+      "base/patch_installed_prefix.py": {
+        "source": "v9/base/patch_installed_prefix.py",
+        "sha256": "ea95c9dd90d493fca1f1bc0453d4b476b74e72356882ebd6492ed26f7f712e51"
+      },
+      "reference/quant_lightning_indexer/quant_lightning_indexer.cpp": {
+        "source": "v9/reference/quant_lightning_indexer/quant_lightning_indexer.cpp",
+        "sha256": "0658dc5fc690734dcc91d3f0b910be6809d2361362b224a329aa8ecae964e52d"
+      },
+      "reference/quant_lightning_indexer/quant_lightning_indexer_template_tiling_key.h": {
+        "source": "v9/reference/quant_lightning_indexer/quant_lightning_indexer_template_tiling_key.h",
+        "sha256": "59293fb3940b31cbeae956d1d6ac322979c21ae1df0b4a05d487dcbb7202eab9"
+      },
+      "reference/quant_lightning_indexer/quant_lightning_indexer_common.h": {
+        "source": "v9/reference/quant_lightning_indexer/quant_lightning_indexer_common.h",
+        "sha256": "0c2e13badad2e5c744ca955be4df3a5406ea530586f8c9bb78f2db907e0ed1ac"
+      },
+      "reference/lightning_indexer/lightning_indexer_common.h": {
+        "source": "v9/reference/lightning_indexer/lightning_indexer_common.h",
+        "sha256": "a8af67d754561462a510735cd6f7334e03f8bb304ea9acc92bb07bb5256a59c1"
+      },
+      "reference/lightning_indexer/lightning_indexer_template_tiling_key.h": {
+        "source": "v9/reference/lightning_indexer/lightning_indexer_template_tiling_key.h",
+        "sha256": "a087348920a255ae64b6a789a83ed1ec7f204e19fac99282bce3f7a418e05abb"
+      },
+      "reference/lightning_indexer/lightning_indexer.cpp": {
+        "source": "v9/reference/lightning_indexer/lightning_indexer.cpp",
+        "sha256": "8daa3ec56a041f7d8de241be7d2ff928a8498a97b9a453a74368b96404e8b271"
+      },
+      "reference/quant_lightning_indexer/arch35/quant_lightning_indexer_service_vector.h": {
+        "source": "v9/reference/quant_lightning_indexer/arch35/quant_lightning_indexer_service_vector.h",
+        "sha256": "c3b8ac68b3838f3e89eec3d1870ef4b394f9d7600ab79568f000c8ef159fd20e"
+      },
+      "reference/quant_lightning_indexer/arch35/quant_lightning_indexer_service_cube.h": {
+        "source": "v9/reference/quant_lightning_indexer/arch35/quant_lightning_indexer_service_cube.h",
+        "sha256": "15dd02adaa68754b95e8f767ed6dfa654f3983bd2c5e5dc0513b43ca379d3f85"
+      },
+      "reference/quant_lightning_indexer/arch35/quant_lightning_indexer_kernel.h": {
+        "source": "v9/reference/quant_lightning_indexer/arch35/quant_lightning_indexer_kernel.h",
+        "sha256": "9f345c3e751bc4570fe3204680a84851fa1673a0f02eca61853dfa1d4de4ae4a"
+      },
+      "reference/quant_lightning_indexer/arch35/vf/quant_lightning_indexer_vector1.h": {
+        "source": "v9/reference/quant_lightning_indexer/arch35/vf/quant_lightning_indexer_vector1.h",
+        "sha256": "d6ca822b2a18015fe031c381f7030bd80023b6ff7de3002c2870f0efb6775247"
+      },
+      "reference/quant_lightning_indexer/arch35/vf/quant_lightning_indexer_topk.h": {
+        "source": "v9/reference/quant_lightning_indexer/arch35/vf/quant_lightning_indexer_topk.h",
+        "sha256": "5c52dd66247a37bc73d81df606244c0bba4ee1b46d74772fd1cfdd6015680dab"
+      },
+      "reference/lightning_indexer/arch35/lightning_indexer_service_cube.h": {
+        "source": "v9/reference/lightning_indexer/arch35/lightning_indexer_service_cube.h",
+        "sha256": "c69626a0e20189aa72acf5a3bb943599932199b5b5639b2e358142e36fc8cccd"
+      },
+      "reference/lightning_indexer/arch35/lightning_indexer_kernel.h": {
+        "source": "v9/reference/lightning_indexer/arch35/lightning_indexer_kernel.h",
+        "sha256": "7e73c45edab4213e758420abde8c408badccf21717d929f526924f9d5e3ca6a1"
+      },
+      "reference/lightning_indexer/arch35/lightning_indexer_service_vector.h": {
+        "source": "v9/reference/lightning_indexer/arch35/lightning_indexer_service_vector.h",
+        "sha256": "25a8e06579941425362ad8f45d15012a2fa7a833252d94eb95d933d9e85903d4"
+      },
+      "reference/lightning_indexer/arch35/vf/vf_topk_gather.h": {
+        "source": "v9/reference/lightning_indexer/arch35/vf/vf_topk_gather.h",
+        "sha256": "c84d230a03afc3328118a1bb0db277d890c1bfcf27d5ea66c517ff451951e248"
+      },
+      "reference/lightning_indexer/arch35/vf/lightning_indexer_vector1.h": {
+        "source": "v9/reference/lightning_indexer/arch35/vf/lightning_indexer_vector1.h",
+        "sha256": "2490851ce8582128ebe0635fcc0931c5c8e46777183f351dab3c982c9da9849c"
+      },
+      "reference/lightning_indexer/arch35/vf/lightning_indexer_topk.h": {
+        "source": "v9/reference/lightning_indexer/arch35/vf/lightning_indexer_topk.h",
+        "sha256": "ecb3846c76b8f61675cf806e65b09e7da3ec4fce2aea8375c00008e7fde49bbb"
+      },
+      "reference/lightning_indexer/arch35/vf/common/lightning_indexer_vector1_base.h": {
+        "source": "v9/reference/lightning_indexer/arch35/vf/common/lightning_indexer_vector1_base.h",
+        "sha256": "a7804b5f5de6155f8a129c79b832062b199383831e7d242c9fe807f629c9ad99"
+      },
+      "reference/lightning_indexer/arch35/vf/common/vf_topk_16_gather.h": {
+        "source": "v9/reference/lightning_indexer/arch35/vf/common/vf_topk_16_gather.h",
+        "sha256": "0b969a603f6e47f393f496072b5f266dc10631b877a18384bb4148b4dab27932"
+      },
+      "fixture_support/real_fetch_inputs.py": {
+        "source": "v8/refactor/real_fetch_inputs.py",
+        "sha256": "d32b1fe1f8bd0ce16afc618a9d4deda0d3fdaf112c7112318b764502b8fddc27"
+      },
+      "fixture_support/fixture.py": {
+        "source": "v8/refactor/fixture.py",
+        "sha256": "dc1efb98d90d27413a535de27f286a8306c2992227e28ee8f232692f439cd426"
+      },
+      "fixture_support/miss_fixture.py": {
+        "source": "v8/refactor/miss_fixture.py",
+        "sha256": "b7befe8f6df2f67f2a20a8ebf358a7b68e1154c724a7a49f5c620e4da5a94cba"
+      },
+      "fixture_support/native_refactor_mtp.py": {
+        "source": "v8/refactor/native_refactor_mtp.py",
+        "sha256": "c3b1bffd98510770aabca3d3fa976622127176b5929f1cf5b2cb5fb45bceeadd"
+      },
+      "fixture_support/native_mtp.py": {
+        "source": "v8/tools/native_mtp.py",
+        "sha256": "278fc947211517fd720fd0e29d65362a4131d71c926a5025b75d377d70028371"
+      },
+      "fixture_support/mtp_fixture.py": {
+        "source": "v8/tools/mtp_fixture.py",
+        "sha256": "1cdb974483fe13a8d7f16383a080337e0f949453640e277355ba6d17cc7ea642"
+      }
+    },
+    "files": {
+      "CMakeLists.txt": {
+        "sha256": "0df246f146d89dba6e77eae3ef89ed9d51d6dc6522348620b4930d5dcb6f72d1"
+      },
+      "README.md": {
+        "sha256": "09684030c95a1e269458a7a3b57704facc9ed3d8e554a2c460f51828eeadd9ac"
+      },
+      "include/launch.h": {
+        "sha256": "562c9a2b6e63d8ecdf14737a88180595b702b9969f699f71ce1c239ce0a6b19b"
+      },
+      "include/rotation_abi.h": {
+        "sha256": "5ddc4f30001113ff970c32d31ca0d0702e3a60372aecde9002f6e9fb96ccd7e3"
+      },
+      "op_host/launch.cpp": {
+        "sha256": "0d3991960095d7eeaa78891f89d97090c3fb774860cbc3e4842821e62e5393d1"
+      },
+      "op_host/transport_abi.cpp": {
+        "sha256": "53c7f8d136c6a77a320749a3e7796b20c02987a29220759b70260e5d69406c5d"
+      },
+      "op_kernel/cache_lifecycle.cpp": {
+        "sha256": "89ae84a94540872edbd3a0be67fc080282bf4dfe2513efa5c32fede621605f87"
+      },
+      "op_kernel/detail/batch_post.h": {
+        "sha256": "37365912ede47485a13a6d639ad05a68813474883a6de6002bc33f217563b8ba"
+      },
+      "op_kernel/detail/cq_drain.h": {
+        "sha256": "fa0f26a16c058469e69c74435f0bc9dd5dbaf2ecf930b5a6aaf2a648f8c72027"
+      },
+      "op_kernel/detail/fetch_profiling.h": {
+        "sha256": "9e3b4cc18a6ce0ea72c982aed54a548c3aeaec096d043d621e49a7a5cae450cb"
+      },
+      "op_kernel/detail/final_dense.h": {
+        "sha256": "bd2a522a87d0c88b19d6f9f816b62363373c84d38b8a679ff1f830813a2cb2f4"
+      },
+      "op_kernel/detail/final_parallel.h": {
+        "sha256": "221d79b4760b97303420550f7ad0d1be9a7e4b91703d353df381a974cb1ed2cf"
+      },
+      "op_kernel/detail/final_replicated.h": {
+        "sha256": "88a10fee835a57d5b9edd6370be6d25cb592aadeb40dc861ba2dffe9489215be"
+      },
+      "op_kernel/detail/final_resolve.h": {
+        "sha256": "61a0fd0d4466dc676b933a7edfa59e45433950f96ef011c065619af7cf1cae64"
+      },
+      "op_kernel/detail/final_scratch.h": {
+        "sha256": "cb11fe9c1213e4a1187e147dd5ad7e28da711f83b07db44110969f72545b716d"
+      },
+      "op_kernel/detail/final_sparse.h": {
+        "sha256": "531a66223cfd52ac09b4d81d994fa0acbb4d10c6b8211d56a9cdb52f702e8971"
+      },
+      "op_kernel/detail/final_submit.h": {
+        "sha256": "73d1b3950688af92e9b323ed8ff72bd1e031839b79f2867ebc942d766ba6f608"
+      },
+      "op_kernel/detail/final_worker_submit.h": {
+        "sha256": "5c34ad422846762953d4841dd349a62d24e9c7b9e4877cf01257b7a922adae63"
+      },
+      "op_kernel/detail/rotation_device.h": {
+        "sha256": "d56301df9687630f4a968090978d85a1964ba832edf5e92be850e362a7b6fd9f"
+      },
+      "op_kernel/detail/window_fetch.h": {
+        "sha256": "e8dfc8cd6a4b2c7e1a22f0e1709f3b5783885288da4eb04e6ddb93e2bb18ac44"
+      },
+      "op_kernel/lightning_indexer.cpp": {
+        "sha256": "fa57230b09d823bbe771603794936337b7ce3d40cb826d8b12e49b5633bc2e52"
+      },
+      "reference/lightning_indexer/arch35/lightning_indexer_kernel.h": {
+        "sha256": "7e73c45edab4213e758420abde8c408badccf21717d929f526924f9d5e3ca6a1"
+      },
+      "reference/lightning_indexer/arch35/lightning_indexer_service_cube.h": {
+        "sha256": "c69626a0e20189aa72acf5a3bb943599932199b5b5639b2e358142e36fc8cccd"
+      },
+      "reference/lightning_indexer/arch35/lightning_indexer_service_vector.h": {
+        "sha256": "25a8e06579941425362ad8f45d15012a2fa7a833252d94eb95d933d9e85903d4"
+      },
+      "reference/lightning_indexer/arch35/vf/common/lightning_indexer_vector1_base.h": {
+        "sha256": "a7804b5f5de6155f8a129c79b832062b199383831e7d242c9fe807f629c9ad99"
+      },
+      "reference/lightning_indexer/arch35/vf/common/vf_topk_16_gather.h": {
+        "sha256": "0b969a603f6e47f393f496072b5f266dc10631b877a18384bb4148b4dab27932"
+      },
+      "reference/lightning_indexer/arch35/vf/lightning_indexer_topk.h": {
+        "sha256": "ecb3846c76b8f61675cf806e65b09e7da3ec4fce2aea8375c00008e7fde49bbb"
+      },
+      "reference/lightning_indexer/arch35/vf/lightning_indexer_vector1.h": {
+        "sha256": "2490851ce8582128ebe0635fcc0931c5c8e46777183f351dab3c982c9da9849c"
+      },
+      "reference/lightning_indexer/arch35/vf/vf_topk_gather.h": {
+        "sha256": "c84d230a03afc3328118a1bb0db277d890c1bfcf27d5ea66c517ff451951e248"
+      },
+      "reference/lightning_indexer/lightning_indexer.cpp": {
+        "sha256": "8daa3ec56a041f7d8de241be7d2ff928a8498a97b9a453a74368b96404e8b271"
+      },
+      "reference/lightning_indexer/lightning_indexer_common.h": {
+        "sha256": "a8af67d754561462a510735cd6f7334e03f8bb304ea9acc92bb07bb5256a59c1"
+      },
+      "reference/lightning_indexer/lightning_indexer_template_tiling_key.h": {
+        "sha256": "a087348920a255ae64b6a789a83ed1ec7f204e19fac99282bce3f7a418e05abb"
+      },
+      "reference/quant_lightning_indexer/arch35/quant_lightning_indexer_kernel.h": {
+        "sha256": "9f345c3e751bc4570fe3204680a84851fa1673a0f02eca61853dfa1d4de4ae4a"
+      },
+      "reference/quant_lightning_indexer/arch35/quant_lightning_indexer_service_cube.h": {
+        "sha256": "15dd02adaa68754b95e8f767ed6dfa654f3983bd2c5e5dc0513b43ca379d3f85"
+      },
+      "reference/quant_lightning_indexer/arch35/quant_lightning_indexer_service_vector.h": {
+        "sha256": "c3b8ac68b3838f3e89eec3d1870ef4b394f9d7600ab79568f000c8ef159fd20e"
+      },
+      "reference/quant_lightning_indexer/arch35/vf/quant_lightning_indexer_topk.h": {
+        "sha256": "5c52dd66247a37bc73d81df606244c0bba4ee1b46d74772fd1cfdd6015680dab"
+      },
+      "reference/quant_lightning_indexer/arch35/vf/quant_lightning_indexer_vector1.h": {
+        "sha256": "d6ca822b2a18015fe031c381f7030bd80023b6ff7de3002c2870f0efb6775247"
+      },
+      "reference/quant_lightning_indexer/quant_lightning_indexer.cpp": {
+        "sha256": "0658dc5fc690734dcc91d3f0b910be6809d2361362b224a329aa8ecae964e52d"
+      },
+      "reference/quant_lightning_indexer/quant_lightning_indexer_common.h": {
+        "sha256": "0c2e13badad2e5c744ca955be4df3a5406ea530586f8c9bb78f2db907e0ed1ac"
+      },
+      "reference/quant_lightning_indexer/quant_lightning_indexer_template_tiling_key.h": {
+        "sha256": "59293fb3940b31cbeae956d1d6ac322979c21ae1df0b4a05d487dcbb7202eab9"
+      },
+      "tests/fixture_support/fixture.py": {
+        "sha256": "dc1efb98d90d27413a535de27f286a8306c2992227e28ee8f232692f439cd426"
+      },
+      "tests/fixture_support/miss_fixture.py": {
+        "sha256": "b7befe8f6df2f67f2a20a8ebf358a7b68e1154c724a7a49f5c620e4da5a94cba"
+      },
+      "tests/fixture_support/mtp_fixture.py": {
+        "sha256": "1cdb974483fe13a8d7f16383a080337e0f949453640e277355ba6d17cc7ea642"
+      },
+      "tests/fixture_support/native_mtp.py": {
+        "sha256": "278fc947211517fd720fd0e29d65362a4131d71c926a5025b75d377d70028371"
+      },
+      "tests/fixture_support/native_refactor_mtp.py": {
+        "sha256": "c3b1bffd98510770aabca3d3fa976622127176b5929f1cf5b2cb5fb45bceeadd"
+      },
+      "tests/fixture_support/real_fetch_inputs.py": {
+        "sha256": "15960a3f6e09307c919cdfd837b7c6aac4cc2e36cccc28525de19ade1fea35c3"
+      },
+      "tests/original_benchmark_real_fetch.py": {
+        "sha256": "2a094e4ea6564ef2a0b54bf77617bb7015fff95e74c5722ad5d10c7d927878c0"
+      },
+      "tests/protocol.py": {
+        "sha256": "b068dc5f0ccc383316ef64b561e71881f9a652ebcb21d602b79370edc720261a"
+      },
+      "tests/simulator_main.cpp": {
+        "sha256": "597840df00d2f7c7b6fd999919be25d284887ff43b45a20bcafe5123c505878e"
+      },
+      "tools/base/patch_installed_classify.py": {
+        "sha256": "856169758ae9b8679641e1f2a96dfc2727066a928649ba7ba99909a26811134d"
+      },
+      "tools/base/patch_installed_prefix.py": {
+        "sha256": "ea95c9dd90d493fca1f1bc0453d4b476b74e72356882ebd6492ed26f7f712e51"
+      },
+      "tools/patch.py": {
+        "sha256": "146ae437a101983e57b755b2b3afdf96b23401d33851b53757e4aca92c283a65"
+      },
+      "torch_extension/device_resources.py": {
+        "sha256": "2e5de50793b61cce41606c482cf5d06bd8f6eb059a2af93b569bb45d9ed95943"
+      },
+      "torch_extension/geometry.py": {
+        "sha256": "fb3df453da3cca491b5f03c227d23991ae2a3a073400d1654ebaaf17e460beb8"
+      },
+      "torch_extension/launch.py": {
+        "sha256": "c73cdc735ff3e66c2ad3819cd510413a0e154de0266538311860bff11c350ed9"
+      },
+      "op_kernel/detail/direct_slots.h": {
+        "sha256": "37ee996257379c325ff6e0d4aab12244686f9a0cc576c97d6a7c9ee8593b169b",
+        "source": "KVOP direct LRU interface adaptation"
+      },
+      "op_kernel/transport_get.cpp": {
+        "sha256": "9fb86970268e01e08fd92148f1be9ee4d026088c4253c73fc7278d1b2781cf91"
+      },
+      "tests/resolver_reference/provenance.json": {
+        "sha256": "b6d29cd7d98159fb70886d8a236250f83f157f6f1dfb9efc1cf67d1af46fb038"
+      },
+      "tests/resolver_reference/original.h": {
+        "sha256": "147d8db042b23039b18ff0285edf5357738159ff25cfadc17c99755e240dcfb3"
+      },
+      "tests/resolver_reference/adapted.h": {
+        "sha256": "c26ec435b91e56f511c1583bee72ffcd26f79443d0ec5e39d1f2c05647127f20"
+      }
+    },
+    "preserved_bodies": {
+      "window_fetch.h": "6d65ea69b9c4a8b8ded262c6a099de9335d00f28e42028dc6f3eadb4f66b9931",
+      "final_parallel.h": "7d6ebaaa6a0a4b0b51e552525888c62a813e4a6aacbed9777e845a3b401ae9a3",
+      "kernel.cpp": "ab9bf9650211635df079081f668915582552a2a9234e1059f98a0a7d2e9cf2ab",
+      "final_replicated.h": "eea8103e63ddc2b4ab4f914e6e4e3220c750b54bf26ed2c3eab5b91545090aa0",
+      "cq_drain.h": "7f2f392b9c8b0fec8556088c2c7c0d070ec5b8f7a99c20b4a0e02c7a085db3dd",
+      "lifecycle.cpp": "f2b1107d269b9e80a89c2c4ef4b277b91cf562424b43b64391602801a224b52f",
+      "final_dense.h": "94921ff70503be25ca3c67d66b7f78c632b002245c5f8dae66f2ccd6cbd085a0",
+      "final_submit.h": "92c8ef1854db04876fef43c8c6f706663fb249a7d1e8bfe0292514b8883fe856",
+      "rotation_abi.h": "944b70c3c740bffc941bd53e0643b94d06f73ab25b61c3f8a93c130ed5f5ef97",
+      "final_scratch.h": "1cce98e29e490f611302b1085f2860e21bfda948c000bc3a83a245d1d0b431aa",
+      "final_sparse.h": "47ff4090df9b8a679f7d4fce8e135789555435a34fbefc5fcfc7b89d539feb4a",
+      "simulator_main.cpp": "11d7677814762d73f2d58bcc50f782b52abe0ce34cded7d9be6b31dd70cd3b2e",
+      "final_resolve.h": "04fa48e3f7cf761d48de6db9c9326b297438cf66bcf5d4682884109093e8f757",
+      "bridge.cpp": "417aa937542aa14d7f98954fb5a2e3752d06aec0abbfb0b01cca01158982c9fa",
+      "batch_post.h": "fd1c3dde32342a2e9f243aef254a4b204fb0db062fb86949ac16f790d539f545",
+      "fetch_profiling.h": "14d37872a26acb6193e7cd28a5c7e9a6553a2eeb1b167e46c20e88851bfc613e",
+      "rotation_device.h": "c93c043d5e05e1984775e0db5024e62aa71b2856d4e783df7cbf988054a7afbf",
+      "final_worker_submit.h": "f0afdc38ad4e0fef450a200a4aa8ed08ed83d7a62598ab524363bc04c1c7a1ab"
+    },
+    "original_device_files": {
+      "op_kernel/detail/window_fetch.h": "b34d8ad9915a576e0e6b6c371dab3e93050c8c5bbbf6cba7aaf1cc8a178fc665",
+      "op_kernel/detail/final_parallel.h": "221d79b4760b97303420550f7ad0d1be9a7e4b91703d353df381a974cb1ed2cf",
+      "op_kernel/lightning_indexer.cpp": "1d1e98d2cc8eebe2801fe30557213bb3392c5ff7e268a935a60980e0d87357d9",
+      "op_kernel/detail/final_replicated.h": "147d8db042b23039b18ff0285edf5357738159ff25cfadc17c99755e240dcfb3",
+      "op_kernel/detail/cq_drain.h": "fa0f26a16c058469e69c74435f0bc9dd5dbaf2ecf930b5a6aaf2a648f8c72027",
+      "op_kernel/cache_lifecycle.cpp": "39ba7230955db9ea967764b21e5a14ece963b9466cc346095377dd0442b0b8b7",
+      "op_kernel/detail/final_dense.h": "bd2a522a87d0c88b19d6f9f816b62363373c84d38b8a679ff1f830813a2cb2f4",
+      "op_kernel/detail/final_submit.h": "73d1b3950688af92e9b323ed8ff72bd1e031839b79f2867ebc942d766ba6f608",
+      "include/rotation_abi.h": "028472e0ed848e154d25a8b400c500b962b9cbfca9410acc13e48733cec8d615",
+      "op_kernel/detail/final_scratch.h": "cb11fe9c1213e4a1187e147dd5ad7e28da711f83b07db44110969f72545b716d",
+      "op_kernel/detail/final_sparse.h": "531a66223cfd52ac09b4d81d994fa0acbb4d10c6b8211d56a9cdb52f702e8971",
+      "op_kernel/detail/final_resolve.h": "7974b4c8b937d9865f5d93107e150160384f29e19805ac82174d2ca065f7f00e",
+      "op_kernel/detail/batch_post.h": "775adf8113b2d051fd8c48f7889dc455cf12df11c19264b473eaefaed1a81648",
+      "op_kernel/detail/fetch_profiling.h": "9e3b4cc18a6ce0ea72c982aed54a548c3aeaec096d043d621e49a7a5cae450cb",
+      "op_kernel/detail/rotation_device.h": "910807ab95d1be1b07d90818376696c47d4c9e3ba3070137810c8072b96c673a",
+      "op_kernel/detail/final_worker_submit.h": "5c34ad422846762953d4841dd349a62d24e9c7b9e4877cf01257b7a922adae63"
+    },
+    "interface_adaptations": {
+      "include/rotation_abi.h": {
+        "previous_sha256": "028472e0ed848e154d25a8b400c500b962b9cbfca9410acc13e48733cec8d615",
+        "sha256": "5ddc4f30001113ff970c32d31ca0d0702e3a60372aecde9002f6e9fb96ccd7e3",
+        "reason": "Stable request-owner rows, separate ABC ring and reserved first-window destinations; preserve original LI tile traversal and TopK computation"
+      },
+      "op_host/launch.cpp": {
+        "previous_sha256": "3cc28d6628eb9d7df81fb957845ae8674ccbdbfb2cf7440d4c27f38f99c77861",
+        "sha256": "0d3991960095d7eeaa78891f89d97090c3fb774860cbc3e4842821e62e5393d1",
+        "reason": "Explicit cold-start residency and invalid TopK padding; publish validity after Fetch completion; original LI tiling unchanged"
+      },
+      "op_kernel/detail/batch_post.h": {
+        "previous_sha256": "775adf8113b2d051fd8c48f7889dc455cf12df11c19264b473eaefaed1a81648",
+        "sha256": "37365912ede47485a13a6d639ad05a68813474883a6de6002bc33f217563b8ba",
+        "reason": "Stable request-owner rows, separate ABC ring and reserved first-window destinations; preserve original LI tile traversal and TopK computation"
+      },
+      "op_kernel/detail/final_replicated.h": {
+        "previous_sha256": "147d8db042b23039b18ff0285edf5357738159ff25cfadc17c99755e240dcfb3",
+        "sha256": "88a10fee835a57d5b9edd6370be6d25cb592aadeb40dc861ba2dffe9489215be",
+        "reason": "Stage hot-valid/reserved metadata in existing UB scratch for hot<=16384; cache owner/stride; preserve original rank/hash/slot allocation and fallback. Diagnostic references are compiled only with RESOLVER_COMPARE."
+      },
+      "op_kernel/detail/final_resolve.h": {
+        "previous_sha256": "7974b4c8b937d9865f5d93107e150160384f29e19805ac82174d2ca065f7f00e",
+        "sha256": "61a0fd0d4466dc676b933a7edfa59e45433950f96ef011c065619af7cf1cae64",
+        "reason": "Explicit cold-start residency and invalid TopK padding; publish validity after Fetch completion; original LI tiling unchanged"
+      },
+      "op_kernel/detail/rotation_device.h": {
+        "previous_sha256": "910807ab95d1be1b07d90818376696c47d4c9e3ba3070137810c8072b96c673a",
+        "sha256": "d56301df9687630f4a968090978d85a1964ba832edf5e92be850e362a7b6fd9f",
+        "reason": "Compact LRU-victim score classification and native bitmap consumer; cold-only physical mapping, actual-write residency publication and grouped reset dependencies; core tiling and fallback unchanged"
+      },
+      "op_kernel/detail/window_fetch.h": {
+        "previous_sha256": "b34d8ad9915a576e0e6b6c371dab3e93050c8c5bbbf6cba7aaf1cc8a178fc665",
+        "sha256": "e8dfc8cd6a4b2c7e1a22f0e1709f3b5783885288da4eb04e6ddb93e2bb18ac44",
+        "reason": "Compact LRU-victim score classification and native bitmap consumer; cold-only physical mapping, actual-write residency publication and grouped reset dependencies; core tiling and fallback unchanged"
+      },
+      "tools/patch.py": {
+        "previous_sha256": "91dc4ac90c13ea24e38fab4d61c2f1e1dcfeda5a000ce3d880857ca00a2313a1",
+        "sha256": "146ae437a101983e57b755b2b3afdf96b23401d33851b53757e4aca92c283a65",
+        "reason": "Compact LRU-victim score classification and native bitmap consumer; cold-only physical mapping, actual-write residency publication and grouped reset dependencies; core tiling and fallback unchanged"
+      },
+      "torch_extension/geometry.py": {
+        "previous_sha256": "23741c8553020340f4289ead4dc538a630a593b147e4fa9e61eac0fc98bf461d",
+        "sha256": "fb3df453da3cca491b5f03c227d23991ae2a3a073400d1654ebaaf17e460beb8",
+        "reason": "Direct LRU destination interface, hot-ready first window and producer change export; core LI tiling unchanged"
+      },
+      "torch_extension/launch.py": {
+        "previous_sha256": "ffc97ad582dfb7ad16305e9d0dffa8fa2585d6215968fbed738150cc534915d7",
+        "sha256": "c73cdc735ff3e66c2ad3819cd510413a0e154de0266538311860bff11c350ed9",
+        "reason": "Stable request-owner rows, separate ABC ring and reserved first-window destinations; preserve original LI tile traversal and TopK computation"
+      },
+      "CMakeLists.txt": {
+        "previous_sha256": "266e1b1341d94185ad8fb2a1b26ab211061a510ea6bf4f72a3191f959ff38b04",
+        "sha256": "0df246f146d89dba6e77eae3ef89ed9d51d6dc6522348620b4930d5dcb6f72d1",
+        "reason": "Direct LRU interface and configurable single/four-layer transport row width; LI tiling unchanged"
+      },
+      "op_kernel/cache_lifecycle.cpp": {
+        "previous_sha256": "39ba7230955db9ea967764b21e5a14ece963b9466cc346095377dd0442b0b8b7",
+        "sha256": "89ae84a94540872edbd3a0be67fc080282bf4dfe2513efa5c32fede621605f87",
+        "reason": "Compact LRU-victim score classification and native bitmap consumer; cold-only physical mapping, actual-write residency publication and grouped reset dependencies; core tiling and fallback unchanged"
+      },
+      "op_kernel/lightning_indexer.cpp": {
+        "previous_sha256": "1d1e98d2cc8eebe2801fe30557213bb3392c5ff7e268a935a60980e0d87357d9",
+        "sha256": "fa57230b09d823bbe771603794936337b7ce3d40cb826d8b12e49b5633bc2e52",
+        "reason": "Parameterize gSize with INDEX_HEADS (32 or 64); preserve original tiling and kernel algorithm."
+      }
+    }
+  },
+  "files": {
+    "csrc/operators/lidu/build_lidu_fused_batch_get_prepare_mtp.sh": "a9af1e34d2eee299dfe7a89b4058f90b3cfc655a8d003ad024738943faed9087",
+    "csrc/operators/lidu/op_host/a5_lidu_fused_batch_get_prepare_mtp.cpp": "7695e731f660bf4f908288fe9b75e2811f33056b68068994d2933f280ff0a636",
+    "csrc/operators/lidu/op_kernel/a5_lidu_fused_batch_get_prepare_mtp.cpp": "42896a8747ef798f1c697ed83c6a95c70049b49a9c4dc19119e6b8d4cf5088d4",
+    "csrc/operators/lidu/op_kernel/a5_lidu_fused_batch_get_prepare_mtp_tiling.h": "a1067bb34786a6e7d1b7ab8889a5a53a27249f6dc48ecda8e705f60bd6cc830f",
+    "csrc/operators/lidu/op_kernel/a5_lidu_fused_batch_get_prepare_mtp_vector.h": "39d3ba268478103db039324f7834b2f89c094c2e524cd3d26c1bb9a9baaea057",
+    "csrc/operators/lidu/ops.json": "9e67edfc0558a5585791722d8bb23099c3766005ff84cfe1764610944031e753",
+    "csrc/operators/lidu/torch_extension/csrc/lidu_fused_batch_get_prepare_mtp_op_api.h": "07bc42481e3635e44ebe264f9175f29b6d5bbdf4624dd12a59fc4e736802ca24",
+    "csrc/operators/lidu/torch_extension/csrc/lidu_fused_batch_get_prepare_mtp_ops.cpp": "1edb2300d83ce7f44bcc59b6ca994b4602a4c618b2a59c733eedb4d91e769a16",
+    "csrc/operators/lidu/torch_extension/nanovllm_dsa_lidu_fused_batch_get_prepare_mtp/__init__.py": "3c0eca925693b7b0afc2d92f12ccb43c96d32d1d8426b779686c423da6949a4b",
+    "csrc/operators/lidu/torch_extension/setup.py": "1f30c24149590502e7eb5075322a9afe7bc43da8c84334ea4615b7eefaa2f9db",
+    "csrc/operators/lightning_indexer_with_fetch/CMakeLists.txt": "6b1959d9b7b2e53a9b44008ee27c3e2c56a1aea1d3d28c9c92f4f33a6a94f33a",
+    "csrc/operators/lightning_indexer_with_fetch/include/api.h": "155018ffd5057b00be28d88b2fad3a2058e01ea6cfc909398462f8ac03e9a4d4",
+    "csrc/operators/lightning_indexer_with_fetch/include/context.h": "1f50e529540b3ddc65db8325de9488cd619bd49b8742138380d1ad1b5cc29e1f",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/index_cache_update.cpp": "f22e77efec82b0f1232242fa5e526794b257a86f8e86d6d37ef84c2afa168ce2",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/index_cache_update.h": "3a1829fa2f164f8f4faffae061de0a7138f25ffe87412483fe18d9d6be09204c",
+    "csrc/operators/lightning_indexer_with_fetch/op_host/index_cache_update.cpp": "adcb13df2512a3bca673550cf6f3858eda702cb60b0d0aa5b48f62fa1dcf31c6",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer.cpp": "61e53c334034bbd7ad7ac6fac5fcc072709623df17157c559fa62072d4d04078",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer.h": "a65a0ea7f21b685be456bc760c62caa09cc9e68f42cd08c4d60e2ffe40962762",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_cube.h": "324d7f56a920417caf72ff493821678fcaf9835eabf3c5773998df43bbf91718",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_score.h": "36070015466018f9b66b3efeb49c7fc8c8ec3dc5916aa1e4aa4fc470369fb6e1",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_types.h": "76fb6b1dcf00077d3ef7c32a55eef4884eddd431ee24b7ac4059cb3e5e2fea28",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_vector.h": "eea631fac34fe0f7f7038b2639487208d1a86d0c3093f1f47ef545e564c60426",
+    "csrc/operators/lightning_indexer_with_fetch/op_host/launch.cpp": "b3d494738b9b1ab28e61a31c34321d33a93bb01992d1dfbffc53e9b9dfe8c8f8",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/li_types.h": "3bcfe5694f3b83eae8ead1a43bd6e45c059c47da8654a3f9086562ef5a931e96",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/lifecycle.cpp": "66373aa110899a5f07945c856066662d918c01fed7dc33ece3f8961e24be5c1f",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/prefetch.h": "1ade1d1694322913a6138f7f35eaff660aa5fa4152f47645a0b4460b665047b3",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/resolver.h": "bb7c8d8a37bdbf5910d343115c040d93b0274b469cc8f9424696781ce94923fe",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/score_common.h": "a7804b5f5de6155f8a129c79b832062b199383831e7d242c9fe807f629c9ad99",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/topk.h": "82367d9610dec3ac2e4659dd621823674ca3cab2437b374e8dd96d7c549251ab",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/topk_common.h": "2c02a2a0b06bec14bca760c8fc912cce837d59ce198c449988e81e889d10860d",
+    "csrc/operators/lightning_indexer_with_fetch/include/runtime_shape.h": "cdf09fc43d38ea4e370d253af0f914b493e19a485de83c5426f78c35f600289e"
+  },
+  "initial_migration_files": {
+    "csrc/operators/lidu/build_lidu_fused_batch_get_prepare_mtp.sh": "a9af1e34d2eee299dfe7a89b4058f90b3cfc655a8d003ad024738943faed9087",
+    "csrc/operators/lidu/op_host/a5_lidu_fused_batch_get_prepare_mtp.cpp": "7695e731f660bf4f908288fe9b75e2811f33056b68068994d2933f280ff0a636",
+    "csrc/operators/lidu/op_kernel/a5_lidu_fused_batch_get_prepare_mtp.cpp": "42896a8747ef798f1c697ed83c6a95c70049b49a9c4dc19119e6b8d4cf5088d4",
+    "csrc/operators/lidu/op_kernel/a5_lidu_fused_batch_get_prepare_mtp_tiling.h": "a1067bb34786a6e7d1b7ab8889a5a53a27249f6dc48ecda8e705f60bd6cc830f",
+    "csrc/operators/lidu/op_kernel/a5_lidu_fused_batch_get_prepare_mtp_vector.h": "39d3ba268478103db039324f7834b2f89c094c2e524cd3d26c1bb9a9baaea057",
+    "csrc/operators/lidu/ops.json": "9e67edfc0558a5585791722d8bb23099c3766005ff84cfe1764610944031e753",
+    "csrc/operators/lidu/torch_extension/csrc/lidu_fused_batch_get_prepare_mtp_op_api.h": "07bc42481e3635e44ebe264f9175f29b6d5bbdf4624dd12a59fc4e736802ca24",
+    "csrc/operators/lidu/torch_extension/csrc/lidu_fused_batch_get_prepare_mtp_ops.cpp": "1edb2300d83ce7f44bcc59b6ca994b4602a4c618b2a59c733eedb4d91e769a16",
+    "csrc/operators/lidu/torch_extension/nanovllm_dsa_lidu_fused_batch_get_prepare_mtp/__init__.py": "3c0eca925693b7b0afc2d92f12ccb43c96d32d1d8426b779686c423da6949a4b",
+    "csrc/operators/lidu/torch_extension/setup.py": "1f30c24149590502e7eb5075322a9afe7bc43da8c84334ea4615b7eefaa2f9db",
+    "csrc/operators/lightning_indexer_with_fetch/CMakeLists.txt": "ac94a0dc3b822ffd2aa89ec2105e14c1cd6e8205a89e4f90cdea4aa1ee3b5b58",
+    "csrc/operators/lightning_indexer_with_fetch/api.h": "a3ce666dff1af81213a0b1668ee57c6471c2f328ec17a7b8bc06bd9e0474ccbc",
+    "csrc/operators/lightning_indexer_with_fetch/context.h": "5ddc4f30001113ff970c32d31ca0d0702e3a60372aecde9002f6e9fb96ccd7e3",
+    "csrc/operators/lightning_indexer_with_fetch/index_cache_update.cpp": "8a491b430755feb6f78ce0f02e456a7871b191835ffeb65644ad8ce658599653",
+    "csrc/operators/lightning_indexer_with_fetch/index_cache_update.h": "af295ca7aa388d5ab1cf809370c89e7dff411ac129c9240e254b27b3668fa798",
+    "csrc/operators/lightning_indexer_with_fetch/index_cache_update_host.cpp": "e1cdd87caeabff9f7e15991ea163e8f473f50b945c1dcbc39c974edee3388842",
+    "csrc/operators/lightning_indexer_with_fetch/indexer.cpp": "14db20779852aab8068a9893bed6f98ee6d533fe64db97c79a3f54a9c37d06b8",
+    "csrc/operators/lightning_indexer_with_fetch/indexer.h": "a810a60c1a119cfae3529f5d46fcd2888c618dabe2b12d8a618a4bb560d13108",
+    "csrc/operators/lightning_indexer_with_fetch/indexer_cube.h": "324d7f56a920417caf72ff493821678fcaf9835eabf3c5773998df43bbf91718",
+    "csrc/operators/lightning_indexer_with_fetch/indexer_score.h": "36070015466018f9b66b3efeb49c7fc8c8ec3dc5916aa1e4aa4fc470369fb6e1",
+    "csrc/operators/lightning_indexer_with_fetch/indexer_types.h": "76fb6b1dcf00077d3ef7c32a55eef4884eddd431ee24b7ac4059cb3e5e2fea28",
+    "csrc/operators/lightning_indexer_with_fetch/indexer_vector.h": "7dad6e7682c05516c906026a0dc20ce3945d4cee8f677911d62c8467d9f0b27f",
+    "csrc/operators/lightning_indexer_with_fetch/launch.cpp": "348587a84ae7dcccc89579f9a820666ca131505374d262823df101ff719b4e0a",
+    "csrc/operators/lightning_indexer_with_fetch/li_types.h": "3bcfe5694f3b83eae8ead1a43bd6e45c059c47da8654a3f9086562ef5a931e96",
+    "csrc/operators/lightning_indexer_with_fetch/lifecycle.cpp": "44044f8f4a6c0597491e8512e0bff327de8825b328b2f0d2a19d3db7294c9e40",
+    "csrc/operators/lightning_indexer_with_fetch/prefetch.h": "9409e98f754e39d1fe8c2463220e6d69090e3662f455e31fa47fdbc4e0297379",
+    "csrc/operators/lightning_indexer_with_fetch/resolve.h": "008d10f60b163795bdb1e2ff413745fc13330712c6dac41897526374cf9a1807",
+    "csrc/operators/lightning_indexer_with_fetch/score_common.h": "a7804b5f5de6155f8a129c79b832062b199383831e7d242c9fe807f629c9ad99",
+    "csrc/operators/lightning_indexer_with_fetch/topk.h": "82367d9610dec3ac2e4659dd621823674ca3cab2437b374e8dd96d7c549251ab",
+    "csrc/operators/lightning_indexer_with_fetch/topk_common.h": "2c02a2a0b06bec14bca760c8fc912cce837d59ce198c449988e81e889d10860d",
+    "csrc/operators/lightning_indexer_with_fetch/transport.cpp": "9fb86970268e01e08fd92148f1be9ee4d026088c4253c73fc7278d1b2781cf91"
+  },
+  "runtime_adaptation": "ABI 10 runtime geometry; original scalar partition/window formulas retained; device validation pending.",
+  "layout_baseline": "7bda3a0"
+}
