@@ -1,8 +1,0 @@
-recursive-include operators/v9 *.h *.inc *.cpp *.py *.txt *.json
-recursive-include operators/native_lidu *.h *.cpp *.py *.sh *.json *.md
-recursive-include tests *.py *.h
-include build.sh env.sh README.md LICENSE
-include DEVELOPMENT.md
-recursive-include docs *.md
-recursive-include manifests *.json
-recursive-include tools *.py *.sh
