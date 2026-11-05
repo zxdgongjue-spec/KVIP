@@ -17,10 +17,10 @@ PY
     if [[ "$transport" == ubmem ]]; then
         export KVAF_BATCH_GET_KERNEL="$dependency/bin/kvaf_ubmem_batch_get.o"
         export KVAF_BATCH_PUT_KERNEL="$dependency/bin/kvaf_ubmem_batch_put.o"
-        return 0
+    else
+        export KVAF_BATCH_GET_KERNEL="$dependency/bin/kvaf_execute_batch_get_kernels.o"
+        export KVAF_BATCH_PUT_KERNEL="$dependency/bin/kvaf_execute_batch_put_kernels.o"
     fi
-    export KVAF_BATCH_GET_KERNEL="$dependency/bin/kvaf_execute_batch_get_kernels.o"
-    export KVAF_BATCH_PUT_KERNEL="$dependency/bin/kvaf_execute_batch_put_kernels.o"
     local libraries=("$root"/csrc/operators/lidu/_custom_opp/vendors/*/op_api/lib/libcust_opapi.so)
     if [[ "${#libraries[@]}" != 1 || ! -f "${libraries[0]}" ]]; then
         echo "Build KVIP first: bash $root/scripts/build.sh" >&2

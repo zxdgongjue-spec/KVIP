@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 REVISION = "c4375e13d7a9519d907ab6a5d11227795f207286"
 PATCHES = ("kvaf-reuse-device-ra", "kvaf-fused-context", "kvaf-fused-output-views")
 UBMEM_PATCH = "kvaf-ubmem-runtime"
+UBMEM_FUSED_PATCH = "kvaf-ubmem-fused-context"
 
 
 def call(command, cwd=None, env=None):
@@ -38,6 +39,18 @@ def applies(root, name, reverse=False):
     )
 
 
+def build_lidu(env, skip=False):
+    source = ROOT / "csrc/operators/lidu"
+    if skip:
+        libraries = list((source / "_custom_opp/vendors").glob("*/op_api/lib/libcust_opapi.so"))
+        extensions = list((source / "torch_extension/nanovllm_dsa_lidu_fused_batch_get_prepare_mtp").glob("_C*.so"))
+        if len(libraries) != 1 or len(extensions) != 1:
+            raise RuntimeError("--skip-lidu-build requires one existing LIDU vendor library and Python extension")
+        print(f"REUSE LIDU: {libraries[0]} {extensions[0]}", flush=True)
+        return
+    call(["bash", source / "build_lidu_fused_batch_get_prepare_mtp.sh"], env=env)
+
+
 def prepare_dependency(root, transport="urma"):
     if transport not in ("urma", "ubmem"):
         raise ValueError("transport must be urma or ubmem")
@@ -50,10 +63,19 @@ def prepare_dependency(root, transport="urma"):
         raise RuntimeError(f"Expected KVAF {REVISION}, found {head}; existing checkout left unchanged")
     # The UBmem patch changes shared Runtime/binding contexts from earlier
     # patches. Recognize the complete final patch before examining its parents.
-    if (ROOT / "scripts/patches" / (UBMEM_PATCH + ".patch")).is_file() and applies(root, UBMEM_PATCH, True):
+    if applies(root, UBMEM_FUSED_PATCH, True):
         if transport != "ubmem":
             raise RuntimeError("This KVAF tree contains UBmem changes; use a separate URMA baseline tree")
-        print(f"KVAF UBmem dependency ready: {root} @ {head}", flush=True)
+        print(f"KVAF UBmem fusion dependency ready: {root} @ {head}", flush=True)
+        return
+    runtime_ready = applies(root, UBMEM_PATCH, True)
+    if runtime_ready:
+        if transport != "ubmem":
+            raise RuntimeError("This KVAF tree contains UBmem changes; use a separate URMA baseline tree")
+        if not applies(root, UBMEM_FUSED_PATCH):
+            raise RuntimeError("KVAF UBmem fused-context patch conflicts with existing edits; checkout preserved")
+        call(["git", "apply", ROOT / "scripts/patches" / (UBMEM_FUSED_PATCH + ".patch")], cwd=root)
+        print(f"KVAF UBmem fusion dependency ready: {root} @ {head}", flush=True)
         return
     # Applying output-views changes the parent patch's context: check newest first.
     if not applies(root, PATCHES[0], True):
@@ -68,9 +90,10 @@ def prepare_dependency(root, transport="urma"):
                 raise RuntimeError(f"KVAF {name} conflicts with existing edits; no forced reset")
             call(["git", "apply", ROOT / "scripts/patches" / (name + ".patch")], cwd=root)
     if transport == "ubmem":
-        if not applies(root, UBMEM_PATCH):
-            raise RuntimeError("KVAF UBmem patch conflicts with existing edits; checkout preserved")
-        call(["git", "apply", ROOT / "scripts/patches" / (UBMEM_PATCH + ".patch")], cwd=root)
+        for name in (UBMEM_PATCH, UBMEM_FUSED_PATCH):
+            if not applies(root, name):
+                raise RuntimeError(f"KVAF {name} patch conflicts with existing edits; checkout preserved")
+            call(["git", "apply", ROOT / "scripts/patches" / (name + ".patch")], cwd=root)
     print(f"KVAF dependency ready: {root} @ {head}", flush=True)
 
 
@@ -79,6 +102,7 @@ def main():
     parser.add_argument("--kvaf-root", type=Path, help="existing checkout; otherwise download to third_party/KVAF")
     parser.add_argument("--prepare-only", action="store_true", help="prepare patches, without CANN builds")
     parser.add_argument("--skip-kvaf-build", action="store_true", help="use an already rebuilt, patched KVAF")
+    parser.add_argument("--skip-lidu-build", action="store_true", help="reuse existing LIDU vendor/Python libraries")
     parser.add_argument("--cann", type=Path, default=Path("/usr/local/Ascend/cann"))
     parser.add_argument("--soc", default="Ascend950PR_9599", help="compile target architecture")
     parser.add_argument("--jobs", type=int, default=2)
@@ -115,13 +139,28 @@ def main():
                 raise RuntimeError(f"UBmem kernel missing: {build_dir / 'bin' / name}")
         if not list((build_dir / "python/kvaf").glob("*.so")):
             raise RuntimeError(f"UBmem Python extension missing: {build_dir / 'python/kvaf'}")
+        build_lidu(env, args.skip_lidu_build)
+        call([sys.executable, "-m", "pip", "install", "--no-build-isolation", "-e", ROOT])
+        sys.path.insert(0, str(ROOT / "python"))
+        from kvip.operators.lifetch_ubmem.specialization import Specialization, build_specialization
+
+        # Initial no-weight smoke shapes. Serving prepares its exact history,
+        # head count and device AIC budget once before memory profiling.
+        for batch in (1, 2):
+            for token_bytes in (656, 2624):
+                build_specialization(
+                    cache_dir=build_dir / "lifetch_ubmem",
+                    cann=args.cann,
+                    shape=Specialization(batch, 33024, 8192, 64, token_bytes, 32, 8, args.soc),
+                    jobs=args.jobs,
+                )
         (ROOT / "build/dependencies.json").write_text(json.dumps(state, indent=2))
-        print("PASS: KVAF UBmem Put/Get runtime built. UBmem LIFetch is not integrated yet.", flush=True)
+        print("PASS: KVAF UBmem Put/Get + LIDU + UBmem LIFetch/Index update built. Source scripts/env.sh.", flush=True)
         return
     if not args.skip_kvaf_build:
         for target in ("cpu", "npu"):
             call(["bash", dependency / "build.sh", target, "--jobs", args.jobs], cwd=dependency, env=env)
-    call(["bash", ROOT / "csrc/operators/lidu/build_lidu_fused_batch_get_prepare_mtp.sh"], env=env)
+    build_lidu(env, args.skip_lidu_build)
     # Editable install intentionally retains csrc alongside the Python package.
     call([sys.executable, "-m", "pip", "install", "--no-build-isolation", "-e", ROOT])
     sys.path.insert(0, str(ROOT / "python"))

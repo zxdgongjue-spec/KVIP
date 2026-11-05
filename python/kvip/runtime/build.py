@@ -57,7 +57,7 @@ def build_libraries(*, cache_dir, cann, headers, soc):
         if tool.is_file():
             stat = tool.stat()
             digest.update(f"{tool.resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode())
-    for directory in (root / "lightning_indexer_with_fetch", Path(headers)):
+    for directory in (root / "lightning_indexer_with_fetch", root / "common/lightning_indexer", Path(headers)):
         for path in sorted(directory.rglob("*")):
             if path.is_file() and (path.suffix in (".h", ".cpp", ".py") or path.name == "CMakeLists.txt"):
                 digest.update(str(path.relative_to(directory)).encode())
