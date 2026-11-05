@@ -1,6 +1,7 @@
 /build/
 /third_party/
 /tests/results/
+/export_only_prof_dir/
 **/__pycache__/
 *.egg-info/
 .pytest_cache/
