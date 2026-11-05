@@ -62,7 +62,7 @@ constexpr uint32_t REQUEST_CONTROL_WORDS = 16;
 constexpr uint32_t DYNAMIC_UB_BYTES = static_cast<uint32_t>(
     MISS_BITMAP_STORAGE_WORDS * sizeof(uint32_t) +
     4 * SPARSE_COUNT * sizeof(int32_t) +
-    REQUEST_CONTROL_WORDS * sizeof(int32_t) +
+    2 * REQUEST_CONTROL_WORDS * sizeof(int32_t) +
     SOURCE_SCRATCH_STORAGE_WORDS * sizeof(uint32_t) +
     MTP_MISS_CAPACITY * sizeof(int32_t));
 constexpr uint32_t GM_CACHE_LINE_WORDS = 64 / sizeof(int32_t);
