@@ -8,8 +8,11 @@
  *   miss-first compaction -> unordered request-level miss deduplication -> map
  *   update -> miss-prefix refill -> compact descriptor generation.
  *
- * Miss-slot membership is supplied as a bitmap input. Classification and
- * compacted tokens occupy different GM workspace slices.
+ * Miss-slot membership is supplied as a bitmap input. The lane owning a
+ * query keeps the classification in UB and compacts the query in place, so
+ * the reserved per-query classification slice in the GM workspace only
+ * carries the published per-query miss count. Compacted tokens occupy their
+ * own GM workspace slices.
  * The unique-source, resolved-slot, and descriptor slices reserve 8192
  * entries per request. Requests with more than 2048 unique misses protect
  * every input miss slot and hit slot, then select additional eviction slots
@@ -63,7 +66,7 @@ constexpr uint32_t REQUEST_CONTROL_WORDS = 16;
 constexpr uint32_t DYNAMIC_UB_BYTES =
     MISS_BITMAP_STORAGE_WORDS * sizeof(uint32_t) +
     4U * SPARSE_COUNT * sizeof(int32_t) +
-    REQUEST_CONTROL_WORDS * sizeof(int32_t) +
+    2U * REQUEST_CONTROL_WORDS * sizeof(int32_t) +
     SOURCE_SCRATCH_STORAGE_WORDS * sizeof(uint32_t) +
     MTP_MISS_CAPACITY * sizeof(int32_t);
 constexpr uint32_t GM_CACHE_LINE_WORDS = 64 / sizeof(int32_t);
@@ -139,23 +142,34 @@ enum ProfileField : uint32_t {
     PROFILE_QUERY2_MISS_COUNT,
     PROFILE_QUERY3_MISS_COUNT,
     PROFILE_SLOT_SELECT,
+    PROFILE_PREFIX_CLEAR,
+    PROFILE_PREFIX_INSTALL,
+    PROFILE_PREFIX_TOTAL,
+    PROFILE_USED_FIELD_COUNT,
 };
 
 struct RequestTiming {
-    uint64_t membership;
-    uint64_t classify;
-    uint64_t compact;
-    uint64_t dedup;
-    uint64_t slotSelect;
-    uint64_t clear;
-    uint64_t install;
-    uint64_t refill;
-    uint64_t descriptor;
+    uint64_t membership = 0;
+    uint64_t classify = 0;
+    uint64_t compact = 0;
+    uint64_t dedup = 0;
+    uint64_t slotSelect = 0;
+    uint64_t clear = 0;
+    uint64_t install = 0;
+    uint64_t refill = 0;
+    uint64_t descriptor = 0;
+    uint64_t prefixClear = 0;
+    uint64_t prefixInstall = 0;
+    uint64_t prefixTotal = 0;
 };
 
 static_assert(SOURCE_BITMAP_WORDS * 32 == MAX_SOURCE_CAPACITY,
               "source bitmap must cover the complete source domain");
-static_assert(PROFILE_SEQUENTIAL_START > PROFILE_SLOT_SELECT,
+static_assert(
+    PROFILE_USED_FIELD_COUNT <=
+        A5_LIDU_FUSED_BATCH_GET_PREPARE_MTP_PROFILE_FIELDS,
+    "profiling fields exceed the public profiling tensor capacity");
+static_assert(PROFILE_SEQUENTIAL_START >= PROFILE_USED_FIELD_COUNT,
               "sequential profile timestamp must use a reserved field");
 static_assert(DYNAMIC_UB_BYTES % UB_BLOCK_BYTES == 0,
               "dynamic UB allocation must be data-block aligned");
@@ -183,7 +197,7 @@ ClassifyTopkSimt(
     __ubuf__ int32_t *topk,
     __gm__ int32_t *tokenToSlot,
     __ubuf__ uint32_t *missSlotMembership,
-    __gm__ int32_t *classification,
+    __ubuf__ int32_t *classification,
     int32_t candidateLen,
     int32_t residentBudget)
 {
@@ -767,6 +781,8 @@ public:
         pipe_->InitBuffer(outputSlotsBuf_, SPARSE_COUNT * sizeof(int32_t));
         pipe_->InitBuffer(controlBuf_, REQUEST_CONTROL_WORDS * sizeof(int32_t));
         pipe_->InitBuffer(
+            prefixControlBuf_, REQUEST_CONTROL_WORDS * sizeof(int32_t));
+        pipe_->InitBuffer(
             sourceMembershipBuf_, SOURCE_SCRATCH_STORAGE_WORDS * sizeof(uint32_t));
         pipe_->InitBuffer(
             uniqueSourcesBuf_, MTP_MISS_CAPACITY * sizeof(int32_t));
@@ -798,6 +814,8 @@ public:
             PublishAllInvalidQueryRows();
             GlobalSync();
             if (coreIdx_ == 0) {
+                SetFlag<HardEvent::V_S>(EVENT_ID4);
+                WaitFlag<HardEvent::V_S>(EVENT_ID4);
                 WriteBatchOutputs(true);
             }
             return;
@@ -826,16 +844,17 @@ public:
         }
         ProfileSet(timing.membership, membershipStart);
 
-        const uint64_t classifyStart = ProfileStart();
+        // Each lane classifies and compacts the queries it owns in one pass,
+        // then publishes the per-query miss count for the leader.
         if (status == STATUS_OK && !paddingRow) {
             for (uint32_t localQuery = lane; localQuery < queryCount;
                  localQuery += tiling_->coresPerRequest) {
-                ClassifyQuery(
+                const uint32_t missCount = ClassifyAndCompactQuery(
                     row, localQuery, queryBegin + localQuery,
-                    candidateLen, budget, poolRow);
+                    candidateLen, budget, poolRow, timing);
+                PublishQueryMissCount(row, localQuery, missCount);
             }
         }
-        ProfileSet(timing.classify, classifyStart);
         GlobalSync();
 
         if (lane == 0) {
@@ -843,27 +862,81 @@ public:
                 PrepareMtpGraphPaddingRow(
                     row, queryBegin, queryCount);
             } else {
+                uint32_t queryMissCounts[MAX_QUERIES_PER_REQUEST] = {
+                    0, 0, 0, 0};
+                if (status == STATUS_OK) {
+                    LoadQueryMissCounts(row, queryCount, queryMissCounts);
+                }
                 PrepareRequestAfterClassification(
-                    row, status, queryBegin, queryCount,
+                    row, status, queryBegin, queryCount, queryMissCounts,
                     candidateLen, static_cast<uint32_t>(budget), poolRow,
                     timing);
             }
         }
         GlobalSync();
 
-        ClearPreparedRequest(row, lane, timing);
+        LocalTensor<int32_t> compactPrefixes =
+            missMembershipBuf_.Get<uint32_t>()
+                .template ReinterpretCast<int32_t>();
+        LocalTensor<int32_t> prefixControl =
+            prefixControlBuf_.Get<int32_t>();
+        compactPrefixes.SetValue(0, 0);
+        uint32_t totalMissCount = 0;
+        const uint32_t prefixSplit =
+            (tiling_->batchSize + 1U) / 2U;
+
+        const uint64_t clearStart = ProfileStart();
+        event_t clearDone = static_cast<event_t>(0);
+        const bool clearLaunched = LaunchClearPreparedRequest(
+            row, lane, clearDone);
+        const uint64_t prefixClearStart = ReadCycle();
+        BuildCompactPrefixRange(
+            0, prefixSplit, compactPrefixes, prefixControl,
+            totalMissCount);
+        timing.prefixClear = ReadCycle() - prefixClearStart;
+        if (clearLaunched) {
+            WaitFlag<HardEvent::V_S>(clearDone);
+        }
         // Preserve the base operator's clear-before-install rule globally,
         // including when two request entries unexpectedly alias one pool row.
         GlobalSync();
-        InstallPreparedRequest(row, lane, timing);
+        ProfileSet(timing.clear, clearStart);
+
+        const uint64_t installStart = ProfileStart();
+        event_t installDone = static_cast<event_t>(0);
+        const bool installLaunched = LaunchInstallPreparedRequest(
+            row, lane, installDone);
+        const uint64_t prefixInstallStart = ReadCycle();
+        BuildCompactPrefixRange(
+            prefixSplit, tiling_->batchSize, compactPrefixes,
+            prefixControl, totalMissCount);
+        timing.prefixInstall = ReadCycle() - prefixInstallStart;
+        timing.prefixTotal = timing.prefixClear + timing.prefixInstall;
+        if (installLaunched) {
+            WaitFlag<HardEvent::V_S>(installDone);
+        }
         GlobalSync();
+        SetFlag<HardEvent::S_V>(EVENT_ID4);
+        WaitFlag<HardEvent::S_V>(EVENT_ID4);
+        ProfileSet(timing.install, installStart);
+
         RefillPreparedRequest(row, lane, timing);
+        GlobalSync();
+
+        // Launch descriptor SIMT before core 0 publishes scalar/MTE3 outputs.
+        // The per-core prefix is scalar-built and must be vector-visible.
+        SetFlag<HardEvent::V_S>(EVENT_ID4);
+        WaitFlag<HardEvent::V_S>(EVENT_ID4);
+        const uint64_t descriptorStart = ProfileStart();
+        event_t descriptorDone = static_cast<event_t>(0);
+        const bool descriptorLaunched = LaunchCompactDescriptorTask(
+            compactPrefixes, totalMissCount, descriptorDone);
         if (coreIdx_ == 0) {
             WriteBatchOutputs(false);
         }
-
-        const uint64_t descriptorStart = ProfileStart();
-        GenerateCompactDescriptorTask();
+        if (descriptorLaunched) {
+            WaitFlag<HardEvent::V_S>(descriptorDone);
+        }
         ProfileSet(timing.descriptor, descriptorStart);
         if (profileEnabled_) {
             WriteProfile(row, lane, ReadCycle() - totalStart, timing);
@@ -881,6 +954,8 @@ public:
             PublishAllInvalidQueryRows();
             GlobalSync();
             if (coreIdx_ == 0) {
+                SetFlag<HardEvent::V_S>(EVENT_ID4);
+                WaitFlag<HardEvent::V_S>(EVENT_ID4);
                 WriteBatchOutputs(true);
             }
             return;
@@ -906,6 +981,18 @@ public:
         }
         GlobalSync();
 
+        LocalTensor<int32_t> compactPrefixes =
+            missMembershipBuf_.Get<uint32_t>()
+                .template ReinterpretCast<int32_t>();
+        LocalTensor<int32_t> prefixControl =
+            prefixControlBuf_.Get<int32_t>();
+        compactPrefixes.SetValue(0, 0);
+        uint32_t totalMissCount = 0;
+        const uint32_t prefixSplit =
+            (tiling_->batchSize + 1U) / 2U;
+        uint64_t prefixClear = 0;
+        uint64_t prefixInstall = 0;
+
         for (uint32_t waveBegin = 0;
              waveBegin < tiling_->batchSize;
              waveBegin += tiling_->usedCoreNum) {
@@ -914,7 +1001,21 @@ public:
                 continue;
             }
             RequestTiming timing;
-            ClearPreparedRequest(row, 0, timing);
+            const uint64_t clearStart = ProfileStart();
+            event_t clearDone = static_cast<event_t>(0);
+            const bool clearLaunched = LaunchClearPreparedRequest(
+                row, 0, clearDone);
+            if (waveBegin == 0) {
+                const uint64_t prefixStart = ReadCycle();
+                BuildCompactPrefixRange(
+                    0, prefixSplit, compactPrefixes, prefixControl,
+                    totalMissCount);
+                prefixClear = ReadCycle() - prefixStart;
+            }
+            if (clearLaunched) {
+                WaitFlag<HardEvent::V_S>(clearDone);
+            }
+            ProfileSet(timing.clear, clearStart);
             if (profileEnabled_) {
                 StoreSequentialStageTiming(row, PROFILE_CLEAR, timing.clear);
             }
@@ -929,13 +1030,29 @@ public:
                 continue;
             }
             RequestTiming timing;
-            InstallPreparedRequest(row, 0, timing);
+            const uint64_t installStart = ProfileStart();
+            event_t installDone = static_cast<event_t>(0);
+            const bool installLaunched = LaunchInstallPreparedRequest(
+                row, 0, installDone);
+            if (waveBegin == 0) {
+                const uint64_t prefixStart = ReadCycle();
+                BuildCompactPrefixRange(
+                    prefixSplit, tiling_->batchSize, compactPrefixes,
+                    prefixControl, totalMissCount);
+                prefixInstall = ReadCycle() - prefixStart;
+            }
+            if (installLaunched) {
+                WaitFlag<HardEvent::V_S>(installDone);
+            }
+            ProfileSet(timing.install, installStart);
             if (profileEnabled_) {
                 StoreSequentialStageTiming(
                     row, PROFILE_INSTALL, timing.install);
             }
         }
         GlobalSync();
+        SetFlag<HardEvent::S_V>(EVENT_ID4);
+        WaitFlag<HardEvent::S_V>(EVENT_ID4);
 
         for (uint32_t waveBegin = 0;
              waveBegin < tiling_->batchSize;
@@ -952,13 +1069,21 @@ public:
         }
         GlobalSync();
 
+        // Make the reused output buffers scalar-visible before descriptor
+        // SIMT starts. Core 0 then writes batch outputs while its own
+        // descriptor VF is in flight.
+        SetFlag<HardEvent::V_S>(EVENT_ID4);
+        WaitFlag<HardEvent::V_S>(EVENT_ID4);
+        event_t descriptorDone = static_cast<event_t>(0);
+        const uint64_t descriptorStart = ReadCycle();
+        const bool descriptorLaunched = LaunchCompactDescriptorTask(
+            compactPrefixes, totalMissCount, descriptorDone);
         if (coreIdx_ == 0) {
             WriteBatchOutputs(false);
         }
-        GlobalSync();
-
-        const uint64_t descriptorStart = ReadCycle();
-        GenerateCompactDescriptorTask();
+        if (descriptorLaunched) {
+            WaitFlag<HardEvent::V_S>(descriptorDone);
+        }
         const uint64_t descriptor = ReadCycle() - descriptorStart;
         if (profileEnabled_) {
             for (uint32_t waveBegin = 0;
@@ -966,7 +1091,8 @@ public:
                  waveBegin += tiling_->usedCoreNum) {
                 const uint32_t row = waveBegin + coreIdx_;
                 if (row < tiling_->batchSize) {
-                    FinalizeSequentialProfile(row, descriptor);
+                    FinalizeSequentialProfile(
+                        row, descriptor, prefixClear, prefixInstall);
                 }
             }
         }
@@ -1034,22 +1160,21 @@ private:
         }
         timing.membership = ReadCycle() - membershipStart;
 
-        const uint64_t classifyStart = ReadCycle();
+        uint32_t queryMissCounts[MAX_QUERIES_PER_REQUEST] = {0, 0, 0, 0};
         if (status == STATUS_OK && !paddingRow) {
             for (uint32_t localQuery = 0;
                  localQuery < queryCount;
                  ++localQuery) {
-                ClassifyQuery(
+                queryMissCounts[localQuery] = ClassifyAndCompactQuery(
                     row, localQuery, queryBegin + localQuery,
-                    candidateLen, budget, poolRow);
+                    candidateLen, budget, poolRow, timing);
             }
         }
-        timing.classify = ReadCycle() - classifyStart;
         if (paddingRow) {
             PrepareMtpGraphPaddingRow(row, queryBegin, queryCount);
         } else {
             PrepareRequestAfterClassification(
-                row, status, queryBegin, queryCount,
+                row, status, queryBegin, queryCount, queryMissCounts,
                 candidateLen, static_cast<uint32_t>(budget), poolRow,
                 timing);
         }
@@ -1372,14 +1497,27 @@ private:
         WaitFlag<HardEvent::S_V>(EVENT_ID4);
     }
 
-    __aicore__ inline void ClassifyQuery(
+    // Fused per-query classification and miss-first compaction. The only
+    // consumer of a query's classification is this query's compaction, which
+    // is a pure function of the TopK row and the classification, so the lane
+    // owning the query classifies straight into UB and compacts in place.
+    // This avoids the GM classification write, the 8KB classification read
+    // back, and the TopK reload, and lets the lanes compact their queries in
+    // parallel without extra barriers.
+    __aicore__ inline uint32_t ClassifyAndCompactQuery(
         uint32_t row, uint32_t localQuery, uint32_t queryRow,
-        int32_t candidateLen, int32_t budget, int32_t poolRow)
+        int32_t candidateLen, int32_t budget, int32_t poolRow,
+        RequestTiming &timing)
     {
         LocalTensor<int32_t> topk = topkBuf_.Get<int32_t>();
         LocalTensor<uint32_t> membership =
             missMembershipBuf_.Get<uint32_t>();
+        LocalTensor<int32_t> classification =
+            classificationBuf_.Get<int32_t>();
+        LocalTensor<int32_t> outputTokens = outputTokensBuf_.Get<int32_t>();
+        LocalTensor<int32_t> outputSlots = outputSlotsBuf_.Get<int32_t>();
 
+        const uint64_t classifyStart = ProfileStart();
         LoadTopk(queryRow, topk);
         SanitizeGraphDummyTopk(topk, candidateLen);
         const uint64_t tokenBase =
@@ -1389,31 +1527,12 @@ private:
             (__ubuf__ int32_t *)topk.GetPhyAddr(),
             (__gm__ int32_t *)tokenToSlotPoolGm_[tokenBase].GetPhyAddr(),
             (__ubuf__ uint32_t *)membership.GetPhyAddr(),
-            (__gm__ int32_t *)workspaceGm_[
-                ClassificationBase(row, localQuery)].GetPhyAddr(),
+            (__ubuf__ int32_t *)classification.GetPhyAddr(),
             candidateLen, budget);
         PipeBarrier<PIPE_ALL>();
-    }
-
-    __aicore__ inline uint32_t CompactQuery(
-        uint32_t row, uint32_t localQuery, uint32_t queryRow,
-        int32_t candidateLen, RequestTiming &timing)
-    {
-        LocalTensor<int32_t> topk = topkBuf_.Get<int32_t>();
-        LocalTensor<int32_t> classification =
-            classificationBuf_.Get<int32_t>();
-        LocalTensor<int32_t> outputTokens = outputTokensBuf_.Get<int32_t>();
-        LocalTensor<int32_t> outputSlots = outputSlotsBuf_.Get<int32_t>();
+        ProfileAdd(timing.classify, classifyStart);
 
         const uint64_t compactStart = ProfileStart();
-        // Classification for every packed query is already complete before
-        // compaction starts. Reload this query's TopK row and consume only
-        // its dedicated classification slice.
-        LoadTopk(queryRow, topk);
-        SanitizeGraphDummyTopk(topk, candidateLen);
-        LoadWorkspaceVector(
-            ClassificationBase(row, localQuery), classification,
-            SPARSE_COUNT);
         Duplicate(outputTokens, static_cast<int32_t>(-1), SPARSE_COUNT);
         Duplicate(outputSlots, static_cast<int32_t>(-1), SPARSE_COUNT);
         PipeBarrier<PIPE_V>();
@@ -1449,6 +1568,29 @@ private:
             row, localQuery, queryRow, outputTokens, outputSlots);
         ProfileAdd(timing.compact, compactStart);
         return missCount;
+    }
+
+    // Lane 0 needs every query's miss count for request-level dedup and row
+    // control. The owning lane publishes the count into the first word of
+    // the query's reserved classification slice. Per-query slices are 2048
+    // words apart, so concurrent publishes never share a GM cache line.
+    __aicore__ inline void PublishQueryMissCount(
+        uint32_t row, uint32_t localQuery, uint32_t missCount)
+    {
+        LocalTensor<int32_t> control = controlBuf_.Get<int32_t>();
+        control.SetValue(0, static_cast<int32_t>(missCount));
+        StoreScalarControl(ClassificationBase(row, localQuery), control, 1);
+    }
+
+    __aicore__ inline void LoadQueryMissCounts(
+        uint32_t row, uint32_t queryCount,
+        uint32_t queryMissCounts[MAX_QUERIES_PER_REQUEST]) const
+    {
+        for (uint32_t localQuery = 0; localQuery < queryCount;
+             ++localQuery) {
+            queryMissCounts[localQuery] = static_cast<uint32_t>(
+                workspaceGm_.GetValue(ClassificationBase(row, localQuery)));
+        }
     }
 
     __aicore__ inline void InitializeDedup(
@@ -1835,12 +1977,11 @@ private:
             queryMissCounts, false, -1);
     }
 
-    __aicore__ inline void ClearVictims(
+    __aicore__ inline void LaunchClearVictims(
         uint32_t row, uint32_t lane, uint32_t uniqueCount,
         bool useResolvedSlots, int32_t candidateLen, int32_t poolRow,
-        RequestTiming &timing)
+        event_t &clearDone)
     {
-        const uint64_t start = ProfileStart();
         const uint64_t missBase =
             static_cast<uint64_t>(row) * SPARSE_COUNT;
         const uint64_t resolvedBase = ResolvedSlotBase(row);
@@ -1873,19 +2014,16 @@ private:
             uniqueCount, useResolvedSlots, tiling_->residentCapacity,
             forwardBegin, forwardEnd);
         PipeBarrier<PIPE_V>();
-        const event_t clearDone = static_cast<event_t>(
+        clearDone = static_cast<event_t>(
             GetTPipePtr()->FetchEventID(HardEvent::V_S));
         SetFlag<HardEvent::V_S>(clearDone);
-        WaitFlag<HardEvent::V_S>(clearDone);
-        ProfileAdd(timing.clear, start);
     }
 
-    __aicore__ inline void InstallMaps(
+    __aicore__ inline void LaunchInstallMaps(
         uint32_t row, uint32_t lane, uint32_t uniqueCount,
         bool useResolvedSlots, uint32_t budget, uint32_t candidateLen,
-        int32_t poolRow, RequestTiming &timing)
+        int32_t poolRow, event_t &installDone)
     {
-        const uint64_t start = ProfileStart();
         const uint64_t missBase =
             static_cast<uint64_t>(row) * SPARSE_COUNT;
         const uint64_t resolvedBase = ResolvedSlotBase(row);
@@ -1931,11 +2069,9 @@ private:
             forwardBegin, forwardEnd,
             reverseBegin, reverseEnd);
         PipeBarrier<PIPE_V>();
-        const event_t installDone = static_cast<event_t>(
+        installDone = static_cast<event_t>(
             GetTPipePtr()->FetchEventID(HardEvent::V_S));
         SetFlag<HardEvent::V_S>(installDone);
-        WaitFlag<HardEvent::V_S>(installDone);
-        ProfileAdd(timing.install, start);
     }
 
     __aicore__ inline void RefillMissPrefixes(
@@ -1966,10 +2102,11 @@ private:
 
     __aicore__ inline void PrepareRequestAfterClassification(
         uint32_t row, int32_t status, uint32_t queryBegin,
-        uint32_t queryCount, int32_t candidateLen, uint32_t budget,
+        uint32_t queryCount,
+        const uint32_t queryMissCounts[MAX_QUERIES_PER_REQUEST],
+        int32_t candidateLen, uint32_t budget,
         int32_t poolRow, RequestTiming &timing)
     {
-        uint32_t queryMissCounts[MAX_QUERIES_PER_REQUEST] = {0, 0, 0, 0};
         uint32_t uniqueCount = 0;
         bool usesResolvedSlots = false;
         bool dedupInitialized = false;
@@ -1979,19 +2116,21 @@ private:
         if (status == STATUS_OK) {
             for (uint32_t localQuery = 0;
                  localQuery < queryCount; ++localQuery) {
-                const uint32_t missCount = CompactQuery(
-                    row, localQuery, queryBegin + localQuery,
-                    candidateLen, timing);
+                const uint32_t missCount = queryMissCounts[localQuery];
                 if (missCount > SPARSE_COUNT) {
                     status = ERROR_COUNT_ACCOUNTING;
                     break;
                 }
-                queryMissCounts[localQuery] = missCount;
                 if (missCount > 0) {
                     if (!dedupInitialized) {
                         InitializeDedup(candidateLen, timing);
                         dedupInitialized = true;
                     }
+                    // The owning lane already published the compacted miss
+                    // prefix to GM. Only the miss prefix feeds dedup.
+                    LoadWorkspaceVector(
+                        CompactedTokenBase(row, localQuery),
+                        compactedTokens, missCount);
                     DeduplicateCompactedQuery(
                         compactedTokens, missCount, candidateLen, timing);
                 }
@@ -2019,8 +2158,8 @@ private:
             queryMissCounts, usesResolvedSlots, proposedCursor);
     }
 
-    __aicore__ inline void ClearPreparedRequest(
-        uint32_t row, uint32_t lane, RequestTiming &timing)
+    __aicore__ inline bool LaunchClearPreparedRequest(
+        uint32_t row, uint32_t lane, event_t &clearDone)
     {
         LocalTensor<int32_t> control = controlBuf_.Get<int32_t>();
         LoadRowControl(row, control);
@@ -2029,18 +2168,19 @@ private:
             CONTROL_UNIQUE_MISS_COUNT);
         if (status != STATUS_OK || uniqueCount <= 0 ||
             uniqueCount > static_cast<int32_t>(MTP_MISS_CAPACITY)) {
-            return;
+            return false;
         }
         const bool useResolvedSlots = control.GetValue(
             CONTROL_USES_RESOLVED_SLOTS) != 0;
-        ClearVictims(
+        LaunchClearVictims(
             row, lane, static_cast<uint32_t>(uniqueCount),
             useResolvedSlots, candidateLensGm_.GetValue(row),
-            reqPoolEntriesGm_.GetValue(row), timing);
+            reqPoolEntriesGm_.GetValue(row), clearDone);
+        return true;
     }
 
-    __aicore__ inline void InstallPreparedRequest(
-        uint32_t row, uint32_t lane, RequestTiming &timing)
+    __aicore__ inline bool LaunchInstallPreparedRequest(
+        uint32_t row, uint32_t lane, event_t &installDone)
     {
         LocalTensor<int32_t> control = controlBuf_.Get<int32_t>();
         LoadRowControl(row, control);
@@ -2049,17 +2189,18 @@ private:
             CONTROL_UNIQUE_MISS_COUNT);
         if (status != STATUS_OK || uniqueCountValue <= 0 ||
             uniqueCountValue > static_cast<int32_t>(MTP_MISS_CAPACITY)) {
-            return;
+            return false;
         }
         const uint32_t uniqueCount = static_cast<uint32_t>(uniqueCountValue);
         const bool useResolvedSlots = control.GetValue(
             CONTROL_USES_RESOLVED_SLOTS) != 0;
         const int32_t poolRow = reqPoolEntriesGm_.GetValue(row);
-        InstallMaps(
+        LaunchInstallMaps(
             row, lane, uniqueCount, useResolvedSlots,
             static_cast<uint32_t>(cacheTokensGm_.GetValue(row)),
             static_cast<uint32_t>(candidateLensGm_.GetValue(row)),
-            poolRow, timing);
+            poolRow, installDone);
+        return true;
     }
 
     __aicore__ inline void RefillPreparedRequest(
@@ -2119,8 +2260,6 @@ private:
             if (count > SPARSE_COUNT) {
                 count = SPARSE_COUNT;
             }
-            SetFlag<HardEvent::V_S>(EVENT_ID4);
-            WaitFlag<HardEvent::V_S>(EVENT_ID4);
             for (uint32_t index = 0; index < count; ++index) {
                 int32_t status = ERROR_QUERY_LAYOUT;
                 int32_t uniqueCount = 0;
@@ -2173,36 +2312,32 @@ private:
         WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
     }
 
-    __aicore__ inline uint32_t LoadCompactPrefixes(
-        LocalTensor<int32_t> prefixes)
+    __aicore__ inline void BuildCompactPrefixRange(
+        uint32_t beginRow, uint32_t endRow,
+        LocalTensor<int32_t> prefixes,
+        LocalTensor<int32_t> prefixControl,
+        uint32_t &totalMissCount)
     {
-        uint32_t total = 0;
-        prefixes.SetValue(0, 0);
-        LocalTensor<int32_t> control = controlBuf_.Get<int32_t>();
-        for (uint32_t row = 0; row < tiling_->batchSize; ++row) {
-            LoadRowControl(row, control);
-            const int32_t status = control.GetValue(CONTROL_STATUS);
-            const int32_t count = control.GetValue(
+        for (uint32_t row = beginRow; row < endRow; ++row) {
+            LoadRowControl(row, prefixControl);
+            const int32_t status = prefixControl.GetValue(CONTROL_STATUS);
+            const int32_t count = prefixControl.GetValue(
                 CONTROL_UNIQUE_MISS_COUNT);
             if (status == STATUS_OK && count > 0 &&
                 count <= static_cast<int32_t>(MTP_MISS_CAPACITY)) {
-                total += static_cast<uint32_t>(count);
+                totalMissCount += static_cast<uint32_t>(count);
             }
-            prefixes.SetValue(row + 1, static_cast<int32_t>(total));
+            prefixes.SetValue(
+                row + 1, static_cast<int32_t>(totalMissCount));
         }
-        SetFlag<HardEvent::S_V>(EVENT_ID4);
-        WaitFlag<HardEvent::S_V>(EVENT_ID4);
-        return total;
     }
 
-    __aicore__ inline void GenerateCompactDescriptorTask()
+    __aicore__ inline bool LaunchCompactDescriptorTask(
+        LocalTensor<int32_t> prefixes, uint32_t total,
+        event_t &descriptorDone)
     {
-        LocalTensor<int32_t> prefixes =
-            missMembershipBuf_.Get<uint32_t>()
-                .template ReinterpretCast<int32_t>();
-        const uint32_t total = LoadCompactPrefixes(prefixes);
         if (total == 0) {
-            return;
+            return false;
         }
         const uint32_t totalLines =
             (total + GM_CACHE_LINE_WORDS - 1) / GM_CACHE_LINE_WORDS;
@@ -2213,7 +2348,7 @@ private:
             static_cast<uint64_t>(totalLines) * (coreIdx_ + 1) /
             tiling_->usedCoreNum);
         if (lineBegin >= lineEnd) {
-            return;
+            return false;
         }
         const uint32_t taskBegin = lineBegin * GM_CACHE_LINE_WORDS;
         uint32_t taskEnd = lineEnd * GM_CACHE_LINE_WORDS;
@@ -2235,7 +2370,11 @@ private:
             tiling_->residentCapacity, tiling_->residentBlockCapacity,
             tiling_->numLayers,
             tiling_->layerId, tiling_->qcap);
-        PipeBarrier<PIPE_ALL>();
+        PipeBarrier<PIPE_V>();
+        descriptorDone = static_cast<event_t>(
+            GetTPipePtr()->FetchEventID(HardEvent::V_S));
+        SetFlag<HardEvent::V_S>(descriptorDone);
+        return true;
     }
 
     __aicore__ inline uint64_t ProfileBase(uint32_t row) const
@@ -2290,7 +2429,8 @@ private:
     }
 
     __aicore__ inline void FinalizeSequentialProfile(
-        uint32_t row, uint64_t descriptor)
+        uint32_t row, uint64_t descriptor,
+        uint64_t prefixClear, uint64_t prefixInstall)
     {
         const uint64_t base = ProfileBase(row);
         const uint64_t totalStart = static_cast<uint64_t>(
@@ -2313,6 +2453,9 @@ private:
         timing.refill = static_cast<uint64_t>(
             profilingGm_.GetValue(base + PROFILE_REFILL));
         timing.descriptor = descriptor;
+        timing.prefixClear = prefixClear;
+        timing.prefixInstall = prefixInstall;
+        timing.prefixTotal = prefixClear + prefixInstall;
         WriteProfile(row, 0, ReadCycle() - totalStart, timing);
     }
 
@@ -2367,6 +2510,12 @@ private:
         }
         profilingGm_.SetValue(base + PROFILE_SLOT_SELECT,
                               static_cast<int64_t>(timing.slotSelect));
+        profilingGm_.SetValue(base + PROFILE_PREFIX_CLEAR,
+                              static_cast<int64_t>(timing.prefixClear));
+        profilingGm_.SetValue(base + PROFILE_PREFIX_INSTALL,
+                              static_cast<int64_t>(timing.prefixInstall));
+        profilingGm_.SetValue(base + PROFILE_PREFIX_TOTAL,
+                              static_cast<int64_t>(timing.prefixTotal));
     }
 
 private:
@@ -2402,6 +2551,7 @@ private:
     TBuf<TPosition::VECCALC> outputTokensBuf_;
     TBuf<TPosition::VECCALC> outputSlotsBuf_;
     TBuf<TPosition::VECCALC> controlBuf_;
+    TBuf<TPosition::VECCALC> prefixControlBuf_;
     bool profileEnabled_ = false;
     bool graphDummy_ = false;
 };
