@@ -62,6 +62,9 @@ def check_shape(kvaf, torch, build, device_id, shape, library):
         stride = resident + 8192
         output = torch.zeros((batch + 1, stride, token_bytes), dtype=torch.uint8, device=device)
         output[1:, :resident].copy_(source.view(batch, history, token_bytes)[:, :resident])
+        # Match vLLM policy.bytes_outputs: KVAF registers one token per row.
+        # Keep the owner-shaped alias only for payload verification below.
+        output_rows = output.view(-1, token_bytes)
         workspace = UbmemWorkspace(
             torch,
             batch=batch,
@@ -78,14 +81,14 @@ def check_shape(kvaf, torch, build, device_id, shape, library):
         workspace.inputs.weights.fill_(1)
         workspace.inputs.scale.fill_(1)
         workspace.inputs.query_ends.fill_(history)
-        lease = UbmemLease(torch, runtime, output, stream)
+        lease = UbmemLease(torch, runtime, output_rows, stream)
         lease.register_table(device_table)
         rotating = UbmemBinding(
             torch,
             library,
             workspace.arguments(storage),
             lease,
-            output,
+            output_rows,
             shape=shape,
             query_ends=workspace.inputs.query_ends.view(batch, 4),
             hot_valid=storage.hot_valid,
