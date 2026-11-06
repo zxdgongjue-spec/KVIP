@@ -75,7 +75,6 @@ def check_shape(kvaf, torch, build, device_id, shape, library):
             device=device,
             index_heads=shape.heads,
         )
-        workspace.scratch["lru_slots"].copy_(torch.arange(2048, dtype=torch.int32, device=device))
         workspace.inputs.prepare([4] * batch, query_owners=list(range(1, batch + 1)))
         workspace.inputs.query.view(torch.uint8).fill_(0x38)
         workspace.inputs.weights.fill_(1)
@@ -97,6 +96,13 @@ def check_shape(kvaf, torch, build, device_id, shape, library):
             output_stride=stride,
             scratch=workspace.scratch,
         )
+        # Match KVCachePolicy.prepare: candidates and their inverse reservation
+        # map are one input. Binding initializes reservations to -1, so publish
+        # both after construction. On later rounds prefetch may overwrite a
+        # candidate that LI still selects; it must be refetched, not read as a hit.
+        ordinals = torch.arange(2048, dtype=torch.int32, device=device)
+        rotating.lru_slots.copy_(ordinals)
+        rotating.reserved_hot[:, :2048].copy_(ordinals)
         update = UbmemIndexUpdate(
             torch,
             keys=storage.keys,
@@ -111,7 +117,7 @@ def check_shape(kvaf, torch, build, device_id, shape, library):
         )
         forward = UbmemForward(rotating, update)
 
-        def verify(owners, *, counts=None, padding=False):
+        def verify(owners, *, phase, counts=None, padding=False):
             stream.synchronize()
             assert not np.any(update.status.cpu().numpy()), "Index update rejected UBmem completion"
             counters = rotating.ubmem_status.cpu().numpy()
@@ -139,17 +145,39 @@ def check_shape(kvaf, torch, build, device_id, shape, library):
                     "Index scales detached"
                 )
                 assert np.array_equal(key_values[owner], key_columns[ids[owner]]), "Index keys detached"
+                # Tags check the persistent hot-cache invariant, including
+                # prefetched entries absent from this round's final TopK.
+                hot_valid = storage.hot_valid[owner].cpu().numpy() != 0
+                hot_tags = output[owner, :resident, :8].contiguous().cpu().numpy().view("<u8").reshape(-1)
+                expected_tags = ids[owner, :resident].astype(np.uint64) + np.uint64(owner << 32)
+                bad_hot = np.flatnonzero(hot_valid & (hot_tags != expected_tags))
+                if bad_hot.size:
+                    slot = int(bad_hot[0])
+                    raise AssertionError(
+                        f"Hot slot/Index mismatch: phase={phase} device={device_id} batch={batch} "
+                        f"token_bytes={token_bytes} owner={owner} slot={slot} "
+                        f"expected_tag={int(expected_tags[slot])} actual_tag={int(hot_tags[slot])}"
+                    )
                 for _ in range(count):
                     assert np.array_equal(np.sort(logical[output_row]), expected_ids), "LI selected the wrong TopK set"
                     selected_slots = torch.from_numpy(slots[output_row].astype(np.int64)).to(device)
                     actual = torch.index_select(output[owner], 0, selected_slots).cpu().numpy()
                     expected = payload(owner, logical[output_row], token_bytes)
-                    assert np.array_equal(actual, expected), "Fused Fetch bytes differ from KVAF Put"
+                    mismatch = np.flatnonzero(np.any(actual != expected, axis=1))
+                    if mismatch.size:
+                        k = int(mismatch[0])
+                        byte = int(np.flatnonzero(actual[k] != expected[k])[0])
+                        raise AssertionError(
+                            f"Fused Fetch bytes differ from KVAF Put: phase={phase} device={device_id} "
+                            f"batch={batch} token_bytes={token_bytes} owner={owner} query={output_row} "
+                            f"token={int(logical[output_row, k])} slot={int(slots[output_row, k])} "
+                            f"byte={byte} expected={int(expected[k, byte])} actual={int(actual[k, byte])}"
+                        )
                     output_row += 1
             assert np.all(logical[output_row:] == -1) and np.all(slots[output_row:] == -1), "TND padding is stale"
 
         forward()
-        verify(list(range(1, batch + 1)))
+        verify(list(range(1, batch + 1)), phase="eager")
         first_counters = rotating.ubmem_status.cpu().numpy()
         assert np.any(first_counters[:, 1] + first_counters[:, 3]), "Fixture did not exercise a cold DDR fetch"
         graph = kvaf.AclGraph()
@@ -164,7 +192,7 @@ def check_shape(kvaf, torch, build, device_id, shape, library):
         workspace.inputs.prepare([4] * batch, query_owners=owners)
         workspace.inputs.query_ends.fill_(history)
         graph.replay(stream)
-        verify(owners)
+        verify(owners, phase="graph_replay")
         if batch == 2:
             # Compact TND output row 1..4 belongs to the second packed request;
             # output block number is not its producer/status block number.
@@ -174,13 +202,13 @@ def check_shape(kvaf, torch, build, device_id, shape, library):
                 torch.tensor([[history, 0, 0, 0], [history] * 4], dtype=torch.int32, device=device)
             )
             graph.replay(stream)
-            verify(owners, counts=counts)
+            verify(owners, phase="packed_queries", counts=counts)
         # All-padding warmup is legal: owner zero can repeat in inactive rows.
         workspace.inputs.prepare([0] * batch, query_owners=[0] * batch)
         workspace.inputs.query_ends.zero_()
         before = storage.logical_ids.clone()
         graph.replay(stream)
-        verify([], padding=True)
+        verify([], phase="padding", padding=True)
         assert torch.equal(storage.logical_ids, before), "Padding changed Index ownership"
         graph.reset()
         graph = None

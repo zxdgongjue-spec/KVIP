@@ -170,5 +170,7 @@ class UbmemBinding:
         self.context = torch.from_numpy(blob.copy()).to(self.device)
         self.arguments = tuple(arguments) + (self.context,)
         self.bindings = device_words(torch, [t.data_ptr() for t in self.arguments], self.device)
+        # The caller prepares this inverse map together with lru_slots before
+        # execution; reserved candidates cannot be treated as stable hot hits.
         self.reserved_hot.fill_(-1)
         lease.bindings.append(self)
