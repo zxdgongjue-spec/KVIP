@@ -92,24 +92,41 @@ class UpdateMoveTest(unittest.TestCase):
         if compiler is None:
             self.skipTest("C++ compiler unavailable")
         program = '\n#include <cstdint>\n#include <vector>\n#include <numeric>\n#include <algorithm>\n#include <random>\n#include <cassert>\n#define __simt_callee__\n#define __simt_vf__\n#define __aicore__\n#define LAUNCH_BOUND(x)\n#define SIM_HISTORY 8192\n#define SIM_RESIDENT 4096\n#define __simt_vf__\n#define __aicore__\n#define __gm__\n#define __ubuf__\n#define LAUNCH_BOUND(x)\n#define SIM_HISTORY 8192\n#define SIM_RESIDENT 4096\nstruct { unsigned x=0; } threadIdx;\ntemplate<class T> T asc_ldcg(T* p) { return *p; }\ntemplate<class T> void asc_stcg(T* p,T v) { *p=v; }\nuint32_t asc_atomic_cas(uint32_t* p,uint32_t old,uint32_t v) { auto x=*p;if(x==old)*p=v;return x; }\nvoid asc_atomic_or(uint32_t* p,uint32_t v) { *p|=v; }\nvoid asc_syncthreads() {}\nvoid asc_threadfence() {}\nuint32_t asc_shfl_up(uint32_t v,uint32_t) { return v; }\n#include "index_cache_update.h"\n\nint main() {\n std::mt19937 rng(17);\n for(unsigned trial=0;trial<70;++trial) {\n  std::vector<uint32_t> lru(2048),changes(2048,UINT32_MAX),work(kPlanWords),status(128),plan(kTransferPlanWords);\n  std::vector<uint32_t> dsts(SIM_RESIDENT),srcs(SIM_HISTORY);\n  std::iota(dsts.begin(),dsts.end(),0);std::iota(srcs.begin(),srcs.end(),0);\n  std::shuffle(dsts.begin(),dsts.end(),rng);std::shuffle(srcs.begin(),srcs.end(),rng);\n  unsigned n=trial==0?0:(trial==1?2:(trial==2?2048:rng()%2049));\n  for(unsigned i=0;i<n;++i){lru[i]=dsts[i];changes[i]=srcs[i];}\n  if(trial==1){lru[0]=0;lru[1]=1;changes[0]=1;changes[1]=0;}\n  BuildUpdatePlan<1>(lru.data(),changes.data(),SIM_HISTORY,SIM_RESIDENT,work.data(),status.data());\n  assert(status[0]==0);\n  PublishUpdatePlan<1>(work.data(),status.data(),plan.data(),SIM_RESIDENT);\n  auto dst=work.data()+2*kPlanHash,src=dst+kPlanRecords;\n  unsigned count=0;\n  for(unsigned i=0;i<kPlanRecords;++i)if(src[i]!=UINT32_MAX && src[i]!=dst[i]) {\n    auto tagged=dst[i]|((i>=kPlanCandidates && dst[i]<SIM_RESIDENT)?kInvalidateHot:0);\n    assert(plan[8+2*count]==tagged && plan[9+2*count]==src[i]);++count;\n  }\n  assert(plan[0]==count);\n  constexpr unsigned owners=2,stride=SIM_HISTORY+8;\n  std::vector<uint64_t> keys(owners*SIM_HISTORY*16),addresses(owners*stride),ids(owners*SIM_HISTORY);\n  std::vector<uint32_t> scales(owners*SIM_HISTORY),valid(owners*SIM_RESIDENT,1);\n  std::iota(keys.begin(),keys.end(),100);std::iota(addresses.begin(),addresses.end(),1000000);\n  std::iota(ids.begin(),ids.end(),2000000);std::iota(scales.begin(),scales.end(),3000000);\n  auto ek=keys,ea=addresses,ei=ids;auto es=scales,ev=valid;\n  unsigned owner=trial%2;\n  for(unsigned i=0;i<kPlanRecords;++i)if(src[i]!=UINT32_MAX && src[i]!=dst[i]) {\n    for(unsigned f=0;f<16;++f)ek[(owner*SIM_HISTORY+dst[i])*16+f]=keys[(owner*SIM_HISTORY+src[i])*16+f];\n    ea[owner*stride+dst[i]]=addresses[owner*stride+src[i]];\n    ei[owner*SIM_HISTORY+dst[i]]=ids[owner*SIM_HISTORY+src[i]];\n    es[owner*SIM_HISTORY+dst[i]]=scales[owner*SIM_HISTORY+src[i]];\n    if(i>=kPlanCandidates && dst[i]<SIM_RESIDENT)ev[owner*SIM_RESIDENT+dst[i]]=0;\n  }\n  uint64_t a[26]{};a[24]=SIM_HISTORY;a[25]=SIM_RESIDENT;a[0]=(uint64_t)keys.data();a[1]=(uint64_t)scales.data();\n  a[2]=(uint64_t)addresses.data();a[3]=(uint64_t)ids.data();a[7]=stride;\n  a[9]=a[16]=(uint64_t)valid.data();\n  std::vector<uint64_t> staged(kPlanRecords*kKeyFieldsPerWorker);\n  unsigned groups[]={0,1,2,3};std::shuffle(groups,groups+4,rng);\n  for(auto g:groups)Move<1>(a,owner,g,trial%2,plan.data(),staged.data(),count);\n  assert(keys==ek && addresses==ea && ids==ei && scales==es && valid==ev);\n }\n}\n'
+        extended = program.replace("SIM_HISTORY 8192", "SIM_HISTORY 32768").replace(
+            "SIM_RESIDENT 4096", "SIM_RESIDENT 16384"
+        )
+        extended = extended.replace("trial<70", "trial<20").replace("2048", "10240").replace("2049", "10241")
+        extended = extended.replace("work(kPlanWords)", "work(2*kExtendedRecords), hashes(2*kExtendedHash)")
+        extended = extended.replace("plan(kTransferPlanWords)", "plan(kExtendedTransferWords)")
+        extended = extended.replace(
+            "BuildUpdatePlan<1>(lru.data(),changes.data(),SIM_HISTORY,SIM_RESIDENT,work.data(),status.data())",
+            "BuildExtendedPlan<1>(lru.data(),changes.data(),n,SIM_HISTORY,SIM_RESIDENT,hashes.data(),status.data(),work.data())",
+        )
+        extended = extended.replace("PublishUpdatePlan<1>", "PublishExtendedPlan<1>")
+        extended = extended.replace("work.data()+2*kPlanHash", "work.data()")
+        extended = extended.replace("kPlanRecords", "kExtendedRecords").replace(
+            "kPlanCandidates", "kExtendedCandidates"
+        )
+        extended = extended.replace("Move<1>", "MoveExtended<1>")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "test.cpp").write_text(program)
-            subprocess.run(
-                [
-                    compiler,
-                    "-std=c++17",
-                    "-O2",
-                    str(root / "test.cpp"),
-                    "-I" + str(ROOT / "csrc/operators/lightning_indexer_with_fetch/op_kernel"),
-                    "-o",
-                    str(root / "test"),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            subprocess.run([str(root / "test")], check=True)
+            for name, text in (("small", program), ("extended", extended)):
+                with self.subTest(planner=name):
+                    cpp, exe = root / (name + ".cpp"), root / name
+                    cpp.write_text(text)
+                    subprocess.run(
+                        [
+                            compiler,
+                            "-std=c++17",
+                            "-O2",
+                            str(cpp),
+                            "-I" + str(ROOT / "csrc/operators/lightning_indexer_with_fetch/op_kernel"),
+                            "-o",
+                            str(exe),
+                        ],
+                        check=True,
+                    )
+                    subprocess.run([str(exe)], check=True)
 
 
 class EarlyUpdateTest(unittest.TestCase):
@@ -119,7 +136,11 @@ class EarlyUpdateTest(unittest.TestCase):
             self.skipTest("C++ compiler unavailable")
         kernel = ROOT / "csrc/operators/lightning_indexer_with_fetch/op_kernel"
         text = (kernel / "index_cache_update.cpp").read_text()
-        update = text[text.index("template <bool WaitForFetch>") : text.index("// Service output adaptation")]
+        update = text[
+            text.index("template <bool WaitForFetch, bool Extended>") : text.index(
+                "// Select the original small planner"
+            )
+        ]
         source = r"""
 #include <cstdint>
 #include <vector>
@@ -154,7 +175,7 @@ int main() {
     std::vector<uint32_t> rows(256), rowStatus(32), posts(2*32), valid(2*resident,1);
     std::vector<uint64_t> prefetch(2*statusBytes/8), final(2*statusBytes/8);
     uint32_t error=0, owner=1;
-    uint64_t a[26]{};
+    uint64_t a[28]{}; uint32_t count=2048; a[26]=(uint64_t)&count;
     a[4]=(uint64_t)lru.data(); a[5]=(uint64_t)changes.data(); a[6]=(uint64_t)&error;
     a[8]=(uint64_t)rows.data(); a[9]=(uint64_t)&owner; a[10]=(uint64_t)rowStatus.data();
     a[11]=(uint64_t)posts.data(); a[12]=(uint64_t)prefetch.data(); a[13]=(uint64_t)final.data();
@@ -162,19 +183,19 @@ int main() {
     a[24]=history; a[25]=resident;
     // Resolver has stable records, but prefetch/final CQs are still pending.
     rows[211]=rows[248]=posts[1]=posts[35]=1;
-    Update<false>(a,0,owner,true,work.data());
+    Update<false, false>(a,0,owner,true,work.data());
     assert(error==0 && plan[0]>0);
-    Update<true>(a,0,owner,true,work.data());
+    Update<true, false>(a,0,owner,true,work.data());
     assert(error!=0 && plan[0]==0);
     // Standalone API keeps its completed-transport validation.
     rows[211]=rows[248]=posts[1]=posts[35]=0;
     for(auto states:{prefetch.data(),final.data()})
         for(unsigned lane=0;lane<2;++lane)states[lane*statusBytes/8]=0x4B5641464247444FULL;
-    Update<true>(a,0,owner,true,work.data());
+    Update<true, false>(a,0,owner,true,work.data());
     assert(error==0 && plan[0]>0);
     for(auto fault:{&rows[11],&rowStatus[0],&posts[34]}) {
         *fault=1;
-        Update<false>(a,0,owner,true,work.data());
+        Update<false, false>(a,0,owner,true,work.data());
         assert(error!=0 && plan[0]==0);
         *fault=0;
     }
@@ -206,7 +227,8 @@ int main() {
 class IndexUpdateTest(unittest.TestCase):
     def setUp(self):
         self.library = SimpleNamespace(
-            kvop_direct_update_abi_version=Mock(return_value=2),
+            kvop_direct_update_abi_version=Mock(return_value=3),
+            kvop_direct_update_work_words=Mock(return_value=40960),
             kvop_direct_update_plan_words=Mock(return_value=8200),
             kvop_direct_update_resident=Mock(return_value=128),
             kvop_direct_update_owned=Mock(return_value=0),
@@ -214,7 +236,9 @@ class IndexUpdateTest(unittest.TestCase):
         )
         self.rotating = SimpleNamespace(
             lru_slots=torch.zeros((2, 2048), dtype=torch.int32),
-            changes=torch.full((2, 2048), -1, dtype=torch.int32),
+            change_slots=torch.zeros((2, 10240), dtype=torch.int32),
+            change_count=torch.full((2,), 2048, dtype=torch.int32),
+            changes=torch.full((2, 10240), -1, dtype=torch.int32),
             rows=torch.zeros((2, 256), dtype=torch.int32),
             hot_valid=torch.zeros((5, 128), dtype=torch.int32),
             row_status=torch.zeros((2, 32), dtype=torch.int32),
@@ -234,6 +258,7 @@ class IndexUpdateTest(unittest.TestCase):
         )
         self.torch = SimpleNamespace(
             zeros=torch.zeros,
+            empty=torch.empty,
             tensor=torch.tensor,
             int32=torch.int32,
             int64=torch.int64,
@@ -251,7 +276,7 @@ class IndexUpdateTest(unittest.TestCase):
             update.bindings.tolist(),
             [self.inputs[name].data_ptr() for name in ("keys", "scales", "addresses", "logical_ids")]
             + [
-                self.rotating.lru_slots.data_ptr(),
+                self.rotating.change_slots.data_ptr(),
                 self.rotating.changes.data_ptr(),
                 update.status.data_ptr(),
                 256,
@@ -267,7 +292,7 @@ class IndexUpdateTest(unittest.TestCase):
                 update.plan_buffer.data_ptr(),
             ]
             + [0] * 6
-            + [256, 128],
+            + [256, 128, self.rotating.change_count.data_ptr(), update.work_buffer.data_ptr()],
         )
         with patch.object(self.torch, "tensor", side_effect=AssertionError("replay allocation")):
             update()
@@ -284,7 +309,7 @@ class IndexUpdateTest(unittest.TestCase):
         outputs = torch.zeros(2, 8, 1, 2048, dtype=torch.int32)
         self.inputs["outputs"] = outputs
         update = self.make()
-        self.assertEqual(update.bindings.numel(), 26)
+        self.assertEqual(update.bindings.numel(), 28)
         self.assertEqual(update.bindings[22], outputs[0].data_ptr())
         self.assertEqual(update.bindings[23], outputs[1].data_ptr())
         update()
@@ -293,7 +318,7 @@ class IndexUpdateTest(unittest.TestCase):
 
     def test_reject_old_update_abi_before_launch(self):
         self.library.kvop_direct_update_abi_version.return_value = 1
-        with self.assertRaisesRegex(ValueError, "ABI 2"):
+        with self.assertRaisesRegex(ValueError, "ABI 3"):
             self.make()
         self.library.kvop_direct_update_owned.assert_not_called()
 
@@ -349,7 +374,7 @@ class IndexUpdateTest(unittest.TestCase):
         self.assertEqual(update.bindings[7], 300)
         self.assertEqual(update.bindings[22], update.logical_output.data_ptr())
         self.assertEqual(update.bindings[23], update.slot_output.data_ptr())
-        self.assertEqual(update.bindings[-2:].tolist(), [256, 128])
+        self.assertEqual(update.bindings[24:26].tolist(), [256, 128])
 
     def test_report_launch_error(self):
         update = self.make()

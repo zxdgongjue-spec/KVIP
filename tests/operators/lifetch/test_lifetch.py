@@ -27,6 +27,7 @@ def arguments(argv=None):
     p.add_argument("--history", type=int, default=131072)
     p.add_argument("--resident", type=int, default=16384)
     p.add_argument("--intermediate-fetches", type=int, default=8)
+    p.add_argument("--prefetch-tokens", type=int, default=512)
     p.add_argument("--runtime-shapes", action="store_true", help="one binary, four distinct runtime shapes")
     p.add_argument("--resolver-compare", action="store_true")
     p.add_argument("--trace-rounds", type=int, default=3)
@@ -51,6 +52,8 @@ def arguments(argv=None):
         p.error("invalid timing iterations")
     if not 1 <= a.intermediate_fetches <= 32:
         p.error("windows must be 1..32")
+    if not 0 <= a.prefetch_tokens <= 2048 or a.prefetch_tokens % a.intermediate_fetches:
+        p.error("prefetch tokens must be 0..2048 and divisible by windows")
     return a
 
 
@@ -140,7 +143,7 @@ def test_public_launch_same_stream_and_addresses():
         library=SimpleNamespace(kvip_lifetch_forward=function),
         torch=SimpleNamespace(npu=SimpleNamespace(current_stream=lambda device: SimpleNamespace(npu_stream=300))),
     )
-    update = SimpleNamespace(device=5, bindings=SimpleNamespace(data_ptr=lambda: 200, numel=lambda: 26))
+    update = SimpleNamespace(device=5, bindings=SimpleNamespace(data_ptr=lambda: 200, numel=lambda: 28))
     forward = kvip.LIFetch(rotating, update)
     forward()
     assert function.args == (100, 200, 300, 400)
@@ -219,7 +222,7 @@ def test_runtime_tiling_matches_original_geometry(tmp_path):
     (tmp_path / "batch_get_abi.h").write_text("")
     source.write_text("""
 #include "context.h"
-static_assert(sizeof(rotating::Context)==304,"context ABI");
+static_assert(sizeof(rotating::Context)==320,"context ABI");
 extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* s){return rotating::PrepareShape(s);}
 extern "C" uint32_t trigger(rotating::RuntimeShape* s,uint32_t e){return rotating::Trigger(s->history,s->resident,s->rounds,e);}
 extern "C" uint32_t core(rotating::RuntimeShape* s,uint32_t e,uint32_t g){return rotating::ServiceCore(s->batch,s->splitQ,s->serviceAics,e,g);}
@@ -391,3 +394,126 @@ def test_load_bridge_without_rpath(tmp_path):
     library = load_lifetch_library(bridge)
     assert library.kvip_test_forward() == 42
     assert library._kvip_update_dependency is not None
+
+
+def test_hot_resolver_actual_function_on_empty_and_populated_cache(tmp_path):
+    """Execute production SIMT logic serially; CANN simulator covers barriers."""
+    import subprocess
+
+    kernel = ROOT / "csrc/operators/lightning_indexer_with_fetch/op_kernel"
+
+    def function(path, name):
+        text = path.read_text()
+        begin = text.index(name + "(")
+        begin = text.rfind("\n", 0, begin) + 1
+        brace = text.index("{", begin)
+        end, depth = brace + 1, 1
+        while depth:
+            depth += (text[end] == "{") - (text[end] == "}")
+            end += 1
+        return text[begin:end]
+
+    functions = "\n".join(
+        function(kernel / "prefetch.h", name)
+        for name in ("OwnerRow", "OutputStride", "StoreFallbackSource", "ResolvePhysicalSlot", "InitializeTailMappings")
+    )
+    functions += "\n" + function(kernel / "resolver.h", "SparseHash")
+    functions += "\ntemplate<unsigned Threads>\n" + function(kernel / "resolver.h", "ReplicatedResolve")
+    source = r"""
+#include <cstdint>
+#include <vector>
+#include <numeric>
+#include <algorithm>
+#include <random>
+#include <cassert>
+#define __simt_callee__
+#define __simt_vf__
+#define __aicore__
+#define __gm__
+#define __ubuf__
+#define LAUNCH_BOUND(x)
+struct {unsigned x=0;} threadIdx;
+constexpr unsigned warpSize=1;
+namespace AscendC {namespace Simt {unsigned GetThreadIdx(){return 0;} unsigned GetThreadNum(){return 1;}}}
+#include "hot_slot_selection.h"
+#include "context.h"
+using namespace rotating;
+constexpr unsigned kLruSlots=2048,kChangeCapacity=10240;
+template<class T>T asc_ldcg(T* p){return *p;}
+template<class T>void asc_stcg(T* p,T v){*p=v;}
+unsigned asc_atomic_cas(unsigned* p,unsigned a,unsigned b){auto old=*p;if(old==a)*p=b;return old;}
+void asc_atomic_or(unsigned* p,unsigned v){*p|=v;}
+void asc_atomic_min(unsigned* p,unsigned v){*p=std::min(*p,v);}
+void asc_atomic_max(unsigned* p,unsigned v){*p=std::max(*p,v);}
+void asc_atomic_add(unsigned* p,unsigned v){*p+=v;}
+unsigned asc_shfl_up(unsigned v,unsigned){return v;}
+void asc_syncthreads(){} void asc_threadfence(){}
+FUNCTIONS
+int main(){
+ std::mt19937 rng(71);
+ for(unsigned trial=0;trial<24;++trial){
+  const unsigned h=32768,r=trial%2?16384:8192,workers=4,used=trial%3?512:0;
+  std::vector<unsigned> candidates(r);std::iota(candidates.begin(),candidates.end(),0);
+  std::shuffle(candidates.begin(),candidates.end(),rng);candidates.resize(2048);
+  std::vector<int32_t> reserved(r,-1);for(unsigned i=0;i<2048;++i)reserved[candidates[i]]=i;
+  std::vector<unsigned> map(h,UINT32_MAX),changes(kChangeCapacity,UINT32_MAX),changeSlots(kChangeCapacity);
+  std::copy(candidates.begin(),candidates.end(),changeSlots.begin());
+  for(unsigned i=0;i<used;++i){map[r+i]=r+i;changes[i]=r+i;}
+  std::vector<unsigned> selected(8192),base(h),hotValid(r,trial%4!=0);
+  const bool abc=trial%2;unsigned tailBounds[2]={h-384,h};
+  std::iota(base.begin(),base.end(),0);std::shuffle(base.begin(),base.end(),rng);
+  std::copy(base.begin(),base.begin()+8192,selected.begin());
+  if(trial%3==0)for(unsigned i=4096;i<8192;++i)selected[i]=selected[i-4096];
+  if(trial%5==0)for(unsigned i=6144;i<8192;++i)selected[i]=UINT32_MAX;
+  if(abc){for(unsigned i=0;i<384;++i)map[h-384+i]=r+8192+i;
+   for(unsigned i=0;i<8;++i)selected[i]=h-384+i;}
+  std::vector<uint64_t> addresses(h),remote(8192);std::iota(addresses.begin(),addresses.end(),100000);
+  std::vector<int32_t> blocks(8192),offsets(8192),destinations(8192);
+  Context ctx{};unsigned changeCount=2048,total=0;
+  ctx.lruSlots=(uint64_t)candidates.data();ctx.reservedHot=(uint64_t)reserved.data();
+  ctx.changes=(uint64_t)changes.data();ctx.changeSlots=(uint64_t)changeSlots.data();ctx.changeCount=(uint64_t)&changeCount;
+  ctx.fallbackAddresses=(uint64_t)remote.data();ctx.outputStride=r+(abc?384:0);
+  if(abc)ctx.tailBounds=(uint64_t)tailBounds;
+  ctx.mapping=(uint64_t)map.data();changeCount=0;
+  for(unsigned lane=0;lane<256;++lane){threadIdx.x=lane;InitializeTailMappings(h,r,&ctx,0);}
+  threadIdx.x=0;assert(changeCount==2048);
+  std::vector<unsigned> output(8192),locations(8192),positions(8192),keys(8192),ranks(8192),slots(8192),cfg(2560);
+  std::vector<uint16_t> ids(8192);unsigned cold=0;
+  for(unsigned w=0;w<workers;++w){
+   cold=0;locations=selected;
+   for(unsigned i=0;i<8192;++i){unsigned t=selected[i];
+    if(t!=UINT32_MAX && (t>=r || !hotValid[t] || reserved[t]>=0)){positions[cold++]=i;locations[i]=r;}}
+   ReplicatedResolve<1>(h,r,workers,656,selected.data(),locations.data(),positions.data(),cold,
+    keys.data(),ranks.data(),ids.data(),slots.data(),cfg.data(),map.data(),addresses.data(),
+    blocks.data(),offsets.data(),destinations.data(),&total,w,used,0,&ctx);
+   assert(cfg[1]==0);
+   std::copy(locations.begin()+w*2048,locations.begin()+(w+1)*2048,output.begin()+w*2048);
+  }
+  std::vector<unsigned> ownership(r),seen(r);std::iota(ownership.begin(),ownership.end(),0);
+  for(unsigned i=0;i<kChangeCapacity;++i)if(changes[i]!=UINT32_MAX){assert(changeSlots[i]<r);assert(!seen[changeSlots[i]]++);ownership[changeSlots[i]]=changes[i];}
+  for(unsigned i=0;i<8192;++i){if(selected[i]==UINT32_MAX){assert(output[i]==UINT32_MAX);continue;}
+   if(abc && selected[i]>=h-384){assert(output[i]==r+selected[i]%384);continue;}
+   assert(output[i]<r);assert(ownership[output[i]]==selected[i]);}
+  for(unsigned i=0;i<total;++i){assert(unsigned(destinations[i])<r);assert(remote[i]==addresses[ownership[destinations[i]]]);}
+  assert(changeCount<=kChangeCapacity);
+ }
+}
+""".replace("FUNCTIONS", functions)
+    (tmp_path / "batch_get_abi.h").write_text("")
+    cpp, exe = tmp_path / "resolver.cpp", tmp_path / "resolver"
+    cpp.write_text(source)
+    subprocess.run(
+        [
+            "c++",
+            "-std=c++17",
+            "-O2",
+            str(cpp),
+            "-I" + str(tmp_path),
+            "-I" + str(kernel.parent / "include"),
+            "-I" + str(kernel.parents[1] / "lidu/op_kernel"),
+            "-o",
+            str(exe),
+        ],
+        check=True,
+    )
+    subprocess.run([str(exe)], check=True, timeout=30)

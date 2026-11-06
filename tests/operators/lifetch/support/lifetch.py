@@ -357,6 +357,8 @@ def run_device(
         resident=r,
         aic_count=aics,
         intermediate_fetches=args.intermediate_fetches,
+        prefetch_limit=args.prefetch_tokens,
+        output_stride=owner.output.shape[1],
         row_owners=torch.arange(b, dtype=torch.int32, device=device) if args.resolver_compare else None,
     )
     topk = arguments[9].view(torch.int32).reshape(b, 4, 2048)
@@ -397,7 +399,7 @@ def run_device(
     def full():
         pipeline()
 
-    def verify(updated=False):
+    def verify(updated=False, persistent=True):
         rows = rotating.rows.cpu().numpy()
         posts = rotating.final_posts.cpu().numpy()
         statuses = rotating.row_status.cpu().numpy()
@@ -429,7 +431,7 @@ def run_device(
                 raise AssertionError("Service SFA slot output differs from Fetch destinations")
         output = owner.output.cpu()
         for row in range(b):
-            if slots[row].min() < 0 or slots[row].max() >= r + 8192:
+            if slots[row].min() < 0 or slots[row].max() >= (r if persistent else owner.output.shape[1]):
                 raise AssertionError("slot outside cache")
             actual = output[row, slots[row]]
             expected = owner.session.cpu_payload[row, ids[row].reshape(-1)]
@@ -462,14 +464,16 @@ def run_device(
 
         return run(torch, args, rotating, owner, topk, initial_selected, reset, verify, folder)
 
-    def check_direct_update(orders):
+    def check_direct_update(orders, cold_start=False):
         reset()
         update.set_order(orders)
+        if cold_start:
+            rotating.hot_valid.zero_()
         core()
         stream.synchronize()
         source_data = [t.cpu().clone() for t in update.inputs[:4]]
         changes = rotating.changes.cpu().numpy()
-        lru = rotating.lru_slots.cpu().numpy()
+        lru = rotating.change_slots.cpu().numpy()
         expected = [t.clone() for t in source_data]
         moved_rows = 0
         expected_valid = rotating.hot_valid.cpu().numpy().copy()
@@ -505,6 +509,7 @@ def run_device(
         )
 
     snapshot_changes = check_direct_update(initial_orders)
+    cold_start_changes = check_direct_update(initial_orders, cold_start=True)
     unlucky = []
     for row in range(b):
         selected_hot = list(dict.fromkeys(initial_selected[row].reshape(-1).tolist()))
@@ -646,9 +651,11 @@ def run_device(
             / 1000,
             update_target_20us=timings["aiv_cache_update"]["p50_us"] < 20,
             update_copy_workers_per_request=4,
+            cold_start_changes_checked=cold_start_changes,
+            prefetch_tokens=args.prefetch_tokens,
             former_hot_changes_checked=restored_hot,
             first_window_fetches_checked=hot_case["first_window_fetches"],
-            scope="Producer change records; direct LRU destinations; zero KV copy; no TopK scan or victim selection",
+            scope="Producer records include final hot fallback; no temporary KV slots; zero KV copy",
         ),
         kernel="KVIP/csrc/operators/lightning_indexer_with_fetch; preserved core tiling, direct LRU interface",
         scope="fixed Q4 shared history; graph kernel and AIV maintenance separately; no ABC growth",

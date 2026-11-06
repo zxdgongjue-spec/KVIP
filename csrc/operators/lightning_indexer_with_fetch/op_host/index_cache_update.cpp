@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <cstdint>
-extern "C" uint32_t kvop_direct_update_plan_words() { return 8 + 2 * 4096; }
+extern "C" uint32_t kvop_direct_update_plan_words() { return 8 + 2 * 20480; }
 extern "C" uint32_t kvop_direct_update_copy_workers() { return 4; }
 extern "C" uint32_t aclrtlaunch_kvop_direct_update_kernel(uint32_t, void*, void*);
 extern "C" uint32_t aclrtlaunch_kvop_direct_update_owned_kernel(uint32_t, void*, void*);
@@ -48,4 +48,6 @@ extern "C" uint32_t kvop_direct_apply_owned(uint32_t batch, void* bindings, void
   return aclrtlaunch_kvop_direct_apply_owned_kernel(batch * 4, stream, bindings);
 }
 
-extern "C" uint32_t kvop_direct_update_abi_version() { return 2; }
+extern "C" uint32_t kvop_direct_update_abi_version() { return 3; }
+
+extern "C" uint32_t kvop_direct_update_work_words() { return 2 * 20480; }

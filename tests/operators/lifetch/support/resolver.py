@@ -73,7 +73,8 @@ def run(torch, args, rotating, owner, topk, selected, reset, verify, folder):
             if case == "original_compatible":
                 # Original v9 has no ABC/invalid-hot/LRU destination semantics.
                 # All hot entries valid, no prefetch, same final TopK/DDR data.
-                rotating.reserved_hot.fill_(-1)
+                # Keep the inverse LRU map: selected hot entries in this fixture
+                # are outside the candidate list, so the original semantics match.
                 topk.copy_(compatible_topk)
             else:
                 for target, saved in snapshot:
@@ -104,7 +105,7 @@ def run(torch, args, rotating, owner, topk, selected, reset, verify, folder):
             # Network completion and payload/TopK verification are outside timing.
             rotating.finish()
             stream.synchronize()
-            verify()
+            verify(persistent=label == "fixed")
             count = int(rotating.rows[:, 247].cpu().long().sum())
             if label in counts and counts[label] != count:
                 raise AssertionError("Fixed snapshot produced varying final Get counts")
@@ -112,9 +113,9 @@ def run(torch, args, rotating, owner, topk, selected, reset, verify, folder):
             if label != "original":
                 for name in ("locations", "changes"):
                     values = getattr(rotating, name).cpu().numpy()
-                    if name in expected and not np.array_equal(expected[name], values):
-                        raise AssertionError(f"Adapted/fixed resolver {name} differs")
-                    expected[name] = values.copy()
+                    if (label, name) in expected and not np.array_equal(expected[label, name], values):
+                        raise AssertionError(f"Repeated {label} resolver {name} differs")
+                    expected[label, name] = values.copy()
 
         for step in range(args.warmup + args.iterations):
             order = labels if step % 2 == 0 else tuple(reversed(labels))

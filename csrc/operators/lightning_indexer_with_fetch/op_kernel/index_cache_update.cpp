@@ -9,14 +9,14 @@
   #include "index_cache_update.h"
 using namespace AscendC;
 namespace {
-constexpr uint32_t kCandidates = 2048, kThreads = 512;
+constexpr uint32_t kCandidates = kExtendedCandidates, kThreads = 512;
 // keys, scales, addresses, logical IDs, LRU slots, producer changes,
 // status, address row stride, producer rows, hot validity. No KV payload input.
-template <bool WaitForFetch>
+template <bool WaitForFetch, bool Extended>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void Update(__gm__ uint64_t* a, uint32_t b, uint32_t owner,
                                                             bool checkTransport, __ubuf__ uint32_t* work) {
   uint32_t tid = threadIdx.x;
-  auto status = work + kPlanWords;
+  auto status = work + (Extended ? 2*kExtendedHash : kPlanWords);
   auto rows = reinterpret_cast<__gm__ uint32_t*>(a[8]) + b * 256;
   auto lru = reinterpret_cast<__gm__ uint32_t*>(a[4]) + b * kCandidates;
   auto changes = reinterpret_cast<__gm__ uint32_t*>(a[5]) + b * kCandidates;
@@ -48,17 +48,37 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void Update(__gm__ uint64_t* a, 
     }
   }
   asc_syncthreads();
-  if (!status[0]) BuildUpdatePlan<kThreads>(lru, changes, uint32_t(a[24]), uint32_t(a[25]), work, status);
+  if (!status[0]) {
+    if constexpr (!Extended) BuildUpdatePlan<kThreads>(lru,changes,uint32_t(a[24]),uint32_t(a[25]),work,status);
+    else {
+      uint32_t count=asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(a[26])+b);
+      auto extended=reinterpret_cast<__gm__ uint32_t*>(a[27])+uint64_t(b)*kExtendedWorkWords;
+      BuildExtendedPlan<kThreads>(lru,changes,count,uint32_t(a[24]),uint32_t(a[25]),work,status,extended);
+    }
+  }
   asc_syncthreads();
   if (!tid) asc_stcg(reinterpret_cast<__gm__ uint32_t*>(a[6]) + b, status[0]);
-  auto plan = reinterpret_cast<__gm__ uint32_t*>(a[checkTransport ? 17 : 10]) + uint64_t(b) * kTransferPlanWords;
+  auto plan = reinterpret_cast<__gm__ uint32_t*>(a[checkTransport ? 17 : 10]) + uint64_t(b) * kExtendedTransferWords;
   if (status[0]) {
     if (!tid) asc_stcg(plan, uint32_t(0));
     asc_threadfence();
     return;
   }
-  PublishUpdatePlan<kThreads>(work, status, plan, uint32_t(a[25]));
+  if constexpr (!Extended) PublishUpdatePlan<kThreads>(work,status,plan,uint32_t(a[25]));
+  else PublishExtendedPlan<kThreads>(reinterpret_cast<__gm__ uint32_t*>(a[27])+uint64_t(b)*kExtendedWorkWords,
+                                     status,plan,uint32_t(a[25]));
   asc_threadfence();
+}
+// Select the original small planner before entering SIMT: the extended
+// planner must not increase its register footprint on the common path.
+template <bool WaitForFetch>
+__aicore__ inline void DispatchUpdate(__gm__ uint64_t* args, uint32_t batch,
+                                    uint32_t owner, bool owned, __ubuf__ uint32_t* work) {
+  auto counts = reinterpret_cast<__gm__ uint32_t*>(args[26]);
+  if (counts[batch] <= kPlanCandidates)
+    Simt::VF_CALL<Update<WaitForFetch, false>>(Simt::Dim3{kThreads, 1, 1}, args, batch, owner, owned, work);
+  else
+    Simt::VF_CALL<Update<WaitForFetch, true>>(Simt::Dim3{kThreads, 1, 1}, args, batch, owner, owned, work);
 }
 // Service output adaptation runs before Apply changes logical Index ownership.
 // Each block owns four TND output rows, independently of their packed owners.
@@ -89,7 +109,7 @@ template <bool Owned>
 __aicore__ inline void Apply(GM_ADDR bindings) {
   uint32_t b = GetBlockIdx() / kCopyWorkers, group = GetBlockIdx() % kCopyWorkers;
   auto a = reinterpret_cast<__gm__ uint64_t*>(bindings);
-  auto input = reinterpret_cast<__gm__ uint32_t*>(a[Owned ? 17 : 10]) + uint64_t(b) * kTransferPlanWords;
+  auto input = reinterpret_cast<__gm__ uint32_t*>(a[Owned ? 17 : 10]) + uint64_t(b) * kExtendedTransferWords;
   uint32_t owner = Owned ? reinterpret_cast<__gm__ uint32_t*>(a[9])[b] : b;
   TPipe pipe;
   TBuf<TPosition::VECCALC> storage;
@@ -102,6 +122,12 @@ __aicore__ inline void Apply(GM_ADDR bindings) {
   WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
   uint32_t count = local.GetValue(0);
   if (!count) return;
+  if(count>kPlanRecords) {
+    if(count>kExtendedRecords)return;
+    Simt::VF_CALL<MoveExtended<kThreads>>(Simt::Dim3{kThreads,1,1},a,owner,group,Owned,input,
+      reinterpret_cast<__ubuf__ uint64_t*>(local.GetPhyAddr()),count);
+    return;
+  }
   DataCopy(local[kTransferHeaderWords], planGm[kTransferHeaderWords], ((count * 2 + 7) / 8) * 8);
   SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
   WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
@@ -114,13 +140,13 @@ template <bool WaitForFetch>
 __aicore__ inline void UpdateOutputs(GM_ADDR bindings) {
   TPipe pipe;
   TBuf<TPosition::VECCALC> scratch;
-  pipe.InitBuffer(scratch, kUpdateScratchBytes);
+  pipe.InitBuffer(scratch, kExtendedScratchBytes);
   auto local = scratch.Get<uint32_t>();
   auto args = reinterpret_cast<__gm__ uint64_t*>(bindings);
   auto owners = reinterpret_cast<__gm__ uint32_t*>(args[9]);
   uint32_t batch = GetBlockIdx();
   Simt::VF_CALL<PublishOutputs>(Simt::Dim3{kThreads, 1, 1}, args, batch);
-  Simt::VF_CALL<Update<WaitForFetch>>(Simt::Dim3{kThreads, 1, 1}, args, batch, owners[batch], true,
+  DispatchUpdate<WaitForFetch>(args, batch, owners[batch], true,
                                    reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
 }
 
@@ -132,9 +158,9 @@ extern "C" __global__ __aicore__ void kvop_direct_update_kernel(GM_ADDR bindings
   if ASCEND_IS_AIV {
     TPipe pipe;
     TBuf<TPosition::VECCALC> scratch;
-    pipe.InitBuffer(scratch, kUpdateScratchBytes);
+    pipe.InitBuffer(scratch, kExtendedScratchBytes);
     auto local = scratch.Get<uint32_t>();
-    Simt::VF_CALL<Update<true>>(Simt::Dim3{kThreads, 1, 1}, reinterpret_cast<__gm__ uint64_t*>(bindings), GetBlockIdx(),
+    DispatchUpdate<true>(reinterpret_cast<__gm__ uint64_t*>(bindings), GetBlockIdx(),
                           GetBlockIdx(), false, reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
   }
 #endif
@@ -148,12 +174,12 @@ extern "C" __global__ __aicore__ void kvop_direct_update_owned_kernel(GM_ADDR bi
   if ASCEND_IS_AIV {
     TPipe pipe;
     TBuf<TPosition::VECCALC> scratch;
-    pipe.InitBuffer(scratch, kUpdateScratchBytes);
+    pipe.InitBuffer(scratch, kExtendedScratchBytes);
     auto local = scratch.Get<uint32_t>();
     auto args = reinterpret_cast<__gm__ uint64_t*>(bindings);
     auto owners = reinterpret_cast<__gm__ uint32_t*>(args[9]);
     uint32_t batch = GetBlockIdx();
-    Simt::VF_CALL<Update<true>>(Simt::Dim3{kThreads, 1, 1}, args, batch, owners[batch], true,
+    DispatchUpdate<true>(args, batch, owners[batch], true,
                           reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
   }
 #endif
