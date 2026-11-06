@@ -44,6 +44,7 @@ V9_CQ_INLINE CqDrainResult DrainCq(Access& access, uint64_t consumer,
 
 #include "prefetch.h"
 #include "resolver.h"
+#include "index_cache_update.h"
 using namespace AscendC;
 using namespace rotating;
 #if V9_RESOLVER_COMPARE
@@ -270,89 +271,111 @@ extern "C" __global__ __aicore__ void v9_resolve_kernel(GM_ADDR bindings) {
 }
 // Completion is a separate launch: final resolver + complete SIMD WQE/SQ/post
 // can be timed without CQ latency. Small queues retain KVAF's bounded fallback.
-extern "C" __global__ __aicore__ void v9_fetch_kernel(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
+__aicore__ inline void FinishFetch(GM_ADDR bindings, GM_ADDR update) {
     auto runtimeShape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(reinterpret_cast<__gm__ uint64_t*>(bindings)[14]));
     const uint32_t rt_batch = runtimeShape.batch;
     const uint32_t rt_resident = runtimeShape.resident;
     const uint32_t rt_finalWorkers = runtimeShape.finalWorkers;
     const uint32_t rt_finalPostOffset = runtimeShape.finalPostOffset;
 
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    if ASCEND_IS_AIV {
-        uint32_t b=GetBlockIdx(); if(b>=rt_batch) return;
-        auto ctx=GetContext(bindings);
-        CompletePrefetch(ctx,b);
-        auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
-        auto info=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),kRowStatusWords*sizeof(uint32_t));
-        auto args=GetArgs(ctx,b*2);
-        args.core_status=ctx->finalStatus+b*2*sizeof(KvafBatchGetCoreStatus);
-        auto status=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(args.core_status);
-        auto spare=status+1;
-        kvaf_device::WriteStatus(spare,0,0,0,0,0,UINT64_MAX,0);
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(spare),sizeof(*spare));
-        uint64_t error=info[0] ? kvaf_device::kInvalidArgs : row->error;
-        uint32_t completed=0,total=0,deferred=0;
-        uint64_t lastHead=0,lastCq=0;
-        for(uint32_t w=0;w<rt_finalWorkers;++w){
-            auto post=FinalPostAt(rt_finalPostOffset,ctx,b*rt_finalWorkers+w);
-            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
-            auto workerArgs=GetArgs(ctx,FinalQueue(rt_batch,rt_finalWorkers,b,w));
-            auto entity=reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(workerArgs.channel_entity);
-            auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(workerArgs.queue_state);
-            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
-            total+=post->count;error|=post->error;
-            if(post->deferred){
-                ++deferred;
-#if !V9_SIMULATION
-                if(!error && !row->pending){
-                    workerArgs.indices=ctx->sourceBlocks;workerArgs.offsets=ctx->sourceOffsets;
-                    workerArgs.output_indices=ctx->destinations;workerArgs.miss_count=ctx->count;
-                    workerArgs.request_capacity=rt_batch*kSlots;
-                    if(ctx->fallbackAddresses) {
-                        workerArgs.address_table=ctx->fallbackAddresses;
-                        workerArgs.valid_table=ctx->fallbackValid;
-                        workerArgs.table_capacity=rt_batch*kSlots;
-                    }
-                    kvaf_device::KvafBatchGetDevice(workerArgs,0,post->descriptor,post->count);
-                    auto done=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(workerArgs.core_status);
-                    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(done),sizeof(*done));
-                    error|=done->result;completed+=done->completed_batch_count;
-                    if(done->magic!=KVAF_AIV_BATCH_GET_STATUS_MAGIC || done->processed_request_count!=post->count)
-                        error|=kvaf_device::kInvalidArgs;
-                    if(!done->result)post->deferred=0;
-                }
-#else
-                error|=kvaf_device::kInvalidArgs; // DMA fallback needs real hardware.
-#endif
-            }
-            if(post->pending){
-#if !V9_SIMULATION
-                auto drained=DrainQueue(entity,queue,post->pending);
-                uint64_t waitError=drained.error;
-                error|=waitError;
-                completed+=drained.completed;
-                if(!waitError){post->pending=0;}
-#else
-                post->pending=0;++completed;
-#endif
-            }
-            lastHead=queue->sq_producer_index;lastCq=queue->cq_consumer_index;
-            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
-            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
-        }
-        if(row->pending || total!=info[1])error|=kvaf_device::kInvalidArgs;
-        info[0]|=uint32_t(error);info[3]=deferred?1:0;info[4]=completed;
-        if(!error) {
-            Simt::VF_CALL<PublishCompletedResidency>(Simt::Dim3{256,1,1},rt_resident,ctx,b,total);
-            row->finalPending=0;
-        }
-        kvaf_device::WriteStatus(status,error,total,completed,lastHead,lastCq,UINT64_MAX,0);
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),sizeof(*status));
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),32);
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row)+960,64);
+    uint32_t b=GetBlockIdx(); if(b>=rt_batch) return;
+    auto ctx=GetContext(bindings);
+    auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
+    auto info=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),kRowStatusWords*sizeof(uint32_t));
+    uint32_t updateError=0;
+    if(update) {
+        auto updateBindings=reinterpret_cast<__gm__ uint64_t*>(update);
+        auto status=reinterpret_cast<__gm__ uint32_t*>(updateBindings[6]);
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status+b),sizeof(uint32_t));
+        updateError=status[b];
+        if(!updateError)
+            Simt::VF_CALL<PublishDestinationResidency>(Simt::Dim3{256,1,1},rt_resident,ctx,b,info[1]);
     }
+    CompletePrefetch(ctx,b);
+    auto args=GetArgs(ctx,b*2);
+    args.core_status=ctx->finalStatus+b*2*sizeof(KvafBatchGetCoreStatus);
+    auto status=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(args.core_status);
+    auto spare=status+1;
+    kvaf_device::WriteStatus(spare,0,0,0,0,0,UINT64_MAX,0);
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(spare),sizeof(*spare));
+    uint64_t error=info[0] ? kvaf_device::kInvalidArgs : row->error;
+    uint32_t completed=0,total=0,deferred=0;
+    uint64_t lastHead=0,lastCq=0;
+    for(uint32_t w=0;w<rt_finalWorkers;++w){
+        auto post=FinalPostAt(rt_finalPostOffset,ctx,b*rt_finalWorkers+w);
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
+        auto workerArgs=GetArgs(ctx,FinalQueue(rt_batch,rt_finalWorkers,b,w));
+        auto entity=reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(workerArgs.channel_entity);
+        auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(workerArgs.queue_state);
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
+        total+=post->count;error|=post->error;
+        if(post->deferred){
+            ++deferred;
+#if !V9_SIMULATION
+            if(!error && !row->pending){
+                workerArgs.indices=ctx->sourceBlocks;workerArgs.offsets=ctx->sourceOffsets;
+                workerArgs.output_indices=ctx->destinations;workerArgs.miss_count=ctx->count;
+                workerArgs.request_capacity=rt_batch*kSlots;
+                if(ctx->fallbackAddresses) {
+                    workerArgs.address_table=ctx->fallbackAddresses;
+                    workerArgs.valid_table=ctx->fallbackValid;
+                    workerArgs.table_capacity=rt_batch*kSlots;
+                }
+                kvaf_device::KvafBatchGetDevice(workerArgs,0,post->descriptor,post->count);
+                auto done=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(workerArgs.core_status);
+                kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(done),sizeof(*done));
+                error|=done->result;completed+=done->completed_batch_count;
+                if(done->magic!=KVAF_AIV_BATCH_GET_STATUS_MAGIC || done->processed_request_count!=post->count)
+                    error|=kvaf_device::kInvalidArgs;
+                if(!done->result)post->deferred=0;
+            }
+#else
+            error|=kvaf_device::kInvalidArgs; // DMA fallback needs real hardware.
+#endif
+        }
+        if(post->pending){
+#if !V9_SIMULATION
+            auto drained=DrainQueue(entity,queue,post->pending);
+            uint64_t waitError=drained.error;
+            error|=waitError;
+            completed+=drained.completed;
+            if(!waitError){post->pending=0;}
+#else
+            post->pending=0;++completed;
+#endif
+        }
+        lastHead=queue->sq_producer_index;lastCq=queue->cq_consumer_index;
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
+    }
+    if(row->pending || total!=info[1])error|=kvaf_device::kInvalidArgs;
+    info[0]|=uint32_t(error);info[3]=deferred?1:0;info[4]=completed;
+    if(!error) {
+        if(!update)
+            Simt::VF_CALL<PublishDestinationResidency>(Simt::Dim3{256,1,1},rt_resident,ctx,b,total);
+        row->finalPending=0;
+    }
+    kvaf_device::WriteStatus(status,error,total,completed,lastHead,lastCq,UINT64_MAX,0);
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),sizeof(*status));
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),32);
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row)+960,64);
+    if(update && (error || updateError))
+        Simt::VF_CALL<CompleteEarlyUpdate<256>>(Simt::Dim3{256,1,1},
+            reinterpret_cast<__gm__ uint64_t*>(update),b,error);
+}
+#endif
+extern "C" __global__ __aicore__ void v9_fetch_kernel(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV { FinishFetch(bindings,nullptr); }
+#endif
+}
+extern "C" __global__ __aicore__ void v9_fetch_update_kernel(GM_ADDR bindings, GM_ADDR update) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV { FinishFetch(bindings,update); }
 #endif
 }
 extern "C" __global__ __aicore__ void v9_probe_kernel(GM_ADDR bindings) {

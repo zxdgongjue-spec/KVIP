@@ -49,7 +49,7 @@ lru = kvip.SlotLRU()
 
 # Bind once, before graph capture, using the existing prepared launch objects:
 forward = kvip.LIFetch(rotating, update)
-forward()  # round init -> LI/prefetch -> resolver -> Fetch completion -> Index update
+forward()  # round init -> LI/prefetch -> resolver -> outputs/Index update -> Fetch completion
 ```
 
 `LIFetch` accepts `LIFetchBinding` and `DirectIndexUpdate` objects;

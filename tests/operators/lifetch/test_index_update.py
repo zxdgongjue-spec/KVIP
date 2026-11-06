@@ -55,6 +55,18 @@ class UpdatePlanTest(unittest.TestCase):
             self.assertEqual(sorted(new), old)
             kv = old.copy()
             written = {dst for dst, _ in case}
+            invalidated = {dst for dst, src in records[len(case) :] if dst < 4096 and dst != src}
+            self.assertTrue(written.isdisjoint(invalidated))
+            # Apply's invalidations and Fetch's residency publication commute.
+            before = [slot % 3 == 0 for slot in range(4096)]
+            fetch_first, update_first = before.copy(), before.copy()
+            for slots, value in ((written, True), (invalidated, False)):
+                for slot in slots:
+                    fetch_first[slot] = value
+            for slots, value in ((invalidated, False), (written, True)):
+                for slot in slots:
+                    update_first[slot] = value
+            self.assertEqual(fetch_first, update_first)
             for dst, src in case:
                 kv[dst] = old[src]
             valid = [True] * 4096
@@ -98,6 +110,97 @@ class UpdateMoveTest(unittest.TestCase):
                 text=True,
             )
             subprocess.run([str(root / "test")], check=True)
+
+
+class EarlyUpdateTest(unittest.TestCase):
+    def test_pending_dma_and_late_error_with_actual_device_functions(self):
+        compiler = shutil.which("c++")
+        if compiler is None:
+            self.skipTest("C++ compiler unavailable")
+        kernel = ROOT / "csrc/operators/lightning_indexer_with_fetch/op_kernel"
+        text = (kernel / "index_cache_update.cpp").read_text()
+        update = text[text.index("template <bool WaitForFetch>") : text.index("// Service output adaptation")]
+        source = r"""
+#include <cstdint>
+#include <vector>
+#include <numeric>
+#include <algorithm>
+#include <cassert>
+#define __simt_callee__
+#define __simt_vf__
+#define __aicore__
+#define __gm__
+#define __ubuf__
+#define LAUNCH_BOUND(x)
+struct { unsigned x=0; } threadIdx;
+template<class T> T asc_ldcg(T* p) { return *p; }
+template<class T> void asc_stcg(T* p,T v) { *p=v; }
+uint32_t asc_atomic_cas(uint32_t* p,uint32_t old,uint32_t v) {
+    auto x=*p; if(x==old)*p=v; return x;
+}
+void asc_atomic_or(uint32_t* p,uint32_t v) { *p|=v; }
+void asc_syncthreads() {}
+void asc_threadfence() {}
+uint32_t asc_shfl_up(uint32_t v,uint32_t) { return v; }
+#include "index_cache_update.h"
+constexpr uint32_t kCandidates=2048, kThreads=1;
+UPDATE_FUNCTION
+int main() {
+    constexpr uint32_t resident=4096, history=8192, statusBytes=1216;
+    std::vector<uint32_t> lru(kCandidates), changes(kCandidates,UINT32_MAX);
+    std::iota(lru.begin(),lru.end(),0);
+    changes[7]=5000;
+    std::vector<uint32_t> work(kPlanWords+128), plan(kTransferPlanWords);
+    std::vector<uint32_t> rows(256), rowStatus(32), posts(2*32), valid(2*resident,1);
+    std::vector<uint64_t> prefetch(2*statusBytes/8), final(2*statusBytes/8);
+    uint32_t error=0, owner=1;
+    uint64_t a[26]{};
+    a[4]=(uint64_t)lru.data(); a[5]=(uint64_t)changes.data(); a[6]=(uint64_t)&error;
+    a[8]=(uint64_t)rows.data(); a[9]=(uint64_t)&owner; a[10]=(uint64_t)rowStatus.data();
+    a[11]=(uint64_t)posts.data(); a[12]=(uint64_t)prefetch.data(); a[13]=(uint64_t)final.data();
+    a[14]=2; a[15]=statusBytes; a[16]=(uint64_t)valid.data(); a[17]=(uint64_t)plan.data();
+    a[24]=history; a[25]=resident;
+    // Resolver has stable records, but prefetch/final CQs are still pending.
+    rows[211]=rows[248]=posts[1]=posts[35]=1;
+    Update<false>(a,0,owner,true,work.data());
+    assert(error==0 && plan[0]>0);
+    Update<true>(a,0,owner,true,work.data());
+    assert(error!=0 && plan[0]==0);
+    // Standalone API keeps its completed-transport validation.
+    rows[211]=rows[248]=posts[1]=posts[35]=0;
+    for(auto states:{prefetch.data(),final.data()})
+        for(unsigned lane=0;lane<2;++lane)states[lane*statusBytes/8]=0x4B5641464247444FULL;
+    Update<true>(a,0,owner,true,work.data());
+    assert(error==0 && plan[0]>0);
+    for(auto fault:{&rows[11],&rowStatus[0],&posts[34]}) {
+        *fault=1;
+        Update<false>(a,0,owner,true,work.data());
+        assert(error!=0 && plan[0]==0);
+        *fault=0;
+    }
+    error=0;
+    CompleteEarlyUpdate<1>(a,0,0);
+    assert(error==0 && std::all_of(valid.begin(),valid.end(),[](auto v){return v==1;}));
+    CompleteEarlyUpdate<1>(a,0,1);
+    assert(error==4);
+    assert(std::all_of(valid.begin(),valid.begin()+resident,[](auto v){return v==1;}));
+    assert(std::all_of(valid.begin()+resident,valid.end(),[](auto v){return v==0;}));
+    std::fill(valid.begin(),valid.end(),1);
+    error=2;
+    CompleteEarlyUpdate<1>(a,0,0);
+    assert(error==2 && valid[0]==1 && valid[resident]==0);
+}
+""".replace("UPDATE_FUNCTION", update)
+        with tempfile.TemporaryDirectory() as directory:
+            cpp, exe = Path(directory) / "test.cpp", Path(directory) / "test"
+            cpp.write_text(source)
+            subprocess.run(
+                [compiler, "-std=c++17", "-O2", str(cpp), "-I" + str(kernel), "-o", str(exe)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run([str(exe)], check=True, capture_output=True, text=True)
 
 
 class IndexUpdateTest(unittest.TestCase):

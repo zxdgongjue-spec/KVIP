@@ -65,13 +65,14 @@ extern "C" uint32_t refactor_fetch_pack_args(void *output, uint32_t capacity,
     return 0;
 }
 
-extern "C" uint32_t kvop_direct_update_outputs(uint32_t,void*,void*);
+extern "C" uint32_t kvop_direct_update_outputs_early(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_fetch_update_kernel(uint32_t,void*,void*,void*);
 extern "C" uint32_t kvip_lifetch_forward(void* bindings, void* update, void* stream,const rotating::RuntimeShape* shape) {
     if (!bindings || !update || !stream || !shape) return 100000;
     uint32_t result = v9_init(bindings, stream, shape);
     if (!result) result = v9_li(bindings, stream, shape);
     if (!result) result = v9_resolve(bindings, stream, shape);
-    if (!result) result = v9_fetch(bindings, stream, shape);
-    if (!result) result = kvop_direct_update_outputs(shape->batch, update, stream);
+    if (!result) result = kvop_direct_update_outputs_early(shape->batch, update, stream);
+    if (!result) result = aclrtlaunch_v9_fetch_update_kernel(shape->batch, stream, bindings, update);
     return result;
 }
