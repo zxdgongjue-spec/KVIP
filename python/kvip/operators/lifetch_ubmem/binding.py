@@ -7,7 +7,7 @@ import numpy as np
 
 from kvip.operators.lifetch.geometry import final_aivs, li_geometry
 from kvip.operators.lifetch_ubmem.specialization import query
-from kvip.operators.lifetch_ubmem.workspace import rotation_spec
+from kvip.operators.lifetch_ubmem.workspace import device_words, rotation_spec
 
 
 class UbmemBinding:
@@ -169,6 +169,6 @@ class UbmemBinding:
             raise AssertionError("UBmem Context ABI changed")
         self.context = torch.from_numpy(blob.copy()).to(self.device)
         self.arguments = tuple(arguments) + (self.context,)
-        self.bindings = torch.tensor([t.data_ptr() for t in self.arguments], dtype=torch.uint64, device=self.device)
+        self.bindings = device_words(torch, [t.data_ptr() for t in self.arguments], self.device)
         self.reserved_hot.fill_(-1)
         lease.bindings.append(self)

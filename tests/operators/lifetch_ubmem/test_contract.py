@@ -4,12 +4,13 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 
 from kvip.adapters.ubmem import UbmemLease
 from kvip.operators.lifetch_ubmem.forward import UbmemForward
 from kvip.operators.lifetch_ubmem.specialization import Specialization
-from kvip.operators.lifetch_ubmem.workspace import UbmemQueryInputs, rotation_spec
+from kvip.operators.lifetch_ubmem.workspace import UbmemQueryInputs, UbmemWorkspace, device_words, rotation_spec
 
 
 def lease_fixture(token_bytes=656):
@@ -84,10 +85,45 @@ def test_static_shape_and_ubmem_scratch_contract():
             shape = Specialization(batch, 33024, 8192, 64, width, 32, 8, "Ascend950DT_9582")
             assert shape.options("/cann")["SIM_HISTORY"] == 33024
             scratch = rotation_spec(batch, shape.history, shape.resident, shape.aic_count, shape.intermediate_fetches)
-            assert scratch["ubmem_status"] == ((batch, 16), "uint64")
+            assert scratch["ubmem_status"] == ((batch, 16), "int64")
             assert "final_status" not in scratch and "prefetch_status" not in scratch
     with pytest.raises(ValueError, match="cold tiles"):
         Specialization(2, 2304, 2048, 64, 656, 32, 8, "Ascend950DT_9582")
+
+
+def test_workspace_initializes_with_npu_supported_zero_dtypes():
+    def zeros(size, *, dtype, device):
+        if dtype == np.uint64:
+            raise RuntimeError("aclnnInplaceZero does not support DT_UINT64")
+        return np.zeros(size, dtype=dtype)
+
+    torch = SimpleNamespace(
+        int32=np.int32,
+        int64=np.int64,
+        uint8=np.uint8,
+        uint64=np.uint64,
+        zeros=zeros,
+        full=lambda size, value, *, dtype, device: np.full(size, value, dtype=dtype),
+        empty=lambda size, *, dtype, device: np.empty(size, dtype=dtype),
+    )
+    with patch("kvip.operators.lifetch_ubmem.workspace.UbmemQueryInputs"):
+        workspace = UbmemWorkspace(torch, batch=2, history=33024, resident=8192, aics=32, windows=8, device="npu:0")
+    status = workspace.scratch["ubmem_status"]
+    assert status.shape == (2, 16) and status.itemsize == 8
+    assert status.tobytes() == bytes(2 * 128)
+
+
+def test_device_abi_words_preserve_all_pointer_bits_in_signed_storage():
+    words = [0, 17, (1 << 63) - 1, 1 << 63, (1 << 64) - 1]
+
+    def from_numpy(values):
+        assert values.dtype == np.int64
+        return SimpleNamespace(to=lambda device: (device, values.copy()))
+
+    device, values = device_words(SimpleNamespace(from_numpy=from_numpy), words, "npu:1")
+    assert device == "npu:1" and values.shape == (len(words),)
+    assert values.tobytes() == np.asarray(words, dtype="<u8").tobytes()
+    assert values.view(np.uint64).tolist() == words
 
 
 def test_unique_active_owners_accepts_repeated_padding_without_device_read():

@@ -1,8 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Graph-stable LI buffers and UBmem copy counters, allocated before profiling."""
 
+import numpy as np
+
 from kvip.adapters.vllm.inputs import QueryInputs
 from kvip.operators.lifetch.geometry import final_aivs, li_geometry
+
+
+def device_words(torch, words, device):
+    """Upload uint64_t ABI words through NPU-supported int64 storage, without casting their bits."""
+    values = np.asarray(words, dtype="<u8").view("<i8")
+    return torch.from_numpy(values).to(device)
 
 
 class UbmemQueryInputs(QueryInputs):
@@ -35,7 +43,9 @@ def rotation_spec(batch, history, resident, aics, windows):
         "row_status": ((batch, 32), "int32"),
         "events": ((shape["intermediate_fetches"], shape["service_aivs_per_window"], 128), "uint8"),
         "fallback_addresses": ((batch, 8192), "int64"),
-        "ubmem_status": ((batch, 16), "uint64"),
+        # aclnnInplaceZero lacks uint64 support. The kernel reads these same
+        # 8-byte words as uint64_t; signed storage leaves that ABI unchanged.
+        "ubmem_status": ((batch, 16), "int64"),
     }
     return spec
 

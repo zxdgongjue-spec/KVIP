@@ -3,6 +3,8 @@
 
 import ctypes
 
+from kvip.operators.lifetch_ubmem.workspace import device_words
+
 
 class UbmemIndexUpdate:
     def __init__(
@@ -72,5 +74,5 @@ class UbmemIndexUpdate:
             history,
             rotating.shape.resident,
         ]
-        self.bindings = torch.tensor(pointers, dtype=torch.uint64, device=self.device)
+        self.bindings = device_words(torch, pointers, self.device)
         rotating.lease.bindings.append(self)
