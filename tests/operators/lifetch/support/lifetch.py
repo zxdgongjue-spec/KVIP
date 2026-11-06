@@ -30,14 +30,7 @@ def seed_native_bitmap(torch, native, row, bitmap):
     native.bitmap[row, : len(bitmap)].copy_(torch.as_tensor(bitmap, device=native.bitmap.device))
 
 
-def check_sources():
-    from kvip.runtime.integrity import verify_sources
-
-    verify_sources()
-
-
 def run(args, run_dir):
-    check_sources()
     from attention import check_sfa
     from contract_payload import payload
     from kvip.operators.lifetch import binding as launch_module

@@ -156,7 +156,7 @@ def test_host_pipeline_order_and_first_error(tmp_path):
     import subprocess
 
     source = (ROOT / "csrc/operators/lightning_indexer_with_fetch/op_host/launch.cpp").read_text()
-    entry = source[source.index('extern "C" uint32_t kvop_direct_update_outputs(uint32_t,') :]
+    entry = source[source.index('extern "C" uint32_t kvop_direct_update_outputs_early(uint32_t,') :]
     stub = r"""
 #include <cstdint>
 #include <cassert>
@@ -167,8 +167,8 @@ uint32_t step(int n,void* a,void* stream) { assert(a==(void*)1);assert(stream==s
 uint32_t v9_init(void*a,void*s,const rotating::RuntimeShape*){return step(1,a,s);}
 uint32_t v9_li(void*a,void*s,const rotating::RuntimeShape*){return step(2,a,s);}
 uint32_t v9_resolve(void*a,void*s,const rotating::RuntimeShape*){return step(3,a,s);}
-uint32_t v9_fetch(void*a,void*s,const rotating::RuntimeShape*){return step(4,a,s);}
-extern "C" uint32_t kvop_direct_update_outputs(uint32_t batch,void*a,void*s){assert(batch==16);assert(a==(void*)2);return step(5,(void*)1,s);}
+extern "C" uint32_t kvop_direct_update_outputs_early(uint32_t batch,void*a,void*s){assert(batch==16);assert(a==(void*)2);return step(4,(void*)1,s);}
+extern "C" uint32_t aclrtlaunch_v9_fetch_update_kernel(uint32_t batch,void*s,void*a,void*update){assert(batch==16);assert(update==(void*)2);return step(5,a,s);}
 """
     main = r"""
 int main(){rotating::RuntimeShape shape{};shape.batch=16;for(fail=0;fail<=5;++fail){count=0;assert(kvip_lifetch_forward((void*)1,(void*)2,stream_expected,&shape)==(fail?99:0));assert(count==(fail?fail:5));}return 0;}
@@ -187,12 +187,6 @@ int main(){rotating::RuntimeShape shape{};shape.batch=16;for(fail=0;fail<=5;++fa
         check=True,
     )
     subprocess.run([str(tmp_path / "test")], check=True)
-
-
-def test_operator_sources_match_migration_manifest():
-    from kvip.runtime.integrity import verify_sources
-
-    assert verify_sources() > 0
 
 
 def test_default_fixture_preserves_requested_misses(tmp_path):

@@ -12,6 +12,7 @@ namespace {
 constexpr uint32_t kCandidates = 2048, kThreads = 512;
 // keys, scales, addresses, logical IDs, LRU slots, producer changes,
 // status, address row stride, producer rows, hot validity. No KV payload input.
+template <bool WaitForFetch>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void Update(__gm__ uint64_t* a, uint32_t b, uint32_t owner,
                                                             bool checkTransport, __ubuf__ uint32_t* work) {
   uint32_t tid = threadIdx.x;
@@ -19,21 +20,30 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void Update(__gm__ uint64_t* a, 
   auto rows = reinterpret_cast<__gm__ uint32_t*>(a[8]) + b * 256;
   auto lru = reinterpret_cast<__gm__ uint32_t*>(a[4]) + b * kCandidates;
   auto changes = reinterpret_cast<__gm__ uint32_t*>(a[5]) + b * kCandidates;
-  // Do not publish Index ownership after a failed/incomplete producer fetch.
-  // These are the existing Row error, pending and finalPending ABI fields.
-  if (!tid) status[0] = (asc_ldcg(rows + 11) || asc_ldcg(rows + 211) || asc_ldcg(rows + 248)) ? 2U : 0U;
+  // Early updates consume the resolver's stable records while DMA is pending.
+  // The standalone update entry still requires completed transport.
+  if (!tid) {
+    status[0] = asc_ldcg(rows + 11) ? 2U : 0U;
+    if constexpr (WaitForFetch)
+      if (asc_ldcg(rows + 211) || asc_ldcg(rows + 248)) status[0] |= 2U;
+  }
   if (!tid && checkTransport) {
     auto rowStatus = reinterpret_cast<__gm__ uint32_t*>(a[10]) + b * 32;
     if (asc_ldcg(rowStatus)) status[0] |= 4U;
     auto posts = reinterpret_cast<__gm__ uint32_t*>(a[11]) + uint64_t(b) * a[14] * 32;
-    for (uint32_t worker = 0; worker < a[14]; ++worker)
-      for (uint32_t field = 1; field < 4; ++field)
-        if (asc_ldcg(posts + worker * 32 + field)) status[0] |= 4U;
-    for (uint32_t array = 12; array <= 13; ++array) {
-      auto states = reinterpret_cast<__gm__ uint64_t*>(a[array]);
-      for (uint32_t lane = 0; lane < 2; ++lane) {
-        auto state = states + uint64_t(b * 2 + lane) * (a[15] / 8);
-        if (asc_ldcg(state) != 0x4B5641464247444FULL || asc_ldcg(state + 2)) status[0] |= 4U;
+    for (uint32_t worker = 0; worker < a[14]; ++worker) {
+      auto post = posts + worker * 32;
+      if (asc_ldcg(post + 2)) status[0] |= 4U;
+      if constexpr (WaitForFetch)
+        if (asc_ldcg(post + 1) || asc_ldcg(post + 3)) status[0] |= 4U;
+    }
+    if constexpr (WaitForFetch) {
+      for (uint32_t array = 12; array <= 13; ++array) {
+        auto states = reinterpret_cast<__gm__ uint64_t*>(a[array]);
+        for (uint32_t lane = 0; lane < 2; ++lane) {
+          auto state = states + uint64_t(b * 2 + lane) * (a[15] / 8);
+          if (asc_ldcg(state) != 0x4B5641464247444FULL || asc_ldcg(state + 2)) status[0] |= 4U;
+        }
       }
     }
   }
@@ -100,6 +110,20 @@ __aicore__ inline void Apply(GM_ADDR bindings) {
                                 reinterpret_cast<__ubuf__ uint64_t*>(local[kTransferPlanWords].GetPhyAddr()), count);
 }
 
+template <bool WaitForFetch>
+__aicore__ inline void UpdateOutputs(GM_ADDR bindings) {
+  TPipe pipe;
+  TBuf<TPosition::VECCALC> scratch;
+  pipe.InitBuffer(scratch, kUpdateScratchBytes);
+  auto local = scratch.Get<uint32_t>();
+  auto args = reinterpret_cast<__gm__ uint64_t*>(bindings);
+  auto owners = reinterpret_cast<__gm__ uint32_t*>(args[9]);
+  uint32_t batch = GetBlockIdx();
+  Simt::VF_CALL<PublishOutputs>(Simt::Dim3{kThreads, 1, 1}, args, batch);
+  Simt::VF_CALL<Update<WaitForFetch>>(Simt::Dim3{kThreads, 1, 1}, args, batch, owners[batch], true,
+                                   reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
+}
+
 }  // namespace
 #endif
 extern "C" __global__ __aicore__ void kvop_direct_update_kernel(GM_ADDR bindings) {
@@ -110,7 +134,7 @@ extern "C" __global__ __aicore__ void kvop_direct_update_kernel(GM_ADDR bindings
     TBuf<TPosition::VECCALC> scratch;
     pipe.InitBuffer(scratch, kUpdateScratchBytes);
     auto local = scratch.Get<uint32_t>();
-    Simt::VF_CALL<Update>(Simt::Dim3{kThreads, 1, 1}, reinterpret_cast<__gm__ uint64_t*>(bindings), GetBlockIdx(),
+    Simt::VF_CALL<Update<true>>(Simt::Dim3{kThreads, 1, 1}, reinterpret_cast<__gm__ uint64_t*>(bindings), GetBlockIdx(),
                           GetBlockIdx(), false, reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
   }
 #endif
@@ -129,7 +153,7 @@ extern "C" __global__ __aicore__ void kvop_direct_update_owned_kernel(GM_ADDR bi
     auto args = reinterpret_cast<__gm__ uint64_t*>(bindings);
     auto owners = reinterpret_cast<__gm__ uint32_t*>(args[9]);
     uint32_t batch = GetBlockIdx();
-    Simt::VF_CALL<Update>(Simt::Dim3{kThreads, 1, 1}, args, batch, owners[batch], true,
+    Simt::VF_CALL<Update<true>>(Simt::Dim3{kThreads, 1, 1}, args, batch, owners[batch], true,
                           reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
   }
 #endif
@@ -138,16 +162,15 @@ extern "C" __global__ __aicore__ void kvop_direct_update_outputs_kernel(GM_ADDR 
 #if defined(__CCE_AICORE__)
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
   if ASCEND_IS_AIV {
-    TPipe pipe;
-    TBuf<TPosition::VECCALC> scratch;
-    pipe.InitBuffer(scratch, kUpdateScratchBytes);
-    auto local = scratch.Get<uint32_t>();
-    auto args = reinterpret_cast<__gm__ uint64_t*>(bindings);
-    auto owners = reinterpret_cast<__gm__ uint32_t*>(args[9]);
-    uint32_t batch = GetBlockIdx();
-    Simt::VF_CALL<PublishOutputs>(Simt::Dim3{kThreads, 1, 1}, args, batch);
-    Simt::VF_CALL<Update>(Simt::Dim3{kThreads, 1, 1}, args, batch, owners[batch], true,
-                          reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
+    UpdateOutputs<true>(bindings);
+  }
+#endif
+}
+extern "C" __global__ __aicore__ void kvop_direct_update_outputs_early_kernel(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__)
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  if ASCEND_IS_AIV {
+    UpdateOutputs<false>(bindings);
   }
 #endif
 }

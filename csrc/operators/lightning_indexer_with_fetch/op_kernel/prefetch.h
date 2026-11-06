@@ -67,10 +67,10 @@ __simt_callee__ inline void RecordChange(uint32_t rt_resident,__gm__ Context* ct
         asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+b*kLruSlots+slot-rt_resident,token);
 
 }
-// Publish residency only after every prefetch/final queue completed. Resolver
-// workers must all observe the same pre-round validity, not one another's posts.
+// Resolver workers consume the pre-round validity. Publish only after all
+// resolver workers finish; consumers of KV still wait for Fetch completion.
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
-inline void PublishCompletedResidency(uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,uint32_t fetched) {
+inline void PublishDestinationResidency(uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,uint32_t fetched) {
     if(!ctx->hotValid)return;
     auto valid=reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+OwnerRow(ctx,b)*rt_resident;
     // The original resolver already emits exactly the final Fetch destinations.
