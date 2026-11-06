@@ -37,6 +37,54 @@ def test_statistics_preserve_samples_and_microsecond_units():
             benchmark.statistics(bad)
 
 
+def test_actual_urma_prefetch_final_partition_keeps_fixed_workload():
+    baseline = dict(
+        prefetch_hot=3840, prefetch_cold=6485, unused_hot=3840, unused_cold=0, final=75, total=10400, unused=3840
+    )
+    replay = dict(
+        prefetch_hot=3840, prefetch_cold=6503, unused_hot=3840, unused_cold=0, final=57, total=10400, unused=3840
+    )
+    assert baseline != replay
+    assert benchmark.fixed_read_workload(baseline) == benchmark.fixed_read_workload(replay)
+    # Validation must not rewrite the recorded stage distribution.
+    assert replay["prefetch_cold"] == 6503 and replay["final"] == 57
+
+
+@pytest.mark.parametrize(
+    "change",
+    (
+        {"prefetch_cold": 6484, "total": 10399},
+        {"prefetch_hot": 3841, "prefetch_cold": 6484},
+        {"unused_hot": 3839, "unused": 3839},
+        {"unused_hot": 3839, "unused_cold": 1},
+    ),
+)
+def test_fixed_workload_rejects_changed_transfer_or_unused_work(change):
+    baseline = dict(
+        prefetch_hot=3840, prefetch_cold=6485, unused_hot=3840, unused_cold=0, final=75, total=10400, unused=3840
+    )
+    assert benchmark.fixed_read_workload(baseline) != benchmark.fixed_read_workload({**baseline, **change})
+
+
+@pytest.mark.parametrize(
+    "change",
+    (
+        {"final": -1},
+        {"total": 1},
+        {"unused": 1},
+        {"unused_cold": 6486, "unused": 10326},
+        {"prefetch_hot": True},
+        {"final": 75.0},
+    ),
+)
+def test_fixed_workload_rejects_invalid_counter_evidence(change):
+    baseline = dict(
+        prefetch_hot=3840, prefetch_cold=6485, unused_hot=3840, unused_cold=0, final=75, total=10400, unused=3840
+    )
+    with pytest.raises(ValueError):
+        benchmark.fixed_read_workload({**baseline, **change})
+
+
 def test_explicit_transport_and_padded_capacity_contract(tmp_path):
     common = [
         "--build-dir",

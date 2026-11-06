@@ -88,6 +88,7 @@ def test_cli_pairs_devices_and_widths_without_creating_outputs(tmp_path, capsys)
         assert row["urma_over_ubmem"] == 2
         assert row["reduction_percent"] == 50
         assert row["equal_actual_read_counts"]
+        assert row["equal_actual_read_bytes"]
 
 
 @pytest.mark.parametrize(
@@ -122,10 +123,45 @@ def test_different_speculative_traffic_is_reported_without_claiming_equal_bytes(
     compare_transports.validate(remote, "urma")
     pair = compare_transports.compare({(6, 656): local}, {(6, 656): remote})["comparisons"][0]
     assert not pair["equal_actual_read_counts"]
+    assert not pair["equal_actual_read_bytes"]
     assert pair["ubmem_read_bytes_per_replay"] == 60 * 656
     assert pair["urma_read_bytes_per_replay"] == 70 * 656
     assert pair["reduction_percent"] == -100
     assert "different speculative Fetch traffic" in pair["interpretation"]
+
+
+def test_allows_prefetch_final_redistribution_and_preserves_timed_evidence():
+    local, remote = result(), result("urma", samples=(20, 40, 60))
+    reference = dict(
+        prefetch_hot=3840,
+        prefetch_cold=6485,
+        unused_hot=3840,
+        unused_cold=0,
+        final=75,
+        total=10400,
+        unused=3840,
+    )
+    for row in (local, remote):
+        row["reads_per_replay"] = copy.deepcopy(reference)
+        row["reads_samples"] = [copy.deepcopy(reference) for _ in range(3)]
+    remote["reads_samples"][1].update(prefetch_cold=6503, final=57)
+    remote["reads_samples"][2].update(prefetch_cold=6500, final=60)
+    original_samples = [copy.deepcopy(row["reads_samples"]) for row in (local, remote)]
+    for row in (local, remote):
+        compare_transports.validate(row, row["transport"])
+    report = compare_transports.compare({(6, 656): local}, {(6, 656): remote})
+    pair = report["comparisons"][0]
+    assert pair["equal_actual_read_bytes"]
+    assert not pair["equal_actual_read_counts"]
+    assert [row["reads_samples"] for row in (local, remote)] == original_samples
+    assert "ubmem_reads_samples" not in pair and "urma_reads_samples" not in pair
+    assert pair["urma_read_count_ranges"]["prefetch_cold"] == dict(min=6485, max=6503)
+    assert pair["urma_read_count_ranges"]["final"] == dict(min=57, max=75)
+    assert pair["urma_read_bytes_per_replay"] == pair["ubmem_read_bytes_per_replay"] == 10400 * 656
+    assert "equal total Fetch bytes" in pair["interpretation"]
+    assert "different speculative Fetch traffic" not in pair["interpretation"]
+    assert report["metric"] == "fixed_snapshot_fusion_latency_us"
+    assert report["note"] == "Not model TPOT."
 
 
 @pytest.mark.parametrize(
@@ -140,6 +176,12 @@ def test_different_speculative_traffic_is_reported_without_claiming_equal_bytes(
         (lambda row: row["timing"].update(count=4), "sample"),
         (lambda row: row["reads_per_replay"].update(total=61), "inconsistent"),
         (lambda row: row["reads_samples"][1].update(final=11, total=61), "changed"),
+        (lambda row: row["reads_samples"][1].update(total=61), "inconsistent"),
+        (lambda row: row["reads_samples"][1].update(prefetch_hot=31, prefetch_cold=19), "changed"),
+        (lambda row: row["reads_samples"][1].update(unused_hot=6, unused=9), "changed"),
+        (lambda row: row["reads_samples"][1].update(prefetch_cold=2, final=28), "[Uu]nused"),
+        (lambda row: row["reads_samples"][1].update(prefetch_cold=-1, final=31), "prefetch_cold"),
+        (lambda row: row["reads_samples"][1].update(final=True), "final"),
     ],
 )
 def test_rejects_invalid_measurements(mutation, match):

@@ -10,6 +10,8 @@ import statistics
 import sys
 from pathlib import Path
 
+from support.benchmark_reads import fixed_read_workload
+
 
 CONTRACT_INTS = (
     "batch",
@@ -126,23 +128,18 @@ def validate(result, transport):
 
     reads = result.get("reads_per_replay")
     require(isinstance(reads, dict), "missing reads_per_replay")
-    for name in READ_FIELDS:
-        require(integer(reads.get(name)), f"invalid reads_per_replay.{name}")
-    require(
-        reads["total"] == reads["prefetch_hot"] + reads["prefetch_cold"] + reads["final"], "read total is inconsistent"
-    )
-    require(reads["unused"] == reads["unused_hot"] + reads["unused_cold"], "unused read total is inconsistent")
-    require(
-        reads["unused_hot"] <= reads["prefetch_hot"] and reads["unused_cold"] <= reads["prefetch_cold"],
-        "unused reads exceed prefetches",
-    )
+    workload = fixed_read_workload(reads)
     require(reads["total"] > 0, "benchmark recorded no Fetch reads")
     read_samples = result.get("reads_samples")
     require(
         isinstance(read_samples, list) and len(read_samples) == len(samples),
         "reads_samples differs from timing sample count",
     )
-    require(all(sample == reads for sample in read_samples), "Fetch workload changed between timed replays")
+    for index, sample in enumerate(read_samples):
+        require(
+            fixed_read_workload(sample) == workload,
+            f"Fetch workload changed at timed replay {index}; only prefetch_cold/final redistribution is allowed",
+        )
     return result
 
 
@@ -170,6 +167,13 @@ def differences(left, right, prefix=""):
     return [] if left == right else [prefix]
 
 
+def read_ranges(samples):
+    return {
+        name: dict(min=min(sample[name] for sample in samples), max=max(sample[name] for sample in samples))
+        for name in READ_FIELDS
+    }
+
+
 def compare(ubmem, urma):
     require(ubmem.keys() == urma.keys(), f"device/width pairs differ: ubmem={sorted(ubmem)}, urma={sorted(urma)}")
     pairs = []
@@ -183,7 +187,9 @@ def compare(ubmem, urma):
         require(not mismatch, f"device/width {key}: incomparable results; mismatched {', '.join(mismatch)}")
         local_us, remote_us = [statistics.median(row["timing"]["samples_us"]) for row in (local, remote)]
         local_reads, remote_reads = local["reads_per_replay"], remote["reads_per_replay"]
-        equal_reads = local_reads == remote_reads
+        local_samples, remote_samples = local["reads_samples"], remote["reads_samples"]
+        equal_reads = all(sample == local_samples[0] for sample in (*local_samples, *remote_samples))
+        equal_bytes = local_reads["total"] == remote_reads["total"]
         contract = local["contract"]
         pairs.append(
             dict(
@@ -203,13 +209,18 @@ def compare(ubmem, urma):
                 reduction_percent=100 * (remote_us - local_us) / remote_us,
                 samples_per_transport=local["timing"]["count"],
                 equal_actual_read_counts=equal_reads,
+                equal_actual_read_bytes=equal_bytes,
                 ubmem_reads_per_replay=local_reads,
                 urma_reads_per_replay=remote_reads,
+                ubmem_read_count_ranges=read_ranges(local_samples),
+                urma_read_count_ranges=read_ranges(remote_samples),
                 ubmem_read_bytes_per_replay=local_reads["total"] * key[1],
                 urma_read_bytes_per_replay=remote_reads["total"] * key[1],
                 interpretation=(
                     "Same-demand full fusion pipeline latency with equal recorded Fetch counts."
                     if equal_reads
+                    else "Same-demand full fusion pipeline latency with equal total Fetch bytes; recorded Fetch counter breakdowns differ."
+                    if equal_bytes
                     else "Same-demand full fusion pipeline latency includes different speculative Fetch traffic; not an equal-byte bandwidth comparison."
                 ),
             )

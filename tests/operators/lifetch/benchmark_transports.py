@@ -23,6 +23,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path[:0] = [str(ROOT / "python"), str(Path(__file__).parent / "support")]
+from benchmark_reads import fixed_read_workload  # noqa: E402 — standalone test bootstrap
 
 
 def arguments(argv=None):
@@ -404,6 +405,7 @@ def run(args, work):
     graph.replay(stream)
     stream.synchronize()
     baseline_reads = check(full=True)
+    baseline_workload = fixed_read_workload(baseline_reads)
     samples, read_samples = [], []
     begin, end = [torch.npu.Event(enable_timing=True) for _ in range(2)]
     progress(f"time graph replay: warmup={args.warmup} iterations={args.iterations}; reset/check excluded")
@@ -416,8 +418,9 @@ def run(args, work):
         end.synchronize()
         elapsed = begin.elapsed_time(end) * 1000
         reads = check(full=step == args.warmup + args.iterations - 1)
-        if reads != baseline_reads:
-            raise AssertionError(f"fixed-snapshot Fetch workload changed: {reads} != {baseline_reads}")
+        workload = fixed_read_workload(reads)
+        if workload != baseline_workload:
+            raise AssertionError(f"fixed-snapshot Fetch workload changed: {workload} != {baseline_workload}")
         if step >= args.warmup:
             samples.append(elapsed)
             read_samples.append(reads)
