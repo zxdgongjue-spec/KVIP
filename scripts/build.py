@@ -17,6 +17,7 @@ UBMEM_PAGE_PATCH = "kvaf-ubmem-page-mode"
 UBMEM_THP_PATCH = "kvaf-ubmem-thp"
 UBMEM_NUMA_PATCH = "kvaf-ubmem-numa"
 UBMEM_NUMA_MASK_PATCH = "kvaf-ubmem-numa-mask"
+UBMEM_COPY_PIPELINE_PATCH = "kvaf-ubmem-copy-pipeline"
 
 
 def call(command, cwd=None, env=None):
@@ -68,7 +69,7 @@ def prepare_dependency(root, transport="urma"):
     # Later UBmem patches change shared Runtime/binding contexts from earlier
     # patches. Recognize the newest applied patch before examining its parents,
     # then upgrade an existing checkout with only the remaining patches.
-    ubmem_patches = (UBMEM_PATCH, UBMEM_FUSED_PATCH, UBMEM_PAGE_PATCH, UBMEM_THP_PATCH, UBMEM_NUMA_PATCH, UBMEM_NUMA_MASK_PATCH)
+    ubmem_patches = (UBMEM_PATCH, UBMEM_FUSED_PATCH, UBMEM_PAGE_PATCH, UBMEM_THP_PATCH, UBMEM_NUMA_PATCH, UBMEM_NUMA_MASK_PATCH, UBMEM_COPY_PIPELINE_PATCH)
     for index in range(len(ubmem_patches) - 1, -1, -1):
         if not applies(root, ubmem_patches[index], True):
             continue

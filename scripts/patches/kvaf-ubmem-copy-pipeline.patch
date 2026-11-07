@@ -1,0 +1,457 @@
+diff --git a/access_operator/ubmem/host/access_operator.cc b/access_operator/ubmem/host/access_operator.cc
+index 52266b9..56924d1 100644
+--- a/access_operator/ubmem/host/access_operator.cc
++++ b/access_operator/ubmem/host/access_operator.cc
+@@ -193,18 +193,21 @@ class UbmemAccessOperator final : public AccessOperator {
+     aclError error = aclrtMemcpyAsync(state_->metadata_device, state_->metadata_capacity,
+         state_->metadata_host, entries.size() * sizeof(PutEntry), ACL_MEMCPY_HOST_TO_DEVICE, stream);
+     if (error != ACL_SUCCESS) return DrainFailure(stream, "copy Put metadata", error);
+-    error = aclrtMemsetAsync(state_->status, kMaxWorkers * sizeof(CoreStatus), 0, sizeof(CoreStatus), stream);
++    const uint32_t workers = state_->region.base % 32 == 0 && state_->region.slot_size % 32 == 0
++        ? state_->config.npu_core_count : 1;
++    error = aclrtMemsetAsync(state_->status, kMaxWorkers * sizeof(CoreStatus), 0,
++                            workers * sizeof(CoreStatus), stream);
+     if (error != ACL_SUCCESS) return DrainFailure(stream, "clear Put status", error);
+     PutArgs args{Pointer(r.input.data), r.input.bytes, Pointer(state_->metadata_device),
+         Pointer(state_->status), state_->region.base, state_->region.length,
+         state_->region.slot_size, static_cast<uint32_t>(entries.size()), kAbiVersion};
+-    error = state_->put.Launch(&args, sizeof(args), 1, stream);
++    error = state_->put.Launch(&args, sizeof(args), workers, stream);
+     if (error != ACL_SUCCESS) return DrainFailure(stream, "launch Put", error);
+     error = aclrtSynchronizeStream(stream);
+     if (error != ACL_SUCCESS) return Poison("Put synchronization", error);
+     // Only this success permits RuntimeCore::CommitPut. A completed device
+     // validation failure is safe to Abort; unknown completion never is.
+-    return ReadStatus(1, "Put", entries.size());
++    return ReadStatus(workers, "Put", entries.size());
+   }
+ 
+  private:
+@@ -250,15 +253,18 @@ class UbmemAccessOperator final : public AccessOperator {
+     const aclError error = aclrtMemcpy(statuses.data(), statuses.size() * sizeof(CoreStatus),
+         state_->status, statuses.size() * sizeof(CoreStatus), ACL_MEMCPY_DEVICE_TO_HOST);
+     if (error != ACL_SUCCESS) return AclFailure("read completed status", error);
++    uint64_t total = 0;
+     for (const auto& status : statuses) {
+-      if (status.magic != kStatusMagic || status.result != kSuccess ||
+-          (expected != UINT64_MAX && status.copied_requests != expected)) {
++      total += status.copied_requests;
++      if (status.magic != kStatusMagic || status.result != kSuccess) {
+         return Status::Internal(std::string("UBmem ") + operation + " completed with device error: magic=" +
+             std::to_string(status.magic) + " result=" + std::to_string(status.result) +
+             " request=" + std::to_string(status.failed_request) +
+             " copied=" + std::to_string(status.copied_requests));
+       }
+     }
++    if (expected != UINT64_MAX && total != expected)
++      return Status::Internal("UBmem Put completed count differs from reserved entries");
+     return Status::OK();
+   }
+   Status EnsureMetadata(size_t bytes) {
+diff --git a/access_operator/ubmem/host/kernel_loader.cc b/access_operator/ubmem/host/kernel_loader.cc
+index 88b2b80..2fca5c7 100644
+--- a/access_operator/ubmem/host/kernel_loader.cc
++++ b/access_operator/ubmem/host/kernel_loader.cc
+@@ -1,6 +1,7 @@
+ #include "kernel_loader.h"
+ 
+ #include <fstream>
++#include <cstring>
+ 
+ #include "ubmem/transfer_abi.h"
+ 
+@@ -10,6 +11,8 @@ Status Kernel::Load(const std::string& path, const char* name) {
+   if (binary_ != nullptr) return Status::InvalidState("UBmem kernel already loaded");
+   std::ifstream file(path, std::ios::binary | std::ios::ate);
+   if (!file || file.tellg() <= 0) return Status::InvalidArgument("cannot read UBmem kernel: " + path);
++  local_memory_bytes_ = std::strcmp(name, "KvafUbmemBatchGet") == 0
++      ? kvaf_ubmem::kGetLocalMemoryBytes : kvaf_ubmem::kLocalMemoryBytes;
+   const auto size = file.tellg();
+   bytes_.resize(static_cast<size_t>(size));
+   file.seekg(0);
+@@ -43,7 +46,7 @@ aclError Kernel::Launch(const void* arguments, size_t bytes, uint32_t workers,
+   attrs[0].id = ACL_RT_LAUNCH_KERNEL_ATTR_SCHEM_MODE;
+   attrs[0].value.schemMode = 1;
+   attrs[1].id = ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE;
+-  attrs[1].value.dynUBufSize = kvaf_ubmem::kLocalMemoryBytes;
++  attrs[1].value.dynUBufSize = local_memory_bytes_;
+   attrs[2].id = ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT_US;
+   attrs[2].value.timeoutUs.timeoutLow = 180U * 1000000U;
+   attrs[2].value.timeoutUs.timeoutHigh = 0;
+diff --git a/access_operator/ubmem/host/kernel_loader.h b/access_operator/ubmem/host/kernel_loader.h
+index 40a3ec5..8bd51bb 100644
+--- a/access_operator/ubmem/host/kernel_loader.h
++++ b/access_operator/ubmem/host/kernel_loader.h
+@@ -18,6 +18,7 @@ class Kernel {
+                   aclrtStream stream) const;
+ 
+  private:
++  uint32_t local_memory_bytes_{0};
+   aclrtBinHandle binary_{nullptr};
+   aclrtFuncHandle function_{nullptr};
+   std::vector<char> bytes_;
+diff --git a/access_operator/ubmem/include/ubmem/transfer_abi.h b/access_operator/ubmem/include/ubmem/transfer_abi.h
+index 4a13d8b..7042998 100644
+--- a/access_operator/ubmem/include/ubmem/transfer_abi.h
++++ b/access_operator/ubmem/include/ubmem/transfer_abi.h
+@@ -11,7 +11,8 @@ namespace kvaf_ubmem {
+ constexpr uint32_t kAbiVersion = 1;
+ constexpr uint32_t kMaxWorkers = 64;
+ constexpr uint32_t kCopyChunkBytes = 8192;
+-constexpr uint32_t kLocalMemoryBytes = 16 * 1024;
++constexpr uint32_t kLocalMemoryBytes = 80 * 1024;
++constexpr uint32_t kGetLocalMemoryBytes = 32 * 1024;
+ constexpr uint64_t kStatusMagic = 0x55424d454d303031ULL;
+ 
+ enum Result : uint64_t {
+diff --git a/access_operator/ubmem/kernel/batch_get.asc b/access_operator/ubmem/kernel/batch_get.asc
+index 5919bb5..cf2e323 100644
+--- a/access_operator/ubmem/kernel/batch_get.asc
++++ b/access_operator/ubmem/kernel/batch_get.asc
+@@ -4,7 +4,8 @@ using namespace AscendC;
+ using namespace kvaf_ubmem;
+ 
+ extern "C" __global__ __aicore__ void KvafUbmemBatchGet(GetArgs args) {
+-  kvaf_ubmem_device::ByteCopier copy;
++  kvaf_ubmem_device::GetCopier copy;
++  copy.InvalidateMetadata(args.miss_count);
+   const uint32_t core = GetBlockIdx();
+   uint64_t result = kSuccess, failed = UINT64_MAX, copied = 0;
+   if (args.abi_version != kAbiVersion || args.workers == 0 ||
+@@ -39,6 +40,7 @@ extern "C" __global__ __aicore__ void KvafUbmemBatchGet(GetArgs args) {
+               args.output + uint64_t(row) * args.token_bytes, args.token_bytes);
+     ++copied;
+   }
++  copy.Finish();
+   copy.WriteStatus(args.status == 0 ? 0 : args.status + core * sizeof(CoreStatus),
+                    result, failed, copied);
+ }
+diff --git a/access_operator/ubmem/kernel/batch_put.asc b/access_operator/ubmem/kernel/batch_put.asc
+index 314a183..49112a5 100644
+--- a/access_operator/ubmem/kernel/batch_put.asc
++++ b/access_operator/ubmem/kernel/batch_put.asc
+@@ -4,10 +4,12 @@ using namespace AscendC;
+ using namespace kvaf_ubmem;
+ 
+ extern "C" __global__ __aicore__ void KvafUbmemBatchPut(PutArgs args) {
+-  // One writer also makes arbitrary-length neighboring slots safe when a
+-  // slot boundary lies inside a 32-byte GM write sector.
+-  if (GetBlockIdx() != 0) return;
++  // Each aligned 8 KiB destination chunk has exactly one writer. Assign
++  // by physical slot/chunk, not request index, to preserve duplicate ordering.
++  // Unaligned public inputs retain the single-writer path selected by host.
++  const uint32_t core = GetBlockIdx(), workers = GetBlockNum();
+   kvaf_ubmem_device::ByteCopier copy;
++  copy.InvalidateMetadata(args.entries);
+   uint64_t result = args.abi_version == kAbiVersion ? kSuccess : kInvalidAbi;
+   uint64_t failed = UINT64_MAX, copied = 0;
+   for (uint32_t i = 0; result == kSuccess && i < args.count; ++i) {
+@@ -23,10 +25,21 @@ extern "C" __global__ __aicore__ void KvafUbmemBatchPut(PutArgs args) {
+         (destination - args.region_base) % args.slot_bytes != 0) {
+       result = kInvalidDestination; failed = i; break;
+     }
+-    copy.Copy(args.input + offset, destination, length);
+-    ++copied;
++    if (workers > 1 && (args.region_base % 32 || args.slot_bytes % 32)) {
++      result = kInvalidAbi; failed = i; break;
++    }
++    const uint64_t slot = (destination - args.region_base) / args.slot_bytes;
++    for (uint64_t chunk = 0; chunk < length; chunk += kCopyChunkBytes) {
++      if ((slot + chunk / kCopyChunkBytes) % workers != core) continue;
++      const uint64_t size = length - chunk < kCopyChunkBytes ? length - chunk : kCopyChunkBytes;
++      copy.Copy(args.input + offset + chunk, destination + chunk, size);
++    }
++    // Count each reservation once, after the owner submits its chunks.
++    // Host synchronizes *all* cores and checks every status before commit.
++    if (slot % workers == core) ++copied;
+   }
+-  copy.WriteStatus(args.status, result, failed, copied);
++  copy.Finish();
++  copy.WriteStatus(args.status + core * sizeof(CoreStatus), result, failed, copied);
+ }
+ 
+ #if !defined(KVAF_UBMEM_CPU_MODEL)
+diff --git a/access_operator/ubmem/kernel/copy_primitives.h b/access_operator/ubmem/kernel/copy_primitives.h
+index db4242e..6950c97 100644
+--- a/access_operator/ubmem/kernel/copy_primitives.h
++++ b/access_operator/ubmem/kernel/copy_primitives.h
+@@ -9,55 +9,71 @@ namespace kvaf_ubmem_device {
+ using namespace AscendC;
+ using namespace kvaf_ubmem;
+ 
+-// Deliberately conservative first implementation: drain each exact-length
+-// MTE2/MTE3 copy before reusing UB. DataCopyPad Normal mode does not extend
+-// the GM transfer to its 32-byte UB padding. Source offsets and final tails
+-// may therefore be unaligned without reading/writing neighboring payloads.
+-class ByteCopier {
++// Eight exact-length DMA stages overlap Host-DDR reads with HBM writes.
++// Destination owners serialize duplicate rows and shared partial sectors.
++// Drain every credit before returning, including on a validation failure.
++template <uint32_t StageBytes>
++class CopyPipeline {
+  public:
+-  __aicore__ inline ByteCopier() {
+-    pipe_.InitBuffer(payload_, kCopyChunkBytes);
++  __aicore__ inline CopyPipeline() {
++    pipe_.InitBuffer(payload_, kDepth * kStageBytes);
+     pipe_.InitBuffer(control_, 32);
+   }
+ 
++  // Descriptors/tables live in HBM and can change between graph replays.
++  // Invalidate once per launch, then use scalar cache lines rather than one
++  // MTE2 transfer plus a scalar wait for each 1/4/8-byte field.
++  __aicore__ inline void InvalidateMetadata(uint64_t address) {
++    GlobalTensor<uint8_t> metadata;
++    metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(address));
++    DataCacheCleanAndInvalid<uint8_t, CacheLine::ENTIRE_DATA_CACHE>(metadata);
++  }
++
+   template <typename T>
+   __aicore__ inline T Load(uint64_t address) {
+-    GlobalTensor<uint8_t> source;
+-    source.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(address));
+-    SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+-    WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+-    DataCopyExtParams copy{1, static_cast<uint32_t>(sizeof(T)), 0, 0, 0};
+-    DataCopyPadExtParams<uint8_t> pad{false, 0, 0, 0};
+-    DataCopyPad<uint8_t, PaddingMode::Normal>(control_.Get<uint8_t>(), source, copy, pad);
+-    SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+-    WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+-    return control_.Get<T>().GetValue(0);
++    GlobalTensor<T> source;
++    source.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(address));
++    return source.GetValue(0);
+   }
+ 
+   __aicore__ inline void Copy(uint64_t source_address,
+-                               uint64_t destination_address, uint64_t bytes) {
++                              uint64_t destination_address, uint64_t bytes) {
++    if (!issued_) {
++      SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
++      WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
++      for (uint32_t i = 0; i < kDepth; ++i)
++        SetFlag<HardEvent::MTE3_MTE2>(static_cast<event_t>(i));
++    }
+     for (uint64_t offset = 0; offset < bytes;) {
+       const uint32_t size = static_cast<uint32_t>(
+-          bytes - offset > kCopyChunkBytes ? kCopyChunkBytes : bytes - offset);
+-      GlobalTensor<uint8_t> source, destination;
++          bytes - offset > kStageBytes ? kStageBytes : bytes - offset);
++      const uint32_t stage = issued_ % kDepth;
++      WaitFlag<HardEvent::MTE3_MTE2>(static_cast<event_t>(stage));
++      GlobalTensor<uint8_t> source;
+       source.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(source_address + offset));
+-      destination.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(destination_address + offset));
+-      SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+-      WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+       DataCopyExtParams copy{1, size, 0, 0, 0};
+       DataCopyPadExtParams<uint8_t> pad{false, 0, 0, 0};
+-      DataCopyPad<uint8_t, PaddingMode::Normal>(payload_.Get<uint8_t>(), source, copy, pad);
+-      SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+-      WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+-      DataCopyPad<uint8_t, PaddingMode::Normal>(destination, payload_.Get<uint8_t>(), copy);
+-      SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+-      WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+-      SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+-      WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
++      DataCopyPad<uint8_t, PaddingMode::Normal>(
++          payload_.Get<uint8_t>()[stage * kStageBytes], source, copy, pad);
++      SetFlag<HardEvent::MTE2_MTE3>(static_cast<event_t>(stage));
++      destinations_[stage] = destination_address + offset;
++      sizes_[stage] = size;
++      ++issued_;
++      if (issued_ - stored_ == kDepth) StoreOne();
+       offset += size;
+     }
+   }
+ 
++  __aicore__ inline void Finish() {
++    if (!issued_) return;
++    while (stored_ < issued_) StoreOne();
++    for (uint32_t i = 0; i < kDepth; ++i)
++      WaitFlag<HardEvent::MTE3_MTE2>(static_cast<event_t>(i));
++    SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
++    WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
++    issued_ = stored_ = 0;
++  }
++
+   __aicore__ inline void WriteStatus(uint64_t address, uint64_t result,
+                                       uint64_t failed, uint64_t copied) {
+     if (address == 0) return;
+@@ -77,7 +93,25 @@ class ByteCopier {
+   }
+ 
+  private:
++  static constexpr uint32_t kDepth = 8;
++  static constexpr uint32_t kStageBytes = StageBytes;
++  __aicore__ inline void StoreOne() {
++    const uint32_t stage = stored_ % kDepth;
++    WaitFlag<HardEvent::MTE2_MTE3>(static_cast<event_t>(stage));
++    GlobalTensor<uint8_t> destination;
++    destination.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(destinations_[stage]));
++    DataCopyExtParams copy{1, sizes_[stage], 0, 0, 0};
++    DataCopyPad<uint8_t, PaddingMode::Normal>(
++        destination, payload_.Get<uint8_t>()[stage * kStageBytes], copy);
++    SetFlag<HardEvent::MTE3_MTE2>(static_cast<event_t>(stage));
++    ++stored_;
++  }
++  uint64_t destinations_[kDepth]{};
++  uint32_t sizes_[kDepth]{};
++  uint64_t issued_{0}, stored_{0};
+   TPipe pipe_;
+   TBuf<TPosition::VECCALC> payload_, control_;
+ };
++using GetCopier = CopyPipeline<2624>;
++using ByteCopier = CopyPipeline<kCopyChunkBytes>;
+ }  // namespace kvaf_ubmem_device
+diff --git a/access_operator/ubmem/tests/copy_model_test.cc b/access_operator/ubmem/tests/copy_model_test.cc
+index d892cc3..5f38725 100644
+--- a/access_operator/ubmem/tests/copy_model_test.cc
++++ b/access_operator/ubmem/tests/copy_model_test.cc
+@@ -27,7 +27,7 @@ void RunGet(GetArgs args, CoreStatus* statuses) {
+ }
+ 
+ void TestGet(uint32_t width, uint32_t workers) {
+-  constexpr uint32_t rows = 17, block_rows = 3, blocks = 6;
++  constexpr uint32_t rows = 513, block_rows = 3, blocks = 6;
+   const uint64_t slot = uint64_t(width) * block_rows;
+   std::vector<uint8_t> arena(slot * blocks);
+   for (size_t i = 0; i < arena.size(); ++i) arena[i] = (i * 29 + i / 7) % 251;
+@@ -97,27 +97,40 @@ void TestGet(uint32_t width, uint32_t workers) {
+   ubmem_model::TrackWrites(nullptr, 0);
+ }
+ 
+-void TestPut() {
+-  const std::vector<uint64_t> sizes{1, 15, 31, 32, 33, 655, 656, 2624, 8191, 8192, 8193, 13003};
+-  constexpr uint64_t slot = 13141;  // deliberately not sector aligned
+-  std::vector<uint8_t> arena(slot * sizes.size() + 64, 0xb9), source(100000, 0);
++void TestPut(uint64_t slot, uint32_t workers) {
++  const std::vector<uint64_t> sizes{1, 15, 31, 32, 33, 655, 656, 2624, 8191, 8192, 8193, 13003, 128 * 656, 128 * 2624, 10 * 8192 + 17};
++  std::vector<uint8_t> arena(slot * sizes.size() + 128, 0xb9), source(1000000, 0);
+   for (size_t i = 0; i < source.size(); ++i) source[i] = (i * 17 + i / 11) % 253;
+   std::vector<PutEntry> entries;
++  const uint64_t prefix = 32 + (32 - Address(arena.data()) % 32) % 32;
+   auto expected = arena;
+   uint64_t offset = 3;
+   for (size_t i = 0; i < sizes.size(); ++i) {
+-    entries.push_back({offset, sizes[i], Address(arena.data() + 32 + i * slot)});
+-    std::memcpy(expected.data() + 32 + i * slot, source.data() + offset, sizes[i]);
++    entries.push_back({offset, sizes[i], Address(arena.data() + prefix + i * slot)});
++    std::memcpy(expected.data() + prefix + i * slot, source.data() + offset, sizes[i]);
+     offset += sizes[i] + 5;
+   }
+-  CoreStatus status{};
++  // Repeat a destination with different bytes/length. Every chunk must
++  // remain on its original owner and preserve submission order.
++  entries.push_back({13, slot - 17, Address(arena.data() + prefix)});
++  std::memcpy(expected.data() + prefix, source.data() + 13, slot - 17);
++  std::array<CoreStatus, kMaxWorkers> statuses{};
++  auto& status = statuses[0];
+   PutArgs args{Address(source.data()), source.size(), Address(entries.data()), Address(&status),
+-      Address(arena.data() + 32), slot * sizes.size(), slot, static_cast<uint32_t>(entries.size()), kAbiVersion};
++      Address(arena.data() + prefix), slot * sizes.size(), slot, static_cast<uint32_t>(entries.size()), kAbiVersion};
++  ubmem_model::core = 0;
++  ubmem_model::TrackWrites(arena.data() + prefix, slot * sizes.size());
++  ubmem_model::workers = workers;
++  uint64_t total = 0;
++  for (uint32_t i = 0; i < workers; ++i) {
++    ubmem_model::core = i;
++    KvafUbmemBatchPut(args);
++    ubmem_model::CheckDrained();
++    assert(statuses[i].magic == kStatusMagic && statuses[i].result == kSuccess);
++    total += statuses[i].copied_requests;
++  }
++  assert(total == entries.size());
+   ubmem_model::core = 0;
+-  ubmem_model::TrackWrites(arena.data() + 32, slot * sizes.size());
+-  KvafUbmemBatchPut(args);
+-  ubmem_model::CheckDrained();
+-  assert(status.magic == kStatusMagic && status.result == kSuccess && status.copied_requests == entries.size());
+   assert(arena == expected);
+   args.count = 1;
+   entries[0].length = 0;
+@@ -139,6 +152,7 @@ int main() {
+   for (uint32_t width : {656U, 2624U}) {
+     for (uint32_t workers : {1U, 2U, 3U, 8U, 64U}) TestGet(width, workers);
+   }
+-  TestPut();
++  TestPut(335885, 1);
++  for (uint32_t workers : {1U, 2U, 8U, 32U}) TestPut(335904, workers);
+   std::cout << "UBmem actual-kernel CPU model PASS (bytes, tails, guards, sector ownership, invalid prefixes, event credits)\n";
+ }
+diff --git a/access_operator/ubmem/tests/host_contract_test.cc b/access_operator/ubmem/tests/host_contract_test.cc
+index 5d30b94..a57e528 100644
+--- a/access_operator/ubmem/tests/host_contract_test.cc
++++ b/access_operator/ubmem/tests/host_contract_test.cc
+@@ -69,7 +69,11 @@ aclError Kernel::Launch(const void* arguments, size_t, uint32_t workers, aclrtSt
+       std::memcpy(reinterpret_cast<void*>(entries[i].destination),
+           reinterpret_cast<void*>(args.input + entries[i].input_offset), entries[i].length);
+     }
+-    *reinterpret_cast<CoreStatus*>(args.status) = {kStatusMagic, kSuccess, UINT64_MAX, args.count};
++    for (uint32_t i = 0; i < workers; ++i)
++      reinterpret_cast<CoreStatus*>(args.status)[i] = {kStatusMagic, kSuccess, UINT64_MAX, 0};
++    for (uint32_t i = 0; i < args.count; ++i)
++      ++reinterpret_cast<CoreStatus*>(args.status)[
++          ((entries[i].destination - args.region_base) / args.slot_bytes) % workers].copied_requests;
+   } else {
+     const auto& args = *static_cast<const GetArgs*>(arguments);
+     if (args.status) {
+diff --git a/access_operator/ubmem/tests/model/kernel_operator.h b/access_operator/ubmem/tests/model/kernel_operator.h
+index 94116de..7b15056 100644
+--- a/access_operator/ubmem/tests/model/kernel_operator.h
++++ b/access_operator/ubmem/tests/model/kernel_operator.h
+@@ -16,8 +16,8 @@
+ #define KVAF_UBMEM_CPU_MODEL 1
+ 
+ namespace ubmem_model {
+-inline uint32_t core = 0;
+-inline bool events[6]{};
++inline uint32_t core = 0, workers = 1;
++inline bool events[6][8]{};
+ inline uintptr_t tracked_begin = 0, tracked_end = 0;
+ inline std::map<uintptr_t, uint32_t> owners;
+ inline void TrackWrites(void* address, size_t bytes) {
+@@ -35,33 +35,38 @@ inline void Write(void* address, size_t bytes) {
+     }
+   }
+ }
+-inline void CheckDrained() { for (bool event : events) assert(!event); }
++inline void CheckDrained() { for (auto& row : events) for (bool event : row) assert(!event); }
+ }  // namespace ubmem_model
+ 
+ namespace AscendC {
+ using event_t = uint32_t;
+ constexpr event_t EVENT_ID0 = 0;
+ enum class HardEvent { S_MTE2, MTE2_S, MTE2_MTE3, MTE3_MTE2, MTE3_S, S_MTE3 };
+-template <HardEvent Event> void SetFlag(event_t) {
+-  auto& credit = ubmem_model::events[static_cast<unsigned>(Event)];
++template <HardEvent Event> void SetFlag(event_t id) {
++  auto& credit = ubmem_model::events[static_cast<unsigned>(Event)][id];
+   assert(!credit); credit = true;
+ }
+-template <HardEvent Event> void WaitFlag(event_t) {
+-  auto& credit = ubmem_model::events[static_cast<unsigned>(Event)];
++template <HardEvent Event> void WaitFlag(event_t id) {
++  auto& credit = ubmem_model::events[static_cast<unsigned>(Event)][id];
+   assert(credit); credit = false;
+ }
++inline uint32_t GetBlockNum() { return ubmem_model::workers; }
+ inline uint32_t GetBlockIdx() { return ubmem_model::core; }
+ enum class TPosition { VECCALC };
+ enum class PaddingMode { Normal };
+ template <typename T> struct LocalTensor {
+   T* data;
++  LocalTensor<T> operator[](size_t i) const { return {data + i}; }
+   T GetValue(size_t index) const { T value; std::memcpy(&value, data + index, sizeof(T)); return value; }
+   void SetValue(size_t index, T value) { std::memcpy(data + index, &value, sizeof(T)); }
+ };
+ template <typename T> struct GlobalTensor {
+   T* data{nullptr};
++  T GetValue(size_t i) const { T value; std::memcpy(&value, data + i, sizeof(T)); return value; }
+   void SetGlobalBuffer(T* value) { data = value; }
+ };
++enum class CacheLine { ENTIRE_DATA_CACHE };
++template <typename T, CacheLine> void DataCacheCleanAndInvalid(GlobalTensor<T>) {}
+ template <TPosition> struct TBuf {
+   std::vector<uint8_t> bytes;
+   template <typename T> LocalTensor<T> Get() { return {reinterpret_cast<T*>(bytes.data())}; }
