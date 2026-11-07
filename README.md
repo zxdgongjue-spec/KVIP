@@ -74,12 +74,16 @@ available. The following downloads the pinned KVAF revision if necessary and
 builds KVAF, LIDU and LIFetch including Index update:
 
 ```bash
-git clone --branch codex/lifetch-hot-resolver https://gitcode.com/CacheOS/KVIP.git /vllm-workspace/KVIP
+git clone --branch main https://gitcode.com/CacheOS/KVIP.git /vllm-workspace/KVIP
 cd /vllm-workspace/KVIP
 source /usr/local/Ascend/cann/set_env.sh
 bash scripts/build.sh
 source scripts/env.sh
 ```
+
+If KVIP is already checked out, build from that checkout; no second clone or
+branch switch is required. The build uses the current KVIP source and pins only
+the external KVAF dependency.
 
 To use the existing KVAF source instead, replace the build command with:
 
