@@ -18,10 +18,10 @@ LAUNCH(direct_update_outputs,6)
 LAUNCH(direct_apply_owned,7)
 int main() {
     using namespace rotating;
-    static_assert(sizeof(Context)==240 && sizeof(Row)==1024 && sizeof(UbmemRegion)==128);
+    static_assert(sizeof(Context)==256 && sizeof(Row)==1024 && sizeof(UbmemRegion)==128);
     static_assert(offsetof(Row,error)==11*4 && offsetof(Row,pending)==211*4 && offsetof(Row,finalPending)==248*4);
     static_assert(offsetof(Context,ubmemRegion)==128 && offsetof(Context,ubmemStatus)==136 && offsetof(Context,lruSlots)==144);
-    assert(kvip_ubmem_abi_version()==1 && kvip_ubmem_context_bytes()==240 && kvip_ubmem_region_bytes()==128);
+    assert(kvip_ubmem_abi_version()==2 && kvip_ubmem_context_bytes()==256 && kvip_ubmem_region_bytes()==128);
     void* pointer=reinterpret_cast<void*>(1);
     assert(kvip_ubmem_forward(pointer,pointer,pointer)==0);
     assert((calls==std::vector<unsigned>{1,2,3,4,5,6,7}));

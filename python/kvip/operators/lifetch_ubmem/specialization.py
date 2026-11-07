@@ -29,8 +29,8 @@ class Specialization:
             raise ValueError("UBmem LIFetch requires 1..16 requests and 1..32 AICs")
         if self.batch > self.aic_count:
             raise ValueError("UBmem LIFetch requests must fit concurrently resident LI cores")
-        if self.history % 256 or self.resident % 256 or not 2048 <= self.resident < self.history <= 210944:
-            raise ValueError("UBmem history/resident must align to 256, with 2048 <= resident < history <= 210944")
+        if self.history % 256 or self.resident % 256 or not 8192 <= self.resident < self.history <= 210944:
+            raise ValueError("UBmem history/resident must align to 256, with 8192 <= resident < history <= 210944")
         if self.heads not in (32, 64) or self.token_bytes not in (656, 2624):
             raise ValueError("UBmem supports 32/64 Indexer heads and 656/2624-byte KV rows")
         if not 1 <= self.intermediate_fetches <= 32 or not self.soc.startswith("Ascend950"):
@@ -71,7 +71,7 @@ def build_specialization(*, cache_dir, cann, shape, jobs=2):
         raise FileNotFoundError(f"UBmem fusion sources unavailable: {source}")
     options = shape.options(cann)
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
-    for directory in (source, source.parent / "common/lightning_indexer"):
+    for directory in (source, source.parent / "common"):
         for path in sorted(directory.rglob("*")):
             if path.is_file() and (path.suffix in (".h", ".cpp", ".asc", ".cmake") or path.name == "CMakeLists.txt"):
                 digest.update(str(path.relative_to(source.parent)).encode())

@@ -43,9 +43,9 @@ if(_rounds GREATER _li_cores)
   set(_rounds ${_li_cores})
 endif()
 if(NOT _history_remainder EQUAL 0 OR NOT _resident_remainder EQUAL 0 OR
-   SIM_RESIDENT LESS 2048 OR SIM_HISTORY GREATER 210944 OR
+   SIM_RESIDENT LESS 8192 OR SIM_HISTORY GREATER 210944 OR
    _cold_tiles LESS_EQUAL _rounds OR _cold_tiles LESS 1 OR INTERMEDIATE_FETCHES GREATER 32)
-  message(FATAL_ERROR "Requires 256-aligned H>R>=2048, bounded LI scratch, and distinct cold window boundaries")
+  message(FATAL_ERROR "Requires 256-aligned H>R>=8192, bounded LI scratch, and distinct cold window boundaries")
 endif()
 if(NOT EXISTS "${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake")
   message(FATAL_ERROR "Matching CANN AscendC CMake package is absent")

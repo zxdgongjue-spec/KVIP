@@ -37,6 +37,9 @@ __simt_callee__ inline uint32_t SparseHash(uint32_t token) {
     return (token*0x9e3779b9U)>>19;
 }
 
+}
+#include "../../../common/lifetch/resident_selection.h"
+namespace rotating {
 template<uint32_t Threads>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
 inline void ReplicatedResolve(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc,
@@ -48,105 +51,34 @@ inline void ReplicatedResolve(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc
     uint32_t tid=threadIdx.x,lane=tid%warpSize,warp=tid/warpSize;
     auto lru=ctx->lruSlots ? reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+batch*kLruSlots : nullptr;
     uint32_t outputStride=OutputStride(SIM_RESIDENT,ctx),ownerBase=OwnerRow(ctx,batch)*outputStride;
-    uint32_t buckets=coldCount<=1024?2048U:(coldCount<=2048?4096U:8192U);
-    for(uint32_t i=tid;i<buckets;i+=Threads){keys[i]=UINT32_MAX;ranks[i]=UINT32_MAX;}
-    if(tid<256)cfg[32+tid]=0;
-    if(tid<8)cfg[tid]=0;
-    asc_syncthreads();
-    for(uint32_t i=tid;i<coldCount;i+=Threads){
-        uint32_t pos=positions[i],token=selected[pos];
-        if(token>=SIM_HISTORY){asc_atomic_or(cfg+1,1U);continue;}
-        if(pos>=2*kTop && selected[pos-2*kTop]==token){loc[pos]=UINT32_MAX-2;continue;}
-        uint32_t slot=(used || ctx->tailBounds)?asc_ldcg(mapping+token):UINT32_MAX;loc[pos]=slot;
-        if(slot==UINT32_MAX){
-            uint32_t h=SparseHash(token)&(buckets-1);
-            for(uint32_t n=0;n<buckets;++n){uint32_t old=asc_atomic_cas(keys+h,UINT32_MAX,token);
-                if(old==UINT32_MAX || old==token){asc_atomic_min(ranks+h,pos);break;}h=(h+1)&(buckets-1);}
-        } else if(slot<SIM_RESIDENT || slot>=outputStride)asc_atomic_or(cfg+1,2U);
-        else if(slot<SIM_RESIDENT+kSlots && used+coldCount>kSlots)asc_atomic_or(cfg+32+(slot-SIM_RESIDENT)/32,1U<<((slot-SIM_RESIDENT)%32));
-    }
-    asc_syncthreads();
-    // Mark the first occurrence before replacing hash-table positions by ranks.
-    uint32_t per=(coldCount+Threads-1)/Threads,localCount=0;
-    for(uint32_t i=tid*per;i<(tid+1)*per && i<coldCount;++i){uint32_t pos=positions[i];
-        if(loc[pos]!=UINT32_MAX)continue;
-        uint32_t token=selected[pos],h=SparseHash(token)&(buckets-1);
-        while(keys[h]!=token)h=(h+1)&(buckets-1);
-        if(ranks[h]==pos){loc[pos]=UINT32_MAX-1;++localCount;}}
-    uint32_t scan=localCount;
-    for(uint32_t d=1;d<warpSize;d*=2){uint32_t prior=asc_shfl_up(scan,d);if(lane>=d)scan+=prior;}
-    if(lane==warpSize-1)cfg[544+warp]=scan;
-    asc_syncthreads();
-    if(!warp){uint32_t value=lane<Threads/warpSize?cfg[544+lane]:0;
-        for(uint32_t d=1;d<warpSize;d*=2){uint32_t prior=asc_shfl_up(value,d);if(lane>=d)value+=prior;}cfg[544+lane]=value;}
-    asc_syncthreads();
-    uint32_t begin=scan-localCount+(warp?cfg[544+warp-1]:0),count=cfg[544+Threads/warpSize-1];
-    if(!tid)cfg[0]=count;
-    for(uint32_t i=tid*per;i<(tid+1)*per && i<coldCount;++i){uint32_t pos=positions[i];
-        if(loc[pos]!=UINT32_MAX-1)continue;
-        uint32_t token=selected[pos],h=SparseHash(token)&(buckets-1);while(keys[h]!=token)h=(h+1)&(buckets-1);
-        ids[begin]=uint16_t(pos);ranks[h]=begin++;}
-    asc_syncthreads();
-    if(used+count<=kSlots){for(uint32_t i=tid;i<count;i+=Threads)slots[i]=SIM_RESIDENT+used+i;}
-    else {
-        uint32_t n=tid<256?uint32_t(__popc(~cfg[32+tid])):0,value=n;
-        for(uint32_t d=1;d<warpSize;d*=2){uint32_t prior=asc_shfl_up(value,d);if(lane>=d)value+=prior;}
-        if(lane==warpSize-1)cfg[544+warp]=value;
-        asc_syncthreads();
-        if(!warp){uint32_t v=lane<Threads/warpSize?cfg[544+lane]:0;
-            for(uint32_t d=1;d<warpSize;d*=2){uint32_t prior=asc_shfl_up(v,d);if(lane>=d)v+=prior;}cfg[544+lane]=v;}
-        asc_syncthreads();
-        if(tid<256)cfg[288+tid]=value-n+(warp?cfg[544+warp-1]:0);
-        if(!tid && cfg[544+Threads/warpSize-1]<count)cfg[1]=4;
-        asc_syncthreads();
-        for(uint32_t slot=tid;slot<kSlots;slot+=Threads){uint32_t bits=cfg[32+slot/32],bit=slot%32;
-            uint32_t rank=cfg[288+slot/32]+uint32_t(__popc((~bits)&((1U<<bit)-1U)));
-            if(!(bits&(1U<<bit)) && rank<count)slots[rank]=SIM_RESIDENT+slot;}
-    }
-    asc_syncthreads();
-    // Only an empty hot row outside the LRU pool retains its own destination.
-    // Reserved hot rows are ordinary misses and keep the allocator's slots.
-    for(uint32_t i=tid;i<count;i+=Threads) {
-        uint32_t token=selected[ids[i]];
-        if(token<SIM_RESIDENT && !IsTailToken(ctx,batch,token)) {
-            int32_t ordinal=ctx->reservedHot ? asc_ldcg(reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+batch*SIM_RESIDENT+token) : -1;
-            if(ordinal<0)slots[i]=token;
-        }
-    }
-    asc_syncthreads();
-    if(cfg[1])return;
+    uint32_t count=0,candidateCount=0;
+    if(!ResolveResidentPlan<Threads>(SIM_HISTORY,SIM_RESIDENT,outputStride,selected,loc,
+        positions,coldCount,keys,ranks,ids,slots,cfg,mapping,lru,used,ctx->tailBounds!=0,count,candidateCount))return;
+    constexpr uint32_t missingTag=0x80000000U;
     uint32_t ownBegin=count*worker/kFinalWorkers,ownEnd=count*(worker+1)/kFinalWorkers;
     if(!tid){cfg[2]=ownBegin;cfg[3]=ownEnd-ownBegin;if(!worker)asc_atomic_add(total,count);}
-    for(uint32_t i=tid;i<coldCount;i+=Threads){uint32_t pos=positions[i];
-        if(pos/(kSlots/kFinalWorkers)!=worker)continue;
-        uint32_t slot=loc[pos],token=selected[pos];
-        if(slot==UINT32_MAX-2)slot=loc[pos-2*kTop];
-        if(slot>=UINT32_MAX-1){uint32_t h=SparseHash(token)&(buckets-1);while(keys[h]!=token)h=(h+1)&(buckets-1);slot=slots[ranks[h]];}
-        loc[pos]=slot;
-    }
-    asc_syncthreads(); // hash and position arrays may now be reused
-    // All duplicate-query reads of logical slots joined above. The output
-    // adapter shares the original resolver invocation; no extra VF launch.
     for(uint32_t i=tid;i<coldCount;i+=Threads) {
-        uint32_t pos=positions[i];
-        if(pos/(kSlots/kFinalWorkers)==worker)
-            loc[pos]=ResolvePhysicalSlot(SIM_RESIDENT,lru,loc[pos]);
+        uint32_t pos=positions[i],slot=loc[pos];
+        if(pos/(kSlots/kFinalWorkers)==worker && (slot&missingTag))loc[pos]=slots[slot&~missingTag];
     }
-    asc_syncthreads(); // Join position readers before descriptor scratch reuse.
-    // The UBmem final workers retain the same complete immutable plan.
-    // Ownership is selected from each actual destination sector, so scattered
-    // LRU victims cannot make two AIVs overwrite halves of one 32-byte sector.
+    asc_syncthreads();
+    auto changeSlots=reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+batch*kChangeCapacity;
+    auto changes=reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+batch*kChangeCapacity;
+    // All final AIVs retain an identical immutable copy plan. Payload writes
+    // remain partitioned by destination sector, including scattered hot victims.
     for(uint32_t rank=tid;rank<count;rank+=Threads) {
-        uint32_t token=selected[ids[rank]],logicalSlot=slots[rank],dst=batch*kSlots+rank;
-        uint32_t physical=ResolvePhysicalSlot(SIM_RESIDENT,lru,logicalSlot);
+        uint32_t token=selected[ids[rank]],physical=slots[rank],dst=batch*kSlots+rank;
         uint64_t remote=asc_ldcg(addresses+token);
-        keys[rank]=uint32_t(remote);ranks[rank]=uint32_t(remote>>32);slots[rank]=physical;
+        keys[rank]=uint32_t(remote);ranks[rank]=uint32_t(remote>>32);
         if(rank>=ownBegin && rank<ownEnd) {
-            RecordChange(SIM_RESIDENT,ctx,batch,logicalSlot,token);
+            int32_t ordinal=asc_ldcg(reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+batch*SIM_RESIDENT+physical);
+            uint32_t record=ordinal>=0?uint32_t(ordinal):kLruSlots+rank;
+            asc_stcg(changeSlots+record,physical);asc_stcg(changes+record,token);
             StoreFallbackSource(SIM_HISTORY,kTokenBytes,ctx,batch,dst,token,remote,blocks,offsets);
             asc_stcg(destinations+dst,int32_t(ownerBase+physical));
         }
     }
+    if(!tid && ownEnd>candidateCount)asc_atomic_max(reinterpret_cast<__gm__ uint32_t*>(ctx->changeCount)+batch,kLruSlots+ownEnd);
     // Mapping remains the immutable prefetch snapshot. Final locations and
     // descriptors are authoritative; mutating mapping here races other readers.
     asc_threadfence();

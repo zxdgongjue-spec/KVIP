@@ -39,8 +39,17 @@ __aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     FillWords(ctx->mapping+uint64_t(b)*SIM_HISTORY*4,SIM_HISTORY,local);
     FillWords(ctx->selected+uint64_t(b)*kSlots*4,kSlots,local);
-    if(ctx->changes)FillWords(ctx->changes+b*kLruSlots*4,kLruSlots,local);
+    if(ctx->changes)FillWords(ctx->changes+b*kChangeCapacity*4,kChangeCapacity,local);
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    if(ctx->changeSlots) {
+        GlobalTensor<uint32_t> source,target;
+        source.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots);
+        target.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+b*kChangeCapacity);
+        DataCopy(local,source,kLruSlots);
+        SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+        DataCopy(target,local,kLruSlots);
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    }
     Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},SIM_HISTORY,SIM_RESIDENT,ctx,b);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
     pipe.Destroy();
@@ -91,16 +100,17 @@ extern "C" __global__ __aicore__ void kvip_ubmem_init_kernel(GM_ADDR bindings) {
         auto region=UbmemRegionAt(ctx);
         auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
         uint64_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
-        uint64_t stride=ctx->outputStride?ctx->outputStride:SIM_RESIDENT+kSlots;
+        uint64_t stride=ctx->outputStride?ctx->outputStride:SIM_RESIDENT;
         uint64_t rowBytes=stride*kTokenBytes;
         uint32_t error=(!ctx->ubmemStatus || !UbmemRegionValid(region) || !ctx->tokenAddresses ||
-            ctx->addressStride<SIM_HISTORY || stride<SIM_RESIDENT+kSlots || (stride-SIM_RESIDENT-kSlots)%128 || (ctx->tailBounds && stride<SIM_RESIDENT+kSlots+384) ||
+            !ctx->lruSlots || !ctx->reservedHot || !ctx->changeSlots || !ctx->changeCount ||
+            ctx->addressStride<SIM_HISTORY || stride<SIM_RESIDENT || (stride-SIM_RESIDENT)%128 || (ctx->tailBounds && stride<SIM_RESIDENT+384) ||
             rowBytes%32 || ctx->prefetchLimit>kSlots || !ctx->windowLimit || ctx->windowLimit>480)?kUbmemInvalidRegion:0;
         if(!error && (rowBytes>region->outputBytes || owner>region->outputBytes/rowBytes-1))error=kUbmemInvalidRegion;
         row->reserved0=0;row->reserved1=0;row->reserved2=0;
         row->addresses=ctx->tokenAddresses+owner*ctx->addressStride*8;
         row->output=error?0:region->outputBase+owner*rowBytes;
-        row->limit=kSlots;row->prefetchLimit=ctx->prefetchLimit;row->copyLimit=kSlots;row->error=error;
+        row->limit=kSlots;row->prefetchLimit=ctx->prefetchLimit;row->copyLimit=kLruSlots;row->error=error;
         ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),sizeof(Row));
     }
 #endif

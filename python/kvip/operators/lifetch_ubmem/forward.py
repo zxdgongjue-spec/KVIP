@@ -6,8 +6,8 @@ import ctypes
 
 class UbmemForward:
     def __init__(self, rotating, update):
-        if rotating.device != update.device or update.bindings.numel() != 26:
-            raise ValueError("UBmem forward requires the same-device 26-field Index update binding")
+        if rotating.device != update.device or update.bindings.numel() != 28:
+            raise ValueError("UBmem forward requires the same-device 28-field Index update binding")
         self.rotating, self.update = rotating, update
         self.function = rotating.library.kvip_ubmem_forward
         self.function.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]

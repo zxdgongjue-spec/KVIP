@@ -3,7 +3,7 @@
 
 import ctypes
 
-from kvip.operators.lifetch_ubmem.workspace import device_words
+from kvip.operators.lifetch_ubmem.workspace import WORK_WORDS, device_words
 
 
 class UbmemIndexUpdate:
@@ -20,6 +20,8 @@ class UbmemIndexUpdate:
         status,
         query_inputs,
         outputs,
+        plan_buffer=None,
+        extended_work=None,
     ):
         self.torch, self.device, self.library = torch, keys.device, rotating.library
         batch, history = rotating.shape.batch, rotating.shape.history
@@ -43,7 +45,25 @@ class UbmemIndexUpdate:
             raise ValueError("UBmem Index keys must be contiguous bytes [owner, history, 128]")
         words = self.library.kvip_ubmem_plan_words
         words.argtypes, words.restype = [], ctypes.c_uint32
-        self.plan_buffer = torch.zeros((batch, words()), dtype=torch.int32, device=self.device)
+        self.plan_buffer = (
+            torch.zeros((batch, words()), dtype=torch.int32, device=self.device) if plan_buffer is None else plan_buffer
+        )
+        self.extended_work = (
+            torch.empty((batch, WORK_WORDS), dtype=torch.int32, device=self.device)
+            if extended_work is None
+            else extended_work
+        )
+        for name, tensor, shape in (
+            ("plan_buffer", self.plan_buffer, (batch, words())),
+            ("extended_work", self.extended_work, (batch, WORK_WORDS)),
+        ):
+            if (
+                tensor.device != self.device
+                or tensor.dtype != torch.int32
+                or tuple(tensor.shape) != shape
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(f"UBmem Index {name} must be contiguous int32 with shape {shape}")
         self.status = status
         self.logical_output, self.slot_output = outputs.unbind(0)
         pointers = [
@@ -51,7 +71,7 @@ class UbmemIndexUpdate:
             scales.data_ptr(),
             addresses.data_ptr(),
             logical_ids.data_ptr(),
-            rotating.lru_slots.data_ptr(),
+            rotating.change_slots.data_ptr(),
             rotating.changes.data_ptr(),
             status.data_ptr(),
             addresses.stride(0),
@@ -73,6 +93,8 @@ class UbmemIndexUpdate:
             self.slot_output.data_ptr(),
             history,
             rotating.shape.resident,
+            rotating.change_count.data_ptr(),
+            self.extended_work.data_ptr(),
         ]
         self.bindings = device_words(torch, pointers, self.device)
         rotating.lease.bindings.append(self)

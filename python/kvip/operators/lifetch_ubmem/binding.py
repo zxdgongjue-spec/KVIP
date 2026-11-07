@@ -44,15 +44,15 @@ class UbmemBinding:
             ("token_bytes", shape.token_bytes),
             ("aic_count", shape.aic_count),
             ("index_heads", shape.heads),
-            ("context_bytes", 240),
+            ("context_bytes", 256),
             ("row_bytes", 1024),
         ):
             if query(self.library, name) != expected:
                 raise ValueError(f"UBmem static binary contract mismatch: {name}")
         version = self.library.kvip_ubmem_abi_version
         version.argtypes, version.restype = [], ctypes.c_uint32
-        if version() != 1:
-            raise ValueError("UBmem fusion ABI 1 is required")
+        if version() != 2:
+            raise ValueError("UBmem fusion ABI 2 is required")
         if lease.context["token_bytes"] != shape.token_bytes or lease.context["tokens_per_block"] != 128:
             raise ValueError("UBmem kernel and KVAF slot geometry differ")
         if not 0 <= prefetch_limit <= 8192 or not 1 <= window_limit <= 480:
@@ -68,7 +68,7 @@ class UbmemBinding:
         ):
             if query(self.library, name) != expected:
                 raise ValueError(f"UBmem static scheduling mismatch: {name}")
-        for name, expected in (("context_bytes", 240), ("region_bytes", 128), ("status_bytes", 128)):
+        for name, expected in (("context_bytes", 256), ("region_bytes", 128), ("status_bytes", 128)):
             function = getattr(self.library, "kvip_ubmem_" + name)
             function.argtypes, function.restype = [], ctypes.c_uint32
             if function() != expected:
@@ -110,10 +110,10 @@ class UbmemBinding:
             or not token_addresses.is_contiguous()
         ):
             raise ValueError("UBmem token addresses must match the stable-owner Index rows")
-        self.output_stride = shape.resident + 8192 if output_stride is None else output_stride
-        tail_tokens = self.output_stride - shape.resident - 8192
+        self.output_stride = shape.resident if output_stride is None else output_stride
+        tail_tokens = self.output_stride - shape.resident
         if tail_tokens < 0 or tail_tokens % 128 or self.output_stride > 0xFFFFFFFF:
-            raise ValueError("UBmem output stride must preserve hot/fallback/optional ABC slots")
+            raise ValueError("UBmem output stride must preserve hot/optional ABC slots")
         if self.output_stride * shape.token_bytes % 32 or output.data_ptr() % 32:
             raise ValueError("UBmem owner rows must start on distinct aligned 32-byte sectors")
         if tail_bounds is not None and (
@@ -158,6 +158,8 @@ class UbmemBinding:
             token_addresses.stride(0),
             self.output_stride,
             0 if tail_bounds is None else tail_bounds.data_ptr(),
+            self.change_slots.data_ptr(),
+            self.change_count.data_ptr(),
         ]
         blob = np.concatenate(
             (
@@ -166,7 +168,7 @@ class UbmemBinding:
                 np.asarray(extra, dtype="<u8").view("u1"),
             )
         )
-        if blob.size != 240:
+        if blob.size != 256:
             raise AssertionError("UBmem Context ABI changed")
         self.context = torch.from_numpy(blob.copy()).to(self.device)
         self.arguments = tuple(arguments) + (self.context,)

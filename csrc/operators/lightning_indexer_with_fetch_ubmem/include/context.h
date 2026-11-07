@@ -7,7 +7,7 @@ static_assert(V9_UBPIPE_DEPTH != 1 || V9_UBPIPE_ROWS == 1, "Serial UBmem require
 namespace rotating {
 constexpr bool kDedicatedService = V9_DEDICATED_SERVICE;
 constexpr uint32_t kTop = 2048, kSlots = 8192, kTokenBytes = TOKEN_BYTES;
-static_assert((uint64_t(SIM_RESIDENT)+kSlots)*kTokenBytes%32==0,
+static_assert(uint64_t(SIM_RESIDENT)*kTokenBytes%32==0,
               "UBmem batch outputs must not share a 32-byte GM sector");
 constexpr uint32_t kMaxRounds = 32;
 // Scalar cache maintenance must never write back another AIV's status.
@@ -76,8 +76,9 @@ struct Context {
     uint64_t lruSlots, reservedHot, changes, queryEnds;
     uint64_t fallbackAddresses, reservedFallbackValid, hotValid;
     uint64_t rowOwners, tokenAddresses, addressStride, outputStride, tailBounds;
+    uint64_t changeSlots, changeCount;
 };
-static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 240,
+static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 256,
               "V9 ABI layout changed");
 // Workload configuration is compiled into each benchmark binary, as in V8.
 // One selected AIC pair per window; zero disables intermediate Fetch.

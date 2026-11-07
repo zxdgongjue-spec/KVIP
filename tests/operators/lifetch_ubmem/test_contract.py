@@ -88,7 +88,7 @@ def test_static_shape_and_ubmem_scratch_contract():
             assert scratch["ubmem_status"] == ((batch, 16), "int64")
             assert "final_status" not in scratch and "prefetch_status" not in scratch
     with pytest.raises(ValueError, match="cold tiles"):
-        Specialization(2, 2304, 2048, 64, 656, 32, 8, "Ascend950DT_9582")
+        Specialization(2, 8448, 8192, 64, 656, 32, 8, "Ascend950DT_9582")
 
 
 def test_workspace_initializes_with_npu_supported_zero_dtypes():
@@ -111,6 +111,11 @@ def test_workspace_initializes_with_npu_supported_zero_dtypes():
     status = workspace.scratch["ubmem_status"]
     assert status.shape == (2, 16) and status.itemsize == 8
     assert status.tobytes() == bytes(2 * 128)
+    workspace.inputs.block_table = SimpleNamespace(shape=(2, 33024 // 128))
+    storage = SimpleNamespace(history=33024, keys=object(), scales=object())
+    assert len(workspace.arguments(storage)) == 14
+    assert workspace.index_plan.shape == (2, 40968)
+    assert workspace.index_work.shape == (2, 40960)
 
 
 def test_device_abi_words_preserve_all_pointer_bits_in_signed_storage():
@@ -146,7 +151,7 @@ def test_forward_only_submits_bound_pointers_on_the_current_lease_stream():
         bindings=SimpleNamespace(data_ptr=lambda: 101),
         lease=SimpleNamespace(check_stream=Mock(return_value=SimpleNamespace(npu_stream=303))),
     )
-    update = SimpleNamespace(device=device, bindings=SimpleNamespace(numel=lambda: 26, data_ptr=lambda: 202))
+    update = SimpleNamespace(device=device, bindings=SimpleNamespace(numel=lambda: 28, data_ptr=lambda: 202))
     forward = UbmemForward(rotating, update)
     forward()
     launch.assert_called_once_with(101, 202, 303)

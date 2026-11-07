@@ -256,3 +256,18 @@ The user verified this service path runs. Initial history restoration and fused
 final fetch still retain their existing Get paths; this is not a general queue
 handoff fix. Do not reintroduce an ordinary Get for ABC promotion without resolving
 and validating the shared-queue handoff. Include this limitation in the merge PR.
+
+## UBmem hot-only final repair
+
+UBmem fusion ABI 2 uses the same final TopK protection and hot-slot selection
+as URMA, in `csrc/operators/common/lifetch/resident_selection.h`. Missing rows
+replace unprotected persistent hot slots; the payload layout is hot + ABC, with
+no separate 8192-token payload region. UBmem retains its eight-stage copy pipeline
+and native completion checks. The shared Index planner handles up to 10240 change
+records (2048 prefetch candidates plus the Q4 union); plan/work buffers are shared
+across sequential layer groups and allocated before memory profiling.
+
+Rebuild UBmem fusion and use the matching vLLM integration before serving. Source
+hashes include the shared headers and old ABI 1 libraries are rejected. Resident
+capacity must be at least 8192 for the worst-case Q4 union. No KVAF runtime or URMA
+transport change is needed.

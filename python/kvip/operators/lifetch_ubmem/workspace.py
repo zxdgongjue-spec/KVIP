@@ -7,6 +7,11 @@ from kvip.adapters.vllm.inputs import QueryInputs
 from kvip.operators.lifetch.geometry import final_aivs, li_geometry
 
 
+CHANGE_CAPACITY = 2048 + 8192
+PLAN_WORDS = 8 + 4 * CHANGE_CAPACITY
+WORK_WORDS = 4 * CHANGE_CAPACITY
+
+
 def device_words(torch, words, device):
     """Upload uint64_t ABI words through NPU-supported int64 storage, without casting their bits."""
     values = np.asarray(words, dtype="<u8").view("<i8")
@@ -39,7 +44,9 @@ def rotation_spec(batch, history, resident, aics, windows):
         "count": ((1,), "int32"),
         "lru_slots": ((batch, 2048), "int32"),
         "reserved_hot": ((batch, resident), "int32"),
-        "changes": ((batch, 2048), "int32"),
+        "changes": ((batch, CHANGE_CAPACITY), "int32"),
+        "change_slots": ((batch, CHANGE_CAPACITY), "int32"),
+        "change_count": ((batch,), "int32"),
         "row_status": ((batch, 32), "int32"),
         "events": ((shape["intermediate_fetches"], shape["service_aivs_per_window"], 128), "uint8"),
         "fallback_addresses": ((batch, 8192), "int64"),
@@ -70,6 +77,8 @@ class UbmemWorkspace:
         tail_bytes = 4 * history * 2 + history * 8 + 8192 * 64 + 4 * 128
         self.prefix_storage = torch.zeros(batch * (prefix_bytes + tail_bytes), dtype=torch.uint8, device=device)
         self.prefix_reset = self.prefix_storage[: batch * (prefix_bytes + 4 * history * 2)]
+        self.index_plan = torch.zeros((batch, PLAN_WORDS), dtype=torch.int32, device=device)
+        self.index_work = torch.empty((batch, WORK_WORDS), dtype=torch.int32, device=device)
         self.scratch = {
             name: torch.zeros(size, dtype=getattr(torch, dtype), device=device)
             for name, (size, dtype) in rotation_spec(batch, history, resident, aics, windows).items()
@@ -85,6 +94,8 @@ class UbmemWorkspace:
             self.tail_bounds,
             self.compute,
             self.prefix_storage,
+            self.index_plan,
+            self.index_work,
             *self.scratch.values(),
         )
         return self.inputs.nbytes + sum(t.numel() * t.element_size() for t in tensors)

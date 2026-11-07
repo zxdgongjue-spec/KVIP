@@ -31,11 +31,11 @@ extern "C" uint32_t kvip_ubmem_forward(void* bindings,void* update,void* stream)
 }
 
 #define VALUE(name,value) extern "C" uint32_t name() {return value;}
-VALUE(kvip_ubmem_abi_version,1)
+VALUE(kvip_ubmem_abi_version,2)
 VALUE(kvip_ubmem_context_bytes,sizeof(rotating::Context))
 VALUE(kvip_ubmem_region_bytes,sizeof(rotating::UbmemRegion))
 VALUE(kvip_ubmem_status_bytes,rotating::kUbmemStatusWords*sizeof(uint64_t))
-VALUE(kvip_ubmem_plan_words,8+2*4096)
+VALUE(kvip_ubmem_plan_words,8+2*20480)
 VALUE(v9_abi_version,1)
 VALUE(v9_context_bytes,sizeof(rotating::Context))
 VALUE(v9_row_bytes,sizeof(rotating::Row))

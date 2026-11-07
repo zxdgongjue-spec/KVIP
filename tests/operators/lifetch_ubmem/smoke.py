@@ -59,7 +59,7 @@ def check_shape(kvaf, torch, build, device_id, shape, library):
         offsets = torch.arange(128, dtype=torch.int64, device=device) * token_bytes
         storage.addresses[1:].copy_((device_table.addresses.view(batch, blocks, 1) + offsets).reshape(batch, history))
         original_addresses = storage.addresses.cpu().numpy()
-        stride = resident + 8192
+        stride = resident
         output = torch.zeros((batch + 1, stride, token_bytes), dtype=torch.uint8, device=device)
         output[1:, :resident].copy_(source.view(batch, history, token_bytes)[:, :resident])
         # Match vLLM policy.bytes_outputs: KVAF registers one token per row.
@@ -114,6 +114,8 @@ def check_shape(kvaf, torch, build, device_id, shape, library):
             status=torch.zeros(batch, dtype=torch.int32, device=device),
             query_inputs=workspace.inputs,
             outputs=torch.empty((2, batch * 4, 1, 2048), dtype=torch.int32, device=device),
+            plan_buffer=workspace.index_plan,
+            extended_work=workspace.index_work,
         )
         forward = UbmemForward(rotating, update)
 
