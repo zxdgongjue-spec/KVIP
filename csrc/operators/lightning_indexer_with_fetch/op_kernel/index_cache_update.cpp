@@ -81,8 +81,21 @@ __aicore__ inline void DispatchUpdate(__gm__ uint64_t* args, uint32_t batch,
     Simt::VF_CALL<Update<WaitForFetch, true>>(Simt::Dim3{kThreads, 1, 1}, args, batch, owner, owned, work);
 }
 // Service output adaptation runs before Apply changes logical Index ownership.
-// Each block owns four TND output rows, independently of their packed owners.
-__simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PublishOutputs(__gm__ uint64_t* a, uint32_t b) {
+// Four TND rows per request; tiles are partitioned so several AIVs share one
+// request instead of one block walking all 8192 elements by itself.
+constexpr uint32_t kPublishTokens = 2048;
+
+struct OutputRange {
+  uint32_t begin, end;
+};
+
+__aicore__ inline OutputRange PartitionOutputs(uint32_t split, uint32_t part) {
+  constexpr uint32_t tiles = 4 * kPublishTokens / kThreads;
+  return {tiles * part / split * kThreads, tiles * (part + 1) / split * kThreads};
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PublishOutputs(__gm__ uint64_t* a, uint32_t b, uint32_t begin,
+                                                                   uint32_t end) {
   auto topk = reinterpret_cast<__gm__ int32_t*>(a[18]);
   auto slots = reinterpret_cast<__gm__ int32_t*>(a[19]);
   auto unpack = reinterpret_cast<__gm__ int64_t*>(a[20]);
@@ -91,17 +104,20 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PublishOutputs(__gm__ uint6
   auto slotsOut = reinterpret_cast<__gm__ int32_t*>(a[23]);
   auto owners = reinterpret_cast<__gm__ uint32_t*>(a[9]);
   auto logical = reinterpret_cast<__gm__ int64_t*>(a[3]);
-  for (uint32_t q = 0; q < 4; ++q) {
+  for (uint32_t q = begin / kPublishTokens; q * kPublishTokens < end; ++q) {
     uint32_t row = b * 4 + q;
+    const uint32_t base = q * kPublishTokens;
+    const uint32_t first = begin > base ? begin - base : 0;
+    const uint32_t last = end - base < kPublishTokens ? end - base : kPublishTokens;
     bool active = asc_ldcg(valid + row) != 0;
     uint64_t sourceRow = active ? asc_ldcg(unpack + row) : 0;
     uint64_t owner = active ? asc_ldcg(owners + sourceRow / 4) : 0;
-    for (uint32_t k = threadIdx.x; k < 2048; k += 512) {
-      int32_t token = active ? asc_ldcg(topk + sourceRow * 2048 + k) : -1;
+    for (uint32_t k = first + threadIdx.x; k < last; k += kThreads) {
+      int32_t token = active ? asc_ldcg(topk + sourceRow * kPublishTokens + k) : -1;
       int32_t id = token >= 0 ? static_cast<int32_t>(asc_ldcg(logical + owner * uint32_t(a[24]) + token)) : -1;
-      int32_t slot = active ? asc_ldcg(slots + sourceRow * 2048 + k) : -1;
-      asc_stcg(logicalOut + uint64_t(row) * 2048 + k, id);
-      asc_stcg(slotsOut + uint64_t(row) * 2048 + k, slot);
+      int32_t slot = active ? asc_ldcg(slots + sourceRow * kPublishTokens + k) : -1;
+      asc_stcg(logicalOut + uint64_t(row) * kPublishTokens + k, id);
+      asc_stcg(slotsOut + uint64_t(row) * kPublishTokens + k, slot);
     }
   }
 }
@@ -137,15 +153,20 @@ __aicore__ inline void Apply(GM_ADDR bindings) {
 }
 
 template <bool WaitForFetch>
-__aicore__ inline void UpdateOutputs(GM_ADDR bindings) {
+__aicore__ inline void UpdateOutputs(GM_ADDR bindings, uint32_t split) {
+  const uint32_t block = GetBlockIdx();
+  const uint32_t batch = block / split, part = block % split;
+  auto args = reinterpret_cast<__gm__ uint64_t*>(bindings);
+  auto owners = reinterpret_cast<__gm__ uint32_t*>(args[9]);
+  const auto range = PartitionOutputs(split, part);
+  Simt::VF_CALL<PublishOutputs>(Simt::Dim3{kThreads, 1, 1}, args, batch, range.begin, range.end);
+  if (part) return;
+  // Only the first share of each request plans; the others are publish-only,
+  // so the plan and the mapping run on different AIVs at the same time.
   TPipe pipe;
   TBuf<TPosition::VECCALC> scratch;
   pipe.InitBuffer(scratch, kExtendedScratchBytes);
   auto local = scratch.Get<uint32_t>();
-  auto args = reinterpret_cast<__gm__ uint64_t*>(bindings);
-  auto owners = reinterpret_cast<__gm__ uint32_t*>(args[9]);
-  uint32_t batch = GetBlockIdx();
-  Simt::VF_CALL<PublishOutputs>(Simt::Dim3{kThreads, 1, 1}, args, batch);
   DispatchUpdate<WaitForFetch>(args, batch, owners[batch], true,
                                    reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
 }
@@ -184,19 +205,19 @@ extern "C" __global__ __aicore__ void kvop_direct_update_owned_kernel(GM_ADDR bi
   }
 #endif
 }
-extern "C" __global__ __aicore__ void kvop_direct_update_outputs_kernel(GM_ADDR bindings) {
+extern "C" __global__ __aicore__ void kvop_direct_update_outputs_kernel(GM_ADDR bindings, uint32_t split) {
 #if defined(__CCE_AICORE__)
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
   if ASCEND_IS_AIV {
-    UpdateOutputs<true>(bindings);
+    UpdateOutputs<true>(bindings, split);
   }
 #endif
 }
-extern "C" __global__ __aicore__ void kvop_direct_update_outputs_early_kernel(GM_ADDR bindings) {
+extern "C" __global__ __aicore__ void kvop_direct_update_outputs_early_kernel(GM_ADDR bindings, uint32_t split) {
 #if defined(__CCE_AICORE__)
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
   if ASCEND_IS_AIV {
-    UpdateOutputs<false>(bindings);
+    UpdateOutputs<false>(bindings, split);
   }
 #endif
 }
