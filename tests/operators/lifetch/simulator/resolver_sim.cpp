@@ -35,7 +35,7 @@ int main(int argc,char** argv) {
   for(unsigned i=0;i<8192;++i)selected[i]=i<misses?r+i:r/2+i-misses;
   for(unsigned i=0;i<2048;++i){candidates[i]=slots[i]=i;reserved[i]=i;}
   for(unsigned i=0;i<512;++i){unsigned token=r+(i<256?i:10000+i);mapping[token]=r+i;changes[i]=token;}
-  bind(ctx.selected,selected);bind(ctx.mapping,mapping);bind(ctx.lruSlots,candidates);bind(ctx.reservedHot,reserved);
+  bind(ctx.args,std::vector<uint32_t>(workers*8192*16,0xdeadbeef));bind(ctx.selected,selected);bind(ctx.mapping,mapping);bind(ctx.lruSlots,candidates);bind(ctx.reservedHot,reserved);
   bind(ctx.changeSlots,slots);bind(ctx.changes,changes);bind(ctx.changeCount,std::vector<uint32_t>{2048});
   bind(ctx.hotValid,std::vector<uint32_t>(r,1));bind(ctx.locations,std::vector<uint32_t>(8192,UINT32_MAX));
   bind(ctx.sourceBlocks,std::vector<uint32_t>(8192));bind(ctx.sourceOffsets,std::vector<uint32_t>(8192));
@@ -52,6 +52,22 @@ int main(int argc,char** argv) {
   for(unsigned i=0;i<8192;++i)if(out[i]>=r || ownership[out[i]]!=selected[i])throw std::runtime_error("Final TopK hot ownership mismatch at "+std::to_string(i));
   auto descriptors=download<uint32_t>((void*)ctx.destinations,misses-256);auto remote=download<uint64_t>((void*)ctx.fallbackAddresses,misses-256);
   for(unsigned i=0;i<misses-256;++i)if(descriptors[i]>=r || remote[i]!=addresses[ownership[descriptors[i]]])throw std::runtime_error("Descriptor mismatch");
+  auto wqes=download<uint32_t>((void*)ctx.args,workers*8192*16);
+  unsigned bad=0;
+  for(unsigned w=0;w<workers;++w) {
+    unsigned start=(misses-256)*w/workers,end=(misses-256)*(w+1)/workers;
+    for(unsigned j=0;j<end-start;++j) {
+      auto p=&wqes[(w*8192+j)*16];
+      uint64_t src=uint64_t(p[10])|(uint64_t(p[11])<<32),dst=uint64_t(p[14])|(uint64_t(p[15])<<32);
+      uint32_t control=0x80000000U|(j+1==end-start?0x30360000U:0x30150000U);
+      uint64_t expectedDst=0x120080000000ULL+uint64_t(descriptors[start+j])*656;
+      if(src!=remote[start+j] || dst!=expectedDst || p[0]!=control || p[12]!=656 || p[13]!=0x789) {
+        if(bad++<10)std::printf("BAD worker=%u j=%u src=%llx expected=%llx dst=%llx expected=%llx control=%x expected=%x\n",w,j,(unsigned long long)src,(unsigned long long)remote[start+j],(unsigned long long)dst,(unsigned long long)expectedDst,p[0],control);
+      }
+    }
+  }
+  if(bad)throw std::runtime_error("WQE mismatch count="+std::to_string(bad));
+  std::printf("PASS all production FinalBuild WQE source/destination/control/length/token fields\n");
   auto count=download<uint32_t>((void*)ctx.changeCount,1)[0];
   if(count>capacity || count<2048)throw std::runtime_error("Record bound error");
   std::printf("PASS production resolver: workers=%u final_union=8192 misses=%u prefetch=512 final_reads=%u records=%zu bound=%u; all final KV use persistent hot; descriptors/records/protection checked\n",workers,misses,misses-256,written.size(),count);
