@@ -8,6 +8,7 @@
 #include "simt_api/device_sync_functions.h"
 #include "simt_api/device_warp_functions.h"
 #include "context.h"
+#include "../../common/lifetch/prefetch_budget.h"
 
 // Imported from direct_slots.h
 
@@ -832,10 +833,8 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         uint32_t count=0,missing=0;
         if(candidateCount) {
             auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;
-            uint32_t available=ctx->windowLimit;
-            uint32_t room=slots<state.GetValue(208)?state.GetValue(208)-slots:0;if(available>room)available=room;
-            room=requests<state.GetValue(209)?state.GetValue(209)-requests:0;if(available>room)available=room;
-            room=requests<state.GetValue(210)?state.GetValue(210)-requests:0;if(available>room)available=room;
+            uint32_t available=PrefetchAllowance(slots,requests,state.GetValue(208),
+                state.GetValue(209),state.GetValue(210),ctx->windowLimit);
             if(!slots && !ctx->tailBounds) {
                 // No slot has ever been assigned: the OR bitmap already
                 // deduplicated tokens, so every candidate is a new miss.

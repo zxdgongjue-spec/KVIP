@@ -11,10 +11,24 @@ from kvip.operators.lifetch.forward import LIFetchForward
 
 
 class VllmIndexSelector:
-    def __init__(self, torch, *, inputs, rotating, update, logical_ids, row_owners, prefix_workspace, storage=None):
+    def __init__(
+        self,
+        torch,
+        *,
+        inputs,
+        rotating,
+        update,
+        logical_ids,
+        row_owners,
+        prefix_workspace,
+        storage=None,
+        forward_factory=LIFetchForward,
+        unique_active_owners=False,
+    ):
         self.torch = torch
         self.inputs, self.rotating, self.update = inputs, rotating, update
-        self.forward = LIFetchForward(rotating, update)
+        self.forward = forward_factory(rotating, update)
+        self.unique_active_owners = unique_active_owners
         self.logical_ids, self.row_owners = logical_ids, row_owners
         self.prefix_workspace = prefix_workspace
         self.storage, self.positions = storage, None
@@ -41,6 +55,10 @@ class VllmIndexSelector:
         """CPU request layout, once per forward; no device readback."""
         self.plans = tuple(plans)
         self.decodes = tuple(p for p in self.plans if p.decode)
+        if self.unique_active_owners:
+            owners = [p.owner for p in self.decodes if p.stop > p.begin]
+            if len(owners) != len(set(owners)):
+                raise ValueError("UBmem active decode rows must have distinct stable owners")
         if self.storage is not None:
             self.storage.prepare(self.plans)
         if prepare_inputs:

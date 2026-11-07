@@ -1,15 +1,26 @@
 #!/usr/bin/env bash
 _kvip_env() {
-    local root dependency vendor
+    local root dependency vendor selection transport
     root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-    dependency="$(python3 - "$root" <<'PY'
+    selection="$(python3 - "$root" <<'PY'
 import json,sys
 from pathlib import Path
 root = Path(sys.argv[1]); state = root / 'build/dependencies.json'
-print(json.loads(state.read_text())['kvaf'] if state.is_file() else root / 'third_party/KVAF')
+data = json.loads(state.read_text()) if state.is_file() else {}
+print(data.get('kvaf_build_dir', str(Path(data.get('kvaf', root / 'third_party/KVAF')) / 'build-npu')))
+print(data.get('transport', 'urma'))
 PY
 )" || return 1
-    export PYTHONPATH="$root/python:$dependency/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
+    dependency="${selection%$'\n'*}"
+    transport="${selection##*$'\n'}"
+    export PYTHONPATH="$root/python:$dependency/python${PYTHONPATH:+:$PYTHONPATH}"
+    if [[ "$transport" == ubmem ]]; then
+        export KVAF_BATCH_GET_KERNEL="$dependency/bin/kvaf_ubmem_batch_get.o"
+        export KVAF_BATCH_PUT_KERNEL="$dependency/bin/kvaf_ubmem_batch_put.o"
+    else
+        export KVAF_BATCH_GET_KERNEL="$dependency/bin/kvaf_execute_batch_get_kernels.o"
+        export KVAF_BATCH_PUT_KERNEL="$dependency/bin/kvaf_execute_batch_put_kernels.o"
+    fi
     local libraries=("$root"/csrc/operators/lidu/_custom_opp/vendors/*/op_api/lib/libcust_opapi.so)
     if [[ "${#libraries[@]}" != 1 || ! -f "${libraries[0]}" ]]; then
         echo "Build KVIP first: bash $root/scripts/build.sh" >&2

@@ -1,0 +1,87 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Shared speculative limits and cache invalidation for hot-slot algorithms."""
+
+import inspect
+import random
+import shutil
+import subprocess
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from kvip.operators.lifetch.binding import LIFetchBinding
+from kvip.operators.lifetch.geometry import prefetch_budget
+from kvip.operators.lifetch_ubmem import specialization
+from kvip.operators.lifetch_ubmem.binding import UbmemBinding
+
+
+def test_binding_defaults_and_budget_boundaries():
+    for binding in (LIFetchBinding, UbmemBinding):
+        params = inspect.signature(binding).parameters
+        assert prefetch_budget(params["prefetch_limit"].default, params["window_limit"].default, 8) == (512, 64)
+    assert prefetch_budget(0, None, 8) == (0, 1)
+    assert prefetch_budget(2048, None, 8) == (2048, 256)
+    for total, window, rounds in ((2049, 64, 8), (-1, 64, 8), (512, 481, 8), (512, 0, 8), (512, None, 0)):
+        with pytest.raises(ValueError):
+            prefetch_budget(total, window, rounds)
+
+
+def test_device_budget_saturates_without_unsigned_wrap(tmp_path):
+    compiler = shutil.which("c++")
+    if not compiler:
+        pytest.skip("C++ unavailable")
+    root = Path(__file__).resolve().parents[3]
+    source = tmp_path / "budget.cpp"
+    source.write_text(
+        '#include <iostream>\n#define __aicore__\n#include "prefetch_budget.h"\n'
+        "int main() { unsigned s,r,sl,pl,tl,w; while(std::cin>>s>>r>>sl>>pl>>tl>>w) "
+        'std::cout<<rotating::PrefetchAllowance(s,r,sl,pl,tl,w)<<"\\n"; }\n'
+    )
+    binary = tmp_path / "budget"
+    subprocess.run(
+        [compiler, "-std=c++17", str(source), "-I" + str(root / "csrc/operators/common/lifetch"), "-o", str(binary)],
+        check=True,
+        capture_output=True,
+    )
+    cases = [(0, 0, 8192, 0, 2048, 1), (8192, 0, 8192, 512, 2048, 64), (0, 512, 8192, 512, 2048, 64)]
+    rng = random.Random(17)
+    cases.extend(tuple(rng.randrange(10000) for _ in range(6)) for _ in range(1000))
+    data = "".join(" ".join(map(str, case)) + "\n" for case in cases)
+    result = subprocess.run([str(binary)], input=data, text=True, capture_output=True, check=True)
+    expected = [min(w, max(0, sl - s), max(0, pl - r), max(0, tl - r)) for s, r, sl, pl, tl, w in cases]
+    assert list(map(int, result.stdout.split())) == expected
+
+
+def test_shared_hot_selector_invalidates_specialization_cache(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    module = repo / "python/kvip/operators/lifetch_ubmem/specialization.py"
+    module.parent.mkdir(parents=True)
+    module.touch()
+    source = repo / "csrc/operators/lightning_indexer_with_fetch_ubmem"
+    source.mkdir(parents=True)
+    (source / "CMakeLists.txt").write_text("# fixture\n")
+    selector = source.parent / "lidu/op_kernel/hot_slot_selection.h"
+    selector.parent.mkdir(parents=True)
+    selector.write_text("// first algorithm\n")
+    monkeypatch.setattr(specialization, "__file__", str(module))
+    calls = []
+
+    def compile_fixture(command, **kwargs):
+        calls.append(command)
+        if command[1] == "--build":
+            (Path(command[2]) / "libkvip_lifetch_ubmem.so").write_bytes(b"fixture")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(specialization.subprocess, "run", compile_fixture)
+    options = dict(
+        cache_dir=tmp_path / "cache",
+        cann=tmp_path / "cann",
+        shape=specialization.Specialization(2, 33024, 8192, 64, 656, 32, 8, "Ascend950DT_9582"),
+    )
+    old = specialization.build_specialization(**options)
+    assert specialization.build_specialization(**options) == old
+    assert len(calls) == 2
+    selector.write_text("// changed hot-slot algorithm\n")
+    new = specialization.build_specialization(**options)
+    assert new != old and len(calls) == 4

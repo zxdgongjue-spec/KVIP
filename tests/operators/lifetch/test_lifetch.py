@@ -397,10 +397,21 @@ def test_load_bridge_without_rpath(tmp_path):
 
 
 def test_hot_resolver_actual_function_on_empty_and_populated_cache(tmp_path):
+    _check_hot_resolver(tmp_path, "urma")
+
+
+def test_ubmem_hot_resolver_actual_function_on_empty_and_populated_cache(tmp_path):
+    _check_hot_resolver(tmp_path, "ubmem")
+
+
+def _check_hot_resolver(tmp_path, transport):
     """Execute production SIMT logic serially; CANN simulator covers barriers."""
     import subprocess
 
-    kernel = ROOT / "csrc/operators/lightning_indexer_with_fetch/op_kernel"
+    operator = "lightning_indexer_with_fetch" + ("_ubmem" if transport == "ubmem" else "")
+    kernel = ROOT / "csrc/operators" / operator / "op_kernel"
+    metadata = kernel / ("resolver/direct_slots.h" if transport == "ubmem" else "prefetch.h")
+    resolver = kernel / ("resolver/resolver.h" if transport == "ubmem" else "resolver.h")
 
     def function(path, name):
         text = path.read_text()
@@ -414,11 +425,14 @@ def test_hot_resolver_actual_function_on_empty_and_populated_cache(tmp_path):
         return text[begin:end]
 
     functions = "\n".join(
-        function(kernel / "prefetch.h", name)
+        function(metadata, name)
         for name in ("OwnerRow", "OutputStride", "StoreFallbackSource", "ResolvePhysicalSlot", "InitializeTailMappings")
     )
-    functions += "\n" + function(kernel / "resolver.h", "SparseHash")
-    functions += "\ntemplate<unsigned Threads>\n" + function(kernel / "resolver.h", "ReplicatedResolve")
+    functions += "\n" + function(resolver, "SparseHash")
+    functions += "\ntemplate<unsigned Threads>\n" + function(
+        ROOT / "csrc/operators/common/lifetch/resident_selection.h", "ResolveResidentPlan"
+    )
+    functions += "\ntemplate<unsigned Threads>\n" + function(resolver, "ReplicatedResolve")
     source = r"""
 #include <cstdint>
 #include <vector>
@@ -451,7 +465,7 @@ void asc_syncthreads(){} void asc_threadfence(){}
 FUNCTIONS
 int main(){
  std::mt19937 rng(71);
- for(unsigned trial=0;trial<24;++trial){
+ for(unsigned trial=0;trial<27;++trial){
   const unsigned h=32768,r=trial%2?16384:8192,workers=4,used=trial%3?512:0;
   std::vector<unsigned> candidates(r);std::iota(candidates.begin(),candidates.end(),0);
   std::shuffle(candidates.begin(),candidates.end(),rng);candidates.resize(2048);
@@ -467,6 +481,10 @@ int main(){
   if(trial%5==0)for(unsigned i=6144;i<8192;++i)selected[i]=UINT32_MAX;
   if(abc){for(unsigned i=0;i<384;++i)map[h-384+i]=r+8192+i;
    for(unsigned i=0;i<8;++i)selected[i]=h-384+i;}
+  if(trial==24)for(unsigned i=0;i<8192;++i)selected[i]=r+i; // Maximum Q4 union, no prefetch.
+  if(trial==25)for(unsigned i=0;i<8192;++i)selected[i]=r+i%used; // All prefetch hits.
+  if(trial==26){std::vector<unsigned> hot;for(unsigned i=0;i<r;++i)if(reserved[i]<0)hot.push_back(i);
+   for(unsigned i=0;i<8192;++i)selected[i]=hot[i%hot.size()];} // All untouched hot hits.
   std::vector<uint64_t> addresses(h),remote(8192);std::iota(addresses.begin(),addresses.end(),100000);
   std::vector<int32_t> blocks(8192),offsets(8192),destinations(8192);
   Context ctx{};unsigned changeCount=2048,total=0;
@@ -505,6 +523,29 @@ int main(){
  }
 }
 """.replace("FUNCTIONS", functions)
+    definitions = []
+    if transport == "ubmem":
+        definitions = [
+            "-D" + value
+            for value in (
+                "SIM_BATCH=1",
+                "SIM_HISTORY=32768",
+                "SIM_RESIDENT=16384",
+                "TOKEN_BYTES=656",
+                "V9_UBPIPE_DEPTH=8",
+                "V9_UBPIPE_ROWS=4",
+                "V9_DEDICATED_SERVICE=0",
+                "V9_SPLIT_Q=1",
+                "V9_AIC_COUNT=32",
+                "V9_INTERMEDIATE_FETCHES=2",
+                "V9_FINAL_REPLICATED=1",
+            )
+        ]
+        source = source.replace("r=trial%2?16384:8192", "r=SIM_RESIDENT")
+        source = source.replace("ReplicatedResolve<1>(h,r,workers,656,", "ReplicatedResolve<1>(")
+        begin = source.index("   assert(cfg[5]<=cfg[3]);")
+        end = source.index("   std::copy(locations.begin()", begin)
+        source = source[:begin] + source[end:]
     (tmp_path / "batch_get_abi.h").write_text("")
     cpp, exe = tmp_path / "resolver.cpp", tmp_path / "resolver"
     cpp.write_text(source)
@@ -513,6 +554,7 @@ int main(){
             "c++",
             "-std=c++17",
             "-O2",
+            *definitions,
             str(cpp),
             "-I" + str(tmp_path),
             "-I" + str(kernel.parent / "include"),
