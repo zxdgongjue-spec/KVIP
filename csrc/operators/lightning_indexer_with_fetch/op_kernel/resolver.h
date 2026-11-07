@@ -55,76 +55,12 @@ __aicore__ inline __ubuf__ uint32_t* FinalPtr(LocalTensor<uint32_t> x) {return r
 __aicore__ inline __gm__ FinalPost* FinalPostAt(uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t core) {
     return reinterpret_cast<__gm__ FinalPost*>(ctx->owners+rt_finalPostOffset)+core;
 }
-__aicore__ inline void PublishFinalWorker(uint32_t rt_batch,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,uint32_t rt_tokenBytes,__gm__ Context* ctx,__gm__ Row* row,
-    uint32_t b,uint32_t w,uint32_t own,uint32_t batchCount,uint32_t descriptor,uint32_t error,
-    LocalTensor<uint32_t> local,LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,
-    LocalTensor<uint32_t> slots,LocalTensor<uint32_t> ctl,bool reusePrefetch=false) {
-    auto args=reinterpret_cast<__gm__ KvafExecuteBatchGetKernelArgs*>(ctx->args)+FinalQueue(rt_batch,rt_finalWorkers,b,w);
+// Resolver publishes compact ranges only. KVAF owns all final transport work.
+__aicore__ inline void PrepareFinalFetch(uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,
+    __gm__ Context* ctx,uint32_t b,uint32_t w,uint32_t count,uint32_t descriptor,uint32_t error) {
     auto post=FinalPostAt(rt_finalPostOffset,ctx,b*rt_finalWorkers+w);
-    auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args->queue_state);
-    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
-    auto cfg=ctl[1024],meta=ctl[1280],queueLocal=ctl[1344];
-    GlobalTensor<uint32_t> entityGm,queueGm;
-    entityGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(args->channel_entity));
-    queueGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(args->queue_state));
-    DataCopy(meta,entityGm,48);DataCopy(queueLocal,queueGm,16);
-    SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-    auto meta64=meta.ReinterpretCast<uint64_t>(),queue64=queueLocal.ReinterpretCast<uint64_t>();
-    uint64_t head=queue64.GetValue(1),doorbell=meta64.GetValue(8);uint32_t depth=meta.GetValue(19);
-    if(depth<2 || (depth&(depth-1)) || !meta64.GetValue(7) || !doorbell ||
-       head>UINT64_MAX-own || queue64.GetValue(4))error|=64;
-#if !V9_SIMULATION
-    if(queueLocal.GetValue(1) && queueLocal.GetValue(0)!=kvaf_device::kQueueMagic)error|=64;
-#endif
-    // Recycling a speculative slot must not race its still-in-flight prefetch.
-    bool deferred=own && (reusePrefetch || row->slots+batchCount>kSlots || own>=depth);
-    bool submit=own && !deferred && !error;
-    if(submit){
-#if !V9_SIMULATION
-        if(!queueLocal.GetValue(1)) {
-            queue->magic=kvaf_device::kQueueMagic;queue->initialized=1;
-        }
-#endif
-        cfg.SetValue(1,6U<<8);cfg.SetValue(2,(meta.GetValue(20)&0xffffffU)|0x1000000U);cfg.SetValue(3,meta.GetValue(6)&0xfffffU);
-        for(uint32_t j=0;j<4;++j)cfg.SetValue(4+j,meta.GetValue(22+j));
-        cfg.SetValue(8,meta.GetValue(7));cfg.SetValue(9,0);cfg.SetValue(12,rt_tokenBytes);cfg.SetValue(13,meta.GetValue(12));
-        cfg.SetValue(14,uint32_t(row->output));cfg.SetValue(15,uint32_t(row->output>>32));cfg.SetValue(16,uint32_t(head));cfg.SetValue(17,depth);
-        SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
-        // Use KVAF's native SQ copy and scalar commit protocol. Keep the
-        // resolver's WQE encoder, but notify each native-sized post rather
-        // than maintaining a second bulk-copy/doorbell implementation.
-        kvaf_device::ConfigureUbToGmCopy();
-        for(uint32_t begin=0;begin<own;begin+=kvaf_device::kWqesPerPost){
-            uint32_t n=own-begin<kvaf_device::kWqesPerPost?own-begin:kvaf_device::kWqesPerPost;
-            FinalBuild(rt_tokenBytes,FinalPtr(remoteLow),FinalPtr(remoteHigh),FinalPtr(slots),FinalPtr(local),FinalPtr(cfg),begin,n,own);
-            SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-            uint32_t start=uint32_t(head+begin)&(depth-1),first=n<depth-start?n:depth-start;
-            kvaf_device::CopyUbToGm(
-                reinterpret_cast<__gm__ void*>(meta64.GetValue(7)+uint64_t(start)*64),
-                reinterpret_cast<__ubuf__ void*>(local.GetPhyAddr()),uint64_t(first)*64);
-            if(first<n)kvaf_device::CopyUbToGm(
-                reinterpret_cast<__gm__ void*>(meta64.GetValue(7)),
-                reinterpret_cast<__ubuf__ void*>(local[first*16].GetPhyAddr()),uint64_t(n-first)*64);
-            SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
-#if V9_SIMULATION
-            WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
-            queue->sq_producer_index=head+begin+n;
-            *reinterpret_cast<__gm__ uint64_t*>(doorbell)=head+begin+n;
-            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(doorbell),64);
-#else
-            kvaf_device::PendingPost pending{};
-            pending.next_head=head+begin+n;
-            pending.sq_db_address=doorbell;
-            pending.queue_state_address=args->queue_state;
-            pending.event_id=0;
-            kvaf_device::CommitPostScalarStage(&pending);
-#endif
-            SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
-        }
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
-    }
-    post->count=own;post->pending=submit;post->error=error;post->deferred=deferred;
-    post->descriptor=descriptor;post->head=head;
+    post->count=count;post->pending=0;post->error=error;
+    post->deferred=count && !error;post->descriptor=descriptor;post->head=0;
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
 }
 }
@@ -298,12 +234,6 @@ inline void ReplicatedResolve(uint32_t rt_history,uint32_t rt_resident,uint32_t 
     // overwritten by final repair are replaced, not duplicated in the plan.
     auto changeSlots=reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+batch*kChangeCapacity;
     auto changes=reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+batch*kChangeCapacity;
-    for(uint32_t i=tid;i<count;i+=Threads) {
-        uint32_t slot=slots[i];
-        int32_t ordinal=asc_ldcg(reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+batch*rt_resident+slot);
-        if(ordinal>=0 && uint32_t(ordinal)<used)asc_atomic_or(cfg+5,1U);
-    }
-    asc_syncthreads();
     for(uint32_t i=tid;i<ownEnd-ownBegin;i+=Threads) {
         uint32_t rank=ownBegin+i,token=selected[ids[rank]],slot=slots[rank],dst=batch*kSlots+rank;
         uint64_t remote=asc_ldcg(addresses+token);keys[i]=uint32_t(remote);ranks[i]=uint32_t(remote>>32);positions[i]=slot;
@@ -381,7 +311,7 @@ __aicore__ inline void ReplicatedFinal(uint32_t rt_batch,uint32_t rt_history,uin
     DataCopy(output[w*(kSlots/rt_finalWorkers)],loc[w*(kSlots/rt_finalWorkers)],kSlots/rt_finalWorkers);
     SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
     if(!w)trace[2]=GetSystemCycle();
-    PublishFinalWorker(rt_batch,rt_finalWorkers,rt_finalPostOffset,rt_tokenBytes,ctx,row,b,w,own,batchCount,batchBase+prefix,error,local,keys,ranks,positions,ctl,ctl.GetValue(5)!=0);
+    PrepareFinalFetch(rt_finalWorkers,rt_finalPostOffset,ctx,b,w,own,batchBase+prefix,error);
     if(!w){
         status[0]=error;status[1]=batchCount;status[2]=batchBase;status[3]=0;status[4]=0;
         row->finalBegin=started;row->finalRequests=batchCount;row->finalHead=FinalPostAt(rt_finalPostOffset,ctx,core)->head;

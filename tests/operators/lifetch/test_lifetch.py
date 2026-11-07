@@ -701,3 +701,49 @@ def test_destination_overlap_audit_checks_cross_queue_byte_ranges():
     audit = destination_overlaps(raw)
     assert audit["final_final"] == 1  # Cross-request alias.
     assert audit["prefetch_snapshot_present"]
+
+
+def test_final_fetch_uses_native_explicit_range_without_direct_submission():
+    from pathlib import Path
+    import subprocess
+    import tempfile
+
+    root = Path(__file__).resolve().parents[3] / "csrc/operators/lightning_indexer_with_fetch/op_kernel"
+    resolver = (root / "resolver.h").read_text()
+    lifecycle = (root / "lifecycle.cpp").read_text()
+    assert "PublishFinalWorker" not in resolver
+    assert "CommitPostScalarStage" not in resolver
+    finish = lifecycle[lifecycle.index("__aicore__ inline void FinishFetch") :]
+    assert finish.index("CompletePrefetch(ctx,b)") < finish.index("kvaf_device::KvafBatchGetDevice(")
+    assert "kvaf_device::KvafBatchGetDevice(workerArgs,0,post->descriptor,post->count)" in finish
+    assert "DrainQueue(" not in finish
+    # Execute the production descriptor publisher: it must never mark an SQ post
+    # pending, even for nonempty or oversized ranges; native KVAF schedules them.
+    start = resolver.index("__aicore__ inline void PrepareFinalFetch")
+    function = resolver[start : resolver.index("\n}\n", start) + 2]
+    program = (
+        """#include <cstdint>
+#include <cassert>
+#define __aicore__
+#define __gm__
+struct FinalPost { uint32_t count,pending,error,deferred,descriptor; uint64_t head; };
+struct Context { FinalPost posts[8]; };
+FinalPost* FinalPostAt(uint32_t,Context* c,uint32_t i) { return c->posts+i; }
+namespace kvaf_device { void CleanCacheLines(uint8_t*,unsigned long) {} }
+"""
+        + function
+        + """
+int main() { Context c{};
+ for(uint32_t n: {0U,608U,8192U}) {
+  PrepareFinalFetch(4,0,&c,1,2,n,123,0);
+  auto p=c.posts[6]; assert(p.count==n && p.descriptor==123 && p.pending==0 && p.deferred==(n!=0));
+ }
+ PrepareFinalFetch(4,0,&c,1,2,608,123,4); assert(c.posts[6].error==4 && !c.posts[6].deferred);
+}
+"""
+    )
+    with tempfile.TemporaryDirectory() as folder:
+        source = Path(folder) / "test.cpp"
+        source.write_text("#include <initializer_list>\n" + program)
+        subprocess.run(["c++", "-std=c++17", str(source), "-o", folder + "/test"], check=True)
+        subprocess.run([folder + "/test"], check=True)

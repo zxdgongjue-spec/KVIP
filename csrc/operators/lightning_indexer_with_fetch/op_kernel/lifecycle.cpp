@@ -280,8 +280,8 @@ extern "C" __global__ __aicore__ void v9_resolve_kernel(GM_ADDR bindings) {
     }
 #endif
 }
-// Completion is a separate launch: final resolver + complete SIMD WQE/SQ/post
-// can be timed without CQ latency. Small queues retain KVAF's bounded fallback.
+// Final transport consumes compact resolver ranges through native KVAF.
+// Complete prefetch first so reclaimed hot destinations cannot race earlier READs.
 #if defined(__CCE_AICORE__)
 __aicore__ inline void FinishFetch(GM_ADDR bindings, GM_ADDR update) {
     auto runtimeShape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(reinterpret_cast<__gm__ uint64_t*>(bindings)[14]));
@@ -318,7 +318,6 @@ __aicore__ inline void FinishFetch(GM_ADDR bindings, GM_ADDR update) {
         auto post=FinalPostAt(rt_finalPostOffset,ctx,b*rt_finalWorkers+w);
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
         auto workerArgs=GetArgs(ctx,FinalQueue(rt_batch,rt_finalWorkers,b,w));
-        auto entity=reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(workerArgs.channel_entity);
         auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(workerArgs.queue_state);
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
         total+=post->count;error|=post->error;
@@ -344,17 +343,6 @@ __aicore__ inline void FinishFetch(GM_ADDR bindings, GM_ADDR update) {
             }
 #else
             error|=kvaf_device::kInvalidArgs; // DMA fallback needs real hardware.
-#endif
-        }
-        if(post->pending){
-#if !V9_SIMULATION
-            auto drained=DrainQueue(entity,queue,post->pending);
-            uint64_t waitError=drained.error;
-            error|=waitError;
-            completed+=drained.completed;
-            if(!waitError){post->pending=0;}
-#else
-            post->pending=0;++completed;
 #endif
         }
         lastHead=queue->sq_producer_index;lastCq=queue->cq_consumer_index;

@@ -26,15 +26,3 @@ if(KVAF_INCLUDE)
   target_link_libraries(resolver_sim PRIVATE resolver_kernel host_intf_pub ascendcl)
   target_link_options(resolver_sim PRIVATE -Wl,--allow-shlib-undefined)
 endif()
-
-if(KVAF_INCLUDE)
-  ascendc_library(transport_kernel STATIC transport_kernel.cpp)
-  ascendc_include_directories(transport_kernel PRIVATE ${OP_ROOT}/include ${OP_ROOT}/op_kernel ${KVAF_INCLUDE}
-    ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)
-  ascendc_compile_options(transport_kernel PRIVATE -O2 --cce-auto-sync=off -mllvm -user-reserved-ub-size=223232
-    -DV9_USER_UB_BYTES=223232 -DV9_SIMULATION=0 -DV9_BATCH_POST=2 -DSIM_CAPTURE_HITS=1)
-  add_executable(transport_sim transport_sim.cpp)
-  target_include_directories(transport_sim PRIVATE ${OP_ROOT}/include ${KVAF_INCLUDE})
-  target_link_libraries(transport_sim PRIVATE transport_kernel host_intf_pub ascendcl)
-  target_link_options(transport_sim PRIVATE -Wl,--allow-shlib-undefined)
-endif()
