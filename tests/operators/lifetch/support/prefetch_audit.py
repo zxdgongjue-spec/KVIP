@@ -89,6 +89,44 @@ def audit_wqes(wqes, entity, head, remote, destinations, token_bytes):
     )
 
 
+def destination_overlaps(raw):
+    """Check actual WQE destination byte intervals, including partial overlaps."""
+    spans = []
+    for key, words in raw.items():
+        if not key.endswith("_sq"):
+            continue
+        phase = "prefetch" if "_prefetch_" in key else "final"
+        for index, wqe in enumerate(words):
+            start = int(wqe[14]) | (int(wqe[15]) << 32)
+            size = int(wqe[12])
+            if size:
+                spans.append((start, start + size, phase, key, index))
+    counts = {"final_final": 0, "prefetch_prefetch": 0, "prefetch_final": 0}
+    examples, active = [], []
+    for span in sorted(spans):
+        active = [prior for prior in active if prior[1] > span[0]]
+        for prior in active:
+            kind = span[2] + "_" + span[2] if prior[2] == span[2] else "prefetch_final"
+            counts[kind] += 1
+            if len(examples) < 5:
+                examples.append(
+                    dict(
+                        kind=kind,
+                        first=[prior[3], prior[4]],
+                        second=[span[3], span[4]],
+                        start=hex(span[0]),
+                        end=hex(min(span[1], prior[1])),
+                    )
+                )
+        active.append(span)
+    return dict(
+        **counts,
+        wqes=len(spans),
+        examples=examples,
+        prefetch_snapshot_present=any("_prefetch_sq" in key for key in raw),
+    )
+
+
 def snapshot_failed_transport(owner, rotating, posts, failures, folder):
     """Read failed queues after device execution; never consume CQ or retry DMA.
 
@@ -119,8 +157,28 @@ def snapshot_failed_transport(owner, rotating, posts, failures, folder):
     destinations = rotating.destinations.cpu().numpy().reshape(-1)
     raw, queues = {}, []
     batch, workers = posts.shape[:2]
+    rows = rotating.rows.cpu().numpy() if hasattr(rotating, "rows") else None
     for failure in failures:
         b = failure["request"]
+        if rows is not None:
+            # The prefetch queue is exclusive to this request. Its current-round
+            # WQEs are the last row.requests entries, even after CQ consumption.
+            entity = read(int(contexts[b * 2, 8]), 192).view("<u4")
+            meta = entity.view("<u8")
+            queue = read(int(contexts[b * 2, 9]), 64).view("<u8")
+            count, depth, producer = int(rows[b, 9]), int(entity[19]), int(queue[1])
+            if not 0 <= count < depth or producer < count:
+                raise ValueError("Prefetch SQ history unavailable or overwritten")
+            start = (producer - count) % depth
+            first = min(count, depth - start)
+            pieces = []
+            if first:
+                pieces.append(read(int(meta[7]) + start * 64, first * 64))
+            if first < count:
+                pieces.append(read(int(meta[7]), (count - first) * 64))
+            raw[f"b{b}_prefetch_sq"] = (
+                np.concatenate(pieces).view("<u4").reshape(count, 16) if pieces else np.empty((0, 16), dtype="<u4")
+            )
         for worker, post in enumerate(posts[b]):
             count, pending, error, deferred, descriptor = map(int, post[:5])
             if not count or deferred or error:
@@ -168,6 +226,7 @@ def snapshot_failed_transport(owner, rotating, posts, failures, folder):
     np.savez(folder / "transport_snapshot.npz", **raw)
     return dict(
         queues=queues,
+        destination_overlaps=destination_overlaps(raw),
         checked=sum(q["checked"] for q in queues),
         mismatched_wqes=sum(q["mismatched_wqes"] for q in queues),
         source_out_of_range=sum(q["source_out_of_range"] for q in queues),
@@ -197,6 +256,10 @@ def summarize_saved_transport(folder):
         fields.setdefault(name, []).append(int(value))
 
     with np.load(folder / "transport_snapshot.npz", allow_pickle=False) as raw:
+        overlaps = destination_overlaps(raw)
+        lines.append("WQE destination overlaps: " + json.dumps(overlaps))
+        if not overlaps["prefetch_snapshot_present"]:
+            lines.append("prefetch/final intersection UNKNOWN: old snapshot contains no prefetch SQ")
         for q in queues:
             key = f"b{q['request']}_w{q['worker']}"
             entity = raw[key + "_entity"].astype("<u4", copy=False)

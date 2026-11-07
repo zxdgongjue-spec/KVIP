@@ -639,6 +639,16 @@ def test_transport_snapshot_uses_device_launcher(tmp_path):
     assert result["checked"] == 2 and result["queue_count"] == 1
     assert (tmp_path / "transport_snapshot.npz").is_file()
 
+    # Repeat with current-round prefetch history straddling the ring boundary.
+    args[0] = args[1]
+    queue[1] = 5
+    rows = np.zeros((1, 256), dtype=np.uint64)
+    rows[0, 9] = 2
+    rotating.rows = Tensor(rows)
+    snapshot_failed_transport(SimpleNamespace(device_args=Tensor(args)), rotating, posts, [{"request": 0}], tmp_path)
+    with np.load(tmp_path / "transport_snapshot.npz") as raw:
+        assert raw["b0_prefetch_sq"].shape == (2, 16)
+
 
 def test_saved_transport_summary_detects_aliases_and_completed_queues(tmp_path):
     import json
@@ -666,3 +676,28 @@ def test_saved_transport_summary_detects_aliases_and_completed_queues(tmp_path):
     assert "SQ_depth: {32768: 2}" in summary
     assert "SQ: unique_base=1 overlapping_pairs=1 unique_doorbell=1" in summary
     assert "CQ: unique_base=1 overlapping_pairs=1 unique_doorbell=1" in summary
+
+
+def test_destination_overlap_audit_checks_cross_queue_byte_ranges():
+    import numpy as np
+    from prefetch_audit import destination_overlaps
+
+    def wqes(addresses):
+        data = np.zeros((len(addresses), 16), dtype=np.uint32)
+        data[:, 12] = 656
+        for i, address in enumerate(addresses):
+            data[i, 14], data[i, 15] = address & 0xFFFFFFFF, address >> 32
+        return data
+
+    base = 0x120000000000
+    raw = {"b0_w0_sq": wqes([base, base + 656]), "b1_w0_sq": wqes([base + 1312])}
+    audit = destination_overlaps(raw)
+    assert audit["final_final"] == 0
+    assert not audit["prefetch_snapshot_present"]
+    raw["b0_prefetch_sq"] = wqes([base + 650])
+    audit = destination_overlaps(raw)
+    assert audit["prefetch_final"] == 2  # Partial overlap with two adjacent slots.
+    raw["b2_w0_sq"] = wqes([base])
+    audit = destination_overlaps(raw)
+    assert audit["final_final"] == 1  # Cross-request alias.
+    assert audit["prefetch_snapshot_present"]
