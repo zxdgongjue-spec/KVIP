@@ -424,8 +424,26 @@ def run_device(
                 f"completion failed phase={phase}; bad_requests={len(failures)}; "
                 f"transport={json.dumps(brief)}; first={json.dumps(failures[0])}; full={path}"
             )
+        if not updated:
+            destinations = rotating.destinations.cpu().numpy().reshape(-1)
+            lru_slots = rotating.lru_slots.cpu().numpy()
+            for row_index in range(b):
+                # Compare physical hot slots, independent of resolver's inverse map.
+                used_slots = set(lru_slots[row_index, : int(rows[row_index, 8])].tolist())
+                for post in posts[row_index]:
+                    count, start, safe = int(post[0]), int(post[4]), int(post[5])
+                    if safe > count:
+                        raise AssertionError("Invalid nonconflicting descriptor count")
+                    for index, destination in enumerate(destinations[start : start + count]):
+                        slot = int(destination) % owner.output.shape[1]
+                        if (slot in used_slots) != (index >= safe):
+                            raise AssertionError(
+                                f"Final split mismatch: request={row_index} descriptor={start + index}"
+                            )
         state["completion"] = dict(
             final_reads=int(statuses[:, 1].astype(np.uint64).sum()),
+            nonconflicting_reads=int(posts[:, :, 5].astype(np.uint64).sum()),
+            conflicting_reads=int((posts[:, :, 0].astype(np.uint64) - posts[:, :, 5].astype(np.uint64)).sum()),
             native_deferred_rows=int(np.count_nonzero(statuses[:, 3])),
             completed_checkpoints=int(statuses[:, 4].astype(np.uint64).sum()),
         )

@@ -488,6 +488,12 @@ int main(){
     keys.data(),ranks.data(),ids.data(),slots.data(),cfg.data(),map.data(),addresses.data(),
     blocks.data(),offsets.data(),destinations.data(),&total,w,used,0,&ctx);
    assert(cfg[1]==0);
+   assert(cfg[5]<=cfg[3]);
+   for(unsigned i=0;i<cfg[3];++i){
+    int ordinal=reserved[destinations[cfg[2]+i]];
+    bool conflict=ordinal>=0 && unsigned(ordinal)<used;
+    assert(conflict==(i>=cfg[5]));
+   }
    std::copy(locations.begin()+w*2048,locations.begin()+(w+1)*2048,output.begin()+w*2048);
   }
   std::vector<unsigned> ownership(r),seen(r);std::iota(ownership.begin(),ownership.end(),0);
@@ -714,8 +720,9 @@ def test_final_fetch_uses_native_explicit_range_without_direct_submission():
     assert "PublishFinalWorker" not in resolver
     assert "CommitPostScalarStage" not in resolver
     finish = lifecycle[lifecycle.index("__aicore__ inline void FinishFetch") :]
-    assert finish.index("CompletePrefetch(ctx,b)") < finish.index("kvaf_device::KvafBatchGetDevice(")
-    assert "kvaf_device::KvafBatchGetDevice(workerArgs,0,post->descriptor,post->count)" in finish
+    assert "if(phase==1)" in finish
+    assert "(!phase || !row->pending)" in finish
+    assert "kvaf_device::KvafBatchGetDevice(workerArgs,0,begin,count)" in finish
     assert "DrainQueue(" not in finish
     # Execute the production descriptor publisher: it must never mark an SQ post
     # pending, even for nonempty or oversized ranges; native KVAF schedules them.
@@ -726,7 +733,7 @@ def test_final_fetch_uses_native_explicit_range_without_direct_submission():
 #include <cassert>
 #define __aicore__
 #define __gm__
-struct FinalPost { uint32_t count,pending,error,deferred,descriptor; uint64_t head; };
+struct FinalPost { uint32_t count,pending,error,deferred,descriptor,nonconflicting; uint64_t head; };
 struct Context { FinalPost posts[8]; };
 FinalPost* FinalPostAt(uint32_t,Context* c,uint32_t i) { return c->posts+i; }
 namespace kvaf_device { void CleanCacheLines(uint8_t*,unsigned long) {} }
@@ -735,10 +742,10 @@ namespace kvaf_device { void CleanCacheLines(uint8_t*,unsigned long) {} }
         + """
 int main() { Context c{};
  for(uint32_t n: {0U,608U,8192U}) {
-  PrepareFinalFetch(4,0,&c,1,2,n,123,0);
-  auto p=c.posts[6]; assert(p.count==n && p.descriptor==123 && p.pending==0 && p.deferred==(n!=0));
+  PrepareFinalFetch(4,0,&c,1,2,n,123,0,n/2);
+  auto p=c.posts[6]; assert(p.count==n && p.descriptor==123 && p.pending==0 && p.deferred==(n!=0) && p.nonconflicting==n/2);
  }
- PrepareFinalFetch(4,0,&c,1,2,608,123,4); assert(c.posts[6].error==4 && !c.posts[6].deferred);
+ PrepareFinalFetch(4,0,&c,1,2,608,123,4,0); assert(c.posts[6].error==4 && !c.posts[6].deferred);
 }
 """
     )
@@ -747,3 +754,60 @@ int main() { Context c{};
         source.write_text("#include <initializer_list>\n" + program)
         subprocess.run(["c++", "-std=c++17", str(source), "-o", folder + "/test"], check=True)
         subprocess.run([folder + "/test"], check=True)
+
+
+def test_native_final_phase_order_runs_production_loop(tmp_path):
+    """Exercise the actual Fetch orchestration with a recording native SDK."""
+    import subprocess
+
+    text = (ROOT / "csrc/operators/lightning_indexer_with_fetch/op_kernel/lifecycle.cpp").read_text()
+    start = text.index("    for(uint32_t phase=0;phase<2;++phase)")
+    loop = text[start : text.index("    if(row->pending || total!=info[1])", start)]
+    code = r"""
+#include <cstdint>
+#include <vector>
+#include <cassert>
+#define __gm__
+#define V9_SIMULATION 0
+#define KVAF_AIV_BATCH_GET_STATUS_MAGIC 99
+struct Post { unsigned count=0,pending=0,error=0,deferred=0,descriptor=0,nonconflicting=0; } posts[4];
+struct KvafBatchGetQueueState { uint64_t sq_producer_index=0,cq_consumer_index=0; } queues[4];
+struct KvafBatchGetCoreStatus { uint64_t magic=99,result=0,completed_batch_count=1,processed_request_count=0; } statuses[4];
+struct Args { uint64_t queue_state,core_status,indices,offsets,output_indices,miss_count,address_table,valid_table; unsigned request_capacity,table_capacity; };
+struct Context { uint64_t sourceBlocks=1,sourceOffsets=2,destinations=3,count=4,fallbackAddresses=5,fallbackValid=6; } context;
+struct Row { unsigned pending=1,error=0; } rowValue;
+std::vector<int> events; bool joined=false,failJoin=false;
+Post* FinalPostAt(unsigned,Context*,unsigned w){return posts+w;}
+unsigned FinalQueue(unsigned,unsigned,unsigned,unsigned w){return w;}
+Args GetArgs(Context*,unsigned w){Args a{};a.queue_state=(uint64_t)(queues+w);a.core_status=(uint64_t)(statuses+w);return a;}
+void CompletePrefetch(Context*,unsigned){events.push_back(-1);joined=true;rowValue.pending=failJoin;rowValue.error=failJoin?6:0;}
+namespace kvaf_device {
+constexpr unsigned kInvalidArgs=1;
+void CleanCacheLines(uint8_t*,unsigned long){}
+void KvafBatchGetDevice(Args a,unsigned,unsigned begin,unsigned count){
+ unsigned w=begin/100;auto& p=posts[w];bool suffix=begin!=p.descriptor;
+ if(p.nonconflicting==0)suffix=true;
+ assert(joined==suffix);assert(a.indices==1 && a.offsets==2 && a.output_indices==3 && a.address_table==5);
+ events.push_back(int(begin));auto s=(KvafBatchGetCoreStatus*)a.core_status;s->result=0;s->processed_request_count=count;
+}
+}
+void run(unsigned safe,bool failure=false){
+ events.clear();joined=false;failJoin=failure;rowValue={1,0};
+ for(unsigned w=0;w<4;++w)posts[w]={8,0,0,1,w*100,safe};
+ unsigned rt_batch=1,rt_finalWorkers=4,rt_finalPostOffset=0,kSlots=8192,b=0;
+ Context* ctx=&context;Row* row=&rowValue;
+ uint64_t error=0,lastHead=0,lastCq=0;unsigned total=0,completed=0,deferred=0;
+LOOP
+ assert(total==32);unsigned index=0;
+ if(safe)for(unsigned w=0;w<4;++w)assert(events[index++]==int(w*100));
+ assert(events[index++]==-1);
+ if(safe<8 && !failure)for(unsigned w=0;w<4;++w)assert(events[index++]==int(w*100+safe));
+ assert(index==events.size());assert(bool(error)==failure);
+ if(!failure)for(auto p:posts)assert(!p.deferred);
+}
+int main(){run(8);run(3);run(0);run(3,true);}
+""".replace("LOOP", loop)
+    source, exe = tmp_path / "phases.cpp", tmp_path / "phases"
+    source.write_text(code)
+    subprocess.run(["c++", "-std=c++17", str(source), "-o", str(exe)], check=True)
+    subprocess.run([str(exe)], check=True)

@@ -57,10 +57,11 @@ __aicore__ inline __gm__ FinalPost* FinalPostAt(uint32_t rt_finalPostOffset,__gm
 }
 // Resolver publishes compact ranges only. KVAF owns all final transport work.
 __aicore__ inline void PrepareFinalFetch(uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,
-    __gm__ Context* ctx,uint32_t b,uint32_t w,uint32_t count,uint32_t descriptor,uint32_t error) {
+    __gm__ Context* ctx,uint32_t b,uint32_t w,uint32_t count,uint32_t descriptor,uint32_t error,uint32_t nonconflicting) {
     auto post=FinalPostAt(rt_finalPostOffset,ctx,b*rt_finalWorkers+w);
     post->count=count;post->pending=0;post->error=error;
     post->deferred=count && !error;post->descriptor=descriptor;post->head=0;
+    post->nonconflicting=nonconflicting;
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
 }
 }
@@ -234,10 +235,34 @@ inline void ReplicatedResolve(uint32_t rt_history,uint32_t rt_resident,uint32_t 
     // overwritten by final repair are replaced, not duplicated in the plan.
     auto changeSlots=reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+batch*kChangeCapacity;
     auto changes=reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+batch*kChangeCapacity;
-    for(uint32_t i=tid;i<ownEnd-ownBegin;i+=Threads) {
-        uint32_t rank=ownBegin+i,token=selected[ids[rank]],slot=slots[rank],dst=batch*kSlots+rank;
-        uint64_t remote=asc_ldcg(addresses+token);keys[i]=uint32_t(remote);ranks[i]=uint32_t(remote>>32);positions[i]=slot;
+    // Stable partition within each worker's existing compact range. Reuse the
+    // dead hash scratch and the same warp-prefix scan used above; no new GM pass.
+    uint32_t ownCount=ownEnd-ownBegin,perOwn=(ownCount+Threads-1)/Threads;
+    uint32_t localSafe=0;
+    for(uint32_t i=tid*perOwn;i<(tid+1)*perOwn && i<ownCount;++i) {
+        uint32_t slot=slots[ownBegin+i];
         int32_t ordinal=asc_ldcg(reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+batch*rt_resident+slot);
+        keys[i]=uint32_t(ordinal);
+        localSafe+=!(ordinal>=0 && uint32_t(ordinal)<used);
+    }
+    uint32_t safeScan=localSafe;
+    for(uint32_t d=1;d<warpSize;d*=2){uint32_t prior=asc_shfl_up(safeScan,d);if(lane>=d)safeScan+=prior;}
+    if(lane==warpSize-1)cfg[544+warp]=safeScan;
+    asc_syncthreads();
+    if(!warp){uint32_t v=lane<Threads/warpSize?cfg[544+lane]:0;
+        for(uint32_t d=1;d<warpSize;d*=2){uint32_t prior=asc_shfl_up(v,d);if(lane>=d)v+=prior;}cfg[544+lane]=v;}
+    asc_syncthreads();
+    uint32_t safeCount=cfg[544+Threads/warpSize-1];
+    uint32_t safeBefore=safeScan-localSafe+(warp?cfg[544+warp-1]:0);
+    uint32_t conflictBefore=tid*perOwn-safeBefore;
+    if(!tid)cfg[5]=safeCount;
+    for(uint32_t i=tid*perOwn;i<(tid+1)*perOwn && i<ownCount;++i) {
+        uint32_t rank=ownBegin+i,token=selected[ids[rank]],slot=slots[rank];
+        int32_t ordinal=int32_t(keys[i]);
+        bool conflict=ordinal>=0 && uint32_t(ordinal)<used;
+        uint32_t index=conflict?safeCount+conflictBefore++:safeBefore++;
+        uint32_t dst=batch*kSlots+ownBegin+index;
+        uint64_t remote=asc_ldcg(addresses+token);
         uint32_t record=ordinal>=0?uint32_t(ordinal):kLruSlots+rank;
         asc_stcg(changeSlots+record,slot);asc_stcg(changes+record,token);
         StoreFallbackSource(rt_history,rt_tokenBytes,ctx,batch,dst,token,remote,blocks,offsets);
@@ -311,7 +336,7 @@ __aicore__ inline void ReplicatedFinal(uint32_t rt_batch,uint32_t rt_history,uin
     DataCopy(output[w*(kSlots/rt_finalWorkers)],loc[w*(kSlots/rt_finalWorkers)],kSlots/rt_finalWorkers);
     SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
     if(!w)trace[2]=GetSystemCycle();
-    PrepareFinalFetch(rt_finalWorkers,rt_finalPostOffset,ctx,b,w,own,batchBase+prefix,error);
+    PrepareFinalFetch(rt_finalWorkers,rt_finalPostOffset,ctx,b,w,own,batchBase+prefix,error,error?0:ctl.GetValue(5));
     if(!w){
         status[0]=error;status[1]=batchCount;status[2]=batchBase;status[3]=0;status[4]=0;
         row->finalBegin=started;row->finalRequests=batchCount;row->finalHead=FinalPostAt(rt_finalPostOffset,ctx,core)->head;

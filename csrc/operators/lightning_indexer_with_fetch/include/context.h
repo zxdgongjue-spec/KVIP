@@ -8,7 +8,7 @@ constexpr bool kFinalReplicated=true;
 constexpr uint32_t kFinalStateWords=288;
 struct alignas(128) FinalPost {
     uint32_t count, pending, error, deferred, descriptor;
-    uint32_t reserved;
+    uint32_t nonconflicting; // Compact descriptor prefix safe before prefetch CQ.
     uint64_t head;
 };
 static_assert(sizeof(FinalPost)==128,"Final post must own a cache line");
