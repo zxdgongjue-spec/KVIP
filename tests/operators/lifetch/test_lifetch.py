@@ -30,6 +30,9 @@ def arguments(argv=None):
     p.add_argument("--prefetch-tokens", type=int, default=512)
     p.add_argument("--runtime-shapes", action="store_true", help="one binary, four distinct runtime shapes")
     p.add_argument("--resolver-compare", action="store_true")
+    p.add_argument(
+        "--queue-handoff-check", action="store_true", help="audit native Get after fused execution, outside timing"
+    )
     p.add_argument("--trace-rounds", type=int, default=3)
     p.add_argument("--miss-percent", type=float, default=10)
     p.add_argument("--batches", default="16")
@@ -648,3 +651,14 @@ int main(){run(8);run(3);run(0);run(3,true);}
     source.write_text(code)
     subprocess.run(["c++", "-std=c++17", str(source), "-o", str(exe)], check=True)
     subprocess.run([str(exe)], check=True)
+
+
+def test_queue_handoff_snapshot_decodes_persistent_abi():
+    import struct
+    from queue_handoff import decode_queues
+
+    fields = (0x4B564151, 1, 1234, 7, 3, 0, 0, 0, 0)
+    rows = decode_queues(struct.pack("<II7Q", *fields))
+    assert rows[0]["magic"] == fields[0]
+    assert rows[0]["sq"] == 1234 and rows[0]["cq"] == 7
+    assert rows[0]["error"] == rows[0]["poisoned"] == 0
