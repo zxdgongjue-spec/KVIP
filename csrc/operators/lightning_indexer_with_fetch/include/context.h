@@ -30,7 +30,11 @@ struct alignas(128) Event {
     uint32_t core, epoch, complete, skipped;
     uint64_t waitBegin;
     uint64_t scanTicks, candidateTicks, postTicks, bitmapBytes, candidateCount, postedCount;
-    uint32_t pad[10];
+    // Per-epoch admission: how many misses asked for a slot and how many the
+    // service was allowed to grant. They answer whether prefetch is capped by
+    // the budget or by how few new misses the window produced.
+    uint32_t budget, demanded;
+    uint32_t pad[8];
 };
 struct Context {
     uint64_t progress, rows, mapping, locations, events, hits, selected, owners;

@@ -65,7 +65,10 @@ enter the final TopK; they cost slots and DDR but return to no consumer.
    of 8 is already too many.
 2. Prefetch budget 256/512/1024 at the winning epoch count.
 3. Service event cross-check: `span_sum` from `events` against the measured
-   `li_us` for the same round.
+   `li_us` for the same round. The same table now carries `budget` and
+   `demanded` per epoch: `demanded` far below `budget` means prefetch is
+   limited by how few new misses a window produces, not by the budget, and the
+   prefetch-token sweep would then be a no-op.
 4. Init journal: `InitializeRound` rewrites `mapping` for the whole history
    (12-13 us per replay). A journal of written tokens bounds that to the
    prefetched set; the sentinel semantics must be kept, so a stale entry must

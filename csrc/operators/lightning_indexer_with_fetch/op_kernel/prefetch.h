@@ -682,6 +682,7 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
     }
     V9_FETCH_PROFILE(event->begin=GetSystemCycle();)
     uint64_t postedCount=0; // Business state: controls batched WQE submission.
+    V9_FETCH_PROFILE(uint32_t budgetTotal=0,demandedTotal=0;)
     V9_FETCH_PROFILE(uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0;)
     auto work=flags.ReinterpretCast<uint32_t>();auto cfg=work[4096];
     auto rowStorage=ids;
@@ -850,7 +851,8 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
                 SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
                 missing=cfg.GetValue(56);count=missing<available?missing:available;
             }
-            V9_FETCH_PROFILE(candidateTicks+=GetSystemCycle()-candidateBegin;)
+            V9_FETCH_PROFILE(budgetTotal+=available;demandedTotal+=missing;
+                          candidateTicks+=GetSystemCycle()-candidateBegin;)
             if(count) {
                 V9_FETCH_PROFILE(postBegin=GetSystemCycle();)
 if (rt_batchedRows) {
@@ -967,6 +969,7 @@ if (rt_batchedRows) {
 }
     V9_FETCH_PROFILE(event->scanTicks=scanTicks;event->candidateTicks=candidateTicks;event->postTicks=postTicks;)
     V9_FETCH_PROFILE(event->bitmapBytes=bitmapBytes;event->candidateCount=totalCandidates;event->postedCount=postedCount;)
+    V9_FETCH_PROFILE(event->budget=budgetTotal;event->demanded=demandedTotal;)
     V9_FETCH_PROFILE(event->end=GetSystemCycle();)event->complete=1;
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event),V9_INTERMEDIATE_PROFILING?sizeof(Event):64);
 }

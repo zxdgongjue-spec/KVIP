@@ -24,7 +24,9 @@ EVENT = np.dtype(
         ("bitmapBytes", "<u8"),
         ("candidateCount", "<u8"),
         ("postedCount", "<u8"),
-        ("pad", "<u4", 10),
+        ("budget", "<u4"),
+        ("demanded", "<u4"),
+        ("pad", "<u4", 8),
     ]
 )
 
@@ -49,6 +51,8 @@ def rows(rotating):
                 bitmap_bytes=int(event["bitmapBytes"]),
                 candidates=int(event["candidateCount"]),
                 posted=int(event["postedCount"]),
+                budget=int(event["budget"]),
+                demanded=int(event["demanded"]),
             )
         )
     return out
@@ -62,7 +66,8 @@ def table(rotating):
     complete = sum(event["complete"] for event in events)
     lines = [
         f"service events: {len(events)} stamped, {complete} complete",
-        "epoch\tlanes\twait_max\tspan_max\tspan_sum\tscan\tscan_max\tcandidate\tpost\tbitmap_B\tcandidates\tposted",
+        "epoch\tlanes\twait_max\tspan_max\tspan_sum\tscan\tscan_max\tcandidate\tpost"
+        "\tbitmap_B\tcandidates\tposted\tbudget\tdemanded",
     ]
     for epoch in sorted({event["epoch"] for event in events}):
         group = [event for event in events if event["epoch"] == epoch]
@@ -78,6 +83,8 @@ def table(rotating):
             f"\t{sum(e['bitmap_bytes'] for e in group)}"
             f"\t{sum(e['candidates'] for e in group)}"
             f"\t{sum(e['posted'] for e in group)}"
+            f"\t{sum(e['budget'] for e in group)}"
+            f"\t{sum(e['demanded'] for e in group)}"
         )
     span_sum = sum(event["span"] for event in events)
     scan = sum(event["scan"] for event in events)
@@ -93,6 +100,8 @@ def table(rotating):
         f"\t{sum(event['bitmap_bytes'] for event in events)}"
         f"\t{sum(event['candidates'] for event in events)}"
         f"\t{sum(event['posted'] for event in events)}"
+        f"\t{sum(event['budget'] for event in events)}"
+        f"\t{sum(event['demanded'] for event in events)}"
     )
     if span_sum:
         lines.append(
