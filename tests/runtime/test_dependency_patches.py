@@ -24,7 +24,7 @@ def dependency(tmp_path, monkeypatch):
     (root / "page_mode.txt").write_text("huge\n")
     (root / "local.txt").write_text("unrelated local changes\n")
 
-    names = (*build.PATCHES, build.UBMEM_PATCH, build.UBMEM_FUSED_PATCH, build.UBMEM_PAGE_PATCH, build.UBMEM_THP_PATCH, build.UBMEM_NUMA_PATCH)
+    names = (*build.PATCHES, build.UBMEM_PATCH, build.UBMEM_FUSED_PATCH, build.UBMEM_PAGE_PATCH, build.UBMEM_THP_PATCH, build.UBMEM_NUMA_PATCH, build.UBMEM_NUMA_MASK_PATCH)
     changes = (
         ("base.txt", "base", "reuse"),
         ("context.txt", "initial", "fused"),
@@ -34,6 +34,7 @@ def dependency(tmp_path, monkeypatch):
         ("context.txt", "ubmem-fused", "page-mode"),
         ("context.txt", "page-mode", "thp"),
         ("context.txt", "thp", "numa"),
+        ("context.txt", "numa", "numa-mask"),
     )
 
     def diff(path, before, after):
@@ -62,7 +63,7 @@ def dependency(tmp_path, monkeypatch):
     return build, root, apply_prefix
 
 
-@pytest.mark.parametrize("applied", [0, 3, 4, 5, 6, 7, 8], ids=["fresh", "urma", "runtime", "fused", "page-mode", "thp", "numa"])
+@pytest.mark.parametrize("applied", [0, 3, 4, 5, 6, 7, 8, 9], ids=["fresh", "urma", "runtime", "fused", "page-mode", "thp", "numa", "numa-mask"])
 def test_ubmem_upgrade_and_repeat_preserve_local_edits(dependency, applied):
     build, root, apply_prefix = dependency
     apply_prefix(applied)
@@ -72,12 +73,12 @@ def test_ubmem_upgrade_and_repeat_preserve_local_edits(dependency, applied):
     build.prepare_dependency(root, "ubmem")
 
     assert {path.name: path.read_bytes() for path in root.iterdir()} == first
-    assert (root / "context.txt").read_text() == "numa\n"
+    assert (root / "context.txt").read_text() == "numa-mask\n"
     assert (root / "page_mode.txt").read_text() == "configurable-thp\n"
     assert (root / "local.txt").read_text() == "unrelated local changes\n"
 
 
-@pytest.mark.parametrize("applied", [4, 5, 6, 7, 8], ids=["runtime", "fused", "page-mode", "thp", "numa"])
+@pytest.mark.parametrize("applied", [4, 5, 6, 7, 8, 9], ids=["runtime", "fused", "page-mode", "thp", "numa", "numa-mask"])
 def test_urma_rejects_ubmem_tree_without_changes(dependency, applied):
     build, root, apply_prefix = dependency
     apply_prefix(applied)
