@@ -517,3 +517,24 @@ int main(){
         check=True,
     )
     subprocess.run([str(exe)], check=True, timeout=30)
+
+
+def test_completion_diagnostics_distinguish_transport_states():
+    import numpy as np
+    from prefetch_audit import completion_failures
+
+    rows = np.zeros((2, 256), dtype=np.uint32)
+    posts = np.zeros((2, 4, 32), dtype=np.uint32)
+    statuses = np.zeros((2, 32), dtype=np.uint32)
+    cq = np.zeros((4, 8), dtype=np.uint64)
+    cq[:, 0] = 0x4B5641464247444F
+    assert not completion_failures(rows, posts, statuses, cq, cq)
+    posts[1, 2, 3] = 1
+    result = completion_failures(rows, posts, statuses, cq, cq)
+    assert len(result) == 1 and result[0]["request"] == 1
+    assert result[0]["posts_count_pending_error_deferred_descriptor"][2][3] == 1
+    posts.fill(0)
+    failed = cq.copy()
+    failed[0, 2] = 7
+    result = completion_failures(rows, posts, statuses, cq, failed)
+    assert len(result) == 1 and result[0]["final_cq"][0][2] == 7

@@ -10,7 +10,7 @@ from device_trace import collect_core, core_summary
 from index_update import DirectCacheUpdate, permutation_records
 from kvip.operators.lifetch.forward import LIFetchForward
 from kvip.runtime.loader import load_lifetch_library
-from prefetch_audit import actual_reads
+from prefetch_audit import actual_reads, completion_failures
 from runner import progress
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -403,18 +403,16 @@ def run_device(
         rows = rotating.rows.cpu().numpy()
         posts = rotating.final_posts.cpu().numpy()
         statuses = rotating.row_status.cpu().numpy()
-        if (
-            np.any(rows[:, 11])
-            or np.any(rows[:, 211])
-            or np.any(rows[:, 248])
-            or np.any(posts[:, :, 1:4])
-            or np.any(statuses[:, 0])
-        ):
-            raise AssertionError("prototype transport/resolver completion failed")
-        for status in (rotating.prefetch_status, rotating.final_status):
-            words = status.cpu().view(torch.uint64).numpy()
-            if np.any(words[:, 0] != 5428598170857194575) or np.any(words[:, 2]):
-                raise AssertionError("CQ status failed")
+        cq = [status.cpu().view(torch.uint64).numpy() for status in (rotating.prefetch_status, rotating.final_status)]
+        failures = completion_failures(rows, posts, statuses, *cq)
+        if failures:
+            phase = state.get("check_phase", "graph replay")
+            path = folder / "completion_failure.json"
+            path.write_text(json.dumps(dict(phase=phase, requests=failures), indent=2))
+            raise AssertionError(
+                f"completion failed phase={phase}; bad_requests={len(failures)}; "
+                f"first={json.dumps(failures[0])}; full={path}"
+            )
         owner.mark_completed(completion_verified=True)
         if updated:
             update.check_capacity()
@@ -464,13 +462,16 @@ def run_device(
 
         return run(torch, args, rotating, owner, topk, initial_selected, reset, verify, folder)
 
-    def check_direct_update(orders, cold_start=False):
+    def check_direct_update(orders, cold_start=False, label="regular"):
+        state["check_phase"] = f"{label}: fetch before Index update"
         reset()
         update.set_order(orders)
         if cold_start:
             rotating.hot_valid.zero_()
         core()
         stream.synchronize()
+        verify()
+        state["check_phase"] = f"{label}: after Index update"
         source_data = [t.cpu().clone() for t in update.inputs[:4]]
         changes = rotating.changes.cpu().numpy()
         lru = rotating.change_slots.cpu().numpy()
@@ -509,14 +510,14 @@ def run_device(
         )
 
     snapshot_changes = check_direct_update(initial_orders)
-    cold_start_changes = check_direct_update(initial_orders, cold_start=True)
+    cold_start_changes = check_direct_update(initial_orders, cold_start=True, label="cold-start")
     unlucky = []
     for row in range(b):
         selected_hot = list(dict.fromkeys(initial_selected[row].reshape(-1).tolist()))
         selected_hot = [x for x in selected_hot if x < r]
         seen = set(selected_hot)
         unlucky.append(selected_hot + [x for x in initial_orders[row] if x not in seen])
-    hot_case = check_direct_update(unlucky)
+    hot_case = check_direct_update(unlucky, label="hot-victim-collision")
     restored_hot = hot_case["hot_changes"]
     if not hot_case["first_window_fetches"] or not restored_hot:
         raise AssertionError(f"First window did not Fetch former hot candidates into LRU slots: {hot_case}")
