@@ -13,6 +13,7 @@ REVISION = "c4375e13d7a9519d907ab6a5d11227795f207286"
 PATCHES = ("kvaf-reuse-device-ra", "kvaf-fused-context", "kvaf-fused-output-views")
 UBMEM_PATCH = "kvaf-ubmem-runtime"
 UBMEM_FUSED_PATCH = "kvaf-ubmem-fused-context"
+UBMEM_PAGE_PATCH = "kvaf-ubmem-page-mode"
 
 
 def call(command, cwd=None, env=None):
@@ -61,20 +62,19 @@ def prepare_dependency(root, transport="urma"):
     head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
     if head != REVISION:
         raise RuntimeError(f"Expected KVAF {REVISION}, found {head}; existing checkout left unchanged")
-    # The UBmem patch changes shared Runtime/binding contexts from earlier
-    # patches. Recognize the complete final patch before examining its parents.
-    if applies(root, UBMEM_FUSED_PATCH, True):
+    # Later UBmem patches change shared Runtime/binding contexts from earlier
+    # patches. Recognize the newest applied patch before examining its parents,
+    # then upgrade an existing checkout with only the remaining patches.
+    ubmem_patches = (UBMEM_PATCH, UBMEM_FUSED_PATCH, UBMEM_PAGE_PATCH)
+    for index in range(len(ubmem_patches) - 1, -1, -1):
+        if not applies(root, ubmem_patches[index], True):
+            continue
         if transport != "ubmem":
             raise RuntimeError("This KVAF tree contains UBmem changes; use a separate URMA baseline tree")
-        print(f"KVAF UBmem fusion dependency ready: {root} @ {head}", flush=True)
-        return
-    runtime_ready = applies(root, UBMEM_PATCH, True)
-    if runtime_ready:
-        if transport != "ubmem":
-            raise RuntimeError("This KVAF tree contains UBmem changes; use a separate URMA baseline tree")
-        if not applies(root, UBMEM_FUSED_PATCH):
-            raise RuntimeError("KVAF UBmem fused-context patch conflicts with existing edits; checkout preserved")
-        call(["git", "apply", ROOT / "scripts/patches" / (UBMEM_FUSED_PATCH + ".patch")], cwd=root)
+        for name in ubmem_patches[index + 1 :]:
+            if not applies(root, name):
+                raise RuntimeError(f"KVAF {name} patch conflicts with existing edits; checkout preserved")
+            call(["git", "apply", ROOT / "scripts/patches" / (name + ".patch")], cwd=root)
         print(f"KVAF UBmem fusion dependency ready: {root} @ {head}", flush=True)
         return
     # Applying output-views changes the parent patch's context: check newest first.
@@ -90,7 +90,7 @@ def prepare_dependency(root, transport="urma"):
                 raise RuntimeError(f"KVAF {name} conflicts with existing edits; no forced reset")
             call(["git", "apply", ROOT / "scripts/patches" / (name + ".patch")], cwd=root)
     if transport == "ubmem":
-        for name in (UBMEM_PATCH, UBMEM_FUSED_PATCH):
+        for name in ubmem_patches:
             if not applies(root, name):
                 raise RuntimeError(f"KVAF {name} patch conflicts with existing edits; checkout preserved")
             call(["git", "apply", ROOT / "scripts/patches" / (name + ".patch")], cwd=root)
