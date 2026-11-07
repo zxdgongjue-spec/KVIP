@@ -16,6 +16,7 @@ BS = re.compile(r"^BS=(\d+) .*history=(\d+) hot=(\d+)", re.M)
 P50 = re.compile(r"graph_p50_us=([^\n]+)")
 SPEED = re.compile(r"full_speedup=([0-9.]+)x")
 ROUND = re.compile(r"^round=(\d+) total_us=([0-9.]+) (.*)$", re.M)
+SERVICE = re.compile(r"^total\t[^\n]*$", re.M)
 STAGE = re.compile(r"([a-z_]+)_us=([0-9.]+)")
 
 
@@ -45,7 +46,13 @@ def parse(path):
             for key, value in STAGE.findall(rounds[-1].group(3)):
                 stages[key] = float(value)
         speed = SPEED.search(block)
-        cases[batch] = dict(times=per, stages=stages, speed=float(speed.group(1)) if speed else None)
+        service = SERVICE.search(block)
+        span = None
+        if service:
+            columns = service.group(0).split("\t")
+            if len(columns) > 4 and columns[4].isdigit():
+                span = int(columns[4])
+        cases[batch] = dict(times=per, stages=stages, speed=float(speed.group(1)) if speed else None, span=span)
     return cases
 
 
@@ -73,6 +80,8 @@ def main(argv):
                 delta=100.0 * (cp50 - bp50) / bp50,
                 base_speed=b["speed"],
                 cand_speed=c["speed"],
+                base_span=b["span"],
+                cand_span=c["span"],
             )
             for stage in ("init", "li", "resolve", "fetch"):
                 row[f"base_{stage}"] = b["stages"].get(stage)
@@ -80,7 +89,7 @@ def main(argv):
             rows.append(row)
     if not rows:
         raise SystemExit(f"No comparable cases under {base_dir} and {cand_dir}")
-    header = ["miss", "B", "base_us", "cand_us", "delta%", "init", "li", "resolve", "fetch", "speed"]
+    header = ["miss", "B", "base_us", "cand_us", "delta%", "init", "li", "resolve", "fetch", "speed", "svc_ticks"]
     print("\t".join(header))
     for row in rows:
         stages = []
@@ -88,13 +97,19 @@ def main(argv):
             base, cand = row[f"base_{stage}"], row[f"cand_{stage}"]
             stages.append(f"{base:.1f}->{cand:.1f}" if base is not None and cand is not None else "-")
         speed = f"{row['base_speed']:.3f}->{row['cand_speed']:.3f}" if row["base_speed"] and row["cand_speed"] else "-"
+        span = (
+            f"{row['base_span']}->{row['cand_span']}"
+            if row["base_span"] is not None and row["cand_span"] is not None
+            else "-"
+        )
         print(
             f"{row['miss']}%\t{row['batch']}\t{row['base']:.3f}\t{row['cand']:.3f}\t{row['delta']:+.1f}\t"
             + "\t".join(stages)
-            + f"\t{speed}"
+            + f"\t{speed}\t{span}"
         )
     print()
     print("delta% is candidate vs baseline on prototype_with_update p50; negative is faster.")
+    print("svc_ticks is the summed service span from the per-epoch events; it only appears on builds that dump it.")
     return 0
 
 
