@@ -14,13 +14,16 @@ __aicore__ inline bool UbmemRegionValid(__gm__ UbmemRegion* region) {
         UbmemRange(region->mappedBase, region->bytes) &&
         UbmemRange(region->outputBase, region->outputBytes) &&
         !(region->outputBase & 31) &&
-        region->outputBytes >= uint64_t(SIM_BATCH)*(SIM_RESIDENT+kSlots)*kTokenBytes;
+        // The registration contains stable-owner rows with hot + optional ABC.
+        // InitializeRound validates each selected owner's full stride. Neither
+        // packed batch size nor the virtual Q4 tag space adds payload storage.
+        region->outputBytes >= uint64_t(SIM_RESIDENT)*kTokenBytes;
 }
 __aicore__ inline bool UbmemCopyRow(__gm__ Context* ctx, uint64_t peer,
     uint64_t output, uint32_t slot, LocalTensor<uint8_t> scratch) {
     auto region = UbmemRegionAt(ctx);
     uint64_t source = 0;
-    if (slot >= SIM_RESIDENT+kSlots ||
+    if (!UbmemRegionValid(region) || slot >= SIM_RESIDENT ||
         !UbmemTranslate(region->peerBase, region->mappedBase, region->bytes,
                         peer, kTokenBytes, source) || output < region->outputBase)
         return false;
@@ -96,7 +99,7 @@ public:
     __aicore__ inline bool Add(uint64_t peer,uint32_t slot) { return AddAt(peer,output_,slot); }
     __aicore__ inline bool AddAt(uint64_t peer,uint64_t output,uint32_t slot) {
         uint64_t source=0;
-        if (!valid_ || slot>=SIM_RESIDENT+kSlots || output<outputBase_ ||
+        if (!valid_ || slot>=SIM_RESIDENT || output<outputBase_ ||
             !UbmemTranslate(peerBase_,mappedBase_,bytes_,peer,kTokenBytes,source)) return false;
         uint64_t offset=output-outputBase_, rowOffset=uint64_t(slot)*kTokenBytes;
         if (offset>outputBytes_ || rowOffset>outputBytes_-offset ||
@@ -121,6 +124,11 @@ public:
     __aicore__ inline uint64_t PlanPeerBase() const {return peerBase_;}
     __aicore__ inline uint64_t PlanMaxPeerOffset() const {return bytes_>=kTokenBytes?bytes_-kTokenBytes:0;}
     __aicore__ inline bool BeginRunAt(uint64_t output,uint32_t slot,uint32_t count) {
+        runCount_=0;
+        if(!valid_ || !count || slot>=SIM_RESIDENT || count>SIM_RESIDENT-slot || output<outputBase_)return false;
+        uint64_t offset=output-outputBase_,rowOffset=uint64_t(slot)*kTokenBytes;
+        if(offset>outputBytes_ || rowOffset>outputBytes_-offset ||
+            count>(outputBytes_-offset-rowOffset)/kTokenBytes)return false;
         runOutput_=output;runSlot_=slot;runCount_=count;return true;
     }
     __aicore__ inline bool AddNext(uint64_t peer) {
@@ -214,7 +222,7 @@ public:
     // cannot change a store already in flight or merge across an output gap.
     __aicore__ inline bool AddAt(uint64_t peer, uint64_t output, uint32_t slot) {
         uint64_t source=0;
-        if (!valid_ || slot>=SIM_RESIDENT+kSlots || output<outputBase_ ||
+        if (!valid_ || slot>=SIM_RESIDENT || output<outputBase_ ||
             !TranslatePeer(peer,source)) return false;
         uint64_t offset=output-outputBase_, rowOffset=uint64_t(slot)*kTokenBytes;
         if (offset>outputBytes_ || rowOffset>outputBytes_-offset ||
@@ -228,8 +236,8 @@ public:
     // individually by AddNext, and this run never accepts beyond count rows.
     __aicore__ inline bool BeginRunAt(uint64_t output,uint32_t slot,uint32_t count) {
         runRemaining_=0;
-        if(!valid_ || !count || slot>=SIM_RESIDENT+kSlots ||
-            count>SIM_RESIDENT+kSlots-slot || output<outputBase_)return false;
+        if(!valid_ || !count || slot>=SIM_RESIDENT ||
+            count>SIM_RESIDENT-slot || output<outputBase_)return false;
         uint64_t offset=output-outputBase_,rowOffset=uint64_t(slot)*kTokenBytes;
         if(offset>outputBytes_ || rowOffset>outputBytes_-offset ||
             count>(outputBytes_-offset-rowOffset)/kTokenBytes)return false;

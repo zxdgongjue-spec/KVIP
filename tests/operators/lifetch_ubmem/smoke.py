@@ -122,7 +122,20 @@ def check_shape(kvaf, torch, build, device_id, shape, library, prefetch_tokens=5
 
         def verify(owners, *, phase, counts=None, padding=False):
             stream.synchronize()
-            assert not np.any(update.status.cpu().numpy()), "Index update rejected UBmem completion"
+            index_status = update.status.cpu().tolist()
+            if any(index_status):
+                rows = rotating.rows.cpu().tolist()
+                diagnostics = dict(
+                    phase=phase,
+                    prefetch_tokens=prefetch_tokens,
+                    index_status=index_status,
+                    ubmem_status=rotating.ubmem_status.cpu().tolist(),
+                    row_status=rotating.row_status.cpu().tolist(),
+                    final_posts=rotating.final_posts[:, :, :8].cpu().tolist(),
+                    change_count=rotating.change_count.cpu().tolist(),
+                    row_fields=[{i: row[i] for i in (8, 9, 11, 208, 209, 210, 211, 247, 248)} for row in rows],
+                )
+                raise AssertionError(f"Index update rejected UBmem completion: {diagnostics}")
             counters = rotating.ubmem_status.cpu().numpy()
             assert not np.any(counters[:, 0]), "UBmem copy failed"
             assert np.array_equal(counters[:, 1], counters[:, 2]), "UBmem prefetch incomplete"
