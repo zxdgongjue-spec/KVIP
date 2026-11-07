@@ -14,6 +14,7 @@ PATCHES = ("kvaf-reuse-device-ra", "kvaf-fused-context", "kvaf-fused-output-view
 UBMEM_PATCH = "kvaf-ubmem-runtime"
 UBMEM_FUSED_PATCH = "kvaf-ubmem-fused-context"
 UBMEM_PAGE_PATCH = "kvaf-ubmem-page-mode"
+UBMEM_THP_PATCH = "kvaf-ubmem-thp"
 
 
 def call(command, cwd=None, env=None):
@@ -65,7 +66,7 @@ def prepare_dependency(root, transport="urma"):
     # Later UBmem patches change shared Runtime/binding contexts from earlier
     # patches. Recognize the newest applied patch before examining its parents,
     # then upgrade an existing checkout with only the remaining patches.
-    ubmem_patches = (UBMEM_PATCH, UBMEM_FUSED_PATCH, UBMEM_PAGE_PATCH)
+    ubmem_patches = (UBMEM_PATCH, UBMEM_FUSED_PATCH, UBMEM_PAGE_PATCH, UBMEM_THP_PATCH)
     for index in range(len(ubmem_patches) - 1, -1, -1):
         if not applies(root, ubmem_patches[index], True):
             continue
