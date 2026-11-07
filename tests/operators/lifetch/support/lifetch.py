@@ -12,6 +12,7 @@ from kvip.operators.lifetch.forward import LIFetchForward
 from kvip.runtime.loader import load_lifetch_library
 from prefetch_audit import actual_reads, completion_failures
 from runner import progress
+from service_events import table as service_event_table
 
 ROOT = Path(__file__).resolve().parents[4]
 SOURCE = ROOT / "csrc/operators/lightning_indexer_with_fetch"
@@ -360,6 +361,7 @@ def run_device(
         prefetch_limit=args.prefetch_tokens,
         output_stride=owner.output.shape[1],
         row_owners=torch.arange(b, dtype=torch.int32, device=device) if args.resolver_compare else None,
+        service_aics=getattr(args, "service_aics", 0),
     )
     topk = arguments[9].view(torch.int32).reshape(b, 4, 2048)
     prefix = 4 * 2048 * 6 + 1024 + 4 * h * 2
@@ -597,6 +599,9 @@ def run_device(
         stream.synchronize()
 
     timings["aiv_cache_update"] = measure(lambda: update(topk, rotating.locations), update_reset, lambda: verify(True))
+
+    if getattr(args, "dump_events", False):
+        print(service_event_table(rotating))
 
     def plan_check():
         verify()
