@@ -97,19 +97,22 @@ def snapshot_failed_transport(owner, rotating, posts, failures, folder):
     """
     import ctypes  # Failure-only ACL dependency; CPU audit tests need no CANN.
 
-    acl = ctypes.CDLL("libascendcl.so")
-    copy = acl.aclrtMemcpy
-    copy.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-    copy.restype = ctypes.c_int
+    torch = rotating.torch
+    snapshot = rotating.library.kvip_transport_snapshot
+    snapshot.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
+    snapshot.restype = ctypes.c_uint32
 
     def read(address, size):
-        if not address or not 0 < size <= 64 * 1024 * 1024:
+        if not address or address % 32 or not 0 < size <= 64 * 1024 * 1024 or size % 32:
             raise ValueError(f"Invalid diagnostic read: address={address:#x} bytes={size}")
-        result = np.empty(size, dtype=np.uint8)
-        rc = copy(result.ctypes.data, size, address, size, 2)  # ACL_MEMCPY_DEVICE_TO_HOST
+        # Driver queue VAs are device-accessible, not ACL-copyable allocations.
+        # Copy on device first; only the owned output is transferred to the CPU.
+        result = torch.empty(size, dtype=torch.uint8, device=rotating.device)
+        stream = torch.npu.current_stream(rotating.device)
+        rc = snapshot(address, result.data_ptr(), size, stream.npu_stream)
         if rc:
-            raise RuntimeError(f"ACL diagnostic read failed: {rc}")
-        return result
+            raise RuntimeError(f"Device diagnostic launch failed: {rc}")
+        return result.cpu().numpy()
 
     contexts = owner.device_args.cpu().numpy().view("<u8")
     remote = rotating.fallback_addresses.cpu().numpy().reshape(-1)

@@ -445,3 +445,33 @@ extern "C" __global__ __aicore__ void v9_resolve_adapted_kernel(GM_ADDR bindings
 #endif
 }
 #endif
+
+// Failure-only diagnostic. Never called by the forward pipeline; queue reads
+// must execute on device because driver queue VAs are not ACL allocations.
+extern "C" __global__ __aicore__ void kvip_transport_snapshot_kernel(
+    GM_ADDR source, GM_ADDR destination, uint32_t bytes) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV {
+        TPipe pipe;
+        TBuf<TPosition::VECCALC> storage;
+        constexpr uint32_t kChunkBytes = 4096;
+        pipe.InitBuffer(storage, kChunkBytes);
+        auto local = storage.Get<uint32_t>();
+        GlobalTensor<uint32_t> input, output;
+        input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(source));
+        output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(destination));
+        for (uint32_t offset = 0; offset < bytes; offset += kChunkBytes) {
+            uint32_t count = bytes - offset;
+            if (count > kChunkBytes) count = kChunkBytes;
+            DataCopy(local, input[offset / 4], count / 4);
+            SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+            DataCopy(output[offset / 4], local, count / 4);
+            SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+        }
+        pipe.Destroy();
+    }
+#endif
+}

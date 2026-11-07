@@ -408,6 +408,8 @@ def run_device(
         if failures:
             phase = state.get("check_phase", "graph replay")
             path = folder / "completion_failure.json"
+            path.write_text(json.dumps(dict(phase=phase, requests=failures), indent=2))
+            print(f"COMPLETION FAILURE: phase={phase}; first={json.dumps(failures[0])}; full={path}", flush=True)
             try:
                 transport = snapshot_failed_transport(owner, rotating, posts, failures, folder)
             except Exception as exc:

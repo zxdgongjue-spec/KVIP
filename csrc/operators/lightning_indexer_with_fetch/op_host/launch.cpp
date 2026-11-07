@@ -76,3 +76,10 @@ extern "C" uint32_t kvip_lifetch_forward(void* bindings, void* update, void* str
     if (!result) result = aclrtlaunch_v9_fetch_update_kernel(shape->batch, stream, bindings, update);
     return result;
 }
+
+extern "C" uint32_t aclrtlaunch_kvip_transport_snapshot_kernel(uint32_t,void*,void*,void*,uint32_t);
+extern "C" uint32_t kvip_transport_snapshot(void* source, void* destination, uint32_t bytes, void* stream) {
+    if (!source || !destination || !stream || !bytes || bytes % 32 ||
+        reinterpret_cast<uintptr_t>(source) % 32 || bytes > 64U * 1024U * 1024U) return 100000;
+    return aclrtlaunch_kvip_transport_snapshot_kernel(1,stream,source,destination,bytes);
+}

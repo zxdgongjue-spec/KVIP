@@ -172,6 +172,7 @@ uint32_t v9_li(void*a,void*s,const rotating::RuntimeShape*){return step(2,a,s);}
 uint32_t v9_resolve(void*a,void*s,const rotating::RuntimeShape*){return step(3,a,s);}
 extern "C" uint32_t kvop_direct_update_outputs_early(uint32_t batch,void*a,void*s){assert(batch==16);assert(a==(void*)2);return step(4,(void*)1,s);}
 extern "C" uint32_t aclrtlaunch_v9_fetch_update_kernel(uint32_t batch,void*s,void*a,void*update){assert(batch==16);assert(update==(void*)2);return step(5,a,s);}
+extern "C" uint32_t aclrtlaunch_kvip_transport_snapshot_kernel(uint32_t,void*,void*,void*,uint32_t){assert(false);return 1;}
 """
     main = r"""
 int main(){rotating::RuntimeShape shape{};shape.batch=16;for(fail=0;fail<=5;++fail){count=0;assert(kvip_lifetch_forward((void*)1,(void*)2,stream_expected,&shape)==(fail?99:0));assert(count==(fail?fail:5));}return 0;}
@@ -567,3 +568,73 @@ def test_failed_wqe_audit_checks_completion_addresses_and_registration():
     remote[0] = 0x100100000
     result = audit_wqes(sq, entity, 32767, remote, np.array([-1, 1]), 656)
     assert result["source_out_of_range"] == result["destination_out_of_range"] == 1
+
+
+def test_transport_snapshot_uses_device_launcher(tmp_path):
+    import numpy as np
+    from types import SimpleNamespace
+    from prefetch_audit import snapshot_failed_transport
+
+    buffers = {}
+    calls = []
+
+    class Tensor:
+        def __init__(self, data, address=0):
+            self.data, self.address = data, address
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self.data
+
+        def data_ptr(self):
+            return self.address
+
+    def allocate(size, **kwargs):
+        address = 0x100000 + 0x10000 * len(buffers)
+        buffers[address] = np.zeros(size, dtype=np.uint8)
+        return Tensor(buffers[address], address)
+
+    def launch(source, destination, size, stream):
+        calls.append((source, size))
+        assert stream == 123
+        for base, data in sources.items():
+            if base <= source and source + size <= base + data.nbytes:
+                offset = source - base
+                buffers[destination][:] = data.view(np.uint8).reshape(-1)[offset : offset + size]
+                return 0
+        raise AssertionError(f"Unregistered diagnostic source {source:#x}")
+
+    entity = np.zeros(48, dtype="<u4")
+    entity[19], entity[31], entity[32] = 4, 4, 64
+    entity.view("<u8")[7], entity.view("<u8")[13] = 0x3000, 0x4000
+    queue = np.zeros(8, dtype="<u8")
+    queue[2] = 3
+    sources = {
+        0x1000: entity,
+        0x2000: queue,
+        0x3000: np.zeros(256, dtype=np.uint8),
+        0x4000: np.zeros(256, dtype=np.uint8),
+    }
+    args = np.zeros((2, 14), dtype="<u8")
+    args[1, 8:10] = [0x1000, 0x2000]
+    args[1].view("<u4")[23] = 656
+    posts = np.zeros((1, 1, 32), dtype=np.uint32)
+    posts[0, 0, :2], posts[0, 0, 6] = [2, 1], 3
+    torch = SimpleNamespace(
+        empty=allocate, uint8=None, npu=SimpleNamespace(current_stream=lambda device: SimpleNamespace(npu_stream=123))
+    )
+    rotating = SimpleNamespace(
+        torch=torch,
+        device=5,
+        library=SimpleNamespace(kvip_transport_snapshot=launch),
+        fallback_addresses=Tensor(np.zeros(2, dtype=np.uint64)),
+        destinations=Tensor(np.zeros(2, dtype=np.uint32)),
+    )
+    result = snapshot_failed_transport(
+        SimpleNamespace(device_args=Tensor(args)), rotating, posts, [{"request": 0}], tmp_path
+    )
+    assert calls == [(0x1000, 192), (0x2000, 64), (0x30C0, 64), (0x3000, 64), (0x40C0, 64)]
+    assert result["checked"] == 2 and result["queue_count"] == 1
+    assert (tmp_path / "transport_snapshot.npz").is_file()
