@@ -228,3 +228,19 @@ The matrix includes B1/B8/B16, history 65536/131072, resident 8192/16384,
 retains native/fused byte checks, SFA checks, stateful checks and graph timings.
 The runtime conversion changes scalar plumbing and generated code; preserved
 formulas alone do not prove unchanged device performance. A5 validation is required.
+
+## Known vLLM integration limitation
+
+The service has observed `InvalidQueue` when an ordinary leased KVAF Get follows
+LIFetch on shared persistent queues. The root cause is unresolved; successful
+standalone operator tests do not establish that this mixed call sequence is safe.
+This does not identify all KVAF Get calls, or the native submission inside
+LIFetch, as failing paths.
+
+The current vLLM workaround copies retiring ABC tokens directly into hot HBM
+before the next forward overwrites their ABC positions. It avoids the ordinary
+Get previously used for this promotion, including across the ABC ring boundary.
+The user verified this service path runs. Initial history restoration and fused
+final fetch still retain their existing Get paths; this is not a general queue
+handoff fix. Do not reintroduce an ordinary Get for ABC promotion without resolving
+and validating the shared-queue handoff. Include this limitation in the merge PR.

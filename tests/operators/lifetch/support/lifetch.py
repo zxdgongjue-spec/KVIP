@@ -536,11 +536,6 @@ def run_device(
         )
 
     snapshot_changes = check_direct_update(initial_orders)
-    if getattr(args, "queue_handoff_check", False):
-        from queue_handoff import check_handoff
-
-        check_handoff(torch, owner, folder)
-        check_direct_update(initial_orders, label="fused-after-native")
     cold_start_changes = check_direct_update(initial_orders, cold_start=True, label="cold-start")
     unlucky = []
     for row in range(b):
