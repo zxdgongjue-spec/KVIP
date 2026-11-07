@@ -107,9 +107,9 @@ older patched dependency. `--prepare-only` prepares source without compiling;
 `--transport ubmem` builds the worker-local Host DDR allocator and optimized
 Get/Put kernels without UMDK or CPU services. Local page modes are `thp` (default)
 and `base`; `huge` is rejected. URMA remains the default build. The independent
-UBmem fused operator retains its 8192 fallback slots between resident storage
-and the configurable ABC ring; upstream URMA fusion uses persistent hot slots.
-Both layouts share incremental page publication and background Put ownership.
+UBmem and URMA fused operators both repair final misses in persistent hot slots,
+followed by the configurable ABC ring. Both share incremental page publication
+and background Put ownership.
 
 The original LIDU build uses its own `csrc/operators/lidu/build` directory.
 
@@ -271,3 +271,11 @@ Rebuild UBmem fusion and use the matching vLLM integration before serving. Sourc
 hashes include the shared headers and old ABI 1 libraries are rejected. Resident
 capacity must be at least 8192 for the worst-case Q4 union. No KVAF runtime or URMA
 transport change is needed.
+
+Both bindings default to 512 speculative fetches per request/round, accept a
+total budget of 0..2048, and cap each window at its configured allowance (at
+most 480). Device admission shares the same saturating budget calculation.
+The final TopK repair is independent of this speculative budget: setting it to
+zero disables prefetch but still retrieves every required cold row. The UBmem
+smoke check accepts `--prefetch-tokens 0 512` to check both cases, including eager
+execution, graph replay, changed owner packing, and Index/payload consistency.

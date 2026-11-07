@@ -25,7 +25,7 @@ def payload(owner, tokens, token_bytes):
     return values
 
 
-def check_shape(kvaf, torch, build, device_id, shape, library):
+def check_shape(kvaf, torch, build, device_id, shape, library, prefetch_tokens=512):
     batch, history, resident, token_bytes = shape.batch, shape.history, shape.resident, shape.token_bytes
     device = torch.device(f"npu:{device_id}")
     block_bytes = 128 * token_bytes
@@ -95,6 +95,7 @@ def check_shape(kvaf, torch, build, device_id, shape, library):
             token_addresses=storage.addresses,
             output_stride=stride,
             scratch=workspace.scratch,
+            prefetch_limit=prefetch_tokens,
         )
         # Match KVCachePolicy.prepare: candidates and their inverse reservation
         # map are one input. Binding initializes reservations to -1, so publish
@@ -126,6 +127,11 @@ def check_shape(kvaf, torch, build, device_id, shape, library):
             assert not np.any(counters[:, 0]), "UBmem copy failed"
             assert np.array_equal(counters[:, 1], counters[:, 2]), "UBmem prefetch incomplete"
             assert np.array_equal(counters[:, 3], counters[:, 4]), "UBmem final fetch incomplete"
+            assert np.all(counters[:, 1] <= prefetch_tokens), "Prefetch exceeded its total budget"
+            epochs = rotating.rows.cpu().numpy()[:, 16 : 16 + rotating.rounds]
+            assert np.all(epochs <= max(1, prefetch_tokens // shape.intermediate_fetches)), (
+                "Prefetch exceeded its per-window budget"
+            )
             logical = update.logical_output.cpu().numpy().reshape(batch * 4, 2048)
             slots = update.slot_output.cpu().numpy().reshape(batch * 4, 2048)
             if padding:
@@ -182,6 +188,9 @@ def check_shape(kvaf, torch, build, device_id, shape, library):
         verify(list(range(1, batch + 1)), phase="eager")
         first_counters = rotating.ubmem_status.cpu().numpy()
         assert np.any(first_counters[:, 1] + first_counters[:, 3]), "Fixture did not exercise a cold DDR fetch"
+        assert np.all(first_counters[:, 3] >= 2048 - prefetch_tokens), (
+            "Final repair must fetch all missing TopK rows even beyond the speculative budget"
+        )
         graph = kvaf.AclGraph()
         with lease.capture_scope():
             graph.capture_begin(stream)
@@ -237,6 +246,7 @@ def check_shape(kvaf, torch, build, device_id, shape, library):
             runtime.shutdown()
     print(
         f"UBMEM_LIFETCH_PASS device={device_id} batch={batch} token_bytes={token_bytes} "
+        f"prefetch_tokens={prefetch_tokens} "
         "put=topk=fetch=index_update=graph=packed_queries=padding"
     )
 
@@ -250,6 +260,7 @@ def main():
     parser.add_argument("--token-bytes", type=int, nargs="+", default=[656, 2624])
     parser.add_argument("--history", type=int, default=33024)
     parser.add_argument("--resident", type=int, default=8192)
+    parser.add_argument("--prefetch-tokens", type=int, nargs="+", default=[512])
     args = parser.parse_args()
     import kvaf
     import torch
@@ -267,7 +278,8 @@ def main():
         for token_bytes in args.token_bytes:
             shape = Specialization(batch, args.history, args.resident, 64, token_bytes, aics, 8, args.soc)
             library = build_specialization(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape)
-            check_shape(kvaf, torch, build, args.device, shape, library)
+            for prefetch_tokens in args.prefetch_tokens:
+                check_shape(kvaf, torch, build, args.device, shape, library, prefetch_tokens)
 
 
 if __name__ == "__main__":

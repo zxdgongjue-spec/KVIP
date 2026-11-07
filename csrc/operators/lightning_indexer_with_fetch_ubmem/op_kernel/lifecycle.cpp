@@ -105,7 +105,7 @@ extern "C" __global__ __aicore__ void kvip_ubmem_init_kernel(GM_ADDR bindings) {
         uint32_t error=(!ctx->ubmemStatus || !UbmemRegionValid(region) || !ctx->tokenAddresses ||
             !ctx->lruSlots || !ctx->reservedHot || !ctx->changeSlots || !ctx->changeCount ||
             ctx->addressStride<SIM_HISTORY || stride<SIM_RESIDENT || (stride-SIM_RESIDENT)%128 || (ctx->tailBounds && stride<SIM_RESIDENT+384) ||
-            rowBytes%32 || ctx->prefetchLimit>kSlots || !ctx->windowLimit || ctx->windowLimit>480)?kUbmemInvalidRegion:0;
+            rowBytes%32 || ctx->prefetchLimit>kLruSlots || !ctx->windowLimit || ctx->windowLimit>480)?kUbmemInvalidRegion:0;
         if(!error && (rowBytes>region->outputBytes || owner>region->outputBytes/rowBytes-1))error=kUbmemInvalidRegion;
         row->reserved0=0;row->reserved1=0;row->reserved2=0;
         row->addresses=ctx->tokenAddresses+owner*ctx->addressStride*8;

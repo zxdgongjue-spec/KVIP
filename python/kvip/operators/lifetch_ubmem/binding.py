@@ -5,7 +5,7 @@ import ctypes
 
 import numpy as np
 
-from kvip.operators.lifetch.geometry import final_aivs, li_geometry
+from kvip.operators.lifetch.geometry import final_aivs, li_geometry, prefetch_budget
 from kvip.operators.lifetch_ubmem.specialization import query
 from kvip.operators.lifetch_ubmem.workspace import device_words, rotation_spec
 
@@ -27,8 +27,8 @@ class UbmemBinding:
         tail_bounds=None,
         output_stride=None,
         scratch=None,
-        prefetch_limit=2048,
-        window_limit=480,
+        prefetch_limit=512,
+        window_limit=None,
     ):
         self.torch, self.lease, self.shape = torch, lease, shape
         self.library = ctypes.CDLL(str(library))
@@ -55,8 +55,7 @@ class UbmemBinding:
             raise ValueError("UBmem fusion ABI 2 is required")
         if lease.context["token_bytes"] != shape.token_bytes or lease.context["tokens_per_block"] != 128:
             raise ValueError("UBmem kernel and KVAF slot geometry differ")
-        if not 0 <= prefetch_limit <= 8192 or not 1 <= window_limit <= 480:
-            raise ValueError("Invalid UBmem admission budget")
+        prefetch_limit, window_limit = prefetch_budget(prefetch_limit, window_limit, shape.intermediate_fetches)
         geometry = li_geometry(shape.batch, "auto", shape.intermediate_fetches, shape.aic_count)
         self.rounds, self.service_lanes = geometry["intermediate_fetches"], geometry["service_aivs_per_window"]
         self.final_workers = final_aivs(shape.batch, "auto", shape.aic_count)

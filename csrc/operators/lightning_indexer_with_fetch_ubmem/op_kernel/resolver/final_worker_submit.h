@@ -24,21 +24,9 @@ __aicore__ inline void PublishFinalWorker(__gm__ Context* ctx,__gm__ Row* row,
     // address vectors. Each destination sector belongs to one final AIV.
     UbmemCopyTrace trace;trace.Begin();
     UbmemFinalCopyPipeline copyPipe(ctx,row->output,local.ReinterpretCast<uint8_t>());
-    // ReplicatedResolve assigns slot=SIM_RESIDENT+row->slots+rank until
-    // capacity is exhausted. Walk only this AIV's two-row sector pairs in
-    // that case, rather than loading every other worker's slot in scalar.
-    // Recycled slots need the original full scan because their gaps are not
-    // predictable from rank. Keep the actual slot/owner and Add checks below.
-    const bool consecutive=!ctx->lruSlots && !ctx->hotValid && !ctx->reservedHot && row->slots<=kSlots && batchCount<=kSlots-row->slots;
-    const uint32_t firstSlot=SIM_RESIDENT+row->slots;
-    uint32_t firstRank=0;
-    if(consecutive) {
-        const uint32_t pairOwner=(firstSlot>>1)%kFinalWorkers;
-        const uint32_t pairs=(w+kFinalWorkers-pairOwner)%kFinalWorkers;
-        firstRank=pairs?2*pairs-(firstSlot&1):0;
-    }
-    for(uint32_t rank=firstRank;rank<batchCount;
-        rank+=consecutive?(((firstSlot+rank)&1)?2*kFinalWorkers-1:1):1) {
+    // Recycled hot slots are not consecutive. Sector ownership prevents two
+    // AIVs from overwriting opposite halves of an unaligned KV row boundary.
+    for(uint32_t rank=0;rank<batchCount;++rank) {
         uint32_t slot=slots.GetValue(rank);
         if(UbmemDestinationOwner(slot,kFinalWorkers)!=w)continue;
         ++scheduled;

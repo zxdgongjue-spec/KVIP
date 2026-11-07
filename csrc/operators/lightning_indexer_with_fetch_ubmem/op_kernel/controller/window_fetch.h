@@ -3,6 +3,7 @@ static_assert(V9_WINDOW_COPY_ENGINE >= 0 && V9_WINDOW_COPY_ENGINE <= 4,
               "Invalid UBmem window copy engine");
 #include "fetch_profiling.h"
 #include "device_utils.h"
+#include "../../../common/lifetch/prefetch_budget.h"
 
 #include "post_geometry.h"
 #include "ubmem_copy.h"
@@ -511,10 +512,8 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
         uint32_t count=0,missing=0;
         if(candidateCount) {
             auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*SIM_HISTORY;
-            uint32_t available=ctx->windowLimit;
-            uint32_t room=slots<state.GetValue(208)?state.GetValue(208)-slots:0;if(available>room)available=room;
-            room=requests<state.GetValue(209)?state.GetValue(209)-requests:0;if(available>room)available=room;
-            room=requests<state.GetValue(210)?state.GetValue(210)-requests:0;if(available>room)available=room;
+            uint32_t available=PrefetchAllowance(slots,requests,state.GetValue(208),
+                state.GetValue(209),state.GetValue(210),ctx->windowLimit);
             if(!slots && !ctx->tailBounds) {
                 // No slot has ever been assigned: the OR bitmap already
                 // deduplicated tokens, so every candidate is a new miss.
