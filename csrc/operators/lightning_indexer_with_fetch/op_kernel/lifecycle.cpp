@@ -47,6 +47,8 @@ V9_CQ_INLINE CqDrainResult DrainCq(Access& access, uint64_t consumer,
 #include "index_cache_update.h"
 using namespace AscendC;
 using namespace rotating;
+// Extend fused CQ waits to 10x the native polling budget (not wall-clock time).
+constexpr uint32_t kFusedCqPollMultiplier = 10U;
 #if V9_RESOLVER_COMPARE
 namespace resolver_original { using namespace rotating;
 #define rotating original_body
@@ -95,7 +97,7 @@ __aicore__ inline CqDrainResult DrainQueue(
     CqAccess access{reinterpret_cast<__gm__ uint8_t*>(entity->cq_va),entity->cqe_size,
         reinterpret_cast<__gm__ uint32_t*>(entity->cq_db_va),queue};
     auto result=DrainCq(access,queue->cq_consumer_index,entity->cq_depth,pending,
-        kvaf_device::kMaxCqPolls,kvaf_device::kInvalidArgs,kvaf_device::kCqError,kvaf_device::kCqTimeout);
+        kvaf_device::kMaxCqPolls*kFusedCqPollMultiplier,kvaf_device::kInvalidArgs,kvaf_device::kCqError,kvaf_device::kCqTimeout);
     queue->completed_batch_count+=result.completed;
     return result;
 }
