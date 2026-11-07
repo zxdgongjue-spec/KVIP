@@ -10,7 +10,7 @@ from device_trace import collect_core, core_summary
 from index_update import DirectCacheUpdate, permutation_records
 from kvip.operators.lifetch.forward import LIFetchForward
 from kvip.runtime.loader import load_lifetch_library
-from prefetch_audit import actual_reads, completion_failures
+from prefetch_audit import actual_reads, completion_failures, snapshot_failed_transport
 from runner import progress
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -408,10 +408,19 @@ def run_device(
         if failures:
             phase = state.get("check_phase", "graph replay")
             path = folder / "completion_failure.json"
-            path.write_text(json.dumps(dict(phase=phase, requests=failures), indent=2))
+            try:
+                transport = snapshot_failed_transport(owner, rotating, posts, failures, folder)
+            except Exception as exc:
+                transport = dict(snapshot_error=f"{type(exc).__name__}: {exc}")
+            path.write_text(json.dumps(dict(phase=phase, requests=failures, transport=transport), indent=2))
+            brief = {key: value for key, value in transport.items() if key != "queues"}
+            bad_queue = next((q for q in transport.get("queues", []) if q["examples"]), None)
+            if bad_queue:
+                brief["first_bad_wqe"] = {k: bad_queue[k] for k in ("request", "worker", "examples")}
+            print(f"TRANSPORT AUDIT: {json.dumps(brief)}", flush=True)
             raise AssertionError(
                 f"completion failed phase={phase}; bad_requests={len(failures)}; "
-                f"first={json.dumps(failures[0])}; full={path}"
+                f"transport={json.dumps(brief)}; first={json.dumps(failures[0])}; full={path}"
             )
         owner.mark_completed(completion_verified=True)
         if updated:

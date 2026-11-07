@@ -538,3 +538,32 @@ def test_completion_diagnostics_distinguish_transport_states():
     failed[0, 2] = 7
     result = completion_failures(rows, posts, statuses, cq, failed)
     assert len(result) == 1 and result[0]["final_cq"][0][2] == 7
+
+
+def test_failed_wqe_audit_checks_completion_addresses_and_registration():
+    import numpy as np
+    from prefetch_audit import audit_wqes
+
+    entity = np.zeros(48, dtype="<u4")
+    meta = entity.view("<u8")
+    meta[1], meta[2], meta[4], meta[5] = 0x100000000, 0x100000, 0x200000000, 0x100000
+    entity[19], entity[12] = 32768, 19
+    # Two wire-format READs straddle the SQ owner-bit boundary. Only the last
+    # requests a CQ completion. Deliberately use fixed literals as the oracle.
+    sq = np.zeros((2, 16), dtype="<u4")
+    sq[:, 0] = [0xB0150000, 0x30360000]
+    sq[:, 1], sq[:, 2], sq[:, 12], sq[:, 13] = 0x600, 0x1000000, 656, 19
+    sq[:, 10], sq[:, 11], sq[:, 14], sq[:, 15] = [0, 656], 1, [0, 656], 2
+    remote = np.array([0x100000000, 0x100000290], dtype=np.uint64)
+    destinations = np.array([0, 1])
+    result = audit_wqes(sq, entity, 32767, remote, destinations, 656)
+    assert not result["mismatched_wqes"] and not result["source_out_of_range"]
+    broken = sq.copy()
+    broken[1, 0] = 0x30150000  # Missing completion bit/order.
+    broken[0, 10] += 1
+    result = audit_wqes(broken, entity, 32767, remote, destinations, 656)
+    assert result["mismatched_wqes"] == 2
+    assert result["mismatched_fields"][0] == result["mismatched_fields"][10] == 1
+    remote[0] = 0x100100000
+    result = audit_wqes(sq, entity, 32767, remote, np.array([-1, 1]), 656)
+    assert result["source_out_of_range"] == result["destination_out_of_range"] == 1
