@@ -638,3 +638,31 @@ def test_transport_snapshot_uses_device_launcher(tmp_path):
     assert calls == [(0x1000, 192), (0x2000, 64), (0x30C0, 64), (0x3000, 64), (0x40C0, 64)]
     assert result["checked"] == 2 and result["queue_count"] == 1
     assert (tmp_path / "transport_snapshot.npz").is_file()
+
+
+def test_saved_transport_summary_detects_aliases_and_completed_queues(tmp_path):
+    import json
+    import numpy as np
+    from prefetch_audit import summarize_saved_transport
+
+    entity = np.zeros(48, dtype="<u4")
+    entity[19], entity[21], entity[31], entity[32] = 32768, 64, 1024, 64
+    entity.view("<u8")[[7, 8, 13, 14]] = [0x100000, 0x400000, 0x500000, 0x600000]
+    raw = {}
+    queues = []
+    for worker in range(2):
+        key = f"b0_w{worker}"
+        raw[key + "_entity"] = entity
+        raw[key + "_queue"] = np.zeros(8, dtype="<u8")
+        raw[key + "_cq"] = np.zeros(16, dtype="<u4")
+        queues.append(
+            dict(request=0, worker=worker, pending=worker, head=2059, producer=2667, checked=608, consumer=34)
+        )
+    np.savez(tmp_path / "transport_snapshot.npz", **raw)
+    (tmp_path / "completion_failure.json").write_text(json.dumps(dict(phase="test", transport=dict(queues=queues))))
+    summary = summarize_saved_transport(tmp_path)
+    assert "queues=2 pending=1 completed=1" in summary
+    assert "producer_mismatch=0" in summary
+    assert "SQ_depth: {32768: 2}" in summary
+    assert "SQ: unique_base=1 overlapping_pairs=1 unique_doorbell=1" in summary
+    assert "CQ: unique_base=1 overlapping_pairs=1 unique_doorbell=1" in summary

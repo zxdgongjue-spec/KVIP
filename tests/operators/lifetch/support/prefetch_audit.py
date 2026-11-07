@@ -175,3 +175,83 @@ def snapshot_failed_transport(owner, rotating, posts, failures, folder):
         ready_cqs=sum(q["cq_ready"] for q in queues),
         queue_count=len(queues),
     )
+
+
+def summarize_saved_transport(folder):
+    """Inspect existing snapshots only: no ACL, kernel launch or queue mutation."""
+    import json
+    from collections import Counter
+    from pathlib import Path
+
+    folder = Path(folder)
+    failure = json.loads((folder / "completion_failure.json").read_text())
+    queues = failure["transport"]["queues"]
+    lines = ["SAVED TRANSPORT AUDIT: no device execution", f"phase={failure['phase']}"]
+    pending = [q for q in queues if q["pending"]]
+    lines.append(f"queues={len(queues)} pending={len(pending)} completed={len(queues) - len(pending)}")
+    lines.append("completed=" + str([(q["request"], q["worker"]) for q in queues if not q["pending"]]))
+    lines.append("producer_mismatch=" + str(sum(q["producer"] != q["head"] + q["checked"] for q in queues)))
+    fields, regions, doorbells = {}, {"SQ": [], "CQ": []}, {"SQ": [], "CQ": []}
+
+    def record(name, value):
+        fields.setdefault(name, []).append(int(value))
+
+    with np.load(folder / "transport_snapshot.npz", allow_pickle=False) as raw:
+        for q in queues:
+            key = f"b{q['request']}_w{q['worker']}"
+            entity = raw[key + "_entity"].astype("<u4", copy=False)
+            meta = entity.view("<u8")
+            state, cq = raw[key + "_queue"], raw[key + "_cq"]
+            for name, value in (
+                ("SQ_depth", entity[19]),
+                ("WQE_bytes", entity[21]),
+                ("CQ_depth", entity[31]),
+                ("CQE_bytes", entity[32]),
+                ("queue_initialized", state.view("<u4")[1]),
+                ("queue_error", state[4]),
+                ("queue_poisoned", state[5]),
+                ("SQ_head", q["head"]),
+                ("CQ_consumer", q["consumer"]),
+                ("CQ_completed_batches", state[3]),
+                ("local_token", entity[12]),
+                ("remote_token", entity[6]),
+                ("remote_token_value", entity[7]),
+                ("CQ_word0", cq[0]),
+            ):
+                record(name, value)
+            for kind, base, depth, size, db in (
+                ("SQ", meta[7], entity[19], entity[21], meta[8]),
+                ("CQ", meta[13], entity[31], entity[32], meta[14]),
+            ):
+                regions[kind].append((int(base), int(base) + int(depth) * int(size), key))
+                doorbells[kind].append(int(db))
+    for name, values in fields.items():
+        counts = Counter(values)
+        detail = (
+            dict(sorted(counts.items()))
+            if len(counts) <= 8
+            else f"min={min(values)} max={max(values)} unique={len(counts)}"
+        )
+        lines.append(f"{name}: {detail}")
+    for kind, spans in regions.items():
+        overlaps = [
+            (a[2], b[2]) for i, a in enumerate(spans) for b in spans[i + 1 :] if max(a[0], b[0]) < min(a[1], b[1])
+        ]
+        lines.append(
+            f"{kind}: unique_base={len({a[0] for a in spans})} overlapping_pairs={len(overlaps)} "
+            f"unique_doorbell={len(set(doorbells[kind]))} examples={overlaps[:3]}"
+        )
+    lines.append("CQ_consumer and SQ_head have different units; do not subtract them.")
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    import argparse
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(description="Summarize an existing transport_snapshot.npz without NPU execution")
+    parser.add_argument("folder", type=Path)
+    args = parser.parse_args()
+    summary = summarize_saved_transport(args.folder)
+    (args.folder / "transport_brief.log").write_text(summary + "\n")
+    print(summary)
