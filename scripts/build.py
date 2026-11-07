@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-REVISION = "c4375e13d7a9519d907ab6a5d11227795f207286"
+REVISION = "1c1310387ebfb6776a07316874e924265b209ada"
 PATCHES = ("kvaf-reuse-device-ra", "kvaf-fused-context", "kvaf-fused-output-views")
 
 
@@ -84,7 +84,11 @@ def main():
     )
     if not args.skip_kvaf_build:
         for target in ("cpu", "npu"):
-            call(["bash", dependency / "build.sh", target], cwd=dependency, env=env)
+            call(
+                ["bash", dependency / "build.sh", target, *(["--without-aicpu"] if target == "npu" else [])],
+                cwd=dependency,
+                env=env,
+            )
     call(["bash", ROOT / "csrc/operators/lidu/build_lidu_fused_batch_get_prepare_mtp.sh"], env=env)
     # Editable install intentionally retains csrc alongside the Python package.
     call([sys.executable, "-m", "pip", "install", "--no-build-isolation", "-e", ROOT])

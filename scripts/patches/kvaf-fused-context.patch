@@ -14,16 +14,16 @@ index cd60dbaf..3b81bbaa 100644
 @@ -10,7 +12,7 @@
  // consume indices/offsets/output_indices directly without mask compaction.
  using namespace AscendC;
-
+ 
 -namespace {
 +namespace kvaf_device {
-
+ 
  constexpr uint32_t kEntityMagic = 0x4b564155U;  // "KVAU"
  constexpr uint32_t kEntityVersion = 1U;
 @@ -583,11 +585,11 @@ __aicore__ inline uint64_t WaitForCompletion(
    return kCqTimeout;
  }
-
+ 
 -}  // namespace
 -
 -extern "C" __global__ __aicore__ void KvafExecuteBatchGetAivKernelV2(
@@ -38,7 +38,7 @@ index cd60dbaf..3b81bbaa 100644
        args.jettys_per_core == 0U ? 1U : args.jettys_per_core;
    if (args.block_count == 0U || core >= args.block_count ||
 @@ -605,10 +607,13 @@ extern "C" __global__ __aicore__ void KvafExecuteBatchGetAivKernelV2(
-
+ 
    __gm__ const int32_t *const miss_count_input =
        reinterpret_cast<__gm__ const int32_t *>(args.miss_count);
 -  const int32_t miss_count_value = *miss_count_input;
@@ -52,7 +52,7 @@ index cd60dbaf..3b81bbaa 100644
 +      (!explicit_range || request_begin <= args.request_capacity - request_count);
    const uint32_t miss_count =
        miss_count_valid ? static_cast<uint32_t>(miss_count_value) : 0U;
-
+ 
 @@ -638,10 +643,10 @@ extern "C" __global__ __aicore__ void KvafExecuteBatchGetAivKernelV2(
    uint64_t completion_polls[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE] = {};
    ExecutionCounters counters;
@@ -65,11 +65,11 @@ index cd60dbaf..3b81bbaa 100644
 +  const uint32_t end = explicit_range ? request_begin + miss_count : static_cast<uint32_t>(
        (static_cast<uint64_t>(miss_count) * (core + 1U)) /
        args.block_count);
-
+ 
 @@ -848,7 +853,5 @@ extern "C" __global__ __aicore__ void KvafExecuteBatchGetAivKernelV2(
    }
  }
-
+ 
 -static const struct FunLevelKType
 -    KvafExecuteBatchGetAivKernelV2_kernel_type_section __attribute__(
 -        (used, section(".ascend.meta.KvafExecuteBatchGetAivKernelV2"))) =
@@ -86,11 +86,11 @@ index 00000000..e195ee65
 +// Public schedule policy is shared with the standalone BatchGet kernel.
 +#include "batch_get_schedule.h"
 diff --git a/access_operator/demo/aiv_batch_get/kernel/CMakeLists.txt b/access_operator/demo/aiv_batch_get/kernel/CMakeLists.txt
-index b84905dd..1b7e7bb5 100644
+index e45c74ea..41757ace 100644
 --- a/access_operator/demo/aiv_batch_get/kernel/CMakeLists.txt
 +++ b/access_operator/demo/aiv_batch_get/kernel/CMakeLists.txt
-@@ -68,6 +68,7 @@ add_custom_command(
-   DEPENDS "${KVAF_EXECUTE_KERNEL_SOURCE}"
+@@ -19,6 +19,7 @@ add_custom_command(
+           "${KVAF_OPERATOR_INCLUDE}/ubmem/copy.h" "${KVAF_OPERATOR_INCLUDE}/ubmem/batch_abi.h"
            "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_abi.h"
            "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_schedule.h"
 +          "${KVAF_AIV_DEMO_INCLUDE_DIR}/kvaf_batch_get_device.h"
@@ -113,14 +113,45 @@ new file mode 100644
 +    KvafExecuteBatchGetAivKernelV2_kernel_type_section __attribute__(
 +        (used, section(".ascend.meta.KvafExecuteBatchGetAivKernelV2"))) =
 +        {{F_TYPE_KTYPE, sizeof(unsigned int), K_TYPE_AIV}};
+
 diff --git a/access_operator/include/access_operator.h b/access_operator/include/access_operator.h
-index 0a8a182b..21260332 100644
+index f2df07b6..bf01f4ed 100644
 --- a/access_operator/include/access_operator.h
 +++ b/access_operator/include/access_operator.h
-@@ -85,6 +85,24 @@ struct BatchGetKernelProfile {
-   std::uint64_t peak_submitted_not_drained{0};
+@@ -17,6 +17,7 @@ class PeerLink;
+ namespace kvaf {
+ 
+ struct PutAccessDesc;
++struct FusedBatchGetContext;
+ using PeerLink = peer::PeerLink;
+ 
+ struct BatchPutExecRequest {
+@@ -37,6 +38,21 @@ class AccessOperator {
+   virtual Status ExecuteBatchGet(const BatchGetExecRequest& request) = 0;
+   virtual Status ExecuteBatchPut(const BatchPutExecRequest& request) = 0;
+ 
++  // Optional capability: only the AIV backend exports fused queue leases.
++  virtual Status AcquireFusedBatchGetContext(
++      void*, std::uint64_t, std::uint32_t, std::uint32_t,
++      FusedBatchGetContext*) {
++    return Status::NotImplemented("This backend does not support fused BatchGet");
++  }
++  virtual Status RegisterFusedBatchGetOutput(
++      const FusedBatchGetContext&, void*, std::uint64_t, FusedBatchGetContext*) {
++    return Status::NotImplemented("This backend does not support fused BatchGet");
++  }
++  virtual Status ReleaseFusedBatchGetContext(const FusedBatchGetContext&, void*) {
++    return Status::NotImplemented("This backend does not support fused BatchGet");
++  }
++
++
  };
-
+ 
+ // Configuration for the current NPU-backed default implementation. Transport
+@@ -90,6 +106,24 @@ struct BatchGetKernelProfile {
+   std::uint64_t ubmem_drain_cycles{0};
+ };
+ 
 +// Borrowed device resources for a caller-launched fused kernel. KVAF retains
 +// the registrations and queue storage until ReleaseFusedBatchGetContext.
 +// Queue cursors are persistent: never clear them between kernel invocations.
@@ -142,10 +173,10 @@ index 0a8a182b..21260332 100644
  // Default synchronous NPU data-plane implementation.
  //
  // Initialize creates reusable BatchGet and (when configured) BatchPut
-@@ -110,6 +128,17 @@ class DefaultAccessOperator final : public AccessOperator {
+@@ -115,6 +149,17 @@ class DefaultAccessOperator final : public AccessOperator {
    Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
    Status ExecuteBatchPut(const BatchPutExecRequest& request) override;
-
+ 
 +  Status AcquireFusedBatchGetContext(
 +      void* output, std::uint64_t output_bytes, std::uint32_t token_bytes,
 +      std::uint32_t tokens_per_block, FusedBatchGetContext* context);
@@ -175,7 +206,7 @@ index 43b69c31..46f3c251 100644
 @@ -43,6 +44,25 @@ struct BatchGetExecutionState {
    std::size_t queue_state_bytes{0};
  };
-
+ 
 +Status CheckBatchGetQueueHealth(const BatchGetExecutionState& execution,
 +                               std::uint32_t workers,
 +                               std::uint32_t jettys_per_core) {
@@ -213,7 +244,7 @@ index 43b69c31..46f3c251 100644
 @@ -300,9 +325,18 @@ struct DefaultAccessOperator::Impl {
  DefaultAccessOperator::DefaultAccessOperator(AccessOperatorConfig config)
      : impl_(std::make_unique<Impl>(std::move(config))) {}
-
+ 
 -DefaultAccessOperator::~DefaultAccessOperator() { (void)Shutdown(); }
 +DefaultAccessOperator::~DefaultAccessOperator() {
 +  if (!Shutdown().ok()) {
@@ -224,7 +255,7 @@ index 43b69c31..46f3c251 100644
 +    (void)impl_.release();
 +  }
 +}
-
+ 
  Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) {
 +  std::lock_guard<std::mutex> lock(impl_->batch_get_mutex);
    if (impl_->initialized) {
@@ -232,7 +263,7 @@ index 43b69c31..46f3c251 100644
    }
 @@ -454,9 +488,14 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region)
  }
-
+ 
  Status DefaultAccessOperator::Shutdown() {
 +  std::lock_guard<std::mutex> lock(impl_->batch_get_mutex);
    if (!impl_->initialized) {
@@ -242,12 +273,12 @@ index 43b69c31..46f3c251 100644
 +    return Status::Busy("release the fused BatchGet context before shutdown; "
 +                        "a failed release requires device/process teardown");
 +  }
-
+ 
    // Callers must complete all submitted streams before Runtime::Shutdown,
    // including the default enqueue-only Python BatchGet path.
 @@ -484,10 +523,14 @@ Status DefaultAccessOperator::Shutdown() {
  }
-
+ 
  Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
 +  std::lock_guard<std::mutex> lock(impl_->batch_get_mutex);
    if (!impl_->initialized || impl_->transport == nullptr) {
@@ -263,7 +294,7 @@ index 43b69c31..46f3c251 100644
 @@ -532,11 +575,93 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
    return Status::OK();
  }
-
+ 
 +Status DefaultAccessOperator::AcquireFusedBatchGetContext(
 +    void* output, std::uint64_t output_bytes, std::uint32_t token_bytes,
 +    std::uint32_t tokens_per_block, FusedBatchGetContext* context) {
@@ -359,16 +390,16 @@ index 2e1f81b1..03cf4a6b 100644
 --- a/bindings/include/npu_python_runtime.h
 +++ b/bindings/include/npu_python_runtime.h
 @@ -6,6 +6,8 @@ namespace kvaf {
-
+ 
  // Registered only in a CANN build. Keep this separate from the portable
  // binding so a normal Mac/CPU build never includes ACL or Direct-HCCP headers.
 +// Fused context methods retain output and the selected stream until native
 +// fenced release succeeds; the dict is not a version-specific device ABI.
  void BindNpuPythonRuntime(pybind11::module_& module);
-
+ 
  }  // namespace kvaf
 diff --git a/bindings/src/npu_python_runtime.cc b/bindings/src/npu_python_runtime.cc
-index c68f5a84..f3e1de33 100644
+index 9de4be92..1749a07d 100644
 --- a/bindings/src/npu_python_runtime.cc
 +++ b/bindings/src/npu_python_runtime.cc
 @@ -5,6 +5,7 @@
@@ -379,10 +410,10 @@ index c68f5a84..f3e1de33 100644
  #include <limits>
  #include <memory>
  #include <stdexcept>
-@@ -208,6 +209,21 @@ aclrtStream ResolveStream(const py::object& stream) {
-   return acl_python::StreamFromPython(torch.attr("npu").attr("current_stream")());
+@@ -264,6 +265,21 @@ py::dict BatchGetProfileDict(const BatchGetProfile& profile) {
+   return result;
  }
-
+ 
 +py::dict FusedContextDict(const FusedBatchGetContext& context) {
 +  py::dict result;
 +  result["lease_id"] = context.lease_id;
@@ -401,10 +432,10 @@ index c68f5a84..f3e1de33 100644
  class NpuPythonRuntime final {
   public:
    NpuPythonRuntime(std::string batch_get_kernel_object_path,
-@@ -239,6 +255,22 @@ class NpuPythonRuntime final {
-     native_ = std::make_unique<::kvaf::NpuRuntime>(std::move(options));
+@@ -303,6 +319,22 @@ class NpuPythonRuntime final {
+     aicpu_backend_ = native_->uses_aicpu();
    }
-
+ 
 +  ~NpuPythonRuntime() {
 +    if (fused_context_.lease_id != 0U) {
 +      // GC is not proof that caller-launched DMA finished. Keep both the
@@ -424,10 +455,10 @@ index c68f5a84..f3e1de33 100644
    void LinkTo(std::string address) {
      ThrowIfError(native_->LinkTo(LinkTarget{std::move(address)}));
    }
-@@ -259,6 +291,82 @@ class NpuPythonRuntime final {
+@@ -323,6 +355,82 @@ class NpuPythonRuntime final {
      return native_->batch_get_tokens_per_block();
    }
-
+ 
 +  py::dict AcquireFusedBatchGetContext(const py::object& output,
 +                                      const py::object& stream) {
 +    if (fused_context_.lease_id != 0U) {
@@ -507,8 +538,8 @@ index c68f5a84..f3e1de33 100644
    py::dict RemoteRegion() const {
      const RemoteRegionDesc& region = native_->core().remote_region();
      py::dict result;
-@@ -505,6 +613,11 @@ class NpuPythonRuntime final {
-
+@@ -585,6 +693,11 @@ class NpuPythonRuntime final {
+ 
   public:
    void Shutdown() {
 +    if (fused_context_.lease_id != 0U) {
@@ -518,8 +549,8 @@ index c68f5a84..f3e1de33 100644
 +    }
      ThrowIfError(native_->Shutdown());
    }
-
-@@ -513,6 +626,10 @@ class NpuPythonRuntime final {
+ 
+@@ -594,6 +707,10 @@ class NpuPythonRuntime final {
    // Runtime::BatchPut is synchronous, so these vectors can be reused after
    // each call and avoid allocator churn in the measured loop.
    BatchPutRequest batch_put_request_;
@@ -528,9 +559,9 @@ index c68f5a84..f3e1de33 100644
 +  py::object fused_stream_;
 +  aclrtStream fused_acl_stream_{nullptr};
  };
-
+ 
  }  // namespace
-@@ -548,6 +665,22 @@ void BindNpuPythonRuntime(py::module_& module) {
+@@ -614,6 +731,22 @@ void BindNpuPythonRuntime(py::module_& module) {
        .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),
             py::arg("slot_size"))
        .def("shutdown", &NpuPythonRuntime::Shutdown)
@@ -554,21 +585,21 @@ index c68f5a84..f3e1de33 100644
        .def_property_readonly("device_id", &NpuPythonRuntime::DeviceId)
        .def_property_readonly("npu_core_count", &NpuPythonRuntime::NpuCoreCount)
 diff --git a/runtime/include/npu_runtime.h b/runtime/include/npu_runtime.h
-index fb9a6c47..4af75a47 100644
+index 792ef60b..d2f04f2d 100644
 --- a/runtime/include/npu_runtime.h
 +++ b/runtime/include/npu_runtime.h
 @@ -6,6 +6,7 @@
  #include <utility>
  #include <vector>
-
+ 
 +#include "access_operator.h"
  #include "runtime.h"
-
- namespace kvaf {
-@@ -73,6 +74,15 @@ class NpuRuntime final : public Runtime {
+ #include "npu_runtime_config.h"
+ 
+@@ -84,6 +85,15 @@ class NpuRuntime final : public Runtime {
    Status CopyBatchGetKernelProfiles(
        std::vector<BatchGetKernelProfile>* profiles) const;
-
+ 
 +  // Acquire once before fused launches. KVAF registers this caller-owned HBM
 +  // output and exclusively leases its BatchGet queues; ordinary BatchGet and
 +  // another acquisition are rejected until release. All uses of the returned
@@ -582,15 +613,14 @@ index fb9a6c47..4af75a47 100644
    Status AcceptLink(const LinkTarget& peer) override;
    Status ReleaseLink(LinkId link_id) override;
 diff --git a/runtime/src/npu_runtime.cc b/runtime/src/npu_runtime.cc
-index 8c0ec7e4..10ac1229 100644
+index 14d208c5..c8773942 100644
 --- a/runtime/src/npu_runtime.cc
 +++ b/runtime/src/npu_runtime.cc
-@@ -488,7 +488,12 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
-
+@@ -566,6 +566,12 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
  NpuRuntime::~NpuRuntime() {
    if (impl_ != nullptr) {
--    (void)Shutdown();
-+    if (!Shutdown().ok()) {
+     const auto status = Shutdown();
++    if (!status.ok()) {
 +      std::fprintf(stderr, "[KVAF_AIV] FUSED_RUNTIME_RETAINED_ON_DESTRUCTION "
 +                           "reason=teardown_not_safe\n");
 +      (void)impl_.release();
@@ -598,11 +628,11 @@ index 8c0ec7e4..10ac1229 100644
 +    }
      impl_->runtime_core.reset();
      impl_->access_operator.reset();
-     impl_->ReleaseProbe();
-@@ -854,6 +859,24 @@ Status NpuRuntime::AcceptLink(const LinkTarget&) {
+     if (status.ok()) impl_->ReleaseProbe();
+@@ -995,6 +1001,24 @@ Status NpuRuntime::AcceptLink(const LinkTarget&) {
    return Status::NotImplemented("NpuRuntime does not accept links in the CPU--NPU deployment");
  }
-
+ 
 +Status NpuRuntime::AcquireFusedBatchGetContext(
 +    void* output, std::uint64_t output_bytes, FusedBatchGetContext* context) {
 +  if (!initialized() || impl_->access_operator == nullptr) {
@@ -624,46 +654,21 @@ index 8c0ec7e4..10ac1229 100644
  Status NpuRuntime::ReleaseLink(LinkId link_id) {
    if (link_id != 1U || impl_->peer_link == nullptr) return Status::NotFound("PeerLink was not found");
    const Status shutdown = Shutdown();
-@@ -878,6 +901,7 @@ Status NpuRuntime::Shutdown() {
-   const Status status = impl_->runtime_core != nullptr && impl_->runtime_core->initialized()
+@@ -1019,7 +1043,8 @@ Status NpuRuntime::Shutdown() {
+   const Status status = impl_->runtime_core != nullptr && impl_->runtime_core->needs_cleanup()
                              ? impl_->runtime_core->Shutdown()
                              : Status::OK();
+-  if (status.ok()) impl_->ReleaseProbe();
 +  if (!status.ok()) return status;
-   impl_->ReleaseProbe();
++  impl_->ReleaseProbe();
    return status;
  }
-diff --git a/runtime/src/runtime.cc b/runtime/src/runtime.cc
-index bafeec03..388bf440 100644
---- a/runtime/src/runtime.cc
-+++ b/runtime/src/runtime.cc
-@@ -116,6 +116,11 @@ Status RuntimeCore::Shutdown() {
-     return Status::NotInitialized("Runtime has not been initialized");
-   }
-
-+  // A device data plane can refuse teardown while a fused context is leased
-+  // or DMA completion is uncertain. Keep DDR and metadata locks intact then.
-+  const Status operator_status = access_operator_.Shutdown();
-+  if (!operator_status.ok()) return operator_status;
-+
-   Status first_error = Status::OK();
-   for (const auto& entry : access_tables_) {
-     const Status status = meta_manager_.UnlockKeys(entry.second->lock_context);
-@@ -125,10 +130,6 @@ Status RuntimeCore::Shutdown() {
-   }
-   access_tables_.clear();
-
--  const Status operator_status = access_operator_.Shutdown();
--  if (!operator_status.ok() && first_error.ok()) {
--    first_error = operator_status;
--  }
-   const Status release_status = ddr_allocator_.Release(remote_region_);
-   if (!release_status.ok() && first_error.ok()) {
-     first_error = release_status;
+ 
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 2ac97062..4454d357 100644
+index 2fb8b91d..017321cf 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -60,3 +60,13 @@ else()
+@@ -112,3 +112,13 @@ else()
    message(STATUS
      "Skipping direct Runtime Python tests; configure with -DKVAF_BUILD_PYTHON=ON")
  endif()
@@ -686,12 +691,12 @@ index b553e140..6bdaf7d3 100644
  #include "../access_operator/demo/aiv_batch_get/kernel/execute_batch_get_aiv.asc"
  #undef __attribute__
 +using namespace kvaf_device;
-
+ 
  #define CHECK(condition) do { if (!(condition)) { \
    std::cerr << "line " << __LINE__ << ": " #condition "\n"; std::exit(1); \
 @@ -204,6 +205,24 @@ struct Fixture {
  };
-
+ 
  int main() {
 +  // A fused caller owns a descriptor subrange, not the whole prefix. The
 +  // standalone entry point below still exercises the original partitioning.
@@ -716,10 +721,10 @@ index b553e140..6bdaf7d3 100644
                             {1, 16, 0}}) {
 diff --git a/tests/fused_batch_get_context_test.cc b/tests/fused_batch_get_context_test.cc
 new file mode 100644
-index 00000000..65e35f25
+index 00000000..847046e9
 --- /dev/null
 +++ b/tests/fused_batch_get_context_test.cc
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,219 @@
 +#include <cstdlib>
 +#include <cstring>
 +#include <iostream>
@@ -779,7 +784,8 @@ index 00000000..65e35f25
 +
 +void TestLeaseAndRuntimeTeardown() {
 +  driver = {};
-+  kvaf::DefaultAccessOperator op(Config());
++  kvaf::DefaultAccessOperator concrete(Config());
++  kvaf::AccessOperator& op = concrete;
 +  auto metadata = kvaf::CreateInMemoryMetaManager();
 +  Allocator allocator;
 +  kvaf::RuntimeCore runtime(*metadata, op, allocator);
@@ -812,11 +818,12 @@ index 00000000..65e35f25
 +          "reject concurrent lease");
 +  Require(op.ExecuteBatchGet({}).code() == kvaf::StatusCode::kBusy,
 +          "ordinary BatchGet cannot use leased queues");
-+  Require(op.SetBatchGetKernelProfiling(true).code() == kvaf::StatusCode::kBusy,
++  Require(concrete.SetBatchGetKernelProfiling(true).code() == kvaf::StatusCode::kBusy,
 +          "profiling cannot reset leased status");
 +  Require(runtime.Shutdown().code() == kvaf::StatusCode::kBusy,
 +          "runtime must propagate active lease");
-+  Require(runtime.initialized() && allocator.releases == 0 && driver.destroys == 0,
++  Require(!runtime.initialized() && runtime.needs_cleanup() &&
++              allocator.releases == 0 && driver.destroys == 0,
 +          "busy shutdown preserves remote DDR and transport");
 +  auto wrong = context;
 +  ++wrong.lease_id;

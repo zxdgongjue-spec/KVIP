@@ -1,0 +1,28 @@
+cmake_minimum_required(VERSION 3.16)
+project(kvip_update_sim LANGUAGES C CXX)
+set(CMAKE_BUILD_TYPE Release)
+set(RUN_MODE sim CACHE STRING "Execution target")
+set(SOC_VERSION Ascend950PR_9599 CACHE STRING "Target SoC")
+set(ASCEND_CANN_PACKAGE_PATH /usr/local/Ascend/cann-9.1.0 CACHE PATH "CANN")
+set(OP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../csrc/operators/lightning_indexer_with_fetch" CACHE PATH "Operator source")
+include(${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
+ascendc_library(update_kernel STATIC ${OP_ROOT}/op_kernel/index_cache_update.cpp)
+ascendc_include_directories(update_kernel PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)
+ascendc_compile_options(update_kernel PRIVATE -O2 -mllvm -user-reserved-ub-size=223232)
+add_executable(update_sim update_sim.cpp ${OP_ROOT}/op_host/index_cache_update.cpp)
+target_link_libraries(update_sim PRIVATE update_kernel host_intf_pub ascendcl)
+# Simulator driver symbols are provided by msprof's process launcher.
+target_link_options(update_sim PRIVATE -Wl,--allow-shlib-undefined)
+
+set(KVAF_INCLUDE "" CACHE PATH "Patched KVAF headers for resolver validation")
+if(KVAF_INCLUDE)
+  ascendc_library(resolver_kernel STATIC resolver_kernel.cpp)
+  ascendc_include_directories(resolver_kernel PRIVATE ${OP_ROOT}/include ${OP_ROOT}/op_kernel ${KVAF_INCLUDE}
+    ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)
+  ascendc_compile_options(resolver_kernel PRIVATE -O2 --cce-auto-sync=off -mllvm -user-reserved-ub-size=223232
+    -DV9_USER_UB_BYTES=223232 -DV9_SIMULATION=0 -DV9_BATCH_POST=2 -DSIM_CAPTURE_HITS=1)
+  add_executable(resolver_sim resolver_sim.cpp)
+  target_include_directories(resolver_sim PRIVATE ${OP_ROOT}/include ${KVAF_INCLUDE})
+  target_link_libraries(resolver_sim PRIVATE resolver_kernel host_intf_pub ascendcl)
+  target_link_options(resolver_sim PRIVATE -Wl,--allow-shlib-undefined)
+endif()
