@@ -73,19 +73,28 @@ __simt_callee__ inline void BuildUpdatePlan(__gm__ uint32_t* lru, __gm__ uint32_
   if (status[0]) return;
   // Consecutive per-thread ranges retain the CPU oracle's record order.
   constexpr uint32_t per = kPlanCandidates / Threads;
+  const uint32_t first = tid * per;
+  // Two bits per record retain both membership results across the prefix scan,
+  // so the append pass reuses them instead of probing the hash tables twice.
+  uint32_t appendFlags[(per + 15) / 16]{};
   uint32_t out = 0, free = 0;
-  for (uint32_t i = tid * per; i < (tid + 1) * per; ++i)
+  for (uint32_t j = 0; j < per; ++j) {
+    const uint32_t i = first + j;
     if (src[i] != UINT32_MAX) {
-      out += !PlanContains(srcSet, dst[i]);
-      free += !PlanContains(dstSet, src[i]);
+      const uint32_t outgoing = !PlanContains(srcSet, dst[i]);
+      const uint32_t freed = !PlanContains(dstSet, src[i]);
+      appendFlags[j / 16] |= (outgoing | (freed << 1)) << (2 * (j % 16));
+      out += outgoing;
+      free += freed;
     }
+  }
   uint32_t outRank = kPlanCandidates + PlanPrefix<Threads>(out, status + 32);
   uint32_t freeRank = kPlanCandidates + PlanPrefix<Threads>(free, status + 64);
-  for (uint32_t i = tid * per; i < (tid + 1) * per; ++i)
-    if (src[i] != UINT32_MAX) {
-      if (!PlanContains(srcSet, dst[i])) dst[outRank++] = dst[i];
-      if (!PlanContains(dstSet, src[i])) src[freeRank++] = src[i];
-    }
+  for (uint32_t j = 0; j < per; ++j) {
+    const uint32_t flags = appendFlags[j / 16] >> (2 * (j % 16));
+    if (flags & 1U) dst[outRank++] = dst[first + j];
+    if (flags & 2U) src[freeRank++] = src[first + j];
+  }
   // Extras move old outgoing destinations to the freed source rows.
   asc_syncthreads();
   for (uint32_t i = kPlanCandidates + tid; i < kPlanRecords; i += Threads) {
@@ -260,12 +269,29 @@ inline void MoveExtended(__gm__ uint64_t* a,uint32_t owner,uint32_t group,bool o
 }
 // Each worker owns disjoint key fields over ALL records. Snapshotting its
 // fields before scatter preserves arbitrary cycles without a cross-core wait.
+// Snapshot one field across every record before scattering it, so arbitrary
+// cycles still resolve without a cross-core wait.
+template<uint32_t Threads, class T>
+__simt_callee__ inline void MoveField(__gm__ T* values, __ubuf__ uint32_t* plan,
+                                     __ubuf__ T* staged, uint32_t count) {
+  asc_syncthreads();
+  for (uint32_t i = threadIdx.x; i < count; i += Threads)
+    staged[i] = asc_ldcg(values + plan[kTransferHeaderWords + 2 * i + 1]);
+  asc_syncthreads();
+  for (uint32_t i = threadIdx.x; i < count; i += Threads)
+    asc_stcg(values + (plan[kTransferHeaderWords + 2 * i] & ~kInvalidateHot), staged[i]);
+}
+
+// Each worker owns disjoint key fields over ALL records. Snapshotting its
+// fields before scatter preserves arbitrary cycles without a cross-core wait.
 template<uint32_t Threads>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
 inline void Move(__gm__ uint64_t* a, uint32_t owner, uint32_t group, bool owned,
                  __ubuf__ uint32_t* plan, __ubuf__ uint64_t* staged, uint32_t count) {
   uint32_t tid = threadIdx.x;
   auto keys = reinterpret_cast<__gm__ uint64_t*>(a[0]) + uint64_t(owner) * uint32_t(a[24]) * 16;
+  // Interleaved (row, field) order keeps consecutive threads on consecutive
+  // u64 words, so each warp touches one contiguous GM run.
   for (uint32_t i = tid; i < count * kKeyFieldsPerWorker; i += Threads) {
     uint32_t row = i / kKeyFieldsPerWorker, field = i % kKeyFieldsPerWorker;
     uint32_t src = plan[kTransferHeaderWords + 2 * row + 1];
@@ -277,27 +303,17 @@ inline void Move(__gm__ uint64_t* a, uint32_t owner, uint32_t group, bool owned,
     uint32_t dst = plan[kTransferHeaderWords + 2 * row] & ~kInvalidateHot;
     asc_stcg(keys + uint64_t(dst) * 16 + group * kKeyFieldsPerWorker + field, staged[i]);
   }
-  // Metadata lives in separate arrays, so this worker can overlap other key
-  // workers without overwriting any of their source bytes.
-  if (group == kCopyWorkers - 1) {
-    asc_syncthreads();
+  // Metadata lives in separate arrays, so these workers can overlap the key
+  // scatter without overwriting any other worker's source bytes.
+  if (group == 1) {
     auto scales = reinterpret_cast<__gm__ uint32_t*>(a[1]) + uint64_t(owner) * uint32_t(a[24]);
+    MoveField<Threads>(scales, plan, reinterpret_cast<__ubuf__ uint32_t*>(staged), count);
+  } else if (group == 2) {
     auto addresses = reinterpret_cast<__gm__ uint64_t*>(a[2]) + uint64_t(owner) * a[7];
+    MoveField<Threads>(addresses, plan, staged, count);
+  } else if (group == 3) {
     auto logical = reinterpret_cast<__gm__ uint64_t*>(a[3]) + uint64_t(owner) * uint32_t(a[24]);
-    for (uint32_t i = tid; i < count * kMetadataFields; i += Threads) {
-      uint32_t src = plan[kTransferHeaderWords + 2 * (i / kMetadataFields) + 1];
-      uint32_t field = i % kMetadataFields;
-      staged[i] = field == 0 ? uint64_t(asc_ldcg(scales + src)) :
-                  (field == 1 ? asc_ldcg(addresses + src) : asc_ldcg(logical + src));
-    }
-    asc_syncthreads();
-    for (uint32_t i = tid; i < count * kMetadataFields; i += Threads) {
-      uint32_t dst = plan[kTransferHeaderWords + 2 * (i / kMetadataFields)] & ~kInvalidateHot;
-      uint32_t field = i % kMetadataFields;
-      if (field == 0) asc_stcg(scales + dst, uint32_t(staged[i]));
-      else if (field == 1) asc_stcg(addresses + dst, staged[i]);
-      else asc_stcg(logical + dst, staged[i]);
-    }
+    MoveField<Threads>(logical, plan, staged, count);
   }
   if (!group) {
     auto valid = reinterpret_cast<__gm__ uint32_t*>(a[owned ? 16 : 9]) + uint64_t(owner) * uint32_t(a[25]);
