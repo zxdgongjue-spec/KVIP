@@ -31,7 +31,6 @@ def arguments(argv=None):
     p.add_argument("--runtime-shapes", action="store_true", help="one binary, four distinct runtime shapes")
     p.add_argument("--resolver-compare", action="store_true")
     p.add_argument("--trace-rounds", type=int, default=3)
-    p.add_argument("--dump-events", action="store_true", help="print the per-epoch service bubble breakdown")
     p.add_argument(
         "--service-aics", type=int, default=0, help="AICs per window that serve prefetch; 0 keeps the maximum"
     )

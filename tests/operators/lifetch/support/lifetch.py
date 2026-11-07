@@ -600,8 +600,7 @@ def run_device(
 
     timings["aiv_cache_update"] = measure(lambda: update(topk, rotating.locations), update_reset, lambda: verify(True))
 
-    if getattr(args, "dump_events", False):
-        print(service_event_table(rotating))
+    print(service_event_table(rotating))
 
     def plan_check():
         verify()
