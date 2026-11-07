@@ -70,13 +70,17 @@ def main(argv):
             b, c = base[batch], cand[batch]
             bp50 = b["times"].get("prototype_with_update")
             cp50 = c["times"].get("prototype_with_update")
+            bcore = b["times"].get("prototype_core")
+            ccore = c["times"].get("prototype_core")
             if bp50 is None or cp50 is None:
                 continue
+            drift = 100.0 * (ccore - bcore) / bcore if bcore and ccore else None
             row = dict(
                 miss=miss,
                 batch=batch,
                 base=bp50,
                 cand=cp50,
+                drift=drift,
                 delta=100.0 * (cp50 - bp50) / bp50,
                 base_speed=b["speed"],
                 cand_speed=c["speed"],
@@ -89,7 +93,20 @@ def main(argv):
             rows.append(row)
     if not rows:
         raise SystemExit(f"No comparable cases under {base_dir} and {cand_dir}")
-    header = ["miss", "B", "base_us", "cand_us", "delta%", "init", "li", "resolve", "fetch", "speed", "svc_ticks"]
+    header = [
+        "miss",
+        "B",
+        "base_us",
+        "cand_us",
+        "delta%",
+        "core_drift%",
+        "init",
+        "li",
+        "resolve",
+        "fetch",
+        "speed",
+        "svc_ticks",
+    ]
     print("\t".join(header))
     for row in rows:
         stages = []
@@ -102,14 +119,28 @@ def main(argv):
             if row["base_span"] is not None and row["cand_span"] is not None
             else "-"
         )
+        drift = f"{row['drift']:+.1f}" if row["drift"] is not None else "-"
+        flag = " <-drift" if row["drift"] is not None and abs(row["drift"]) > 2.0 else ""
         print(
             f"{row['miss']}%\t{row['batch']}\t{row['base']:.3f}\t{row['cand']:.3f}\t{row['delta']:+.1f}\t"
+            + drift
+            + "\t"
             + "\t".join(stages)
-            + f"\t{speed}\t{span}"
+            + f"\t{speed}\t{span}{flag}"
         )
     print()
     print("delta% is candidate vs baseline on prototype_with_update p50; negative is faster.")
     print("svc_ticks is the summed service span from the per-epoch events; it only appears on builds that dump it.")
+    drifted = [row for row in rows if row["drift"] is not None and abs(row["drift"]) > 2.0]
+    if drifted:
+        print()
+        print("WARNING: core_drift% compares prototype_core, which neither build changes.")
+        print(f"{len(drifted)} case(s) moved more than 2% between the two runs:")
+        for row in drifted:
+            print(f"  miss{row['miss']}% B{row['batch']}: core {row['drift']:+.1f}%")
+        print("Re-run both tags back to back on the same session before trusting delta%.")
+    else:
+        print("core_drift% within 2% on every case: the two runs are comparable.")
     return 0
 
 
