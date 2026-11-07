@@ -11,7 +11,6 @@
 // append/recycle algorithm and its full 8192-slot fallback capacity.
 namespace rotating {
 constexpr uint32_t kLruSlots = 2048;
-constexpr uint32_t kTailTokens = 384;
 __simt_callee__ inline uint32_t OwnerRow(__gm__ Context* ctx,uint32_t b) {
     return ctx->rowOwners ? asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)+b) : b;
 }
@@ -21,13 +20,15 @@ __simt_callee__ inline uint32_t OutputStride(uint32_t rt_resident,__gm__ Context
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm__ Context* ctx,uint32_t b) {
     if(!ctx->tailBounds)return;
+    const uint32_t tailTokens=OutputStride(rt_resident,ctx)-rt_resident-kSlots;
+    if (!tailTokens) return;
     auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds)+b*2;
     auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;
     uint32_t begin=asc_ldcg(bounds),end=asc_ldcg(bounds+1);
-    for(uint32_t i=threadIdx.x;i<kTailTokens;i+=256) {
+    for(uint32_t i=threadIdx.x;i<tailTokens;i+=256) {
         uint32_t token=begin+i;
         if(token<end && token<rt_history)
-            asc_stcg(map+token,rt_resident+kSlots+token%kTailTokens);
+            asc_stcg(map+token,rt_resident+kSlots+token%tailTokens);
     }
     asc_threadfence();
 }

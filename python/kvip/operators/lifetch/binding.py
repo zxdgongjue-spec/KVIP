@@ -21,8 +21,8 @@ class LIFetchBinding:
         batch,
         history,
         resident,
-        prefetch_limit=2048,
-        window_limit=480,
+        prefetch_limit=512,
+        window_limit=None,
         li_tiling="auto",
         intermediate_fetches=32,
         aic_count=32,
@@ -38,6 +38,8 @@ class LIFetchBinding:
         output_stride=None,
         scratch=None,
     ):
+        if resident > 131072:
+            raise ValueError("LIFetch hot bitmap supports resident <= 131072")
         self.torch, self.owner = torch, owner
         self.library = load_lifetch_library(library)
         self.device = arguments[0].device
@@ -66,7 +68,7 @@ class LIFetchBinding:
             ("final_replicated", int(final_strategy == "replicated")),
             ("final_workers", final_aivs(batch, li_tiling, aic_count, final_workers)),
             ("aic_count", aic_count),
-            ("abi_version", 10),
+            ("abi_version", 11),
             (
                 "service_lanes",
                 li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)["service_aivs_per_window"],
@@ -80,14 +82,16 @@ class LIFetchBinding:
             ("history", history),
             ("resident", resident),
             ("simulation", 0),
-            ("context_bytes", 304),
+            ("context_bytes", 320),
             ("row_bytes", 1024),
         ):
             fn = getattr(self.library, "v9_" + name)
             fn.argtypes, fn.restype = [ctypes.c_void_p], ctypes.c_uint32
             if fn(self.shape_pointer) != expected:
                 raise ValueError(f"V9 binary contract mismatch: {name}")
-        if not 0 <= prefetch_limit <= 8192 or not 1 <= window_limit <= 480:
+        if window_limit is None:
+            window_limit = max(1, prefetch_limit // intermediate_fetches)
+        if not 0 <= prefetch_limit <= 2048 or not 1 <= window_limit <= 480:
             raise ValueError("Invalid V9 admission budgets")
         geometry = li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)
         if geometry["logical_aic_tasks"] > aic_count or not geometry["intermediate_fetches"]:
@@ -153,11 +157,12 @@ class LIFetchBinding:
             or not token_addresses.is_contiguous()
         ):
             raise ValueError("Token addresses must match the stable-owner Index storage")
-        self.output_stride = resident + 8192 if output_stride is None else output_stride
-        if self.output_stride not in (resident + 8192, resident + 8192 + 384):
-            raise ValueError("Output stride must preserve hot, fallback and optional ABC slots")
-        if tail_bounds is not None and self.output_stride != resident + 8192 + 384:
-            raise ValueError("Serving ABC bounds require 384 dedicated output slots")
+        self.output_stride = resident if output_stride is None else output_stride
+        tail_tokens = self.output_stride - resident
+        if tail_tokens < 0 or tail_tokens % 128:
+            raise ValueError("Output stride must preserve hot and optional ABC slots")
+        if tail_bounds is not None and tail_tokens < 384:
+            raise ValueError("Serving ABC bounds require at least 384 dedicated output slots")
         self.prefetch_status = owner.core_status[: batch * 2]
         pointers = [
             self.progress.data_ptr(),
@@ -199,7 +204,13 @@ class LIFetchBinding:
                 ).view("u1"),
             )
         )
-        blob = np.concatenate((blob, np.frombuffer(bytes(self.runtime_shape), dtype=np.uint8)))
+        blob = np.concatenate(
+            (
+                blob,
+                np.frombuffer(bytes(self.runtime_shape), dtype=np.uint8),
+                np.array([self.change_slots.data_ptr(), self.change_count.data_ptr()], dtype="<u8").view("u1"),
+            )
+        )
         self.context = torch.from_numpy(blob.copy()).to(self.device)
         self.arguments = tuple(arguments) + (self.context,)
         self.bindings = torch.tensor([x.data_ptr() for x in self.arguments], dtype=torch.uint64, device=self.device)

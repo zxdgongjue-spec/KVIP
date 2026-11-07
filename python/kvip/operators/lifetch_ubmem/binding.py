@@ -111,7 +111,8 @@ class UbmemBinding:
         ):
             raise ValueError("UBmem token addresses must match the stable-owner Index rows")
         self.output_stride = shape.resident + 8192 if output_stride is None else output_stride
-        if self.output_stride not in (shape.resident + 8192, shape.resident + 8192 + 384):
+        tail_tokens = self.output_stride - shape.resident - 8192
+        if tail_tokens < 0 or tail_tokens % 128 or self.output_stride > 0xFFFFFFFF:
             raise ValueError("UBmem output stride must preserve hot/fallback/optional ABC slots")
         if self.output_stride * shape.token_bytes % 32 or output.data_ptr() % 32:
             raise ValueError("UBmem owner rows must start on distinct aligned 32-byte sectors")
@@ -120,9 +121,9 @@ class UbmemBinding:
             or tail_bounds.dtype != torch.int32
             or tuple(tail_bounds.shape) != (shape.batch, 2)
             or not tail_bounds.is_contiguous()
-            or self.output_stride != shape.resident + 8192 + 384
+            or tail_tokens < 384
         ):
-            raise ValueError("UBmem ABC bounds require contiguous int32 [B,2] and 384 output slots")
+            raise ValueError("UBmem ABC bounds require contiguous int32 [B,2] and at least 384 ABC slots")
         if output.numel() * output.element_size() < hot_valid.shape[0] * self.output_stride * shape.token_bytes:
             raise ValueError("UBmem output does not cover every stable owner")
         pointers = [

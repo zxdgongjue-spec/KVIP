@@ -99,6 +99,8 @@ def _bind_selectors(torch, policy, config):
             token_addresses=storage.addresses,
             tail_bounds=workspace.tail_bounds,
             output_stride=policy.slot_capacity,
+            prefetch_limit=config.prefetch_tokens,
+            window_limit=max(1, config.prefetch_tokens // setup.windows),
             scratch=scratch,
         )
         update = UbmemIndexUpdate(

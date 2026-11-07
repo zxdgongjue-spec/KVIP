@@ -9,40 +9,11 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-REVISION = "c4375e13d7a9519d907ab6a5d11227795f207286"
-PATCHES = ("kvaf-reuse-device-ra", "kvaf-fused-context", "kvaf-fused-output-views")
-UBMEM_PATCH = "kvaf-ubmem-runtime"
-UBMEM_FUSED_PATCH = "kvaf-ubmem-fused-context"
-UBMEM_PAGE_PATCH = "kvaf-ubmem-page-mode"
-UBMEM_THP_PATCH = "kvaf-ubmem-thp"
-UBMEM_NUMA_PATCH = "kvaf-ubmem-numa"
-UBMEM_NUMA_MASK_PATCH = "kvaf-ubmem-numa-mask"
-UBMEM_COPY_PIPELINE_PATCH = "kvaf-ubmem-copy-pipeline"
-UBMEM_STATUS_READBACK_PATCH = "kvaf-ubmem-status-readback"
-
+REVISION = "d2946eeacb878b8e95dc84216b866f262eca9a7b"
 
 def call(command, cwd=None, env=None):
     print("+ " + " ".join(map(str, command)), flush=True)
     subprocess.run(list(map(str, command)), cwd=cwd, env=env, check=True)
-
-
-def applies(root, name, reverse=False):
-    return (
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                str(root),
-                "apply",
-                *(["--reverse"] if reverse else []),
-                "--check",
-                str(ROOT / "scripts/patches" / (name + ".patch")),
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode
-        == 0
-    )
 
 
 def build_lidu(env, skip=False):
@@ -67,46 +38,14 @@ def prepare_dependency(root, transport="urma"):
     head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
     if head != REVISION:
         raise RuntimeError(f"Expected KVAF {REVISION}, found {head}; existing checkout left unchanged")
-    # Later UBmem patches change shared Runtime/binding contexts from earlier
-    # patches. Recognize the newest applied patch before examining its parents,
-    # then upgrade an existing checkout with only the remaining patches.
-    ubmem_patches = (UBMEM_PATCH, UBMEM_FUSED_PATCH, UBMEM_PAGE_PATCH, UBMEM_THP_PATCH, UBMEM_NUMA_PATCH, UBMEM_NUMA_MASK_PATCH, UBMEM_COPY_PIPELINE_PATCH, UBMEM_STATUS_READBACK_PATCH)
-    for index in range(len(ubmem_patches) - 1, -1, -1):
-        if not applies(root, ubmem_patches[index], True):
-            continue
-        if transport != "ubmem":
-            raise RuntimeError("This KVAF tree contains UBmem changes; use a separate URMA baseline tree")
-        for name in ubmem_patches[index + 1 :]:
-            if not applies(root, name):
-                raise RuntimeError(f"KVAF {name} patch conflicts with existing edits; checkout preserved")
-            call(["git", "apply", ROOT / "scripts/patches" / (name + ".patch")], cwd=root)
-        print(f"KVAF UBmem fusion dependency ready: {root} @ {head}", flush=True)
-        return
-    # Applying output-views changes the parent patch's context: check newest first.
-    if not applies(root, PATCHES[0], True):
-        if not applies(root, PATCHES[0]):
-            raise RuntimeError("KVAF base patch conflicts with existing edits; checkout preserved")
-        call(["git", "apply", ROOT / "scripts/patches" / (PATCHES[0] + ".patch")], cwd=root)
-    if not applies(root, PATCHES[-1], True):
-        for name in PATCHES[1:]:
-            if applies(root, name, True):
-                continue
-            if not applies(root, name):
-                raise RuntimeError(f"KVAF {name} conflicts with existing edits; no forced reset")
-            call(["git", "apply", ROOT / "scripts/patches" / (name + ".patch")], cwd=root)
-    if transport == "ubmem":
-        for name in ubmem_patches:
-            if not applies(root, name):
-                raise RuntimeError(f"KVAF {name} patch conflicts with existing edits; checkout preserved")
-            call(["git", "apply", ROOT / "scripts/patches" / (name + ".patch")], cwd=root)
-    print(f"KVAF dependency ready: {root} @ {head}", flush=True)
+    print(f"Native KVAF dependency ready: {root} @ {head}", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kvaf-root", type=Path, help="existing checkout; otherwise download to third_party/KVAF")
-    parser.add_argument("--prepare-only", action="store_true", help="prepare patches, without CANN builds")
-    parser.add_argument("--skip-kvaf-build", action="store_true", help="use an already rebuilt, patched KVAF")
+    parser.add_argument("--prepare-only", action="store_true", help="prepare pinned source, without CANN builds")
+    parser.add_argument("--skip-kvaf-build", action="store_true", help="use an already rebuilt KVAF")
     parser.add_argument("--skip-lidu-build", action="store_true", help="reuse existing LIDU vendor/Python libraries")
     parser.add_argument("--cann", type=Path, default=Path("/usr/local/Ascend/cann"))
     parser.add_argument("--soc", default="Ascend950PR_9599", help="compile target architecture")
@@ -164,7 +103,8 @@ def main():
         return
     if not args.skip_kvaf_build:
         for target in ("cpu", "npu"):
-            call(["bash", dependency / "build.sh", target, "--jobs", args.jobs], cwd=dependency, env=env)
+            call(["bash", dependency / "build.sh", target, "--jobs", args.jobs,
+                  *(["--without-aicpu"] if target == "npu" else [])], cwd=dependency, env=env)
     build_lidu(env, args.skip_lidu_build)
     # Editable install intentionally retains csrc alongside the Python package.
     call([sys.executable, "-m", "pip", "install", "--no-build-isolation", "-e", ROOT])

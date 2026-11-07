@@ -19,7 +19,9 @@ def rotation_spec(batch, history, resident, final, rounds, lanes, status_bytes):
         count=(1,),
         lru_slots=(batch, 2048),
         reserved_hot=(batch, resident),
-        changes=(batch, 2048),
+        changes=(batch, 10240),
+        change_slots=(batch, 10240),
+        change_count=(batch,),
         row_status=(batch, 32),
     )
     spec = {name: (shape, "int32") for name, shape in shapes.items()}

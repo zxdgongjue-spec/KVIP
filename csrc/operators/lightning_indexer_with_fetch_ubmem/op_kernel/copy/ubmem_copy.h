@@ -20,7 +20,7 @@ __aicore__ inline bool UbmemCopyRow(__gm__ Context* ctx, uint64_t peer,
     uint64_t output, uint32_t slot, LocalTensor<uint8_t> scratch) {
     auto region = UbmemRegionAt(ctx);
     uint64_t source = 0;
-    if (slot >= SIM_RESIDENT+kSlots+384 ||
+    if (slot >= SIM_RESIDENT+kSlots ||
         !UbmemTranslate(region->peerBase, region->mappedBase, region->bytes,
                         peer, kTokenBytes, source) || output < region->outputBase)
         return false;
@@ -96,7 +96,7 @@ public:
     __aicore__ inline bool Add(uint64_t peer,uint32_t slot) { return AddAt(peer,output_,slot); }
     __aicore__ inline bool AddAt(uint64_t peer,uint64_t output,uint32_t slot) {
         uint64_t source=0;
-        if (!valid_ || slot>=SIM_RESIDENT+kSlots+384 || output<outputBase_ ||
+        if (!valid_ || slot>=SIM_RESIDENT+kSlots || output<outputBase_ ||
             !UbmemTranslate(peerBase_,mappedBase_,bytes_,peer,kTokenBytes,source)) return false;
         uint64_t offset=output-outputBase_, rowOffset=uint64_t(slot)*kTokenBytes;
         if (offset>outputBytes_ || rowOffset>outputBytes_-offset ||
@@ -214,7 +214,7 @@ public:
     // cannot change a store already in flight or merge across an output gap.
     __aicore__ inline bool AddAt(uint64_t peer, uint64_t output, uint32_t slot) {
         uint64_t source=0;
-        if (!valid_ || slot>=SIM_RESIDENT+kSlots+384 || output<outputBase_ ||
+        if (!valid_ || slot>=SIM_RESIDENT+kSlots || output<outputBase_ ||
             !TranslatePeer(peer,source)) return false;
         uint64_t offset=output-outputBase_, rowOffset=uint64_t(slot)*kTokenBytes;
         if (offset>outputBytes_ || rowOffset>outputBytes_-offset ||
@@ -228,8 +228,8 @@ public:
     // individually by AddNext, and this run never accepts beyond count rows.
     __aicore__ inline bool BeginRunAt(uint64_t output,uint32_t slot,uint32_t count) {
         runRemaining_=0;
-        if(!valid_ || !count || slot>=SIM_RESIDENT+kSlots+384 ||
-            count>SIM_RESIDENT+kSlots+384-slot || output<outputBase_)return false;
+        if(!valid_ || !count || slot>=SIM_RESIDENT+kSlots ||
+            count>SIM_RESIDENT+kSlots-slot || output<outputBase_)return false;
         uint64_t offset=output-outputBase_,rowOffset=uint64_t(slot)*kTokenBytes;
         if(offset>outputBytes_ || rowOffset>outputBytes_-offset ||
             count>(outputBytes_-offset-rowOffset)/kTokenBytes)return false;
