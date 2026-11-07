@@ -4,6 +4,8 @@
 
 def update_abc(token_to_slot, slot_to_token, descriptors, requests, history, tail):
     if token_to_slot.device.type == "npu":
+        import triton
+
         from kvip.cache._abc_kernel import update_abc_kernel
 
         update_abc_kernel[(descriptors.shape[0], requests)](
@@ -15,7 +17,7 @@ def update_abc(token_to_slot, slot_to_token, descriptors, requests, history, tai
             token_to_slot.shape[2],
             history,
             tail,
-            BLOCK=512,
+            BLOCK=triton.next_power_of_2(tail),
         )
         return
     # CPU reference used by byte-level service-path tests.

@@ -40,8 +40,9 @@ class DirectIndexUpdate:
         if scales.dtype != torch.float32 or addresses.dtype != torch.int64 or logical_ids.dtype != torch.int64:
             raise ValueError("Index scales require float32; address and logical IDs require int64")
         for name, shape in (
-            ("lru_slots", (self.batch, 2048)),
-            ("changes", (self.batch, 2048)),
+            ("change_slots", (self.batch, 10240)),
+            ("changes", (self.batch, 10240)),
+            ("change_count", (self.batch,)),
             ("rows", (self.batch, 256)),
         ):
             tensor = getattr(rotating, name)
@@ -55,8 +56,8 @@ class DirectIndexUpdate:
         self.library = ctypes.CDLL(str(library))
         version = self.library.kvop_direct_update_abi_version
         version.argtypes, version.restype = [], ctypes.c_uint32
-        if version() != 2:
-            raise ValueError("Index update requires runtime-shape ABI 2")
+        if version() != 3:
+            raise ValueError("Index update requires hot-only ABI 3")
         self.status = torch.zeros(self.batch, dtype=torch.int32, device=self.device) if status is None else status
         if (
             self.status.device != self.device
@@ -68,12 +69,15 @@ class DirectIndexUpdate:
         plan_words = self.library.kvop_direct_update_plan_words
         plan_words.argtypes, plan_words.restype = [], ctypes.c_uint32
         self.plan_buffer = torch.zeros((self.batch, plan_words()), dtype=torch.int32, device=self.device)
+        work_words = self.library.kvop_direct_update_work_words
+        work_words.argtypes, work_words.restype = [], ctypes.c_uint32
+        self.work_buffer = torch.empty((self.batch, work_words()), dtype=torch.int32, device=self.device)
         pointers = [
             keys.data_ptr(),
             scales.data_ptr(),
             addresses.data_ptr(),
             logical_ids.data_ptr(),
-            rotating.lru_slots.data_ptr(),
+            rotating.change_slots.data_ptr(),
             rotating.changes.data_ptr(),
             self.status.data_ptr(),
             addresses.stride(0),
@@ -111,7 +115,9 @@ class DirectIndexUpdate:
                 ]
             )
         pointers.extend([0] * (24 - len(pointers)))
-        pointers.extend([keys.shape[1], rotating.hot_valid.shape[1]])
+        pointers.extend(
+            [keys.shape[1], rotating.hot_valid.shape[1], rotating.change_count.data_ptr(), self.work_buffer.data_ptr()]
+        )
         self.bindings = torch.tensor(pointers, dtype=torch.int64, device=self.device)
         self.launch = (
             self.library.kvop_direct_update_owned if query_inputs is None else self.library.kvop_direct_update_outputs

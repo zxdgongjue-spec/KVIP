@@ -8,8 +8,8 @@ class LIFetchForward:
     def __init__(self, rotating, update):
         if rotating.device != update.device:
             raise ValueError("Fetch and Index update must use the same device")
-        if update.bindings.numel() != 26:
-            raise ValueError("LIFetch requires the 26-field Index update/output binding ABI")
+        if update.bindings.numel() != 28:
+            raise ValueError("LIFetch requires the 28-field Index update/output binding ABI")
         self.rotating, self.update = rotating, update
         self.function = rotating.library.kvip_lifetch_forward
         self.function.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]

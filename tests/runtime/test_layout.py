@@ -61,6 +61,9 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
 
     source = tmp_path / "csrc/operators/lightning_indexer_with_fetch"
     source.mkdir(parents=True)
+    selector = source.parent / "lidu/op_kernel/hot_slot_selection.h"
+    selector.parent.mkdir(parents=True)
+    selector.write_text("// shared LIDU selector\n")
     kernel = source / "prefetch.h"
     kernel.write_text("// baseline kernel\n", encoding="utf-8")
     headers = tmp_path / "kvaf-headers"
@@ -94,6 +97,10 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
     assert updated != optimized
     assert all(path.is_file() for path in updated)
     assert len(commands) == 6
+
+    selector.write_text("// updated shared LIDU selector\n")
+    assert build.build_libraries(**options) != updated
+    assert len(commands) == 8
 
 
 def test_actual_operator_cmake_resolves_relocated_sources(tmp_path):

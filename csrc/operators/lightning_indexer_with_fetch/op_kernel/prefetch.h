@@ -12,27 +12,34 @@
 // Imported from direct_slots.h
 
 #include "simt_api/device_functions.h"
-// Adapt logical fetch slots at the transport boundary; preserve the original
-// append/recycle algorithm and its full 8192-slot fallback capacity.
+// Prefetch ordinals map to LRU hot destinations. Final repair uses hot slots;
+// virtual ABC tags remain disjoint from prefetch ordinals.
 namespace rotating {
 constexpr uint32_t kLruSlots = 2048;
-constexpr uint32_t kTailTokens = 384;
+constexpr uint32_t kChangeCapacity = kLruSlots + kSlots;
 __simt_callee__ inline uint32_t OwnerRow(__gm__ Context* ctx,uint32_t b) {
     return ctx->rowOwners ? asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)+b) : b;
 }
 __simt_callee__ inline uint32_t OutputStride(uint32_t rt_resident,__gm__ Context* ctx) {
-    return ctx->outputStride ? uint32_t(ctx->outputStride) : rt_resident+kSlots;
+    return ctx->outputStride ? uint32_t(ctx->outputStride) : rt_resident;
 }
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm__ Context* ctx,uint32_t b) {
+    // Use the existing SIMT launch: scalar cache-line writeback would race
+    // adjacent request counts initialized by other cores.
+    if(!threadIdx.x && ctx->changeCount) {
+        asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->changeCount)+b,kLruSlots);
+        asc_threadfence();
+    }
     if(!ctx->tailBounds)return;
     auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds)+b*2;
     auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;
     uint32_t begin=asc_ldcg(bounds),end=asc_ldcg(bounds+1);
-    for(uint32_t i=threadIdx.x;i<kTailTokens;i+=256) {
+    const uint32_t tailTokens=OutputStride(rt_resident,ctx)-rt_resident;
+    for(uint32_t i=threadIdx.x;i<tailTokens;i+=256) {
         uint32_t token=begin+i;
         if(token<end && token<rt_history)
-            asc_stcg(map+token,rt_resident+kSlots+token%kTailTokens);
+            asc_stcg(map+token,rt_resident+kSlots+token%tailTokens);
     }
     asc_threadfence();
 }
@@ -64,7 +71,7 @@ __simt_callee__ inline uint32_t PhysicalSlot(uint32_t rt_resident,__gm__ Context
 }
 __simt_callee__ inline void RecordChange(uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,uint32_t slot,uint32_t token) {
     if(ctx->changes && uint32_t(slot-rt_resident)<kLruSlots)
-        asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+b*kLruSlots+slot-rt_resident,token);
+        asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+b*kChangeCapacity+slot-rt_resident,token);
 
 }
 // Resolver workers consume the pre-round validity. Publish only after all
@@ -82,7 +89,7 @@ inline void PublishDestinationResidency(uint32_t rt_resident,__gm__ Context* ctx
         if(slot<rt_resident)asc_stcg(valid+slot,uint32_t(1));
     }
     if(ctx->changes && ctx->lruSlots) {
-        auto changes=reinterpret_cast<__gm__ int32_t*>(ctx->changes)+b*kLruSlots;
+        auto changes=reinterpret_cast<__gm__ int32_t*>(ctx->changes)+b*kChangeCapacity;
         auto lru=reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots;
         for(uint32_t i=threadIdx.x;i<kLruSlots;i+=256)
             if(asc_ldcg(changes+i)>=0)asc_stcg(valid+asc_ldcg(lru+i),uint32_t(1));
@@ -110,7 +117,9 @@ inline void AdaptColdPredicateLocal(uint32_t rt_resident,__ubuf__ uint32_t* sele
     }
 }
 __simt_callee__ inline uint32_t ResolvePhysicalSlot(uint32_t rt_resident,__gm__ uint32_t* lru,uint32_t slot) {
-    return lru && uint32_t(slot-rt_resident)<kLruSlots ? asc_ldcg(lru+slot-rt_resident) : slot;
+    if(lru && uint32_t(slot-rt_resident)<kLruSlots)return asc_ldcg(lru+slot-rt_resident);
+    // Missing-rank markers have their high bit set and are not ABC slots.
+    return slot>=rt_resident+kSlots && slot<0x80000000U ? slot-kSlots : slot;
 }
 
 }

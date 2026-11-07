@@ -10,7 +10,7 @@ from device_trace import collect_core, core_summary
 from index_update import DirectCacheUpdate, permutation_records
 from kvip.operators.lifetch.forward import LIFetchForward
 from kvip.runtime.loader import load_lifetch_library
-from prefetch_audit import actual_reads
+from prefetch_audit import actual_reads, completion_failures
 from runner import progress
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -357,6 +357,8 @@ def run_device(
         resident=r,
         aic_count=aics,
         intermediate_fetches=args.intermediate_fetches,
+        prefetch_limit=args.prefetch_tokens,
+        output_stride=owner.output.shape[1],
         row_owners=torch.arange(b, dtype=torch.int32, device=device) if args.resolver_compare else None,
     )
     topk = arguments[9].view(torch.int32).reshape(b, 4, 2048)
@@ -397,22 +399,44 @@ def run_device(
     def full():
         pipeline()
 
-    def verify(updated=False):
+    def verify(updated=False, persistent=True):
         rows = rotating.rows.cpu().numpy()
         posts = rotating.final_posts.cpu().numpy()
         statuses = rotating.row_status.cpu().numpy()
-        if (
-            np.any(rows[:, 11])
-            or np.any(rows[:, 211])
-            or np.any(rows[:, 248])
-            or np.any(posts[:, :, 1:4])
-            or np.any(statuses[:, 0])
-        ):
-            raise AssertionError("prototype transport/resolver completion failed")
-        for status in (rotating.prefetch_status, rotating.final_status):
-            words = status.cpu().view(torch.uint64).numpy()
-            if np.any(words[:, 0] != 5428598170857194575) or np.any(words[:, 2]):
-                raise AssertionError("CQ status failed")
+        cq = [status.cpu().view(torch.uint64).numpy() for status in (rotating.prefetch_status, rotating.final_status)]
+        failures = completion_failures(rows, posts, statuses, *cq)
+        if failures:
+            phase = state.get("check_phase", "graph replay")
+            path = folder / "completion_failure.json"
+            path.write_text(json.dumps(dict(phase=phase, requests=failures), indent=2))
+            print(f"COMPLETION FAILURE: phase={phase}; first={json.dumps(failures[0])}; full={path}", flush=True)
+            raise AssertionError(
+                f"completion failed phase={phase}; bad_requests={len(failures)}; "
+                f"first={json.dumps(failures[0])}; full={path}"
+            )
+        if not updated:
+            destinations = rotating.destinations.cpu().numpy().reshape(-1)
+            lru_slots = rotating.lru_slots.cpu().numpy()
+            for row_index in range(b):
+                # Compare physical hot slots, independent of resolver's inverse map.
+                used_slots = set(lru_slots[row_index, : int(rows[row_index, 8])].tolist())
+                for post in posts[row_index]:
+                    count, start, safe = int(post[0]), int(post[4]), int(post[5])
+                    if safe > count:
+                        raise AssertionError("Invalid nonconflicting descriptor count")
+                    for index, destination in enumerate(destinations[start : start + count]):
+                        slot = int(destination) % owner.output.shape[1]
+                        if (slot in used_slots) != (index >= safe):
+                            raise AssertionError(
+                                f"Final split mismatch: request={row_index} descriptor={start + index}"
+                            )
+        state["completion"] = dict(
+            final_reads=int(statuses[:, 1].astype(np.uint64).sum()),
+            nonconflicting_reads=int(posts[:, :, 5].astype(np.uint64).sum()),
+            conflicting_reads=int((posts[:, :, 0].astype(np.uint64) - posts[:, :, 5].astype(np.uint64)).sum()),
+            native_deferred_rows=int(np.count_nonzero(statuses[:, 3])),
+            completed_checkpoints=int(statuses[:, 4].astype(np.uint64).sum()),
+        )
         owner.mark_completed(completion_verified=True)
         if updated:
             update.check_capacity()
@@ -429,7 +453,7 @@ def run_device(
                 raise AssertionError("Service SFA slot output differs from Fetch destinations")
         output = owner.output.cpu()
         for row in range(b):
-            if slots[row].min() < 0 or slots[row].max() >= r + 8192:
+            if slots[row].min() < 0 or slots[row].max() >= (r if persistent else owner.output.shape[1]):
                 raise AssertionError("slot outside cache")
             actual = output[row, slots[row]]
             expected = owner.session.cpu_payload[row, ids[row].reshape(-1)]
@@ -462,14 +486,19 @@ def run_device(
 
         return run(torch, args, rotating, owner, topk, initial_selected, reset, verify, folder)
 
-    def check_direct_update(orders):
+    def check_direct_update(orders, cold_start=False, label="regular"):
+        state["check_phase"] = f"{label}: fetch before Index update"
         reset()
         update.set_order(orders)
+        if cold_start:
+            rotating.hot_valid.zero_()
         core()
         stream.synchronize()
+        verify()
+        state["check_phase"] = f"{label}: after Index update"
         source_data = [t.cpu().clone() for t in update.inputs[:4]]
         changes = rotating.changes.cpu().numpy()
-        lru = rotating.lru_slots.cpu().numpy()
+        lru = rotating.change_slots.cpu().numpy()
         expected = [t.clone() for t in source_data]
         moved_rows = 0
         expected_valid = rotating.hot_valid.cpu().numpy().copy()
@@ -497,7 +526,9 @@ def run_device(
             resident = torch.from_numpy(valid[row] != 0)
             if not torch.equal(hot_kv[row, resident], owner.session.cpu_payload[row, logical[row, :r][resident]]):
                 raise AssertionError("Hot Index/KV ownership mismatch")
+        print(f"CHECK PASS {label}: {json.dumps(state['completion'])}; KV/Index/ownership verified", flush=True)
         return dict(
+            transport=state["completion"],
             moved_index_rows=moved_rows,
             first_window_fetches=int(rotating.rows[:, 16].cpu().sum()),
             hot_changes=int(np.count_nonzero((changes >= 0) & (changes < r))),
@@ -505,13 +536,14 @@ def run_device(
         )
 
     snapshot_changes = check_direct_update(initial_orders)
+    cold_start_changes = check_direct_update(initial_orders, cold_start=True, label="cold-start")
     unlucky = []
     for row in range(b):
         selected_hot = list(dict.fromkeys(initial_selected[row].reshape(-1).tolist()))
         selected_hot = [x for x in selected_hot if x < r]
         seen = set(selected_hot)
         unlucky.append(selected_hot + [x for x in initial_orders[row] if x not in seen])
-    hot_case = check_direct_update(unlucky)
+    hot_case = check_direct_update(unlucky, label="hot-victim-collision")
     restored_hot = hot_case["hot_changes"]
     if not hot_case["first_window_fetches"] or not restored_hot:
         raise AssertionError(f"First window did not Fetch former hot candidates into LRU slots: {hot_case}")
@@ -646,9 +678,11 @@ def run_device(
             / 1000,
             update_target_20us=timings["aiv_cache_update"]["p50_us"] < 20,
             update_copy_workers_per_request=4,
+            cold_start_changes_checked=cold_start_changes,
+            prefetch_tokens=args.prefetch_tokens,
             former_hot_changes_checked=restored_hot,
             first_window_fetches_checked=hot_case["first_window_fetches"],
-            scope="Producer change records; direct LRU destinations; zero KV copy; no TopK scan or victim selection",
+            scope="Producer records include final hot fallback; no temporary KV slots; zero KV copy",
         ),
         kernel="KVIP/csrc/operators/lightning_indexer_with_fetch; preserved core tiling, direct LRU interface",
         scope="fixed Q4 shared history; graph kernel and AIV maintenance separately; no ABC growth",

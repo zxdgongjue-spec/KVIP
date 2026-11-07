@@ -40,7 +40,7 @@ class DirectCacheUpdate(DirectIndexUpdate):
     ):
         self.torch, self.device = torch, keys.device
         self.batch, self.hot, self.history = batch, hot, history
-        self.max_swaps = 2048
+        self.max_swaps = rotating.changes.shape[1]
         self.rotating = rotating
         self.identity = torch.arange(history, device=self.device).expand(batch, -1)
         self.logical = self.identity.clone()
@@ -51,7 +51,7 @@ class DirectCacheUpdate(DirectIndexUpdate):
             scales,
             addresses,
             self.logical,
-            rotating.lru_slots,
+            rotating.change_slots,
             rotating.changes,
             self.status,
         )
