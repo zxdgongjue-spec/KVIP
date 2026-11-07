@@ -424,6 +424,11 @@ def run_device(
                 f"completion failed phase={phase}; bad_requests={len(failures)}; "
                 f"transport={json.dumps(brief)}; first={json.dumps(failures[0])}; full={path}"
             )
+        state["completion"] = dict(
+            final_reads=int(statuses[:, 1].astype(np.uint64).sum()),
+            native_deferred_rows=int(np.count_nonzero(statuses[:, 3])),
+            completed_checkpoints=int(statuses[:, 4].astype(np.uint64).sum()),
+        )
         owner.mark_completed(completion_verified=True)
         if updated:
             update.check_capacity()
@@ -513,7 +518,9 @@ def run_device(
             resident = torch.from_numpy(valid[row] != 0)
             if not torch.equal(hot_kv[row, resident], owner.session.cpu_payload[row, logical[row, :r][resident]]):
                 raise AssertionError("Hot Index/KV ownership mismatch")
+        print(f"CHECK PASS {label}: {json.dumps(state['completion'])}; KV/Index/ownership verified", flush=True)
         return dict(
+            transport=state["completion"],
             moved_index_rows=moved_rows,
             first_window_fetches=int(rotating.rows[:, 16].cpu().sum()),
             hot_changes=int(np.count_nonzero((changes >= 0) & (changes < r))),
