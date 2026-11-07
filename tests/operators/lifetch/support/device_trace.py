@@ -101,6 +101,10 @@ def account(events, name, elapsed):
     if overlap > 0.1:
         return dict(error="Cross-stage overlap prevents additive stage accounting", overlap_us=overlap)
     span = intervals[-1][1] - intervals[0][0]
+    # Split the unexplained edge time: a constant lead or tail is replay
+    # dispatch, while an internal gap would point at the stream itself.
+    lead = intervals[0][0]
+    tail = elapsed - intervals[-1][1] if elapsed is not None else None
     residual = elapsed - span if elapsed is not None else None
     if residual is not None and residual < -2:
         return dict(error="Event/trace interval mismatch", event_us=elapsed, kernel_span_us=span)
@@ -109,6 +113,8 @@ def account(events, name, elapsed):
         kernel_span_us=span,
         stages_us=durations,
         inter_kernel_gap_us=span - busy,
+        lead_us=lead,
+        tail_us=tail,
         boundary_residual_us=residual,
         note="Boundary residual includes event-to-kernel edges and clock measurement error; not proven CPU idle",
     )
@@ -172,7 +178,13 @@ def core_summary(result):
         if "error" in a:
             lines.append(f"round={row['round']} attribution unavailable: {a}")
             continue
-        values = dict(a["stages_us"], gap=a["inter_kernel_gap_us"], boundary=a["boundary_residual_us"])
+        values = dict(
+            a["stages_us"],
+            gap=a["inter_kernel_gap_us"],
+            lead=a["lead_us"],
+            tail=a["tail_us"],
+            boundary=a["boundary_residual_us"],
+        )
         lines.append(
             f"round={row['round']} total_us={row['us']:.3f} "
             + " ".join(f"{key}_us={value:.3f}" for key, value in values.items())
