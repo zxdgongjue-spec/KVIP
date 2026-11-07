@@ -40,6 +40,7 @@ cp -f "${ROOT}/op_host/a5_lidu_fused_batch_get_prepare_mtp.cpp" "${OP_DEV}/op_ho
 cp -f "${ROOT}/op_kernel/a5_lidu_fused_batch_get_prepare_mtp.cpp" "${OP_DEV}/op_kernel/"
 cp -f "${ROOT}/op_kernel/a5_lidu_fused_batch_get_prepare_mtp_tiling.h" "${OP_DEV}/op_kernel/"
 cp -f "${ROOT}/op_kernel/a5_lidu_fused_batch_get_prepare_mtp_vector.h" "${OP_DEV}/op_kernel/"
+cp -f "${ROOT}/op_kernel/hot_slot_selection.h" "${OP_DEV}/op_kernel/"
 
 msopgen gen \
     -i "${OP_DEV}/ops.json" \

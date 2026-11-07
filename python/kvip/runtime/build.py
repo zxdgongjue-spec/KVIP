@@ -62,6 +62,9 @@ def build_libraries(*, cache_dir, cann, headers, soc):
             if path.is_file() and (path.suffix in (".h", ".cpp", ".py") or path.name == "CMakeLists.txt"):
                 digest.update(str(path.relative_to(directory)).encode())
                 digest.update(path.read_bytes())
+    shared_selector = root / "lidu/op_kernel/hot_slot_selection.h"
+    digest.update(str(shared_selector.relative_to(root)).encode())
+    digest.update(shared_selector.read_bytes())
     directory = Path(cache_dir) / digest.hexdigest()[:20]
     directory.mkdir(parents=True, exist_ok=True)
     libraries = directory / "libv9_bridge.so", directory / "libkvop_cache_update.so"

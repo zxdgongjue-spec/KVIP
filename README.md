@@ -74,7 +74,7 @@ available. The following downloads the pinned KVAF revision if necessary and
 builds KVAF, LIDU and LIFetch including Index update:
 
 ```bash
-git clone --branch codex/clean-slate https://gitcode.com/CacheOS/KVIP.git /vllm-workspace/KVIP
+git clone --branch codex/lifetch-hot-resolver https://gitcode.com/CacheOS/KVIP.git /vllm-workspace/KVIP
 cd /vllm-workspace/KVIP
 source /usr/local/Ascend/cann/set_env.sh
 bash scripts/build.sh
@@ -93,7 +93,7 @@ For another A5 SKU, pass its concrete CANN target with `--soc`; `Ascend950` alon
 is not a valid target for this CANN build API. The NPU test discovers the device
 SoC through ACL unless `--soc` is specified.
 
-The supported KVAF base is `c4375e13d7a9519d907ab6a5d11227795f207286`.
+The supported KVAF base is `1c1310387ebfb6776a07316874e924265b209ada`.
 Preparation applies the three patches in `scripts/patches`, recognizes an already
 patched tree, and never resets existing edits. A different revision or conflicting
 patch fails explicitly. `--prepare-only` prepares dependencies without compiling;
@@ -116,7 +116,7 @@ Graph-mode native/fused comparison using real DDR and the current service LRU:
 ```bash
 cd /vllm-workspace/KVIP
 source scripts/env.sh
-python tests/operators/lifetch/test_lifetch.py --device 5 --kvaf-server 127.0.0.1:28885 --batches 16 --history 131072 --resident 16384 --index-heads 32 --miss-percent 10 --intermediate-fetches 8 --warmup 4 --iterations 20 --trace-rounds 3
+python tests/operators/lifetch/test_lifetch.py --device 5 --kvaf-server 127.0.0.1:28885 --batches 16 --history 131072 --resident 16384 --index-heads 32 --miss-percent 10 --intermediate-fetches 8 --prefetch-tokens 512 --warmup 4 --iterations 20 --trace-rounds 3
 ```
 
 This uses Q4, TopK 2048, and reports the actual quantized miss fraction. Full-path
@@ -127,11 +127,45 @@ reads and unused prefetches are printed. Summaries, status and errors are saved
 under the printed `tests/results/lifetch/<run>/summary.log`; detailed logs stay
 beside it. Snapshot and stateful correctness checks are retained.
 
+The default total prefetch budget is 512, divided evenly over the windows (64
+for eight windows). Final misses first consume unprotected LRU candidates, then
+reuse LIDU's hot bitmap selector from slot zero. There is no temporary KV region:
+all final repairs persist in hot storage, and ABC follows hot storage directly.
+The resolver exports destination/source records for every final repair to Index
+update. Final descriptors are split into nonconflicting and conflicting ranges. Native
+KVAF BatchGet submits the nonconflicting ranges before joining prefetch CQ, then
+fetches the conflicting ranges. Its inflight control and completion handling are
+reused without a separate final WQE submitter. The test also checks an empty hot cache, victim collisions,
+full Index/scale/address ownership, and multiple graph replays, outside timing.
+
 For the original/adapted/fixed resolver comparison, use the same entry:
 
 ```bash
-python tests/operators/lifetch/test_lifetch.py --device 5 --kvaf-server 127.0.0.1:28885 --batches 8,16 --history 131072 --resident 16384 --index-heads 32 --miss-percent 10 --intermediate-fetches 8 --warmup 4 --iterations 20 --resolver-compare
+python tests/operators/lifetch/test_lifetch.py --device 5 --kvaf-server 127.0.0.1:28885 --batches 8,16 --history 131072 --resident 16384 --index-heads 32 --miss-percent 10 --intermediate-fetches 8 --prefetch-tokens 512 --warmup 4 --iterations 20 --resolver-compare
 ```
+
+The CPU suite executes the production resolver and shared LIDU selector with
+empty/populated hot storage, duplicate queries, padding and ABC mappings. A CANN
+simulator fixture additionally executes the compiled planner/mover and resolver
+without network transport:
+
+```bash
+source /usr/local/Ascend/cann/set_env.sh
+cmake -S tests/operators/lifetch/simulator -B build/hot-fallback-sim \
+  -DASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/cann \
+  -DKVAF_INCLUDE="$PWD/third_party/KVAF/access_operator/demo/aiv_batch_get/include"
+cmake --build build/hot-fallback-sim -j2
+msprof op simulator --application="$PWD/build/hot-fallback-sim/update_sim 410 8" \
+  --soc-version=Ascend950PR_9599 --output=tests/results/update-sim-410-b8 --launch-count=2 --timeout=90
+msprof op simulator --application="$PWD/build/hot-fallback-sim/update_sim 3000 1" \
+  --soc-version=Ascend950PR_9599 --output=tests/results/update-sim-3000 --launch-count=2 --timeout=90
+msprof op simulator --application="$PWD/build/hot-fallback-sim/resolver_sim 3000" \
+  --soc-version=Ascend950PR_9599 --output=tests/results/resolver-sim-3000 --launch-count=1 --timeout=90
+```
+
+The fixtures require their own `PASS` line after all tensor checks. A profiler
+success message or a partial trace following timeout is not a correctness pass.
+Simulator times are device-model times, not hardware graph or TPOT measurements.
 
 Independent LIDU and ABC device checks:
 
@@ -143,7 +177,9 @@ python tests/cache/test_abc.py --device 5
 ## Migration evidence and limits
 
 Source baseline: vLLM-DSA commit `dad47855b20cbe8b74bf412f05757043d22ce0a0`.
-LIDU files are byte-identical. At the initial migration, retained LI/Fetch/resolver/update function bodies
+LIDU originally migrated byte-identically; its bitmap count/enumeration now lives
+in a shared header used by LIFetch fallback as well. At the initial migration,
+retained LI/Fetch/resolver/update function bodies
 were compared after removing include paths, comments and whitespace. Both Q2 and
 Q4 materialized LI sources match the prior generation pipeline; the build no
 longer rewrites source files. LI/Fetch and Index update keep their separate
@@ -154,9 +190,10 @@ only, disabled in normal builds.
 `scripts/migration_sources.json` records source provenance and hashes of the
 migrated operator files. Hash checks detect accidental edits, not device correctness.
 CPU tests include host execution of the Index-update planner/mover and the unified
-launch ordering/error path. NPU compilation, graph correctness and performance
-must still be verified on A5: this migration was prepared on a machine without
-CANN/NPU, so no new device performance result is claimed.
+launch ordering/error path. The hot-fallback change was compiled with CANN 9.1
+and checked with its operator simulator as described above. Hardware graph
+correctness and performance still require A5 validation; simulator results are
+not hardware measurements.
 
 The imported CANN LI headers retain their original license notices; their license
 is reproduced in `LICENSE-CANN`. Apache-2.0 applies to files so marked.
@@ -167,11 +204,11 @@ Installation does not take device, batch, history, resident, heads or window cou
 Host tiling evaluates the original partition/window formulas when a launch object
 is bound, then stores its immutable parameters in the device Context before graph
 capture. No per-shape compilation is required. Index update reads history/resident
-from its bindings. ABI versions are now LIFetch 10 and Index update 2; rebuild both.
+from its bindings. ABI versions are now LIFetch 11 and Index update 3; rebuild both.
 
 Supported runtime dimensions: batch 1–32 (also limited by available AIC count),
 index heads 32/64, 1–32 requested windows, 256-aligned history/resident with
-2048 <= resident < history <= 210944. Existing UB/queue constraints are checked
+2048 <= resident <= 131072 and resident < history <= 210944. Existing UB/queue constraints are checked
 before launch. Q4, TopK 2048 and the existing element types remain fixed. These
 limits preserve the original kernel's storage budget; this is not unrestricted
 shape support. Each captured graph still owns its shape-specific buffers and
