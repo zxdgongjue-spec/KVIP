@@ -660,6 +660,26 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         AscendC::DataCopyPadExtParams<SCORE_T> padParams{true, 0, 0, 0};
         if (validS2Len >= topkCount_) {
             uint32_t s2LoopNum = (validS2Len + trunkLen_ - 1) / trunkLen_;
+            uint32_t firstColdLoop = 0;
+            if constexpr (std::is_same_v<SCORE_T, uint16_t>) {
+                // Resident TopK was already published before scanning cold keys.
+                // Service/progress reuse its UB, so restore the saved GM result.
+                if (!prefixActive_ && prefixOutput_ != nullptr && topkCount_ == 2048 &&
+                    runtimeShape_.resident >= topkCount_ && runtimeShape_.resident % trunkLen_ == 0 &&
+                    runtimeShape_.resident < static_cast<uint32_t>(validS2Len)) {
+                    constexpr uint32_t count = SIM_Q * 2048;
+                    constexpr uint32_t rowBytes = count * 6 + SIM_Q * 256;
+                    uint32_t query = info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx;
+                    GlobalTensor<uint16_t> savedScores;
+                    GlobalTensor<uint32_t> savedIndices;
+                    savedScores.SetGlobalBuffer((__gm__ uint16_t *)(prefixOutput_ + query / SIM_Q * rowBytes));
+                    savedIndices.SetGlobalBuffer((__gm__ uint32_t *)(prefixOutput_ + query / SIM_Q * rowBytes + count * 2));
+                    firstColdLoop = runtimeShape_.resident / trunkLen_;
+                    topkOp_.LoadHistory(savedScores, savedIndices, scoreOutLocal_, query % SIM_Q * 2048, firstColdLoop);
+                    SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+                    WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+                }
+            }
             if (s2LoopNum == 1) {
                 uint32_t validS2LenAlign = QLICommon::Align(validS2Len, (int32_t)256);
                 Duplicate(mrgValueLocal_[validS2Len / 256 * 256], zero, validS2LenAlign - validS2Len / 256 * 256);
@@ -672,7 +692,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
                 WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
                 topkOp_(mrgValueLocal_, indicesOutLocal_, scoreOutLocal_, validS2LenAlign, 0, 1, prefixActive_);
             } else {
-                for (uint32_t loopIdx = 0; loopIdx < s2LoopNum; loopIdx++) {
+                for (uint32_t loopIdx = firstColdLoop; loopIdx < s2LoopNum; loopIdx++) {
                     if (loopIdx == 0) {
                         copyInParams.blockLen = trunkLen_ * sizeof(SCORE_T); // byte
                         AscendC::DataCopyPad(mrgValueLocal_, scoreGm[vecOffset * QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_)], copyInParams, padParams);
