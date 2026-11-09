@@ -23,6 +23,11 @@ def compare(urma_path, ubmem_path, resident):
         if not np.array_equal(a['payload'], b['payload']):
             raise AssertionError('cross-transport selected KV bytes differ')
         lines = ['logical_topk=identical selected_kv_bytes=identical']
+        if a['lru'].shape != b['lru'].shape:
+            raise ValueError('cross-transport LRU candidate shapes differ')
+        changed_rows = np.flatnonzero(np.any(a['lru'] != b['lru'], axis=1))
+        lines.append(f'lru_candidate_order_different_rows={len(changed_rows)}/{len(a["lru"])} '
+                     f'differing_positions={np.count_nonzero(a["lru"] != b["lru"])}')
         for row in range(len(a['mapping'])):
             am, bm = a['mapping'][row], b['mapping'][row]
             at, bt = np.flatnonzero(am >= 0), np.flatnonzero(bm >= 0)

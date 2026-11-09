@@ -127,9 +127,11 @@ def test_snapshot_compares_kv_and_reports_prefetch_differences(tmp_path):
     mapping[0, 9] = 4097
     rows[0, 17] = 1
     rows[0, 215] = 2
+    lru[0, 1] = 17
     save(b, ids, slots, output, mapping, lru, rows, addresses)
     result = compare_snapshot(a, b, 4096)
     assert 'logical_topk=identical selected_kv_bytes=identical' in result[0]
+    assert 'lru_candidate_order_different_rows=1/1 differing_positions=1' in result
     assert any('ubmem_only=1' in line for line in result)
     output[0, 0, 0] ^= 1
     save(b, ids, slots, output, mapping, lru, rows, addresses)
