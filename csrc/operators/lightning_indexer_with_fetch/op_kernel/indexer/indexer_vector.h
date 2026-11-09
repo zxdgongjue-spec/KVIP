@@ -75,7 +75,8 @@ public:
     using SCORE_T = typename QLIT::scoreType;
 
     __aicore__ inline QLIVector(){};
-    __aicore__ inline void ProcessVec1(const QLICommon::RunInfo &info, uint32_t progressShard = 0);
+    __aicore__ inline void ProcessVec1(const QLICommon::RunInfo &info, uint32_t progressShard = 0,
+                                     bool publishShardEnd = false);
     __aicore__ inline void ProcessTopK(const QLICommon::RunInfo &info, uint32_t queryRow = SIM_Q);
     __aicore__ inline void SetPrefixStorage(GM_ADDR output) { prefixOutput_ = output; }
     __aicore__ inline void ProcessResidentTopK(QLICommon::RunInfo info, uint32_t queryRow = SIM_Q) {
@@ -462,7 +463,8 @@ __aicore__ inline void QLIVector<QLIT>::GetKeyScale(const QLICommon::RunInfo &ru
 }
 
 template <typename QLIT>
-__aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &info, uint32_t progressShard)
+__aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &info, uint32_t progressShard,
+                                                   bool publishShardEnd)
 {
     auto pingpong = (info.loop % 2);
     auto qScalepingpong = (info.qScaleLoop % 2);
@@ -581,7 +583,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     }
 #endif
 
-    if (curS2Idx >= runtimeShape_.resident && ((info.s2Idx + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
+    if (curS2Idx >= runtimeShape_.resident && (publishShardEnd || (info.s2Idx + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
         rotating::IsTrigger(runtimeShape_.history,runtimeShape_.resident,runtimeShape_.rounds,info.s2Idx + 1))) {
         const uint32_t tableBase = (info.s2Idx / 64) * 64;
         if (tableBase != rotationProgressBase_) {

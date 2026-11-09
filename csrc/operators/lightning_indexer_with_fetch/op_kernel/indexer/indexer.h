@@ -663,7 +663,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
         if ASCEND_IS_AIC {
             matmulService.ComputeMm1(info);
         } else {
-            vectorService.ProcessVec1(info, shard);
+            vectorService.ProcessVec1(info, shard, tile + 1 == end);
         }
     }
 }

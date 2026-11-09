@@ -672,16 +672,35 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
         do { kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(events+(epoch-1)*rt_serviceLanes+lane),64); }
         while(!previous->complete);
     }
+    GlobalTensor<uint32_t> progressGm;
+    progressGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress));
+    auto work=flags.ReinterpretCast<uint32_t>();
+    const uint32_t windowEnd=Trigger(rt_history,rt_resident,rt_rounds,epoch)*128;
+    if (sequenceHalfWindow && epoch) {
+        // The owner has published its half. Join the same two queries on
+        // its sibling shard before taking the batch-wide ready snapshot.
+        const uint32_t peerShard=1-core%2;
+        const uint32_t peerEnd=windowEnd-(peerShard==0 ? sequenceHalfWindow : 0);
+        const uint32_t firstQuery=(core/2)*4+(lane%2)*2;
+        const uint32_t peerProgress=firstQuery*32+peerShard*16;
+        DataCopyExtParams gather{2,32,96,0,0};
+        DataCopyPadExtParams<uint32_t> padding{false,0,0,0};
+        do {
+            SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            DataCopyPad(work,progressGm[peerProgress],gather,padding);
+            SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        } while (work.GetValue(0)<peerEnd || work.GetValue(8)<peerEnd);
+    }
     V9_FETCH_PROFILE(event->begin=GetSystemCycle();)
     uint64_t postedCount=0; // Business state: controls batched WQE submission.
     V9_FETCH_PROFILE(uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0;)
-    auto work=flags.ReinterpretCast<uint32_t>();auto cfg=work[4096];
+    auto cfg=work[4096];
     auto rowStorage=ids;
     if(rt_batchedRows)ids=scratch[23808/4];
     // Freeze every ready snapshot before doing any batch work. Cap to the
     // scheduled boundary so slow service cannot chase newly produced history.
-    GlobalTensor<uint32_t> progressGm;
-    progressGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress));
     if(lane<rt_batch) {
         DataCopyExtParams gather;gather.blockCount=(rt_batch-lane+rt_serviceLanes-1)/rt_serviceLanes;
         gather.blockLen=4*sizeof(Progress);gather.srcStride=(rt_serviceLanes-1)*4*sizeof(Progress);gather.dstStride=0;
@@ -691,7 +710,7 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
         SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
         for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes)for(uint32_t q=0;q<4;++q) {
             uint32_t progress=(b/rt_serviceLanes)*128+q*32;
-            uint32_t end=work.GetValue(progress),cap=Trigger(rt_history,rt_resident,rt_rounds,epoch)*128;
+            uint32_t end=work.GetValue(progress),cap=windowEnd;
             if(ctx->queryEnds) {
                 auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds);
                 uint32_t valid=bounds[b*4+q];
