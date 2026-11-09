@@ -61,6 +61,15 @@ def test_padded_kvaf_slots_and_failed_release_retain_owners(token_bytes):
     assert lease.closed and not lease.outputs and not lease.bindings and not lease.graphs
 
 
+
+def test_invalid_native_lease_descriptor_releases_acquired_lease():
+    torch, runtime, output, stream = lease_fixture()
+    context = runtime.acquire_ubmem_fused_context.return_value
+    context["device_id"] = 7
+    with pytest.raises(ValueError, match="ABI/device"):
+        UbmemLease(torch, runtime, output, stream)
+    runtime.release_ubmem_fused_context.assert_called_once_with(context, stream)
+
 def test_peer_and_device_mapping_bases_are_kept_distinct():
     torch, runtime, output, stream = lease_fixture()
 

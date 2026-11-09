@@ -16,7 +16,14 @@ class UbmemLease:
         self.outputs = {self.output_key(output): (output, self.context)}
         self.bindings = []
         self.graphs = []
-        self._validate(self.context, output)
+        try:
+            self._validate(self.context, output)
+        except Exception:
+            # No work has been submitted. Release the native lease even if
+            # the returned descriptor is incompatible with this adapter.
+            self.runtime.release_ubmem_fused_context(self.context, self.stream)
+            self.closed = True
+            raise
 
     @staticmethod
     def output_key(output):
