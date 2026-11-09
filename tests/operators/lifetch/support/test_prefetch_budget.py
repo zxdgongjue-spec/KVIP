@@ -65,6 +65,12 @@ def test_shared_hot_selector_invalidates_specialization_cache(tmp_path, monkeypa
     selector.parent.mkdir(parents=True)
     selector.write_text("// first algorithm\n")
     monkeypatch.setattr(specialization, "__file__", str(module))
+    kvaf_root = tmp_path / "kvaf"
+    include = kvaf_root / "access_operator/include/ubmem"
+    include.mkdir(parents=True)
+    for name in ("copy.h", "batch_abi.h", "fused_batch_get_device.h"):
+        (include / name).write_text(name)
+    monkeypatch.setattr(specialization, "kvaf_source", lambda _: kvaf_root)
     calls = []
 
     def compile_fixture(command, **kwargs):
@@ -88,6 +94,9 @@ def test_shared_hot_selector_invalidates_specialization_cache(tmp_path, monkeypa
     selector.write_text("// changed hot-slot algorithm\n")
     new = specialization.build_ubmem_library(**options)
     assert new != old and len(calls) == 4
+    (include / "fused_batch_get_device.h").write_text("// updated device entry\n")
+    updated = specialization.build_ubmem_library(**options)
+    assert updated != new and len(calls) == 6
 
 
 def test_service_chunk_assignment_covers_every_request_once(tmp_path):

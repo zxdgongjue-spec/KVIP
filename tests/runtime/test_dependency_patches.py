@@ -46,11 +46,16 @@ class DependencyPatchTests(unittest.TestCase):
             (10, "output views"),
             (20, "background Put"),
             (30, "UBmem"),
+            (37, "UBmem device Get"),
         ):
             rows[index] = value + "\n"
             self.stages.append("".join(rows))
         (self.source / "runtime.txt").write_text(self.stages[0])
         (self.source / "unrelated.txt").write_text("original\n")
+        (self.source / "bindings/src").mkdir(parents=True)
+        (self.source / "bindings/src/npu_python_runtime.cc").write_text(
+            "acquire_ubmem_fused_context release_ubmem_fused_context\n"
+        )
         self.git("add", ".")
         self.git(
             "-c", "user.name=Patch fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "test fixture"
@@ -63,6 +68,7 @@ class DependencyPatchTests(unittest.TestCase):
             (self.root / "scripts/patches" / f"{name}.patch").write_text(data)
         (self.root / "patches/kvaf-background-put.patch").write_text(diff(self.stages[3], self.stages[4]))
         (self.root / "patches/kvaf-ubmem-fused-lease.patch").write_text(diff(self.stages[4], self.stages[5]))
+        (self.root / "patches/kvaf-ubmem-device-get.patch").write_text(diff(self.stages[5], self.stages[6]))
         self.root_patch = patch.object(BUILD, "ROOT", self.root)
         self.revision_patch = patch.object(BUILD, "REVISION", revision)
         self.root_patch.start()
@@ -93,7 +99,7 @@ class DependencyPatchTests(unittest.TestCase):
 
     def test_fresh_ubmem_and_repeat(self):
         BUILD.prepare_dependency(self.source, "ubmem")
-        self.assertEqual(self.text(), self.stages[5])
+        self.assertEqual(self.text(), self.stages[6])
         before = self.git("diff")
         BUILD.prepare_dependency(self.source, "ubmem")
         self.assertEqual(self.git("diff"), before)
@@ -106,12 +112,12 @@ class DependencyPatchTests(unittest.TestCase):
     def test_legacy_three_patch_ubmem_upgrade(self):
         self.legacy()
         BUILD.prepare_dependency(self.source, "ubmem")
-        self.assertEqual(self.text(), self.stages[5])
+        self.assertEqual(self.text(), self.stages[6])
 
     def test_common_background_put_checkout_upgrades_to_ubmem(self):
         BUILD.prepare_dependency(self.source)
         BUILD.prepare_dependency(self.source, "ubmem")
-        self.assertEqual(self.text(), self.stages[5])
+        self.assertEqual(self.text(), self.stages[6])
 
     def test_unrelated_tracked_and_untracked_edits_survive(self):
         (self.source / "unrelated.txt").write_text("user work\n")

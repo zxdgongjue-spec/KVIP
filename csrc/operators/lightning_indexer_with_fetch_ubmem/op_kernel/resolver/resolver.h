@@ -14,20 +14,14 @@ inline void ReplicatedResolve(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc
     __gm__ int32_t* blocks,__gm__ int32_t* offsets,__gm__ int32_t* destinations,
     __gm__ uint32_t* total,uint32_t worker,uint32_t used,uint32_t batch,__gm__ Context* ctx,
     uint32_t history,uint32_t resident,uint32_t finalWorkers,uint32_t tokenBytes) {
-    uint32_t tid=threadIdx.x,lane=tid%warpSize,warp=tid/warpSize;
-    auto lru=ctx->lruSlots ? reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+batch*kLruSlots : nullptr;
-    uint32_t outputStride=OutputStride(resident,ctx),ownerBase=OwnerRow(ctx,batch)*outputStride;
-    uint32_t count=0,candidateCount=0;
-    if(!ResolveResidentPlan<Threads>(history,resident,outputStride,selected,loc,
-        positions,coldCount,keys,ranks,ids,slots,cfg,mapping,lru,used,ctx->tailBounds!=0,count,candidateCount))return;
-    constexpr uint32_t missingTag=0x80000000U;
-    uint32_t ownBegin=count*worker/finalWorkers,ownEnd=count*(worker+1)/finalWorkers;
-    if(!tid){cfg[2]=ownBegin;cfg[3]=ownEnd-ownBegin;if(!worker)asc_atomic_add(total,count);}
-    for(uint32_t i=tid;i<coldCount;i+=Threads) {
-        uint32_t pos=positions[i],slot=loc[pos];
-        if(pos/(kSlots/finalWorkers)==worker && (slot&missingTag))loc[pos]=slots[slot&~missingTag];
-    }
-    asc_syncthreads();
+#define KV_RESOLVE_HISTORY history
+#define KV_RESOLVE_RESIDENT resident
+#define KV_RESOLVE_WORKERS finalWorkers
+#include "../../../common/lifetch/resolver_plan.h"
+#undef KV_RESOLVE_HISTORY
+#undef KV_RESOLVE_RESIDENT
+#undef KV_RESOLVE_WORKERS
+
     auto changeSlots=reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+batch*kChangeCapacity;
     auto changes=reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+batch*kChangeCapacity;
     // All final AIVs retain an identical immutable copy plan. Payload writes

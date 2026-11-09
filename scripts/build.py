@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 REVISION = "1c1310387ebfb6776a07316874e924265b209ada"
 PATCHES = ("kvaf-reuse-device-ra", "kvaf-fused-context", "kvaf-fused-output-views")
 UBMEM_PATCH = "kvaf-ubmem-fused-lease"
+UBMEM_DEVICE_PATCH = "kvaf-ubmem-device-get"
 BACKGROUND_PATCH = "kvaf-background-put"
 
 
@@ -50,7 +51,7 @@ def build_lidu(env, skip=False):
 
 
 def patch_path(name):
-    directory = ROOT / "patches" if name in (BACKGROUND_PATCH, UBMEM_PATCH) else ROOT / "scripts/patches"
+    directory = ROOT / "patches" if name in (BACKGROUND_PATCH, UBMEM_PATCH, UBMEM_DEVICE_PATCH) else ROOT / "scripts/patches"
     return directory / (name + ".patch")
 
 
@@ -81,11 +82,23 @@ def prepare_dependency(root, transport="urma"):
     head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
     if head != REVISION:
         raise RuntimeError(f"Expected KVAF {REVISION}, found {head}; existing checkout left unchanged")
+    # The device patch appends to tests/CMakeLists.txt, changing the context of
+    # the preceding lease patch. Check the newest patch first.
+    if applies(root, UBMEM_DEVICE_PATCH, True):
+        if transport != "ubmem":
+            raise RuntimeError("KVAF checkout already has the UBmem device patch; use a separate URMA checkout")
+        bindings = (root / "bindings/src/npu_python_runtime.cc").read_text()
+        if "acquire_ubmem_fused_context" not in bindings or "release_ubmem_fused_context" not in bindings:
+            raise RuntimeError("KVAF UBmem device patch exists but its fused lease dependency is missing")
+        print(f"KVAF UBmem device dependency already patched: {root} @ {head}", flush=True)
+        return
     # The UBmem patch changes common-patch contexts. Recognize it first, while
     # keeping the default URMA checkout on its original three-patch chain.
     if applies(root, UBMEM_PATCH, True):
         if transport != "ubmem":
             raise RuntimeError("KVAF checkout already has the UBmem lease patch; use a separate URMA checkout")
+        if not applies(root, UBMEM_DEVICE_PATCH, True):
+            apply_patch(root, UBMEM_DEVICE_PATCH)
         print(f"KVAF UBmem dependency already patched: {root} @ {head}", flush=True)
         return
     # Applying output-views changes the parent patch's context: check newest first.
@@ -101,6 +114,7 @@ def prepare_dependency(root, transport="urma"):
         apply_patch(root, BACKGROUND_PATCH)
     if transport == "ubmem":
         apply_patch(root, UBMEM_PATCH)
+        apply_patch(root, UBMEM_DEVICE_PATCH)
     print(f"KVAF {transport} dependency ready: {root} @ {head}", flush=True)
 
 

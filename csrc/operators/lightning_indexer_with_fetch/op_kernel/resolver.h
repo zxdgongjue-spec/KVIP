@@ -66,20 +66,14 @@ inline void ReplicatedResolve(uint32_t rt_history,uint32_t rt_resident,uint32_t 
     __ubuf__ uint32_t* cfg,__gm__ uint32_t* mapping,__gm__ uint64_t* addresses,
     __gm__ int32_t* blocks,__gm__ int32_t* offsets,__gm__ int32_t* destinations,
     __gm__ uint32_t* total,uint32_t worker,uint32_t used,uint32_t batch,__gm__ Context* ctx) {
-    uint32_t tid=threadIdx.x,lane=tid%warpSize,warp=tid/warpSize;
-    auto lru=ctx->lruSlots ? reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+batch*kLruSlots : nullptr;
-    uint32_t outputStride=OutputStride(rt_resident,ctx),ownerBase=OwnerRow(ctx,batch)*outputStride;
-    uint32_t count=0,candidateCount=0;
-    if(!ResolveResidentPlan<Threads>(rt_history,rt_resident,outputStride,selected,loc,
-        positions,coldCount,keys,ranks,ids,slots,cfg,mapping,lru,used,ctx->tailBounds!=0,count,candidateCount))return;
-    constexpr uint32_t missingTag=0x80000000U;
-    uint32_t ownBegin=count*worker/rt_finalWorkers,ownEnd=count*(worker+1)/rt_finalWorkers;
-    if(!tid){cfg[2]=ownBegin;cfg[3]=ownEnd-ownBegin;if(!worker)asc_atomic_add(total,count);}
-    for(uint32_t i=tid;i<coldCount;i+=Threads) {
-        uint32_t pos=positions[i],slot=loc[pos];
-        if(pos/(kSlots/rt_finalWorkers)==worker && (slot&missingTag))loc[pos]=slots[slot&~missingTag];
-    }
-    asc_syncthreads();
+#define KV_RESOLVE_HISTORY rt_history
+#define KV_RESOLVE_RESIDENT rt_resident
+#define KV_RESOLVE_WORKERS rt_finalWorkers
+#include "../../common/lifetch/resolver_plan.h"
+#undef KV_RESOLVE_HISTORY
+#undef KV_RESOLVE_RESIDENT
+#undef KV_RESOLVE_WORKERS
+
     // Source addresses are snapshotted before Index update. Prefetch records
     // overwritten by final repair are replaced, not duplicated in the plan.
     auto changeSlots=reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+batch*kChangeCapacity;

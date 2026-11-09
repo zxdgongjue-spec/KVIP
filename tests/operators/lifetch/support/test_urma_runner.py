@@ -434,7 +434,11 @@ def _check_hot_resolver(tmp_path, transport):
     functions += "\ntemplate<unsigned Threads>\n" + function(
         ROOT / "csrc/operators/common/lifetch/resident_selection.h", "ResolveResidentPlan"
     )
-    functions += "\ntemplate<unsigned Threads>\n" + function(resolver, "ReplicatedResolve")
+    resolve = function(resolver, "ReplicatedResolve")
+    shared = (ROOT / "csrc/operators/common/lifetch/resolver_plan.h").read_text()
+    for relative in ("../../common/lifetch/resolver_plan.h", "../../../common/lifetch/resolver_plan.h"):
+        resolve = resolve.replace(f'#include "{relative}"', shared)
+    functions += "\ntemplate<unsigned Threads>\n" + resolve
     source = r"""
 #include <cstdint>
 #include <vector>

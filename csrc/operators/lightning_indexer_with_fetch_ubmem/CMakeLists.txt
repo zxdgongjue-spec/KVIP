@@ -5,11 +5,15 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(RUN_MODE npu CACHE STRING "UBmem requires real NPU execution")
 set(SOC_VERSION "" CACHE STRING "Exact active Ascend950 SoC")
 set(ASCEND_CANN_PACKAGE_PATH "" CACHE PATH "Matching CANN installation")
+set(KVAF_INCLUDE "" CACHE PATH "KVAF access_operator/include")
 if(NOT RUN_MODE STREQUAL "npu" OR NOT SOC_VERSION MATCHES "^Ascend950[A-Za-z0-9_]+$")
   message(FATAL_ERROR "UBmem fusion needs RUN_MODE=npu and explicit active Ascend950 SOC_VERSION")
 endif()
 if(NOT EXISTS "${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake")
   message(FATAL_ERROR "Matching CANN AscendC CMake package is absent")
+endif()
+if(NOT EXISTS "${KVAF_INCLUDE}/ubmem/fused_batch_get_device.h")
+  message(FATAL_ERROR "KVAF UBmem device Get header is missing: ${KVAF_INCLUDE}")
 endif()
 include("${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake")
 set(_definitions
@@ -41,6 +45,7 @@ foreach(_width IN ITEMS 656 2624)
     "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/controller"
     "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/copy"
     "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/resolver"
+    "${KVAF_INCLUDE}"
     "${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include")
   ascendc_compile_options(${_target} PRIVATE ${_width_options} -O2 -g --cce-auto-sync=off
     -mllvm -user-reserved-ub-size=223232)

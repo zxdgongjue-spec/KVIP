@@ -61,6 +61,13 @@ def kvaf_cann(build_dir):
     raise ValueError(f"CANN path is missing from {build_dir}/CMakeCache.txt")
 
 
+def kvaf_source(build_dir):
+    for line in (Path(build_dir) / "CMakeCache.txt").read_text().splitlines():
+        if line.startswith("CMAKE_HOME_DIRECTORY:"):
+            return Path(line.split("=", 1)[1]).resolve()
+    raise ValueError(f"KVAF source path is missing from {build_dir}/CMakeCache.txt")
+
+
 def build_ubmem_library(*, cache_dir, cann, shape, jobs=2):
     """Compile once before profiling/capture; never called by forward."""
     if not isinstance(shape, UbmemGeometry) or jobs < 1:
@@ -68,7 +75,9 @@ def build_ubmem_library(*, cache_dir, cann, shape, jobs=2):
     source = Path(__file__).resolve().parents[4] / "csrc/operators/lightning_indexer_with_fetch_ubmem"
     if not (source / "CMakeLists.txt").is_file():
         raise FileNotFoundError(f"UBmem fusion sources unavailable: {source}")
-    options = shape.options(cann)
+    kvaf_root = kvaf_source(Path(cache_dir).parent)
+    kvaf_include = kvaf_root / "access_operator/include"
+    options = shape.options(cann) | {"KVAF_INCLUDE": str(kvaf_include)}
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     for directory in (source, source.parent / "common"):
         for path in sorted(directory.rglob("*")):
@@ -78,6 +87,10 @@ def build_ubmem_library(*, cache_dir, cann, shape, jobs=2):
     shared_selector = source.parent / "lidu/op_kernel/hot_slot_selection.h"
     digest.update(str(shared_selector.relative_to(source.parent)).encode())
     digest.update(shared_selector.read_bytes())
+    for name in ("copy.h", "batch_abi.h", "fused_batch_get_device.h"):
+        path = kvaf_include / "ubmem" / name
+        digest.update(str(path.resolve()).encode())
+        digest.update(path.read_bytes())
     for relative in (
         "version.info",
         "compiler/ccec_compiler/bin/bisheng",
