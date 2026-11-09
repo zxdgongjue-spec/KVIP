@@ -6,7 +6,7 @@ from pathlib import Path
 
 from kvip.runtime.build import build_libraries
 from kvip.operators.lifetch.binding import LIFetchBinding
-from kvip.adapters.vllm.selector import bind_group_selector, group_scratch
+from kvip.adapters.vllm.selector import bind_group_selector, group_scratch, index_update_arguments
 from kvip.operators.lifetch.index_update import DirectIndexUpdate
 from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, LeasedRuntime
 
@@ -82,15 +82,7 @@ def _bind_selectors(torch, policy, config):
         update = DirectIndexUpdate(
             torch,
             update_library,
-            keys=storage.keys,
-            scales=storage.scales,
-            addresses=storage.addresses,
-            logical_ids=storage.logical_ids,
-            row_owners=workspace.inputs.row_owners,
-            rotating=rotating,
-            status=policy.fused_errors[group],
-            query_inputs=workspace.inputs,
-            outputs=policy.fused_outputs[group],
+            **index_update_arguments(policy, workspace, storage, rotating, group),
         )
         selectors[group] = bind_group_selector(torch, policy, workspace, setup, group, storage, rotating, update)
     policy.indexer_selectors = selectors

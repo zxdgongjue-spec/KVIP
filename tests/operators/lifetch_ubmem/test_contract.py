@@ -211,6 +211,20 @@ def test_shared_index_update_abi_preserves_transport_descriptors():
     assert values[18:24] == [0] * 6
 
 
+def test_service_update_arguments_use_matching_layer_group_buffers():
+    from kvip.adapters.vllm.selector import index_update_arguments
+
+    storage = SimpleNamespace(keys=object(), scales=object(), addresses=object(), logical_ids=object())
+    workspace = SimpleNamespace(inputs=SimpleNamespace(row_owners=object()))
+    policy = SimpleNamespace(fused_errors=[object(), object()], fused_outputs=[object(), object()])
+    rotating = object()
+    values = index_update_arguments(policy, workspace, storage, rotating, 1)
+    assert values == dict(keys=storage.keys, scales=storage.scales, addresses=storage.addresses,
+                          logical_ids=storage.logical_ids, row_owners=workspace.inputs.row_owners,
+                          rotating=rotating, status=policy.fused_errors[1], query_inputs=workspace.inputs,
+                          outputs=policy.fused_outputs[1])
+
+
 def test_unique_active_owners_accepts_repeated_padding_without_device_read():
     inputs = object.__new__(UbmemQueryInputs)
     with patch("kvip.adapters.vllm.inputs.QueryInputs.prepare", return_value=None) as original:

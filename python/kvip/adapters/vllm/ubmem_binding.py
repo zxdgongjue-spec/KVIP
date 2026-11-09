@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from kvip.adapters.ubmem import UbmemLease, UbmemLeasedRuntime
-from kvip.adapters.vllm.selector import bind_group_selector, group_scratch
+from kvip.adapters.vllm.selector import bind_group_selector, group_scratch, index_update_arguments
 from kvip.operators.lifetch_ubmem.binding import UbmemBinding
 from kvip.operators.lifetch.index_update import UbmemIndexUpdate
 from kvip.operators.lifetch_ubmem.build import UbmemGeometry, build_ubmem_library, kvaf_cann
@@ -101,15 +101,7 @@ def _bind_selectors(torch, policy, config):
         )
         update = UbmemIndexUpdate(
             torch,
-            keys=storage.keys,
-            scales=storage.scales,
-            addresses=storage.addresses,
-            logical_ids=storage.logical_ids,
-            row_owners=workspace.inputs.row_owners,
-            rotating=rotating,
-            status=policy.fused_errors[group],
-            query_inputs=workspace.inputs,
-            outputs=policy.fused_outputs[group],
+            **index_update_arguments(policy, workspace, storage, rotating, group),
             plan_buffer=workspace.index_plan,
             extended_work=workspace.index_work,
         )

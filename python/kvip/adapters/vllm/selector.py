@@ -19,6 +19,16 @@ def group_scratch(policy, workspace, batch, group):
     return scratch
 
 
+def index_update_arguments(policy, workspace, storage, rotating, group):
+    """Bind persistent Index and output buffers shared by both transports."""
+    return dict(
+        keys=storage.keys, scales=storage.scales, addresses=storage.addresses,
+        logical_ids=storage.logical_ids, row_owners=workspace.inputs.row_owners,
+        rotating=rotating, status=policy.fused_errors[group], query_inputs=workspace.inputs,
+        outputs=policy.fused_outputs[group],
+    )
+
+
 def bind_group_selector(torch, policy, workspace, setup, group, storage, rotating, update, *, ubmem=False):
     """Bind the shared selector to one group's persistent storage."""
     selector = VllmIndexSelector(
