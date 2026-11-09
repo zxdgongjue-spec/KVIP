@@ -1,7 +1,7 @@
 #pragma once
 static_assert(V9_WINDOW_COPY_ENGINE >= 0 && V9_WINDOW_COPY_ENGINE <= 4,
               "Invalid UBmem window copy engine");
-#include "fetch_profiling.h"
+#define V9_FETCH_PROFILE(...)
 #include "device_utils.h"
 #include "../../../common/lifetch/prefetch_budget.h"
 

@@ -15,9 +15,9 @@ from kvip.adapters.ubmem import UbmemLease
 from kvip.cache.index_storage import IndexCacheStorage
 from kvip.operators.lifetch_ubmem.binding import UbmemBinding
 from kvip.operators.lifetch.forward import LIFetchForward
-from kvip.operators.lifetch_ubmem.index_update import UbmemIndexUpdate
+from kvip.operators.lifetch.index_update import UbmemIndexUpdate
 from kvip.operators.lifetch_ubmem.build import UbmemGeometry, build_ubmem_library, kvaf_cann
-from kvip.operators.lifetch_ubmem.workspace import UbmemWorkspace
+from kvip.operators.lifetch.workspace import UbmemWorkspace
 from kvip.runtime.device import query_device_resources
 
 

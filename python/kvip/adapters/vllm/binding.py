@@ -6,7 +6,7 @@ from pathlib import Path
 
 from kvip.runtime.build import build_libraries
 from kvip.operators.lifetch.binding import LIFetchBinding
-from kvip.adapters.vllm.selector import bind_group_selector
+from kvip.adapters.vllm.selector import bind_group_selector, group_scratch
 from kvip.operators.lifetch.index_update import DirectIndexUpdate
 from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, LeasedRuntime
 
@@ -57,11 +57,7 @@ def _bind_selectors(torch, policy, config):
         owner = KvafQueueView(
             runtime.lease, policy.bytes_outputs[group], policy.addresses.view(-1), policy.valid.view(-1)
         )
-        scratch = dict(workspace.scratch)
-        scratch["rows"] = policy.fused_fetch_rows[group]
-        # Bind existing candidates directly: no extra selection or per-layer copy.
-        scratch["lru_slots"] = policy.spare_slots[group, : setup.batch]
-        scratch["reserved_hot"] = policy.fused_reserved_hot[group, : setup.batch]
+        scratch = group_scratch(policy, workspace, setup.batch, group)
         rotating = launch_type(
             torch,
             library,

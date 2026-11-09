@@ -7,7 +7,7 @@ import numpy as np
 
 from kvip.operators.lifetch.geometry import final_aivs, li_geometry, prefetch_budget
 from kvip.operators.lifetch.tiling import RuntimeShape
-from kvip.operators.lifetch_ubmem.workspace import device_words, rotation_spec
+from kvip.operators.lifetch.workspace import device_words, ubmem_rotation_spec
 
 
 class UbmemBinding:
@@ -61,7 +61,7 @@ class UbmemBinding:
             function.argtypes, function.restype = [], ctypes.c_uint32
             if function() != expected:
                 raise ValueError(f"UBmem descriptor ABI mismatch: {name}")
-        for name, (size, dtype) in rotation_spec(
+        for name, (size, dtype) in ubmem_rotation_spec(
             shape.batch, shape.history, shape.resident, shape.aic_count, shape.intermediate_fetches
         ).items():
             value = (

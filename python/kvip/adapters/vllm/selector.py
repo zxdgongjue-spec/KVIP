@@ -10,6 +10,15 @@ from copy import copy
 from kvip.operators.lifetch.forward import LIFetchForward
 
 
+def group_scratch(policy, workspace, batch, group):
+    """Bind shared scratch and the existing per-group candidate buffers."""
+    scratch = dict(workspace.scratch)
+    scratch["rows"] = policy.fused_fetch_rows[group]
+    scratch["lru_slots"] = policy.spare_slots[group, :batch]
+    scratch["reserved_hot"] = policy.fused_reserved_hot[group, :batch]
+    return scratch
+
+
 def bind_group_selector(torch, policy, workspace, setup, group, storage, rotating, update, *, ubmem=False):
     """Bind the shared selector to one group's persistent storage."""
     selector = VllmIndexSelector(

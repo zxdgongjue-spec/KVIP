@@ -6,11 +6,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from kvip.adapters.ubmem import UbmemLease, UbmemLeasedRuntime
-from kvip.adapters.vllm.selector import bind_group_selector
+from kvip.adapters.vllm.selector import bind_group_selector, group_scratch
 from kvip.operators.lifetch_ubmem.binding import UbmemBinding
-from kvip.operators.lifetch_ubmem.index_update import UbmemIndexUpdate
+from kvip.operators.lifetch.index_update import UbmemIndexUpdate
 from kvip.operators.lifetch_ubmem.build import UbmemGeometry, build_ubmem_library, kvaf_cann
-from kvip.operators.lifetch_ubmem.workspace import UbmemWorkspace
+from kvip.operators.lifetch.workspace import UbmemWorkspace
 from kvip.runtime.device import query_device_resources
 
 
@@ -81,10 +81,7 @@ def _bind_selectors(torch, policy, config):
             lease = UbmemLease(torch, runtime, output, torch.npu.current_stream(policy.pool.device))
             runtime = UbmemLeasedRuntime(lease)
             writer.runtimes[layer.geometry] = runtime
-        scratch = dict(workspace.scratch)
-        scratch["rows"] = policy.fused_fetch_rows[group]
-        scratch["lru_slots"] = policy.spare_slots[group, : setup.batch]
-        scratch["reserved_hot"] = policy.fused_reserved_hot[group, : setup.batch]
+        scratch = group_scratch(policy, workspace, setup.batch, group)
         rotating = UbmemBinding(
             torch,
             setup.libraries[token_bytes],

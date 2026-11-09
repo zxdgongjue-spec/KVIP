@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Own the KVAF CPU-service DDR mapping lease for UBmem fusion and captured graphs."""
 
-from contextlib import contextmanager
+from kvip.adapters.kvaf import StreamLease
 
 import numpy as np
 
 
-class UbmemLease:
+class UbmemLease(StreamLease):
+    capture_scope_name = "UBmem"
+
     def __init__(self, torch, runtime, output, stream):
         if runtime.transport != "ubmem":
             raise ValueError("UBmem fusion requires a UBmem KVAF runtime")
@@ -24,10 +26,6 @@ class UbmemLease:
             self.runtime.release_ubmem_fused_context(self.context, self.stream)
             self.closed = True
             raise
-
-    @staticmethod
-    def output_key(output):
-        return output.data_ptr(), output.numel() * output.element_size()
 
     def _validate(self, context, output):
         if context["abi_version"] != 1 or context["device_id"] != self.device.index:
@@ -74,24 +72,6 @@ class UbmemLease:
         self.check_stream()
         self.runtime.retain_ubmem_fused_graph(self.context, graph)
         self.graphs.append(graph)
-
-    @contextmanager
-    def capture_scope(self):
-        self.check_stream()
-        if self.capturing_startup:
-            raise RuntimeError("Nested UBmem capture scopes are unsupported")
-        self.torch.npu.synchronize(self.device)
-        self.capturing_startup = True
-        try:
-            yield
-        finally:
-            try:
-                self.torch.npu.synchronize(self.device)
-            except BaseException:
-                self.capture_fence_failed = True
-                raise
-            finally:
-                self.capturing_startup = False
 
     def region(self, output):
         context = self.register_output(output)

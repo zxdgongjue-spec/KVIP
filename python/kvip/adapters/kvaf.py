@@ -6,6 +6,34 @@ from kvip.runtime.loader import load_lifetch_library, load_native_get
 from contextlib import contextmanager
 
 
+class StreamLease:
+    """Shared graph-capture lifecycle for transport-specific KVAF leases."""
+
+    capture_scope_name = "fused"
+
+    @staticmethod
+    def output_key(output):
+        return output.data_ptr(), output.numel() * output.element_size()
+
+    @contextmanager
+    def capture_scope(self):
+        self.check_stream()
+        if self.capturing_startup:
+            raise RuntimeError(f"Nested {self.capture_scope_name} capture scopes are unsupported")
+        self.torch.npu.synchronize(self.device)
+        self.capturing_startup = True
+        try:
+            yield
+        finally:
+            try:
+                self.torch.npu.synchronize(self.device)
+            except BaseException:
+                self.capture_fence_failed = True
+                raise
+            finally:
+                self.capturing_startup = False
+
+
 class LeasedRuntime:
     """Preserve Runtime calls while routing Get through its existing lease.
 
@@ -58,7 +86,7 @@ class GetLaunch:
             raise RuntimeError(f"Leased BatchGet launch failed: {code}")
 
 
-class KvafGetLease:
+class KvafGetLease(StreamLease):
     """Setup/teardown owner, not a second Runtime or DDR allocation.
 
     Register outputs and prepare descriptor bindings before graph capture.
@@ -86,10 +114,6 @@ class KvafGetLease:
         self.capturing_startup = False
         self.capture_fence_failed = False
 
-    @staticmethod
-    def output_key(output):
-        return output.data_ptr(), output.numel() * output.element_size()
-
     def check_stream(self):
         if self.closed:
             raise RuntimeError("Fused Get lease has been released")
@@ -97,29 +121,6 @@ class KvafGetLease:
         if stream.npu_stream != self.stream.npu_stream and not self.capturing_startup:
             raise RuntimeError("Fused and ordinary Get must use the lease stream")
         return stream
-
-    @contextmanager
-    def capture_scope(self):
-        """Startup-only auxiliary streams, fenced before normal inference.
-
-        vLLM captures on a separate stream, then replays on its execution
-        stream. No wait or event is inserted into the decode hot path.
-        """
-        self.check_stream()
-        if self.capturing_startup:
-            raise RuntimeError("Nested fused capture scopes are unsupported")
-        self.torch.npu.synchronize(self.device)
-        self.capturing_startup = True
-        try:
-            yield
-        finally:
-            try:
-                self.torch.npu.synchronize(self.device)
-            except BaseException:
-                self.capture_fence_failed = True
-                raise
-            finally:
-                self.capturing_startup = False
 
     def register_output(self, output):
         self.check_stream()

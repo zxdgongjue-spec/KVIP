@@ -10,7 +10,7 @@ import pytest
 
 from kvip.adapters.ubmem import UbmemLease
 from kvip.operators.lifetch_ubmem.build import UbmemGeometry
-from kvip.operators.lifetch_ubmem.workspace import UbmemQueryInputs, UbmemWorkspace, device_words, rotation_spec
+from kvip.operators.lifetch.workspace import UbmemQueryInputs, UbmemWorkspace, device_words, ubmem_rotation_spec as rotation_spec
 
 
 def lease_fixture(token_bytes=656):
@@ -161,7 +161,7 @@ def test_workspace_initializes_with_npu_supported_zero_dtypes():
         full=lambda size, value, *, dtype, device: np.full(size, value, dtype=dtype),
         empty=lambda size, *, dtype, device: np.empty(size, dtype=dtype),
     )
-    with patch("kvip.operators.lifetch_ubmem.workspace.UbmemQueryInputs"):
+    with patch("kvip.operators.lifetch.workspace.UbmemQueryInputs"):
         workspace = UbmemWorkspace(torch, batch=2, history=33024, resident=8192, aics=32, windows=8, device="npu:0")
     status = workspace.scratch["ubmem_status"]
     assert status.shape == (2, 16) and status.itemsize == 8
@@ -184,6 +184,31 @@ def test_device_abi_words_preserve_all_pointer_bits_in_signed_storage():
     assert device == "npu:1" and values.shape == (len(words),)
     assert values.tobytes() == np.asarray(words, dtype="<u8").tobytes()
     assert values.view(np.uint64).tolist() == words
+
+
+def test_shared_index_update_abi_preserves_transport_descriptors():
+    from kvip.operators.lifetch.index_update import _update_pointers
+
+    def tensor(address):
+        return SimpleNamespace(data_ptr=lambda: address)
+
+    rotating = SimpleNamespace(
+        change_slots=tensor(5), changes=tensor(6), rows=tensor(9), row_status=tensor(11),
+        final_posts=tensor(12), final_workers=15, hot_valid=tensor(17),
+        arguments=[None] * 9 + [tensor(19)], locations=tensor(20), change_count=tensor(27),
+    )
+    addresses = tensor(3)
+    addresses.stride = lambda dim: 8
+    query = SimpleNamespace(unpack_indices=tensor(21), output_valid=tensor(22))
+    prefix = (tensor(1), tensor(2), addresses, tensor(4), tensor(10), rotating, tensor(7), tensor(18))
+    for statuses, expected in (((13, 14, 16), (13, 14, 16)), ((113, 114, 128), (113, 114, 128))):
+        values = _update_pointers(*prefix, tensor(statuses[0]), tensor(statuses[1]), statuses[2],
+                                  tensor(28), query, tensor(23), tensor(24), 25, 26)
+        assert values == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+                          expected[0], expected[1], 15, expected[2], 17, 18,
+                          19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
+    values = _update_pointers(*prefix, tensor(13), tensor(14), 16, tensor(28), None, None, None, 25, 26)
+    assert values[18:24] == [0] * 6
 
 
 def test_unique_active_owners_accepts_repeated_padding_without_device_read():
