@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Own the real KVAF local-DDR lease for UBmem fusion and captured graphs."""
+"""Own the KVAF CPU-service DDR mapping lease for UBmem fusion and captured graphs."""
 
 from contextlib import contextmanager
 
@@ -32,7 +32,11 @@ class UbmemLease:
             or context["region_bytes"] % context["slot_bytes"]
         ):
             raise ValueError("KVAF UBmem lease slot geometry is inconsistent")
-        for base, size in ((context["region_base"], context["region_bytes"]), self.output_key(output)):
+        for base, size in (
+            (context["region_base"], context["region_bytes"]),
+            (context["mapped_base"], context["region_bytes"]),
+            self.output_key(output),
+        ):
             if base <= 0 or size <= 0 or base + size > (1 << 64) - 1:
                 raise ValueError("KVAF UBmem lease address span is invalid")
         if not context["lease_id"]:
@@ -84,14 +88,14 @@ class UbmemLease:
 
     def region(self, output):
         context = self.register_output(output)
-        # KVAF access tables already contain device-visible addresses of this
-        # exact mapping. Both bases are the mapped VA, never a guessed CPU VA.
+        # Access table entries are CPU service VAs; translate by offset into
+        # the same KVAF-owned NPU mapping. Both remain valid for this lease.
         base = context["region_base"]
         fields = [
             0x55424D454D563931,
             1,
             base,
-            base,
+            context["mapped_base"],
             context["region_bytes"],
             context["lease_id"],
             output.data_ptr(),

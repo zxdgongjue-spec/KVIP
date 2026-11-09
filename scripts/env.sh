@@ -15,8 +15,8 @@ PY
     transport="${selection##*$'\n'}"
     export PYTHONPATH="$root/python:$dependency/python${PYTHONPATH:+:$PYTHONPATH}"
     if [[ "$transport" == ubmem ]]; then
-        export KVAF_BATCH_GET_KERNEL="$dependency/bin/kvaf_ubmem_batch_get.o"
-        export KVAF_BATCH_PUT_KERNEL="$dependency/bin/kvaf_ubmem_batch_put.o"
+        export KVAF_BATCH_GET_KERNEL="$dependency/bin/kvaf_execute_batch_get_kernels.o"
+        export KVAF_BATCH_PUT_KERNEL="$dependency/bin/kvaf_execute_batch_put_kernels.o"
     else
         export KVAF_BATCH_GET_KERNEL="$dependency/bin/kvaf_execute_batch_get_kernels.o"
         export KVAF_BATCH_PUT_KERNEL="$dependency/bin/kvaf_execute_batch_put_kernels.o"

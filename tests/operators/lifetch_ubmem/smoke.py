@@ -25,7 +25,7 @@ def payload(owner, tokens, token_bytes):
     return values
 
 
-def check_shape(kvaf, torch, build, device_id, shape, library, prefetch_tokens=512):
+def check_shape(kvaf, torch, build, device_id, shape, library, prefetch_tokens=512, args_server="127.0.0.1:28880"):
     batch, history, resident, token_bytes = shape.batch, shape.history, shape.resident, shape.token_bytes
     device = torch.device(f"npu:{device_id}")
     block_bytes = 128 * token_bytes
@@ -35,17 +35,18 @@ def check_shape(kvaf, torch, build, device_id, shape, library, prefetch_tokens=5
     source_cpu = np.concatenate([payload(owner, np.arange(history), token_bytes) for owner in range(1, batch + 1)])
     source = torch.from_numpy(source_cpu).to(device)
     runtime = kvaf.NpuRuntime(
-        str(build / "bin/kvaf_ubmem_batch_get.o"),
+        str(build / "bin/kvaf_execute_batch_get_kernels.o"),
         token_bytes,
         128,
         device_id=device_id,
         npu_core_count=2,
-        batch_put_kernel_object_path=str(build / "bin/kvaf_ubmem_batch_put.o"),
+        batch_put_kernel_object_path=str(build / "bin/kvaf_execute_batch_put_kernels.o"),
         transport="ubmem",
     )
     table = lease = graph = None
     stream = torch.npu.current_stream(device)
     try:
+        runtime.link_to(args_server)
         runtime.initialize((len(keys) + 2) * slot_bytes, slot_bytes)
         runtime.batch_put(keys, source, [i * block_bytes for i in keys], [block_bytes] * len(keys))
         table = runtime.prepare_access_table(keys)
@@ -268,6 +269,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=Path, required=True)
     parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--kvaf-server", required=True, help="KVAF CPU service host:port")
     parser.add_argument("--soc", required=True)
     parser.add_argument("--batches", type=int, nargs="+", default=[1, 2])
     parser.add_argument("--token-bytes", type=int, nargs="+", default=[656, 2624])
@@ -292,7 +294,7 @@ def main():
             shape = Specialization(batch, args.history, args.resident, 64, token_bytes, aics, 8, args.soc)
             library = build_specialization(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape)
             for prefetch_tokens in args.prefetch_tokens:
-                check_shape(kvaf, torch, build, args.device, shape, library, prefetch_tokens)
+                check_shape(kvaf, torch, build, args.device, shape, library, prefetch_tokens, args.kvaf_server)
 
 
 if __name__ == "__main__":

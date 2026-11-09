@@ -134,7 +134,7 @@ def _bind_selectors(torch, policy, config):
     policy.indexer_selectors = selectors
     logging.getLogger("vllm").info(
         "KVAF transport=ubmem decode_backend=li_fetch groups=%s batch_capacity=%s history_capacity=%s "
-        "hot_tokens=%s requested_windows=%s device=%s; worker-local Host DDR arena",
+        "hot_tokens=%s requested_windows=%s device=%s; CPU-service Host DDR mapping",
         len(selectors),
         setup.batch,
         policy.fused_index_storage[0].history,

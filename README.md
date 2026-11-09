@@ -2,8 +2,8 @@
 
 Ascend A5 cache operators extracted from vLLM-DSA's KVOP. Python 3.12,
 a matching CANN and `torch`/`torch_npu` runtime are required for NPU validation.
-URMA additionally requires a reachable KVAF CPU service; UBmem owns local Host DDR
-in each NPU worker and does not connect to a CPU service. Installation is editable: keep this checkout beside
+URMA and UBmem require a reachable KVAF CPU service. UBmem imports the service's
+Host DDR mapping into the NPU process. Installation is editable: keep this checkout beside
 the installed Python package because startup builds use its C++ sources.
 
 ## Layout and API
@@ -34,7 +34,7 @@ python/kvip/
   _compat.py                        # centralized lazy aliases for legacy kvip imports
 scripts/                            # existing build/environment entry points and common KVAF patches
 patches/kvaf-background-put.patch    # shared background Put binding compatibility
-patches/kvaf-ubmem.patch             # optional local-DDR runtime/Get/Put/fused-lease increment
+patches/kvaf-ubmem-fused-lease.patch # optional mapped-region fused lease for KVAF UBmem
 tests/
   operators/lidu/
   operators/lifetch/                 # single CLI, update tests, support and resolver_reference
@@ -112,7 +112,7 @@ The supported KVAF base is `1c1310387ebfb6776a07316874e924265b209ada`.
 Preparation retains the existing three common patches in `scripts/patches` and
 applies `patches/kvaf-background-put.patch` for background Put's GIL release and
 capability flag. `--transport ubmem` additionally
-applies `patches/kvaf-ubmem.patch` to that checkout. Preparation recognizes an
+applies `patches/kvaf-ubmem-fused-lease.patch` to that checkout. Preparation recognizes an
 already patched tree and preserves unrelated edits; conflicting changes fail
 without a forced reset. A separate KVAF checkout/build is recommended per transport.
 `--prepare-only` prepares the dependency without replacing the active build selection;
@@ -124,17 +124,15 @@ bash scripts/build.sh --transport ubmem --kvaf-root /vllm-workspace/KVAF-ubmem \
 source scripts/env.sh
 ```
 
-UBmem builds the worker-local Host DDR allocator and Get/Put kernels without
-UMDK or CPU services. `thp` (default) allocates host memory, requests transparent
-huge pages and registers the device-visible mapping; actual huge-page coverage
-is reported separately and depends on the host. `base` uses the regular-page VMM
-path. Both paths keep the allocation alive until outstanding work and retained
-fused contexts are released. The existing key/slot metadata and background Put
-ownership remain in KVAF. URMA remains the default build.
+UBmem uses KVAF's existing CPU service, Host DDR allocator and Get/Put kernels.
+The fused lease retains the imported NPU mapping and its graph-owned buffers.
+The CPU service manages memory placement; worker-local allocation, THP and NUMA
+settings from the earlier local-DDR prototype are not part of this path. URMA
+remains the default build.
 
 The serial vLLM path uses native LI/LIDU followed by KVAF UBmem BatchGet;
 `decode_backend=li_fetch` selects the independent UBmem LI/TopK/Fetch/Index-update
-pipeline. Both use UBmem BatchPut and the same local DDR arena. Shared Indexer
+pipeline. Both use UBmem BatchPut and the same CPU-service DDR region. Shared Indexer
 layers fetch the complete grouped record (656 or 2624 bytes), so the following
 layers reuse the fetched payload. UBmem retains its own copy scheduling and
 completion checks while reusing the transport-independent algorithms above.

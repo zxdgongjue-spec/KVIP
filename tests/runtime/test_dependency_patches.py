@@ -62,7 +62,7 @@ class DependencyPatchTests(unittest.TestCase):
             data = diff(self.stages[index], self.stages[index + 1])
             (self.root / "scripts/patches" / f"{name}.patch").write_text(data)
         (self.root / "patches/kvaf-background-put.patch").write_text(diff(self.stages[3], self.stages[4]))
-        (self.root / "patches/kvaf-ubmem.patch").write_text(diff(self.stages[4], self.stages[5]))
+        (self.root / "patches/kvaf-ubmem-fused-lease.patch").write_text(diff(self.stages[4], self.stages[5]))
         self.root_patch = patch.object(BUILD, "ROOT", self.root)
         self.revision_patch = patch.object(BUILD, "REVISION", revision)
         self.root_patch.start()

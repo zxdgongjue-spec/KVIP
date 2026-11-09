@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 REVISION = "1c1310387ebfb6776a07316874e924265b209ada"
 PATCHES = ("kvaf-reuse-device-ra", "kvaf-fused-context", "kvaf-fused-output-views")
-UBMEM_PATCH = "kvaf-ubmem"
+UBMEM_PATCH = "kvaf-ubmem-fused-lease"
 BACKGROUND_PATCH = "kvaf-background-put"
 
 
@@ -85,7 +85,7 @@ def prepare_dependency(root, transport="urma"):
     # keeping the default URMA checkout on its original three-patch chain.
     if applies(root, UBMEM_PATCH, True):
         if transport != "ubmem":
-            raise RuntimeError("KVAF checkout already has the local UBmem patch; use a separate URMA checkout")
+            raise RuntimeError("KVAF checkout already has the UBmem lease patch; use a separate URMA checkout")
         print(f"KVAF UBmem dependency already patched: {root} @ {head}", flush=True)
         return
     # Applying output-views changes the parent patch's context: check newest first.
@@ -122,7 +122,7 @@ def main():
     dependency = (args.kvaf_root or ROOT / "third_party/KVAF").resolve()
     prepare_dependency(dependency, args.transport)
     (ROOT / "build").mkdir(exist_ok=True)
-    build_dir = dependency / ("build-ubmem-npu" if args.transport == "ubmem" else "build-npu")
+    build_dir = dependency / "build-npu"
     state = dict(kvaf=str(dependency), revision=REVISION, transport=args.transport, kvaf_build_dir=str(build_dir))
     if args.prepare_only:
         # Preparing source must not switch a working Python environment to an
@@ -139,12 +139,20 @@ def main():
     )
     if args.transport == "ubmem":
         if not args.skip_kvaf_build:
-            call(
-                ["bash", dependency / "build.sh", "npu", "--transport", "ubmem", "--jobs", args.jobs],
-                cwd=dependency,
-                env=env,
-            )
-        for name in ("kvaf_ubmem_batch_get.o", "kvaf_ubmem_batch_put.o"):
+            for target in ("cpu", "npu"):
+                call(
+                    [
+                        "bash",
+                        dependency / "build.sh",
+                        target,
+                        "--jobs",
+                        args.jobs,
+                        *(["--without-aicpu"] if target == "npu" else []),
+                    ],
+                    cwd=dependency,
+                    env=env,
+                )
+        for name in ("kvaf_execute_batch_get_kernels.o", "kvaf_execute_batch_put_kernels.o"):
             if not (build_dir / "bin" / name).is_file():
                 raise RuntimeError(f"UBmem kernel missing: {build_dir / 'bin' / name}")
         if not list((build_dir / "python/kvaf").glob("*.so")):

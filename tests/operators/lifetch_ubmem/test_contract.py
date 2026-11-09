@@ -25,6 +25,7 @@ def lease_fixture(token_bytes=656):
         lease_id=9,
         device_id=1,
         region_base=0x100000,
+        mapped_base=0x400000,
         region_bytes=slot_bytes * 4,
         slot_bytes=slot_bytes,
         output_address=output.data_ptr(),
@@ -58,6 +59,24 @@ def test_padded_kvaf_slots_and_failed_release_retain_owners(token_bytes):
     runtime.release_ubmem_fused_context.side_effect = None
     lease.close()
     assert lease.closed and not lease.outputs and not lease.bindings and not lease.graphs
+
+
+def test_peer_and_device_mapping_bases_are_kept_distinct():
+    torch, runtime, output, stream = lease_fixture()
+
+    class Wrapped:
+        def __init__(self, array):
+            self.array = array
+
+        def to(self, device):
+            return self.array
+
+    torch.from_numpy = Wrapped
+    lease = UbmemLease(torch, runtime, output, stream)
+    words = lease.region(output).view("<u8")
+    assert words[2] == 0x100000  # addresses supplied by CPU service
+    assert words[3] == 0x400000  # actual imported NPU mapping
+    assert words[4] == runtime.acquire_ubmem_fused_context.return_value["region_bytes"]
 
 
 def test_capture_stream_only_allowed_inside_fenced_scope():
