@@ -1,6 +1,17 @@
 """Native Q4/Q2 geometry scaled to the active logical device's AIC budget."""
 
 
+def prefetch_budget(prefetch_limit=512, window_limit=None, intermediate_fetches=8):
+    """Limit speculative fetches only; final TopK repair has its own capacity."""
+    if not isinstance(intermediate_fetches, int) or intermediate_fetches < 1:
+        raise ValueError("Prefetch requires a positive window count")
+    if window_limit is None:
+        window_limit = max(1, prefetch_limit // intermediate_fetches)
+    if not 0 <= prefetch_limit <= 2048 or not 1 <= window_limit <= 480:
+        raise ValueError("Invalid prefetch budgets: total must be 0..2048 and window 1..480")
+    return prefetch_limit, window_limit
+
+
 def li_geometry(batch, tiling="auto", intermediate_fetches=32, aic_count=32, service_aics=0):
     if not 1 <= batch <= 32 or tiling not in ("auto", "q4"):
         raise ValueError("Requires B1..32 and LI tiling auto/q4")

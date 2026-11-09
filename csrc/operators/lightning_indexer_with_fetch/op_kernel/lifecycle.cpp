@@ -313,51 +313,11 @@ __aicore__ inline void FinishFetch(GM_ADDR bindings, GM_ADDR update) {
     uint64_t error=info[0] ? kvaf_device::kInvalidArgs : row->error;
     uint32_t completed=0,total=0,deferred=0;
     uint64_t lastHead=0,lastCq=0;
-    for(uint32_t phase=0;phase<2;++phase) {
-      if(phase==1) {
-          CompletePrefetch(ctx,b);
-          error|=row->error;
-      }
-        for(uint32_t w=0;w<rt_finalWorkers;++w){
-            auto post=FinalPostAt(rt_finalPostOffset,ctx,b*rt_finalWorkers+w);
-            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
-            auto workerArgs=GetArgs(ctx,FinalQueue(rt_batch,rt_finalWorkers,b,w));
-            auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(workerArgs.queue_state);
-            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
-            if(!phase)total+=post->count;
-            error|=post->error;
-            if(post->nonconflicting>post->count)error|=kvaf_device::kInvalidArgs;
-            uint32_t begin=post->descriptor+(phase?post->nonconflicting:0);
-            uint32_t count=phase?post->count-post->nonconflicting:post->nonconflicting;
-            if(post->deferred && count){
-                if(phase)++deferred;
-#if !V9_SIMULATION
-                if(!error && (!phase || !row->pending)){
-                    workerArgs.indices=ctx->sourceBlocks;workerArgs.offsets=ctx->sourceOffsets;
-                    workerArgs.output_indices=ctx->destinations;workerArgs.miss_count=ctx->count;
-                    workerArgs.request_capacity=rt_batch*kSlots;
-                    if(ctx->fallbackAddresses) {
-                        workerArgs.address_table=ctx->fallbackAddresses;
-                        workerArgs.valid_table=ctx->fallbackValid;
-                        workerArgs.table_capacity=rt_batch*kSlots;
-                    }
-                    kvaf_device::KvafBatchGetDevice(workerArgs,0,begin,count);
-                    auto done=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(workerArgs.core_status);
-                    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(done),sizeof(*done));
-                    error|=done->result;completed+=done->completed_batch_count;
-                    if(done->magic!=KVAF_AIV_BATCH_GET_STATUS_MAGIC || done->processed_request_count!=count)
-                        error|=kvaf_device::kInvalidArgs;
-                    if(!done->result && (phase || post->nonconflicting==post->count))post->deferred=0;
-                }
-#else
-                error|=kvaf_device::kInvalidArgs; // DMA fallback needs real hardware.
-#endif
-            }
-            lastHead=queue->sq_producer_index;lastCq=queue->cq_consumer_index;
-            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
-            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
-        }
-    }
+#define LIFETCH_FINAL_JOIN do { CompletePrefetch(ctx,b); error|=row->error; } while (0)
+#define LIFETCH_FINAL_PHASE "../../lightning_indexer_with_fetch/op_kernel/final_fetch_phase.h"
+#include "../../common/lifetch/final_phase_loop.h"
+#undef LIFETCH_FINAL_PHASE
+#undef LIFETCH_FINAL_JOIN
     if(row->pending || total!=info[1])error|=kvaf_device::kInvalidArgs;
     info[0]|=uint32_t(error);info[3]=deferred?1:0;info[4]=completed;
     if(!error) {

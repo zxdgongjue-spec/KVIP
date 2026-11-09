@@ -1,0 +1,218 @@
+diff --git a/access_operator/include/ubmem/copy.h b/access_operator/include/ubmem/copy.h
+index 7633b641..79a6a171 100644
+--- a/access_operator/include/ubmem/copy.h
++++ b/access_operator/include/ubmem/copy.h
+@@ -25,6 +25,17 @@ class MteCopyPipeline {
+     }
+   }
+ 
++  // Caller-owned scratch allows a fused kernel to reuse retired local memory
++  // without overwriting other live UB allocations. Event IDs remain [0, stages_).
++  __aicore__ inline MteCopyPipeline(uint64_t row_bytes, AscendC::LocalTensor<uint8_t> scratch) {
++    const uint32_t limit = BufferBytes / 2 / 32 * 32;
++    chunk_bytes_ = row_bytes < limit ? row_bytes : limit;
++    const uint32_t bank_bytes = (chunk_bytes_ + 31U) / 32U * 32U;
++    const uint32_t available_stages = BufferBytes / bank_bytes;
++    stages_ = available_stages < MaxStages ? available_stages : MaxStages;
++    for (uint32_t bank = 0; bank < stages_; ++bank) buffers_[bank] = scratch[bank * bank_bytes];
++  }
++
+   __aicore__ inline void Copy(uint64_t dst, uint64_t src, uint64_t bytes) {
+     for (uint64_t offset = 0; offset < bytes;) {
+       const uint32_t bank = read_bank_;
+diff --git a/access_operator/include/ubmem/fused_batch_get_device.h b/access_operator/include/ubmem/fused_batch_get_device.h
+new file mode 100644
+index 00000000..9cdb416b
+--- /dev/null
++++ b/access_operator/include/ubmem/fused_batch_get_device.h
+@@ -0,0 +1,64 @@
++#pragma once
++#include "ubmem/copy.h"
++
++namespace kvaf_device {
++// Compact descriptors are the same resolver outputs used by URMA: one remote
++// address and one absolute output row per request. The caller ensures the
++// descriptor-producing kernel has completed before entering this overload.
++struct UbmemBatchGetDeviceArgs {
++  __gm__ const uint64_t* addresses;
++  __gm__ const int32_t* output_indices;
++  uint64_t peer_base, mapped_base, region_bytes, output_base, output_bytes;
++  uint32_t begin, count, owner_base, resident, worker, workers, token_bytes;
++};
++struct UbmemBatchGetDeviceResult {
++  uint32_t scheduled, completed, error;
++};
++
++// Workers own complete destination sectors. Consecutive 656-byte rows share
++// a 32-byte sector, so both rows of a pair must be handled by one worker.
++__aicore__ inline UbmemBatchGetDeviceResult KvafBatchGetDevice(
++    const UbmemBatchGetDeviceArgs& a, AscendC::LocalTensor<uint8_t> scratch) {
++  UbmemBatchGetDeviceResult result{};
++  if (!a.addresses || !a.output_indices || !a.workers || a.worker >= a.workers || !a.token_bytes ||
++      !a.peer_base || !a.mapped_base || !a.region_bytes ||
++      a.region_bytes > UINT64_MAX - a.peer_base || a.region_bytes > UINT64_MAX - a.mapped_base ||
++      !a.output_base || !a.output_bytes || a.output_bytes > UINT64_MAX - a.output_base ||
++      (a.output_base & 31U) || ((uint64_t(a.owner_base) * a.token_bytes) & 31U) ||
++      (a.token_bytes % 32U != 0U && a.token_bytes % 32U != 16U) ||
++      a.token_bytes > a.region_bytes || a.token_bytes > a.output_bytes ||
++      a.count > UINT32_MAX - a.begin) {
++    result.error = 0x20000U;
++    return result;
++  }
++  kvaf::ubmem::MteCopyPipeline<4, 21504> pipeline(a.token_bytes, scratch);
++  bool started = false;
++  for (uint32_t rank = 0; rank < a.count; ++rank) {
++    const uint32_t index = a.begin + rank;
++    const int32_t output_index = a.output_indices[index];
++    const bool valid_slot = output_index >= 0 && uint32_t(output_index) >= a.owner_base &&
++                            uint32_t(output_index) - a.owner_base < a.resident;
++    const uint32_t slot = valid_slot ? uint32_t(output_index) - a.owner_base : 0;
++    const uint32_t owner = valid_slot ? (slot >> 1U) % a.workers : rank % a.workers;
++    if (owner != a.worker) continue;
++    ++result.scheduled;
++    if (result.error) continue;
++    const uint64_t peer = a.addresses[index];
++    const uint64_t output_offset = uint64_t(uint32_t(output_index)) * a.token_bytes;
++    if (!valid_slot || peer < a.peer_base || peer - a.peer_base > a.region_bytes - a.token_bytes ||
++        output_offset > a.output_bytes - a.token_bytes) {
++      result.error |= 0x20000U;
++      continue;
++    }
++    if (!started) {
++      AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(0);
++      AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(0);
++      started = true;
++    }
++    pipeline.Copy(a.output_base + output_offset, a.mapped_base + (peer - a.peer_base), a.token_bytes);
++    ++result.completed;
++  }
++  pipeline.Finish();
++  return result;
++}
++}  // namespace kvaf_device
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 044823ae..7b0041fc 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -126,3 +126,8 @@ add_test(NAME kvaf_fused_batch_get_context_host
+ add_executable(kvaf_runtime_completion_test runtime_completion_test.cc)
+ target_link_libraries(kvaf_runtime_completion_test PRIVATE kvaf_runtime kvaf_meta_manager)
+ add_test(NAME kvaf_runtime_completion_host COMMAND kvaf_runtime_completion_test)
++
++add_executable(kvaf_ubmem_fused_device_test ubmem_fused_device_test.cc)
++target_include_directories(kvaf_ubmem_fused_device_test PRIVATE
++  ubmem_device_stub ${PROJECT_SOURCE_DIR}/access_operator/include)
++add_test(NAME kvaf_ubmem_fused_device_host COMMAND kvaf_ubmem_fused_device_test)
+diff --git a/tests/ubmem_device_stub/kernel_operator.h b/tests/ubmem_device_stub/kernel_operator.h
+new file mode 100644
+index 00000000..82a35c6c
+--- /dev/null
++++ b/tests/ubmem_device_stub/kernel_operator.h
+@@ -0,0 +1,29 @@
++#pragma once
++#include <cassert>
++#include <cstdint>
++#include <cstring>
++#define __aicore__
++#define __gm__
++using event_t = unsigned;
++namespace AscendC {
++enum class TPosition { VECIN };
++enum class HardEvent { MTE3_MTE2, MTE2_MTE3, MTE3_S, S_MTE2 };
++inline bool events[4][8]{};
++template<HardEvent D> void SetFlag(event_t e) { assert(e<8); assert(!events[unsigned(D)][e]); events[unsigned(D)][e]=true; }
++template<HardEvent D> void WaitFlag(event_t e) { assert(e<8); assert(events[unsigned(D)][e]); events[unsigned(D)][e]=false; }
++template<class T> struct LocalTensor {
++    struct { uint8_t logicPos; uint32_t bufferAddr, dataLen; } address_{};
++    T* data{};
++    LocalTensor operator[](size_t offset) const { auto out=*this; out.data+=offset; return out; }
++    T GetValue(size_t index) const { return data[index]; }
++};
++template<class T> struct GlobalTensor { T* data{}; void SetGlobalBuffer(T* p) {data=p;} };
++struct DataCopyExtParams { uint16_t blockCount; uint32_t blockLen, srcStride, dstStride, reserved; };
++template<class T> struct DataCopyPadExtParams { bool enabled; uint8_t left, right; T value; };
++template<class T> void DataCopyPad(LocalTensor<T> dst, GlobalTensor<T> src, DataCopyExtParams c, DataCopyPadExtParams<T>) {
++    assert(c.blockCount==1); std::memcpy(dst.data,src.data,c.blockLen);
++}
++template<class T> void DataCopyPad(GlobalTensor<T> dst, LocalTensor<T> src, DataCopyExtParams c) {
++    assert(c.blockCount==1); std::memcpy(dst.data,src.data,c.blockLen);
++}
++}
+diff --git a/tests/ubmem_fused_device_test.cc b/tests/ubmem_fused_device_test.cc
+new file mode 100644
+index 00000000..17914065
+--- /dev/null
++++ b/tests/ubmem_fused_device_test.cc
+@@ -0,0 +1,72 @@
++#ifdef NDEBUG
++#undef NDEBUG
++#endif
++#include "ubmem/fused_batch_get_device.h"
++#include <cassert>
++#include <cstdint>
++#include <vector>
++int main() {
++  for (uint32_t width : {656U, 2624U}) {
++    constexpr uint32_t rows=16, workers=4;
++    std::vector<uint8_t> source(rows*width), storage(rows*width+31, 0), expected(rows*width,0), scratch(21504);
++    auto* output=reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(storage.data())+31U)&~uintptr_t(31U));
++    for (size_t i=0;i<source.size();++i) source[i]=uint8_t(i*17U);
++    uint64_t addresses[rows]; int32_t slots[rows];
++    for (uint32_t i=0;i<rows;++i) {
++      uint64_t peer=0x100000ULL+uint64_t(i)*width;
++      addresses[i]=peer; slots[i]=(i*5)%rows;
++      std::memcpy(expected.data()+uint64_t(slots[i])*width,source.data()+uint64_t(i)*width,width);
++    }
++    uint32_t total=0;
++    for (uint32_t w=0;w<workers;++w) {
++      kvaf_device::UbmemBatchGetDeviceArgs args{addresses,slots,0x100000ULL,
++        reinterpret_cast<uint64_t>(source.data()),source.size(),reinterpret_cast<uint64_t>(output),rows*width,
++        0,rows,0,rows,w,workers,width};
++      auto result=kvaf_device::KvafBatchGetDevice(args,AscendC::LocalTensor<uint8_t>{{},scratch.data()});
++      assert(result.error==0 && result.scheduled==result.completed); total+=result.completed;
++    }
++    assert(total==rows && std::memcmp(output,expected.data(),expected.size())==0);
++    for(auto& dir:AscendC::events)for(bool flag:dir)assert(!flag);
++    kvaf_device::UbmemBatchGetDeviceArgs invalid{addresses,slots,0x100000ULL,
++      reinterpret_cast<uint64_t>(source.data()),source.size(),reinterpret_cast<uint64_t>(output),rows*width,
++      0,rows,0,rows,0,workers,width};
++    addresses[0]=0;auto result=kvaf_device::KvafBatchGetDevice(invalid,AscendC::LocalTensor<uint8_t>{{},scratch.data()});
++    assert(result.error!=0 && result.completed==0 && result.scheduled>0);
++
++    // Descriptor ranges and owner rows are not necessarily zero in a batch.
++    constexpr uint32_t begin=3, owner=16;
++    std::vector<uint64_t> shifted_addresses(begin+rows);
++    std::vector<int32_t> shifted_slots(begin+rows);
++    std::vector<uint8_t> shifted_storage((owner+rows)*width+31,0), shifted_expected((owner+rows)*width,0);
++    auto* shifted_output=reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(shifted_storage.data())+31U)&~uintptr_t(31U));
++    for(uint32_t i=0;i<rows;++i) {
++      shifted_addresses[begin+i]=0x100000ULL+uint64_t(i)*width;
++      shifted_slots[begin+i]=owner+(i*5)%rows;
++      std::memcpy(shifted_expected.data()+uint64_t(shifted_slots[begin+i])*width,source.data()+uint64_t(i)*width,width);
++    }
++    total=0;
++    for(uint32_t w=0;w<workers;++w) {
++      kvaf_device::UbmemBatchGetDeviceArgs args{shifted_addresses.data(),shifted_slots.data(),0x100000ULL,
++        reinterpret_cast<uint64_t>(source.data()),source.size(),reinterpret_cast<uint64_t>(shifted_output),shifted_expected.size(),
++        begin,rows,owner,rows,w,workers,width};
++      auto actual=kvaf_device::KvafBatchGetDevice(args,AscendC::LocalTensor<uint8_t>{{},scratch.data()});
++      assert(actual.error==0 && actual.scheduled==actual.completed);total+=actual.completed;
++    }
++    assert(total==rows && std::memcmp(shifted_output,shifted_expected.data(),shifted_expected.size())==0);
++    shifted_slots[begin]=-1;
++    kvaf_device::UbmemBatchGetDeviceArgs bad_slot{shifted_addresses.data(),shifted_slots.data(),0x100000ULL,
++      reinterpret_cast<uint64_t>(source.data()),source.size(),reinterpret_cast<uint64_t>(shifted_output),shifted_expected.size(),
++      begin,rows,owner,rows,0,workers,width};
++    assert(kvaf_device::KvafBatchGetDevice(bad_slot,AscendC::LocalTensor<uint8_t>{{},scratch.data()}).error!=0);
++    // Each owner must start at a sector boundary: different batch owners are
++    // executed by different AIVs even when their per-owner worker IDs match.
++    bad_slot.owner_base=17;bad_slot.count=0;
++    if(width==656)
++      assert(kvaf_device::KvafBatchGetDevice(bad_slot,AscendC::LocalTensor<uint8_t>{{},scratch.data()}).error!=0);
++    else
++      assert(kvaf_device::KvafBatchGetDevice(bad_slot,AscendC::LocalTensor<uint8_t>{{},scratch.data()}).error==0);
++    auto unsupported=bad_slot;
++    unsupported.owner_base=0;unsupported.token_bytes=655;
++    assert(kvaf_device::KvafBatchGetDevice(unsupported,AscendC::LocalTensor<uint8_t>{{},scratch.data()}).error!=0);
++  }
++}

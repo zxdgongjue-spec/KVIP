@@ -6,6 +6,9 @@ from importlib.util import spec_from_loader
 import sys
 
 ALIASES = (
+    # The vLLM UBmem integration still imports these pre-merge module paths.
+    ("adapters.ubmem", "adapters.kvaf"),
+    ("adapters.vllm.ubmem_binding", "adapters.vllm.binding"),
     ("fused_inputs", "adapters.vllm.inputs"),
     ("fused_selector", "adapters.vllm.selector"),
     ("fused_service", "adapters.vllm.binding"),
