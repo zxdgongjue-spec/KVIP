@@ -10,11 +10,55 @@ from copy import copy
 from kvip.operators.lifetch.forward import LIFetchForward
 
 
+def group_scratch(policy, workspace, batch, group):
+    """Bind shared scratch and the existing per-group candidate buffers."""
+    scratch = dict(workspace.scratch)
+    scratch["rows"] = policy.fused_fetch_rows[group]
+    scratch["lru_slots"] = policy.spare_slots[group, :batch]
+    scratch["reserved_hot"] = policy.fused_reserved_hot[group, :batch]
+    return scratch
+
+
+def index_update_arguments(policy, workspace, storage, rotating, group):
+    """Bind persistent Index and output buffers shared by both transports."""
+    return dict(
+        keys=storage.keys, scales=storage.scales, addresses=storage.addresses,
+        logical_ids=storage.logical_ids, row_owners=workspace.inputs.row_owners,
+        rotating=rotating, status=policy.fused_errors[group], query_inputs=workspace.inputs,
+        outputs=policy.fused_outputs[group],
+    )
+
+
+def bind_group_selector(torch, policy, workspace, setup, group, storage, rotating, update, *, ubmem=False):
+    """Bind the shared selector to one group's persistent storage."""
+    selector = VllmIndexSelector(
+        torch, inputs=workspace.inputs, rotating=rotating, update=update,
+        logical_ids=storage.logical_ids, row_owners=workspace.inputs.row_owners,
+        prefix_workspace=workspace.prefix_reset, storage=storage, unique_active_owners=ubmem,
+    )
+    selector.tail_source = policy.abc_descriptors[group, : setup.batch, 2:4]
+    return selector
+
+
 class VllmIndexSelector:
-    def __init__(self, torch, *, inputs, rotating, update, logical_ids, row_owners, prefix_workspace, storage=None):
+    def __init__(
+        self,
+        torch,
+        *,
+        inputs,
+        rotating,
+        update,
+        logical_ids,
+        row_owners,
+        prefix_workspace,
+        storage=None,
+        forward_factory=LIFetchForward,
+        unique_active_owners=False,
+    ):
         self.torch = torch
         self.inputs, self.rotating, self.update = inputs, rotating, update
-        self.forward = LIFetchForward(rotating, update)
+        self.forward = forward_factory(rotating, update)
+        self.unique_active_owners = unique_active_owners
         self.logical_ids, self.row_owners = logical_ids, row_owners
         self.prefix_workspace = prefix_workspace
         self.storage, self.positions = storage, None
@@ -41,6 +85,10 @@ class VllmIndexSelector:
         """CPU request layout, once per forward; no device readback."""
         self.plans = tuple(plans)
         self.decodes = tuple(p for p in self.plans if p.decode)
+        if self.unique_active_owners:
+            owners = [p.owner for p in self.decodes if p.stop > p.begin]
+            if len(owners) != len(set(owners)):
+                raise ValueError("UBmem active decode rows must have distinct stable owners")
         if self.storage is not None:
             self.storage.prepare(self.plans)
         if prepare_inputs:

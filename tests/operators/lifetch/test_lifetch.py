@@ -1,18 +1,21 @@
+#!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""LIFetch + Index update: native A/B, SFA/KV checks, resolver isolation, graph timing."""
-
+"""Run graph-mode LIFetch correctness and performance for one transport."""
 import argparse
 import contextlib
 import ctypes
 import json
 import os
+from pathlib import Path
+import subprocess
 import sys
 import time
-from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
-sys.path[:0] = [str(ROOT / "python"), str(ROOT / "tests/operators/lifetch/support")]
-from runner import progress, supervise  # noqa: E402 — standalone test bootstrap
+SUPPORT = ROOT / 'tests/operators/lifetch/support'
+sys.path.insert(0, str(SUPPORT))
+from compare_transports import execute  # noqa: E402
+from runner import progress, supervise  # noqa: E402
 
 
 def arguments(argv=None):
@@ -35,6 +38,8 @@ def arguments(argv=None):
     p.add_argument("--batches", default="16")
     p.add_argument("--iterations", type=int, default=20)
     p.add_argument("--warmup", type=int, default=4)
+    p.add_argument("--comparison-output", type=Path)
+    p.add_argument("--comparison-sfa", type=Path)
     p.add_argument("--output", type=Path, default=ROOT / "tests/results/lifetch")
     a = p.parse_args(argv)
     if a.kvaf_root is None:
@@ -98,7 +103,7 @@ def native_log(path):
             os.close(original)
 
 
-def main(argv=None):
+def run_urma(argv=None):
     args = arguments(argv)
     if args.worker_run is not None:
         code = run_worker(args, args.worker_run)
@@ -112,6 +117,7 @@ def main(argv=None):
         "-X",
         "faulthandler",
         str(Path(__file__).resolve()),
+        "--internal-urma",
         *(sys.argv[1:] if argv is None else argv),
         "--worker-run",
         str(run),
@@ -119,7 +125,113 @@ def main(argv=None):
     return supervise(command, run)
 
 
-if __name__ == "__main__":
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv[:1] == ["--internal-urma"]:
+        return run_urma(argv[1:])
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--transport', required=True, choices=('urma', 'ubmem'))
+    p.add_argument('--device', type=int, default=0)
+    p.add_argument('--kvaf-server', required=True)
+    p.add_argument('--kvaf-root', type=Path)
+    p.add_argument('--soc')
+    p.add_argument('--cann', default='/usr/local/Ascend/cann')
+    p.add_argument('--batches', default='16', help='comma-separated request counts')
+    p.add_argument('--history', type=int, default=131072)
+    p.add_argument('--resident', type=int, default=16384)
+    p.add_argument('--index-heads', type=int, choices=(32, 64), default=32)
+    p.add_argument('--intermediate-fetches', type=int, default=8)
+    p.add_argument('--prefetch-tokens', type=int, default=512)
+    p.add_argument('--miss-percent', type=float, default=10)
+    p.add_argument('--warmup', type=int, default=4)
+    p.add_argument('--iterations', type=int, default=20)
+    p.add_argument('--trace-rounds', type=int, default=3, help='separate device profiling replays')
+    p.add_argument('--runtime-shapes', action='store_true')
+    p.add_argument('--resolver-compare', action='store_true', help='URMA resolver comparison')
+    p.add_argument('--comparison-output', type=Path)
+    p.add_argument('--comparison-sfa', type=Path)
+    p.add_argument('--output', type=Path, default=ROOT / 'tests/results/lifetch')
+    p.add_argument('--timeout-seconds', type=int, default=1800)
+    a = p.parse_args(argv)
+    try:
+        batches = [int(x) for x in a.batches.split(',')]
+    except ValueError:
+        p.error('batches must be comma-separated integers')
+    if not batches or any(not 1 <= x <= 32 for x in batches):
+        p.error('batches must be in 1..32')
+    if (a.history <= a.resident + 4 or not 0 <= a.miss_percent <= 100 or a.warmup < 0
+            or a.iterations < 1 or a.trace_rounds < 0 or not 1 <= a.intermediate_fetches <= 32
+            or not 0 <= a.prefetch_tokens <= 2048 or a.prefetch_tokens % a.intermediate_fetches
+            or a.timeout_seconds < 20):
+        p.error('invalid geometry, prefetch budget, timing or timeout')
+    if (a.comparison_output or a.comparison_sfa) and (len(batches) != 1 or a.runtime_shapes):
+        p.error('comparison snapshots require one batch and no runtime-shapes')
+    state = ROOT / 'build/dependencies.json'
+    kvaf_root = (a.kvaf_root or (Path(json.loads(state.read_text())['kvaf']) if state.exists()
+                                 else ROOT / 'third_party/KVAF')).resolve()
+    common = ['--device', str(a.device), '--kvaf-server', a.kvaf_server, '--history', str(a.history),
+              '--resident', str(a.resident), '--index-heads', str(a.index_heads), '--miss-percent',
+              str(a.miss_percent), '--prefetch-tokens', str(a.prefetch_tokens), '--warmup', str(a.warmup),
+              '--iterations', str(a.iterations)]
+    if a.transport == 'urma':
+        command = [sys.executable, '-u', str(Path(__file__).resolve()), '--internal-urma', *common,
+                   '--kvaf-root', str(kvaf_root), '--cann', a.cann, '--batches', a.batches,
+                   '--intermediate-fetches', str(a.intermediate_fetches), '--trace-rounds', str(a.trace_rounds),
+                   '--output', str(a.output)]
+        if a.soc:
+            command += ['--soc', a.soc]
+        if a.runtime_shapes:
+            command.append('--runtime-shapes')
+        if a.resolver_compare:
+            command.append('--resolver-compare')
+        if a.comparison_output:
+            command += ['--comparison-output', str(a.comparison_output)]
+        if a.comparison_sfa:
+            command += ['--comparison-sfa', str(a.comparison_sfa)]
+        return subprocess.call(command)
+    if a.intermediate_fetches != 8:
+        p.error('UBmem fixture currently supports exactly 8 windows')
+    if not a.soc:
+        p.error('--soc is required for UBmem, e.g. Ascend950PR_9599')
+    if a.resolver_compare:
+        p.error('resolver comparison is currently supported only by URMA')
+    run = a.output.resolve() / (time.strftime('%Y%m%d_%H%M%S') + f'_{os.getpid()}')
+    run.mkdir(parents=True)
+    log, summary = run / 'worker.log', run / 'summary.log'
+    print(f'Summary: {summary}', flush=True)
+    command = [sys.executable, '-u', str(SUPPORT / 'ubmem_smoke.py'), *common,
+               '--build-dir', str(kvaf_root / 'build-npu'), '--soc', a.soc,
+               '--batches', *map(str, batches), '--token-bytes', '656',
+               '--trace-rounds', str(a.trace_rounds), '--trace-output', str(run / 'trace')]
+    if a.runtime_shapes:
+        command.append('--runtime-shapes')
+    if a.comparison_output:
+        command += ['--comparison-output', str(a.comparison_output)]
+    if a.comparison_sfa:
+        command += ['--comparison-sfa', str(a.comparison_sfa)]
+    print('UBmem stage traces use separate profiled replays outside graph timing.', flush=True)
+    code = execute(command, log, a.timeout_seconds, 'ubmem')
+    lines = log.read_text(errors='replace').splitlines()
+    selected = [line for line in lines if line.startswith(('UBMEM_LIFETCH_PASS', 'UBMEM_SFA_PASS',
+                'UBMEM_GRAPH_EVENT_US', 'UBMEM_FETCH_COUNTS', 'UBMEM_WINDOW_TRIGGERS', 'UBMEM_RUNTIME_BINARY',
+                'UBMEM_TRACE'))]
+    expected = len(batches) + int(a.runtime_shapes and (a.history, a.resident) != (33024, 8192))
+    ok = (code == 0 and sum(line.startswith('UBMEM_LIFETCH_PASS') for line in selected) == expected
+          and sum(line.startswith('UBMEM_SFA_PASS') for line in selected) == expected
+          and sum(line.startswith('UBMEM_GRAPH_EVENT_US') for line in selected) == expected
+          and sum(line.startswith('UBMEM_TRACE round=') for line in selected) == expected * a.trace_rounds)
+    result = [f'{"PASS" if ok else "FAIL"}: transport=ubmem exit={code}', *selected]
+    if not ok:
+        result += ['--- worker.log tail ---', *lines[-25:]]
+    summary.write_text('\n'.join(result) + '\n')
+    print('\n'.join(result), flush=True)
+    print(f'Full logs: {run}', flush=True)
+    return 0 if ok else 1
+
+
+if __name__ == '__main__':
     sys.exit(main())
 
 
@@ -397,10 +509,20 @@ def test_load_bridge_without_rpath(tmp_path):
 
 
 def test_hot_resolver_actual_function_on_empty_and_populated_cache(tmp_path):
+    _check_hot_resolver(tmp_path, "urma")
+
+
+def test_ubmem_hot_resolver_actual_function_on_empty_and_populated_cache(tmp_path):
+    _check_hot_resolver(tmp_path, "ubmem")
+
+
+def _check_hot_resolver(tmp_path, transport):
     """Execute production SIMT logic serially; CANN simulator covers barriers."""
     import subprocess
 
-    kernel = ROOT / "csrc/operators/lightning_indexer_with_fetch/op_kernel"
+    operator = "lightning_indexer_with_fetch" + ("_ubmem" if transport == "ubmem" else "")
+    kernel = ROOT / "csrc/operators" / operator / "op_kernel"
+    metadata = kernel / ("controller/cache_metadata.h" if transport == "ubmem" else "prefetch.h")
 
     def function(path, name):
         text = path.read_text()
@@ -413,12 +535,21 @@ def test_hot_resolver_actual_function_on_empty_and_populated_cache(tmp_path):
             end += 1
         return text[begin:end]
 
+    common = ROOT / "csrc/operators/common/lifetch"
     functions = "\n".join(
-        function(kernel / "prefetch.h", name)
-        for name in ("OwnerRow", "OutputStride", "StoreFallbackSource", "ResolvePhysicalSlot", "InitializeTailMappings")
+        function(common / "cache_metadata.h", name)
+        for name in ("OwnerRow", "OutputStride", "StoreFallbackSource")
     )
-    functions += "\n" + function(kernel / "resolver.h", "SparseHash")
-    functions += "\ntemplate<unsigned Threads>\n" + function(kernel / "resolver.h", "ReplicatedResolve")
+    functions += "\n" + function(common / "cache_metadata.h", "ResolvePhysicalSlot")
+    functions += "\n" + function(metadata, "InitializeTailMappings")
+    functions += "\n" + function(ROOT / "csrc/operators/common/lifetch/resolver_candidates.h", "SparseHash")
+    functions += "\ntemplate<unsigned Threads>\n" + function(
+        ROOT / "csrc/operators/common/lifetch/resident_selection.h", "ResolveResidentPlan"
+    )
+    resolve = function(ROOT / "csrc/operators/common/lifetch/resolver.h", "ReplicatedResolve")
+    shared = (ROOT / "csrc/operators/common/lifetch/resolver_plan.h").read_text()
+    resolve = resolve.replace('#include "resolver_plan.h"', shared)
+    functions += "\ntemplate<unsigned Threads>\n" + resolve
     source = r"""
 #include <cstdint>
 #include <vector>
@@ -451,7 +582,7 @@ void asc_syncthreads(){} void asc_threadfence(){}
 FUNCTIONS
 int main(){
  std::mt19937 rng(71);
- for(unsigned trial=0;trial<24;++trial){
+ for(unsigned trial=0;trial<27;++trial){
   const unsigned h=32768,r=trial%2?16384:8192,workers=4,used=trial%3?512:0;
   std::vector<unsigned> candidates(r);std::iota(candidates.begin(),candidates.end(),0);
   std::shuffle(candidates.begin(),candidates.end(),rng);candidates.resize(2048);
@@ -467,6 +598,10 @@ int main(){
   if(trial%5==0)for(unsigned i=6144;i<8192;++i)selected[i]=UINT32_MAX;
   if(abc){for(unsigned i=0;i<384;++i)map[h-384+i]=r+8192+i;
    for(unsigned i=0;i<8;++i)selected[i]=h-384+i;}
+  if(trial==24)for(unsigned i=0;i<8192;++i)selected[i]=r+i; // Maximum Q4 union, no prefetch.
+  if(trial==25)for(unsigned i=0;i<8192;++i)selected[i]=r+i%used; // All prefetch hits.
+  if(trial==26){std::vector<unsigned> hot;for(unsigned i=0;i<r;++i)if(reserved[i]<0)hot.push_back(i);
+   for(unsigned i=0;i<8192;++i)selected[i]=hot[i%hot.size()];} // All untouched hot hits.
   std::vector<uint64_t> addresses(h),remote(8192);std::iota(addresses.begin(),addresses.end(),100000);
   std::vector<int32_t> blocks(8192),offsets(8192),destinations(8192);
   Context ctx{};unsigned changeCount=2048,total=0;
@@ -505,6 +640,24 @@ int main(){
  }
 }
 """.replace("FUNCTIONS", functions)
+    definitions = []
+    if transport == "ubmem":
+        definitions = [
+            "-D" + value
+            for value in (
+                "SIM_BATCH=1",
+                "SIM_HISTORY=32768",
+                "SIM_RESIDENT=16384",
+                "TOKEN_BYTES=656",
+                "V9_UBPIPE_DEPTH=8",
+                "V9_UBPIPE_ROWS=4",
+                "V9_DEDICATED_SERVICE=0",
+                "V9_SPLIT_Q=1",
+                "V9_AIC_COUNT=32",
+                "V9_INTERMEDIATE_FETCHES=2",
+                "V9_FINAL_REPLICATED=1",
+            )
+        ]
     (tmp_path / "batch_get_abi.h").write_text("")
     cpp, exe = tmp_path / "resolver.cpp", tmp_path / "resolver"
     cpp.write_text(source)
@@ -513,6 +666,7 @@ int main(){
             "c++",
             "-std=c++17",
             "-O2",
+            *definitions,
             str(cpp),
             "-I" + str(tmp_path),
             "-I" + str(kernel.parent / "include"),
@@ -556,6 +710,10 @@ def test_final_fetch_uses_native_explicit_range_without_direct_submission():
     lifecycle = (root / "lifecycle.cpp").read_text()
     assert "PublishFinalWorker" not in resolver
     assert "CommitPostScalarStage" not in resolver
+    phase = (root / "final_fetch_phase.h").read_text()
+    phase_loop = (root.parents[1] / "common/lifetch/final_phase_loop.h").read_text()
+    phase_loop = phase_loop.replace("#include LIFETCH_FINAL_PHASE", phase)
+    lifecycle = lifecycle.replace('#include "../../common/lifetch/final_phase_loop.h"', phase_loop)
     finish = lifecycle[lifecycle.index("__aicore__ inline void FinishFetch") :]
     assert "if(phase==1)" in finish
     assert "(!phase || !row->pending)" in finish
@@ -563,8 +721,10 @@ def test_final_fetch_uses_native_explicit_range_without_direct_submission():
     assert "DrainQueue(" not in finish
     # Execute the production descriptor publisher: it must never mark an SQ post
     # pending, even for nonempty or oversized ranges; native KVAF schedules them.
-    start = resolver.index("__aicore__ inline void PrepareFinalFetch")
-    function = resolver[start : resolver.index("\n}\n", start) + 2]
+    publisher = (root.parents[1] / "common/lifetch/final_post.h").read_text()
+    start = publisher.index("__aicore__ inline void PrepareFinalFetch")
+    function = publisher[start : publisher.index("\n}\n", start) + 2]
+    function = function.replace("LIFETCH_CLEAN_CACHE_LINES", "kvaf_device::CleanCacheLines")
     program = (
         """#include <cstdint>
 #include <cassert>
@@ -597,9 +757,10 @@ def test_native_final_phase_order_runs_production_loop(tmp_path):
     """Exercise the actual Fetch orchestration with a recording native SDK."""
     import subprocess
 
-    text = (ROOT / "csrc/operators/lightning_indexer_with_fetch/op_kernel/lifecycle.cpp").read_text()
-    start = text.index("    for(uint32_t phase=0;phase<2;++phase)")
-    loop = text[start : text.index("    if(row->pending || total!=info[1])", start)]
+    common = ROOT / "csrc/operators/common/lifetch/final_phase_loop.h"
+    phase = ROOT / "csrc/operators/lightning_indexer_with_fetch/op_kernel/final_fetch_phase.h"
+    loop = common.read_text().replace("#include LIFETCH_FINAL_PHASE", phase.read_text())
+    loop = loop.replace("LIFETCH_FINAL_JOIN", "CompletePrefetch(ctx,b); error|=row->error")
     code = r"""
 #include <cstdint>
 #include <vector>

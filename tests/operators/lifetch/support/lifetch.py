@@ -332,6 +332,16 @@ def run_device(
                         r,
                     )
                 )
+        if read_label == "prototype_with_update" and args.comparison_output:
+            reset()
+            stream.synchronize()
+            graph.replay()
+            stream.synchronize()
+            check()
+            from transport_snapshot import save
+            save(args.comparison_output, state["ids"], state["slots"], owner.output.cpu().numpy(),
+                 rotating.mapping.cpu().numpy(), rotating.lru_slots.cpu().numpy(),
+                 rotating.rows.cpu().numpy().view(np.uint32), owner.remote_token_addresses.cpu().numpy())
         if trace_core:
             core_trace.update(
                 collect_core(torch, rotating, graph, reset, check, args.trace_rounds or AUTO_CORE_TRACE_ROUNDS, folder)
@@ -655,7 +665,8 @@ def run_device(
         logical_lens=torch.full((b,), h, device=device, dtype=torch.int32),
     )
     geom = SimpleNamespace(batch=b, queries=4, num_layers=1, layer_id=0, resident_blocks=b * (r + 8192) // 128)
-    sfa = check_sfa(torch, tensors, geom, {"pool_rows": np.arange(b), "budgets": np.full(b, r + 8192)}, after)
+    sfa = check_sfa(torch, tensors, geom, {"pool_rows": np.arange(b), "budgets": np.full(b, r + 8192)}, after,
+                    output_path=args.comparison_sfa)
     return dict(
         status="pass",
         timing=timings,

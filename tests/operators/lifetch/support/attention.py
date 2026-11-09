@@ -3,7 +3,7 @@ import numpy as np
 TOPK, BLOCK_TOKENS, TOKEN_BYTES = 2048, 128, 656
 
 
-def check_sfa(torch, tensors, geometry, before, after):
+def check_sfa(torch, tensors, geometry, before, after, *, output_path=None):
     """Actual service C8 API, plus independent logical-token numerical oracle.
 
     Scope is attention on the LI-selected 2048 history tokens. The 384-slot
@@ -68,6 +68,8 @@ def check_sfa(torch, tensors, geometry, before, after):
     )
     actual = actual[0] if isinstance(actual, (tuple, list)) else actual
     actual = actual.float().cpu().numpy().reshape(expected.shape)
+    if output_path is not None:
+        np.save(output_path, actual)
     error = float(np.max(np.abs(actual - expected)))
     if not np.all(np.isfinite(actual)) or not np.allclose(actual, expected, atol=0.006, rtol=0.025):
         raise AssertionError(f"A5 C8 SFA numerical mismatch: max_abs={error}")
