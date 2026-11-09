@@ -5,7 +5,7 @@ from kvip.runtime.loader import load_lifetch_library
 
 import numpy as np
 
-from kvip.operators.lifetch.geometry import final_aivs, li_geometry
+from kvip.operators.lifetch.geometry import final_aivs, li_geometry, prefetch_budget
 from kvip.operators.lifetch.tiling import RuntimeShape
 from kvip.operators.lifetch.workspace import rotation_spec
 
@@ -89,10 +89,7 @@ class LIFetchBinding:
             fn.argtypes, fn.restype = [ctypes.c_void_p], ctypes.c_uint32
             if fn(self.shape_pointer) != expected:
                 raise ValueError(f"V9 binary contract mismatch: {name}")
-        if window_limit is None:
-            window_limit = max(1, prefetch_limit // intermediate_fetches)
-        if not 0 <= prefetch_limit <= 2048 or not 1 <= window_limit <= 480:
-            raise ValueError("Invalid V9 admission budgets")
+        prefetch_limit, window_limit = prefetch_budget(prefetch_limit, window_limit, intermediate_fetches)
         geometry = li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)
         if geometry["logical_aic_tasks"] > aic_count or not geometry["intermediate_fetches"]:
             raise ValueError("Direct hot-first mode requires a window and concurrently resident LI tasks")

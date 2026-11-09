@@ -1,8 +1,9 @@
 # KVIP
 
 Ascend A5 cache operators extracted from vLLM-DSA's KVOP. Python 3.12,
-CANN 9.1, matching `torch`/`torch_npu`, and a reachable KVAF CPU service are
-required for NPU validation. Installation is editable: keep this checkout beside
+a matching CANN and `torch`/`torch_npu` runtime are required for NPU validation.
+URMA additionally requires a reachable KVAF CPU service; UBmem owns local Host DDR
+in each NPU worker and does not connect to a CPU service. Installation is editable: keep this checkout beside
 the installed Python package because startup builds use its C++ sources.
 
 ## Layout and API
@@ -10,20 +11,30 @@ the installed Python package because startup builds use its C++ sources.
 ```text
 csrc/operators/
   lidu/                             # op_host / op_kernel / torch_extension
+  common/lightning_indexer/          # shared LI/score/TopK device functions
+  common/lifetch/                    # resident selection, budgets and Index-update planner
   lightning_indexer_with_fetch/
     include/                        # public ABI, Context and runtime shape
     op_host/                        # launch entry points and Index-update host binding
     op_kernel/                      # LI/Fetch lifecycle, prefetch, resolver, Index update
-      indexer/                      # original LI/score/TopK template implementation
+      indexer/                      # URMA runtime-shape LI scheduling
+  lightning_indexer_with_fetch_ubmem/
+    include/                        # UBmem launch, region and completion ABIs
+    op_host/                        # graph-capturable launch sequence
+    op_kernel/                      # static LI, controller, pipelined copies, resolver/update
 python/kvip/
   operators/lidu.py
-  operators/lifetch/                 # binding, forward, workspace, tiling, Index update
+  operators/lifetch/                 # URMA binding, forward, workspace, tiling, Index update
+  operators/lifetch_ubmem/            # startup specialization, binding, workspace and update
   cache/                            # LRU, ABC and persistent Index storage
-  adapters/kvaf.py                   # Runtime lease and shared transport queues
+  adapters/kvaf.py                   # URMA Runtime lease and shared transport queues
+  adapters/ubmem.py                  # local mapping/output/graph lifetime
   adapters/vllm/                     # inputs, selector, startup binding and paged Index import
   runtime/                          # build cache, library loader, hardware query, integrity
   _compat.py                        # centralized lazy aliases for legacy kvip imports
-scripts/                            # build, environment and KVAF patches
+scripts/                            # existing build/environment entry points and common KVAF patches
+patches/kvaf-background-put.patch    # shared background Put binding compatibility
+patches/kvaf-ubmem.patch             # optional local-DDR runtime/Get/Put/fused-lease increment
 tests/
   operators/lidu/
   operators/lifetch/                 # single CLI, update tests, support and resolver_reference
@@ -98,11 +109,36 @@ is not a valid target for this CANN build API. The NPU test discovers the device
 SoC through ACL unless `--soc` is specified.
 
 The supported KVAF base is `1c1310387ebfb6776a07316874e924265b209ada`.
-Preparation applies the three patches in `scripts/patches`, recognizes an already
-patched tree, and never resets existing edits. A different revision or conflicting
-patch fails explicitly. `--prepare-only` prepares dependencies without compiling;
-`--skip-kvaf-build` is only for an already rebuilt patched KVAF. One binary supports both 656-byte and
-2624-byte KV records through runtime parameters. Build logs are under `build/lifetch/*/build.log`.
+Preparation retains the existing three common patches in `scripts/patches` and
+applies `patches/kvaf-background-put.patch` for background Put's GIL release and
+capability flag. `--transport ubmem` additionally
+applies `patches/kvaf-ubmem.patch` to that checkout. Preparation recognizes an
+already patched tree and preserves unrelated edits; conflicting changes fail
+without a forced reset. A separate KVAF checkout/build is recommended per transport.
+`--prepare-only` prepares the dependency without replacing the active build selection;
+`--skip-kvaf-build` requires matching existing build products.
+
+```bash
+bash scripts/build.sh --transport ubmem --kvaf-root /vllm-workspace/KVAF-ubmem \
+    --cann /usr/local/Ascend/ascend-toolkit/latest --soc Ascend950DT_9582 --jobs 2
+source scripts/env.sh
+```
+
+UBmem builds the worker-local Host DDR allocator and Get/Put kernels without
+UMDK or CPU services. `thp` (default) allocates host memory, requests transparent
+huge pages and registers the device-visible mapping; actual huge-page coverage
+is reported separately and depends on the host. `base` uses the regular-page VMM
+path. Both paths keep the allocation alive until outstanding work and retained
+fused contexts are released. The existing key/slot metadata and background Put
+ownership remain in KVAF. URMA remains the default build.
+
+The serial vLLM path uses native LI/LIDU followed by KVAF UBmem BatchGet;
+`decode_backend=li_fetch` selects the independent UBmem LI/TopK/Fetch/Index-update
+pipeline. Both use UBmem BatchPut and the same local DDR arena. Shared Indexer
+layers fetch the complete grouped record (656 or 2624 bytes), so the following
+layers reuse the fetched payload. UBmem retains its own copy scheduling and
+completion checks while reusing the transport-independent algorithms above.
+
 The original LIDU build uses its own `csrc/operators/lidu/build` directory.
 
 ## Verify
@@ -248,3 +284,33 @@ The user verified this service path runs. Initial history restoration and fused
 final fetch still retain their existing Get paths; this is not a general queue
 handoff fix. Do not reintroduce an ordinary Get for ABC promotion without resolving
 and validating the shared-queue handoff. Include this limitation in the merge PR.
+
+## UBmem hot-only final repair
+
+UBmem fusion ABI 2 uses the same final TopK protection and hot-slot selection
+as URMA, in `csrc/operators/common/lifetch/resident_selection.h`. Missing rows
+replace unprotected persistent hot slots; the payload layout is hot + ABC, with
+no separate 8192-token payload region. UBmem retains its eight-stage copy pipeline
+and native completion checks. The shared Index planner handles up to 10240 change
+records (2048 prefetch candidates plus the Q4 union); plan/work buffers are shared
+across sequential layer groups and allocated before memory profiling.
+
+Rebuild UBmem fusion and use the matching vLLM integration before serving. Source
+hashes include the shared headers and old ABI 1 libraries are rejected. Resident
+capacity must be at least 8192 for the worst-case Q4 union. This hot-slot repair changes the fusion ABI, while retaining the KVAF UBmem
+runtime ABI and the URMA transport implementation.
+
+Both bindings default to 512 speculative fetches per request/round, accept a
+total budget of 0..2048, and cap each window at its configured allowance (at
+most 480). Device admission shares the same saturating budget calculation.
+The final TopK repair is independent of this speculative budget: setting it to
+zero disables prefetch but still retrieves every required cold row. The UBmem
+smoke check accepts `--prefetch-tokens 0 512` to check both cases, including eager
+execution, graph replay, changed owner packing, and Index/payload consistency.
+
+UBmem fusion currently specializes batch 1–16, 32/64 Indexer heads and
+656/2624-byte records before profiling/graph capture; history and hot capacity
+are 256-aligned, with `8192 <= resident < history <= 210944` and
+`resident <= 131072`. The binary cache includes the shape and source hashes.
+The forward path uses preallocated storage without per-step compilation or a
+new host synchronization. URMA's runtime-shape limits described above are separate.
