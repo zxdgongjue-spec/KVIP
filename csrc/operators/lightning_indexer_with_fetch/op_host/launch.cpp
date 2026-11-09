@@ -7,11 +7,24 @@ extern "C" uint32_t v9_##name(void* bindings,void* stream,const rotating::Runtim
     if (!bindings || !stream || !shape) return 100000; \
     return aclrtlaunch_v9_##name##_kernel(blocks,stream,bindings); }
 ENTRY(init,shape->batch)
-ENTRY(li,shape->liCores)
 ENTRY(wait,shape->batch)
 ENTRY(resolve,shape->finalCores)
 ENTRY(fetch,shape->batch)
 ENTRY(probe,shape->serviceLanes)
+
+extern "C" uint32_t aclrtlaunch_v9_li_kernel(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_1(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_2(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_3(uint32_t,void*,void*);
+extern "C" uint32_t v9_li(void* bindings, void* stream, const rotating::RuntimeShape* shape) {
+    if (!bindings || !stream || !shape) return 100000;
+    uint32_t result = aclrtlaunch_v9_li_kernel(shape->liCores, stream, bindings);
+    if (result || !rotating::UseSequenceSplit(*shape)) return result;
+    result = aclrtlaunch_v9_li_kernel_1(shape->liCores, stream, bindings);
+    if (!result) result = aclrtlaunch_v9_li_kernel_2(shape->liCores, stream, bindings);
+    if (!result) result = aclrtlaunch_v9_li_kernel_3(shape->liCores, stream, bindings);
+    return result;
+}
 extern "C" uint32_t v9_li_cores(const rotating::RuntimeShape* shape) { return shape->liCores; }
 extern "C" uint32_t v9_batch(const rotating::RuntimeShape* shape) { return shape->batch; }
 extern "C" uint32_t v9_history(const rotating::RuntimeShape* shape) { return shape->history; }

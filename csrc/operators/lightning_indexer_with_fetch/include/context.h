@@ -92,4 +92,28 @@ V9_DEVICE inline int32_t EpochAt(uint32_t rt_batch,uint32_t rt_history,uint32_t 
     uint32_t rank=ServiceRank(rt_batch,rt_splitQ,core),epoch=rank/rt_serviceAics;
     return epoch<rt_rounds && Trigger(rt_history,rt_resident,rt_rounds,epoch)==tileEnd ? int32_t(epoch) : -1;
 }
+
+// Each shard owns half of the resident range and half of every cold window.
+// Align halves to two tiles so neither shard loads its sibling's Key page.
+V9_DEVICE inline bool UseSequenceSplit(const RuntimeShape& s) {
+    return s.splitQ && s.indexHeads == 32 && s.rounds > 1 && s.resident % 512 == 0 &&
+        (s.history - s.resident) % (512 * (s.rounds - 1)) == 0;
+}
+
+V9_DEVICE inline uint32_t SequenceHalfWindow(const RuntimeShape& s) {
+    return (s.history - s.resident) / (2 * (s.rounds - 1));
+}
+
+// A raw end is the last published tile end on that shard. Extend a shard's
+// frontier over its sibling's interval only after its own interval is done.
+V9_DEVICE inline uint32_t SequenceReadyEnd(uint32_t low, uint32_t high,
+                                          uint32_t resident, uint32_t history, uint32_t half) {
+    // The threshold phase has already completed the hot interval for all Qs.
+    if (low < resident) low = resident;
+    uint32_t width = 2 * half;
+    if ((low - resident) % width == half) low += half;
+    if (high <= resident) high = resident + half;
+    else if (high < history && (high - resident) % width == 0) high += half;
+    return low < high ? low : high;
+}
 }

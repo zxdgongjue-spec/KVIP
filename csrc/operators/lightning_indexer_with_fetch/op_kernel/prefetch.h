@@ -663,7 +663,8 @@ inline void RestoreVictimTokens(__ubuf__ uint32_t* ids,__gm__ uint32_t* victims,
     }
 }
 __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer,uint32_t epoch,uint32_t core,uint32_t lane,
-    LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids) {
+    LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids,
+    uint32_t sequenceHalfWindow) {
     auto ctx=reinterpret_cast<__gm__ Context*>(pointer);auto events=reinterpret_cast<__gm__ Event*>(ctx->events);
     auto event=events+epoch*rt_serviceLanes+lane;event->core=core;event->epoch=epoch;V9_FETCH_PROFILE(event->waitBegin=GetSystemCycle();)
     if(epoch) {
@@ -689,7 +690,10 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
         DataCopyPad(work,progressGm[lane*128],gather,padding);
         SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
         for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes)for(uint32_t q=0;q<4;++q) {
-            uint32_t end=work.GetValue((b/rt_serviceLanes)*128+q*32),cap=Trigger(rt_history,rt_resident,rt_rounds,epoch)*128;
+            uint32_t progress=(b/rt_serviceLanes)*128+q*32;
+            uint32_t end=work.GetValue(progress),cap=Trigger(rt_history,rt_resident,rt_rounds,epoch)*128;
+            if(sequenceHalfWindow)
+                end=SequenceReadyEnd(end,work.GetValue(progress+16),rt_resident,rt_history,sequenceHalfWindow);
             if(ctx->queryEnds) {
                 auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds);
                 uint32_t valid=bounds[b*4+q];
@@ -966,7 +970,7 @@ if (rt_batchedRows) {
 namespace rotating {
 __aicore__ inline void Service(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_splitQ,uint32_t rt_rounds,uint32_t rt_serviceAics,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer, uint32_t epoch, uint32_t core,
     uint32_t lane, LocalTensor<uint32_t> scratch, LocalTensor<uint16_t> flags,
-    LocalTensor<uint32_t> indices) {
-    FastService(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices);
+    LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow = 0) {
+    FastService(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow);
 }
 }
