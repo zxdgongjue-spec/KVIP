@@ -314,3 +314,74 @@ are 256-aligned, with `8192 <= resident < history <= 210944` and
 `resident <= 131072`. The binary cache includes the shape and source hashes.
 The forward path uses preallocated storage without per-step compilation or a
 new host synchronization. URMA's runtime-shape limits described above are separate.
+
+## Compare a captured service group without model weights
+
+`python -m kvip.diagnostics.replay` accepts `--transport ubmem|urma` and
+`--mode serial|fused`. `python -m kvip.diagnostics.compare` runs all four cases
+in separate, sequential processes and prints a comparison table. Both reuse the
+existing KVAF installation and operator build paths; no new build script or
+KVAF patch is required. Keep UBmem and URMA in separate KVAF checkouts/builds.
+
+Given a verified service snapshot and built runtimes:
+
+```bash
+python -B -m kvip.diagnostics.compare \
+  --snapshot "$snapshot" \
+  --ubmem-build-dir "$ubmem_build" \
+  --urma-build-dir "$urma_build" \
+  --kvaf-server 127.0.0.1:28999 \
+  --device 0 --soc Ascend950DT_9582 \
+  --ubmem-serial-workers 32 --urma-serial-workers 2 \
+  --warmup 2 --iterations 10 --stage-iterations 3 \
+  --result-dir "$new_result_directory"
+```
+
+Start one dedicated local `kvaf_cpu_service` for URMA, using the snapshot's
+NUMA node and page policy. For device 0 on the validated A5 layout this is
+`numactl --cpunodebind=0 --membind=2 .../kvaf_cpu_service --listen 127.0.0.1
+--port 28999 --ub-device udmac1d1e2 --memory-page-mode thp`.
+Stop it after the comparison. This CPU peer is not a vLLM/model service.
+URMA restores the original keys and fixed-slot offsets through its existing
+Put/access-table APIs. Both transports allocate the full captured arena even
+when exported payload is sparse; the BS16 capture needs approximately 109 GiB
+of DDR at a time. THP coverage and physical pages are not replicated by the
+snapshot, and the peer's effective page policy must not be inferred from the
+source manifest alone.
+
+The measured boundary is query/Index ready through LI, TopK, Fetch, cache
+update and TND slot outputs ready. A 2624-byte record includes all four shared
+layers; this is a group latency, not a measured 656-byte layer latency or TPOT.
+Model work, initial Put, representation conversion, state restoration and
+correctness readback are outside the device events. Each replay restores the
+original hot/ABC state and checks the logical TopK set and selected KV bytes.
+Native LI is executed; the captured TopK is only the correctness reference.
+
+Serial reuses CANN's TND/PA_BSND causal LI and production LIDU/Get. Its logical
+paged Index and resident maps are reconstructed from the captured hot-first
+permutation outside timing. The archive does not record the original serial
+map allocation padding, so this is a semantic input reconstruction rather
+than a byte-for-byte reconstruction of that backend's former allocations.
+Serial Get defaults match serving: UBmem 32 workers, URMA 2, explicitly
+overridable. Fused bindings use their original geometry and worker contracts.
+Serial graphs use the Torch NPU graph allocator for native LI/gather outputs;
+fused graphs retain the existing KVAF graph API. The supported explicit stream
+argument is documented in [Torch NPU graphs](https://github.com/Ascend/pytorch/blob/master/torch_npu/npu/graphs.py).
+
+The four full-path means/medians come from uninstrumented production graphs.
+`--stage-iterations` additionally captures each existing stage without changing
+its internal launches, then measures the ordered stage graphs with device events.
+These additional graph/event boundaries can change scheduling and overlap;
+stage times locate large costs but are not an exact additive decomposition of
+the full-path latency. URMA preserves early Index update while Get is in flight.
+UBmem's `li_with_prefetch` includes concurrent LI/TopK and speculative copies,
+so it must not be interpreted as pure LI compute time.
+
+Read counters distinguish unused speculative prefetch from serial LIDU's
+candidate-hot refetch. The latter rereads selected hot slots reserved for
+replacement and is separate from genuine cold demand. Equal source inputs do
+not require equal transport bytes or identical speculative scheduling.
+ABC mappings are not DDR prefetches. The comparison saves four case JSON files
+and `summary.json`, without persistent native setup logs or profiler traces.
+Host tests cover layout reconstruction, ABI arguments, restoration, validation
+and reporting; actual four-path correctness/timing still requires NPU execution.

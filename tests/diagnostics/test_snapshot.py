@@ -376,12 +376,13 @@ def test_completion_failure_never_becomes_pass():
         check_completion(torch, rotating, update)
 
 
-def test_cli_inspect_needs_no_build_or_device_and_urma_is_not_advertised():
+def test_cli_inspect_needs_no_build_or_device_and_urma_requires_server():
     assert arguments(["--snapshot", "/tmp/snapshot", "--inspect"]).inspect
     with pytest.raises(SystemExit):
         arguments(["--snapshot", "/tmp/snapshot"])
     with pytest.raises(SystemExit):
-        arguments(["--snapshot", "/tmp/snapshot", "--transport", "urma", "--inspect"])
+        arguments(["--snapshot", "/tmp/snapshot", "--transport", "urma", "--build-dir", "/tmp/build", "--soc", "soc"])
+    assert arguments(["--snapshot", "/tmp/snapshot", "--transport", "urma", "--inspect"]).inspect
 
 
 def test_failed_replay_retains_owners_without_unsafe_cleanup(monkeypatch):

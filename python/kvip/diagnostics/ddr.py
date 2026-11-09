@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Copy frozen UBmem pages and restore their original fixed-slot layout.
+"""Copy frozen UBmem pages and restore their fixed-slot layout on either transport.
 
 The caller stops submission, drains background Put/feedback, and synchronizes
 the device *before* export. A fused lease alone does not freeze serving state.
@@ -48,9 +48,16 @@ def _geometry(base, size, slot, token, tokens):
     return dict(zip(("region_base", "region_bytes", "slot_bytes", "token_bytes", "tokens_per_block"), values))
 
 
-def _runtime_geometry(runtime):
-    if runtime.transport != "ubmem":
-        raise ValueError("DDR snapshots require a UBmem Runtime")
+def _runtime_geometry(runtime, target_transport="ubmem"):
+    if target_transport not in ("ubmem", "urma"):
+        raise ValueError("target_transport must be ubmem or urma")
+    reported = getattr(runtime, "transport", None)
+    # The original URMA binding has no transport property. Only an explicit
+    # target_transport permits that ABI; absence must never infer a backend.
+    if target_transport == "ubmem" and reported != "ubmem":
+        raise ValueError("UBmem DDR snapshots require an explicit UBmem Runtime")
+    if target_transport == "urma" and reported not in (None, "urma"):
+        raise ValueError("target_transport differs from the Runtime transport")
     region = runtime.remote_region
     return _geometry(
         region["base"],
@@ -246,14 +253,16 @@ def validate_pages(directory, manifest):
     }
 
 
-def import_pages(runtime, directory, manifest, *, chunk_bytes=CHUNK_BYTES, torch_module=None):
+def import_pages(runtime, directory, manifest, *, target_transport="ubmem", chunk_bytes=CHUNK_BYTES, torch_module=None):
     """Restore into an already initialized, fresh Runtime. Caller releases the returned handle.
 
-    All files are verified before Put. On failure discard the replay Runtime;
-    never free/reuse slots after unknown transfer completion.
+    The source manifest remains UBmem. Explicit ``target_transport="urma"``
+    allows restoring it through the original URMA binding, whose Runtime has
+    no transport property. All files are verified before Put. On failure discard
+    the replay Runtime; never free/reuse slots after unknown transfer completion.
     """
     old, arrays, payload = _load(directory, manifest, verify_payload=True)
-    current = _runtime_geometry(runtime)
+    current = _runtime_geometry(runtime, target_transport)
     if any(old[name] != current[name] for name in old if name != "region_base"):
         raise ValueError("replay Runtime must preserve arena size, slot size and block geometry")
     per_chunk = _chunk_records(old, chunk_bytes)

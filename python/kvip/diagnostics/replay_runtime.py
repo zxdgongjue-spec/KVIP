@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Select a native Runtime bundle without allocating DDR or connecting a peer."""
+
+from pathlib import Path
+
+from kvip.operators.lifetch.geometry import final_aivs
+
+
+def runtime_worker_config(args, archive, aics):
+    """Report explicit CLI overrides separately from serving/backend defaults."""
+    if args.transport not in ("ubmem", "urma") or args.mode not in ("serial", "fused"):
+        raise ValueError("Replay requires ubmem/urma transport and serial/fused mode")
+    override = getattr(args, "serial_workers", None)
+    if override is not None and (type(override) is not int or not 1 <= override <= 48):
+        raise ValueError("serial_workers must be an integer in 1..48")
+    if args.mode == "serial":
+        return {
+            "runtime_workers": override if override is not None else (32 if args.transport == "ubmem" else 2),
+            "runtime_workers_source": "cli" if override is not None else "service_default",
+        }
+    if override is not None:
+        raise ValueError("serial_workers applies only to serial replay")
+    if args.transport == "ubmem":
+        workers = 2
+    else:
+        geometry = archive.manifest["geometry"]
+        batch, captured_aics = geometry["batch"], geometry["aic_count"]
+        if aics < captured_aics:
+            raise ValueError("Replay device has fewer AICs than the captured fusion")
+        final = final_aivs(batch, "auto", captured_aics)
+        workers = (batch * (final + 1) + 1) // 2
+    return {"runtime_workers": workers, "runtime_workers_source": "fused_backend_geometry"}
+
+
+def create_runtime(args, archive, kvaf, torch, device, stream, cann, aics):
+    """Construct only; caller retains the result before link_to/initialize.
+
+    An URMA Runtime uses the original constructor ABI, with no transport
+    keyword or UBmem options. The caller owns all device/stream setup and
+    must select a separate process for each native extension bundle.
+    """
+    config = runtime_worker_config(args, archive, aics)
+    geometry, ddr = archive.manifest["geometry"], archive.manifest["ddr"]
+    if geometry["token_bytes"] != ddr["token_bytes"]:
+        raise ValueError("Snapshot operator and DDR token geometry differ")
+    if args.transport == "urma" and not getattr(args, "kvaf_server", None):
+        raise ValueError("URMA replay requires --kvaf-server")
+    build = Path(args.build_dir).resolve()
+    pattern = "kvaf_ubmem_batch_{}.o" if args.transport == "ubmem" else "kvaf_execute_batch_{}_kernels.o"
+    kernels = {kind: build / "bin" / pattern.format(kind) for kind in ("get", "put")}
+    for path in kernels.values():
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing {args.transport} Runtime kernel: {path}")
+    options = dict(
+        device_id=args.device,
+        npu_core_count=config["runtime_workers"],
+        batch_put_kernel_object_path=str(kernels["put"]),
+    )
+    if args.transport == "ubmem":
+        options.update(transport="ubmem", ubmem_page_mode=ddr["page_mode"], ubmem_numa_node=ddr["numa_node"])
+    else:
+        options["jettys_per_core"] = 2
+    return kvaf.NpuRuntime(str(kernels["get"]), ddr["token_bytes"], ddr["tokens_per_block"], **options)

@@ -5,12 +5,14 @@ import copy
 import hashlib
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 import numpy as np
 import torch
 
 from kvip.diagnostics.ddr import export_pages, import_pages, rebase_addresses, validate_pages
+from kvip.diagnostics.replay_runtime import create_runtime, runtime_worker_config
 
 
 class CpuTorch:
@@ -87,6 +89,18 @@ class Runtime:
             if key in self.pages:
                 raise ValueError("key already exists")
             self.pages[key] = source[offset : offset + length].numpy().copy()
+
+
+class OriginalUrmaRuntime:
+    """The original binding deliberately has no transport property."""
+
+    def __init__(self, **kwargs):
+        self.native = Runtime(**kwargs)
+
+    def __getattr__(self, name):
+        if name == "transport":
+            raise AttributeError(name)
+        return getattr(self.native, name)
 
 
 class DDRTest(unittest.TestCase):
@@ -199,6 +213,44 @@ class DDRTest(unittest.TestCase):
             import_pages(replay, self.path, manifest, torch_module=CpuTorch())
         self.assertEqual(replay.put_calls, [])
 
+    def test_explicit_urma_restore_preserves_slots_and_relocates(self):
+        manifest = self.export()
+        original = copy.deepcopy(manifest)
+        replay = OriginalUrmaRuntime(base=0x900000)
+        with self.assertRaisesRegex(ValueError, "explicit UBmem"):
+            import_pages(replay, self.path, manifest, torch_module=CpuTorch())
+        self.assertEqual(replay.put_calls, [])
+        result = import_pages(
+            replay, self.path, manifest, target_transport="urma", chunk_bytes=2624, torch_module=CpuTorch()
+        )
+        self.assertEqual([call[1] for call in replay.put_calls], [2624, 1312])
+        self.assertEqual(list(replay.pages), [4, 1, 9])
+        for key in replay.pages:
+            np.testing.assert_array_equal(replay.pages[key], self.runtime.pages[key])
+        self.assertEqual(manifest, original)
+        np.testing.assert_array_equal(result["addresses"], [0x900000 + key * 4096 for key in [4, 1, 9]])
+        self.assertIn(result["access_table"], replay.handles)
+        replay.release_access_table(result["access_table"])
+
+    def test_urma_import_requires_matching_geometry_and_explicit_transport(self):
+        manifest = self.export()
+        for target in ("automatic", "cpu", None):
+            with self.subTest(target=target), self.assertRaisesRegex(ValueError, "target_transport"):
+                import_pages(OriginalUrmaRuntime(), self.path, manifest, target_transport=target)
+        with self.assertRaisesRegex(ValueError, "differs"):
+            import_pages(Runtime(), self.path, manifest, target_transport="urma")
+        for field, value in (("length", 11 * 4096), ("slot_size", 8192), ("base", 0x100001)):
+            replay = OriginalUrmaRuntime()
+            replay.remote_region[field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                import_pages(replay, self.path, manifest, target_transport="urma")
+            self.assertEqual(replay.put_calls, [])
+
+    def test_export_still_rejects_original_urma_runtime(self):
+        with self.assertRaisesRegex(ValueError, "explicit UBmem"):
+            export_pages(OriginalUrmaRuntime(), [], self.path, page_mode="thp", generation=0, torch_module=CpuTorch())
+        self.assertFalse((self.path / "payload.bin").exists())
+
     def test_array_checksum_and_path_validation(self):
         manifest = self.export()
         forged = copy.deepcopy(manifest)
@@ -266,6 +318,87 @@ class DDRTest(unittest.TestCase):
         np.testing.assert_array_equal(actual, expected)
         with self.assertRaises(ValueError):
             rebase_addresses(addresses, self.path, manifest, new_base, width=(1 << 64) - 1)
+
+
+class ReplayRuntimeTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.build = Path(self.temp.name)
+        (self.build / "bin").mkdir()
+        for transport in ("ubmem", "execute"):
+            suffix = ".o" if transport == "ubmem" else "_kernels.o"
+            for kind in ("get", "put"):
+                (self.build / "bin" / f"kvaf_{transport}_batch_{kind}{suffix}").touch()
+        self.archive = SimpleNamespace(
+            manifest={
+                "geometry": {"batch": 16, "token_bytes": 2624, "aic_count": 32},
+                "ddr": {"token_bytes": 2624, "tokens_per_block": 128, "page_mode": "thp", "numa_node": 2},
+            }
+        )
+        self.calls = []
+        self.sdk = SimpleNamespace(NpuRuntime=lambda *args, **kwargs: self.calls.append((args, kwargs)) or object())
+
+    def args(self, transport="urma", mode="serial", serial_workers=None):
+        return SimpleNamespace(
+            transport=transport,
+            mode=mode,
+            serial_workers=serial_workers,
+            build_dir=self.build,
+            device=0,
+            kvaf_server="127.0.0.1:28999",
+        )
+
+    def test_workers_match_service_defaults_and_fused_geometry(self):
+        for transport, mode, expected in (
+            ("urma", "serial", 2),
+            ("ubmem", "serial", 32),
+            ("urma", "fused", 40),
+            ("ubmem", "fused", 2),
+        ):
+            with self.subTest(transport=transport, mode=mode):
+                config = runtime_worker_config(self.args(transport, mode), self.archive, 32)
+                self.assertEqual(config["runtime_workers"], expected)
+        config = runtime_worker_config(self.args(serial_workers=8), self.archive, 32)
+        self.assertEqual(config, {"runtime_workers": 8, "runtime_workers_source": "cli"})
+        self.archive.manifest["geometry"]["batch"] = 1
+        self.assertEqual(runtime_worker_config(self.args(mode="fused"), self.archive, 32)["runtime_workers"], 3)
+        self.archive.manifest["geometry"]["batch"] = 16
+        self.archive.manifest["geometry"]["aic_count"] = 16
+        self.assertEqual(runtime_worker_config(self.args(mode="fused"), self.archive, 32)["runtime_workers"], 24)
+
+    def test_constructor_uses_original_urma_abi_and_does_not_initialize(self):
+        create_runtime(self.args(), self.archive, self.sdk, None, None, None, None, 32)
+        args, options = self.calls[0]
+        self.assertEqual(args[1:], (2624, 128))
+        self.assertTrue(args[0].endswith("kvaf_execute_batch_get_kernels.o"))
+        self.assertEqual(options["npu_core_count"], 2)
+        self.assertEqual(options["jettys_per_core"], 2)
+        self.assertNotIn("transport", options)
+        self.assertNotIn("ubmem_page_mode", options)
+
+    def test_ubmem_keeps_snapshot_page_policy(self):
+        create_runtime(self.args("ubmem", "fused"), self.archive, self.sdk, None, None, None, None, 32)
+        _, options = self.calls[0]
+        self.assertEqual(options["npu_core_count"], 2)
+        self.assertEqual(options["transport"], "ubmem")
+        self.assertEqual(options["ubmem_page_mode"], "thp")
+        self.assertEqual(options["ubmem_numa_node"], 2)
+
+    def test_invalid_selection_fails_before_native_construction(self):
+        for override in (0, 49, True):
+            with self.subTest(override=override), self.assertRaises(ValueError):
+                runtime_worker_config(self.args(serial_workers=override), self.archive, 32)
+        with self.assertRaisesRegex(ValueError, "only to serial"):
+            runtime_worker_config(self.args(mode="fused", serial_workers=2), self.archive, 32)
+        args = self.args()
+        args.kvaf_server = None
+        with self.assertRaisesRegex(ValueError, "kvaf-server"):
+            create_runtime(args, self.archive, self.sdk, None, None, None, None, 32)
+        (self.build / "bin/kvaf_execute_batch_put_kernels.o").unlink()
+        with self.assertRaises(FileNotFoundError):
+            create_runtime(self.args(), self.archive, self.sdk, None, None, None, None, 32)
+        self.assertEqual(self.calls, [])
 
 
 if __name__ == "__main__":
