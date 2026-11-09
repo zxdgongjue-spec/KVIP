@@ -17,6 +17,7 @@ __aicore__ inline void FillWords(uint64_t address,uint32_t words,LocalTensor<uin
     }
 }
 __aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
+    const auto shape=LoadRuntimeShape(ctx);
     TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,4096*4);
     auto local=scratch.Get<uint32_t>();
     Duplicate(local,uint32_t(0),4096);
@@ -24,11 +25,11 @@ __aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
     FillWords(ctx->rows+b*sizeof(Row),sizeof(Row)/4,local);
     FillWords(ctx->progress+b*4*sizeof(Progress),4*sizeof(Progress)/4,local);
     FillWords(ctx->owners+b*128,32,local);
-    FillWords(ctx->owners+SIM_BATCH*128+b*kFinalWorkers*kFinalStateWords*4,kFinalWorkers*kFinalStateWords,local);
-    FillWords(ctx->owners+kFinalPostOffset+b*kFinalWorkers*sizeof(FinalPost),kFinalWorkers*sizeof(FinalPost)/4,local);
+    FillWords(ctx->owners+shape.batch*128+b*shape.finalWorkers*kFinalStateWords*4,shape.finalWorkers*kFinalStateWords,local);
+    FillWords(ctx->owners+shape.finalPostOffset+b*shape.finalWorkers*sizeof(FinalPost),shape.finalWorkers*sizeof(FinalPost)/4,local);
     FillWords(ctx->rowStatus+b*kRowStatusWords*4,kRowStatusWords,local);
     if(ctx->ubmemStatus)FillWords(ctx->ubmemStatus+b*kUbmemStatusWords*8,kUbmemStatusWords*2,local);
-    for(uint32_t e=b;e<(kRounds?kRounds:1)*kServiceLanes;e+=SIM_BATCH)
+    for(uint32_t e=b;e<(shape.rounds?shape.rounds:1)*shape.serviceLanes;e+=shape.batch)
         FillWords(ctx->events+e*sizeof(Event),sizeof(Event)/4,local);
     if(!b) {
         *reinterpret_cast<__gm__ uint32_t*>(ctx->count)=0;
@@ -37,7 +38,7 @@ __aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
     SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
     Duplicate(local,UINT32_MAX,4096);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-    FillWords(ctx->mapping+uint64_t(b)*SIM_HISTORY*4,SIM_HISTORY,local);
+    FillWords(ctx->mapping+uint64_t(b)*shape.history*4,shape.history,local);
     FillWords(ctx->selected+uint64_t(b)*kSlots*4,kSlots,local);
     if(ctx->changes)FillWords(ctx->changes+b*kChangeCapacity*4,kChangeCapacity,local);
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
@@ -50,11 +51,12 @@ __aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
         DataCopy(target,local,kLruSlots);
         SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     }
-    Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},SIM_HISTORY,SIM_RESIDENT,ctx,b);
+    Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},shape.history,shape.resident,ctx,b);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
     pipe.Destroy();
 }
 __aicore__ inline void CompleteBatch(__gm__ Context* ctx,uint32_t b) {
+    const auto shape=LoadRuntimeShape(ctx);
     auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
     auto info=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
     ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),sizeof(Row));
@@ -63,8 +65,8 @@ __aicore__ inline void CompleteBatch(__gm__ Context* ctx,uint32_t b) {
     uint64_t error=info[0]|row->error;
     if(!ctx->ubmemStatus || !UbmemRegionValid(region))error|=kUbmemInvalidRegion;
     uint64_t scheduled=0,completed=0;
-    for(uint32_t w=0;w<kFinalWorkers;++w) {
-        auto post=FinalPostAt(ctx,b*kFinalWorkers+w);
+    for(uint32_t w=0;w<shape.finalWorkers;++w) {
+        auto post=FinalPostAt(ctx,b*shape.finalWorkers+w);
         ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(FinalPost));
         scheduled+=post->count;completed+=post->head;error|=post->error;
         if(post->pending || post->deferred || post->count!=post->head)error|=kUbmemIncomplete;
@@ -75,7 +77,7 @@ __aicore__ inline void CompleteBatch(__gm__ Context* ctx,uint32_t b) {
         ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),128);
         if(status[2]!=row->requests)error|=kUbmemIncomplete;
         status[0]=error;status[1]=row->requests;status[3]=scheduled;status[4]=completed;
-        status[5]=(status[2]+completed)*kTokenBytes;
+        status[5]=(status[2]+completed)*shape.tokenBytes;
         status[6]=UbmemRegionValid(region)?region->generation:0;
         ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),128);
     }
@@ -83,7 +85,7 @@ __aicore__ inline void CompleteBatch(__gm__ Context* ctx,uint32_t b) {
     info[0]|=static_cast<uint32_t>(error);info[3]=0;info[4]=static_cast<uint32_t>(completed);
     if(!error) {
         row->finalPending=0;
-        Simt::VF_CALL<PublishCompletedResidency>(Simt::Dim3{256,1,1},SIM_RESIDENT,ctx,b,static_cast<uint32_t>(completed));
+        Simt::VF_CALL<PublishCompletedResidency>(Simt::Dim3{256,1,1},shape.resident,ctx,b,static_cast<uint32_t>(completed));
         SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
     }
     ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),sizeof(Row));
@@ -95,16 +97,17 @@ extern "C" __global__ __aicore__ void kvip_ubmem_init_kernel(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     if ASCEND_IS_AIV {
-        uint32_t b=GetBlockIdx();if(b>=SIM_BATCH)return;
-        auto ctx=GetContext(bindings);InitializeRound(ctx,b);
+        auto ctx=GetContext(bindings);const auto shape=LoadRuntimeShape(ctx);
+        uint32_t b=GetBlockIdx();if(b>=shape.batch)return;
+        InitializeRound(ctx,b);
         auto region=UbmemRegionAt(ctx);
         auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
         uint64_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
-        uint64_t stride=ctx->outputStride?ctx->outputStride:SIM_RESIDENT;
-        uint64_t rowBytes=stride*kTokenBytes;
+        uint64_t stride=ctx->outputStride?ctx->outputStride:shape.resident;
+        uint64_t rowBytes=stride*shape.tokenBytes;
         uint32_t error=(!ctx->ubmemStatus || !UbmemRegionValid(region) || !ctx->tokenAddresses ||
             !ctx->lruSlots || !ctx->reservedHot || !ctx->changeSlots || !ctx->changeCount ||
-            ctx->addressStride<SIM_HISTORY || stride<SIM_RESIDENT || (stride-SIM_RESIDENT)%128 || (ctx->tailBounds && stride<SIM_RESIDENT+384) ||
+            ctx->addressStride<shape.history || stride<shape.resident || (stride-shape.resident)%128 || (ctx->tailBounds && stride<shape.resident+384) ||
             rowBytes%32 || ctx->prefetchLimit>kLruSlots || !ctx->windowLimit || ctx->windowLimit>480)?kUbmemInvalidRegion:0;
         if(!error && (rowBytes>region->outputBytes || owner>region->outputBytes/rowBytes-1))error=kUbmemInvalidRegion;
         row->reserved0=0;row->reserved1=0;row->reserved2=0;
@@ -124,6 +127,7 @@ extern "C" __global__ __aicore__ void kvip_ubmem_resolve_kernel(GM_ADDR bindings
 extern "C" __global__ __aicore__ void kvip_ubmem_complete_kernel(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    if ASCEND_IS_AIV {uint32_t b=GetBlockIdx();if(b<SIM_BATCH)CompleteBatch(GetContext(bindings),b);}
+    if ASCEND_IS_AIV {auto ctx=GetContext(bindings);const auto shape=LoadRuntimeShape(ctx);
+        uint32_t b=GetBlockIdx();if(b<shape.batch)CompleteBatch(ctx,b);}
 #endif
 }
