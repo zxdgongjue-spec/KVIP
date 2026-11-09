@@ -150,6 +150,14 @@ class DependencyPatchTests(unittest.TestCase):
             BUILD.prepare_dependency(self.source)
         self.assertEqual(self.git("diff"), before)
 
+    def test_old_device_patch_requires_a_fresh_checkout(self):
+        path = self.source / "access_operator/include/ubmem/fused_batch_get_device.h"
+        path.parent.mkdir(parents=True)
+        path.write_text("previous device API\n")
+        with self.assertRaisesRegex(RuntimeError, "different UBmem fused-device patch"):
+            BUILD.prepare_dependency(self.source, "ubmem")
+        self.assertEqual(path.read_text(), "previous device API\n")
+
     def test_wrong_revision_preserves_checkout(self):
         before = self.text()
         with patch.object(BUILD, "REVISION", "wrong-revision"):

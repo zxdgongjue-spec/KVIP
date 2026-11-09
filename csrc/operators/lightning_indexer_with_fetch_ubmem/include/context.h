@@ -10,7 +10,7 @@ constexpr uint32_t kTop = 2048, kSlots = 8192, kTokenBytes = TOKEN_BYTES;
 constexpr uint32_t kMaxRounds = 32, kRowStatusWords = 32, kFinalStateWords = 288;
 struct alignas(128) FinalPost {
     uint32_t count, pending, error, deferred, descriptor;
-    uint32_t reserved;
+    uint32_t nonconflicting;
     uint64_t head;
 };
 

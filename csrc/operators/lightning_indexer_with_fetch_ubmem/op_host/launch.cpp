@@ -14,7 +14,12 @@ extern "C" uint32_t api(void* bindings,void* stream,const rotating::RuntimeShape
 ENTRY(v9_init,init,shape->batch)
 ENTRY(v9_li,li,shape->liCores)
 ENTRY(v9_resolve,resolve,shape->finalCores)
-ENTRY(v9_fetch,complete,shape->batch)
+ENTRY(v9_fetch_workers,fetch,shape->finalCores)
+ENTRY(v9_finish_fetch,complete,shape->batch)
+extern "C" uint32_t v9_fetch(void* bindings,void* stream,const rotating::RuntimeShape* shape) {
+    uint32_t result=v9_fetch_workers(bindings,stream,shape);
+    return result?result:v9_finish_fetch(bindings,stream,shape);
+}
 
 extern "C" uint32_t aclrtlaunch_kvip_ubmem_direct_update_outputs_kernel(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_kvip_ubmem_direct_update_owned_kernel(uint32_t,void*,void*);

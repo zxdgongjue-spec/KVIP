@@ -413,7 +413,6 @@ def _check_hot_resolver(tmp_path, transport):
     operator = "lightning_indexer_with_fetch" + ("_ubmem" if transport == "ubmem" else "")
     kernel = ROOT / "csrc/operators" / operator / "op_kernel"
     metadata = kernel / ("resolver/direct_slots.h" if transport == "ubmem" else "prefetch.h")
-    resolver = kernel / ("resolver/resolver.h" if transport == "ubmem" else "resolver.h")
 
     def function(path, name):
         text = path.read_text()
@@ -434,10 +433,9 @@ def _check_hot_resolver(tmp_path, transport):
     functions += "\ntemplate<unsigned Threads>\n" + function(
         ROOT / "csrc/operators/common/lifetch/resident_selection.h", "ResolveResidentPlan"
     )
-    resolve = function(resolver, "ReplicatedResolve")
+    resolve = function(ROOT / "csrc/operators/common/lifetch/resolver.h", "ReplicatedResolve")
     shared = (ROOT / "csrc/operators/common/lifetch/resolver_plan.h").read_text()
-    for relative in ("../../common/lifetch/resolver_plan.h", "../../../common/lifetch/resolver_plan.h"):
-        resolve = resolve.replace(f'#include "{relative}"', shared)
+    resolve = resolve.replace('#include "resolver_plan.h"', shared)
     functions += "\ntemplate<unsigned Threads>\n" + resolve
     source = r"""
 #include <cstdint>
@@ -547,11 +545,6 @@ int main(){
                 "V9_FINAL_REPLICATED=1",
             )
         ]
-        source = source.replace("ReplicatedResolve<1>(h,r,workers,656,", "ReplicatedResolve<1>(")
-        source = source.replace("&total,w,used,0,&ctx);", "&total,w,used,0,&ctx,h,r,workers,656);")
-        begin = source.index("   assert(cfg[5]<=cfg[3]);")
-        end = source.index("   std::copy(locations.begin()", begin)
-        source = source[:begin] + source[end:]
     (tmp_path / "batch_get_abi.h").write_text("")
     cpp, exe = tmp_path / "resolver.cpp", tmp_path / "resolver"
     cpp.write_text(source)
@@ -604,6 +597,10 @@ def test_final_fetch_uses_native_explicit_range_without_direct_submission():
     lifecycle = (root / "lifecycle.cpp").read_text()
     assert "PublishFinalWorker" not in resolver
     assert "CommitPostScalarStage" not in resolver
+    phase = (root / "final_fetch_phase.h").read_text()
+    phase_loop = (root.parents[1] / "common/lifetch/final_phase_loop.h").read_text()
+    phase_loop = phase_loop.replace("#include LIFETCH_FINAL_PHASE", phase)
+    lifecycle = lifecycle.replace('#include "../../common/lifetch/final_phase_loop.h"', phase_loop)
     finish = lifecycle[lifecycle.index("__aicore__ inline void FinishFetch") :]
     assert "if(phase==1)" in finish
     assert "(!phase || !row->pending)" in finish
@@ -611,8 +608,10 @@ def test_final_fetch_uses_native_explicit_range_without_direct_submission():
     assert "DrainQueue(" not in finish
     # Execute the production descriptor publisher: it must never mark an SQ post
     # pending, even for nonempty or oversized ranges; native KVAF schedules them.
-    start = resolver.index("__aicore__ inline void PrepareFinalFetch")
-    function = resolver[start : resolver.index("\n}\n", start) + 2]
+    publisher = (root.parents[1] / "common/lifetch/final_post.h").read_text()
+    start = publisher.index("__aicore__ inline void PrepareFinalFetch")
+    function = publisher[start : publisher.index("\n}\n", start) + 2]
+    function = function.replace("LIFETCH_CLEAN_CACHE_LINES", "kvaf_device::CleanCacheLines")
     program = (
         """#include <cstdint>
 #include <cassert>
@@ -645,9 +644,10 @@ def test_native_final_phase_order_runs_production_loop(tmp_path):
     """Exercise the actual Fetch orchestration with a recording native SDK."""
     import subprocess
 
-    text = (ROOT / "csrc/operators/lightning_indexer_with_fetch/op_kernel/lifecycle.cpp").read_text()
-    start = text.index("    for(uint32_t phase=0;phase<2;++phase)")
-    loop = text[start : text.index("    if(row->pending || total!=info[1])", start)]
+    common = ROOT / "csrc/operators/common/lifetch/final_phase_loop.h"
+    phase = ROOT / "csrc/operators/lightning_indexer_with_fetch/op_kernel/final_fetch_phase.h"
+    loop = common.read_text().replace("#include LIFETCH_FINAL_PHASE", phase.read_text())
+    loop = loop.replace("LIFETCH_FINAL_JOIN", "CompletePrefetch(ctx,b); error|=row->error")
     code = r"""
 #include <cstdint>
 #include <vector>

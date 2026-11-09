@@ -92,6 +92,11 @@ def prepare_dependency(root, transport="urma"):
             raise RuntimeError("KVAF UBmem device patch exists but its fused lease dependency is missing")
         print(f"KVAF UBmem device dependency already patched: {root} @ {head}", flush=True)
         return
+    if (root / "access_operator/include/ubmem/fused_batch_get_device.h").exists():
+        raise RuntimeError(
+            "KVAF has a different UBmem fused-device patch; preserve it and use a fresh "
+            "--kvaf-root for this KVIP revision"
+        )
     # The UBmem patch changes common-patch contexts. Recognize it first, while
     # keeping the default URMA checkout on its original three-patch chain.
     if applies(root, UBMEM_PATCH, True):

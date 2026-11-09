@@ -66,7 +66,7 @@ __aicore__ inline void CompleteBatch(__gm__ Context* ctx,uint32_t b) {
     if(!ctx->ubmemStatus || !UbmemRegionValid(region,shape.resident))error|=kUbmemInvalidRegion;
     uint64_t scheduled=0,completed=0;
     for(uint32_t w=0;w<shape.finalWorkers;++w) {
-        auto post=FinalPostAt(ctx,b*shape.finalWorkers+w);
+        auto post=FinalPostAt(shape.finalPostOffset,ctx,b*shape.finalWorkers+w);
         ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(FinalPost));
         scheduled+=post->count;completed+=post->head;error|=post->error;
         if(post->pending || post->deferred || post->count!=post->head)error|=kUbmemIncomplete;
@@ -82,6 +82,8 @@ __aicore__ inline void CompleteBatch(__gm__ Context* ctx,uint32_t b) {
         ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),128);
     }
     row->error=static_cast<uint32_t>(error);
+    row->finalCompleted=completed;
+    row->finalEnd=GetSystemCycle();
     info[0]|=static_cast<uint32_t>(error);info[3]=0;info[4]=static_cast<uint32_t>(completed);
     if(!error) {
         row->finalPending=0;
@@ -122,6 +124,37 @@ extern "C" __global__ __aicore__ void kvip_ubmem_resolve_kernel(GM_ADDR bindings
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     if ASCEND_IS_AIV {ReplicatedFinal(GetContext(bindings));}
+#endif
+}
+// Resolver writes the same compact final descriptors as URMA. The preceding
+// LI kernel has completed UBmem prefetch, so all destinations are safe here.
+extern "C" __global__ __aicore__ void kvip_ubmem_fetch_kernel(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV {
+        auto ctx=GetContext(bindings);const auto shape=LoadRuntimeShape(ctx);
+        uint32_t core=GetBlockIdx(),b=core/shape.finalWorkers,w=core%shape.finalWorkers;
+        if(b>=shape.batch)return;
+        auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
+        auto info=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
+        auto post=FinalPostAt(shape.finalPostOffset,ctx,core);
+        ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),kRowStatusWords*4);
+        ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),sizeof(Row));
+        auto region=UbmemRegionAt(ctx);
+        uint32_t error=info[0]|row->error;
+        kvaf_device::UbmemBatchGetDeviceResult result{};
+        if(!ctx->fallbackAddresses || !UbmemRegionValid(region,shape.resident))error|=kUbmemInvalidRegion;
+        if(row->pending || info[1]>kSlots)error|=kUbmemIncomplete;
+#define LIFETCH_FINAL_JOIN do {} while (0)
+#define LIFETCH_FINAL_PHASE "../../lightning_indexer_with_fetch_ubmem/op_kernel/resolver/final_fetch_phase.h"
+#include "../../common/lifetch/final_phase_loop.h"
+#undef LIFETCH_FINAL_PHASE
+#undef LIFETCH_FINAL_JOIN
+        error|=result.error;
+        post->count=result.scheduled;post->pending=result.scheduled!=result.completed;
+        post->error=error;post->deferred=0;post->head=result.completed;
+        ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(FinalPost));
+    }
 #endif
 }
 extern "C" __global__ __aicore__ void kvip_ubmem_complete_kernel(GM_ADDR bindings) {
