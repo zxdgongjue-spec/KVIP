@@ -323,11 +323,6 @@ def run_device(
             if step >= args.warmup:
                 samples.append(start.elapsed_time(end) * 1000)
             check()
-            if read_label == "prototype_with_update" and step == args.warmup and args.comparison_output:
-                from transport_snapshot import save
-                save(args.comparison_output, state["ids"], state["slots"], owner.output.cpu().numpy(),
-                     rotating.mapping.cpu().numpy(), rotating.lru_slots.cpu().numpy(),
-                     rotating.rows.cpu().numpy().view(np.uint32), owner.remote_token_addresses.cpu().numpy())
             if read_label and step >= args.warmup:
                 read_samples.setdefault(read_label, []).append(
                     actual_reads(
@@ -337,6 +332,16 @@ def run_device(
                         r,
                     )
                 )
+        if read_label == "prototype_with_update" and args.comparison_output:
+            reset()
+            stream.synchronize()
+            graph.replay()
+            stream.synchronize()
+            check()
+            from transport_snapshot import save
+            save(args.comparison_output, state["ids"], state["slots"], owner.output.cpu().numpy(),
+                 rotating.mapping.cpu().numpy(), rotating.lru_slots.cpu().numpy(),
+                 rotating.rows.cpu().numpy().view(np.uint32), owner.remote_token_addresses.cpu().numpy())
         if trace_core:
             core_trace.update(
                 collect_core(torch, rotating, graph, reset, check, args.trace_rounds or AUTO_CORE_TRACE_ROUNDS, folder)
