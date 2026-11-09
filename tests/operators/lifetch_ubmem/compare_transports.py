@@ -8,6 +8,7 @@ claim beyond the captured graph events is implied. Long logs stay on disk.
 
 import argparse
 import os
+import re
 from pathlib import Path
 import signal
 import subprocess
@@ -49,6 +50,27 @@ def extract(log, prefixes):
     return [line for line in rows if any(line.startswith(prefix) for prefix in prefixes)]
 
 
+def baseline_timings(path, batch, history, resident, heads):
+    lines = path.read_text().splitlines()
+    expected = f"batch={batch} history={history} resident={resident} heads={heads} "
+    contract = "Q=4 topk=2048 windows=8 budget=512 graph=True"
+    if not any(line.startswith(expected) and contract in line for line in lines):
+        raise ValueError(f"baseline geometry differs from {expected.strip()}: {path}")
+    values, label = {}, None
+    for line in lines:
+        match = re.match(r"(urma|ubmem)-miss(\d+): (PASS|FAIL)\b", line)
+        if match:
+            label = (match.group(1), int(match.group(2))) if match.group(3) == "PASS" else None
+        elif label:
+            match = re.search(r"prototype_with_update:([\d.]+)", line) if label[0] == "urma" else (
+                re.search(r"^UBMEM_GRAPH_EVENT_US p50=([\d.]+)", line)
+            )
+            if match:
+                values[label] = float(match.group(1))
+                label = None
+    return values
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", type=int, required=True)
@@ -66,6 +88,7 @@ def main(argv=None):
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     parser.add_argument("--output", type=Path, default=ROOT / "tests/results/ubmem-compare")
+    parser.add_argument("--baseline-summary", type=Path, help="earlier matching-geometry summary.log for p50 comparison")
     args = parser.parse_args(argv)
     if (
         not 1 <= args.batch <= 32
@@ -75,6 +98,16 @@ def main(argv=None):
         or any(not 0 <= value <= 100 for value in args.miss_percent)
     ):
         parser.error("invalid batch, miss ratio, timing count or timeout")
+    baseline = {}
+    if args.baseline_summary:
+        try:
+            baseline = baseline_timings(args.baseline_summary, args.batch, args.history, args.resident, args.index_heads)
+            missing = [(transport, miss) for miss in args.miss_percent for transport in ("urma", "ubmem")
+                       if (transport, miss) not in baseline]
+            if missing:
+                raise ValueError(f"baseline missing successful full-graph timings: {missing}")
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
     root = args.kvaf_root.resolve()
     build = root / "build-npu"
     if not (build / "CMakeCache.txt").is_file():
@@ -198,6 +231,17 @@ def main(argv=None):
             selected = extract(log, prefixes)
             success = code == 0 and all(any(line.startswith(prefix) for line in selected) for prefix in required)
             record = [f"{label}: {'PASS' if success else 'FAIL'} exit={code}", *selected]
+            if success and baseline:
+                pattern = (r"prototype_with_update:([\d.]+)" if transport == "urma"
+                           else r"^UBMEM_GRAPH_EVENT_US p50=([\d.]+)")
+                matches = [re.search(pattern, line) for line in selected]
+                matches = [match for match in matches if match]
+                if len(matches) != 1 or baseline[(transport, miss)] <= 0:
+                    record.append("BASELINE: unavailable: expected one current p50 and positive baseline")
+                else:
+                    old, new = baseline[(transport, miss)], float(matches[0].group(1))
+                    record.append(f"BASELINE {transport} miss={miss}: old={old:.3f}us new={new:.3f}us "
+                                  f"change={(new / old - 1) * 100:+.2f}% (independent runs)")
             if not success:
                 record += ["last log lines:", *log.read_text(errors="replace").splitlines()[-12:]]
             with summary.open("a") as result:

@@ -3,6 +3,26 @@
 import compare_transports as compare
 
 
+def test_baseline_requires_matching_geometry_and_successful_full_graph(tmp_path):
+    import pytest
+
+    summary = tmp_path / "summary.log"
+    summary.write_text(
+        "batch=16 history=131072 resident=16384 heads=32 Q=4 topk=2048 windows=8 budget=512 graph=True\n"
+        "urma-miss10: PASS exit=0\n"
+        "graph_p50_us=native_chain:605.794, prototype_with_update:518.138\n"
+        "ubmem-miss10: PASS exit=0\n"
+        "UBMEM_GRAPH_EVENT_US p50=499.474 p99=508.989\n"
+        "urma-miss30: FAIL exit=1\n"
+        "graph_p50_us=prototype_with_update:1\n"
+    )
+    assert compare.baseline_timings(summary, 16, 131072, 16384, 32) == {
+        ("urma", 10): 518.138, ("ubmem", 10): 499.474,
+    }
+    with pytest.raises(ValueError, match="geometry differs"):
+        compare.baseline_timings(summary, 8, 131072, 16384, 32)
+
+
 def test_runner_requires_checked_completion_for_both_backends(tmp_path, monkeypatch):
     root = tmp_path / "KVAF"
     (root / "build-npu").mkdir(parents=True)
