@@ -30,5 +30,11 @@ int main() {
     assert((calls==std::vector<unsigned>{1,2,3,4}));
     calls.clear();assert(kvip_ubmem_forward(nullptr,pointer,pointer)!=0 && calls.empty());
     for(uint32_t e=1;e<kRounds;++e)assert(Trigger(e)>Trigger(e-1));
-    assert(Trigger(kRounds-1)==SIM_HISTORY/128);
+    assert(Trigger(0)==SIM_RESIDENT/128);
+    if(kRounds>1)assert(Trigger(kRounds-1)==SIM_HISTORY/128);
+    for(uint32_t tile=0;tile<=SIM_HISTORY/128+1;++tile) {
+        bool expected=false;
+        for(uint32_t e=0;e<kRounds;++e)expected |= Trigger(e)==tile;
+        assert(IsTrigger(tile)==expected);
+    }
 }

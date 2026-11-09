@@ -3,6 +3,7 @@
 """Real KVAF Put -> UBmem LI/TopK/Fetch -> Index update, with no model weights."""
 
 import argparse
+import ctypes
 import sys
 import tempfile
 from pathlib import Path
@@ -161,6 +162,19 @@ def check_shape(
             scratch=workspace.scratch,
             prefetch_limit=prefetch_tokens,
         )
+        # Check the compiled UBmem schedule against the URMA runtime contract,
+        # including epoch zero at the end of the hot region.
+        from kvip.operators.lifetch.geometry import trigger_tokens
+
+        trigger = rotating.library.v9_window_trigger_tile
+        trigger.argtypes, trigger.restype = [ctypes.c_uint32], ctypes.c_uint32
+        actual_triggers = [128 * trigger(epoch) for epoch in range(rotating.rounds)]
+        expected_triggers = trigger_tokens(
+            batch, history, resident, intermediate_fetches=shape.intermediate_fetches, aic_count=shape.aic_count
+        )
+        if actual_triggers != expected_triggers:
+            raise AssertionError(f"UBmem/URMA prefetch window mismatch: {actual_triggers} != {expected_triggers}")
+        print(f"UBMEM_WINDOW_TRIGGERS tokens={actual_triggers}", flush=True)
         update = UbmemIndexUpdate(
             torch,
             keys=storage.keys,

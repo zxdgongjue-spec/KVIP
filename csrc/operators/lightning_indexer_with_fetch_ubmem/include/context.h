@@ -87,21 +87,20 @@ static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 
 #else
 #define V9_DEVICE
 #endif
+// Match URMA: epoch zero handles displaced hot candidates immediately after
+// the resident scores; the remaining epochs span the cold region.
 V9_DEVICE constexpr uint32_t Trigger(uint32_t epoch) {
-    // Zero rounds disables service; keep this helper valid without division by zero.
     if (kRounds == 0) return SIM_RESIDENT / 128;
     return SIM_RESIDENT / 128 +
-        ((SIM_HISTORY - SIM_RESIDENT) / 128) * (epoch + 1) / (kRounds ? kRounds : 1);
+        ((SIM_HISTORY - SIM_RESIDENT) / 128) * epoch / (kRounds > 1 ? kRounds - 1 : 1);
 }
 V9_DEVICE constexpr bool IsTrigger(uint32_t tileEnd) {
     constexpr uint32_t coldTiles = (SIM_HISTORY - SIM_RESIDENT) / 128;
-    if constexpr (kRounds != 0 && coldTiles != 0 && coldTiles % (kRounds ? kRounds : 1) == 0) {
-        // Equal-width windows need one constant-divisor test in the tile loop,
-        // rather than one comparison per epoch. Keep the original floor-based
-        // schedule below for uneven windows and degenerate geometries.
-        constexpr uint32_t step = coldTiles / (kRounds ? kRounds : 1);
+    if constexpr (kRounds == 1) return tileEnd == SIM_RESIDENT / 128;
+    if constexpr (kRounds > 1 && coldTiles != 0 && coldTiles % (kRounds > 1 ? kRounds - 1 : 1) == 0) {
+        constexpr uint32_t step = coldTiles / (kRounds > 1 ? kRounds - 1 : 1);
         constexpr uint32_t first = SIM_RESIDENT / 128;
-        return tileEnd > first && tileEnd <= first + coldTiles &&
+        return tileEnd >= first && tileEnd <= first + coldTiles &&
             (tileEnd - first) % (step ? step : 1) == 0;
     }
     for (uint32_t e = 0; e < kRounds; ++e) if (Trigger(e) == tileEnd) return true;

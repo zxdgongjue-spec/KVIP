@@ -160,8 +160,9 @@ def main(argv=None):
                     "--prefetch-tokens",
                     "512",
                 ]
-                prefixes = ("UBMEM_LIFETCH_PASS", "UBMEM_GRAPH_EVENT_US", "UBMEM_SFA_PASS", "UBMEM_FETCH_COUNTS")
-                required = ("UBMEM_LIFETCH_PASS", "UBMEM_GRAPH_EVENT_US", "UBMEM_SFA_PASS")
+                prefixes = ("UBMEM_LIFETCH_PASS", "UBMEM_GRAPH_EVENT_US", "UBMEM_SFA_PASS", "UBMEM_FETCH_COUNTS",
+                            "UBMEM_WINDOW_TRIGGERS")
+                required = ("UBMEM_LIFETCH_PASS", "UBMEM_GRAPH_EVENT_US", "UBMEM_SFA_PASS", "UBMEM_WINDOW_TRIGGERS")
             code = execute(command, log, args.timeout_seconds, label)
             selected = extract(log, prefixes)
             success = code == 0 and all(any(line.startswith(prefix) for line in selected) for prefix in required)

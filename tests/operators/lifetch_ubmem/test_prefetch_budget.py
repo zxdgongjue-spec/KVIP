@@ -109,3 +109,42 @@ def test_service_chunk_assignment_covers_every_request_once(tmp_path):
     binary = tmp_path / "chunks"
     subprocess.run([compiler, "-std=c++17", str(source), "-I" + str(header), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
+
+
+@pytest.mark.parametrize("batch,windows,history,resident", [
+    (1, 1, 33024, 8192),
+    (1, 8, 33024, 8192),
+    (8, 8, 131072, 16384),
+    (16, 8, 131072, 16384),
+    (32, 32, 131072, 16384),
+])
+def test_ubmem_window_triggers_match_urma(tmp_path, batch, windows, history, resident):
+    from kvip.operators.lifetch.geometry import trigger_tokens
+
+    compiler = shutil.which("c++")
+    if not compiler:
+        pytest.skip("C++ unavailable")
+    root = Path(__file__).resolve().parents[3]
+    source = tmp_path / "triggers.cpp"
+    source.write_text(
+        '#include "context.h"\n#include <cstdio>\n'
+        'int main() { for(unsigned e=0;e<rotating::kRounds;++e) '
+        'std::printf("%u ",128*rotating::Trigger(e)); '
+        'for(unsigned t=0;t<=SIM_HISTORY/128+1;++t) { bool found=false; '
+        'for(unsigned e=0;e<rotating::kRounds;++e)found |= rotating::Trigger(e)==t; '
+        'if(found != rotating::IsTrigger(t))return 1; } }\n'
+    )
+    definitions = dict(
+        SIM_BATCH=batch, SIM_HISTORY=history, SIM_RESIDENT=resident, TOKEN_BYTES=656,
+        V9_UBPIPE_DEPTH=8, V9_UBPIPE_ROWS=4, V9_DEDICATED_SERVICE=0,
+        V9_AIC_COUNT=32, V9_SPLIT_Q=int(2 * batch <= 32),
+        V9_INTERMEDIATE_FETCHES=windows, V9_FINAL_REPLICATED=1,
+    )
+    binary = tmp_path / "triggers"
+    subprocess.run(
+        [compiler, "-std=c++17", str(source), *[f"-D{k}={v}" for k, v in definitions.items()],
+         "-I" + str(root / "csrc/operators/lightning_indexer_with_fetch_ubmem/include"), "-o", str(binary)],
+        check=True, capture_output=True,
+    )
+    actual = subprocess.check_output([str(binary)], text=True)
+    assert list(map(int, actual.split())) == trigger_tokens(batch, history, resident, intermediate_fetches=windows)
