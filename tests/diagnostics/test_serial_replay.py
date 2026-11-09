@@ -131,6 +131,7 @@ def test_restores_logical_index_hot_abc_and_published_pages(tmp_path, batch, wid
     [
         ("permutation", "permutations"),
         ("causal", "consecutive"),
+        ("visible_prefix", "causal prefixes"),
         ("page", "contiguous"),
         ("lru", "distinct"),
         ("unpack", "TND"),
@@ -144,6 +145,8 @@ def test_rejects_unrecoverable_snapshot_contract(tmp_path, fault, match):
         arrays["pre.logical_ids"][1, 2] = 1
     elif fault == "causal":
         arrays["pre.query_ends"][0, 1] -= 1
+    elif fault == "visible_prefix":
+        arrays["pre.logical_ids"][1, [1, 4095]] = arrays["pre.logical_ids"][1, [4095, 1]]
     elif fault == "page":
         arrays["pre.addresses"][1, 1] += 1
     elif fault == "lru":

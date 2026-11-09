@@ -13,6 +13,7 @@ import numpy as np
 
 from kvip.diagnostics.archive import cpu_array
 from kvip.diagnostics.oracle import DecodeOracle
+from kvip.diagnostics.selection import SelectionOracle
 
 TOPK = 2048
 BLOCK = 128
@@ -64,6 +65,12 @@ def serial_inputs(archive, new_base):
     ends = archive.array("pre.query_ends").reshape(b, QUERIES)[packed_rows]
     if np.any(np.diff(ends, axis=1) != 1) or np.any(ends < TOPK) or np.any(ends > h):
         raise ValueError("Native LI requires four real consecutive causal query positions")
+    for owner, row_ends in zip(owners, ends):
+        for end in row_ends:
+            # Fusion masks the physical prefix; native LI masks logical IDs.
+            # A serving Index may permute committed rows, never future tokens.
+            if np.any(ids[owner, :end] >= end):
+                raise ValueError("Snapshot physical and logical causal prefixes differ")
     bounds = archive.array("pre.tail_bounds")[packed_rows]
     tail = stride - r
     if (
@@ -143,9 +150,6 @@ def _verify_serial(archive, inputs, oracle, logical, slots, forward, reverse, ou
     g = archive.manifest["geometry"]
     b, h, r, stride, width = (g[n] for n in ("batch", "history", "resident", "output_stride", "token_bytes"))
     logical, slots = logical.reshape(b, QUERIES, TOPK), slots.reshape(b, QUERIES, TOPK)
-    expected_topk = archive.array("post.logical_output").reshape(b, QUERIES, TOPK)
-    if not np.array_equal(np.sort(logical, axis=-1), np.sort(expected_topk, axis=-1)):
-        raise AssertionError("Native LI TopK set differs from the captured fusion selection")
     if counts.shape != (b + 1,) or np.any(counts < 0) or counts[-1] != counts[:-1].sum():
         raise AssertionError("Native LIDU miss counts are invalid")
     output = output.reshape(-1, width)[: len(forward) * stride].reshape(len(forward), stride, width)
@@ -252,6 +256,8 @@ def create_serial(
     state = {}
     generated_outputs = []
     oracle = DecodeOracle(archive)
+    selection = SelectionOracle(archive, inputs)
+    selection_comparison = {}
     retained.update(locals())
     retained.pop("retained", None)
 
@@ -336,17 +342,29 @@ def create_serial(
         # Native transport queue cursors and registrations must never be reset.
 
     def verify():
-        return _verify_serial(
+        values = [
+            cpu_array(torch, value)
+            for value in (state["logical"], state["slots"], forward_map, reverse_map, output, counts, destinations)
+        ]
+        checked_selection = selection.verify(values[0])
+        reads = _verify_serial(
             archive,
             inputs,
             oracle,
-            *(
-                cpu_array(torch, value)
-                for value in (state["logical"], state["slots"], forward_map, reverse_map, output, counts, destinations)
-            ),
+            *values,
         )
+        selection_comparison.clear()
+        selection_comparison.update(checked_selection)
+        return reads
 
     retained.update(state=state, stages=stages)
     return SimpleNamespace(
-        forward=forward, stage_calls=stages, reset=reset, verify=verify, lease=None, library=None, retained=retained
+        forward=forward,
+        stage_calls=stages,
+        reset=reset,
+        verify=verify,
+        lease=None,
+        library=None,
+        retained=retained,
+        selection_comparison=selection_comparison,
     )

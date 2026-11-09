@@ -38,6 +38,24 @@ def test_comparison_uses_fixed_archive_and_reports_fusion_reduction():
     assert value["table"]["urma-fused"]["mean_read_bytes"] == 26240
 
 
+def test_comparison_preserves_boundary_tie_and_actual_read_evidence():
+    entries = results()
+    selection = dict(
+        status="bf16_boundary_ties",
+        selected_set_sha256="native_selection",
+        changed_queries=2,
+        total_replacements=3,
+        min_overlap_fraction=2046 / 2048,
+    )
+    entries["ubmem-serial"]["selection_comparison"] = selection
+    entries["urma-serial"]["selection_comparison"] = {**selection, "selected_set_sha256": "another_selection"}
+    entries["ubmem-serial"]["reads_samples"] = [dict(bytes=30000), dict(bytes=32000)]
+    value = summarize(entries)
+    assert value["table"]["ubmem-serial"]["selection"] == selection
+    assert value["table"]["ubmem-serial"]["mean_read_bytes"] == 31000
+    assert value["same_selection_across_transports"] == dict(serial=False)
+
+
 @pytest.mark.parametrize(
     "key,value",
     [

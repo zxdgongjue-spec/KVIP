@@ -97,6 +97,7 @@ def summarize(results):
             p50_us=timing["p50_us"],
             mean_read_bytes=float(np.mean([x["bytes"] for x in result["reads_samples"]])),
             runtime_workers=result["runtime_workers"],
+            selection=result.get("selection_comparison"),
             reads_per_round={
                 key: float(np.mean([row[key] for row in result["reads_samples"]]))
                 for key in ("prefetch", "final", "unused_prefetch", "cold_demand", "candidate_hot_refetch")
@@ -107,6 +108,11 @@ def summarize(results):
     for transport in ("ubmem", "urma"):
         serial, fused = (table[f"{transport}-{mode}"]["mean_us"] for mode in ("serial", "fused"))
         ratios[transport] = dict(serial_over_fused=serial / fused, latency_reduction_percent=(1 - fused / serial) * 100)
+    selection_pairs = {}
+    for mode in ("serial", "fused"):
+        selections = [table[f"{transport}-{mode}"]["selection"] for transport in ("ubmem", "urma")]
+        if all(value is not None for value in selections):
+            selection_pairs[mode] = selections[0]["selected_set_sha256"] == selections[1]["selected_set_sha256"]
     return dict(
         status="pass",
         snapshot_sha256=first["snapshot_sha256"],
@@ -114,11 +120,13 @@ def summarize(results):
         scope=first["scope"],
         table=table,
         fusion_vs_serial=ratios,
+        same_selection_across_transports=selection_pairs,
         stage_diagnostics={name: result.get("stage_diagnostics") for name, result in results.items()},
         notes=[
             "Full-path latency uses one uninstrumented production graph per case.",
             "Stage diagnostics add graph/event boundaries: use to localize cost, not as an exact decomposition.",
             "Serial uses native CANN LI plus production LIDU/Get; fused uses its own LI and Index update.",
+            "TopK ID sets may differ only at a verified BF16 boundary tie; read bytes reflect each path's actual selection.",
             "The snapshot fixes inputs and pre-state, not speculative prefetch scheduling or physical pages.",
         ],
     )
@@ -134,11 +142,22 @@ def display(summary):
             f"{row['mean_read_bytes'] / (1 << 20):16.3f} {row['runtime_workers']:13d}"
         )
         print("  reads/round: " + ", ".join(f"{key}={value:.1f}" for key, value in row["reads_per_round"].items()))
+        selection = row["selection"]
+        if selection is not None:
+            print(
+                f"  selection: {selection['status']}; changed_queries={selection['changed_queries']}; "
+                f"replacements={selection['total_replacements']}; "
+                f"min_overlap={selection['min_overlap_fraction']:.6f}"
+            )
     for transport, values in summary["fusion_vs_serial"].items():
         print(
             f"{transport}: serial/fused={values['serial_over_fused']:.3f}x; "
             f"latency reduction={values['latency_reduction_percent']:.2f}%"
         )
+    for mode, same in summary["same_selection_across_transports"].items():
+        print(f"{mode}: UBmem/URMA selected ID sets identical={same}")
+        if not same:
+            print("  Different tied selections: the latency difference cannot be attributed only to transport.")
     for name, values in summary["stage_diagnostics"].items():
         if values is None:
             continue

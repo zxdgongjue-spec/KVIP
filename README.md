@@ -357,6 +357,21 @@ correctness readback are outside the device events. Each replay restores the
 original hot/ABC state and checks the logical TopK set and selected KV bytes.
 Native LI is executed; the captured TopK is only the correctness reference.
 
+Native LI sees logical token order, while fusion sees the captured hot-first
+permutation and ranks BF16 scores. Those orders can break a cutoff tie
+differently. Serial replay first checks unique, causal IDs; unequal sets pass
+only when every substituted ID is at the captured set's minimum BF16 score in
+an untimed selected-union reference calculation using fusion's final
+`CAST_ROUND` BF16 rounding rule. The first accepted native ID set must remain
+unchanged in eager, full-graph and stage replays. It reports `exact` or
+`bf16_boundary_ties`, replacement counts and a selection hash. The CPU FP64
+reference rounded to BF16 is an equivalence check against the captured set,
+not a bit-exact CANN implementation or a full-history numerical proof. Other
+score differences remain failures with token/score diagnostics. All KV byte,
+miss-count and resident-map checks still apply to the actual native selection.
+Read volumes therefore describe each path's selection, not forced identical
+miss IDs. No saved TopK is injected into the measured chain.
+
 Serial reuses CANN's TND/PA_BSND causal LI and production LIDU/Get. Its logical
 paged Index and resident maps are reconstructed from the captured hot-first
 permutation outside timing. The archive does not record the original serial

@@ -7,7 +7,7 @@ import sys
 
 import numpy as np
 
-from kvip.diagnostics.archive import cpu_array, file_digest, source_commit
+from kvip.diagnostics.archive import array_digest, cpu_array, file_digest, source_commit
 from kvip.diagnostics.oracle import DecodeOracle
 from kvip.diagnostics.snapshot import input_tensors, persistent_tensors, post_state, relocate_snapshot_addresses
 
@@ -103,6 +103,15 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
 
     bundle.reset, bundle.verify = reset, verify
     bundle.seeds, bundle.oracle = seeds, oracle
+    bundle.selection_comparison = dict(
+        status="exact",
+        selected_set_sha256=array_digest(np.sort(expected.astype("<i4"), axis=-1)),
+        compared_queries=len(expected),
+        changed_queries=0,
+        total_replacements=0,
+        min_overlap_fraction=1.0,
+        reference="Captured fusion TopK sets; equality enforced on every replay",
+    )
 
 
 def measure(torch, kvaf, stream, bundle, args, retained):
@@ -313,6 +322,7 @@ def run(args, archive, retained):
         exclusions="Model, input preparation/import/packing, DDR Put, state restoration and correctness readbacks",
         interpretation="Isolated four-layer group graph latency; not DP service latency or TPOT",
         graph_backend="torch.npu.NPUGraph" if args.mode == "serial" else "kvaf.AclGraph",
+        selection_comparison=bundle.selection_comparison,
         representation=(
             "Native logical paged Index and LIDU maps reconstructed outside timing; original serial map allocation padding was not captured."
             if args.mode == "serial"
