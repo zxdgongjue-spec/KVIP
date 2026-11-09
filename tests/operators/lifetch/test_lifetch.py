@@ -147,7 +147,7 @@ def main(argv=None):
     p.add_argument('--miss-percent', type=float, default=10)
     p.add_argument('--warmup', type=int, default=4)
     p.add_argument('--iterations', type=int, default=20)
-    p.add_argument('--trace-rounds', type=int, default=3, help='URMA device profiling replays; UBmem reports graph timing')
+    p.add_argument('--trace-rounds', type=int, default=3, help='separate device profiling replays')
     p.add_argument('--runtime-shapes', action='store_true')
     p.add_argument('--resolver-compare', action='store_true', help='URMA resolver comparison')
     p.add_argument('--comparison-output', type=Path)
@@ -203,22 +203,25 @@ def main(argv=None):
     print(f'Summary: {summary}', flush=True)
     command = [sys.executable, '-u', str(SUPPORT / 'ubmem_smoke.py'), *common,
                '--build-dir', str(kvaf_root / 'build-npu'), '--soc', a.soc,
-               '--batches', *map(str, batches), '--token-bytes', '656']
+               '--batches', *map(str, batches), '--token-bytes', '656',
+               '--trace-rounds', str(a.trace_rounds), '--trace-output', str(run / 'trace')]
     if a.runtime_shapes:
         command.append('--runtime-shapes')
     if a.comparison_output:
         command += ['--comparison-output', str(a.comparison_output)]
     if a.comparison_sfa:
         command += ['--comparison-sfa', str(a.comparison_sfa)]
-    print('UBmem reports full-graph timing; per-stage trace is not collected.', flush=True)
+    print('UBmem stage traces use separate profiled replays outside graph timing.', flush=True)
     code = execute(command, log, a.timeout_seconds, 'ubmem')
     lines = log.read_text(errors='replace').splitlines()
     selected = [line for line in lines if line.startswith(('UBMEM_LIFETCH_PASS', 'UBMEM_SFA_PASS',
-                'UBMEM_GRAPH_EVENT_US', 'UBMEM_FETCH_COUNTS', 'UBMEM_WINDOW_TRIGGERS', 'UBMEM_RUNTIME_BINARY'))]
+                'UBMEM_GRAPH_EVENT_US', 'UBMEM_FETCH_COUNTS', 'UBMEM_WINDOW_TRIGGERS', 'UBMEM_RUNTIME_BINARY',
+                'UBMEM_TRACE'))]
     expected = len(batches) + int(a.runtime_shapes and (a.history, a.resident) != (33024, 8192))
     ok = (code == 0 and sum(line.startswith('UBMEM_LIFETCH_PASS') for line in selected) == expected
           and sum(line.startswith('UBMEM_SFA_PASS') for line in selected) == expected
-          and sum(line.startswith('UBMEM_GRAPH_EVENT_US') for line in selected) == expected)
+          and sum(line.startswith('UBMEM_GRAPH_EVENT_US') for line in selected) == expected
+          and sum(line.startswith('UBMEM_TRACE round=') for line in selected) == expected * a.trace_rounds)
     result = [f'{"PASS" if ok else "FAIL"}: transport=ubmem exit={code}', *selected]
     if not ok:
         result += ['--- worker.log tail ---', *lines[-25:]]

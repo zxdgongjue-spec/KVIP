@@ -86,6 +86,7 @@ def main(argv=None):
     parser.add_argument("--miss-percent", type=int, nargs="+", default=[10, 30, 50])
     parser.add_argument("--warmup", type=int, default=4)
     parser.add_argument("--iterations", type=int, default=20)
+    parser.add_argument("--trace-rounds", type=int, default=3)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     parser.add_argument("--output", type=Path, default=ROOT / "tests/results/ubmem-compare")
     parser.add_argument("--baseline-summary", type=Path, help="earlier matching-geometry summary.log for p50 comparison")
@@ -95,6 +96,7 @@ def main(argv=None):
         or args.iterations < 1
         or args.warmup < 0
         or args.timeout_seconds < 20
+        or args.trace_rounds < 0
         or any(not 0 <= value <= 100 for value in args.miss_percent)
     ):
         parser.error("invalid batch, miss ratio, timing count or timeout")
@@ -193,7 +195,7 @@ def main(argv=None):
                     "--prefetch-tokens",
                     "512",
                     "--trace-rounds",
-                    "3",
+                    str(args.trace_rounds),
                     "--output",
                     str(out / label),
                 ]
@@ -204,6 +206,8 @@ def main(argv=None):
                     "actual_reads native:",
                     "actual_reads prototype_with_update:",
                     "SFA_max_abs=",
+                    "CORE DEVICE TRACE:",
+                    "round=",
                 )
                 required = ("PASS: exit_code=0", "graph_p50_us=", "SFA_max_abs=")
             else:
@@ -222,15 +226,21 @@ def main(argv=None):
                     "656",
                     "--prefetch-tokens",
                     "512",
+                    "--trace-rounds", str(args.trace_rounds),
+                    "--trace-output", str(out / f"{label}-trace"),
                 ]
                 prefixes = ("UBMEM_LIFETCH_PASS", "UBMEM_GRAPH_EVENT_US", "UBMEM_SFA_PASS", "UBMEM_FETCH_COUNTS",
-                            "UBMEM_WINDOW_TRIGGERS")
+                            "UBMEM_WINDOW_TRIGGERS", "UBMEM_TRACE")
                 required = ("UBMEM_LIFETCH_PASS", "UBMEM_GRAPH_EVENT_US", "UBMEM_SFA_PASS", "UBMEM_WINDOW_TRIGGERS")
+                if args.trace_rounds:
+                    required += ("UBMEM_TRACE round=",)
             command += ["--comparison-output", str(out / f"{label}.npz"),
                         "--comparison-sfa", str(out / f"{label}-sfa.npy")]
             code = execute(command, log, args.timeout_seconds, label)
             selected = extract(log, prefixes)
             success = code == 0 and all(any(line.startswith(prefix) for line in selected) for prefix in required)
+            if transport == "ubmem" and args.trace_rounds:
+                success &= sum(line.startswith("UBMEM_TRACE round=") for line in selected) == args.trace_rounds
             record = [f"{label}: {'PASS' if success else 'FAIL'} exit={code}", *selected]
             if success and baseline:
                 pattern = (r"prototype_with_update:([\d.]+)" if transport == "urma"

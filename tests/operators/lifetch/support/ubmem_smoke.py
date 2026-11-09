@@ -83,6 +83,8 @@ def check_shape(
     iterations=0,
     comparison_output=None,
     comparison_sfa=None,
+    trace_rounds=0,
+    trace_output=None,
 ):
     batch, history, resident, token_bytes = shape.batch, shape.history, shape.resident, shape.token_bytes
     fixture = controlled_fixture(history, resident, shape.heads, miss_percent)
@@ -437,6 +439,17 @@ def check_shape(
                 "excludes=fixture_restore,native_li,verification,CPU_LRU,SFA",
                 flush=True,
             )
+            if trace_rounds:
+                from device_trace import collect_ubmem
+
+                def restore_fixture():
+                    for tensor, saved in zip(measured_buffers, initial_state):
+                        tensor.copy_(saved)
+
+                folder = trace_output / f"b{batch}-h{history}-r{resident}-w{token_bytes}"
+                collect_ubmem(torch, rotating, graph, restore_fixture,
+                              lambda: verify(list(range(1, batch + 1)), phase="profiled_replay"),
+                              trace_rounds, folder)
         graph.reset()
         graph = None
         lease.close()
@@ -486,12 +499,16 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=4)
     parser.add_argument("--iterations", type=int, default=20)
+    parser.add_argument("--trace-rounds", type=int, default=0)
+    parser.add_argument("--trace-output", type=Path)
     parser.add_argument("--comparison-output", type=Path)
     parser.add_argument("--comparison-sfa", type=Path)
     parser.add_argument("--runtime-shapes", action="store_true", help="Also check a second history/hot shape with the same binary")
     args = parser.parse_args()
-    if args.warmup < 0 or args.iterations < 0:
-        parser.error("warmup/iterations must be non-negative")
+    if args.warmup < 0 or args.iterations < 0 or args.trace_rounds < 0:
+        parser.error("warmup/iterations/trace-rounds must be non-negative")
+    if args.trace_rounds and (not args.iterations or args.trace_output is None):
+        parser.error("trace-rounds requires iterations and trace-output")
     if not 0 <= args.miss_percent <= 100:
         parser.error("miss-percent must be in 0..100")
     import kvaf
@@ -534,6 +551,8 @@ def main():
                 args.iterations,
                 args.comparison_output,
                 args.comparison_sfa,
+                args.trace_rounds,
+                args.trace_output,
             )
 
 

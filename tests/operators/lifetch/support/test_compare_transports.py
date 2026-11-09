@@ -40,7 +40,9 @@ def test_runner_requires_checked_completion_for_both_backends(tmp_path, monkeypa
         elif label.startswith("urma"):
             log.write_text("PASS: exit_code=0\ngraph_p50_us=native_chain:100\nSFA_max_abs=0.001\n")
         else:
-            log.write_text("UBMEM_LIFETCH_PASS\nUBMEM_GRAPH_EVENT_US p50=100\nUBMEM_SFA_PASS\nUBMEM_WINDOW_TRIGGERS tokens=[16384]\n")
+            log.write_text("UBMEM_LIFETCH_PASS\nUBMEM_GRAPH_EVENT_US p50=100\nUBMEM_SFA_PASS\n"
+                           "UBMEM_WINDOW_TRIGGERS tokens=[16384]\n"
+                           + "".join(f"UBMEM_TRACE round={i} resolve_us=10 fetch_us=20\n" for i in range(3)))
         return 0
 
     monkeypatch.setattr(compare, "execute", fake_execute)

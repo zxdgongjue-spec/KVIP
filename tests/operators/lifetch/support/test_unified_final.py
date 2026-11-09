@@ -2,7 +2,24 @@
 import subprocess
 from pathlib import Path
 
+from device_trace import account_ubmem
+
 ROOT = Path(__file__).resolve().parents[4]
+
+
+def test_ubmem_trace_distinguishes_inline_and_separate_fetch():
+    events = [{"name": "replay", "ph": "X", "ts": "1000.0", "dur": 100.0}]
+    names = ("init", "li", "resolve", "fetch", "complete")
+    events += [{"name": f"kvip_ubmem_656_{name}_kernel_0", "ph": "X", "ts": str(1001 + 10 * i),
+                "dur": 5.0} for i, name in enumerate(names)]
+    events += [{"name": f"kvip_ubmem_direct_{name}_kernel_0", "ph": "X", "ts": str(1052 + 8 * i),
+                "dur": 4.0} for i, name in enumerate(("update_owned", "update_outputs", "apply_owned"))]
+    result = account_ubmem(events, "replay", 90)
+    assert result["fetch_separate"] and result["stages_us"]["resolve"] == 5
+    assert result["stages_us"]["fetch"] == 5 and result["stages_us"]["update"] == 12
+    old = account_ubmem([event for event in events if "_fetch_kernel" not in event["name"]], "replay", 90)
+    assert not old["fetch_separate"] and old["stages_us"]["fetch"] == 0
+    assert "error" in account_ubmem([event for event in events if "_resolve_kernel" not in event["name"]], "replay", 90)
 
 
 def test_ubmem_final_uses_published_compact_descriptors(tmp_path):

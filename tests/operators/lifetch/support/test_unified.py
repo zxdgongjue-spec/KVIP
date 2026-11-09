@@ -31,7 +31,8 @@ def test_ubmem_requires_correctness_and_timing_markers(monkeypatch, tmp_path):
     commands = []
     def fake(command, log, timeout, label):
         commands.append(command)
-        log.write_text('UBMEM_LIFETCH_PASS\nUBMEM_SFA_PASS\nUBMEM_GRAPH_EVENT_US p50=1\n')
+        log.write_text('UBMEM_LIFETCH_PASS\nUBMEM_SFA_PASS\nUBMEM_GRAPH_EVENT_US p50=1\n'
+                       + ''.join(f'UBMEM_TRACE round={i} resolve_us=10 fetch_us=20\n' for i in range(3)))
         return 0
     monkeypatch.setattr(module, 'execute', fake)
     args = ['--transport', 'ubmem', '--kvaf-server', 'host:1', '--kvaf-root', str(tmp_path),
