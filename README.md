@@ -130,12 +130,10 @@ The CPU service manages memory placement; worker-local allocation, THP and NUMA
 settings from the earlier local-DDR prototype are not part of this path. URMA
 remains the default build.
 
-The serial vLLM path uses native LI/LIDU followed by KVAF UBmem BatchGet;
-`decode_backend=li_fetch` selects the independent UBmem LI/TopK/Fetch/Index-update
-pipeline. Both use UBmem BatchPut and the same CPU-service DDR region. Shared Indexer
-layers fetch the complete grouped record (656 or 2624 bytes), so the following
-layers reuse the fetched payload. UBmem retains its own copy scheduling and
-completion checks while reusing the transport-independent algorithms above.
+The UBmem single-operator path uses the CPU-service DDR region and the existing
+KVAF BatchPut and BatchGet transport. Fused LIFetch retains its own copy scheduling
+and completion checks while reusing the transport-independent algorithms above.
+vLLM integration with this CPU-service-backed interface has not yet been validated.
 
 The original LIDU build uses its own `csrc/operators/lidu/build` directory.
 
