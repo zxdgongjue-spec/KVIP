@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Bind static UBmem kernels to a retained KVAF mapping and service storage."""
+"""Bind runtime-shaped UBmem kernels to a retained KVAF mapping and service storage."""
 
 import ctypes
 

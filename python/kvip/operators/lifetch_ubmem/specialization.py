@@ -64,7 +64,7 @@ def kvaf_cann(build_dir):
 def build_specialization(*, cache_dir, cann, shape, jobs=2):
     """Compile once before profiling/capture; never called by forward."""
     if not isinstance(shape, Specialization) or jobs < 1:
-        raise ValueError("A validated UBmem specialization and positive jobs are required")
+        raise ValueError("A validated UBmem shape and positive jobs are required")
     source = Path(__file__).resolve().parents[4] / "csrc/operators/lightning_indexer_with_fetch_ubmem"
     if not (source / "CMakeLists.txt").is_file():
         raise FileNotFoundError(f"UBmem fusion sources unavailable: {source}")
