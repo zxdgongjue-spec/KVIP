@@ -273,6 +273,7 @@ def main():
     parser.add_argument("--soc", required=True)
     parser.add_argument("--batches", type=int, nargs="+", default=[1, 2])
     parser.add_argument("--token-bytes", type=int, nargs="+", default=[656, 2624])
+    parser.add_argument("--index-heads", type=int, choices=(32, 64), default=32)
     parser.add_argument("--history", type=int, default=33024)
     parser.add_argument("--resident", type=int, default=8192)
     parser.add_argument("--prefetch-tokens", type=int, nargs="+", default=[512])
@@ -291,7 +292,7 @@ def main():
     aics = query_device_resources(cann, args.device)["effective_aic"]
     for batch in args.batches:
         for token_bytes in args.token_bytes:
-            shape = Specialization(batch, args.history, args.resident, 64, token_bytes, aics, 8, args.soc)
+            shape = Specialization(batch, args.history, args.resident, args.index_heads, token_bytes, aics, 8, args.soc)
             library = build_specialization(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape)
             for prefetch_tokens in args.prefetch_tokens:
                 check_shape(kvaf, torch, build, args.device, shape, library, prefetch_tokens, args.kvaf_server)
