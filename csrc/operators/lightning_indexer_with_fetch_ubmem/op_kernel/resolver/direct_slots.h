@@ -138,8 +138,9 @@ inline void GatherVictimScores(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* output,
 
 namespace rotating {
 __aicore__ inline uint32_t PhysicalSlotScalar(__gm__ Context* ctx,uint32_t batch,uint32_t slot) {
-    return ctx->lruSlots && uint32_t(slot-SIM_RESIDENT)<kLruSlots ?
-        reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)[batch*kLruSlots+slot-SIM_RESIDENT] : slot;
+    uint32_t resident=ctx->shape.resident;
+    return ctx->lruSlots && uint32_t(slot-resident)<kLruSlots ?
+        reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)[batch*kLruSlots+slot-resident] : slot;
 }
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void RestoreVictimTokens(__ubuf__ uint32_t* ids,__gm__ uint32_t* victims,uint32_t count) {

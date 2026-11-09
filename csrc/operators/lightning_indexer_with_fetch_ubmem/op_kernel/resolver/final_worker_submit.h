@@ -9,7 +9,8 @@ __aicore__ inline void PublishFinalWorker(__gm__ Context* ctx,__gm__ Row* row,
     uint32_t b,uint32_t w,uint32_t own,uint32_t batchCount,uint32_t descriptor,uint32_t error,
     LocalTensor<uint32_t> local,LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,
     LocalTensor<uint32_t> slots,LocalTensor<uint32_t> ctl) {
-    auto post=FinalPostAt(ctx,b*kFinalWorkers+w);
+    const auto shape=LoadRuntimeShape(ctx);
+    auto post=FinalPostAt(ctx,b*shape.finalWorkers+w);
     // Resolve may fail before constructing the slot/address vectors. Publish
     // that error without reading uninitialized UB, even when batchCount is set.
     if(error) {
@@ -28,7 +29,7 @@ __aicore__ inline void PublishFinalWorker(__gm__ Context* ctx,__gm__ Row* row,
     // AIVs from overwriting opposite halves of an unaligned KV row boundary.
     for(uint32_t rank=0;rank<batchCount;++rank) {
         uint32_t slot=slots.GetValue(rank);
-        if(UbmemDestinationOwner(slot,kFinalWorkers)!=w)continue;
+        if(UbmemDestinationOwner(slot,shape.finalWorkers)!=w)continue;
         ++scheduled;
         if(error)continue;
         uint64_t peer=uint64_t(remoteLow.GetValue(rank)) | (uint64_t(remoteHigh.GetValue(rank))<<32);

@@ -541,8 +541,8 @@ int main(){
                 "V9_FINAL_REPLICATED=1",
             )
         ]
-        source = source.replace("r=trial%2?16384:8192", "r=SIM_RESIDENT")
         source = source.replace("ReplicatedResolve<1>(h,r,workers,656,", "ReplicatedResolve<1>(")
+        source = source.replace("&total,w,used,0,&ctx);", "&total,w,used,0,&ctx,h,r,workers,656);")
         begin = source.index("   assert(cfg[5]<=cfg[3]);")
         end = source.index("   std::copy(locations.begin()", begin)
         source = source[:begin] + source[end:]
