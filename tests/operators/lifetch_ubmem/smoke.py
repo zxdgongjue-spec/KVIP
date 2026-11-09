@@ -59,6 +59,14 @@ def controlled_fixture(history, resident, heads, miss_percent):
     return data
 
 
+def mixed_query_counts(batch):
+    """Exercise Q1-Q4 and one inactive row in the same graph replay."""
+    counts = [1 + row % 4 for row in range(batch)]
+    if batch >= 5:
+        counts[-1] = 0
+    return counts
+
+
 def check_shape(
     kvaf,
     torch,
@@ -206,6 +214,8 @@ def check_shape(
             counts = [4] * len(owners) if counts is None else counts
             output_row = 0
             for owner, count in zip(owners, counts):
+                if not count:
+                    continue
                 assert np.array_equal(np.sort(ids[owner]), np.arange(history)), "Index ownership is not a permutation"
                 assert np.array_equal(addresses[owner], original_addresses[owner, ids[owner]]), (
                     "Index addresses detached"
@@ -223,8 +233,8 @@ def check_shape(
                         f"Hot slot/Index mismatch: phase={phase} owner={owner} "
                         f"slot={hot_slots[difference[0]]} byte={difference[1]}"
                     )
-                for _ in range(count):
-                    assert np.array_equal(np.sort(logical[output_row]), expected_ids[output_row % 4]), (
+                for query in range(count):
+                    assert np.array_equal(np.sort(logical[output_row]), expected_ids[query]), (
                         "LI selected the wrong TopK set"
                     )
                     selected_slots = torch.from_numpy(slots[output_row].astype(np.int64)).to(device)
@@ -362,16 +372,19 @@ def check_shape(
         workspace.inputs.query_ends.fill_(history)
         graph.replay(stream)
         verify(owners, phase="graph_replay")
-        if batch == 2:
-            # Compact TND output row 1..4 belongs to the second packed request;
-            # output block number is not its producer/status block number.
-            counts = [1, 4]
-            workspace.inputs.prepare(counts, query_owners=owners)
-            workspace.inputs.query_ends.view(batch, 4).copy_(
-                torch.tensor([[history, 0, 0, 0], [history] * 4], dtype=torch.int32, device=device)
-            )
-            graph.replay(stream)
-            verify(owners, phase="packed_queries", counts=counts)
+        # Compact TND outputs no longer have the fixed four-row stride of
+        # their source request. Exercise all Q1..Q4 lengths at the requested
+        # batch, including an inactive/padded row when the batch permits it.
+        counts = mixed_query_counts(batch)
+        packed_owners = [owner if count else 0 for owner, count in zip(owners, counts)]
+        workspace.inputs.prepare(counts, query_owners=packed_owners)
+        ends = torch.tensor(
+            [[history if q < count else 0 for q in range(4)] for count in counts],
+            dtype=torch.int32, device=device,
+        )
+        workspace.inputs.query_ends.view(batch, 4).copy_(ends)
+        graph.replay(stream)
+        verify(packed_owners, phase="packed_queries", counts=counts)
         # All-padding warmup is legal: owner zero can repeat in inactive rows.
         workspace.inputs.prepare([0] * batch, query_owners=[0] * batch)
         workspace.inputs.query_ends.zero_()

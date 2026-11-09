@@ -225,3 +225,13 @@ def test_shared_q4_fixture_topk_and_lru_match_urma():
     assert payload(1, np.arange(3), 656).shape == (3, 656)
     assert payload(1, np.arange(3), 2624).shape == (3, 2624)
     np.testing.assert_array_equal(payload(1, np.arange(3), 2624)[:, :656], payload(1, np.arange(3), 656))
+
+
+def test_mixed_query_counts_cover_padding_and_query_lengths():
+    from smoke import mixed_query_counts
+
+    assert mixed_query_counts(2) == [1, 2]
+    counts = mixed_query_counts(16)
+    assert counts[:4] == [1, 2, 3, 4]
+    assert counts[-1] == 0
+    assert set(counts) == {0, 1, 2, 3, 4}
