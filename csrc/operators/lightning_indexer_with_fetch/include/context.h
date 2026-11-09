@@ -18,6 +18,7 @@ struct alignas(128) Row {
     uint32_t slots, requests, suppressed, error;
     uint32_t consumed[4];
     uint32_t epochCount[kMaxRounds], epochSuppressed[kMaxRounds];
+    // Sequence split stores S0 in consumed and the post-window S1 cursor here.
     uint32_t snapshot[kMaxRounds][4];
     uint32_t limit, prefetchLimit, queueLimit, pending;
     uint64_t initialHead;
@@ -104,16 +105,12 @@ V9_DEVICE inline uint32_t SequenceHalfWindow(const RuntimeShape& s) {
     return (s.history - s.resident) / (2 * (s.rounds - 1));
 }
 
-// A raw end is the last published tile end on that shard. Extend a shard's
-// frontier over its sibling's interval only after its own interval is done.
-V9_DEVICE inline uint32_t SequenceReadyEnd(uint32_t low, uint32_t high,
-                                          uint32_t resident, uint32_t history, uint32_t half) {
-    // The threshold phase has already completed the hot interval for all Qs.
-    if (low < resident) low = resident;
-    uint32_t width = 2 * half;
-    if ((low - resident) % width == half) low += half;
-    if (high <= resident) high = resident + half;
-    else if (high < history && (high - resident) % width == 0) high += half;
-    return low < high ? low : high;
+struct SequenceSlice { uint32_t shard, end; };
+
+// Hot predicates belong to the shared prefix; cold halves alternate in S2.
+V9_DEVICE inline SequenceSlice SequenceSliceAt(uint32_t token, uint32_t resident, uint32_t half) {
+    if (token < resident) return {0, resident};
+    uint32_t index = (token - resident) / half;
+    return {index % 2, resident + (index + 1) * half};
 }
 }

@@ -692,13 +692,19 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
         for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes)for(uint32_t q=0;q<4;++q) {
             uint32_t progress=(b/rt_serviceLanes)*128+q*32;
             uint32_t end=work.GetValue(progress),cap=Trigger(rt_history,rt_resident,rt_rounds,epoch)*128;
-            if(sequenceHalfWindow)
-                end=SequenceReadyEnd(end,work.GetValue(progress+16),rt_resident,rt_history,sequenceHalfWindow);
             if(ctx->queryEnds) {
                 auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds);
                 uint32_t valid=bounds[b*4+q];
                 if(ctx->lruSlots && valid<rt_resident)valid=rt_resident;
                 if(cap>valid)cap=valid;
+            }
+            if(sequenceHalfWindow) {
+                // A separate hot phase has already published the hot bitmap.
+                if(end<rt_resident)end=rt_resident;
+                uint32_t high=work.GetValue(progress+16);
+                // Split-Q geometry limits the batch to 16, leaving this band
+                // disjoint from both the low snapshot and batched post input.
+                cfg.SetValue(192+b*4+q,high<cap?high:cap);
             }
             cfg.SetValue(128+b*4+q,end<cap?end:cap);
         }
@@ -732,20 +738,32 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         const uint64_t entityAddress=state64.GetValue(0),queueAddress=state64.GetValue(1);
         const uint64_t addresses=state64.GetValue(2),output=state64.GetValue(3);
         const uint32_t lower=ctx->lruSlots?0:rt_resident;
-        uint32_t end[4],first=rt_history,last=lower;
-        for(uint32_t q=0;q<4;++q) {
-            uint32_t saved=cfg.GetValue(128+b*4+q);
-            end[q]=saved>state.GetValue(12+q)?saved:state.GetValue(12+q);
-            uint32_t lo=state.GetValue(12+q)>lower?state.GetValue(12+q):lower;
-            if(lo<first)first=lo;if(end[q]>last)last=end[q];
+        const uint32_t shards=sequenceHalfWindow?2:1;
+        uint32_t consumed[2][4]{},begin[2][4]{},end[2][4]{};
+        uint32_t readyBegin[2]{},readyEnd[2]{};
+        uint32_t first=rt_history,last=lower;
+        bool aggregate=true;
+        for(uint32_t shard=0;shard<shards;++shard) {
+            uint32_t shardLower=shard?rt_resident+sequenceHalfWindow:lower;
+            readyBegin[shard]=rt_history;readyEnd[shard]=shardLower;
+            for(uint32_t q=0;q<4;++q) {
+                uint32_t prior=shard?(epoch?state.GetValue(80+(epoch-1)*4+q):0):state.GetValue(12+q);
+                uint32_t saved=cfg.GetValue(128+64*shard+b*4+q);
+                consumed[shard][q]=prior;
+                begin[shard][q]=prior>shardLower?prior:shardLower;
+                end[shard][q]=saved>prior?saved:prior;
+                if(begin[shard][q]<readyBegin[shard])readyBegin[shard]=begin[shard][q];
+                if(end[shard][q]>readyEnd[shard])readyEnd[shard]=end[shard][q];
+            }
+            if(readyBegin[shard]>=readyEnd[shard])continue;
+            if(readyBegin[shard]<first)first=readyBegin[shard];
+            if(readyEnd[shard]>last)last=readyEnd[shard];
+            if(readyBegin[shard]%128 || readyEnd[shard]%128)aggregate=false;
+            for(uint32_t q=0;q<4;++q)
+                if(begin[shard][q]!=readyBegin[shard] || end[shard][q]!=readyEnd[shard])aggregate=false;
         }
         V9_FETCH_PROFILE(uint64_t scanBegin=GetSystemCycle();)
         uint32_t candidateCount=0,stop=last,wordCount=0;
-        bool aggregate=first%128==0 && last%128==0;
-        for(uint32_t q=0;q<4;++q) {
-            uint32_t consumed=state.GetValue(12+q);if(consumed<lower)consumed=lower;
-            if(consumed!=first || end[q]!=last)aggregate=false;
-        }
         GlobalTensor<uint8_t> bitmap;
         bitmap.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(ctx->hits)+b*rt_history);
         for(uint32_t base=(first/128)*128;first<last && base<last;) {
@@ -754,7 +772,22 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
             if(ctx->lruSlots && base>=kLruSlots && base<rt_resident) {
                 base=rt_resident;continue;
             }
-            uint32_t span=((last-base+127)/128)*128;
+            uint32_t shard=0,scanEnd=last;
+            if(sequenceHalfWindow) {
+                auto slice=SequenceSliceAt(base,rt_resident,sequenceHalfWindow);
+                shard=slice.shard;
+                // Traverse absolute token order, but skip each shard's holes
+                // independently before applying the shared candidate budget.
+                if(readyBegin[shard]>=readyEnd[shard] || base>=readyEnd[shard]) {
+                    base=slice.end;continue;
+                }
+                uint32_t alignedBegin=(readyBegin[shard]/128)*128;
+                if(base<alignedBegin) {
+                    base=alignedBegin<slice.end?alignedBegin:slice.end;continue;
+                }
+                scanEnd=readyEnd[shard]<slice.end?readyEnd[shard]:slice.end;
+            }
+            uint32_t span=((scanEnd-base+127)/128)*128;
             if(span>rt_scanTokens)span=rt_scanTokens;
             if(ctx->lruSlots && base<kLruSlots && span>kLruSlots-base)span=kLruSlots-base;
             if(aggregate) {
@@ -766,9 +799,8 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
             // half-tile cursor, which is masked on the next service.
             bool full=true;
             for(uint32_t q=0;q<4;++q) {
-                uint32_t lo=state.GetValue(12+q)>base?state.GetValue(12+q)-base:0;
-                if(base<lower && lo<lower-base)lo=lower-base;
-                uint32_t hi=end[q]>base?end[q]-base:0;
+                uint32_t lo=begin[shard][q]>base?begin[shard][q]-base:0;
+                uint32_t hi=end[shard][q]>base?end[shard][q]-base:0;
                 cfg.SetValue(28+q,lo<span?lo:span);cfg.SetValue(24+q,hi<span?hi:span);
                 if(lo || hi<span)full=false;
 #if V9_PARTIAL_SCAN_SIMD
@@ -884,9 +916,14 @@ if (rt_batchedRows) {
         state.SetValue(10,state.GetValue(10)+missing-count);
         state.SetValue(8,slots);state.SetValue(9,requests);state.SetValue(211,pending);
         for(uint32_t q=0;q<4;++q) {
-            uint32_t processed=end[q]<stop?end[q]:stop;
-            if(processed<state.GetValue(12+q))processed=state.GetValue(12+q);
-            state.SetValue(80+epoch*4+q,processed);state.SetValue(12+q,processed);
+            uint32_t processed=end[0][q]<stop?end[0][q]:stop;
+            if(processed<consumed[0][q])processed=consumed[0][q];
+            state.SetValue(12+q,processed);
+            if(sequenceHalfWindow) {
+                processed=end[1][q]<stop?end[1][q]:stop;
+                if(processed<consumed[1][q])processed=consumed[1][q];
+            }
+            state.SetValue(80+epoch*4+q,processed);
         }
         if(!rt_batchedRows) {
             SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
