@@ -46,65 +46,14 @@ inline void ReplicatedResolve(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc
 
 __aicore__ inline void ReplicatedFinal(__gm__ Context* ctx) {
     const auto shape=LoadRuntimeShape(ctx);
-    const uint32_t core=GetBlockIdx(),b=core/shape.finalWorkers,w=core%shape.finalWorkers;
-    auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
-    auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
-    auto trace=reinterpret_cast<__gm__ uint64_t*>(ctx->owners)+b*16;
-    uint64_t started=GetSystemCycle();
-    TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,kFinalScratchBytes);auto local=scratch.Get<uint32_t>();
-    auto selected=local,loc=local[kSlots],keys=local[2*kSlots],ranks=local[3*kSlots];
-    auto ids=local[4*kSlots].ReinterpretCast<uint16_t>();
-    auto slots=local[kFinalSlotsOffset],positions=local[kFinalPositionsOffset],ctl=local[kFinalControlOffset];
-    GlobalTensor<uint32_t> input,output;input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->selected)+b*kSlots);
-    output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*kSlots);
-    DataCopy(selected,input,kSlots);SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-    if(shape.resident<=2*kSlots) {
-        static_assert(6*kSlots<=kFinalControlOffset,"metadata staging overlaps resolver control");
-        // Hash/ID/slot scratch is not live yet. Reuse it for two dense metadata
-        // rows; release it before ColdPositions and the original resolver.
-        GlobalTensor<uint32_t> metadata;
-        uint32_t owner=ctx->rowOwners ? reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b] : b;
-        if(ctx->hotValid) {
-            metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+owner*shape.resident);
-            DataCopy(keys,metadata,shape.resident);
-        }
-        if(ctx->reservedHot) {
-            metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->reservedHot)+b*shape.resident);
-            DataCopy(local[4*kSlots],metadata,shape.resident);
-        }
-        uint32_t begin=0,end=0;
-        if(ctx->tailBounds) {
-            auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds)+b*2;
-            begin=bounds[0];end=bounds[1];
-        }
-        SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-        Simt::VF_CALL<AdaptColdPredicateLocal>(Simt::Dim3{512,1,1},shape.resident,FinalPtr(selected),FinalPtr(loc),
-            FinalPtr(keys),reinterpret_cast<__ubuf__ int32_t*>(local[4*kSlots].GetPhyAddr()),
-            ctx->hotValid!=0,ctx->reservedHot!=0,begin,end);
-        PipeBarrier<PIPE_V>();
-        ColdPositions(shape.history,shape.resident,FinalPtr(loc),FinalPtr(loc),FinalPtr(positions),FinalPtr(ctl[2048]));
-    } else {
-        // Larger supported resident layouts cannot hold both rows in this UB.
-        Simt::VF_CALL<AdaptColdPredicate>(Simt::Dim3{512,1,1},shape.resident,ctx,b,FinalPtr(selected),FinalPtr(keys));
-        PipeBarrier<PIPE_V>();
-        ColdPositions(shape.history,shape.resident,FinalPtr(keys),FinalPtr(loc),FinalPtr(positions),FinalPtr(ctl[2048]));
-    }
-    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-    uint32_t cold=ctl.GetValue(2048),error=ctl.GetValue(2056)|row->error|(row->slots>kSlots?32U:0U);
-
-    if(!w){trace[0]=started;trace[1]=GetSystemCycle();}
+    const uint32_t rt_history=shape.history,rt_resident=shape.resident,rt_finalWorkers=shape.finalWorkers;
+#include "../../../common/lifetch/resolver_front.h"
     if(!error)Simt::VF_CALL<ReplicatedResolve<512>>(Simt::Dim3{512,1,1},FinalPtr(selected),FinalPtr(loc),FinalPtr(positions),cold,
         FinalPtr(keys),FinalPtr(ranks),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(ctl),
         reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*shape.history,reinterpret_cast<__gm__ uint64_t*>(row->addresses),
         reinterpret_cast<__gm__ int32_t*>(ctx->sourceBlocks),reinterpret_cast<__gm__ int32_t*>(ctx->sourceOffsets),
         reinterpret_cast<__gm__ int32_t*>(ctx->destinations),reinterpret_cast<__gm__ uint32_t*>(ctx->count),w,row->slots,b,ctx,shape.history,shape.resident,shape.finalWorkers,shape.tokenBytes);
-    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-    uint32_t batchCount=error?0:ctl.GetValue(0),prefix=error?0:ctl.GetValue(2),own=error?0:ctl.GetValue(3),batchBase=b*kSlots;
-    if(!error)error=ctl.GetValue(1);
-    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-    DataCopy(output[w*(kSlots/shape.finalWorkers)],loc[w*(kSlots/shape.finalWorkers)],kSlots/shape.finalWorkers);
-    SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
-    if(!w)trace[2]=GetSystemCycle();
+#include "../../../common/lifetch/resolver_output.h"
     PublishFinalWorker(ctx,row,b,w,own,batchCount,batchBase+prefix,error,local,keys,ranks,slots,ctl);
     if(!w){
         status[0]=error;status[1]=batchCount;status[2]=batchBase;status[3]=0;status[4]=0;

@@ -35,24 +35,7 @@ __aicore__ inline void PrepareFinalFetch(uint32_t rt_finalWorkers,uint32_t rt_fi
 
 // Imported from final_scratch.h
 
-#include <cstdint>
-#ifndef V9_USER_UB_BYTES
-#error "V9_USER_UB_BYTES must match the compiler user-reserved-ub-size option"
-#endif
-namespace rotating {
-// Six uint32 banks, one uint16 first-occurrence-position bank, and control.
-// Storing a TopK position (0..8191) instead of its token saves 16 KiB without
-// narrowing token IDs. Recover tokens from selected[position] at address gather.
-constexpr uint32_t kFinalSlotsOffset = 4 * 8192 + 4096;
-constexpr uint32_t kFinalPositionsOffset = kFinalSlotsOffset + 8192;
-constexpr uint32_t kFinalControlOffset = kFinalPositionsOffset + 8192;
-constexpr uint32_t kFinalScratchWords = kFinalControlOffset + 2560;
-constexpr uint32_t kFinalScratchBytes = kFinalScratchWords * sizeof(uint32_t);
-static_assert(kFinalScratchBytes <= V9_USER_UB_BYTES,
-              "final scratch exceeds the compiler user UB reservation");
-static_assert(V9_USER_UB_BYTES + 6144 <= 229376,
-              "user plus CANN 9.1 compiler UB exceeds the SIMT limit");
-}
+#include "../../common/lifetch/final_scratch.h"
 
 namespace rotating {
 // Every worker independently builds the same rank/slot plan from immutable
@@ -120,65 +103,13 @@ inline void ReplicatedResolve(uint32_t rt_history,uint32_t rt_resident,uint32_t 
     asc_threadfence();
 }
 __aicore__ inline void ReplicatedFinal(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,uint32_t rt_tokenBytes,__gm__ Context* ctx) {
-    const uint32_t core=GetBlockIdx(),b=core/rt_finalWorkers,w=core%rt_finalWorkers;
-    auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
-    auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
-    auto trace=reinterpret_cast<__gm__ uint64_t*>(ctx->owners)+b*16;
-    uint64_t started=GetSystemCycle();
-    TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,kFinalScratchBytes);auto local=scratch.Get<uint32_t>();
-    auto selected=local,loc=local[kSlots],keys=local[2*kSlots],ranks=local[3*kSlots];
-    auto ids=local[4*kSlots].ReinterpretCast<uint16_t>();
-    auto slots=local[kFinalSlotsOffset],positions=local[kFinalPositionsOffset],ctl=local[kFinalControlOffset];
-    GlobalTensor<uint32_t> input,output;input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->selected)+b*kSlots);
-    output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*kSlots);
-    DataCopy(selected,input,kSlots);SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-    if(rt_resident<=2*kSlots) {
-        static_assert(6*kSlots<=kFinalControlOffset,"metadata staging overlaps resolver control");
-        // Hash/ID/slot scratch is not live yet. Reuse it for two dense metadata
-        // rows; release it before ColdPositions and the original resolver.
-        GlobalTensor<uint32_t> metadata;
-        uint32_t owner=ctx->rowOwners ? reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b] : b;
-        if(ctx->hotValid) {
-            metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+owner*rt_resident);
-            DataCopy(keys,metadata,rt_resident);
-        }
-        if(ctx->reservedHot) {
-            metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->reservedHot)+b*rt_resident);
-            DataCopy(local[4*kSlots],metadata,rt_resident);
-        }
-        uint32_t begin=0,end=0;
-        if(ctx->tailBounds) {
-            auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds)+b*2;
-            begin=bounds[0];end=bounds[1];
-        }
-        SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-        Simt::VF_CALL<AdaptColdPredicateLocal>(Simt::Dim3{512,1,1},rt_resident,FinalPtr(selected),FinalPtr(loc),
-            FinalPtr(keys),reinterpret_cast<__ubuf__ int32_t*>(local[4*kSlots].GetPhyAddr()),
-            ctx->hotValid!=0,ctx->reservedHot!=0,begin,end);
-        PipeBarrier<PIPE_V>();
-        ColdPositions(rt_history,rt_resident,FinalPtr(loc),FinalPtr(loc),FinalPtr(positions),FinalPtr(ctl[2048]));
-    } else {
-        // Larger supported resident layouts cannot hold both rows in this UB.
-        Simt::VF_CALL<AdaptColdPredicate>(Simt::Dim3{512,1,1},rt_resident,ctx,b,FinalPtr(selected),FinalPtr(keys));
-        PipeBarrier<PIPE_V>();
-        ColdPositions(rt_history,rt_resident,FinalPtr(keys),FinalPtr(loc),FinalPtr(positions),FinalPtr(ctl[2048]));
-    }
-    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-    uint32_t cold=ctl.GetValue(2048),error=ctl.GetValue(2056)|row->error|(row->slots>kSlots?32U:0U);
-
-    if(!w){trace[0]=started;trace[1]=GetSystemCycle();}
+#include "../../common/lifetch/resolver_front.h"
     if(!error)Simt::VF_CALL<ReplicatedResolve<512>>(Simt::Dim3{512,1,1},rt_history,rt_resident,rt_finalWorkers,rt_tokenBytes,FinalPtr(selected),FinalPtr(loc),FinalPtr(positions),cold,
         FinalPtr(keys),FinalPtr(ranks),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(ctl),
         reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history,reinterpret_cast<__gm__ uint64_t*>(row->addresses),
         reinterpret_cast<__gm__ int32_t*>(ctx->sourceBlocks),reinterpret_cast<__gm__ int32_t*>(ctx->sourceOffsets),
         reinterpret_cast<__gm__ int32_t*>(ctx->destinations),reinterpret_cast<__gm__ uint32_t*>(ctx->count),w,row->slots,b,ctx);
-    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-    uint32_t batchCount=error?0:ctl.GetValue(0),prefix=error?0:ctl.GetValue(2),own=error?0:ctl.GetValue(3),batchBase=b*kSlots;
-    if(!error)error=ctl.GetValue(1);
-    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-    DataCopy(output[w*(kSlots/rt_finalWorkers)],loc[w*(kSlots/rt_finalWorkers)],kSlots/rt_finalWorkers);
-    SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
-    if(!w)trace[2]=GetSystemCycle();
+#include "../../common/lifetch/resolver_output.h"
     PrepareFinalFetch(rt_finalWorkers,rt_finalPostOffset,ctx,b,w,own,batchBase+prefix,error,error?0:ctl.GetValue(5));
     if(!w){
         status[0]=error;status[1]=batchCount;status[2]=batchBase;status[3]=0;status[4]=0;
