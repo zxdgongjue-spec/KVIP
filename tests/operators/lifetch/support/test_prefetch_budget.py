@@ -61,6 +61,11 @@ def test_shared_hot_selector_invalidates_specialization_cache(tmp_path, monkeypa
     source = repo / "csrc/operators/lightning_indexer_with_fetch_ubmem"
     source.mkdir(parents=True)
     (source / "CMakeLists.txt").write_text("# fixture\n")
+    shared = source.parent / "lightning_indexer_with_fetch"
+    for name in ("op_kernel/indexer/indexer.h", "op_kernel/index_cache_update.h", "include/runtime_shape.h"):
+        path = shared / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(name)
     selector = source.parent / "lidu/op_kernel/hot_slot_selection.h"
     selector.parent.mkdir(parents=True)
     selector.write_text("// first algorithm\n")
@@ -97,6 +102,9 @@ def test_shared_hot_selector_invalidates_specialization_cache(tmp_path, monkeypa
     (include / "fused_batch_get_device.h").write_text("// updated device entry\n")
     updated = specialization.build_ubmem_library(**options)
     assert updated != new and len(calls) == 6
+    (shared / "op_kernel/indexer/indexer.h").write_text("// changed shared indexer\n")
+    rebuilt = specialization.build_ubmem_library(**options)
+    assert rebuilt != updated and len(calls) == 8
 
 
 def test_service_chunk_assignment_covers_every_request_once(tmp_path):

@@ -2,6 +2,10 @@
 """Host checks for the fusion lease and static-shape contract; no NPU required."""
 
 import ctypes
+from pathlib import Path
+import shutil
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -11,6 +15,13 @@ import pytest
 from kvip.adapters.kvaf import UbmemLease
 from kvip.operators.lifetch_ubmem.build import UbmemGeometry
 from kvip.operators.lifetch.workspace import UbmemQueryInputs, UbmemWorkspace, device_words, ubmem_rotation_spec as rotation_spec
+
+
+def test_host_copy_and_launch_models():
+    if shutil.which("c++") is None:
+        pytest.skip("C++ compiler unavailable")
+    script = Path(__file__).parent / "host_ubmem/run_host_models.py"
+    subprocess.run([sys.executable, str(script)], check=True, timeout=180)
 
 
 def lease_fixture(token_bytes=656):

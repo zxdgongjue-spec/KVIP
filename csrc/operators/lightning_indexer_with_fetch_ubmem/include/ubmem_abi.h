@@ -34,10 +34,5 @@ V9_ADDRESS_FN inline bool UbmemTranslate(uint64_t peerBase, uint64_t mappedBase,
     mapped = mappedBase + offset;
     return true;
 }
-V9_ADDRESS_FN inline uint32_t UbmemDestinationOwner(uint32_t slot, uint32_t workers) {
-    // 656-byte rows share a 32-byte GM sector in pairs. Both partial writes
-    // must be issued by the same AIV, including noncontiguous recycled slots.
-    return (slot >> 1) % workers;
-}
 #undef V9_ADDRESS_FN
 }

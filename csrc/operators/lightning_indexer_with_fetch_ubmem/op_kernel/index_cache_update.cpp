@@ -6,7 +6,7 @@
   #include "simt_api/device_atomic_functions.h"
   #include "simt_api/device_sync_functions.h"
   #include "simt_api/device_warp_functions.h"
-  #include "../../common/lifetch/index_cache_update.h"
+  #include "../../lightning_indexer_with_fetch/op_kernel/index_cache_update.h"
   #include "ubmem_abi.h"
 using namespace AscendC;
 namespace {

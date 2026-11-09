@@ -177,7 +177,8 @@ def main(argv=None):
                 command = [
                     sys.executable,
                     "-u",
-                    str(ROOT / "tests/operators/lifetch/support/test_urma_runner.py"),
+                    str(ROOT / "tests/operators/lifetch/test_lifetch.py"),
+                    "--transport", "urma",
                     *common,
                     "--kvaf-server",
                     args.urma_server,

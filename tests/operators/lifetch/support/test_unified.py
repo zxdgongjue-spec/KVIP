@@ -17,9 +17,14 @@ def test_urma_passes_geometry_to_existing_graph_runner(monkeypatch, tmp_path):
     assert module.main(['--transport', 'urma', '--kvaf-server', 'host:1', '--kvaf-root', str(tmp_path),
                         '--batches', '8,16', '--intermediate-fetches', '8', '--miss-percent', '30']) == 0
     cmd = commands[0]
+    assert '--internal-urma' in cmd and str(SOURCE) in cmd
     assert cmd[cmd.index('--batches') + 1] == '8,16'
     assert cmd[cmd.index('--miss-percent') + 1] == '30.0'
     assert cmd[cmd.index('--kvaf-root') + 1] == str(tmp_path)
+
+
+def test_urma_fixture_can_import_native_log():
+    assert callable(module.native_log)
 
 
 def test_ubmem_requires_correctness_and_timing_markers(monkeypatch, tmp_path):

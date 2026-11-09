@@ -14,10 +14,12 @@ namespace {std::vector<unsigned> calls, blocks;unsigned fail=0;}
 LAUNCH_WIDTH(656,init,1)
 LAUNCH_WIDTH(656,li,2)
 LAUNCH_WIDTH(656,resolve,3)
+LAUNCH_WIDTH(656,fetch,8)
 LAUNCH_WIDTH(656,complete,4)
 LAUNCH_WIDTH(2624,init,11)
 LAUNCH_WIDTH(2624,li,12)
 LAUNCH_WIDTH(2624,resolve,13)
+LAUNCH_WIDTH(2624,fetch,18)
 LAUNCH_WIDTH(2624,complete,14)
 LAUNCH(direct_update_owned,5)
 LAUNCH(direct_update_outputs,6)
@@ -40,14 +42,17 @@ int main() {
     shape.tokenBytes=656;
     void* pointer=reinterpret_cast<void*>(1);
     assert(kvip_ubmem_forward(pointer,pointer,pointer,&shape)==0);
-    assert((calls==std::vector<unsigned>{1,2,3,4,5,6,7}));
-    assert((blocks==std::vector<unsigned>{shape.batch,shape.liCores,shape.finalCores,shape.batch,shape.batch,shape.batch,shape.batch*4}));
+    assert((calls==std::vector<unsigned>{1,2,3,8,4,5,6,7}));
+    assert((blocks==std::vector<unsigned>{shape.batch,shape.liCores,shape.finalCores,shape.finalCores,shape.batch,shape.batch,shape.batch,shape.batch*4}));
     calls.clear();blocks.clear();shape.tokenBytes=2624;
     assert(kvip_ubmem_forward(pointer,pointer,pointer,&shape)==0);
-    assert((calls==std::vector<unsigned>{11,12,13,14,5,6,7}));
+    assert((calls==std::vector<unsigned>{11,12,13,18,14,5,6,7}));
     calls.clear();blocks.clear();shape.tokenBytes=656;fail=4;
     assert(kvip_ubmem_forward(pointer,pointer,pointer,&shape)==71);
-    assert((calls==std::vector<unsigned>{1,2,3,4}));
+    assert((calls==std::vector<unsigned>{1,2,3,8,4}));
+    calls.clear();blocks.clear();fail=8;
+    assert(kvip_ubmem_forward(pointer,pointer,pointer,&shape)==71);
+    assert((calls==std::vector<unsigned>{1,2,3,8}));
     calls.clear();assert(kvip_ubmem_forward(nullptr,pointer,pointer,&shape)!=0 && calls.empty());
     for(uint32_t e=1;e<shape.rounds;++e)assert(RuntimeTrigger(shape.history,shape.resident,shape.rounds,e)>
         RuntimeTrigger(shape.history,shape.resident,shape.rounds,e-1));

@@ -11,13 +11,12 @@ the installed Python package because startup builds use its C++ sources.
 ```text
 csrc/operators/
   lidu/                             # op_host / op_kernel / torch_extension
-  common/lightning_indexer/          # shared LI/score/TopK device functions
   common/lifetch/                    # resident selection, budgets and Index-update planner
   lightning_indexer_with_fetch/
     include/                        # public ABI, Context and runtime shape
     op_host/                        # launch entry points and Index-update host binding
     op_kernel/                      # LI/Fetch lifecycle, prefetch, resolver, Index update
-      indexer/                      # URMA runtime-shape LI scheduling
+      indexer/                      # shared LI/score/TopK device functions
   lightning_indexer_with_fetch_ubmem/
     include/                        # UBmem launch, region and completion ABIs
     op_host/                        # graph-capturable launch sequence
@@ -113,7 +112,8 @@ The supported KVAF base is `1c1310387ebfb6776a07316874e924265b209ada`.
 Preparation retains the existing three common patches in `scripts/patches` and
 applies `patches/kvaf-background-put.patch` for background Put's GIL release and
 capability flag. `--transport ubmem` additionally
-applies `patches/kvaf-ubmem-fused-lease.patch` to that checkout. Preparation recognizes an
+applies `patches/kvaf-ubmem-fused-lease.patch` and `patches/kvaf-ubmem-device-get.patch`
+to that checkout. Preparation recognizes an
 already patched tree and preserves unrelated edits; conflicting changes fail
 without a forced reset. A separate KVAF checkout/build is recommended per transport.
 `--prepare-only` prepares the dependency without replacing the active build selection;
@@ -131,9 +131,8 @@ The CPU service manages memory placement; worker-local allocation, THP and NUMA
 settings from the earlier local-DDR prototype are not part of this path. URMA
 remains the default build.
 
-The UBmem single-operator path uses the CPU-service DDR region and the existing
-KVAF BatchPut and BatchGet transport. Fused LIFetch retains its own copy scheduling
-and completion checks while reusing the transport-independent algorithms above.
+The UBmem single-operator path uses the CPU-service DDR region and KVAF BatchPut.
+Fused final fetch consumes the shared descriptors through KVAF's patched UBmem device Get.
 vLLM integration with this CPU-service-backed interface has not yet been validated.
 
 The original LIDU build uses its own `csrc/operators/lidu/build` directory.

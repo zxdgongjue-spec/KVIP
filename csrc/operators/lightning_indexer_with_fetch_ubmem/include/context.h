@@ -4,7 +4,7 @@ static_assert(V9_UBPIPE_DEPTH == 1 || V9_UBPIPE_DEPTH == 8, "Invalid UBmem pipel
 static_assert(V9_UBPIPE_ROWS == 1 || V9_UBPIPE_ROWS == 4, "Invalid UBmem rows per pipeline stage");
 static_assert(V9_UBPIPE_DEPTH != 1 || V9_UBPIPE_ROWS == 1, "Serial UBmem requires one row per stage");
 #include "ubmem_abi.h"
-#include "../../common/lifetch/runtime_shape.h"
+#include "../../lightning_indexer_with_fetch/include/runtime_shape.h"
 namespace rotating {
 constexpr uint32_t kTop = 2048, kSlots = 8192, kTokenBytes = TOKEN_BYTES;
 constexpr uint32_t kMaxRounds = 32, kRowStatusWords = 32, kFinalStateWords = 288;

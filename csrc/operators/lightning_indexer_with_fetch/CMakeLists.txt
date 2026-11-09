@@ -13,7 +13,7 @@ set(RESOLVER_COMPARE 0 CACHE STRING "Include resolver diagnostic entry points")
 include(${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
 ascendc_library(v9_kernel STATIC op_kernel/indexer.cpp op_kernel/lifecycle.cpp)
 ascendc_include_directories(v9_kernel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel
-  ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/indexer ${CMAKE_CURRENT_SOURCE_DIR}/../common/lightning_indexer ${KVAF_INCLUDE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/indexer ${KVAF_INCLUDE}
   ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)
 ascendc_compile_options(v9_kernel PRIVATE -DV9_RESOLVER_COMPARE=${RESOLVER_COMPARE} -O2 -g --cce-auto-sync=off
   -mllvm -user-reserved-ub-size=223232 -DV9_USER_UB_BYTES=223232

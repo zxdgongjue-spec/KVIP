@@ -1,6 +1,6 @@
 #pragma once
 #include <stdint.h>
-#include "../../common/lifetch/runtime_shape.h"
+#include "../../lightning_indexer_with_fetch/include/runtime_shape.h"
 
 // All pointers refer to caller-owned, persistent NPU buffers. forward only
 // enqueues work on stream. The caller holds its arena lease until stream work

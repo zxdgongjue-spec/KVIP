@@ -92,37 +92,13 @@ void CheckOutputLayout(uint32_t resident,uint32_t tailTokens) {
         copy_model::Drained();
     }
     check();
-    reset();
-    constexpr uint32_t kFinalWorkers=2*SIM_BATCH<=V9_AIC_COUNT?4:2;
-    // Replicated final workers select actual destination sectors after an
-    // arbitrary LRU mapping. Consecutive logical ranks are not safe owners.
-    std::vector<uint32_t> slots;
-    for(uint32_t i=0;i<61;++i)slots.push_back((i*17)%61);
-    slots.push_back(resident-2);slots.push_back(resident-1);
-    for(uint32_t b=0;b<SIM_BATCH;++b) {
-        for(uint32_t worker=0;worker<kFinalWorkers;++worker) {
-            copy_model::worker=b*kFinalWorkers+worker;
-            uint64_t base=Address(output)+uint64_t(b+1)*stride*kTokenBytes;
-            UbmemFinalCopyPipeline pipe(&ctx,base,local);
-            uint32_t accepted=0;
-            for(uint32_t i=0;i<slots.size();++i)if(UbmemDestinationOwner(slots[i],kFinalWorkers)==worker) {
-                uint64_t offset=3+uint64_t((i*5)%sourceRows)*kTokenBytes;
-                assert(pipe.Add(region.peerBase+offset,slots[i]));++accepted;
-                std::memcpy(expected.data()+(uint64_t(b+1)*stride+slots[i])*kTokenBytes,source.data()+offset,kTokenBytes);
-            }
-            assert(!pipe.Add(region.peerBase,resident));
-            assert(pipe.Finish()==accepted);copy_model::Drained();
-        }
-    }
-    check();
     assert(UbmemWindowCopyPipeline::kScratchBytes<=32000);
     assert(4096+UbmemWindowCopyPipeline::kOverflowBytes<=16384);
-    assert(UbmemFinalCopyPipeline::kScratchBytes<=23808);
     std::cout<<"UBmem fused copy model PASS B="<<SIM_BATCH<<" token="<<kTokenBytes
              <<" tail="<<tailTokens
              <<" window_ub="<<UbmemWindowCopyPipeline::kScratchBytes
              <<" overflow="<<UbmemWindowCopyPipeline::kOverflowBytes
-             <<" final_ub="<<UbmemFinalCopyPipeline::kScratchBytes<<"\n";
+             <<"\n";
 }
 
 int main() {

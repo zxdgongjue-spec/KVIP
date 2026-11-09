@@ -79,11 +79,16 @@ def build_ubmem_library(*, cache_dir, cann, shape, jobs=2):
     kvaf_include = kvaf_root / "access_operator/include"
     options = shape.options(cann) | {"KVAF_INCLUDE": str(kvaf_include)}
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
-    for directory in (source, source.parent / "common"):
+    shared_lifetch = source.parent / "lightning_indexer_with_fetch"
+    for directory in (source, source.parent / "common", shared_lifetch / "op_kernel/indexer"):
         for path in sorted(directory.rglob("*")):
             if path.is_file() and (path.suffix in (".h", ".cpp", ".asc", ".cmake") or path.name == "CMakeLists.txt"):
                 digest.update(str(path.relative_to(source.parent)).encode())
                 digest.update(path.read_bytes())
+    for relative in ("op_kernel/index_cache_update.h", "include/runtime_shape.h"):
+        path = shared_lifetch / relative
+        digest.update(str(path.relative_to(source.parent)).encode())
+        digest.update(path.read_bytes())
     shared_selector = source.parent / "lidu/op_kernel/hot_slot_selection.h"
     digest.update(str(shared_selector.relative_to(source.parent)).encode())
     digest.update(shared_selector.read_bytes())

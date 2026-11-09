@@ -140,7 +140,6 @@ public:
     template<class... T> __aicore__ inline bool TryAddNext4(T...) {return false;}
     template<class... T> __aicore__ inline bool TryAddNext6(T...) {return false;}
     template<class... T> __aicore__ inline bool TryAddNext8(T...) {return false;}
-    __aicore__ inline void SaveFinalCommandCounts(__gm__ uint64_t*) const {}
     __aicore__ inline uint32_t Finish() {
         if (!issued_) return 0;
         while (stored_<issued_) StoreOne();
@@ -180,20 +179,19 @@ private:
 // Irregular runs that would start at an unaligned UB address retain Normal
 // 672-byte row padding and exact 656-byte per-block stores.
 static_assert(V9_WINDOW_UBPIPE_DEPTH==4 || V9_WINDOW_UBPIPE_DEPTH==8,"Invalid window pipeline depth");
-template<uint32_t CompactRows=4,bool PairGaps=false,uint32_t Depth=8,bool PrefillLoads=false>
+template<uint32_t CompactRows=4,uint32_t Depth=8,bool PrefillLoads=false>
 class UbmemGroupedCopyPipelineT {
 public:
     static constexpr uint32_t kDepth = Depth, kRowsPerStage = 4;
     static constexpr uint32_t kLoadPrefill = PrefillLoads ? kDepth : 1;
     static_assert(Depth==4 || Depth==8,"Grouped ring depth must fit the eight event IDs");
-    static_assert(!PrefillLoads || (CompactRows==8 && !PairGaps),"Load prefill is window-only");
+    static_assert(!PrefillLoads || CompactRows==8,"Load prefill is window-only");
     static constexpr uint32_t kRowBytes = (kTokenBytes+31)/32*32;
     // Wide groups use Compact; irregular inputs retain <=4-row Normal. The
     // depth-eight window has six stages in retired candidate scratch and two
     // in a disjoint dead work segment. Depth four fits entirely in retired
     // candidates, reducing live requests without changing final-copy storage.
     static_assert(CompactRows==4 || CompactRows==6 || CompactRows==8,"Unsupported compact group width");
-    static_assert(!PairGaps || CompactRows==4,"Sector-pair groups use the original final scratch layout");
     static constexpr uint32_t kStageBytes = CompactRows>=6?CompactRows*kTokenBytes:kRowsPerStage*kRowBytes;
     static constexpr uint32_t kPrimaryStages = CompactRows==8 && kDepth>6?6:kDepth;
     static constexpr uint32_t kScratchBytes = kPrimaryStages*kStageBytes;
@@ -431,21 +429,7 @@ private:
         DataCopyPad<uint8_t,PaddingMode::Compact>(Stage(stage)[first*kTokenBytes],from,copy,pad);
     }
     __aicore__ inline void Append(uint64_t source,uint64_t destination) {
-        // Final workers own two-row sectors separated by the other workers'
-        // sectors. Join at most two aligned sectors in one existing stage;
-        // the strided GM store skips the gap and never touches another owner.
-        // All other gaps retain the original flush, including a one-row tail,
-        // backward/repeated destinations and oversized strides.
-        if (pending_ && destination!=nextDestination_) {
-            bool joinPair=false;
-            if constexpr(PairGaps) {
-                joinPair=pending_==2 && !pairDestination_ && !(groupDestination_&31) &&
-                    !(destination&31) && destination>nextDestination_ &&
-                    destination-nextDestination_<=UINT32_MAX;
-            }
-            if(joinPair)pairDestination_=destination;
-            else FlushGroup();
-        }
+        if (pending_ && destination!=nextDestination_) FlushGroup();
         if (!accepted_) {
             SetFlag<HardEvent::S_MTE2>(EVENT_ID0); WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
             for (uint32_t i=0;i<kDepth;++i) SetFlag<HardEvent::MTE3_MTE2>(static_cast<event_t>(i));
@@ -475,10 +459,6 @@ public:
         for (uint32_t i=0;i<kDepth;++i) WaitFlag<HardEvent::MTE3_MTE2>(static_cast<event_t>(i));
         SetFlag<HardEvent::MTE2_S>(EVENT_ID0); WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
         return accepted_;
-    }
-    __aicore__ inline void SaveCommandCounts(__gm__ uint64_t* out) const {
-    }
-    __aicore__ inline void SaveFinalCommandCounts(__gm__ uint64_t* out) const {
     }
 private:
     __aicore__ inline bool ForwardPair(uint32_t first) const {
@@ -524,11 +504,9 @@ private:
         }
         SetFlag<HardEvent::MTE2_MTE3>(static_cast<event_t>(stage));
         pending_=0; ++issued_;
-        QueueStore(stage,groupDestination_,rows,compact,pairDestination_);
-        pairDestination_=0;
+        QueueStore(stage,groupDestination_,rows,compact);
     }
-    __aicore__ inline void QueueStore(uint32_t stage,uint64_t destination,uint32_t rows,bool compact,
-        uint64_t pairDestination=0) {
+    __aicore__ inline void QueueStore(uint32_t stage,uint64_t destination,uint32_t rows,bool compact) {
         if constexpr(PrefillLoads) {
             // Admit the full MTE2 ring before placing waits/stores into MTE3.
             // Only scalar metadata is retained; each UB stage keeps its own
@@ -537,46 +515,20 @@ private:
             storeDescriptors_[stage]=rows|(compact?256:0);
             if(issued_-stored_==kDepth)StoreOldest();
         } else {
-            StoreOne(stage,destination,rows,compact,pairDestination);
+            StoreOne(stage,destination,rows,compact);
         }
     }
     __aicore__ inline void StoreOldest() {
         uint32_t stage=stored_%kDepth,descriptor=storeDescriptors_[stage];
         StoreOne(stage,storeDestinations_[stage],descriptor&255,descriptor&256);
     }
-    __aicore__ inline void StoreOne(uint32_t stage,uint64_t destination,uint32_t rows,bool compact,
-        uint64_t pairDestination=0) {
+    __aicore__ inline void StoreOne(uint32_t stage,uint64_t destination,uint32_t rows,bool compact) {
         WaitFlag<HardEvent::MTE2_MTE3>(static_cast<event_t>(stage));
         GlobalTensor<uint8_t> to;
         to.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(destination));
-        if constexpr(PairGaps) {
-            if(pairDestination) {
-                if(compact && rows==4) {
-                    // GM stride is bytes; UB block stride is rounded to 32B.
-                    // Two 656B rows form one aligned1312B sector payload.
-                    DataCopyExtParams copy{2,2*kTokenBytes,0,
-                        static_cast<uint32_t>(pairDestination-destination-2*kTokenBytes),0};
-                    DataCopyPad<uint8_t,PaddingMode::Normal>(to,Stage(stage),copy);
-                } else {
-                    DataCopyExtParams first{static_cast<uint16_t>(compact?1:2),
-                        compact?2*kTokenBytes:kTokenBytes,0,0,0};
-                    DataCopyPad<uint8_t,PaddingMode::Normal>(to,Stage(stage),first);
-                    to.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(pairDestination));
-                    DataCopyExtParams second{static_cast<uint16_t>(compact?1:rows-2),
-                        compact?(rows-2)*kTokenBytes:kTokenBytes,0,0,0};
-                    DataCopyPad<uint8_t,PaddingMode::Normal>(to,
-                        Stage(stage)[2*(compact?kTokenBytes:kRowBytes)],second);
-                }
-            } else {
-                DataCopyExtParams copy{static_cast<uint16_t>(compact?1:rows),
-                    compact?rows*kTokenBytes:kTokenBytes,0,0,0};
-                DataCopyPad<uint8_t,PaddingMode::Normal>(to,Stage(stage),copy);
-            }
-        } else {
-            DataCopyExtParams copy{static_cast<uint16_t>(compact?1:rows),
-                compact?rows*kTokenBytes:kTokenBytes,0,0,0};
-            DataCopyPad<uint8_t,PaddingMode::Normal>(to,Stage(stage),copy);
-        }
+        DataCopyExtParams copy{static_cast<uint16_t>(compact?1:rows),
+            compact?rows*kTokenBytes:kTokenBytes,0,0,0};
+        DataCopyPad<uint8_t,PaddingMode::Normal>(to,Stage(stage),copy);
         SetFlag<HardEvent::MTE3_MTE2>(static_cast<event_t>(stage));
         ++stored_;
     }
@@ -585,31 +537,17 @@ private:
     LocalTensor<uint8_t> scratch_,overflow_;
     uint64_t storeDestinations_[PrefillLoads?kDepth:1];
     uint32_t storeDescriptors_[PrefillLoads?kDepth:1];
-    uint64_t sources_[kRowsPerStage]{},groupDestination_=0,nextDestination_=0,runDestination_=0,pairDestination_=0;
+    uint64_t sources_[kRowsPerStage]{},groupDestination_=0,nextDestination_=0,runDestination_=0;
     uint32_t issued_=0,stored_=0,accepted_=0,pending_=0,runRemaining_=0;
     uint32_t resident_=0;
     bool valid_=false;
 };
 
 using UbmemGroupedCopyPipeline=UbmemGroupedCopyPipelineT<4>;
-using UbmemFinalCopyPipeline=UbmemGroupedCopyPipelineT<4,true>;
-using UbmemWindowCopyPipeline=UbmemGroupedCopyPipelineT<8,false,8,false>;
+using UbmemWindowCopyPipeline=UbmemGroupedCopyPipelineT<8,8,false>;
 #else
 using UbmemGroupedCopyPipeline=UbmemCopyPipeline;
-using UbmemFinalCopyPipeline=UbmemCopyPipeline;
 using UbmemWindowCopyPipeline=UbmemCopyPipeline;
 #endif
 
-struct UbmemCopyTrace {
-    __aicore__ inline void Begin() {
-    }
-    __aicore__ inline void IssueEnd() {
-    }
-    __aicore__ inline void Done() {
-    }
-    __aicore__ inline void AccumulatePrefetch(__gm__ uint64_t* status,uint32_t rows) {
-    }
-    __aicore__ inline void SaveFinal(__gm__ FinalPost* post,uint32_t rows) {
-    }
-};
 }
