@@ -91,6 +91,26 @@ __aicore__ inline RuntimeShape LoadRuntimeShape(const __gm__ Context* ctx) {
     return result;
 }
 #endif
+// Runtime schedule follows the same hot-first geometry as URMA.
+#if defined(__CCE_AICORE__)
+#define UB_SCHEDULE_DEVICE __aicore__
+#else
+#define UB_SCHEDULE_DEVICE
+#endif
+UB_SCHEDULE_DEVICE inline uint32_t RuntimeTrigger(uint32_t history,uint32_t resident,uint32_t rounds,uint32_t epoch) {
+    return resident/128 + ((history-resident)/128)*epoch/(rounds>1?rounds-1:1);
+}
+UB_SCHEDULE_DEVICE inline bool IsTrigger(uint32_t history,uint32_t resident,uint32_t rounds,uint32_t tile) {
+    for(uint32_t epoch=0;epoch<rounds;++epoch)
+        if(RuntimeTrigger(history,resident,rounds,epoch)==tile)return true;
+    return false;
+}
+UB_SCHEDULE_DEVICE inline int32_t EpochAt(uint32_t batch,uint32_t history,uint32_t resident,uint32_t split,
+    uint32_t rounds,uint32_t serviceAics,uint32_t tile,uint32_t core) {
+    uint32_t rank=split?(core%2)*batch+core/2:core,epoch=rank/serviceAics;
+    return epoch<rounds && RuntimeTrigger(history,resident,rounds,epoch)==tile ? int32_t(epoch) : -1;
+}
+#undef UB_SCHEDULE_DEVICE
 // Workload configuration is compiled into each benchmark binary, as in V8.
 // One selected AIC pair per window; zero disables intermediate Fetch.
 #if defined(__CCE_AICORE__)

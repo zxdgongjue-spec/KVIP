@@ -82,9 +82,7 @@ public:
     static constexpr uint32_t SYNC_V1_C1_FLAG = 5;
     uint32_t resident_=0;
 public:
-#if !defined(V9_UBMEM) || !V9_UBMEM
     rotating::RuntimeShape runtimeShape_;
-#endif
 private:
     static constexpr uint32_t HEAD_DIM = 128;
     static constexpr uint32_t K_HEAD_NUM = 1;
@@ -694,11 +692,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessBaseBlock(uint3
     CalcRunInfo(loop, s2LoopIdx, runInfo, qScaleLoop, kScaleLoop);
     if ASCEND_IS_AIC {
         matmulService.ComputeMm1(runInfo);
-#if defined(V9_UBMEM) && V9_UBMEM
-        if (!rotationServed_ && rotating::EpochAt(s2LoopIdx + 1, aiCoreIdx) >= 0) {
-#else
         if (!rotationServed_ && rotating::EpochAt(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.splitQ,runtimeShape_.rounds,runtimeShape_.serviceAics,s2LoopIdx + 1, aiCoreIdx) >= 0) {
-#endif
             CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(8);
             rotationServed_ = true;
         }
@@ -708,13 +702,8 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessBaseBlock(uint3
             vectorService.ProcessResidentTopK(runInfo);
             vectorService.PrepareRotationProgress();
         }
-#if defined(V9_UBMEM) && V9_UBMEM
-        if (!rotationServed_ && rotating::EpochAt(s2LoopIdx + 1, aiCoreIdx) >= 0) {
-            vectorService.RotateFetch(rotating::EpochAt(s2LoopIdx + 1, aiCoreIdx));
-#else
         if (!rotationServed_ && rotating::EpochAt(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.splitQ,runtimeShape_.rounds,runtimeShape_.serviceAics,s2LoopIdx + 1, aiCoreIdx) >= 0) {
             vectorService.RotateFetch(rotating::EpochAt(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.splitQ,runtimeShape_.rounds,runtimeShape_.serviceAics,s2LoopIdx + 1, aiCoreIdx));
-#endif
             CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(8);
             rotationServed_ = true;
         }

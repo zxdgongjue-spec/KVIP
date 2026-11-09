@@ -148,3 +148,42 @@ def test_ubmem_window_triggers_match_urma(tmp_path, batch, windows, history, res
     )
     actual = subprocess.check_output([str(binary)], text=True)
     assert list(map(int, actual.split())) == trigger_tokens(batch, history, resident, intermediate_fetches=windows)
+
+
+def test_runtime_trigger_and_epoch_assignment_use_urma_schedule(tmp_path):
+    from kvip.operators.lifetch.geometry import li_geometry, trigger_tokens
+
+    compiler = shutil.which("c++")
+    if not compiler:
+        pytest.skip("C++ unavailable")
+    root = Path(__file__).resolve().parents[3]
+    source = tmp_path / "runtime_schedule.cpp"
+    source.write_text(
+        '#include "context.h"\n#include <cstdio>\n'
+        'int main(){ unsigned b,h,r,s,n,lanes; '
+        'while(std::scanf("%u%u%u%u%u%u",&b,&h,&r,&s,&n,&lanes)==6){'
+        'for(unsigned e=0;e<n;++e)std::printf("%u ",128*rotating::RuntimeTrigger(h,r,n,e));'
+        'std::printf("\\n"); for(unsigned t=0;t<=h/128;++t){bool found=false;'
+        'for(unsigned e=0;e<n;++e)found |= rotating::RuntimeTrigger(h,r,n,e)==t;'
+        'if(found!=rotating::IsTrigger(h,r,n,t))return 2;}'
+        'for(unsigned c=0;c<b*(1+s);++c){unsigned rank=s?(c%2)*b+c/2:c,e=rank/lanes;'
+        'if(e<n && rotating::EpochAt(b,h,r,s,n,lanes,rotating::RuntimeTrigger(h,r,n,e),c)!=int(e))return 3;}'
+        '} }\n'
+    )
+    defs = dict(SIM_BATCH=1, SIM_HISTORY=33024, SIM_RESIDENT=8192, TOKEN_BYTES=656,
+                V9_UBPIPE_DEPTH=8, V9_UBPIPE_ROWS=4, V9_DEDICATED_SERVICE=0,
+                V9_AIC_COUNT=32, V9_SPLIT_Q=1, V9_INTERMEDIATE_FETCHES=2, V9_FINAL_REPLICATED=1)
+    binary = tmp_path / "runtime_schedule"
+    subprocess.run([compiler, "-std=c++17", str(source), *[f"-D{k}={v}" for k, v in defs.items()],
+                    "-I" + str(root / "csrc/operators/lightning_indexer_with_fetch_ubmem/include"),
+                    "-o", str(binary)], check=True, capture_output=True)
+    cases = [(1, 33024, 8192, 1), (8, 131072, 16384, 8), (16, 131072, 16384, 8),
+             (32, 131072, 16384, 32)]
+    rows, expected = [], []
+    for batch, history, resident, windows in cases:
+        geo = li_geometry(batch, intermediate_fetches=windows)
+        rows.append(f"{batch} {history} {resident} {geo['cores_per_batch']-1} "
+                    f"{geo['intermediate_fetches']} {geo['service_aics_per_window']}\n")
+        expected.append(trigger_tokens(batch, history, resident, intermediate_fetches=windows))
+    result = subprocess.run([str(binary)], input="".join(rows), text=True, capture_output=True, check=True)
+    assert [list(map(int, row.split())) for row in result.stdout.splitlines()] == expected
