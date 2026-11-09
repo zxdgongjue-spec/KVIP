@@ -162,16 +162,13 @@ def main():
         sys.path.insert(0, str(ROOT / "python"))
         from kvip.operators.lifetch_ubmem.specialization import Specialization, build_specialization
 
-        # Initial no-weight smoke shapes. Serving prepares its exact history,
-        # head count and device AIC budget once before memory profiling.
-        for batch in (1, 2):
-            for token_bytes in (656, 2624):
-                build_specialization(
-                    cache_dir=build_dir / "lifetch_ubmem",
-                    cann=args.cann,
-                    shape=Specialization(batch, 33024, 8192, 64, token_bytes, 32, 8, args.soc),
-                    jobs=args.jobs,
-                )
+        # One library contains both KV widths and accepts runtime geometry.
+        build_specialization(
+            cache_dir=build_dir / "lifetch_ubmem",
+            cann=args.cann,
+            shape=Specialization(1, 33024, 8192, 64, 656, 32, 8, args.soc),
+            jobs=args.jobs,
+        )
         (ROOT / "build/dependencies.json").write_text(json.dumps(state, indent=2))
         print("PASS: KVAF UBmem Put/Get + LIDU + UBmem LIFetch/Index update built. Source scripts/env.sh.", flush=True)
         return

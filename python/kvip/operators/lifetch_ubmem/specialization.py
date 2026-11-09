@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Startup-only, content-addressed builds for the static UBmem pipeline."""
+"""Startup-only, content-addressed build for runtime-shaped UBmem kernels."""
 
-import ctypes
 import fcntl
 import hashlib
 import json
 import logging
 import subprocess
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
 from kvip.runtime.build import build_failure
@@ -15,6 +14,8 @@ from kvip.runtime.build import build_failure
 
 @dataclass(frozen=True)
 class Specialization:
+    """Validated per-invocation geometry; not a compiler specialization."""
+
     batch: int
     history: int
     resident: int
@@ -43,17 +44,12 @@ class Specialization:
 
 
     def options(self, cann):
+        # Kernel copy variants are packaged together. The other shape fields
+        # are runtime parameters and must not affect the binary cache key.
         return dict(
             RUN_MODE="npu",
             ASCEND_CANN_PACKAGE_PATH=str(Path(cann).resolve()),
             SOC_VERSION=self.soc,
-            SIM_BATCH=self.batch,
-            SIM_HISTORY=self.history,
-            SIM_RESIDENT=self.resident,
-            INDEX_HEADS=self.heads,
-            TOKEN_BYTES=self.token_bytes,
-            AIC_COUNT=self.aic_count,
-            INTERMEDIATE_FETCHES=self.intermediate_fetches,
         )
 
 
@@ -95,7 +91,7 @@ def build_specialization(*, cache_dir, cann, shape, jobs=2):
     directory = Path(cache_dir) / digest.hexdigest()[:20]
     directory.mkdir(parents=True, exist_ok=True)
     library, log = directory / "libkvip_lifetch_ubmem.so", directory / "build.log"
-    logging.getLogger("kvip").info("UBmem LIFetch specialization=%s log=%s", asdict(shape), log)
+    logging.getLogger("kvip").info("UBmem runtime LIFetch soc=%s log=%s", shape.soc, log)
     with (directory / "build.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if not (directory / "complete.json").is_file() or not library.is_file():
@@ -114,9 +110,3 @@ def build_specialization(*, cache_dir, cann, shape, jobs=2):
                 raise RuntimeError(f"UBmem build did not produce {library}; see {log}")
             (directory / "complete.json").write_text(json.dumps(options, indent=2) + "\n")
     return library
-
-
-def query(library, name):
-    function = getattr(library, "v9_" + name)
-    function.argtypes, function.restype = [], ctypes.c_uint32
-    return int(function())

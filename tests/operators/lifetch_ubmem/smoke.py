@@ -4,6 +4,7 @@
 
 import argparse
 import ctypes
+import hashlib
 import sys
 import tempfile
 from pathlib import Path
@@ -495,10 +496,17 @@ def main():
     torch.npu.set_device(args.device)
     cann = kvaf_cann(build)
     aics = query_device_resources(cann, args.device)["effective_aic"]
+    selected_library = None
     for batch in args.batches:
         for token_bytes in args.token_bytes:
             shape = Specialization(batch, args.history, args.resident, args.index_heads, token_bytes, aics, 8, args.soc)
             library = build_specialization(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape)
+            if selected_library is None:
+                selected_library = library.resolve()
+                print(f"UBMEM_RUNTIME_BINARY path={selected_library} sha256={hashlib.sha256(library.read_bytes()).hexdigest()}",
+                      flush=True)
+            elif library.resolve() != selected_library:
+                raise AssertionError("Runtime shape change unexpectedly rebuilt UBmem LIFetch")
             for prefetch_tokens in args.prefetch_tokens:
                 check_shape(
                     kvaf,

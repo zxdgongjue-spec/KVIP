@@ -112,7 +112,7 @@ def test_static_shape_and_ubmem_scratch_contract():
     for batch in (1, 2):
         for width in (656, 2624):
             shape = Specialization(batch, 33024, 8192, 64, width, 32, 8, "Ascend950DT_9582")
-            assert shape.options("/cann")["SIM_HISTORY"] == 33024
+            assert set(shape.options("/cann")) == {"RUN_MODE", "ASCEND_CANN_PACKAGE_PATH", "SOC_VERSION"}
             scratch = rotation_spec(batch, shape.history, shape.resident, shape.aic_count, shape.intermediate_fetches)
             assert scratch["ubmem_status"] == ((batch, 16), "int64")
             assert "final_status" not in scratch and "prefetch_status" not in scratch
@@ -130,7 +130,7 @@ def test_extended_ubmem_geometry(batch, resident):
 
 def test_ubmem_supports_wide_batch_and_many_windows():
     shape = Specialization(32, 131072, 16384, 32, 656, 32, 32, "Ascend950PR_9599")
-    assert shape.options("/cann")["INTERMEDIATE_FETCHES"] == 32
+    assert shape.options("/cann")["SOC_VERSION"] == "Ascend950PR_9599"
 
 
 def test_workspace_initializes_with_npu_supported_zero_dtypes():

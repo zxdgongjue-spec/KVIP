@@ -82,6 +82,9 @@ def test_shared_hot_selector_invalidates_specialization_cache(tmp_path, monkeypa
     old = specialization.build_specialization(**options)
     assert specialization.build_specialization(**options) == old
     assert len(calls) == 2
+    alternate = specialization.Specialization(16, 131072, 16384, 32, 2624, 32, 8, "Ascend950DT_9582")
+    assert specialization.build_specialization(**(options | {"shape": alternate})) == old
+    assert len(calls) == 2  # no recompilation for a new runtime geometry or row width
     selector.write_text("// changed hot-slot algorithm\n")
     new = specialization.build_specialization(**options)
     assert new != old and len(calls) == 4

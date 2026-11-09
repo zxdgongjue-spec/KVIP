@@ -7,7 +7,6 @@ import numpy as np
 
 from kvip.operators.lifetch.geometry import final_aivs, li_geometry, prefetch_budget
 from kvip.operators.lifetch.tiling import RuntimeShape
-from kvip.operators.lifetch_ubmem.specialization import query
 from kvip.operators.lifetch_ubmem.workspace import device_words, rotation_spec
 
 
@@ -38,18 +37,6 @@ class UbmemBinding:
             raise ValueError("UBmem requires 14 input buffers on the leased NPU")
         if any(t.device != self.device or not t.is_contiguous() for t in arguments):
             raise ValueError("UBmem inputs must be contiguous on one NPU")
-        for name, expected in (
-            ("batch", shape.batch),
-            ("history", shape.history),
-            ("resident", shape.resident),
-            ("token_bytes", shape.token_bytes),
-            ("aic_count", shape.aic_count),
-            ("index_heads", shape.heads),
-            ("context_bytes", 336),
-            ("row_bytes", 1024),
-        ):
-            if query(self.library, name) != expected:
-                raise ValueError(f"UBmem static binary contract mismatch: {name}")
         version = self.library.kvip_ubmem_abi_version
         version.argtypes, version.restype = [], ctypes.c_uint32
         if version() != 3:
@@ -60,14 +47,15 @@ class UbmemBinding:
         geometry = li_geometry(shape.batch, "auto", shape.intermediate_fetches, shape.aic_count)
         self.rounds, self.service_lanes = geometry["intermediate_fetches"], geometry["service_aivs_per_window"]
         self.final_workers = final_aivs(shape.batch, "auto", shape.aic_count)
-        for name, expected in (
-            ("rounds", self.rounds),
-            ("service_lanes", self.service_lanes),
-            ("final_workers", self.final_workers),
-            ("li_cores", geometry["rotating_aic"]),
-        ):
-            if query(self.library, name) != expected:
-                raise ValueError(f"UBmem static scheduling mismatch: {name}")
+        self.runtime_shape = RuntimeShape.prepare(
+            self.library, batch=shape.batch, history=shape.history, resident=shape.resident,
+            index_heads=shape.heads, aic_count=shape.aic_count, windows=shape.intermediate_fetches,
+            token_bytes=shape.token_bytes,
+        )
+        if (self.runtime_shape.rounds, self.runtime_shape.serviceLanes, self.runtime_shape.finalWorkers,
+            self.runtime_shape.liCores) != (self.rounds, self.service_lanes, self.final_workers,
+                                           geometry["rotating_aic"]):
+            raise ValueError("UBmem runtime scheduling mismatch")
         for name, expected in (("context_bytes", 336), ("region_bytes", 128), ("status_bytes", 128)):
             function = getattr(self.library, "kvip_ubmem_" + name)
             function.argtypes, function.restype = [], ctypes.c_uint32
@@ -161,11 +149,6 @@ class UbmemBinding:
             self.change_slots.data_ptr(),
             self.change_count.data_ptr(),
         ]
-        self.runtime_shape = RuntimeShape.prepare(
-            self.library, batch=shape.batch, history=shape.history, resident=shape.resident,
-            index_heads=shape.heads, aic_count=shape.aic_count, windows=shape.intermediate_fetches,
-            token_bytes=shape.token_bytes,
-        )
         blob = np.concatenate(
             (
                 np.asarray(pointers, dtype="<u8").view("u1"),
