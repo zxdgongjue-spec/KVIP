@@ -1,4 +1,4 @@
-// Shared resolver; UBmem retains the local plan for sector-owned copies.
+// Shared resolver publishes the compact final descriptors for both transports.
 template<uint32_t Threads>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
 inline void ReplicatedResolve(uint32_t rt_history,uint32_t rt_resident,uint32_t rt_finalWorkers,uint32_t rt_tokenBytes,__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc,

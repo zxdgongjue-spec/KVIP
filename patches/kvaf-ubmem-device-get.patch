@@ -22,10 +22,10 @@ index 7633b641..79a6a171 100644
        const uint32_t bank = read_bank_;
 diff --git a/access_operator/include/ubmem/fused_batch_get_device.h b/access_operator/include/ubmem/fused_batch_get_device.h
 new file mode 100644
-index 00000000..84e7c1d5
+index 00000000..9cdb416b
 --- /dev/null
 +++ b/access_operator/include/ubmem/fused_batch_get_device.h
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,64 @@
 +#pragma once
 +#include "ubmem/copy.h"
 +
@@ -52,7 +52,9 @@ index 00000000..84e7c1d5
 +      !a.peer_base || !a.mapped_base || !a.region_bytes ||
 +      a.region_bytes > UINT64_MAX - a.peer_base || a.region_bytes > UINT64_MAX - a.mapped_base ||
 +      !a.output_base || !a.output_bytes || a.output_bytes > UINT64_MAX - a.output_base ||
-+      (a.output_base & 31U) || a.token_bytes > a.region_bytes || a.token_bytes > a.output_bytes ||
++      (a.output_base & 31U) || ((uint64_t(a.owner_base) * a.token_bytes) & 31U) ||
++      (a.token_bytes % 32U != 0U && a.token_bytes % 32U != 16U) ||
++      a.token_bytes > a.region_bytes || a.token_bytes > a.output_bytes ||
 +      a.count > UINT32_MAX - a.begin) {
 +    result.error = 0x20000U;
 +    return result;
@@ -138,10 +140,10 @@ index 00000000..82a35c6c
 +}
 diff --git a/tests/ubmem_fused_device_test.cc b/tests/ubmem_fused_device_test.cc
 new file mode 100644
-index 00000000..ed3ec0ae
+index 00000000..17914065
 --- /dev/null
 +++ b/tests/ubmem_fused_device_test.cc
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,72 @@
 +#ifdef NDEBUG
 +#undef NDEBUG
 +#endif
@@ -202,5 +204,15 @@ index 00000000..ed3ec0ae
 +      reinterpret_cast<uint64_t>(source.data()),source.size(),reinterpret_cast<uint64_t>(shifted_output),shifted_expected.size(),
 +      begin,rows,owner,rows,0,workers,width};
 +    assert(kvaf_device::KvafBatchGetDevice(bad_slot,AscendC::LocalTensor<uint8_t>{{},scratch.data()}).error!=0);
++    // Each owner must start at a sector boundary: different batch owners are
++    // executed by different AIVs even when their per-owner worker IDs match.
++    bad_slot.owner_base=17;bad_slot.count=0;
++    if(width==656)
++      assert(kvaf_device::KvafBatchGetDevice(bad_slot,AscendC::LocalTensor<uint8_t>{{},scratch.data()}).error!=0);
++    else
++      assert(kvaf_device::KvafBatchGetDevice(bad_slot,AscendC::LocalTensor<uint8_t>{{},scratch.data()}).error==0);
++    auto unsupported=bad_slot;
++    unsupported.owner_base=0;unsupported.token_bytes=655;
++    assert(kvaf_device::KvafBatchGetDevice(unsupported,AscendC::LocalTensor<uint8_t>{{},scratch.data()}).error!=0);
 +  }
 +}
