@@ -7,7 +7,7 @@ __aicore__ inline __gm__ UbmemRegion* UbmemRegionAt(__gm__ Context* ctx) {
 __aicore__ inline __gm__ uint64_t* UbmemStatusAt(__gm__ Context* ctx, uint32_t batch) {
     return reinterpret_cast<__gm__ uint64_t*>(ctx->ubmemStatus) + batch*kUbmemStatusWords;
 }
-__aicore__ inline bool UbmemRegionValid(__gm__ UbmemRegion* region) {
+__aicore__ inline bool UbmemRegionValid(__gm__ UbmemRegion* region,uint32_t resident) {
     return region && region->magic == kUbmemMagic && region->version == kUbmemVersion &&
         region->locality == kUbmemHostLocal && region->generation &&
         UbmemRange(region->peerBase, region->bytes) &&
@@ -17,13 +17,14 @@ __aicore__ inline bool UbmemRegionValid(__gm__ UbmemRegion* region) {
         // The registration contains stable-owner rows with hot + optional ABC.
         // InitializeRound validates each selected owner's full stride. Neither
         // packed batch size nor the virtual Q4 tag space adds payload storage.
-        region->outputBytes >= uint64_t(SIM_RESIDENT)*kTokenBytes;
+        region->outputBytes >= uint64_t(resident)*kTokenBytes;
 }
 __aicore__ inline bool UbmemCopyRow(__gm__ Context* ctx, uint64_t peer,
     uint64_t output, uint32_t slot, LocalTensor<uint8_t> scratch) {
     auto region = UbmemRegionAt(ctx);
     uint64_t source = 0;
-    if (!UbmemRegionValid(region) || slot >= SIM_RESIDENT ||
+    const uint32_t resident=ctx->shape.resident;
+    if (!UbmemRegionValid(region,resident) || slot >= resident ||
         !UbmemTranslate(region->peerBase, region->mappedBase, region->bytes,
                         peer, kTokenBytes, source) || output < region->outputBase)
         return false;
@@ -88,7 +89,8 @@ public:
     static_assert(kScratchBytes<=23808,"single-row copy ring exceeds retired candidate scratch");
     __aicore__ inline UbmemCopyPipeline(__gm__ Context* ctx, uint64_t output,
         LocalTensor<uint8_t> scratch): region_(UbmemRegionAt(ctx)), output_(output), scratch_(scratch) {
-        valid_ = UbmemRegionValid(region_);
+        resident_=ctx->shape.resident;
+        valid_ = UbmemRegionValid(region_,resident_);
         if (valid_) {
             peerBase_=region_->peerBase; mappedBase_=region_->mappedBase; bytes_=region_->bytes;
             outputBase_=region_->outputBase; outputBytes_=region_->outputBytes;
@@ -99,7 +101,7 @@ public:
     __aicore__ inline bool Add(uint64_t peer,uint32_t slot) { return AddAt(peer,output_,slot); }
     __aicore__ inline bool AddAt(uint64_t peer,uint64_t output,uint32_t slot) {
         uint64_t source=0;
-        if (!valid_ || slot>=SIM_RESIDENT || output<outputBase_ ||
+        if (!valid_ || slot>=resident_ || output<outputBase_ ||
             !UbmemTranslate(peerBase_,mappedBase_,bytes_,peer,kTokenBytes,source)) return false;
         uint64_t offset=output-outputBase_, rowOffset=uint64_t(slot)*kTokenBytes;
         if (offset>outputBytes_ || rowOffset>outputBytes_-offset ||
@@ -125,7 +127,7 @@ public:
     __aicore__ inline uint64_t PlanMaxPeerOffset() const {return bytes_>=kTokenBytes?bytes_-kTokenBytes:0;}
     __aicore__ inline bool BeginRunAt(uint64_t output,uint32_t slot,uint32_t count) {
         runCount_=0;
-        if(!valid_ || !count || slot>=SIM_RESIDENT || count>SIM_RESIDENT-slot || output<outputBase_)return false;
+        if(!valid_ || !count || slot>=resident_ || count>resident_-slot || output<outputBase_)return false;
         uint64_t offset=output-outputBase_,rowOffset=uint64_t(slot)*kTokenBytes;
         if(offset>outputBytes_ || rowOffset>outputBytes_-offset ||
             count>(outputBytes_-offset-rowOffset)/kTokenBytes)return false;
@@ -166,6 +168,7 @@ private:
     uint64_t destinations_[kDepth]{},runOutput_=0;
     uint32_t runSlot_=0,runCount_=0;
     uint32_t issued_=0,stored_=0;
+    uint32_t resident_=0;
     bool valid_=false;
 };
 
@@ -207,7 +210,8 @@ public:
     __aicore__ inline UbmemGroupedCopyPipelineT(__gm__ Context* ctx,uint64_t output,
         LocalTensor<uint8_t> scratch,LocalTensor<uint8_t> overflow)
         :region_(UbmemRegionAt(ctx)),output_(output),scratch_(scratch),overflow_(overflow) {
-        valid_ = UbmemRegionValid(region_) && region_->bytes>=kTokenBytes;
+        resident_=ctx->shape.resident;
+        valid_ = UbmemRegionValid(region_,resident_) && region_->bytes>=kTokenBytes;
         if (valid_) {
             peerBase_=region_->peerBase; mappedBase_=region_->mappedBase; bytes_=region_->bytes;
             outputBase_=region_->outputBase; outputBytes_=region_->outputBytes;
@@ -222,7 +226,7 @@ public:
     // cannot change a store already in flight or merge across an output gap.
     __aicore__ inline bool AddAt(uint64_t peer, uint64_t output, uint32_t slot) {
         uint64_t source=0;
-        if (!valid_ || slot>=SIM_RESIDENT || output<outputBase_ ||
+        if (!valid_ || slot>=resident_ || output<outputBase_ ||
             !TranslatePeer(peer,source)) return false;
         uint64_t offset=output-outputBase_, rowOffset=uint64_t(slot)*kTokenBytes;
         if (offset>outputBytes_ || rowOffset>outputBytes_-offset ||
@@ -236,8 +240,8 @@ public:
     // individually by AddNext, and this run never accepts beyond count rows.
     __aicore__ inline bool BeginRunAt(uint64_t output,uint32_t slot,uint32_t count) {
         runRemaining_=0;
-        if(!valid_ || !count || slot>=SIM_RESIDENT ||
-            count>SIM_RESIDENT-slot || output<outputBase_)return false;
+        if(!valid_ || !count || slot>=resident_ ||
+            count>resident_-slot || output<outputBase_)return false;
         uint64_t offset=output-outputBase_,rowOffset=uint64_t(slot)*kTokenBytes;
         if(offset>outputBytes_ || rowOffset>outputBytes_-offset ||
             count>(outputBytes_-offset-rowOffset)/kTokenBytes)return false;
@@ -583,6 +587,7 @@ private:
     uint32_t storeDescriptors_[PrefillLoads?kDepth:1];
     uint64_t sources_[kRowsPerStage]{},groupDestination_=0,nextDestination_=0,runDestination_=0,pairDestination_=0;
     uint32_t issued_=0,stored_=0,accepted_=0,pending_=0,runRemaining_=0;
+    uint32_t resident_=0;
     bool valid_=false;
 };
 

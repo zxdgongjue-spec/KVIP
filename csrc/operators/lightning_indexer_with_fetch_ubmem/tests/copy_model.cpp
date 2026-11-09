@@ -11,11 +11,11 @@
 using namespace rotating;
 uint64_t Address(const void* value) {return reinterpret_cast<uintptr_t>(value);}
 
-void CheckOutputLayout(uint32_t tailTokens) {
+void CheckOutputLayout(uint32_t resident,uint32_t tailTokens) {
     // This runs the production ring code. It validates byte extents, sector
     // ownership and event credits, not hardware DMA overlap or visibility.
     constexpr uint32_t sourceRows=128;
-    const uint32_t stride=SIM_RESIDENT+tailTokens;
+    const uint32_t stride=resident+tailTokens;
     const size_t outputBytes=uint64_t(SIM_BATCH+1)*stride*kTokenBytes;
     const size_t storageBytes=(outputBytes+128+63)/64*64;
     std::unique_ptr<uint8_t,decltype(&std::free)> allocation(
@@ -26,14 +26,14 @@ void CheckOutputLayout(uint32_t tailTokens) {
     for(size_t i=0;i<source.size();++i)source[i]=uint8_t((i*23+i/11)%251);
     UbmemRegion region{kUbmemMagic,kUbmemVersion,0x100000,Address(source.data()),source.size(),7,
         Address(output),outputBytes,0,kUbmemHostLocal};
-    assert(UbmemRegionValid(&region));
+    assert(UbmemRegionValid(&region,resident));
     // Packed batch size does not describe the registered stable-owner extent.
-    region.outputBytes=uint64_t(SIM_RESIDENT)*kTokenBytes;
-    assert(UbmemRegionValid(&region));
+    region.outputBytes=uint64_t(resident)*kTokenBytes;
+    assert(UbmemRegionValid(&region,resident));
     --region.outputBytes;
-    assert(!UbmemRegionValid(&region));
+    assert(!UbmemRegionValid(&region,resident));
     region.outputBytes=outputBytes;
-    Context ctx{};ctx.ubmemRegion=Address(&region);
+    Context ctx{};ctx.ubmemRegion=Address(&region);ctx.shape.resident=resident;
     std::vector<uint8_t> scratch(32000),overflow(12288);
     LocalTensor<uint8_t> local{scratch.data(),scratch.size()},extra{overflow.data(),overflow.size()};
     std::vector<uint8_t> expected(outputBytes);
@@ -58,8 +58,8 @@ void CheckOutputLayout(uint32_t tailTokens) {
         assert(!pipe.AddAt(region.peerBase+region.bytes-1,base,71));
         // ABC and the next owner may be inside the registration, but Fetch
         // must still reject them as destinations for this owner's hot rows.
-        assert(!pipe.AddAt(region.peerBase,base,SIM_RESIDENT));
-        assert(!pipe.AddAt(region.peerBase,base,SIM_RESIDENT+kSlots-1));
+        assert(!pipe.AddAt(region.peerBase,base,resident));
+        assert(!pipe.AddAt(region.peerBase,base,resident+kSlots-1));
         assert(!pipe.AddAt(region.peerBase,region.outputBase-1,0));
         assert(!pipe.AddAt(region.peerBase,region.outputBase+region.outputBytes,0));
         assert(pipe.Finish()==39);
@@ -72,7 +72,7 @@ void CheckOutputLayout(uint32_t tailTokens) {
         copy_model::worker=b;
         UbmemWindowCopyPipeline pipe(&ctx,0,local,extra);
         uint64_t base=Address(output)+uint64_t(b+1)*stride*kTokenBytes;
-        assert(pipe.BeginRunAt(base,SIM_RESIDENT-32,31));
+        assert(pipe.BeginRunAt(base,resident-32,31));
         uint32_t copied=0;
         while(copied<31) {
             auto peer=[&](uint32_t j){return region.peerBase+3+uint64_t(copied+j)*kTokenBytes;};
@@ -84,11 +84,11 @@ void CheckOutputLayout(uint32_t tailTokens) {
             copied+=n;
         }
         assert(pipe.Finish()==31);
-        assert(!pipe.BeginRunAt(base,SIM_RESIDENT,1));
-        assert(!pipe.BeginRunAt(base,SIM_RESIDENT-1,2));
+        assert(!pipe.BeginRunAt(base,resident,1));
+        assert(!pipe.BeginRunAt(base,resident-1,2));
         assert(!pipe.BeginRunAt(base,0,0));
         assert(!pipe.BeginRunAt(region.outputBase+region.outputBytes,0,1));
-        std::memcpy(expected.data()+(uint64_t(b+1)*stride+SIM_RESIDENT-32)*kTokenBytes,source.data()+3,31*kTokenBytes);
+        std::memcpy(expected.data()+(uint64_t(b+1)*stride+resident-32)*kTokenBytes,source.data()+3,31*kTokenBytes);
         copy_model::Drained();
     }
     check();
@@ -97,7 +97,7 @@ void CheckOutputLayout(uint32_t tailTokens) {
     // arbitrary LRU mapping. Consecutive logical ranks are not safe owners.
     std::vector<uint32_t> slots;
     for(uint32_t i=0;i<61;++i)slots.push_back((i*17)%61);
-    slots.push_back(SIM_RESIDENT-2);slots.push_back(SIM_RESIDENT-1);
+    slots.push_back(resident-2);slots.push_back(resident-1);
     for(uint32_t b=0;b<SIM_BATCH;++b) {
         for(uint32_t worker=0;worker<kFinalWorkers;++worker) {
             copy_model::worker=b*kFinalWorkers+worker;
@@ -109,7 +109,7 @@ void CheckOutputLayout(uint32_t tailTokens) {
                 assert(pipe.Add(region.peerBase+offset,slots[i]));++accepted;
                 std::memcpy(expected.data()+(uint64_t(b+1)*stride+slots[i])*kTokenBytes,source.data()+offset,kTokenBytes);
             }
-            assert(!pipe.Add(region.peerBase,SIM_RESIDENT));
+            assert(!pipe.Add(region.peerBase,resident));
             assert(pipe.Finish()==accepted);copy_model::Drained();
         }
     }
@@ -125,5 +125,6 @@ void CheckOutputLayout(uint32_t tailTokens) {
 }
 
 int main() {
-    for(uint32_t tail:{0U,384U,640U})CheckOutputLayout(tail);
+    for(uint32_t tail:{0U,384U,640U})CheckOutputLayout(SIM_RESIDENT,tail);
+    if(SIM_BATCH<=2)CheckOutputLayout(SIM_RESIDENT==8192?2048:8192,0);
 }

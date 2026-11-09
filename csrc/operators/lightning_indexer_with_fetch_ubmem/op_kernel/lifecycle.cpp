@@ -63,7 +63,7 @@ __aicore__ inline void CompleteBatch(__gm__ Context* ctx,uint32_t b) {
     ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),kRowStatusWords*4);
     auto region=UbmemRegionAt(ctx);
     uint64_t error=info[0]|row->error;
-    if(!ctx->ubmemStatus || !UbmemRegionValid(region))error|=kUbmemInvalidRegion;
+    if(!ctx->ubmemStatus || !UbmemRegionValid(region,shape.resident))error|=kUbmemInvalidRegion;
     uint64_t scheduled=0,completed=0;
     for(uint32_t w=0;w<shape.finalWorkers;++w) {
         auto post=FinalPostAt(ctx,b*shape.finalWorkers+w);
@@ -78,7 +78,7 @@ __aicore__ inline void CompleteBatch(__gm__ Context* ctx,uint32_t b) {
         if(status[2]!=row->requests)error|=kUbmemIncomplete;
         status[0]=error;status[1]=row->requests;status[3]=scheduled;status[4]=completed;
         status[5]=(status[2]+completed)*shape.tokenBytes;
-        status[6]=UbmemRegionValid(region)?region->generation:0;
+        status[6]=UbmemRegionValid(region,shape.resident)?region->generation:0;
         ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),128);
     }
     row->error=static_cast<uint32_t>(error);
@@ -105,7 +105,7 @@ extern "C" __global__ __aicore__ void kvip_ubmem_init_kernel(GM_ADDR bindings) {
         uint64_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
         uint64_t stride=ctx->outputStride?ctx->outputStride:shape.resident;
         uint64_t rowBytes=stride*shape.tokenBytes;
-        uint32_t error=(!ctx->ubmemStatus || !UbmemRegionValid(region) || !ctx->tokenAddresses ||
+        uint32_t error=(!ctx->ubmemStatus || !UbmemRegionValid(region,shape.resident) || !ctx->tokenAddresses ||
             !ctx->lruSlots || !ctx->reservedHot || !ctx->changeSlots || !ctx->changeCount ||
             ctx->addressStride<shape.history || stride<shape.resident || (stride-shape.resident)%128 || (ctx->tailBounds && stride<shape.resident+384) ||
             rowBytes%32 || ctx->prefetchLimit>kLruSlots || !ctx->windowLimit || ctx->windowLimit>480)?kUbmemInvalidRegion:0;
