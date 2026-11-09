@@ -22,7 +22,7 @@ constexpr uint32_t kScanTokens=kBatchedRows?23808:28672, kCandidateCapacity=2048
 static_assert(!kWindowScanFused || sizeof(uint32_t)*kCandidateCapacity<=kScanTokens,
               "Fused candidate-map values overlap the candidate ID array");
 static_assert(!kBatchedRows || kScanTokens+4*kCandidateCapacity<=32000,"Candidate scratch overflow");
-static_assert(!kBatchedRows || kPostGroups*sizeof(Row)<=8448,"Row scratch overflow");
+static_assert(!kBatchedRows || 8*sizeof(Row)<=8448,"Row scratch overflow");
 static_assert(UbmemGroupedCopyPipeline::kScratchBytes<=kScanTokens,"Grouped copies overlap live candidates");
 static_assert(!kWindowScanFused || V9_PARTIAL_SCAN_SIMD,"Fused scan requires SIMD clipping");
 // Clip each query before union so publication skew never admits future bits.
@@ -213,16 +213,8 @@ inline void PrepareCandidateWqes(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* lo,
 // This separate 8448-byte tensor is neither scanned nor used by the DMA ring,
 // so the second batch and subsequent 240-row peer banks cannot clobber IDs.
 constexpr uint32_t kUbmemLocalIdCapacity=448;
-constexpr uint32_t kUbmemLocalIdOffsetWords=kPostGroups*sizeof(Row)/sizeof(uint32_t);
-constexpr uint32_t kUbmemLocalIdGroups=kPostGroups==1?1:
-    ((V9_WINDOW_COPY_ENGINE==0 || V9_WINDOW_COPY_ENGINE==4) && kPostGroups==2?2:0);
-static_assert(kUbmemLocalIdGroups!=1 || kPostBank==kUbmemLocalIdCapacity,
-              "Single-batch local IDs must fit one peer bank");
-static_assert(kUbmemLocalIdGroups!=2 ||
-              (kUbmemLocalIdOffsetWords+2*kUbmemLocalIdCapacity)*sizeof(uint32_t)<=8448,
-              "Retained IDs overlap the end of rowStorage");
-__aicore__ inline bool UbmemWindowUseLocalIds(uint32_t count) {
-    return kUbmemLocalIdGroups!=0 && count!=0 && count<=kUbmemLocalIdCapacity;
+__aicore__ inline bool UbmemWindowUseLocalIds(uint32_t groups,uint32_t count) {
+    return groups!=0 && count!=0 && count<=kUbmemLocalIdCapacity;
 }
 __simd_vf__ inline void StageUbmemWindowIds(__ubuf__ uint32_t* dst,
     __ubuf__ uint32_t* src,uint32_t count) {
@@ -237,33 +229,31 @@ __simd_vf__ inline void StageUbmemWindowIds(__ubuf__ uint32_t* dst,
 }
 // Scanning is finished before this task runs. Peer staging occupies only the
 // low work area, disjoint from cfg and the ring's bitmap scratch allocation.
-constexpr uint32_t kUbmemPeerBytes=kPostGroups*kPostBank*sizeof(uint64_t);
-constexpr uint32_t kUbmemPlanCount=kPostGroups*kPostBank/8;
-static_assert(kPostBank%8==0,"Prepared groups must not cross peer banks");
-static_assert(kUbmemPeerBytes+kUbmemPlanCount*sizeof(uint32_t)<=4096,
-              "Peer bank and group plans overlap copy overflow");
+// Maximum 480 peer addresses plus 60 plans fit within the 4096-byte bank.
+static_assert(480*sizeof(uint64_t)+60*sizeof(uint32_t)<=4096,"Peer bank scratch overflow");
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
 inline void PrepareUbmemWindow(__gm__ Context* ctx,uint32_t firstBatch,uint32_t begin,
     uint32_t batch,uint32_t history,uint32_t resident,uint32_t serviceLanes,
+    uint32_t postThreads,uint32_t postBank,uint32_t localIdGroups,
     __ubuf__ uint32_t* inputs,__ubuf__ uint32_t* localIds,
     __ubuf__ uint64_t* peers,__ubuf__ uint32_t* plans,
     uint64_t peerBase,uint64_t maxPeerOffset
     ) {
-    const uint32_t g=threadIdx.x/kPostThreads,t=threadIdx.x%kPostThreads,b=firstBatch+g*serviceLanes;
+    const uint32_t g=threadIdx.x/postThreads,t=threadIdx.x%postThreads,b=firstBatch+g*serviceLanes;
     uint32_t n=0;
     if(b<batch) {
         auto input=inputs+g*80;auto in64=reinterpret_cast<__ubuf__ uint64_t*>(input);
         uint32_t count=input[64];n=count>begin?count-begin:0;
-        if(n>kPostBank)n=kPostBank;
+        if(n>postBank)n=postBank;
         if(input[67])n=0;
         auto jobs=reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*8192;
         auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*history;
         auto addresses=reinterpret_cast<__gm__ uint64_t*>(in64[34]);
-        for(uint32_t i=t;i<n;i+=kPostThreads) {
-            uint32_t token=localIds && kUbmemLocalIdGroups && count<=kUbmemLocalIdCapacity?
+        for(uint32_t i=t;i<n;i+=postThreads) {
+            uint32_t token=localIds && localIdGroups && count<=kUbmemLocalIdCapacity?
                 localIds[g*kUbmemLocalIdCapacity+begin+i]:asc_ldcg(jobs+begin+i);
             uint64_t peer=asc_ldcg(addresses+token);
-            peers[g*kPostBank+i]=peer;
+            peers[g*postBank+i]=peer;
             uint32_t logicalSlot=input[65]+begin+i;
             asc_stcg(map+token,logicalSlot);
             RecordChange(resident,ctx,b,logicalSlot,token);
@@ -276,19 +266,21 @@ __aicore__ inline void CopyUbmemWindow(__gm__ Context* ctx,uint32_t firstBatch,
     LocalTensor<uint32_t> rowStorage,__gm__ Event* event
     ) {
     const auto shape=LoadRuntimeShape(ctx);
+    const auto geometry=MakePostGeometry(shape.batch,shape.serviceLanes,V9_WINDOW_COPY_ENGINE==0 || V9_WINDOW_COPY_ENGINE==4);
+    const uint32_t peerBytes=geometry.groups*geometry.bank*sizeof(uint64_t);
     uint32_t maxCount=0,acceptedTotal=0,lastGroup=0;
-    for(uint32_t b=firstBatch;b<shape.batch && (b-firstBatch)/shape.serviceLanes<kPostGroups;b+=shape.serviceLanes) {
+    for(uint32_t b=firstBatch;b<shape.batch && (b-firstBatch)/shape.serviceLanes<geometry.groups;b+=shape.serviceLanes) {
         auto input=cfg[256+((b-firstBatch)/shape.serviceLanes)*80];input.SetValue(66,0);input.SetValue(67,0);
         uint32_t n=input.GetValue(64);if(n>maxCount)maxCount=n;
     }
     if(!maxCount)return;
     bool usedSimt=false;
     __ubuf__ uint32_t* localIds=nullptr;
-    if constexpr(kUbmemLocalIdGroups==1) {
-        if(UbmemWindowUseLocalIds(maxCount))
+    if(geometry.localIdGroups==1) {
+        if(UbmemWindowUseLocalIds(geometry.localIdGroups,maxCount))
             localIds=reinterpret_cast<__ubuf__ uint32_t*>(scratch[kScanTokens/4].GetPhyAddr());
-    } else if constexpr(kUbmemLocalIdGroups==2) {
-        localIds=reinterpret_cast<__ubuf__ uint32_t*>(rowStorage[kUbmemLocalIdOffsetWords].GetPhyAddr());
+    } else if(geometry.localIdGroups==2) {
+        localIds=reinterpret_cast<__ubuf__ uint32_t*>(rowStorage[geometry.localIdOffsetWords].GetPhyAddr());
     }
     // FastService has finished consuming candidate IDs for every batch before
     // calling here. Depth eight borrows scratch[0,31488) plus the dead
@@ -297,36 +289,36 @@ __aicore__ inline void CopyUbmemWindow(__gm__ Context* ctx,uint32_t firstBatch,
     // at byte 16384, so even next-bank SIMT preparation cannot reuse in-flight
     // stages. rowStorage remains a separate buffer until the final drain.
     constexpr uint32_t overflowOffset=4096,cfgOffset=16384;
-    static_assert(kPostGroups*kPostBank*sizeof(uint64_t)<=overflowOffset,"Peer bank overlaps copy overflow");
     static_assert(UbmemWindowCopyPipeline::kScratchBytes<=32000,"Window ring exceeds retired candidates");
     static_assert(overflowOffset+UbmemWindowCopyPipeline::kOverflowBytes<=cfgOffset,"Copy overflow overlaps cfg");
     UbmemWindowCopyPipeline copyPipe(ctx,0,scratch.ReinterpretCast<uint8_t>(),
         work.ReinterpretCast<uint8_t>()[overflowOffset]);
-    for(uint32_t begin=0;begin<maxCount;begin+=kPostBank) {
+    for(uint32_t begin=0;begin<maxCount;begin+=geometry.bank) {
         // Publish scalar metadata/error changes and finish reading the prior
         // peer bank before SIMT reuses it. The ring itself uses other scratch.
         SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
         Simt::VF_CALL<PrepareUbmemWindow>(Simt::Dim3{512,1,1},ctx,firstBatch,begin,
             shape.batch,shape.history,shape.resident,shape.serviceLanes,
+            geometry.threads,geometry.bank,geometry.localIdGroups,
             reinterpret_cast<__ubuf__ uint32_t*>(cfg[256].GetPhyAddr()),
             localIds,
             reinterpret_cast<__ubuf__ uint64_t*>(work.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ uint32_t*>(work[kUbmemPeerBytes/4].GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(work[peerBytes/4].GetPhyAddr()),
             copyPipe.PlanPeerBase(),copyPipe.PlanMaxPeerOffset()
             );
         SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-        auto peers=work.ReinterpretCast<uint64_t>();auto plans=work[kUbmemPeerBytes/4];
+        auto peers=work.ReinterpretCast<uint64_t>();auto plans=work[peerBytes/4];
         if(!usedSimt)
-        for(uint32_t b=firstBatch;b<shape.batch && (b-firstBatch)/shape.serviceLanes<kPostGroups;b+=shape.serviceLanes) {
+        for(uint32_t b=firstBatch;b<shape.batch && (b-firstBatch)/shape.serviceLanes<geometry.groups;b+=shape.serviceLanes) {
             uint32_t g=(b-firstBatch)/shape.serviceLanes;auto input=cfg[256+g*80];auto in64=input.ReinterpretCast<uint64_t>();
             uint32_t count=input.GetValue(64);if(count<=begin || input.GetValue(67))continue;
-            uint32_t n=count-begin;if(n>kPostBank)n=kPostBank;
+            uint32_t n=count-begin;if(n>geometry.bank)n=geometry.bank;
             uint32_t accepted=input.GetValue(66),slotBase=input.GetValue(65);
             uint64_t output=in64.GetValue(35);
             {
                 bool contiguous=!ctx->lruSlots && copyPipe.BeginRunAt(output,slotBase+begin,n);
                 for(uint32_t i=0;i<n;) {
-                    uint32_t added=1,index=g*kPostBank+i;
+                    uint32_t added=1,index=g*geometry.bank+i;
                     uint64_t peer=peers.GetValue(index);
                     if(contiguous && n-i>=8 && copyPipe.TryAddNext8(peer,peers.GetValue(index+1),
                         peers.GetValue(index+2),peers.GetValue(index+3),peers.GetValue(index+4),peers.GetValue(index+5),
@@ -347,7 +339,7 @@ __aicore__ inline void CopyUbmemWindow(__gm__ Context* ctx,uint32_t firstBatch,
     // A released plan exposes the Row and mapping to readers. Completion
     // status and Event state 1 must still wait for every shared ring credit.
     uint32_t completed=usedSimt?acceptedTotal:copyPipe.Finish();
-    for(uint32_t b=firstBatch;b<shape.batch && (b-firstBatch)/shape.serviceLanes<kPostGroups;b+=shape.serviceLanes) {
+    for(uint32_t b=firstBatch;b<shape.batch && (b-firstBatch)/shape.serviceLanes<geometry.groups;b+=shape.serviceLanes) {
         uint32_t g=(b-firstBatch)/shape.serviceLanes;auto input=cfg[256+g*80];auto state=rowStorage[g*256];
         uint32_t error=input.GetValue(67);if(completed!=acceptedTotal)error|=kUbmemIncomplete;
         if(error)state.SetValue(11,state.GetValue(11)|error);
@@ -361,7 +353,7 @@ __aicore__ inline void CopyUbmemWindow(__gm__ Context* ctx,uint32_t firstBatch,
 }
 __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,uint32_t lane,
     LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids) {
-    auto ctx=reinterpret_cast<__gm__ Context*>(pointer);const auto shape=LoadRuntimeShape(ctx);auto events=reinterpret_cast<__gm__ Event*>(ctx->events);
+    auto ctx=reinterpret_cast<__gm__ Context*>(pointer);const auto shape=LoadRuntimeShape(ctx);const auto geometry=MakePostGeometry(shape.batch,shape.serviceLanes,V9_WINDOW_COPY_ENGINE==0 || V9_WINDOW_COPY_ENGINE==4);auto events=reinterpret_cast<__gm__ Event*>(ctx->events);
     auto event=events+epoch*shape.serviceLanes+lane;event->core=core;event->epoch=epoch;V9_FETCH_PROFILE(event->waitBegin=GetSystemCycle();)
     if(epoch) {
         auto previous=reinterpret_cast<__gm__ volatile Event*>(events)+(epoch-1)*shape.serviceLanes+lane;
@@ -376,10 +368,10 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
     // A service lane owns at most eight Row snapshots in UB. For larger
     // batches/window counts process consecutive groups sequentially; each
     // chunk completes its copy before the same UB storage is reused.
-    for(uint32_t groupBase=0;groupBase<(shape.batch+shape.serviceLanes-1)/shape.serviceLanes;groupBase+=kPostGroups) {
+    for(uint32_t groupBase=0;groupBase<(shape.batch+shape.serviceLanes-1)/shape.serviceLanes;groupBase+=geometry.groups) {
     uint64_t postedCount=0;
     const uint32_t firstBatch=ServiceChunkFirst(lane,groupBase,shape.serviceLanes);
-    const uint32_t groupCount=ServiceChunkCount(shape.batch,firstBatch,shape.serviceLanes,kPostGroups);
+    const uint32_t groupCount=ServiceChunkCount(shape.batch,firstBatch,shape.serviceLanes,geometry.groups);
     // Freeze every ready snapshot before scanning any batch. An early snapshot
     // is usable only when every end is at the ceiling; otherwise resample
     // after completion so early planning cannot shorten the captured history.
@@ -392,7 +384,7 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
         SetFlag<HardEvent::S_MTE2>(EVENT_ID0);WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
         DataCopyPad(work,progressGm[firstBatch*128],gather,padding);
         SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-        for(uint32_t b=firstBatch;b<shape.batch && (b-firstBatch)/shape.serviceLanes<kPostGroups;b+=shape.serviceLanes)for(uint32_t q=0;q<4;++q) {
+        for(uint32_t b=firstBatch;b<shape.batch && (b-firstBatch)/shape.serviceLanes<geometry.groups;b+=shape.serviceLanes)for(uint32_t q=0;q<4;++q) {
             uint32_t end=work.GetValue(((b-firstBatch)/shape.serviceLanes)*128+q*32),cap=RuntimeTrigger(shape.history,shape.resident,shape.rounds,epoch)*128;
             if(ctx->queryEnds) {
                 uint32_t bound=reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)[b*4+q];
@@ -413,7 +405,7 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
             SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
         }
     }
-    for(uint32_t b=firstBatch;b<shape.batch && (b-firstBatch)/shape.serviceLanes<kPostGroups;b+=shape.serviceLanes) {
+    for(uint32_t b=firstBatch;b<shape.batch && (b-firstBatch)/shape.serviceLanes<geometry.groups;b+=shape.serviceLanes) {
         // Transfer state as a block. Avoid scalar GM read/modify/write and
         // repeated cache maintenance for every counter/cache line.
         auto state=kBatchedRows?rowStorage[((b-firstBatch)/shape.serviceLanes)*256]:work[2048];auto state64=state.ReinterpretCast<uint64_t>();
@@ -544,16 +536,16 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
                 postInput.SetValue(64,count);postInput.SetValue(65,shape.resident+slots);
                 postInput.SetValue(66,pending);post64.SetValue(34,addresses);
                 post64.SetValue(35,output);
-                if constexpr(kUbmemLocalIdGroups==2) {
-                    if(UbmemWindowUseLocalIds(count)) {
-                        auto retained=rowStorage[kUbmemLocalIdOffsetWords+((b-firstBatch)/shape.serviceLanes)*kUbmemLocalIdCapacity];
+                if(geometry.localIdGroups==2) {
+                    if(UbmemWindowUseLocalIds(geometry.localIdGroups,count)) {
+                        auto retained=rowStorage[geometry.localIdOffsetWords+((b-firstBatch)/shape.serviceLanes)*kUbmemLocalIdCapacity];
                         SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
                         StageUbmemWindowIds(reinterpret_cast<__ubuf__ uint32_t*>(retained.GetPhyAddr()),
                             reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),count);
                         SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
                     }
                 }
-                if(!UbmemWindowUseLocalIds(count))
+                if(!UbmemWindowUseLocalIds(geometry.localIdGroups,count))
                 {
                     GlobalTensor<uint32_t> jobs;
                     jobs.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*8192);

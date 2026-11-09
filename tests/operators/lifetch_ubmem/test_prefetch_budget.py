@@ -100,6 +100,10 @@ def test_service_chunk_assignment_covers_every_request_once(tmp_path):
         '#include "post_geometry.h"\n'
         "int main() { for(uint32_t b=1;b<=32;++b) for(uint32_t lanes=2;lanes<=64;lanes+=2) {"
         "uint32_t groups=(b+lanes-1)/lanes,chunk=std::min(groups,8U),seen[32]={};"
+        "auto geometry=rotating::MakePostGeometry(b,lanes);assert(geometry.groups==chunk);"
+        "assert(geometry.threads*geometry.groups==512 || geometry.groups==3 || geometry.groups>=5);"
+        "assert(geometry.groups*geometry.bank<=480 && geometry.bank%8==0);"
+        "assert(geometry.groups*1024<=8448);"
         "for(uint32_t base=0;base<groups;base+=chunk) for(uint32_t lane=0;lane<lanes;++lane){"
         "auto first=rotating::ServiceChunkFirst(lane,base,lanes);"
         "auto count=rotating::ServiceChunkCount(b,first,lanes,chunk);"
