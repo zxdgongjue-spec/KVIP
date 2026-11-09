@@ -12,7 +12,7 @@ import pytest
 
 from kvip.operators.lifetch.binding import LIFetchBinding
 from kvip.operators.lifetch.geometry import prefetch_budget
-from kvip.operators.lifetch_ubmem import specialization
+from kvip.operators.lifetch_ubmem import build as specialization
 from kvip.operators.lifetch_ubmem.binding import UbmemBinding
 
 
@@ -55,7 +55,7 @@ def test_device_budget_saturates_without_unsigned_wrap(tmp_path):
 
 def test_shared_hot_selector_invalidates_specialization_cache(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
-    module = repo / "python/kvip/operators/lifetch_ubmem/specialization.py"
+    module = repo / "python/kvip/operators/lifetch_ubmem/build.py"
     module.parent.mkdir(parents=True)
     module.touch()
     source = repo / "csrc/operators/lightning_indexer_with_fetch_ubmem"
@@ -77,16 +77,16 @@ def test_shared_hot_selector_invalidates_specialization_cache(tmp_path, monkeypa
     options = dict(
         cache_dir=tmp_path / "cache",
         cann=tmp_path / "cann",
-        shape=specialization.Specialization(2, 33024, 8192, 64, 656, 32, 8, "Ascend950DT_9582"),
+        shape=specialization.UbmemGeometry(2, 33024, 8192, 64, 656, 32, 8, "Ascend950DT_9582"),
     )
-    old = specialization.build_specialization(**options)
-    assert specialization.build_specialization(**options) == old
+    old = specialization.build_ubmem_library(**options)
+    assert specialization.build_ubmem_library(**options) == old
     assert len(calls) == 2
-    alternate = specialization.Specialization(16, 131072, 16384, 32, 2624, 32, 8, "Ascend950DT_9582")
-    assert specialization.build_specialization(**(options | {"shape": alternate})) == old
+    alternate = specialization.UbmemGeometry(16, 131072, 16384, 32, 2624, 32, 8, "Ascend950DT_9582")
+    assert specialization.build_ubmem_library(**(options | {"shape": alternate})) == old
     assert len(calls) == 2  # no recompilation for a new runtime geometry or row width
     selector.write_text("// changed hot-slot algorithm\n")
-    new = specialization.build_specialization(**options)
+    new = specialization.build_ubmem_library(**options)
     assert new != old and len(calls) == 4
 
 

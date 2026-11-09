@@ -9,8 +9,7 @@ import numpy as np
 import pytest
 
 from kvip.adapters.ubmem import UbmemLease
-from kvip.operators.lifetch_ubmem.forward import UbmemForward
-from kvip.operators.lifetch_ubmem.specialization import Specialization
+from kvip.operators.lifetch_ubmem.build import UbmemGeometry
 from kvip.operators.lifetch_ubmem.workspace import UbmemQueryInputs, UbmemWorkspace, device_words, rotation_spec
 
 
@@ -111,25 +110,39 @@ def test_capture_stream_only_allowed_inside_fenced_scope():
 def test_static_shape_and_ubmem_scratch_contract():
     for batch in (1, 2):
         for width in (656, 2624):
-            shape = Specialization(batch, 33024, 8192, 64, width, 32, 8, "Ascend950DT_9582")
+            shape = UbmemGeometry(batch, 33024, 8192, 64, width, 32, 8, "Ascend950DT_9582")
             assert set(shape.options("/cann")) == {"RUN_MODE", "ASCEND_CANN_PACKAGE_PATH", "SOC_VERSION"}
             scratch = rotation_spec(batch, shape.history, shape.resident, shape.aic_count, shape.intermediate_fetches)
             assert scratch["ubmem_status"] == ((batch, 16), "int64")
             assert "final_status" not in scratch and "prefetch_status" not in scratch
     with pytest.raises(ValueError, match="cold tiles"):
-        Specialization(2, 8448, 8192, 64, 656, 32, 8, "Ascend950DT_9582")
+        UbmemGeometry(2, 8448, 8192, 64, 656, 32, 8, "Ascend950DT_9582")
 
 
 @pytest.mark.parametrize("batch,resident", [(1, 2048), (16, 2048), (24, 16384), (32, 2048)])
 def test_extended_ubmem_geometry(batch, resident):
-    shape = Specialization(batch, 131072, resident, 32, 656, 32, 8, "Ascend950PR_9599")
+    shape = UbmemGeometry(batch, 131072, resident, 32, 656, 32, 8, "Ascend950PR_9599")
     spec = rotation_spec(batch, shape.history, resident, shape.aic_count, shape.intermediate_fetches)
     assert spec["mapping"][0] == (batch, shape.history)
     assert spec["reserved_hot"][0] == (batch, resident)
 
 
+def test_shared_workspace_keeps_ubmem_transport_specific_status():
+    from kvip.operators.lifetch.geometry import final_aivs, li_geometry
+    from kvip.operators.lifetch.workspace import rotation_spec as urma_spec
+
+    for batch in (1, 8, 16, 32):
+        geometry = li_geometry(batch, "auto", 8, 32)
+        original = urma_spec(batch, 131072, 16384, final_aivs(batch, "auto", 32),
+                             geometry["intermediate_fetches"], geometry["service_aivs_per_window"], 1216)
+        ubmem = rotation_spec(batch, 131072, 16384, 32, 8)
+        assert set(original) - {"final_status"} == set(ubmem) - {"ubmem_status"}
+        assert all(ubmem[name] == spec for name, spec in original.items() if name != "final_status")
+        assert ubmem["ubmem_status"] == ((batch, 16), "int64")
+
+
 def test_ubmem_supports_wide_batch_and_many_windows():
-    shape = Specialization(32, 131072, 16384, 32, 656, 32, 32, "Ascend950PR_9599")
+    shape = UbmemGeometry(32, 131072, 16384, 32, 656, 32, 32, "Ascend950PR_9599")
     assert shape.options("/cann")["SOC_VERSION"] == "Ascend950PR_9599"
 
 
@@ -185,6 +198,8 @@ def test_unique_active_owners_accepts_repeated_padding_without_device_read():
 
 
 def test_forward_only_submits_bound_pointers_on_the_current_lease_stream():
+    import kvip
+
     launch = Mock(return_value=0)
     device = object()
     rotating = SimpleNamespace(
@@ -195,7 +210,7 @@ def test_forward_only_submits_bound_pointers_on_the_current_lease_stream():
         lease=SimpleNamespace(check_stream=Mock(return_value=SimpleNamespace(npu_stream=303))),
     )
     update = SimpleNamespace(device=device, bindings=SimpleNamespace(numel=lambda: 28, data_ptr=lambda: 202))
-    forward = UbmemForward(rotating, update)
+    forward = kvip.LIFetch(rotating, update)
     forward()
     args = launch.call_args.args
     assert args[:3] == (101, 202, 303)
@@ -203,6 +218,46 @@ def test_forward_only_submits_bound_pointers_on_the_current_lease_stream():
     launch.return_value = 4
     with pytest.raises(RuntimeError, match="launch failed: 4"):
         forward()
+
+
+def test_public_forward_preserves_urma_launch_and_stream():
+    import kvip
+
+    launch = Mock(return_value=0)
+    device = object()
+    stream = SimpleNamespace(npu_stream=303)
+    rotating = SimpleNamespace(
+        device=device,
+        shape_pointer=404,
+        torch=SimpleNamespace(npu=SimpleNamespace(current_stream=Mock(return_value=stream))),
+        library=SimpleNamespace(kvip_lifetch_forward=launch),
+        bindings=SimpleNamespace(data_ptr=lambda: 101),
+    )
+    update = SimpleNamespace(device=device, bindings=SimpleNamespace(numel=lambda: 28, data_ptr=lambda: 202))
+    kvip.LIFetch(rotating, update)()
+    launch.assert_called_once_with(101, 202, 303, 404)
+    rotating.torch.npu.current_stream.assert_called_once_with(device)
+
+
+@pytest.mark.parametrize("transport", ["urma", "ubmem"])
+def test_public_selector_dispatches_transport(transport):
+    import kvip
+
+    class InferenceMode:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    torch = SimpleNamespace(inference_mode=InferenceMode)
+    policy = object()
+    config = SimpleNamespace(transport=transport)
+    with patch("kvip.adapters.vllm.binding._bind_selectors") as urma, \
+         patch("kvip.adapters.vllm.ubmem_binding._bind_selectors") as ubmem:
+        kvip.bind_selectors(torch, policy, config)
+        (ubmem if transport == "ubmem" else urma).assert_called_once_with(torch, policy, config)
+        (urma if transport == "ubmem" else ubmem).assert_not_called()
 
 
 @pytest.mark.parametrize("percent", [10, 30, 50])

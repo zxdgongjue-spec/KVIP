@@ -13,7 +13,7 @@ from kvip.runtime.build import build_failure
 
 
 @dataclass(frozen=True)
-class Specialization:
+class UbmemGeometry:
     """Validated per-invocation geometry; not a compiler specialization."""
 
     batch: int
@@ -61,9 +61,9 @@ def kvaf_cann(build_dir):
     raise ValueError(f"CANN path is missing from {build_dir}/CMakeCache.txt")
 
 
-def build_specialization(*, cache_dir, cann, shape, jobs=2):
+def build_ubmem_library(*, cache_dir, cann, shape, jobs=2):
     """Compile once before profiling/capture; never called by forward."""
-    if not isinstance(shape, Specialization) or jobs < 1:
+    if not isinstance(shape, UbmemGeometry) or jobs < 1:
         raise ValueError("A validated UBmem shape and positive jobs are required")
     source = Path(__file__).resolve().parents[4] / "csrc/operators/lightning_indexer_with_fetch_ubmem"
     if not (source / "CMakeLists.txt").is_file():

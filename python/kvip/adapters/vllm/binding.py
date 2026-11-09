@@ -6,7 +6,7 @@ from pathlib import Path
 
 from kvip.runtime.build import build_libraries
 from kvip.operators.lifetch.binding import LIFetchBinding
-from kvip.adapters.vllm.selector import VllmIndexSelector
+from kvip.adapters.vllm.selector import bind_group_selector
 from kvip.operators.lifetch.index_update import DirectIndexUpdate
 from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, LeasedRuntime
 
@@ -15,7 +15,15 @@ def bind_selectors(torch, policy, config):
     # Profiling allocates inference tensors; startup must initialize their
     # shared views under the same mode, without cloning graph-bound storage.
     with torch.inference_mode():
-        _bind_selectors(torch, policy, config)
+        transport = getattr(config, "transport", "urma")
+        if transport == "ubmem":
+            from kvip.adapters.vllm.ubmem_binding import _bind_selectors as bind_ubmem
+
+            bind_ubmem(torch, policy, config)
+        elif transport == "urma":
+            _bind_selectors(torch, policy, config)
+        else:
+            raise ValueError(f"Unsupported LIFetch transport: {transport}")
 
 
 def _bind_selectors(torch, policy, config):
@@ -88,18 +96,7 @@ def _bind_selectors(torch, policy, config):
             query_inputs=workspace.inputs,
             outputs=policy.fused_outputs[group],
         )
-        selector = VllmIndexSelector(
-            torch,
-            inputs=workspace.inputs,
-            rotating=rotating,
-            update=update,
-            logical_ids=storage.logical_ids,
-            row_owners=workspace.inputs.row_owners,
-            prefix_workspace=workspace.prefix_reset,
-            storage=storage,
-        )
-        selector.tail_source = policy.abc_descriptors[group, : setup.batch, 2:4]
-        selectors[group] = selector
+        selectors[group] = bind_group_selector(torch, policy, workspace, setup, group, storage, rotating, update)
     policy.indexer_selectors = selectors
     logging.getLogger("vllm").info(
         "KVAF decode backend=li_fetch groups=%s batch_capacity=%s history_capacity=%s hot_tokens=%s "

@@ -6,11 +6,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from kvip.adapters.ubmem import UbmemLease, UbmemLeasedRuntime
-from kvip.adapters.vllm.selector import VllmIndexSelector
+from kvip.adapters.vllm.selector import bind_group_selector
 from kvip.operators.lifetch_ubmem.binding import UbmemBinding
-from kvip.operators.lifetch_ubmem.forward import UbmemForward
 from kvip.operators.lifetch_ubmem.index_update import UbmemIndexUpdate
-from kvip.operators.lifetch_ubmem.specialization import Specialization, build_specialization, kvaf_cann
+from kvip.operators.lifetch_ubmem.build import UbmemGeometry, build_ubmem_library, kvaf_cann
 from kvip.operators.lifetch_ubmem.workspace import UbmemWorkspace
 from kvip.runtime.device import query_device_resources
 
@@ -24,7 +23,7 @@ def prepare_workspace(torch, policy, config, device_id, soc, index_heads=64):
     shapes, libraries = {}, {}
     for width in sorted(set(policy.group_sizes)):
         token_bytes = 656 * width
-        shape = Specialization(
+        shape = UbmemGeometry(
             batch,
             history,
             policy.history_capacity,
@@ -35,7 +34,7 @@ def prepare_workspace(torch, policy, config, device_id, soc, index_heads=64):
             soc,
         )
         shapes[token_bytes] = shape
-        libraries[token_bytes] = build_specialization(
+        libraries[token_bytes] = build_ubmem_library(
             cache_dir=Path(config.build_dir) / "lifetch_ubmem",
             cann=cann,
             shape=shape,
@@ -117,20 +116,9 @@ def _bind_selectors(torch, policy, config):
             plan_buffer=workspace.index_plan,
             extended_work=workspace.index_work,
         )
-        selector = VllmIndexSelector(
-            torch,
-            inputs=workspace.inputs,
-            rotating=rotating,
-            update=update,
-            logical_ids=storage.logical_ids,
-            row_owners=workspace.inputs.row_owners,
-            prefix_workspace=workspace.prefix_reset,
-            storage=storage,
-            forward_factory=UbmemForward,
-            unique_active_owners=True,
+        selectors[group] = bind_group_selector(
+            torch, policy, workspace, setup, group, storage, rotating, update, ubmem=True
         )
-        selector.tail_source = policy.abc_descriptors[group, : setup.batch, 2:4]
-        selectors[group] = selector
     policy.indexer_selectors = selectors
     logging.getLogger("vllm").info(
         "KVAF transport=ubmem decode_backend=li_fetch groups=%s batch_capacity=%s history_capacity=%s "

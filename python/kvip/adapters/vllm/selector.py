@@ -10,6 +10,17 @@ from copy import copy
 from kvip.operators.lifetch.forward import LIFetchForward
 
 
+def bind_group_selector(torch, policy, workspace, setup, group, storage, rotating, update, *, ubmem=False):
+    """Bind the shared selector to one group's persistent storage."""
+    selector = VllmIndexSelector(
+        torch, inputs=workspace.inputs, rotating=rotating, update=update,
+        logical_ids=storage.logical_ids, row_owners=workspace.inputs.row_owners,
+        prefix_workspace=workspace.prefix_reset, storage=storage, unique_active_owners=ubmem,
+    )
+    selector.tail_source = policy.abc_descriptors[group, : setup.batch, 2:4]
+    return selector
+
+
 class VllmIndexSelector:
     def __init__(
         self,

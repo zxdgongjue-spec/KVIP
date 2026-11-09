@@ -37,7 +37,6 @@ foreach(_width IN ITEMS 656 2624)
   ascendc_library(${_target} STATIC op_kernel/indexer.cpp op_kernel/lifecycle.cpp)
   ascendc_include_directories(${_target} PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel"
-    "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/indexer"
     "${CMAKE_CURRENT_SOURCE_DIR}/../common/lightning_indexer"
     "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/controller"
     "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/copy"

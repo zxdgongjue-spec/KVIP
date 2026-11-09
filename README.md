@@ -24,8 +24,8 @@ csrc/operators/
     op_kernel/                      # runtime-shaped LI, controller, pipelined copies, resolver/update
 python/kvip/
   operators/lidu.py
-  operators/lifetch/                 # URMA binding, forward, workspace, tiling, Index update
-  operators/lifetch_ubmem/            # startup build, runtime binding, workspace and update
+  operators/lifetch/                 # shared forward and workspace layout; URMA binding and update
+  operators/lifetch_ubmem/           # UBmem startup build, binding, workspace and update
   cache/                            # LRU, ABC and persistent Index storage
   adapters/kvaf.py                   # URMA Runtime lease and shared transport queues
   adapters/ubmem.py                  # local mapping/output/graph lifetime
@@ -63,8 +63,9 @@ forward = kvip.LIFetch(rotating, update)
 forward()  # round init -> LI/prefetch -> resolver -> outputs/Index update -> Fetch completion
 ```
 
-`LIFetch` accepts `LIFetchBinding` and `DirectIndexUpdate` objects;
-it is not a new tensor ABI. It retains both objects and uses their preallocated
+`LIFetch` accepts either the URMA or UBmem rotating binding and its matching
+Index update; it selects the transport launcher when the binding is created.
+It is not a new tensor ABI. It retains both objects and uses their preallocated
 bindings. No tensor allocation, synchronization, fixture reset or correctness
 readback is added to `forward()`. Transport/workspace ownership must outlive graph
 replay. Device errors remain available through the existing status/feedback path.
@@ -72,7 +73,8 @@ Individual launch methods remain internal diagnostic interfaces.
 
 `kvip.QueryInputs`, `kvip.LIFetchWorkspace`, `kvip.IndexCacheStorage`,
 `kvip.build_libraries` and `kvip.bind_selectors` expose the existing service setup.
-`bind_selectors` requires the current vLLM KVAF policy/writer contract; this is not
+`bind_selectors` dispatches on the policy configuration's transport and requires
+the current vLLM KVAF policy/writer contract; this is not
 an arbitrary vLLM-version plugin. The `kvop` package has been removed. External integrations must import `kvip`.
 Legacy `kvip.fused_*` imports resolve lazily to the canonical modules through
 `_compat.py`; there are no duplicate implementation or forwarding files. Migrating the service installation to

@@ -14,9 +14,9 @@ import numpy as np
 from kvip.adapters.ubmem import UbmemLease
 from kvip.cache.index_storage import IndexCacheStorage
 from kvip.operators.lifetch_ubmem.binding import UbmemBinding
-from kvip.operators.lifetch_ubmem.forward import UbmemForward
+from kvip.operators.lifetch.forward import LIFetchForward
 from kvip.operators.lifetch_ubmem.index_update import UbmemIndexUpdate
-from kvip.operators.lifetch_ubmem.specialization import Specialization, build_specialization, kvaf_cann
+from kvip.operators.lifetch_ubmem.build import UbmemGeometry, build_ubmem_library, kvaf_cann
 from kvip.operators.lifetch_ubmem.workspace import UbmemWorkspace
 from kvip.runtime.device import query_device_resources
 
@@ -192,7 +192,7 @@ def check_shape(
             plan_buffer=workspace.index_plan,
             extended_work=workspace.index_work,
         )
-        forward = UbmemForward(rotating, update)
+        forward = LIFetchForward(rotating, update)
 
         def verify(owners, *, phase, counts=None, padding=False):
             stream.synchronize()
@@ -511,8 +511,8 @@ def main():
     if args.runtime_shapes and (33024, 8192) != (args.history, args.resident):
         cases.append((args.batches[0], 33024, 8192, args.token_bytes[0]))
     for batch, history, resident, token_bytes in cases:
-        shape = Specialization(batch, history, resident, args.index_heads, token_bytes, aics, 8, args.soc)
-        library = build_specialization(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape)
+        shape = UbmemGeometry(batch, history, resident, args.index_heads, token_bytes, aics, 8, args.soc)
+        library = build_ubmem_library(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape)
         if selected_library is None:
             selected_library = library.resolve()
             print(f"UBMEM_RUNTIME_BINARY path={selected_library} sha256={hashlib.sha256(library.read_bytes()).hexdigest()}",

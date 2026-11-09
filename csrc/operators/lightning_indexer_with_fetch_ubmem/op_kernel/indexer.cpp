@@ -6,7 +6,7 @@ struct QLITilingData {
     uint32_t keyStride0=16384,keyDequantScaleStride0=128;
     uint32_t resident,splitQ,aicCount;
 };
-#include "indexer.h"
+#include "../../common/lightning_indexer/indexer.h"
 #endif
 extern "C" __global__ __aicore__ void kvip_ubmem_li_kernel(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)

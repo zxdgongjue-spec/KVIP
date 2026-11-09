@@ -160,13 +160,13 @@ def main():
         build_lidu(env, args.skip_lidu_build)
         call([sys.executable, "-m", "pip", "install", "--no-build-isolation", "-e", ROOT])
         sys.path.insert(0, str(ROOT / "python"))
-        from kvip.operators.lifetch_ubmem.specialization import Specialization, build_specialization
+        from kvip.operators.lifetch_ubmem.build import UbmemGeometry, build_ubmem_library
 
         # One library contains both KV widths and accepts runtime geometry.
-        build_specialization(
+        build_ubmem_library(
             cache_dir=build_dir / "lifetch_ubmem",
             cann=args.cann,
-            shape=Specialization(1, 33024, 8192, 64, 656, 32, 8, args.soc),
+            shape=UbmemGeometry(1, 33024, 8192, 64, 656, 32, 8, args.soc),
             jobs=args.jobs,
         )
         (ROOT / "build/dependencies.json").write_text(json.dumps(state, indent=2))
