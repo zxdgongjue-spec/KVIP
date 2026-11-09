@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[4]
 
 def test_ubmem_final_uses_published_compact_descriptors(tmp_path):
     common = ROOT / "csrc/operators/common/lifetch/final_phase_loop.h"
-    phase = ROOT / "csrc/operators/lightning_indexer_with_fetch_ubmem/op_kernel/resolver/final_fetch_phase.h"
+    phase = ROOT / "csrc/operators/lightning_indexer_with_fetch_ubmem/op_kernel/final_fetch_phase.h"
     loop = common.read_text().replace("#include LIFETCH_FINAL_PHASE", phase.read_text())
     loop = loop.replace("LIFETCH_FINAL_JOIN", "(void)0")
     source = r'''

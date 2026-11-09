@@ -2,7 +2,39 @@
 #if defined(__CCE_AICORE__)
 #include "context.h"
 #include "prefetch.h"
-#include "resolver.h"
+#include "../../common/lifetch/final_scratch.h"
+#include "ubmem/fused_batch_get_device.h"
+#include "../../common/lifetch/resolver_candidates.h"
+#include "../../common/lifetch/resident_selection.h"
+namespace rotating {
+__aicore__ inline __ubuf__ uint32_t* FinalPtr(LocalTensor<uint32_t> x) {return reinterpret_cast<__ubuf__ uint32_t*>(x.GetPhyAddr());}
+#define LIFETCH_CLEAN_CACHE_LINES ubmem_device::CleanCacheLines
+#include "../../common/lifetch/final_post.h"
+#undef LIFETCH_CLEAN_CACHE_LINES
+#include "../../common/lifetch/resolver.h"
+
+__aicore__ inline void ReplicatedFinal(__gm__ Context* ctx) {
+    const auto shape=LoadRuntimeShape(ctx);
+    const uint32_t rt_history=shape.history,rt_resident=shape.resident,rt_finalWorkers=shape.finalWorkers;
+#include "../../common/lifetch/resolver_front.h"
+    if(!error)Simt::VF_CALL<ReplicatedResolve<512>>(Simt::Dim3{512,1,1},shape.history,shape.resident,shape.finalWorkers,shape.tokenBytes,FinalPtr(selected),FinalPtr(loc),FinalPtr(positions),cold,
+        FinalPtr(keys),FinalPtr(ranks),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(ctl),
+        reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*shape.history,reinterpret_cast<__gm__ uint64_t*>(row->addresses),
+        reinterpret_cast<__gm__ int32_t*>(ctx->sourceBlocks),reinterpret_cast<__gm__ int32_t*>(ctx->sourceOffsets),
+        reinterpret_cast<__gm__ int32_t*>(ctx->destinations),reinterpret_cast<__gm__ uint32_t*>(ctx->count),w,row->slots,b,ctx);
+#include "../../common/lifetch/resolver_output.h"
+    PrepareFinalFetch(rt_finalWorkers,shape.finalPostOffset,ctx,b,w,own,batchBase+prefix,error,error?0:ctl.GetValue(5));
+    if(!w){
+        status[0]=error;status[1]=batchCount;status[2]=batchBase;status[3]=0;status[4]=0;
+        row->finalBegin=started;row->finalRequests=batchCount;row->finalCompleted=FinalPostAt(shape.finalPostOffset,ctx,core)->head;
+        row->finalPending=batchCount?1:0;row->finalEnd=GetSystemCycle();trace[3]=row->finalEnd;
+        ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(trace),64);
+        ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),32);
+        ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row)+960,64);
+    }
+    pipe.Destroy();
+}
+}
 using namespace AscendC;
 using namespace rotating;
 namespace {
@@ -87,7 +119,7 @@ __aicore__ inline void CompleteBatch(__gm__ Context* ctx,uint32_t b) {
     info[0]|=static_cast<uint32_t>(error);info[3]=0;info[4]=static_cast<uint32_t>(completed);
     if(!error) {
         row->finalPending=0;
-        Simt::VF_CALL<PublishCompletedResidency>(Simt::Dim3{256,1,1},shape.resident,ctx,b,static_cast<uint32_t>(completed));
+        Simt::VF_CALL<PublishDestinationResidency>(Simt::Dim3{256,1,1},shape.resident,ctx,b,static_cast<uint32_t>(completed));
         SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
     }
     ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),sizeof(Row));
@@ -146,7 +178,7 @@ extern "C" __global__ __aicore__ void kvip_ubmem_fetch_kernel(GM_ADDR bindings) 
         if(!ctx->fallbackAddresses || !UbmemRegionValid(region,shape.resident))error|=kUbmemInvalidRegion;
         if(row->pending || info[1]>kSlots)error|=kUbmemIncomplete;
 #define LIFETCH_FINAL_JOIN do {} while (0)
-#define LIFETCH_FINAL_PHASE "../../lightning_indexer_with_fetch_ubmem/op_kernel/resolver/final_fetch_phase.h"
+#define LIFETCH_FINAL_PHASE "../../lightning_indexer_with_fetch_ubmem/op_kernel/final_fetch_phase.h"
 #include "../../common/lifetch/final_phase_loop.h"
 #undef LIFETCH_FINAL_PHASE
 #undef LIFETCH_FINAL_JOIN

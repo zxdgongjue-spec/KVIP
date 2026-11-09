@@ -44,7 +44,6 @@ foreach(_width IN ITEMS 656 2624)
     "${CMAKE_CURRENT_SOURCE_DIR}/../common/lightning_indexer"
     "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/controller"
     "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/copy"
-    "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/resolver"
     "${KVAF_INCLUDE}"
     "${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include")
   ascendc_compile_options(${_target} PRIVATE ${_width_options} -O2 -g --cce-auto-sync=off
@@ -53,7 +52,7 @@ foreach(_width IN ITEMS 656 2624)
 endforeach()
 ascendc_library(kvip_ubmem_update_kernel STATIC op_kernel/index_cache_update.cpp)
 ascendc_include_directories(kvip_ubmem_update_kernel PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/resolver"
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
   "${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include")
 ascendc_compile_options(kvip_ubmem_update_kernel PRIVATE ${_device_options} -O2 -mllvm -user-reserved-ub-size=223232)
 add_library(kvip_lifetch_ubmem SHARED op_host/launch.cpp)

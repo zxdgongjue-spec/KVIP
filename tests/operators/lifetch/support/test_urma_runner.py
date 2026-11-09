@@ -412,7 +412,7 @@ def _check_hot_resolver(tmp_path, transport):
 
     operator = "lightning_indexer_with_fetch" + ("_ubmem" if transport == "ubmem" else "")
     kernel = ROOT / "csrc/operators" / operator / "op_kernel"
-    metadata = kernel / ("resolver/direct_slots.h" if transport == "ubmem" else "prefetch.h")
+    metadata = kernel / ("controller/cache_metadata.h" if transport == "ubmem" else "prefetch.h")
 
     def function(path, name):
         text = path.read_text()
@@ -425,10 +425,13 @@ def _check_hot_resolver(tmp_path, transport):
             end += 1
         return text[begin:end]
 
+    common = ROOT / "csrc/operators/common/lifetch"
     functions = "\n".join(
-        function(metadata, name)
-        for name in ("OwnerRow", "OutputStride", "StoreFallbackSource", "ResolvePhysicalSlot", "InitializeTailMappings")
+        function(common / "cache_metadata.h", name)
+        for name in ("OwnerRow", "OutputStride", "StoreFallbackSource")
     )
+    functions += "\n" + function(common / "cache_metadata.h", "ResolvePhysicalSlot")
+    functions += "\n" + function(metadata, "InitializeTailMappings")
     functions += "\n" + function(ROOT / "csrc/operators/common/lifetch/resolver_candidates.h", "SparseHash")
     functions += "\ntemplate<unsigned Threads>\n" + function(
         ROOT / "csrc/operators/common/lifetch/resident_selection.h", "ResolveResidentPlan"

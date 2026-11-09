@@ -16,14 +16,7 @@
 // Prefetch ordinals map to LRU hot destinations. Final repair uses hot slots;
 // virtual ABC tags remain disjoint from prefetch ordinals.
 namespace rotating {
-constexpr uint32_t kLruSlots = 2048;
-constexpr uint32_t kChangeCapacity = kLruSlots + kSlots;
-__simt_callee__ inline uint32_t OwnerRow(__gm__ Context* ctx,uint32_t b) {
-    return ctx->rowOwners ? asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)+b) : b;
-}
-__simt_callee__ inline uint32_t OutputStride(uint32_t rt_resident,__gm__ Context* ctx) {
-    return ctx->outputStride ? uint32_t(ctx->outputStride) : rt_resident;
-}
+#include "../../common/lifetch/cache_metadata.h"
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm__ Context* ctx,uint32_t b) {
     // Use the existing SIMT launch: scalar cache-line writeback would race
@@ -44,84 +37,11 @@ inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm
     }
     asc_threadfence();
 }
-__simt_callee__ inline bool IsTailToken(__gm__ Context* ctx,uint32_t b,uint32_t token) {
-    if(!ctx->tailBounds)return false;
-    auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds)+b*2;
-    return token>=asc_ldcg(bounds) && token<asc_ldcg(bounds+1);
-}
-__simt_callee__ inline uint32_t QueryEnd(uint32_t rt_history,__gm__ Context* ctx,uint32_t query) {
-    return ctx->queryEnds ? asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)+query) : rt_history;
-}
-__simt_callee__ inline void StoreFallbackSource(uint32_t rt_history,uint32_t rt_tokenBytes,__gm__ Context* ctx,uint32_t batch,uint32_t dst,
-    uint32_t token,uint64_t remote,__gm__ int32_t* blocks,__gm__ int32_t* offsets) {
-    if(ctx->fallbackAddresses) {
-        asc_stcg(reinterpret_cast<__gm__ uint64_t*>(ctx->fallbackAddresses)+dst,remote);
-        asc_stcg(blocks+dst,int32_t(dst));asc_stcg(offsets+dst,int32_t(0));
-    } else {
-        asc_stcg(blocks+dst,int32_t(batch*(rt_history/128)+token/128));
-        asc_stcg(offsets+dst,int32_t((token%128)*rt_tokenBytes));
-    }
-}
-__simt_callee__ inline bool HotValid(uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,uint32_t token) {
-    return !ctx->hotValid || asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+OwnerRow(ctx,b)*rt_resident+token)!=0;
-}
-__simt_callee__ inline uint32_t PhysicalSlot(uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,uint32_t slot) {
-    if(ctx->lruSlots && uint32_t(slot-rt_resident)<kLruSlots)
-        return asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots+slot-rt_resident);
-    return slot;
-}
-__simt_callee__ inline void RecordChange(uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,uint32_t slot,uint32_t token) {
-    if(ctx->changes && uint32_t(slot-rt_resident)<kLruSlots)
-        asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+b*kChangeCapacity+slot-rt_resident,token);
 
-}
 // Resolver workers consume the pre-round validity. Publish only after all
 // resolver workers finish; consumers of KV still wait for Fetch completion.
-__simt_vf__ __aicore__ LAUNCH_BOUND(256)
-inline void PublishDestinationResidency(uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,uint32_t fetched) {
-    if(!ctx->hotValid)return;
-    auto valid=reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+OwnerRow(ctx,b)*rt_resident;
-    // The original resolver already emits exactly the final Fetch destinations.
-    // Hits need no publication; do not rescan all four TopK rows.
-    auto destinations=reinterpret_cast<__gm__ int32_t*>(ctx->destinations)+b*kSlots;
-    uint32_t ownerBase=OwnerRow(ctx,b)*OutputStride(rt_resident,ctx);
-    for(uint32_t i=threadIdx.x;i<fetched;i+=256) {
-        uint32_t slot=uint32_t(asc_ldcg(destinations+i))-ownerBase;
-        if(slot<rt_resident)asc_stcg(valid+slot,uint32_t(1));
-    }
-    if(ctx->changes && ctx->lruSlots) {
-        auto changes=reinterpret_cast<__gm__ int32_t*>(ctx->changes)+b*kChangeCapacity;
-        auto lru=reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots;
-        for(uint32_t i=threadIdx.x;i<kLruSlots;i+=256)
-            if(asc_ldcg(changes+i)>=0)asc_stcg(valid+asc_ldcg(lru+i),uint32_t(1));
-    }
-    asc_threadfence();
-}
-__simt_vf__ __aicore__ LAUNCH_BOUND(512)
-inline void AdaptColdPredicate(uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,__ubuf__ uint32_t* selected,__ubuf__ uint32_t* predicate) {
-    auto reserved=reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+b*rt_resident;
-    for(uint32_t i=threadIdx.x;i<kSlots;i+=512) {
-        uint32_t token=selected[i];
-        predicate[i]=(token<rt_resident &&
-            (IsTailToken(ctx,b,token) || (!HotValid(rt_resident,ctx,b,token)) || (ctx->reservedHot && asc_ldcg(reserved+token)>=0)))?rt_resident:token;
-    }
-}
-// Bulk metadata is staged once in UB by the resolver, not fetched per TopK item.
-__simt_vf__ __aicore__ LAUNCH_BOUND(512)
-inline void AdaptColdPredicateLocal(uint32_t rt_resident,__ubuf__ uint32_t* selected,__ubuf__ uint32_t* predicate,
-    __ubuf__ uint32_t* valid,__ubuf__ int32_t* reserved,bool hasValid,bool hasReserved,
-    uint32_t tailBegin,uint32_t tailEnd) {
-    for(uint32_t i=threadIdx.x;i<kSlots;i+=512) {
-        uint32_t token=selected[i];
-        predicate[i]=(token<rt_resident && ((token>=tailBegin && token<tailEnd) ||
-            (hasValid && !valid[token]) || (hasReserved && reserved[token]>=0)))?rt_resident:token;
-    }
-}
-__simt_callee__ inline uint32_t ResolvePhysicalSlot(uint32_t rt_resident,__gm__ uint32_t* lru,uint32_t slot) {
-    if(lru && uint32_t(slot-rt_resident)<kLruSlots)return asc_ldcg(lru+slot-rt_resident);
-    // Missing-rank markers have their high bit set and are not ABC slots.
-    return slot>=rt_resident+kSlots && slot<0x80000000U ? slot-kSlots : slot;
-}
+
+
 
 }
 
@@ -129,17 +49,7 @@ namespace rotating {
 using namespace AscendC;
 // v9 GatherCandidateMap's indexed-load loop, adapted to packed uint16 scores.
 // One thread owns both halves of each UB word; no half-word write sharing.
-__simt_vf__ __aicore__ LAUNCH_BOUND(256)
-inline void GatherVictimScores(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* output,
-    const __gm__ uint32_t* scores) {
-    auto input=const_cast<__gm__ uint32_t*>(scores);
-    for(uint32_t i=threadIdx.x;i<1024;i+=256) {
-        uint32_t a=ids[2*i],b=ids[2*i+1];
-        uint32_t low=(asc_ldcg(input+a/2)>>((a%2)*16))&0xffffU;
-        uint32_t high=(asc_ldcg(input+b/2)>>((b%2)*16))&0xffffU;
-        output[i]=low|(high<<16);
-    }
-}
+#include "../../common/lifetch/victim_ops.h"
 
 __simd_vf__ inline void PrepareProgress(__ubuf__ uint32_t* table, uint32_t baseTile) {
     using namespace MicroAPI;
@@ -665,13 +575,7 @@ inline void PrepareCandidateWqes(uint32_t rt_resident,__ubuf__ uint32_t* ids,__u
     asc_threadfence();
 }
 // Same indexed-load pattern as v9 GatherCandidateMap; cold IDs pass through.
-__simt_vf__ __aicore__ LAUNCH_BOUND(256)
-inline void RestoreVictimTokens(__ubuf__ uint32_t* ids,__gm__ uint32_t* victims,uint32_t count) {
-    for(uint32_t i=threadIdx.x;i<count;i+=256) {
-        uint32_t token=ids[i];
-        if(token<kLruSlots)ids[i]=asc_ldcg(victims+token);
-    }
-}
+
 __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer,uint32_t epoch,uint32_t core,uint32_t lane,
     LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids) {
     auto ctx=reinterpret_cast<__gm__ Context*>(pointer);auto events=reinterpret_cast<__gm__ Event*>(ctx->events);
