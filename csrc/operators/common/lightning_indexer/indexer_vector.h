@@ -32,14 +32,12 @@ constexpr uint32_t TRUNK_LEN_6K = 6144;
 template <typename QLIT>
 class QLIVector {
 public:
-#if defined(V9_UBMEM) && V9_UBMEM
-#else
+#if !defined(V9_UBMEM) || !V9_UBMEM
     rotating::RuntimeShape runtimeShape_;
 #endif
     __aicore__ inline void SetRotationContext(GM_ADDR p) {
         rotationContext_ = p;
-#if defined(V9_UBMEM) && V9_UBMEM
-#else
+#if !defined(V9_UBMEM) || !V9_UBMEM
         runtimeShape_ = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(p));
 #endif
         rotationProgressGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(

@@ -82,8 +82,7 @@ public:
     static constexpr uint32_t SYNC_V1_C1_FLAG = 5;
     uint32_t resident_=0;
 public:
-#if defined(V9_UBMEM) && V9_UBMEM
-#else
+#if !defined(V9_UBMEM) || !V9_UBMEM
     rotating::RuntimeShape runtimeShape_;
 #endif
 private:
