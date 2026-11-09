@@ -430,7 +430,7 @@ def _check_hot_resolver(tmp_path, transport):
         function(metadata, name)
         for name in ("OwnerRow", "OutputStride", "StoreFallbackSource", "ResolvePhysicalSlot", "InitializeTailMappings")
     )
-    functions += "\n" + function(resolver, "SparseHash")
+    functions += "\n" + function(ROOT / "csrc/operators/common/lifetch/resolver_candidates.h", "SparseHash")
     functions += "\ntemplate<unsigned Threads>\n" + function(
         ROOT / "csrc/operators/common/lifetch/resident_selection.h", "ResolveResidentPlan"
     )
