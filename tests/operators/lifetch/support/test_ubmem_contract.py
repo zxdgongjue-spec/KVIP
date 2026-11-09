@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 import pytest
 
-from kvip.adapters.ubmem import UbmemLease
+from kvip.adapters.kvaf import UbmemLease
 from kvip.operators.lifetch_ubmem.build import UbmemGeometry
 from kvip.operators.lifetch.workspace import UbmemQueryInputs, UbmemWorkspace, device_words, ubmem_rotation_spec as rotation_spec
 
@@ -293,7 +293,7 @@ def test_public_selector_dispatches_transport(transport):
     policy = object()
     config = SimpleNamespace(transport=transport)
     with patch("kvip.adapters.vllm.binding._bind_selectors") as urma, \
-         patch("kvip.adapters.vllm.ubmem_binding._bind_selectors") as ubmem:
+         patch("kvip.adapters.vllm.binding._bind_ubmem_selectors") as ubmem:
         kvip.bind_selectors(torch, policy, config)
         (ubmem if transport == "ubmem" else urma).assert_called_once_with(torch, policy, config)
         (urma if transport == "ubmem" else ubmem).assert_not_called()

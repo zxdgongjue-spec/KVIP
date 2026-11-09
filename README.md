@@ -27,8 +27,7 @@ python/kvip/
   operators/lifetch/                 # shared forward and workspace layout; URMA binding and update
   operators/lifetch_ubmem/           # UBmem startup build, binding, workspace and update
   cache/                            # LRU, ABC and persistent Index storage
-  adapters/kvaf.py                   # URMA Runtime lease and shared transport queues
-  adapters/ubmem.py                  # local mapping/output/graph lifetime
+  adapters/kvaf.py                   # URMA queues and UBmem mapped-region lease lifetimes
   adapters/vllm/                     # inputs, selector, startup binding and paged Index import
   runtime/                          # build cache, library loader, hardware query, integrity
   _compat.py                        # centralized lazy aliases for legacy kvip imports

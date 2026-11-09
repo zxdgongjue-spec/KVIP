@@ -21,7 +21,7 @@ def main(transport, argv=None):
     import torch
     import torch_npu  # noqa: F401
     from kvip.adapters.kvaf import KvafGetLease
-    from kvip.adapters.ubmem import UbmemLease
+    from kvip.adapters.kvaf import UbmemLease
     from kvip.runtime.build import build_libraries, kvaf_build_paths
 
     state = ROOT / 'build/dependencies.json'

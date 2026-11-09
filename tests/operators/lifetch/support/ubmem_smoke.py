@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from kvip.adapters.ubmem import UbmemLease
+from kvip.adapters.kvaf import UbmemLease
 from kvip.cache.index_storage import IndexCacheStorage
 from kvip.operators.lifetch_ubmem.binding import UbmemBinding
 from kvip.operators.lifetch.forward import LIFetchForward

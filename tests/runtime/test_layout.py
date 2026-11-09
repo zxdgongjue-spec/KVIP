@@ -154,3 +154,14 @@ def test_actual_operator_cmake_resolves_relocated_sources(tmp_path):
                 "index_cache_update.h",
             ) or include.startswith("resolver_reference/"):
                 assert any((folder / include).is_file() for folder in [cpp.parent, *includes]), (cpp, include)
+
+
+def test_ubmem_previous_import_paths_resolve_to_merged_modules():
+    from kvip.adapters.ubmem import UbmemLease as old_lease
+    from kvip.adapters.kvaf import UbmemLease
+    from kvip.adapters.vllm.ubmem_binding import bind_selectors as old_bind, prepare_workspace as old_prepare
+    from kvip.adapters.vllm.binding import bind_selectors, prepare_workspace
+
+    assert old_lease is UbmemLease
+    assert old_bind is bind_selectors
+    assert old_prepare is prepare_workspace

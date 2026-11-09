@@ -7,7 +7,6 @@ import sys
 import pytest
 import init_transport
 import kvip.adapters.kvaf
-import kvip.adapters.ubmem
 import kvip.runtime.build
 
 
@@ -24,7 +23,7 @@ def test_initialization_acquires_and_releases_selected_lease(monkeypatch, tmp_pa
                             device=lambda value: value, uint8='uint8', zeros=Mock(return_value='output'))
     monkeypatch.setitem(sys.modules, 'torch', torch)
     monkeypatch.setattr(kvip.adapters.kvaf, 'KvafGetLease', Mock(return_value=lease))
-    monkeypatch.setattr(kvip.adapters.ubmem, 'UbmemLease', Mock(return_value=lease))
+    monkeypatch.setattr(kvip.adapters.kvaf, 'UbmemLease', Mock(return_value=lease))
     monkeypatch.setattr(kvip.runtime.build, 'kvaf_build_paths', lambda path: ('cann', 'headers'))
     monkeypatch.setattr(kvip.runtime.build, 'build_libraries', lambda **kwargs: ('library', 'update'))
     kernels = tmp_path / 'build-npu/bin'
