@@ -9,10 +9,16 @@
 namespace {std::vector<unsigned> calls, blocks;unsigned fail=0;}
 #define LAUNCH(name,number) extern "C" uint32_t aclrtlaunch_kvip_ubmem_##name##_kernel(uint32_t blockCount,void*,void*) { \
  calls.push_back(number);blocks.push_back(blockCount);return number==fail?71:0;}
-LAUNCH(init,1)
-LAUNCH(li,2)
-LAUNCH(resolve,3)
-LAUNCH(complete,4)
+#define LAUNCH_WIDTH(width,name,number) extern "C" uint32_t aclrtlaunch_kvip_ubmem_##width##_##name##_kernel(uint32_t blockCount,void*,void*) { \
+ calls.push_back(number);blocks.push_back(blockCount);return number==fail?71:0;}
+LAUNCH_WIDTH(656,init,1)
+LAUNCH_WIDTH(656,li,2)
+LAUNCH_WIDTH(656,resolve,3)
+LAUNCH_WIDTH(656,complete,4)
+LAUNCH_WIDTH(2624,init,11)
+LAUNCH_WIDTH(2624,li,12)
+LAUNCH_WIDTH(2624,resolve,13)
+LAUNCH_WIDTH(2624,complete,14)
 LAUNCH(direct_update_owned,5)
 LAUNCH(direct_update_outputs,6)
 LAUNCH(direct_apply_owned,7)
@@ -30,11 +36,15 @@ int main() {
     assert(PrepareShape(&shape)==0);
     assert(shape.liCores==kLiCores && shape.rounds==kRounds && shape.serviceLanes==kServiceLanes);
     assert(shape.finalWorkers==kFinalWorkers && shape.finalPostOffset==kFinalPostOffset);
+    shape.tokenBytes=656;
     void* pointer=reinterpret_cast<void*>(1);
     assert(kvip_ubmem_forward(pointer,pointer,pointer,&shape)==0);
     assert((calls==std::vector<unsigned>{1,2,3,4,5,6,7}));
     assert((blocks==std::vector<unsigned>{shape.batch,shape.liCores,shape.finalCores,shape.batch,shape.batch,shape.batch,shape.batch*4}));
-    calls.clear();fail=4;
+    calls.clear();blocks.clear();shape.tokenBytes=2624;
+    assert(kvip_ubmem_forward(pointer,pointer,pointer,&shape)==0);
+    assert((calls==std::vector<unsigned>{11,12,13,14,5,6,7}));
+    calls.clear();blocks.clear();shape.tokenBytes=656;fail=4;
     assert(kvip_ubmem_forward(pointer,pointer,pointer,&shape)==71);
     assert((calls==std::vector<unsigned>{1,2,3,4}));
     calls.clear();assert(kvip_ubmem_forward(nullptr,pointer,pointer,&shape)!=0 && calls.empty());

@@ -68,17 +68,30 @@ set(_device_options)
 foreach(_definition IN LISTS _definitions)
   list(APPEND _device_options "-D${_definition}")
 endforeach()
-ascendc_library(kvip_ubmem_kernel STATIC op_kernel/indexer.cpp op_kernel/lifecycle.cpp)
-ascendc_include_directories(kvip_ubmem_kernel PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel"
-  "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/indexer"
-  "${CMAKE_CURRENT_SOURCE_DIR}/../common/lightning_indexer"
-  "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/controller"
-  "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/copy"
-  "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/resolver"
-  "${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include")
-ascendc_compile_options(kvip_ubmem_kernel PRIVATE ${_device_options} -O2 -g --cce-auto-sync=off
-  -mllvm -user-reserved-ub-size=223232)
+# Compile the two fixed KV row pipelines into the same library. The LI
+# geometry and host launches remain runtime-driven; only row-copy tiling differs.
+set(_kernel_libraries)
+foreach(_width IN ITEMS 656 2624)
+  set(_target "kvip_ubmem_kernel_${_width}")
+  set(_width_options ${_device_options})
+  list(FILTER _width_options EXCLUDE REGEX "^-DTOKEN_BYTES=")
+  list(APPEND _width_options "-DTOKEN_BYTES=${_width}")
+  foreach(_name IN ITEMS init li resolve complete)
+    list(APPEND _width_options "-Dkvip_ubmem_${_name}_kernel=kvip_ubmem_${_width}_${_name}_kernel")
+  endforeach()
+  ascendc_library(${_target} STATIC op_kernel/indexer.cpp op_kernel/lifecycle.cpp)
+  ascendc_include_directories(${_target} PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel"
+    "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/indexer"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../common/lightning_indexer"
+    "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/controller"
+    "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/copy"
+    "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/resolver"
+    "${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include")
+  ascendc_compile_options(${_target} PRIVATE ${_width_options} -O2 -g --cce-auto-sync=off
+    -mllvm -user-reserved-ub-size=223232)
+  list(APPEND _kernel_libraries ${_target})
+endforeach()
 ascendc_library(kvip_ubmem_update_kernel STATIC op_kernel/index_cache_update.cpp)
 ascendc_include_directories(kvip_ubmem_update_kernel PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/resolver"
@@ -87,4 +100,4 @@ ascendc_compile_options(kvip_ubmem_update_kernel PRIVATE ${_device_options} -O2 
 add_library(kvip_lifetch_ubmem SHARED op_host/launch.cpp)
 target_include_directories(kvip_lifetch_ubmem PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_definitions(kvip_lifetch_ubmem PRIVATE ${_definitions})
-target_link_libraries(kvip_lifetch_ubmem PRIVATE kvip_ubmem_kernel kvip_ubmem_update_kernel host_intf_pub ascendcl)
+target_link_libraries(kvip_lifetch_ubmem PRIVATE ${_kernel_libraries} kvip_ubmem_update_kernel host_intf_pub ascendcl)

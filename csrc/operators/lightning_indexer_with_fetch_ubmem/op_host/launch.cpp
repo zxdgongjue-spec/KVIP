@@ -4,10 +4,13 @@
 extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) { return rotating::PrepareShape(shape); }
 
 #define ENTRY(api,kernel,blocks) \
-extern "C" uint32_t aclrtlaunch_kvip_ubmem_##kernel##_kernel(uint32_t,void*,void*); \
+extern "C" uint32_t aclrtlaunch_kvip_ubmem_656_##kernel##_kernel(uint32_t,void*,void*); \
+extern "C" uint32_t aclrtlaunch_kvip_ubmem_2624_##kernel##_kernel(uint32_t,void*,void*); \
 extern "C" uint32_t api(void* bindings,void* stream,const rotating::RuntimeShape* shape) { \
     if(!bindings || !stream || !shape)return 100000; \
-    return aclrtlaunch_kvip_ubmem_##kernel##_kernel(blocks,stream,bindings); }
+    if(shape->tokenBytes==656)return aclrtlaunch_kvip_ubmem_656_##kernel##_kernel(blocks,stream,bindings); \
+    if(shape->tokenBytes==2624)return aclrtlaunch_kvip_ubmem_2624_##kernel##_kernel(blocks,stream,bindings); \
+    return 100000; }
 ENTRY(v9_init,init,shape->batch)
 ENTRY(v9_li,li,shape->liCores)
 ENTRY(v9_resolve,resolve,shape->finalCores)
