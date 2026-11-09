@@ -4,6 +4,7 @@ static_assert(V9_UBPIPE_DEPTH == 1 || V9_UBPIPE_DEPTH == 8, "Invalid UBmem pipel
 static_assert(V9_UBPIPE_ROWS == 1 || V9_UBPIPE_ROWS == 4, "Invalid UBmem rows per pipeline stage");
 static_assert(V9_UBPIPE_DEPTH != 1 || V9_UBPIPE_ROWS == 1, "Serial UBmem requires one row per stage");
 #include "ubmem_abi.h"
+#include "../../common/lifetch/runtime_shape.h"
 namespace rotating {
 constexpr bool kDedicatedService = V9_DEDICATED_SERVICE;
 constexpr uint32_t kTop = 2048, kSlots = 8192, kTokenBytes = TOKEN_BYTES;
@@ -77,9 +78,19 @@ struct Context {
     uint64_t fallbackAddresses, reservedFallbackValid, hotValid;
     uint64_t rowOwners, tokenAddresses, addressStride, outputStride, tailBounds;
     uint64_t changeSlots, changeCount;
+    RuntimeShape shape;
 };
-static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 256,
+static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 336,
               "V9 ABI layout changed");
+#if defined(__CCE_AICORE__)
+__aicore__ inline RuntimeShape LoadRuntimeShape(const __gm__ Context* ctx) {
+    RuntimeShape result;
+    auto input=reinterpret_cast<const __gm__ uint32_t*>(&ctx->shape);
+    auto output=reinterpret_cast<uint32_t*>(&result);
+    for(uint32_t i=0;i<sizeof(result)/sizeof(uint32_t);++i)output[i]=input[i];
+    return result;
+}
+#endif
 // Workload configuration is compiled into each benchmark binary, as in V8.
 // One selected AIC pair per window; zero disables intermediate Fetch.
 #if defined(__CCE_AICORE__)

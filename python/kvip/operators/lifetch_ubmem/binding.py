@@ -6,6 +6,7 @@ import ctypes
 import numpy as np
 
 from kvip.operators.lifetch.geometry import final_aivs, li_geometry, prefetch_budget
+from kvip.operators.lifetch.tiling import RuntimeShape
 from kvip.operators.lifetch_ubmem.specialization import query
 from kvip.operators.lifetch_ubmem.workspace import device_words, rotation_spec
 
@@ -44,15 +45,15 @@ class UbmemBinding:
             ("token_bytes", shape.token_bytes),
             ("aic_count", shape.aic_count),
             ("index_heads", shape.heads),
-            ("context_bytes", 256),
+            ("context_bytes", 336),
             ("row_bytes", 1024),
         ):
             if query(self.library, name) != expected:
                 raise ValueError(f"UBmem static binary contract mismatch: {name}")
         version = self.library.kvip_ubmem_abi_version
         version.argtypes, version.restype = [], ctypes.c_uint32
-        if version() != 2:
-            raise ValueError("UBmem fusion ABI 2 is required")
+        if version() != 3:
+            raise ValueError("UBmem fusion ABI 3 is required")
         if lease.context["token_bytes"] != shape.token_bytes or lease.context["tokens_per_block"] != 128:
             raise ValueError("UBmem kernel and KVAF slot geometry differ")
         prefetch_limit, window_limit = prefetch_budget(prefetch_limit, window_limit, shape.intermediate_fetches)
@@ -67,7 +68,7 @@ class UbmemBinding:
         ):
             if query(self.library, name) != expected:
                 raise ValueError(f"UBmem static scheduling mismatch: {name}")
-        for name, expected in (("context_bytes", 256), ("region_bytes", 128), ("status_bytes", 128)):
+        for name, expected in (("context_bytes", 336), ("region_bytes", 128), ("status_bytes", 128)):
             function = getattr(self.library, "kvip_ubmem_" + name)
             function.argtypes, function.restype = [], ctypes.c_uint32
             if function() != expected:
@@ -160,14 +161,20 @@ class UbmemBinding:
             self.change_slots.data_ptr(),
             self.change_count.data_ptr(),
         ]
+        self.runtime_shape = RuntimeShape.prepare(
+            self.library, batch=shape.batch, history=shape.history, resident=shape.resident,
+            index_heads=shape.heads, aic_count=shape.aic_count, windows=shape.intermediate_fetches,
+            token_bytes=shape.token_bytes,
+        )
         blob = np.concatenate(
             (
                 np.asarray(pointers, dtype="<u8").view("u1"),
                 np.asarray([prefetch_limit, window_limit], dtype="<u4").view("u1"),
                 np.asarray(extra, dtype="<u8").view("u1"),
+                np.frombuffer(bytes(self.runtime_shape), dtype=np.uint8),
             )
         )
-        if blob.size != 256:
+        if blob.size != 336:
             raise AssertionError("UBmem Context ABI changed")
         self.context = torch.from_numpy(blob.copy()).to(self.device)
         self.arguments = tuple(arguments) + (self.context,)

@@ -1,6 +1,8 @@
 #include "api.h"
 #include "context.h"
 
+extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) { return rotating::PrepareShape(shape); }
+
 #define ENTRY(api,kernel,blocks) \
 extern "C" uint32_t aclrtlaunch_kvip_ubmem_##kernel##_kernel(uint32_t,void*,void*); \
 extern "C" uint32_t api(void* bindings,void* stream) { \
@@ -31,7 +33,7 @@ extern "C" uint32_t kvip_ubmem_forward(void* bindings,void* update,void* stream)
 }
 
 #define VALUE(name,value) extern "C" uint32_t name() {return value;}
-VALUE(kvip_ubmem_abi_version,2)
+VALUE(kvip_ubmem_abi_version,3)
 VALUE(kvip_ubmem_context_bytes,sizeof(rotating::Context))
 VALUE(kvip_ubmem_region_bytes,sizeof(rotating::UbmemRegion))
 VALUE(kvip_ubmem_status_bytes,rotating::kUbmemStatusWords*sizeof(uint64_t))

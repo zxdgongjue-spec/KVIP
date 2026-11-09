@@ -17,8 +17,9 @@ extern "C" __global__ __aicore__ void kvip_ubmem_li_kernel(GM_ADDR bindings) {
     using Type=QLIType<fp8_e4m3fn_t,fp8_e4m3fn_t,int32_t,true,LI_LAYOUT::BSND,LI_LAYOUT::PA_BSND,
         bfloat16_t,float,float,uint16_t>;
     QLIKernel::QuantLightningIndexerKernel<Type> op;
-    QLITilingData tiling{SIM_BATCH,SIM_BATCH*4,INDEX_HEADS,4,SIM_HISTORY,
-        2048,rotating::kLiCores,128,SIM_HISTORY/128,0,16384,128,SIM_RESIDENT,V9_SPLIT_Q,V9_AIC_COUNT};
+    auto shape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(a[14]));
+    QLITilingData tiling{shape.batch,shape.batch*4,shape.indexHeads,4,shape.history,
+        2048,shape.liCores,128,shape.history/128,0,16384,128,shape.resident,shape.splitQ,shape.aicCount};
 #define P(i) reinterpret_cast<GM_ADDR>(a[i])
     op.Init(P(0),P(1),P(2),P(3),P(4),P(5),P(6),P(7),P(9),P(12),&tiling,&pipe);
     if ASCEND_IS_AIV {
