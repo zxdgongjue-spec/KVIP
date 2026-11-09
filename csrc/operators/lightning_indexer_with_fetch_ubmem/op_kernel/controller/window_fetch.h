@@ -22,7 +22,7 @@ constexpr uint32_t kScanTokens=kBatchedRows?23808:28672, kCandidateCapacity=2048
 static_assert(!kWindowScanFused || sizeof(uint32_t)*kCandidateCapacity<=kScanTokens,
               "Fused candidate-map values overlap the candidate ID array");
 static_assert(!kBatchedRows || kScanTokens+4*kCandidateCapacity<=32000,"Candidate scratch overflow");
-static_assert(!kBatchedRows || ((SIM_BATCH+kServiceLanes-1)/kServiceLanes)*sizeof(Row)<=8448,"Row scratch overflow");
+static_assert(!kBatchedRows || kPostGroups*sizeof(Row)<=8448,"Row scratch overflow");
 static_assert(UbmemGroupedCopyPipeline::kScratchBytes<=kScanTokens,"Grouped copies overlap live candidates");
 static_assert(!kWindowScanFused || V9_PARTIAL_SCAN_SIMD,"Fused scan requires SIMD clipping");
 // Clip each query before union so publication skew never admits future bits.
@@ -243,12 +243,12 @@ static_assert(kPostBank%8==0,"Prepared groups must not cross peer banks");
 static_assert(kUbmemPeerBytes+kUbmemPlanCount*sizeof(uint32_t)<=4096,
               "Peer bank and group plans overlap copy overflow");
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
-inline void PrepareUbmemWindow(__gm__ Context* ctx,uint32_t lane,uint32_t begin,
+inline void PrepareUbmemWindow(__gm__ Context* ctx,uint32_t firstBatch,uint32_t begin,
     __ubuf__ uint32_t* inputs,__ubuf__ uint32_t* localIds,
     __ubuf__ uint64_t* peers,__ubuf__ uint32_t* plans,
     uint64_t peerBase,uint64_t maxPeerOffset
     ) {
-    const uint32_t g=threadIdx.x/kPostThreads,t=threadIdx.x%kPostThreads,b=lane+g*kServiceLanes;
+    const uint32_t g=threadIdx.x/kPostThreads,t=threadIdx.x%kPostThreads,b=firstBatch+g*kServiceLanes;
     uint32_t n=0;
     if(b<SIM_BATCH) {
         auto input=inputs+g*80;auto in64=reinterpret_cast<__ubuf__ uint64_t*>(input);
@@ -270,13 +270,13 @@ inline void PrepareUbmemWindow(__gm__ Context* ctx,uint32_t lane,uint32_t begin,
     }
     asc_threadfence();
 }
-__aicore__ inline void CopyUbmemWindow(__gm__ Context* ctx,uint32_t lane,
+__aicore__ inline void CopyUbmemWindow(__gm__ Context* ctx,uint32_t firstBatch,
     LocalTensor<uint32_t> scratch,LocalTensor<uint32_t> work,LocalTensor<uint32_t> cfg,
     LocalTensor<uint32_t> rowStorage,__gm__ Event* event
     ) {
     uint32_t maxCount=0,acceptedTotal=0,lastGroup=0;
-    for(uint32_t b=lane;b<SIM_BATCH;b+=kServiceLanes) {
-        auto input=cfg[256+(b/kServiceLanes)*80];input.SetValue(66,0);input.SetValue(67,0);
+    for(uint32_t b=firstBatch;b<SIM_BATCH && (b-firstBatch)/kServiceLanes<kPostGroups;b+=kServiceLanes) {
+        auto input=cfg[256+((b-firstBatch)/kServiceLanes)*80];input.SetValue(66,0);input.SetValue(67,0);
         uint32_t n=input.GetValue(64);if(n>maxCount)maxCount=n;
     }
     if(!maxCount)return;
@@ -304,7 +304,7 @@ __aicore__ inline void CopyUbmemWindow(__gm__ Context* ctx,uint32_t lane,
         // Publish scalar metadata/error changes and finish reading the prior
         // peer bank before SIMT reuses it. The ring itself uses other scratch.
         SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
-        Simt::VF_CALL<PrepareUbmemWindow>(Simt::Dim3{512,1,1},ctx,lane,begin,
+        Simt::VF_CALL<PrepareUbmemWindow>(Simt::Dim3{512,1,1},ctx,firstBatch,begin,
             reinterpret_cast<__ubuf__ uint32_t*>(cfg[256].GetPhyAddr()),
             localIds,
             reinterpret_cast<__ubuf__ uint64_t*>(work.GetPhyAddr()),
@@ -314,8 +314,8 @@ __aicore__ inline void CopyUbmemWindow(__gm__ Context* ctx,uint32_t lane,
         SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
         auto peers=work.ReinterpretCast<uint64_t>();auto plans=work[kUbmemPeerBytes/4];
         if(!usedSimt)
-        for(uint32_t b=lane;b<SIM_BATCH;b+=kServiceLanes) {
-            uint32_t g=b/kServiceLanes;auto input=cfg[256+g*80];auto in64=input.ReinterpretCast<uint64_t>();
+        for(uint32_t b=firstBatch;b<SIM_BATCH && (b-firstBatch)/kServiceLanes<kPostGroups;b+=kServiceLanes) {
+            uint32_t g=(b-firstBatch)/kServiceLanes;auto input=cfg[256+g*80];auto in64=input.ReinterpretCast<uint64_t>();
             uint32_t count=input.GetValue(64);if(count<=begin || input.GetValue(67))continue;
             uint32_t n=count-begin;if(n>kPostBank)n=kPostBank;
             uint32_t accepted=input.GetValue(66),slotBase=input.GetValue(65);
@@ -344,8 +344,8 @@ __aicore__ inline void CopyUbmemWindow(__gm__ Context* ctx,uint32_t lane,
     // A released plan exposes the Row and mapping to readers. Completion
     // status and Event state 1 must still wait for every shared ring credit.
     uint32_t completed=usedSimt?acceptedTotal:copyPipe.Finish();
-    for(uint32_t b=lane;b<SIM_BATCH;b+=kServiceLanes) {
-        uint32_t g=b/kServiceLanes;auto input=cfg[256+g*80];auto state=rowStorage[g*256];
+    for(uint32_t b=firstBatch;b<SIM_BATCH && (b-firstBatch)/kServiceLanes<kPostGroups;b+=kServiceLanes) {
+        uint32_t g=(b-firstBatch)/kServiceLanes;auto input=cfg[256+g*80];auto state=rowStorage[g*256];
         uint32_t error=input.GetValue(67);if(completed!=acceptedTotal)error|=kUbmemIncomplete;
         if(error)state.SetValue(11,state.GetValue(11)|error);
         if(!input.GetValue(64))continue;
@@ -366,25 +366,31 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
         while(!previous->complete);
     }
     V9_FETCH_PROFILE(event->begin=GetSystemCycle();)
-    uint64_t postedCount=0; // Business state: controls batched WQE submission.
-    V9_FETCH_PROFILE(uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0;)
+    V9_FETCH_PROFILE(uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0,totalPosted=0;)
     auto work=flags.ReinterpretCast<uint32_t>();auto cfg=work[4096];
     auto rowStorage=ids;
     if constexpr(kBatchedRows)ids=scratch[23808/4];
+    // A service lane owns at most eight Row snapshots in UB. For larger
+    // batches/window counts process consecutive groups sequentially; each
+    // chunk completes its copy before the same UB storage is reused.
+    for(uint32_t groupBase=0;groupBase<kTotalPostGroups;groupBase+=kPostGroups) {
+    uint64_t postedCount=0;
+    const uint32_t firstBatch=ServiceChunkFirst(lane,groupBase,kServiceLanes);
+    const uint32_t groupCount=ServiceChunkCount(SIM_BATCH,firstBatch,kServiceLanes,kPostGroups);
     // Freeze every ready snapshot before scanning any batch. An early snapshot
     // is usable only when every end is at the ceiling; otherwise resample
     // after completion so early planning cannot shorten the captured history.
     GlobalTensor<uint32_t> progressGm;
     progressGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress));
-    if(lane<SIM_BATCH) {
-        DataCopyExtParams gather;gather.blockCount=(SIM_BATCH-lane+kServiceLanes-1)/kServiceLanes;
+    if(firstBatch<SIM_BATCH) {
+        DataCopyExtParams gather;gather.blockCount=groupCount;
         gather.blockLen=4*sizeof(Progress);gather.srcStride=(kServiceLanes-1)*4*sizeof(Progress);gather.dstStride=0;
         DataCopyPadExtParams<uint32_t> padding{false,0,0,0};
         SetFlag<HardEvent::S_MTE2>(EVENT_ID0);WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
-        DataCopyPad(work,progressGm[lane*128],gather,padding);
+        DataCopyPad(work,progressGm[firstBatch*128],gather,padding);
         SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-        for(uint32_t b=lane;b<SIM_BATCH;b+=kServiceLanes)for(uint32_t q=0;q<4;++q) {
-            uint32_t end=work.GetValue((b/kServiceLanes)*128+q*32),cap=Trigger(epoch)*128;
+        for(uint32_t b=firstBatch;b<SIM_BATCH && (b-firstBatch)/kServiceLanes<kPostGroups;b+=kServiceLanes)for(uint32_t q=0;q<4;++q) {
+            uint32_t end=work.GetValue(((b-firstBatch)/kServiceLanes)*128+q*32),cap=Trigger(epoch)*128;
             if(ctx->queryEnds) {
                 uint32_t bound=reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)[b*4+q];
                 // Compact victim predicates are clipped before publication.
@@ -396,25 +402,25 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
     }
     GlobalTensor<uint32_t> allRows;allRows.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->rows));
     if constexpr(kBatchedRows) {
-        if(lane<SIM_BATCH) {
-            DataCopyExtParams copy;copy.blockCount=(SIM_BATCH-lane+kServiceLanes-1)/kServiceLanes;
+        if(firstBatch<SIM_BATCH) {
+            DataCopyExtParams copy;copy.blockCount=groupCount;
             copy.blockLen=sizeof(Row);copy.srcStride=(kServiceLanes-1)*sizeof(Row);copy.dstStride=0;
             DataCopyPadExtParams<uint32_t> pad{false,0,0,0};
-            DataCopyPad(rowStorage,allRows[lane*256],copy,pad);
+            DataCopyPad(rowStorage,allRows[firstBatch*256],copy,pad);
             SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
         }
     }
-    for(uint32_t b=lane;b<SIM_BATCH;b+=kServiceLanes) {
+    for(uint32_t b=firstBatch;b<SIM_BATCH && (b-firstBatch)/kServiceLanes<kPostGroups;b+=kServiceLanes) {
         // Transfer state as a block. Avoid scalar GM read/modify/write and
         // repeated cache maintenance for every counter/cache line.
-        auto state=kBatchedRows?rowStorage[(b/kServiceLanes)*256]:work[2048];auto state64=state.ReinterpretCast<uint64_t>();
+        auto state=kBatchedRows?rowStorage[((b-firstBatch)/kServiceLanes)*256]:work[2048];auto state64=state.ReinterpretCast<uint64_t>();
         GlobalTensor<uint32_t> rowGm;
         rowGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->rows)+b*256);
         if constexpr(!kBatchedRows) {
             DataCopy(state,rowGm,256);
             SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
         }
-        auto postInput=cfg[256+(b/kServiceLanes)*80];postInput.SetValue(64,0);
+        auto postInput=cfg[256+((b-firstBatch)/kServiceLanes)*80];postInput.SetValue(64,0);
         if(state.GetValue(11))continue;
         uint32_t slots=state.GetValue(8),requests=state.GetValue(9),pending=state.GetValue(211);
         uint32_t sequence=state.GetValue(246)+1;
@@ -537,7 +543,7 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
                 post64.SetValue(35,output);
                 if constexpr(kUbmemLocalIdGroups==2) {
                     if(UbmemWindowUseLocalIds(count)) {
-                        auto retained=rowStorage[kUbmemLocalIdOffsetWords+(b/kServiceLanes)*kUbmemLocalIdCapacity];
+                        auto retained=rowStorage[kUbmemLocalIdOffsetWords+((b-firstBatch)/kServiceLanes)*kUbmemLocalIdCapacity];
                         SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
                         StageUbmemWindowIds(reinterpret_cast<__ubuf__ uint32_t*>(retained.GetPhyAddr()),
                             reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),count);
@@ -573,22 +579,24 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
     }
     if(postedCount) {
         V9_FETCH_PROFILE(uint64_t begin=GetSystemCycle();)
-        CopyUbmemWindow(ctx,lane,scratch,work,cfg,rowStorage,event
+        CopyUbmemWindow(ctx,firstBatch,scratch,work,cfg,rowStorage,event
         );
         V9_FETCH_PROFILE(postTicks+=GetSystemCycle()-begin;)
     }
     if constexpr(kBatchedRows) {
-        if(lane<SIM_BATCH
+        if(firstBatch<SIM_BATCH
         ) {
-            DataCopyExtParams copy;copy.blockCount=(SIM_BATCH-lane+kServiceLanes-1)/kServiceLanes;
+            DataCopyExtParams copy;copy.blockCount=groupCount;
             copy.blockLen=sizeof(Row);copy.srcStride=0;copy.dstStride=(kServiceLanes-1)*sizeof(Row);
             SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
-            DataCopyPad(allRows[lane*256],rowStorage,copy);
+            DataCopyPad(allRows[firstBatch*256],rowStorage,copy);
             SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
         }
     }
+    V9_FETCH_PROFILE(totalPosted+=postedCount;)
+    } // groupBase
     V9_FETCH_PROFILE(event->scanTicks=scanTicks;event->candidateTicks=candidateTicks;event->postTicks=postTicks;)
-    V9_FETCH_PROFILE(event->bitmapBytes=bitmapBytes;event->candidateCount=totalCandidates;event->postedCount=postedCount;)
+    V9_FETCH_PROFILE(event->bitmapBytes=bitmapBytes;event->candidateCount=totalCandidates;event->postedCount=totalPosted;)
     V9_FETCH_PROFILE(event->end=GetSystemCycle();)event->complete=1;
     ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event),
         (V9_INTERMEDIATE_PROFILING || (V9_UBMEM && V9_WINDOW_COPY_ENGINE==1))?sizeof(Event):64);

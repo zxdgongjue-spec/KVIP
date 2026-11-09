@@ -85,3 +85,27 @@ def test_shared_hot_selector_invalidates_specialization_cache(tmp_path, monkeypa
     selector.write_text("// changed hot-slot algorithm\n")
     new = specialization.build_specialization(**options)
     assert new != old and len(calls) == 4
+
+
+def test_service_chunk_assignment_covers_every_request_once(tmp_path):
+    compiler = shutil.which("c++")
+    if not compiler:
+        pytest.skip("C++ unavailable")
+    root = Path(__file__).resolve().parents[3]
+    header = root / "csrc/operators/lightning_indexer_with_fetch_ubmem/op_kernel/controller"
+    source = tmp_path / "chunks.cpp"
+    source.write_text(
+        "#include <cstdint>\n#include <cassert>\n#include <algorithm>\n"
+        "#define SIM_BATCH 32\nnamespace rotating { constexpr uint32_t kServiceLanes=2; }\n"
+        '#include "post_geometry.h"\n'
+        "int main() { for(uint32_t b=1;b<=32;++b) for(uint32_t lanes=2;lanes<=64;lanes+=2) {"
+        "uint32_t groups=(b+lanes-1)/lanes,chunk=std::min(groups,8U),seen[32]={};"
+        "for(uint32_t base=0;base<groups;base+=chunk) for(uint32_t lane=0;lane<lanes;++lane){"
+        "auto first=rotating::ServiceChunkFirst(lane,base,lanes);"
+        "auto count=rotating::ServiceChunkCount(b,first,lanes,chunk);"
+        "assert(count<=8);for(uint32_t i=0;i<count;++i){auto row=first+i*lanes;assert(row<b);++seen[row];}}"
+        "for(uint32_t i=0;i<b;++i)assert(seen[i]==1); } }\n"
+    )
+    binary = tmp_path / "chunks"
+    subprocess.run([compiler, "-std=c++17", str(source), "-I" + str(header), "-o", str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)

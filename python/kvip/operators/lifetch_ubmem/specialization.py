@@ -25,12 +25,12 @@ class Specialization:
     soc: str
 
     def __post_init__(self):
-        if not 1 <= self.batch <= 16 or not 1 <= self.aic_count <= 32:
-            raise ValueError("UBmem LIFetch requires 1..16 requests and 1..32 AICs")
+        if not 1 <= self.batch <= 32 or not 1 <= self.aic_count <= 32:
+            raise ValueError("UBmem LIFetch requires 1..32 requests and 1..32 AICs")
         if self.batch > self.aic_count:
             raise ValueError("UBmem LIFetch requests must fit concurrently resident LI cores")
-        if self.history % 256 or self.resident % 256 or not 8192 <= self.resident < self.history <= 210944:
-            raise ValueError("UBmem history/resident must align to 256, with 8192 <= resident < history <= 210944")
+        if self.history % 256 or self.resident % 256 or not 2048 <= self.resident < self.history <= 210944:
+            raise ValueError("UBmem history/resident must align to 256, with 2048 <= resident < history <= 210944")
         if self.resident > 131072:
             raise ValueError("LIFetch hot bitmap supports resident <= 131072")
         if self.heads not in (32, 64) or self.token_bytes not in (656, 2624):
@@ -40,6 +40,7 @@ class Specialization:
         cores = self.batch * (2 if 2 * self.batch <= self.aic_count else 1)
         if (self.history - self.resident) // 128 <= min(self.intermediate_fetches, cores):
             raise ValueError("UBmem requires more cold tiles than active prefetch windows")
+
 
     def options(self, cann):
         return dict(

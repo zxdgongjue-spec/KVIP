@@ -110,6 +110,19 @@ def test_static_shape_and_ubmem_scratch_contract():
         Specialization(2, 8448, 8192, 64, 656, 32, 8, "Ascend950DT_9582")
 
 
+@pytest.mark.parametrize("batch,resident", [(1, 2048), (16, 2048), (24, 16384), (32, 2048)])
+def test_extended_ubmem_geometry(batch, resident):
+    shape = Specialization(batch, 131072, resident, 32, 656, 32, 8, "Ascend950PR_9599")
+    spec = rotation_spec(batch, shape.history, resident, shape.aic_count, shape.intermediate_fetches)
+    assert spec["mapping"][0] == (batch, shape.history)
+    assert spec["reserved_hot"][0] == (batch, resident)
+
+
+def test_ubmem_supports_wide_batch_and_many_windows():
+    shape = Specialization(32, 131072, 16384, 32, 656, 32, 32, "Ascend950PR_9599")
+    assert shape.options("/cann")["INTERMEDIATE_FETCHES"] == 32
+
+
 def test_workspace_initializes_with_npu_supported_zero_dtypes():
     def zeros(size, *, dtype, device):
         if dtype == np.uint64:
@@ -177,3 +190,38 @@ def test_forward_only_submits_bound_pointers_on_the_current_lease_stream():
     launch.return_value = 4
     with pytest.raises(RuntimeError, match="launch failed: 4"):
         forward()
+
+
+@pytest.mark.parametrize("percent", [10, 30, 50])
+def test_controlled_fixture_matches_urma(percent):
+    from smoke import controlled_fixture
+
+    fixture = controlled_fixture(8192, 4096, 32, percent)
+    order = fixture["order"]
+    assert fixture["expected"].shape == (4, 2048)
+    assert fixture["native_miss_union"] > 0
+    assert len(set(order)) == len(order) == 8192
+    assert len(fixture["info"]["final_misses_per_query"]) == 4
+
+
+def test_shared_q4_fixture_topk_and_lru_match_urma():
+    from smoke import controlled_fixture, payload
+    from kvip.cache.lru import SlotLRU
+
+    fixture = controlled_fixture(8192, 4096, 32, 10)
+    scores, order = fixture["scores"], fixture["order"]
+    expected = fixture["expected"]
+    physical_scores = scores[:, order]
+    physical = np.stack([np.flatnonzero(row >= np.partition(row, -2048)[-2048]) for row in physical_scores])
+    assert np.array_equal(np.sort(physical, axis=-1), expected)
+    union = np.unique(physical[physical >= 4096])
+    assert len(union) == fixture["native_miss_union"]
+    policy = SlotLRU()
+    policy.resize(4096, 4096)
+    values = physical.reshape(-1)
+    policy.commit(values[values < 4096])
+    selected = policy.slots[0, :2048]
+    assert len(set(selected)) == 2048 and np.all((selected >= 0) & (selected < 4096))
+    assert payload(1, np.arange(3), 656).shape == (3, 656)
+    assert payload(1, np.arange(3), 2624).shape == (3, 2624)
+    np.testing.assert_array_equal(payload(1, np.arange(3), 2624)[:, :656], payload(1, np.arange(3), 656))

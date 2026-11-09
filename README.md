@@ -212,6 +212,31 @@ python tests/operators/lidu/test_lidu.py --device 5
 python tests/cache/test_abc.py --device 5
 ```
 
+## URMA / UBmem matched single-operator check
+
+Start the existing KVAF CPU service with both URMA and UBmem enabled. Build the
+NPU runtime with `bash scripts/build.sh --transport ubmem --kvaf-root
+/vllm-workspace/vllm-ascend/third_party/KVAF` and source `scripts/env.sh`. The
+same build supplies both original KVAF transport kernels and the fused mapping
+lease; the service must be reachable from the selected NPU worker.
+
+```bash
+python tests/operators/lifetch_ubmem/compare_transports.py \
+  --device 5 --soc Ascend950PR_9599 \
+  --kvaf-root /vllm-workspace/vllm-ascend/third_party/KVAF \
+  --urma-server 127.0.0.1:28885 --ubmem-server 127.0.0.1:28885 \
+  --batch 16 --history 131072 --resident 16384 --index-heads 32 \
+  --miss-percent 10 30 50 --warmup 4 --iterations 20
+```
+
+The runner uses the same controlled Q4 LI fixture, Index permutation, LRU
+candidate order and 656-byte KV payload. UBmem checks native LI, KV bytes,
+Index/slot ownership, real SFA, eager, graph replay and padded rows. Timed graph
+replays restore the fixture before the event pair. UBmem and URMA use different
+output strides and capture implementations, so their reported events are not a
+same-process paired experiment. Detailed logs and one short summary are in
+`tests/results/ubmem-compare`. NPU results are not yet established by host tests.
+
 ## Migration evidence and limits
 
 Source baseline: vLLM-DSA commit `dad47855b20cbe8b74bf412f05757043d22ce0a0`.
@@ -295,7 +320,9 @@ across sequential layer groups and allocated before memory profiling.
 
 Rebuild UBmem fusion and use the matching vLLM integration before serving. Source
 hashes include the shared headers and old ABI 1 libraries are rejected. Resident
-capacity must be at least 8192 for the worst-case Q4 union. This hot-slot repair changes the fusion ABI, while retaining the KVAF UBmem
+capacity must be at least 8192 for the worst-case Q4 union; smaller capacities
+are admitted but a union exceeding available hot slots reports an error.
+This hot-slot repair changes the fusion ABI, while retaining the KVAF UBmem
 runtime ABI and the URMA transport implementation.
 
 Both bindings default to 512 speculative fetches per request/round, accept a
@@ -306,9 +333,11 @@ zero disables prefetch but still retrieves every required cold row. The UBmem
 smoke check accepts `--prefetch-tokens 0 512` to check both cases, including eager
 execution, graph replay, changed owner packing, and Index/payload consistency.
 
-UBmem fusion currently specializes batch 1–16, 32/64 Indexer heads and
+UBmem fusion currently specializes batch 1–32, 32/64 Indexer heads and
 656/2624-byte records before profiling/graph capture; history and hot capacity
-are 256-aligned, with `8192 <= resident < history <= 210944` and
+are 256-aligned, with `2048 <= resident < history <= 210944` and
 `resident <= 131072`. The binary cache includes the shape and source hashes.
 The forward path uses preallocated storage without per-step compilation or a
-new host synchronization. URMA's runtime-shape limits described above are separate.
+new host synchronization. B17–32 and resident below 8192 require NPU validation. The UBmem controller processes more than eight request rows per service lane
+in bounded chunks. Successful compilation
+does not prove runtime correctness. URMA's runtime-shape limits described above are separate.

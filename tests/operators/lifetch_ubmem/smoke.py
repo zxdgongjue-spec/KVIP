@@ -3,6 +3,8 @@
 """Real KVAF Put -> UBmem LI/TopK/Fetch -> Index update, with no model weights."""
 
 import argparse
+import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -18,15 +20,64 @@ from kvip.runtime.device import query_device_resources
 
 
 def payload(owner, tokens, token_bytes):
-    tokens = np.asarray(tokens, dtype=np.uint64).reshape(-1)
-    columns = np.arange(token_bytes, dtype=np.uint16)
-    values = ((tokens[:, None] % 251 + columns[None, :] + owner * 17) % 251).astype(np.uint8)
-    values[:, :8] = (tokens + np.uint64(owner << 32)).astype("<u8").view(np.uint8).reshape(-1, 8)
-    return values
+    """Same packed C8 records used by the URMA numerical oracle."""
+    from contract_payload import payload as layer_payload
+
+    return np.concatenate(
+        [layer_payload(owner - 1 + layer * 1024, tokens) for layer in range(token_bytes // 656)], axis=1
+    )
 
 
-def check_shape(kvaf, torch, build, device_id, shape, library, prefetch_tokens=512, args_server="127.0.0.1:28880"):
+def controlled_fixture(history, resident, heads, miss_percent):
+    """Use precisely the same deterministic Q4 fixture as URMA's A/B test."""
+    support = Path(__file__).resolve().parents[1] / "lifetch/support"
+    if str(support) not in sys.path:
+        sys.path.insert(0, str(support))
+    from real_fetch_inputs import prepare_full_chain_fixture
+
+    with tempfile.TemporaryDirectory(prefix="kvip-ubmem-fixture-") as tmp:
+        root = Path(tmp) / "fixture"
+        info = prepare_full_chain_fixture(root, history, resident, miss_percent, index_heads=heads)
+        data = {
+            "info": info,
+            "order": np.load(root / "physical_to_logical.npy").astype(np.int64),
+            "keys": np.fromfile(root / "arg1.bin", np.uint8).reshape(history, 128),
+            "scales": np.fromfile(root / "arg4.bin", np.float32),
+            "query": np.fromfile(root / "arg0.bin", np.uint8).reshape(4, heads, 128),
+            "weights": np.fromfile(root / "arg2.bin", np.float32).reshape(4, heads),
+            "query_scale": np.fromfile(root / "arg3.bin", np.float32).reshape(4, heads),
+            "scores": np.load(root / "logical_scores.npy"),
+        }
+    order = data["order"]
+    assert len(order) == history and np.array_equal(np.sort(order), np.arange(history))
+    # URMA's single-operator harness identifies tokens by physical fixture row.
+    # Its source payload and initial hot slots use these same row IDs.
+    physical_scores = data["scores"][:, order]
+    data["expected"] = np.sort(np.argpartition(physical_scores, -2048, axis=1)[:, -2048:], axis=1)
+    all_cold = np.unique(data["expected"][data["expected"] >= resident])
+    data["native_miss_union"] = len(all_cold)
+    return data
+
+
+def check_shape(
+    kvaf,
+    torch,
+    build,
+    device_id,
+    shape,
+    library,
+    prefetch_tokens=512,
+    args_server="127.0.0.1:28880",
+    miss_percent=100,
+    warmup=0,
+    iterations=0,
+):
     batch, history, resident, token_bytes = shape.batch, shape.history, shape.resident, shape.token_bytes
+    fixture = controlled_fixture(history, resident, shape.heads, miss_percent)
+    expected_ids = fixture["expected"]
+    cold_count = fixture["native_miss_union"]
+    logical_scales = fixture["scales"]
+    logical_key_columns = fixture["keys"][:, 0]
     device = torch.device(f"npu:{device_id}")
     block_bytes = 128 * token_bytes
     slot_bytes = (block_bytes + 4095) // 4096 * 4096
@@ -52,10 +103,10 @@ def check_shape(kvaf, torch, build, device_id, shape, library, prefetch_tokens=5
         table = runtime.prepare_access_table(keys)
         device_table = runtime.access_table_view(table, device="npu")
         storage = IndexCacheStorage(torch, batch + 1, history, resident, device)
-        storage.keys.fill_(0x38)  # FP8 1.0; cold scales dominate the small key variation.
-        key_columns = np.where(np.arange(history) % 2, 0x40, 0x38).astype(np.uint8)
-        storage.keys[1:, :, 0].copy_(torch.from_numpy(key_columns).to(device))
-        storage.scales[:, -2048:].fill_(8)
+        key_tensor = torch.from_numpy(fixture["keys"]).to(device)
+        scale_tensor = torch.from_numpy(fixture["scales"]).to(device)
+        storage.keys[1:].copy_(key_tensor.expand(batch, -1, -1))
+        storage.scales[1:].copy_(scale_tensor.expand(batch, -1))
         storage.hot_valid[1:].fill_(1)
         offsets = torch.arange(128, dtype=torch.int64, device=device) * token_bytes
         storage.addresses[1:].copy_((device_table.addresses.view(batch, blocks, 1) + offsets).reshape(batch, history))
@@ -77,9 +128,13 @@ def check_shape(kvaf, torch, build, device_id, shape, library, prefetch_tokens=5
             index_heads=shape.heads,
         )
         workspace.inputs.prepare([4] * batch, query_owners=list(range(1, batch + 1)))
-        workspace.inputs.query.view(torch.uint8).fill_(0x38)
-        workspace.inputs.weights.fill_(1)
-        workspace.inputs.scale.fill_(1)
+        workspace.inputs.query.view(torch.uint8).copy_(
+            torch.from_numpy(fixture["query"]).to(device).repeat(batch, 1, 1)
+        )
+        workspace.inputs.weights.copy_(
+            torch.from_numpy(fixture["weights"]).to(device, dtype=torch.bfloat16).repeat(batch, 1)
+        )
+        workspace.inputs.scale.copy_(torch.from_numpy(fixture["query_scale"]).to(device).repeat(batch, 1))
         workspace.inputs.query_ends.fill_(history)
         lease = UbmemLease(torch, runtime, output_rows, stream)
         lease.register_table(device_table)
@@ -98,13 +153,6 @@ def check_shape(kvaf, torch, build, device_id, shape, library, prefetch_tokens=5
             scratch=workspace.scratch,
             prefetch_limit=prefetch_tokens,
         )
-        # Match KVCachePolicy.prepare: candidates and their inverse reservation
-        # map are one input. Binding initializes reservations to -1, so publish
-        # both after construction. On later rounds prefetch may overwrite a
-        # candidate that LI still selects; it must be refetched, not read as a hit.
-        ordinals = torch.arange(2048, dtype=torch.int32, device=device)
-        rotating.lru_slots.copy_(ordinals)
-        rotating.reserved_hot[:, :2048].copy_(ordinals)
         update = UbmemIndexUpdate(
             torch,
             keys=storage.keys,
@@ -151,7 +199,6 @@ def check_shape(kvaf, torch, build, device_id, shape, library, prefetch_tokens=5
             if padding:
                 assert np.all(logical == -1) and np.all(slots == -1), "Padding inherited live outputs"
                 return
-            expected_ids = np.arange(history - 2048, history)
             ids = storage.logical_ids.cpu().numpy()
             addresses = storage.addresses.cpu().numpy()
             scales = storage.scales.cpu().numpy()
@@ -163,25 +210,23 @@ def check_shape(kvaf, torch, build, device_id, shape, library, prefetch_tokens=5
                 assert np.array_equal(addresses[owner], original_addresses[owner, ids[owner]]), (
                     "Index addresses detached"
                 )
-                assert np.array_equal(scales[owner], np.where(ids[owner] >= history - 2048, 8, 1)), (
-                    "Index scales detached"
-                )
-                assert np.array_equal(key_values[owner], key_columns[ids[owner]]), "Index keys detached"
-                # Tags check the persistent hot-cache invariant, including
-                # prefetched entries absent from this round's final TopK.
+                assert np.array_equal(scales[owner], logical_scales[ids[owner]]), "Index scales detached"
+                assert np.array_equal(key_values[owner], logical_key_columns[ids[owner]]), "Index keys detached"
+                # Verify every valid persistent hot entry, not just selected rows.
                 hot_valid = storage.hot_valid[owner].cpu().numpy() != 0
-                hot_tags = output[owner, :resident, :8].contiguous().cpu().numpy().view("<u8").reshape(-1)
-                expected_tags = ids[owner, :resident].astype(np.uint64) + np.uint64(owner << 32)
-                bad_hot = np.flatnonzero(hot_valid & (hot_tags != expected_tags))
-                if bad_hot.size:
-                    slot = int(bad_hot[0])
+                hot_slots = np.flatnonzero(hot_valid)
+                actual_hot = output[owner, :resident].cpu().numpy()[hot_slots]
+                expected_hot = payload(owner, ids[owner, hot_slots], token_bytes)
+                if not np.array_equal(actual_hot, expected_hot):
+                    difference = np.argwhere(actual_hot != expected_hot)[0]
                     raise AssertionError(
-                        f"Hot slot/Index mismatch: phase={phase} device={device_id} batch={batch} "
-                        f"token_bytes={token_bytes} owner={owner} slot={slot} "
-                        f"expected_tag={int(expected_tags[slot])} actual_tag={int(hot_tags[slot])}"
+                        f"Hot slot/Index mismatch: phase={phase} owner={owner} "
+                        f"slot={hot_slots[difference[0]]} byte={difference[1]}"
                     )
                 for _ in range(count):
-                    assert np.array_equal(np.sort(logical[output_row]), expected_ids), "LI selected the wrong TopK set"
+                    assert np.array_equal(np.sort(logical[output_row]), expected_ids[output_row % 4]), (
+                        "LI selected the wrong TopK set"
+                    )
                     selected_slots = torch.from_numpy(slots[output_row].astype(np.int64)).to(device)
                     actual = torch.index_select(output[owner], 0, selected_slots).cpu().numpy()
                     expected = payload(owner, logical[output_row], token_bytes)
@@ -198,11 +243,110 @@ def check_shape(kvaf, torch, build, device_id, shape, library, prefetch_tokens=5
                     output_row += 1
             assert np.all(logical[output_row:] == -1) and np.all(slots[output_row:] == -1), "TND padding is stale"
 
+        # Restore the exact initial mapping/cache outside the event pair.
+        measured_buffers = (
+            storage.keys,
+            storage.scales,
+            storage.addresses,
+            storage.logical_ids,
+            storage.hot_valid,
+            output,
+        )
+        initial_state = tuple(t.clone() for t in measured_buffers) if iterations else ()
+
+        # Compare LI selection against the independent torch_npu native LI on
+        # exactly the same query, Index cache, scales and block table. This is
+        # outside graph timing and happens before Index ownership is updated.
+        import torch_npu
+
+        native = torch_npu.npu_quant_lightning_indexer(
+            query=workspace.inputs.query.reshape(batch, 4, shape.heads, 128),
+            key=storage.keys.view(torch.float8_e4m3fn).reshape((batch + 1) * blocks, 128, 1, 128),
+            weights=workspace.inputs.weights.reshape(batch, 4, shape.heads),
+            query_dequant_scale=workspace.inputs.scale.reshape(batch, 4, shape.heads),
+            key_dequant_scale=storage.scales.reshape((batch + 1) * blocks, 128, 1),
+            actual_seq_lengths_query=workspace.query_lengths,
+            actual_seq_lengths_key=workspace.key_lengths,
+            block_table=workspace.inputs.block_table,
+            query_quant_mode=0,
+            key_quant_mode=0,
+            layout_query="BSND",
+            layout_key="PA_BSND",
+            sparse_count=2048,
+            sparse_mode=0,
+        )
+        native_ids = (native[0] if isinstance(native, (tuple, list)) else native).cpu().numpy().reshape(batch, 4, 2048)
+        if not np.all(np.sort(native_ids, axis=-1) == expected_ids[None, :, :]):
+            raise AssertionError("Native LI differs from the independent controlled TopK oracle")
+        # The URMA test commits this same native TopK to the service LRU before
+        # choosing victims. Match the exact ordered candidates and inverse map.
+        from kvip.cache.lru import SlotLRU
+
+        candidates = np.empty((batch, 2048), dtype=np.int32)
+        reserved = np.full((batch, resident), -1, dtype=np.int32)
+        for row in range(batch):
+            policy = SlotLRU()
+            policy.resize(resident, resident)
+            hits = native_ids[row].reshape(-1)
+            policy.commit(hits[hits < resident])
+            slot = int(policy.head[0])
+            for i in range(2048):
+                candidates[row, i] = slot
+                slot = int(policy.next[0, slot])
+            reserved[row, candidates[row]] = np.arange(2048, dtype=np.int32)
+        rotating.lru_slots.copy_(torch.from_numpy(candidates).to(device))
+        rotating.reserved_hot.copy_(torch.from_numpy(reserved).to(device))
+        del native, native_ids
+
         forward()
         verify(list(range(1, batch + 1)), phase="eager")
+        # Actual service SFA with the URMA fixture's packed C8 payload, using
+        # this fused path's final token-to-slot mapping. All outside timing.
+        from types import SimpleNamespace
+        from attention import check_sfa
+
+        selected_ids = update.logical_output.cpu().numpy().reshape(batch * 4, 1, 2048)
+        selected_slots = update.slot_output.cpu().numpy().reshape(batch * 4, 1, 2048)
+        physical_ids = storage.logical_ids.cpu().numpy()
+        forward_map = np.full((batch, history), -1, np.int32)
+        for row in range(batch):
+            forward_map[row, physical_ids[row + 1, :resident]] = np.arange(resident)
+            forward_map[row, selected_ids[row * 4 : (row + 1) * 4].reshape(-1)] = selected_slots[
+                row * 4 : (row + 1) * 4
+            ].reshape(-1)
+        block_table = torch.arange(batch * resident // 128, device=device, dtype=torch.int32).reshape(batch, -1)
+        geometry = SimpleNamespace(
+            batch=batch, queries=4, num_layers=1, layer_id=0, resident_blocks=batch * resident // 128
+        )
+        before = {"pool_rows": np.arange(batch), "budgets": np.full(batch, resident)}
+        after = {"topk": selected_ids, "forward": forward_map}
+        tensors = dict(
+            query=workspace.inputs.query,
+            resident_output=output[1:, :, :656].contiguous(),
+            forward=torch.from_numpy(forward_map).to(device),
+            pool_rows=torch.arange(batch, dtype=torch.int32, device=device),
+            topk=torch.from_numpy(selected_ids).to(device),
+            resident_table=block_table,
+            cumulative_query=torch.arange(1, batch + 1, dtype=torch.int32, device=device) * 4,
+            logical_lens=torch.full((batch,), history, dtype=torch.int32, device=device),
+        )
+        sfa = check_sfa(torch, tensors, geometry, before, after)
+        print(f"UBMEM_SFA_PASS max_abs={sfa['max_abs']:.8f}", flush=True)
         first_counters = rotating.ubmem_status.cpu().numpy()
-        assert np.any(first_counters[:, 1] + first_counters[:, 3]), "Fixture did not exercise a cold DDR fetch"
-        assert np.all(first_counters[:, 3] >= 2048 - prefetch_tokens), (
+        print(
+            "UBMEM_FETCH_COUNTS "
+            f"prefetch_posted={int(first_counters[:, 1].sum())} "
+            f"prefetch_completed={int(first_counters[:, 2].sum())} "
+            f"final_posted={int(first_counters[:, 3].sum())} "
+            f"final_completed={int(first_counters[:, 4].sum())} "
+            f"native_required={batch * cold_count} "
+            f"requested_miss_pct={miss_percent:g} actual_misses_per_query={fixture['info']['final_misses_per_query']} "
+            f"Q4_union_per_request={cold_count} fixture=shared_urma_seed20261104",
+            flush=True,
+        )
+        if cold_count:
+            assert np.any(first_counters[:, 1] + first_counters[:, 3]), "Fixture did not exercise a cold DDR fetch"
+        assert np.all(first_counters[:, 3] >= max(0, cold_count - prefetch_tokens)), (
             "Final repair must fetch all missing TopK rows even beyond the speculative budget"
         )
         graph = kvaf.AclGraph()
@@ -235,6 +379,29 @@ def check_shape(kvaf, torch, build, device_id, shape, library, prefetch_tokens=5
         graph.replay(stream)
         verify([], phase="padding", padding=True)
         assert torch.equal(storage.logical_ids, before), "Padding changed Index ownership"
+        if iterations:
+            workspace.inputs.prepare([4] * batch, query_owners=list(range(1, batch + 1)))
+            workspace.inputs.query_ends.fill_(history)
+            elapsed = []
+            for turn in range(warmup + iterations):
+                for tensor, saved in zip(measured_buffers, initial_state):
+                    tensor.copy_(saved)
+                begin = torch.npu.Event(enable_timing=True)
+                end = torch.npu.Event(enable_timing=True)
+                begin.record(stream)
+                graph.replay(stream)
+                end.record(stream)
+                end.synchronize()
+                if turn >= warmup:
+                    elapsed.append(begin.elapsed_time(end) * 1000)
+            verify(list(range(1, batch + 1)), phase="timed_replay")
+            print(
+                f"UBMEM_GRAPH_EVENT_US p50={np.percentile(elapsed, 50):.3f} "
+                f"p99={np.percentile(elapsed, 99):.3f} iterations={iterations} "
+                "includes=init,LI,prefetch,resolve,final_fetch,index_update "
+                "excludes=fixture_restore,native_li,verification,CPU_LRU,SFA",
+                flush=True,
+            )
         graph.reset()
         graph = None
         lease.close()
@@ -259,9 +426,11 @@ def check_shape(kvaf, torch, build, device_id, shape, library, prefetch_tokens=5
         if runtime.initialized:
             runtime.shutdown()
     print(
-        f"UBMEM_LIFETCH_PASS device={device_id} batch={batch} token_bytes={token_bytes} "
+        f"UBMEM_LIFETCH_PASS device={device_id} batch={batch} heads={shape.heads} "
+        f"history={history} resident={resident} token_bytes={token_bytes} "
+        f"requested_miss_pct={miss_percent:g} Q4_unique_misses={cold_count} "
         f"prefetch_tokens={prefetch_tokens} "
-        "put=topk=fetch=index_update=graph=packed_queries=padding"
+        "put=native_li=topk=fetch=sfa=index_update=graph=packed_queries=padding"
     )
 
 
@@ -277,7 +446,16 @@ def main():
     parser.add_argument("--history", type=int, default=33024)
     parser.add_argument("--resident", type=int, default=8192)
     parser.add_argument("--prefetch-tokens", type=int, nargs="+", default=[512])
+    parser.add_argument(
+        "--miss-percent", type=float, default=100, help="Controlled per-query miss; fixture matches the URMA benchmark"
+    )
+    parser.add_argument("--warmup", type=int, default=4)
+    parser.add_argument("--iterations", type=int, default=20)
     args = parser.parse_args()
+    if args.warmup < 0 or args.iterations < 0:
+        parser.error("warmup/iterations must be non-negative")
+    if not 0 <= args.miss_percent <= 100:
+        parser.error("miss-percent must be in 0..100")
     import kvaf
     import torch
     import torch_npu  # noqa: F401
@@ -295,7 +473,19 @@ def main():
             shape = Specialization(batch, args.history, args.resident, args.index_heads, token_bytes, aics, 8, args.soc)
             library = build_specialization(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape)
             for prefetch_tokens in args.prefetch_tokens:
-                check_shape(kvaf, torch, build, args.device, shape, library, prefetch_tokens, args.kvaf_server)
+                check_shape(
+                    kvaf,
+                    torch,
+                    build,
+                    args.device,
+                    shape,
+                    library,
+                    prefetch_tokens,
+                    args.kvaf_server,
+                    args.miss_percent,
+                    args.warmup,
+                    args.iterations,
+                )
 
 
 if __name__ == "__main__":
