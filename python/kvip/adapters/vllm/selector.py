@@ -50,6 +50,7 @@ class VllmIndexSelector:
         self.attention_indices = None
         self.plans = None
         self.tail_source = None
+        self.snapshot_observer = None
 
     def prepare(self, plans, *, prepare_inputs=True):
         """CPU request layout, once per forward; no device readback."""
@@ -81,8 +82,12 @@ class VllmIndexSelector:
         self.inputs.pack(query, weights, query_scale)
         if self.tail_source is not None:
             self.rotating.tail_bounds.copy_(self.tail_source)
+        if self.snapshot_observer is not None:
+            self.snapshot_observer.before(self)
         # v9_init owns round-local initialization inside the captured launch.
         self.forward()
+        if self.snapshot_observer is not None:
+            self.snapshot_observer.after(self)
 
         mixed = self.plans is not None and len(self.decodes) != len(self.plans)
         token_count = self.inputs.token_count if mixed or weights.shape[0] > self.inputs.batch * 4 else weights.shape[0]
