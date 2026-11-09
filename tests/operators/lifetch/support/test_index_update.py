@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 import torch
 from kvip.operators.lifetch.index_update import DirectIndexUpdate
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[4]
 
 
 class UpdatePlanTest(unittest.TestCase):
@@ -83,7 +83,7 @@ class UpdatePlanTest(unittest.TestCase):
             self.assertEqual(line, "1")
 
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[4]
 
 
 class UpdateMoveTest(unittest.TestCase):
@@ -331,7 +331,7 @@ class IndexUpdateTest(unittest.TestCase):
         compiler = shutil.which("c++")
         if not compiler:
             self.skipTest("C++ unavailable")
-        root = Path(__file__).resolve().parents[3]
+        root = Path(__file__).resolve().parents[4]
         text = (root / "csrc/operators/lightning_indexer_with_fetch/op_kernel/index_cache_update.cpp").read_text()
         function = text[
             text.index("__simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PublishOutputs") : text.index(

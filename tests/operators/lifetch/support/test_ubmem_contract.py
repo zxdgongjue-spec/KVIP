@@ -301,7 +301,7 @@ def test_public_selector_dispatches_transport(transport):
 
 @pytest.mark.parametrize("percent", [10, 30, 50])
 def test_controlled_fixture_matches_urma(percent):
-    from smoke import controlled_fixture
+    from ubmem_smoke import controlled_fixture
 
     fixture = controlled_fixture(8192, 4096, 32, percent)
     order = fixture["order"]
@@ -312,7 +312,7 @@ def test_controlled_fixture_matches_urma(percent):
 
 
 def test_shared_q4_fixture_topk_and_lru_match_urma():
-    from smoke import controlled_fixture, payload
+    from ubmem_smoke import controlled_fixture, payload
     from kvip.cache.lru import SlotLRU
 
     fixture = controlled_fixture(8192, 4096, 32, 10)
@@ -335,7 +335,7 @@ def test_shared_q4_fixture_topk_and_lru_match_urma():
 
 
 def test_mixed_query_counts_cover_padding_and_query_lengths():
-    from smoke import mixed_query_counts
+    from ubmem_smoke import mixed_query_counts
 
     assert mixed_query_counts(2) == [1, 2]
     counts = mixed_query_counts(16)
@@ -352,7 +352,7 @@ def test_runtime_batch_bounds_compact_outputs(tmp_path):
     compiler = shutil.which("c++")
     if not compiler:
         pytest.skip("C++ unavailable")
-    root = Path(__file__).resolve().parents[3]
+    root = Path(__file__).resolve().parents[4]
     text = (root / "csrc/operators/lightning_indexer_with_fetch_ubmem/op_kernel/index_cache_update.cpp").read_text()
     begin = text.index("__simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PublishOutputs")
     end = text.index("template <bool Owned>", begin)

@@ -32,7 +32,7 @@ def payload(owner, tokens, token_bytes):
 
 def controlled_fixture(history, resident, heads, miss_percent):
     """Use precisely the same deterministic Q4 fixture as URMA's A/B test."""
-    support = Path(__file__).resolve().parents[1] / "lifetch/support"
+    support = Path(__file__).resolve().parent
     if str(support) not in sys.path:
         sys.path.insert(0, str(support))
     from real_fetch_inputs import prepare_full_chain_fixture

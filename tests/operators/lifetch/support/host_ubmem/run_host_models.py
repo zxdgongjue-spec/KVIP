@@ -6,7 +6,8 @@ import os
 import subprocess
 import tempfile
 
-root = Path(__file__).resolve().parents[1]
+root = Path(__file__).resolve().parents[5] / "csrc/operators/lightning_indexer_with_fetch_ubmem"
+tests = Path(__file__).resolve().parent
 compiler = os.environ.get("CXX", "c++")
 common = {
     "SIM_HISTORY": 33024,
@@ -51,8 +52,8 @@ with tempfile.TemporaryDirectory(prefix="kvip-ubmem-model-") as directory:
             f"-I{root / 'op_kernel/copy'}",
         ]
         for name, sources in (
-            ("copy", [root / "tests/copy_model.cpp"]),
-            ("abi", [root / "tests/abi_test.cpp", root / "op_host/launch.cpp"]),
+            ("copy", [tests / "copy_model.cpp"]),
+            ("abi", [tests / "abi_test.cpp", root / "op_host/launch.cpp"]),
         ):
             binary = Path(directory) / f"{name}-{batch}-{width}"
             subprocess.run([*options, *map(str, sources), "-o", str(binary)], check=True)

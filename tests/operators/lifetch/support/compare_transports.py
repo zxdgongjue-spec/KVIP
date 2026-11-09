@@ -15,7 +15,7 @@ import subprocess
 import sys
 import time
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "tests/operators/lifetch/support"))
 from transport_snapshot import compare as compare_snapshots  # noqa: E402
 
@@ -127,7 +127,7 @@ def main(argv=None):
     # Verify one process reuses one binary across batch, KV width and history.
     shape_batches = list(dict.fromkeys((1, args.batch)))
     shape_command = [
-        sys.executable, "-u", str(ROOT / "tests/operators/lifetch_ubmem/smoke.py"),
+        sys.executable, "-u", str(ROOT / "tests/operators/lifetch/support/ubmem_smoke.py"),
         "--device", str(args.device), "--soc", args.soc, "--build-dir", str(build),
         "--kvaf-server", args.ubmem_server, "--batches", *map(str, shape_batches),
         "--history", str(args.history), "--resident", str(args.resident),
@@ -177,7 +177,7 @@ def main(argv=None):
                 command = [
                     sys.executable,
                     "-u",
-                    str(ROOT / "tests/operators/lifetch/test_lifetch.py"),
+                    str(ROOT / "tests/operators/lifetch/support/test_urma_runner.py"),
                     *common,
                     "--kvaf-server",
                     args.urma_server,
@@ -209,7 +209,7 @@ def main(argv=None):
                 command = [
                     sys.executable,
                     "-u",
-                    str(ROOT / "tests/operators/lifetch_ubmem/smoke.py"),
+                    str(ROOT / "tests/operators/lifetch/support/ubmem_smoke.py"),
                     *common,
                     "--build-dir",
                     str(build),

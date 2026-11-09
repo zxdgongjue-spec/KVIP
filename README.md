@@ -154,7 +154,7 @@ Graph-mode native/fused comparison using real DDR and the current service LRU:
 ```bash
 cd /vllm-workspace/KVIP
 source scripts/env.sh
-python tests/operators/lifetch/test_lifetch.py --device 5 --kvaf-server 127.0.0.1:28885 --batches 16 --history 131072 --resident 16384 --index-heads 32 --miss-percent 10 --intermediate-fetches 8 --prefetch-tokens 512 --warmup 4 --iterations 20 --trace-rounds 3
+python tests/operators/lifetch/test_lifetch.py --transport urma --device 5 --kvaf-server 127.0.0.1:28885 --batches 16 --history 131072 --resident 16384 --index-heads 32 --miss-percent 10 --intermediate-fetches 8 --prefetch-tokens 512 --warmup 4 --iterations 20 --trace-rounds 3
 ```
 
 This uses Q4, TopK 2048, and reports the actual quantized miss fraction. Full-path
@@ -179,7 +179,7 @@ full Index/scale/address ownership, and multiple graph replays, outside timing.
 For the original/adapted/fixed resolver comparison, use the same entry:
 
 ```bash
-python tests/operators/lifetch/test_lifetch.py --device 5 --kvaf-server 127.0.0.1:28885 --batches 8,16 --history 131072 --resident 16384 --index-heads 32 --miss-percent 10 --intermediate-fetches 8 --prefetch-tokens 512 --warmup 4 --iterations 20 --resolver-compare
+python tests/operators/lifetch/test_lifetch.py --transport urma --device 5 --kvaf-server 127.0.0.1:28885 --batches 8,16 --history 131072 --resident 16384 --index-heads 32 --miss-percent 10 --intermediate-fetches 8 --prefetch-tokens 512 --warmup 4 --iterations 20 --resolver-compare
 ```
 
 The CPU suite executes the production resolver and shared LIDU selector with
@@ -212,6 +212,27 @@ python tests/operators/lidu/test_lidu.py --device 5
 python tests/cache/test_abc.py --device 5
 ```
 
+## LIFetch tests
+
+All LIFetch test code lives under `tests/operators/lifetch`. The three public
+entry points are:
+
+```bash
+python tests/operators/lifetch/test_init_urma.py --device 5 --kvaf-server 127.0.0.1:28905
+python tests/operators/lifetch/test_init_ubmem.py --device 5 --kvaf-server 127.0.0.1:28905
+python tests/operators/lifetch/test_lifetch.py --transport ubmem --device 5 \
+  --kvaf-server 127.0.0.1:28905 --soc Ascend950PR_9599 --batches 16 \
+  --history 131072 --resident 16384 --index-heads 32 --miss-percent 10 \
+  --intermediate-fetches 8 --prefetch-tokens 512 --warmup 4 --iterations 20
+```
+
+Select `--transport urma` for URMA using the same workload arguments. Both
+paths check numerical results and report graph timing; UBmem currently reports
+the full graph rather than individual stage traces. The initialization commands
+connect to KVAF and acquire/release their transport leases, but do not execute
+LIFetch. Auxiliary CPU models, fixtures and detailed test implementations live
+under `support/`; they are not NPU accuracy or performance tests.
+
 ## URMA / UBmem matched single-operator check
 
 Build one KVAF checkout with both transports and start its CPU service. The
@@ -229,7 +250,7 @@ nohup third_party/KVAF-ubmem-review/build-cpu/runtime/kvaf_cpu_service \
 ```
 
 ```bash
-python tests/operators/lifetch_ubmem/compare_transports.py \
+python tests/operators/lifetch/support/compare_transports.py \
   --device 5 --soc Ascend950PR_9599 \
   --kvaf-root "$PWD/third_party/KVAF-ubmem-review" \
   --urma-server 127.0.0.1:28905 --ubmem-server 127.0.0.1:28905 \
@@ -298,7 +319,7 @@ compiled library (the runner prints and checks its SHA256):
 ```bash
 cd /vllm-workspace/KVIP
 source scripts/env.sh
-python tests/operators/lifetch/test_lifetch.py --device 5 --kvaf-server 127.0.0.1:28885 --runtime-shapes --miss-percent 10 --warmup 4 --iterations 20 --trace-rounds 3
+python tests/operators/lifetch/test_lifetch.py --transport urma --device 5 --kvaf-server 127.0.0.1:28885 --runtime-shapes --miss-percent 10 --warmup 4 --iterations 20 --trace-rounds 3
 ```
 
 The matrix includes B1/B8/B16, history 65536/131072, resident 8192/16384,

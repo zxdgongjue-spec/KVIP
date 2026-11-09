@@ -31,7 +31,7 @@ def test_device_budget_saturates_without_unsigned_wrap(tmp_path):
     compiler = shutil.which("c++")
     if not compiler:
         pytest.skip("C++ unavailable")
-    root = Path(__file__).resolve().parents[3]
+    root = Path(__file__).resolve().parents[4]
     source = tmp_path / "budget.cpp"
     source.write_text(
         '#include <iostream>\n#define __aicore__\n#include "prefetch_budget.h"\n'
@@ -94,7 +94,7 @@ def test_service_chunk_assignment_covers_every_request_once(tmp_path):
     compiler = shutil.which("c++")
     if not compiler:
         pytest.skip("C++ unavailable")
-    root = Path(__file__).resolve().parents[3]
+    root = Path(__file__).resolve().parents[4]
     header = root / "csrc/operators/lightning_indexer_with_fetch_ubmem/op_kernel/controller"
     source = tmp_path / "chunks.cpp"
     source.write_text(
@@ -131,7 +131,7 @@ def test_ubmem_window_triggers_match_urma(tmp_path, batch, windows, history, res
     compiler = shutil.which("c++")
     if not compiler:
         pytest.skip("C++ unavailable")
-    root = Path(__file__).resolve().parents[3]
+    root = Path(__file__).resolve().parents[4]
     source = tmp_path / "triggers.cpp"
     source.write_text(
         '#include "context.h"\n#include <cstdio>\n'
@@ -164,7 +164,7 @@ def test_runtime_trigger_and_epoch_assignment_use_urma_schedule(tmp_path):
     compiler = shutil.which("c++")
     if not compiler:
         pytest.skip("C++ unavailable")
-    root = Path(__file__).resolve().parents[3]
+    root = Path(__file__).resolve().parents[4]
     source = tmp_path / "runtime_schedule.cpp"
     source.write_text(
         '#include "context.h"\n#include <cstdio>\n'
