@@ -6,9 +6,9 @@
 #include <vector>
 #include "api.h"
 #include "context.h"
-namespace {std::vector<unsigned> calls;unsigned fail=0;}
-#define LAUNCH(name,number) extern "C" uint32_t aclrtlaunch_kvip_ubmem_##name##_kernel(uint32_t,void*,void*) { \
- calls.push_back(number);return number==fail?71:0;}
+namespace {std::vector<unsigned> calls, blocks;unsigned fail=0;}
+#define LAUNCH(name,number) extern "C" uint32_t aclrtlaunch_kvip_ubmem_##name##_kernel(uint32_t blockCount,void*,void*) { \
+ calls.push_back(number);blocks.push_back(blockCount);return number==fail?71:0;}
 LAUNCH(init,1)
 LAUNCH(li,2)
 LAUNCH(resolve,3)
@@ -31,12 +31,13 @@ int main() {
     assert(shape.liCores==kLiCores && shape.rounds==kRounds && shape.serviceLanes==kServiceLanes);
     assert(shape.finalWorkers==kFinalWorkers && shape.finalPostOffset==kFinalPostOffset);
     void* pointer=reinterpret_cast<void*>(1);
-    assert(kvip_ubmem_forward(pointer,pointer,pointer)==0);
+    assert(kvip_ubmem_forward(pointer,pointer,pointer,&shape)==0);
     assert((calls==std::vector<unsigned>{1,2,3,4,5,6,7}));
+    assert((blocks==std::vector<unsigned>{shape.batch,shape.liCores,shape.finalCores,shape.batch,shape.batch,shape.batch,shape.batch*4}));
     calls.clear();fail=4;
-    assert(kvip_ubmem_forward(pointer,pointer,pointer)==71);
+    assert(kvip_ubmem_forward(pointer,pointer,pointer,&shape)==71);
     assert((calls==std::vector<unsigned>{1,2,3,4}));
-    calls.clear();assert(kvip_ubmem_forward(nullptr,pointer,pointer)!=0 && calls.empty());
+    calls.clear();assert(kvip_ubmem_forward(nullptr,pointer,pointer,&shape)!=0 && calls.empty());
     for(uint32_t e=1;e<kRounds;++e)assert(Trigger(e)>Trigger(e-1));
     assert(Trigger(0)==SIM_RESIDENT/128);
     if(kRounds>1)assert(Trigger(kRounds-1)==SIM_HISTORY/128);

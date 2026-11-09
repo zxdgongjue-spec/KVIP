@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Host checks for the fusion lease and static-shape contract; no NPU required."""
 
+import ctypes
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -188,6 +189,7 @@ def test_forward_only_submits_bound_pointers_on_the_current_lease_stream():
     device = object()
     rotating = SimpleNamespace(
         device=device,
+        runtime_shape=ctypes.c_uint32(7),
         library=SimpleNamespace(kvip_ubmem_forward=launch),
         bindings=SimpleNamespace(data_ptr=lambda: 101),
         lease=SimpleNamespace(check_stream=Mock(return_value=SimpleNamespace(npu_stream=303))),
@@ -195,7 +197,9 @@ def test_forward_only_submits_bound_pointers_on_the_current_lease_stream():
     update = SimpleNamespace(device=device, bindings=SimpleNamespace(numel=lambda: 28, data_ptr=lambda: 202))
     forward = UbmemForward(rotating, update)
     forward()
-    launch.assert_called_once_with(101, 202, 303)
+    args = launch.call_args.args
+    assert args[:3] == (101, 202, 303)
+    assert ctypes.cast(args[3], ctypes.POINTER(ctypes.c_uint32)).contents.value == 7
     launch.return_value = 4
     with pytest.raises(RuntimeError, match="launch failed: 4"):
         forward()

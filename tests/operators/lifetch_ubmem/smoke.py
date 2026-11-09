@@ -167,8 +167,8 @@ def check_shape(
         from kvip.operators.lifetch.geometry import trigger_tokens
 
         trigger = rotating.library.v9_window_trigger_tile
-        trigger.argtypes, trigger.restype = [ctypes.c_uint32], ctypes.c_uint32
-        actual_triggers = [128 * trigger(epoch) for epoch in range(rotating.rounds)]
+        trigger.argtypes, trigger.restype = [ctypes.c_uint32, ctypes.c_void_p], ctypes.c_uint32
+        actual_triggers = [128 * trigger(epoch, ctypes.byref(rotating.runtime_shape)) for epoch in range(rotating.rounds)]
         expected_triggers = trigger_tokens(
             batch, history, resident, intermediate_fetches=shape.intermediate_fetches, aic_count=shape.aic_count
         )

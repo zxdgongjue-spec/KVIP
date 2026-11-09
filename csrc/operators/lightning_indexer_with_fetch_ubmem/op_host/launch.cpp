@@ -5,30 +5,30 @@ extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) { return r
 
 #define ENTRY(api,kernel,blocks) \
 extern "C" uint32_t aclrtlaunch_kvip_ubmem_##kernel##_kernel(uint32_t,void*,void*); \
-extern "C" uint32_t api(void* bindings,void* stream) { \
-    if(!bindings || !stream)return 100000; \
+extern "C" uint32_t api(void* bindings,void* stream,const rotating::RuntimeShape* shape) { \
+    if(!bindings || !stream || !shape)return 100000; \
     return aclrtlaunch_kvip_ubmem_##kernel##_kernel(blocks,stream,bindings); }
-ENTRY(v9_init,init,SIM_BATCH)
-ENTRY(v9_li,li,rotating::kLaunchCores)
-ENTRY(v9_resolve,resolve,rotating::kFinalCores)
-ENTRY(v9_fetch,complete,SIM_BATCH)
+ENTRY(v9_init,init,shape->batch)
+ENTRY(v9_li,li,shape->liCores)
+ENTRY(v9_resolve,resolve,shape->finalCores)
+ENTRY(v9_fetch,complete,shape->batch)
 
 extern "C" uint32_t aclrtlaunch_kvip_ubmem_direct_update_outputs_kernel(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_kvip_ubmem_direct_update_owned_kernel(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_kvip_ubmem_direct_apply_owned_kernel(uint32_t,void*,void*);
-extern "C" uint32_t kvip_ubmem_update(void* update,void* stream) {
-    if(!update || !stream)return 100000;
-    uint32_t result=aclrtlaunch_kvip_ubmem_direct_update_owned_kernel(SIM_BATCH,stream,update);
-    if(!result)result=aclrtlaunch_kvip_ubmem_direct_update_outputs_kernel(SIM_BATCH,stream,update);
-    return result?result:aclrtlaunch_kvip_ubmem_direct_apply_owned_kernel(SIM_BATCH*4,stream,update);
+extern "C" uint32_t kvip_ubmem_update(void* update,void* stream,const rotating::RuntimeShape* shape) {
+    if(!update || !stream || !shape)return 100000;
+    uint32_t result=aclrtlaunch_kvip_ubmem_direct_update_owned_kernel(shape->batch,stream,update);
+    if(!result)result=aclrtlaunch_kvip_ubmem_direct_update_outputs_kernel(shape->batch,stream,update);
+    return result?result:aclrtlaunch_kvip_ubmem_direct_apply_owned_kernel(shape->batch*4,stream,update);
 }
-extern "C" uint32_t kvip_ubmem_forward(void* bindings,void* update,void* stream) {
-    if(!bindings || !update || !stream)return 100000;
-    uint32_t result=v9_init(bindings,stream);
-    if(!result)result=v9_li(bindings,stream);
-    if(!result)result=v9_resolve(bindings,stream);
-    if(!result)result=v9_fetch(bindings,stream);
-    if(!result)result=kvip_ubmem_update(update,stream);
+extern "C" uint32_t kvip_ubmem_forward(void* bindings,void* update,void* stream,const rotating::RuntimeShape* shape) {
+    if(!bindings || !update || !stream || !shape)return 100000;
+    uint32_t result=v9_init(bindings,stream,shape);
+    if(!result)result=v9_li(bindings,stream,shape);
+    if(!result)result=v9_resolve(bindings,stream,shape);
+    if(!result)result=v9_fetch(bindings,stream,shape);
+    if(!result)result=kvip_ubmem_update(update,stream,shape);
     return result;
 }
 
@@ -63,6 +63,6 @@ VALUE(v9_ubpipe_depth,8)
 VALUE(v9_ubpipe_rows,TOKEN_BYTES==656?4:1)
 VALUE(v9_window_ubpipe_rows,TOKEN_BYTES==656?8:1)
 VALUE(v9_window_ubpipe_depth,8)
-extern "C" uint32_t v9_window_trigger_tile(uint32_t epoch) {
-    return epoch<rotating::kRounds?rotating::Trigger(epoch):0;
+extern "C" uint32_t v9_window_trigger_tile(uint32_t epoch,const rotating::RuntimeShape* shape) {
+    return shape && epoch<shape->rounds?rotating::RuntimeTrigger(shape->history,shape->resident,shape->rounds,epoch):0;
 }
