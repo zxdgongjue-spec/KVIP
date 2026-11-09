@@ -35,6 +35,8 @@ def arguments(argv=None):
     p.add_argument("--batches", default="16")
     p.add_argument("--iterations", type=int, default=20)
     p.add_argument("--warmup", type=int, default=4)
+    p.add_argument("--comparison-output", type=Path)
+    p.add_argument("--comparison-sfa", type=Path)
     p.add_argument("--output", type=Path, default=ROOT / "tests/results/lifetch")
     a = p.parse_args(argv)
     if a.kvaf_root is None:

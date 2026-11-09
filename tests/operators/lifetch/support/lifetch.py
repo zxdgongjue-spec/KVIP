@@ -323,6 +323,11 @@ def run_device(
             if step >= args.warmup:
                 samples.append(start.elapsed_time(end) * 1000)
             check()
+            if read_label == "prototype_with_update" and step == args.warmup and args.comparison_output:
+                from transport_snapshot import save
+                save(args.comparison_output, state["ids"], state["slots"], owner.output.cpu().numpy(),
+                     rotating.mapping.cpu().numpy(), rotating.lru_slots.cpu().numpy(),
+                     rotating.rows.cpu().numpy().view(np.uint32), owner.remote_token_addresses.cpu().numpy())
             if read_label and step >= args.warmup:
                 read_samples.setdefault(read_label, []).append(
                     actual_reads(
@@ -655,7 +660,8 @@ def run_device(
         logical_lens=torch.full((b,), h, device=device, dtype=torch.int32),
     )
     geom = SimpleNamespace(batch=b, queries=4, num_layers=1, layer_id=0, resident_blocks=b * (r + 8192) // 128)
-    sfa = check_sfa(torch, tensors, geom, {"pool_rows": np.arange(b), "budgets": np.full(b, r + 8192)}, after)
+    sfa = check_sfa(torch, tensors, geom, {"pool_rows": np.arange(b), "budgets": np.full(b, r + 8192)}, after,
+                    output_path=args.comparison_sfa)
     return dict(
         status="pass",
         timing=timings,

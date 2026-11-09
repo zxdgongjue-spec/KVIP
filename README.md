@@ -241,7 +241,13 @@ candidate order and 656-byte KV payload. UBmem checks native LI, KV bytes,
 Index/slot ownership, real SFA, eager, graph replay and padded rows. Timed graph
 replays restore the fixture before the event pair. UBmem and URMA use different
 output strides and capture implementations, so their reported events are not a
-same-process paired experiment. Detailed logs and one short summary are in
+same-process paired experiment. The post-timing snapshots compare logical TopK,
+selected KV bytes and SFA output. Each snapshot also records per-token prefetch
+mapping, source addresses, target slots and per-window counts; epoch attribution
+is reconstructed from the recorded per-request execution order and allocation
+ordinal. Differences in speculative work are reported, not treated as a numerical
+failure. Raw DDR virtual addresses belong to separate allocations and cannot be
+compared as identical addresses. Detailed snapshots and a summary are in
 `tests/results/ubmem-compare`. NPU results are not yet established by host tests.
 
 ## Migration evidence and limits

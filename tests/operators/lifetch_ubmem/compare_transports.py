@@ -15,6 +15,8 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "tests/operators/lifetch/support"))
+from transport_snapshot import compare as compare_snapshots  # noqa: E402
 
 
 def execute(command, log, timeout, label):
@@ -190,6 +192,8 @@ def main(argv=None):
                 prefixes = ("UBMEM_LIFETCH_PASS", "UBMEM_GRAPH_EVENT_US", "UBMEM_SFA_PASS", "UBMEM_FETCH_COUNTS",
                             "UBMEM_WINDOW_TRIGGERS")
                 required = ("UBMEM_LIFETCH_PASS", "UBMEM_GRAPH_EVENT_US", "UBMEM_SFA_PASS", "UBMEM_WINDOW_TRIGGERS")
+            command += ["--comparison-output", str(out / f"{label}.npz"),
+                        "--comparison-sfa", str(out / f"{label}-sfa.npy")]
             code = execute(command, log, args.timeout_seconds, label)
             selected = extract(log, prefixes)
             success = code == 0 and all(any(line.startswith(prefix) for line in selected) for prefix in required)
@@ -202,6 +206,24 @@ def main(argv=None):
             if not success:
                 print(f"STOP: {label}; full log={log}; summary={summary}", flush=True)
                 return 1
+        try:
+            comparison = compare_snapshots(out / f"urma-miss{miss}.npz", out / f"ubmem-miss{miss}.npz", args.resident)
+            import numpy as np
+            first = np.load(out / f"urma-miss{miss}-sfa.npy")
+            second = np.load(out / f"ubmem-miss{miss}-sfa.npy")
+            if first.shape != second.shape or not np.allclose(first, second, atol=0.006, rtol=0.025):
+                raise AssertionError("cross-transport SFA outputs differ")
+            comparison.insert(1, f"sfa_max_abs_difference={np.max(np.abs(first-second)):.8g}")
+            record = [f"cross-transport miss={miss}: PASS final output; prefetch differences are informational", *comparison]
+        except Exception as error:
+            record = [f"cross-transport miss={miss}: FAIL {type(error).__name__}: {error}"]
+            with summary.open("a") as result:
+                result.write("\n".join(record) + "\n")
+            print("\n".join(record), flush=True)
+            return 1
+        with summary.open("a") as result:
+            result.write("\n".join(record) + "\n")
+        print("\n".join(record), flush=True)
     print(f"PASS: all requested cases; summary={summary}", flush=True)
     return 0
 

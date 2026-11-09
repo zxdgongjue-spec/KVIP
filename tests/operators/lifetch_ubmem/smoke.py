@@ -81,6 +81,8 @@ def check_shape(
     miss_percent=100,
     warmup=0,
     iterations=0,
+    comparison_output=None,
+    comparison_sfa=None,
 ):
     batch, history, resident, token_bytes = shape.batch, shape.history, shape.resident, shape.token_bytes
     fixture = controlled_fixture(history, resident, shape.heads, miss_percent)
@@ -355,7 +357,7 @@ def check_shape(
             cumulative_query=torch.arange(1, batch + 1, dtype=torch.int32, device=device) * 4,
             logical_lens=torch.full((batch,), history, dtype=torch.int32, device=device),
         )
-        sfa = check_sfa(torch, tensors, geometry, before, after)
+        sfa = check_sfa(torch, tensors, geometry, before, after, output_path=comparison_sfa)
         print(f"UBMEM_SFA_PASS max_abs={sfa['max_abs']:.8f}", flush=True)
         first_counters = rotating.ubmem_status.cpu().numpy()
         print(
@@ -423,6 +425,11 @@ def check_shape(
                 if turn >= warmup:
                     elapsed.append(begin.elapsed_time(end) * 1000)
             verify(list(range(1, batch + 1)), phase="timed_replay")
+            if comparison_output:
+                from transport_snapshot import save
+                save(comparison_output, update.logical_output.cpu().numpy(), update.slot_output.cpu().numpy(),
+                     output[1:].cpu().numpy(), rotating.mapping.cpu().numpy(), rotating.lru_slots.cpu().numpy(),
+                     rotating.rows.cpu().numpy().view(np.uint32), original_addresses[1:])
             print(
                 f"UBMEM_GRAPH_EVENT_US p50={np.percentile(elapsed, 50):.3f} "
                 f"p99={np.percentile(elapsed, 99):.3f} iterations={iterations} "
@@ -479,6 +486,8 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=4)
     parser.add_argument("--iterations", type=int, default=20)
+    parser.add_argument("--comparison-output", type=Path)
+    parser.add_argument("--comparison-sfa", type=Path)
     parser.add_argument("--runtime-shapes", action="store_true", help="Also check a second history/hot shape with the same binary")
     args = parser.parse_args()
     if args.warmup < 0 or args.iterations < 0:
@@ -523,6 +532,8 @@ def main():
                 args.miss_percent,
                 args.warmup,
                 args.iterations,
+                args.comparison_output,
+                args.comparison_sfa,
             )
 
 
