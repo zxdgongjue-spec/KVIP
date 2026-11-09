@@ -135,14 +135,15 @@ def test_ubmem_window_triggers_match_urma(tmp_path, batch, windows, history, res
     source = tmp_path / "triggers.cpp"
     source.write_text(
         '#include "context.h"\n#include <cstdio>\n'
-        'int main() { for(unsigned e=0;e<rotating::kRounds;++e) '
-        'std::printf("%u ",128*rotating::Trigger(e)); '
+        'int main() { for(unsigned e=0;e<ROUNDS;++e) '
+        'std::printf("%u ",128*rotating::RuntimeTrigger(SIM_HISTORY,SIM_RESIDENT,ROUNDS,e)); '
         'for(unsigned t=0;t<=SIM_HISTORY/128+1;++t) { bool found=false; '
-        'for(unsigned e=0;e<rotating::kRounds;++e)found |= rotating::Trigger(e)==t; '
-        'if(found != rotating::IsTrigger(t))return 1; } }\n'
+        'for(unsigned e=0;e<ROUNDS;++e)found |= rotating::RuntimeTrigger(SIM_HISTORY,SIM_RESIDENT,ROUNDS,e)==t; '
+        'if(found != rotating::IsTrigger(SIM_HISTORY,SIM_RESIDENT,ROUNDS,t))return 1; } }\n'
     )
     definitions = dict(
         SIM_BATCH=batch, SIM_HISTORY=history, SIM_RESIDENT=resident, TOKEN_BYTES=656,
+        ROUNDS=min(windows,batch*(2 if 2*batch<=32 else 1)),
         V9_UBPIPE_DEPTH=8, V9_UBPIPE_ROWS=4, V9_DEDICATED_SERVICE=0,
         V9_AIC_COUNT=32, V9_SPLIT_Q=int(2 * batch <= 32),
         V9_INTERMEDIATE_FETCHES=windows, V9_FINAL_REPLICATED=1,

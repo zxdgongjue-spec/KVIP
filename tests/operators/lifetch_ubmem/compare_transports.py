@@ -89,6 +89,33 @@ def main(argv=None):
     ]
     summary.write_text("\n".join(lines) + "\n")
     print(f"Summary: {summary}", flush=True)
+    # Verify one process reuses one binary across batch, KV width and history.
+    shape_batches = list(dict.fromkeys((1, args.batch)))
+    shape_command = [
+        sys.executable, "-u", str(ROOT / "tests/operators/lifetch_ubmem/smoke.py"),
+        "--device", str(args.device), "--soc", args.soc, "--build-dir", str(build),
+        "--kvaf-server", args.ubmem_server, "--batches", *map(str, shape_batches),
+        "--history", str(args.history), "--resident", str(args.resident),
+        "--index-heads", str(args.index_heads), "--token-bytes", "656", "2624",
+        "--prefetch-tokens", "512", "--miss-percent", "10", "--runtime-shapes",
+        "--warmup", "0", "--iterations", "1",
+    ]
+    shape_log = out / "ubmem-runtime-shapes.log"
+    code = execute(shape_command, shape_log, args.timeout_seconds, "ubmem-runtime-shapes")
+    shape_rows = extract(shape_log, ("UBMEM_RUNTIME_BINARY", "UBMEM_LIFETCH_PASS", "UBMEM_SFA_PASS"))
+    expected_shapes = len(shape_batches) * 2 + int((args.history, args.resident) != (33024, 8192))
+    success = (code == 0 and sum(row.startswith("UBMEM_LIFETCH_PASS") for row in shape_rows) == expected_shapes
+               and sum(row.startswith("UBMEM_SFA_PASS") for row in shape_rows) == expected_shapes
+               and sum(row.startswith("UBMEM_RUNTIME_BINARY") for row in shape_rows) == 1)
+    record = [f"ubmem-runtime-shapes: {'PASS' if success else 'FAIL'} exit={code}", *shape_rows]
+    if not success:
+        record += ["last log lines:", *shape_log.read_text(errors="replace").splitlines()[-12:]]
+    with summary.open("a") as result:
+        result.write("\n".join(record) + "\n")
+    print("\n".join(record), flush=True)
+    if not success:
+        print(f"STOP: ubmem-runtime-shapes; full log={shape_log}; summary={summary}", flush=True)
+        return 1
     for miss in args.miss_percent:
         for transport in ("urma", "ubmem"):
             label = f"{transport}-miss{miss}"

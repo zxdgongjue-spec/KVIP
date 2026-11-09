@@ -11,7 +11,10 @@ def test_runner_requires_checked_completion_for_both_backends(tmp_path, monkeypa
 
     def fake_execute(command, log, timeout, label):
         commands.append((label, command))
-        if label.startswith("urma"):
+        if label == "ubmem-runtime-shapes":
+            log.write_text("UBMEM_RUNTIME_BINARY path=fixture\n" +
+                           "UBMEM_LIFETCH_PASS\nUBMEM_SFA_PASS\n" * 5)
+        elif label.startswith("urma"):
             log.write_text("PASS: exit_code=0\ngraph_p50_us=native_chain:100\nSFA_max_abs=0.001\n")
         else:
             log.write_text("UBMEM_LIFETCH_PASS\nUBMEM_GRAPH_EVENT_US p50=100\nUBMEM_SFA_PASS\nUBMEM_WINDOW_TRIGGERS tokens=[16384]\n")
@@ -36,7 +39,7 @@ def test_runner_requires_checked_completion_for_both_backends(tmp_path, monkeypa
         str(output),
     ]
     assert compare.main(args) == 0
-    assert [label for label, _ in commands] == ["urma-miss10", "ubmem-miss10"]
+    assert [label for label, _ in commands] == ["ubmem-runtime-shapes", "urma-miss10", "ubmem-miss10"]
     for _, command in commands:
         for flag, value in (
             ("--history", "131072"),
@@ -77,4 +80,4 @@ def test_runner_does_not_treat_zero_exit_without_correctness_as_pass(tmp_path, m
         str(output),
     ]
     assert compare.main(args) == 1
-    assert "urma-miss10: FAIL" in next(output.glob("*/summary.log")).read_text()
+    assert "ubmem-runtime-shapes: FAIL" in next(output.glob("*/summary.log")).read_text()

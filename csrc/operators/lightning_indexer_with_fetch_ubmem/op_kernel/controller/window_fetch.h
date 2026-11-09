@@ -16,7 +16,6 @@ namespace rotating {
 // Reserve the last 8KiB of the 32000-byte Q4 scratch for candidate IDs
 // when indicesOut holds the complete lane's batch rows.
 constexpr bool kBatchedRows=true;
-#define V9_UBMEM_LANE_COPY (V9_UBMEM && V9_UBPIPE_DEPTH == 8 && V9_UBPIPE_ROWS == 4 && V9_BATCH_POST && SIM_BATCH <= 16)
 constexpr bool kWindowScanFused=false;
 constexpr uint32_t kScanTokens=kBatchedRows?23808:28672, kCandidateCapacity=2048;
 static_assert(!kWindowScanFused || sizeof(uint32_t)*kCandidateCapacity<=kScanTokens,

@@ -93,6 +93,7 @@ void CheckOutputLayout(uint32_t resident,uint32_t tailTokens) {
     }
     check();
     reset();
+    constexpr uint32_t kFinalWorkers=2*SIM_BATCH<=V9_AIC_COUNT?4:2;
     // Replicated final workers select actual destination sectors after an
     // arbitrary LRU mapping. Consecutive logical ranks are not safe owners.
     std::vector<uint32_t> slots;

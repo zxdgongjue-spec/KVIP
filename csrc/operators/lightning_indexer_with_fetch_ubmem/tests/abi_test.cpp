@@ -34,8 +34,9 @@ int main() {
     shape.indexHeads=INDEX_HEADS;shape.aicCount=V9_AIC_COUNT;shape.splitQ=V9_SPLIT_Q;
     shape.rounds=V9_INTERMEDIATE_FETCHES;shape.tokenBytes=TOKEN_BYTES;
     assert(PrepareShape(&shape)==0);
-    assert(shape.liCores==kLiCores && shape.rounds==kRounds && shape.serviceLanes==kServiceLanes);
-    assert(shape.finalWorkers==kFinalWorkers && shape.finalPostOffset==kFinalPostOffset);
+    assert(shape.liCores==shape.batch*(1+shape.splitQ));
+    assert(shape.serviceLanes==2*shape.serviceAics);
+    assert(shape.finalPostOffset==shape.batch*128+shape.finalCores*288*4);
     shape.tokenBytes=656;
     void* pointer=reinterpret_cast<void*>(1);
     assert(kvip_ubmem_forward(pointer,pointer,pointer,&shape)==0);
@@ -48,12 +49,12 @@ int main() {
     assert(kvip_ubmem_forward(pointer,pointer,pointer,&shape)==71);
     assert((calls==std::vector<unsigned>{1,2,3,4}));
     calls.clear();assert(kvip_ubmem_forward(nullptr,pointer,pointer,&shape)!=0 && calls.empty());
-    for(uint32_t e=1;e<kRounds;++e)assert(Trigger(e)>Trigger(e-1));
-    assert(Trigger(0)==SIM_RESIDENT/128);
-    if(kRounds>1)assert(Trigger(kRounds-1)==SIM_HISTORY/128);
-    for(uint32_t tile=0;tile<=SIM_HISTORY/128+1;++tile) {
+    for(uint32_t e=1;e<shape.rounds;++e)assert(RuntimeTrigger(shape.history,shape.resident,shape.rounds,e)>
+        RuntimeTrigger(shape.history,shape.resident,shape.rounds,e-1));
+    assert(RuntimeTrigger(shape.history,shape.resident,shape.rounds,0)==shape.resident/128);
+    for(uint32_t tile=0;tile<=shape.history/128+1;++tile) {
         bool expected=false;
-        for(uint32_t e=0;e<kRounds;++e)expected |= Trigger(e)==tile;
-        assert(IsTrigger(tile)==expected);
+        for(uint32_t e=0;e<shape.rounds;++e)expected |= RuntimeTrigger(shape.history,shape.resident,shape.rounds,e)==tile;
+        assert(IsTrigger(shape.history,shape.resident,shape.rounds,tile)==expected);
     }
 }

@@ -479,6 +479,7 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=4)
     parser.add_argument("--iterations", type=int, default=20)
+    parser.add_argument("--runtime-shapes", action="store_true", help="Also check a second history/hot shape with the same binary")
     args = parser.parse_args()
     if args.warmup < 0 or args.iterations < 0:
         parser.error("warmup/iterations must be non-negative")
@@ -497,30 +498,33 @@ def main():
     cann = kvaf_cann(build)
     aics = query_device_resources(cann, args.device)["effective_aic"]
     selected_library = None
-    for batch in args.batches:
-        for token_bytes in args.token_bytes:
-            shape = Specialization(batch, args.history, args.resident, args.index_heads, token_bytes, aics, 8, args.soc)
-            library = build_specialization(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape)
-            if selected_library is None:
-                selected_library = library.resolve()
-                print(f"UBMEM_RUNTIME_BINARY path={selected_library} sha256={hashlib.sha256(library.read_bytes()).hexdigest()}",
-                      flush=True)
-            elif library.resolve() != selected_library:
-                raise AssertionError("Runtime shape change unexpectedly rebuilt UBmem LIFetch")
-            for prefetch_tokens in args.prefetch_tokens:
-                check_shape(
-                    kvaf,
-                    torch,
-                    build,
-                    args.device,
-                    shape,
-                    library,
-                    prefetch_tokens,
-                    args.kvaf_server,
-                    args.miss_percent,
-                    args.warmup,
-                    args.iterations,
-                )
+    cases = [(batch, args.history, args.resident, width) for batch in args.batches for width in args.token_bytes]
+    if args.runtime_shapes and (33024, 8192) != (args.history, args.resident):
+        cases.append((args.batches[0], 33024, 8192, args.token_bytes[0]))
+    for batch, history, resident, token_bytes in cases:
+        shape = Specialization(batch, history, resident, args.index_heads, token_bytes, aics, 8, args.soc)
+        library = build_specialization(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape)
+        if selected_library is None:
+            selected_library = library.resolve()
+            print(f"UBMEM_RUNTIME_BINARY path={selected_library} sha256={hashlib.sha256(library.read_bytes()).hexdigest()}",
+                  flush=True)
+        elif library.resolve() != selected_library:
+            raise AssertionError("Runtime shape change unexpectedly rebuilt UBmem LIFetch")
+        for prefetch_tokens in args.prefetch_tokens:
+            check_shape(
+                kvaf,
+                torch,
+                build,
+                args.device,
+                shape,
+                library,
+                prefetch_tokens,
+                args.kvaf_server,
+                args.miss_percent,
+                args.warmup,
+                args.iterations,
+            )
+
 
 
 if __name__ == "__main__":
