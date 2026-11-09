@@ -244,3 +244,47 @@ def test_mixed_query_counts_cover_padding_and_query_lengths():
     assert counts[:4] == [1, 2, 3, 4]
     assert counts[-1] == 0
     assert set(counts) == {0, 1, 2, 3, 4}
+
+
+def test_runtime_batch_bounds_compact_outputs(tmp_path):
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    compiler = shutil.which("c++")
+    if not compiler:
+        pytest.skip("C++ unavailable")
+    root = Path(__file__).resolve().parents[3]
+    text = (root / "csrc/operators/lightning_indexer_with_fetch_ubmem/op_kernel/index_cache_update.cpp").read_text()
+    begin = text.index("__simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PublishOutputs")
+    end = text.index("template <bool Owned>", begin)
+    source = r'''
+#include <cstdint>
+#include <vector>
+#include <cassert>
+#define __simt_vf__
+#define __aicore__
+#define __gm__
+#define LAUNCH_BOUND(x)
+struct { uint32_t x; } threadIdx;
+template<class T>T asc_ldcg(T* p){return *p;}
+template<class T>void asc_stcg(T* p,T v){*p=v;}
+FUNCTION
+int main() {
+ std::vector<int32_t> topk(8192,-1), slots(8192,-1), out(8192,99), dest(8192,99);
+ std::vector<int64_t> unpack={0,3,4,0}, valid={1,1,1,0}, ids(64);
+ uint32_t owners[]={0},status[]={0}; uint64_t a[26]={};a[24]=64;
+ for(unsigned i=0;i<64;++i)ids[i]=100+i;
+ topk[0]=7;slots[0]=11;topk[3*2048]=8;slots[3*2048]=12;
+ a[3]=(uint64_t)ids.data();a[6]=(uint64_t)status;a[9]=(uint64_t)owners;
+ a[18]=(uint64_t)topk.data();a[19]=(uint64_t)slots.data();a[20]=(uint64_t)unpack.data();
+ a[21]=(uint64_t)valid.data();a[22]=(uint64_t)out.data();a[23]=(uint64_t)dest.data();
+ for(threadIdx.x=0;threadIdx.x<512;++threadIdx.x)PublishOutputs(a,0,1);
+ assert(out[0]==107 && dest[0]==11);assert(out[2048]==108 && dest[2048]==12);
+ assert(out[4096]==-1 && dest[4096]==-1);assert(out[6144]==-1 && dest[6144]==-1);
+}
+'''.replace("FUNCTION", text[begin:end])
+    cpp, exe = tmp_path / "outputs.cpp", tmp_path / "outputs"
+    cpp.write_text(source)
+    subprocess.run([compiler, "-std=c++17", str(cpp), "-o", str(exe)], check=True, capture_output=True)
+    subprocess.run([str(exe)], check=True)

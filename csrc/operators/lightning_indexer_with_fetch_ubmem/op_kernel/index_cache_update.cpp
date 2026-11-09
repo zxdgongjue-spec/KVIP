@@ -61,7 +61,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void Update(__gm__ uint64_t* a, 
 }
 // Service output adaptation runs before Apply changes logical Index ownership.
 // Each block owns four TND output rows, independently of their packed owners.
-__simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PublishOutputs(__gm__ uint64_t* a, uint32_t b) {
+__simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PublishOutputs(__gm__ uint64_t* a, uint32_t b, uint32_t batchCount) {
   auto topk = reinterpret_cast<__gm__ int32_t*>(a[18]);
   auto slots = reinterpret_cast<__gm__ int32_t*>(a[19]);
   auto unpack = reinterpret_cast<__gm__ int64_t*>(a[20]);
@@ -76,7 +76,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PublishOutputs(__gm__ uint6
     uint64_t sourceRow = active ? asc_ldcg(unpack + row) : 0;
     // Plan statuses are complete on every packed row before this separate
     // launch. TND output row b need not come from packed row b.
-    active = active && sourceRow<uint64_t(SIM_BATCH)*4 &&
+    active = active && sourceRow<uint64_t(batchCount)*4 &&
         asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(a[6])+sourceRow/4)==0;
     uint64_t owner = active ? asc_ldcg(owners + sourceRow / 4) : 0;
     for (uint32_t k = threadIdx.x; k < 2048; k += 512) {
@@ -153,7 +153,7 @@ extern "C" __global__ __aicore__ void kvip_ubmem_direct_update_outputs_kernel(GM
   if ASCEND_IS_AIV {
     auto args = reinterpret_cast<__gm__ uint64_t*>(bindings);
     uint32_t batch = GetBlockIdx();
-    Simt::VF_CALL<PublishOutputs>(Simt::Dim3{kThreads, 1, 1}, args, batch);
+    Simt::VF_CALL<PublishOutputs>(Simt::Dim3{kThreads, 1, 1}, args, batch, GetBlockNum());
   }
 #endif
 }
