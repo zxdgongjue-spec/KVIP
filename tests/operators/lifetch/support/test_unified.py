@@ -80,3 +80,14 @@ def test_baseline_unoccupied_selection_forwarded(monkeypatch, tmp_path):
                         '--avoid-prefetch-slots']) == 0
     assert '--avoid-prefetch-slots' in commands[0]
     assert '--early-fetch' not in commands[0]
+
+
+def test_final_workers_are_forwarded(monkeypatch, tmp_path):
+    commands = []
+    monkeypatch.setattr(module.subprocess, 'call', lambda command: commands.append(command) or 0)
+    assert module.main(['--transport', 'urma', '--kvaf-server', 'host:1', '--kvaf-root', str(tmp_path),
+                        '--avoid-prefetch-slots', '--batches', '1,2,4,8,16', '--final-workers', '2']) == 0
+    assert commands[0][commands[0].index('--final-workers') + 1] == '2'
+    assert '--avoid-prefetch-slots' in commands[0]
+    with pytest.raises(SystemExit):
+        module.main(['--transport', 'urma', '--kvaf-server', 'host:1', '--final-workers', '3'])

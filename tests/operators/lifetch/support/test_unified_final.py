@@ -124,3 +124,32 @@ def test_split_fetch_timing_decodes_64_bit_counters():
     actual = decode_final_detail(owners, statuses)
     assert actual == [dict(ticks=[100, 130, 200, 300, 310, 400, 460, 500],
                            safe=11, conflict=7, pending=3, kvaf_ticks=[2**32 + 1, 7, 11, 13])]
+
+
+def test_worker_comparison_summary_checks_all_geometries(tmp_path):
+    import importlib.util
+    import json
+
+    source = Path(__file__).resolve().parents[1] / 'compare_resolver_workers.py'
+    spec = importlib.util.spec_from_file_location('compare_resolver_workers', source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    for workers in (1, 2, 4):
+        for batch in (1, 2, 4, 8, 16):
+            directory = tmp_path / f'w{workers}' / f'case-{batch}'
+            directory.mkdir(parents=True)
+            report = {
+                'status': 'pass', 'final_workers': workers,
+                'resource_geometry': {'logical_aic_tasks': 2 * batch, 'cores_per_batch': 2,
+                                      'intermediate_fetches': min(8, 2 * batch)},
+                'full_trace': {'samples': [{'accounting': {'stages_us': {'resolve': value}}}
+                                           for value in (10, 12, 11)]},
+                'timing': {'prototype_with_update': {'p50_us': 400, 'p99_us': 450}},
+                'split_samples': {'prototype_with_update': [{'final_reads': 5}, {'final_reads': 7}]},
+                'sfa': {'max_abs': 0.001},
+            }
+            (directory / 'report.json').write_text(json.dumps(report))
+    summary = module.summarize(tmp_path)
+    assert '1 | 1 | 2 | 11.000 | 400.000 | 450.000 | 5..7' in summary
+    assert '16 | 4 | 8 | 11.000 | 400.000 | 450.000 | 5..7' in summary
+    assert len([line for line in summary.splitlines() if ' | ' in line]) == 16

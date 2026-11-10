@@ -130,7 +130,7 @@ def run(args, run_dir):
                 run_dir,
                 f"UNIVERSAL binary_sha256={digest} batch={batch} H={history} R={resident} G={heads} windows={windows}",
             )
-            workers = (batch * (final_aivs(batch, "auto", aics, 0) + 1) + 1) // 2
+            workers = (batch * (final_aivs(batch, "auto", aics, args.final_workers or 0) + 1) + 1) // 2
             progress(run_dir, f"BS={batch}: DDR Put and transport initialization; logs={folder}")
             owner = Owner.open(
                 torch,
@@ -165,6 +165,7 @@ def run(args, run_dir):
                     fixture=fixture_info,
                     resources=resources,
                     resource_geometry=geometry,
+                    final_workers=final_aivs(batch, "auto", aics, args.final_workers or 0),
                     build_options={k: str(v) for k, v in options.items()},
                 )
                 (folder / "report.json").write_text(json.dumps(report, indent=2))
@@ -377,6 +378,7 @@ def run_device(
         resident=r,
         aic_count=aics,
         intermediate_fetches=args.intermediate_fetches,
+        final_workers=args.final_workers or 0,
         prefetch_limit=args.prefetch_tokens,
         output_stride=owner.output.shape[1],
         row_owners=torch.arange(b, dtype=torch.int32, device=device) if args.resolver_compare else None,
