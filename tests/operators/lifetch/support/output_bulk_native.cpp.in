@@ -1,0 +1,184 @@
+// The six publisher/helper functions below are extracted without rewriting.
+// Pending copies model explicitly coded dependencies, not NPU execution timing.
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cstring>
+#include <functional>
+#include <iostream>
+#include <limits>
+#include <random>
+#include <stdexcept>
+#include <string>
+#include <vector>
+#define __gm__
+#define __ubuf__
+#define __aicore__
+#define __simt_vf__
+#define __simt_callee__
+#define LAUNCH_BOUND(x)
+constexpr uint32_t kCandidates=2048,kThreads=512;
+constexpr uint32_t EVENT_ID0=0;
+struct {uint32_t x=0;} threadIdx;
+void require(bool okay,const std::string& text){if(!okay)throw std::runtime_error(text);}
+struct PendingCopy {void* dst;const void* src;size_t bytes;};
+struct State {
+    std::vector<PendingCopy> mte2,mte3;
+    std::array<bool,4> flags{};
+    bool scalarDirty=false,vectorReady=false;
+    uint64_t mte2Bytes=0,mte3Bytes=0,vfs=0,logicalReads=0;
+    uintptr_t logicalBegin=0,logicalEnd=0;
+} state;
+bool overlap(const void* a,size_t n,const void* b,size_t m){auto x=reinterpret_cast<uintptr_t>(a),y=reinterpret_cast<uintptr_t>(b);return x<y+m&&y<x+n;}
+void assertReusable(void* dst,size_t n){for(auto c:state.mte3)require(!overlap(dst,n,c.src,c.bytes),"UB overwritten while output DMA reads it");}
+enum class HardEvent {MTE2_V,V_MTE3,MTE3_S,S_V};
+template<HardEvent event> void SetFlag(uint32_t){auto i=static_cast<size_t>(event);require(!state.flags[i],"event set twice");state.flags[i]=true;}
+template<HardEvent event> void WaitFlag(uint32_t){
+    auto i=static_cast<size_t>(event);require(state.flags[i],"wait without matching set");state.flags[i]=false;
+    if constexpr(event==HardEvent::MTE2_V){
+        for(auto c:state.mte2){assertReusable(c.dst,c.bytes);std::memcpy(c.dst,c.src,c.bytes);}state.mte2.clear();
+    } else if constexpr(event==HardEvent::V_MTE3){
+        require(state.mte2.empty(),"output published before input DMA completed");state.vectorReady=true;
+    } else if constexpr(event==HardEvent::MTE3_S){
+        for(auto c:state.mte3)std::memcpy(c.dst,c.src,c.bytes);state.mte3.clear();
+    } else if constexpr(event==HardEvent::S_V){state.scalarDirty=false;}
+}
+template<class T> struct LocalTensor {
+    T* data;size_t count;
+    LocalTensor operator[](size_t i)const{require(i<=count,"UB offset out of range");return {data+i,count-i};}
+    template<class U> LocalTensor<U> ReinterpretCast()const{return {reinterpret_cast<U*>(data),count*sizeof(T)/sizeof(U)};}
+    uintptr_t GetPhyAddr()const{return reinterpret_cast<uintptr_t>(data);}
+    void SetValue(size_t i,T value){require(i<count,"UB scalar write out of range");assertReusable(data+i,sizeof(T));data[i]=value;state.scalarDirty=true;}
+};
+template<class T> struct GlobalTensor {
+    T* data=nullptr;
+    void SetGlobalBuffer(T* p){data=p;}
+    GlobalTensor operator[](size_t i)const{return {data+i};}
+};
+template<class T> void DataCopy(LocalTensor<T> dst,GlobalTensor<T> src,uint32_t n){
+    require(n<=dst.count,"MTE2 UB copy out of range");assertReusable(dst.data,n*sizeof(T));
+    state.mte2.push_back({dst.data,src.data,n*sizeof(T)});state.mte2Bytes+=n*sizeof(T);state.vectorReady=false;
+}
+template<class T> void DataCopy(GlobalTensor<T> dst,LocalTensor<T> src,uint32_t n){
+    require(n<=src.count,"MTE3 UB copy out of range");require(state.vectorReady,"MTE3 missing V_MTE3 handoff");
+    state.mte3.push_back({dst.data,src.data,n*sizeof(T)});state.mte3Bytes+=n*sizeof(T);
+}
+template<class T> void Duplicate(LocalTensor<T> dst,T value,uint32_t n){
+    require(n<=dst.count,"Duplicate UB range");assertReusable(dst.data,n*sizeof(T));
+    std::fill_n(dst.data,n,value);state.vectorReady=false;
+}
+template<class T> T asc_ldcg(T* p){auto a=reinterpret_cast<uintptr_t>(p);
+    if(a>=state.logicalBegin&&a<state.logicalEnd)++state.logicalReads;return *p;}
+template<class T> void asc_stcg(T* p,T v){*p=v;}
+// Uninstantiated planner helpers need the same host declarations.
+inline uint32_t asc_atomic_cas(uint32_t* p,uint32_t old,uint32_t value){auto prior=*p;if(prior==old)*p=value;return prior;}
+inline void asc_atomic_or(uint32_t* p,uint32_t value){*p|=value;}
+inline void asc_syncthreads(){}
+inline void asc_threadfence(){}
+inline uint32_t asc_shfl_up(uint32_t value,uint32_t){return value;}
+#include "index_cache_update.h"
+namespace Simt {
+struct Dim3 {uint32_t x,y,z;};
+template<auto Fn,class... Args> void VF_CALL(Dim3 dim,Args... args){
+    require(state.mte2.empty(),"VF starts before MTE2_V wait");require(state.mte3.empty(),"VF starts before prior MTE3 completion");
+    require(!state.scalarDirty,"VF reads scalar metadata before S_V wait");require(dim.x==512,"wrong gather lane count");
+    ++state.vfs;for(uint32_t tid=0;tid<dim.x;++tid){threadIdx.x=tid;Fn(args...);}state.vectorReady=false;
+}
+}
+// @ACTUAL_PUBLISHERS@
+
+struct Fixture {
+    static constexpr uint32_t history=4352,sourceRows=12,destRows=12,ownerRows=4;
+    std::string name;
+    uint32_t batch=0;bool nullInactiveSources=false;
+    std::vector<int32_t> topk,slots;
+    std::vector<int64_t> logical,unpack,valid;
+    std::vector<uint32_t> owners;
+    explicit Fixture(std::string n):name(std::move(n)),topk(sourceRows*kCandidates),slots(topk.size()),
+        logical(ownerRows*history),unpack(destRows,-1),valid(destRows,0),owners{2,0,3}{
+        for(uint32_t r=0;r<sourceRows;++r)for(uint32_t k=0;k<kCandidates;++k){
+            topk[r*kCandidates+k]=int32_t((r*593+k*43)%history);
+            slots[r*kCandidates+k]=int32_t((r*97+k*37)%12288);
+        }
+        const uint64_t edge[]={0,0x7fffffff,0x80000000,0xffffffff,0x100000000ULL,0x7fffffffffffffffULL,0x8000000000000000ULL,0xffffffffffffffffULL};
+        for(uint32_t o=0;o<ownerRows;++o)for(uint32_t t=0;t<history;++t){
+            uint64_t bits=(t%17<8)?edge[t%17]:0x1234000000000000ULL+uint64_t(o)*0x100000007ULL+t;
+            std::memcpy(&logical[o*history+t],&bits,sizeof(bits));
+        }
+        for(uint32_t q=0;q<4;++q){unpack[q]=q;valid[q]=1;}
+    }
+};
+struct Result {std::vector<int32_t> ids,slots;uint64_t reads,vfs,mte2,mte3;};
+constexpr int32_t outputPoison=0x5a5a5a5a;
+Result run(const Fixture& f,int variant){
+    state=State{};Result out;out.ids.assign(Fixture::destRows*kCandidates,outputPoison);out.slots=out.ids;
+    uint64_t a[26]{};
+    a[3]=reinterpret_cast<uint64_t>(f.nullInactiveSources?nullptr:f.logical.data());
+    a[9]=reinterpret_cast<uint64_t>(f.nullInactiveSources?nullptr:f.owners.data());
+    a[18]=reinterpret_cast<uint64_t>(f.nullInactiveSources?nullptr:f.topk.data());
+    a[19]=reinterpret_cast<uint64_t>(f.nullInactiveSources?nullptr:f.slots.data());
+    a[20]=reinterpret_cast<uint64_t>(f.nullInactiveSources?nullptr:f.unpack.data());
+    a[21]=reinterpret_cast<uint64_t>(f.valid.data());
+    a[22]=reinterpret_cast<uint64_t>(out.ids.data());a[23]=reinterpret_cast<uint64_t>(out.slots.data());a[24]=Fixture::history;
+    state.logicalBegin=reinterpret_cast<uintptr_t>(f.logical.data());state.logicalEnd=state.logicalBegin+f.logical.size()*8;
+    constexpr uint32_t guard=32,scratchWords=kUpdateScratchBytes/4;
+    std::vector<uint32_t> ub(scratchWords+2*guard,0x7f7f7f7f);
+    LocalTensor<uint32_t> scratch{ub.data()+guard,scratchWords};
+    if(variant==0)for(uint32_t tid=0;tid<kThreads;++tid){threadIdx.x=tid;PublishOutputs(a,f.batch);}
+    else if(variant==1)PublishOutputsBulk(a,f.batch,scratch);
+    else PublishOutputsPacked(a,f.batch,scratch);
+    require(state.mte2.empty()&&state.mte3.empty(),f.name+": pending DMA at wrapper return");
+    for(bool flag:state.flags)require(!flag,f.name+": unconsumed event");
+    require(std::all_of(ub.begin(),ub.begin()+guard,[](auto n){return n==0x7f7f7f7f;}),"UB lower guard overwritten");
+    require(std::all_of(ub.end()-guard,ub.end(),[](auto n){return n==0x7f7f7f7f;}),"UB upper guard overwritten");
+    // Update may immediately overwrite the whole same scratch allocation.
+    std::fill_n(scratch.data,scratchWords,0xdeadbeef);
+    out.reads=state.logicalReads;out.vfs=state.vfs;out.mte2=state.mte2Bytes;out.mte3=state.mte3Bytes;
+    return out;
+}
+uint32_t activeCount(const Fixture& f){uint32_t n=0;for(uint32_t q=0;q<4;++q)n+=f.valid[f.batch*4+q]!=0;return n;}
+void oracle(const Fixture& f,const Result& out){
+    uint64_t reads=0;
+    for(uint32_t row=0;row<Fixture::destRows;++row)for(uint32_t k=0;k<kCandidates;++k){
+        auto i=row*kCandidates+k;int32_t id=outputPoison,slot=outputPoison;
+        if(row/4==f.batch){id=slot=-1;
+            if(f.valid[row]){auto src=uint64_t(f.unpack[row]);auto owner=f.owners[src/4];auto token=f.topk[src*kCandidates+k];
+                slot=f.slots[src*kCandidates+k];if(token>=0){uint32_t bits=uint32_t(uint64_t(f.logical[owner*Fixture::history+token]));
+                    std::memcpy(&id,&bits,sizeof(id));++reads;}}}
+        require(out.ids[i]==id,f.name+": scalar logical-ID oracle mismatch");require(out.slots[i]==slot,f.name+": scalar slot oracle mismatch");
+    }
+    require(out.reads==reads,f.name+": logical read count mismatch");
+}
+int main(){try{
+    std::vector<Fixture> fixtures;
+    fixtures.emplace_back("identity_active");
+    fixtures.emplace_back("nonzero_batch_packed_owners");{
+        auto& f=fixtures.back();f.batch=1;f.valid.assign(Fixture::destRows,0);
+        uint32_t src[]={11,2,7,0};for(uint32_t q=0;q<4;++q){f.valid[4+q]=1;f.unpack[4+q]=src[q];}}
+    fixtures.emplace_back("mixed_inactive_poison_unpack");{
+        auto& f=fixtures.back();f.valid={0,-7,0,1,0,0,0,0,0,0,0,0};f.unpack[0]=f.unpack[2]=-1;f.unpack[1]=10;f.unpack[3]=3;}
+    fixtures.emplace_back("all_inactive_null_sources");{
+        auto& f=fixtures.back();f.valid.assign(Fixture::destRows,0);f.nullInactiveSources=true;}
+    fixtures.emplace_back("negative_tokens_and_slots");{
+        auto& f=fixtures.back();for(uint32_t i=0;i<f.topk.size();++i){if(i%5==0)f.topk[i]=-1;if(i%13==0)f.topk[i]=std::numeric_limits<int32_t>::min();
+            if(i%7==0)f.slots[i]=-1;if(i%11==0)f.slots[i]=std::numeric_limits<int32_t>::min();}}
+    fixtures.emplace_back("all_negative_tokens");{
+        auto& f=fixtures.back();std::fill(f.topk.begin(),f.topk.end(),-1);}
+    fixtures.emplace_back("repeated_packed_source");{
+        auto& f=fixtures.back();for(uint32_t q=0;q<4;++q)f.unpack[q]=11;}
+    fixtures.emplace_back("last_destination_batch");{
+        auto& f=fixtures.back();f.batch=2;f.valid.assign(Fixture::destRows,0);
+        for(uint32_t q=0;q<4;++q){f.valid[8+q]=1;f.unpack[8+q]=(q*7)%Fixture::sourceRows;}}
+    std::mt19937 rng(20261105);
+    for(uint32_t c=0;c<32;++c){fixtures.emplace_back("random_"+std::to_string(c));auto& f=fixtures.back();f.batch=c%3;
+        f.valid.assign(Fixture::destRows,0);for(auto& owner:f.owners)owner=rng()%Fixture::ownerRows;
+        for(uint32_t q=0;q<4;++q){auto row=f.batch*4+q;f.valid[row]=(rng()%3)?int64_t(rng()|1):0;f.unpack[row]=f.valid[row]?rng()%Fixture::sourceRows:-1;}
+        for(uint32_t i=0;i<f.topk.size();++i){f.topk[i]=(rng()%11)?int32_t(rng()%Fixture::history):-1;uint32_t bits=rng();std::memcpy(&f.slots[i],&bits,4);}}
+    for(const auto& f:fixtures){auto base=run(f,0),one=run(f,1),packed=run(f,2);oracle(f,base);oracle(f,one);oracle(f,packed);
+        require(base.ids==one.ids&&base.ids==packed.ids&&base.slots==one.slots&&base.slots==packed.slots,f.name+": publishers differ");
+        auto active=activeCount(f);require(one.mte2==uint64_t(active)*16384&&packed.mte2==one.mte2,"input bytes mismatch");
+        require(one.mte3==65536&&packed.mte3==65536,"output bytes mismatch");require(one.vfs==active&&packed.vfs==1,"VF count mismatch");
+        std::cout<<f.name<<" "<<active<<" "<<base.reads<<" "<<one.vfs<<" "<<packed.vfs<<" "<<one.mte2<<"\n";
+    }
+    return 0;
+}catch(const std::exception& e){std::cerr<<e.what()<<"\n";return 1;}}

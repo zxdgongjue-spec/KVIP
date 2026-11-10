@@ -18,6 +18,13 @@
 #include "kernel_operator.h"
 #include "score_common.h"
 
+#ifndef KVIP_OPT_LI_REGISTER_PREDICATE
+#define KVIP_OPT_LI_REGISTER_PREDICATE 0
+#endif
+#if KVIP_OPT_LI_REGISTER_PREDICATE != 0 && KVIP_OPT_LI_REGISTER_PREDICATE != 1
+#error "KVIP_OPT_LI_REGISTER_PREDICATE must be 0 or 1"
+#endif
+
 namespace vector1 {
 
 __simd_callee__ inline void BroadcastLane(AscendC::MicroAPI::RegTensor<float>& dst,
@@ -1021,10 +1028,18 @@ __simd_vf__ inline void ClassifyResidentScores(__ubuf__ uint16_t* scores,
     // Low half contains the hot token position (resident <= 16384).
     for (uint16_t part = 0; part < 2048; part += 128) {
         LoadAlign(values, scores + part);
+        MaskReg selected, visible;
+#if KVIP_OPT_LI_REGISTER_PREDICATE
+        // Only the visibility AND consumes this predicate; keep it in a
+        // register instead of storing and reloading the intermediate UB mask.
+        RegTensor<uint16_t> limit;
+        LoadAlign<uint16_t, LoadDist::DIST_BRC_B16>(limit, threshold);
+        Compare<uint16_t, CMPMODE::GT>(selected, values, limit, all);
+#else
         ClassifyScore(values, threshold, hits + part, all);
         LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
-        MaskReg selected, visible;
         LoadAlign(selected, hits + part);
+#endif
         Gather(positions, victims + part * 2, offsets, all);
         CompareScalar<uint16_t, CMPMODE::LT>(visible, positions, uint16_t(end), all);
         MaskAnd(selected, selected, visible, all);

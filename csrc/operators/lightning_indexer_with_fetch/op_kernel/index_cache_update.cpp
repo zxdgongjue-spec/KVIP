@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "kernel_operator.h"
+#ifndef KVIP_OPT_OUTPUT_BULK
+#define KVIP_OPT_OUTPUT_BULK 0
+#endif
+#if KVIP_OPT_OUTPUT_BULK < 0 || KVIP_OPT_OUTPUT_BULK > 2
+#error "KVIP_OPT_OUTPUT_BULK must be 0, 1 or 2"
+#endif
 #if defined(__CCE_AICORE__)
   #include "simt_api/asc_simt.h"
   #include "simt_api/device_functions.h"
@@ -105,6 +111,189 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PublishOutputs(__gm__ uint6
     }
   }
 }
+#ifndef KVIP_OPT_OUTPUT_PINGPONG
+#define KVIP_OPT_OUTPUT_PINGPONG 0
+#endif
+#if KVIP_OPT_OUTPUT_PINGPONG && KVIP_OPT_OUTPUT_BULK != 1
+#error "KVIP_OPT_OUTPUT_PINGPONG requires per-query bulk output"
+#endif
+#if KVIP_OPT_OUTPUT_BULK
+// Only logical-ID lookup remains indirect. Token/slot rows are staged by MTE2
+// and both complete output rows are published by MTE3 below.
+__simt_callee__ inline int32_t LookupOutputLogical(__gm__ int64_t* logical, int32_t token) {
+  return token >= 0 ? static_cast<int32_t>(asc_ldcg(logical + token)) : -1;
+}
+__simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void GatherOutputLogical(
+    __gm__ int64_t* logical, __ubuf__ int32_t* topk, __ubuf__ int32_t* ids) {
+  for (uint32_t k = threadIdx.x; k < kPlanCandidates; k += kThreads)
+    ids[k] = LookupOutputLogical(logical, topk[k]);
+}
+__aicore__ inline void PublishOutputsBulk(__gm__ uint64_t* a, uint32_t b,
+                                         LocalTensor<uint32_t> scratch) {
+  static_assert(3 * kPlanCandidates * sizeof(int32_t) <= kUpdateScratchBytes,
+                "Output staging must reuse the existing Update scratch");
+  auto topkLocal = scratch.ReinterpretCast<int32_t>();
+  auto slotsLocal = scratch[kPlanCandidates].ReinterpretCast<int32_t>();
+  auto logicalLocal = scratch[2 * kPlanCandidates].ReinterpretCast<int32_t>();
+  auto unpack = reinterpret_cast<__gm__ int64_t*>(a[20]);
+  auto valid = reinterpret_cast<__gm__ int64_t*>(a[21]);
+  auto owners = reinterpret_cast<__gm__ uint32_t*>(a[9]);
+  auto logical = reinterpret_cast<__gm__ int64_t*>(a[3]);
+  GlobalTensor<int32_t> topk, slots, logicalOut, slotsOut;
+  topk.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(a[18]));
+  slots.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(a[19]));
+  logicalOut.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(a[22]));
+  slotsOut.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(a[23]));
+  for (uint32_t q = 0; q < 4; ++q) {
+    uint32_t row = b * 4 + q;
+    bool active = valid[row] != 0;
+    if (active) {
+      uint64_t sourceRow = unpack[row], owner = owners[sourceRow / 4];
+      DataCopy(topkLocal, topk[sourceRow * kPlanCandidates], kPlanCandidates);
+      DataCopy(slotsLocal, slots[sourceRow * kPlanCandidates], kPlanCandidates);
+      SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+      WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+      Simt::VF_CALL<GatherOutputLogical>(Simt::Dim3{kThreads, 1, 1},
+          logical + owner * uint32_t(a[24]),
+          reinterpret_cast<__ubuf__ int32_t*>(topkLocal.GetPhyAddr()),
+          reinterpret_cast<__ubuf__ int32_t*>(logicalLocal.GetPhyAddr()));
+    } else {
+      // Inactive unpack/source rows may be poison; never dereference them.
+      Duplicate(logicalLocal, int32_t(-1), kPlanCandidates);
+      Duplicate(slotsLocal, int32_t(-1), kPlanCandidates);
+    }
+    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    DataCopy(logicalOut[uint64_t(row) * kPlanCandidates], logicalLocal, kPlanCandidates);
+    DataCopy(slotsOut[uint64_t(row) * kPlanCandidates], slotsLocal, kPlanCandidates);
+    // The next query can write these same buffers with either MTE2 or V.
+    // Join MTE3 on scalar control before either path, and before Update reuses
+    // all scratch. No output DMA remains live when this wrapper returns.
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+  }
+}
+template <bool Pipeline>
+__aicore__ inline void PublishOutputsPipelined(__gm__ uint64_t* a, uint32_t b,
+                                         LocalTensor<uint32_t> scratch) {
+  constexpr uint32_t bankWords = 3 * kPlanCandidates, banks = Pipeline ? 2 : 1;
+  static_assert(banks * bankWords * sizeof(uint32_t) <= kExtendedScratchBytes,
+                "Output banks must fit the existing Update allocation");
+  auto pipe = GetTPipePtr();
+  TEventID inputEvent = pipe->AllocEventID<HardEvent::MTE2_V>();
+  TEventID publishEvent = pipe->AllocEventID<HardEvent::V_MTE3>();
+  TEventID done[2];
+  bool pending[2] = {false, false};
+  for (uint32_t bank = 0; bank < banks; ++bank)
+    done[bank] = pipe->AllocEventID<HardEvent::MTE3_S>();
+  auto unpack = reinterpret_cast<__gm__ int64_t*>(a[20]);
+  auto valid = reinterpret_cast<__gm__ int64_t*>(a[21]);
+  auto owners = reinterpret_cast<__gm__ uint32_t*>(a[9]);
+  auto logical = reinterpret_cast<__gm__ int64_t*>(a[3]);
+  GlobalTensor<int32_t> topk, slots, logicalOut, slotsOut;
+  topk.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(a[18]));
+  slots.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(a[19]));
+  logicalOut.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(a[22]));
+  slotsOut.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(a[23]));
+  for (uint32_t q = 0; q < 4; ++q) {
+    uint32_t bank = Pipeline ? q % 2 : 0;
+    if (pending[bank]) {
+      WaitFlag<HardEvent::MTE3_S>(done[bank]);
+      pending[bank] = false;
+    }
+    auto topkLocal = scratch[bank * bankWords].ReinterpretCast<int32_t>();
+    auto slotsLocal = scratch[bank * bankWords + kPlanCandidates].ReinterpretCast<int32_t>();
+    auto logicalLocal = scratch[bank * bankWords + 2 * kPlanCandidates].ReinterpretCast<int32_t>();
+    uint32_t row = b * 4 + q;
+    // This is AICore scalar control, not a SIMT callee. asc_ldcg is legal
+    // inside GatherOutputLogical/PublishOutputs only.
+    if (valid[row] != 0) {
+      uint64_t sourceRow = unpack[row], owner = owners[sourceRow / 4];
+      DataCopy(topkLocal, topk[sourceRow * kPlanCandidates], kPlanCandidates);
+      DataCopy(slotsLocal, slots[sourceRow * kPlanCandidates], kPlanCandidates);
+      SetFlag<HardEvent::MTE2_V>(inputEvent);
+      WaitFlag<HardEvent::MTE2_V>(inputEvent);
+      Simt::VF_CALL<GatherOutputLogical>(Simt::Dim3{kThreads, 1, 1},
+          logical + owner * uint32_t(a[24]),
+          reinterpret_cast<__ubuf__ int32_t*>(topkLocal.GetPhyAddr()),
+          reinterpret_cast<__ubuf__ int32_t*>(logicalLocal.GetPhyAddr()));
+    } else {
+      // Padding may carry poison source/owner pointers.
+      Duplicate(logicalLocal, int32_t(-1), kPlanCandidates);
+      Duplicate(slotsLocal, int32_t(-1), kPlanCandidates);
+    }
+    SetFlag<HardEvent::V_MTE3>(publishEvent);
+    WaitFlag<HardEvent::V_MTE3>(publishEvent);
+    DataCopy(logicalOut[uint64_t(row) * kPlanCandidates], logicalLocal, kPlanCandidates);
+    DataCopy(slotsOut[uint64_t(row) * kPlanCandidates], slotsLocal, kPlanCandidates);
+    SetFlag<HardEvent::MTE3_S>(done[bank]);
+    pending[bank] = true;
+  }
+  for (uint32_t bank = 0; bank < banks; ++bank) {
+    if (pending[bank]) WaitFlag<HardEvent::MTE3_S>(done[bank]);
+    pipe->ReleaseEventID<HardEvent::MTE3_S>(done[bank]);
+  }
+  pipe->ReleaseEventID<HardEvent::V_MTE3>(publishEvent);
+  pipe->ReleaseEventID<HardEvent::MTE2_V>(inputEvent);
+}
+__simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void GatherPackedOutputLogical(
+    __gm__ int64_t* logical, uint32_t history, __ubuf__ uint32_t* metadata,
+    __ubuf__ int32_t* topk, __ubuf__ int32_t* ids) {
+  for (uint32_t i = threadIdx.x; i < 4 * kPlanCandidates; i += kThreads) {
+    uint32_t q = i / kPlanCandidates;
+    // An inactive bank of topk is uninitialized and must not be loaded.
+    ids[i] = metadata[2 * q] ?
+        LookupOutputLogical(logical + uint64_t(metadata[2 * q + 1]) * history, topk[i]) : -1;
+  }
+}
+__aicore__ inline void PublishOutputsPacked(__gm__ uint64_t* a, uint32_t b,
+                                           LocalTensor<uint32_t> scratch) {
+  constexpr uint32_t rowWords = 4 * kPlanCandidates;
+  static_assert(3 * rowWords + 8 <= kPlanWords + 128,
+                "Packed output staging and metadata must fit Update scratch");
+  auto topkLocal = scratch.ReinterpretCast<int32_t>();
+  auto slotsLocal = scratch[rowWords].ReinterpretCast<int32_t>();
+  auto logicalLocal = scratch[2 * rowWords].ReinterpretCast<int32_t>();
+  auto metadata = scratch[3 * rowWords];
+  auto unpack = reinterpret_cast<__gm__ int64_t*>(a[20]);
+  auto valid = reinterpret_cast<__gm__ int64_t*>(a[21]);
+  auto owners = reinterpret_cast<__gm__ uint32_t*>(a[9]);
+  GlobalTensor<int32_t> topk, slots, logicalOut, slotsOut;
+  topk.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(a[18]));
+  slots.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(a[19]));
+  logicalOut.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(a[22]));
+  slotsOut.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(a[23]));
+  for (uint32_t q = 0; q < 4; ++q) {
+    uint32_t row = b * 4 + q;
+    bool active = valid[row] != 0;
+    metadata.SetValue(2 * q, uint32_t(active));
+    metadata.SetValue(2 * q + 1, 0U);
+    if (active) {
+      uint64_t sourceRow = unpack[row];
+      metadata.SetValue(2 * q + 1, owners[sourceRow / 4]);
+      DataCopy(topkLocal[q * kPlanCandidates], topk[sourceRow * kPlanCandidates], kPlanCandidates);
+      DataCopy(slotsLocal[q * kPlanCandidates], slots[sourceRow * kPlanCandidates], kPlanCandidates);
+    } else {
+      Duplicate(slotsLocal[q * kPlanCandidates], int32_t(-1), kPlanCandidates);
+    }
+  }
+  SetFlag<HardEvent::S_V>(EVENT_ID0);
+  WaitFlag<HardEvent::S_V>(EVENT_ID0);
+  SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+  WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+  Simt::VF_CALL<GatherPackedOutputLogical>(Simt::Dim3{kThreads, 1, 1},
+      reinterpret_cast<__gm__ int64_t*>(a[3]), uint32_t(a[24]),
+      reinterpret_cast<__ubuf__ uint32_t*>(metadata.GetPhyAddr()),
+      reinterpret_cast<__ubuf__ int32_t*>(topkLocal.GetPhyAddr()),
+      reinterpret_cast<__ubuf__ int32_t*>(logicalLocal.GetPhyAddr()));
+  SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+  WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+  DataCopy(logicalOut[uint64_t(b) * rowWords], logicalLocal, rowWords);
+  DataCopy(slotsOut[uint64_t(b) * rowWords], slotsLocal, rowWords);
+  SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+  WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+}
+#endif
 template <bool Owned>
 __aicore__ inline void Apply(GM_ADDR bindings) {
   uint32_t b = GetBlockIdx() / kCopyWorkers, group = GetBlockIdx() % kCopyWorkers;
@@ -145,7 +334,17 @@ __aicore__ inline void UpdateOutputs(GM_ADDR bindings) {
   auto args = reinterpret_cast<__gm__ uint64_t*>(bindings);
   auto owners = reinterpret_cast<__gm__ uint32_t*>(args[9]);
   uint32_t batch = GetBlockIdx();
+#if KVIP_OPT_OUTPUT_BULK == 1
+#if KVIP_OPT_OUTPUT_PINGPONG
+  PublishOutputsPipelined<true>(args, batch, local);
+#else
+  PublishOutputsBulk(args, batch, local);
+#endif
+#elif KVIP_OPT_OUTPUT_BULK == 2
+  PublishOutputsPacked(args, batch, local);
+#else
   Simt::VF_CALL<PublishOutputs>(Simt::Dim3{kThreads, 1, 1}, args, batch);
+#endif
   DispatchUpdate<WaitForFetch>(args, batch, owners[batch], true,
                                    reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
 }

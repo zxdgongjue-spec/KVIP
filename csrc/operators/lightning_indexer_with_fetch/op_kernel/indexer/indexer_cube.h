@@ -135,7 +135,12 @@ __aicore__ inline void QLIMatmul<QLIT>::InitBuffers(TPipe *pipe)
 
     pipe->InitBuffer(bufQL0_, L0_BUF_NUM * M_BASIC_BLOCK_L0 * D_BASIC_BLOCK_L0 * sizeof(Q_T));
     queryL0_ = bufQL0_.Get<Q_T>();
+#if KVIP_LI_SCALE_TILES
+    // Cover both slots: the second slot starts at L0AB_BUFFER_OFFSET.
+    pipe->InitBuffer(bufKeyL0_, L0_BUF_NUM * L0AB_BUFFER_OFFSET * sizeof(K_T));
+#else
     pipe->InitBuffer(bufKeyL0_, L0_BUF_NUM * D_BASIC_BLOCK_L0 * S2_BASIC_BLOCK_L0 * sizeof(K_T));
+#endif
     keyL0_ = bufKeyL0_.Get<K_T>();
 
     pipe->InitBuffer(bufL0C_, L0_BUF_NUM * M_BASIC_BLOCK_L0 * S2_BASIC_BLOCK_L0 * sizeof(float));
