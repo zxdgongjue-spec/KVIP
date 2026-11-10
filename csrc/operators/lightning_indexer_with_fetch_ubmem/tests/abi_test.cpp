@@ -6,9 +6,9 @@
 #include <vector>
 #include "api.h"
 #include "context.h"
-namespace {std::vector<unsigned> calls;unsigned fail=0;}
-#define LAUNCH(name,number) extern "C" uint32_t aclrtlaunch_kvip_ubmem_##name##_kernel(uint32_t,void*,void*) { \
- calls.push_back(number);return number==fail?71:0;}
+namespace {std::vector<unsigned> calls,blocks;unsigned fail=0;}
+#define LAUNCH(name,number) extern "C" uint32_t aclrtlaunch_kvip_ubmem_##name##_kernel(uint32_t count,void*,void*) { \
+ calls.push_back(number);blocks.push_back(count);return number==fail?71:0;}
 LAUNCH(init,1)
 LAUNCH(li,2)
 LAUNCH(resolve,3)
@@ -25,6 +25,13 @@ int main() {
     void* pointer=reinterpret_cast<void*>(1);
     assert(kvip_ubmem_forward(pointer,pointer,pointer)==0);
     assert((calls==std::vector<unsigned>{1,2,3,4,5,6,7}));
+    assert((blocks==std::vector<unsigned>{kInitCores,kLaunchCores,kFinalCores,SIM_BATCH,SIM_BATCH,SIM_BATCH,SIM_BATCH*4}));
+    calls.clear();blocks.clear();
+    assert(kvip_ubmem_update_plan(pointer,pointer)==0);
+    assert(kvip_ubmem_update_outputs(pointer,pointer)==0);
+    assert(kvip_ubmem_update_apply(pointer,pointer)==0);
+    assert((calls==std::vector<unsigned>{5,6,7}));
+    assert((blocks==std::vector<unsigned>{SIM_BATCH,SIM_BATCH,SIM_BATCH*4}));
     calls.clear();fail=4;
     assert(kvip_ubmem_forward(pointer,pointer,pointer)==71);
     assert((calls==std::vector<unsigned>{1,2,3,4}));

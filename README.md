@@ -400,3 +400,43 @@ ABC mappings are not DDR prefetches. The comparison saves four case JSON files
 and `summary.json`, without persistent native setup logs or profiler traces.
 Host tests cover layout reconstruction, ABI arguments, restoration, validation
 and reporting; actual four-path correctness/timing still requires NPU execution.
+
+### Isolate UBmem init, Index update and speculative reads
+
+For an existing snapshot, run the three-case experiment without a model or CPU
+peer service:
+
+```bash
+python -B -m kvip.diagnostics.replay \
+  --snapshot "$snapshot" --build-dir "$ubmem_build" \
+  --transport ubmem --mode fused --device 0 --soc Ascend950DT_9582 \
+  --ubmem-ablation --split-index-stages \
+  --warmup 2 --iterations 10 --stage-iterations 3 \
+  --output "$new_result_json"
+```
+
+This restores the captured DDR arena once and runs three sequential cases:
+
+1. `baseline`: existing init/Index kernels and captured prefetch budgets.
+2. `optimized`: shard init's map clears across available AIV cores, and spread
+   Index scale/address/logical-ID movement across three of the four workers
+   instead of assigning all metadata to one worker. Both small and extended
+   Index plans preserve the snapshot-before-scatter rule for permutation cycles.
+3. `optimized_half_prefetch`: the same optimized binary, with per-request and
+   per-window prefetch budgets halved (512/64 becomes 256/32). LI, TopK,
+   window count, history and four-layer record width stay unchanged.
+
+Each iteration restores the original pre-state outside timing and runs the
+existing correctness checks; the three cases share DDR but not mutable hot
+cache/workspace state. Full graphs retain the production launch sequence.
+`--split-index-stages` diagnoses plan generation, TND outputs and field movement
+separately as `index_plan`, `index_outputs` and `index_apply`. These diagnostic
+graph boundaries are excluded from full-graph timing. The result JSON keeps
+all timings, read counts, effective tuning and source/binary hashes.
+
+The optimization switches are opt-in `Specialization` fields (`parallel_init`,
+`balanced_index`); serving defaults and URMA remain unchanged. The existing
+specialization cache builds one baseline and one optimized library, then reuses
+the optimized library for the smaller budget. Reducing prefetch can reduce
+wasted reads but increase final-fetch latency, so compare complete graph times
+before choosing a budget. Local host-model checks do not establish NPU speedup.

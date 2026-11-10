@@ -46,6 +46,8 @@ class UbmemBinding:
             ("index_heads", shape.heads),
             ("context_bytes", 256),
             ("row_bytes", 1024),
+            ("parallel_init", int(shape.parallel_init)),
+            ("balanced_index", int(shape.balanced_index)),
         ):
             if query(self.library, name) != expected:
                 raise ValueError(f"UBmem static binary contract mismatch: {name}")

@@ -213,7 +213,7 @@ __simt_callee__ inline void PublishExtendedPlan(__gm__ uint32_t* records, __ubuf
 }
 // Snapshot one field across every record before scattering that field. This
 // retains arbitrary cycles with the original four workers and bounded UB.
-template<uint32_t Threads>
+template<uint32_t Threads, bool BalancedMetadata = false>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
 inline void MoveExtended(__gm__ uint64_t* a,uint32_t owner,uint32_t group,bool owned,
     __gm__ uint32_t* plan,__ubuf__ uint64_t* staged,uint32_t count) {
@@ -231,11 +231,17 @@ inline void MoveExtended(__gm__ uint64_t* a,uint32_t owner,uint32_t group,bool o
     }
     asc_syncthreads();
   }
-  if(group==kCopyWorkers-1) {
+  // Metadata planes are independent of key fields and each other. The
+  // opt-in policy assigns one whole plane to each of workers 0..2, instead
+  // of appending all three planes to worker 3. Every plane still snapshots
+  // ALL records before scatter, preserving arbitrary permutation cycles.
+  if(BalancedMetadata ? group<kMetadataFields : group==kCopyWorkers-1) {
     auto scales=reinterpret_cast<__gm__ uint32_t*>(a[1])+uint64_t(owner)*uint32_t(a[24]);
     auto addresses=reinterpret_cast<__gm__ uint64_t*>(a[2])+uint64_t(owner)*a[7];
     auto logical=reinterpret_cast<__gm__ uint64_t*>(a[3])+uint64_t(owner)*uint32_t(a[24]);
-    for(uint32_t field=0;field<kMetadataFields;++field) {
+    const uint32_t first = BalancedMetadata ? group : 0;
+    const uint32_t stop = BalancedMetadata ? group+1 : kMetadataFields;
+    for(uint32_t field=first;field<stop;++field) {
       for(uint32_t i=tid;i<count;i+=Threads) {
         uint32_t src=asc_ldcg(plan+kTransferHeaderWords+2*i+1);
         staged[i]=field==0?uint64_t(asc_ldcg(scales+src)):(field==1?asc_ldcg(addresses+src):asc_ldcg(logical+src));
@@ -260,7 +266,7 @@ inline void MoveExtended(__gm__ uint64_t* a,uint32_t owner,uint32_t group,bool o
 }
 // Each worker owns disjoint key fields over ALL records. Snapshotting its
 // fields before scatter preserves arbitrary cycles without a cross-core wait.
-template<uint32_t Threads>
+template<uint32_t Threads, bool BalancedMetadata = false>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
 inline void Move(__gm__ uint64_t* a, uint32_t owner, uint32_t group, bool owned,
                  __ubuf__ uint32_t* plan, __ubuf__ uint64_t* staged, uint32_t count) {
@@ -279,21 +285,22 @@ inline void Move(__gm__ uint64_t* a, uint32_t owner, uint32_t group, bool owned,
   }
   // Metadata lives in separate arrays, so this worker can overlap other key
   // workers without overwriting any of their source bytes.
-  if (group == kCopyWorkers - 1) {
+  if (BalancedMetadata ? group < kMetadataFields : group == kCopyWorkers - 1) {
     asc_syncthreads();
     auto scales = reinterpret_cast<__gm__ uint32_t*>(a[1]) + uint64_t(owner) * uint32_t(a[24]);
     auto addresses = reinterpret_cast<__gm__ uint64_t*>(a[2]) + uint64_t(owner) * a[7];
     auto logical = reinterpret_cast<__gm__ uint64_t*>(a[3]) + uint64_t(owner) * uint32_t(a[24]);
-    for (uint32_t i = tid; i < count * kMetadataFields; i += Threads) {
-      uint32_t src = plan[kTransferHeaderWords + 2 * (i / kMetadataFields) + 1];
-      uint32_t field = i % kMetadataFields;
+    constexpr uint32_t fields = BalancedMetadata ? 1 : kMetadataFields;
+    for (uint32_t i = tid; i < count * fields; i += Threads) {
+      uint32_t src = plan[kTransferHeaderWords + 2 * (i / fields) + 1];
+      uint32_t field = BalancedMetadata ? group : i % fields;
       staged[i] = field == 0 ? uint64_t(asc_ldcg(scales + src)) :
                   (field == 1 ? asc_ldcg(addresses + src) : asc_ldcg(logical + src));
     }
     asc_syncthreads();
-    for (uint32_t i = tid; i < count * kMetadataFields; i += Threads) {
-      uint32_t dst = plan[kTransferHeaderWords + 2 * (i / kMetadataFields)] & ~kInvalidateHot;
-      uint32_t field = i % kMetadataFields;
+    for (uint32_t i = tid; i < count * fields; i += Threads) {
+      uint32_t dst = plan[kTransferHeaderWords + 2 * (i / fields)] & ~kInvalidateHot;
+      uint32_t field = BalancedMetadata ? group : i % fields;
       if (field == 0) asc_stcg(scales + dst, uint32_t(staged[i]));
       else if (field == 1) asc_stcg(addresses + dst, staged[i]);
       else asc_stcg(logical + dst, staged[i]);

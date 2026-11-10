@@ -19,4 +19,7 @@ uint32_t v9_li(void* bindings,void* stream);
 uint32_t v9_resolve(void* bindings,void* stream);
 uint32_t v9_fetch(void* bindings,void* stream);
 uint32_t kvip_ubmem_update(void* update,void* stream);
+uint32_t kvip_ubmem_update_plan(void* update,void* stream);
+uint32_t kvip_ubmem_update_outputs(void* update,void* stream);
+uint32_t kvip_ubmem_update_apply(void* update,void* stream);
 }

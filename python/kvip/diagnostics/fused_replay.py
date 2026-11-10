@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from kvip.cache.index_storage import IndexCacheStorage
-from kvip.operators.lifetch.geometry import final_aivs, li_geometry
+from kvip.operators.lifetch.geometry import final_aivs, li_geometry, prefetch_budget
 
 
 def _stage(library, symbol, argtypes, arguments, lease):
@@ -27,7 +27,7 @@ def _stage(library, symbol, argtypes, arguments, lease):
     return launch
 
 
-def fused_stages(transport, rotating, update, lease, batch):
+def fused_stages(transport, rotating, update, lease, batch, *, split_index_stages=False):
     """Actual backend boundaries; URMA Index work overlaps outstanding Get DMA."""
     pointer, u32 = ctypes.c_void_p, ctypes.c_uint32
     library = rotating.library
@@ -46,17 +46,27 @@ def fused_stages(transport, rotating, update, lease, batch):
                 ("complete", "v9_fetch"),
             )
         ]
-        result.append(
+        updates = (
             (
-                "index_update",
+                ("index_plan", "kvip_ubmem_update_plan"),
+                ("index_outputs", "kvip_ubmem_update_outputs"),
+                ("index_apply", "kvip_ubmem_update_apply"),
+            )
+            if split_index_stages
+            else (("index_update", "kvip_ubmem_update"),)
+        )
+        result.extend(
+            (
+                name,
                 _stage(
                     library,
-                    "kvip_ubmem_update",
+                    symbol,
                     [pointer, pointer],
                     lambda stream: (update.bindings.data_ptr(), stream),
                     lease,
                 ),
             )
+            for name, symbol in updates
         )
         return tuple(result)
     if transport != "urma":
@@ -114,7 +124,43 @@ def _check_geometry(geometry, aics):
         raise ValueError("Captured fusion scheduling differs from this replay implementation")
 
 
-def create_fused(torch, runtime, archive, restored, device_table, build, soc, device, stream, cann, aics, *, transport):
+def fusion_tuning(geometry, transport, overrides=None):
+    """Resolve opt-in UBmem experiments without mutating the captured geometry."""
+    values = dict(
+        parallel_init=False,
+        balanced_index=False,
+        prefetch_limit=geometry["prefetch_limit"],
+        window_limit=geometry["window_limit"],
+    )
+    if overrides:
+        if transport != "ubmem" or set(overrides) - set(values):
+            raise ValueError("Fusion tuning only accepts known UBmem options")
+        values.update(overrides)
+    if any(type(values[name]) is not bool for name in ("parallel_init", "balanced_index")):
+        raise ValueError("UBmem optimization switches must be booleans")
+    if any(type(values[name]) is not int for name in ("prefetch_limit", "window_limit")):
+        raise ValueError("UBmem prefetch budgets must be integers")
+    prefetch_budget(values["prefetch_limit"], values["window_limit"], geometry["requested_windows"])
+    return values
+
+
+def create_fused(
+    torch,
+    runtime,
+    archive,
+    restored,
+    device_table,
+    build,
+    soc,
+    device,
+    stream,
+    cann,
+    aics,
+    *,
+    transport,
+    tuning=None,
+    split_index_stages=False,
+):
     """Build/bind before capture; the caller restores every archived pre tensor.
 
     Runtime allocation, page import, seed copies and completion/oracle checks
@@ -127,6 +173,7 @@ def create_fused(torch, runtime, archive, restored, device_table, build, soc, de
         raise ValueError("Fusion replay requires the imported published DDR pages")
     geometry = archive.manifest["geometry"]
     _check_geometry(geometry, aics)
+    effective = fusion_tuning(geometry, transport, tuning)
     build, cann = Path(build), Path(cann)
     b, h, r = (geometry[name] for name in ("batch", "history", "resident"))
     common_workspace = dict(
@@ -154,6 +201,8 @@ def create_fused(torch, runtime, archive, restored, device_table, build, soc, de
             geometry["aic_count"],
             geometry["requested_windows"],
             soc,
+            parallel_init=effective["parallel_init"],
+            balanced_index=effective["balanced_index"],
         )
         library = build_specialization(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape)
         workspace = UbmemWorkspace(torch, resident=r, **common_workspace)
@@ -182,8 +231,8 @@ def create_fused(torch, runtime, archive, restored, device_table, build, soc, de
         token_addresses=storage.addresses,
         tail_bounds=workspace.tail_bounds,
         output_stride=geometry["output_stride"],
-        prefetch_limit=geometry["prefetch_limit"],
-        window_limit=geometry["window_limit"],
+        prefetch_limit=effective["prefetch_limit"],
+        window_limit=effective["window_limit"],
     )
     if transport == "ubmem":
         lease = UbmemLease(torch, runtime, output, stream)
@@ -264,5 +313,6 @@ def create_fused(torch, runtime, archive, restored, device_table, build, soc, de
         output=output,
         restored=restored,
         device_table=device_table,
-        stage_calls=fused_stages(transport, rotating, update, lease, b),
+        stage_calls=fused_stages(transport, rotating, update, lease, b, split_index_stages=split_index_stages),
+        tuning=effective,
     )

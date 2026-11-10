@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from kvip.diagnostics.fused_replay import _check_geometry, create_fused, fused_stages
+from kvip.diagnostics.fused_replay import _check_geometry, create_fused, fused_stages, fusion_tuning
 
 
 class Library:
@@ -103,3 +103,29 @@ def test_factory_rejects_wrong_transport_or_missing_page_lease_before_allocating
     # accepts that Runtime and proceeds to the real published-page requirement.
     with pytest.raises(ValueError, match="published DDR"):
         create_fused(None, SimpleNamespace(), None, {}, None, None, None, None, None, None, None, transport="urma")
+
+
+def test_split_index_stages_retain_native_order_without_extra_work():
+    calls = []
+    library = Library(calls)
+    rotating = SimpleNamespace(library=library, bindings=SimpleNamespace(data_ptr=lambda: 11))
+    update = SimpleNamespace(bindings=SimpleNamespace(data_ptr=lambda: 22))
+    lease = SimpleNamespace(check_stream=lambda: SimpleNamespace(npu_stream=33))
+    stages = fused_stages("ubmem", rotating, update, lease, 16, split_index_stages=True)
+    assert [name for name, _ in stages][-3:] == ["index_plan", "index_outputs", "index_apply"]
+    for _, launch in stages:
+        launch()
+    assert calls[-3:] == [("kvip_ubmem_update_" + name, (22, 33)) for name in ("plan", "outputs", "apply")]
+
+
+def test_tuning_keeps_snapshot_immutable_and_validates_only_known_options():
+    geometry = dict(prefetch_limit=512, window_limit=64, requested_windows=8)
+    optimized = dict(parallel_init=True, balanced_index=True, prefetch_limit=256, window_limit=32)
+    assert fusion_tuning(geometry, "ubmem", optimized) == optimized
+    assert geometry == dict(prefetch_limit=512, window_limit=64, requested_windows=8)
+    assert fusion_tuning(geometry, "ubmem")["parallel_init"] is False
+    for invalid in (dict(unknown=1), dict(parallel_init=1), dict(prefetch_limit=256.0), dict(window_limit=0)):
+        with pytest.raises(ValueError):
+            fusion_tuning(geometry, "ubmem", invalid)
+    with pytest.raises(ValueError):
+        fusion_tuning(geometry, "urma", optimized)

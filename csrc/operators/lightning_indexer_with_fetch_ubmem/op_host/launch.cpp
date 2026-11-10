@@ -6,7 +6,7 @@ extern "C" uint32_t aclrtlaunch_kvip_ubmem_##kernel##_kernel(uint32_t,void*,void
 extern "C" uint32_t api(void* bindings,void* stream) { \
     if(!bindings || !stream)return 100000; \
     return aclrtlaunch_kvip_ubmem_##kernel##_kernel(blocks,stream,bindings); }
-ENTRY(v9_init,init,SIM_BATCH)
+ENTRY(v9_init,init,rotating::kInitCores)
 ENTRY(v9_li,li,rotating::kLaunchCores)
 ENTRY(v9_resolve,resolve,rotating::kFinalCores)
 ENTRY(v9_fetch,complete,SIM_BATCH)
@@ -14,11 +14,23 @@ ENTRY(v9_fetch,complete,SIM_BATCH)
 extern "C" uint32_t aclrtlaunch_kvip_ubmem_direct_update_outputs_kernel(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_kvip_ubmem_direct_update_owned_kernel(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_kvip_ubmem_direct_apply_owned_kernel(uint32_t,void*,void*);
+extern "C" uint32_t kvip_ubmem_update_plan(void* update,void* stream) {
+    if(!update || !stream)return 100000;
+    return aclrtlaunch_kvip_ubmem_direct_update_owned_kernel(SIM_BATCH,stream,update);
+}
+extern "C" uint32_t kvip_ubmem_update_outputs(void* update,void* stream) {
+    if(!update || !stream)return 100000;
+    return aclrtlaunch_kvip_ubmem_direct_update_outputs_kernel(SIM_BATCH,stream,update);
+}
+extern "C" uint32_t kvip_ubmem_update_apply(void* update,void* stream) {
+    if(!update || !stream)return 100000;
+    return aclrtlaunch_kvip_ubmem_direct_apply_owned_kernel(SIM_BATCH*4,stream,update);
+}
 extern "C" uint32_t kvip_ubmem_update(void* update,void* stream) {
     if(!update || !stream)return 100000;
-    uint32_t result=aclrtlaunch_kvip_ubmem_direct_update_owned_kernel(SIM_BATCH,stream,update);
-    if(!result)result=aclrtlaunch_kvip_ubmem_direct_update_outputs_kernel(SIM_BATCH,stream,update);
-    return result?result:aclrtlaunch_kvip_ubmem_direct_apply_owned_kernel(SIM_BATCH*4,stream,update);
+    uint32_t result=kvip_ubmem_update_plan(update,stream);
+    if(!result)result=kvip_ubmem_update_outputs(update,stream);
+    return result?result:kvip_ubmem_update_apply(update,stream);
 }
 extern "C" uint32_t kvip_ubmem_forward(void* bindings,void* update,void* stream) {
     if(!bindings || !update || !stream)return 100000;
@@ -45,6 +57,9 @@ VALUE(v9_resident,SIM_RESIDENT)
 VALUE(v9_index_heads,INDEX_HEADS)
 VALUE(v9_token_bytes,TOKEN_BYTES)
 VALUE(v9_aic_count,V9_AIC_COUNT)
+VALUE(v9_parallel_init,V9_UBMEM_PARALLEL_INIT)
+VALUE(v9_init_cores,rotating::kInitCores)
+VALUE(v9_balanced_index,V9_UBMEM_BALANCED_INDEX)
 VALUE(v9_li_cores,rotating::kLiCores)
 VALUE(v9_launch_cores,rotating::kLaunchCores)
 VALUE(v9_rounds,rotating::kRounds)

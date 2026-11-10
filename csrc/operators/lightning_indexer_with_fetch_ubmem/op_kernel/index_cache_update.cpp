@@ -108,14 +108,14 @@ __aicore__ inline void Apply(GM_ADDR bindings) {
   if (!count) return;
   if(count>kPlanRecords) {
     if(count>kExtendedRecords)return;
-    Simt::VF_CALL<MoveExtended<kThreads>>(Simt::Dim3{kThreads,1,1},a,owner,group,Owned,input,
+    Simt::VF_CALL<MoveExtended<kThreads, V9_UBMEM_BALANCED_INDEX != 0>>(Simt::Dim3{kThreads,1,1},a,owner,group,Owned,input,
       reinterpret_cast<__ubuf__ uint64_t*>(local.GetPhyAddr()),count);
     return;
   }
   DataCopy(local[kTransferHeaderWords], planGm[kTransferHeaderWords], ((count * 2 + 7) / 8) * 8);
   SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
   WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-  Simt::VF_CALL<Move<kThreads>>(Simt::Dim3{kThreads, 1, 1}, a, owner, group, Owned,
+  Simt::VF_CALL<Move<kThreads, V9_UBMEM_BALANCED_INDEX != 0>>(Simt::Dim3{kThreads, 1, 1}, a, owner, group, Owned,
                                 reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()),
                                 reinterpret_cast<__ubuf__ uint64_t*>(local[kTransferPlanWords].GetPhyAddr()), count);
 }

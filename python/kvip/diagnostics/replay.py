@@ -35,6 +35,16 @@ def arguments(argv=None):
     parser.add_argument("--kvaf-server", help="Dedicated local CPU service, required for URMA replay")
     parser.add_argument("--serial-workers", type=int, help="Serial Get workers: service defaults UBmem=32, URMA=2")
     parser.add_argument(
+        "--ubmem-ablation",
+        action="store_true",
+        help="Three UBmem fused cases, sharing one restored DDR arena: baseline, optimized, half-prefetch",
+    )
+    parser.add_argument(
+        "--split-index-stages",
+        action="store_true",
+        help="Diagnose UBmem index_plan/index_outputs/index_apply instead of combined index_update",
+    )
+    parser.add_argument(
         "--stage-iterations",
         type=int,
         default=0,
@@ -48,6 +58,12 @@ def arguments(argv=None):
         parser.error("device/warmup must be nonnegative and iterations positive")
     if args.stage_iterations < 0:
         parser.error("stage-iterations must be nonnegative")
+    if (args.ubmem_ablation or args.split_index_stages) and (
+        args.inspect or args.transport != "ubmem" or args.mode != "fused"
+    ):
+        parser.error("UBmem ablation/split-index-stages require UBmem fused replay")
+    if args.ubmem_ablation and args.output is None:
+        parser.error("--ubmem-ablation requires --output to retain all case results")
     if args.serial_workers is not None and (args.mode != "serial" or not 1 <= args.serial_workers <= 48):
         parser.error("serial-workers requires serial mode and a value in 1..48")
     if not args.inspect and ((args.transport == "urma") != bool(args.kvaf_server)):
@@ -101,6 +117,10 @@ def run(args, archive):
 
 
 def _run(args, archive, retained):
+    if getattr(args, "ubmem_ablation", False):
+        from kvip.diagnostics.ubmem_ablation import run_ablation
+
+        return run_ablation(args, archive, retained)
     from kvip.diagnostics.replay_measure import run as measure
 
     return measure(args, archive, retained)
@@ -139,7 +159,10 @@ def main():
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with args.output.open("x") as output:
             output.write(text)
-    print(text, end="")
+    if args.ubmem_ablation:
+        print(f"Results: {args.output}")
+    else:
+        print(text, end="")
 
 
 if __name__ == "__main__":

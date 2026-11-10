@@ -3,6 +3,7 @@
 
 from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 
 import numpy as np
@@ -212,7 +213,8 @@ def measure(torch, kvaf, stream, bundle, args, retained):
     return result
 
 
-def run(args, archive, retained):
+def allocate_context(args, archive, retained):
+    """Import real DDR once; case graphs and leases are owned separately."""
     build = args.build_dir.resolve()
     sys.path.insert(0, str(build / "python"))
     import kvaf
@@ -220,7 +222,7 @@ def run(args, archive, retained):
     import torch_npu  # noqa: F401
 
     from kvip.diagnostics.ddr import import_pages
-    from kvip.diagnostics.replay_runtime import create_runtime, runtime_worker_config
+    from kvip.diagnostics.replay_runtime import create_runtime
     from kvip.runtime.build import kvaf_build_paths
     from kvip.runtime.device import query_device_resources
     from kvip.operators.lifetch_ubmem.specialization import kvaf_cann
@@ -253,6 +255,29 @@ def run(args, archive, retained):
         raise ValueError("Real-history replay requires published DDR pages")
     table = runtime.access_table_view(restored["access_table"], device="npu")
     retained["table"] = table
+    return SimpleNamespace(
+        build=build,
+        kvaf=kvaf,
+        torch=torch,
+        device=device,
+        stream=stream,
+        cann=cann,
+        aics=aics,
+        runtime=runtime,
+        restored=restored,
+        table=table,
+    )
+
+
+def measure_case(args, archive, context, retained):
+    """Release a successful case after graph reset; retain everything on failure."""
+    from kvip.diagnostics.replay_runtime import runtime_worker_config
+
+    build, kvaf, torch = context.build, context.kvaf, context.torch
+    device, stream, cann, aics = context.device, context.stream, context.cann, context.aics
+    runtime, restored, table = context.runtime, context.restored, context.table
+    case_retained = {}
+    retained["active_case"] = case_retained
     if args.mode == "fused":
         from kvip.diagnostics.fused_replay import create_fused
 
@@ -269,8 +294,10 @@ def run(args, archive, retained):
             cann,
             aics,
             transport=args.transport,
+            tuning=getattr(args, "ubmem_tuning", None),
+            split_index_stages=getattr(args, "split_index_stages", False),
         )
-        retained["bundle"] = bundle
+        case_retained["bundle"] = bundle
         prepare_fused_state(bundle, archive, restored, torch, device, args.transport)
     else:
         from kvip.diagnostics.serial_replay import create_serial
@@ -289,15 +316,11 @@ def run(args, archive, retained):
             aics,
             transport=args.transport,
         )
-        retained["bundle"] = bundle
-    results = measure(torch, kvaf, stream, bundle, args, retained)
-    if bundle.lease is not None:
-        bundle.lease.close()
-    runtime.release_access_table(restored["access_table"])
-    runtime.shutdown()
+        case_retained["bundle"] = bundle
+    results = measure(torch, kvaf, stream, bundle, args, case_retained)
     library = getattr(bundle, "library", None)
     libraries = getattr(bundle, "libraries", (() if library is None else (library,)))
-    return dict(
+    result = dict(
         schema_version=2,
         status="pass",
         transport=args.transport,
@@ -305,7 +328,7 @@ def run(args, archive, retained):
         snapshot=str(archive.directory),
         snapshot_sha256=file_digest(archive.directory / "manifest.json"),
         scope="Query_Index_ready_to_LI_TopK_Fetch_cache_state_and_TND_slot_outputs",
-        geometry=geometry,
+        geometry=archive.manifest["geometry"],
         device=args.device,
         soc=args.soc,
         kvaf_module=str(Path(kvaf.__file__).resolve()),
@@ -330,3 +353,25 @@ def run(args, archive, retained):
         ),
         **results,
     )
+    if args.mode == "fused" and args.transport == "ubmem":
+        result["tuning"] = dict(bundle.tuning)
+    # measure() reset every full/stage graph first. A failing reset or lease
+    # close leaves the active case and shared arena retained by the CLI.
+    if bundle.lease is not None:
+        bundle.lease.close()
+    case_retained.clear()
+    del retained["active_case"]
+    return result
+
+
+def release_context(context):
+    """Called only after every case graph and output lease completed."""
+    context.runtime.release_access_table(context.restored["access_table"])
+    context.runtime.shutdown()
+
+
+def run(args, archive, retained):
+    context = allocate_context(args, archive, retained)
+    result = measure_case(args, archive, context, retained)
+    release_context(context)
+    return result

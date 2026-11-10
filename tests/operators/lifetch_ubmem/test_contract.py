@@ -91,6 +91,19 @@ def test_static_shape_and_ubmem_scratch_contract():
         Specialization(2, 8448, 8192, 64, 656, 32, 8, "Ascend950DT_9582")
 
 
+def test_optimization_switches_are_explicit_content_addressed_build_options():
+    baseline = Specialization(16, 131328, 16384, 32, 2624, 32, 8, "Ascend950DT_9582")
+    optimized = Specialization(
+        16, 131328, 16384, 32, 2624, 32, 8, "Ascend950DT_9582", parallel_init=True, balanced_index=True
+    )
+    assert baseline.options("/cann")["UBMEM_PARALLEL_INIT"] == 0
+    assert baseline.options("/cann")["UBMEM_BALANCED_INDEX"] == 0
+    assert optimized.options("/cann")["UBMEM_PARALLEL_INIT"] == 1
+    assert optimized.options("/cann")["UBMEM_BALANCED_INDEX"] == 1
+    with pytest.raises(ValueError, match="booleans"):
+        Specialization(16, 131328, 16384, 32, 2624, 32, 8, "Ascend950DT_9582", parallel_init=1)
+
+
 def test_workspace_initializes_with_npu_supported_zero_dtypes():
     def zeros(size, *, dtype, device):
         if dtype == np.uint64:

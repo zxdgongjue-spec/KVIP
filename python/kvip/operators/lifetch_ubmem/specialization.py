@@ -23,8 +23,12 @@ class Specialization:
     aic_count: int
     intermediate_fetches: int
     soc: str
+    parallel_init: bool = False
+    balanced_index: bool = False
 
     def __post_init__(self):
+        if type(self.parallel_init) is not bool or type(self.balanced_index) is not bool:
+            raise ValueError("UBmem optimization switches must be booleans")
         if not 1 <= self.batch <= 16 or not 1 <= self.aic_count <= 32:
             raise ValueError("UBmem LIFetch requires 1..16 requests and 1..32 AICs")
         if self.batch > self.aic_count:
@@ -53,6 +57,8 @@ class Specialization:
             TOKEN_BYTES=self.token_bytes,
             AIC_COUNT=self.aic_count,
             INTERMEDIATE_FETCHES=self.intermediate_fetches,
+            UBMEM_PARALLEL_INIT=int(self.parallel_init),
+            UBMEM_BALANCED_INDEX=int(self.balanced_index),
         )
 
 

@@ -3,6 +3,7 @@
 #include "context.h"
 #include "prefetch.h"
 #include "resolver.h"
+#include "init_partition.h"
 using namespace AscendC;
 using namespace rotating;
 namespace {
@@ -16,11 +17,7 @@ __aicore__ inline void FillWords(uint64_t address,uint32_t words,LocalTensor<uin
         DataCopy(output[offset],local,count);
     }
 }
-__aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
-    TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,4096*4);
-    auto local=scratch.Get<uint32_t>();
-    Duplicate(local,uint32_t(0),4096);
-    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+__aicore__ inline void InitializeControl(__gm__ Context* ctx,uint32_t b,LocalTensor<uint32_t> local) {
     FillWords(ctx->rows+b*sizeof(Row),sizeof(Row)/4,local);
     FillWords(ctx->progress+b*4*sizeof(Progress),4*sizeof(Progress)/4,local);
     FillWords(ctx->owners+b*128,32,local);
@@ -34,13 +31,8 @@ __aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
         *reinterpret_cast<__gm__ uint32_t*>(ctx->count)=0;
         ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->count),4);
     }
-    SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
-    Duplicate(local,UINT32_MAX,4096);
-    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-    FillWords(ctx->mapping+uint64_t(b)*SIM_HISTORY*4,SIM_HISTORY,local);
-    FillWords(ctx->selected+uint64_t(b)*kSlots*4,kSlots,local);
-    if(ctx->changes)FillWords(ctx->changes+b*kChangeCapacity*4,kChangeCapacity,local);
-    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+}
+__aicore__ inline void CopyInitialLruSlots(__gm__ Context* ctx,uint32_t b,LocalTensor<uint32_t> local) {
     if(ctx->changeSlots) {
         GlobalTensor<uint32_t> source,target;
         source.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots);
@@ -50,10 +42,78 @@ __aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
         DataCopy(target,local,kLruSlots);
         SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     }
+}
+__aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
+    TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,4096*4);
+    auto local=scratch.Get<uint32_t>();
+    Duplicate(local,uint32_t(0),4096);
+    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    InitializeControl(ctx,b,local);
+    SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+    Duplicate(local,UINT32_MAX,4096);
+    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    FillWords(ctx->mapping+uint64_t(b)*SIM_HISTORY*4,SIM_HISTORY,local);
+    FillWords(ctx->selected+uint64_t(b)*kSlots*4,kSlots,local);
+    if(ctx->changes)FillWords(ctx->changes+b*kChangeCapacity*4,kChangeCapacity,local);
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    CopyInitialLruSlots(ctx,b,local);
     Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},SIM_HISTORY,SIM_RESIDENT,ctx,b);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
     pipe.Destroy();
 }
+#if V9_UBMEM_PARALLEL_INIT
+__simt_vf__ __aicore__ LAUNCH_BOUND(256)
+inline void InitializeTailShard(__gm__ Context* ctx,uint32_t b,uint32_t part,
+    uint32_t first,uint32_t last) {
+    if(!part && !threadIdx.x && ctx->changeCount)
+        asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->changeCount)+b,kLruSlots);
+    if(ctx->tailBounds) {
+        const uint32_t tailTokens=OutputStride(SIM_RESIDENT,ctx)-SIM_RESIDENT;
+        if(tailTokens) {
+            auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds)+b*2;
+            // Keep the original bounded ABC initialization, including when
+            // a malformed end exceeds the available tail output capacity.
+            uint32_t begin=asc_ldcg(bounds),end=asc_ldcg(bounds+1);
+            uint64_t capacityEnd=uint64_t(begin)+tailTokens;
+            if(uint64_t(end)>capacityEnd)end=uint32_t(capacityEnd);
+            auto range=InitTailIntersection({first,last},begin,end,SIM_HISTORY);
+            auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+uint64_t(b)*SIM_HISTORY;
+            for(uint32_t i=threadIdx.x;i<range.end-range.begin;i+=256) {
+                uint32_t token=range.begin+i;
+                asc_stcg(map+token,SIM_RESIDENT+kSlots+token%tailTokens);
+            }
+        }
+    }
+    asc_threadfence();
+}
+__aicore__ inline void InitializeRoundParallel(__gm__ Context* ctx,uint32_t b,uint32_t part) {
+    TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,4096*4);
+    auto local=scratch.Get<uint32_t>();
+    Duplicate(local,uint32_t(0),4096);
+    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    if(!part) {
+        // Only one writer initializes each control record. Mapping writers
+        // need no global barrier: the next kernel waits for every init AIV.
+        InitializeControl(ctx,b,local);
+    }
+    SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+    Duplicate(local,UINT32_MAX,4096);
+    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    auto map=PartitionInitWords<SIM_HISTORY>(part,kInitWorkersPerBatch);
+    auto selected=PartitionInitWords<kSlots>(part,kInitWorkersPerBatch);
+    auto changes=PartitionInitWords<kChangeCapacity>(part,kInitWorkersPerBatch);
+    FillWords(ctx->mapping+(uint64_t(b)*SIM_HISTORY+map.begin)*4,map.end-map.begin,local);
+    FillWords(ctx->selected+(uint64_t(b)*kSlots+selected.begin)*4,selected.end-selected.begin,local);
+    if(ctx->changes)FillWords(ctx->changes+(uint64_t(b)*kChangeCapacity+changes.begin)*4,changes.end-changes.begin,local);
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    if(!part)CopyInitialLruSlots(ctx,b,local);
+    // Each shard installs ABC only after its own sentinel DMA has completed;
+    // no shard can clear or scalar-write another shard's cache line.
+    Simt::VF_CALL<InitializeTailShard>(Simt::Dim3{256,1,1},ctx,b,part,map.begin,map.end);
+    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+    pipe.Destroy();
+}
+#endif
 __aicore__ inline void CompleteBatch(__gm__ Context* ctx,uint32_t b) {
     auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
     auto info=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
@@ -95,8 +155,15 @@ extern "C" __global__ __aicore__ void kvip_ubmem_init_kernel(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     if ASCEND_IS_AIV {
+#if V9_UBMEM_PARALLEL_INIT
+        uint32_t core=GetBlockIdx();if(core>=kInitCores)return;
+        uint32_t b=core%SIM_BATCH,part=core/SIM_BATCH;
+        auto ctx=GetContext(bindings);InitializeRoundParallel(ctx,b,part);
+        if(part)return;
+#else
         uint32_t b=GetBlockIdx();if(b>=SIM_BATCH)return;
         auto ctx=GetContext(bindings);InitializeRound(ctx,b);
+#endif
         auto region=UbmemRegionAt(ctx);
         auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
         uint64_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;

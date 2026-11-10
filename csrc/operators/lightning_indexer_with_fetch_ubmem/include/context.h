@@ -37,6 +37,18 @@ static_assert(kDedicatedService || !kRounds || kServiceAics*kRounds<=kLiCores,"S
 constexpr bool kFinalReplicated=V9_FINAL_REPLICATED;
 constexpr uint32_t kFinalWorkers=V9_FINAL_AIVS ? V9_FINAL_AIVS : (2*kLiCores>=4*SIM_BATCH?4:(2*kLiCores>=2*SIM_BATCH?2:1));
 constexpr uint32_t kFinalCores=SIM_BATCH*kFinalWorkers;
+#ifndef V9_UBMEM_PARALLEL_INIT
+#define V9_UBMEM_PARALLEL_INIT 0
+#endif
+#ifndef V9_UBMEM_BALANCED_INDEX
+#define V9_UBMEM_BALANCED_INDEX 0
+#endif
+static_assert(V9_UBMEM_PARALLEL_INIT == 0 || V9_UBMEM_PARALLEL_INIT == 1,
+              "Parallel init must be enabled explicitly with 0 or 1");
+constexpr uint32_t kInitWorkersPerBatch=V9_UBMEM_PARALLEL_INIT ? 2*V9_AIC_COUNT/SIM_BATCH : 1;
+constexpr uint32_t kInitCores=SIM_BATCH*kInitWorkersPerBatch;
+static_assert(kInitWorkersPerBatch>=1 && kInitCores<=2*V9_AIC_COUNT,
+              "Invalid init AIV budget");
 constexpr uint32_t kFinalStateWords=288;
 constexpr uint32_t kFinalPostOffset=SIM_BATCH*128+kFinalCores*kFinalStateWords*4;
 constexpr uint32_t kFinalOwnerBytes=kFinalPostOffset+kFinalCores*128;
