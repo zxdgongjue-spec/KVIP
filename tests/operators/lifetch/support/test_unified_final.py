@@ -110,3 +110,17 @@ def test_trace_accounts_early_fetch_before_update():
     assert result["stages_us"]["early_fetch"] == 5
     assert result["stages_us"]["fetch"] == 2
     assert sum(result["stages_us"].values()) + result["inter_kernel_gap_us"] + result["boundary_residual_us"] == 31
+
+
+def test_split_fetch_timing_decodes_64_bit_counters():
+    import numpy as np
+    from device_trace import decode_final_detail
+
+    owners = np.zeros((1, 16), dtype=np.uint64)
+    owners[0, 4:12] = [100, 130, 200, 300, 310, 400, 460, 500]
+    owners[0, 12:15] = [11, 7, 3]
+    statuses = np.zeros((1, 32), dtype=np.uint32)
+    statuses[0, 8:16].view(np.uint64)[:] = [2**32 + 1, 7, 11, 13]
+    actual = decode_final_detail(owners, statuses)
+    assert actual == [dict(ticks=[100, 130, 200, 300, 310, 400, 460, 500],
+                           safe=11, conflict=7, pending=3, kvaf_ticks=[2**32 + 1, 7, 11, 13])]

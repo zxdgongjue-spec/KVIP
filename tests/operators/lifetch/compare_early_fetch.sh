@@ -46,6 +46,39 @@ for variant in ('baseline', 'early'):
     lines.append(f"{variant}: graph_p50={float(match[1]):.3f} trace={row['us']:.3f} {stages} "
                  f"gap={account['inter_kernel_gap_us']:.3f} boundary={account['boundary_residual_us']:.3f} "
                  f"prefetch={row['prefetch']} final={row['final']}")
+    if variant == 'early':
+        detail = row.get('detail', [])
+        if len(detail) != 16:
+            raise SystemExit(f'early: per-request device timestamps missing: {traces[0]}')
+        early_request = max(enumerate(detail), key=lambda x: x[1]['ticks'][2] - x[1]['ticks'][0])
+        final_request = max(enumerate(detail), key=lambda x: x[1]['ticks'][7] - x[1]['ticks'][3])
+        early_row, final_row = early_request[1], final_request[1]
+        et, ft = early_row['ticks'], final_row['ticks']
+        early_ticks, final_ticks = et[2] - et[0], ft[7] - ft[3]
+        if early_ticks <= 0 or final_ticks <= 0:
+            raise SystemExit('early: invalid device timestamps')
+        # Clock frequency is device-specific: relative scaling uses the
+        # enclosing profiler kernel interval and is explicitly approximate.
+        er = account['stages_us']['early_fetch'] / early_ticks
+        fr = account['stages_us']['fetch'] / final_ticks
+        def metric(label, ticks, factor):
+            return f'{label}={ticks}cycles(~{ticks * factor:.2f}us)'
+        lines.append(f"early slowest request={early_request[0]} safe={early_row['safe']} "
+                     f"conflict={early_row['conflict']} prefetch_pending_batches={early_row['pending']} "
+                     + metric('check_and_publish', et[1] - et[0], er) + ' '
+                     + metric('safe_get_total', et[2] - et[1], er) + ' '
+                     + metric('safe_post', early_row['kvaf_ticks'][0], er) + ' '
+                     + metric('safe_get_cq', early_row['kvaf_ticks'][1], er))
+        lines.append(f"final slowest request={final_request[0]} safe={final_row['safe']} "
+                     f"conflict={final_row['conflict']} prefetch_pending_batches={final_row['pending']} "
+                     + metric('update_status', ft[4] - ft[3], fr) + ' '
+                     + metric('prefetch_cq', ft[5] - ft[4], fr) + ' '
+                     + metric('conflict_get_total', ft[6] - ft[5], fr) + ' '
+                     + metric('conflict_post', final_row['kvaf_ticks'][2], fr) + ' '
+                     + metric('conflict_get_cq', final_row['kvaf_ticks'][3], fr) + ' '
+                     + metric('status_writeback', ft[7] - ft[6], fr))
+        lines.append('Microseconds above are estimates calibrated to each enclosing kernel, not a verified device clock; '
+                     'KVAF post/CQ values are components of Get total and must not be added twice.')
 result = '\n'.join(lines) + '\n'
 (root / 'summary.log').write_text(result)
 print(result, end='')

@@ -22,10 +22,14 @@
                         workerArgs.valid_table=ctx->fallbackValid;
                         workerArgs.table_capacity=rt_batch*kSlots;
                     }
-                    kvaf_device::KvafBatchGetDevice(workerArgs,0,begin,count);
                     auto done=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(workerArgs.core_status);
+                    done->profile.magic=KVAF_AIV_BATCH_GET_PROFILE_MAGIC;
+                    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&done->profile),sizeof(done->profile));
+                    kvaf_device::KvafBatchGetDevice(workerArgs,0,begin,count);
                     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(done),sizeof(*done));
                     error|=done->result;completed+=done->completed_batch_count;
+                    submitCycles+=done->profile.post_active_cycles;
+                    completionCycles+=done->profile.drain_wait_cycles;
                     if(done->magic!=KVAF_AIV_BATCH_GET_STATUS_MAGIC || done->processed_request_count!=count)
                         error|=kvaf_device::kInvalidArgs;
                     if(!done->result && (phase || post->nonconflicting==post->count))post->deferred=0;

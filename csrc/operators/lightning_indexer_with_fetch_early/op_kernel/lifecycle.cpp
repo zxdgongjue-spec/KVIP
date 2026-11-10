@@ -280,94 +280,97 @@ extern "C" __global__ __aicore__ void v9_resolve_kernel(GM_ADDR bindings) {
     }
 #endif
 }
-// Final transport consumes compact resolver ranges through native KVAF.
-// Submit disjoint destinations first; join prefetch before overwriting its slots.
+// Split final transport: disjoint destinations are processed before Index
+// update; the prefetch join and conflicting destinations remain after it.
 #if defined(__CCE_AICORE__)
-__aicore__ inline void FinishFetch(GM_ADDR bindings, GM_ADDR update) {
-    auto runtimeShape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(reinterpret_cast<__gm__ uint64_t*>(bindings)[14]));
-    const uint32_t rt_batch = runtimeShape.batch;
-    const uint32_t rt_resident = runtimeShape.resident;
-    const uint32_t rt_finalWorkers = runtimeShape.finalWorkers;
-    const uint32_t rt_finalPostOffset = runtimeShape.finalPostOffset;
-
-    uint32_t b=GetBlockIdx(); if(b>=rt_batch) return;
+__aicore__ inline void SplitFinalFetch(GM_ADDR bindings, GM_ADDR update, uint32_t phase) {
     auto ctx=GetContext(bindings);
+    auto shape=rotating::LoadRuntimeShape(ctx);
+    const uint32_t rt_batch=shape.batch, rt_resident=shape.resident;
+    const uint32_t rt_finalWorkers=shape.finalWorkers, rt_finalPostOffset=shape.finalPostOffset;
+    uint32_t b=GetBlockIdx(); if(b>=rt_batch)return;
     auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
     auto info=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
+    auto trace=reinterpret_cast<__gm__ uint64_t*>(ctx->owners)+b*16;
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),kRowStatusWords*sizeof(uint32_t));
-    uint32_t updateError=0;
-    if(update) {
-        auto updateBindings=reinterpret_cast<__gm__ uint64_t*>(update);
-        auto status=reinterpret_cast<__gm__ uint32_t*>(updateBindings[6]);
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status+b),sizeof(uint32_t));
-        updateError=status[b];
-        if(!updateError)
-            Simt::VF_CALL<PublishDestinationResidency>(Simt::Dim3{256,1,1},rt_resident,ctx,b,info[1]);
-    }
-    auto args=GetArgs(ctx,b*2);
-    args.core_status=ctx->finalStatus+b*2*sizeof(KvafBatchGetCoreStatus);
-    auto status=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(args.core_status);
-    auto spare=status+1;
-    kvaf_device::WriteStatus(spare,0,0,0,0,0,UINT64_MAX,0);
-    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(spare),sizeof(*spare));
     uint64_t error=info[0] ? kvaf_device::kInvalidArgs : row->error;
-    uint32_t completed=0,total=0,deferred=0;
-    uint64_t lastHead=0,lastCq=0;
-#define LIFETCH_FINAL_JOIN do { CompletePrefetch(ctx,b); error|=row->error; } while (0)
-#define LIFETCH_FINAL_PHASE "../../lightning_indexer_with_fetch/op_kernel/final_fetch_phase.h"
-#include "../../common/lifetch/final_phase_loop.h"
-#undef LIFETCH_FINAL_PHASE
-#undef LIFETCH_FINAL_JOIN
-    if(row->pending || total!=info[1])error|=kvaf_device::kInvalidArgs;
-    info[0]|=uint32_t(error);info[3]=deferred?1:0;info[4]=completed;
-    if(!error) {
-        if(!update)
-            Simt::VF_CALL<PublishDestinationResidency>(Simt::Dim3{256,1,1},rt_resident,ctx,b,total);
-        row->finalPending=0;
+    uint32_t updateError=0,completed=phase ? info[5] : 0,total=phase ? info[1] : 0,deferred=0;
+    uint64_t lastHead=0,lastCq=0,submitCycles=0,completionCycles=0;
+    if(!phase) {
+        trace[4]=GetSystemCycle();
+        trace[14]=row->pending;
+        trace[12]=0;trace[13]=0;
+        for(uint32_t w=0;w<rt_finalWorkers;++w) {
+            auto post=FinalPostAt(rt_finalPostOffset,ctx,b*rt_finalWorkers+w);
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
+            error|=post->error;
+            if(post->nonconflicting>post->count)error|=kvaf_device::kInvalidArgs;
+            else { trace[12]+=post->nonconflicting;trace[13]+=post->count-post->nonconflicting; }
+        }
+        // Mark only after resolver metadata has passed its checks. Fetch and
+        // update failure still invalidate ownership in the final phase.
+        if(!error) Simt::VF_CALL<PublishDestinationResidency>(Simt::Dim3{256,1,1},rt_resident,ctx,b,info[1]);
+        trace[5]=GetSystemCycle();
+    } else {
+        trace[7]=GetSystemCycle();
+        if(update) {
+            auto updateBindings=reinterpret_cast<__gm__ uint64_t*>(update);
+            auto updateStatus=reinterpret_cast<__gm__ uint32_t*>(updateBindings[6])+b;
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(updateStatus),sizeof(uint32_t));
+            updateError=*updateStatus;
+        }
+        trace[8]=GetSystemCycle();
+        CompletePrefetch(ctx,b); error|=row->error;
+        trace[9]=GetSystemCycle();
     }
-    kvaf_device::WriteStatus(status,error,total,completed,lastHead,lastCq,UINT64_MAX,0);
-    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),sizeof(*status));
-    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),32);
-    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row)+960,64);
-    if(update && (error || updateError))
-        Simt::VF_CALL<CompleteEarlyUpdate<256>>(Simt::Dim3{256,1,1},
-            reinterpret_cast<__gm__ uint64_t*>(update),b,error);
+#define LIFETCH_FINAL_PHASE "../../lightning_indexer_with_fetch_early/op_kernel/final_fetch_phase.h"
+#include LIFETCH_FINAL_PHASE
+#undef LIFETCH_FINAL_PHASE
+    auto detail=reinterpret_cast<__gm__ uint64_t*>(info);
+    detail[phase ? 6 : 4]=submitCycles;
+    detail[phase ? 7 : 5]=completionCycles;
+    if(!phase) {
+        info[0]|=uint32_t(error);info[5]=completed;
+        trace[6]=GetSystemCycle();
+    } else {
+        trace[10]=GetSystemCycle();
+        auto args=GetArgs(ctx,b*2);
+        args.core_status=ctx->finalStatus+b*2*sizeof(KvafBatchGetCoreStatus);
+        auto status=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(args.core_status);
+        auto spare=status+1;
+        kvaf_device::WriteStatus(spare,0,0,0,0,0,UINT64_MAX,0);
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(spare),sizeof(*spare));
+        if(row->pending || total!=info[1])error|=kvaf_device::kInvalidArgs;
+        info[0]|=uint32_t(error);info[3]=deferred?1:0;info[4]=completed;
+        if(!error)row->finalPending=0;
+        kvaf_device::WriteStatus(status,error,total,completed,lastHead,lastCq,UINT64_MAX,0);
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),sizeof(*status));
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row)+960,64);
+        if(update && (error || updateError))
+            Simt::VF_CALL<CompleteEarlyUpdate<256>>(Simt::Dim3{256,1,1},
+                reinterpret_cast<__gm__ uint64_t*>(update),b,error);
+        trace[11]=GetSystemCycle();
+    }
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),kRowStatusWords*sizeof(uint32_t));
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(trace),128);
 }
 #endif
-// Experiment: resolver is followed immediately by all final Get work.
 extern "C" __global__ __aicore__ void v9_early_fetch_kernel(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    if ASCEND_IS_AIV { FinishFetch(bindings,nullptr); }
+    if ASCEND_IS_AIV { SplitFinalFetch(bindings,nullptr,0); }
 #endif
 }
-// Transport has completed; only propagate Index update failures. The core-only
-// test has no Index update, so it needs no further work here.
 extern "C" __global__ __aicore__ void v9_fetch_kernel(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV { SplitFinalFetch(bindings,nullptr,1); }
 #endif
 }
 extern "C" __global__ __aicore__ void v9_fetch_update_kernel(GM_ADDR bindings, GM_ADDR update) {
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    if ASCEND_IS_AIV {
-        auto ctx=GetContext(bindings);
-        auto shape=rotating::LoadRuntimeShape(ctx);
-        uint32_t b=GetBlockIdx();
-        if(b<shape.batch && update) {
-            auto args=reinterpret_cast<__gm__ uint64_t*>(update);
-            auto updateStatus=reinterpret_cast<__gm__ uint32_t*>(args[6])+b;
-            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(updateStatus),sizeof(uint32_t));
-            uint32_t error=*updateStatus;
-            if(error) {
-                auto info=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
-                info[0] |= error;
-                kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),32);
-                Simt::VF_CALL<CompleteEarlyUpdate<256>>(Simt::Dim3{256,1,1},args,b,error);
-            }
-        }
-    }
+    if ASCEND_IS_AIV { SplitFinalFetch(bindings,update,1); }
 #endif
 }
 extern "C" __global__ __aicore__ void v9_probe_kernel(GM_ADDR bindings) {

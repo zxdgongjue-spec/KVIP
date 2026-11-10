@@ -120,6 +120,17 @@ def account(events, name, elapsed, *, full=False):
     )
 
 
+def decode_final_detail(owner_words, status_words):
+    """Decode per-request diagnostic counters after synchronization."""
+    detail = []
+    for owner, status in zip(owner_words, status_words):
+        if owner[4] and owner[11]:
+            detail.append(dict(ticks=[int(x) for x in owner[4:12]],
+                               safe=int(owner[12]), conflict=int(owner[13]), pending=int(owner[14]),
+                               kvaf_ticks=[int(x) for x in status[8:16].view(np.uint64)]))
+    return detail
+
+
 def collect_core(torch, rotating, graph, reset, verify, rounds, folder, *, full=False):
     """Profile the existing core graph separately from primary timing."""
     import torch_npu
@@ -146,9 +157,14 @@ def collect_core(torch, rotating, graph, reset, verify, rounds, folder, *, full=
                 end.synchronize()
             verify()
             rows = rotating.rows.cpu().numpy().view(np.uint32)
+            # Read diagnostic counters after the timed graph and correctness checks.
+            owner_words = rotating.owners[:len(rows) * 32].cpu().numpy().view(np.uint64).reshape(len(rows), 16)
+            status_words = rotating.row_status.cpu().numpy().view(np.uint32).reshape(len(rows), 32)
+            detail = decode_final_detail(owner_words, status_words)
             samples.append(
                 dict(
                     name=name,
+                    detail=detail,
                     round=step,
                     us=begin.elapsed_time(end) * 1000,
                     prefetch=int(rows[:, 9].astype(np.uint64).sum()),
