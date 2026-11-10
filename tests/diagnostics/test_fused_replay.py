@@ -146,9 +146,11 @@ def test_tuning_keeps_snapshot_immutable_and_validates_only_known_options():
         final_copy_stages=4,
         ordered_pair=False,
         merge_outputs=False,
+        single_plan=False,
         cold_only_prefetch=False,
         threshold_only=False,
         simt_init=False,
+        staged_outputs=False,
     )
     assert geometry == dict(prefetch_limit=512, window_limit=64, requested_windows=8)
     assert fusion_tuning(geometry, "ubmem")["parallel_init"] is False
@@ -170,6 +172,7 @@ def test_urma_tuning_has_only_real_switches_and_fixed_inactive_gate():
         cold_only_prefetch=False,
         threshold_only=False,
         simt_init=False,
+        staged_outputs=False,
     )
     assert fusion_tuning(geometry, "urma", {"parallel_final": True})["parallel_final"] is True
     assert fusion_tuning(geometry, "ubmem", {"grouped_copy": True})["grouped_copy"] is True
@@ -186,6 +189,8 @@ def test_urma_tuning_has_only_real_switches_and_fixed_inactive_gate():
         ("ubmem", {"ordered_pair": True}),
         ("ubmem", {"merge_outputs": 1}),
         ("urma", {"merge_outputs": True}),
+        ("urma", {"single_plan": True}),
+        ("ubmem", {"single_plan": 1}),
         ("urma", {"cold_only_prefetch": 1}),
         ("ubmem", {"threshold_only": 1}),
         ("ubmem", {"simt_init": True, "parallel_init": True}),
@@ -243,7 +248,9 @@ def test_urma_factory_passes_compact_switch_to_actual_build(monkeypatch, tmp_pat
         assert kwargs["compact_reserved"] is True
         assert kwargs["parallel_final"] is parallel_final
         assert kwargs["async_final"] is async_final
-        assert all(kwargs[name] is True for name in ("cold_only_prefetch", "threshold_only", "simt_init"))
+        assert all(
+            kwargs[name] is True for name in ("cold_only_prefetch", "threshold_only", "simt_init", "staged_outputs")
+        )
         raise ReachedBuild
 
     monkeypatch.setattr(build, "build_libraries", build_libraries)
@@ -268,6 +275,7 @@ def test_urma_factory_passes_compact_switch_to_actual_build(monkeypatch, tmp_pat
                 "cold_only_prefetch": True,
                 "threshold_only": True,
                 "simt_init": True,
+                "staged_outputs": True,
             },
         )
 
@@ -401,7 +409,13 @@ def test_ubmem_factory_passes_shared_optimizations_to_the_actual_specialization(
 
     def build_specialization(**kwargs):
         shape = kwargs["shape"]
-        assert shape.cold_only_prefetch and shape.threshold_only and shape.simt_init
+        assert (
+            shape.cold_only_prefetch
+            and shape.threshold_only
+            and shape.simt_init
+            and shape.single_plan
+            and shape.staged_outputs
+        )
         assert not shape.parallel_init
         raise ReachedBuild
 
@@ -420,5 +434,48 @@ def test_ubmem_factory_passes_shared_optimizations_to_the_actual_specialization(
             tmp_path,
             32,
             transport="ubmem",
-            tuning={"cold_only_prefetch": True, "threshold_only": True, "simt_init": True},
+            tuning={
+                "cold_only_prefetch": True,
+                "threshold_only": True,
+                "simt_init": True,
+                "single_plan": True,
+                "staged_outputs": True,
+            },
         )
+
+
+def test_single_plan_diagnostics_include_both_native_resolve_launches():
+    calls = []
+    library = Library(calls)
+    rotating = SimpleNamespace(
+        library=library,
+        bindings=SimpleNamespace(data_ptr=lambda: 11),
+        shape=SimpleNamespace(single_plan=True, merge_outputs=False),
+    )
+    update = SimpleNamespace(bindings=SimpleNamespace(data_ptr=lambda: 22))
+    lease = SimpleNamespace(check_stream=lambda: SimpleNamespace(npu_stream=33))
+    stages = fused_stages("ubmem", rotating, update, lease, 16, split_index_stages=True)
+    assert [name for name, _ in stages] == [
+        "init",
+        "li_with_prefetch",
+        "resolve_plan",
+        "final_fetch",
+        "complete_index_plan",
+        "index_outputs",
+        "index_apply",
+    ]
+    for _, launch in stages:
+        launch()
+    assert calls == [
+        (name, (11, 33))
+        for name in (
+            "v9_init",
+            "v9_li",
+            "kvip_ubmem_resolve_plan",
+            "kvip_ubmem_resolve_copy",
+        )
+    ] + [
+        ("kvip_ubmem_complete_plan", (11, 22, 33)),
+        ("kvip_ubmem_update_outputs", (22, 33)),
+        ("kvip_ubmem_update_apply", (22, 33)),
+    ]

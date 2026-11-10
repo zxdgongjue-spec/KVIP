@@ -408,7 +408,15 @@ def test_tagged_ubmem_hot_resolver_ignores_stale_generations(tmp_path):
     _check_hot_resolver(tmp_path, "ubmem", tagged=True)
 
 
-def _check_hot_resolver(tmp_path, transport, *, tagged=False):
+def test_ubmem_single_plan_matches_every_replicated_descriptor_and_location(tmp_path):
+    _check_hot_resolver(tmp_path, "ubmem", single_plan=True)
+
+
+def test_tagged_ubmem_single_plan_matches_replicated_descriptors_and_locations(tmp_path):
+    _check_hot_resolver(tmp_path, "ubmem", tagged=True, single_plan=True)
+
+
+def _check_hot_resolver(tmp_path, transport, *, tagged=False, single_plan=False):
     """Execute production SIMT logic serially; CANN simulator covers barriers."""
     import subprocess
 
@@ -445,7 +453,10 @@ def _check_hot_resolver(tmp_path, transport, *, tagged=False):
     functions += "\ntemplate<unsigned Threads>\n" + function(
         ROOT / "csrc/operators/common/lifetch/resident_selection.h", "ResolveResidentPlan"
     )
-    functions += "\ntemplate<unsigned Threads>\n" + function(resolver, "ReplicatedResolve")
+    template = (
+        "template<unsigned Threads,bool PlanOnly=false>" if transport == "ubmem" else "template<unsigned Threads>"
+    )
+    functions += "\n" + template + "\n" + function(resolver, "ReplicatedResolve")
     source = r"""
 #include <cstdint>
 #include <vector>
@@ -560,6 +571,28 @@ int main(){
         begin = source.index("   assert(cfg[5]<=cfg[3]);")
         end = source.index("   std::copy(locations.begin()", begin)
         source = source[:begin] + source[end:]
+        if single_plan:
+            source = source.replace(
+                "  std::vector<unsigned> ownership(r),seen(r);",
+                """  const auto expectedChanges=changes,expectedSlots=changeSlots;
+  const auto expectedRemote=remote;const auto expectedBlocks=blocks,expectedOffsets=offsets,expectedDestinations=destinations;
+  const unsigned expectedTotal=total,expectedChangeCount=changeCount;
+  std::fill(changes.begin(),changes.end(),UINT32_MAX);std::fill(changeSlots.begin(),changeSlots.end(),0);
+  std::copy(candidates.begin(),candidates.end(),changeSlots.begin());
+  for(unsigned i=0;i<used;++i)changes[i]=r+i;
+  std::fill(remote.begin(),remote.end(),0);std::fill(blocks.begin(),blocks.end(),0);
+  std::fill(offsets.begin(),offsets.end(),0);std::fill(destinations.begin(),destinations.end(),0);
+  total=0;changeCount=2048;cold=0;locations=selected;
+  for(unsigned i=0;i<8192;++i){unsigned t=selected[i];
+   if(t!=UINT32_MAX && (t>=r || !hotValid[t] || reserved[t]>=0)){positions[cold++]=i;locations[i]=r;}}
+  ReplicatedResolve<1,true>(selected.data(),locations.data(),positions.data(),cold,
+   keys.data(),ranks.data(),ids.data(),slots.data(),cfg.data(),map.data(),addresses.data(),
+   blocks.data(),offsets.data(),destinations.data(),&total,0,used,0,&ctx);
+  assert(cfg[1]==0 && total==expectedTotal && changeCount==expectedChangeCount);
+  assert(locations==output && changes==expectedChanges && changeSlots==expectedSlots);
+  assert(remote==expectedRemote && blocks==expectedBlocks && offsets==expectedOffsets && destinations==expectedDestinations);
+  std::vector<unsigned> ownership(r),seen(r);""",
+            )
         if tagged:
             definitions.append("-DV9_UBMEM_TAGGED_MAP=1")
             source = source.replace(

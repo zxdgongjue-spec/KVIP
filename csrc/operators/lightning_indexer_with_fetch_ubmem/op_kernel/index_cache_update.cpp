@@ -9,6 +9,7 @@
   #include "index_cache_update.h"
   #include "context.h"
   #include "completion.h"
+  #include "../../common/lifetch/staged_outputs.h"
 using namespace AscendC;
 namespace {
 constexpr uint32_t kCandidates = kExtendedCandidates, kThreads = 512;
@@ -213,6 +214,12 @@ extern "C" __global__ __aicore__ void kvip_ubmem_direct_update_outputs_kernel(GM
   if ASCEND_IS_AIV {
     auto args = reinterpret_cast<__gm__ uint64_t*>(bindings);
     uint32_t core = GetBlockIdx();
+#if V9_STAGED_OUTPUTS
+    if(kvip_output::CanStageOutputs(uint32_t(args[25]),SIM_BATCH)) {
+      if(core<SIM_BATCH)kvip_output::PublishStagedOutputs<true>(args,core,SIM_BATCH);
+      return;
+    }
+#endif
     if(core>=rotating::kOutputCores)return;
     Simt::VF_CALL<PublishOutputs>(Simt::Dim3{kThreads, 1, 1}, args, core);
   }

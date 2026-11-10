@@ -40,7 +40,7 @@ __simt_callee__ inline uint32_t SparseHash(uint32_t token) {
 }
 #include "../../../common/lifetch/resident_selection.h"
 namespace rotating {
-template<uint32_t Threads>
+template<uint32_t Threads,bool PlanOnly=false>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
 inline void ReplicatedResolve(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc,
     __ubuf__ uint32_t* positions,uint32_t coldCount,__ubuf__ uint32_t* keys,
@@ -48,6 +48,7 @@ inline void ReplicatedResolve(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc
     __ubuf__ uint32_t* cfg,__gm__ uint32_t* mapping,__gm__ uint64_t* addresses,
     __gm__ int32_t* blocks,__gm__ int32_t* offsets,__gm__ int32_t* destinations,
     __gm__ uint32_t* total,uint32_t worker,uint32_t used,uint32_t batch,__gm__ Context* ctx) {
+    constexpr uint32_t planWorkers=PlanOnly?1:kFinalWorkers;
     uint32_t tid=threadIdx.x,lane=tid%warpSize,warp=tid/warpSize;
     auto lru=ctx->lruSlots ? reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+batch*kLruSlots : nullptr;
     uint32_t outputStride=OutputStride(SIM_RESIDENT,ctx),ownerBase=OwnerRow(ctx,batch)*outputStride;
@@ -56,11 +57,11 @@ inline void ReplicatedResolve(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc
         positions,coldCount,keys,ranks,ids,slots,cfg,mapping,lru,used,ctx->tailBounds!=0,count,candidateCount,
         CurrentMappingTag(ctx,batch),V9_UBMEM_TAGGED_MAP?kMappingSlotMask:UINT32_MAX))return;
     constexpr uint32_t missingTag=0x80000000U;
-    uint32_t ownBegin=count*worker/kFinalWorkers,ownEnd=count*(worker+1)/kFinalWorkers;
+    uint32_t ownBegin=count*worker/planWorkers,ownEnd=count*(worker+1)/planWorkers;
     if(!tid){cfg[2]=ownBegin;cfg[3]=ownEnd-ownBegin;if(!worker)asc_atomic_add(total,count);}
     for(uint32_t i=tid;i<coldCount;i+=Threads) {
         uint32_t pos=positions[i],slot=loc[pos];
-        if(pos/(kSlots/kFinalWorkers)==worker && (slot&missingTag))loc[pos]=slots[slot&~missingTag];
+        if(pos/(kSlots/planWorkers)==worker && (slot&missingTag))loc[pos]=slots[slot&~missingTag];
     }
     asc_syncthreads();
     auto changeSlots=reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+batch*kChangeCapacity;
@@ -85,8 +86,10 @@ inline void ReplicatedResolve(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc
     asc_threadfence();
 }
 
+template<bool PlanOnly=false>
 __aicore__ inline void ReplicatedFinal(__gm__ Context* ctx) {
-    const uint32_t core=GetBlockIdx(),b=core/kFinalWorkers,w=core%kFinalWorkers;
+    constexpr uint32_t planWorkers=PlanOnly?1:kFinalWorkers;
+    const uint32_t core=GetBlockIdx(),b=core/planWorkers,w=core%planWorkers;
     auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
     auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
     auto trace=reinterpret_cast<__gm__ uint64_t*>(ctx->owners)+b*16;
@@ -133,7 +136,7 @@ __aicore__ inline void ReplicatedFinal(__gm__ Context* ctx) {
     uint32_t cold=ctl.GetValue(2048),error=ctl.GetValue(2056)|row->error|(row->slots>kSlots?32U:0U);
 
     if(!w){trace[0]=started;trace[1]=GetSystemCycle();}
-    if(!error)Simt::VF_CALL<ReplicatedResolve<512>>(Simt::Dim3{512,1,1},FinalPtr(selected),FinalPtr(loc),FinalPtr(positions),cold,
+    if(!error)Simt::VF_CALL<ReplicatedResolve<512,PlanOnly>>(Simt::Dim3{512,1,1},FinalPtr(selected),FinalPtr(loc),FinalPtr(positions),cold,
         FinalPtr(keys),FinalPtr(ranks),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(ctl),
         reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*SIM_HISTORY,reinterpret_cast<__gm__ uint64_t*>(row->addresses),
         reinterpret_cast<__gm__ int32_t*>(ctx->sourceBlocks),reinterpret_cast<__gm__ int32_t*>(ctx->sourceOffsets),
@@ -142,16 +145,72 @@ __aicore__ inline void ReplicatedFinal(__gm__ Context* ctx) {
     uint32_t batchCount=error?0:ctl.GetValue(0),prefix=error?0:ctl.GetValue(2),own=error?0:ctl.GetValue(3),batchBase=b*kSlots;
     if(!error)error=ctl.GetValue(1);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-    DataCopy(output[w*(kSlots/kFinalWorkers)],loc[w*(kSlots/kFinalWorkers)],kSlots/kFinalWorkers);
+    DataCopy(output[w*(kSlots/planWorkers)],loc[w*(kSlots/planWorkers)],kSlots/planWorkers);
     SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
     if(!w)trace[2]=GetSystemCycle();
-    PublishFinalWorker(ctx,row,b,w,own,batchCount,batchBase+prefix,error,local,keys,ranks,slots,ctl);
+    if constexpr(!PlanOnly)
+        PublishFinalWorker(ctx,row,b,w,own,batchCount,batchBase+prefix,error,local,keys,ranks,slots,ctl);
     if(!w){
         status[0]=error;status[1]=batchCount;status[2]=batchBase;status[3]=0;status[4]=0;
-        row->finalBegin=started;row->finalRequests=batchCount;row->finalCompleted=FinalPostAt(ctx,core)->head;
+        row->finalBegin=started;row->finalRequests=batchCount;
+        row->finalCompleted=PlanOnly?0:FinalPostAt(ctx,core)->head;
         row->finalPending=batchCount?1:0;row->finalEnd=GetSystemCycle();trace[3]=row->finalEnd;
         ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(trace),64);
         ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),32);
+        ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row)+960,64);
+    }
+    pipe.Destroy();
+}
+
+// Read the existing compact descriptors after the plan kernel has finished.
+// No planner scratch or pointer survives that kernel; the same stream provides
+// the publication boundary. Preserve the optional block/offset source form.
+__simt_vf__ __aicore__ LAUNCH_BOUND(256)
+inline void LoadFinalCopyPlan(__gm__ Context* ctx,__gm__ Row* row,uint32_t b,uint32_t count,
+    __ubuf__ uint32_t* remoteLow,__ubuf__ uint32_t* remoteHigh,__ubuf__ uint32_t* slots,
+    __ubuf__ uint32_t* error) {
+    const uint32_t ownerBase=OwnerRow(ctx,b)*OutputStride(SIM_RESIDENT,ctx);
+    for(uint32_t rank=threadIdx.x;rank<count;rank+=256) {
+        const uint32_t descriptor=b*kSlots+rank;
+        uint64_t peer=0;
+        if(ctx->fallbackAddresses)peer=asc_ldcg(reinterpret_cast<__gm__ uint64_t*>(ctx->fallbackAddresses)+descriptor);
+        else {
+            const uint32_t block=uint32_t(asc_ldcg(reinterpret_cast<__gm__ int32_t*>(ctx->sourceBlocks)+descriptor));
+            const uint32_t offset=uint32_t(asc_ldcg(reinterpret_cast<__gm__ int32_t*>(ctx->sourceOffsets)+descriptor));
+            const uint32_t localBlock=block-b*(SIM_HISTORY/128);
+            if(localBlock>=SIM_HISTORY/128 || offset%kTokenBytes || offset/kTokenBytes>=128)
+                asc_atomic_or(error,kUbmemInvalidAddress);
+            else peer=asc_ldcg(reinterpret_cast<__gm__ uint64_t*>(row->addresses)+localBlock*128+offset/kTokenBytes);
+        }
+        remoteLow[rank]=uint32_t(peer);remoteHigh[rank]=uint32_t(peer>>32);
+        slots[rank]=uint32_t(asc_ldcg(reinterpret_cast<__gm__ int32_t*>(ctx->destinations)+descriptor))-ownerBase;
+    }
+}
+
+__aicore__ inline void CopyFinalPlan(__gm__ Context* ctx) {
+    const uint32_t core=GetBlockIdx(),b=core/kFinalWorkers,w=core%kFinalWorkers;
+    auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
+    auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
+    ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),sizeof(Row));
+    ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),kRowStatusWords*4);
+    uint32_t count=status[1],error=status[0];
+    if(count>kSlots){count=0;error|=kUbmemInvalidAddress;}
+    TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,kFinalScratchBytes);
+    auto local=scratch.Get<uint32_t>(),keys=local[2*kSlots],ranks=local[3*kSlots];
+    auto slots=local[kFinalSlotsOffset],ctl=local[kFinalControlOffset];
+    ctl.SetValue(0,0);
+    SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
+    if(!error && count)
+        Simt::VF_CALL<LoadFinalCopyPlan>(Simt::Dim3{256,1,1},ctx,row,b,count,
+            FinalPtr(keys),FinalPtr(ranks),FinalPtr(slots),FinalPtr(ctl));
+    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+    error|=ctl.GetValue(0);
+    const uint32_t begin=count*w/kFinalWorkers,end=count*(w+1)/kFinalWorkers;
+    PublishFinalWorker(ctx,row,b,w,end-begin,count,b*kSlots+begin,error,local,keys,ranks,slots,ctl);
+    if(!w) {
+        auto trace=reinterpret_cast<__gm__ uint64_t*>(ctx->owners)+b*16;
+        row->finalCompleted=FinalPostAt(ctx,core)->head;row->finalEnd=GetSystemCycle();trace[3]=row->finalEnd;
+        ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(trace),64);
         ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row)+960,64);
     }
     pipe.Destroy();

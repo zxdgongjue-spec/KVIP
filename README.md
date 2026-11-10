@@ -537,6 +537,35 @@ graph without changing the captured inputs or the final TopK algorithm:
   useful work from prefetch to final Fetch, so lower read traffic alone is not
   a latency win.
 
+Node24 NPU4's paired run enabling these three switches together measured
+UBmem at 694.429 versus 698.832 us (p50 694.940 versus 692.621 us), and URMA
+at 711.141 versus 681.243 us. This is no stable UBmem improvement and a 4.39%
+URMA regression. Candidate-hot prefetch was about 91% useful before the change;
+removing it increased final reads while unused cold prefetch barely changed.
+Keep `cold_only_prefetch=false` for the next experiment. Init/LI stage gains
+do not establish a full-graph gain or isolate the three switches individually.
+
+Two further switches remain opt-in, with all new work included in graph timing:
+
+- UBmem `single_plan=true` uses one final planner per request instead of four
+  redundant planners, then launches the original four copy workers on the same
+  stream. Existing descriptors, slot ownership, byte copies and error checks
+  are preserved. The added launch and descriptor reload must earn their cost;
+  diagnostic stages are `resolve_plan` and `final_fetch`.
+- Shared `staged_outputs=true` stages the resident logical-ID table, packed Q4
+  TopK, slot locations and TND map in UB. Hot lookup reuses this table and whole
+  output rows use DMA; cold logical IDs retain their original GM lookup. Apply
+  remains a later kernel. Resident lengths above 16384 or batches above 32
+  retain the original path; invalid/padding output behavior is unchanged.
+
+Use `replay --quiet` or `compare --quiet` to print only progress, effective
+tuning, correctness, timing, read counts and stage diagnostics. Successful
+native build/link chatter is discarded; failures retain the log and show its
+last 80 lines. Reprint a saved result without rebuilding or touching an NPU:
+`python -m kvip.diagnostics.replay --report-only /absolute/path/result.json`
+(the same option on `compare` reads its `summary.json`). Full result JSON still
+contains the measurements; compact output does not change timing boundaries.
+
 Replay readback additionally classifies actual prefetch and unused prefetch
 against each request's frozen initial cold, candidate-hot, other-hot and ABC
 residency. Mapping coordinates are converted through the pre-call logical-ID

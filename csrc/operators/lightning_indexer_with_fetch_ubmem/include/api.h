@@ -21,11 +21,17 @@ uint32_t v9_merge_outputs();
 uint32_t v9_cold_only_prefetch();
 uint32_t v9_threshold_only();
 uint32_t v9_simt_init();
+uint32_t v9_single_plan();
+uint32_t v9_staged_outputs();
 uint32_t v9_ubpipe_depth();
 uint32_t v9_window_ubpipe_depth();
 uint32_t v9_init(void* bindings,void* stream);
 uint32_t v9_li(void* bindings,void* stream);
 uint32_t v9_resolve(void* bindings,void* stream);
+// Single-plan mode retains both launches inside v9_resolve. These entries
+// expose the exact same boundaries for instrumented stage diagnostics.
+uint32_t kvip_ubmem_resolve_plan(void* bindings,void* stream);
+uint32_t kvip_ubmem_resolve_copy(void* bindings,void* stream);
 uint32_t v9_fetch(void* bindings,void* stream);
 // Completes the same packed batch before building its Index plan. Retain the
 // outputs/apply launches after this kernel: unpack can cross packed batches.

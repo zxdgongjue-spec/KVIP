@@ -11,18 +11,23 @@ from pathlib import Path
 import numpy as np
 
 from kvip.diagnostics.demand import DEMAND_ACCOUNTING
+from kvip.diagnostics.console import compact_report, failure_tail, report_only
 
 CASES = (("ubmem", "serial"), ("urma", "serial"), ("ubmem", "fused"), ("urma", "fused"))
 
 
 def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--snapshot", required=True, type=Path)
-    parser.add_argument("--ubmem-build-dir", required=True, type=Path)
-    parser.add_argument("--urma-build-dir", required=True, type=Path)
-    parser.add_argument("--kvaf-server", required=True, help="Dedicated local URMA CPU service")
+    parser.add_argument("--snapshot", type=Path)
+    parser.add_argument("--ubmem-build-dir", type=Path)
+    parser.add_argument("--urma-build-dir", type=Path)
+    parser.add_argument("--kvaf-server", help="Dedicated local URMA CPU service")
+    parser.add_argument(
+        "--quiet", action="store_true", help="Only case progress and compact results; native logs appear on failure"
+    )
+    parser.add_argument("--report-only", type=Path, help="Summarize an existing result JSON without device work")
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--soc", required=True)
+    parser.add_argument("--soc")
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--stage-iterations", type=int, default=3)
@@ -55,8 +60,35 @@ def arguments(argv=None):
     )
     parser.add_argument("--ubmem-fused-tuning", help="JSON options passed only to UBmem fused replay")
     parser.add_argument("--urma-fused-tuning", help="JSON options passed only to URMA fused replay")
-    parser.add_argument("--result-dir", required=True, type=Path, help="New directory; all cases and one summary JSON")
+    parser.add_argument("--result-dir", type=Path, help="New directory; all cases and one summary JSON")
     args = parser.parse_args(argv)
+    if args.report_only is not None:
+        if any(
+            (
+                args.snapshot,
+                args.ubmem_build_dir,
+                args.urma_build_dir,
+                args.kvaf_server,
+                args.soc,
+                args.result_dir,
+                args.ubmem_fused_tuning,
+                args.urma_fused_tuning,
+            )
+        ):
+            parser.error("--report-only cannot be combined with capture/build/output or run options")
+        return args
+    if any(
+        value is None
+        for value in (
+            args.snapshot,
+            args.ubmem_build_dir,
+            args.urma_build_dir,
+            args.kvaf_server,
+            args.soc,
+            args.result_dir,
+        )
+    ):
+        parser.error("comparison requires --snapshot, both build dirs, --kvaf-server, --soc and --result-dir")
     if args.urma_serial_workers is None:
         args.urma_serial_workers = 2
     if args.device < 0 or args.warmup < 0 or args.iterations < 1 or args.stage_iterations < 0:
@@ -205,6 +237,15 @@ def summarize(results):
                     "useful_transfers",
                     "cold_demand",
                     "candidate_hot_refetch",
+                    "prefetch_cold",
+                    "prefetch_candidate_hot",
+                    "prefetch_other_hot",
+                    "prefetch_abc",
+                    "prefetch_unclassified",
+                    "unused_prefetch_cold",
+                    "unused_prefetch_candidate_hot",
+                    "unused_prefetch_other_hot",
+                    "unused_prefetch_abc",
                 )
                 if key in result["reads_samples"][0]
             },
@@ -404,27 +445,51 @@ def display(summary):
 
 def main():
     args = arguments()
+    if args.report_only is not None:
+        report_only(args.report_only)
+        return
     args.result_dir.mkdir(parents=True)
+    print(
+        f"CONFIG device={args.device} warmup={args.warmup} iterations={args.iterations} stages={args.stage_iterations}",
+        flush=True,
+    )
     results = {}
     for transport, mode, workers in case_plan(args):
         argv, result_file = command(args, transport, mode, workers)
         name = result_file.stem
-        print(f"[snapshot-compare] {name}: restore real DDR/pre-state, then measure", flush=True)
+        print(f"CASE_BEGIN {name}: restore real DDR/pre-state, then measure", flush=True)
         # Keep successful native setup chatter out of the terminal. The temporary
         # spool is removed immediately, not retained as another benchmark log.
-        with tempfile.TemporaryFile(mode="w+") as output:
-            result = subprocess.run(argv, stdout=output, stderr=subprocess.STDOUT, check=False)
+        with tempfile.NamedTemporaryFile(mode="w+", prefix="kvip-compare-", suffix=".log", delete=False) as output:
+            spool = Path(output.name)
+            try:
+                result = subprocess.run(argv, stdout=output, stderr=subprocess.STDOUT, check=False)
+            except BaseException as error:
+                output.flush()
+                failure_tail(spool, message=f"{name}: {type(error).__name__}: {error}")
+                raise
             if result.returncode:
-                output.seek(0)
-                lines = output.readlines()
-                print("".join(lines[-100:]), file=sys.stderr, end="")
-                raise SystemExit(f"{name} failed (exit {result.returncode}); result: {result_file}")
-        results[name] = json.loads(result_file.read_text())
-        print(f"[snapshot-compare] {name}: PASS mean={results[name]['timing']['mean_us']:.3f} us", flush=True)
+                output.flush()
+                failure_tail(spool, message=f"{name} exited {result.returncode}; result: {result_file}")
+                raise SystemExit(1)
+            try:
+                case_result = json.loads(result_file.read_text())
+                if case_result.get("status") != "pass" or "timing" not in case_result:
+                    raise ValueError("Child returned no validated timing result")
+            except Exception as error:
+                output.flush()
+                failure_tail(spool, message=f"{name}: {type(error).__name__}: {error}")
+                raise
+        spool.unlink()
+        results[name] = case_result
+        print(f"CASE_PASS {name}: mean={results[name]['timing']['mean_us']:.3f} us", flush=True)
     summary = summarize(results)
     (args.result_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-    display(summary)
-    print(f"\nResults: {args.result_dir / 'summary.json'}")
+    if args.quiet:
+        compact_report(summary, path=args.result_dir / "summary.json")
+    else:
+        display(summary)
+        print(f"\nResults: {args.result_dir / 'summary.json'}")
 
 
 if __name__ == "__main__":

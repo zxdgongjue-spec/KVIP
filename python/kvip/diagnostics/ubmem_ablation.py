@@ -8,6 +8,7 @@ import json
 import numpy as np
 
 from kvip.diagnostics import replay_measure
+from kvip.diagnostics.console import emit
 from kvip.operators.lifetch.geometry import prefetch_budget
 
 
@@ -198,13 +199,13 @@ def run_ablation(args, archive, retained):
     context = replay_measure.allocate_context(args, archive, retained)
     cases = []
     for name, tuning, case_archive in plans:
-        print(f"[{args.transport}-ablation] {name}: {tuning}", flush=True)
+        emit(f"CASE_BEGIN {args.transport}-{name}: {tuning}")
         case_args = copy(args)
         case_args.fused_tuning = tuning
         result = replay_measure.measure_case(case_args, case_archive, context, retained)
         cases.append(dict(name=name, **result))
-        print(
-            f"[{args.transport}-ablation] {name}: PASS mean={result['timing']['mean_us']:.3f} us "
+        emit(
+            f"CASE_PASS {args.transport}-{name}: mean={result['timing']['mean_us']:.3f} us "
             f"p50={result['timing']['p50_us']:.3f} us",
             flush=True,
         )
@@ -242,5 +243,6 @@ def run_ablation(args, archive, retained):
             "Optional candidate_call separately measures one group's candidate staging/inverse map/H2D to completion; "
             "it does not reconstruct the full service step."
         )
-    print_summary(result)
+    if not getattr(args, "quiet", False):
+        print_summary(result)
     return result

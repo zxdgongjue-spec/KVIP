@@ -49,6 +49,7 @@ def build_libraries(
     cold_only_prefetch=False,
     threshold_only=False,
     simt_init=False,
+    staged_outputs=False,
 ):
     """Build one shape-independent binary per source/toolchain/SoC."""
     if type(compact_reserved) is not bool:
@@ -57,7 +58,7 @@ def build_libraries(
         raise ValueError("parallel_final must be a boolean")
     if type(async_final) is not bool or (async_final and not parallel_final):
         raise ValueError("async_final must be a boolean and requires parallel_final")
-    if any(type(flag) is not bool for flag in (cold_only_prefetch, threshold_only, simt_init)):
+    if any(type(flag) is not bool for flag in (cold_only_prefetch, threshold_only, simt_init, staged_outputs)):
         raise ValueError("Fusion optimization switches must be booleans")
     root = Path(__file__).resolve().parents[3] / "csrc/operators"
     options = dict(
@@ -72,6 +73,7 @@ def build_libraries(
         COLD_ONLY_PREFETCH=int(cold_only_prefetch),
         THRESHOLD_ONLY=int(threshold_only),
         SIMT_INIT=int(simt_init),
+        STAGED_OUTPUTS=int(staged_outputs),
     )
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     for relative in (

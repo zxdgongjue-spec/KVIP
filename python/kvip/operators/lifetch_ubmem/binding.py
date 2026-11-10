@@ -58,6 +58,8 @@ class UbmemBinding:
             ("cold_only_prefetch", int(shape.cold_only_prefetch)),
             ("threshold_only", int(shape.threshold_only)),
             ("simt_init", int(shape.simt_init)),
+            ("single_plan", int(shape.single_plan)),
+            ("staged_outputs", int(shape.staged_outputs)),
         ):
             if query(self.library, name) != expected:
                 raise ValueError(f"UBmem static binary contract mismatch: {name}")

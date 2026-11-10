@@ -8,7 +8,16 @@ extern "C" uint32_t api(void* bindings,void* stream) { \
     return aclrtlaunch_kvip_ubmem_##kernel##_kernel(blocks,stream,bindings); }
 ENTRY(v9_init,init,rotating::kInitCores)
 ENTRY(v9_li,li,rotating::kLaunchCores)
+ENTRY(kvip_ubmem_resolve_plan,resolve_plan,SIM_BATCH)
+ENTRY(kvip_ubmem_resolve_copy,resolve_copy,rotating::kFinalCores)
+#if V9_UBMEM_SINGLE_PLAN
+extern "C" uint32_t v9_resolve(void* bindings,void* stream) {
+    uint32_t result=kvip_ubmem_resolve_plan(bindings,stream);
+    return result?result:kvip_ubmem_resolve_copy(bindings,stream);
+}
+#else
 ENTRY(v9_resolve,resolve,rotating::kFinalCores)
+#endif
 ENTRY(v9_fetch,complete,SIM_BATCH)
 
 extern "C" uint32_t aclrtlaunch_kvip_ubmem_direct_update_outputs_kernel(uint32_t,void*,void*);
@@ -77,6 +86,8 @@ VALUE(v9_tagged_map,V9_UBMEM_TAGGED_MAP)
 VALUE(v9_init_cores,rotating::kInitCores)
 VALUE(v9_balanced_index,V9_UBMEM_BALANCED_INDEX)
 VALUE(v9_merge_outputs,V9_UBMEM_MERGE_OUTPUTS)
+VALUE(v9_single_plan,V9_UBMEM_SINGLE_PLAN)
+VALUE(v9_staged_outputs,V9_STAGED_OUTPUTS)
 VALUE(v9_skip_inactive,V9_SKIP_INACTIVE)
 VALUE(v9_compact_reserved,V9_COMPACT_RESERVED)
 VALUE(v9_grouped_copy,V9_UBMEM_GROUPED_COPY)

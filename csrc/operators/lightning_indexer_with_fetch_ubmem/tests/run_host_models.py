@@ -77,18 +77,19 @@ with tempfile.TemporaryDirectory(prefix="kvip-ubmem-model-") as directory:
                 subprocess.run([str(binary)], check=True)
     # Parallel init uses all 64 AIVs; tagged mapping requires the serial init
     # owner. Both keep the same complete-plan/output/apply sequence and ABI.
-    for parallel, tagged, merged in ((1, 0, 0), (0, 1, 0), (0, 1, 1)):
+    for parallel, tagged, merged, single_plan in ((1, 0, 0, 0), (0, 1, 0, 0), (0, 1, 1, 0), (0, 1, 0, 1)):
         definitions = common | {
             "SIM_BATCH": 16,
             "TOKEN_BYTES": 2624,
             "V9_UBMEM_PARALLEL_INIT": parallel,
             "V9_UBMEM_TAGGED_MAP": tagged,
             "V9_UBMEM_MERGE_OUTPUTS": merged,
+            "V9_UBMEM_SINGLE_PLAN": single_plan,
             "V9_UBMEM_BALANCED_INDEX": 1,
             "V9_UBMEM_GROUPED_COPY": 1,
             "V9_UBMEM_FINAL_COPY_STAGES": 8,
         }
-        binary = Path(directory) / f"abi-optimized-b16-{parallel}-{tagged}-{merged}"
+        binary = Path(directory) / f"abi-optimized-b16-{parallel}-{tagged}-{merged}-{single_plan}"
         subprocess.run(
             [
                 compiler,

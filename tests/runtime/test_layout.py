@@ -123,7 +123,7 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="requires parallel_final"):
         build.build_libraries(**options, async_final=True)
     assert len(commands) == 14
-    for index, flag in enumerate(("cold_only_prefetch", "threshold_only", "simt_init"), 1):
+    for index, flag in enumerate(("cold_only_prefetch", "threshold_only", "simt_init", "staged_outputs"), 1):
         specialized = build.build_libraries(**options, **{flag: True})
         assert specialized != current
         assert f"-D{flag.upper()}=1" in commands[-2]

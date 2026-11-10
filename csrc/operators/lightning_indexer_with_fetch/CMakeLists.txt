@@ -16,7 +16,8 @@ set(URMA_ASYNC_FINAL 0 CACHE STRING "Submit safe final reads before Index and dr
 set(COLD_ONLY_PREFETCH 0 CACHE STRING "Speculatively read cold history only; final TopK repair is unchanged")
 set(THRESHOLD_ONLY 0 CACHE STRING "Compute the exact resident admission threshold without materializing hot TopK")
 set(SIMT_INIT 0 CACHE STRING "Initialize per-row state in a single SIMT pass")
-foreach(flag COLD_ONLY_PREFETCH THRESHOLD_ONLY SIMT_INIT)
+set(STAGED_OUTPUTS 0 CACHE STRING "Stage hot logical IDs and packed outputs in UB before TND publication")
+foreach(flag COLD_ONLY_PREFETCH THRESHOLD_ONLY SIMT_INIT STAGED_OUTPUTS)
   if(NOT ${flag} MATCHES "^[01]$")
     message(FATAL_ERROR "${flag} must be 0 or 1")
   endif()
@@ -44,12 +45,13 @@ ascendc_compile_options(v9_kernel PRIVATE -DV9_RESOLVER_COMPARE=${RESOLVER_COMPA
 add_library(v9_bridge SHARED op_host/launch.cpp)
 target_include_directories(v9_bridge PRIVATE ${KVAF_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_definitions(v9_bridge PRIVATE V9_RESOLVER_COMPARE=${RESOLVER_COMPARE} V9_URMA_PARALLEL_FINAL=${URMA_PARALLEL_FINAL} V9_URMA_ASYNC_FINAL=${URMA_ASYNC_FINAL}
-  V9_COLD_ONLY_PREFETCH=${COLD_ONLY_PREFETCH} V9_THRESHOLD_ONLY=${THRESHOLD_ONLY} V9_SIMT_INIT=${SIMT_INIT})
+  V9_COLD_ONLY_PREFETCH=${COLD_ONLY_PREFETCH} V9_THRESHOLD_ONLY=${THRESHOLD_ONLY} V9_SIMT_INIT=${SIMT_INIT}
+  V9_STAGED_OUTPUTS=${STAGED_OUTPUTS})
 target_link_libraries(v9_bridge PRIVATE v9_kernel host_intf_pub ascendcl)
 # Independent AIV target: does not change the LI/Fetch compilation options.
 ascendc_library(kvop_cache_update_kernel STATIC op_kernel/index_cache_update.cpp)
 ascendc_include_directories(kvop_cache_update_kernel PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)
-ascendc_compile_options(kvop_cache_update_kernel PRIVATE -O2
+ascendc_compile_options(kvop_cache_update_kernel PRIVATE -O2 -DV9_STAGED_OUTPUTS=${STAGED_OUTPUTS}
   -mllvm -user-reserved-ub-size=223232)
 add_library(kvop_cache_update SHARED op_host/index_cache_update.cpp)
 target_link_libraries(kvop_cache_update PRIVATE kvop_cache_update_kernel host_intf_pub ascendcl)

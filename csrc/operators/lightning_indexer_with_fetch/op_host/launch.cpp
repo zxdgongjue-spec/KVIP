@@ -35,6 +35,7 @@ extern "C" uint32_t v9_async_final(const rotating::RuntimeShape* shape) { return
 extern "C" uint32_t v9_cold_only_prefetch(const rotating::RuntimeShape* shape) { return V9_COLD_ONLY_PREFETCH; }
 extern "C" uint32_t v9_threshold_only(const rotating::RuntimeShape* shape) { return V9_THRESHOLD_ONLY; }
 extern "C" uint32_t v9_simt_init(const rotating::RuntimeShape* shape) { return V9_SIMT_INIT; }
+extern "C" uint32_t v9_staged_outputs(const rotating::RuntimeShape* shape) { return V9_STAGED_OUTPUTS; }
 
 #if V9_RESOLVER_COMPARE
 ENTRY(resolve_original,shape->finalCores)

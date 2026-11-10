@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 
 from kvip.diagnostics.archive import load_snapshot
+from kvip.diagnostics.console import NativeLog, compact_report, emit, flush_output, report_only
 from kvip.diagnostics.snapshot import (
     relocate_snapshot_addresses,
     validate_capture_inputs,
@@ -25,7 +26,11 @@ _RETAINED_RUNS = []
 
 def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--snapshot", required=True, type=Path)
+    parser.add_argument("--snapshot", type=Path)
+    parser.add_argument(
+        "--quiet", action="store_true", help="Keep key progress/results; retain native logs only on failure"
+    )
+    parser.add_argument("--report-only", type=Path, help="Summarize an existing result JSON without loading a runtime")
     parser.add_argument("--inspect", action="store_true", help="Verify hashes and address coverage without Torch/NPU")
     parser.add_argument("--build-dir", type=Path)
     parser.add_argument("--device", type=int, default=0)
@@ -85,6 +90,25 @@ def arguments(argv=None):
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--output", type=Path, help="New result JSON; stdout also contains the result")
     args = parser.parse_args(argv)
+    if args.report_only is not None:
+        if any(
+            (
+                args.snapshot,
+                args.build_dir,
+                args.soc,
+                args.output,
+                args.inspect,
+                args.kvaf_server,
+                args.fused_tuning,
+                args.fused_variants,
+                args.ubmem_ablation,
+                args.service_ablation,
+            )
+        ):
+            parser.error("--report-only cannot be combined with capture/build/output or run options")
+        return args
+    if args.snapshot is None:
+        parser.error("--snapshot is required unless --report-only is used")
     if args.device < 0 or args.warmup < 0 or args.iterations < 1:
         parser.error("device/warmup must be nonnegative and iterations positive")
     if args.stage_iterations < 0:
@@ -210,38 +234,62 @@ def _run(args, archive, retained):
 
 def main():
     args = arguments()
+    if args.report_only is not None:
+        report_only(args.report_only)
+        return
+    logging = NativeLog(args.quiet)
     try:
-        archive = load_snapshot(args.snapshot)
-        inspected = inspect_snapshot(archive)
-        result = inspected if args.inspect else run(args, archive)
+        with logging:
+            emit(
+                f"CONFIG transport={args.transport} mode={args.mode} device={args.device} "
+                f"warmup={args.warmup} iterations={args.iterations} stages={args.stage_iterations}"
+            )
+            emit("SNAPSHOT_CHECK_BEGIN")
+            archive = load_snapshot(args.snapshot)
+            inspected = inspect_snapshot(archive)
+            emit("SNAPSHOT_CHECK_PASS")
+            matrix = args.ubmem_ablation or args.service_ablation or args.fused_variants is not None
+            if not args.inspect and not matrix:
+                emit(f"CASE_BEGIN {args.transport}-{args.mode}")
+            result = inspected if args.inspect else run(args, archive)
+            if not args.inspect and not matrix:
+                emit(f"CASE_PASS {args.transport}-{args.mode}")
     except BaseException as error:
-        traceback.print_exc()
+        if logging.failure_path is None:
+            traceback.print_exc()
         if args.output is not None:
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            with args.output.open("x") as output:
-                json.dump(
-                    dict(
-                        status="failed",
-                        transport=args.transport,
-                        mode=args.mode,
-                        error=f"{type(error).__name__}: {error}",
-                    ),
-                    output,
-                    indent=2,
-                )
-        sys.stdout.flush()
-        sys.stderr.flush()
+            try:
+                args.output.parent.mkdir(parents=True, exist_ok=True)
+                with args.output.open("x") as output:
+                    json.dump(
+                        dict(
+                            status="failed",
+                            transport=args.transport,
+                            mode=args.mode,
+                            error=f"{type(error).__name__}: {error}",
+                            failure_log=str(logging.failure_path) if logging.failure_path else None,
+                        ),
+                        output,
+                        indent=2,
+                    )
+            except Exception as save_error:
+                emit(f"Could not save failure JSON {args.output}: {save_error}", file=sys.stderr)
+        flush_output()
         if _RETAINED_RUNS:
             # Completion may be unknown. Avoid Python destructor order while
             # native kernels/DMA can still reference the retained object graph.
             os._exit(130 if isinstance(error, KeyboardInterrupt) else 70)
+        if args.quiet:
+            raise SystemExit(130 if isinstance(error, KeyboardInterrupt) else 1) from None
         raise
     text = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with args.output.open("x") as output:
             output.write(text)
-    if args.ubmem_ablation or args.service_ablation or args.fused_variants is not None:
+    if args.quiet:
+        compact_report(result, path=args.output)
+    elif args.ubmem_ablation or args.service_ablation or args.fused_variants is not None:
         print(f"Results: {args.output}")
     else:
         print(text, end="")

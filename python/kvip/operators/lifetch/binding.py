@@ -42,6 +42,7 @@ class LIFetchBinding:
         cold_only_prefetch=False,
         threshold_only=False,
         simt_init=False,
+        staged_outputs=False,
     ):
         if resident > 131072:
             raise ValueError("LIFetch hot bitmap supports resident <= 131072")
@@ -88,6 +89,7 @@ class LIFetchBinding:
             ("cold_only_prefetch", cold_only_prefetch),
             ("threshold_only", threshold_only),
             ("simt_init", simt_init),
+            ("staged_outputs", staged_outputs),
         ):
             if type(expected) is not bool:
                 raise ValueError(f"{name} must be a boolean")

@@ -3,6 +3,7 @@
 #endif
 #include <cassert>
 #include <cstddef>
+#include <algorithm>
 #include <vector>
 #include "api.h"
 #include "context.h"
@@ -16,6 +17,14 @@ LAUNCH(complete,4)
 LAUNCH(direct_update_owned,5)
 LAUNCH(direct_update_outputs,6)
 LAUNCH(direct_apply_owned,7)
+extern "C" uint32_t aclrtlaunch_kvip_ubmem_resolve_plan_kernel(uint32_t count,void* stream,void* bindings) {
+    assert(bindings==expectedBindings && stream==expectedStream);
+    calls.push_back(10);blocks.push_back(count);return fail==10?71:0;
+}
+extern "C" uint32_t aclrtlaunch_kvip_ubmem_resolve_copy_kernel(uint32_t count,void* stream,void* bindings) {
+    assert(bindings==expectedBindings && stream==expectedStream);
+    calls.push_back(11);blocks.push_back(count);return fail==11?71:0;
+}
 extern "C" uint32_t aclrtlaunch_kvip_ubmem_complete_plan_kernel(uint32_t count,void* stream,void* bindings,void* update) {
     assert(bindings==expectedBindings && update==expectedUpdate && stream==expectedStream);
     calls.push_back(8);blocks.push_back(count);return fail==8?71:0;
@@ -35,6 +44,8 @@ int main() {
     assert(v9_ordered_pair()==V9_UBMEM_ORDERED_PAIR);
     assert(v9_tagged_map()==V9_UBMEM_TAGGED_MAP);
     assert(v9_merge_outputs()==V9_UBMEM_MERGE_OUTPUTS);
+    assert(v9_single_plan()==V9_UBMEM_SINGLE_PLAN);
+    assert(v9_staged_outputs()==V9_STAGED_OUTPUTS);
     assert(v9_ubpipe_depth()==(V9_UBMEM_GROUPED_COPY?V9_UBMEM_FINAL_COPY_STAGES:8));
     assert(v9_window_ubpipe_depth()==(V9_UBMEM_GROUPED_COPY?4:8));
     void* pointer=reinterpret_cast<void*>(1);
@@ -42,7 +53,10 @@ int main() {
     expectedBindings=pointer;expectedUpdate=update;expectedStream=stream;
     assert(kvip_ubmem_forward(pointer,update,stream)==0);
     const unsigned planCall=V9_UBMEM_MERGE_OUTPUTS?9:8;
-    std::vector<unsigned> forwardCalls{1,2,3,planCall},forwardBlocks{kInitCores,kLaunchCores,kFinalCores,SIM_BATCH};
+    std::vector<unsigned> forwardCalls{1,2},forwardBlocks{kInitCores,kLaunchCores};
+    if(V9_UBMEM_SINGLE_PLAN){forwardCalls.push_back(10);forwardBlocks.push_back(SIM_BATCH);}
+    forwardCalls.push_back(V9_UBMEM_SINGLE_PLAN?11:3);forwardBlocks.push_back(kFinalCores);
+    forwardCalls.push_back(planCall);forwardBlocks.push_back(SIM_BATCH);
     if(!V9_UBMEM_MERGE_OUTPUTS){forwardCalls.push_back(6);forwardBlocks.push_back(kOutputCores);}
     forwardCalls.push_back(7);forwardBlocks.push_back(SIM_BATCH*4);
     assert(calls==forwardCalls && blocks==forwardBlocks);
@@ -59,12 +73,18 @@ int main() {
     calls.clear();blocks.clear();
     assert(kvip_ubmem_complete_plan_outputs(pointer,update,stream)==0);
     assert((calls==std::vector<unsigned>{9}) && (blocks==std::vector<unsigned>{SIM_BATCH}));
-    calls.clear();fail=planCall;
-    assert(kvip_ubmem_forward(pointer,update,stream)==71);
-    assert((calls==std::vector<unsigned>{1,2,3,planCall}));
-    calls.clear();fail=V9_UBMEM_MERGE_OUTPUTS?7:6;
-    assert(kvip_ubmem_forward(pointer,update,stream)==71);
-    assert((calls==std::vector<unsigned>{1,2,3,planCall,fail}));
+    // A failed plan must not launch its copy or publish Index state. Test
+    // every launch boundary, using the same stream in both resolve kernels.
+    for(auto failed:forwardCalls) {
+        calls.clear();fail=failed;
+        assert(kvip_ubmem_forward(pointer,update,stream)==71);
+        auto stop=std::find(forwardCalls.begin(),forwardCalls.end(),failed)+1;
+        assert(calls==std::vector<unsigned>(forwardCalls.begin(),stop));
+    }
+    fail=0;calls.clear();blocks.clear();
+    assert(kvip_ubmem_resolve_plan(pointer,stream)==0);
+    assert(kvip_ubmem_resolve_copy(pointer,stream)==0);
+    assert((calls==std::vector<unsigned>{10,11}) && (blocks==std::vector<unsigned>{SIM_BATCH,kFinalCores}));
     calls.clear();assert(kvip_ubmem_forward(nullptr,pointer,pointer)!=0 && calls.empty());
     assert(kvip_ubmem_complete_plan(nullptr,update,stream)!=0 && calls.empty());
     assert(kvip_ubmem_complete_plan(pointer,nullptr,stream)!=0 && calls.empty());
@@ -72,6 +92,10 @@ int main() {
     assert(kvip_ubmem_complete_plan_outputs(nullptr,update,stream)!=0 && calls.empty());
     assert(kvip_ubmem_complete_plan_outputs(pointer,nullptr,stream)!=0 && calls.empty());
     assert(kvip_ubmem_complete_plan_outputs(pointer,update,nullptr)!=0 && calls.empty());
+    assert(kvip_ubmem_resolve_plan(nullptr,stream)!=0 && calls.empty());
+    assert(kvip_ubmem_resolve_plan(pointer,nullptr)!=0 && calls.empty());
+    assert(kvip_ubmem_resolve_copy(nullptr,stream)!=0 && calls.empty());
+    assert(kvip_ubmem_resolve_copy(pointer,nullptr)!=0 && calls.empty());
     for(uint32_t e=1;e<kRounds;++e)assert(Trigger(e)>Trigger(e-1));
     assert(Trigger(kRounds-1)==SIM_HISTORY/128);
 }

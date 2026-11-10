@@ -35,6 +35,8 @@ class Specialization:
     cold_only_prefetch: bool = False
     threshold_only: bool = False
     simt_init: bool = False
+    single_plan: bool = False
+    staged_outputs: bool = False
 
     def __post_init__(self):
         if any(
@@ -51,6 +53,8 @@ class Specialization:
                 "cold_only_prefetch",
                 "threshold_only",
                 "simt_init",
+                "single_plan",
+                "staged_outputs",
             )
         ):
             raise ValueError("UBmem optimization switches must be booleans")
@@ -106,6 +110,8 @@ class Specialization:
             COLD_ONLY_PREFETCH=int(self.cold_only_prefetch),
             THRESHOLD_ONLY=int(self.threshold_only),
             SIMT_INIT=int(self.simt_init),
+            UBMEM_SINGLE_PLAN=int(self.single_plan),
+            STAGED_OUTPUTS=int(self.staged_outputs),
         )
 
 

@@ -34,6 +34,12 @@ def fused_stages(transport, rotating, update, lease, batch, *, split_index_stage
     library = rotating.library
     if transport == "ubmem":
         merge_outputs = getattr(getattr(rotating, "shape", None), "merge_outputs", False)
+        single_plan = getattr(getattr(rotating, "shape", None), "single_plan", False)
+        resolve = (
+            (("resolve_plan", "kvip_ubmem_resolve_plan"), ("final_fetch", "kvip_ubmem_resolve_copy"))
+            if single_plan
+            else (("resolve_final_fetch", "v9_resolve"),)
+        )
         result = [
             (
                 name,
@@ -44,7 +50,7 @@ def fused_stages(transport, rotating, update, lease, batch, *, split_index_stage
             for name, symbol in (
                 ("init", "v9_init"),
                 ("li_with_prefetch", "v9_li"),
-                ("resolve_final_fetch", "v9_resolve"),
+                *resolve,
             )
         ]
         updates = [
@@ -172,7 +178,7 @@ def validate_fused_tuning(overrides, transport):
     """Reject options that the selected backend cannot actually apply."""
     if transport not in ("ubmem", "urma") or not isinstance(overrides, dict):
         raise ValueError("Fusion tuning requires a JSON object and ubmem/urma transport")
-    booleans = {"compact_reserved", "cold_only_prefetch", "threshold_only", "simt_init"}
+    booleans = {"compact_reserved", "cold_only_prefetch", "threshold_only", "simt_init", "staged_outputs"}
     if transport == "ubmem":
         booleans |= {
             "parallel_init",
@@ -182,6 +188,7 @@ def validate_fused_tuning(overrides, transport):
             "tagged_map",
             "ordered_pair",
             "merge_outputs",
+            "single_plan",
         }
     else:
         booleans |= {"parallel_final", "async_final"}
@@ -220,6 +227,7 @@ def fusion_tuning(geometry, transport, overrides=None):
         cold_only_prefetch=False,
         threshold_only=False,
         simt_init=False,
+        staged_outputs=False,
         prefetch_limit=geometry["prefetch_limit"],
         window_limit=geometry["window_limit"],
     )
@@ -233,6 +241,7 @@ def fusion_tuning(geometry, transport, overrides=None):
             final_copy_stages=4,
             ordered_pair=False,
             merge_outputs=False,
+            single_plan=False,
         )
     values.update(validate_fused_tuning({} if overrides is None else overrides, transport))
     if transport == "urma":
@@ -313,6 +322,8 @@ def create_fused(
             threshold_only=effective["threshold_only"],
             simt_init=effective["simt_init"],
             merge_outputs=effective["merge_outputs"],
+            single_plan=effective["single_plan"],
+            staged_outputs=effective["staged_outputs"],
         )
         library = build_specialization(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape)
         workspace = UbmemWorkspace(torch, resident=r, **common_workspace)
@@ -341,6 +352,7 @@ def create_fused(
             cold_only_prefetch=effective["cold_only_prefetch"],
             threshold_only=effective["threshold_only"],
             simt_init=effective["simt_init"],
+            staged_outputs=effective["staged_outputs"],
         )
         workspace = LIFetchWorkspace(torch, **common_workspace)
     storage = IndexCacheStorage(torch, geometry["owners"], h, r, device)
@@ -403,6 +415,7 @@ def create_fused(
             cold_only_prefetch=effective["cold_only_prefetch"],
             threshold_only=effective["threshold_only"],
             simt_init=effective["simt_init"],
+            staged_outputs=effective["staged_outputs"],
             **common,
         )
         rotating.output = output

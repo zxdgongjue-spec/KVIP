@@ -7,6 +7,7 @@
   #include "simt_api/device_sync_functions.h"
   #include "simt_api/device_warp_functions.h"
   #include "index_cache_update.h"
+  #include "../../common/lifetch/staged_outputs.h"
 using namespace AscendC;
 namespace {
 constexpr uint32_t kCandidates = kExtendedCandidates, kThreads = 512;
@@ -138,14 +139,19 @@ __aicore__ inline void Apply(GM_ADDR bindings) {
 
 template <bool WaitForFetch>
 __aicore__ inline void UpdateOutputs(GM_ADDR bindings) {
+  auto args = reinterpret_cast<__gm__ uint64_t*>(bindings);
+  uint32_t batch = GetBlockIdx();
+  bool staged=false;
+#if V9_STAGED_OUTPUTS
+  staged=kvip_output::CanStageOutputs(uint32_t(args[25]),GetBlockNum());
+  if(staged)kvip_output::PublishStagedOutputs<false>(args,batch,GetBlockNum());
+#endif
   TPipe pipe;
   TBuf<TPosition::VECCALC> scratch;
   pipe.InitBuffer(scratch, kExtendedScratchBytes);
   auto local = scratch.Get<uint32_t>();
-  auto args = reinterpret_cast<__gm__ uint64_t*>(bindings);
   auto owners = reinterpret_cast<__gm__ uint32_t*>(args[9]);
-  uint32_t batch = GetBlockIdx();
-  Simt::VF_CALL<PublishOutputs>(Simt::Dim3{kThreads, 1, 1}, args, batch);
+  if(!staged)Simt::VF_CALL<PublishOutputs>(Simt::Dim3{kThreads, 1, 1}, args, batch);
   DispatchUpdate<WaitForFetch>(args, batch, owners[batch], true,
                                    reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
 }

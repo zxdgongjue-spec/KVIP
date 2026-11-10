@@ -78,6 +78,14 @@ static_assert(V9_UBMEM_MERGE_OUTPUTS==0 || V9_UBMEM_MERGE_OUTPUTS==1,"Merged out
 #ifndef V9_UBMEM_ORDERED_PAIR
 #define V9_UBMEM_ORDERED_PAIR 0
 #endif
+#ifndef V9_UBMEM_SINGLE_PLAN
+#define V9_UBMEM_SINGLE_PLAN 0
+#endif
+#ifndef V9_STAGED_OUTPUTS
+#define V9_STAGED_OUTPUTS 0
+#endif
+static_assert(V9_STAGED_OUTPUTS==0 || V9_STAGED_OUTPUTS==1,"Staged outputs must be boolean");
+static_assert(V9_UBMEM_SINGLE_PLAN==0 || V9_UBMEM_SINGLE_PLAN==1,"Single planner must be boolean");
 static_assert(V9_UBMEM_ORDERED_PAIR==0 ||
               (V9_UBMEM_ORDERED_PAIR==1 && V9_UBMEM_GROUPED_COPY && TOKEN_BYTES==2624),
               "Ordered pairs require paired four-layer transfers");
