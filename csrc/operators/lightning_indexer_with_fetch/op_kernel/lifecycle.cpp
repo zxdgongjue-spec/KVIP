@@ -288,6 +288,11 @@ extern "C" __global__ __aicore__ void v9_resolve_kernel(GM_ADDR bindings) {
 // Final transport consumes compact resolver ranges through native KVAF.
 // Submit disjoint destinations first; join prefetch before overwriting its slots.
 #if defined(__CCE_AICORE__)
+#include "parallel_final.h"
+extern "C" __global__ __aicore__ void v9_parallel_fetch_kernel(GM_ADDR bindings) {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV { ParallelFinalGet(GetContext(bindings),GetBlockIdx()); }
+}
 __aicore__ inline void FinishFetch(GM_ADDR bindings, GM_ADDR update) {
     auto runtimeShape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(reinterpret_cast<__gm__ uint64_t*>(bindings)[14]));
     const uint32_t rt_batch = runtimeShape.batch;
@@ -299,6 +304,12 @@ __aicore__ inline void FinishFetch(GM_ADDR bindings, GM_ADDR update) {
     auto ctx=GetContext(bindings);
     auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
     auto info=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
+#if V9_URMA_PARALLEL_FINAL
+    // The prefetch join ran on a different AIV invocation. Its row/error and
+    // pending writes must be acquired before reducing the final worker posts.
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),64);
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->pending),sizeof(row->pending));
+#endif
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),kRowStatusWords*sizeof(uint32_t));
     uint32_t updateError=0;
     if(update) {
@@ -318,6 +329,21 @@ __aicore__ inline void FinishFetch(GM_ADDR bindings, GM_ADDR update) {
     uint64_t error=info[0] ? kvaf_device::kInvalidArgs : row->error;
     uint32_t completed=0,total=0,deferred=0;
     uint64_t lastHead=0,lastCq=0;
+#if V9_URMA_PARALLEL_FINAL
+    // The separate parallel kernel joined every worker's native Get. This
+    // reducer never reuses its queues or submits a second copy of the range.
+    for(uint32_t w=0;w<rt_finalWorkers;++w) {
+        auto post=FinalPostAt(rt_finalPostOffset,ctx,b*rt_finalWorkers+w);
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
+        auto workerArgs=GetArgs(ctx,FinalQueue(rt_batch,rt_finalWorkers,b,w));
+        auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(workerArgs.queue_state);
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
+        total+=post->count;completed+=post->head;deferred+=post->deferred!=0;
+        error|=post->error;
+        if(post->pending || post->deferred || post->nonconflicting>post->count)error|=kvaf_device::kInvalidArgs;
+        lastHead=queue->sq_producer_index;lastCq=queue->cq_consumer_index;
+    }
+#else
     for(uint32_t phase=0;phase<2;++phase) {
       if(phase==1) {
           CompletePrefetch(ctx,b);
@@ -363,6 +389,7 @@ __aicore__ inline void FinishFetch(GM_ADDR bindings, GM_ADDR update) {
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
         }
     }
+#endif
     if(row->pending || total!=info[1])error|=kvaf_device::kInvalidArgs;
     info[0]|=uint32_t(error);info[3]=deferred?1:0;info[4]=completed;
     if(!error) {

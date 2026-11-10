@@ -11,6 +11,9 @@ ENTRY(li,shape->liCores)
 ENTRY(wait,shape->batch)
 ENTRY(resolve,shape->finalCores)
 ENTRY(fetch,shape->batch)
+#if V9_URMA_PARALLEL_FINAL
+ENTRY(parallel_fetch,shape->finalCores)
+#endif
 ENTRY(probe,shape->serviceLanes)
 extern "C" uint32_t v9_li_cores(const rotating::RuntimeShape* shape) { return shape->liCores; }
 extern "C" uint32_t v9_batch(const rotating::RuntimeShape* shape) { return shape->batch; }
@@ -27,6 +30,7 @@ extern "C" uint32_t v9_final_workers(const rotating::RuntimeShape* shape) { retu
 extern "C" uint32_t v9_final_owner_bytes(const rotating::RuntimeShape* shape) { return shape->finalOwnerBytes; }
 extern "C" uint32_t v9_final_replicated(const rotating::RuntimeShape* shape) { return 1; }
 extern "C" uint32_t v9_token_bytes(const rotating::RuntimeShape* shape) { return shape->tokenBytes; }
+extern "C" uint32_t v9_parallel_final(const rotating::RuntimeShape* shape) { return V9_URMA_PARALLEL_FINAL; }
 
 #if V9_RESOLVER_COMPARE
 ENTRY(resolve_original,shape->finalCores)
@@ -73,6 +77,12 @@ extern "C" uint32_t kvip_lifetch_forward(void* bindings, void* update, void* str
     if (!result) result = v9_li(bindings, stream, shape);
     if (!result) result = v9_resolve(bindings, stream, shape);
     if (!result) result = kvop_direct_update_outputs_early(shape->batch, update, stream);
+#if V9_URMA_PARALLEL_FINAL
+    // Prefetch may target a final victim slot. Join it globally before final
+    // workers run independently, then reduce completion on the same stream.
+    if (!result) result = v9_wait(bindings, stream, shape);
+    if (!result) result = v9_parallel_fetch(bindings, stream, shape);
+#endif
     if (!result) result = aclrtlaunch_v9_fetch_update_kernel(shape->batch, stream, bindings, update);
     return result;
 }

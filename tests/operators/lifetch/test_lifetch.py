@@ -660,7 +660,7 @@ def test_native_final_phase_order_runs_production_loop(tmp_path):
 
     text = (ROOT / "csrc/operators/lightning_indexer_with_fetch/op_kernel/lifecycle.cpp").read_text()
     start = text.index("    for(uint32_t phase=0;phase<2;++phase)")
-    loop = text[start : text.index("    if(row->pending || total!=info[1])", start)]
+    loop = text[start : text.index("\n#endif\n    if(row->pending || total!=info[1])", start)]
     code = r"""
 #include <cstdint>
 #include <vector>

@@ -108,6 +108,12 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
     assert build.build_libraries(**options, compact_reserved=True) == compact
     assert build.build_libraries(**options) == current
     assert len(commands) == 10
+    parallel = build.build_libraries(**options, parallel_final=True)
+    assert parallel != current and parallel != compact
+    assert "-DURMA_PARALLEL_FINAL=1" in commands[-2]
+    assert build.build_libraries(**options, parallel_final=True) == parallel
+    assert build.build_libraries(**options) == current
+    assert len(commands) == 12
 
 
 def test_actual_operator_cmake_resolves_relocated_sources(tmp_path):

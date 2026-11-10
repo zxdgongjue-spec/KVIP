@@ -157,20 +157,43 @@ def test_tuning_keeps_snapshot_immutable_and_validates_only_known_options():
 def test_urma_tuning_has_only_real_switches_and_fixed_inactive_gate():
     geometry = dict(prefetch_limit=512, window_limit=64, requested_windows=8)
     overrides = dict(compact_reserved=True, prefetch_limit=256, window_limit=32)
-    assert fusion_tuning(geometry, "urma", overrides) == dict(overrides, skip_inactive=True)
+    assert fusion_tuning(geometry, "urma", overrides) == dict(overrides, skip_inactive=True, parallel_final=False)
+    assert fusion_tuning(geometry, "urma", {"parallel_final": True})["parallel_final"] is True
     assert fusion_tuning(geometry, "ubmem", {"grouped_copy": True})["grouped_copy"] is True
     for transport, invalid in (
         ("urma", {"grouped_copy": False}),
         ("urma", {"skip_inactive": True}),
         ("ubmem", {"grouped_copy": 1}),
         ("urma", {"prefetch_limit": True}),
+        ("urma", {"parallel_final": 1}),
+        ("ubmem", {"parallel_final": True}),
         ("urma", []),
     ):
         with pytest.raises(ValueError):
             fusion_tuning(geometry, transport, invalid)
 
 
-def test_urma_factory_passes_compact_switch_to_actual_build(monkeypatch, tmp_path):
+def test_parallel_final_stages_join_prefetch_then_get_then_reduce():
+    calls = []
+    library = Library(calls)
+    rotating = SimpleNamespace(
+        library=library, bindings=SimpleNamespace(data_ptr=lambda: 11), shape_pointer=44, parallel_final=True
+    )
+    update = SimpleNamespace(library=library, bindings=SimpleNamespace(data_ptr=lambda: 22))
+    lease = SimpleNamespace(check_stream=lambda: SimpleNamespace(npu_stream=33))
+    stages = fused_stages("urma", rotating, update, lease, 16)
+    assert [name for name, _ in stages][-3:] == ["prefetch_completion", "parallel_final_get", "final_completion"]
+    for _, launch in stages:
+        launch()
+    assert calls[-3:] == [
+        ("v9_wait", (11, 33, 44)),
+        ("v9_parallel_fetch", (11, 33, 44)),
+        ("aclrtlaunch_v9_fetch_update_kernel", (16, 33, 11, 22)),
+    ]
+
+
+@pytest.mark.parametrize("parallel_final", (False, True))
+def test_urma_factory_passes_compact_switch_to_actual_build(monkeypatch, tmp_path, parallel_final):
     from kvip.diagnostics import fused_replay
     from kvip.runtime import build
 
@@ -196,6 +219,7 @@ def test_urma_factory_passes_compact_switch_to_actual_build(monkeypatch, tmp_pat
 
     def build_libraries(**kwargs):
         assert kwargs["compact_reserved"] is True
+        assert kwargs["parallel_final"] is parallel_final
         raise ReachedBuild
 
     monkeypatch.setattr(build, "build_libraries", build_libraries)
@@ -213,7 +237,7 @@ def test_urma_factory_passes_compact_switch_to_actual_build(monkeypatch, tmp_pat
             tmp_path,
             32,
             transport="urma",
-            tuning={"compact_reserved": True},
+            tuning={"compact_reserved": True, "parallel_final": parallel_final},
         )
 
 

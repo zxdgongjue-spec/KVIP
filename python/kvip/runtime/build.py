@@ -37,10 +37,12 @@ def build_failure(log, stage, returncode):
     )
 
 
-def build_libraries(*, cache_dir, cann, headers, soc, compact_reserved=False):
+def build_libraries(*, cache_dir, cann, headers, soc, compact_reserved=False, parallel_final=False):
     """Build one shape-independent binary per source/toolchain/SoC."""
     if type(compact_reserved) is not bool:
         raise ValueError("compact_reserved must be a boolean")
+    if type(parallel_final) is not bool:
+        raise ValueError("parallel_final must be a boolean")
     root = Path(__file__).resolve().parents[3] / "csrc/operators"
     options = dict(
         RUN_MODE="npu",
@@ -49,6 +51,7 @@ def build_libraries(*, cache_dir, cann, headers, soc, compact_reserved=False):
         SOC_VERSION=soc,
         RESOLVER_COMPARE=0,
         COMPACT_RESERVED=int(compact_reserved),
+        URMA_PARALLEL_FINAL=int(parallel_final),
     )
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     for relative in (

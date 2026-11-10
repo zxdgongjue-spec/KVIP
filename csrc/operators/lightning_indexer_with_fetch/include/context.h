@@ -2,6 +2,10 @@
 #include <stdint.h>
 #include "batch_get_abi.h"
 #include "runtime_shape.h"
+#ifndef V9_URMA_PARALLEL_FINAL
+#define V9_URMA_PARALLEL_FINAL 0
+#endif
+static_assert(V9_URMA_PARALLEL_FINAL==0 || V9_URMA_PARALLEL_FINAL==1,"Parallel final Get must be 0 or 1");
 namespace rotating {
 constexpr uint32_t kTop=2048, kSlots=8192, kMaxRounds=32, kRowStatusWords=32;
 constexpr bool kFinalReplicated=true;

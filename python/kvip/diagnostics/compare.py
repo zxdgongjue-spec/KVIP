@@ -26,6 +26,11 @@ def arguments(argv=None):
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--stage-iterations", type=int, default=3)
+    parser.add_argument(
+        "--split-index-stages",
+        action="store_true",
+        help="Split UBmem fused completion/plan, output adaptation and Index apply diagnostics",
+    )
     parser.add_argument("--ubmem-serial-workers", type=int, default=32)
     parser.add_argument(
         "--urma-serial-post-size",
@@ -141,6 +146,8 @@ def command(args, transport, mode, serial_workers=None):
         if transport == "urma":
             values += ["--urma-serial-post-size", str(getattr(args, "urma_serial_post_size", 128))]
     else:
+        if transport == "ubmem" and getattr(args, "split_index_stages", False):
+            values.append("--split-index-stages")
         tuning = getattr(args, transport + "_fused_tuning", None)
         if tuning is not None:
             values += ["--fused-tuning", json.dumps(tuning, sort_keys=True)]

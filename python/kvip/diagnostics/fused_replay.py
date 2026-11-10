@@ -29,7 +29,7 @@ def _stage(library, symbol, argtypes, arguments, lease):
 
 
 def fused_stages(transport, rotating, update, lease, batch, *, split_index_stages=False):
-    """Actual backend boundaries; URMA Index work overlaps outstanding Get DMA."""
+    """Actual backend launch order, including optional parallel final Get."""
     pointer, u32 = ctypes.c_void_p, ctypes.c_uint32
     library = rotating.library
     if transport == "ubmem":
@@ -99,27 +99,42 @@ def fused_stages(transport, rotating, update, lease, batch, *, split_index_stage
         )
         for name, symbol in (("init", "v9_init"), ("li_with_prefetch", "v9_li"), ("resolve_final_plan", "v9_resolve"))
     ]
-    result.extend(
+    result.append(
         (
-            (
-                "index_update_before_final_get",
-                _stage(
-                    update.library,
-                    "kvop_direct_update_outputs_early",
-                    [u32, pointer, pointer],
-                    lambda stream: (batch, update.bindings.data_ptr(), stream),
-                    lease,
-                ),
+            "index_update_before_final_get",
+            _stage(
+                update.library,
+                "kvop_direct_update_outputs_early",
+                [u32, pointer, pointer],
+                lambda stream: (batch, update.bindings.data_ptr(), stream),
+                lease,
             ),
+        )
+    )
+    parallel_final = getattr(rotating, "parallel_final", False)
+    if parallel_final:
+        result.extend(
             (
-                "final_get_and_completion",
+                name,
                 _stage(
                     library,
-                    "aclrtlaunch_v9_fetch_update_kernel",
-                    [u32, pointer, pointer, pointer],
-                    lambda stream: (batch, stream, rotating.bindings.data_ptr(), update.bindings.data_ptr()),
+                    symbol,
+                    [pointer, pointer, pointer],
+                    lambda stream: (rotating.bindings.data_ptr(), stream, rotating.shape_pointer),
                     lease,
                 ),
+            )
+            for name, symbol in (("prefetch_completion", "v9_wait"), ("parallel_final_get", "v9_parallel_fetch"))
+        )
+    result.append(
+        (
+            "final_completion" if parallel_final else "final_get_and_completion",
+            _stage(
+                library,
+                "aclrtlaunch_v9_fetch_update_kernel",
+                [u32, pointer, pointer, pointer],
+                lambda stream: (batch, stream, rotating.bindings.data_ptr(), update.bindings.data_ptr()),
+                lease,
             ),
         )
     )
@@ -146,6 +161,8 @@ def validate_fused_tuning(overrides, transport):
     booleans = {"compact_reserved"}
     if transport == "ubmem":
         booleans |= {"parallel_init", "balanced_index", "skip_inactive", "grouped_copy", "tagged_map"}
+    else:
+        booleans.add("parallel_final")
     integers = {"prefetch_limit", "window_limit"}
     if transport == "ubmem":
         integers.add("final_copy_stages")
@@ -188,6 +205,7 @@ def fusion_tuning(geometry, transport, overrides=None):
     if transport == "urma":
         # The URMA LI has an unconditional inactive-row gate, not a build knob.
         values["skip_inactive"] = True
+        values.setdefault("parallel_final", False)
     prefetch_budget(values["prefetch_limit"], values["window_limit"], geometry["requested_windows"])
     return values
 
@@ -274,7 +292,12 @@ def create_fused(
         # includes the selected KVAF headers/toolchain, so bundles stay isolated.
         cache = Path(__file__).resolve().parents[3] / "build/lifetch"
         library, update_library = build_libraries(
-            cache_dir=cache, cann=cann, headers=headers, soc=soc, compact_reserved=effective["compact_reserved"]
+            cache_dir=cache,
+            cann=cann,
+            headers=headers,
+            soc=soc,
+            compact_reserved=effective["compact_reserved"],
+            parallel_final=effective["parallel_final"],
         )
         workspace = LIFetchWorkspace(torch, **common_workspace)
     storage = IndexCacheStorage(torch, geometry["owners"], h, r, device)
@@ -332,6 +355,7 @@ def create_fused(
             intermediate_fetches=geometry["requested_windows"],
             token_bytes=geometry["token_bytes"],
             scratch=workspace.scratch,
+            parallel_final=effective["parallel_final"],
             **common,
         )
         rotating.output = output

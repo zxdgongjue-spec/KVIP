@@ -139,12 +139,14 @@ def test_command_never_loads_two_transports_in_one_process(tmp_path):
         result_dir=tmp_path,
         ubmem_serial_workers=32,
         urma_serial_workers=2,
+        split_index_stages=True,
     )
     for transport, mode in CASES:
         argv, output = command(args, transport, mode)
         assert argv[argv.index("--build-dir") + 1] == f"/{transport}/build"
         assert ("--kvaf-server" in argv) == (transport == "urma")
         assert ("--serial-workers" in argv) == (mode == "serial")
+        assert ("--split-index-stages" in argv) == ((transport, mode) == ("ubmem", "fused"))
         assert output.name == f"{transport}-{mode}.json"
 
 
