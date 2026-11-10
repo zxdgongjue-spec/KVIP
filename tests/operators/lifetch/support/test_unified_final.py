@@ -67,3 +67,29 @@ int main() {
     exe = tmp_path / "final"
     subprocess.run(["c++", "-std=c++17", str(cpp), "-o", str(exe)], check=True)
     subprocess.run([str(exe)], check=True)
+
+
+def test_full_trace_accounts_all_li_kernels_and_combined_fetch_update():
+    from device_trace import account
+
+    events = [dict(name="replay", ph="X", ts="1000", dur=100)]
+    kernels = [
+        ("v9_init_kernel_0", 1, 2),
+        ("v9_li_kernel_0", 4, 10),
+        ("v9_li_kernel_1_0", 14, 2),
+        ("v9_li_kernel_2", 16, 8),
+        ("v9_li_kernel_3", 24, 2),
+        ("v9_resolve_kernel_0", 26, 4),
+        ("kvop_direct_update_outputs_early_kernel_0", 30, 3),
+        ("kvop_direct_apply_owned_kernel_0", 33, 5),
+        ("v9_fetch_update_kernel_0", 38, 7),
+    ]
+    events.extend(dict(name=name, ph="X", cat="kernel", ts=str(1000 + start), dur=duration)
+                  for name, start, duration in kernels)
+    result = account(events, "replay", 50, full=True)
+    assert result["stages_us"] == dict(init=2, li=22, resolve=4, publish=3, apply=5, fetch=7)
+    assert result["inter_kernel_gap_us"] == 1
+    assert result["boundary_residual_us"] == 6
+    assert sum(result["stages_us"].values()) + result["inter_kernel_gap_us"] + result["boundary_residual_us"] == 50
+    missing = account(events[:-1], "replay", 50, full=True)
+    assert "error" in missing and missing["found"]["fetch"] == 0

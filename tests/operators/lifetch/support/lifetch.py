@@ -293,6 +293,7 @@ def run_device(
         state["native_misses"] = counts[:-1]
 
     core_trace = {}
+    full_trace = {}
     read_samples = {}
 
     def measure(call, reset, check, trace_core=False, read_label=None):
@@ -341,6 +342,9 @@ def run_device(
             save(args.comparison_output, state["ids"], state["slots"], owner.output.cpu().numpy(),
                  rotating.mapping.cpu().numpy(), rotating.lru_slots.cpu().numpy(),
                  rotating.rows.cpu().numpy().view(np.uint32), owner.remote_token_addresses.cpu().numpy())
+        if read_label == "prototype_with_update" and args.trace_rounds:
+            progress(folder.parent, f"BS={b}: full graph profiler ({args.trace_rounds} replays); logs={folder}")
+            full_trace.update(collect_core(torch, rotating, graph, reset, check, args.trace_rounds, folder, full=True))
         if trace_core and args.trace_rounds:
             progress(folder.parent, f"BS={b}: core graph profiler ({args.trace_rounds} replays); logs={folder}")
             core_trace.update(collect_core(torch, rotating, graph, reset, check, args.trace_rounds, folder))
@@ -669,6 +673,7 @@ def run_device(
         status="pass",
         timing=timings,
         core_trace=core_trace,
+        full_trace=full_trace,
         read_samples=read_samples,
         sfa=sfa,
         stateful_rounds=3,
