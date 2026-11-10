@@ -30,7 +30,8 @@ def seed_native_bitmap(torch, native, row, bitmap):
 
 
 def run(args, run_dir):
-    source = SOURCE.with_name("lightning_indexer_with_fetch_early") if args.early_fetch else SOURCE
+    source = (SOURCE.with_name("lightning_indexer_with_fetch_early_safe") if args.avoid_prefetch_slots
+              else SOURCE.with_name("lightning_indexer_with_fetch_early") if args.early_fetch else SOURCE)
     from attention import check_sfa
     from contract_payload import payload
     from kvip.operators.lifetch import binding as launch_module

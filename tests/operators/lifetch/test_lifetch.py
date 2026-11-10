@@ -22,6 +22,7 @@ def arguments(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--worker-run", type=Path, help=argparse.SUPPRESS)
     p.add_argument("--early-fetch", action="store_true")
+    p.add_argument("--avoid-prefetch-slots", action="store_true")
     p.add_argument("--timeout-seconds", type=int, default=300)
     p.add_argument("--device", type=int, default=0)
     p.add_argument("--kvaf-server", required=True)
@@ -136,6 +137,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--transport', required=True, choices=('urma', 'ubmem'))
     p.add_argument('--early-fetch', action='store_true')
+    p.add_argument('--avoid-prefetch-slots', action='store_true')
     p.add_argument('--device', type=int, default=0)
     p.add_argument('--kvaf-server', required=True)
     p.add_argument('--kvaf-root', type=Path)
@@ -178,6 +180,8 @@ def main(argv=None):
               '--resident', str(a.resident), '--index-heads', str(a.index_heads), '--miss-percent',
               str(a.miss_percent), '--prefetch-tokens', str(a.prefetch_tokens), '--warmup', str(a.warmup),
               '--iterations', str(a.iterations)]
+    if a.avoid_prefetch_slots and not a.early_fetch:
+        p.error('--avoid-prefetch-slots requires --early-fetch')
     if a.transport == 'urma':
         command = [sys.executable, '-u', str(Path(__file__).resolve()), '--internal-urma', *common,
                    '--kvaf-root', str(kvaf_root), '--cann', a.cann, '--batches', a.batches,
@@ -185,6 +189,8 @@ def main(argv=None):
                    '--output', str(a.output), '--timeout-seconds', str(a.timeout_seconds)]
         if a.early_fetch:
             command.append('--early-fetch')
+        if a.avoid_prefetch_slots:
+            command.append('--avoid-prefetch-slots')
         if a.soc:
             command += ['--soc', a.soc]
         if a.runtime_shapes:
@@ -523,11 +529,15 @@ def test_ubmem_hot_resolver_actual_function_on_empty_and_populated_cache(tmp_pat
     _check_hot_resolver(tmp_path, "ubmem")
 
 
+def test_prefer_unoccupied_resolver_actual_function(tmp_path):
+    _check_hot_resolver(tmp_path, "early_safe")
+
+
 def _check_hot_resolver(tmp_path, transport):
     """Execute production SIMT logic serially; CANN simulator covers barriers."""
     import subprocess
 
-    operator = "lightning_indexer_with_fetch" + ("_ubmem" if transport == "ubmem" else "")
+    operator = "lightning_indexer_with_fetch" + ("_ubmem" if transport == "ubmem" else "_early_safe" if transport == "early_safe" else "")
     kernel = ROOT / "csrc/operators" / operator / "op_kernel"
     metadata = kernel / ("controller/cache_metadata.h" if transport == "ubmem" else "prefetch.h")
 
@@ -551,7 +561,7 @@ def _check_hot_resolver(tmp_path, transport):
     functions += "\n" + function(metadata, "InitializeTailMappings")
     functions += "\n" + function(ROOT / "csrc/operators/common/lifetch/resolver_candidates.h", "SparseHash")
     functions += "\ntemplate<unsigned Threads>\n" + function(
-        ROOT / "csrc/operators/common/lifetch/resident_selection.h", "ResolveResidentPlan"
+        kernel / "resident_selection.h" if transport == "early_safe" else common / "resident_selection.h", "ResolveResidentPlan"
     )
     resolve = function(ROOT / "csrc/operators/common/lifetch/resolver.h", "ReplicatedResolve")
     shared = (ROOT / "csrc/operators/common/lifetch/resolver_plan.h").read_text()
@@ -647,6 +657,19 @@ int main(){
  }
 }
 """.replace("FUNCTIONS", functions)
+    if transport == "early_safe":
+        source = source.replace(
+            "   assert(cfg[1]==0);",
+            """   assert(cfg[1]==0);
+   // The candidate prefix must use every available unoccupied LRU slot
+   // before choosing a slot whose prefetch may still be in flight.
+   bool sawOccupied=false;
+   for(unsigned i=0;i<cfg[0];++i){
+    int ordinal=reserved[slots[i]];
+    if(ordinal>=0 && unsigned(ordinal)<used)sawOccupied=true;
+    else if(ordinal>=0)assert(!sawOccupied);
+   }""",
+        )
     definitions = []
     if transport == "ubmem":
         definitions = [

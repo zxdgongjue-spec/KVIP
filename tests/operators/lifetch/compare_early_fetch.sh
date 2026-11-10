@@ -10,9 +10,10 @@ run="$repo/tests/results/early-fetch-ab/$(date +%Y%m%d_%H%M%S)_$$"
 mkdir -p "$run"
 trap 'status=$?; if (( status != 0 )); then printf "FAIL: exit=%s; logs=%s\n" "$status" "$run" | tee "$run/summary.log"; fi' EXIT
 source "$repo/scripts/env.sh"
-for variant in baseline early; do
+for variant in baseline early early-safe; do
     args=()
-    if [[ "$variant" == early ]]; then args+=(--early-fetch); fi
+    if [[ "$variant" == early* ]]; then args+=(--early-fetch); fi
+    if [[ "$variant" == early-safe ]]; then args+=(--avoid-prefetch-slots); fi
     echo "=== $variant ==="
     python "$repo/tests/operators/lifetch/test_lifetch.py" \
         --transport urma --device "$device" --kvaf-root "$kvaf" --kvaf-server "$server" \
@@ -29,8 +30,8 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 lines = ['BS16 Q4 H131072 R16384 miss10%; independent graph-event p50 and 3 profiled replays.',
-         'Early experiment moves all transport completion before Index update; not a stage-only speedup.']
-for variant in ('baseline', 'early'):
+         'Early experiments submit nonconflicting final reads before Index update; prefetch completion remains after it.']
+for variant in ('baseline', 'early', 'early-safe'):
     text = (root / f'{variant}.log').read_text()
     traces = list((root / variant).rglob('full_attribution.json'))
     match = re.search(r'prototype_with_update:([\d.]+)', text)
@@ -46,10 +47,11 @@ for variant in ('baseline', 'early'):
     lines.append(f"{variant}: graph_p50={float(match[1]):.3f} trace={row['us']:.3f} {stages} "
                  f"gap={account['inter_kernel_gap_us']:.3f} boundary={account['boundary_residual_us']:.3f} "
                  f"prefetch={row['prefetch']} final={row['final']}")
-    if variant == 'early':
+    if variant in ('early', 'early-safe'):
         detail = row.get('detail', [])
         if len(detail) != 16:
             raise SystemExit(f'early: per-request device timestamps missing: {traces[0]}')
+        lines.append(f"{variant} all requests: safe={sum(x['safe'] for x in detail)} conflict={sum(x['conflict'] for x in detail)} pending_batches={sum(x['pending'] for x in detail)}")
         early_request = max(enumerate(detail), key=lambda x: x[1]['ticks'][2] - x[1]['ticks'][0])
         final_request = max(enumerate(detail), key=lambda x: x[1]['ticks'][7] - x[1]['ticks'][3])
         early_row, final_row = early_request[1], final_request[1]
