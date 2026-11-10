@@ -7,6 +7,7 @@
 // Imported from direct_slots.h
 
 #include "simt_api/device_functions.h"
+#include "../../../common/lifetch/reserved_hot.h"
 // Adapt logical fetch slots at the transport boundary; preserve the original
 // hot-slot replacement policy; no KV payload fallback arena is allocated.
 namespace rotating {
@@ -19,7 +20,12 @@ __simt_callee__ inline uint32_t OutputStride(uint32_t rt_resident,__gm__ Context
     return ctx->outputStride ? uint32_t(ctx->outputStride) : rt_resident;
 }
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
-inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm__ Context* ctx,uint32_t b) {
+inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,
+    uint64_t reservedRow=0) {
+#if V9_COMPACT_RESERVED
+    if(reservedRow)ScatterReservedHot(reinterpret_cast<__gm__ uint32_t*>(reservedRow),
+        reinterpret_cast<const __gm__ uint32_t*>(ctx->lruSlots)+uint64_t(b)*kLruSlots,rt_resident,kLruSlots);
+#endif
     if(!threadIdx.x && ctx->changeCount) {
         asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->changeCount)+b,kLruSlots);
         asc_threadfence();

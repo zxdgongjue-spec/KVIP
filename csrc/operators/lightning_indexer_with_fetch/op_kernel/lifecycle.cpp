@@ -45,7 +45,6 @@ V9_CQ_INLINE CqDrainResult DrainCq(Access& access, uint64_t consumer,
 #include "prefetch.h"
 #include "resolver.h"
 #include "index_cache_update.h"
-#include "../../common/lifetch/reserved_hot.h"
 using namespace AscendC;
 using namespace rotating;
 // Extend fused CQ waits to 10x the native polling budget (not wall-clock time).
@@ -113,7 +112,7 @@ __aicore__ inline void FillRoundWords(uint64_t address,uint32_t words,
     }
     // Caller joins the whole fill group before reusing the shared UB value.
 }
-__aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t b) {
+__aicore__ inline uint64_t InitializeRound(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t b) {
     TPipe pipe;TBuf<TPosition::VECCALC> storage;pipe.InitBuffer(storage,4096*4);
     auto local=storage.Get<uint32_t>();
     Duplicate(local,uint32_t(0),4096);
@@ -138,6 +137,10 @@ __aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uin
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     FillRoundWords(ctx->mapping+uint64_t(b)*rt_history*4,rt_history,local);
     if(ctx->changes)FillRoundWords(ctx->changes+b*kChangeCapacity*4,kChangeCapacity,local);
+    uint64_t reservedRow=0;
+#if V9_COMPACT_RESERVED
+    reservedRow=ClearReservedHot(ctx->lruSlots,ctx->reservedHot,ctx->queryEnds,b,rt_resident,local);
+#endif
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     // Copy only the candidate prefix; resolver writes extended destinations.
     if(ctx->changeSlots) {
@@ -149,10 +152,8 @@ __aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uin
         DataCopy(target,local,kLruSlots);
         SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     }
-#if V9_COMPACT_RESERVED
-    RebuildReservedHot(ctx->lruSlots,ctx->reservedHot,ctx->queryEnds,b,rt_resident,kLruSlots,local);
-#endif
     pipe.Destroy();
+    return reservedRow;
 }
 #endif
 extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
@@ -171,7 +172,7 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
     if ASCEND_IS_AIV {
         uint32_t b=GetBlockIdx(); if(b>=rt_batch) return;
         auto ctx=GetContext(bindings);
-        InitializeRound(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b);
+        auto reservedRow=InitializeRound(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b);
         auto args=GetArgs(ctx,b*2);
         auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
         auto entity=reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(args.channel_entity);
@@ -185,7 +186,7 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
         uint64_t outputStride=ctx->outputStride ? ctx->outputStride : rt_resident;
         row->addresses=ctx->tokenAddresses ? ctx->tokenAddresses+uint64_t(owner)*ctx->addressStride*8 : a[13]+rt_batch*prefix+b*tail;
         row->output=args.output+uint64_t(owner)*outputStride*rt_tokenBytes;
-        Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},rt_history,rt_resident,ctx,b);
+        Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},rt_history,rt_resident,ctx,b,reservedRow);
         row->initialHead=queue->sq_producer_index;
         row->limit=kSlots;
         row->prefetchLimit=ctx->prefetchLimit;

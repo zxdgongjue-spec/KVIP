@@ -74,7 +74,7 @@ def print_summary(report, output=None):
     def time(value):
         return "-" if value is None else f"{value:.3f}"
 
-    print("case  full_mean_us  full_p50_us  init_diag_us  index_diag_us  prefetch  final  unused  read_bytes")
+    print("case  device_mean_us  device_p50_us  init_diag_us  index_diag_us  prefetch  final  unused  read_bytes")
     for row in report["summary"]:
         print(
             f"{row['name']}  {time(row['full_graph_mean_us'])}  {time(row['full_graph_p50_us'])}  "
@@ -88,6 +88,20 @@ def print_summary(report, output=None):
         if details:
             print(f"{case['name']} diagnostic p50 us: " + ", ".join(details))
     print("Init/index are separate instrumented diagnostics; they are not additive components of full-graph latency.")
+    calls = [(case["name"], case["candidate_call"]) for case in report.get("cases", []) if "candidate_call" in case]
+    if calls:
+        print("case  group_call_mean_us  group_call_p50_us  cpu_prepare_p50_us  h2d_diag_p50_us  h2d_bytes")
+        for name, call in calls:
+            payload = call["payload"]
+            size = payload["candidate_h2d_bytes"] + payload["dense_protection_h2d_bytes"]
+            print(
+                f"{name}  {time(call['wall']['mean_us'])}  {time(call['wall']['p50_us'])}  "
+                f"{time(call['cpu_prepare']['p50_us'])}  "
+                f"{time(call.get('h2d_diagnostic', {}).get('p50_us'))}  {size}"
+            )
+        print(
+            "Group call starts with captured candidates ready; excludes full-step/shared preparation. Do not multiply by 21."
+        )
     if output is not None:
         print(f"Result JSON: {output.resolve()}")
 
@@ -139,7 +153,9 @@ def run_ablation(args, archive, retained):
         result["interpretation"] += (
             " Small batches are explicitly derived padding views of captured requests, not newly captured service waves. "
             "Both variants disable the regressing parallel init and retain balanced Index + half prefetch. "
-            "Device inverse-map construction is timed; CPU prepare and H2D savings are not measured here."
+            "Device inverse-map construction is timed in the graph. "
+            "Optional candidate_call separately measures one group's candidate staging/inverse map/H2D to completion; "
+            "it does not reconstruct the full service step."
         )
     print_summary(result)
     return result

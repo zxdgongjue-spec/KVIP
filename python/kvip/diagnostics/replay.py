@@ -56,6 +56,11 @@ def arguments(argv=None):
         help="Derived active request counts for service-ablation (default: 1 and captured-batch)",
     )
     parser.add_argument(
+        "--measure-call-preparation",
+        action="store_true",
+        help="Also time one group's captured-candidate CPU staging, H2D and fusion completion (not the full service step)",
+    )
+    parser.add_argument(
         "--stage-iterations",
         type=int,
         default=0,
@@ -69,6 +74,8 @@ def arguments(argv=None):
         parser.error("device/warmup must be nonnegative and iterations positive")
     if args.stage_iterations < 0:
         parser.error("stage-iterations must be nonnegative")
+    if args.measure_call_preparation and (args.inspect or args.mode != "fused"):
+        parser.error("--measure-call-preparation requires fused device replay")
     if (args.ubmem_ablation or args.service_ablation or args.split_index_stages) and (
         args.inspect or args.transport != "ubmem" or args.mode != "fused"
     ):

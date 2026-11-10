@@ -16,7 +16,7 @@ from kvip.diagnostics.snapshot import input_tensors, persistent_tensors, post_st
 def statistics(samples):
     values = np.asarray(samples, dtype=np.float64)
     if values.ndim != 1 or not len(values) or not np.all(np.isfinite(values)) or np.any(values <= 0):
-        raise ValueError("Device timing samples must be finite positive microseconds")
+        raise ValueError("Timing samples must be finite positive microseconds")
     return dict(
         count=len(values),
         mean_us=float(values.mean()),
@@ -184,6 +184,10 @@ def measure(torch, kvaf, stream, bundle, args, retained):
             samples.append(float(elapsed))
             reads.append(counts)
     result = dict(timing=statistics(samples), reads_samples=reads)
+    if getattr(args, "measure_call_preparation", False):
+        from kvip.diagnostics.call_preparation import measure_candidate_call
+
+        result["candidate_call"] = measure_candidate_call(torch, stream, bundle, args, lambda: replay(graph), retained)
     if args.stage_iterations:
         # Capture all stages in order without resetting in between. URMA can
         # leave DMA in flight until a later stage consumes its CQ completion.
@@ -312,6 +316,10 @@ def measure_case(args, archive, context, retained):
         )
         case_retained["bundle"] = bundle
         prepare_fused_state(bundle, archive, restored, torch, device, args.transport)
+        if getattr(args, "measure_call_preparation", False):
+            from kvip.diagnostics.call_preparation import CandidatePreparation
+
+            bundle.candidate_preparation = CandidatePreparation(torch, archive, bundle)
     else:
         from kvip.diagnostics.serial_replay import create_serial
 
@@ -358,6 +366,7 @@ def measure_case(args, archive, context, retained):
         fidelity=archive.manifest["fidelity"],
         exclusions="Model, input preparation/import/packing, DDR Put, state restoration and correctness readbacks",
         interpretation="Isolated four-layer group graph latency; not DP service latency or TPOT",
+        timing_boundary="timing contains device graph only; optional candidate_call reports a separate host-to-output boundary",
         graph_backend="torch.npu.NPUGraph" if args.mode == "serial" else "kvaf.AclGraph",
         selection_comparison=bundle.selection_comparison,
         representation=(
@@ -374,6 +383,7 @@ def measure_case(args, archive, context, retained):
             compact_lru_bytes_per_group=int(archive.array("pre.lru_slots").nbytes),
             reconstruction_checked=bool(bundle.tuning.get("compact_reserved", False)),
             h2d_in_timing=False,
+            h2d_in_candidate_call="candidate_call" in results,
             note="Compact LRU upload already exists in serving; only dense reserved-hot H2D is eliminated.",
         )
     # measure() reset every full/stage graph first. A failing reset or lease

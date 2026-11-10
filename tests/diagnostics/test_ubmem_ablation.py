@@ -278,7 +278,7 @@ def test_service_matrix_reuses_ddr_and_pairs_identical_derived_inputs(native_moc
         assert tuning["prefetch_limit"] == 256 and tuning["window_limit"] == 32
         assert tuning["skip_inactive"] is (not case["name"].endswith("dense_baseline"))
         assert tuning["compact_reserved"] is case["name"].endswith("compact_skip")
-    assert "not measured" in report["interpretation"]
+    assert "not reconstruct the full service step" in report["interpretation"]
 
 
 def test_service_matrix_rejects_invalid_counts_before_allocating(native_mocks):
@@ -299,6 +299,94 @@ def test_cli_service_ablation_requires_ubmem_fused_and_an_output(tmp_path):
     for extra in (["--service-ablation"], ["--active-batches", "1"], ["--service-ablation", "--mode", "serial"]):
         with pytest.raises(SystemExit):
             arguments(common + extra)
+
+
+def test_cli_call_preparation_accepts_fused_device_paths_and_rejects_inspect_serial(tmp_path):
+    from kvip.diagnostics.replay import arguments
+
+    common = ["--snapshot", str(tmp_path), "--build-dir", str(tmp_path), "--soc", "Ascend950DT_9582"]
+    assert not arguments(common).measure_call_preparation
+    assert arguments(common + ["--measure-call-preparation"]).measure_call_preparation
+    urma = arguments(common + ["--transport", "urma", "--kvaf-server", "127.0.0.1:28880", "--measure-call-preparation"])
+    assert urma.measure_call_preparation and urma.stage_iterations == 0
+    for extra in (["--inspect"], ["--mode", "serial"]):
+        with pytest.raises(SystemExit):
+            arguments(common + extra + ["--measure-call-preparation"])
+    matrix = arguments(
+        common
+        + [
+            "--service-ablation",
+            "--measure-call-preparation",
+            "--stage-iterations",
+            "2",
+            "--output",
+            str(tmp_path / "x.json"),
+        ]
+    )
+    assert matrix.service_ablation and matrix.measure_call_preparation and matrix.stage_iterations == 2
+
+
+def test_summary_keeps_call_wall_cpu_and_optional_h2d_separate(capsys):
+    calls = []
+    for name, dense, h2d in (("dense", 1048576, 8.0), ("compact", 0, None)):
+        call = dict(
+            wall=dict(mean_us=120.0, p50_us=115.0),
+            cpu_prepare=dict(p50_us=9.0),
+            payload=dict(candidate_h2d_bytes=131072, dense_protection_h2d_bytes=dense),
+        )
+        if h2d is not None:
+            call["h2d_diagnostic"] = dict(p50_us=h2d)
+        calls.append(dict(name=name, candidate_call=call))
+    ubmem_ablation.print_summary(dict(summary=[], cases=calls))
+    text = capsys.readouterr().out
+    assert "group_call_mean_us" in text and "h2d_diag_p50_us" in text
+    assert "dense  120.000  115.000  9.000  8.000  1179648" in text
+    assert "compact  120.000  115.000  9.000  -  131072" in text
+    assert "Do not multiply by 21" in text and "excludes full-step/shared preparation" in text
+
+
+@pytest.mark.parametrize("fail", (False, True))
+def test_call_preparation_integration_runs_before_graph_release_and_reports_distinct_scope(
+    native_mocks, monkeypatch, fail
+):
+    from kvip.diagnostics import call_preparation
+
+    mock = native_mocks
+    mock.args.measure_call_preparation = True
+    preparation = object()
+
+    def create_preparation(torch, archive, bundle):
+        assert archive is mock.archive
+        mock.events.append("candidate_prepare_setup")
+        return preparation
+
+    def measure_call(torch, stream, bundle, args, replay, retained):
+        assert bundle.candidate_preparation is preparation
+        assert retained["bundle"] is bundle and retained["graphs"]
+        assert "graph_reset" not in mock.events and not mock.leases[0].closed
+        mock.events.append("candidate_call")
+        replay()
+        if fail:
+            raise RuntimeError("candidate call failed")
+        return dict(scope="single_group_candidate_ready_to_output_ready", wall=dict(p50_us=123.0))
+
+    monkeypatch.setattr(call_preparation, "CandidatePreparation", create_preparation)
+    monkeypatch.setattr(call_preparation, "measure_candidate_call", measure_call)
+    retained = {}
+    if fail:
+        with pytest.raises(RuntimeError, match="candidate call failed"):
+            replay_measure.run(mock.args, mock.archive, retained)
+        assert retained["active_case"]["bundle"].candidate_preparation is preparation
+        assert retained["active_case"]["graphs"] and "runtime" in retained
+        assert "graph_reset" not in mock.events and "release_table" not in mock.events and "shutdown" not in mock.events
+        return
+    report = replay_measure.run(mock.args, mock.archive, retained)
+    assert mock.events.index("candidate_prepare_setup") < mock.events.index("candidate_call")
+    assert mock.events.index("candidate_call") < mock.events.index("graph_reset") < mock.events.index("lease_close")
+    assert report["timing"]["p50_us"] == 1000.0  # Mock device event interval, separate from mock call wall.
+    assert report["candidate_call"]["wall"]["p50_us"] == 123.0
+    assert report["reserved_metadata"]["h2d_in_timing"] is False
+    assert report["reserved_metadata"]["h2d_in_candidate_call"] is True
 
 
 @pytest.mark.parametrize("transport,mode", (("urma", "fused"), ("ubmem", "serial")))

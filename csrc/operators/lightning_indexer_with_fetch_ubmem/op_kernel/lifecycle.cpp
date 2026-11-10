@@ -4,7 +4,6 @@
 #include "prefetch.h"
 #include "resolver.h"
 #include "init_partition.h"
-#include "../../common/lifetch/reserved_hot.h"
 using namespace AscendC;
 using namespace rotating;
 namespace {
@@ -56,19 +55,24 @@ __aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
     FillWords(ctx->mapping+uint64_t(b)*SIM_HISTORY*4,SIM_HISTORY,local);
     FillWords(ctx->selected+uint64_t(b)*kSlots*4,kSlots,local);
     if(ctx->changes)FillWords(ctx->changes+b*kChangeCapacity*4,kChangeCapacity,local);
+    uint64_t reservedRow=0;
+#if V9_COMPACT_RESERVED
+    reservedRow=ClearReservedHot(ctx->lruSlots,ctx->reservedHot,ctx->queryEnds,b,SIM_RESIDENT,local);
+#endif
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     CopyInitialLruSlots(ctx,b,local);
-    Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},SIM_HISTORY,SIM_RESIDENT,ctx,b);
+    Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},SIM_HISTORY,SIM_RESIDENT,ctx,b,reservedRow);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-#if V9_COMPACT_RESERVED
-    RebuildReservedHot(ctx->lruSlots,ctx->reservedHot,ctx->queryEnds,b,SIM_RESIDENT,kLruSlots,local);
-#endif
     pipe.Destroy();
 }
 #if V9_UBMEM_PARALLEL_INIT
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void InitializeTailShard(__gm__ Context* ctx,uint32_t b,uint32_t part,
-    uint32_t first,uint32_t last) {
+    uint32_t first,uint32_t last,uint64_t reservedRow) {
+#if V9_COMPACT_RESERVED
+    if(!part && reservedRow)ScatterReservedHot(reinterpret_cast<__gm__ uint32_t*>(reservedRow),
+        reinterpret_cast<const __gm__ uint32_t*>(ctx->lruSlots)+uint64_t(b)*kLruSlots,SIM_RESIDENT,kLruSlots);
+#endif
     if(!part && !threadIdx.x && ctx->changeCount)
         asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->changeCount)+b,kLruSlots);
     if(ctx->tailBounds) {
@@ -109,15 +113,16 @@ __aicore__ inline void InitializeRoundParallel(__gm__ Context* ctx,uint32_t b,ui
     FillWords(ctx->mapping+(uint64_t(b)*SIM_HISTORY+map.begin)*4,map.end-map.begin,local);
     FillWords(ctx->selected+(uint64_t(b)*kSlots+selected.begin)*4,selected.end-selected.begin,local);
     if(ctx->changes)FillWords(ctx->changes+(uint64_t(b)*kChangeCapacity+changes.begin)*4,changes.end-changes.begin,local);
+    uint64_t reservedRow=0;
+#if V9_COMPACT_RESERVED
+    if(!part)reservedRow=ClearReservedHot(ctx->lruSlots,ctx->reservedHot,ctx->queryEnds,b,SIM_RESIDENT,local);
+#endif
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     if(!part)CopyInitialLruSlots(ctx,b,local);
     // Each shard installs ABC only after its own sentinel DMA has completed;
     // no shard can clear or scalar-write another shard's cache line.
-    Simt::VF_CALL<InitializeTailShard>(Simt::Dim3{256,1,1},ctx,b,part,map.begin,map.end);
+    Simt::VF_CALL<InitializeTailShard>(Simt::Dim3{256,1,1},ctx,b,part,map.begin,map.end,reservedRow);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-#if V9_COMPACT_RESERVED
-    if(!part)RebuildReservedHot(ctx->lruSlots,ctx->reservedHot,ctx->queryEnds,b,SIM_RESIDENT,kLruSlots,local);
-#endif
     pipe.Destroy();
 }
 #endif

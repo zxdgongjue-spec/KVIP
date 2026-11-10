@@ -470,6 +470,10 @@ the candidate upload already existed. No extra kernel or CPU readback is added.
 Both repository revisions must be updated together. A compact-mode capture
 labels the inverse map as derived from its saved LRU input and verifies the
 device result after the call, rather than saving the preceding round's map.
+The reconstruction reuses init's existing all-ones scratch and DMA completion
+barrier, then scatters inside the existing ABC-tail VF call. It avoids a second
+16 KiB scratch fill and standalone VF launch while retaining clear-before-scatter
+ordering and a single writer per protection row.
 
 To validate these changes from a verified B16 snapshot without a model service:
 
@@ -494,7 +498,50 @@ timing; correctness checks require the kernel to rebuild the active rows.
 
 Compare B1 dense vs skip-only for padded-LI savings, and skip-only vs compact
 for inverse-map construction overhead. The full B16 comparison checks the
-unchanged active workload. H2D/CPU preparation is outside this snapshot's timing
-boundary; these results do not measure the service-level benefit of deleting
-the dense upload. The original archive is never rewritten, and JSON provenance
-records the derived selection and original manifest hash.
+unchanged active workload. The original `timing` boundary remains device-only.
+The original archive is never rewritten, and JSON provenance records the derived
+selection and original manifest hash.
+
+To include the reproducible host preparation in the same comparison, add
+`--measure-call-preparation`. For just the captured B16 workload, use:
+
+```bash
+python -B -m kvip.diagnostics.replay \
+  --snapshot "$snapshot" --build-dir "$ubmem_build" \
+  --transport ubmem --mode fused --device 0 --soc Ascend950DT_9582 \
+  --service-ablation --active-batches 16 --measure-call-preparation \
+  --split-index-stages --warmup 2 --iterations 10 --stage-iterations 3 \
+  --output "$new_result_json"
+```
+
+The two cases share one arena import and the same real queries, DDR/hot state,
+balanced Index movement and 256/32 prefetch budgets. They compare legacy dense
+protection metadata against device reconstruction. Both retain full correctness
+checks. The result separates these boundaries:
+
+| Result | Measured interval |
+| --- | --- |
+| `timing` | Inputs already on device through full fusion graph completion, including required init reconstruction |
+| `candidate_call.wall` | Captured candidate lists ready on CPU, staging copy and legacy inverse-map construction, necessary H2D, graph submission and synchronized completion |
+| `candidate_call.cpu_prepare` | CPU staging and inverse-map construction within the wall-time pass |
+| `candidate_call.h2d_diagnostic` | Separate event-instrumented upload interval; enabled by `--stage-iterations` |
+
+The host-wall pass has no NPU timing-event submissions in its measured interval.
+Pinned buffers, ordinals and array views are allocated beforehand; diagnostic
+validation, archive reads, DDR import, state reset and correctness readbacks
+remain outside every timed interval. Both input buffers are poisoned before
+each call so missing candidate uploads or protection reconstruction cannot pass
+by using the previous valid state. The CPU staging buffers remain owned until
+stream completion. H2D diagnostics and device-only graph samples are separate
+runs, not additive components of host wall time.
+
+This is a **single-group candidate-ready call**, not the complete service Target
+step. A one-group archive does not contain scheduler/LRU feedback, generation of
+the candidates, owner lifecycle, new Index ingest, shared ABC maintenance, or
+the combined preparation/upload for all groups. These exclusions are recorded
+in JSON. One must not multiply the measured group preparation latency by 21.
+The B16 archive has 16 packed rows: its dense table is 1 MiB and candidate list
+128 KiB. The observed service allocation has 17 rows including the guard and
+21 groups: the deleted dense upload is 22.3125 MiB **once per worker/Target step**;
+the pre-existing 2.7890625 MiB candidate upload remains. The snapshot reproduces
+that optimization's local cost, but cannot establish a full-service TPOT gain.
