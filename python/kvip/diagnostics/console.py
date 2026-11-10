@@ -11,6 +11,8 @@ import sys
 import tempfile
 import traceback
 
+from kvip.diagnostics.prefetch_admission import mean_admission
+
 _ACTIVE = None
 
 
@@ -146,7 +148,29 @@ def _payload_bandwidth(label, duration_us, payload, rates=None):
     emit(f"  {label} (decimal GB/s, not link peak): " + "; ".join(values))
 
 
-def _case(name, timing, stages, reads, tuning=None, *, token_bytes=None, payload=None, payload_rates=None):
+def print_admission(admission):
+    if admission is None:
+        return
+
+    def vector(key):
+        return "[" + ",".join(f"{value:g}" for value in admission[key]) + "]"
+
+    emit(
+        "  admission/round mean: "
+        f"packed/active_rows={admission['packed_rows']}/{admission['active_rows']}, "
+        f"window_limited={admission['window_limited_epochs']:g}, "
+        f"other_or_tied={admission['other_or_tied_limited_epochs']:g}, "
+        f"budget_exhausted={admission['budget_exhausted_epochs']:g}, "
+        f"active_unused_budget={admission['remaining_admissible_budget']:g}, "
+        f"suppressed_with_budget_left_rows={admission['rows_suppressed_with_budget_left']:g}; "
+        f"sent={vector('posted_by_epoch')} suppressed={vector('suppressed_by_epoch')} "
+        "(epochs include padding; suppressed candidates can repeat, not final misses)"
+    )
+
+
+def _case(
+    name, timing, stages, reads, tuning=None, *, token_bytes=None, payload=None, payload_rates=None, admission=None
+):
     if not all(math.isfinite(timing[key]) and timing[key] > 0 for key in ("mean_us", "p50_us")):
         raise ValueError(f"Invalid saved timing: {name}")
     if tuning is not None:
@@ -176,6 +200,7 @@ def _case(name, timing, stages, reads, tuning=None, *, token_bytes=None, payload
             )
             + f"; unclassified={reads.get('prefetch_unclassified', 0):g}"
         )
+    print_admission(admission)
     stage_details = stages or {}
     stage_times = stage_details.get("stages", {})
     if stage_times:
@@ -229,6 +254,7 @@ def compact_report(report, *, path=None):
                     _read_means(case),
                     case.get("tuning"),
                     token_bytes=case.get("geometry", report.get("geometry", {})).get("token_bytes"),
+                    admission=mean_admission(case.get("reads_samples", [])),
                 )
                 _candidate_call(case)
             baseline = report["cases"][0]
@@ -267,6 +293,7 @@ def compact_report(report, *, path=None):
                         ),
                     },
                     payload_rates=row.get("graph_normalized_payload_GBps"),
+                    admission=row.get("prefetch_admission"),
                 )
             for name, value in report.get("fusion_vs_serial", {}).items():
                 emit(
@@ -281,6 +308,7 @@ def compact_report(report, *, path=None):
                 _read_means(report),
                 report.get("tuning"),
                 token_bytes=report.get("geometry", {}).get("token_bytes"),
+                admission=mean_admission(report.get("reads_samples", [])),
             )
             _candidate_call(report)
         else:

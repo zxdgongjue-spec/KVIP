@@ -123,7 +123,9 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="requires parallel_final"):
         build.build_libraries(**options, async_final=True)
     assert len(commands) == 14
-    for index, flag in enumerate(("cold_only_prefetch", "threshold_only", "simt_init", "staged_outputs"), 1):
+    for index, flag in enumerate(
+        ("cold_only_prefetch", "threshold_only", "simt_init", "staged_outputs", "rolling_threshold"), 1
+    ):
         specialized = build.build_libraries(**options, **{flag: True})
         assert specialized != current
         assert f"-D{flag.upper()}=1" in commands[-2]
@@ -131,6 +133,17 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
         with pytest.raises(ValueError, match="must be booleans"):
             build.build_libraries(**options, **{flag: 1})
         assert len(commands) == 14 + index * 2
+
+    for flag in ("single_planner", "skip_final_partition"):
+        specialized = build.build_libraries(**options, parallel_final=True, **{flag: True})
+        assert specialized != parallel
+        assert f"-DURMA_{flag.upper()}=1" in commands[-2]
+        with pytest.raises(ValueError, match="require parallel_final"):
+            build.build_libraries(**options, **{flag: True})
+        with pytest.raises(ValueError, match="without async_final"):
+            build.build_libraries(**options, parallel_final=True, async_final=True, **{flag: True})
+    with pytest.raises(ValueError, match="resident TopK seed"):
+        build.build_libraries(**options, rolling_threshold=True, threshold_only=True)
 
 
 def test_actual_operator_cmake_resolves_relocated_sources(tmp_path):

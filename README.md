@@ -486,6 +486,41 @@ snapshot's original geometry is retained; mapping diagnostics decode epoch
 tags before counting useful/unused prefetch. New tagged captures also retain
 the raw mapping tensor as `post.mapping_raw`.
 
+The following experiments retain all completion, output and Index work inside
+the graph. They are opt-in and require real-snapshot correctness/performance
+validation before use in serving:
+
+- `rolling_threshold=true` reuses the resident TopK as the first 16K chunk,
+  then performs each existing BF16 TopK merge when that score chunk completes.
+  The updated kth score filters later score tiles. Published bitmaps are never
+  rewritten. Final TopK copies the saved indices instead of repeating the
+  chunk merges. State uses the existing prefix GM buffers, because Fetch
+  borrows the TopK UB scratch. Extra state transfers and synchronization can
+  offset the saved sorting/prefetch work. Both backends require resident=16384,
+  split-Q2 and `threshold_only=false`; unsupported shapes are rejected.
+- URMA `single_planner=true` computes the immutable final slot plan once per
+  request and publishes all original final-worker ranges. Final Get concurrency
+  is unchanged. `skip_final_partition=true` independently skips the old
+  safe/conflicting descriptor partition. Both require `parallel_final=true`
+  and `async_final=false`: this path joins prefetch before any final Get, so the
+  safe-prefix split is unnecessary. Neither option adds a kernel launch.
+
+Extended Index planning now clears and scans only its producer high-water
+prefix and the corresponding path-closing prefix. Their ABI offsets and record
+order are unchanged; old records outside those ranges cannot be consumed.
+This only benefits rows that use the extended planner.
+
+Replay also reports `prefetch_admission` from existing Row counters, after
+timing: per-window posted/suppressed candidates, strictly window-limited epochs,
+other/tied limits, zero-budget epochs and active-row unused budget. Suppression
+counts examined per-window candidates, not globally unique or final cold misses;
+windows skipped after budget exhaustion do not count their unseen candidates.
+`prefetch_limit` is per request across all windows, while `window_limit` applies
+to each individual service visit. Unused capacity in an early window is not a
+separate bank of credits, and candidates skipped at that visit are not retried
+automatically. Compare window changes at a fixed total budget before increasing
+the total; report complete graph latency rather than summing diagnostic stages.
+
 Three additional opt-in switches target the remaining stages; all default to
 false and preserve the selected KV bytes and required state updates:
 

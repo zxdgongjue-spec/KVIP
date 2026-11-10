@@ -116,7 +116,7 @@ def test_optimization_switches_are_explicit_content_addressed_build_options():
     assert replace(tagged, merge_outputs=True).options("/cann")["UBMEM_MERGE_OUTPUTS"] == 1
     assert replace(tagged, ordered_pair=True).options("/cann")["UBMEM_ORDERED_PAIR"] == 1
     assert replace(tagged, single_plan=True).options("/cann")["UBMEM_SINGLE_PLAN"] == 1
-    for flag in ("cold_only_prefetch", "threshold_only", "simt_init", "staged_outputs"):
+    for flag in ("cold_only_prefetch", "threshold_only", "simt_init", "staged_outputs", "rolling_threshold"):
         assert baseline.options("/cann")[flag.upper()] == 0
         assert replace(baseline, **{flag: True}).options("/cann")[flag.upper()] == 1
         with pytest.raises(ValueError, match="booleans"):
@@ -133,6 +133,9 @@ def test_optimization_switches_are_explicit_content_addressed_build_options():
         dict(ordered_pair=True, grouped_copy=False),
         dict(ordered_pair=True, token_bytes=656),
         dict(simt_init=True, parallel_init=True),
+        dict(rolling_threshold=True, resident=8192),
+        dict(rolling_threshold=True, aic_count=16),
+        dict(rolling_threshold=True, threshold_only=True),
     ):
         with pytest.raises(ValueError):
             replace(paired, **overrides)

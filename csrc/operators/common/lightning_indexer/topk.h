@@ -185,6 +185,17 @@ public:
             }
         }
     }
+    // Resume the exact normal multi-trunk merge after Service has borrowed
+    // UB: caller restored previous ordered indices into sharedTmp bank 1.
+    __aicore__ inline void MergeNext(LocalTensor<uint16_t>& values,LocalTensor<uint32_t>& indices,
+        LocalTensor<uint16_t>& scores,uint32_t padded,uint32_t absoluteStart) {
+        topkb16gather::LiTopKVF<true>(tmpIndexLocal,scores,values,histogramsLocal,
+            idxHighLocal,idxLowLocal,nkValueLocal,topK,padded);
+        PipeBarrier<PIPE_V>();
+        topkb16gather::LiTopKGatherVF(indices,scores,values,tmpIndexLocal,
+            hisIndexLocal[1],topK,absoluteStart-QLICommon::Align(topK,uint32_t(256)),padded);
+        PipeBarrier<PIPE_V>();
+    }
 private:
     LocalTensor<uint32_t> hisIndexLocal[2];      // 每trunkLen长度的s2选出的topK个索引
     LocalTensor<uint32_t> histogramsLocal;       // 直方图的临时Buf 256 * 4B

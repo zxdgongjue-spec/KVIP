@@ -23,6 +23,7 @@ uint32_t v9_threshold_only();
 uint32_t v9_simt_init();
 uint32_t v9_single_plan();
 uint32_t v9_staged_outputs();
+uint32_t v9_rolling_threshold();
 uint32_t v9_ubpipe_depth();
 uint32_t v9_window_ubpipe_depth();
 uint32_t v9_init(void* bindings,void* stream);

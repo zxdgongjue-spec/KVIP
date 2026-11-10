@@ -1,6 +1,10 @@
 #include "api.h"
 #include "context.h"
-extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) { return rotating::PrepareShape(shape); }
+extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) {
+    auto result=rotating::PrepareShape(shape);
+    if(result)return result;
+    return V9_ROLLING_THRESHOLD && (shape->resident!=16384 || !shape->splitQ) ? 100000 : 0;
+}
 #define ENTRY(name, blocks) \
 extern "C" uint32_t aclrtlaunch_v9_##name##_kernel(uint32_t,void*,void*); \
 extern "C" uint32_t v9_##name(void* bindings,void* stream,const rotating::RuntimeShape* shape) { \
@@ -9,7 +13,7 @@ extern "C" uint32_t v9_##name(void* bindings,void* stream,const rotating::Runtim
 ENTRY(init,shape->batch)
 ENTRY(li,shape->liCores)
 ENTRY(wait,shape->batch)
-ENTRY(resolve,shape->finalCores)
+ENTRY(resolve,V9_URMA_SINGLE_PLANNER?shape->batch:shape->finalCores)
 ENTRY(fetch,shape->batch)
 #if V9_URMA_PARALLEL_FINAL
 ENTRY(parallel_fetch,shape->finalCores)
@@ -36,6 +40,9 @@ extern "C" uint32_t v9_cold_only_prefetch(const rotating::RuntimeShape* shape) {
 extern "C" uint32_t v9_threshold_only(const rotating::RuntimeShape* shape) { return V9_THRESHOLD_ONLY; }
 extern "C" uint32_t v9_simt_init(const rotating::RuntimeShape* shape) { return V9_SIMT_INIT; }
 extern "C" uint32_t v9_staged_outputs(const rotating::RuntimeShape* shape) { return V9_STAGED_OUTPUTS; }
+extern "C" uint32_t v9_rolling_threshold(const rotating::RuntimeShape* shape) { return V9_ROLLING_THRESHOLD; }
+extern "C" uint32_t v9_single_planner(const rotating::RuntimeShape* shape) { return V9_URMA_SINGLE_PLANNER; }
+extern "C" uint32_t v9_skip_final_partition(const rotating::RuntimeShape* shape) { return V9_URMA_SKIP_FINAL_PARTITION; }
 
 #if V9_RESOLVER_COMPARE
 ENTRY(resolve_original,shape->finalCores)

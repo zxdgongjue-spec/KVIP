@@ -8,6 +8,11 @@
 #ifndef V9_THRESHOLD_ONLY
 #define V9_THRESHOLD_ONLY 0
 #endif
+#ifndef V9_ROLLING_THRESHOLD
+#define V9_ROLLING_THRESHOLD 0
+#endif
+static_assert(V9_ROLLING_THRESHOLD==0 || V9_ROLLING_THRESHOLD==1,"Rolling threshold must be boolean");
+static_assert(!V9_ROLLING_THRESHOLD || !V9_THRESHOLD_ONLY,"Rolling threshold requires resident TopK");
 #ifndef V9_SIMT_INIT
 #define V9_SIMT_INIT 0
 #endif
@@ -27,6 +32,17 @@ static_assert(V9_URMA_PARALLEL_FINAL==0 || V9_URMA_PARALLEL_FINAL==1,"Parallel f
 #endif
 static_assert(V9_URMA_ASYNC_FINAL==0 || V9_URMA_ASYNC_FINAL==1,"Async final Get must be 0 or 1");
 static_assert(!V9_URMA_ASYNC_FINAL || V9_URMA_PARALLEL_FINAL,"Async final Get requires parallel completion");
+#ifndef V9_URMA_SINGLE_PLANNER
+#define V9_URMA_SINGLE_PLANNER 0
+#endif
+#ifndef V9_URMA_SKIP_FINAL_PARTITION
+#define V9_URMA_SKIP_FINAL_PARTITION 0
+#endif
+static_assert(V9_URMA_SINGLE_PLANNER==0 || V9_URMA_SINGLE_PLANNER==1,"Single planner must be boolean");
+static_assert(V9_URMA_SKIP_FINAL_PARTITION==0 || V9_URMA_SKIP_FINAL_PARTITION==1,"Skip partition must be boolean");
+static_assert(!(V9_URMA_SINGLE_PLANNER || V9_URMA_SKIP_FINAL_PARTITION) ||
+              (V9_URMA_PARALLEL_FINAL && !V9_URMA_ASYNC_FINAL),
+              "Resolver optimizations require synchronous parallel final Get");
 namespace rotating {
 constexpr uint32_t kTop=2048, kSlots=8192, kMaxRounds=32, kRowStatusWords=32;
 constexpr bool kFinalReplicated=true;

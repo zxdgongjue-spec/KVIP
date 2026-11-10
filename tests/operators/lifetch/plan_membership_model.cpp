@@ -16,7 +16,16 @@
 #define LAUNCH_BOUND(n)
 struct {uint32_t x=0;} threadIdx;
 uint64_t membershipQueries=0;
-template<class T>T asc_ldcg(T* p){return *p;}
+uintptr_t recordBegin=0,recordEnd=0;
+uint32_t recordHalf=0,liveCount=0,candidateHalf=0;
+template<class T>T asc_ldcg(T* p){
+    const uintptr_t address=reinterpret_cast<uintptr_t>(p);
+    if(address>=recordBegin && address<recordEnd) {
+        const uint32_t i=((address-recordBegin)/sizeof(uint32_t))%recordHalf;
+        assert(i<liveCount || (i>=candidateHalf && i<candidateHalf+liveCount));
+    }
+    return *p;
+}
 template<class T>void asc_stcg(T* p,T value){*p=value;}
 uint32_t asc_atomic_cas(uint32_t* p,uint32_t old,uint32_t value){auto before=*p;if(before==old)*p=value;return before;}
 void asc_atomic_or(uint32_t* p,uint32_t value){*p|=value;}
@@ -28,6 +37,7 @@ uint32_t asc_shfl_up(uint32_t value,uint32_t){return value;}
 constexpr uint32_t history=131328,resident=16384;
 void Check(bool extended,uint32_t count,const std::vector<uint32_t>& inputSlots,
            const std::vector<uint32_t>& changes) {
+    recordBegin=recordEnd=0;
     const uint32_t capacity=extended?kExtendedCandidates:kPlanCandidates;
     const uint32_t records=capacity*2,limit=extended?count:capacity;
     std::unordered_set<uint32_t> dstSet,srcSet;
@@ -55,8 +65,23 @@ void Check(bool extended,uint32_t count,const std::vector<uint32_t>& inputSlots,
     std::vector<uint32_t> work(extended?2*kExtendedRecords:kPlanWords,0x12345678);
     std::vector<uint32_t> hashes(2*kExtendedHash,0x87654321),status(128,0);
     std::vector<uint32_t> plan(extended?kExtendedTransferWords:kTransferPlanWords,0x91919191);
+    if(extended) {
+        // Reuse a genuinely populated maximum-sized previous round. The next
+        // round may shrink to zero, holes, a short prefix, or an invalid count.
+        std::vector<uint32_t> priorSlots(capacity),priorSources(capacity);
+        std::iota(priorSlots.begin(),priorSlots.end(),0);
+        std::iota(priorSources.begin(),priorSources.end(),resident);
+        BuildExtendedPlan<1>(priorSlots.data(),priorSources.data(),capacity,history,resident,
+                            hashes.data(),status.data(),work.data());
+        assert(status[0]==0);
+        std::fill(status.begin(),status.end(),0);
+    }
+    const auto priorWork=work;
     // Native API is mutable-pointer even though these two inputs are read-only.
     auto slots=inputSlots,input=changes;
+    recordBegin=extended?reinterpret_cast<uintptr_t>(work.data()):0;
+    recordEnd=extended?reinterpret_cast<uintptr_t>(work.data()+work.size()):0;
+    recordHalf=records;candidateHalf=capacity;liveCount=count;
     membershipQueries=0;
     if(extended)BuildExtendedPlan<1>(slots.data(),input.data(),count,history,resident,
         hashes.data(),status.data(),work.data());
@@ -66,8 +91,11 @@ void Check(bool extended,uint32_t count,const std::vector<uint32_t>& inputSlots,
     if(invalid){assert(membershipQueries==0);return;}
     assert(membershipQueries==uint64_t(valid)*2); // Previously four probes.
     const auto dst=work.data()+(extended?0:2*kPlanHash),src=dst+records;
-    assert(std::equal(expectedDst.begin(),expectedDst.end(),dst));
-    assert(std::equal(expectedSrc.begin(),expectedSrc.end(),src));
+    for(uint32_t i=0;i<records;++i) {
+        const bool live=!extended || i<count || (i>=capacity && i<capacity+count);
+        assert(dst[i]==(live?expectedDst[i]:priorWork[i]));
+        assert(src[i]==(live?expectedSrc[i]:priorWork[records+i]));
+    }
     if(extended)PublishExtendedPlan<1>(work.data(),status.data(),plan.data(),resident);
     else PublishUpdatePlan<1>(work.data(),status.data(),plan.data(),resident);
     uint32_t rank=0;

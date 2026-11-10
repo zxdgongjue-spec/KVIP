@@ -11,7 +11,8 @@ from pathlib import Path
 import numpy as np
 
 from kvip.diagnostics.demand import DEMAND_ACCOUNTING
-from kvip.diagnostics.console import compact_report, failure_tail, report_only
+from kvip.diagnostics.console import compact_report, failure_tail, print_admission, report_only
+from kvip.diagnostics.prefetch_admission import ADMISSION_ACCOUNTING, mean_admission
 
 CASES = (("ubmem", "serial"), ("urma", "serial"), ("ubmem", "fused"), ("urma", "fused"))
 
@@ -226,6 +227,7 @@ def summarize(results):
                 if key in result
             },
             get_kernel=result.get("get_kernel"),
+            prefetch_admission=mean_admission(result["reads_samples"]),
             selection=result.get("selection_comparison"),
             reads_per_round={
                 key: float(np.mean([row[key] for row in result["reads_samples"]]))
@@ -314,6 +316,7 @@ def summarize(results):
         scope=first["scope"],
         table=table,
         demand_accounting=DEMAND_ACCOUNTING,
+        prefetch_admission_accounting=ADMISSION_ACCOUNTING,
         demand_delta_fused_minus_serial=demand_deltas,
         payload_rate_accounting="Decimal GB/s = payload bytes / full graph mean_us / 1000; graph-normalized throughput, not Get-stage or hardware bandwidth.",
         fusion_vs_serial=ratios,
@@ -361,6 +364,7 @@ def display(summary):
                 if key not in ("cold_demand", "candidate_hot_refetch")
             )
         )
+        print_admission(row.get("prefetch_admission"))
         demand = row["demand_per_round"]
         if demand:
             print(

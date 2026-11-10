@@ -136,10 +136,18 @@ __simt_callee__ inline void BuildExtendedPlan(__gm__ uint32_t* inputSlots, __gm_
   uint32_t tid = threadIdx.x;
   auto dstSet = hashes, srcSet = hashes + kExtendedHash;
   auto dst = records, src = records + kExtendedRecords;
-  for (uint32_t i = tid; i < 2*kExtendedHash; i += Threads) hashes[i] = UINT32_MAX;
-  for (uint32_t i = tid; i < 2*kExtendedRecords; i += Threads) asc_stcg(records+i, UINT32_MAX);
-  asc_threadfence();asc_syncthreads();
   if(count > kExtendedCandidates) { if(!tid)status[0]=1; return; }
+  // The producer high-water mark bounds both the input and path-closing
+  // records. Keep their ABI offsets, but never clear/read the unused tail.
+  // status[1] is private to this Build/Publish pair (prefix scans use 32/64).
+  if(!tid)status[1]=count;
+  for (uint32_t i = tid; i < 2*kExtendedHash; i += Threads) hashes[i] = UINT32_MAX;
+  for (uint32_t i = tid; i < count; i += Threads) {
+    asc_stcg(dst+i,UINT32_MAX);asc_stcg(src+i,UINT32_MAX);
+    asc_stcg(dst+kExtendedCandidates+i,UINT32_MAX);
+    asc_stcg(src+kExtendedCandidates+i,UINT32_MAX);
+  }
+  asc_threadfence();asc_syncthreads();
   for(uint32_t i=tid;i<count;i+=Threads) {
     uint32_t s=asc_ldcg(changes+i),d=asc_ldcg(inputSlots+i);
     if(s==UINT32_MAX)continue;
@@ -207,15 +215,18 @@ constexpr uint32_t kExtendedTransferWords = kTransferHeaderWords + 2*kExtendedRe
 template<uint32_t Threads>
 __simt_callee__ inline void PublishExtendedPlan(__gm__ uint32_t* records, __ubuf__ uint32_t* status,
     __gm__ uint32_t* plan,uint32_t resident) {
-  uint32_t tid=threadIdx.x,per=kExtendedRecords/Threads,count=0;
+  const uint32_t inputCount=status[1],liveRecords=2*inputCount;
+  uint32_t tid=threadIdx.x,per=(liveRecords+Threads-1)/Threads,count=0;
   auto destinations=records,sources=records+kExtendedRecords;
-  for(uint32_t i=tid*per;i<(tid+1)*per;++i) {
+  for(uint32_t ordinal=tid*per;ordinal<(tid+1)*per && ordinal<liveRecords;++ordinal) {
+    const uint32_t i=ordinal<inputCount?ordinal:kExtendedCandidates+ordinal-inputCount;
     uint32_t src=asc_ldcg(sources+i),dst=asc_ldcg(destinations+i);
     count+=src!=UINT32_MAX && src!=dst;
   }
   uint32_t rank=PlanPrefix<Threads>(count,status+32);
   if(tid==Threads-1)asc_stcg(plan,rank+count);
-  for(uint32_t i=tid*per;i<(tid+1)*per;++i) {
+  for(uint32_t ordinal=tid*per;ordinal<(tid+1)*per && ordinal<liveRecords;++ordinal) {
+    const uint32_t i=ordinal<inputCount?ordinal:kExtendedCandidates+ordinal-inputCount;
     uint32_t src=asc_ldcg(sources+i),dst=asc_ldcg(destinations+i);
     if(src==UINT32_MAX || src==dst)continue;
     if(i>=kExtendedCandidates && dst<resident)dst|=kInvalidateHot;

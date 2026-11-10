@@ -10,6 +10,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[3]
 sys.path[:0] = [str(ROOT / "python"), str(ROOT / "tests/operators/lifetch/support")]
 from runner import progress, supervise  # noqa: E402 — standalone test bootstrap
@@ -400,6 +402,20 @@ def test_hot_resolver_actual_function_on_empty_and_populated_cache(tmp_path):
     _check_hot_resolver(tmp_path, "urma")
 
 
+@pytest.mark.parametrize("single_plan,skip_partition", ((True, False), (False, True), (True, True)))
+@pytest.mark.parametrize("final_workers", (1, 2, 4))
+def test_urma_row_planner_preserves_slots_changes_and_worker_fetch_sets(
+    tmp_path, single_plan, skip_partition, final_workers
+):
+    _check_hot_resolver(
+        tmp_path,
+        "urma",
+        single_plan=single_plan,
+        skip_final_partition=skip_partition,
+        final_workers=final_workers,
+    )
+
+
 def test_ubmem_hot_resolver_actual_function_on_empty_and_populated_cache(tmp_path):
     _check_hot_resolver(tmp_path, "ubmem")
 
@@ -416,7 +432,9 @@ def test_tagged_ubmem_single_plan_matches_replicated_descriptors_and_locations(t
     _check_hot_resolver(tmp_path, "ubmem", tagged=True, single_plan=True)
 
 
-def _check_hot_resolver(tmp_path, transport, *, tagged=False, single_plan=False):
+def _check_hot_resolver(
+    tmp_path, transport, *, tagged=False, single_plan=False, skip_final_partition=False, final_workers=4
+):
     """Execute production SIMT logic serially; CANN simulator covers barriers."""
     import subprocess
 
@@ -463,6 +481,8 @@ def _check_hot_resolver(tmp_path, transport, *, tagged=False, single_plan=False)
     baseline = resolve.replace(
         "if(count>candidateCount && ordinal>=0)asc_stcg(changes+kLruSlots+rank,UINT32_MAX);", ""
     ).replace("ReplicatedResolve(", "BaselineResolve(", 1)
+    if transport == "urma":
+        baseline = baseline.replace("V9_URMA_SINGLE_PLANNER", "0").replace("V9_URMA_SKIP_FINAL_PARTITION", "0")
     functions += "\n" + template + "\n" + baseline
     planner = ROOT / "csrc/operators/common/lifetch/index_cache_update.h"
     functions += """
@@ -615,6 +635,45 @@ int main(){
 }
 """.replace("FUNCTIONS", functions)
     definitions = []
+    if transport == "urma":
+        definitions = [
+            f"-DV9_URMA_SINGLE_PLANNER={int(single_plan)}",
+            f"-DV9_URMA_SKIP_FINAL_PARTITION={int(skip_final_partition)}",
+            "-DV9_URMA_PARALLEL_FINAL=1",
+        ]
+        if single_plan:
+            source = source.replace("  for(unsigned w=0;w<workers;++w){", "  for(unsigned w=0;w<1;++w){", 1)
+            source = source.replace(
+                "std::copy(locations.begin()+w*2048,locations.begin()+(w+1)*2048,output.begin()+w*2048);",
+                "std::copy(locations.begin(),locations.end(),output.begin());",
+                1,
+            )
+            source = source.replace(
+                "   assert(cfg[5]<=cfg[3]);",
+                "   for(unsigned p=0;p<workers;++p){\n"
+                "   cfg[2]=cfg[0]*p/workers;cfg[3]=cfg[0]*(p+1)/workers-cfg[2];\n"
+                "   cfg[5]=cfg[3]?cfg[576+p]:0;assert(cfg[5]<=cfg[3]);",
+                1,
+            ).replace(
+                "   std::copy(locations.begin(),locations.end(),output.begin());",
+                "   }\n   std::copy(locations.begin(),locations.end(),output.begin());",
+                1,
+            )
+        if skip_final_partition:
+            source = source.replace("cfg[5]=cfg[3]?cfg[576+p]:0;", "cfg[5]=0;")
+            source = source.replace("assert(conflict==(i>=cfg[5]));", "assert(cfg[5]==0);", 1)
+            # Dropping the safe-prefix stable partition may reorder descriptors
+            # within a worker range. Its source/destination set must stay exact.
+            source = source.replace(
+                "assert(remote==actualRemote && blocks==actualBlocks && offsets==actualOffsets && destinations==actualDestinations);",
+                """assert(blocks==actualBlocks && offsets==actualOffsets);
+  for(unsigned p=0;p<workers;++p){
+   std::vector<std::pair<uint64_t,int>> expected,actual;
+   for(unsigned i=total*p/workers;i<total*(p+1)/workers;++i){
+    expected.emplace_back(remote[i],destinations[i]);actual.emplace_back(actualRemote[i],actualDestinations[i]);}
+   std::sort(expected.begin(),expected.end());std::sort(actual.begin(),actual.end());assert(expected==actual);
+  }""",
+            )
     if transport == "ubmem":
         definitions = [
             "-D" + value
@@ -672,6 +731,8 @@ int main(){
     EncodeMappingSlot(r+17,(epoch==1?2:epoch-1)<<kMappingSlotBits,kMappingSlotMask);""",
             )
             source = source.replace("InitializeTailMappings(h,r,&ctx,0)", "InitializeTailMappings(h,r,&ctx,0,0,tag)")
+    source = source.replace("workers=4,used=", f"workers={final_workers},used=")
+    source = source.replace("w*2048", "w*(8192/workers)").replace("(w+1)*2048", "(w+1)*(8192/workers)")
     (tmp_path / "batch_get_abi.h").write_text("")
     cpp, exe = tmp_path / "resolver.cpp", tmp_path / "resolver"
     cpp.write_text(source)
@@ -760,6 +821,68 @@ int main() { Context c{};
         source.write_text("#include <initializer_list>\n" + program)
         subprocess.run(["c++", "-std=c++17", str(source), "-o", folder + "/test"], check=True)
         subprocess.run([folder + "/test"], check=True)
+
+
+@pytest.mark.parametrize("skip_partition", (False, True))
+def test_single_planner_publishes_every_native_worker_range(tmp_path, skip_partition):
+    """Run the scalar publisher with poisoned prior-replay posts and empty ranges."""
+    import subprocess
+
+    resolver = (ROOT / "csrc/operators/lightning_indexer_with_fetch/op_kernel/resolver.h").read_text()
+    start = resolver.index("__aicore__ inline void PrepareFinalFetch")
+    publish = resolver[start : resolver.index("\n}\n", start) + 2]
+    start = resolver.index("    for(uint32_t target=0;target<rt_finalWorkers;++target)")
+    ranges = resolver[start : resolver.index("\n#else", start)]
+    program = r"""
+#include <cstdint>
+#include <cassert>
+#include <algorithm>
+#include <initializer_list>
+#define __aicore__
+#define __gm__
+struct FinalPost { uint32_t count,pending,error,deferred,descriptor,nonconflicting; uint64_t head; };
+struct Context { FinalPost posts[12]; };
+struct Control { uint32_t values[2560]; uint32_t GetValue(unsigned i){return values[i];} };
+FinalPost* FinalPostAt(uint32_t,Context* c,uint32_t i){return c->posts+i;}
+namespace kvaf_device { void CleanCacheLines(uint8_t*,unsigned long){} }
+PUBLISH
+void run(Context* ctx,Control& ctl,uint32_t rt_finalWorkers,uint32_t batchCount,uint32_t error){
+ const uint32_t b=1,batchBase=8192,rt_finalPostOffset=0;
+ RANGES
+}
+int main(){
+ for(unsigned workers:{1U,2U,4U})for(unsigned count:{0U,1U,3U,608U,8191U})for(unsigned error:{0U,4U}){
+  Context ctx{};Control ctl{};
+  for(auto& p:ctx.posts)p={999,999,999,999,999,999,999};
+  for(unsigned w=0;w<workers;++w)ctl.values[576+w]=(count*(w+1)/workers-count*w/workers)/2;
+  run(&ctx,ctl,workers,count,error);
+  unsigned total=0;
+  for(unsigned i=0;i<12;++i){const auto& p=ctx.posts[i];
+   if(i<workers || i>=2*workers){assert(p.count==999 && p.pending==999);continue;}
+   const unsigned w=i-workers,begin=count*w/workers,end=count*(w+1)/workers;
+   assert(p.count==end-begin && p.descriptor==8192+begin && p.error==error);
+   assert(!p.pending && !p.head && p.deferred==bool(p.count && !error));
+   assert(p.nonconflicting==(error || V9_URMA_SKIP_FINAL_PARTITION?0:(end-begin)/2));
+   total+=p.count;
+  }
+  assert(total==count);
+ }
+}
+""".replace("PUBLISH", publish).replace("RANGES", ranges)
+    source, binary = tmp_path / "posts.cpp", tmp_path / "posts"
+    source.write_text(program)
+    subprocess.run(
+        [
+            "c++",
+            "-std=c++17",
+            f"-DV9_URMA_SKIP_FINAL_PARTITION={int(skip_partition)}",
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+    )
+    subprocess.run([str(binary)], check=True)
 
 
 def test_native_final_phase_order_runs_production_loop(tmp_path):

@@ -743,6 +743,9 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessBaseBlock(uint3
             vectorService.ProcessResidentTopK(runInfo);
             vectorService.PrepareRotationProgress();
         }
+#if V9_ROLLING_THRESHOLD
+        else vectorService.ProcessRollingTopK(runInfo);
+#endif
         if (!rotationServed_ && rotating::EpochAt(s2LoopIdx + 1, aiCoreIdx) >= 0) {
             vectorService.RotateFetch(rotating::EpochAt(s2LoopIdx + 1, aiCoreIdx));
             CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(8);

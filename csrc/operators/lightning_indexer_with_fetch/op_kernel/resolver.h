@@ -90,9 +90,9 @@ static_assert(V9_USER_UB_BYTES + 6144 <= 229376,
 }
 
 namespace rotating {
-// Every worker independently builds the same rank/slot plan from immutable
-// prefetch mapping. Rank is the first TopK occurrence, NOT atomic arrival order.
-// Only disjoint location/descriptor/WQE outputs are partitioned across workers.
+// Rank is the first TopK occurrence, NOT atomic arrival order. The baseline
+// repeats this immutable plan on every final worker. The optional row planner
+// computes it once, then publishes the same disjoint final worker ranges.
 template<uint32_t Threads>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
 inline void ReplicatedResolve(uint32_t rt_history,uint32_t rt_resident,uint32_t rt_finalWorkers,uint32_t rt_tokenBytes,__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc,
@@ -108,20 +108,30 @@ inline void ReplicatedResolve(uint32_t rt_history,uint32_t rt_resident,uint32_t 
     if(!ResolveResidentPlan<Threads>(rt_history,rt_resident,outputStride,selected,loc,
         positions,coldCount,keys,ranks,ids,slots,cfg,mapping,lru,used,ctx->tailBounds!=0,count,candidateCount))return;
     constexpr uint32_t missingTag=0x80000000U;
-    uint32_t ownBegin=count*worker/rt_finalWorkers,ownEnd=count*(worker+1)/rt_finalWorkers;
-    if(!tid){cfg[2]=ownBegin;cfg[3]=ownEnd-ownBegin;if(!worker)asc_atomic_add(total,count);}
+    constexpr bool singlePlanner=V9_URMA_SINGLE_PLANNER!=0;
+    if(!tid && !worker)asc_atomic_add(total,count);
     for(uint32_t i=tid;i<coldCount;i+=Threads) {
         uint32_t pos=positions[i],slot=loc[pos];
-        if(pos/(kSlots/rt_finalWorkers)==worker && (slot&missingTag))loc[pos]=slots[slot&~missingTag];
+        if((singlePlanner || pos/(kSlots/rt_finalWorkers)==worker) && (slot&missingTag))loc[pos]=slots[slot&~missingTag];
     }
     asc_syncthreads();
     // Source addresses are snapshotted before Index update. Prefetch records
     // overwritten by final repair are replaced, not duplicated in the plan.
     auto changeSlots=reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+batch*kChangeCapacity;
     auto changes=reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+batch*kChangeCapacity;
-    // Stable partition within each worker's existing compact range. Reuse the
-    // dead hash scratch and the same warp-prefix scan used above; no new GM pass.
+    // Without the safe-prefix split a single planner emits the entire rank
+    // sequence in one pass. Final Get still slices it across the original queues.
+    const uint32_t partitions=singlePlanner && V9_URMA_SKIP_FINAL_PARTITION?1:rt_finalWorkers;
+    const uint32_t first=singlePlanner?0:worker,last=singlePlanner?partitions:worker+1;
+    for(uint32_t partition=first;partition<last;++partition) {
+    uint32_t ownBegin=count*partition/partitions,ownEnd=count*(partition+1)/partitions;
+    if(!tid){cfg[2]=ownBegin;cfg[3]=ownEnd-ownBegin;}
     uint32_t ownCount=ownEnd-ownBegin,perOwn=(ownCount+Threads-1)/Threads;
+#if V9_URMA_SKIP_FINAL_PARTITION
+    const uint32_t safeCount=0;
+#else
+    // Stable partition within the original worker range. All queue consumers
+    // outside parallel synchronous Get still require this safe-prefix contract.
     uint32_t localSafe=0;
     for(uint32_t i=tid*perOwn;i<(tid+1)*perOwn && i<ownCount;++i) {
         uint32_t slot=slots[ownBegin+i];
@@ -139,12 +149,18 @@ inline void ReplicatedResolve(uint32_t rt_history,uint32_t rt_resident,uint32_t 
     uint32_t safeCount=cfg[544+Threads/warpSize-1];
     uint32_t safeBefore=safeScan-localSafe+(warp?cfg[544+warp-1]:0);
     uint32_t conflictBefore=tid*perOwn-safeBefore;
-    if(!tid)cfg[5]=safeCount;
+#endif
+    if(!tid){cfg[5]=safeCount;if(singlePlanner)cfg[576+partition]=safeCount;}
     for(uint32_t i=tid*perOwn;i<(tid+1)*perOwn && i<ownCount;++i) {
         uint32_t rank=ownBegin+i,token=selected[ids[rank]],slot=slots[rank];
+#if V9_URMA_SKIP_FINAL_PARTITION
+        int32_t ordinal=asc_ldcg(reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+batch*rt_resident+slot);
+        uint32_t index=i;
+#else
         int32_t ordinal=int32_t(keys[i]);
         bool conflict=ordinal>=0 && uint32_t(ordinal)<used;
         uint32_t index=conflict?safeCount+conflictBefore++:safeBefore++;
+#endif
         uint32_t dst=batch*kSlots+ownBegin+index;
         uint64_t remote=asc_ldcg(addresses+token);
         uint32_t record=ordinal>=0?uint32_t(ordinal):kLruSlots+rank;
@@ -160,12 +176,17 @@ inline void ReplicatedResolve(uint32_t rt_history,uint32_t rt_resident,uint32_t 
     // per worker, not an atomic on the same GM word for every repaired token.
     if(!tid && ownEnd>candidateCount)
         asc_atomic_max(reinterpret_cast<__gm__ uint32_t*>(ctx->changeCount)+batch,kLruSlots+ownEnd);
+    // Single-planner partitions reuse keys and warp scan scratch. Join readers
+    // before the next partition replaces those UB values.
+    if(singlePlanner)asc_syncthreads();
+    }
     // Mapping remains the immutable prefetch snapshot. Final locations and
     // descriptors are authoritative; mutating mapping here races other readers.
     asc_threadfence();
 }
 __aicore__ inline void ReplicatedFinal(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,uint32_t rt_tokenBytes,__gm__ Context* ctx) {
-    const uint32_t core=GetBlockIdx(),b=core/rt_finalWorkers,w=core%rt_finalWorkers;
+    const uint32_t core=GetBlockIdx(),b=V9_URMA_SINGLE_PLANNER?core:core/rt_finalWorkers;
+    const uint32_t w=V9_URMA_SINGLE_PLANNER?0:core%rt_finalWorkers;
     auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
     auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
     auto trace=reinterpret_cast<__gm__ uint64_t*>(ctx->owners)+b*16;
@@ -221,13 +242,22 @@ __aicore__ inline void ReplicatedFinal(uint32_t rt_batch,uint32_t rt_history,uin
     uint32_t batchCount=error?0:ctl.GetValue(0),prefix=error?0:ctl.GetValue(2),own=error?0:ctl.GetValue(3),batchBase=b*kSlots;
     if(!error)error=ctl.GetValue(1);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-    DataCopy(output[w*(kSlots/rt_finalWorkers)],loc[w*(kSlots/rt_finalWorkers)],kSlots/rt_finalWorkers);
+    const uint32_t locationWorkers=V9_URMA_SINGLE_PLANNER?1:rt_finalWorkers;
+    DataCopy(output[w*(kSlots/locationWorkers)],loc[w*(kSlots/locationWorkers)],kSlots/locationWorkers);
     SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
     if(!w)trace[2]=GetSystemCycle();
+#if V9_URMA_SINGLE_PLANNER
+    for(uint32_t target=0;target<rt_finalWorkers;++target) {
+        const uint32_t begin=batchCount*target/rt_finalWorkers,end=batchCount*(target+1)/rt_finalWorkers;
+        const uint32_t safe=error || end==begin || V9_URMA_SKIP_FINAL_PARTITION?0:ctl.GetValue(576+target);
+        PrepareFinalFetch(rt_finalWorkers,rt_finalPostOffset,ctx,b,target,end-begin,batchBase+begin,error,safe);
+    }
+#else
     PrepareFinalFetch(rt_finalWorkers,rt_finalPostOffset,ctx,b,w,own,batchBase+prefix,error,error?0:ctl.GetValue(5));
+#endif
     if(!w){
         status[0]=error;status[1]=batchCount;status[2]=batchBase;status[3]=0;status[4]=0;
-        row->finalBegin=started;row->finalRequests=batchCount;row->finalHead=FinalPostAt(rt_finalPostOffset,ctx,core)->head;
+        row->finalBegin=started;row->finalRequests=batchCount;row->finalHead=FinalPostAt(rt_finalPostOffset,ctx,b*rt_finalWorkers)->head;
         row->finalPending=batchCount?1:0;row->finalEnd=GetSystemCycle();trace[3]=row->finalEnd;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(trace),64);
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),32);

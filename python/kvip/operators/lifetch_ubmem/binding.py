@@ -60,6 +60,7 @@ class UbmemBinding:
             ("simt_init", int(shape.simt_init)),
             ("single_plan", int(shape.single_plan)),
             ("staged_outputs", int(shape.staged_outputs)),
+            ("rolling_threshold", int(shape.rolling_threshold)),
         ):
             if query(self.library, name) != expected:
                 raise ValueError(f"UBmem static binary contract mismatch: {name}")

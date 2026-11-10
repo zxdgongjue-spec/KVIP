@@ -26,6 +26,9 @@
 #include "indexer_score.h"
 #include "topk.h"
 #include "resident_threshold.h"
+#ifndef V9_ROLLING_THRESHOLD
+#define V9_ROLLING_THRESHOLD 0
+#endif
 
 namespace QLIKernel {
 using namespace QLICommon;
@@ -39,11 +42,12 @@ public:
         rotationProgressGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(
             reinterpret_cast<__gm__ rotating::Context*>(p)->progress));
     }
-    __aicore__ inline void PrepareRotationProgress() {
+    __aicore__ inline void PrepareRotationProgress(uint32_t tableBase=UINT32_MAX) {
         // Prefix scores have been published; this 4KB output is dead until final TopK.
         PipeBarrier<PIPE_ALL>();
         rotationProgress_ = scoreOutLocal_.template ReinterpretCast<uint32_t>();
         rotationProgressBase_ = (SIM_RESIDENT / 128 / 64) * 64;
+        if(tableBase!=UINT32_MAX)rotationProgressBase_=tableBase;
         rotating::PrepareProgress(reinterpret_cast<__ubuf__ uint32_t*>(rotationProgress_.GetPhyAddr()), rotationProgressBase_);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
         WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
@@ -87,9 +91,12 @@ public:
     __aicore__ inline QLIVector(){};
     __aicore__ inline void ProcessVec1(const QLICommon::RunInfo &info);
     __aicore__ inline void ProcessTopK(const QLICommon::RunInfo &info);
+    __aicore__ inline void ProcessRollingTopK(const QLICommon::RunInfo &info);
+    __aicore__ inline void PublishRollingTopK(const QLICommon::RunInfo &info);
     __aicore__ inline void SetPrefixStorage(GM_ADDR output) { prefixOutput_ = output; }
     __aicore__ inline void ProcessResidentTopK(QLICommon::RunInfo info) {
         info.actS2Size = SIM_RESIDENT;
+        rollingReady_=false;
         prefixActive_ = true;
         ProcessTopK(info);
         prefixActive_ = false;
@@ -139,11 +146,13 @@ private:
 
     GM_ADDR prefixOutput_ = nullptr;
     bool prefixActive_ = false;
+    bool rollingReady_ = false;
+    uint32_t rollingEnd_ = 0;
     TBuf<TPosition::VECCALC> classifyBuf_;
     LocalTensor<uint16_t> classifyUB_;
     TBuf<TPosition::VECCALC> prefixThresholdBuf_;
     LocalTensor<uint16_t> prefixThreshold_;
-    __aicore__ inline void SaveResident(uint32_t query, uint32_t scoreRow) {
+    __aicore__ inline void SaveTopKState(uint32_t query) {
         auto src = (__local_mem__ uint16_t *)scoreOutLocal_.GetPhyAddr();
         auto dst = (__local_mem__ uint16_t *)prefixThreshold_.GetPhyAddr() + (query % 2) * 128;
         __VEC_SCOPE__ {
@@ -171,7 +180,13 @@ private:
         DataCopy(indices[q * 2048], indicesOutLocal_.template ReinterpretCast<int32_t>(), 2048);
         DataCopy(thresholds[q * 128], prefixThreshold_[(query % 2) * 128], 128);
         PipeBarrier<PIPE_ALL>();
+    }
+    __aicore__ inline void SaveResident(uint32_t query,uint32_t scoreRow) {
+        SaveTopKState(query);
         PublishResident(query,scoreRow);
+#if V9_ROLLING_THRESHOLD
+        rollingEnd_=16384;rollingReady_=true;
+#endif
     }
     __aicore__ inline void PublishResident(uint32_t query,uint32_t scoreRow) {
         uint32_t batch=query/SIM_Q;
@@ -619,6 +634,9 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &info)
 {
+#if V9_ROLLING_THRESHOLD
+    if(!prefixActive_ && rollingReady_) {PublishRollingTopK(info);return;}
+#endif
     SetFlag<HardEvent::MTE3_MTE2>(MTE3_MTE2_EVENT);
     WaitFlag<HardEvent::MTE3_MTE2>(MTE3_MTE2_EVENT);
 
@@ -666,7 +684,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
             uint32_t bound = reinterpret_cast<__gm__ uint32_t*>(rotationContext->queryEnds)[query];
             validS2Len = Min(validS2Len, static_cast<int32_t>(bound));
         }
-        if(kvip_prefix::UseThresholdOnly(prefixActive_,validS2Len,topkCount_,trunkLen_)) {
+        if(!V9_ROLLING_THRESHOLD && kvip_prefix::UseThresholdOnly(prefixActive_,validS2Len,topkCount_,trunkLen_)) {
             // Consume and return the same existing TopK buffer credits. The
             // helper introduces no event IDs and never changes final TopK.
             WaitFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);
@@ -796,4 +814,5 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
     }
 }
 }  // namespace QLIKernel
+#include "rolling_topk.h"
 #endif

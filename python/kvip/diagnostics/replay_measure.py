@@ -11,6 +11,7 @@ import numpy as np
 from kvip.diagnostics.archive import array_digest, cpu_array, file_digest, source_commit
 from kvip.diagnostics.demand import DEMAND_ACCOUNTING, SnapshotDemand
 from kvip.diagnostics.oracle import DecodeOracle
+from kvip.diagnostics.prefetch_admission import ADMISSION_ACCOUNTING, prefetch_admission
 from kvip.diagnostics.snapshot import (
     input_tensors,
     mapping_values,
@@ -34,7 +35,7 @@ def statistics(samples):
     )
 
 
-def fused_reads(torch, rotating, update, transport, width, demand=None):
+def fused_reads(torch, rotating, update, transport, width, demand=None, *, window_limit=None, active_rows=None):
     rows = cpu_array(torch, rotating.rows)
     status = cpu_array(torch, rotating.row_status)
     posts = cpu_array(torch, rotating.final_posts)
@@ -83,6 +84,10 @@ def fused_reads(torch, rotating, update, transport, width, demand=None):
         if classified > prefetch:
             raise AssertionError("Prefetch mappings exceed completed transfer count")
         result["prefetch_unclassified"] = prefetch - classified
+    if window_limit is not None:
+        result["prefetch_admission"] = prefetch_admission(
+            rows, window_limit=window_limit, rounds=rotating.rounds, active_rows=active_rows
+        )
     return result
 
 
@@ -120,7 +125,16 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         # Production init resets round-local work; never rewind transport queues.
 
     def verify():
-        reads = fused_reads(torch, rotating, update, transport, archive.manifest["geometry"]["token_bytes"], demand)
+        reads = fused_reads(
+            torch,
+            rotating,
+            update,
+            transport,
+            archive.manifest["geometry"]["token_bytes"],
+            demand,
+            window_limit=bundle.tuning["window_limit"],
+            active_rows=active_rows,
+        )
         if compact_reserved:
             actual_reserved = cpu_array(torch, rotating.reserved_hot)
             if not np.array_equal(actual_reserved[active_rows], reserved_expected[active_rows]):
@@ -463,6 +477,7 @@ def measure_case(args, archive, context, retained):
     )
     if args.mode == "fused":
         result["tuning"] = dict(bundle.tuning)
+        result["prefetch_admission_accounting"] = ADMISSION_ACCOUNTING
         result["reserved_metadata"] = dict(
             dense_bytes_per_group=int(archive.array("pre.reserved_hot").nbytes),
             compact_lru_bytes_per_group=int(archive.array("pre.lru_slots").nbytes),

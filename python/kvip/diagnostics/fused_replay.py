@@ -178,7 +178,14 @@ def validate_fused_tuning(overrides, transport):
     """Reject options that the selected backend cannot actually apply."""
     if transport not in ("ubmem", "urma") or not isinstance(overrides, dict):
         raise ValueError("Fusion tuning requires a JSON object and ubmem/urma transport")
-    booleans = {"compact_reserved", "cold_only_prefetch", "threshold_only", "simt_init", "staged_outputs"}
+    booleans = {
+        "compact_reserved",
+        "cold_only_prefetch",
+        "threshold_only",
+        "simt_init",
+        "staged_outputs",
+        "rolling_threshold",
+    }
     if transport == "ubmem":
         booleans |= {
             "parallel_init",
@@ -191,7 +198,7 @@ def validate_fused_tuning(overrides, transport):
             "single_plan",
         }
     else:
-        booleans |= {"parallel_final", "async_final"}
+        booleans |= {"parallel_final", "async_final", "single_planner", "skip_final_partition"}
     integers = {"prefetch_limit", "window_limit"}
     if transport == "ubmem":
         integers.add("final_copy_stages")
@@ -210,6 +217,12 @@ def validate_fused_tuning(overrides, transport):
         raise ValueError("SIMT init requires one init worker per request")
     if overrides.get("async_final") and not overrides.get("parallel_final"):
         raise ValueError("async_final requires parallel_final")
+    if (overrides.get("single_planner") or overrides.get("skip_final_partition")) and (
+        not overrides.get("parallel_final") or overrides.get("async_final")
+    ):
+        raise ValueError("Resolver optimizations require parallel_final without async_final")
+    if overrides.get("rolling_threshold") and overrides.get("threshold_only"):
+        raise ValueError("rolling_threshold requires threshold_only=False")
     if overrides.get("ordered_pair") and not overrides.get("grouped_copy"):
         raise ValueError("ordered_pair requires grouped_copy")
     prefetch_budget(overrides.get("prefetch_limit", 512), overrides.get("window_limit", 64), 1)
@@ -228,6 +241,7 @@ def fusion_tuning(geometry, transport, overrides=None):
         threshold_only=False,
         simt_init=False,
         staged_outputs=False,
+        rolling_threshold=False,
         prefetch_limit=geometry["prefetch_limit"],
         window_limit=geometry["window_limit"],
     )
@@ -249,6 +263,8 @@ def fusion_tuning(geometry, transport, overrides=None):
         values["skip_inactive"] = True
         values.setdefault("parallel_final", False)
         values.setdefault("async_final", False)
+        values.setdefault("single_planner", False)
+        values.setdefault("skip_final_partition", False)
     prefetch_budget(values["prefetch_limit"], values["window_limit"], geometry["requested_windows"])
     return values
 
@@ -324,6 +340,7 @@ def create_fused(
             merge_outputs=effective["merge_outputs"],
             single_plan=effective["single_plan"],
             staged_outputs=effective["staged_outputs"],
+            rolling_threshold=effective["rolling_threshold"],
         )
         library = build_specialization(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape)
         workspace = UbmemWorkspace(torch, resident=r, **common_workspace)
@@ -349,10 +366,13 @@ def create_fused(
             compact_reserved=effective["compact_reserved"],
             parallel_final=effective["parallel_final"],
             async_final=effective["async_final"],
+            single_planner=effective["single_planner"],
+            skip_final_partition=effective["skip_final_partition"],
             cold_only_prefetch=effective["cold_only_prefetch"],
             threshold_only=effective["threshold_only"],
             simt_init=effective["simt_init"],
             staged_outputs=effective["staged_outputs"],
+            rolling_threshold=effective["rolling_threshold"],
         )
         workspace = LIFetchWorkspace(torch, **common_workspace)
     storage = IndexCacheStorage(torch, geometry["owners"], h, r, device)
@@ -412,10 +432,13 @@ def create_fused(
             scratch=workspace.scratch,
             parallel_final=effective["parallel_final"],
             async_final=effective["async_final"],
+            single_planner=effective["single_planner"],
+            skip_final_partition=effective["skip_final_partition"],
             cold_only_prefetch=effective["cold_only_prefetch"],
             threshold_only=effective["threshold_only"],
             simt_init=effective["simt_init"],
             staged_outputs=effective["staged_outputs"],
+            rolling_threshold=effective["rolling_threshold"],
             **common,
         )
         rotating.output = output

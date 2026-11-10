@@ -37,6 +37,7 @@ class Specialization:
     simt_init: bool = False
     single_plan: bool = False
     staged_outputs: bool = False
+    rolling_threshold: bool = False
 
     def __post_init__(self):
         if any(
@@ -55,6 +56,7 @@ class Specialization:
                 "simt_init",
                 "single_plan",
                 "staged_outputs",
+                "rolling_threshold",
             )
         ):
             raise ValueError("UBmem optimization switches must be booleans")
@@ -62,6 +64,10 @@ class Specialization:
             raise ValueError("Tagged mapping requires one init worker per request")
         if self.simt_init and self.parallel_init:
             raise ValueError("SIMT init requires one init worker per request")
+        if self.rolling_threshold and (
+            self.resident != 16384 or 2 * self.batch > self.aic_count or self.threshold_only
+        ):
+            raise ValueError("rolling_threshold requires resident=16384, split-Q2, and threshold_only=False")
         if self.ordered_pair and not (self.grouped_copy and self.token_bytes == 2624):
             raise ValueError("Ordered pair copy requires grouped four-layer copy")
         if type(self.final_copy_stages) is not int or self.final_copy_stages not in (4, 8):
@@ -112,6 +118,7 @@ class Specialization:
             SIMT_INIT=int(self.simt_init),
             UBMEM_SINGLE_PLAN=int(self.single_plan),
             STAGED_OUTPUTS=int(self.staged_outputs),
+            ROLLING_THRESHOLD=int(self.rolling_threshold),
         )
 
 

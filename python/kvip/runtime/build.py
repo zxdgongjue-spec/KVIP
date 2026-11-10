@@ -50,6 +50,9 @@ def build_libraries(
     threshold_only=False,
     simt_init=False,
     staged_outputs=False,
+    rolling_threshold=False,
+    single_planner=False,
+    skip_final_partition=False,
 ):
     """Build one shape-independent binary per source/toolchain/SoC."""
     if type(compact_reserved) is not bool:
@@ -58,8 +61,23 @@ def build_libraries(
         raise ValueError("parallel_final must be a boolean")
     if type(async_final) is not bool or (async_final and not parallel_final):
         raise ValueError("async_final must be a boolean and requires parallel_final")
-    if any(type(flag) is not bool for flag in (cold_only_prefetch, threshold_only, simt_init, staged_outputs)):
+    if any(
+        type(flag) is not bool
+        for flag in (
+            cold_only_prefetch,
+            threshold_only,
+            simt_init,
+            staged_outputs,
+            rolling_threshold,
+            single_planner,
+            skip_final_partition,
+        )
+    ):
         raise ValueError("Fusion optimization switches must be booleans")
+    if (single_planner or skip_final_partition) and (not parallel_final or async_final):
+        raise ValueError("Resolver optimizations require parallel_final without async_final")
+    if rolling_threshold and threshold_only:
+        raise ValueError("rolling_threshold requires the resident TopK seed; disable threshold_only")
     root = Path(__file__).resolve().parents[3] / "csrc/operators"
     options = dict(
         RUN_MODE="npu",
@@ -74,6 +92,9 @@ def build_libraries(
         THRESHOLD_ONLY=int(threshold_only),
         SIMT_INIT=int(simt_init),
         STAGED_OUTPUTS=int(staged_outputs),
+        ROLLING_THRESHOLD=int(rolling_threshold),
+        URMA_SINGLE_PLANNER=int(single_planner),
+        URMA_SKIP_FINAL_PARTITION=int(skip_final_partition),
     )
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     for relative in (

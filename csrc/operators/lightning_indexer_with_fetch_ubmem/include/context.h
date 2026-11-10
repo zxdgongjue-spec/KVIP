@@ -6,6 +6,12 @@
 #ifndef V9_THRESHOLD_ONLY
 #define V9_THRESHOLD_ONLY 0
 #endif
+#ifndef V9_ROLLING_THRESHOLD
+#define V9_ROLLING_THRESHOLD 0
+#endif
+static_assert(V9_ROLLING_THRESHOLD==0 || V9_ROLLING_THRESHOLD==1,"Rolling threshold must be boolean");
+static_assert(!V9_ROLLING_THRESHOLD || (SIM_RESIDENT==16384 && V9_SPLIT_Q && !V9_THRESHOLD_ONLY),
+              "Rolling threshold requires resident=16384, split-Q2 and resident TopK");
 #ifndef V9_SIMT_INIT
 #define V9_SIMT_INIT 0
 #endif

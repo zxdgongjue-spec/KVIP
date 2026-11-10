@@ -43,9 +43,16 @@ class LIFetchBinding:
         threshold_only=False,
         simt_init=False,
         staged_outputs=False,
+        rolling_threshold=False,
+        single_planner=False,
+        skip_final_partition=False,
     ):
         if resident > 131072:
             raise ValueError("LIFetch hot bitmap supports resident <= 131072")
+        if rolling_threshold and (resident != 16384 or li_tiling != "auto" or 2 * batch > aic_count or threshold_only):
+            raise ValueError("rolling_threshold requires resident=16384, split-Q2, and threshold_only=False")
+        if (single_planner or skip_final_partition) and (not parallel_final or async_final):
+            raise ValueError("Resolver optimizations require parallel_final without async_final")
         self.torch, self.owner = torch, owner
         self.library = load_lifetch_library(library)
         self.device = arguments[0].device
@@ -90,6 +97,9 @@ class LIFetchBinding:
             ("threshold_only", threshold_only),
             ("simt_init", simt_init),
             ("staged_outputs", staged_outputs),
+            ("rolling_threshold", rolling_threshold),
+            ("single_planner", single_planner),
+            ("skip_final_partition", skip_final_partition),
         ):
             if type(expected) is not bool:
                 raise ValueError(f"{name} must be a boolean")

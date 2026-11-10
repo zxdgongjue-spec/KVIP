@@ -8,7 +8,8 @@ import json
 import numpy as np
 
 from kvip.diagnostics import replay_measure
-from kvip.diagnostics.console import emit
+from kvip.diagnostics.console import emit, print_admission
+from kvip.diagnostics.prefetch_admission import ADMISSION_ACCOUNTING, mean_admission
 from kvip.operators.lifetch.geometry import prefetch_budget
 
 
@@ -81,6 +82,7 @@ def summarize_case(case):
     return dict(
         name=case["name"],
         tuning=case["tuning"],
+        prefetch_admission=mean_admission(case["reads_samples"]),
         full_graph_mean_us=case["timing"]["mean_us"],
         full_graph_p50_us=case["timing"]["p50_us"],
         init_diagnostic_p50_us=stages.get("init", {}).get("p50_us"),
@@ -140,6 +142,7 @@ def print_summary(report, output=None):
                 f"cold/selected_union={row['cold_miss_rate']:.4%}; "
                 f"useful_transfers={row['useful_transfers']:g} (includes hot refetch, not pure cold)"
             )
+        print_admission(row.get("prefetch_admission"))
         if "prefetch_cold" in row:
             print(
                 f"  prefetch initial residency: cold={row['prefetch_cold']:g}, "
@@ -231,6 +234,7 @@ def run_ablation(args, archive, retained):
         geometry=archive.manifest["geometry"],
         cases=cases,
         summary=[summarize_case(case) for case in cases],
+        prefetch_admission_accounting=ADMISSION_ACCOUNTING,
         interpretation=(
             "Sequential cases reuse one Runtime, imported DDR arena, access table and transport connections. "
             "Full-graph latency is isolated group latency, not service TPOT; stage diagnostics add instrumentation."

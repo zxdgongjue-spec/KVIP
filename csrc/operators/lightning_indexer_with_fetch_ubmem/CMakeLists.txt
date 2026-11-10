@@ -28,7 +28,8 @@ set(COLD_ONLY_PREFETCH 0 CACHE STRING "Speculatively read cold history only; fin
 set(THRESHOLD_ONLY 0 CACHE STRING "Compute the exact resident admission threshold without materializing hot TopK")
 set(SIMT_INIT 0 CACHE STRING "Initialize per-row state in a single SIMT pass")
 set(STAGED_OUTPUTS 0 CACHE STRING "Stage hot logical IDs and packed outputs in UB before TND publication")
-foreach(flag COLD_ONLY_PREFETCH THRESHOLD_ONLY SIMT_INIT UBMEM_SINGLE_PLAN STAGED_OUTPUTS)
+set(ROLLING_THRESHOLD 0 CACHE STRING "Move existing chunk TopK merges into LI and refresh admission threshold")
+foreach(flag COLD_ONLY_PREFETCH THRESHOLD_ONLY SIMT_INIT UBMEM_SINGLE_PLAN STAGED_OUTPUTS ROLLING_THRESHOLD)
   if(NOT ${flag} MATCHES "^[01]$")
     message(FATAL_ERROR "${flag} must be 0 or 1")
   endif()
@@ -79,6 +80,9 @@ set(_split 0)
 if(LI_TILING STREQUAL "auto" AND _split_tasks LESS_EQUAL AIC_COUNT)
   set(_split 1)
 endif()
+if(ROLLING_THRESHOLD AND (NOT SIM_RESIDENT EQUAL 16384 OR NOT _split OR THRESHOLD_ONLY))
+  message(FATAL_ERROR "Rolling threshold requires resident=16384, split-Q2, and THRESHOLD_ONLY=0")
+endif()
 math(EXPR _li_cores "${SIM_BATCH}*(1+${_split})")
 set(_rounds ${INTERMEDIATE_FETCHES})
 if(_rounds GREATER _li_cores)
@@ -106,6 +110,7 @@ set(_definitions
   V9_UBMEM_ORDERED_PAIR=${UBMEM_ORDERED_PAIR}
   V9_UBMEM_SINGLE_PLAN=${UBMEM_SINGLE_PLAN}
   V9_STAGED_OUTPUTS=${STAGED_OUTPUTS}
+  V9_ROLLING_THRESHOLD=${ROLLING_THRESHOLD}
   V9_COLD_ONLY_PREFETCH=${COLD_ONLY_PREFETCH} V9_THRESHOLD_ONLY=${THRESHOLD_ONLY} V9_SIMT_INIT=${SIMT_INIT}
   V9_UBMEM=1 V9_UBPIPE_DEPTH=8 V9_UBPIPE_ROWS=4 V9_WINDOW_UBPIPE_DEPTH=8
   V9_WINDOW_COPY_ENGINE=0 V9_WINDOW_SCAN_FUSED=0 V9_WINDOW_PREPARED_GROUPS=0

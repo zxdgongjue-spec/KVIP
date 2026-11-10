@@ -47,6 +47,52 @@ def saved_case():
     )
 
 
+@pytest.mark.parametrize("kind", ("single", "paired", "comparison"))
+def test_admission_report_has_one_compact_window_vector_without_claiming_final_misses(kind, capsys):
+    from kvip.diagnostics.console import compact_report
+    from kvip.diagnostics.prefetch_admission import mean_admission
+
+    case = saved_case()
+    counts = dict(
+        rounds=2,
+        window_limit=4,
+        packed_rows=1,
+        active_rows=1,
+        visited_epochs=2,
+        unvisited_epochs=0,
+        window_limited_epochs=1,
+        other_or_tied_limited_epochs=0,
+        budget_exhausted_epochs=0,
+        suppressed_candidates=3,
+        remaining_admissible_budget=3,
+        rows_suppressed_with_budget_left=1,
+        posted_by_epoch=[1, 4],
+        suppressed_by_epoch=[0, 3],
+    )
+    case["reads_samples"][0]["prefetch_admission"] = counts
+    if kind == "single":
+        report = case
+    elif kind == "paired":
+        report = dict(status="pass", geometry=case["geometry"], cases=[dict(name="budget", **case)])
+    else:
+        report = dict(
+            status="pass",
+            geometry=case["geometry"],
+            table={
+                "urma-fused": dict(
+                    **case["timing"], reads_per_round={}, prefetch_admission=mean_admission(case["reads_samples"])
+                )
+            },
+        )
+    compact_report(report)
+    output = capsys.readouterr().out
+    lines = [line for line in output.splitlines() if "admission/round" in line]
+    assert len(lines) == 1
+    assert "window_limited=1" in lines[0] and "unused_budget=3" in lines[0]
+    assert "sent=[1,4] suppressed=[0,3]" in lines[0]
+    assert "not final misses" in lines[0]
+
+
 def test_quiet_captures_native_and_buffered_c_stdio_but_keeps_progress(tmp_path):
     result = execute(
         r"""

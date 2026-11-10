@@ -107,6 +107,13 @@ class UpdateMoveTest(unittest.TestCase):
         extended = extended.replace("kPlanRecords", "kExtendedRecords").replace(
             "kPlanCandidates", "kExtendedCandidates"
         )
+        # Only the producer prefix and its path-closing prefix are live;
+        # spare records intentionally retain arbitrary previous-round data.
+        extended = extended.replace(
+            "i<kExtendedRecords;++i)if(src[i]!=UINT32_MAX",
+            "i<kExtendedRecords;++i)if((i<n || (i>=kExtendedCandidates && "
+            "i<kExtendedCandidates+n)) && src[i]!=UINT32_MAX",
+        )
         extended = extended.replace("Move<1>", "MoveExtended<1>")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

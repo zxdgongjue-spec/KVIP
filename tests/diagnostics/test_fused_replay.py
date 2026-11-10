@@ -151,6 +151,7 @@ def test_tuning_keeps_snapshot_immutable_and_validates_only_known_options():
         threshold_only=False,
         simt_init=False,
         staged_outputs=False,
+        rolling_threshold=False,
     )
     assert geometry == dict(prefetch_limit=512, window_limit=64, requested_windows=8)
     assert fusion_tuning(geometry, "ubmem")["parallel_init"] is False
@@ -169,10 +170,13 @@ def test_urma_tuning_has_only_real_switches_and_fixed_inactive_gate():
         skip_inactive=True,
         parallel_final=False,
         async_final=False,
+        single_planner=False,
+        skip_final_partition=False,
         cold_only_prefetch=False,
         threshold_only=False,
         simt_init=False,
         staged_outputs=False,
+        rolling_threshold=False,
     )
     assert fusion_tuning(geometry, "urma", {"parallel_final": True})["parallel_final"] is True
     assert fusion_tuning(geometry, "ubmem", {"grouped_copy": True})["grouped_copy"] is True
@@ -194,6 +198,11 @@ def test_urma_tuning_has_only_real_switches_and_fixed_inactive_gate():
         ("urma", {"cold_only_prefetch": 1}),
         ("ubmem", {"threshold_only": 1}),
         ("ubmem", {"simt_init": True, "parallel_init": True}),
+        ("urma", {"single_planner": True}),
+        ("urma", {"skip_final_partition": True, "parallel_final": True, "async_final": True}),
+        ("ubmem", {"single_planner": False}),
+        ("ubmem", {"rolling_threshold": 1}),
+        ("urma", {"rolling_threshold": True, "threshold_only": True}),
         ("urma", []),
     ):
         with pytest.raises(ValueError):

@@ -62,6 +62,31 @@ def test_comparison_preserves_boundary_tie_and_actual_read_evidence():
     assert value["same_selection_across_transports"] == dict(serial=False)
 
 
+def test_comparison_keeps_admission_vectors_and_their_accounting_scope(capsys):
+    import numpy as np
+    from kvip.diagnostics.prefetch_admission import ADMISSION_ACCOUNTING, prefetch_admission
+
+    entries = results()
+    row = np.zeros((1, 256), dtype=np.int32)
+    row[0, [8, 9, 16]] = 4
+    row[0, [10, 48]] = 3
+    row[0, 208:211] = (8192, 8, 2048)
+    row[0, 214:216] = (1, 2)
+    row[0, 246] = 2
+    counts = prefetch_admission(row, window_limit=4, rounds=2)
+    for name in ("ubmem-fused", "urma-fused"):
+        entries[name]["reads_samples"][0]["prefetch_admission"] = counts
+    original = copy.deepcopy(entries)
+    report = summarize(entries)
+    assert entries == original
+    assert report["table"]["ubmem-fused"]["prefetch_admission"]["posted_by_epoch"] == [4.0, 0.0]
+    assert report["table"]["urma-serial"]["prefetch_admission"] is None
+    assert report["prefetch_admission_accounting"] == ADMISSION_ACCOUNTING
+    display(report)
+    lines = [line for line in capsys.readouterr().out.splitlines() if "admission/round" in line]
+    assert len(lines) == 2 and all("sent=[4,0] suppressed=[3,0]" in line for line in lines)
+
+
 def test_demand_is_separate_from_observed_transfers_and_rates_name_the_denominator(capsys):
     entries = results()
     width = 2624
