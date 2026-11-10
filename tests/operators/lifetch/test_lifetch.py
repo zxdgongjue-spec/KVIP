@@ -432,8 +432,21 @@ def test_tagged_ubmem_single_plan_matches_replicated_descriptors_and_locations(t
     _check_hot_resolver(tmp_path, "ubmem", tagged=True, single_plan=True)
 
 
+@pytest.mark.parametrize("tagged", (False, True))
+@pytest.mark.parametrize("single_plan", (False, True))
+def test_ubmem_cached_buckets_preserves_actual_plan_and_reduces_hash_lookups(tmp_path, tagged, single_plan):
+    _check_hot_resolver(tmp_path, "ubmem", tagged=tagged, single_plan=single_plan, cached_buckets=True)
+
+
 def _check_hot_resolver(
-    tmp_path, transport, *, tagged=False, single_plan=False, skip_final_partition=False, final_workers=4
+    tmp_path,
+    transport,
+    *,
+    tagged=False,
+    single_plan=False,
+    skip_final_partition=False,
+    final_workers=4,
+    cached_buckets=False,
 ):
     """Execute production SIMT logic serially; CANN simulator covers barriers."""
     import subprocess
@@ -467,8 +480,8 @@ def _check_hot_resolver(
     )
     if transport == "ubmem":
         functions = function(metadata, "CurrentMappingTag") + "\n" + functions
-    functions += "\n" + function(resolver, "SparseHash")
-    functions += "\ntemplate<unsigned Threads>\n" + function(
+    functions += "\n" + function(resolver, "SparseHash").replace("{", "{++hashCalls;", 1)
+    functions += "\ntemplate<unsigned Threads,bool CacheBuckets=false>\n" + function(
         ROOT / "csrc/operators/common/lifetch/resident_selection.h", "ResolveResidentPlan"
     )
     template = (
@@ -481,6 +494,7 @@ def _check_hot_resolver(
     baseline = resolve.replace(
         "if(count>candidateCount && ordinal>=0)asc_stcg(changes+kLruSlots+rank,UINT32_MAX);", ""
     ).replace("ReplicatedResolve(", "BaselineResolve(", 1)
+    baseline = baseline.replace("ResolveResidentPlan<Threads,V9_CACHED_BUCKETS>", "ResolveResidentPlan<Threads,false>")
     if transport == "urma":
         baseline = baseline.replace("V9_URMA_SINGLE_PLANNER", "0").replace("V9_URMA_SKIP_FINAL_PARTITION", "0")
     functions += "\n" + template + "\n" + baseline
@@ -524,6 +538,7 @@ void asc_atomic_add(unsigned* p,unsigned v){*p+=v;}
 unsigned asc_shfl_up(unsigned v,unsigned){return v;}
 void asc_syncthreads(){} void asc_threadfence(){}
 #include "mapping.h"
+uint64_t hashCalls=0;
 FUNCTIONS
 std::vector<unsigned> Plan(std::vector<unsigned>& slots,std::vector<unsigned>& changes,unsigned count,unsigned h,unsigned r){
  std::vector<unsigned> work(2*kExtendedHash),status(128),records(2*kExtendedRecords),plan(8+2*kExtendedRecords);
@@ -536,6 +551,7 @@ std::vector<unsigned> Plan(std::vector<unsigned>& slots,std::vector<unsigned>& c
 int main(){
  std::mt19937 rng(71);
  for(unsigned trial=0;trial<30;++trial){
+  hashCalls=0;
   const unsigned h=32768,r=trial%2?16384:8192,workers=4,used=trial%3?512:0;
   std::vector<unsigned> candidates(r);std::iota(candidates.begin(),candidates.end(),0);
   std::shuffle(candidates.begin(),candidates.end(),rng);candidates.resize(2048);
@@ -602,6 +618,7 @@ int main(){
    assert(cfg[1]==expectedError && total==0 && changeCount==2048);
    continue; // Production rowStatus prevents Index planning on this error.
   }
+  const uint64_t actualHashes=hashCalls;
   std::vector<unsigned> ownership(r),seen(r);std::iota(ownership.begin(),ownership.end(),0);
   for(unsigned i=0;i<changeCount;++i)if(changes[i]!=UINT32_MAX){assert(changeSlots[i]<r);assert(!seen[changeSlots[i]]++);ownership[changeSlots[i]]=changes[i];}
   for(unsigned i=0;i<8192;++i){if(selected[i]==UINT32_MAX){assert(output[i]==UINT32_MAX);continue;}
@@ -615,7 +632,7 @@ int main(){
   std::fill(changes.begin(),changes.end(),UINT32_MAX);std::fill(changeSlots.begin(),changeSlots.end(),0);
   std::copy(candidates.begin(),candidates.end(),changeSlots.begin());
   for(unsigned i=0;i<used;++i)changes[i]=r+i;
-  total=0;changeCount=2048;
+  total=0;changeCount=2048;hashCalls=0;
   for(unsigned w=0;w<workers;++w){
    cold=0;locations=selected;
    for(unsigned i=0;i<8192;++i){unsigned t=selected[i];
@@ -631,6 +648,10 @@ int main(){
    if(changes[i]!=UINT32_MAX)assert(changeSlots[i]==actualSlots[i]);}
   assert(Plan(changeSlots,changes,changeCount,h,r)==actualPlan);
   assert(remote==actualRemote && blocks==actualBlocks && offsets==actualOffsets && destinations==actualDestinations);
+#if V9_CACHED_BUCKETS
+  assert(hashCalls>=actualHashes);
+  if(trial<24 && actualTotal)assert(hashCalls>actualHashes);
+#endif
  }
 }
 """.replace("FUNCTIONS", functions)
@@ -689,6 +710,7 @@ int main(){
                 "V9_AIC_COUNT=32",
                 "V9_INTERMEDIATE_FETCHES=2",
                 "V9_FINAL_REPLICATED=1",
+                f"V9_CACHED_BUCKETS={int(cached_buckets)}",
             )
         ]
         source = source.replace("r=trial%2?16384:8192", "r=SIM_RESIDENT")

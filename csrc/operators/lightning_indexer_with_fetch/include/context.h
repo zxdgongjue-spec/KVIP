@@ -16,6 +16,13 @@ static_assert(!V9_ROLLING_THRESHOLD || !V9_THRESHOLD_ONLY,"Rolling threshold req
 #ifndef V9_SIMT_INIT
 #define V9_SIMT_INIT 0
 #endif
+#ifndef V9_RESERVED_UB
+#define V9_RESERVED_UB 0
+#endif
+static_assert(V9_RESERVED_UB==0 || V9_RESERVED_UB==1,"Reserved UB must be boolean");
+#if V9_RESERVED_UB && (!V9_COMPACT_RESERVED || V9_SIMT_INIT)
+#error "Reserved UB requires compact reserved with scalar init"
+#endif
 #ifndef V9_STAGED_OUTPUTS
 #define V9_STAGED_OUTPUTS 0
 #endif
@@ -32,6 +39,13 @@ static_assert(V9_URMA_PARALLEL_FINAL==0 || V9_URMA_PARALLEL_FINAL==1,"Parallel f
 #endif
 static_assert(V9_URMA_ASYNC_FINAL==0 || V9_URMA_ASYNC_FINAL==1,"Async final Get must be 0 or 1");
 static_assert(!V9_URMA_ASYNC_FINAL || V9_URMA_PARALLEL_FINAL,"Async final Get requires parallel completion");
+#ifndef V9_POST_FINAL_BEFORE_INDEX
+#define V9_POST_FINAL_BEFORE_INDEX 0
+#endif
+static_assert(V9_POST_FINAL_BEFORE_INDEX==0 || V9_POST_FINAL_BEFORE_INDEX==1,
+              "Post final before Index must be boolean");
+static_assert(!V9_POST_FINAL_BEFORE_INDEX || (V9_URMA_PARALLEL_FINAL && !V9_URMA_ASYNC_FINAL),
+              "Post final before Index requires parallel completion without safe-prefix submission");
 #ifndef V9_URMA_SINGLE_PLANNER
 #define V9_URMA_SINGLE_PLANNER 0
 #endif

@@ -53,6 +53,8 @@ def build_libraries(
     rolling_threshold=False,
     single_planner=False,
     skip_final_partition=False,
+    post_final_before_index=False,
+    reserved_ub=False,
 ):
     """Build one shape-independent binary per source/toolchain/SoC."""
     if type(compact_reserved) is not bool:
@@ -71,13 +73,17 @@ def build_libraries(
             rolling_threshold,
             single_planner,
             skip_final_partition,
+            post_final_before_index,
+            reserved_ub,
         )
     ):
         raise ValueError("Fusion optimization switches must be booleans")
-    if (single_planner or skip_final_partition) and (not parallel_final or async_final):
+    if (single_planner or skip_final_partition or post_final_before_index) and (not parallel_final or async_final):
         raise ValueError("Resolver optimizations require parallel_final without async_final")
     if rolling_threshold and threshold_only:
         raise ValueError("rolling_threshold requires the resident TopK seed; disable threshold_only")
+    if reserved_ub and (not compact_reserved or simt_init):
+        raise ValueError("reserved_ub requires compact_reserved=True and simt_init=False")
     root = Path(__file__).resolve().parents[3] / "csrc/operators"
     options = dict(
         RUN_MODE="npu",
@@ -95,6 +101,8 @@ def build_libraries(
         ROLLING_THRESHOLD=int(rolling_threshold),
         URMA_SINGLE_PLANNER=int(single_planner),
         URMA_SKIP_FINAL_PARTITION=int(skip_final_partition),
+        POST_FINAL_BEFORE_INDEX=int(post_final_before_index),
+        RESERVED_UB=int(reserved_ub),
     )
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     for relative in (

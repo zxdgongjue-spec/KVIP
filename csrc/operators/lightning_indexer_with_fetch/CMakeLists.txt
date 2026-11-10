@@ -15,21 +15,26 @@ set(URMA_PARALLEL_FINAL 0 CACHE STRING "Opt-in independent final Get worker laun
 set(URMA_ASYNC_FINAL 0 CACHE STRING "Submit safe final reads before Index and drain after prefetch join")
 set(URMA_SINGLE_PLANNER 0 CACHE STRING "Compute each request's final plan once, retaining parallel Get workers")
 set(URMA_SKIP_FINAL_PARTITION 0 CACHE STRING "Skip safe-prefix partition after joining prefetch")
+set(POST_FINAL_BEFORE_INDEX 0 CACHE STRING "Join prefetch and post final reads before Index; drain after Index")
 set(COLD_ONLY_PREFETCH 0 CACHE STRING "Speculatively read cold history only; final TopK repair is unchanged")
 set(THRESHOLD_ONLY 0 CACHE STRING "Compute the exact resident admission threshold without materializing hot TopK")
 set(SIMT_INIT 0 CACHE STRING "Initialize per-row state in a single SIMT pass")
 set(STAGED_OUTPUTS 0 CACHE STRING "Stage hot logical IDs and packed outputs in UB before TND publication")
 set(ROLLING_THRESHOLD 0 CACHE STRING "Move existing chunk TopK merges into LI and refresh admission threshold")
-foreach(flag COLD_ONLY_PREFETCH THRESHOLD_ONLY SIMT_INIT STAGED_OUTPUTS ROLLING_THRESHOLD URMA_SINGLE_PLANNER URMA_SKIP_FINAL_PARTITION)
+set(RESERVED_UB 0 CACHE STRING "Build the resident=16384 inverse map in UB and publish once")
+foreach(flag COLD_ONLY_PREFETCH THRESHOLD_ONLY SIMT_INIT STAGED_OUTPUTS ROLLING_THRESHOLD URMA_SINGLE_PLANNER URMA_SKIP_FINAL_PARTITION POST_FINAL_BEFORE_INDEX RESERVED_UB)
   if(NOT ${flag} MATCHES "^[01]$")
     message(FATAL_ERROR "${flag} must be 0 or 1")
   endif()
 endforeach()
-if((URMA_SINGLE_PLANNER OR URMA_SKIP_FINAL_PARTITION) AND (NOT URMA_PARALLEL_FINAL OR URMA_ASYNC_FINAL))
+if((URMA_SINGLE_PLANNER OR URMA_SKIP_FINAL_PARTITION OR POST_FINAL_BEFORE_INDEX) AND (NOT URMA_PARALLEL_FINAL OR URMA_ASYNC_FINAL))
   message(FATAL_ERROR "Resolver optimizations require URMA_PARALLEL_FINAL=1 and URMA_ASYNC_FINAL=0")
 endif()
 if(ROLLING_THRESHOLD AND THRESHOLD_ONLY)
   message(FATAL_ERROR "Rolling threshold requires the resident TopK seed")
+endif()
+if(RESERVED_UB AND (NOT COMPACT_RESERVED OR SIMT_INIT))
+  message(FATAL_ERROR "RESERVED_UB requires COMPACT_RESERVED=1 and SIMT_INIT=0")
 endif()
 if(NOT COMPACT_RESERVED MATCHES "^[01]$")
   message(FATAL_ERROR "COMPACT_RESERVED must be 0 or 1")
@@ -49,6 +54,8 @@ ascendc_compile_options(v9_kernel PRIVATE -DV9_RESOLVER_COMPARE=${RESOLVER_COMPA
   -DV9_URMA_PARALLEL_FINAL=${URMA_PARALLEL_FINAL} -DV9_URMA_ASYNC_FINAL=${URMA_ASYNC_FINAL}
   -DV9_URMA_SINGLE_PLANNER=${URMA_SINGLE_PLANNER} -DV9_URMA_SKIP_FINAL_PARTITION=${URMA_SKIP_FINAL_PARTITION}
   -DV9_ROLLING_THRESHOLD=${ROLLING_THRESHOLD}
+  -DV9_POST_FINAL_BEFORE_INDEX=${POST_FINAL_BEFORE_INDEX}
+  -DV9_RESERVED_UB=${RESERVED_UB}
   -DV9_COLD_ONLY_PREFETCH=${COLD_ONLY_PREFETCH} -DV9_THRESHOLD_ONLY=${THRESHOLD_ONLY} -DV9_SIMT_INIT=${SIMT_INIT} -O2 -g --cce-auto-sync=off
   -mllvm -user-reserved-ub-size=223232 -DV9_USER_UB_BYTES=223232
   -DV9_PARTIAL_SCAN_SIMD=1 -DV9_PROBE_EPOCH=0 -DV9_INTERMEDIATE_PROFILING=0
@@ -56,9 +63,12 @@ ascendc_compile_options(v9_kernel PRIVATE -DV9_RESOLVER_COMPARE=${RESOLVER_COMPA
 add_library(v9_bridge SHARED op_host/launch.cpp)
 target_include_directories(v9_bridge PRIVATE ${KVAF_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_definitions(v9_bridge PRIVATE V9_RESOLVER_COMPARE=${RESOLVER_COMPARE} V9_URMA_PARALLEL_FINAL=${URMA_PARALLEL_FINAL} V9_URMA_ASYNC_FINAL=${URMA_ASYNC_FINAL}
+  V9_COMPACT_RESERVED=${COMPACT_RESERVED}
   V9_COLD_ONLY_PREFETCH=${COLD_ONLY_PREFETCH} V9_THRESHOLD_ONLY=${THRESHOLD_ONLY} V9_SIMT_INIT=${SIMT_INIT}
   V9_STAGED_OUTPUTS=${STAGED_OUTPUTS})
 target_compile_definitions(v9_bridge PRIVATE V9_ROLLING_THRESHOLD=${ROLLING_THRESHOLD}
+  V9_POST_FINAL_BEFORE_INDEX=${POST_FINAL_BEFORE_INDEX}
+  V9_RESERVED_UB=${RESERVED_UB}
   V9_URMA_SINGLE_PLANNER=${URMA_SINGLE_PLANNER} V9_URMA_SKIP_FINAL_PARTITION=${URMA_SKIP_FINAL_PARTITION})
 target_link_libraries(v9_bridge PRIVATE v9_kernel host_intf_pub ascendcl)
 # Independent AIV target: does not change the LI/Fetch compilation options.

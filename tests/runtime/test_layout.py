@@ -144,6 +144,27 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
             build.build_libraries(**options, parallel_final=True, async_final=True, **{flag: True})
     with pytest.raises(ValueError, match="resident TopK seed"):
         build.build_libraries(**options, rolling_threshold=True, threshold_only=True)
+    posted = build.build_libraries(**options, parallel_final=True, post_final_before_index=True)
+    assert posted != parallel
+    assert "-DPOST_FINAL_BEFORE_INDEX=1" in commands[-2]
+    assert build.build_libraries(**options, parallel_final=True, post_final_before_index=True) == posted
+    for invalid in (
+        dict(post_final_before_index=True),
+        dict(parallel_final=True, async_final=True, post_final_before_index=True),
+        dict(parallel_final=True, post_final_before_index=1),
+    ):
+        with pytest.raises(ValueError):
+            build.build_libraries(**options, **invalid)
+    staged_reserved = build.build_libraries(**options, compact_reserved=True, reserved_ub=True)
+    assert staged_reserved != compact
+    assert "-DRESERVED_UB=1" in commands[-2]
+    for invalid in (
+        dict(reserved_ub=1),
+        dict(reserved_ub=True),
+        dict(reserved_ub=True, compact_reserved=True, simt_init=True),
+    ):
+        with pytest.raises(ValueError):
+            build.build_libraries(**options, **invalid)
 
 
 def test_actual_operator_cmake_resolves_relocated_sources(tmp_path):

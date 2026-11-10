@@ -147,11 +147,13 @@ def test_tuning_keeps_snapshot_immutable_and_validates_only_known_options():
         ordered_pair=False,
         merge_outputs=False,
         single_plan=False,
+        cached_buckets=False,
         cold_only_prefetch=False,
         threshold_only=False,
         simt_init=False,
         staged_outputs=False,
         rolling_threshold=False,
+        reserved_ub=False,
     )
     assert geometry == dict(prefetch_limit=512, window_limit=64, requested_windows=8)
     assert fusion_tuning(geometry, "ubmem")["parallel_init"] is False
@@ -172,11 +174,13 @@ def test_urma_tuning_has_only_real_switches_and_fixed_inactive_gate():
         async_final=False,
         single_planner=False,
         skip_final_partition=False,
+        post_final_before_index=False,
         cold_only_prefetch=False,
         threshold_only=False,
         simt_init=False,
         staged_outputs=False,
         rolling_threshold=False,
+        reserved_ub=False,
     )
     assert fusion_tuning(geometry, "urma", {"parallel_final": True})["parallel_final"] is True
     assert fusion_tuning(geometry, "ubmem", {"grouped_copy": True})["grouped_copy"] is True
@@ -203,6 +207,15 @@ def test_urma_tuning_has_only_real_switches_and_fixed_inactive_gate():
         ("ubmem", {"single_planner": False}),
         ("ubmem", {"rolling_threshold": 1}),
         ("urma", {"rolling_threshold": True, "threshold_only": True}),
+        ("urma", {"post_final_before_index": True}),
+        ("urma", {"post_final_before_index": 1, "parallel_final": True}),
+        ("urma", {"post_final_before_index": True, "parallel_final": True, "async_final": True}),
+        ("ubmem", {"post_final_before_index": True}),
+        ("urma", {"cached_buckets": False}),
+        ("ubmem", {"cached_buckets": 1}),
+        ("ubmem", {"reserved_ub": True}),
+        ("urma", {"reserved_ub": True, "compact_reserved": True, "simt_init": True}),
+        ("ubmem", {"reserved_ub": True, "compact_reserved": True, "parallel_init": True}),
         ("urma", []),
     ):
         with pytest.raises(ValueError):
@@ -223,6 +236,35 @@ def test_parallel_final_stages_join_prefetch_then_get_then_reduce():
         launch()
     assert calls[-3:] == [
         ("v9_wait", (11, 33, 44)),
+        ("v9_parallel_fetch", (11, 33, 44)),
+        ("aclrtlaunch_v9_fetch_update_kernel", (16, 33, 11, 22)),
+    ]
+
+
+def test_final_post_before_index_stage_order_and_arguments():
+    calls = []
+    library = Library(calls)
+    rotating = SimpleNamespace(
+        library=library,
+        bindings=SimpleNamespace(data_ptr=lambda: 11),
+        shape_pointer=44,
+        parallel_final=True,
+        post_final_before_index=True,
+    )
+    update = SimpleNamespace(library=library, bindings=SimpleNamespace(data_ptr=lambda: 22))
+    lease = SimpleNamespace(check_stream=lambda: SimpleNamespace(npu_stream=33))
+    stages = fused_stages("urma", rotating, update, lease, 16)
+    assert [name for name, _ in stages][3:] == [
+        "prefetch_join_and_final_submit",
+        "index_update_during_final_get",
+        "final_fetch_wait",
+        "final_completion",
+    ]
+    for _, launch in stages:
+        launch()
+    assert calls[3:] == [
+        ("v9_submit_final", (11, 33, 44)),
+        ("kvop_direct_update_outputs_early", (16, 22, 33)),
         ("v9_parallel_fetch", (11, 33, 44)),
         ("aclrtlaunch_v9_fetch_update_kernel", (16, 33, 11, 22)),
     ]

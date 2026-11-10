@@ -504,6 +504,26 @@ validation before use in serving:
   safe/conflicting descriptor partition. Both require `parallel_final=true`
   and `async_final=false`: this path joins prefetch before any final Get, so the
   safe-prefix split is unnecessary. Neither option adds a kernel launch.
+- `reserved_ub=true` builds the reserved-hot inverse map in a 64 KiB UB
+  scratch area, then publishes the entire row with one DMA. It replaces
+  2048 scattered GM stores per active request, retaining the same overwrite
+  protection and the existing tail-init VF. It requires resident=16384,
+  `compact_reserved=true`, `simt_init=false`, and UBmem `parallel_init=false`.
+  Init scratch grows by 64 KiB; init remains inside the measured graph.
+- UBmem `cached_buckets=true` retains the hash bucket of each selected miss
+  in currently unused slot scratch, then reuses it in the subsequent rank and
+  location passes. The slots become destination-slot storage only after all
+  bucket consumers finish. Outputs, ordering and the selected hot slots are
+  unchanged; this reduces repeated hash probes, not payload copy bytes.
+- URMA `post_final_before_index=true` joins each row's prefetch and submits
+  its whole final-read ranges before Index. The same final workers drain their
+  own queues after Index, and the final completion/error checks remain. It
+  requires `parallel_final=true`, `async_final=false`; it is compatible with
+  single-planner/skip-partition. Final payload reads can overlap Index metadata
+  work without destination conflicts with prefetch. The row worker submits
+  four queues sequentially, so increased submit cost may offset hidden NIC
+  wait. No kernel launch is added. Stage diagnostics identify the combined
+  prefetch join/submission explicitly.
 
 Extended Index planning now clears and scans only its producer high-water
 prefix and the corresponding path-closing prefix. Their ABI offsets and record
@@ -520,6 +540,32 @@ to each individual service visit. Unused capacity in an early window is not a
 separate bank of credits, and candidates skipped at that visit are not retried
 automatically. Compare window changes at a fixed total budget before increasing
 the total; report complete graph latency rather than summing diagnostic stages.
+
+Node24 NPU4's `7f3a767` window sweep measured UBmem means of 646.998 us
+(window32), 668.706 us (window64), 671.793 us (window128), and 651.503 us
+(window64+rolling), with a fixed per-request total of 256. Wider windows moved
+work from final Fetch into LI but increased the full graph. Retain window32
+as that snapshot's measured baseline; rolling32 has not been measured.
+URMA measured 512.010 us (window64), 493.294 us (window128), 488.878 us
+(window128+single planner+skip partition), and 481.299 us (plus rolling),
+with total512: 6.00% below its same-run fused baseline. These results do not
+establish 35% improvement over serial, whose current-version timings must be
+measured separately. The new init/hash/post experiments remain opt-in.
+
+After running serial references and fused variants on one revision, reuse
+their JSON files without another device run:
+
+```bash
+python3 -m kvip.diagnostics.compare --from-results \
+  ubmem-serial.json urma-serial.json ubmem-variants.json urma-variants.json \
+  --output summary.json --quiet
+```
+
+The command rejects failed or mixed-snapshot/revision/geometry/scope cases,
+retains all candidate means, and selects the lowest validated fused mean in
+each sweep. It reports target attainment against the saved serial references.
+This is selection from a finite sweep, not an independent remeasurement of
+the winner; the summary records that limitation.
 
 Three additional opt-in switches target the remaining stages; all default to
 false and preserve the selected KV bytes and required state updates:

@@ -125,8 +125,16 @@ inline void InitializeRoundSimt(uint32_t batches,uint32_t history,uint32_t resid
     InitializeTailMappingsBody(history,resident,ctx,b,reservedRow);
 }
 #endif
+#if V9_RESERVED_UB
+__simt_vf__ __aicore__ LAUNCH_BOUND(256)
+inline void InitializeReservedLocal(uint32_t history,uint32_t resident,__gm__ Context* ctx,
+    uint32_t b,uint64_t reservedRow,__ubuf__ uint32_t* inverse,const __ubuf__ uint32_t* candidates) {
+    if(reservedRow)ScatterReservedHotLocal(inverse,candidates,resident,kLruSlots);
+    InitializeTailMappingsBody(history,resident,ctx,b,0);
+}
+#endif
 __aicore__ inline uint64_t InitializeRound(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t b) {
-    TPipe pipe;TBuf<TPosition::VECCALC> storage;pipe.InitBuffer(storage,4096*4);
+    TPipe pipe;TBuf<TPosition::VECCALC> storage;pipe.InitBuffer(storage,(4096+V9_RESERVED_UB*16384)*4);
     auto local=storage.Get<uint32_t>();
 #if !V9_SIMT_INIT
     Duplicate(local,uint32_t(0),4096);
@@ -148,28 +156,50 @@ __aicore__ inline uint64_t InitializeRound(uint32_t rt_batch,uint32_t rt_history
     }
     SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
 #endif
-    Duplicate(local,UINT32_MAX,4096);
+    uint64_t reservedRow=0;
+#if V9_RESERVED_UB
+    reservedRow=ReservedHotRow(ctx->lruSlots,ctx->reservedHot,ctx->queryEnds,b,rt_resident);
+#endif
+    Duplicate(local,UINT32_MAX,4096+(V9_RESERVED_UB && reservedRow?16384:0));
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     FillRoundWords(ctx->mapping+uint64_t(b)*rt_history*4,rt_history,local);
     // Prefetch may leave candidate holes. Final resolver owns every extended
     // rank it publishes, including the sentinel holes below its high-water mark.
     if(ctx->changes)FillRoundWords(ctx->changes+b*kChangeCapacity*4,kLruSlots,local);
-    uint64_t reservedRow=0;
-#if V9_COMPACT_RESERVED
+#if V9_COMPACT_RESERVED && !V9_RESERVED_UB
     reservedRow=ClearReservedHot(ctx->lruSlots,ctx->reservedHot,ctx->queryEnds,b,rt_resident,local);
 #endif
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
 #if !V9_SIMT_INIT
     // Copy only the candidate prefix; resolver writes extended destinations.
-    if(ctx->changeSlots) {
+    if(ctx->changeSlots || (V9_RESERVED_UB && reservedRow)) {
         GlobalTensor<uint32_t> source,target;
         source.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots);
-        target.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+b*kChangeCapacity);
         DataCopy(local,source,kLruSlots);
         SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-        DataCopy(target,local,kLruSlots);
+        if(ctx->changeSlots) {
+            target.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+b*kChangeCapacity);
+            DataCopy(target,local,kLruSlots);
+        }
         SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     }
+#endif
+#if V9_RESERVED_UB
+    // The tail initializer does not depend on Row or queue bootstrap. Move
+    // the same VF here while the staged candidates/inverse are still live.
+    if(reservedRow) {
+        SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+    }
+    auto inverse=local[4096];
+    Simt::VF_CALL<InitializeReservedLocal>(Simt::Dim3{256,1,1},rt_history,rt_resident,ctx,b,reservedRow,
+        reinterpret_cast<__ubuf__ uint32_t*>(inverse.GetPhyAddr()),
+        reinterpret_cast<const __ubuf__ uint32_t*>(local.GetPhyAddr()));
+    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    if(reservedRow) {
+        GlobalTensor<uint32_t> output;output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(reservedRow));
+        DataCopy(output,inverse,rt_resident);
+    }
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
 #endif
     pipe.Destroy();
     return reservedRow;
@@ -207,7 +237,9 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
         auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
         row->entity=args.channel_entity;row->queue=args.queue_state;
         row->addresses=addresses;row->output=output;
+#if !V9_RESERVED_UB
         Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},rt_history,rt_resident,ctx,b,reservedRow);
+#endif
 #endif
         const uint64_t initialHead=queue->sq_producer_index;
         const uint32_t queueLimit=entity->sq_depth>1 ? entity->sq_depth-1 : 0;
@@ -300,8 +332,15 @@ extern "C" __global__ __aicore__ void v9_wait_kernel(GM_ADDR bindings) {
     }
 #endif
 }
-#if defined(__CCE_AICORE__) && V9_URMA_ASYNC_FINAL
+#if defined(__CCE_AICORE__) && (V9_URMA_ASYNC_FINAL || V9_POST_FINAL_BEFORE_INDEX)
 #include "async_final.h"
+#endif
+#if defined(__CCE_AICORE__) && V9_POST_FINAL_BEFORE_INDEX
+#include "post_final_before_index.h"
+extern "C" __global__ __aicore__ void v9_submit_final_kernel(GM_ADDR bindings) {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV { SubmitFinalBeforeIndex(GetContext(bindings),GetBlockIdx()); }
+}
 #endif
 extern "C" __global__ __aicore__ void v9_resolve_kernel(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
@@ -334,6 +373,8 @@ extern "C" __global__ __aicore__ void v9_parallel_fetch_kernel(GM_ADDR bindings)
     if ASCEND_IS_AIV {
 #if V9_URMA_ASYNC_FINAL
         CompleteAsyncFinal(GetContext(bindings),GetBlockIdx());
+#elif V9_POST_FINAL_BEFORE_INDEX
+        CompletePostedFinal(GetContext(bindings),GetBlockIdx());
 #else
         ParallelFinalGet(GetContext(bindings),GetBlockIdx());
 #endif

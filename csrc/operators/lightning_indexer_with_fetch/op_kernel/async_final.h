@@ -5,7 +5,7 @@
 // No payload destination in that prefix aliases an outstanding prefetch write.
 __aicore__ inline uint64_t AsyncFinalView(__gm__ rotating::Context* ctx,
     const rotating::RuntimeShape& shape,uint32_t b,uint32_t w,
-    __gm__ rotating::FinalPost* post,KvafExecuteBatchGetKernelArgs& args) {
+    __gm__ rotating::FinalPost* post,KvafExecuteBatchGetKernelArgs& args,uint32_t completionRanges=0) {
     args=GetArgs(ctx,rotating::FinalQueue(shape.batch,shape.finalWorkers,b,w));
     args.indices=ctx->sourceBlocks;args.offsets=ctx->sourceOffsets;
     args.output_indices=ctx->destinations;args.miss_count=ctx->count;
@@ -31,7 +31,8 @@ __aicore__ inline uint64_t AsyncFinalView(__gm__ rotating::Context* ctx,
         entity->sq_depth!=kvaf_device::kSqDepthWqebbs || entity->wqe_size!=kvaf_device::kWqeBytes ||
         !entity->cq_va || !entity->cq_db_va || !entity->cq_depth ||
         entity->cqe_size<kvaf_device::kCqeProbeBytes)return kvaf_device::kInvalidEntity;
-    uint32_t checkpoints=uint32_t(post->nonconflicting!=0)+uint32_t(post->nonconflicting!=post->count);
+    uint32_t checkpoints=completionRanges?completionRanges:
+        uint32_t(post->nonconflicting!=0)+uint32_t(post->nonconflicting!=post->count);
     if(post->count>=entity->sq_depth || checkpoints>entity->cq_depth)return kvaf_device::kQueueFull;
     auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args.queue_state);
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));

@@ -2,12 +2,13 @@
 """Reject mismatched real-snapshot comparisons and invalid timing evidence."""
 
 import copy
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from kvip.diagnostics.compare import CASES, arguments, case_plan, command, display, summarize
+from kvip.diagnostics.compare import CASES, arguments, case_plan, command, display, summarize, summarize_saved
 from kvip.diagnostics.replay_measure import fused_reads, statistics
 
 
@@ -42,6 +43,60 @@ def test_comparison_uses_fixed_archive_and_reports_fusion_reduction():
         target_met=True,
     )
     assert value["table"]["urma-fused"]["mean_read_bytes"] == 26240
+
+
+@pytest.mark.parametrize("bad_candidate", (None, "kvip_commit", "status", "scope", "mean_us"))
+def test_saved_comparison_selects_validated_winner_and_rejects_mixed_nonwinner(tmp_path, bad_candidate):
+    entries = results()
+    paths = []
+    for name in ("ubmem-serial", "urma-serial", "ubmem-fused", "urma-fused"):
+        case = entries[name]
+        report = case
+        if name.endswith("-fused"):
+            slow = dict(case, name="baseline", timing=dict(mean_us=110.0, p50_us=109.0))
+            fast = dict(case, name="candidate")
+            if bad_candidate is not None and name == "urma-fused":
+                if bad_candidate == "mean_us":
+                    slow["timing"]["mean_us"] = float("nan")
+                else:
+                    slow[bad_candidate] = "invalid"
+            report = dict(status="pass", cases=[slow, fast])
+        path = tmp_path / (name + ".json")
+        path.write_text(json.dumps(report))
+        paths.append(path)
+    if bad_candidate is not None:
+        with pytest.raises(ValueError):
+            summarize_saved(paths)
+    else:
+        summary = summarize_saved(paths)
+        assert summary["fusion_vs_serial"]["ubmem"]["serial_over_fused"] == 2.0
+        assert summary["saved_result_selection"]["urma-fused"]["selected"] == "candidate"
+        assert len(summary["saved_result_selection"]["urma-fused"]["cases"]) == 2
+
+
+def test_saved_comparison_cli_does_not_launch_or_import_runtime(tmp_path, monkeypatch, capsys):
+    import sys
+    from kvip.diagnostics import compare
+
+    paths = []
+    entries = results()
+    for name in ("ubmem-serial", "urma-serial", "ubmem-fused", "urma-fused"):
+        path = tmp_path / (name + ".json")
+        path.write_text(json.dumps(entries[name]))
+        paths.append(str(path))
+    output = tmp_path / "summary.json"
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Saved summary must not run a device process")
+
+    monkeypatch.setattr(compare.subprocess, "run", forbidden)
+    monkeypatch.setattr(sys, "argv", ["compare", "--from-results", *paths, "--output", str(output), "--quiet"])
+    compare.main()
+    assert "SELECTED ubmem-fused=ubmem-fused" in capsys.readouterr().out
+    assert json.loads(output.read_text())["performance_target"]["target_met"] is True
+    assert "torch_npu" not in sys.modules
+    with pytest.raises(SystemExit):
+        arguments(["--from-results", *paths, "--output", str(output)])
 
 
 def test_comparison_preserves_boundary_tie_and_actual_read_evidence():

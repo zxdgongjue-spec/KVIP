@@ -3,6 +3,7 @@
 extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) {
     auto result=rotating::PrepareShape(shape);
     if(result)return result;
+    if(V9_RESERVED_UB && shape->resident!=16384)return 100000;
     return V9_ROLLING_THRESHOLD && (shape->resident!=16384 || !shape->splitQ) ? 100000 : 0;
 }
 #define ENTRY(name, blocks) \
@@ -13,6 +14,9 @@ extern "C" uint32_t v9_##name(void* bindings,void* stream,const rotating::Runtim
 ENTRY(init,shape->batch)
 ENTRY(li,shape->liCores)
 ENTRY(wait,shape->batch)
+#if V9_POST_FINAL_BEFORE_INDEX
+ENTRY(submit_final,shape->batch)
+#endif
 ENTRY(resolve,V9_URMA_SINGLE_PLANNER?shape->batch:shape->finalCores)
 ENTRY(fetch,shape->batch)
 #if V9_URMA_PARALLEL_FINAL
@@ -36,9 +40,11 @@ extern "C" uint32_t v9_final_replicated(const rotating::RuntimeShape* shape) { r
 extern "C" uint32_t v9_token_bytes(const rotating::RuntimeShape* shape) { return shape->tokenBytes; }
 extern "C" uint32_t v9_parallel_final(const rotating::RuntimeShape* shape) { return V9_URMA_PARALLEL_FINAL; }
 extern "C" uint32_t v9_async_final(const rotating::RuntimeShape* shape) { return V9_URMA_ASYNC_FINAL; }
+extern "C" uint32_t v9_post_final_before_index(const rotating::RuntimeShape* shape) { return V9_POST_FINAL_BEFORE_INDEX; }
 extern "C" uint32_t v9_cold_only_prefetch(const rotating::RuntimeShape* shape) { return V9_COLD_ONLY_PREFETCH; }
 extern "C" uint32_t v9_threshold_only(const rotating::RuntimeShape* shape) { return V9_THRESHOLD_ONLY; }
 extern "C" uint32_t v9_simt_init(const rotating::RuntimeShape* shape) { return V9_SIMT_INIT; }
+extern "C" uint32_t v9_reserved_ub(const rotating::RuntimeShape* shape) { return V9_RESERVED_UB; }
 extern "C" uint32_t v9_staged_outputs(const rotating::RuntimeShape* shape) { return V9_STAGED_OUTPUTS; }
 extern "C" uint32_t v9_rolling_threshold(const rotating::RuntimeShape* shape) { return V9_ROLLING_THRESHOLD; }
 extern "C" uint32_t v9_single_planner(const rotating::RuntimeShape* shape) { return V9_URMA_SINGLE_PLANNER; }
@@ -88,12 +94,19 @@ extern "C" uint32_t kvip_lifetch_forward(void* bindings, void* update, void* str
     uint32_t result = v9_init(bindings, stream, shape);
     if (!result) result = v9_li(bindings, stream, shape);
     if (!result) result = v9_resolve(bindings, stream, shape);
+#if V9_POST_FINAL_BEFORE_INDEX
+    // Join prefetch, then submit whole final ranges. Index only mutates its
+    // metadata planes; the independent KV payload READs remain outstanding.
+    if (!result) result = v9_submit_final(bindings, stream, shape);
+#endif
     if (!result) result = kvop_direct_update_outputs_early(shape->batch, update, stream);
 #if V9_URMA_PARALLEL_FINAL
+#if !V9_POST_FINAL_BEFORE_INDEX
     // With async final enabled, resolver already posted only the safe prefix.
     // Index runs while those READs are outstanding. Join prefetch before
     // workers submit conflicting destinations and collect their own CQEs.
     if (!result) result = v9_wait(bindings, stream, shape);
+#endif
     if (!result) result = v9_parallel_fetch(bindings, stream, shape);
 #endif
     if (!result) result = aclrtlaunch_v9_fetch_update_kernel(shape->batch, stream, bindings, update);

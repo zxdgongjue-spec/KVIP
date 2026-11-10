@@ -27,6 +27,14 @@ def arguments(argv=None):
         "--quiet", action="store_true", help="Only case progress and compact results; native logs appear on failure"
     )
     parser.add_argument("--report-only", type=Path, help="Summarize an existing result JSON without device work")
+    parser.add_argument(
+        "--from-results",
+        type=Path,
+        nargs=4,
+        metavar=("UBMEM_SERIAL", "URMA_SERIAL", "UBMEM_FUSED", "URMA_FUSED"),
+        help="Compare saved results without device work; choose the lowest validated mean from each fused ablation",
+    )
+    parser.add_argument("--output", type=Path, help="New summary JSON, only with --from-results")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--soc")
     parser.add_argument("--warmup", type=int, default=2)
@@ -63,7 +71,7 @@ def arguments(argv=None):
     parser.add_argument("--urma-fused-tuning", help="JSON options passed only to URMA fused replay")
     parser.add_argument("--result-dir", type=Path, help="New directory; all cases and one summary JSON")
     args = parser.parse_args(argv)
-    if args.report_only is not None:
+    if args.report_only is not None or args.from_results is not None:
         if any(
             (
                 args.snapshot,
@@ -76,8 +84,14 @@ def arguments(argv=None):
                 args.urma_fused_tuning,
             )
         ):
-            parser.error("--report-only cannot be combined with capture/build/output or run options")
+            parser.error("Saved-result modes cannot be combined with capture/build/run options")
+        if args.report_only is not None and (args.from_results is not None or args.output is not None):
+            parser.error("--report-only cannot be combined with --from-results/--output")
+        if args.from_results is not None and (args.output is None or args.output.exists()):
+            parser.error("--from-results requires a new --output path")
         return args
+    if args.output is not None:
+        parser.error("--output requires --from-results")
     if any(
         value is None
         for value in (
@@ -349,6 +363,49 @@ def summarize(results):
     )
 
 
+def summarize_saved(paths):
+    """Reuse measured evidence; validate every candidate before selecting by mean."""
+    if len(paths) != 4:
+        raise ValueError("Expected UBmem serial, URMA serial, UBmem fused, URMA fused results")
+    identities = ("ubmem-serial", "urma-serial", "ubmem-fused", "urma-fused")
+    selected, candidates = {}, {}
+    for identity, path in zip(identities, paths):
+        report = json.loads(Path(path).read_text())
+        if report.get("status") != "pass":
+            raise ValueError(f"Saved run failed: {path}")
+        cases = report.get("cases", [report])
+        if not cases or ("cases" in report and not identity.endswith("-fused")):
+            raise ValueError("Only fused results may contain an ablation")
+        for case in cases:
+            if f"{case.get('transport')}-{case.get('mode')}" != identity:
+                raise ValueError(f"Saved case identity differs from {identity}")
+            # summarize() checks successful validation, identity, positive means,
+            # snapshot hash, geometry, scope, revision, device and SoC together.
+            probe = dict(selected, **{identity: case})
+            reference = next(iter(probe.values()))
+            for key in ("snapshot_sha256", "geometry", "scope", "soc", "device", "kvip_commit"):
+                if key not in case or case[key] != reference.get(key):
+                    raise ValueError(f"Incomparable {key}: {identity}")
+            if case.get("status") != "pass" or any(
+                not np.isfinite(case["timing"][key]) or case["timing"][key] <= 0 for key in ("mean_us", "p50_us")
+            ):
+                raise ValueError(f"Invalid saved timing: {identity}")
+        winner = min(cases, key=lambda case: case["timing"]["mean_us"])
+        selected[identity] = winner
+        candidates[identity] = dict(
+            path=str(Path(path).resolve()),
+            selected=winner.get("name", identity),
+            cases=[dict(name=case.get("name", identity), mean_us=case["timing"]["mean_us"]) for case in cases],
+        )
+    result = summarize(selected)
+    result["saved_result_selection"] = candidates
+    result["notes"].append(
+        "Fused winners are selected from this finite measured sweep, not independently remeasured; "
+        "the full candidate list is retained. Serial references are separate same-revision runs."
+    )
+    return result
+
+
 def display(summary):
     print("\ncase          mean_us     p50_us   read_MiB/round   runtime_workers")
     for name, row in summary["table"].items():
@@ -451,6 +508,14 @@ def main():
     args = arguments()
     if args.report_only is not None:
         report_only(args.report_only)
+        return
+    if getattr(args, "from_results", None) is not None:
+        summary = summarize_saved(args.from_results)
+        with args.output.open("x") as output:
+            output.write(json.dumps(summary, indent=2) + "\n")
+        for name, selected in summary["saved_result_selection"].items():
+            print(f"SELECTED {name}={selected['selected']}", flush=True)
+        compact_report(summary, path=args.output)
         return
     args.result_dir.mkdir(parents=True)
     print(

@@ -53,7 +53,7 @@ inline void ReplicatedResolve(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc
     auto lru=ctx->lruSlots ? reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+batch*kLruSlots : nullptr;
     uint32_t outputStride=OutputStride(SIM_RESIDENT,ctx),ownerBase=OwnerRow(ctx,batch)*outputStride;
     uint32_t count=0,candidateCount=0;
-    if(!ResolveResidentPlan<Threads>(SIM_HISTORY,SIM_RESIDENT,outputStride,selected,loc,
+    if(!ResolveResidentPlan<Threads,V9_CACHED_BUCKETS>(SIM_HISTORY,SIM_RESIDENT,outputStride,selected,loc,
         positions,coldCount,keys,ranks,ids,slots,cfg,mapping,lru,used,ctx->tailBounds!=0,count,candidateCount,
         CurrentMappingTag(ctx,batch),V9_UBMEM_TAGGED_MAP?kMappingSlotMask:UINT32_MAX))return;
     constexpr uint32_t missingTag=0x80000000U;

@@ -38,6 +38,14 @@ inline void InitializeRoundSimt(__gm__ Context* ctx,uint32_t b,uint64_t reserved
     InitializeTailMappingsBody(SIM_HISTORY,SIM_RESIDENT,ctx,b,reservedRow,mappingTag);
 }
 #endif
+#if V9_RESERVED_UB
+__simt_vf__ __aicore__ LAUNCH_BOUND(256)
+inline void InitializeReservedLocal(__gm__ Context* ctx,uint32_t b,uint64_t reservedRow,
+    __ubuf__ uint32_t* inverse,const __ubuf__ uint32_t* candidates,uint32_t mappingTag) {
+    if(reservedRow)ScatterReservedHotLocal(inverse,candidates,SIM_RESIDENT,kLruSlots);
+    InitializeTailMappingsBody(SIM_HISTORY,SIM_RESIDENT,ctx,b,0,mappingTag);
+}
+#endif
 __aicore__ inline void FillWords(uint64_t address,uint32_t words,LocalTensor<uint32_t> local) {
     GlobalTensor<uint32_t> output;output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(address));
     for(uint32_t offset=0;offset<words;offset+=4096) {
@@ -60,14 +68,16 @@ __aicore__ inline void InitializeControl(__gm__ Context* ctx,uint32_t b,LocalTen
         ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->count),4);
     }
 }
-__aicore__ inline void CopyInitialLruSlots(__gm__ Context* ctx,uint32_t b,LocalTensor<uint32_t> local) {
-    if(ctx->changeSlots) {
+__aicore__ inline void CopyInitialLruSlots(__gm__ Context* ctx,uint32_t b,LocalTensor<uint32_t> local,bool stage=false) {
+    if(ctx->changeSlots || stage) {
         GlobalTensor<uint32_t> source,target;
         source.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots);
-        target.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+b*kChangeCapacity);
         DataCopy(local,source,kLruSlots);
         SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-        DataCopy(target,local,kLruSlots);
+        if(ctx->changeSlots) {
+            target.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+b*kChangeCapacity);
+            DataCopy(target,local,kLruSlots);
+        }
         SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     }
 }
@@ -82,7 +92,7 @@ __aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
     // counters back over those zeros.
     ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),64);
 #endif
-    TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,4096*4);
+    TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,(4096+V9_RESERVED_UB*16384)*4);
     auto local=scratch.Get<uint32_t>();
 #if !V9_SIMT_INIT
     Duplicate(local,uint32_t(0),4096);
@@ -90,15 +100,18 @@ __aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
     InitializeControl(ctx,b,local);
     SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
 #endif
-    Duplicate(local,UINT32_MAX,4096);
+    uint64_t reservedRow=0;
+#if V9_RESERVED_UB
+    reservedRow=ReservedHotRow(ctx->lruSlots,ctx->reservedHot,ctx->queryEnds,b,SIM_RESIDENT);
+#endif
+    Duplicate(local,UINT32_MAX,4096+(V9_RESERVED_UB && reservedRow?16384:0));
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     if(generation.clear)FillWords(ctx->mapping+uint64_t(b)*SIM_HISTORY*4,SIM_HISTORY,local);
     FillWords(ctx->selected+uint64_t(b)*kSlots*4,kSlots,local);
     // Only prefetch candidate holes need a round-wide sentinel fill. Resolver
     // publishes every extended rank below changeCount before Index consumes it.
     if(ctx->changes)FillWords(ctx->changes+b*kChangeCapacity*4,kLruSlots,local);
-    uint64_t reservedRow=0;
-#if V9_COMPACT_RESERVED
+#if V9_COMPACT_RESERVED && !V9_RESERVED_UB
     reservedRow=ClearReservedHot(ctx->lruSlots,ctx->reservedHot,ctx->queryEnds,b,SIM_RESIDENT,local);
 #endif
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
@@ -114,8 +127,26 @@ __aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
     // the init entry publishes this cache line after filling row metadata.
     row->mappingState=generation.state;
 #endif
-    CopyInitialLruSlots(ctx,b,local);
+    CopyInitialLruSlots(ctx,b,local,V9_RESERVED_UB && reservedRow);
+#if V9_RESERVED_UB
+    // The existing candidate copy owns the first 8 KiB. The inverse occupies
+    // a disjoint 64 KiB and remains live until its single MTE3 has completed.
+    if(reservedRow) {
+        SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+    }
+    auto inverse=local[4096];
+    Simt::VF_CALL<InitializeReservedLocal>(Simt::Dim3{256,1,1},ctx,b,reservedRow,
+        reinterpret_cast<__ubuf__ uint32_t*>(inverse.GetPhyAddr()),
+        reinterpret_cast<const __ubuf__ uint32_t*>(local.GetPhyAddr()),generation.tag);
+    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    if(reservedRow) {
+        GlobalTensor<uint32_t> output;output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(reservedRow));
+        DataCopy(output,inverse,SIM_RESIDENT);
+    }
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+#else
     Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},SIM_HISTORY,SIM_RESIDENT,ctx,b,reservedRow,generation.tag);
+#endif
 #endif
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
     pipe.Destroy();

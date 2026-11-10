@@ -5,7 +5,7 @@
 #include "../../lidu/op_kernel/hot_slot_selection.h"
 #include "mapping.h"
 namespace rotating {
-template<uint32_t Threads>
+template<uint32_t Threads,bool CacheBuckets=false>
 __simt_callee__ inline bool ResolveResidentPlan(
     uint32_t rt_history, uint32_t rt_resident, uint32_t outputStride,
     __ubuf__ uint32_t* selected, __ubuf__ uint32_t* loc,
@@ -16,6 +16,9 @@ __simt_callee__ inline bool ResolveResidentPlan(
     uint32_t mappingTag=0,uint32_t mappingMask=UINT32_MAX) {
     uint32_t tid=threadIdx.x,lane=tid%warpSize,warp=tid/warpSize;
     uint32_t buckets=coldCount<=1024?2048U:(coldCount<=2048?4096U:8192U);
+    // slots has kSlots entries and is otherwise dead until hot-slot selection.
+    // Cache one bucket per cold-list position (not per token/rank): each writer
+    // owns a distinct i, even when different queries select the same token.
     for(uint32_t i=tid;i<buckets;i+=Threads){keys[i]=UINT32_MAX;ranks[i]=UINT32_MAX;}
     if(tid<8)cfg[tid]=0;
     asc_syncthreads();
@@ -27,7 +30,9 @@ __simt_callee__ inline bool ResolveResidentPlan(
         if(slot==UINT32_MAX){
             uint32_t h=SparseHash(token)&(buckets-1);
             for(uint32_t n=0;n<buckets;++n){uint32_t old=asc_atomic_cas(keys+h,UINT32_MAX,token);
-                if(old==UINT32_MAX || old==token){asc_atomic_min(ranks+h,pos);break;}h=(h+1)&(buckets-1);}
+                if(old==UINT32_MAX || old==token){asc_atomic_min(ranks+h,pos);
+                    if constexpr(CacheBuckets)slots[i]=h;
+                    break;}h=(h+1)&(buckets-1);}
         } else if(slot<rt_resident || slot>=kSlots+outputStride || (slot>=rt_resident+kLruSlots && slot<rt_resident+kSlots))asc_atomic_or(cfg+1,2U);
     }
     asc_syncthreads();
@@ -35,8 +40,10 @@ __simt_callee__ inline bool ResolveResidentPlan(
     uint32_t per=(coldCount+Threads-1)/Threads,localCount=0;
     for(uint32_t i=tid*per;i<(tid+1)*per && i<coldCount;++i){uint32_t pos=positions[i];
         if(loc[pos]!=UINT32_MAX)continue;
-        uint32_t token=selected[pos],h=SparseHash(token)&(buckets-1);
-        while(keys[h]!=token)h=(h+1)&(buckets-1);
+        uint32_t h;
+        if constexpr(CacheBuckets)h=slots[i];
+        else {uint32_t token=selected[pos];h=SparseHash(token)&(buckets-1);
+            while(keys[h]!=token)h=(h+1)&(buckets-1);}
         if(ranks[h]==pos){loc[pos]=UINT32_MAX-1;++localCount;}}
     uint32_t scan=localCount;
     for(uint32_t d=1;d<warpSize;d*=2){uint32_t prior=asc_shfl_up(scan,d);if(lane>=d)scan+=prior;}
@@ -50,7 +57,9 @@ __simt_callee__ inline bool ResolveResidentPlan(
     if(!tid)cfg[0]=count;
     for(uint32_t i=tid*per;i<(tid+1)*per && i<coldCount;++i){uint32_t pos=positions[i];
         if(loc[pos]!=UINT32_MAX-1)continue;
-        uint32_t token=selected[pos],h=SparseHash(token)&(buckets-1);while(keys[h]!=token)h=(h+1)&(buckets-1);
+        uint32_t h;
+        if constexpr(CacheBuckets)h=slots[i];
+        else {uint32_t token=selected[pos];h=SparseHash(token)&(buckets-1);while(keys[h]!=token)h=(h+1)&(buckets-1);}
         ids[begin]=uint16_t(pos);ranks[h]=begin++;}
     asc_syncthreads();
     // Resolve rank markers before releasing the hash tables. All workers see
@@ -60,13 +69,22 @@ __simt_callee__ inline bool ResolveResidentPlan(
         uint32_t pos=positions[i],slot=loc[pos],token=selected[pos];
         // Earlier query locations may already be physical (including ABC).
         // Read the immutable mapping instead of translating them a second time.
-        if(slot==UINT32_MAX-2)slot=(used || hasTail)?ReadMappingSlot(mapping+token,mappingTag,mappingMask):UINT32_MAX;
+        const bool skipped=slot==UINT32_MAX-2;
+        if(skipped)slot=(used || hasTail)?ReadMappingSlot(mapping+token,mappingTag,mappingMask):UINT32_MAX;
         if(slot>=UINT32_MAX-2) {
-            uint32_t h=SparseHash(token)&(buckets-1);while(keys[h]!=token)h=(h+1)&(buckets-1);
+            uint32_t h;
+            if constexpr(CacheBuckets) {
+                // The Q2-repeat fast path skipped insertion, so it alone
+                // still needs a probe. Every inserted occurrence owns slots[i].
+                if(!skipped)h=slots[i];
+                else {h=SparseHash(token)&(buckets-1);while(keys[h]!=token)h=(h+1)&(buckets-1);}
+            } else {h=SparseHash(token)&(buckets-1);while(keys[h]!=token)h=(h+1)&(buckets-1);}
             slot=missingTag|ranks[h];
         } else slot=ResolvePhysicalSlot(rt_resident,lru,slot);
         loc[pos]=slot;
     }
+    // All cached bucket reads must finish before hot-slot selection overwrites
+    // slots. This existing barrier is also the handoff for the uncached path.
     asc_syncthreads();
     if(!count)return false;
     // Hash scratch is now dead. Reuse it as LIDU's hot protection bitmap and

@@ -1,5 +1,9 @@
 #pragma once
 #include <stdint.h>
+#ifndef V9_CACHED_BUCKETS
+#define V9_CACHED_BUCKETS 0
+#endif
+static_assert(V9_CACHED_BUCKETS==0 || V9_CACHED_BUCKETS==1,"Cached buckets must be boolean");
 #ifndef V9_COLD_ONLY_PREFETCH
 #define V9_COLD_ONLY_PREFETCH 0
 #endif
@@ -14,6 +18,14 @@ static_assert(!V9_ROLLING_THRESHOLD || (SIM_RESIDENT==16384 && V9_SPLIT_Q && !V9
               "Rolling threshold requires resident=16384, split-Q2 and resident TopK");
 #ifndef V9_SIMT_INIT
 #define V9_SIMT_INIT 0
+#endif
+#ifndef V9_RESERVED_UB
+#define V9_RESERVED_UB 0
+#endif
+static_assert(V9_RESERVED_UB==0 || V9_RESERVED_UB==1,"Reserved UB must be boolean");
+static_assert(!V9_RESERVED_UB || SIM_RESIDENT==16384,"Reserved UB requires resident=16384");
+#if V9_RESERVED_UB && (!V9_COMPACT_RESERVED || V9_SIMT_INIT || V9_UBMEM_PARALLEL_INIT)
+#error "Reserved UB requires compact reserved with one scalar init worker per row"
 #endif
 static_assert(V9_COLD_ONLY_PREFETCH==0 || V9_COLD_ONLY_PREFETCH==1,"Cold-only prefetch must be 0 or 1");
 static_assert(V9_THRESHOLD_ONLY==0 || V9_THRESHOLD_ONLY==1,"Threshold-only selection must be 0 or 1");

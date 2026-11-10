@@ -38,6 +38,8 @@ class Specialization:
     single_plan: bool = False
     staged_outputs: bool = False
     rolling_threshold: bool = False
+    reserved_ub: bool = False
+    cached_buckets: bool = False
 
     def __post_init__(self):
         if any(
@@ -57,6 +59,8 @@ class Specialization:
                 "single_plan",
                 "staged_outputs",
                 "rolling_threshold",
+                "reserved_ub",
+                "cached_buckets",
             )
         ):
             raise ValueError("UBmem optimization switches must be booleans")
@@ -64,6 +68,10 @@ class Specialization:
             raise ValueError("Tagged mapping requires one init worker per request")
         if self.simt_init and self.parallel_init:
             raise ValueError("SIMT init requires one init worker per request")
+        if self.reserved_ub and (
+            self.resident != 16384 or not self.compact_reserved or self.simt_init or self.parallel_init
+        ):
+            raise ValueError("reserved_ub requires resident=16384, compact_reserved, and scalar single-worker init")
         if self.rolling_threshold and (
             self.resident != 16384 or 2 * self.batch > self.aic_count or self.threshold_only
         ):
@@ -119,6 +127,8 @@ class Specialization:
             UBMEM_SINGLE_PLAN=int(self.single_plan),
             STAGED_OUTPUTS=int(self.staged_outputs),
             ROLLING_THRESHOLD=int(self.rolling_threshold),
+            RESERVED_UB=int(self.reserved_ub),
+            CACHED_BUCKETS=int(self.cached_buckets),
         )
 
 

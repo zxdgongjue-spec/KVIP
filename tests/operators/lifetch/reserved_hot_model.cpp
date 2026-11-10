@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cstdint>
 #include <functional>
+#include <iostream>
 #include <vector>
 #define __CCE_AICORE__ 1
 #define __aicore__
@@ -20,27 +21,34 @@ inline uint32_t* reservedEnd=nullptr;
 inline uint32_t* mappingBegin=nullptr;
 inline uint32_t* mappingEnd=nullptr;
 inline uint64_t mappingWords=0;
+inline uint64_t reservedStores=0,reservedCopies=0;
 // Match CANN's intrinsic signature: it loads through a mutable GM pointer,
 // even when the caller's source data is logically read-only.
 template<class T> inline T asc_ldcg(T* p) {return *p;}
 inline void asc_stcg(uint32_t* p,uint32_t value) {
-    if(uintptr_t(p)>=uintptr_t(reservedBegin) && uintptr_t(p)<uintptr_t(reservedEnd))assert(currentPart==0);
+    if(uintptr_t(p)>=uintptr_t(reservedBegin) && uintptr_t(p)<uintptr_t(reservedEnd)) {
+        assert(currentPart==0);++reservedStores;
+    }
     *p=value;
 }
 inline void asc_threadfence() {}
 namespace AscendC {
 constexpr uint32_t EVENT_ID0=0;
-enum class HardEvent {V_MTE3,MTE3_V,V_S,MTE3_S,MTE2_MTE3};
-inline bool flags[5]{};
+enum class HardEvent {V_MTE3,MTE3_V,V_S,MTE3_S,MTE2_MTE3,MTE2_V};
+inline bool flags[6]{};
 inline std::vector<std::function<void()>> pendingMte2,pendingMte3;
 inline void Drain(std::vector<std::function<void()>>& pending) {for(auto& op:pending)op();pending.clear();}
 template<HardEvent event> void SetFlag(uint32_t) {assert(!flags[unsigned(event)]);flags[unsigned(event)]=true;}
 template<HardEvent event> void WaitFlag(uint32_t) {
     assert(flags[unsigned(event)]);flags[unsigned(event)]=false;
     if constexpr(event==HardEvent::MTE3_V || event==HardEvent::MTE3_S)Drain(pendingMte3);
-    if constexpr(event==HardEvent::MTE2_MTE3)Drain(pendingMte2);
+    if constexpr(event==HardEvent::MTE2_MTE3 || event==HardEvent::MTE2_V)Drain(pendingMte2);
 }
-template<class T> struct LocalTensor {T* data;};
+template<class T> struct LocalTensor {
+    T* data;
+    LocalTensor operator[](uint32_t offset)const {return {data+offset};}
+    T* GetPhyAddr()const {return data;}
+};
 template<class T> struct GlobalTensor {
     T* data=nullptr;
     void SetGlobalBuffer(T* value) {data=value;}
@@ -54,6 +62,7 @@ template<class T> void Duplicate(LocalTensor<T> output,T value,uint32_t count) {
 template<class T> void DataCopy(GlobalTensor<T> output,LocalTensor<T> input,uint32_t count) {
     assert(count%8==0 && pendingMte2.empty());
     if(uintptr_t(output.data)>=uintptr_t(mappingBegin) && uintptr_t(output.data)<uintptr_t(mappingEnd))mappingWords+=count;
+    if(uintptr_t(output.data)>=uintptr_t(reservedBegin) && uintptr_t(output.data)<uintptr_t(reservedEnd))++reservedCopies;
     pendingMte3.push_back([=] {std::copy_n(input.data,count,output.data);});
 }
 template<class T> void DataCopy(LocalTensor<T> output,GlobalTensor<T> input,uint32_t count) {
@@ -64,11 +73,11 @@ template<class T> void DataCopy(LocalTensor<T> output,GlobalTensor<T> input,uint
 }
 enum class TPosition {VECCALC};
 template<TPosition> struct TBuf {
-    std::array<uint32_t,4096> words;
+    std::array<uint32_t,20480> words;
     template<class T> LocalTensor<T> Get() {return {reinterpret_cast<T*>(words.data())};}
 };
 struct TPipe {
-    template<class Buffer> void InitBuffer(Buffer&,uint32_t size) {assert(size==4096*4);}
+    template<class Buffer> void InitBuffer(Buffer&,uint32_t size) {assert(size==4096*4 || size==20480*4);}
     void Destroy() {assert(pendingMte2.empty() && pendingMte3.empty());for(bool flag:flags)assert(!flag);}
 };
 namespace Simt {
@@ -130,9 +139,10 @@ int main() {
     ctx.outputStride=resident+384;
     reservedBegin=output.data();reservedEnd=output.data()+batches*resident;
     mappingBegin=map.data();mappingEnd=map.data()+batches*history;
+    uint64_t resultHash=1469598103934665603ULL,activeRows=0;
     // Full -> shrink/reorder -> empty -> owner/row reuse -> optional bounds.
     for(uint32_t round=0;round<(V9_UBMEM_TAGGED_MAP?12:6);++round) {
-        const uint32_t active=round==0?4:round==1?1:round==2?0:round==3?3:4;
+        const uint32_t active=round==0?batches:round==1?1:round==2?0:round==3?batches-1:batches;
         std::fill(ends.begin(),ends.end(),0);expected=output;
         ctx.queryEnds=round==4?0:uint64_t(ends.data());
         ctx.tailBounds=round==1?0:uint64_t(bounds.data());
@@ -154,6 +164,7 @@ int main() {
                 candidates[b*kLruSlots+i]=(resident-1024+i+round*173+b*991)%resident;
             if(b<active) {
                 ends[b*4+round%4]=130000;
+                ++activeRows;
 #if V9_COMPACT_RESERVED
                 std::fill_n(expected.begin()+b*resident,resident,UINT32_MAX);
                 for(uint32_t i=0;i<kLruSlots;++i)expected[b*resident+candidates[b*kLruSlots+i]]=i;
@@ -166,7 +177,9 @@ int main() {
                 auto fills=negativeFills,calls=vfCalls;
 #if MODEL_URMA
                 auto reserved=InitializeRound(batches,history,resident,kRounds,kServiceLanes,kFinalWorkers,kFinalPostOffset,&ctx,b);
+#if !V9_RESERVED_UB
                 Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},history,resident,&ctx,b,reserved);
+#endif
 #elif MODEL_PARALLEL
                 InitializeRoundParallel(&ctx,b,currentPart);
 #else
@@ -210,6 +223,8 @@ int main() {
 #endif
         for(const auto* values:{&output,&map,&selected,&changes,&slots})
             assert(std::all_of(values->end()-32,values->end(),[](uint32_t x){return x==91;}));
+        for(const auto* values:{&output,&map,&selected,&changes,&slots,&counts})
+            for(uint32_t value:*values){resultHash^=value;resultHash*=1099511628211ULL;}
 #if V9_UBMEM_TAGGED_MAP
         // Execute the actual grouped window publisher and its gather reader.
         // The next init must invalidate these values even for inactive rows.
@@ -253,4 +268,10 @@ int main() {
     assert(ClearReservedHot(ctx.lruSlots,0,0,0,resident,LocalTensor<uint32_t>{local.data()})==0);
     assert(pendingMte3.empty());
 #endif
+    // Report actual modeled operations, never a simulated latency. The new
+    // path publishes the same inverse with one DMA and no random GM stores.
+#if V9_RESERVED_UB
+    assert(reservedStores==0 && reservedCopies==activeRows);
+#endif
+    std::cout<<resultHash<<' '<<reservedStores<<' '<<reservedCopies<<' '<<vfCalls<<' '<<negativeFills<<'\n';
 }
