@@ -67,6 +67,10 @@ for variant in ('baseline-safe', 'streaming'):
             topk_only = sum(int(q['topk_only']) for x in details[-1] for q in x['li'])
             lines.append(f"  cycles BS={batch} LI_max_query={json.dumps(li)} metadata_overlap={overlap}/{len(details[-1])*4} topk_only={topk_only}/{len(details[-1])*4}")
             lines.append(f"  cycles BS={batch} producer_max_request={json.dumps(producer)} updater_max_request={json.dumps(updater)}")
+            for query in range(4):
+                qstage = {key: worst_median(lambda x, k=key, q=query: x['producer'][q][k]) for key in qkeys}
+                qli = {key: worst_median(lambda x, k=key, q=query: x['li'][q][k]) for key in li_keys}
+                lines.append(f"  cycles BS={batch} Q{query+1}: LI={json.dumps(qli)} resolver={json.dumps(qstage)}")
 text = '\n'.join(lines) + '\n'
 (root / 'summary.log').write_text(text)
 print(text, end='')
