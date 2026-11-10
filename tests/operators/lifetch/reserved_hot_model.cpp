@@ -16,7 +16,9 @@ struct {uint32_t x;} threadIdx;
 inline uint32_t currentPart=0,negativeFills=0,vfCalls=0;
 inline uint32_t* reservedBegin=nullptr;
 inline uint32_t* reservedEnd=nullptr;
-inline uint32_t asc_ldcg(const uint32_t* p) {return *p;}
+// Match CANN's intrinsic signature: it loads through a mutable GM pointer,
+// even when the caller's source data is logically read-only.
+inline uint32_t asc_ldcg(uint32_t* p) {return *p;}
 inline void asc_stcg(uint32_t* p,uint32_t value) {
     if(uintptr_t(p)>=uintptr_t(reservedBegin) && uintptr_t(p)<uintptr_t(reservedEnd))assert(currentPart==0);
     *p=value;

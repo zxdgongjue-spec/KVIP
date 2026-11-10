@@ -13,7 +13,9 @@ using namespace AscendC;
 __simt_callee__ inline void ScatterReservedHot(__gm__ uint32_t* output,
     const __gm__ uint32_t* candidates,uint32_t resident,uint32_t count) {
     for(uint32_t ordinal=threadIdx.x;ordinal<count;ordinal+=256) {
-        uint32_t slot=asc_ldcg(candidates+ordinal);
+        // CANN 9.2 exposes asc_ldcg only for mutable GM pointers. The
+        // intrinsic is a load; preserve the read-only candidate interface.
+        uint32_t slot=asc_ldcg(const_cast<__gm__ uint32_t*>(candidates+ordinal));
         // Service LRU candidates are unique in-range slots. Keep malformed
         // input from writing outside the row; the decode oracle checks the map.
         if(slot<resident)asc_stcg(output+slot,ordinal);
