@@ -73,19 +73,25 @@ __simt_callee__ inline void BuildUpdatePlan(__gm__ uint32_t* lru, __gm__ uint32_
   if (status[0]) return;
   // Consecutive per-thread ranges retain the CPU oracle's record order.
   constexpr uint32_t per = kPlanCandidates / Threads;
+  // Membership is immutable after the insertion barrier. Save these two
+  // predicates across the prefix scans instead of probing both hash tables
+  // again during publication. Production Threads=512 needs one word each;
+  // the small arrays also keep the Threads=1 host model well-defined.
+  uint32_t outFlags[(per+31)/32]{}, freeFlags[(per+31)/32]{};
   uint32_t out = 0, free = 0;
   for (uint32_t i = tid * per; i < (tid + 1) * per; ++i)
     if (src[i] != UINT32_MAX) {
-      out += !PlanContains(srcSet, dst[i]);
-      free += !PlanContains(dstSet, src[i]);
+      uint32_t local=i-tid*per, outgoing=!PlanContains(srcSet,dst[i]), released=!PlanContains(dstSet,src[i]);
+      out+=outgoing;free+=released;
+      outFlags[local/32]|=outgoing<<(local%32);freeFlags[local/32]|=released<<(local%32);
     }
   uint32_t outRank = kPlanCandidates + PlanPrefix<Threads>(out, status + 32);
   uint32_t freeRank = kPlanCandidates + PlanPrefix<Threads>(free, status + 64);
-  for (uint32_t i = tid * per; i < (tid + 1) * per; ++i)
-    if (src[i] != UINT32_MAX) {
-      if (!PlanContains(srcSet, dst[i])) dst[outRank++] = dst[i];
-      if (!PlanContains(dstSet, src[i])) src[freeRank++] = src[i];
-    }
+  for (uint32_t i = tid * per; i < (tid + 1) * per; ++i) {
+    uint32_t local=i-tid*per, bit=1U<<(local%32);
+    if(outFlags[local/32]&bit)dst[outRank++]=dst[i];
+    if(freeFlags[local/32]&bit)src[freeRank++]=src[i];
+  }
   // Extras move old outgoing destinations to the freed source rows.
   asc_syncthreads();
   for (uint32_t i = kPlanCandidates + tid; i < kPlanRecords; i += Threads) {
@@ -144,18 +150,24 @@ __simt_callee__ inline void BuildExtendedPlan(__gm__ uint32_t* inputSlots, __gm_
   asc_threadfence();asc_syncthreads();
   if(status[0])return;
   uint32_t per=(count+Threads-1)/Threads,out=0,free=0;
+  constexpr uint32_t flagWords=((kExtendedCandidates+Threads-1)/Threads+31)/32;
+  // Same immutable predicates as the small planner; only the record backing
+  // differs. Retaining flags also avoids reloading unused GM record fields.
+  uint32_t outFlags[flagWords]{},freeFlags[flagWords]{};
   for(uint32_t i=tid*per;i<(tid+1)*per && i<count;++i) {
     uint32_t s=asc_ldcg(src+i),d=asc_ldcg(dst+i);
-    if(s!=UINT32_MAX) {out+=!ExtendedContains(srcSet,d);free+=!ExtendedContains(dstSet,s);}
+    if(s!=UINT32_MAX) {
+      uint32_t local=i-tid*per,outgoing=!ExtendedContains(srcSet,d),released=!ExtendedContains(dstSet,s);
+      out+=outgoing;free+=released;
+      outFlags[local/32]|=outgoing<<(local%32);freeFlags[local/32]|=released<<(local%32);
+    }
   }
   uint32_t outRank=kExtendedCandidates+PlanPrefix<Threads>(out,status+32);
   uint32_t freeRank=kExtendedCandidates+PlanPrefix<Threads>(free,status+64);
   for(uint32_t i=tid*per;i<(tid+1)*per && i<count;++i) {
-    uint32_t s=asc_ldcg(src+i),d=asc_ldcg(dst+i);
-    if(s!=UINT32_MAX) {
-      if(!ExtendedContains(srcSet,d))asc_stcg(src+outRank++,d);
-      if(!ExtendedContains(dstSet,s))asc_stcg(dst+freeRank++,s);
-    }
+    uint32_t local=i-tid*per,bit=1U<<(local%32);
+    if(outFlags[local/32]&bit)asc_stcg(src+outRank++,asc_ldcg(dst+i));
+    if(freeFlags[local/32]&bit)asc_stcg(dst+freeRank++,asc_ldcg(src+i));
   }
   asc_threadfence();asc_syncthreads();
 }
