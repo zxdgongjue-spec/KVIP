@@ -4,6 +4,18 @@
 import numpy as np
 
 
+def selected_bounds(selected, history):
+    """Summarize invalid LI outputs; UINT32_MAX is the padding sentinel."""
+    values = np.asarray(selected).astype(np.uint32, copy=False)
+    invalid = (values >= history) & (values != np.uint32(0xFFFFFFFF))
+    examples = []
+    for position in np.argwhere(invalid)[:8]:
+        index = tuple(int(x) for x in position)
+        examples.append(dict(index=index, value=int(values[index])))
+    return dict(shape=list(values.shape), history=int(history),
+                invalid_count=int(invalid.sum()), examples=examples)
+
+
 def actual_reads(mapping, selected, rows, resident):
     """Inspect completed replay outputs outside timing; count unique prefetches."""
     result = dict(

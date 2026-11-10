@@ -719,6 +719,10 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     LocalTensor<uint32_t> secondValid,secondReserved;
     if(overlapSecond) {
         SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+        // Both destinations alias TopK vector scratch. PIPE_V orders vector
+        // instructions only; establish the cross-pipe dependency before MTE2
+        // overwrites the scratch used by the final TopK operation.
+        SetFlag<HardEvent::V_MTE2>(EVENT_ID0);WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
         secondValid=mrgValueLocal_.template ReinterpretCast<uint32_t>();
         secondReserved=topkSharedTmpLocal_;
         if(ctx->hotValid)DataCopy(secondValid,validGm[8192],8192);
