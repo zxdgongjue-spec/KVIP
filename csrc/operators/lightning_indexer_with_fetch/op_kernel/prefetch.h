@@ -381,10 +381,27 @@ namespace rotating {
 // One SIMT task covers every batch assigned to this AIV. Per-batch queues
 // remain independent. locations is dead until final resolve and stages IDs.
 
+// Two Row snapshots occupy the first 2 KiB of the 8448-byte row tensor.
+constexpr uint32_t kRetainedIdCapacity = 448;
+constexpr uint32_t kRetainedIdOffset = 2 * sizeof(Row) / sizeof(uint32_t);
+static_assert((kRetainedIdOffset + 2 * kRetainedIdCapacity) * sizeof(uint32_t) <= 8448);
+
+__simd_vf__ inline void StageWindowIds(__ubuf__ uint32_t* dst, __ubuf__ uint32_t* src, uint32_t count) {
+    using namespace MicroAPI;
+    RegTensor<uint32_t> ids;
+    uint32_t remaining = count;
+    for (uint16_t i = 0; i < count; i += 64) {
+        auto mask = UpdateMask<uint32_t>(remaining);
+        LoadAlign(ids, src + i);
+        StoreAlign(dst + i, ids, mask);
+    }
+}
+
 template<bool BuildSimt>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
 inline void BatchBuild(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,__gm__ Context* ctx,uint32_t epoch,uint32_t lane,uint32_t begin,
-    __ubuf__ uint64_t* remote,__ubuf__ uint32_t* meta,__ubuf__ uint32_t* inputs,__ubuf__ uint32_t* wqes) {
+    __ubuf__ uint64_t* remote,__ubuf__ uint32_t* meta,__ubuf__ uint32_t* inputs,__ubuf__ uint32_t* wqes,
+    __ubuf__ uint32_t* retainedIds) {
     const uint32_t g=threadIdx.x/rt_postThreads,t=threadIdx.x%rt_postThreads,b=lane+rt_serviceLanes*g;
     const bool active=b<rt_batch;
     uint32_t count=0,n=0,slotBase=0,depth=0;uint64_t head=0,output=0;
@@ -407,7 +424,8 @@ inline void BatchBuild(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_residen
                 slotBase=input[65];
                 n=count>begin?count-begin:0;if(n>rt_postBank)n=rt_postBank;
                 for(uint32_t i=t;i<n;i+=rt_postThreads) {
-                    uint32_t token=asc_ldcg(jobs+begin+i);
+                    uint32_t token=retainedIds && count<=kRetainedIdCapacity?
+                        retainedIds[g*kRetainedIdCapacity+begin+i]:asc_ldcg(jobs+begin+i);
                     uint32_t slot=slotBase+begin+i;
                     uint64_t address=asc_ldcg(addresses+token);
                     if constexpr(BuildSimt)remote[g*rt_postBank+i]=address;
@@ -676,6 +694,7 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
     V9_FETCH_PROFILE(uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0;)
     auto work=flags.ReinterpretCast<uint32_t>();auto cfg=work[4096];
     auto rowStorage=ids;
+    const bool retainIds=rt_batchedRows && rt_batch<=2*rt_serviceLanes;
     if(rt_batchedRows)ids=scratch[23808/4];
     // Freeze every ready snapshot before doing any batch work. Cap to the
     // scheduled boundary so slow service cannot chase newly produced history.
@@ -853,12 +872,22 @@ if (rt_batchedRows) {
                 entityGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(entityAddress));
                 queueGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(queueAddress));
                 DataCopy(postInput,entityGm,48);DataCopy(postInput[48],queueGm,16);
+                const bool localIds=retainIds && count<=kRetainedIdCapacity;
+                if(localIds) {
+                    auto dst=rowStorage[kRetainedIdOffset+(b/rt_serviceLanes)*kRetainedIdCapacity];
+                    SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
+                    StageWindowIds(reinterpret_cast<__ubuf__ uint32_t*>(dst.GetPhyAddr()),
+                        reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),count);
+                    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+                }
                 SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-                GlobalTensor<uint32_t> jobs;
-                jobs.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*8192);
-                SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
-                DataCopy(jobs,ids,((count+7)/8)*8);
-                SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+                if(!localIds) {
+                    GlobalTensor<uint32_t> jobs;
+                    jobs.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*8192);
+                    SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+                    DataCopy(jobs,ids,((count+7)/8)*8);
+                    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+                }
                 slots+=count;requests+=count;
 } else {
                 {
@@ -911,7 +940,8 @@ if (rt_batchedRows) {
                 reinterpret_cast<__ubuf__ uint64_t*>(work[512].GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(cfg[256].GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()));
+                reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),
+                retainIds?reinterpret_cast<__ubuf__ uint32_t*>(rowStorage[kRetainedIdOffset].GetPhyAddr()):nullptr);
             SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
             SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
             for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
