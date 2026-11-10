@@ -275,7 +275,7 @@ def test_bundle_runs_real_chain_contract_and_resets_all_mutable_state(tmp_path, 
         bundle.reset()
         bundle.forward()
         reads = bundle.verify()
-        assert reads == dict(
+        expected_reads = dict(
             prefetch=0,
             final=batch * 2047,
             bytes=batch * 2047 * width,
@@ -283,6 +283,14 @@ def test_bundle_runs_real_chain_contract_and_resets_all_mutable_state(tmp_path, 
             cold_demand=batch * 2,
             candidate_hot_refetch=batch * 2045,
         )
+        assert {key: reads[key] for key in expected_reads} == expected_reads
+        from kvip.diagnostics.demand import snapshot_demand
+
+        demand = snapshot_demand(archive)
+        assert {key: reads[key] for key in demand} == demand
+        assert reads["transfers"] == reads["useful_transfers"] == reads["selected_read_demand"] == batch * 2047
+        assert reads["useful_transfer_bytes"] == reads["bytes"]
+        assert reads["unused_prefetch"] == reads["unused_prefetch_bytes"] == 0
     assert calls == ["li", "lidu", "li", "lidu"]
     assert runtime.calls == [batch * 2047, batch * 2047]
     assert len(bundle.retained["generated_outputs"]) == 4

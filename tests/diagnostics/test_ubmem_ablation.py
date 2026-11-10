@@ -38,7 +38,23 @@ def test_summary_joins_corresponding_index_samples_without_subtracting_full_late
         name="optimized",
         tuning={},
         timing=dict(mean_us=51.0, p50_us=50.0),
-        reads_samples=[dict(prefetch=4, final=6, unused_prefetch=2, bytes=26240)],
+        reads_samples=[
+            dict(
+                prefetch=4,
+                final=6,
+                unused_prefetch=2,
+                bytes=26240,
+                useful_transfers=8,
+                useful_transfer_bytes=20992,
+                selected_unique=100,
+                cold_demand=5,
+                candidate_hot_refetch=2,
+                hot_hit=83,
+                abc_hit=10,
+                selected_read_demand=7,
+                cold_miss_rate=0.05,
+            )
+        ],
         stage_diagnostics=dict(
             stages={
                 "init": dict(p50_us=2.0),
@@ -53,9 +69,12 @@ def test_summary_joins_corresponding_index_samples_without_subtracting_full_late
     assert summary["full_graph_mean_us"] == 51.0
     assert summary["index_diagnostic_p50_us"] == 12.0  # median([12, 8, 12]), not sum of medians.
     assert summary["init_diagnostic_p50_us"] == 2.0
+    assert summary["cold_demand"] == 5
+    assert summary["useful_transfers"] == 8
     ubmem_ablation.print_summary(dict(summary=[summary]), Path("result.json"))
     text = capsys.readouterr().out
     assert "not additive" in text and "Result JSON:" in text and "optimized" in text
+    assert "cold/selected_union=5.0000%" in text and "not pure cold" in text
     del case["stage_diagnostics"]
     assert ubmem_ablation.summarize_case(case)["index_diagnostic_p50_us"] is None
 

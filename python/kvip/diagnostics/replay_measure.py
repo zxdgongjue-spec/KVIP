@@ -9,6 +9,7 @@ import sys
 import numpy as np
 
 from kvip.diagnostics.archive import array_digest, cpu_array, file_digest, source_commit
+from kvip.diagnostics.demand import DEMAND_ACCOUNTING, SnapshotDemand
 from kvip.diagnostics.oracle import DecodeOracle
 from kvip.diagnostics.snapshot import (
     input_tensors,
@@ -64,12 +65,17 @@ def fused_reads(torch, rotating, update, transport, width):
         # only the 2048 reserved hot-slot mapping range represents prefetch.
         fetched = np.flatnonzero((row >= resident) & (row < resident + 2048))
         unused += int(np.count_nonzero(~np.isin(fetched, topk.reshape(-1))))
+    if unused > prefetch:
+        raise AssertionError("Unused prefetch exceeds completed prefetch transfers")
     return dict(
         prefetch=prefetch,
         final=final,
+        transfers=prefetch + final,
         bytes=(prefetch + final) * width,
         unused_prefetch=unused,
         unused_prefetch_bytes=unused * width,
+        useful_transfers=prefetch + final - unused,
+        useful_transfer_bytes=(prefetch + final - unused) * width,
     )
 
 
@@ -89,6 +95,7 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
             raise ValueError(f"Replay binding differs from captured tensor: {name}")
         seeds.append((target, seed))
     oracle = DecodeOracle(archive)
+    demand = SnapshotDemand(archive)
     expected = archive.array("post.logical_output").reshape(archive.manifest["geometry"]["batch"] * 4, 2048)
     saved_tags = archive.array("post.selected_tags")
     saved_payload = archive.array("post.selected_payload")
@@ -111,7 +118,8 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
             actual_reserved = cpu_array(torch, rotating.reserved_hot)
             if not np.array_equal(actual_reserved[active_rows], reserved_expected[active_rows]):
                 raise AssertionError("Device reserved-hot reconstruction differs from the captured inverse map")
-        checked = oracle.verify(post_state(torch, selector), address_delta=delta, expected_topk=expected)
+        state = post_state(torch, selector)
+        checked = oracle.verify(state, address_delta=delta, expected_topk=expected)
         positions = {tuple(tag): i for i, tag in enumerate(checked["selected_tags"])}
         if len(positions) != len(saved_tags):
             raise AssertionError("Replay selected a different logical payload set")
@@ -119,6 +127,7 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
             position = positions.get(tuple(tag))
             if position is None or not np.array_equal(saved_payload[i], checked["selected_payload"][position]):
                 raise AssertionError("Replay KV bytes differ from the captured service output")
+        reads.update(demand.classify(state["logical_output"]))
         return reads
 
     bundle.reset, bundle.verify = reset, verify
@@ -434,6 +443,7 @@ def measure_case(args, archive, context, retained):
         timing_boundary="timing contains device graph only; optional candidate_call reports a separate host-to-output boundary",
         graph_backend="torch.npu.NPUGraph" if args.mode == "serial" else "kvaf.AclGraph",
         selection_comparison=bundle.selection_comparison,
+        demand_accounting=DEMAND_ACCOUNTING,
         representation=(
             "Native logical paged Index and LIDU maps reconstructed outside timing; original serial map allocation padding was not captured."
             if args.mode == "serial"

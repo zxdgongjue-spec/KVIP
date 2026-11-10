@@ -150,6 +150,7 @@ def arguments(argv=None):
 
 def inspect_snapshot(archive):
     from kvip.diagnostics.ddr import validate_pages
+    from kvip.diagnostics.demand import DEMAND_ACCOUNTING, snapshot_demand
 
     ddr = archive.manifest["ddr"]
     summary = validate_pages(archive.directory / "ddr", ddr)
@@ -176,6 +177,8 @@ def inspect_snapshot(archive):
         active_requests=int(np.count_nonzero(np.any(ends > 0, axis=1))),
         ddr=summary,
         source=source,
+        captured_fusion_demand=snapshot_demand(archive),
+        demand_accounting=DEMAND_ACCOUNTING,
         scope=archive.manifest["scope"],
         fidelity=archive.manifest["fidelity"],
     )

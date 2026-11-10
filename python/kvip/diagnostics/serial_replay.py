@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from kvip.diagnostics.archive import cpu_array
+from kvip.diagnostics.demand import classify_initial_slots, sum_demand
 from kvip.diagnostics.oracle import DecodeOracle
 from kvip.diagnostics.selection import SelectionOracle
 
@@ -154,7 +155,7 @@ def _verify_serial(archive, inputs, oracle, logical, slots, forward, reverse, ou
         raise AssertionError("Native LIDU miss counts are invalid")
     output = output.reshape(-1, width)[: len(forward) * stride].reshape(len(forward), stride, width)
     destinations = destinations.reshape(b, QUERIES, TOPK)
-    cold_demand, hot_refetch = [], []
+    demand = []
     for row, owner in enumerate(inputs["owners"]):
         selected = logical[row]
         if np.any(selected < 0) or np.any(selected >= inputs["query_ends"][row, :, None]):
@@ -163,13 +164,11 @@ def _verify_serial(archive, inputs, oracle, logical, slots, forward, reverse, ou
             raise AssertionError("Native LI selected duplicate logical tokens")
         unique = np.unique(selected)
         initial_slots = inputs["forward"][owner, unique]
-        cold = initial_slots < 0
         # Production LIDU deliberately treats a resident candidate slot as a
         # miss too: those reserved slots may be overwritten during this round.
-        reserved = np.isin(initial_slots, inputs["candidates"][row]) & ~cold
-        cold_demand.append(int(np.count_nonzero(cold)))
-        hot_refetch.append(int(np.count_nonzero(reserved)))
-        misses = cold_demand[-1] + hot_refetch[-1]
+        classified = classify_initial_slots(initial_slots, inputs["candidates"][row], r)
+        demand.append(classified)
+        misses = classified["cold_demand"] + classified["candidate_hot_refetch"]
         if int(counts[row]) != misses:
             raise AssertionError("Native LIDU reads differ from its cold/candidate-slot miss classification")
         mapped = forward[owner, selected]
@@ -196,10 +195,14 @@ def _verify_serial(archive, inputs, oracle, logical, slots, forward, reverse, ou
     return dict(
         prefetch=0,
         final=int(counts[-1]),
+        transfers=int(counts[-1]),
         bytes=int(counts[-1]) * width,
         final_per_request=[int(value) for value in counts[:-1]],
-        cold_demand=sum(cold_demand),
-        candidate_hot_refetch=sum(hot_refetch),
+        unused_prefetch=0,
+        unused_prefetch_bytes=0,
+        useful_transfers=int(counts[-1]),
+        useful_transfer_bytes=int(counts[-1]) * width,
+        **sum_demand(demand),
     )
 
 

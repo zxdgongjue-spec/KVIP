@@ -50,6 +50,9 @@ def test_b1_recorder_oracle_archive_and_replay_contract(tmp_path):
         index_heads=32,
         pin_memory=False,
     )
+    workspace.scratch["lru_slots"][0].copy_(torch.arange(2048, dtype=torch.int32))
+    workspace.scratch["reserved_hot"].fill_(-1)
+    workspace.scratch["reserved_hot"][0, :2048].copy_(torch.arange(2048, dtype=torch.int32))
     storage = IndexCacheStorage(torch, 2, h, r, torch.device("cpu"))
     inputs = workspace.inputs
     inputs.prepare([4], query_owners=[1])
@@ -167,6 +170,16 @@ def test_b1_recorder_oracle_archive_and_replay_contract(tmp_path):
     summary = inspect_snapshot(archive)
     assert summary["geometry"]["batch"] == summary["active_requests"] == 1
     assert summary["query_ends"] == [[h - 3, h - 2, h - 1, h]]
+    assert summary["captured_fusion_demand"] == dict(
+        selected_unique=2048,
+        cold_demand=1,
+        candidate_hot_refetch=2046,
+        hot_hit=0,
+        abc_hit=1,
+        selected_read_demand=2047,
+        cold_miss_rate=1 / 2048,
+    )
+    assert "Q4 union" in summary["demand_accounting"]["denominator"]
     assert archive.array("post.selected_payload").shape == (2048, width)
     assert archive.array("post.final_records")[0].tolist() == [0, cold, int(addresses[cold]) - base, stride + 2046]
     # Exercise the same replay data restoration contract, including metadata

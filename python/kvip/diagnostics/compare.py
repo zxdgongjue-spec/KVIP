@@ -10,6 +10,8 @@ from pathlib import Path
 
 import numpy as np
 
+from kvip.diagnostics.demand import DEMAND_ACCOUNTING
+
 CASES = (("ubmem", "serial"), ("urma", "serial"), ("ubmem", "fused"), ("urma", "fused"))
 
 
@@ -188,11 +190,48 @@ def summarize(results):
             selection=result.get("selection_comparison"),
             reads_per_round={
                 key: float(np.mean([row[key] for row in result["reads_samples"]]))
-                for key in ("prefetch", "final", "unused_prefetch", "cold_demand", "candidate_hot_refetch")
+                for key in (
+                    "prefetch",
+                    "final",
+                    "transfers",
+                    "unused_prefetch",
+                    "useful_transfers",
+                    "cold_demand",
+                    "candidate_hot_refetch",
+                )
+                if key in result["reads_samples"][0]
+            },
+            demand_per_round={
+                key: float(np.mean([row[key] for row in result["reads_samples"]]))
+                for key in (
+                    "selected_unique",
+                    "cold_demand",
+                    "candidate_hot_refetch",
+                    "hot_hit",
+                    "abc_hit",
+                    "selected_read_demand",
+                )
                 if key in result["reads_samples"][0]
             },
         )
+        demand = table[name]["demand_per_round"]
+        if "selected_unique" in demand:
+            demand["cold_miss_rate"] = (
+                demand["cold_demand"] / demand["selected_unique"] if demand["selected_unique"] else 0.0
+            )
+            demand["cold_payload_bytes"] = demand["cold_demand"] * result["geometry"]["token_bytes"]
+        if "useful_transfer_bytes" in result["reads_samples"][0]:
+            table[name]["mean_useful_transfer_bytes"] = float(
+                np.mean([row["useful_transfer_bytes"] for row in result["reads_samples"]])
+            )
+        normalized = dict(actual_transfers=table[name]["mean_read_bytes"] / (timing["mean_us"] * 1000))
+        if "mean_useful_transfer_bytes" in table[name]:
+            normalized["useful_transfers"] = table[name]["mean_useful_transfer_bytes"] / (timing["mean_us"] * 1000)
+        if "cold_payload_bytes" in demand:
+            normalized["cold_demand"] = demand["cold_payload_bytes"] / (timing["mean_us"] * 1000)
+        table[name]["graph_normalized_payload_GBps"] = normalized
     ratios = {}
+    demand_deltas = {}
     selected_urma = min(serial_cases, key=lambda name: table[name]["mean_us"])
     for transport in ("ubmem", "urma"):
         serial_case = "ubmem-serial" if transport == "ubmem" else selected_urma
@@ -205,6 +244,15 @@ def summarize(results):
             target_fused_us=target,
             target_met=fused <= serial * 0.65 and fused <= serial / 1.5,
         )
+        serial_demand, fused_demand = (
+            table[serial_case]["demand_per_round"],
+            table[f"{transport}-fused"]["demand_per_round"],
+        )
+        if "selected_unique" in serial_demand and "selected_unique" in fused_demand:
+            demand_deltas[transport] = {
+                key: fused_demand[key] - serial_demand[key]
+                for key in ("cold_demand", "candidate_hot_refetch", "selected_unique", "cold_miss_rate")
+            }
     selection_pairs = {}
     for mode in ("serial", "fused"):
         names = ("ubmem-serial", selected_urma) if mode == "serial" else ("ubmem-fused", "urma-fused")
@@ -217,6 +265,9 @@ def summarize(results):
         geometry=first["geometry"],
         scope=first["scope"],
         table=table,
+        demand_accounting=DEMAND_ACCOUNTING,
+        demand_delta_fused_minus_serial=demand_deltas,
+        payload_rate_accounting="Decimal GB/s = payload bytes / full graph mean_us / 1000; graph-normalized throughput, not Get-stage or hardware bandwidth.",
         fusion_vs_serial=ratios,
         performance_target=dict(
             metric="timing.mean_us",
@@ -248,13 +299,43 @@ def summarize(results):
 
 
 def display(summary):
-    print("\ncase          mean_us     p50_us   read_MiB/round   Get_workers")
+    print("\ncase          mean_us     p50_us   read_MiB/round   runtime_workers")
     for name, row in summary["table"].items():
         print(
             f"{name:13s} {row['mean_us']:10.3f} {row['p50_us']:10.3f} "
             f"{row['mean_read_bytes'] / (1 << 20):16.3f} {row['runtime_workers']:13d}"
         )
-        print("  reads/round: " + ", ".join(f"{key}={value:.1f}" for key, value in row["reads_per_round"].items()))
+        print(
+            "  actual transfers/round: "
+            + ", ".join(
+                f"{key}={value:.1f}"
+                for key, value in row["reads_per_round"].items()
+                if key not in ("cold_demand", "candidate_hot_refetch")
+            )
+        )
+        demand = row["demand_per_round"]
+        if demand:
+            print(
+                "  initial-state demand/round: "
+                + ", ".join(
+                    f"{key}={value:.1f}"
+                    for key, value in demand.items()
+                    if key not in ("cold_miss_rate", "cold_payload_bytes")
+                )
+            )
+        if "cold_miss_rate" in demand:
+            print(
+                f"  cold miss rate: {demand['cold_miss_rate']:.4%} = cold_demand / selected_unique "
+                "(per-request Q4 union; initial hot/ABC excluded from cold)"
+            )
+        if "mean_useful_transfer_bytes" in row:
+            print(
+                f"  useful transferred payload: {row['mean_useful_transfer_bytes'] / (1 << 20):.3f} MiB/round (includes hot refetch)"
+            )
+        print(
+            "  graph-normalized payload GB/s: "
+            + ", ".join(f"{key}={value:.3f}" for key, value in row["graph_normalized_payload_GBps"].items())
+        )
         if row["tuning"] is not None:
             print("  effective tuning: " + json.dumps(row["tuning"], sort_keys=True))
         if row["serial_get_config"]:
@@ -280,6 +361,18 @@ def display(summary):
             f"target <= {values['target_fused_us']:.3f} us: {'MET' if values['target_met'] else 'NOT MET'}"
         )
     print("Targets use device graph mean only; require both >=35% reduction and >=1.5x speedup.")
+    print(
+        "Candidate-hot demand is required in serial and potential in fusion; useful transfers are not pure cold misses."
+    )
+    for transport, values in summary["demand_delta_fused_minus_serial"].items():
+        print(
+            f"{transport} fused - serial demand: "
+            + ", ".join(
+                f"{key}={value:+.4f}" if key == "cold_miss_rate" else f"{key}={value:+.1f}"
+                for key, value in values.items()
+            )
+        )
+    print(summary["payload_rate_accounting"])
     for name, profile in summary["native_get_profiles"].items():
         totals, maxima = profile["totals"], profile["maxima"]
         print(

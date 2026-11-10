@@ -87,7 +87,22 @@ def summarize_case(case):
         completion_index_diagnostic_p50_us=index_time if includes_completion else None,
         **{
             key: float(np.median([sample[key] for sample in reads]))
-            for key in ("prefetch", "final", "unused_prefetch", "bytes")
+            for key in (
+                "prefetch",
+                "final",
+                "unused_prefetch",
+                "bytes",
+                "useful_transfers",
+                "useful_transfer_bytes",
+                "selected_unique",
+                "cold_demand",
+                "candidate_hot_refetch",
+                "hot_hit",
+                "abc_hit",
+                "selected_read_demand",
+                "cold_miss_rate",
+            )
+            if key in reads[0]
         },
     )
 
@@ -108,6 +123,13 @@ def print_summary(report, output=None):
             f"{row['prefetch']:g}  {row['final']:g}  "
             f"{row['unused_prefetch']:g}  {row['bytes']:g}"
         )
+        if "cold_miss_rate" in row:
+            print(
+                f"  initial-state demand: cold={row['cold_demand']:g}, "
+                f"candidate_hot={row['candidate_hot_refetch']:g}, selected_union={row['selected_unique']:g}; "
+                f"cold/selected_union={row['cold_miss_rate']:.4%}; "
+                f"useful_transfers={row['useful_transfers']:g} (includes hot refetch, not pure cold)"
+            )
     for case in report.get("cases", []):
         stages = case.get("stage_diagnostics", {}).get("stages", {})
         details = [f"{name}={time(value['p50_us'])}" for name, value in stages.items()]

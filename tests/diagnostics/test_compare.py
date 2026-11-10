@@ -62,6 +62,51 @@ def test_comparison_preserves_boundary_tie_and_actual_read_evidence():
     assert value["same_selection_across_transports"] == dict(serial=False)
 
 
+def test_demand_is_separate_from_observed_transfers_and_rates_name_the_denominator(capsys):
+    entries = results()
+    width = 2624
+    for result in entries.values():
+        fused = result["mode"] == "fused"
+        result["reads_samples"] = [
+            dict(
+                prefetch=10 if fused else 0,
+                final=5 if fused else 10,
+                transfers=15 if fused else 10,
+                unused_prefetch=3 if fused else 0,
+                bytes=(15 if fused else 10) * width,
+                useful_transfers=12 if fused else 10,
+                useful_transfer_bytes=(12 if fused else 10) * width,
+                selected_unique=100,
+                cold_demand=7 if fused else 8,
+                candidate_hot_refetch=2,
+                hot_hit=81 if fused else 80,
+                abc_hit=10,
+                selected_read_demand=9 if fused else 10,
+                cold_miss_rate=0.07 if fused else 0.08,
+            )
+        ]
+    original = copy.deepcopy(entries)
+    report = summarize(entries)
+    fused = report["table"]["ubmem-fused"]
+    assert fused["demand_per_round"]["cold_demand"] == 7
+    assert fused["demand_per_round"]["cold_miss_rate"] == 7 / 100
+    assert fused["reads_per_round"]["useful_transfers"] == 12  # Not 7 or 7+2.
+    assert fused["mean_useful_transfer_bytes"] == 12 * width
+    assert fused["graph_normalized_payload_GBps"] == dict(
+        actual_transfers=15 * width / 100000,
+        useful_transfers=12 * width / 100000,
+        cold_demand=7 * width / 100000,
+    )
+    assert report["demand_delta_fused_minus_serial"]["ubmem"]["cold_demand"] == -1
+    assert entries == original
+    display(report)
+    output = capsys.readouterr().out
+    assert "cold_demand / selected_unique" in output
+    assert "runtime_workers" in output
+    assert "not Get-stage or hardware bandwidth" in output
+    assert "potential in fusion" in output
+
+
 @pytest.mark.parametrize(
     "key,value",
     [
@@ -273,7 +318,16 @@ def test_urma_completion_and_speculative_read_accounting():
     )
     update = SimpleNamespace(status=torch.zeros(1, dtype=torch.int32))
     read = fused_reads(torch, rotating, update, "urma", 2624)
-    assert read == dict(prefetch=2, final=1, bytes=7872, unused_prefetch=1, unused_prefetch_bytes=2624)
+    assert read == dict(
+        prefetch=2,
+        final=1,
+        transfers=3,
+        bytes=7872,
+        unused_prefetch=1,
+        unused_prefetch_bytes=2624,
+        useful_transfers=2,
+        useful_transfer_bytes=5248,
+    )
     bad = copy.copy(rotating)
     bad.final_status = completion.clone()
     bad.final_status.view(torch.int64)[0, 2] = 1
