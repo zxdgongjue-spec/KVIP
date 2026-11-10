@@ -404,7 +404,11 @@ def test_ubmem_hot_resolver_actual_function_on_empty_and_populated_cache(tmp_pat
     _check_hot_resolver(tmp_path, "ubmem")
 
 
-def _check_hot_resolver(tmp_path, transport):
+def test_tagged_ubmem_hot_resolver_ignores_stale_generations(tmp_path):
+    _check_hot_resolver(tmp_path, "ubmem", tagged=True)
+
+
+def _check_hot_resolver(tmp_path, transport, *, tagged=False):
     """Execute production SIMT logic serially; CANN simulator covers barriers."""
     import subprocess
 
@@ -428,6 +432,8 @@ def _check_hot_resolver(tmp_path, transport):
         function(metadata, name)
         for name in ("OwnerRow", "OutputStride", "StoreFallbackSource", "ResolvePhysicalSlot", "InitializeTailMappings")
     )
+    if transport == "ubmem":
+        functions = function(metadata, "CurrentMappingTag") + "\n" + functions
     functions += "\n" + function(resolver, "SparseHash")
     functions += "\ntemplate<unsigned Threads>\n" + function(
         ROOT / "csrc/operators/common/lifetch/resident_selection.h", "ResolveResidentPlan"
@@ -462,6 +468,7 @@ void asc_atomic_max(unsigned* p,unsigned v){*p=std::max(*p,v);}
 void asc_atomic_add(unsigned* p,unsigned v){*p+=v;}
 unsigned asc_shfl_up(unsigned v,unsigned){return v;}
 void asc_syncthreads(){} void asc_threadfence(){}
+#include "mapping.h"
 FUNCTIONS
 int main(){
  std::mt19937 rng(71);
@@ -546,6 +553,17 @@ int main(){
         begin = source.index("   assert(cfg[5]<=cfg[3]);")
         end = source.index("   std::copy(locations.begin()", begin)
         source = source[:begin] + source[end:]
+        if tagged:
+            definitions.append("-DV9_UBMEM_TAGGED_MAP=1")
+            source = source.replace(
+                "ctx.mapping=(uint64_t)map.data();changeCount=0;",
+                """ctx.mapping=(uint64_t)map.data();changeCount=0;
+  Row row{};const unsigned epoch=trial%2?1:kMappingEpochMax,tag=epoch<<kMappingSlotBits;
+  row.mappingState=(uint64_t(kMappingEpochMagic)<<32)|epoch;ctx.rows=(uint64_t)&row;
+  for(unsigned i=0;i<h;++i)map[i]=map[i]!=UINT32_MAX?EncodeMappingSlot(map[i],tag,kMappingSlotMask):
+    EncodeMappingSlot(r+17,(epoch==1?2:epoch-1)<<kMappingSlotBits,kMappingSlotMask);""",
+            )
+            source = source.replace("InitializeTailMappings(h,r,&ctx,0)", "InitializeTailMappings(h,r,&ctx,0,0,tag)")
     (tmp_path / "batch_get_abi.h").write_text("")
     cpp, exe = tmp_path / "resolver.cpp", tmp_path / "resolver"
     cpp.write_text(source)
@@ -559,6 +577,7 @@ int main(){
             "-I" + str(tmp_path),
             "-I" + str(kernel.parent / "include"),
             "-I" + str(kernel.parents[1] / "lidu/op_kernel"),
+            "-I" + str(ROOT / "csrc/operators/common/lifetch"),
             "-o",
             str(exe),
         ],

@@ -9,9 +9,17 @@
 
 #include "simt_api/device_functions.h"
 #include "../../../common/lifetch/reserved_hot.h"
+#include "../../../common/lifetch/mapping.h"
 // Adapt logical fetch slots at the transport boundary; preserve the original
 // hot-slot replacement policy; no KV payload fallback arena is allocated.
 namespace rotating {
+__simt_callee__ inline uint32_t CurrentMappingTag(__gm__ Context* ctx,uint32_t b) {
+#if V9_UBMEM_TAGGED_MAP
+    return asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(ctx->rows)+uint64_t(b)*256)<<kMappingSlotBits;
+#else
+    return 0;
+#endif
+}
 __simt_callee__ inline uint32_t OwnerRow(__gm__ Context* ctx,uint32_t b) {
     return ctx->rowOwners ? asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)+b) : b;
 }
@@ -20,7 +28,7 @@ __simt_callee__ inline uint32_t OutputStride(uint32_t rt_resident,__gm__ Context
 }
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,
-    uint64_t reservedRow=0) {
+    uint64_t reservedRow=0,uint32_t mappingTag=0) {
 #if V9_COMPACT_RESERVED
     if(reservedRow)ScatterReservedHot(reinterpret_cast<__gm__ uint32_t*>(reservedRow),
         reinterpret_cast<const __gm__ uint32_t*>(ctx->lruSlots)+uint64_t(b)*kLruSlots,rt_resident,kLruSlots);
@@ -38,7 +46,8 @@ inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm
     for(uint32_t i=threadIdx.x;i<tailTokens;i+=256) {
         uint32_t token=begin+i;
         if(token<end && token<rt_history)
-            asc_stcg(map+token,rt_resident+kSlots+token%tailTokens);
+            asc_stcg(map+token,EncodeMappingSlot(rt_resident+kSlots+token%tailTokens,mappingTag,
+                V9_UBMEM_TAGGED_MAP?kMappingSlotMask:UINT32_MAX));
     }
     asc_threadfence();
 }

@@ -51,6 +51,8 @@ class UbmemBinding:
             ("skip_inactive", int(shape.skip_inactive)),
             ("compact_reserved", int(shape.compact_reserved)),
             ("grouped_copy", int(shape.grouped_copy)),
+            ("tagged_map", int(shape.tagged_map)),
+            ("final_copy_stages", shape.final_copy_stages),
         ):
             if query(self.library, name) != expected:
                 raise ValueError(f"UBmem static binary contract mismatch: {name}")
@@ -118,6 +120,8 @@ class UbmemBinding:
         tail_tokens = self.output_stride - shape.resident
         if tail_tokens < 0 or tail_tokens % 128 or self.output_stride > 0xFFFFFFFF:
             raise ValueError("UBmem output stride must preserve hot/optional ABC slots")
+        if shape.tagged_map and self.output_stride >= (1 << 18) - 8192:
+            raise ValueError("Tagged mapping output stride exceeds its 18-bit slot field")
         if self.output_stride * shape.token_bytes % 32 or output.data_ptr() % 32:
             raise ValueError("UBmem owner rows must start on distinct aligned 32-byte sectors")
         if tail_bounds is not None and (

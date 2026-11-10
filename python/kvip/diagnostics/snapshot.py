@@ -11,6 +11,26 @@ from kvip.diagnostics.oracle import DecodeOracle
 from kvip.adapters.vllm.inputs import reserved_hot_reference
 
 
+def decode_tagged_mapping(mapping, rows):
+    """Normalize the opt-in epoch14/slot18 ABI for untimed diagnostics."""
+    raw = np.asarray(mapping).view(np.uint32)
+    control = np.asarray(rows).view(np.uint32)
+    if raw.ndim != 2 or control.ndim != 2 or len(raw) != len(control) or control.shape[1] < 2:
+        raise ValueError("Tagged mapping requires matching mapping and control rows")
+    epochs = control[:, 0]
+    if np.any(control[:, 1] != 0x4D415031) or np.any((epochs == 0) | (epochs > 16383)):
+        raise AssertionError("Tagged mapping has invalid epoch state")
+    valid = (raw != np.uint32(0xFFFFFFFF)) & ((raw >> 18) == epochs[:, None])
+    return np.where(valid, raw & np.uint32(0x3FFFF), np.uint32(0xFFFFFFFF)).view(np.int32)
+
+
+def mapping_values(torch, rotating, rows=None):
+    raw = cpu_array(torch, rotating.mapping)
+    if not getattr(getattr(rotating, "shape", None), "tagged_map", False):
+        return raw
+    return decode_tagged_mapping(raw, cpu_array(torch, rotating.rows) if rows is None else rows)
+
+
 def persistent_tensors(selector):
     rotating, storage = selector.rotating, selector.storage
     if storage is None:
@@ -233,7 +253,6 @@ class DecodeSnapshotRecorder:
             self.archive.save("post." + name, result[name])
         for name, tensor in dict(
             topk=selector.topk,
-            mapping=selector.rotating.mapping,
             locations=selector.rotating.locations,
             rows=selector.rotating.rows,
             row_status=selector.rotating.row_status,
@@ -247,6 +266,10 @@ class DecodeSnapshotRecorder:
             index_status=selector.update.status,
         ).items():
             self.archive.save_tensor("post." + name, self.torch, tensor)
+        if getattr(getattr(selector.rotating, "shape", None), "tagged_map", False):
+            self.archive.save_tensor("post.mapping_raw", self.torch, selector.rotating.mapping)
+            self.manifest["post_mapping_encoding"] = "post.mapping_raw is epoch14/slot18; post.mapping is decoded slots"
+        self.archive.save("post.mapping", mapping_values(self.torch, selector.rotating))
         mapping = self.archive.array("post.mapping")
         pre_ids = self.archive.array("pre.logical_ids")
         row_owners = self.archive.array("pre.metadata")[4].view(np.int32)[: len(mapping)]

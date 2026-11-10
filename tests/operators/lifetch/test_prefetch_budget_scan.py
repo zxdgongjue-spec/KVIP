@@ -39,6 +39,7 @@ def test_actual_service_preserves_epochs_cursors_and_pending_when_budget_exhaust
             f"-DMODEL_UBMEM={int(ubmem)}",
             "-I" + str(tmp_path),
             "-I" + str(root / "lightning_indexer_with_fetch/include"),
+            "-I" + str(root / "lightning_indexer_with_fetch_ubmem/include"),
             "-I" + str(root / "common/lifetch"),
             str(Path(__file__).with_name("prefetch_budget_model.cpp")),
             "-o",

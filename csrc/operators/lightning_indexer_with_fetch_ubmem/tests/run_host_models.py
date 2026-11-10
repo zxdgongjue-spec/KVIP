@@ -43,8 +43,13 @@ with tempfile.TemporaryDirectory(prefix="kvip-ubmem-model-") as directory:
     )
     subprocess.run([str(init_binary)], check=True)
     for batch in (1, 2):
-        for width, grouped in ((656, 0), (2624, 0), (2624, 1)):
-            definitions = common | {"SIM_BATCH": batch, "TOKEN_BYTES": width, "V9_UBMEM_GROUPED_COPY": grouped}
+        for width, grouped, stages in ((656, 0, 4), (2624, 0, 4), (2624, 1, 4), (2624, 1, 8)):
+            definitions = common | {
+                "SIM_BATCH": batch,
+                "TOKEN_BYTES": width,
+                "V9_UBMEM_GROUPED_COPY": grouped,
+                "V9_UBMEM_FINAL_COPY_STAGES": stages,
+            }
             options = [
                 compiler,
                 "-std=c++17",
@@ -59,34 +64,37 @@ with tempfile.TemporaryDirectory(prefix="kvip-ubmem-model-") as directory:
                 ("copy", [root / "tests/copy_model.cpp"]),
                 ("abi", [root / "tests/abi_test.cpp", root / "op_host/launch.cpp"]),
             ):
-                binary = Path(directory) / f"{name}-{batch}-{width}-{grouped}"
+                binary = Path(directory) / f"{name}-{batch}-{width}-{grouped}-{stages}"
                 subprocess.run([*options, *map(str, sources), "-o", str(binary)], check=True)
                 subprocess.run([str(binary)], check=True)
-    # The opted-in B16 launch uses all 64 AIVs; verify the exported stage
-    # wrappers still issue the same plan/output/apply calls and block counts.
-    definitions = common | {
-        "SIM_BATCH": 16,
-        "TOKEN_BYTES": 2624,
-        "V9_UBMEM_PARALLEL_INIT": 1,
-        "V9_UBMEM_BALANCED_INDEX": 1,
-        "V9_UBMEM_GROUPED_COPY": 1,
-    }
-    binary = Path(directory) / "abi-optimized-b16"
-    subprocess.run(
-        [
-            compiler,
-            "-std=c++17",
-            "-O1",
-            "-g",
-            "-fsanitize=address,undefined",
-            *[f"-D{k}={v}" for k, v in definitions.items()],
-            f"-I{root / 'include'}",
-            str(root / "tests/abi_test.cpp"),
-            str(root / "op_host/launch.cpp"),
-            "-o",
-            str(binary),
-        ],
-        check=True,
-    )
-    subprocess.run([str(binary)], check=True)
-print("Init and ABI/copy models passed B1/B2 × 656/2624, including paired 2624 DMA/event checks")
+    # Parallel init uses all 64 AIVs; tagged mapping requires the serial init
+    # owner. Both keep the same complete-plan/output/apply sequence and ABI.
+    for parallel, tagged in ((1, 0), (0, 1)):
+        definitions = common | {
+            "SIM_BATCH": 16,
+            "TOKEN_BYTES": 2624,
+            "V9_UBMEM_PARALLEL_INIT": parallel,
+            "V9_UBMEM_TAGGED_MAP": tagged,
+            "V9_UBMEM_BALANCED_INDEX": 1,
+            "V9_UBMEM_GROUPED_COPY": 1,
+            "V9_UBMEM_FINAL_COPY_STAGES": 8,
+        }
+        binary = Path(directory) / f"abi-optimized-b16-{parallel}-{tagged}"
+        subprocess.run(
+            [
+                compiler,
+                "-std=c++17",
+                "-O1",
+                "-g",
+                "-fsanitize=address,undefined",
+                *[f"-D{k}={v}" for k, v in definitions.items()],
+                f"-I{root / 'include'}",
+                str(root / "tests/abi_test.cpp"),
+                str(root / "op_host/launch.cpp"),
+                "-o",
+                str(binary),
+            ],
+            check=True,
+        )
+        subprocess.run([str(binary)], check=True)
+print("Init and ABI/copy models passed B1/B2 × 656/2624, including paired final 4/8-stage DMA/event checks")

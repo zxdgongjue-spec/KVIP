@@ -1,6 +1,11 @@
 #include "copy_model.h"
 #include "context.h"
 #include "ubmem_copy.h"
+#include "../op_kernel/resolver/final_scratch.h"
+namespace ubmem_device {
+inline void CleanCacheLines(uint8_t*,size_t) {}
+}
+#include "../op_kernel/resolver/final_worker_submit.h"
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -34,8 +39,9 @@ void CheckOutputLayout(uint32_t tailTokens) {
     assert(!UbmemRegionValid(&region));
     region.outputBytes=outputBytes;
     Context ctx{};ctx.ubmemRegion=Address(&region);
-    std::vector<uint8_t> scratch(32000),overflow(12288);
-    LocalTensor<uint8_t> local{scratch.data(),scratch.size()},extra{overflow.data(),overflow.size()};
+    std::vector<uint8_t> scratch(std::max(32000U,UbmemFinalCopyPipeline::kScratchBytes)),overflow(12288);
+    LocalTensor<uint8_t> local{scratch.data(),32000},extra{overflow.data(),overflow.size()};
+    LocalTensor<uint8_t> finalLocal{scratch.data(),scratch.size()};
     std::vector<uint8_t> expected(outputBytes);
     auto reset=[&] {std::memset(allocation.get(),0xa9,storageBytes);std::fill(expected.begin(),expected.end(),0xa9);copy_model::owners.clear();};
     auto check=[&] {
@@ -102,7 +108,7 @@ void CheckOutputLayout(uint32_t tailTokens) {
         for(uint32_t worker=0;worker<kFinalWorkers;++worker) {
             copy_model::worker=b*kFinalWorkers+worker;
             uint64_t base=Address(output)+uint64_t(b+1)*stride*kTokenBytes;
-            UbmemFinalCopyPipeline pipe(&ctx,base,local);
+            UbmemFinalCopyPipeline pipe(&ctx,base,finalLocal);
             uint32_t accepted=0;
             for(uint32_t i=0;i<slots.size();++i)if(UbmemDestinationOwner(slots[i],kFinalWorkers)==worker) {
                 uint64_t offset=3+uint64_t((i*5)%sourceRows)*kTokenBytes;
@@ -116,9 +122,10 @@ void CheckOutputLayout(uint32_t tailTokens) {
     check();
     assert(UbmemWindowCopyPipeline::kScratchBytes<=32000);
     assert(4096+UbmemWindowCopyPipeline::kOverflowBytes<=16384);
-    assert(UbmemFinalCopyPipeline::kScratchBytes<=23808);
+    assert(UbmemFinalCopyPipeline::kScratchBytes<=2*kSlots*sizeof(uint32_t));
     std::cout<<"UBmem fused copy model PASS B="<<SIM_BATCH<<" token="<<kTokenBytes
              <<" paired="<<V9_UBMEM_GROUPED_COPY
+             <<" final_stages="<<V9_UBMEM_FINAL_COPY_STAGES
              <<" tail="<<tailTokens
              <<" window_ub="<<UbmemWindowCopyPipeline::kScratchBytes
              <<" overflow="<<UbmemWindowCopyPipeline::kOverflowBytes
@@ -126,6 +133,82 @@ void CheckOutputLayout(uint32_t tailTokens) {
 }
 
 #if V9_UBMEM_GROUPED_COPY
+struct alignas(32) FinalOutput {std::array<uint8_t,SIM_RESIDENT*kTokenBytes> bytes{};};
+
+template<uint32_t Stages>
+void CheckFinalLookahead() {
+    using Pipeline=UbmemPairCopyPipelineT<Stages>;
+    constexpr uint32_t count=3*2*Stages+1;
+    std::vector<uint8_t> source(count*kTokenBytes,0x39);
+    auto allocation=std::make_unique<FinalOutput>();auto& output=allocation->bytes;
+    UbmemRegion region{kUbmemMagic,kUbmemVersion,0x300000,Address(source.data()),source.size(),7,
+        Address(output.data()),output.size(),0,kUbmemHostLocal};
+    Context ctx{};ctx.ubmemRegion=Address(&region);
+    // The production final call may borrow selected + locations, but never
+    // keys at byte 65536. Fill all unused bytes to detect late DMA spill.
+    std::vector<uint8_t> scratch(2*kSlots*sizeof(uint32_t)+64,0xa7);
+    LocalTensor<uint8_t> local{scratch.data(),Pipeline::kScratchBytes};
+    copy_model::owners.clear();copy_model::worker=0;copy_model::peakLoadRows=0;
+    Pipeline pipe(&ctx,Address(output.data()),local);
+    for(uint32_t i=0;i<count;++i) {
+        assert(pipe.Add(region.peerBase+uint64_t(i)*kTokenBytes,i));
+        if(i+1<2*Stages)assert(copy_model::stores.empty());
+        if(i+1==2*Stages) {
+            assert(copy_model::peakLoadRows==2*Stages);
+            assert(copy_model::stores.size()==1 && copy_model::storesDone==0);
+            for(auto value:output)assert(value==0); // queued stores are genuinely delayed
+        }
+    }
+    assert(pipe.Finish()==count);
+    assert(copy_model::peakLoadRows==2*Stages);
+    assert(std::memcmp(output.data(),source.data(),source.size())==0);
+    for(size_t i=Pipeline::kScratchBytes;i<scratch.size();++i)assert(scratch[i]==0xa7);
+    copy_model::Drained();
+}
+
+void CheckFinalBorrow() {
+    // Invoke the actual final caller, with the same live keys/ranks/slots
+    // offsets as ReplicatedFinal. Their contents must survive delayed DMA.
+    constexpr uint32_t count=257;
+    std::vector<uint8_t> source(count*kTokenBytes);
+    for(size_t i=0;i<source.size();++i)source[i]=uint8_t((i*19+i/5)%251);
+    auto allocation=std::make_unique<FinalOutput>();auto& output=allocation->bytes;
+    std::vector<uint8_t> expected(output.size());
+    UbmemRegion region{kUbmemMagic,kUbmemVersion,0x400000,Address(source.data()),source.size(),7,
+        Address(output.data()),output.size(),0,kUbmemHostLocal};
+    std::vector<uint64_t> owners((kFinalOwnerBytes+7)/8);
+    Context ctx{};ctx.ubmemRegion=Address(&region);ctx.owners=Address(owners.data());
+    Row row{};row.output=Address(output.data());
+    copy_model::owners.clear();
+    for(uint32_t worker=0;worker<kFinalWorkers;++worker) {
+        copy_model::worker=worker;
+        std::vector<uint32_t> scratch(kFinalScratchWords,0xabababab);
+        LocalTensor<uint32_t> local{scratch.data(),scratch.size()*sizeof(uint32_t)};
+        auto keys=local[2*kSlots],ranks=local[3*kSlots],slots=local[kFinalSlotsOffset];
+        for(uint32_t rank=0;rank<count;++rank) {
+            uint64_t peer=region.peerBase+uint64_t(rank)*kTokenBytes;
+            keys.SetValue(rank,uint32_t(peer));ranks.SetValue(rank,uint32_t(peer>>32));
+            slots.SetValue(rank,rank*13%512);
+        }
+        auto before=scratch;
+        PublishFinalWorker(&ctx,&row,0,worker,0,count,0,0,local,keys,ranks,slots,local[kFinalControlOffset]);
+        auto* post=FinalPostAt(&ctx,worker);
+        uint32_t wanted=0;
+        for(uint32_t rank=0;rank<count;++rank)if(UbmemDestinationOwner(slots.GetValue(rank),kFinalWorkers)==worker) {
+            ++wanted;
+            std::memcpy(expected.data()+uint64_t(slots.GetValue(rank))*kTokenBytes,
+                source.data()+uint64_t(rank)*kTokenBytes,kTokenBytes);
+        }
+        assert(post->error==0 && post->pending==0 && post->count==wanted && post->head==wanted);
+        constexpr size_t usedWords=(UbmemFinalCopyPipeline::kScratchBytes+3)/4;
+        assert(std::equal(scratch.begin()+usedWords,scratch.end(),before.begin()+usedWords));
+        copy_model::Drained();
+    }
+    assert(std::memcmp(output.data(),expected.data(),output.size())==0);
+    std::cout<<"Final actual caller PASS stages="<<V9_UBMEM_FINAL_COPY_STAGES
+             <<" borrowed_bytes="<<UbmemFinalCopyPipeline::kScratchBytes<<" live_keys_offset="<<2*kSlots*4<<"\n";
+}
+
 void CheckPairCommands() {
     constexpr uint32_t stride=SIM_RESIDENT+384,sourceRows=128;
     const size_t outputBytes=uint64_t(2)*stride*kTokenBytes;
@@ -221,6 +304,8 @@ void CheckPairCommands() {
 int main() {
     for(uint32_t tail:{0U,384U,640U})CheckOutputLayout(tail);
 #if V9_UBMEM_GROUPED_COPY
+    CheckFinalLookahead<4>();CheckFinalLookahead<8>();
+    CheckFinalBorrow();
     CheckPairCommands();
 #endif
 }

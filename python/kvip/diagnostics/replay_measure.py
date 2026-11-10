@@ -10,7 +10,13 @@ import numpy as np
 
 from kvip.diagnostics.archive import array_digest, cpu_array, file_digest, source_commit
 from kvip.diagnostics.oracle import DecodeOracle
-from kvip.diagnostics.snapshot import input_tensors, persistent_tensors, post_state, relocate_snapshot_addresses
+from kvip.diagnostics.snapshot import (
+    input_tensors,
+    mapping_values,
+    persistent_tensors,
+    post_state,
+    relocate_snapshot_addresses,
+)
 
 
 def statistics(samples):
@@ -49,7 +55,7 @@ def fused_reads(torch, rotating, update, transport, width):
             words = cpu_array(torch, value).view(np.uint64)
             if np.any(words[:, 0] != 0x4B5641464247444F) or np.any(words[:, 2]):
                 raise AssertionError("URMA completion status failed")
-    mapping = cpu_array(torch, rotating.mapping)
+    mapping = mapping_values(torch, rotating, rows)
     selected = cpu_array(torch, rotating.arguments[9])
     resident = rotating.hot_valid.shape[1]
     unused = 0

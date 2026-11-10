@@ -18,6 +18,7 @@
 #define V9_WINDOW_COPY_ENGINE 0
 using GM_ADDR=uint8_t*;
 #include "context.h"
+#include "mapping_epoch.h"
 #include "prefetch_budget.h"
 unsigned bitmapCopies=0,scanCalls=0,postCalls=0,previousChecks=0;
 uint8_t* bitmapBegin=nullptr;
@@ -82,7 +83,11 @@ template<bool Partial>void UnionWords(uint32_t*,uint32_t*,uint32_t*,uint32_t* cf
 void ExpandWords(uint32_t*,uint32_t*,uint32_t*,uint32_t*,unsigned,unsigned,unsigned,unsigned){assert(false);}
 void ScanPartial(uint32_t*,uint32_t*,uint32_t*,unsigned,unsigned,unsigned){assert(false);}
 void RestoreVictimTokens(uint32_t*,uint32_t*,unsigned){assert(false);}
+#if MODEL_UBMEM
+void GatherCandidateMap(uint32_t*,uint32_t*,uint32_t*,unsigned,unsigned){assert(false);}
+#else
 void GatherCandidateMap(uint32_t*,uint32_t*,uint32_t*,unsigned){assert(false);}
+#endif
 void CompactMisses(uint32_t*,uint32_t*,uint32_t*,unsigned,unsigned){assert(false);}
 void PrepareCandidateWqes(unsigned,uint32_t*,uint32_t*,uint32_t*,uint32_t*,uint32_t*,uint64_t*,unsigned,unsigned,Context*,unsigned){assert(false);}
 template<class... Args>bool SubmitWqesAt(Args...){++postCalls;return true;}

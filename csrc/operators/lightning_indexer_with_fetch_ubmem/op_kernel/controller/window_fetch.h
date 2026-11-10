@@ -173,8 +173,9 @@ inline void ScanPartial(__ubuf__ uint32_t* input,__ubuf__ uint32_t* ids,__ubuf__
 // LIDU pattern: gather only candidate map entries, then SIMD squeeze misses.
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void GatherCandidateMap(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* slots,
-    __gm__ uint32_t* map,uint32_t count) {
-    for(uint32_t i=threadIdx.x;i<count;i+=256)slots[i]=asc_ldcg(map+ids[i]);
+    __gm__ uint32_t* map,uint32_t count,uint32_t mappingTag) {
+    for(uint32_t i=threadIdx.x;i<count;i+=256)
+        slots[i]=ReadMappingSlot(map+ids[i],mappingTag,V9_UBMEM_TAGGED_MAP?kMappingSlotMask:UINT32_MAX);
 }
 __simd_vf__ inline void CompactMisses(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* slots,
     __ubuf__ uint32_t* cfg,uint32_t count,uint32_t available) {
@@ -194,18 +195,6 @@ __simd_vf__ inline void CompactMisses(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* 
         StoreUnAlign<uint32_t,PostLiteral::POST_MODE_UPDATE>(output,packed,store);
     }
     StoreUnAlignPost(output,store);StoreAlign(cfg+56,written,lane);
-}
-// V7's direct transport pattern: address lookup/slot assignment only for the
-// compact miss list. FinalBuild/SubmitWqes are shared with final completion.
-__simt_vf__ __aicore__ LAUNCH_BOUND(256)
-inline void PrepareCandidateWqes(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* lo,
-    __ubuf__ uint32_t* hi,__ubuf__ uint32_t* slots,__gm__ uint32_t* map,
-    __gm__ uint64_t* addresses,uint32_t count,uint32_t slotBase) {
-    for(uint32_t i=threadIdx.x;i<count;i+=256) {
-        uint32_t token=ids[i],slot=slotBase+i;uint64_t remote=asc_ldcg(addresses+token);
-        lo[i]=uint32_t(remote);hi[i]=uint32_t(remote>>32);slots[i]=slot;asc_stcg(map+token,slot);
-    }
-    asc_threadfence();
 }
 // One batch retains IDs in retired bitmap scratch for its sole peer bank.
 // Two batches instead retain complete ID lists after the live Row snapshots:
@@ -257,6 +246,7 @@ inline void PrepareUbmemWindow(__gm__ Context* ctx,uint32_t lane,uint32_t begin,
         if(input[67])n=0;
         auto jobs=reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*8192;
         auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*SIM_HISTORY;
+        const uint32_t mappingTag=CurrentMappingTag(ctx,b);
         auto addresses=reinterpret_cast<__gm__ uint64_t*>(in64[34]);
         for(uint32_t i=t;i<n;i+=kPostThreads) {
             uint32_t token=localIds && kUbmemLocalIdGroups && count<=kUbmemLocalIdCapacity?
@@ -264,7 +254,7 @@ inline void PrepareUbmemWindow(__gm__ Context* ctx,uint32_t lane,uint32_t begin,
             uint64_t peer=asc_ldcg(addresses+token);
             peers[g*kPostBank+i]=peer;
             uint32_t logicalSlot=input[65]+begin+i;
-            asc_stcg(map+token,logicalSlot);
+            asc_stcg(map+token,EncodeMappingSlot(logicalSlot,mappingTag,V9_UBMEM_TAGGED_MAP?kMappingSlotMask:UINT32_MAX));
             RecordChange(SIM_RESIDENT,ctx,b,logicalSlot,token);
         }
     }
@@ -524,7 +514,8 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
                 missing=candidateCount;count=missing<available?missing:available;
             } else {
                 Simt::VF_CALL<GatherCandidateMap>(Simt::Dim3{256,1,1},
-                    reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),map,candidateCount);
+                    reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),map,candidateCount,
+                    V9_UBMEM_TAGGED_MAP?state.GetValue(0)<<kMappingSlotBits:0);
                 SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
                 SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
                 CompactMisses(reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),

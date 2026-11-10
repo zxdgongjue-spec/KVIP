@@ -29,7 +29,7 @@ def test_reference_rejects_invalid_active_candidate_lists(slots):
         reserved_hot_reference(np.array([slots], dtype=np.int32), np.ones((1, 4), dtype=np.int32), 8)
 
 
-@pytest.mark.parametrize("variant", ("urma", "ubmem", "ubmem_parallel"))
+@pytest.mark.parametrize("variant", ("urma", "ubmem", "ubmem_parallel", "ubmem_tagged"))
 @pytest.mark.parametrize("resident", (8192, 16384, 131072))
 @pytest.mark.parametrize("compact", (0, 1))
 def test_shared_native_helper_rebuilds_active_rows_after_dma_clear(tmp_path, variant, resident, compact):
@@ -63,6 +63,12 @@ def test_shared_native_helper_rebuilds_active_rows_after_dma_clear(tmp_path, var
     functions.extend(function(lifecycle, name) for name in names)
     if variant == "ubmem_parallel":
         functions.extend(function(lifecycle, name) for name in ("InitializeTailShard", "InitializeRoundParallel"))
+    if variant == "ubmem_tagged":
+        functions.extend(function(tail, name) for name in ("CurrentMappingTag", "RecordChange"))
+        functions.extend(
+            function(kernel / "controller/window_fetch.h", name)
+            for name in ("PrepareUbmemWindow", "GatherCandidateMap")
+        )
     (tmp_path / "reserved_hot_lifecycle.h").write_text("\n".join(functions))
     binary = tmp_path / "reserved-hot-model"
     subprocess.run(
@@ -78,6 +84,7 @@ def test_shared_native_helper_rebuilds_active_rows_after_dma_clear(tmp_path, var
             f"-DSIM_RESIDENT={resident}",
             f"-DMODEL_URMA={int(variant == 'urma')}",
             f"-DMODEL_PARALLEL={int(variant == 'ubmem_parallel')}",
+            f"-DV9_UBMEM_TAGGED_MAP={int(variant == 'ubmem_tagged')}",
             f"-I{root / 'csrc/operators/common/lifetch'}",
             f"-I{root / 'csrc/operators/lightning_indexer_with_fetch_ubmem/include'}",
             f"-I{tmp_path}",

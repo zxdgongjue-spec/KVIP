@@ -97,12 +97,12 @@ def fused_stages(transport, rotating, update, lease, batch, *, split_index_stage
                 lease,
             ),
         )
-        for name, symbol in (("init", "v9_init"), ("li_with_prefetch", "v9_li"), ("resolve_final_submit", "v9_resolve"))
+        for name, symbol in (("init", "v9_init"), ("li_with_prefetch", "v9_li"), ("resolve_final_plan", "v9_resolve"))
     ]
     result.extend(
         (
             (
-                "index_update_while_fetch",
+                "index_update_before_final_get",
                 _stage(
                     update.library,
                     "kvop_direct_update_outputs_early",
@@ -112,7 +112,7 @@ def fused_stages(transport, rotating, update, lease, batch, *, split_index_stage
                 ),
             ),
             (
-                "fetch_complete",
+                "final_get_and_completion",
                 _stage(
                     library,
                     "aclrtlaunch_v9_fetch_update_kernel",
@@ -145,15 +145,21 @@ def validate_fused_tuning(overrides, transport):
         raise ValueError("Fusion tuning requires a JSON object and ubmem/urma transport")
     booleans = {"compact_reserved"}
     if transport == "ubmem":
-        booleans |= {"parallel_init", "balanced_index", "skip_inactive", "grouped_copy"}
+        booleans |= {"parallel_init", "balanced_index", "skip_inactive", "grouped_copy", "tagged_map"}
     integers = {"prefetch_limit", "window_limit"}
+    if transport == "ubmem":
+        integers.add("final_copy_stages")
     unknown = set(overrides) - booleans - integers
     if unknown:
         raise ValueError(f"Unsupported {transport} fusion tuning options: {sorted(unknown)}")
     if any(type(overrides[name]) is not bool for name in booleans & overrides.keys()):
         raise ValueError("Fusion optimization switches must be booleans")
     if any(type(overrides[name]) is not int for name in integers & overrides.keys()):
-        raise ValueError("Fusion prefetch budgets must be integers")
+        raise ValueError("Fusion budgets and pipeline stages must be integers")
+    if "final_copy_stages" in overrides and overrides["final_copy_stages"] not in (4, 8):
+        raise ValueError("final_copy_stages must be 4 or 8")
+    if overrides.get("tagged_map") and overrides.get("parallel_init"):
+        raise ValueError("Tagged mapping requires one init worker per request")
     prefetch_budget(overrides.get("prefetch_limit", 512), overrides.get("window_limit", 64), 1)
     return dict(overrides)
 
@@ -170,7 +176,14 @@ def fusion_tuning(geometry, transport, overrides=None):
         window_limit=geometry["window_limit"],
     )
     if transport == "ubmem":
-        values.update(parallel_init=False, balanced_index=False, skip_inactive=False, grouped_copy=False)
+        values.update(
+            parallel_init=False,
+            balanced_index=False,
+            skip_inactive=False,
+            grouped_copy=False,
+            tagged_map=False,
+            final_copy_stages=4,
+        )
     values.update(validate_fused_tuning({} if overrides is None else overrides, transport))
     if transport == "urma":
         # The URMA LI has an unconditional inactive-row gate, not a build knob.
@@ -241,6 +254,8 @@ def create_fused(
             skip_inactive=effective["skip_inactive"],
             compact_reserved=effective["compact_reserved"],
             grouped_copy=effective["grouped_copy"],
+            tagged_map=effective["tagged_map"],
+            final_copy_stages=effective["final_copy_stages"],
         )
         library = build_specialization(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape)
         workspace = UbmemWorkspace(torch, resident=r, **common_workspace)

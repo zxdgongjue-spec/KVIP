@@ -45,6 +45,16 @@ __aicore__ inline void CopyInitialLruSlots(__gm__ Context* ctx,uint32_t b,LocalT
     }
 }
 __aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
+    MappingGeneration generation{0,0,true};
+#if V9_UBMEM_TAGGED_MAP
+    auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
+    ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),64);
+    generation=NextMappingGeneration(row->mappingState);
+    // Scalar loading the old epoch refills this cache line. Discard it before
+    // the DMA zero-fill, so publishing the new epoch cannot write old Row
+    // counters back over those zeros.
+    ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),64);
+#endif
     TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,4096*4);
     auto local=scratch.Get<uint32_t>();
     Duplicate(local,uint32_t(0),4096);
@@ -53,7 +63,7 @@ __aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
     SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
     Duplicate(local,UINT32_MAX,4096);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-    FillWords(ctx->mapping+uint64_t(b)*SIM_HISTORY*4,SIM_HISTORY,local);
+    if(generation.clear)FillWords(ctx->mapping+uint64_t(b)*SIM_HISTORY*4,SIM_HISTORY,local);
     FillWords(ctx->selected+uint64_t(b)*kSlots*4,kSlots,local);
     if(ctx->changes)FillWords(ctx->changes+b*kChangeCapacity*4,kChangeCapacity,local);
     uint64_t reservedRow=0;
@@ -61,8 +71,13 @@ __aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
     reservedRow=ClearReservedHot(ctx->lruSlots,ctx->reservedHot,ctx->queryEnds,b,SIM_RESIDENT,local);
 #endif
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+#if V9_UBMEM_TAGGED_MAP
+    // The Row zero-fill is complete. Persist the epoch for later windows;
+    // the init entry publishes this cache line after filling row metadata.
+    row->mappingState=generation.state;
+#endif
     CopyInitialLruSlots(ctx,b,local);
-    Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},SIM_HISTORY,SIM_RESIDENT,ctx,b,reservedRow);
+    Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},SIM_HISTORY,SIM_RESIDENT,ctx,b,reservedRow,generation.tag);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
     pipe.Destroy();
 }
@@ -151,9 +166,13 @@ extern "C" __global__ __aicore__ void kvip_ubmem_init_kernel(GM_ADDR bindings) {
         uint32_t error=(!ctx->ubmemStatus || !UbmemRegionValid(region) || !ctx->tokenAddresses ||
             !ctx->lruSlots || !ctx->reservedHot || !ctx->changeSlots || !ctx->changeCount ||
             ctx->addressStride<SIM_HISTORY || stride<SIM_RESIDENT || (stride-SIM_RESIDENT)%128 || (ctx->tailBounds && stride<SIM_RESIDENT+384) ||
-            rowBytes%32 || ctx->prefetchLimit>kLruSlots || !ctx->windowLimit || ctx->windowLimit>480)?kUbmemInvalidRegion:0;
+            rowBytes%32 || ctx->prefetchLimit>kLruSlots || !ctx->windowLimit || ctx->windowLimit>480 ||
+            (V9_UBMEM_TAGGED_MAP && stride>=kMappingMaxOutputStride))?kUbmemInvalidRegion:0;
         if(!error && (rowBytes>region->outputBytes || owner>region->outputBytes/rowBytes-1))error=kUbmemInvalidRegion;
-        row->reserved0=0;row->reserved1=0;row->reserved2=0;
+#if !V9_UBMEM_TAGGED_MAP
+        row->mappingState=0;
+#endif
+        row->reserved1=0;row->reserved2=0;
         row->addresses=ctx->tokenAddresses+owner*ctx->addressStride*8;
         row->output=error?0:region->outputBase+owner*rowBytes;
         row->limit=kSlots;row->prefetchLimit=ctx->prefetchLimit;row->copyLimit=kLruSlots;row->error=error;

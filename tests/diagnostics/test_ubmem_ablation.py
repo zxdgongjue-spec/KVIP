@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 import sys
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -251,6 +252,47 @@ def test_ablation_reuses_runtime_import_table_and_releases_every_case_before_the
     assert not hasattr(mock.args, "ubmem_tuning")
     assert result["geometry"]["prefetch_limit"] == 512
     assert result["cases"][-1]["tuning"]["prefetch_limit"] == 256
+
+
+def test_explicit_variants_keep_one_import_and_each_requested_configuration(native_mocks):
+    mock = native_mocks
+    cases = [dict(name="current", tuning={}), dict(name="tagged", tuning={"tagged_map": True})]
+    mock.args.fused_variants = ubmem_ablation.parse_variants(json.dumps(cases))
+    result = ubmem_ablation.run_ablation(mock.args, mock.archive, {})
+    assert result["ablation"] == "ubmem_explicit_variants"
+    assert [case["name"] for case in result["cases"]] == ["current", "tagged"]
+    assert mock.tunings == [{}, {"tagged_map": True}]
+    assert mock.events.count("import_pages") == mock.events.count("runtime") == 1
+    assert mock.events.count("factory") == mock.events.count("lease_close") == 2
+
+
+def test_explicit_variants_reject_malformed_and_conflicting_cli_options(tmp_path):
+    from kvip.diagnostics.replay import arguments
+
+    variants = '[{"name":"current","tuning":{}},{"name":"tagged","tuning":{"tagged_map":true}}]'
+    common = [
+        "--snapshot",
+        "/snapshot",
+        "--build-dir",
+        "/build",
+        "--soc",
+        "soc",
+        "--output",
+        str(tmp_path / "result.json"),
+    ]
+    assert arguments(common + ["--fused-variants", variants]).fused_variants[-1][1] == {"tagged_map": True}
+    for value in (
+        "{}",
+        "[]",
+        '[{"name":"a","tuning":{}}]',
+        variants.replace('"tagged"', '"current"'),
+        variants.replace('"tagged_map"', '"unknown"'),
+    ):
+        with pytest.raises(SystemExit):
+            arguments(common + ["--fused-variants", value])
+    for extra in (["--inspect"], ["--mode", "serial"], ["--ubmem-ablation"], ["--fused-tuning", "{}"]):
+        with pytest.raises(SystemExit):
+            arguments(common + ["--fused-variants", variants] + extra)
 
 
 @pytest.mark.parametrize("failure", ("fail_verify", "fail_reset", "fail_close"))

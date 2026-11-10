@@ -2,6 +2,7 @@
 """Host checks for the fusion lease and static-shape contract; no NPU required."""
 
 from types import SimpleNamespace
+from dataclasses import replace
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -107,6 +108,18 @@ def test_optimization_switches_are_explicit_content_addressed_build_options():
     paired = Specialization(16, 131328, 16384, 32, 2624, 32, 8, "Ascend950DT_9582", grouped_copy=True)
     assert paired.options("/cann")["UBMEM_GROUPED_COPY"] == 1
     assert baseline.options("/cann")["UBMEM_GROUPED_COPY"] == 0
+    tagged = replace(paired, tagged_map=True, final_copy_stages=8)
+    assert tagged.options("/cann")["UBMEM_TAGGED_MAP"] == 1
+    assert tagged.options("/cann")["UBMEM_FINAL_COPY_STAGES"] == 8
+    for overrides in (
+        dict(tagged_map=1),
+        dict(tagged_map=True, parallel_init=True),
+        dict(final_copy_stages=5),
+        dict(final_copy_stages=True),
+        dict(final_copy_stages=8, grouped_copy=False),
+    ):
+        with pytest.raises(ValueError):
+            replace(paired, **overrides)
     with pytest.raises(ValueError, match="booleans"):
         Specialization(16, 131328, 16384, 32, 2624, 32, 8, "Ascend950DT_9582", parallel_init=1)
     with pytest.raises(ValueError, match="booleans"):

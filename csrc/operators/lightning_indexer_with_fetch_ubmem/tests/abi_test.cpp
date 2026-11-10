@@ -23,9 +23,14 @@ extern "C" uint32_t aclrtlaunch_kvip_ubmem_complete_plan_kernel(uint32_t count,v
 int main() {
     using namespace rotating;
     static_assert(sizeof(Context)==256 && sizeof(Row)==1024 && sizeof(UbmemRegion)==128);
+    static_assert(offsetof(Row,mappingState)==0);
     static_assert(offsetof(Row,error)==11*4 && offsetof(Row,pending)==211*4 && offsetof(Row,finalPending)==248*4);
     static_assert(offsetof(Context,ubmemRegion)==128 && offsetof(Context,ubmemStatus)==136 && offsetof(Context,lruSlots)==144);
     assert(kvip_ubmem_abi_version()==2 && kvip_ubmem_context_bytes()==256 && kvip_ubmem_region_bytes()==128);
+    assert(v9_final_copy_stages()==V9_UBMEM_FINAL_COPY_STAGES);
+    assert(v9_tagged_map()==V9_UBMEM_TAGGED_MAP);
+    assert(v9_ubpipe_depth()==(V9_UBMEM_GROUPED_COPY?V9_UBMEM_FINAL_COPY_STAGES:8));
+    assert(v9_window_ubpipe_depth()==(V9_UBMEM_GROUPED_COPY?4:8));
     void* pointer=reinterpret_cast<void*>(1);
     auto update=reinterpret_cast<void*>(2),stream=reinterpret_cast<void*>(3);
     expectedBindings=pointer;expectedUpdate=update;expectedStream=stream;

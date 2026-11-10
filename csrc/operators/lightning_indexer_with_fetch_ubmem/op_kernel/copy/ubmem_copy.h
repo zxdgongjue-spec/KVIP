@@ -153,17 +153,20 @@ private:
 
 #if V9_UBMEM_GROUPED_COPY
 // Four-layer rows are already 32-byte aligned. Pair independently validated
-// rows in four stages: the same eight-row/20992-byte footprint as the original
-// ring, but one ready/free exchange per pair. Both source and destination gaps
+// rows: four stages retain the original eight-row/20992-byte footprint; only
+// final Fetch may borrow the retired selected/locations banks for eight stages.
+// Both source and destination gaps
 // are represented by exact strided copies, never by reading/writing the gaps.
 // Reversed/repeated addresses retain two ordered copies within the same stage.
-class UbmemPairCopyPipeline {
+template<uint32_t Depth=4>
+class UbmemPairCopyPipelineT {
 public:
-    static constexpr uint32_t kDepth=4,kStageBytes=2*kTokenBytes;
+    static constexpr uint32_t kDepth=Depth,kStageBytes=2*kTokenBytes;
     static constexpr uint32_t kScratchBytes=kDepth*kStageBytes,kOverflowBytes=0;
-    static_assert(kTokenBytes==2624 && kTokenBytes%32==0 && kScratchBytes<=23808,
-                  "Paired pipeline requires aligned four-layer rows and retired scratch");
-    __aicore__ inline UbmemPairCopyPipeline(__gm__ Context* ctx,uint64_t output,LocalTensor<uint8_t> scratch)
+    static_assert((Depth==4 || Depth==8) && kTokenBytes==2624 && kTokenBytes%32==0,
+                  "Paired pipeline requires four or eight stages of aligned four-layer rows");
+    static_assert(kScratchBytes<=2*kSlots*sizeof(uint32_t),"Final ring overlaps live address vectors");
+    __aicore__ inline UbmemPairCopyPipelineT(__gm__ Context* ctx,uint64_t output,LocalTensor<uint8_t> scratch)
         :output_(output),scratch_(scratch) {
         auto region=UbmemRegionAt(ctx);
         valid_=UbmemRegionValid(region);
@@ -172,8 +175,8 @@ public:
             outputBase_=region->outputBase;outputBytes_=region->outputBytes;
         }
     }
-    __aicore__ inline UbmemPairCopyPipeline(__gm__ Context* ctx,uint64_t output,
-        LocalTensor<uint8_t> scratch,LocalTensor<uint8_t>):UbmemPairCopyPipeline(ctx,output,scratch) {}
+    __aicore__ inline UbmemPairCopyPipelineT(__gm__ Context* ctx,uint64_t output,
+        LocalTensor<uint8_t> scratch,LocalTensor<uint8_t>):UbmemPairCopyPipelineT(ctx,output,scratch) {}
     __aicore__ inline uint64_t PlanPeerBase()const {return peerBase_;}
     __aicore__ inline uint64_t PlanMaxPeerOffset()const {return bytes_>=kTokenBytes?bytes_-kTokenBytes:0;}
     __aicore__ inline bool Add(uint64_t peer,uint32_t slot) {return AddAt(peer,output_,slot);}
@@ -242,7 +245,8 @@ private:
         storeRows_[stage]=rows;
         SetFlag<HardEvent::MTE2_MTE3>(static_cast<event_t>(stage));
         pending_=0;++issued_;
-        // Preserve eight-row load lookahead before the first MTE3 store.
+        // Fill every stage before the first MTE3 store. Final depth eight
+        // exposes sixteen in-flight rows; window depth four remains unchanged.
         if(issued_-stored_==kDepth)StoreOldest();
     }
     __aicore__ inline void StoreOldest() {
@@ -270,6 +274,7 @@ private:
     uint32_t storeRows_[kDepth]{},pending_=0,accepted_=0,issued_=0,stored_=0,runSlot_=0,runCount_=0;
     bool valid_=false;
 };
+using UbmemPairCopyPipeline=UbmemPairCopyPipelineT<4>;
 #endif
 
 #if TOKEN_BYTES == 656
@@ -694,7 +699,7 @@ using UbmemFinalCopyPipeline=UbmemGroupedCopyPipelineT<4,true>;
 using UbmemWindowCopyPipeline=UbmemGroupedCopyPipelineT<8,false,8,false>;
 #elif V9_UBMEM_GROUPED_COPY
 using UbmemGroupedCopyPipeline=UbmemPairCopyPipeline;
-using UbmemFinalCopyPipeline=UbmemPairCopyPipeline;
+using UbmemFinalCopyPipeline=UbmemPairCopyPipelineT<V9_UBMEM_FINAL_COPY_STAGES>;
 using UbmemWindowCopyPipeline=UbmemPairCopyPipeline;
 #else
 using UbmemGroupedCopyPipeline=UbmemCopyPipeline;

@@ -13,7 +13,12 @@ import torch
 from kvip.diagnostics.archive import TensorArchive, array_digest, file_digest, load_snapshot
 from kvip.diagnostics.oracle import DecodeOracle
 from kvip.diagnostics.replay import arguments
-from kvip.diagnostics.snapshot import DecodeSnapshotRecorder, check_completion, validate_capture_inputs
+from kvip.diagnostics.snapshot import (
+    DecodeSnapshotRecorder,
+    check_completion,
+    decode_tagged_mapping,
+    validate_capture_inputs,
+)
 
 
 def test_tensor_archive_preserves_fp8_bfloat16_and_unsigned_bits(tmp_path):
@@ -423,3 +428,26 @@ def test_array_hash_includes_every_byte():
     right = copy.deepcopy(left)
     right[-1, -1] = 1
     assert array_digest(left) != array_digest(right)
+
+
+def test_tagged_mapping_diagnostics_keep_only_current_epoch_and_preserve_slots():
+    rows = np.zeros((2, 256), dtype=np.uint32)
+    rows[:, 0] = [1, 16383]
+    rows[:, 1] = 0x4D415031
+    raw = np.array(
+        [
+            [(1 << 18) | 16384, (2 << 18) | 16385, 0xFFFFFFFF],
+            [(16383 << 18) | 147839, (16382 << 18) | 1, 0xFFFFFFFF],
+        ],
+        dtype=np.uint32,
+    )
+    before = raw.copy()
+    assert np.array_equal(decode_tagged_mapping(raw, rows), [[16384, -1, -1], [147839, -1, -1]])
+    assert np.array_equal(raw, before)
+    rows[0, 1] = 0
+    with pytest.raises(AssertionError, match="epoch state"):
+        decode_tagged_mapping(raw, rows)
+    rows[0, 1] = 0x4D415031
+    rows[0, 0] = 0
+    with pytest.raises(AssertionError, match="epoch state"):
+        decode_tagged_mapping(raw, rows)

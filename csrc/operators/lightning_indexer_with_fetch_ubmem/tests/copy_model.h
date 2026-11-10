@@ -11,12 +11,14 @@
 
 #define __aicore__
 #define __gm__
+#define __ubuf__
 #define __simt_callee__
 namespace copy_model {
 inline bool events[7][8]{};
 inline size_t fences[7][8]{};
 inline std::vector<std::function<void()>> loads,stores;
 inline size_t loadsDone=0,storesDone=0,loadCommands=0,storeCommands=0;
+inline size_t pendingLoadRows=0,peakLoadRows=0;
 inline unsigned worker=0;
 inline std::map<uintptr_t,unsigned> owners;
 inline void Write(void* output,size_t bytes) {
@@ -33,6 +35,7 @@ inline void Complete(std::vector<std::function<void()>>& commands,size_t& done,s
 inline void Drained() {
     for(auto& direction:events)for(bool credit:direction)assert(!credit);
     assert(loadsDone==loads.size() && storesDone==stores.size());
+    assert(pendingLoadRows==0);
     loads.clear();stores.clear();loadsDone=storesDone=0;
 }
 }
@@ -56,6 +59,7 @@ template<HardEvent Direction> void WaitFlag(event_t event) {
 }
 template<class T> struct LocalTensor {
     T* data;size_t bytes;
+    T* GetPhyAddr()const {return data;}
     LocalTensor operator[](size_t index)const {assert(index*sizeof(T)<=bytes);return {data+index,bytes-index*sizeof(T)};}
     T GetValue(size_t index)const {assert((index+1)*sizeof(T)<=bytes);T result;std::memcpy(&result,data+index,sizeof(T));return result;}
     void SetValue(size_t index,T value)const {assert((index+1)*sizeof(T)<=bytes);std::memcpy(data+index,&value,sizeof(T));}
@@ -74,11 +78,14 @@ void DataCopyPad(LocalTensor<T> destination,GlobalTensor<T> source,DataCopyExtPa
     auto* out=reinterpret_cast<uint8_t*>(destination.data);
     auto* in=reinterpret_cast<uint8_t*>(source.data);
     ++copy_model::loadCommands;
+    copy_model::pendingLoadRows+=copy.blockCount;
+    if(copy_model::peakLoadRows<copy_model::pendingLoadRows)copy_model::peakLoadRows=copy_model::pendingLoadRows;
     copy_model::loads.push_back([=] {
         for(unsigned block=0;block<copy.blockCount;++block) {
             assert(block*localStride+copy.blockLen<=destination.bytes);
             std::memcpy(out+block*localStride,in+block*(copy.blockLen+copy.srcStride),copy.blockLen);
         }
+        copy_model::pendingLoadRows-=copy.blockCount;
     });
 }
 template<class T,PaddingMode>

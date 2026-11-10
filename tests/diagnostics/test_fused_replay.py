@@ -54,9 +54,9 @@ def test_fused_stages_preserve_exact_production_launch_order_and_arguments(trans
         assert [name for name, _ in stages] == [
             "init",
             "li_with_prefetch",
-            "resolve_final_submit",
-            "index_update_while_fetch",
-            "fetch_complete",
+            "resolve_final_plan",
+            "index_update_before_final_get",
+            "final_get_and_completion",
         ]
         assert calls == [(name, (0x1000, 0x4000, 0x3000)) for name in ("v9_init", "v9_li", "v9_resolve")] + [
             ("kvop_direct_update_outputs_early", (16, 0x2000, 0x4000)),
@@ -138,7 +138,12 @@ def test_tuning_keeps_snapshot_immutable_and_validates_only_known_options():
     geometry = dict(prefetch_limit=512, window_limit=64, requested_windows=8)
     optimized = dict(parallel_init=True, balanced_index=True, prefetch_limit=256, window_limit=32)
     assert fusion_tuning(geometry, "ubmem", optimized) == dict(
-        optimized, skip_inactive=False, compact_reserved=False, grouped_copy=False
+        optimized,
+        skip_inactive=False,
+        compact_reserved=False,
+        grouped_copy=False,
+        tagged_map=False,
+        final_copy_stages=4,
     )
     assert geometry == dict(prefetch_limit=512, window_limit=64, requested_windows=8)
     assert fusion_tuning(geometry, "ubmem")["parallel_init"] is False

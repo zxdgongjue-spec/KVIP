@@ -17,9 +17,13 @@ __aicore__ inline void PublishFinalWorker(__gm__ Context* ctx,__gm__ Row* row,
         return;
     }
     uint32_t scheduled=0,completed=0;
-    // selected/loc have finished all SIMD/SIMT use and locations have been
-    // committed above. Reuse at most [0,21504) of selected, never slots or
-    // address vectors. Each destination sector belongs to one final AIV.
+    // selected/loc have finished all SIMD/SIMT use. ReplicatedFinal joined
+    // their last location-store DMA before entering here. Both banks are dead:
+    // [0,65536) may hold the final ring; keys starts at 65536 and remains live.
+    // The opt-in sixteen-row ring uses 41984 bytes without adding UB storage.
+    // Each destination sector still belongs to one final AIV.
+    static_assert(UbmemFinalCopyPipeline::kScratchBytes<=2*kSlots*sizeof(uint32_t),
+                  "Final copy must not overwrite live address vectors");
     UbmemCopyTrace trace;trace.Begin();
     UbmemFinalCopyPipeline copyPipe(ctx,row->output,local.ReinterpretCast<uint8_t>());
     // Recycled hot slots are not consecutive. Sector ownership prevents two

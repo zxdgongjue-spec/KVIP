@@ -46,6 +46,7 @@ def arguments(argv=None):
         help="URMA serial total inflight bound: 0 submits whole core slices; omitted keeps native default 2048",
     )
     parser.add_argument("--fused-tuning", help="JSON object of supported options for one fused replay")
+    parser.add_argument("--fused-variants", help="JSON list of named UBmem tuning objects sharing one DDR import")
     parser.add_argument(
         "--ubmem-ablation",
         action="store_true",
@@ -86,6 +87,22 @@ def arguments(argv=None):
         parser.error("device/warmup must be nonnegative and iterations positive")
     if args.stage_iterations < 0:
         parser.error("stage-iterations must be nonnegative")
+    if args.fused_variants is not None:
+        if (
+            args.inspect
+            or (args.transport, args.mode) != ("ubmem", "fused")
+            or args.ubmem_ablation
+            or args.service_ablation
+            or args.fused_tuning is not None
+            or args.output is None
+        ):
+            parser.error("--fused-variants requires UBmem fused replay, --output, and no other ablation/tuning option")
+        from kvip.diagnostics.ubmem_ablation import parse_variants
+
+        try:
+            args.fused_variants = parse_variants(args.fused_variants)
+        except ValueError as error:
+            parser.error(str(error))
     if args.fused_tuning is not None:
         if args.inspect or args.mode != "fused" or args.ubmem_ablation or args.service_ablation:
             parser.error("--fused-tuning requires one fused device replay, without an ablation matrix")
@@ -173,7 +190,11 @@ def run(args, archive):
 
 
 def _run(args, archive, retained):
-    if getattr(args, "ubmem_ablation", False) or getattr(args, "service_ablation", False):
+    if (
+        getattr(args, "ubmem_ablation", False)
+        or getattr(args, "service_ablation", False)
+        or getattr(args, "fused_variants", None) is not None
+    ):
         from kvip.diagnostics.ubmem_ablation import run_ablation
 
         return run_ablation(args, archive, retained)
@@ -215,7 +236,7 @@ def main():
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with args.output.open("x") as output:
             output.write(text)
-    if args.ubmem_ablation or args.service_ablation:
+    if args.ubmem_ablation or args.service_ablation or args.fused_variants is not None:
         print(f"Results: {args.output}")
     else:
         print(text, end="")

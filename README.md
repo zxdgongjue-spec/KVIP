@@ -450,6 +450,40 @@ at least 1.5x speedup against the measured serial path (the former is stricter:
 approximately 1.5385x). Candidate-call wall time and instrumented stages do not
 enter that ratio. Host models or a successful compile do not establish target
 attainment; the same-snapshot NPU result is required.
+
+Node24's later NPU4 run measured UBmem serial/fused at 684.875/676.665 us
+and URMA serial/fused at 584.858/583.266 us. Neither met that target. Both
+URMA paths improved substantially on the different NPU, although fusion does
+not use the standalone post32 object; this does not isolate a post32 benefit.
+Native serial diagnostics show completion waiting dominates posting cycles.
+The current URMA resolver records deferred final Get descriptors; the final
+Fetch kernel submits and waits for those reads after early Index update.
+`index_update_before_final_get` names that boundary explicitly. It may overlap
+prefetch DMA, but it is not evidence that final-demand reads overlap Index.
+The adjacent diagnostic stages are `resolve_final_plan` and
+`final_get_and_completion`; the latter includes submitting the final Get,
+not just waiting for previously submitted work.
+
+Two further UBmem switches are opt-in and preserve all queries and KV bytes:
+
+- `tagged_map=true`: encode the per-row epoch alongside mapping slots. Normal
+  rounds advance the epoch instead of clearing all history entries. First use,
+  invalid epoch state and 14-bit epoch wrap still clear inside Init. It requires
+  serial Init and a bounded output stride; old epochs decode as invalid. No
+  preparation is moved outside the graph. Warm replay measures steady-state
+  epochs, not first-use or wrap latency.
+- `final_copy_stages=8`, with `grouped_copy=true` and 2624-byte rows: increase
+  final-copy capacity from 8 to 16 in-flight rows using retired resolver scratch.
+  Window-copy depth remains unchanged. Default final depth remains 4 stages.
+
+`replay --fused-variants` accepts two to four objects with unique `name` and
+`tuning` fields. It uses the existing ablation runner to import DDR once and
+then builds, restores, verifies and times each case separately. Comparing
+current, tagged-map-only, and tagged-map-plus-deeper-final isolates the two
+incremental changes without a new model service or a worker sweep. The
+snapshot's original geometry is retained; mapping diagnostics decode epoch
+tags before counting useful/unused prefetch. New tagged captures also retain
+the raw mapping tensor as `post.mapping_raw`.
 Serial graphs use the Torch NPU graph allocator for native LI/gather outputs;
 fused graphs retain the existing KVAF graph API. The supported explicit stream
 argument is documented in [Torch NPU graphs](https://github.com/Ascend/pytorch/blob/master/torch_npu/npu/graphs.py).

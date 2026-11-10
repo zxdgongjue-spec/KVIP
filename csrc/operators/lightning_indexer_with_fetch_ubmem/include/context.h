@@ -4,6 +4,7 @@ static_assert(V9_UBPIPE_DEPTH == 1 || V9_UBPIPE_DEPTH == 8, "Invalid UBmem pipel
 static_assert(V9_UBPIPE_ROWS == 1 || V9_UBPIPE_ROWS == 4, "Invalid UBmem rows per pipeline stage");
 static_assert(V9_UBPIPE_DEPTH != 1 || V9_UBPIPE_ROWS == 1, "Serial UBmem requires one row per stage");
 #include "ubmem_abi.h"
+#include "mapping_epoch.h"
 namespace rotating {
 constexpr bool kDedicatedService = V9_DEDICATED_SERVICE;
 constexpr uint32_t kTop = 2048, kSlots = 8192, kTokenBytes = TOKEN_BYTES;
@@ -52,10 +53,21 @@ constexpr uint32_t kFinalCores=SIM_BATCH*kFinalWorkers;
 #ifndef V9_UBMEM_GROUPED_COPY
 #define V9_UBMEM_GROUPED_COPY 0
 #endif
+#ifndef V9_UBMEM_FINAL_COPY_STAGES
+#define V9_UBMEM_FINAL_COPY_STAGES 4
+#endif
 static_assert(V9_UBMEM_GROUPED_COPY==0 || (V9_UBMEM_GROUPED_COPY==1 && TOKEN_BYTES==2624),
               "Paired copy is an explicit four-layer specialization");
+static_assert(V9_UBMEM_FINAL_COPY_STAGES==4 ||
+              (V9_UBMEM_FINAL_COPY_STAGES==8 && V9_UBMEM_GROUPED_COPY && TOKEN_BYTES==2624),
+              "Eight final-copy stages require paired four-layer transfers");
 static_assert(V9_UBMEM_PARALLEL_INIT == 0 || V9_UBMEM_PARALLEL_INIT == 1,
               "Parallel init must be enabled explicitly with 0 or 1");
+static_assert(V9_UBMEM_TAGGED_MAP==0 || V9_UBMEM_TAGGED_MAP==1,"Tagged mapping must be boolean");
+static_assert(!V9_UBMEM_TAGGED_MAP || !V9_UBMEM_PARALLEL_INIT,
+              "Tagged mapping requires one init owner per packed row");
+static_assert(SIM_RESIDENT+2*8192+384<=kMappingSlotMask,
+              "Default resident/spill/ABC slots exceed tagged mapping representation");
 constexpr uint32_t kInitWorkersPerBatch=V9_UBMEM_PARALLEL_INIT ? 2*V9_AIC_COUNT/SIM_BATCH : 1;
 constexpr uint32_t kInitCores=SIM_BATCH*kInitWorkersPerBatch;
 static_assert(kInitWorkersPerBatch>=1 && kInitCores<=2*V9_AIC_COUNT,
@@ -78,7 +90,7 @@ static_assert(sizeof(FinalPost)==128,"Final post must own a cache line");
 static_assert((kFinalWorkers==1 || kFinalWorkers==2 || kFinalWorkers==4) && kFinalCores<=2*kLiCores,"Invalid final AIV budget");
 struct alignas(128) Progress { uint32_t end[32]; };
 struct alignas(128) Row {
-    uint64_t reserved0, reserved1, addresses, output; // former transport slots; always zero
+    uint64_t mappingState, reserved1, addresses, output; // MAP1+epoch only when tagged; otherwise zero
     uint32_t slots, requests, suppressed, error;
     uint32_t consumed[4];
     uint32_t epochCount[kMaxRounds], epochSuppressed[kMaxRounds];

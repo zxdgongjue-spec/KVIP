@@ -3,6 +3,7 @@
 // Transport-independent final TopK protection and persistent hot-slot selection.
 // Both backends provide the same virtual-slot translation from prefetch/ABC.
 #include "../../lidu/op_kernel/hot_slot_selection.h"
+#include "mapping.h"
 namespace rotating {
 template<uint32_t Threads>
 __simt_callee__ inline bool ResolveResidentPlan(
@@ -11,7 +12,8 @@ __simt_callee__ inline bool ResolveResidentPlan(
     __ubuf__ uint32_t* positions, uint32_t coldCount, __ubuf__ uint32_t* keys,
     __ubuf__ uint32_t* ranks, __ubuf__ uint16_t* ids, __ubuf__ uint32_t* slots,
     __ubuf__ uint32_t* cfg, __gm__ uint32_t* mapping, __gm__ uint32_t* lru,
-    uint32_t used, bool hasTail, uint32_t& count, uint32_t& candidateCount) {
+    uint32_t used, bool hasTail, uint32_t& count, uint32_t& candidateCount,
+    uint32_t mappingTag=0,uint32_t mappingMask=UINT32_MAX) {
     uint32_t tid=threadIdx.x,lane=tid%warpSize,warp=tid/warpSize;
     uint32_t buckets=coldCount<=1024?2048U:(coldCount<=2048?4096U:8192U);
     for(uint32_t i=tid;i<buckets;i+=Threads){keys[i]=UINT32_MAX;ranks[i]=UINT32_MAX;}
@@ -21,7 +23,7 @@ __simt_callee__ inline bool ResolveResidentPlan(
         uint32_t pos=positions[i],token=selected[pos];
         if(token>=rt_history){asc_atomic_or(cfg+1,1U);continue;}
         if(pos>=2*kTop && selected[pos-2*kTop]==token){loc[pos]=UINT32_MAX-2;continue;}
-        uint32_t slot=(used || hasTail)?asc_ldcg(mapping+token):UINT32_MAX;loc[pos]=slot;
+        uint32_t slot=(used || hasTail)?ReadMappingSlot(mapping+token,mappingTag,mappingMask):UINT32_MAX;loc[pos]=slot;
         if(slot==UINT32_MAX){
             uint32_t h=SparseHash(token)&(buckets-1);
             for(uint32_t n=0;n<buckets;++n){uint32_t old=asc_atomic_cas(keys+h,UINT32_MAX,token);
@@ -58,7 +60,7 @@ __simt_callee__ inline bool ResolveResidentPlan(
         uint32_t pos=positions[i],slot=loc[pos],token=selected[pos];
         // Earlier query locations may already be physical (including ABC).
         // Read the immutable mapping instead of translating them a second time.
-        if(slot==UINT32_MAX-2)slot=(used || hasTail)?asc_ldcg(mapping+token):UINT32_MAX;
+        if(slot==UINT32_MAX-2)slot=(used || hasTail)?ReadMappingSlot(mapping+token,mappingTag,mappingMask):UINT32_MAX;
         if(slot>=UINT32_MAX-2) {
             uint32_t h=SparseHash(token)&(buckets-1);while(keys[h]!=token)h=(h+1)&(buckets-1);
             slot=missingTag|ranks[h];

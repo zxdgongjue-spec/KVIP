@@ -3,11 +3,30 @@
 
 from copy import copy
 import gc
+import json
 
 import numpy as np
 
 from kvip.diagnostics import replay_measure
 from kvip.operators.lifetch.geometry import prefetch_budget
+
+
+def parse_variants(value):
+    from kvip.diagnostics.fused_replay import validate_fused_tuning
+
+    values = json.loads(value)
+    if not isinstance(values, list) or not 2 <= len(values) <= 4:
+        raise ValueError("fused-variants requires two to four named tuning objects")
+    result, names = [], set()
+    for item in values:
+        if not isinstance(item, dict) or set(item) != {"name", "tuning"}:
+            raise ValueError("Each fused variant requires name and tuning")
+        name = item["name"]
+        if not isinstance(name, str) or not name.isascii() or not name.isidentifier() or name in names:
+            raise ValueError("Variant names must be unique ASCII identifiers")
+        names.add(name)
+        result.append((name, validate_fused_tuning(item["tuning"], "ubmem")))
+    return result
 
 
 def plan_cases(geometry):
@@ -119,11 +138,13 @@ def run_ablation(args, archive, retained):
     if args.transport != "ubmem" or args.mode != "fused":
         raise ValueError("UBmem ablation requires --transport ubmem --mode fused")
     service = getattr(args, "service_ablation", False)
-    plans = (
-        service_cases(archive, getattr(args, "active_batches", None))
-        if service
-        else [(name, tuning, archive) for name, tuning in plan_cases(archive.manifest["geometry"])]
-    )
+    variants = getattr(args, "fused_variants", None)
+    if variants is not None:
+        plans = [(name, tuning, archive) for name, tuning in variants]
+    elif service:
+        plans = service_cases(archive, getattr(args, "active_batches", None))
+    else:
+        plans = [(name, tuning, archive) for name, tuning in plan_cases(archive.manifest["geometry"])]
     context = replay_measure.allocate_context(args, archive, retained)
     cases = []
     for name, tuning, case_archive in plans:
@@ -147,7 +168,13 @@ def run_ablation(args, archive, retained):
         status="pass",
         transport="ubmem",
         mode="fused",
-        ablation="ubmem_active_rows_compact_metadata" if service else "ubmem_init_index_prefetch",
+        ablation=(
+            "ubmem_explicit_variants"
+            if variants is not None
+            else "ubmem_active_rows_compact_metadata"
+            if service
+            else "ubmem_init_index_prefetch"
+        ),
         snapshot=str(archive.directory),
         geometry=archive.manifest["geometry"],
         cases=cases,
