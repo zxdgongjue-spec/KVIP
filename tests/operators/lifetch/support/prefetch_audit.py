@@ -16,6 +16,16 @@ def selected_bounds(selected, history):
                 invalid_count=int(invalid.sum()), examples=examples)
 
 
+def score_rows(raw, history):
+    """Describe the first request's four uint16 score rows, without interpreting dtype."""
+    values = np.asarray(raw, dtype=np.uint8).view('<u2').reshape(4, history)
+    return [dict(query=q, nonzero=int(np.count_nonzero(row)),
+                 zero=int(np.count_nonzero(row == 0)),
+                 all_ones=int(np.count_nonzero(row == 0xffff)),
+                 minimum=int(row.min()), maximum=int(row.max()))
+            for q, row in enumerate(values)]
+
+
 def actual_reads(mapping, selected, rows, resident):
     """Inspect completed replay outputs outside timing; count unique prefetches."""
     result = dict(

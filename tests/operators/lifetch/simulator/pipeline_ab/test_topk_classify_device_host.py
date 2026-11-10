@@ -68,6 +68,19 @@ int main() {
  for(uint32_t lane=0;lane<512;++lane){threadIdx.x=lane;ClassifyTopkHalf(h,r,0,0,0,half,0,0,true,true,false,&c,idx.data(),out.data(),valid.data(),reserved.data(),bits.data(),error.data());}
  for(uint32_t lane=0;lane<512;++lane){threadIdx.x=lane;MergeClassifyBitmap(bits.data());}
  for(uint32_t word=0;word<512;++word)assert(bits[word]==(word<32?UINT32_MAX:0));
+ // A smaller merge scratch requires four chunks instead of two. Results and
+ // protection bitmap must be identical, including cold and invalid entries.
+ for(uint32_t i=0;i<2048;++i)idx[i]=(i*53)%(h+2);
+ auto classify=[&](uint32_t chunk){
+  std::vector<uint32_t> result(kTop,0),bitmap(kBitmapWords*kBitmapShards),errors(1);
+  for(uint32_t base=0;base<r;base+=chunk)for(uint32_t lane=0;lane<512;++lane){
+   threadIdx.x=lane;ClassifyTopkHalf(h,r,0,3,base,chunk,0,0,true,true,false,&c,
+    idx.data(),result.data(),valid.data()+base,reserved.data()+base,bitmap.data(),errors.data());
+  }
+  for(uint32_t lane=0;lane<512;++lane){threadIdx.x=lane;MergeClassifyBitmap(bitmap.data());}
+  bitmap.resize(kBitmapWords);result.insert(result.end(),bitmap.begin(),bitmap.end());result.push_back(errors[0]);return result;
+ };
+ assert(classify(8192)==classify(4096));
 }
 ''')
     subprocess.run(['c++', '-std=c++17', '-O2', '-I', str(HERE.parents[4] / 'csrc/operators/lightning_indexer_with_fetch_streaming/op_kernel'), str(source), '-o', str(exe)], check=True)

@@ -10,7 +10,7 @@ from device_trace import collect_core, core_summary
 from index_update import DirectCacheUpdate, permutation_records
 from kvip.operators.lifetch.forward import LIFetchForward
 from kvip.runtime.loader import load_lifetch_library
-from prefetch_audit import actual_reads, completion_failures, selected_bounds
+from prefetch_audit import actual_reads, completion_failures, score_rows, selected_bounds
 from runner import progress
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -451,9 +451,15 @@ def run_device(
                 bounds = selected_bounds(topk.cpu().numpy(), h)
             except Exception as exc:
                 bounds = dict(error=f"{type(exc).__name__}: {exc}")
-            path.write_text(json.dumps(dict(phase=phase, requests=failures, selected_bounds=bounds), indent=2))
+            try:
+                scores = score_rows(arguments[12][:4 * h * 2].cpu().numpy(), h)
+            except Exception as exc:
+                scores = dict(error=f"{type(exc).__name__}: {exc}")
+            path.write_text(json.dumps(dict(phase=phase, requests=failures, selected_bounds=bounds,
+                                            first_request_score_rows=scores), indent=2))
             print(f"COMPLETION FAILURE: phase={phase}; first={json.dumps(failures[0])}; full={path}", flush=True)
             print(f"LI OUTPUT BOUNDS: {json.dumps(bounds)}", flush=True)
+            print(f"LI SCORE WORDS request=0: {json.dumps(scores)}", flush=True)
             raise AssertionError(
                 f"completion failed phase={phase}; bad_requests={len(failures)}; "
                 f"first={json.dumps(failures[0])}; full={path}"
