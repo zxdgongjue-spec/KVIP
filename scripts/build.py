@@ -2,6 +2,7 @@
 """Build pinned KVAF, original LIDU and the complete LIFetch/Index update library."""
 
 import argparse
+import importlib
 import json
 import os
 import subprocess
@@ -9,8 +10,11 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-REVISION = "c4375e13d7a9519d907ab6a5d11227795f207286"
+REVISION = "1c1310387ebfb6776a07316874e924265b209ada"
 PATCHES = ("kvaf-reuse-device-ra", "kvaf-fused-context", "kvaf-fused-output-views")
+UBMEM_PATCH = "kvaf-ubmem-fused-lease"
+UBMEM_DEVICE_PATCH = "kvaf-ubmem-device-get"
+BACKGROUND_PATCH = "kvaf-background-put"
 
 
 def call(command, cwd=None, env=None):
@@ -18,18 +22,43 @@ def call(command, cwd=None, env=None):
     subprocess.run(list(map(str, command)), cwd=cwd, env=env, check=True)
 
 
+def runtime_preflight():
+    if sys.version_info < (3, 12):
+        raise RuntimeError(
+            f"KVIP builds require Python >= 3.12; selected {sys.executable} "
+            f"({sys.version.split()[0]}). Set PYTHON to the serving interpreter."
+        )
+    for name in ("torch", "torch_npu"):
+        try:
+            importlib.import_module(name)
+        except Exception as error:
+            raise RuntimeError(
+                f"Cannot load {name} with {sys.executable}: {error}. "
+                "Select the serving Python with torch/torch_npu and load its CANN environment."
+            ) from error
+
+
+def build_lidu(env, skip=False):
+    source = ROOT / "csrc/operators/lidu"
+    if skip:
+        libraries = list((source / "_custom_opp/vendors").glob("*/op_api/lib/libcust_opapi.so"))
+        extensions = list((source / "torch_extension/nanovllm_dsa_lidu_fused_batch_get_prepare_mtp").glob("_C*.so"))
+        if len(libraries) != 1 or len(extensions) != 1:
+            raise RuntimeError("--skip-lidu-build requires one existing LIDU vendor library and Python extension")
+        print(f"REUSE LIDU: {libraries[0]} {extensions[0]}", flush=True)
+        return
+    call(["bash", source / "build_lidu_fused_batch_get_prepare_mtp.sh"], env=env)
+
+
+def patch_path(name):
+    directory = ROOT / "patches" if name in (BACKGROUND_PATCH, UBMEM_PATCH, UBMEM_DEVICE_PATCH) else ROOT / "scripts/patches"
+    return directory / (name + ".patch")
+
+
 def applies(root, name, reverse=False):
     return (
         subprocess.run(
-            [
-                "git",
-                "-C",
-                str(root),
-                "apply",
-                *(["--reverse"] if reverse else []),
-                "--check",
-                str(ROOT / "scripts/patches" / (name + ".patch")),
-            ],
+            ["git", "-C", str(root), "apply", *(["--reverse"] if reverse else []), "--check", str(patch_path(name))],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         ).returncode
@@ -37,7 +66,15 @@ def applies(root, name, reverse=False):
     )
 
 
-def prepare_dependency(root):
+def apply_patch(root, name):
+    if not applies(root, name):
+        raise RuntimeError(f"KVAF {name} conflicts with existing edits; checkout preserved")
+    call(["git", "apply", patch_path(name)], cwd=root)
+
+
+def prepare_dependency(root, transport="urma"):
+    if transport not in ("urma", "ubmem"):
+        raise ValueError("transport must be urma or ubmem")
     if not root.exists():
         root.parent.mkdir(parents=True, exist_ok=True)
         call(["git", "clone", "--no-checkout", "https://gitcode.com/CacheOS/KVAF.git", root])
@@ -45,47 +82,130 @@ def prepare_dependency(root):
     head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
     if head != REVISION:
         raise RuntimeError(f"Expected KVAF {REVISION}, found {head}; existing checkout left unchanged")
+    # The device patch appends to tests/CMakeLists.txt, changing the context of
+    # the preceding lease patch. Check the newest patch first.
+    if applies(root, UBMEM_DEVICE_PATCH, True):
+        if transport != "ubmem":
+            raise RuntimeError("KVAF checkout already has the UBmem device patch; use a separate URMA checkout")
+        bindings = (root / "bindings/src/npu_python_runtime.cc").read_text()
+        if "acquire_ubmem_fused_context" not in bindings or "release_ubmem_fused_context" not in bindings:
+            raise RuntimeError("KVAF UBmem device patch exists but its fused lease dependency is missing")
+        print(f"KVAF UBmem device dependency already patched: {root} @ {head}", flush=True)
+        return
+    if (root / "access_operator/include/ubmem/fused_batch_get_device.h").exists():
+        raise RuntimeError(
+            "KVAF has a different UBmem fused-device patch; preserve it and use a fresh "
+            "--kvaf-root for this KVIP revision"
+        )
+    # The UBmem patch changes common-patch contexts. Recognize it first, while
+    # keeping the default URMA checkout on its original three-patch chain.
+    if applies(root, UBMEM_PATCH, True):
+        if transport != "ubmem":
+            raise RuntimeError("KVAF checkout already has the UBmem lease patch; use a separate URMA checkout")
+        if not applies(root, UBMEM_DEVICE_PATCH, True):
+            apply_patch(root, UBMEM_DEVICE_PATCH)
+        print(f"KVAF UBmem dependency already patched: {root} @ {head}", flush=True)
+        return
     # Applying output-views changes the parent patch's context: check newest first.
     if not applies(root, PATCHES[0], True):
-        if not applies(root, PATCHES[0]):
-            raise RuntimeError("KVAF base patch conflicts with existing edits; checkout preserved")
-        call(["git", "apply", ROOT / "scripts/patches" / (PATCHES[0] + ".patch")], cwd=root)
+        apply_patch(root, PATCHES[0])
     if not applies(root, PATCHES[-1], True):
         for name in PATCHES[1:]:
-            if applies(root, name, True):
-                continue
-            if not applies(root, name):
-                raise RuntimeError(f"KVAF {name} conflicts with existing edits; no forced reset")
-            call(["git", "apply", ROOT / "scripts/patches" / (name + ".patch")], cwd=root)
-    print(f"KVAF dependency ready: {root} @ {head}", flush=True)
+            if not applies(root, name, True):
+                apply_patch(root, name)
+    # Preserve the existing three-patch checkout when only its background Put
+    # upgrade is missing; never reverse a patch or overwrite local source.
+    if not applies(root, BACKGROUND_PATCH, True):
+        apply_patch(root, BACKGROUND_PATCH)
+    if transport == "ubmem":
+        apply_patch(root, UBMEM_PATCH)
+        apply_patch(root, UBMEM_DEVICE_PATCH)
+    print(f"KVAF {transport} dependency ready: {root} @ {head}", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kvaf-root", type=Path, help="existing checkout; otherwise download to third_party/KVAF")
-    parser.add_argument("--prepare-only", action="store_true", help="prepare patches, without CANN builds")
-    parser.add_argument("--skip-kvaf-build", action="store_true", help="use an already rebuilt, patched KVAF")
+    parser.add_argument("--prepare-only", action="store_true", help="prepare pinned source, without CANN builds")
+    parser.add_argument("--skip-kvaf-build", action="store_true", help="use an already rebuilt KVAF")
+    parser.add_argument("--skip-lidu-build", action="store_true", help="reuse existing LIDU vendor/Python libraries")
     parser.add_argument("--cann", type=Path, default=Path("/usr/local/Ascend/cann"))
     parser.add_argument("--soc", default="Ascend950PR_9599", help="compile target architecture")
     parser.add_argument("--jobs", type=int, default=2)
+    parser.add_argument("--transport", choices=("urma", "ubmem"), default="urma")
     args = parser.parse_args()
+    if args.jobs < 1:
+        parser.error("--jobs must be positive")
+    if not args.prepare_only:
+        runtime_preflight()
     dependency = (args.kvaf_root or ROOT / "third_party/KVAF").resolve()
-    prepare_dependency(dependency)
+    prepare_dependency(dependency, args.transport)
     (ROOT / "build").mkdir(exist_ok=True)
-    (ROOT / "build/dependencies.json").write_text(json.dumps({"kvaf": str(dependency), "revision": REVISION}, indent=2))
+    build_dir = dependency / "build-npu"
+    state = dict(kvaf=str(dependency), revision=REVISION, transport=args.transport, kvaf_build_dir=str(build_dir))
     if args.prepare_only:
+        # Preparing source must not switch a working Python environment to an
+        # unbuilt dependency. Select it only after the build succeeds.
         return
     env = dict(
         os.environ,
+        PYTHON=sys.executable,
         ASCEND_CANN_PACKAGE_PATH=str(args.cann),
+        SOC_VERSION=args.soc,
         KVAF_UMDK_ROOT=str(dependency / "third_party/umdk"),
         NANOVLLM_A5_OPS_BUILD_JOBS=str(args.jobs),
         NANOVLLM_A5_OPS_PYTHON=sys.executable,
     )
+    if args.transport == "ubmem":
+        if not args.skip_kvaf_build:
+            for target in ("cpu", "npu"):
+                call(
+                    [
+                        "bash",
+                        dependency / "build.sh",
+                        target,
+                        "--jobs",
+                        args.jobs,
+                        *(["--without-aicpu"] if target == "npu" else []),
+                    ],
+                    cwd=dependency,
+                    env=env,
+                )
+        for name in ("kvaf_execute_batch_get_kernels.o", "kvaf_execute_batch_put_kernels.o"):
+            if not (build_dir / "bin" / name).is_file():
+                raise RuntimeError(f"UBmem kernel missing: {build_dir / 'bin' / name}")
+        if not list((build_dir / "python/kvaf").glob("*.so")):
+            raise RuntimeError(f"UBmem Python extension missing: {build_dir / 'python/kvaf'}")
+        build_lidu(env, args.skip_lidu_build)
+        call([sys.executable, "-m", "pip", "install", "--no-build-isolation", "-e", ROOT])
+        sys.path.insert(0, str(ROOT / "python"))
+        from kvip.operators.lifetch_ubmem.build import UbmemGeometry, build_ubmem_library
+
+        # One library contains both KV widths and accepts runtime geometry.
+        build_ubmem_library(
+            cache_dir=build_dir / "lifetch_ubmem",
+            cann=args.cann,
+            shape=UbmemGeometry(1, 33024, 8192, 64, 656, 32, 8, args.soc),
+            jobs=args.jobs,
+        )
+        (ROOT / "build/dependencies.json").write_text(json.dumps(state, indent=2))
+        print("PASS: KVAF UBmem Put/Get + LIDU + UBmem LIFetch/Index update built. Source scripts/env.sh.", flush=True)
+        return
     if not args.skip_kvaf_build:
         for target in ("cpu", "npu"):
-            call(["bash", dependency / "build.sh", target], cwd=dependency, env=env)
-    call(["bash", ROOT / "csrc/operators/lidu/build_lidu_fused_batch_get_prepare_mtp.sh"], env=env)
+            call(
+                [
+                    "bash",
+                    dependency / "build.sh",
+                    target,
+                    "--jobs",
+                    args.jobs,
+                    *(["--without-aicpu"] if target == "npu" else []),
+                ],
+                cwd=dependency,
+                env=env,
+            )
+    build_lidu(env, args.skip_lidu_build)
     # Editable install intentionally retains csrc alongside the Python package.
     call([sys.executable, "-m", "pip", "install", "--no-build-isolation", "-e", ROOT])
     sys.path.insert(0, str(ROOT / "python"))
@@ -94,6 +214,7 @@ def main():
     cann, headers = kvaf_build_paths(dependency / "build-npu")
     print(f"BUILD universal LIFetch; logs under {ROOT / 'build/lifetch'}", flush=True)
     paths = build_libraries(cache_dir=ROOT / "build/lifetch", cann=cann, headers=headers, soc=args.soc)
+    (ROOT / "build/dependencies.json").write_text(json.dumps(state, indent=2))
     print(f"READY: {paths}", flush=True)
     print("PASS: KVAF + LIDU + LIFetch/Index update built. Source scripts/env.sh before serving.", flush=True)
 

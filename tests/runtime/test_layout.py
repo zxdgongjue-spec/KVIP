@@ -61,6 +61,9 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
 
     source = tmp_path / "csrc/operators/lightning_indexer_with_fetch"
     source.mkdir(parents=True)
+    selector = source.parent / "lidu/op_kernel/hot_slot_selection.h"
+    selector.parent.mkdir(parents=True)
+    selector.write_text("// shared LIDU selector\n")
     kernel = source / "prefetch.h"
     kernel.write_text("// baseline kernel\n", encoding="utf-8")
     headers = tmp_path / "kvaf-headers"
@@ -94,6 +97,10 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
     assert updated != optimized
     assert all(path.is_file() for path in updated)
     assert len(commands) == 6
+
+    selector.write_text("// updated shared LIDU selector\n")
+    assert build.build_libraries(**options) != updated
+    assert len(commands) == 8
 
 
 def test_actual_operator_cmake_resolves_relocated_sources(tmp_path):
@@ -147,3 +154,14 @@ def test_actual_operator_cmake_resolves_relocated_sources(tmp_path):
                 "index_cache_update.h",
             ) or include.startswith("resolver_reference/"):
                 assert any((folder / include).is_file() for folder in [cpp.parent, *includes]), (cpp, include)
+
+
+def test_ubmem_previous_import_paths_resolve_to_merged_modules():
+    from kvip.adapters.ubmem import UbmemLease as old_lease
+    from kvip.adapters.kvaf import UbmemLease
+    from kvip.adapters.vllm.ubmem_binding import bind_selectors as old_bind, prepare_workspace as old_prepare
+    from kvip.adapters.vllm.binding import bind_selectors, prepare_workspace
+
+    assert old_lease is UbmemLease
+    assert old_bind is bind_selectors
+    assert old_prepare is prepare_workspace

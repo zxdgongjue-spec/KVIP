@@ -51,8 +51,16 @@ public:
     __aicore__ inline void RotateFetch(uint32_t epoch, uint32_t sequenceHalfWindow = 0) {
         // Join this producer's hit publication. Other producers remain free.
         PipeBarrier<PIPE_ALL>();
+#if defined(V9_UBMEM) && V9_UBMEM
+        rotating::Service(rotationContext_, epoch, blockId_ / 2, blockId_ % 2,
+#else
         rotating::Service(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.splitQ,runtimeShape_.rounds,runtimeShape_.serviceAics,runtimeShape_.serviceLanes,runtimeShape_.tokenBytes,runtimeShape_.postThreads,runtimeShape_.postBank,runtimeShape_.batchedRows,runtimeShape_.scanTokens,rotationContext_, epoch, blockId_ / 2, blockId_ % 2,
+#endif
+#if defined(V9_UBMEM) && V9_UBMEM
+            topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_);
+#else
             topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow);
+#endif
     }
     __aicore__ inline void LoadSequenceSplitThresholds(uint32_t batch) {
         constexpr uint32_t count = SIM_Q * 2048;
@@ -200,7 +208,11 @@ private:
             SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
             auto ready = reinterpret_cast<__gm__ uint32_t*>(context->progress)+query*32;
             ready[0]=runtimeShape_.resident;
+#if defined(V9_UBMEM) && V9_UBMEM
+            ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ready),128);
+#else
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ready),128);
+#endif
         }
     }
 

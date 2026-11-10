@@ -23,3 +23,29 @@ def actual_reads(mapping, selected, rows, resident):
     result["total"] = prefetch + result["final"]
     result["unused"] = result["unused_hot"] + result["unused_cold"]
     return result
+
+
+def completion_failures(rows, posts, statuses, prefetch, final):
+    """Decode existing device status buffers; no device work or state changes."""
+    failures = []
+    for b in range(len(rows)):
+        cq = {
+            name: words[2 * b : 2 * b + 2, :8].tolist()
+            for name, words in (("prefetch_cq", prefetch), ("final_cq", final))
+        }
+        cq_bad = any(any(w[0] != 0x4B5641464247444F or w[2] for w in pair) for pair in cq.values())
+        if not (rows[b, 11] or rows[b, 211] or rows[b, 248] or np.any(posts[b, :, 1:4]) or statuses[b, 0] or cq_bad):
+            continue
+        failures.append(
+            dict(
+                request=b,
+                prefetch_error=int(rows[b, 11]),
+                prefetch_pending=int(rows[b, 211]),
+                final_pending=int(rows[b, 248]),
+                final_requests=int(rows[b, 247]),
+                resolver_status=statuses[b, :5].tolist(),
+                posts_count_pending_error_deferred_descriptor=posts[b, :, :5].tolist(),
+                **cq,
+            )
+        )
+    return failures

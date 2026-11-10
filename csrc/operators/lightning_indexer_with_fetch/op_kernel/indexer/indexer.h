@@ -647,6 +647,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessInvalid()
     }
 }
 
+#if !defined(V9_UBMEM) || !V9_UBMEM
 template <typename QLIT>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
     uint32_t begin, uint32_t end, uint32_t shard, uint32_t& loop, uint32_t& scaleLoop, bool last)
@@ -730,6 +731,8 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
         }
     }
 }
+
+#endif
 
 template <typename QLIT>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()

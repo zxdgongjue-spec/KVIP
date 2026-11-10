@@ -1,0 +1,1011 @@
+diff --git a/access_operator/include/ubmem/access_operator.h b/access_operator/include/ubmem/access_operator.h
+index a373f9c9..f69a8c5c 100644
+--- a/access_operator/include/ubmem/access_operator.h
++++ b/access_operator/include/ubmem/access_operator.h
+@@ -19,6 +19,7 @@ class AccessOperator final : public kvaf::AccessOperator {
+   ~AccessOperator() override;
+   Status Initialize(const RemoteRegionDesc& region) override;
+   Status Shutdown() override;
++  Status FusedMapping(std::uint64_t* base) const;
+   Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
+   Status ExecuteBatchPut(const BatchPutExecRequest& request) override;
+   Status SetBatchGetKernelProfiling(bool enabled, bool detailed = false);
+diff --git a/access_operator/src/ubmem/access_operator.cc b/access_operator/src/ubmem/access_operator.cc
+index 670f08a4..dc42d9d8 100644
+--- a/access_operator/src/ubmem/access_operator.cc
++++ b/access_operator/src/ubmem/access_operator.cc
+@@ -218,6 +218,12 @@ Status AccessOperator::Initialize(const RemoteRegionDesc& region) {
+   return Status::OK();
+ }
+
++Status AccessOperator::FusedMapping(std::uint64_t* base) const {
++  if (!base || !impl_->ready || !impl_->mapping) return Status::InvalidState("UBmem mapping unavailable");
++  *base = impl_->mapping->address();
++  return Status::OK();
++}
++
+ Status AccessOperator::Shutdown() {
+   impl_->ready = false;
+   impl_->profiling = false;
+diff --git a/bindings/src/npu_python_runtime.cc b/bindings/src/npu_python_runtime.cc
+index eda2b718..cbe09dea 100644
+--- a/bindings/src/npu_python_runtime.cc
++++ b/bindings/src/npu_python_runtime.cc
+@@ -187,14 +187,16 @@ void CopyCpuUint64SequenceInto(const py::object& values, const char* name,
+ class DeviceAccessTable final {
+  public:
+   DeviceAccessTable(AccessTableHandle source, py::object addresses,
+-                    py::object valid)
+-      : source_(source), addresses_(std::move(addresses)), valid_(std::move(valid)) {}
++                    py::object valid, std::shared_ptr<int> owner)
++      : source_(source), addresses_(std::move(addresses)), valid_(std::move(valid)), owner_(std::move(owner)) {}
+
++  bool OwnedBy(const std::shared_ptr<int>& owner) const { return owner_ == owner; }
+   const AccessTableHandle& source() const { return source_; }
+   py::object addresses() const { return addresses_; }
+   py::object valid() const { return valid_; }
+
+  private:
++  std::shared_ptr<int> owner_;
+   AccessTableHandle source_;
+   py::object addresses_;
+   py::object valid_;
+@@ -211,6 +213,22 @@ aclrtStream ResolveStream(const py::object& stream) {
+   return acl_python::StreamFromPython(torch.attr("npu").attr("current_stream")());
+ }
+
++py::dict UbmemFusedContextDict(const UbmemFusedContext& context) {
++  py::dict result;
++  result["abi_version"] = context.abi_version;
++  result["lease_id"] = context.lease_id;
++  result["device_id"] = context.device_id;
++  result["region_base"] = context.region_base;
++  result["mapped_base"] = context.mapped_base;
++  result["region_bytes"] = context.region_bytes;
++  result["slot_bytes"] = context.slot_bytes;
++  result["output_address"] = context.output_address;
++  result["output_bytes"] = context.output_bytes;
++  result["token_bytes"] = context.token_bytes;
++  result["tokens_per_block"] = context.tokens_per_block;
++  return result;
++}
++
+ py::dict BatchGetProfileDict(const BatchGetProfile& profile) {
+   py::dict result, host;
+ #define HOST_TIME(name) host[#name "_us"] = profile.name##_ns / 1000.0
+@@ -320,6 +338,12 @@ class NpuPythonRuntime final {
+   }
+
+   ~NpuPythonRuntime() {
++    if (ubmem_fused_context_.lease_id || completion_unknown_) {
++      for (auto& owner : ubmem_fused_owners_) (void)owner.release();
++      (void)ubmem_fused_stream_.release();
++      (void)native_.release();
++      return;
++    }
+     if (fused_context_.lease_id != 0U) {
+       // GC is not proof that caller-launched DMA finished. Keep both the
+       // registered storage and its native owner until process exit. Native
+@@ -344,6 +368,7 @@ class NpuPythonRuntime final {
+     ThrowIfError(native_->Initialize(ddr_bytes, slot_size));
+   }
+
++  const char* TransportName() const { return native_->transport()==Transport::kUbmem ? "ubmem" : "urma"; }
+   bool Initialized() const { return native_->initialized(); }
+   std::uint32_t DeviceId() const { return native_->device_id(); }
+   std::uint32_t NpuCoreCount() const { return native_->npu_core_count(); }
+@@ -356,6 +381,115 @@ class NpuPythonRuntime final {
+     return native_->batch_get_tokens_per_block();
+   }
+
++  py::dict AcquireUbmemFusedContext(const py::object& output,
++                                    const py::object& stream) {
++    if (native_->transport() != Transport::kUbmem) {
++      throw py::value_error("UBmem fused context requires transport=ubmem");
++    }
++    if (completion_unknown_) throw std::runtime_error("Runtime completion is unknown");
++    if (ubmem_fused_context_.lease_id != 0) {
++      throw py::value_error("Runtime already owns a UBmem fused lease");
++    }
++    const auto tensor = CheckUbmemFusedOutput(output);
++    py::object owner = stream;
++    if (owner.is_none()) {
++      owner = py::module_::import("torch").attr("npu").attr("current_stream")(DeviceId());
++    }
++    if (!py::hasattr(owner, "device")) {
++      throw py::value_error("UBmem fused acquire requires a stream object with a device");
++    }
++    CheckUbmemDevice(owner, "UBmem fused stream");
++    const aclrtStream acl_stream = acl_python::StreamFromPython(owner);
++    ThrowIfAclError(aclrtSetDevice(static_cast<int32_t>(DeviceId())),
++                    "aclrtSetDevice before UBmem fused acquire");
++    // Retain before the native fence: unknown completion must not DECREF them.
++    ubmem_fused_owners_.push_back(output);
++    ubmem_fused_stream_ = std::move(owner);
++    ubmem_fused_acl_stream_ = acl_stream;
++    UbmemFusedContext context;
++    const Status status = native_->AcquireUbmemFusedContext(
++        tensor.data, tensor.bytes, acl_stream, &context);
++    if (status.code() == StatusCode::kCompletionUnknown) completion_unknown_ = true;
++    if (!status.ok()) {
++      if (!completion_unknown_) {
++        ubmem_fused_owners_.clear();
++        ubmem_fused_stream_ = py::object{};
++        ubmem_fused_acl_stream_ = nullptr;
++      }
++      ThrowIfError(status);
++    }
++    ubmem_fused_context_ = context;
++    return UbmemFusedContextDict(context);
++  }
++
++  py::dict RegisterUbmemFusedOutput(const py::dict& context,
++                                    const py::object& output) {
++    CheckUbmemFusedOwner(context);
++    const auto tensor = CheckUbmemFusedOutput(output);
++    ThrowIfAclError(aclrtSetDevice(static_cast<int32_t>(DeviceId())),
++                    "aclrtSetDevice before UBmem fused output registration");
++    ubmem_fused_owners_.push_back(output);
++    UbmemFusedContext view;
++    const Status status = native_->RegisterUbmemFusedOutput(
++        ubmem_fused_context_, tensor.data, tensor.bytes, &view);
++    if (!status.ok()) {
++      ubmem_fused_owners_.pop_back();
++      ThrowIfError(status);
++    }
++    return UbmemFusedContextDict(view);
++  }
++
++  void RegisterUbmemFusedAccessTable(const py::dict& context,
++                                     const py::object& table_owner) {
++    CheckUbmemFusedOwner(context);
++    const auto& table = table_owner.cast<const DeviceAccessTable&>();
++    if (!table.OwnedBy(access_table_owner_)) throw py::value_error("DeviceAccessTable belongs to another Runtime");
++    CheckUbmemDevice(table.addresses(), "UBmem fused table addresses");
++    CheckUbmemDevice(table.valid(), "UBmem fused table valid");
++    ThrowIfAclError(aclrtSetDevice(static_cast<int32_t>(DeviceId())),
++                    "aclrtSetDevice before UBmem fused table registration");
++    ubmem_fused_owners_.push_back(table_owner);
++    const Status status = native_->RegisterUbmemFusedAccessTable(
++        ubmem_fused_context_, table.source());
++    if (!status.ok()) {
++      ubmem_fused_owners_.pop_back();
++      ThrowIfError(status);
++    }
++  }
++
++  void RetainUbmemFusedGraph(const py::dict& context, const py::object& graph) {
++    CheckUbmemFusedOwner(context);
++    CheckUbmemDevice(graph, "UBmem fused graph");
++    if (!py::hasattr(graph, "replay") || !PyCallable_Check(graph.attr("replay").ptr())) {
++      throw py::type_error("UBmem fused graph must expose replay()");
++    }
++    ubmem_fused_owners_.push_back(graph);
++  }
++
++  void ReleaseUbmemFusedContext(const py::dict& context,
++                                 const py::object& stream) {
++    CheckUbmemFusedOwner(context);
++    if (!stream.is_none()) {
++      if (!py::hasattr(stream, "device")) {
++        throw py::value_error("UBmem fused release requires the acquire stream object");
++      }
++      CheckUbmemDevice(stream, "UBmem fused release stream");
++      if (acl_python::StreamFromPython(stream) != ubmem_fused_acl_stream_) {
++        throw py::value_error("UBmem fused release must use its acquire stream");
++      }
++    }
++    ThrowIfAclError(aclrtSetDevice(static_cast<int32_t>(DeviceId())),
++                    "aclrtSetDevice before UBmem fused release");
++    const Status status = native_->ReleaseUbmemFusedContext(
++        ubmem_fused_context_, ubmem_fused_acl_stream_);
++    if (status.code() == StatusCode::kCompletionUnknown) completion_unknown_ = true;
++    ThrowIfError(status);
++    ubmem_fused_context_ = {};
++    ubmem_fused_acl_stream_ = nullptr;
++    ubmem_fused_owners_.clear();
++    ubmem_fused_stream_ = py::object{};
++  }
++
+   py::dict AcquireFusedBatchGetContext(const py::object& output,
+                                       const py::object& stream) {
+     if (fused_context_.lease_id != 0U) {
+@@ -564,7 +698,7 @@ class NpuPythonRuntime final {
+                     ACL_MEMCPY_HOST_TO_DEVICE),
+         "aclrtMemcpy NPU AccessTable valid");
+     return py::cast(DeviceAccessTable{handle, std::move(addresses),
+-                                      std::move(valid)});
++                                      std::move(valid), access_table_owner_});
+   }
+
+   void ReleaseAccessTable(const AccessTableHandle& handle) {
+@@ -728,6 +862,7 @@ class NpuPythonRuntime final {
+
+  public:
+   void Shutdown() {
++    if (ubmem_fused_context_.lease_id || completion_unknown_) throw py::value_error("release UBmem lease; retain on uncertain completion");
+     if (fused_context_.lease_id != 0U) {
+       throw py::value_error(
+           "release the fused BatchGet context successfully before shutdown; "
+@@ -737,6 +872,46 @@ class NpuPythonRuntime final {
+   }
+
+  private:
++  NpuTensorView CheckUbmemFusedOutput(const py::object& output) const {
++    CheckUbmemDevice(output, "UBmem fused output");
++    const auto view = GetNpuTensorView(output, "UBmem fused output");
++    if (view.shape.size() < 2 || view.shape.front() <= 0 ||
++        view.bytes % static_cast<std::size_t>(view.shape.front()) != 0 ||
++        view.bytes / static_cast<std::size_t>(view.shape.front()) != BatchGetTokenBytes()) {
++      throw py::value_error("UBmem fused output requires one token_bytes-sized row per slot");
++    }
++    return view;
++  }
++
++  void CheckUbmemFusedOwner(const py::dict& context) const {
++    if (completion_unknown_) throw std::runtime_error("Runtime completion is unknown; fused owners are retained");
++    if (ubmem_fused_context_.lease_id == 0) throw py::value_error("Runtime has no active UBmem fused lease");
++    ThrowIfError(native_->core().CheckFusedReadLease());
++    const auto expected = UbmemFusedContextDict(ubmem_fused_context_);
++    for (const auto& item : expected) {
++      if (!context.contains(item.first) ||
++          context[item.first].cast<std::uint64_t>() != item.second.cast<std::uint64_t>()) {
++        throw py::value_error("pass the original unmodified UBmem fused owner context");
++      }
++    }
++  }
++
++  void CheckUbmemDevice(const py::object& object, const char* name) const {
++    if (native_->transport() != Transport::kUbmem ||
++        !py::hasattr(object, "device")) return;
++    const std::string expected = "npu:" + std::to_string(DeviceId());
++    if (py::str(object.attr("device")).cast<std::string>() != expected) {
++      throw py::value_error(std::string(name) + " must belong to Runtime device " + expected);
++    }
++    // Raw ACL stream pointers expose no device. Their owner must enforce the
++    // same-device contract; do not infer an ACL device from the pointer value.
++  }
++  std::shared_ptr<int> access_table_owner_=std::make_shared<int>(0);
++  bool completion_unknown_{false};
++  UbmemFusedContext ubmem_fused_context_;
++  std::vector<py::object> ubmem_fused_owners_;
++  py::object ubmem_fused_stream_;
++  aclrtStream ubmem_fused_acl_stream_{nullptr};
+   std::unique_ptr<::kvaf::NpuRuntime> native_;
+   bool aicpu_backend_{false};
+   // Runtime::BatchPut is synchronous, so these vectors can be reused after
+@@ -767,6 +942,32 @@ void BindNpuPythonRuntime(py::module_& module) {
+       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),
+            py::arg("slot_size"))
+       .def("shutdown", &NpuPythonRuntime::Shutdown)
++      .def("acquire_ubmem_fused_context",
++           &NpuPythonRuntime::AcquireUbmemFusedContext,
++           py::arg("output"), py::arg("stream") = py::none(),
++           "Lease the worker-local HostDDR arena and an output tensor for UBmem fusion. "
++           "Returns an independent mapping/geometry ABI with no URMA queues. "
++           "Keep all launches ordered on the acquire stream. Do not resize retained storage. "
++           "BatchFree fences the device at request retirement: first stop submitting that "
++           "request and invalidate its addresses; later graph replays must not use freed keys.")
++      .def("register_ubmem_fused_output", &NpuPythonRuntime::RegisterUbmemFusedOutput,
++           py::arg("context"), py::arg("output"),
++           "Retain another output under the original UBmem owner lease before capture. "
++           "Returns a view sharing lease and arena, with this output's address and size.")
++      .def("register_ubmem_fused_access_table", &NpuPythonRuntime::RegisterUbmemFusedAccessTable,
++           py::arg("context"), py::arg("device_access_table"),
++           "Optionally retain a KVAF DeviceAccessTable and its metadata pin until lease "
++           "release. Its keys cannot be freed and its handle cannot be released meanwhile. "
++           "Dynamic request address tables may instead use the request-retirement contract.")
++      .def("retain_ubmem_fused_graph", &NpuPythonRuntime::RetainUbmemFusedGraph,
++           py::arg("context"), py::arg("graph"),
++           "Retain a captured graph until explicit UBmem lease release. The graph and its "
++           "remaining inputs must belong to the same Runtime device. Never replay it after release.")
++      .def("release_ubmem_fused_context", &NpuPythonRuntime::ReleaseUbmemFusedContext,
++           py::arg("context"), py::arg("stream") = py::none(),
++           "Pass the original owner dict. Drain device work, remove optional table reader "
++           "pins, and release retained output/table/graph/stream owners. The caller must "
++           "stop all future replays before release. Unknown completion retains all resources.")
+       .def("acquire_fused_batch_get_context",
+            &NpuPythonRuntime::AcquireFusedBatchGetContext,
+            py::arg("output"), py::arg("stream") = py::none(),
+@@ -791,6 +992,7 @@ void BindNpuPythonRuntime(py::module_& module) {
+            "stream, not the current stream. Failure retains all resources and blocks "
+            "shutdown; unknown DMA completion requires process/device teardown.")
+       .def_property_readonly("initialized", &NpuPythonRuntime::Initialized)
++      .def_property_readonly("transport", [](const NpuPythonRuntime& r) { return r.TransportName(); })
+       .def_property_readonly("device_id", &NpuPythonRuntime::DeviceId)
+       .def_property_readonly("npu_core_count", &NpuPythonRuntime::NpuCoreCount)
+       .def_property_readonly("jettys_per_core", &NpuPythonRuntime::JettysPerCore)
+diff --git a/common/include/status.h b/common/include/status.h
+index 1e70c3ae..35cca0b6 100644
+--- a/common/include/status.h
++++ b/common/include/status.h
+@@ -16,6 +16,9 @@ enum class StatusCode {
+   kInvalidState,
+   kOutOfMemory,
+   kInternal,
++  // A device transfer was submitted but its completion cannot be established.
++  // Its memory and metadata must remain reserved until process teardown.
++  kCompletionUnknown,
+ };
+
+ class Status {
+@@ -64,6 +67,10 @@ class Status {
+     return Error(StatusCode::kInternal, std::move(message));
+   }
+
++  static Status CompletionUnknown(std::string message) {
++    return Error(StatusCode::kCompletionUnknown, std::move(message));
++  }
++
+   bool ok() const { return code_ == StatusCode::kOk; }
+   StatusCode code() const { return code_; }
+   const std::string& message() const { return message_; }
+diff --git a/runtime/include/npu_runtime.h b/runtime/include/npu_runtime.h
+index d3ab56e0..13db3c7d 100644
+--- a/runtime/include/npu_runtime.h
++++ b/runtime/include/npu_runtime.h
+@@ -9,6 +9,7 @@
+ #include "access_operator.h"
+ #include "runtime.h"
+ #include "npu_runtime_config.h"
++#include "ubmem/fused_context.h"
+
+ namespace kvaf {
+
+@@ -97,6 +98,16 @@ class NpuRuntime final : public Runtime {
+   Status ReleaseFusedBatchGetContext(const FusedBatchGetContext& context,
+                                     void* stream);
+
++  Transport transport() const;
++  Status AcquireUbmemFusedContext(void* output, std::uint64_t output_bytes,
++                                  void* stream, UbmemFusedContext* context);
++  Status RegisterUbmemFusedOutput(const UbmemFusedContext& owner, void* output,
++                                  std::uint64_t output_bytes,
++                                  UbmemFusedContext* view);
++  Status RegisterUbmemFusedAccessTable(const UbmemFusedContext& owner,
++                                      const AccessTableHandle& table);
++  Status ReleaseUbmemFusedContext(const UbmemFusedContext& owner, void* stream);
++
+   Status LinkTo(const LinkTarget& target) override;
+   Status AcceptLink(const LinkTarget& peer) override;
+   Status ReleaseLink(LinkId link_id) override;
+diff --git a/runtime/include/runtime.h b/runtime/include/runtime.h
+index 89d19c35..925156a9 100644
+--- a/runtime/include/runtime.h
++++ b/runtime/include/runtime.h
+@@ -1,6 +1,9 @@
+ #pragma once
+
++#include <atomic>
++
+ #include <cstdint>
++#include <functional>
+ #include <memory>
+ #include <string>
+ #include <unordered_map>
+@@ -88,6 +91,18 @@ class RuntimeCore {
+                             AccessTableView* view) const;
+   Status ReleaseAccessTable(const AccessTableHandle& handle);
+
++  // External fused readers share the arena without owning an AccessOperator
++  // queue. Fence only at request retirement/release, never on every launch.
++  // The owner must stop submitting a retired request and invalidate its address
++  // table before BatchFree; a fence cannot prevent future graph replays.
++  Status AcquireFusedReadLease(std::function<Status()> fence);
++  Status CheckFusedReadLease() const;
++  Status FenceFusedReads();
++  Status ReleaseFusedReadLease();
++  Status RetainFusedAccessTable(const AccessTableHandle& handle,
++                                std::uint64_t required_block_bytes = 0);
++  Status ReleaseFusedAccessTable(const AccessTableHandle& handle);
++
+   Status BatchGet(
+       const BatchGetRequest& request,
+       const BatchGetExecutionOptions& execution = BatchGetExecutionOptions{});
+@@ -106,6 +121,7 @@ class RuntimeCore {
+     std::vector<Address> addresses;
+     std::vector<std::uint64_t> lengths;
+     std::vector<std::uint8_t> valid;
++    std::uint64_t fused_readers{0};
+
+     // NPU BatchGet requires every valid lookup entry to match its configured
+     // tokens_per_block * output_block_bytes layout. Compute the invariant once
+@@ -120,6 +136,8 @@ class RuntimeCore {
+       const AccessTableHandle& handle) const;
+
+   bool initialized_{false};
++  std::atomic<bool> completion_unknown_{false};
++  std::function<Status()> fused_read_fence_;
+   bool needs_cleanup_{false};
+   RemoteRegionDesc remote_region_;
+   std::uint64_t next_access_table_id_{1};
+diff --git a/runtime/include/ubmem/fused_context.h b/runtime/include/ubmem/fused_context.h
+new file mode 100644
+index 00000000..4a0f91fb
+--- /dev/null
++++ b/runtime/include/ubmem/fused_context.h
+@@ -0,0 +1,24 @@
++#pragma once
++
++#include <cstdint>
++
++namespace kvaf {
++
++// Host-side ownership descriptor, not a kernel launch ABI. Every output view
++// shares one arena/lease; only the original descriptor may release that lease.
++// It intentionally contains no URMA queue, channel, or completion pointers.
++struct UbmemFusedContext {
++  std::uint32_t abi_version{1};
++  std::uint32_t device_id{0};
++  std::uint64_t lease_id{0};
++  std::uint64_t region_base{0};
++  std::uint64_t mapped_base{0};
++  std::uint64_t region_bytes{0};
++  std::uint64_t slot_bytes{0};
++  std::uint64_t output_address{0};
++  std::uint64_t output_bytes{0};
++  std::uint32_t token_bytes{0};
++  std::uint32_t tokens_per_block{0};
++};
++
++}  // namespace kvaf
+diff --git a/runtime/src/npu_runtime.cc b/runtime/src/npu_runtime.cc
+index 5f122188..abc06a94 100644
+--- a/runtime/src/npu_runtime.cc
++++ b/runtime/src/npu_runtime.cc
+@@ -509,6 +509,59 @@ struct NpuRuntime::Impl {
+   std::unique_ptr<AccessOperator> access_operator;
+   DefaultAccessOperator* urma_operator{nullptr};
+   std::unique_ptr<RuntimeCore> runtime_core;
++#if defined(KVAF_ENABLE_AIV_BATCH_GET)
++  UbmemFusedContext ubmem_fused;
++  void* ubmem_fused_stream{nullptr};
++  std::uint64_t next_ubmem_lease{1};
++  std::vector<AccessTableHandle> ubmem_fused_tables;
++
++  Status CheckUbmemDevice() const {
++    std::int32_t current = -1;
++    const aclError error = aclrtGetDevice(&current);
++    if (error != ACL_SUCCESS || current < 0 ||
++        static_cast<std::uint32_t>(current) != options.device_id) {
++      return Status::InvalidState("UBmem fused context must run on its Runtime device");
++    }
++    return Status::OK();
++  }
++
++  Status CheckUbmemOwner(const UbmemFusedContext& owner) const {
++    const Status ready = runtime_core->CheckFusedReadLease();
++    if (!ready.ok()) return ready;
++    const auto& live = ubmem_fused;
++    if (live.lease_id == 0) return Status::NotFound("Runtime has no UBmem fused lease");
++    if (owner.abi_version != live.abi_version || owner.lease_id != live.lease_id ||
++        owner.device_id != live.device_id || owner.region_base != live.region_base ||
++        owner.mapped_base != live.mapped_base || owner.region_bytes != live.region_bytes || owner.slot_bytes != live.slot_bytes ||
++        owner.output_address != live.output_address || owner.output_bytes != live.output_bytes ||
++        owner.token_bytes != live.token_bytes || owner.tokens_per_block != live.tokens_per_block) {
++      return Status::InvalidArgument("pass the original unmodified UBmem fused owner context");
++    }
++    return CheckUbmemDevice();
++  }
++
++  Status CheckUbmemOutput(void* output, std::uint64_t bytes) const {
++    const auto base = reinterpret_cast<std::uintptr_t>(output);
++    const auto token_bytes = options.batch_get_token_bytes;
++    if (base == 0 || base % 32 != 0 || bytes == 0 ||
++        bytes > std::numeric_limits<std::uintptr_t>::max() - base ||
++        (token_bytes != 656 && token_bytes != 2624) || bytes % token_bytes != 0) {
++      return Status::InvalidArgument("UBmem fused output requires aligned complete 656/2624-byte rows");
++    }
++    return Status::OK();
++  }
++
++  Status FenceUbmemReads() {
++    Status status = CheckUbmemDevice();
++    if (!status.ok()) return status;
++    const aclError error = aclrtSynchronizeDevice();
++    if (error != ACL_SUCCESS) {
++      return Status::CompletionUnknown("UBmem fused device fence failed; retain arena, output, tables and graphs; ACL=" +
++                                        std::to_string(error));
++    }
++    return Status::OK();
++  }
++#endif
+   void* probe_buffer{nullptr};
+   std::unique_ptr<detail::StartupBandwidthProbe> bandwidth_probe;
+ };
+@@ -1029,6 +1082,130 @@ Status NpuRuntime::ReleaseFusedBatchGetContext(
+   return impl_->access_operator->ReleaseFusedBatchGetContext(context, stream);
+ }
+
++Transport NpuRuntime::transport() const { return impl_->options.transport; }
++
++Status NpuRuntime::AcquireUbmemFusedContext(
++    void* output, std::uint64_t output_bytes, void* stream,
++    UbmemFusedContext* context) {
++  if (impl_->options.transport != Transport::kUbmem) {
++    return Status::NotImplemented("UBmem fused context requires transport=ubmem");
++  }
++#if defined(KVAF_ENABLE_AIV_BATCH_GET)
++  if (context == nullptr || stream == nullptr) {
++    return Status::InvalidArgument("UBmem fused acquire requires output context and caller stream");
++  }
++  *context = {};
++  if (!initialized()) return Status::NotInitialized("initialize Runtime before acquiring a UBmem fused lease");
++  if (impl_->ubmem_fused.lease_id != 0) return Status::Busy("Runtime already has a UBmem fused lease");
++  Status status = impl_->CheckUbmemDevice();
++  if (!status.ok()) return status;
++  status = impl_->CheckUbmemOutput(output, output_bytes);
++  if (!status.ok()) return status;
++  if (impl_->next_ubmem_lease == 0) return Status::InvalidState("UBmem fused lease ID space exhausted");
++  const auto& region = core().remote_region();
++  const std::uint64_t block_bytes =
++      static_cast<std::uint64_t>(impl_->options.batch_get_token_bytes) *
++      impl_->options.batch_get_tokens_per_block;
++  if (region.slot_size < block_bytes) {
++    return Status::InvalidArgument("UBmem fused block layout exceeds the DDR slot size");
++  }
++  status = core().AcquireFusedReadLease([state = impl_.get()] {
++    return state->FenceUbmemReads();
++  });
++  if (!status.ok()) return status;
++  std::uint64_t mapped = 0;
++  status = static_cast<ubmem::AccessOperator*>(impl_->access_operator.get())->FusedMapping(&mapped);
++  if (!status.ok()) { (void)core().ReleaseFusedReadLease(); return status; }
++  impl_->ubmem_fused = UbmemFusedContext{
++      1, impl_->options.device_id, impl_->next_ubmem_lease++,
++      region.base, mapped, region.length, region.slot_size,
++      reinterpret_cast<std::uintptr_t>(output), output_bytes,
++      impl_->options.batch_get_token_bytes, impl_->options.batch_get_tokens_per_block};
++  impl_->ubmem_fused_stream = stream;
++  // Drain previous ordinary operations once. A failed fence deliberately keeps
++  // the lease and native owner intact even though acquire cannot return it.
++  status = core().FenceFusedReads();
++  if (!status.ok()) return status;
++  *context = impl_->ubmem_fused;
++  return Status::OK();
++#else
++  return Status::NotImplemented("KVAF was built without UBmem support");
++#endif
++}
++
++Status NpuRuntime::RegisterUbmemFusedOutput(
++    const UbmemFusedContext& owner, void* output, std::uint64_t output_bytes,
++    UbmemFusedContext* view) {
++  if (impl_->options.transport != Transport::kUbmem) {
++    return Status::NotImplemented("UBmem fused context requires transport=ubmem");
++  }
++#if defined(KVAF_ENABLE_AIV_BATCH_GET)
++  if (view == nullptr) return Status::InvalidArgument("UBmem fused output view must not be null");
++  *view = {};
++  Status status = impl_->CheckUbmemOwner(owner);
++  if (!status.ok()) return status;
++  status = impl_->CheckUbmemOutput(output, output_bytes);
++  if (!status.ok()) return status;
++  *view = owner;
++  view->output_address = reinterpret_cast<std::uintptr_t>(output);
++  view->output_bytes = output_bytes;
++  return Status::OK();
++#else
++  return Status::NotImplemented("KVAF was built without UBmem support");
++#endif
++}
++
++Status NpuRuntime::RegisterUbmemFusedAccessTable(
++    const UbmemFusedContext& owner, const AccessTableHandle& table) {
++  if (impl_->options.transport != Transport::kUbmem) {
++    return Status::NotImplemented("UBmem fused context requires transport=ubmem");
++  }
++#if defined(KVAF_ENABLE_AIV_BATCH_GET)
++  Status status = impl_->CheckUbmemOwner(owner);
++  if (!status.ok()) return status;
++  for (const auto& registered : impl_->ubmem_fused_tables) {
++    if (registered.opaque == table.opaque) return Status::OK();
++  }
++  // Reserve bookkeeping before taking the extra reader, so host allocation
++  // failure cannot strand a pin absent from the release list.
++  impl_->ubmem_fused_tables.push_back(table);
++  status = core().RetainFusedAccessTable(
++      table, static_cast<std::uint64_t>(owner.token_bytes) * owner.tokens_per_block);
++  if (!status.ok()) impl_->ubmem_fused_tables.pop_back();
++  return status;
++#else
++  return Status::NotImplemented("KVAF was built without UBmem support");
++#endif
++}
++
++Status NpuRuntime::ReleaseUbmemFusedContext(
++    const UbmemFusedContext& owner, void* stream) {
++  if (impl_->options.transport != Transport::kUbmem) {
++    return Status::NotImplemented("UBmem fused context requires transport=ubmem");
++  }
++#if defined(KVAF_ENABLE_AIV_BATCH_GET)
++  Status status = impl_->CheckUbmemOwner(owner);
++  if (!status.ok()) return status;
++  if (stream == nullptr || stream != impl_->ubmem_fused_stream) {
++    return Status::InvalidArgument("release UBmem fused context with its acquire stream");
++  }
++  status = core().FenceFusedReads();
++  if (!status.ok()) return status;
++  while (!impl_->ubmem_fused_tables.empty()) {
++    status = core().ReleaseFusedAccessTable(impl_->ubmem_fused_tables.back());
++    if (!status.ok()) return status;
++    impl_->ubmem_fused_tables.pop_back();
++  }
++  status = core().ReleaseFusedReadLease();
++  if (!status.ok()) return status;
++  impl_->ubmem_fused = {};
++  impl_->ubmem_fused_stream = nullptr;
++  return Status::OK();
++#else
++  return Status::NotImplemented("KVAF was built without UBmem support");
++#endif
++}
++
+ Status NpuRuntime::ReleaseLink(LinkId link_id) {
+   if (link_id != 1U || impl_->peer_link == nullptr) return Status::NotFound("PeerLink was not found");
+   const Status shutdown = Shutdown();
+diff --git a/runtime/src/runtime.cc b/runtime/src/runtime.cc
+index 1d369ffd..3c465557 100644
+--- a/runtime/src/runtime.cc
++++ b/runtime/src/runtime.cc
+@@ -115,6 +115,8 @@ Status RuntimeCore::Initialize(const RuntimeInitRequest& request) {
+ }
+
+ Status RuntimeCore::Shutdown() {
++  if (completion_unknown_) return Status::CompletionUnknown("Runtime completion is unknown; retain resources");
++  if (fused_read_fence_) return Status::Busy("release the external fused read lease before Runtime shutdown");
+   if (!needs_cleanup_) {
+     return Status::NotInitialized("Runtime has not been initialized");
+   }
+@@ -150,6 +152,9 @@ Status RuntimeCore::PrepareAccessTable(const AccessTablePrepareRequest& request,
+   if (!initialized_) {
+     return Status::NotInitialized("Runtime has not been initialized");
+   }
++  if (completion_unknown_) {
++    return Status::CompletionUnknown("Runtime is quarantined after an unconfirmed device transfer");
++  }
+   if (handle == nullptr) {
+     return Status::InvalidArgument("handle must not be null");
+   }
+@@ -217,6 +222,9 @@ Status RuntimeCore::GetAccessTableView(const AccessTableHandle& handle,
+   if (!initialized_) {
+     return Status::NotInitialized("Runtime has not been initialized");
+   }
++  if (completion_unknown_) {
++    return Status::CompletionUnknown("Runtime is quarantined after an unconfirmed device transfer");
++  }
+   if (view == nullptr) {
+     return Status::InvalidArgument("view must not be null");
+   }
+@@ -233,10 +241,16 @@ Status RuntimeCore::ReleaseAccessTable(const AccessTableHandle& handle) {
+   if (!initialized_) {
+     return Status::NotInitialized("Runtime has not been initialized");
+   }
++  if (completion_unknown_) {
++    return Status::CompletionUnknown("Runtime is quarantined after an unconfirmed device transfer");
++  }
+   AccessTableState* table = FindAccessTable(handle);
+   if (table == nullptr) {
+     return Status::NotFound("AccessTable handle was not found");
+   }
++  if (table->fused_readers != 0) {
++    return Status::Busy("AccessTable is retained by an external fused read lease");
++  }
+   const Status status = meta_manager_.UnlockKeys(table->lock_context);
+   if (!status.ok()) {
+     return status;
+@@ -245,11 +259,77 @@ Status RuntimeCore::ReleaseAccessTable(const AccessTableHandle& handle) {
+   return Status::OK();
+ }
+
++Status RuntimeCore::AcquireFusedReadLease(std::function<Status()> fence) {
++  if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
++  if (completion_unknown_) return Status::CompletionUnknown("Runtime completion is unknown");
++  if (!fence) return Status::InvalidArgument("fused read lease requires a completion fence");
++  if (fused_read_fence_) return Status::Busy("Runtime already has an external fused read lease");
++  fused_read_fence_ = std::move(fence);
++  return Status::OK();
++}
++
++Status RuntimeCore::CheckFusedReadLease() const {
++  if (completion_unknown_) return Status::CompletionUnknown("Runtime completion is unknown");
++  if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
++  if (!fused_read_fence_) return Status::NotFound("Runtime has no external fused read lease");
++  return Status::OK();
++}
++
++Status RuntimeCore::FenceFusedReads() {
++  const Status ready = CheckFusedReadLease();
++  if (!ready.ok()) return ready;
++  const Status status = fused_read_fence_();
++  if (status.code() == StatusCode::kCompletionUnknown) completion_unknown_ = true;
++  return status;
++}
++
++Status RuntimeCore::ReleaseFusedReadLease() {
++  if (completion_unknown_) return Status::CompletionUnknown("Runtime completion is unknown");
++  if (!fused_read_fence_) return Status::NotFound("Runtime has no external fused read lease");
++  for (const auto& entry : access_tables_) {
++    if (entry.second->fused_readers != 0) {
++      return Status::Busy("release retained AccessTables before the fused read lease");
++    }
++  }
++  fused_read_fence_ = {};
++  return Status::OK();
++}
++
++Status RuntimeCore::RetainFusedAccessTable(const AccessTableHandle& handle,
++                                          std::uint64_t required_block_bytes) {
++  if (completion_unknown_) return Status::CompletionUnknown("Runtime completion is unknown");
++  if (!fused_read_fence_) return Status::NotFound("Runtime has no external fused read lease");
++  auto* table = FindAccessTable(handle);
++  if (table == nullptr) return Status::NotFound("AccessTable handle was not found");
++  if (required_block_bytes != 0 && table->has_valid_entries &&
++      (!table->has_uniform_valid_length || table->uniform_valid_length != required_block_bytes)) {
++    return Status::InvalidArgument("fused AccessTable block lengths differ from the Runtime layout");
++  }
++  if (table->fused_readers == std::numeric_limits<std::uint64_t>::max()) {
++    return Status::Busy("AccessTable fused reader count overflow");
++  }
++  ++table->fused_readers;
++  return Status::OK();
++}
++
++Status RuntimeCore::ReleaseFusedAccessTable(const AccessTableHandle& handle) {
++  if (completion_unknown_) return Status::CompletionUnknown("Runtime completion is unknown");
++  if (!fused_read_fence_) return Status::NotFound("Runtime has no external fused read lease");
++  auto* table = FindAccessTable(handle);
++  if (table == nullptr) return Status::NotFound("AccessTable handle was not found");
++  if (table->fused_readers == 0) return Status::NotFound("AccessTable has no fused reader");
++  --table->fused_readers;
++  return Status::OK();
++}
++
+ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
+                              const BatchGetExecutionOptions& execution) {
+   if (!initialized_) {
+     return Status::NotInitialized("Runtime has not been initialized");
+   }
++  if (completion_unknown_) {
++    return Status::CompletionUnknown("Runtime is quarantined after an unconfirmed device transfer");
++  }
+   const AccessTableState* table = nullptr;
+   if (request.access_table.opaque != 0) {
+     table = FindAccessTable(request.access_table);
+@@ -337,8 +417,10 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
+     view = AccessTableView{table->addresses.data(), table->lengths.data(),
+                            table->valid.data(), table->addresses.size()};
+   }
+-  return access_operator_.ExecuteBatchGet(
++  const Status status = access_operator_.ExecuteBatchGet(
+       BatchGetExecRequest{view, &request, execution});
++  if (status.code() == StatusCode::kCompletionUnknown) completion_unknown_ = true;
++  return status;
+ }
+
+ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
+@@ -346,6 +428,9 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
+   if (!initialized_) {
+     return Status::NotInitialized("Runtime has not been initialized");
+   }
++  if (completion_unknown_) {
++    return Status::CompletionUnknown("Runtime is quarantined after an unconfirmed device transfer");
++  }
+   if (request.keys.empty() || request.input.data == nullptr ||
+       request.input.bytes == 0 ||
+       request.keys.size() != request.input_offsets.size() ||
+@@ -374,7 +459,12 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
+   status = access_operator_.ExecuteBatchPut(
+       BatchPutExecRequest{&request, &put_desc, execution});
+   if (!status.ok()) {
+-    (void)meta_manager_.AbortPut(put_context);
++    if (status.code() == StatusCode::kCompletionUnknown) {
++      // Do not recycle destinations while an earlier WRITE may still reach them.
++      completion_unknown_ = true;
++    } else {
++      (void)meta_manager_.AbortPut(put_context);
++    }
+     return status;
+   }
+   status = meta_manager_.CommitPut(put_context);
+@@ -388,9 +478,16 @@ Status RuntimeCore::BatchFree(const BatchFreeRequest& request) {
+   if (!initialized_) {
+     return Status::NotInitialized("Runtime has not been initialized");
+   }
++  if (completion_unknown_) {
++    return Status::CompletionUnknown("Runtime is quarantined after an unconfirmed device transfer");
++  }
+   if (request.keys.empty()) {
+     return Status::InvalidArgument("BatchFree requires at least one key");
+   }
++  if (fused_read_fence_) {
++    const Status status = FenceFusedReads();
++    if (!status.ok()) return status;
++  }
+   return meta_manager_.BatchFree(request.keys);
+ }
+
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 017321cf..044823ae 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -122,3 +122,7 @@ target_link_libraries(kvaf_fused_batch_get_context_test PRIVATE
+   kvaf_runtime kvaf_meta_manager kvaf_peer_link)
+ add_test(NAME kvaf_fused_batch_get_context_host
+   COMMAND kvaf_fused_batch_get_context_test)
++
++add_executable(kvaf_runtime_completion_test runtime_completion_test.cc)
++target_link_libraries(kvaf_runtime_completion_test PRIVATE kvaf_runtime kvaf_meta_manager)
++add_test(NAME kvaf_runtime_completion_host COMMAND kvaf_runtime_completion_test)
+diff --git a/tests/runtime_completion_test.cc b/tests/runtime_completion_test.cc
+new file mode 100644
+index 00000000..a50fef60
+--- /dev/null
++++ b/tests/runtime_completion_test.cc
+@@ -0,0 +1,166 @@
++#include <cstdint>
++#include <iostream>
++#include <stdexcept>
++#include <vector>
++
++#include "meta_manager.h"
++#include "runtime.h"
++
++namespace {
++void Require(bool condition, const char* message) {
++  if (!condition) throw std::runtime_error(message);
++}
++
++class Allocator final : public kvaf::DdrMemoryAllocator {
++ public:
++  kvaf::Status Allocate(const kvaf::RuntimeInitRequest& request,
++                       kvaf::RemoteRegionDesc* region) override {
++    storage.resize(request.ddr_bytes);
++    *region = {reinterpret_cast<kvaf::Address>(storage.data()), request.ddr_bytes,
++               request.slot_size, kvaf::DeviceKind::kCpu};
++    return kvaf::Status::OK();
++  }
++  kvaf::Status Release(const kvaf::RemoteRegionDesc&) override {
++    ++releases;
++    if (fail_release) return kvaf::Status::Internal("unmap failed");
++    return kvaf::Status::OK();
++  }
++  bool fail_release{false};
++  int releases{0};
++  std::vector<std::uint8_t> storage;
++};
++
++class Operator final : public kvaf::AccessOperator {
++ public:
++  kvaf::Status Initialize(const kvaf::RemoteRegionDesc&) override { return kvaf::Status::OK(); }
++  kvaf::Status Shutdown() override { ++shutdowns; return kvaf::Status::OK(); }
++  kvaf::Status ExecuteBatchGet(const kvaf::BatchGetExecRequest&) override { return kvaf::Status::OK(); }
++  kvaf::Status ExecuteBatchPut(const kvaf::BatchPutExecRequest&) override {
++    ++writes;
++    return result;
++  }
++  kvaf::Status result;
++  int writes{0};
++  int shutdowns{0};
++};
++
++void TestPutCompletion(bool unknown) {
++  Allocator allocator;
++  Operator op;
++  auto metadata = kvaf::CreateInMemoryMetaManager();
++  kvaf::RuntimeCore core(*metadata, op, allocator);
++  Require(core.Initialize({4096, 256, kvaf::DeviceKind::kCpu}).ok(), "initialize");
++  std::uint8_t input[8]{};
++  const kvaf::BatchPutRequest put{{0}, {input, sizeof(input), kvaf::DeviceKind::kCpu}, {0}, {8}};
++  op.result = unknown ? kvaf::Status::CompletionUnknown("submitted, synchronization failed")
++                      : kvaf::Status::InvalidArgument("not submitted");
++  Require(!core.BatchPut(put).ok(), "failed Put must not commit");
++  if (unknown) {
++    kvaf::PutContext context;
++    kvaf::PutAccessDesc destinations;
++    Require(!metadata->PreparePut({0}, {8}, &context, &destinations).ok(), "unknown Put must retain slot");
++    Require(core.BatchPut(put).code() == kvaf::StatusCode::kCompletionUnknown, "reject subsequent Put");
++    Require(core.BatchFree({{0}}).code() == kvaf::StatusCode::kCompletionUnknown, "reject free");
++    kvaf::AccessTableHandle table;
++    Require(core.PrepareAccessTable({{0}}, &table).code() == kvaf::StatusCode::kCompletionUnknown,
++            "reject reads from quarantined Runtime");
++    Require(core.Shutdown().code() == kvaf::StatusCode::kCompletionUnknown, "retain DDR on shutdown");
++    Require(allocator.releases == 0 && op.writes == 1, "no release or new device work");
++  } else {
++    op.result = kvaf::Status::OK();
++    Require(core.BatchPut(put).ok(), "unsubmitted failure must release its reservation");
++    kvaf::AccessTableHandle table;
++    Require(core.PrepareAccessTable({{0}}, &table).ok(), "read committed key");
++    kvaf::AccessTableView view;
++    Require(core.GetAccessTableView(table, &view).ok() && view.size == 1 && view.valid[0], "visible only after completion");
++    Require(core.ReleaseAccessTable(table).ok(), "release read lock");
++    Require(core.BatchFree({{0}}).ok(), "free committed key");
++    Require(core.Shutdown().ok() && allocator.releases == 1, "normal teardown");
++  }
++}
++
++void TestPartialTeardown() {
++  Allocator allocator;
++  Operator op;
++  auto metadata = kvaf::CreateInMemoryMetaManager();
++  kvaf::RuntimeCore core(*metadata, op, allocator);
++  Require(core.Initialize({4096, 256, kvaf::DeviceKind::kCpu}).ok(), "initialize cleanup test");
++  allocator.fail_release = true;
++  Require(!core.Shutdown().ok() && !core.initialized() && core.needs_cleanup(), "retain incomplete cleanup state");
++  Require(core.BatchFree({{0}}).code() == kvaf::StatusCode::kNotInitialized, "reject work during cleanup");
++  allocator.fail_release = false;
++  Require(core.Shutdown().ok(), "retry arena release");
++  Require(op.shutdowns == 2 && allocator.releases == 2, "retry idempotent operator cleanup and retained allocation");
++}
++
++void TestFusedReadLease() {
++  Allocator allocator;
++  Operator op;
++  auto metadata = kvaf::CreateInMemoryMetaManager();
++  kvaf::RuntimeCore core(*metadata, op, allocator);
++  Require(core.Initialize({4096, 256, kvaf::DeviceKind::kCpu}).ok(), "initialize fused lease test");
++  std::uint8_t input[16]{};
++  Require(core.BatchPut({{0, 1}, {input, sizeof(input), kvaf::DeviceKind::kCpu},
++                          {0, 8}, {8, 8}}).ok(), "publish keys before fusion");
++  kvaf::AccessTableHandle table;
++  Require(core.PrepareAccessTable({{0}}, &table).ok(), "prepare pinned table");
++  int fences = 0;
++  Require(core.AcquireFusedReadLease([&] { ++fences; return kvaf::Status::OK(); }).ok(),
++          "acquire external reader");
++  Require(core.AcquireFusedReadLease([] { return kvaf::Status::OK(); }).code() ==
++              kvaf::StatusCode::kBusy, "reject duplicate lease");
++  Require(!core.RetainFusedAccessTable(table, 256).ok(), "validate table block lengths");
++  Require(core.RetainFusedAccessTable(table, 8).ok(), "retain optional table");
++  Require(core.ReleaseAccessTable(table).code() == kvaf::StatusCode::kBusy,
++          "fused consumer preserves original table metadata pin");
++  Require(core.BatchFree({{0}}).code() == kvaf::StatusCode::kBusy && fences == 1,
++          "registered keys stay pinned across a request retirement fence");
++  Require(core.BatchFree({{1}}).ok() && fences == 2, "unrelated retired keys can be freed");
++  Require(core.BatchPut({{2}, {input, sizeof(input), kvaf::DeviceKind::kCpu}, {0}, {8}}).ok(),
++          "append Put remains available during a long-lived fused lease");
++  Require(fences == 2, "append has no external-reader fence");
++  Require(core.Shutdown().code() == kvaf::StatusCode::kBusy && op.shutdowns == 0 &&
++              allocator.releases == 0, "lease prevents arena teardown");
++  Require(core.ReleaseFusedReadLease().code() == kvaf::StatusCode::kBusy,
++          "cannot drop lease before its extra table readers");
++  Require(core.FenceFusedReads().ok() && fences == 3, "explicit release fence");
++  Require(core.ReleaseFusedAccessTable(table).ok(), "remove extra reader");
++  Require(core.ReleaseFusedReadLease().ok(), "release external reader");
++  Require(core.ReleaseAccessTable(table).ok(), "caller releases its original table");
++  Require(core.BatchFree({{0, 2}}).ok() && fences == 3, "ordinary free needs no fused fence");
++  Require(core.Shutdown().ok(), "safe shutdown after release");
++}
++
++void TestFusedFenceFailure() {
++  Allocator allocator;
++  Operator op;
++  auto metadata = kvaf::CreateInMemoryMetaManager();
++  kvaf::RuntimeCore core(*metadata, op, allocator);
++  Require(core.Initialize({4096, 256, kvaf::DeviceKind::kCpu}).ok(), "initialize failed fence test");
++  std::uint8_t input[8]{};
++  Require(core.BatchPut({{0}, {input, sizeof(input), kvaf::DeviceKind::kCpu}, {0}, {8}}).ok(),
++          "publish key before failed retirement");
++  Require(core.AcquireFusedReadLease([] {
++    return kvaf::Status::CompletionUnknown("external kernel synchronization failed");
++  }).ok(), "acquire failing external reader");
++  Require(core.BatchFree({{0}}).code() == kvaf::StatusCode::kCompletionUnknown,
++          "failed fence prevents key reuse");
++  kvaf::PutContext pending;
++  kvaf::PutAccessDesc destinations;
++  Require(metadata->PreparePut({0}, {8}, &pending, &destinations).code() ==
++              kvaf::StatusCode::kAlreadyExists, "metadata retains the key after failed free");
++  Require(core.ReleaseFusedReadLease().code() == kvaf::StatusCode::kCompletionUnknown,
++          "unknown completion cannot release the lease");
++  Require(core.Shutdown().code() == kvaf::StatusCode::kCompletionUnknown &&
++              op.shutdowns == 0 && allocator.releases == 0, "retain arena and operator on failure");
++}
++}  // namespace
++
++int main() {
++  TestPutCompletion(false);
++  TestPutCompletion(true);
++  TestPartialTeardown();
++  TestFusedReadLease();
++  TestFusedFenceFailure();
++  std::cout << "PASS: Runtime Put completion and slot lifetime\n";
++}

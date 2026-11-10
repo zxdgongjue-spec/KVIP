@@ -33,7 +33,7 @@ extern "C" uint32_t v9_row_bytes(const rotating::RuntimeShape* shape) { return s
 extern "C" uint32_t v9_context_bytes(const rotating::RuntimeShape* shape) { return sizeof(rotating::Context); }
 extern "C" uint32_t v9_rounds(const rotating::RuntimeShape* shape) { return shape->rounds; }
 extern "C" uint32_t v9_simulation(const rotating::RuntimeShape* shape) { return 0; }
-extern "C" uint32_t v9_abi_version(const rotating::RuntimeShape* shape) { return 10; }
+extern "C" uint32_t v9_abi_version(const rotating::RuntimeShape* shape) { return 11; }
 extern "C" uint32_t v9_aic_count(const rotating::RuntimeShape* shape) { return shape->aicCount; }
 extern "C" uint32_t v9_service_lanes(const rotating::RuntimeShape* shape) { return shape->serviceLanes; }
 extern "C" uint32_t v9_final_workers(const rotating::RuntimeShape* shape) { return shape->finalWorkers; }
