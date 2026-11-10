@@ -62,7 +62,7 @@ def arguments(argv=None):
     parser.add_argument(
         "--split-index-stages",
         action="store_true",
-        help="Diagnose UBmem complete_index_plan/index_outputs/index_apply instead of complete_index_update",
+        help="Split existing Index plan/output and apply launches for stage diagnostics",
     )
     parser.add_argument(
         "--service-ablation",
@@ -140,10 +140,12 @@ def arguments(argv=None):
             parser.error(str(error))
     if args.measure_call_preparation and (args.inspect or args.mode != "fused"):
         parser.error("--measure-call-preparation requires fused device replay")
-    if (args.ubmem_ablation or args.service_ablation or args.split_index_stages) and (
+    if (args.ubmem_ablation or args.service_ablation) and (
         args.inspect or args.transport != "ubmem" or args.mode != "fused"
     ):
-        parser.error("UBmem ablation/split-index-stages require UBmem fused replay")
+        parser.error("UBmem ablation requires UBmem fused replay")
+    if args.split_index_stages and (args.inspect or args.mode != "fused"):
+        parser.error("--split-index-stages requires fused device replay")
     if args.ubmem_ablation and args.service_ablation:
         parser.error("Select only one ablation matrix")
     if (args.ubmem_ablation or args.service_ablation) and args.output is None:

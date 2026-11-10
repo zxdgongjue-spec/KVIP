@@ -8,6 +8,9 @@ extern "C" uint32_t api(void* bindings,void* stream) { \
     return aclrtlaunch_kvip_ubmem_##kernel##_kernel(blocks,stream,bindings); }
 ENTRY(v9_init,init,rotating::kInitCores)
 ENTRY(v9_li,li,rotating::kLaunchCores)
+#if V9_UBMEM_FUSED_INIT
+ENTRY(v9_init_li,init_li,rotating::kLaunchCores)
+#endif
 ENTRY(kvip_ubmem_resolve_plan,resolve_plan,SIM_BATCH)
 ENTRY(kvip_ubmem_resolve_copy,resolve_copy,rotating::kFinalCores)
 #if V9_UBMEM_SINGLE_PLAN
@@ -53,8 +56,12 @@ extern "C" uint32_t kvip_ubmem_update(void* update,void* stream) {
 }
 extern "C" uint32_t kvip_ubmem_forward(void* bindings,void* update,void* stream) {
     if(!bindings || !update || !stream)return 100000;
+#if V9_UBMEM_FUSED_INIT
+    uint32_t result=v9_init_li(bindings,stream);
+#else
     uint32_t result=v9_init(bindings,stream);
     if(!result)result=v9_li(bindings,stream);
+#endif
     if(!result)result=v9_resolve(bindings,stream);
 #if V9_UBMEM_MERGE_OUTPUTS
     if(!result)result=kvip_ubmem_complete_plan_outputs(bindings,update,stream);
@@ -94,11 +101,13 @@ VALUE(v9_skip_inactive,V9_SKIP_INACTIVE)
 VALUE(v9_compact_reserved,V9_COMPACT_RESERVED)
 VALUE(v9_grouped_copy,V9_UBMEM_GROUPED_COPY)
 VALUE(v9_final_copy_stages,V9_UBMEM_FINAL_COPY_STAGES)
+VALUE(v9_final_copy_rows,V9_UBMEM_FINAL_COPY_ROWS)
 VALUE(v9_ordered_pair,V9_UBMEM_ORDERED_PAIR)
 VALUE(v9_cold_only_prefetch,V9_COLD_ONLY_PREFETCH)
 VALUE(v9_threshold_only,V9_THRESHOLD_ONLY)
 VALUE(v9_simt_init,V9_SIMT_INIT)
 VALUE(v9_reserved_ub,V9_RESERVED_UB)
+VALUE(v9_fused_init,V9_UBMEM_FUSED_INIT)
 VALUE(v9_li_cores,rotating::kLiCores)
 VALUE(v9_launch_cores,rotating::kLaunchCores)
 VALUE(v9_rounds,rotating::kRounds)
@@ -112,7 +121,7 @@ VALUE(v9_simulation,0)
 VALUE(v9_transport_backend,1)
 VALUE(v9_fused_lifecycle,0)
 VALUE(v9_ubpipe_depth,V9_UBMEM_GROUPED_COPY?V9_UBMEM_FINAL_COPY_STAGES:8)
-VALUE(v9_ubpipe_rows,TOKEN_BYTES==656?4:(V9_UBMEM_GROUPED_COPY?2:1))
+VALUE(v9_ubpipe_rows,TOKEN_BYTES==656?4:(V9_UBMEM_GROUPED_COPY?V9_UBMEM_FINAL_COPY_ROWS:1))
 VALUE(v9_window_ubpipe_rows,TOKEN_BYTES==656?8:(V9_UBMEM_GROUPED_COPY?2:1))
 VALUE(v9_window_ubpipe_depth,V9_UBMEM_GROUPED_COPY?4:8)
 extern "C" uint32_t v9_window_trigger_tile(uint32_t epoch) {

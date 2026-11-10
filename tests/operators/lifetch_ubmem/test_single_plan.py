@@ -8,8 +8,8 @@ import subprocess
 import pytest
 
 
-@pytest.mark.parametrize("width,ordered", ((656, False), (2624, False), (2624, True)))
-def test_single_plan_reload_preserves_sources_owners_and_copy_bytes(tmp_path, width, ordered):
+@pytest.mark.parametrize("width,ordered,rows", ((656, False, 2), (2624, False, 2), (2624, True, 2), (2624, False, 4)))
+def test_single_plan_reload_preserves_sources_owners_and_copy_bytes(tmp_path, width, ordered, rows):
     compiler = shutil.which("c++")
     if compiler is None:
         pytest.skip("C++ compiler required for descriptor/DMA model")
@@ -45,7 +45,8 @@ def test_single_plan_reload_preserves_sources_owners_and_copy_bytes(tmp_path, wi
         "V9_UBPIPE_ROWS": 4,
         "V9_WINDOW_UBPIPE_DEPTH": 8,
         "V9_UBMEM_GROUPED_COPY": int(width == 2624),
-        "V9_UBMEM_FINAL_COPY_STAGES": 8 if width == 2624 else 4,
+        "V9_UBMEM_FINAL_COPY_STAGES": 6 if rows == 4 else 8 if width == 2624 else 4,
+        "V9_UBMEM_FINAL_COPY_ROWS": rows,
         "V9_UBMEM_ORDERED_PAIR": int(ordered),
         "V9_USER_UB_BYTES": 223232,
     }

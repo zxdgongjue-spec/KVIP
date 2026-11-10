@@ -132,6 +132,12 @@ def test_optimization_switches_are_explicit_content_addressed_build_options():
         dict(tagged_map=1),
         dict(tagged_map=True, parallel_init=True),
         dict(final_copy_stages=5),
+        dict(final_copy_stages=6),
+        dict(final_copy_rows=True),
+        dict(final_copy_rows=4),
+        dict(final_copy_rows=4, final_copy_stages=6, grouped_copy=False),
+        dict(final_copy_rows=4, final_copy_stages=6, ordered_pair=True, grouped_copy=True),
+        dict(fused_init=True, parallel_init=True),
         dict(final_copy_stages=True),
         dict(final_copy_stages=8, grouped_copy=False),
         dict(merge_outputs=1),
@@ -152,6 +158,10 @@ def test_optimization_switches_are_explicit_content_addressed_build_options():
         with pytest.raises(ValueError):
             replace(paired, **overrides)
     assert replace(compact, reserved_ub=True).options("/cann")["RESERVED_UB"] == 1
+    assert replace(compact, fused_init=True).options("/cann")["UBMEM_FUSED_INIT"] == 1
+    wide = replace(paired, final_copy_stages=6, final_copy_rows=4, ordered_pair=False)
+    assert wide.options("/cann")["UBMEM_FINAL_COPY_ROWS"] == 4
+    assert wide.options("/cann")["UBMEM_FINAL_COPY_STAGES"] == 6
     with pytest.raises(ValueError, match="booleans"):
         Specialization(16, 131328, 16384, 32, 2624, 32, 8, "Ascend950DT_9582", parallel_init=1)
     with pytest.raises(ValueError, match="booleans"):

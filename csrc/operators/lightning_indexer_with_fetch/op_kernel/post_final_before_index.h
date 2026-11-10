@@ -89,3 +89,13 @@ __aicore__ inline void CompletePostedFinal(__gm__ rotating::Context* ctx,uint32_
     post->error=uint32_t(error);
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
 }
+
+// Optional row-local join before the existing completion reducer. Each CQ
+// retains exactly one consumer; a failed queue must not skip sibling drains.
+// No inter-AIV spin barrier is needed, and no new work is submitted here.
+__aicore__ inline void CompletePostedRow(__gm__ rotating::Context* ctx,uint32_t b) {
+    const auto shape=rotating::LoadRuntimeShape(ctx);
+    if(b>=shape.batch)return;
+    for(uint32_t w=0;w<shape.finalWorkers;++w)
+        CompletePostedFinal(ctx,b*shape.finalWorkers+w);
+}

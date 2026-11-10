@@ -79,11 +79,7 @@ int main() {
 #endif
 #else
             expected.mappingState=generation.state;expected.copyLimit=kLruSlots;
-            InitializeRound(&ctx,b);
-#if !V9_SIMT_INIT
-            rows[b].reserved1=rows[b].reserved2=0;rows[b].addresses=values.addresses;rows[b].output=values.output;
-            rows[b].limit=kSlots;rows[b].prefetchLimit=ctx.prefetchLimit;rows[b].copyLimit=kLruSlots;rows[b].error=modelError;
-#endif
+            InitializeFetchCore(&ctx,b);
 #endif
             assert(vfCalls==oldCalls+1);
             assert(std::memcmp(&rows[b],&expected,sizeof(Row))==0);

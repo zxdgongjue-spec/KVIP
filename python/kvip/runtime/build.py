@@ -54,6 +54,7 @@ def build_libraries(
     single_planner=False,
     skip_final_partition=False,
     post_final_before_index=False,
+    merge_final_completion=False,
     reserved_ub=False,
 ):
     """Build one shape-independent binary per source/toolchain/SoC."""
@@ -74,12 +75,15 @@ def build_libraries(
             single_planner,
             skip_final_partition,
             post_final_before_index,
+            merge_final_completion,
             reserved_ub,
         )
     ):
         raise ValueError("Fusion optimization switches must be booleans")
     if (single_planner or skip_final_partition or post_final_before_index) and (not parallel_final or async_final):
         raise ValueError("Resolver optimizations require parallel_final without async_final")
+    if merge_final_completion and not post_final_before_index:
+        raise ValueError("merge_final_completion requires post_final_before_index=True")
     if rolling_threshold and threshold_only:
         raise ValueError("rolling_threshold requires the resident TopK seed; disable threshold_only")
     if reserved_ub and (not compact_reserved or simt_init):
@@ -102,6 +106,7 @@ def build_libraries(
         URMA_SINGLE_PLANNER=int(single_planner),
         URMA_SKIP_FINAL_PARTITION=int(skip_final_partition),
         POST_FINAL_BEFORE_INDEX=int(post_final_before_index),
+        MERGE_FINAL_COMPLETION=int(merge_final_completion),
         RESERVED_UB=int(reserved_ub),
     )
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())

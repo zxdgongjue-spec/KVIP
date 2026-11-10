@@ -193,7 +193,7 @@ def command(args, transport, mode, serial_workers=None):
         if transport == "urma":
             values += ["--urma-serial-post-size", str(getattr(args, "urma_serial_post_size", 128))]
     else:
-        if transport == "ubmem" and getattr(args, "split_index_stages", False):
+        if getattr(args, "split_index_stages", False):
             values.append("--split-index-stages")
         tuning = getattr(args, transport + "_fused_tuning", None)
         if tuning is not None:
@@ -305,6 +305,9 @@ def summarize(results):
             serial_case=serial_case,
             serial_over_fused=serial / fused,
             latency_reduction_percent=(1 - fused / serial) * 100,
+            p50_serial_over_fused=table[serial_case]["p50_us"] / table[f"{transport}-fused"]["p50_us"],
+            p50_latency_reduction_percent=(1 - table[f"{transport}-fused"]["p50_us"] / table[serial_case]["p50_us"])
+            * 100,
             target_fused_us=target,
             target_met=fused <= serial * 0.65 and fused <= serial / 1.5,
         )

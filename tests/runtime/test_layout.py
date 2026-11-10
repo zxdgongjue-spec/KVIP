@@ -155,6 +155,18 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
     ):
         with pytest.raises(ValueError):
             build.build_libraries(**options, **invalid)
+    merged = build.build_libraries(
+        **options, parallel_final=True, post_final_before_index=True, merge_final_completion=True
+    )
+    assert merged != posted
+    assert "-DMERGE_FINAL_COMPLETION=1" in commands[-2]
+    for invalid in (
+        dict(merge_final_completion=True),
+        dict(parallel_final=True, merge_final_completion=True),
+        dict(parallel_final=True, post_final_before_index=True, merge_final_completion=1),
+    ):
+        with pytest.raises(ValueError):
+            build.build_libraries(**options, **invalid)
     staged_reserved = build.build_libraries(**options, compact_reserved=True, reserved_ub=True)
     assert staged_reserved != compact
     assert "-DRESERVED_UB=1" in commands[-2]

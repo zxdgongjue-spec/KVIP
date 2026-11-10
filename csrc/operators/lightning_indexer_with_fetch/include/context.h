@@ -46,6 +46,13 @@ static_assert(V9_POST_FINAL_BEFORE_INDEX==0 || V9_POST_FINAL_BEFORE_INDEX==1,
               "Post final before Index must be boolean");
 static_assert(!V9_POST_FINAL_BEFORE_INDEX || (V9_URMA_PARALLEL_FINAL && !V9_URMA_ASYNC_FINAL),
               "Post final before Index requires parallel completion without safe-prefix submission");
+#ifndef V9_MERGE_FINAL_COMPLETION
+#define V9_MERGE_FINAL_COMPLETION 0
+#endif
+static_assert(V9_MERGE_FINAL_COMPLETION==0 || V9_MERGE_FINAL_COMPLETION==1,
+              "Merged final completion must be boolean");
+static_assert(!V9_MERGE_FINAL_COMPLETION || V9_POST_FINAL_BEFORE_INDEX,
+              "Merged final completion requires final submission before Index");
 #ifndef V9_URMA_SINGLE_PLANNER
 #define V9_URMA_SINGLE_PLANNER 0
 #endif

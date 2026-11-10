@@ -12,6 +12,7 @@ namespace {std::vector<unsigned> calls,blocks;unsigned fail=0;void* expectedBind
  calls.push_back(number);blocks.push_back(count);return number==fail?71:0;}
 LAUNCH(init,1)
 LAUNCH(li,2)
+LAUNCH(init_li,12)
 LAUNCH(resolve,3)
 LAUNCH(complete,4)
 LAUNCH(direct_update_owned,5)
@@ -41,19 +42,25 @@ int main() {
     static_assert(offsetof(Context,ubmemRegion)==128 && offsetof(Context,ubmemStatus)==136 && offsetof(Context,lruSlots)==144);
     assert(kvip_ubmem_abi_version()==2 && kvip_ubmem_context_bytes()==256 && kvip_ubmem_region_bytes()==128);
     assert(v9_final_copy_stages()==V9_UBMEM_FINAL_COPY_STAGES);
+    assert(v9_final_copy_rows()==V9_UBMEM_FINAL_COPY_ROWS);
     assert(v9_ordered_pair()==V9_UBMEM_ORDERED_PAIR);
     assert(v9_tagged_map()==V9_UBMEM_TAGGED_MAP);
     assert(v9_merge_outputs()==V9_UBMEM_MERGE_OUTPUTS);
     assert(v9_single_plan()==V9_UBMEM_SINGLE_PLAN);
     assert(v9_staged_outputs()==V9_STAGED_OUTPUTS);
+    assert(v9_fused_init()==V9_UBMEM_FUSED_INIT);
     assert(v9_ubpipe_depth()==(V9_UBMEM_GROUPED_COPY?V9_UBMEM_FINAL_COPY_STAGES:8));
+    assert(v9_ubpipe_rows()==(TOKEN_BYTES==656?4:(V9_UBMEM_GROUPED_COPY?V9_UBMEM_FINAL_COPY_ROWS:1)));
     assert(v9_window_ubpipe_depth()==(V9_UBMEM_GROUPED_COPY?4:8));
+    assert(v9_window_ubpipe_rows()==(TOKEN_BYTES==656?8:(V9_UBMEM_GROUPED_COPY?2:1)));
     void* pointer=reinterpret_cast<void*>(1);
     auto update=reinterpret_cast<void*>(2),stream=reinterpret_cast<void*>(3);
     expectedBindings=pointer;expectedUpdate=update;expectedStream=stream;
     assert(kvip_ubmem_forward(pointer,update,stream)==0);
     const unsigned planCall=V9_UBMEM_MERGE_OUTPUTS?9:8;
-    std::vector<unsigned> forwardCalls{1,2},forwardBlocks{kInitCores,kLaunchCores};
+    std::vector<unsigned> forwardCalls,forwardBlocks;
+    if(V9_UBMEM_FUSED_INIT){forwardCalls={12};forwardBlocks={kLaunchCores};}
+    else {forwardCalls={1,2};forwardBlocks={kInitCores,kLaunchCores};}
     if(V9_UBMEM_SINGLE_PLAN){forwardCalls.push_back(10);forwardBlocks.push_back(SIM_BATCH);}
     forwardCalls.push_back(V9_UBMEM_SINGLE_PLAN?11:3);forwardBlocks.push_back(kFinalCores);
     forwardCalls.push_back(planCall);forwardBlocks.push_back(SIM_BATCH);
@@ -96,6 +103,12 @@ int main() {
     assert(kvip_ubmem_resolve_plan(pointer,nullptr)!=0 && calls.empty());
     assert(kvip_ubmem_resolve_copy(nullptr,stream)!=0 && calls.empty());
     assert(kvip_ubmem_resolve_copy(pointer,nullptr)!=0 && calls.empty());
+#if V9_UBMEM_FUSED_INIT
+    assert(v9_init_li(nullptr,stream)!=0 && calls.empty());
+    assert(v9_init_li(pointer,nullptr)!=0 && calls.empty());
+    assert(v9_init_li(pointer,stream)==0);
+    assert(calls==std::vector<unsigned>{12});
+#endif
     for(uint32_t e=1;e<kRounds;++e)assert(Trigger(e)>Trigger(e-1));
     assert(Trigger(kRounds-1)==SIM_HISTORY/128);
 }

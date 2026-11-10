@@ -27,7 +27,7 @@ def test_simt_init_matches_all_baseline_records_and_reduces_dma(tmp_path, transp
     if compiler is None:
         pytest.skip("C++ compiler required for the init model")
     operator = ROOT / "csrc/operators" / ("lightning_indexer_with_fetch" + ("_ubmem" if transport == "ubmem" else ""))
-    lifecycle = (operator / "op_kernel/lifecycle.cpp").read_text()
+    lifecycle = (operator / "op_kernel" / ("lifecycle.cpp" if transport == "urma" else "init.h")).read_text()
     tail = (operator / "op_kernel" / ("resolver/direct_slots.h" if transport == "ubmem" else "prefetch.h")).read_text()
     context = (operator / "include/context.h").read_text()
     row_start = context.index("struct alignas(128) Row {")
@@ -70,7 +70,14 @@ def test_simt_init_matches_all_baseline_records_and_reduces_dma(tmp_path, transp
     names = (
         ("FillRoundWords", "InitializeRoundSimt", "InitializeRound")
         if transport == "urma"
-        else ("InitializeRoundSimt", "FillWords", "InitializeControl", "CopyInitialLruSlots", "InitializeRound")
+        else (
+            "InitializeRoundSimt",
+            "FillWords",
+            "InitializeControl",
+            "CopyInitialLruSlots",
+            "InitializeRound",
+            "InitializeFetchCore",
+        )
     )
     functions.extend(_function(lifecycle, name) for name in names)
     (tmp_path / "reserved_hot_lifecycle.h").write_text("\n".join(functions))

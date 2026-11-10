@@ -43,19 +43,21 @@ with tempfile.TemporaryDirectory(prefix="kvip-ubmem-model-") as directory:
     )
     subprocess.run([str(init_binary)], check=True)
     for batch in (1, 2):
-        for width, grouped, stages, ordered in (
-            (656, 0, 4, 0),
-            (2624, 0, 4, 0),
-            (2624, 1, 4, 0),
-            (2624, 1, 8, 0),
-            (2624, 1, 4, 1),
-            (2624, 1, 8, 1),
+        for width, grouped, stages, rows, ordered in (
+            (656, 0, 4, 2, 0),
+            (2624, 0, 4, 2, 0),
+            (2624, 1, 4, 2, 0),
+            (2624, 1, 8, 2, 0),
+            (2624, 1, 4, 2, 1),
+            (2624, 1, 8, 2, 1),
+            (2624, 1, 6, 4, 0),
         ):
             definitions = common | {
                 "SIM_BATCH": batch,
                 "TOKEN_BYTES": width,
                 "V9_UBMEM_GROUPED_COPY": grouped,
                 "V9_UBMEM_FINAL_COPY_STAGES": stages,
+                "V9_UBMEM_FINAL_COPY_ROWS": rows,
                 "V9_UBMEM_ORDERED_PAIR": ordered,
             }
             options = [
@@ -72,12 +74,18 @@ with tempfile.TemporaryDirectory(prefix="kvip-ubmem-model-") as directory:
                 ("copy", [root / "tests/copy_model.cpp"]),
                 ("abi", [root / "tests/abi_test.cpp", root / "op_host/launch.cpp"]),
             ):
-                binary = Path(directory) / f"{name}-{batch}-{width}-{grouped}-{stages}-{ordered}"
+                binary = Path(directory) / f"{name}-{batch}-{width}-{grouped}-{stages}-{rows}-{ordered}"
                 subprocess.run([*options, *map(str, sources), "-o", str(binary)], check=True)
                 subprocess.run([str(binary)], check=True)
     # Parallel init uses all 64 AIVs; tagged mapping requires the serial init
     # owner. Both keep the same complete-plan/output/apply sequence and ABI.
-    for parallel, tagged, merged, single_plan in ((1, 0, 0, 0), (0, 1, 0, 0), (0, 1, 1, 0), (0, 1, 0, 1)):
+    for parallel, tagged, merged, single_plan, fused in (
+        (1, 0, 0, 0, 0),
+        (0, 1, 0, 0, 0),
+        (0, 1, 1, 0, 0),
+        (0, 1, 0, 1, 0),
+        (0, 1, 0, 0, 1),
+    ):
         definitions = common | {
             "SIM_BATCH": 16,
             "TOKEN_BYTES": 2624,
@@ -85,11 +93,12 @@ with tempfile.TemporaryDirectory(prefix="kvip-ubmem-model-") as directory:
             "V9_UBMEM_TAGGED_MAP": tagged,
             "V9_UBMEM_MERGE_OUTPUTS": merged,
             "V9_UBMEM_SINGLE_PLAN": single_plan,
+            "V9_UBMEM_FUSED_INIT": fused,
             "V9_UBMEM_BALANCED_INDEX": 1,
             "V9_UBMEM_GROUPED_COPY": 1,
             "V9_UBMEM_FINAL_COPY_STAGES": 8,
         }
-        binary = Path(directory) / f"abi-optimized-b16-{parallel}-{tagged}-{merged}-{single_plan}"
+        binary = Path(directory) / f"abi-optimized-b16-{parallel}-{tagged}-{merged}-{single_plan}-{fused}"
         subprocess.run(
             [
                 compiler,
@@ -108,5 +117,5 @@ with tempfile.TemporaryDirectory(prefix="kvip-ubmem-model-") as directory:
         )
         subprocess.run([str(binary)], check=True)
 print(
-    "Init and ABI/copy models passed B1/B2 × 656/2624, including paired final 4/8-stage and ordered-pair DMA/event checks"
+    "Init and ABI/copy models passed B1/B2 × 656/2624, including pair4/pair8, wide6x4 and ordered-pair DMA/event checks"
 )

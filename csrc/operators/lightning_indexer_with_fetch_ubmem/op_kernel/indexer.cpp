@@ -7,12 +7,23 @@ struct QLITilingData {
     uint32_t resident,splitQ,aicCount;
 };
 #include "indexer.h"
+#if V9_UBMEM_FUSED_INIT
+#include "init.h"
 #endif
-extern "C" __global__ __aicore__ void kvip_ubmem_li_kernel(GM_ADDR bindings) {
+#endif
 #if defined(__CCE_AICORE__)
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+namespace {
+template<bool WithInit>
+__aicore__ inline void RunIndexer(GM_ADDR bindings) {
     using namespace AscendC;using namespace QLICommon;
     auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
+#if V9_UBMEM_FUSED_INIT
+    if constexpr(WithInit) {
+        if ASCEND_IS_AIV {
+            rotating::init::InitializeBeforeLi(reinterpret_cast<__gm__ rotating::Context*>(a[14]),GetBlockIdx());
+        }
+    }
+#endif
     TPipe pipe;
     using Type=QLIType<fp8_e4m3fn_t,fp8_e4m3fn_t,int32_t,true,LI_LAYOUT::BSND,LI_LAYOUT::PA_BSND,
         bfloat16_t,float,float,uint16_t>;
@@ -28,5 +39,20 @@ extern "C" __global__ __aicore__ void kvip_ubmem_li_kernel(GM_ADDR bindings) {
     }
     op.Process();pipe.Destroy();
 #undef P
+}
+}
+#endif
+extern "C" __global__ __aicore__ void kvip_ubmem_li_kernel(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    RunIndexer<false>(bindings);
 #endif
 }
+#if V9_UBMEM_FUSED_INIT
+extern "C" __global__ __aicore__ void kvip_ubmem_init_li_kernel(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    RunIndexer<true>(bindings);
+#endif
+}
+#endif

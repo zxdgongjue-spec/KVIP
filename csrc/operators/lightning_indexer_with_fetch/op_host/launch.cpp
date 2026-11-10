@@ -41,6 +41,7 @@ extern "C" uint32_t v9_token_bytes(const rotating::RuntimeShape* shape) { return
 extern "C" uint32_t v9_parallel_final(const rotating::RuntimeShape* shape) { return V9_URMA_PARALLEL_FINAL; }
 extern "C" uint32_t v9_async_final(const rotating::RuntimeShape* shape) { return V9_URMA_ASYNC_FINAL; }
 extern "C" uint32_t v9_post_final_before_index(const rotating::RuntimeShape* shape) { return V9_POST_FINAL_BEFORE_INDEX; }
+extern "C" uint32_t v9_merge_final_completion(const rotating::RuntimeShape* shape) { return V9_MERGE_FINAL_COMPLETION; }
 extern "C" uint32_t v9_cold_only_prefetch(const rotating::RuntimeShape* shape) { return V9_COLD_ONLY_PREFETCH; }
 extern "C" uint32_t v9_threshold_only(const rotating::RuntimeShape* shape) { return V9_THRESHOLD_ONLY; }
 extern "C" uint32_t v9_simt_init(const rotating::RuntimeShape* shape) { return V9_SIMT_INIT; }
@@ -107,7 +108,9 @@ extern "C" uint32_t kvip_lifetch_forward(void* bindings, void* update, void* str
     // workers submit conflicting destinations and collect their own CQEs.
     if (!result) result = v9_wait(bindings, stream, shape);
 #endif
+#if !V9_MERGE_FINAL_COMPLETION
     if (!result) result = v9_parallel_fetch(bindings, stream, shape);
+#endif
 #endif
     if (!result) result = aclrtlaunch_v9_fetch_update_kernel(shape->batch, stream, bindings, update);
     return result;

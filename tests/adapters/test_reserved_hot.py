@@ -39,7 +39,7 @@ def test_shared_native_helper_rebuilds_active_rows_after_dma_clear(tmp_path, var
     root = Path(__file__).resolve().parents[2]
     operator = "lightning_indexer_with_fetch" + ("_ubmem" if variant != "urma" else "")
     kernel = root / "csrc/operators" / operator / "op_kernel"
-    lifecycle = kernel / "lifecycle.cpp"
+    lifecycle = kernel / ("lifecycle.cpp" if variant == "urma" else "init.h")
     tail = kernel / ("prefetch.h" if variant == "urma" else "resolver/direct_slots.h")
 
     def function(path, name):

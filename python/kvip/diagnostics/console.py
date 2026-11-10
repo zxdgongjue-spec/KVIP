@@ -296,8 +296,10 @@ def compact_report(report, *, path=None):
                     admission=row.get("prefetch_admission"),
                 )
             for name, value in report.get("fusion_vs_serial", {}).items():
+                median = value.get("p50_latency_reduction_percent")
+                median_text = "" if median is None else f", p50 reduction={median:.2f}%"
                 emit(
-                    f"{name}: {value['serial_over_fused']:.3f}x, reduction={value['latency_reduction_percent']:.2f}%, "
+                    f"{name}: {value['serial_over_fused']:.3f}x, reduction={value['latency_reduction_percent']:.2f}%{median_text}, "
                     f"target_met={value['target_met']} (device graph mean)"
                 )
         elif "timing" in report:

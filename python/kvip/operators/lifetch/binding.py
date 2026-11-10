@@ -47,6 +47,7 @@ class LIFetchBinding:
         single_planner=False,
         skip_final_partition=False,
         post_final_before_index=False,
+        merge_final_completion=False,
         reserved_ub=False,
     ):
         if resident > 131072:
@@ -57,6 +58,8 @@ class LIFetchBinding:
             raise ValueError("rolling_threshold requires resident=16384, split-Q2, and threshold_only=False")
         if (single_planner or skip_final_partition or post_final_before_index) and (not parallel_final or async_final):
             raise ValueError("Resolver optimizations require parallel_final without async_final")
+        if merge_final_completion and not post_final_before_index:
+            raise ValueError("merge_final_completion requires post_final_before_index=True")
         self.torch, self.owner = torch, owner
         self.library = load_lifetch_library(library)
         self.device = arguments[0].device
@@ -105,6 +108,7 @@ class LIFetchBinding:
             ("single_planner", single_planner),
             ("skip_final_partition", skip_final_partition),
             ("post_final_before_index", post_final_before_index),
+            ("merge_final_completion", merge_final_completion),
             ("reserved_ub", reserved_ub),
         ):
             if type(expected) is not bool:

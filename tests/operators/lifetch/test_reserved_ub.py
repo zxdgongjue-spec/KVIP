@@ -28,7 +28,7 @@ def test_reserved_ub_matches_records_with_one_dma_and_no_gm_scatter(tmp_path, tr
         pytest.skip("C++ compiler required for the actual init model")
     operator = ROOT / "csrc/operators" / ("lightning_indexer_with_fetch" + ("_ubmem" if transport == "ubmem" else ""))
     kernel = operator / "op_kernel"
-    lifecycle = (kernel / "lifecycle.cpp").read_text()
+    lifecycle = (kernel / ("lifecycle.cpp" if transport == "urma" else "init.h")).read_text()
     tail = (kernel / ("resolver/direct_slots.h" if transport == "ubmem" else "prefetch.h")).read_text()
     functions = [
         _function(tail, name) for name in ("OutputStride", "InitializeTailMappingsBody", "InitializeTailMappings")

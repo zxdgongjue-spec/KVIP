@@ -4,12 +4,21 @@
 from pathlib import Path
 import subprocess
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[3]
 OP = ROOT / "csrc/operators/lightning_indexer_with_fetch"
 
 
-def test_final_submission_joins_prefetch_then_survives_index_and_failures(tmp_path):
+@pytest.mark.parametrize("merged", (False, True))
+def test_final_submission_joins_prefetch_then_survives_index_and_failures(tmp_path, merged):
     (tmp_path / "batch_get_abi.h").write_text("")
+    lifecycle = (OP / "op_kernel/lifecycle.cpp").read_text()
+    start = lifecycle.index("__aicore__ inline void FinishFetch(")
+    finish = lifecycle[start : lifecycle.index("\n}\n#endif", start) + 2]
+    planner = (OP.parent / "common/lifetch/index_cache_update.h").read_text()
+    start = planner.index("template<uint32_t Threads>\n__simt_vf__", planner.index("// Finish the early update"))
+    cleanup = planner[start:]
     source = r"""
 #include <algorithm>
 #include <array>
@@ -18,6 +27,8 @@ def test_final_submission_joins_prefetch_then_survives_index_and_failures(tmp_pa
 #include <vector>
 #define __aicore__
 #define __gm__
+#define __simt_vf__
+#define LAUNCH_BOUND(x)
 #define __CCE_AICORE__ 1
 #define V9_URMA_PARALLEL_FINAL 1
 #define V9_POST_FINAL_BEFORE_INDEX 1
@@ -25,6 +36,17 @@ def test_final_submission_joins_prefetch_then_survives_index_and_failures(tmp_pa
 #define V9_URMA_SKIP_FINAL_PARTITION 1
 #include "context.h"
 using namespace rotating;
+using GM_ADDR=uint8_t*;
+struct {unsigned x=0;} threadIdx;
+template<class T>T asc_ldcg(T* p){return *p;}
+template<class T>void asc_stcg(T* p,T value){*p=value;}
+void asc_threadfence(){}
+namespace Simt {
+struct Dim3{unsigned x,y,z;};
+template<auto Fn,class... Args>void VF_CALL(Dim3 dims,Args... args){
+ for(threadIdx.x=0;threadIdx.x<dims.x;++threadIdx.x)Fn(args...);threadIdx.x=0;
+}
+}
 struct KvafBatchGetQueueState {
  uint64_t magic=0,initialized=0,sq_producer_index=0,cq_consumer_index=0,completed_batch_count=0,last_error=0,poisoned=0;
 };
@@ -47,6 +69,12 @@ std::array<std::vector<Pending>,10> nic;
 std::array<unsigned,10> counts{},descriptors{},delivered{},posts{},waits{},flushes{};
 std::array<bool,2> joined{};
 unsigned phase=0,badQueue=0,fault=0,sourceGeneration=1;
+unsigned currentBlock=0;uint32_t* hotValidity=nullptr;
+unsigned GetBlockIdx(){return currentBlock;}
+Context* GetContext(GM_ADDR bindings){return reinterpret_cast<Context*>(reinterpret_cast<uint64_t*>(bindings)[14]);}
+void PublishDestinationResidency(unsigned resident,Context*,unsigned b,unsigned){
+ if(!threadIdx.x)std::fill(hotValidity+b*resident,hotValidity+(b+1)*resident,1);
+}
 namespace rotating {
 FinalPost* FinalPostAt(uint32_t offset,Context* ctx,uint32_t core){
  return reinterpret_cast<FinalPost*>(ctx->owners+offset)+core;
@@ -97,21 +125,38 @@ void CompletePrefetch(Context* ctx,unsigned b){
 }
 #include "async_final.h"
 #include "post_final_before_index.h"
+CLEANUP
+FINISH
+void CompleteAll(Context* ctx,uint64_t* update){
+ uint64_t bindings[15]{};bindings[14]=uint64_t(ctx);
+#if !V9_MERGE_FINAL_COMPLETION
+ for(unsigned core=8;core-->0;)CompletePostedFinal(ctx,core);CompletePostedFinal(ctx,8);
+#endif
+ for(currentBlock=0;currentBlock<2;++currentBlock)
+  FinishFetch(reinterpret_cast<GM_ADDR>(bindings),reinterpret_cast<GM_ADDR>(update));
+}
 int main(){
  for(unsigned scenario=0;scenario<14;++scenario){
   fault=scenario;phase=0;sourceGeneration=1;queues={};statuses={};entities={};nic={};joined={};
   counts={};descriptors={};delivered={};posts={};waits={};flushes={};
   Context ctx{};ctx.shape.batch=2;ctx.shape.finalWorkers=4;ctx.shape.finalCores=8;ctx.shape.finalPostOffset=128;
+  ctx.shape.resident=16;
   std::array<Row,2> rows{};std::array<uint32_t,2*kRowStatusWords> info{};
+  std::array<KvafBatchGetCoreStatus,4> finalStatus{};
+  std::array<uint32_t,2> updateStatus{},ownerIds{0,1};std::array<uint32_t,32> valid{};hotValidity=valid.data();
+  uint64_t update[28]{};update[6]=uint64_t(updateStatus.data());update[9]=uint64_t(ownerIds.data());
+  update[16]=uint64_t(valid.data());update[25]=16;
+  ctx.finalStatus=uint64_t(finalStatus.data());
   alignas(128) std::array<uint8_t,128+8*sizeof(FinalPost)> owners{};
   ctx.rows=uint64_t(rows.data());ctx.rowStatus=uint64_t(info.data());ctx.owners=uint64_t(owners.data());
   ctx.sourceBlocks=1;ctx.sourceOffsets=2;ctx.destinations=3;ctx.count=4;ctx.fallbackAddresses=5;ctx.fallbackValid=6;
-  for(unsigned b=0;b<2;++b){rows[b].pending=3;for(unsigned w=0;w<4;++w){
+  for(unsigned b=0;b<2;++b){rows[b].pending=3;rows[b].finalPending=1;for(unsigned w=0;w<4;++w){
    unsigned q=FinalQueue(2,4,b,w);auto* p=FinalPostAt(128,&ctx,b*4+w);
    counts[q]=p->count=w==3?0:7+w;descriptors[q]=p->descriptor=b*kSlots+w*16;
-   p->nonconflicting=w==1?3:0;p->deferred=p->count!=0;
+   p->nonconflicting=w==1?3:0;p->deferred=p->count!=0;info[b*kRowStatusWords+1]+=p->count;
   }}
-  badQueue=FinalQueue(2,4,0,2);auto* bad=FinalPostAt(128,&ctx,2);
+  const unsigned badWorker=V9_MERGE_FINAL_COMPLETION?0:2;
+  badQueue=FinalQueue(2,4,0,badWorker);auto* bad=FinalPostAt(128,&ctx,badWorker);
   if(fault==2){queues[badQueue].initialized=1;queues[badQueue].magic=19;queues[badQueue].poisoned=1;}
   if(fault==3)entities[badQueue].local_hbm_address=999;
   if(fault==4)bad->descriptor=2*kSlots; // whole range would overrun descriptors
@@ -128,10 +173,15 @@ int main(){
   phase=1;sourceGeneration=2; // Index mutates metadata, never the KV payload.
   if(fault==7)entities[badQueue].version=7;
   if(fault==8)bad->pending=2; // cannot safely infer which CQEs this represents
-  phase=2;for(unsigned core=8;core-->0;)CompletePostedFinal(&ctx,core);CompletePostedFinal(&ctx,8);
+  phase=2;CompleteAll(&ctx,update);
+  for(unsigned b=0;b<2;++b){
+   const bool error=!b && fault!=0;
+   assert(bool(rows[b].finalPending)==error && bool(updateStatus[b])==error);
+   for(unsigned slot=0;slot<16;++slot)assert(valid[b*16+slot]==unsigned(!error));
+  }
   for(unsigned b=0;b<2;++b)for(unsigned w=0;w<4;++w){
    const unsigned q=FinalQueue(2,4,b,w);auto* p=FinalPostAt(128,&ctx,b*4+w);
-   const bool invalid=!b && (fault==6 || (fault==10 && w<3) || (w==2 && fault!=0 && fault!=10));
+   const bool invalid=!b && (fault==6 || (fault==10 && w<3) || (w==badWorker && fault!=0 && fault!=10));
    assert(bool(p->error)==invalid);
    if(!invalid){assert(!p->pending && !p->deferred && delivered[q]==counts[q] && nic[q].empty());
     assert(posts[q]==unsigned(counts[q]!=0) && waits[q]==posts[q]);
@@ -148,7 +198,7 @@ int main(){
    phase=0;sourceGeneration=1;joined={};for(auto& row:rows)row.pending=3;
    for(unsigned core=0;core<8;++core){auto* p=FinalPostAt(128,&ctx,core);p->head=0;p->deferred=p->count!=0;}
    SubmitFinalBeforeIndex(&ctx,0);SubmitFinalBeforeIndex(&ctx,1);
-   phase=2;for(unsigned core=0;core<8;++core)CompletePostedFinal(&ctx,core);
+   phase=2;CompleteAll(&ctx,update);
    for(unsigned b=0;b<2;++b)for(unsigned w=0;w<4;++w){
     unsigned q=FinalQueue(2,4,b,w);auto* p=FinalPostAt(128,&ctx,b*4+w);
     assert(!p->error && !p->pending && !p->deferred && nic[q].empty() && delivered[q]==2*counts[q]);
@@ -157,7 +207,7 @@ int main(){
   }
  }
 }
-"""
+""".replace("CLEANUP", cleanup).replace("FINISH", finish)
     cpp, binary = tmp_path / "post_before_index.cpp", tmp_path / "post_before_index"
     cpp.write_text(source)
     subprocess.run(
@@ -167,6 +217,7 @@ int main(){
             "-O1",
             "-g",
             "-fsanitize=address,undefined",
+            f"-DV9_MERGE_FINAL_COMPLETION={int(merged)}",
             f"-I{tmp_path}",
             f"-I{OP / 'include'}",
             f"-I{OP / 'op_kernel'}",
@@ -179,7 +230,8 @@ int main(){
     subprocess.run([str(binary)], check=True)
 
 
-def test_forward_posts_before_index_and_drains_afterwards(tmp_path):
+@pytest.mark.parametrize("merged", (False, True))
+def test_forward_posts_before_index_and_drains_afterwards(tmp_path, merged):
     text = (OP / "op_host/launch.cpp").read_text()
     entry = text[text.index('extern "C" uint32_t kvop_direct_update_outputs_early(uint32_t,') :]
     source = r"""
@@ -195,16 +247,27 @@ unsigned v9_li(void*,void*,const rotating::RuntimeShape*){return call(2);}
 unsigned v9_resolve(void*,void*,const rotating::RuntimeShape*){return call(3);}
 unsigned v9_submit_final(void*,void*,const rotating::RuntimeShape*){return call(4);}
 unsigned v9_wait(void*,void*,const rotating::RuntimeShape*){assert(false);return 0;}
-unsigned v9_parallel_fetch(void*,void*,const rotating::RuntimeShape*){return call(6);}
+unsigned v9_parallel_fetch(void*,void*,const rotating::RuntimeShape*){assert(!V9_MERGE_FINAL_COMPLETION);return call(6);}
 extern "C" unsigned kvop_direct_update_outputs_early(unsigned,void*,void*){return call(5);}
-extern "C" unsigned aclrtlaunch_v9_fetch_update_kernel(unsigned,void*,void*,void*){return call(7);}
+extern "C" unsigned aclrtlaunch_v9_fetch_update_kernel(unsigned,void*,void*,void*){return call(V9_MERGE_FINAL_COMPLETION?6:7);}
 ENTRY
-int main(){rotating::RuntimeShape shape{};
- for(fail=0;fail<=7;++fail){step=0;assert(kvip_lifetch_forward((void*)1,(void*)2,(void*)3,&shape)==(fail?77:0));
-  assert(step==(fail?fail:7));}
+int main(){rotating::RuntimeShape shape{};const unsigned steps=V9_MERGE_FINAL_COMPLETION?6:7;
+ for(fail=0;fail<=steps;++fail){step=0;assert(kvip_lifetch_forward((void*)1,(void*)2,(void*)3,&shape)==(fail?77:0));
+  assert(step==(fail?fail:steps));}
 }
 """.replace("ENTRY", entry)
     cpp, binary = tmp_path / "launch.cpp", tmp_path / "launch"
     cpp.write_text(source)
-    subprocess.run(["c++", "-std=c++17", f"-I{OP / 'include'}", str(cpp), "-o", str(binary)], check=True)
+    subprocess.run(
+        [
+            "c++",
+            "-std=c++17",
+            f"-DV9_MERGE_FINAL_COMPLETION={int(merged)}",
+            f"-I{OP / 'include'}",
+            str(cpp),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+    )
     subprocess.run([str(binary)], check=True)

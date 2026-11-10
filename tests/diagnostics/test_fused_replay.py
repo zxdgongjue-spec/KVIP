@@ -144,10 +144,12 @@ def test_tuning_keeps_snapshot_immutable_and_validates_only_known_options():
         grouped_copy=False,
         tagged_map=False,
         final_copy_stages=4,
+        final_copy_rows=2,
         ordered_pair=False,
         merge_outputs=False,
         single_plan=False,
         cached_buckets=False,
+        fused_init=False,
         cold_only_prefetch=False,
         threshold_only=False,
         simt_init=False,
@@ -175,6 +177,7 @@ def test_urma_tuning_has_only_real_switches_and_fixed_inactive_gate():
         single_planner=False,
         skip_final_partition=False,
         post_final_before_index=False,
+        merge_final_completion=False,
         cold_only_prefetch=False,
         threshold_only=False,
         simt_init=False,
@@ -216,6 +219,17 @@ def test_urma_tuning_has_only_real_switches_and_fixed_inactive_gate():
         ("ubmem", {"reserved_ub": True}),
         ("urma", {"reserved_ub": True, "compact_reserved": True, "simt_init": True}),
         ("ubmem", {"reserved_ub": True, "compact_reserved": True, "parallel_init": True}),
+        ("ubmem", {"fused_init": 1}),
+        ("ubmem", {"fused_init": True, "parallel_init": True}),
+        ("urma", {"fused_init": False}),
+        ("ubmem", {"final_copy_stages": 6}),
+        ("ubmem", {"final_copy_rows": 4}),
+        ("ubmem", {"final_copy_rows": True}),
+        ("ubmem", {"final_copy_rows": 4, "final_copy_stages": 6}),
+        ("ubmem", {"final_copy_rows": 4, "final_copy_stages": 6, "grouped_copy": True, "ordered_pair": True}),
+        ("urma", {"merge_final_completion": True, "parallel_final": True}),
+        ("urma", {"merge_final_completion": 1, "parallel_final": True, "post_final_before_index": True}),
+        ("ubmem", {"merge_final_completion": False}),
         ("urma", []),
     ):
         with pytest.raises(ValueError):
@@ -530,3 +544,103 @@ def test_single_plan_diagnostics_include_both_native_resolve_launches():
         ("kvip_ubmem_update_outputs", (22, 33)),
         ("kvip_ubmem_update_apply", (22, 33)),
     ]
+
+
+def test_init_li_diagnostic_keeps_initialization_inside_timing():
+    calls = []
+    library = Library(calls)
+    rotating = SimpleNamespace(
+        library=library, bindings=SimpleNamespace(data_ptr=lambda: 11), shape=SimpleNamespace(fused_init=True)
+    )
+    update = SimpleNamespace(bindings=SimpleNamespace(data_ptr=lambda: 22))
+    lease = SimpleNamespace(check_stream=lambda: SimpleNamespace(npu_stream=33))
+    stages = fused_stages("ubmem", rotating, update, lease, 16)
+    assert [name for name, _ in stages] == ["init_li_with_prefetch", "resolve_final_fetch", "complete_index_update"]
+    stages[0][1]()
+    assert calls == [("v9_init_li", (11, 33))]
+    library.result = 17
+    with pytest.raises(RuntimeError, match="v9_init_li failed"):
+        stages[0][1]()
+
+
+def test_merged_urma_completion_drains_in_last_stage_once():
+    calls = []
+    library = Library(calls)
+    rotating = SimpleNamespace(
+        library=library,
+        bindings=SimpleNamespace(data_ptr=lambda: 11),
+        shape_pointer=44,
+        parallel_final=True,
+        post_final_before_index=True,
+        merge_final_completion=True,
+    )
+    update = SimpleNamespace(library=library, bindings=SimpleNamespace(data_ptr=lambda: 22))
+    lease = SimpleNamespace(check_stream=lambda: SimpleNamespace(npu_stream=33))
+    stages = fused_stages("urma", rotating, update, lease, 16)
+    assert [name for name, _ in stages][3:] == [
+        "prefetch_join_and_final_submit",
+        "index_update_during_final_get",
+        "final_wait_and_completion",
+    ]
+    for _, launch in stages:
+        launch()
+    assert calls[3:] == [
+        ("v9_submit_final", (11, 33, 44)),
+        ("kvop_direct_update_outputs_early", (16, 22, 33)),
+        ("aclrtlaunch_v9_fetch_update_kernel", (16, 33, 11, 22)),
+    ]
+
+
+def test_urma_split_index_keeps_both_production_launches_and_exact_arguments():
+    calls = []
+    library = Library(calls)
+    rotating = SimpleNamespace(
+        library=library,
+        bindings=SimpleNamespace(data_ptr=lambda: 11),
+        shape_pointer=44,
+        parallel_final=True,
+        post_final_before_index=True,
+        merge_final_completion=True,
+    )
+    update = SimpleNamespace(library=library, bindings=SimpleNamespace(data_ptr=lambda: 22))
+    lease = SimpleNamespace(check_stream=lambda: SimpleNamespace(npu_stream=33))
+    stages = fused_stages("urma", rotating, update, lease, 16, split_index_stages=True)
+    assert [name for name, _ in stages][3:] == [
+        "prefetch_join_and_final_submit",
+        "index_outputs_plan",
+        "index_apply",
+        "final_wait_and_completion",
+    ]
+    for _, launch in stages:
+        launch()
+    assert calls[4:6] == [
+        ("aclrtlaunch_kvop_direct_update_outputs_early_kernel", (16, 33, 22)),
+        ("kvop_direct_apply_owned", (16, 22, 33)),
+    ]
+
+
+def test_urma_split_index_cli_uses_existing_flag_without_an_ablation(monkeypatch):
+    import sys
+    from kvip.diagnostics.replay import arguments
+
+    argv = [
+        "replay",
+        "--snapshot",
+        "/snapshot",
+        "--transport",
+        "urma",
+        "--mode",
+        "fused",
+        "--build-dir",
+        "/build",
+        "--soc",
+        "Ascend950DT_9582",
+        "--kvaf-server",
+        "127.0.0.1:28999",
+        "--split-index-stages",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    assert arguments().split_index_stages is True
+    argv[argv.index("fused")] = "serial"
+    with pytest.raises(SystemExit):
+        arguments()

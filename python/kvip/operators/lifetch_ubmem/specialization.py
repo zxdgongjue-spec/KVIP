@@ -30,6 +30,7 @@ class Specialization:
     grouped_copy: bool = False
     tagged_map: bool = False
     final_copy_stages: int = 4
+    final_copy_rows: int = 2
     merge_outputs: bool = False
     ordered_pair: bool = False
     cold_only_prefetch: bool = False
@@ -40,6 +41,7 @@ class Specialization:
     rolling_threshold: bool = False
     reserved_ub: bool = False
     cached_buckets: bool = False
+    fused_init: bool = False
 
     def __post_init__(self):
         if any(
@@ -61,9 +63,12 @@ class Specialization:
                 "rolling_threshold",
                 "reserved_ub",
                 "cached_buckets",
+                "fused_init",
             )
         ):
             raise ValueError("UBmem optimization switches must be booleans")
+        if self.fused_init and self.parallel_init:
+            raise ValueError("fused_init requires one init worker per request")
         if self.tagged_map and self.parallel_init:
             raise ValueError("Tagged mapping requires one init worker per request")
         if self.simt_init and self.parallel_init:
@@ -78,10 +83,16 @@ class Specialization:
             raise ValueError("rolling_threshold requires resident=16384, split-Q2, and threshold_only=False")
         if self.ordered_pair and not (self.grouped_copy and self.token_bytes == 2624):
             raise ValueError("Ordered pair copy requires grouped four-layer copy")
-        if type(self.final_copy_stages) is not int or self.final_copy_stages not in (4, 8):
-            raise ValueError("UBmem final_copy_stages must be 4 or 8")
-        if self.final_copy_stages == 8 and not (self.grouped_copy and self.token_bytes == 2624):
-            raise ValueError("Eight final copy stages require grouped four-layer copy")
+        if (
+            type(self.final_copy_stages) is not int
+            or type(self.final_copy_rows) is not int
+            or (self.final_copy_stages, self.final_copy_rows) not in ((4, 2), (8, 2), (6, 4))
+        ):
+            raise ValueError("UBmem final copy requires (stages, rows) = (4, 2), (8, 2), or (6, 4)")
+        if self.final_copy_stages != 4 and not (self.grouped_copy and self.token_bytes == 2624):
+            raise ValueError("Extended final copy requires grouped four-layer copy")
+        if self.final_copy_rows == 4 and self.ordered_pair:
+            raise ValueError("Four-row final copy requires ordered_pair=False")
         if not 1 <= self.batch <= 16 or not 1 <= self.aic_count <= 32:
             raise ValueError("UBmem LIFetch requires 1..16 requests and 1..32 AICs")
         if self.batch > self.aic_count:
@@ -119,6 +130,7 @@ class Specialization:
             UBMEM_GROUPED_COPY=int(self.grouped_copy),
             UBMEM_TAGGED_MAP=int(self.tagged_map),
             UBMEM_FINAL_COPY_STAGES=self.final_copy_stages,
+            UBMEM_FINAL_COPY_ROWS=self.final_copy_rows,
             UBMEM_MERGE_OUTPUTS=int(self.merge_outputs),
             UBMEM_ORDERED_PAIR=int(self.ordered_pair),
             COLD_ONLY_PREFETCH=int(self.cold_only_prefetch),
@@ -129,6 +141,7 @@ class Specialization:
             ROLLING_THRESHOLD=int(self.rolling_threshold),
             RESERVED_UB=int(self.reserved_ub),
             CACHED_BUCKETS=int(self.cached_buckets),
+            UBMEM_FUSED_INIT=int(self.fused_init),
         )
 
 

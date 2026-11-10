@@ -53,6 +53,7 @@ class UbmemBinding:
             ("grouped_copy", int(shape.grouped_copy)),
             ("tagged_map", int(shape.tagged_map)),
             ("final_copy_stages", shape.final_copy_stages),
+            ("final_copy_rows", shape.final_copy_rows),
             ("merge_outputs", int(shape.merge_outputs)),
             ("ordered_pair", int(shape.ordered_pair)),
             ("cold_only_prefetch", int(shape.cold_only_prefetch)),
@@ -63,6 +64,7 @@ class UbmemBinding:
             ("rolling_threshold", int(shape.rolling_threshold)),
             ("reserved_ub", int(shape.reserved_ub)),
             ("cached_buckets", int(shape.cached_buckets)),
+            ("fused_init", int(shape.fused_init)),
         ):
             if query(self.library, name) != expected:
                 raise ValueError(f"UBmem static binary contract mismatch: {name}")

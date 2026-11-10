@@ -23,7 +23,9 @@ set(COMPACT_RESERVED 0 CACHE STRING "Rebuild reserved-hot inverse map from compa
 set(UBMEM_GROUPED_COPY 0 CACHE STRING "Opt-in paired 2624-byte transfer pipeline: 0 or 1")
 set(UBMEM_ORDERED_PAIR 0 CACHE STRING "Opt-in source-ordered pairs and balanced final rank ranges: 0 or 1")
 set(UBMEM_SINGLE_PLAN 0 CACHE STRING "Plan final hot slots once per request, then copy on existing workers: 0 or 1")
-set(UBMEM_FINAL_COPY_STAGES 4 CACHE STRING "Paired final-copy stages: 4 baseline or 8 opt-in; window stages stay 4")
+set(UBMEM_FINAL_COPY_STAGES 4 CACHE STRING "Final-copy ring depth: 4/8 pairs or 6 groups of four")
+set(UBMEM_FINAL_COPY_ROWS 2 CACHE STRING "Final-copy rows per event credit: 2 baseline or 4")
+set(UBMEM_FUSED_INIT 0 CACHE STRING "Run complete initialization inside the mixed LI entry")
 set(COLD_ONLY_PREFETCH 0 CACHE STRING "Speculatively read cold history only; final TopK repair is unchanged")
 set(THRESHOLD_ONLY 0 CACHE STRING "Compute the exact resident admission threshold without materializing hot TopK")
 set(SIMT_INIT 0 CACHE STRING "Initialize per-row state in a single SIMT pass")
@@ -31,11 +33,14 @@ set(STAGED_OUTPUTS 0 CACHE STRING "Stage hot logical IDs and packed outputs in U
 set(ROLLING_THRESHOLD 0 CACHE STRING "Move existing chunk TopK merges into LI and refresh admission threshold")
 set(RESERVED_UB 0 CACHE STRING "Build the resident=16384 inverse map in UB and publish once")
 set(CACHED_BUCKETS 0 CACHE STRING "Reuse each selected miss hash bucket within final planning")
-foreach(flag COLD_ONLY_PREFETCH THRESHOLD_ONLY SIMT_INIT UBMEM_SINGLE_PLAN STAGED_OUTPUTS ROLLING_THRESHOLD RESERVED_UB CACHED_BUCKETS)
+foreach(flag COLD_ONLY_PREFETCH THRESHOLD_ONLY SIMT_INIT UBMEM_SINGLE_PLAN STAGED_OUTPUTS ROLLING_THRESHOLD RESERVED_UB CACHED_BUCKETS UBMEM_FUSED_INIT)
   if(NOT ${flag} MATCHES "^[01]$")
     message(FATAL_ERROR "${flag} must be 0 or 1")
   endif()
 endforeach()
+if(UBMEM_FUSED_INIT AND UBMEM_PARALLEL_INIT)
+  message(FATAL_ERROR "Fused init requires one init worker per request")
+endif()
 if(SIMT_INIT AND UBMEM_PARALLEL_INIT)
   message(FATAL_ERROR "SIMT init requires UBMEM_PARALLEL_INIT=0")
 endif()
@@ -48,9 +53,15 @@ endif()
 if(NOT UBMEM_ORDERED_PAIR MATCHES "^[01]$" OR (UBMEM_ORDERED_PAIR AND NOT UBMEM_GROUPED_COPY))
   message(FATAL_ERROR "Ordered pairs require UBMEM_GROUPED_COPY=1 with TOKEN_BYTES=2624")
 endif()
-if(NOT UBMEM_FINAL_COPY_STAGES MATCHES "^(4|8)$" OR
-   (UBMEM_FINAL_COPY_STAGES STREQUAL "8" AND (NOT UBMEM_GROUPED_COPY OR NOT TOKEN_BYTES STREQUAL "2624")))
-  message(FATAL_ERROR "Eight final-copy stages require UBMEM_GROUPED_COPY=1 with TOKEN_BYTES=2624")
+if(NOT ((UBMEM_FINAL_COPY_ROWS STREQUAL "2" AND UBMEM_FINAL_COPY_STAGES MATCHES "^(4|8)$") OR
+          (UBMEM_FINAL_COPY_ROWS STREQUAL "4" AND UBMEM_FINAL_COPY_STAGES STREQUAL "6")))
+  message(FATAL_ERROR "Final copy requires (stages, rows) = (4, 2), (8, 2), or (6, 4)")
+endif()
+if((NOT UBMEM_FINAL_COPY_STAGES STREQUAL "4") AND (NOT UBMEM_GROUPED_COPY OR NOT TOKEN_BYTES STREQUAL "2624"))
+  message(FATAL_ERROR "Extended final copy requires grouped four-layer copy")
+endif()
+if(UBMEM_FINAL_COPY_ROWS STREQUAL "4" AND UBMEM_ORDERED_PAIR)
+  message(FATAL_ERROR "Four-row final copy requires UBMEM_ORDERED_PAIR=0")
 endif()
 if(NOT UBMEM_PARALLEL_INIT MATCHES "^[01]$" OR NOT UBMEM_BALANCED_INDEX MATCHES "^[01]$" OR
    NOT UBMEM_MERGE_OUTPUTS MATCHES "^[01]$")
@@ -112,6 +123,7 @@ set(_definitions
   V9_UBMEM_TAGGED_MAP=${UBMEM_TAGGED_MAP}
   V9_SKIP_INACTIVE=${SKIP_INACTIVE} V9_COMPACT_RESERVED=${COMPACT_RESERVED}
   V9_UBMEM_GROUPED_COPY=${UBMEM_GROUPED_COPY} V9_UBMEM_FINAL_COPY_STAGES=${UBMEM_FINAL_COPY_STAGES}
+  V9_UBMEM_FINAL_COPY_ROWS=${UBMEM_FINAL_COPY_ROWS} V9_UBMEM_FUSED_INIT=${UBMEM_FUSED_INIT}
   V9_UBMEM_ORDERED_PAIR=${UBMEM_ORDERED_PAIR}
   V9_UBMEM_SINGLE_PLAN=${UBMEM_SINGLE_PLAN}
   V9_STAGED_OUTPUTS=${STAGED_OUTPUTS}

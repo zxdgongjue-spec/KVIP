@@ -74,6 +74,13 @@ constexpr uint32_t kFinalCores=SIM_BATCH*kFinalWorkers;
 #ifndef V9_UBMEM_PARALLEL_INIT
 #define V9_UBMEM_PARALLEL_INIT 0
 #endif
+#ifndef V9_UBMEM_FUSED_INIT
+#define V9_UBMEM_FUSED_INIT 0
+#endif
+static_assert(V9_UBMEM_FUSED_INIT==0 || V9_UBMEM_FUSED_INIT==1,"Fused init must be boolean");
+static_assert(!V9_UBMEM_FUSED_INIT || (!V9_UBMEM_PARALLEL_INIT && !kDedicatedService &&
+              kLaunchCores<=V9_AIC_COUNT && SIM_BATCH<=2*kLaunchCores),
+              "Fused init requires resident mixed AIVs and one init owner per row");
 #ifndef V9_UBMEM_BALANCED_INDEX
 #define V9_UBMEM_BALANCED_INDEX 0
 #endif
@@ -93,6 +100,9 @@ static_assert(V9_UBMEM_MERGE_OUTPUTS==0 || V9_UBMEM_MERGE_OUTPUTS==1,"Merged out
 #ifndef V9_UBMEM_FINAL_COPY_STAGES
 #define V9_UBMEM_FINAL_COPY_STAGES 4
 #endif
+#ifndef V9_UBMEM_FINAL_COPY_ROWS
+#define V9_UBMEM_FINAL_COPY_ROWS 2
+#endif
 #ifndef V9_UBMEM_ORDERED_PAIR
 #define V9_UBMEM_ORDERED_PAIR 0
 #endif
@@ -109,9 +119,12 @@ static_assert(V9_UBMEM_ORDERED_PAIR==0 ||
               "Ordered pairs require paired four-layer transfers");
 static_assert(V9_UBMEM_GROUPED_COPY==0 || (V9_UBMEM_GROUPED_COPY==1 && TOKEN_BYTES==2624),
               "Paired copy is an explicit four-layer specialization");
-static_assert(V9_UBMEM_FINAL_COPY_STAGES==4 ||
-              (V9_UBMEM_FINAL_COPY_STAGES==8 && V9_UBMEM_GROUPED_COPY && TOKEN_BYTES==2624),
-              "Eight final-copy stages require paired four-layer transfers");
+static_assert((V9_UBMEM_FINAL_COPY_ROWS==2 &&
+               (V9_UBMEM_FINAL_COPY_STAGES==4 ||
+                (V9_UBMEM_FINAL_COPY_STAGES==8 && V9_UBMEM_GROUPED_COPY && TOKEN_BYTES==2624))) ||
+              (V9_UBMEM_FINAL_COPY_ROWS==4 && V9_UBMEM_FINAL_COPY_STAGES==6 &&
+               V9_UBMEM_GROUPED_COPY && TOKEN_BYTES==2624 && !V9_UBMEM_ORDERED_PAIR),
+              "Final copy supports pair4/pair8, or unordered six stages of four four-layer rows");
 static_assert(V9_UBMEM_PARALLEL_INIT == 0 || V9_UBMEM_PARALLEL_INIT == 1,
               "Parallel init must be enabled explicitly with 0 or 1");
 static_assert(V9_UBMEM_TAGGED_MAP==0 || V9_UBMEM_TAGGED_MAP==1,"Tagged mapping must be boolean");

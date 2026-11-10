@@ -389,6 +389,12 @@ __aicore__ inline void FinishFetch(GM_ADDR bindings, GM_ADDR update) {
 
     uint32_t b=GetBlockIdx(); if(b>=rt_batch) return;
     auto ctx=GetContext(bindings);
+#if V9_MERGE_FINAL_COMPLETION
+    // Index has completed, and every final range was already submitted.
+    // Drain all row-owned queues before publishing residency or reducing any
+    // success/error status. The original checks below remain authoritative.
+    CompletePostedRow(ctx,b);
+#endif
     auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
     auto info=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
 #if V9_URMA_PARALLEL_FINAL

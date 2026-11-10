@@ -16,6 +16,7 @@ uint32_t v9_parallel_fetch(void* bindings, void* stream,const rotating::RuntimeS
 uint32_t v9_parallel_final(const rotating::RuntimeShape* shape);
 uint32_t v9_async_final(const rotating::RuntimeShape* shape);
 uint32_t v9_post_final_before_index(const rotating::RuntimeShape* shape);
+uint32_t v9_merge_final_completion(const rotating::RuntimeShape* shape);
 uint32_t v9_cold_only_prefetch(const rotating::RuntimeShape* shape);
 uint32_t v9_threshold_only(const rotating::RuntimeShape* shape);
 uint32_t v9_simt_init(const rotating::RuntimeShape* shape);

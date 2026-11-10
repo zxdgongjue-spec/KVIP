@@ -39,6 +39,8 @@ def test_comparison_uses_fixed_archive_and_reports_fusion_reduction():
         serial_case="ubmem-serial",
         serial_over_fused=2.0,
         latency_reduction_percent=50.0,
+        p50_serial_over_fused=2.0,
+        p50_latency_reduction_percent=50.0,
         target_fused_us=130.0,
         target_met=True,
     )
@@ -226,7 +228,7 @@ def test_command_never_loads_two_transports_in_one_process(tmp_path):
         assert argv[argv.index("--build-dir") + 1] == f"/{transport}/build"
         assert ("--kvaf-server" in argv) == (transport == "urma")
         assert ("--serial-workers" in argv) == (mode == "serial")
-        assert ("--split-index-stages" in argv) == ((transport, mode) == ("ubmem", "fused"))
+        assert ("--split-index-stages" in argv) == (mode == "fused")
         assert output.name == f"{transport}-{mode}.json"
 
 

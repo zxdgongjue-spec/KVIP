@@ -40,6 +40,11 @@ def fused_stages(transport, rotating, update, lease, batch, *, split_index_stage
             if single_plan
             else (("resolve_final_fetch", "v9_resolve"),)
         )
+        compute = (
+            (("init_li_with_prefetch", "v9_init_li"),)
+            if getattr(getattr(rotating, "shape", None), "fused_init", False)
+            else (("init", "v9_init"), ("li_with_prefetch", "v9_li"))
+        )
         result = [
             (
                 name,
@@ -47,11 +52,7 @@ def fused_stages(transport, rotating, update, lease, batch, *, split_index_stage
                     library, symbol, [pointer, pointer], lambda stream: (rotating.bindings.data_ptr(), stream), lease
                 ),
             )
-            for name, symbol in (
-                ("init", "v9_init"),
-                ("li_with_prefetch", "v9_li"),
-                *resolve,
-            )
+            for name, symbol in (*compute, *resolve)
         ]
         updates = [
             (
@@ -123,24 +124,53 @@ def fused_stages(transport, rotating, update, lease, batch, *, split_index_stage
                 ),
             )
         )
-    result.append(
-        (
-            "index_update_during_final_get"
-            if post_before_index
-            else "index_update_during_safe_final_get"
-            if getattr(rotating, "async_final", False)
-            else "index_update_before_final_get",
-            _stage(
-                update.library,
-                "kvop_direct_update_outputs_early",
-                [u32, pointer, pointer],
-                lambda stream: (batch, update.bindings.data_ptr(), stream),
-                lease,
-            ),
+    if split_index_stages:
+        # These are exactly the two launches inside the production early
+        # update wrapper. Events perturb overlap; the full graph is unchanged.
+        result.extend(
+            (
+                (
+                    "index_outputs_plan",
+                    _stage(
+                        update.library,
+                        "aclrtlaunch_kvop_direct_update_outputs_early_kernel",
+                        [u32, pointer, pointer],
+                        lambda stream: (batch, stream, update.bindings.data_ptr()),
+                        lease,
+                    ),
+                ),
+                (
+                    "index_apply",
+                    _stage(
+                        update.library,
+                        "kvop_direct_apply_owned",
+                        [u32, pointer, pointer],
+                        lambda stream: (batch, update.bindings.data_ptr(), stream),
+                        lease,
+                    ),
+                ),
+            )
         )
-    )
+    else:
+        result.append(
+            (
+                "index_update_during_final_get"
+                if post_before_index
+                else "index_update_during_safe_final_get"
+                if getattr(rotating, "async_final", False)
+                else "index_update_before_final_get",
+                _stage(
+                    update.library,
+                    "kvop_direct_update_outputs_early",
+                    [u32, pointer, pointer],
+                    lambda stream: (batch, update.bindings.data_ptr(), stream),
+                    lease,
+                ),
+            )
+        )
     parallel_final = getattr(rotating, "parallel_final", False)
-    if parallel_final:
+    merge_completion = getattr(rotating, "merge_final_completion", False)
+    if parallel_final and not merge_completion:
         result.extend(
             (
                 name,
@@ -167,7 +197,11 @@ def fused_stages(transport, rotating, update, lease, batch, *, split_index_stage
         )
     result.append(
         (
-            "final_completion" if parallel_final else "final_get_and_completion",
+            "final_wait_and_completion"
+            if merge_completion
+            else "final_completion"
+            if parallel_final
+            else "final_get_and_completion",
             _stage(
                 library,
                 "aclrtlaunch_v9_fetch_update_kernel",
@@ -217,6 +251,7 @@ def validate_fused_tuning(overrides, transport):
             "merge_outputs",
             "single_plan",
             "cached_buckets",
+            "fused_init",
         }
     else:
         booleans |= {
@@ -225,10 +260,11 @@ def validate_fused_tuning(overrides, transport):
             "single_planner",
             "skip_final_partition",
             "post_final_before_index",
+            "merge_final_completion",
         }
     integers = {"prefetch_limit", "window_limit"}
     if transport == "ubmem":
-        integers.add("final_copy_stages")
+        integers.update(("final_copy_stages", "final_copy_rows"))
     unknown = set(overrides) - booleans - integers
     if unknown:
         raise ValueError(f"Unsupported {transport} fusion tuning options: {sorted(unknown)}")
@@ -236,8 +272,16 @@ def validate_fused_tuning(overrides, transport):
         raise ValueError("Fusion optimization switches must be booleans")
     if any(type(overrides[name]) is not int for name in integers & overrides.keys()):
         raise ValueError("Fusion budgets and pipeline stages must be integers")
-    if "final_copy_stages" in overrides and overrides["final_copy_stages"] not in (4, 8):
-        raise ValueError("final_copy_stages must be 4 or 8")
+    if transport == "ubmem":
+        stages, rows = overrides.get("final_copy_stages", 4), overrides.get("final_copy_rows", 2)
+        if (stages, rows) not in ((4, 2), (8, 2), (6, 4)):
+            raise ValueError("final copy requires (stages, rows) = (4, 2), (8, 2), or (6, 4)")
+        if rows == 4 and (not overrides.get("grouped_copy") or overrides.get("ordered_pair")):
+            raise ValueError("Four-row final copy requires grouped_copy=True and ordered_pair=False")
+    if overrides.get("fused_init") and overrides.get("parallel_init"):
+        raise ValueError("fused_init requires one init worker per request")
+    if overrides.get("merge_final_completion") and not overrides.get("post_final_before_index"):
+        raise ValueError("merge_final_completion requires post_final_before_index=True")
     if overrides.get("tagged_map") and overrides.get("parallel_init"):
         raise ValueError("Tagged mapping requires one init worker per request")
     if overrides.get("simt_init") and overrides.get("parallel_init"):
@@ -285,10 +329,12 @@ def fusion_tuning(geometry, transport, overrides=None):
             grouped_copy=False,
             tagged_map=False,
             final_copy_stages=4,
+            final_copy_rows=2,
             ordered_pair=False,
             merge_outputs=False,
             single_plan=False,
             cached_buckets=False,
+            fused_init=False,
         )
     values.update(validate_fused_tuning({} if overrides is None else overrides, transport))
     if transport == "urma":
@@ -299,6 +345,7 @@ def fusion_tuning(geometry, transport, overrides=None):
         values.setdefault("single_planner", False)
         values.setdefault("skip_final_partition", False)
         values.setdefault("post_final_before_index", False)
+        values.setdefault("merge_final_completion", False)
     prefetch_budget(values["prefetch_limit"], values["window_limit"], geometry["requested_windows"])
     return values
 
@@ -367,6 +414,7 @@ def create_fused(
             grouped_copy=effective["grouped_copy"],
             tagged_map=effective["tagged_map"],
             final_copy_stages=effective["final_copy_stages"],
+            final_copy_rows=effective["final_copy_rows"],
             ordered_pair=effective["ordered_pair"],
             cold_only_prefetch=effective["cold_only_prefetch"],
             threshold_only=effective["threshold_only"],
@@ -377,6 +425,7 @@ def create_fused(
             rolling_threshold=effective["rolling_threshold"],
             reserved_ub=effective["reserved_ub"],
             cached_buckets=effective["cached_buckets"],
+            fused_init=effective["fused_init"],
         )
         library = build_specialization(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape)
         workspace = UbmemWorkspace(torch, resident=r, **common_workspace)
@@ -405,6 +454,7 @@ def create_fused(
             single_planner=effective["single_planner"],
             skip_final_partition=effective["skip_final_partition"],
             post_final_before_index=effective["post_final_before_index"],
+            merge_final_completion=effective["merge_final_completion"],
             reserved_ub=effective["reserved_ub"],
             cold_only_prefetch=effective["cold_only_prefetch"],
             threshold_only=effective["threshold_only"],
@@ -473,6 +523,7 @@ def create_fused(
             single_planner=effective["single_planner"],
             skip_final_partition=effective["skip_final_partition"],
             post_final_before_index=effective["post_final_before_index"],
+            merge_final_completion=effective["merge_final_completion"],
             reserved_ub=effective["reserved_ub"],
             cold_only_prefetch=effective["cold_only_prefetch"],
             threshold_only=effective["threshold_only"],

@@ -126,6 +126,7 @@ void CheckOutputLayout(uint32_t tailTokens) {
     std::cout<<"UBmem fused copy model PASS B="<<SIM_BATCH<<" token="<<kTokenBytes
              <<" paired="<<V9_UBMEM_GROUPED_COPY
              <<" final_stages="<<V9_UBMEM_FINAL_COPY_STAGES
+             <<" final_rows="<<V9_UBMEM_FINAL_COPY_ROWS
              <<" tail="<<tailTokens
              <<" window_ub="<<UbmemWindowCopyPipeline::kScratchBytes
              <<" overflow="<<UbmemWindowCopyPipeline::kOverflowBytes
@@ -135,10 +136,10 @@ void CheckOutputLayout(uint32_t tailTokens) {
 #if V9_UBMEM_GROUPED_COPY
 struct alignas(32) FinalOutput {std::array<uint8_t,SIM_RESIDENT*kTokenBytes> bytes{};};
 
-template<uint32_t Stages>
+template<uint32_t Stages,uint32_t Rows=2>
 void CheckFinalLookahead() {
-    using Pipeline=UbmemPairCopyPipelineT<Stages>;
-    constexpr uint32_t count=3*2*Stages+1;
+    using Pipeline=UbmemAlignedCopyPipelineT<Stages,Rows>;
+    constexpr uint32_t count=3*Rows*Stages+1;
     std::vector<uint8_t> source(count*kTokenBytes,0x39);
     auto allocation=std::make_unique<FinalOutput>();auto& output=allocation->bytes;
     UbmemRegion region{kUbmemMagic,kUbmemVersion,0x300000,Address(source.data()),source.size(),7,
@@ -152,15 +153,15 @@ void CheckFinalLookahead() {
     Pipeline pipe(&ctx,Address(output.data()),local);
     for(uint32_t i=0;i<count;++i) {
         assert(pipe.Add(region.peerBase+uint64_t(i)*kTokenBytes,i));
-        if(i+1<2*Stages)assert(copy_model::stores.empty());
-        if(i+1==2*Stages) {
-            assert(copy_model::peakLoadRows==2*Stages);
+        if(i+1<Rows*Stages)assert(copy_model::stores.empty());
+        if(i+1==Rows*Stages) {
+            assert(copy_model::peakLoadRows==Rows*Stages);
             assert(copy_model::stores.size()==1 && copy_model::storesDone==0);
             for(auto value:output)assert(value==0); // queued stores are genuinely delayed
         }
     }
     assert(pipe.Finish()==count);
-    assert(copy_model::peakLoadRows==2*Stages);
+    assert(copy_model::peakLoadRows==Rows*Stages);
     assert(std::memcmp(output.data(),source.data(),source.size())==0);
     for(size_t i=Pipeline::kScratchBytes;i<scratch.size();++i)assert(scratch[i]==0xa7);
     copy_model::Drained();
@@ -218,7 +219,9 @@ void CheckFinalBorrow(bool skewed) {
              <<" borrowed_bytes="<<UbmemFinalCopyPipeline::kScratchBytes<<" live_keys_offset="<<2*kSlots*4<<"\n";
 }
 
+template<uint32_t Stages=4,uint32_t Rows=2>
 void CheckPairCommands() {
+    using Pipeline=UbmemAlignedCopyPipelineT<Stages,Rows>;
     constexpr uint32_t stride=SIM_RESIDENT+384,sourceRows=128;
     const size_t outputBytes=uint64_t(2)*stride*kTokenBytes;
     const size_t storageBytes=(outputBytes+128+63)/64*64;
@@ -231,14 +234,14 @@ void CheckPairCommands() {
     UbmemRegion region{kUbmemMagic,kUbmemVersion,0x200000,Address(source.data()),source.size(),7,
         Address(output),outputBytes,0,kUbmemHostLocal};
     Context ctx{};ctx.ubmemRegion=Address(&region);
-    constexpr uint32_t scratchBytes=UbmemPairCopyPipeline::kScratchBytes;
+    constexpr uint32_t scratchBytes=Pipeline::kScratchBytes;
     std::vector<uint8_t> scratch(scratchBytes+64,0x8b);
     LocalTensor<uint8_t> local{scratch.data(),scratchBytes};
     struct Copy {uint64_t peer,base;uint32_t slot;};
     size_t totalBaseLoads=0,totalPairLoads=0,totalBaseStores=0,totalPairStores=0;
     // Exact pair reduction, strided gaps, reversed/repeated addresses, odd
     // tails, multiple ring wraps and pairs spanning stable-owner rows.
-    for(uint32_t pattern=0;pattern<10;++pattern)for(uint32_t count:{0U,1U,2U,7U,8U,9U,17U}) {
+    for(uint32_t pattern=0;pattern<10;++pattern)for(uint32_t count:{0U,1U,2U,3U,4U,5U,7U,8U,9U,17U,23U,24U,25U,49U}) {
         std::vector<Copy> copies;
         std::fill(expected.begin(),expected.end(),0xa9);
         for(uint32_t i=0;i<count;++i) {
@@ -278,14 +281,18 @@ void CheckPairCommands() {
         assert(baseLoads==count && baseStores==count);
         std::memset(allocation.get(),0xa9,storageBytes);copy_model::owners.clear();
         beforeLoads=copy_model::loadCommands;beforeStores=copy_model::storeCommands;
-        UbmemPairCopyPipeline paired(&ctx,Address(output),local);exercise(paired);
+        Pipeline paired(&ctx,Address(output),local);exercise(paired);
         auto pairLoads=copy_model::loadCommands-beforeLoads,pairStores=copy_model::storeCommands-beforeStores;
         assert(pairLoads<=baseLoads && pairStores<=baseStores);
         bool singleLoads=pattern==2 || pattern==7 || pattern==9 || (!V9_UBMEM_ORDERED_PAIR && (pattern==1 || pattern==8));
         bool singleStores=pattern==3 || pattern==4 || pattern==6 || pattern==7 || pattern==9 ||
             (V9_UBMEM_ORDERED_PAIR?pattern==1:pattern==8);
-        assert(pairLoads==(singleLoads?count:(count+1)/2));
-        assert(pairStores==(singleStores?count:(count+1)/2));
+        if constexpr(Rows==2) {
+            assert(pairLoads==(singleLoads?count:(count+1)/2));
+            assert(pairStores==(singleStores?count:(count+1)/2));
+        } else if(pattern==0) {
+            assert(pairLoads==(count+Rows-1)/Rows && pairStores==(count+Rows-1)/Rows);
+        }
         if(pattern==0) {
             totalBaseLoads+=baseLoads;totalPairLoads+=pairLoads;
             totalBaseStores+=baseStores;totalPairStores+=pairStores;
@@ -294,7 +301,7 @@ void CheckPairCommands() {
     // Empty/invalid regions, a complete last record and run-state failures.
     {
         std::memset(allocation.get(),0xa9,storageBytes);copy_model::owners.clear();
-        UbmemPairCopyPipeline pipe(&ctx,Address(output),local);
+        Pipeline pipe(&ctx,Address(output),local);
         assert(!pipe.AddAt(region.peerBase,Address(output)+1,0));
         assert(!pipe.BeginRunAt(Address(output)+1,0,1));
         assert(pipe.BeginRunAt(Address(output),SIM_RESIDENT-1,1));
@@ -305,12 +312,12 @@ void CheckPairCommands() {
         assert(std::memcmp(output+uint64_t(SIM_RESIDENT-1)*kTokenBytes,
             source.data()+source.size()-kTokenBytes,kTokenBytes)==0);
         region.generation=0;
-        UbmemPairCopyPipeline invalid(&ctx,Address(output),local);
+        Pipeline invalid(&ctx,Address(output),local);
         assert(!invalid.Add(region.peerBase,0) && !invalid.BeginRunAt(Address(output),0,1));
         assert(invalid.Finish()==0);copy_model::Drained();
     }
     assert(totalPairLoads<totalBaseLoads && totalPairStores<totalBaseStores);
-    std::cout<<"Paired actual-function model PASS: forward MTE2 "<<totalBaseLoads<<" -> "<<totalPairLoads
+    std::cout<<"Grouped actual-function model PASS stages="<<Stages<<" rows="<<Rows<<": forward MTE2 "<<totalBaseLoads<<" -> "<<totalPairLoads
              <<", MTE3 "<<totalBaseStores<<" -> "<<totalPairStores<<"; byte-identical\n";
 }
 #endif
@@ -321,5 +328,9 @@ int main() {
     CheckFinalLookahead<4>();CheckFinalLookahead<8>();
     CheckFinalBorrow(false);CheckFinalBorrow(true);
     CheckPairCommands();
+#if !V9_UBMEM_ORDERED_PAIR
+    CheckFinalLookahead<6,4>();
+    CheckPairCommands<6,4>();
+#endif
 #endif
 }

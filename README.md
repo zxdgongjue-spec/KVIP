@@ -525,6 +525,37 @@ validation before use in serving:
   wait. No kernel launch is added. Stage diagnostics identify the combined
   prefetch join/submission explicitly.
 
+Three follow-up experiments retain the measured window/selection policies:
+
+- UBmem `fused_init=true` runs the **complete existing initialization** inside
+  the mixed LI kernel. All launched AIVs finish a hardware collective before
+  LI can publish its cube/vector credits. The independent init and LI entries
+  remain available. This removes one launch boundary and can overlap AIC setup;
+  it does not remove initialization work from timing. It requires
+  `parallel_init=false`. Diagnostic timing uses `init_li_with_prefetch` as one
+  inseparable stage.
+- UBmem `final_copy_rows=4, final_copy_stages=6` increases the final-copy ring
+  from 16 rows (8 pairs) to 24 rows. Its 62,976-byte scratch fits the same
+  retired 64 KiB selection/location banks; live address vectors are untouched.
+  Exact forward arithmetic runs share a DMA command; reversed, repeated or
+  incompatible addresses keep their original order. No gap bytes are read or
+  written. This requires grouped 2624-byte copy and `ordered_pair=false`.
+  Window copy and the default 4/8-stage pair paths are unchanged.
+- URMA `merge_final_completion=true` drains all of a row's posted final queues
+  in the existing completion kernel, then performs the original completion
+  checks. It requires `post_final_before_index=true`. Each CQ still has one
+  consumer; an error does not skip sibling drains. This removes the separate
+  final-wait launch, but serial polling of a row's four queues can offset that
+  saving. Diagnostic timing is `final_wait_and_completion`.
+
+Node24 NPU4 measured revision `9b6b696`: UBmem serial 682.726 us versus
+fused `reserved_ub` 649.735 us (4.83% lower mean; 4.91% lower p50).
+Adding cached buckets regressed to 657.909 us, so keep that option disabled.
+URMA serial was 605.932 us versus fused reserved-map/final-post overlap
+477.283 us (21.23% lower mean; 20.05% lower p50). The different mean/median
+reductions expose serial timing outliers. Neither meets the 35% target;
+the follow-up experiments above have no measured NPU performance claim yet.
+
 Extended Index planning now clears and scans only its producer high-water
 prefix and the corresponding path-closing prefix. Their ABI offsets and record
 order are unchanged; old records outside those ranges cannot be consumed.
@@ -563,7 +594,11 @@ python3 -m kvip.diagnostics.compare --from-results \
 
 The command rejects failed or mixed-snapshot/revision/geometry/scope cases,
 retains all candidate means, and selects the lowest validated fused mean in
-each sweep. It reports target attainment against the saved serial references.
+each sweep. It reports target attainment against the saved serial references and shows
+median reduction alongside the mean; the target still uses the full graph mean.
+`--split-index-stages` also works for URMA: it separates the existing
+early-output/plan launch from the owned Index apply launch. This localizes
+Index cost without adding work or splitting the uninstrumented full graph.
 This is selection from a finite sweep, not an independent remeasurement of
 the winner; the summary records that limitation.
 

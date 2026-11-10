@@ -158,15 +158,17 @@ private:
 // Both source and destination gaps
 // are represented by exact strided copies, never by reading/writing the gaps.
 // Reversed/repeated addresses retain two ordered copies within the same stage.
-template<uint32_t Depth=4>
-class UbmemPairCopyPipelineT {
+template<uint32_t Depth,uint32_t Rows=2>
+class UbmemAlignedCopyPipelineT {
 public:
-    static constexpr uint32_t kDepth=Depth,kStageBytes=2*kTokenBytes;
+    static constexpr uint32_t kDepth=Depth,kRows=Rows,kStageBytes=Rows*kTokenBytes;
     static constexpr uint32_t kScratchBytes=kDepth*kStageBytes,kOverflowBytes=0;
-    static_assert((Depth==4 || Depth==8) && kTokenBytes==2624 && kTokenBytes%32==0,
-                  "Paired pipeline requires four or eight stages of aligned four-layer rows");
+    static_assert(((Rows==2 && (Depth==4 || Depth==8)) || (Rows==4 && Depth==6)) &&
+                  kTokenBytes==2624 && kTokenBytes%32==0,
+                  "Aligned copy requires pair4/pair8 or six stages of four four-layer rows");
+    static_assert(Rows==2 || !V9_UBMEM_ORDERED_PAIR,"Wide copy keeps original row order");
     static_assert(kScratchBytes<=2*kSlots*sizeof(uint32_t),"Final ring overlaps live address vectors");
-    __aicore__ inline UbmemPairCopyPipelineT(__gm__ Context* ctx,uint64_t output,LocalTensor<uint8_t> scratch)
+    __aicore__ inline UbmemAlignedCopyPipelineT(__gm__ Context* ctx,uint64_t output,LocalTensor<uint8_t> scratch)
         :output_(output),scratch_(scratch) {
         auto region=UbmemRegionAt(ctx);
         valid_=UbmemRegionValid(region);
@@ -175,8 +177,8 @@ public:
             outputBase_=region->outputBase;outputBytes_=region->outputBytes;
         }
     }
-    __aicore__ inline UbmemPairCopyPipelineT(__gm__ Context* ctx,uint64_t output,
-        LocalTensor<uint8_t> scratch,LocalTensor<uint8_t>):UbmemPairCopyPipelineT(ctx,output,scratch) {}
+    __aicore__ inline UbmemAlignedCopyPipelineT(__gm__ Context* ctx,uint64_t output,
+        LocalTensor<uint8_t> scratch,LocalTensor<uint8_t>):UbmemAlignedCopyPipelineT(ctx,output,scratch) {}
     __aicore__ inline uint64_t PlanPeerBase()const {return peerBase_;}
     __aicore__ inline uint64_t PlanMaxPeerOffset()const {return bytes_>=kTokenBytes?bytes_-kTokenBytes:0;}
     __aicore__ inline bool Add(uint64_t peer,uint32_t slot) {return AddAt(peer,output_,slot);}
@@ -193,7 +195,7 @@ public:
         }
         sources_[pending_]=source;destinations_[pending_]=output+rowOffset;
         ++pending_;++accepted_;
-        if(pending_==2)FlushPair();
+        if(pending_==Rows)FlushGroup();
         return true;
     }
     __aicore__ inline bool BeginRunAt(uint64_t output,uint32_t slot,uint32_t count) {
@@ -215,7 +217,7 @@ public:
     __aicore__ inline void SaveFinalCommandCounts(__gm__ uint64_t*)const {}
     __aicore__ inline uint32_t Finish() {
         if(!accepted_)return 0;
-        if(pending_)FlushPair();
+        if(pending_)FlushGroup();
         while(stored_<issued_)StoreOldest();
         for(uint32_t i=0;i<kDepth;++i)WaitFlag<HardEvent::MTE3_MTE2>(static_cast<event_t>(i));
         SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
@@ -225,7 +227,18 @@ private:
     __aicore__ static inline bool ForwardPair(uint64_t first,uint64_t second) {
         return second>=first && second-first>=kTokenBytes && second-first-kTokenBytes<=UINT32_MAX;
     }
-    __aicore__ inline void FlushPair() {
+    // Only combine an exact forward arithmetic run. Repeated, descending,
+    // overlapping and over-wide gaps retain separate commands in input order.
+    __aicore__ static inline uint32_t ForwardRun(const uint64_t* addresses,uint32_t remaining,uint32_t& gap) {
+        gap=0;
+        if(remaining<2 || !ForwardPair(addresses[0],addresses[1]))return 1;
+        const uint64_t delta=addresses[1]-addresses[0];gap=static_cast<uint32_t>(delta-kTokenBytes);
+        uint32_t count=2;
+        while(count<remaining && addresses[count]>=addresses[count-1] &&
+              addresses[count]-addresses[count-1]==delta)++count;
+        return count;
+    }
+    __aicore__ inline void FlushGroup() {
         uint32_t stage=issued_%kDepth,rows=pending_;
         if constexpr(V9_UBMEM_ORDERED_PAIR) {
             // Reverse only disjoint destinations, moving each destination
@@ -245,7 +258,15 @@ private:
         WaitFlag<HardEvent::MTE3_MTE2>(static_cast<event_t>(stage));
         GlobalTensor<uint8_t> from;
         DataCopyPadExtParams<uint8_t> pad{false,0,0,0};
-        if(rows==2 && ForwardPair(sources_[0],sources_[1])) {
+        if constexpr(Rows==4) {
+            for(uint32_t first=0;first<rows;) {
+                uint32_t gap=0,count=ForwardRun(sources_+first,rows-first,gap);
+                from.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(sources_[first]));
+                DataCopyExtParams copy{static_cast<uint16_t>(count),kTokenBytes,gap,0,0};
+                DataCopyPad<uint8_t,PaddingMode::Normal>(scratch_[stage*kStageBytes+first*kTokenBytes],from,copy,pad);
+                first+=count;
+            }
+        } else if(rows==2 && ForwardPair(sources_[0],sources_[1])) {
             from.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(sources_[0]));
             DataCopyExtParams copy{2,kTokenBytes,static_cast<uint32_t>(sources_[1]-sources_[0]-kTokenBytes),0,0};
             DataCopyPad<uint8_t,PaddingMode::Normal>(scratch_[stage*kStageBytes],from,copy,pad);
@@ -260,35 +281,48 @@ private:
         storeRows_[stage]=rows;
         SetFlag<HardEvent::MTE2_MTE3>(static_cast<event_t>(stage));
         pending_=0;++issued_;
-        // Fill every stage before the first MTE3 store. Final depth eight
-        // exposes sixteen in-flight rows; window depth four remains unchanged.
+        // Fill every stage before the first MTE3 store: the optional 6x4
+        // final ring exposes 24 in-flight rows within the same retired banks.
+        // The original pair rings expose 8/16 rows and keep their old path.
         if(issued_-stored_==kDepth)StoreOldest();
     }
     __aicore__ inline void StoreOldest() {
         uint32_t stage=stored_%kDepth,rows=storeRows_[stage];
-        auto first=storeDestinations_[stage][0],second=storeDestinations_[stage][1];
         WaitFlag<HardEvent::MTE2_MTE3>(static_cast<event_t>(stage));
         GlobalTensor<uint8_t> to;
-        if(rows==2 && ForwardPair(first,second)) {
-            to.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(first));
-            DataCopyExtParams copy{2,kTokenBytes,0,static_cast<uint32_t>(second-first-kTokenBytes),0};
-            DataCopyPad<uint8_t,PaddingMode::Normal>(to,scratch_[stage*kStageBytes],copy);
+        if constexpr(Rows==4) {
+            for(uint32_t first=0;first<rows;) {
+                uint32_t gap=0,count=ForwardRun(storeDestinations_[stage]+first,rows-first,gap);
+                to.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(storeDestinations_[stage][first]));
+                DataCopyExtParams copy{static_cast<uint16_t>(count),kTokenBytes,0,gap,0};
+                DataCopyPad<uint8_t,PaddingMode::Normal>(to,scratch_[stage*kStageBytes+first*kTokenBytes],copy);
+                first+=count;
+            }
         } else {
-            for(uint32_t i=0;i<rows;++i) {
-                to.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(storeDestinations_[stage][i]));
-                DataCopyExtParams copy{1,kTokenBytes,0,0,0};
-                DataCopyPad<uint8_t,PaddingMode::Normal>(to,scratch_[stage*kStageBytes+i*kTokenBytes],copy);
+            auto first=storeDestinations_[stage][0],second=storeDestinations_[stage][1];
+            if(rows==2 && ForwardPair(first,second)) {
+                to.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(first));
+                DataCopyExtParams copy{2,kTokenBytes,0,static_cast<uint32_t>(second-first-kTokenBytes),0};
+                DataCopyPad<uint8_t,PaddingMode::Normal>(to,scratch_[stage*kStageBytes],copy);
+            } else {
+                for(uint32_t i=0;i<rows;++i) {
+                    to.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(storeDestinations_[stage][i]));
+                    DataCopyExtParams copy{1,kTokenBytes,0,0,0};
+                    DataCopyPad<uint8_t,PaddingMode::Normal>(to,scratch_[stage*kStageBytes+i*kTokenBytes],copy);
+                }
             }
         }
         SetFlag<HardEvent::MTE3_MTE2>(static_cast<event_t>(stage));++stored_;
     }
     LocalTensor<uint8_t> scratch_;
     uint64_t output_,peerBase_=0,mappedBase_=0,bytes_=0,outputBase_=0,outputBytes_=0;
-    uint64_t sources_[2]{},destinations_[2]{},storeDestinations_[kDepth][2]{};
+    uint64_t sources_[Rows]{},destinations_[Rows]{},storeDestinations_[kDepth][Rows]{};
     uint64_t runOutput_=0;
     uint32_t storeRows_[kDepth]{},pending_=0,accepted_=0,issued_=0,stored_=0,runSlot_=0,runCount_=0;
     bool valid_=false;
 };
+template<uint32_t Depth=4>
+using UbmemPairCopyPipelineT=UbmemAlignedCopyPipelineT<Depth,2>;
 using UbmemPairCopyPipeline=UbmemPairCopyPipelineT<4>;
 #endif
 
@@ -714,7 +748,7 @@ using UbmemFinalCopyPipeline=UbmemGroupedCopyPipelineT<4,true>;
 using UbmemWindowCopyPipeline=UbmemGroupedCopyPipelineT<8,false,8,false>;
 #elif V9_UBMEM_GROUPED_COPY
 using UbmemGroupedCopyPipeline=UbmemPairCopyPipeline;
-using UbmemFinalCopyPipeline=UbmemPairCopyPipelineT<V9_UBMEM_FINAL_COPY_STAGES>;
+using UbmemFinalCopyPipeline=UbmemAlignedCopyPipelineT<V9_UBMEM_FINAL_COPY_STAGES,V9_UBMEM_FINAL_COPY_ROWS>;
 using UbmemWindowCopyPipeline=UbmemPairCopyPipeline;
 #else
 using UbmemGroupedCopyPipeline=UbmemCopyPipeline;
