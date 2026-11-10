@@ -23,6 +23,16 @@ source "$repo/scripts/env.sh"
 cp "$repo/tests/operators/lifetch/test_lifetch.py" "$baseline/tests/operators/lifetch/test_lifetch.py"
 cp "$repo/tests/operators/lifetch/support/lifetch.py" "$baseline/tests/operators/lifetch/support/lifetch.py"
 cp "$repo/tests/operators/lifetch/support/device_trace.py" "$baseline/tests/operators/lifetch/support/device_trace.py"
+cp "$repo/tests/operators/lifetch/support/runner.py" "$baseline/tests/operators/lifetch/support/runner.py"
+python - "$baseline/tests/operators/lifetch/support" <<'PYCHECK'
+import inspect
+import sys
+sys.path.insert(0, sys.argv[1])
+from runner import supervise
+from device_trace import account, collect_core
+if "timeout_seconds" not in inspect.signature(supervise).parameters or "full" not in inspect.signature(account).parameters or "full" not in inspect.signature(collect_core).parameters:
+    raise SystemExit("Incompatible baseline diagnostic harness")
+PYCHECK
 for miss in 10; do
     for version in main pr11; do
         code="$repo"
