@@ -65,7 +65,7 @@ public:
     using SCORE_T = typename QLIT::scoreType;
 
     __aicore__ inline QLIVector(){};
-    __aicore__ inline void ProcessVec1(const QLICommon::RunInfo &info, uint32_t end);
+    __aicore__ inline void ProcessVec1(const QLICommon::RunInfo &info);
     __aicore__ inline void ProcessTopK(const QLICommon::RunInfo &info);
     __aicore__ inline void SetPrefixStorage(GM_ADDR output) { prefixOutput_ = output; }
     __aicore__ inline void ProcessResidentTopK(QLICommon::RunInfo info) {
@@ -94,7 +94,6 @@ protected:
     GlobalTensor<int32_t> indiceOutGm;
     GlobalTensor<int32_t> blockTableGm;
     // =================================常量区=================================
-    static constexpr uint32_t K_SCALE_TILES = 16;
     static constexpr uint32_t VEC1_V_MTE2_EVENT_KSCALE = EVENT_ID0;
     static constexpr uint32_t VEC1_MTE2_V_EVENT_KSCALE = EVENT_ID1;
     static constexpr uint32_t VEC1_V_MTE3_EVENT = EVENT_ID2;
@@ -193,8 +192,6 @@ private:
 
     }
 
-    __aicore__ inline void StageKeyScale(const QLICommon::RunInfo &info, uint32_t tile,
-                                         uint32_t limit, uint32_t scaleLoop);
     __aicore__ inline void GetKeyScale(const QLICommon::RunInfo &runInfo, LocalTensor<SCALE_T> &kScaleUB,
                                        int64_t batchId, int64_t startS2, int64_t getLen);
     // ================================Local Buffer区====================================
@@ -451,24 +448,7 @@ __aicore__ inline void QLIVector<QLIT>::GetKeyScale(const QLICommon::RunInfo &ru
 }
 
 template <typename QLIT>
-__aicore__ inline void QLIVector<QLIT>::StageKeyScale(
-    const QLICommon::RunInfo &info, uint32_t tile, uint32_t limit, uint32_t scaleLoop)
-{
-    const uint32_t bank = scaleLoop % 2;
-    const uint32_t start = tile * s2BaseSize_;
-    const uint32_t count = Min(K_SCALE_TILES * s2BaseSize_, limit - start);
-    QLICommon::RunInfo stage = info;
-    stage.kScaleLoop = scaleLoop;
-    if constexpr (!PAGE_ATTENTION) {
-        stage.tensorKeyScaleOffset += uint64_t(tile - info.s2Idx) * s2BaseSize_ * kHeadNum_;
-    }
-    WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_KSCALE + bank);
-    GetKeyScale(stage, kScaleUB_, info.bIdx, start, count);
-    SetFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT_KSCALE + bank);
-}
-
-template <typename QLIT>
-__aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &info, uint32_t end)
+__aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &info)
 {
     auto pingpong = (info.loop % 2);
     auto qScalepingpong = (info.qScaleLoop % 2);
@@ -511,12 +491,15 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         WaitFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT_QSCALE + qScalepingpong);
     }
 
-    const uint32_t scaleTile = (info.s2Idx - info.s2Start) % K_SCALE_TILES;
-    if (scaleTile == 0) {
-        const uint32_t limit = Min(info.validS2Len, end * s2BaseSize_);
-        if (info.isFirstS2InnerLoop) StageKeyScale(info, info.s2Idx, limit, info.kScaleLoop);
-        const uint32_t nextTile = info.s2Idx + K_SCALE_TILES;
-        if (nextTile * s2BaseSize_ < limit) StageKeyScale(info, nextTile, limit, info.kScaleLoop + 1);
+    if ((info.s2Idx - info.s2Start) % 16 == 0) {
+        WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_KSCALE + kScalepingpong);
+        uint32_t getLen = 16 * s2BaseSize_ > (info.validS2Len - info.s2Idx * s2BaseSize_)
+                                           ? info.validS2Len - info.s2Idx * s2BaseSize_
+                                           : 16 * s2BaseSize_;
+        //kScaleGm  -->  kScaleUB_
+        GetKeyScale(info, kScaleUB_, info.bIdx, curS2Idx, getLen);
+        SetFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT_KSCALE + kScalepingpong);
+        WaitFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT_KSCALE + kScalepingpong);
     }
     WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
 
@@ -531,11 +514,10 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     auto weightBase = weightUB_[qScalepingpong * (UB_BANK_STRIDE / sizeof(W_T))];
     auto weightFloatBase = weightFloatUB_[qScalepingpong * (UB_BANK_STRIDE / sizeof(float))];
     auto qScaleBase = qScaleUB_[qScalepingpong * (UB_BANK_STRIDE / sizeof(SCALE_T))];
-    auto kScaleBase = kScaleUB_[(kScalepingpong * K_SCALE_TILES + scaleTile) * s2BaseSize_];
+    auto kScaleBase = kScaleUB_[kScalepingpong * 16 * s2BaseSize_ + ((info.s2Idx - info.s2Start) % 16) * s2BaseSize_];
     auto qkBase = resMm1UB_[pingpong * (UB_BANK_STRIDE / sizeof(float))];
     auto qkVLstride = (UB_BANK_DEPTH_STRIDE / sizeof(float)) / 2 * constInfo_.mBaseSize;
 
-    if (scaleTile == 0) WaitFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT_KSCALE + kScalepingpong);
     if (curS2Idx >= runtimeShape_.resident) {
     vector1::BatchClassifyScore(outBase, UB_BANK_DEPTH_STRIDE / sizeof(SCORE_T),
                                         qkBase, qkVLstride, (uint32_t)(gSize_ * UB_BANK_DEPTH_STRIDE / sizeof(float)),
@@ -556,12 +538,9 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     if (info.isFirstS2InnerLoop) {
         SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_QSCALE + qScalepingpong);
     }
-    if (scaleTile + 1 == K_SCALE_TILES || info.isLastS2InnerLoop) {
+    if ((info.s2Idx - info.s2Start) % 16 == 0) {
         SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_KSCALE + kScalepingpong);
     }
-    // Score/progress stores use separate buffers after the VF reads QK.
-    CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(
-        QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);
     SetFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
     WaitFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
     //outUB_ --->  scoreGm
@@ -608,6 +587,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
             rotationProgress_[(info.s2Idx % 64) * 16], publish);
     }
     SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
+    CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);   //V核处理完，通知C核可以把mm1Res搬运到UB
 }
 
 template <typename QLIT>

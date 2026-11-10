@@ -697,7 +697,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessBaseBlock(uint3
             rotationServed_ = true;
         }
     } else {
-        vectorService.ProcessVec1(runInfo, tempLoopInfo.s2LoopEnd + 1);
+        vectorService.ProcessVec1(runInfo);
         if ((runInfo.s2Idx + 1) * 128 == resident_) {
             vectorService.ProcessResidentTopK(runInfo);
             vectorService.PrepareRotationProgress();
