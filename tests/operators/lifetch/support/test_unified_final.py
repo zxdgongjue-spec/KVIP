@@ -93,3 +93,20 @@ def test_full_trace_accounts_all_li_kernels_and_combined_fetch_update():
     assert sum(result["stages_us"].values()) + result["inter_kernel_gap_us"] + result["boundary_residual_us"] == 50
     missing = account(events[:-1], "replay", 50, full=True)
     assert "error" in missing and missing["found"]["fetch"] == 0
+
+
+def test_trace_accounts_early_fetch_before_update():
+    from device_trace import account
+
+    events = [dict(name="replay", ph="X", ts="0", dur=100)]
+    for name, start, duration in (
+        ("v9_init_kernel_0", 0, 2), ("v9_li_kernel_0", 2, 10),
+        ("v9_resolve_kernel_0", 12, 4), ("v9_early_fetch_kernel_0", 16, 5),
+        ("kvop_direct_update_outputs_early_kernel_0", 21, 3),
+        ("kvop_direct_apply_owned_kernel_0", 24, 5), ("v9_fetch_update_kernel_0", 29, 2),
+    ):
+        events.append(dict(name=name, ph="X", cat="kernel", ts=str(start), dur=duration))
+    result = account(events, "replay", 31, full=True)
+    assert result["stages_us"]["early_fetch"] == 5
+    assert result["stages_us"]["fetch"] == 2
+    assert sum(result["stages_us"].values()) + result["inter_kernel_gap_us"] + result["boundary_residual_us"] == 31

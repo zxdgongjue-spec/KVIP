@@ -72,6 +72,8 @@ def account(events, name, elapsed, *, full=False):
                     publish="kvop_direct_update_outputs_early_kernel",
                     apply="kvop_direct_apply_owned_kernel", fetch="v9_fetch_update_kernel")
                if full else {stage: f"v9_{stage}_kernel" for stage in STAGES})
+    if any(e.get("name", "").lower().startswith("v9_early_fetch_kernel") for e in events):
+        kernels["early_fetch"] = "v9_early_fetch_kernel"
     groups = {stage: [] for stage in kernels}
     for event in events:
         n = event.get("name", "").lower()

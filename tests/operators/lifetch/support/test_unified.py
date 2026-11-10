@@ -60,3 +60,14 @@ def test_supervisor_reports_timeout(tmp_path):
     assert supervise([sys.executable, '-c', 'import time; time.sleep(30)'], tmp_path,
                      heartbeat_seconds=0.1, timeout_seconds=0.3) == 1
     assert 'timeout=0.3s' in (tmp_path / 'summary.log').read_text()
+
+
+def test_early_fetch_selects_urma_only(monkeypatch, tmp_path):
+    commands = []
+    monkeypatch.setattr(module.subprocess, 'call', lambda command: commands.append(command) or 0)
+    assert module.main(['--transport', 'urma', '--kvaf-server', 'host:1', '--kvaf-root', str(tmp_path),
+                        '--early-fetch']) == 0
+    assert '--early-fetch' in commands[0]
+    with pytest.raises(SystemExit):
+        module.main(['--transport', 'ubmem', '--kvaf-server', 'host:1', '--kvaf-root', str(tmp_path),
+                     '--soc', 'Ascend950PR_9599', '--early-fetch'])

@@ -21,6 +21,7 @@ from runner import progress, supervise  # noqa: E402
 def arguments(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--worker-run", type=Path, help=argparse.SUPPRESS)
+    p.add_argument("--early-fetch", action="store_true")
     p.add_argument("--timeout-seconds", type=int, default=300)
     p.add_argument("--device", type=int, default=0)
     p.add_argument("--kvaf-server", required=True)
@@ -134,6 +135,7 @@ def main(argv=None):
         return run_urma(argv[1:])
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--transport', required=True, choices=('urma', 'ubmem'))
+    p.add_argument('--early-fetch', action='store_true')
     p.add_argument('--device', type=int, default=0)
     p.add_argument('--kvaf-server', required=True)
     p.add_argument('--kvaf-root', type=Path)
@@ -181,6 +183,8 @@ def main(argv=None):
                    '--kvaf-root', str(kvaf_root), '--cann', a.cann, '--batches', a.batches,
                    '--intermediate-fetches', str(a.intermediate_fetches), '--trace-rounds', str(a.trace_rounds),
                    '--output', str(a.output), '--timeout-seconds', str(a.timeout_seconds)]
+        if a.early_fetch:
+            command.append('--early-fetch')
         if a.soc:
             command += ['--soc', a.soc]
         if a.runtime_shapes:
@@ -192,6 +196,8 @@ def main(argv=None):
         if a.comparison_sfa:
             command += ['--comparison-sfa', str(a.comparison_sfa)]
         return subprocess.call(command)
+    if a.early_fetch:
+        p.error('--early-fetch is supported only by URMA')
     if a.intermediate_fetches != 8:
         p.error('UBmem fixture currently supports exactly 8 windows')
     if not a.soc:

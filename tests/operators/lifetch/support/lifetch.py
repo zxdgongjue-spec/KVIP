@@ -30,6 +30,7 @@ def seed_native_bitmap(torch, native, row, bitmap):
 
 
 def run(args, run_dir):
+    source = SOURCE.with_name("lightning_indexer_with_fetch_early") if args.early_fetch else SOURCE
     from attention import check_sfa
     from contract_payload import payload
     from kvip.operators.lifetch import binding as launch_module
@@ -111,7 +112,7 @@ def run(args, run_dir):
             )
             if not shared_build.exists():
                 command(
-                    ["cmake", "-S", SOURCE, "-B", build, *[f"-D{k}={v}" for k, v in options.items()]],
+                    ["cmake", "-S", source, "-B", build, *[f"-D{k}={v}" for k, v in options.items()]],
                     folder / "configure.log",
                 )
                 command(["cmake", "--build", build, "-j2"], folder / "build.log")
@@ -181,7 +182,7 @@ def run(args, run_dir):
             continue
         times = report["timing"]
         line = (
-            f"binary_sha256={built_digest}\nBS={batch} prototype PASS index_heads={args.index_heads} windows={geometry['intermediate_fetches']} requested_windows={args.intermediate_fetches} history={args.history} hot={args.resident} topk=2048 Q=4 graph=True\n"
+            f"binary_sha256={built_digest} early_fetch={args.early_fetch}\nBS={batch} prototype PASS index_heads={args.index_heads} windows={geometry['intermediate_fetches']} requested_windows={args.intermediate_fetches} history={args.history} hot={args.resident} topk=2048 Q=4 graph=True\n"
             + "graph_p50_us="
             + ", ".join((f"{k}:{v['p50_us']:.3f}" for k, v in times.items()))
             + f"\ncore_speedup={times['native_chain']['p50_us'] / times['prototype_core']['p50_us']:.3f}x"
