@@ -280,8 +280,8 @@ extern "C" __global__ __aicore__ void v9_resolve_kernel(GM_ADDR bindings) {
     }
 #endif
 }
-// Final transport consumes compact resolver ranges through native KVAF.
-// Submit disjoint destinations first; join prefetch before overwriting its slots.
+// Final transport drains resolver posts and submits any remaining ranges.
+// Join prefetch before overwriting its slots.
 #if defined(__CCE_AICORE__)
 __aicore__ inline void FinishFetch(GM_ADDR bindings, GM_ADDR update) {
     auto runtimeShape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(reinterpret_cast<__gm__ uint64_t*>(bindings)[14]));

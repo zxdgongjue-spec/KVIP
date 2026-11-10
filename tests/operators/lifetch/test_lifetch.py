@@ -700,27 +700,12 @@ def test_completion_diagnostics_distinguish_transport_states():
     assert len(result) == 1 and result[0]["final_cq"][0][2] == 7
 
 
-def test_final_fetch_uses_native_explicit_range_without_direct_submission():
+def test_final_fetch_publishes_ranges_and_early_checkpoint():
     from pathlib import Path
     import subprocess
     import tempfile
 
     root = Path(__file__).resolve().parents[3] / "csrc/operators/lightning_indexer_with_fetch/op_kernel"
-    resolver = (root / "resolver.h").read_text()
-    lifecycle = (root / "lifecycle.cpp").read_text()
-    assert "PublishFinalWorker" not in resolver
-    assert "CommitPostScalarStage" not in resolver
-    phase = (root / "final_fetch_phase.h").read_text()
-    phase_loop = (root.parents[1] / "common/lifetch/final_phase_loop.h").read_text()
-    phase_loop = phase_loop.replace("#include LIFETCH_FINAL_PHASE", phase)
-    lifecycle = lifecycle.replace('#include "../../common/lifetch/final_phase_loop.h"', phase_loop)
-    finish = lifecycle[lifecycle.index("__aicore__ inline void FinishFetch") :]
-    assert "if(phase==1)" in finish
-    assert "(!phase || !row->pending)" in finish
-    assert "kvaf_device::KvafBatchGetDevice(workerArgs,0,begin,count)" in finish
-    assert "DrainQueue(" not in finish
-    # Execute the production descriptor publisher: it must never mark an SQ post
-    # pending, even for nonempty or oversized ranges; native KVAF schedules them.
     publisher = (root.parents[1] / "common/lifetch/final_post.h").read_text()
     start = publisher.index("__aicore__ inline void PrepareFinalFetch")
     function = publisher[start : publisher.index("\n}\n", start) + 2]
@@ -743,6 +728,8 @@ int main() { Context c{};
   auto p=c.posts[6]; assert(p.count==n && p.descriptor==123 && p.pending==0 && p.deferred==(n!=0) && p.nonconflicting==n/2);
  }
  PrepareFinalFetch(4,0,&c,1,2,608,123,4,0); assert(c.posts[6].error==4 && !c.posts[6].deferred);
+ PrepareFinalFetch(4,0,&c,1,2,608,123,0,304,1,32766);
+ assert(c.posts[6].pending==1 && c.posts[6].head==32766 && c.posts[6].deferred);
 }
 """
     )
@@ -769,16 +756,22 @@ def test_native_final_phase_order_runs_production_loop(tmp_path):
 #define V9_SIMULATION 0
 #define KVAF_AIV_BATCH_GET_STATUS_MAGIC 99
 struct Post { unsigned count=0,pending=0,error=0,deferred=0,descriptor=0,nonconflicting=0; } posts[4];
-struct KvafBatchGetQueueState { uint64_t sq_producer_index=0,cq_consumer_index=0; } queues[4];
+struct KvafBatchGetDirectUrmaEntity {};
+struct KvafBatchGetQueueState { uint64_t sq_producer_index=0,cq_consumer_index=0,last_error=0,poisoned=0; } queues[4];
 struct KvafBatchGetCoreStatus { uint64_t magic=99,result=0,completed_batch_count=1,processed_request_count=0; } statuses[4];
-struct Args { uint64_t queue_state,core_status,indices,offsets,output_indices,miss_count,address_table,valid_table; unsigned request_capacity,table_capacity; };
+struct Args { uint64_t channel_entity,queue_state,core_status,indices,offsets,output_indices,miss_count,address_table,valid_table; unsigned request_capacity,table_capacity; };
 struct Context { uint64_t sourceBlocks=1,sourceOffsets=2,destinations=3,count=4,fallbackAddresses=5,fallbackValid=6; } context;
 struct Row { unsigned pending=1,error=0; } rowValue;
-std::vector<int> events; bool joined=false,failJoin=false;
+std::vector<int> events; bool joined=false,failJoin=false,failCq=false;
 Post* FinalPostAt(unsigned,Context*,unsigned w){return posts+w;}
 unsigned FinalQueue(unsigned,unsigned,unsigned,unsigned w){return w;}
 Args GetArgs(Context*,unsigned w){Args a{};a.queue_state=(uint64_t)(queues+w);a.core_status=(uint64_t)(statuses+w);return a;}
 void CompletePrefetch(Context*,unsigned){events.push_back(-1);joined=true;rowValue.pending=failJoin;rowValue.error=failJoin?6:0;}
+struct DrainResult { uint64_t error; unsigned completed; };
+DrainResult DrainQueue(const KvafBatchGetDirectUrmaEntity*,KvafBatchGetQueueState* queue,unsigned pending){
+ assert(joined && pending==1); unsigned w=queue-queues;events.push_back(-2-int(w));
+ return failCq && w==0 ? DrainResult{7,0} : DrainResult{0,1};
+}
 namespace kvaf_device {
 constexpr unsigned kInvalidArgs=1;
 void CleanCacheLines(uint8_t*,unsigned long){}
@@ -789,21 +782,27 @@ void KvafBatchGetDevice(Args a,unsigned,unsigned begin,unsigned count){
  events.push_back(int(begin));auto s=(KvafBatchGetCoreStatus*)a.core_status;s->result=0;s->processed_request_count=count;
 }
 }
-void run(unsigned safe,bool failure=false){
- events.clear();joined=false;failJoin=failure;rowValue={1,0};
- for(unsigned w=0;w<4;++w)posts[w]={8,0,0,1,w*100,safe};
+void run(unsigned safe,unsigned early=0,bool joinFailure=false,bool cqFailure=false){
+ events.clear();joined=false;failJoin=joinFailure;failCq=cqFailure;rowValue={1,0};
+ for(unsigned w=0;w<4;++w){posts[w]={8,early>>w&1,0,1,w*100,safe};queues[w]={};}
  unsigned rt_batch=1,rt_finalWorkers=4,rt_finalPostOffset=0,kSlots=8192,b=0;
  Context* ctx=&context;Row* row=&rowValue;
  uint64_t error=0,lastHead=0,lastCq=0;unsigned total=0,completed=0,deferred=0;
 LOOP
  assert(total==32);unsigned index=0;
- if(safe)for(unsigned w=0;w<4;++w)assert(events[index++]==int(w*100));
+ if(safe)for(unsigned w=0;w<4;++w)if(!(early>>w&1))assert(events[index++]==int(w*100));
  assert(events[index++]==-1);
- if(safe<8 && !failure)for(unsigned w=0;w<4;++w)assert(events[index++]==int(w*100+safe));
+ const bool failure=joinFailure || cqFailure;
+ for(unsigned w=0;w<4;++w){
+  if(early>>w&1)assert(events[index++]==-2-int(w));
+  if(safe<8 && !failure)assert(events[index++]==int(w*100+safe));
+  assert(bool(posts[w].pending)==(cqFailure && w==0));
+  assert(bool(queues[w].poisoned)==(cqFailure && w==0));
+ }
  assert(index==events.size());assert(bool(error)==failure);
  if(!failure)for(auto p:posts)assert(!p.deferred);
 }
-int main(){run(8);run(3);run(0);run(3,true);}
+int main(){run(8);run(3);run(0);run(3,0,true);run(8,15);run(3,5);run(3,5,true);run(3,5,false,true);}
 """.replace("LOOP", loop)
     source, exe = tmp_path / "phases.cpp", tmp_path / "phases"
     source.write_text(code)
