@@ -75,6 +75,10 @@ inline void ReplicatedResolve(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc
         if(rank>=ownBegin && rank<ownEnd) {
             int32_t ordinal=asc_ldcg(reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+batch*SIM_RESIDENT+physical);
             uint32_t record=ordinal>=0?uint32_t(ordinal):kLruSlots+rank;
+            // Candidate records live in the prefix, leaving holes in the
+            // extended rank range. Its sole rank owner publishes those holes
+            // before changeCount exposes the range to the Index planner.
+            if(count>candidateCount && ordinal>=0)asc_stcg(changes+kLruSlots+rank,UINT32_MAX);
             asc_stcg(changeSlots+record,physical);asc_stcg(changes+record,token);
             StoreFallbackSource(SIM_HISTORY,kTokenBytes,ctx,batch,dst,token,remote,blocks,offsets);
             asc_stcg(destinations+dst,int32_t(ownerBase+physical));

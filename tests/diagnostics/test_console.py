@@ -304,3 +304,79 @@ sys.argv=["cli", "--report-only", {str(path)!r}]
     assert "FAILED: CQ timeout" in result.stderr
     assert "Failure log: /tmp/retained.log" in result.stderr
     assert "PASS" not in result.stdout
+
+
+def payload_case():
+    mib = 1 << 20
+    return dict(
+        saved_case(),
+        mode="serial",
+        geometry={"token_bytes": 1024},
+        timing={"mean_us": 200.0, "p50_us": 100.0},
+        reads_samples=[
+            dict(bytes=3 * mib, useful_transfer_bytes=2 * mib, cold_demand=512),
+            dict(bytes=5 * mib + 1, useful_transfer_bytes=4 * mib, cold_demand=1536),
+        ],
+        stage_diagnostics={
+            "stages": {"batch_get": {"mean_us": 50.0, "p50_us": 25.0}},
+            "reads_samples": [{"bytes": mib}, {"bytes": 3 * mib}],
+        },
+    )
+
+
+@pytest.mark.parametrize("variants", (False, True))
+def test_payload_rates_use_matching_mean_bytes_and_mean_latency(capsys, variants):
+    from kvip.diagnostics.console import compact_report
+
+    case = payload_case()
+    report = dict(status="pass", cases=[dict(name="before", **case)]) if variants else case
+    compact_report(report)
+    text = capsys.readouterr().out
+    # Actual includes a wasted MiB; useful includes two MiB beyond cold demand.
+    assert "bytes=4,194,304.5" in text
+    assert "actual=4.000 MiB @ 20.972 GB/s; useful=3.000 MiB @ 15.729 GB/s; cold=1.000 MiB @ 5.243 GB/s" in text
+    assert "payload / graph mean (decimal GB/s, not link peak)" in text
+    # Stage bytes differ from full-graph bytes. Neither full bytes nor p50 is its denominator/numerator.
+    assert (
+        "payload / Get stage mean (instrumented) (decimal GB/s, not link peak): actual=2.000 MiB @ 41.943 GB/s" in text
+    )
+
+
+def test_compare_payload_uses_saved_normalized_metrics_and_available_bytes(capsys):
+    from kvip.diagnostics.console import compact_report
+
+    mib = 1 << 20
+    compact_report(
+        dict(
+            status="pass",
+            table={
+                "ubmem-fused": dict(
+                    mean_us=200.0,
+                    p50_us=100.0,
+                    mean_read_bytes=4 * mib,
+                    mean_useful_transfer_bytes=3 * mib,
+                    demand_per_round={"cold_payload_bytes": mib},
+                    graph_normalized_payload_GBps={
+                        "actual_transfers": 4 * mib / 200000,
+                        "useful_transfers": 3 * mib / 200000,
+                        "cold_demand": mib / 200000,
+                    },
+                )
+            },
+        )
+    )
+    text = capsys.readouterr().out
+    assert "bytes=4,194,304" in text
+    assert "actual=4.000 MiB @ 20.972 GB/s; useful=3.000 MiB @ 15.729 GB/s; cold=1.000 MiB @ 5.243 GB/s" in text
+    assert "Get stage mean" not in text
+
+
+def test_get_payload_is_not_inferred_from_uninstrumented_samples(capsys):
+    from kvip.diagnostics.console import compact_report
+
+    case = payload_case()
+    del case["stage_diagnostics"]["reads_samples"]
+    compact_report(case)
+    text = capsys.readouterr().out
+    assert "payload / graph mean" in text and "stage p50 us" in text
+    assert "Get stage mean" not in text

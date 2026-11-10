@@ -200,7 +200,11 @@ int main() {
             }
         }
         assert(output==expected);
-        assert(std::all_of(changes.begin(),changes.begin()+batches*kChangeCapacity,[](uint32_t x){return x==UINT32_MAX;}));
+        for(uint32_t b=0;b<batches;++b) {
+            auto row=changes.begin()+b*kChangeCapacity;
+            assert(std::all_of(row,row+kLruSlots,[](uint32_t x){return x==UINT32_MAX;}));
+            assert(std::all_of(row+kLruSlots,row+kChangeCapacity,[](uint32_t x){return x==91;}));
+        }
 #if !MODEL_URMA
         assert(std::all_of(selected.begin(),selected.begin()+batches*kSlots,[](uint32_t x){return x==UINT32_MAX;}));
 #endif

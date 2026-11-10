@@ -148,6 +148,10 @@ inline void ReplicatedResolve(uint32_t rt_history,uint32_t rt_resident,uint32_t 
         uint32_t dst=batch*kSlots+ownBegin+index;
         uint64_t remote=asc_ldcg(addresses+token);
         uint32_t record=ordinal>=0?uint32_t(ordinal):kLruSlots+rank;
+        // The extended count includes candidate ranks whose actual record is
+        // in the prefix. Publish their holes here instead of clearing 8192
+        // unused records at init; each rank has exactly one final worker.
+        if(count>candidateCount && ordinal>=0)asc_stcg(changes+kLruSlots+rank,UINT32_MAX);
         asc_stcg(changeSlots+record,slot);asc_stcg(changes+record,token);
         StoreFallbackSource(rt_history,rt_tokenBytes,ctx,batch,dst,token,remote,blocks,offsets);
         asc_stcg(destinations+dst,int32_t(ownerBase+slot));

@@ -69,8 +69,10 @@ uint32_t GetBlockIdx(){return block;}
 bool publicationReady=false;
 bool allPlansComplete=false;
 uintptr_t errorsBegin=0,errorsEnd=0;
+uintptr_t unpublishedBegin=0,unpublishedEnd=0;
 std::vector<std::pair<uintptr_t,uintptr_t>> watched;
 template<class T>T asc_ldcg(T* p) {
+    assert(uintptr_t(p)<unpublishedBegin || uintptr_t(p)>=unpublishedEnd);
     for(auto range:watched)if(uintptr_t(p)>=range.first && uintptr_t(p)<range.second)assert(publicationReady);
     if(uintptr_t(p)>=errorsBegin && uintptr_t(p)<errorsEnd)
         assert(allPlansComplete || (uintptr_t(p)-errorsBegin)/sizeof(uint32_t)==block);
@@ -159,6 +161,7 @@ Result Run(uint32_t mode,uint32_t fault) {
         status[b*kUbmemStatusWords+2]=1;info[b*kRowStatusWords+1]=2;
         for(uint32_t i=0;i<kLruSlots;++i)lru[b*kLruSlots+i]=changeSlots[b*kChangeCapacity+i]=i;
         changes[b*kChangeCapacity]=SIM_RESIDENT+7;
+        std::fill(changes.begin()+b*kChangeCapacity+kLruSlots,changes.begin()+(b+1)*kChangeCapacity,37U);
         for(uint32_t w=0;w<kFinalWorkers;++w) {
             auto post=FinalPostAt(&ctx,b*kFinalWorkers+w);post->count=post->head=w<2?1:0;
         }
@@ -185,6 +188,13 @@ Result Run(uint32_t mode,uint32_t fault) {
         case 14: // No final reads, but one valid prefetch completion.
             for(uint32_t w=0;w<kFinalWorkers;++w)FinalPostAt(&ctx,w)->count=FinalPostAt(&ctx,w)->head=0;
             info[1]=0;rows[0].finalPending=0;break;
+    }
+    // Failed partial final planning may expose a stale high-water mark. The
+    // completion error must gate extended planning before any suffix read.
+    if(fault>=1 && fault<=11) {
+        counts[0]=kChangeCapacity;
+        unpublishedBegin=uint64_t(changes.data()+kLruSlots);
+        unpublishedEnd=uint64_t(changes.data()+kChangeCapacity);
     }
     uint64_t bindings[15]{};bindings[14]=uint64_t(&ctx);
     uint64_t a[28]{};a[4]=uint64_t(changeSlots.data());a[5]=uint64_t(changes.data());a[6]=uint64_t(errors.data());
@@ -223,7 +233,7 @@ Result Run(uint32_t mode,uint32_t fault) {
     assert((errors[0]==0)==(completedSuccessfully && fault!=12));
     if(!errors[0])assert(plan[0]>0);
     if(fault!=10 && fault!=11)assert(errors[1]==0); // Failed row never poisons another owner.
-    watched.clear();
+    watched.clear();unpublishedBegin=unpublishedEnd=0;
     Result result;result.rows.resize(rows.size()*sizeof(Row));
     std::memcpy(result.rows.data(),rows.data(),result.rows.size());
     result.info=info;result.hot=hot;result.errors=errors;result.plan=plan;result.status=status;result.output=output;return result;

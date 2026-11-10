@@ -118,16 +118,54 @@ def _read_means(case):
     }
 
 
-def _case(name, timing, stages, reads, tuning=None):
+def _payload_bytes(reads, token_bytes=None):
+    result = {
+        name: reads[key]
+        for name, key in (("actual_transfers", "bytes"), ("useful_transfers", "useful_transfer_bytes"))
+        if key in reads
+    }
+    if token_bytes is not None and "cold_demand" in reads:
+        result["cold_demand"] = reads["cold_demand"] * token_bytes
+    return result
+
+
+def _payload_bandwidth(label, duration_us, payload, rates=None):
+    if not payload:
+        return
+    if not math.isfinite(duration_us) or duration_us <= 0:
+        raise ValueError("Invalid saved payload timing")
+    values = []
+    for key, name in (("actual_transfers", "actual"), ("useful_transfers", "useful"), ("cold_demand", "cold")):
+        if key not in payload:
+            continue
+        size = payload[key]
+        rate = (rates or {}).get(key, size / (duration_us * 1000))
+        if not math.isfinite(size) or size < 0 or not math.isfinite(rate) or rate < 0:
+            raise ValueError("Invalid saved payload bytes or rate")
+        values.append(f"{name}={size / (1 << 20):.3f} MiB @ {rate:.3f} GB/s")
+    emit(f"  {label} (decimal GB/s, not link peak): " + "; ".join(values))
+
+
+def _case(name, timing, stages, reads, tuning=None, *, token_bytes=None, payload=None, payload_rates=None):
     if not all(math.isfinite(timing[key]) and timing[key] > 0 for key in ("mean_us", "p50_us")):
         raise ValueError(f"Invalid saved timing: {name}")
     if tuning is not None:
         emit(f"CONFIG {name}: {json.dumps(tuning, sort_keys=True)}")
     emit(f"{name}: device graph mean={timing['mean_us']:.3f} us p50={timing['p50_us']:.3f} us")
     keys = ("prefetch", "final", "unused_prefetch", "bytes", "cold_demand", "candidate_hot_refetch")
-    values = [f"{key}={reads[key]:g}" for key in keys if key in reads]
+    values = [
+        f"{key}=" + (f"{reads[key]:,.3f}".rstrip("0").rstrip(".") if key == "bytes" else f"{reads[key]:g}")
+        for key in keys
+        if key in reads
+    ]
     if values:
         emit("  reads/round mean: " + ", ".join(values))
+    _payload_bandwidth(
+        "payload / graph mean",
+        timing["mean_us"],
+        {**_payload_bytes(reads, token_bytes), **(payload or {})},
+        payload_rates,
+    )
     categories = ("cold", "candidate_hot", "other_hot", "abc")
     if "prefetch_cold" in reads:
         emit(
@@ -138,11 +176,18 @@ def _case(name, timing, stages, reads, tuning=None):
             )
             + f"; unclassified={reads.get('prefetch_unclassified', 0):g}"
         )
-    stages = (stages or {}).get("stages", {})
-    if stages:
+    stage_details = stages or {}
+    stage_times = stage_details.get("stages", {})
+    if stage_times:
         emit(
             "  stage p50 us (instrumented): "
-            + ", ".join(f"{name}={value['p50_us']:.3f}" for name, value in stages.items())
+            + ", ".join(f"{name}={value['p50_us']:.3f}" for name, value in stage_times.items())
+        )
+    get_mean = stage_times.get("batch_get", {}).get("mean_us")
+    stage_reads = _read_means(stage_details)
+    if get_mean is not None and "bytes" in stage_reads:
+        _payload_bandwidth(
+            "payload / Get stage mean (instrumented)", get_mean, {"actual_transfers": stage_reads["bytes"]}
         )
 
 
@@ -178,7 +223,12 @@ def compact_report(report, *, path=None):
                 raise ValueError("Saved report has no measured cases")
             for case in report["cases"]:
                 _case(
-                    case["name"], case["timing"], case.get("stage_diagnostics"), _read_means(case), case.get("tuning")
+                    case["name"],
+                    case["timing"],
+                    case.get("stage_diagnostics"),
+                    _read_means(case),
+                    case.get("tuning"),
+                    token_bytes=case.get("geometry", report.get("geometry", {})).get("token_bytes"),
                 )
                 _candidate_call(case)
             baseline = report["cases"][0]
@@ -203,6 +253,20 @@ def compact_report(report, *, path=None):
                         **({"bytes": row["mean_read_bytes"]} if "mean_read_bytes" in row else {}),
                     ),
                     row.get("tuning"),
+                    token_bytes=report.get("geometry", {}).get("token_bytes"),
+                    payload={
+                        **(
+                            {"useful_transfers": row["mean_useful_transfer_bytes"]}
+                            if "mean_useful_transfer_bytes" in row
+                            else {}
+                        ),
+                        **(
+                            {"cold_demand": row["demand_per_round"]["cold_payload_bytes"]}
+                            if "cold_payload_bytes" in row.get("demand_per_round", {})
+                            else {}
+                        ),
+                    },
+                    payload_rates=row.get("graph_normalized_payload_GBps"),
                 )
             for name, value in report.get("fusion_vs_serial", {}).items():
                 emit(
@@ -216,6 +280,7 @@ def compact_report(report, *, path=None):
                 report.get("stage_diagnostics"),
                 _read_means(report),
                 report.get("tuning"),
+                token_bytes=report.get("geometry", {}).get("token_bytes"),
             )
             _candidate_call(report)
         else:

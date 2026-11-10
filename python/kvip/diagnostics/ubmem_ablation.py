@@ -199,7 +199,8 @@ def run_ablation(args, archive, retained):
     context = replay_measure.allocate_context(args, archive, retained)
     cases = []
     for name, tuning, case_archive in plans:
-        emit(f"CASE_BEGIN {args.transport}-{name}: {tuning}")
+        detail = "" if getattr(args, "quiet", False) else f": {tuning}"
+        emit(f"CASE_BEGIN {args.transport}-{name}{detail}")
         case_args = copy(args)
         case_args.fused_tuning = tuning
         result = replay_measure.measure_case(case_args, case_archive, context, retained)

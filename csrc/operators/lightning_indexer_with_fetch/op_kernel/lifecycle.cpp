@@ -151,7 +151,9 @@ __aicore__ inline uint64_t InitializeRound(uint32_t rt_batch,uint32_t rt_history
     Duplicate(local,UINT32_MAX,4096);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     FillRoundWords(ctx->mapping+uint64_t(b)*rt_history*4,rt_history,local);
-    if(ctx->changes)FillRoundWords(ctx->changes+b*kChangeCapacity*4,kChangeCapacity,local);
+    // Prefetch may leave candidate holes. Final resolver owns every extended
+    // rank it publishes, including the sentinel holes below its high-water mark.
+    if(ctx->changes)FillRoundWords(ctx->changes+b*kChangeCapacity*4,kLruSlots,local);
     uint64_t reservedRow=0;
 #if V9_COMPACT_RESERVED
     reservedRow=ClearReservedHot(ctx->lruSlots,ctx->reservedHot,ctx->queryEnds,b,rt_resident,local);

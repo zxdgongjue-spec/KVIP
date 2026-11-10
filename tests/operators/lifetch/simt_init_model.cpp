@@ -115,7 +115,8 @@ int main() {
             assert(std::all_of(values->end()-guard,values->end(),[](uint32_t x){return x==91;}));
             Hash(values->data(),values->size()*4);
         }
-        for(uint32_t i=0;i<B*kChangeCapacity;++i)assert(changes[i]==UINT32_MAX);
+        for(uint32_t b=0;b<B;++b)for(uint32_t i=0;i<kChangeCapacity;++i)
+            assert(changes[b*kChangeCapacity+i]==(i<kLruSlots?UINT32_MAX:91));
         for(uint32_t i=0;i<B*kSlots;++i)assert(selected[i]==(MODEL_URMA?91:UINT32_MAX));
         assert(std::all_of(map.end()-guard,map.end(),[](uint32_t x){return x==91;}));
         for(uint32_t i=0;i<sizeof(Row);++i)assert(reinterpret_cast<unsigned char*>(rows.data()+B)[i]==0x5a);

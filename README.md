@@ -558,6 +558,34 @@ Two further switches remain opt-in, with all new work included in graph timing:
   remains a later kernel. Resident lengths above 16384 or batches above 32
   retain the original path; invalid/padding output behavior is unchanged.
 
+Node24 NPU4's `51efb06` four-path run measured device means of 679.101 us
+(UBmem serial), 586.706 us (URMA serial, 32 workers/post32/inflight0),
+670.706 us (UBmem fused, single plan plus staged outputs), and 515.975 us
+(URMA fused, staged outputs). Fusion reduced latency by 1.24% and 12.06%,
+respectively; neither met the 35% target. UBmem output diagnostics fell to
+16.427 us, but its split plan/fetch diagnostics were 47.976/172.170 us.
+These are instrumented stages, not additive full-graph components. The large
+URMA final-Get change across runs does not establish that output staging
+overlapped that Get: this configuration still submits final Get after Index.
+
+The next UBmem comparison retains staged outputs and separately tests removing
+the extra single-plan launch, then enabling the existing `ordered_pair` path.
+The latter assigns each copy worker a contiguous rank range and can coalesce
+reverse-ordered source pairs after swapping both sources and destinations.
+It preserves payload bytes and destination ownership; window copies use the
+same pair logic, so prefetch timing and waste may change. This needs device
+measurement; prior ordered-pair results also enabled the regressing merged
+Index path and did not isolate copy performance.
+
+Round initialization now fills only the 2048 candidate change records. Final
+resolver writers publish all extended records that Index can read, including
+sentinel holes for ranks whose actual changes live in the candidate prefix.
+This removes 512 KiB of initialization writes for B16 (the original one-worker
+init removes 32 fill commands), while adding bounded sentinel writes in the
+resolver. It preserves replayed state, empty/error handling and the existing
+Index high-water mark. It is a small reduction of redundant work, not evidence
+that the whole init diagnostic interval can be eliminated.
+
 Use `replay --quiet` or `compare --quiet` to print only progress, effective
 tuning, correctness, timing, read counts and stage diagnostics. Successful
 native build/link chatter is discarded; failures retain the log and show its
@@ -565,6 +593,11 @@ last 80 lines. Reprint a saved result without rebuilding or touching an NPU:
 `python -m kvip.diagnostics.replay --report-only /absolute/path/result.json`
 (the same option on `compare` reads its `summary.json`). Full result JSON still
 contains the measurements; compact output does not change timing boundaries.
+Compact reports also show actual, useful (excluding unused prefetch), and cold
+payload MiB and decimal GB/s normalized by the same full-graph mean. These
+are operator-chain throughput figures, not hardware bandwidth. A separate
+instrumented serial Get rate is shown only when that stage has its own byte
+samples and mean time; full-graph bytes and stage p50 are never mixed.
 
 Replay readback additionally classifies actual prefetch and unused prefetch
 against each request's frozen initial cold, candidate-hot, other-hot and ABC

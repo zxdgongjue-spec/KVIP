@@ -456,7 +456,24 @@ def _check_hot_resolver(tmp_path, transport, *, tagged=False, single_plan=False)
     template = (
         "template<unsigned Threads,bool PlanOnly=false>" if transport == "ubmem" else "template<unsigned Threads>"
     )
-    functions += "\n" + template + "\n" + function(resolver, "ReplicatedResolve")
+    resolve = function(resolver, "ReplicatedResolve")
+    functions += "\n" + template + "\n" + resolve
+    # Reference the previous producer: full sentinel init, with no per-rank
+    # sentinel publication. Everything else is the same actual resolver body.
+    baseline = resolve.replace(
+        "if(count>candidateCount && ordinal>=0)asc_stcg(changes+kLruSlots+rank,UINT32_MAX);", ""
+    ).replace("ReplicatedResolve(", "BaselineResolve(", 1)
+    functions += "\n" + template + "\n" + baseline
+    planner = ROOT / "csrc/operators/common/lifetch/index_cache_update.h"
+    functions += """
+constexpr unsigned kPlanCandidates=2048,kPlanHash=8192,kPlanRecords=4096,kPlanWords=24576;
+constexpr unsigned kExtendedCandidates=10240,kExtendedRecords=20480,kExtendedHash=16384;
+constexpr unsigned kTransferHeaderWords=8,kInvalidateHot=0x80000000U;
+"""
+    for name in ("PlanHash", "PlanInsert", "PlanContains", "ExtendedInsert", "ExtendedContains"):
+        functions += "\n" + function(planner, name)
+    for name in ("PlanPrefix", "BuildUpdatePlan", "BuildExtendedPlan", "PublishUpdatePlan", "PublishExtendedPlan"):
+        functions += "\ntemplate<unsigned Threads>\n" + function(planner, name)
     source = r"""
 #include <cstdint>
 #include <vector>
@@ -488,14 +505,25 @@ unsigned asc_shfl_up(unsigned v,unsigned){return v;}
 void asc_syncthreads(){} void asc_threadfence(){}
 #include "mapping.h"
 FUNCTIONS
+std::vector<unsigned> Plan(std::vector<unsigned>& slots,std::vector<unsigned>& changes,unsigned count,unsigned h,unsigned r){
+ std::vector<unsigned> work(2*kExtendedHash),status(128),records(2*kExtendedRecords),plan(8+2*kExtendedRecords);
+ if(count<=kPlanCandidates){BuildUpdatePlan<1>(slots.data(),changes.data(),h,r,work.data(),status.data());
+  assert(!status[0]);PublishUpdatePlan<1>(work.data(),status.data(),plan.data(),r);}
+ else{BuildExtendedPlan<1>(slots.data(),changes.data(),count,h,r,work.data(),status.data(),records.data());
+  assert(!status[0]);PublishExtendedPlan<1>(records.data(),status.data(),plan.data(),r);}
+ plan.resize(8+2*plan[0]);return plan;
+}
 int main(){
  std::mt19937 rng(71);
- for(unsigned trial=0;trial<27;++trial){
+ for(unsigned trial=0;trial<30;++trial){
   const unsigned h=32768,r=trial%2?16384:8192,workers=4,used=trial%3?512:0;
   std::vector<unsigned> candidates(r);std::iota(candidates.begin(),candidates.end(),0);
   std::shuffle(candidates.begin(),candidates.end(),rng);candidates.resize(2048);
   std::vector<int32_t> reserved(r,-1);for(unsigned i=0;i<2048;++i)reserved[candidates[i]]=i;
   std::vector<unsigned> map(h,UINT32_MAX),changes(kChangeCapacity,UINT32_MAX),changeSlots(kChangeCapacity);
+  // Previous requests leave arbitrary valid-looking tokens/slots in suffixes.
+  // Only the candidate prefix is initialized by the new production init.
+  std::fill(changes.begin()+kLruSlots,changes.end(),37U);
   std::copy(candidates.begin(),candidates.end(),changeSlots.begin());
   for(unsigned i=0;i<used;++i){map[r+i]=r+i;changes[i]=r+i;}
   std::vector<unsigned> selected(8192),base(h),hotValid(r,trial%4!=0);
@@ -510,6 +538,9 @@ int main(){
   if(trial==25)for(unsigned i=0;i<8192;++i)selected[i]=r+i%used; // All prefetch hits.
   if(trial==26){std::vector<unsigned> hot;for(unsigned i=0;i<r;++i)if(reserved[i]<0)hot.push_back(i);
    for(unsigned i=0;i<8192;++i)selected[i]=hot[i%hot.size()];} // All untouched hot hits.
+  if(trial==27)std::fill(selected.begin(),selected.end(),UINT32_MAX); // Padding-only row.
+  if(trial==28){for(unsigned i=0;i<8192;++i)selected[i]=r+i;candidates[0]=r;} // Invalid victim.
+  if(trial==29){std::fill(selected.begin(),selected.end(),UINT32_MAX);selected[0]=h;} // Invalid token.
   std::vector<uint64_t> addresses(h),remote(8192);std::iota(addresses.begin(),addresses.end(),100000);
   std::vector<int32_t> blocks(8192),offsets(8192),destinations(8192);
   Context ctx{};unsigned changeCount=2048,total=0;
@@ -529,6 +560,7 @@ int main(){
    ReplicatedResolve<1>(h,r,workers,656,selected.data(),locations.data(),positions.data(),cold,
     keys.data(),ranks.data(),ids.data(),slots.data(),cfg.data(),map.data(),addresses.data(),
     blocks.data(),offsets.data(),destinations.data(),&total,w,used,0,&ctx);
+   if(trial>=28){assert(cfg[1]);break;}
    assert(cfg[1]==0);
    assert(cfg[5]<=cfg[3]);
    for(unsigned i=0;i<cfg[3];++i){
@@ -538,13 +570,47 @@ int main(){
    }
    std::copy(locations.begin()+w*2048,locations.begin()+(w+1)*2048,output.begin()+w*2048);
   }
+  if(trial>=28){
+   const unsigned expectedError=cfg[1];
+   assert(total==0 && changeCount==2048);
+   assert(std::all_of(changes.begin()+kLruSlots,changes.end(),[](unsigned x){return x==37;}));
+   locations=selected;
+   for(unsigned i=0;i<cold;++i)locations[positions[i]]=r;
+   BaselineResolve<1>(h,r,workers,656,selected.data(),locations.data(),positions.data(),cold,
+    keys.data(),ranks.data(),ids.data(),slots.data(),cfg.data(),map.data(),addresses.data(),
+    blocks.data(),offsets.data(),destinations.data(),&total,0,used,0,&ctx);
+   assert(cfg[1]==expectedError && total==0 && changeCount==2048);
+   continue; // Production rowStatus prevents Index planning on this error.
+  }
   std::vector<unsigned> ownership(r),seen(r);std::iota(ownership.begin(),ownership.end(),0);
-  for(unsigned i=0;i<kChangeCapacity;++i)if(changes[i]!=UINT32_MAX){assert(changeSlots[i]<r);assert(!seen[changeSlots[i]]++);ownership[changeSlots[i]]=changes[i];}
+  for(unsigned i=0;i<changeCount;++i)if(changes[i]!=UINT32_MAX){assert(changeSlots[i]<r);assert(!seen[changeSlots[i]]++);ownership[changeSlots[i]]=changes[i];}
   for(unsigned i=0;i<8192;++i){if(selected[i]==UINT32_MAX){assert(output[i]==UINT32_MAX);continue;}
    if(abc && selected[i]>=h-384){assert(output[i]==r+selected[i]%384);continue;}
    assert(output[i]<r);assert(ownership[output[i]]==selected[i]);}
   for(unsigned i=0;i<total;++i){assert(unsigned(destinations[i])<r);assert(remote[i]==addresses[ownership[destinations[i]]]);}
   assert(changeCount<=kChangeCapacity);
+  const auto actualChanges=changes,actualSlots=changeSlots,actualPlan=Plan(changeSlots,changes,changeCount,h,r);
+  const auto actualRemote=remote;const auto actualBlocks=blocks,actualOffsets=offsets,actualDestinations=destinations;
+  const unsigned actualTotal=total,actualChangeCount=changeCount;
+  std::fill(changes.begin(),changes.end(),UINT32_MAX);std::fill(changeSlots.begin(),changeSlots.end(),0);
+  std::copy(candidates.begin(),candidates.end(),changeSlots.begin());
+  for(unsigned i=0;i<used;++i)changes[i]=r+i;
+  total=0;changeCount=2048;
+  for(unsigned w=0;w<workers;++w){
+   cold=0;locations=selected;
+   for(unsigned i=0;i<8192;++i){unsigned t=selected[i];
+    if(t!=UINT32_MAX && (t>=r || !hotValid[t] || reserved[t]>=0)){positions[cold++]=i;locations[i]=r;}}
+   BaselineResolve<1>(h,r,workers,656,selected.data(),locations.data(),positions.data(),cold,
+    keys.data(),ranks.data(),ids.data(),slots.data(),cfg.data(),map.data(),addresses.data(),
+    blocks.data(),offsets.data(),destinations.data(),&total,w,used,0,&ctx);
+   assert(cfg[1]==0);
+   assert(std::equal(locations.begin()+w*2048,locations.begin()+(w+1)*2048,output.begin()+w*2048));
+  }
+  assert(total==actualTotal && changeCount==actualChangeCount);
+  for(unsigned i=0;i<changeCount;++i){assert(changes[i]==actualChanges[i]);
+   if(changes[i]!=UINT32_MAX)assert(changeSlots[i]==actualSlots[i]);}
+  assert(Plan(changeSlots,changes,changeCount,h,r)==actualPlan);
+  assert(remote==actualRemote && blocks==actualBlocks && offsets==actualOffsets && destinations==actualDestinations);
  }
 }
 """.replace("FUNCTIONS", functions)
@@ -568,6 +634,7 @@ int main(){
         ]
         source = source.replace("r=trial%2?16384:8192", "r=SIM_RESIDENT")
         source = source.replace("ReplicatedResolve<1>(h,r,workers,656,", "ReplicatedResolve<1>(")
+        source = source.replace("BaselineResolve<1>(h,r,workers,656,", "BaselineResolve<1>(")
         begin = source.index("   assert(cfg[5]<=cfg[3]);")
         end = source.index("   std::copy(locations.begin()", begin)
         source = source[:begin] + source[end:]
@@ -578,6 +645,7 @@ int main(){
   const auto expectedRemote=remote;const auto expectedBlocks=blocks,expectedOffsets=offsets,expectedDestinations=destinations;
   const unsigned expectedTotal=total,expectedChangeCount=changeCount;
   std::fill(changes.begin(),changes.end(),UINT32_MAX);std::fill(changeSlots.begin(),changeSlots.end(),0);
+  std::fill(changes.begin()+kLruSlots,changes.end(),37U);
   std::copy(candidates.begin(),candidates.end(),changeSlots.begin());
   for(unsigned i=0;i<used;++i)changes[i]=r+i;
   std::fill(remote.begin(),remote.end(),0);std::fill(blocks.begin(),blocks.end(),0);

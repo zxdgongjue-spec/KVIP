@@ -171,7 +171,7 @@ int main() {
     std::vector<uint32_t> lru(kCandidates), changes(kCandidates,UINT32_MAX);
     std::iota(lru.begin(),lru.end(),0);
     changes[7]=5000;
-    std::vector<uint32_t> work(kPlanWords+128), plan(kTransferPlanWords);
+    std::vector<uint32_t> work(2*kExtendedHash+128), plan(kExtendedTransferWords);
     std::vector<uint32_t> rows(256), rowStatus(32), posts(2*32), valid(2*resident,1);
     std::vector<uint64_t> prefetch(2*statusBytes/8), final(2*statusBytes/8);
     uint32_t error=0, owner=1;
@@ -197,6 +197,13 @@ int main() {
         *fault=1;
         Update<false, false>(a,0,owner,true,work.data());
         assert(error!=0 && plan[0]==0);
+        // A partial/failed resolver may leave an extended high-water mark and
+        // stale suffix. Error gating must reject it before reading any suffix
+        // or extended workspace (the latter deliberately remains null here).
+        count=kExtendedCandidates;
+        Update<false, true>(a,0,owner,true,work.data());
+        assert(error!=0 && plan[0]==0);
+        count=kPlanCandidates;
         *fault=0;
     }
     error=0;

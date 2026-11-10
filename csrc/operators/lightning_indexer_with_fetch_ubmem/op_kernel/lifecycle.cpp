@@ -94,7 +94,9 @@ __aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     if(generation.clear)FillWords(ctx->mapping+uint64_t(b)*SIM_HISTORY*4,SIM_HISTORY,local);
     FillWords(ctx->selected+uint64_t(b)*kSlots*4,kSlots,local);
-    if(ctx->changes)FillWords(ctx->changes+b*kChangeCapacity*4,kChangeCapacity,local);
+    // Only prefetch candidate holes need a round-wide sentinel fill. Resolver
+    // publishes every extended rank below changeCount before Index consumes it.
+    if(ctx->changes)FillWords(ctx->changes+b*kChangeCapacity*4,kLruSlots,local);
     uint64_t reservedRow=0;
 #if V9_COMPACT_RESERVED
     reservedRow=ClearReservedHot(ctx->lruSlots,ctx->reservedHot,ctx->queryEnds,b,SIM_RESIDENT,local);
@@ -162,7 +164,7 @@ __aicore__ inline void InitializeRoundParallel(__gm__ Context* ctx,uint32_t b,ui
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     auto map=PartitionInitWords<SIM_HISTORY>(part,kInitWorkersPerBatch);
     auto selected=PartitionInitWords<kSlots>(part,kInitWorkersPerBatch);
-    auto changes=PartitionInitWords<kChangeCapacity>(part,kInitWorkersPerBatch);
+    auto changes=PartitionInitWords<kLruSlots>(part,kInitWorkersPerBatch);
     FillWords(ctx->mapping+(uint64_t(b)*SIM_HISTORY+map.begin)*4,map.end-map.begin,local);
     FillWords(ctx->selected+(uint64_t(b)*kSlots+selected.begin)*4,selected.end-selected.begin,local);
     if(ctx->changes)FillWords(ctx->changes+(uint64_t(b)*kChangeCapacity+changes.begin)*4,changes.end-changes.begin,local);
