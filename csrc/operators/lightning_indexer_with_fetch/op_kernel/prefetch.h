@@ -590,23 +590,9 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
     progressGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress));
     auto work=flags.ReinterpretCast<uint32_t>();
     const uint32_t windowEnd=Trigger(rt_history,rt_resident,rt_rounds,epoch)*128;
-    if (sequenceHalfWindow && epoch) {
-        // The owner has published its half. Join the same two queries on
-        // its sibling shard before taking the batch-wide ready snapshot.
-        const uint32_t peerShard=1-core%2;
-        const uint32_t peerEnd=windowEnd-(peerShard==0 ? sequenceHalfWindow : 0);
-        const uint32_t firstQuery=(core/2)*4+(lane%2)*2;
-        const uint32_t peerProgress=firstQuery*32+peerShard*16;
-        DataCopyExtParams gather{2,32,96,0,0};
-        DataCopyPadExtParams<uint32_t> padding{false,0,0,0};
-        do {
-            SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
-            WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
-            DataCopyPad(work,progressGm[peerProgress],gather,padding);
-            SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
-            WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-        } while (work.GetValue(0)<peerEnd || work.GetValue(8)<peerEnd);
-    }
+    // Each shard publishes an independent ready boundary. Snapshot whatever
+    // has completed; the final resolver repairs selected tokens that were not
+    // prefetched. Waiting for another shard here can stall its producer.
     V9_FETCH_PROFILE(event->begin=GetSystemCycle();)
     uint64_t postedCount=0; // Business state: controls batched WQE submission.
     V9_FETCH_PROFILE(uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0;)

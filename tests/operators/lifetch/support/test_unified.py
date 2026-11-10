@@ -42,3 +42,21 @@ def test_ubmem_requires_correctness_and_timing_markers(monkeypatch, tmp_path):
     assert 'PASS: transport=ubmem' in next((tmp_path / 'out').glob('*/summary.log')).read_text()
     with pytest.raises(SystemExit):
         module.main(args + ['--intermediate-fetches', '4'])
+
+
+def test_urma_timeout_is_forwarded(monkeypatch, tmp_path):
+    commands = []
+    monkeypatch.setattr(module.subprocess, 'call', lambda command: commands.append(command) or 0)
+    assert module.main(['--transport', 'urma', '--kvaf-server', 'host:1', '--kvaf-root', str(tmp_path),
+                        '--timeout-seconds', '90']) == 0
+    command = commands[0]
+    assert command[command.index('--timeout-seconds') + 1] == '90'
+
+
+def test_supervisor_reports_timeout(tmp_path):
+    import sys
+    from runner import supervise
+
+    assert supervise([sys.executable, '-c', 'import time; time.sleep(30)'], tmp_path,
+                     heartbeat_seconds=0.1, timeout_seconds=0.3) == 1
+    assert 'timeout=0.3s' in (tmp_path / 'summary.log').read_text()

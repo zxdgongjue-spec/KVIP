@@ -21,6 +21,7 @@ from runner import progress, supervise  # noqa: E402
 def arguments(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--worker-run", type=Path, help=argparse.SUPPRESS)
+    p.add_argument("--timeout-seconds", type=int, default=300)
     p.add_argument("--device", type=int, default=0)
     p.add_argument("--kvaf-server", required=True)
     p.add_argument("--kvaf-root", type=Path)
@@ -122,7 +123,7 @@ def run_urma(argv=None):
         "--worker-run",
         str(run),
     ]
-    return supervise(command, run)
+    return supervise(command, run, timeout_seconds=args.timeout_seconds)
 
 
 
@@ -153,7 +154,7 @@ def main(argv=None):
     p.add_argument('--comparison-output', type=Path)
     p.add_argument('--comparison-sfa', type=Path)
     p.add_argument('--output', type=Path, default=ROOT / 'tests/results/lifetch')
-    p.add_argument('--timeout-seconds', type=int, default=1800)
+    p.add_argument('--timeout-seconds', type=int, default=300)
     a = p.parse_args(argv)
     try:
         batches = [int(x) for x in a.batches.split(',')]
@@ -179,7 +180,7 @@ def main(argv=None):
         command = [sys.executable, '-u', str(Path(__file__).resolve()), '--internal-urma', *common,
                    '--kvaf-root', str(kvaf_root), '--cann', a.cann, '--batches', a.batches,
                    '--intermediate-fetches', str(a.intermediate_fetches), '--trace-rounds', str(a.trace_rounds),
-                   '--output', str(a.output)]
+                   '--output', str(a.output), '--timeout-seconds', str(a.timeout_seconds)]
         if a.soc:
             command += ['--soc', a.soc]
         if a.runtime_shapes:

@@ -32,7 +32,7 @@ for miss in 10 30 50; do
                 --history 131072 --resident 16384 --index-heads 32 \
                 --intermediate-fetches 8 --prefetch-tokens 512 \
                 --miss-percent "$miss" --warmup 4 --iterations 20 \
-                --trace-rounds 0 --output "$run/$version-$miss"
+                --trace-rounds 0 --timeout-seconds 240 --output "$run/$version-$miss"
         ) 2>&1 | tee "$run/$version-$miss.log"
     done
 done
