@@ -30,6 +30,7 @@ for mode in baseline classify; do
     --soc-version=Ascend950PR_9599 --output="$run/$mode" --launch-count=1 --timeout=1200 > "$run/$mode.log" 2>&1
   grep -E 'REAL_TOPK|core[0-9]+\.veccore[0-9]+' "$run/$mode.log"
 done
+python3 "$repo/tests/operators/lifetch/simulator/real_topk/check_trace.py" "$run/classify" | tee "$run/synchronization.log"
 python3 - "$run" <<'PY'
 import re
 import sys
