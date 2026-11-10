@@ -101,6 +101,15 @@ def summarize_case(case):
                 "abc_hit",
                 "selected_read_demand",
                 "cold_miss_rate",
+                "prefetch_cold",
+                "prefetch_candidate_hot",
+                "prefetch_other_hot",
+                "prefetch_abc",
+                "prefetch_unclassified",
+                "unused_prefetch_cold",
+                "unused_prefetch_candidate_hot",
+                "unused_prefetch_other_hot",
+                "unused_prefetch_abc",
             )
             if key in reads[0]
         },
@@ -129,6 +138,15 @@ def print_summary(report, output=None):
                 f"candidate_hot={row['candidate_hot_refetch']:g}, selected_union={row['selected_unique']:g}; "
                 f"cold/selected_union={row['cold_miss_rate']:.4%}; "
                 f"useful_transfers={row['useful_transfers']:g} (includes hot refetch, not pure cold)"
+            )
+        if "prefetch_cold" in row:
+            print(
+                f"  prefetch initial residency: cold={row['prefetch_cold']:g}, "
+                f"candidate_hot={row['prefetch_candidate_hot']:g}, other_hot={row['prefetch_other_hot']:g}, "
+                f"abc={row['prefetch_abc']:g}, unclassified={row['prefetch_unclassified']:g}; "
+                f"unused: cold={row['unused_prefetch_cold']:g}, "
+                f"candidate_hot={row['unused_prefetch_candidate_hot']:g}, "
+                f"other_hot={row['unused_prefetch_other_hot']:g}, abc={row['unused_prefetch_abc']:g}"
             )
     for case in report.get("cases", []):
         stages = case.get("stage_diagnostics", {}).get("stages", {})

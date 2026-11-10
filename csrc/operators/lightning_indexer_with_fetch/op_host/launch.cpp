@@ -32,6 +32,9 @@ extern "C" uint32_t v9_final_replicated(const rotating::RuntimeShape* shape) { r
 extern "C" uint32_t v9_token_bytes(const rotating::RuntimeShape* shape) { return shape->tokenBytes; }
 extern "C" uint32_t v9_parallel_final(const rotating::RuntimeShape* shape) { return V9_URMA_PARALLEL_FINAL; }
 extern "C" uint32_t v9_async_final(const rotating::RuntimeShape* shape) { return V9_URMA_ASYNC_FINAL; }
+extern "C" uint32_t v9_cold_only_prefetch(const rotating::RuntimeShape* shape) { return V9_COLD_ONLY_PREFETCH; }
+extern "C" uint32_t v9_threshold_only(const rotating::RuntimeShape* shape) { return V9_THRESHOLD_ONLY; }
+extern "C" uint32_t v9_simt_init(const rotating::RuntimeShape* shape) { return V9_SIMT_INIT; }
 
 #if V9_RESOLVER_COMPARE
 ENTRY(resolve_original,shape->finalCores)

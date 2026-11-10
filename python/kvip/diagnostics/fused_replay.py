@@ -172,7 +172,7 @@ def validate_fused_tuning(overrides, transport):
     """Reject options that the selected backend cannot actually apply."""
     if transport not in ("ubmem", "urma") or not isinstance(overrides, dict):
         raise ValueError("Fusion tuning requires a JSON object and ubmem/urma transport")
-    booleans = {"compact_reserved"}
+    booleans = {"compact_reserved", "cold_only_prefetch", "threshold_only", "simt_init"}
     if transport == "ubmem":
         booleans |= {
             "parallel_init",
@@ -199,6 +199,8 @@ def validate_fused_tuning(overrides, transport):
         raise ValueError("final_copy_stages must be 4 or 8")
     if overrides.get("tagged_map") and overrides.get("parallel_init"):
         raise ValueError("Tagged mapping requires one init worker per request")
+    if overrides.get("simt_init") and overrides.get("parallel_init"):
+        raise ValueError("SIMT init requires one init worker per request")
     if overrides.get("async_final") and not overrides.get("parallel_final"):
         raise ValueError("async_final requires parallel_final")
     if overrides.get("ordered_pair") and not overrides.get("grouped_copy"):
@@ -215,6 +217,9 @@ def fusion_tuning(geometry, transport, overrides=None):
     """Resolve opt-in experiments without mutating the captured geometry."""
     values = dict(
         compact_reserved=False,
+        cold_only_prefetch=False,
+        threshold_only=False,
+        simt_init=False,
         prefetch_limit=geometry["prefetch_limit"],
         window_limit=geometry["window_limit"],
     )
@@ -304,6 +309,9 @@ def create_fused(
             tagged_map=effective["tagged_map"],
             final_copy_stages=effective["final_copy_stages"],
             ordered_pair=effective["ordered_pair"],
+            cold_only_prefetch=effective["cold_only_prefetch"],
+            threshold_only=effective["threshold_only"],
+            simt_init=effective["simt_init"],
             merge_outputs=effective["merge_outputs"],
         )
         library = build_specialization(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape)
@@ -330,6 +338,9 @@ def create_fused(
             compact_reserved=effective["compact_reserved"],
             parallel_final=effective["parallel_final"],
             async_final=effective["async_final"],
+            cold_only_prefetch=effective["cold_only_prefetch"],
+            threshold_only=effective["threshold_only"],
+            simt_init=effective["simt_init"],
         )
         workspace = LIFetchWorkspace(torch, **common_workspace)
     storage = IndexCacheStorage(torch, geometry["owners"], h, r, device)
@@ -389,6 +400,9 @@ def create_fused(
             scratch=workspace.scratch,
             parallel_final=effective["parallel_final"],
             async_final=effective["async_final"],
+            cold_only_prefetch=effective["cold_only_prefetch"],
+            threshold_only=effective["threshold_only"],
+            simt_init=effective["simt_init"],
             **common,
         )
         rotating.output = output

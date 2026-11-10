@@ -25,8 +25,7 @@ __simt_callee__ inline uint32_t OwnerRow(__gm__ Context* ctx,uint32_t b) {
 __simt_callee__ inline uint32_t OutputStride(uint32_t rt_resident,__gm__ Context* ctx) {
     return ctx->outputStride ? uint32_t(ctx->outputStride) : rt_resident;
 }
-__simt_vf__ __aicore__ LAUNCH_BOUND(256)
-inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,
+__simt_callee__ inline void InitializeTailMappingsBody(uint32_t rt_history,uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,
     uint64_t reservedRow=0) {
 #if V9_COMPACT_RESERVED
     if(reservedRow)ScatterReservedHot(reinterpret_cast<__gm__ uint32_t*>(reservedRow),
@@ -49,6 +48,11 @@ inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm
             asc_stcg(map+token,rt_resident+kSlots+token%tailTokens);
     }
     asc_threadfence();
+}
+__simt_vf__ __aicore__ LAUNCH_BOUND(256)
+inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,
+    uint64_t reservedRow=0) {
+    InitializeTailMappingsBody(rt_history,rt_resident,ctx,b,reservedRow);
 }
 __simt_callee__ inline bool IsTailToken(__gm__ Context* ctx,uint32_t b,uint32_t token) {
     if(!ctx->tailBounds)return false;
@@ -745,7 +749,9 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
             state.GetValue(209),state.GetValue(210),ctx->windowLimit);
         const uint64_t entityAddress=state64.GetValue(0),queueAddress=state64.GetValue(1);
         const uint64_t addresses=state64.GetValue(2),output=state64.GetValue(3);
-        const uint32_t lower=ctx->lruSlots?0:rt_resident;
+        // Optional transport policy: reserve speculative traffic for cold
+        // history. Final TopK repair still handles selected evicted hot slots.
+        const uint32_t lower=V9_COLD_ONLY_PREFETCH?rt_resident:(ctx->lruSlots?0:rt_resident);
         uint32_t end[4],first=rt_history,last=lower;
         for(uint32_t q=0;q<4;++q) {
             uint32_t saved=cfg.GetValue(128+b*4+q);

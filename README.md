@@ -510,6 +510,42 @@ false and preserve the selected KV bytes and required state updates:
 Same-runtime variants control DDR placement and connection setup within each
 transport. They do not eliminate load/thermal variability, and their printed
 speedup compares fused variants, not the separate serial performance target.
+Node24 NPU4 measured the UBmem ordered-pair/output-merge combination at
+864.554 us versus 677.495 us before, a 27.61% regression. The instrumented
+completion/Index chain rose from 87.746 to 267.312 us while final Fetch stayed
+near 196 us; one fewer launch did not compensate for reduced output parallelism.
+This paired run does not isolate ordered-pair copying, so both switches remain
+off in the next baseline. URMA async-final measured 672.136 versus 668.285 us:
+the shorter final drain was offset by longer prefetch completion. It also
+remains off; neither experiment establishes the serial-relative target.
+
+Three shared switches, also disabled by default, reduce work inside the timed
+graph without changing the captured inputs or the final TopK algorithm:
+
+- `simt_init=true` combines control-record zeroing, initial LRU copying and Row
+  publication into the existing init VF. Bulk sentinel initialization, epoch
+  reset, hot-slot protection and URMA queue validation stay in init. It does
+  not add a launch or move preparation outside timing. UBmem cannot combine
+  it with `parallel_init=true`.
+- `threshold_only=true` computes the exact resident-prefix cutoff with the
+  existing BF16 sortable-key histogram stages, avoiding a full TopK whose
+  selected resident IDs are unused. Short/invalid and multi-trunk prefixes
+  keep the original path; final full-history TopK and tie behavior are unchanged.
+- `cold_only_prefetch=true` scans speculative candidates from the resident
+  boundary onward and omits unused hot-candidate bitmap production. Selected
+  candidate-hot tokens are still repaired by the final resolver. It may shift
+  useful work from prefetch to final Fetch, so lower read traffic alone is not
+  a latency win.
+
+Replay readback additionally classifies actual prefetch and unused prefetch
+against each request's frozen initial cold, candidate-hot, other-hot and ABC
+residency. Mapping coordinates are converted through the pre-call logical-ID
+permutation; epoch tags are decoded first. This bookkeeping is outside timing,
+as are the existing output checks. `prefetch_unclassified` makes any gap against
+the native transfer counter explicit rather than assigning it to cold demand.
+Summary columns take separate medians; their sums need not equal the median
+of the per-iteration sum. Use `reads_samples` for exact per-round accounting.
+
 Serial graphs use the Torch NPU graph allocator for native LI/gather outputs;
 fused graphs retain the existing KVAF graph API. The supported explicit stream
 argument is documented in [Torch NPU graphs](https://github.com/Ascend/pytorch/blob/master/torch_npu/npu/graphs.py).

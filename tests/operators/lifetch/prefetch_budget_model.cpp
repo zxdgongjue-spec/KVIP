@@ -21,6 +21,7 @@ using GM_ADDR=uint8_t*;
 #include "mapping_epoch.h"
 #include "prefetch_budget.h"
 unsigned bitmapCopies=0,scanCalls=0,postCalls=0,previousChecks=0;
+unsigned hotBitmapCopies=0,coldBitmapCopies=0,bitmapHistory=0,bitmapResident=0;
 uint8_t* bitmapBegin=nullptr;
 uint8_t* bitmapEnd=nullptr;
 rotating::Event* previousEvent=nullptr;
@@ -48,7 +49,11 @@ template<class T>struct DataCopyPadExtParams {bool enabled;unsigned left,right;T
 template<class T>void DataCopy(LocalTensor<T> dst,GlobalTensor<T> src,unsigned n){std::copy_n(src.data,n,dst.data);}
 template<class T>void DataCopy(GlobalTensor<T> dst,LocalTensor<T> src,unsigned n){std::copy_n(src.data,n,dst.data);}
 template<class T>void DataCopyPad(LocalTensor<T> dst,GlobalTensor<T> src,DataCopyExtParams p,DataCopyPadExtParams<T>){
-    if(uintptr_t(src.data)>=uintptr_t(bitmapBegin) && uintptr_t(src.data)<uintptr_t(bitmapEnd))++bitmapCopies;
+    if(uintptr_t(src.data)>=uintptr_t(bitmapBegin) && uintptr_t(src.data)<uintptr_t(bitmapEnd)) {
+        ++bitmapCopies;
+        unsigned token=unsigned(reinterpret_cast<uint8_t*>(src.data)-bitmapBegin)%bitmapHistory*4;
+        if(token<bitmapResident)++hotBitmapCopies;else ++coldBitmapCopies;
+    }
     for(unsigned b=0;b<p.blockCount;++b)
         std::memcpy(reinterpret_cast<uint8_t*>(dst.data)+b*(p.blockLen+p.dstStride),
                     reinterpret_cast<uint8_t*>(src.data)+b*(p.blockLen+p.srcStride),p.blockLen);
@@ -108,6 +113,7 @@ int main(){
     std::vector<uint32_t> ends(SIM_BATCH*4,SIM_HISTORY),mapping(SIM_BATCH*SIM_HISTORY,191),jobs(SIM_BATCH*8192,313);
     std::vector<uint64_t> scratch(5000),work(5000),storage(2000);
     bitmapBegin=bitmap.data();bitmapEnd=bitmap.data()+bitmap.size();
+    bitmapHistory=SIM_HISTORY;bitmapResident=SIM_RESIDENT;
     Context ctx{};ctx.rows=uint64_t(rows.data());ctx.progress=uint64_t(progress.data());ctx.events=uint64_t(events.data());
     ctx.hits=uint64_t(bitmap.data());ctx.queryEnds=uint64_t(ends.data());ctx.mapping=uint64_t(mapping.data());
     ctx.locations=uint64_t(jobs.data());ctx.lruSlots=1;ctx.windowLimit=64;
@@ -128,6 +134,7 @@ int main(){
         }
         const auto initial=rows;
         bitmapCopies=scanCalls=postCalls=previousChecks=0;
+        hotBitmapCopies=coldBitmapCopies=0;
         for(unsigned epoch=1;epoch<4;++epoch)for(unsigned lane=0;lane<kServiceLanes;++lane){
             std::fill(scratch.begin(),scratch.end(),0x7777777777777777ULL);
             std::fill(work.begin(),work.end(),0x7777777777777777ULL);
@@ -148,6 +155,10 @@ int main(){
         }
         assert(previousChecks==6 && postCalls==0);
         assert(reason==4 ? bitmapCopies>0 && scanCalls>0 : bitmapCopies==0 && scanCalls==0);
+        if(reason==4) {
+            assert(coldBitmapCopies>0);
+            assert(V9_COLD_ONLY_PREFETCH ? hotBitmapCopies==0 : hotBitmapCopies>0);
+        }
         for(unsigned b=0;b<SIM_BATCH;++b){
             const auto& row=rows[b];assert(row.sequence==3);
             assert(row.slots==initial[b].slots && row.requests==initial[b].requests && row.pending==3);

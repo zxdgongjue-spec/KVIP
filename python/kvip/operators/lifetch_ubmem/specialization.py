@@ -32,6 +32,9 @@ class Specialization:
     final_copy_stages: int = 4
     merge_outputs: bool = False
     ordered_pair: bool = False
+    cold_only_prefetch: bool = False
+    threshold_only: bool = False
+    simt_init: bool = False
 
     def __post_init__(self):
         if any(
@@ -45,11 +48,16 @@ class Specialization:
                 "tagged_map",
                 "merge_outputs",
                 "ordered_pair",
+                "cold_only_prefetch",
+                "threshold_only",
+                "simt_init",
             )
         ):
             raise ValueError("UBmem optimization switches must be booleans")
         if self.tagged_map and self.parallel_init:
             raise ValueError("Tagged mapping requires one init worker per request")
+        if self.simt_init and self.parallel_init:
+            raise ValueError("SIMT init requires one init worker per request")
         if self.ordered_pair and not (self.grouped_copy and self.token_bytes == 2624):
             raise ValueError("Ordered pair copy requires grouped four-layer copy")
         if type(self.final_copy_stages) is not int or self.final_copy_stages not in (4, 8):
@@ -95,6 +103,9 @@ class Specialization:
             UBMEM_FINAL_COPY_STAGES=self.final_copy_stages,
             UBMEM_MERGE_OUTPUTS=int(self.merge_outputs),
             UBMEM_ORDERED_PAIR=int(self.ordered_pair),
+            COLD_ONLY_PREFETCH=int(self.cold_only_prefetch),
+            THRESHOLD_ONLY=int(self.threshold_only),
+            SIMT_INIT=int(self.simt_init),
         )
 
 

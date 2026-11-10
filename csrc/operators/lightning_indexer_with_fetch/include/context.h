@@ -2,6 +2,18 @@
 #include <stdint.h>
 #include "batch_get_abi.h"
 #include "runtime_shape.h"
+#ifndef V9_COLD_ONLY_PREFETCH
+#define V9_COLD_ONLY_PREFETCH 0
+#endif
+#ifndef V9_THRESHOLD_ONLY
+#define V9_THRESHOLD_ONLY 0
+#endif
+#ifndef V9_SIMT_INIT
+#define V9_SIMT_INIT 0
+#endif
+static_assert(V9_COLD_ONLY_PREFETCH==0 || V9_COLD_ONLY_PREFETCH==1,"Cold-only prefetch must be 0 or 1");
+static_assert(V9_THRESHOLD_ONLY==0 || V9_THRESHOLD_ONLY==1,"Threshold-only selection must be 0 or 1");
+static_assert(V9_SIMT_INIT==0 || V9_SIMT_INIT==1,"SIMT init must be 0 or 1");
 #ifndef V9_URMA_PARALLEL_FINAL
 #define V9_URMA_PARALLEL_FINAL 0
 #endif

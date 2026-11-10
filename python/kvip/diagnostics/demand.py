@@ -92,6 +92,7 @@ class SnapshotDemand:
             raise ValueError("Demand classification requires distinct live request owners")
         self.active, self.resident, self.history = active, resident, history
         self.requests = []
+        self.prefetch_requests = {}
         identity = np.arange(history)
         for row in packed_rows:
             owner = owners[row]
@@ -110,6 +111,37 @@ class SnapshotDemand:
             forward[abc] = resident + abc % (stride - resident)
             tnd_rows = np.flatnonzero(active & (metadata[2] // 4 == row))
             self.requests.append((tnd_rows, forward, lru))
+            self.prefetch_requests[int(row)] = (ids[owner], forward, lru)
+
+    def classify_prefetch(self, mapping, selected):
+        """Classify completed prefetch mappings, using pre-call residency.
+
+        Mapping/selected coordinates address the original physical Index;
+        convert through that owner's frozen logical IDs before classifying.
+        The final resolver does not rewrite these speculative mappings.
+        """
+        mapping, selected = np.asarray(mapping), np.asarray(selected)
+        if mapping.ndim != 2 or mapping.shape[1] != self.history or selected.shape[0] != len(mapping):
+            raise ValueError("Prefetch mapping and selected rows differ from captured geometry")
+        categories = ("cold", "candidate_hot", "other_hot", "abc")
+        result = {prefix + category: 0 for prefix in ("prefetch_", "unused_prefetch_") for category in categories}
+        for row, values in enumerate(mapping):
+            fetched = np.flatnonzero((values >= self.resident) & (values < self.resident + 2048))
+            if not len(fetched):
+                continue
+            if row not in self.prefetch_requests:
+                raise ValueError("Inactive request contains speculative transfers")
+            ids, forward, lru = self.prefetch_requests[row]
+            slots = forward[ids[fetched]]
+            cold, abc = slots < 0, slots >= self.resident
+            candidate = ~cold & ~abc & np.isin(slots, lru)
+            flags = (cold, candidate, ~cold & ~abc & ~candidate, abc)
+            unused = ~np.isin(fetched, selected[row].reshape(-1))
+            for category, mask in zip(categories, flags):
+                result["prefetch_" + category] += int(np.count_nonzero(mask))
+                result["unused_prefetch_" + category] += int(np.count_nonzero(mask & unused))
+        result["prefetch_classified"] = sum(result["prefetch_" + category] for category in categories)
+        return result
 
     def classify(self, logical):
         logical = np.asarray(logical)

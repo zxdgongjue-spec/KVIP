@@ -45,6 +45,7 @@ V9_CQ_INLINE CqDrainResult DrainCq(Access& access, uint64_t consumer,
 #include "prefetch.h"
 #include "resolver.h"
 #include "index_cache_update.h"
+#include "../../common/lifetch/simt_init.h"
 using namespace AscendC;
 using namespace rotating;
 // Extend fused CQ waits to 10x the native polling budget (not wall-clock time).
@@ -112,9 +113,22 @@ __aicore__ inline void FillRoundWords(uint64_t address,uint32_t words,
     }
     // Caller joins the whole fill group before reusing the shared UB value.
 }
+#if V9_SIMT_INIT
+__simt_vf__ __aicore__ LAUNCH_BOUND(256)
+inline void InitializeRoundSimt(uint32_t batches,uint32_t history,uint32_t resident,
+    uint32_t rounds,uint32_t lanes,uint32_t workers,uint32_t postOffset,
+    __gm__ Context* ctx,uint32_t b,uint64_t reservedRow,uint64_t entity,uint64_t queue,
+    uint64_t addresses,uint64_t output,uint64_t initialHead,uint32_t queueLimit,uint32_t error) {
+    InitializeSimtControl<Row,Progress,Event,FinalPost>(ctx,b,batches,rounds,lanes,workers,postOffset,
+        ctx->finalStatus+uint64_t(b)*2*sizeof(KvafBatchGetCoreStatus),2*sizeof(KvafBatchGetCoreStatus)/4,
+        entity,queue,addresses,output,initialHead,queueLimit,error);
+    InitializeTailMappingsBody(history,resident,ctx,b,reservedRow);
+}
+#endif
 __aicore__ inline uint64_t InitializeRound(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t b) {
     TPipe pipe;TBuf<TPosition::VECCALC> storage;pipe.InitBuffer(storage,4096*4);
     auto local=storage.Get<uint32_t>();
+#if !V9_SIMT_INIT
     Duplicate(local,uint32_t(0),4096);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     FillRoundWords(ctx->rows+b*sizeof(Row),sizeof(Row)/4,local);
@@ -133,6 +147,7 @@ __aicore__ inline uint64_t InitializeRound(uint32_t rt_batch,uint32_t rt_history
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->count),4);
     }
     SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+#endif
     Duplicate(local,UINT32_MAX,4096);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     FillRoundWords(ctx->mapping+uint64_t(b)*rt_history*4,rt_history,local);
@@ -142,6 +157,7 @@ __aicore__ inline uint64_t InitializeRound(uint32_t rt_batch,uint32_t rt_history
     reservedRow=ClearReservedHot(ctx->lruSlots,ctx->reservedHot,ctx->queryEnds,b,rt_resident,local);
 #endif
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+#if !V9_SIMT_INIT
     // Copy only the candidate prefix; resolver writes extended destinations.
     if(ctx->changeSlots) {
         GlobalTensor<uint32_t> source,target;
@@ -152,6 +168,7 @@ __aicore__ inline uint64_t InitializeRound(uint32_t rt_batch,uint32_t rt_history
         DataCopy(target,local,kLruSlots);
         SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     }
+#endif
     pipe.Destroy();
     return reservedRow;
 }
@@ -174,48 +191,61 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
         auto ctx=GetContext(bindings);
         auto reservedRow=InitializeRound(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b);
         auto args=GetArgs(ctx,b*2);
-        auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
         auto entity=reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(args.channel_entity);
         auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args.queue_state);
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
-        row->entity=args.channel_entity; row->queue=args.queue_state;
         const uint64_t prefix=4*2048*6+1024+4*uint64_t(rt_history)*2;
         const uint64_t tail=uint64_t(rt_history)*8+8192*64+512;
         auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
         uint32_t owner=ctx->rowOwners ? reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b] : b;
         uint64_t outputStride=ctx->outputStride ? ctx->outputStride : rt_resident;
-        row->addresses=ctx->tokenAddresses ? ctx->tokenAddresses+uint64_t(owner)*ctx->addressStride*8 : a[13]+rt_batch*prefix+b*tail;
-        row->output=args.output+uint64_t(owner)*outputStride*rt_tokenBytes;
+        const uint64_t addresses=ctx->tokenAddresses ? ctx->tokenAddresses+uint64_t(owner)*ctx->addressStride*8 : a[13]+rt_batch*prefix+b*tail;
+        const uint64_t output=args.output+uint64_t(owner)*outputStride*rt_tokenBytes;
+#if !V9_SIMT_INIT
+        auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
+        row->entity=args.channel_entity;row->queue=args.queue_state;
+        row->addresses=addresses;row->output=output;
         Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},rt_history,rt_resident,ctx,b,reservedRow);
-        row->initialHead=queue->sq_producer_index;
-        row->limit=kSlots;
-        row->prefetchLimit=ctx->prefetchLimit;
-        row->queueLimit=entity->sq_depth>1 ? entity->sq_depth-1 : 0;
-        row->error=queue->last_error;
+#endif
+        const uint64_t initialHead=queue->sq_producer_index;
+        const uint32_t queueLimit=entity->sq_depth>1 ? entity->sq_depth-1 : 0;
+        uint32_t error=queue->last_error;
         if(entity->sq_depth<2 || (entity->sq_depth&(entity->sq_depth-1)) || entity->cq_depth<2 ||
            !entity->sq_va || !entity->sq_db_va || ctx->prefetchLimit>kSlots ||
            ctx->windowLimit==0 || ctx->windowLimit>480)
-            row->error=kvaf_device::kInvalidArgs;
+            error=kvaf_device::kInvalidArgs;
 #if !V9_SIMULATION
         if(queue->initialized && queue->magic!=kvaf_device::kQueueMagic)
-            row->error=kvaf_device::kInvalidArgs;
+            error=kvaf_device::kInvalidArgs;
         if(!queue->initialized) {
             queue->magic=kvaf_device::kQueueMagic; queue->initialized=1;
         }
-        if(entity->sq_depth>(1U<<30) || row->initialHead>UINT64_MAX-ctx->prefetchLimit ||
+        if(entity->sq_depth>(1U<<30) || initialHead>UINT64_MAX-ctx->prefetchLimit ||
            args.token_bytes!=rt_tokenBytes || args.tokens_per_block!=128 ||
            args.block_count!=1 || args.jettys_per_core!=1)
-            row->error=kvaf_device::kInvalidArgs;
+            error=kvaf_device::kInvalidArgs;
         if(entity->magic!=kvaf_device::kEntityMagic || entity->version!=kvaf_device::kEntityVersion ||
            entity->wqe_size!=64 || !entity->cq_va || !entity->cq_db_va ||
            entity->cqe_size<kvaf_device::kCqeProbeBytes || !entity->local_token_id ||
            entity->local_hbm_address!=args.output ||
            entity->local_hbm_size<(uint64_t(owner)+1)*outputStride*rt_tokenBytes ||
            !entity->remote_host_ddr_address || entity->remote_host_ddr_size<rt_tokenBytes)
-            row->error=kvaf_device::kInvalidEntity;
+            error=kvaf_device::kInvalidEntity;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
 #endif
+#if V9_SIMT_INIT
+        // Queue bootstrap remains scalar and was published above. The VF
+        // never touches queue state and is the sole writer of this round's
+        // Row, so no scalar cache-line flush can overwrite its zero fields.
+        Simt::VF_CALL<InitializeRoundSimt>(Simt::Dim3{256,1,1},rt_batch,rt_history,rt_resident,
+            rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b,reservedRow,
+            args.channel_entity,args.queue_state,addresses,output,initialHead,queueLimit,error);
+        SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+#else
+        row->initialHead=initialHead;row->limit=kSlots;row->prefetchLimit=ctx->prefetchLimit;
+        row->queueLimit=queueLimit;row->error=error;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),sizeof(*row));
+#endif
     }
 #endif
 }

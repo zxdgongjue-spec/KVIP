@@ -37,7 +37,19 @@ def build_failure(log, stage, returncode):
     )
 
 
-def build_libraries(*, cache_dir, cann, headers, soc, compact_reserved=False, parallel_final=False, async_final=False):
+def build_libraries(
+    *,
+    cache_dir,
+    cann,
+    headers,
+    soc,
+    compact_reserved=False,
+    parallel_final=False,
+    async_final=False,
+    cold_only_prefetch=False,
+    threshold_only=False,
+    simt_init=False,
+):
     """Build one shape-independent binary per source/toolchain/SoC."""
     if type(compact_reserved) is not bool:
         raise ValueError("compact_reserved must be a boolean")
@@ -45,6 +57,8 @@ def build_libraries(*, cache_dir, cann, headers, soc, compact_reserved=False, pa
         raise ValueError("parallel_final must be a boolean")
     if type(async_final) is not bool or (async_final and not parallel_final):
         raise ValueError("async_final must be a boolean and requires parallel_final")
+    if any(type(flag) is not bool for flag in (cold_only_prefetch, threshold_only, simt_init)):
+        raise ValueError("Fusion optimization switches must be booleans")
     root = Path(__file__).resolve().parents[3] / "csrc/operators"
     options = dict(
         RUN_MODE="npu",
@@ -55,6 +69,9 @@ def build_libraries(*, cache_dir, cann, headers, soc, compact_reserved=False, pa
         COMPACT_RESERVED=int(compact_reserved),
         URMA_PARALLEL_FINAL=int(parallel_final),
         URMA_ASYNC_FINAL=int(async_final),
+        COLD_ONLY_PREFETCH=int(cold_only_prefetch),
+        THRESHOLD_ONLY=int(threshold_only),
+        SIMT_INIT=int(simt_init),
     )
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     for relative in (

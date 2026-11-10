@@ -54,7 +54,9 @@ def test_shared_native_helper_rebuilds_active_rows_after_dma_clear(tmp_path, var
 
     # Compile actual init call sites, not a second implementation of their
     # ordering. The model delays MTE3 until WaitFlag and counts Duplicate/VF.
-    functions = [function(tail, name) for name in ("OutputStride", "InitializeTailMappings")]
+    functions = [
+        function(tail, name) for name in ("OutputStride", "InitializeTailMappingsBody", "InitializeTailMappings")
+    ]
     names = (
         ("FillRoundWords", "InitializeRound")
         if variant == "urma"

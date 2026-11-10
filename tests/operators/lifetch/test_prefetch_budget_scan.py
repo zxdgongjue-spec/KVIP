@@ -9,7 +9,8 @@ import pytest
 
 
 @pytest.mark.parametrize("ubmem", (False, True))
-def test_actual_service_preserves_epochs_cursors_and_pending_when_budget_exhausted(tmp_path, ubmem):
+@pytest.mark.parametrize("cold_only", (False, True))
+def test_actual_service_preserves_epochs_cursors_and_pending_when_budget_exhausted(tmp_path, ubmem, cold_only):
     compiler = shutil.which("c++")
     if compiler is None:
         pytest.skip("C++ compiler is required for the service control model")
@@ -37,6 +38,7 @@ def test_actual_service_preserves_epochs_cursors_and_pending_when_budget_exhaust
             "-g",
             "-fsanitize=address,undefined",
             f"-DMODEL_UBMEM={int(ubmem)}",
+            f"-DV9_COLD_ONLY_PREFETCH={int(cold_only)}",
             "-I" + str(tmp_path),
             "-I" + str(root / "lightning_indexer_with_fetch/include"),
             "-I" + str(root / "lightning_indexer_with_fetch_ubmem/include"),

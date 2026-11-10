@@ -146,6 +146,9 @@ def test_tuning_keeps_snapshot_immutable_and_validates_only_known_options():
         final_copy_stages=4,
         ordered_pair=False,
         merge_outputs=False,
+        cold_only_prefetch=False,
+        threshold_only=False,
+        simt_init=False,
     )
     assert geometry == dict(prefetch_limit=512, window_limit=64, requested_windows=8)
     assert fusion_tuning(geometry, "ubmem")["parallel_init"] is False
@@ -160,7 +163,13 @@ def test_urma_tuning_has_only_real_switches_and_fixed_inactive_gate():
     geometry = dict(prefetch_limit=512, window_limit=64, requested_windows=8)
     overrides = dict(compact_reserved=True, prefetch_limit=256, window_limit=32)
     assert fusion_tuning(geometry, "urma", overrides) == dict(
-        overrides, skip_inactive=True, parallel_final=False, async_final=False
+        overrides,
+        skip_inactive=True,
+        parallel_final=False,
+        async_final=False,
+        cold_only_prefetch=False,
+        threshold_only=False,
+        simt_init=False,
     )
     assert fusion_tuning(geometry, "urma", {"parallel_final": True})["parallel_final"] is True
     assert fusion_tuning(geometry, "ubmem", {"grouped_copy": True})["grouped_copy"] is True
@@ -177,6 +186,9 @@ def test_urma_tuning_has_only_real_switches_and_fixed_inactive_gate():
         ("ubmem", {"ordered_pair": True}),
         ("ubmem", {"merge_outputs": 1}),
         ("urma", {"merge_outputs": True}),
+        ("urma", {"cold_only_prefetch": 1}),
+        ("ubmem", {"threshold_only": 1}),
+        ("ubmem", {"simt_init": True, "parallel_init": True}),
         ("urma", []),
     ):
         with pytest.raises(ValueError):
@@ -231,6 +243,7 @@ def test_urma_factory_passes_compact_switch_to_actual_build(monkeypatch, tmp_pat
         assert kwargs["compact_reserved"] is True
         assert kwargs["parallel_final"] is parallel_final
         assert kwargs["async_final"] is async_final
+        assert all(kwargs[name] is True for name in ("cold_only_prefetch", "threshold_only", "simt_init"))
         raise ReachedBuild
 
     monkeypatch.setattr(build, "build_libraries", build_libraries)
@@ -248,7 +261,14 @@ def test_urma_factory_passes_compact_switch_to_actual_build(monkeypatch, tmp_pat
             tmp_path,
             32,
             transport="urma",
-            tuning={"compact_reserved": True, "parallel_final": parallel_final, "async_final": async_final},
+            tuning={
+                "compact_reserved": True,
+                "parallel_final": parallel_final,
+                "async_final": async_final,
+                "cold_only_prefetch": True,
+                "threshold_only": True,
+                "simt_init": True,
+            },
         )
 
 
@@ -353,3 +373,52 @@ def test_merged_ubmem_outputs_use_exact_five_native_launches(split):
         ("kvip_ubmem_complete_plan_outputs", (11, 22, 33)),
         ("kvip_ubmem_update_apply", (22, 33)),
     ]
+
+
+def test_ubmem_factory_passes_shared_optimizations_to_the_actual_specialization(monkeypatch, tmp_path):
+    from kvip.diagnostics import fused_replay
+    from kvip.operators.lifetch_ubmem import specialization
+
+    archive = SimpleNamespace(
+        manifest=dict(
+            geometry=dict(
+                batch=16,
+                history=131328,
+                resident=16384,
+                aic_count=32,
+                requested_windows=8,
+                heads=32,
+                token_bytes=2624,
+                prefetch_limit=512,
+                window_limit=64,
+            )
+        )
+    )
+    monkeypatch.setattr(fused_replay, "_check_geometry", lambda *args: None)
+
+    class ReachedBuild(Exception):
+        pass
+
+    def build_specialization(**kwargs):
+        shape = kwargs["shape"]
+        assert shape.cold_only_prefetch and shape.threshold_only and shape.simt_init
+        assert not shape.parallel_init
+        raise ReachedBuild
+
+    monkeypatch.setattr(specialization, "build_specialization", build_specialization)
+    with pytest.raises(ReachedBuild):
+        create_fused(
+            None,
+            SimpleNamespace(),
+            archive,
+            {"access_table": object()},
+            None,
+            tmp_path,
+            "Ascend950DT_9582",
+            None,
+            None,
+            tmp_path,
+            32,
+            transport="ubmem",
+            tuning={"cold_only_prefetch": True, "threshold_only": True, "simt_init": True},
+        )

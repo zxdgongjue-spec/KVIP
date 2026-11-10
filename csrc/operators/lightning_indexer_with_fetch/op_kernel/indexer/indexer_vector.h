@@ -25,6 +25,7 @@
 #include "inactive_row.h"
 #include "indexer_score.h"
 #include "topk.h"
+#include "resident_threshold.h"
 
 namespace QLIKernel {
 using namespace QLICommon;
@@ -172,8 +173,14 @@ private:
         DataCopy(indices[q * 2048], indicesOutLocal_.template ReinterpretCast<int32_t>(), 2048);
         DataCopy(thresholds[q * 128], prefixThreshold_[(query % 2) * 128], 128);
         PipeBarrier<PIPE_ALL>();
+        PublishResident(query,scoreRow);
+    }
+    __aicore__ inline void PublishResident(uint32_t query,uint32_t scoreRow) {
+        uint32_t batch=query/SIM_Q;
         auto context = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
-        if (context->lruSlots) {
+        // Cold-only service starts at resident; no consumer reads these hot
+        // victim bits. Keep the threshold and ready publication for cold LI.
+        if (!V9_COLD_ONLY_PREFETCH && context->lruSlots) {
             // TopK scratch is dead after the resident result is saved. Reuse
             // 16KiB: 4KiB scores, 8KiB victim IDs, 4KiB predicate scratch.
             auto scoreChunk = topkSharedTmpLocal_.template ReinterpretCast<uint16_t>();
@@ -660,6 +667,31 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
             uint32_t query = info.bIdx * SIM_Q + curS1Idx + rowIdx;
             uint32_t bound = reinterpret_cast<__gm__ uint32_t*>(rotationContext->queryEnds)[query];
             validS2Len = Min(validS2Len, static_cast<int32_t>(bound));
+        }
+        if(kvip_prefix::UseThresholdOnly(prefixActive_,validS2Len,topkCount_,trunkLen_)) {
+            // Consume and return the same existing TopK buffer credits. The
+            // helper introduces no event IDs and never changes final TopK.
+            WaitFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);
+            WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
+            uint32_t aligned=QLICommon::Align(uint32_t(validS2Len),uint32_t(256));
+            if(aligned!=uint32_t(validS2Len))
+                Duplicate(mrgValueLocal_[validS2Len/256*256],zero,aligned-validS2Len/256*256);
+            SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+            copyInParams.blockLen=validS2Len*sizeof(SCORE_T);
+            AscendC::DataCopyPadExtParams<SCORE_T> pad{true,0,0,0};
+            DataCopyPad(mrgValueLocal_,scoreGm[vecOffset*QLICommon::Align(
+                uint64_t(constInfo_.kSeqSize),uint64_t(s2BaseSize_))],copyInParams,pad);
+            SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+            uint32_t query=info.indiceOutOffset/topkCount_+curS1Idx+rowIdx;
+            kvip_prefix::ResidentThresholdOnly(mrgValueLocal_,topkSharedTmpLocal_,
+                prefixThreshold_[(query%2)*128],aligned,topkCount_);
+            // The victim gather reuses histogram scratch. Finish its vector
+            // reads before MTE2 stages the victim IDs into that same storage.
+            PipeBarrier<PIPE_ALL>();
+            PublishResident(query,vecOffset);
+            SetFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);
+            SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
+            continue;
         }
         if (validS2Len <= 0) {
             WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);

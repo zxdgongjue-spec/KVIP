@@ -412,7 +412,9 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
         const uint32_t available=PrefetchAllowance(slots,requests,state.GetValue(208),
             state.GetValue(209),state.GetValue(210),ctx->windowLimit);
         const uint64_t addresses=state64.GetValue(2),output=state64.GetValue(3);
-        const uint32_t lower=ctx->lruSlots?0:SIM_RESIDENT;
+        // Optional transport policy: reserve speculative traffic for cold
+        // history. Final TopK repair still handles selected evicted hot slots.
+        const uint32_t lower=V9_COLD_ONLY_PREFETCH?SIM_RESIDENT:(ctx->lruSlots?0:SIM_RESIDENT);
         uint32_t end[4],first=SIM_HISTORY,last=lower;
         for(uint32_t q=0;q<4;++q) {
             uint32_t saved=cfg.GetValue(128+b*4+q);

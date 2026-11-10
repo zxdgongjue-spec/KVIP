@@ -1,5 +1,20 @@
 #pragma once
 #include <stdint.h>
+#ifndef V9_COLD_ONLY_PREFETCH
+#define V9_COLD_ONLY_PREFETCH 0
+#endif
+#ifndef V9_THRESHOLD_ONLY
+#define V9_THRESHOLD_ONLY 0
+#endif
+#ifndef V9_SIMT_INIT
+#define V9_SIMT_INIT 0
+#endif
+static_assert(V9_COLD_ONLY_PREFETCH==0 || V9_COLD_ONLY_PREFETCH==1,"Cold-only prefetch must be 0 or 1");
+static_assert(V9_THRESHOLD_ONLY==0 || V9_THRESHOLD_ONLY==1,"Threshold-only selection must be 0 or 1");
+static_assert(V9_SIMT_INIT==0 || V9_SIMT_INIT==1,"SIMT init must be 0 or 1");
+#if V9_SIMT_INIT && V9_UBMEM_PARALLEL_INIT
+#error "SIMT init requires one worker per row"
+#endif
 static_assert(V9_UBPIPE_DEPTH == 1 || V9_UBPIPE_DEPTH == 8, "Invalid UBmem pipeline depth");
 static_assert(V9_UBPIPE_ROWS == 1 || V9_UBPIPE_ROWS == 4, "Invalid UBmem rows per pipeline stage");
 static_assert(V9_UBPIPE_DEPTH != 1 || V9_UBPIPE_ROWS == 1, "Serial UBmem requires one row per stage");

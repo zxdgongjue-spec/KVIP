@@ -34,7 +34,7 @@ def statistics(samples):
     )
 
 
-def fused_reads(torch, rotating, update, transport, width):
+def fused_reads(torch, rotating, update, transport, width, demand=None):
     rows = cpu_array(torch, rotating.rows)
     status = cpu_array(torch, rotating.row_status)
     posts = cpu_array(torch, rotating.final_posts)
@@ -67,7 +67,7 @@ def fused_reads(torch, rotating, update, transport, width):
         unused += int(np.count_nonzero(~np.isin(fetched, topk.reshape(-1))))
     if unused > prefetch:
         raise AssertionError("Unused prefetch exceeds completed prefetch transfers")
-    return dict(
+    result = dict(
         prefetch=prefetch,
         final=final,
         transfers=prefetch + final,
@@ -77,6 +77,13 @@ def fused_reads(torch, rotating, update, transport, width):
         useful_transfers=prefetch + final - unused,
         useful_transfer_bytes=(prefetch + final - unused) * width,
     )
+    if demand is not None:
+        result.update(demand.classify_prefetch(mapping, selected))
+        classified = result["prefetch_classified"]
+        if classified > prefetch:
+            raise AssertionError("Prefetch mappings exceed completed transfer count")
+        result["prefetch_unclassified"] = prefetch - classified
+    return result
 
 
 def prepare_fused_state(bundle, archive, restored, torch, device, transport):
@@ -113,7 +120,7 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         # Production init resets round-local work; never rewind transport queues.
 
     def verify():
-        reads = fused_reads(torch, rotating, update, transport, archive.manifest["geometry"]["token_bytes"])
+        reads = fused_reads(torch, rotating, update, transport, archive.manifest["geometry"]["token_bytes"], demand)
         if compact_reserved:
             actual_reserved = cpu_array(torch, rotating.reserved_hot)
             if not np.array_equal(actual_reserved[active_rows], reserved_expected[active_rows]):

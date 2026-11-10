@@ -13,6 +13,14 @@ set(RESOLVER_COMPARE 0 CACHE STRING "Include resolver diagnostic entry points")
 set(COMPACT_RESERVED 0 CACHE STRING "Rebuild reserved-hot rows from compact LRU candidates")
 set(URMA_PARALLEL_FINAL 0 CACHE STRING "Opt-in independent final Get worker launches after prefetch completion")
 set(URMA_ASYNC_FINAL 0 CACHE STRING "Submit safe final reads before Index and drain after prefetch join")
+set(COLD_ONLY_PREFETCH 0 CACHE STRING "Speculatively read cold history only; final TopK repair is unchanged")
+set(THRESHOLD_ONLY 0 CACHE STRING "Compute the exact resident admission threshold without materializing hot TopK")
+set(SIMT_INIT 0 CACHE STRING "Initialize per-row state in a single SIMT pass")
+foreach(flag COLD_ONLY_PREFETCH THRESHOLD_ONLY SIMT_INIT)
+  if(NOT ${flag} MATCHES "^[01]$")
+    message(FATAL_ERROR "${flag} must be 0 or 1")
+  endif()
+endforeach()
 if(NOT COMPACT_RESERVED MATCHES "^[01]$")
   message(FATAL_ERROR "COMPACT_RESERVED must be 0 or 1")
 endif()
@@ -28,13 +36,15 @@ ascendc_include_directories(v9_kernel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/includ
   ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/indexer ${CMAKE_CURRENT_SOURCE_DIR}/../common/lightning_indexer ${KVAF_INCLUDE}
   ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)
 ascendc_compile_options(v9_kernel PRIVATE -DV9_RESOLVER_COMPARE=${RESOLVER_COMPARE} -DV9_COMPACT_RESERVED=${COMPACT_RESERVED}
-  -DV9_URMA_PARALLEL_FINAL=${URMA_PARALLEL_FINAL} -DV9_URMA_ASYNC_FINAL=${URMA_ASYNC_FINAL} -O2 -g --cce-auto-sync=off
+  -DV9_URMA_PARALLEL_FINAL=${URMA_PARALLEL_FINAL} -DV9_URMA_ASYNC_FINAL=${URMA_ASYNC_FINAL}
+  -DV9_COLD_ONLY_PREFETCH=${COLD_ONLY_PREFETCH} -DV9_THRESHOLD_ONLY=${THRESHOLD_ONLY} -DV9_SIMT_INIT=${SIMT_INIT} -O2 -g --cce-auto-sync=off
   -mllvm -user-reserved-ub-size=223232 -DV9_USER_UB_BYTES=223232
   -DV9_PARTIAL_SCAN_SIMD=1 -DV9_PROBE_EPOCH=0 -DV9_INTERMEDIATE_PROFILING=0
   -DV9_BATCH_POST=2 -DSIM_Q=4 -DSIM_CAPTURE_HITS=1 -DV9_SIMULATION=0 -DROTATION_PUBLISH_TILES=1)
 add_library(v9_bridge SHARED op_host/launch.cpp)
 target_include_directories(v9_bridge PRIVATE ${KVAF_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_compile_definitions(v9_bridge PRIVATE V9_RESOLVER_COMPARE=${RESOLVER_COMPARE} V9_URMA_PARALLEL_FINAL=${URMA_PARALLEL_FINAL} V9_URMA_ASYNC_FINAL=${URMA_ASYNC_FINAL})
+target_compile_definitions(v9_bridge PRIVATE V9_RESOLVER_COMPARE=${RESOLVER_COMPARE} V9_URMA_PARALLEL_FINAL=${URMA_PARALLEL_FINAL} V9_URMA_ASYNC_FINAL=${URMA_ASYNC_FINAL}
+  V9_COLD_ONLY_PREFETCH=${COLD_ONLY_PREFETCH} V9_THRESHOLD_ONLY=${THRESHOLD_ONLY} V9_SIMT_INIT=${SIMT_INIT})
 target_link_libraries(v9_bridge PRIVATE v9_kernel host_intf_pub ascendcl)
 # Independent AIV target: does not change the LI/Fetch compilation options.
 ascendc_library(kvop_cache_update_kernel STATIC op_kernel/index_cache_update.cpp)

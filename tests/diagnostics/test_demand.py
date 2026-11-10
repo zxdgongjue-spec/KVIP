@@ -63,6 +63,43 @@ def test_actual_changed_selection_changes_cold_count_without_assuming_tie_probab
     assert classifier.classify(archive.array("post.logical_output"))["cold_demand"] == 6
 
 
+def test_prefetch_uses_original_index_owner_and_counts_unused_by_initial_residency():
+    classifier = SnapshotDemand(fixture())
+    mapping = np.full((2, 12), -1, dtype=np.int64)
+    mapping[0, [0, 1, 2, 4, 7]] = np.arange(4, 9)
+    mapping[1, [0, 2, 4]] = np.arange(4, 7)
+    # ABC mappings use a distinct range and must not count as transfers.
+    mapping[1, 3] = 4 + 8192
+    selected = np.array([[1, 4, 4], [0, 2, 2]])
+    actual = classifier.classify_prefetch(mapping, selected)
+    assert actual == dict(
+        prefetch_cold=4,
+        prefetch_candidate_hot=2,
+        prefetch_other_hot=0,
+        prefetch_abc=2,
+        unused_prefetch_cold=3,
+        unused_prefetch_candidate_hot=0,
+        unused_prefetch_other_hot=0,
+        unused_prefetch_abc=1,
+        prefetch_classified=8,
+    )
+    # Original owner 1 slot 0 contains logical 4, whose ABC copy has priority.
+    assert actual["unused_prefetch_abc"] == 1
+
+
+def test_prefetch_rejects_transfers_owned_by_padding():
+    archive = fixture()
+    metadata = archive.array("pre.metadata")
+    inactive = metadata[2] >= 4
+    metadata[3, inactive], metadata[2, inactive] = 0, 0
+    metadata[4].view(np.int32)[1] = 0
+    classifier = SnapshotDemand(archive)
+    mapping = np.full((2, 12), -1, dtype=np.int64)
+    mapping[1, 0] = 4
+    with pytest.raises(ValueError, match="Inactive"):
+        classifier.classify_prefetch(mapping, np.zeros((2, 4), dtype=np.int32))
+
+
 def test_inactive_guard_rows_do_not_contribute_or_merge_into_live_request():
     archive = fixture()
     metadata = archive.array("pre.metadata")

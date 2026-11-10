@@ -26,8 +26,7 @@ __simt_callee__ inline uint32_t OwnerRow(__gm__ Context* ctx,uint32_t b) {
 __simt_callee__ inline uint32_t OutputStride(uint32_t rt_resident,__gm__ Context* ctx) {
     return ctx->outputStride ? uint32_t(ctx->outputStride) : rt_resident;
 }
-__simt_vf__ __aicore__ LAUNCH_BOUND(256)
-inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,
+__simt_callee__ inline void InitializeTailMappingsBody(uint32_t rt_history,uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,
     uint64_t reservedRow=0,uint32_t mappingTag=0) {
 #if V9_COMPACT_RESERVED
     if(reservedRow)ScatterReservedHot(reinterpret_cast<__gm__ uint32_t*>(reservedRow),
@@ -50,6 +49,11 @@ inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm
                 V9_UBMEM_TAGGED_MAP?kMappingSlotMask:UINT32_MAX));
     }
     asc_threadfence();
+}
+__simt_vf__ __aicore__ LAUNCH_BOUND(256)
+inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,
+    uint64_t reservedRow=0,uint32_t mappingTag=0) {
+    InitializeTailMappingsBody(rt_history,rt_resident,ctx,b,reservedRow,mappingTag);
 }
 __simt_callee__ inline bool IsTailToken(__gm__ Context* ctx,uint32_t b,uint32_t token) {
     if(!ctx->tailBounds)return false;

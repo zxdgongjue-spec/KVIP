@@ -430,7 +430,14 @@ def _check_hot_resolver(tmp_path, transport, *, tagged=False):
 
     functions = "\n".join(
         function(metadata, name)
-        for name in ("OwnerRow", "OutputStride", "StoreFallbackSource", "ResolvePhysicalSlot", "InitializeTailMappings")
+        for name in (
+            "OwnerRow",
+            "OutputStride",
+            "StoreFallbackSource",
+            "ResolvePhysicalSlot",
+            "InitializeTailMappingsBody",
+            "InitializeTailMappings",
+        )
     )
     if transport == "ubmem":
         functions = function(metadata, "CurrentMappingTag") + "\n" + functions

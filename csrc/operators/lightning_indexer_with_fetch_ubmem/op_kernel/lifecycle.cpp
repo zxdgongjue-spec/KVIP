@@ -5,12 +5,39 @@
 #include "resolver.h"
 #include "init_partition.h"
 #include "completion.h"
+#include "../../common/lifetch/simt_init.h"
 using namespace AscendC;
 using namespace rotating;
 namespace {
 __aicore__ inline __gm__ Context* GetContext(GM_ADDR bindings) {
     return reinterpret_cast<__gm__ Context*>(reinterpret_cast<__gm__ uint64_t*>(bindings)[14]);
 }
+struct InitRowValues {uint64_t addresses,output;uint32_t error;};
+__aicore__ inline InitRowValues GetInitRowValues(__gm__ Context* ctx,uint32_t b) {
+    auto region=UbmemRegionAt(ctx);
+    uint64_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
+    uint64_t stride=ctx->outputStride?ctx->outputStride:SIM_RESIDENT;
+    uint64_t rowBytes=stride*kTokenBytes;
+    uint32_t error=(!ctx->ubmemStatus || !UbmemRegionValid(region) || !ctx->tokenAddresses ||
+        !ctx->lruSlots || !ctx->reservedHot || !ctx->changeSlots || !ctx->changeCount ||
+        ctx->addressStride<SIM_HISTORY || stride<SIM_RESIDENT || (stride-SIM_RESIDENT)%128 || (ctx->tailBounds && stride<SIM_RESIDENT+384) ||
+        rowBytes%32 || ctx->prefetchLimit>kLruSlots || !ctx->windowLimit || ctx->windowLimit>480 ||
+        (V9_UBMEM_TAGGED_MAP && stride>=kMappingMaxOutputStride))?kUbmemInvalidRegion:0;
+    if(!error && (rowBytes>region->outputBytes || owner>region->outputBytes/rowBytes-1))error=kUbmemInvalidRegion;
+    return {ctx->tokenAddresses+owner*ctx->addressStride*8,
+            error?0:region->outputBase+owner*rowBytes,error};
+}
+#if V9_SIMT_INIT
+__simt_vf__ __aicore__ LAUNCH_BOUND(256)
+inline void InitializeRoundSimt(__gm__ Context* ctx,uint32_t b,uint64_t reservedRow,
+    uint32_t mappingTag,uint64_t mappingState,uint64_t addresses,uint64_t output,uint32_t error) {
+    uint64_t status=ctx->ubmemStatus?ctx->ubmemStatus+uint64_t(b)*kUbmemStatusWords*8:0;
+    InitializeSimtControl<Row,Progress,Event,FinalPost>(ctx,b,SIM_BATCH,kRounds,kServiceLanes,
+        kFinalWorkers,kFinalPostOffset,status,kUbmemStatusWords*2,
+        mappingState,0,addresses,output,0,kLruSlots,error);
+    InitializeTailMappingsBody(SIM_HISTORY,SIM_RESIDENT,ctx,b,reservedRow,mappingTag);
+}
+#endif
 __aicore__ inline void FillWords(uint64_t address,uint32_t words,LocalTensor<uint32_t> local) {
     GlobalTensor<uint32_t> output;output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(address));
     for(uint32_t offset=0;offset<words;offset+=4096) {
@@ -57,10 +84,12 @@ __aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
 #endif
     TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,4096*4);
     auto local=scratch.Get<uint32_t>();
+#if !V9_SIMT_INIT
     Duplicate(local,uint32_t(0),4096);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     InitializeControl(ctx,b,local);
     SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+#endif
     Duplicate(local,UINT32_MAX,4096);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     if(generation.clear)FillWords(ctx->mapping+uint64_t(b)*SIM_HISTORY*4,SIM_HISTORY,local);
@@ -71,6 +100,13 @@ __aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
     reservedRow=ClearReservedHot(ctx->lruSlots,ctx->reservedHot,ctx->queryEnds,b,SIM_RESIDENT,local);
 #endif
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+#if V9_SIMT_INIT
+    const auto values=GetInitRowValues(ctx,b);
+    // Old epoch cache lines were discarded above. The VF is the only Row
+    // writer; no later scalar writeback can restore stale epoch/counter data.
+    Simt::VF_CALL<InitializeRoundSimt>(Simt::Dim3{256,1,1},ctx,b,reservedRow,generation.tag,
+        generation.state,values.addresses,values.output,values.error);
+#else
 #if V9_UBMEM_TAGGED_MAP
     // The Row zero-fill is complete. Persist the epoch for later windows;
     // the init entry publishes this cache line after filling row metadata.
@@ -78,6 +114,7 @@ __aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
 #endif
     CopyInitialLruSlots(ctx,b,local);
     Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},SIM_HISTORY,SIM_RESIDENT,ctx,b,reservedRow,generation.tag);
+#endif
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
     pipe.Destroy();
 }
@@ -158,25 +195,17 @@ extern "C" __global__ __aicore__ void kvip_ubmem_init_kernel(GM_ADDR bindings) {
         uint32_t b=GetBlockIdx();if(b>=SIM_BATCH)return;
         auto ctx=GetContext(bindings);InitializeRound(ctx,b);
 #endif
-        auto region=UbmemRegionAt(ctx);
+#if !V9_SIMT_INIT
         auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
-        uint64_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
-        uint64_t stride=ctx->outputStride?ctx->outputStride:SIM_RESIDENT;
-        uint64_t rowBytes=stride*kTokenBytes;
-        uint32_t error=(!ctx->ubmemStatus || !UbmemRegionValid(region) || !ctx->tokenAddresses ||
-            !ctx->lruSlots || !ctx->reservedHot || !ctx->changeSlots || !ctx->changeCount ||
-            ctx->addressStride<SIM_HISTORY || stride<SIM_RESIDENT || (stride-SIM_RESIDENT)%128 || (ctx->tailBounds && stride<SIM_RESIDENT+384) ||
-            rowBytes%32 || ctx->prefetchLimit>kLruSlots || !ctx->windowLimit || ctx->windowLimit>480 ||
-            (V9_UBMEM_TAGGED_MAP && stride>=kMappingMaxOutputStride))?kUbmemInvalidRegion:0;
-        if(!error && (rowBytes>region->outputBytes || owner>region->outputBytes/rowBytes-1))error=kUbmemInvalidRegion;
+        const auto values=GetInitRowValues(ctx,b);
 #if !V9_UBMEM_TAGGED_MAP
         row->mappingState=0;
 #endif
         row->reserved1=0;row->reserved2=0;
-        row->addresses=ctx->tokenAddresses+owner*ctx->addressStride*8;
-        row->output=error?0:region->outputBase+owner*rowBytes;
-        row->limit=kSlots;row->prefetchLimit=ctx->prefetchLimit;row->copyLimit=kLruSlots;row->error=error;
+        row->addresses=values.addresses;row->output=values.output;
+        row->limit=kSlots;row->prefetchLimit=ctx->prefetchLimit;row->copyLimit=kLruSlots;row->error=values.error;
         ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),sizeof(Row));
+#endif
     }
 #endif
 }
