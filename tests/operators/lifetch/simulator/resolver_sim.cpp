@@ -26,7 +26,7 @@ int main(int argc,char** argv) {
   unsigned misses=argc>1?std::stoul(argv[1]):3000;
   if(misses<512 || misses>8192)throw std::runtime_error("misses must be 512..8192");
   check(aclInit(nullptr));check(aclrtSetDevice(0));aclrtStream stream;check(aclrtCreateStream(&stream));
-  rotating::Context ctx{};ctx.shape.history=h;ctx.shape.resident=r;ctx.shape.finalWorkers=workers;ctx.shape.tokenBytes=656;
+  rotating::Context ctx{};ctx.shape.batch=1;ctx.shape.history=h;ctx.shape.resident=r;ctx.shape.finalWorkers=workers;ctx.shape.tokenBytes=656;
   std::vector<void*> allocations;
   auto bind=[&](uint64_t& field,auto const& data){void* p=upload(data);allocations.push_back(p);field=(uint64_t)p;};
   std::vector<uint32_t> selected(8192),mapping(h,UINT32_MAX),candidates(2048),slots(capacity),changes(capacity,UINT32_MAX);
