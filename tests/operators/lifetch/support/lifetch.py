@@ -31,7 +31,7 @@ def seed_native_bitmap(torch, native, row, bitmap):
 
 def run(args, run_dir):
     suffix = ("_early" if args.early_fetch else "") + ("_safe" if args.avoid_prefetch_slots else "")
-    source = SOURCE.with_name(SOURCE.name + suffix) if suffix else SOURCE
+    source = SOURCE.with_name(SOURCE.name + "_streaming") if args.streaming else (SOURCE.with_name(SOURCE.name + suffix) if suffix else SOURCE)
     from attention import check_sfa
     from contract_payload import payload
     from kvip.operators.lifetch import binding as launch_module
@@ -184,7 +184,7 @@ def run(args, run_dir):
             continue
         times = report["timing"]
         line = (
-            f"binary_sha256={built_digest} early_fetch={args.early_fetch}\nBS={batch} prototype PASS index_heads={args.index_heads} windows={geometry['intermediate_fetches']} requested_windows={args.intermediate_fetches} history={args.history} hot={args.resident} topk=2048 Q=4 graph=True\n"
+            f"binary_sha256={built_digest} early_fetch={args.early_fetch} streaming={args.streaming}\nBS={batch} prototype PASS index_heads={args.index_heads} windows={geometry['intermediate_fetches']} requested_windows={args.intermediate_fetches} history={args.history} hot={args.resident} topk=2048 Q=4 graph=True\n"
             + "graph_p50_us="
             + ", ".join((f"{k}:{v['p50_us']:.3f}" for k, v in times.items()))
             + f"\ncore_speedup={times['native_chain']['p50_us'] / times['prototype_core']['p50_us']:.3f}x"
@@ -401,7 +401,11 @@ def run_device(
         locations=rotating.locations,
         rotating=rotating,
     )
-    pipeline = LIFetchForward(rotating, update)
+    if args.streaming:
+        from streaming_forward import StreamingForward
+        pipeline = StreamingForward(rotating, update, torch, args.prefetch_tokens)
+    else:
+        pipeline = LIFetchForward(rotating, update)
     saved = [arguments[i].clone() for i in (1, 4, 13)]
 
     def reset():
@@ -503,6 +507,17 @@ def run_device(
                 )
         state["ids"], state["slots"] = (ids, slots.numpy())
 
+    def verify_all_valid_hot():
+        """Catch stale KV beyond the current TopK, including displaced slots."""
+        valid = rotating.hot_valid.cpu().numpy().reshape(b, r)
+        logical = update.logical.cpu().long()
+        hot_kv = owner.output[:, :r].cpu()
+        for row in range(b):
+            mask = torch.from_numpy(valid[row] != 0)
+            expected = owner.session.cpu_payload[row, logical[row, :r][mask]]
+            if not torch.equal(hot_kv[row, mask], expected):
+                raise AssertionError(f"valid hot slot has mismatched Index/KV owner: request={row}")
+
     if args.resolver_compare:
         from resolver import run
 
@@ -569,6 +584,19 @@ def run_device(
     restored_hot = hot_case["hot_changes"]
     if not hot_case["first_window_fetches"] or not restored_hot:
         raise AssertionError(f"First window did not Fetch former hot candidates into LRU slots: {hot_case}")
+
+    if args.streaming:
+        # The standalone checks above use the baseline resolver/update. Exercise
+        # the actual streaming graph path as well, including the victim case.
+        for label, orders in (("regular", initial_orders), ("hot-victim-collision", unlucky)):
+            state["check_phase"] = f"streaming {label}"
+            reset()
+            update.set_order(orders)
+            full()
+            stream.synchronize()
+            verify(True)
+            verify_all_valid_hot()
+            print(f"STREAMING CHECK PASS {label}: selected KV and all valid hot KV/Index match", flush=True)
 
     def init_reset():
         reset()
@@ -647,6 +675,8 @@ def run_device(
         graph.replay()
         stream.synchronize()
         verify(True)
+        if args.streaming:
+            verify_all_valid_hot()
         for row, p in enumerate(policies):
             touched = state["slots"][row]
             p.commit(touched[touched < r].astype(np.int32))
@@ -707,7 +737,8 @@ def run_device(
             prefetch_tokens=args.prefetch_tokens,
             former_hot_changes_checked=restored_hot,
             first_window_fetches_checked=hot_case["first_window_fetches"],
-            scope="Producer records include final hot fallback; no temporary KV slots; zero KV copy",
+            scope=("Standalone update counters use baseline resolver, not streaming; " if args.streaming else "")
+            + "Producer records include final hot fallback; no temporary KV slots; zero KV copy",
         ),
         kernel="KVIP/csrc/operators/lightning_indexer_with_fetch; preserved core tiling, direct LRU interface",
         scope="fixed Q4 shared history; graph kernel and AIV maintenance separately; no ABC growth",

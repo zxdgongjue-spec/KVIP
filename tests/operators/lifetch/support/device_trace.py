@@ -72,6 +72,11 @@ def account(events, name, elapsed, *, full=False):
                     publish="kvop_direct_update_outputs_early_kernel",
                     apply="kvop_direct_apply_owned_kernel", fetch="v9_fetch_update_kernel")
                if full else {stage: f"v9_{stage}_kernel" for stage in STAGES})
+    if full and any(e.get("name", "").lower().startswith("v9_streaming_resolve_update") for e in events):
+        # This kernel contains both resolver and index update; reporting separate
+        # kernel durations would invent a boundary that does not exist.
+        kernels = dict(init="v9_init_kernel", li="v9_li_kernel",
+                       resolve_update="v9_streaming_resolve_update", fetch="v9_fetch_update_kernel")
     if any(e.get("name", "").lower().startswith("v9_early_fetch_kernel") for e in events):
         kernels["early_fetch"] = "v9_early_fetch_kernel"
     groups = {stage: [] for stage in kernels}
