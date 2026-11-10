@@ -20,36 +20,36 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PublishPrefetch(
  for(uint32_t i=threadIdx.x;i<count;i+=512){asc_stcg(outSource+i,asc_ldcg(source+i));asc_stcg(outDest+i,asc_ldcg(dest+i));}
  asc_threadfence();asc_syncthreads();
 }
-__aicore__ inline void Producer(__gm__ Args* a) {
+__aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
- auto row=reinterpret_cast<__gm__ Row*>(ctx->rows);auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags);
- auto ticks=reinterpret_cast<__gm__ uint64_t*>(a->times);
+ auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
+ auto ticks=reinterpret_cast<__gm__ uint64_t*>(a->times)+b*64;
  TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,kFinalScratchBytes);auto local=scratch.Get<uint32_t>();
- Simt::VF_CALL<PublishPrefetch>(Simt::Dim3{512,1,1},reinterpret_cast<__gm__ uint32_t*>(ctx->changes),
-  reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots),reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc),
-  reinterpret_cast<__gm__ uint32_t*>(a->eventsDst),a->prefetchCount);
+ Simt::VF_CALL<PublishPrefetch>(Simt::Dim3{512,1,1},reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+b*10240,
+  reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+b*10240,reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+b*a->maxEvents,
+  reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+b*a->maxEvents,a->prefetchCount);
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  flags[0].count=a->prefetchCount;flags[0].ready=1;ticks[0]=GetSystemCycle();
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&flags[0]),sizeof(BatchFlag));
  auto selected=local,loc=local[kSlots],keys=local[2*kSlots],ranks=local[3*kSlots];
  auto ids=local[4*kSlots].ReinterpretCast<uint16_t>();
  auto slots=local[kFinalSlotsOffset],work=local[kFinalPositionsOffset],ctl=local[kFinalControlOffset];
- GlobalTensor<uint32_t> input;input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->selected));DataCopy(selected,input,kSlots);
- input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations));DataCopy(loc,input,kSlots);
- input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->hits));DataCopy(ctl[1024],input,(shape.resident+31)/32);
- input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots));DataCopy(work[4096],input,kLruSlots);
+ GlobalTensor<uint32_t> input;input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->selected)+b*kSlots);DataCopy(selected,input,kSlots);
+ input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*kSlots);DataCopy(loc,input,kSlots);
+ input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->hits)+b*((shape.resident+31)/32));DataCopy(ctl[1024],input,(shape.resident+31)/32);
+ input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots);DataCopy(work[4096],input,kLruSlots);
  SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
  Simt::VF_CALL<StagedInitializeReady>(Simt::Dim3{512,1,1},FinalPtr(selected),FinalPtr(loc),FinalPtr(keys),FinalPtr(ranks),FinalPtr(ctl));
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
- GlobalTensor<uint32_t> output;output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations));
- auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus);
+ GlobalTensor<uint32_t> output;output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*kSlots);
+ auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*32;
  for(uint32_t q=0;q<4 && !ctl.GetValue(1);++q){
-  Simt::VF_CALL<StagedQuery>(Simt::Dim3{512,1,1},q,shape.history,shape.resident,shape.tokenBytes,0,row->slots,ctx,
+  Simt::VF_CALL<StagedQuery>(Simt::Dim3{512,1,1},q,shape.history,shape.resident,shape.tokenBytes,b,row->slots,ctx,
    FinalPtr(selected),FinalPtr(loc),FinalPtr(keys),FinalPtr(ranks),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(work),FinalPtr(ctl));
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
   uint32_t total=ctl.GetValue(0),added=ctl.GetValue(2+q),error=ctl.GetValue(1);
   if(!error) Simt::VF_CALL<PublishQ>(Simt::Dim3{512,1,1},FinalPtr(selected),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),
-    reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc),reinterpret_cast<__gm__ uint32_t*>(a->eventsDst),total-added,total);
+    reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+b*a->maxEvents,reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+b*a->maxEvents,total-added,total);
   SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);DataCopy(output[q*kTop],loc[q*kTop],kTop);
   SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
   flags[q+1].count=added;flags[q+1].error=error;flags[q+1].ready=1;
@@ -64,10 +64,10 @@ __aicore__ inline void Producer(__gm__ Args* a) {
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ticks),128);
  pipe.Destroy();
 }
-__aicore__ inline void Consumer(__gm__ Args* a) {
- auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags);auto status=reinterpret_cast<__gm__ uint32_t*>(a->workerStatus);
+__aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
+ auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;auto status=reinterpret_cast<__gm__ uint32_t*>(a->workerStatus)+b*32;
  // Producer and consumer must not write the same cache lines.
- auto ticks=reinterpret_cast<__gm__ uint64_t*>(a->times)+32;auto ctx=reinterpret_cast<__gm__ Context*>(a->context);
+ auto ticks=reinterpret_cast<__gm__ uint64_t*>(a->times)+b*64+32;auto ctx=reinterpret_cast<__gm__ Context*>(a->context);
  TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,SCRATCH_WORDS*4);auto local=scratch.Get<uint32_t>();
  auto work=reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr());
  ticks[10]=GetSystemCycle();Simt::VF_CALL<InitShadow>(Simt::Dim3{THREADS,1,1},work);
@@ -80,14 +80,14 @@ __aicore__ inline void Consumer(__gm__ Args* a) {
   uint32_t count=flags[phase].count;
   if(flags[phase].error){error=flags[phase].error;break;}
   uint32_t begin=phase?kPrefetch+total:0;
-  auto source=reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc);
-  auto dest=reinterpret_cast<__gm__ uint32_t*>(a->eventsDst);
+  auto source=reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+b*a->maxEvents;
+  auto dest=reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+b*a->maxEvents;
   ticks[12+2*phase]=GetSystemCycle();
-  Simt::VF_CALL<ApplyBatch>(Simt::Dim3{THREADS,1,1},source,dest,begin,count,reinterpret_cast<__gm__ uint64_t*>(a->keys),reinterpret_cast<__gm__ uint32_t*>(a->scales),work);
+  Simt::VF_CALL<ApplyBatch>(Simt::Dim3{THREADS,1,1},source,dest,begin,count,reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(b)*a->history*16,reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(b)*a->history,work);
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
   error=local.GetValue(CONTROL);ticks[13+2*phase]=GetSystemCycle();if(phase)total+=count;
  }
- if(!error){ticks[22]=GetSystemCycle();Simt::VF_CALL<CommitMetadata>(Simt::Dim3{THREADS,1,1},reinterpret_cast<__gm__ uint64_t*>(a->addresses),reinterpret_cast<__gm__ uint64_t*>(a->logical),work);
+ if(!error){ticks[22]=GetSystemCycle();Simt::VF_CALL<CommitMetadata>(Simt::Dim3{THREADS,1,1},reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(b)*a->history,reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(b)*a->history,work);
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);ticks[23]=GetSystemCycle();}
  status[0]=error;status[1]=total;status[2]=local.GetValue(CONTROL+4);ticks[24]=GetSystemCycle();
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),128);
@@ -97,6 +97,6 @@ __aicore__ inline void Consumer(__gm__ Args* a) {
 extern "C" __global__ __aicore__ void test_pipeline_ab_parallel(GM_ADDR arg) {
 #if defined(__CCE_AICORE__)
  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
- if ASCEND_IS_AIV {auto a=reinterpret_cast<__gm__ Args*>(arg);if(GetBlockIdx()==0)Producer(a);else if(GetBlockIdx()==1)Consumer(a);}
+ if ASCEND_IS_AIV {auto a=reinterpret_cast<__gm__ Args*>(arg);uint32_t block=GetBlockIdx(),b=block/2;if(b<LoadRuntimeShape(reinterpret_cast<__gm__ Context*>(a->context)).batch){if(block%2==0)Producer(a,b);else Consumer(a,b);}}
 #endif
 }
