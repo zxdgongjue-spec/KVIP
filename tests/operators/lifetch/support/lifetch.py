@@ -16,7 +16,6 @@ from runner import progress
 ROOT = Path(__file__).resolve().parents[4]
 SOURCE = ROOT / "csrc/operators/lightning_indexer_with_fetch"
 NATIVE_BITMAP_WORDS = 4176
-AUTO_CORE_TRACE_ROUNDS = 3
 
 
 def prepare_native_bitmap(torch, native):
@@ -342,10 +341,9 @@ def run_device(
             save(args.comparison_output, state["ids"], state["slots"], owner.output.cpu().numpy(),
                  rotating.mapping.cpu().numpy(), rotating.lru_slots.cpu().numpy(),
                  rotating.rows.cpu().numpy().view(np.uint32), owner.remote_token_addresses.cpu().numpy())
-        if trace_core:
-            core_trace.update(
-                collect_core(torch, rotating, graph, reset, check, args.trace_rounds or AUTO_CORE_TRACE_ROUNDS, folder)
-            )
+        if trace_core and args.trace_rounds:
+            progress(folder.parent, f"BS={b}: core graph profiler ({args.trace_rounds} replays); logs={folder}")
+            core_trace.update(collect_core(torch, rotating, graph, reset, check, args.trace_rounds, folder))
         graph.reset()
         owner.graphs.remove(graph)
         return dict(p50_us=float(np.median(samples)), p99_us=float(np.percentile(samples, 99)), samples=len(samples))
