@@ -30,6 +30,35 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(32) inline void PublishStreamingUpdateStatus
  if(!threadIdx.x)asc_stcg(status+b,error);
  asc_threadfence();
 }
+__aicore__ inline void PublishQueryOutputs(__gm__ uint64_t* update,uint32_t batchCount,uint32_t batch,uint32_t query,
+ LocalTensor<uint32_t> selected,LocalTensor<uint32_t> loc,LocalTensor<uint32_t> work) {
+ if(!update[20]||!update[21]||!update[22]||!update[23])return;
+ auto values=work[64];
+ Duplicate(work,uint32_t(0),8);PipeBarrier<PIPE_V>();
+ Simt::VF_CALL<PrepareStagedQueryOutputs>(Simt::Dim3{512,1,1},update,batchCount,batch,query,
+  FinalPtr(selected),FinalPtr(work),FinalPtr(values));
+ SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+ GlobalTensor<uint32_t> logicalOut,slotOut;
+ logicalOut.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(update[22]));
+ slotOut.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(update[23]));
+ const uint32_t words=(batchCount*4+31)/32;
+ for(uint32_t w=0;w<words;++w){uint32_t mask=work.GetValue(w);while(mask){
+  uint32_t row=w*32+__builtin_ctz(mask);
+  DataCopy(logicalOut[row*kTop],values,kTop);DataCopy(slotOut[row*kTop],loc[query*kTop],kTop);
+  mask&=mask-1;
+ }}
+ uint32_t pad0=work.GetValue(2),pad1=words>1?work.GetValue(3):0;
+ if(pad0||pad1){
+  SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+  Duplicate(values,UINT32_MAX,kTop);SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+  for(uint32_t w=0;w<words;++w){uint32_t mask=w?pad1:pad0;while(mask){
+   uint32_t row=w*32+__builtin_ctz(mask);
+   DataCopy(logicalOut[row*kTop],values,kTop);DataCopy(slotOut[row*kTop],values,kTop);
+   mask&=mask-1;
+  }}
+ }
+ SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+}
 __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
@@ -79,9 +108,7 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
   if(profile)ticks[11+q*5]=GetSystemCycle();
   uint32_t total=ctl.GetValue(0),added=ctl.GetValue(2+q),error=ctl.GetValue(1);
   if(!error && a->updateBindings){
-   Simt::VF_CALL<PublishStagedQueryOutputs>(Simt::Dim3{512,1,1},
-    reinterpret_cast<__gm__ uint64_t*>(a->updateBindings),shape.batch,b,q,FinalPtr(selected),FinalPtr(loc),FinalPtr(work));
-   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+   PublishQueryOutputs(reinterpret_cast<__gm__ uint64_t*>(a->updateBindings),shape.batch,b,q,selected,loc,work);
   }
   if(profile)ticks[12+q*5]=GetSystemCycle();
   if(!error && q==3){

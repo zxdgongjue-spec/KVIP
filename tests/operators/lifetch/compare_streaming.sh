@@ -54,7 +54,7 @@ for variant in ('baseline-safe', 'streaming'):
                 raise SystemExit(f'streaming BS={batch}: missing per-request device timestamps: {trace_path}')
             def worst_median(fn):
                 return round(statistics.median(max(fn(x) for x in replay) for replay in details))
-            li_keys = ('mapping_wait','barrier','load_first','classify_first','wait_second','classify_second','publish')
+            li_keys = ('mapping_wait','barrier','load_first','classify_first','wait_second','classify_second','bitmap_merge','publish')
             li = {k: worst_median(lambda x, k=k: max(q[k] for q in x['li'])) for k in li_keys}
             qkeys = ('resolve', 'output', 'pack', 'publish')
             producer = {k: worst_median(lambda x, k=k: sum(q[k] for q in x['producer'])) for k in qkeys}

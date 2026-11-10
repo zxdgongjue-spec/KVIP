@@ -4,6 +4,7 @@
 #pragma once
 namespace rotating {
 constexpr uint32_t kClassifyThreads=512;
+constexpr uint32_t kBitmapWords=512,kBitmapShards=8;
 __simt_vf__ __aicore__ LAUNCH_BOUND(kClassifyThreads)
 inline void ClassifyTopkHalf(uint32_t history,uint32_t resident,uint32_t batch,
     uint32_t used,uint32_t halfBase,uint32_t halfSize,uint32_t tailBegin,uint32_t tailEnd,
@@ -26,8 +27,17 @@ inline void ClassifyTopkHalf(uint32_t history,uint32_t resident,uint32_t batch,
            (!hasReserved || reserved[token-halfBase]<0))slot=token;
         else if(used || hasTail)slot=ResolvePhysicalSlot(resident,lru,asc_ldcg(mapping+token));
         locations[i]=slot;
-        if(slot<resident)asc_atomic_or(bitmap+slot/32,1U<<(slot%32));
+        if(slot<resident)asc_atomic_or(bitmap+(threadIdx.x%kBitmapShards)*kBitmapWords+slot/32,1U<<(slot%32));
     }
+    asc_syncthreads();
+}
+// The first shard becomes the exact per-query protection bitmap. Sharding
+// limits contention between lanes without changing which slots are protected.
+__simt_vf__ __aicore__ LAUNCH_BOUND(kClassifyThreads)
+inline void MergeClassifyBitmap(__ubuf__ uint32_t* bitmap) {
+    uint32_t word=threadIdx.x,value=bitmap[word];
+    for(uint32_t shard=1;shard<kBitmapShards;++shard)value|=bitmap[shard*kBitmapWords+word];
+    bitmap[word]=value;
     asc_syncthreads();
 }
 }

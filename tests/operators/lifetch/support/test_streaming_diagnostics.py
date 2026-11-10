@@ -25,6 +25,7 @@ def test_decode_two_requests_and_all_query_stages():
             p[10 + q * 5:15 + q * 5] = np.arange(10, 15) + q * 10
             li[b, q, :8] = np.arange(100, 108) + q * 10
             li[b, q, 8:10] = [1, 1]
+            li[b, q, 10:12] = [106 + q * 10, 107 + q * 10]
         u[10], u[24] = 10, 100
         for phase in range(5):
             u[12 + phase * 2:14 + phase * 2] = [20 + phase * 10, 25 + phase * 10]
@@ -40,4 +41,5 @@ def test_decode_two_requests_and_all_query_stages():
         assert row['update_wait'] == [10, 5, 5, 5, 5]
         assert len(row['li']) == len(row['producer']) == 4
         assert all(q['overlap'] and q['topk_only'] for q in row['li'])
+        assert all(q['bitmap_merge'] == 1 and q['publish'] == 0 for q in row['li'])
         assert all(q['resolve'] == q['output'] == q['pack'] == q['publish'] == 1 for q in row['producer'])

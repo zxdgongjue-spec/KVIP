@@ -294,7 +294,7 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe, bool topkOnly)
         pipe->InitBuffer(streamingValidBuf_, 8192 * sizeof(uint32_t));
         pipe->InitBuffer(streamingReservedBuf_, 8192 * sizeof(uint32_t));
         pipe->InitBuffer(streamingOutputBuf_, 2048 * sizeof(uint32_t));
-        pipe->InitBuffer(streamingBitmapBuf_, (512 + 8) * sizeof(uint32_t));
+        pipe->InitBuffer(streamingBitmapBuf_, (rotating::kBitmapShards * rotating::kBitmapWords + 8) * sizeof(uint32_t));
         streamingValid_ = streamingValidBuf_.Get<uint32_t>();
         streamingReserved_ = streamingReservedBuf_.Get<uint32_t>();
         streamingOutput_ = streamingOutputBuf_.Get<uint32_t>();
@@ -685,7 +685,11 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
         }
     }
     if(profile)liTicks[1]=GetSystemCycle();
-    PipeBarrier<PIPE_ALL>();
+    // A final-TopK-only phase has no outstanding cube/score work; mirror the
+    // validated TopK flow and join the vector pipe before reusing its scratch.
+    // The combined LI phase retains its original full-pipeline boundary.
+    if(streamingTopkOnly_)PipeBarrier<PIPE_V>();
+    else PipeBarrier<PIPE_ALL>();
     if(profile)liTicks[2]=GetSystemCycle();
     LocalTensor<uint32_t> valid,reserved,result,bitmap;
     if(streamingTopkOnly_) {
@@ -697,7 +701,8 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
         reserved=mrgValueLocal_.template ReinterpretCast<uint32_t>();
         result=topkSharedTmpLocal_;bitmap=topkSharedTmpLocal_[2048];
     }
-    Duplicate(bitmap,uint32_t(0),520);PipeBarrier<PIPE_V>();
+    constexpr uint32_t bitmapWords=rotating::kBitmapShards*rotating::kBitmapWords;
+    Duplicate(bitmap,uint32_t(0),bitmapWords+8);PipeBarrier<PIPE_V>();
     uint32_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
     auto row=reinterpret_cast<__gm__ rotating::Row*>(ctx->rows)+b;
     uint32_t used=row->slots,tailBegin=0,tailEnd=0;
@@ -734,9 +739,12 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
           ctx->hotValid!=0,ctx->reservedHot!=0,ctx->tailBounds!=0,ctx,
           reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(result.GetPhyAddr()),
           reinterpret_cast<__ubuf__ uint32_t*>(valid.GetPhyAddr()),reinterpret_cast<__ubuf__ int32_t*>(reserved.GetPhyAddr()),
-          reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(bitmap[512].GetPhyAddr()));
+          reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(bitmap[bitmapWords].GetPhyAddr()));
         if(profile){SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);liTicks[4+half*2]=GetSystemCycle();}
     }
+    if(profile)liTicks[10]=GetSystemCycle();
+    Simt::VF_CALL<rotating::MergeClassifyBitmap>(Simt::Dim3{512,1,1},reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()));
+    if(profile){SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);liTicks[11]=GetSystemCycle();}
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     GlobalTensor<uint32_t> output,bits;
     output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+uint64_t(query)*2048);
@@ -744,7 +752,7 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     DataCopy(output,result,2048);DataCopy(bits,bitmap,512);
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-    errors[query*32]=bitmap.GetValue(512);kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);
+    errors[query*32]=bitmap.GetValue(bitmapWords);kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);
     if(profile){liTicks[7]=GetSystemCycle();liTicks[8]=overlapSecond?1:0;liTicks[9]=streamingTopkOnly_?1:0;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(liTicks),128);}
 }

@@ -70,12 +70,13 @@ class StreamingForward:
             queries = []
             for q in range(4):
                 t = li[b, q]
-                if not all(int(v) for v in t[:8]):
+                if not all(int(v) for v in t[:8]) or not int(t[10]) or not int(t[11]):
                     raise AssertionError(f'missing LI diagnostic timestamps: batch={b} query={q}')
                 queries.append(dict(mapping_wait=int(t[1]-t[0]), barrier=int(t[2]-t[1]),
                                     load_first=int(t[3]-t[2]), classify_first=int(t[4]-t[3]),
                                     wait_second=int(t[5]-t[4]), classify_second=int(t[6]-t[5]),
-                                    publish=int(t[7]-t[6]), overlap=bool(t[8]), topk_only=bool(t[9])))
+                                    bitmap_merge=int(t[11]-t[10]), publish=int(t[7]-t[11]),
+                                    overlap=bool(t[8]), topk_only=bool(t[9])))
             producer = []
             for q in range(4):
                 t = p[10+5*q:15+5*q]
