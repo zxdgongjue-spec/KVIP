@@ -8,6 +8,7 @@ from decimal import Decimal
 import numpy as np
 
 STAGES = ("init", "li", "resolve", "fetch")
+TOKEN_BYTES = 656
 
 
 def footprint(addresses, token_bytes=656):
@@ -140,13 +141,16 @@ def collect_core(torch, rotating, graph, reset, verify, rounds, folder):
                 end.synchronize()
             verify()
             rows = rotating.rows.cpu().numpy().view(np.uint32)
+            prefetch_rows = int(rows[:, 9].astype(np.uint64).sum())
+            final_rows = int(rows[:, 247].astype(np.uint64).sum())
             samples.append(
                 dict(
                     name=name,
                     round=step,
                     us=begin.elapsed_time(end) * 1000,
-                    prefetch=int(rows[:, 9].astype(np.uint64).sum()),
-                    final=int(rows[:, 247].astype(np.uint64).sum()),
+                    prefetch=prefetch_rows,
+                    final=final_rows,
+                    fetch_bytes=(prefetch_rows + final_rows) * TOKEN_BYTES,
                     epochs=rows[:, 16 : 16 + rotating.rounds].astype(np.uint64).sum(axis=0).tolist(),
                 )
             )
@@ -159,10 +163,84 @@ def collect_core(torch, rotating, graph, reset, verify, rounds, folder):
     events = trace["traceEvents"] if isinstance(trace, dict) else trace
     for sample in samples:
         sample["accounting"] = account(events, sample["name"], sample["us"])
+        _annotate_transport(sample)
     result = dict(samples=samples, trace=str(path))
     (folder / "core_attribution.json").write_text(json.dumps(result, indent=2))
     (folder / "core_summary.log").write_text(core_summary(result) + "\n")
     return result
+
+
+def _annotate_transport(sample):
+    """Split the round into KVAF-transfer time and the transport-independent part.
+
+    ``kvaf_fetch_us`` is the time the round spends waiting for KVAF BatchGet to
+    complete; it is the term that tracks link bandwidth contention. Everything
+    else (init + LI + resolve + inter-kernel gap + boundary residual) does not
+    depend on KVAF transfer speed, so ``unaffected_us`` is the stable part.
+    """
+    account = sample.get("accounting", {})
+    fetch_us = account.get("stages_us", {}).get("fetch")
+    fetch_bytes = sample.get("fetch_bytes", 0)
+    sample["kvaf_fetch_us"] = fetch_us
+    sample["kvaf_fetch_GBps"] = (
+        round(fetch_bytes / (fetch_us * 1000.0), 3) if fetch_us and fetch_us > 0 else None
+    )
+    if fetch_us is not None:
+        unaffected = sample["us"] - fetch_us
+        sample["unaffected_us"] = round(unaffected, 3)
+        sample["unaffected_pct"] = round(unaffected * 100.0 / sample["us"], 2) if sample["us"] else None
+    else:
+        sample["unaffected_us"] = None
+        sample["unaffected_pct"] = None
+
+
+def bandwidth_summary(result):
+    """Aggregate KVAF bandwidth, its cost, and the transport-independent part."""
+    rows = [
+        r for r in result.get("samples", [])
+        if r.get("kvaf_fetch_us") is not None and r.get("fetch_bytes")
+    ]
+    if not rows:
+        return None
+    mean = lambda key: sum(r[key] for r in rows) / len(rows)
+    lo = lambda key: min(r[key] for r in rows)
+    hi = lambda key: max(r[key] for r in rows)
+    fetch_us = [r["kvaf_fetch_us"] for r in rows]
+    gbps = [r["kvaf_fetch_GBps"] for r in rows]
+    return dict(
+        rounds=len(rows),
+        fetch_bytes_mean=mean("fetch_bytes"),
+        kvaf_fetch_us_mean=mean("kvaf_fetch_us"),
+        kvaf_fetch_us_min=lo("kvaf_fetch_us"),
+        kvaf_fetch_us_max=hi("kvaf_fetch_us"),
+        kvaf_fetch_us_swing=max(fetch_us) / min(fetch_us) if min(fetch_us) else None,
+        kvaf_fetch_GBps_mean=mean("kvaf_fetch_GBps"),
+        kvaf_fetch_GBps_min=lo("kvaf_fetch_GBps"),
+        kvaf_fetch_GBps_max=hi("kvaf_fetch_GBps"),
+        round_us_mean=mean("us"),
+        unaffected_us_mean=mean("unaffected_us"),
+        unaffected_us_min=lo("unaffected_us"),
+        unaffected_us_max=hi("unaffected_us"),
+        unaffected_pct_mean=mean("unaffected_pct"),
+    )
+
+
+def bandwidth_line(result):
+    """One-line, parseable summary that separates KVAF transfer from stable work."""
+    summary = bandwidth_summary(result)
+    if not summary:
+        return None
+    swing = summary["kvaf_fetch_us_swing"]
+    return (
+        "KVAF BANDWIDTH: rounds={rounds} fetch_bytes_mean={fetch_bytes_mean:.0f} "
+        "kvaf_fetch_us mean={kvaf_fetch_us_mean:.3f} min={kvaf_fetch_us_min:.3f} "
+        "max={kvaf_fetch_us_max:.3f} swing={swing:.2f}x "
+        "kvaf_GBps mean={kvaf_fetch_GBps_mean:.3f} min={kvaf_fetch_GBps_min:.3f} "
+        "max={kvaf_fetch_GBps_max:.3f} | round_us_mean={round_us_mean:.3f} "
+        "unaffected_us mean={unaffected_us_mean:.3f} min={unaffected_us_min:.3f} "
+        "max={unaffected_us_max:.3f} ({unaffected_pct_mean:.1f}% of round) "
+        "= round minus KVAF fetch wait; this part does not track link bandwidth"
+    ).format(**summary, swing=swing or 0.0)
 
 
 def core_summary(result):
@@ -177,8 +255,14 @@ def core_summary(result):
             f"round={row['round']} total_us={row['us']:.3f} "
             + " ".join(f"{key}_us={value:.3f}" for key, value in values.items())
             + f" sum_us={sum(values.values()):.3f} prefetch={row['prefetch']} final={row['final']}"
+            + f" fetch_bytes={row.get('fetch_bytes', 0)}"
+            + f" kvaf_fetch_us={row.get('kvaf_fetch_us')} kvaf_GBps={row.get('kvaf_fetch_GBps')}"
+            + f" unaffected_us={row.get('unaffected_us')} unaffected_pct={row.get('unaffected_pct')}"
             + f" epochs={row['epochs']}"
         )
+    line = bandwidth_line(result)
+    if line:
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -254,9 +338,12 @@ def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder):
                 end.synchronize()
             verify()
             rows = rotating.rows.cpu().numpy().view(np.uint32)
+            prefetch_rows = int(rows[:, 9].astype(np.uint64).sum())
+            final_rows = int(rows[:, 247].astype(np.uint64).sum())
             samples.append({"name": name, "round": step, "us": begin.elapsed_time(end) * 1000,
-                            "prefetch": int(rows[:, 9].astype(np.uint64).sum()),
-                            "final": int(rows[:, 247].astype(np.uint64).sum())})
+                            "prefetch": prefetch_rows,
+                            "final": final_rows,
+                            "fetch_bytes": (prefetch_rows + final_rows) * TOKEN_BYTES})
     (folder / "samples.json").write_text(json.dumps(samples, indent=2))
     trace_path = folder / "trace.json"
     profile.export_chrome_trace(str(trace_path.resolve()))
@@ -267,6 +354,7 @@ def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder):
         account = sample["accounting"]
         if "error" not in account and hasattr(rotating.library, "v9_fetch_workers") and not account["fetch_separate"]:
             account["error"] = "Separate fetch kernel expected but absent from trace"
+        _annotate_transport(sample)
     (folder / "attribution.json").write_text(json.dumps(samples, indent=2))
     for sample in samples:
         account = sample["accounting"]
@@ -277,6 +365,12 @@ def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder):
               + " ".join(f"{key}_us={value:.3f}" for key, value in account["stages_us"].items())
               + f" span_us={account['kernel_span_us']:.3f} gap_us={account['inter_kernel_gap_us']:.3f}"
               + f" boundary_us={account['boundary_residual_us']:.3f} overlap_us={account['overlap_us']:.3f}"
+              + f" fetch_bytes={sample.get('fetch_bytes', 0)}"
+              + f" kvaf_fetch_us={sample.get('kvaf_fetch_us')} kvaf_GBps={sample.get('kvaf_fetch_GBps')}"
+              + f" unaffected_us={sample.get('unaffected_us')} unaffected_pct={sample.get('unaffected_pct')}"
               + f" fetch_separate={account['fetch_separate']} prefetch={sample['prefetch']} final={sample['final']}",
               flush=True)
+    line = bandwidth_line(dict(samples=samples))
+    if line:
+        print(line, flush=True)
     print(f"UBMEM_TRACE_FILES {folder}", flush=True)
