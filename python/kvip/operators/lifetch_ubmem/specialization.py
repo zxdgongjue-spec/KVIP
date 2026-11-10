@@ -30,6 +30,8 @@ class Specialization:
     grouped_copy: bool = False
     tagged_map: bool = False
     final_copy_stages: int = 4
+    merge_outputs: bool = False
+    ordered_pair: bool = False
 
     def __post_init__(self):
         if any(
@@ -41,11 +43,15 @@ class Specialization:
                 "compact_reserved",
                 "grouped_copy",
                 "tagged_map",
+                "merge_outputs",
+                "ordered_pair",
             )
         ):
             raise ValueError("UBmem optimization switches must be booleans")
         if self.tagged_map and self.parallel_init:
             raise ValueError("Tagged mapping requires one init worker per request")
+        if self.ordered_pair and not (self.grouped_copy and self.token_bytes == 2624):
+            raise ValueError("Ordered pair copy requires grouped four-layer copy")
         if type(self.final_copy_stages) is not int or self.final_copy_stages not in (4, 8):
             raise ValueError("UBmem final_copy_stages must be 4 or 8")
         if self.final_copy_stages == 8 and not (self.grouped_copy and self.token_bytes == 2624):
@@ -87,6 +93,8 @@ class Specialization:
             UBMEM_GROUPED_COPY=int(self.grouped_copy),
             UBMEM_TAGGED_MAP=int(self.tagged_map),
             UBMEM_FINAL_COPY_STAGES=self.final_copy_stages,
+            UBMEM_MERGE_OUTPUTS=int(self.merge_outputs),
+            UBMEM_ORDERED_PAIR=int(self.ordered_pair),
         )
 
 

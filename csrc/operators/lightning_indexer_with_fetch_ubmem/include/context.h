@@ -44,6 +44,10 @@ constexpr uint32_t kFinalCores=SIM_BATCH*kFinalWorkers;
 #ifndef V9_UBMEM_BALANCED_INDEX
 #define V9_UBMEM_BALANCED_INDEX 0
 #endif
+#ifndef V9_UBMEM_MERGE_OUTPUTS
+#define V9_UBMEM_MERGE_OUTPUTS 0
+#endif
+static_assert(V9_UBMEM_MERGE_OUTPUTS==0 || V9_UBMEM_MERGE_OUTPUTS==1,"Merged outputs must be 0 or 1");
 #ifndef V9_SKIP_INACTIVE
 #define V9_SKIP_INACTIVE 1
 #endif
@@ -56,6 +60,12 @@ constexpr uint32_t kFinalCores=SIM_BATCH*kFinalWorkers;
 #ifndef V9_UBMEM_FINAL_COPY_STAGES
 #define V9_UBMEM_FINAL_COPY_STAGES 4
 #endif
+#ifndef V9_UBMEM_ORDERED_PAIR
+#define V9_UBMEM_ORDERED_PAIR 0
+#endif
+static_assert(V9_UBMEM_ORDERED_PAIR==0 ||
+              (V9_UBMEM_ORDERED_PAIR==1 && V9_UBMEM_GROUPED_COPY && TOKEN_BYTES==2624),
+              "Ordered pairs require paired four-layer transfers");
 static_assert(V9_UBMEM_GROUPED_COPY==0 || (V9_UBMEM_GROUPED_COPY==1 && TOKEN_BYTES==2624),
               "Paired copy is an explicit four-layer specialization");
 static_assert(V9_UBMEM_FINAL_COPY_STAGES==4 ||

@@ -15,9 +15,14 @@ extern "C" uint32_t aclrtlaunch_kvip_ubmem_direct_update_outputs_kernel(uint32_t
 extern "C" uint32_t aclrtlaunch_kvip_ubmem_direct_update_owned_kernel(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_kvip_ubmem_direct_apply_owned_kernel(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_kvip_ubmem_complete_plan_kernel(uint32_t,void*,void*,void*);
+extern "C" uint32_t aclrtlaunch_kvip_ubmem_complete_plan_outputs_kernel(uint32_t,void*,void*,void*);
 extern "C" uint32_t kvip_ubmem_complete_plan(void* bindings,void* update,void* stream) {
     if(!bindings || !update || !stream)return 100000;
     return aclrtlaunch_kvip_ubmem_complete_plan_kernel(SIM_BATCH,stream,bindings,update);
+}
+extern "C" uint32_t kvip_ubmem_complete_plan_outputs(void* bindings,void* update,void* stream) {
+    if(!bindings || !update || !stream)return 100000;
+    return aclrtlaunch_kvip_ubmem_complete_plan_outputs_kernel(SIM_BATCH,stream,bindings,update);
 }
 extern "C" uint32_t kvip_ubmem_update_plan(void* update,void* stream) {
     if(!update || !stream)return 100000;
@@ -42,8 +47,12 @@ extern "C" uint32_t kvip_ubmem_forward(void* bindings,void* update,void* stream)
     uint32_t result=v9_init(bindings,stream);
     if(!result)result=v9_li(bindings,stream);
     if(!result)result=v9_resolve(bindings,stream);
+#if V9_UBMEM_MERGE_OUTPUTS
+    if(!result)result=kvip_ubmem_complete_plan_outputs(bindings,update,stream);
+#else
     if(!result)result=kvip_ubmem_complete_plan(bindings,update,stream);
     if(!result)result=kvip_ubmem_update_outputs(update,stream);
+#endif
     if(!result)result=kvip_ubmem_update_apply(update,stream);
     return result;
 }
@@ -67,10 +76,12 @@ VALUE(v9_parallel_init,V9_UBMEM_PARALLEL_INIT)
 VALUE(v9_tagged_map,V9_UBMEM_TAGGED_MAP)
 VALUE(v9_init_cores,rotating::kInitCores)
 VALUE(v9_balanced_index,V9_UBMEM_BALANCED_INDEX)
+VALUE(v9_merge_outputs,V9_UBMEM_MERGE_OUTPUTS)
 VALUE(v9_skip_inactive,V9_SKIP_INACTIVE)
 VALUE(v9_compact_reserved,V9_COMPACT_RESERVED)
 VALUE(v9_grouped_copy,V9_UBMEM_GROUPED_COPY)
 VALUE(v9_final_copy_stages,V9_UBMEM_FINAL_COPY_STAGES)
+VALUE(v9_ordered_pair,V9_UBMEM_ORDERED_PAIR)
 VALUE(v9_li_cores,rotating::kLiCores)
 VALUE(v9_launch_cores,rotating::kLaunchCores)
 VALUE(v9_rounds,rotating::kRounds)

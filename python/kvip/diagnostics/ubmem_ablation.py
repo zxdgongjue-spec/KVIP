@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Three real UBmem fusion cases sharing one imported DDR arena."""
+"""Same-transport fused variants sharing one runtime and imported DDR arena."""
 
 from copy import copy
 import gc
@@ -11,7 +11,7 @@ from kvip.diagnostics import replay_measure
 from kvip.operators.lifetch.geometry import prefetch_budget
 
 
-def parse_variants(value):
+def parse_variants(value, transport="ubmem"):
     from kvip.diagnostics.fused_replay import validate_fused_tuning
 
     values = json.loads(value)
@@ -25,7 +25,7 @@ def parse_variants(value):
         if not isinstance(name, str) or not name.isascii() or not name.isidentifier() or name in names:
             raise ValueError("Variant names must be unique ASCII identifiers")
         names.add(name)
-        result.append((name, validate_fused_tuning(item["tuning"], "ubmem")))
+        result.append((name, validate_fused_tuning(item["tuning"], transport)))
     return result
 
 
@@ -135,6 +135,14 @@ def print_summary(report, output=None):
         details = [f"{name}={time(value['p50_us'])}" for name, value in stages.items()]
         if details:
             print(f"{case['name']} diagnostic p50 us: " + ", ".join(details))
+    if len(report["summary"]) > 1:
+        baseline = report["summary"][0]
+        for row in report["summary"][1:]:
+            old, new = baseline["full_graph_mean_us"], row["full_graph_mean_us"]
+            print(
+                f"{row['name']} vs {baseline['name']}: speedup={old / new:.3f}x; "
+                f"latency reduction={100 * (1 - new / old):.2f}% (same-runtime fused comparison)"
+            )
     print("Init/index are separate instrumented diagnostics; they are not additive components of full-graph latency.")
     print("Merged completion/index time includes completion bookkeeping; the index-only column is unavailable for it.")
     calls = [(case["name"], case["candidate_call"]) for case in report.get("cases", []) if "candidate_call" in case]
@@ -157,10 +165,12 @@ def print_summary(report, output=None):
 
 def run_ablation(args, archive, retained):
     """Failure keeps the active case and shared Runtime alive in _RETAINED_RUNS."""
-    if args.transport != "ubmem" or args.mode != "fused":
-        raise ValueError("UBmem ablation requires --transport ubmem --mode fused")
     service = getattr(args, "service_ablation", False)
     variants = getattr(args, "fused_variants", None)
+    if args.mode != "fused" or args.transport not in ("ubmem", "urma"):
+        raise ValueError("Fused ablation requires --mode fused and a supported transport")
+    if args.transport != "ubmem" and (variants is None or service or getattr(args, "ubmem_ablation", False)):
+        raise ValueError("URMA ablation requires explicit --fused-variants")
     if variants is not None:
         plans = [(name, tuning, archive) for name, tuning in variants]
     elif service:
@@ -170,13 +180,13 @@ def run_ablation(args, archive, retained):
     context = replay_measure.allocate_context(args, archive, retained)
     cases = []
     for name, tuning, case_archive in plans:
-        print(f"[ubmem-ablation] {name}: {tuning}", flush=True)
+        print(f"[{args.transport}-ablation] {name}: {tuning}", flush=True)
         case_args = copy(args)
-        case_args.ubmem_tuning = tuning
+        case_args.fused_tuning = tuning
         result = replay_measure.measure_case(case_args, case_archive, context, retained)
         cases.append(dict(name=name, **result))
         print(
-            f"[ubmem-ablation] {name}: PASS mean={result['timing']['mean_us']:.3f} us "
+            f"[{args.transport}-ablation] {name}: PASS mean={result['timing']['mean_us']:.3f} us "
             f"p50={result['timing']['p50_us']:.3f} us",
             flush=True,
         )
@@ -188,10 +198,10 @@ def run_ablation(args, archive, retained):
     result = dict(
         schema_version=2,
         status="pass",
-        transport="ubmem",
+        transport=args.transport,
         mode="fused",
         ablation=(
-            "ubmem_explicit_variants"
+            f"{args.transport}_explicit_variants"
             if variants is not None
             else "ubmem_active_rows_compact_metadata"
             if service
@@ -202,7 +212,7 @@ def run_ablation(args, archive, retained):
         cases=cases,
         summary=[summarize_case(case) for case in cases],
         interpretation=(
-            "Sequential cases reuse one Runtime, imported DDR arena and access table. "
+            "Sequential cases reuse one Runtime, imported DDR arena, access table and transport connections. "
             "Full-graph latency is isolated group latency, not service TPOT; stage diagnostics add instrumentation."
         ),
     )

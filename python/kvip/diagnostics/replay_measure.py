@@ -372,6 +372,9 @@ def measure_case(args, archive, context, retained):
     if args.mode == "fused":
         from kvip.diagnostics.fused_replay import create_fused
 
+        tuning = getattr(args, "fused_tuning", None)
+        if tuning is None:
+            tuning = getattr(args, "ubmem_tuning", None)
         bundle = create_fused(
             torch,
             runtime,
@@ -385,7 +388,7 @@ def measure_case(args, archive, context, retained):
             cann,
             aics,
             transport=args.transport,
-            tuning=getattr(args, "fused_tuning", None) or getattr(args, "ubmem_tuning", None),
+            tuning=tuning,
             split_index_stages=getattr(args, "split_index_stages", False),
         )
         case_retained["bundle"] = bundle

@@ -31,6 +31,7 @@ extern "C" uint32_t v9_final_owner_bytes(const rotating::RuntimeShape* shape) { 
 extern "C" uint32_t v9_final_replicated(const rotating::RuntimeShape* shape) { return 1; }
 extern "C" uint32_t v9_token_bytes(const rotating::RuntimeShape* shape) { return shape->tokenBytes; }
 extern "C" uint32_t v9_parallel_final(const rotating::RuntimeShape* shape) { return V9_URMA_PARALLEL_FINAL; }
+extern "C" uint32_t v9_async_final(const rotating::RuntimeShape* shape) { return V9_URMA_ASYNC_FINAL; }
 
 #if V9_RESOLVER_COMPARE
 ENTRY(resolve_original,shape->finalCores)
@@ -78,8 +79,9 @@ extern "C" uint32_t kvip_lifetch_forward(void* bindings, void* update, void* str
     if (!result) result = v9_resolve(bindings, stream, shape);
     if (!result) result = kvop_direct_update_outputs_early(shape->batch, update, stream);
 #if V9_URMA_PARALLEL_FINAL
-    // Prefetch may target a final victim slot. Join it globally before final
-    // workers run independently, then reduce completion on the same stream.
+    // With async final enabled, resolver already posted only the safe prefix.
+    // Index runs while those READs are outstanding. Join prefetch before
+    // workers submit conflicting destinations and collect their own CQEs.
     if (!result) result = v9_wait(bindings, stream, shape);
     if (!result) result = v9_parallel_fetch(bindings, stream, shape);
 #endif

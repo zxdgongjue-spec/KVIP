@@ -3,6 +3,8 @@
 import importlib
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -114,6 +116,13 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
     assert build.build_libraries(**options, parallel_final=True) == parallel
     assert build.build_libraries(**options) == current
     assert len(commands) == 12
+    asynchronous = build.build_libraries(**options, parallel_final=True, async_final=True)
+    assert asynchronous != parallel
+    assert "-DURMA_ASYNC_FINAL=1" in commands[-2]
+    assert build.build_libraries(**options, parallel_final=True, async_final=True) == asynchronous
+    with pytest.raises(ValueError, match="requires parallel_final"):
+        build.build_libraries(**options, async_final=True)
+    assert len(commands) == 14
 
 
 def test_actual_operator_cmake_resolves_relocated_sources(tmp_path):

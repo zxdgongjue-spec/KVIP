@@ -46,7 +46,9 @@ def arguments(argv=None):
         help="URMA serial total inflight bound: 0 submits whole core slices; omitted keeps native default 2048",
     )
     parser.add_argument("--fused-tuning", help="JSON object of supported options for one fused replay")
-    parser.add_argument("--fused-variants", help="JSON list of named UBmem tuning objects sharing one DDR import")
+    parser.add_argument(
+        "--fused-variants", help="JSON list of named same-transport tuning objects sharing one DDR import"
+    )
     parser.add_argument(
         "--ubmem-ablation",
         action="store_true",
@@ -90,17 +92,17 @@ def arguments(argv=None):
     if args.fused_variants is not None:
         if (
             args.inspect
-            or (args.transport, args.mode) != ("ubmem", "fused")
+            or args.mode != "fused"
             or args.ubmem_ablation
             or args.service_ablation
             or args.fused_tuning is not None
             or args.output is None
         ):
-            parser.error("--fused-variants requires UBmem fused replay, --output, and no other ablation/tuning option")
+            parser.error("--fused-variants requires fused replay, --output, and no other ablation/tuning option")
         from kvip.diagnostics.ubmem_ablation import parse_variants
 
         try:
-            args.fused_variants = parse_variants(args.fused_variants)
+            args.fused_variants = parse_variants(args.fused_variants, args.transport)
         except ValueError as error:
             parser.error(str(error))
     if args.fused_tuning is not None:

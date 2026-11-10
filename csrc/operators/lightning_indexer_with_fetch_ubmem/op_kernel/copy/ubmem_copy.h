@@ -227,6 +227,21 @@ private:
     }
     __aicore__ inline void FlushPair() {
         uint32_t stage=issued_%kDepth,rows=pending_;
+        if constexpr(V9_UBMEM_ORDERED_PAIR) {
+            // Reverse only disjoint destinations, moving each destination
+            // with its source. Repeated/overlapping writes retain their input
+            // order. Two descending Host rows can then use one strided MTE2
+            // command; HBM stores still use exact rows, never the gap.
+            if(rows==2) {
+                uint64_t gap=destinations_[0]>=destinations_[1]?
+                    destinations_[0]-destinations_[1]:destinations_[1]-destinations_[0];
+                if(gap>=kTokenBytes && ForwardPair(sources_[1],sources_[0])) {
+                    uint64_t source=sources_[0],destination=destinations_[0];
+                    sources_[0]=sources_[1];sources_[1]=source;
+                    destinations_[0]=destinations_[1];destinations_[1]=destination;
+                }
+            }
+        }
         WaitFlag<HardEvent::MTE3_MTE2>(static_cast<event_t>(stage));
         GlobalTensor<uint8_t> from;
         DataCopyPadExtParams<uint8_t> pad{false,0,0,0};

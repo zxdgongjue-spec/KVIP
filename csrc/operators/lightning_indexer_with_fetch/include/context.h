@@ -6,6 +6,11 @@
 #define V9_URMA_PARALLEL_FINAL 0
 #endif
 static_assert(V9_URMA_PARALLEL_FINAL==0 || V9_URMA_PARALLEL_FINAL==1,"Parallel final Get must be 0 or 1");
+#ifndef V9_URMA_ASYNC_FINAL
+#define V9_URMA_ASYNC_FINAL 0
+#endif
+static_assert(V9_URMA_ASYNC_FINAL==0 || V9_URMA_ASYNC_FINAL==1,"Async final Get must be 0 or 1");
+static_assert(!V9_URMA_ASYNC_FINAL || V9_URMA_PARALLEL_FINAL,"Async final Get requires parallel completion");
 namespace rotating {
 constexpr uint32_t kTop=2048, kSlots=8192, kMaxRounds=32, kRowStatusWords=32;
 constexpr bool kFinalReplicated=true;

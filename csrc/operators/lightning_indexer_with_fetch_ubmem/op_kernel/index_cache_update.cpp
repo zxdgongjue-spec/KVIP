@@ -12,9 +12,41 @@
 using namespace AscendC;
 namespace {
 constexpr uint32_t kCandidates = kExtendedCandidates, kThreads = 512;
+template<uint32_t Threads>
+__simt_callee__ inline void PublishOutputRow(__gm__ uint64_t* a,uint32_t row,
+    uint64_t sourceRow,uint32_t owner,bool active) {
+  auto topk=reinterpret_cast<__gm__ int32_t*>(a[18]);
+  auto slots=reinterpret_cast<__gm__ int32_t*>(a[19]);
+  auto logical=reinterpret_cast<__gm__ int64_t*>(a[3]);
+  auto logicalOut=reinterpret_cast<__gm__ int32_t*>(a[22]);
+  auto slotsOut=reinterpret_cast<__gm__ int32_t*>(a[23]);
+  for(uint32_t k=threadIdx.x;k<2048;k+=Threads) {
+    int32_t token=active?asc_ldcg(topk+sourceRow*2048+k):-1;
+    int32_t id=token>=0 && uint32_t(token)<uint32_t(a[24])?
+        static_cast<int32_t>(asc_ldcg(logical+uint64_t(owner)*uint32_t(a[24])+token)):-1;
+    int32_t slot=active?asc_ldcg(slots+sourceRow*2048+k):-1;
+    asc_stcg(logicalOut+uint64_t(row)*2048+k,id);
+    asc_stcg(slotsOut+uint64_t(row)*2048+k,slot);
+  }
+}
+template<uint32_t Threads>
+__simt_callee__ inline void PublishOwnedOutputs(__gm__ uint64_t* a,uint32_t batch,
+    uint32_t owner,uint32_t planError) {
+  auto unpack=reinterpret_cast<__gm__ int64_t*>(a[20]);
+  auto valid=reinterpret_cast<__gm__ int64_t*>(a[21]);
+  for(uint32_t row=0;row<uint32_t(SIM_BATCH)*4;++row) {
+    bool active=asc_ldcg(valid+row)!=0;
+    uint64_t sourceRow=active?asc_ldcg(unpack+row):0;
+    active=active && sourceRow<uint64_t(SIM_BATCH)*4;
+    // Valid TND rows belong to the packed producer, never the output row's
+    // batch. Padding/invalid selectors still have exactly one clearing owner.
+    uint32_t writer=active?uint32_t(sourceRow/4):row/4;
+    if(writer==batch)PublishOutputRow<Threads>(a,row,sourceRow,owner,active && !planError);
+  }
+}
 // keys, scales, addresses, logical IDs, LRU slots, producer changes,
 // status, address row stride, producer rows, hot validity. No KV payload input.
-template<bool Extended>
+template<bool Extended,bool WithOutputs=false>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void Update(__gm__ uint64_t* a, uint32_t b, uint32_t owner,
                                                             bool checkTransport, __ubuf__ uint32_t* work) {
   uint32_t tid = threadIdx.x;
@@ -52,12 +84,14 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void Update(__gm__ uint64_t* a, 
   auto plan = reinterpret_cast<__gm__ uint32_t*>(a[checkTransport ? 17 : 10]) + uint64_t(b) * kExtendedTransferWords;
   if (status[0]) {
     if (!tid) asc_stcg(plan, uint32_t(0));
-    asc_threadfence();
-    return;
+  } else {
+    if constexpr (!Extended) PublishUpdatePlan<kThreads>(work,status,plan,uint32_t(a[25]));
+    else PublishExtendedPlan<kThreads>(reinterpret_cast<__gm__ uint32_t*>(a[27])+uint64_t(b)*kExtendedWorkWords,
+                                       status,plan,uint32_t(a[25]));
   }
-  if constexpr (!Extended) PublishUpdatePlan<kThreads>(work,status,plan,uint32_t(a[25]));
-  else PublishExtendedPlan<kThreads>(reinterpret_cast<__gm__ uint32_t*>(a[27])+uint64_t(b)*kExtendedWorkWords,
-                                     status,plan,uint32_t(a[25]));
+  // The optional publisher consumes this VF's local error. No other batch's
+  // status or plan is read, and Apply remains a later kernel boundary.
+  if constexpr(WithOutputs)PublishOwnedOutputs<kThreads>(a,b,owner,status[0]);
   asc_threadfence();
 }
 // Service output adaptation runs before Apply changes logical Index ownership.
@@ -65,14 +99,9 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void Update(__gm__ uint64_t* a, 
 // owns 8 KiB in each output tensor, so no two AIVs share a write sector. Keep
 // this separate from Apply: another row may still read the old logical Index.
 __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PublishOutputs(__gm__ uint64_t* a, uint32_t core) {
-  auto topk = reinterpret_cast<__gm__ int32_t*>(a[18]);
-  auto slots = reinterpret_cast<__gm__ int32_t*>(a[19]);
   auto unpack = reinterpret_cast<__gm__ int64_t*>(a[20]);
   auto valid = reinterpret_cast<__gm__ int64_t*>(a[21]);
-  auto logicalOut = reinterpret_cast<__gm__ int32_t*>(a[22]);
-  auto slotsOut = reinterpret_cast<__gm__ int32_t*>(a[23]);
   auto owners = reinterpret_cast<__gm__ uint32_t*>(a[9]);
-  auto logical = reinterpret_cast<__gm__ int64_t*>(a[3]);
   for (uint32_t row = core; row < uint32_t(SIM_BATCH)*4; row += rotating::kOutputCores) {
     bool active = asc_ldcg(valid + row) != 0;
     uint64_t sourceRow = active ? asc_ldcg(unpack + row) : 0;
@@ -81,14 +110,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PublishOutputs(__gm__ uint6
     active = active && sourceRow<uint64_t(SIM_BATCH)*4 &&
         asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(a[6])+sourceRow/4)==0;
     uint64_t owner = active ? asc_ldcg(owners + sourceRow / 4) : 0;
-    for (uint32_t k = threadIdx.x; k < 2048; k += 512) {
-      int32_t token = active ? asc_ldcg(topk + sourceRow * 2048 + k) : -1;
-      int32_t id = token >= 0 && uint32_t(token)<uint32_t(a[24]) ?
-          static_cast<int32_t>(asc_ldcg(logical + owner * uint32_t(a[24]) + token)) : -1;
-      int32_t slot = active ? asc_ldcg(slots + sourceRow * 2048 + k) : -1;
-      asc_stcg(logicalOut + uint64_t(row) * 2048 + k, id);
-      asc_stcg(slotsOut + uint64_t(row) * 2048 + k, slot);
-    }
+    PublishOutputRow<kThreads>(a,row,sourceRow,uint32_t(owner),active);
   }
 }
 template <bool Owned>
@@ -122,7 +144,7 @@ __aicore__ inline void Apply(GM_ADDR bindings) {
                                 reinterpret_cast<__ubuf__ uint64_t*>(local[kTransferPlanWords].GetPhyAddr()), count);
 }
 
-__aicore__ inline void PlanOwned(GM_ADDR bindings) {
+__aicore__ inline void PlanOwned(GM_ADDR bindings,bool withOutputs=false) {
     TPipe pipe;
     TBuf<TPosition::VECCALC> scratch;
     pipe.InitBuffer(scratch, kExtendedScratchBytes);
@@ -131,12 +153,25 @@ __aicore__ inline void PlanOwned(GM_ADDR bindings) {
     auto owners = reinterpret_cast<__gm__ uint32_t*>(args[9]);
     uint32_t batch = GetBlockIdx();
     auto counts=reinterpret_cast<__gm__ uint32_t*>(args[26]);
-    if(counts[batch]<=kPlanCandidates)
-      Simt::VF_CALL<Update<false>>(Simt::Dim3{kThreads,1,1},args,batch,owners[batch],true,
-                                  reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
-    else
-      Simt::VF_CALL<Update<true>>(Simt::Dim3{kThreads,1,1},args,batch,owners[batch],true,
-                                 reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
+    auto work=reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr());
+    if(withOutputs) {
+      if(counts[batch]<=kPlanCandidates)
+        Simt::VF_CALL<Update<false,true>>(Simt::Dim3{kThreads,1,1},args,batch,owners[batch],true,work);
+      else Simt::VF_CALL<Update<true,true>>(Simt::Dim3{kThreads,1,1},args,batch,owners[batch],true,work);
+    } else {
+      if(counts[batch]<=kPlanCandidates)
+        Simt::VF_CALL<Update<false>>(Simt::Dim3{kThreads,1,1},args,batch,owners[batch],true,work);
+      else Simt::VF_CALL<Update<true>>(Simt::Dim3{kThreads,1,1},args,batch,owners[batch],true,work);
+    }
+}
+
+__aicore__ inline void CompleteAndPlan(GM_ADDR bindings,GM_ADDR update,bool withOutputs) {
+    uint32_t batch=GetBlockIdx();if(batch>=SIM_BATCH)return;
+    auto ctx=reinterpret_cast<__gm__ rotating::Context*>(reinterpret_cast<__gm__ uint64_t*>(bindings)[14]);
+    rotating::CompleteBatch(ctx,batch);
+    // Scalar completion/cache publication must precede SIMT status reads.
+    SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
+    PlanOwned(update,withOutputs);
 }
 
 }  // namespace
@@ -160,14 +195,16 @@ extern "C" __global__ __aicore__ void kvip_ubmem_complete_plan_kernel(GM_ADDR bi
 #if defined(__CCE_AICORE__)
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
   if ASCEND_IS_AIV {
-    uint32_t batch=GetBlockIdx();if(batch>=SIM_BATCH)return;
-    auto ctx=reinterpret_cast<__gm__ rotating::Context*>(reinterpret_cast<__gm__ uint64_t*>(bindings)[14]);
-    rotating::CompleteBatch(ctx,batch);
-    // Replace the removed kernel boundary for scalar status/cache publication
-    // before the following SIMT planner uses asc_ldcg on those same records.
-    SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
-    PlanOwned(update);
+    CompleteAndPlan(bindings,update,false);
   }
+#endif
+}
+// Packed ownership removes the cross-batch status dependency of TND output
+// publication. All old logical IDs are read before the following Apply launch.
+extern "C" __global__ __aicore__ void kvip_ubmem_complete_plan_outputs_kernel(GM_ADDR bindings,GM_ADDR update) {
+#if defined(__CCE_AICORE__)
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  if ASCEND_IS_AIV {CompleteAndPlan(bindings,update,true);}
 #endif
 }
 extern "C" __global__ __aicore__ void kvip_ubmem_direct_update_outputs_kernel(GM_ADDR bindings) {

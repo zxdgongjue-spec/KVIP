@@ -26,11 +26,16 @@ __aicore__ inline void PublishFinalWorker(__gm__ Context* ctx,__gm__ Row* row,
                   "Final copy must not overwrite live address vectors");
     UbmemCopyTrace trace;trace.Begin();
     UbmemFinalCopyPipeline copyPipe(ctx,row->output,local.ReinterpretCast<uint8_t>());
-    // Recycled hot slots are not consecutive. Sector ownership prevents two
-    // AIVs from overwriting opposite halves of an unaligned KV row boundary.
-    for(uint32_t rank=0;rank<batchCount;++rank) {
+    // 2624-byte rows are complete 32-byte sectors. The resolver proves unique
+    // destination slots, so its contiguous rank ranges also balance actual
+    // payload work and avoid every worker scanning the full plan. 656-byte
+    // rows keep sector ownership: adjacent rows share a partial sector.
+    const uint32_t begin=V9_UBMEM_ORDERED_PAIR?batchCount*w/kFinalWorkers:0;
+    const uint32_t end=V9_UBMEM_ORDERED_PAIR?batchCount*(w+1)/kFinalWorkers:batchCount;
+    for(uint32_t rank=begin;rank<end;++rank) {
         uint32_t slot=slots.GetValue(rank);
-        if(UbmemDestinationOwner(slot,kFinalWorkers)!=w)continue;
+        if constexpr(!V9_UBMEM_ORDERED_PAIR)
+            if(UbmemDestinationOwner(slot,kFinalWorkers)!=w)continue;
         ++scheduled;
         if(error)continue;
         uint64_t peer=uint64_t(remoteLow.GetValue(rank)) | (uint64_t(remoteHigh.GetValue(rank))<<32);

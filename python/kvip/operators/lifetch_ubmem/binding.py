@@ -53,6 +53,8 @@ class UbmemBinding:
             ("grouped_copy", int(shape.grouped_copy)),
             ("tagged_map", int(shape.tagged_map)),
             ("final_copy_stages", shape.final_copy_stages),
+            ("merge_outputs", int(shape.merge_outputs)),
+            ("ordered_pair", int(shape.ordered_pair)),
         ):
             if query(self.library, name) != expected:
                 raise ValueError(f"UBmem static binary contract mismatch: {name}")

@@ -15,7 +15,9 @@ uint32_t kvip_ubmem_region_bytes();
 uint32_t kvip_ubmem_status_bytes();
 uint32_t kvip_ubmem_plan_words();
 uint32_t v9_final_copy_stages();
+uint32_t v9_ordered_pair();
 uint32_t v9_tagged_map();
+uint32_t v9_merge_outputs();
 uint32_t v9_ubpipe_depth();
 uint32_t v9_window_ubpipe_depth();
 uint32_t v9_init(void* bindings,void* stream);
@@ -25,6 +27,9 @@ uint32_t v9_fetch(void* bindings,void* stream);
 // Completes the same packed batch before building its Index plan. Retain the
 // outputs/apply launches after this kernel: unpack can cross packed batches.
 uint32_t kvip_ubmem_complete_plan(void* bindings,void* update,void* stream);
+// Same completion/plan checks, with outputs owned by their packed source row.
+// This entry includes all TND publication; follow it only with Apply.
+uint32_t kvip_ubmem_complete_plan_outputs(void* bindings,void* update,void* stream);
 uint32_t kvip_ubmem_update(void* update,void* stream);
 uint32_t kvip_ubmem_update_plan(void* update,void* stream);
 uint32_t kvip_ubmem_update_outputs(void* update,void* stream);

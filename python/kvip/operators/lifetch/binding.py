@@ -38,6 +38,7 @@ class LIFetchBinding:
         output_stride=None,
         scratch=None,
         parallel_final=False,
+        async_final=False,
     ):
         if resident > 131072:
             raise ValueError("LIFetch hot bitmap supports resident <= 131072")
@@ -72,6 +73,14 @@ class LIFetchBinding:
             mode.argtypes, mode.restype = [ctypes.c_void_p], ctypes.c_uint32
             if int(mode(self.shape_pointer)) != int(parallel_final):
                 raise ValueError("V9 binary contract mismatch: parallel_final")
+        if type(async_final) is not bool or (async_final and not parallel_final):
+            raise ValueError("async_final must be a boolean and requires parallel_final")
+        self.async_final = async_final
+        if async_final or hasattr(self.library, "v9_async_final"):
+            mode = self.library.v9_async_final
+            mode.argtypes, mode.restype = [ctypes.c_void_p], ctypes.c_uint32
+            if int(mode(self.shape_pointer)) != int(async_final):
+                raise ValueError("V9 binary contract mismatch: async_final")
         for name, expected in (
             ("token_bytes", token_bytes),
             ("final_replicated", int(final_strategy == "replicated")),

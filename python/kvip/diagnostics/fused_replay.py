@@ -33,6 +33,7 @@ def fused_stages(transport, rotating, update, lease, batch, *, split_index_stage
     pointer, u32 = ctypes.c_void_p, ctypes.c_uint32
     library = rotating.library
     if transport == "ubmem":
+        merge_outputs = getattr(getattr(rotating, "shape", None), "merge_outputs", False)
         result = [
             (
                 name,
@@ -48,10 +49,10 @@ def fused_stages(transport, rotating, update, lease, batch, *, split_index_stage
         ]
         updates = [
             (
-                "complete_index_plan",
+                "complete_index_plan_outputs" if merge_outputs else "complete_index_plan",
                 _stage(
                     library,
-                    "kvip_ubmem_complete_plan",
+                    "kvip_ubmem_complete_plan_outputs" if merge_outputs else "kvip_ubmem_complete_plan",
                     [pointer, pointer, pointer],
                     lambda stream: (rotating.bindings.data_ptr(), update.bindings.data_ptr(), stream),
                     lease,
@@ -73,6 +74,7 @@ def fused_stages(transport, rotating, update, lease, batch, *, split_index_stage
                 ("index_outputs", "kvip_ubmem_update_outputs"),
                 ("index_apply", "kvip_ubmem_update_apply"),
             )
+            if not (merge_outputs and name == "index_outputs")
         )
         if split_index_stages:
             result.extend(updates)
@@ -99,9 +101,13 @@ def fused_stages(transport, rotating, update, lease, batch, *, split_index_stage
         )
         for name, symbol in (("init", "v9_init"), ("li_with_prefetch", "v9_li"), ("resolve_final_plan", "v9_resolve"))
     ]
+    if getattr(rotating, "async_final", False):
+        result[-1] = ("resolve_and_submit_safe_final", result[-1][1])
     result.append(
         (
-            "index_update_before_final_get",
+            "index_update_during_safe_final_get"
+            if getattr(rotating, "async_final", False)
+            else "index_update_before_final_get",
             _stage(
                 update.library,
                 "kvop_direct_update_outputs_early",
@@ -124,7 +130,15 @@ def fused_stages(transport, rotating, update, lease, batch, *, split_index_stage
                     lease,
                 ),
             )
-            for name, symbol in (("prefetch_completion", "v9_wait"), ("parallel_final_get", "v9_parallel_fetch"))
+            for name, symbol in (
+                ("prefetch_completion", "v9_wait"),
+                (
+                    "conflicting_final_and_completion"
+                    if getattr(rotating, "async_final", False)
+                    else "parallel_final_get",
+                    "v9_parallel_fetch",
+                ),
+            )
         )
     result.append(
         (
@@ -160,9 +174,17 @@ def validate_fused_tuning(overrides, transport):
         raise ValueError("Fusion tuning requires a JSON object and ubmem/urma transport")
     booleans = {"compact_reserved"}
     if transport == "ubmem":
-        booleans |= {"parallel_init", "balanced_index", "skip_inactive", "grouped_copy", "tagged_map"}
+        booleans |= {
+            "parallel_init",
+            "balanced_index",
+            "skip_inactive",
+            "grouped_copy",
+            "tagged_map",
+            "ordered_pair",
+            "merge_outputs",
+        }
     else:
-        booleans.add("parallel_final")
+        booleans |= {"parallel_final", "async_final"}
     integers = {"prefetch_limit", "window_limit"}
     if transport == "ubmem":
         integers.add("final_copy_stages")
@@ -177,6 +199,10 @@ def validate_fused_tuning(overrides, transport):
         raise ValueError("final_copy_stages must be 4 or 8")
     if overrides.get("tagged_map") and overrides.get("parallel_init"):
         raise ValueError("Tagged mapping requires one init worker per request")
+    if overrides.get("async_final") and not overrides.get("parallel_final"):
+        raise ValueError("async_final requires parallel_final")
+    if overrides.get("ordered_pair") and not overrides.get("grouped_copy"):
+        raise ValueError("ordered_pair requires grouped_copy")
     prefetch_budget(overrides.get("prefetch_limit", 512), overrides.get("window_limit", 64), 1)
     return dict(overrides)
 
@@ -200,12 +226,15 @@ def fusion_tuning(geometry, transport, overrides=None):
             grouped_copy=False,
             tagged_map=False,
             final_copy_stages=4,
+            ordered_pair=False,
+            merge_outputs=False,
         )
     values.update(validate_fused_tuning({} if overrides is None else overrides, transport))
     if transport == "urma":
         # The URMA LI has an unconditional inactive-row gate, not a build knob.
         values["skip_inactive"] = True
         values.setdefault("parallel_final", False)
+        values.setdefault("async_final", False)
     prefetch_budget(values["prefetch_limit"], values["window_limit"], geometry["requested_windows"])
     return values
 
@@ -274,6 +303,8 @@ def create_fused(
             grouped_copy=effective["grouped_copy"],
             tagged_map=effective["tagged_map"],
             final_copy_stages=effective["final_copy_stages"],
+            ordered_pair=effective["ordered_pair"],
+            merge_outputs=effective["merge_outputs"],
         )
         library = build_specialization(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape)
         workspace = UbmemWorkspace(torch, resident=r, **common_workspace)
@@ -298,6 +329,7 @@ def create_fused(
             soc=soc,
             compact_reserved=effective["compact_reserved"],
             parallel_final=effective["parallel_final"],
+            async_final=effective["async_final"],
         )
         workspace = LIFetchWorkspace(torch, **common_workspace)
     storage = IndexCacheStorage(torch, geometry["owners"], h, r, device)
@@ -356,6 +388,7 @@ def create_fused(
             token_bytes=geometry["token_bytes"],
             scratch=workspace.scratch,
             parallel_final=effective["parallel_final"],
+            async_final=effective["async_final"],
             **common,
         )
         rotating.output = output

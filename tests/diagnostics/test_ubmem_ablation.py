@@ -173,6 +173,9 @@ def native_mocks(monkeypatch, tmp_path):
             self.graphs.clear()
 
     class Runtime:
+        def link_to(self, server):
+            events.append("link_to")
+
         def initialize(self, *args):
             events.append("initialize")
 
@@ -285,6 +288,38 @@ def test_explicit_variants_keep_one_import_and_each_requested_configuration(nati
     assert mock.events.count("factory") == mock.events.count("lease_close") == 2
 
 
+def test_urma_variants_reuse_connection_and_reject_cross_transport_tuning(native_mocks, monkeypatch):
+    from kvip.runtime import build
+
+    mock = native_mocks
+    mock.args.transport = "urma"
+    mock.args.kvaf_server = "127.0.0.1:28999"
+    mock.args.split_index_stages = False
+    monkeypatch.setattr(build, "kvaf_build_paths", lambda path: (path / "cann", path / "include"))
+    cases = [dict(name="current", tuning={}), dict(name="parallel", tuning={"parallel_final": True})]
+    mock.args.fused_variants = ubmem_ablation.parse_variants(json.dumps(cases), "urma")
+    # Fixture's factory deliberately checks UBmem split-index forwarding. URMA
+    # has its own stage chain, so retain that check through a small wrapper.
+    from kvip.diagnostics import fused_replay
+
+    factory = fused_replay.create_fused
+
+    def urma_factory(*args, **kwargs):
+        assert kwargs["transport"] == "urma"
+        assert kwargs["split_index_stages"] is False
+        return factory(*args, **dict(kwargs, split_index_stages=True))
+
+    monkeypatch.setattr(fused_replay, "create_fused", urma_factory)
+    report = ubmem_ablation.run_ablation(mock.args, mock.archive, {})
+    assert report["transport"] == "urma" and report["ablation"] == "urma_explicit_variants"
+    assert mock.tunings == [{}, {"parallel_final": True}]
+    for event in ("runtime", "link_to", "initialize", "import_pages", "shutdown"):
+        assert mock.events.count(event) == 1
+    assert mock.events.count("lease_close") == 2
+    with pytest.raises(ValueError):
+        ubmem_ablation.parse_variants(json.dumps([cases[0], dict(name="wrong", tuning={"tagged_map": True})]), "urma")
+
+
 def test_explicit_variants_reject_malformed_and_conflicting_cli_options(tmp_path):
     from kvip.diagnostics.replay import arguments
 
@@ -300,6 +335,11 @@ def test_explicit_variants_reject_malformed_and_conflicting_cli_options(tmp_path
         str(tmp_path / "result.json"),
     ]
     assert arguments(common + ["--fused-variants", variants]).fused_variants[-1][1] == {"tagged_map": True}
+    urma = common + ["--transport", "urma", "--kvaf-server", "127.0.0.1:28999"]
+    parallel = variants.replace('"tagged_map"', '"parallel_final"')
+    assert arguments(urma + ["--fused-variants", parallel]).fused_variants[-1][1] == {"parallel_final": True}
+    with pytest.raises(SystemExit):
+        arguments(urma + ["--fused-variants", variants])
     for value in (
         "{}",
         "[]",

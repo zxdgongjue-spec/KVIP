@@ -111,12 +111,20 @@ def test_optimization_switches_are_explicit_content_addressed_build_options():
     tagged = replace(paired, tagged_map=True, final_copy_stages=8)
     assert tagged.options("/cann")["UBMEM_TAGGED_MAP"] == 1
     assert tagged.options("/cann")["UBMEM_FINAL_COPY_STAGES"] == 8
+    assert baseline.options("/cann")["UBMEM_MERGE_OUTPUTS"] == 0
+    assert baseline.options("/cann")["UBMEM_ORDERED_PAIR"] == 0
+    assert replace(tagged, merge_outputs=True).options("/cann")["UBMEM_MERGE_OUTPUTS"] == 1
+    assert replace(tagged, ordered_pair=True).options("/cann")["UBMEM_ORDERED_PAIR"] == 1
     for overrides in (
         dict(tagged_map=1),
         dict(tagged_map=True, parallel_init=True),
         dict(final_copy_stages=5),
         dict(final_copy_stages=True),
         dict(final_copy_stages=8, grouped_copy=False),
+        dict(merge_outputs=1),
+        dict(ordered_pair=1),
+        dict(ordered_pair=True, grouped_copy=False),
+        dict(ordered_pair=True, token_bytes=656),
     ):
         with pytest.raises(ValueError):
             replace(paired, **overrides)

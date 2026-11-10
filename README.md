@@ -477,13 +477,39 @@ Two further UBmem switches are opt-in and preserve all queries and KV bytes:
   Window-copy depth remains unchanged. Default final depth remains 4 stages.
 
 `replay --fused-variants` accepts two to four objects with unique `name` and
-`tuning` fields. It uses the existing ablation runner to import DDR once and
+`tuning` fields for either UBmem or URMA. It uses the existing ablation runner
+to import DDR once and retain one Runtime, access table and transport connection,
 then builds, restores, verifies and times each case separately. Comparing
 current, tagged-map-only, and tagged-map-plus-deeper-final isolates the two
 incremental changes without a new model service or a worker sweep. The
 snapshot's original geometry is retained; mapping diagnostics decode epoch
 tags before counting useful/unused prefetch. New tagged captures also retain
 the raw mapping tensor as `post.mapping_raw`.
+
+Three additional opt-in switches target the remaining stages; all default to
+false and preserve the selected KV bytes and required state updates:
+
+- UBmem `ordered_pair=true` requires `grouped_copy=true` and 2624-byte rows.
+  Final workers own balanced, disjoint rank ranges instead of rescanning every
+  descriptor. Reverse-address pairs may swap source and destination together
+  to use one strided Host read; overlapping destinations or unrepresentable
+  strides retain the exact-row fallback. 656-byte sector ownership is unchanged.
+- UBmem `merge_outputs=true` publishes each packed batch's TND outputs inside
+  the existing completion/planning VF, reducing the graph from six launches
+  to five. Each writer uses its own plan status; invalid/padding rows still
+  receive -1. Index apply remains a later kernel so output reads see old logical
+  IDs. This trades output parallelism for one fewer launch and needs an NPU A/B.
+- URMA `async_final=true` requires `parallel_final=true`. Resolver workers post
+  final descriptors that cannot conflict with outstanding prefetch writes,
+  without waiting for CQ completion. Those reads can overlap Index update.
+  After prefetch completion, workers post conflicting tails and drain their
+  private queues. Queue bounds, completion errors and poisoned-queue rejection
+  remain active. Stage names distinguish submission, Index overlap and final
+  drain; no necessary preparation is moved outside timing.
+
+Same-runtime variants control DDR placement and connection setup within each
+transport. They do not eliminate load/thermal variability, and their printed
+speedup compares fused variants, not the separate serial performance target.
 Serial graphs use the Torch NPU graph allocator for native LI/gather outputs;
 fused graphs retain the existing KVAF graph API. The supported explicit stream
 argument is documented in [Torch NPU graphs](https://github.com/Ascend/pytorch/blob/master/torch_npu/npu/graphs.py).
@@ -493,7 +519,8 @@ The four full-path means/medians come from uninstrumented production graphs.
 its internal launches, then measures the ordered stage graphs with device events.
 These additional graph/event boundaries can change scheduling and overlap;
 stage times locate large costs but are not an exact additive decomposition of
-the full-path latency. URMA preserves early Index update while Get is in flight.
+the full-path latency. URMA's original early Index update can overlap prefetch;
+only the explicit async-final path above also posts final-demand reads before it.
 UBmem's `li_with_prefetch` includes concurrent LI/TopK and speculative copies,
 so it must not be interpreted as pure LI compute time.
 

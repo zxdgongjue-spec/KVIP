@@ -166,7 +166,7 @@ void CheckFinalLookahead() {
     copy_model::Drained();
 }
 
-void CheckFinalBorrow() {
+void CheckFinalBorrow(bool skewed) {
     // Invoke the actual final caller, with the same live keys/ranks/slots
     // offsets as ReplicatedFinal. Their contents must survive delayed DMA.
     constexpr uint32_t count=257;
@@ -188,24 +188,33 @@ void CheckFinalBorrow() {
         for(uint32_t rank=0;rank<count;++rank) {
             uint64_t peer=region.peerBase+uint64_t(rank)*kTokenBytes;
             keys.SetValue(rank,uint32_t(peer));ranks.SetValue(rank,uint32_t(peer>>32));
-            slots.SetValue(rank,rank*13%512);
+            // All skewed slots share the old sector owner. Rank ownership
+            // must still cover each whole aligned row exactly once.
+            slots.SetValue(rank,skewed?rank*8:rank*13%512);
         }
         auto before=scratch;
+        auto beforeReads=copy_model::scalarLocalReads;
         PublishFinalWorker(&ctx,&row,0,worker,0,count,0,0,local,keys,ranks,slots,local[kFinalControlOffset]);
+        auto scalarReads=copy_model::scalarLocalReads-beforeReads;
         auto* post=FinalPostAt(&ctx,worker);
         uint32_t wanted=0;
-        for(uint32_t rank=0;rank<count;++rank)if(UbmemDestinationOwner(slots.GetValue(rank),kFinalWorkers)==worker) {
+        for(uint32_t rank=0;rank<count;++rank)if(V9_UBMEM_ORDERED_PAIR?
+            (rank>=count*worker/kFinalWorkers && rank<count*(worker+1)/kFinalWorkers):
+            UbmemDestinationOwner(slots.GetValue(rank),kFinalWorkers)==worker) {
             ++wanted;
             std::memcpy(expected.data()+uint64_t(slots.GetValue(rank))*kTokenBytes,
                 source.data()+uint64_t(rank)*kTokenBytes,kTokenBytes);
         }
         assert(post->error==0 && post->pending==0 && post->count==wanted && post->head==wanted);
+        assert(scalarReads==(V9_UBMEM_ORDERED_PAIR?3*wanted:count+2*wanted));
+        if(V9_UBMEM_ORDERED_PAIR)assert(wanted==count/kFinalWorkers || wanted==count/kFinalWorkers+1);
         constexpr size_t usedWords=(UbmemFinalCopyPipeline::kScratchBytes+3)/4;
         assert(std::equal(scratch.begin()+usedWords,scratch.end(),before.begin()+usedWords));
         copy_model::Drained();
     }
     assert(std::memcmp(output.data(),expected.data(),output.size())==0);
     std::cout<<"Final actual caller PASS stages="<<V9_UBMEM_FINAL_COPY_STAGES
+             <<" ordered="<<V9_UBMEM_ORDERED_PAIR<<" skewed="<<skewed
              <<" borrowed_bytes="<<UbmemFinalCopyPipeline::kScratchBytes<<" live_keys_offset="<<2*kSlots*4<<"\n";
 }
 
@@ -229,17 +238,19 @@ void CheckPairCommands() {
     size_t totalBaseLoads=0,totalPairLoads=0,totalBaseStores=0,totalPairStores=0;
     // Exact pair reduction, strided gaps, reversed/repeated addresses, odd
     // tails, multiple ring wraps and pairs spanning stable-owner rows.
-    for(uint32_t pattern=0;pattern<7;++pattern)for(uint32_t count:{0U,1U,2U,7U,8U,9U,17U}) {
+    for(uint32_t pattern=0;pattern<10;++pattern)for(uint32_t count:{0U,1U,2U,7U,8U,9U,17U}) {
         std::vector<Copy> copies;
         std::fill(expected.begin(),expected.end(),0xa9);
         for(uint32_t i=0;i<count;++i) {
-            uint32_t sourceRow=pattern==1?(i^1U)*2:pattern==2?(i/2)*2:i*2;
-            uint32_t slot=pattern==3?(i^1U)*3:pattern==4?(i/2)*3:i*3;
+            uint32_t sourceRow=(pattern==1 || pattern>=7)?(i^1U)*2:pattern==2?(i/2)*2:i*2;
+            uint32_t slot=(pattern==3 || pattern==8)?(i^1U)*3:(pattern==4 || pattern==7)?(i/2)*3:i*3;
             uint32_t owner=pattern==5?i%2:pattern==6?(i%2?0:1):0;
-            if(pattern>=5)slot=(i/2)*3;
+            if(pattern==5 || pattern==6)slot=(i/2)*3;
+            if(pattern==9)slot=(i/2)*3;
+            uint64_t overlap=pattern==9?(i%2)*32:0;
             uint64_t offset=3+uint64_t(sourceRow)*kTokenBytes;
-            copies.push_back({region.peerBase+offset,Address(output)+uint64_t(owner)*stride*kTokenBytes,slot});
-            std::memcpy(expected.data()+(uint64_t(owner)*stride+slot)*kTokenBytes,source.data()+offset,kTokenBytes);
+            copies.push_back({region.peerBase+offset,Address(output)+uint64_t(owner)*stride*kTokenBytes+overlap,slot});
+            std::memcpy(expected.data()+(uint64_t(owner)*stride+slot)*kTokenBytes+overlap,source.data()+offset,kTokenBytes);
         }
         auto exercise=[&](auto& pipe) {
             // Failure before any accepted row must not acquire an event.
@@ -270,8 +281,11 @@ void CheckPairCommands() {
         UbmemPairCopyPipeline paired(&ctx,Address(output),local);exercise(paired);
         auto pairLoads=copy_model::loadCommands-beforeLoads,pairStores=copy_model::storeCommands-beforeStores;
         assert(pairLoads<=baseLoads && pairStores<=baseStores);
-        assert(pairLoads==(pattern==1 || pattern==2?count:(count+1)/2));
-        assert(pairStores==(pattern==3 || pattern==4 || pattern==6?count:(count+1)/2));
+        bool singleLoads=pattern==2 || pattern==7 || pattern==9 || (!V9_UBMEM_ORDERED_PAIR && (pattern==1 || pattern==8));
+        bool singleStores=pattern==3 || pattern==4 || pattern==6 || pattern==7 || pattern==9 ||
+            (V9_UBMEM_ORDERED_PAIR?pattern==1:pattern==8);
+        assert(pairLoads==(singleLoads?count:(count+1)/2));
+        assert(pairStores==(singleStores?count:(count+1)/2));
         if(pattern==0) {
             totalBaseLoads+=baseLoads;totalPairLoads+=pairLoads;
             totalBaseStores+=baseStores;totalPairStores+=pairStores;
@@ -305,7 +319,7 @@ int main() {
     for(uint32_t tail:{0U,384U,640U})CheckOutputLayout(tail);
 #if V9_UBMEM_GROUPED_COPY
     CheckFinalLookahead<4>();CheckFinalLookahead<8>();
-    CheckFinalBorrow();
+    CheckFinalBorrow(false);CheckFinalBorrow(true);
     CheckPairCommands();
 #endif
 }

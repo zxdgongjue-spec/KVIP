@@ -34,9 +34,15 @@ def test_complete_plan_preserves_checks_publication_and_plan(tmp_path):
         + "\n".join(function(completion, name) for name in ("PublishCompletedResidency", "CompleteBatch"))
         + "\n}\n"
     )
-    functions += "template<bool Extended>\n" + function(update, "Update")
+    functions += "\n".join(
+        "template<uint32_t Threads>\n" + function(update, name) for name in ("PublishOutputRow", "PublishOwnedOutputs")
+    )
+    functions += "\ntemplate<bool Extended,bool WithOutputs=false>\n" + function(update, "Update")
+    functions += "\n" + function(update, "PublishOutputs")
     functions += "\n" + function(update, "PlanOwned")
+    functions += "\n" + function(update, "CompleteAndPlan")
     functions += "\n" + function(update, "kvip_ubmem_complete_plan_kernel")
+    functions += "\n" + function(update, "kvip_ubmem_complete_plan_outputs_kernel")
     source = r"""
 #include <algorithm>
 #include <array>
@@ -61,9 +67,13 @@ struct {uint32_t x;} threadIdx;
 uint32_t block=0;
 uint32_t GetBlockIdx(){return block;}
 bool publicationReady=false;
+bool allPlansComplete=false;
+uintptr_t errorsBegin=0,errorsEnd=0;
 std::vector<std::pair<uintptr_t,uintptr_t>> watched;
 template<class T>T asc_ldcg(T* p) {
     for(auto range:watched)if(uintptr_t(p)>=range.first && uintptr_t(p)<range.second)assert(publicationReady);
+    if(uintptr_t(p)>=errorsBegin && uintptr_t(p)<errorsEnd)
+        assert(allPlansComplete || (uintptr_t(p)-errorsBegin)/sizeof(uint32_t)==block);
     return *p;
 }
 template<class T>void asc_stcg(T* p,T value){*p=value;}
@@ -112,10 +122,11 @@ using namespace rotating;
 struct Result {
     std::vector<uint8_t> rows;
     std::vector<uint32_t> info,hot,errors,plan;
+    std::vector<int32_t> output;
     std::vector<uint64_t> status;
-    bool operator==(const Result& o)const{return rows==o.rows && info==o.info && hot==o.hot && errors==o.errors && plan==o.plan && status==o.status;}
+    bool operator==(const Result& o)const{return rows==o.rows && info==o.info && hot==o.hot && errors==o.errors && plan==o.plan && status==o.status && output==o.output;}
 };
-Result Run(bool merged,uint32_t fault) {
+Result Run(uint32_t mode,uint32_t fault) {
     std::vector<Row> rows(SIM_BATCH);
     std::memset(rows.data(),0,rows.size()*sizeof(Row));
     std::vector<FinalPost> ownerStorage((kFinalOwnerBytes+sizeof(FinalPost)-1)/sizeof(FinalPost));
@@ -126,6 +137,16 @@ Result Run(bool merged,uint32_t fault) {
     std::vector<uint32_t> plan(SIM_BATCH*kExtendedTransferWords,777),work(SIM_BATCH*kExtendedWorkWords);
     std::vector<int32_t> destinations(SIM_BATCH*kSlots,-1);
     std::vector<uint64_t> status(SIM_BATCH*kUbmemStatusWords);
+    std::vector<int64_t> logical((SIM_BATCH+1)*SIM_HISTORY),unpack(SIM_BATCH*4),valid(SIM_BATCH*4,1);
+    std::vector<int32_t> topk(SIM_BATCH*kSlots),locations(SIM_BATCH*kSlots),output(SIM_BATCH*kSlots*2,9191);
+    std::iota(logical.begin(),logical.end(),100000);
+    for(uint32_t q=0;q<SIM_BATCH*4;++q) {
+        unpack[q]=(q*3+5)%(SIM_BATCH*4);
+        for(uint32_t k=0;k<2048;++k){topk[q*2048+k]=k%SIM_HISTORY;locations[q*2048+k]=(q+k)%SIM_RESIDENT;}
+    }
+    if(fault%3==0)valid.back()=0;
+    if(fault%3==1)unpack[0]=-1;
+    if(fault%3==2)unpack.back()=SIM_BATCH*4;
     UbmemRegion region{kUbmemMagic,kUbmemVersion,0x100000,0x200000,0x100000,7,0x800000,
         uint64_t(SIM_BATCH+1)*(SIM_RESIDENT+384)*kTokenBytes,0,kUbmemHostLocal};
     Context ctx{};
@@ -170,13 +191,29 @@ Result Run(bool merged,uint32_t fault) {
     a[8]=ctx.rows;a[9]=ctx.rowOwners;a[10]=ctx.rowStatus;a[11]=uint64_t(FinalPostAt(&ctx,0));
     a[12]=ctx.ubmemStatus;a[13]=ctx.ubmemRegion;a[14]=kFinalWorkers;a[17]=uint64_t(plan.data());
     a[24]=SIM_HISTORY;a[25]=SIM_RESIDENT;a[26]=uint64_t(counts.data());a[27]=uint64_t(work.data());
+    a[3]=uint64_t(logical.data());a[18]=uint64_t(topk.data());a[19]=uint64_t(locations.data());
+    a[20]=uint64_t(unpack.data());a[21]=uint64_t(valid.data());
+    a[22]=uint64_t(output.data());a[23]=uint64_t(output.data()+SIM_BATCH*kSlots);
+    errorsBegin=uint64_t(errors.data());errorsEnd=errorsBegin+errors.size()*4;allPlansComplete=false;
     watched={{ctx.rows,ctx.rows+rows.size()*sizeof(Row)},{ctx.rowStatus,ctx.rowStatus+info.size()*4},
         {ctx.ubmemStatus,ctx.ubmemStatus+status.size()*8},{a[11],a[11]+SIM_BATCH*kFinalWorkers*sizeof(FinalPost)}};
     publicationReady=false;
-    for(block=0;block<SIM_BATCH;++block) {
-        if(merged)kvip_ubmem_complete_plan_kernel(reinterpret_cast<GM_ADDR>(bindings),reinterpret_cast<GM_ADDR>(a));
+    for(uint32_t i=0;i<SIM_BATCH;++i) {
+        block=SIM_BATCH-1-i; // Cross-batch TND rows cannot rely on another block's status.
+        if(mode==2)kvip_ubmem_complete_plan_outputs_kernel(reinterpret_cast<GM_ADDR>(bindings),reinterpret_cast<GM_ADDR>(a));
+        else if(mode==1)kvip_ubmem_complete_plan_kernel(reinterpret_cast<GM_ADDR>(bindings),reinterpret_cast<GM_ADDR>(a));
         else {CompleteBatch(&ctx,block);publicationReady=true;PlanOwned(reinterpret_cast<GM_ADDR>(a));}
         assert(pending.empty() && !events[0] && !events[1]);
+    }
+    allPlansComplete=true;
+    if(mode!=2)for(uint32_t core=0;core<kOutputCores;++core){threadIdx.x=0;PublishOutputs(a,core);}
+    for(uint32_t q=0;q<SIM_BATCH*4;++q)for(uint32_t k=0;k<2048;++k) {
+        bool active=valid[q] && unpack[q]>=0 && unpack[q]<SIM_BATCH*4;
+        if(active)active=!errors[unpack[q]/4];
+        int32_t token=active?topk[unpack[q]*2048+k]:-1;
+        int32_t expected=active?int32_t(logical[owners[unpack[q]/4]*SIM_HISTORY+token]):-1;
+        assert(output[q*2048+k]==expected);
+        assert(output[SIM_BATCH*kSlots+q*2048+k]==(active?locations[unpack[q]*2048+k]:-1));
     }
     assert(errors[0]==0 || plan[0]==0);
     const bool completedSuccessfully=fault==0 || fault>=12;
@@ -189,9 +226,9 @@ Result Run(bool merged,uint32_t fault) {
     watched.clear();
     Result result;result.rows.resize(rows.size()*sizeof(Row));
     std::memcpy(result.rows.data(),rows.data(),result.rows.size());
-    result.info=info;result.hot=hot;result.errors=errors;result.plan=plan;result.status=status;return result;
+    result.info=info;result.hot=hot;result.errors=errors;result.plan=plan;result.status=status;result.output=output;return result;
 }
-int main(){for(uint32_t fault=0;fault<15;++fault)assert(Run(false,fault)==Run(true,fault));}
+int main(){for(uint32_t fault=0;fault<15;++fault){auto baseline=Run(0,fault);assert(baseline==Run(1,fault));assert(baseline==Run(2,fault));}}
 """.replace("FUNCTIONS", functions)
     cpp, binary = tmp_path / "complete.cpp", tmp_path / "complete"
     cpp.write_text(source)

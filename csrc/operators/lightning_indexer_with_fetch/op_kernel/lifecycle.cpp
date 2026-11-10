@@ -268,6 +268,9 @@ extern "C" __global__ __aicore__ void v9_wait_kernel(GM_ADDR bindings) {
     }
 #endif
 }
+#if defined(__CCE_AICORE__) && V9_URMA_ASYNC_FINAL
+#include "async_final.h"
+#endif
 extern "C" __global__ __aicore__ void v9_resolve_kernel(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
     auto runtimeShape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(reinterpret_cast<__gm__ uint64_t*>(bindings)[14]));
@@ -282,6 +285,11 @@ extern "C" __global__ __aicore__ void v9_resolve_kernel(GM_ADDR bindings) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     if ASCEND_IS_AIV {
         ReplicatedFinal(rt_batch,rt_history,rt_resident,rt_finalWorkers,rt_finalPostOffset,rt_tokenBytes,GetContext(bindings));
+#if V9_URMA_ASYNC_FINAL
+        // ReplicatedFinal destroyed its pipe and published this worker's
+        // descriptor slice. Native WQE staging may now borrow UB offset zero.
+        SubmitSafeFinal(GetContext(bindings),GetBlockIdx());
+#endif
     }
 #endif
 }
@@ -291,7 +299,13 @@ extern "C" __global__ __aicore__ void v9_resolve_kernel(GM_ADDR bindings) {
 #include "parallel_final.h"
 extern "C" __global__ __aicore__ void v9_parallel_fetch_kernel(GM_ADDR bindings) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    if ASCEND_IS_AIV { ParallelFinalGet(GetContext(bindings),GetBlockIdx()); }
+    if ASCEND_IS_AIV {
+#if V9_URMA_ASYNC_FINAL
+        CompleteAsyncFinal(GetContext(bindings),GetBlockIdx());
+#else
+        ParallelFinalGet(GetContext(bindings),GetBlockIdx());
+#endif
+    }
 }
 __aicore__ inline void FinishFetch(GM_ADDR bindings, GM_ADDR update) {
     auto runtimeShape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(reinterpret_cast<__gm__ uint64_t*>(bindings)[14]));

@@ -19,6 +19,7 @@ inline size_t fences[7][8]{};
 inline std::vector<std::function<void()>> loads,stores;
 inline size_t loadsDone=0,storesDone=0,loadCommands=0,storeCommands=0;
 inline size_t pendingLoadRows=0,peakLoadRows=0;
+inline size_t scalarLocalReads=0;
 inline unsigned worker=0;
 inline std::map<uintptr_t,unsigned> owners;
 inline void Write(void* output,size_t bytes) {
@@ -61,7 +62,7 @@ template<class T> struct LocalTensor {
     T* data;size_t bytes;
     T* GetPhyAddr()const {return data;}
     LocalTensor operator[](size_t index)const {assert(index*sizeof(T)<=bytes);return {data+index,bytes-index*sizeof(T)};}
-    T GetValue(size_t index)const {assert((index+1)*sizeof(T)<=bytes);T result;std::memcpy(&result,data+index,sizeof(T));return result;}
+    T GetValue(size_t index)const {assert((index+1)*sizeof(T)<=bytes);++copy_model::scalarLocalReads;T result;std::memcpy(&result,data+index,sizeof(T));return result;}
     void SetValue(size_t index,T value)const {assert((index+1)*sizeof(T)<=bytes);std::memcpy(data+index,&value,sizeof(T));}
     template<class U> LocalTensor<U> ReinterpretCast()const {return {reinterpret_cast<U*>(data),bytes};}
 };
