@@ -691,13 +691,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessBaseBlock(uint3
 {
     CalcRunInfo(loop, s2LoopIdx, runInfo, qScaleLoop, kScaleLoop);
     if ASCEND_IS_AIC {
-        const uint32_t end = tempLoopInfo.s2LoopEnd + 1;
-        if (matmulService.CanStageKeyPairs(runInfo, end)) {
-            const uint32_t nextKeyTile = s2LoopIdx + 2 < end ? s2LoopIdx + 2 : 0;
-            matmulService.template ComputeMm1<true>(runInfo, nextKeyTile);
-        } else {
-            matmulService.ComputeMm1(runInfo);
-        }
+        matmulService.ComputeMm1(runInfo);
         if (!rotationServed_ && rotating::EpochAt(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.splitQ,runtimeShape_.rounds,runtimeShape_.serviceAics,s2LoopIdx + 1, aiCoreIdx) >= 0) {
             CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(8);
             rotationServed_ = true;
