@@ -63,6 +63,9 @@ class DependencyPatchTests(unittest.TestCase):
             (self.root / "scripts/patches" / f"{name}.patch").write_text(data)
         (self.root / "patches/kvaf-background-put.patch").write_text(diff(self.stages[3], self.stages[4]))
         (self.root / "patches/kvaf-ubmem.patch").write_text(diff(self.stages[4], self.stages[5]))
+        (self.root / "patches/kvaf-urma-get-post32.patch").write_text(
+            diff("original\n", "optional post32\n", "unrelated.txt")
+        )
         self.root_patch = patch.object(BUILD, "ROOT", self.root)
         self.revision_patch = patch.object(BUILD, "REVISION", revision)
         self.root_patch.start()
@@ -90,6 +93,70 @@ class DependencyPatchTests(unittest.TestCase):
         self.assertEqual(self.text(), self.stages[4])
         BUILD.prepare_dependency(self.source)
         self.assertEqual(self.text(), self.stages[4])
+
+    def test_optional_post32_is_idempotent_and_default_path_does_not_apply_it(self):
+        BUILD.prepare_dependency(self.source)
+        self.assertEqual((self.source / "unrelated.txt").read_text(), "original\n")
+        BUILD.prepare_dependency(self.source, urma_get_post32=True)
+        self.assertEqual((self.source / "unrelated.txt").read_text(), "optional post32\n")
+        before = self.git("diff")
+        BUILD.prepare_dependency(self.source, urma_get_post32=True)
+        BUILD.prepare_dependency(self.source)
+        self.assertEqual(self.git("diff"), before)
+
+    def test_post32_rejects_ubmem_before_mutation_and_preserves_conflicts(self):
+        with self.assertRaisesRegex(ValueError, "requires --transport urma"):
+            BUILD.prepare_dependency(self.source, "ubmem", urma_get_post32=True)
+        self.assertEqual(self.text(), self.stages[0])
+        BUILD.prepare_dependency(self.source)
+        (self.source / "unrelated.txt").write_text("user edit\n")
+        with self.assertRaisesRegex(RuntimeError, "conflicts"):
+            BUILD.prepare_dependency(self.source, urma_get_post32=True)
+        self.assertEqual((self.source / "unrelated.txt").read_text(), "user edit\n")
+
+    def test_post32_prepare_only_preserves_manifest_and_does_not_build(self):
+        (self.root / "build").mkdir()
+        manifest = self.root / "build/dependencies.json"
+        manifest.write_text("existing selected build")
+        with (
+            patch.object(
+                sys, "argv", ["build.py", "--prepare-only", "--urma-get-post32", "--kvaf-root", str(self.source)]
+            ),
+            patch.object(BUILD, "build_urma_post32") as build,
+        ):
+            BUILD.main()
+        build.assert_not_called()
+        self.assertEqual(manifest.read_text(), "existing selected build")
+        self.assertEqual((self.source / "unrelated.txt").read_text(), "optional post32\n")
+
+    def test_post32_incremental_build_uses_explicit_nondefault_target(self):
+        build_dir = self.source / "build-npu"
+        build_dir.mkdir()
+        with self.assertRaisesRegex(RuntimeError, "configured"):
+            BUILD.build_urma_post32(build_dir, 2, {})
+        (build_dir / "CMakeCache.txt").touch()
+        (build_dir / "bin").mkdir()
+        (build_dir / "bin/kvaf_execute_batch_get_post32.o").touch()
+        with patch.object(BUILD, "call") as run:
+            BUILD.build_urma_post32(build_dir, 2, {"PYTHON": "serving-python"})
+        self.assertEqual(
+            run.call_args_list,
+            [
+                call(["cmake", "-S", self.source, "-B", build_dir], env={"PYTHON": "serving-python"}),
+                call(
+                    [
+                        "cmake",
+                        "--build",
+                        build_dir,
+                        "--target",
+                        "kvaf_execute_batch_get_post32_kernel",
+                        "--parallel",
+                        2,
+                    ],
+                    env={"PYTHON": "serving-python"},
+                ),
+            ],
+        )
 
     def test_fresh_ubmem_and_repeat(self):
         BUILD.prepare_dependency(self.source, "ubmem")

@@ -35,6 +35,12 @@ def arguments(argv=None):
     parser.add_argument("--kvaf-server", help="Dedicated local CPU service, required for URMA replay")
     parser.add_argument("--serial-workers", type=int, help="Serial Get workers: service defaults UBmem=32, URMA=2")
     parser.add_argument(
+        "--urma-serial-post-size",
+        type=int,
+        choices=(32, 128),
+        help="URMA serial WQEs per post; default 128, 32 requires the optional post32 kernel",
+    )
+    parser.add_argument(
         "--urma-serial-max-inflight",
         type=int,
         help="URMA serial total inflight bound: 0 submits whole core slices; omitted keeps native default 2048",
@@ -48,7 +54,7 @@ def arguments(argv=None):
     parser.add_argument(
         "--split-index-stages",
         action="store_true",
-        help="Diagnose UBmem index_plan/index_outputs/index_apply instead of combined index_update",
+        help="Diagnose UBmem complete_index_plan/index_outputs/index_apply instead of complete_index_update",
     )
     parser.add_argument(
         "--service-ablation",
@@ -103,6 +109,10 @@ def arguments(argv=None):
         parser.error("--active-batches requires --service-ablation")
     if args.serial_workers is not None and (args.mode != "serial" or not 1 <= args.serial_workers <= 48):
         parser.error("serial-workers requires serial mode and a value in 1..48")
+    if args.urma_serial_post_size is not None and (args.inspect or (args.transport, args.mode) != ("urma", "serial")):
+        parser.error("--urma-serial-post-size requires URMA serial device replay")
+    if args.urma_serial_post_size is None:
+        args.urma_serial_post_size = 128
     if args.urma_serial_max_inflight is not None:
         if args.inspect or (args.transport, args.mode) != ("urma", "serial"):
             parser.error("--urma-serial-max-inflight requires URMA serial device replay")

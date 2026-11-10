@@ -8,6 +8,7 @@
   #include "simt_api/device_warp_functions.h"
   #include "index_cache_update.h"
   #include "context.h"
+  #include "completion.h"
 using namespace AscendC;
 namespace {
 constexpr uint32_t kCandidates = kExtendedCandidates, kThreads = 512;
@@ -121,16 +122,7 @@ __aicore__ inline void Apply(GM_ADDR bindings) {
                                 reinterpret_cast<__ubuf__ uint64_t*>(local[kTransferPlanWords].GetPhyAddr()), count);
 }
 
-}  // namespace
-#endif
-
-
-// Same update body, with stable request-owner storage instead of compact batch
-// storage. The test interface also carries its hot-valid pointer.
-extern "C" __global__ __aicore__ void kvip_ubmem_direct_update_owned_kernel(GM_ADDR bindings) {
-#if defined(__CCE_AICORE__)
-  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-  if ASCEND_IS_AIV {
+__aicore__ inline void PlanOwned(GM_ADDR bindings) {
     TPipe pipe;
     TBuf<TPosition::VECCALC> scratch;
     pipe.InitBuffer(scratch, kExtendedScratchBytes);
@@ -145,6 +137,36 @@ extern "C" __global__ __aicore__ void kvip_ubmem_direct_update_owned_kernel(GM_A
     else
       Simt::VF_CALL<Update<true>>(Simt::Dim3{kThreads,1,1},args,batch,owners[batch],true,
                                  reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
+}
+
+}  // namespace
+#endif
+
+
+// Same update body, with stable request-owner storage instead of compact batch
+// storage. The test interface also carries its hot-valid pointer.
+extern "C" __global__ __aicore__ void kvip_ubmem_direct_update_owned_kernel(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__)
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  if ASCEND_IS_AIV {
+    PlanOwned(bindings);
+  }
+#endif
+}
+// The preceding resolve launch completed every final worker. Completion and
+// planning are row-local; the separate outputs launch remains the cross-row
+// barrier needed by TND unpack, before Apply changes logical Index ownership.
+extern "C" __global__ __aicore__ void kvip_ubmem_complete_plan_kernel(GM_ADDR bindings,GM_ADDR update) {
+#if defined(__CCE_AICORE__)
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  if ASCEND_IS_AIV {
+    uint32_t batch=GetBlockIdx();if(batch>=SIM_BATCH)return;
+    auto ctx=reinterpret_cast<__gm__ rotating::Context*>(reinterpret_cast<__gm__ uint64_t*>(bindings)[14]);
+    rotating::CompleteBatch(ctx,batch);
+    // Replace the removed kernel boundary for scalar status/cache publication
+    // before the following SIMT planner uses asc_ldcg on those same records.
+    SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
+    PlanOwned(update);
   }
 #endif
 }

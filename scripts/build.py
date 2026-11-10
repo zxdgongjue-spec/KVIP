@@ -14,6 +14,7 @@ REVISION = "1c1310387ebfb6776a07316874e924265b209ada"
 PATCHES = ("kvaf-reuse-device-ra", "kvaf-fused-context", "kvaf-fused-output-views")
 UBMEM_PATCH = "kvaf-ubmem"
 BACKGROUND_PATCH = "kvaf-background-put"
+URMA_POST32_PATCH = "kvaf-urma-get-post32"
 
 
 def call(command, cwd=None, env=None):
@@ -50,7 +51,9 @@ def build_lidu(env, skip=False):
 
 
 def patch_path(name):
-    directory = ROOT / "patches" if name in (BACKGROUND_PATCH, UBMEM_PATCH) else ROOT / "scripts/patches"
+    directory = (
+        ROOT / "patches" if name in (BACKGROUND_PATCH, UBMEM_PATCH, URMA_POST32_PATCH) else ROOT / "scripts/patches"
+    )
     return directory / (name + ".patch")
 
 
@@ -71,9 +74,11 @@ def apply_patch(root, name):
     call(["git", "apply", patch_path(name)], cwd=root)
 
 
-def prepare_dependency(root, transport="urma"):
+def prepare_dependency(root, transport="urma", urma_get_post32=False):
     if transport not in ("urma", "ubmem"):
         raise ValueError("transport must be urma or ubmem")
+    if urma_get_post32 and transport != "urma":
+        raise ValueError("--urma-get-post32 requires --transport urma")
     if not root.exists():
         root.parent.mkdir(parents=True, exist_ok=True)
         call(["git", "clone", "--no-checkout", "https://gitcode.com/CacheOS/KVAF.git", root])
@@ -101,7 +106,22 @@ def prepare_dependency(root, transport="urma"):
         apply_patch(root, BACKGROUND_PATCH)
     if transport == "ubmem":
         apply_patch(root, UBMEM_PATCH)
+    elif urma_get_post32 and not applies(root, URMA_POST32_PATCH, True):
+        apply_patch(root, URMA_POST32_PATCH)
     print(f"KVAF {transport} dependency ready: {root} @ {head}", flush=True)
+
+
+def build_urma_post32(build_dir, jobs, env):
+    if not (build_dir / "CMakeCache.txt").is_file():
+        raise RuntimeError("--urma-get-post32 requires an existing configured URMA NPU build")
+    # An existing Make generator cannot build a newly added target until it is
+    # reconfigured. Keep its toolchain/options in the existing cache.
+    call(["cmake", "-S", build_dir.parent, "-B", build_dir], env=env)
+    call(
+        ["cmake", "--build", build_dir, "--target", "kvaf_execute_batch_get_post32_kernel", "--parallel", jobs], env=env
+    )
+    if not (build_dir / "bin/kvaf_execute_batch_get_post32.o").is_file():
+        raise RuntimeError("Optional URMA post32 kernel was not produced")
 
 
 def main():
@@ -114,16 +134,21 @@ def main():
     parser.add_argument("--soc", default="Ascend950PR_9599", help="compile target architecture")
     parser.add_argument("--jobs", type=int, default=2)
     parser.add_argument("--transport", choices=("urma", "ubmem"), default="urma")
+    parser.add_argument("--urma-get-post32", action="store_true", help="Build the optional URMA 32-WQE Get object")
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be positive")
+    if args.urma_get_post32 and args.transport != "urma":
+        parser.error("--urma-get-post32 requires --transport urma")
     if not args.prepare_only:
         runtime_preflight()
     dependency = (args.kvaf_root or ROOT / "third_party/KVAF").resolve()
-    prepare_dependency(dependency, args.transport)
+    prepare_dependency(dependency, args.transport, urma_get_post32=args.urma_get_post32)
     (ROOT / "build").mkdir(exist_ok=True)
     build_dir = dependency / ("build-ubmem-npu" if args.transport == "ubmem" else "build-npu")
     state = dict(kvaf=str(dependency), revision=REVISION, transport=args.transport, kvaf_build_dir=str(build_dir))
+    if args.urma_get_post32:
+        state["urma_get_post32"] = True
     if args.prepare_only:
         # Preparing source must not switch a working Python environment to an
         # unbuilt dependency. Select it only after the build succeeds.
@@ -181,6 +206,8 @@ def main():
                 cwd=dependency,
                 env=env,
             )
+    if args.urma_get_post32:
+        build_urma_post32(build_dir, args.jobs, env)
     build_lidu(env, args.skip_lidu_build)
     # Editable install intentionally retains csrc alongside the Python package.
     call([sys.executable, "-m", "pip", "install", "--no-build-isolation", "-e", ROOT])

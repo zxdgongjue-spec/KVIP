@@ -42,13 +42,14 @@ def test_fused_stages_preserve_exact_production_launch_order_and_arguments(trans
             "init",
             "li_with_prefetch",
             "resolve_final_fetch",
-            "complete",
-            "index_update",
+            "complete_index_update",
         ]
-        assert calls == [(name, (0x1000, 0x4000)) for name in ("v9_init", "v9_li", "v9_resolve", "v9_fetch")] + [
-            ("kvip_ubmem_update", (0x2000, 0x4000))
+        assert calls == [(name, (0x1000, 0x4000)) for name in ("v9_init", "v9_li", "v9_resolve")] + [
+            ("kvip_ubmem_complete_plan", (0x1000, 0x2000, 0x4000)),
+            ("kvip_ubmem_update_outputs", (0x2000, 0x4000)),
+            ("kvip_ubmem_update_apply", (0x2000, 0x4000)),
         ]
-        assert library.functions["kvip_ubmem_update"].argtypes == [ctypes.c_void_p, ctypes.c_void_p]
+        assert library.functions["kvip_ubmem_complete_plan"].argtypes == [ctypes.c_void_p] * 3
     else:
         assert [name for name, _ in stages] == [
             "init",
@@ -112,10 +113,25 @@ def test_split_index_stages_retain_native_order_without_extra_work():
     update = SimpleNamespace(bindings=SimpleNamespace(data_ptr=lambda: 22))
     lease = SimpleNamespace(check_stream=lambda: SimpleNamespace(npu_stream=33))
     stages = fused_stages("ubmem", rotating, update, lease, 16, split_index_stages=True)
-    assert [name for name, _ in stages][-3:] == ["index_plan", "index_outputs", "index_apply"]
+    assert [name for name, _ in stages][-3:] == ["complete_index_plan", "index_outputs", "index_apply"]
     for _, launch in stages:
         launch()
-    assert calls[-3:] == [("kvip_ubmem_update_" + name, (22, 33)) for name in ("plan", "outputs", "apply")]
+    assert calls[-3:] == [("kvip_ubmem_complete_plan", (11, 22, 33))] + [
+        ("kvip_ubmem_update_" + name, (22, 33)) for name in ("outputs", "apply")
+    ]
+
+
+def test_combined_completion_stage_stops_on_plan_failure():
+    calls = []
+    library = Library(calls)
+    rotating = SimpleNamespace(library=library, bindings=SimpleNamespace(data_ptr=lambda: 11))
+    update = SimpleNamespace(bindings=SimpleNamespace(data_ptr=lambda: 22))
+    lease = SimpleNamespace(check_stream=lambda: SimpleNamespace(npu_stream=33))
+    stages = fused_stages("ubmem", rotating, update, lease, 16)
+    library.result = 17
+    with pytest.raises(RuntimeError, match="complete_plan failed: 17"):
+        stages[-1][1]()
+    assert calls == [("kvip_ubmem_complete_plan", (11, 22, 33))]
 
 
 def test_tuning_keeps_snapshot_immutable_and_validates_only_known_options():

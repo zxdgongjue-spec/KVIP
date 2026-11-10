@@ -4,6 +4,7 @@
 #include "prefetch.h"
 #include "resolver.h"
 #include "init_partition.h"
+#include "completion.h"
 using namespace AscendC;
 using namespace rotating;
 namespace {
@@ -126,41 +127,7 @@ __aicore__ inline void InitializeRoundParallel(__gm__ Context* ctx,uint32_t b,ui
     pipe.Destroy();
 }
 #endif
-__aicore__ inline void CompleteBatch(__gm__ Context* ctx,uint32_t b) {
-    auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
-    auto info=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
-    ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),sizeof(Row));
-    ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),kRowStatusWords*4);
-    auto region=UbmemRegionAt(ctx);
-    uint64_t error=info[0]|row->error;
-    if(!ctx->ubmemStatus || !UbmemRegionValid(region))error|=kUbmemInvalidRegion;
-    uint64_t scheduled=0,completed=0;
-    for(uint32_t w=0;w<kFinalWorkers;++w) {
-        auto post=FinalPostAt(ctx,b*kFinalWorkers+w);
-        ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(FinalPost));
-        scheduled+=post->count;completed+=post->head;error|=post->error;
-        if(post->pending || post->deferred || post->count!=post->head)error|=kUbmemIncomplete;
-    }
-    if(row->pending || scheduled!=info[1] || scheduled!=completed)error|=kUbmemIncomplete;
-    if(ctx->ubmemStatus) {
-        auto status=UbmemStatusAt(ctx,b);
-        ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),128);
-        if(status[2]!=row->requests)error|=kUbmemIncomplete;
-        status[0]=error;status[1]=row->requests;status[3]=scheduled;status[4]=completed;
-        status[5]=(status[2]+completed)*kTokenBytes;
-        status[6]=UbmemRegionValid(region)?region->generation:0;
-        ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),128);
-    }
-    row->error=static_cast<uint32_t>(error);
-    info[0]|=static_cast<uint32_t>(error);info[3]=0;info[4]=static_cast<uint32_t>(completed);
-    if(!error) {
-        row->finalPending=0;
-        Simt::VF_CALL<PublishCompletedResidency>(Simt::Dim3{256,1,1},SIM_RESIDENT,ctx,b,static_cast<uint32_t>(completed));
-        SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-    }
-    ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),sizeof(Row));
-    ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),32);
-}
+
 }
 #endif
 extern "C" __global__ __aicore__ void kvip_ubmem_init_kernel(GM_ADDR bindings) {

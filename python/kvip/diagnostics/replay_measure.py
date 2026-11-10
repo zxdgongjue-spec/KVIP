@@ -128,7 +128,57 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
     )
 
 
-def measure(torch, kvaf, stream, bundle, args, retained):
+def profile_urma_get(runtime, stream, reset, verify, replay_stages):
+    """One instrumented replay after headline timing, without guessing a clock rate."""
+    reset()
+    stream.synchronize()
+    runtime.start_batch_get_kernel_profile()
+    failed = False
+    try:
+        replay_stages()
+        stream.synchronize()
+        cores = runtime.batch_get_kernel_profile()
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        try:
+            runtime.stop_batch_get_kernel_profile()
+        except BaseException:
+            # Preserve the original completion/readback error; the CLI keeps
+            # the full active bundle alive and exits without native cleanup.
+            if not failed:
+                raise
+    reads = verify()
+    if not cores:
+        raise RuntimeError("URMA native Get profile returned no core records")
+    fields = (
+        "active_requests",
+        "total_posts",
+        "submitted_group_count",
+        "completed_group_count",
+        "completion_count",
+        "post_active_cycles",
+        "drain_wait_cycles",
+    )
+    totals = {name: sum(int(core[name]) for core in cores) for name in fields}
+    if totals["active_requests"] != reads["final"]:
+        raise AssertionError("URMA native Get profile request count differs from verified serial reads")
+    maxima = {name: max(int(core[name]) for core in cores) for name in ("post_active_cycles", "drain_wait_cycles")}
+    return dict(
+        method="one additional instrumented stage-graph replay after headline and stage timing",
+        unit="native_cycles",
+        included_in_headline=False,
+        caveat="Core sums and maxima are diagnostics, not additive wall latency; no cycle-to-us conversion.",
+        cores=cores,
+        totals=totals,
+        maxima=maxima,
+        active_cores=sum(int(core["active_requests"]) > 0 for core in cores),
+        reads=reads,
+    )
+
+
+def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
     """Time one full graph; optional stage graphs are separately labelled diagnostics."""
     graphs = retained.setdefault("graphs", [])
     reset, verify = bundle.reset, bundle.verify
@@ -225,6 +275,15 @@ def measure(torch, kvaf, stream, bundle, args, retained):
             total=statistics(totals),
             reads_samples=stage_reads,
         )
+        if getattr(args, "transport", None) == "urma" and args.mode == "serial":
+            # Stage capture rebinds native LI/slot output tensors. Reuse that
+            # same stage chain, whose outputs verify() currently owns, rather
+            # than replaying the earlier full graph against stale references.
+            def replay_stages():
+                for _, stage in stages:
+                    replay(stage)
+
+            result["native_get_profile"] = profile_urma_get(runtime, stream, reset, verify, replay_stages)
     for graph in reversed(graphs):
         graph.reset()
     return result
@@ -288,7 +347,7 @@ def allocate_context(args, archive, retained):
 
 def measure_case(args, archive, context, retained):
     """Release a successful case after graph reset; retain everything on failure."""
-    from kvip.diagnostics.replay_runtime import runtime_worker_config
+    from kvip.diagnostics.replay_runtime import get_kernel_path, runtime_worker_config
 
     build, kvaf, torch = context.build, context.kvaf, context.torch
     device, stream, cann, aics = context.device, context.stream, context.cann, context.aics
@@ -338,7 +397,7 @@ def measure_case(args, archive, context, retained):
             transport=args.transport,
         )
         case_retained["bundle"] = bundle
-    results = measure(torch, kvaf, stream, bundle, args, case_retained)
+    results = measure(torch, kvaf, stream, bundle, args, case_retained, runtime=runtime)
     library = getattr(bundle, "library", None)
     libraries = getattr(bundle, "libraries", (() if library is None else (library,)))
     result = dict(
@@ -386,6 +445,9 @@ def measure_case(args, archive, context, retained):
             h2d_in_candidate_call="candidate_call" in results,
             note="Compact LRU upload already exists in serving; only dense reserved-hot H2D is eliminated.",
         )
+    if args.transport == "urma" and args.mode == "serial":
+        kernel = get_kernel_path(args)
+        result["get_kernel"] = dict(path=str(kernel), sha256=file_digest(kernel))
     # measure() reset every full/stage graph first. A failing reset or lease
     # close leaves the active case and shared arena retained by the CLI.
     if bundle.lease is not None:

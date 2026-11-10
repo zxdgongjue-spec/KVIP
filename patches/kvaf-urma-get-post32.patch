@@ -1,0 +1,162 @@
+diff --git a/access_operator/demo/aiv_batch_get/include/batch_get_schedule.h b/access_operator/demo/aiv_batch_get/include/batch_get_schedule.h
+index e518c5c..0dca996 100644
+--- a/access_operator/demo/aiv_batch_get/include/batch_get_schedule.h
++++ b/access_operator/demo/aiv_batch_get/include/batch_get_schedule.h
+@@ -10,7 +10,15 @@
+ 
+ namespace kvaf_batch_get {
+ 
+-constexpr uint32_t kWqesPerPost = 128U;
++// Only the optional standalone object overrides this macro. Header consumers
++// such as the fused operator retain the original 128-WQE policy.
++#ifndef KVAF_BATCH_GET_WQES_PER_POST
++#define KVAF_BATCH_GET_WQES_PER_POST 128
++#endif
++static_assert(KVAF_BATCH_GET_WQES_PER_POST == 32 ||
++              KVAF_BATCH_GET_WQES_PER_POST == 128,
++              "BatchGet supports 32 or 128 WQEs per post");
++constexpr uint32_t kWqesPerPost = KVAF_BATCH_GET_WQES_PER_POST;
+ 
+ KVAF_BATCH_GET_SCHEDULE_INLINE uint32_t PostCount(uint32_t count) {
+   return count / kWqesPerPost + (count % kWqesPerPost != 0U);
+diff --git a/access_operator/demo/aiv_batch_get/include/kvaf_batch_get_device.h b/access_operator/demo/aiv_batch_get/include/kvaf_batch_get_device.h
+index 3b81bba..d1c0355 100644
+--- a/access_operator/demo/aiv_batch_get/include/kvaf_batch_get_device.h
++++ b/access_operator/demo/aiv_batch_get/include/kvaf_batch_get_device.h
+@@ -299,7 +299,7 @@ __aicore__ inline void RunBatchGetValidation(
+   }
+ }
+ 
+-__simt_vf__ __aicore__ LAUNCH_BOUND(128)
++__simt_vf__ __aicore__ LAUNCH_BOUND(KVAF_BATCH_GET_WQES_PER_POST)
+ inline void FillBatchGetReadWqes(
+     __gm__ const int32_t *indices,
+     __gm__ const int32_t *output_indices,
+diff --git a/access_operator/demo/aiv_batch_get/kernel/CMakeLists.txt b/access_operator/demo/aiv_batch_get/kernel/CMakeLists.txt
+index 41757ac..44b56ba 100644
+--- a/access_operator/demo/aiv_batch_get/kernel/CMakeLists.txt
++++ b/access_operator/demo/aiv_batch_get/kernel/CMakeLists.txt
+@@ -27,3 +27,22 @@ add_custom_command(TARGET kvaf_execute_batch_get_kernel POST_BUILD
+   COMMAND "${CMAKE_COMMAND}" -E make_directory "${KVAF_AIV_DEMO_BIN_DIR}"
+   COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${KVAF_EXECUTE_KERNEL_OBJECT}"
+           "${KVAF_AIV_DEMO_BIN_DIR}/kvaf_execute_batch_get_kernels.o")
++
++# Opt-in standalone comparison object. It exports the same V2 entry/ABI, so
++# callers select it through their existing kernel_object_path. Do not propagate
++# the definition to the default object or fused operators consuming our headers.
++set(KVAF_POST32_KERNEL_TMP "${CMAKE_CURRENT_BINARY_DIR}/kvaf_execute_batch_get_post32.tmp.o")
++set(KVAF_POST32_KERNEL_OBJECT "${KVAF_AIV_DEMO_BIN_DIR}/kvaf_execute_batch_get_post32.o")
++add_custom_command(
++  OUTPUT "${KVAF_POST32_KERNEL_OBJECT}"
++  COMMAND "${KVAF_CCEC}" -c -x cce -O2 "${KVAF_URMA_SOURCE}" -o "${KVAF_POST32_KERNEL_TMP}"
++          -DKVAF_BATCH_GET_WQES_PER_POST=32 ${KVAF_AIV_COMPILE_OPTIONS} ${KVAF_KERNEL_INCLUDES}
++  COMMAND "${KVAF_LLD}" ${KVAF_AIV_LINK_OPTIONS} "${KVAF_POST32_KERNEL_TMP}"
++          -o "${KVAF_POST32_KERNEL_OBJECT}"
++  DEPENDS "${KVAF_URMA_SOURCE}"
++          "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_abi.h"
++          "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_schedule.h"
++          "${KVAF_AIV_DEMO_INCLUDE_DIR}/kvaf_batch_get_device.h"
++          "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"
++  VERBATIM)
++add_custom_target(kvaf_execute_batch_get_post32_kernel DEPENDS "${KVAF_POST32_KERNEL_OBJECT}")
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 017321c..2b024d2 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -53,6 +53,17 @@ target_include_directories(kvaf_batch_get_kernel_model_test PRIVATE
+   ${CMAKE_CURRENT_SOURCE_DIR}/aiv_model
+   ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include)
+ add_test(NAME kvaf_batch_get_kernel_model_test COMMAND kvaf_batch_get_kernel_model_test)
++add_executable(kvaf_batch_get_schedule_post32_test batch_get_schedule_test.cc)
++target_include_directories(kvaf_batch_get_schedule_post32_test PRIVATE
++  ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include)
++target_compile_definitions(kvaf_batch_get_schedule_post32_test PRIVATE KVAF_BATCH_GET_WQES_PER_POST=32)
++add_test(NAME kvaf_batch_get_schedule_post32_test COMMAND kvaf_batch_get_schedule_post32_test)
++add_executable(kvaf_batch_get_kernel_model_post32_test batch_get_kernel_model_test.cc)
++target_include_directories(kvaf_batch_get_kernel_model_post32_test PRIVATE
++  ${CMAKE_CURRENT_SOURCE_DIR}/aiv_model
++  ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include)
++target_compile_definitions(kvaf_batch_get_kernel_model_post32_test PRIVATE KVAF_BATCH_GET_WQES_PER_POST=32)
++add_test(NAME kvaf_batch_get_kernel_model_post32_test COMMAND kvaf_batch_get_kernel_model_post32_test)
+ add_test(NAME kvaf_batch_get_inflight_config_python
+   COMMAND "${Python3_EXECUTABLE}"
+           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_inflight_config.py")
+diff --git a/tests/batch_get_kernel_model_test.cc b/tests/batch_get_kernel_model_test.cc
+index 6bdaf7d..9f97a44 100644
+--- a/tests/batch_get_kernel_model_test.cc
++++ b/tests/batch_get_kernel_model_test.cc
+@@ -43,7 +43,7 @@ void Doorbell(uint32_t value, uint32_t* address) {
+     if (address != &queue.sq_db) continue;
+     ++doorbells;
+     const uint32_t added = value - queue.sq_db;
+-    CHECK(added > 0 && added <= 128);
++    CHECK(added > 0 && added <= KVAF_BATCH_GET_WQES_PER_POST);
+     CHECK(queue.producer + added - queue.completed < 32768);
+     for (uint32_t i = 0; i < added; ++i) {
+       const uint64_t pi = queue.producer++;
+@@ -205,6 +205,32 @@ struct Fixture {
+ };
+ 
+ int main() {
++  // The real B16/Q4 replay allocates 131072 descriptor slots but publishes
++  // only 5708 misses. Partition the dynamic prefix, never the capacity; both
++  // post policies must preserve every request and one checkpoint per Jetty.
++  {
++    Fixture f(131072, 32, 2, 0);
++    const uint64_t before = aiv_model::doorbells;
++    f.Run(5708);
++    uint64_t requests = 0;
++    for (uint32_t c = 0; c < 32; ++c) {
++      const uint32_t count = 5708 * (c + 1) / 32 - 5708 * c / 32;
++      CHECK(count == 178 || count == 179);
++      const uint64_t first = KVAF_BATCH_GET_WQES_PER_POST == 32 ? 96 : 128;
++      CHECK(aiv_model::hardware[2 * c].producer == first);
++      CHECK(aiv_model::hardware[2 * c + 1].producer == count - first);
++      CHECK(f.statuses[c].profile.active_requests == count);
++      CHECK(f.statuses[c].profile.completion_count == 2);
++      CHECK(f.statuses[c].profile.submitted_group_count == 1);
++      requests += count;
++    }
++    CHECK(requests == 5708);
++    CHECK(aiv_model::doorbells - before ==
++          (KVAF_BATCH_GET_WQES_PER_POST == 32 ? 192 : 64));
++    f.Run(0);
++    f.Run(1);
++    f.Run(5708);
++  }
+   // A fused caller owns a descriptor subrange, not the whole prefix. The
+   // standalone entry point below still exercises the original partitioning.
+   {
+diff --git a/tests/batch_get_schedule_test.cc b/tests/batch_get_schedule_test.cc
+index 3642f7d..5e0c259 100644
+--- a/tests/batch_get_schedule_test.cc
++++ b/tests/batch_get_schedule_test.cc
+@@ -21,7 +21,7 @@ void CheckAssignment(const Group& group, uint32_t jettys) {
+   std::array<uint32_t, 64> expected{};
+   uint32_t jetty = group.first_jetty;
+   for (uint32_t remaining = group.count; remaining != 0;) {
+-    const uint32_t count = std::min(remaining, 128U);
++    const uint32_t count = std::min(remaining, uint32_t(KVAF_BATCH_GET_WQES_PER_POST));
+     expected[jetty] += count;
+     remaining -= count;
+     jetty = (jetty + 1U) % jettys;
+@@ -101,7 +101,8 @@ int main() {
+   CHECK(trace == "PPDPDD");
+   CHECK(groups.size() == 3);
+   CHECK(groups[0].count == 1024 && groups[0].first_jetty == 0);
+-  CHECK(groups[1].count == 1024 && groups[1].first_jetty == 8);
++  CHECK(groups[1].count == 1024 &&
++        groups[1].first_jetty == (1024 / KVAF_BATCH_GET_WQES_PER_POST) % 16);
+   CHECK(groups[2].count == 1 && groups[2].first_jetty == 0);
+ 
+   Schedule odd{{}, 0, 17, 5, 3, 0, 0, 0};
+@@ -125,7 +126,8 @@ int main() {
+   }
+   CheckLaunch(65537, 1, 64, 2048);
+   CheckLaunch(65537, 3, 3, 2049);
+-  CHECK(kvaf_batch_get::PostCount(UINT32_MAX) == 33554432U);
++  CHECK(kvaf_batch_get::PostCount(UINT32_MAX) ==
++        uint64_t(UINT32_MAX) / KVAF_BATCH_GET_WQES_PER_POST + 1U);
+   for (uint32_t jettys : {1U, 3U, 64U}) {
+     uint64_t sum = 0;
+     for (uint32_t j = 0; j < jettys; ++j) {

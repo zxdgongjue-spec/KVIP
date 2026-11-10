@@ -1,4 +1,5 @@
 #pragma once
+#include "../device_context.h"
 
 #include "simt_api/asc_simt.h"
 #include "simt_api/device_atomic_functions.h"
@@ -11,8 +12,6 @@
 // Adapt logical fetch slots at the transport boundary; preserve the original
 // hot-slot replacement policy; no KV payload fallback arena is allocated.
 namespace rotating {
-constexpr uint32_t kLruSlots = 2048;
-constexpr uint32_t kChangeCapacity = kLruSlots + kSlots;
 __simt_callee__ inline uint32_t OwnerRow(__gm__ Context* ctx,uint32_t b) {
     return ctx->rowOwners ? asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)+b) : b;
 }
@@ -73,28 +72,6 @@ __simt_callee__ inline void RecordChange(uint32_t rt_resident,__gm__ Context* ct
     if(ctx->changes && uint32_t(slot-rt_resident)<kLruSlots)
         asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+b*kChangeCapacity+slot-rt_resident,token);
 
-}
-// Publish residency only after all UBmem copy pipelines report completion. Resolver
-// workers must all observe the same pre-round validity, not one another's posts.
-__simt_vf__ __aicore__ LAUNCH_BOUND(256)
-inline void PublishCompletedResidency(uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,uint32_t fetched) {
-    if(!ctx->hotValid)return;
-    auto valid=reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+OwnerRow(ctx,b)*rt_resident;
-    // The original resolver already emits exactly the final Fetch destinations.
-    // Hits need no publication; do not rescan all four TopK rows.
-    auto destinations=reinterpret_cast<__gm__ int32_t*>(ctx->destinations)+b*kSlots;
-    uint32_t ownerBase=OwnerRow(ctx,b)*OutputStride(rt_resident,ctx);
-    for(uint32_t i=threadIdx.x;i<fetched;i+=256) {
-        uint32_t slot=uint32_t(asc_ldcg(destinations+i))-ownerBase;
-        if(slot<rt_resident)asc_stcg(valid+slot,uint32_t(1));
-    }
-    if(ctx->changes && ctx->lruSlots) {
-        auto changes=reinterpret_cast<__gm__ int32_t*>(ctx->changes)+b*kChangeCapacity;
-        auto lru=reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots;
-        for(uint32_t i=threadIdx.x;i<kLruSlots;i+=256)
-            if(asc_ldcg(changes+i)>=0)asc_stcg(valid+asc_ldcg(lru+i),uint32_t(1));
-    }
-    asc_threadfence();
 }
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
 inline void AdaptColdPredicate(uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,__ubuf__ uint32_t* selected,__ubuf__ uint32_t* predicate) {

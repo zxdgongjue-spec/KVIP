@@ -44,19 +44,21 @@ def fused_stages(transport, rotating, update, lease, batch, *, split_index_stage
                 ("init", "v9_init"),
                 ("li_with_prefetch", "v9_li"),
                 ("resolve_final_fetch", "v9_resolve"),
-                ("complete", "v9_fetch"),
             )
         ]
-        updates = (
+        updates = [
             (
-                ("index_plan", "kvip_ubmem_update_plan"),
-                ("index_outputs", "kvip_ubmem_update_outputs"),
-                ("index_apply", "kvip_ubmem_update_apply"),
+                "complete_index_plan",
+                _stage(
+                    library,
+                    "kvip_ubmem_complete_plan",
+                    [pointer, pointer, pointer],
+                    lambda stream: (rotating.bindings.data_ptr(), update.bindings.data_ptr(), stream),
+                    lease,
+                ),
             )
-            if split_index_stages
-            else (("index_update", "kvip_ubmem_update"),)
-        )
-        result.extend(
+        ]
+        updates.extend(
             (
                 name,
                 _stage(
@@ -67,8 +69,20 @@ def fused_stages(transport, rotating, update, lease, batch, *, split_index_stage
                     lease,
                 ),
             )
-            for name, symbol in updates
+            for name, symbol in (
+                ("index_outputs", "kvip_ubmem_update_outputs"),
+                ("index_apply", "kvip_ubmem_update_apply"),
+            )
         )
+        if split_index_stages:
+            result.extend(updates)
+        else:
+
+            def complete_and_update():
+                for _, launch in updates:
+                    launch()
+
+            result.append(("complete_index_update", complete_and_update))
         return tuple(result)
     if transport != "urma":
         raise ValueError("Fusion replay transport must be ubmem or urma")

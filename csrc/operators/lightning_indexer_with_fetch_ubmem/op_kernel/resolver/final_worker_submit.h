@@ -1,10 +1,8 @@
 #pragma once
+#include "../device_context.h"
 namespace rotating {
 __aicore__ inline __ubuf__ uint32_t* FinalPtr(LocalTensor<uint32_t> x) {return reinterpret_cast<__ubuf__ uint32_t*>(x.GetPhyAddr());}
 
-__aicore__ inline __gm__ FinalPost* FinalPostAt(__gm__ Context* ctx,uint32_t core) {
-    return reinterpret_cast<__gm__ FinalPost*>(ctx->owners+kFinalPostOffset)+core;
-}
 __aicore__ inline void PublishFinalWorker(__gm__ Context* ctx,__gm__ Row* row,
     uint32_t b,uint32_t w,uint32_t own,uint32_t batchCount,uint32_t descriptor,uint32_t error,
     LocalTensor<uint32_t> local,LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,

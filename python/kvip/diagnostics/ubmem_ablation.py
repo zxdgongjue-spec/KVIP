@@ -50,19 +50,22 @@ def service_cases(archive, active_batches):
 
 def summarize_case(case):
     stages = case.get("stage_diagnostics", {}).get("stages", {})
-    index_stages = [value["samples_us"] for name, value in stages.items() if name.startswith("index_")]
+    includes_completion = any(name.startswith("complete_index_") for name in stages)
+    index_stages = [
+        value["samples_us"] for name, value in stages.items() if name.startswith(("index_", "complete_index_"))
+    ]
     if index_stages and len({len(values) for values in index_stages}) != 1:
         raise ValueError("Index stage samples must represent the same diagnostic iterations")
     reads = case["reads_samples"]
+    index_time = float(np.median(np.sum(np.asarray(index_stages, dtype=np.float64), axis=0))) if index_stages else None
     return dict(
         name=case["name"],
         tuning=case["tuning"],
         full_graph_mean_us=case["timing"]["mean_us"],
         full_graph_p50_us=case["timing"]["p50_us"],
         init_diagnostic_p50_us=stages.get("init", {}).get("p50_us"),
-        index_diagnostic_p50_us=(
-            float(np.median(np.sum(np.asarray(index_stages, dtype=np.float64), axis=0))) if index_stages else None
-        ),
+        index_diagnostic_p50_us=None if includes_completion else index_time,
+        completion_index_diagnostic_p50_us=index_time if includes_completion else None,
         **{
             key: float(np.median([sample[key] for sample in reads]))
             for key in ("prefetch", "final", "unused_prefetch", "bytes")
@@ -74,12 +77,16 @@ def print_summary(report, output=None):
     def time(value):
         return "-" if value is None else f"{value:.3f}"
 
-    print("case  device_mean_us  device_p50_us  init_diag_us  index_diag_us  prefetch  final  unused  read_bytes")
+    print(
+        "case  device_mean_us  device_p50_us  init_diag_us  index_diag_us  "
+        "completion_index_diag_us  prefetch  final  unused  read_bytes"
+    )
     for row in report["summary"]:
         print(
             f"{row['name']}  {time(row['full_graph_mean_us'])}  {time(row['full_graph_p50_us'])}  "
             f"{time(row['init_diagnostic_p50_us'])}  "
-            f"{time(row['index_diagnostic_p50_us'])}  {row['prefetch']:g}  {row['final']:g}  "
+            f"{time(row['index_diagnostic_p50_us'])}  {time(row.get('completion_index_diagnostic_p50_us'))}  "
+            f"{row['prefetch']:g}  {row['final']:g}  "
             f"{row['unused_prefetch']:g}  {row['bytes']:g}"
         )
     for case in report.get("cases", []):
@@ -88,6 +95,7 @@ def print_summary(report, output=None):
         if details:
             print(f"{case['name']} diagnostic p50 us: " + ", ".join(details))
     print("Init/index are separate instrumented diagnostics; they are not additive components of full-graph latency.")
+    print("Merged completion/index time includes completion bookkeeping; the index-only column is unavailable for it.")
     calls = [(case["name"], case["candidate_call"]) for case in report.get("cases", []) if "candidate_call" in case]
     if calls:
         print("case  group_call_mean_us  group_call_p50_us  cpu_prepare_p50_us  h2d_diag_p50_us  h2d_bytes")

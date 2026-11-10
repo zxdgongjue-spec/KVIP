@@ -21,6 +21,11 @@ def runtime_worker_config(args, archive, aics):
     if override is not None and (type(override) is not int or not 1 <= override <= 48):
         raise ValueError("serial_workers must be an integer in 1..48")
     inflight = getattr(args, "urma_serial_max_inflight", None)
+    post_size = getattr(args, "urma_serial_post_size", 128)
+    if type(post_size) is not int or post_size not in (32, 128):
+        raise ValueError("URMA serial post size must be 32 or 128")
+    if post_size != 128 and (args.transport, args.mode) != ("urma", "serial"):
+        raise ValueError("URMA serial post size applies only to URMA serial replay")
     if inflight is not None and (args.transport, args.mode) != ("urma", "serial"):
         raise ValueError("URMA serial max inflight applies only to URMA serial replay")
     if args.mode == "serial":
@@ -34,6 +39,7 @@ def runtime_worker_config(args, archive, aics):
                 batch_get_max_inflight_total=2048 if inflight is None else inflight,
                 batch_get_max_inflight_total_source="native_default" if inflight is None else "cli",
                 jettys_per_core=2,
+                batch_get_post_size=post_size,
             )
         return config
     if override is not None:
@@ -48,6 +54,16 @@ def runtime_worker_config(args, archive, aics):
         final = final_aivs(batch, "auto", captured_aics)
         workers = (batch * (final + 1) + 1) // 2
     return {"runtime_workers": workers, "runtime_workers_source": "fused_backend_geometry"}
+
+
+def get_kernel_path(args):
+    if args.transport == "ubmem":
+        name = "kvaf_ubmem_batch_get.o"
+    elif args.mode == "serial" and getattr(args, "urma_serial_post_size", 128) == 32:
+        name = "kvaf_execute_batch_get_post32.o"
+    else:
+        name = "kvaf_execute_batch_get_kernels.o"
+    return Path(args.build_dir).resolve() / "bin" / name
 
 
 def create_runtime(args, archive, kvaf, torch, device, stream, cann, aics):
@@ -66,6 +82,7 @@ def create_runtime(args, archive, kvaf, torch, device, stream, cann, aics):
     build = Path(args.build_dir).resolve()
     pattern = "kvaf_ubmem_batch_{}.o" if args.transport == "ubmem" else "kvaf_execute_batch_{}_kernels.o"
     kernels = {kind: build / "bin" / pattern.format(kind) for kind in ("get", "put")}
+    kernels["get"] = get_kernel_path(args)
     for path in kernels.values():
         if not path.is_file():
             raise FileNotFoundError(f"Missing {args.transport} Runtime kernel: {path}")

@@ -14,6 +14,11 @@ ENTRY(v9_fetch,complete,SIM_BATCH)
 extern "C" uint32_t aclrtlaunch_kvip_ubmem_direct_update_outputs_kernel(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_kvip_ubmem_direct_update_owned_kernel(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_kvip_ubmem_direct_apply_owned_kernel(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_kvip_ubmem_complete_plan_kernel(uint32_t,void*,void*,void*);
+extern "C" uint32_t kvip_ubmem_complete_plan(void* bindings,void* update,void* stream) {
+    if(!bindings || !update || !stream)return 100000;
+    return aclrtlaunch_kvip_ubmem_complete_plan_kernel(SIM_BATCH,stream,bindings,update);
+}
 extern "C" uint32_t kvip_ubmem_update_plan(void* update,void* stream) {
     if(!update || !stream)return 100000;
     return aclrtlaunch_kvip_ubmem_direct_update_owned_kernel(SIM_BATCH,stream,update);
@@ -37,8 +42,9 @@ extern "C" uint32_t kvip_ubmem_forward(void* bindings,void* update,void* stream)
     uint32_t result=v9_init(bindings,stream);
     if(!result)result=v9_li(bindings,stream);
     if(!result)result=v9_resolve(bindings,stream);
-    if(!result)result=v9_fetch(bindings,stream);
-    if(!result)result=kvip_ubmem_update(update,stream);
+    if(!result)result=kvip_ubmem_complete_plan(bindings,update,stream);
+    if(!result)result=kvip_ubmem_update_outputs(update,stream);
+    if(!result)result=kvip_ubmem_update_apply(update,stream);
     return result;
 }
 

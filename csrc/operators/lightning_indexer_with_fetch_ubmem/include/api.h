@@ -5,7 +5,7 @@
 // enqueues work on stream. The caller holds its arena lease until stream work
 // completes and every captured graph referring to these addresses is gone.
 // bindings: 15 uint64 words, same LI tensor order as the KVIP LI/Fetch API.
-// update: 26 uint64 words; UBmem replaces the transport fields at 12 and 13
+// update: 28 uint64 words; UBmem replaces the transport fields at 12 and 13
 // with ubmemStatus and UbmemRegion, respectively. No queue handle is accepted.
 extern "C" {
 uint32_t kvip_ubmem_forward(void* bindings,void* update,void* stream);
@@ -18,6 +18,9 @@ uint32_t v9_init(void* bindings,void* stream);
 uint32_t v9_li(void* bindings,void* stream);
 uint32_t v9_resolve(void* bindings,void* stream);
 uint32_t v9_fetch(void* bindings,void* stream);
+// Completes the same packed batch before building its Index plan. Retain the
+// outputs/apply launches after this kernel: unpack can cross packed batches.
+uint32_t kvip_ubmem_complete_plan(void* bindings,void* update,void* stream);
 uint32_t kvip_ubmem_update(void* update,void* stream);
 uint32_t kvip_ubmem_update_plan(void* update,void* stream);
 uint32_t kvip_ubmem_update_outputs(void* update,void* stream);

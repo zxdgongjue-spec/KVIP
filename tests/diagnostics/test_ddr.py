@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from kvip.diagnostics.ddr import export_pages, import_pages, rebase_addresses, validate_pages
-from kvip.diagnostics.replay_runtime import create_runtime, runtime_worker_config
+from kvip.diagnostics.replay_runtime import create_runtime, get_kernel_path, runtime_worker_config
 
 
 class CpuTorch:
@@ -442,6 +442,25 @@ class ReplayRuntimeTest(unittest.TestCase):
                     32,
                 )
         self.assertEqual(self.calls, [])
+
+    def test_post32_selects_only_optional_urma_serial_object(self):
+        args = self.args(serial_workers=32, urma_serial_max_inflight=0)
+        args.urma_serial_post_size = 32
+        optional = self.build / "bin/kvaf_execute_batch_get_post32.o"
+        with self.assertRaises(FileNotFoundError):
+            create_runtime(args, self.archive, self.sdk, None, None, None, None, 32)
+        optional.write_bytes(b"post32 object")
+        create_runtime(args, self.archive, self.sdk, None, None, None, None, 32)
+        self.assertEqual(self.calls[-1][0][0], str(optional.resolve()))
+        self.assertEqual(self.calls[-1][1]["batch_get_max_inflight_total"], 0)
+        self.assertEqual(runtime_worker_config(args, self.archive, 32)["batch_get_post_size"], 32)
+        self.assertEqual(runtime_worker_config(self.args(), self.archive, 32)["batch_get_post_size"], 128)
+        self.assertTrue(str(get_kernel_path(self.args(mode="fused"))).endswith("kvaf_execute_batch_get_kernels.o"))
+        for transport, mode in (("urma", "fused"), ("ubmem", "serial"), ("ubmem", "fused")):
+            invalid = self.args(transport, mode)
+            invalid.urma_serial_post_size = 32
+            with self.assertRaisesRegex(ValueError, "only to URMA serial"):
+                runtime_worker_config(invalid, self.archive, 32)
 
     def test_ubmem_keeps_snapshot_page_policy(self):
         create_runtime(self.args("ubmem", "fused"), self.archive, self.sdk, None, None, None, None, 32)

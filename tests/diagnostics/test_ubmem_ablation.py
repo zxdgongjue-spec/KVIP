@@ -59,6 +59,25 @@ def test_summary_joins_corresponding_index_samples_without_subtracting_full_late
     assert ubmem_ablation.summarize_case(case)["index_diagnostic_p50_us"] is None
 
 
+def test_summary_does_not_label_merged_completion_as_index_only():
+    case = dict(
+        name="optimized",
+        tuning={},
+        timing=dict(mean_us=51, p50_us=50),
+        reads_samples=[dict(prefetch=4, final=6, unused_prefetch=2, bytes=26240)],
+        stage_diagnostics=dict(
+            stages={
+                "complete_index_plan": dict(samples_us=[5, 10]),
+                "index_outputs": dict(samples_us=[20, 10]),
+                "index_apply": dict(samples_us=[5, 5]),
+            }
+        ),
+    )
+    summary = ubmem_ablation.summarize_case(case)
+    assert summary["index_diagnostic_p50_us"] is None
+    assert summary["completion_index_diagnostic_p50_us"] == 27.5
+
+
 @pytest.fixture
 def native_mocks(monkeypatch, tmp_path):
     from kvip.diagnostics import ddr, fused_replay, replay_runtime

@@ -227,6 +227,25 @@ def test_urma_serial_inflight_is_forwarded_and_reported_without_touching_other_p
             arguments(cli(tmp_path) + extra)
 
 
+def test_post_size_cli_scope_and_transport_specific_forwarding(tmp_path):
+    from kvip.diagnostics.replay import arguments as replay_arguments
+
+    args = arguments(cli(tmp_path) + ["--urma-serial-post-size", "32"])
+    for transport, mode, workers in case_plan(args):
+        argv, _ = command(args, transport, mode, workers)
+        if (transport, mode) == ("urma", "serial"):
+            assert argv[argv.index("--urma-serial-post-size") + 1] == "32"
+        else:
+            assert "--urma-serial-post-size" not in argv
+    common = ["--snapshot", "/snapshot", "--build-dir", "/build", "--soc", "soc"]
+    assert replay_arguments(common).urma_serial_post_size == 128
+    serial = common + ["--transport", "urma", "--mode", "serial", "--kvaf-server", "127.0.0.1:28880"]
+    assert replay_arguments(serial + ["--urma-serial-post-size", "32"]).urma_serial_post_size == 32
+    for base, size in ((common, "32"), (common, "128"), (serial, "64"), (serial + ["--inspect"], "32")):
+        with pytest.raises(SystemExit):
+            replay_arguments(base + ["--urma-serial-post-size", size])
+
+
 @pytest.mark.parametrize("samples", [[], [0], [-1], [float("nan")], [float("inf")], [[1]]])
 def test_invalid_device_timing_is_never_a_performance_result(samples):
     with pytest.raises(ValueError):

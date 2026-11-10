@@ -390,17 +390,30 @@ than a byte-for-byte reconstruction of that backend's former allocations.
 Serial Get defaults match serving: UBmem 32 workers, URMA 2, explicitly
 overridable. Fused bindings use their original geometry and worker contracts.
 These defaults are compatibility settings, not tuned performance baselines.
-For a tuned URMA serial comparison, use `--urma-serial-workers 32
---urma-serial-max-inflight 0`. The latter removes the runtime's default total
+The candidate `--urma-serial-workers 32 --urma-serial-max-inflight 0`
+removes the runtime's default total
 inflight cap of 2048 and uses its existing whole-slice submission path. It is
 limited to URMA serial replay; fusion queue geometry and UBmem are unchanged.
 Runtime workers and the effective inflight policy are recorded in each result.
+On node24's captured B16/Q4/2624-byte workload this candidate measured
+979.080 us, worse than the earlier 2-worker result of 895.811 us. Increasing
+workers alone is not a validated baseline improvement.
 The older V9 serial implementation used two jettys per worker, no total inflight
-cap and 32-WQE posts. Current KVAF retains two jettys but uses 128-WQE posts;
-this comparison reuses the earlier concurrency policy, not the old binary.
+cap and 32-WQE posts. Current KVAF retains two jettys but uses 128-WQE posts.
+To reproduce the old post width without replacing the current Runtime, pass
+`--urma-get-post32` to the existing installer/build entry. Its focused optional
+KVAF patch builds `bin/kvaf_execute_batch_get_post32.o`; the default Get object
+and fusion remain unchanged. Select it with `--urma-serial-post-size 32` in
+`compare` or URMA-serial `replay`. Results include the selected object's hash.
+This reuses the earlier post/concurrency policy, not the old binary.
 Its optimum worker count depends on the real misses and four-layer width.
 An optional `--urma-serial-workers-candidates 16 32` adds one serial run and
 reports both results, using the lower validated device mean for the ratio.
+With stage diagnostics enabled, URMA serial also runs one native Get profile
+after headline timing. It reports active requests, posts, completion counts,
+post-active and drain-wait cycles per core. These cycles are not converted to
+microseconds or added to device latency. The extra pass restores and verifies
+the same pre-state; profiling is disabled afterward, including on failure.
 
 Backend-specific `--ubmem-fused-tuning` and `--urma-fused-tuning` accept JSON
 objects. For the captured four-layer B16 case, an explicit candidate is:
@@ -422,6 +435,14 @@ final repair. Suppression counts cover candidates actually examined, not bits
 skipped by this gate. Init still constructs all required mapping/protection
 state inside timing; the previously regressing parallel-init option remains
 disabled in this candidate.
+
+UBmem completion bookkeeping and row-local Index planning now share one AIV
+launch after resolve has joined all Fetch workers. TND output publication stays
+in a separate launch so every row's plan is ready before cross-row reads;
+Index apply remains last. Completion/error checks and hot-valid publication
+are preserved. The device chain has six launches instead of seven. This
+removes a boundary, not the work inside completion; hardware measurements are
+still needed to establish its benefit.
 
 The summary separately reports correctness and `performance_target.target_met`.
 The performance target requires both at least 35% lower device-graph mean and
@@ -479,8 +500,10 @@ This restores the captured DDR arena once and runs three sequential cases:
 Each iteration restores the original pre-state outside timing and runs the
 existing correctness checks; the three cases share DDR but not mutable hot
 cache/workspace state. Full graphs retain the production launch sequence.
-`--split-index-stages` diagnoses plan generation, TND outputs and field movement
-separately as `index_plan`, `index_outputs` and `index_apply`. These diagnostic
+`--split-index-stages` diagnoses completion plus plan generation, TND outputs
+and field movement separately as `complete_index_plan`, `index_outputs` and
+`index_apply`. Without that flag they are grouped as `complete_index_update`.
+Do not compare that combined scope directly with old index-only timings. These diagnostic
 graph boundaries are excluded from full-graph timing. The result JSON keeps
 all timings, read counts, effective tuning and source/binary hashes.
 

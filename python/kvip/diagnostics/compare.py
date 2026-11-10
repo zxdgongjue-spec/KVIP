@@ -26,6 +26,13 @@ def arguments(argv=None):
     parser.add_argument("--stage-iterations", type=int, default=3)
     parser.add_argument("--ubmem-serial-workers", type=int, default=32)
     parser.add_argument(
+        "--urma-serial-post-size",
+        type=int,
+        choices=(32, 128),
+        default=128,
+        help="URMA serial WQEs per post; 32 requires the optional post32 kernel",
+    )
+    parser.add_argument(
         "--urma-serial-max-inflight",
         type=int,
         help="Forward only to URMA serial: 0 submits whole core slices; omitted keeps native default 2048",
@@ -129,6 +136,8 @@ def command(args, transport, mode, serial_workers=None):
         inflight = getattr(args, "urma_serial_max_inflight", None)
         if transport == "urma" and inflight is not None:
             values += ["--urma-serial-max-inflight", str(inflight)]
+        if transport == "urma":
+            values += ["--urma-serial-post-size", str(getattr(args, "urma_serial_post_size", 128))]
     else:
         tuning = getattr(args, transport + "_fused_tuning", None)
         if tuning is not None:
@@ -167,9 +176,15 @@ def summarize(results):
             tuning=result.get("tuning"),
             serial_get_config={
                 key: result[key]
-                for key in ("batch_get_max_inflight_total", "batch_get_max_inflight_total_source", "jettys_per_core")
+                for key in (
+                    "batch_get_max_inflight_total",
+                    "batch_get_max_inflight_total_source",
+                    "jettys_per_core",
+                    "batch_get_post_size",
+                )
                 if key in result
             },
+            get_kernel=result.get("get_kernel"),
             selection=result.get("selection_comparison"),
             reads_per_round={
                 key: float(np.mean([row[key] for row in result["reads_samples"]]))
@@ -218,6 +233,9 @@ def summarize(results):
         ),
         same_selection_across_transports=selection_pairs,
         stage_diagnostics={name: result.get("stage_diagnostics") for name, result in results.items()},
+        native_get_profiles={
+            name: result["native_get_profile"] for name, result in results.items() if "native_get_profile" in result
+        },
         notes=[
             "Full-path latency uses one uninstrumented production graph per case.",
             "Stage diagnostics add graph/event boundaries: use to localize cost, not as an exact decomposition.",
@@ -241,6 +259,8 @@ def display(summary):
             print("  effective tuning: " + json.dumps(row["tuning"], sort_keys=True))
         if row["serial_get_config"]:
             print("  serial Get config: " + json.dumps(row["serial_get_config"], sort_keys=True))
+        if row["get_kernel"] is not None:
+            print("  Get object: " + json.dumps(row["get_kernel"], sort_keys=True))
         selection = row["selection"]
         if selection is not None:
             print(
@@ -260,6 +280,14 @@ def display(summary):
             f"target <= {values['target_fused_us']:.3f} us: {'MET' if values['target_met'] else 'NOT MET'}"
         )
     print("Targets use device graph mean only; require both >=35% reduction and >=1.5x speedup.")
+    for name, profile in summary["native_get_profiles"].items():
+        totals, maxima = profile["totals"], profile["maxima"]
+        print(
+            f"{name} extra native profile (cycles, outside headline): active_cores={profile['active_cores']}; "
+            f"requests={totals['active_requests']}; posts={totals['total_posts']}; "
+            f"post_active sum/max={totals['post_active_cycles']}/{maxima['post_active_cycles']}; "
+            f"drain_wait sum/max={totals['drain_wait_cycles']}/{maxima['drain_wait_cycles']}"
+        )
     for mode, same in summary["same_selection_across_transports"].items():
         print(f"{mode}: UBmem/URMA selected ID sets identical={same}")
         if not same:
