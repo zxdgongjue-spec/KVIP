@@ -47,6 +47,7 @@ for mode in ('baseline', 'classify'):
         raise SystemExit(f'{mode}: expected four simulated AIV timings, found {len(cores)}')
     timings[mode] = max(map(float, cores))
 text = (f"Real ProcessTopK Q4, B1, history=131072, resident=16384, heads=32, miss10%\n"
+        "Fixture protects final hot hits and maps up to 512 final cold tokens as prefetched.\n"
         f"Simulated max-core us: baseline={timings['baseline']:.3f} "
         f"classified={timings['classify']:.3f} "
         f"delta={timings['classify']-timings['baseline']:+.3f}\n"

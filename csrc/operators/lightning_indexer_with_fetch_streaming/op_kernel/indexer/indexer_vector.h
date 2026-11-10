@@ -753,7 +753,10 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
           reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(result.GetPhyAddr()),
           reinterpret_cast<__ubuf__ uint32_t*>(valid.GetPhyAddr()),reinterpret_cast<__ubuf__ int32_t*>(reserved.GetPhyAddr()),
           reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(bitmap[bitmapWords].GetPhyAddr()));
-        if(profile && half<2){SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);liTicks[4+half*2]=GetSystemCycle();}
+        if(profile && (half==0 || half+1==runtimeShape_.resident/chunkSize)){
+            SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            liTicks[half==0?4:6]=GetSystemCycle();
+        }
     }
     if(profile)liTicks[10]=GetSystemCycle();
     Simt::VF_CALL<rotating::MergeClassifyBitmap>(Simt::Dim3{512,1,1},reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()));
