@@ -136,7 +136,7 @@ def decode_final_detail(owner_words, status_words):
     return detail
 
 
-def collect_core(torch, rotating, graph, reset, verify, rounds, folder, *, full=False):
+def collect_core(torch, rotating, graph, reset, verify, rounds, folder, *, full=False, diagnostics=None):
     """Profile the existing core graph separately from primary timing."""
     import torch_npu
     from torch.profiler import record_function
@@ -177,6 +177,8 @@ def collect_core(torch, rotating, graph, reset, verify, rounds, folder, *, full=
                     epochs=rows[:, 16 : 16 + rotating.rounds].astype(np.uint64).sum(axis=0).tolist(),
                 )
             )
+            if diagnostics is not None:
+                samples[-1]["streaming_cycles"] = diagnostics()
     # Save events/counters before parsing, so collection never needs repeating
     # merely because a vendor trace schema differs.
     label = "full" if full else "core"

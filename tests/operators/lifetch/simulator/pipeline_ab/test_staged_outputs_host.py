@@ -46,8 +46,14 @@ int main(){
  uint64_t a[28]={};a[3]=(uint64_t)ids.data();a[9]=(uint64_t)owners;a[18]=(uint64_t)topk.data();a[19]=(uint64_t)slots.data();a[20]=(uint64_t)unpack.data();a[21]=(uint64_t)valid.data();a[22]=(uint64_t)oldId.data();a[23]=(uint64_t)oldSlot.data();a[24]=h;
  for(uint32_t row=0;row<b;++row)for(threadIdx.x=0;threadIdx.x<512;++threadIdx.x)PublishOutputs(a,row);
  a[22]=(uint64_t)newId.data();a[23]=(uint64_t)newSlot.data();
- for(uint32_t row=0;row<b;++row)for(uint32_t q=0;q<4;++q)for(threadIdx.x=0;threadIdx.x<512;++threadIdx.x)
-  rotating::PublishStagedQueryOutputs(a,b,row,q,(uint32_t*)(topk.data()+row*4*k),(uint32_t*)(slots.data()+row*4*k));
+ uint32_t kinds[b*4];
+ for(uint32_t row=0;row<b;++row)for(uint32_t q=0;q<4;++q){
+  // The host shim has no SIMT barrier: model the lane-parallel first phase
+  // before executing the individual lanes of the production function.
+  for(uint32_t i=0;i<b*4;++i)kinds[i]=valid[i]?(unpack[i]==row*4+q?1:0):(q==0&&i/4==row?2:0);
+  for(threadIdx.x=0;threadIdx.x<512;++threadIdx.x)
+   rotating::PublishStagedQueryOutputs(a,b,row,q,(uint32_t*)(topk.data()+row*4*k),(uint32_t*)(slots.data()+row*4*k),kinds);
+ }
  assert(oldId==newId && oldSlot==newSlot);
 }
 '''

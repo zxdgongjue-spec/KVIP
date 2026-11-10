@@ -34,6 +34,8 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
  auto ticks=reinterpret_cast<__gm__ uint64_t*>(a->times)+b*64;
+ bool profile=(a->prefetchCount & 0x80000000U)!=0;
+ if(profile)ticks[1]=GetSystemCycle();
  uint32_t inputError=0;
  if(!a->queryBitmaps || !a->queryErrors || !a->updateBindings || !ctx->hotValid || !ctx->changeCount || row->slots>kPrefetch ||
     shape.history!=kHistory || shape.resident!=kResident || a->maxEvents<kPrefetch+kSlots)inputError=1;
@@ -63,20 +65,25 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
  Simt::VF_CALL<MergeQueryBitmaps>(Simt::Dim3{512,1,1},FinalPtr(ctl[1024]),FinalPtr(keys),words);
  PipeBarrier<PIPE_V>();
+ if(profile)ticks[2]=GetSystemCycle();
  Simt::VF_CALL<StagedInitializeReady>(Simt::Dim3{512,1,1},FinalPtr(selected),FinalPtr(loc),FinalPtr(keys),FinalPtr(ranks),FinalPtr(ctl));
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+ if(profile)ticks[3]=GetSystemCycle();
  GlobalTensor<uint32_t> output;output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*kSlots);
  auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*32;
  for(uint32_t q=0;q<4 && !ctl.GetValue(1);++q){
+  if(profile)ticks[10+q*5]=GetSystemCycle();
   Simt::VF_CALL<StagedQuery>(Simt::Dim3{512,1,1},q,shape.history,shape.resident,shape.tokenBytes,b,row->slots,ctx,
    FinalPtr(selected),FinalPtr(loc),FinalPtr(keys),FinalPtr(ranks),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(work),FinalPtr(ctl));
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+  if(profile)ticks[11+q*5]=GetSystemCycle();
   uint32_t total=ctl.GetValue(0),added=ctl.GetValue(2+q),error=ctl.GetValue(1);
   if(!error && a->updateBindings){
    Simt::VF_CALL<PublishStagedQueryOutputs>(Simt::Dim3{512,1,1},
-    reinterpret_cast<__gm__ uint64_t*>(a->updateBindings),shape.batch,b,q,FinalPtr(selected),FinalPtr(loc));
+    reinterpret_cast<__gm__ uint64_t*>(a->updateBindings),shape.batch,b,q,FinalPtr(selected),FinalPtr(loc),FinalPtr(work));
    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
   }
+  if(profile)ticks[12+q*5]=GetSystemCycle();
   if(!error && q==3){
    Simt::VF_CALL<PackStagedUrma>(Simt::Dim3{512,1,1},shape.history,shape.resident,shape.tokenBytes,b,shape.finalWorkers,row->slots,total,ctx,
     FinalPtr(selected),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(ctl));
@@ -87,10 +94,12 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
       error?0:ctl.GetValue(16+2*w),b*kSlots+start,error,error?0:ctl.GetValue(17+2*w));
    }
   }
+  if(profile)ticks[13+q*5]=GetSystemCycle();
   if(!error) Simt::VF_CALL<PublishQ>(Simt::Dim3{512,1,1},FinalPtr(selected),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),
     reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+b*a->maxEvents,reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+b*a->maxEvents,total-added,total);
   SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);DataCopy(output[q*kTop],loc[q*kTop],kTop);
   SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+  if(profile)ticks[14+q*5]=GetSystemCycle();
   flags[q+1].count=added;flags[q+1].error=error;flags[q+1].ready=1;
   ticks[4+q]=GetSystemCycle();status[4+q]=added;status[8+q]=total;
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&flags[q+1]),sizeof(BatchFlag));
@@ -102,7 +111,7 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  for(uint32_t q=0;q<4;++q)if(!flags[q+1].ready){flags[q+1].count=0;flags[q+1].error=status[0]?status[0]:1;flags[q+1].ready=1;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&flags[q+1]),sizeof(BatchFlag));}
  ticks[8]=GetSystemCycle();
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),128);
- kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ticks),128);
+ kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ticks),profile?256:128);
  pipe.Destroy();
 }
 __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {

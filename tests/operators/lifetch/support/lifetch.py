@@ -353,7 +353,20 @@ def run_device(
                  rotating.rows.cpu().numpy().view(np.uint32), owner.remote_token_addresses.cpu().numpy())
         if read_label == "prototype_with_update" and args.trace_rounds:
             progress(folder.parent, f"BS={b}: full graph profiler ({args.trace_rounds} replays); logs={folder}")
-            full_trace.update(collect_core(torch, rotating, graph, reset, check, args.trace_rounds, folder, full=True))
+            if args.streaming:
+                pipeline.set_diagnostics(True)
+                stream.synchronize()
+            def trace_reset():
+                reset()
+                if args.streaming:
+                    pipeline.times.zero_()
+            try:
+                full_trace.update(collect_core(torch, rotating, graph, trace_reset, check, args.trace_rounds, folder,
+                                               full=True, diagnostics=pipeline.diagnostic_cycles if args.streaming else None))
+            finally:
+                if args.streaming:
+                    pipeline.set_diagnostics(False)
+                    stream.synchronize()
         if trace_core and args.trace_rounds:
             progress(folder.parent, f"BS={b}: core graph profiler ({args.trace_rounds} replays); logs={folder}")
             core_trace.update(collect_core(torch, rotating, graph, reset, check, args.trace_rounds, folder))

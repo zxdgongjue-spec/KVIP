@@ -665,6 +665,9 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
         if (errors && b<runtimeShape_.batch) { errors[query*32]=1; kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128); }
         return;
     }
+    bool profile=(a->prefetchCount & 0x80000000U)!=0;
+    auto liTicks=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(runtimeShape_.batch)*64+uint64_t(query)*16;
+    if(profile)liTicks[0]=GetSystemCycle();
     // General LI combines score, window service and final TopK in one launch.
     // Wait for mapping publication, not for URMA completion. In sequence-split
     // mode the earlier LI kernels already form the publication boundary.
@@ -681,7 +684,9 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
             }
         }
     }
+    if(profile)liTicks[1]=GetSystemCycle();
     PipeBarrier<PIPE_ALL>();
+    if(profile)liTicks[2]=GetSystemCycle();
     LocalTensor<uint32_t> valid,reserved,result,bitmap;
     if(streamingTopkOnly_) {
         valid=streamingValid_;reserved=streamingReserved_;result=streamingOutput_;bitmap=streamingBitmap_;
@@ -700,17 +705,37 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     GlobalTensor<uint32_t> validGm,reservedGm;
     if(ctx->hotValid)validGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*runtimeShape_.resident);
     if(ctx->reservedHot)reservedGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->reservedHot)+uint64_t(b)*runtimeShape_.resident);
-    for(uint32_t half=0;half<2;++half){
-        if(half)PipeBarrier<PIPE_ALL>();
-        bool preloaded=half==0 && streamingTopkOnly_ && streamingPrefetched_;
-        if(ctx->hotValid && !preloaded)DataCopy(valid,validGm[half*8192],8192);
-        if(ctx->reservedHot && !preloaded)DataCopy(reserved,reservedGm[half*8192],8192);
+    // Match the validated TopK experiment: once TopK has finished, its merge
+    // and temporary buffers are dead. Load the second metadata half there
+    // while the vector pipe classifies the first half.
+    const bool overlapSecond = streamingTopkOnly_ && streamingPrefetched_ &&
+        (topkCountAlign256_ + trunkLen_) * sizeof(SCORE_T) >= 8192 * sizeof(uint32_t) &&
+        topkOp_.GetSharedTmpBufferSize() >= 8192 * sizeof(uint32_t);
+    LocalTensor<uint32_t> secondValid,secondReserved;
+    if(overlapSecond) {
         SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+        secondValid=mrgValueLocal_.template ReinterpretCast<uint32_t>();
+        secondReserved=topkSharedTmpLocal_;
+        if(ctx->hotValid)DataCopy(secondValid,validGm[8192],8192);
+        if(ctx->reservedHot)DataCopy(secondReserved,reservedGm[8192],8192);
+    }
+    for(uint32_t half=0;half<2;++half){
+        if(half && !overlapSecond)PipeBarrier<PIPE_ALL>();
+        bool preloaded=half==0 && streamingTopkOnly_ && streamingPrefetched_;
+        if(half && overlapSecond){valid=secondValid;reserved=secondReserved;}
+        if(ctx->hotValid && !preloaded && !(half && overlapSecond))DataCopy(valid,validGm[half*8192],8192);
+        if(ctx->reservedHot && !preloaded && !(half && overlapSecond))DataCopy(reserved,reservedGm[half*8192],8192);
+        if(half && overlapSecond)PipeBarrier<PIPE_V>();
+        if(half || !overlapSecond) {
+            SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+        }
+        if(profile)liTicks[3+half*2]=GetSystemCycle();
         Simt::VF_CALL<rotating::ClassifyTopkHalf>(Simt::Dim3{512,1,1},runtimeShape_.history,runtimeShape_.resident,b,used,half*8192,8192,tailBegin,tailEnd,
           ctx->hotValid!=0,ctx->reservedHot!=0,ctx->tailBounds!=0,ctx,
           reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(result.GetPhyAddr()),
           reinterpret_cast<__ubuf__ uint32_t*>(valid.GetPhyAddr()),reinterpret_cast<__ubuf__ int32_t*>(reserved.GetPhyAddr()),
           reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(bitmap[512].GetPhyAddr()));
+        if(profile){SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);liTicks[4+half*2]=GetSystemCycle();}
     }
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     GlobalTensor<uint32_t> output,bits;
@@ -720,6 +745,8 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
     errors[query*32]=bitmap.GetValue(512);kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);
+    if(profile){liTicks[7]=GetSystemCycle();liTicks[8]=overlapSecond?1:0;liTicks[9]=streamingTopkOnly_?1:0;
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(liTicks),128);}
 }
 
 template <typename QLIT>

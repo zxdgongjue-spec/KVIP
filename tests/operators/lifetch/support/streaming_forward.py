@@ -23,7 +23,8 @@ class StreamingForward:
         self.events_src = torch.empty((b, 512 + 8192), dtype=torch.int32, device=device)
         self.events_dst = torch.empty_like(self.events_src)
         self.worker_status = torch.zeros((b, 32), dtype=torch.int32, device=device)
-        self.times = torch.zeros((b, 64), dtype=torch.int64, device=device)
+        # First 64 words/request are resolver/update, then 16 words per Q.
+        self.times = torch.zeros((b * 128,), dtype=torch.int64, device=device)
         self.query_bitmaps = torch.empty((b, 4, 512), dtype=torch.int32, device=device)
         self.query_errors = torch.zeros((b, 4, 32), dtype=torch.int32, device=device)
         pointers = [rotating.context.data_ptr(), keys.data_ptr(), scales.data_ptr(), addresses.data_ptr(),
@@ -52,3 +53,41 @@ class StreamingForward:
                                self.workspace.data_ptr(), stream.npu_stream, self.rotating.shape_pointer)
         if result:
             raise RuntimeError(f'streaming LIFetch launch failed: {result}')
+
+    def set_diagnostics(self, enabled):
+        # Existing prefetchCount field is unused by the streaming kernel; its
+        # high bit gates timestamps only in the separate profiled pass.
+        value = np.asarray([512 | (0x80000000 if enabled else 0)], dtype='<u4').view('u1')
+        self.workspace[96:100].copy_(self.torch.from_numpy(value.copy()))
+
+    def diagnostic_cycles(self):
+        raw = self.times.cpu().numpy().astype(np.uint64)
+        rows = raw[:self.batch * 64].reshape(self.batch, 64)
+        li = raw[self.batch * 64:].reshape(self.batch, 4, 16)
+        result = []
+        for b in range(self.batch):
+            p, u = rows[b, :32], rows[b, 32:]
+            queries = []
+            for q in range(4):
+                t = li[b, q]
+                if not all(int(v) for v in t[:8]):
+                    raise AssertionError(f'missing LI diagnostic timestamps: batch={b} query={q}')
+                queries.append(dict(mapping_wait=int(t[1]-t[0]), barrier=int(t[2]-t[1]),
+                                    load_first=int(t[3]-t[2]), classify_first=int(t[4]-t[3]),
+                                    wait_second=int(t[5]-t[4]), classify_second=int(t[6]-t[5]),
+                                    publish=int(t[7]-t[6]), overlap=bool(t[8]), topk_only=bool(t[9])))
+            producer = []
+            for q in range(4):
+                t = p[10+5*q:15+5*q]
+                if not all(int(v) for v in t):
+                    raise AssertionError(f'missing resolver diagnostic timestamps: batch={b} query={q}')
+                producer.append(dict(resolve=int(t[1]-t[0]), output=int(t[2]-t[1]),
+                                     pack=int(t[3]-t[2]), publish=int(t[4]-t[3])))
+            update = [int(u[13+2*q]-u[12+2*q]) for q in range(5)]
+            waits = [int(u[12]-u[10])] + [int(u[12+2*q]-u[11+2*q]) for q in range(1, 5)]
+            result.append(dict(batch=b, li=queries, producer=producer, update=update,
+                               update_wait=waits,
+                               input_and_bitmap=int(p[2]-p[1]), initialize=int(p[3]-p[2]),
+                               metadata=int(u[23]-u[22]), consumer_start=int(u[10]),
+                               consumer_finish=int(u[24]), producer_finish=int(p[8])))
+        return result

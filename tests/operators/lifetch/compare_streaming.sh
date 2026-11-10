@@ -29,6 +29,7 @@ from pathlib import Path
 root = Path(sys.argv[1])
 lines = ['URMA graph A/B: Q4 H131072 R16384 heads32 miss10% prefetch512.',
          'Separate runs; full graph includes LI, resolver, update and KVAF fetch. Verification outside timing.',
+         'Streaming breakdown is a separate instrumented replay; counters are raw device cycles, include instrumentation and may overlap.',
          'The streaming resolve_update kernel fuses resolver and index update; it has no separate device boundary.',
          'batch | variant | full_p50_us | init_us | li_us | resolve_us | publish_us | apply_us | resolve_update_us | fetch_us']
 for variant in ('baseline-safe', 'streaming'):
@@ -47,6 +48,25 @@ for variant in ('baseline-safe', 'streaming'):
         val = lambda k: f'{stages[k]:.2f}' if k in stages else '--'
         lines.append(f"{batch} | {variant} | {report['timing']['prototype_with_update']['p50_us']:.2f} | "
                      + ' | '.join(val(k) for k in ('init','li','resolve','publish','apply','resolve_update','fetch')))
+        if variant == 'streaming':
+            details = [s.get('streaming_cycles') for s in rows]
+            if any(not d for d in details):
+                raise SystemExit(f'streaming BS={batch}: missing per-request device timestamps: {trace_path}')
+            def worst_median(fn):
+                return round(statistics.median(max(fn(x) for x in replay) for replay in details))
+            li_keys = ('mapping_wait','barrier','load_first','classify_first','wait_second','classify_second','publish')
+            li = {k: worst_median(lambda x, k=k: max(q[k] for q in x['li'])) for k in li_keys}
+            qkeys = ('resolve', 'output', 'pack', 'publish')
+            producer = {k: worst_median(lambda x, k=k: sum(q[k] for q in x['producer'])) for k in qkeys}
+            producer['input_and_bitmap'] = worst_median(lambda x: x['input_and_bitmap'])
+            producer['initialize'] = worst_median(lambda x: x['initialize'])
+            updater = {f'phase{i}': worst_median(lambda x, i=i: x['update'][i]) for i in range(5)}
+            updater.update({f'wait_before_phase{i}': worst_median(lambda x, i=i: x['update_wait'][i]) for i in range(5)})
+            updater['metadata'] = worst_median(lambda x: x['metadata'])
+            overlap = sum(int(q['overlap']) for x in details[-1] for q in x['li'])
+            topk_only = sum(int(q['topk_only']) for x in details[-1] for q in x['li'])
+            lines.append(f"  cycles BS={batch} LI_max_query={json.dumps(li)} metadata_overlap={overlap}/{len(details[-1])*4} topk_only={topk_only}/{len(details[-1])*4}")
+            lines.append(f"  cycles BS={batch} producer_max_request={json.dumps(producer)} updater_max_request={json.dumps(updater)}")
 text = '\n'.join(lines) + '\n'
 (root / 'summary.log').write_text(text)
 print(text, end='')
