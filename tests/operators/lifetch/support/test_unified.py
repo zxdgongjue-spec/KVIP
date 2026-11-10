@@ -71,3 +71,12 @@ def test_early_fetch_selects_urma_only(monkeypatch, tmp_path):
     with pytest.raises(SystemExit):
         module.main(['--transport', 'ubmem', '--kvaf-server', 'host:1', '--kvaf-root', str(tmp_path),
                      '--soc', 'Ascend950PR_9599', '--early-fetch'])
+
+
+def test_baseline_unoccupied_selection_forwarded(monkeypatch, tmp_path):
+    commands = []
+    monkeypatch.setattr(module.subprocess, 'call', lambda command: commands.append(command) or 0)
+    assert module.main(['--transport', 'urma', '--kvaf-server', 'host:1', '--kvaf-root', str(tmp_path),
+                        '--avoid-prefetch-slots']) == 0
+    assert '--avoid-prefetch-slots' in commands[0]
+    assert '--early-fetch' not in commands[0]

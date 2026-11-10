@@ -180,8 +180,6 @@ def main(argv=None):
               '--resident', str(a.resident), '--index-heads', str(a.index_heads), '--miss-percent',
               str(a.miss_percent), '--prefetch-tokens', str(a.prefetch_tokens), '--warmup', str(a.warmup),
               '--iterations', str(a.iterations)]
-    if a.avoid_prefetch_slots and not a.early_fetch:
-        p.error('--avoid-prefetch-slots requires --early-fetch')
     if a.transport == 'urma':
         command = [sys.executable, '-u', str(Path(__file__).resolve()), '--internal-urma', *common,
                    '--kvaf-root', str(kvaf_root), '--cann', a.cann, '--batches', a.batches,
@@ -202,8 +200,8 @@ def main(argv=None):
         if a.comparison_sfa:
             command += ['--comparison-sfa', str(a.comparison_sfa)]
         return subprocess.call(command)
-    if a.early_fetch:
-        p.error('--early-fetch is supported only by URMA')
+    if a.early_fetch or a.avoid_prefetch_slots:
+        p.error('--early-fetch and --avoid-prefetch-slots are supported only by URMA')
     if a.intermediate_fetches != 8:
         p.error('UBmem fixture currently supports exactly 8 windows')
     if not a.soc:
@@ -533,11 +531,15 @@ def test_prefer_unoccupied_resolver_actual_function(tmp_path):
     _check_hot_resolver(tmp_path, "early_safe")
 
 
+def test_baseline_prefer_unoccupied_resolver_actual_function(tmp_path):
+    _check_hot_resolver(tmp_path, "safe")
+
+
 def _check_hot_resolver(tmp_path, transport):
     """Execute production SIMT logic serially; CANN simulator covers barriers."""
     import subprocess
 
-    operator = "lightning_indexer_with_fetch" + ("_ubmem" if transport == "ubmem" else "_early_safe" if transport == "early_safe" else "")
+    operator = "lightning_indexer_with_fetch" + ("_ubmem" if transport == "ubmem" else "_early_safe" if transport == "early_safe" else "_safe" if transport == "safe" else "")
     kernel = ROOT / "csrc/operators" / operator / "op_kernel"
     metadata = kernel / ("controller/cache_metadata.h" if transport == "ubmem" else "prefetch.h")
 
@@ -561,7 +563,7 @@ def _check_hot_resolver(tmp_path, transport):
     functions += "\n" + function(metadata, "InitializeTailMappings")
     functions += "\n" + function(ROOT / "csrc/operators/common/lifetch/resolver_candidates.h", "SparseHash")
     functions += "\ntemplate<unsigned Threads>\n" + function(
-        kernel / "resident_selection.h" if transport == "early_safe" else common / "resident_selection.h", "ResolveResidentPlan"
+        kernel / "resident_selection.h" if transport in ("early_safe", "safe") else common / "resident_selection.h", "ResolveResidentPlan"
     )
     resolve = function(ROOT / "csrc/operators/common/lifetch/resolver.h", "ReplicatedResolve")
     shared = (ROOT / "csrc/operators/common/lifetch/resolver_plan.h").read_text()
@@ -657,7 +659,7 @@ int main(){
  }
 }
 """.replace("FUNCTIONS", functions)
-    if transport == "early_safe":
+    if transport in ("early_safe", "safe"):
         source = source.replace(
             "   assert(cfg[1]==0);",
             """   assert(cfg[1]==0);

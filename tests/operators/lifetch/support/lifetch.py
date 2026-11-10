@@ -30,8 +30,8 @@ def seed_native_bitmap(torch, native, row, bitmap):
 
 
 def run(args, run_dir):
-    source = (SOURCE.with_name("lightning_indexer_with_fetch_early_safe") if args.avoid_prefetch_slots
-              else SOURCE.with_name("lightning_indexer_with_fetch_early") if args.early_fetch else SOURCE)
+    suffix = ("_early" if args.early_fetch else "") + ("_safe" if args.avoid_prefetch_slots else "")
+    source = SOURCE.with_name(SOURCE.name + suffix) if suffix else SOURCE
     from attention import check_sfa
     from contract_payload import payload
     from kvip.operators.lifetch import binding as launch_module
@@ -198,6 +198,10 @@ def run(args, run_dir):
         )
         native_reads = sum(report["native_misses_per_request"])
         line += f"\nactual_reads native: total={native_reads} unused=0 (final selected misses)"
+        for label, samples in report.get("split_samples", {}).items():
+            ranges = {key: [min(x[key] for x in samples), max(x[key] for x in samples)]
+                      for key in ("final_reads", "nonconflicting_reads", "conflicting_reads")}
+            line += f"\nfinal_split {label}: min_max=" + json.dumps(ranges)
         for label, samples in report.get("read_samples", {}).items():
             ranges = {key: [min(row[key] for row in samples), max(row[key] for row in samples)] for key in samples[0]}
             line += f"\nactual_reads {label}: min_max=" + json.dumps(ranges)
@@ -297,6 +301,7 @@ def run_device(
     core_trace = {}
     full_trace = {}
     read_samples = {}
+    split_samples = {}
 
     def measure(call, reset, check, trace_core=False, read_label=None):
         reset()
@@ -326,6 +331,7 @@ def run_device(
                 samples.append(start.elapsed_time(end) * 1000)
             check()
             if read_label and step >= args.warmup:
+                split_samples.setdefault(read_label, []).append(dict(state["completion"]))
                 read_samples.setdefault(read_label, []).append(
                     actual_reads(
                         rotating.mapping.cpu().numpy(),
@@ -677,6 +683,7 @@ def run_device(
         core_trace=core_trace,
         full_trace=full_trace,
         read_samples=read_samples,
+        split_samples=split_samples,
         sfa=sfa,
         stateful_rounds=3,
         native_misses_per_request=state["native_misses"],
