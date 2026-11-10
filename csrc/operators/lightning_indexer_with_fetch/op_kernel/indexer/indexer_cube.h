@@ -102,6 +102,9 @@ protected:
     uint64_t queryL1Mte2BufIdx_ = 0;
     uint64_t queryL1Mte1BufIdx_ = 0;
     uint64_t l0BufIdx_ = 0;
+    bool queryL0Valid_[L0_BUF_NUM] = {};
+    uint64_t queryL0Generation_[L0_BUF_NUM] = {};
+    uint64_t queryL0Rows_[L0_BUF_NUM] = {};
 
     bool isKeyCacheValid_ = false; // L1中是否有可复用的数据
     uint64_t keyGmStart_ = 0; // L1数据对应的GM S2偏移
@@ -121,6 +124,9 @@ __aicore__ inline void QLIMatmul<QLIT>::InitParams(const ConstInfo &constInfo)
     constInfo_ = constInfo;
     s2BasicBlock_ = (constInfo_.tSize <= 256) ? 256 : 128;
     keyBufferOffset_ = s2BasicBlock_ * D_BASIC_BLOCK; // 128*128
+    for (uint32_t slot = 0; slot < L0_BUF_NUM; ++slot) {
+        queryL0Valid_[slot] = false;
+    }
 }
 
 template <typename QLIT>
@@ -389,6 +395,15 @@ template <typename QLIT>
 __aicore__ inline void QLIMatmul<QLIT>::LoadQueryToL0a(uint64_t s1gGmOffset, uint64_t s1gL1Offset, uint64_t s1gL1RealSize,
                                                      uint64_t s1gL0RealSize, const QLICommon::RunInfo &runInfo)
 {
+    uint32_t slot = l0BufIdx_ % L0_BUF_NUM;
+    bool fullQuery = s1gL1Offset == 0 && s1gL0RealSize == s1gL1RealSize &&
+                     constInfo_.headDim == D_BASIC_BLOCK;
+    // Q remains unchanged across S2 tiles. Track the full L1 generation,
+    // not its ring slot, so a new request cannot hit an older Q copy.
+    if (fullQuery && queryL0Valid_[slot] && queryL0Generation_[slot] == queryL1Mte1BufIdx_ &&
+        queryL0Rows_[slot] == s1gL0RealSize) {
+        return;
+    }
     LoadData2DParamsV2 loadData2DParamsV2;
     loadData2DParamsV2.mStartPosition = CeilDiv(s1gL1Offset, BLOCK_CUBE);
     loadData2DParamsV2.kStartPosition = 0;
@@ -400,6 +415,10 @@ __aicore__ inline void QLIMatmul<QLIT>::LoadQueryToL0a(uint64_t s1gGmOffset, uin
 
     LoadData(queryL0_[(l0BufIdx_ % L0_BUF_NUM) * L0AB_BUFFER_OFFSET],
              queryL1_[(queryL1Mte1BufIdx_ % QUERY_BUF_NUM) * QUERY_BUFFER_OFFSET], loadData2DParamsV2);
+    // A partial overwrite invalidates any earlier complete Q in this slot.
+    queryL0Valid_[slot] = fullQuery;
+    queryL0Generation_[slot] = queryL1Mte1BufIdx_;
+    queryL0Rows_[slot] = s1gL0RealSize;
 }
 
 template <typename QLIT>
