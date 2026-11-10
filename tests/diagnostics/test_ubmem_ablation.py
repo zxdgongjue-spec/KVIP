@@ -8,6 +8,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+import numpy as np
 
 from kvip.diagnostics import replay_measure, ubmem_ablation
 
@@ -83,6 +84,7 @@ def native_mocks(monkeypatch, tmp_path):
     archive = SimpleNamespace(
         directory=tmp_path / "snapshot",
         manifest=dict(geometry=geometry(), ddr=dict(region_bytes=4096, slot_bytes=128), fidelity={}),
+        array=lambda name: np.empty((16, 16384 if name == "pre.reserved_hot" else 2048), dtype=np.int32),
     )
 
     class Graph:
@@ -251,6 +253,52 @@ def test_normal_run_preserves_one_case_api(native_mocks):
     result = replay_measure.run(mock.args, mock.archive, {})
     assert result["status"] == "pass" and result["mode"] == "fused"
     assert mock.events.count("factory") == 1 and mock.events[-2:] == ["release_table", "shutdown"]
+
+
+def test_service_matrix_reuses_ddr_and_pairs_identical_derived_inputs(native_mocks, monkeypatch):
+    from kvip.diagnostics import active_rows
+
+    mock = native_mocks
+    selected = []
+
+    def mask(source, count):
+        assert source is mock.archive
+        selected.append(count)
+        return source
+
+    monkeypatch.setattr(active_rows, "mask_active_rows", mask)
+    mock.args.service_ablation = True
+    mock.args.active_batches = [1, 4, 16]
+    report = ubmem_ablation.run_ablation(mock.args, mock.archive, {})
+    assert selected == [1, 4, 16]
+    assert len(report["cases"]) == 8
+    assert mock.events.count("import_pages") == mock.events.count("shutdown") == 1
+    for case, tuning in zip(report["cases"], mock.tunings):
+        assert tuning["parallel_init"] is False and tuning["balanced_index"] is True
+        assert tuning["prefetch_limit"] == 256 and tuning["window_limit"] == 32
+        assert tuning["skip_inactive"] is (not case["name"].endswith("dense_baseline"))
+        assert tuning["compact_reserved"] is case["name"].endswith("compact_skip")
+    assert "not measured" in report["interpretation"]
+
+
+def test_service_matrix_rejects_invalid_counts_before_allocating(native_mocks):
+    for counts in ([], [0], [17]):
+        with pytest.raises(ValueError, match="Active request counts"):
+            ubmem_ablation.service_cases(native_mocks.archive, counts)
+    assert not native_mocks.events
+
+
+def test_cli_service_ablation_requires_ubmem_fused_and_an_output(tmp_path):
+    from kvip.diagnostics.replay import arguments
+
+    common = ["--snapshot", str(tmp_path), "--build-dir", str(tmp_path), "--soc", "Ascend950DT_9582"]
+    args = arguments(
+        common + ["--service-ablation", "--active-batches", "1", "4", "16", "--output", str(tmp_path / "x.json")]
+    )
+    assert args.service_ablation and args.active_batches == [1, 4, 16]
+    for extra in (["--service-ablation"], ["--active-batches", "1"], ["--service-ablation", "--mode", "serial"]):
+        with pytest.raises(SystemExit):
+            arguments(common + extra)
 
 
 @pytest.mark.parametrize("transport,mode", (("urma", "fused"), ("ubmem", "serial")))

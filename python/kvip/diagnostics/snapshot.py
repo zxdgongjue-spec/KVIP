@@ -8,6 +8,7 @@ import numpy as np
 
 from kvip.diagnostics.archive import TensorArchive, cpu_array, source_commit
 from kvip.diagnostics.oracle import DecodeOracle
+from kvip.adapters.vllm.inputs import reserved_hot_reference
 
 
 def persistent_tensors(selector):
@@ -185,8 +186,25 @@ class DecodeSnapshotRecorder:
             },
         )
         self.archive = TensorArchive(self.directory, self.manifest)
+        compact_reserved = getattr(shape, "compact_reserved", False)
         for name, tensor in (persistent_tensors(selector) | input_tensors(selector)).items():
-            self.archive.save_tensor("pre." + name, self.torch, tensor)
+            if name == "reserved_hot" and compact_reserved:
+                # This output of init still contains the preceding round at
+                # the capture boundary. Save its exact deterministic expected
+                # value from the captured compact input, without running init
+                # early or changing any live device buffer/cache decision.
+                expected = reserved_hot_reference(
+                    self.archive.array("pre.lru_slots"), self.archive.array("pre.query_ends"), shape.resident
+                )
+                self.archive.save("pre.reserved_hot", expected)
+                self.manifest["input_derivations"] = {
+                    "pre.reserved_hot": "Init output reconstructed from pre.lru_slots and pre.query_ends; inactive rows are canonical -1."
+                }
+                self.manifest["fidelity"] += (
+                    " reserved_hot is derived from compact LRU input, not a pre-forward device copy."
+                )
+            else:
+                self.archive.save_tensor("pre." + name, self.torch, tensor)
         validate_capture_inputs(self.archive)
         self.manifest["ddr"] = self.page_exporter(selector, self.directory / "ddr")
         # Rebase to the same base only to prove every nonzero address has a
@@ -199,6 +217,13 @@ class DecodeSnapshotRecorder:
             raise RuntimeError("Snapshot after() requires one unfinished before()")
         selector.rotating.lease.check_stream().synchronize()
         reads = check_completion(self.torch, selector.rotating, selector.update)
+        if "input_derivations" in self.manifest:
+            actual = cpu_array(self.torch, selector.rotating.reserved_hot)
+            expected = self.archive.array("pre.reserved_hot")
+            active = np.any(self.archive.array("pre.query_ends").reshape(len(expected), 4) > 0, axis=1)
+            if not np.array_equal(actual[active], expected[active]):
+                raise AssertionError("Init reserved-hot reconstruction differs from captured compact LRU candidates")
+            self.archive.save("post.reserved_hot", actual)
         state = post_state(self.torch, selector)
         oracle = DecodeOracle(self.archive)
         result = oracle.verify(state)

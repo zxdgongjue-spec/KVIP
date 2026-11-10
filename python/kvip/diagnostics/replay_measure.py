@@ -69,8 +69,11 @@ def fused_reads(torch, rotating, update, transport, width):
 
 def prepare_fused_state(bundle, archive, restored, torch, device, transport):
     selector, rotating, update = bundle.selector, bundle.rotating, bundle.update
+    compact_reserved = getattr(bundle, "tuning", {}).get("compact_reserved", False)
     seeds = []
     for name, target in (persistent_tensors(selector) | input_tensors(selector)).items():
+        if name == "reserved_hot" and compact_reserved:
+            continue
         seed = (
             torch.from_numpy(relocate_snapshot_addresses(archive, restored["new_base"]).copy()).to(device)
             if name == "addresses"
@@ -84,14 +87,24 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
     saved_tags = archive.array("post.selected_tags")
     saved_payload = archive.array("post.selected_payload")
     delta = restored["new_base"] - restored["old_base"]
+    active_rows = np.any(archive.array("pre.query_ends").reshape(-1, 4) > 0, axis=1)
+    reserved_expected = archive.array("pre.reserved_hot")
 
     def reset():
         for target, seed in seeds:
             target.copy_(seed)
+        if compact_reserved:
+            # Poison outside timing. The captured init must rebuild the table;
+            # retaining a correct table from the preceding replay cannot pass.
+            rotating.reserved_hot.fill_(-2)
         # Production init resets round-local work; never rewind transport queues.
 
     def verify():
         reads = fused_reads(torch, rotating, update, transport, archive.manifest["geometry"]["token_bytes"])
+        if compact_reserved:
+            actual_reserved = cpu_array(torch, rotating.reserved_hot)
+            if not np.array_equal(actual_reserved[active_rows], reserved_expected[active_rows]):
+                raise AssertionError("Device reserved-hot reconstruction differs from the captured inverse map")
         checked = oracle.verify(post_state(torch, selector), address_delta=delta, expected_topk=expected)
         positions = {tuple(tag): i for i, tag in enumerate(checked["selected_tags"])}
         if len(positions) != len(saved_tags):
@@ -327,6 +340,7 @@ def measure_case(args, archive, context, retained):
         mode=args.mode,
         snapshot=str(archive.directory),
         snapshot_sha256=file_digest(archive.directory / "manifest.json"),
+        replay_selection=archive.manifest.get("replay_selection"),
         scope="Query_Index_ready_to_LI_TopK_Fetch_cache_state_and_TND_slot_outputs",
         geometry=archive.manifest["geometry"],
         device=args.device,
@@ -355,6 +369,13 @@ def measure_case(args, archive, context, retained):
     )
     if args.mode == "fused" and args.transport == "ubmem":
         result["tuning"] = dict(bundle.tuning)
+        result["reserved_metadata"] = dict(
+            dense_bytes_per_group=int(archive.array("pre.reserved_hot").nbytes),
+            compact_lru_bytes_per_group=int(archive.array("pre.lru_slots").nbytes),
+            reconstruction_checked=bool(bundle.tuning.get("compact_reserved", False)),
+            h2d_in_timing=False,
+            note="Compact LRU upload already exists in serving; only dense reserved-hot H2D is eliminated.",
+        )
     # measure() reset every full/stage graph first. A failing reset or lease
     # close leaves the active case and shared arena retained by the CLI.
     if bundle.lease is not None:

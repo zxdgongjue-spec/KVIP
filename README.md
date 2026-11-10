@@ -70,6 +70,15 @@ readback is added to `forward()`. Transport/workspace ownership must outlive gra
 replay. Device errors remain available through the existing status/feedback path.
 Individual launch methods remain internal diagnostic interfaces.
 
+The vLLM adapters build both transports with `compact_reserved=True`. The existing
+init launch reconstructs each active packed row's reserved-hot inverse map from
+its 2048 LRU candidates; serving no longer constructs or uploads the dense
+`[group, packed row, hot slot]` map. Buffer addresses and graph bindings stay
+stable, and newly active rows are cleared before rebuilding. Standalone builds
+default to the captured dense-input path for reproducible comparisons. Diagnostic
+captures explicitly label the derived inverse map and verify its device value
+after init; offline replay does not measure the eliminated service H2D transfer.
+
 `kvip.QueryInputs`, `kvip.LIFetchWorkspace`, `kvip.IndexCacheStorage`,
 `kvip.build_libraries` and `kvip.bind_selectors` expose the existing service setup.
 `bind_selectors` requires the current vLLM KVAF policy/writer contract; this is not
@@ -434,9 +443,58 @@ separately as `index_plan`, `index_outputs` and `index_apply`. These diagnostic
 graph boundaries are excluded from full-graph timing. The result JSON keeps
 all timings, read counts, effective tuning and source/binary hashes.
 
-The optimization switches are opt-in `Specialization` fields (`parallel_init`,
-`balanced_index`); serving defaults and URMA remain unchanged. The existing
+The optimization switches are `Specialization` fields (`parallel_init`,
+`balanced_index`). Parallel init remains off in serving; balanced Index movement
+is enabled for UBmem serving after the real-snapshot validation. URMA Index
+movement is unchanged. The existing
 specialization cache builds one baseline and one optimized library, then reuses
 the optimized library for the smaller budget. Reducing prefetch can reduce
 wasted reads but increase final-fetch latency, so compare complete graph times
 before choosing a budget. Local host-model checks do not establish NPU speedup.
+
+### Skip padded LI work and construct protection maps from compact inputs
+
+Both fusion backends keep graph capacity and addresses stable, but skip LI's
+matrix/vector/history loop for a request whose four device query bounds are
+zero. The inactive core still participates in its assigned prefetch window and
+cube/vector synchronization. Window service waits for active producers to reach
+the corresponding history boundary before sampling their candidate state.
+Init, final resolution and other control work retain their existing capacity.
+
+Serving also stops constructing/uploading the dense reserved-hot inverse map
+on the CPU. It uploads the existing LRU candidate lists; the original init
+kernel rebuilds the inverse map for active packed rows on the NPU. The mapping
+uses packed request rows, not persistent owner IDs. For 21 groups, 17 allocated
+rows and 16384 hot slots this removes 22.3125 MiB of extra H2D per worker/step;
+the candidate upload already existed. No extra kernel or CPU readback is added.
+Both repository revisions must be updated together. A compact-mode capture
+labels the inverse map as derived from its saved LRU input and verifies the
+device result after the call, rather than saving the preceding round's map.
+
+To validate these changes from a verified B16 snapshot without a model service:
+
+```bash
+python -B -m kvip.diagnostics.replay \
+  --snapshot "$snapshot" --build-dir "$ubmem_build" \
+  --transport ubmem --mode fused --device 0 --soc Ascend950DT_9582 \
+  --service-ablation --active-batches 1 16 --split-index-stages \
+  --warmup 2 --iterations 10 --stage-iterations 3 \
+  --output "$new_result_json"
+```
+
+Five cases share one restored DDR arena: B1 dense, B1 skip-only, B1 skip+compact,
+B16 dense and B16 skip+compact. All disable the regressing parallel-init option,
+keep balanced Index movement, and halve the captured prefetch budget (512/64
+becomes 256/32). B1 is explicitly a derived padding view at B16 capacity: it
+preserves one real request's packed inputs, owner, DDR and hot state. It is not
+a new B1 service capture or a B1-specialized kernel. Valid TopK/KV/Index results
+are checked against the corresponding captured requests, and padding outputs
+must remain -1. Before each compact run the inverse map is poisoned outside
+timing; correctness checks require the kernel to rebuild the active rows.
+
+Compare B1 dense vs skip-only for padded-LI savings, and skip-only vs compact
+for inverse-map construction overhead. The full B16 comparison checks the
+unchanged active workload. H2D/CPU preparation is outside this snapshot's timing
+boundary; these results do not measure the service-level benefit of deleting
+the dense upload. The original archive is never rewritten, and JSON provenance
+records the derived selection and original manifest hash.

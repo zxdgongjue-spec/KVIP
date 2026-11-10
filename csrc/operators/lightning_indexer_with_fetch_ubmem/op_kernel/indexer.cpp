@@ -17,6 +17,7 @@ extern "C" __global__ __aicore__ void kvip_ubmem_li_kernel(GM_ADDR bindings) {
     using Type=QLIType<fp8_e4m3fn_t,fp8_e4m3fn_t,int32_t,true,LI_LAYOUT::BSND,LI_LAYOUT::PA_BSND,
         bfloat16_t,float,float,uint16_t>;
     QLIKernel::QuantLightningIndexerKernel<Type> op;
+    op.queryEnds_=reinterpret_cast<__gm__ rotating::Context*>(a[14])->queryEnds;
     QLITilingData tiling{SIM_BATCH,SIM_BATCH*4,INDEX_HEADS,4,SIM_HISTORY,
         2048,rotating::kLiCores,128,SIM_HISTORY/128,0,16384,128,SIM_RESIDENT,V9_SPLIT_Q,V9_AIC_COUNT};
 #define P(i) reinterpret_cast<GM_ADDR>(a[i])

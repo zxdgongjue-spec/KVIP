@@ -206,7 +206,8 @@ def test_oracle_rejects_future_token_using_cross_packed_source(captured):
         oracle.verify(state)
 
 
-def test_complete_recorder_publishes_only_verified_files(captured, tmp_path):
+@pytest.mark.parametrize("compact_reserved", (False, True))
+def test_complete_recorder_publishes_only_verified_files(captured, tmp_path, compact_reserved):
     archive, state = captured
     b, h, r, width = 2, 4096, 2048, 656
     pre = {
@@ -240,6 +241,7 @@ def test_complete_recorder_publishes_only_verified_files(captured, tmp_path):
             aic_count=32,
             intermediate_fetches=8,
             soc="cpu_contract_fixture",
+            compact_reserved=compact_reserved,
         ),
         context=context,
         rounds=8,
@@ -250,8 +252,8 @@ def test_complete_recorder_publishes_only_verified_files(captured, tmp_path):
         output=pre["output"],
         tail_bounds=pre["tail_bounds"],
         arguments=[None] * 5 + [torch.full((b,), 4, dtype=torch.int32), torch.full((b,), h, dtype=torch.int32)],
-        lru_slots=torch.zeros((b, 2048), dtype=torch.int32),
-        reserved_hot=torch.full((b, r), -1, dtype=torch.int32),
+        lru_slots=torch.arange(2048, dtype=torch.int32).repeat(b, 1),
+        reserved_hot=torch.full((b, r), 91 if compact_reserved else -1, dtype=torch.int32),
         rows=torch.zeros((b, 256), dtype=torch.int32),
         row_status=torch.zeros((b, 32), dtype=torch.int32),
         final_posts=torch.zeros((b, 4, 32), dtype=torch.int32),
@@ -330,6 +332,14 @@ def test_complete_recorder_publishes_only_verified_files(captured, tmp_path):
     recorder = DecodeSnapshotRecorder(torch, tmp_path / "recorded", source, exporter)
     recorder.before(selector)
     assert not recorder.completed and (recorder.directory / "INCOMPLETE").is_file()
+    if compact_reserved:
+        assert torch.all(rotating.reserved_hot == 91)  # Recording did not execute init early.
+        assert "pre.reserved_hot" in recorder.manifest["input_derivations"]
+        np.testing.assert_array_equal(recorder.archive.array("pre.reserved_hot"), np.tile(np.arange(r), (b, 1)))
+        with pytest.raises(AssertionError, match="reserved-hot reconstruction"):
+            recorder.after(selector)
+        assert not (recorder.directory / "manifest.json").exists()
+        rotating.reserved_hot.copy_(rotating.lru_slots)  # CPU fixture substitutes the validated native init.
     for name, value in state.items():
         if name in ("logical_output", "slot_output"):
             continue

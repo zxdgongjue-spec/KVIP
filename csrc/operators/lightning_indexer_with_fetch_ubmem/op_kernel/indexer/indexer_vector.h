@@ -22,6 +22,7 @@
 #include "lib/matmul_intf.h"
 #include "lib/matrix/matmul/tiling.h"
 #include "indexer_types.h"
+#include "inactive_row.h"
 #include "indexer_score.h"
 #include "topk.h"
 
@@ -45,6 +46,26 @@ public:
         rotating::PrepareProgress(reinterpret_cast<__ubuf__ uint32_t*>(rotationProgress_.GetPhyAddr()), rotationProgressBase_);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
         WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    }
+    __aicore__ inline void WaitInactiveServiceWindow(uint32_t epoch) {
+        // This producer did no LI work, but its service window must not run
+        // before the active rows assigned to this lane reach that window.
+        // Read through MTE2: never write back a cached producer progress line.
+        PipeBarrier<PIPE_ALL>();
+        auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+        auto ends=reinterpret_cast<__gm__ const uint32_t*>(ctx->queryEnds);
+        auto ready=scoreOutLocal_.template ReinterpretCast<uint32_t>();
+        uint32_t lane=rotating::ServiceLane(blockId_/2,blockId_%2),trigger=rotating::Trigger(epoch)*128;
+        for(uint32_t b=lane;b<SIM_BATCH;b+=rotating::kServiceLanes)for(uint32_t q=0;q<4;++q) {
+            uint32_t query=b*4+q;
+            uint32_t target=QLICommon::InactiveWindowTarget(trigger,SIM_RESIDENT,ends[query],ctx->lruSlots!=0);
+            if(!target)continue;
+            do {
+                SetFlag<HardEvent::S_MTE2>(EVENT_ID0);WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                DataCopy(ready,rotationProgressGm_[query*32],32);
+                SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            } while(ready.GetValue(0)<target);
+        }
     }
     __aicore__ inline void RotateFetch(uint32_t epoch) {
         // Join this producer's hit publication. Other producers remain free.

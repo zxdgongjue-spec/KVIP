@@ -33,6 +33,8 @@ def prepare_workspace(torch, policy, config, device_id, soc, index_heads=64):
             aics,
             config.intermediate_fetches,
             soc,
+            compact_reserved=True,
+            balanced_index=True,
         )
         shapes[token_bytes] = shape
         libraries[token_bytes] = build_specialization(

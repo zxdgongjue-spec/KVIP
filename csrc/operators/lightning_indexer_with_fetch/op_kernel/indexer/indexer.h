@@ -23,6 +23,7 @@
 #include "lib/matmul_intf.h"
 #include "lib/matrix/matmul/tiling.h"
 #include "indexer_types.h"
+#include "inactive_row.h"
 #include "indexer_vector.h"
 #include "indexer_cube.h"
 
@@ -81,6 +82,7 @@ public:
     static constexpr uint32_t SYNC_C1_V1_FLAG = 4;
     static constexpr uint32_t SYNC_V1_C1_FLAG = 5;
     uint32_t resident_=0;
+    uint64_t queryEnds_=0;
 public:
     rotating::RuntimeShape runtimeShape_;
 private:
@@ -136,6 +138,7 @@ protected:
     __aicore__ inline uint32_t GetS2BaseBlockNumOnMask(uint32_t s1gIdx, uint32_t actS1Size, uint32_t actS2SizeOrig);
     // ================================Process functions================================
     __aicore__ inline void ProcessMain();
+    __aicore__ inline void ProcessInactiveGroup(const QLICommon::RunInfo &info);
     __aicore__ inline void ProcessBaseBlock(uint32_t loop, uint64_t s2LoopIdx,
                                             QLICommon::RunInfo runInfo, uint32_t qScaleLoop, uint32_t kScaleLoop);
     __aicore__ inline void ProcessInvalid();
@@ -652,12 +655,24 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()
     uint32_t qScaleLoop = 0;
     for (uint32_t bN2LoopIdx = splitCoreInfo.bN2Start; bN2LoopIdx <= splitCoreInfo.bN2End; bN2LoopIdx++) {
         CalcGS1LoopParams(bN2LoopIdx);
+        bool inactive=false;
+        if (queryEnds_) {
+            auto ends=reinterpret_cast<__gm__ const uint32_t*>(queryEnds_)+tempLoopInfo.bIdx*4;
+            inactive=QLICommon::InactiveQueryRow(ends[0],ends[1],ends[2],ends[3]);
+        }
         if (tempLoopInfo.curActSeqLenIsZero) {
             DealActSeqLenIsZero(tempLoopInfo.bIdx, tempLoopInfo.n2Idx, 0U);
             continue;
         }
         for (uint32_t gS1LoopIdx = splitCoreInfo.gS1Start; gS1LoopIdx <= tempLoopInfo.gS1LoopEnd; gS1LoopIdx++) {
             CalcS2LoopParams(bN2LoopIdx, gS1LoopIdx);
+            if (inactive) {
+                CalcRunInfo(gloop,splitCoreInfo.s2Start,runInfo,qScaleLoop,0);
+                ProcessInactiveGroup(runInfo);
+                ++qScaleLoop;
+                splitCoreInfo.s2Start=0;
+                continue;
+            }
             uint32_t kScaleLoop = 0;
             for (int s2LoopIdx = splitCoreInfo.s2Start; s2LoopIdx <= tempLoopInfo.s2LoopEnd; s2LoopIdx++) {
                 if ((s2LoopIdx - splitCoreInfo.s2Start) % 16 == 0) {
@@ -681,6 +696,33 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()
         matmulService.FreeEventID();
         CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT + 0);
         CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT + 1);
+    }
+}
+
+template <typename QLIT>
+__aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessInactiveGroup(const QLICommon::RunInfo &info)
+{
+    // Init left all four progress records at zero. Never publish readiness for
+    // stale bitmap/prefix storage: service clips its scan to that zero bound.
+    // Each AIV writes only its Q2/Q4 slice through the existing invalid TopK
+    // branch, which does not read scores or consume cube/vector tile credits.
+    if ASCEND_IS_AIV { vectorService.ProcessTopK(info); }
+    if (rotationServed_) return;
+    for (uint32_t epoch=0;epoch<runtimeShape_.rounds;++epoch) {
+        uint32_t tile=rotating::Trigger(runtimeShape_.history,runtimeShape_.resident,runtimeShape_.rounds,epoch);
+        if (tile<=splitCoreInfo.s2Start || tile>tempLoopInfo.s2LoopEnd+1 ||
+            rotating::EpochAt(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.splitQ,runtimeShape_.rounds,runtimeShape_.serviceAics,tile,aiCoreIdx)!=static_cast<int32_t>(epoch)) continue;
+        // An inactive producer can still own service for other active rows.
+        // Preserve the assigned window and its paired cube acknowledgement.
+        if ASCEND_IS_AIV {
+            vectorService.WaitInactiveServiceWindow(epoch);
+            vectorService.RotateFetch(epoch);
+            CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(8);
+        } else {
+            CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(8);
+        }
+        rotationServed_=true;
+        break;
     }
 }
 

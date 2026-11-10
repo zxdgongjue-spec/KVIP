@@ -43,6 +43,12 @@ constexpr uint32_t kFinalCores=SIM_BATCH*kFinalWorkers;
 #ifndef V9_UBMEM_BALANCED_INDEX
 #define V9_UBMEM_BALANCED_INDEX 0
 #endif
+#ifndef V9_SKIP_INACTIVE
+#define V9_SKIP_INACTIVE 1
+#endif
+#ifndef V9_COMPACT_RESERVED
+#define V9_COMPACT_RESERVED 0
+#endif
 static_assert(V9_UBMEM_PARALLEL_INIT == 0 || V9_UBMEM_PARALLEL_INIT == 1,
               "Parallel init must be enabled explicitly with 0 or 1");
 constexpr uint32_t kInitWorkersPerBatch=V9_UBMEM_PARALLEL_INIT ? 2*V9_AIC_COUNT/SIM_BATCH : 1;

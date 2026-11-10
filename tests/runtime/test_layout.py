@@ -99,8 +99,15 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
     assert len(commands) == 6
 
     selector.write_text("// updated shared LIDU selector\n")
-    assert build.build_libraries(**options) != updated
+    current = build.build_libraries(**options)
+    assert current != updated
     assert len(commands) == 8
+    compact = build.build_libraries(**options, compact_reserved=True)
+    assert compact != current
+    assert "-DCOMPACT_RESERVED=1" in commands[-2]
+    assert build.build_libraries(**options, compact_reserved=True) == compact
+    assert build.build_libraries(**options) == current
+    assert len(commands) == 10
 
 
 def test_actual_operator_cmake_resolves_relocated_sources(tmp_path):

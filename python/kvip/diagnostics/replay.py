@@ -45,6 +45,17 @@ def arguments(argv=None):
         help="Diagnose UBmem index_plan/index_outputs/index_apply instead of combined index_update",
     )
     parser.add_argument(
+        "--service-ablation",
+        action="store_true",
+        help="Compare dense baseline vs inactive-LI skipping and compact reserved-hot construction on real rows",
+    )
+    parser.add_argument(
+        "--active-batches",
+        type=int,
+        nargs="+",
+        help="Derived active request counts for service-ablation (default: 1 and captured-batch)",
+    )
+    parser.add_argument(
         "--stage-iterations",
         type=int,
         default=0,
@@ -58,12 +69,16 @@ def arguments(argv=None):
         parser.error("device/warmup must be nonnegative and iterations positive")
     if args.stage_iterations < 0:
         parser.error("stage-iterations must be nonnegative")
-    if (args.ubmem_ablation or args.split_index_stages) and (
+    if (args.ubmem_ablation or args.service_ablation or args.split_index_stages) and (
         args.inspect or args.transport != "ubmem" or args.mode != "fused"
     ):
         parser.error("UBmem ablation/split-index-stages require UBmem fused replay")
-    if args.ubmem_ablation and args.output is None:
-        parser.error("--ubmem-ablation requires --output to retain all case results")
+    if args.ubmem_ablation and args.service_ablation:
+        parser.error("Select only one ablation matrix")
+    if (args.ubmem_ablation or args.service_ablation) and args.output is None:
+        parser.error("Ablation requires --output to retain all case results")
+    if args.active_batches and not args.service_ablation:
+        parser.error("--active-batches requires --service-ablation")
     if args.serial_workers is not None and (args.mode != "serial" or not 1 <= args.serial_workers <= 48):
         parser.error("serial-workers requires serial mode and a value in 1..48")
     if not args.inspect and ((args.transport == "urma") != bool(args.kvaf_server)):
@@ -117,7 +132,7 @@ def run(args, archive):
 
 
 def _run(args, archive, retained):
-    if getattr(args, "ubmem_ablation", False):
+    if getattr(args, "ubmem_ablation", False) or getattr(args, "service_ablation", False):
         from kvip.diagnostics.ubmem_ablation import run_ablation
 
         return run_ablation(args, archive, retained)
@@ -159,7 +174,7 @@ def main():
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with args.output.open("x") as output:
             output.write(text)
-    if args.ubmem_ablation:
+    if args.ubmem_ablation or args.service_ablation:
         print(f"Results: {args.output}")
     else:
         print(text, end="")

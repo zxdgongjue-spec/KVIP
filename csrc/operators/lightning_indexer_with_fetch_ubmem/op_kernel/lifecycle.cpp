@@ -4,6 +4,7 @@
 #include "prefetch.h"
 #include "resolver.h"
 #include "init_partition.h"
+#include "../../common/lifetch/reserved_hot.h"
 using namespace AscendC;
 using namespace rotating;
 namespace {
@@ -59,6 +60,9 @@ __aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
     CopyInitialLruSlots(ctx,b,local);
     Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},SIM_HISTORY,SIM_RESIDENT,ctx,b);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+#if V9_COMPACT_RESERVED
+    RebuildReservedHot(ctx->lruSlots,ctx->reservedHot,ctx->queryEnds,b,SIM_RESIDENT,kLruSlots,local);
+#endif
     pipe.Destroy();
 }
 #if V9_UBMEM_PARALLEL_INIT
@@ -111,6 +115,9 @@ __aicore__ inline void InitializeRoundParallel(__gm__ Context* ctx,uint32_t b,ui
     // no shard can clear or scalar-write another shard's cache line.
     Simt::VF_CALL<InitializeTailShard>(Simt::Dim3{256,1,1},ctx,b,part,map.begin,map.end);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+#if V9_COMPACT_RESERVED
+    if(!part)RebuildReservedHot(ctx->lruSlots,ctx->reservedHot,ctx->queryEnds,b,SIM_RESIDENT,kLruSlots,local);
+#endif
     pipe.Destroy();
 }
 #endif

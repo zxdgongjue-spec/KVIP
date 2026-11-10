@@ -23,6 +23,31 @@ def plan_cases(geometry):
     ]
 
 
+def service_cases(archive, active_batches):
+    """Keep B-capacity fixed and retain the captured queries/owners for active rows."""
+    from kvip.diagnostics.active_rows import mask_active_rows
+
+    geometry = archive.manifest["geometry"]
+    batch = geometry["batch"]
+    counts = active_batches if active_batches is not None else [1, batch]
+    if not counts or any(type(n) is not int or not 1 <= n <= batch for n in counts):
+        raise ValueError(f"Active request counts must be integers in 1..{batch}")
+    total, window = prefetch_budget(geometry["prefetch_limit"], geometry["window_limit"], geometry["requested_windows"])
+    common = dict(parallel_init=False, balanced_index=True, prefetch_limit=total // 2, window_limit=max(1, window // 2))
+    plans = []
+    for count in dict.fromkeys(counts):
+        view = mask_active_rows(archive, count)
+        variants = [("dense_baseline", False, False)]
+        if count < batch:
+            variants.append(("skip_only", True, False))
+        variants.append(("compact_skip", True, True))
+        for label, skip, compact in variants:
+            name = f"b{count}_{label}"
+            tuning = dict(common, skip_inactive=skip, compact_reserved=compact)
+            plans.append((name, tuning, view))
+    return plans
+
+
 def summarize_case(case):
     stages = case.get("stage_diagnostics", {}).get("stages", {})
     index_stages = [value["samples_us"] for name, value in stages.items() if name.startswith("index_")]
@@ -71,14 +96,19 @@ def run_ablation(args, archive, retained):
     """Failure keeps the active case and shared Runtime alive in _RETAINED_RUNS."""
     if args.transport != "ubmem" or args.mode != "fused":
         raise ValueError("UBmem ablation requires --transport ubmem --mode fused")
-    plans = plan_cases(archive.manifest["geometry"])
+    service = getattr(args, "service_ablation", False)
+    plans = (
+        service_cases(archive, getattr(args, "active_batches", None))
+        if service
+        else [(name, tuning, archive) for name, tuning in plan_cases(archive.manifest["geometry"])]
+    )
     context = replay_measure.allocate_context(args, archive, retained)
     cases = []
-    for name, tuning in plans:
+    for name, tuning, case_archive in plans:
         print(f"[ubmem-ablation] {name}: {tuning}", flush=True)
         case_args = copy(args)
         case_args.ubmem_tuning = tuning
-        result = replay_measure.measure_case(case_args, archive, context, retained)
+        result = replay_measure.measure_case(case_args, case_archive, context, retained)
         cases.append(dict(name=name, **result))
         print(
             f"[ubmem-ablation] {name}: PASS mean={result['timing']['mean_us']:.3f} us "
@@ -95,15 +125,21 @@ def run_ablation(args, archive, retained):
         status="pass",
         transport="ubmem",
         mode="fused",
-        ablation="ubmem_init_index_prefetch",
+        ablation="ubmem_active_rows_compact_metadata" if service else "ubmem_init_index_prefetch",
         snapshot=str(archive.directory),
         geometry=archive.manifest["geometry"],
         cases=cases,
         summary=[summarize_case(case) for case in cases],
         interpretation=(
-            "Three sequential cases reuse one Runtime, imported DDR arena and access table. "
+            "Sequential cases reuse one Runtime, imported DDR arena and access table. "
             "Full-graph latency is isolated group latency, not service TPOT; stage diagnostics add instrumentation."
         ),
     )
+    if service:
+        result["interpretation"] += (
+            " Small batches are explicitly derived padding views of captured requests, not newly captured service waves. "
+            "Both variants disable the regressing parallel init and retain balanced Index + half prefetch. "
+            "Device inverse-map construction is timed; CPU prepare and H2D savings are not measured here."
+        )
     print_summary(result)
     return result

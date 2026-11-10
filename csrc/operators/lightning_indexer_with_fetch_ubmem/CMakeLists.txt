@@ -16,8 +16,13 @@ set(LI_TILING auto CACHE STRING "auto split Q, or q4")
 set(FINAL_AIVS 0 CACHE STRING "Final workers per batch: 0 auto, 1, 2, or 4")
 set(UBMEM_PARALLEL_INIT 0 CACHE STRING "Opt-in cache-line-partitioned init: 0 or 1")
 set(UBMEM_BALANCED_INDEX 0 CACHE STRING "Opt-in balanced Index metadata workers: 0 or 1")
+set(SKIP_INACTIVE 1 CACHE STRING "Skip padded LI rows while preserving window service: 0 or 1")
+set(COMPACT_RESERVED 0 CACHE STRING "Rebuild reserved-hot inverse map from compact LRU slots: 0 or 1")
 if(NOT UBMEM_PARALLEL_INIT MATCHES "^[01]$" OR NOT UBMEM_BALANCED_INDEX MATCHES "^[01]$")
   message(FATAL_ERROR "UBmem optimization switches must be 0 or 1")
+endif()
+if(NOT SKIP_INACTIVE MATCHES "^[01]$" OR NOT COMPACT_RESERVED MATCHES "^[01]$")
+  message(FATAL_ERROR "Skip-inactive and compact-reserved switches must be 0 or 1")
 endif()
 if(NOT RUN_MODE STREQUAL "npu" OR NOT SOC_VERSION MATCHES "^Ascend950[A-Za-z0-9_]+$")
   message(FATAL_ERROR "UBmem fusion needs RUN_MODE=npu and explicit active Ascend950 SOC_VERSION")
@@ -62,6 +67,7 @@ set(_definitions
   V9_AIC_COUNT=${AIC_COUNT} V9_SPLIT_Q=${_split} V9_INTERMEDIATE_FETCHES=${_rounds}
   V9_FINAL_AIVS=${FINAL_AIVS} V9_SERVICE_AICS=0 V9_FINAL_REPLICATED=1
   V9_UBMEM_PARALLEL_INIT=${UBMEM_PARALLEL_INIT} V9_UBMEM_BALANCED_INDEX=${UBMEM_BALANCED_INDEX}
+  V9_SKIP_INACTIVE=${SKIP_INACTIVE} V9_COMPACT_RESERVED=${COMPACT_RESERVED}
   V9_UBMEM=1 V9_UBPIPE_DEPTH=8 V9_UBPIPE_ROWS=4 V9_WINDOW_UBPIPE_DEPTH=8
   V9_WINDOW_COPY_ENGINE=0 V9_WINDOW_SCAN_FUSED=0 V9_WINDOW_PREPARED_GROUPS=0
   V9_PHASE_PROFILING=0 V9_INTERMEDIATE_PROFILING=0 V9_FUSED_LIFECYCLE=0

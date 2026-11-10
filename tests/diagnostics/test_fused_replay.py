@@ -121,7 +121,7 @@ def test_split_index_stages_retain_native_order_without_extra_work():
 def test_tuning_keeps_snapshot_immutable_and_validates_only_known_options():
     geometry = dict(prefetch_limit=512, window_limit=64, requested_windows=8)
     optimized = dict(parallel_init=True, balanced_index=True, prefetch_limit=256, window_limit=32)
-    assert fusion_tuning(geometry, "ubmem", optimized) == optimized
+    assert fusion_tuning(geometry, "ubmem", optimized) == dict(optimized, skip_inactive=False, compact_reserved=False)
     assert geometry == dict(prefetch_limit=512, window_limit=64, requested_windows=8)
     assert fusion_tuning(geometry, "ubmem")["parallel_init"] is False
     for invalid in (dict(unknown=1), dict(parallel_init=1), dict(prefetch_limit=256.0), dict(window_limit=0)):

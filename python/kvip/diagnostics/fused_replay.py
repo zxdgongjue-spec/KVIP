@@ -129,6 +129,8 @@ def fusion_tuning(geometry, transport, overrides=None):
     values = dict(
         parallel_init=False,
         balanced_index=False,
+        skip_inactive=False,
+        compact_reserved=False,
         prefetch_limit=geometry["prefetch_limit"],
         window_limit=geometry["window_limit"],
     )
@@ -136,7 +138,10 @@ def fusion_tuning(geometry, transport, overrides=None):
         if transport != "ubmem" or set(overrides) - set(values):
             raise ValueError("Fusion tuning only accepts known UBmem options")
         values.update(overrides)
-    if any(type(values[name]) is not bool for name in ("parallel_init", "balanced_index")):
+    if any(
+        type(values[name]) is not bool
+        for name in ("parallel_init", "balanced_index", "skip_inactive", "compact_reserved")
+    ):
         raise ValueError("UBmem optimization switches must be booleans")
     if any(type(values[name]) is not int for name in ("prefetch_limit", "window_limit")):
         raise ValueError("UBmem prefetch budgets must be integers")
@@ -203,6 +208,8 @@ def create_fused(
             soc,
             parallel_init=effective["parallel_init"],
             balanced_index=effective["balanced_index"],
+            skip_inactive=effective["skip_inactive"],
+            compact_reserved=effective["compact_reserved"],
         )
         library = build_specialization(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape)
         workspace = UbmemWorkspace(torch, resident=r, **common_workspace)

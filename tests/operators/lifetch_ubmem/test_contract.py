@@ -100,6 +100,10 @@ def test_optimization_switches_are_explicit_content_addressed_build_options():
     assert baseline.options("/cann")["UBMEM_BALANCED_INDEX"] == 0
     assert optimized.options("/cann")["UBMEM_PARALLEL_INIT"] == 1
     assert optimized.options("/cann")["UBMEM_BALANCED_INDEX"] == 1
+    assert baseline.options("/cann")["SKIP_INACTIVE"] == 1
+    assert baseline.options("/cann")["COMPACT_RESERVED"] == 0
+    compact = Specialization(16, 131328, 16384, 32, 2624, 32, 8, "Ascend950DT_9582", compact_reserved=True)
+    assert compact.options("/cann")["COMPACT_RESERVED"] == 1
     with pytest.raises(ValueError, match="booleans"):
         Specialization(16, 131328, 16384, 32, 2624, 32, 8, "Ascend950DT_9582", parallel_init=1)
 

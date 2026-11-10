@@ -17,6 +17,7 @@ extern "C" __global__ __aicore__ void v9_li_kernel(GM_ADDR bindings) {
     using Type=QLIType<fp8_e4m3fn_t,fp8_e4m3fn_t,int32_t,true,LI_LAYOUT::BSND,LI_LAYOUT::PA_BSND,
         bfloat16_t,float,float,uint16_t>;
     QLIKernel::QuantLightningIndexerKernel<Type> op;
+    op.queryEnds_=reinterpret_cast<__gm__ rotating::Context*>(a[14])->queryEnds;
     auto shape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(a[14]));
     op.runtimeShape_ = shape;
     QLITilingData tiling{shape.batch,shape.batch*4,shape.indexHeads,4,shape.history,

@@ -37,8 +37,10 @@ def build_failure(log, stage, returncode):
     )
 
 
-def build_libraries(*, cache_dir, cann, headers, soc):
+def build_libraries(*, cache_dir, cann, headers, soc, compact_reserved=False):
     """Build one shape-independent binary per source/toolchain/SoC."""
+    if type(compact_reserved) is not bool:
+        raise ValueError("compact_reserved must be a boolean")
     root = Path(__file__).resolve().parents[3] / "csrc/operators"
     options = dict(
         RUN_MODE="npu",
@@ -46,6 +48,7 @@ def build_libraries(*, cache_dir, cann, headers, soc):
         KVAF_INCLUDE=str(headers),
         SOC_VERSION=soc,
         RESOLVER_COMPARE=0,
+        COMPACT_RESERVED=int(compact_reserved),
     )
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     for relative in (

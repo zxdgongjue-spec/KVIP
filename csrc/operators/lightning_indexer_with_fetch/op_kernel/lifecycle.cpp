@@ -45,6 +45,7 @@ V9_CQ_INLINE CqDrainResult DrainCq(Access& access, uint64_t consumer,
 #include "prefetch.h"
 #include "resolver.h"
 #include "index_cache_update.h"
+#include "../../common/lifetch/reserved_hot.h"
 using namespace AscendC;
 using namespace rotating;
 // Extend fused CQ waits to 10x the native polling budget (not wall-clock time).
@@ -112,7 +113,7 @@ __aicore__ inline void FillRoundWords(uint64_t address,uint32_t words,
     }
     // Caller joins the whole fill group before reusing the shared UB value.
 }
-__aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t b) {
+__aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t b) {
     TPipe pipe;TBuf<TPosition::VECCALC> storage;pipe.InitBuffer(storage,4096*4);
     auto local=storage.Get<uint32_t>();
     Duplicate(local,uint32_t(0),4096);
@@ -148,6 +149,9 @@ __aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uin
         DataCopy(target,local,kLruSlots);
         SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     }
+#if V9_COMPACT_RESERVED
+    RebuildReservedHot(ctx->lruSlots,ctx->reservedHot,ctx->queryEnds,b,rt_resident,kLruSlots,local);
+#endif
     pipe.Destroy();
 }
 #endif
@@ -167,7 +171,7 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
     if ASCEND_IS_AIV {
         uint32_t b=GetBlockIdx(); if(b>=rt_batch) return;
         auto ctx=GetContext(bindings);
-        InitializeRound(rt_batch,rt_history,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b);
+        InitializeRound(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b);
         auto args=GetArgs(ctx,b*2);
         auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
         auto entity=reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(args.channel_entity);
