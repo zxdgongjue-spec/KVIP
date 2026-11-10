@@ -419,6 +419,8 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
         uint32_t slots=state.GetValue(8),requests=state.GetValue(9),pending=state.GetValue(211);
         uint32_t sequence=state.GetValue(246)+1;
         state.SetValue(246,sequence);state.SetValue(214+epoch,sequence);
+        const uint32_t available=PrefetchAllowance(slots,requests,state.GetValue(208),
+            state.GetValue(209),state.GetValue(210),ctx->windowLimit);
         const uint64_t addresses=state64.GetValue(2),output=state64.GetValue(3);
         const uint32_t lower=ctx->lruSlots?0:SIM_RESIDENT;
         uint32_t end[4],first=SIM_HISTORY,last=lower;
@@ -429,7 +431,11 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
             if(lo<first)first=lo;if(end[q]>last)last=end[q];
         }
         V9_FETCH_PROFILE(uint64_t scanBegin=GetSystemCycle();)
-        uint32_t candidateCount=0,stop=last,wordCount=0;
+        // Exhausted budgets cannot recover within this invocation: counters
+        // only increase and limits are fixed. Retain the unscanned cursor;
+        // final TopK repair is independent of this speculative scan position.
+        // Suppression statistics count examined candidates only, not skipped bits.
+        uint32_t candidateCount=0,stop=available?last:0,wordCount=0;
         bool aggregate=first%128==0 && last%128==0;
         for(uint32_t q=0;q<4;++q) {
             uint32_t consumed=state.GetValue(12+q);if(consumed<lower)consumed=lower;
@@ -437,7 +443,7 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
         }
         GlobalTensor<uint8_t> bitmap;
         bitmap.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(ctx->hits)+b*SIM_HISTORY);
-        for(uint32_t base=(first/128)*128;first<last && base<last;) {
+        for(uint32_t base=(first/128)*128;available && first<last && base<last;) {
             if(ctx->lruSlots && base>=kLruSlots && base<SIM_RESIDENT) {base=SIM_RESIDENT;continue;}
             uint32_t span=((last-base+127)/128)*128;
             if(span>kScanTokens)span=kScanTokens;
@@ -512,8 +518,6 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
         uint32_t count=0,missing=0;
         if(candidateCount) {
             auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*SIM_HISTORY;
-            uint32_t available=PrefetchAllowance(slots,requests,state.GetValue(208),
-                state.GetValue(209),state.GetValue(210),ctx->windowLimit);
             if(!slots && !ctx->tailBounds) {
                 // No slot has ever been assigned: the OR bitmap already
                 // deduplicated tokens, so every candidate is a new miss.

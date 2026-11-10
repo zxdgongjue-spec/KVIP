@@ -6,6 +6,13 @@ from pathlib import Path
 from kvip.operators.lifetch.geometry import final_aivs
 
 
+def validate_urma_serial_max_inflight(value, workers):
+    if value is not None and (type(value) is not int or not 0 <= value <= 0xFFFFFFFF):
+        raise ValueError("URMA serial max inflight must be a nonnegative uint32")
+    if value is not None and value != 0 and value < 2 * workers:
+        raise ValueError("Nonzero URMA serial max inflight must be at least twice the worker count")
+
+
 def runtime_worker_config(args, archive, aics):
     """Report explicit CLI overrides separately from serving/backend defaults."""
     if args.transport not in ("ubmem", "urma") or args.mode not in ("serial", "fused"):
@@ -13,11 +20,22 @@ def runtime_worker_config(args, archive, aics):
     override = getattr(args, "serial_workers", None)
     if override is not None and (type(override) is not int or not 1 <= override <= 48):
         raise ValueError("serial_workers must be an integer in 1..48")
+    inflight = getattr(args, "urma_serial_max_inflight", None)
+    if inflight is not None and (args.transport, args.mode) != ("urma", "serial"):
+        raise ValueError("URMA serial max inflight applies only to URMA serial replay")
     if args.mode == "serial":
-        return {
+        config = {
             "runtime_workers": override if override is not None else (32 if args.transport == "ubmem" else 2),
             "runtime_workers_source": "cli" if override is not None else "service_default",
         }
+        if args.transport == "urma":
+            validate_urma_serial_max_inflight(inflight, config["runtime_workers"])
+            config.update(
+                batch_get_max_inflight_total=2048 if inflight is None else inflight,
+                batch_get_max_inflight_total_source="native_default" if inflight is None else "cli",
+                jettys_per_core=2,
+            )
+        return config
     if override is not None:
         raise ValueError("serial_workers applies only to serial replay")
     if args.transport == "ubmem":
@@ -60,4 +78,6 @@ def create_runtime(args, archive, kvaf, torch, device, stream, cann, aics):
         options.update(transport="ubmem", ubmem_page_mode=ddr["page_mode"], ubmem_numa_node=ddr["numa_node"])
     else:
         options["jettys_per_core"] = 2
+        if args.mode == "serial" and getattr(args, "urma_serial_max_inflight", None) is not None:
+            options["batch_get_max_inflight_total"] = config["batch_get_max_inflight_total"]
     return kvaf.NpuRuntime(str(kernels["get"]), ddr["token_bytes"], ddr["tokens_per_block"], **options)

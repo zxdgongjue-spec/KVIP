@@ -741,6 +741,8 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         uint32_t slots=state.GetValue(8),requests=state.GetValue(9),pending=state.GetValue(211);
         uint32_t sequence=state.GetValue(246)+1;
         state.SetValue(246,sequence);state.SetValue(214+epoch,sequence);
+        const uint32_t available=PrefetchAllowance(slots,requests,state.GetValue(208),
+            state.GetValue(209),state.GetValue(210),ctx->windowLimit);
         const uint64_t entityAddress=state64.GetValue(0),queueAddress=state64.GetValue(1);
         const uint64_t addresses=state64.GetValue(2),output=state64.GetValue(3);
         const uint32_t lower=ctx->lruSlots?0:rt_resident;
@@ -752,7 +754,11 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
             if(lo<first)first=lo;if(end[q]>last)last=end[q];
         }
         V9_FETCH_PROFILE(uint64_t scanBegin=GetSystemCycle();)
-        uint32_t candidateCount=0,stop=last,wordCount=0;
+        // Exhausted budgets cannot recover within this invocation: counters
+        // only increase and limits are fixed. Retain the unscanned cursor;
+        // final TopK repair is independent of this speculative scan position.
+        // Suppression statistics count examined candidates only, not skipped bits.
+        uint32_t candidateCount=0,stop=available?last:0,wordCount=0;
         bool aggregate=first%128==0 && last%128==0;
         for(uint32_t q=0;q<4;++q) {
             uint32_t consumed=state.GetValue(12+q);if(consumed<lower)consumed=lower;
@@ -760,7 +766,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         }
         GlobalTensor<uint8_t> bitmap;
         bitmap.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(ctx->hits)+b*rt_history);
-        for(uint32_t base=(first/128)*128;first<last && base<last;) {
+        for(uint32_t base=(first/128)*128;available && first<last && base<last;) {
             // Compact victim coordinates occupy [0,2048); the remaining
             // hot bitmap is not written or read. Cold coordinates are unchanged.
             if(ctx->lruSlots && base>=kLruSlots && base<rt_resident) {
@@ -839,8 +845,6 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         uint32_t count=0,missing=0;
         if(candidateCount) {
             auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;
-            uint32_t available=PrefetchAllowance(slots,requests,state.GetValue(208),
-                state.GetValue(209),state.GetValue(210),ctx->windowLimit);
             if(!slots && !ctx->tailBounds) {
                 // No slot has ever been assigned: the OR bitmap already
                 // deduplicated tokens, so every candidate is a new miss.

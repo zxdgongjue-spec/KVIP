@@ -7,6 +7,7 @@ diagnosis, and retain the uninstrumented production graph as the total baseline.
 """
 
 import ctypes
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -124,27 +125,42 @@ def _check_geometry(geometry, aics):
         raise ValueError("Captured fusion scheduling differs from this replay implementation")
 
 
+def validate_fused_tuning(overrides, transport):
+    """Reject options that the selected backend cannot actually apply."""
+    if transport not in ("ubmem", "urma") or not isinstance(overrides, dict):
+        raise ValueError("Fusion tuning requires a JSON object and ubmem/urma transport")
+    booleans = {"compact_reserved"}
+    if transport == "ubmem":
+        booleans |= {"parallel_init", "balanced_index", "skip_inactive", "grouped_copy"}
+    integers = {"prefetch_limit", "window_limit"}
+    unknown = set(overrides) - booleans - integers
+    if unknown:
+        raise ValueError(f"Unsupported {transport} fusion tuning options: {sorted(unknown)}")
+    if any(type(overrides[name]) is not bool for name in booleans & overrides.keys()):
+        raise ValueError("Fusion optimization switches must be booleans")
+    if any(type(overrides[name]) is not int for name in integers & overrides.keys()):
+        raise ValueError("Fusion prefetch budgets must be integers")
+    prefetch_budget(overrides.get("prefetch_limit", 512), overrides.get("window_limit", 64), 1)
+    return dict(overrides)
+
+
+def parse_fused_tuning(value, transport):
+    return validate_fused_tuning(json.loads(value), transport)
+
+
 def fusion_tuning(geometry, transport, overrides=None):
-    """Resolve opt-in UBmem experiments without mutating the captured geometry."""
+    """Resolve opt-in experiments without mutating the captured geometry."""
     values = dict(
-        parallel_init=False,
-        balanced_index=False,
-        skip_inactive=False,
         compact_reserved=False,
         prefetch_limit=geometry["prefetch_limit"],
         window_limit=geometry["window_limit"],
     )
-    if overrides:
-        if transport != "ubmem" or set(overrides) - set(values):
-            raise ValueError("Fusion tuning only accepts known UBmem options")
-        values.update(overrides)
-    if any(
-        type(values[name]) is not bool
-        for name in ("parallel_init", "balanced_index", "skip_inactive", "compact_reserved")
-    ):
-        raise ValueError("UBmem optimization switches must be booleans")
-    if any(type(values[name]) is not int for name in ("prefetch_limit", "window_limit")):
-        raise ValueError("UBmem prefetch budgets must be integers")
+    if transport == "ubmem":
+        values.update(parallel_init=False, balanced_index=False, skip_inactive=False, grouped_copy=False)
+    values.update(validate_fused_tuning({} if overrides is None else overrides, transport))
+    if transport == "urma":
+        # The URMA LI has an unconditional inactive-row gate, not a build knob.
+        values["skip_inactive"] = True
     prefetch_budget(values["prefetch_limit"], values["window_limit"], geometry["requested_windows"])
     return values
 
@@ -210,6 +226,7 @@ def create_fused(
             balanced_index=effective["balanced_index"],
             skip_inactive=effective["skip_inactive"],
             compact_reserved=effective["compact_reserved"],
+            grouped_copy=effective["grouped_copy"],
         )
         library = build_specialization(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape)
         workspace = UbmemWorkspace(torch, resident=r, **common_workspace)
@@ -227,7 +244,9 @@ def create_fused(
         # Reuse install_kvip.sh's shape-independent build cache. Its hash also
         # includes the selected KVAF headers/toolchain, so bundles stay isolated.
         cache = Path(__file__).resolve().parents[3] / "build/lifetch"
-        library, update_library = build_libraries(cache_dir=cache, cann=cann, headers=headers, soc=soc)
+        library, update_library = build_libraries(
+            cache_dir=cache, cann=cann, headers=headers, soc=soc, compact_reserved=effective["compact_reserved"]
+        )
         workspace = LIFetchWorkspace(torch, **common_workspace)
     storage = IndexCacheStorage(torch, geometry["owners"], h, r, device)
     output = archive.tensor("pre.output", torch, device)

@@ -43,8 +43,8 @@ with tempfile.TemporaryDirectory(prefix="kvip-ubmem-model-") as directory:
     )
     subprocess.run([str(init_binary)], check=True)
     for batch in (1, 2):
-        for width in (656, 2624):
-            definitions = common | {"SIM_BATCH": batch, "TOKEN_BYTES": width}
+        for width, grouped in ((656, 0), (2624, 0), (2624, 1)):
+            definitions = common | {"SIM_BATCH": batch, "TOKEN_BYTES": width, "V9_UBMEM_GROUPED_COPY": grouped}
             options = [
                 compiler,
                 "-std=c++17",
@@ -59,7 +59,7 @@ with tempfile.TemporaryDirectory(prefix="kvip-ubmem-model-") as directory:
                 ("copy", [root / "tests/copy_model.cpp"]),
                 ("abi", [root / "tests/abi_test.cpp", root / "op_host/launch.cpp"]),
             ):
-                binary = Path(directory) / f"{name}-{batch}-{width}"
+                binary = Path(directory) / f"{name}-{batch}-{width}-{grouped}"
                 subprocess.run([*options, *map(str, sources), "-o", str(binary)], check=True)
                 subprocess.run([str(binary)], check=True)
     # The opted-in B16 launch uses all 64 AIVs; verify the exported stage
@@ -69,6 +69,7 @@ with tempfile.TemporaryDirectory(prefix="kvip-ubmem-model-") as directory:
         "TOKEN_BYTES": 2624,
         "V9_UBMEM_PARALLEL_INIT": 1,
         "V9_UBMEM_BALANCED_INDEX": 1,
+        "V9_UBMEM_GROUPED_COPY": 1,
     }
     binary = Path(directory) / "abi-optimized-b16"
     subprocess.run(
@@ -88,4 +89,4 @@ with tempfile.TemporaryDirectory(prefix="kvip-ubmem-model-") as directory:
         check=True,
     )
     subprocess.run([str(binary)], check=True)
-print("Init partition model and ABI/copy-header models passed all B1/B2 × 656/2624 specializations")
+print("Init and ABI/copy models passed B1/B2 × 656/2624, including paired 2624 DMA/event checks")

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from kvip.diagnostics.compare import CASES, command, summarize
+from kvip.diagnostics.compare import CASES, arguments, case_plan, command, display, summarize
 from kvip.diagnostics.replay_measure import fused_reads, statistics
 
 
@@ -34,7 +34,13 @@ def results():
 
 def test_comparison_uses_fixed_archive_and_reports_fusion_reduction():
     value = summarize(results())
-    assert value["fusion_vs_serial"]["ubmem"] == dict(serial_over_fused=2.0, latency_reduction_percent=50.0)
+    assert value["fusion_vs_serial"]["ubmem"] == dict(
+        serial_case="ubmem-serial",
+        serial_over_fused=2.0,
+        latency_reduction_percent=50.0,
+        target_fused_us=130.0,
+        target_met=True,
+    )
     assert value["table"]["urma-fused"]["mean_read_bytes"] == 26240
 
 
@@ -95,6 +101,130 @@ def test_command_never_loads_two_transports_in_one_process(tmp_path):
         assert ("--kvaf-server" in argv) == (transport == "urma")
         assert ("--serial-workers" in argv) == (mode == "serial")
         assert output.name == f"{transport}-{mode}.json"
+
+
+def cli(tmp_path):
+    return [
+        "--snapshot",
+        "/snapshot",
+        "--ubmem-build-dir",
+        "/ubmem",
+        "--urma-build-dir",
+        "/urma",
+        "--kvaf-server",
+        "127.0.0.1:28880",
+        "--soc",
+        "soc",
+        "--result-dir",
+        str(tmp_path / "results"),
+    ]
+
+
+def test_compare_five_cases_preserve_candidates_and_forward_only_backend_tuning(tmp_path):
+    args = arguments(
+        cli(tmp_path)
+        + [
+            "--urma-serial-workers-candidates",
+            "2",
+            "8",
+            "--ubmem-fused-tuning",
+            '{"grouped_copy":true,"balanced_index":true}',
+            "--urma-fused-tuning",
+            '{"compact_reserved":true,"prefetch_limit":256,"window_limit":32}',
+        ]
+    )
+    plan = list(case_plan(args))
+    assert len(plan) == 5
+    assert plan[1:3] == [("urma", "serial", 2), ("urma", "serial", 8)]
+    outputs = []
+    for transport, mode, workers in plan:
+        argv, output = command(args, transport, mode, workers)
+        outputs.append(output.name)
+        if mode == "fused":
+            import json
+
+            assert json.loads(argv[argv.index("--fused-tuning") + 1]) == getattr(args, transport + "_fused_tuning")
+        else:
+            assert "--fused-tuning" not in argv
+            assert int(argv[argv.index("--serial-workers") + 1]) == (workers or 32)
+    assert outputs[1:3] == ["urma-serial-workers2.json", "urma-serial-workers8.json"]
+    assert len(list(case_plan(arguments(cli(tmp_path))))) == 4
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--urma-serial-workers-candidates", "2", "2"],
+        ["--urma-serial-workers-candidates", "2", "49"],
+        ["--urma-serial-workers-candidates", "2", "8", "16"],
+        ["--urma-serial-workers", "2", "--urma-serial-workers-candidates", "2", "8"],
+        ["--urma-fused-tuning", '{"grouped_copy":true}'],
+        ["--ubmem-fused-tuning", "[]"],
+    ],
+)
+def test_compare_rejects_unsupported_or_ambiguous_configuration(tmp_path, extra):
+    with pytest.raises(SystemExit):
+        arguments(cli(tmp_path) + extra)
+
+
+def test_fastest_correct_serial_sets_a_stricter_target_and_wall_never_enters_ratio(capsys):
+    entries = results()
+    baseline = entries.pop("urma-serial")
+    entries["urma-serial-workers2"] = baseline
+    entries["urma-serial-workers8"] = dict(baseline, runtime_workers=8, timing=dict(mean_us=140.0, p50_us=145.0))
+    for result in entries.values():
+        result["candidate_call"] = dict(wall=dict(mean_us=1.0))
+    report = summarize(entries)
+    assert report["status"] == "pass"  # Numerical correctness never implies the performance goal.
+    assert report["fusion_vs_serial"]["urma"]["serial_case"] == "urma-serial-workers8"
+    assert report["fusion_vs_serial"]["urma"]["target_fused_us"] == 91
+    assert report["fusion_vs_serial"]["urma"]["target_met"] is False
+    assert report["performance_target"]["target_met"] is False
+    assert report["urma_serial_selection"]["improvement_over_first_percent"] == pytest.approx(30)
+    assert set(report["table"]) == set(entries)
+    display(report)
+    assert "NOT MET" in capsys.readouterr().out
+    entries["urma-serial-workers8"]["status"] = "failed"
+    with pytest.raises(ValueError, match="did not pass"):
+        summarize(entries)
+
+
+@pytest.mark.parametrize("fused,met", [(130.0, True), (130.001, False), (200 / 1.5, False)])
+def test_both_performance_targets_apply_to_device_mean(fused, met):
+    entries = results()
+    entries["ubmem-fused"]["timing"] = dict(mean_us=fused, p50_us=1.0)
+    assert summarize(entries)["fusion_vs_serial"]["ubmem"]["target_met"] is met
+
+
+def test_urma_serial_inflight_is_forwarded_and_reported_without_touching_other_paths(tmp_path, capsys):
+    args = arguments(cli(tmp_path) + ["--urma-serial-workers", "32", "--urma-serial-max-inflight", "0"])
+    for transport, mode, workers in case_plan(args):
+        argv, _ = command(args, transport, mode, workers)
+        if (transport, mode) == ("urma", "serial"):
+            assert argv[argv.index("--urma-serial-max-inflight") + 1] == "0"
+        else:
+            assert "--urma-serial-max-inflight" not in argv
+    entries = results()
+    entries["urma-serial"].update(
+        batch_get_max_inflight_total=0, batch_get_max_inflight_total_source="cli", jettys_per_core=2
+    )
+    summary = summarize(entries)
+    assert summary["table"]["urma-serial"]["serial_get_config"] == dict(
+        batch_get_max_inflight_total=0,
+        batch_get_max_inflight_total_source="cli",
+        jettys_per_core=2,
+    )
+    display(summary)
+    assert '"batch_get_max_inflight_total": 0' in capsys.readouterr().out
+    assert arguments(cli(tmp_path)).urma_serial_max_inflight is None
+    for extra in (
+        ["--urma-serial-max-inflight", "-1"],
+        ["--urma-serial-max-inflight", str(1 << 32)],
+        ["--urma-serial-workers", "32", "--urma-serial-max-inflight", "63"],
+        ["--urma-serial-workers-candidates", "16", "32", "--urma-serial-max-inflight", "32"],
+    ):
+        with pytest.raises(SystemExit):
+            arguments(cli(tmp_path) + extra)
 
 
 @pytest.mark.parametrize("samples", [[], [0], [-1], [float("nan")], [float("inf")], [[1]]])

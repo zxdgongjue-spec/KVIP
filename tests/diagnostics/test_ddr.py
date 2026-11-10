@@ -339,11 +339,12 @@ class ReplayRuntimeTest(unittest.TestCase):
         self.calls = []
         self.sdk = SimpleNamespace(NpuRuntime=lambda *args, **kwargs: self.calls.append((args, kwargs)) or object())
 
-    def args(self, transport="urma", mode="serial", serial_workers=None):
+    def args(self, transport="urma", mode="serial", serial_workers=None, urma_serial_max_inflight=None):
         return SimpleNamespace(
             transport=transport,
             mode=mode,
             serial_workers=serial_workers,
+            urma_serial_max_inflight=urma_serial_max_inflight,
             build_dir=self.build,
             device=0,
             kvaf_server="127.0.0.1:28999",
@@ -360,7 +361,10 @@ class ReplayRuntimeTest(unittest.TestCase):
                 config = runtime_worker_config(self.args(transport, mode), self.archive, 32)
                 self.assertEqual(config["runtime_workers"], expected)
         config = runtime_worker_config(self.args(serial_workers=8), self.archive, 32)
-        self.assertEqual(config, {"runtime_workers": 8, "runtime_workers_source": "cli"})
+        self.assertEqual(config["runtime_workers"], 8)
+        self.assertEqual(config["runtime_workers_source"], "cli")
+        self.assertEqual(config["batch_get_max_inflight_total"], 2048)
+        self.assertEqual(config["batch_get_max_inflight_total_source"], "native_default")
         self.archive.manifest["geometry"]["batch"] = 1
         self.assertEqual(runtime_worker_config(self.args(mode="fused"), self.archive, 32)["runtime_workers"], 3)
         self.archive.manifest["geometry"]["batch"] = 16
@@ -376,6 +380,68 @@ class ReplayRuntimeTest(unittest.TestCase):
         self.assertEqual(options["jettys_per_core"], 2)
         self.assertNotIn("transport", options)
         self.assertNotIn("ubmem_page_mode", options)
+        self.assertNotIn("batch_get_max_inflight_total", options)
+
+    def test_urma_inflight_uses_exact_native_constructor_keyword_and_preserves_zero(self):
+        # Match the existing pybind keyword, type and default; no **kwargs that
+        # could accidentally accept a misspelled option or UBmem-only argument.
+        calls = []
+
+        def native(
+            get_path,
+            token_bytes,
+            tokens_per_block,
+            *,
+            device_id=0,
+            npu_core_count=2,
+            batch_put_kernel_object_path="",
+            jettys_per_core=2,
+            batch_get_max_inflight_total=2048,
+        ):
+            calls.append((npu_core_count, jettys_per_core, batch_get_max_inflight_total))
+            return object()
+
+        sdk = SimpleNamespace(NpuRuntime=native)
+        for value, expected in ((None, 2048), (0, 0), (4096, 4096)):
+            with self.subTest(value=value):
+                args = self.args(serial_workers=32, urma_serial_max_inflight=value)
+                create_runtime(args, self.archive, sdk, None, None, None, None, 32)
+                self.assertEqual(calls[-1], (32, 2, expected))
+                report = runtime_worker_config(args, self.archive, 32)
+                self.assertEqual(report["batch_get_max_inflight_total"], expected)
+                self.assertEqual(
+                    report["batch_get_max_inflight_total_source"], "native_default" if value is None else "cli"
+                )
+
+    def test_inflight_override_rejects_wrong_modes_and_invalid_native_ranges(self):
+        for transport, mode in (("urma", "fused"), ("ubmem", "serial"), ("ubmem", "fused")):
+            with self.subTest(transport=transport, mode=mode):
+                with self.assertRaisesRegex(ValueError, "only to URMA serial"):
+                    create_runtime(
+                        self.args(transport, mode, urma_serial_max_inflight=0),
+                        self.archive,
+                        self.sdk,
+                        None,
+                        None,
+                        None,
+                        None,
+                        32,
+                    )
+                config = runtime_worker_config(self.args(transport, mode), self.archive, 32)
+                self.assertNotIn("batch_get_max_inflight_total", config)
+        for value in (-1, True, 1.5, 1 << 32, 63):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                create_runtime(
+                    self.args(serial_workers=32, urma_serial_max_inflight=value),
+                    self.archive,
+                    self.sdk,
+                    None,
+                    None,
+                    None,
+                    None,
+                    32,
+                )
+        self.assertEqual(self.calls, [])
 
     def test_ubmem_keeps_snapshot_page_policy(self):
         create_runtime(self.args("ubmem", "fused"), self.archive, self.sdk, None, None, None, None, 32)

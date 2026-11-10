@@ -20,7 +20,7 @@ extern "C" uint32_t kvip_ubmem_update_plan(void* update,void* stream) {
 }
 extern "C" uint32_t kvip_ubmem_update_outputs(void* update,void* stream) {
     if(!update || !stream)return 100000;
-    return aclrtlaunch_kvip_ubmem_direct_update_outputs_kernel(SIM_BATCH,stream,update);
+    return aclrtlaunch_kvip_ubmem_direct_update_outputs_kernel(rotating::kOutputCores,stream,update);
 }
 extern "C" uint32_t kvip_ubmem_update_apply(void* update,void* stream) {
     if(!update || !stream)return 100000;
@@ -62,6 +62,7 @@ VALUE(v9_init_cores,rotating::kInitCores)
 VALUE(v9_balanced_index,V9_UBMEM_BALANCED_INDEX)
 VALUE(v9_skip_inactive,V9_SKIP_INACTIVE)
 VALUE(v9_compact_reserved,V9_COMPACT_RESERVED)
+VALUE(v9_grouped_copy,V9_UBMEM_GROUPED_COPY)
 VALUE(v9_li_cores,rotating::kLiCores)
 VALUE(v9_launch_cores,rotating::kLaunchCores)
 VALUE(v9_rounds,rotating::kRounds)
@@ -74,10 +75,10 @@ VALUE(v9_final_replicated,1)
 VALUE(v9_simulation,0)
 VALUE(v9_transport_backend,1)
 VALUE(v9_fused_lifecycle,0)
-VALUE(v9_ubpipe_depth,8)
-VALUE(v9_ubpipe_rows,TOKEN_BYTES==656?4:1)
-VALUE(v9_window_ubpipe_rows,TOKEN_BYTES==656?8:1)
-VALUE(v9_window_ubpipe_depth,8)
+VALUE(v9_ubpipe_depth,V9_UBMEM_GROUPED_COPY?4:8)
+VALUE(v9_ubpipe_rows,TOKEN_BYTES==656?4:(V9_UBMEM_GROUPED_COPY?2:1))
+VALUE(v9_window_ubpipe_rows,TOKEN_BYTES==656?8:(V9_UBMEM_GROUPED_COPY?2:1))
+VALUE(v9_window_ubpipe_depth,V9_UBMEM_GROUPED_COPY?4:8)
 extern "C" uint32_t v9_window_trigger_tile(uint32_t epoch) {
     return epoch<rotating::kRounds?rotating::Trigger(epoch):0;
 }

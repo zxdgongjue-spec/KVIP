@@ -25,13 +25,13 @@ int main() {
     void* pointer=reinterpret_cast<void*>(1);
     assert(kvip_ubmem_forward(pointer,pointer,pointer)==0);
     assert((calls==std::vector<unsigned>{1,2,3,4,5,6,7}));
-    assert((blocks==std::vector<unsigned>{kInitCores,kLaunchCores,kFinalCores,SIM_BATCH,SIM_BATCH,SIM_BATCH,SIM_BATCH*4}));
+    assert((blocks==std::vector<unsigned>{kInitCores,kLaunchCores,kFinalCores,SIM_BATCH,SIM_BATCH,kOutputCores,SIM_BATCH*4}));
     calls.clear();blocks.clear();
     assert(kvip_ubmem_update_plan(pointer,pointer)==0);
     assert(kvip_ubmem_update_outputs(pointer,pointer)==0);
     assert(kvip_ubmem_update_apply(pointer,pointer)==0);
     assert((calls==std::vector<unsigned>{5,6,7}));
-    assert((blocks==std::vector<unsigned>{SIM_BATCH,SIM_BATCH,SIM_BATCH*4}));
+    assert((blocks==std::vector<unsigned>{SIM_BATCH,kOutputCores,SIM_BATCH*4}));
     calls.clear();fail=4;
     assert(kvip_ubmem_forward(pointer,pointer,pointer)==71);
     assert((calls==std::vector<unsigned>{1,2,3,4}));

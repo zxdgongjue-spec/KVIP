@@ -35,6 +35,12 @@ def arguments(argv=None):
     parser.add_argument("--kvaf-server", help="Dedicated local CPU service, required for URMA replay")
     parser.add_argument("--serial-workers", type=int, help="Serial Get workers: service defaults UBmem=32, URMA=2")
     parser.add_argument(
+        "--urma-serial-max-inflight",
+        type=int,
+        help="URMA serial total inflight bound: 0 submits whole core slices; omitted keeps native default 2048",
+    )
+    parser.add_argument("--fused-tuning", help="JSON object of supported options for one fused replay")
+    parser.add_argument(
         "--ubmem-ablation",
         action="store_true",
         help="Three UBmem fused cases, sharing one restored DDR arena: baseline, optimized, half-prefetch",
@@ -74,6 +80,15 @@ def arguments(argv=None):
         parser.error("device/warmup must be nonnegative and iterations positive")
     if args.stage_iterations < 0:
         parser.error("stage-iterations must be nonnegative")
+    if args.fused_tuning is not None:
+        if args.inspect or args.mode != "fused" or args.ubmem_ablation or args.service_ablation:
+            parser.error("--fused-tuning requires one fused device replay, without an ablation matrix")
+        from kvip.diagnostics.fused_replay import parse_fused_tuning
+
+        try:
+            args.fused_tuning = parse_fused_tuning(args.fused_tuning, args.transport)
+        except ValueError as error:
+            parser.error(str(error))
     if args.measure_call_preparation and (args.inspect or args.mode != "fused"):
         parser.error("--measure-call-preparation requires fused device replay")
     if (args.ubmem_ablation or args.service_ablation or args.split_index_stages) and (
@@ -88,6 +103,15 @@ def arguments(argv=None):
         parser.error("--active-batches requires --service-ablation")
     if args.serial_workers is not None and (args.mode != "serial" or not 1 <= args.serial_workers <= 48):
         parser.error("serial-workers requires serial mode and a value in 1..48")
+    if args.urma_serial_max_inflight is not None:
+        if args.inspect or (args.transport, args.mode) != ("urma", "serial"):
+            parser.error("--urma-serial-max-inflight requires URMA serial device replay")
+        from kvip.diagnostics.replay_runtime import validate_urma_serial_max_inflight
+
+        try:
+            validate_urma_serial_max_inflight(args.urma_serial_max_inflight, args.serial_workers or 2)
+        except ValueError as error:
+            parser.error(str(error))
     if not args.inspect and ((args.transport == "urma") != bool(args.kvaf_server)):
         parser.error("--kvaf-server is required only for URMA replay")
     if not args.inspect and (args.build_dir is None or not args.soc):

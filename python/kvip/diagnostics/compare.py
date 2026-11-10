@@ -25,13 +25,50 @@ def arguments(argv=None):
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--stage-iterations", type=int, default=3)
     parser.add_argument("--ubmem-serial-workers", type=int, default=32)
-    parser.add_argument("--urma-serial-workers", type=int, default=2)
-    parser.add_argument("--result-dir", required=True, type=Path, help="New directory; four cases and one summary JSON")
+    parser.add_argument(
+        "--urma-serial-max-inflight",
+        type=int,
+        help="Forward only to URMA serial: 0 submits whole core slices; omitted keeps native default 2048",
+    )
+    serial = parser.add_mutually_exclusive_group()
+    serial.add_argument("--urma-serial-workers", type=int, help="URMA serial Get workers (default: 2)")
+    serial.add_argument(
+        "--urma-serial-workers-candidates",
+        type=int,
+        nargs=2,
+        metavar=("BASE", "CANDIDATE"),
+        help="Measure both URMA serial worker counts and use the fastest validated device mean as baseline",
+    )
+    parser.add_argument("--ubmem-fused-tuning", help="JSON options passed only to UBmem fused replay")
+    parser.add_argument("--urma-fused-tuning", help="JSON options passed only to URMA fused replay")
+    parser.add_argument("--result-dir", required=True, type=Path, help="New directory; all cases and one summary JSON")
     args = parser.parse_args(argv)
+    if args.urma_serial_workers is None:
+        args.urma_serial_workers = 2
     if args.device < 0 or args.warmup < 0 or args.iterations < 1 or args.stage_iterations < 0:
         parser.error("Invalid device/warmup/iterations/stage-iterations")
     if any(not 1 <= n <= 48 for n in (args.ubmem_serial_workers, args.urma_serial_workers)):
         parser.error("Serial worker counts must be 1..48")
+    candidates = args.urma_serial_workers_candidates
+    if candidates is not None and (len(set(candidates)) != 2 or any(not 1 <= n <= 48 for n in candidates)):
+        parser.error("URMA serial candidates must be two distinct worker counts in 1..48")
+    from kvip.diagnostics.replay_runtime import validate_urma_serial_max_inflight
+
+    try:
+        for workers in candidates or (args.urma_serial_workers,):
+            validate_urma_serial_max_inflight(args.urma_serial_max_inflight, workers)
+    except ValueError as error:
+        parser.error(str(error))
+    from kvip.diagnostics.fused_replay import parse_fused_tuning
+
+    for transport in ("ubmem", "urma"):
+        name = transport + "_fused_tuning"
+        value = getattr(args, name)
+        if value is not None:
+            try:
+                setattr(args, name, parse_fused_tuning(value, transport))
+            except ValueError as error:
+                parser.error(str(error))
     if args.result_dir.exists():
         parser.error("--result-dir already exists; choose a new directory")
     if args.ubmem_build_dir.resolve() == args.urma_build_dir.resolve():
@@ -39,9 +76,25 @@ def arguments(argv=None):
     return args
 
 
-def command(args, transport, mode):
+def case_plan(args):
+    """Keep the default four cases; a two-point URMA sweep adds just one run."""
+    for transport, mode in CASES:
+        candidates = getattr(args, "urma_serial_workers_candidates", None)
+        if (transport, mode) == ("urma", "serial") and candidates:
+            for workers in candidates:
+                yield transport, mode, workers
+        else:
+            yield transport, mode, None
+
+
+def command(args, transport, mode, serial_workers=None):
     build = getattr(args, transport + "_build_dir")
-    result = args.result_dir / f"{transport}-{mode}.json"
+    name = f"{transport}-{mode}"
+    if serial_workers is not None:
+        if (transport, mode) != ("urma", "serial"):
+            raise ValueError("Worker candidates apply only to URMA serial replay")
+        name += f"-workers{serial_workers}"
+    result = args.result_dir / f"{name}.json"
     values = [
         sys.executable,
         "-B",
@@ -71,12 +124,24 @@ def command(args, transport, mode):
     if transport == "urma":
         values += ["--kvaf-server", args.kvaf_server]
     if mode == "serial":
-        values += ["--serial-workers", str(getattr(args, transport + "_serial_workers"))]
+        workers = serial_workers if serial_workers is not None else getattr(args, transport + "_serial_workers")
+        values += ["--serial-workers", str(workers)]
+        inflight = getattr(args, "urma_serial_max_inflight", None)
+        if transport == "urma" and inflight is not None:
+            values += ["--urma-serial-max-inflight", str(inflight)]
+    else:
+        tuning = getattr(args, transport + "_fused_tuning", None)
+        if tuning is not None:
+            values += ["--fused-tuning", json.dumps(tuning, sort_keys=True)]
     return values, result
 
 
 def summarize(results):
-    if set(results) != {f"{transport}-{mode}" for transport, mode in CASES}:
+    required = {"ubmem-serial", "ubmem-fused", "urma-fused"}
+    serial_cases = [
+        name for name, result in results.items() if (result.get("transport"), result.get("mode")) == ("urma", "serial")
+    ]
+    if not required.issubset(results) or not serial_cases or set(results) != required | set(serial_cases):
         raise ValueError("All four cases are required")
     first = results["ubmem-serial"]
     for name, result in results.items():
@@ -85,7 +150,9 @@ def summarize(results):
         for key in ("snapshot_sha256", "geometry", "scope", "soc", "device", "kvip_commit"):
             if result.get(key) != first.get(key) or key not in result:
                 raise ValueError(f"Incomparable {key}: {name}")
-        if name != f"{result['transport']}-{result['mode']}":
+        identity = f"{result['transport']}-{result['mode']}"
+        candidate = f"urma-serial-workers{result['runtime_workers']}"
+        if name != identity and not (identity == "urma-serial" and name == candidate):
             raise ValueError("Case identity mismatch")
     table = {}
     for name, result in results.items():
@@ -97,6 +164,12 @@ def summarize(results):
             p50_us=timing["p50_us"],
             mean_read_bytes=float(np.mean([x["bytes"] for x in result["reads_samples"]])),
             runtime_workers=result["runtime_workers"],
+            tuning=result.get("tuning"),
+            serial_get_config={
+                key: result[key]
+                for key in ("batch_get_max_inflight_total", "batch_get_max_inflight_total_source", "jettys_per_core")
+                if key in result
+            },
             selection=result.get("selection_comparison"),
             reads_per_round={
                 key: float(np.mean([row[key] for row in result["reads_samples"]]))
@@ -105,12 +178,22 @@ def summarize(results):
             },
         )
     ratios = {}
+    selected_urma = min(serial_cases, key=lambda name: table[name]["mean_us"])
     for transport in ("ubmem", "urma"):
-        serial, fused = (table[f"{transport}-{mode}"]["mean_us"] for mode in ("serial", "fused"))
-        ratios[transport] = dict(serial_over_fused=serial / fused, latency_reduction_percent=(1 - fused / serial) * 100)
+        serial_case = "ubmem-serial" if transport == "ubmem" else selected_urma
+        serial, fused = table[serial_case]["mean_us"], table[f"{transport}-fused"]["mean_us"]
+        target = min(serial * 0.65, serial / 1.5)
+        ratios[transport] = dict(
+            serial_case=serial_case,
+            serial_over_fused=serial / fused,
+            latency_reduction_percent=(1 - fused / serial) * 100,
+            target_fused_us=target,
+            target_met=fused <= serial * 0.65 and fused <= serial / 1.5,
+        )
     selection_pairs = {}
     for mode in ("serial", "fused"):
-        selections = [table[f"{transport}-{mode}"]["selection"] for transport in ("ubmem", "urma")]
+        names = ("ubmem-serial", selected_urma) if mode == "serial" else ("ubmem-fused", "urma-fused")
+        selections = [table[name]["selection"] for name in names]
         if all(value is not None for value in selections):
             selection_pairs[mode] = selections[0]["selected_set_sha256"] == selections[1]["selected_set_sha256"]
     return dict(
@@ -120,6 +203,19 @@ def summarize(results):
         scope=first["scope"],
         table=table,
         fusion_vs_serial=ratios,
+        performance_target=dict(
+            metric="timing.mean_us",
+            minimum_latency_reduction_percent=35.0,
+            minimum_speedup=1.5,
+            target_met=all(value["target_met"] for value in ratios.values()),
+        ),
+        urma_serial_selection=dict(
+            candidates=serial_cases,
+            selected=selected_urma,
+            criterion="lowest validated device graph timing.mean_us among measured candidates",
+            improvement_over_first_percent=(1 - table[selected_urma]["mean_us"] / table[serial_cases[0]]["mean_us"])
+            * 100,
+        ),
         same_selection_across_transports=selection_pairs,
         stage_diagnostics={name: result.get("stage_diagnostics") for name, result in results.items()},
         notes=[
@@ -128,20 +224,23 @@ def summarize(results):
             "Serial uses native CANN LI plus production LIDU/Get; fused uses its own LI and Index update.",
             "TopK ID sets may differ only at a verified BF16 boundary tie; read bytes reflect each path's actual selection.",
             "The snapshot fixes inputs and pre-state, not speculative prefetch scheduling or physical pages.",
+            "Correctness PASS is separate from performance target_met; candidate_call and stage timings never enter the target.",
         ],
     )
 
 
 def display(summary):
     print("\ncase          mean_us     p50_us   read_MiB/round   Get_workers")
-    for transport, mode in CASES:
-        name = f"{transport}-{mode}"
-        row = summary["table"][name]
+    for name, row in summary["table"].items():
         print(
             f"{name:13s} {row['mean_us']:10.3f} {row['p50_us']:10.3f} "
             f"{row['mean_read_bytes'] / (1 << 20):16.3f} {row['runtime_workers']:13d}"
         )
         print("  reads/round: " + ", ".join(f"{key}={value:.1f}" for key, value in row["reads_per_round"].items()))
+        if row["tuning"] is not None:
+            print("  effective tuning: " + json.dumps(row["tuning"], sort_keys=True))
+        if row["serial_get_config"]:
+            print("  serial Get config: " + json.dumps(row["serial_get_config"], sort_keys=True))
         selection = row["selection"]
         if selection is not None:
             print(
@@ -149,11 +248,18 @@ def display(summary):
                 f"replacements={selection['total_replacements']}; "
                 f"min_overlap={selection['min_overlap_fraction']:.6f}"
             )
+    selection = summary["urma_serial_selection"]
+    print(
+        f"URMA serial baseline: {selection['selected']}; "
+        f"improvement over first measured candidate={selection['improvement_over_first_percent']:.2f}%"
+    )
     for transport, values in summary["fusion_vs_serial"].items():
         print(
             f"{transport}: serial/fused={values['serial_over_fused']:.3f}x; "
-            f"latency reduction={values['latency_reduction_percent']:.2f}%"
+            f"latency reduction={values['latency_reduction_percent']:.2f}%; "
+            f"target <= {values['target_fused_us']:.3f} us: {'MET' if values['target_met'] else 'NOT MET'}"
         )
+    print("Targets use device graph mean only; require both >=35% reduction and >=1.5x speedup.")
     for mode, same in summary["same_selection_across_transports"].items():
         print(f"{mode}: UBmem/URMA selected ID sets identical={same}")
         if not same:
@@ -172,10 +278,10 @@ def main():
     args = arguments()
     args.result_dir.mkdir(parents=True)
     results = {}
-    for transport, mode in CASES:
-        name = f"{transport}-{mode}"
+    for transport, mode, workers in case_plan(args):
+        argv, result_file = command(args, transport, mode, workers)
+        name = result_file.stem
         print(f"[snapshot-compare] {name}: restore real DDR/pre-state, then measure", flush=True)
-        argv, result_file = command(args, transport, mode)
         # Keep successful native setup chatter out of the terminal. The temporary
         # spool is removed immediately, not retained as another benchmark log.
         with tempfile.TemporaryFile(mode="w+") as output:

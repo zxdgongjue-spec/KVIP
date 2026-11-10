@@ -104,8 +104,15 @@ def test_optimization_switches_are_explicit_content_addressed_build_options():
     assert baseline.options("/cann")["COMPACT_RESERVED"] == 0
     compact = Specialization(16, 131328, 16384, 32, 2624, 32, 8, "Ascend950DT_9582", compact_reserved=True)
     assert compact.options("/cann")["COMPACT_RESERVED"] == 1
+    paired = Specialization(16, 131328, 16384, 32, 2624, 32, 8, "Ascend950DT_9582", grouped_copy=True)
+    assert paired.options("/cann")["UBMEM_GROUPED_COPY"] == 1
+    assert baseline.options("/cann")["UBMEM_GROUPED_COPY"] == 0
     with pytest.raises(ValueError, match="booleans"):
         Specialization(16, 131328, 16384, 32, 2624, 32, 8, "Ascend950DT_9582", parallel_init=1)
+    with pytest.raises(ValueError, match="booleans"):
+        Specialization(16, 131328, 16384, 32, 2624, 32, 8, "Ascend950DT_9582", grouped_copy=1)
+    with pytest.raises(ValueError, match="four-layer"):
+        Specialization(16, 131328, 16384, 32, 656, 32, 8, "Ascend950DT_9582", grouped_copy=True)
 
 
 def test_workspace_initializes_with_npu_supported_zero_dtypes():

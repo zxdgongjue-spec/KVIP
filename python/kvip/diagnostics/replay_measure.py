@@ -311,7 +311,7 @@ def measure_case(args, archive, context, retained):
             cann,
             aics,
             transport=args.transport,
-            tuning=getattr(args, "ubmem_tuning", None),
+            tuning=getattr(args, "fused_tuning", None) or getattr(args, "ubmem_tuning", None),
             split_index_stages=getattr(args, "split_index_stages", False),
         )
         case_retained["bundle"] = bundle
@@ -376,7 +376,7 @@ def measure_case(args, archive, context, retained):
         ),
         **results,
     )
-    if args.mode == "fused" and args.transport == "ubmem":
+    if args.mode == "fused":
         result["tuning"] = dict(bundle.tuning)
         result["reserved_metadata"] = dict(
             dense_bytes_per_group=int(archive.array("pre.reserved_hot").nbytes),

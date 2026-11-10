@@ -341,7 +341,8 @@ python -B -m kvip.diagnostics.compare \
   --urma-build-dir "$urma_build" \
   --kvaf-server 127.0.0.1:28999 \
   --device 0 --soc Ascend950DT_9582 \
-  --ubmem-serial-workers 32 --urma-serial-workers 2 \
+  --ubmem-serial-workers 32 --urma-serial-workers 32 \
+  --urma-serial-max-inflight 0 \
   --warmup 2 --iterations 10 --stage-iterations 3 \
   --result-dir "$new_result_directory"
 ```
@@ -388,6 +389,46 @@ map allocation padding, so this is a semantic input reconstruction rather
 than a byte-for-byte reconstruction of that backend's former allocations.
 Serial Get defaults match serving: UBmem 32 workers, URMA 2, explicitly
 overridable. Fused bindings use their original geometry and worker contracts.
+These defaults are compatibility settings, not tuned performance baselines.
+For a tuned URMA serial comparison, use `--urma-serial-workers 32
+--urma-serial-max-inflight 0`. The latter removes the runtime's default total
+inflight cap of 2048 and uses its existing whole-slice submission path. It is
+limited to URMA serial replay; fusion queue geometry and UBmem are unchanged.
+Runtime workers and the effective inflight policy are recorded in each result.
+The older V9 serial implementation used two jettys per worker, no total inflight
+cap and 32-WQE posts. Current KVAF retains two jettys but uses 128-WQE posts;
+this comparison reuses the earlier concurrency policy, not the old binary.
+Its optimum worker count depends on the real misses and four-layer width.
+An optional `--urma-serial-workers-candidates 16 32` adds one serial run and
+reports both results, using the lower validated device mean for the ratio.
+
+Backend-specific `--ubmem-fused-tuning` and `--urma-fused-tuning` accept JSON
+objects. For the captured four-layer B16 case, an explicit candidate is:
+
+```bash
+--ubmem-fused-tuning '{"parallel_init":false,"balanced_index":true,"skip_inactive":true,"compact_reserved":true,"grouped_copy":true,"prefetch_limit":256,"window_limit":32}' \
+--urma-fused-tuning '{"compact_reserved":true,"prefetch_limit":512,"window_limit":64}'
+```
+
+UBmem's opt-in `grouped_copy` pairs independently validated 2624-byte rows in
+four pipeline stages. It keeps the original eight-row scratch footprint and
+load lookahead. Positive representable address gaps use two-block DMA;
+reversed/repeated addresses use ordered single-row operations, and an odd tail
+is drained normally. The 656-byte pipeline is unchanged. Index TND publication
+assigns complete query rows to available AIVs (64 at B16), retaining
+plan-before-output-before-apply ordering. Both backends skip speculative bitmap
+scans when the admission budget is exhausted, preserving event completion and
+final repair. Suppression counts cover candidates actually examined, not bits
+skipped by this gate. Init still constructs all required mapping/protection
+state inside timing; the previously regressing parallel-init option remains
+disabled in this candidate.
+
+The summary separately reports correctness and `performance_target.target_met`.
+The performance target requires both at least 35% lower device-graph mean and
+at least 1.5x speedup against the measured serial path (the former is stricter:
+approximately 1.5385x). Candidate-call wall time and instrumented stages do not
+enter that ratio. Host models or a successful compile do not establish target
+attainment; the same-snapshot NPU result is required.
 Serial graphs use the Torch NPU graph allocator for native LI/gather outputs;
 fused graphs retain the existing KVAF graph API. The supported explicit stream
 argument is documented in [Torch NPU graphs](https://github.com/Ascend/pytorch/blob/master/torch_npu/npu/graphs.py).

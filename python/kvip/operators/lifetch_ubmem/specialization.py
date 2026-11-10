@@ -27,11 +27,12 @@ class Specialization:
     balanced_index: bool = False
     skip_inactive: bool = True
     compact_reserved: bool = False
+    grouped_copy: bool = False
 
     def __post_init__(self):
         if any(
             type(getattr(self, name)) is not bool
-            for name in ("parallel_init", "balanced_index", "skip_inactive", "compact_reserved")
+            for name in ("parallel_init", "balanced_index", "skip_inactive", "compact_reserved", "grouped_copy")
         ):
             raise ValueError("UBmem optimization switches must be booleans")
         if not 1 <= self.batch <= 16 or not 1 <= self.aic_count <= 32:
@@ -44,6 +45,8 @@ class Specialization:
             raise ValueError("LIFetch hot bitmap supports resident <= 131072")
         if self.heads not in (32, 64) or self.token_bytes not in (656, 2624):
             raise ValueError("UBmem supports 32/64 Indexer heads and 656/2624-byte KV rows")
+        if self.grouped_copy and self.token_bytes != 2624:
+            raise ValueError("Opt-in paired copy requires the four-layer 2624-byte layout")
         if not 1 <= self.intermediate_fetches <= 32 or not self.soc.startswith("Ascend950"):
             raise ValueError("UBmem requires 1..32 prefetch windows and an explicit Ascend950 SoC")
         cores = self.batch * (2 if 2 * self.batch <= self.aic_count else 1)
@@ -66,6 +69,7 @@ class Specialization:
             UBMEM_BALANCED_INDEX=int(self.balanced_index),
             SKIP_INACTIVE=int(self.skip_inactive),
             COMPACT_RESERVED=int(self.compact_reserved),
+            UBMEM_GROUPED_COPY=int(self.grouped_copy),
         )
 
 

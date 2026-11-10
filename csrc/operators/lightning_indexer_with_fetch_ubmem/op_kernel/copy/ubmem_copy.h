@@ -169,6 +169,127 @@ private:
     bool valid_=false;
 };
 
+#if V9_UBMEM_GROUPED_COPY
+// Four-layer rows are already 32-byte aligned. Pair independently validated
+// rows in four stages: the same eight-row/20992-byte footprint as the original
+// ring, but one ready/free exchange per pair. Both source and destination gaps
+// are represented by exact strided copies, never by reading/writing the gaps.
+// Reversed/repeated addresses retain two ordered copies within the same stage.
+class UbmemPairCopyPipeline {
+public:
+    static constexpr uint32_t kDepth=4,kStageBytes=2*kTokenBytes;
+    static constexpr uint32_t kScratchBytes=kDepth*kStageBytes,kOverflowBytes=0;
+    static_assert(kTokenBytes==2624 && kTokenBytes%32==0 && kScratchBytes<=23808,
+                  "Paired pipeline requires aligned four-layer rows and retired scratch");
+    __aicore__ inline UbmemPairCopyPipeline(__gm__ Context* ctx,uint64_t output,LocalTensor<uint8_t> scratch)
+        :output_(output),scratch_(scratch) {
+        auto region=UbmemRegionAt(ctx);
+        valid_=UbmemRegionValid(region);
+        if(valid_) {
+            peerBase_=region->peerBase;mappedBase_=region->mappedBase;bytes_=region->bytes;
+            outputBase_=region->outputBase;outputBytes_=region->outputBytes;
+        }
+    }
+    __aicore__ inline UbmemPairCopyPipeline(__gm__ Context* ctx,uint64_t output,
+        LocalTensor<uint8_t> scratch,LocalTensor<uint8_t>):UbmemPairCopyPipeline(ctx,output,scratch) {}
+    __aicore__ inline uint64_t PlanPeerBase()const {return peerBase_;}
+    __aicore__ inline uint64_t PlanMaxPeerOffset()const {return bytes_>=kTokenBytes?bytes_-kTokenBytes:0;}
+    __aicore__ inline bool Add(uint64_t peer,uint32_t slot) {return AddAt(peer,output_,slot);}
+    __aicore__ inline bool AddAt(uint64_t peer,uint64_t output,uint32_t slot) {
+        uint64_t source=0;
+        if(!valid_ || slot>=SIM_RESIDENT || output<outputBase_ || (output&31) ||
+           !UbmemTranslate(peerBase_,mappedBase_,bytes_,peer,kTokenBytes,source))return false;
+        uint64_t offset=output-outputBase_,rowOffset=uint64_t(slot)*kTokenBytes;
+        if(offset>outputBytes_ || rowOffset>outputBytes_-offset ||
+           kTokenBytes>outputBytes_-offset-rowOffset)return false;
+        if(!accepted_) {
+            SetFlag<HardEvent::S_MTE2>(EVENT_ID0);WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            for(uint32_t i=0;i<kDepth;++i)SetFlag<HardEvent::MTE3_MTE2>(static_cast<event_t>(i));
+        }
+        sources_[pending_]=source;destinations_[pending_]=output+rowOffset;
+        ++pending_;++accepted_;
+        if(pending_==2)FlushPair();
+        return true;
+    }
+    __aicore__ inline bool BeginRunAt(uint64_t output,uint32_t slot,uint32_t count) {
+        runCount_=0;
+        if(!valid_ || !count || slot>=SIM_RESIDENT || count>SIM_RESIDENT-slot ||
+           output<outputBase_ || (output&31))return false;
+        uint64_t offset=output-outputBase_,rowOffset=uint64_t(slot)*kTokenBytes;
+        if(offset>outputBytes_ || rowOffset>outputBytes_-offset ||
+           count>(outputBytes_-offset-rowOffset)/kTokenBytes)return false;
+        runOutput_=output;runSlot_=slot;runCount_=count;return true;
+    }
+    __aicore__ inline bool AddNext(uint64_t peer) {
+        if(!runCount_ || !AddAt(peer,runOutput_,runSlot_))return false;
+        --runCount_;++runSlot_;return true;
+    }
+    template<class... T> __aicore__ inline bool TryAddNext4(T...) {return false;}
+    template<class... T> __aicore__ inline bool TryAddNext6(T...) {return false;}
+    template<class... T> __aicore__ inline bool TryAddNext8(T...) {return false;}
+    __aicore__ inline void SaveFinalCommandCounts(__gm__ uint64_t*)const {}
+    __aicore__ inline uint32_t Finish() {
+        if(!accepted_)return 0;
+        if(pending_)FlushPair();
+        while(stored_<issued_)StoreOldest();
+        for(uint32_t i=0;i<kDepth;++i)WaitFlag<HardEvent::MTE3_MTE2>(static_cast<event_t>(i));
+        SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        return accepted_;
+    }
+private:
+    __aicore__ static inline bool ForwardPair(uint64_t first,uint64_t second) {
+        return second>=first && second-first>=kTokenBytes && second-first-kTokenBytes<=UINT32_MAX;
+    }
+    __aicore__ inline void FlushPair() {
+        uint32_t stage=issued_%kDepth,rows=pending_;
+        WaitFlag<HardEvent::MTE3_MTE2>(static_cast<event_t>(stage));
+        GlobalTensor<uint8_t> from;
+        DataCopyPadExtParams<uint8_t> pad{false,0,0,0};
+        if(rows==2 && ForwardPair(sources_[0],sources_[1])) {
+            from.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(sources_[0]));
+            DataCopyExtParams copy{2,kTokenBytes,static_cast<uint32_t>(sources_[1]-sources_[0]-kTokenBytes),0,0};
+            DataCopyPad<uint8_t,PaddingMode::Normal>(scratch_[stage*kStageBytes],from,copy,pad);
+        } else {
+            for(uint32_t i=0;i<rows;++i) {
+                from.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(sources_[i]));
+                DataCopyExtParams copy{1,kTokenBytes,0,0,0};
+                DataCopyPad<uint8_t,PaddingMode::Normal>(scratch_[stage*kStageBytes+i*kTokenBytes],from,copy,pad);
+            }
+        }
+        for(uint32_t i=0;i<rows;++i)storeDestinations_[stage][i]=destinations_[i];
+        storeRows_[stage]=rows;
+        SetFlag<HardEvent::MTE2_MTE3>(static_cast<event_t>(stage));
+        pending_=0;++issued_;
+        // Preserve eight-row load lookahead before the first MTE3 store.
+        if(issued_-stored_==kDepth)StoreOldest();
+    }
+    __aicore__ inline void StoreOldest() {
+        uint32_t stage=stored_%kDepth,rows=storeRows_[stage];
+        auto first=storeDestinations_[stage][0],second=storeDestinations_[stage][1];
+        WaitFlag<HardEvent::MTE2_MTE3>(static_cast<event_t>(stage));
+        GlobalTensor<uint8_t> to;
+        if(rows==2 && ForwardPair(first,second)) {
+            to.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(first));
+            DataCopyExtParams copy{2,kTokenBytes,0,static_cast<uint32_t>(second-first-kTokenBytes),0};
+            DataCopyPad<uint8_t,PaddingMode::Normal>(to,scratch_[stage*kStageBytes],copy);
+        } else {
+            for(uint32_t i=0;i<rows;++i) {
+                to.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(storeDestinations_[stage][i]));
+                DataCopyExtParams copy{1,kTokenBytes,0,0,0};
+                DataCopyPad<uint8_t,PaddingMode::Normal>(to,scratch_[stage*kStageBytes+i*kTokenBytes],copy);
+            }
+        }
+        SetFlag<HardEvent::MTE3_MTE2>(static_cast<event_t>(stage));++stored_;
+    }
+    LocalTensor<uint8_t> scratch_;
+    uint64_t output_,peerBase_=0,mappedBase_=0,bytes_=0,outputBase_=0,outputBytes_=0;
+    uint64_t sources_[2]{},destinations_[2]{},storeDestinations_[kDepth][2]{};
+    uint64_t runOutput_=0;
+    uint32_t storeRows_[kDepth]{},pending_=0,accepted_=0,issued_=0,stored_=0,runSlot_=0,runCount_=0;
+    bool valid_=false;
+};
+#endif
+
 #if TOKEN_BYTES == 656
 // Keep the one-row ring above intact as the measured reference. This ring
 // groups only consecutive destinations: the Host source of every row remains
@@ -589,6 +710,10 @@ private:
 using UbmemGroupedCopyPipeline=UbmemGroupedCopyPipelineT<4>;
 using UbmemFinalCopyPipeline=UbmemGroupedCopyPipelineT<4,true>;
 using UbmemWindowCopyPipeline=UbmemGroupedCopyPipelineT<8,false,8,false>;
+#elif V9_UBMEM_GROUPED_COPY
+using UbmemGroupedCopyPipeline=UbmemPairCopyPipeline;
+using UbmemFinalCopyPipeline=UbmemPairCopyPipeline;
+using UbmemWindowCopyPipeline=UbmemPairCopyPipeline;
 #else
 using UbmemGroupedCopyPipeline=UbmemCopyPipeline;
 using UbmemFinalCopyPipeline=UbmemCopyPipeline;

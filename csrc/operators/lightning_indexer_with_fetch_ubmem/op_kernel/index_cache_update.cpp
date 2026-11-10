@@ -7,7 +7,7 @@
   #include "simt_api/device_sync_functions.h"
   #include "simt_api/device_warp_functions.h"
   #include "index_cache_update.h"
-  #include "ubmem_abi.h"
+  #include "context.h"
 using namespace AscendC;
 namespace {
 constexpr uint32_t kCandidates = kExtendedCandidates, kThreads = 512;
@@ -60,8 +60,10 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void Update(__gm__ uint64_t* a, 
   asc_threadfence();
 }
 // Service output adaptation runs before Apply changes logical Index ownership.
-// Each block owns four TND output rows, independently of their packed owners.
-__simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PublishOutputs(__gm__ uint64_t* a, uint32_t b) {
+// Distribute complete TND query rows across the AIV budget. Each output row
+// owns 8 KiB in each output tensor, so no two AIVs share a write sector. Keep
+// this separate from Apply: another row may still read the old logical Index.
+__simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PublishOutputs(__gm__ uint64_t* a, uint32_t core) {
   auto topk = reinterpret_cast<__gm__ int32_t*>(a[18]);
   auto slots = reinterpret_cast<__gm__ int32_t*>(a[19]);
   auto unpack = reinterpret_cast<__gm__ int64_t*>(a[20]);
@@ -70,12 +72,11 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PublishOutputs(__gm__ uint6
   auto slotsOut = reinterpret_cast<__gm__ int32_t*>(a[23]);
   auto owners = reinterpret_cast<__gm__ uint32_t*>(a[9]);
   auto logical = reinterpret_cast<__gm__ int64_t*>(a[3]);
-  for (uint32_t q = 0; q < 4; ++q) {
-    uint32_t row = b * 4 + q;
+  for (uint32_t row = core; row < uint32_t(SIM_BATCH)*4; row += rotating::kOutputCores) {
     bool active = asc_ldcg(valid + row) != 0;
     uint64_t sourceRow = active ? asc_ldcg(unpack + row) : 0;
     // Plan statuses are complete on every packed row before this separate
-    // launch. TND output row b need not come from packed row b.
+    // launch. A TND row need not come from the same packed batch.
     active = active && sourceRow<uint64_t(SIM_BATCH)*4 &&
         asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(a[6])+sourceRow/4)==0;
     uint64_t owner = active ? asc_ldcg(owners + sourceRow / 4) : 0;
@@ -152,8 +153,9 @@ extern "C" __global__ __aicore__ void kvip_ubmem_direct_update_outputs_kernel(GM
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
   if ASCEND_IS_AIV {
     auto args = reinterpret_cast<__gm__ uint64_t*>(bindings);
-    uint32_t batch = GetBlockIdx();
-    Simt::VF_CALL<PublishOutputs>(Simt::Dim3{kThreads, 1, 1}, args, batch);
+    uint32_t core = GetBlockIdx();
+    if(core>=rotating::kOutputCores)return;
+    Simt::VF_CALL<PublishOutputs>(Simt::Dim3{kThreads, 1, 1}, args, core);
   }
 #endif
 }

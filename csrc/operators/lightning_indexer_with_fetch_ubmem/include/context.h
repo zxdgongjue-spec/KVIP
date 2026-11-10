@@ -49,12 +49,22 @@ constexpr uint32_t kFinalCores=SIM_BATCH*kFinalWorkers;
 #ifndef V9_COMPACT_RESERVED
 #define V9_COMPACT_RESERVED 0
 #endif
+#ifndef V9_UBMEM_GROUPED_COPY
+#define V9_UBMEM_GROUPED_COPY 0
+#endif
+static_assert(V9_UBMEM_GROUPED_COPY==0 || (V9_UBMEM_GROUPED_COPY==1 && TOKEN_BYTES==2624),
+              "Paired copy is an explicit four-layer specialization");
 static_assert(V9_UBMEM_PARALLEL_INIT == 0 || V9_UBMEM_PARALLEL_INIT == 1,
               "Parallel init must be enabled explicitly with 0 or 1");
 constexpr uint32_t kInitWorkersPerBatch=V9_UBMEM_PARALLEL_INIT ? 2*V9_AIC_COUNT/SIM_BATCH : 1;
 constexpr uint32_t kInitCores=SIM_BATCH*kInitWorkersPerBatch;
 static_assert(kInitWorkersPerBatch>=1 && kInitCores<=2*V9_AIC_COUNT,
               "Invalid init AIV budget");
+// TND output rows are independent after every packed update plan completes.
+// Use a separate AIV per query where possible, without exceeding the device
+// budget when four queries per batch require more than the available AIVs.
+constexpr uint32_t kOutputCores=4*SIM_BATCH<2*V9_AIC_COUNT ? 4*SIM_BATCH : 2*V9_AIC_COUNT;
+static_assert(kOutputCores>=1,"Invalid output AIV budget");
 constexpr uint32_t kFinalStateWords=288;
 constexpr uint32_t kFinalPostOffset=SIM_BATCH*128+kFinalCores*kFinalStateWords*4;
 constexpr uint32_t kFinalOwnerBytes=kFinalPostOffset+kFinalCores*128;
