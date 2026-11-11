@@ -4,6 +4,7 @@
 import numpy as np
 
 from kvip.diagnostics.archive import array_digest, checked_path
+from kvip.diagnostics.ddr import PayloadReader
 
 
 class DecodeOracle:
@@ -49,9 +50,7 @@ class DecodeOracle:
         self.lengths = np.load(checked_path(folder, files["valid_lengths"]["path"]), allow_pickle=False)
         self.key_to_record = {int(key): row for row, key in enumerate(self.ddr_keys)}
         self.block_bytes = self.width * self.ddr["tokens_per_block"]
-        self.payload = np.memmap(checked_path(folder, files["payload"]["path"]), mode="r", dtype=np.uint8).reshape(
-            len(self.ddr_keys), self.block_bytes
-        )
+        self.payload = PayloadReader(folder, self.ddr, record_count=len(self.ddr_keys), block_bytes=self.block_bytes)
 
     def expected(self, owner, logical):
         """Use pre-round hot/ABC bytes or the complete committed DDR snapshot."""

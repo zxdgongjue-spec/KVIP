@@ -10,7 +10,11 @@ are dereferenced from Python, and no queue/lease state is serialized.
 from __future__ import annotations
 
 import hashlib
+import copy
+from collections import OrderedDict
+from contextlib import nullcontext
 from pathlib import Path
+import shutil
 
 import numpy as np
 
@@ -146,13 +150,24 @@ def _page_policy(page_mode, numa_node, generation):
 
 
 def export_pages(
-    runtime, keys, directory, *, page_mode, generation, numa_node=-1, chunk_bytes=CHUNK_BYTES, torch_module=None
+    runtime,
+    keys,
+    directory,
+    *,
+    page_mode,
+    generation,
+    numa_node=-1,
+    chunk_bytes=CHUNK_BYTES,
+    torch_module=None,
+    object_store=None,
 ):
     """Export ALL supplied published blocks at the frozen before boundary.
 
     ``keys`` must cover the selected group's entire valid input address domain,
     not merely this launch's final misses. Caller-provided generation identifies
-    that frozen capture; it is not a native slot generation counter.
+    that frozen capture; it is not a native slot generation counter. With an
+    object store, every block is STILL read through BatchGet on every export;
+    only the bytes written to disk are deduplicated by content.
     """
     info = _runtime_geometry(runtime)
     policy = _page_policy(page_mode, numa_node, generation)
@@ -168,6 +183,7 @@ def export_pages(
     torch = _torch(torch_module)
     device = torch.device(f"npu:{runtime.device_id}")
     digest = hashlib.sha256()
+    blocks = []
     try:
         if len(keys):
             handle = runtime.prepare_access_table(keys.tolist())
@@ -175,7 +191,8 @@ def export_pages(
             device_table = runtime.access_table_view(handle, device="npu")
         else:
             addresses = offsets = lengths = np.empty(0, dtype=np.uint64)
-        with (directory / _FILES["payload"]).open("xb") as target:
+        output_file = (directory / _FILES["payload"]).open("xb") if object_store is None else nullcontext(None)
+        with output_file as target:
             for first in range(0, len(keys), per_chunk):
                 stop = min(first + per_chunk, len(keys))
                 tokens, token_bytes = info["tokens_per_block"], info["token_bytes"]
@@ -189,7 +206,11 @@ def export_pages(
                 output = torch.empty((count, token_bytes), dtype=torch.uint8, device=device)
                 runtime.batch_get(device_table, indices, within, miss_count, output_indices, output, synchronize=True)
                 data = output.cpu().numpy().tobytes()
-                target.write(data)
+                if target is not None:
+                    target.write(data)
+                else:
+                    block = tokens * token_bytes
+                    blocks.extend(object_store.put(data[start : start + block]) for start in range(0, len(data), block))
                 digest.update(data)
         arrays = dict(keys=keys, addresses=addresses, slot_offsets=offsets, valid_lengths=lengths)
         files = {}
@@ -198,52 +219,230 @@ def export_pages(
             with path.open("xb") as target:
                 np.save(target, values, allow_pickle=False)
             files[name] = {"path": path.name, "sha256": _hash(path)}
-        files["payload"] = {"path": _FILES["payload"], "sha256": digest.hexdigest()}
+        payload = {}
+        if object_store is None:
+            files["payload"] = {"path": _FILES["payload"], "sha256": digest.hexdigest()}
+        else:
+            object_store.flush()
+            payload["payload"] = dict(
+                storage="cas_blocks",
+                store=object_store.describe_for(directory),
+                blocks=blocks,
+                sha256=digest.hexdigest(),
+            )
         return dict(
             info,
-            schema_version=1,
+            schema_version=1 if object_store is None else 2,
             transport="ubmem",
             device_id=_integer(runtime.device_id, "device_id", 0, (1 << 31) - 1),
             **policy,
             record_count=len(keys),
             payload_bytes=len(keys) * info["token_bytes"] * info["tokens_per_block"],
             files=files,
+            **payload,
         )
     finally:
         if handle is not None:
             runtime.release_access_table(handle)
 
 
+class PayloadReader:
+    """Bounded record access for legacy files and content-addressed page blocks.
+
+    ``record_count``/``block_bytes`` also support callers that already validated
+    geometry (the oracle). No entire DDR payload is materialized in memory.
+    CAS objects are immutable: their complete bytes are checked before the
+    first read, then cached with a bounded LRU for per-token oracle access.
+    """
+
+    def __init__(self, directory, manifest, *, record_count=None, block_bytes=None, cache_bytes=32 << 20):
+        from kvip.diagnostics.archive import checked_path
+
+        self.manifest = manifest
+        self.schema = manifest.get("schema_version", 1)
+        self.record_count = _integer(manifest["record_count"] if record_count is None else record_count, "record_count")
+        self.block_bytes = _integer(
+            manifest["token_bytes"] * manifest["tokens_per_block"] if block_bytes is None else block_bytes,
+            "block_bytes",
+            1,
+        )
+        self.shape = (self.record_count, self.block_bytes)
+        self.nbytes = self.record_count * self.block_bytes
+        self._cache_limit = _integer(cache_bytes, "cache_bytes", 0, 32 << 20)
+        self._cache, self._cache_bytes, self._verified = OrderedDict(), 0, set()
+        self._legacy = self._store = None
+        if self.schema == 1:
+            entry = manifest["files"]["payload"]
+            if entry["path"] != _FILES["payload"]:
+                raise ValueError("unexpected DDR snapshot file path")
+            self.path = checked_path(directory, entry["path"])
+            if self.path.stat().st_size != self.nbytes:
+                raise ValueError("DDR snapshot payload is truncated or has trailing bytes")
+            self.digest = entry.get("sha256")
+            if self.nbytes:
+                self._legacy = np.memmap(self.path, mode="r", dtype=np.uint8).reshape(self.shape)
+        elif self.schema == 2:
+            from kvip.diagnostics.storage import PackedObjectStore
+
+            payload = manifest["payload"]
+            if payload.get("storage") != "cas_blocks" or "payload" in manifest["files"]:
+                raise ValueError("unsupported DDR payload storage")
+            self._blocks = payload["blocks"]
+            if not isinstance(self._blocks, list) or len(self._blocks) != self.record_count:
+                raise ValueError("DDR payload record reference count mismatch")
+            self.digest = payload["sha256"]
+            self._identities = []
+            for ref in self._blocks:
+                if not isinstance(ref, dict) or not isinstance(ref.get("pack"), str):
+                    raise ValueError("invalid DDR payload object reference")
+                digest = ref.get("sha256")
+                if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                    raise ValueError("invalid DDR payload object checksum")
+                offset = _integer(ref["offset"], "payload object offset")
+                if _integer(ref["length"], "payload object length", 1) != self.block_bytes:
+                    raise ValueError("DDR payload object does not contain one complete block")
+                self._identities.append((digest, ref["pack"], offset, self.block_bytes))
+            self._store = PackedObjectStore.from_description(directory, payload["store"])
+        else:
+            raise ValueError("unsupported DDR payload schema")
+
+    def _record(self, index):
+        index = _integer(index, "record index", 0, self.record_count - 1)
+        if self.schema == 1:
+            return self._legacy[index]
+        identity = self._identities[index]
+        if identity in self._cache:
+            self._cache.move_to_end(identity)
+            return self._cache[identity]
+        raw = self._store.read(self._blocks[index], verify=identity not in self._verified)
+        if len(raw) != self.block_bytes:
+            raise ValueError("DDR object changed or was truncated during read")
+        self._verified.add(identity)
+        result = np.frombuffer(raw, dtype=np.uint8)
+        if result.nbytes <= self._cache_limit:
+            while self._cache_bytes + result.nbytes > self._cache_limit:
+                _, old = self._cache.popitem(last=False)
+                self._cache_bytes -= old.nbytes
+            self._cache[identity] = result
+            self._cache_bytes += result.nbytes
+        return result
+
+    def __getitem__(self, item):
+        """Read ``reader[record, byte_slice]`` without allocating other records."""
+        if isinstance(item, tuple):
+            if len(item) != 2:
+                raise IndexError("DDR payload expects a record and byte slice")
+            record, within = item
+        else:
+            record, within = item, slice(None)
+        if isinstance(within, slice):
+            start = 0 if within.start is None else _integer(within.start, "byte slice start", 0, self.block_bytes)
+            stop = (
+                self.block_bytes
+                if within.stop is None
+                else _integer(within.stop, "byte slice stop", 0, self.block_bytes)
+            )
+            if within.step not in (None, 1) or stop < start:
+                raise ValueError("DDR payload byte slices must be contiguous and ordered")
+            return self._record(record)[start:stop]
+        index = _integer(within, "byte index", 0, self.block_bytes - 1)
+        return self._record(record)[index]
+
+    def read_records(self, first, stop):
+        """Return a bounded consecutive-record chunk as bytes."""
+        first = _integer(first, "first record", 0, self.record_count)
+        stop = _integer(stop, "stop record", first, self.record_count)
+        if (stop - first) * self.block_bytes > 32 << 20:
+            raise ValueError("DDR payload read exceeds the 32 MiB chunk limit")
+        if self.schema == 1:
+            count = (stop - first) * self.block_bytes
+            with self.path.open("rb") as source:
+                source.seek(first * self.block_bytes)
+                data = source.read(count)
+            if len(data) != count:
+                raise ValueError("DDR payload changed during restore")
+            return data
+        return b"".join(self._record(index).tobytes() for index in range(first, stop))
+
+    def verify(self):
+        """Check every referenced byte and its original ordered payload digest."""
+        if self.schema == 1:
+            actual = _hash(self.path)
+        else:
+            digest = hashlib.sha256()
+            for index in range(self.record_count):
+                digest.update(self._record(index))
+            actual = digest.hexdigest()
+        if actual != self.digest:
+            raise ValueError("DDR snapshot checksum mismatch: payload")
+        return self
+
+    def close(self):
+        store = getattr(self, "_store", None)
+        if store is not None:
+            store.close()
+            self._store = None
+        # Existing returned NumPy views keep their backing bytes/mmap alive.
+        self._legacy = None
+        if hasattr(self, "_cache"):
+            self._cache.clear()
+            self._cache_bytes = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def __del__(self):
+        self.close()
+
+
 def _load(directory, manifest, *, verify_payload):
-    if manifest.get("schema_version") != 1 or manifest.get("transport") != "ubmem":
+    if manifest.get("schema_version") not in (1, 2) or manifest.get("transport") != "ubmem":
         raise ValueError("unsupported DDR snapshot schema/transport")
     _page_policy(manifest["page_mode"], manifest["numa_node"], manifest["generation"])
     info = _geometry(
         *(manifest[name] for name in ("region_base", "region_bytes", "slot_bytes", "token_bytes", "tokens_per_block"))
     )
     paths = {}
+    from kvip.diagnostics.archive import checked_path
+
     for name, filename in _FILES.items():
+        if name == "payload":
+            continue
         entry = manifest["files"][name]
         if entry["path"] != filename:
             raise ValueError("unexpected DDR snapshot file path")
-        path = Path(directory) / filename
-        if name != "payload" or verify_payload:
-            if _hash(path) != entry["sha256"]:
-                raise ValueError(f"DDR snapshot checksum mismatch: {name}")
+        path = checked_path(directory, filename)
+        if _hash(path) != entry["sha256"]:
+            raise ValueError(f"DDR snapshot checksum mismatch: {name}")
         paths[name] = path
     arrays = {name: np.load(paths[name], allow_pickle=False) for name in _FILES if name != "payload"}
     _validate_records(info, arrays["keys"], arrays["addresses"], arrays["slot_offsets"], arrays["valid_lengths"])
     expected = len(arrays["keys"]) * info["token_bytes"] * info["tokens_per_block"]
     if manifest["record_count"] != len(arrays["keys"]) or manifest["payload_bytes"] != expected:
         raise ValueError("DDR snapshot record/payload count mismatch")
-    if paths["payload"].stat().st_size != expected:
-        raise ValueError("DDR snapshot payload is truncated or has trailing bytes")
-    return info, arrays, paths["payload"]
+    if verify_payload and manifest["schema_version"] == 1:
+        entry = manifest["files"]["payload"]
+        if entry["path"] != _FILES["payload"]:
+            raise ValueError("unexpected DDR snapshot file path")
+        if _hash(checked_path(directory, entry["path"])) != entry["sha256"]:
+            raise ValueError("DDR snapshot checksum mismatch: payload")
+    reader = PayloadReader(directory, manifest)
+    if verify_payload and manifest["schema_version"] == 2:
+        try:
+            reader.verify()
+        except BaseException:
+            reader.close()
+            raise
+    return info, arrays, reader
 
 
 def validate_pages(directory, manifest):
     """Verify all files and return a printable summary without native addresses."""
-    info, arrays, _ = _load(directory, manifest, verify_payload=True)
+    info, arrays, reader = _load(directory, manifest, verify_payload=True)
+    reader.close()
     return {
         **{name: value for name, value in info.items() if name != "region_base"},
         **_page_policy(manifest["page_mode"], manifest["numa_node"], manifest["generation"]),
@@ -270,12 +469,10 @@ def import_pages(runtime, directory, manifest, *, target_transport="ubmem", chun
     keys = arrays["keys"]
     torch = _torch(torch_module)
     device = torch.device(f"npu:{runtime.device_id}")
-    with payload.open("rb") as source:
+    with payload:
         for first in range(0, len(keys), per_chunk):
             stop = min(first + per_chunk, len(keys))
-            data = source.read((stop - first) * block)
-            if len(data) != (stop - first) * block:
-                raise ValueError("DDR payload changed during restore")
+            data = payload.read_records(first, stop)
             tensor = torch.from_numpy(np.frombuffer(data, dtype=np.uint8).copy()).to(device)
             runtime.batch_put(
                 keys[first:stop].tolist(),
@@ -303,13 +500,42 @@ def import_pages(runtime, directory, manifest, *, target_transport="ubmem", chun
         raise
 
 
+def materialize_pages(source_directory, manifest, destination):
+    """Verify and write an independent legacy DDR payload for one series item."""
+    info, _, reader = _load(source_directory, manifest, verify_payload=True)
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    if any(destination.iterdir()):
+        raise FileExistsError("materialized DDR directory must be empty")
+    per_chunk = _chunk_records(info, CHUNK_BYTES)
+    digest = hashlib.sha256()
+    with reader, (destination / _FILES["payload"]).open("xb") as output:
+        for first in range(0, reader.record_count, per_chunk):
+            data = reader.read_records(first, min(first + per_chunk, reader.record_count))
+            output.write(data)
+            digest.update(data)
+    if digest.hexdigest() != reader.digest:
+        raise ValueError("DDR payload changed during materialization")
+    result = copy.deepcopy(manifest)
+    result["schema_version"] = 1
+    result.pop("payload", None)
+    result["files"]["payload"] = {"path": _FILES["payload"], "sha256": digest.hexdigest()}
+    for name, filename in _FILES.items():
+        if name != "payload":
+            shutil.copyfile(Path(source_directory) / filename, destination / filename)
+            if _hash(destination / filename) != result["files"][name]["sha256"]:
+                raise ValueError("DDR metadata changed during materialization")
+    return result
+
+
 def rebase_addresses(addresses, directory, manifest, new_base, *, width=1):
     """Rebase only valid captured addresses, preserving zeros, shape and int64 bits.
 
     ``import_pages`` verifies the large payload once. This function verifies
     metadata checksums and ranges; it does not reread payload for every tensor.
     """
-    info, arrays, _ = _load(directory, manifest, verify_payload=False)
+    info, arrays, reader = _load(directory, manifest, verify_payload=False)
+    reader.close()
     new_base = _integer(new_base, "new_base", 1)
     width = _integer(width, "width", 1)
     if new_base % 32 or new_base + info["region_bytes"] > _U64_MAX:

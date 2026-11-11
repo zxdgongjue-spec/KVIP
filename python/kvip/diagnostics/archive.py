@@ -3,10 +3,13 @@
 
 import hashlib
 import json
+import math
 import subprocess
 from pathlib import Path
 
 import numpy as np
+
+from kvip.diagnostics.storage import PackedObjectStore, TENSOR_CHUNK_BYTES
 
 
 NUMPY_DTYPES = {
@@ -69,10 +72,24 @@ def cpu_array(torch, tensor):
 
 
 class TensorArchive:
-    def __init__(self, directory, manifest):
+    def __init__(self, directory, manifest, *, object_store=None):
         self.directory, self.manifest = Path(directory), manifest
+        self.object_store = object_store
+        self._owns_store = False
+        if object_store is not None:
+            description = object_store.describe_for(self.directory)
+            if manifest.get("object_store", description) != description:
+                raise ValueError("Tensor archive object store differs from its manifest")
+            self.manifest["object_store"] = description
+        elif "object_store" in manifest:
+            self.object_store = PackedObjectStore.from_description(self.directory, manifest["object_store"])
+            self._owns_store = True
 
     def save(self, name, value, *, dtype=None):
+        if name in self.manifest.setdefault("tensors", {}):
+            raise FileExistsError(f"Snapshot tensor already exists: {name}")
+        relative = f"tensors/{name}.npy"
+        path = checked_path(self.directory, relative)
         value = np.ascontiguousarray(value)
         if value.dtype.hasobject:
             raise ValueError("Object arrays are forbidden in snapshots")
@@ -81,30 +98,83 @@ class TensorArchive:
             raise ValueError(f"Unsupported snapshot dtype: {dtype}")
         if value.dtype.itemsize != np.dtype(NUMPY_DTYPES[dtype]).itemsize:
             raise ValueError("Snapshot dtype width differs from its data")
-        relative = f"tensors/{name}.npy"
-        path = checked_path(self.directory, relative)
+        if self.object_store is not None:
+            raw = memoryview(value.view(np.uint8).reshape(-1))
+            chunks = [
+                self.object_store.put(raw[start : start + TENSOR_CHUNK_BYTES])
+                for start in range(0, value.nbytes, TENSOR_CHUNK_BYTES)
+            ]
+            self.manifest["tensors"][name] = dict(
+                storage="cas_chunks",
+                dtype=dtype,
+                shape=list(value.shape),
+                nbytes=value.nbytes,
+                sha256=hashlib.sha256(raw).hexdigest(),
+                chunk_bytes=TENSOR_CHUNK_BYTES,
+                chunks=chunks,
+            )
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("xb") as output:
             np.save(output, value.view(np.uint8).reshape(-1), allow_pickle=False)
-        self.manifest.setdefault("tensors", {})[name] = dict(
+        self.manifest["tensors"][name] = dict(
             file=relative, dtype=dtype, shape=list(value.shape), nbytes=value.nbytes, sha256=file_digest(path)
         )
 
     def save_tensor(self, name, torch, tensor):
         self.save(name, cpu_array(torch, tensor), dtype=str(tensor.dtype).removeprefix("torch."))
 
-    def array(self, name, *, verify=False):
+    def _layout(self, name):
         description = self.manifest["tensors"][name]
-        path = checked_path(self.directory, description["file"])
-        if verify and file_digest(path) != description["sha256"]:
-            raise ValueError(f"Snapshot checksum mismatch: {name}")
-        raw = np.load(path, mmap_mode="r", allow_pickle=False)
         dtype = np.dtype(NUMPY_DTYPES[description["dtype"]])
         shape = tuple(description["shape"])
         if any(type(n) is not int or n < 0 for n in shape):
             raise ValueError(f"Invalid snapshot shape: {name}")
-        size = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
-        if raw.dtype != np.uint8 or raw.ndim != 1 or raw.nbytes != size or size != description["nbytes"]:
+        size = math.prod(shape) * dtype.itemsize
+        if type(description["nbytes"]) is not int or size != description["nbytes"]:
+            raise ValueError(f"Snapshot size/dtype mismatch: {name}")
+        return description, dtype, shape, size
+
+    def _chunks(self, name, description, size):
+        chunks = description.get("chunks")
+        if description.get("storage") != "cas_chunks" or self.object_store is None or not isinstance(chunks, list):
+            raise ValueError(f"Invalid tensor object storage: {name}")
+        chunk_bytes = description.get("chunk_bytes")
+        if type(chunk_bytes) is not int or not 0 < chunk_bytes <= (32 << 20):
+            raise ValueError(f"Invalid tensor chunk size: {name}")
+        total = 0
+        for i, reference in enumerate(chunks):
+            length = reference.get("length") if isinstance(reference, dict) else None
+            if type(length) is not int or length <= 0 or length > chunk_bytes:
+                raise ValueError(f"Invalid tensor chunk length: {name}")
+            if i < len(chunks) - 1 and length != chunk_bytes:
+                raise ValueError(f"Invalid nonfinal tensor chunk length: {name}")
+            total += length
+        if total != size:
+            raise ValueError(f"Snapshot chunk sizes differ from its tensor: {name}")
+        return chunks
+
+    def array(self, name, *, verify=False):
+        description, dtype, shape, size = self._layout(name)
+        if "storage" in description:
+            chunks = self._chunks(name, description, size)
+            raw = np.empty(size, dtype=np.uint8)
+            start = 0
+            digest = hashlib.sha256() if verify else None
+            for reference in chunks:
+                data = self.object_store.read(reference, verify=verify)
+                raw[start : start + len(data)] = np.frombuffer(data, dtype=np.uint8)
+                start += len(data)
+                if digest is not None:
+                    digest.update(data)
+            if digest is not None and digest.hexdigest() != description["sha256"]:
+                raise ValueError(f"Snapshot checksum mismatch: {name}")
+            return raw.view(dtype).reshape(shape)
+        path = checked_path(self.directory, description["file"])
+        if verify and file_digest(path) != description["sha256"]:
+            raise ValueError(f"Snapshot checksum mismatch: {name}")
+        raw = np.load(path, mmap_mode="r", allow_pickle=False)
+        if raw.dtype != np.uint8 or raw.ndim != 1 or raw.nbytes != size:
             raise ValueError(f"Snapshot size/dtype mismatch: {name}")
         return raw.view(dtype).reshape(shape)
 
@@ -115,14 +185,31 @@ class TensorArchive:
 
     def verify(self):
         for name in self.manifest["tensors"]:
-            self.array(name, verify=True)
+            description, _, _, size = self._layout(name)
+            if "storage" not in description:
+                self.array(name, verify=True)
+                continue
+            digest = hashlib.sha256()
+            for reference in self._chunks(name, description, size):
+                digest.update(self.object_store.read(reference, verify=True))
+            if digest.hexdigest() != description["sha256"]:
+                raise ValueError(f"Snapshot checksum mismatch: {name}")
+
+    def close(self):
+        if self._owns_store:
+            self.object_store.close()
+            self._owns_store = False
 
 
 def load_snapshot(directory):
     directory = Path(directory).resolve()
     manifest = json.loads((directory / "manifest.json").read_text())
-    if manifest.get("schema_version") != 1 or manifest.get("status") != "complete":
+    if manifest.get("schema_version") not in (1, 2) or manifest.get("status") != "complete":
         raise ValueError("Snapshot is incomplete or has an unsupported schema")
     archive = TensorArchive(directory, manifest)
-    archive.verify()
+    try:
+        archive.verify()
+    except BaseException:
+        archive.close()
+        raise
     return archive

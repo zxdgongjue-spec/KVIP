@@ -142,9 +142,10 @@ class DecodeSnapshotRecorder:
     preserves serving ownership through after().
     """
 
-    def __init__(self, torch, directory, metadata, page_exporter):
+    def __init__(self, torch, directory, metadata, page_exporter, *, object_store=None):
         self.torch, self.directory = torch, Path(directory).resolve()
         self.metadata, self.page_exporter = dict(metadata), page_exporter
+        self.object_store = object_store
         self.completed, self.result_path, self.started = False, None, False
 
     def before(self, selector):
@@ -185,7 +186,7 @@ class DecodeSnapshotRecorder:
             token_count=selector.inputs.token_count,
         )
         self.manifest = dict(
-            schema_version=1,
+            schema_version=2 if self.object_store is not None else 1,
             status="incomplete",
             source_transport="ubmem",
             metadata=self.metadata,
@@ -205,7 +206,7 @@ class DecodeSnapshotRecorder:
                 "policy": "Rebuild workspace/bindings/leases; never restore native pointers or queue cursors.",
             },
         )
-        self.archive = TensorArchive(self.directory, self.manifest)
+        self.archive = TensorArchive(self.directory, self.manifest, object_store=self.object_store)
         compact_reserved = getattr(shape, "compact_reserved", False)
         for name, tensor in (persistent_tensors(selector) | input_tensors(selector)).items():
             if name == "reserved_hot" and compact_reserved:
@@ -317,6 +318,10 @@ class DecodeSnapshotRecorder:
             },
         )
         self.manifest["status"] = "complete"
+        # Every shared extent must be durable before this invocation becomes
+        # independently replayable. No whole-array cache survives after().
+        if self.object_store is not None:
+            self.object_store.flush()
         pending = self.directory / "manifest.json.tmp"
         pending.write_text(json.dumps(self.manifest, indent=2, sort_keys=True) + "\n")
         pending.replace(self.directory / "manifest.json")

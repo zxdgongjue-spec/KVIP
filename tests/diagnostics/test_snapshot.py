@@ -2,6 +2,7 @@
 """Host tests exercise real snapshot bytes/oracles, not simulated device timing."""
 
 import copy
+import hashlib
 import json
 import shutil
 from types import SimpleNamespace as NS
@@ -19,6 +20,7 @@ from kvip.diagnostics.snapshot import (
     decode_tagged_mapping,
     validate_capture_inputs,
 )
+from kvip.diagnostics.storage import PackedObjectStore
 
 
 def test_tensor_archive_preserves_fp8_bfloat16_and_unsigned_bits(tmp_path):
@@ -212,7 +214,8 @@ def test_oracle_rejects_future_token_using_cross_packed_source(captured):
 
 
 @pytest.mark.parametrize("compact_reserved", (False, True))
-def test_complete_recorder_publishes_only_verified_files(captured, tmp_path, compact_reserved):
+@pytest.mark.parametrize("packed", (False, True))
+def test_complete_recorder_publishes_only_verified_files(captured, tmp_path, compact_reserved, packed):
     archive, state = captured
     b, h, r, width = 2, 4096, 2048, 656
     pre = {
@@ -325,8 +328,26 @@ def test_complete_recorder_publishes_only_verified_files(captured, tmp_path, com
     }
 
     def exporter(_, destination):
-        shutil.copytree(old_folder, destination)
-        return ddr
+        if store is None:
+            shutil.copytree(old_folder, destination)
+            return ddr
+        destination.mkdir()
+        files = {name: value for name, value in ddr["files"].items() if name != "payload"}
+        for entry in files.values():
+            shutil.copyfile(old_folder / entry["path"], destination / entry["path"])
+        block = width * 128
+        data = (old_folder / "payload.bin").read_bytes()
+        return dict(
+            ddr,
+            schema_version=2,
+            files=files,
+            payload=dict(
+                storage="cas_blocks",
+                store=store.describe_for(destination),
+                blocks=[store.put(data[start : start + block]) for start in range(0, len(data), block)],
+                sha256=hashlib.sha256(data).hexdigest(),
+            ),
+        )
 
     source = dict(
         capture_mode="eager_diagnostic",
@@ -334,7 +355,8 @@ def test_complete_recorder_publishes_only_verified_files(captured, tmp_path, com
         context=dict(min_context=4092, max_context=4096),
         requests=[dict(owner=i + 1, query_begin=4 * i, query_stop=4 * i + 4) for i in range(b)],
     )
-    recorder = DecodeSnapshotRecorder(torch, tmp_path / "recorded", source, exporter)
+    store = PackedObjectStore(tmp_path / "objects", create=True) if packed else None
+    recorder = DecodeSnapshotRecorder(torch, tmp_path / "recorded", source, exporter, object_store=store)
     recorder.before(selector)
     assert not recorder.completed and (recorder.directory / "INCOMPLETE").is_file()
     if compact_reserved:
@@ -350,16 +372,34 @@ def test_complete_recorder_publishes_only_verified_files(captured, tmp_path, com
             continue
         target = rotating.output if name == "output" else getattr(storage, "scales" if name == "key_scales" else name)
         target.copy_(torch.from_numpy(value))
+    durable = []
+    if store is not None:
+        flush = store.flush
+
+        def checked_flush():
+            assert not (recorder.directory / "manifest.json").exists()
+            flush()
+            durable.append(True)
+
+        store.flush = checked_flush
     recorder.after(selector)
+    if store is not None:
+        store.flush = flush
+        assert durable == [True]
     loaded = load_snapshot(recorder.directory)
     assert recorder.completed and not (recorder.directory / "INCOMPLETE").exists()
     assert loaded.manifest["oracle"]["passed"] is True
+    assert loaded.manifest["schema_version"] == (2 if packed else 1)
+    assert loaded.manifest["ddr"]["schema_version"] == (2 if packed else 1)
     assert loaded.array("post.selected_payload").shape == (4096, width)
     assert loaded.array("post.final_records").shape == (0, 4)
     validate_capture_inputs(loaded)
     loaded.manifest["metadata"]["context"]["min_context"] = 4093
     with pytest.raises(ValueError, match="Actual NPU"):
         validate_capture_inputs(loaded)
+    loaded.close()
+    if store is not None:
+        store.close()
 
 
 def test_recorder_does_not_publish_on_bad_mode_or_existing_directory(tmp_path):
