@@ -460,6 +460,7 @@ def run_device(
         pipeline = StreamingForward(rotating, update, torch, args.prefetch_tokens, fused_final=args.fused_final, q_workers=args.q_workers)
         pipeline.legacy_layout = args.legacy_fetch_layout
         pipeline.parallel_finalize = args.parallel_fetch_finalize
+        pipeline.prepare_metadata = args.prepare_update_metadata
         pipeline.set_diagnostics(False)
     else:
         pipeline = LIFetchForward(rotating, update)

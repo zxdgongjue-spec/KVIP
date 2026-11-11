@@ -1,9 +1,12 @@
 """Exercise the production dense fallback on large, chained exchanges."""
 import subprocess
+
+import pytest
 from pathlib import Path
 
 
-def test_dense_shadow_against_swap_reference(tmp_path):
+@pytest.mark.parametrize("prepare", [False, True])
+def test_dense_shadow_against_swap_reference(tmp_path, prepare):
     root = Path(__file__).resolve().parents[4]
     header = (root / 'csrc/operators/lightning_indexer_with_fetch_streaming_qworkers/op_kernel/shadow_exchange_parallel.h').read_text()
     header = header.replace('THREADS=512', 'THREADS=1').replace('CHUNK=512', 'CHUNK=1')
@@ -32,7 +35,7 @@ void asc_syncthreads(){} void asc_threadfence(){}
 ''' + header + r'''
 int main(){using namespace pipeline_ab;
  constexpr uint32_t H=16384,R=8192,N=5000;
- std::vector<uint32_t> m(SCRATCH_WORDS),dense(H*6),valid(R,1),scale(H),source(N),dest(N),reference(H),inverse(H);
+ std::vector<uint32_t> m(SCRATCH_WORDS+4*MAP),dense(H*6),valid(R,1),scale(H),source(N),dest(N),reference(H),inverse(H);
  std::vector<uint64_t> keys(H*16),addr(H),logical(H);
  std::iota(reference.begin(),reference.end(),0);std::iota(inverse.begin(),inverse.end(),0);
  for(uint32_t i=0;i<H;i++){scale[i]=i;addr[i]=i+100000;logical[i]=i+200000;for(int j=0;j<16;j++)keys[16*i+j]=16*i+j;}
@@ -55,6 +58,13 @@ int main(){using namespace pipeline_ab;
  }
 }
 '''
+    if prepare:
+        code = code.replace('ApplyBatch(source.data()', 'ApplyBatch<true>(source.data()').replace('ApplyDenseBatch(source.data()', 'ApplyDenseBatch<true>(source.data()')
+        code = code.replace('R,m.data());', 'R,m.data(),addr.data(),logical.data(),reinterpret_cast<uint64_t*>(dense.data()+2*H),H);')
+        code = code.replace('R,dense.data(),H,m.data());', 'R,dense.data(),H,m.data(),addr.data(),logical.data(),reinterpret_cast<uint64_t*>(dense.data()+2*H));')
+        code = code.replace('CommitDenseMetadata(addr.data(),logical.data(),dense.data(),reinterpret_cast<uint64_t*>(dense.data()+2*H),H);',
+                            'CommitPreparedMetadata(addr.data(),logical.data(),reinterpret_cast<uint64_t*>(dense.data()+2*H),H,m.data(),dense.data(),true);')
+        code = code.replace('assert(m[CONTROL]==0);', 'assert(m[CONTROL]==0);assert(addr[0]==100000 && logical[0]==200000);')
     src = tmp_path / 'dense.cpp'
     exe = tmp_path / 'dense'
     src.write_text(code)
@@ -62,11 +72,14 @@ int main(){using namespace pipeline_ab;
     subprocess.run([str(exe)], check=True, timeout=30)
 
 
-def test_dense_shadow_parallel_batch_and_cross_batch_chain(tmp_path):
+@pytest.mark.parametrize("prepare", [False, True])
+@pytest.mark.parametrize("use_dense", [False, True])
+def test_dense_shadow_parallel_batch_and_cross_batch_chain(tmp_path, prepare, use_dense):
     """Run the real vector body with a 32-lane host model of one warp."""
     root = Path(__file__).resolve().parents[4]
     header = (root / 'csrc/operators/lightning_indexer_with_fetch_streaming_qworkers/op_kernel/shadow_exchange_parallel.h').read_text()
     header = header.replace('THREADS=512', 'THREADS=32').replace('CHUNK=512', 'CHUNK=32')
+    # Keep full metadata staging capacity even when shrinking CHUNK below MAP.
     # A one-warp model has one partial sum instead of sixteen.
     header = header.replace('lane<16?scan[lane]:0', 'lane<1?scan[lane]:0')
     header = header.replace('ctl[32+15]', 'ctl[32]')
@@ -102,12 +115,12 @@ namespace pipeline_ab { constexpr uint32_t kMapSize=4096,kHistory=131072,kReside
 template<class F> void launch(F f){std::vector<std::thread> ts;for(unsigned i=0;i<32;i++)ts.emplace_back([&,i]{threadIdx.x=i;f();});for(auto &t:ts)t.join();}
 int main(){using namespace pipeline_ab;
  constexpr uint32_t H=512,R=256,N=96;
- std::vector<uint32_t> m(SCRATCH_WORDS),dense(H*6),valid(R,1),scale(H),src(N),dst(N),ref(H),inverse(H);
+ std::vector<uint32_t> m(SCRATCH_WORDS+4*MAP),dense(H*6),valid(R,1),scale(H),src(N),dst(N),ref(H),inverse(H);
  std::vector<uint64_t> keys(H*16),addr(H),logical(H);
  std::iota(ref.begin(),ref.end(),0);std::iota(inverse.begin(),inverse.end(),0);
  for(uint32_t i=0;i<H;i++){scale[i]=i;addr[i]=i+1000;logical[i]=i+2000;for(int j=0;j<16;j++)keys[16*i+j]=16*i+j;}
  for(uint32_t i=0;i<N;i++){src[i]=256+i;dst[i]=i;}
- src[32]=0; // source row moved by the previous batch
+ src[32]=0;dst[33]=0; // moved source and repeated destination across batches
  src[64]=65;src[65]=64; // two-row cycle within the third batch
  launch([&]{InitShadow(m.data());});
  for(uint32_t phase=0;phase<3;phase++){
@@ -128,6 +141,18 @@ int main(){using namespace pipeline_ab;
  }
 }
 '''
+    if not use_dense:
+        source = source.replace('if(phase==1)launch([&]{InitDenseShadow(dense.data(),H,m.data());});', '')
+        source = source.replace('if(!phase)launch', 'if(true)launch')
+        source = source.replace('CommitDenseMetadata(addr.data(),logical.data(),dense.data(),reinterpret_cast<uint64_t*>(dense.data()+2*H),H);', 'CommitMetadata(addr.data(),logical.data(),m.data());')
+        source = source.replace('assert(dense[i]==ref[i] && dense[H+ref[i]]==i);', 'assert(get(m.data()+KEYS_POS,m.data()+VALUES_POS,i)==ref[i]);')
+    if prepare:
+        source = source.replace('ApplyBatch(src.data()', 'ApplyBatch<true>(src.data()').replace('ApplyDenseBatch(src.data()', 'ApplyDenseBatch<true>(src.data()')
+        source = source.replace('R,m.data());', 'R,m.data(),addr.data(),logical.data(),reinterpret_cast<uint64_t*>(dense.data()+2*H),H);')
+        source = source.replace('R,dense.data(),H,m.data());', 'R,dense.data(),H,m.data(),addr.data(),logical.data(),reinterpret_cast<uint64_t*>(dense.data()+2*H));')
+        target = ('CommitDenseMetadata(addr.data(),logical.data(),dense.data(),reinterpret_cast<uint64_t*>(dense.data()+2*H),H);' if use_dense else 'CommitMetadata(addr.data(),logical.data(),m.data());')
+        source = source.replace(target, 'CommitPreparedMetadata(addr.data(),logical.data(),reinterpret_cast<uint64_t*>(dense.data()+2*H),H,m.data(),dense.data(),' + str(use_dense).lower() + ');')
+        source = source.replace('assert(!m[CONTROL]);', 'assert(!m[CONTROL]);for(unsigned i=0;i<H;i++){assert(addr[i]==i+1000 && logical[i]==i+2000);}')
     src, exe = tmp_path / 'parallel.cpp', tmp_path / 'parallel'
     src.write_text(source)
     subprocess.run(['c++', '-std=c++17', '-O2', '-pthread', str(src), '-o', str(exe)], check=True)

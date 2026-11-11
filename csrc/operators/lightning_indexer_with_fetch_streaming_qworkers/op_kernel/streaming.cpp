@@ -169,6 +169,11 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  uint32_t total=0,error=0,seen=0;bool denseMode=false;
  auto dense=reinterpret_cast<__gm__ uint32_t*>(a->denseShadow)+uint64_t(b)*shape.history*6;
+ bool prepareMetadata=(a->prefetchCount & 0x08000000U)!=0;
+ auto update=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);
+ auto addresses=reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(owner)*update[7];
+ auto logical=reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*a->history;
+ auto prepared=reinterpret_cast<__gm__ uint64_t*>(dense+2*shape.history);
  for(uint32_t phase=0;phase<5 && !error;++phase){
   {uint64_t wait=GetSystemCycle();while(true){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&flags[phase]),sizeof(BatchFlag));if(flags[phase].ready)break;
    if(GetSystemCycle()-wait>5000000000ULL){error=8;break;}}}
@@ -185,13 +190,20 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
    Simt::VF_CALL<InitDenseShadow>(Simt::Dim3{THREADS,1,1},dense,shape.history,work);
    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);denseMode=true;
   }
-  if(denseMode)Simt::VF_CALL<ApplyDenseBatch>(Simt::Dim3{THREADS,1,1},source,dest,begin,count,reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*a->history*16,reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*a->history,reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*shape.resident,shape.resident,dense,shape.history,work);
-  else Simt::VF_CALL<ApplyBatch>(Simt::Dim3{THREADS,1,1},source,dest,begin,count,reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*a->history*16,reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*a->history,reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*shape.resident,shape.resident,work);
+  if(prepareMetadata){
+  if(denseMode)Simt::VF_CALL<ApplyDenseBatch<true>>(Simt::Dim3{THREADS,1,1},source,dest,begin,count,reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*a->history*16,reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*a->history,reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*shape.resident,shape.resident,dense,shape.history,work,addresses,logical,prepared);
+  else Simt::VF_CALL<ApplyBatch<true>>(Simt::Dim3{THREADS,1,1},source,dest,begin,count,reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*a->history*16,reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*a->history,reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*shape.resident,shape.resident,work,addresses,logical,prepared,shape.history);
+  }else{
+  if(denseMode)Simt::VF_CALL<ApplyDenseBatch<false>>(Simt::Dim3{THREADS,1,1},source,dest,begin,count,reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*a->history*16,reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*a->history,reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*shape.resident,shape.resident,dense,shape.history,work,nullptr,nullptr,nullptr);
+  else Simt::VF_CALL<ApplyBatch<false>>(Simt::Dim3{THREADS,1,1},source,dest,begin,count,reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*a->history*16,reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*a->history,reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*shape.resident,shape.resident,work,nullptr,nullptr,nullptr,shape.history);
+  }
   seen+=count;
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
   error=local.GetValue(CONTROL);if(profile)ticks[13+2*phase]=GetSystemCycle();if(phase)total+=count;
  }
- if(!error){auto update=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);uint64_t addressStride=update[7];if(profile)ticks[22]=GetSystemCycle();if(denseMode)Simt::VF_CALL<CommitDenseMetadata>(Simt::Dim3{THREADS,1,1},reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(owner)*addressStride,reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*a->history,dense,reinterpret_cast<__gm__ uint64_t*>(dense+2*shape.history),shape.history);
+ if(!error){auto update=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);uint64_t addressStride=update[7];if(profile)ticks[22]=GetSystemCycle();
+  if(prepareMetadata)Simt::VF_CALL<CommitPreparedMetadata>(Simt::Dim3{THREADS,1,1},addresses,logical,prepared,shape.history,work,dense,denseMode);
+  else if(denseMode)Simt::VF_CALL<CommitDenseMetadata>(Simt::Dim3{THREADS,1,1},reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(owner)*addressStride,reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*a->history,dense,reinterpret_cast<__gm__ uint64_t*>(dense+2*shape.history),shape.history);
   else Simt::VF_CALL<CommitMetadata>(Simt::Dim3{THREADS,1,1},reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(owner)*addressStride,reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*a->history,work);
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);if(profile)ticks[23]=GetSystemCycle();}
  status[0]=error;status[1]=total;status[2]=local.GetValue(CONTROL+4);if(profile)ticks[24]=GetSystemCycle();

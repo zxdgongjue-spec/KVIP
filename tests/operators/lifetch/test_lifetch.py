@@ -27,6 +27,7 @@ def arguments(argv=None):
     p.add_argument("--streaming-fetch", action="store_true", help="submit each Q during streaming resolver")
     p.add_argument("--legacy-fetch-layout", action="store_true")
     p.add_argument("--parallel-fetch-finalize", action="store_true")
+    p.add_argument("--prepare-update-metadata", action="store_true")
     p.add_argument("--fused-final", action="store_true", help="finish fetch status in streaming kernel")
     p.add_argument("--q-workers", type=int, choices=(1, 2, 4), default=None,
                    help="AIV workers per query across all requests")
@@ -54,6 +55,8 @@ def arguments(argv=None):
     p.add_argument("--comparison-sfa", type=Path)
     p.add_argument("--output", type=Path, default=ROOT / "tests/results/lifetch")
     a = p.parse_args(argv)
+    if a.prepare_update_metadata and (a.q_workers is None or a.fetch_only_compare):
+        p.error("--prepare-update-metadata requires Q workers and full pipeline")
     if a.parallel_fetch_finalize and (a.q_workers is None or a.fetch_only_compare):
         p.error("--parallel-fetch-finalize requires Q workers and full pipeline")
     if a.fetch_only_compare and a.q_workers != 2:
@@ -165,6 +168,7 @@ def main(argv=None):
     p.add_argument('--streaming-fetch', action='store_true')
     p.add_argument('--legacy-fetch-layout', action='store_true')
     p.add_argument('--parallel-fetch-finalize', action='store_true')
+    p.add_argument('--prepare-update-metadata', action='store_true')
     p.add_argument('--fused-final', action='store_true')
     p.add_argument('--q-workers', type=int, choices=(1, 2, 4))
     p.add_argument('--final-workers', type=int, choices=(1, 2, 4))
@@ -217,11 +221,15 @@ def main(argv=None):
         p.error('--fetch-only-compare requires URMA and --streaming --streaming-fetch --fused-final --q-workers 2')
     if a.parallel_fetch_finalize and a.transport != 'urma':
         p.error('--parallel-fetch-finalize is an URMA experiment')
+    if a.prepare_update_metadata and (a.transport != 'urma' or a.q_workers is None or a.fetch_only_compare):
+        p.error('--prepare-update-metadata requires URMA Q workers and full pipeline')
     if a.transport == 'urma':
         command = [sys.executable, '-u', str(Path(__file__).resolve()), '--internal-urma', *common,
                    '--kvaf-root', str(kvaf_root), '--cann', a.cann, '--batches', a.batches,
                    '--intermediate-fetches', str(a.intermediate_fetches), '--trace-rounds', str(a.trace_rounds),
                    '--output', str(a.output), '--timeout-seconds', str(a.timeout_seconds)]
+        if a.prepare_update_metadata:
+            command.append('--prepare-update-metadata')
         if a.parallel_fetch_finalize:
             if a.q_workers is None or a.fetch_only_compare:
                 p.error('--parallel-fetch-finalize requires Q workers and full pipeline')

@@ -23,6 +23,7 @@ class StreamingForward:
         self.q_workers = q_workers
         self.legacy_layout = False
         self.parallel_finalize = False
+        self.prepare_metadata = False
         self.flags = torch.zeros((b, 12 if q_workers else (7 if fused_final else 5), 32), dtype=torch.int32, device=device)
         self.events_src = torch.empty((b, 512 + 8192), dtype=torch.int32, device=device)
         self.events_dst = torch.empty_like(self.events_src)
@@ -106,13 +107,13 @@ class StreamingForward:
 
     def set_deferred_fetch(self, enabled):
         # Isolation-only mode, set before launch; never used for graph timing.
-        value = np.asarray([512 | ((self.q_workers or 0) << 16) | (0x20000000 if self.legacy_layout else 0) | (0x10000000 if self.parallel_finalize else 0) | (0x40000000 if enabled else 0)], dtype='<u4').view('u1')
+        value = np.asarray([512 | ((self.q_workers or 0) << 16) | (0x20000000 if self.legacy_layout else 0) | (0x10000000 if self.parallel_finalize else 0) | (0x08000000 if self.prepare_metadata else 0) | (0x40000000 if enabled else 0)], dtype='<u4').view('u1')
         self.workspace[96:100].copy_(self.torch.from_numpy(value.copy()))
 
     def set_diagnostics(self, enabled):
         # Existing prefetchCount field is unused by the streaming kernel; its
         # high bit gates timestamps only in the separate profiled pass.
-        value = np.asarray([512 | ((self.q_workers or 0) << 16) | (0x20000000 if self.legacy_layout else 0) | (0x10000000 if self.parallel_finalize else 0) | (0x80000000 if enabled else 0)], dtype='<u4').view('u1')
+        value = np.asarray([512 | ((self.q_workers or 0) << 16) | (0x20000000 if self.legacy_layout else 0) | (0x10000000 if self.parallel_finalize else 0) | (0x08000000 if self.prepare_metadata else 0) | (0x80000000 if enabled else 0)], dtype='<u4').view('u1')
         self.workspace[96:100].copy_(self.torch.from_numpy(value.copy()))
 
     def diagnostic_cycles(self):
