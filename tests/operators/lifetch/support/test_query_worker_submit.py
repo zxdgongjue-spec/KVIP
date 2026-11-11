@@ -116,7 +116,7 @@ def test_standalone_dispatch_reuses_fused_worker():
     root = Path(__file__).resolve().parents[4]
     kernel = (root / 'csrc/operators/lightning_indexer_with_fetch_streaming_qworkers/op_kernel/streaming.cpp').read_text()
     entry = kernel.split('void v9_query_fetch_only(', 1)[1]
-    assert 'FetchQueryGroup(reinterpret_cast<__gm__ Args*>(arg),q,lane,workers)' in entry
+    assert 'FetchQueryGroup(reinterpret_cast<__gm__ Args*>(arg),q,lane,workers,skipEmptyConflict)' in entry
     assert 'uint32_t workers=2' in entry
     assert 'query==4?8U:2U' in entry
 

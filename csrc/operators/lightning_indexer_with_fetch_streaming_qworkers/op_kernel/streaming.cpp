@@ -242,7 +242,7 @@ constexpr uint32_t kBatchGetInflight = 2048;
 // Each worker owns one KVAF queue. It gathers its shard of requests for one Q,
 // calls the native BatchGet once per safe/conflicting phase, then acknowledges
 // all rows covered by that call. The native scheduler owns WQE and CQ handling.
-__aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,uint32_t workers){
+__aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,uint32_t workers,bool skipEmptyConflict=true){
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  if(lane>=shape.batch)return;
  auto allFlags=reinterpret_cast<__gm__ BatchFlag*>(a->flags);
@@ -259,8 +259,10 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
  args.miss_count=ctx->count;args.request_capacity=stride;
  if(ctx->fallbackAddresses){args.address_table=ctx->fallbackAddresses;args.valid_table=ctx->fallbackValid;args.table_capacity=shape.batch*kSlots;}
  if(!args.batch_get_max_inflight_total)args.batch_get_max_inflight_total=kBatchGetInflight;
- uint64_t error=0;uint32_t completed=0;
+ uint64_t error=0;uint32_t completed=0;bool hasConflict=false;
  for(uint32_t phase=0;phase<2 && !error;++phase){
+  if(phase && skipEmptyConflict && !hasConflict)break;
+  uint64_t prepareStart=profile?GetSystemCycle():0;
   uint32_t size=0,rangeCount=0;
   for(uint32_t b=lane;b<shape.batch;b+=workers){
    auto flags=allFlags+b*kFlagCount;auto ft=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*128+uint64_t(b)*128+q*24;
@@ -274,6 +276,7 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
    error|=flags[q+1].error|post->error;
    if(post->count>kTop || post->descriptor!=b*kSlots+q*kTop || post->nonconflicting>post->count ||
       post->descriptor>shape.batch*kSlots || post->count>shape.batch*kSlots-post->descriptor)error|=kvaf_device::kInvalidArgs;
+   hasConflict|=post->count>post->nonconflicting;
    uint32_t count=phase?post->count-post->nonconflicting:post->nonconflicting;
    uint32_t begin=post->descriptor+(phase?post->nonconflicting:0);
    if(phase && count && !error){
@@ -290,11 +293,13 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
    if(profile && !phase)ft[2]=GetSystemCycle();
   }
   if(error)break;
+  uint64_t packStart=profile?GetSystemCycle():0;
   if(rangeCount){
    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ranges),uint64_t(rangeCount)*12);
    Simt::VF_CALL<PackFetchRanges>(Simt::Dim3{256,1,1},ctx,packed,stride,ranges,rangeCount);
    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
   }
+  uint64_t packEnd=profile?GetSystemCycle():0;
   uint64_t start=GetSystemCycle(),end=start,postCycles=0,waitCycles=0,groups=0;
 #if !V9_SIMULATION
   if(size){
@@ -321,6 +326,7 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
   if(profile)for(uint32_t b=lane;b<shape.batch;b+=workers){
    auto ft=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*128+uint64_t(b)*128+q*24;
    ft[phase?7:3]=start;ft[phase?8:4]=end;ft[12+2*phase]=postCycles;ft[13+2*phase]=waitCycles;
+   if(!phase){ft[18]=packStart-prepareStart;ft[19]=packEnd-packStart;}
    ft[16+phase]=groups;ft[20]=3; // shared Q-worker group, not per-request time
   }
  }
@@ -433,12 +439,13 @@ extern "C" __global__ __aicore__ void v9_query_fetch_only(GM_ADDR arg,uint32_t q
 #if defined(__CCE_AICORE__)
  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
  if ASCEND_IS_AIV {
+  bool skipEmptyConflict=(query & 256U)==0;query &= 255U;
   uint32_t block=GetBlockIdx();
   if(block<(query==4?8U:2U) && query<5){
    uint32_t workers=2;
    uint32_t q=query==4?block/2:query;
    uint32_t lane=query==4?block%2:block;
-   FetchQueryGroup(reinterpret_cast<__gm__ Args*>(arg),q,lane,workers);
+   FetchQueryGroup(reinterpret_cast<__gm__ Args*>(arg),q,lane,workers,skipEmptyConflict);
   }
  }
 #endif

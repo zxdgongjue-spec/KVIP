@@ -85,7 +85,8 @@ def run(torch, owner, rotating, pipeline, args):
             expected[ids] = reference.reshape(-1, TOKEN_BYTES)[ids]
         expected = expected.reshape_as(owner.output)
         group_ids = list(range(8)) if query == 4 else [query * 2, query * 2 + 1]
-        for version, function in [('native', native), ('fused', fused)]:
+        for version, function in [('native', native), ('fused_before', fused), ('fused', fused)]:
+            stage_lines = []
             if version == 'native':
                 # Native KVAF receives one contiguous request list and performs
                 # its own standard block_count partition across 2 or 8 AIVs.
@@ -100,7 +101,7 @@ def run(torch, owner, rotating, pipeline, args):
                 native_count.fill_(len(selected))
             def prepare():
                 owner.output.copy_(original)
-                if version == 'fused':
+                if version != 'native':
                     for q in (range(4) if query == 4 else [query]):
                         pipeline.flags[:, 8 + q, :3].zero_()
                 else:
@@ -114,7 +115,7 @@ def run(torch, owner, rotating, pipeline, args):
                 if version == 'native':
                     result = function(pipeline.workspace.data_ptr(), native_reference.data_ptr(), capture.npu_stream, query)
                 else:
-                    result = function(pipeline.workspace.data_ptr(), capture.npu_stream, query)
+                    result = function(pipeline.workspace.data_ptr(), capture.npu_stream, query | (256 if version == 'fused_before' else 0))
                 if result:
                     raise RuntimeError(f'{version} fetch-only launch failed: {result}')
             capture.synchronize()
@@ -155,12 +156,46 @@ def run(torch, owner, rotating, pipeline, args):
                 if iteration >= args.warmup:
                     samples.append(start.elapsed_time(end) * 1000)
                 verify()
+            if version == 'native':
+                prepare()
+                profile_magic = torch.tensor(list((0x4b56414650524f46).to_bytes(8, 'little')),
+                                             dtype=torch.uint8, device=device)
+                native_status[:, 64:72].copy_(profile_magic)
+                stream.synchronize()
+                owner.mark_launched()
+                graph.replay()
+                stream.synchronize()
+                verify()
+                statuses = native_status.cpu().numpy().view('<u8')
+                for core in range(8 if query == 4 else 2):
+                    t = statuses[core, 8:]
+                    stage_lines.append(f'FETCH STAGES native Q={query} core={core} cycles: '
+                          f'get={int(t[7])-int(t[1])} post={int(t[-3])} cq={int(t[-2])}')
+            if version != 'native':
+                prepare()
+                pipeline.times.zero_()
+                pipeline.set_diagnostics(True)
+                stream.synchronize()
+                owner.mark_launched()
+                graph.replay()
+                stream.synchronize()
+                verify()
+                ticks = pipeline.times.cpu().numpy()[batch * 128:].reshape(batch, 128)
+                qs = range(4) if query == 4 else [query]
+                for q in qs:
+                    for lane in range(2):
+                        t = ticks[lane, q * 24:q * 24 + 24]
+                        stage_lines.append(f'FETCH STAGES {version} Q{q+1} lane={lane} cycles: '
+                              f'prepare={int(t[18])} pack={int(t[19])} '
+                              f'get={int(t[4])-int(t[3])} post={int(t[12])} cq={int(t[13])}')
+                pipeline.set_diagnostics(False)
+                stream.synchronize()
             graph.reset()
             owner.graphs.remove(graph)
             median = float(np.median(samples))
             rows.append(dict(query='Q4_all' if query == 4 else f'Q{query+1}', version=version,
                              aiv=8 if query == 4 else 2, jettys_per_aiv=2,
-                             count=len(selected), bytes=len(selected)*TOKEN_BYTES,
+                             count=len(selected), bytes=len(selected)*TOKEN_BYTES, stages=stage_lines,
                              safe_count=int(counts[group_ids, 0].sum()),
                              conflict_count=int(counts[group_ids, 1].sum()),
                              p50_us=median, p99_us=float(np.percentile(samples, 99)),
