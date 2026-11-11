@@ -93,6 +93,9 @@ def test_prefetch_does_not_reset_owned_final_status():
     assert 'if(initializeSpare)' in helper
     assert 'pair=2*shape.batch+2*(q*workers+lane)' in kernel
     assert 'args.jettys_per_core=2' in kernel
+    worker = kernel.split('__aicore__ inline void FetchQueryGroup(', 1)[1].split(
+        '__aicore__ inline void FinalizeStreaming', 1)[0]
+    assert worker.count('reinterpret_cast<__gm__ uint8_t*>(queue),2*sizeof(*queue)') == 2
 
 
 def test_two_jetty_pairs_do_not_overlap_prefetch_or_each_other():
