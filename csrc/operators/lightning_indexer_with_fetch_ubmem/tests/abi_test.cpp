@@ -47,6 +47,7 @@ int main() {
     assert(v9_tagged_map()==V9_UBMEM_TAGGED_MAP);
     assert(v9_merge_outputs()==V9_UBMEM_MERGE_OUTPUTS);
     assert(v9_single_plan()==V9_UBMEM_SINGLE_PLAN);
+    assert(v9_simt_final()==V9_UBMEM_SIMT_FINAL);
     assert(v9_staged_outputs()==V9_STAGED_OUTPUTS);
     assert(v9_fused_init()==V9_UBMEM_FUSED_INIT);
     assert(v9_ubpipe_depth()==(V9_UBMEM_GROUPED_COPY?V9_UBMEM_FINAL_COPY_STAGES:8));

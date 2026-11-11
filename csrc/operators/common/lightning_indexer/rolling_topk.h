@@ -52,7 +52,11 @@ __aicore__ inline void QLIVector<QLIT>::ProcessRollingTopK(const QLICommon::RunI
     DataCopyPad(mrgValueLocal_[topkCount_],scoreGm[row*scoreStride+rollingEnd_],copy,pad);
     SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
     WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+#if V9_PRUNED_TOPK
+    topkOp_.MergePruned(mrgValueLocal_,scoreOutLocal_,prunedPositions_,count,rollingEnd_,1,0);
+#else
     topkOp_.MergeNext(mrgValueLocal_,indicesOutLocal_,scoreOutLocal_,padded,rollingEnd_);
+#endif
     SaveTopKState(query);
     TraceThreshold(query,end,available,3);
     rollingEnd_=end;

@@ -122,6 +122,7 @@ def test_optimization_switches_are_explicit_content_addressed_build_options():
         "simt_init",
         "staged_outputs",
         "rolling_threshold",
+        "pruned_topk",
         "cached_buckets",
     ):
         assert baseline.options("/cann")[flag.upper()] == 0
@@ -149,17 +150,21 @@ def test_optimization_switches_are_explicit_content_addressed_build_options():
         dict(rolling_threshold=True, resident=8192),
         dict(rolling_threshold=True, aic_count=16),
         dict(rolling_threshold=True, threshold_only=True),
+        dict(pruned_topk=True, resident=8192),
+        dict(pruned_topk=True, aic_count=16),
+        dict(pruned_topk=True, threshold_only=True),
         dict(bitmap_index=1),
         dict(reserved_ub=1),
         dict(reserved_ub=True),
         dict(reserved_ub=True, compact_reserved=True, resident=8192),
-        dict(reserved_ub=True, compact_reserved=True, simt_init=True),
         dict(reserved_ub=True, compact_reserved=True, parallel_init=True),
     ):
         with pytest.raises(ValueError):
             replace(paired, **overrides)
     assert replace(compact, bitmap_index=True).options("/cann")["BITMAP_INDEX"] == 1
     assert replace(compact, reserved_ub=True).options("/cann")["RESERVED_UB"] == 1
+    combined_init = replace(compact, reserved_ub=True, simt_init=True).options("/cann")
+    assert combined_init["RESERVED_UB"] == combined_init["SIMT_INIT"] == 1
     assert replace(compact, fused_init=True).options("/cann")["UBMEM_FUSED_INIT"] == 1
     wide = replace(paired, final_copy_stages=6, final_copy_rows=4, ordered_pair=False)
     assert wide.options("/cann")["UBMEM_FINAL_COPY_ROWS"] == 4
@@ -170,6 +175,17 @@ def test_optimization_switches_are_explicit_content_addressed_build_options():
         Specialization(16, 131328, 16384, 32, 2624, 32, 8, "Ascend950DT_9582", grouped_copy=1)
     with pytest.raises(ValueError, match="four-layer"):
         Specialization(16, 131328, 16384, 32, 656, 32, 8, "Ascend950DT_9582", grouped_copy=True)
+
+
+def test_simt_final_is_opt_in_and_preserves_the_supported_copy_geometry():
+    shape = Specialization(16, 131328, 16384, 32, 656, 32, 8, "Ascend950DT_9582")
+    assert shape.options("/cann")["UBMEM_SIMT_FINAL"] == 0
+    assert replace(shape, simt_final=True).options("/cann")["UBMEM_SIMT_FINAL"] == 1
+    with pytest.raises(ValueError, match="booleans"):
+        replace(shape, simt_final=1)
+    for overrides in (dict(token_bytes=2624), dict(single_plan=True)):
+        with pytest.raises(ValueError, match="SIMT final"):
+            replace(shape, simt_final=True, **overrides)
 
 
 def test_workspace_initializes_with_npu_supported_zero_dtypes():

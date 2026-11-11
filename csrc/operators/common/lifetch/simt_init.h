@@ -16,7 +16,7 @@ __simt_callee__ inline void InitializeSimtControl(__gm__ ContextType* ctx,uint32
     uint32_t batches,uint32_t rounds,uint32_t lanes,uint32_t workers,uint32_t postOffset,
     uint64_t transportStatus,uint32_t transportStatusWords,
     uint64_t first,uint64_t second,uint64_t addresses,uint64_t output,uint64_t initialHead,
-    uint32_t queueLimit,uint32_t error) {
+    uint32_t queueLimit,uint32_t error,bool copyCandidates=true) {
     static_assert(sizeof(RowType)==1024 && offsetof(RowType,limit)%8==0,
                   "SIMT init requires the existing aligned Row ABI");
     static_assert(offsetof(RowType,addresses)==16 && offsetof(RowType,output)==24 &&
@@ -49,7 +49,7 @@ __simt_callee__ inline void InitializeSimtControl(__gm__ ContextType* ctx,uint32
     for(uint32_t e=b;e<(rounds?rounds:1)*lanes;e+=batches)
         InitControlWords(ctx->events+uint64_t(e)*sizeof(EventType),sizeof(EventType)/4);
     if(!b && !threadIdx.x)asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->count),uint32_t(0));
-    if(ctx->changeSlots) {
+    if(copyCandidates && ctx->changeSlots) {
         auto source=reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+uint64_t(b)*kLruSlots;
         auto destination=reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+uint64_t(b)*kChangeCapacity;
         for(uint32_t i=threadIdx.x;i<kLruSlots;i+=256)asc_stcg(destination+i,asc_ldcg(source+i));

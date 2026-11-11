@@ -60,6 +60,8 @@ class UbmemBinding:
             ("threshold_only", int(shape.threshold_only)),
             ("simt_init", int(shape.simt_init)),
             ("single_plan", int(shape.single_plan)),
+            ("simt_final", int(shape.simt_final)),
+            ("pruned_topk", int(shape.pruned_topk)),
             ("staged_outputs", int(shape.staged_outputs)),
             ("rolling_threshold", int(shape.rolling_threshold)),
             ("bitmap_index", int(shape.bitmap_index)),

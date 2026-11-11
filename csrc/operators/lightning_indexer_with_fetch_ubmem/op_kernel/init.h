@@ -39,6 +39,21 @@ inline void InitializeRoundSimt(__gm__ Context* ctx,uint32_t b,uint64_t reserved
 }
 #endif
 #if V9_RESERVED_UB
+#if V9_SIMT_INIT
+__simt_vf__ __aicore__ LAUNCH_BOUND(256)
+inline void InitializeReservedAndControl(__gm__ Context* ctx,uint32_t b,uint64_t reservedRow,
+    __ubuf__ uint32_t* inverse,const __ubuf__ uint32_t* candidates,uint32_t mappingTag,
+    uint64_t mappingState,uint64_t addresses,uint64_t output,uint32_t error) {
+    uint64_t status=ctx->ubmemStatus?ctx->ubmemStatus+uint64_t(b)*kUbmemStatusWords*8:0;
+    // Candidate slots were already copied by MTE3. This VF owns control words
+    // and the local inverse together; no scalar Row writeback follows it.
+    InitializeSimtControl<Row,Progress,Event,FinalPost>(ctx,b,SIM_BATCH,kRounds,kServiceLanes,
+        kFinalWorkers,kFinalPostOffset,status,kUbmemStatusWords*2,
+        mappingState,0,addresses,output,0,kLruSlots,error,false);
+    if(reservedRow)ScatterReservedHotLocal(inverse,candidates,SIM_RESIDENT,kLruSlots);
+    InitializeTailMappingsBody(SIM_HISTORY,SIM_RESIDENT,ctx,b,0,mappingTag);
+}
+#endif
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void InitializeReservedLocal(__gm__ Context* ctx,uint32_t b,uint64_t reservedRow,
     __ubuf__ uint32_t* inverse,const __ubuf__ uint32_t* candidates,uint32_t mappingTag) {
@@ -119,8 +134,24 @@ __aicore__ inline void InitializeRound(__gm__ Context* ctx,uint32_t b) {
     const auto values=GetInitRowValues(ctx,b);
     // Old epoch cache lines were discarded above. The VF is the only Row
     // writer; no later scalar writeback can restore stale epoch/counter data.
+#if V9_RESERVED_UB
+    CopyInitialLruSlots(ctx,b,local,reservedRow!=0);
+    SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+    auto inverse=local[4096];
+    Simt::VF_CALL<InitializeReservedAndControl>(Simt::Dim3{256,1,1},ctx,b,reservedRow,
+        reinterpret_cast<__ubuf__ uint32_t*>(inverse.GetPhyAddr()),
+        reinterpret_cast<const __ubuf__ uint32_t*>(local.GetPhyAddr()),generation.tag,
+        generation.state,values.addresses,values.output,values.error);
+    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    if(reservedRow) {
+        GlobalTensor<uint32_t> output;output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(reservedRow));
+        DataCopy(output,inverse,SIM_RESIDENT);
+    }
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+#else
     Simt::VF_CALL<InitializeRoundSimt>(Simt::Dim3{256,1,1},ctx,b,reservedRow,generation.tag,
         generation.state,values.addresses,values.output,values.error);
+#endif
 #else
 #if V9_UBMEM_TAGGED_MAP
     // The Row zero-fill is complete. Persist the epoch for later windows;

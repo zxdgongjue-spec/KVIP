@@ -37,6 +37,8 @@ class Specialization:
     threshold_only: bool = False
     simt_init: bool = False
     single_plan: bool = False
+    simt_final: bool = False
+    pruned_topk: bool = False
     staged_outputs: bool = False
     rolling_threshold: bool = False
     bitmap_index: bool = False
@@ -60,6 +62,8 @@ class Specialization:
                 "threshold_only",
                 "simt_init",
                 "single_plan",
+                "simt_final",
+                "pruned_topk",
                 "staged_outputs",
                 "rolling_threshold",
                 "bitmap_index",
@@ -75,16 +79,18 @@ class Specialization:
             raise ValueError("Tagged mapping requires one init worker per request")
         if self.simt_init and self.parallel_init:
             raise ValueError("SIMT init requires one init worker per request")
-        if self.reserved_ub and (
-            self.resident != 16384 or not self.compact_reserved or self.simt_init or self.parallel_init
-        ):
-            raise ValueError("reserved_ub requires resident=16384, compact_reserved, and scalar single-worker init")
-        if self.rolling_threshold and (
+        if self.reserved_ub and (self.resident != 16384 or not self.compact_reserved or self.parallel_init):
+            raise ValueError("reserved_ub requires resident=16384, compact_reserved, and single-worker init")
+        if (self.rolling_threshold or self.pruned_topk) and (
             self.resident != 16384 or 2 * self.batch > self.aic_count or self.threshold_only
         ):
-            raise ValueError("rolling_threshold requires resident=16384, split-Q2, and threshold_only=False")
+            raise ValueError(
+                "rolling_threshold/pruned_topk requires resident=16384, split-Q2, and threshold_only=False"
+            )
         if self.ordered_pair and not (self.grouped_copy and self.token_bytes == 2624):
             raise ValueError("Ordered pair copy requires grouped four-layer copy")
+        if self.simt_final and (self.token_bytes != 656 or self.single_plan):
+            raise ValueError("SIMT final copy requires 656-byte rows and single_plan=False")
         if (
             type(self.final_copy_stages) is not int
             or type(self.final_copy_rows) is not int
@@ -139,6 +145,8 @@ class Specialization:
             THRESHOLD_ONLY=int(self.threshold_only),
             SIMT_INIT=int(self.simt_init),
             UBMEM_SINGLE_PLAN=int(self.single_plan),
+            UBMEM_SIMT_FINAL=int(self.simt_final),
+            PRUNED_TOPK=int(self.pruned_topk),
             STAGED_OUTPUTS=int(self.staged_outputs),
             ROLLING_THRESHOLD=int(self.rolling_threshold),
             BITMAP_INDEX=int(self.bitmap_index),

@@ -304,6 +304,10 @@ private:
     uint32_t topkCountAlign256_ = 0; // topkCount对齐到256(直方图需要)，支持topk泛化
     uint32_t trunkLen_ = 0;
     struct QLICommon::ConstInfo constInfo_;
+#if V9_PRUNED_TOPK
+    TBuf<TPosition::VECCALC> prunedPositionsBuf_;
+    LocalTensor<uint16_t> prunedPositions_;
+#endif
     topk::LITopk<SCORE_T> topkOp_;
 };
 
@@ -343,6 +347,13 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe)
     pipe->InitBuffer(topkSharedTmpBuf_, topkSharedTmpSize);
     topkSharedTmpLocal_ = topkSharedTmpBuf_.Get<uint32_t>();
     topkOp_.InitBuffers(topkSharedTmpLocal_, indicesOutLocal_);
+#if V9_PRUNED_TOPK
+    // Q2/head64 is the largest admitted shape: 217600 bytes total, below
+    // 253 KiB UB. The AIC may already be filling resMm1's next bank, so that
+    // live buffer is deliberately not borrowed for this 32 KiB map.
+    pipe->InitBuffer(prunedPositionsBuf_, 16384 * sizeof(uint16_t));
+    prunedPositions_ = prunedPositionsBuf_.Get<uint16_t>();
+#endif
 
     //刷-1
     Duplicate(kScaleUB_, static_cast<SCALE_T>(0), 2 * s2BaseSize_ * 16);
@@ -758,6 +769,14 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
             } else {
                 for (uint32_t loopIdx = 0; loopIdx < s2LoopNum; loopIdx++) {
                     if (loopIdx == 0) {
+#if V9_PRUNED_TOPK
+                        // This is the identical first 16K selection already
+                        // saved before Service borrowed the TopK scratch.
+                        kvip_pruned::RestoreResident(prefixOutput_,
+                            info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx,
+                            scoreOutLocal_, topkSharedTmpLocal_);
+                        continue;
+#endif
                         copyInParams.blockLen = trunkLen_ * sizeof(SCORE_T); // byte
                         AscendC::DataCopyPad(mrgValueLocal_, scoreGm[vecOffset * QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_)], copyInParams, padParams);
                         SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
@@ -795,7 +814,14 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
                     AscendC::DataCopyPad(mrgValueLocal_[topkCountAlign256_], scoreGm[offset], copyInParams, padParams);
                     SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
                     WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+#if V9_PRUNED_TOPK
+                    topkOp_.MergePruned(mrgValueLocal_,scoreOutLocal_,prunedPositions_,
+                        validTrunkLen,loopIdx*trunkLen_,loopIdx%2,(loopIdx+1)%2);
+                    if(loopIdx==s2LoopNum-1 && (loopIdx+1)%2==1)
+                        DataCopy(indicesOutLocal_,topkSharedTmpLocal_,topkCount_);
+#else
                     topkOp_(mrgValueLocal_, indicesOutLocal_, scoreOutLocal_, QLICommon::Align(topkCountAlign256_ + validTrunkLen, (uint32_t)256), loopIdx, s2LoopNum);
+#endif
                     SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT1);
                 }
             }

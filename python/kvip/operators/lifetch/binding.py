@@ -44,9 +44,11 @@ class LIFetchBinding:
         simt_init=False,
         staged_outputs=False,
         rolling_threshold=False,
+        pruned_topk=False,
         single_planner=False,
         skip_final_partition=False,
         post_final_before_index=False,
+        resolve_submit=False,
         merge_final_completion=False,
         bitmap_index=False,
         reserved_ub=False,
@@ -55,12 +57,18 @@ class LIFetchBinding:
             raise ValueError("LIFetch hot bitmap supports resident <= 131072")
         if reserved_ub and (resident != 16384 or simt_init):
             raise ValueError("reserved_ub requires resident=16384 and simt_init=False")
-        if rolling_threshold and (resident != 16384 or li_tiling != "auto" or 2 * batch > aic_count or threshold_only):
-            raise ValueError("rolling_threshold requires resident=16384, split-Q2, and threshold_only=False")
+        if (rolling_threshold or pruned_topk) and (
+            resident != 16384 or li_tiling != "auto" or 2 * batch > aic_count or threshold_only
+        ):
+            raise ValueError(
+                "rolling_threshold/pruned_topk requires resident=16384, split-Q2, and threshold_only=False"
+            )
         if (single_planner or skip_final_partition or post_final_before_index) and (not parallel_final or async_final):
             raise ValueError("Resolver optimizations require parallel_final without async_final")
         if merge_final_completion and not post_final_before_index:
             raise ValueError("merge_final_completion requires post_final_before_index=True")
+        if resolve_submit and not (single_planner and post_final_before_index):
+            raise ValueError("resolve_submit requires single_planner=True and post_final_before_index=True")
         self.torch, self.owner = torch, owner
         self.library = load_lifetch_library(library)
         self.device = arguments[0].device
@@ -106,9 +114,11 @@ class LIFetchBinding:
             ("simt_init", simt_init),
             ("staged_outputs", staged_outputs),
             ("rolling_threshold", rolling_threshold),
+            ("pruned_topk", pruned_topk),
             ("single_planner", single_planner),
             ("skip_final_partition", skip_final_partition),
             ("post_final_before_index", post_final_before_index),
+            ("resolve_submit", resolve_submit),
             ("merge_final_completion", merge_final_completion),
             ("bitmap_index", bitmap_index),
             ("reserved_ub", reserved_ub),

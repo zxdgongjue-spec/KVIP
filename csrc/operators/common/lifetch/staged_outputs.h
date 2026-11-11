@@ -36,7 +36,8 @@ inline void ConvertStagedOutputs(__ubuf__ int32_t* tokens,__ubuf__ int64_t* hot,
 // reuse its resident logical-ID table across all four queries, and publish
 // whole 8 KiB output rows by MTE3. Apply must remain a later kernel: these
 // logical IDs describe the old Index permutation.
-// CheckStatus is true only after UBmem's preceding complete/plan kernel.
+// CheckStatus is true only after this packed row's UBmem complete/plan is
+// published; no other row's status is read, so a row-local VF join is enough.
 // URMA's original early output contract intentionally precedes its plan.
 template<bool CheckStatus>
 __aicore__ inline void PublishStagedOutputs(__gm__ uint64_t* a,uint32_t b,uint32_t batches) {

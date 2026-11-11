@@ -51,9 +51,11 @@ def build_libraries(
     simt_init=False,
     staged_outputs=False,
     rolling_threshold=False,
+    pruned_topk=False,
     single_planner=False,
     skip_final_partition=False,
     post_final_before_index=False,
+    resolve_submit=False,
     merge_final_completion=False,
     bitmap_index=False,
     reserved_ub=False,
@@ -73,9 +75,11 @@ def build_libraries(
             simt_init,
             staged_outputs,
             rolling_threshold,
+            pruned_topk,
             single_planner,
             skip_final_partition,
             post_final_before_index,
+            resolve_submit,
             merge_final_completion,
             bitmap_index,
             reserved_ub,
@@ -86,8 +90,12 @@ def build_libraries(
         raise ValueError("Resolver optimizations require parallel_final without async_final")
     if merge_final_completion and not post_final_before_index:
         raise ValueError("merge_final_completion requires post_final_before_index=True")
+    if resolve_submit and not (single_planner and post_final_before_index):
+        raise ValueError("resolve_submit requires single_planner=True and post_final_before_index=True")
     if rolling_threshold and threshold_only:
         raise ValueError("rolling_threshold requires the resident TopK seed; disable threshold_only")
+    if pruned_topk and threshold_only:
+        raise ValueError("pruned_topk requires the resident TopK seed; disable threshold_only")
     if reserved_ub and (not compact_reserved or simt_init):
         raise ValueError("reserved_ub requires compact_reserved=True and simt_init=False")
     root = Path(__file__).resolve().parents[3] / "csrc/operators"
@@ -105,9 +113,11 @@ def build_libraries(
         SIMT_INIT=int(simt_init),
         STAGED_OUTPUTS=int(staged_outputs),
         ROLLING_THRESHOLD=int(rolling_threshold),
+        PRUNED_TOPK=int(pruned_topk),
         URMA_SINGLE_PLANNER=int(single_planner),
         URMA_SKIP_FINAL_PARTITION=int(skip_final_partition),
         POST_FINAL_BEFORE_INDEX=int(post_final_before_index),
+        RESOLVE_SUBMIT=int(resolve_submit),
         MERGE_FINAL_COMPLETION=int(merge_final_completion),
         BITMAP_INDEX=int(bitmap_index),
         RESERVED_UB=int(reserved_ub),

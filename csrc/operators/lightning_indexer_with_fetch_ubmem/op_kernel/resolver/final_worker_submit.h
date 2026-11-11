@@ -16,6 +16,18 @@ __aicore__ inline void PublishFinalWorker(__gm__ Context* ctx,__gm__ Row* row,
         ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
         return;
     }
+#if V9_UBMEM_SIMT_FINAL
+    // The same resolver VF already copied all owned words and completed its
+    // threadfence/barrier. Unaligned sources leave mode zero for the original
+    // MTE pipeline below, without any speculative SIMT payload writes.
+    if(ctl.GetValue(6)) {
+        const uint32_t scheduled=ctl.GetValue(4),completed=ctl.GetValue(5);
+        post->count=scheduled;post->pending=scheduled!=completed;post->error=0;
+        post->deferred=0;post->descriptor=descriptor;post->head=completed;
+        ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
+        return;
+    }
+#endif
     uint32_t scheduled=0,completed=0;
     // selected/loc have finished all SIMD/SIMT use. ReplicatedFinal joined
     // their last location-store DMA before entering here. Both banks are dead:

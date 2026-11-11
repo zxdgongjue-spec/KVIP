@@ -11,21 +11,26 @@ OP = ROOT / "csrc/operators/lightning_indexer_with_fetch"
 
 
 @pytest.mark.parametrize("merged", (False, True))
-def test_final_submission_joins_prefetch_then_survives_index_and_failures(tmp_path, merged):
+@pytest.mark.parametrize("resolve_submit", (False, True))
+def test_final_submission_joins_prefetch_then_survives_index_and_failures(tmp_path, merged, resolve_submit):
     (tmp_path / "batch_get_abi.h").write_text("")
     lifecycle = (OP / "op_kernel/lifecycle.cpp").read_text()
     start = lifecycle.index("__aicore__ inline void FinishFetch(")
     finish = lifecycle[start : lifecycle.index("\n}\n#endif", start) + 2]
+    start = lifecycle.index('extern "C" __global__ __aicore__ void v9_resolve_kernel(')
+    resolve_entry = lifecycle[start : lifecycle.index("// Final transport", start)]
     planner = (OP.parent / "common/lifetch/index_cache_update.h").read_text()
     start = planner.index("template<uint32_t Threads>\n__simt_vf__", planner.index("// Finish the early update"))
     cleanup = planner[start:]
-    source = r"""
+    source = (
+        r"""
 #include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstdint>
 #include <vector>
 #define __aicore__
+#define __global__
 #define __gm__
 #define __simt_vf__
 #define LAUNCH_BOUND(x)
@@ -34,6 +39,8 @@ def test_final_submission_joins_prefetch_then_survives_index_and_failures(tmp_pa
 #define V9_POST_FINAL_BEFORE_INDEX 1
 #define V9_URMA_SINGLE_PLANNER 1
 #define V9_URMA_SKIP_FINAL_PARTITION 1
+#define KERNEL_TASK_TYPE_DEFAULT(x)
+#define ASCEND_IS_AIV (true)
 #include "context.h"
 using namespace rotating;
 using GM_ADDR=uint8_t*;
@@ -68,6 +75,8 @@ std::array<KvafBatchGetDirectUrmaEntity,10> entities;
 std::array<std::vector<Pending>,10> nic;
 std::array<unsigned,10> counts{},descriptors{},delivered{},posts{},waits{},flushes{};
 std::array<bool,2> joined{};
+std::array<bool,2> planned{};
+bool plannerUbLive=false;
 unsigned phase=0,badQueue=0,fault=0,sourceGeneration=1;
 unsigned currentBlock=0;uint32_t* hotValidity=nullptr;
 unsigned GetBlockIdx(){return currentBlock;}
@@ -118,13 +127,22 @@ void WriteStatus(KvafBatchGetCoreStatus* status,uint64_t result,uint64_t process
 }
 }
 void CompletePrefetch(Context* ctx,unsigned b){
- assert(phase==0 && !joined[b]);joined[b]=true;
+ assert(phase==0 && planned[b] && !plannerUbLive && !joined[b]);joined[b]=true;
  auto& row=reinterpret_cast<Row*>(ctx->rows)[b];
  assert(row.pending==3);
  row.error=fault==6 && !b?32:0;row.pending=row.error?1:0;
 }
+// The real planner is covered by the resolver models. Here its published
+// descriptor/TPipe lifetime is the boundary exercised by the actual entry.
+void ReplicatedFinal(unsigned batch,unsigned,unsigned,unsigned,unsigned,unsigned,Context* ctx){
+ const unsigned b=GetBlockIdx();assert(b<batch && !planned[b] && !plannerUbLive);
+ plannerUbLive=true;
+ if(fault==14 && !b)reinterpret_cast<uint32_t*>(ctx->rowStatus)[0]=64;
+ planned[b]=true;plannerUbLive=false;
+}
 #include "async_final.h"
 #include "post_final_before_index.h"
+RESOLVE_ENTRY
 CLEANUP
 FINISH
 void CompleteAll(Context* ctx,uint64_t* update){
@@ -136,9 +154,10 @@ void CompleteAll(Context* ctx,uint64_t* update){
   FinishFetch(reinterpret_cast<GM_ADDR>(bindings),reinterpret_cast<GM_ADDR>(update));
 }
 int main(){
- for(unsigned scenario=0;scenario<14;++scenario){
+ for(unsigned scenario=0;scenario<15;++scenario){
   fault=scenario;phase=0;sourceGeneration=1;queues={};statuses={};entities={};nic={};joined={};
   counts={};descriptors={};delivered={};posts={};waits={};flushes={};
+  planned={};plannerUbLive=false;
   Context ctx{};ctx.shape.batch=2;ctx.shape.finalWorkers=4;ctx.shape.finalCores=8;ctx.shape.finalPostOffset=128;
   ctx.shape.resident=16;
   std::array<Row,2> rows{};std::array<uint32_t,2*kRowStatusWords> info{};
@@ -163,7 +182,16 @@ int main(){
   if(fault==5)entities[badQueue].sq_depth=8; // invalid native SQ geometry
   if(fault==11)entities[badQueue].cq_depth=0;
   if(fault==13)bad->count=kSlots+1; // exceeds the resolver range contract
-  SubmitFinalBeforeIndex(&ctx,1);SubmitFinalBeforeIndex(&ctx,0);SubmitFinalBeforeIndex(&ctx,2);
+  uint64_t bindings[15]{};bindings[14]=uint64_t(&ctx);
+  currentBlock=1;v9_resolve_kernel(reinterpret_cast<GM_ADDR>(bindings));
+  // The merged path can post this row while a different row is unplanned.
+  assert(!planned[0] && planned[1]);
+  assert(posts[FinalQueue(2,4,1,0)]==unsigned(V9_RESOLVE_SUBMIT));
+  currentBlock=0;v9_resolve_kernel(reinterpret_cast<GM_ADDR>(bindings));
+#if !V9_RESOLVE_SUBMIT
+  SubmitFinalBeforeIndex(&ctx,1);SubmitFinalBeforeIndex(&ctx,0);
+#endif
+  SubmitFinalBeforeIndex(&ctx,2);
   for(unsigned q=0;q<10;++q)assert(waits[q]==0 && delivered[q]==0);
   if(fault==10){
    // An accidental second submission must not append a second SQ range.
@@ -181,13 +209,13 @@ int main(){
   }
   for(unsigned b=0;b<2;++b)for(unsigned w=0;w<4;++w){
    const unsigned q=FinalQueue(2,4,b,w);auto* p=FinalPostAt(128,&ctx,b*4+w);
-   const bool invalid=!b && (fault==6 || (fault==10 && w<3) || (w==badWorker && fault!=0 && fault!=10));
+   const bool invalid=!b && (fault==6 || fault==14 || (fault==10 && w<3) || (w==badWorker && fault!=0 && fault!=10));
    assert(bool(p->error)==invalid);
    if(!invalid){assert(!p->pending && !p->deferred && delivered[q]==counts[q] && nic[q].empty());
     assert(posts[q]==unsigned(counts[q]!=0) && waits[q]==posts[q]);
     if(counts[q])assert(queues[q].completed_batch_count==1 && p->head==1);
    }else if(p->pending){assert(queues[q].poisoned);}
-   if(fault==6 && !b)assert(posts[q]==0 && waits[q]==0 && nic[q].empty());
+   if((fault==6 || fault==14) && !b)assert(posts[q]==0 && waits[q]==0 && nic[q].empty());
   }
   if(fault==1 || fault==7 || fault==8 || fault==9){
    const unsigned oldPosts=posts[badQueue];assert(queues[badQueue].poisoned);
@@ -207,7 +235,10 @@ int main(){
   }
  }
 }
-""".replace("CLEANUP", cleanup).replace("FINISH", finish)
+""".replace("CLEANUP", cleanup)
+        .replace("FINISH", finish)
+        .replace("RESOLVE_ENTRY", resolve_entry)
+    )
     cpp, binary = tmp_path / "post_before_index.cpp", tmp_path / "post_before_index"
     cpp.write_text(source)
     subprocess.run(
@@ -218,6 +249,7 @@ int main(){
             "-g",
             "-fsanitize=address,undefined",
             f"-DV9_MERGE_FINAL_COMPLETION={int(merged)}",
+            f"-DV9_RESOLVE_SUBMIT={int(resolve_submit)}",
             f"-I{tmp_path}",
             f"-I{OP / 'include'}",
             f"-I{OP / 'op_kernel'}",
@@ -231,7 +263,8 @@ int main(){
 
 
 @pytest.mark.parametrize("merged", (False, True))
-def test_forward_posts_before_index_and_drains_afterwards(tmp_path, merged):
+@pytest.mark.parametrize("resolve_submit", (False, True))
+def test_forward_posts_before_index_and_drains_afterwards(tmp_path, merged, resolve_submit):
     text = (OP / "op_host/launch.cpp").read_text()
     entry = text[text.index('extern "C" uint32_t kvop_direct_update_outputs_early(uint32_t,') :]
     source = r"""
@@ -245,13 +278,13 @@ unsigned call(unsigned n){assert(++step==n);return fail==n?77:0;}
 unsigned v9_init(void*,void*,const rotating::RuntimeShape*){return call(1);}
 unsigned v9_li(void*,void*,const rotating::RuntimeShape*){return call(2);}
 unsigned v9_resolve(void*,void*,const rotating::RuntimeShape*){return call(3);}
-unsigned v9_submit_final(void*,void*,const rotating::RuntimeShape*){return call(4);}
+unsigned v9_submit_final(void*,void*,const rotating::RuntimeShape*){assert(!V9_RESOLVE_SUBMIT);return call(4);}
 unsigned v9_wait(void*,void*,const rotating::RuntimeShape*){assert(false);return 0;}
-unsigned v9_parallel_fetch(void*,void*,const rotating::RuntimeShape*){assert(!V9_MERGE_FINAL_COMPLETION);return call(6);}
-extern "C" unsigned kvop_direct_update_outputs_early(unsigned,void*,void*){return call(5);}
-extern "C" unsigned aclrtlaunch_v9_fetch_update_kernel(unsigned,void*,void*,void*){return call(V9_MERGE_FINAL_COMPLETION?6:7);}
+unsigned v9_parallel_fetch(void*,void*,const rotating::RuntimeShape*){assert(!V9_MERGE_FINAL_COMPLETION);return call(6-V9_RESOLVE_SUBMIT);}
+extern "C" unsigned kvop_direct_update_outputs_early(unsigned,void*,void*){return call(5-V9_RESOLVE_SUBMIT);}
+extern "C" unsigned aclrtlaunch_v9_fetch_update_kernel(unsigned,void*,void*,void*){return call((V9_MERGE_FINAL_COMPLETION?6:7)-V9_RESOLVE_SUBMIT);}
 ENTRY
-int main(){rotating::RuntimeShape shape{};const unsigned steps=V9_MERGE_FINAL_COMPLETION?6:7;
+int main(){rotating::RuntimeShape shape{};const unsigned steps=(V9_MERGE_FINAL_COMPLETION?6:7)-V9_RESOLVE_SUBMIT;
  for(fail=0;fail<=steps;++fail){step=0;assert(kvip_lifetch_forward((void*)1,(void*)2,(void*)3,&shape)==(fail?77:0));
   assert(step==(fail?fail:steps));}
 }
@@ -263,6 +296,7 @@ int main(){rotating::RuntimeShape shape{};const unsigned steps=V9_MERGE_FINAL_CO
             "c++",
             "-std=c++17",
             f"-DV9_MERGE_FINAL_COMPLETION={int(merged)}",
+            f"-DV9_RESOLVE_SUBMIT={int(resolve_submit)}",
             f"-I{OP / 'include'}",
             str(cpp),
             "-o",
@@ -271,3 +305,43 @@ int main(){rotating::RuntimeShape shape{};const unsigned steps=V9_MERGE_FINAL_CO
         check=True,
     )
     subprocess.run([str(binary)], check=True)
+
+
+@pytest.mark.parametrize(
+    "enabled,single_planner,post_before,valid",
+    ((0, 0, 0, True), (1, 1, 1, True), (1, 0, 1, False), (1, 1, 0, False), (2, 1, 1, False)),
+)
+def test_resolve_submit_native_contract_and_getter(tmp_path, enabled, single_planner, post_before, valid):
+    (tmp_path / "batch_get_abi.h").touch()
+    text = (OP / "op_host/launch.cpp").read_text()
+    getter = next(line for line in text.splitlines() if "uint32_t v9_resolve_submit(" in line)
+    source = tmp_path / "contract.cpp"
+    source.write_text(
+        '#include "context.h"\n#include <cassert>\n'
+        + getter
+        + "\nint main(){assert(v9_resolve_submit(nullptr)==V9_RESOLVE_SUBMIT);}\n"
+    )
+    binary = tmp_path / "contract"
+    result = subprocess.run(
+        [
+            "c++",
+            "-std=c++17",
+            "-DV9_URMA_PARALLEL_FINAL=1",
+            f"-DV9_RESOLVE_SUBMIT={enabled}",
+            f"-DV9_URMA_SINGLE_PLANNER={single_planner}",
+            f"-DV9_POST_FINAL_BEFORE_INDEX={post_before}",
+            f"-I{tmp_path}",
+            f"-I{OP / 'include'}",
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if valid:
+        assert result.returncode == 0, result.stderr
+        subprocess.run([str(binary)], check=True)
+    else:
+        assert result.returncode != 0
+        assert "Resolve submission" in result.stderr

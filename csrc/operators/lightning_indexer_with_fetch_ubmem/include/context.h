@@ -10,6 +10,12 @@ static_assert(V9_CACHED_BUCKETS==0 || V9_CACHED_BUCKETS==1,"Cached buckets must 
 #ifndef V9_THRESHOLD_ONLY
 #define V9_THRESHOLD_ONLY 0
 #endif
+#ifndef V9_PRUNED_TOPK
+#define V9_PRUNED_TOPK 0
+#endif
+static_assert(V9_PRUNED_TOPK==0 || V9_PRUNED_TOPK==1,"Pruned TopK must be boolean");
+static_assert(!V9_PRUNED_TOPK || (SIM_RESIDENT==16384 && V9_SPLIT_Q && !V9_THRESHOLD_ONLY),
+              "Pruned TopK requires resident=16384, split-Q2 and the resident TopK seed");
 #ifndef V9_ROLLING_THRESHOLD
 #define V9_ROLLING_THRESHOLD 0
 #endif
@@ -28,8 +34,8 @@ static_assert(V9_BITMAP_INDEX==0 || V9_BITMAP_INDEX==1,"Bitmap Index must be boo
 #endif
 static_assert(V9_RESERVED_UB==0 || V9_RESERVED_UB==1,"Reserved UB must be boolean");
 static_assert(!V9_RESERVED_UB || SIM_RESIDENT==16384,"Reserved UB requires resident=16384");
-#if V9_RESERVED_UB && (!V9_COMPACT_RESERVED || V9_SIMT_INIT || V9_UBMEM_PARALLEL_INIT)
-#error "Reserved UB requires compact reserved with one scalar init worker per row"
+#if V9_RESERVED_UB && (!V9_COMPACT_RESERVED || V9_UBMEM_PARALLEL_INIT)
+#error "Reserved UB requires compact reserved with one init worker per row"
 #endif
 static_assert(V9_COLD_ONLY_PREFETCH==0 || V9_COLD_ONLY_PREFETCH==1,"Cold-only prefetch must be 0 or 1");
 static_assert(V9_THRESHOLD_ONLY==0 || V9_THRESHOLD_ONLY==1,"Threshold-only selection must be 0 or 1");
@@ -113,6 +119,12 @@ static_assert(V9_UBMEM_MERGE_OUTPUTS==0 || V9_UBMEM_MERGE_OUTPUTS==1,"Merged out
 #ifndef V9_UBMEM_SINGLE_PLAN
 #define V9_UBMEM_SINGLE_PLAN 0
 #endif
+#ifndef V9_UBMEM_SIMT_FINAL
+#define V9_UBMEM_SIMT_FINAL 0
+#endif
+static_assert(V9_UBMEM_SIMT_FINAL==0 ||
+              (V9_UBMEM_SIMT_FINAL==1 && TOKEN_BYTES==656 && !V9_UBMEM_SINGLE_PLAN),
+              "SIMT final copy requires 656-byte rows and the combined resolver");
 #ifndef V9_STAGED_OUTPUTS
 #define V9_STAGED_OUTPUTS 0
 #endif

@@ -145,6 +145,7 @@ __aicore__ inline void Apply(GM_ADDR bindings) {
                                 reinterpret_cast<__ubuf__ uint64_t*>(local[kTransferPlanWords].GetPhyAddr()), count);
 }
 
+template<bool ReleaseScratch=false>
 __aicore__ inline void PlanOwned(GM_ADDR bindings,bool withOutputs=false) {
     TPipe pipe;
     TBuf<TPosition::VECCALC> scratch;
@@ -164,6 +165,12 @@ __aicore__ inline void PlanOwned(GM_ADDR bindings,bool withOutputs=false) {
         Simt::VF_CALL<Update<false>>(Simt::Dim3{kThreads,1,1},args,batch,owners[batch],true,work);
       else Simt::VF_CALL<Update<true>>(Simt::Dim3{kThreads,1,1},args,batch,owners[batch],true,work);
     }
+    if constexpr(ReleaseScratch) {
+      // Update releases its GM status/plan writes before returning. Join the
+      // VF and destroy its UB/events before another TPipe occupies this AIV.
+      SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+      pipe.Destroy();
+    }
 }
 
 __aicore__ inline void CompleteAndPlan(GM_ADDR bindings,GM_ADDR update,bool withOutputs) {
@@ -172,6 +179,17 @@ __aicore__ inline void CompleteAndPlan(GM_ADDR bindings,GM_ADDR update,bool with
     rotating::CompleteBatch(ctx,batch);
     // Scalar completion/cache publication must precede SIMT status reads.
     SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
+#if V9_UBMEM_MERGE_OUTPUTS && V9_STAGED_OUTPUTS
+    auto args=reinterpret_cast<__gm__ uint64_t*>(update);
+    if(withOutputs && kvip_output::CanStageOutputs(uint32_t(args[25]),SIM_BATCH)) {
+      PlanOwned<true>(update);
+      // This publisher reads only this packed row's completed status. It
+      // owns all TND rows that select this producer, even across batches.
+      // Apply remains a later kernel, after every old logical ID was read.
+      kvip_output::PublishStagedOutputs<true>(args,batch,SIM_BATCH);
+      return;
+    }
+#endif
     PlanOwned(update,withOutputs);
 }
 

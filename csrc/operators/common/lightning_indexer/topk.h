@@ -19,6 +19,7 @@
 #include "li_types.h"
 #include "topk_common.h"
 #include "topk_common.h"
+#include "pruned_topk.h"
 
 namespace topk {
 template<typename T>
@@ -196,6 +197,37 @@ public:
             hisIndexLocal[1],topK,absoluteStart-QLICommon::Align(topK,uint32_t(256)),padded);
         PipeBarrier<PIPE_V>();
     }
+#if V9_PRUNED_TOPK
+    __aicore__ inline void MergePruned(LocalTensor<uint16_t>& values,
+        LocalTensor<uint16_t>& scores,LocalTensor<uint16_t>& positions,
+        uint32_t count,uint32_t absoluteStart,uint32_t previousBank,uint32_t outputBank) {
+        kvip_pruned::CompactPositions(
+            reinterpret_cast<__ubuf__ uint16_t*>(positions.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint16_t*>(values.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint16_t*>(nkValueLocal.GetPhyAddr()),topK,count);
+        // Squeeze's AR byte count is a vector result, not a scalar dependency
+        // of the call. Join V->S before reading it or sizing the next TopK.
+        SetFlag<HardEvent::V_S>(0);WaitFlag<HardEvent::V_S>(0);
+        const uint32_t kept=uint32_t(GetSpr<SpecialPurposeReg::AR>()/sizeof(uint16_t));
+        const uint32_t padded=QLICommon::Align(topK+kept,uint32_t(256));
+        kvip_pruned::GatherScores(
+            reinterpret_cast<__ubuf__ uint16_t*>(values.GetPhyAddr())+topK,
+            reinterpret_cast<__ubuf__ uint16_t*>(positions.GetPhyAddr()),kept,padded-topK);
+        PipeBarrier<PIPE_V>();
+        topkb16gather::LiTopKVF<true>(tmpIndexLocal,scores,values,histogramsLocal,
+            idxHighLocal,idxLowLocal,nkValueLocal,topK,padded);
+        PipeBarrier<PIPE_V>();
+        kvip_pruned::RestorePositions(
+            reinterpret_cast<__ubuf__ uint16_t*>(tmpIndexLocal.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint16_t*>(positions.GetPhyAddr()),topK);
+        PipeBarrier<PIPE_V>();
+        // LiTopKVF already produced the selected scores. This gather maps only
+        // indices, using the original cold positions and absolute block start.
+        topkb16gather::LiTopKGatherVF(hisIndexLocal[outputBank],scores,values,tmpIndexLocal,
+            hisIndexLocal[previousBank],topK,absoluteStart-topK,padded);
+        PipeBarrier<PIPE_V>();
+    }
+#endif
 private:
     LocalTensor<uint32_t> hisIndexLocal[2];      // 每trunkLen长度的s2选出的topK个索引
     LocalTensor<uint32_t> histogramsLocal;       // 直方图的临时Buf 256 * 4B

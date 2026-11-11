@@ -13,6 +13,11 @@
 #endif
 static_assert(V9_ROLLING_THRESHOLD==0 || V9_ROLLING_THRESHOLD==1,"Rolling threshold must be boolean");
 static_assert(!V9_ROLLING_THRESHOLD || !V9_THRESHOLD_ONLY,"Rolling threshold requires resident TopK");
+#ifndef V9_PRUNED_TOPK
+#define V9_PRUNED_TOPK 0
+#endif
+static_assert(V9_PRUNED_TOPK==0 || V9_PRUNED_TOPK==1,"Pruned TopK must be boolean");
+static_assert(!V9_PRUNED_TOPK || !V9_THRESHOLD_ONLY,"Pruned TopK requires resident TopK");
 #ifndef V9_SIMT_INIT
 #define V9_SIMT_INIT 0
 #endif
@@ -68,6 +73,12 @@ static_assert(V9_URMA_SKIP_FINAL_PARTITION==0 || V9_URMA_SKIP_FINAL_PARTITION==1
 static_assert(!(V9_URMA_SINGLE_PLANNER || V9_URMA_SKIP_FINAL_PARTITION) ||
               (V9_URMA_PARALLEL_FINAL && !V9_URMA_ASYNC_FINAL),
               "Resolver optimizations require synchronous parallel final Get");
+#ifndef V9_RESOLVE_SUBMIT
+#define V9_RESOLVE_SUBMIT 0
+#endif
+static_assert(V9_RESOLVE_SUBMIT==0 || V9_RESOLVE_SUBMIT==1,"Resolve submission must be boolean");
+static_assert(!V9_RESOLVE_SUBMIT || (V9_URMA_SINGLE_PLANNER && V9_POST_FINAL_BEFORE_INDEX),
+              "Resolve submission requires a single planner and final submission before Index");
 namespace rotating {
 constexpr uint32_t kTop=2048, kSlots=8192, kMaxRounds=32, kRowStatusWords=32;
 constexpr bool kFinalReplicated=true;

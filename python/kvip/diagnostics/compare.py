@@ -72,6 +72,11 @@ def arguments(argv=None):
     )
     parser.add_argument("--ubmem-fused-tuning", help="JSON options passed only to UBmem fused replay")
     parser.add_argument("--urma-fused-tuning", help="JSON options passed only to URMA fused replay")
+    for transport in ("ubmem", "urma"):
+        parser.add_argument(
+            f"--{transport}-fused-variants",
+            help="Two to four named fused tunings; share one restored arena and report every candidate",
+        )
     parser.add_argument("--result-dir", type=Path, help="New directory; all cases and one summary JSON")
     args = parser.parse_args(argv)
     if args.report_only is not None or args.from_results is not None:
@@ -85,6 +90,8 @@ def arguments(argv=None):
                 args.result_dir,
                 args.ubmem_fused_tuning,
                 args.urma_fused_tuning,
+                args.ubmem_fused_variants,
+                args.urma_fused_variants,
             )
         ):
             parser.error("Saved-result modes cannot be combined with capture/build/run options")
@@ -124,10 +131,19 @@ def arguments(argv=None):
     except ValueError as error:
         parser.error(str(error))
     from kvip.diagnostics.fused_replay import parse_fused_tuning
+    from kvip.diagnostics.ubmem_ablation import parse_variants
 
     for transport in ("ubmem", "urma"):
         name = transport + "_fused_tuning"
         value = getattr(args, name)
+        variants = getattr(args, transport + "_fused_variants")
+        if variants is not None:
+            if value is not None or args.urma_serial_workers_candidates is not None:
+                parser.error("Fused variants cannot combine with the same transport's tuning or a serial worker sweep")
+            try:
+                parse_variants(variants, transport)
+            except ValueError as error:
+                parser.error(str(error))
         if value is not None:
             try:
                 setattr(args, name, parse_fused_tuning(value, transport))
@@ -201,7 +217,34 @@ def command(args, transport, mode, serial_workers=None):
         tuning = getattr(args, transport + "_fused_tuning", None)
         if tuning is not None:
             values += ["--fused-tuning", json.dumps(tuning, sort_keys=True)]
+        variants = getattr(args, transport + "_fused_variants", None)
+        if variants is not None:
+            values += ["--fused-variants", variants, "--quiet"]
     return values, result
+
+
+def stage_payload_rates(result):
+    """Use matching instrumented byte samples; never divide all bytes by a CQ wait."""
+    diagnostic = result.get("stage_diagnostics") or {}
+    stages, samples = diagnostic.get("stages", {}), diagnostic.get("reads_samples", [])
+    if not samples:
+        return {}
+    if result["mode"] == "serial":
+        stage, key, scale = "batch_get", "bytes", 1
+        scope = "complete serial Get kernel, including request submission and completion"
+    elif result["transport"] == "ubmem":
+        stage = "final_fetch" if "final_fetch" in stages else "resolve_final_fetch"
+        key, scale = "final", result["geometry"]["token_bytes"]
+        scope = "remaining final payload only; includes resolver when combined, excludes LI prefetch"
+    else:
+        # URMA continues moving data across LI, Index and CQ-wait stages.
+        # The duration of fetch_complete/final_fetch_wait is only exposed tail.
+        return {}
+    duration = stages.get(stage, {}).get("mean_us")
+    if duration is None or not np.isfinite(duration) or duration <= 0 or any(key not in row for row in samples):
+        return {}
+    size = float(np.mean([row[key] for row in samples])) * scale
+    return dict(stage=stage, mean_us=duration, mean_bytes=size, payload_GBps=size / duration / 1000, scope=scope)
 
 
 def summarize(results):
@@ -246,6 +289,7 @@ def summarize(results):
                 if key in result
             },
             get_kernel=result.get("get_kernel"),
+            stage_payload_rate=stage_payload_rates(result),
             prefetch_admission=mean_admission(result["reads_samples"]),
             selection=result.get("selection_comparison"),
             reads_per_round={
@@ -400,6 +444,8 @@ def summarize_saved(paths):
             for key in ("snapshot_sha256", "geometry", "scope", "soc", "device", "kvip_commit"):
                 if key not in case or case[key] != reference.get(key):
                     raise ValueError(f"Incomparable {key}: {identity}")
+            if case.get("content", "full") != reference.get("content", "full"):
+                raise ValueError(f"Incomparable content: {identity}")
             if case.get("status") != "pass" or any(
                 not np.isfinite(case["timing"][key]) or case["timing"][key] <= 0 for key in ("mean_us", "p50_us")
             ):
@@ -411,6 +457,18 @@ def summarize_saved(paths):
             selected=winner.get("name", identity),
             cases=[dict(name=case.get("name", identity), mean_us=case["timing"]["mean_us"]) for case in cases],
         )
+        for item, case in zip(candidates[identity]["cases"], cases):
+            item.update(
+                p50_us=case["timing"]["p50_us"],
+                stages=(case.get("stage_diagnostics") or {}).get("stages", {}),
+                stage_payload_rate=stage_payload_rates(case),
+                score_status=case.get("score_comparison", {}).get("status", "not_recorded"),
+                reads={
+                    key: float(np.mean([sample[key] for sample in case["reads_samples"]]))
+                    for key in ("bytes", "prefetch", "final", "unused_prefetch")
+                    if key in case["reads_samples"][0]
+                },
+            )
     result = summarize(selected)
     result["saved_result_selection"] = candidates
     result["notes"].append(
@@ -418,6 +476,16 @@ def summarize_saved(paths):
         "the full candidate list is retained. Serial references are separate same-revision runs."
     )
     return result
+
+
+def brief_stages(name, stages, rate):
+    if stages:
+        emit("STAGES " + name + " " + " ".join(f"{key}={value['mean_us']:.2f}" for key, value in stages.items()))
+    if rate:
+        emit(
+            f"STAGE_PAYLOAD {name} {rate['stage']}={rate['mean_us']:.3f}us "
+            f"bytes={rate['mean_bytes']:.0f} GB/s={rate['payload_GBps']:.3f}; {rate['scope']}"
+        )
 
 
 def brief_report(summary, *, path=None):
@@ -447,6 +515,30 @@ def brief_report(summary, *, path=None):
             f"FUSION {transport}: speedup={value['serial_over_fused']:.3f}x "
             f"latency_reduction={value['latency_reduction_percent']:.2f}%"
         )
+        emit(
+            f"TARGET35 {transport} limit={value['target_fused_us']:.3f}us "
+            f"status={'MET' if value['target_met'] else 'NOT_MET'}"
+        )
+    candidates = summary.get("saved_result_selection", {})
+    if any(len(row["cases"]) > 1 for row in candidates.values()):
+        emit("VARIANT_NOTE table selects the lowest measured mean; all candidates follow, without independent retest.")
+    for name, row in summary["table"].items():
+        variants = candidates.get(name, {}).get("cases", [])
+        if len(variants) > 1:
+            for variant in variants:
+                label = name + "/" + variant["name"]
+                emit(
+                    f"VARIANT {label} mean={variant['mean_us']:.3f}us p50={variant['p50_us']:.3f}us "
+                    f"scores={variant.get('score_status', 'not_recorded')}"
+                )
+                if reads := variant.get("reads"):
+                    emit("READS " + label + " " + " ".join(f"{key}={value:.1f}" for key, value in reads.items()))
+                brief_stages(label, variant.get("stages", {}), variant.get("stage_payload_rate", {}))
+        else:
+            stages = (summary.get("stage_diagnostics", {}).get(name) or {}).get("stages", {})
+            brief_stages(name, stages, row.get("stage_payload_rate", {}))
+    if any(summary.get("stage_diagnostics", {}).values()):
+        emit("STAGE_NOTE diagnostic us; events perturb overlap. URMA fused CQ wait is not complete Get duration.")
     if checks := summary.get("score_validation"):
         emit("LI_SCORE_CHECK " + " ".join(f"{name}={value['status']}" for name, value in checks.items()))
     if pairs := summary.get("same_selection_across_transports"):
@@ -598,7 +690,7 @@ def main():
                 raise SystemExit(1)
             try:
                 case_result = json.loads(result_file.read_text())
-                if case_result.get("status") != "pass" or "timing" not in case_result:
+                if case_result.get("status") != "pass" or not any(key in case_result for key in ("timing", "cases")):
                     raise ValueError("Child returned no validated timing result")
             except Exception as error:
                 output.flush()
@@ -606,8 +698,13 @@ def main():
                 raise
         spool.unlink()
         results[name] = case_result
-        print(f"CASE_PASS {name}: mean={results[name]['timing']['mean_us']:.3f} us", flush=True)
-    summary = summarize(results)
+        for case in case_result.get("cases", [case_result]):
+            label = name + ("/" + case["name"] if "cases" in case_result else "")
+            print(f"CASE_PASS {label}: mean={case['timing']['mean_us']:.3f} us", flush=True)
+    if any("cases" in result for result in results.values()):
+        summary = summarize_saved([args.result_dir / (name + ".json") for name in results])
+    else:
+        summary = summarize(results)
     if summary.get("content") == "synthetic_token_replay":
         emit("CONTENT synthetic_token_replay: generated scores/KV bytes; not real-model timing")
     elif summary.get("content") == "real_li_synthetic_kv":

@@ -20,9 +20,13 @@ def _function(source, name):
     return source[begin:end]
 
 
-@pytest.mark.parametrize("transport,tagged", (("urma", 0), ("ubmem", 0), ("ubmem", 1)))
+@pytest.mark.parametrize(
+    "transport,tagged,reserved_ub", (("urma", 0, 0), ("ubmem", 0, 0), ("ubmem", 1, 0), ("ubmem", 1, 1))
+)
 @pytest.mark.parametrize("batch,rounds", ((1, 0), (16, 8)))
-def test_simt_init_matches_all_baseline_records_and_reduces_dma(tmp_path, transport, tagged, batch, rounds):
+def test_simt_init_matches_all_baseline_records_and_reduces_dma(
+    tmp_path, transport, tagged, reserved_ub, batch, rounds
+):
     compiler = shutil.which("c++")
     if compiler is None:
         pytest.skip("C++ compiler required for the init model")
@@ -72,6 +76,8 @@ def test_simt_init_matches_all_baseline_records_and_reduces_dma(tmp_path, transp
         if transport == "urma"
         else (
             "InitializeRoundSimt",
+            "InitializeReservedAndControl",
+            "InitializeReservedLocal",
             "FillWords",
             "InitializeControl",
             "CopyInitialLruSlots",
@@ -95,6 +101,7 @@ def test_simt_init_matches_all_baseline_records_and_reduces_dma(tmp_path, transp
                 "-fsanitize=address,undefined",
                 f"-DV9_SIMT_INIT={enabled}",
                 "-DV9_COMPACT_RESERVED=1",
+                f"-DV9_RESERVED_UB={reserved_ub}",
                 f"-DSIM_BATCH={batch}",
                 "-DSIM_HISTORY=131328",
                 "-DSIM_RESIDENT=16384",
@@ -113,6 +120,9 @@ def test_simt_init_matches_all_baseline_records_and_reduces_dma(tmp_path, transp
     before, after = results
     assert before[0] == after[0]  # Byte-identical rows, control, maps and input copies.
     assert after[1] < before[1]  # Fewer actual MTE3 calls, not an estimated latency.
-    assert before[2] > 0 and after[2] == 0  # LRU no longer has an MTE2/MTE3 chain.
+    if reserved_ub:
+        assert before[2] == after[2]  # One existing candidate DMA serves both control and the inverse VF.
+    else:
+        assert before[2] > 0 and after[2] == 0  # LRU no longer has an MTE2/MTE3 chain.
     assert before[3] > 0 and after[3] == 0  # Zero Duplicate and its joins are gone.
     assert before[4] == after[4]  # Exactly one VF per packed row in either path.

@@ -16,6 +16,7 @@ uint32_t v9_parallel_fetch(void* bindings, void* stream,const rotating::RuntimeS
 uint32_t v9_parallel_final(const rotating::RuntimeShape* shape);
 uint32_t v9_async_final(const rotating::RuntimeShape* shape);
 uint32_t v9_post_final_before_index(const rotating::RuntimeShape* shape);
+uint32_t v9_resolve_submit(const rotating::RuntimeShape* shape);
 uint32_t v9_merge_final_completion(const rotating::RuntimeShape* shape);
 uint32_t v9_cold_only_prefetch(const rotating::RuntimeShape* shape);
 uint32_t v9_threshold_only(const rotating::RuntimeShape* shape);
@@ -24,6 +25,7 @@ uint32_t v9_bitmap_index(const rotating::RuntimeShape* shape);
 uint32_t v9_reserved_ub(const rotating::RuntimeShape* shape);
 uint32_t v9_staged_outputs(const rotating::RuntimeShape* shape);
 uint32_t v9_rolling_threshold(const rotating::RuntimeShape* shape);
+uint32_t v9_pruned_topk(const rotating::RuntimeShape* shape);
 uint32_t v9_single_planner(const rotating::RuntimeShape* shape);
 uint32_t v9_skip_final_partition(const rotating::RuntimeShape* shape);
 uint32_t v9_probe(void* bindings, void* stream,const rotating::RuntimeShape* shape);

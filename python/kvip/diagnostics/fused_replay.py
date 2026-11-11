@@ -111,7 +111,10 @@ def fused_stages(transport, rotating, update, lease, batch, *, split_index_stage
     if getattr(rotating, "async_final", False):
         result[-1] = ("resolve_and_submit_safe_final", result[-1][1])
     post_before_index = getattr(rotating, "post_final_before_index", False)
-    if post_before_index:
+    resolve_submit = getattr(rotating, "resolve_submit", False)
+    if resolve_submit:
+        result[-1] = ("resolve_join_and_final_submit", result[-1][1])
+    if post_before_index and not resolve_submit:
         result.append(
             (
                 "prefetch_join_and_final_submit",
@@ -238,6 +241,7 @@ def validate_fused_tuning(overrides, transport):
         "simt_init",
         "staged_outputs",
         "rolling_threshold",
+        "pruned_topk",
         "bitmap_index",
         "reserved_ub",
     }
@@ -253,6 +257,7 @@ def validate_fused_tuning(overrides, transport):
             "single_plan",
             "cached_buckets",
             "fused_init",
+            "simt_final",
         }
     else:
         booleans |= {
@@ -262,6 +267,7 @@ def validate_fused_tuning(overrides, transport):
             "skip_final_partition",
             "post_final_before_index",
             "merge_final_completion",
+            "resolve_submit",
         }
     integers = {"prefetch_limit", "window_limit"}
     if transport == "ubmem":
@@ -283,14 +289,22 @@ def validate_fused_tuning(overrides, transport):
         raise ValueError("fused_init requires one init worker per request")
     if overrides.get("merge_final_completion") and not overrides.get("post_final_before_index"):
         raise ValueError("merge_final_completion requires post_final_before_index=True")
+    if overrides.get("resolve_submit") and not (
+        overrides.get("single_planner") and overrides.get("post_final_before_index")
+    ):
+        raise ValueError("resolve_submit requires single_planner=True and post_final_before_index=True")
+    if overrides.get("simt_final") and overrides.get("single_plan"):
+        raise ValueError("simt_final requires single_plan=False")
     if overrides.get("tagged_map") and overrides.get("parallel_init"):
         raise ValueError("Tagged mapping requires one init worker per request")
     if overrides.get("simt_init") and overrides.get("parallel_init"):
         raise ValueError("SIMT init requires one init worker per request")
     if overrides.get("reserved_ub") and (
-        not overrides.get("compact_reserved") or overrides.get("simt_init") or overrides.get("parallel_init")
+        not overrides.get("compact_reserved")
+        or (transport == "urma" and overrides.get("simt_init"))
+        or overrides.get("parallel_init")
     ):
-        raise ValueError("reserved_ub requires compact_reserved and scalar single-worker init")
+        raise ValueError("reserved_ub requires compact_reserved and single-worker init; URMA also requires scalar init")
     if overrides.get("async_final") and not overrides.get("parallel_final"):
         raise ValueError("async_final requires parallel_final")
     if any(overrides.get(name) for name in ("single_planner", "skip_final_partition", "post_final_before_index")) and (
@@ -299,6 +313,8 @@ def validate_fused_tuning(overrides, transport):
         raise ValueError("Resolver optimizations require parallel_final without async_final")
     if overrides.get("rolling_threshold") and overrides.get("threshold_only"):
         raise ValueError("rolling_threshold requires threshold_only=False")
+    if overrides.get("pruned_topk") and overrides.get("threshold_only"):
+        raise ValueError("pruned_topk requires threshold_only=False")
     if overrides.get("ordered_pair") and not overrides.get("grouped_copy"):
         raise ValueError("ordered_pair requires grouped_copy")
     prefetch_budget(overrides.get("prefetch_limit", 512), overrides.get("window_limit", 64), 1)
@@ -318,6 +334,7 @@ def fusion_tuning(geometry, transport, overrides=None):
         simt_init=False,
         staged_outputs=False,
         rolling_threshold=False,
+        pruned_topk=False,
         bitmap_index=False,
         reserved_ub=False,
         prefetch_limit=geometry["prefetch_limit"],
@@ -337,6 +354,7 @@ def fusion_tuning(geometry, transport, overrides=None):
             single_plan=False,
             cached_buckets=False,
             fused_init=False,
+            simt_final=False,
         )
     values.update(validate_fused_tuning({} if overrides is None else overrides, transport))
     if transport == "urma":
@@ -348,6 +366,7 @@ def fusion_tuning(geometry, transport, overrides=None):
         values.setdefault("skip_final_partition", False)
         values.setdefault("post_final_before_index", False)
         values.setdefault("merge_final_completion", False)
+        values.setdefault("resolve_submit", False)
     prefetch_budget(values["prefetch_limit"], values["window_limit"], geometry["requested_windows"])
     return values
 
@@ -425,10 +444,12 @@ def create_fused(
             single_plan=effective["single_plan"],
             staged_outputs=effective["staged_outputs"],
             rolling_threshold=effective["rolling_threshold"],
+            pruned_topk=effective["pruned_topk"],
             bitmap_index=effective["bitmap_index"],
             reserved_ub=effective["reserved_ub"],
             cached_buckets=effective["cached_buckets"],
             fused_init=effective["fused_init"],
+            simt_final=effective["simt_final"],
         )
         library = build_specialization(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape)
         workspace = UbmemWorkspace(torch, resident=r, **common_workspace)
@@ -458,6 +479,7 @@ def create_fused(
             skip_final_partition=effective["skip_final_partition"],
             post_final_before_index=effective["post_final_before_index"],
             merge_final_completion=effective["merge_final_completion"],
+            resolve_submit=effective["resolve_submit"],
             bitmap_index=effective["bitmap_index"],
             reserved_ub=effective["reserved_ub"],
             cold_only_prefetch=effective["cold_only_prefetch"],
@@ -465,6 +487,7 @@ def create_fused(
             simt_init=effective["simt_init"],
             staged_outputs=effective["staged_outputs"],
             rolling_threshold=effective["rolling_threshold"],
+            pruned_topk=effective["pruned_topk"],
         )
         workspace = LIFetchWorkspace(torch, **common_workspace)
     storage = IndexCacheStorage(torch, geometry["owners"], h, r, device)
@@ -528,6 +551,7 @@ def create_fused(
             skip_final_partition=effective["skip_final_partition"],
             post_final_before_index=effective["post_final_before_index"],
             merge_final_completion=effective["merge_final_completion"],
+            resolve_submit=effective["resolve_submit"],
             bitmap_index=effective["bitmap_index"],
             reserved_ub=effective["reserved_ub"],
             cold_only_prefetch=effective["cold_only_prefetch"],
@@ -535,6 +559,7 @@ def create_fused(
             simt_init=effective["simt_init"],
             staged_outputs=effective["staged_outputs"],
             rolling_threshold=effective["rolling_threshold"],
+            pruned_topk=effective["pruned_topk"],
             **common,
         )
         rotating.output = output

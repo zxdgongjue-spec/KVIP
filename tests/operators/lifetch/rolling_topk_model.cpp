@@ -15,14 +15,16 @@
 #define __gm__
 #define __ubuf__
 constexpr uint32_t SIM_Q=4,EVENT_ID0=0,PIPE_V=0;
+using GM_ADDR=uint8_t*;
+enum class CMPMODE {GT,GE};
 template<class T>T Min(T a,T b){return std::min(a,b);}
 namespace QLICommon {
 template<class T>T Align(T a,T b){return (a+b-1)/b*b;}
 struct RunInfo {uint32_t s2Idx{},gS1Idx{},bIdx{},actS2SizeOrig{},actS1Size{4},actS2Size{},indiceOutOffset{};bool isLastS2InnerLoop{};};
 }
 namespace AscendC {
-enum class HardEvent {MTE3_MTE2,V_MTE2,MTE3_V,MTE2_V,MTE2_MTE3};
-inline bool events[5][8]{};
+enum class HardEvent {MTE3_MTE2,V_MTE2,MTE3_V,MTE2_V,MTE2_MTE3,V_S};
+inline bool events[6][8]{};
 inline std::vector<std::function<void()>> loads,stores;
 void DrainLoads(){for(auto& f:loads)f();loads.clear();}
 void DrainStores(){for(auto& f:stores)f();stores.clear();}
@@ -56,19 +58,24 @@ enum class RoundMode {CAST_NONE};
 void Cast(LocalTensor<uint32_t> dst,LocalTensor<uint16_t> src,RoundMode,unsigned n){for(unsigned i=0;i<n;++i)dst.data[i]=src.data[i];}
 }
 using namespace AscendC;
+#if V9_PRUNED_TOPK
+#include "pruned_topk_cpu.h"
+#endif
 namespace topkb16gather {
-// Choose the highest score keys, with deterministic ties, then emit in input
-// order. Both production call paths must preserve this exact ordered list.
+// Match production: all GT in input order, then the earliest EQ entries.
+// Both production call paths must preserve this exact ordered list.
 template<bool Scores>void LiTopKVF(LocalTensor<uint16_t> indices,LocalTensor<uint16_t> out,
     LocalTensor<uint16_t> input,LocalTensor<uint32_t>,LocalTensor<uint32_t>,LocalTensor<uint32_t>,LocalTensor<uint32_t>,uint32_t k,uint32_t n){
     std::vector<uint32_t> order(n);std::iota(order.begin(),order.end(),0);
     std::stable_sort(order.begin(),order.end(),[&](unsigned a,unsigned b){return input.data[a]>input.data[b];});
-    order.resize(k);std::sort(order.begin(),order.end());
+    const auto threshold=input.data[order[k-1]];order.clear();
+    for(unsigned i=0;i<n;++i)if(input.data[i]>threshold)order.push_back(i);
+    for(unsigned i=0;i<n && order.size()<k;++i)if(input.data[i]==threshold)order.push_back(i);
     for(unsigned i=0;i<k;++i){indices.data[i]=order[i];if(Scores)out.data[i]=input.data[order[i]];}
 }
 void LiTopKGatherVF(LocalTensor<uint32_t> dst,LocalTensor<uint16_t> out,LocalTensor<uint16_t> input,
     LocalTensor<uint16_t> selected,LocalTensor<uint32_t> previous,uint32_t k,uint32_t offset,uint32_t){
-    std::vector<uint32_t> mapped(k);for(unsigned i=0;i<k;++i){auto p=selected.data[i];mapped[i]=p<k?previous.data[p]:p+offset;out.data[i]=input.data[p];}
+    std::vector<uint32_t> mapped(k);for(unsigned i=0;i<k;++i){auto p=selected.data[i];mapped[i]=p<k?previous.data[p]:p+offset;}
     std::copy(mapped.begin(),mapped.end(),dst.data);
 }
 }
@@ -88,6 +95,10 @@ public:
     std::vector<uint32_t> indices=std::vector<uint32_t>(2112),work=std::vector<uint32_t>(20000);
     LocalTensor<uint16_t> mrgValueLocal_{merge.data(),merge.size()},scoreOutLocal_{scores.data(),scores.size()};
     LocalTensor<uint32_t> indicesOutLocal_{indices.data(),indices.size()},topkSharedTmpLocal_{work.data(),work.size()};
+#if V9_PRUNED_TOPK
+    std::vector<uint16_t> positions=std::vector<uint16_t>(16384);
+    LocalTensor<uint16_t> prunedPositions_{positions.data(),positions.size()};
+#endif
     topk::LITopk<uint16_t> topkOp_;
     uint16_t threshold{};unsigned updates{},progressRebuilds{};
     QLIVector(){topkOp_.Init(2048,16384);topkOp_.InitBuffers(topkSharedTmpLocal_,indicesOutLocal_);}
@@ -120,16 +131,45 @@ std::vector<uint32_t> Original(const std::vector<uint16_t>& source,uint32_t vali
     return {op.indices.begin(),op.indices.begin()+2048};
 }
 
+#if V9_PRUNED_TOPK
+std::vector<uint32_t> PrunedFinal(const std::vector<uint16_t>& source,uint32_t valid,uint32_t query){
+    if(valid<=16384)return Original(source,valid);
+    QLIKernel::QLIVector<Qlit> op;
+    std::vector<uint8_t> prefix(3*50176,0);
+    auto resident=Original(source,16384,true);
+    auto* row=prefix.data()+(query/4)*50176;
+    auto* vals=reinterpret_cast<uint16_t*>(row)+(query%4)*2048;
+    auto* ids=reinterpret_cast<uint32_t*>(row+16384)+(query%4)*2048;
+    for(unsigned i=0;i<2048;++i){vals[i]=source[resident[i]];ids[i]=resident[i];}
+    op.ServicePoison();
+    kvip_pruned::RestoreResident(prefix.data(),query,op.scoreOutLocal_,op.topkSharedTmpLocal_);
+    const uint32_t loops=(valid+16383)/16384;
+    for(unsigned loop=1;loop<loops;++loop){
+        unsigned n=std::min(16384U,valid-loop*16384);
+        std::copy(op.scores.begin(),op.scores.end(),op.merge.begin());
+        std::copy_n(source.begin()+loop*16384,n,op.merge.begin()+2048);
+        op.topkOp_.MergePruned(op.mrgValueLocal_,op.scoreOutLocal_,op.prunedPositions_,
+            n,loop*16384,loop%2,(loop+1)%2);
+        if(loop==loops-1 && (loop+1)%2==1)std::copy_n(op.work.begin(),2048,op.indices.begin());
+    }
+    return {op.indices.begin(),op.indices.begin()+2048};
+}
+#endif
 int main(){
     constexpr uint32_t history=131328;
     std::mt19937 random(9281);
-    for(unsigned pattern=0;pattern<3;++pattern)for(bool causal:{false,true})
+    for(unsigned pattern=0;pattern<5;++pattern)for(bool causal:{false,true})
     for(uint32_t query=0;query<12;++query){
         uint32_t bounds[]={0,1,2047,2048,16383,16384,16385,32768,32769,130049,131072,131328};
         uint32_t end=bounds[query];if(causal)end=std::min(end,history-4+query%4+1);
         std::vector<uint16_t> src(history);
-        for(unsigned i=0;i<history;++i)src[i]=pattern==0?uint16_t(0x8001):pattern==1?uint16_t(0x8100+(random()%17)):uint16_t(1+random()%65535);
+        for(unsigned i=0;i<history;++i)src[i]=pattern==0?uint16_t(0x8001):pattern==1?uint16_t(0x8100+(random()%17)):pattern==2?uint16_t(1+random()%65535):pattern==3?
+            uint16_t(i<16384?0xc000+random()%64:0x8000+random()%64):
+            uint16_t(i<16384?0x8100:0x9000+random()%64);
         auto expected=Original(src,end);
+#if V9_PRUNED_TOPK
+        assert(PrunedFinal(src,end,query)==expected);
+#endif
         std::vector<uint8_t> prefix(3*50176,0xa7);
         auto* row=prefix.data()+(query/4)*50176;
         auto* prefixValues=reinterpret_cast<uint16_t*>(row)+query%4*2048;

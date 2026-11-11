@@ -124,7 +124,7 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
         build.build_libraries(**options, async_final=True)
     assert len(commands) == 14
     for index, flag in enumerate(
-        ("cold_only_prefetch", "threshold_only", "simt_init", "staged_outputs", "rolling_threshold"), 1
+        ("cold_only_prefetch", "threshold_only", "simt_init", "staged_outputs", "rolling_threshold", "pruned_topk"), 1
     ):
         specialized = build.build_libraries(**options, **{flag: True})
         assert specialized != current
@@ -144,6 +144,8 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
             build.build_libraries(**options, parallel_final=True, async_final=True, **{flag: True})
     with pytest.raises(ValueError, match="resident TopK seed"):
         build.build_libraries(**options, rolling_threshold=True, threshold_only=True)
+    with pytest.raises(ValueError, match="resident TopK seed"):
+        build.build_libraries(**options, pruned_topk=True, threshold_only=True)
     posted = build.build_libraries(**options, parallel_final=True, post_final_before_index=True)
     assert posted != parallel
     assert "-DPOST_FINAL_BEFORE_INDEX=1" in commands[-2]
@@ -164,6 +166,21 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
         dict(merge_final_completion=True),
         dict(parallel_final=True, merge_final_completion=True),
         dict(parallel_final=True, post_final_before_index=True, merge_final_completion=1),
+    ):
+        with pytest.raises(ValueError):
+            build.build_libraries(**options, **invalid)
+    planner = dict(parallel_final=True, post_final_before_index=True, single_planner=True)
+    separate = build.build_libraries(**options, **planner)
+    resolve_submit = build.build_libraries(**options, **planner, resolve_submit=True)
+    assert resolve_submit != separate
+    assert "-DRESOLVE_SUBMIT=1" in commands[-2]
+    assert build.build_libraries(**options, **planner, resolve_submit=True) == resolve_submit
+    assert build.build_libraries(**options, **planner) == separate
+    for invalid in (
+        dict(resolve_submit=True),
+        dict(parallel_final=True, single_planner=True, resolve_submit=True),
+        dict(parallel_final=True, post_final_before_index=True, resolve_submit=True),
+        dict(**planner, resolve_submit=1),
     ):
         with pytest.raises(ValueError):
             build.build_libraries(**options, **invalid)
@@ -217,6 +234,10 @@ def test_actual_operator_cmake_resolves_relocated_sources(tmp_path, bitmap_index
             f"-DKVAF_INCLUDE={headers}",
             "-DRESOLVER_COMPARE=1",
             f"-DBITMAP_INDEX={bitmap_index}",
+            f"-DRESOLVE_SUBMIT={bitmap_index}",
+            f"-DURMA_PARALLEL_FINAL={bitmap_index}",
+            f"-DURMA_SINGLE_PLANNER={bitmap_index}",
+            f"-DPOST_FINAL_BEFORE_INDEX={bitmap_index}",
         ],
         check=True,
         capture_output=True,
@@ -227,6 +248,9 @@ def test_actual_operator_cmake_resolves_relocated_sources(tmp_path, bitmap_index
     bridge_definitions = (tmp_path / "build/bridge-definitions.txt").read_text().split(";")
     assert f"-DV9_BITMAP_INDEX={bitmap_index}" in update_options
     assert f"V9_BITMAP_INDEX={bitmap_index}" in bridge_definitions
+    lifecycle_options = (tmp_path / "build/v9_kernel-options.txt").read_text().split(";")
+    assert f"-DV9_RESOLVE_SUBMIT={bitmap_index}" in lifecycle_options
+    assert f"V9_RESOLVE_SUBMIT={bitmap_index}" in bridge_definitions
     includes = [
         source / "include",
         source / "op_kernel",

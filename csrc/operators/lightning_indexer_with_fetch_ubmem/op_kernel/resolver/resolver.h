@@ -2,6 +2,9 @@
 #include "prefetch.h"
 #include "final_scratch.h"
 #include "final_worker_submit.h"
+#if V9_UBMEM_SIMT_FINAL
+#include "final_simt_copy.h"
+#endif
 namespace rotating {
 __simd_vf__ inline void ColdPositions(__ubuf__ uint32_t* selected,
     __ubuf__ uint32_t* locations,__ubuf__ uint32_t* positions,__ubuf__ uint32_t* count) {
@@ -88,6 +91,11 @@ inline void ReplicatedResolve(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc
     // Mapping remains the immutable prefetch snapshot. Final locations and
     // descriptors are authoritative; mutating mapping here races other readers.
     asc_threadfence();
+#if V9_UBMEM_SIMT_FINAL
+    // Reuse the existing planner VF: no new launch or payload scratch. Its
+    // first barrier makes every gathered address/slot visible to copy warps.
+    if constexpr(!PlanOnly)CopyFinalPayloadSimt<Threads>(ctx,batch,worker,count,keys,ranks,slots,cfg);
+#endif
 }
 
 template<bool PlanOnly=false>

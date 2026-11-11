@@ -361,6 +361,13 @@ extern "C" __global__ __aicore__ void v9_resolve_kernel(GM_ADDR bindings) {
         // descriptor slice. Native WQE staging may now borrow UB offset zero.
         SubmitSafeFinal(GetContext(bindings),GetBlockIdx());
 #endif
+#if V9_RESOLVE_SUBMIT
+        // The single planner owns every final descriptor for this row. Its
+        // MTE3 writes are joined and its TPipe is destroyed before native WQE
+        // staging borrows UB offset zero. Join only this row's prefetch CQ;
+        // other rows can still be planning while these READs are outstanding.
+        SubmitFinalBeforeIndex(GetContext(bindings),GetBlockIdx());
+#endif
     }
 #endif
 }

@@ -10,7 +10,8 @@ import pytest
 
 
 @pytest.mark.parametrize("bitmap_index", (0, 1))
-def test_complete_plan_preserves_checks_publication_and_plan(tmp_path, bitmap_index):
+@pytest.mark.parametrize("staged_outputs,resident", ((0, 8192), (1, 16384), (1, 32768)))
+def test_complete_plan_preserves_checks_publication_and_plan(tmp_path, bitmap_index, staged_outputs, resident):
     compiler = shutil.which("c++")
     if compiler is None:
         pytest.skip("C++ compiler required for completion model")
@@ -40,7 +41,7 @@ def test_complete_plan_preserves_checks_publication_and_plan(tmp_path, bitmap_in
     )
     functions += "\ntemplate<bool Extended,bool WithOutputs=false>\n" + function(update, "Update")
     functions += "\n" + function(update, "PublishOutputs")
-    functions += "\n" + function(update, "PlanOwned")
+    functions += "\ntemplate<bool ReleaseScratch=false>\n" + function(update, "PlanOwned")
     functions += "\n" + function(update, "CompleteAndPlan")
     functions += "\n" + function(update, "kvip_ubmem_complete_plan_kernel")
     functions += "\n" + function(update, "kvip_ubmem_complete_plan_outputs_kernel")
@@ -87,26 +88,64 @@ void asc_syncthreads(){}
 void asc_threadfence(){}
 namespace AscendC {
 constexpr uint32_t EVENT_ID0=0;
-enum class HardEvent{V_S,S_V};
-std::vector<std::function<void()>> pending;
-bool events[2]{};
+enum class HardEvent{V_S,S_V,MTE2_S,MTE2_V,V_MTE3,MTE3_S};
+std::vector<std::function<void()>> pending,mte2,mte3;
+bool events[6]{},pipeLive=false;
+uint32_t explicitReleases=0,stagedInvocations=0;
+alignas(32) std::array<uint64_t,223232/8> ub;
 void CompleteV(){for(auto& f:pending)f();pending.clear();}
 template<HardEvent E>void SetFlag(uint32_t){assert(!events[unsigned(E)]);events[unsigned(E)]=true;}
 template<HardEvent E>void WaitFlag(uint32_t){
     assert(events[unsigned(E)]);events[unsigned(E)]=false;
-    if constexpr(E==HardEvent::V_S)CompleteV();
-    else publicationReady=true;
+    if constexpr(E==HardEvent::V_S || E==HardEvent::V_MTE3)CompleteV();
+    if constexpr(E==HardEvent::S_V)publicationReady=true;
+    if constexpr(E==HardEvent::MTE2_S || E==HardEvent::MTE2_V){for(auto& f:mte2)f();mte2.clear();}
+    if constexpr(E==HardEvent::MTE3_S){for(auto& f:mte3)f();mte3.clear();}
 }
-template<class T>struct LocalTensor{T* data;void* GetPhyAddr(){return data;}};
-enum class TPosition{VECCALC};
-// Native TPipe retains its UB through pending VF work. The host model joins
-// at destruction before the matching buffer goes out of scope.
-struct TPipe{template<class T>void InitBuffer(T&,uint32_t){} ~TPipe(){CompleteV();}};
-template<TPosition>struct TBuf{
-    std::vector<uint32_t> data=std::vector<uint32_t>(40000);
-    template<class T>LocalTensor<T> Get(){return {reinterpret_cast<T*>(data.data())};}
-    ~TBuf(){CompleteV();}
+template<class T>struct LocalTensor{
+    T* data;
+    void* GetPhyAddr(){return data;}
+    LocalTensor operator[](uint32_t index)const{return {data+index};}
+    template<class U>LocalTensor<U> ReinterpretCast()const{return {reinterpret_cast<U*>(data)};}
+    T GetValue(uint32_t index)const{assert(mte2.empty());return data[index];}
 };
+template<class T>struct GlobalTensor{
+    T* data=nullptr;
+    void SetGlobalBuffer(T* value){data=value;}
+    GlobalTensor operator[](uint32_t index)const{return {data+index};}
+};
+enum class TPosition{VECCALC};
+// All TPipe instances share the same UB. Opening a second pipe before an
+// explicit release, or releasing while a VF/DMA still uses UB, must fail.
+struct TPipe{
+    bool active=true;
+    TPipe(){assert(!pipeLive);pipeLive=true;}
+    template<class T>void InitBuffer(T&,uint32_t bytes){assert(bytes<=sizeof(ub));}
+    void Destroy(){assert(active && pending.empty() && mte2.empty() && mte3.empty());
+        for(bool flag:events)assert(!flag);active=false;pipeLive=false;++explicitReleases;}
+    ~TPipe(){if(active){CompleteV();Destroy();--explicitReleases;}}
+};
+template<TPosition>struct TBuf{
+    template<class T>LocalTensor<T> Get(){return {reinterpret_cast<T*>(ub.data())};}
+};
+template<class T>void DataCopy(LocalTensor<T> output,GlobalTensor<T> input,uint32_t count){
+    assert(mte3.empty() && count*sizeof(T)%32==0);
+    mte2.push_back([=]{std::copy_n(input.data,count,output.data);});
+}
+template<class T>void DataCopy(GlobalTensor<T> output,LocalTensor<T> input,uint32_t count){
+    assert(pending.empty() && mte2.empty() && count==2048);
+    mte3.push_back([=]{std::copy_n(input.data,count,output.data);});
+}
+struct DataCopyExtParams{uint16_t blocks;uint32_t bytes,srcStride,dstStride,rsv;};
+template<class T>struct DataCopyPadExtParams{bool pad;uint32_t left,right;T value;};
+template<class T>void DataCopyPad(LocalTensor<T> output,GlobalTensor<T> input,
+    DataCopyExtParams shape,DataCopyPadExtParams<T>){
+    assert(shape.blocks==1 && shape.bytes==sizeof(T));
+    // The actual staged publisher may read its own status before any other
+    // batch is complete, but reading another packed row's status must fail.
+    if(uintptr_t(input.data)>=errorsBegin && uintptr_t(input.data)<errorsEnd)++stagedInvocations;
+    mte2.push_back([=]{*output.data=asc_ldcg(input.data);});
+}
 namespace Simt {
 struct Dim3{uint32_t x,y,z;};
 template<auto F,class... A>void VF_CALL(Dim3 grid,A... args){
@@ -118,6 +157,7 @@ namespace ubmem_device {void CleanCacheLines(uint8_t*,uint64_t){publicationReady
 using namespace AscendC;
 #include "device_context.h"
 #include "index_cache_update.h"
+#include "staged_outputs.h"
 // Planner's existing one-thread host mode runs its real path/cycle algorithm.
 constexpr uint32_t kCandidates=kExtendedCandidates,kThreads=1;
 FUNCTIONS
@@ -145,7 +185,10 @@ Result Run(uint32_t mode,uint32_t fault) {
     std::iota(logical.begin(),logical.end(),100000);
     for(uint32_t q=0;q<SIM_BATCH*4;++q) {
         unpack[q]=(q*3+5)%(SIM_BATCH*4);
-        for(uint32_t k=0;k<2048;++k){topk[q*2048+k]=k%SIM_HISTORY;locations[q*2048+k]=(q+k)%SIM_RESIDENT;}
+        for(uint32_t k=0;k<2048;++k){
+            topk[q*2048+k]=k%13? k%SIM_RESIDENT:SIM_RESIDENT+k%(SIM_HISTORY-SIM_RESIDENT);
+            locations[q*2048+k]=(q+k)%SIM_RESIDENT;
+        }
     }
     if(fault%3==0)valid.back()=0;
     if(fault%3==1)unpack[0]=-1;
@@ -209,13 +252,18 @@ Result Run(uint32_t mode,uint32_t fault) {
     watched={{ctx.rows,ctx.rows+rows.size()*sizeof(Row)},{ctx.rowStatus,ctx.rowStatus+info.size()*4},
         {ctx.ubmemStatus,ctx.ubmemStatus+status.size()*8},{a[11],a[11]+SIM_BATCH*kFinalWorkers*sizeof(FinalPost)}};
     publicationReady=false;
+    explicitReleases=stagedInvocations=0;
     for(uint32_t i=0;i<SIM_BATCH;++i) {
         block=SIM_BATCH-1-i; // Cross-batch TND rows cannot rely on another block's status.
         if(mode==2)kvip_ubmem_complete_plan_outputs_kernel(reinterpret_cast<GM_ADDR>(bindings),reinterpret_cast<GM_ADDR>(a));
         else if(mode==1)kvip_ubmem_complete_plan_kernel(reinterpret_cast<GM_ADDR>(bindings),reinterpret_cast<GM_ADDR>(a));
         else {CompleteBatch(&ctx,block);publicationReady=true;PlanOwned(reinterpret_cast<GM_ADDR>(a));}
-        assert(pending.empty() && !events[0] && !events[1]);
+        assert(pending.empty() && mte2.empty() && mte3.empty() && !pipeLive);
+        for(bool flag:events)assert(!flag);
     }
+    const bool mergedStaging=mode==2 && V9_STAGED_OUTPUTS && SIM_RESIDENT<=16384;
+    assert(stagedInvocations==(mergedStaging?SIM_BATCH:0));
+    assert(explicitReleases==(mergedStaging?SIM_BATCH*2:0));
     allPlansComplete=true;
     if(mode!=2)for(uint32_t core=0;core<kOutputCores;++core){threadIdx.x=0;PublishOutputs(a,core);}
     for(uint32_t q=0;q<SIM_BATCH*4;++q)for(uint32_t k=0;k<2048;++k) {
@@ -249,7 +297,14 @@ int main(){for(uint32_t fault=0;fault<15;++fault){auto baseline=Run(0,fault);ass
         for node in runner.body
         if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "common" for t in node.targets)
     )
-    definitions = common | {"SIM_BATCH": 2, "TOKEN_BYTES": 2624, "V9_BITMAP_INDEX": bitmap_index}
+    definitions = common | {
+        "SIM_BATCH": 2,
+        "SIM_RESIDENT": resident,
+        "TOKEN_BYTES": 2624,
+        "V9_BITMAP_INDEX": bitmap_index,
+        "V9_UBMEM_MERGE_OUTPUTS": 1,
+        "V9_STAGED_OUTPUTS": staged_outputs,
+    }
     subprocess.run(
         [
             compiler,

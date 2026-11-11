@@ -17,6 +17,7 @@ from kvip.diagnostics.compare import (
     display,
     summarize,
     summarize_saved,
+    stage_payload_rates,
 )
 from kvip.diagnostics.replay_measure import fused_reads, statistics
 
@@ -54,6 +55,46 @@ def test_comparison_uses_fixed_archive_and_reports_fusion_reduction():
         target_met=True,
     )
     assert value["table"]["urma-fused"]["mean_read_bytes"] == 26240
+
+
+def test_stage_rates_use_instrumented_bytes_and_never_urma_cq_tail():
+    entry = results()["ubmem-serial"]
+    entry["stage_diagnostics"] = dict(
+        stages={"batch_get": dict(mean_us=20.0), "resolve_final_fetch": dict(mean_us=40.0)},
+        reads_samples=[dict(bytes=100000, final=10), dict(bytes=200000, final=30)],
+    )
+    assert stage_payload_rates(entry)["payload_GBps"] == 7.5
+    entry["mode"] = "fused"
+    rate = stage_payload_rates(entry)
+    assert rate["mean_bytes"] == 20 * 2624
+    assert rate["payload_GBps"] == 20 * 2624 / 40 / 1000
+    assert "excludes LI prefetch" in rate["scope"]
+    entry["transport"] = "urma"
+    entry["stage_diagnostics"]["stages"]["final_fetch_wait"] = dict(mean_us=0.1)
+    assert stage_payload_rates(entry) == {}
+    entry["mode"] = "serial"
+    entry["stage_diagnostics"]["reads_samples"] = []
+    assert stage_payload_rates(entry) == {}
+
+
+def test_compare_fused_variants_reuse_existing_replay_cli(tmp_path):
+    value = json.dumps(
+        [
+            dict(name="before", tuning=dict(compact_reserved=True)),
+            dict(name="after", tuning=dict(compact_reserved=True, balanced_index=True)),
+        ]
+    )
+    args = arguments(cli(tmp_path) + ["--ubmem-fused-variants", value])
+    argv, _ = command(args, "ubmem", "fused")
+    assert argv[argv.index("--fused-variants") + 1] == value
+    assert "--fused-tuning" not in argv
+    assert "--quiet" in argv
+    assert "--fused-variants" not in command(args, "urma", "fused")[0]
+    assert "--fused-variants" not in command(args, "ubmem", "serial")[0]
+    with pytest.raises(SystemExit):
+        arguments(cli(tmp_path) + ["--ubmem-fused-variants", value, "--ubmem-fused-tuning", "{}"])
+    with pytest.raises(SystemExit):
+        arguments(cli(tmp_path) + ["--ubmem-fused-variants", value, "--urma-serial-workers-candidates", "2", "32"])
 
 
 @pytest.mark.parametrize("bad_candidate", (None, "kvip_commit", "status", "scope", "mean_us"))

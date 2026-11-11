@@ -121,6 +121,33 @@ def test_split_index_stages_retain_native_order_without_extra_work():
     ]
 
 
+def test_resolve_submit_diagnostic_does_not_submit_final_twice():
+    calls = []
+    library = Library(calls)
+    rotating = SimpleNamespace(
+        library=library,
+        bindings=SimpleNamespace(data_ptr=lambda: 11),
+        shape_pointer=44,
+        parallel_final=True,
+        post_final_before_index=True,
+        resolve_submit=True,
+    )
+    update = SimpleNamespace(library=library, bindings=SimpleNamespace(data_ptr=lambda: 22))
+    lease = SimpleNamespace(check_stream=lambda: SimpleNamespace(npu_stream=33))
+    stages = fused_stages("urma", rotating, update, lease, 16)
+    for _, call in stages:
+        call()
+    assert [name for name, _ in stages][:3] == ["init", "li_with_prefetch", "resolve_join_and_final_submit"]
+    assert "v9_submit_final" not in [name for name, _ in calls]
+    assert [name for name, _ in calls].count("v9_resolve") == 1
+
+
+def test_ubmem_reserved_local_inverse_can_share_simt_control_vf():
+    geometry = dict(prefetch_limit=256, window_limit=32, requested_windows=8)
+    tuning = fusion_tuning(geometry, "ubmem", dict(compact_reserved=True, reserved_ub=True, simt_init=True))
+    assert tuning["reserved_ub"] and tuning["simt_init"]
+
+
 def test_combined_completion_stage_stops_on_plan_failure():
     calls = []
     library = Library(calls)
@@ -150,11 +177,13 @@ def test_tuning_keeps_snapshot_immutable_and_validates_only_known_options():
         single_plan=False,
         cached_buckets=False,
         fused_init=False,
+        simt_final=False,
         cold_only_prefetch=False,
         threshold_only=False,
         simt_init=False,
         staged_outputs=False,
         rolling_threshold=False,
+        pruned_topk=False,
         bitmap_index=False,
         reserved_ub=False,
     )
@@ -179,17 +208,25 @@ def test_urma_tuning_has_only_real_switches_and_fixed_inactive_gate():
         skip_final_partition=False,
         post_final_before_index=False,
         merge_final_completion=False,
+        resolve_submit=False,
         cold_only_prefetch=False,
         threshold_only=False,
         simt_init=False,
         staged_outputs=False,
         rolling_threshold=False,
+        pruned_topk=False,
         bitmap_index=False,
         reserved_ub=False,
     )
     assert fusion_tuning(geometry, "urma", {"parallel_final": True})["parallel_final"] is True
     assert fusion_tuning(geometry, "ubmem", {"grouped_copy": True})["grouped_copy"] is True
     for transport, invalid in (
+        ("ubmem", {"pruned_topk": True, "threshold_only": True}),
+        ("urma", {"pruned_topk": True, "threshold_only": True}),
+        ("ubmem", {"simt_final": True, "single_plan": True}),
+        ("urma", {"resolve_submit": True}),
+        ("urma", {"simt_final": True}),
+        ("ubmem", {"resolve_submit": True}),
         ("urma", {"grouped_copy": False}),
         ("urma", {"skip_inactive": True}),
         ("ubmem", {"grouped_copy": 1}),
