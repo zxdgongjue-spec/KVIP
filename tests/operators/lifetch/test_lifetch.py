@@ -40,6 +40,8 @@ def arguments(argv=None):
     p.add_argument("--warmup", type=int, default=4)
     p.add_argument("--comparison-output", type=Path)
     p.add_argument("--comparison-sfa", type=Path)
+    p.add_argument("--li-only-varlen", action="store_true",
+                   help="run only custom v9 LI with two mixed-length forwards; requires the URMA test fixture")
     p.add_argument("--output", type=Path, default=ROOT / "tests/results/lifetch")
     a = p.parse_args(argv)
     if a.kvaf_root is None:
@@ -59,6 +61,15 @@ def arguments(argv=None):
         p.error("windows must be 1..32")
     if not 0 <= a.prefetch_tokens <= 2048 or a.prefetch_tokens % a.intermediate_fetches:
         p.error("prefetch tokens must be 0..2048 and divisible by windows")
+    if a.li_only_varlen and (
+        batches != [4] or a.history != 8192 or a.resident != 2048 or a.index_heads != 32
+        or a.miss_percent != 0 or a.prefetch_tokens != 0 or a.runtime_shapes
+        or a.resolver_compare or a.comparison_output or a.comparison_sfa
+    ):
+        p.error(
+            "li-only-varlen requires batch=4, history=8192, resident=2048, "
+            "index-heads=32, miss-percent=0, prefetch-tokens=0, and no runtime/resolver comparisons"
+        )
     return a
 
 
@@ -152,6 +163,8 @@ def main(argv=None):
     p.add_argument('--resolver-compare', action='store_true', help='URMA resolver comparison')
     p.add_argument('--comparison-output', type=Path)
     p.add_argument('--comparison-sfa', type=Path)
+    p.add_argument('--li-only-varlen', action='store_true',
+                   help='run only custom v9 LI with two mixed-length forwards')
     p.add_argument('--output', type=Path, default=ROOT / 'tests/results/lifetch')
     p.add_argument('--timeout-seconds', type=int, default=1800)
     a = p.parse_args(argv)
@@ -168,6 +181,15 @@ def main(argv=None):
         p.error('invalid geometry, prefetch budget, timing or timeout')
     if (a.comparison_output or a.comparison_sfa) and (len(batches) != 1 or a.runtime_shapes):
         p.error('comparison snapshots require one batch and no runtime-shapes')
+    if a.li_only_varlen and (
+        a.transport != 'urma' or batches != [4] or a.history != 8192 or a.resident != 2048
+        or a.index_heads != 32 or a.miss_percent != 0 or a.prefetch_tokens != 0
+        or a.runtime_shapes or a.resolver_compare or a.comparison_output or a.comparison_sfa
+    ):
+        p.error(
+            'li-only-varlen requires URMA, batch=4, history=8192, resident=2048, '
+            'index-heads=32, miss-percent=0, prefetch-tokens=0, and no runtime/resolver comparisons'
+        )
     state = ROOT / 'build/dependencies.json'
     kvaf_root = (a.kvaf_root or (Path(json.loads(state.read_text())['kvaf']) if state.exists()
                                  else ROOT / 'third_party/KVAF')).resolve()
@@ -175,6 +197,8 @@ def main(argv=None):
               '--resident', str(a.resident), '--index-heads', str(a.index_heads), '--miss-percent',
               str(a.miss_percent), '--prefetch-tokens', str(a.prefetch_tokens), '--warmup', str(a.warmup),
               '--iterations', str(a.iterations)]
+    if a.li_only_varlen:
+        common.append('--li-only-varlen')
     if a.transport == 'urma':
         command = [sys.executable, '-u', str(Path(__file__).resolve()), '--internal-urma', *common,
                    '--kvaf-root', str(kvaf_root), '--cann', a.cann, '--batches', a.batches,

@@ -167,6 +167,16 @@ def run(args, run_dir):
                     build_options={k: str(v) for k, v in options.items()},
                 )
                 (folder / "report.json").write_text(json.dumps(report, indent=2))
+                if args.li_only_varlen:
+                    line = (
+                        f"V9_LI_VARLEN_PASS batch={batch} history={history} resident={resident} "
+                        f"index_heads={heads} rounds={len(report['rounds'])}; "
+                        "scope=v9_init+v9_li+v9_wait; resolver/final-fetch/Index-update not tested"
+                    )
+                    summaries.append(line)
+                    (run_dir / "cases.log").write_text("\n".join(summaries) + "\n")
+                    print(line, flush=True)
+                    continue
             except BaseException:
                 (folder / "error.log").write_text(traceback.format_exc())
                 raise
@@ -209,6 +219,183 @@ def run(args, run_dir):
         print(line, flush=True)
     progress(run_dir, "all prototype graph cases completed")
     return 0
+
+
+
+def run_v9_li_varlen_only(args, b, torch, torch_npu, device, owner, arguments, fixture, native_li, launch_module, aics):
+    """Exercise only v9_init + v9_li + v9_wait with per-request Q/K lengths."""
+    from kvip.adapters.vllm.inputs import QueryInputs
+
+    history, resident = args.history, args.resident
+    inputs = QueryInputs(
+        torch, b, device, pin_memory=True, history=history, index_heads=args.index_heads
+    )
+    query_lengths = torch.zeros((b,), dtype=torch.int32, device=device)
+    key_lengths = torch.zeros((b,), dtype=torch.int32, device=device)
+    inputs.bind_actual_lengths(query_lengths, key_lengths)
+
+    # These are the exact pointers consumed as P(5)/P(6) by v9_li_kernel.
+    arguments[5] = query_lengths
+    arguments[6] = key_lengths
+    query_ends = inputs.query_ends.view(b, 4)
+    q_ptr, k_ptr, ends_ptr = (
+        query_lengths.data_ptr(), key_lengths.data_ptr(), query_ends.data_ptr()
+    )
+
+    owner.acquire()
+    rotating = launch_module.LIFetchBinding(
+        torch,
+        owner._lifetch_library_path,
+        arguments,
+        owner,
+        batch=b,
+        history=history,
+        resident=resident,
+        aic_count=aics,
+        intermediate_fetches=args.intermediate_fetches,
+        prefetch_limit=0,
+        output_stride=owner.output.shape[1],
+        query_ends=query_ends,
+    )
+    topk = arguments[9].view(torch.int32).reshape(b, 4, 2048)
+    stream = torch.npu.current_stream(device)
+
+    scenarios = (
+        {
+            "name": "mixed_qk_round1",
+            "query_counts": (4, 2, 1, 0),
+            "query_starts": (0, 4, 6, 7),
+            "key_lengths": (8192, 6144, 2048, 0),
+        },
+        {
+            "name": "mixed_qk_round2",
+            "query_counts": (1, 0, 3, 2),
+            "query_starts": (0, 1, 1, 4),
+            "key_lengths": (4096, 0, 8192, 6144),
+        },
+    )
+
+    summaries = []
+    for scenario in scenarios:
+        counts = scenario["query_counts"]
+        expected_k = scenario["key_lengths"]
+        packed_positions = [
+            key_len - 1
+            for count, key_len in zip(counts, expected_k)
+            for _ in range(count)
+        ]
+        inputs.prepare(
+            counts,
+            query_starts=scenario["query_starts"],
+            query_owners=tuple(range(b)),
+        )
+        inputs.bind_positions(
+            torch.tensor(packed_positions, dtype=torch.int64, device=device)
+        )
+        stream.synchronize()
+
+        actual_q = tuple(int(x) for x in query_lengths.cpu().tolist())
+        actual_k = tuple(int(x) for x in key_lengths.cpu().tolist())
+        if actual_q != counts or actual_k != expected_k:
+            raise AssertionError(
+                f"{scenario['name']}: actual Q/K lengths "
+                f"{actual_q}/{actual_k} != {counts}/{expected_k}"
+            )
+
+        fixture["li_query_lengths"] = query_lengths
+        fixture["actual_key"] = key_lengths
+        native_output = native_li(torch_npu, fixture).reshape(b, 4, 2048)
+        torch.npu.synchronize()
+
+        # The zero-miss fixture guarantees every native TopK is resident.
+        for row, q_len in enumerate(counts):
+            active = native_output[row, :q_len]
+            if active.numel() and (
+                bool(torch.any(active < 0).item()) or bool(torch.any(active >= resident).item())
+            ):
+                raise AssertionError(
+                    f"{scenario['name']}: native TopK escaped the resident range at row {row}"
+                )
+
+        topk.fill_(0x5A5A5A5A)
+        rotating.reset()
+        owner.reset()
+        owner.mark_launched()
+        rotating.launch_compute()
+        rotating.wait()
+        stream.synchronize()
+
+        # v9_wait drains the LI-stage prefetch CQ. No final queue is submitted
+        # in this LI-only test, so only the prefetch status is authoritative.
+        status_words = rotating.prefetch_status.cpu().contiguous().view(torch.uint64).numpy()
+        expected_magic = 0x4B5641464247444F
+        if status_words.shape[0] != b * 2:
+            raise AssertionError(f"unexpected prefetch status rows: {status_words.shape}")
+        if not bool(np.all(status_words[:, 0] == expected_magic)) or not bool(
+            np.all(status_words[:, 2] == 0)
+        ):
+            raise AssertionError(f"{scenario['name']}: LI prefetch CQ status is invalid")
+        rows = rotating.rows.cpu().numpy()
+        if bool(np.any(rows[:, 11] != 0)) or bool(np.any(rows[:, 211] != 0)):
+            raise AssertionError(f"{scenario['name']}: LI row error or pending WQE remains")
+
+        owner.mark_completed(completion_verified=True)
+
+        active_queries = 0
+        padded_queries = 0
+        for row, q_len in enumerate(counts):
+            for query_index in range(q_len):
+                actual = torch.sort(topk[row, query_index]).values
+                expected = torch.sort(native_output[row, query_index]).values
+                if not torch.equal(actual, expected):
+                    raise AssertionError(
+                        f"{scenario['name']}: v9 LI/native TopK mismatch "
+                        f"at row={row}, query={query_index}"
+                    )
+                active_queries += 1
+            padding = topk[row, q_len:]
+            if padding.numel():
+                if not bool(torch.all(padding == -1).item()):
+                    raise AssertionError(
+                        f"{scenario['name']}: v9 LI did not clear padded Q outputs at row {row}"
+                    )
+                padded_queries += 4 - q_len
+
+        if (
+            query_lengths.data_ptr() != q_ptr
+            or key_lengths.data_ptr() != k_ptr
+            or inputs.query_ends.data_ptr() != ends_ptr
+        ):
+            raise AssertionError("Q/K/query-end buffer addresses changed between forwards")
+
+        summaries.append(
+            {
+                "name": scenario["name"],
+                "query_lengths": list(actual_q),
+                "key_lengths": list(actual_k),
+                "active_queries_checked": active_queries,
+                "padded_queries_checked": padded_queries,
+                "native_vs_v9_li": "PASS",
+                "prefetch_cq": "PASS",
+                "result": "PASS",
+            }
+        )
+
+    return {
+        "test": "custom_v9_li_variable_actual_qk_lengths",
+        "soc": args.soc,
+        "batch": b,
+        "history": history,
+        "resident": resident,
+        "index_heads": args.index_heads,
+        "topk": 2048,
+        "prefetch_limit": 0,
+        "length_buffers_stable": True,
+        "rounds": summaries,
+        "executed_stages": ["v9_init", "v9_li", "v9_wait"],
+        "excluded_stages": ["v9_resolve", "v9_fetch", "Index cache update"],
+        "result": "PASS",
+    }
 
 
 def run_device(
@@ -254,6 +441,11 @@ def run_device(
         query_scale=arguments[3].view(torch.float32).reshape(b, 4, args.index_heads),
         key_scale=arguments[4].view(torch.float32).reshape(-1, 128, 1),
     )
+    if getattr(args, "li_only_varlen", False):
+        return run_v9_li_varlen_only(
+            args, b, torch, torch_npu, device, owner, arguments, fixture,
+            native_li, launch_module, aics,
+        )
     stream = torch.npu.current_stream(device)
     capture = torch.npu.Stream(device=device)
     native = NativeMtp(torch, device, owner, fixture, source_tokens=h, padded_tokens=h)
