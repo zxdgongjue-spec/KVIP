@@ -47,30 +47,35 @@ def audit_queue_writes(owner, rows, posts, row, bad_slots):
     """Read already-completed SQ entries on failure; no device work is submitted."""
     import ctypes
 
-    acl = ctypes.CDLL("libascendcl.so")
-    copy = acl.aclrtMemcpy
-    copy.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-    copy.restype = ctypes.c_int
+    torch = owner.torch
+    snapshot = owner.abi_library.kvip_transport_snapshot
+    snapshot.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
+    snapshot.restype = ctypes.c_uint32
 
     def read(address, size):
-        if not address or not 0 < size <= 2 * 1024 * 1024:
-            raise ValueError(f"invalid device read: {address:#x}, {size}")
-        result = np.empty(size, dtype=np.uint8)
-        code = copy(result.ctypes.data, size, address, size, 2)
+        if not address or address % 32 or not 0 < size <= 2 * 1024 * 1024 or size % 32:
+            raise ValueError(f"invalid queue snapshot: {address:#x}, {size}")
+        result = torch.empty(size, dtype=torch.uint8, device=owner.device)
+        stream = torch.npu.current_stream(owner.device)
+        code = snapshot(address, result.data_ptr(), size, stream.npu_stream)
         if code:
-            raise RuntimeError(f"aclrtMemcpy returned {code}")
-        return result
+            raise RuntimeError(f"queue snapshot launch returned {code}")
+        return result.cpu().numpy()
 
     contexts = owner.device_args.cpu().numpy().view('<u8')
     workers = posts.shape[1]
     batch = posts.shape[0]
-    initial = int(rows[row, 212]) | (int(rows[row, 213]) << 32)
-    queue_specs = [('prefetch', row * 2, initial, int(rows[row, 9]))]
-    for q, post in enumerate(posts[row]):
-        view = row * 2 + 1 if q == 0 else batch * 2 + row * (workers - 1) + q - 1
-        count = int(post[0])
-        queue = read(int(contexts[view, 9]), 64).view('<u8')
-        queue_specs.append((f'final_q{q+1}', view, int(queue[1]) - count, count))
+    queue_specs = []
+    for owner_row in range(batch):
+        initial = int(rows[owner_row, 212]) | (int(rows[owner_row, 213]) << 32)
+        queue_specs.append((f'b{owner_row}_prefetch', owner_row * 2, initial, int(rows[owner_row, 9])))
+        for q, post in enumerate(posts[owner_row]):
+            view = owner_row * 2 + 1 if q == 0 else batch * 2 + owner_row * (workers - 1) + q - 1
+            count = int(post[0])
+            if not count:
+                continue
+            queue = read(int(contexts[view, 9]), 64).view('<u8')
+            queue_specs.append((f'b{owner_row}_final_q{q+1}', view, int(queue[1]) - count, count))
     result = []
     for name, view, start, count in queue_specs:
         if not count:
