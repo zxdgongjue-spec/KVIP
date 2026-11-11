@@ -44,10 +44,14 @@ def run(args, run_dir):
     from real_fetch_session import RealFetchSession
     from test_lifetch import native_log
 
-    torch, registration, _ = _load_native_operators("c8_offload")
-    import torch_npu
+    if args.li_only_varlen:
+        import torch
+        import torch_npu  # noqa: F401
+    else:
+        torch, registration, _ = _load_native_operators("c8_offload")
+        import torch_npu
 
-    registration.require_a5_dsa_registration(("lidu_fused_batch_get_prepare_mtp_out",))
+        registration.require_a5_dsa_registration(("lidu_fused_batch_get_prepare_mtp_out",))
     torch.npu.set_device(args.device)
     device = torch.device(f"npu:{args.device}")
     resources = query_device_resources(args.cann, args.device, 0)
