@@ -41,6 +41,7 @@ class LIFetchWorkspace:
         self.inputs = self._make_inputs(torch, batch, device, pin_memory=pin_memory, history=history, index_heads=index_heads)
         self.query_lengths = torch.full((batch,), 4, dtype=torch.int32, device=device)
         self.key_lengths = torch.full((batch,), history, dtype=torch.int32, device=device)
+        self.inputs.bind_actual_lengths(self.query_lengths, self.key_lengths)
         self.topk = torch.full((batch, 4, 2048), -1, dtype=torch.int32, device=device)
         self.dummy = torch.zeros(1, dtype=torch.uint8, device=device)
         self.tail_bounds = torch.zeros((batch, 2), dtype=torch.int32, device=device)

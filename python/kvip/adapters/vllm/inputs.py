@@ -50,6 +50,8 @@ class QueryInputs:
         self.scale = torch.empty((capacity, self.index_heads), dtype=torch.float32, device=device)
         self.position_scratch = torch.empty(capacity, dtype=torch.int64, device=device)
         self.query_ends = torch.zeros(capacity, dtype=torch.int32, device=device)
+        self.query_lengths = None
+        self.key_lengths = None
         self.token_count = 0
         self.block_offsets = torch.arange(history // 128, dtype=torch.int32, device=device)
         self.block_table = torch.zeros((batch, history // 128), dtype=torch.int32, device=device)
@@ -118,11 +120,39 @@ class QueryInputs:
             event.record(self.torch.npu.current_stream(self.device))
         self.turn += 1
 
+    def bind_actual_lengths(self, query_lengths, key_lengths):
+        """Bind the persistent Native LI actual-sequence-length ABI outputs."""
+        expected_shape = (self.batch,)
+        for value in (query_lengths, key_lengths):
+            if (
+                value.device != self.query_ends.device
+                or value.dtype != self.torch.int32
+                or tuple(value.shape) != expected_shape
+                or not value.is_contiguous()
+            ):
+                raise ValueError(
+                    "LIFetch actual lengths must be contiguous int32 [batch] tensors "
+                    "on the QueryInputs device"
+                )
+        if query_lengths.data_ptr() == key_lengths.data_ptr():
+            raise ValueError("LIFetch query and key lengths must use distinct output buffers")
+        self.query_lengths, self.key_lengths = query_lengths, key_lengths
+
     def bind_positions(self, positions):
-        """Enqueue once per forward, after the runner corrects MTP positions."""
+        """Enqueue corrected positions and publish actual Q/K lengths for Native LI."""
         self.torch.index_select(positions, 0, self.gather_indices, out=self.position_scratch)
         self.position_scratch.add_(1).mul_(self.query_valid)
         self.query_ends.copy_(self.position_scratch)
+        if self.query_lengths is not None:
+            query_valid = self.query_valid.view(self.batch, QUERIES_PER_REQUEST)
+            query_ends = self.query_ends.view(self.batch, QUERIES_PER_REQUEST)
+            self.torch.sum(
+                query_valid,
+                dim=1,
+                dtype=self.torch.int32,
+                out=self.query_lengths,
+            )
+            self.torch.amax(query_ends, dim=1, out=self.key_lengths)
         return self.query_ends.view(self.batch, QUERIES_PER_REQUEST)
 
     def pack(self, query, weights, scale):
