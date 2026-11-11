@@ -19,6 +19,12 @@ BATCHES = (1, 2, 4, 8, 16)
 MISSES = (3, 5, 10, 15)
 
 
+def worker_pythonpath(code, kvaf, inherited):
+    """Prioritize selected checkouts while retaining CANN/ACL environment paths."""
+    return os.pathsep.join(filter(None, (str(code / "python"),
+                                       str(kvaf / "build-npu/python"), inherited)))
+
+
 def git(*args):
     return subprocess.check_output(['git', '-C', str(ROOT), *args], text=True).strip()
 
@@ -123,7 +129,7 @@ def main():
                     command += ['--streaming', '--streaming-fetch', '--fused-final', '--q-workers', '2',
                                 '--prepare-update-metadata', '--optimized-resolve']
                 old_path = os.environ.get('PYTHONPATH')
-                os.environ['PYTHONPATH'] = f'{code}/python:{kvaf}/build-npu/python'
+                os.environ['PYTHONPATH'] = worker_pythonpath(code, kvaf, old_path)
                 print(f'=== {variant} BS={batch} miss={miss}% ===', flush=True)
                 try:
                     status = supervise(command, folder, timeout_seconds=args.timeout_seconds)

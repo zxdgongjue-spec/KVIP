@@ -11,6 +11,13 @@ SPEC.loader.exec_module(matrix)
 
 
 class MatrixSummaryTest(unittest.TestCase):
+    def test_preserve_cann_acl_path(self):
+        inherited = '/usr/local/Ascend/cann/python/site-packages:/custom/python'
+        result = matrix.worker_pythonpath(Path('/selected'), Path('/kvaf'), inherited)
+        self.assertEqual(result, '/selected/python:/kvaf/build-npu/python:' + inherited)
+        self.assertEqual(matrix.worker_pythonpath(Path('/selected'), Path('/kvaf'), None),
+                         '/selected/python:/kvaf/build-npu/python')
+
     def populate(self, root):
         for batch in matrix.BATCHES:
             for miss in matrix.MISSES:
