@@ -27,7 +27,7 @@ class StreamingForward:
         self.events_dst = torch.empty_like(self.events_src)
         self.worker_status = torch.zeros((b, 32), dtype=torch.int32, device=device)
         # First 64 words/request are resolver/update, then 16 words per Q.
-        self.times = torch.zeros((b * (256 if q_workers else (224 if fused_final else 128)),), dtype=torch.int64, device=device)
+        self.times = torch.zeros((b * (256 if q_workers else (224 if fused_final else 128)) + ((2*b+4*q_workers)*32 if q_workers else 0),), dtype=torch.int64, device=device)
         self.query_bitmaps = torch.empty((b, 4, 512), dtype=torch.int32, device=device)
         self.query_errors = torch.zeros((b, 4, 32), dtype=torch.int32, device=device)
         # Dense fallback holds two uint32 permutations and two uint64 snapshots.
@@ -118,7 +118,7 @@ class StreamingForward:
         raw = self.times.cpu().numpy().astype(np.uint64)
         rows = raw[:self.batch * 64].reshape(self.batch, 64)
         li = raw[self.batch * 64:self.batch * 128].reshape(self.batch, 4, 16)
-        fetch = raw[self.batch * 128:].reshape(self.batch, 128 if self.q_workers else 96) if self.fused_final else None
+        fetch = raw[self.batch * 128:self.batch * (256 if self.q_workers else 224)].reshape(self.batch, 128 if self.q_workers else 96) if self.fused_final else None
         flags = self.flags.cpu().numpy()
         posts = (self.rotating.final_posts.cpu().numpy() if hasattr(self, "rotating") else None)
         result = []
@@ -153,7 +153,7 @@ class StreamingForward:
                     safe_cq_wait=int(f[q*24+13]), conflict_post=int(f[q*24+14]),
                     conflict_cq_wait=int(f[q*24+15]), safe_groups=int(f[q*24+16]),
                     conflict_groups=int(f[q*24+17]), safe_mode=int(f[q*24+20]), total=int(f[q*24+9]-f[q*24]),
-                    final_prefetch_join=int(f[q*24+19]-f[q*24+18]) if f[q*24+18] else 0)
+                    group_prepare=int(f[q*24+18]), group_pack=int(f[q*24+19]))
                     for q in range(4)], finalize=dict(prefetch_join=int(f[100]-f[96]), prefetch_polls=int(f[101]),
                     prefetch_cq_poll_cycles=int(f[102]), prefetch_last_cq_observed=int(f[103]), wait=int(f[97]-f[100]),
                     residency=int(f[98]-f[97]), status=int(f[99]-f[98])))
@@ -196,4 +196,11 @@ class StreamingForward:
                     first_doorbell=start, last_doorbell=int(last_nonzero.max()),
                     last_cq_observed=end, interval_cycles=max(0, end - start),
                     note='first doorbell to last CQ observed; includes polling delay and LI-window gaps')
+        if self.q_workers:
+            result[0]['core_timeline_raw'] = dict(
+                batch=self.batch, workers_per_query=self.q_workers,
+                clock_mhz=getattr(self, 'counter_clock_mhz', None),
+                cores=raw[self.batch*256:].reshape(2*self.batch+4*self.q_workers, 32).tolist(),
+                producer_update=raw[:self.batch*64].reshape(self.batch, 64).tolist(),
+                fetch=fetch.tolist(), flags=flags.tolist())
         return result

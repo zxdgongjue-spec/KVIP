@@ -21,7 +21,7 @@ def test_fused_fetch_timing_decodes_per_query_and_per_request():
     pipeline.fused_final = True
     pipeline.q_workers = None
     words = np.zeros(224, dtype=np.uint64)
-    p, u, li, f = words[:32], words[32:64], words[64:128].reshape(4, 16), words[128:]
+    p, u, li, f = words[:32], words[32:64], words[64:128].reshape(4, 16), words[128:256]
     p[1:4] = [10, 20, 30]
     p[8] = 100
     for q in range(4):
@@ -48,8 +48,8 @@ def test_query_worker_timing_and_assignment_are_distinct():
     pipeline.batch = 1
     pipeline.fused_final = True
     pipeline.q_workers = 2
-    words = np.zeros(256, dtype=np.uint64)
-    p, u, li, f = words[:32], words[32:64], words[64:128].reshape(4, 16), words[128:]
+    words = np.zeros(256 + 10 * 32, dtype=np.uint64)
+    p, u, li, f = words[:32], words[32:64], words[64:128].reshape(4, 16), words[128:256]
     p[1:4] = [10, 20, 30]
     p[8] = 100
     for q in range(4):
@@ -83,3 +83,9 @@ def test_query_worker_timing_and_assignment_are_distinct():
     assert data['fetch']['queries'][2]['safe_cq_wait'] == 2
     assert data['fetch']['queries'][2]['conflict_groups'] == 6
     assert data['fetch']['finalize'] == {'prefetch_join': 4, 'prefetch_polls': 7, 'prefetch_cq_poll_cycles': 3, 'prefetch_last_cq_observed': 53, 'wait': 6, 'residency': 10, 'status': 10}
+
+
+def test_core_timeline_export_uses_timestamp_rows():
+    import inspect
+    source = inspect.getsource(StreamingForward.diagnostic_cycles)
+    assert 'producer_update=raw[:self.batch*64]' in source

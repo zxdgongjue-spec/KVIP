@@ -180,7 +180,7 @@ def run(torch, owner, rotating, pipeline, args):
                 graph.replay()
                 stream.synchronize()
                 verify()
-                ticks = pipeline.times.cpu().numpy()[batch * 128:].reshape(batch, 128)
+                ticks = pipeline.times.cpu().numpy()[batch * 128:batch * 256].reshape(batch, 128)
                 qs = range(4) if query == 4 else [query]
                 for q in qs:
                     for lane in range(2):

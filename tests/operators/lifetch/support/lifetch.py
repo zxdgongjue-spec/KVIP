@@ -465,6 +465,7 @@ def run_device(
     counter_clock_mhz = (pipeline.calibrate_counter_mhz()
                          if args.streaming and args.q_workers and not args.fetch_only_compare else None)
     if counter_clock_mhz is not None:
+        pipeline.counter_clock_mhz = counter_clock_mhz
         print(f"GetSystemCycle calibration: {counter_clock_mhz:.2f} MHz (independent long graph event)", flush=True)
     saved = [arguments[i].clone() for i in (1, 4, 13)]
 

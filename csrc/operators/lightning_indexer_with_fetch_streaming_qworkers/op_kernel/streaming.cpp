@@ -340,6 +340,10 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
    auto ft=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*128+uint64_t(b)*128+q*24;
    ft[phase?7:3]=start;ft[phase?8:4]=end;ft[12+2*phase]=postCycles;ft[13+2*phase]=waitCycles;
    if(!phase){ft[18]=packStart-prepareStart;ft[19]=packEnd-packStart;}
+   auto coreTrace=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*256+
+       uint64_t(2*shape.batch+q*workers+lane)*32;
+   coreTrace[2+phase*5]=prepareStart;coreTrace[3+phase*5]=packStart;
+   coreTrace[4+phase*5]=packEnd;coreTrace[5+phase*5]=start;coreTrace[6+phase*5]=end;
    ft[16+phase]=groups;ft[20]=3; // shared Q-worker group, not per-request time
   }
  }
@@ -367,10 +371,11 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
  CompletePrefetch(ctx,b,true,profile?&polls:nullptr,profile?&drain:nullptr,profile?&arrival:nullptr);
  if(profile){ft[4]=GetSystemCycle();ft[5]=polls;ft[6]=drain;ft[7]=arrival;}error|=row->error;flags[7].error=error;flags[7].ready=1;
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+7),sizeof(BatchFlag));
- for(uint32_t f=6;f<12;++f){uint64_t start=GetSystemCycle();while(true){
+ for(uint32_t f=6;f<12;++f){uint64_t start=GetSystemCycle();if(profile)ft[8+2*(f-6)]=start;while(true){
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+f),sizeof(BatchFlag));
   if(flags[f].ready){error|=flags[f].error;break;}
-  if(GetSystemCycle()-start>5000000000ULL){error|=kvaf_device::kCqTimeout;break;}}}
+  if(GetSystemCycle()-start>5000000000ULL){error|=kvaf_device::kCqTimeout;break;}}
+  if(profile)ft[9+2*(f-6)]=GetSystemCycle();}
  auto info=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),kRowStatusWords*4);
  auto update=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);
@@ -423,11 +428,15 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
   auto shape=LoadRuntimeShape(reinterpret_cast<__gm__ Context*>(a->context));
   uint32_t workers=(a->prefetchCount>>16)&0xffU;
   if(workers!=1 && workers!=2 && workers!=4)return;
+  bool profile=(a->prefetchCount & 0x80000000U)!=0;
+  auto trace=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*256+uint64_t(block)*32;
+  if(profile)trace[0]=GetSystemCycle();
   if(block<shape.batch*2){uint32_t b=block/2;if(block%2==0){Producer(a,b);FinalizeStreaming(a,b);}else Consumer(a,b);}
   else {uint32_t lane=block-shape.batch*2,q=lane/workers,part=lane%workers;
    if(q<4 && part<workers){
     FetchQueryGroup(a,q,part,workers);
    }}
+  if(profile){trace[1]=GetSystemCycle();kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(trace),32*8);}
  }
 #endif
 }
