@@ -99,7 +99,7 @@ def run(args, run_dir):
         )
         folder = run_dir / f"case{case}-b{batch}-prototype-graph"
         folder.mkdir()
-        stage = "LIFetch build"
+        stage = "fixture preparation"
         progress(run_dir, f"BS={batch}: {stage}; logs={folder}")
         with native_log(folder / "native.log"):
             common, data, build = (folder / "fixture", folder / "input", shared_build)
@@ -120,11 +120,14 @@ def run(args, run_dir):
             if getattr(args, "optimized_resolve", False):
                 options.update(KVIP_FUSE_QUERY_WORK="ON", KVIP_OUTPUT_WORKER="ON")
             if not shared_build.exists():
+                progress(run_dir, f"BS={batch}: COMPILE LIFetch; logs={folder}")
                 command(
                     ["cmake", "-S", source, "-B", build, *[f"-D{k}={v}" for k, v in options.items()]],
                     folder / "configure.log",
                 )
                 command(["cmake", "--build", build, "-j2"], folder / "build.log")
+            else:
+                progress(run_dir, f"BS={batch}: REUSE LIFetch build={shared_build.resolve()}; logs={folder}")
             import hashlib
 
             # Fail before allocating/populating DDR if shared dependencies cannot load.

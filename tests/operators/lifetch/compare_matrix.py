@@ -114,6 +114,9 @@ def main():
                 folder.mkdir()
                 if variant in builds:
                     (folder / 'universal-build').symlink_to(builds[variant], target_is_directory=True)
+                    print(f'REUSE {variant}: {builds[variant]} sha256={digests[variant]}', flush=True)
+                else:
+                    print(f'COMPILE {variant}: first case only', flush=True)
                 code = codes[variant]
                 command = [sys.executable, '-u', '-X', 'faulthandler',
                            str(code / 'tests/operators/lifetch/test_lifetch.py'), '--internal-urma',
@@ -142,6 +145,8 @@ def main():
                     print(summarize(run))
                     raise SystemExit(f'Failed {variant} BS={batch} miss={miss}; stopped, logs={folder}')
                 build = folder / 'universal-build'
+                if variant in builds and list(folder.glob('case*/build.log')):
+                    raise RuntimeError(f'Unexpected recompilation despite shared binary: {folder}')
                 digest = hashlib.sha256((build / 'libv9_bridge.so').read_bytes()).hexdigest()
                 if variant in digests and digests[variant] != digest:
                     raise RuntimeError('Binary changed during matrix')
