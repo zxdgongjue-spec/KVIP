@@ -774,18 +774,13 @@ __aicore__ inline void BatchMulWeightAndReduceSum(const LocalTensor<SCORE_T> &ou
     }
 }
 
-__simd_callee__ inline void ScoreHitMask(AscendC::MicroAPI::RegTensor<uint16_t>& score,
-    __ubuf__ uint16_t* threshold, AscendC::MicroAPI::MaskReg& selected,
-    AscendC::MicroAPI::MaskReg& all) {
-    AscendC::MicroAPI::RegTensor<uint16_t> limit;
-    AscendC::MicroAPI::LoadAlign<uint16_t, AscendC::MicroAPI::LoadDist::DIST_BRC_B16>(limit, threshold);
-    AscendC::MicroAPI::Compare<uint16_t, CMPMODE::GT>(selected, score, limit, all);
-}
 __simd_callee__ inline void ClassifyScore(AscendC::MicroAPI::RegTensor<uint16_t>& score,
     __ubuf__ uint16_t* threshold, __ubuf__ uint16_t* hits,
     AscendC::MicroAPI::MaskReg& all) {
+    AscendC::MicroAPI::RegTensor<uint16_t> limit, one, zero, output;
     AscendC::MicroAPI::MaskReg selected;
-    ScoreHitMask(score, threshold, selected, all);
+    AscendC::MicroAPI::LoadAlign<uint16_t, AscendC::MicroAPI::LoadDist::DIST_BRC_B16>(limit, threshold);
+    AscendC::MicroAPI::Compare<uint16_t, CMPMODE::GT>(selected, score, limit, all);
     AscendC::MicroAPI::StoreAlign(hits, selected);
 }
 __simd_callee__ inline void ReduceSumFinalizeClassify(AscendC::MicroAPI::RegTensor<float> (&regSum0)[2],
@@ -823,7 +818,7 @@ __simd_callee__ inline void ReduceSumFinalizeClassify(AscendC::MicroAPI::RegTens
     AscendC::MicroAPI::RegTensor<uint16_t> regOut;
     FloatToSortableKey<bfloat16_t>(regOut, regSumBF16, bf16Ctx, maskAllB16);
     AscendC::MicroAPI::StoreAlign<uint16_t, AscendC::MicroAPI::StoreDist::DIST_NORM>(out_, regOut, maskAllB16);
-    ClassifyScore(regOut, threshold, hits, maskAllB16);
+ClassifyScore(regOut, threshold, hits, maskAllB16);
 }
 __simd_callee__ inline void ReduceSum2FinalizeClassify(AscendC::MicroAPI::RegTensor<float> (&regSum0)[2],
                                                AscendC::MicroAPI::RegTensor<float> (&regSum1)[2],
@@ -832,8 +827,7 @@ __simd_callee__ inline void ReduceSum2FinalizeClassify(AscendC::MicroAPI::RegTen
                                                FloatSortConstCtx<bfloat16_t>& bf16Ctx,
                                                AscendC::MicroAPI::MaskReg& maskAllB16,
                                                __ubuf__ uint16_t* out0_,
-                                               __ubuf__ uint16_t* out1_, __ubuf__ uint16_t* threshold,
-                                               __ubuf__ uint16_t* hits, bool pairHits)
+                                               __ubuf__ uint16_t* out1_, __ubuf__ uint16_t* threshold, __ubuf__ uint16_t* hits)
 {
     AscendC::MicroAPI::Mul(regSum0[0], regSum0[0], regKScale[0], maskAllB32);
     AscendC::MicroAPI::Mul(regSum0[1], regSum0[1], regKScale[1], maskAllB32);
@@ -861,15 +855,8 @@ __simd_callee__ inline void ReduceSum2FinalizeClassify(AscendC::MicroAPI::RegTen
     FloatX2ToSortableKey<bfloat16_t>(regOut[0], regOut[1], regSumBF16[0], regSumBF16[1], bf16Ctx, maskAllB16);
     AscendC::MicroAPI::StoreAlign<uint16_t, AscendC::MicroAPI::StoreDist::DIST_NORM>(out0_, regOut[0], maskAllB16);
     AscendC::MicroAPI::StoreAlign<uint16_t, AscendC::MicroAPI::StoreDist::DIST_NORM>(out1_, regOut[1], maskAllB16);
-    AscendC::MicroAPI::MaskReg selected0, selected1;
-    ScoreHitMask(regOut[0], threshold, selected0, maskAllB16);
-    ScoreHitMask(regOut[1], threshold + 128, selected1, maskAllB16);
-    if (pairHits) {
-        AscendC::MicroAPI::MaskOr(selected0, selected0, selected1, maskAllB16);
-    } else {
-        AscendC::MicroAPI::StoreAlign(hits + 128, selected1);
-    }
-    AscendC::MicroAPI::StoreAlign(hits, selected0);
+ClassifyScore(regOut[0], threshold, hits, maskAllB16);
+ClassifyScore(regOut[1], threshold + 128, hits + 128, maskAllB16);
 }
 template <typename QK_T>
 __simd_vf__ inline void ClassifyMulWeightAndReduceSum(__ubuf__ uint16_t* out_,
@@ -932,8 +919,7 @@ __simd_vf__ inline void ClassifyMulWeightAndReduceSum2(__ubuf__ uint16_t* out0_,
                                                __ubuf__ float* qScale0_,
                                                __ubuf__ float* qScale1_,
                                                uint32_t qScaleStride,
-                                               const int gSize, __ubuf__ uint16_t* threshold,
-                                               __ubuf__ uint16_t* hits, bool pairHits)
+                                               const int gSize, __ubuf__ uint16_t* threshold, __ubuf__ uint16_t* hits)
 {
     AscendC::MicroAPI::RegTensor<float> regW[2];
     AscendC::MicroAPI::RegTensor<float> regwBrc[2];
@@ -977,8 +963,7 @@ __simd_vf__ inline void ClassifyMulWeightAndReduceSum2(__ubuf__ uint16_t* out0_,
     ReduceSum2LoopBody<QK_T>(regQK0, regQK1, regQK0Half, regQK1Half, regQK0Int32, regQK1Int32, regwBrc, regW,
         regSum0, regSum1, maskAllB32, qk0_, qk1_, qkVLStride, weightFloat_, gSize);
 
-    ReduceSum2FinalizeClassify(regSum0, regSum1, regKScale, maskAllB32, bf16Ctx, maskAllB16,
-                              out0_, out1_, threshold, hits, pairHits);
+    ReduceSum2FinalizeClassify(regSum0, regSum1, regKScale, maskAllB32, bf16Ctx, maskAllB16, out0_, out1_, threshold, hits);
 }
 template <typename QK_T, typename W_T, typename SCALE_T, typename SCORE_T>
 __aicore__ inline void BatchClassifyScore(const LocalTensor<SCORE_T> &out_,   // out    [S2Base]     [128   ]
@@ -994,8 +979,7 @@ __aicore__ inline void BatchClassifyScore(const LocalTensor<SCORE_T> &out_,   //
                                                   const LocalTensor<SCALE_T> &qScale_,   // qScale [G]          [64    ]
                                                   uint32_t qScaleStride,
                                                   const int gSize,                     // G 64
-                                                  const int batch, __ubuf__ uint16_t* threshold,
-                                                  __ubuf__ uint16_t* hits, bool pairHits)
+                                                  const int batch, __ubuf__ uint16_t* threshold, __ubuf__ uint16_t* hits)
 {
     // 暂只支持这两种情况, 后续改成循环
     if (batch != 2 && batch != 1) {
@@ -1019,7 +1003,7 @@ __aicore__ inline void BatchClassifyScore(const LocalTensor<SCORE_T> &out_,   //
                             weight, weight1, weightStride, weightFloat,
                             kScale, kScaleStride,
                             qScale, qScale1, qScaleStride,
-                            gSize, threshold, hits, pairHits);
+                            gSize, threshold, hits);
     } else {
         ClassifyMulWeightAndReduceSum(out, qk, qkVLStride, weight, kScale, qScale, gSize, threshold, hits);
     }

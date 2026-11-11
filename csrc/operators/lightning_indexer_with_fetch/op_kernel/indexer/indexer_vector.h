@@ -55,8 +55,6 @@ public:
             topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow);
     }
     __aicore__ inline void LoadSequenceSplitThresholds(uint32_t batch) {
-        pairedColdEnd_ = rotating::ColdBitmapPairEnd(
-            reinterpret_cast<__gm__ rotating::Context*>(rotationContext_), batch, runtimeShape_.history);
         constexpr uint32_t count = SIM_Q * 2048;
         constexpr uint32_t rowBytes = count * 6 + SIM_Q * 256;
         GlobalTensor<uint16_t> thresholds;
@@ -129,7 +127,6 @@ private:
     GlobalTensor<uint32_t> rotationProgressGm_;
     LocalTensor<uint32_t> rotationProgress_;
     uint32_t rotationProgressBase_ = 0;
-    uint32_t pairedColdEnd_ = 0;
 
     GM_ADDR prefixOutput_ = nullptr;
     bool prefixActive_ = false;
@@ -537,7 +534,6 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     auto qkBase = resMm1UB_[pingpong * (UB_BANK_STRIDE / sizeof(float))];
     auto qkVLstride = (UB_BANK_DEPTH_STRIDE / sizeof(float)) / 2 * constInfo_.mBaseSize;
 
-    const bool pairHits = curS2Idx < pairedColdEnd_;
     if (curS2Idx >= runtimeShape_.resident) {
     vector1::BatchClassifyScore(outBase, UB_BANK_DEPTH_STRIDE / sizeof(SCORE_T),
                                         qkBase, qkVLstride, (uint32_t)(gSize_ * UB_BANK_DEPTH_STRIDE / sizeof(float)),
@@ -546,7 +542,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
                                         qScaleBase, UB_BANK_DEPTH_STRIDE / sizeof(SCALE_T),
                                         gSize_, curAivS1ProcNum,
         (__ubuf__ uint16_t *)prefixThreshold_.GetPhyAddr() + (curAivS1Idx % 2) * 128,
-        (__ubuf__ uint16_t *)classifyUB_.GetPhyAddr() + pingpong * 256, pairHits);
+        (__ubuf__ uint16_t *)classifyUB_.GetPhyAddr() + pingpong * 256);
     } else {
     vector1::BatchMulWeightAndReduceSum(outBase, UB_BANK_DEPTH_STRIDE / sizeof(SCORE_T),
                                         qkBase, qkVLstride, (uint32_t)(gSize_ * UB_BANK_DEPTH_STRIDE / sizeof(float)),
@@ -578,8 +574,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         GlobalTensor<uint8_t> outputHits;
         outputHits.SetGlobalBuffer((__gm__ uint8_t *)(prefixOutput_ + runtimeShape_.batch * prefixBytes));
         DataCopyExtParams hitCopy;
-        // In the paired prefix the even Q plane holds the union of both Qs.
-        hitCopy.blockCount = pairHits ? 1 : curAivS1ProcNum;
+        hitCopy.blockCount = curAivS1ProcNum;
         hitCopy.blockLen = 32;
         hitCopy.srcStride = 7; // classifyUB query stride is 256 bytes.
         hitCopy.dstStride = runtimeShape_.history / 4 - 32;
