@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from kvip.diagnostics.archive import load_snapshot
+from kvip.diagnostics.demand import sum_demand
 from kvip.diagnostics.score_replay import analyze_scores, load_round, main, merge_traces, score_value
 from kvip.diagnostics.token_replay import materialize_score_trace, materialize_token_trace
 from kvip.diagnostics.token_trace import trace_summary
@@ -180,6 +181,106 @@ def test_real_materializer_preserves_li_bits_sparse_slots_and_score_keys(token_t
     assert not np.array_equal(
         archive.array("post.selected_payload"), np.zeros_like(archive.array("post.selected_payload"))
     )
+
+
+@pytest.mark.parametrize("layer_index", [0, 3])
+def test_dp8_single_layer_projection_preserves_real_inputs_cache_demand_and_slot_identity(
+    token_trace, tmp_path, layer_index
+):
+    if token_trace.manifest["geometry"]["token_bytes"] != 2624:
+        pytest.skip("Four-layer source projection")
+    traces = [score_trace(token_trace, rank) for rank in range(8)]
+    layers = [f"model.layers.{index}.self_attn.attn" for index in range(8, 12)]
+    for trace in traces:
+        trace.manifest["metadata"].update(group=2, layer_names=layers)
+    merged = merge_traces(traces, numa_node=3)
+    original = copy.deepcopy(merged.manifest)
+    result = materialize_score_trace(merged, tmp_path / "single", numa_node=3, layer_index=layer_index)
+    archive = load_snapshot(result.directory)
+    g, ddr, metadata = (archive.manifest[name] for name in ("geometry", "ddr", "metadata"))
+    assert g["batch"] == 16 and g["token_count"] == 64
+    assert g["token_bytes"] == ddr["token_bytes"] == 656
+    assert g["slot_bytes"] == ddr["slot_bytes"] == 86016
+    assert g["region_bytes"] == ddr["region_bytes"] == 8 * 1024 * 86016
+    assert metadata["layer_names"] == [layers[layer_index]]
+    projection = metadata["layer_projection"]
+    assert projection["source_layer_names"] == layers
+    assert projection["source_token_bytes"] == 2624 and projection["source_slot_bytes"] == 335872
+    assert projection["source_region_bytes"] == original["geometry"]["region_bytes"]
+    assert projection["layer_index"] == layer_index
+    assert "not the captured grouped KV layout" in archive.manifest["fidelity"]
+    assert merged.manifest == original  # Projection cannot mutate the source trace/DP metadata.
+    for name, real_name in (("keys", "keys"), ("key_scales", "key_scales")):
+        np.testing.assert_array_equal(archive.array("pre." + name)[1:], merged.array("real." + real_name))
+    for name, real_name in (("query", "query"), ("weights", "weights"), ("query_scale", "query_scale")):
+        expected = merged.array("real." + real_name)
+        np.testing.assert_array_equal(archive.array("pre." + name), expected.reshape(64, *expected.shape[2:]))
+    for name in ("metadata", "tail_bounds", "lru_slots"):
+        np.testing.assert_array_equal(archive.array("pre." + name), merged.array("pre." + name))
+    np.testing.assert_array_equal(archive.array("pre.query_ends"), merged.array("pre.query_ends").reshape(-1))
+    np.testing.assert_array_equal(archive.array("pre.logical_ids")[1:], merged.array("pre.logical_ids"))
+    np.testing.assert_array_equal(archive.array("pre.hot_valid")[1:], merged.array("pre.hot_valid"))
+    for name in ("logical_output", "score_keys"):
+        np.testing.assert_array_equal(archive.array("post." + name), merged.array("post." + name))
+    demand = sum_demand([trace_summary(trace)["demand"] for trace in traces])
+    assert archive.manifest["synthetic"]["captured_selection_demand"] == demand
+    addresses = archive.array("pre.addresses")[1:]
+    np.testing.assert_array_equal(addresses != 0, merged.array("pre.address_valid") != 0)
+    for rank in range(8):
+        # Existing DP-local sharing and different-DP identity survive the new byte stride.
+        assert addresses[rank * 2, 10] == addresses[rank * 2 + 1, 10]
+        assert addresses[rank * 2, 10] - addresses[0, 10] == rank * 1024 * 86016
+        subarena = metadata["ddr_subarenas"][rank]
+        assert subarena["slot_offset"] == rank * 1024
+        assert subarena["region_bytes"] == 1024 * 86016
+        assert subarena["source_region_bytes"] == 1024 * 335872
+    keys = np.load(archive.directory / "ddr/keys.npy")
+    wanted = set(map(int, merged.array("pre.ddr_page_slots").reshape(-1))) - {-1}
+    assert set(map(int, keys)) == wanted
+    np.testing.assert_array_equal(np.load(archive.directory / "ddr/slot_offsets.npy"), keys * 86016)
+    np.testing.assert_array_equal(np.load(archive.directory / "ddr/valid_lengths.npy"), np.full(len(keys), 128 * 656))
+    assert archive.array("pre.output").shape[-1] == archive.array("post.selected_payload").shape[-1] == 656
+    assert archive.manifest["oracle"]["passed"] and not archive.manifest["oracle"]["native_validated"]
+
+
+@pytest.mark.parametrize("layer_index", [-1, 4, True])
+def test_invalid_layer_projection_does_not_create_fixture(token_trace, tmp_path, layer_index):
+    trace = score_trace(token_trace)
+    trace.manifest["metadata"]["layer_names"] = [
+        f"model.layers.{index}" for index in range(trace.manifest["geometry"]["token_bytes"] // 656)
+    ]
+    with pytest.raises(ValueError, match="Layer projection"):
+        materialize_score_trace(trace, tmp_path / "invalid", numa_node=0, layer_index=layer_index)
+    assert not (tmp_path / "invalid").exists()
+
+
+def test_layer_projection_rejects_inconsistent_source_layer_names(token_trace, tmp_path):
+    trace = score_trace(token_trace)
+    trace.manifest["metadata"]["layer_names"] = []
+    with pytest.raises(ValueError, match="names matching"):
+        materialize_score_trace(trace, tmp_path / "invalid", numa_node=0, layer_index=0)
+    assert not (tmp_path / "invalid").exists()
+
+
+def test_quiet_projection_cli_prints_geometry_and_demand_without_per_dp_reports(
+    token_trace, tmp_path, monkeypatch, capsys
+):
+    trace = score_trace(token_trace)
+    trace.manifest["metadata"]["layer_names"] = [
+        f"model.layers.{index}" for index in range(trace.manifest["geometry"]["token_bytes"] // 656)
+    ]
+    monkeypatch.setattr("kvip.diagnostics.score_replay.load_round", lambda *args: ([trace], [predecessor(trace)]))
+    arguments = ["--root", str(tmp_path), "--round", "2", "--group", "0", "--dp-ranks", "0"]
+    with pytest.raises(SystemExit) as exc:
+        main([*arguments, "--layer-index", "0"])
+    assert exc.value.code == 2
+    capsys.readouterr()
+    main([*arguments, "--output", str(tmp_path / "single"), "--numa-node", "-1", "--layer-index", "0", "--quiet"])
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 2 and lines[0].startswith("REAL_LI_SYNTHETIC_KV_READY")
+    assert "token_bytes=656" in lines[0] and "captured_cold=" in lines[0] and "cold_miss_percent=" in lines[0]
+    assert lines[1].startswith("SOURCE root=") and "layer_index=0" in lines[1]
+    assert all(not line.startswith("SCORE_PASS") for line in lines)
 
 
 def test_score_only_cannot_silently_become_a_timing_fixture(token_trace, tmp_path):

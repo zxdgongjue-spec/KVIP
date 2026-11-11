@@ -382,15 +382,23 @@ def main(argv=None):
     parser.add_argument(
         "--numa-node", type=int, help="Explicit single-card target NUMA node; -1 uses the target default"
     )
+    parser.add_argument(
+        "--layer-index", type=int, help="Project one zero-based source group layer to independent 656-byte KV slots"
+    )
+    parser.add_argument("--quiet", action="store_true", help="Print only the final fixture/analysis summary")
     args = parser.parse_args(argv)
     if args.output is not None and args.numa_node is None:
         parser.error("--output requires explicit --numa-node (-1 or a nonnegative node)")
     if args.output is None and args.numa_node is not None:
         parser.error("--numa-node requires --output")
+    if args.output is None and args.layer_index is not None:
+        parser.error("--layer-index requires --output")
     try:
         current, previous = load_round(args.root, args.dp_ranks, args.round_index, args.group)
         reports = [analyze_scores(trace, old) for trace, old in zip(current, previous)]
         for report in reports:
+            if args.quiet:
+                continue
             q = report["queries"]
             initial = [item["observed_initial_value"] for item in q if item["observed_initial_value"] is not None]
 
@@ -407,12 +415,25 @@ def main(argv=None):
         if args.output is not None:
             merged = merge_traces(current, numa_node=args.numa_node)
             merged.manifest["metadata"]["score_analysis"] = reports
-            output = materialize_score_trace(merged, args.output, numa_node=args.numa_node)
+            output = materialize_score_trace(
+                merged, args.output, numa_node=args.numa_node, layer_index=args.layer_index
+            )
+            demand = output.manifest["synthetic"]["captured_selection_demand"]
             print(
                 f"REAL_LI_SYNTHETIC_KV_READY {output.directory} batch={merged.manifest['geometry']['batch']} "
+                f"queries=4 layers={','.join(output.manifest['metadata']['layer_names'])} "
+                f"token_bytes={output.manifest['geometry']['token_bytes']} "
+                f"captured_cold={demand['cold_demand']} selected_unique={demand['selected_unique']} "
+                f"cold_miss_percent={100 * demand['cold_miss_rate']:.4f} "
                 f"ddr_GiB={output.manifest['ddr']['region_bytes'] / (1 << 30):.3f} "
                 f"numa={args.numa_node} page_mode=thp; native score/KV validation remains required; not DP service timing"
             )
+            if args.quiet:
+                print(
+                    f"SOURCE root={args.root} round={args.round_index} group={args.group} "
+                    f"dp_ranks={','.join(map(str, args.dp_ranks))} "
+                    f"layer_index={'all' if args.layer_index is None else args.layer_index}"
+                )
         else:
             print("SCORES_ONLY: CPU threshold/TopK/miss validation; no native LI or fusion performance measurement")
     except (ValueError, KeyError, OSError) as error:

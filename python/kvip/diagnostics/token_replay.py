@@ -288,20 +288,79 @@ def materialize_token_trace(trace, destination):
     return _materialize(trace, destination)
 
 
-def materialize_score_trace(trace, destination, *, numa_node):
-    """Preserve real LI bits and slot spacing; synthesize only KV payload bytes."""
+def materialize_score_trace(trace, destination, *, numa_node, layer_index=None):
+    """Keep real LI bits; optionally project synthetic KV to a single-layer layout."""
     if trace.manifest.get("content") != "scores" or trace.manifest.get("real_inputs_saved") is not True:
         raise ValueError("Real LI replay requires saved real inputs on every selected DP")
     if type(numa_node) is not int or numa_node < -1:
         raise ValueError("An explicit target NUMA node (-1 or a nonnegative node) is required")
-    return _materialize(trace, destination, real_li=True, numa_node=numa_node)
+    return _materialize(trace, destination, real_li=True, numa_node=numa_node, layer_index=layer_index)
 
 
-def _materialize(trace, destination, *, real_li=False, numa_node=-1):
+def _project_layer(geometry, metadata, layer_index):
+    """Project the synthetic KV layout, retaining source LI bits and slot identities.
+
+    Layer groups share one captured LI selection. Selecting a layer changes the
+    synthetic record width, not its query/Index or the captured selected IDs.
+    Slot gaps remain measured in slots; byte gaps shrink with the new stride.
+    """
+    layers = metadata.get("layer_names")
+    width, old_slot, old_region = (geometry[name] for name in ("token_bytes", "slot_bytes", "region_bytes"))
+    if (
+        type(layer_index) is not int
+        or not isinstance(layers, list)
+        or len(layers) != width // 656
+        or any(not isinstance(name, str) or not name for name in layers)
+        or len(set(layers)) != len(layers)
+        or not 0 <= layer_index < len(layers)
+    ):
+        raise ValueError("Layer projection requires an in-range layer index and names matching the source KV width")
+    if (
+        type(old_slot) is not int
+        or type(old_region) is not int
+        or old_slot < BLOCK * width
+        or old_region <= 0
+        or old_region % old_slot
+    ):
+        raise ValueError("Layer projection requires complete fixed-size source DDR slots")
+    slot = ((BLOCK * 656 + 4095) // 4096) * 4096
+    region = old_region // old_slot * slot
+    for subarena in metadata.get("ddr_subarenas", []):
+        if subarena["slot_bytes"] != old_slot or subarena["region_bytes"] % old_slot:
+            raise ValueError("Layer projection source DP subarena geometry differs")
+        subarena.update(
+            source_slot_bytes=old_slot,
+            source_region_bytes=subarena["region_bytes"],
+            slot_bytes=slot,
+            region_bytes=subarena["region_bytes"] // old_slot * slot,
+        )
+    metadata["layer_projection"] = dict(
+        layer_index=layer_index,
+        source_group=metadata["group"],
+        source_layer_names=layers,
+        source_token_bytes=width,
+        source_slot_bytes=old_slot,
+        source_region_bytes=old_region,
+        replay_layer_names=[layers[layer_index]],
+        replay_token_bytes=656,
+        replay_slot_bytes=slot,
+        replay_region_bytes=region,
+        layout="Independent single-layer synthetic KV; slot IDs, aliases and DP slot ranges retained; byte strides recomputed, not the original grouped KV stride",
+        li_inputs="Unchanged captured group-shared Q/Index/weights/scales and score reference",
+    )
+    metadata["layer_names"] = [layers[layer_index]]
+    metadata["geometry"] = dict(metadata.get("geometry", {}), token_bytes=656)
+    geometry.update(token_bytes=656, slot_bytes=slot, region_bytes=region)
+
+
+def _materialize(trace, destination, *, real_li=False, numa_node=-1, layer_index=None):
     destination = Path(destination).resolve()
     if destination.exists():
         raise FileExistsError(f"Refusing to overwrite synthetic fixture: {destination}")
     geometry, inputs = _inputs(trace)
+    metadata = copy.deepcopy(trace.manifest["metadata"])
+    if layer_index is not None:
+        _project_layer(geometry, metadata, layer_index)
     destination.mkdir(parents=True)
     (destination / "INCOMPLETE").write_text("Synthetic fixture construction has not completed.\n")
     manifest = dict(
@@ -311,7 +370,7 @@ def _materialize(trace, destination, *, real_li=False, numa_node=-1):
         source_transport="ubmem",
         geometry=geometry,
         tensors={},
-        metadata=copy.deepcopy(trace.manifest["metadata"]),
+        metadata=metadata,
         provenance=dict(
             source_token_manifest_sha256=array_digest(
                 np.frombuffer(json.dumps(trace.manifest, sort_keys=True).encode(), dtype=np.uint8)
@@ -329,6 +388,13 @@ def _materialize(trace, destination, *, real_li=False, numa_node=-1):
             native_validated=False,
         ),
     )
+    if layer_index is not None:
+        manifest["fidelity"] = (
+            REAL_LI_FIDELITY.replace(
+                "within-DP DDR slot spacing/shared aliases", "within-DP DDR slot-index gaps/shared aliases"
+            )
+            + " Single-layer KV uses recomputed 656-byte records and slot byte strides, not the captured grouped KV layout."
+        )
     manifest["metadata"]["content"] = manifest["content"]
     addresses, manifest["ddr"] = _write_ddr(
         destination / "ddr", geometry, inputs, preserve_slots=real_li, numa_node=numa_node

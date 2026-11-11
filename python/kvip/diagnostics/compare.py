@@ -26,6 +26,9 @@ def arguments(argv=None):
     parser.add_argument(
         "--quiet", action="store_true", help="Only case progress and compact results; native logs appear on failure"
     )
+    parser.add_argument(
+        "--brief", action="store_true", help="One row per path: latency, measured cold misses and transferred payload"
+    )
     parser.add_argument("--report-only", type=Path, help="Summarize an existing result JSON without device work")
     parser.add_argument(
         "--from-results",
@@ -356,6 +359,9 @@ def summarize(results):
             * 100,
         ),
         same_selection_across_transports=selection_pairs,
+        score_validation={
+            name: result["score_comparison"] for name, result in results.items() if "score_comparison" in result
+        },
         stage_diagnostics={name: result.get("stage_diagnostics") for name, result in results.items()},
         native_get_profiles={
             name: result["native_get_profile"] for name, result in results.items() if "native_get_profile" in result
@@ -412,6 +418,41 @@ def summarize_saved(paths):
         "the full candidate list is retained. Serial references are separate same-revision runs."
     )
     return result
+
+
+def brief_report(summary, *, path=None):
+    """Keep measured per-path demand visible without printing per-window counters."""
+    if summary.get("status") != "pass" or "table" not in summary:
+        raise ValueError("Brief comparison requires a successful four-path summary")
+    geometry = summary["geometry"]
+    emit(
+        f"COMPARE_PASS batch={geometry['batch']} token_bytes={geometry['token_bytes']} "
+        f"content={summary.get('content', 'full')}; device graph us, payload/graph decimal GB/s"
+    )
+    emit("case          mean_us    p50_us    cold/selected    miss%    read_MiB    payload_GB/s")
+    for name, row in summary["table"].items():
+        demand = row.get("demand_per_round", {})
+        if "cold_miss_rate" in demand:
+            counts = f"{demand['cold_demand']:.0f}/{demand['selected_unique']:.0f}"
+            rate = f"{100 * demand['cold_miss_rate']:.4f}"
+        else:
+            counts = rate = "--"
+        emit(
+            f"{name:13s} {row['mean_us']:9.3f} {row['p50_us']:9.3f} {counts:>16s} {rate:>8s} "
+            f"{row['mean_read_bytes'] / (1 << 20):11.3f} "
+            f"{row['graph_normalized_payload_GBps']['actual_transfers']:15.3f}"
+        )
+    for transport, value in summary["fusion_vs_serial"].items():
+        emit(
+            f"FUSION {transport}: speedup={value['serial_over_fused']:.3f}x "
+            f"latency_reduction={value['latency_reduction_percent']:.2f}%"
+        )
+    if checks := summary.get("score_validation"):
+        emit("LI_SCORE_CHECK " + " ".join(f"{name}={value['status']}" for name, value in checks.items()))
+    if pairs := summary.get("same_selection_across_transports"):
+        emit("SAME_SELECTION " + " ".join(f"{name}={str(value).lower()}" for name, value in pairs.items()))
+    if path is not None:
+        emit(f"Results: {Path(path).resolve()}")
 
 
 def display(summary):
@@ -515,7 +556,13 @@ def display(summary):
 def main():
     args = arguments()
     if args.report_only is not None:
-        report_only(args.report_only)
+        if args.brief:
+            try:
+                brief_report(json.loads(args.report_only.read_text()), path=args.report_only)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                raise SystemExit(f"FAILED reading comparison: {error}") from error
+        else:
+            report_only(args.report_only)
         return
     if getattr(args, "from_results", None) is not None:
         summary = summarize_saved(args.from_results)
@@ -523,7 +570,7 @@ def main():
             output.write(json.dumps(summary, indent=2) + "\n")
         for name, selected in summary["saved_result_selection"].items():
             print(f"SELECTED {name}={selected['selected']}", flush=True)
-        compact_report(summary, path=args.output)
+        (brief_report if args.brief else compact_report)(summary, path=args.output)
         return
     args.result_dir.mkdir(parents=True)
     print(
@@ -566,7 +613,9 @@ def main():
     elif summary.get("content") == "real_li_synthetic_kv":
         emit("CONTENT real_li_synthetic_kv: real Q/Index; generated KV bytes; single-device operator timing")
     (args.result_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-    if args.quiet:
+    if args.brief:
+        brief_report(summary, path=args.result_dir / "summary.json")
+    elif args.quiet:
         compact_report(summary, path=args.result_dir / "summary.json")
     else:
         display(summary)

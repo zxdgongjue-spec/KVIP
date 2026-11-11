@@ -8,7 +8,16 @@ from types import SimpleNamespace
 
 import pytest
 
-from kvip.diagnostics.compare import CASES, arguments, case_plan, command, display, summarize, summarize_saved
+from kvip.diagnostics.compare import (
+    CASES,
+    arguments,
+    brief_report,
+    case_plan,
+    command,
+    display,
+    summarize,
+    summarize_saved,
+)
 from kvip.diagnostics.replay_measure import fused_reads, statistics
 
 
@@ -117,6 +126,49 @@ def test_comparison_preserves_boundary_tie_and_actual_read_evidence():
     assert value["table"]["ubmem-serial"]["selection"] == selection
     assert value["table"]["ubmem-serial"]["mean_read_bytes"] == 31000
     assert value["same_selection_across_transports"] == dict(serial=False)
+
+
+def test_brief_report_preserves_actual_path_demand_and_score_validation(tmp_path, monkeypatch, capsys):
+    import sys
+    from kvip.diagnostics import compare
+
+    entries = results()
+    for case in entries.values():
+        case["geometry"]["token_bytes"] = 656
+        fused = case["mode"] == "fused"
+        case["reads_samples"] = [
+            dict(
+                bytes=6560,
+                cold_demand=7 if fused else 8,
+                selected_unique=100,
+                candidate_hot_refetch=2,
+                hot_hit=81 if fused else 80,
+                abc_hit=10,
+                selected_read_demand=9 if fused else 10,
+            )
+        ]
+        if fused:
+            case["score_comparison"] = dict(status="bit_exact", compared_scores=100, included_in_timing=False)
+    summary = summarize(entries)
+    assert set(summary["score_validation"]) == {"ubmem-fused", "urma-fused"}
+    path = tmp_path / "summary.json"
+    path.write_text(json.dumps(summary))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Saved brief report must not run a device process")
+
+    monkeypatch.setattr(compare.subprocess, "run", forbidden)
+    monkeypatch.setattr(sys, "argv", ["compare", "--report-only", str(path), "--brief"])
+    compare.main()
+    output = capsys.readouterr().out
+    assert "batch=16 token_bytes=656" in output
+    assert "8/100   8.0000" in output
+    assert "7/100   7.0000" in output
+    assert "ubmem-fused=bit_exact urma-fused=bit_exact" in output
+    assert "prefetch" not in output
+    assert "torch_npu" not in sys.modules
+    with pytest.raises(ValueError):
+        brief_report({**summary, "status": "failed"})
 
 
 def test_comparison_keeps_admission_vectors_and_their_accounting_scope(capsys):
