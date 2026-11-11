@@ -128,3 +128,5 @@ def test_native_reference_uses_kvaf_default_partition():
     assert 'args.block_count=cores;args.jettys_per_core=2' in entry
     assert 'kvaf_device::KvafBatchGetDevice(args,core)' in entry
     assert 'query==4?8U:2U' in entry
+    assert entry.count('reinterpret_cast<__gm__ uint8_t*>(queues),2*sizeof(*queues)') == 2
+    assert entry.count('reinterpret_cast<__gm__ uint8_t*>(status),sizeof(*status)') == 2

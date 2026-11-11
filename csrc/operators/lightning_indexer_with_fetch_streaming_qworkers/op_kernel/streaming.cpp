@@ -462,7 +462,13 @@ extern "C" __global__ __aicore__ void v9_native_fetch_only(GM_ADDR arg,GM_ADDR r
    args.request_capacity=shape.batch*kSlots;args.block_count=cores;args.jettys_per_core=2;
    if(ctx->fallbackAddresses){args.address_table=ctx->fallbackAddresses;args.valid_table=ctx->fallbackValid;args.table_capacity=shape.batch*kSlots;}
    if(!args.batch_get_max_inflight_total)args.batch_get_max_inflight_total=kBatchGetInflight;
+   auto queues=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args.queue_state)+core*2;
+   auto status=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(args.core_status)+core;
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queues),2*sizeof(*queues));
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),sizeof(*status));
    kvaf_device::KvafBatchGetDevice(args,core);
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queues),2*sizeof(*queues));
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),sizeof(*status));
   }
  }
 #endif
