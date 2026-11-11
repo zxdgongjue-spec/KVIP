@@ -676,7 +676,7 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
     progressGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress));
     auto work=flags.ReinterpretCast<uint32_t>();
     const uint32_t windowEnd=Trigger(rt_history,rt_resident,rt_rounds,epoch)*128;
-    if (sequenceHalfWindow && epoch) {
+    if (sequenceHalfWindow && epoch && epoch + 1 < rt_rounds) {
         // The owner has published its half. Join the same two queries on
         // its sibling shard before taking the batch-wide ready snapshot.
         const uint32_t peerShard=1-core%2;

@@ -674,6 +674,9 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
 {
     uint32_t batch = splitCoreInfo.bN2Start;
     uint32_t shard = aiCoreIdx % 2;
+    const uint32_t finalEpoch = runtimeShape_.rounds - 1;
+    const uint32_t serviceEpoch = rotating::ServiceRank(runtimeShape_.batch, runtimeShape_.splitQ,
+                                                       aiCoreIdx) / runtimeShape_.serviceAics;
     CalcGS1LoopParams(batch);
     CalcS2LoopParams(batch, 0);
 
@@ -685,6 +688,12 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
             if constexpr (Phase == SequenceLiPhase::Threshold) {
                 vectorService.ProcessResidentTopK(info, tmpBlockIdx % SIM_Q);
             } else {
+                // The Cold launch has published both shards for every request.
+                // The final service owners can post while other AIVs start TopK.
+                if (serviceEpoch == finalEpoch) {
+                    vectorService.RotateFetch(finalEpoch, rotating::SequenceHalfWindow(runtimeShape_));
+                    PipeBarrier<PIPE_ALL>();
+                }
                 vectorService.ProcessTopK(info, tmpBlockIdx % SIM_Q);
             }
             vectorService.FreeEventID();
@@ -705,18 +714,16 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
         } else {
             uint32_t halfTokens = rotating::SequenceHalfWindow(runtimeShape_);
             uint32_t half = halfTokens / S2_BASE_SIZE;
-            uint32_t serviceEpoch = rotating::ServiceRank(runtimeShape_.batch, runtimeShape_.splitQ,
-                                                          aiCoreIdx) / runtimeShape_.serviceAics;
             if ASCEND_IS_AIV {
                 vectorService.LoadSequenceSplitThresholds(batch);
                 vectorService.PrepareRotationProgress();
                 if (serviceEpoch == 0) vectorService.RotateFetch(0, halfTokens);
             }
             uint32_t begin = resident_ / S2_BASE_SIZE + shard * half;
-            for (uint32_t epoch = 1; epoch < runtimeShape_.rounds; ++epoch, begin += 2 * half) {
-                ScanSequenceHalf(begin, begin + half, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
+            for (uint32_t epoch = 1; epoch <= finalEpoch; ++epoch, begin += 2 * half) {
+                ScanSequenceHalf(begin, begin + half, shard, loop, scaleLoop, epoch == finalEpoch);
                 if ASCEND_IS_AIV {
-                    if (serviceEpoch == epoch) vectorService.RotateFetch(epoch, halfTokens);
+                    if (serviceEpoch == epoch && epoch < finalEpoch) vectorService.RotateFetch(epoch, halfTokens);
                 }
             }
         }
