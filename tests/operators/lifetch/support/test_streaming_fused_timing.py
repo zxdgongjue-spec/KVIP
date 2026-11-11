@@ -61,6 +61,7 @@ def test_query_worker_timing_and_assignment_are_distinct():
         f[q*24+20] = 1
     u[10:25] = np.arange(20, 35)
     f[96:100] = [50, 60, 70, 80]
+    f[100] = 54
     flags = np.zeros((1, 12, 32), dtype=np.int32)
     flags[0, :5, 1] = [100, 1, 2, 3, 4]
     pipeline.times, pipeline.flags = HostTensor(words), HostTensor(flags)
@@ -69,4 +70,4 @@ def test_query_worker_timing_and_assignment_are_distinct():
     assert data['fetch']['queries'][2]['safe_mode'] == 1
     assert data['fetch']['queries'][2]['safe_cq_wait'] == 2
     assert data['fetch']['queries'][2]['conflict_groups'] == 6
-    assert data['fetch']['finalize'] == {'wait': 10, 'residency': 10, 'status': 10}
+    assert data['fetch']['finalize'] == {'prefetch_join': 4, 'wait': 6, 'residency': 10, 'status': 10}

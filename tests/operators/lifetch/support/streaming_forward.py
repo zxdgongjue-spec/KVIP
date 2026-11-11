@@ -32,6 +32,10 @@ class StreamingForward:
         # Dense fallback holds two uint32 permutations and two uint64 snapshots.
         self.dense_shadow = (torch.empty((b, 3 * self.history), dtype=torch.int64, device=device)
                              if q_workers else None)
+        # Each Q worker owns independent packed indices, offsets and destinations.
+        self.packed_fetch = (torch.empty((4 * q_workers, 3 * b * 2048 + ((3 * b + 31) // 32) * 32),
+                                        dtype=torch.int32, device=device)
+                             if q_workers else None)
         pointers = [rotating.context.data_ptr(), keys.data_ptr(), scales.data_ptr(), addresses.data_ptr(),
                     logical.data_ptr(), rotating.hot_valid.data_ptr(), self.flags.data_ptr(),
                     self.events_src.data_ptr(), self.events_dst.data_ptr(), self.worker_status.data_ptr(),
@@ -42,8 +46,8 @@ class StreamingForward:
                                np.asarray(geometry, dtype='<u4').view('u1'),
                                np.asarray(trailing, dtype='<u8').view('u1')))
         if q_workers:
-            blob = np.concatenate((blob, np.asarray([self.dense_shadow.data_ptr()], dtype='<u8').view('u1'),
-                                   np.zeros(120, dtype='u1')))
+            blob = np.concatenate((blob, np.asarray([self.dense_shadow.data_ptr(), self.packed_fetch.data_ptr()], dtype='<u8').view('u1'),
+                                   np.zeros(112, dtype='u1')))
         expected_size = 256 if q_workers else 128
         if len(blob) != expected_size:
             raise AssertionError(f'streaming workspace ABI size={len(blob)}, expected {expected_size}')
@@ -116,7 +120,7 @@ class StreamingForward:
                     conflict_cq_wait=int(f[q*24+15]), safe_groups=int(f[q*24+16]),
                     conflict_groups=int(f[q*24+17]), safe_mode=int(f[q*24+20]), total=int(f[q*24+9]-f[q*24]),
                     final_prefetch_join=int(f[q*24+19]-f[q*24+18]) if f[q*24+18] else 0)
-                    for q in range(4)], finalize=dict(wait=int(f[97]-f[96]),
+                    for q in range(4)], finalize=dict(prefetch_join=int(f[100]-f[96]), wait=int(f[97]-f[100]),
                     residency=int(f[98]-f[97]), status=int(f[99]-f[98])))
             elif fetch is not None:
                 f = fetch[b]

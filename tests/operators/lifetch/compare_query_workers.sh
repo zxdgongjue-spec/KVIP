@@ -36,7 +36,7 @@ lines = ['URMA graph A/B: Q4 H131072 R16384 heads32 miss10% prefetch512.',
          'Separate runs; full graph includes LI, resolver, update and KVAF fetch. Verification outside timing.',
          'Streaming breakdown is a separate instrumented replay; counters are raw device cycles, include instrumentation and may overlap.',
          f"GetSystemCycle counter clock MHz: {clock_mhz if clock_mhz else 'not supplied; cycles only'}.",
-         'Q workers batch safe submissions before CQ collection; nonzero KVAF inflight budgets use native synchronous fallback.',
+         'Q workers pack their request shard and call native KVAF BatchGet for safe/conflicting groups; mode=3 counters are shared per worker group.',
          'Block IDs are logical launch indices; physical AIV IDs are not measured.',
          'batch | variant | full_p50_us | init_us | li_us | resolve_us | publish_us | apply_us | resolve_update_us | fetch_us']
 for variant in ('baseline', 'q1', 'q2', 'q4'):

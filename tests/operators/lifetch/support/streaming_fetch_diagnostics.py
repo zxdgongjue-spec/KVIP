@@ -43,7 +43,7 @@ def summarize_mismatches(row, selected, ids, slots, output, payload, destination
                 posts=posts[:, :6].astype(np.int64).tolist())
 
 
-def audit_queue_writes(owner, rows, posts, row, bad_slots, destinations, remote_addresses):
+def audit_queue_writes(owner, rows, posts, row, bad_slots, destinations, remote_addresses, q_workers=None):
     """Read already-completed SQ entries on failure; no device work is submitted."""
     import ctypes
 
@@ -69,6 +69,8 @@ def audit_queue_writes(owner, rows, posts, row, bad_slots, destinations, remote_
     for owner_row in range(batch):
         initial = int(rows[owner_row, 212]) | (int(rows[owner_row, 213]) << 32)
         queue_specs.append((f'b{owner_row}_prefetch', owner_row * 2, initial, int(rows[owner_row, 9])))
+        if q_workers:
+            continue
         for q, post in enumerate(posts[owner_row]):
             view = owner_row * 2 + 1 if q == 0 else batch * 2 + owner_row * (workers - 1) + q - 1
             count = int(post[0])
@@ -76,6 +78,27 @@ def audit_queue_writes(owner, rows, posts, row, bad_slots, destinations, remote_
                 continue
             queue = read(int(contexts[view, 9]), 64).view('<u8')
             queue_specs.append((f'b{owner_row}_final_q{q+1}', view, int(queue[1]) - count, count))
+    # Grouped Q workers use one queue per (Q, lane), not one per request.
+    # Native BatchGet writes safe descriptors for all rows followed by conflicts.
+    group_indices = {}
+    if q_workers:
+        for q in range(workers):
+            for lane in range(min(q_workers, batch)):
+                indices = []
+                for phase in range(2):
+                    for b in range(lane, batch, q_workers):
+                        post = posts[b, q]
+                        count, begin, safe = int(post[0]), int(post[4]), int(post[5])
+                        start = begin if phase == 0 else begin + safe
+                        length = safe if phase == 0 else count - safe
+                        indices.extend(range(start, start + length))
+                if not indices:
+                    continue
+                view = lane * 2 + 1 if q == 0 else batch * 2 + lane * (workers - 1) + q - 1
+                queue = read(int(contexts[view, 9]), 64).view('<u8')
+                name = f'b{lane}_final_q{q+1}'
+                group_indices[name] = np.asarray(indices, dtype=np.int64)
+                queue_specs.append((name, view, int(queue[1]) - len(indices), len(indices)))
     result = []
     final_checks = []
     for name, view, start, count in queue_specs:
@@ -97,8 +120,9 @@ def audit_queue_writes(owner, rows, posts, row, bad_slots, destinations, remote_
             owner_row = int(name.split('_')[0][1:])
             query = int(name.rsplit('q', 1)[1]) - 1
             begin = int(posts[owner_row, query, 4])
-            wanted_local = np.uint64(owner.output.data_ptr()) + destinations[begin:begin+count].astype(np.uint64) * np.uint64(656)
-            wanted_remote = remote_addresses[begin:begin+count].astype(np.uint64)
+            index = group_indices.get(name, slice(begin, begin + count))
+            wanted_local = np.uint64(owner.output.data_ptr()) + destinations[index].astype(np.uint64) * np.uint64(656)
+            wanted_remote = remote_addresses[index].astype(np.uint64)
             different = np.flatnonzero((local != wanted_local) | (remote != wanted_remote))
             final_checks.append(dict(queue=name, checked=count, mismatches=int(len(different)),
                 examples=[dict(index=int(i), actual_local=hex(int(local[i])), expected_local=hex(int(wanted_local[i])),
