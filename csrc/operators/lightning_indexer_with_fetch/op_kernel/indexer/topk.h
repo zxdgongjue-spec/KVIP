@@ -152,14 +152,6 @@ public:
         tmpIndexLocal = tmpIndexLocalTmp.template ReinterpretCast<uint16_t>();
     }
 
-    // Restore the result of skipped prefix chunks into the bank consumed next.
-    __aicore__ inline void LoadHistory(GlobalTensor<uint16_t>& scores, GlobalTensor<uint32_t>& indices,
-                                       LocalTensor<uint16_t>& hisValueLocal, uint32_t offset, uint32_t nextLoop)
-    {
-        AscendC::DataCopy(hisValueLocal, scores[offset], topK);
-        AscendC::DataCopy(hisIndexLocal[nextLoop % 2], indices[offset], topK);
-    }
-
     __aicore__ inline void operator()(LocalTensor<uint16_t>& mrgValueLocal, LocalTensor<uint32_t>& indicesOutLocal,
                                       LocalTensor<uint16_t>& hisValueLocal, uint32_t s2SeqLen, uint32_t loopIdx, uint32_t s2LoopNum, bool returnScores = false)
     {
