@@ -81,6 +81,36 @@ def predecessor(current):
     return previous
 
 
+@pytest.mark.parametrize("wrap", [int, np.uint16, lambda value: np.asarray(value, dtype=np.uint16)])
+@pytest.mark.parametrize(
+    "key,expected_bits",
+    [
+        (0x8000, 0x00000000),  # +0
+        (0x7FFF, 0x80000000),  # -0
+        (0xBF80, 0x3F800000),  # +1
+        (0x407F, 0xBF800000),  # -1
+        (0x8001, 0x00010000),  # Positive BF16 subnormal.
+        (0x7FFE, 0x80010000),  # Negative BF16 subnormal.
+        (0xFF80, 0x7F800000),  # +inf
+        (0x007F, 0xFF800000),  # -inf
+        (0xFFC1, 0x7FC10000),  # Preserve NaN payload bits.
+    ],
+)
+def test_scalar_score_value_keeps_float32_bits_on_numpy1_and_numpy2(wrap, key, expected_bits):
+    value = score_value(wrap(key))
+    assert value.shape == () and value.dtype == np.float32
+    assert int(value.view(np.uint32)) == expected_bits
+
+
+def test_score_value_preserves_array_shape_bits_and_input():
+    keys = np.asarray([[0x8000, 0x7FFF], [0xBF80, 0x407F]], dtype=np.uint16)
+    original = keys.copy()
+    values = score_value(keys)
+    assert values.shape == keys.shape and values.dtype == np.float32
+    np.testing.assert_array_equal(values.view(np.uint32), [[0, 0x80000000], [0x3F800000, 0xBF800000]])
+    np.testing.assert_array_equal(keys, original)
+
+
 def test_scores_validate_full_causal_topk_thresholds_and_observed_misses(token_trace):
     current = score_trace(token_trace)
     previous = predecessor(current)

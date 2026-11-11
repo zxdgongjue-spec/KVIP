@@ -22,7 +22,11 @@ def score_value(key):
     """Inverse FloatToSortableKey<bfloat16_t>; ranking uses the original keys."""
     key = np.asarray(key, dtype=np.uint16)
     bits = np.where(key & 0x8000, key ^ 0x8000, ~key).astype(np.uint16)
-    return (bits.astype(np.uint32) << 16).view(np.float32)
+    words = np.asarray(bits, dtype=np.uint32)
+    # NumPy 1.x can promote a zero-dimensional uint32 << Python int to
+    # int64. Keep both operands and the destination uint32 before bitcasting.
+    np.left_shift(words, np.uint32(16), out=words)
+    return words.view(np.float32)
 
 
 def _identity(trace):
