@@ -712,6 +712,8 @@ def run_device(
             streaming_checks.append(("cold-start", initial_orders, True))
         for label, orders, cold_start in streaming_checks:
             state["check_phase"] = f"streaming {label}"
+            print(f"STREAMING CHECK START {label}: resolver_cores/request={pipeline.resolver_cores}; "
+                  f"total_AIV={pipeline.resolver_cores*b+4*(args.q_workers or 0)}", flush=True)
             reset()
             update.set_order(orders)
             if cold_start:
