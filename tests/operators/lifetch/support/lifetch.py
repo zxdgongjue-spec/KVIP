@@ -527,6 +527,17 @@ def run_device(
                             slot_owner=changes[ordinal] if ordinal >= 0 else None,
                         )
                     )
+                if args.streaming_fetch:
+                    from streaming_fetch_diagnostics import summarize_mismatches
+                    report = summarize_mismatches(
+                        row, selected[row], ids[row], slots[row].numpy(), output[row].numpy(),
+                        owner.session.cpu_payload[row].numpy(), rotating.destinations.cpu().numpy(),
+                        rotating.fallback_addresses.cpu().numpy(), posts[row], lru,
+                        rotating.mapping[row].cpu().numpy(), owner.output.shape[1], r,
+                        owner.remote_token_addresses[row].cpu().numpy())
+                    report_path = folder / "streaming_fetch_kv_mismatch.json"
+                    report_path.write_text(json.dumps(report, indent=2) + "\n")
+                    print(f"STREAMING FETCH KV AUDIT: {json.dumps(report)}; details={report_path}", flush=True)
                 raise AssertionError(
                     f"KV byte mismatch: batch={row} mismatched_tokens={int(mismatches.sum())} examples={details}"
                 )
