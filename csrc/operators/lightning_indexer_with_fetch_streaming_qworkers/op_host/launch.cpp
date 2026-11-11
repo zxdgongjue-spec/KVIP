@@ -117,8 +117,9 @@ extern "C" uint32_t kvip_counter_calibration(void* output,void* stream) {
 
 extern "C" uint32_t aclrtlaunch_v9_query_fetch_only(uint32_t,void*,void*,uint32_t);
 extern "C" uint32_t kvip_query_fetch_only(void* workspace,void* stream,uint32_t query) {
-    if(!workspace||!stream||query>4)return 100000;
-    return aclrtlaunch_v9_query_fetch_only(query==4?8:2,stream,workspace,query);
+    const uint32_t selected=query & 255U;
+    if(!workspace||!stream||selected>4||(query & ~511U))return 100000;
+    return aclrtlaunch_v9_query_fetch_only(selected==4?8:2,stream,workspace,query);
 }
 
 extern "C" uint32_t aclrtlaunch_v9_native_fetch_only(uint32_t,void*,void*,void*,uint32_t);
