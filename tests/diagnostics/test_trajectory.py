@@ -169,6 +169,120 @@ def test_scores_reject_missing_consecutive_predecessor(series):
         inspect_series(series)
 
 
+def _subset_series(root, content="full"):
+    if content == "token_ids":
+        _token_series(root)
+    elif content == "scores":
+        _score_series(root)
+    target = [f"model.layers.{layer}.self_attn.attn" for layer in range(78)]
+    for path in root.glob("dp*/series.json"):
+        data = json.loads(path.read_text())
+        groups = [dict(group=group, layer_names=target[group * 4 : group * 4 + 4]) for group in (2, 7)]
+        data.update(group_selection=[2, 7], groups=groups, target_layer_names=target, expected_target_layer_count=78)
+        if content == "scores":
+            data["real_input_groups"] = [7]
+        for round_entry in data["rounds"]:
+            for entry, group in zip(round_entry["groups"], groups, strict=True):
+                snapshot = json.loads((path.parent / entry["manifest"]).read_text())
+                snapshot["metadata"].update(**group, target_layer_names=target)
+                entry.update(
+                    group=group["group"],
+                    manifest=f"round{round_entry['round_index']:04d}/group{group['group']:03d}/manifest.json",
+                )
+                snapshot_path = path.parent / entry["manifest"]
+                _write(snapshot_path, snapshot)
+                if content != "full":
+                    (snapshot_path.parent / snapshot["archive"]["file"]).write_bytes(b"ids")
+        _write(path, data)
+
+
+@pytest.mark.parametrize("content", ["full", "token_ids", "scores"])
+def test_selected_groups_cover_eight_of_78_target_layers(series, capsys, content):
+    _subset_series(series, content)
+    reports = inspect_series(
+        series, expected_groups=[2, 7], expected_layers=8, expected_rounds=2, expected_content=content
+    )
+    assert all(
+        report["selected_groups"] == [2, 7]
+        and report["group_selection"] == [2, 7]
+        and report["model_layers"] == 78
+        and report["layers"] == 8
+        and report["coverage"] == "selected_target_layers"
+        and report["snapshots"] == 4
+        for report in reports
+    )
+    if content == "scores":
+        assert all(report["analysis_rounds"] == 1 and report["real_input_snapshots"] == 1 for report in reports)
+    main(["--root", str(series), "--expect-groups", "2", "7", "--expect-layers", "8"])
+    output = capsys.readouterr().out
+    assert "coverage=selected_target_layers" in output
+    assert "model_layers=78 selected_groups=2,7" in output
+    assert "coverage=all_target_layers" not in output
+
+
+@pytest.mark.parametrize("expected", [[2], [2, 8], [2, 2]])
+def test_expected_groups_must_match_exact_selection(series, expected):
+    _subset_series(series)
+    with pytest.raises(ValueError, match="groups"):
+        inspect_series(series, expected_groups=expected)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda data: data["rounds"][0]["groups"].pop(),
+        lambda data: data.update(group_selection=[2]),
+        lambda data: data.update(group_selection=[2, 7, 7]),
+        lambda data: data.update(group_selection=[]),
+        lambda data: data.update(group_selection=[2, True]),
+        lambda data: data["groups"].append(data["groups"][0]),
+        lambda data: data["groups"][0]["layer_names"].append("model.layers.78.self_attn.attn"),
+        lambda data: data["groups"][1].update(layer_names=data["groups"][0]["layer_names"]),
+        lambda data: data.update(expected_target_layer_count=79),
+        lambda data: data["target_layer_names"].append(data["target_layer_names"][0]),
+        lambda data: data.pop("group_selection"),
+        lambda data: data.update(group_selection="all"),
+    ],
+)
+def test_subset_must_preserve_selected_groups_and_complete_model_declaration(series, change):
+    _subset_series(series)
+    path = series / "dp0/series.json"
+    data = json.loads(path.read_text())
+    change(data)
+    _write(path, data)
+    with pytest.raises(ValueError):
+        inspect_series(series)
+
+
+def test_selected_mapping_must_be_identical_across_dp(series):
+    _subset_series(series)
+    path = series / "dp1/series.json"
+    data = json.loads(path.read_text())
+    data["groups"][0]["layer_names"], data["groups"][1]["layer_names"] = (
+        data["groups"][1]["layer_names"],
+        data["groups"][0]["layer_names"],
+    )
+    _write(path, data)
+    with pytest.raises(ValueError, match="disagree about group selection or target layer mapping"):
+        inspect_series(series)
+
+
+def test_group_selection_mode_must_match_across_dp(series):
+    path = series / "dp1/series.json"
+    data = json.loads(path.read_text())
+    data["group_selection"] = [0, 1]
+    _write(path, data)
+    with pytest.raises(ValueError, match="disagree about group selection"):
+        inspect_series(series)
+
+
+def test_legacy_absent_selection_still_means_all_target_layers(series, capsys):
+    reports = inspect_series(series, expected_groups=[0, 1], expected_layers=2)
+    assert all(report["group_selection"] == "all" and report["coverage"] == "all_target_layers" for report in reports)
+    main(["--root", str(series)])
+    assert "coverage=all_target_layers" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize(
     "change",
     [

@@ -9,7 +9,59 @@ from pathlib import Path
 from kvip.diagnostics.archive import TensorArchive, checked_path, load_snapshot
 
 
-def inspect_series(root, *, expected_dp=None, expected_rounds=None, expected_layers=None, expected_content=None):
+def _selected_groups(value, label):
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(type(group) is not int or group < 0 for group in value)
+        or len(value) != len(set(value))
+    ):
+        raise ValueError(f"{label} must contain distinct nonnegative group IDs")
+    return sorted(value)
+
+
+def _group_coverage(series, rank, expected_groups):
+    target = series["target_layer_names"]
+    expected_total = series["expected_target_layer_count"]
+    if (
+        not isinstance(target, list)
+        or any(not isinstance(name, str) or not name for name in target)
+        or len(target) != len(set(target))
+        or type(expected_total) is not int
+        or expected_total <= 0
+        or len(target) != expected_total
+    ):
+        raise ValueError(f"DP{rank} declared model target layers differ from its expected total")
+    entries = series["groups"]
+    group_ids = _selected_groups([entry["group"] for entry in entries], f"DP{rank} captured groups")
+    groups = {entry["group"]: entry["layer_names"] for entry in entries}
+    if any(
+        not isinstance(names, list) or not names or any(not isinstance(name, str) or not name for name in names)
+        for names in groups.values()
+    ):
+        raise ValueError(f"DP{rank} target group layer names are invalid")
+    layers = [name for names in groups.values() for name in names]
+    selection = series.get("group_selection", "all")
+    if selection != "all":
+        selection = _selected_groups(selection, f"DP{rank} group selection")
+        if selection != group_ids:
+            raise ValueError(f"DP{rank} captured group IDs differ from its explicit group selection")
+    if (
+        len(layers) != len(set(layers))
+        or not set(layers).issubset(target)
+        or selection == "all"
+        and set(layers) != set(target)
+    ):
+        raise ValueError(f"DP{rank} target layer coverage is incomplete or duplicated")
+    if expected_groups is not None and group_ids != expected_groups:
+        raise ValueError(f"DP{rank} captured groups {group_ids}, expected {expected_groups}")
+    coverage = "all_target_layers" if set(layers) == set(target) else "selected_target_layers"
+    return groups, layers, selection, coverage
+
+
+def inspect_series(
+    root, *, expected_dp=None, expected_rounds=None, expected_layers=None, expected_content=None, expected_groups=None
+):
     """Check every manifest, without rereading terabytes of saved tensor payloads."""
     root = Path(root)
     paths = sorted(root.glob("dp[0-9]*/series.json"))
@@ -17,6 +69,9 @@ def inspect_series(root, *, expected_dp=None, expected_rounds=None, expected_lay
         raise ValueError(f"No DP series manifests found under {root}")
     reports, ranks, expected_ranks = [], set(), None
     contents, real_plans = set(), set()
+    group_plan = None
+    if expected_groups is not None:
+        expected_groups = _selected_groups(expected_groups, "Expected groups")
     for path in paths:
         series = json.loads(path.read_text())
         rank = series.get("dp_rank")
@@ -59,7 +114,15 @@ def inspect_series(root, *, expected_dp=None, expected_rounds=None, expected_lay
         real_rounds = set(series.get("real_input_rounds", []))
         real_groups = set(series.get("real_input_groups", []))
         real_count = 0
-        groups = {entry["group"]: entry["layer_names"] for entry in series["groups"]}
+        groups, layers, selection, coverage = _group_coverage(series, rank, expected_groups)
+        current_plan = (
+            selection,
+            [(group, groups[group]) for group in sorted(groups)],
+            series["target_layer_names"],
+        )
+        if group_plan is not None and current_plan != group_plan:
+            raise ValueError("DP series disagree about group selection or target layer mapping")
+        group_plan = current_plan
         if content == "scores":
             if (
                 bool(real_rounds) != bool(real_groups)
@@ -68,14 +131,6 @@ def inspect_series(root, *, expected_dp=None, expected_rounds=None, expected_lay
             ):
                 raise ValueError(f"DP{rank} real-input sampling plan exceeds the captured rounds/groups")
             real_plans.add((tuple(sorted(real_rounds)), tuple(sorted(real_groups))))
-        layers = [name for names in groups.values() for name in names]
-        if (
-            len(groups) != len(series["groups"])
-            or len(layers) != len(set(layers))
-            or set(layers) != set(series["target_layer_names"])
-            or len(layers) != series["expected_target_layer_count"]
-        ):
-            raise ValueError(f"DP{rank} target layer coverage is incomplete or duplicated")
         if expected_layers is not None and len(layers) != expected_layers:
             raise ValueError(f"DP{rank} covers {len(layers)} layers, expected {expected_layers}")
         previous_scheduler_round = -1
@@ -151,6 +206,10 @@ def inspect_series(root, *, expected_dp=None, expected_rounds=None, expected_lay
                 rounds=total,
                 layers=len(layers),
                 groups=len(groups),
+                selected_groups=sorted(groups),
+                group_selection=selection,
+                model_layers=len(series["target_layer_names"]),
+                coverage=coverage,
                 snapshots=total * len(groups),
                 batch=series["batch"],
                 queries=series["queries"],
@@ -206,6 +265,7 @@ def main(argv=None):
     parser.add_argument("--expect-dp", type=int, nargs="+")
     parser.add_argument("--expect-rounds", type=int)
     parser.add_argument("--expect-layers", type=int)
+    parser.add_argument("--expect-groups", type=int, nargs="+")
     parser.add_argument("--expect-content", choices=("full", "token_ids", "scores"))
     parser.add_argument("--extract", type=Path, help="Expand one snapshot to a new standalone directory")
     parser.add_argument("--dp-rank", type=int)
@@ -224,11 +284,13 @@ def main(argv=None):
             expected_rounds=args.expect_rounds,
             expected_layers=args.expect_layers,
             expected_content=args.expect_content,
+            expected_groups=args.expect_groups,
         )
         for report in reports:
             print(
                 f"TRACE_DP_PASS dp={report['dp_rank']} batch={report['batch']} queries={report['queries']} "
                 f"rounds={report['rounds']} layers={report['layers']} groups={report['groups']} "
+                f"model_layers={report['model_layers']} selected_groups={','.join(map(str, report['selected_groups']))} "
                 f"snapshots={report['snapshots']} content={report['content']} all_pure_decode=true"
             )
             if report["content"] == "scores":
@@ -238,11 +300,11 @@ def main(argv=None):
                 )
         if reports[0]["content"] in ("token_ids", "scores"):
             print(
-                f"TRACE_SERIES_PASS coverage=all_target_layers content={reports[0]['content']} "
+                f"TRACE_SERIES_PASS coverage={reports[0]['coverage']} content={reports[0]['content']} "
                 "real_payload=not_collected"
             )
         else:
-            print("TRACE_SERIES_PASS coverage=all_target_layers payload_check=at_capture_and_replay")
+            print(f"TRACE_SERIES_PASS coverage={reports[0]['coverage']} payload_check=at_capture_and_replay")
         if args.extract is not None:
             if args.dp_rank not in [report["dp_rank"] for report in reports] or args.round_index < 1:
                 raise ValueError("Extraction DP/round is outside the captured series")
