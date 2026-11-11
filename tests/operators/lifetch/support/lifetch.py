@@ -222,7 +222,7 @@ def run(args, run_dir):
 
 
 
-def run_v9_li_varlen_only(args, b, torch, torch_npu, device, owner, arguments, fixture, native_li, launch_module, aics):
+def run_v9_li_varlen_only(args, b, torch, torch_npu, device, owner, arguments, fixture, native_li, launch_module, build, aics):
     """Exercise only v9_init + v9_li + v9_wait with per-request Q/K lengths."""
     from kvip.adapters.vllm.inputs import QueryInputs
 
@@ -245,7 +245,7 @@ def run_v9_li_varlen_only(args, b, torch, torch_npu, device, owner, arguments, f
     owner.acquire()
     rotating = launch_module.LIFetchBinding(
         torch,
-        owner._lifetch_library_path,
+        build / "libv9_bridge.so",
         arguments,
         owner,
         batch=b,
@@ -444,7 +444,7 @@ def run_device(
     if getattr(args, "li_only_varlen", False):
         return run_v9_li_varlen_only(
             args, b, torch, torch_npu, device, owner, arguments, fixture,
-            native_li, launch_module, aics,
+            native_li, launch_module, build, aics,
         )
     stream = torch.npu.current_stream(device)
     capture = torch.npu.Stream(device=device)
