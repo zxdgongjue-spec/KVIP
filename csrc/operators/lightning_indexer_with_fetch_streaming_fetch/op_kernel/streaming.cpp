@@ -204,7 +204,7 @@ __aicore__ inline void FetchQueries(__gm__ Args* a,uint32_t b) {
    if(count && !error){kvaf_device::KvafBatchGetDevice(args,0,begin,count);
     auto done=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(args.core_status);
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(done),sizeof(*done));
-    error|=done->result;completed+=done->completed_batch_count;
+    error|=done->result;completed=done->completed_batch_count;
     if(done->magic!=KVAF_AIV_BATCH_GET_STATUS_MAGIC || done->processed_request_count!=count)error|=kvaf_device::kInvalidArgs;
    }
 #else

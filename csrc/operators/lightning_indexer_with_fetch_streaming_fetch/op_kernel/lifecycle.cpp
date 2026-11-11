@@ -329,6 +329,8 @@ __aicore__ inline void FinishFetch(GM_ADDR bindings, GM_ADDR update) {
         auto post=FinalPostAt(rt_finalPostOffset,ctx,b*rt_finalWorkers+w);
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
         completed+=post->pending;
+        post->pending=0;
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
     }
 #define LIFETCH_FINAL_JOIN do { if(!update) CompletePrefetch(ctx,b); error|=row->error; } while (0)
 #define LIFETCH_FINAL_PHASE "../../lightning_indexer_with_fetch/op_kernel/final_fetch_phase.h"
