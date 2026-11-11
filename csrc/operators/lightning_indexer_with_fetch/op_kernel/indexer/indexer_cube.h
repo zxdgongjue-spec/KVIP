@@ -339,33 +339,16 @@ template <typename QLIT>
 __aicore__ inline void QLIMatmul<QLIT>::KeyNd2NzForPA(uint64_t s2L1RealSize, uint64_t s2GmOffset,
                                                     const QLICommon::RunInfo &runInfo)
 {
-    if (s2L1RealSize == 0) {
-        return;
-    }
     uint64_t s2L1Offset = 0;
-    uint64_t s2BlkId = s2GmOffset / constInfo_.kCacheBlockSize;
-    uint64_t s2BlkOffset = s2GmOffset % constInfo_.kCacheBlockSize;
-    uint64_t blockTableOffset = runInfo.bIdx * constInfo_.maxBlockNumPerBatch;
-    uint64_t physicalBlock = blkTableGm_.GetValue(blockTableOffset + s2BlkId);
-    bool densePages = constInfo_.keyStride0 == constInfo_.kCacheBlockSize * constInfo_.headDim;
     while (s2L1Offset < s2L1RealSize) {
-        uint64_t keyGmOffset = physicalBlock * constInfo_.keyStride0 + s2BlkOffset * constInfo_.headDim;
+        uint64_t s2BlkId = (s2L1Offset + s2GmOffset) / constInfo_.kCacheBlockSize;
+        uint64_t s2BlkOffset = (s2L1Offset + s2GmOffset) % constInfo_.kCacheBlockSize;
+        uint64_t keyGmOffset = blkTableGm_.GetValue(runInfo.bIdx * constInfo_.maxBlockNumPerBatch + s2BlkId) *
+                                constInfo_.keyStride0 + s2BlkOffset * constInfo_.headDim;
 
         uint64_t s2Mte2Size = s2L1RealSize - s2L1Offset;
         s2Mte2Size = s2BlkOffset + s2Mte2Size >= constInfo_.kCacheBlockSize ? constInfo_.kCacheBlockSize - s2BlkOffset
                                                                             : s2Mte2Size;
-        // Join only physically adjacent, unpadded pages within this L1 tile.
-        // Keep the first non-adjacent page for the next copy instead of re-reading it.
-        while (s2L1Offset + s2Mte2Size < s2L1RealSize) {
-            uint64_t previousBlock = physicalBlock;
-            physicalBlock = blkTableGm_.GetValue(blockTableOffset + ++s2BlkId);
-            s2BlkOffset = 0;
-            if (!densePages || physicalBlock != previousBlock + 1) {
-                break;
-            }
-            uint64_t remaining = s2L1RealSize - s2L1Offset - s2Mte2Size;
-            s2Mte2Size += remaining < constInfo_.kCacheBlockSize ? remaining : constInfo_.kCacheBlockSize;
-        }
         Nd2NzParams nd2nzPara;
         nd2nzPara.ndNum = 1;
         nd2nzPara.nValue = s2Mte2Size; // 行数
