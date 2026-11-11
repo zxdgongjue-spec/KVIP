@@ -75,11 +75,12 @@ def arguments(argv=None):
 
 def run_worker(args, run):
     progress(run, "checking native registration and KVAF dependency")
-    vendors = ROOT / "csrc/operators/lidu/_custom_opp/vendors"
-    paths = sorted(str(p) for p in vendors.glob("*") if (p / "op_api/lib/libcust_opapi.so").is_file())
-    if not paths:
-        raise RuntimeError("Build first: bash scripts/build.sh")
-    os.environ["ASCEND_CUSTOM_OPP_PATH"] = ":".join([*paths, *filter(None, [os.environ.get("ASCEND_CUSTOM_OPP_PATH")])])
+    if not args.li_only_varlen:
+        vendors = ROOT / "csrc/operators/lidu/_custom_opp/vendors"
+        paths = sorted(str(p) for p in vendors.glob("*") if (p / "op_api/lib/libcust_opapi.so").is_file())
+        if not paths:
+            raise RuntimeError("Build first: bash scripts/build.sh")
+        os.environ["ASCEND_CUSTOM_OPP_PATH"] = ":".join([*paths, *filter(None, [os.environ.get("ASCEND_CUSTOM_OPP_PATH")])])
     if args.soc is None:
         import acl
         import torch
