@@ -28,6 +28,7 @@ def arguments(argv=None):
     p.add_argument("--legacy-fetch-layout", action="store_true")
     p.add_argument("--parallel-fetch-finalize", action="store_true")
     p.add_argument("--prepare-update-metadata", action="store_true")
+    p.add_argument("--optimized-resolve", action="store_true")
     p.add_argument("--fused-final", action="store_true", help="finish fetch status in streaming kernel")
     p.add_argument("--q-workers", type=int, choices=(1, 2, 4), default=None,
                    help="AIV workers per query across all requests")
@@ -169,6 +170,7 @@ def main(argv=None):
     p.add_argument('--legacy-fetch-layout', action='store_true')
     p.add_argument('--parallel-fetch-finalize', action='store_true')
     p.add_argument('--prepare-update-metadata', action='store_true')
+    p.add_argument('--optimized-resolve', action='store_true')
     p.add_argument('--fused-final', action='store_true')
     p.add_argument('--q-workers', type=int, choices=(1, 2, 4))
     p.add_argument('--final-workers', type=int, choices=(1, 2, 4))
@@ -228,6 +230,10 @@ def main(argv=None):
                    '--kvaf-root', str(kvaf_root), '--cann', a.cann, '--batches', a.batches,
                    '--intermediate-fetches', str(a.intermediate_fetches), '--trace-rounds', str(a.trace_rounds),
                    '--output', str(a.output), '--timeout-seconds', str(a.timeout_seconds)]
+        if a.optimized_resolve:
+            if not (a.streaming and a.streaming_fetch and a.fused_final and a.q_workers and a.prepare_update_metadata):
+                p.error('--optimized-resolve requires streaming, streaming-fetch, fused-final, q-workers and prepare-update-metadata')
+            command.append('--optimized-resolve')
         if a.prepare_update_metadata:
             command.append('--prepare-update-metadata')
         if a.parallel_fetch_finalize:
@@ -263,6 +269,8 @@ def main(argv=None):
         if a.comparison_sfa:
             command += ['--comparison-sfa', str(a.comparison_sfa)]
         return subprocess.call(command)
+    if a.optimized_resolve:
+        p.error('--optimized-resolve is supported only by URMA')
     if a.final_workers is not None:
         p.error('--final-workers is supported only by URMA')
     if a.early_fetch or a.avoid_prefetch_slots or a.streaming or a.streaming_fetch or a.fused_final or a.q_workers is not None:

@@ -6,9 +6,10 @@ from pathlib import Path
 
 def decode(raw):
     batch, workers = raw['batch'], raw['workers_per_query']
+    resolver_cores = raw.get('resolver_cores', 2)
     cores, pu, fetch = raw['cores'], raw['producer_update'], raw['fetch']
     mhz = raw['clock_mhz']
-    if not mhz or mhz <= 0 or len(cores) != 2 * batch + 4 * workers:
+    if not mhz or mhz <= 0 or len(cores) != resolver_cores * batch + 4 * workers:
         raise ValueError('missing clock calibration or core records')
     if any(not c[0] or c[1] < c[0] for c in cores):
         raise ValueError('missing/nonmonotonic core entry or exit marker')
@@ -23,10 +24,10 @@ def decode(raw):
             stages.append(dict(name=name, start_cycles=start, end_cycles=end,
                                start_us=(start-origin)/mhz, end_us=(end-origin)/mhz,
                                duration_us=(end-start)/mhz))
-        if block < 2 * batch:
-            b = block // 2
+        if block < resolver_cores * batch:
+            b = block // resolver_cores
             p, u, f = pu[b][:32], pu[b][32:], fetch[b]
-            if block % 2 == 0:
+            if block % resolver_cores == 0:
                 role = f'resolver+finalize b{b}'
                 add('input_and_bitmap', p[1], p[2])
                 add('initialize', p[2], p[3])
@@ -40,15 +41,23 @@ def decode(raw):
                 if f[116]: add('prefetch_residency', f[116], f[117])
                 add('residency', f[97], f[98])
                 add('status', f[98], f[99])
-            else:
+            elif block % resolver_cores == 1:
                 role = f'index_update b{b}'
                 add('initialize_and_wait_prefetch', u[10], u[12])
                 for q in range(5):
                     if q: add(f'wait.Q{q}', u[11+2*q], u[12+2*q])
                     add('apply.prefetch' if q == 0 else f'apply.Q{q}', u[12+2*q], u[13+2*q])
                 add('metadata', u[22], u[23])
+            else:
+                role = f'output_pack b{b}'
+                add('wait.prefetch_publication', c[0], c[2])
+                add('input_and_output_masks', c[2], c[3])
+                for q in range(4):
+                    t = c[4+q*6:10+q*6]
+                    for i, name in enumerate(('logical_lookup', 'wait.resolver', 'locations_and_pack', 'output_and_sync', 'publish')):
+                        add(f'Q{q+1}.{name}', t[i], t[i+1])
         else:
-            q, lane = divmod(block-2*batch, workers)
+            q, lane = divmod(block-resolver_cores*batch, workers)
             role = f'fetch Q{q+1} lane{lane}'
             for phase, name in enumerate(('safe','conflict')):
                 t = c[2+phase*5:7+phase*5]
@@ -87,7 +96,7 @@ def decode(raw):
         item = dict(block=block, role=role, start_cycles=c[0], end_cycles=c[1],
                     start_us=(c[0]-origin)/mhz, end_us=(c[1]-origin)/mhz,
                     duration_us=(c[1]-c[0])/mhz, stages=stages)
-        if block >= 2*batch:
+        if block >= resolver_cores*batch:
             item['KVAF_counters'] = counters
             item['requests'] = list(range(lane, batch, workers))
             item['published_misses'] = [raw['flags'][b][q+1][1] for b in item['requests']]

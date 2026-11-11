@@ -102,3 +102,18 @@ def test_fetch_only_requires_matching_two_worker_fused_path(monkeypatch, tmp_pat
     assert '--fetch-only-compare' in commands[0]
     with pytest.raises(SystemExit):
         module.main(common[:-2] + ['4', '--fetch-only-compare'])
+
+
+def test_optimized_resolve_requires_full_streaming_metadata_path(monkeypatch, tmp_path):
+    commands = []
+    monkeypatch.setattr(module.subprocess, 'call', lambda command: commands.append(command) or 0)
+    base = ['--transport', 'urma', '--kvaf-server', 'host:1', '--kvaf-root', str(tmp_path),
+            '--optimized-resolve']
+    with pytest.raises(SystemExit):
+        module.main(base)
+    flags = ['--streaming', '--streaming-fetch', '--fused-final', '--q-workers', '2',
+             '--prepare-update-metadata']
+    assert module.main(base + flags) == 0
+    assert '--optimized-resolve' in commands[0]
+    internal = module.arguments(commands[0][commands[0].index('--internal-urma') + 1:])
+    assert internal.optimized_resolve and internal.prepare_update_metadata

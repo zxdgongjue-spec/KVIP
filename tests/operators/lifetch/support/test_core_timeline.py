@@ -51,3 +51,25 @@ def test_incomplete_or_inconsistent_timeline_fails(mutation):
     if mutation == 'publication_order': raw['fetch'][0][1] = 130
     with pytest.raises(ValueError):
         module.decode(raw)
+
+
+def test_publication_core_preserves_fetch_roles_and_all_query_stages():
+    raw = fixture()
+    raw['resolver_cores'] = 3
+    publisher = [100, 1000] + [0] * 30
+    publisher[2:4] = [115, 125]
+    for q in range(4):
+        publisher[4+q*6:10+q*6] = list(range(140+q*30, 146+q*30))
+    raw['cores'].insert(2, publisher)
+    raw['flags'][0].extend([[1, 0, 0]] * 4)
+    result = module.decode(raw)
+    assert result['cores'][2]['role'] == 'output_pack b0'
+    assert result['cores'][3]['role'] == 'fetch Q1 lane0'
+    assert result['cores'][6]['role'] == 'fetch Q4 lane0'
+    stages = [s for s in result['cores'][2]['stages']
+              if not s['name'].startswith('control_gap')]
+    assert len(stages) == 22
+    assert stages[-1]['name'] == 'Q4.publish'
+    raw['cores'][2][20] = 0
+    with pytest.raises(ValueError):
+        module.decode(raw)

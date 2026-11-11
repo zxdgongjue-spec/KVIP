@@ -52,13 +52,24 @@ inline void PackStagedUrma(uint32_t history, uint32_t resident, uint32_t tokenBy
     asc_threadfence();asc_syncthreads();
 }
 
+#if KVIP_FUSE_QUERY_WORK
+__simt_callee__
+#else
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
+#endif
 inline void PackStagedUrmaQuery(uint32_t history, uint32_t resident, uint32_t tokenBytes,
     uint32_t batch, uint32_t query, uint32_t used, uint32_t rangeBegin, uint32_t count,
-    __gm__ Context* ctx, __ubuf__ uint32_t* selected, __ubuf__ uint16_t* ids,
+    StagedContextPointer ctx, __ubuf__ uint32_t* selected, __ubuf__ uint16_t* ids,
     __ubuf__ uint32_t* slots, __ubuf__ uint32_t* ctl,
     __gm__ int32_t* direct=nullptr,uint32_t directStride=0) {
     uint32_t tid=threadIdx.x;
+#if KVIP_FUSE_QUERY_WORK
+    if(!count){
+        if(!tid){ctl[16]=0;ctl[17]=0;ctl[18]=0;ctl[19]=0;}
+        asc_syncthreads();
+        return;
+    }
+#endif
     auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+batch;
     auto addresses=reinterpret_cast<__gm__ uint64_t*>(row->addresses);
     auto reserved=reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+batch*resident;

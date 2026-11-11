@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Experimental two-AIV in-kernel producer/consumer: no KV transport.
 #include "kernel_operator.h"
+#ifndef KVIP_FUSE_QUERY_WORK
+#define KVIP_FUSE_QUERY_WORK 0
+#endif
 #if defined(__CCE_AICORE__)
 #include "resolver.h"
 #include "resolver_staged_dma2.h"
@@ -13,7 +16,12 @@ using namespace AscendC;
 using namespace rotating;
 using namespace pipeline_ab;
 #include "staged_fetch_worker.h"
-__simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PublishQ(
+#if KVIP_FUSE_QUERY_WORK
+__simt_callee__
+#else
+__simt_vf__ __aicore__ LAUNCH_BOUND(512)
+#endif
+inline void PublishQ(
  __ubuf__ uint32_t* selected,__ubuf__ uint16_t* ids,__ubuf__ uint32_t* slots,
  __gm__ uint32_t* source,__gm__ uint32_t* dest,uint32_t begin,uint32_t end) {
  for(uint32_t i=begin+threadIdx.x;i<end;i+=512){asc_stcg(source+kPrefetch+i,selected[ids[i]]);asc_stcg(dest+kPrefetch+i,slots[i]);}
@@ -24,22 +32,69 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PublishPrefetch(
  for(uint32_t i=threadIdx.x;i<count;i+=512){asc_stcg(outSource+i,asc_ldcg(source+i));asc_stcg(outDest+i,asc_ldcg(dest+i));}
  asc_threadfence();asc_syncthreads();
 }
-__simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void MergeQueryBitmaps(__ubuf__ uint32_t* output,__ubuf__ uint32_t* other,uint32_t words) {
+// ctl[32:64] is outside resolver counts, prefix scratch and protection bitmap.
+constexpr uint32_t kOutputMasksOffset=32;
+constexpr uint32_t kOutputMasksPerQuery=8;
+__simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void MergeQueryBitmaps(__ubuf__ uint32_t* output,__ubuf__ uint32_t* other,uint32_t words
+#if KVIP_FUSE_QUERY_WORK
+ ,__gm__ int64_t* unpack,__gm__ int64_t* valid,uint32_t batchCount,uint32_t batch,
+ __ubuf__ uint32_t* masks,bool outputEnabled
+#endif
+ ) {
  for(uint32_t i=threadIdx.x;i<words;i+=512)output[i]|=other[i]|other[words+i]|other[2*words+i];
+#if KVIP_FUSE_QUERY_WORK
+ if(threadIdx.x<4*kOutputMasksPerQuery)masks[threadIdx.x]=0;
+ asc_syncthreads();
+ if(outputEnabled)for(uint32_t row=threadIdx.x;row<batchCount*4;row+=512){
+  bool active=asc_ldcg(valid+row)!=0;
+  uint64_t source=active?uint64_t(asc_ldcg(unpack+row)):0;
+  if(active && source/4==batch)
+   asc_atomic_or(masks+(source%4)*kOutputMasksPerQuery+row/32,1U<<(row%32));
+  else if(!active && row/4==batch)asc_atomic_or(masks+2+row/32,1U<<(row%32));
+ }
+#endif
  asc_syncthreads();
 }
 __simt_vf__ __aicore__ LAUNCH_BOUND(32) inline void PublishStreamingUpdateStatus(__gm__ uint32_t* status,uint32_t b,uint32_t error) {
  if(!threadIdx.x)asc_stcg(status+b,error);
  asc_threadfence();
 }
+#if KVIP_FUSE_QUERY_WORK
+// Same operations and buffers as the separate VF calls, with one dispatch.
+// Q-ready is still published by the scalar caller after output DMA completion.
+__simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void ResolveQueryWork(
+ StagedContextPointer ctx,uint32_t history,uint32_t resident,uint32_t tokenBytes,uint32_t used,
+ uint32_t batchCount,uint32_t b,uint32_t q,
+ __gm__ int64_t* logicalRow,__gm__ int64_t* unpack,__gm__ int64_t* valid,
+ __gm__ uint32_t* eventSource,__gm__ uint32_t* eventDest,__ubuf__ uint32_t* selected,
+ __ubuf__ uint32_t* loc,__ubuf__ uint32_t* keys,__ubuf__ uint32_t* ranks,
+ __ubuf__ uint16_t* ids,__ubuf__ uint32_t* slots,__ubuf__ uint32_t* work,
+ __ubuf__ uint32_t* ctl,__gm__ int32_t* direct,uint32_t stride) {
+ StagedQuery(q,history,resident,tokenBytes,b,used,ctx,
+             selected,loc,keys,ranks,ids,slots,work,ctl);
+ if(ctl[1])return;
+ #if !KVIP_OUTPUT_WORKER
+ if(threadIdx.x<8)work[threadIdx.x]=0;
+ asc_syncthreads();
+ if(logicalRow)
+  PrepareStagedQueryOutputs(logicalRow,ctl+kOutputMasksOffset+q*kOutputMasksPerQuery,batchCount,b,q,selected,work,work+64);
+ PackStagedUrmaQuery(history,resident,tokenBytes,b,q,used,
+    ctl[0]-ctl[2+q],ctl[2+q],ctx,selected,ids,slots,ctl,direct,stride);
+ if(ctl[1])return;
+ #endif
+ PublishQ(selected,ids,slots,eventSource,eventDest,ctl[0]-ctl[2+q],ctl[0]);
+}
+#endif
 __aicore__ inline void PublishQueryOutputs(__gm__ uint64_t* update,uint32_t batchCount,uint32_t batch,uint32_t query,
  LocalTensor<uint32_t> selected,LocalTensor<uint32_t> loc,LocalTensor<uint32_t> work) {
  if(!update[20]||!update[21]||!update[22]||!update[23])return;
  auto values=work[64];
+ #if !KVIP_FUSE_QUERY_WORK
  Duplicate(work,uint32_t(0),8);PipeBarrier<PIPE_V>();
  Simt::VF_CALL<PrepareStagedQueryOutputs>(Simt::Dim3{512,1,1},update,batchCount,batch,query,
   FinalPtr(selected),FinalPtr(work),FinalPtr(values));
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+ #endif
  GlobalTensor<uint32_t> logicalOut,slotOut;
  logicalOut.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(update[22]));
  slotOut.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(update[23]));
@@ -72,6 +127,7 @@ __aicore__ inline void SyncFetchDescriptors(__gm__ Context* ctx, uint32_t begin,
  if(ctx->fallbackAddresses)
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->fallbackAddresses)+uint64_t(begin)*8,uint64_t(count)*8);
 }
+#include "output_worker.h"
 __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
@@ -85,7 +141,7 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
   for(uint32_t q=0;q<4;++q){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+q*32),128);inputError|=errors[q*32];}}
  if(inputError){auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*32;status[0]=inputError;status[1]=0;
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),128);
-  for(uint32_t q=0;q<=5;++q){flags[q].count=0;flags[q].error=inputError;flags[q].ready=1;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+q),sizeof(BatchFlag));}
+  for(uint32_t q=0;q<kFlagCount;++q){if(q==6 || (q>=7 && q<12))continue;flags[q].count=0;flags[q].error=inputError;flags[q].ready=1;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+q),sizeof(BatchFlag));}
   return;}
  TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,kFinalScratchBytes);auto local=scratch.Get<uint32_t>();
  Simt::VF_CALL<PublishPrefetch>(Simt::Dim3{512,1,1},reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+b*10240,
@@ -97,7 +153,30 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  auto selected=local,loc=local[kSlots],keys=local[2*kSlots],ranks=local[3*kSlots];
  auto ids=local[4*kSlots].ReinterpretCast<uint16_t>();
  auto slots=local[kFinalSlotsOffset],work=local[kFinalPositionsOffset],ctl=local[kFinalControlOffset];
- GlobalTensor<uint32_t> input;input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->selected)+b*kSlots);DataCopy(selected,input,kSlots);
+#if KVIP_FUSE_QUERY_WORK
+ // Bind immutable metadata once on scalar control instead of reloading the
+ // pointer chain in every SIMT warp and query. Official maps remain unchanged
+ // until the consumer has observed the final Q publication.
+ auto u=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);
+ bool outputEnabled=u[20] && u[21] && u[22] && u[23];
+ auto logicalRow=outputEnabled?reinterpret_cast<__gm__ int64_t*>(u[3])+
+    uint64_t(reinterpret_cast<__gm__ uint32_t*>(u[9])[b])*uint32_t(u[24]):nullptr;
+ auto unpack=reinterpret_cast<__gm__ int64_t*>(u[20]);
+ auto outputValid=reinterpret_cast<__gm__ int64_t*>(u[21]);
+ auto eventSource=reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+b*a->maxEvents;
+ auto eventDest=reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+b*a->maxEvents;
+#endif
+ GlobalTensor<uint32_t> input;
+#if KVIP_FUSE_QUERY_WORK
+ // Context fields are immutable for this invocation; pointer targets remain
+ // GM and retain their original loads/stores and publication protocol.
+ constexpr uint32_t contextWords=sizeof(Context)/sizeof(uint32_t),contextOffset=128;
+ static_assert(contextOffset+contextWords<544,"Context snapshot overlaps prefix scratch");
+ input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx));
+ DataCopy(ctl[contextOffset],input,contextWords);
+ auto stagedContext=reinterpret_cast<__ubuf__ Context*>(ctl[contextOffset].GetPhyAddr());
+#endif
+ input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->selected)+b*kSlots);DataCopy(selected,input,kSlots);
  input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*kSlots);DataCopy(loc,input,kSlots);
  uint32_t words=(shape.resident+31)/32;
  input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(a->queryBitmaps)+uint64_t(b)*4*words);
@@ -105,7 +184,11 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  for(uint32_t q=1;q<4;++q)DataCopy(keys[(q-1)*words],input[q*words],words);
  input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots);DataCopy(work[4096],input,kLruSlots);
  SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
- Simt::VF_CALL<MergeQueryBitmaps>(Simt::Dim3{512,1,1},FinalPtr(ctl[1024]),FinalPtr(keys),words);
+ Simt::VF_CALL<MergeQueryBitmaps>(Simt::Dim3{512,1,1},FinalPtr(ctl[1024]),FinalPtr(keys),words
+#if KVIP_FUSE_QUERY_WORK
+  ,unpack,outputValid,shape.batch,b,FinalPtr(ctl[kOutputMasksOffset]),outputEnabled && !KVIP_OUTPUT_WORKER
+#endif
+ );
  PipeBarrier<PIPE_V>();
  if(profile)ticks[2]=GetSystemCycle();
  Simt::VF_CALL<StagedInitializeReady>(Simt::Dim3{512,1,1},FinalPtr(selected),FinalPtr(loc),FinalPtr(keys),FinalPtr(ranks),FinalPtr(ctl));
@@ -113,38 +196,65 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  if(profile)ticks[3]=GetSystemCycle();
  GlobalTensor<uint32_t> output;output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*kSlots);
  auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*32;
+
  for(uint32_t q=0;q<4 && !ctl.GetValue(1);++q){
   if(profile)ticks[10+q*5]=GetSystemCycle();
+#if KVIP_FUSE_QUERY_WORK
+  uint32_t fw=(a->prefetchCount>>16)&0xffU,ds=shape.batch*kTop,meta=(3*shape.batch+31)&~31U;
+  auto direct=reinterpret_cast<__gm__ int32_t*>(a->packedFetch)+4*fw*(3*ds+meta)+(q*fw+b%fw)*(6*ds+64);
+  Simt::VF_CALL<ResolveQueryWork>(Simt::Dim3{512,1,1},stagedContext,shape.history,shape.resident,shape.tokenBytes,row->slots,
+    shape.batch,b,q,logicalRow,unpack,outputValid,eventSource,eventDest,
+    FinalPtr(selected),FinalPtr(loc),FinalPtr(keys),FinalPtr(ranks),
+    reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(work),FinalPtr(ctl),
+    (a->prefetchCount & 0x20000000U)?nullptr:direct,ds);
+#else
   Simt::VF_CALL<StagedQuery>(Simt::Dim3{512,1,1},q,shape.history,shape.resident,shape.tokenBytes,b,row->slots,ctx,
    FinalPtr(selected),FinalPtr(loc),FinalPtr(keys),FinalPtr(ranks),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(work),FinalPtr(ctl));
+#endif
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
   if(profile)ticks[11+q*5]=GetSystemCycle();
   uint32_t total=ctl.GetValue(0),added=ctl.GetValue(2+q),error=ctl.GetValue(1);
+  #if !KVIP_OUTPUT_WORKER
   if(!error && a->updateBindings){
    PublishQueryOutputs(reinterpret_cast<__gm__ uint64_t*>(a->updateBindings),shape.batch,b,q,selected,loc,work);
   }
   if(profile)ticks[12+q*5]=GetSystemCycle();
   if(!error){
+#if !KVIP_FUSE_QUERY_WORK
    uint32_t fw=(a->prefetchCount>>16)&0xffU,ds=shape.batch*kTop;
    uint32_t meta=(3*shape.batch+31)&~31U;
    auto direct=reinterpret_cast<__gm__ int32_t*>(a->packedFetch)+4*fw*(3*ds+meta)+(q*fw+b%fw)*(6*ds+64);
    Simt::VF_CALL<PackStagedUrmaQuery>(Simt::Dim3{512,1,1},shape.history,shape.resident,shape.tokenBytes,b,q,row->slots,total-added,added,ctx,
     FinalPtr(selected),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(ctl),(a->prefetchCount & 0x20000000U)?nullptr:direct,ds);
    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);error=ctl.GetValue(1);
+#endif
    if(!error)SyncFetchDescriptors(ctx,b*kSlots+q*kTop,added);
    PrepareFinalFetch(shape.finalWorkers,shape.finalPostOffset,ctx,b,q,error?0:ctl.GetValue(16),
       b*kSlots+q*kTop,error,error?0:ctl.GetValue(17));
   }
+  #else
+  if(profile)ticks[12+q*5]=ticks[11+q*5];
+  #endif
   if(profile)ticks[13+q*5]=GetSystemCycle();
+#if !KVIP_FUSE_QUERY_WORK
   if(!error) Simt::VF_CALL<PublishQ>(Simt::Dim3{512,1,1},FinalPtr(selected),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),
     reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+b*a->maxEvents,reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+b*a->maxEvents,total-added,total);
+#endif
   SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);DataCopy(output[q*kTop],loc[q*kTop],kTop);
   SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
   if(profile)ticks[14+q*5]=GetSystemCycle();
-  flags[q+1].count=added;flags[q+1].error=error;flags[q+1].ready=1;
+  uint32_t published=KVIP_OUTPUT_WORKER?kRawQueryFlag+q:q+1;
+  flags[published].count=added;flags[published].error=error;flags[published].ready=1;
   if(profile)ticks[4+q]=GetSystemCycle();status[4+q]=added;status[8+q]=total;
-  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&flags[q+1]),sizeof(BatchFlag));
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&flags[published]),sizeof(BatchFlag));
  }
+#if KVIP_OUTPUT_WORKER
+ // Wake every publication reader on error, then join before final transport state.
+ for(uint32_t q=0;q<4;++q)if(!flags[kRawQueryFlag+q].ready){auto f=flags+kRawQueryFlag+q;f->count=0;f->error=ctl.GetValue(1)?ctl.GetValue(1):1;f->ready=1;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(f),sizeof(BatchFlag));}
+ uint64_t publishWait=GetSystemCycle();
+ while(true){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+4),sizeof(BatchFlag));if(flags[4].ready)break;if(GetSystemCycle()-publishWait>5000000000ULL){ctl.SetValue(1,8);break;}}
+ if(flags[4].error)ctl.SetValue(1,ctl.GetValue(1)|flags[4].error);
+#endif
  status[0]=ctl.GetValue(1);status[1]=ctl.GetValue(0);status[2]=b*kSlots;status[3]=0;status[4]=0;
  row->finalBegin=0;row->finalRequests=status[1];row->finalHead=0;row->finalPending=status[1]?1:0;row->finalEnd=GetSystemCycle();
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row)+960,64);
@@ -175,18 +285,26 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
  auto logical=reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*a->history;
  auto prepared=reinterpret_cast<__gm__ uint64_t*>(dense+2*shape.history);
  for(uint32_t phase=0;phase<5 && !error;++phase){
-  {uint64_t wait=GetSystemCycle();while(true){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&flags[phase]),sizeof(BatchFlag));if(flags[phase].ready)break;
+  uint32_t publication=KVIP_OUTPUT_WORKER && phase?kRawQueryFlag+phase-1:phase;
+  {uint64_t wait=GetSystemCycle();while(true){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&flags[publication]),sizeof(BatchFlag));if(flags[publication].ready)break;
    if(GetSystemCycle()-wait>5000000000ULL){error=8;break;}}}
   if(error)break;
-  uint32_t count=flags[phase].count;
-  if(flags[phase].error){error=flags[phase].error;break;}
+  uint32_t count=flags[publication].count;
+  if(flags[publication].error){error=flags[publication].error;break;}
   uint32_t begin=phase?kPrefetch+total:0;
   auto source=reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+b*a->maxEvents;
   auto dest=reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+b*a->maxEvents;
   if(profile)ticks[12+2*phase]=GetSystemCycle();
   // Each exchange introduces at most two new positions into either map.
-  if(!denseMode && uint64_t(seen+count)*2>MAP){
+  // Switch before exact saturation as well: retain an empty probe terminator.
+  if(!denseMode && uint64_t(seen+count)*2>=MAP){
    if(!a->denseShadow){error=1;break;}
+#if KVIP_FUSE_QUERY_WORK
+   if(prepareMetadata){
+    Simt::VF_CALL<ExpandPreparedMetadata>(Simt::Dim3{THREADS,1,1},prepared,shape.history,work);
+    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+   }
+#endif
    Simt::VF_CALL<InitDenseShadow>(Simt::Dim3{THREADS,1,1},dense,shape.history,work);
    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);denseMode=true;
   }
@@ -201,7 +319,19 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
   error=local.GetValue(CONTROL);if(profile)ticks[13+2*phase]=GetSystemCycle();if(phase)total+=count;
  }
+#if KVIP_OUTPUT_WORKER
+ if(!error){uint64_t start=GetSystemCycle();while(true){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+4),sizeof(BatchFlag));if(flags[4].ready){error=flags[4].error;break;}if(GetSystemCycle()-start>5000000000ULL){error=8;break;}}}
+#endif
  if(!error){auto update=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);uint64_t addressStride=update[7];if(profile)ticks[22]=GetSystemCycle();
+#if KVIP_FUSE_QUERY_WORK
+  if(prepareMetadata && !denseMode){
+   static_assert(2*MAP*sizeof(uint64_t)<=4*CHUNK*16*sizeof(uint32_t),"Metadata staging exceeds dead key/scale staging");
+   GlobalTensor<uint64_t> source;source.SetGlobalBuffer(prepared);
+   auto values=local[STAGING].ReinterpretCast<uint64_t>();
+   DataCopy(values,source,MAP);DataCopy(values[MAP],source[shape.history],MAP);
+   SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+  }
+#endif
   if(prepareMetadata)Simt::VF_CALL<CommitPreparedMetadata>(Simt::Dim3{THREADS,1,1},addresses,logical,prepared,shape.history,work,dense,denseMode);
   else if(denseMode)Simt::VF_CALL<CommitDenseMetadata>(Simt::Dim3{THREADS,1,1},reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(owner)*addressStride,reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*a->history,dense,reinterpret_cast<__gm__ uint64_t*>(dense+2*shape.history),shape.history);
   else Simt::VF_CALL<CommitMetadata>(Simt::Dim3{THREADS,1,1},reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(owner)*addressStride,reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*a->history,work);
@@ -393,7 +523,7 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
    ft[phase?7:3]=start;ft[phase?8:4]=end;ft[12+2*phase]=postCycles;ft[13+2*phase]=waitCycles;
    if(!phase){ft[18]=packStart-prepareStart;ft[19]=packEnd-packStart;}
    auto coreTrace=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*256+
-       uint64_t(2*shape.batch+q*workers+lane)*32;
+       uint64_t(kResolveCores*shape.batch+q*workers+lane)*32;
    coreTrace[2+phase*5]=prepareStart;coreTrace[3+phase*5]=packStart;
    coreTrace[4+phase*5]=packEnd;coreTrace[5+phase*5]=start;coreTrace[6+phase*5]=end;
    ft[16+phase]=groups;ft[20]=3; // shared Q-worker group, not per-request time
@@ -401,7 +531,7 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
  }
  if(a->prefetchCount & 0x10000000U){
   auto trace=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*256+
-      uint64_t(2*shape.batch+q*workers+lane)*32;
+      uint64_t(kResolveCores*shape.batch+q*workers+lane)*32;
   if(profile)trace[12]=GetSystemCycle();
   // Update may invalidate displaced hot slots. Publish only after it finishes.
   for(uint32_t b=lane;b<shape.batch;b+=workers){
@@ -513,8 +643,13 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
   bool profile=(a->prefetchCount & 0x80000000U)!=0;
   auto trace=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*256+uint64_t(block)*32;
   if(profile)trace[0]=GetSystemCycle();
-  if(block<shape.batch*2){uint32_t b=block/2;if(block%2==0){Producer(a,b);FinalizeStreaming(a,b);}else Consumer(a,b);}
-  else {uint32_t lane=block-shape.batch*2,q=lane/workers,part=lane%workers;
+  if(block<shape.batch*kResolveCores){uint32_t b=block/kResolveCores,role=block%kResolveCores;
+   if(role==0){Producer(a,b);FinalizeStreaming(a,b);}else if(role==1)Consumer(a,b);
+#if KVIP_OUTPUT_WORKER
+   else OutputWorker(a,b);
+#endif
+  }
+  else {uint32_t lane=block-shape.batch*kResolveCores,q=lane/workers,part=lane%workers;
    if(q<4 && part<workers){
     FetchQueryGroup(a,q,part,workers);
    }}

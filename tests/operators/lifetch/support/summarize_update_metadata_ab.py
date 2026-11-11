@@ -7,8 +7,8 @@ from pathlib import Path
 from summarize_core_timeline import decode
 
 
-def summarize(root):
-    lines = ['A: original Update; B: per-batch metadata preparation. Parallel Fetch finalization disabled.',
+def summarize(root, description=None):
+    lines = [description or 'A: original Update; B: per-batch metadata preparation. Parallel Fetch finalization disabled.',
              'Graph times are unprofiled; core stages are separate profiled replays in calibrated us.',
              'version | BS | full_graph_p50 | full_graph_p99 | fused_profiled_median']
     results = {}
@@ -26,9 +26,13 @@ def summarize(root):
             fused = statistics.median(s['accounting']['stages_us']['resolve_update'] for s in samples)
             results[batch, version] = timing['p50_us']
             lines.append(f"{version} | {batch} | {timing['p50_us']:.3f} | {timing['p99_us']:.3f} | {fused:.3f}")
+            lines.append('Profiled stage | median_us (separate replay, not additive to graph p50)')
+            names = sorted(set.intersection(*(set(s['accounting']['stages_us']) for s in samples)))
+            for name in names:
+                lines.append(f"{name} | {statistics.median(s['accounting']['stages_us'][name] for s in samples):.3f}")
             for sample in samples:
                 timeline = decode(sample['streaming_cycles'][0]['core_timeline_raw'])
-                updates = [c for c in timeline['cores'][:2*batch] if c['block'] % 2 == 1]
+                updates = [c for c in timeline['cores'] if c['role'].startswith('index_update ')]
                 last = max(updates, key=lambda c: c['end_us'])
                 lines.append(f"round={sample['round']} last_Update={last['block']} last_kernel_block={timeline['last_block']} span={timeline['observed_span_us']:.3f}")
                 lines.append('Update block | prefetch_apply | Q1_apply | Q2_apply | Q3_apply | Q4_apply | Q_wait_sum | metadata | end')
@@ -51,8 +55,9 @@ def summarize(root):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('root', type=Path)
+    parser.add_argument('--description')
     args = parser.parse_args()
-    text = summarize(args.root)
+    text = summarize(args.root, args.description)
     (args.root / 'summary.log').write_text(text)
     print(text, end='')
     print(f'Summary: {args.root / "summary.log"}')

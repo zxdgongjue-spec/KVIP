@@ -6,7 +6,12 @@ import pytest
 root = Path(__file__).resolve().parents[4]
 common=root/'csrc/operators/common/lifetch'
 def fn(path,name):
- s=path.read_text();p=s.index(name+'(');start=s.rfind('\n',0,p)+1;b=s.index('{',p);i=b+1;d=1
+ # Extract the default production branch after preprocessing conditional
+ # signatures; slicing before #if/#else resolution creates invalid C++.
+ s=subprocess.run(['c++', '-E', '-P', '-x', 'c++',
+                   '-DKVIP_FUSE_QUERY_WORK=0', str(path)],
+                  check=True, capture_output=True, text=True).stdout
+ p=s.index(name+'(');start=s.rfind('\n',0,p)+1;b=s.index('{',p);i=b+1;d=1
  while d:
   d+=(s[i]=='{')-(s[i]=='}');i+=1
  return s[start:i]
@@ -71,7 +76,8 @@ int main(){constexpr unsigned h=8192,r=4096,cap=10240;Context c{};unsigned used=
 # production; allocate a contiguous surrogate to preserve that arrangement.
 main=main.replace('std::vector<uint16_t> ids(8192);','std::vector<uint16_t> ids(16384);')
 @pytest.mark.parametrize('scenario', ['normal', 'fallback', 'cross_query', 'padding', 'exhaustion', 'prefetch512'])
-def test_staged_device_code_serial(tmp_path, scenario):
+@pytest.mark.parametrize('production', [False, True])
+def test_staged_device_code_serial(tmp_path, scenario, production):
     code = main
     if scenario == 'fallback':
         code = code.replace('h=8192,r=4096', 'h=32768,r=8192')
@@ -102,7 +108,17 @@ def test_staged_device_code_serial(tmp_path, scenario):
                             'for(unsigned i=0;i<cap;i++)if(change[i]!=UINT32_MAX){assert(cs[i]<r);ownership[cs[i]]=change[i];}'
                             'for(unsigned i=0;i<8192;i++){if(sel[i]==UINT32_MAX){assert(out[i]==UINT32_MAX);continue;}assert(out[i]<r);assert(ownership[out[i]]==sel[i]);}')
     source, exe = tmp_path / 'staged.cpp', tmp_path / 'staged'
-    source.write_text(prefix + code)
+    current_prefix = prefix
+    if production:
+        body = (root / 'csrc/operators/lightning_indexer_with_fetch_streaming_qworkers/op_kernel/resolver_staged_dma2.h').read_text().replace('#pragma once', '')
+        body = body.replace('512/warpSize', '1/warpSize').replace('+=512', '+=1').replace('tid*4', 'tid*2048').replace('(tid+1)*4', '(tid+1)*2048').replace('(words+511)/512', 'words')
+        current_prefix = '#define KVIP_FUSE_QUERY_WORK 1\n' + prefix.replace(stage, body)
+        # Exercise the actual ready-input initializer after emulating LI's
+        # classification. This is an algorithm oracle, never a timing model.
+        code = code.replace('for(unsigned q=0;q<4 && !ctl[1];q++){',
+            'StagedInitializeReady(sel.data(),loc.data(),keys.data(),ranks.data(),ctl.data());'
+            'for(unsigned q=0;q<4 && !ctl[1];q++){')
+    source.write_text(current_prefix + code)
     (tmp_path / 'batch_get_abi.h').write_text('')
     subprocess.run(['c++', '-std=c++17', '-O0', str(source), '-I' + str(tmp_path),
                     '-I' + str(root/'csrc/operators/lightning_indexer_with_fetch_safe/include'),

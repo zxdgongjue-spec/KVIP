@@ -117,6 +117,8 @@ def run(args, run_dir):
                 ASCEND_CANN_PACKAGE_PATH=args.cann,
                 KVAF_INCLUDE=find_headers(args.kvaf_root),
             )
+            if getattr(args, "optimized_resolve", False):
+                options.update(KVIP_FUSE_QUERY_WORK="ON", KVIP_OUTPUT_WORKER="ON")
             if not shared_build.exists():
                 command(
                     ["cmake", "-S", source, "-B", build, *[f"-D{k}={v}" for k, v in options.items()]],

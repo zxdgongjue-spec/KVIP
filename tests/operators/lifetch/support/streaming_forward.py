@@ -24,12 +24,24 @@ class StreamingForward:
         self.legacy_layout = False
         self.parallel_finalize = False
         self.prepare_metadata = False
-        self.flags = torch.zeros((b, 12 if q_workers else (7 if fused_final else 5), 32), dtype=torch.int32, device=device)
+        self.resolver_cores = 2
+        if q_workers and hasattr(rotating.library, 'kvip_streaming_resolver_cores'):
+            geometry_fn = rotating.library.kvip_streaming_resolver_cores
+            geometry_fn.argtypes = []
+            geometry_fn.restype = ctypes.c_uint32
+            self.resolver_cores = int(geometry_fn())
+        flag_count = ((16 if self.resolver_cores == 3 else 12) if q_workers else (7 if fused_final else 5))
+        if q_workers and hasattr(rotating.library, 'kvip_streaming_flag_count'):
+            flags_fn = rotating.library.kvip_streaming_flag_count
+            flags_fn.argtypes = []
+            flags_fn.restype = ctypes.c_uint32
+            flag_count = int(flags_fn())
+        self.flags = torch.zeros((b, flag_count, 32), dtype=torch.int32, device=device)
         self.events_src = torch.empty((b, 512 + 8192), dtype=torch.int32, device=device)
         self.events_dst = torch.empty_like(self.events_src)
         self.worker_status = torch.zeros((b, 32), dtype=torch.int32, device=device)
         # First 64 words/request are resolver/update, then 16 words per Q.
-        self.times = torch.zeros((b * (256 if q_workers else (224 if fused_final else 128)) + ((2*b+4*q_workers)*32 if q_workers else 0),), dtype=torch.int64, device=device)
+        self.times = torch.zeros((b * (256 if q_workers else (224 if fused_final else 128)) + ((self.resolver_cores*b+4*q_workers)*32 if q_workers else 0),), dtype=torch.int64, device=device)
         self.query_bitmaps = torch.empty((b, 4, 512), dtype=torch.int32, device=device)
         self.query_errors = torch.zeros((b, 4, 32), dtype=torch.int32, device=device)
         # Dense fallback holds two uint32 permutations and two uint64 snapshots.
@@ -200,9 +212,9 @@ class StreamingForward:
                     note='first doorbell to last CQ observed; includes polling delay and LI-window gaps')
         if self.q_workers:
             result[0]['core_timeline_raw'] = dict(
-                batch=self.batch, workers_per_query=self.q_workers,
+                batch=self.batch, workers_per_query=self.q_workers, resolver_cores=self.resolver_cores,
                 clock_mhz=getattr(self, 'counter_clock_mhz', None),
-                cores=raw[self.batch*256:].reshape(2*self.batch+4*self.q_workers, 32).tolist(),
+                cores=raw[self.batch*256:].reshape(self.resolver_cores*self.batch+4*self.q_workers, 32).tolist(),
                 producer_update=raw[:self.batch*64].reshape(self.batch, 64).tolist(),
                 fetch=fetch.tolist(), flags=flags.tolist())
         return result

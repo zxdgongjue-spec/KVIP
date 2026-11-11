@@ -74,7 +74,8 @@ int main(){using namespace pipeline_ab;
 
 @pytest.mark.parametrize("prepare", [False, True])
 @pytest.mark.parametrize("use_dense", [False, True])
-def test_dense_shadow_parallel_batch_and_cross_batch_chain(tmp_path, prepare, use_dense):
+@pytest.mark.parametrize("optimized", [False, True])
+def test_dense_shadow_parallel_batch_and_cross_batch_chain(tmp_path, prepare, use_dense, optimized):
     """Run the real vector body with a 32-lane host model of one warp."""
     root = Path(__file__).resolve().parents[4]
     header = (root / 'csrc/operators/lightning_indexer_with_fetch_streaming_qworkers/op_kernel/shadow_exchange_parallel.h').read_text()
@@ -153,6 +154,20 @@ int main(){using namespace pipeline_ab;
         target = ('CommitDenseMetadata(addr.data(),logical.data(),dense.data(),reinterpret_cast<uint64_t*>(dense.data()+2*H),H);' if use_dense else 'CommitMetadata(addr.data(),logical.data(),m.data());')
         source = source.replace(target, 'CommitPreparedMetadata(addr.data(),logical.data(),reinterpret_cast<uint64_t*>(dense.data()+2*H),H,m.data(),dense.data(),' + str(use_dense).lower() + ');')
         source = source.replace('assert(!m[CONTROL]);', 'assert(!m[CONTROL]);for(unsigned i=0;i<H;i++){assert(addr[i]==i+1000 && logical[i]==i+2000);}')
+    if optimized:
+        source = '#define KVIP_FUSE_QUERY_WORK 1\n' + source
+        # Sparse prepared values are indexed by MAP buckets, unlike dense rows.
+        source = source.replace('H=512,R=256,N=96', 'H=8192,R=4096,N=96')
+        if prepare and use_dense:
+            source = source.replace('InitDenseShadow(dense.data(),H,m.data());',
+                'ExpandPreparedMetadata(reinterpret_cast<uint64_t*>(dense.data()+2*H),H,m.data());InitDenseShadow(dense.data(),H,m.data());')
+        elif prepare:
+            # Model the production MTE2 staging before sparse metadata commit.
+            source = source.replace('launch([&]{CommitPreparedMetadata(',
+                'std::copy_n(reinterpret_cast<uint64_t*>(dense.data()+2*H),MAP,reinterpret_cast<uint64_t*>(m.data()+STAGING));'
+                'std::copy_n(reinterpret_cast<uint64_t*>(dense.data()+2*H)+H,MAP,reinterpret_cast<uint64_t*>(m.data()+STAGING)+MAP);'
+                'launch([&]{CommitPreparedMetadata(')
+            source = '#include <algorithm>\n' + source
     src, exe = tmp_path / 'parallel.cpp', tmp_path / 'parallel'
     src.write_text(source)
     subprocess.run(['c++', '-std=c++17', '-O2', '-pthread', str(src), '-o', str(exe)], check=True)

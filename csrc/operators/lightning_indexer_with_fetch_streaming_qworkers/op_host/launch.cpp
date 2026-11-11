@@ -1,3 +1,4 @@
+#include "../op_kernel/pipeline_types.h"
 #include "api.h"
 #include "context.h"
 extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) { return rotating::PrepareShape(shape); }
@@ -95,10 +96,10 @@ extern "C" uint32_t kvip_lifetch_forward(void* bindings, void* update, void* str
 extern "C" uint32_t aclrtlaunch_v9_streaming_resolve_update(uint32_t,void*,void*);
 extern "C" uint32_t kvip_lifetch_streaming_forward(void* bindings,void* update,void* workspace,void* stream,const rotating::RuntimeShape* shape,uint32_t workers) {
     if(!bindings||!update||!workspace||!stream||!shape||shape->history!=131072||shape->resident!=16384||shape->indexHeads!=32||shape->batch<1||shape->batch>16||shape->finalWorkers!=4)return 100000;
-    if((workers!=1 && workers!=2 && workers!=4) || shape->batch*2+4*workers>shape->aicCount*2)return 100000;
+    if((workers!=1 && workers!=2 && workers!=4) || shape->batch*pipeline_ab::kResolveCores+4*workers>shape->aicCount*2)return 100000;
     uint32_t result=v9_init(bindings,stream,shape);
     if(!result)result=v9_li(bindings,stream,shape);
-    if(!result)result=aclrtlaunch_v9_streaming_resolve_update(shape->batch*2+4*workers,stream,workspace);
+    if(!result)result=aclrtlaunch_v9_streaming_resolve_update(shape->batch*pipeline_ab::kResolveCores+4*workers,stream,workspace);
     return result;
 }
 
@@ -127,3 +128,7 @@ extern "C" uint32_t kvip_native_fetch_only(void* workspace,void* counts,void* st
     if(!workspace||!counts||!stream||query>4)return 100000;
     return aclrtlaunch_v9_native_fetch_only(query==4?8:2,stream,workspace,counts,query);
 }
+
+extern "C" uint32_t kvip_streaming_resolver_cores(){return pipeline_ab::kResolveCores;}
+
+extern "C" uint32_t kvip_streaming_flag_count(){return pipeline_ab::kFlagCount;}
