@@ -20,7 +20,7 @@ def record_stage(log_path, scenario, stage, event, **details):
     )
     path = Path(log_path)
     with path.open("a", encoding="utf-8") as output:
-        output.write(json.dumps(entry, sort_keys=True, default=str) + "\\n")
+        output.write(json.dumps(entry, sort_keys=True, default=str) + "\n")
         output.flush()
         os.fsync(output.fileno())
     return entry
