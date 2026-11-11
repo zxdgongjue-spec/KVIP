@@ -535,6 +535,7 @@ def run_device(
                         rotating.fallback_addresses.cpu().numpy(), posts[row], lru,
                         rotating.mapping[row].cpu().numpy(), owner.output.shape[1], r,
                         owner.remote_token_addresses[row].cpu().numpy())
+                    report["phase"] = state.get("check_phase", "unknown")
                     report["initial_output_matches"] = [
                         bool(torch.equal(owner.initial_output[row, item["slot"]].cpu(),
                                          owner.session.cpu_payload[row, item["expected_token"]]))
@@ -632,6 +633,22 @@ def run_device(
     restored_hot = hot_case["hot_changes"]
     if not hot_case["first_window_fetches"] or not restored_hot:
         raise AssertionError(f"First window did not Fetch former hot candidates into LRU slots: {hot_case}")
+
+    if args.streaming_fetch:
+        # Same per-Q descriptors, with Q4 publication as the submission boundary.
+        # This runs only for correctness diagnosis, outside graph measurements.
+        state["check_phase"] = "streaming per-Q packing with deferred fetch"
+        reset()
+        pipeline.set_deferred_fetch(True)
+        try:
+            full()
+            stream.synchronize()
+            verify(True)
+            verify_all_valid_hot()
+            (folder / "streaming_isolation.log").write_text("PASS: per-Q packing with deferred fetch\n")
+            print("STREAMING ISOLATION PASS: per-Q packing, deferred fetch", flush=True)
+        finally:
+            pipeline.set_deferred_fetch(False)
 
     if args.streaming:
         # The standalone checks above use the baseline resolver/update. Exercise

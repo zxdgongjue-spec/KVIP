@@ -178,7 +178,17 @@ __aicore__ inline void FetchQueries(__gm__ Args* a,uint32_t b) {
  auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
  auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
  uint64_t error=0;bool joined=false;
- for(uint32_t q=0;q<4;++q) {
+ // Diagnostic-only isolation: keep the per-Q packing but start submission
+ // after Q4 publication. This uses the existing mailbox, not a host sync.
+ if(a->prefetchCount & 0x40000000U){
+  uint64_t start=GetSystemCycle();
+  while(true){
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+4),sizeof(BatchFlag));
+   if(flags[4].ready)break;
+   if(GetSystemCycle()-start>5000000000ULL){error|=kvaf_device::kCqTimeout;break;}
+  }
+ }
+ for(uint32_t q=0;q<4 && !error;++q) {
   uint64_t start=GetSystemCycle();
   while(true) {
    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+q+1),sizeof(BatchFlag));

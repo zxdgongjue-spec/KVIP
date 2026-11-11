@@ -111,10 +111,13 @@ def supervise(command, run, heartbeat_seconds=20, timeout_seconds=300):
     if cases.exists():
         lines.extend(cases.read_text().splitlines())
     if not passed:
+        for isolation in run.rglob("streaming_isolation.log"):
+            lines.append(f"STREAMING ISOLATION: {isolation.read_text().strip()}")
         for audit in run.rglob("streaming_fetch_kv_mismatch.json"):
             try:
                 data = json.loads(audit.read_text())
                 compact = {key: data[key] for key in ("batch", "mismatch_positions", "posts")}
+                compact["phase"] = data.get("phase", "unknown")
                 compact["examples"] = data.get("examples", [])[:3]
                 for key in ("actual_sq_writers", "initial_output_matches", "sq_audit_error"):
                     if key in data:

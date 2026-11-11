@@ -54,6 +54,11 @@ class StreamingForward:
         if result:
             raise RuntimeError(f'streaming LIFetch launch failed: {result}')
 
+    def set_deferred_fetch(self, enabled):
+        # Isolation-only mode, set before launch; never used for graph timing.
+        value = np.asarray([512 | (0x40000000 if enabled else 0)], dtype='<u4').view('u1')
+        self.workspace[96:100].copy_(self.torch.from_numpy(value.copy()))
+
     def set_diagnostics(self, enabled):
         # Existing prefetchCount field is unused by the streaming kernel; its
         # high bit gates timestamps only in the separate profiled pass.
