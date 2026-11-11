@@ -11,6 +11,6 @@ struct alignas(128) Args {
  uint64_t context, keys, scales, addresses, logical, valid;
  uint64_t flags, eventsSrc, eventsDst, workerStatus, times;
  uint32_t history, resident, prefetchCount, maxEvents;
- uint64_t queryBitmaps, queryErrors, updateBindings;
+ uint64_t queryBitmaps, queryErrors, updateBindings, denseShadow;
 };
 }

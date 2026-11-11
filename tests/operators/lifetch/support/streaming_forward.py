@@ -29,6 +29,9 @@ class StreamingForward:
         self.times = torch.zeros((b * (256 if q_workers else (224 if fused_final else 128)),), dtype=torch.int64, device=device)
         self.query_bitmaps = torch.empty((b, 4, 512), dtype=torch.int32, device=device)
         self.query_errors = torch.zeros((b, 4, 32), dtype=torch.int32, device=device)
+        # Dense fallback holds two uint32 permutations and two uint64 snapshots.
+        self.dense_shadow = (torch.empty((b, 3 * self.history), dtype=torch.int64, device=device)
+                             if q_workers else None)
         pointers = [rotating.context.data_ptr(), keys.data_ptr(), scales.data_ptr(), addresses.data_ptr(),
                     logical.data_ptr(), rotating.hot_valid.data_ptr(), self.flags.data_ptr(),
                     self.events_src.data_ptr(), self.events_dst.data_ptr(), self.worker_status.data_ptr(),
@@ -38,8 +41,12 @@ class StreamingForward:
         blob = np.concatenate((np.asarray(pointers, dtype='<u8').view('u1'),
                                np.asarray(geometry, dtype='<u4').view('u1'),
                                np.asarray(trailing, dtype='<u8').view('u1')))
-        if len(blob) != 128:
-            raise AssertionError(f'streaming workspace ABI size={len(blob)}, expected 128')
+        if q_workers:
+            blob = np.concatenate((blob, np.asarray([self.dense_shadow.data_ptr()], dtype='<u8').view('u1'),
+                                   np.zeros(120, dtype='u1')))
+        expected_size = 256 if q_workers else 128
+        if len(blob) != expected_size:
+            raise AssertionError(f'streaming workspace ABI size={len(blob)}, expected {expected_size}')
         self.workspace = torch.from_numpy(blob.copy()).to(device)
         rotating.bindings = torch.tensor(
             [x.data_ptr() for x in rotating.arguments] + [self.workspace.data_ptr()],

@@ -41,3 +41,60 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void ApplyBatch(__gm__ uint3
 }
 __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void CommitMetadata(__gm__ uint64_t* addresses,__gm__ uint64_t* logical,__ubuf__ uint32_t* m){auto key=m+KEYS_POS,val=m+VALUES_POS;auto addr=reinterpret_cast<__ubuf__ uint64_t*>(m+STAGING);auto id=addr+MAP;for(uint32_t i=threadIdx.x;i<MAP;i+=THREADS)if(key[i]!=EMPTY){addr[i]=asc_ldcg(addresses+val[i]);id[i]=asc_ldcg(logical+val[i]);}asc_syncthreads();for(uint32_t i=threadIdx.x;i<MAP;i+=THREADS)if(key[i]!=EMPTY){asc_stcg(addresses+key[i],addr[i]);asc_stcg(logical+key[i],id[i]);}asc_threadfence();asc_syncthreads();}
 }
+
+namespace pipeline_ab {
+// Dense fallback is entered before the UB maps can fill. Its two maps contain
+// physical-position -> original row and the inverse permutation respectively.
+__simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void InitDenseShadow(
+ __gm__ uint32_t* dense,uint32_t history,__ubuf__ uint32_t* m) {
+ for(uint32_t i=threadIdx.x;i<history;i+=THREADS){asc_stcg(dense+i,i);asc_stcg(dense+history+i,i);}
+ asc_threadfence();asc_syncthreads();
+ for(uint32_t i=threadIdx.x;i<MAP;i+=THREADS){
+  if(m[KEYS_POS+i]!=EMPTY)asc_stcg(dense+m[KEYS_POS+i],m[VALUES_POS+i]);
+  if(m[KEYS_ROW+i]!=EMPTY)asc_stcg(dense+history+m[KEYS_ROW+i],m[VALUES_ROW+i]);
+ }
+ asc_threadfence();asc_syncthreads();
+}
+__simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void ApplyDenseBatch(
+ __gm__ uint32_t* sources,__gm__ uint32_t* destinations,uint32_t begin,uint32_t count,
+ __gm__ uint64_t* keys,__gm__ uint32_t* scales,__gm__ uint32_t* valid,uint32_t resident,
+ __gm__ uint32_t* dense,uint32_t history,__ubuf__ uint32_t* m){
+ uint32_t tid=threadIdx.x;auto ctl=m+CONTROL;auto ps=m+PLAN_SRC;auto pd=m+PLAN_DST;
+ auto data=reinterpret_cast<__ubuf__ uint64_t*>(m+STAGING);
+ for(uint32_t base=0;base<count;base+=CHUNK){uint32_t n=(count-base)<CHUNK?count-base:CHUNK;
+  for(uint32_t i=tid;i<2*SET;i+=THREADS)m[SRCSET+i]=EMPTY;asc_syncthreads();
+  if(tid<n){uint32_t orig=asc_ldcg(sources+begin+base+tid),dst=asc_ldcg(destinations+begin+base+tid);
+   uint32_t src=orig<history?asc_ldcg(dense+history+orig):EMPTY;ps[tid]=src;pd[tid]=dst;
+   if(orig>=history||dst>=resident||src>=history||!insert(m+SRCSET,src)||!insert(m+DSTSET,dst))asc_atomic_or(ctl,1U);}
+  asc_syncthreads();if(ctl[0])return;
+  uint32_t out=tid<n&&!contains(m+SRCSET,pd[tid]),freed=tid<n&&!contains(m+DSTSET,ps[tid]);
+  uint32_t oi=prefix(out,ctl+32),fi=prefix(freed,ctl+64);if(out)ps[CHUNK+oi]=pd[tid];if(freed)pd[CHUNK+fi]=ps[tid];
+  asc_syncthreads();uint32_t extras=ctl[32+15],moves=n+extras;
+  for(uint32_t x=tid;x<moves*16;x+=THREADS){uint32_t i=x/16,j=i<n?i:CHUNK+i-n;data[x]=asc_ldcg(keys+uint64_t(ps[j])*16+x%16);}
+  asc_syncthreads();
+  for(uint32_t x=tid;x<moves*16;x+=THREADS){uint32_t i=x/16,j=i<n?i:CHUNK+i-n;asc_stcg(keys+uint64_t(pd[j])*16+x%16,data[x]);}
+  asc_threadfence();asc_syncthreads();
+  for(uint32_t i=tid;i<moves;i+=THREADS){uint32_t j=i<n?i:CHUNK+i-n;data[i]=asc_ldcg(scales+ps[j]);}
+  asc_syncthreads();
+  for(uint32_t i=tid;i<moves;i+=THREADS){uint32_t j=i<n?i:CHUNK+i-n;asc_stcg(scales+pd[j],uint32_t(data[i]));}
+  asc_threadfence();asc_syncthreads();
+  for(uint32_t i=tid;i<moves;i+=THREADS){uint32_t j=i<n?i:CHUNK+i-n;data[i]=asc_ldcg(dense+ps[j]);}
+  asc_syncthreads();
+  for(uint32_t i=tid;i<moves;i+=THREADS){uint32_t j=i<n?i:CHUNK+i-n,dst=pd[j],row=uint32_t(data[i]);
+   asc_stcg(dense+dst,row);asc_stcg(dense+history+row,dst);}
+  for(uint32_t i=n+tid;i<moves;i+=THREADS)InvalidateFreedHot(valid,pd[CHUNK+i-n],resident);
+  asc_threadfence();asc_syncthreads();if(!tid)ctl[4]++;asc_syncthreads();
+ }
+}
+__simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void CommitDenseMetadata(
+ __gm__ uint64_t* addresses,__gm__ uint64_t* logical,__gm__ uint32_t* dense,
+ __gm__ uint64_t* snapshot,uint32_t history){
+ for(uint32_t i=threadIdx.x;i<history;i+=THREADS){uint32_t src=asc_ldcg(dense+i);if(src!=i){
+  asc_stcg(snapshot+i,asc_ldcg(addresses+src));asc_stcg(snapshot+history+i,asc_ldcg(logical+src));}}
+ asc_threadfence();asc_syncthreads();
+ for(uint32_t i=threadIdx.x;i<history;i+=THREADS)if(asc_ldcg(dense+i)!=i){
+  asc_stcg(addresses+i,asc_ldcg(snapshot+i));asc_stcg(logical+i,asc_ldcg(snapshot+history+i));}
+ asc_threadfence();asc_syncthreads();
+}
+
+}  // namespace pipeline_ab
