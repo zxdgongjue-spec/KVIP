@@ -43,6 +43,7 @@ namespace Simt {struct Dim3{int x,y,z;};template<auto f,class... T>void VF_CALL(
 namespace kvaf_device {
 constexpr uint64_t kCqTimeout=6,kInvalidArgs=1;
 void CleanCacheLines(uint8_t*,uint64_t){}
+void WriteStatus(KvafBatchGetCoreStatus* s,uint64_t result,uint64_t processed,uint64_t completed,uint64_t,uint64_t,uint64_t,uint64_t){s->magic=123;s->result=result;s->processed_request_count=processed;s->completed_batch_count=completed;}
 void KvafBatchGetDevice(DeviceArgs a,unsigned,unsigned begin,unsigned n){
  assert(a.batch_get_max_inflight_total==2048);auto status=(KvafBatchGetCoreStatus*)a.core_status;
  calls.emplace_back((int32_t*)a.indices+begin,(int32_t*)a.indices+begin+n);
@@ -82,3 +83,12 @@ int main(){
     cpp.write_text(code)
     subprocess.run(['c++', '-std=c++17', str(cpp), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)
+
+
+def test_prefetch_does_not_reset_owned_final_status():
+    root = Path(__file__).resolve().parents[4]
+    kernel = (root / 'csrc/operators/lightning_indexer_with_fetch_streaming_qworkers/op_kernel/streaming.cpp').read_text()
+    helper = (root / 'csrc/operators/lightning_indexer_with_fetch_streaming_qworkers/op_kernel/staged_fetch_worker.h').read_text()
+    assert 'CompletePrefetch(ctx,b,b>=workers)' in kernel
+    assert 'if(initializeSpare)' in helper
+    assert 'if(!q){auto status=' in kernel

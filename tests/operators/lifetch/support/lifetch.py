@@ -311,6 +311,7 @@ def run_device(
     split_samples = {}
 
     def measure(call, reset, check, trace_core=False, read_label=None):
+        state["check_phase"] = f"timing {read_label or getattr(call, '__name__', 'operation')}"
         reset()
         call()
         stream.synchronize()

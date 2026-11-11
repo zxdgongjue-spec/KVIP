@@ -252,6 +252,11 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
  auto packed=reinterpret_cast<__gm__ int32_t*>(a->packedFetch)+uint64_t(q*workers+lane)*(3*stride+metadataWords);
  auto ranges=reinterpret_cast<__gm__ uint32_t*>(packed+3*stride);
  auto args=GetArgs(ctx,FinalQueue(shape.batch,shape.finalWorkers,owner,q));
+ // Q1 exclusively owns this odd status; CompletePrefetch must not overwrite it.
+ // Initialize it even when the group has no requests, for the status contract.
+ if(!q){auto status=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(args.core_status);
+  kvaf_device::WriteStatus(status,0,0,0,0,0,UINT64_MAX,0);
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),sizeof(*status));}
  args.indices=uint64_t(packed);args.offsets=uint64_t(packed+stride);args.output_indices=uint64_t(packed+2*stride);
  args.miss_count=ctx->count;args.request_capacity=stride;
  if(ctx->fallbackAddresses){args.address_table=ctx->fallbackAddresses;args.valid_table=ctx->fallbackValid;args.table_capacity=shape.batch*kSlots;}
@@ -341,7 +346,8 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
  if(profile)ft[0]=GetSystemCycle();
  // This request's resolver core owns its prefetch CQ; Q workers only wait
  // on this request's flag when a conflicting range exists.
- CompletePrefetch(ctx,b);if(profile)ft[4]=GetSystemCycle();error|=row->error;flags[7].error=error;flags[7].ready=1;
+ uint32_t workers=(a->prefetchCount>>16)&0xffU;
+ CompletePrefetch(ctx,b,b>=workers);if(profile)ft[4]=GetSystemCycle();error|=row->error;flags[7].error=error;flags[7].ready=1;
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+7),sizeof(BatchFlag));
  for(uint32_t f=6;f<12;++f){uint64_t start=GetSystemCycle();while(true){
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+f),sizeof(BatchFlag));
