@@ -5,7 +5,7 @@ from pathlib import Path
 
 def test_per_query_pack_does_not_overwrite_other_queries(tmp_path):
     root = Path(__file__).resolve().parents[4]
-    header = (root / 'csrc/operators/lightning_indexer_with_fetch_streaming_fetch/op_kernel/staged_urma_pack.h').read_text()
+    header = (root / 'csrc/operators/lightning_indexer_with_fetch_streaming_qworkers/op_kernel/staged_urma_pack.h').read_text()
     start = header.index('inline void PackStagedUrmaQuery(')
     body = header[start:header.rindex('\n}')].replace('(own+511)/512', 'own').replace('512/warpSize', '1')
     code = r'''
@@ -22,7 +22,7 @@ struct Context {uint64_t rows,reservedHot,sourceBlocks,sourceOffsets,destination
 template<class T>T asc_ldcg(T* p){return *p;}
 template<class T>void asc_stcg(T* p,T v){*p=v;}
 void asc_atomic_or(unsigned* p,unsigned v){*p|=v;}
-void asc_atomic_add(unsigned* p,unsigned v){*p+=v;}
+unsigned asc_atomic_add(unsigned* p,unsigned v){auto old=*p;*p+=v;return old;}
 void asc_syncthreads(){} void asc_threadfence(){}
 unsigned OwnerRow(Context*,unsigned b){return b;}
 unsigned OutputStride(unsigned r,Context*){return r;}
@@ -40,6 +40,15 @@ int main(){
  PackStagedUrmaQuery(32,32,656,0,1,0,3,3,&c,selected.data(),ids.data(),slots.data(),ctl.data());
  for(int i=0;i<3;i++){assert(dest[i]==i);assert(dest[2048+i]==i+3);assert(remote[i]==1000+i);assert(remote[2048+i]==1003+i);}
  assert(dest[3]==-1 && dest[2047]==-1 && count[0]==6);
+ std::vector<int> direct(6*kTop+64,-1);direct[6*kTop]=0;direct[6*kTop+8]=0;
+ reserved[1]=0;
+ PackStagedUrmaQuery(32,32,656,0,0,1,0,3,&c,selected.data(),ids.data(),slots.data(),ctl.data(),direct.data(),kTop);
+ assert(direct[6*kTop]==2 && direct[6*kTop+8]==1);
+ assert(direct[2*kTop]==0 && direct[2*kTop+1]==2 && direct[5*kTop]==1);
+ PackStagedUrmaQuery(32,32,656,0,1,1,3,3,&c,selected.data(),ids.data(),slots.data(),ctl.data(),direct.data(),kTop);
+ assert(direct[6*kTop]==5 && direct[6*kTop+8]==1);
+ for(int i=0;i<3;i++)assert(direct[2*kTop+2+i]==3+i);
+ assert(ctl[1]==0);
 }
 '''
     cpp = tmp_path / 'pack.cpp'

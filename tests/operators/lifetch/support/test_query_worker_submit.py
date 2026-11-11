@@ -54,7 +54,7 @@ void KvafBatchGetDevice(DeviceArgs a,unsigned,unsigned begin,unsigned n){
 }
 ''' + body + r'''
 int main(){
- std::vector<int32_t> src(4*kSlots),off(4*kSlots),dst(4*kSlots),packed(4*2*(3*4*kTop+32));
+ std::vector<int32_t> src(4*kSlots),off(4*kSlots),dst(4*kSlots),packed(4*2*(9*4*kTop+32+64));
  for(unsigned i=0;i<src.size();i++){src[i]=i;off[i]=i+1;dst[i]=i+2;}
  Context c{uint64_t(src.data()),uint64_t(off.data()),uint64_t(dst.data()),0};
  BatchFlag flags[4*kFlagCount];Args a{uint64_t(&c),uint64_t(flags),0,uint64_t(packed.data()),0};
@@ -62,18 +62,32 @@ int main(){
  for(int i=0;i<20;i++){deviceArgs[i].queue_state=uint64_t(&queues[i]);deviceArgs[i].core_status=uint64_t(&statuses[i]);}
  for(unsigned b=0;b<4;b++){flags[b*kFlagCount+1].ready=1;flags[b*kFlagCount+7].ready=1;
   auto &p=posts[b*4];p.count=2;p.nonconflicting=1;p.descriptor=b*kSlots;}
- FetchQueryGroup(&a,0,0,2);
+ FetchQueryGroup(&a,0,0,2,false);
  assert(calls.size()==2);assert((calls[0]==std::vector<int32_t>{0,16384}));
  assert((calls[1]==std::vector<int32_t>{1,16385}));
  assert((offsetCalls[0]==std::vector<int32_t>{1,16385}));
  assert((destCalls[0]==std::vector<int32_t>{2,16386}));
  for(unsigned b: {0U,2U})assert(flags[b*kFlagCount+8].ready && !flags[b*kFlagCount+8].error && !posts[b*4].error);
  assert(!flags[1*kFlagCount+8].ready && !flags[3*kFlagCount+8].ready);
- FetchQueryGroup(&a,0,1,2);assert(calls.size()==4);
+ FetchQueryGroup(&a,0,1,2,false);assert(calls.size()==4);
  assert((calls[2]==std::vector<int32_t>{8192,24576}));
  assert((calls[3]==std::vector<int32_t>{8193,24577}));
+ // Direct producer output consumes the same descriptors without invoking packing.
+ calls.clear();offsetCalls.clear();destCalls.clear();
+ auto direct=packed.data()+8*(3*4*kTop+32);unsigned stride=4*kTop;
+ for(unsigned phase=0;phase<2;phase++){
+  auto out=direct+phase*3*stride;
+  for(unsigned i=0;i<2;i++){unsigned id=i*16384+phase;out[i]=id;out[stride+i]=id+1;out[2*stride+i]=id+2;}
+  direct[6*stride+phase*8]=2;
+ }
+ FetchQueryGroup(&a,0,0,2,true);
+ assert(calls.size()==2 && (calls[0]==std::vector<int32_t>{0,16384}) && (calls[1]==std::vector<int32_t>{1,16385}));
+ assert((offsetCalls[1]==std::vector<int32_t>{2,16386}));
+ assert((destCalls[1]==std::vector<int32_t>{3,16387}));
+ // Mismatched publication counters fail closed.
+ direct[6*stride]=3;calls.clear();FetchQueryGroup(&a,0,0,2,true);assert(calls.empty());
  // Invalid producer descriptors must fail closed without calling KVAF.
- posts[0].nonconflicting=3;calls.clear();FetchQueryGroup(&a,0,0,2);
+ posts[0].nonconflicting=3;calls.clear();FetchQueryGroup(&a,0,0,2,false);
  assert(calls.empty() && flags[8].error==1 && flags[2*kFlagCount+8].error==1);
  // More workers than requests do not touch a queue or flag.
  calls.clear();FetchQueryGroup(&a,0,4,8);assert(calls.empty());

@@ -125,8 +125,11 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
   }
   if(profile)ticks[12+q*5]=GetSystemCycle();
   if(!error){
+   uint32_t fw=(a->prefetchCount>>16)&0xffU,ds=shape.batch*kTop;
+   uint32_t meta=(3*shape.batch+31)&~31U;
+   auto direct=reinterpret_cast<__gm__ int32_t*>(a->packedFetch)+4*fw*(3*ds+meta)+(q*fw+b%fw)*(6*ds+64);
    Simt::VF_CALL<PackStagedUrmaQuery>(Simt::Dim3{512,1,1},shape.history,shape.resident,shape.tokenBytes,b,q,row->slots,total-added,added,ctx,
-    FinalPtr(selected),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(ctl));
+    FinalPtr(selected),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(ctl),(a->prefetchCount & 0x20000000U)?nullptr:direct,ds);
    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);error=ctl.GetValue(1);
    if(!error)SyncFetchDescriptors(ctx,b*kSlots+q*kTop,added);
    PrepareFinalFetch(shape.finalWorkers,shape.finalPostOffset,ctx,b,q,error?0:ctl.GetValue(16),
@@ -245,12 +248,14 @@ constexpr uint32_t kBatchGetInflight = 2048;
 __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,uint32_t workers,bool skipEmptyConflict=true){
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  if(lane>=shape.batch)return;
+ bool directLayout=skipEmptyConflict && !(a->prefetchCount & 0x20000000U);
  auto allFlags=reinterpret_cast<__gm__ BatchFlag*>(a->flags);
  bool profile=(a->prefetchCount & 0x80000000U)!=0;
  uint32_t stride=shape.batch*kTop;
  uint32_t metadataWords=(3*shape.batch+31)&~31U;
  auto packed=reinterpret_cast<__gm__ int32_t*>(a->packedFetch)+uint64_t(q*workers+lane)*(3*stride+metadataWords);
  auto ranges=reinterpret_cast<__gm__ uint32_t*>(packed+3*stride);
+ auto direct=reinterpret_cast<__gm__ int32_t*>(a->packedFetch)+4*workers*(3*stride+metadataWords)+(q*workers+lane)*(6*stride+64);
  // The first 2*batch views include the independent prefetch queues. The
  // following views are paired, exclusively owned by this Q worker.
  uint32_t pair=2*shape.batch+2*(q*workers+lane);
@@ -294,11 +299,19 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
   }
   if(error)break;
   uint64_t packStart=profile?GetSystemCycle():0;
-  if(rangeCount){
+  if(rangeCount && !directLayout){
    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ranges),uint64_t(rangeCount)*12);
    Simt::VF_CALL<PackFetchRanges>(Simt::Dim3{256,1,1},ctx,packed,stride,ranges,rangeCount);
    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
   }
+  if(directLayout){
+   auto counters=reinterpret_cast<__gm__ uint32_t*>(direct+6*stride);
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(counters),64);
+   if(counters[phase*8]!=size)error|=kvaf_device::kInvalidArgs;
+   packed=direct+phase*3*stride;
+   args.indices=uint64_t(packed);args.offsets=uint64_t(packed+stride);args.output_indices=uint64_t(packed+2*stride);
+  }
+  if(error)break;
   uint64_t packEnd=profile?GetSystemCycle():0;
   uint64_t start=GetSystemCycle(),end=start,postCycles=0,waitCycles=0,groups=0;
 #if !V9_SIMULATION

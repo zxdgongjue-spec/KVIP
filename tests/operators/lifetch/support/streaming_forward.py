@@ -21,6 +21,7 @@ class StreamingForward:
         b, device = self.batch, rotating.device
         self.fused_final = fused_final
         self.q_workers = q_workers
+        self.legacy_layout = False
         self.flags = torch.zeros((b, 12 if q_workers else (7 if fused_final else 5), 32), dtype=torch.int32, device=device)
         self.events_src = torch.empty((b, 512 + 8192), dtype=torch.int32, device=device)
         self.events_dst = torch.empty_like(self.events_src)
@@ -33,7 +34,7 @@ class StreamingForward:
         self.dense_shadow = (torch.empty((b, 3 * self.history), dtype=torch.int64, device=device)
                              if q_workers else None)
         # Each Q worker owns independent packed indices, offsets and destinations.
-        self.packed_fetch = (torch.empty((4 * q_workers, 3 * b * 2048 + ((3 * b + 31) // 32) * 32),
+        self.packed_fetch = (torch.empty((4 * q_workers, 9 * b * 2048 + ((3 * b + 31) // 32) * 32 + 64),
                                         dtype=torch.int32, device=device)
                              if q_workers else None)
         pointers = [rotating.context.data_ptr(), keys.data_ptr(), scales.data_ptr(), addresses.data_ptr(),
@@ -104,13 +105,13 @@ class StreamingForward:
 
     def set_deferred_fetch(self, enabled):
         # Isolation-only mode, set before launch; never used for graph timing.
-        value = np.asarray([512 | ((self.q_workers or 0) << 16) | (0x40000000 if enabled else 0)], dtype='<u4').view('u1')
+        value = np.asarray([512 | ((self.q_workers or 0) << 16) | (0x20000000 if self.legacy_layout else 0) | (0x40000000 if enabled else 0)], dtype='<u4').view('u1')
         self.workspace[96:100].copy_(self.torch.from_numpy(value.copy()))
 
     def set_diagnostics(self, enabled):
         # Existing prefetchCount field is unused by the streaming kernel; its
         # high bit gates timestamps only in the separate profiled pass.
-        value = np.asarray([512 | ((self.q_workers or 0) << 16) | (0x80000000 if enabled else 0)], dtype='<u4').view('u1')
+        value = np.asarray([512 | ((self.q_workers or 0) << 16) | (0x20000000 if self.legacy_layout else 0) | (0x80000000 if enabled else 0)], dtype='<u4').view('u1')
         self.workspace[96:100].copy_(self.torch.from_numpy(value.copy()))
 
     def diagnostic_cycles(self):

@@ -128,6 +128,10 @@ __aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uin
     // Producer/consumer flags are per-round ephemeral state; initialize them
     // in the existing init kernel, not as an extra graph launch.
     if(streaming) {
+        uint32_t fw=(streaming->prefetchCount>>16)&0xffU,ds=rt_batch*2048;
+        uint32_t meta=(3*rt_batch+31)&~31U;
+        for(uint32_t g=b;g<4*fw;g+=rt_batch)
+            FillRoundWords(streaming->packedFetch+uint64_t(4*fw*(3*ds+meta)+g*(6*ds+64)+6*ds)*4,64,local);
         FillRoundWords(streaming->flags+uint64_t(b)*pipeline_ab::kFlagCount*sizeof(pipeline_ab::BatchFlag),
                        pipeline_ab::kFlagCount*sizeof(pipeline_ab::BatchFlag)/4,local);
         FillRoundWords(streaming->workerStatus+uint64_t(b)*128,32,local);
