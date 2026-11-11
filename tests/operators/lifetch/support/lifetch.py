@@ -185,6 +185,25 @@ def run(args, run_dir):
                 raise
             finally:
                 owner.close()
+        if args.fetch_only_compare:
+            lines = [f"BS={batch} Fetch-only graph: exact fused Q worker; native descriptors prepacked outside timing; byte checks PASS.",
+                     "query | AIV | jetty/AIV | entries | safe/conflict | bytes | native p50/p99 us | native GB/s | fused p50/p99 us | fused GB/s | change"]
+            results = report['fetch_only']
+            for query in ('Q1', 'Q2', 'Q3', 'Q4', 'Q4_all'):
+                old = next(r for r in results if r['query'] == query and r['version'] == 'native')
+                new = next(r for r in results if r['query'] == query and r['version'] == 'fused')
+                delta = (new['p50_us'] / old['p50_us'] - 1) * 100
+                native_bw = f"{old['effective_GBps']:.2f}" if old['effective_GBps'] is not None else '--'
+                fused_bw = f"{new['effective_GBps']:.2f}" if new['effective_GBps'] is not None else '--'
+                lines.append(f"{query} | {old['aiv']} | 2 | {old['count']} | {old['safe_count']}/{old['conflict_count']} | {old['bytes']} | "
+                             f"{old['p50_us']:.3f}/{old['p99_us']:.3f} | {native_bw} | "
+                             f"{new['p50_us']:.3f}/{new['p99_us']:.3f} | {fused_bw} | {delta:+.2f}%")
+            lines.append('Q1-Q4 are individual queries; Q4_all runs all four concurrently. Zero-entry cases measure launch/control only.')
+            line = '\n'.join(lines)
+            summaries.append(line)
+            (run_dir / 'cases.log').write_text('\n'.join(summaries) + '\n')
+            print(line, flush=True)
+            continue
         if args.resolver_compare:
             from resolver import summary
 
@@ -436,7 +455,8 @@ def run_device(
         pipeline = StreamingForward(rotating, update, torch, args.prefetch_tokens, fused_final=args.fused_final, q_workers=args.q_workers)
     else:
         pipeline = LIFetchForward(rotating, update)
-    counter_clock_mhz = pipeline.calibrate_counter_mhz() if args.streaming and args.q_workers else None
+    counter_clock_mhz = (pipeline.calibrate_counter_mhz()
+                         if args.streaming and args.q_workers and not args.fetch_only_compare else None)
     if counter_clock_mhz is not None:
         print(f"GetSystemCycle calibration: {counter_clock_mhz:.2f} MHz (independent long graph event)", flush=True)
     saved = [arguments[i].clone() for i in (1, 4, 13)]
@@ -689,6 +709,18 @@ def run_device(
             verify(True)
             verify_all_valid_hot()
             print(f"STREAMING CHECK PASS {label}: selected KV and all valid hot KV/Index match", flush=True)
+
+    if args.fetch_only_compare:
+        # Capture a regular real resolver snapshot. Prefetch has completed;
+        # the isolated comparison intentionally excludes LI and CQ join.
+        state["check_phase"] = "fetch-only snapshot"
+        reset()
+        full()
+        stream.synchronize()
+        verify(True)
+        verify_all_valid_hot()
+        from fetch_only_ab import run as run_fetch_only
+        return dict(status="pass", fetch_only=run_fetch_only(torch, owner, rotating, pipeline, args))
 
     def init_reset():
         reset()

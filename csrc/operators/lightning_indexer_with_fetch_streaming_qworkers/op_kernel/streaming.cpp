@@ -426,3 +426,44 @@ extern "C" __global__ __aicore__ void v9_counter_calibration(GM_ADDR output) {
  }
 #endif
 }
+
+// Standalone dispatch uses the identical Q worker body as the fused kernel.
+// 0..3: one Q across two AIVs; 4: all four Qs, two AIVs each.
+extern "C" __global__ __aicore__ void v9_query_fetch_only(GM_ADDR arg,uint32_t query) {
+#if defined(__CCE_AICORE__)
+ KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+ if ASCEND_IS_AIV {
+  uint32_t block=GetBlockIdx();
+  if(block<(query==4?8U:2U) && query<5){
+   uint32_t workers=2;
+   uint32_t q=query==4?block/2:query;
+   uint32_t lane=query==4?block%2:block;
+   FetchQueryGroup(reinterpret_cast<__gm__ Args*>(arg),q,lane,workers);
+  }
+ }
+#endif
+}
+
+// Native reference: a real KVAF BatchGet dispatch across 2 or 8 AIVs.
+// Inputs are compacted before timing, as in native LIDU.
+extern "C" __global__ __aicore__ void v9_native_fetch_only(GM_ADDR arg,GM_ADDR reference,uint32_t query) {
+#if defined(__CCE_AICORE__)
+ KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+ if ASCEND_IS_AIV {
+  uint32_t core=GetBlockIdx(),cores=query==4?8U:2U;
+  if(core<cores && query<5){
+   auto a=reinterpret_cast<__gm__ Args*>(arg);
+   auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
+   auto ref=reinterpret_cast<__gm__ uint64_t*>(reference);
+   // Queue pairs are contiguous; KVAF splits the compacted descriptors itself.
+   auto args=GetArgs(ctx,2*shape.batch);
+   args.indices=ref[0];args.offsets=ref[1];args.output_indices=ref[2];
+   args.miss_count=ref[3];args.core_status=ref[4];
+   args.request_capacity=shape.batch*kSlots;args.block_count=cores;args.jettys_per_core=2;
+   if(ctx->fallbackAddresses){args.address_table=ctx->fallbackAddresses;args.valid_table=ctx->fallbackValid;args.table_capacity=shape.batch*kSlots;}
+   if(!args.batch_get_max_inflight_total)args.batch_get_max_inflight_total=kBatchGetInflight;
+   kvaf_device::KvafBatchGetDevice(args,core);
+  }
+ }
+#endif
+}

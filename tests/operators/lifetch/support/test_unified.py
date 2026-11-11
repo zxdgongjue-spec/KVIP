@@ -91,3 +91,14 @@ def test_final_workers_are_forwarded(monkeypatch, tmp_path):
     assert '--avoid-prefetch-slots' in commands[0]
     with pytest.raises(SystemExit):
         module.main(['--transport', 'urma', '--kvaf-server', 'host:1', '--final-workers', '3'])
+
+
+def test_fetch_only_requires_matching_two_worker_fused_path(monkeypatch, tmp_path):
+    commands = []
+    monkeypatch.setattr(module.subprocess, 'call', lambda command: commands.append(command) or 0)
+    common = ['--transport', 'urma', '--kvaf-server', 'host:1', '--kvaf-root', str(tmp_path),
+              '--streaming', '--streaming-fetch', '--fused-final', '--q-workers', '2', '--fetch-only-compare']
+    assert module.main(common) == 0
+    assert '--fetch-only-compare' in commands[0]
+    with pytest.raises(SystemExit):
+        module.main(common[:-2] + ['4', '--fetch-only-compare'])

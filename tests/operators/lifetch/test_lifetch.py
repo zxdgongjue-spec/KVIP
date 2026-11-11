@@ -21,6 +21,7 @@ from runner import progress, supervise  # noqa: E402
 def arguments(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--worker-run", type=Path, help=argparse.SUPPRESS)
+    p.add_argument("--fetch-only-compare", action="store_true", help="compare the actual Q Fetch worker with native KVAF Get")
     p.add_argument("--early-fetch", action="store_true")
     p.add_argument("--streaming", action="store_true", help="experimental LI/Resolver/Index streaming path")
     p.add_argument("--streaming-fetch", action="store_true", help="submit each Q during streaming resolver")
@@ -51,6 +52,8 @@ def arguments(argv=None):
     p.add_argument("--comparison-sfa", type=Path)
     p.add_argument("--output", type=Path, default=ROOT / "tests/results/lifetch")
     a = p.parse_args(argv)
+    if a.fetch_only_compare and a.q_workers != 2:
+        p.error("--fetch-only-compare requires --q-workers 2 --fused-final --streaming-fetch --streaming")
     if a.q_workers is not None and not a.fused_final:
         p.error("--q-workers requires --fused-final --streaming-fetch --streaming")
     if a.fused_final and not a.streaming_fetch:
@@ -68,6 +71,8 @@ def arguments(argv=None):
         p.error("batches must be comma-separated integers")
     if not batches or any(not 1 <= b <= 32 for b in batches):
         p.error("batch must be 1..32")
+    if a.fetch_only_compare and any(b < 2 for b in batches):
+        p.error("--fetch-only-compare requires batch >= 2 to use both workers per query")
     if not 0 <= a.miss_percent <= 100 or a.history <= a.resident + 4:
         p.error("invalid history/resident/miss geometry")
     if a.iterations < 1 or a.warmup < 0 or a.trace_rounds < 0:
@@ -150,6 +155,7 @@ def main(argv=None):
         return run_urma(argv[1:])
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--transport', required=True, choices=('urma', 'ubmem'))
+    p.add_argument('--fetch-only-compare', action='store_true')
     p.add_argument('--early-fetch', action='store_true')
     p.add_argument('--streaming', action='store_true')
     p.add_argument('--streaming-fetch', action='store_true')
@@ -185,6 +191,8 @@ def main(argv=None):
         p.error('batches must be comma-separated integers')
     if not batches or any(not 1 <= x <= 32 for x in batches):
         p.error('batches must be in 1..32')
+    if a.fetch_only_compare and any(x < 2 for x in batches):
+        p.error('--fetch-only-compare requires batch >= 2 to use both workers per query')
     if (a.history <= a.resident + 4 or not 0 <= a.miss_percent <= 100 or a.warmup < 0
             or a.iterations < 1 or a.trace_rounds < 0 or not 1 <= a.intermediate_fetches <= 32
             or not 0 <= a.prefetch_tokens <= 2048 or a.prefetch_tokens % a.intermediate_fetches
@@ -199,11 +207,15 @@ def main(argv=None):
               '--resident', str(a.resident), '--index-heads', str(a.index_heads), '--miss-percent',
               str(a.miss_percent), '--prefetch-tokens', str(a.prefetch_tokens), '--warmup', str(a.warmup),
               '--iterations', str(a.iterations)]
+    if a.fetch_only_compare and (a.transport != 'urma' or a.q_workers != 2 or not a.fused_final or not a.streaming_fetch or not a.streaming):
+        p.error('--fetch-only-compare requires URMA and --streaming --streaming-fetch --fused-final --q-workers 2')
     if a.transport == 'urma':
         command = [sys.executable, '-u', str(Path(__file__).resolve()), '--internal-urma', *common,
                    '--kvaf-root', str(kvaf_root), '--cann', a.cann, '--batches', a.batches,
                    '--intermediate-fetches', str(a.intermediate_fetches), '--trace-rounds', str(a.trace_rounds),
                    '--output', str(a.output), '--timeout-seconds', str(a.timeout_seconds)]
+        if a.fetch_only_compare:
+            command.append('--fetch-only-compare')
         if a.final_workers is not None:
             command += ['--final-workers', str(a.final_workers)]
         if a.early_fetch:

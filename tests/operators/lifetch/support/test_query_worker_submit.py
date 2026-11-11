@@ -107,3 +107,21 @@ def test_two_jetty_pairs_do_not_overlap_prefetch_or_each_other():
             assert not prefetch.intersection(views)
             assert max(views) < capacity
             assert (capacity + 1) // 2 <= 48
+
+
+def test_standalone_dispatch_reuses_fused_worker():
+    root = Path(__file__).resolve().parents[4]
+    kernel = (root / 'csrc/operators/lightning_indexer_with_fetch_streaming_qworkers/op_kernel/streaming.cpp').read_text()
+    entry = kernel.split('void v9_query_fetch_only(', 1)[1]
+    assert 'FetchQueryGroup(reinterpret_cast<__gm__ Args*>(arg),q,lane,workers)' in entry
+    assert 'uint32_t workers=2' in entry
+    assert 'query==4?8U:2U' in entry
+
+
+def test_native_reference_uses_kvaf_default_partition():
+    root = Path(__file__).resolve().parents[4]
+    kernel = (root / 'csrc/operators/lightning_indexer_with_fetch_streaming_qworkers/op_kernel/streaming.cpp').read_text()
+    entry = kernel.split('void v9_native_fetch_only(', 1)[1]
+    assert 'args.block_count=cores;args.jettys_per_core=2' in entry
+    assert 'kvaf_device::KvafBatchGetDevice(args,core)' in entry
+    assert 'query==4?8U:2U' in entry

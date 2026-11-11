@@ -114,3 +114,15 @@ extern "C" uint32_t kvip_counter_calibration(void* output,void* stream) {
     if(!output || !stream)return 100000;
     return aclrtlaunch_v9_counter_calibration(1,stream,output);
 }
+
+extern "C" uint32_t aclrtlaunch_v9_query_fetch_only(uint32_t,void*,void*,uint32_t);
+extern "C" uint32_t kvip_query_fetch_only(void* workspace,void* stream,uint32_t query) {
+    if(!workspace||!stream||query>4)return 100000;
+    return aclrtlaunch_v9_query_fetch_only(query==4?8:2,stream,workspace,query);
+}
+
+extern "C" uint32_t aclrtlaunch_v9_native_fetch_only(uint32_t,void*,void*,void*,uint32_t);
+extern "C" uint32_t kvip_native_fetch_only(void* workspace,void* counts,void* stream,uint32_t query) {
+    if(!workspace||!counts||!stream||query>4)return 100000;
+    return aclrtlaunch_v9_native_fetch_only(query==4?8:2,stream,workspace,counts,query);
+}
