@@ -489,7 +489,7 @@ __simd_callee__ inline void ClipWords(MicroAPI::RegTensor<uint32_t>& value,
     Compare<uint32_t,CMPMODE::EQ>(edge,index,low,all);Select(mask,lowMask,ones,edge);And(value,value,mask,all);
     Compare<uint32_t,CMPMODE::EQ>(edge,index,high,all);Select(mask,highMask,ones,edge);And(value,value,mask,all);
 }
-template<bool Partial=false>
+template<bool Partial=false, bool Paired=false>
 __simd_vf__ inline void UnionWords(__ubuf__ uint32_t* masks,__ubuf__ uint32_t* indices,__ubuf__ uint32_t* values,
     __ubuf__ uint32_t* cfg,uint32_t words,uint32_t wordBase) {
     using namespace MicroAPI;
@@ -501,12 +501,20 @@ __simd_vf__ inline void UnionWords(__ubuf__ uint32_t* masks,__ubuf__ uint32_t* i
     UnalignRegForStore indexStore;ClearSpr<SpecialPurposeReg::AR>();
     for(uint16_t i=0;i<words;i+=64) {
         auto valid=UpdateMask<uint32_t>(remaining);
-        LoadAlign(a,masks+i);LoadAlign(b,masks+words+i);LoadAlign(c,masks+2*words+i);LoadAlign(d,masks+3*words+i);
-        if constexpr(Partial){
-            ClipWords(a,index,cfg,0,all);ClipWords(b,index,cfg,1,all);
-            ClipWords(c,index,cfg,2,all);ClipWords(d,index,cfg,3,all);
+        LoadAlign(a,masks+i);LoadAlign(b,masks+words+i);
+        if constexpr(!Paired) {
+            LoadAlign(c,masks+2*words+i);LoadAlign(d,masks+3*words+i);
         }
-        Or(a,a,b,all);Or(c,c,d,all);Or(a,a,c,all);
+        if constexpr(Partial){
+            ClipWords(a,index,cfg,0,all);ClipWords(b,index,cfg,Paired?2:1,all);
+            if constexpr(!Paired) {
+                ClipWords(c,index,cfg,2,all);ClipWords(d,index,cfg,3,all);
+            }
+        }
+        Or(a,a,b,all);
+        if constexpr(!Paired) {
+            Or(c,c,d,all);Or(a,a,c,all);
+        }
         And(a,a,bitMask,all);
         MaskReg nonzero;CompareScalar<uint32_t,CMPMODE::NE>(nonzero,a,uint32_t(0),valid);
         Duplicate<uint32_t,MaskMergeMode::ZEROING>(counts,uint32_t(1),nonzero);Add(accum,accum,counts,all);
@@ -571,26 +579,28 @@ inline void ExpandWords(__ubuf__ uint32_t* input,__ubuf__ uint32_t* wordIndices,
     if(stopValue<span)asc_atomic_min(cfg+48,stopValue);
 }
 // Explicit two-bit predicate decoding for unequal query publication bounds.
-__simt_callee__ inline uint32_t ReadyWord(__ubuf__ uint32_t* input,__ubuf__ uint32_t* cfg,uint32_t word,uint32_t words) {
+__simt_callee__ inline uint32_t ReadyWord(__ubuf__ uint32_t* input,__ubuf__ uint32_t* cfg,
+    uint32_t word,uint32_t words,uint32_t planes) {
     uint32_t bits=0,start=word*16;
-    for(uint32_t q=0;q<4;++q) {
+    for(uint32_t plane=0;plane<planes;++plane) {
+        uint32_t q=planes==2?plane*2:plane;
         uint32_t low=cfg[28+q],high=cfg[24+q];
         if(start>=high || start+16<=low)continue;
         uint32_t lo=low>start?low-start:0,hi=high-start<16?high-start:16;
         uint32_t mask=0x55555555U<<(lo*2);
         if(hi<16)mask&=(1U<<(hi*2))-1;
-        bits|=input[q*words+word]&mask;
+        bits|=input[plane*words+word]&mask;
     }
     return bits;
 }
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void ScanPartial(__ubuf__ uint32_t* input,__ubuf__ uint32_t* ids,__ubuf__ uint32_t* cfg,
-    uint32_t base,uint32_t span,uint32_t oldCount) {
+    uint32_t base,uint32_t span,uint32_t oldCount,uint32_t planes) {
     uint32_t tid=threadIdx.x,lane=tid%warpSize,warp=tid/warpSize;
     uint32_t words=span/16,perThread=(words+255)/256,count=0;
     for(uint32_t i=0;i<perThread;++i) {
         uint32_t w=tid*perThread+i;
-        if(w<words)count+=uint32_t(__popc(ReadyWord(input,cfg,w,words)));
+        if(w<words)count+=uint32_t(__popc(ReadyWord(input,cfg,w,words,planes)));
     }
     uint32_t inclusive=count;
     for(uint32_t d=1;d<warpSize;d*=2) {
@@ -606,7 +616,7 @@ inline void ScanPartial(__ubuf__ uint32_t* input,__ubuf__ uint32_t* ids,__ubuf__
     asc_syncthreads();
     uint32_t rank=cfg[64+warp]+inclusive-count,stop=span;
     for(uint32_t i=0;i<perThread;++i) {
-        uint32_t w=tid*perThread+i,bits=w<words?ReadyWord(input,cfg,w,words):0;
+        uint32_t w=tid*perThread+i,bits=w<words?ReadyWord(input,cfg,w,words,planes):0;
         while(bits) {
             uint32_t offset=w*16+uint32_t(__ffs(int32_t(bits))-1)/2;
             if(rank<kCandidateCapacity)ids[rank]=base+offset;
@@ -697,6 +707,7 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
     uint64_t postedCount=0; // Business state: controls batched WQE submission.
     V9_FETCH_PROFILE(uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0;)
     auto cfg=work[4096];
+    auto pairedEnds=cfg[96]; // Between the clipping masks and the ready snapshots.
     auto rowStorage=ids;
     if(rt_batchedRows)ids=scratch[23808/4];
     // Freeze every ready snapshot before doing any batch work. Cap to the
@@ -708,24 +719,32 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
         SetFlag<HardEvent::S_MTE2>(EVENT_ID0);WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
         DataCopyPad(work,progressGm[lane*128],gather,padding);
         SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-        for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes)for(uint32_t q=0;q<4;++q) {
-            uint32_t progress=(b/rt_serviceLanes)*128+q*32;
-            uint32_t end=work.GetValue(progress),cap=windowEnd;
-            if(ctx->queryEnds) {
-                auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds);
-                uint32_t valid=bounds[b*4+q];
-                if(ctx->lruSlots && valid<rt_resident)valid=rt_resident;
-                if(cap>valid)cap=valid;
+        for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
+            uint32_t pairedEnd=windowEnd;
+            for(uint32_t q=0;q<4;++q) {
+                // Both Qs on a seq producer are published together. Sample
+                // the first progress slot so a racing DMA cannot split a pair.
+                uint32_t publishedQuery=sequenceHalfWindow ? (q&~1U) : q;
+                uint32_t progress=(b/rt_serviceLanes)*128+publishedQuery*32;
+                uint32_t end=work.GetValue(progress),cap=windowEnd;
+                if(ctx->queryEnds) {
+                    auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds);
+                    uint32_t valid=bounds[b*4+q];
+                    if(ctx->lruSlots && valid<rt_resident)valid=rt_resident;
+                    if(cap>valid)cap=valid;
+                }
+                if(sequenceHalfWindow) {
+                    // A separate hot phase has already published the hot bitmap.
+                    if(end<rt_resident)end=rt_resident;
+                    uint32_t high=work.GetValue(progress+16);
+                    // Split-Q geometry limits the batch to 16, leaving this
+                    // band disjoint from the low snapshot and post input.
+                    cfg.SetValue(192+b*4+q,high<cap?high:cap);
+                    if(cap<pairedEnd)pairedEnd=cap;
+                }
+                cfg.SetValue(128+b*4+q,end<cap?end:cap);
             }
-            if(sequenceHalfWindow) {
-                // A separate hot phase has already published the hot bitmap.
-                if(end<rt_resident)end=rt_resident;
-                uint32_t high=work.GetValue(progress+16);
-                // Split-Q geometry limits the batch to 16, leaving this band
-                // disjoint from both the low snapshot and batched post input.
-                cfg.SetValue(192+b*4+q,high<cap?high:cap);
-            }
-            cfg.SetValue(128+b*4+q,end<cap?end:cap);
+            if(sequenceHalfWindow)pairedEnds.SetValue(b,pairedEnd/128*128);
         }
     }
     GlobalTensor<uint32_t> allRows;allRows.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->rows));
@@ -758,6 +777,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         const uint64_t addresses=state64.GetValue(2),output=state64.GetValue(3);
         const uint32_t lower=ctx->lruSlots?0:rt_resident;
         const uint32_t shards=sequenceHalfWindow?2:1;
+        const uint32_t pairedColdEnd=sequenceHalfWindow?pairedEnds.GetValue(b):0;
         uint32_t consumed[2][4]{},begin[2][4]{},end[2][4]{};
         uint32_t readyBegin[2]{},readyEnd[2]{};
         uint32_t first=rt_history,last=lower;
@@ -806,6 +826,8 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
                 }
                 scanEnd=readyEnd[shard]<slice.end?readyEnd[shard]:slice.end;
             }
+            const bool paired=base>=rt_resident && base<pairedColdEnd;
+            if(paired && scanEnd>pairedColdEnd)scanEnd=pairedColdEnd;
             uint32_t span=((scanEnd-base+127)/128)*128;
             if(span>rt_scanTokens)span=rt_scanTokens;
             if(ctx->lruSlots && base<kLruSlots && span>kLruSlots-base)span=kLruSlots-base;
@@ -829,21 +851,29 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
                 cfg.SetValue(83+q*4,((1U<<((clippedHi%16)*2))-1U)&0x55555555U);
 #endif
             }
-            DataCopyExtParams copy;copy.blockCount=4;copy.blockLen=span/4;
-            copy.srcStride=(rt_history-span)/4;copy.dstStride=0;
-            V9_FETCH_PROFILE(bitmapBytes+=span;)
+            const uint32_t planes=paired?2:4;
+            const uint32_t planeStride=paired?2*rt_history:rt_history;
+            DataCopyExtParams copy;copy.blockCount=planes;copy.blockLen=span/4;
+            copy.srcStride=(planeStride-span)/4;copy.dstStride=0;
+            V9_FETCH_PROFILE(bitmapBytes+=planes*(span/4);)
             DataCopyPadExtParams<uint8_t> padding{false,0,0,0};
             DataCopyPad(scratch.ReinterpretCast<uint8_t>(),bitmap[base/4],copy,padding);
             SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
             SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
             if(full || V9_PARTIAL_SCAN_SIMD) {
                 uint32_t prior=aggregate?wordCount:0;
-                if(full)UnionWords<false>(reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work[prior].GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint32_t*>(work[2304+prior].GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),span/16,aggregate?base/16:0);
-                else UnionWords<true>(reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work[prior].GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint32_t*>(work[2304+prior].GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),span/16,aggregate?base/16:0);
+                uint32_t wordBase=aggregate?base/16:0;
+                auto masks=reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr());
+                auto wordIds=reinterpret_cast<__ubuf__ uint32_t*>(work[prior].GetPhyAddr());
+                auto values=reinterpret_cast<__ubuf__ uint32_t*>(work[2304+prior].GetPhyAddr());
+                auto scanCfg=reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr());
+                if(paired) {
+                    if(full)UnionWords<false,true>(masks,wordIds,values,scanCfg,span/16,wordBase);
+                    else UnionWords<true,true>(masks,wordIds,values,scanCfg,span/16,wordBase);
+                } else {
+                    if(full)UnionWords<false>(masks,wordIds,values,scanCfg,span/16,wordBase);
+                    else UnionWords<true>(masks,wordIds,values,scanCfg,span/16,wordBase);
+                }
                 SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
                 uint32_t words=cfg.GetValue(72);wordCount+=words;
                 if(!aggregate && words)Simt::VF_CALL<ExpandWords>(Simt::Dim3{256,1,1},reinterpret_cast<__ubuf__ uint32_t*>(work[2304].GetPhyAddr()),
@@ -851,7 +881,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
                     reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),base,span,candidateCount,words);
                 else {cfg.SetValue(40,candidateCount);cfg.SetValue(48,span);}
             } else Simt::VF_CALL<ScanPartial>(Simt::Dim3{256,1,1},reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),base,span,candidateCount);
+                reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),base,span,candidateCount,planes);
             SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
             candidateCount=cfg.GetValue(40);uint32_t scanned=cfg.GetValue(48);
             // V_S above joins the scan; forward that dependency to MTE2.
