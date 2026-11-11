@@ -214,7 +214,9 @@ inline void PublishStreamingResidency(uint32_t resident,uint32_t postOffset,__gm
 // queues. The zero-count native call performs KVAF's existing entity/queue
 // validation and initialization; the native PostDirectRequests routine creates
 // the WQEs and the completion checkpoint. Configured in-flight budgets use the
-// unchanged synchronous KVAF path instead.
+// unchanged synchronous KVAF path instead. Large cold-start ranges also use
+// KVAF scheduling rather than issuing an unbounded burst across all queues.
+constexpr uint32_t kMaxAsyncSafeRequests = 64;
 __aicore__ inline void SubmitSafeQuery(__gm__ Args* a,uint32_t b,uint32_t q){
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
@@ -240,7 +242,7 @@ __aicore__ inline void SubmitSafeQuery(__gm__ Args* a,uint32_t b,uint32_t q){
  if(profile)ft[2]=GetSystemCycle();
 #if !V9_SIMULATION
  if(!error && count){
-  if(args.batch_get_max_inflight_total){mode=2;} // Native synchronous fallback retains the configured limit.
+  if(args.batch_get_max_inflight_total || count > kMaxAsyncSafeRequests){mode=2;} // Preserve KVAF scheduling for large or explicitly budgeted ranges.
   else {
    auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args.queue_state);
    auto entity=reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(args.channel_entity);

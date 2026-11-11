@@ -16,7 +16,7 @@ def test_safe_ranges_are_posted_for_all_requests_before_any_cq_drain(tmp_path):
 #define __aicore__
 #define __gm__
 #define V9_SIMULATION 0
-constexpr unsigned kFlagCount=12,kSlots=8192,kTop=2048;
+constexpr unsigned kFlagCount=12,kSlots=8192,kTop=2048,kMaxAsyncSafeRequests=64;
 constexpr uint64_t KVAF_AIV_BATCH_GET_STATUS_MAGIC=123;
 struct BatchFlag {uint32_t ready=0,count=0,error=0,reserved[29]={};};
 struct FinalPost {uint32_t count=0,pending=0,error=0,deferred=0,descriptor=0,nonconflicting=0;};
@@ -56,6 +56,9 @@ int main(){
  assert(flags[8].reserved[0]==1 && flags[20].reserved[0]==1);
  assert(flags[8].ready==0 && flags[20].ready==0);
  event_log.clear();deviceArgs[1].batch_get_max_inflight_total=64;
+ SubmitSafeQuery(&a,0,0);
+ assert(event_log.empty() && flags[8].reserved[0]==2);
+ deviceArgs[1].batch_get_max_inflight_total=0;posts[0].count=posts[0].nonconflicting=65;
  SubmitSafeQuery(&a,0,0);
  assert(event_log.empty() && flags[8].reserved[0]==2);
 }
