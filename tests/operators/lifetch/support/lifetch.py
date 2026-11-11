@@ -31,8 +31,13 @@ def seed_native_bitmap(torch, native, row, bitmap):
 
 def run(args, run_dir):
     suffix = ("_early" if args.early_fetch else "") + ("_safe" if args.avoid_prefetch_slots else "")
-    source = (SOURCE.with_name(SOURCE.name + ("_streaming_fused" if args.fused_final else ("_streaming_fetch" if args.streaming_fetch else "_streaming")))
-              if args.streaming else (SOURCE.with_name(SOURCE.name + suffix) if suffix else SOURCE))
+    if args.streaming:
+        name = ("_streaming_qworkers" if args.q_workers is not None else
+                "_streaming_fused" if args.fused_final else
+                "_streaming_fetch" if args.streaming_fetch else "_streaming")
+        source = SOURCE.with_name(SOURCE.name + name)
+    else:
+        source = SOURCE.with_name(SOURCE.name + suffix) if suffix else SOURCE
     from attention import check_sfa
     from contract_payload import payload
     from kvip.operators.lifetch import binding as launch_module
@@ -185,7 +190,7 @@ def run(args, run_dir):
             continue
         times = report["timing"]
         line = (
-            f"binary_sha256={built_digest} early_fetch={args.early_fetch} streaming={args.streaming}\nBS={batch} prototype PASS index_heads={args.index_heads} windows={geometry['intermediate_fetches']} requested_windows={args.intermediate_fetches} history={args.history} hot={args.resident} topk=2048 Q=4 graph=True\n"
+            f"binary_sha256={built_digest} early_fetch={args.early_fetch} streaming={args.streaming} q_workers={args.q_workers}\nBS={batch} prototype PASS index_heads={args.index_heads} windows={geometry['intermediate_fetches']} requested_windows={args.intermediate_fetches} history={args.history} hot={args.resident} topk=2048 Q=4 graph=True\n"
             + "graph_p50_us="
             + ", ".join((f"{k}:{v['p50_us']:.3f}" for k, v in times.items()))
             + f"\ncore_speedup={times['native_chain']['p50_us'] / times['prototype_core']['p50_us']:.3f}x"
@@ -418,7 +423,7 @@ def run_device(
     )
     if args.streaming:
         from streaming_forward import StreamingForward
-        pipeline = StreamingForward(rotating, update, torch, args.prefetch_tokens, fused_final=args.fused_final)
+        pipeline = StreamingForward(rotating, update, torch, args.prefetch_tokens, fused_final=args.fused_final, q_workers=args.q_workers)
     else:
         pipeline = LIFetchForward(rotating, update)
     saved = [arguments[i].clone() for i in (1, 4, 13)]
@@ -638,7 +643,7 @@ def run_device(
     if not hot_case["first_window_fetches"] or not restored_hot:
         raise AssertionError(f"First window did not Fetch former hot candidates into LRU slots: {hot_case}")
 
-    if args.streaming_fetch:
+    if args.streaming_fetch and args.q_workers is None:
         # Same per-Q descriptors, with Q4 publication as the submission boundary.
         # This runs only for correctness diagnosis, outside graph measurements.
         state["check_phase"] = "streaming per-Q packing with deferred fetch"
@@ -657,10 +662,15 @@ def run_device(
     if args.streaming:
         # The standalone checks above use the baseline resolver/update. Exercise
         # the actual streaming graph path as well, including the victim case.
-        for label, orders in (("regular", initial_orders), ("hot-victim-collision", unlucky)):
+        streaming_checks = [("regular", initial_orders, False), ("hot-victim-collision", unlucky, False)]
+        if args.q_workers is not None:
+            streaming_checks.append(("cold-start", initial_orders, True))
+        for label, orders, cold_start in streaming_checks:
             state["check_phase"] = f"streaming {label}"
             reset()
             update.set_order(orders)
+            if cold_start:
+                rotating.hot_valid.zero_()
             full()
             stream.synchronize()
             verify(True)
