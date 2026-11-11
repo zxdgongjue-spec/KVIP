@@ -93,6 +93,7 @@ public:
     QLIVector(){topkOp_.Init(2048,16384);topkOp_.InitBuffers(topkSharedTmpLocal_,indicesOutLocal_);}
     void ProcessRollingTopK(const QLICommon::RunInfo&);
     void PublishRollingTopK(const QLICommon::RunInfo&);
+    void TraceThreshold(uint32_t,uint32_t,uint32_t,uint32_t) {}
     void SaveTopKState(uint32_t query){
         assert(loads.empty());auto* row=prefixOutput_+(query/4)*50176;
         auto* vals=reinterpret_cast<uint16_t*>(row)+query%4*2048;

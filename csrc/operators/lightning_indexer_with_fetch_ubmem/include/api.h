@@ -21,6 +21,8 @@ uint32_t v9_tagged_map();
 uint32_t v9_merge_outputs();
 uint32_t v9_cold_only_prefetch();
 uint32_t v9_threshold_only();
+// Optional eager-only diagnostics; zero Context pointer disables every write.
+uint32_t v9_threshold_trace_abi();
 uint32_t v9_simt_init();
 uint32_t v9_bitmap_index();
 uint32_t v9_reserved_ub();

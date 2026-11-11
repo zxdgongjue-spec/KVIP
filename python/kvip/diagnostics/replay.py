@@ -254,6 +254,10 @@ def main():
             emit("SNAPSHOT_CHECK_PASS")
             if inspected.get("content") == "synthetic_token_replay":
                 emit("CONTENT synthetic_token_replay: generated scores/KV bytes; not real-model timing")
+            elif inspected.get("content") == "real_li_synthetic_kv":
+                emit(
+                    "CONTENT real_li_synthetic_kv: real Q/Index; generated KV bytes; native LI checked against captured scores"
+                )
             matrix = args.ubmem_ablation or args.service_ablation or args.fused_variants is not None
             if not args.inspect and not matrix:
                 emit(f"CASE_BEGIN {args.transport}-{args.mode}")

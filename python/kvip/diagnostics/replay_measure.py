@@ -114,6 +114,9 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
     delta = restored["new_base"] - restored["old_base"]
     active_rows = np.any(archive.array("pre.query_ends").reshape(-1, 4) > 0, axis=1)
     reserved_expected = archive.array("pre.reserved_hot")
+    score_reference = (
+        archive.array("post.score_keys") if archive.manifest.get("content") == "real_li_synthetic_kv" else None
+    )
 
     def reset():
         for target, seed in seeds:
@@ -125,6 +128,12 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         # Production init resets round-local work; never rewind transport queues.
 
     def verify():
+        if score_reference is not None:
+            from kvip.diagnostics.score_trace import read_score_keys
+
+            bundle.score_comparison = verify_score_keys(
+                read_score_keys(torch, rotating), score_reference, archive.array("pre.query_ends")
+            )
         reads = fused_reads(
             torch,
             rotating,
@@ -162,6 +171,23 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         min_overlap_fraction=1.0,
         reference="Captured fusion TopK sets; equality enforced on every replay",
     )
+
+
+def verify_score_keys(actual, expected, query_ends):
+    """Check valid score bits outside timing; future/padding positions are undefined."""
+    if actual.shape != expected.shape or actual.dtype != np.uint16 or expected.dtype != np.uint16:
+        raise AssertionError("Replayed LI score layout differs from the captured real input")
+    ends = np.asarray(query_ends).reshape(actual.shape[:2])
+    compared = 0
+    for row, query in np.ndindex(ends.shape):
+        end = int(ends[row, query])
+        if not 0 <= end <= actual.shape[2]:
+            raise AssertionError("Captured query end exceeds the LI score row")
+        mismatch = np.count_nonzero(actual[row, query, :end] != expected[row, query, :end])
+        if mismatch:
+            raise AssertionError(f"Real LI score keys differ: row={row} query={query} positions={mismatch}")
+        compared += end
+    return dict(status="bit_exact", compared_scores=compared, included_in_timing=False)
 
 
 def profile_urma_get(runtime, stream, reset, verify, replay_stages):
@@ -465,14 +491,14 @@ def measure_case(args, archive, context, retained):
         address_relocation=restored["new_base"] - restored["old_base"],
         fidelity=archive.manifest["fidelity"],
         exclusions="Model, input preparation/import/packing, DDR Put, state restoration and correctness readbacks",
-        interpretation="Isolated four-layer group graph latency; not DP service latency or TPOT",
+        interpretation="Isolated Index-sharing group graph latency; not DP service latency or TPOT",
         timing_boundary="timing contains device graph only; optional candidate_call reports a separate host-to-output boundary",
         graph_backend="torch.npu.NPUGraph" if args.mode == "serial" else "kvaf.AclGraph",
         selection_comparison=bundle.selection_comparison,
         demand_accounting=DEMAND_ACCOUNTING,
         representation=(
             archive.manifest["fidelity"]
-            if archive.manifest.get("content") == "synthetic_token_replay"
+            if archive.manifest.get("content") in ("synthetic_token_replay", "real_li_synthetic_kv")
             else "Native logical paged Index and LIDU maps reconstructed outside timing; original serial map allocation padding was not captured."
             if args.mode == "serial"
             else "Original hot-first Index, KV bytes, packed inputs and relative DDR addresses restored."
@@ -480,6 +506,8 @@ def measure_case(args, archive, context, retained):
         **results,
     )
     if args.mode == "fused":
+        if score_reference_result := getattr(bundle, "score_comparison", None):
+            result["score_comparison"] = score_reference_result
         result["tuning"] = dict(bundle.tuning)
         result["prefetch_admission_accounting"] = ADMISSION_ACCOUNTING
         result["reserved_metadata"] = dict(

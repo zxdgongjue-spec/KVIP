@@ -563,6 +563,8 @@ def main():
     summary = summarize(results)
     if summary.get("content") == "synthetic_token_replay":
         emit("CONTENT synthetic_token_replay: generated scores/KV bytes; not real-model timing")
+    elif summary.get("content") == "real_li_synthetic_kv":
+        emit("CONTENT real_li_synthetic_kv: real Q/Index; generated KV bytes; single-device operator timing")
     (args.result_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     if args.quiet:
         compact_report(summary, path=args.result_dir / "summary.json")

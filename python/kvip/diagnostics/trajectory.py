@@ -16,7 +16,7 @@ def inspect_series(root, *, expected_dp=None, expected_rounds=None, expected_lay
     if not paths:
         raise ValueError(f"No DP series manifests found under {root}")
     reports, ranks, expected_ranks = [], set(), None
-    contents = set()
+    contents, real_plans = set(), set()
     for path in paths:
         series = json.loads(path.read_text())
         rank = series.get("dp_rank")
@@ -33,7 +33,9 @@ def inspect_series(root, *, expected_dp=None, expected_rounds=None, expected_lay
         ranks.add(rank)
         content = series.get("content", "full")
         contents.add(content)
-        if content not in ("full", "token_ids") or (expected_content is not None and content != expected_content):
+        if content not in ("full", "token_ids", "scores") or (
+            expected_content is not None and content != expected_content
+        ):
             raise ValueError(f"DP{rank} content is {content}, expected {expected_content}")
         configured = set(series["dp_ranks"])
         if expected_ranks is not None and configured != expected_ranks:
@@ -50,7 +52,22 @@ def inspect_series(root, *, expected_dp=None, expected_rounds=None, expected_lay
             raise ValueError(f"DP{rank} round count differs from its completion marker")
         if expected_rounds is not None and total != expected_rounds:
             raise ValueError(f"DP{rank} has {total} rounds, expected {expected_rounds}")
+        if content == "scores" and (
+            series.get("seed_rounds") != 1 or series.get("consecutive_required") is not True or total < 2
+        ):
+            raise ValueError(f"DP{rank} scores require a seed and consecutive analysis rounds")
+        real_rounds = set(series.get("real_input_rounds", []))
+        real_groups = set(series.get("real_input_groups", []))
+        real_count = 0
         groups = {entry["group"]: entry["layer_names"] for entry in series["groups"]}
+        if content == "scores":
+            if (
+                bool(real_rounds) != bool(real_groups)
+                or not real_rounds.issubset(range(1, total + 1))
+                or not real_groups.issubset(groups)
+            ):
+                raise ValueError(f"DP{rank} real-input sampling plan exceeds the captured rounds/groups")
+            real_plans.add((tuple(sorted(real_rounds)), tuple(sorted(real_groups))))
         layers = [name for names in groups.values() for name in names]
         if (
             len(groups) != len(series["groups"])
@@ -68,6 +85,8 @@ def inspect_series(root, *, expected_dp=None, expected_rounds=None, expected_lay
             schedule = round_entry["scheduler_round"]
             if type(schedule) is not int or schedule <= previous_scheduler_round:
                 raise ValueError(f"DP{rank} scheduler round sequence is not increasing")
+            if content == "scores" and number > 1 and schedule != previous_scheduler_round + 1:
+                raise ValueError(f"DP{rank} round {number} has no consecutive captured predecessor")
             previous_scheduler_round = schedule
             seen = set()
             for entry in round_entry["groups"]:
@@ -81,14 +100,25 @@ def inspect_series(root, *, expected_dp=None, expected_rounds=None, expected_lay
                 context = source.get("context", {})
                 requests = source.get("requests", [])
                 signature = [{"request_id": item["request_id"], "owner": item["owner"]} for item in requests]
-                if content == "token_ids":
+                if content in ("token_ids", "scores"):
+                    is_scores = content == "scores"
                     valid_record = (
-                        manifest.get("schema_version") == 3
-                        and manifest.get("kind") == "kvaf_decode_token_trace"
-                        and manifest.get("content") == "token_ids"
+                        manifest.get("schema_version") == (4 if is_scores else 3)
+                        and manifest.get("kind")
+                        == ("kvaf_decode_score_trace" if is_scores else "kvaf_decode_token_trace")
+                        and manifest.get("content") == content
                         and manifest.get("validation", {}).get("passed") is True
-                        and manifest.get("validation", {}).get("kind") == "token_id_integrity"
+                        and manifest.get("validation", {}).get("kind")
+                        == ("score_trace_integrity" if is_scores else "token_id_integrity")
                     )
+                    if is_scores:
+                        expected_real = number in real_rounds and group in real_groups
+                        valid_record = (
+                            valid_record
+                            and manifest.get("real_inputs_saved") is expected_real
+                            and source.get("capture_real_inputs") is expected_real
+                        )
+                        real_count += int(expected_real)
                     archive = manifest.get("archive", {})
                     token_file = checked_path(snapshot_path.parent, archive.get("file", ""))
                     valid_record = (
@@ -125,6 +155,8 @@ def inspect_series(root, *, expected_dp=None, expected_rounds=None, expected_lay
                 batch=series["batch"],
                 queries=series["queries"],
                 content=content,
+                analysis_rounds=total - 1 if content == "scores" else total,
+                real_input_snapshots=real_count,
                 scheduler_rounds=[entry["scheduler_round"] for entry in rounds],
             )
         )
@@ -132,6 +164,8 @@ def inspect_series(root, *, expected_dp=None, expected_rounds=None, expected_lay
         raise ValueError(f"Missing/unexpected DP series: found {sorted(ranks)}, configured {sorted(expected_ranks)}")
     if len(contents) != 1:
         raise ValueError("DP series disagree about capture content")
+    if len(real_plans) > 1:
+        raise ValueError("DP series disagree about real-input sampling")
     if len({tuple(report["scheduler_rounds"]) for report in reports}) != 1:
         raise ValueError("Selected DPs did not capture the same coordinated scheduler rounds")
     return reports
@@ -172,7 +206,7 @@ def main(argv=None):
     parser.add_argument("--expect-dp", type=int, nargs="+")
     parser.add_argument("--expect-rounds", type=int)
     parser.add_argument("--expect-layers", type=int)
-    parser.add_argument("--expect-content", choices=("full", "token_ids"))
+    parser.add_argument("--expect-content", choices=("full", "token_ids", "scores"))
     parser.add_argument("--extract", type=Path, help="Expand one snapshot to a new standalone directory")
     parser.add_argument("--dp-rank", type=int)
     parser.add_argument("--round", dest="round_index", type=int)
@@ -197,8 +231,16 @@ def main(argv=None):
                 f"rounds={report['rounds']} layers={report['layers']} groups={report['groups']} "
                 f"snapshots={report['snapshots']} content={report['content']} all_pure_decode=true"
             )
-        if reports[0]["content"] == "token_ids":
-            print("TRACE_SERIES_PASS coverage=all_target_layers content=token_ids real_payload=not_collected")
+            if report["content"] == "scores":
+                print(
+                    f"TRACE_SCORE_PASS dp={report['dp_rank']} seed_rounds=1 "
+                    f"analysis_rounds={report['analysis_rounds']} real_input_snapshots={report['real_input_snapshots']}"
+                )
+        if reports[0]["content"] in ("token_ids", "scores"):
+            print(
+                f"TRACE_SERIES_PASS coverage=all_target_layers content={reports[0]['content']} "
+                "real_payload=not_collected"
+            )
         else:
             print("TRACE_SERIES_PASS coverage=all_target_layers payload_check=at_capture_and_replay")
         if args.extract is not None:
@@ -213,9 +255,10 @@ def main(argv=None):
             if len(groups) != 1:
                 raise ValueError("Extraction group is outside the captured series")
             source = checked_path(series_path.parent, groups[0]["manifest"]).parent
-            if series.get("content") == "token_ids":
+            if series.get("content") in ("token_ids", "scores"):
+                command = "score_replay" if series.get("content") == "scores" else "token_replay"
                 raise ValueError(
-                    "Use python3 -m kvip.diagnostics.token_replay with the selected token trace directory "
+                    f"Use python3 -m kvip.diagnostics.{command} with the selected token trace directory "
                     f"to construct standalone operator inputs: {source}"
                 )
             materialize_snapshot(source, args.extract)

@@ -178,7 +178,7 @@ struct alignas(128) Event {
 };
 struct Context {
     uint64_t progress, rows, mapping, locations, events, hits, selected, owners;
-    uint64_t reservedArgs, sourceBlocks, sourceOffsets, destinations, count, rowStatus, reservedFinalStatus;
+    uint64_t diagnosticThresholds, sourceBlocks, sourceOffsets, destinations, count, rowStatus, reservedFinalStatus;
     uint32_t prefetchLimit, windowLimit;
     uint64_t ubmemRegion, ubmemStatus;
     uint64_t lruSlots, reservedHot, changes, queryEnds;

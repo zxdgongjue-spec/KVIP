@@ -54,6 +54,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessRollingTopK(const QLICommon::RunI
     WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
     topkOp_.MergeNext(mrgValueLocal_,indicesOutLocal_,scoreOutLocal_,padded,rollingEnd_);
     SaveTopKState(query);
+    TraceThreshold(query,end,available,3);
     rollingEnd_=end;
     SetFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);
     SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);

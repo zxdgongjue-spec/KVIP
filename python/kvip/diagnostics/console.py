@@ -232,6 +232,12 @@ def compact_report(report, *, path=None):
     """Render existing JSON evidence; no runtime imports, inference or writes."""
     if not isinstance(report, dict) or "status" not in report:
         raise ValueError("Not a saved diagnostic report")
+    if report.get("content") == "real_li_synthetic_kv":
+        emit("CONTENT real_li_synthetic_kv: real Q/Index/scores; generated KV bytes; single-device operator timing")
+    elif report.get("content") == "synthetic_token_replay":
+        emit("CONTENT synthetic_token_replay: generated scores/KV bytes; not real-model timing")
+    if report.get("score_comparison"):
+        emit("LI_SCORE_CHECK " + json.dumps(report["score_comparison"], sort_keys=True))
     status = report["status"]
     if status == "failed":
         emit(f"FAILED: {report.get('error', 'saved run failed')}", file=sys.stderr)

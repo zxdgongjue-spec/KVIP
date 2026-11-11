@@ -26,6 +26,7 @@
 #include "indexer_score.h"
 #include "topk.h"
 #include "resident_threshold.h"
+#include "threshold_trace.h"
 #ifndef V9_ROLLING_THRESHOLD
 #define V9_ROLLING_THRESHOLD 0
 #endif
@@ -152,6 +153,16 @@ private:
     LocalTensor<uint16_t> classifyUB_;
     TBuf<TPosition::VECCALC> prefixThresholdBuf_;
     LocalTensor<uint16_t> prefixThreshold_;
+    __aicore__ inline void TraceThreshold(uint32_t query,uint32_t validEnd,
+        uint32_t appliesFrom,uint32_t kind) {
+        auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+        if(!ctx->diagnosticThresholds)return;
+        SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        auto line=kvip_score_trace::Store(reinterpret_cast<__gm__ uint32_t*>(ctx->diagnosticThresholds),
+            SIM_BATCH*4,SIM_HISTORY,query,validEnd,appliesFrom,
+            prefixThreshold_.GetValue((query%2)*128),kind);
+        if(line)ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(line),128);
+    }
     __aicore__ inline void SaveTopKState(uint32_t query) {
         auto src = (__local_mem__ uint16_t *)scoreOutLocal_.GetPhyAddr();
         auto dst = (__local_mem__ uint16_t *)prefixThreshold_.GetPhyAddr() + (query % 2) * 128;
@@ -183,6 +194,9 @@ private:
     }
     __aicore__ inline void SaveResident(uint32_t query,uint32_t scoreRow) {
         SaveTopKState(query);
+        auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+        uint32_t bound=ctx->queryEnds?reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)[query]:SIM_HISTORY;
+        TraceThreshold(query,Min(bound,uint32_t(SIM_RESIDENT)),SIM_RESIDENT,1);
         PublishResident(query,scoreRow);
 #if V9_ROLLING_THRESHOLD
         rollingEnd_=16384;rollingReady_=true;
@@ -705,6 +719,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
             // reads before MTE2 stages the victim IDs into that same storage.
             PipeBarrier<PIPE_ALL>();
             PublishResident(query,vecOffset);
+            TraceThreshold(query,uint32_t(validS2Len),SIM_RESIDENT,2);
             SetFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);
             SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
             continue;

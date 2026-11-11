@@ -30,6 +30,12 @@ FIDELITY = (
     "Captured active-owner logical permutations, valid hot slots, ABC bounds, LRU candidates, causal queries, "
     "published-token availability and TopK sets are preserved. DDR slots are compact with captured shared-page aliases preserved; original addresses, page placement, inactive-owner state, scores and LI/prefetch timing are not reproduced."
 )
+REAL_LI_FIDELITY = (
+    "Captured FP8 Index keys/query, BF16 weights and FP32 scales are unchanged; KV bytes are synthetic. "
+    "Active residency, causal bounds and within-DP DDR slot spacing/shared aliases are preserved. "
+    "DP arenas are concatenated with disjoint slot namespaces on one target card using THP and an explicit NUMA policy. "
+    "This is a single-card merged workload, not the original multi-DP service timing or physical placement."
+)
 
 
 def synthetic_payload(owner, logical, width):
@@ -52,8 +58,8 @@ def _array(trace, name, shape, dtype):
 def _inputs(trace):
     manifest, geometry = trace.manifest, dict(trace.manifest["geometry"])
     if (
-        manifest.get("kind") != "kvaf_decode_token_trace"
-        or manifest.get("content") != "token_ids"
+        (manifest.get("kind"), manifest.get("content"))
+        not in (("kvaf_decode_token_trace", "token_ids"), ("kvaf_decode_score_trace", "scores"))
         or manifest.get("status") != "complete"
         or manifest.get("validation", {}).get("passed") is not True
     ):
@@ -155,15 +161,21 @@ def _token_payload(owner, logical, inputs, width):
     return result
 
 
-def _write_ddr(directory, geometry, inputs):
+def _write_ddr(directory, geometry, inputs, *, preserve_slots=False, numa_node=-1):
     width, h = geometry["token_bytes"], geometry["history"]
     slot = ((width * BLOCK + 4095) // 4096) * 4096
+    if preserve_slots:
+        slot = geometry["slot_bytes"]
+        if slot < width * BLOCK or geometry["region_bytes"] % slot:
+            raise ValueError("Captured slot/region geometry is invalid")
     directory.mkdir()
     addresses = np.zeros(inputs["ids"].shape, dtype=np.int64)
     identities = list(dict.fromkeys(int(slot) for slot in inputs["page_slots"].reshape(-1) if slot >= 0))
     if not identities:
         raise ValueError("Operator replay requires at least one actually published DDR page")
-    compact = {identity: index for index, identity in enumerate(identities)}
+    compact = {identity: identity if preserve_slots else index for index, identity in enumerate(identities)}
+    if preserve_slots and max(identities) >= geometry["region_bytes"] // slot:
+        raise ValueError("Captured DDR slot lies outside its arena")
     with (directory / "payload.bin").open("xb") as output:
         for identity in identities:
             output.write(synthetic_payload(identity, np.arange(BLOCK), width).tobytes())
@@ -176,7 +188,7 @@ def _write_ddr(directory, geometry, inputs):
                 )
         addresses[owner] = logical_addresses[inputs["ids"][owner]]
     count = len(identities)
-    keys = np.arange(count, dtype=np.int64)
+    keys = np.asarray(identities, dtype=np.int64) if preserve_slots else np.arange(count, dtype=np.int64)
     offsets = keys.astype(np.uint64) * slot
     arrays = dict(
         keys=keys,
@@ -194,11 +206,11 @@ def _write_ddr(directory, geometry, inputs):
         schema_version=1,
         transport="ubmem",
         device_id=0,
-        page_mode="base",
-        numa_node=-1,
+        page_mode="thp" if preserve_slots else "base",
+        numa_node=numa_node if preserve_slots else -1,
         generation="synthetic-token-replay",
         region_base=SYNTHETIC_BASE,
-        region_bytes=count * slot,
+        region_bytes=geometry["region_bytes"] if preserve_slots else count * slot,
         slot_bytes=slot,
         token_bytes=width,
         tokens_per_block=BLOCK,
@@ -209,27 +221,39 @@ def _write_ddr(directory, geometry, inputs):
     )
 
 
-def _synthetic_tensors(geometry, inputs, addresses):
+def _synthetic_tensors(geometry, inputs, addresses, *, real_trace=None):
     b, h, r, width, stride, heads = (
         geometry[name] for name in ("batch", "history", "resident", "token_bytes", "output_stride", "heads")
     )
     ids, owners = inputs["ids"], inputs["row_owners"]
     keys = np.zeros((*ids.shape, KEY_WIDTH), dtype=np.uint8)
-    # Q is zero in these columns. Token/owner fingerprints make Index key
-    # permutations observable even for tokens with identical membership scores.
-    for owner in owners:
-        for bit in range(32):
-            keys[owner, :, 4 + bit] = ((ids[owner] >> bit) & 1).astype(np.uint8) * FP8_ONE
-            keys[owner, :, 36 + bit] = ((int(owner) >> bit) & 1) * FP8_ONE
-    query = np.zeros((b * QUERIES, heads, KEY_WIDTH), dtype=np.uint8)
-    weights = np.zeros((b * QUERIES, heads), dtype=np.uint16)
-    weights[:, 0] = BF16_ONE
-    # Captured outputs are TND. Scatter each set back into its packed query.
-    for tnd, source in enumerate(inputs["metadata"][2]):
-        row, q = divmod(int(source), QUERIES)
-        owner = owners[row]
-        keys[owner, np.isin(ids[owner], inputs["selected"][tnd]), q] = FP8_ONE
-        query[source, 0, q] = FP8_ONE
+    key_scales = np.ones(ids.shape, dtype=np.float32)
+    query_scale = np.ones((b * QUERIES, heads), dtype=np.float32)
+    if real_trace is not None:
+        keys[owners] = _array(real_trace, "real.keys", (b, h, KEY_WIDTH), np.uint8)
+        key_scales[owners] = _array(real_trace, "real.key_scales", (b, h), np.float32)
+        query = _array(real_trace, "real.query", (b, QUERIES, heads, KEY_WIDTH), np.uint8).reshape(
+            b * QUERIES, heads, KEY_WIDTH
+        )
+        weights = _array(real_trace, "real.weights", (b, QUERIES, heads), np.uint16).reshape(b * QUERIES, heads)
+        query_scale = _array(real_trace, "real.query_scale", (b, QUERIES, heads), np.float32).reshape(
+            b * QUERIES, heads
+        )
+    else:
+        # Unscored columns make token identity observable after Index updates.
+        for owner in owners:
+            for bit in range(32):
+                keys[owner, :, 4 + bit] = ((ids[owner] >> bit) & 1).astype(np.uint8) * FP8_ONE
+                keys[owner, :, 36 + bit] = ((int(owner) >> bit) & 1) * FP8_ONE
+        query = np.zeros((b * QUERIES, heads, KEY_WIDTH), dtype=np.uint8)
+        weights = np.zeros((b * QUERIES, heads), dtype=np.uint16)
+        weights[:, 0] = BF16_ONE
+        # Captured outputs are TND. Scatter each set back into its packed query.
+        for tnd, source in enumerate(inputs["metadata"][2]):
+            row, q = divmod(int(source), QUERIES)
+            owner = owners[row]
+            keys[owner, np.isin(ids[owner], inputs["selected"][tnd]), q] = FP8_ONE
+            query[source, 0, q] = FP8_ONE
     output = np.zeros((len(ids), stride, width), dtype=np.uint8)
     for row, owner in enumerate(owners):
         hot_slots = np.flatnonzero(inputs["hot"][owner])
@@ -238,7 +262,7 @@ def _synthetic_tensors(geometry, inputs, addresses):
         output[owner, r + abc % (stride - r)] = _token_payload(owner, abc, inputs, width)
     return dict(
         keys=keys,
-        key_scales=np.ones(ids.shape, dtype=np.float32),
+        key_scales=key_scales,
         addresses=addresses,
         logical_ids=ids,
         hot_valid=inputs["hot"],
@@ -246,7 +270,7 @@ def _synthetic_tensors(geometry, inputs, addresses):
         metadata=inputs["metadata"],
         query=query,
         weights=weights,
-        query_scale=np.ones((b * QUERIES, heads), dtype=np.float32),
+        query_scale=query_scale,
         query_ends=inputs["ends"].reshape(-1),
         query_lengths=np.full(b, QUERIES, dtype=np.int32),
         key_lengths=np.full(b, h, dtype=np.int32),
@@ -259,6 +283,21 @@ def _synthetic_tensors(geometry, inputs, addresses):
 
 def materialize_token_trace(trace, destination):
     """Build one self-contained synthetic fixture; device correctness is checked by replay.py."""
+    if trace.manifest.get("content") != "token_ids":
+        raise ValueError("Score traces require real-input materialization; membership rewriting is forbidden")
+    return _materialize(trace, destination)
+
+
+def materialize_score_trace(trace, destination, *, numa_node):
+    """Preserve real LI bits and slot spacing; synthesize only KV payload bytes."""
+    if trace.manifest.get("content") != "scores" or trace.manifest.get("real_inputs_saved") is not True:
+        raise ValueError("Real LI replay requires saved real inputs on every selected DP")
+    if type(numa_node) is not int or numa_node < -1:
+        raise ValueError("An explicit target NUMA node (-1 or a nonnegative node) is required")
+    return _materialize(trace, destination, real_li=True, numa_node=numa_node)
+
+
+def _materialize(trace, destination, *, real_li=False, numa_node=-1):
     destination = Path(destination).resolve()
     if destination.exists():
         raise FileExistsError(f"Refusing to overwrite synthetic fixture: {destination}")
@@ -268,7 +307,7 @@ def materialize_token_trace(trace, destination):
     manifest = dict(
         schema_version=1,
         status="incomplete",
-        content="synthetic_token_replay",
+        content="real_li_synthetic_kv" if real_li else "synthetic_token_replay",
         source_transport="ubmem",
         geometry=geometry,
         tensors={},
@@ -278,21 +317,32 @@ def materialize_token_trace(trace, destination):
                 np.frombuffer(json.dumps(trace.manifest, sort_keys=True).encode(), dtype=np.uint8)
             )
         ),
-        scope="synthetic_token_ID_membership_LI_TopK_Fetch_IndexUpdate_validation",
-        fidelity=FIDELITY,
+        scope="real_LI_synthetic_KV_merged_single_card"
+        if real_li
+        else "synthetic_token_ID_membership_LI_TopK_Fetch_IndexUpdate_validation",
+        fidelity=REAL_LI_FIDELITY if real_li else FIDELITY,
         synthetic=dict(
-            score_reference="Exact FP8 0/1 membership: selected=1, other=0; BF16 boundary gap=1",
+            score_reference="Captured real LI inputs; native score validation remains required"
+            if real_li
+            else "Exact FP8 0/1 membership: selected=1, other=0; BF16 boundary gap=1",
             payload_reference="shared page/token tags; owner/logical-ID tags for unpublished ABC",
             native_validated=False,
         ),
     )
-    manifest["metadata"]["content"] = "synthetic_token_replay"
-    addresses, manifest["ddr"] = _write_ddr(destination / "ddr", geometry, inputs)
+    manifest["metadata"]["content"] = manifest["content"]
+    addresses, manifest["ddr"] = _write_ddr(
+        destination / "ddr", geometry, inputs, preserve_slots=real_li, numa_node=numa_node
+    )
     archive = TensorArchive(destination, manifest)
-    tensors = _synthetic_tensors(geometry, inputs, addresses)
+    tensors = _synthetic_tensors(geometry, inputs, addresses, real_trace=trace if real_li else None)
     for name, value in tensors.items():
         archive.save("pre." + name, value, dtype={"query": "float8_e4m3fn", "weights": "bfloat16"}.get(name))
     archive.save("post.logical_output", inputs["selected"])
+    if real_li:
+        archive.save(
+            "post.score_keys",
+            _array(trace, "post.score_keys", (geometry["batch"], QUERIES, geometry["history"]), np.uint16),
+        )
     # Oracle identity is (stable owner, logical token), not captured physical slots.
     tags = []
     seen = set()

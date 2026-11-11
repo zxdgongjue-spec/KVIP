@@ -154,6 +154,8 @@ private:
     LocalTensor<uint16_t> classifyUB_;
     TBuf<TPosition::VECCALC> prefixThresholdBuf_;
     LocalTensor<uint16_t> prefixThreshold_;
+    // Capture is currently UBmem-only; keep the shared rolling hook inert.
+    __aicore__ inline void TraceThreshold(uint32_t,uint32_t,uint32_t,uint32_t) {}
     __aicore__ inline void SaveTopKState(uint32_t query) {
         auto src = (__local_mem__ uint16_t *)scoreOutLocal_.GetPhyAddr();
         auto dst = (__local_mem__ uint16_t *)prefixThreshold_.GetPhyAddr() + (query % 2) * 128;

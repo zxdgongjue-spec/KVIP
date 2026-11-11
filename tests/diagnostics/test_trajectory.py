@@ -121,6 +121,54 @@ def test_token_trace_cannot_claim_full_snapshot_extraction(series, tmp_path):
         )
 
 
+def _score_series(root):
+    _token_series(root)
+    for path in root.glob("dp*/series.json"):
+        data = json.loads(path.read_text())
+        data.update(
+            content="scores", seed_rounds=1, consecutive_required=True, real_input_rounds=[2], real_input_groups=[1]
+        )
+        _write(path, data)
+        for entry in data["rounds"]:
+            for group in entry["groups"]:
+                manifest_path = path.parent / group["manifest"]
+                manifest = json.loads(manifest_path.read_text())
+                real = entry["round_index"] == 2 and group["group"] == 1
+                manifest.update(
+                    schema_version=4,
+                    kind="kvaf_decode_score_trace",
+                    content="scores",
+                    real_inputs_saved=real,
+                    validation={"passed": True, "kind": "score_trace_integrity"},
+                )
+                manifest["metadata"]["capture_real_inputs"] = real
+                _write(manifest_path, manifest)
+
+
+def test_scores_require_seed_and_sampled_real_inputs(series, capsys):
+    _score_series(series)
+    reports = inspect_series(series, expected_content="scores")
+    assert all(r["analysis_rounds"] == 1 and r["real_input_snapshots"] == 1 for r in reports)
+    main(["--root", str(series), "--expect-content", "scores"])
+    assert "seed_rounds=1 analysis_rounds=1 real_input_snapshots=1" in capsys.readouterr().out
+    path = series / "dp0/round0002/group001/manifest.json"
+    data = json.loads(path.read_text())
+    data["real_inputs_saved"] = False
+    _write(path, data)
+    with pytest.raises(ValueError, match="contract differs"):
+        inspect_series(series)
+
+
+def test_scores_reject_missing_consecutive_predecessor(series):
+    _score_series(series)
+    path = series / "dp0/series.json"
+    data = json.loads(path.read_text())
+    data["rounds"][1]["scheduler_round"] += 1
+    _write(path, data)
+    with pytest.raises(ValueError, match="consecutive captured predecessor"):
+        inspect_series(series)
+
+
 @pytest.mark.parametrize(
     "change",
     [

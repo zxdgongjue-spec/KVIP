@@ -302,18 +302,29 @@ def trace_summary(archive):
 def load_token_trace(directory, *, verify=True):
     directory = Path(directory).resolve()
     manifest = json.loads((directory / "manifest.json").read_text())
+    from kvip.diagnostics import score_trace
+
+    scores = manifest.get("content") == "scores"
+    expected_schema = score_trace.SCHEMA_VERSION if scores else SCHEMA_VERSION
+    expected_kind = score_trace.KIND if scores else KIND
+    validation_kind = "score_trace_integrity" if scores else "token_id_integrity"
     if (
-        manifest.get("schema_version") != SCHEMA_VERSION
-        or manifest.get("kind") != KIND
-        or manifest.get("content") != "token_ids"
+        manifest.get("schema_version") != expected_schema
+        or manifest.get("kind") != expected_kind
+        or manifest.get("content") not in ("token_ids", "scores")
         or manifest.get("status") != "complete"
     ):
-        raise ValueError("A complete schema-3 token-ID trace is required")
+        raise ValueError("A complete schema-3 token-ID or schema-4 score trace is required")
     if (
         manifest.get("validation", {}).get("passed") is not True
-        or manifest["validation"].get("kind") != "token_id_integrity"
+        or manifest["validation"].get("kind") != validation_kind
     ):
-        raise ValueError("Token trace requires its distinct ID-integrity validation marker")
+        raise ValueError("Token trace requires its distinct ID-integrity/score validation marker")
+    expected_arrays = set(_ARRAYS)
+    if scores:
+        expected_arrays |= score_trace.SCORE_ARRAYS
+        if manifest.get("real_inputs_saved"):
+            expected_arrays |= score_trace.REAL_ARRAYS
     if _metadata(manifest["metadata"]) != manifest["metadata"]:
         raise ValueError("Token trace metadata contains forbidden native-address fields")
     description = manifest["archive"]
@@ -321,7 +332,7 @@ def load_token_trace(directory, *, verify=True):
     if verify and file_digest(path) != description["sha256"]:
         raise ValueError("Token trace archive checksum differs")
     with np.load(path, allow_pickle=False) as source:
-        if set(source.files) != _ARRAYS or set(manifest["arrays"]) != _ARRAYS:
+        if set(source.files) != expected_arrays or set(manifest["arrays"]) != expected_arrays:
             raise ValueError("Token trace contains missing or forbidden arrays")
         arrays = {name: source[name] for name in source.files}
     for name, value in arrays.items():
@@ -331,6 +342,8 @@ def load_token_trace(directory, *, verify=True):
     archive = TokenIdTrace(directory, manifest, arrays)
     _validate_pre(archive)
     _validate_post(archive)
+    if scores:
+        score_trace.validate_scores(archive)
     if trace_summary(archive) != manifest["summary"]:
         raise ValueError("Token trace summary differs from its actual IDs")
     return archive
@@ -344,6 +357,12 @@ class TokenIdTraceRecorder:
         self.metadata = _metadata(metadata)
         self.started, self.completed, self.result_path = False, False, None
         self._addresses = None
+        self._score_capture = None
+        self.content = self.metadata.get("content", "token_ids")
+        if self.content not in ("token_ids", "scores"):
+            raise ValueError("Trace content must be token_ids or scores")
+        if self.content != "scores" and self.metadata.get("capture_real_inputs", False):
+            raise ValueError("Real LI samples require explicit scores content")
 
     def before(self, selector):
         try:
@@ -434,6 +453,14 @@ class TokenIdTraceRecorder:
                 "post.read_counts": ["prefetch", "final", "bytes"],
             },
         )
+        if self.content == "scores":
+            from kvip.diagnostics.score_trace import KIND as SCORE_KIND, SCHEMA_VERSION as SCORE_SCHEMA
+
+            self.manifest.update(schema_version=SCORE_SCHEMA, kind=SCORE_KIND, content="scores")
+            self.manifest["validation_scope"] += " Includes actual score ranking and native threshold observations."
+            self.manifest["replay_scope"] = (
+                "Saved actual sortable BF16 scores; optional sparse real LI inputs. KV payloads are not saved."
+            )
         self.archive = TokenIdTrace(self.directory, self.manifest, arrays)
         _validate_pre(self.archive, page_slots=False)
         # Verify the available bits really refer to complete, contiguous logical
@@ -465,6 +492,11 @@ class TokenIdTraceRecorder:
             page_slots[row, present] = _i32(offsets // slot_bytes)
         arrays["pre.ddr_page_slots"] = page_slots
         _validate_pre(self.archive)
+        if self.content == "scores":
+            from kvip.diagnostics.score_trace import ScoreCapture
+
+            self._score_capture = ScoreCapture(self.torch, rotating)
+            self._score_capture.before(selector, self.archive)
 
     def after(self, selector):
         if not self.started or self.completed:
@@ -518,14 +550,18 @@ class TokenIdTraceRecorder:
             counts = cpu_array(self.torch, rotating.ubmem_status)
             a["post.read_counts"] = np.ascontiguousarray(counts[:, [1, 3, 5]], dtype=np.int64)
             _validate_post(self.archive)
+            if self._score_capture is not None:
+                self._score_capture.after(self.archive, rows, mapping)
             self.manifest["summary"] = trace_summary(self.archive)
             self.manifest["validation"] = dict(
-                passed=True, kind="token_id_integrity", scope=self.manifest["validation_scope"]
+                passed=True,
+                kind="score_trace_integrity" if self.content == "scores" else "token_id_integrity",
+                scope=self.manifest["validation_scope"],
             )
             self.manifest["arrays"] = {
                 name: dict(dtype=value.dtype.name, shape=list(value.shape)) for name, value in a.items()
             }
-            path = self.directory / "token_ids.npz"
+            path = self.directory / ("scores.npz" if self.content == "scores" else "token_ids.npz")
             with path.open("xb") as output:
                 np.savez_compressed(output, **a)
                 output.flush()
@@ -545,3 +581,5 @@ class TokenIdTraceRecorder:
         finally:
             # No address table survives a completed or failed after() call.
             self._addresses = None
+            if self._score_capture is not None:
+                self._score_capture.disarm()
