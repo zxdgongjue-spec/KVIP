@@ -246,13 +246,13 @@ def main():
     )
     args = parser.parse_args()
 
+    torch.npu.set_device(args.device)
     soc = acl.get_soc_name()
     if "950" not in soc:
         raise RuntimeError(
             f"This test is scoped to Ascend A5/950; detected SoC={soc!r}"
         )
 
-    torch.npu.set_device(args.device)
     device = torch.device(f"npu:{args.device}")
     inputs = QueryInputs(
         torch,
