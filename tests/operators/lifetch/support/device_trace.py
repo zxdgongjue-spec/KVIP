@@ -61,7 +61,7 @@ def union(intervals):
     return merged
 
 
-def account(events, name, elapsed, *, full=False):
+def account(events, name, elapsed, *, full=False, fused_final=False):
     scopes = [e for e in events if e.get("name") == name and e.get("ph") == "X"]
     if len(scopes) != 1:
         return dict(error=f"Expected one CPU replay scope, found {len(scopes)}")
@@ -76,7 +76,9 @@ def account(events, name, elapsed, *, full=False):
         # This kernel contains both resolver and index update; reporting separate
         # kernel durations would invent a boundary that does not exist.
         kernels = dict(init="v9_init_kernel", li="v9_li_kernel",
-                       resolve_update="v9_streaming_resolve_update", fetch="v9_fetch_update_kernel")
+                       resolve_update="v9_streaming_resolve_update")
+        if not fused_final:
+            kernels["fetch"] = "v9_fetch_update_kernel"
     if any(e.get("name", "").lower().startswith("v9_early_fetch_kernel") for e in events):
         kernels["early_fetch"] = "v9_early_fetch_kernel"
     groups = {stage: [] for stage in kernels}
@@ -136,7 +138,7 @@ def decode_final_detail(owner_words, status_words):
     return detail
 
 
-def collect_core(torch, rotating, graph, reset, verify, rounds, folder, *, full=False, diagnostics=None):
+def collect_core(torch, rotating, graph, reset, verify, rounds, folder, *, full=False, diagnostics=None, fused_final=False):
     """Profile the existing core graph separately from primary timing."""
     import torch_npu
     from torch.profiler import record_function
@@ -188,7 +190,7 @@ def collect_core(torch, rotating, graph, reset, verify, rounds, folder, *, full=
     trace = json.loads(path.read_text())
     events = trace["traceEvents"] if isinstance(trace, dict) else trace
     for sample in samples:
-        sample["accounting"] = account(events, sample["name"], sample["us"], full=full)
+        sample["accounting"] = account(events, sample["name"], sample["us"], full=full, fused_final=fused_final)
     result = dict(samples=samples, trace=str(path))
     (folder / f"{label}_attribution.json").write_text(json.dumps(result, indent=2))
     (folder / f"{label}_summary.log").write_text(core_summary(result, label=label) + "\n")

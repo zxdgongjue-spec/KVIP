@@ -9,7 +9,7 @@ import numpy as np
 
 
 class StreamingForward:
-    def __init__(self, rotating, update, torch, prefetch_limit):
+    def __init__(self, rotating, update, torch, prefetch_limit, *, fused_final=False):
         self.rotating, self.update, self.torch = rotating, update, torch
         shape = rotating.runtime_shape
         self.batch, self.history, self.resident = shape.batch, shape.history, shape.resident
@@ -19,12 +19,13 @@ class StreamingForward:
             raise ValueError('streaming experiment supports at most 512 prefetches per request')
         keys, scales, addresses, logical = update.storage[:4]
         b, device = self.batch, rotating.device
-        self.flags = torch.zeros((b, 5, 32), dtype=torch.int32, device=device)
+        self.fused_final = fused_final
+        self.flags = torch.zeros((b, 7 if fused_final else 5, 32), dtype=torch.int32, device=device)
         self.events_src = torch.empty((b, 512 + 8192), dtype=torch.int32, device=device)
         self.events_dst = torch.empty_like(self.events_src)
         self.worker_status = torch.zeros((b, 32), dtype=torch.int32, device=device)
         # First 64 words/request are resolver/update, then 16 words per Q.
-        self.times = torch.zeros((b * 128,), dtype=torch.int64, device=device)
+        self.times = torch.zeros((b * (224 if fused_final else 128),), dtype=torch.int64, device=device)
         self.query_bitmaps = torch.empty((b, 4, 512), dtype=torch.int32, device=device)
         self.query_errors = torch.zeros((b, 4, 32), dtype=torch.int32, device=device)
         pointers = [rotating.context.data_ptr(), keys.data_ptr(), scales.data_ptr(), addresses.data_ptr(),
@@ -68,7 +69,9 @@ class StreamingForward:
     def diagnostic_cycles(self):
         raw = self.times.cpu().numpy().astype(np.uint64)
         rows = raw[:self.batch * 64].reshape(self.batch, 64)
-        li = raw[self.batch * 64:].reshape(self.batch, 4, 16)
+        li = raw[self.batch * 64:self.batch * 128].reshape(self.batch, 4, 16)
+        fetch = raw[self.batch * 128:].reshape(self.batch, 96) if self.fused_final else None
+        flags = self.flags.cpu().numpy()
         result = []
         for b in range(self.batch):
             p, u = rows[b, :32], rows[b, 32:]
@@ -91,7 +94,23 @@ class StreamingForward:
                                      pack=int(t[3]-t[2]), publish=int(t[4]-t[3])))
             update = [int(u[13+2*q]-u[12+2*q]) for q in range(5)]
             waits = [int(u[12]-u[10])] + [int(u[12+2*q]-u[11+2*q]) for q in range(1, 5)]
-            result.append(dict(batch=b, li=queries, producer=producer, update=update,
+            fetch_detail = None
+            if fetch is not None:
+                f = fetch[b]
+                fetch_detail = dict(queries=[dict(wait=int(f[q*10+1]-f[q*10]),
+                    prepare=int(f[q*10+2]-f[q*10+1]), safe_get=int(f[q*10+4]-f[q*10+3]),
+                    prefetch_join=int(f[q*10+6]-f[q*10+5]) if f[q*10+5] else 0,
+                    conflict_get=int(f[q*10+8]-f[q*10+7]),
+                    safe_post=int(f[64+q*6]), safe_cq_wait=int(f[65+q*6]),
+                    conflict_post=int(f[66+q*6]), conflict_cq_wait=int(f[67+q*6]),
+                    safe_groups=int(f[68+q*6]), conflict_groups=int(f[69+q*6]),
+                    total=int(f[q*10+9]-f[q*10])) for q in range(4)],
+                    final_prefetch_join=int(f[50]-f[49]), wait_producer_update=int(f[51]-f[50]),
+                    collect=int(f[52]-f[51]), residency=int(f[53]-f[52]),
+                    write_status=int(f[54]-f[53]), span=int(f[54]-f[48]))
+            counts = [int(flags[b, phase, 1]) for phase in range(5)]
+            result.append(dict(batch=b, li=queries, producer=producer, update=update, fetch=fetch_detail,
+                               prefetch_changes=counts[0], q_new_misses=counts[1:],
                                update_wait=waits,
                                input_and_bitmap=int(p[2]-p[1]), initialize=int(p[3]-p[2]),
                                metadata=int(u[23]-u[22]), consumer_start=int(u[10]),

@@ -153,3 +153,16 @@ def test_worker_comparison_summary_checks_all_geometries(tmp_path):
     assert '1 | 1 | 2 | 11.000 | 400.000 | 450.000 | 5..7' in summary
     assert '16 | 4 | 8 | 11.000 | 400.000 | 450.000 | 5..7' in summary
     assert len([line for line in summary.splitlines() if ' | ' in line]) == 16
+
+
+def test_streaming_fused_trace_requires_the_expected_kernel_set():
+    from device_trace import account
+    events = [dict(name="replay", ph="X", ts="0", dur=100)]
+    for name, start, duration in (("v9_init_kernel_0", 0, 2),
+                                  ("v9_li_kernel_0", 2, 10),
+                                  ("v9_streaming_resolve_update_0", 12, 15)):
+        events.append(dict(name=name, ph="X", cat="kernel", ts=str(start), dur=duration))
+    fused = account(events, "replay", 27, full=True, fused_final=True)
+    assert fused["stages_us"] == {"init": 2, "li": 10, "resolve_update": 15}
+    baseline = account(events, "replay", 27, full=True)
+    assert baseline["found"]["fetch"] == 0 and "error" in baseline

@@ -31,7 +31,7 @@ def seed_native_bitmap(torch, native, row, bitmap):
 
 def run(args, run_dir):
     suffix = ("_early" if args.early_fetch else "") + ("_safe" if args.avoid_prefetch_slots else "")
-    source = (SOURCE.with_name(SOURCE.name + ("_streaming_fetch" if args.streaming_fetch else "_streaming"))
+    source = (SOURCE.with_name(SOURCE.name + ("_streaming_fused" if args.fused_final else ("_streaming_fetch" if args.streaming_fetch else "_streaming")))
               if args.streaming else (SOURCE.with_name(SOURCE.name + suffix) if suffix else SOURCE))
     from attention import check_sfa
     from contract_payload import payload
@@ -363,7 +363,8 @@ def run_device(
                     pipeline.times.zero_()
             try:
                 full_trace.update(collect_core(torch, rotating, graph, trace_reset, check, args.trace_rounds, folder,
-                                               full=True, diagnostics=pipeline.diagnostic_cycles if args.streaming else None))
+                                               full=True, diagnostics=pipeline.diagnostic_cycles if args.streaming else None,
+                                               fused_final=args.fused_final))
             finally:
                 if args.streaming:
                     pipeline.set_diagnostics(False)
@@ -417,7 +418,7 @@ def run_device(
     )
     if args.streaming:
         from streaming_forward import StreamingForward
-        pipeline = StreamingForward(rotating, update, torch, args.prefetch_tokens)
+        pipeline = StreamingForward(rotating, update, torch, args.prefetch_tokens, fused_final=args.fused_final)
     else:
         pipeline = LIFetchForward(rotating, update)
     saved = [arguments[i].clone() for i in (1, 4, 13)]
