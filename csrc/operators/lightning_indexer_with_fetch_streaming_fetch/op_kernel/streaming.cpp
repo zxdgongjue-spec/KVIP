@@ -124,12 +124,12 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
   }
   if(profile)ticks[12+q*5]=GetSystemCycle();
   if(!error){
-   Simt::VF_CALL<PackStagedUrmaQuery>(Simt::Dim3{512,1,1},shape.history,shape.resident,shape.tokenBytes,b,row->slots,total-added,added,ctx,
+   Simt::VF_CALL<PackStagedUrmaQuery>(Simt::Dim3{512,1,1},shape.history,shape.resident,shape.tokenBytes,b,q,row->slots,total-added,added,ctx,
     FinalPtr(selected),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(ctl));
    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);error=ctl.GetValue(1);
-   if(!error)SyncFetchDescriptors(ctx,b*kSlots+total-added,added);
+   if(!error)SyncFetchDescriptors(ctx,b*kSlots+q*kTop,added);
    PrepareFinalFetch(shape.finalWorkers,shape.finalPostOffset,ctx,b,q,error?0:ctl.GetValue(16),
-      b*kSlots+total-added,error,error?0:ctl.GetValue(17));
+      b*kSlots+q*kTop,error,error?0:ctl.GetValue(17));
   }
   if(profile)ticks[13+q*5]=GetSystemCycle();
   if(!error) Simt::VF_CALL<PublishQ>(Simt::Dim3{512,1,1},FinalPtr(selected),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),

@@ -292,6 +292,34 @@ extern "C" __global__ __aicore__ void v9_resolve_kernel(GM_ADDR bindings) {
 #endif
 }
 // Final transport consumes compact resolver ranges through native KVAF.
+
+#if defined(__CCE_AICORE__)
+// Streaming descriptors occupy one fixed 2048-entry region per Q. Publish
+// residency from those ranges rather than treating them as a compact prefix.
+__simt_vf__ __aicore__ LAUNCH_BOUND(256)
+inline void PublishStreamingResidency(uint32_t resident,uint32_t postOffset,__gm__ Context* ctx,uint32_t b) {
+    if(!ctx->hotValid)return;
+    auto valid=reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+OwnerRow(ctx,b)*resident;
+    auto destinations=reinterpret_cast<__gm__ int32_t*>(ctx->destinations);
+    uint32_t ownerBase=OwnerRow(ctx,b)*OutputStride(resident,ctx);
+    for(uint32_t q=0;q<4;++q){
+        auto post=reinterpret_cast<__gm__ FinalPost*>(ctx->owners+postOffset)+b*4+q;
+        uint32_t count=asc_ldcg(&post->count),begin=asc_ldcg(&post->descriptor);
+        for(uint32_t i=threadIdx.x;i<count;i+=256){
+            uint32_t slot=uint32_t(asc_ldcg(destinations+begin+i))-ownerBase;
+            if(slot<resident)asc_stcg(valid+slot,uint32_t(1));
+        }
+    }
+    if(ctx->changes && ctx->lruSlots){
+        auto changes=reinterpret_cast<__gm__ int32_t*>(ctx->changes)+b*kChangeCapacity;
+        auto lru=reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots;
+        for(uint32_t i=threadIdx.x;i<kLruSlots;i+=256)
+            if(asc_ldcg(changes+i)>=0)asc_stcg(valid+asc_ldcg(lru+i),uint32_t(1));
+    }
+    asc_threadfence();
+}
+#endif
+
 // Submit disjoint destinations first; join prefetch before overwriting its slots.
 #if defined(__CCE_AICORE__)
 __aicore__ inline void FinishFetch(GM_ADDR bindings, GM_ADDR update) {
@@ -313,7 +341,7 @@ __aicore__ inline void FinishFetch(GM_ADDR bindings, GM_ADDR update) {
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status+b),sizeof(uint32_t));
         updateError=status[b];
         if(!updateError)
-            Simt::VF_CALL<PublishDestinationResidency>(Simt::Dim3{256,1,1},rt_resident,ctx,b,info[1]);
+            Simt::VF_CALL<PublishStreamingResidency>(Simt::Dim3{256,1,1},rt_resident,rt_finalPostOffset,ctx,b);
     }
     auto args=GetArgs(ctx,b*2);
     args.core_status=ctx->finalStatus+b*2*sizeof(KvafBatchGetCoreStatus);

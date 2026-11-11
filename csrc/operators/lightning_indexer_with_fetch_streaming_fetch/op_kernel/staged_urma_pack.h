@@ -54,7 +54,7 @@ inline void PackStagedUrma(uint32_t history, uint32_t resident, uint32_t tokenBy
 
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
 inline void PackStagedUrmaQuery(uint32_t history, uint32_t resident, uint32_t tokenBytes,
-    uint32_t batch, uint32_t used, uint32_t rangeBegin, uint32_t count,
+    uint32_t batch, uint32_t query, uint32_t used, uint32_t rangeBegin, uint32_t count,
     __gm__ Context* ctx, __ubuf__ uint32_t* selected, __ubuf__ uint16_t* ids,
     __ubuf__ uint32_t* slots, __ubuf__ uint32_t* ctl) {
     uint32_t tid=threadIdx.x;
@@ -83,7 +83,7 @@ inline void PackStagedUrmaQuery(uint32_t history, uint32_t resident, uint32_t to
             int32_t ordinal=asc_ldcg(reserved+slot);
             bool conflict=ordinal>=0 && uint32_t(ordinal)<used;
             uint32_t position=conflict?safeCount+conflictBefore++:safeBefore++;
-            uint32_t output=batch*kSlots+begin+position;
+            uint32_t output=batch*kSlots+query*kTop+position;
             uint32_t token=selected[ids[rank]];
             if(token>=history){asc_atomic_or(ctl+1,1U);continue;}
             StoreFallbackSource(history,tokenBytes,ctx,batch,output,token,asc_ldcg(addresses+token),blocks,offsets);

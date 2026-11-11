@@ -219,10 +219,9 @@ inline void StagedQuery(uint32_t query,uint32_t history,uint32_t resident,uint32
             uint32_t rank=oldCount+i, token=selected[ids[rank]], slot=slots[rank];
             int32_t ordinal=asc_ldcg(reserved+slot);
             uint32_t record=ordinal>=0?uint32_t(ordinal):kLruSlots+rank;
-            uint32_t dst=batch*kSlots+rank;
+            // PackStagedUrmaQuery publishes the per-Q transport descriptors.
+            // Do not write the shared compact descriptor arrays here.
             asc_stcg(changeSlots+record,slot);asc_stcg(changes+record,token);
-            StoreFallbackSource(history,bytes,ctx,batch,dst,token,asc_ldcg(addresses+token),blocks,offsets);
-            asc_stcg(destinations+dst,int32_t(owner*stride+slot));
         }
         asc_threadfence();asc_syncthreads();
         if(!tid){ctl[0]=oldCount+added;ctl[2+query]=added;
