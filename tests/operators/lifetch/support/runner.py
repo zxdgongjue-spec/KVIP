@@ -116,6 +116,9 @@ def supervise(command, run, heartbeat_seconds=20, timeout_seconds=300):
                 data = json.loads(audit.read_text())
                 compact = {key: data[key] for key in ("batch", "mismatch_positions", "posts")}
                 compact["examples"] = data.get("examples", [])[:3]
+                for key in ("actual_sq_writers", "initial_output_matches", "sq_audit_error"):
+                    if key in data:
+                        compact[key] = data[key]
                 lines.append(f"STREAMING FETCH KV AUDIT: {json.dumps(compact)}; details={audit}")
             except (OSError, ValueError, KeyError) as error:
                 lines.append(f"Could not read streaming fetch audit {audit}: {error}")

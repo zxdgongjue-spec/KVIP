@@ -535,6 +535,17 @@ def run_device(
                         rotating.fallback_addresses.cpu().numpy(), posts[row], lru,
                         rotating.mapping[row].cpu().numpy(), owner.output.shape[1], r,
                         owner.remote_token_addresses[row].cpu().numpy())
+                    report["initial_output_matches"] = [
+                        bool(torch.equal(owner.initial_output[row, item["slot"]].cpu(),
+                                         owner.session.cpu_payload[row, item["expected_token"]]))
+                        for item in report["examples"]
+                    ]
+                    try:
+                        from streaming_fetch_diagnostics import audit_queue_writes
+                        report["actual_sq_writers"] = audit_queue_writes(
+                            owner, rows, posts, row, [item["slot"] for item in report["examples"]])
+                    except Exception as exc:
+                        report["sq_audit_error"] = f"{type(exc).__name__}: {exc}"
                     report_path = folder / "streaming_fetch_kv_mismatch.json"
                     report_path.write_text(json.dumps(report, indent=2) + "\n")
                     print(f"STREAMING FETCH KV AUDIT: {json.dumps(report)}; details={report_path}", flush=True)
