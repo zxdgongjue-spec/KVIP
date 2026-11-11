@@ -23,6 +23,7 @@ def arguments(argv=None):
     p.add_argument("--worker-run", type=Path, help=argparse.SUPPRESS)
     p.add_argument("--early-fetch", action="store_true")
     p.add_argument("--streaming", action="store_true", help="experimental LI/Resolver/Index streaming path")
+    p.add_argument("--streaming-fetch", action="store_true", help="submit each Q during streaming resolver")
     p.add_argument("--final-workers", type=int, choices=(1, 2, 4), default=None)
     p.add_argument("--avoid-prefetch-slots", action="store_true")
     p.add_argument("--timeout-seconds", type=int, default=300)
@@ -47,6 +48,8 @@ def arguments(argv=None):
     p.add_argument("--comparison-sfa", type=Path)
     p.add_argument("--output", type=Path, default=ROOT / "tests/results/lifetch")
     a = p.parse_args(argv)
+    if a.streaming_fetch and not a.streaming:
+        p.error("--streaming-fetch requires --streaming")
     if a.streaming and (a.early_fetch or a.avoid_prefetch_slots or a.runtime_shapes or a.resolver_compare):
         p.error("--streaming cannot be combined with early-fetch, avoid-prefetch-slots, runtime-shapes, or resolver-compare")
     if a.kvaf_root is None:
@@ -142,6 +145,7 @@ def main(argv=None):
     p.add_argument('--transport', required=True, choices=('urma', 'ubmem'))
     p.add_argument('--early-fetch', action='store_true')
     p.add_argument('--streaming', action='store_true')
+    p.add_argument('--streaming-fetch', action='store_true')
     p.add_argument('--final-workers', type=int, choices=(1, 2, 4))
     p.add_argument('--avoid-prefetch-slots', action='store_true')
     p.add_argument('--device', type=int, default=0)
@@ -197,6 +201,8 @@ def main(argv=None):
             command.append('--early-fetch')
         if a.streaming:
             command.append('--streaming')
+        if a.streaming_fetch:
+            command.append('--streaming-fetch')
         if a.avoid_prefetch_slots:
             command.append('--avoid-prefetch-slots')
         if a.soc:
@@ -212,7 +218,7 @@ def main(argv=None):
         return subprocess.call(command)
     if a.final_workers is not None:
         p.error('--final-workers is supported only by URMA')
-    if a.early_fetch or a.avoid_prefetch_slots or a.streaming:
+    if a.early_fetch or a.avoid_prefetch_slots or a.streaming or a.streaming_fetch:
         p.error('--early-fetch and --avoid-prefetch-slots are supported only by URMA')
     if a.intermediate_fetches != 8:
         p.error('UBmem fixture currently supports exactly 8 windows')
