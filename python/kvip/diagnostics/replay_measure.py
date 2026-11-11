@@ -445,6 +445,8 @@ def measure_case(args, archive, context, retained):
         transport=args.transport,
         mode=args.mode,
         snapshot=str(archive.directory),
+        content=archive.manifest.get("content", "full"),
+        input_validation=archive.manifest.get("oracle", {}),
         snapshot_sha256=file_digest(archive.directory / "manifest.json"),
         replay_selection=archive.manifest.get("replay_selection"),
         scope="Query_Index_ready_to_LI_TopK_Fetch_cache_state_and_TND_slot_outputs",
@@ -469,7 +471,9 @@ def measure_case(args, archive, context, retained):
         selection_comparison=bundle.selection_comparison,
         demand_accounting=DEMAND_ACCOUNTING,
         representation=(
-            "Native logical paged Index and LIDU maps reconstructed outside timing; original serial map allocation padding was not captured."
+            archive.manifest["fidelity"]
+            if archive.manifest.get("content") == "synthetic_token_replay"
+            else "Native logical paged Index and LIDU maps reconstructed outside timing; original serial map allocation padding was not captured."
             if args.mode == "serial"
             else "Original hot-first Index, KV bytes, packed inputs and relative DDR addresses restored."
         ),

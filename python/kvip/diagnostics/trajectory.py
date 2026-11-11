@@ -9,13 +9,14 @@ from pathlib import Path
 from kvip.diagnostics.archive import TensorArchive, checked_path, load_snapshot
 
 
-def inspect_series(root, *, expected_dp=None, expected_rounds=None, expected_layers=None):
+def inspect_series(root, *, expected_dp=None, expected_rounds=None, expected_layers=None, expected_content=None):
     """Check every manifest, without rereading terabytes of saved tensor payloads."""
     root = Path(root)
     paths = sorted(root.glob("dp[0-9]*/series.json"))
     if not paths:
         raise ValueError(f"No DP series manifests found under {root}")
     reports, ranks, expected_ranks = [], set(), None
+    contents = set()
     for path in paths:
         series = json.loads(path.read_text())
         rank = series.get("dp_rank")
@@ -30,6 +31,10 @@ def inspect_series(root, *, expected_dp=None, expected_rounds=None, expected_lay
         ):
             raise ValueError(f"Invalid DP series identity: {path}")
         ranks.add(rank)
+        content = series.get("content", "full")
+        contents.add(content)
+        if content not in ("full", "token_ids") or (expected_content is not None and content != expected_content):
+            raise ValueError(f"DP{rank} content is {content}, expected {expected_content}")
         configured = set(series["dp_ranks"])
         if expected_ranks is not None and configured != expected_ranks:
             raise ValueError("DP series disagree about the selected ranks")
@@ -76,10 +81,26 @@ def inspect_series(root, *, expected_dp=None, expected_rounds=None, expected_lay
                 context = source.get("context", {})
                 requests = source.get("requests", [])
                 signature = [{"request_id": item["request_id"], "owner": item["owner"]} for item in requests]
+                if content == "token_ids":
+                    valid_record = (
+                        manifest.get("schema_version") == 3
+                        and manifest.get("kind") == "kvaf_decode_token_trace"
+                        and manifest.get("content") == "token_ids"
+                        and manifest.get("validation", {}).get("passed") is True
+                        and manifest.get("validation", {}).get("kind") == "token_id_integrity"
+                    )
+                    archive = manifest.get("archive", {})
+                    token_file = checked_path(snapshot_path.parent, archive.get("file", ""))
+                    valid_record = (
+                        valid_record and token_file.is_file() and token_file.stat().st_size == archive.get("bytes")
+                    )
+                else:
+                    valid_record = (
+                        manifest.get("schema_version") in (1, 2) and manifest.get("oracle", {}).get("passed") is True
+                    )
                 if (
-                    manifest.get("schema_version") not in (1, 2)
+                    not valid_record
                     or manifest.get("status") != "complete"
-                    or manifest.get("oracle", {}).get("passed") is not True
                     or source.get("dp_rank") != rank
                     or source.get("group") != group
                     or source.get("layer_names") != groups[group]
@@ -103,11 +124,14 @@ def inspect_series(root, *, expected_dp=None, expected_rounds=None, expected_lay
                 snapshots=total * len(groups),
                 batch=series["batch"],
                 queries=series["queries"],
+                content=content,
                 scheduler_rounds=[entry["scheduler_round"] for entry in rounds],
             )
         )
     if ranks != expected_ranks or expected_dp is not None and ranks != set(expected_dp):
         raise ValueError(f"Missing/unexpected DP series: found {sorted(ranks)}, configured {sorted(expected_ranks)}")
+    if len(contents) != 1:
+        raise ValueError("DP series disagree about capture content")
     if len({tuple(report["scheduler_rounds"]) for report in reports}) != 1:
         raise ValueError("Selected DPs did not capture the same coordinated scheduler rounds")
     return reports
@@ -148,6 +172,7 @@ def main(argv=None):
     parser.add_argument("--expect-dp", type=int, nargs="+")
     parser.add_argument("--expect-rounds", type=int)
     parser.add_argument("--expect-layers", type=int)
+    parser.add_argument("--expect-content", choices=("full", "token_ids"))
     parser.add_argument("--extract", type=Path, help="Expand one snapshot to a new standalone directory")
     parser.add_argument("--dp-rank", type=int)
     parser.add_argument("--round", dest="round_index", type=int)
@@ -164,14 +189,18 @@ def main(argv=None):
             expected_dp=args.expect_dp,
             expected_rounds=args.expect_rounds,
             expected_layers=args.expect_layers,
+            expected_content=args.expect_content,
         )
         for report in reports:
             print(
                 f"TRACE_DP_PASS dp={report['dp_rank']} batch={report['batch']} queries={report['queries']} "
                 f"rounds={report['rounds']} layers={report['layers']} groups={report['groups']} "
-                f"snapshots={report['snapshots']} all_pure_decode=true"
+                f"snapshots={report['snapshots']} content={report['content']} all_pure_decode=true"
             )
-        print("TRACE_SERIES_PASS coverage=all_target_layers payload_check=at_capture_and_replay")
+        if reports[0]["content"] == "token_ids":
+            print("TRACE_SERIES_PASS coverage=all_target_layers content=token_ids real_payload=not_collected")
+        else:
+            print("TRACE_SERIES_PASS coverage=all_target_layers payload_check=at_capture_and_replay")
         if args.extract is not None:
             if args.dp_rank not in [report["dp_rank"] for report in reports] or args.round_index < 1:
                 raise ValueError("Extraction DP/round is outside the captured series")
@@ -184,6 +213,11 @@ def main(argv=None):
             if len(groups) != 1:
                 raise ValueError("Extraction group is outside the captured series")
             source = checked_path(series_path.parent, groups[0]["manifest"]).parent
+            if series.get("content") == "token_ids":
+                raise ValueError(
+                    "Use python3 -m kvip.diagnostics.token_replay with the selected token trace directory "
+                    f"to construct standalone operator inputs: {source}"
+                )
             materialize_snapshot(source, args.extract)
             print(f"TRACE_EXTRACT_PASS snapshot={args.extract}")
     except (OSError, ValueError, KeyError, TypeError) as error:

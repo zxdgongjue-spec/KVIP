@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 
 from kvip.diagnostics.demand import DEMAND_ACCOUNTING
-from kvip.diagnostics.console import compact_report, failure_tail, print_admission, report_only
+from kvip.diagnostics.console import compact_report, emit, failure_tail, print_admission, report_only
 from kvip.diagnostics.prefetch_admission import ADMISSION_ACCOUNTING, mean_admission
 
 CASES = (("ubmem", "serial"), ("urma", "serial"), ("ubmem", "fused"), ("urma", "fused"))
@@ -215,6 +215,8 @@ def summarize(results):
         for key in ("snapshot_sha256", "geometry", "scope", "soc", "device", "kvip_commit"):
             if result.get(key) != first.get(key) or key not in result:
                 raise ValueError(f"Incomparable {key}: {name}")
+        if result.get("content", "full") != first.get("content", "full"):
+            raise ValueError(f"Incomparable content: {name}")
         identity = f"{result['transport']}-{result['mode']}"
         candidate = f"urma-serial-workers{result['runtime_workers']}"
         if name != identity and not (identity == "urma-serial" and name == candidate):
@@ -329,6 +331,9 @@ def summarize(results):
     return dict(
         status="pass",
         snapshot_sha256=first["snapshot_sha256"],
+        content=first.get("content", "full"),
+        fidelity=first.get("fidelity", first.get("representation")),
+        input_validation=first.get("input_validation"),
         geometry=first["geometry"],
         scope=first["scope"],
         table=table,
@@ -556,6 +561,8 @@ def main():
         results[name] = case_result
         print(f"CASE_PASS {name}: mean={results[name]['timing']['mean_us']:.3f} us", flush=True)
     summary = summarize(results)
+    if summary.get("content") == "synthetic_token_replay":
+        emit("CONTENT synthetic_token_replay: generated scores/KV bytes; not real-model timing")
     (args.result_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     if args.quiet:
         compact_report(summary, path=args.result_dir / "summary.json")

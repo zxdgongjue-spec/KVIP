@@ -199,6 +199,8 @@ def inspect_snapshot(archive):
     source["kvip_commit"] = archive.manifest.get("provenance", {}).get("kvip_commit", "unknown")
     return dict(
         status="verified_snapshot",
+        content=archive.manifest.get("content", "full"),
+        native_validated=archive.manifest.get("oracle", {}).get("native_validated", True),
         geometry=geometry,
         query_ends=ends.tolist(),
         row_owners=owners.tolist(),
@@ -250,6 +252,8 @@ def main():
             archive = load_snapshot(args.snapshot)
             inspected = inspect_snapshot(archive)
             emit("SNAPSHOT_CHECK_PASS")
+            if inspected.get("content") == "synthetic_token_replay":
+                emit("CONTENT synthetic_token_replay: generated scores/KV bytes; not real-model timing")
             matrix = args.ubmem_ablation or args.service_ablation or args.fused_variants is not None
             if not args.inspect and not matrix:
                 emit(f"CASE_BEGIN {args.transport}-{args.mode}")

@@ -67,6 +67,60 @@ def test_two_dp_all_layer_complete_trace_summary(series, capsys):
     assert capsys.readouterr().out.count("TRACE_DP_PASS") == 2
 
 
+def _token_series(root):
+    for series_path in root.glob("dp*/series.json"):
+        data = json.loads(series_path.read_text())
+        data["content"] = "token_ids"
+        _write(series_path, data)
+        for entry in data["rounds"]:
+            for group in entry["groups"]:
+                path = series_path.parent / group["manifest"]
+                manifest = json.loads(path.read_text())
+                manifest.pop("oracle")
+                manifest.update(
+                    schema_version=3,
+                    kind="kvaf_decode_token_trace",
+                    content="token_ids",
+                    validation={"passed": True, "kind": "token_id_integrity"},
+                    archive={"file": "token_ids.npz", "bytes": 3},
+                )
+                _write(path, manifest)
+                (path.parent / "token_ids.npz").write_bytes(b"ids")
+
+
+def test_token_trace_coverage_has_separate_integrity_contract(series, capsys):
+    _token_series(series)
+    reports = inspect_series(series, expected_content="token_ids")
+    assert all(report["content"] == "token_ids" for report in reports)
+    main(["--root", str(series), "--expect-content", "token_ids"])
+    assert "real_payload=not_collected" in capsys.readouterr().out
+    with pytest.raises(ValueError, match="content"):
+        inspect_series(series, expected_content="full")
+    path = series / "dp1/round0002/group001/token_ids.npz"
+    path.write_bytes(b"")
+    with pytest.raises(ValueError, match="snapshot contract"):
+        inspect_series(series)
+
+
+def test_token_trace_cannot_claim_full_snapshot_extraction(series, tmp_path):
+    _token_series(series)
+    with pytest.raises(SystemExit, match="token_replay"):
+        main(
+            [
+                "--root",
+                str(series),
+                "--dp-rank",
+                "0",
+                "--round",
+                "1",
+                "--group",
+                "0",
+                "--extract",
+                str(tmp_path / "full"),
+            ]
+        )
+
+
 @pytest.mark.parametrize(
     "change",
     [
