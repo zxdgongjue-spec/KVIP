@@ -149,6 +149,7 @@ def test_optimization_switches_are_explicit_content_addressed_build_options():
         dict(rolling_threshold=True, resident=8192),
         dict(rolling_threshold=True, aic_count=16),
         dict(rolling_threshold=True, threshold_only=True),
+        dict(bitmap_index=1),
         dict(reserved_ub=1),
         dict(reserved_ub=True),
         dict(reserved_ub=True, compact_reserved=True, resident=8192),
@@ -157,6 +158,7 @@ def test_optimization_switches_are_explicit_content_addressed_build_options():
     ):
         with pytest.raises(ValueError):
             replace(paired, **overrides)
+    assert replace(compact, bitmap_index=True).options("/cann")["BITMAP_INDEX"] == 1
     assert replace(compact, reserved_ub=True).options("/cann")["RESERVED_UB"] == 1
     assert replace(compact, fused_init=True).options("/cann")["UBMEM_FUSED_INIT"] == 1
     wide = replace(paired, final_copy_stages=6, final_copy_rows=4, ordered_pair=False)

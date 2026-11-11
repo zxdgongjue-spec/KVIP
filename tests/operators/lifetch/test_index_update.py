@@ -166,7 +166,7 @@ template<class T> void asc_stcg(T* p,T v) { *p=v; }
 uint32_t asc_atomic_cas(uint32_t* p,uint32_t old,uint32_t v) {
     auto x=*p; if(x==old)*p=v; return x;
 }
-void asc_atomic_or(uint32_t* p,uint32_t v) { *p|=v; }
+uint32_t asc_atomic_or(uint32_t* p,uint32_t v) { auto old=*p;*p|=v;return old; }
 void asc_syncthreads() {}
 void asc_threadfence() {}
 uint32_t asc_shfl_up(uint32_t v,uint32_t) { return v; }
@@ -229,13 +229,24 @@ int main() {
         with tempfile.TemporaryDirectory() as directory:
             cpp, exe = Path(directory) / "test.cpp", Path(directory) / "test"
             cpp.write_text(source)
-            subprocess.run(
-                [compiler, "-std=c++17", "-O2", str(cpp), "-I" + str(kernel), "-o", str(exe)],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            subprocess.run([str(exe)], check=True, capture_output=True, text=True)
+            for bitmap in (0, 1):
+                with self.subTest(bitmap_index=bitmap):
+                    subprocess.run(
+                        [
+                            compiler,
+                            "-std=c++17",
+                            "-O2",
+                            f"-DV9_BITMAP_INDEX={bitmap}",
+                            str(cpp),
+                            "-I" + str(kernel),
+                            "-o",
+                            str(exe),
+                        ],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                    subprocess.run([str(exe)], check=True, capture_output=True, text=True)
 
 
 class IndexUpdateTest(unittest.TestCase):

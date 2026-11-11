@@ -506,8 +506,16 @@ constexpr unsigned kTransferHeaderWords=8,kInvalidateHot=0x80000000U;
 """
     for name in ("PlanHash", "PlanInsert", "PlanContains", "ExtendedInsert", "ExtendedContains"):
         functions += "\n" + function(planner, name)
+    for name in ("PlanBitmapWords", "PlanBitmapContains"):
+        functions += "\n" + function(planner, name)
+    functions += "\ntemplate<class Word>\n" + function(planner, "PlanBitmapInsert")
     for name in ("PlanPrefix", "BuildUpdatePlan", "BuildExtendedPlan", "PublishUpdatePlan", "PublishExtendedPlan"):
-        functions += "\ntemplate<unsigned Threads>\n" + function(planner, name)
+        template = (
+            "template<unsigned Threads,bool Bitmap=false>"
+            if name in ("BuildUpdatePlan", "BuildExtendedPlan")
+            else "template<unsigned Threads>"
+        )
+        functions += "\n" + template + "\n" + function(planner, name)
     source = r"""
 #include <cstdint>
 #include <vector>

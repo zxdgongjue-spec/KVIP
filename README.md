@@ -556,6 +556,36 @@ URMA serial was 605.932 us versus fused reserved-map/final-post overlap
 reductions expose serial timing outliers. Neither meets the 35% target;
 the follow-up experiments above have no measured NPU performance claim yet.
 
+The next structural cleanup separates necessary cache maintenance from
+redundant representation work:
+
+- `bitmap_index=true` replaces the two Index-planner hash sets with exact
+  bounded bitmaps, for both transports. At H=131328/R=16384 their initialized
+  set storage drops from 64 KiB (small planner) or 128 KiB (extended planner)
+  to 18,464 bytes. The old scratch allocation and record offsets remain;
+  total small-planner clearing also includes unchanged record arrays.
+  Every duplicate, range check, path-closing record and completion gate is
+  retained. Oversized domains fall back to the full hash implementation.
+  This is opt-in until real-snapshot timings confirm an improvement; it does
+  not delete Index payload movement or remove any preparation from timing.
+- Service binders can write physical slot outputs directly into the existing
+  per-group feedback destination view. Both Index update adapters validate and
+  retain the view; overlapping Index/TopK/KV buffers are rejected. The paired
+  vLLM change skips the redundant copy only for identical destination storage.
+  At B16/Q4/K2048 this avoids 512 KiB of device-to-device output copying per
+  group. Logical TopK publication and TND validity checks remain unchanged.
+- The paired vLLM change skips native LIDU bitmap preparation/upload only when
+  every group is bound to a fused selector. Partial binding, startup and
+  dynamic fallback retain fresh native bitmaps. This does not remove the
+  device-generated reserved-hot protection required by fused prefetch.
+
+The latter two service copies are outside the current device-ready snapshot
+scope. Their removal must not be reported as a replay-graph speedup. No NPU
+performance result is claimed for these changes yet. Removing the full Index
+permutation requires a different residency layout, not simply dropping the
+current Apply kernel: the existing next-round LI relies on hot keys being
+physically first in Index storage.
+
 Extended Index planning now clears and scans only its producer high-water
 prefix and the corresponding path-closing prefix. Their ABI offsets and record
 order are unchanged; old records outside those ranges cannot be consumed.

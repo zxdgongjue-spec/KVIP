@@ -1,5 +1,9 @@
 #pragma once
 // SPDX-License-Identifier: Apache-2.0
+#ifndef V9_BITMAP_INDEX
+#define V9_BITMAP_INDEX 0
+#endif
+static_assert(V9_BITMAP_INDEX==0 || V9_BITMAP_INDEX==1,"Bitmap Index must be boolean");
 
 // Producer changes form an injective partial permutation. Close its paths by
 // pairing outgoing destinations with freed source rows; cycles need no extras.
@@ -29,6 +33,20 @@ __simt_callee__ inline bool PlanContains(__ubuf__ uint32_t* table, uint32_t key)
   }
   return false;
 }
+// Full domains, not low-bit hashes: source IDs cover history, destinations
+// cover resident. Keep the existing scratch/record offsets; oversized domains
+// use the original hash path rather than truncating either bitmap.
+__simt_callee__ inline uint32_t PlanBitmapWords(uint32_t bound) {
+  return uint32_t((uint64_t(bound)+31)/32);
+}
+template<class Word>
+__simt_callee__ inline bool PlanBitmapInsert(__ubuf__ Word* table,uint32_t key) {
+  const Word mask=Word(1)<<(key%32);
+  return (asc_atomic_or(table+key/32,mask)&mask)==0;
+}
+__simt_callee__ inline bool PlanBitmapContains(__ubuf__ uint32_t* table,uint32_t key,uint32_t bound) {
+  return key<bound && (table[key/32]&(1U<<(key%32)))!=0;
+}
 template <uint32_t Threads>
 __simt_callee__ inline uint32_t PlanPrefix(uint32_t n, __ubuf__ uint32_t* scan) {
   if constexpr (Threads == 1) return 0;  // Host execution of the same planner.
@@ -50,13 +68,20 @@ __simt_callee__ inline uint32_t PlanPrefix(uint32_t n, __ubuf__ uint32_t* scan) 
   asc_syncthreads();
   return value - n + (warp ? scan[warp - 1] : 0);
 }
-template <uint32_t Threads>
+template <uint32_t Threads,bool Bitmap=false>
 __simt_callee__ inline void BuildUpdatePlan(__gm__ uint32_t* lru, __gm__ uint32_t* changes, uint32_t history,
                                             uint32_t resident, __ubuf__ uint32_t* work, __ubuf__ uint32_t* status) {
   uint32_t tid = threadIdx.x;
-  auto dstSet = work, srcSet = work + kPlanHash;
+  const uint32_t dstWords=PlanBitmapWords(resident),srcWords=PlanBitmapWords(history);
+  const bool bitmap=Bitmap && uint64_t(dstWords)+srcWords<=2*kPlanHash;
+  auto dstSet = work, srcSet = work + (bitmap?dstWords:kPlanHash);
   auto dst = work + 2 * kPlanHash, src = dst + kPlanRecords;
-  for (uint32_t i = tid; i < kPlanWords; i += Threads) work[i] = UINT32_MAX;
+  if(bitmap) {
+    for(uint32_t i=tid;i<dstWords+srcWords;i+=Threads)work[i]=0;
+    for(uint32_t i=tid;i<2*kPlanRecords;i+=Threads)dst[i]=UINT32_MAX;
+  } else {
+    for (uint32_t i = tid; i < kPlanWords; i += Threads) work[i] = UINT32_MAX;
+  }
   asc_syncthreads();
   for (uint32_t i = tid; i < kPlanCandidates; i += Threads) {
     uint32_t s = asc_ldcg(changes + i), d = asc_ldcg(lru + i);
@@ -67,7 +92,12 @@ __simt_callee__ inline void BuildUpdatePlan(__gm__ uint32_t* lru, __gm__ uint32_
     }
     src[i] = s;
     dst[i] = d;
-    if (!PlanInsert(dstSet, d) || !PlanInsert(srcSet, s)) asc_atomic_or(status, 1U);
+    bool inserted;
+    if constexpr(Bitmap)inserted=bitmap?
+        (PlanBitmapInsert(dstSet,d) && PlanBitmapInsert(srcSet,s)):
+        (PlanInsert(dstSet,d) && PlanInsert(srcSet,s));
+    else inserted=PlanInsert(dstSet,d) && PlanInsert(srcSet,s);
+    if(!inserted)asc_atomic_or(status,1U);
   }
   asc_syncthreads();
   if (status[0]) return;
@@ -81,7 +111,9 @@ __simt_callee__ inline void BuildUpdatePlan(__gm__ uint32_t* lru, __gm__ uint32_
   uint32_t out = 0, free = 0;
   for (uint32_t i = tid * per; i < (tid + 1) * per; ++i)
     if (src[i] != UINT32_MAX) {
-      uint32_t local=i-tid*per, outgoing=!PlanContains(srcSet,dst[i]), released=!PlanContains(dstSet,src[i]);
+      uint32_t local=i-tid*per;
+      uint32_t outgoing=!(bitmap?PlanBitmapContains(srcSet,dst[i],history):PlanContains(srcSet,dst[i]));
+      uint32_t released=!(bitmap?PlanBitmapContains(dstSet,src[i],resident):PlanContains(dstSet,src[i]));
       out+=outgoing;free+=released;
       outFlags[local/32]|=outgoing<<(local%32);freeFlags[local/32]|=released<<(local%32);
     }
@@ -103,7 +135,8 @@ __simt_callee__ inline void BuildUpdatePlan(__gm__ uint32_t* lru, __gm__ uint32_
 }
 
 // Extended records use the same partial-permutation planner. Only records
-// spill to GM; hash tables remain in UB. The original <=2048 path is unchanged.
+// spill to GM; membership sets remain in UB. Both modes retain the original
+// small/extended record layouts and publication order.
 constexpr uint32_t kExtendedCandidates = 2048 + 8192;
 constexpr uint32_t kExtendedRecords = 2 * kExtendedCandidates;
 constexpr uint32_t kExtendedHash = 16384;
@@ -129,19 +162,22 @@ __simt_callee__ inline bool ExtendedContains(__ubuf__ uint32_t* table, uint32_t 
   }
   return false;
 }
-template<uint32_t Threads>
+template<uint32_t Threads,bool Bitmap=false>
 __simt_callee__ inline void BuildExtendedPlan(__gm__ uint32_t* inputSlots, __gm__ uint32_t* changes,
     uint32_t count, uint32_t history, uint32_t resident, __ubuf__ uint32_t* hashes,
     __ubuf__ uint32_t* status, __gm__ uint32_t* records) {
   uint32_t tid = threadIdx.x;
-  auto dstSet = hashes, srcSet = hashes + kExtendedHash;
+  const uint32_t dstWords=PlanBitmapWords(resident),srcWords=PlanBitmapWords(history);
+  const bool bitmap=Bitmap && uint64_t(dstWords)+srcWords<=2*kExtendedHash;
+  auto dstSet = hashes, srcSet = hashes + (bitmap?dstWords:kExtendedHash);
   auto dst = records, src = records + kExtendedRecords;
   if(count > kExtendedCandidates) { if(!tid)status[0]=1; return; }
   // The producer high-water mark bounds both the input and path-closing
   // records. Keep their ABI offsets, but never clear/read the unused tail.
   // status[1] is private to this Build/Publish pair (prefix scans use 32/64).
   if(!tid)status[1]=count;
-  for (uint32_t i = tid; i < 2*kExtendedHash; i += Threads) hashes[i] = UINT32_MAX;
+  const uint32_t setWords=bitmap?dstWords+srcWords:2*kExtendedHash;
+  for (uint32_t i = tid; i < setWords; i += Threads) hashes[i] = bitmap?0:UINT32_MAX;
   for (uint32_t i = tid; i < count; i += Threads) {
     asc_stcg(dst+i,UINT32_MAX);asc_stcg(src+i,UINT32_MAX);
     asc_stcg(dst+kExtendedCandidates+i,UINT32_MAX);
@@ -153,7 +189,12 @@ __simt_callee__ inline void BuildExtendedPlan(__gm__ uint32_t* inputSlots, __gm_
     if(s==UINT32_MAX)continue;
     if(s>=history || d>=resident) {asc_atomic_or(status,1U);continue;}
     asc_stcg(src+i,s);asc_stcg(dst+i,d);
-    if(!ExtendedInsert(dstSet,d) || !ExtendedInsert(srcSet,s))asc_atomic_or(status,1U);
+    bool inserted;
+    if constexpr(Bitmap)inserted=bitmap?
+        (PlanBitmapInsert(dstSet,d) && PlanBitmapInsert(srcSet,s)):
+        (ExtendedInsert(dstSet,d) && ExtendedInsert(srcSet,s));
+    else inserted=ExtendedInsert(dstSet,d) && ExtendedInsert(srcSet,s);
+    if(!inserted)asc_atomic_or(status,1U);
   }
   asc_threadfence();asc_syncthreads();
   if(status[0])return;
@@ -165,7 +206,9 @@ __simt_callee__ inline void BuildExtendedPlan(__gm__ uint32_t* inputSlots, __gm_
   for(uint32_t i=tid*per;i<(tid+1)*per && i<count;++i) {
     uint32_t s=asc_ldcg(src+i),d=asc_ldcg(dst+i);
     if(s!=UINT32_MAX) {
-      uint32_t local=i-tid*per,outgoing=!ExtendedContains(srcSet,d),released=!ExtendedContains(dstSet,s);
+      uint32_t local=i-tid*per;
+      uint32_t outgoing=!(bitmap?PlanBitmapContains(srcSet,d,history):ExtendedContains(srcSet,d));
+      uint32_t released=!(bitmap?PlanBitmapContains(dstSet,s,resident):ExtendedContains(dstSet,s));
       out+=outgoing;free+=released;
       outFlags[local/32]|=outgoing<<(local%32);freeFlags[local/32]|=released<<(local%32);
     }

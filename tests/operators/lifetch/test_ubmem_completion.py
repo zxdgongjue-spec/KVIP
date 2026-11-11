@@ -9,7 +9,8 @@ import subprocess
 import pytest
 
 
-def test_complete_plan_preserves_checks_publication_and_plan(tmp_path):
+@pytest.mark.parametrize("bitmap_index", (0, 1))
+def test_complete_plan_preserves_checks_publication_and_plan(tmp_path, bitmap_index):
     compiler = shutil.which("c++")
     if compiler is None:
         pytest.skip("C++ compiler required for completion model")
@@ -80,7 +81,7 @@ template<class T>T asc_ldcg(T* p) {
 }
 template<class T>void asc_stcg(T* p,T value){*p=value;}
 uint32_t asc_atomic_cas(uint32_t* p,uint32_t old,uint32_t value){auto v=*p;if(v==old)*p=value;return v;}
-void asc_atomic_or(uint32_t* p,uint32_t value){*p|=value;}
+uint32_t asc_atomic_or(uint32_t* p,uint32_t value){auto old=*p;*p|=value;return old;}
 uint32_t asc_shfl_up(uint32_t value,uint32_t){return value;}
 void asc_syncthreads(){}
 void asc_threadfence(){}
@@ -248,7 +249,7 @@ int main(){for(uint32_t fault=0;fault<15;++fault){auto baseline=Run(0,fault);ass
         for node in runner.body
         if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "common" for t in node.targets)
     )
-    definitions = common | {"SIM_BATCH": 2, "TOKEN_BYTES": 2624}
+    definitions = common | {"SIM_BATCH": 2, "TOKEN_BYTES": 2624, "V9_BITMAP_INDEX": bitmap_index}
     subprocess.run(
         [
             compiler,

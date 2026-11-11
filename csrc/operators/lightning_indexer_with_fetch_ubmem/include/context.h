@@ -19,6 +19,10 @@ static_assert(!V9_ROLLING_THRESHOLD || (SIM_RESIDENT==16384 && V9_SPLIT_Q && !V9
 #ifndef V9_SIMT_INIT
 #define V9_SIMT_INIT 0
 #endif
+#ifndef V9_BITMAP_INDEX
+#define V9_BITMAP_INDEX 0
+#endif
+static_assert(V9_BITMAP_INDEX==0 || V9_BITMAP_INDEX==1,"Bitmap Index must be boolean");
 #ifndef V9_RESERVED_UB
 #define V9_RESERVED_UB 0
 #endif

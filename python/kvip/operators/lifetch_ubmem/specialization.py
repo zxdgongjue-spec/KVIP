@@ -39,6 +39,7 @@ class Specialization:
     single_plan: bool = False
     staged_outputs: bool = False
     rolling_threshold: bool = False
+    bitmap_index: bool = False
     reserved_ub: bool = False
     cached_buckets: bool = False
     fused_init: bool = False
@@ -61,6 +62,7 @@ class Specialization:
                 "single_plan",
                 "staged_outputs",
                 "rolling_threshold",
+                "bitmap_index",
                 "reserved_ub",
                 "cached_buckets",
                 "fused_init",
@@ -139,6 +141,7 @@ class Specialization:
             UBMEM_SINGLE_PLAN=int(self.single_plan),
             STAGED_OUTPUTS=int(self.staged_outputs),
             ROLLING_THRESHOLD=int(self.rolling_threshold),
+            BITMAP_INDEX=int(self.bitmap_index),
             RESERVED_UB=int(self.reserved_ub),
             CACHED_BUCKETS=int(self.cached_buckets),
             UBMEM_FUSED_INIT=int(self.fused_init),

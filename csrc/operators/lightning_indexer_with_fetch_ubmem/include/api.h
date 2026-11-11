@@ -22,6 +22,7 @@ uint32_t v9_merge_outputs();
 uint32_t v9_cold_only_prefetch();
 uint32_t v9_threshold_only();
 uint32_t v9_simt_init();
+uint32_t v9_bitmap_index();
 uint32_t v9_reserved_ub();
 uint32_t v9_fused_init();
 uint32_t v9_init_li(void* bindings,void* stream);

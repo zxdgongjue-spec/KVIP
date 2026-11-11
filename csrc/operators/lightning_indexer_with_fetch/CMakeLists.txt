@@ -22,8 +22,9 @@ set(THRESHOLD_ONLY 0 CACHE STRING "Compute the exact resident admission threshol
 set(SIMT_INIT 0 CACHE STRING "Initialize per-row state in a single SIMT pass")
 set(STAGED_OUTPUTS 0 CACHE STRING "Stage hot logical IDs and packed outputs in UB before TND publication")
 set(ROLLING_THRESHOLD 0 CACHE STRING "Move existing chunk TopK merges into LI and refresh admission threshold")
+set(BITMAP_INDEX 0 CACHE STRING "Use bounded exact bitmaps for Index move membership")
 set(RESERVED_UB 0 CACHE STRING "Build the resident=16384 inverse map in UB and publish once")
-foreach(flag COLD_ONLY_PREFETCH THRESHOLD_ONLY SIMT_INIT STAGED_OUTPUTS ROLLING_THRESHOLD URMA_SINGLE_PLANNER URMA_SKIP_FINAL_PARTITION POST_FINAL_BEFORE_INDEX RESERVED_UB MERGE_FINAL_COMPLETION)
+foreach(flag BITMAP_INDEX COLD_ONLY_PREFETCH THRESHOLD_ONLY SIMT_INIT STAGED_OUTPUTS ROLLING_THRESHOLD URMA_SINGLE_PLANNER URMA_SKIP_FINAL_PARTITION POST_FINAL_BEFORE_INDEX RESERVED_UB MERGE_FINAL_COMPLETION)
   if(NOT ${flag} MATCHES "^[01]$")
     message(FATAL_ERROR "${flag} must be 0 or 1")
   endif()
@@ -72,13 +73,13 @@ target_compile_definitions(v9_bridge PRIVATE V9_RESOLVER_COMPARE=${RESOLVER_COMP
   V9_STAGED_OUTPUTS=${STAGED_OUTPUTS})
 target_compile_definitions(v9_bridge PRIVATE V9_ROLLING_THRESHOLD=${ROLLING_THRESHOLD}
   V9_POST_FINAL_BEFORE_INDEX=${POST_FINAL_BEFORE_INDEX} V9_MERGE_FINAL_COMPLETION=${MERGE_FINAL_COMPLETION}
-  V9_RESERVED_UB=${RESERVED_UB}
+  V9_BITMAP_INDEX=${BITMAP_INDEX} V9_RESERVED_UB=${RESERVED_UB}
   V9_URMA_SINGLE_PLANNER=${URMA_SINGLE_PLANNER} V9_URMA_SKIP_FINAL_PARTITION=${URMA_SKIP_FINAL_PARTITION})
 target_link_libraries(v9_bridge PRIVATE v9_kernel host_intf_pub ascendcl)
 # Independent AIV target: does not change the LI/Fetch compilation options.
 ascendc_library(kvop_cache_update_kernel STATIC op_kernel/index_cache_update.cpp)
 ascendc_include_directories(kvop_cache_update_kernel PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)
-ascendc_compile_options(kvop_cache_update_kernel PRIVATE -O2 -DV9_STAGED_OUTPUTS=${STAGED_OUTPUTS}
+ascendc_compile_options(kvop_cache_update_kernel PRIVATE -O2 -DV9_BITMAP_INDEX=${BITMAP_INDEX} -DV9_STAGED_OUTPUTS=${STAGED_OUTPUTS}
   -mllvm -user-reserved-ub-size=223232)
 add_library(kvop_cache_update SHARED op_host/index_cache_update.cpp)
 target_link_libraries(kvop_cache_update PRIVATE kvop_cache_update_kernel host_intf_pub ascendcl)

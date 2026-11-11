@@ -155,6 +155,7 @@ def test_tuning_keeps_snapshot_immutable_and_validates_only_known_options():
         simt_init=False,
         staged_outputs=False,
         rolling_threshold=False,
+        bitmap_index=False,
         reserved_ub=False,
     )
     assert geometry == dict(prefetch_limit=512, window_limit=64, requested_windows=8)
@@ -183,6 +184,7 @@ def test_urma_tuning_has_only_real_switches_and_fixed_inactive_gate():
         simt_init=False,
         staged_outputs=False,
         rolling_threshold=False,
+        bitmap_index=False,
         reserved_ub=False,
     )
     assert fusion_tuning(geometry, "urma", {"parallel_final": True})["parallel_final"] is True
@@ -644,3 +646,12 @@ def test_urma_split_index_cli_uses_existing_flag_without_an_ablation(monkeypatch
     argv[argv.index("fused")] = "serial"
     with pytest.raises(SystemExit):
         arguments()
+
+
+@pytest.mark.parametrize("transport", ["ubmem", "urma"])
+def test_bitmap_index_is_explicit_and_boolean(transport):
+    geometry = dict(prefetch_limit=512, window_limit=64, requested_windows=8)
+    assert fusion_tuning(geometry, transport)["bitmap_index"] is False
+    assert fusion_tuning(geometry, transport, {"bitmap_index": True})["bitmap_index"] is True
+    with pytest.raises(ValueError, match="booleans"):
+        fusion_tuning(geometry, transport, {"bitmap_index": 1})

@@ -4,6 +4,7 @@
 import ctypes
 
 from kvip.operators.lifetch_ubmem.workspace import WORK_WORDS, device_words
+from kvip.operators.output_views import validate_slot_output
 
 
 class UbmemIndexUpdate:
@@ -22,6 +23,7 @@ class UbmemIndexUpdate:
         outputs,
         plan_buffer=None,
         extended_work=None,
+        slot_output=None,
     ):
         self.torch, self.device, self.library = torch, keys.device, rotating.library
         batch, history = rotating.shape.batch, rotating.shape.history
@@ -66,6 +68,38 @@ class UbmemIndexUpdate:
                 raise ValueError(f"UBmem Index {name} must be contiguous int32 with shape {shape}")
         self.status = status
         self.logical_output, self.slot_output = outputs.unbind(0)
+        if slot_output is not None:
+            self.slot_output = validate_slot_output(
+                torch,
+                slot_output,
+                batch=batch,
+                device=self.device,
+                protected=(
+                    keys,
+                    scales,
+                    addresses,
+                    logical_ids,
+                    row_owners,
+                    status,
+                    self.plan_buffer,
+                    self.extended_work,
+                    self.logical_output,
+                    rotating.change_slots,
+                    rotating.changes,
+                    rotating.change_count,
+                    rotating.rows,
+                    rotating.hot_valid,
+                    rotating.row_status,
+                    rotating.final_posts,
+                    rotating.ubmem_status,
+                    rotating.region,
+                    rotating.output,
+                    *rotating.arguments,
+                    rotating.locations,
+                    query_inputs.unpack_indices,
+                    query_inputs.output_valid,
+                ),
+            )
         pointers = [
             keys.data_ptr(),
             scales.data_ptr(),

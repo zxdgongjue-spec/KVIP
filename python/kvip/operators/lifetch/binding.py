@@ -48,6 +48,7 @@ class LIFetchBinding:
         skip_final_partition=False,
         post_final_before_index=False,
         merge_final_completion=False,
+        bitmap_index=False,
         reserved_ub=False,
     ):
         if resident > 131072:
@@ -109,6 +110,7 @@ class LIFetchBinding:
             ("skip_final_partition", skip_final_partition),
             ("post_final_before_index", post_final_before_index),
             ("merge_final_completion", merge_final_completion),
+            ("bitmap_index", bitmap_index),
             ("reserved_ub", reserved_ub),
         ):
             if type(expected) is not bool:

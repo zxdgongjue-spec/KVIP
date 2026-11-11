@@ -45,6 +45,7 @@ extern "C" uint32_t v9_merge_final_completion(const rotating::RuntimeShape* shap
 extern "C" uint32_t v9_cold_only_prefetch(const rotating::RuntimeShape* shape) { return V9_COLD_ONLY_PREFETCH; }
 extern "C" uint32_t v9_threshold_only(const rotating::RuntimeShape* shape) { return V9_THRESHOLD_ONLY; }
 extern "C" uint32_t v9_simt_init(const rotating::RuntimeShape* shape) { return V9_SIMT_INIT; }
+extern "C" uint32_t v9_bitmap_index(const rotating::RuntimeShape* shape) { return V9_BITMAP_INDEX; }
 extern "C" uint32_t v9_reserved_ub(const rotating::RuntimeShape* shape) { return V9_RESERVED_UB; }
 extern "C" uint32_t v9_staged_outputs(const rotating::RuntimeShape* shape) { return V9_STAGED_OUTPUTS; }
 extern "C" uint32_t v9_rolling_threshold(const rotating::RuntimeShape* shape) { return V9_ROLLING_THRESHOLD; }

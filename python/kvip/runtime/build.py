@@ -55,6 +55,7 @@ def build_libraries(
     skip_final_partition=False,
     post_final_before_index=False,
     merge_final_completion=False,
+    bitmap_index=False,
     reserved_ub=False,
 ):
     """Build one shape-independent binary per source/toolchain/SoC."""
@@ -76,6 +77,7 @@ def build_libraries(
             skip_final_partition,
             post_final_before_index,
             merge_final_completion,
+            bitmap_index,
             reserved_ub,
         )
     ):
@@ -107,6 +109,7 @@ def build_libraries(
         URMA_SKIP_FINAL_PARTITION=int(skip_final_partition),
         POST_FINAL_BEFORE_INDEX=int(post_final_before_index),
         MERGE_FINAL_COMPLETION=int(merge_final_completion),
+        BITMAP_INDEX=int(bitmap_index),
         RESERVED_UB=int(reserved_ub),
     )
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())

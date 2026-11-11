@@ -118,6 +118,7 @@ def _bind_selectors(torch, policy, config):
             outputs=policy.fused_outputs[group],
             plan_buffer=workspace.index_plan,
             extended_work=workspace.index_work,
+            slot_output=policy.destinations[group, : setup.batch * 4],
         )
         selector = VllmIndexSelector(
             torch,

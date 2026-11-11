@@ -62,6 +62,7 @@ class UbmemBinding:
             ("single_plan", int(shape.single_plan)),
             ("staged_outputs", int(shape.staged_outputs)),
             ("rolling_threshold", int(shape.rolling_threshold)),
+            ("bitmap_index", int(shape.bitmap_index)),
             ("reserved_ub", int(shape.reserved_ub)),
             ("cached_buckets", int(shape.cached_buckets)),
             ("fused_init", int(shape.fused_init)),

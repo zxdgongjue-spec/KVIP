@@ -88,6 +88,7 @@ def _bind_selectors(torch, policy, config):
             status=policy.fused_errors[group],
             query_inputs=workspace.inputs,
             outputs=policy.fused_outputs[group],
+            slot_output=policy.destinations[group, : setup.batch * 4],
         )
         selector = VllmIndexSelector(
             torch,

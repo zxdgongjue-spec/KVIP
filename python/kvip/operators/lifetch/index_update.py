@@ -3,6 +3,8 @@
 
 import ctypes
 
+from kvip.operators.output_views import validate_slot_output
+
 
 class DirectIndexUpdate:
     def __init__(
@@ -19,6 +21,7 @@ class DirectIndexUpdate:
         status=None,
         query_inputs=None,
         outputs=None,
+        slot_output=None,
     ):
         self.torch, self.device = torch, keys.device
         self.batch = row_owners.numel()
@@ -93,6 +96,8 @@ class DirectIndexUpdate:
             self.plan_buffer.data_ptr(),
         ]
         self.logical_output = self.slot_output = None
+        if slot_output is not None and query_inputs is None:
+            raise ValueError("Slot output requires service query inputs")
         if query_inputs is not None:
             if outputs is None:
                 outputs = torch.zeros((2, self.batch * 4, 1, 2048), dtype=torch.int32, device=self.device)
@@ -104,6 +109,34 @@ class DirectIndexUpdate:
             ):
                 raise ValueError("Service outputs must be contiguous int32 [2, B*4, 1, 2048]")
             self.logical_output, self.slot_output = outputs.unbind(0)
+            if slot_output is not None:
+                self.slot_output = validate_slot_output(
+                    torch,
+                    slot_output,
+                    batch=self.batch,
+                    device=self.device,
+                    protected=(
+                        *self.storage[:-1],
+                        self.status,
+                        self.plan_buffer,
+                        self.work_buffer,
+                        self.logical_output,
+                        rotating.change_slots,
+                        rotating.changes,
+                        rotating.change_count,
+                        rotating.rows,
+                        rotating.hot_valid,
+                        rotating.row_status,
+                        rotating.final_posts,
+                        rotating.prefetch_status,
+                        rotating.final_status,
+                        rotating.owner.output,
+                        *rotating.arguments,
+                        rotating.locations,
+                        query_inputs.unpack_indices,
+                        query_inputs.output_valid,
+                    ),
+                )
             pointers.extend(
                 [
                     rotating.arguments[9].data_ptr(),

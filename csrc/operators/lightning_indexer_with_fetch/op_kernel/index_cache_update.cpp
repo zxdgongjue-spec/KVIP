@@ -50,11 +50,11 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void Update(__gm__ uint64_t* a, 
   }
   asc_syncthreads();
   if (!status[0]) {
-    if constexpr (!Extended) BuildUpdatePlan<kThreads>(lru,changes,uint32_t(a[24]),uint32_t(a[25]),work,status);
+    if constexpr (!Extended) BuildUpdatePlan<kThreads,V9_BITMAP_INDEX!=0>(lru,changes,uint32_t(a[24]),uint32_t(a[25]),work,status);
     else {
       uint32_t count=asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(a[26])+b);
       auto extended=reinterpret_cast<__gm__ uint32_t*>(a[27])+uint64_t(b)*kExtendedWorkWords;
-      BuildExtendedPlan<kThreads>(lru,changes,count,uint32_t(a[24]),uint32_t(a[25]),work,status,extended);
+      BuildExtendedPlan<kThreads,V9_BITMAP_INDEX!=0>(lru,changes,count,uint32_t(a[24]),uint32_t(a[25]),work,status,extended);
     }
   }
   asc_syncthreads();

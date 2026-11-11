@@ -167,6 +167,12 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
     ):
         with pytest.raises(ValueError):
             build.build_libraries(**options, **invalid)
+    bitmap = build.build_libraries(**options, bitmap_index=True)
+    assert bitmap != compact
+    assert "-DBITMAP_INDEX=1" in commands[-2]
+    assert build.build_libraries(**options, bitmap_index=True) == bitmap
+    with pytest.raises(ValueError, match="booleans"):
+        build.build_libraries(**options, bitmap_index=1)
     staged_reserved = build.build_libraries(**options, compact_reserved=True, reserved_ub=True)
     assert staged_reserved != compact
     assert "-DRESERVED_UB=1" in commands[-2]
@@ -179,7 +185,8 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
             build.build_libraries(**options, **invalid)
 
 
-def test_actual_operator_cmake_resolves_relocated_sources(tmp_path):
+@pytest.mark.parametrize("bitmap_index", (0, 1))
+def test_actual_operator_cmake_resolves_relocated_sources(tmp_path, bitmap_index):
     import subprocess
 
     cann = tmp_path / "cann"
@@ -188,8 +195,12 @@ def test_actual_operator_cmake_resolves_relocated_sources(tmp_path):
     module.write_text(
         "function(ascendc_library)\n add_library(${ARGV})\nendfunction()\n"
         "function(ascendc_include_directories)\n target_include_directories(${ARGV})\nendfunction()\n"
-        "function(ascendc_compile_options)\nendfunction()\n"
+        "function(ascendc_compile_options)\n target_compile_options(${ARGV})\n"
+        ' file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/${ARGV0}-options.txt" '
+        'CONTENT "$<TARGET_PROPERTY:${ARGV0},COMPILE_OPTIONS>")\nendfunction()\n'
         "add_library(host_intf_pub INTERFACE)\nadd_library(ascendcl INTERFACE)\n"
+        'file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/bridge-definitions.txt" '
+        'CONTENT "$<TARGET_PROPERTY:v9_bridge,COMPILE_DEFINITIONS>")\n'
     )
     headers = tmp_path / "headers"
     headers.mkdir()
@@ -205,10 +216,17 @@ def test_actual_operator_cmake_resolves_relocated_sources(tmp_path):
             f"-DASCEND_CANN_PACKAGE_PATH={cann}",
             f"-DKVAF_INCLUDE={headers}",
             "-DRESOLVER_COMPARE=1",
+            f"-DBITMAP_INDEX={bitmap_index}",
         ],
         check=True,
         capture_output=True,
     )
+    # The Index planner is a separate native target. A bridge getter or a
+    # top-level configure option alone must not masquerade as kernel support.
+    update_options = (tmp_path / "build/kvop_cache_update_kernel-options.txt").read_text().split(";")
+    bridge_definitions = (tmp_path / "build/bridge-definitions.txt").read_text().split(";")
+    assert f"-DV9_BITMAP_INDEX={bitmap_index}" in update_options
+    assert f"V9_BITMAP_INDEX={bitmap_index}" in bridge_definitions
     includes = [
         source / "include",
         source / "op_kernel",
