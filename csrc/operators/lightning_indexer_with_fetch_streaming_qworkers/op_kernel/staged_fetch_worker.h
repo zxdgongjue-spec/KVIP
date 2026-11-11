@@ -71,7 +71,8 @@ __aicore__ inline CqDrainResult DrainQueue(
     queue->completed_batch_count+=result.completed;
     return result;
 }
-__aicore__ inline void CompletePrefetch(__gm__ Context* ctx,uint32_t b,bool initializeSpare) {
+__aicore__ inline void CompletePrefetch(__gm__ Context* ctx,uint32_t b,bool initializeSpare,
+    uint64_t* diagnosticPolls=nullptr,uint64_t* diagnosticDrain=nullptr,uint64_t* diagnosticArrival=nullptr) {
         auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
         // Only the first cache line and the pending field are read/written here.
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),64);
@@ -85,7 +86,11 @@ __aicore__ inline void CompletePrefetch(__gm__ Context* ctx,uint32_t b,bool init
         uint32_t completed=0;
 #if !V9_SIMULATION
         if(!error) {
+            uint64_t start=diagnosticDrain?GetSystemCycle():0;
             auto result=DrainQueue(entity,queue,row->pending);
+            if(diagnosticArrival)*diagnosticArrival=GetSystemCycle();
+            if(diagnosticDrain)*diagnosticDrain=*diagnosticArrival-start;
+            if(diagnosticPolls)*diagnosticPolls=result.polls;
             error=result.error;completed=result.completed;
         }
 #endif

@@ -61,7 +61,8 @@ public:
 #if defined(V9_UBMEM) && V9_UBMEM
             topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_);
 #else
-            topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow);
+            topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow,
+            streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U));
 #endif
     }
     __aicore__ inline void LoadSequenceSplitThresholds(uint32_t batch) {

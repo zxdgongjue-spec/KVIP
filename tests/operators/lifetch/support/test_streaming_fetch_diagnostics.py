@@ -1,6 +1,6 @@
 import numpy as np
 
-from streaming_fetch_diagnostics import summarize_mismatches
+from streaming_fetch_diagnostics import summarize_mismatches, split_native_jetty_descriptors
 
 
 def test_reports_actual_payload_and_both_writers():
@@ -25,3 +25,13 @@ def test_reports_actual_payload_and_both_writers():
     assert item['actual_matching_tokens'] == [5]
     assert item['prefetch_writers'] == [5]
     assert item['final_writers'] == [{'q': 1, 'descriptor': 0, 'remote_address': '0x7b', 'source_tokens': [1]}]
+
+
+def test_native_jetty_audit_rotation_and_phases():
+    phases = [list(range(2500)), list(range(5000, 5200))]
+    a, b = split_native_jetty_descriptors(phases)
+    assert len(a) + len(b) == 2700
+    assert a[:128] == list(range(128)) and b[:128] == list(range(128, 256))
+    assert a[-128:] == list(range(5000, 5128))
+    assert b[-72:] == list(range(5128, 5200))
+    assert sorted(a + b) == list(range(2500)) + list(range(5000, 5200))

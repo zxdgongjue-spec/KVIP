@@ -43,6 +43,22 @@ def summarize_mismatches(row, selected, ids, slots, output, payload, destination
                 posts=posts[:, :6].astype(np.int64).tolist())
 
 
+def split_native_jetty_descriptors(phases, jettys=2, inflight=2048):
+    """Match KVAF native grouping and 128-WQE rotation for SQ audit."""
+    result = [[] for _ in range(jettys)]
+    for entries in phases:
+        # Native BatchGet uses an unbounded group when the entire call fits.
+        group_size = inflight // 2 if inflight and len(entries) > inflight else len(entries)
+        next_jetty = 0
+        for start in range(0, len(entries), max(group_size, 1)):
+            group = entries[start:start + group_size]
+            for post in range((len(group) + 127) // 128):
+                jetty = (next_jetty + post) % jettys
+                result[jetty].extend(group[post * 128:(post + 1) * 128])
+            next_jetty = (next_jetty + (len(group) + 127) // 128) % jettys
+    return result
+
+
 def audit_queue_writes(owner, rows, posts, row, bad_slots, destinations, remote_addresses, q_workers=None):
     """Read already-completed SQ entries on failure; no device work is submitted."""
     import ctypes
@@ -78,27 +94,29 @@ def audit_queue_writes(owner, rows, posts, row, bad_slots, destinations, remote_
                 continue
             queue = read(int(contexts[view, 9]), 64).view('<u8')
             queue_specs.append((f'b{owner_row}_final_q{q+1}', view, int(queue[1]) - count, count))
-    # Grouped Q workers use one queue per (Q, lane), not one per request.
-    # Native BatchGet writes safe descriptors for all rows followed by conflicts.
+    # Each Q worker owns two contiguous Jetty views after all prefetch views.
     group_indices = {}
     if q_workers:
         for q in range(workers):
             for lane in range(min(q_workers, batch)):
-                indices = []
+                phases = []
                 for phase in range(2):
+                    indices = []
                     for b in range(lane, batch, q_workers):
                         post = posts[b, q]
                         count, begin, safe = int(post[0]), int(post[4]), int(post[5])
                         start = begin if phase == 0 else begin + safe
                         length = safe if phase == 0 else count - safe
                         indices.extend(range(start, start + length))
-                if not indices:
-                    continue
-                view = lane * 2 + 1 if q == 0 else batch * 2 + lane * (workers - 1) + q - 1
-                queue = read(int(contexts[view, 9]), 64).view('<u8')
-                name = f'b{lane}_final_q{q+1}'
-                group_indices[name] = np.asarray(indices, dtype=np.int64)
-                queue_specs.append((name, view, int(queue[1]) - len(indices), len(indices)))
+                    phases.append(indices)
+                for jetty, indices in enumerate(split_native_jetty_descriptors(phases)):
+                    if not indices:
+                        continue
+                    view = 2 * batch + 2 * (q * q_workers + lane) + jetty
+                    queue = read(int(contexts[view, 9]), 64).view('<u8')
+                    name = f'b{lane}_final_q{q+1}_jetty{jetty}'
+                    group_indices[name] = np.asarray(indices, dtype=np.int64)
+                    queue_specs.append((name, view, int(queue[1]) - len(indices), len(indices)))
     result = []
     final_checks = []
     for name, view, start, count in queue_specs:
@@ -118,7 +136,7 @@ def audit_queue_writes(owner, rows, posts, row, bad_slots, destinations, remote_
         remote = sq[:, 10].astype(np.uint64) | (sq[:, 11].astype(np.uint64) << np.uint64(32))
         if '_final_q' in name:
             owner_row = int(name.split('_')[0][1:])
-            query = int(name.rsplit('q', 1)[1]) - 1
+            query = int(name.rsplit('q', 1)[1].split('_', 1)[0]) - 1
             begin = int(posts[owner_row, query, 4])
             index = group_indices.get(name, slice(begin, begin + count))
             wanted_local = np.uint64(owner.output.data_ptr()) + destinations[index].astype(np.uint64) * np.uint64(656)

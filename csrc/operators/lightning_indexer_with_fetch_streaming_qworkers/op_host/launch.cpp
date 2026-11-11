@@ -108,3 +108,9 @@ extern "C" uint32_t kvip_transport_snapshot(void* source, void* destination, uin
         reinterpret_cast<uintptr_t>(source) % 32 || bytes > 64U * 1024U * 1024U) return 100000;
     return aclrtlaunch_kvip_transport_snapshot_kernel(1,stream,source,destination,bytes);
 }
+
+extern "C" uint32_t aclrtlaunch_v9_counter_calibration(uint32_t,void*,void*);
+extern "C" uint32_t kvip_counter_calibration(void* output,void* stream) {
+    if(!output || !stream)return 100000;
+    return aclrtlaunch_v9_counter_calibration(1,stream,output);
+}

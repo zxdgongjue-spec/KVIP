@@ -247,16 +247,14 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
  if(lane>=shape.batch)return;
  auto allFlags=reinterpret_cast<__gm__ BatchFlag*>(a->flags);
  bool profile=(a->prefetchCount & 0x80000000U)!=0;
- uint32_t stride=shape.batch*kTop,owner=lane;
+ uint32_t stride=shape.batch*kTop;
  uint32_t metadataWords=(3*shape.batch+31)&~31U;
  auto packed=reinterpret_cast<__gm__ int32_t*>(a->packedFetch)+uint64_t(q*workers+lane)*(3*stride+metadataWords);
  auto ranges=reinterpret_cast<__gm__ uint32_t*>(packed+3*stride);
- auto args=GetArgs(ctx,FinalQueue(shape.batch,shape.finalWorkers,owner,q));
- // Q1 exclusively owns this odd status; CompletePrefetch must not overwrite it.
- // Initialize it even when the group has no requests, for the status contract.
- if(!q){auto status=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(args.core_status);
-  kvaf_device::WriteStatus(status,0,0,0,0,0,UINT64_MAX,0);
-  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),sizeof(*status));}
+ // The first 2*batch views include the independent prefetch queues. The
+ // following views are paired, exclusively owned by this Q worker.
+ uint32_t pair=2*shape.batch+2*(q*workers+lane);
+ auto args=GetArgs(ctx,pair);args.jettys_per_core=2;
  args.indices=uint64_t(packed);args.offsets=uint64_t(packed+stride);args.output_indices=uint64_t(packed+2*stride);
  args.miss_count=ctx->count;args.request_capacity=stride;
  if(ctx->fallbackAddresses){args.address_table=ctx->fallbackAddresses;args.valid_table=ctx->fallbackValid;args.table_capacity=shape.batch*kSlots;}
@@ -346,8 +344,9 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
  if(profile)ft[0]=GetSystemCycle();
  // This request's resolver core owns its prefetch CQ; Q workers only wait
  // on this request's flag when a conflicting range exists.
- uint32_t workers=(a->prefetchCount>>16)&0xffU;
- CompletePrefetch(ctx,b,b>=workers);if(profile)ft[4]=GetSystemCycle();error|=row->error;flags[7].error=error;flags[7].ready=1;
+ uint64_t polls=0,drain=0,arrival=0;
+ CompletePrefetch(ctx,b,true,profile?&polls:nullptr,profile?&drain:nullptr,profile?&arrival:nullptr);
+ if(profile){ft[4]=GetSystemCycle();ft[5]=polls;ft[6]=drain;ft[7]=arrival;}error|=row->error;flags[7].error=error;flags[7].ready=1;
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+7),sizeof(BatchFlag));
  for(uint32_t f=6;f<12;++f){uint64_t start=GetSystemCycle();while(true){
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+f),sizeof(BatchFlag));
@@ -366,7 +365,9 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
   total+=post->count;completed+=post->pending;error|=post->error;
   if(post->deferred){++deferred;error|=kvaf_device::kInvalidArgs;}
-  auto queueArgs=GetArgs(ctx,FinalQueue(shape.batch,shape.finalWorkers,b,q));
+  uint32_t workers=(a->prefetchCount>>16)&0xffU;
+  uint32_t pair=2*shape.batch+2*(q*workers+b%workers);
+  auto queueArgs=GetArgs(ctx,pair);
   auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(queueArgs.queue_state);
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
   lastHead=queue->sq_producer_index;lastCq=queue->cq_consumer_index;
@@ -408,6 +409,20 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
    if(q<4 && part<workers){
     FetchQueryGroup(a,q,part,workers);
    }}
+ }
+#endif
+}
+
+// Diagnostic calibration runs separately from all benchmark samples.
+extern "C" __global__ __aicore__ void v9_counter_calibration(GM_ADDR output) {
+#if defined(__CCE_AICORE__)
+ KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+ if ASCEND_IS_AIV {
+  auto values=reinterpret_cast<__gm__ uint64_t*>(output);
+  uint64_t start=GetSystemCycle(),now=start;
+  while(now-start<20000000ULL)now=GetSystemCycle();
+  values[0]=start;values[1]=now;
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(values),32);
  }
 #endif
 }

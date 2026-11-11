@@ -24,7 +24,7 @@ struct KvafBatchGetQueueState {uint32_t x=0;};
 struct Profile {uint64_t magic=0,post_active_cycles=0,drain_wait_cycles=0,submitted_group_count=0;};
 struct KvafBatchGetCoreStatus {uint64_t magic=123,processed_request_count=0,result=0,completed_batch_count=0; Profile profile;};
 struct DeviceArgs {uint64_t indices=0,offsets=0,output_indices=0,miss_count=0,address_table=0,valid_table=0,queue_state=0,core_status=0;
- uint32_t request_capacity=0,table_capacity=0,batch_get_max_inflight_total=0;};
+ uint32_t request_capacity=0,table_capacity=0,batch_get_max_inflight_total=0,jettys_per_core=1;};
 struct Context {uint64_t sourceBlocks,sourceOffsets,destinations,count,fallbackAddresses=0,fallbackValid=0;};
 struct Shape {uint32_t batch=4,finalWorkers=4,finalPostOffset=0;};
 struct Args {uint64_t context=0,flags=0,times=0,packedFetch=0;uint32_t prefetchCount=0;};
@@ -45,7 +45,7 @@ constexpr uint64_t kCqTimeout=6,kInvalidArgs=1;
 void CleanCacheLines(uint8_t*,uint64_t){}
 void WriteStatus(KvafBatchGetCoreStatus* s,uint64_t result,uint64_t processed,uint64_t completed,uint64_t,uint64_t,uint64_t,uint64_t){s->magic=123;s->result=result;s->processed_request_count=processed;s->completed_batch_count=completed;}
 void KvafBatchGetDevice(DeviceArgs a,unsigned,unsigned begin,unsigned n){
- assert(a.batch_get_max_inflight_total==2048);auto status=(KvafBatchGetCoreStatus*)a.core_status;
+ assert(a.batch_get_max_inflight_total==2048 && a.jettys_per_core==2);auto status=(KvafBatchGetCoreStatus*)a.core_status;
  calls.emplace_back((int32_t*)a.indices+begin,(int32_t*)a.indices+begin+n);
  offsetCalls.emplace_back((int32_t*)a.offsets+begin,(int32_t*)a.offsets+begin+n);
  destCalls.emplace_back((int32_t*)a.output_indices+begin,(int32_t*)a.output_indices+begin+n);
@@ -89,6 +89,21 @@ def test_prefetch_does_not_reset_owned_final_status():
     root = Path(__file__).resolve().parents[4]
     kernel = (root / 'csrc/operators/lightning_indexer_with_fetch_streaming_qworkers/op_kernel/streaming.cpp').read_text()
     helper = (root / 'csrc/operators/lightning_indexer_with_fetch_streaming_qworkers/op_kernel/staged_fetch_worker.h').read_text()
-    assert 'CompletePrefetch(ctx,b,b>=workers)' in kernel
+    assert 'CompletePrefetch(ctx,b,true,profile?' in kernel
     assert 'if(initializeSpare)' in helper
-    assert 'if(!q){auto status=' in kernel
+    assert 'pair=2*shape.batch+2*(q*workers+lane)' in kernel
+    assert 'args.jettys_per_core=2' in kernel
+
+
+def test_two_jetty_pairs_do_not_overlap_prefetch_or_each_other():
+    for batch in (1, 2, 4, 8, 16):
+        for workers in (1, 2, 4):
+            prefetch = {2 * b for b in range(batch)}
+            pairs = [2 * batch + 2 * (q * workers + lane)
+                     for q in range(4) for lane in range(min(workers, batch))]
+            views = [v for pair in pairs for v in (pair, pair + 1)]
+            capacity = max(batch * 5, 2 * batch + 8 * workers)
+            assert len(views) == len(set(views))
+            assert not prefetch.intersection(views)
+            assert max(views) < capacity
+            assert (capacity + 1) // 2 <= 48

@@ -136,7 +136,12 @@ def run(args, run_dir):
                 run_dir,
                 f"UNIVERSAL binary_sha256={digest} batch={batch} H={history} R={resident} G={heads} windows={windows}",
             )
-            workers = (batch * (final_aivs(batch, "auto", aics, args.final_workers or 0) + 1) + 1) // 2
+            queue_views = batch * (final_aivs(batch, "auto", aics, args.final_workers or 0) + 1)
+            if args.q_workers:
+                # Two contiguous private Jettys for each (Q, worker), after the
+                # prefetch pairs; the original final views may be reused.
+                queue_views = max(queue_views, 2 * batch + 8 * args.q_workers)
+            workers = (queue_views + 1) // 2
             progress(run_dir, f"BS={batch}: DDR Put and transport initialization; logs={folder}")
             owner = Owner.open(
                 torch,
@@ -387,6 +392,10 @@ def run_device(
     stream.synchronize()
     native_check()
     timings = {"native_chain": measure(native_call, native.reset, native_check)}
+    # The previous native chain has prepared stable LIDU descriptors and maps.
+    # Restore only the output so that the captured graph contains KVAF Get alone.
+    timings["native_get_only"] = measure(
+        native.fetch, lambda: native.output.copy_(native.initial_payload), native_check)
     reference = state["native_topk"].cpu().reshape(b, 4, 2048).numpy()
     owner.acquire()
     rotating = launch_module.LIFetchBinding(
@@ -427,6 +436,9 @@ def run_device(
         pipeline = StreamingForward(rotating, update, torch, args.prefetch_tokens, fused_final=args.fused_final, q_workers=args.q_workers)
     else:
         pipeline = LIFetchForward(rotating, update)
+    counter_clock_mhz = pipeline.calibrate_counter_mhz() if args.streaming and args.q_workers else None
+    if counter_clock_mhz is not None:
+        print(f"GetSystemCycle calibration: {counter_clock_mhz:.2f} MHz (independent long graph event)", flush=True)
     saved = [arguments[i].clone() for i in (1, 4, 13)]
 
     def reset():
@@ -791,6 +803,7 @@ def run_device(
                     output_path=args.comparison_sfa)
     return dict(
         status="pass",
+        counter_clock_mhz=counter_clock_mhz,
         timing=timings,
         core_trace=core_trace,
         full_trace=full_trace,

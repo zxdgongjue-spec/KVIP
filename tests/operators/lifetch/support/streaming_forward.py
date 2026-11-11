@@ -70,6 +70,38 @@ class StreamingForward:
         if result:
             raise RuntimeError(f'streaming LIFetch launch failed: {result}')
 
+    def calibrate_counter_mhz(self):
+        """Approximate cycle frequency against a long independent graph event."""
+        if not self.q_workers:
+            return None
+        torch = self.torch
+        output = torch.empty(4, dtype=torch.int64, device=self.rotating.device)
+        function = self.rotating.library.kvip_counter_calibration
+        function.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        function.restype = ctypes.c_uint32
+        stream = torch.npu.current_stream(self.rotating.device)
+        capture = torch.npu.Stream(device=self.rotating.device)
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph, stream=capture):
+            if function(output.data_ptr(), capture.npu_stream):
+                raise RuntimeError('counter calibration launch failed')
+        capture.synchronize()
+        samples = []
+        for _ in range(3):
+            start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
+            start.record(stream)
+            graph.replay()
+            end.record(stream)
+            end.synchronize()
+            values = output.cpu().numpy().astype(np.uint64)
+            elapsed_us = start.elapsed_time(end) * 1000
+            cycles = int(values[1]) - int(values[0])
+            if elapsed_us <= 0 or cycles < 20_000_000:
+                raise RuntimeError('counter calibration returned invalid timing')
+            samples.append(cycles / elapsed_us)
+        graph.reset()
+        return float(np.median(samples))
+
     def set_deferred_fetch(self, enabled):
         # Isolation-only mode, set before launch; never used for graph timing.
         value = np.asarray([512 | ((self.q_workers or 0) << 16) | (0x40000000 if enabled else 0)], dtype='<u4').view('u1')
@@ -87,6 +119,7 @@ class StreamingForward:
         li = raw[self.batch * 64:self.batch * 128].reshape(self.batch, 4, 16)
         fetch = raw[self.batch * 128:].reshape(self.batch, 128 if self.q_workers else 96) if self.fused_final else None
         flags = self.flags.cpu().numpy()
+        posts = (self.rotating.final_posts.cpu().numpy() if hasattr(self, "rotating") else None)
         result = []
         for b in range(self.batch):
             p, u = rows[b, :32], rows[b, 32:]
@@ -120,7 +153,8 @@ class StreamingForward:
                     conflict_cq_wait=int(f[q*24+15]), safe_groups=int(f[q*24+16]),
                     conflict_groups=int(f[q*24+17]), safe_mode=int(f[q*24+20]), total=int(f[q*24+9]-f[q*24]),
                     final_prefetch_join=int(f[q*24+19]-f[q*24+18]) if f[q*24+18] else 0)
-                    for q in range(4)], finalize=dict(prefetch_join=int(f[100]-f[96]), wait=int(f[97]-f[100]),
+                    for q in range(4)], finalize=dict(prefetch_join=int(f[100]-f[96]), prefetch_polls=int(f[101]),
+                    prefetch_cq_poll_cycles=int(f[102]), prefetch_last_cq_observed=int(f[103]), wait=int(f[97]-f[100]),
                     residency=int(f[98]-f[97]), status=int(f[99]-f[98])))
             elif fetch is not None:
                 f = fetch[b]
@@ -136,10 +170,29 @@ class StreamingForward:
                     collect=int(f[52]-f[51]), residency=int(f[53]-f[52]),
                     write_status=int(f[54]-f[53]), span=int(f[54]-f[48]))
             counts = [int(flags[b, phase, 1]) for phase in range(5)]
+            final_counts = ([dict(total=int(post[0]), safe=int(post[5]), conflict=int(post[0]-post[5]))
+                             for post in posts[b]] if posts is not None else None)
             result.append(dict(batch=b, li=queries, producer=producer, update=update, fetch=fetch_detail,
-                               prefetch_changes=counts[0], q_new_misses=counts[1:],
+                               final_counts=final_counts, prefetch_changes=counts[0], q_new_misses=counts[1:],
                                update_wait=waits,
                                input_and_bitmap=int(p[2]-p[1]), initialize=int(p[3]-p[2]),
                                metadata=int(u[23]-u[22]), consumer_start=int(u[10]),
                                consumer_finish=int(u[24]), producer_finish=int(p[8])))
+        if self.q_workers and hasattr(self, "rotating"):
+            events = self.rotating.events.cpu().numpy().reshape(-1, 128).view('<u8')
+            first = events[:, 11]
+            last = events[:, 12]
+            first_nonzero = first[first != 0]
+            last_nonzero = last[last != 0]
+            rows = self.rotating.rows.cpu().numpy().view(np.uint32).reshape(self.batch, -1)
+            prefetch_count = int(rows[:, 9].astype(np.uint64).sum())
+            finish = [int(fetch[b, 103]) for b in range(self.batch) if int(rows[b, 9]) and int(fetch[b, 103])]
+            if prefetch_count and len(first_nonzero) and finish:
+                start = int(first_nonzero.min())
+                end = max(finish)
+                result[0]['prefetch_scope'] = dict(
+                    requests=prefetch_count, bytes=prefetch_count * 656,
+                    first_doorbell=start, last_doorbell=int(last_nonzero.max()),
+                    last_cq_observed=end, interval_cycles=max(0, end - start),
+                    note='first doorbell to last CQ observed; includes polling delay and LI-window gaps')
         return result

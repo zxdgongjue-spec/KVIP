@@ -62,12 +62,24 @@ def test_query_worker_timing_and_assignment_are_distinct():
     u[10:25] = np.arange(20, 35)
     f[96:100] = [50, 60, 70, 80]
     f[100] = 54
+    f[101:104] = [7, 3, 53]
     flags = np.zeros((1, 12, 32), dtype=np.int32)
     flags[0, :5, 1] = [100, 1, 2, 3, 4]
     pipeline.times, pipeline.flags = HostTensor(words), HostTensor(flags)
+    class Rotating:
+        pass
+    pipeline.rotating = Rotating()
+    events = np.zeros((1, 1, 128), dtype=np.uint8)
+    events.view('<u8').reshape(-1, 16)[0, 11:13] = [40, 45]
+    rows = np.zeros((1, 256), dtype=np.int32)
+    rows[0, 9] = 5
+    pipeline.rotating.events, pipeline.rotating.rows = HostTensor(events), HostTensor(rows)
+    pipeline.rotating.final_posts = HostTensor(np.zeros((1, 4, 32), dtype=np.int32))
     data = pipeline.diagnostic_cycles()[0]
+    assert data['prefetch_scope']['bytes'] == 5 * 656
+    assert data['prefetch_scope']['interval_cycles'] == 13
     assert data['q_new_misses'] == [1, 2, 3, 4]
     assert data['fetch']['queries'][2]['safe_mode'] == 1
     assert data['fetch']['queries'][2]['safe_cq_wait'] == 2
     assert data['fetch']['queries'][2]['conflict_groups'] == 6
-    assert data['fetch']['finalize'] == {'prefetch_join': 4, 'wait': 6, 'residency': 10, 'status': 10}
+    assert data['fetch']['finalize'] == {'prefetch_join': 4, 'prefetch_polls': 7, 'prefetch_cq_poll_cycles': 3, 'prefetch_last_cq_observed': 53, 'wait': 6, 'residency': 10, 'status': 10}
