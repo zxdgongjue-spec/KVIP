@@ -17,8 +17,12 @@ extern "C" __global__ __aicore__ void v9_li_kernel(GM_ADDR bindings) {
     using Type=QLIType<fp8_e4m3fn_t,fp8_e4m3fn_t,int32_t,true,LI_LAYOUT::BSND,LI_LAYOUT::PA_BSND,
         bfloat16_t,float,float,uint16_t>;
     QLIKernel::QuantLightningIndexerKernel<Type> op;
-    auto shape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(a[14]));
+    auto ctx = reinterpret_cast<__gm__ rotating::Context*>(a[14]);
+    auto shape = rotating::LoadRuntimeShape(ctx);
     op.runtimeShape_ = shape;
+    // A zero prefetch budget makes this a pure LI diagnostic: do not enter
+    // the epoch-ordered Rotation Service from the LI kernel.
+    op.SetRotationEnabled(ctx->prefetchLimit != 0);
     QLITilingData tiling{shape.batch,shape.batch*4,shape.indexHeads,4,shape.history,
         2048,shape.liCores,128,shape.history/128,0,16384,128,shape.resident,shape.splitQ,shape.aicCount};
 #define P(i) reinterpret_cast<GM_ADDR>(a[i])
