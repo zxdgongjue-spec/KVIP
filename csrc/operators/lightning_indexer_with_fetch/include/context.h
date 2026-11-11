@@ -63,16 +63,6 @@ __aicore__ inline RuntimeShape LoadRuntimeShape(const __gm__ Context* ctx) {
     for(uint32_t i=0;i<sizeof(result)/sizeof(uint32_t);++i)output[i]=input[i];
     return result;
 }
-__aicore__ inline uint32_t ColdBitmapPairEnd(const __gm__ Context* ctx,uint32_t batch,uint32_t history) {
-    if (!ctx->queryEnds) return history;
-    auto bounds=reinterpret_cast<const __gm__ uint32_t*>(ctx->queryEnds)+batch*4;
-    for (uint32_t q=0;q<4;++q) {
-        uint32_t end=bounds[q];
-        if (end<history) history=end;
-    }
-    // Only pair whole tiles that are valid for every query.
-    return history/128*128;
-}
 #endif
 // Even views remain prefetch-owned. Reuse spare odd views, then extra views.
 V9_DEVICE inline uint32_t FinalQueue(uint32_t rt_batch,uint32_t rt_finalWorkers,uint32_t batch,uint32_t worker) {
