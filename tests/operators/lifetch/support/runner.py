@@ -111,6 +111,14 @@ def supervise(command, run, heartbeat_seconds=20, timeout_seconds=300):
     if cases.exists():
         lines.extend(cases.read_text().splitlines())
     if not passed:
+        for audit in run.rglob("streaming_fetch_kv_mismatch.json"):
+            try:
+                data = json.loads(audit.read_text())
+                compact = {key: data[key] for key in ("batch", "mismatch_positions", "posts")}
+                compact["examples"] = data.get("examples", [])[:3]
+                lines.append(f"STREAMING FETCH KV AUDIT: {json.dumps(compact)}; details={audit}")
+            except (OSError, ValueError, KeyError) as error:
+                lines.append(f"Could not read streaming fetch audit {audit}: {error}")
         # At most four short tails, including exceptions before native logging.
         logs = [p for p in run.rglob("*.log") if p.name in ("native.log", "error.log", "build.log", "configure.log")]
         logs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
