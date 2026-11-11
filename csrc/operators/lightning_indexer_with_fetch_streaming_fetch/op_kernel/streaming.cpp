@@ -226,7 +226,13 @@ __aicore__ inline void FetchQueries(__gm__ Args* a,uint32_t b) {
    uint32_t begin=post->descriptor+(phase?post->nonconflicting:0);
    if(phase && count && !joined){CompletePrefetch(ctx,b);joined=true;error|=row->error;}
 #if !V9_SIMULATION
-   if(count && !error){kvaf_device::KvafBatchGetDevice(args,0,begin,count);
+   if(count && !error){
+    // Same queue ownership protocol as final_fetch_phase.h: the queue was
+    // previously used by a different kernel/AIV, so refresh its SQ/CQ state.
+    auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args.queue_state);
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
+    kvaf_device::KvafBatchGetDevice(args,0,begin,count);
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
     auto done=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(args.core_status);
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(done),sizeof(*done));
     error|=done->result;completed=done->completed_batch_count;
