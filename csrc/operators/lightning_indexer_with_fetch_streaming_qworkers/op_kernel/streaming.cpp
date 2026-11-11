@@ -223,6 +223,46 @@ inline void PublishStreamingResidency(uint32_t resident,uint32_t postOffset,__gm
     }
     asc_threadfence();
 }
+// One VF handles every request assigned to this Q worker. All slot stores
+// complete before any completion flag is released. The scalar caller has joined
+// Index update; failure is reported without publishing successful residency.
+__simt_vf__ __aicore__ LAUNCH_BOUND(256)
+inline void PublishQueryCompletion(__gm__ Context* ctx,__gm__ BatchFlag* flags,
+ uint32_t batch,uint32_t resident,uint32_t postOffset,uint32_t q,uint32_t lane,
+ uint32_t workers,uint64_t error,uint32_t completed) {
+ for(uint32_t b=lane;b<batch;b+=workers){
+  auto post=reinterpret_cast<__gm__ FinalPost*>(ctx->owners+postOffset)+b*4+q;
+  if(!error && ctx->hotValid){
+   auto valid=reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+OwnerRow(ctx,b)*resident;
+   uint32_t base=OwnerRow(ctx,b)*OutputStride(resident,ctx);
+   auto destinations=reinterpret_cast<__gm__ int32_t*>(ctx->destinations);
+   uint32_t count=asc_ldcg(&post->count),begin=asc_ldcg(&post->descriptor);
+   for(uint32_t i=threadIdx.x;i<count;i+=256){
+    uint32_t slot=uint32_t(asc_ldcg(destinations+begin+i))-base;
+    if(slot<resident)asc_stcg(valid+slot,uint32_t(1));
+   }
+  }
+  if(!threadIdx.x){asc_stcg(&post->pending,b==lane?completed:0U);
+   asc_stcg(&post->error,uint32_t(error));asc_stcg(&post->deferred,0U);}
+ }
+ asc_threadfence();asc_syncthreads();
+ for(uint32_t b=lane+threadIdx.x*workers;b<batch;b+=256*workers){
+  auto flag=flags+b*kFlagCount+8+q;
+  asc_stcg(&flag->error,uint32_t(error));asc_threadfence();asc_stcg(&flag->ready,1U);
+ }
+ asc_threadfence();
+}
+__simt_vf__ __aicore__ LAUNCH_BOUND(256)
+inline void PublishPrefetchResidency(__gm__ Context* ctx,uint32_t b,uint32_t resident){
+ if(ctx->hotValid && ctx->changes && ctx->lruSlots){
+  auto valid=reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+OwnerRow(ctx,b)*resident;
+  auto changes=reinterpret_cast<__gm__ int32_t*>(ctx->changes)+b*kChangeCapacity;
+  auto lru=reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots;
+  for(uint32_t i=threadIdx.x;i<kLruSlots;i+=256)
+   if(asc_ldcg(changes+i)>=0)asc_stcg(valid+asc_ldcg(lru+i),1U);
+ }
+ asc_threadfence();
+}
 // Compact each ready request's descriptors into the worker's private slice.
 // The source block indices still refer to the original immutable address table.
 __simt_vf__ __aicore__ LAUNCH_BOUND(256) inline void PackFetchRanges(
@@ -347,6 +387,29 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
    ft[16+phase]=groups;ft[20]=3; // shared Q-worker group, not per-request time
   }
  }
+ if(a->prefetchCount & 0x10000000U){
+  auto trace=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*256+
+      uint64_t(2*shape.batch+q*workers+lane)*32;
+  if(profile)trace[12]=GetSystemCycle();
+  // Update may invalidate displaced hot slots. Publish only after it finishes.
+  for(uint32_t b=lane;b<shape.batch;b+=workers){
+   auto flag=allFlags+b*kFlagCount+6;uint64_t start=GetSystemCycle();
+   while(true){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flag),sizeof(*flag));
+    if(flag->ready){error|=flag->error;break;}
+    if(GetSystemCycle()-start>5000000000ULL){error|=kvaf_device::kCqTimeout;break;}}
+  }
+  if(profile)trace[13]=GetSystemCycle();
+  Simt::VF_CALL<PublishQueryCompletion>(Simt::Dim3{256,1,1},ctx,allFlags,shape.batch,
+      shape.resident,shape.finalPostOffset,q,lane,workers,error,completed);
+  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+  uint64_t published=profile?GetSystemCycle():0;
+  if(profile){trace[14]=published;
+   for(uint32_t b=lane;b<shape.batch;b+=workers){
+    auto ft=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*128+uint64_t(b)*128+q*24;
+    ft[9]=published;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ft),24*8);}
+   trace[15]=GetSystemCycle();}
+  return;
+ }
  for(uint32_t b=lane;b<shape.batch;b+=workers){
   auto post=FinalPostAt(shape.finalPostOffset,ctx,b*shape.finalWorkers+q);
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
@@ -375,7 +438,14 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+f),sizeof(BatchFlag));
   if(flags[f].ready){error|=flags[f].error;break;}
   if(GetSystemCycle()-start>5000000000ULL){error|=kvaf_device::kCqTimeout;break;}}
-  if(profile)ft[9+2*(f-6)]=GetSystemCycle();}
+  if(profile)ft[9+2*(f-6)]=GetSystemCycle();
+  if(f==6 && (a->prefetchCount & 0x10000000U)){
+   if(profile)ft[20]=GetSystemCycle();
+   if(!error){Simt::VF_CALL<PublishPrefetchResidency>(Simt::Dim3{256,1,1},ctx,b,shape.resident);
+    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);}
+   if(profile)ft[21]=GetSystemCycle();
+  }
+ }
  auto info=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),kRowStatusWords*4);
  auto update=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);
@@ -399,7 +469,7 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
  }
  if(row->pending || total!=info[1])error|=kvaf_device::kInvalidArgs;
  if(profile)ft[1]=GetSystemCycle();
- if(!error && !updateError){
+ if(!error && !updateError && !(a->prefetchCount & 0x10000000U)){
   Simt::VF_CALL<PublishStreamingResidency>(Simt::Dim3{256,1,1},shape.resident,shape.finalPostOffset,ctx,b);
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  }

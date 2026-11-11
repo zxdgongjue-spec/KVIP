@@ -26,7 +26,7 @@ struct KvafBatchGetCoreStatus {uint64_t magic=123,processed_request_count=0,resu
 struct DeviceArgs {uint64_t indices=0,offsets=0,output_indices=0,miss_count=0,address_table=0,valid_table=0,queue_state=0,core_status=0;
  uint32_t request_capacity=0,table_capacity=0,batch_get_max_inflight_total=0,jettys_per_core=1;};
 struct Context {uint64_t sourceBlocks,sourceOffsets,destinations,count,fallbackAddresses=0,fallbackValid=0;};
-struct Shape {uint32_t batch=4,finalWorkers=4,finalPostOffset=0;};
+struct Shape {uint32_t batch=4,finalWorkers=4,finalPostOffset=0,resident=16384;};
 struct Args {uint64_t context=0,flags=0,times=0,packedFetch=0;uint32_t prefetchCount=0;};
 Shape LoadRuntimeShape(Context*){return {};}
 FinalPost posts[16];DeviceArgs deviceArgs[20];std::vector<std::vector<int32_t>> calls,offsetCalls,destCalls;
@@ -39,6 +39,7 @@ enum class HardEvent {V_S};template<HardEvent>void SetFlag(int){} template<HardE
 void PackFetchRanges(Context* c,int32_t* p,uint32_t stride,uint32_t* ranges,uint32_t rows){
  for(unsigned r=0;r<rows;r++){auto begin=ranges[3*r],count=ranges[3*r+1],out=ranges[3*r+2];
  for(unsigned i=0;i<count;i++){p[out+i]=((int32_t*)c->sourceBlocks)[begin+i];p[stride+out+i]=((int32_t*)c->sourceOffsets)[begin+i];p[2*stride+out+i]=((int32_t*)c->destinations)[begin+i];}}}
+void PublishQueryCompletion(Context*,BatchFlag*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint64_t,uint32_t){}
 namespace Simt {struct Dim3{int x,y,z;};template<auto f,class... T>void VF_CALL(Dim3,T... a){f(a...);}}
 namespace kvaf_device {
 constexpr uint64_t kCqTimeout=6,kInvalidArgs=1;

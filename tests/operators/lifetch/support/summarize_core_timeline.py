@@ -37,6 +37,7 @@ def decode(raw):
                 add('prefetch_CQ_join', f[96], f[100])
                 for i, name in enumerate(('index_update','prefetch_ready','Q1_fetch','Q2_fetch','Q3_fetch','Q4_fetch')):
                     add('wait.'+name, f[104+2*i], f[105+2*i])
+                if f[116]: add('prefetch_residency', f[116], f[117])
                 add('residency', f[97], f[98])
                 add('status', f[98], f[99])
             else:
@@ -56,6 +57,10 @@ def decode(raw):
                     continue
                 for i, step in enumerate(('prepare','input_layout','queue_setup','KVAF_Get')):
                     add(f'{name}.{step}', t[i], t[i+1])
+            if c[12]:
+                add('finalize.wait_index', c[12], c[13])
+                add('finalize.residency_and_ack', c[13], c[14])
+                add('finalize.diagnostic_write', c[14], c[15])
             for b in range(lane, batch, workers):
                 ft = fetch[b][q*24:q*24+24]
                 add(f'request{b}.wait_Q_ready', ft[0], ft[1])
