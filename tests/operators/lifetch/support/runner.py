@@ -119,7 +119,7 @@ def supervise(command, run, heartbeat_seconds=20, timeout_seconds=300):
                 compact = {key: data[key] for key in ("batch", "mismatch_positions", "posts")}
                 compact["phase"] = data.get("phase", "unknown")
                 compact["examples"] = data.get("examples", [])[:3]
-                for key in ("actual_sq_writers", "initial_output_matches", "sq_audit_error"):
+                for key in ("actual_sq_writers", "final_wqe_comparison", "initial_output_matches", "sq_audit_error"):
                     if key in data:
                         compact[key] = data[key]
                 lines.append(f"STREAMING FETCH KV AUDIT: {json.dumps(compact)}; details={audit}")

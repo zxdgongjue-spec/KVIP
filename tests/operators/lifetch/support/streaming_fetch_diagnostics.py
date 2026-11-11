@@ -43,7 +43,7 @@ def summarize_mismatches(row, selected, ids, slots, output, payload, destination
                 posts=posts[:, :6].astype(np.int64).tolist())
 
 
-def audit_queue_writes(owner, rows, posts, row, bad_slots):
+def audit_queue_writes(owner, rows, posts, row, bad_slots, destinations, remote_addresses):
     """Read already-completed SQ entries on failure; no device work is submitted."""
     import ctypes
 
@@ -77,6 +77,7 @@ def audit_queue_writes(owner, rows, posts, row, bad_slots):
             queue = read(int(contexts[view, 9]), 64).view('<u8')
             queue_specs.append((f'b{owner_row}_final_q{q+1}', view, int(queue[1]) - count, count))
     result = []
+    final_checks = []
     for name, view, start, count in queue_specs:
         if not count:
             continue
@@ -92,6 +93,17 @@ def audit_queue_writes(owner, rows, posts, row, bad_slots):
         sq = np.concatenate(chunks).view('<u4').reshape(count, 16)
         local = sq[:, 14].astype(np.uint64) | (sq[:, 15].astype(np.uint64) << np.uint64(32))
         remote = sq[:, 10].astype(np.uint64) | (sq[:, 11].astype(np.uint64) << np.uint64(32))
+        if '_final_q' in name:
+            owner_row = int(name.split('_')[0][1:])
+            query = int(name.rsplit('q', 1)[1]) - 1
+            begin = int(posts[owner_row, query, 4])
+            wanted_local = np.uint64(owner.output.data_ptr()) + destinations[begin:begin+count].astype(np.uint64) * np.uint64(656)
+            wanted_remote = remote_addresses[begin:begin+count].astype(np.uint64)
+            different = np.flatnonzero((local != wanted_local) | (remote != wanted_remote))
+            final_checks.append(dict(queue=name, checked=count, mismatches=int(len(different)),
+                examples=[dict(index=int(i), actual_local=hex(int(local[i])), expected_local=hex(int(wanted_local[i])),
+                               actual_remote=hex(int(remote[i])), expected_remote=hex(int(wanted_remote[i])))
+                          for i in different[:3]]))
         for slot in bad_slots:
             expected = int(owner.output.data_ptr()) + (row * owner.output.shape[1] + int(slot)) * 656
             lengths = sq[:, 12].astype(np.uint64)
@@ -99,4 +111,4 @@ def audit_queue_writes(owner, rows, posts, row, bad_slots):
                 result.append(dict(queue=name, sq_index=int((start + int(i)) % depth), slot=int(slot),
                                    local=hex(int(local[i])), remote=hex(int(remote[i])),
                                    length=int(sq[i, 12])))
-    return result
+    return result, final_checks

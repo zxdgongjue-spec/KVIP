@@ -545,8 +545,11 @@ def run_device(
                     report_path.write_text(json.dumps(report, indent=2) + "\n")
                     try:
                         from streaming_fetch_diagnostics import audit_queue_writes
-                        report["actual_sq_writers"] = audit_queue_writes(
-                            owner, rows, posts, row, [item["slot"] for item in report["examples"]])
+                        destinations = rotating.destinations.cpu().numpy().reshape(-1)
+                        remote = rotating.fallback_addresses.cpu().numpy().reshape(-1).view(np.uint64)
+                        report["actual_sq_writers"], report["final_wqe_comparison"] = audit_queue_writes(
+                            owner, rows, posts, row, [item["slot"] for item in report["examples"]],
+                            destinations, remote)
                     except Exception as exc:
                         report["sq_audit_error"] = f"{type(exc).__name__}: {exc}"
                     report_path.write_text(json.dumps(report, indent=2) + "\n")

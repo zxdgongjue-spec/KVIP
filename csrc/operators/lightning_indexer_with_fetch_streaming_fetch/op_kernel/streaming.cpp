@@ -60,6 +60,17 @@ __aicore__ inline void PublishQueryOutputs(__gm__ uint64_t* update,uint32_t batc
  }
  SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
 }
+// The producer and Fetch AIV execute in the same kernel. A kernel boundary no
+// longer provides descriptor visibility: release and invalidate the exact
+// compact range before publishing/consuming its Q-ready flag.
+__aicore__ inline void SyncFetchDescriptors(__gm__ Context* ctx, uint32_t begin, uint32_t count) {
+ if(!count)return;
+ kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->sourceBlocks)+uint64_t(begin)*4,uint64_t(count)*4);
+ kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->sourceOffsets)+uint64_t(begin)*4,uint64_t(count)*4);
+ kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->destinations)+uint64_t(begin)*4,uint64_t(count)*4);
+ if(ctx->fallbackAddresses)
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->fallbackAddresses)+uint64_t(begin)*8,uint64_t(count)*8);
+}
 __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
@@ -116,6 +127,7 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
    Simt::VF_CALL<PackStagedUrmaQuery>(Simt::Dim3{512,1,1},shape.history,shape.resident,shape.tokenBytes,b,row->slots,total-added,added,ctx,
     FinalPtr(selected),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(ctl));
    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);error=ctl.GetValue(1);
+   if(!error)SyncFetchDescriptors(ctx,b*kSlots+total-added,added);
    PrepareFinalFetch(shape.finalWorkers,shape.finalPostOffset,ctx,b,q,error?0:ctl.GetValue(16),
       b*kSlots+total-added,error,error?0:ctl.GetValue(17));
   }
@@ -200,6 +212,9 @@ __aicore__ inline void FetchQueries(__gm__ Args* a,uint32_t b) {
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
   error|=flags[q+1].error|post->error;
   if(post->nonconflicting>post->count)error|=kvaf_device::kInvalidArgs;
+  if(post->descriptor>shape.batch*kSlots || post->count>shape.batch*kSlots-post->descriptor)
+   error|=kvaf_device::kInvalidArgs;
+  if(!error)SyncFetchDescriptors(ctx,post->descriptor,post->count);
   auto args=GetArgs(ctx,FinalQueue(shape.batch,shape.finalWorkers,b,q));
   args.indices=ctx->sourceBlocks;args.offsets=ctx->sourceOffsets;
   args.output_indices=ctx->destinations;args.miss_count=ctx->count;
