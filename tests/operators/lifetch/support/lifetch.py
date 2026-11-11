@@ -226,11 +226,30 @@ def run(args, run_dir):
 
 
 
-def run_v9_li_varlen_only(args, b, torch, torch_npu, device, owner, arguments, fixture, native_li, launch_module, build, aics):
+def run_v9_li_varlen_only(
+    args, b, torch, torch_npu, device, owner, arguments, fixture,
+    native_li, launch_module, build, aics, folder,
+):
     """Exercise only v9_init + v9_li + v9_wait with per-request Q/K lengths."""
     from kvip.adapters.vllm.inputs import QueryInputs
+    from stage_diagnostics import record_stage, run_synchronized_stage
 
     history, resident = args.history, args.resident
+    stage_log = Path(folder) / "li-varlen-stage.jsonl"
+    record_stage(
+        stage_log,
+        "setup",
+        "test",
+        "begin",
+        batch=b,
+        history=history,
+        resident=resident,
+        index_heads=args.index_heads,
+        aic_count=aics,
+        soc=args.soc,
+        device=args.device,
+        prefetch_limit=0,
+    )
     inputs = QueryInputs(
         torch, b, device, pin_memory=True, history=history, index_heads=args.index_heads
     )
@@ -288,28 +307,69 @@ def run_v9_li_varlen_only(args, b, torch, torch_npu, device, owner, arguments, f
             for count, key_len in zip(counts, expected_k)
             for _ in range(count)
         ]
-        inputs.prepare(
-            counts,
-            query_starts=scenario["query_starts"],
-            query_owners=tuple(range(b)),
+        record_stage(
+            stage_log,
+            scenario["name"],
+            "round",
+            "begin",
+            query_counts=list(counts),
+            query_starts=list(scenario["query_starts"]),
+            expected_key_lengths=list(expected_k),
+            packed_position_count=len(packed_positions),
         )
-        inputs.bind_positions(
-            torch.tensor(packed_positions, dtype=torch.int64, device=device)
+        run_synchronized_stage(
+            stage_log,
+            scenario["name"],
+            "bind_runtime_lengths",
+            lambda: (
+                inputs.prepare(
+                    counts,
+                    query_starts=scenario["query_starts"],
+                    query_owners=tuple(range(b)),
+                ),
+                inputs.bind_positions(
+                    torch.tensor(packed_positions, dtype=torch.int64, device=device)
+                ),
+            ),
+            stream.synchronize,
         )
-        stream.synchronize()
 
         actual_q = tuple(int(x) for x in query_lengths.cpu().tolist())
         actual_k = tuple(int(x) for x in key_lengths.cpu().tolist())
         if actual_q != counts or actual_k != expected_k:
+            record_stage(
+                stage_log,
+                scenario["name"],
+                "length_validation",
+                "failed",
+                actual_query_lengths=list(actual_q),
+                actual_key_lengths=list(actual_k),
+            )
             raise AssertionError(
                 f"{scenario['name']}: actual Q/K lengths "
                 f"{actual_q}/{actual_k} != {counts}/{expected_k}"
             )
+        record_stage(
+            stage_log,
+            scenario["name"],
+            "length_validation",
+            "completed",
+            actual_query_lengths=list(actual_q),
+            actual_key_lengths=list(actual_k),
+            query_lengths_ptr=q_ptr,
+            key_lengths_ptr=k_ptr,
+            query_ends_ptr=ends_ptr,
+        )
 
         fixture["li_query_lengths"] = query_lengths
         fixture["actual_key"] = key_lengths
-        native_output = native_li(torch_npu, fixture).reshape(b, 4, 2048)
-        torch.npu.synchronize()
+        native_output = run_synchronized_stage(
+            stage_log,
+            scenario["name"],
+            "native_li",
+            lambda: native_li(torch_npu, fixture).reshape(b, 4, 2048),
+            torch.npu.synchronize,
+        )
 
         # The zero-miss fixture guarantees every native TopK is resident.
         for row, q_len in enumerate(counts):
@@ -321,13 +381,46 @@ def run_v9_li_varlen_only(args, b, torch, torch_npu, device, owner, arguments, f
                     f"{scenario['name']}: native TopK escaped the resident range at row {row}"
                 )
 
-        topk.fill_(0x5A5A5A5A)
-        rotating.reset()
-        owner.reset()
+        def reset_v9_round():
+            topk.fill_(0x5A5A5A5A)
+            rotating.reset()
+            owner.reset()
+
+        run_synchronized_stage(
+            stage_log,
+            scenario["name"],
+            "reset_v9_state",
+            reset_v9_round,
+            stream.synchronize,
+        )
         owner.mark_launched()
-        rotating.launch_compute()
-        rotating.wait()
-        stream.synchronize()
+        record_stage(
+            stage_log,
+            scenario["name"],
+            "v9_launch",
+            "owner_marked_in_flight",
+        )
+        run_synchronized_stage(
+            stage_log,
+            scenario["name"],
+            "v9_init",
+            lambda: rotating._call("init"),
+            stream.synchronize,
+        )
+        run_synchronized_stage(
+            stage_log,
+            scenario["name"],
+            "v9_li",
+            lambda: rotating._call("li"),
+            stream.synchronize,
+        )
+        run_synchronized_stage(
+            stage_log,
+            scenario["name"],
+            "v9_wait",
+            lambda: rotating._call("wait"),
+            stream.synchronize,
+        )
 
         # v9_wait drains the LI-stage prefetch CQ. No final queue is submitted
         # in this LI-only test, so only the prefetch status is authoritative.
@@ -343,7 +436,23 @@ def run_v9_li_varlen_only(args, b, torch, torch_npu, device, owner, arguments, f
         if bool(np.any(rows[:, 11] != 0)) or bool(np.any(rows[:, 211] != 0)):
             raise AssertionError(f"{scenario['name']}: LI row error or pending WQE remains")
 
+        record_stage(
+            stage_log,
+            scenario["name"],
+            "prefetch_completion",
+            "verified",
+            status_rows=int(status_words.shape[0]),
+            row_error_words=rows[:, 11].tolist(),
+            row_pending_words=rows[:, 211].tolist(),
+        )
         owner.mark_completed(completion_verified=True)
+        record_stage(
+            stage_log,
+            scenario["name"],
+            "owner_state",
+            "marked_completed",
+            completion_verified=True,
+        )
 
         active_queries = 0
         padded_queries = 0
@@ -372,6 +481,15 @@ def run_v9_li_varlen_only(args, b, torch, torch_npu, device, owner, arguments, f
         ):
             raise AssertionError("Q/K/query-end buffer addresses changed between forwards")
 
+        record_stage(
+            stage_log,
+            scenario["name"],
+            "round",
+            "passed",
+            active_queries_checked=active_queries,
+            padded_queries_checked=padded_queries,
+            length_buffers_stable=True,
+        )
         summaries.append(
             {
                 "name": scenario["name"],
@@ -448,7 +566,7 @@ def run_device(
     if getattr(args, "li_only_varlen", False):
         return run_v9_li_varlen_only(
             args, b, torch, torch_npu, device, owner, arguments, fixture,
-            native_li, launch_module, build, aics,
+            native_li, launch_module, build, aics, folder,
         )
     stream = torch.npu.current_stream(device)
     capture = torch.npu.Stream(device=device)
