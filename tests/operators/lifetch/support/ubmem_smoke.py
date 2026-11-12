@@ -85,6 +85,8 @@ def check_shape(
     comparison_sfa=None,
     trace_rounds=0,
     trace_output=None,
+    optimized=False,
+    q_workers=2,
 ):
     batch, history, resident, token_bytes = shape.batch, shape.history, shape.resident, shape.token_bytes
     fixture = controlled_fixture(history, resident, shape.heads, miss_percent)
@@ -195,6 +197,12 @@ def check_shape(
             extended_work=workspace.index_work,
         )
         forward = LIFetchForward(rotating, update)
+        if optimized:
+            from streaming_forward import StreamingForward
+            forward = StreamingForward(rotating, update, torch, prefetch_tokens, fused_final=True, q_workers=q_workers)
+            forward.prepare_metadata = True
+            forward.parallel_finalize = True
+            forward.set_diagnostics(False)
 
         def verify(owners, *, phase, counts=None, padding=False):
             stream.synchronize()
@@ -449,7 +457,7 @@ def check_shape(
                 folder = trace_output / f"b{batch}-h{history}-r{resident}-w{token_bytes}"
                 collect_ubmem(torch, rotating, graph, restore_fixture,
                               lambda: verify(list(range(1, batch + 1)), phase="profiled_replay"),
-                              trace_rounds, folder)
+                              trace_rounds, folder, streaming=forward if optimized else None)
         graph.reset()
         graph = None
         lease.close()
@@ -484,6 +492,8 @@ def check_shape(
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--optimized-resolve", action="store_true")
+    parser.add_argument("--q-workers", type=int, choices=(1, 2, 4), default=2)
     parser.add_argument("--build-dir", type=Path, required=True)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--kvaf-server", required=True, help="KVAF CPU service host:port")
@@ -511,6 +521,9 @@ def main():
         parser.error("trace-rounds requires iterations and trace-output")
     if not 0 <= args.miss_percent <= 100:
         parser.error("miss-percent must be in 0..100")
+    if args.optimized_resolve and (args.runtime_shapes or args.history != 131072 or args.resident != 16384
+            or args.index_heads != 32 or max(args.batches) > 16 or max(args.prefetch_tokens) > 512):
+        parser.error("optimized UBmem requires B1..16/H131072/R16384/heads32/prefetch<=512")
     import kvaf
     import torch
     import torch_npu  # noqa: F401
@@ -529,7 +542,7 @@ def main():
         cases.append((args.batches[0], 33024, 8192, args.token_bytes[0]))
     for batch, history, resident, token_bytes in cases:
         shape = UbmemGeometry(batch, history, resident, args.index_heads, token_bytes, aics, 8, args.soc)
-        library = build_ubmem_library(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape)
+        library = build_ubmem_library(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape, optimized=args.optimized_resolve)
         if selected_library is None:
             selected_library = library.resolve()
             print(f"UBMEM_RUNTIME_BINARY path={selected_library} sha256={hashlib.sha256(library.read_bytes()).hexdigest()}",
@@ -553,6 +566,8 @@ def main():
                 args.comparison_sfa,
                 args.trace_rounds,
                 args.trace_output,
+                args.optimized_resolve,
+                args.q_workers,
             )
 
 

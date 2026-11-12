@@ -26,7 +26,8 @@ struct alignas(128) Row {
     uint64_t reserved2;
     uint32_t epochOrder[kMaxRounds], sequence;
     uint32_t finalRequests, finalPending;
-    uint64_t finalCompleted, finalBegin, finalEnd;
+    union { uint64_t finalCompleted; uint64_t finalHead; };
+    uint64_t finalBegin, finalEnd;
 };
 struct alignas(128) Event {
     uint64_t begin, end;
@@ -76,5 +77,9 @@ UB_SCHEDULE_DEVICE inline int32_t EpochAt(uint32_t batch,uint32_t history,uint32
     uint32_t rank=split?(core%2)*batch+core/2:core,epoch=rank/serviceAics;
     return epoch<rounds && RuntimeTrigger(history,resident,rounds,epoch)==tile ? int32_t(epoch) : -1;
 }
+#if KVIP_STREAMING_UBMEM
+UB_SCHEDULE_DEVICE inline uint32_t ServiceRank(uint32_t batch,uint32_t split,uint32_t core) {return split?(core%2)*batch+core/2:core;}
+UB_SCHEDULE_DEVICE inline uint32_t SequenceHalfWindow(const RuntimeShape& s) {return (s.history-s.resident)/(2*(s.rounds-1));}
+#endif
 #undef UB_SCHEDULE_DEVICE
 }

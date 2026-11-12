@@ -1,6 +1,9 @@
 #include "kernel_operator.h"
 #if defined(__CCE_AICORE__)
 #include "context.h"
+#if KVIP_STREAMING_UBMEM
+#include "../../lightning_indexer_with_fetch_streaming_qworkers/op_kernel/pipeline_types.h"
+#endif
 #include "prefetch.h"
 #include "../../common/lifetch/final_scratch.h"
 #include "ubmem/fused_batch_get_device.h"
@@ -134,6 +137,19 @@ extern "C" __global__ __aicore__ void kvip_ubmem_init_kernel(GM_ADDR bindings) {
         auto ctx=GetContext(bindings);const auto shape=LoadRuntimeShape(ctx);
         uint32_t b=GetBlockIdx();if(b>=shape.batch)return;
         InitializeRound(ctx,b);
+#if KVIP_STREAMING_UBMEM
+        auto a=reinterpret_cast<__gm__ pipeline_ab::Args*>(reinterpret_cast<__gm__ uint64_t*>(bindings)[15]);
+        TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,4096*4);
+        auto zero=scratch.Get<uint32_t>();Duplicate(zero,0U,4096);
+        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        FillWords(a->flags+uint64_t(b)*pipeline_ab::kFlagCount*sizeof(pipeline_ab::BatchFlag),pipeline_ab::kFlagCount*32,zero);
+        FillWords(a->workerStatus+uint64_t(b)*128,32,zero);
+        FillWords(a->queryErrors+uint64_t(b)*512,128,zero);
+        uint32_t workers=(a->prefetchCount>>16)&255,ds=shape.batch*2048,meta=(3*shape.batch+31)&~31U;
+        for(uint32_t g=b;g<4*workers;g+=shape.batch)
+            FillWords(a->packedFetch+uint64_t(4*workers*(3*ds+meta)+g*(6*ds+64)+6*ds)*4,64,zero);
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);pipe.Destroy();
+#endif
         auto region=UbmemRegionAt(ctx);
         auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
         uint64_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;

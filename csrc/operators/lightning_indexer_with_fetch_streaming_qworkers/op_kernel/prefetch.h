@@ -1,4 +1,9 @@
 #pragma once
+#if V9_UBMEM
+#include "../../lightning_indexer_with_fetch_ubmem/op_kernel/controller/prefetch.h"
+namespace kvaf_device { using ubmem_device::CleanCacheLines; constexpr uint32_t kInvalidArgs=0x20000, kCqTimeout=0x40000; }
+#else
+#pragma once
 
 // Imported from rotation_device.h
 
@@ -935,3 +940,5 @@ __aicore__ inline void Service(uint32_t rt_batch,uint32_t rt_history,uint32_t rt
     FastService(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow,captureIo);
 }
 }
+
+#endif

@@ -67,3 +67,19 @@ int main() {
     exe = tmp_path / "final"
     subprocess.run(["c++", "-std=c++17", str(cpp), "-o", str(exe)], check=True)
     subprocess.run([str(exe)], check=True)
+
+
+def test_ubmem_trace_recognizes_fused_pipeline_without_phantom_fetch():
+    events = [{"name": "replay", "ph": "X", "ts": 1000, "dur": 100}]
+    for name, start, duration in (
+        ("kvip_ubmem_656_init_kernel", 1001, 5),
+        ("kvip_ubmem_656_li_kernel", 1007, 30),
+        ("v9_streaming_resolve_update_656", 1038, 40),
+    ):
+        events.append({"name": name, "ph": "X", "cat": "kernel", "ts": start, "dur": duration})
+    result = account_ubmem(events, "replay", 80)
+    assert "error" not in result
+    assert result["stages_us"]["resolve_update_fetch"] == 40
+    assert result["stages_us"]["fetch"] == 0 and not result["fetch_separate"]
+    assert result["kernel_span_us"] == 77
+    assert "error" in account_ubmem(events[:-1], "replay", 80)

@@ -8,7 +8,7 @@ def test_query_worker_batches_kvaf_calls_and_preserves_conflicts(tmp_path):
     source = (root / 'csrc/operators/lightning_indexer_with_fetch_streaming_qworkers/op_kernel/streaming.cpp').read_text()
     begin = source.index('__aicore__ inline void FetchQueryGroup(')
     end = source.index('__aicore__ inline void FinalizeStreaming', begin)
-    body = source[begin:end]
+    body = source[begin:end].removesuffix("#endif\n")
     code = r'''
 #include <cstdint>
 #include <cassert>

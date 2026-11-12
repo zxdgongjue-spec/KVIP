@@ -384,7 +384,10 @@ inline void PublishQueryCompletion(__gm__ Context* ctx,__gm__ BatchFlag* flags,
     if(slot<resident)asc_stcg(valid+slot,uint32_t(1));
    }
   }
-  if(!threadIdx.x){asc_stcg(&post->pending,b==lane?completed:0U);
+  if(!threadIdx.x){
+#if !V9_UBMEM
+   asc_stcg(&post->pending,b==lane?completed:0U);
+#endif
    asc_stcg(&post->error,uint32_t(error));asc_stcg(&post->deferred,0U);}
  }
  asc_threadfence();asc_syncthreads();
@@ -423,6 +426,9 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(256) inline void PackFetchRanges(
  }
  asc_threadfence();asc_syncthreads();
 }
+#if V9_UBMEM
+#include "staged_ubmem_fetch.h"
+#else
 constexpr uint32_t kBatchGetInflight = 2048;
 // Each worker owns one KVAF queue. It gathers its shard of requests for one Q,
 // calls the native BatchGet once per safe/conflicting phase, then acknowledges
@@ -563,6 +569,7 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
    ft[9]=GetSystemCycle();kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ft),24*8);}
  }
 }
+#endif
 __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
@@ -573,7 +580,14 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
  // This request's resolver core owns its prefetch CQ; Q workers only wait
  // on this request's flag when a conflicting range exists.
  uint64_t polls=0,drain=0,arrival=0;
+#if V9_UBMEM
+ auto prefetchStatus=UbmemStatusAt(ctx,b);
+ kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(prefetchStatus),128);
+ if(row->pending || prefetchStatus[2]!=row->requests)row->error|=kUbmemIncomplete;
+ arrival=GetSystemCycle();
+#else
  CompletePrefetch(ctx,b,true,profile?&polls:nullptr,profile?&drain:nullptr,profile?&arrival:nullptr);
+#endif
  if(profile){ft[4]=GetSystemCycle();ft[5]=polls;ft[6]=drain;ft[7]=arrival;}error|=row->error;flags[7].error=error;flags[7].ready=1;
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+7),sizeof(BatchFlag));
  for(uint32_t f=6;f<12;++f){uint64_t start=GetSystemCycle();if(profile)ft[8+2*(f-6)]=start;while(true){
@@ -601,12 +615,14 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
   total+=post->count;completed+=post->pending;error|=post->error;
   if(post->deferred){++deferred;error|=kvaf_device::kInvalidArgs;}
+#if !V9_UBMEM
   uint32_t workers=(a->prefetchCount>>16)&0xffU;
   uint32_t pair=2*shape.batch+2*(q*workers+b%workers);
   auto queueArgs=GetArgs(ctx,pair);
   auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(queueArgs.queue_state);
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
   lastHead=queue->sq_producer_index;lastCq=queue->cq_consumer_index;
+#endif
   post->pending=0;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
  }
  if(row->pending || total!=info[1])error|=kvaf_device::kInvalidArgs;
@@ -618,10 +634,18 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
  if(profile)ft[2]=GetSystemCycle();
  info[0]|=uint32_t(error);info[3]=deferred?1:0;info[4]=completed;
  if(!error)row->finalPending=0;
+#if V9_UBMEM
+ auto status=UbmemStatusAt(ctx,b);status[0]=error|updateError;status[1]=row->requests;
+ status[3]=total;status[4]=completed;status[5]=(status[2]+completed)*shape.tokenBytes;
+ status[6]=UbmemRegionAt(ctx)->generation;
+ if(total!=completed){error|=kUbmemIncomplete;status[0]|=error;info[0]|=uint32_t(error);}
+ kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),128);
+#else
  auto status=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(ctx->finalStatus)+b*2;
  kvaf_device::WriteStatus(status,error,total,completed,lastHead,lastCq,UINT64_MAX,0);
  kvaf_device::WriteStatus(status+1,0,0,0,0,0,UINT64_MAX,0);
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),2*sizeof(*status));
+#endif
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),128);
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row)+960,64);
  if(error || updateError){
@@ -692,6 +716,7 @@ extern "C" __global__ __aicore__ void v9_query_fetch_only(GM_ADDR arg,uint32_t q
 
 // Native reference: a real KVAF BatchGet dispatch across 2 or 8 AIVs.
 // Inputs are compacted before timing, as in native LIDU.
+#if !V9_UBMEM
 extern "C" __global__ __aicore__ void v9_native_fetch_only(GM_ADDR arg,GM_ADDR reference,uint32_t query) {
 #if defined(__CCE_AICORE__)
  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
@@ -719,3 +744,5 @@ extern "C" __global__ __aicore__ void v9_native_fetch_only(GM_ADDR arg,GM_ADDR r
  }
 #endif
 }
+
+#endif

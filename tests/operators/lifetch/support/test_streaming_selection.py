@@ -20,12 +20,18 @@ def test_optimized_selects_measured_configuration(monkeypatch, tmp_path):
     assert command[command.index('--q-workers')+1] == '2'
 
 
-def test_ubmem_rejects_optimized_before_launch(monkeypatch):
-    def unexpected(*args, **kwargs):
-        pytest.fail('unsupported transport reached execution')
-    monkeypatch.setattr(module, 'execute', unexpected)
-    with pytest.raises(SystemExit):
-        module.main(['--transport','ubmem','--kvaf-server','host:1','--optimized-resolve'])
+def test_ubmem_selects_streaming_backend(monkeypatch, tmp_path):
+    commands = []
+    def execute(command, log, timeout, label):
+        commands.append(command)
+        log.write_text('UBMEM_LIFETCH_PASS\nUBMEM_SFA_PASS\nUBMEM_GRAPH_EVENT_US\n')
+        return 0
+    monkeypatch.setattr(module, 'execute', execute)
+    assert module.main(['--transport','ubmem','--kvaf-server','host:1', '--soc','Ascend950PR_9599',
+                        '--kvaf-root',str(tmp_path),'--output',str(tmp_path/'out'),
+                        '--trace-rounds','0','--optimized-resolve']) == 0
+    assert '--optimized-resolve' in commands[0]
+    assert commands[0][commands[0].index('--q-workers')+1] == '2'
 
 
 @pytest.mark.parametrize('flag', ['--early-fetch','--avoid-prefetch-slots','--legacy-fetch-layout','--parallel-fetch-finalize','--streaming'])

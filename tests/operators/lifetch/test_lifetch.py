@@ -20,8 +20,6 @@ from runner import progress, supervise  # noqa: E402
 
 def select_supported_pipeline(parser, args):
     """Keep one validated streaming implementation, not historical experiments."""
-    if args.optimized_resolve and getattr(args, "transport", "urma") != "urma":
-        parser.error("The integrated streaming optimization currently supports URMA only")
     if args.optimized_resolve:
         args.streaming = args.streaming_fetch = args.fused_final = True
         args.prepare_update_metadata = True
@@ -240,8 +238,8 @@ def main(argv=None):
         p.error('--fetch-only-compare requires URMA and --streaming --streaming-fetch --fused-final --q-workers 2')
     if a.parallel_fetch_finalize and a.transport != 'urma':
         p.error('--parallel-fetch-finalize is an URMA experiment')
-    if a.prepare_update_metadata and (a.transport != 'urma' or a.q_workers is None or a.fetch_only_compare):
-        p.error('--prepare-update-metadata requires URMA Q workers and full pipeline')
+    if a.prepare_update_metadata and (a.q_workers is None or a.fetch_only_compare):
+        p.error('--prepare-update-metadata requires Q workers and full pipeline')
     if a.transport == 'urma':
         command = [sys.executable, '-u', str(Path(__file__).resolve()), '--internal-urma', *common,
                    '--kvaf-root', str(kvaf_root), '--cann', a.cann, '--batches', a.batches,
@@ -286,11 +284,9 @@ def main(argv=None):
         if a.comparison_sfa:
             command += ['--comparison-sfa', str(a.comparison_sfa)]
         return subprocess.call(command)
-    if a.optimized_resolve:
-        p.error('--optimized-resolve is supported only by URMA')
     if a.final_workers is not None:
         p.error('--final-workers is supported only by URMA')
-    if a.early_fetch or a.avoid_prefetch_slots or a.streaming or a.streaming_fetch or a.fused_final or a.q_workers is not None:
+    if not a.optimized_resolve and (a.early_fetch or a.avoid_prefetch_slots or a.streaming or a.streaming_fetch or a.fused_final or a.q_workers is not None):
         p.error('--early-fetch and --avoid-prefetch-slots are supported only by URMA')
     if a.intermediate_fetches != 8:
         p.error('UBmem fixture currently supports exactly 8 windows')
@@ -312,6 +308,8 @@ def main(argv=None):
         command += ['--comparison-output', str(a.comparison_output)]
     if a.comparison_sfa:
         command += ['--comparison-sfa', str(a.comparison_sfa)]
+    if a.optimized_resolve:
+        command += ['--optimized-resolve', '--q-workers', str(a.q_workers)]
     print('UBmem stage traces use separate profiled replays outside graph timing.', flush=True)
     code = execute(command, log, a.timeout_seconds, 'ubmem')
     lines = log.read_text(errors='replace').splitlines()

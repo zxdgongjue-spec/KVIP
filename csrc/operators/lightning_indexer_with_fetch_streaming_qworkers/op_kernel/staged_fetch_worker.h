@@ -1,4 +1,6 @@
 #pragma once
+#if !V9_UBMEM
+#pragma once
 #define V9_CQ_INLINE __aicore__ inline
 namespace rotating {
 struct CqDrainResult { uint64_t error; uint32_t completed; uint64_t polls; };
@@ -113,3 +115,5 @@ __aicore__ inline void CompletePrefetch(__gm__ Context* ctx,uint32_t b,bool init
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),64);
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->pending),sizeof(row->pending));
 }
+
+#endif

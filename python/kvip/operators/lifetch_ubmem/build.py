@@ -68,7 +68,7 @@ def kvaf_source(build_dir):
     raise ValueError(f"KVAF source path is missing from {build_dir}/CMakeCache.txt")
 
 
-def build_ubmem_library(*, cache_dir, cann, shape, jobs=2):
+def build_ubmem_library(*, cache_dir, cann, shape, jobs=2, optimized=False):
     """Compile once before profiling/capture; never called by forward."""
     if not isinstance(shape, UbmemGeometry) or jobs < 1:
         raise ValueError("A validated UBmem shape and positive jobs are required")
@@ -77,10 +77,13 @@ def build_ubmem_library(*, cache_dir, cann, shape, jobs=2):
         raise FileNotFoundError(f"UBmem fusion sources unavailable: {source}")
     kvaf_root = kvaf_source(Path(cache_dir).parent)
     kvaf_include = kvaf_root / "access_operator/include"
-    options = shape.options(cann) | {"KVAF_INCLUDE": str(kvaf_include)}
+    options = shape.options(cann) | {"KVAF_INCLUDE": str(kvaf_include), "KVIP_STREAMING_UBMEM": "ON" if optimized else "OFF"}
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     shared_lifetch = source.parent / "lightning_indexer_with_fetch"
-    for directory in (source, source.parent / "common", shared_lifetch / "op_kernel/indexer"):
+    directories = [source, source.parent / "common", shared_lifetch / "op_kernel/indexer"]
+    if optimized:
+        directories.append(source.parent / "lightning_indexer_with_fetch_streaming_qworkers")
+    for directory in directories:
         for path in sorted(directory.rglob("*")):
             if path.is_file() and (path.suffix in (".h", ".cpp", ".asc", ".cmake") or path.name == "CMakeLists.txt"):
                 digest.update(str(path.relative_to(source.parent)).encode())

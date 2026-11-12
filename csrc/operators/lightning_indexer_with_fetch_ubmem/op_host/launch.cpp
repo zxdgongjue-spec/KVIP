@@ -49,3 +49,30 @@ VALUE(kvip_ubmem_plan_words,8+2*20480)
 extern "C" uint32_t v9_window_trigger_tile(uint32_t epoch,const rotating::RuntimeShape* shape) {
     return shape && epoch<shape->rounds?rotating::RuntimeTrigger(shape->history,shape->resident,shape->rounds,epoch):0;
 }
+
+#if KVIP_STREAMING_UBMEM
+#include "../../lightning_indexer_with_fetch_streaming_qworkers/op_kernel/pipeline_types.h"
+extern "C" uint32_t aclrtlaunch_v9_streaming_resolve_update_656(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_streaming_resolve_update_2624(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_counter_calibration_656(uint32_t,void*,void*);
+extern "C" uint32_t kvip_counter_calibration(void* output,void* stream){
+ if(!output||!stream)return 100000;
+ return aclrtlaunch_v9_counter_calibration_656(1,stream,output);
+}
+extern "C" uint32_t kvip_streaming_resolver_cores(){return pipeline_ab::kResolveCores;}
+extern "C" uint32_t kvip_streaming_flag_count(){return pipeline_ab::kFlagCount;}
+extern "C" uint32_t kvip_lifetch_streaming_forward(void* bindings,void* update,void* workspace,
+ void* stream,const rotating::RuntimeShape* shape,uint32_t workers) {
+ if(!bindings || !update || !workspace || !stream || !shape || shape->batch<1 || shape->batch>16 ||
+    shape->history!=131072 || shape->resident!=16384 || shape->indexHeads!=32 || shape->finalWorkers!=4 ||
+    (workers!=1 && workers!=2 && workers!=4))return 100000;
+ uint32_t cores=shape->batch*pipeline_ab::kResolveCores+4*workers;
+ if(cores>shape->aicCount*2)return 100000;
+ uint32_t result=v9_init(bindings,stream,shape);
+ if(!result)result=v9_li(bindings,stream,shape);
+ if(result)return result;
+ if(shape->tokenBytes==656)return aclrtlaunch_v9_streaming_resolve_update_656(cores,stream,workspace);
+ if(shape->tokenBytes==2624)return aclrtlaunch_v9_streaming_resolve_update_2624(cores,stream,workspace);
+ return 100000;
+}
+#endif

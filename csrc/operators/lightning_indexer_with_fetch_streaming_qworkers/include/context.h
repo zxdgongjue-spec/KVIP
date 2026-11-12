@@ -1,4 +1,8 @@
 #pragma once
+#if V9_UBMEM
+#include "../../lightning_indexer_with_fetch_ubmem/include/context.h"
+#else
+#pragma once
 #include <stdint.h>
 #include "batch_get_abi.h"
 #include "runtime_shape.h"
@@ -115,3 +119,5 @@ V9_DEVICE inline SequenceSlice SequenceSliceAt(uint32_t token, uint32_t resident
     return {index % 2, resident + (index + 1) * half};
 }
 }
+
+#endif

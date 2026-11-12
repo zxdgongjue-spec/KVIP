@@ -225,7 +225,7 @@ def account_ubmem(events, name, elapsed):
     origin = Decimal(str(scope["ts"]))
     duration = float(scope["dur"])
     stages = {stage: [] for stage in ("init", "li", "resolve", "fetch", "complete",
-                                     "update_owned", "update_outputs", "apply_owned")}
+                                     "update_owned", "update_outputs", "apply_owned", "resolve_update_fetch")}
     examples = []
     for event in events:
         if event.get("ph") != "X":
@@ -234,7 +234,8 @@ def account_ubmem(events, name, elapsed):
         category = str(event.get("cat") or "").lower()
         match = re.fullmatch(r"kvip_ubmem_(?:656|2624)_(init|li|resolve|fetch|complete)_kernel(?:_\d+)?", kernel)
         update = re.fullmatch(r"kvip_ubmem_direct_(update_owned|update_outputs|apply_owned)_kernel(?:_\d+)?", kernel)
-        if not match and not update:
+        streaming = re.fullmatch(r"v9_streaming_resolve_update_(?:656|2624)(?:_\d+)?", kernel)
+        if not match and not update and not streaming:
             if "kvip_ubmem" in kernel and len(examples) < 12:
                 examples.append((kernel, category))
             continue
@@ -244,8 +245,10 @@ def account_ubmem(events, name, elapsed):
         end = start + float(event.get("dur", 0))
         if start < 0 or end > duration:
             continue
-        stages[match.group(1) if match else update.group(1)].append((start, end))
+        stages["resolve_update_fetch" if streaming else (match.group(1) if match else update.group(1))].append((start, end))
     required = ("init", "li", "resolve", "complete", "update_owned", "update_outputs", "apply_owned")
+    if stages["resolve_update_fetch"]:
+        required = ("init", "li", "resolve_update_fetch")
     if any(not stages[key] for key in required):
         return {"error": "Missing named UBmem device kernels", "found": {key: len(value) for key, value in stages.items()},
                 "examples": examples}
@@ -261,7 +264,7 @@ def account_ubmem(events, name, elapsed):
             "note": "resolve includes inline fetch when fetch_separate is false; boundary includes measurement edges"}
 
 
-def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder):
+def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder, streaming=None):
     """Collect a separately profiled graph replay; never included in event timing."""
     import torch_npu
     from torch.profiler import record_function
@@ -273,6 +276,9 @@ def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder):
         activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
         record_shapes=False, profile_memory=False, with_stack=False,
     )
+    if streaming is not None:
+        streaming.counter_clock_mhz = streaming.calibrate_counter_mhz()
+        streaming.set_diagnostics(True)
     with profile:
         for step in range(rounds):
             reset()
@@ -289,6 +295,10 @@ def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder):
             samples.append({"name": name, "round": step, "us": begin.elapsed_time(end) * 1000,
                             "prefetch": int(rows[:, 9].astype(np.uint64).sum()),
                             "final": int(rows[:, 247].astype(np.uint64).sum())})
+            if streaming is not None:
+                samples[-1]["streaming"] = streaming.diagnostic_cycles()
+    if streaming is not None:
+        streaming.set_diagnostics(False)
     (folder / "samples.json").write_text(json.dumps(samples, indent=2))
     trace_path = folder / "trace.json"
     profile.export_chrome_trace(str(trace_path.resolve()))
@@ -297,7 +307,7 @@ def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder):
     for sample in samples:
         sample["accounting"] = account_ubmem(events, sample["name"], sample["us"])
         account = sample["accounting"]
-        if "error" not in account and hasattr(rotating.library, "v9_fetch_workers") and not account["fetch_separate"]:
+        if "error" not in account and hasattr(rotating.library, "v9_fetch_workers") and not account["fetch_separate"] and not account["stages_us"].get("resolve_update_fetch"):
             account["error"] = "Separate fetch kernel expected but absent from trace"
     (folder / "attribution.json").write_text(json.dumps(samples, indent=2))
     for sample in samples:

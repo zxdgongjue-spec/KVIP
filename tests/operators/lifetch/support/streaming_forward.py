@@ -13,6 +13,7 @@ class StreamingForward:
         self.rotating, self.update, self.torch = rotating, update, torch
         shape = rotating.runtime_shape
         self.batch, self.history, self.resident = shape.batch, shape.history, shape.resident
+        self.shape_pointer = ctypes.byref(shape)
         if not (1 <= self.batch <= 16 and self.history == 131072 and self.resident == 16384 and shape.indexHeads == 32):
             raise ValueError('streaming experiment supports B1..16, history=131072, resident=16384, index_heads=32')
         if prefetch_limit > 512:
@@ -78,7 +79,7 @@ class StreamingForward:
     def __call__(self):
         stream = self.torch.npu.current_stream(self.rotating.device)
         args = [self.rotating.bindings.data_ptr(), self.update.bindings.data_ptr(),
-                self.workspace.data_ptr(), stream.npu_stream, self.rotating.shape_pointer]
+                self.workspace.data_ptr(), stream.npu_stream, self.shape_pointer]
         if self.q_workers:
             args.append(self.q_workers)
         result = self.function(*args)
@@ -184,6 +185,15 @@ class StreamingForward:
                     final_prefetch_join=int(f[50]-f[49]), wait_producer_update=int(f[51]-f[50]),
                     collect=int(f[52]-f[51]), residency=int(f[53]-f[52]),
                     write_status=int(f[54]-f[53]), span=int(f[54]-f[48]))
+            if fetch_detail is not None and hasattr(self.rotating, "ubmem_status"):
+                fetch_detail["transport"] = "ubmem"
+                fetch_detail["ubmem_queries"] = [dict(
+                    query_ready_wait=int(fetch[b,q*24+1]-fetch[b,q*24]),
+                    previous_query_copy_wait=int(fetch[b,q*24+2]-fetch[b,q*24+1]),
+                    kvaf_mte_get=int(fetch[b,q*24+4]-fetch[b,q*24+3]),
+                    completion_and_index_join=int(fetch[b,q*24+9]-fetch[b,q*24+4]))
+                    for q in range(4)]
+                fetch_detail["note"] = "UBmem has no CQ; kvaf_mte_get includes pipeline drain"
             counts = [int(flags[b, phase, 1]) for phase in range(5)]
             final_counts = ([dict(total=int(post[0]), safe=int(post[5]), conflict=int(post[0]-post[5]))
                              for post in posts[b]] if posts is not None else None)
@@ -193,7 +203,7 @@ class StreamingForward:
                                input_and_bitmap=int(p[2]-p[1]), initialize=int(p[3]-p[2]),
                                metadata=int(u[23]-u[22]), consumer_start=int(u[10]),
                                consumer_finish=int(u[24]), producer_finish=int(p[8])))
-        if self.q_workers and hasattr(self, "rotating"):
+        if self.q_workers and hasattr(self, "rotating") and not hasattr(self.rotating, "ubmem_status"):
             events = self.rotating.events.cpu().numpy().reshape(-1, 128).view('<u8')
             first = events[:, 11]
             last = events[:, 12]
