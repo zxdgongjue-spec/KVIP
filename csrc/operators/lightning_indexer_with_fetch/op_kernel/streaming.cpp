@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Experimental two-AIV in-kernel producer/consumer: no KV transport.
+// Per-query resolver, Index update and transport workers.
 #include "kernel_operator.h"
 #ifndef KVIP_FUSE_QUERY_WORK
 #define KVIP_FUSE_QUERY_WORK 0
@@ -24,7 +24,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512)
 inline void PublishQ(
  __ubuf__ uint32_t* selected,__ubuf__ uint16_t* ids,__ubuf__ uint32_t* slots,
  __gm__ uint32_t* source,__gm__ uint32_t* dest,uint32_t begin,uint32_t end) {
- for(uint32_t i=begin+threadIdx.x;i<end;i+=512){asc_stcg(source+kPrefetch+i,selected[ids[i]]);asc_stcg(dest+kPrefetch+i,slots[i]);}
+ for(uint32_t i=begin+threadIdx.x;i<end;i+=512){asc_stcg(source+kPrefetch+i,selected[ids[i%kTop]]);asc_stcg(dest+kPrefetch+i,slots[i]);}
  asc_threadfence();asc_syncthreads();
 }
 __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PublishPrefetch(
@@ -136,7 +136,7 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  if(profile)ticks[1]=GetSystemCycle();
  uint32_t inputError=0;
  if(!a->queryBitmaps || !a->queryErrors || !a->updateBindings || !a->packedFetch || !ctx->hotValid || !ctx->changeCount || row->slots>kPrefetch ||
-    shape.history!=kHistory || shape.resident!=kResident || shape.finalWorkers!=4 || a->maxEvents<kPrefetch+kSlots)inputError=1;
+    shape.history!=a->history || shape.resident!=a->resident || shape.resident>131072 || shape.finalWorkers!=4 || a->maxEvents<kPrefetch+kSlots)inputError=1;
  if(!inputError){auto errors=reinterpret_cast<__gm__ uint32_t*>(a->queryErrors)+(b*4)*32;
   for(uint32_t q=0;q<4;++q){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+q*32),128);inputError|=errors[q*32];}}
  if(inputError){auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*32;status[0]=inputError;status[1]=0;
@@ -152,7 +152,7 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&flags[0]),sizeof(BatchFlag));
  auto selected=local,loc=local[kSlots],keys=local[2*kSlots],ranks=local[3*kSlots];
  auto ids=local[4*kSlots].ReinterpretCast<uint16_t>();
- auto slots=local[kFinalSlotsOffset],work=local[kFinalPositionsOffset],ctl=local[kFinalControlOffset];
+ auto slots=local[kStagedSlotsOffset],work=local[kStagedPositionsOffset],ctl=local[kStagedControlOffset];
 #if KVIP_FUSE_QUERY_WORK
  // Bind immutable metadata once on scalar control instead of reloading the
  // pointer chain in every SIMT warp and query. Official maps remain unchanged

@@ -106,7 +106,7 @@ inline void PackStagedUrmaQuery(uint32_t history, uint32_t resident, uint32_t to
             bool conflict=ordinal>=0 && uint32_t(ordinal)<used;
             uint32_t position=conflict?safeCount+conflictBefore++:safeBefore++;
             uint32_t output=batch*kSlots+query*kTop+position;
-            uint32_t token=selected[ids[rank]];
+            uint32_t token=selected[ids[rank%kTop]];
             if(token>=history){asc_atomic_or(ctl+1,1U);continue;}
             StoreFallbackSource(history,tokenBytes,ctx,batch,output,token,asc_ldcg(addresses+token),blocks,offsets);
             asc_stcg(destinations+output,int32_t(ownerBase+slot));

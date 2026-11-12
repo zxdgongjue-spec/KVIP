@@ -6,7 +6,7 @@ import subprocess
 
 def test_context_snapshot_survives_delayed_vector_clear(tmp_path):
     root = Path(__file__).resolve().parents[4]
-    source = (root / 'csrc/operators/lightning_indexer_with_fetch_streaming_qworkers/op_kernel/output_worker.h').read_text()
+    source = (root / 'csrc/operators/lightning_indexer_with_fetch/op_kernel/output_worker.h').read_text()
     # Compile the actual scalar initialization between scratch aliases and bindings.
     body = source.split('auto slots=local[kFinalSlotsOffset]', 1)[1].split(';', 1)[1].split(' auto u=', 1)[0]
     program = r'''

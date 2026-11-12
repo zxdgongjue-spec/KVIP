@@ -683,7 +683,7 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     auto errors=reinterpret_cast<__gm__ uint32_t*>(a->queryErrors);
     uint32_t b=query/SIM_Q;
-    if (b>=runtimeShape_.batch || runtimeShape_.resident!=16384 || runtimeShape_.history!=131072 ||
+    if (b>=runtimeShape_.batch || runtimeShape_.resident>131072 ||
         !a->queryBitmaps || !a->queryErrors || !ctx->mapping || !ctx->lruSlots) {
         if (errors && b<runtimeShape_.batch) { errors[query*32]=1; kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128); }
         return;
@@ -757,35 +757,36 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
         if(ctx->hotValid)DataCopy(secondValid,validGm[8192],8192);
         if(ctx->reservedHot)DataCopy(secondReserved,reservedGm[8192],8192);
     }
-    for(uint32_t half=0;half<runtimeShape_.resident/chunkSize;++half){
+    for(uint32_t half=0;half<(runtimeShape_.resident+chunkSize-1)/chunkSize;++half){
+        uint32_t count=runtimeShape_.resident-half*chunkSize; if(count>chunkSize)count=chunkSize;
         if(half && !overlapSecond)PipeBarrier<PIPE_ALL>();
         bool preloaded=half==0 && streamingTopkOnly_ && streamingPrefetched_;
         if(half && overlapSecond){valid=secondValid;reserved=secondReserved;}
-        if(ctx->hotValid && !preloaded && !(half && overlapSecond))DataCopy(valid,validGm[half*chunkSize],chunkSize);
-        if(ctx->reservedHot && !preloaded && !(half && overlapSecond))DataCopy(reserved,reservedGm[half*chunkSize],chunkSize);
+        if(ctx->hotValid && !preloaded && !(half && overlapSecond))DataCopy(valid,validGm[half*chunkSize],count);
+        if(ctx->reservedHot && !preloaded && !(half && overlapSecond))DataCopy(reserved,reservedGm[half*chunkSize],count);
         if(half && overlapSecond)PipeBarrier<PIPE_V>();
         if(half || !overlapSecond) {
             SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
         }
         if(profile && half<2)liTicks[3+half*2]=GetSystemCycle();
-        Simt::VF_CALL<rotating::ClassifyTopkHalf>(Simt::Dim3{512,1,1},runtimeShape_.history,runtimeShape_.resident,b,used,half*chunkSize,chunkSize,tailBegin,tailEnd,
+        Simt::VF_CALL<rotating::ClassifyTopkHalf>(Simt::Dim3{512,1,1},runtimeShape_.history,runtimeShape_.resident,b,used,half*chunkSize,count,tailBegin,tailEnd,
           ctx->hotValid!=0,ctx->reservedHot!=0,ctx->tailBounds!=0,ctx,
           reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(result.GetPhyAddr()),
           reinterpret_cast<__ubuf__ uint32_t*>(valid.GetPhyAddr()),reinterpret_cast<__ubuf__ int32_t*>(reserved.GetPhyAddr()),
           reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(bitmap[bitmapWords].GetPhyAddr()));
-        if(profile && (half==0 || half+1==runtimeShape_.resident/chunkSize)){
+        if(profile && (half==0 || half+1==(runtimeShape_.resident+chunkSize-1)/chunkSize)){
             SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
             liTicks[half==0?4:6]=GetSystemCycle();
         }
     }
     if(profile)liTicks[10]=GetSystemCycle();
-    Simt::VF_CALL<rotating::MergeClassifyBitmap>(Simt::Dim3{512,1,1},reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()));
+    Simt::VF_CALL<rotating::MergeClassifyBitmap>(Simt::Dim3{512,1,1},reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()),runtimeShape_.resident);
     if(profile){SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);liTicks[11]=GetSystemCycle();}
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     GlobalTensor<uint32_t> output,bits;
     output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+uint64_t(query)*2048);
-    bits.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(a->queryBitmaps)+uint64_t(query)*512);
-    DataCopy(output,result,2048);DataCopy(bits,bitmap,512);
+    bits.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(a->queryBitmaps)+uint64_t(query)*((runtimeShape_.resident+31)/32));
+    DataCopy(output,result,2048);DataCopy(bits,bitmap,(runtimeShape_.resident+31)/32);
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
     errors[query*32]=bitmap.GetValue(bitmapWords);kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);

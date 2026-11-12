@@ -30,7 +30,7 @@ def seed_native_bitmap(torch, native, row, bitmap):
 
 
 def run(args, run_dir):
-    source = (SOURCE.with_name(SOURCE.name + "_streaming_qworkers") if args.streaming else SOURCE)
+    source = SOURCE
     from attention import check_sfa
     from contract_payload import payload
     from kvip.operators.lifetch import binding as launch_module

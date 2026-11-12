@@ -31,6 +31,9 @@ def index_update_arguments(policy, workspace, storage, rotating, group):
 
 def bind_group_selector(torch, policy, workspace, setup, group, storage, rotating, update, *, ubmem=False):
     """Bind the shared selector to one group's persistent storage."""
+    if not hasattr(workspace, "streaming_scratch"):
+        workspace.streaming_scratch = {}
+    rotating.streaming_scratch = workspace.streaming_scratch
     selector = VllmIndexSelector(
         torch, inputs=workspace.inputs, rotating=rotating, update=update,
         logical_ids=storage.logical_ids, row_owners=workspace.inputs.row_owners,

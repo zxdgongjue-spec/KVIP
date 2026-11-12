@@ -201,7 +201,6 @@ def check_shape(
             plan_buffer=workspace.index_plan,
             extended_work=workspace.index_work,
         )
-        forward = LIFetchForward(rotating, update)
         if optimized:
             from streaming_forward import StreamingForward
             forward = StreamingForward(rotating, update, torch, prefetch_tokens, fused_final=True, q_workers=q_workers)
@@ -209,6 +208,8 @@ def check_shape(
             forward.prepare_metadata = True
             forward.parallel_finalize = True
             forward.set_diagnostics(False)
+        else:
+            forward = LIFetchForward(rotating, update)
 
         def verify(owners, *, phase, counts=None, padding=False):
             stream.synchronize()
@@ -528,9 +529,9 @@ def main():
         parser.error("trace-rounds requires iterations and trace-output")
     if not 0 <= args.miss_percent <= 100:
         parser.error("miss-percent must be in 0..100")
-    if args.optimized_resolve and (args.runtime_shapes or args.history != 131072 or args.resident != 16384
-            or args.index_heads != 32 or max(args.batches) > 16 or max(args.prefetch_tokens) > 512):
-        parser.error("optimized UBmem requires B1..16/H131072/R16384/heads32/prefetch<=512")
+    if any(not 1 <= batch <= 16 for batch in args.batches):
+        parser.error("LIFetch supports BS1..16; larger batches are not supported")
+    args.optimized_resolve = True
     print(f"UBMEM_FETCH_MODE {args.ubmem_fetch_mode}", flush=True)
     import kvaf
     import torch

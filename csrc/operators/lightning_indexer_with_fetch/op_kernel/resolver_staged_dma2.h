@@ -120,6 +120,13 @@ inline void StagedQuery(uint32_t query,uint32_t history,uint32_t resident,uint32
     auto offsets=reinterpret_cast<__gm__ int32_t*>(ctx->sourceOffsets);
     auto changes=reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+batch*kChangeCapacity;
     auto changeSlots=reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+batch*kChangeCapacity;
+        // Large hot bitmaps reuse the whole positions bank for fallback
+        // prefix counts. Restore LRU candidates before the next Q consumes it.
+        if(resident>65536){
+            auto lruGm=reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+batch*kLruSlots;
+            for(uint32_t i=tid;i<kLruSlots;i+=512)lru[i]=asc_ldcg(lruGm+i);
+            asc_syncthreads();
+        }
         const uint32_t begin=query*kTop,end=begin+kTop,oldCount=ctl[0];
         for(uint32_t i=begin+tid;i<end;i+=512){
             uint32_t token=selected[i];
@@ -162,7 +169,7 @@ inline void StagedQuery(uint32_t query,uint32_t history,uint32_t resident,uint32
             uint32_t probes=0;
             while(keys[h]!=selected[i] && probes<buckets){h=(h+1)&(buckets-1);++probes;}
             if(probes==buckets){asc_atomic_or(ctl+1,8U);continue;}
-            uint32_t rank=oldCount+offset++;ids[rank]=uint16_t(i);ranks[h]=kStagedRankTag|rank;
+            uint32_t rank=oldCount+offset++;ids[rank%kTop]=uint16_t(i);ranks[h]=kStagedRankTag|rank;
         }
         asc_syncthreads();
         uint32_t allocated=0;
@@ -225,7 +232,7 @@ inline void StagedQuery(uint32_t query,uint32_t history,uint32_t resident,uint32
             }
         }
         for(uint32_t i=tid;i<added;i+=512){
-            uint32_t rank=oldCount+i, token=selected[ids[rank]], slot=slots[rank];
+            uint32_t rank=oldCount+i, token=selected[ids[rank%kTop]], slot=slots[rank];
             int32_t ordinal=asc_ldcg(reserved+slot);
             uint32_t record=ordinal>=0?uint32_t(ordinal):kLruSlots+rank;
             // PackStagedUrmaQuery publishes the per-Q transport descriptors.

@@ -20,15 +20,13 @@ from runner import progress, supervise  # noqa: E402
 
 def select_supported_pipeline(parser, args):
     """Keep one validated streaming implementation, not historical experiments."""
-    if args.optimized_resolve:
-        args.streaming = args.streaming_fetch = args.fused_final = True
-        args.prepare_update_metadata = True
-        if args.q_workers is None:
-            args.q_workers = 2
     if args.early_fetch or args.avoid_prefetch_slots or args.legacy_fetch_layout or args.parallel_fetch_finalize:
         parser.error("Historical early/safe/layout/finalize experiments are not included in this integration branch")
-    if args.streaming and not (args.streaming_fetch and args.fused_final and args.q_workers is not None):
-        parser.error("Use --optimized-resolve for the integrated per-query pipeline")
+    args.optimized_resolve = True
+    args.streaming = args.streaming_fetch = args.fused_final = True
+    args.prepare_update_metadata = not args.fetch_only_compare
+    if args.q_workers is None:
+        args.q_workers = 2
 
 
 def arguments(argv=None):
@@ -36,7 +34,7 @@ def arguments(argv=None):
     p.add_argument("--worker-run", type=Path, help=argparse.SUPPRESS)
     p.add_argument("--fetch-only-compare", action="store_true", help="compare the actual Q Fetch worker with native KVAF Get")
     p.add_argument("--early-fetch", action="store_true")
-    p.add_argument("--streaming", action="store_true", help="experimental LI/Resolver/Index streaming path")
+    p.add_argument("--streaming", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--streaming-fetch", action="store_true", help="submit each Q during streaming resolver")
     p.add_argument("--legacy-fetch-layout", action="store_true")
     p.add_argument("--parallel-fetch-finalize", action="store_true")
@@ -82,7 +80,7 @@ def arguments(argv=None):
         p.error("--fused-final requires --streaming-fetch")
     if a.streaming_fetch and not a.streaming:
         p.error("--streaming-fetch requires --streaming")
-    if a.streaming and (a.early_fetch or a.avoid_prefetch_slots or a.runtime_shapes or a.resolver_compare):
+    if a.streaming and (a.early_fetch or a.avoid_prefetch_slots or a.resolver_compare):
         p.error("--streaming cannot be combined with early-fetch, avoid-prefetch-slots, runtime-shapes, or resolver-compare")
     if a.kvaf_root is None:
         state = ROOT / "build/dependencies.json"
@@ -91,8 +89,8 @@ def arguments(argv=None):
         batches = [int(b) for b in a.batches.split(",")]
     except ValueError:
         p.error("batches must be comma-separated integers")
-    if not batches or any(not 1 <= b <= 32 for b in batches):
-        p.error("batch must be 1..32")
+    if not batches or any(not 1 <= b <= 16 for b in batches):
+        p.error("LIFetch supports BS1..16; larger batches are not supported")
     if a.fetch_only_compare and any(b < 2 for b in batches):
         p.error("--fetch-only-compare requires batch >= 2 to use both workers per query")
     if not 0 <= a.miss_percent <= 100 or a.history <= a.resident + 4:
@@ -217,8 +215,8 @@ def main(argv=None):
         batches = [int(x) for x in a.batches.split(',')]
     except ValueError:
         p.error('batches must be comma-separated integers')
-    if not batches or any(not 1 <= x <= 32 for x in batches):
-        p.error('batches must be in 1..32')
+    if not batches or any(not 1 <= x <= 16 for x in batches):
+        p.error('LIFetch supports BS1..16; larger batches are not supported')
     if a.fetch_only_compare and any(x < 2 for x in batches):
         p.error('--fetch-only-compare requires batch >= 2 to use both workers per query')
     if (a.history <= a.resident + 4 or not 0 <= a.miss_percent <= 100 or a.warmup < 0
@@ -342,58 +340,28 @@ if __name__ == '__main__':
     sys.exit(main())
 
 
-def test_public_launch_same_stream_and_addresses():
-    from types import SimpleNamespace
-    import kvip
-    import pytest
-
-    class Function:
-        result = 0
-
-        def __call__(self, *args):
-            self.args = args
-            return self.result
-
-    function = Function()
-    rotating = SimpleNamespace(
-        device=5,
-        shape_pointer=400,
-        bindings=SimpleNamespace(data_ptr=lambda: 100),
-        library=SimpleNamespace(kvip_lifetch_forward=function),
-        torch=SimpleNamespace(npu=SimpleNamespace(current_stream=lambda device: SimpleNamespace(npu_stream=300))),
-    )
-    update = SimpleNamespace(device=5, bindings=SimpleNamespace(data_ptr=lambda: 200, numel=lambda: 28))
-    forward = kvip.LIFetch(rotating, update)
-    forward()
-    assert function.args == (100, 200, 300, 400)
-    function.result = 42
-    with pytest.raises(RuntimeError, match="42"):
-        forward()
-    update.device = 6
-    with pytest.raises(ValueError, match="same device"):
-        kvip.LIFetch(rotating, update)
-
-
 def test_host_pipeline_order_and_first_error(tmp_path):
     import subprocess
 
     source = (ROOT / "csrc/operators/lightning_indexer_with_fetch/op_host/launch.cpp").read_text()
-    entry = source[source.index('extern "C" uint32_t kvop_direct_update_outputs_early(uint32_t,') :]
+    begin = source.index('extern "C" uint32_t kvip_lifetch_streaming_forward(')
+    entry = source[begin:source.index('\nextern "C" uint32_t aclrtlaunch_kvip_transport_snapshot', begin)]
     stub = r"""
 #include <cstdint>
 #include <cassert>
 #include "runtime_shape.h"
+namespace pipeline_ab { constexpr uint32_t kResolveCores=3; }
 int fail=0, count=0;
 void* stream_expected=(void*)3;
 uint32_t step(int n,void* a,void* stream) { assert(a==(void*)1);assert(stream==stream_expected);assert(++count==n);return fail==n?99:0; }
 uint32_t v9_init(void*a,void*s,const rotating::RuntimeShape*){return step(1,a,s);}
 uint32_t v9_li(void*a,void*s,const rotating::RuntimeShape*){return step(2,a,s);}
-uint32_t v9_resolve(void*a,void*s,const rotating::RuntimeShape*){return step(3,a,s);}
-extern "C" uint32_t kvop_direct_update_outputs_early(uint32_t batch,void*a,void*s){assert(batch==16);assert(a==(void*)2);return step(4,(void*)1,s);}
-extern "C" uint32_t aclrtlaunch_v9_fetch_update_kernel(uint32_t batch,void*s,void*a,void*update){assert(batch==16);assert(update==(void*)2);return step(5,a,s);}
+extern "C" uint32_t aclrtlaunch_v9_streaming_resolve_update(uint32_t cores,void*s,void*a){assert(cores==56);return step(3,a,s);}
 """
     main = r"""
-int main(){rotating::RuntimeShape shape{};shape.batch=16;for(fail=0;fail<=5;++fail){count=0;assert(kvip_lifetch_forward((void*)1,(void*)2,stream_expected,&shape)==(fail?99:0));assert(count==(fail?fail:5));}return 0;}
+int main(){rotating::RuntimeShape shape{};shape.batch=16;shape.finalWorkers=4;shape.aicCount=32;
+for(fail=0;fail<=3;++fail){count=0;assert(kvip_lifetch_streaming_forward((void*)1,(void*)2,(void*)1,stream_expected,&shape,2)==(fail?99:0));assert(count==(fail?fail:3));}
+count=0;shape.batch=17;assert(kvip_lifetch_streaming_forward((void*)1,(void*)2,(void*)1,stream_expected,&shape,2)!=0);assert(count==0);return 0;}
 """
     path = tmp_path / "launch.cpp"
     path.write_text(stub + entry + main)
@@ -623,14 +591,6 @@ def test_ubmem_hot_resolver_actual_function_on_empty_and_populated_cache(tmp_pat
     _check_hot_resolver(tmp_path, "ubmem")
 
 
-def test_prefer_unoccupied_resolver_actual_function(tmp_path):
-    _check_hot_resolver(tmp_path, "early_safe")
-
-
-def test_baseline_prefer_unoccupied_resolver_actual_function(tmp_path):
-    _check_hot_resolver(tmp_path, "safe")
-
-
 def _check_hot_resolver(tmp_path, transport):
     """Execute production SIMT logic serially; CANN simulator covers barriers."""
     import subprocess
@@ -640,7 +600,10 @@ def _check_hot_resolver(tmp_path, transport):
     metadata = kernel / ("controller/cache_metadata.h" if transport == "ubmem" else "prefetch.h")
 
     def function(path, name):
+        import re
         text = path.read_text()
+        # Select the GM signature before extracting a complete function.
+        text = re.sub(r"#if KVIP_FUSE_QUERY_WORK\n.*?#else\n(.*?)#endif\n", r"\1", text, flags=re.S)
         begin = text.index(name + "(")
         begin = text.rfind("\n", 0, begin) + 1
         brace = text.index("{", begin)

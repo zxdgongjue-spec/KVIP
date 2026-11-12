@@ -4,7 +4,8 @@
 
 // Stable host ABI; implementations live in launch.cpp.
 extern "C" {
-uint32_t kvip_lifetch_forward(void* bindings, void* update, void* stream,const rotating::RuntimeShape* shape);
+uint32_t kvip_lifetch_streaming_forward(void* bindings, void* update, void* workspace, void* stream, const rotating::RuntimeShape* shape, uint32_t workers);
+
 uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape);
 uint32_t v9_init(void* bindings, void* stream,const rotating::RuntimeShape* shape);
 uint32_t v9_li(void* bindings, void* stream,const rotating::RuntimeShape* shape);

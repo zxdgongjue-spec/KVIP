@@ -1,6 +1,7 @@
 #include "kernel_operator.h"
 #if defined(__CCE_AICORE__)
 #include "context.h"
+#include "pipeline_types.h"
 
 #include <stdint.h>
 #if defined(__CCE_AICORE__)
@@ -112,7 +113,7 @@ __aicore__ inline void FillRoundWords(uint64_t address,uint32_t words,
     }
     // Caller joins the whole fill group before reusing the shared UB value.
 }
-__aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t b) {
+__aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t b,__gm__ pipeline_ab::Args* streaming) {
     TPipe pipe;TBuf<TPosition::VECCALC> storage;pipe.InitBuffer(storage,4096*4);
     auto local=storage.Get<uint32_t>();
     Duplicate(local,uint32_t(0),4096);
@@ -124,6 +125,18 @@ __aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uin
     FillRoundWords(ctx->owners+rt_finalPostOffset+b*rt_finalWorkers*sizeof(FinalPost),rt_finalWorkers*sizeof(FinalPost)/4,local);
     FillRoundWords(ctx->rowStatus+b*kRowStatusWords*4,kRowStatusWords,local);
     FillRoundWords(ctx->finalStatus+b*2*sizeof(KvafBatchGetCoreStatus),2*sizeof(KvafBatchGetCoreStatus)/4,local);
+    // Producer/consumer flags are per-round ephemeral state; initialize them
+    // in the existing init kernel, not as an extra graph launch.
+    if(streaming) {
+        uint32_t fw=(streaming->prefetchCount>>16)&0xffU,ds=rt_batch*2048;
+        uint32_t meta=(3*rt_batch+31)&~31U;
+        for(uint32_t g=b;g<4*fw;g+=rt_batch)
+            FillRoundWords(streaming->packedFetch+uint64_t(4*fw*(3*ds+meta)+g*(6*ds+64)+6*ds)*4,64,local);
+        FillRoundWords(streaming->flags+uint64_t(b)*pipeline_ab::kFlagCount*sizeof(pipeline_ab::BatchFlag),
+                       pipeline_ab::kFlagCount*sizeof(pipeline_ab::BatchFlag)/4,local);
+        FillRoundWords(streaming->workerStatus+uint64_t(b)*128,32,local);
+        FillRoundWords(streaming->queryErrors+uint64_t(b)*4*128,4*32,local);
+    }
     // Both hot and cold predicates are overwritten before progress is
     // published. Original per-query snapshot clipping excludes unready bits.
     for(uint32_t e=b;e<(rt_rounds?rt_rounds:1)*rt_serviceLanes;e+=rt_batch)
@@ -167,7 +180,9 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
     if ASCEND_IS_AIV {
         uint32_t b=GetBlockIdx(); if(b>=rt_batch) return;
         auto ctx=GetContext(bindings);
-        InitializeRound(rt_batch,rt_history,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b);
+        auto initBindings=reinterpret_cast<__gm__ uint64_t*>(bindings);
+        auto streaming=reinterpret_cast<__gm__ pipeline_ab::Args*>(initBindings[15]);
+        InitializeRound(rt_batch,rt_history,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b,streaming);
         auto args=GetArgs(ctx,b*2);
         auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
         auto entity=reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(args.channel_entity);
@@ -281,6 +296,34 @@ extern "C" __global__ __aicore__ void v9_resolve_kernel(GM_ADDR bindings) {
 #endif
 }
 // Final transport consumes compact resolver ranges through native KVAF.
+
+#if defined(__CCE_AICORE__)
+// Streaming descriptors occupy one fixed 2048-entry region per Q. Publish
+// residency from those ranges rather than treating them as a compact prefix.
+__simt_vf__ __aicore__ LAUNCH_BOUND(256)
+inline void PublishStreamingResidency(uint32_t resident,uint32_t postOffset,__gm__ Context* ctx,uint32_t b) {
+    if(!ctx->hotValid)return;
+    auto valid=reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+OwnerRow(ctx,b)*resident;
+    auto destinations=reinterpret_cast<__gm__ int32_t*>(ctx->destinations);
+    uint32_t ownerBase=OwnerRow(ctx,b)*OutputStride(resident,ctx);
+    for(uint32_t q=0;q<4;++q){
+        auto post=reinterpret_cast<__gm__ FinalPost*>(ctx->owners+postOffset)+b*4+q;
+        uint32_t count=asc_ldcg(&post->count),begin=asc_ldcg(&post->descriptor);
+        for(uint32_t i=threadIdx.x;i<count;i+=256){
+            uint32_t slot=uint32_t(asc_ldcg(destinations+begin+i))-ownerBase;
+            if(slot<resident)asc_stcg(valid+slot,uint32_t(1));
+        }
+    }
+    if(ctx->changes && ctx->lruSlots){
+        auto changes=reinterpret_cast<__gm__ int32_t*>(ctx->changes)+b*kChangeCapacity;
+        auto lru=reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots;
+        for(uint32_t i=threadIdx.x;i<kLruSlots;i+=256)
+            if(asc_ldcg(changes+i)>=0)asc_stcg(valid+asc_ldcg(lru+i),uint32_t(1));
+    }
+    asc_threadfence();
+}
+#endif
+
 // Submit disjoint destinations first; join prefetch before overwriting its slots.
 #if defined(__CCE_AICORE__)
 __aicore__ inline void FinishFetch(GM_ADDR bindings, GM_ADDR update) {
@@ -302,7 +345,7 @@ __aicore__ inline void FinishFetch(GM_ADDR bindings, GM_ADDR update) {
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status+b),sizeof(uint32_t));
         updateError=status[b];
         if(!updateError)
-            Simt::VF_CALL<PublishDestinationResidency>(Simt::Dim3{256,1,1},rt_resident,ctx,b,info[1]);
+            Simt::VF_CALL<PublishStreamingResidency>(Simt::Dim3{256,1,1},rt_resident,rt_finalPostOffset,ctx,b);
     }
     auto args=GetArgs(ctx,b*2);
     args.core_status=ctx->finalStatus+b*2*sizeof(KvafBatchGetCoreStatus);
@@ -313,7 +356,15 @@ __aicore__ inline void FinishFetch(GM_ADDR bindings, GM_ADDR update) {
     uint64_t error=info[0] ? kvaf_device::kInvalidArgs : row->error;
     uint32_t completed=0,total=0,deferred=0;
     uint64_t lastHead=0,lastCq=0;
-#define LIFETCH_FINAL_JOIN do { CompletePrefetch(ctx,b); error|=row->error; } while (0)
+    // Q workers have already completed their own compact descriptors.
+    for(uint32_t w=0;w<rt_finalWorkers;++w){
+        auto post=FinalPostAt(rt_finalPostOffset,ctx,b*rt_finalWorkers+w);
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
+        completed+=post->pending;
+        post->pending=0;
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
+    }
+#define LIFETCH_FINAL_JOIN do { if(!update) CompletePrefetch(ctx,b); error|=row->error; } while (0)
 #define LIFETCH_FINAL_PHASE "../../lightning_indexer_with_fetch/op_kernel/final_fetch_phase.h"
 #include "../../common/lifetch/final_phase_loop.h"
 #undef LIFETCH_FINAL_PHASE
@@ -404,3 +455,33 @@ extern "C" __global__ __aicore__ void v9_resolve_adapted_kernel(GM_ADDR bindings
 #endif
 }
 #endif
+
+// Failure-only diagnostic. Never called by the forward pipeline; queue reads
+// must execute on device because driver queue VAs are not ACL allocations.
+extern "C" __global__ __aicore__ void kvip_transport_snapshot_kernel(
+    GM_ADDR source, GM_ADDR destination, uint32_t bytes) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV {
+        TPipe pipe;
+        TBuf<TPosition::VECCALC> storage;
+        constexpr uint32_t kChunkBytes = 4096;
+        pipe.InitBuffer(storage, kChunkBytes);
+        auto local = storage.Get<uint32_t>();
+        GlobalTensor<uint32_t> input, output;
+        input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(source));
+        output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(destination));
+        for (uint32_t offset = 0; offset < bytes; offset += kChunkBytes) {
+            uint32_t count = bytes - offset;
+            if (count > kChunkBytes) count = kChunkBytes;
+            DataCopy(local, input[offset / 4], count / 4);
+            SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+            DataCopy(output[offset / 4], local, count / 4);
+            SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+        }
+        pipe.Destroy();
+    }
+#endif
+}

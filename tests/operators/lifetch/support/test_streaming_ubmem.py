@@ -5,7 +5,7 @@ import subprocess
 
 def test_query_copy_completion_and_failure_publication(tmp_path):
     root = Path(__file__).resolve().parents[4]
-    header = root / 'csrc/operators/lightning_indexer_with_fetch_streaming_qworkers/op_kernel/staged_ubmem_fetch.h'
+    header = root / 'csrc/operators/lightning_indexer_with_fetch/op_kernel/staged_ubmem_fetch.h'
     sdk = tmp_path / 'ubmem'
     sdk.mkdir()
     (sdk / 'fused_batch_get_device.h').write_text('')

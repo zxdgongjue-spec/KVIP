@@ -174,12 +174,6 @@ fetches the conflicting ranges. Its inflight control and completion handling are
 reused without a separate final WQE submitter. The test also checks an empty hot cache, victim collisions,
 full Index/scale/address ownership, and multiple graph replays, outside timing.
 
-For the original/adapted/fixed resolver comparison, use the same entry:
-
-```bash
-python tests/operators/lifetch/test_lifetch.py --transport urma --device 5 --kvaf-server 127.0.0.1:28885 --batches 8,16 --history 131072 --resident 16384 --index-heads 32 --miss-percent 10 --intermediate-fetches 8 --prefetch-tokens 512 --warmup 4 --iterations 20 --resolver-compare
-```
-
 The CPU suite executes the production resolver and shared LIDU selector with
 empty/populated hot storage, duplicate queries, padding and ABC mappings. A CANN
 simulator fixture additionally executes the compiled planner/mover and resolver
@@ -303,7 +297,7 @@ is bound, then stores its immutable parameters in the device Context before grap
 capture. No per-shape compilation is required. Index update reads history/resident
 from its bindings. ABI versions are now LIFetch 11 and Index update 3; rebuild both.
 
-Supported runtime dimensions: batch 1–32 (also limited by available AIC count),
+Supported runtime dimensions: batch 1–16 (also limited by the concurrently resident AIV budget),
 index heads 32/64, 1–32 requested windows, 256-aligned history/resident with
 2048 <= resident <= 131072 and resident < history <= 210944. Existing UB/queue constraints are checked
 before launch. Q4, TopK 2048 and the existing element types remain fixed. These
@@ -367,11 +361,46 @@ zero disables prefetch but still retrieves every required cold row. The UBmem
 smoke check accepts `--prefetch-tokens 0 512` to check both cases, including eager
 execution, graph replay, changed owner packing, and Index/payload consistency.
 
-UBmem uses one library per CANN/SoC build for batch 1–32, 32/64 Indexer
+UBmem uses one library per CANN/SoC build for batch 1–16, 32/64 Indexer
 heads and both 656/2624-byte records; runtime geometry is prepared before
 graph capture. History and hot capacity are 256-aligned, with
 `2048 <= resident < history <= 210944` and `resident <= 131072`. The binary
 cache key includes source and toolchain identity but not workload shape. The
 controller processes more than eight request rows per service lane in bounded
-chunks. B17–32 and resident below 8192 require NPU validation. Compilation and
+chunks. BS > 16 is rejected at binding, without a legacy fallback. Generalized hot capacities require NPU validation. Compilation and
 host models do not prove runtime correctness or performance.
+
+### Unified streaming LIFetch entry
+
+`kvip.LIFetch(rotating, update)` and `kvip.bind_selectors` use the same pipeline
+for URMA and UBmem: init, shared LI/final TopK classification, and fused
+per-query Resolver/Index update/Fetch. The old complete launch symbols and the
+separate experimental operator directory have been removed. Standalone stage
+entry points remain for correctness tests and native-reference measurements;
+they are not a selectable production fallback.
+
+BS1–16 is supported; a larger batch raises an explicit error during binding.
+The default uses two Fetch AIVs per Q and three pipeline AIVs per request.
+All tasks must fit concurrently: `3 * BS + 4 * q_workers <= 2 * AIC_count`.
+The public binding allocates before graph capture. Service layer groups reuse
+stream-ordered temporary storage while retaining distinct Index and launch
+bindings. KVAF patches and transport-specific leases are unchanged.
+
+The unit-test runner now uses this public entry by default. `--optimized-resolve`
+is accepted for command compatibility and no longer selects a separate kernel.
+For each transport, run with its matching KVAF build and server:
+
+```bash
+python tests/operators/lifetch/test_lifetch.py \
+  --transport urma --kvaf-root /path/to/KVAF --kvaf-server 127.0.0.1:28885 \
+  --device 4 --batches 1,2,4,8,16 --miss-percent 10 \
+  --warmup 4 --iterations 20 --trace-rounds 3 --timeout-seconds 600
+```
+
+For UBmem, replace `--transport urma` with `--transport ubmem`, use its server
+address and add `--soc Ascend950PR_9599` (or the actual device SoC).
+Use `--runtime-shapes` to exercise additional history/hot/head configurations
+without recompilation. Run additional budgets with `--prefetch-tokens 0` and
+`--prefetch-tokens 2048`. Full graph timing, byte/SFA checks, stateful ownership
+checks and per-core diagnostics are retained. Host checks and device compilation
+do not substitute for these NPU runs.

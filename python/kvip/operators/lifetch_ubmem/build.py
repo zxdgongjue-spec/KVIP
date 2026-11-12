@@ -26,8 +26,8 @@ class UbmemGeometry:
     soc: str
 
     def __post_init__(self):
-        if not 1 <= self.batch <= 32 or not 1 <= self.aic_count <= 32:
-            raise ValueError("UBmem LIFetch requires 1..32 requests and 1..32 AICs")
+        if not 1 <= self.batch <= 16 or not 1 <= self.aic_count <= 32:
+            raise ValueError("UBmem LIFetch supports BS1..16 and 1..32 AICs; larger batches are not supported")
         if self.batch > self.aic_count:
             raise ValueError("UBmem LIFetch requests must fit concurrently resident LI cores")
         if self.history % 256 or self.resident % 256 or not 2048 <= self.resident < self.history <= 210944:
@@ -68,7 +68,7 @@ def kvaf_source(build_dir):
     raise ValueError(f"KVAF source path is missing from {build_dir}/CMakeCache.txt")
 
 
-def build_ubmem_library(*, cache_dir, cann, shape, jobs=2, optimized=False):
+def build_ubmem_library(*, cache_dir, cann, shape, jobs=2, optimized=True):
     """Compile once before profiling/capture; never called by forward."""
     if not isinstance(shape, UbmemGeometry) or jobs < 1:
         raise ValueError("A validated UBmem shape and positive jobs are required")
@@ -77,12 +77,10 @@ def build_ubmem_library(*, cache_dir, cann, shape, jobs=2, optimized=False):
         raise FileNotFoundError(f"UBmem fusion sources unavailable: {source}")
     kvaf_root = kvaf_source(Path(cache_dir).parent)
     kvaf_include = kvaf_root / "access_operator/include"
-    options = shape.options(cann) | {"KVAF_INCLUDE": str(kvaf_include), "KVIP_STREAMING_UBMEM": "ON" if optimized else "OFF"}
+    options = shape.options(cann) | {"KVAF_INCLUDE": str(kvaf_include), "KVIP_STREAMING_UBMEM": "ON"}
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     shared_lifetch = source.parent / "lightning_indexer_with_fetch"
     directories = [source, source.parent / "common", shared_lifetch]
-    if optimized:
-        directories.append(source.parent / "lightning_indexer_with_fetch_streaming_qworkers")
     for directory in directories:
         for path in sorted(directory.rglob("*")):
             if path.is_file() and (path.suffix in (".h", ".cpp", ".asc", ".cmake") or path.name == "CMakeLists.txt"):

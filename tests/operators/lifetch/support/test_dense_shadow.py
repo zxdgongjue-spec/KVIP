@@ -8,7 +8,7 @@ from pathlib import Path
 @pytest.mark.parametrize("prepare", [False, True])
 def test_dense_shadow_against_swap_reference(tmp_path, prepare):
     root = Path(__file__).resolve().parents[4]
-    header = (root / 'csrc/operators/lightning_indexer_with_fetch_streaming_qworkers/op_kernel/shadow_exchange_parallel.h').read_text()
+    header = (root / 'csrc/operators/lightning_indexer_with_fetch/op_kernel/shadow_exchange_parallel.h').read_text()
     header = header.replace('THREADS=512', 'THREADS=1').replace('CHUNK=512', 'CHUNK=1')
     begin = header.index('__simt_callee__ inline uint32_t prefix(')
     end = header.index('\n__simt_vf__', begin)
@@ -45,7 +45,7 @@ int main(){using namespace pipeline_ab;
  InitShadow(m.data());
  for(uint32_t i=0;i<N;i++){
   if(i==1500)InitDenseShadow(dense.data(),H,m.data());
-  if(i<1500)ApplyBatch(source.data(),dest.data(),i,1,keys.data(),scale.data(),valid.data(),R,m.data());
+  if(i<1500)ApplyBatch(source.data(),dest.data(),i,1,keys.data(),scale.data(),valid.data(),R,m.data(),nullptr,nullptr,nullptr,H);
   else ApplyDenseBatch(source.data(),dest.data(),i,1,keys.data(),scale.data(),valid.data(),R,dense.data(),H,m.data());
   assert(m[CONTROL]==0);uint32_t p=inverse[source[i]],d=dest[i],a=reference[p],b=reference[d];
   reference[d]=a;reference[p]=b;inverse[a]=d;inverse[b]=p;
@@ -59,6 +59,7 @@ int main(){using namespace pipeline_ab;
 }
 '''
     if prepare:
+        code = code.replace(',nullptr,nullptr,nullptr,H)', ')')
         code = code.replace('ApplyBatch(source.data()', 'ApplyBatch<true>(source.data()').replace('ApplyDenseBatch(source.data()', 'ApplyDenseBatch<true>(source.data()')
         code = code.replace('R,m.data());', 'R,m.data(),addr.data(),logical.data(),reinterpret_cast<uint64_t*>(dense.data()+2*H),H);')
         code = code.replace('R,dense.data(),H,m.data());', 'R,dense.data(),H,m.data(),addr.data(),logical.data(),reinterpret_cast<uint64_t*>(dense.data()+2*H));')
@@ -78,7 +79,7 @@ int main(){using namespace pipeline_ab;
 def test_dense_shadow_parallel_batch_and_cross_batch_chain(tmp_path, prepare, use_dense, optimized):
     """Run the real vector body with a 32-lane host model of one warp."""
     root = Path(__file__).resolve().parents[4]
-    header = (root / 'csrc/operators/lightning_indexer_with_fetch_streaming_qworkers/op_kernel/shadow_exchange_parallel.h').read_text()
+    header = (root / 'csrc/operators/lightning_indexer_with_fetch/op_kernel/shadow_exchange_parallel.h').read_text()
     header = header.replace('THREADS=512', 'THREADS=32').replace('CHUNK=512', 'CHUNK=32')
     # Keep full metadata staging capacity even when shrinking CHUNK below MAP.
     # A one-warp model has one partial sum instead of sixteen.
@@ -127,7 +128,7 @@ int main(){using namespace pipeline_ab;
  for(uint32_t phase=0;phase<3;phase++){
   uint32_t begin=phase*32;
   if(phase==1)launch([&]{InitDenseShadow(dense.data(),H,m.data());});
-  if(!phase)launch([&]{ApplyBatch(src.data(),dst.data(),begin,32,keys.data(),scale.data(),valid.data(),R,m.data());});
+  if(!phase)launch([&]{ApplyBatch(src.data(),dst.data(),begin,32,keys.data(),scale.data(),valid.data(),R,m.data(),nullptr,nullptr,nullptr,H);});
   else launch([&]{ApplyDenseBatch(src.data(),dst.data(),begin,32,keys.data(),scale.data(),valid.data(),R,dense.data(),H,m.data());});
   assert(!m[CONTROL]);
   uint32_t first=0;
@@ -148,6 +149,7 @@ int main(){using namespace pipeline_ab;
         source = source.replace('CommitDenseMetadata(addr.data(),logical.data(),dense.data(),reinterpret_cast<uint64_t*>(dense.data()+2*H),H);', 'CommitMetadata(addr.data(),logical.data(),m.data());')
         source = source.replace('assert(dense[i]==ref[i] && dense[H+ref[i]]==i);', 'assert(get(m.data()+KEYS_POS,m.data()+VALUES_POS,i)==ref[i]);')
     if prepare:
+        source = source.replace(',nullptr,nullptr,nullptr,H)', ')')
         source = source.replace('ApplyBatch(src.data()', 'ApplyBatch<true>(src.data()').replace('ApplyDenseBatch(src.data()', 'ApplyDenseBatch<true>(src.data()')
         source = source.replace('R,m.data());', 'R,m.data(),addr.data(),logical.data(),reinterpret_cast<uint64_t*>(dense.data()+2*H),H);')
         source = source.replace('R,dense.data(),H,m.data());', 'R,dense.data(),H,m.data(),addr.data(),logical.data(),reinterpret_cast<uint64_t*>(dense.data()+2*H));')

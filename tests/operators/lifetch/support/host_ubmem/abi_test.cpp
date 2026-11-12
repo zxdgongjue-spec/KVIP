@@ -24,6 +24,12 @@ LAUNCH_WIDTH(2624,complete,14)
 LAUNCH(direct_update_owned,5)
 LAUNCH(direct_update_outputs,6)
 LAUNCH(direct_apply_owned,7)
+#define LI_PHASE(width,phase) extern "C" uint32_t aclrtlaunch_kvip_ubmem_##width##_li_kernel_##phase(uint32_t n,void*,void*) { calls.push_back(2);blocks.push_back(n);return 0; }
+LI_PHASE(656,1) LI_PHASE(656,2) LI_PHASE(656,3)
+LI_PHASE(2624,1) LI_PHASE(2624,2) LI_PHASE(2624,3)
+extern "C" uint32_t aclrtlaunch_v9_streaming_resolve_update_656(uint32_t n,void*,void*) { calls.push_back(9);blocks.push_back(n);return fail==9?71:0; }
+extern "C" uint32_t aclrtlaunch_v9_streaming_resolve_update_2624(uint32_t n,void*,void*) { calls.push_back(19);blocks.push_back(n);return fail==19?71:0; }
+extern "C" uint32_t aclrtlaunch_v9_counter_calibration_656(uint32_t,void*,void*) { return 0; }
 int main() {
     using namespace rotating;
     static_assert(sizeof(Context)==336 && sizeof(Row)==1024 && sizeof(UbmemRegion)==128);
@@ -41,19 +47,23 @@ int main() {
     assert(shape.finalPostOffset==shape.batch*128+shape.finalCores*288*4);
     shape.tokenBytes=656;
     void* pointer=reinterpret_cast<void*>(1);
-    assert(kvip_ubmem_forward(pointer,pointer,pointer,&shape)==0);
-    assert((calls==std::vector<unsigned>{1,2,3,8,4,5,6,7}));
-    assert((blocks==std::vector<unsigned>{shape.batch,shape.liCores,shape.finalCores,shape.finalCores,shape.batch,shape.batch,shape.batch,shape.batch*4}));
-    calls.clear();blocks.clear();shape.tokenBytes=2624;
-    assert(kvip_ubmem_forward(pointer,pointer,pointer,&shape)==0);
-    assert((calls==std::vector<unsigned>{11,12,13,18,14,5,6,7}));
-    calls.clear();blocks.clear();shape.tokenBytes=656;fail=4;
-    assert(kvip_ubmem_forward(pointer,pointer,pointer,&shape)==71);
-    assert((calls==std::vector<unsigned>{1,2,3,8,4}));
-    calls.clear();blocks.clear();fail=8;
-    assert(kvip_ubmem_forward(pointer,pointer,pointer,&shape)==71);
-    assert((calls==std::vector<unsigned>{1,2,3,8}));
-    calls.clear();assert(kvip_ubmem_forward(nullptr,pointer,pointer,&shape)!=0 && calls.empty());
+    if(shape.batch>16){
+        assert(kvip_lifetch_streaming_forward(pointer,pointer,pointer,pointer,&shape,2)!=0);
+        assert(calls.empty());
+    }else{
+        assert(kvip_lifetch_streaming_forward(pointer,pointer,pointer,pointer,&shape,2)==0);
+        assert((calls==std::vector<unsigned>{1,2,9}));
+        assert((blocks==std::vector<unsigned>{shape.batch,shape.liCores,shape.batch*3+8}));
+        calls.clear();blocks.clear();shape.tokenBytes=2624;
+        assert(kvip_lifetch_streaming_forward(pointer,pointer,pointer,pointer,&shape,2)==0);
+        assert((calls==std::vector<unsigned>{11,12,19}));
+        for(unsigned f: {1U,2U,9U}){
+            calls.clear();shape.tokenBytes=656;fail=f;
+            assert(kvip_lifetch_streaming_forward(pointer,pointer,pointer,pointer,&shape,2)==71);
+            assert(calls.back()==fail);
+        }
+        calls.clear();assert(kvip_lifetch_streaming_forward(nullptr,pointer,pointer,pointer,&shape,2)!=0 && calls.empty());
+    }
     for(uint32_t e=1;e<shape.rounds;++e)assert(RuntimeTrigger(shape.history,shape.resident,shape.rounds,e)>
         RuntimeTrigger(shape.history,shape.resident,shape.rounds,e-1));
     assert(RuntimeTrigger(shape.history,shape.resident,shape.rounds,0)==shape.resident/128);

@@ -132,6 +132,10 @@ def test_static_shape_and_ubmem_scratch_contract():
 
 @pytest.mark.parametrize("batch,resident", [(1, 2048), (16, 2048), (24, 16384), (32, 2048)])
 def test_extended_ubmem_geometry(batch, resident):
+    if batch > 16:
+        with pytest.raises(ValueError, match="BS1..16"):
+            UbmemGeometry(batch, 131072, resident, 32, 656, 32, 8, "Ascend950PR_9599")
+        return
     shape = UbmemGeometry(batch, 131072, resident, 32, 656, 32, 8, "Ascend950PR_9599")
     spec = rotation_spec(batch, shape.history, resident, shape.aic_count, shape.intermediate_fetches)
     assert spec["mapping"][0] == (batch, shape.history)
@@ -152,8 +156,8 @@ def test_shared_workspace_keeps_ubmem_transport_specific_status():
         assert ubmem["ubmem_status"] == ((batch, 16), "int64")
 
 
-def test_ubmem_supports_wide_batch_and_many_windows():
-    shape = UbmemGeometry(32, 131072, 16384, 32, 656, 32, 32, "Ascend950PR_9599")
+def test_ubmem_supports_sixteen_requests_and_many_windows():
+    shape = UbmemGeometry(16, 131072, 16384, 32, 656, 32, 32, "Ascend950PR_9599")
     assert shape.options("/cann")["SOC_VERSION"] == "Ascend950PR_9599"
 
 
@@ -245,48 +249,6 @@ def test_unique_active_owners_accepts_repeated_padding_without_device_read():
         with pytest.raises(ValueError, match="distinct"):
             inputs.prepare([4, 1], query_owners=[1, 1])
         assert original.call_count == 2
-
-
-def test_forward_only_submits_bound_pointers_on_the_current_lease_stream():
-    import kvip
-
-    launch = Mock(return_value=0)
-    device = object()
-    rotating = SimpleNamespace(
-        device=device,
-        runtime_shape=ctypes.c_uint32(7),
-        library=SimpleNamespace(kvip_ubmem_forward=launch),
-        bindings=SimpleNamespace(data_ptr=lambda: 101),
-        lease=SimpleNamespace(check_stream=Mock(return_value=SimpleNamespace(npu_stream=303))),
-    )
-    update = SimpleNamespace(device=device, bindings=SimpleNamespace(numel=lambda: 28, data_ptr=lambda: 202))
-    forward = kvip.LIFetch(rotating, update)
-    forward()
-    args = launch.call_args.args
-    assert args[:3] == (101, 202, 303)
-    assert ctypes.cast(args[3], ctypes.POINTER(ctypes.c_uint32)).contents.value == 7
-    launch.return_value = 4
-    with pytest.raises(RuntimeError, match="launch failed: 4"):
-        forward()
-
-
-def test_public_forward_preserves_urma_launch_and_stream():
-    import kvip
-
-    launch = Mock(return_value=0)
-    device = object()
-    stream = SimpleNamespace(npu_stream=303)
-    rotating = SimpleNamespace(
-        device=device,
-        shape_pointer=404,
-        torch=SimpleNamespace(npu=SimpleNamespace(current_stream=Mock(return_value=stream))),
-        library=SimpleNamespace(kvip_lifetch_forward=launch),
-        bindings=SimpleNamespace(data_ptr=lambda: 101),
-    )
-    update = SimpleNamespace(device=device, bindings=SimpleNamespace(numel=lambda: 28, data_ptr=lambda: 202))
-    kvip.LIFetch(rotating, update)()
-    launch.assert_called_once_with(101, 202, 303, 404)
-    rotating.torch.npu.current_stream.assert_called_once_with(device)
 
 
 @pytest.mark.parametrize("transport", ["urma", "ubmem"])

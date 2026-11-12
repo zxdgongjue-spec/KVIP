@@ -6,7 +6,12 @@
 namespace pipeline_ab {
 constexpr uint32_t kResolveCores=KVIP_OUTPUT_WORKER?3:2;
 constexpr uint32_t kRawQueryFlag=12;
-constexpr uint32_t kHistory=131072, kResident=16384, kPrefetch=512, kQueries=4;
+constexpr uint32_t kPrefetch=2048, kQueries=4;
+// Only the current Q needs first-occurrence IDs; slots/hash ranks span all Qs.
+constexpr uint32_t kStagedSlotsOffset=4*8192+1024;
+constexpr uint32_t kStagedPositionsOffset=kStagedSlotsOffset+8192;
+constexpr uint32_t kStagedControlOffset=kStagedPositionsOffset+8192;
+static_assert((kStagedControlOffset+1024+4096)*4<=223232,"streaming resolver UB budget");
 constexpr uint32_t kMaxFinal=8192, kMapSize=4096, kChunk=32;
 constexpr uint32_t kFlagWords=32, kFlagCount=KVIP_OUTPUT_WORKER?16:12;
 // Each flag is isolated to avoid stale reads/false sharing across AIVs.

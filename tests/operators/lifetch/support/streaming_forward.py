@@ -1,90 +1,16 @@
-"""Isolated LI/Resolver/Index/URMA streaming experiment binding.
-
-All storage is prepared before graph capture. Round state is initialized by
-the experiment's existing v9_init kernel, not by Python in forward.
-"""
+"""Diagnostic extensions for the production streaming LIFetch binding."""
 import ctypes
 
 import numpy as np
 
+from kvip.operators.lifetch.forward import LIFetchForward
 
-class StreamingForward:
-    def __init__(self, rotating, update, torch, prefetch_limit, *, fused_final=False, q_workers=None):
-        self.rotating, self.update, self.torch = rotating, update, torch
-        shape = rotating.runtime_shape
-        self.batch, self.history, self.resident = shape.batch, shape.history, shape.resident
-        self.shape_pointer = ctypes.byref(shape)
-        if not (1 <= self.batch <= 16 and self.history == 131072 and self.resident == 16384 and shape.indexHeads == 32):
-            raise ValueError('streaming experiment supports B1..16, history=131072, resident=16384, index_heads=32')
-        if prefetch_limit > 512:
-            raise ValueError('streaming experiment supports at most 512 prefetches per request')
-        keys, scales, addresses, logical = update.storage[:4]
-        b, device = self.batch, rotating.device
-        self.fused_final = fused_final
-        self.q_workers = q_workers
-        self.legacy_layout = False
-        self.parallel_finalize = False
-        self.prepare_metadata = False
-        self.resolver_cores = 2
-        if q_workers and hasattr(rotating.library, 'kvip_streaming_resolver_cores'):
-            geometry_fn = rotating.library.kvip_streaming_resolver_cores
-            geometry_fn.argtypes = []
-            geometry_fn.restype = ctypes.c_uint32
-            self.resolver_cores = int(geometry_fn())
-        flag_count = ((16 if self.resolver_cores == 3 else 12) if q_workers else (7 if fused_final else 5))
-        if q_workers and hasattr(rotating.library, 'kvip_streaming_flag_count'):
-            flags_fn = rotating.library.kvip_streaming_flag_count
-            flags_fn.argtypes = []
-            flags_fn.restype = ctypes.c_uint32
-            flag_count = int(flags_fn())
-        self.flags = torch.zeros((b, flag_count, 32), dtype=torch.int32, device=device)
-        self.events_src = torch.empty((b, 512 + 8192), dtype=torch.int32, device=device)
-        self.events_dst = torch.empty_like(self.events_src)
-        self.worker_status = torch.zeros((b, 32), dtype=torch.int32, device=device)
-        # First 64 words/request are resolver/update, then 16 words per Q.
-        self.times = torch.zeros((b * (256 if q_workers else (224 if fused_final else 128)) + ((self.resolver_cores*b+4*q_workers)*32 if q_workers else 0),), dtype=torch.int64, device=device)
-        self.query_bitmaps = torch.empty((b, 4, 512), dtype=torch.int32, device=device)
-        self.query_errors = torch.zeros((b, 4, 32), dtype=torch.int32, device=device)
-        # Dense fallback holds two uint32 permutations and two uint64 snapshots.
-        self.dense_shadow = (torch.empty((b, 3 * self.history), dtype=torch.int64, device=device)
-                             if q_workers else None)
-        # Each Q worker owns independent packed indices, offsets and destinations.
-        self.packed_fetch = (torch.empty((4 * q_workers, 9 * b * 2048 + ((3 * b + 31) // 32) * 32 + 64),
-                                        dtype=torch.int32, device=device)
-                             if q_workers else None)
-        pointers = [rotating.context.data_ptr(), keys.data_ptr(), scales.data_ptr(), addresses.data_ptr(),
-                    logical.data_ptr(), rotating.hot_valid.data_ptr(), self.flags.data_ptr(),
-                    self.events_src.data_ptr(), self.events_dst.data_ptr(), self.worker_status.data_ptr(),
-                    self.times.data_ptr()]
-        geometry = [self.history, self.resident, 512 | ((q_workers or 0) << 16), 512 + 8192]
-        trailing = [self.query_bitmaps.data_ptr(), self.query_errors.data_ptr(), update.bindings.data_ptr()]
-        blob = np.concatenate((np.asarray(pointers, dtype='<u8').view('u1'),
-                               np.asarray(geometry, dtype='<u4').view('u1'),
-                               np.asarray(trailing, dtype='<u8').view('u1')))
-        if q_workers:
-            blob = np.concatenate((blob, np.asarray([self.dense_shadow.data_ptr(), self.packed_fetch.data_ptr()], dtype='<u8').view('u1'),
-                                   np.zeros(112, dtype='u1')))
-        expected_size = 256 if q_workers else 128
-        if len(blob) != expected_size:
-            raise AssertionError(f'streaming workspace ABI size={len(blob)}, expected {expected_size}')
-        self.workspace = torch.from_numpy(blob.copy()).to(device)
-        rotating.bindings = torch.tensor(
-            [x.data_ptr() for x in rotating.arguments] + [self.workspace.data_ptr()],
-            dtype=torch.uint64, device=device,
-        )
-        self.function = rotating.library.kvip_lifetch_streaming_forward
-        self.function.argtypes = [ctypes.c_void_p] * 5 + ([ctypes.c_uint32] if q_workers else [])
-        self.function.restype = ctypes.c_uint32
 
-    def __call__(self):
-        stream = self.torch.npu.current_stream(self.rotating.device)
-        args = [self.rotating.bindings.data_ptr(), self.update.bindings.data_ptr(),
-                self.workspace.data_ptr(), stream.npu_stream, self.shape_pointer]
-        if self.q_workers:
-            args.append(self.q_workers)
-        result = self.function(*args)
-        if result:
-            raise RuntimeError(f'streaming LIFetch launch failed: {result}')
+class StreamingForward(LIFetchForward):
+    def __init__(self, rotating, update, torch, prefetch_limit, *, fused_final=True, q_workers=2):
+        if torch is not rotating.torch or prefetch_limit != rotating.prefetch_limit or not fused_final:
+            raise ValueError("Diagnostics must use the exact public LIFetch binding and budget")
+        super().__init__(rotating, update, q_workers=q_workers)
 
     def calibrate_counter_mhz(self):
         """Approximate cycle frequency against a long independent graph event."""
@@ -119,15 +45,10 @@ class StreamingForward:
         return float(np.median(samples))
 
     def set_deferred_fetch(self, enabled):
-        # Isolation-only mode, set before launch; never used for graph timing.
-        value = np.asarray([512 | ((self.q_workers or 0) << 16) | (0x20000000 if self.legacy_layout else 0) | (0x10000000 if self.parallel_finalize else 0) | (0x08000000 if self.prepare_metadata else 0) | (0x40000000 if enabled else 0)], dtype='<u4').view('u1')
-        self.workspace[96:100].copy_(self.torch.from_numpy(value.copy()))
+        self.set_options(deferred_fetch=enabled)
 
     def set_diagnostics(self, enabled):
-        # Existing prefetchCount field is unused by the streaming kernel; its
-        # high bit gates timestamps only in the separate profiled pass.
-        value = np.asarray([512 | ((self.q_workers or 0) << 16) | (0x20000000 if self.legacy_layout else 0) | (0x10000000 if self.parallel_finalize else 0) | (0x08000000 if self.prepare_metadata else 0) | (0x04000000 if getattr(self, "ubmem_overlap_fetch", False) else 0) | (0x80000000 if enabled else 0)], dtype='<u4').view('u1')
-        self.workspace[96:100].copy_(self.torch.from_numpy(value.copy()))
+        self.set_options(diagnostics=enabled)
 
     def diagnostic_cycles(self):
         raw = self.times.cpu().numpy().astype(np.uint64)

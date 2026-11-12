@@ -37,7 +37,7 @@ def test_ubmem_selects_streaming_backend(monkeypatch, tmp_path):
     assert commands[0][commands[0].index('--q-workers')+1] == '2'
 
 
-@pytest.mark.parametrize('flag', ['--early-fetch','--avoid-prefetch-slots','--legacy-fetch-layout','--parallel-fetch-finalize','--streaming'])
+@pytest.mark.parametrize('flag', ['--early-fetch','--avoid-prefetch-slots','--legacy-fetch-layout','--parallel-fetch-finalize'])
 def test_removed_experiments_fail_before_launch(flag):
     with pytest.raises(SystemExit):
         module.main(['--transport','urma','--kvaf-server','host:1',flag])

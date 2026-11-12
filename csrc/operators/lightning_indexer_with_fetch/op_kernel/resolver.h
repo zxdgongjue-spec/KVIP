@@ -12,7 +12,7 @@
 
 #include "../../common/lifetch/resolver_candidates.h"
 
-#include "../../common/lifetch/resident_selection.h"
+#include "resident_selection.h"
 
 // Imported from final_worker_submit.h
 

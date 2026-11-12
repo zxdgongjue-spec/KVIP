@@ -31,7 +31,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void ApplyBatch(__gm__ uint3
  uint32_t tid=threadIdx.x;auto ctl=m+CONTROL;auto ps=m+PLAN_SRC;auto pd=m+PLAN_DST;auto data=reinterpret_cast<__ubuf__ uint64_t*>(m+STAGING);
  for(uint32_t base=0;base<count;base+=CHUNK){uint32_t n=(count-base)<CHUNK?count-base:CHUNK;
   for(uint32_t i=tid;i<2*SET;i+=THREADS)m[SRCSET+i]=EMPTY;asc_syncthreads();
-  if(tid<n){uint32_t orig=asc_ldcg(sources+begin+base+tid),dst=asc_ldcg(destinations+begin+base+tid);uint32_t src=get(m+KEYS_ROW,m+VALUES_ROW,orig);ps[tid]=src;pd[tid]=dst;if(orig>=kHistory||dst>=kResident||src==EMPTY||!insert(m+SRCSET,src)||!insert(m+DSTSET,dst))asc_atomic_or(ctl,1U);}asc_syncthreads();if(ctl[0])return;
+  if(tid<n){uint32_t orig=asc_ldcg(sources+begin+base+tid),dst=asc_ldcg(destinations+begin+base+tid);uint32_t src=get(m+KEYS_ROW,m+VALUES_ROW,orig);ps[tid]=src;pd[tid]=dst;if(orig>=history||dst>=resident||src==EMPTY||!insert(m+SRCSET,src)||!insert(m+DSTSET,dst))asc_atomic_or(ctl,1U);}asc_syncthreads();if(ctl[0])return;
   uint32_t out=tid<n&&!contains(m+SRCSET,pd[tid]),freed=tid<n&&!contains(m+DSTSET,ps[tid]);
 #if KVIP_FUSE_QUERY_WORK
   // Both sums are at most CHUNK=512, so two 16-bit lanes share one scan.

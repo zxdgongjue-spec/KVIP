@@ -5,7 +5,7 @@ from pathlib import Path
 
 def test_query_worker_batches_kvaf_calls_and_preserves_conflicts(tmp_path):
     root = Path(__file__).resolve().parents[4]
-    source = (root / 'csrc/operators/lightning_indexer_with_fetch_streaming_qworkers/op_kernel/streaming.cpp').read_text()
+    source = (root / 'csrc/operators/lightning_indexer_with_fetch/op_kernel/streaming.cpp').read_text()
     begin = source.index('__aicore__ inline void FetchQueryGroup(')
     end = source.index('__aicore__ inline void FinalizeStreaming', begin)
     body = source[begin:end].removesuffix("#endif\n")
@@ -102,8 +102,8 @@ int main(){
 
 def test_prefetch_does_not_reset_owned_final_status():
     root = Path(__file__).resolve().parents[4]
-    kernel = (root / 'csrc/operators/lightning_indexer_with_fetch_streaming_qworkers/op_kernel/streaming.cpp').read_text()
-    helper = (root / 'csrc/operators/lightning_indexer_with_fetch_streaming_qworkers/op_kernel/staged_fetch_worker.h').read_text()
+    kernel = (root / 'csrc/operators/lightning_indexer_with_fetch/op_kernel/streaming.cpp').read_text()
+    helper = (root / 'csrc/operators/lightning_indexer_with_fetch/op_kernel/staged_fetch_worker.h').read_text()
     assert 'CompletePrefetch(ctx,b,true,profile?' in kernel
     assert 'if(initializeSpare)' in helper
     assert 'pair=2*shape.batch+2*(q*workers+lane)' in kernel
@@ -129,7 +129,7 @@ def test_two_jetty_pairs_do_not_overlap_prefetch_or_each_other():
 
 def test_standalone_dispatch_reuses_fused_worker():
     root = Path(__file__).resolve().parents[4]
-    kernel = (root / 'csrc/operators/lightning_indexer_with_fetch_streaming_qworkers/op_kernel/streaming.cpp').read_text()
+    kernel = (root / 'csrc/operators/lightning_indexer_with_fetch/op_kernel/streaming.cpp').read_text()
     entry = kernel.split('void v9_query_fetch_only(', 1)[1]
     assert 'FetchQueryGroup(reinterpret_cast<__gm__ Args*>(arg),q,lane,workers,skipEmptyConflict)' in entry
     assert 'uint32_t workers=2' in entry
@@ -138,7 +138,7 @@ def test_standalone_dispatch_reuses_fused_worker():
 
 def test_native_reference_uses_kvaf_default_partition():
     root = Path(__file__).resolve().parents[4]
-    kernel = (root / 'csrc/operators/lightning_indexer_with_fetch_streaming_qworkers/op_kernel/streaming.cpp').read_text()
+    kernel = (root / 'csrc/operators/lightning_indexer_with_fetch/op_kernel/streaming.cpp').read_text()
     entry = kernel.split('void v9_native_fetch_only(', 1)[1]
     assert 'args.block_count=cores;args.jettys_per_core=2' in entry
     assert 'kvaf_device::KvafBatchGetDevice(args,core)' in entry

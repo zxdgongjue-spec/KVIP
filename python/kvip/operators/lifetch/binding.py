@@ -40,6 +40,8 @@ class LIFetchBinding:
     ):
         if resident > 131072:
             raise ValueError("LIFetch hot bitmap supports resident <= 131072")
+        if not 1 <= batch <= 16:
+            raise ValueError(f"LIFetch supports BS1..16; received BS={batch}; no legacy fallback")
         self.torch, self.owner = torch, owner
         self.library = load_lifetch_library(library)
         self.device = arguments[0].device
@@ -90,11 +92,12 @@ class LIFetchBinding:
             if fn(self.shape_pointer) != expected:
                 raise ValueError(f"V9 binary contract mismatch: {name}")
         prefetch_limit, window_limit = prefetch_budget(prefetch_limit, window_limit, intermediate_fetches)
+        self.prefetch_limit = prefetch_limit
         geometry = li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)
         if geometry["logical_aic_tasks"] > aic_count or not geometry["intermediate_fetches"]:
             raise ValueError("Direct hot-first mode requires a window and concurrently resident LI tasks")
         contexts = owner.build_device_args(library)
-        required_queues = batch * (final_aivs(batch, li_tiling, aic_count, final_workers) + 1)
+        required_queues = max(batch * (final_aivs(batch, li_tiling, aic_count, final_workers) + 1), 2 * batch + 16)
         if contexts.shape[0] < required_queues:
             raise ValueError("V9 requires exclusive prefetch and per-final-AIV queues")
         self.rounds = li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)[

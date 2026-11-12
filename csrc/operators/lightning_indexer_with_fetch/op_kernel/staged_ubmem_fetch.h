@@ -10,7 +10,8 @@ inline void ClassifyUbmemDependencies(__gm__ Context* ctx,uint32_t offset,uint32
  uint32_t q,uint32_t resident,uint32_t width,uint32_t ownerBase,
  __ubuf__ uint32_t* sectors,__ubuf__ uint32_t* masks,__ubuf__ uint32_t* control) {
  uint32_t tid=threadIdx.x;
- for(uint32_t i=tid;i<resident;i+=blockDim.x)sectors[i]=0;
+ const uint32_t sectorCount=(width%32U)?(resident+1)/2:resident;
+ for(uint32_t i=tid;i<(sectorCount+7)/8;i+=blockDim.x)sectors[i]=0;
  if(!tid){control[0]=0;control[1]=0;control[2]=0;}
  asc_syncthreads();
  auto destinations=reinterpret_cast<__gm__ int32_t*>(ctx->destinations);
@@ -22,7 +23,7 @@ inline void ClassifyUbmemDependencies(__gm__ Context* ctx,uint32_t offset,uint32
    uint32_t slot=uint32_t(asc_ldcg(destinations+begin+i))-ownerBase;
    if(slot>=resident){asc_atomic_or(control+2,kUbmemInvalidAddress);continue;}
    uint32_t sector=(width%32U)?slot/2:slot;
-   asc_atomic_or(sectors+sector,1U<<prior);
+   asc_atomic_or(sectors+sector/8,1U<<((sector%8)*4+prior));
   }
  }
  asc_syncthreads();
@@ -31,7 +32,7 @@ inline void ClassifyUbmemDependencies(__gm__ Context* ctx,uint32_t offset,uint32
   uint32_t slot=uint32_t(asc_ldcg(destinations+post->descriptor+i))-ownerBase;
   uint32_t dependencies=0;
   if(slot>=resident)asc_atomic_or(control+2,kUbmemInvalidAddress);
-  else dependencies=sectors[(width%32U)?slot/2:slot];
+  else {uint32_t sector=(width%32U)?slot/2:slot;dependencies=(sectors[sector/8]>>((sector%8)*4))&15U;}
   masks[i]=dependencies;
   if(dependencies){asc_atomic_or(control,dependencies);asc_atomic_add(control+1,1U);}
  }
@@ -44,7 +45,7 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,
  auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags);
  auto region=UbmemRegionAt(ctx);
  bool profile=(a->prefetchCount&0x80000000U)!=0;
- uint32_t error=(UbmemRegionValid(region,shape.resident) && shape.resident<=kUbmemSectorCapacity)?0:kUbmemInvalidRegion;
+ uint32_t error=(UbmemRegionValid(region,shape.resident) && shape.resident<=kUbmemSectorCapacity*8)?0:kUbmemInvalidRegion;
  uint32_t completed=0;
  auto trace=reinterpret_cast<__gm__ uint64_t*>(a->times)+shape.batch*256+
    (shape.batch*kResolveCores+q*workers+lane)*32;
