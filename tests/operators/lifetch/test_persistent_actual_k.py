@@ -51,15 +51,19 @@ def test_state_oracle_composes_base_and_current_physical_mappings():
     scores = np.tile(np.arange(history, dtype=np.float32), (4, 1))
     base_order = np.arange(history - 1, -1, -1, dtype=np.int32)
     current = np.tile(np.arange(history, dtype=np.int32), (2, 1))
-    current[0, 10], current[0, 100] = current[0, 100], current[0, 10]
-    current[1, 2048], current[1, 3000] = current[1, 3000], current[1, 2048]
+    current[0, 0], current[0, 3000] = current[0, 3000], current[0, 0]
+    current[1, 100], current[1, 3500] = current[1, 3500], current[1, 100]
 
     reports, selected = score_oracle_for_persistent_state(
-        scores, base_order, current, (2048, 3072), resident
+        scores, base_order, current, (3072, 4096), resident
     )
     assert selected.shape == (2, 4, 2048)
-    assert [x["actual_key_length"] for x in reports] == [2048, 3072]
-    for row, key in enumerate((2048, 3072)):
+    assert [x["actual_key_length"] for x in reports] == [3072, 4096]
+    # These swaps cross the TopK decision boundary: the current row map must
+    # affect which physical rows win, not merely the logical labels.
+    assert 3000 in selected[0, 0] and 0 not in selected[0, 0]
+    assert 3500 in selected[1, 0] and 100 not in selected[1, 0]
+    for row, key in enumerate((3072, 4096)):
         current_order = base_order[current[row]]
         for query in range(4):
             prefix = scores[query, current_order[:key]]
@@ -96,3 +100,21 @@ def test_cli_wires_persistent_actual_k_mode():
     assert cli.count('add_argument("--actual-k-persistent-check"') == 2
     assert "common.append('--actual-k-persistent-check')" in cli
     assert "persistent_growth_schedule" in cli
+
+
+def test_device_harness_preserves_index_kv_and_mapping_suffix_between_stages():
+    root = Path(__file__).resolve().parents[3]
+    runner = (root / "tests/operators/lifetch/support/lifetch.py").read_text()
+    assert 'getattr(args, "actual_k_persistent_check", False)' in runner
+    assert "reset_count=1" in runner
+    assert "reset_between_stages=0" in runner
+    assert "index_kv_restored_between_stages=False" in runner
+    start = runner.index("for stage_index, (label, new_k) in enumerate(schedule):")
+    end = runner.index("persistent_actual_k_report = dict", start)
+    stage_body = runner[start:end]
+    assert "reset()" not in stage_body
+    assert "owner.reset()" not in stage_body
+    assert "score_oracle_for_persistent_state" in runner
+    assert "Index key rows do not match persistent logical map" in runner
+    assert "persistent Hot KV ownership mismatch" in runner
+    assert "out-of-K Mapping suffix changed" in runner
