@@ -69,3 +69,5 @@ def test_wiring_stays_in_test_harness_only():
     assert "actual_key_lengths=actual_lengths" in runner
     assert "arguments[6].view(torch.int32)" in runner
     assert "query_ends=query_ends" in runner
+    assert "Partial round init overwrote out-of-K suffix" in runner
+    assert "Partial round init failed to clear valid K" in runner

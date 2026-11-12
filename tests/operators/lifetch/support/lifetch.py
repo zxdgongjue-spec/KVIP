@@ -1198,10 +1198,26 @@ def run_device(
             or rotating.events.cpu().count_nonzero()
             or rotating.owners.cpu().count_nonzero()
             or rotating.count.cpu().count_nonzero()
-            or (not (rotating.mapping.cpu() == -1).all())
             or (not (rotating.changes.cpu() == -1).all())
         ):
             raise AssertionError("Round init retained poisoned workspace")
+        # P0-A2: shortened Mapping clear intentionally preserves the suffix.
+        # Poison with +1 before v9_init, then require every valid K prefix
+        # cleared to -1 while ineligible [K, History) remains exactly +1.
+        # With the optimization OFF (or no actual K), require a full clear.
+        observed_mapping = rotating.mapping.cpu().numpy()
+        if actual_lengths is not None and args.active_k_map_clear:
+            for row, effective_k in enumerate(actual_lengths):
+                if not np.all(observed_mapping[row, :effective_k] == -1):
+                    raise AssertionError(
+                        f"Partial round init failed to clear valid K: row={row} K={effective_k}"
+                    )
+                if not np.all(observed_mapping[row, effective_k:] == 1):
+                    raise AssertionError(
+                        f"Partial round init overwrote out-of-K suffix: row={row} K={effective_k}"
+                    )
+        elif not np.all(observed_mapping == -1):
+            raise AssertionError("Full round init retained poisoned Mapping")
         header = b * (4 * 2048 * 6 + 1024)
         bitmap = arguments[13][header : header + b * h].cpu().reshape(b, 4, h // 4)
         if not (bitmap == 255).all():
