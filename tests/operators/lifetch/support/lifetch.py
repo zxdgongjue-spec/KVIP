@@ -461,7 +461,7 @@ def run_v9_li_varlen_only(
             audit["binary_event_profiling"] = bool(getattr(args, "epoch_audit_profile", False))
             epoch_audit_filename = f"epoch-audit-{scenario['name']}.json"
             (Path(folder) / epoch_audit_filename).write_text(
-                json.dumps(audit, indent=2) + "\\n"
+                json.dumps(audit, indent=2) + "\n"
             )
             (Path(folder) / f"epoch-audit-{scenario['name']}.txt").write_text(
                 format_rotation_table(audit)

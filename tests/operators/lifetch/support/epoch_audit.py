@@ -183,18 +183,21 @@ def audit_rotation_events(
     return report
 
 
+def _fmt_count(value):
+    return "N/A" if value is None else str(value)
+
+
 def format_rotation_table(report):
     lines = [
         "Epoch Lane Core Expected Trigger Complete Skipped Candidate SelectedForPost",
     ]
     for entry in report["events"]:
-        fmt = lambda value: "N/A" if value is None else str(value)
         lines.append(
             f"{entry['epoch']:5} {entry['lane']:4} "
             f"{entry['recorded_core']:4} {entry['expected_core']:8} "
             f"{entry['trigger_token']:7} {entry['complete']:8} "
-            f"{entry['skipped']:7} {fmt(entry['candidate_count']):>9} "
-            f"{fmt(entry['selected_for_post_count']):>15}"
+            f"{entry['skipped']:7} {_fmt_count(entry['candidate_count']):>9} "
+            f"{_fmt_count(entry['selected_for_post_count']):>15}"
         )
     summary = report["summary"]
     lines.append(
