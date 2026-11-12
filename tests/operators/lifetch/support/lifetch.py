@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 from device_trace import collect_core, core_summary
 from index_update import DirectCacheUpdate, permutation_records
+from native_miss_oracle import native_miss_oracle
 from kvip.operators.lifetch.forward import LIFetchForward
 from kvip.runtime.loader import load_lifetch_library
 from prefetch_audit import actual_reads, completion_failures
@@ -840,15 +841,33 @@ def run_device(
         native.preferred[row].copy_(torch.from_numpy(policy.slots[0]).to(device))
         seed_native_bitmap(torch, native, row, policy.bitmap[0])
 
+    # Freeze the pre-launch Native LIDU classification oracle outside timings.
+    # The input bitmap reserves potential eviction slots. A selected resident
+    # token in those slots is a Miss too; cold-token count alone undercounts
+    # Native Get work. The four Qs share one unique Miss set per request.
+    initial_maps = native.initial.cpu().numpy()
+    initial_victim_bitmaps = native.bitmap.cpu().numpy()
+    native_miss_expected = [
+        native_miss_oracle(
+            initial_selected[row], initial_maps[row],
+            initial_victim_bitmaps[row], r
+        )
+        for row in range(b)
+    ]
+
     def native_call():
         state["native_topk"] = native_li(torch_npu, fixture)
         native.launch(state["native_topk"])
 
     def native_check():
         counts = native.verify(state["native_topk"])
-        expected = [len(set(int(t) for t in ids if t >= r)) for ids in initial_selected]
+        expected = [entry["effective_unique_misses"] for entry in native_miss_expected]
         if counts[:-1] != expected:
-            raise AssertionError(f"native Get work differs from logical misses: {counts[:-1]} != {expected}")
+            raise AssertionError(
+                "native Get work differs from initial-map/victim-bitmap oracle: "
+                f"actual={counts[:-1]} expected={expected} "
+                f"detail={native_miss_expected}"
+            )
         state["native_misses"] = counts[:-1]
 
     core_trace = {}
