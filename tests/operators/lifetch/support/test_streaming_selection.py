@@ -1,5 +1,8 @@
 """Ensure migration selects only the retained pipeline and never falls back."""
 import importlib.util
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -38,3 +41,34 @@ def test_ubmem_selects_streaming_backend(monkeypatch, tmp_path):
 def test_removed_experiments_fail_before_launch(flag):
     with pytest.raises(SystemExit):
         module.main(['--transport','urma','--kvaf-server','host:1',flag])
+
+
+def test_explicit_kvaf_root_overrides_inherited_module(monkeypatch, tmp_path):
+    selected = tmp_path / 'selected'
+    wrong = tmp_path / 'wrong'
+    for folder, marker in ((selected / 'build-npu/python', 'selected'), (wrong, 'wrong')):
+        folder.mkdir(parents=True)
+        (folder / 'kvaf.py').write_text(f"MARKER = {marker!r}\n")
+    monkeypatch.setenv('PYTHONPATH', str(wrong))
+    def execute(command, log, timeout, label):
+        result = subprocess.check_output([sys.executable, '-c', 'import kvaf; print(kvaf.MARKER)'], text=True)
+        assert result.strip() == 'selected'
+        log.write_text('UBMEM_LIFETCH_PASS\nUBMEM_SFA_PASS\nUBMEM_GRAPH_EVENT_US\n')
+        return 0
+    monkeypatch.setattr(module, 'execute', execute)
+    assert module.main(['--transport', 'ubmem', '--kvaf-server', 'host:1',
+                        '--soc', 'Ascend950PR_9599', '--kvaf-root', str(selected),
+                        '--output', str(tmp_path/'output'), '--trace-rounds', '0']) == 0
+
+
+def test_ubmem_script_remembers_explicit_settings(tmp_path):
+    import json
+    script = (Path(__file__).resolve().parents[1] / 'compare_ubmem_fetch.sh').read_text()
+    code = script.split("<<'PYSET'\n", 1)[1].split('\nPYSET', 1)[0]
+    settings = tmp_path / 'settings.json'
+    base = [sys.executable, '-c', code, str(settings), str(tmp_path)]
+    expected = [str(tmp_path/'kvaf'), '4', '127.0.0.1:28905', '1,2,4,8,16']
+    first = subprocess.check_output(base+expected, text=True).splitlines()
+    again = subprocess.check_output(base, text=True, env={k:v for k,v in os.environ.items() if not k.startswith('UBMEM_')}).splitlines()
+    assert first == again == expected
+    assert json.loads(settings.read_text())['server'] == expected[2]

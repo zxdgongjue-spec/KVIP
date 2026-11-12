@@ -1,11 +1,35 @@
 #!/usr/bin/env bash
 # Same LI/Resolver/Index kernels, inputs and native KVAF MTE pipeline in A and B.
 set -euo pipefail
-kvaf_root="${1:?KVAF checkout required}"
-device="${2:?device required}"
-server="${3:?UBmem CPU service host:port required}"
-batches="${4:-1,2,4,8,16}"
 repo="$(cd "$(dirname "$0")/../../.." && pwd)"
+# Remember explicit connection settings locally; subsequent runs need no arguments.
+settings="$repo/tests/results/ubmem-fetch-settings.json"
+selection="$(python3 - "$settings" "$repo" "$@" <<'PYSET'
+import json, os, sys
+from pathlib import Path
+path, repo = Path(sys.argv[1]), Path(sys.argv[2])
+saved = json.loads(path.read_text()) if path.exists() else {}
+args = sys.argv[3:]
+if len(args) > 4:
+    raise SystemExit('Usage: compare_ubmem_fetch.sh [KVAF_ROOT DEVICE SERVER [BATCHES]]')
+values = [args[i] if i < len(args) else saved.get(key, default)
+          for i, (key, default) in enumerate((
+              ('kvaf_root', os.environ.get('UBMEM_KVAF_ROOT', '')),
+              ('device', '4'), ('server', os.environ.get('UBMEM_SERVER', '')),
+              ('batches', '1,2,4,8,16')))]
+if not values[0] or not values[2]:
+    raise SystemExit('First run: bash tests/operators/lifetch/compare_ubmem_fetch.sh KVAF_ROOT DEVICE SERVER; settings are remembered for later runs.')
+values[0] = str(Path(values[0]).resolve())
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps(dict(zip(('kvaf_root', 'device', 'server', 'batches'), values)), indent=2)+'\n')
+print('\n'.join(values))
+PYSET
+)"
+mapfile -t options <<< "$selection"
+kvaf_root="${options[0]}"; device="${options[1]}"; server="${options[2]}"; batches="${options[3]}"
+set +u
+source /usr/local/Ascend/cann/set_env.sh
+set -u
 run="$repo/tests/results/ubmem-fetch-ab/$(date +%Y%m%d_%H%M%S)_$$"
 mkdir -p "$run"
 cd "$repo"

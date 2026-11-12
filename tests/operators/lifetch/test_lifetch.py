@@ -231,6 +231,11 @@ def main(argv=None):
     state = ROOT / 'build/dependencies.json'
     kvaf_root = (a.kvaf_root or (Path(json.loads(state.read_text())['kvaf']) if state.exists()
                                  else ROOT / 'third_party/KVAF')).resolve()
+    # The selected dependency must also control imports in the worker.
+    # scripts/env.sh may refer to a different checkout used for URMA.
+    selected_python = os.pathsep.join((str(ROOT / 'python'), str(kvaf_root / 'build-npu/python')))
+    inherited_python = os.environ.get('PYTHONPATH', '')
+    os.environ['PYTHONPATH'] = selected_python + (os.pathsep + inherited_python if inherited_python else '')
     common = ['--device', str(a.device), '--kvaf-server', a.kvaf_server, '--history', str(a.history),
               '--resident', str(a.resident), '--index-heads', str(a.index_heads), '--miss-percent',
               str(a.miss_percent), '--prefetch-tokens', str(a.prefetch_tokens), '--warmup', str(a.warmup),

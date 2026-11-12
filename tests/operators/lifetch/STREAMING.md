@@ -137,3 +137,12 @@ that path for head64 or irregular per-request lengths as part of a BS2 fix.
 The A/B above isolates copy scheduling with this same LI schedule in both modes.
 Use pinned commit d975d39 with the same hardware command for a pre-change LI
 comparison; retain its checkout separately instead of replacing its sources.
+
+
+The A/B script remembers the KVAF checkout, device, service and batches under
+`tests/results/ubmem-fetch-settings.json`. After one invocation with explicit
+arguments, subsequent runs are simply `git pull --ff-only` followed by
+`bash tests/operators/lifetch/compare_ubmem_fetch.sh`. It loads the CANN environment
+itself. The public test launcher prepends the selected KVAF Python directory for
+its child process, so a previously sourced environment from another checkout
+cannot override `--kvaf-root`. No KVAF rebuild or kernel change is involved.
