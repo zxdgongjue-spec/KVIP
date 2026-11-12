@@ -27,19 +27,27 @@ uint32_t launch(void* bindings,void* stream,const rotating::RuntimeShape* shape)
 }
 int main() {
  rotating::RuntimeShape shape;auto ptr=reinterpret_cast<void*>(1);
- for(auto rounds:{2U,8U}) {
+ for(auto rounds:{2U,4U,8U}) {
   shape.rounds=rounds;assert(rotating::UseSequenceSplit(shape));
   calls.clear();assert(!launch(ptr,ptr,&shape));assert((calls==std::vector<int>{0,1,2,3}));
   auto half=rotating::SequenceHalfWindow(shape);
   for(uint32_t token=0;token<shape.history;++token) {
    auto part=rotating::SequenceSliceAt(token,shape.resident,half);
-   assert(part.end>token && part.end<=shape.history);
+   assert(part.end>token && part.end<=shape.history+2*half);
    if(token<shape.resident)assert(part.shard==0 && part.end==shape.resident);
    else assert(part.shard==((token-shape.resident)/half)%2);
   }
  }
- // Uneven windows retain the shared general-geometry path, not UBmem-specific logic.
- shape.rounds=4;calls.clear();assert(!launch(ptr,ptr,&shape));assert(calls.size()==1);
+ // BS2 uses the same split path, with an aligned truncated final shard.
+ shape.rounds=4;assert(rotating::SequenceHalfWindow(shape)==19200);
+ std::vector<unsigned> visits(shape.history,0);
+ for(unsigned epoch=0;epoch<3;++epoch)for(unsigned shard=0;shard<2;++shard){
+  unsigned begin=shape.resident+(2*epoch+shard)*19200;
+  unsigned end=begin+19200;if(end>shape.history)end=shape.history;
+  assert(begin%256==0 && end%256==0);
+  for(unsigned t=begin;t<end;++t){++visits[t];assert(rotating::SequenceSliceAt(t,shape.resident,19200).shard==shard);}
+ }
+ for(unsigned t=shape.resident;t<shape.history;++t)assert(visits[t]==1);
  shape.rounds=8;
  for(int phase=0;phase<4;++phase) {failure=phase;calls.clear();assert(launch(ptr,ptr,&shape)==99);assert(calls.size()==phase+1);}
  assert(launch(nullptr,ptr,&shape)==100000);

@@ -595,7 +595,8 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
     GlobalTensor<uint32_t> progressGm;
     progressGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress));
     auto work=flags.ReinterpretCast<uint32_t>();
-    const uint32_t windowEnd=Trigger(rt_history,rt_resident,rt_rounds,epoch)*128;
+    const uint32_t windowEnd=sequenceHalfWindow?SequenceWindowEnd(rt_history,rt_resident,sequenceHalfWindow,epoch):
+        Trigger(rt_history,rt_resident,rt_rounds,epoch)*128;
     // Each shard publishes an independent ready boundary. Snapshot whatever
     // has completed; the final resolver repairs selected tokens that were not
     // prefetched. Waiting for another shard here can stall its producer.
