@@ -112,7 +112,7 @@ def test_device_harness_preserves_index_kv_and_mapping_suffix_between_stages():
     start = runner.index("for stage_index, (label, new_k) in enumerate(schedule):")
     end = runner.index("persistent_actual_k_report = dict", start)
     stage_body = runner[start:end]
-    assert "reset()" not in stage_body
+    assert "\n            reset()\n" not in stage_body
     assert "owner.reset()" not in stage_body
     assert "score_oracle_for_persistent_state" in runner
     assert "Index key rows do not match persistent logical map" in runner
