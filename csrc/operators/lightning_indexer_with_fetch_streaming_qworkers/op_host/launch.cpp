@@ -18,13 +18,15 @@ extern "C" uint32_t aclrtlaunch_v9_li_kernel_1(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_2(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_3(uint32_t,void*,void*);
 extern "C" uint32_t v9_li(void* bindings, void* stream, const rotating::RuntimeShape* shape) {
-    if (!bindings || !stream || !shape) return 100000;
-    uint32_t result = aclrtlaunch_v9_li_kernel(shape->liCores, stream, bindings);
-    if (result || !rotating::UseSequenceSplit(*shape)) return result;
-    result = aclrtlaunch_v9_li_kernel_1(shape->liCores, stream, bindings);
-    if (!result) result = aclrtlaunch_v9_li_kernel_2(shape->liCores, stream, bindings);
-    if (!result) result = aclrtlaunch_v9_li_kernel_3(shape->liCores, stream, bindings);
-    return result;
+#define LI_LAUNCH_0 aclrtlaunch_v9_li_kernel
+#define LI_LAUNCH_1 aclrtlaunch_v9_li_kernel_1
+#define LI_LAUNCH_2 aclrtlaunch_v9_li_kernel_2
+#define LI_LAUNCH_3 aclrtlaunch_v9_li_kernel_3
+#include "../../common/lifetch/li_launch.h"
+#undef LI_LAUNCH_0
+#undef LI_LAUNCH_1
+#undef LI_LAUNCH_2
+#undef LI_LAUNCH_3
 }
 extern "C" uint32_t v9_li_cores(const rotating::RuntimeShape* shape) { return shape->liCores; }
 extern "C" uint32_t v9_batch(const rotating::RuntimeShape* shape) { return shape->batch; }

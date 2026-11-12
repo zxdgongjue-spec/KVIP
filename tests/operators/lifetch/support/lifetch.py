@@ -241,6 +241,8 @@ def run(args, run_dir):
             line += f"\nactual_reads {label}: min_max=" + json.dumps(ranges)
         if report.get("core_trace"):
             line += "\n" + core_summary(report["core_trace"])
+        if report.get("full_trace"):
+            line += "\n" + core_summary(report["full_trace"], label="full")
         if report.get("cache_update"):
             line += "\ncache_update=" + json.dumps(report["cache_update"])
         summaries.append(line)

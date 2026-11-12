@@ -12,7 +12,44 @@ extern "C" uint32_t api(void* bindings,void* stream,const rotating::RuntimeShape
     if(shape->tokenBytes==2624)return aclrtlaunch_kvip_ubmem_2624_##kernel##_kernel(blocks,stream,bindings); \
     return 100000; }
 ENTRY(v9_init,init,shape->batch)
+#if !KVIP_STREAMING_UBMEM
 ENTRY(v9_li,li,shape->liCores)
+#else
+extern "C" uint32_t aclrtlaunch_kvip_ubmem_656_li_kernel(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_kvip_ubmem_656_li_kernel_1(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_kvip_ubmem_656_li_kernel_2(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_kvip_ubmem_656_li_kernel_3(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_kvip_ubmem_2624_li_kernel(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_kvip_ubmem_2624_li_kernel_1(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_kvip_ubmem_2624_li_kernel_2(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_kvip_ubmem_2624_li_kernel_3(uint32_t,void*,void*);
+extern "C" uint32_t v9_li(void* bindings,void* stream,const rotating::RuntimeShape* shape) {
+ if(!shape)return 100000;
+ if(shape->tokenBytes==656) {
+#define LI_LAUNCH_0 aclrtlaunch_kvip_ubmem_656_li_kernel
+#define LI_LAUNCH_1 aclrtlaunch_kvip_ubmem_656_li_kernel_1
+#define LI_LAUNCH_2 aclrtlaunch_kvip_ubmem_656_li_kernel_2
+#define LI_LAUNCH_3 aclrtlaunch_kvip_ubmem_656_li_kernel_3
+#include "../../common/lifetch/li_launch.h"
+#undef LI_LAUNCH_0
+#undef LI_LAUNCH_1
+#undef LI_LAUNCH_2
+#undef LI_LAUNCH_3
+ }
+ if(shape->tokenBytes==2624) {
+#define LI_LAUNCH_0 aclrtlaunch_kvip_ubmem_2624_li_kernel
+#define LI_LAUNCH_1 aclrtlaunch_kvip_ubmem_2624_li_kernel_1
+#define LI_LAUNCH_2 aclrtlaunch_kvip_ubmem_2624_li_kernel_2
+#define LI_LAUNCH_3 aclrtlaunch_kvip_ubmem_2624_li_kernel_3
+#include "../../common/lifetch/li_launch.h"
+#undef LI_LAUNCH_0
+#undef LI_LAUNCH_1
+#undef LI_LAUNCH_2
+#undef LI_LAUNCH_3
+ }
+ return 100000;
+}
+#endif
 ENTRY(v9_resolve,resolve,shape->finalCores)
 ENTRY(v9_fetch_workers,fetch,shape->finalCores)
 ENTRY(v9_finish_fetch,complete,shape->batch)

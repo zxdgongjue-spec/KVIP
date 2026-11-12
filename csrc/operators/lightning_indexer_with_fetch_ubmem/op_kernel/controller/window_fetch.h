@@ -351,7 +351,7 @@ __aicore__ inline void CopyUbmemWindow(__gm__ Context* ctx,uint32_t firstBatch,
     }
 }
 __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,uint32_t lane,
-    LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids) {
+    LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids,uint32_t sequenceHalfWindow=0) {
     auto ctx=reinterpret_cast<__gm__ Context*>(pointer);const auto shape=LoadRuntimeShape(ctx);const auto geometry=MakePostGeometry(shape.batch,shape.serviceLanes,V9_WINDOW_COPY_ENGINE==0 || V9_WINDOW_COPY_ENGINE==4);auto events=reinterpret_cast<__gm__ Event*>(ctx->events);
     auto event=events+epoch*shape.serviceLanes+lane;event->core=core;event->epoch=epoch;V9_FETCH_PROFILE(event->waitBegin=GetSystemCycle();)
     if(epoch) {
@@ -391,6 +391,11 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
                 if(ctx->lruSlots && bound<shape.resident)bound=shape.resident;
                 if(cap>bound)cap=bound;
             }
+            if(sequenceHalfWindow) {
+                if(end<shape.resident)end=shape.resident;
+                uint32_t high=work.GetValue(((b-firstBatch)/shape.serviceLanes)*128+q*32+16);
+                cfg.SetValue(192+b*4+q,high<cap?high:cap);
+            }
             cfg.SetValue(128+b*4+q,end<cap?end:cap);
         }
     }
@@ -421,6 +426,15 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
         state.SetValue(246,sequence);state.SetValue(214+epoch,sequence);
         const uint64_t addresses=state64.GetValue(2),output=state64.GetValue(3);
         const uint32_t lower=ctx->lruSlots?0:shape.resident;
+#if KVIP_STREAMING_UBMEM
+#define KV_WINDOW_HISTORY shape.history
+#define KV_WINDOW_RESIDENT shape.resident
+#define KV_WINDOW_SCAN_TOKENS kScanTokens
+#include "../../../common/lifetch/sequence_candidates.h"
+#undef KV_WINDOW_HISTORY
+#undef KV_WINDOW_RESIDENT
+#undef KV_WINDOW_SCAN_TOKENS
+#else
         uint32_t end[4],first=shape.history,last=lower;
         for(uint32_t q=0;q<4;++q) {
             uint32_t saved=cfg.GetValue(128+b*4+q);
@@ -436,6 +450,7 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
 #undef KV_WINDOW_HISTORY
 #undef KV_WINDOW_RESIDENT
 #undef KV_WINDOW_SCAN_TOKENS
+#endif
         V9_FETCH_PROFILE(scanTicks+=GetSystemCycle()-scanBegin;totalCandidates+=candidateCount;)
         V9_FETCH_PROFILE(uint64_t candidateBegin=GetSystemCycle(),postBegin=0;)
         uint32_t count=0,missing=0;
@@ -489,11 +504,24 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
         state.SetValue(16+epoch,count);state.SetValue(48+epoch,missing-count);
         state.SetValue(10,state.GetValue(10)+missing-count);
         state.SetValue(8,slots);state.SetValue(9,requests);state.SetValue(211,pending);
+#if KVIP_STREAMING_UBMEM
+        for(uint32_t q=0;q<4;++q) {
+            uint32_t processed=end[0][q]<stop?end[0][q]:stop;
+            if(processed<consumed[0][q])processed=consumed[0][q];
+            state.SetValue(12+q,processed);
+            if(sequenceHalfWindow) {
+                processed=end[1][q]<stop?end[1][q]:stop;
+                if(processed<consumed[1][q])processed=consumed[1][q];
+            }
+            state.SetValue(80+epoch*4+q,processed);
+        }
+#else
         for(uint32_t q=0;q<4;++q) {
             uint32_t processed=end[q]<stop?end[q]:stop;
             if(processed<state.GetValue(12+q))processed=state.GetValue(12+q);
             state.SetValue(80+epoch*4+q,processed);state.SetValue(12+q,processed);
         }
+#endif
         if constexpr(!kBatchedRows) {
             SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
             DataCopy(rowGm,state,256);

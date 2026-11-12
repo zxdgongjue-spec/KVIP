@@ -99,25 +99,7 @@ V9_DEVICE inline int32_t EpochAt(uint32_t rt_batch,uint32_t rt_history,uint32_t 
     return epoch<rt_rounds && Trigger(rt_history,rt_resident,rt_rounds,epoch)==tileEnd ? int32_t(epoch) : -1;
 }
 
-// Each shard owns half of the resident range and half of every cold window.
-// Align halves to two tiles so neither shard loads its sibling's Key page.
-V9_DEVICE inline bool UseSequenceSplit(const RuntimeShape& s) {
-    return s.splitQ && s.indexHeads == 32 && s.rounds > 1 && s.resident % 512 == 0 &&
-        (s.history - s.resident) % (512 * (s.rounds - 1)) == 0;
-}
-
-V9_DEVICE inline uint32_t SequenceHalfWindow(const RuntimeShape& s) {
-    return (s.history - s.resident) / (2 * (s.rounds - 1));
-}
-
-struct SequenceSlice { uint32_t shard, end; };
-
-// Hot predicates belong to the shared prefix; cold halves alternate in S2.
-V9_DEVICE inline SequenceSlice SequenceSliceAt(uint32_t token, uint32_t resident, uint32_t half) {
-    if (token < resident) return {0, resident};
-    uint32_t index = (token - resident) / half;
-    return {index % 2, resident + (index + 1) * half};
-}
+#include "../../common/lifetch/sequence_schedule.h"
 }
 
 #endif

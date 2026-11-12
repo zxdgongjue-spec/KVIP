@@ -79,7 +79,7 @@ UB_SCHEDULE_DEVICE inline int32_t EpochAt(uint32_t batch,uint32_t history,uint32
 }
 #if KVIP_STREAMING_UBMEM
 UB_SCHEDULE_DEVICE inline uint32_t ServiceRank(uint32_t batch,uint32_t split,uint32_t core) {return split?(core%2)*batch+core/2:core;}
-UB_SCHEDULE_DEVICE inline uint32_t SequenceHalfWindow(const RuntimeShape& s) {return (s.history-s.resident)/(2*(s.rounds-1));}
+#include "../../common/lifetch/sequence_schedule.h"
 #endif
 #undef UB_SCHEDULE_DEVICE
 }

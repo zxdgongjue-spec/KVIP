@@ -17,7 +17,7 @@ The actual window count remains dependent on BS, as in the tested version.
 `--optimized-resolve` selects the measured options automatically. This remains
 an explicit operator test path: the public `kvip.LIFetch` / vLLM service path
 is not silently switched to this implementation. Model integration and general
-runtime shapes are separate work. The measured kernel source is preserved.
+runtime shapes are separate work. The URMA algorithm is preserved; the LI entry and sequence scan are shared with UBmem.
 
 ```bash
 python tests/operators/lifetch/test_lifetch.py --transport urma \
@@ -41,8 +41,13 @@ implementation. Each published Q calls the existing KVAF `KvafBatchGetDevice`
 UBmem overload; the overload drains its MTE pipeline before completion is released.
 No new KVAF patch or worker-local allocator is required.
 
-The baseline UBmem combined LI schedule is retained (no URMA sequence-split
-transport is introduced). Final TopK runs the shared classification code.
+Both optimized transports compile the same LI entry translation unit and use
+one host launch schedule, sequence-shard scan and Final TopK classification.
+For aligned sequence windows, Final TopK preloads metadata and overlaps the
+second metadata half with classification. Uneven window geometry and packed
+query lengths use the common compatibility path, not a UBmem-specific path.
+In this fixture BS2 has four uneven windows and uses that compatibility path
+on BOTH transports. The baseline library remains unchanged for A/B.
 The optimized path supports the same restricted geometry above and both 656/
 2624-byte KV records. It remains an operator test path, not a vLLM default.
 
@@ -80,3 +85,16 @@ counts are in `trace/*/attribution.json`, with raw `trace.json` retained.
 
 Local validation covers device compilation and host control-flow tests. Hardware
 correctness and performance of this new UBmem path still require the command above.
+
+## Interpreting URMA baselines and saved traces
+
+The default URMA operator on this branch includes the PR11 sequence-LI
+prerequisites. It is not pristine main `81b1472`. Compare against a pinned main
+checkout when reporting gains over main. The `prototype_with_update` metric is
+the optimized full graph; `prototype_core` and standalone update measurements
+are independent reference graphs. Full graph traces are printed separately.
+
+`support/compare_transport_tail.py --urma URMA_RUN --ubmem UBMEM_RUN` reads saved
+full attributions, reports per-BS fused medians and per-round last-finishing
+cores, Fetch-core spans, counts and UBmem Q-ready/previous-Q/MTE/join costs.
+It never runs the device. Pass one exact run directory for each transport.

@@ -6,11 +6,7 @@ struct QLITilingData {
     uint32_t keyStride0=16384,keyDequantScaleStride0=128;
     uint32_t resident,splitQ,aicCount;
 };
-#if KVIP_STREAMING_UBMEM
-#include "../../lightning_indexer_with_fetch_streaming_qworkers/op_kernel/indexer/indexer.h"
-#else
 #include "../../lightning_indexer_with_fetch/op_kernel/indexer/indexer.h"
-#endif
 #endif
 extern "C" __global__ __aicore__ void kvip_ubmem_li_kernel(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
@@ -26,9 +22,6 @@ extern "C" __global__ __aicore__ void kvip_ubmem_li_kernel(GM_ADDR bindings) {
     QLITilingData tiling{shape.batch,shape.batch*4,shape.indexHeads,4,shape.history,
         2048,shape.liCores,128,shape.history/128,0,16384,128,shape.resident,shape.splitQ,shape.aicCount};
 #define P(i) reinterpret_cast<GM_ADDR>(a[i])
-    #if KVIP_STREAMING_UBMEM
-    if ASCEND_IS_AIV { op.vectorService.SetStreamingWorkspace(P(15)); }
-#endif
     op.Init(P(0),P(1),P(2),P(3),P(4),P(5),P(6),P(7),P(9),P(12),&tiling,&pipe);
     if ASCEND_IS_AIV {
         op.vectorService.SetPrefixStorage(P(13));
