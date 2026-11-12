@@ -5,9 +5,12 @@ import ctypes
 
 import numpy as np
 
+from kvip.operators.lifetch.schedule import StreamingSchedule
+from kvip.runtime.device import query_device_resources
+
 
 class StreamingLIFetchForward:
-    def __init__(self, rotating, update, torch, prefetch_limit, *, fused_final=False, q_workers=None):
+    def __init__(self, rotating, update, torch, prefetch_limit, *, fused_final=False, q_workers=None, aiv_budget=None):
         if rotating.device != update.device:
             raise ValueError("Fetch and Index update must use the same device")
         if update.bindings.numel() != 28:
@@ -45,9 +48,21 @@ class StreamingLIFetchForward:
         self.resolver_cores, flag_count = int(geometry_fn()), int(flags_fn())
         if self.resolver_cores != 3 or flag_count != 16:
             raise ValueError("Rebuild KVIP: the public LIFetch pipeline requires the shared three-role ABI")
-        self.function = rotating.library.kvip_lifetch_streaming_forward
-        if b * self.resolver_cores + 4 * q_workers > shape.aicCount * 2:
-            raise ValueError("LIFetch resolver and Fetch workers exceed the concurrently resident AIV budget")
+        self.function = rotating.library.kvip_lifetch_streaming_forward_v2
+        ordinal = getattr(rotating.device, "index", None)
+        if ordinal is None:
+            ordinal = torch.npu.current_device()
+        physical = query_device_resources("", ordinal)
+        if aiv_budget is None:
+            aiv_budget = getattr(rotating, "aiv_budget", None)
+        aiv_budget = int(physical["aiv"]) if aiv_budget is None else aiv_budget
+        if type(aiv_budget) is not int or not 1 <= aiv_budget <= int(physical["aiv"]):
+            raise ValueError("Requested AIV budget exceeds the actual device")
+        if shape.aicCount > int(physical["aic"]):
+            raise ValueError("Requested AIC budget exceeds the actual device")
+        self.schedule = StreamingSchedule(b, int(shape.aicCount), aiv_budget, int(shape.liCores), q_workers)
+        if not hasattr(rotating, "lease") and getattr(rotating, "queue_count", 0) < self.schedule.urma_queues:
+            raise ValueError("URMA queues do not cover the requested Fetch workers")
         if shape.finalWorkers != 4:
             raise ValueError("Streaming LIFetch requires four query publication records per request")
         # Layer groups execute on the same lease stream. Reuse temporary
@@ -109,7 +124,7 @@ class StreamingLIFetchForward:
             dtype=torch.uint64,
             device=device,
         )
-        self.function.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_uint32]
+        self.function.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_uint32] * 2
         self.function.restype = ctypes.c_uint32
 
     def __call__(self):
@@ -125,7 +140,7 @@ class StreamingLIFetchForward:
             stream.npu_stream,
             self.shape_pointer,
         ]
-        args.append(self.q_workers)
+        args.extend((self.q_workers, self.schedule.aiv_budget))
         result = self.function(*args)
         if result:
             raise RuntimeError(f"streaming LIFetch launch failed: {result}")

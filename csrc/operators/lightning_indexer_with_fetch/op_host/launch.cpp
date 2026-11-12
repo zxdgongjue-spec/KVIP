@@ -1,3 +1,4 @@
+#include "../../common/lifetch/independent_schedule.h"
 #include "../op_kernel/pipeline_types.h"
 #include "api.h"
 #include "context.h"
@@ -73,9 +74,9 @@ extern "C" uint32_t refactor_fetch_pack_args(void *output, uint32_t capacity,
 }
 
 extern "C" uint32_t aclrtlaunch_v9_streaming_resolve_update(uint32_t,void*,void*);
-extern "C" uint32_t kvip_lifetch_streaming_forward(void* bindings,void* update,void* workspace,void* stream,const rotating::RuntimeShape* shape,uint32_t workers) {
+extern "C" uint32_t kvip_lifetch_streaming_forward_v2(void* bindings,void* update,void* workspace,void* stream,const rotating::RuntimeShape* shape,uint32_t workers,uint32_t aivBudget) {
     if(!bindings||!update||!workspace||!stream||!shape||shape->resident>131072||shape->batch<1||shape->batch>16||shape->finalWorkers!=4)return 100000;
-    if((workers!=1 && workers!=2 && workers!=4) || shape->batch*pipeline_ab::kResolveCores+4*workers>shape->aicCount*2)return 100000;
+    if(rotating::ValidateStreamingBudget(shape->batch,shape->aicCount,aivBudget,shape->liCores,workers))return 100000;
     uint32_t result=v9_init(bindings,stream,shape);
     if(!result)result=v9_li(bindings,stream,shape);
     if(!result)result=aclrtlaunch_v9_streaming_resolve_update(shape->batch*pipeline_ab::kResolveCores+4*workers,stream,workspace);
@@ -111,3 +112,9 @@ extern "C" uint32_t kvip_native_fetch_only(void* workspace,void* counts,void* st
 extern "C" uint32_t kvip_streaming_resolver_cores(){return pipeline_ab::kResolveCores;}
 
 extern "C" uint32_t kvip_streaming_flag_count(){return pipeline_ab::kFlagCount;}
+
+// Compatibility entry for old callers. New bindings use the explicit V budget.
+extern "C" uint32_t kvip_lifetch_streaming_forward(void* bindings,void* update,void* workspace,
+ void* stream,const rotating::RuntimeShape* shape,uint32_t workers) {
+ return kvip_lifetch_streaming_forward_v2(bindings,update,workspace,stream,shape,workers,shape?2*shape->aicCount:0);
+}

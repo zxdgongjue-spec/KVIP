@@ -1,0 +1,120 @@
+{
+  "scope": "Clean KVIP upstream13d branch CPU validation; imported source-bound prior CANN builds and Model components remain separately scoped. No current streaming native transport acceptance.",
+  "upstream": "13d2898892652382ea36a0652030874efc31097d",
+  "source_code_sha256": {
+    "csrc/operators/common/lifetch/cache_metadata.h": "cf12e14ace38445480f88b023c9ced41c62ea35438a5856e0146c74867b85958",
+    "csrc/operators/common/lifetch/final_post.h": "82e77605e626139e70d6af67fbb369ff89f2e5a08eea13460996975fc7e70eb8",
+    "csrc/operators/common/lifetch/independent_schedule.h": "d78a6cc276b90fe8d600d1712d6fa13475934471361b7bb7beab61cc38a27156",
+    "csrc/operators/common/lifetch/li_launch.h": "a72bf9a771a00fb996589e6cf50c714bc14b2962ce155c54ceaa67bda0231093",
+    "csrc/operators/common/lifetch/prefetch_budget.h": "f79e5c0b0c4f267f70d2e232cff6320045a3737ad2305beeeadd36fe4e141339",
+    "csrc/operators/common/lifetch/sequence_candidates.h": "18e6ae13182efbd2365357d94934ff7fb07333df516d47ea7636ed863a68238e",
+    "csrc/operators/common/lifetch/sequence_schedule.h": "f42321b562e09eb1685a0af7604ea194f3a6eeee1de88d3f2190ce5ff814e8cb",
+    "csrc/operators/common/lifetch/split_topk.cpp": "72ad7ef31263a37e8af4d749c0c688c9c8c2b359ab9c1ce32ceae5dd7c583556",
+    "csrc/operators/common/lifetch/victim_ops.h": "4168b8efb8dcbea029986ce4448b869fffe79c720b5aa2b086caa3841acc3b84",
+    "csrc/operators/common/lifetch/window_candidates.h": "3ca52d8eede0ac2e731492d7579f37f01d72414fd49205368f4920d2ca2858b3",
+    "csrc/operators/lightning_indexer_with_fetch/include/api.h": "3f461fa079d252c35aa1d547e6c3a2273a3cfd2c3949d64a9c3cb4e29da001ea",
+    "csrc/operators/lightning_indexer_with_fetch/include/runtime_shape.h": "7fce72351df671196f861b779a9ce521820bb5b5f363d1e8e1f8aab9cc1ddd96",
+    "csrc/operators/lightning_indexer_with_fetch/op_host/launch.cpp": "937f7d8ee3929209950b64d9267c1dc9537eb90db78b276a1779a7257f6ad13d",
+    "csrc/operators/lightning_indexer_with_fetch_ubmem/include/api.h": "7cdc929e7624c4b9484ba1f682ddac585d995a9b7d4275e85787f47b681debf3",
+    "csrc/operators/lightning_indexer_with_fetch_ubmem/op_host/launch.cpp": "9c7c5b83aa0fa29fe72b283b02f929c499918386e4f92b56ed1617f252b8e881",
+    "csrc/operators/split_topk/CMakeLists.txt": "40733350f0152714eab9c778a5215b35f3054796b59a7bd1ca0761d7029a69a9",
+    "python/kvip/operators/lifetch/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "python/kvip/operators/lifetch/binding.py": "ee3162d1b7e687fe98ab88a7437785c21df683316b72452f48ae4880ce1ff469",
+    "python/kvip/operators/lifetch/forward.py": "b7d26a893adeebde74d211d2c2d3477c260270a91f58be59066f6acaef1516cb",
+    "python/kvip/operators/lifetch/geometry.py": "bd0ddb055a6fb5ebca9d4653a3405bdbef134424d5141e5b56b7a0a15ffb337b",
+    "python/kvip/operators/lifetch/index_update.py": "7bb27b6b154136bb9d1e21917af0d5f2d1d48b9c4f8be414a827b0f01a1bbe33",
+    "python/kvip/operators/lifetch/schedule.py": "c757c44fd94bbe48a255af05847f9bf970c8328065e22e0a15c4ca9586b85e6f",
+    "python/kvip/operators/lifetch/streaming.py": "068a20884df1d946cf4edbefd2318aafbf922d37caf2ab462ebda14b87d34951",
+    "python/kvip/operators/lifetch/tiling.py": "36fe15c4fc17b438708d4ef14365937e9b844cf983a4e0c2f51658e93f198b94",
+    "python/kvip/operators/lifetch/workspace.py": "1c3103ea0f4751c3f56c984993ccf2bbd0e5de434c7a49eabd0d34f4c4a0e65f",
+    "scripts/run_split_core_cases.py": "0df56e2b69a7000933cb4a315dcbfcfe6f8a20159113ddece1d15ad8765e68d6",
+    "tests/operators/lifetch/support/lifetch.py": "22dd3ac8988483067c5dc6fd676528430fd479e376c5271e432392d16a0be5aa",
+    "tests/operators/lifetch/support/real_fetch_inputs.py": "7b69e935ff4a641968060e937d4e8809c1cc6de02bc06681ca3f79b05331275e",
+    "tests/operators/lifetch/support/ubmem_smoke.py": "70609e5dad0617ea5eb24149a71c11c4f41d7e1206ec31ebdfdf330d39789973"
+  },
+  "checks": [
+    {
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-q"
+      ],
+      "status": "passed",
+      "tests": 205,
+      "subtests": 79,
+      "duration_seconds": 51.7,
+      "log": "pytest-cpu.log",
+      "log_sha256": "e39850f3217308ce4c4a595247260ea6719104163b12537db0053f4570c2cd23",
+      "execution": "fresh on this clean upstream worktree"
+    },
+    {
+      "check": "Independent FP8 CPU matrix",
+      "cases": 60,
+      "status": "passed",
+      "execution": "imported prior evidence; source hashes verified identical, not rerun on this branch"
+    },
+    {
+      "check": "Historical data export verifier",
+      "historical_Model_logs": 35,
+      "current_Model_components": 3,
+      "status": "passed",
+      "execution": "repeated on clean upstream worktree"
+    },
+    {
+      "check": "Historical replay global output guard",
+      "positive": "passed",
+      "truncated_guard_only": "rejected_as_expected",
+      "execution": "imported prior evidence; source hashes verified identical, not rerun on this branch"
+    },
+    {
+      "check": "CANN current core TopK",
+      "status": "built_and_3_Model_cases_passed",
+      "execution": "imported prior evidence; source hashes verified identical, not rerun on this branch"
+    },
+    {
+      "check": "Historical full/history source-only builds",
+      "status": "passed",
+      "standard_fixture_shared_files_matching": 20,
+      "note": "Use separate build directories; CANN multi-goal incremental reprocessing rejected an already rewritten object",
+      "execution": "imported prior evidence; source hashes verified identical, not rerun on this branch"
+    },
+    {
+      "check": "URMA/UBmem v2 host source",
+      "status": "syntax_compiled",
+      "ubmem_token_bytes": [
+        656,
+        2624
+      ],
+      "execution": "imported prior evidence; source hashes verified identical, not rerun on this branch"
+    },
+    {
+      "check": "Unified serial6/Fusion3/history comparison",
+      "status": "passed",
+      "measured_rows": 9,
+      "current_streaming_rows_not_run": 1,
+      "imported_Fusion3_raw_logs": 2,
+      "scope": "archive consistency; same-family controls; no new Model execution",
+      "execution": "repeated on clean upstream worktree"
+    }
+  ],
+  "not_run": [
+    "complete 60-case Model sweep",
+    "current public streaming end-to-end Model performance",
+    "native transport / NPU / vLLM TPOT",
+    "production P32/T8 Final classification and restored Service"
+  ],
+  "environment": {
+    "python": "3.12.16",
+    "packages": {
+      "numpy": "2.5.4",
+      "torch": "2.15.0",
+      "pytest": "9.2.0",
+      "cmake": "4.4.4",
+      "ruff": "0.17.4"
+    }
+  },
+  "upstream_test_boundary": "All upstream tests preserved; no private historical git snapshot tests imported.",
+  "source_hashes_match_imported_implementation": true
+}

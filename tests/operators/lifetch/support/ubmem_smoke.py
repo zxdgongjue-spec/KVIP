@@ -30,7 +30,7 @@ def payload(owner, tokens, token_bytes):
     )
 
 
-def controlled_fixture(history, resident, heads, miss_percent):
+def controlled_fixture(history, resident, heads, miss_percent, *, exact_miss=False, valid_history=None):
     """Use precisely the same deterministic Q4 fixture as URMA's A/B test."""
     support = Path(__file__).resolve().parent
     if str(support) not in sys.path:
@@ -39,7 +39,8 @@ def controlled_fixture(history, resident, heads, miss_percent):
 
     with tempfile.TemporaryDirectory(prefix="kvip-ubmem-fixture-") as tmp:
         root = Path(tmp) / "fixture"
-        info = prepare_full_chain_fixture(root, history, resident, miss_percent, index_heads=heads)
+        info = prepare_full_chain_fixture(root, history, resident, miss_percent, index_heads=heads,
+                                          exact_miss=exact_miss, valid_history=valid_history)
         data = {
             "info": info,
             "order": np.load(root / "physical_to_logical.npy").astype(np.int64),
@@ -88,9 +89,11 @@ def check_shape(
     optimized=False,
     q_workers=2,
     fetch_mode="overlap",
+    exact_miss=False, valid_history=None, aiv_budget=None,
 ):
     batch, history, resident, token_bytes = shape.batch, shape.history, shape.resident, shape.token_bytes
-    fixture = controlled_fixture(history, resident, shape.heads, miss_percent)
+    fixture = controlled_fixture(history, resident, shape.heads, miss_percent,
+                                 exact_miss=exact_miss, valid_history=valid_history)
     expected_ids = fixture["expected"]
     cold_count = fixture["native_miss_union"]
     logical_scales = fixture["scales"]
@@ -152,7 +155,8 @@ def check_shape(
             torch.from_numpy(fixture["weights"]).to(device, dtype=torch.bfloat16).repeat(batch, 1)
         )
         workspace.inputs.scale.copy_(torch.from_numpy(fixture["query_scale"]).to(device).repeat(batch, 1))
-        workspace.inputs.query_ends.fill_(history)
+        workspace.inputs.query_ends.fill_(valid_history or history)
+        workspace.key_lengths.fill_(valid_history or history)
         lease = UbmemLease(torch, runtime, output_rows, stream)
         lease.register_table(device_table)
         rotating = UbmemBinding(
@@ -170,6 +174,7 @@ def check_shape(
             scratch=workspace.scratch,
             prefetch_limit=prefetch_tokens,
         )
+        rotating.aiv_budget = aiv_budget
         # Check the compiled UBmem schedule against the URMA runtime contract,
         # including epoch zero at the end of the hot region.
         from kvip.operators.lifetch.geometry import trigger_tokens
@@ -401,7 +406,7 @@ def check_shape(
         # belong to stable owners, not capture-time packed row positions.
         owners = list(range(batch, 0, -1))
         workspace.inputs.prepare([4] * batch, query_owners=owners)
-        workspace.inputs.query_ends.fill_(history)
+        workspace.inputs.query_ends.fill_(valid_history or history)
         graph.replay(stream)
         verify(owners, phase="graph_replay")
         # Compact TND outputs no longer have the fixed four-row stride of
@@ -426,7 +431,7 @@ def check_shape(
         assert torch.equal(storage.logical_ids, before), "Padding changed Index ownership"
         if iterations:
             workspace.inputs.prepare([4] * batch, query_owners=list(range(1, batch + 1)))
-            workspace.inputs.query_ends.fill_(history)
+            workspace.inputs.query_ends.fill_(valid_history or history)
             elapsed = []
             for turn in range(warmup + iterations):
                 for tensor, saved in zip(measured_buffers, initial_state):
@@ -508,6 +513,10 @@ def main():
     parser.add_argument("--token-bytes", type=int, nargs="+", default=[656, 2624])
     parser.add_argument("--index-heads", type=int, choices=(32, 64), default=32)
     parser.add_argument("--history", type=int, default=33024)
+    parser.add_argument("--valid-history", type=int)
+    parser.add_argument("--exact-miss", action="store_true")
+    parser.add_argument("--aic-budget", type=int, default=0)
+    parser.add_argument("--aiv-budget", type=int)
     parser.add_argument("--resident", type=int, default=8192)
     parser.add_argument("--prefetch-tokens", type=int, nargs="+", default=[512])
     parser.add_argument(
@@ -542,7 +551,7 @@ def main():
         raise RuntimeError("UBmem fusion smoke requires a real NPU; it cannot be skipped")
     torch.npu.set_device(args.device)
     cann = kvaf_cann(build)
-    aics = query_device_resources(cann, args.device)["effective_aic"]
+    aics = query_device_resources(cann, args.device, args.aic_budget)["effective_aic"]
     selected_library = None
     cases = [(batch, args.history, args.resident, width) for batch in args.batches for width in args.token_bytes]
     if args.runtime_shapes and (33024, 8192) != (args.history, args.resident):
@@ -576,6 +585,7 @@ def main():
                 args.optimized_resolve,
                 args.q_workers,
                 args.ubmem_fetch_mode,
+                exact_miss=args.exact_miss, valid_history=args.valid_history, aiv_budget=args.aiv_budget,
             )
 
 

@@ -29,3 +29,6 @@ uint32_t refactor_fetch_entity_bytes();
 uint32_t refactor_fetch_queue_bytes();
 uint32_t refactor_fetch_pack_args(void* output, uint32_t capacity, const uint64_t* fields, uint32_t count);
 }
+
+// Explicit independent AIV budget; legacy six-argument entry remains available.
+extern "C" uint32_t kvip_lifetch_streaming_forward_v2(void*,void*,void*,void*,const rotating::RuntimeShape*,uint32_t,uint32_t);

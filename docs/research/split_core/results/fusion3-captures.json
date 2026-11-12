@@ -1,0 +1,167 @@
+{
+  "scope": "Selected original capture fields; raw capture hashes bind originals. Paths are container paths, not host paths. Original clock/performance flags preserved.",
+  "captures": [
+    {
+      "status": "passed_direct_case_pending_clock_calibration",
+      "name": "direct-b1-baseline-r1",
+      "variant": "baseline",
+      "driver_sha256": "a09e05af372dabe9e222b1092743287d04e85675e6bc1bc7049fb6297a235b9a",
+      "cmake_cache_sha256": "7b93dd3c1737494629bb89418523ffe75282228615f52b431cbd2b1a4f4a099a",
+      "runner_sha256": "c2273c9e59ccda3b77f6d9ed9855e610cc8f95fd9f69e2ce4e7daae4aeb56c81",
+      "actual_config_sha256": "78cb02bdeb156d8f864517bdbd514a3e7bac180c446314f6e3732bc9c3b04d50",
+      "runtime_sha256": "fd0373c76316cba887e93c7701b2ea449cf10859f4b1f265e76bfc69bdb541ae",
+      "physical_npu": false,
+      "native_transport": false,
+      "clock_equivalence_unverified": true,
+      "valid_for_standard_performance": false,
+      "loaded_libraries": [
+        {
+          "path": "/usr/local/Ascend/cann-9.1.0/aarch64-linux/devlib/linux/aarch64/libascend_hal.so",
+          "sha256": "95d3e145bacf1c58f450446cf3cb522e3bc4e276ef0518a5f0d8611c6047d449"
+        },
+        {
+          "path": "/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64/libascendcl.so",
+          "sha256": "123d67c313f743e5d6f2e856f40c24d5edac376975cf0a7a1019e079b4171480"
+        },
+        {
+          "path": "/usr/local/Ascend/cann-9.1.0/aarch64-linux/simulator/dav_3510/lib/libnpu_drv.so",
+          "sha256": "e14bcc376dc92c8004702bf696439058f61655b059660d7dfffbbe40ad3bb08f"
+        },
+        {
+          "path": "/usr/local/Ascend/cann-9.1.0/aarch64-linux/simulator/dav_3510/lib/libnpu_drv_camodel.so",
+          "sha256": "6c7b9e54d7028db34fb6fc4258f43d8c0976dd3537a3e65c4f02aa6e020c942b"
+        },
+        {
+          "path": "/usr/local/Ascend/cann-9.1.0/aarch64-linux/simulator/dav_3510/lib/libpem_davinci.so",
+          "sha256": "5e5460d4facdc54230a75d39c05d2bc3fbf6a85f921e55c3bd4331095f172e9c"
+        },
+        {
+          "path": "/usr/local/Ascend/cann-9.1.0/aarch64-linux/simulator/dav_3510/lib/libruntime_camodel.so",
+          "sha256": "fd0373c76316cba887e93c7701b2ea449cf10859f4b1f265e76bfc69bdb541ae"
+        }
+      ],
+      "hardware_configs_sha256": {
+        "/usr/local/Ascend/cann-9.1.0/aarch64-linux/simulator/dav_3510/lib/config.json": "78cb02bdeb156d8f864517bdbd514a3e7bac180c446314f6e3732bc9c3b04d50",
+        "/usr/local/Ascend/cann-9.1.0/aarch64-linux/simulator/dav_3510/lib/config_stars.json": "22989c415bcaaa77bc302b66a5cd36a4d2dd03e5594570a20f743b3288bfcc76"
+      },
+      "host_memory_limit_bytes": 7516192768,
+      "host_swap_limit_bytes": 3221225472,
+      "host_cpu_max": "400000 100000",
+      "fixture_manifest_sha256": "b96059f02152e00c5453d15b3dd532ae973adefdcca42478d81efdf729288307",
+      "exit_code": 0,
+      "geometry": {
+        "history": 131072,
+        "resident": 16384,
+        "batch": 1,
+        "heads": 32,
+        "li_cores": 2,
+        "split_q": 1,
+        "final_workers": 4,
+        "aic_budget": 32,
+        "output_stride": 24576,
+        "service_rounds": 0,
+        "prepared_rounds": 8,
+        "miss_per_query": 205,
+        "unique_misses_per_request": 410
+      },
+      "geometry_legacy_note": "prepared_rounds=8 is the requested value in this unchanged harness; effective prepared rounds=2 from PrepareShape; actual Service rounds=0",
+      "effective_prepared_rounds": 2,
+      "b16_performance_claim": false,
+      "total_model_ticks": 1340113,
+      "full_owner_oracle_passed": true,
+      "model_log_sha256": "b6d3e464f4b93c342038ae9336235fa6ba2cf279f2cdc6040bed401c8b14d2ad",
+      "correctness_sha256": "b1f8759e941d65ef2eb02bea4020b7ed67f5ef04d8cc4183957a030e3fac9d4c",
+      "raw_capture_sha256": "ee4e106bc2b5bef942df6a57e8af274b0d0fa17c61533272093c4f764cd0bfc0",
+      "exported_log": "logs/fusion3-direct-b1-baseline-r1.log",
+      "raw_output_sha256": {
+        "topk.bin": "d9e66f54c3cd5478edff14e7a2572e5333389bdbab907bc20ba33f6e0159aa99",
+        "locations.bin": "12239103e871bc58ca6f13a5daeba360c5c5e051f1867c681d9e590f6f5b87e5",
+        "logical-output.bin": "9bd560cb91bc48f0ad014d8cbbd65070a62f2f906199c811fd4565302a14e888",
+        "slot-output.bin": "c864e58cdba95144cdb1164c609608b2857f6d1878587c98205aec16bd71940c",
+        "changes.bin": "2446dbb1e4a5b70302057598639d064a933deb48a29355e5e7b5201a68698dfb",
+        "change-counts.bin": "cbfd218787df784c39fbc4f4fad92a8f28e2a880430c210b6d0d8dc133c07e66"
+      }
+    },
+    {
+      "status": "passed_direct_case_pending_clock_calibration",
+      "name": "direct-b1-candidate-r1",
+      "variant": "candidate",
+      "driver_sha256": "01672735e22b6936b02e50861720e570b40fc35a1166fa0bd37e3a17c6ea2318",
+      "cmake_cache_sha256": "afc2f0181582b6858a8d1c58d7698b9c1518ce95813b8749beaf35a224e7241a",
+      "runner_sha256": "c2273c9e59ccda3b77f6d9ed9855e610cc8f95fd9f69e2ce4e7daae4aeb56c81",
+      "actual_config_sha256": "78cb02bdeb156d8f864517bdbd514a3e7bac180c446314f6e3732bc9c3b04d50",
+      "runtime_sha256": "fd0373c76316cba887e93c7701b2ea449cf10859f4b1f265e76bfc69bdb541ae",
+      "physical_npu": false,
+      "native_transport": false,
+      "clock_equivalence_unverified": true,
+      "valid_for_standard_performance": false,
+      "loaded_libraries": [
+        {
+          "path": "/usr/local/Ascend/cann-9.1.0/aarch64-linux/devlib/linux/aarch64/libascend_hal.so",
+          "sha256": "95d3e145bacf1c58f450446cf3cb522e3bc4e276ef0518a5f0d8611c6047d449"
+        },
+        {
+          "path": "/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64/libascendcl.so",
+          "sha256": "123d67c313f743e5d6f2e856f40c24d5edac376975cf0a7a1019e079b4171480"
+        },
+        {
+          "path": "/usr/local/Ascend/cann-9.1.0/aarch64-linux/simulator/dav_3510/lib/libnpu_drv.so",
+          "sha256": "e14bcc376dc92c8004702bf696439058f61655b059660d7dfffbbe40ad3bb08f"
+        },
+        {
+          "path": "/usr/local/Ascend/cann-9.1.0/aarch64-linux/simulator/dav_3510/lib/libnpu_drv_camodel.so",
+          "sha256": "6c7b9e54d7028db34fb6fc4258f43d8c0976dd3537a3e65c4f02aa6e020c942b"
+        },
+        {
+          "path": "/usr/local/Ascend/cann-9.1.0/aarch64-linux/simulator/dav_3510/lib/libpem_davinci.so",
+          "sha256": "5e5460d4facdc54230a75d39c05d2bc3fbf6a85f921e55c3bd4331095f172e9c"
+        },
+        {
+          "path": "/usr/local/Ascend/cann-9.1.0/aarch64-linux/simulator/dav_3510/lib/libruntime_camodel.so",
+          "sha256": "fd0373c76316cba887e93c7701b2ea449cf10859f4b1f265e76bfc69bdb541ae"
+        }
+      ],
+      "hardware_configs_sha256": {
+        "/usr/local/Ascend/cann-9.1.0/aarch64-linux/simulator/dav_3510/lib/config.json": "78cb02bdeb156d8f864517bdbd514a3e7bac180c446314f6e3732bc9c3b04d50",
+        "/usr/local/Ascend/cann-9.1.0/aarch64-linux/simulator/dav_3510/lib/config_stars.json": "22989c415bcaaa77bc302b66a5cd36a4d2dd03e5594570a20f743b3288bfcc76"
+      },
+      "host_memory_limit_bytes": 7516192768,
+      "host_swap_limit_bytes": 3221225472,
+      "host_cpu_max": "400000 100000",
+      "fixture_manifest_sha256": "b96059f02152e00c5453d15b3dd532ae973adefdcca42478d81efdf729288307",
+      "exit_code": 0,
+      "geometry": {
+        "history": 131072,
+        "resident": 16384,
+        "batch": 1,
+        "heads": 32,
+        "li_cores": 2,
+        "split_q": 1,
+        "final_workers": 4,
+        "aic_budget": 32,
+        "output_stride": 24576,
+        "service_rounds": 0,
+        "prepared_rounds": 8,
+        "miss_per_query": 205,
+        "unique_misses_per_request": 410
+      },
+      "geometry_legacy_note": "prepared_rounds=8 is the requested value in this unchanged harness; effective prepared rounds=2 from PrepareShape; actual Service rounds=0",
+      "effective_prepared_rounds": 2,
+      "b16_performance_claim": false,
+      "total_model_ticks": 1226673,
+      "full_owner_oracle_passed": true,
+      "model_log_sha256": "7ba4d24697b69c3a8a8f4c0b96bf8f03a8bc451a08477aa3020b62db068d3003",
+      "correctness_sha256": "4d03ca66961fa665c99e40aadc65adbd5399d103b5b55ffb5a34d81fced66449",
+      "raw_capture_sha256": "bd0234373ed4ce8498896f9e6b636c17c57aa13bbe14fe2ae0646391970a1775",
+      "exported_log": "logs/fusion3-direct-b1-candidate-r1.log",
+      "raw_output_sha256": {
+        "topk.bin": "d9e66f54c3cd5478edff14e7a2572e5333389bdbab907bc20ba33f6e0159aa99",
+        "locations.bin": "12239103e871bc58ca6f13a5daeba360c5c5e051f1867c681d9e590f6f5b87e5",
+        "logical-output.bin": "9bd560cb91bc48f0ad014d8cbbd65070a62f2f906199c811fd4565302a14e888",
+        "slot-output.bin": "c864e58cdba95144cdb1164c609608b2857f6d1878587c98205aec16bd71940c",
+        "changes.bin": "2446dbb1e4a5b70302057598639d064a933deb48a29355e5e7b5201a68698dfb",
+        "change-counts.bin": "cbfd218787df784c39fbc4f4fad92a8f28e2a880430c210b6d0d8dc133c07e66"
+      }
+    }
+  ]
+}

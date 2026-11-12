@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 
 
-def prepare_full_chain_fixture(root, history, resident, miss_percent, prefetch_decoys=0, index_heads=64):
+def prepare_full_chain_fixture(root, history, resident, miss_percent, prefetch_decoys=0, index_heads=64, *, exact_miss=False, valid_history=None):
     """Reuse controlled cold masks, give each final TopK an unambiguous boundary.
 
     Hot feature bands independently choose exactly the remaining winners for
@@ -16,8 +16,11 @@ def prepare_full_chain_fixture(root, history, resident, miss_percent, prefetch_d
     """
     from miss_fixture import build
 
+    valid_history = history if valid_history is None else valid_history
+    if not resident < valid_history <= history:
+        raise ValueError("valid history must be within the allocated cold range")
     target = round(2048 * miss_percent / 100)
-    if not 0 <= target <= min(2048, history - resident):
+    if not 0 <= target <= min(2048, valid_history - resident):
         raise ValueError("requested miss count exceeds available cold candidates")
     tiles = (history - resident) // 128
     build(root, 0, "dispersed", history, resident, min(256, 2 * (target + 0.125) / tiles), independent_queries=True)
@@ -50,10 +53,28 @@ def prepare_full_chain_fixture(root, history, resident, miss_percent, prefetch_d
         raise ValueError("prefetch_decoys must be nonnegative")
     logical, actual_misses, selected_cold, prefetched = [], [], set(), set()
     order = np.load(root / "physical_to_logical.npy")
+    encoded[valid_history:] = 0
+    scale[valid_history:] = 0
+    if exact_miss:
+        if valid_history - resident < 2 * target:
+            raise ValueError("exact controlled overlap requires at least 2m valid cold rows")
+        encoded[resident:] = 0
+        scale[resident:valid_history] = 8
+        scale[valid_history:] = 0
+        if target:
+            slots = resident + np.floor(np.arange(2 * target) * (valid_history - resident) / (2 * target)).astype(int)
+            for query in range(4):
+                encoded[np.ix_(slots[query % 2::2], np.arange(32) + query * 32)] = 0x44
+    if valid_history != history:
+        # Valid logical IDs and storage padding are disjoint, including the hot prefix.
+        order = np.concatenate((np.random.default_rng(73121).permutation(valid_history),
+                                np.arange(valid_history, history))).astype(np.int32)
+        np.save(root / "physical_to_logical.npy", order)
+    np.array([valid_history], np.uint32).tofile(root / "arg6.bin")
     for query in range(4):
         columns = np.arange(index_heads) % 32 + query * 32
-        cold = np.count_nonzero(encoded[resident:, query * 32])
-        candidates = np.flatnonzero(encoded[resident:, query * 32] == 0) + resident
+        cold = np.count_nonzero(encoded[resident:valid_history, query * 32])
+        candidates = np.flatnonzero(encoded[resident:valid_history, query * 32] == 0) + resident
         if prefetch_decoys > len(candidates):
             raise ValueError("prefetch_decoys exceeds available nonwinning cold candidates")
         if prefetch_decoys:
@@ -72,22 +93,29 @@ def prepare_full_chain_fixture(root, history, resident, miss_percent, prefetch_d
         )
         scores = (values * (weights[query] * query_scale[query])).sum(-1) * scale
         bits = ((scores.view(np.uint32) + 0x8000) >> 16).astype(np.uint16)
-        cutoff = np.partition(bits, -2048)[-2048]
+        cutoff = np.partition(bits[:valid_history], -2048)[-2048]
         if int(np.count_nonzero(bits >= cutoff)) != 2048:
             raise ValueError(f"fixture_final_boundary_not_unique:query={query}")
         mapped = np.empty_like(bits)
         mapped[order] = bits
         logical.append(mapped)
         actual_misses.append(int(cold))
-        selected_cold.update((np.flatnonzero(bits[resident:] >= cutoff) + resident).tolist())
+        selected_cold.update((np.flatnonzero(bits[resident:valid_history] >= cutoff) + resident).tolist())
         resident_cutoff = np.partition(bits[:resident], -2048)[-2048]
-        prefetched.update((np.flatnonzero(bits[resident:] > resident_cutoff)[:2048] + resident).tolist())
+        prefetched.update((np.flatnonzero(bits[resident:valid_history] > resident_cutoff)[:2048] + resident).tolist())
+    if exact_miss and actual_misses != [target] * 4:
+        raise ValueError("actual FP8 fixture does not produce the requested integer miss count")
     encoded.tofile(root / "arg1.bin")
     scale.tofile(root / "arg4.bin")
     np.save(root / "logical_scores.npy", np.stack(logical))
     config = json.loads((root / "fixture.json").read_text())
     config["full_chain_fixture"] = dict(
         model="controlled_query_feature_bands",
+        exact_miss=exact_miss,
+        valid_history=valid_history,
+        shape_history=history,
+        unique_misses_per_request=len(selected_cold),
+        actual_miss_percent_per_query=[100 * count / 2048 for count in actual_misses],
         index_heads=index_heads,
         requested_miss_percent=miss_percent,
         final_misses_per_query=actual_misses,
@@ -97,6 +125,13 @@ def prepare_full_chain_fixture(root, history, resident, miss_percent, prefetch_d
         prefetch_decoys=prefetch_decoys,
         expected_final_supplement=len(selected_cold - prefetched),
     )
+    config["visible_lengths"] = [valid_history] * 4
+    if valid_history != history:
+        blob = np.fromfile(root / "arg13.bin", np.uint8)
+        offset = 4 * 2048 * 6 + 1024 + 4 * history * 2
+        addresses = np.uint64(0x200000000) + order.astype(np.uint64) * 656
+        blob[offset:offset + history * 8] = addresses.view(np.uint8)
+        blob.tofile(root / "arg13.bin")
     (root / "fixture.json").write_text(json.dumps(config, indent=2))
     return config["full_chain_fixture"]
 

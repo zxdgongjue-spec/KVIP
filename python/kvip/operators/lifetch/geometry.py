@@ -56,8 +56,9 @@ def trigger_tokens(batch, history, resident, tiling="auto", intermediate_fetches
 
 
 def final_aivs(batch, tiling="auto", aic_count=32, requested=0):
-    cores = li_geometry(batch, tiling, 0, aic_count)["rotating_aiv"]
-    workers = requested or (4 if cores >= batch * 4 else (2 if cores >= batch * 2 else 1))
-    if workers not in (1, 2, 4) or workers * batch > cores:
-        raise ValueError("Final AIV count exceeds active LI budget")
+    """Number of per-query publication records, independent of LI worker count."""
+    li_geometry(batch, tiling, 0, aic_count)
+    workers = requested or 4
+    if workers not in (1, 2, 4):
+        raise ValueError("Final publication count must be 1, 2 or 4")
     return workers

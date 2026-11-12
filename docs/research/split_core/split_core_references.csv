@@ -1,0 +1,16 @@
+short_name,title,year,primary_url,publication_note
+DeepSeek-V3.2,DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models,2025,https://arxiv.org/html/2512.02556v1,technical report
+Flash-Decoding,Flash-Decoding for long-context inference,2023,https://pytorch.org/blog/flash-decoding/,"author technical article, not a separate paper"
+FlashAttention-2,FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning,2023; ICLR 2024,https://arxiv.org/abs/2307.08691,preprint / publication
+FlashInfer,FlashInfer: Efficient and Customizable Attention Engine for LLM Inference Serving,2025; MLSys 2025,https://arxiv.org/html/2501.01005v1,paper
+NanoFlow,NanoFlow: Towards Optimal Large Language Model Serving Throughput,2024; OSDI 2025,https://www.usenix.org/conference/osdi25/presentation/zhu-kan,preprint / publication
+InfiniGen,InfiniGen: Efficient Generative Inference of Large Language Models with Dynamic KV Cache Management,2024; OSDI 2024,https://arxiv.org/html/2406.19707v1,paper
+HiSparse,HiSparse: Scaling Sparse-Attention Decoding with Hierarchical KV Cache Management,2026,https://arxiv.org/html/2608.07009v1,preprint
+FlashOffloading,FlashOffloading: Low-Latency KV Cache Offloading for Long-Context LLM Serving,2026,https://arxiv.org/html/2611.07542v1,preprint; 2025 template header is not publication evidence
+StreamIndex,StreamIndex: Memory-Bounded Compressed Sparse Attention via Streaming Top-k,2026,https://arxiv.org/html/2605.02568v1,preprint
+Multi-layer Indexer,Multi-layer Indexer: Overlapping Selection and Attention in DeepSeek Sparse Attention,2026,https://arxiv.org/html/2611.03768v1,preprint
+FlashAttention-3,FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision,2024; NeurIPS 2024,https://arxiv.org/html/2407.08608v2,paper
+FlashAttention-4,FlashAttention-4: Algorithm and Kernel Pipelining Co-Design for Asymmetric Hardware Scaling,2026,https://arxiv.org/html/2603.05451v1,preprint
+Tawa,Tawa: Automatic Warp Specialization for Modern GPUs with Asynchronous References,2025,https://arxiv.org/html/2510.14719v1,preprint
+HyperParallel-MoE,HyperParallel-MoE: Multi-Core Interleaved Scheduling for Fast MoE Training on Ascend NPUs,2026,https://arxiv.org/html/2605.23764v1,preprint
+Roofline,Roofline: An Insightful Visual Performance Model for Floating-Point Programs and Multicore Architectures,2008,https://www2.eecs.berkeley.edu/Pubs/TechRpts/2008/Archive/EECS-2008-134.pdf,UCB/EECS-2008-134; related CACM article appeared 2009 under a different title

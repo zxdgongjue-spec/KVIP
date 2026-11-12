@@ -1,0 +1,31 @@
+{
+  "base": "81b1472809b7a5f3469e26467feee0ca1c61d71a",
+  "files": {
+    "overlay/base/csrc/operators/lightning_indexer_with_fetch/CMakeLists.txt": "640ae1f9be7b7095a28a438b5887c2732ac17cb4e6166b63dbadbd03b6ba7036",
+    "overlay/base/csrc/operators/lightning_indexer_with_fetch/op_host/launch.cpp": "71cc282f369e2378316465efa8f4e6ac550edbb6eaa3ed78f8aed3f64a216496",
+    "overlay/base/csrc/operators/lightning_indexer_with_fetch/op_kernel/fusion3_contract.h": "e7edc6542cc117dcbda014385a6954e81e909f0f7eb5e085eaf7da4832cdaf6f",
+    "overlay/base/csrc/operators/lightning_indexer_with_fetch/op_kernel/fusion3_tail.h": "440b4af03f3254c312156e8ee5d659b83ab540ec0065a25e26ceb55d757c636e",
+    "overlay/base/csrc/operators/lightning_indexer_with_fetch/op_kernel/fusion3_plan.h": "3d24f225f27e19e227f6ff39037a71422f8c4b2b926b98a5cf9d8d2884c963a8",
+    "overlay/base/csrc/operators/lightning_indexer_with_fetch/op_kernel/lifecycle.cpp": "48ca46e0903c12dc5af9ef141f688c3398c525e62190f17d7af3258946054cc9",
+    "overlay/base/csrc/operators/lightning_indexer_with_fetch/op_kernel/final_fetch_phase.h": "a1aa78c811e1e7296bfb78622b31639fe8aa65ad4fa0c97e00ba8ff9ff0e6c84",
+    "overlay/pooled/csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer.cpp": "aab2df2011d95c25ebe027584d3271d9efe55917280c55be57727b10ddb97e45",
+    "overlay/pooled/csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer.h": "6d5e2d439d521c58341f05a73b940504cad2b0ac68451e3d4696180e0ca937c3",
+    "overlay/history/csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer.cpp": "391c81400154c22b82dde2cc2132fcb98e4222a47ea83632e5793002bc0ccfd8",
+    "overlay/history/csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_vector.h": "bdf375ab15eb276d879d79452dfe75cbd4f80234857614a48048c3204a50e726",
+    "overlay/history/csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer.h": "1e514142a65ce8a82566746493b16f8a2de33924144555f83017284dde093c1c",
+    "full/full_pool_host.cpp": "fd1e7ed7b4d3dea3d1121a742b8d63dbb63621b4ef3b7be58fe8b3e20bfcc298",
+    "full/full_pool_launch.h": "bca809d1dcb1f347eedbeaa59ddda5b2ae6c9c409839e85045ea8ff1c3abdc5e",
+    "full/fusion3_transport_mock.h": "fb839b885cb09da1e63aa71bd3bdbba225f06b4b9660dc9d772a87bdfd63021d",
+    "full/standard_host_helpers.h": "09c34014859edda2c54583f66c6d9b412ce6799c06feb6cf9aefe23870ad840f",
+    "history/history_host.cpp": "0e44ba75275d21bcb7f4ee20c879dafe3b2c92eda1c815316d82ec2405edf7d5",
+    "history/history_launch.h": "4aca8b2ad66e64c0bc8118722ed0c44e66be7fe930c66cc6b51e18ba7d3d597a",
+    "history/history_topk_kernel.cpp": "ae1302c43b9578c9db3c88093803c6c0f39acd95d72c5d2b9ab63aeec14b3114",
+    "history/fusion3_transport_mock.h": "fb839b885cb09da1e63aa71bd3bdbba225f06b4b9660dc9d772a87bdfd63021d",
+    "history/standard_host_helpers.h": "09c34014859edda2c54583f66c6d9b412ce6799c06feb6cf9aefe23870ad840f",
+    "topk_v2.cpp": "54a56f2a7f10726b90678f50f08ae6a4c7ba98d4674689aa226f30c53f9e7fe5",
+    "lru-seed.bin": "7fd5234752ba22a513f33ef7afb71f717288e7bfd20c349798f0a3faf64b756d",
+    "history_oracle.py": "28779e9c900bcbf0bdf50475b449bc17760927f2c8aebcafd9f7f8f52c8799db",
+    "CMakeLists.txt": "2d53f7db756ab3794cd5ce6eb2233fddc101518753213df274772ca2db7fc11d"
+  },
+  "note": "Source snapshots only. Fixture path parameterized; rebuilt binary hashes/ticks may differ from archived builds."
+}

@@ -50,7 +50,7 @@ def run(args, run_dir):
     registration.require_a5_dsa_registration(("lidu_fused_batch_get_prepare_mtp_out",))
     torch.npu.set_device(args.device)
     device = torch.device(f"npu:{args.device}")
-    resources = query_device_resources(args.cann, args.device, 0)
+    resources = query_device_resources(args.cann, args.device, getattr(args, "aic_budget", 0))
     aics = resources["effective_aic"]
 
     class FiniteSession(NativeFetchSession):
@@ -97,7 +97,8 @@ def run(args, run_dir):
         with native_log(folder / "native.log"):
             common, data, build = (folder / "fixture", folder / "input", shared_build)
             fixture_info = prepare_full_chain_fixture(
-                common, args.history, args.resident, args.miss_percent, index_heads=args.index_heads
+                common, args.history, args.resident, args.miss_percent, index_heads=args.index_heads,
+                exact_miss=getattr(args, "exact_miss", False), valid_history=getattr(args, "valid_history", None)
             )
             geometry = li_geometry(batch, "auto", args.intermediate_fetches, aics, 0)
             batch_inputs(common, data, batch, args.history, geometry["rotating_aic"])
@@ -275,7 +276,7 @@ def run_device(
         key=arguments[1].view(torch.float8_e4m3fn).reshape(-1, 128, 1, 128),
         actual_query=torch.arange(1, b + 1, device=device, dtype=torch.int32) * 4,
         li_query_lengths=torch.full((b,), 4, device=device, dtype=torch.int32),
-        actual_key=torch.full((b,), h, device=device, dtype=torch.int32),
+        actual_key=arguments[6].view(torch.int32),
         block_table=arguments[7].view(torch.int32).reshape(b, -1),
     )
     fixture["native_inputs"] = dict(
@@ -419,7 +420,9 @@ def run_device(
         final_workers=args.final_workers or 0,
         prefetch_limit=args.prefetch_tokens,
         output_stride=owner.output.shape[1],
+        query_ends=torch.full((b, 4), getattr(args, "valid_history", None) or h, dtype=torch.int32, device=device),
     )
+    rotating.aiv_budget = getattr(args, "aiv_budget", None)
     topk = arguments[9].view(torch.int32).reshape(b, 4, 2048)
     prefix = 4 * 2048 * 6 + 1024 + 4 * h * 2
     tail = h * 8 + 8192 * 64 + 4 * 128

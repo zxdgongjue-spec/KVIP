@@ -1,0 +1,22 @@
+batch,history_percent,history,valid,miss_percent,miss_per_query,unique_miss,shards,aiv_cap,repeat,local_worker_ticks,merge_worker_ticks,sum_phase_worker_ticks,whole_model_ticks,instrumentation,completed_worker_timing_valid,evidence,scope
+1,100,131072,131072,10,205,410,1,64,0,,,,49452,v2_unfenced_scalar_marker,False,results/model-records.json#20261112-125609-pilot/0000-b1-h100-m10-s1-v64-r0,AIV-only exact TopK component; CA Model
+1,100,131072,131072,10,205,410,4,64,0,,,,27898,v2_unfenced_scalar_marker,False,results/model-records.json#20261112-125609-pilot/0001-b1-h100-m10-s4-v64-r0,AIV-only exact TopK component; CA Model
+1,100,131072,131072,10,205,410,8,64,0,,,,24091,v2_unfenced_scalar_marker,False,results/model-records.json#20261112-125609-pilot/0002-b1-h100-m10-s8-v64-r0,AIV-only exact TopK component; CA Model
+1,100,131072,131072,10,205,410,1,56,0,47126,0,47126,50125,v4_start_S_V_end_V_S,True,results/model-records.json#20261112-152622-focused/0000-b1-h100-m10-s1-v56-r0,AIV-only exact TopK component; CA Model
+1,100,131072,131072,10,205,410,4,56,0,14526,9628,24154,29536,v4_start_S_V_end_V_S,True,results/model-records.json#20261112-152622-focused/0001-b1-h100-m10-s4-v56-r0,AIV-only exact TopK component; CA Model
+1,100,131072,131072,10,205,410,8,56,0,7827,12258,20085,25538,v4_start_S_V_end_V_S,True,results/model-records.json#20261112-152622-focused/0002-b1-h100-m10-s8-v56-r0,AIV-only exact TopK component; CA Model
+1,100,131072,131072,10,205,410,1,64,0,47126,0,47126,50127,v4_start_S_V_end_V_S,True,results/model-records.json#20261112-152622-focused/0003-b1-h100-m10-s1-v64-r0,AIV-only exact TopK component; CA Model
+1,100,131072,131072,10,205,410,4,64,0,14526,9628,24154,29517,v4_start_S_V_end_V_S,True,results/model-records.json#20261112-152622-focused/0004-b1-h100-m10-s4-v64-r0,AIV-only exact TopK component; CA Model
+1,100,131072,131072,10,205,410,8,64,0,7827,12258,20085,25542,v4_start_S_V_end_V_S,True,results/model-records.json#20261112-152622-focused/0005-b1-h100-m10-s8-v64-r0,AIV-only exact TopK component; CA Model
+2,100,131072,131072,10,205,410,1,56,0,47586,0,47586,50448,v4_start_S_V_end_V_S,True,results/model-records.json#20261112-152622-focused/0006-b2-h100-m10-s1-v56-r0,AIV-only exact TopK component; CA Model
+2,100,131072,131072,10,205,410,4,56,0,14276,9833,24109,29477,v4_start_S_V_end_V_S,True,results/model-records.json#20261112-152622-focused/0007-b2-h100-m10-s4-v56-r0,AIV-only exact TopK component; CA Model
+2,100,131072,131072,10,205,410,8,56,0,14551,12126,26677,31981,v4_start_S_V_end_V_S,True,results/model-records.json#20261112-152622-focused/0008-b2-h100-m10-s8-v56-r0,AIV-only exact TopK component; CA Model
+2,100,131072,131072,10,205,410,1,64,0,47586,0,47586,50453,v4_start_S_V_end_V_S,True,results/model-records.json#20261112-152622-focused/0009-b2-h100-m10-s1-v64-r0,AIV-only exact TopK component; CA Model
+2,100,131072,131072,10,205,410,4,64,0,14276,9833,24109,29464,v4_start_S_V_end_V_S,True,results/model-records.json#20261112-152622-focused/0010-b2-h100-m10-s4-v64-r0,AIV-only exact TopK component; CA Model
+2,100,131072,131072,10,205,410,8,64,0,8029,12077,20106,25555,v4_start_S_V_end_V_S,True,results/model-records.json#20261112-152622-focused/0011-b2-h100-m10-s8-v64-r0,AIV-only exact TopK component; CA Model
+16,100,131072,131072,10,205,410,1,56,0,93814,0,93814,96671,v4_start_S_V_end_V_S,True,results/model-records.json#20261112-152622-focused/0012-b16-h100-m10-s1-v56-r0,AIV-only exact TopK component; CA Model
+16,100,131072,131072,10,205,410,4,56,0,61942,18951,80893,86563,v4_start_S_V_end_V_S,True,results/model-records.json#20261112-152622-focused/0013-b16-h100-m10-s4-v56-r0,AIV-only exact TopK component; CA Model
+16,100,131072,131072,10,205,410,8,56,0,63247,24285,87532,92980,v4_start_S_V_end_V_S,True,results/model-records.json#20261112-152622-focused/0014-b16-h100-m10-s8-v56-r0,AIV-only exact TopK component; CA Model
+16,100,131072,131072,10,205,410,1,64,0,48810,0,48810,51748,v4_start_S_V_end_V_S,True,results/model-records.json#20261112-152622-focused/0015-b16-h100-m10-s1-v64-r0,AIV-only exact TopK component; CA Model
+16,100,131072,131072,10,205,410,4,64,0,50780,9975,60755,66354,v4_start_S_V_end_V_S,True,results/model-records.json#20261112-152622-focused/0016-b16-h100-m10-s4-v64-r0,AIV-only exact TopK component; CA Model
+16,100,131072,131072,10,205,410,8,64,0,52318,12380,64698,70457,v4_start_S_V_end_V_S,True,results/model-records.json#20261112-152622-focused/0017-b16-h100-m10-s8-v64-r0,AIV-only exact TopK component; CA Model

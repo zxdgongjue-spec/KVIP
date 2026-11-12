@@ -31,6 +31,11 @@ class Tensor:
         self.values[...] = other.values
 
 
+@pytest.fixture(autouse=True)
+def physical_device(monkeypatch):
+    monkeypatch.setattr("kvip.operators.lifetch.streaming.query_device_resources", lambda *a: dict(aic=32,aiv=64))
+
+
 def binding_fixture(transport="urma", batch=1, history=131072, resident=16384, heads=32):
     stream = SimpleNamespace(npu_stream=303)
     torch = SimpleNamespace(
@@ -42,20 +47,21 @@ def binding_fixture(transport="urma", batch=1, history=131072, resident=16384, h
         empty_like=lambda value: Tensor(np.empty_like(value.values)),
         tensor=lambda data, dtype, device: Tensor(np.asarray(data, dtype=dtype)),
         from_numpy=Tensor,
-        npu=SimpleNamespace(current_stream=Mock(return_value=stream)),
+        npu=SimpleNamespace(current_stream=Mock(return_value=stream), current_device=lambda: 5),
     )
     rotating = SimpleNamespace(
         torch=torch,
         device=5,
         prefetch_limit=512,
+        queue_count=128,
         runtime_shape=RuntimeShape(
-            batch=batch, history=history, resident=resident, indexHeads=heads, aicCount=32, finalWorkers=4
+            batch=batch, history=history, resident=resident, indexHeads=heads, aicCount=32, finalWorkers=4, liCores=batch*(2 if batch<=16 else 1)
         ),
         context=Tensor(np.zeros(320, dtype=np.uint8)),
         hot_valid=Tensor(np.zeros(32, dtype=np.int32)),
         arguments=[Tensor(np.zeros(32, dtype=np.uint8)) for _ in range(15)],
         library=SimpleNamespace(
-            kvip_lifetch_streaming_forward=Mock(return_value=0),
+            kvip_lifetch_streaming_forward_v2=Mock(return_value=0),
             kvip_streaming_resolver_cores=Mock(return_value=3),
             kvip_streaming_flag_count=Mock(return_value=16),
         ),
@@ -78,17 +84,17 @@ def test_public_forward_only_launches_retained_workspace(transport):
     pointer = forward.workspace.data_ptr()
     for _ in range(2):
         forward()
-        args = rotating.library.kvip_lifetch_streaming_forward.call_args.args
+        args = rotating.library.kvip_lifetch_streaming_forward_v2.call_args.args
         assert args[:4] == (rotating.bindings.data_ptr(), update.bindings.data_ptr(), pointer, 303)
-        assert args[5] == 2
+        assert args[5:] == (2, 64)
         assert ctypes.cast(args[4], ctypes.POINTER(RuntimeShape)).contents.batch == 1
     assert allocations == (rotating.torch.zeros.call_count, rotating.torch.empty.call_count)
     if transport == "ubmem":
         rotating.lease.check_stream.side_effect = RuntimeError("released lease")
         with pytest.raises(RuntimeError, match="released lease"):
             forward()
-        assert rotating.library.kvip_lifetch_streaming_forward.call_count == 2
-    rotating.library.kvip_lifetch_streaming_forward.return_value = 42
+        assert rotating.library.kvip_lifetch_streaming_forward_v2.call_count == 2
+    rotating.library.kvip_lifetch_streaming_forward_v2.return_value = 42
     if transport == "ubmem":
         rotating.lease.check_stream.side_effect = None
     with pytest.raises(RuntimeError, match="42"):
@@ -122,6 +128,8 @@ def test_device_and_aiv_budget_are_checked():
         LIFetchForward(rotating, update)
     update.device = 5
     rotating.runtime_shape.aicCount = 24
+    rotating.runtime_shape.liCores = 16
+    rotating.aiv_budget = 48
     with pytest.raises(ValueError, match="AIV budget"):
         LIFetchForward(rotating, update)
     rotating.torch.empty.assert_not_called()
@@ -180,3 +188,28 @@ int main(){
     binary = tmp_path / 'failure'
     subprocess.run(['c++', '-std=c++17', '-fsanitize=address,undefined', str(source), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
+
+
+def test_c28_b16_uses_four_records_with_independent_v56(monkeypatch):
+    monkeypatch.setattr("kvip.operators.lifetch.streaming.query_device_resources", lambda *a: dict(aic=28,aiv=56))
+    rotating, update = binding_fixture(batch=16)
+    rotating.runtime_shape.aicCount = 28
+    rotating.runtime_shape.liCores = 16
+    rotating.queue_count = 48
+    forward = LIFetchForward(rotating, update, aiv_budget=56)
+    assert forward.schedule.tail_aiv == 56
+    forward()
+    assert rotating.library.kvip_lifetch_streaming_forward_v2.call_args.args[5:] == (2,56)
+    with pytest.raises(ValueError, match="AIV budget"):
+        LIFetchForward(rotating, update, q_workers=4, aiv_budget=56)
+    with pytest.raises(ValueError, match="actual device"):
+        LIFetchForward(rotating, update, aiv_budget=64)
+
+
+def test_queue_requirement_tracks_fetch_workers():
+    rotating, update = binding_fixture(batch=1)
+    rotating.queue_count = 18
+    with pytest.raises(ValueError, match="queues"):
+        LIFetchForward(rotating, update, q_workers=4)
+    rotating.queue_count = 34
+    assert LIFetchForward(rotating, update, q_workers=4).schedule.urma_queues == 34

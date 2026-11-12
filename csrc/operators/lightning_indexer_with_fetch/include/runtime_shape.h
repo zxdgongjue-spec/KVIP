@@ -39,9 +39,9 @@ inline uint32_t PrepareShape(RuntimeShape* s) {
     if(!s->serviceAics)s->serviceAics=s->liCores/s->rounds;
     if(s->serviceAics>s->liCores/s->rounds)return 100000;
     s->serviceLanes=2*s->serviceAics;
-    if(!s->finalWorkers)s->finalWorkers=s->splitQ?4:2;
-    if((s->finalWorkers!=1 && s->finalWorkers!=2 && s->finalWorkers!=4) ||
-        s->finalWorkers*s->batch>2*s->liCores)return 100000;
+    // Four query publication records; not four concurrently resident LI workers.
+    if(!s->finalWorkers)s->finalWorkers=4;
+    if(s->finalWorkers!=1 && s->finalWorkers!=2 && s->finalWorkers!=4)return 100000;
     s->finalCores=s->batch*s->finalWorkers;
     s->finalPostOffset=s->batch*128+s->finalCores*288*4;
     s->finalOwnerBytes=s->finalPostOffset+s->finalCores*128;

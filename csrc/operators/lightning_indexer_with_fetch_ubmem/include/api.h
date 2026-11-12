@@ -18,3 +18,6 @@ uint32_t kvip_ubmem_status_bytes();
 uint32_t v9_init(void* bindings,void* stream,const rotating::RuntimeShape* shape);
 uint32_t v9_li(void* bindings,void* stream,const rotating::RuntimeShape* shape);
 }
+
+// Explicit independent AIV budget; legacy six-argument entry remains available.
+extern "C" uint32_t kvip_lifetch_streaming_forward_v2(void*,void*,void*,void*,const rotating::RuntimeShape*,uint32_t,uint32_t);

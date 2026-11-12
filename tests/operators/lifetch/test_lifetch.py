@@ -53,6 +53,10 @@ def arguments(argv=None):
     p.add_argument("--cann", default="/usr/local/Ascend/cann")
     p.add_argument("--index-heads", type=int, choices=(32, 64), default=32)
     p.add_argument("--history", type=int, default=131072)
+    p.add_argument("--valid-history", type=int)
+    p.add_argument("--exact-miss", action="store_true")
+    p.add_argument("--aic-budget", type=int, default=0)
+    p.add_argument("--aiv-budget", type=int)
     p.add_argument("--resident", type=int, default=16384)
     p.add_argument("--intermediate-fetches", type=int, default=8)
     p.add_argument("--prefetch-tokens", type=int, default=512)
@@ -195,6 +199,10 @@ def main(argv=None):
     p.add_argument('--cann', default='/usr/local/Ascend/cann')
     p.add_argument('--batches', default='16', help='comma-separated request counts')
     p.add_argument('--history', type=int, default=131072)
+    p.add_argument('--valid-history', type=int)
+    p.add_argument('--exact-miss', action='store_true')
+    p.add_argument('--aic-budget', type=int, default=0)
+    p.add_argument('--aiv-budget', type=int)
     p.add_argument('--resident', type=int, default=16384)
     p.add_argument('--index-heads', type=int, choices=(32, 64), default=32)
     p.add_argument('--intermediate-fetches', type=int, default=8)
@@ -238,6 +246,13 @@ def main(argv=None):
               '--resident', str(a.resident), '--index-heads', str(a.index_heads), '--miss-percent',
               str(a.miss_percent), '--prefetch-tokens', str(a.prefetch_tokens), '--warmup', str(a.warmup),
               '--iterations', str(a.iterations)]
+    if a.valid_history is not None:
+        common.extend(['--valid-history', str(a.valid_history)])
+    if a.exact_miss:
+        common.append('--exact-miss')
+    common.extend(['--aic-budget', str(a.aic_budget)])
+    if a.aiv_budget is not None:
+        common.extend(['--aiv-budget', str(a.aiv_budget)])
     if a.fetch_only_compare and (a.transport != 'urma' or a.q_workers != 2 or not a.fused_final or not a.streaming_fetch or not a.streaming):
         p.error('--fetch-only-compare requires URMA and --streaming --streaming-fetch --fused-final --q-workers 2')
     if a.parallel_fetch_finalize and a.transport != 'urma':
@@ -344,12 +359,13 @@ def test_host_pipeline_order_and_first_error(tmp_path):
     import subprocess
 
     source = (ROOT / "csrc/operators/lightning_indexer_with_fetch/op_host/launch.cpp").read_text()
-    begin = source.index('extern "C" uint32_t kvip_lifetch_streaming_forward(')
+    begin = source.index('extern "C" uint32_t kvip_lifetch_streaming_forward_v2(')
     entry = source[begin:source.index('\nextern "C" uint32_t aclrtlaunch_kvip_transport_snapshot', begin)]
     stub = r"""
 #include <cstdint>
 #include <cassert>
 #include "runtime_shape.h"
+#include "independent_schedule.h"
 namespace pipeline_ab { constexpr uint32_t kResolveCores=3; }
 int fail=0, count=0;
 void* stream_expected=(void*)3;
@@ -359,9 +375,10 @@ uint32_t v9_li(void*a,void*s,const rotating::RuntimeShape*){return step(2,a,s);}
 extern "C" uint32_t aclrtlaunch_v9_streaming_resolve_update(uint32_t cores,void*s,void*a){assert(cores==56);return step(3,a,s);}
 """
     main = r"""
-int main(){rotating::RuntimeShape shape{};shape.batch=16;shape.finalWorkers=4;shape.aicCount=32;
-for(fail=0;fail<=3;++fail){count=0;assert(kvip_lifetch_streaming_forward((void*)1,(void*)2,(void*)1,stream_expected,&shape,2)==(fail?99:0));assert(count==(fail?fail:3));}
-count=0;shape.batch=17;assert(kvip_lifetch_streaming_forward((void*)1,(void*)2,(void*)1,stream_expected,&shape,2)!=0);assert(count==0);return 0;}
+int main(){rotating::RuntimeShape shape{};shape.batch=16;shape.finalWorkers=4;shape.aicCount=28;shape.liCores=16;
+for(fail=0;fail<=3;++fail){count=0;assert(kvip_lifetch_streaming_forward_v2((void*)1,(void*)2,(void*)1,stream_expected,&shape,2,56)==(fail?99:0));assert(count==(fail?fail:3));}
+count=0;assert(kvip_lifetch_streaming_forward_v2((void*)1,(void*)2,(void*)1,stream_expected,&shape,2,55)!=0);assert(count==0);
+count=0;shape.batch=17;assert(kvip_lifetch_streaming_forward_v2((void*)1,(void*)2,(void*)1,stream_expected,&shape,2,56)!=0);assert(count==0);return 0;}
 """
     path = tmp_path / "launch.cpp"
     path.write_text(stub + entry + main)
@@ -370,6 +387,7 @@ count=0;shape.batch=17;assert(kvip_lifetch_streaming_forward((void*)1,(void*)2,(
             "c++",
             "-std=c++17",
             "-I" + str(ROOT / "csrc/operators/lightning_indexer_with_fetch/include"),
+            "-I" + str(ROOT / "csrc/operators/common/lifetch"),
             str(path),
             "-o",
             str(tmp_path / "test"),

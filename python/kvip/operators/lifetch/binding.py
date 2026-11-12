@@ -96,7 +96,8 @@ class LIFetchBinding:
         if geometry["logical_aic_tasks"] > aic_count or not geometry["intermediate_fetches"]:
             raise ValueError("Direct hot-first mode requires a window and concurrently resident LI tasks")
         contexts = owner.build_device_args(library)
-        required_queues = max(batch * (final_aivs(batch, li_tiling, aic_count, final_workers) + 1), 2 * batch + 16)
+        self.queue_count = int(contexts.shape[0])
+        required_queues = 2 * batch  # Forward checks the separate Fetch-worker range.
         if contexts.shape[0] < required_queues:
             raise ValueError("V9 requires exclusive prefetch and per-final-AIV queues")
         self.rounds = li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)[
