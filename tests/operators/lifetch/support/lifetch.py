@@ -11,6 +11,10 @@ from index_update import DirectCacheUpdate, permutation_records
 from native_miss_oracle import native_miss_oracle
 from actual_k_admission import parse_actual_key_lengths, score_oracle_for_actual_k
 from actual_k_transitions import transition_schedule
+from persistent_actual_k import (
+    persistent_growth_schedule,
+    score_oracle_for_persistent_state,
+)
 from kvip.operators.lifetch.forward import LIFetchForward
 from kvip.runtime.loader import load_lifetch_library
 from prefetch_audit import actual_reads, completion_failures
@@ -224,6 +228,10 @@ def run(args, run_dir):
         )
         if report.get("dynamic_k_transition_report"):
             line += "\nP0_A2_DYNAMIC_K_PASS=" + json.dumps(report["dynamic_k_transition_report"])
+        if report.get("persistent_actual_k_report"):
+            line += "\nP0_A2_2B_PERSISTENT_ACTUAL_K_PASS=" + json.dumps(
+                report["persistent_actual_k_report"]
+            )
         if fixture_info.get("actual_key_admission"):
             line += "\nP0_A2_ACTUAL_K=" + json.dumps(fixture_info["actual_key_admission"]["key_lengths"])
             line += (
@@ -1287,6 +1295,7 @@ def run_device(
             next_orders.append(order)
         update.set_order(next_orders)
     dynamic_k_transition_report = None
+    persistent_actual_k_report = None
     if getattr(args, "actual_k_transition_check", False):
         if actual_lengths is None or query_ends is None or not args.active_k_map_clear:
             raise ValueError("Dynamic-K transition requires valid K and Active-K reset")
@@ -1345,6 +1354,226 @@ def run_device(
         # Last stage restores initial K, preserving the subsequent SFA test.
         if tuple(actual_key_buffer.cpu().tolist()) != tuple(key_lengths):
             raise AssertionError("Dynamic-K final stage did not restore initial K")
+
+    # P0-A2.2b: one baseline reset, then monotonic K growth while the
+    # Index rows, scales, DDR addresses, hot KV and LRU state remain live.
+    if getattr(args, "actual_k_persistent_check", False):
+        if actual_lengths is None or query_ends is None or not args.active_k_map_clear:
+            raise ValueError("Persistent Actual-K check requires valid K and Active-K reset")
+        schedule = persistent_growth_schedule(key_lengths, h, r)
+        if tuple(schedule[0][1]) != tuple(key_lengths):
+            raise AssertionError("Persistent Actual-K schedule does not start at fixture K")
+
+        # A single reset establishes the baseline. These immutable CPU
+        # snapshots are the reference for every later in-place Index move.
+        reset()
+        base_index_keys = update.inputs[0].detach().cpu().numpy().copy()
+        base_index_scales = update.inputs[1].detach().cpu().numpy().copy()
+        base_index_addresses = update.inputs[2].detach().cpu().numpy().copy()
+        base_payload = owner.session.cpu_payload.detach().cpu().numpy()
+        base_rows = np.arange(h, dtype=np.int64)
+
+        # Recreate the Python LRU oracle at the same initial state as reset().
+        persistent_policies = []
+        for row in range(b):
+            policy = SlotLRU()
+            policy.resize(r, r)
+            policy.commit(initial_selected[row][initial_selected[row] < r])
+            persistent_policies.append(policy)
+        update.set_order(initial_orders)
+
+        old_key_ptr = actual_key_buffer.data_ptr()
+        old_ends_ptr = rotating.query_ends.data_ptr()
+        first_k = schedule[0][1]
+        actual_key_buffer.copy_(torch.tensor(first_k, dtype=torch.int32, device=device))
+        rotating.query_ends.copy_(
+            torch.tensor(first_k, dtype=torch.int32, device=device)[:, None].expand(b, 4)
+        )
+        # Positive poison models stale entries left beyond the active K.
+        # Each later growth step must clear the newly admitted interval, while
+        # the still-inactive suffix remains byte-for-byte untouched.
+        for row, key in enumerate(first_k):
+            rotating.mapping[row, key:].fill_(1)
+        stream.synchronize()
+        if actual_key_buffer.data_ptr() != old_key_ptr or rotating.query_ends.data_ptr() != old_ends_ptr:
+            raise AssertionError("Persistent Actual-K metadata pointer identity changed")
+
+        persistent_stages = []
+        previous_k = None
+        for stage_index, (label, new_k) in enumerate(schedule):
+            device_k = torch.tensor(new_k, dtype=torch.int32, device=device)
+            actual_key_buffer.copy_(device_k)
+            rotating.query_ends.copy_(device_k[:, None].expand(b, 4))
+            stream.synchronize()
+            if tuple(actual_key_buffer.cpu().tolist()) != tuple(new_k):
+                raise AssertionError(f"{label}: Actual-K buffer did not update")
+            if tuple(tuple(x) for x in rotating.query_ends.cpu().tolist()) != tuple((k,) * 4 for k in new_k):
+                raise AssertionError(f"{label}: QueryEnd buffer did not update")
+
+            # Snapshot current physical->baseline row map BEFORE this stage's
+            # Index Update. Native LI and the independent oracle both consume
+            # the Index cache produced by the previous stage.
+            current_map_before = update.logical.detach().cpu().numpy().astype(np.int64, copy=True)
+            oracle_reports, oracle_selected = score_oracle_for_persistent_state(
+                logical_scores, physical_order, current_map_before, new_k, r
+            )
+            fixture["actual_key"] = actual_key_buffer
+            native_selected = native_li(torch_npu, fixture).detach().cpu().reshape(b, 4, 2048).numpy()
+            for row in range(b):
+                for query in range(4):
+                    if not np.array_equal(
+                        np.sort(native_selected[row, query]),
+                        oracle_selected[row, query],
+                    ):
+                        raise AssertionError(
+                            f"{label}: Native LI differs from persistent-state score oracle "
+                            f"row={row} query={query} K={new_k[row]}"
+                        )
+
+            # verify() compares logical token IDs, not transient physical
+            # TopK row numbers. Capture the map used by this round.
+            logical_reference = np.take_along_axis(
+                current_map_before,
+                native_selected.reshape(b, -1),
+                axis=1,
+            ).reshape(b, 4, 2048)
+            reference[...] = logical_reference
+            state["before_logical"] = current_map_before.copy()
+            state["check_phase"] = "P0-A2.2b " + label
+            before_mapping = rotating.mapping.detach().cpu().numpy().copy()
+
+            # reset() is intentionally NOT called here. Only mark the next
+            # real-fetch lease as launched; graph/workspace and Index/KV persist.
+            if stage_index:
+                owner.mark_launched()
+            graph.replay()
+            stream.synchronize()
+            verify(True)
+
+            current_map_after = update.logical.detach().cpu().numpy().astype(np.int64, copy=True)
+            if any(not np.array_equal(np.sort(row), base_rows) for row in current_map_after):
+                raise AssertionError(f"{label}: Index logical map is no longer a permutation")
+            changed_rows = int(np.count_nonzero(current_map_after != current_map_before))
+            if changed_rows == 0:
+                raise AssertionError(f"{label}: Index Update did not change persistent Index state")
+
+            # Every source TopK row and every hot destination is inside [0,K).
+            # Index Update must not move state across the current actual-K edge.
+            after_mapping = rotating.mapping.detach().cpu().numpy()
+            for row, key in enumerate(new_k):
+                if not np.array_equal(current_map_after[row, key:], current_map_before[row, key:]):
+                    raise AssertionError(
+                        f"{label}: Index Update crossed actual-K boundary row={row} K={key}"
+                    )
+                if not np.array_equal(after_mapping[row, key:], before_mapping[row, key:]):
+                    raise AssertionError(
+                        f"{label}: out-of-K Mapping suffix changed row={row} K={key}"
+                    )
+
+            # Prove the complete Index tuple moved as one logical record:
+            # Key bytes, scale, DDR address and logical identity must all agree.
+            current_keys = update.inputs[0].detach().cpu().numpy()
+            expected_keys = base_index_keys[np.arange(b)[:, None], current_map_after]
+            current_scales = update.inputs[1].detach().cpu().numpy()
+            expected_scales = base_index_scales[np.arange(b)[:, None], current_map_after]
+            current_addresses = update.inputs[2].detach().cpu().numpy()
+            expected_addresses = base_index_addresses[np.arange(b)[:, None], current_map_after]
+            if not np.array_equal(current_keys, expected_keys):
+                raise AssertionError(f"{label}: Index key rows do not match persistent logical map")
+            if not np.array_equal(current_scales, expected_scales):
+                raise AssertionError(f"{label}: Index scales do not match persistent logical map")
+            if not np.array_equal(current_addresses, expected_addresses):
+                raise AssertionError(f"{label}: DDR addresses do not match persistent logical map")
+
+            # Every still-valid Hot KV slot must belong to the logical Index
+            # row at that slot; invalid slots may be refilled on this step.
+            hot_valid = rotating.hot_valid.detach().cpu().numpy().astype(bool)
+            hot_output = owner.output[:, :r].detach().cpu().numpy()
+            for row in range(b):
+                expected_hot = base_payload[row, current_map_after[row, :r][hot_valid[row]]]
+                if not np.array_equal(hot_output[row, hot_valid[row]], expected_hot):
+                    raise AssertionError(f"{label}: persistent Hot KV ownership mismatch row={row}")
+
+            read_check = actual_reads(
+                after_mapping,
+                topk.detach().cpu().numpy(),
+                rotating.rows.detach().cpu().numpy().view(np.uint32),
+                r,
+                actual_key_lengths=new_k,
+            )
+            expected_ignored = sum(h - key for key in new_k)
+            if read_check["ignored_out_of_K_mapping"] != expected_ignored:
+                raise AssertionError(
+                    f"{label}: stale out-of-K entries were consumed or overwritten "
+                    f"actual={read_check['ignored_out_of_K_mapping']} expected={expected_ignored}"
+                )
+
+            # Carry the actual LRU victim order forward to the next Decode step.
+            next_orders = []
+            for row, policy in enumerate(persistent_policies):
+                touched = state["slots"][row]
+                policy.commit(touched[touched < r].astype(np.int32))
+                order = []
+                slot = int(policy.head[0])
+                for _ in range(r):
+                    order.append(slot)
+                    slot = int(policy.next[0, slot])
+                next_orders.append(order)
+            update.set_order(next_orders)
+
+            if previous_k is not None and any(
+                new < old for old, new in zip(previous_k, new_k)
+            ):
+                raise AssertionError(f"{label}: Actual-K regressed")
+            persistent_stages.append(dict(
+                stage=label,
+                key_lengths=list(new_k),
+                newly_admitted_tokens=(
+                    [0] * b if previous_k is None
+                    else [int(new_k[i] - previous_k[i]) for i in range(b)]
+                ),
+                monotonic_growth=True,
+                graph_and_workspace_reused=True,
+                reset_between_stages=False,
+                index_kv_restored_between_stages=False,
+                native_li_independent_oracle_pass=True,
+                index_key_scale_address_permutation_pass=True,
+                index_rows_changed=changed_rows,
+                active_k_boundary_preserved=True,
+                hot_kv_ownership_pass=True,
+                topk_slot_payload_cq_pass=True,
+                out_of_k_mapping_untouched=True,
+                prefetch_requests=read_check["prefetch_hot"] + read_check["prefetch_cold"],
+                stale_out_of_k_entries=read_check["ignored_out_of_K_mapping"],
+                oracle=oracle_reports,
+            ))
+            print(
+                f"P0_A2_2B_PERSISTENT_STAGE_PASS {label}: "
+                f"K={list(new_k)} changed_index_rows={changed_rows}",
+                flush=True,
+            )
+            previous_k = tuple(new_k)
+
+        state.pop("check_phase", None)
+        final_k = (h,) * b
+        if tuple(actual_key_buffer.cpu().tolist()) != final_k:
+            raise AssertionError("Persistent Actual-K sequence did not finish at full History")
+        if tuple(tuple(x) for x in rotating.query_ends.cpu().tolist()) != tuple((h,) * 4 for _ in range(b)):
+            raise AssertionError("Persistent Actual-K final QueryEnd is not full History")
+        persistent_actual_k_report = dict(
+            status="PASS",
+            mode="monotonic_per_request_growth",
+            reset_count=1,
+            reset_between_stages=0,
+            graph_reused=True,
+            workspace_reused=True,
+            actual_key_pointer_stable=actual_key_buffer.data_ptr() == old_key_ptr,
+            query_ends_pointer_stable=rotating.query_ends.data_ptr() == old_ends_ptr,
+            index_kv_restored_between_stages=False,
+            final_key_lengths=list(final_k),
+            stages=persistent_stages,
+        )
+
     graph.reset()
     owner.graphs.remove(graph)
     forward = np.full((b, h), -1, np.int32)
@@ -1398,7 +1627,8 @@ def run_device(
         kernel="KVIP/csrc/operators/lightning_indexer_with_fetch; preserved core tiling, direct LRU interface",
         actual_key_lengths=list(key_lengths),
         dynamic_k_transition_report=dynamic_k_transition_report,
+        persistent_actual_k_report=persistent_actual_k_report,
         scope="fixed H and BSND K, Q4 shared TopK; static K for timing; "
-              "optional A2.2a same-Graph/workspace long-short-long with "
-              "Index/KV restored each stage; persistent cross-K Index not tested",
+              "optional A2.2a reset-between-K replay and A2.2b monotonic-K "
+              "persistent Index/KV/LRU replay",
     )
