@@ -580,12 +580,12 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
     LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids) {
     auto ctx=reinterpret_cast<__gm__ Context*>(pointer);auto events=reinterpret_cast<__gm__ Event*>(ctx->events);
     auto event=events+epoch*rt_serviceLanes+lane;event->core=core;event->epoch=epoch;V9_FETCH_PROFILE(event->waitBegin=GetSystemCycle();)
-    uint32_t waitPolls=0;
+    V9_FETCH_PROFILE(uint32_t waitPolls=0;)
     if(epoch) {
         auto previous=reinterpret_cast<__gm__ volatile Event*>(events)+(epoch-1)*rt_serviceLanes+lane;
         do {
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(events+(epoch-1)*rt_serviceLanes+lane),64);
-            ++waitPolls;
+            V9_FETCH_PROFILE(++waitPolls;)
         } while(!previous->complete);
     }
     V9_FETCH_PROFILE(event->pad[0]=waitPolls;event->begin=GetSystemCycle();)
@@ -823,7 +823,7 @@ __aicore__ inline void CompleteUnreachedEpoch(
     auto events = reinterpret_cast<__gm__ Event*>(ctx->events);
     auto event = events + epoch * rt_serviceLanes + lane;
     V9_FETCH_PROFILE(event->waitBegin = GetSystemCycle();)
-    uint32_t waitPolls = 0;
+    V9_FETCH_PROFILE(uint32_t waitPolls = 0;)
     if (epoch) {
         auto previous = reinterpret_cast<__gm__ volatile Event*>(events)
             + (epoch - 1) * rt_serviceLanes + lane;
@@ -831,7 +831,7 @@ __aicore__ inline void CompleteUnreachedEpoch(
             kvaf_device::CleanCacheLines(
                 reinterpret_cast<__gm__ uint8_t*>(
                     events + (epoch - 1) * rt_serviceLanes + lane), 64);
-            ++waitPolls;
+            V9_FETCH_PROFILE(++waitPolls;)
         } while (!previous->complete);
     }
     V9_FETCH_PROFILE(event->begin = GetSystemCycle();)
@@ -840,14 +840,16 @@ __aicore__ inline void CompleteUnreachedEpoch(
     event->skipped = 1;
     // No FastService ran: zero service counters, but keep candidate_count
     // semantically unknown because the skipped window was never scanned.
-    event->scanTicks = 0;
-    event->candidateTicks = 0;
-    event->postTicks = 0;
-    event->bitmapBytes = 0;
-    event->candidateCount = 0;
-    event->postedCount = 0;
-    event->pad[0] = waitPolls;
-    V9_FETCH_PROFILE(event->end = GetSystemCycle();)
+    V9_FETCH_PROFILE(
+        event->scanTicks = 0;
+        event->candidateTicks = 0;
+        event->postTicks = 0;
+        event->bitmapBytes = 0;
+        event->candidateCount = 0;
+        event->postedCount = 0;
+        event->pad[0] = waitPolls;
+        event->end = GetSystemCycle();
+    )
     // Completion means the no-op epoch is closed, NOT that a prefetch ran.
     event->complete = 1;
     kvaf_device::CleanCacheLines(
