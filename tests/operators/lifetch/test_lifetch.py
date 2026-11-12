@@ -18,9 +18,38 @@ from compare_transports import execute  # noqa: E402
 from runner import progress, supervise  # noqa: E402
 
 
+def select_supported_pipeline(parser, args):
+    """Keep one validated streaming implementation, not historical experiments."""
+    if args.optimized_resolve and getattr(args, "transport", "urma") != "urma":
+        parser.error("The integrated streaming optimization currently supports URMA only")
+    if args.optimized_resolve:
+        args.streaming = args.streaming_fetch = args.fused_final = True
+        args.prepare_update_metadata = True
+        if args.q_workers is None:
+            args.q_workers = 2
+    if args.early_fetch or args.avoid_prefetch_slots or args.legacy_fetch_layout or args.parallel_fetch_finalize:
+        parser.error("Historical early/safe/layout/finalize experiments are not included in this integration branch")
+    if args.streaming and not (args.streaming_fetch and args.fused_final and args.q_workers is not None):
+        parser.error("Use --optimized-resolve for the integrated per-query pipeline")
+
+
 def arguments(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--worker-run", type=Path, help=argparse.SUPPRESS)
+    p.add_argument("--fetch-only-compare", action="store_true", help="compare the actual Q Fetch worker with native KVAF Get")
+    p.add_argument("--early-fetch", action="store_true")
+    p.add_argument("--streaming", action="store_true", help="experimental LI/Resolver/Index streaming path")
+    p.add_argument("--streaming-fetch", action="store_true", help="submit each Q during streaming resolver")
+    p.add_argument("--legacy-fetch-layout", action="store_true")
+    p.add_argument("--parallel-fetch-finalize", action="store_true")
+    p.add_argument("--prepare-update-metadata", action="store_true")
+    p.add_argument("--optimized-resolve", action="store_true")
+    p.add_argument("--fused-final", action="store_true", help="finish fetch status in streaming kernel")
+    p.add_argument("--q-workers", type=int, choices=(1, 2, 4), default=None,
+                   help="AIV workers per query across all requests")
+    p.add_argument("--final-workers", type=int, choices=(1, 2, 4), default=None)
+    p.add_argument("--avoid-prefetch-slots", action="store_true")
+    p.add_argument("--timeout-seconds", type=int, default=300)
     p.add_argument("--device", type=int, default=0)
     p.add_argument("--kvaf-server", required=True)
     p.add_argument("--kvaf-root", type=Path)
@@ -42,6 +71,21 @@ def arguments(argv=None):
     p.add_argument("--comparison-sfa", type=Path)
     p.add_argument("--output", type=Path, default=ROOT / "tests/results/lifetch")
     a = p.parse_args(argv)
+    select_supported_pipeline(p, a)
+    if a.prepare_update_metadata and (a.q_workers is None or a.fetch_only_compare):
+        p.error("--prepare-update-metadata requires Q workers and full pipeline")
+    if a.parallel_fetch_finalize and (a.q_workers is None or a.fetch_only_compare):
+        p.error("--parallel-fetch-finalize requires Q workers and full pipeline")
+    if a.fetch_only_compare and a.q_workers != 2:
+        p.error("--fetch-only-compare requires --q-workers 2 --fused-final --streaming-fetch --streaming")
+    if a.q_workers is not None and not a.fused_final:
+        p.error("--q-workers requires --fused-final --streaming-fetch --streaming")
+    if a.fused_final and not a.streaming_fetch:
+        p.error("--fused-final requires --streaming-fetch")
+    if a.streaming_fetch and not a.streaming:
+        p.error("--streaming-fetch requires --streaming")
+    if a.streaming and (a.early_fetch or a.avoid_prefetch_slots or a.runtime_shapes or a.resolver_compare):
+        p.error("--streaming cannot be combined with early-fetch, avoid-prefetch-slots, runtime-shapes, or resolver-compare")
     if a.kvaf_root is None:
         state = ROOT / "build/dependencies.json"
         a.kvaf_root = Path(json.loads(state.read_text())["kvaf"]) if state.exists() else ROOT / "third_party/KVAF"
@@ -51,6 +95,8 @@ def arguments(argv=None):
         p.error("batches must be comma-separated integers")
     if not batches or any(not 1 <= b <= 32 for b in batches):
         p.error("batch must be 1..32")
+    if a.fetch_only_compare and any(b < 2 for b in batches):
+        p.error("--fetch-only-compare requires batch >= 2 to use both workers per query")
     if not 0 <= a.miss_percent <= 100 or a.history <= a.resident + 4:
         p.error("invalid history/resident/miss geometry")
     if a.iterations < 1 or a.warmup < 0 or a.trace_rounds < 0:
@@ -122,7 +168,7 @@ def run_urma(argv=None):
         "--worker-run",
         str(run),
     ]
-    return supervise(command, run)
+    return supervise(command, run, timeout_seconds=args.timeout_seconds)
 
 
 
@@ -133,6 +179,18 @@ def main(argv=None):
         return run_urma(argv[1:])
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--transport', required=True, choices=('urma', 'ubmem'))
+    p.add_argument('--fetch-only-compare', action='store_true')
+    p.add_argument('--early-fetch', action='store_true')
+    p.add_argument('--streaming', action='store_true')
+    p.add_argument('--streaming-fetch', action='store_true')
+    p.add_argument('--legacy-fetch-layout', action='store_true')
+    p.add_argument('--parallel-fetch-finalize', action='store_true')
+    p.add_argument('--prepare-update-metadata', action='store_true')
+    p.add_argument('--optimized-resolve', action='store_true')
+    p.add_argument('--fused-final', action='store_true')
+    p.add_argument('--q-workers', type=int, choices=(1, 2, 4))
+    p.add_argument('--final-workers', type=int, choices=(1, 2, 4))
+    p.add_argument('--avoid-prefetch-slots', action='store_true')
     p.add_argument('--device', type=int, default=0)
     p.add_argument('--kvaf-server', required=True)
     p.add_argument('--kvaf-root', type=Path)
@@ -153,14 +211,17 @@ def main(argv=None):
     p.add_argument('--comparison-output', type=Path)
     p.add_argument('--comparison-sfa', type=Path)
     p.add_argument('--output', type=Path, default=ROOT / 'tests/results/lifetch')
-    p.add_argument('--timeout-seconds', type=int, default=1800)
+    p.add_argument('--timeout-seconds', type=int, default=300)
     a = p.parse_args(argv)
+    select_supported_pipeline(p, a)
     try:
         batches = [int(x) for x in a.batches.split(',')]
     except ValueError:
         p.error('batches must be comma-separated integers')
     if not batches or any(not 1 <= x <= 32 for x in batches):
         p.error('batches must be in 1..32')
+    if a.fetch_only_compare and any(x < 2 for x in batches):
+        p.error('--fetch-only-compare requires batch >= 2 to use both workers per query')
     if (a.history <= a.resident + 4 or not 0 <= a.miss_percent <= 100 or a.warmup < 0
             or a.iterations < 1 or a.trace_rounds < 0 or not 1 <= a.intermediate_fetches <= 32
             or not 0 <= a.prefetch_tokens <= 2048 or a.prefetch_tokens % a.intermediate_fetches
@@ -175,11 +236,45 @@ def main(argv=None):
               '--resident', str(a.resident), '--index-heads', str(a.index_heads), '--miss-percent',
               str(a.miss_percent), '--prefetch-tokens', str(a.prefetch_tokens), '--warmup', str(a.warmup),
               '--iterations', str(a.iterations)]
+    if a.fetch_only_compare and (a.transport != 'urma' or a.q_workers != 2 or not a.fused_final or not a.streaming_fetch or not a.streaming):
+        p.error('--fetch-only-compare requires URMA and --streaming --streaming-fetch --fused-final --q-workers 2')
+    if a.parallel_fetch_finalize and a.transport != 'urma':
+        p.error('--parallel-fetch-finalize is an URMA experiment')
+    if a.prepare_update_metadata and (a.transport != 'urma' or a.q_workers is None or a.fetch_only_compare):
+        p.error('--prepare-update-metadata requires URMA Q workers and full pipeline')
     if a.transport == 'urma':
         command = [sys.executable, '-u', str(Path(__file__).resolve()), '--internal-urma', *common,
                    '--kvaf-root', str(kvaf_root), '--cann', a.cann, '--batches', a.batches,
                    '--intermediate-fetches', str(a.intermediate_fetches), '--trace-rounds', str(a.trace_rounds),
-                   '--output', str(a.output)]
+                   '--output', str(a.output), '--timeout-seconds', str(a.timeout_seconds)]
+        if a.optimized_resolve:
+            if not (a.streaming and a.streaming_fetch and a.fused_final and a.q_workers and a.prepare_update_metadata):
+                p.error('--optimized-resolve requires streaming, streaming-fetch, fused-final, q-workers and prepare-update-metadata')
+            command.append('--optimized-resolve')
+        if a.prepare_update_metadata:
+            command.append('--prepare-update-metadata')
+        if a.parallel_fetch_finalize:
+            if a.q_workers is None or a.fetch_only_compare:
+                p.error('--parallel-fetch-finalize requires Q workers and full pipeline')
+            command.append('--parallel-fetch-finalize')
+        if a.legacy_fetch_layout:
+            command.append('--legacy-fetch-layout')
+        if a.fetch_only_compare:
+            command.append('--fetch-only-compare')
+        if a.final_workers is not None:
+            command += ['--final-workers', str(a.final_workers)]
+        if a.early_fetch:
+            command.append('--early-fetch')
+        if a.streaming:
+            command.append('--streaming')
+        if a.streaming_fetch:
+            command.append('--streaming-fetch')
+        if a.fused_final:
+            command.append('--fused-final')
+        if a.q_workers is not None:
+            command += ['--q-workers', str(a.q_workers)]
+        if a.avoid_prefetch_slots:
+            command.append('--avoid-prefetch-slots')
         if a.soc:
             command += ['--soc', a.soc]
         if a.runtime_shapes:
@@ -191,6 +286,12 @@ def main(argv=None):
         if a.comparison_sfa:
             command += ['--comparison-sfa', str(a.comparison_sfa)]
         return subprocess.call(command)
+    if a.optimized_resolve:
+        p.error('--optimized-resolve is supported only by URMA')
+    if a.final_workers is not None:
+        p.error('--final-workers is supported only by URMA')
+    if a.early_fetch or a.avoid_prefetch_slots or a.streaming or a.streaming_fetch or a.fused_final or a.q_workers is not None:
+        p.error('--early-fetch and --avoid-prefetch-slots are supported only by URMA')
     if a.intermediate_fetches != 8:
         p.error('UBmem fixture currently supports exactly 8 windows')
     if not a.soc:
@@ -516,11 +617,19 @@ def test_ubmem_hot_resolver_actual_function_on_empty_and_populated_cache(tmp_pat
     _check_hot_resolver(tmp_path, "ubmem")
 
 
+def test_prefer_unoccupied_resolver_actual_function(tmp_path):
+    _check_hot_resolver(tmp_path, "early_safe")
+
+
+def test_baseline_prefer_unoccupied_resolver_actual_function(tmp_path):
+    _check_hot_resolver(tmp_path, "safe")
+
+
 def _check_hot_resolver(tmp_path, transport):
     """Execute production SIMT logic serially; CANN simulator covers barriers."""
     import subprocess
 
-    operator = "lightning_indexer_with_fetch" + ("_ubmem" if transport == "ubmem" else "")
+    operator = "lightning_indexer_with_fetch" + ("_ubmem" if transport == "ubmem" else "_early_safe" if transport == "early_safe" else "_safe" if transport == "safe" else "")
     kernel = ROOT / "csrc/operators" / operator / "op_kernel"
     metadata = kernel / ("controller/cache_metadata.h" if transport == "ubmem" else "prefetch.h")
 
@@ -544,7 +653,7 @@ def _check_hot_resolver(tmp_path, transport):
     functions += "\n" + function(metadata, "InitializeTailMappings")
     functions += "\n" + function(ROOT / "csrc/operators/common/lifetch/resolver_candidates.h", "SparseHash")
     functions += "\ntemplate<unsigned Threads>\n" + function(
-        ROOT / "csrc/operators/common/lifetch/resident_selection.h", "ResolveResidentPlan"
+        kernel / "resident_selection.h" if transport in ("early_safe", "safe") else common / "resident_selection.h", "ResolveResidentPlan"
     )
     resolve = function(ROOT / "csrc/operators/common/lifetch/resolver.h", "ReplicatedResolve")
     shared = (ROOT / "csrc/operators/common/lifetch/resolver_plan.h").read_text()
@@ -640,6 +749,19 @@ int main(){
  }
 }
 """.replace("FUNCTIONS", functions)
+    if transport in ("early_safe", "safe"):
+        source = source.replace(
+            "   assert(cfg[1]==0);",
+            """   assert(cfg[1]==0);
+   // The candidate prefix must use every available unoccupied LRU slot
+   // before choosing a slot whose prefetch may still be in flight.
+   bool sawOccupied=false;
+   for(unsigned i=0;i<cfg[0];++i){
+    int ordinal=reserved[slots[i]];
+    if(ordinal>=0 && unsigned(ordinal)<used)sawOccupied=true;
+    else if(ordinal>=0)assert(!sawOccupied);
+   }""",
+        )
     definitions = []
     if transport == "ubmem":
         definitions = [

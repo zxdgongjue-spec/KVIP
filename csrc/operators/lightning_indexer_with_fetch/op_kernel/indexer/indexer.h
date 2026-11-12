@@ -33,6 +33,8 @@ using AscendC::CacheMode;
 using AscendC::CrossCoreSetFlag;
 using AscendC::CrossCoreWaitFlag;
 
+enum class SequenceLiPhase { Hot, Threshold, Cold, Final };
+
 // 由于S2循环前，RunInfo还没有赋值，使用TempLoopInfo临时存放B、N、S1轴相关的信息；同时减少重复计算
 struct TempLoopInfo {
     uint32_t bN2Idx = 0;
@@ -62,6 +64,8 @@ public:
                                 __gm__ uint8_t *sparseIndices,
                                 __gm__ uint8_t *workspace, const QLITilingData *__restrict tiling, TPipe *tPipe);
     __aicore__ inline void Process();
+    template <SequenceLiPhase Phase>
+    __aicore__ inline void ProcessSequenceSplit();
 
     // =================================类型定义区=================================
     using Q_T = typename QLIT::queryType;
@@ -83,6 +87,8 @@ public:
     uint32_t resident_=0;
 public:
     rotating::RuntimeShape runtimeShape_;
+    bool sequenceSplit_ = false;
+    bool sequenceTopKOnly_ = false;
 private:
     static constexpr uint32_t HEAD_DIM = 128;
     static constexpr uint32_t K_HEAD_NUM = 1;
@@ -136,6 +142,8 @@ protected:
     __aicore__ inline uint32_t GetS2BaseBlockNumOnMask(uint32_t s1gIdx, uint32_t actS1Size, uint32_t actS2SizeOrig);
     // ================================Process functions================================
     __aicore__ inline void ProcessMain();
+    __aicore__ inline void ScanSequenceHalf(uint32_t begin, uint32_t end, uint32_t shard,
+                                           uint32_t& loop, uint32_t& scaleLoop, bool last);
     __aicore__ inline void ProcessBaseBlock(uint32_t loop, uint64_t s2LoopIdx,
                                             QLICommon::RunInfo runInfo, uint32_t qScaleLoop, uint32_t kScaleLoop);
     __aicore__ inline void ProcessInvalid();
@@ -187,14 +195,14 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::InitTilingData(const Q
         constInfo.s1BaseSize /= 2;
     }
 
-    constInfo.setL2DisableFlag = constInfo.tSize / constInfo.batchSize <= constInfo.s1BaseSize;
+    constInfo.setL2DisableFlag = !sequenceSplit_ && constInfo.tSize / constInfo.batchSize <= constInfo.s1BaseSize;
 }
 
 template <typename QLIT>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::InitBuffers()
 {
     if ASCEND_IS_AIV {
-        vectorService.InitBuffers(pipe);
+        vectorService.InitBuffers(pipe, sequenceTopKOnly_);
     } else {
         matmulService.InitBuffers(pipe);
     }
@@ -430,7 +438,13 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Init(__gm__ uint8_t *q
     InitActualSeqLen(actualSeqLengthsQ, actualSeqLengthsK);
 
     // 获取分核信息
-    SplitCore(aiCoreIdx, usedCoreNum, splitCoreInfo);
+    if (sequenceSplit_) {
+        splitCoreInfo.bN2Start = aiCoreIdx / 2;
+        splitCoreInfo.bN2End = splitCoreInfo.bN2Start;
+        splitCoreInfo.s2End = constInfo.kSeqSize / constInfo.s2BaseSize - 1;
+    } else {
+        SplitCore(aiCoreIdx, usedCoreNum, splitCoreInfo);
+    }
 
     pipe = tPipe;
 
@@ -439,11 +453,12 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Init(__gm__ uint8_t *q
     GlobalTensor<SCORE_T> scoreGm; // 存放vec核写出的score
     uint64_t singleCoreScoreSize = constInfo.s1BaseSize * QLICommon::Align((uint64_t)constInfo.kSeqSize,
                                     (uint64_t)constInfo.s2BaseSize)  * sizeof(SCORE_T);
-    scoreGm.SetGlobalBuffer((__gm__ SCORE_T *)(workspace + aiCoreIdx * singleCoreScoreSize));
+    uint32_t scoreRow = sequenceSplit_ ? aiCoreIdx / 2 : aiCoreIdx;
+    scoreGm.SetGlobalBuffer((__gm__ SCORE_T *)(workspace + scoreRow * singleCoreScoreSize));
     offset += GetBlockNum() * singleCoreScoreSize;
 
     if ASCEND_IS_AIV {
-        vectorService.InitParams(constInfo, tiling);
+        vectorService.InitParams(constInfo, tiling, sequenceTopKOnly_);
         indiceOutGm.SetGlobalBuffer((__gm__ int32_t *)sparseIndices);
         weightsGm.SetGlobalBuffer((__gm__ W_T *)weights);
         qScaleGm.SetGlobalBuffer((__gm__ SCALE_T *)queryScale);
@@ -631,6 +646,93 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessInvalid()
         }
     }
 }
+
+#if !defined(V9_UBMEM) || !V9_UBMEM
+template <typename QLIT>
+__aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
+    uint32_t begin, uint32_t end, uint32_t shard, uint32_t& loop, uint32_t& scaleLoop, bool last)
+{
+    splitCoreInfo.s2Start = begin;
+    tempLoopInfo.s2LoopEnd = end - 1;
+    tempLoopInfo.validS2Len = end * S2_BASE_SIZE;
+    for (uint32_t tile = begin; tile < end; ++tile, ++loop) {
+        if ((tile - begin) % 16 == 0) ++scaleLoop;
+        QLICommon::RunInfo info;
+        CalcRunInfo(loop, tile, info, 0, scaleLoop);
+        info.isFirstS2InnerLoop = loop == 0;
+        info.isLastS2InnerLoop = last && tile + 1 == end;
+        if ASCEND_IS_AIC {
+            matmulService.ComputeMm1(info);
+        } else {
+            vectorService.ProcessVec1(info, shard, tile + 1 == end);
+        }
+    }
+}
+
+template <typename QLIT>
+template <SequenceLiPhase Phase>
+__aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
+{
+    uint32_t batch = splitCoreInfo.bN2Start;
+    uint32_t shard = aiCoreIdx % 2;
+    CalcGS1LoopParams(batch);
+    CalcS2LoopParams(batch, 0);
+
+    if constexpr (Phase == SequenceLiPhase::Threshold || Phase == SequenceLiPhase::Final) {
+        if ASCEND_IS_AIV {
+            vectorService.AllocEventID();
+            QLICommon::RunInfo info;
+            CalcRunInfo(0, 0, info, 0, 0);
+            if constexpr (Phase == SequenceLiPhase::Threshold) {
+                vectorService.ProcessResidentTopK(info, tmpBlockIdx % SIM_Q);
+            } else {
+                vectorService.ProcessTopK(info, tmpBlockIdx % SIM_Q);
+            }
+            vectorService.FreeEventID();
+        }
+    } else {
+        if ASCEND_IS_AIV {
+            vectorService.AllocEventID();
+            CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT);
+            CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + 1);
+        } else {
+            matmulService.AllocEventID();
+        }
+
+        uint32_t loop = 0, scaleLoop = 0;
+        if constexpr (Phase == SequenceLiPhase::Hot) {
+            uint32_t half = resident_ / (2 * S2_BASE_SIZE);
+            ScanSequenceHalf(shard * half, (shard + 1) * half, shard, loop, scaleLoop, true);
+        } else {
+            uint32_t halfTokens = rotating::SequenceHalfWindow(runtimeShape_);
+            uint32_t half = halfTokens / S2_BASE_SIZE;
+            uint32_t serviceEpoch = rotating::ServiceRank(runtimeShape_.batch, runtimeShape_.splitQ,
+                                                          aiCoreIdx) / runtimeShape_.serviceAics;
+            if ASCEND_IS_AIV {
+                vectorService.LoadSequenceSplitThresholds(batch);
+                vectorService.PrepareRotationProgress();
+                if (serviceEpoch == 0) vectorService.RotateFetch(0, halfTokens);
+            }
+            uint32_t begin = resident_ / S2_BASE_SIZE + shard * half;
+            for (uint32_t epoch = 1; epoch < runtimeShape_.rounds; ++epoch, begin += 2 * half) {
+                ScanSequenceHalf(begin, begin + half, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
+                if ASCEND_IS_AIV {
+                    if (serviceEpoch == epoch) vectorService.RotateFetch(epoch, halfTokens);
+                }
+            }
+        }
+
+        if ASCEND_IS_AIV {
+            vectorService.FreeEventID();
+        } else {
+            matmulService.FreeEventID();
+            CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT);
+            CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT + 1);
+        }
+    }
+}
+
+#endif
 
 template <typename QLIT>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()

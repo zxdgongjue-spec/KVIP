@@ -10,13 +10,12 @@ from device_trace import collect_core, core_summary
 from index_update import DirectCacheUpdate, permutation_records
 from kvip.operators.lifetch.forward import LIFetchForward
 from kvip.runtime.loader import load_lifetch_library
-from prefetch_audit import actual_reads, completion_failures
+from prefetch_audit import actual_reads, completion_failures, score_rows, selected_bounds
 from runner import progress
 
 ROOT = Path(__file__).resolve().parents[4]
 SOURCE = ROOT / "csrc/operators/lightning_indexer_with_fetch"
 NATIVE_BITMAP_WORDS = 4176
-AUTO_CORE_TRACE_ROUNDS = 3
 
 
 def prepare_native_bitmap(torch, native):
@@ -31,6 +30,7 @@ def seed_native_bitmap(torch, native, row, bitmap):
 
 
 def run(args, run_dir):
+    source = (SOURCE.with_name(SOURCE.name + "_streaming_qworkers") if args.streaming else SOURCE)
     from attention import check_sfa
     from contract_payload import payload
     from kvip.operators.lifetch import binding as launch_module
@@ -92,7 +92,7 @@ def run(args, run_dir):
         )
         folder = run_dir / f"case{case}-b{batch}-prototype-graph"
         folder.mkdir()
-        stage = "LIFetch build"
+        stage = "fixture preparation"
         progress(run_dir, f"BS={batch}: {stage}; logs={folder}")
         with native_log(folder / "native.log"):
             common, data, build = (folder / "fixture", folder / "input", shared_build)
@@ -110,12 +110,17 @@ def run(args, run_dir):
                 ASCEND_CANN_PACKAGE_PATH=args.cann,
                 KVAF_INCLUDE=find_headers(args.kvaf_root),
             )
+            if getattr(args, "optimized_resolve", False):
+                options.update(KVIP_FUSE_QUERY_WORK="ON", KVIP_OUTPUT_WORKER="ON")
             if not shared_build.exists():
+                progress(run_dir, f"BS={batch}: COMPILE LIFetch; logs={folder}")
                 command(
-                    ["cmake", "-S", SOURCE, "-B", build, *[f"-D{k}={v}" for k, v in options.items()]],
+                    ["cmake", "-S", source, "-B", build, *[f"-D{k}={v}" for k, v in options.items()]],
                     folder / "configure.log",
                 )
                 command(["cmake", "--build", build, "-j2"], folder / "build.log")
+            else:
+                progress(run_dir, f"BS={batch}: REUSE LIFetch build={shared_build.resolve()}; logs={folder}")
             import hashlib
 
             # Fail before allocating/populating DDR if shared dependencies cannot load.
@@ -129,7 +134,12 @@ def run(args, run_dir):
                 run_dir,
                 f"UNIVERSAL binary_sha256={digest} batch={batch} H={history} R={resident} G={heads} windows={windows}",
             )
-            workers = (batch * (final_aivs(batch, "auto", aics, 0) + 1) + 1) // 2
+            queue_views = batch * (final_aivs(batch, "auto", aics, args.final_workers or 0) + 1)
+            if args.q_workers:
+                # Two contiguous private Jettys for each (Q, worker), after the
+                # prefetch pairs; the original final views may be reused.
+                queue_views = max(queue_views, 2 * batch + 8 * args.q_workers)
+            workers = (queue_views + 1) // 2
             progress(run_dir, f"BS={batch}: DDR Put and transport initialization; logs={folder}")
             owner = Owner.open(
                 torch,
@@ -164,6 +174,7 @@ def run(args, run_dir):
                     fixture=fixture_info,
                     resources=resources,
                     resource_geometry=geometry,
+                    final_workers=final_aivs(batch, "auto", aics, args.final_workers or 0),
                     build_options={k: str(v) for k, v in options.items()},
                 )
                 (folder / "report.json").write_text(json.dumps(report, indent=2))
@@ -172,6 +183,30 @@ def run(args, run_dir):
                 raise
             finally:
                 owner.close()
+        if args.fetch_only_compare:
+            lines = [f"BS={batch} Fetch-only graph: exact fused Q worker; native descriptors prepacked outside timing; byte checks PASS.",
+                     "query | AIV | jetty/AIV | entries | safe/conflict | bytes | native p50/p99 us | native GB/s | fused p50/p99 us | fused GB/s | change"]
+            results = report['fetch_only']
+            for query in ('Q1', 'Q2', 'Q3', 'Q4', 'Q4_all'):
+                old = next(r for r in results if r['query'] == query and r['version'] == 'native')
+                new = next(r for r in results if r['query'] == query and r['version'] == 'fused')
+                delta = (new['p50_us'] / old['p50_us'] - 1) * 100
+                native_bw = f"{old['effective_GBps']:.2f}" if old['effective_GBps'] is not None else '--'
+                fused_bw = f"{new['effective_GBps']:.2f}" if new['effective_GBps'] is not None else '--'
+                lines.append(f"{query} | {old['aiv']} | 2 | {old['count']} | {old['safe_count']}/{old['conflict_count']} | {old['bytes']} | "
+                             f"{old['p50_us']:.3f}/{old['p99_us']:.3f} | {native_bw} | "
+                             f"{new['p50_us']:.3f}/{new['p99_us']:.3f} | {fused_bw} | {delta:+.2f}%")
+            for r in results:
+                lines.extend(r.get('stages', []))
+                if r['version'] == 'fused_before':
+                    after = next(x for x in results if x['query'] == r['query'] and x['version'] == 'fused')
+                    lines.append(f"FIX A/B {r['query']}: before={r['p50_us']:.3f} after={after['p50_us']:.3f} us change={(after['p50_us']/r['p50_us']-1)*100:+.2f}%")
+            lines.append('Q1-Q4 are individual queries; Q4_all runs all four concurrently. Zero-entry cases measure launch/control only.')
+            line = '\n'.join(lines)
+            summaries.append(line)
+            (run_dir / 'cases.log').write_text('\n'.join(summaries) + '\n')
+            print(line, flush=True)
+            continue
         if args.resolver_compare:
             from resolver import summary
 
@@ -182,7 +217,7 @@ def run(args, run_dir):
             continue
         times = report["timing"]
         line = (
-            f"binary_sha256={built_digest}\nBS={batch} prototype PASS index_heads={args.index_heads} windows={geometry['intermediate_fetches']} requested_windows={args.intermediate_fetches} history={args.history} hot={args.resident} topk=2048 Q=4 graph=True\n"
+            f"binary_sha256={built_digest} early_fetch={args.early_fetch} streaming={args.streaming} q_workers={args.q_workers}\nBS={batch} prototype PASS index_heads={args.index_heads} windows={geometry['intermediate_fetches']} requested_windows={args.intermediate_fetches} history={args.history} hot={args.resident} topk=2048 Q=4 graph=True\n"
             + "graph_p50_us="
             + ", ".join((f"{k}:{v['p50_us']:.3f}" for k, v in times.items()))
             + f"\ncore_speedup={times['native_chain']['p50_us'] / times['prototype_core']['p50_us']:.3f}x"
@@ -197,6 +232,10 @@ def run(args, run_dir):
         )
         native_reads = sum(report["native_misses_per_request"])
         line += f"\nactual_reads native: total={native_reads} unused=0 (final selected misses)"
+        for label, samples in report.get("split_samples", {}).items():
+            ranges = {key: [min(x[key] for x in samples), max(x[key] for x in samples)]
+                      for key in ("final_reads", "nonconflicting_reads", "conflicting_reads")}
+            line += f"\nfinal_split {label}: min_max=" + json.dumps(ranges)
         for label, samples in report.get("read_samples", {}).items():
             ranges = {key: [min(row[key] for row in samples), max(row[key] for row in samples)] for key in samples[0]}
             line += f"\nactual_reads {label}: min_max=" + json.dumps(ranges)
@@ -294,9 +333,12 @@ def run_device(
         state["native_misses"] = counts[:-1]
 
     core_trace = {}
+    full_trace = {}
     read_samples = {}
+    split_samples = {}
 
     def measure(call, reset, check, trace_core=False, read_label=None):
+        state["check_phase"] = f"timing {read_label or getattr(call, '__name__', 'operation')}"
         reset()
         call()
         stream.synchronize()
@@ -324,6 +366,7 @@ def run_device(
                 samples.append(start.elapsed_time(end) * 1000)
             check()
             if read_label and step >= args.warmup:
+                split_samples.setdefault(read_label, []).append(dict(state["completion"]))
                 read_samples.setdefault(read_label, []).append(
                     actual_reads(
                         rotating.mapping.cpu().numpy(),
@@ -342,10 +385,26 @@ def run_device(
             save(args.comparison_output, state["ids"], state["slots"], owner.output.cpu().numpy(),
                  rotating.mapping.cpu().numpy(), rotating.lru_slots.cpu().numpy(),
                  rotating.rows.cpu().numpy().view(np.uint32), owner.remote_token_addresses.cpu().numpy())
-        if trace_core:
-            core_trace.update(
-                collect_core(torch, rotating, graph, reset, check, args.trace_rounds or AUTO_CORE_TRACE_ROUNDS, folder)
-            )
+        if read_label == "prototype_with_update" and args.trace_rounds:
+            progress(folder.parent, f"BS={b}: full graph profiler ({args.trace_rounds} replays); logs={folder}")
+            if args.streaming:
+                pipeline.set_diagnostics(True)
+                stream.synchronize()
+            def trace_reset():
+                reset()
+                if args.streaming:
+                    pipeline.times.zero_()
+            try:
+                full_trace.update(collect_core(torch, rotating, graph, trace_reset, check, args.trace_rounds, folder,
+                                               full=True, diagnostics=pipeline.diagnostic_cycles if args.streaming else None,
+                                               fused_final=args.fused_final))
+            finally:
+                if args.streaming:
+                    pipeline.set_diagnostics(False)
+                    stream.synchronize()
+        if trace_core and args.trace_rounds:
+            progress(folder.parent, f"BS={b}: core graph profiler ({args.trace_rounds} replays); logs={folder}")
+            core_trace.update(collect_core(torch, rotating, graph, reset, check, args.trace_rounds, folder))
         graph.reset()
         owner.graphs.remove(graph)
         return dict(p50_us=float(np.median(samples)), p99_us=float(np.percentile(samples, 99)), samples=len(samples))
@@ -355,6 +414,10 @@ def run_device(
     stream.synchronize()
     native_check()
     timings = {"native_chain": measure(native_call, native.reset, native_check)}
+    # The previous native chain has prepared stable LIDU descriptors and maps.
+    # Restore only the output so that the captured graph contains KVAF Get alone.
+    timings["native_get_only"] = measure(
+        native.fetch, lambda: native.output.copy_(native.initial_payload), native_check)
     reference = state["native_topk"].cpu().reshape(b, 4, 2048).numpy()
     owner.acquire()
     rotating = launch_module.LIFetchBinding(
@@ -367,6 +430,7 @@ def run_device(
         resident=r,
         aic_count=aics,
         intermediate_fetches=args.intermediate_fetches,
+        final_workers=args.final_workers or 0,
         prefetch_limit=args.prefetch_tokens,
         output_stride=owner.output.shape[1],
         row_owners=torch.arange(b, dtype=torch.int32, device=device) if args.resolver_compare else None,
@@ -389,7 +453,20 @@ def run_device(
         locations=rotating.locations,
         rotating=rotating,
     )
-    pipeline = LIFetchForward(rotating, update)
+    if args.streaming:
+        from streaming_forward import StreamingForward
+        pipeline = StreamingForward(rotating, update, torch, args.prefetch_tokens, fused_final=args.fused_final, q_workers=args.q_workers)
+        pipeline.legacy_layout = args.legacy_fetch_layout
+        pipeline.parallel_finalize = args.parallel_fetch_finalize
+        pipeline.prepare_metadata = args.prepare_update_metadata
+        pipeline.set_diagnostics(False)
+    else:
+        pipeline = LIFetchForward(rotating, update)
+    counter_clock_mhz = (pipeline.calibrate_counter_mhz()
+                         if args.streaming and args.q_workers and not args.fetch_only_compare else None)
+    if counter_clock_mhz is not None:
+        pipeline.counter_clock_mhz = counter_clock_mhz
+        print(f"GetSystemCycle calibration: {counter_clock_mhz:.2f} MHz (independent long graph event)", flush=True)
     saved = [arguments[i].clone() for i in (1, 4, 13)]
 
     def reset():
@@ -418,8 +495,19 @@ def run_device(
         if failures:
             phase = state.get("check_phase", "graph replay")
             path = folder / "completion_failure.json"
-            path.write_text(json.dumps(dict(phase=phase, requests=failures), indent=2))
+            try:
+                bounds = selected_bounds(topk.cpu().numpy(), h)
+            except Exception as exc:
+                bounds = dict(error=f"{type(exc).__name__}: {exc}")
+            try:
+                scores = score_rows(arguments[12][:4 * h * 2].cpu().numpy(), h)
+            except Exception as exc:
+                scores = dict(error=f"{type(exc).__name__}: {exc}")
+            path.write_text(json.dumps(dict(phase=phase, requests=failures, selected_bounds=bounds,
+                                            first_request_score_rows=scores), indent=2))
             print(f"COMPLETION FAILURE: phase={phase}; first={json.dumps(failures[0])}; full={path}", flush=True)
+            print(f"LI OUTPUT BOUNDS: {json.dumps(bounds)}", flush=True)
+            print(f"LI SCORE WORDS request=0: {json.dumps(scores)}", flush=True)
             raise AssertionError(
                 f"completion failed phase={phase}; bad_requests={len(failures)}; "
                 f"first={json.dumps(failures[0])}; full={path}"
@@ -486,10 +574,48 @@ def run_device(
                             slot_owner=changes[ordinal] if ordinal >= 0 else None,
                         )
                     )
+                if args.streaming_fetch:
+                    from streaming_fetch_diagnostics import summarize_mismatches
+                    report = summarize_mismatches(
+                        row, selected[row], ids[row], slots[row].numpy(), output[row].numpy(),
+                        owner.session.cpu_payload[row].numpy(), rotating.destinations.cpu().numpy(),
+                        rotating.fallback_addresses.cpu().numpy(), posts[row], lru,
+                        rotating.mapping[row].cpu().numpy(), owner.output.shape[1], r,
+                        owner.remote_token_addresses[row].cpu().numpy())
+                    report["phase"] = state.get("check_phase", "unknown")
+                    report["initial_output_matches"] = [
+                        bool(torch.equal(owner.initial_output[row, item["slot"]].cpu(),
+                                         owner.session.cpu_payload[row, item["expected_token"]]))
+                        for item in report["examples"]
+                    ]
+                    report_path = folder / "streaming_fetch_kv_mismatch.json"
+                    report_path.write_text(json.dumps(report, indent=2) + "\n")
+                    try:
+                        from streaming_fetch_diagnostics import audit_queue_writes
+                        destinations = rotating.destinations.cpu().numpy().reshape(-1)
+                        remote = rotating.fallback_addresses.cpu().numpy().reshape(-1).view(np.uint64)
+                        report["actual_sq_writers"], report["final_wqe_comparison"] = audit_queue_writes(
+                            owner, rows, posts, row, [item["slot"] for item in report["examples"]],
+                            destinations, remote, q_workers=args.q_workers)
+                    except Exception as exc:
+                        report["sq_audit_error"] = f"{type(exc).__name__}: {exc}"
+                    report_path.write_text(json.dumps(report, indent=2) + "\n")
+                    print(f"STREAMING FETCH KV AUDIT: {json.dumps(report)}; details={report_path}", flush=True)
                 raise AssertionError(
                     f"KV byte mismatch: batch={row} mismatched_tokens={int(mismatches.sum())} examples={details}"
                 )
         state["ids"], state["slots"] = (ids, slots.numpy())
+
+    def verify_all_valid_hot():
+        """Catch stale KV beyond the current TopK, including displaced slots."""
+        valid = rotating.hot_valid.cpu().numpy().reshape(b, r)
+        logical = update.logical.cpu().long()
+        hot_kv = owner.output[:, :r].cpu()
+        for row in range(b):
+            mask = torch.from_numpy(valid[row] != 0)
+            expected = owner.session.cpu_payload[row, logical[row, :r][mask]]
+            if not torch.equal(hot_kv[row, mask], expected):
+                raise AssertionError(f"valid hot slot has mismatched Index/KV owner: request={row}")
 
     if args.resolver_compare:
         from resolver import run
@@ -557,6 +683,54 @@ def run_device(
     restored_hot = hot_case["hot_changes"]
     if not hot_case["first_window_fetches"] or not restored_hot:
         raise AssertionError(f"First window did not Fetch former hot candidates into LRU slots: {hot_case}")
+
+    if args.streaming_fetch and args.q_workers is None:
+        # Same per-Q descriptors, with Q4 publication as the submission boundary.
+        # This runs only for correctness diagnosis, outside graph measurements.
+        state["check_phase"] = "streaming per-Q packing with deferred fetch"
+        reset()
+        pipeline.set_deferred_fetch(True)
+        try:
+            full()
+            stream.synchronize()
+            verify(True)
+            verify_all_valid_hot()
+            (folder / "streaming_isolation.log").write_text("PASS: per-Q packing with deferred fetch\n")
+            print("STREAMING ISOLATION PASS: per-Q packing, deferred fetch", flush=True)
+        finally:
+            pipeline.set_deferred_fetch(False)
+
+    if args.streaming:
+        # The standalone checks above use the baseline resolver/update. Exercise
+        # the actual streaming graph path as well, including the victim case.
+        streaming_checks = [("regular", initial_orders, False), ("hot-victim-collision", unlucky, False)]
+        if args.q_workers is not None:
+            streaming_checks.append(("cold-start", initial_orders, True))
+        for label, orders, cold_start in streaming_checks:
+            state["check_phase"] = f"streaming {label}"
+            print(f"STREAMING CHECK START {label}: resolver_cores/request={pipeline.resolver_cores}; "
+                  f"total_AIV={pipeline.resolver_cores*b+4*(args.q_workers or 0)}", flush=True)
+            reset()
+            update.set_order(orders)
+            if cold_start:
+                rotating.hot_valid.zero_()
+            full()
+            stream.synchronize()
+            verify(True)
+            verify_all_valid_hot()
+            print(f"STREAMING CHECK PASS {label}: selected KV and all valid hot KV/Index match", flush=True)
+
+    if args.fetch_only_compare:
+        # Capture a regular real resolver snapshot. Prefetch has completed;
+        # the isolated comparison intentionally excludes LI and CQ join.
+        state["check_phase"] = "fetch-only snapshot"
+        reset()
+        full()
+        stream.synchronize()
+        verify(True)
+        verify_all_valid_hot()
+        from fetch_only_ab import run as run_fetch_only
+        return dict(status="pass", fetch_only=run_fetch_only(torch, owner, rotating, pipeline, args))
 
     def init_reset():
         reset()
@@ -635,6 +809,8 @@ def run_device(
         graph.replay()
         stream.synchronize()
         verify(True)
+        if args.streaming:
+            verify_all_valid_hot()
         for row, p in enumerate(policies):
             touched = state["slots"][row]
             p.commit(touched[touched < r].astype(np.int32))
@@ -669,9 +845,12 @@ def run_device(
                     output_path=args.comparison_sfa)
     return dict(
         status="pass",
+        counter_clock_mhz=counter_clock_mhz,
         timing=timings,
         core_trace=core_trace,
+        full_trace=full_trace,
         read_samples=read_samples,
+        split_samples=split_samples,
         sfa=sfa,
         stateful_rounds=3,
         native_misses_per_request=state["native_misses"],
@@ -693,7 +872,8 @@ def run_device(
             prefetch_tokens=args.prefetch_tokens,
             former_hot_changes_checked=restored_hot,
             first_window_fetches_checked=hot_case["first_window_fetches"],
-            scope="Producer records include final hot fallback; no temporary KV slots; zero KV copy",
+            scope=("Standalone update counters use baseline resolver, not streaming; " if args.streaming else "")
+            + "Producer records include final hot fallback; no temporary KV slots; zero KV copy",
         ),
         kernel="KVIP/csrc/operators/lightning_indexer_with_fetch; preserved core tiling, direct LRU interface",
         scope="fixed Q4 shared history; graph kernel and AIV maintenance separately; no ABC growth",
