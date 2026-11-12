@@ -152,6 +152,24 @@ The original LIDU build uses its own `csrc/operators/lidu/build` directory.
 
 ## Verify
 
+For a completed schema-4 score trajectory, survey all analysis rounds on CPU:
+
+```bash
+PYTHONPATH=python python -m kvip.diagnostics.threshold_survey \
+    --root /path/to/trace --result-dir /path/to/new-survey \
+    --expect-dp 0 1 2 3 4 5 6 7 --expect-rounds 101 --expect-layers 78 --workers 4
+```
+
+Round 1 supplies previous-TopK seeds; rounds 2–101 supply statistics. The survey
+checks archive hashes and saved scores, then exports request/query details,
+per-round/per-layer miss rates and miss-rate bins. Observed unused prefetch is
+reported separately from uncapped candidate estimates for the resident initial
+threshold, a current-query rescored resident/previous-TopK union, and rolling
+16K-prefix thresholds. Estimates freeze the original cache state; they are not
+new transport measurements or speedup claims. No NPU, model service or build is
+required. Shared-layer bytes are split only in layer tables; totals count each
+group once. Terminal byte rates use 656-byte token equivalents.
+
 CPU contract and source checks:
 
 ```bash
