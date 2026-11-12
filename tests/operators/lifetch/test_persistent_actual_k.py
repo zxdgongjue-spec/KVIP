@@ -88,3 +88,11 @@ def test_state_oracle_rejects_boundary_ties():
         score_oracle_for_persistent_state(
             scores, order, current, (2048,), 2048
         )
+
+
+def test_cli_wires_persistent_actual_k_mode():
+    root = Path(__file__).resolve().parents[3]
+    cli = (root / "tests/operators/lifetch/test_lifetch.py").read_text()
+    assert cli.count('add_argument("--actual-k-persistent-check"') == 2
+    assert "common.append('--actual-k-persistent-check')" in cli
+    assert "persistent_growth_schedule" in cli

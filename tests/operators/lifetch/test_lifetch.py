@@ -18,6 +18,7 @@ from compare_transports import execute  # noqa: E402
 from runner import progress, supervise  # noqa: E402
 from actual_k_admission import parse_actual_key_lengths  # noqa: E402
 from actual_k_transitions import transition_schedule  # noqa: E402
+from persistent_actual_k import persistent_growth_schedule  # noqa: E402
 
 
 def arguments(argv=None):
@@ -42,6 +43,8 @@ def arguments(argv=None):
                    help="P0-A2: CSV of per-request actual K within fixed History")
     p.add_argument("--actual-k-transition-check", action="store_true",
                    help="P0-A2.2a: same-Graph long-short-long K; reset Index/KV baseline each round")
+    p.add_argument("--actual-k-persistent-check", action="store_true",
+                   help="P0-A2.2b: monotonic K growth with Index/KV/LRU preserved between rounds")
     p.add_argument("--resolver-compare", action="store_true")
     p.add_argument("--trace-rounds", type=int, default=3)
     p.add_argument("--miss-percent", type=float, default=10)
@@ -90,6 +93,18 @@ def arguments(argv=None):
             p.error("--actual-k-transition-check needs actual K and Active-K clear")
         try:
             transition_schedule(
+                parse_actual_key_lengths(a.actual_key_lengths, batches[0], a.history, a.resident),
+                a.history, a.resident,
+            )
+        except (ValueError, TypeError) as exc:
+            p.error(str(exc))
+    if a.actual_k_persistent_check:
+        if a.actual_k_transition_check:
+            p.error("--actual-k-persistent-check is mutually exclusive with --actual-k-transition-check")
+        if not a.actual_key_lengths or not a.active_k_map_clear or not a.native_union_fit:
+            p.error("--actual-k-persistent-check needs actual K, Native union admission and Active-K clear")
+        try:
+            persistent_growth_schedule(
                 parse_actual_key_lengths(a.actual_key_lengths, batches[0], a.history, a.resident),
                 a.history, a.resident,
             )
@@ -217,6 +232,8 @@ def main(argv=None):
                    help="P0-A2: CSV of per-request actual K within fixed History")
     p.add_argument("--actual-k-transition-check", action="store_true",
                    help="P0-A2.2a: same-Graph long-short-long K; reset Index/KV baseline each round")
+    p.add_argument("--actual-k-persistent-check", action="store_true",
+                   help="P0-A2.2b: monotonic K growth with Index/KV/LRU preserved between rounds")
     p.add_argument('--resolver-compare', action='store_true', help='URMA resolver comparison')
     p.add_argument('--comparison-output', type=Path)
     p.add_argument('--comparison-sfa', type=Path)
@@ -297,6 +314,8 @@ def main(argv=None):
         except (ValueError, TypeError) as exc:
             p.error(str(exc))
         common.append('--actual-k-transition-check')
+    if a.actual_k_persistent_check:
+        common.append('--actual-k-persistent-check')
     if a.actual_key_lengths:
         if not a.native_union_fit:
             p.error('--actual-key-lengths requires --native-union-fit')
