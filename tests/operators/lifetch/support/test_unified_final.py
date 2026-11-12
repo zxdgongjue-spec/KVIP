@@ -140,3 +140,19 @@ def test_ubmem_profile_finishes_schedule_and_keeps_incomplete_trace(tmp_path, mo
     saved = json.loads((tmp_path / 'attribution.json').read_text())
     assert all('error' in sample['accounting'] for sample in saved)
     assert capsys.readouterr().out.count('UBMEM_TRACE_ERROR') == 2
+
+
+def test_ubmem_trace_counts_sequence_phase_and_dispatch_suffixes():
+    events = [dict(name='replay', ph='X', ts=1000, dur=100)]
+    for name, start, duration in (
+        ('kvip_ubmem_656_init_kernel_0', 1001, 3),
+        ('kvip_ubmem_656_li_kernel_0', 1005, 10),
+        ('kvip_ubmem_656_li_kernel_1_0', 1016, 5),
+        ('kvip_ubmem_656_li_kernel_2_0', 1022, 20),
+        ('kvip_ubmem_656_li_kernel_3_0', 1043, 7),
+        ('v9_streaming_resolve_update_656_0', 1051, 30),
+    ):
+        events.append(dict(name=name, ph='X', ts=start, dur=duration, cat='kernel'))
+    result = account_ubmem(events, 'replay', 85)
+    assert result['stages_us']['li'] == 42
+    assert result['inter_kernel_gap_us'] == 5

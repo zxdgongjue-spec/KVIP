@@ -232,8 +232,8 @@ def account_ubmem(events, name, elapsed):
             continue
         kernel = str(event.get("name", "")).lower()
         category = str(event.get("cat") or "").lower()
-        match = re.fullmatch(r"kvip_ubmem_(?:656|2624)_(init|li|resolve|fetch|complete)_kernel(?:_\d+)?", kernel)
-        update = re.fullmatch(r"kvip_ubmem_direct_(update_owned|update_outputs|apply_owned)_kernel(?:_\d+)?", kernel)
+        match = re.fullmatch(r"kvip_ubmem_(?:656|2624)_(init|li|resolve|fetch|complete)_kernel(?:_\d+)*", kernel)
+        update = re.fullmatch(r"kvip_ubmem_direct_(update_owned|update_outputs|apply_owned)_kernel(?:_\d+)*", kernel)
         streaming = re.fullmatch(r"v9_streaming_resolve_update_(?:656|2624)(?:_\d+)?", kernel)
         if not match and not update and not streaming:
             if "kvip_ubmem" in kernel and len(examples) < 12:
@@ -325,3 +325,36 @@ def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder, streami
               + f" fetch_separate={account['fetch_separate']} prefetch={sample['prefetch']} final={sample['final']}",
               flush=True)
     print(f"UBMEM_TRACE_FILES {folder}", flush=True)
+
+
+def reparse_ubmem(root):
+    """Recompute attribution from saved traces without running a device."""
+    paths = sorted(root.rglob('trace.json'))
+    if not paths:
+        raise ValueError(f'No saved trace.json under {root}')
+    for path in paths:
+        samples_path = path.with_name('samples.json')
+        if not samples_path.exists():
+            continue
+        trace = json.loads(path.read_text())
+        events = trace['traceEvents'] if isinstance(trace, dict) else trace
+        samples = json.loads(samples_path.read_text())
+        print(f'SOURCE {path.parent}')
+        for sample in samples:
+            account = account_ubmem(events, sample['name'], sample['us'])
+            sample['accounting'] = account
+            if 'error' in account:
+                print(f"ROUND {sample['round']} INVALID {account}")
+            else:
+                stages = account['stages_us']
+                print(f"ROUND {sample['round']} init={stages['init']:.3f} LI={stages['li']:.3f} "
+                      f"fused={stages['resolve_update_fetch']:.3f} gap={account['inter_kernel_gap_us']:.3f} us")
+        path.with_name('attribution.json').write_text(json.dumps(samples, indent=2))
+
+
+if __name__ == '__main__':
+    import argparse
+    from pathlib import Path
+    parser = argparse.ArgumentParser(description='Offline UBmem trace re-attribution')
+    parser.add_argument('--reparse-ubmem', type=Path, required=True)
+    reparse_ubmem(parser.parse_args().reparse_ubmem)
