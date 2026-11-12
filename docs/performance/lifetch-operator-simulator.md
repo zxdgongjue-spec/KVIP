@@ -39,7 +39,7 @@ O1–O6变体、服务variant接口或大型trace归档。
 `KVIP_LI_SCALE_TILES`、`KVIP_OPT_OUTPUT_PINGPONG`。PINGPONG只允许与mode1组合；
 切mode0或mode2时，必须显式关闭PINGPONG。
 
-正常URMA构建及既有 `tests/operators/lifetch/test_lifetch.py --transport urma ...`
+正常URMA构建及既有 `tests/operators/lifetch/test_lifetch.py bench --transport urma ...`
 使用默认组合；现有UBmem选项、生产build cache接口不变。缓存已包含算子源码/CMake
 与common headers，源码更新会触发重编译。例如独立编译原MR对照：
 

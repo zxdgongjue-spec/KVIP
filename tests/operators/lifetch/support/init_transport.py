@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Real CPU-service registration and transport lease lifecycle; no inference."""
 import argparse
-import json
+
+import numpy as np
 from pathlib import Path
 import sys
 
@@ -24,9 +25,7 @@ def main(transport, argv=None):
     from kvip.adapters.kvaf import UbmemLease
     from kvip.runtime.build import build_libraries, kvaf_build_paths
 
-    state = ROOT / 'build/dependencies.json'
-    root = (args.kvaf_root or (Path(json.loads(state.read_text())['kvaf']) if state.exists()
-                               else ROOT / 'third_party/KVAF')).resolve()
+    root = (args.kvaf_root or ROOT / 'third_party/KVAF').resolve()
     build = root / 'build-npu'
     if not Path(kvaf.__file__).resolve().is_relative_to(build / 'python/kvaf'):
         raise RuntimeError(f'Wrong KVAF package: {kvaf.__file__}; source scripts/env.sh for {root}')
@@ -44,6 +43,8 @@ def main(transport, argv=None):
         kwargs['transport'] = 'ubmem'
     runtime = kvaf.NpuRuntime(str(get), 656, 128, **kwargs)
     lease = None
+    table = None
+    in_flight = False
     try:
         print(f'START {transport}: connecting and allocating four KV blocks', flush=True)
         runtime.link_to(args.kvaf_server)
@@ -51,6 +52,29 @@ def main(transport, argv=None):
         slot = ((block + 4095) // 4096 * 4096) if transport == 'ubmem' else block
         runtime.initialize(4 * slot, slot)
         output = torch.zeros((128, 656), dtype=torch.uint8, device=device)
+        # Validate real data movement, not only resource registration.
+        from contract_payload import payload
+        expected = torch.from_numpy(payload(1, np.arange(128))).contiguous()
+        source = expected.to(device)
+        in_flight = True
+        runtime.batch_put([0], source, [0], [block])
+        stream.synchronize()
+        in_flight = False
+        table = runtime.prepare_access_table([0])
+        view = runtime.access_table_view(table, device="npu")
+        indices = torch.zeros(128, dtype=torch.int32, device=device)
+        offsets = torch.arange(128, dtype=torch.int32, device=device) * 656
+        count = torch.tensor([128], dtype=torch.int32, device=device)
+        destinations = torch.arange(128, dtype=torch.int32, device=device)
+        in_flight = True
+        runtime.batch_get(view.addresses, view.valid, indices, offsets, count,
+                          destinations, output, stream, False)
+        stream.synchronize()
+        in_flight = False
+        if not torch.equal(output.cpu(), expected):
+            raise AssertionError("Initialization Put/Get payload mismatch")
+        runtime.release_access_table(table)
+        table = None
         if transport == 'urma':
             cann, headers = kvaf_build_paths(build)
             (library,) = build_libraries(cache_dir=build / 'lifetch', cann=cann, headers=headers,
@@ -68,6 +92,11 @@ def main(transport, argv=None):
         return 0
     except Exception as error:
         print(f'FAIL {transport}: {type(error).__name__}: {error}', file=sys.stderr, flush=True)
+        if in_flight:
+            from native_batchget_support import NativeFetchSession
+            NativeFetchSession.quarantine("init_put_get_completion_uncertain", error)
         if lease is None and runtime.initialized:
+            if table is not None:
+                runtime.release_access_table(table)
             runtime.shutdown()
         raise

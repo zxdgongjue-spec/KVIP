@@ -1,5 +1,4 @@
 """Host model of the common final scheduler and UBmem descriptor boundary."""
-import subprocess
 from pathlib import Path
 
 from device_trace import account_ubmem
@@ -81,19 +80,26 @@ def test_ubmem_profile_finishes_schedule_and_keeps_incomplete_trace(tmp_path, mo
     monkeypatch.setitem(sys.modules, 'torch_npu', SimpleNamespace(profiler=SimpleNamespace(
         profile=profile, schedule=schedule, ProfilerActivity=SimpleNamespace(CPU=0, NPU=1))))
     monkeypatch.setitem(sys.modules, 'torch.profiler', SimpleNamespace(record_function=lambda name: nullcontext()))
-    event = lambda **kwargs: SimpleNamespace(record=lambda stream: None, synchronize=lambda: None,
-                                             elapsed_time=lambda end: 0.4)
+    def event(**kwargs):
+        return SimpleNamespace(record=lambda stream: None, synchronize=lambda: None,
+                               elapsed_time=lambda end: 0.4)
     stream = SimpleNamespace(synchronize=lambda: None)
     torch = SimpleNamespace(npu=SimpleNamespace(current_stream=lambda device: stream, Event=event,
                                                 synchronize=lambda: None))
     rotating = SimpleNamespace(device=0, rows=SimpleNamespace(cpu=lambda: SimpleNamespace(
         numpy=lambda: np.zeros((1, 256), dtype=np.uint32))), library=object())
+    # This fixture tests profiler lifecycle, not device algorithm decoding.
+    # Preserve an algorithm capture failure alongside incomplete timestamps.
+    monkeypatch.setattr('diagnostics.algorithm_before', lambda binding: {})
+    monkeypatch.setattr('diagnostics.algorithm_after',
+                        lambda binding, before: {'error': 'fixture counters unavailable'})
     checked = []
     collect_ubmem(torch, rotating, SimpleNamespace(replay=lambda stream: None), lambda: None,
                   lambda: checked.append(True), 2, tmp_path)
     assert len(checked) == 2 and profiles[0].steps == 2
     saved = json.loads((tmp_path / 'attribution.json').read_text())
     assert all('error' in sample['accounting'] for sample in saved)
+    assert all(sample['algorithm']['error'] == 'fixture counters unavailable' for sample in saved)
     assert capsys.readouterr().out.count('UBMEM_TRACE_ERROR') == 2
 
 

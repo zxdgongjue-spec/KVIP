@@ -1,0 +1,103 @@
+"""Exercise measurement ordering and failure semantics without device imports."""
+from contextlib import contextmanager
+from types import SimpleNamespace
+
+import pytest
+
+from performance import measure_graph
+
+
+def fake_device():
+    events = []
+    class Stream:
+        def synchronize(self):
+            events.append('sync')
+    class Graph:
+        def replay(self):
+            events.append('replay')
+        def reset(self):
+            events.append('destroy')
+    class Event:
+        def __init__(self, **kwargs):
+            pass
+        def record(self, stream):
+            events.append('event')
+        def synchronize(self):
+            events.append('event_sync')
+        def elapsed_time(self, other):
+            return .012
+    @contextmanager
+    def capture(graph, stream):
+        events.append('capture')
+        yield
+        events.append('captured')
+    return SimpleNamespace(npu=SimpleNamespace(
+        current_stream=Stream, Stream=Stream, NPUGraph=Graph, Event=Event, graph=capture)), events
+
+
+def test_restore_is_outside_events_and_warmup_excluded():
+    torch, events = fake_device()
+    result = measure_graph(torch, lambda: events.append('call'), lambda: events.append('restore'),
+                           lambda: events.append('check'), warmup=2, iterations=3)
+    assert result['timing']['samples_us'] == [12., 12., 12.]
+    assert result['correctness'] == 'PASS'
+    assert events.count('replay') == 5 and events[-1] == 'destroy'
+    for index, event in enumerate(events):
+        if event == 'replay':
+            assert events[index-3:index] == ['restore', 'sync', 'event']
+            assert events[index+1:index+4] == ['event', 'event_sync', 'check']
+
+
+def test_numerical_failure_keeps_all_completed_timings():
+    torch, events = fake_device()
+    def incorrect():
+        raise AssertionError('wrong KV bytes')
+    result = measure_graph(torch, lambda: None, lambda: None, incorrect, warmup=1, iterations=2)
+    assert result['correctness'] == 'FAIL'
+    assert len(result['failures']) == 4
+    assert result['timing']['samples'] == 2
+    assert events[-1] == 'destroy'
+
+
+def test_unsafe_device_completion_stops_replays():
+    torch, events = fake_device()
+    def incomplete():
+        raise RuntimeError('completion incomplete')
+    with pytest.raises(RuntimeError, match='completion incomplete'):
+        measure_graph(torch, lambda: None, lambda: None, incomplete, warmup=1, iterations=2)
+    assert 'replay' not in events
+
+
+def test_continuous_sequence_restores_once_not_between_rounds():
+    from performance import measure_sequence
+    torch, events = fake_device()
+    rounds = [SimpleNamespace(source_round=i, scheduler_round=i+100) for i in (1, 2)]
+    graphs = {i: torch.npu.NPUGraph() for i in (1, 2)}
+    saved = []
+    result = measure_sequence(
+        torch, rounds, graphs, lambda: events.append('restore'),
+        lambda entry: events.append(f'prepare{entry.source_round}'),
+        lambda entry: events.append(f'check{entry.source_round}'),
+        warmup=1, iterations=2, save=saved.append)
+    assert events.count('restore') == 3 and events.count('replay') == 6
+    assert result['sequence_graph_sum']['samples_us'] == [24., 24.]
+    assert result['rounds'][1]['samples_us'] == [12., 12.]
+    assert len(saved) == 8  # Before/after validation, only measured rounds.
+    for i, event in enumerate(events):
+        if event == 'check1':
+            assert events[i+1] == 'prepare2'
+
+
+def test_sequence_persists_timing_before_unsafe_validation_failure():
+    from performance import measure_sequence
+    torch, events = fake_device()
+    saved = []
+    def unsafe(entry):
+        raise RuntimeError('unknown device completion')
+    with pytest.raises(RuntimeError, match='unknown device completion'):
+        measure_sequence(torch, [SimpleNamespace(source_round=1, scheduler_round=101)],
+                         {1: torch.npu.NPUGraph()}, lambda: None, lambda entry: None,
+                         unsafe, warmup=0, iterations=2, save=saved.append)
+    assert len(saved) == 1 and saved[0]['elapsed_us'] == 12.
+    assert saved[0]['correctness'] == 'NOT_CHECKED'
+    assert events.count('replay') == 1

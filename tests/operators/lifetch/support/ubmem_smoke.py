@@ -19,6 +19,7 @@ from kvip.operators.lifetch.index_update import UbmemIndexUpdate
 from kvip.operators.lifetch_ubmem.build import UbmemGeometry, build_ubmem_library, kvaf_cann
 from kvip.operators.lifetch.workspace import UbmemWorkspace
 from kvip.runtime.device import query_device_resources
+from reporting import CorrectnessRecorder
 
 
 def payload(owner, tokens, token_bytes):
@@ -30,7 +31,7 @@ def payload(owner, tokens, token_bytes):
     )
 
 
-def controlled_fixture(history, resident, heads, miss_percent):
+def controlled_fixture(history, resident, heads, miss_percent, seed=20261104):
     """Use precisely the same deterministic Q4 fixture as URMA's A/B test."""
     support = Path(__file__).resolve().parent
     if str(support) not in sys.path:
@@ -39,7 +40,7 @@ def controlled_fixture(history, resident, heads, miss_percent):
 
     with tempfile.TemporaryDirectory(prefix="kvip-ubmem-fixture-") as tmp:
         root = Path(tmp) / "fixture"
-        info = prepare_full_chain_fixture(root, history, resident, miss_percent, index_heads=heads)
+        info = prepare_full_chain_fixture(root, history, resident, miss_percent, index_heads=heads, seed=seed)
         data = {
             "info": info,
             "order": np.load(root / "physical_to_logical.npy").astype(np.int64),
@@ -88,9 +89,14 @@ def check_shape(
     optimized=False,
     q_workers=2,
     fetch_mode="overlap",
+    seed=20261104,
+    result_output=None,
+    serial_compare=False,
+    check_case=None,
 ):
     batch, history, resident, token_bytes = shape.batch, shape.history, shape.resident, shape.token_bytes
-    fixture = controlled_fixture(history, resident, shape.heads, miss_percent)
+    checks = CorrectnessRecorder()
+    fixture = controlled_fixture(history, resident, shape.heads, miss_percent, seed=seed)
     expected_ids = fixture["expected"]
     cold_count = fixture["native_miss_union"]
     logical_scales = fixture["scales"]
@@ -153,6 +159,22 @@ def check_shape(
         )
         workspace.inputs.scale.copy_(torch.from_numpy(fixture["query_scale"]).to(device).repeat(batch, 1))
         workspace.inputs.query_ends.fill_(history)
+        serial_result = None
+        if serial_compare:
+            if token_bytes != 656:
+                raise ValueError("Native paired benchmark currently supports 656-byte C8 tokens")
+            import torch_npu
+            from performance import measure_ubmem_serial
+            serial_result = measure_ubmem_serial(
+                torch, torch_npu, runtime, device_table, workspace, storage, source_cpu,
+                batch=batch, history=history, resident=resident, heads=shape.heads,
+                warmup=warmup, iterations=iterations, trace_rounds=trace_rounds,
+                trace_folder=(result_output / f"b{batch}-h{history}-r{resident}-w{token_bytes}-p{prefetch_tokens}"
+                              if result_output else None))
+            if result_output:
+                from reporting import atomic_json
+                serial_path = result_output / f"b{batch}-h{history}-r{resident}-w{token_bytes}-p{prefetch_tokens}"
+                atomic_json(serial_path / "serial.json", serial_result)
         lease = UbmemLease(torch, runtime, output_rows, stream)
         lease.register_table(device_table)
         rotating = UbmemBinding(
@@ -209,7 +231,7 @@ def check_shape(
         else:
             forward = LIFetchForward(rotating, update)
 
-        def verify(owners, *, phase, counts=None, padding=False):
+        def verify_outputs(owners, *, phase, counts=None, padding=False):
             stream.synchronize()
             index_status = update.status.cpu().tolist()
             if any(index_status):
@@ -224,11 +246,11 @@ def check_shape(
                     change_count=rotating.change_count.cpu().tolist(),
                     row_fields=[{i: row[i] for i in (8, 9, 11, 208, 209, 210, 211, 247, 248)} for row in rows],
                 )
-                raise AssertionError(f"Index update rejected UBmem completion: {diagnostics}")
+                raise RuntimeError(f"Index update rejected UBmem completion: {diagnostics}")
             counters = rotating.ubmem_status.cpu().numpy()
-            assert not np.any(counters[:, 0]), "UBmem copy failed"
-            assert np.array_equal(counters[:, 1], counters[:, 2]), "UBmem prefetch incomplete"
-            assert np.array_equal(counters[:, 3], counters[:, 4]), "UBmem final fetch incomplete"
+            if (np.any(counters[:, 0]) or not np.array_equal(counters[:, 1], counters[:, 2])
+                    or not np.array_equal(counters[:, 3], counters[:, 4])):
+                raise RuntimeError(f"UBmem copy failed or incomplete: {counters.tolist()}")
             assert np.all(counters[:, 1] <= prefetch_tokens), "Prefetch exceeded its total budget"
             epochs = rotating.rows.cpu().numpy()[:, 16 : 16 + rotating.rounds]
             assert np.all(epochs <= max(1, prefetch_tokens // shape.intermediate_fetches)), (
@@ -236,10 +258,16 @@ def check_shape(
             )
             logical = update.logical_output.cpu().numpy().reshape(batch * 4, 2048)
             slots = update.slot_output.cpu().numpy().reshape(batch * 4, 2048)
+            active = sum([4] * len(owners) if counts is None else counts)
+            if not padding and (np.any(logical[:active] < 0) or np.any(logical[:active] >= history)
+                                or np.any(slots[:active] < 0) or np.any(slots[:active] >= resident)):
+                raise RuntimeError("UBmem output token/slot outside allocated bounds")
             if padding:
                 assert np.all(logical == -1) and np.all(slots == -1), "Padding inherited live outputs"
                 return
             ids = storage.logical_ids.cpu().numpy()
+            if np.any(ids < 0) or np.any(ids >= history):
+                raise RuntimeError("UBmem Index ownership is outside allocated history")
             addresses = storage.addresses.cpu().numpy()
             scales = storage.scales.cpu().numpy()
             key_values = storage.keys[:, :, 0].contiguous().cpu().numpy()
@@ -285,6 +313,10 @@ def check_shape(
                     output_row += 1
             assert np.all(logical[output_row:] == -1) and np.all(slots[output_row:] == -1), "TND padding is stale"
 
+        def verify(owners, *, phase, counts=None, padding=False):
+            return checks.check(phase, lambda: verify_outputs(
+                owners, phase=phase, counts=counts, padding=padding))
+
         # Restore the exact initial mapping/cache outside the event pair.
         measured_buffers = (
             storage.keys,
@@ -294,7 +326,7 @@ def check_shape(
             storage.hot_valid,
             output,
         )
-        initial_state = tuple(t.clone() for t in measured_buffers) if iterations else ()
+        initial_state = tuple(t.clone() for t in measured_buffers) if iterations or check_case else ()
 
         # Compare LI selection against the independent torch_npu native LI on
         # exactly the same query, Index cache, scales and block table. This is
@@ -318,8 +350,12 @@ def check_shape(
             sparse_mode=0,
         )
         native_ids = (native[0] if isinstance(native, (tuple, list)) else native).cpu().numpy().reshape(batch, 4, 2048)
-        if not np.all(np.sort(native_ids, axis=-1) == expected_ids[None, :, :]):
-            raise AssertionError("Native LI differs from the independent controlled TopK oracle")
+        if np.any(native_ids < 0) or np.any(native_ids >= history):
+            raise RuntimeError("Native LI output is outside allocated history")
+        def check_native_topk(selected=native_ids):
+            assert np.all(np.sort(selected, axis=-1) == expected_ids[None, :, :]), (
+                "Native LI differs from the independent controlled TopK oracle")
+        checks.check('native_topk', check_native_topk)
         # The URMA test commits this same native TopK to the service LRU before
         # choosing victims. Match the exact ordered candidates and inverse map.
         from kvip.cache.lru import SlotLRU
@@ -340,8 +376,22 @@ def check_shape(
         rotating.reserved_hot.copy_(torch.from_numpy(reserved).to(device))
         del native, native_ids
 
+        boundary_phases = {}
+        before_valid = storage.hot_valid[1:].cpu().numpy().copy()
+        before_layout = storage.logical_ids[1:, :resident].cpu().numpy().copy()
         forward()
         verify(list(range(1, batch + 1)), phase="eager")
+        from correctness import boundary_evidence, require_boundary
+        from reporting import atomic_json
+
+        def record_boundary(label, validity, layout):
+            boundary_phases[label] = boundary_evidence(
+                update.logical_output.cpu().numpy().reshape(batch, 4, 2048), validity, layout,
+                rotating.rows[:, 9].cpu().numpy(), rotating.final_posts[:, :, 0].cpu().numpy())
+            if result_output:
+                atomic_json(result_output / f"b{batch}-h{history}-r{resident}-w{token_bytes}-p{prefetch_tokens}"
+                            / "boundary_coverage.json", boundary_phases)
+        record_boundary('regular', before_valid, before_layout)
         # Actual service SFA with the URMA fixture's packed C8 payload, using
         # this fused path's final token-to-slot mapping. All outside timing.
         from types import SimpleNamespace
@@ -372,8 +422,11 @@ def check_shape(
             cumulative_query=torch.arange(1, batch + 1, dtype=torch.int32, device=device) * 4,
             logical_lens=torch.full((batch,), history, dtype=torch.int32, device=device),
         )
-        sfa = check_sfa(torch, tensors, geometry, before, after, output_path=comparison_sfa)
-        print(f"UBMEM_SFA_PASS max_abs={sfa['max_abs']:.8f}", flush=True)
+        sfa = {}
+        def verify_sfa():
+            sfa.update(check_sfa(torch, tensors, geometry, before, after, output_path=comparison_sfa))
+        if checks.check('sfa', verify_sfa):
+            print(f"UBMEM_SFA_PASS max_abs={sfa['max_abs']:.8f}", flush=True)
         first_counters = rotating.ubmem_status.cpu().numpy()
         print(
             "UBMEM_FETCH_COUNTS "
@@ -386,11 +439,22 @@ def check_shape(
             f"Q4_union_per_request={cold_count} fixture=shared_urma_seed20261104",
             flush=True,
         )
-        if cold_count:
-            assert np.any(first_counters[:, 1] + first_counters[:, 3]), "Fixture did not exercise a cold DDR fetch"
-        assert np.all(first_counters[:, 3] >= max(0, cold_count - prefetch_tokens)), (
-            "Final repair must fetch all missing TopK rows even beyond the speculative budget"
-        )
+        def verify_cold_reads():
+            if cold_count:
+                assert np.any(first_counters[:, 1] + first_counters[:, 3]), "Fixture did not exercise a cold DDR fetch"
+            assert np.all(first_counters[:, 3] >= max(0, cold_count - prefetch_tokens)), (
+                "Final repair must fetch all missing TopK rows even beyond the speculative budget")
+        checks.check('cold_read_coverage', verify_cold_reads)
+        if check_case:
+            for tensor, saved in zip(measured_buffers, initial_state):
+                tensor.copy_(saved)
+            storage.hot_valid[1:].zero_()
+            forward()
+            verify(list(range(1, batch + 1)), phase="cold-start")
+            record_boundary('cold-start', np.zeros_like(before_valid), before_layout)
+            checks.check("boundary trigger coverage", lambda: require_boundary(check_case, boundary_phases))
+            for tensor, saved in zip(measured_buffers, initial_state):
+                tensor.copy_(saved)
         graph = kvaf.AclGraph()
         with lease.capture_scope():
             graph.capture_begin(stream)
@@ -423,7 +487,9 @@ def check_shape(
         before = storage.logical_ids.clone()
         graph.replay(stream)
         verify([], phase="padding", padding=True)
-        assert torch.equal(storage.logical_ids, before), "Padding changed Index ownership"
+        def verify_padding_unchanged():
+            assert torch.equal(storage.logical_ids, before), "Padding changed Index ownership"
+        checks.check('padding_ownership', verify_padding_unchanged)
         if iterations:
             workspace.inputs.prepare([4] * batch, query_owners=list(range(1, batch + 1)))
             workspace.inputs.query_ends.fill_(history)
@@ -439,7 +505,30 @@ def check_shape(
                 end.synchronize()
                 if turn >= warmup:
                     elapsed.append(begin.elapsed_time(end) * 1000)
+            from reporting import atomic_json, timing_summary
+
+            measured = timing_summary(elapsed)
+            result = dict(
+                transport="ubmem", batch=batch, history=history, resident=resident,
+                index_heads=shape.heads, token_bytes=token_bytes, seed=seed,
+                prefetch_tokens=prefetch_tokens, miss_percent=miss_percent,
+                requested_windows=shape.intermediate_fetches, actual_windows=rotating.rounds,
+                timing=dict(prototype_with_update=measured),
+                execution="COMPLETED", correctness="NOT_RUN", boundary_coverage=boundary_phases,
+            )
+            if serial_result is not None:
+                result["timing"]["native_chain"] = serial_result["timing"]
+                result["serial_correctness"] = serial_result["correctness"]
+                result["serial_failures"] = serial_result["failures"]
+            report_path = (result_output / f"b{batch}-h{history}-r{resident}-w{token_bytes}-p{prefetch_tokens}"
+                           / "report.json") if result_output else None
+            if report_path:
+                atomic_json(report_path, result)
             verify(list(range(1, batch + 1)), phase="timed_replay")
+            result['correctness'] = checks.status
+            result['correctness_failures'] = checks.failures
+            if report_path:
+                atomic_json(report_path, result)
             if comparison_output:
                 from transport_snapshot import save
                 save(comparison_output, update.logical_output.cpu().numpy(), update.slot_output.cpu().numpy(),
@@ -447,7 +536,7 @@ def check_shape(
                      rotating.rows.cpu().numpy().view(np.uint32), original_addresses[1:])
             print(
                 f"UBMEM_GRAPH_EVENT_US p50={np.percentile(elapsed, 50):.3f} "
-                f"p99={np.percentile(elapsed, 99):.3f} iterations={iterations} "
+                f"p99={measured['p99_us']:.3f} mean={measured['mean_us']:.3f} iterations={iterations} "
                 "includes=init,LI,prefetch,resolve,final_fetch,index_update "
                 "excludes=fixture_restore,native_li,verification,CPU_LRU,SFA",
                 flush=True,
@@ -463,6 +552,10 @@ def check_shape(
                 collect_ubmem(torch, rotating, graph, restore_fixture,
                               lambda: verify(list(range(1, batch + 1)), phase="profiled_replay"),
                               trace_rounds, folder, streaming=forward if optimized else None)
+                result['correctness'] = checks.status
+                result['correctness_failures'] = checks.failures
+                if report_path:
+                    atomic_json(report_path, result)
         graph.reset()
         graph = None
         lease.close()
@@ -487,15 +580,17 @@ def check_shape(
         if runtime.initialized:
             runtime.shutdown()
     print(
-        f"UBMEM_LIFETCH_PASS device={device_id} batch={batch} heads={shape.heads} "
+        f"UBMEM_LIFETCH_{checks.status} device={device_id} batch={batch} heads={shape.heads} "
         f"history={history} resident={resident} token_bytes={token_bytes} "
         f"requested_miss_pct={miss_percent:g} Q4_unique_misses={cold_count} "
         f"prefetch_tokens={prefetch_tokens} "
         "put=native_li=topk=fetch=sfa=index_update=graph=packed_queries=padding"
     )
 
+    return checks.status == "PASS" and (serial_result is None or serial_result["correctness"] == "PASS")
 
-def main():
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--optimized-resolve", action="store_true")
     parser.add_argument("--ubmem-fetch-mode", choices=("serial", "overlap"), default="overlap")
@@ -503,16 +598,21 @@ def main():
     parser.add_argument("--build-dir", type=Path, required=True)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--kvaf-server", required=True, help="KVAF CPU service host:port")
-    parser.add_argument("--soc", required=True)
+    parser.add_argument("--soc")
     parser.add_argument("--batches", type=int, nargs="+", default=[1, 2])
     parser.add_argument("--token-bytes", type=int, nargs="+", default=[656, 2624])
     parser.add_argument("--index-heads", type=int, choices=(32, 64), default=32)
     parser.add_argument("--history", type=int, default=33024)
     parser.add_argument("--resident", type=int, default=8192)
     parser.add_argument("--prefetch-tokens", type=int, nargs="+", default=[512])
+    parser.add_argument("--intermediate-fetches", type=int, default=8)
     parser.add_argument(
         "--miss-percent", type=float, default=100, help="Controlled per-query miss; fixture matches the URMA benchmark"
     )
+    parser.add_argument("--seed", type=int, default=20261104)
+    parser.add_argument("--result-output", type=Path)
+    parser.add_argument("--serial-compare", action="store_true")
+    parser.add_argument("--check-case", choices=("all_hit_budget0", "all_miss", "prefetch_zero", "boundary_regular"))
     parser.add_argument("--warmup", type=int, default=4)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--trace-rounds", type=int, default=0)
@@ -520,7 +620,7 @@ def main():
     parser.add_argument("--comparison-output", type=Path)
     parser.add_argument("--comparison-sfa", type=Path)
     parser.add_argument("--runtime-shapes", action="store_true", help="Also check a second history/hot shape with the same binary")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.warmup < 0 or args.iterations < 0 or args.trace_rounds < 0:
         parser.error("warmup/iterations/trace-rounds must be non-negative")
     if args.trace_rounds and (not args.iterations or args.trace_output is None):
@@ -541,14 +641,18 @@ def main():
     if not torch.npu.is_available():
         raise RuntimeError("UBmem fusion smoke requires a real NPU; it cannot be skipped")
     torch.npu.set_device(args.device)
+    if args.soc is None:
+        import acl
+        args.soc = acl.get_soc_name()
     cann = kvaf_cann(build)
     aics = query_device_resources(cann, args.device)["effective_aic"]
     selected_library = None
     cases = [(batch, args.history, args.resident, width) for batch in args.batches for width in args.token_bytes]
     if args.runtime_shapes and (33024, 8192) != (args.history, args.resident):
         cases.append((args.batches[0], 33024, 8192, args.token_bytes[0]))
+    failed = False
     for batch, history, resident, token_bytes in cases:
-        shape = UbmemGeometry(batch, history, resident, args.index_heads, token_bytes, aics, 8, args.soc)
+        shape = UbmemGeometry(batch, history, resident, args.index_heads, token_bytes, aics, args.intermediate_fetches, args.soc)
         library = build_ubmem_library(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape, optimized=args.optimized_resolve)
         if selected_library is None:
             selected_library = library.resolve()
@@ -557,7 +661,7 @@ def main():
         elif library.resolve() != selected_library:
             raise AssertionError("Runtime shape change unexpectedly rebuilt UBmem LIFetch")
         for prefetch_tokens in args.prefetch_tokens:
-            check_shape(
+            passed = check_shape(
                 kvaf,
                 torch,
                 build,
@@ -576,9 +680,15 @@ def main():
                 args.optimized_resolve,
                 args.q_workers,
                 args.ubmem_fetch_mode,
+                seed=args.seed,
+                result_output=args.result_output,
+                serial_compare=args.serial_compare,
+                check_case=args.check_case,
             )
+            failed |= not passed
+    return int(failed)
 
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

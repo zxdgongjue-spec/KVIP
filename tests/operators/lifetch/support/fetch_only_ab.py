@@ -9,6 +9,8 @@ import ctypes
 
 import numpy as np
 
+from reporting import timing_summary
+
 
 MAGIC = 0x4B5641464247444F
 TOKEN_BYTES = 656
@@ -85,7 +87,7 @@ def run(torch, owner, rotating, pipeline, args):
             expected[ids] = reference.reshape(-1, TOKEN_BYTES)[ids]
         expected = expected.reshape_as(owner.output)
         group_ids = list(range(8)) if query == 4 else [query * 2, query * 2 + 1]
-        for version, function in [('native', native), ('fused_before', fused), ('fused', fused)]:
+        for version, function in [('native', native), ('fused', fused)]:
             stage_lines = []
             if version == 'native':
                 # Native KVAF receives one contiguous request list and performs
@@ -115,7 +117,7 @@ def run(torch, owner, rotating, pipeline, args):
                 if version == 'native':
                     result = function(pipeline.workspace.data_ptr(), native_reference.data_ptr(), capture.npu_stream, query)
                 else:
-                    result = function(pipeline.workspace.data_ptr(), capture.npu_stream, query | (256 if version == 'fused_before' else 0))
+                    result = function(pipeline.workspace.data_ptr(), capture.npu_stream, query)
                 if result:
                     raise RuntimeError(f'{version} fetch-only launch failed: {result}')
             capture.synchronize()
@@ -129,7 +131,7 @@ def run(torch, owner, rotating, pipeline, args):
                     for core in range(cores):
                         expected_count = len(selected) * (core + 1) // cores - len(selected) * core // cores
                         if int(status[core, 0]) != MAGIC or int(status[core, 2]) or int(status[core, 1]) != expected_count:
-                            raise AssertionError(f'native core={core} status={status[core, :4].tolist()} expected={expected_count}')
+                            raise RuntimeError(f'native core={core} status={status[core, :4].tolist()} expected={expected_count}')
                 else:
                     flags = pipeline.flags.cpu().numpy()
                     qs = range(4) if query == 4 else [query]
@@ -137,7 +139,7 @@ def run(torch, owner, rotating, pipeline, args):
                         for q in qs:
                             flag = flags[b, 8 + q]
                             if int(flag[0]) != 1 or int(flag[2]):
-                                raise AssertionError(f'fused batch={b} q={q} flag={flag[:3].tolist()}')
+                                raise RuntimeError(f'fused batch={b} q={q} flag={flag[:3].tolist()}')
                 if not torch.equal(owner.output, expected):
                     raise AssertionError(f'{version} Q={query} full output byte mismatch')
                 owner.mark_completed(completion_verified=True)
@@ -183,7 +185,7 @@ def run(torch, owner, rotating, pipeline, args):
                 ticks = pipeline.times.cpu().numpy()[batch * 128:batch * 256].reshape(batch, 128)
                 qs = range(4) if query == 4 else [query]
                 for q in qs:
-                    for lane in range(2):
+                    for lane in range(min(2, batch)):
                         t = ticks[lane, q * 24:q * 24 + 24]
                         stage_lines.append(f'FETCH STAGES {version} Q{q+1} lane={lane} cycles: '
                               f'prepare={int(t[18])} pack={int(t[19])} '
@@ -198,6 +200,6 @@ def run(torch, owner, rotating, pipeline, args):
                              count=len(selected), bytes=len(selected)*TOKEN_BYTES, stages=stage_lines,
                              safe_count=int(counts[group_ids, 0].sum()),
                              conflict_count=int(counts[group_ids, 1].sum()),
-                             p50_us=median, p99_us=float(np.percentile(samples, 99)),
+                             **timing_summary(samples),
                              effective_GBps=(len(selected)*TOKEN_BYTES/median/1000 if selected else None)))
     return rows

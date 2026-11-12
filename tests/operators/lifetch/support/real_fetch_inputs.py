@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 
 
-def prepare_full_chain_fixture(root, history, resident, miss_percent, prefetch_decoys=0, index_heads=64):
+def prepare_full_chain_fixture(root, history, resident, miss_percent, prefetch_decoys=0, index_heads=64, seed=20261104):
     """Reuse controlled cold masks, give each final TopK an unambiguous boundary.
 
     Hot feature bands independently choose exactly the remaining winners for
@@ -41,7 +41,7 @@ def prepare_full_chain_fixture(root, history, resident, miss_percent, prefetch_d
     # nonwinning hot rows equal to the resident TopK threshold. Binary scales
     # keep the independent score oracle reproducible. Winner value3 stays
     # above every background value (<=1), even at the minimum scale0.5.
-    rng = np.random.default_rng(20261104)
+    rng = np.random.default_rng(seed)
     for query in range(4):
         background = rng.integers(0x08, 0x39, resident, dtype=np.uint8)
         encoded[:resident, query * 32 : (query + 1) * 32] = background[:, None]
@@ -88,6 +88,7 @@ def prepare_full_chain_fixture(root, history, resident, miss_percent, prefetch_d
     config = json.loads((root / "fixture.json").read_text())
     config["full_chain_fixture"] = dict(
         model="controlled_query_feature_bands",
+        seed=seed,
         index_heads=index_heads,
         requested_miss_percent=miss_percent,
         final_misses_per_query=actual_misses,
@@ -165,7 +166,7 @@ def native_li(torch_npu, fixture):
         layout_query="BSND",
         layout_key="PA_BSND",
         sparse_count=2048,
-        sparse_mode=0,
+        sparse_mode=fixture.get("sparse_mode", 0),
     )
     selected = result[0] if isinstance(result, (list, tuple)) else result
     return selected.reshape(-1, 1, 2048)

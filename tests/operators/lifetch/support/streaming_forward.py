@@ -142,13 +142,14 @@ class StreamingForward(LIFetchForward):
                 start = int(first_nonzero.min())
                 end = max(finish)
                 result[0]['prefetch_scope'] = dict(
-                    requests=prefetch_count, bytes=prefetch_count * 656,
+                    requests=prefetch_count, bytes=prefetch_count * self.rotating.runtime_shape.tokenBytes,
                     first_doorbell=start, last_doorbell=int(last_nonzero.max()),
                     last_cq_observed=end, interval_cycles=max(0, end - start),
                     note='first doorbell to last CQ observed; includes polling delay and LI-window gaps')
         if self.q_workers:
             result[0]['core_timeline_raw'] = dict(
                 batch=self.batch, workers_per_query=self.q_workers, resolver_cores=self.resolver_cores,
+                token_bytes=self.rotating.runtime_shape.tokenBytes,
                 clock_mhz=getattr(self, 'counter_clock_mhz', None),
                 cores=raw[self.batch*256:].reshape(self.resolver_cores*self.batch+4*self.q_workers, 32).tolist(),
                 producer_update=raw[:self.batch*64].reshape(self.batch, 64).tolist(),

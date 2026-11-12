@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Host checks for the public transport-selecting test entry point."""
+"""Public commands route workloads and preserve partial worker evidence."""
 import importlib.util
+import json
 from pathlib import Path
 
-import pytest
+import execution
+from reporting import atomic_json, timing_summary
 
 SOURCE = Path(__file__).resolve().parents[1] / 'test_lifetch.py'
 spec = importlib.util.spec_from_file_location('unified_lifetch_test', SOURCE)
@@ -11,34 +13,43 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 
-def test_urma_passes_geometry_to_existing_graph_runner(monkeypatch, tmp_path):
-    commands = []
-    monkeypatch.setattr(module.subprocess, 'call', lambda command: commands.append(command) or 0)
-    assert module.main(['--transport', 'urma', '--kvaf-server', 'host:1', '--kvaf-root', str(tmp_path),
-                        '--batches', '8,16', '--intermediate-fetches', '8', '--miss-percent', '30']) == 0
-    cmd = commands[0]
-    assert '--internal-urma' in cmd and str(SOURCE) in cmd
-    assert cmd[cmd.index('--batches') + 1] == '8,16'
-    assert cmd[cmd.index('--miss-percent') + 1] == '30.0'
-    assert cmd[cmd.index('--kvaf-root') + 1] == str(tmp_path)
-
-
-def test_urma_fixture_can_import_native_log():
-    assert callable(module.native_log)
-
-
-def test_ubmem_requires_correctness_and_timing_markers(monkeypatch, tmp_path):
-    commands = []
-    def fake(command, log, timeout, label):
-        commands.append(command)
-        log.write_text('UBMEM_LIFETCH_PASS\nUBMEM_SFA_PASS\nUBMEM_GRAPH_EVENT_US p50=1\n'
-                       + ''.join(f'UBMEM_TRACE round={i} resolve_us=10 fetch_us=20\n' for i in range(3)))
+def test_bench_routes_requested_workload_and_saves_table(monkeypatch, tmp_path):
+    calls = []
+    def worker(config, directory):
+        calls.append(config)
+        for batch in config.batches:
+            atomic_json(directory / f'case{batch}/report.json', dict(batch=batch, correctness='PASS', timing=dict(
+                native_chain=timing_summary([100, 110]), prototype_with_update=timing_summary([80, 90]))))
+        atomic_json(directory / 'worker-result.json', dict(exit_code=0))
         return 0
-    monkeypatch.setattr(module, 'execute', fake)
-    args = ['--transport', 'ubmem', '--kvaf-server', 'host:1', '--kvaf-root', str(tmp_path),
-            '--soc', 'Ascend950PR_9599', '--batches', '16', '--output', str(tmp_path / 'out')]
-    assert module.main(args) == 0
-    assert commands[0][commands[0].index('--batches') + 1] == '16'
-    assert 'PASS: transport=ubmem' in next((tmp_path / 'out').glob('*/summary.log')).read_text()
-    with pytest.raises(SystemExit):
-        module.main(args + ['--intermediate-fetches', '4'])
+    monkeypatch.setattr(execution, 'launch', worker)
+    assert module.main(['bench', '--transport', 'ubmem', '--batches', '2,16', '--seed', '19',
+                        '--kvaf-server', 'host:1', '--output', str(tmp_path)]) == 0
+    assert calls[0].batches == (2, 16) and calls[0].seed == 19
+    result = json.loads(next(tmp_path.glob('*/summary.json')).read_text())['cases'][0]
+    assert result['serial_mean_us'] == 105 and result['fused_mean_us'] == 85
+
+
+def test_check_init_uses_only_init_job(monkeypatch, tmp_path):
+    calls = []
+    def worker(config, directory):
+        calls.append(config.operation)
+        atomic_json(directory / 'checks.json', [dict(case='init', correctness='PASS')])
+        atomic_json(directory / 'worker-result.json', dict(exit_code=0))
+        return 0
+    monkeypatch.setattr(execution, 'launch', worker)
+    assert module.main(['check', '--suite', 'init', '--kvaf-server', 'host:1', '--output', str(tmp_path)]) == 0
+    assert calls == ['init']
+
+
+def test_crashed_check_stops_remaining_device_cases(monkeypatch, tmp_path):
+    calls = []
+    def worker(config, directory):
+        directory.mkdir(parents=True)
+        calls.append(config)
+        return -15
+    monkeypatch.setattr(execution, 'launch', worker)
+    assert module.main(['check', '--suite', 'basic', '--kvaf-server', 'host:1', '--output', str(tmp_path)]) == 1
+    assert len(calls) == 1
+    rows = json.loads(next(tmp_path.glob('*/summary.json')).read_text())['cases']
+    assert [row['execution'] for row in rows] == ['FAILED', *['NOT_RUN'] * 4]

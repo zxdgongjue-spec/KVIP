@@ -155,6 +155,8 @@ def collect_core(torch, rotating, graph, reset, verify, rounds, folder, *, full=
         for step in range(rounds):
             reset()
             stream.synchronize()
+            from diagnostics import algorithm_before, algorithm_after
+            algorithm_initial = algorithm_before(rotating)
             begin, end = [torch.npu.Event(enable_timing=True) for _ in range(2)]
             name = f"kvop_{'full' if full else 'core'}_{step}"
             with record_function(name):
@@ -179,6 +181,7 @@ def collect_core(torch, rotating, graph, reset, verify, rounds, folder, *, full=
                     epochs=rows[:, 16 : 16 + rotating.rounds].astype(np.uint64).sum(axis=0).tolist(),
                 )
             )
+            samples[-1]["algorithm"] = algorithm_after(rotating, algorithm_initial)
             if diagnostics is not None:
                 samples[-1]["streaming_cycles"] = diagnostics()
     # Save events/counters before parsing, so collection never needs repeating
@@ -286,6 +289,8 @@ def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder, streami
         for step in range(rounds):
             reset()
             stream.synchronize()
+            from diagnostics import algorithm_before, algorithm_after
+            algorithm_initial = algorithm_before(rotating)
             begin, end = [torch.npu.Event(enable_timing=True) for _ in range(2)]
             name = f"kvip_ubmem_trace_{step}"
             with record_function(name):
@@ -299,6 +304,7 @@ def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder, streami
             samples.append({"name": name, "round": step, "us": begin.elapsed_time(end) * 1000,
                             "prefetch": int(rows[:, 9].astype(np.uint64).sum()),
                             "final": int(rows[:, 247].astype(np.uint64).sum())})
+            samples[-1]["algorithm"] = algorithm_after(rotating, algorithm_initial)
             if streaming is not None:
                 samples[-1]["streaming"] = streaming.diagnostic_cycles()
             profile.step()
@@ -325,6 +331,88 @@ def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder, streami
               + f" fetch_separate={account['fetch_separate']} prefetch={sample['prefetch']} final={sample['final']}",
               flush=True)
     print(f"UBMEM_TRACE_FILES {folder}", flush=True)
+
+
+def collect_replay(torch, state, graph, sequence, validate, config, folder):
+    """Profile a continuous sequence; never restore captured state per round."""
+    import torch_npu
+    from torch.profiler import record_function
+    from diagnostics import algorithm_before, algorithm_after
+    from reporting import CorrectnessRecorder, atomic_json
+
+    folder.mkdir(parents=True, exist_ok=True)
+    pipeline, rotating = state.forward, state.rotating
+    stream = torch.npu.current_stream(state.device)
+    checks = CorrectnessRecorder()
+    # A complete sequence is the unit of reset/warmup, as in unprofiled bench.
+    for repeat in range(config.warmup):
+        state.reset()
+        for inputs in sequence:
+            state.prepare(inputs)
+            stream.synchronize()
+            graph.replay()
+            stream.synchronize()
+            checks.check(f'warmup={repeat} source_round={inputs.source_round}',
+                         lambda: validate(inputs))
+    pipeline.counter_clock_mhz = pipeline.calibrate_counter_mhz()
+    pipeline.set_diagnostics(True)
+    trace_path = folder / 'trace.json'
+    samples = []
+    profile = torch_npu.profiler.profile(
+        activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
+        record_shapes=False, profile_memory=False, with_stack=False,
+        schedule=torch_npu.profiler.schedule(wait=0, warmup=0,
+                                            active=config.iterations * len(sequence.rounds), repeat=1),
+        on_trace_ready=lambda profiler: profiler.export_chrome_trace(str(trace_path.resolve())))
+    try:
+        with profile:
+            for repeat in range(config.iterations):
+                state.reset()
+                for inputs in sequence:
+                    state.prepare(inputs)
+                    stream.synchronize()
+                    before = algorithm_before(rotating)
+                    # TopK and prefetch positions refer to the *pre-call* Index
+                    # layout, which update mutates during this replay.
+                    before['logical_ids'] = state.storage.logical_ids[1:].cpu().numpy().copy()
+                    begin, end = [torch.npu.Event(enable_timing=True) for _ in range(2)]
+                    name = f'real_repeat_{repeat}_source_{inputs.source_round}'
+                    with record_function(name):
+                        begin.record(stream)
+                        graph.replay()
+                        end.record(stream)
+                        end.synchronize()
+                    good = checks.check(name, lambda: validate(inputs))
+                    algorithm = algorithm_after(rotating, before)
+                    totals = algorithm.get('totals', {})
+                    sample = dict(name=name, round=repeat, source_round=inputs.source_round,
+                                  scheduler_round=inputs.scheduler_round,
+                                  identities=inputs.identities, us=begin.elapsed_time(end) * 1000,
+                                  correctness='PASS' if good else 'FAIL', algorithm=algorithm,
+                                  prefetch=totals.get('prefetch'), final=totals.get('final'))
+                    try:
+                        sample['streaming_cycles'] = pipeline.diagnostic_cycles()
+                    except (ValueError, AssertionError) as error:
+                        sample['diagnostic_error'] = str(error)
+                    samples.append(sample)
+                    atomic_json(folder / 'samples.json', samples)
+                    profile.step()
+    finally:
+        pipeline.set_diagnostics(False)
+    trace = json.loads(trace_path.read_text())
+    events = trace['traceEvents'] if isinstance(trace, dict) else trace
+    for sample in samples:
+        sample['accounting'] = (account_ubmem(events, sample['name'], sample['us'])
+                               if config.transport == 'ubmem' else
+                               account(events, sample['name'], sample['us'], full=True, fused_final=True))
+    # Each source round has its own repeat distribution. Never pool different
+    # decode rounds under the same synthetic-case summary.
+    for source_round in sorted({sample['source_round'] for sample in samples}):
+        atomic_json(folder / f'round-{source_round}' / 'full_attribution.json', dict(
+            samples=[sample for sample in samples if sample['source_round'] == source_round]))
+    return dict(correctness=checks.status, failures=checks.failures,
+                rounds=len(sequence.rounds), repeats=config.iterations, samples=len(samples),
+                trace_path=str(trace_path))
 
 
 def reparse_ubmem(root):
@@ -358,3 +446,91 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Offline UBmem trace re-attribution')
     parser.add_argument('--reparse-ubmem', type=Path, required=True)
     reparse_ubmem(parser.parse_args().reparse_ubmem)
+
+
+def account_native(events, name, elapsed):
+    """Attribute native graph kernels by explicit names, never launch order.
+
+    LIDU already includes descriptor/address preparation. Unknown kernels remain
+    explicit and make coverage incomplete instead of being charged to Get.
+    """
+    scopes = [event for event in events if event.get('name') == name and event.get('ph') == 'X']
+    if len(scopes) != 1:
+        return dict(error=f'Expected one native replay scope, found {len(scopes)}')
+    scope = scopes[0]
+    origin = Decimal(str(scope['ts']))
+    groups, unknown = {}, []
+    aliases = {
+        'li': ('quantlightningindexer',),
+        'lidu_prepare': ('a5lidufusedbatchgetpreparemtp',),
+        'fetch': ('kvafexecutebatchgetaivkernelv2',),
+    }
+    for event in events:
+        if event.get('ph') != 'X' or 'kernel' not in (event.get('cat') or '').lower():
+            continue
+        begin = float(Decimal(str(event['ts'])) - origin)
+        end = begin + float(event.get('dur', 0))
+        if begin < 0 or end > float(scope['dur']):
+            continue
+        normalized = re.sub('[^a-z0-9]', '', event.get('name', '').lower())
+        stage = next((stage for stage, names in aliases.items()
+                      if any(normalized.startswith(prefix) for prefix in names)), None)
+        if stage is None:
+            unknown.append(dict(name=event['name'], start_us=begin, end_us=end))
+        else:
+            groups.setdefault(stage, []).append((begin, end))
+    missing = sorted(set(aliases) - groups.keys())
+    stages = {stage: sum(end - begin for begin, end in union(intervals))
+              for stage, intervals in groups.items()}
+    intervals = union([interval for values in groups.values() for interval in values]
+                      + [(row['start_us'], row['end_us']) for row in unknown])
+    result = dict(stages_us=stages, intervals_us=groups, unclassified=unknown,
+                  event_us=elapsed, missing_stages=missing,
+                  note='LIDU includes descriptor/address preparation; no separate mapping boundary inferred')
+    if intervals:
+        busy = sum(end - begin for begin, end in intervals)
+        span = intervals[-1][1] - intervals[0][0]
+        result.update(kernel_span_us=span, inter_kernel_gap_us=span-busy,
+                      boundary_residual_us=elapsed-span)
+    if missing or unknown or not intervals:
+        result['error'] = 'Native stage coverage incomplete; raw names retained for attribution'
+    elif sum(stages.values()) - busy > .1 or elapsed - span < -2:
+        result['error'] = 'Native stage overlap or event/trace interval mismatch'
+    return result
+
+
+def collect_native(torch, graph, reset, verify, rounds, folder):
+    """Profile the unchanged native graph; synchronize only around whole replays."""
+    import torch_npu
+    from torch.profiler import record_function
+    from reporting import atomic_json
+
+    folder.mkdir(parents=True, exist_ok=True)
+    stream = torch.npu.current_stream()
+    samples = []
+    profile = torch_npu.profiler.profile(
+        activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
+        record_shapes=False, profile_memory=False, with_stack=False)
+    with profile:
+        for step in range(rounds):
+            reset()
+            stream.synchronize()
+            begin, end = [torch.npu.Event(enable_timing=True) for _ in range(2)]
+            name = f'kvop_native_{step}'
+            with record_function(name):
+                begin.record(stream)
+                graph.replay()
+                end.record(stream)
+                end.synchronize()
+            samples.append(dict(name=name, round=step, us=begin.elapsed_time(end)*1000))
+            atomic_json(folder / 'native_samples.json', samples)
+            verify()
+    trace_path = folder / 'native_trace.json'
+    profile.export_chrome_trace(str(trace_path.resolve()))
+    trace = json.loads(trace_path.read_text())
+    events = trace['traceEvents'] if isinstance(trace, dict) else trace
+    for sample in samples:
+        sample['accounting'] = account_native(events, sample['name'], sample['us'])
+    result = dict(path='serial', samples=samples, trace=str(trace_path))
+    atomic_json(folder / 'native_attribution.json', result)
+    return result

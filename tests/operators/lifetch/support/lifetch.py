@@ -12,6 +12,7 @@ from kvip.operators.lifetch.forward import LIFetchForward
 from kvip.runtime.loader import load_lifetch_library
 from prefetch_audit import actual_reads, completion_failures, score_rows, selected_bounds
 from runner import progress
+from reporting import CorrectnessRecorder, atomic_json, timing_summary
 
 ROOT = Path(__file__).resolve().parents[4]
 SOURCE = ROOT / "csrc/operators/lightning_indexer_with_fetch"
@@ -30,7 +31,6 @@ def seed_native_bitmap(torch, native, row, bitmap):
 
 
 def run(args, run_dir):
-    source = SOURCE
     from attention import check_sfa
     from contract_payload import payload
     from kvip.operators.lifetch import binding as launch_module
@@ -39,10 +39,11 @@ def run(args, run_dir):
     from kvip.cache.lru import SlotLRU
     from native_batchget_support import NativeFetchSession
     from native_mtp import NativeMtp
-    from native_support import _load_native_operators, command, find_headers
+    from native_support import _load_native_operators, find_headers
+    from kvip.runtime.build import build_libraries
     from real_fetch_inputs import batch_inputs, native_li, prepare_full_chain_fixture
     from real_fetch_session import RealFetchSession
-    from test_lifetch import native_log
+    from execution import native_log
 
     torch, registration, _ = _load_native_operators("c8_offload")
     import torch_npu
@@ -66,6 +67,7 @@ def run(args, run_dir):
             self.support._session_class = lambda: FiniteSession
 
     summaries = []
+    failed = False
     original_args = args
     cases = [
         (b, args.history, args.resident, args.index_heads, args.intermediate_fetches)
@@ -97,7 +99,7 @@ def run(args, run_dir):
         with native_log(folder / "native.log"):
             common, data, build = (folder / "fixture", folder / "input", shared_build)
             fixture_info = prepare_full_chain_fixture(
-                common, args.history, args.resident, args.miss_percent, index_heads=args.index_heads
+                common, args.history, args.resident, args.miss_percent, index_heads=args.index_heads, seed=getattr(args, "seed", 20261104)
             )
             geometry = li_geometry(batch, "auto", args.intermediate_fetches, aics, 0)
             batch_inputs(common, data, batch, args.history, geometry["rotating_aic"])
@@ -112,14 +114,12 @@ def run(args, run_dir):
             if getattr(args, "optimized_resolve", False):
                 options.update(KVIP_FUSE_QUERY_WORK="ON", KVIP_OUTPUT_WORKER="ON")
             if not shared_build.exists():
-                progress(run_dir, f"BS={batch}: COMPILE LIFetch; logs={folder}")
-                command(
-                    ["cmake", "-S", source, "-B", build, *[f"-D{k}={v}" for k, v in options.items()]],
-                    folder / "configure.log",
-                )
-                command(["cmake", "--build", build, "-j2"], folder / "build.log")
-            else:
-                progress(run_dir, f"BS={batch}: REUSE LIFetch build={shared_build.resolve()}; logs={folder}")
+                progress(run_dir, f"BS={batch}: resolve shared LIFetch build cache; logs={folder}")
+                (library,) = build_libraries(
+                    cache_dir=args.kvaf_root / "build-npu/lifetch",
+                    cann=args.cann, headers=options["KVAF_INCLUDE"], soc=args.soc)
+                shared_build.symlink_to(library.parent.resolve(), target_is_directory=True)
+            progress(run_dir, f"BS={batch}: REUSE LIFetch build={shared_build.resolve()}; logs={folder}")
             import hashlib
 
             # Fail before allocating/populating DDR if shared dependencies cannot load.
@@ -169,7 +169,10 @@ def run(args, run_dir):
                     check_sfa,
                     aics,
                 )
+                failed |= report.get("correctness", "PASS") != "PASS"
                 report.update(
+                    batch=batch, history=args.history, resident=args.resident,
+                    index_heads=args.index_heads, seed=args.seed if hasattr(args, 'seed') else 20261104,
                     fixture=fixture_info,
                     resources=resources,
                     resource_geometry=geometry,
@@ -208,7 +211,7 @@ def run(args, run_dir):
             continue
         times = report["timing"]
         line = (
-            f"binary_sha256={built_digest} early_fetch={args.early_fetch} streaming={args.streaming} q_workers={args.q_workers}\nBS={batch} prototype PASS index_heads={args.index_heads} windows={geometry['intermediate_fetches']} requested_windows={args.intermediate_fetches} history={args.history} hot={args.resident} topk=2048 Q=4 graph=True\n"
+            f"binary_sha256={built_digest} early_fetch={args.early_fetch} streaming={args.streaming} q_workers={args.q_workers}\nBS={batch} prototype {report.get('correctness', 'PASS')} index_heads={args.index_heads} windows={geometry['intermediate_fetches']} requested_windows={args.intermediate_fetches} history={args.history} hot={args.resident} topk=2048 Q=4 graph=True\n"
             + "graph_p50_us="
             + ", ".join((f"{k}:{v['p50_us']:.3f}" for k, v in times.items()))
             + f"\nfull_speedup={times['native_chain']['p50_us'] / times['prototype_with_update']['p50_us']:.3f}x"
@@ -237,7 +240,7 @@ def run(args, run_dir):
         (run_dir / "cases.log").write_text("\n".join(summaries) + "\n")
         print(line, flush=True)
     progress(run_dir, "all prototype graph cases completed")
-    return 0
+    return int(failed)
 
 
 def run_device(
@@ -288,6 +291,9 @@ def run_device(
     native = NativeMtp(torch, device, owner, fixture, source_tokens=h, padded_tokens=h)
     prepare_native_bitmap(torch, native)
     state = {}
+    correctness = CorrectnessRecorder()
+    boundary_phases = {}
+    completed_timings = {}
     initial_selected = native_li(torch_npu, fixture).cpu().reshape(b, -1).numpy()
     logical_scores = np.load(folder / "fixture/logical_scores.npy")
     physical_order = np.load(folder / "fixture/physical_to_logical.npy")
@@ -326,7 +332,10 @@ def run_device(
     read_samples = {}
     split_samples = {}
 
-    def measure(call, reset, check, read_label=None):
+    def measure(call, reset, check, read_label=None, timing_name=None):
+        raw_check = check
+        def check():
+            return correctness.check(state["check_phase"], raw_check)
         state["check_phase"] = f"timing {read_label or getattr(call, '__name__', 'operation')}"
         reset()
         call()
@@ -364,6 +373,10 @@ def run_device(
                         r,
                     )
                 )
+        measured = timing_summary(samples)
+        completed_timings[timing_name or read_label or getattr(call, '__name__', 'operation')] = measured
+        atomic_json(folder / 'completed_timings.json', dict(
+            batch=b, timing=completed_timings, correctness=correctness.status, failures=correctness.failures))
         if read_label == "prototype_with_update" and args.comparison_output:
             reset()
             stream.synchronize()
@@ -391,19 +404,22 @@ def run_device(
                 if args.streaming:
                     pipeline.set_diagnostics(False)
                     stream.synchronize()
+        if timing_name == 'native_chain' and args.trace_rounds:
+            from device_trace import collect_native
+            collect_native(torch, graph, reset, check, args.trace_rounds, folder)
         graph.reset()
         owner.graphs.remove(graph)
-        return dict(p50_us=float(np.median(samples)), p99_us=float(np.percentile(samples, 99)), samples=len(samples))
+        return measured
 
     native.reset()
     native_call()
     stream.synchronize()
     native_check()
-    timings = {"native_chain": measure(native_call, native.reset, native_check)}
+    timings = {"native_chain": measure(native_call, native.reset, native_check, timing_name="native_chain")}
     # The previous native chain has prepared stable LIDU descriptors and maps.
     # Restore only the output so that the captured graph contains KVAF Get alone.
     timings["native_get_only"] = measure(
-        native.fetch, lambda: native.output.copy_(native.initial_payload), native_check)
+        native.fetch, lambda: native.output.copy_(native.initial_payload), native_check, timing_name="native_get_only")
     reference = state["native_topk"].cpu().reshape(b, 4, 2048).numpy()
     owner.acquire()
     rotating = launch_module.LIFetchBinding(
@@ -489,7 +505,7 @@ def run_device(
             print(f"COMPLETION FAILURE: phase={phase}; first={json.dumps(failures[0])}; full={path}", flush=True)
             print(f"LI OUTPUT BOUNDS: {json.dumps(bounds)}", flush=True)
             print(f"LI SCORE WORDS request=0: {json.dumps(scores)}", flush=True)
-            raise AssertionError(
+            raise RuntimeError(
                 f"completion failed phase={phase}; bad_requests={len(failures)}; "
                 f"first={json.dumps(failures[0])}; full={path}"
             )
@@ -520,11 +536,16 @@ def run_device(
         if updated:
             update.check_capacity()
         selected = topk.cpu().numpy()
+        if np.any(selected < 0) or np.any(selected >= h):
+            raise RuntimeError("TopK contains out-of-range positions")
         logical = state.get("before_logical", np.broadcast_to(np.arange(h), (b, h)))
         ids = np.take_along_axis(logical, selected.reshape(b, -1), axis=1).reshape(b, 4, 2048)
+        slots = rotating.locations.reshape(b, -1).cpu().long()
+        if (slots < 0).any() or (slots >= (r if persistent else owner.output.shape[1])).any():
+            raise RuntimeError("Fetch slot outside cache")
+        state["ids"], state["slots"] = (ids, slots.numpy())
         if not np.array_equal(np.sort(ids, axis=-1), np.sort(reference, axis=-1)):
             raise AssertionError("TopK changed")
-        slots = rotating.locations.reshape(b, -1).cpu().long()
         if updated:
             if not np.array_equal(update.logical_output.cpu().numpy().reshape(b, 4, 2048), ids):
                 raise AssertionError("Service logical TopK output differs from pre-update IDs")
@@ -604,28 +625,37 @@ def run_device(
         update.set_order(orders)
         if cold_start:
             rotating.hot_valid.zero_()
+        before_valid = rotating.hot_valid.cpu().numpy().copy()
+        before_layout = update.logical.cpu().numpy()[:, :r].copy()
         full()
         stream.synchronize()
-        verify(True)
-        verify_all_valid_hot()
-        # Validate every Index field against its logical owner, including rows
-        # outside current TopK. This checks the actual staged update, not an
-        # independently executed old planner.
-        logical = update.logical.cpu().long()
-        seeds = [saved[0].reshape(b, h, 128).cpu(), saved[1].view(torch.float32).reshape(b, h).cpu()]
-        address_seed = saved[2][b * prefix:].view(torch.int64).reshape(b, tail // 8)[:, :h].cpu()
-        for row in range(b):
-            if not torch.equal(torch.sort(logical[row]).values, torch.arange(h)):
-                raise AssertionError("Index logical owners are not a permutation")
-            for name, tensor, seed in zip(("Index", "scales", "addresses"), update.inputs[:3], seeds + [address_seed]):
-                if not torch.equal(tensor[row].cpu(), seed[row, logical[row]]):
-                    raise AssertionError(f"Staged update field mismatch: {name}, request={row}")
+        def validate_pipeline():
+            verify(True)
+            verify_all_valid_hot()
+            # Validate every Index field against its logical owner, including rows
+            # outside current TopK. This checks the actual staged update, not an
+            # independently executed old planner.
+            logical = update.logical.cpu().long()
+            seeds = [saved[0].reshape(b, h, 128).cpu(), saved[1].view(torch.float32).reshape(b, h).cpu()]
+            address_seed = saved[2][b * prefix:].view(torch.int64).reshape(b, tail // 8)[:, :h].cpu()
+            for row in range(b):
+                if not torch.equal(torch.sort(logical[row]).values, torch.arange(h)):
+                    raise AssertionError("Index logical owners are not a permutation")
+                for name, tensor, seed in zip(("Index", "scales", "addresses"), update.inputs[:3], seeds + [address_seed]):
+                    if not torch.equal(tensor[row].cpu(), seed[row, logical[row]]):
+                        raise AssertionError(f"Staged update field mismatch: {name}, request={row}")
+        passed = correctness.check(label, validate_pipeline)
+        from correctness import boundary_evidence
+        boundary_phases[label] = boundary_evidence(
+            state["ids"], before_valid, before_layout,
+            rotating.rows[:, 9].cpu().numpy(), rotating.final_posts[:, :, 0].cpu().numpy())
+        atomic_json(folder / "boundary_coverage.json", boundary_phases)
         changes = rotating.changes.cpu().numpy()
         result = dict(transport=state["completion"],
             first_window_fetches=int(rotating.rows[:, 16].cpu().sum()),
             hot_changes=int(np.count_nonzero((changes >= 0) & (changes < r))),
             cold_changes=int(np.count_nonzero(changes >= r)))
-        print(f"CHECK PASS {label}: {json.dumps(result)}; full KV/Index/ownership verified", flush=True)
+        print(f"CHECK {'PASS' if passed else 'FAIL'} {label}: {json.dumps(result)}; full KV/Index/ownership verified", flush=True)
         return result
 
     snapshot_changes = check_pipeline(initial_orders)
@@ -638,8 +668,15 @@ def run_device(
         unlucky.append(selected_hot + [x for x in initial_orders[row] if x not in seen])
     hot_case = check_pipeline(unlucky, label="hot-victim-collision")
     restored_hot = hot_case["hot_changes"]
-    if not hot_case["first_window_fetches"] or not restored_hot:
-        raise AssertionError(f"First window did not Fetch former hot candidates into LRU slots: {hot_case}")
+    if args.prefetch_tokens and args.miss_percent < 100:
+        def check_collision_coverage():
+            assert hot_case["first_window_fetches"] and restored_hot, (
+                f"First window did not Fetch former hot candidates into LRU slots: {hot_case}")
+        correctness.check("hot-victim-collision coverage", check_collision_coverage)
+
+    if getattr(args, "check_suite", None) == "boundary":
+        from correctness import require_boundary
+        correctness.check("boundary trigger coverage", lambda: require_boundary(args.check_case, boundary_phases))
 
     if args.fetch_only_compare:
         # Capture a regular real resolver snapshot. Prefetch has completed;
@@ -686,7 +723,7 @@ def run_device(
         if not (bitmap == 255).all():
             raise AssertionError("Round init unexpectedly rewrote producer-owned predicates")
 
-    timings["round_init"] = measure(lambda: rotating._call("init"), init_reset, init_check)
+    timings["round_init"] = measure(lambda: rotating._call("init"), init_reset, init_check, timing_name="round_init")
     timings["prototype_with_update"] = measure(full, reset, lambda: verify(True), read_label="prototype_with_update")
     reset()
     stream.synchronize()
@@ -737,11 +774,28 @@ def run_device(
     geom = SimpleNamespace(batch=b, queries=4, num_layers=1, layer_id=0, resident_blocks=b * (r + 8192) // 128)
     sfa = check_sfa(torch, tensors, geom, {"pool_rows": np.arange(b), "budgets": np.full(b, r + 8192)}, after,
                     output_path=args.comparison_sfa)
+    fetch_only = None
+    if getattr(args, "diagnostic_fetch_only", False):
+        # A separate replay supplies the exact final descriptors. No standalone
+        # preparation or tracing enters the full-graph performance samples.
+        from fetch_only_ab import run as run_fetch_only
+
+        reset()
+        full()
+        stream.synchronize()
+        verify(True)
+        verify_all_valid_hot()
+        fetch_only = run_fetch_only(torch, owner, rotating, pipeline, args)
+        atomic_json(folder / "fetch_only.json", dict(status="PASS", rows=fetch_only))
     return dict(
-        status="pass",
+        status=correctness.status.lower(),
+        correctness=correctness.status,
+        correctness_failures=correctness.failures,
+        boundary_coverage=boundary_phases,
         counter_clock_mhz=counter_clock_mhz,
         timing=timings,
         full_trace=full_trace,
+        fetch_only=fetch_only,
         read_samples=read_samples,
         split_samples=split_samples,
         sfa=sfa,

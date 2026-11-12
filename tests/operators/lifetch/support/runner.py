@@ -40,7 +40,7 @@ def compiler_error(path, before=4, after=10):
     return []
 
 
-def supervise(command, run, heartbeat_seconds=20, timeout_seconds=300):
+def supervise(command, run, heartbeat_seconds=20, timeout_seconds=300, environment=None):
     """Only a checked worker completion marker plus exit code zero means PASS."""
     run = Path(run)
     summary = run / "summary.log"
@@ -57,7 +57,7 @@ def supervise(command, run, heartbeat_seconds=20, timeout_seconds=300):
     timed_out = False
     with (run / "worker.log").open("w") as output:
         try:
-            child = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+            child = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, start_new_session=True, env=environment)
         except OSError as error:
             status(f"FAIL: cannot start worker: {error}")
             return 1

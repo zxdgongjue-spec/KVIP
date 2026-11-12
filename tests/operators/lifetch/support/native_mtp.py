@@ -6,9 +6,12 @@ from mtp_fixture import QUERIES, SOURCE, TOPK
 
 
 class NativeMtp:
-    def __init__(self, torch, device, owner, fixture, *, source_tokens=SOURCE, padded_tokens=PADDED_TOKENS):
+    def __init__(self, torch, device, owner, fixture, *, source_tokens=SOURCE, padded_tokens=PADDED_TOKENS, token_bytes=TOKEN_BYTES):
         if source_tokens < TOPK or padded_tokens < source_tokens or padded_tokens % 128:
             raise ValueError("native_mtp_invalid_source_geometry")
+        if token_bytes not in (656, 2624):
+            raise ValueError("native_mtp_invalid_token_width")
+        self.token_bytes = token_bytes
         self.source_tokens, self.padded_tokens = source_tokens, padded_tokens
         self.torch, self.owner, self.fixture = torch, owner, fixture
         self.batch, self.hot = owner.batch, owner.resident_budget
@@ -44,7 +47,7 @@ class NativeMtp:
             torch.stack(
                 [owner.session.cpu_payload[row, ids] for row, ids in enumerate(self.reverse_initial.cpu().long())]
             )
-            .reshape(-1, TOKEN_BYTES)
+            .reshape(-1, self.token_bytes)
             .to(device)
         )
         self.output = self.initial_payload.clone()
@@ -94,6 +97,9 @@ class NativeMtp:
         if self.owner.lease is not None:
             raise ValueError("native_mtp_requires_unleased_batch_get_queues")
         self.owner.session.batch_get_attempted = True
+        if self.token_bytes != TOKEN_BYTES:
+            # Unchanged LIDU writes offsets in single-layer C8 bytes.
+            self.offsets.mul_(self.token_bytes // TOKEN_BYTES)
         self.owner.session.runtime.batch_get(
             self.owner.session.device_table.addresses,
             self.owner.session.device_table.valid,
@@ -113,7 +119,7 @@ class NativeMtp:
         # updated forward map, then check the exported slot set separately.
         exported = self.destinations.cpu().reshape(self.batch, QUERIES, TOPK).long()
         forward = self.forward.cpu().long()
-        output = self.output.cpu().reshape(self.batch, self.hot, TOKEN_BYTES)
+        output = self.output.cpu().reshape(self.batch, self.hot, self.token_bytes)
         counts = self.counts.cpu().tolist()
         if any(count < 0 or count > QUERIES * TOPK for count in counts[:-1]) or counts[-1] != sum(counts[:-1]):
             raise ValueError(f"native_mtp_counts_invalid:{counts}")
