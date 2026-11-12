@@ -118,3 +118,12 @@ def test_device_harness_preserves_index_kv_and_mapping_suffix_between_stages():
     assert "Index key rows do not match persistent logical map" in runner
     assert "persistent Hot KV ownership mismatch" in runner
     assert "out-of-K Mapping suffix changed" in runner
+
+
+def test_persistent_mode_probes_active_k_init_without_resetting_index_kv():
+    root = Path(__file__).resolve().parents[3]
+    runner = (root / "tests/operators/lifetch/support/lifetch.py").read_text()
+    assert 'rotating._call("init")' in runner
+    assert "v9_init failed to clear active Mapping prefix" in runner
+    assert "v9_init changed poisoned out-of-K suffix" in runner
+    assert "active_k_init_prefix_clear_pass=True" in runner

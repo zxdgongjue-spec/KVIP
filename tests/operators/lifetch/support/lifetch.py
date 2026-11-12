@@ -1442,10 +1442,28 @@ def run_device(
             state["check_phase"] = "P0-A2.2b " + label
             before_mapping = rotating.mapping.detach().cpu().numpy().copy()
 
-            # reset() is intentionally NOT called here. Only mark the next
-            # real-fetch lease as launched; graph/workspace and Index/KV persist.
+            # Probe v9_init independently at the current K. The init-only
+            # replay touches workspace Mapping, not Index/KV state. It must
+            # clear [0,K) and preserve the poisoned [K,H) suffix.
             if stage_index:
                 owner.mark_launched()
+            rotating._call("init")
+            stream.synchronize()
+            owner.mark_completed(completion_verified=True)
+            init_mapping = rotating.mapping.detach().cpu().numpy()
+            for row, key in enumerate(new_k):
+                if not np.all(init_mapping[row, :key] == -1):
+                    raise AssertionError(
+                        f"{label}: v9_init failed to clear active Mapping prefix row={row} K={key}"
+                    )
+                if not np.all(init_mapping[row, key:] == 1):
+                    raise AssertionError(
+                        f"{label}: v9_init changed poisoned out-of-K suffix row={row} K={key}"
+                    )
+
+            # No reset() is called between growth stages. Re-arm the same
+            # queue lease and replay the already-captured full pipeline.
+            owner.mark_launched()
             graph.replay()
             stream.synchronize()
             verify(True)
@@ -1539,6 +1557,7 @@ def run_device(
                 native_li_independent_oracle_pass=True,
                 index_key_scale_address_permutation_pass=True,
                 index_rows_changed=changed_rows,
+                active_k_init_prefix_clear_pass=True,
                 active_k_boundary_preserved=True,
                 hot_kv_ownership_pass=True,
                 topk_slot_payload_cq_pass=True,
