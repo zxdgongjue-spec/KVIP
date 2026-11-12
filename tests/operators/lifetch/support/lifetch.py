@@ -938,6 +938,7 @@ def run_device(
                         topk.cpu().numpy(),
                         rotating.rows.cpu().numpy().view(np.uint32),
                         r,
+                        actual_key_lengths=actual_lengths,
                     )
                 )
         if read_label == "prototype_with_update" and args.comparison_output:
