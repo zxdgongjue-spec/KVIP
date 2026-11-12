@@ -10,6 +10,7 @@ import numpy as np
 def prepare_full_chain_fixture(
     root, history, resident, miss_percent, prefetch_decoys=0,
     index_heads=64, cold_probe_per_query=0, native_union_fit=False,
+    actual_key_lengths=None,
 ):
     """Reuse controlled cold masks, give each final TopK an unambiguous boundary.
 
@@ -20,6 +21,8 @@ def prepare_full_chain_fixture(
     from miss_fixture import build
 
     target = round(2048 * miss_percent / 100)
+    if actual_key_lengths is not None and (cold_probe_per_query or prefetch_decoys):
+        raise ValueError("P0-A2 actual-K fixture disallows cold probe and speculative decoys")
     if not 0 <= target <= min(2048, history - resident):
         raise ValueError("requested miss count exceeds available cold candidates")
     if cold_probe_per_query:
@@ -33,7 +36,7 @@ def prepare_full_chain_fixture(
     # Cold probe overrides the naturally dispersed cold tokens with one strong
     # winner per feature band inside the FIRST cold tile. This makes them
     # observable by the earliest active post-resident Rotation window.
-    mean = 0 if cold_probe_per_query else min(256, 2 * (target + 0.125) / tiles)
+    mean = 0 if cold_probe_per_query or actual_key_lengths is not None else min(256, 2 * (target + 0.125) / tiles)
     build(root, 0, "dispersed", history, resident, mean, independent_queries=True)
     root = Path(root)
     encoded = np.fromfile(root / "arg1.bin", np.uint8).reshape(history, 128)
@@ -66,6 +69,17 @@ def prepare_full_chain_fixture(
         background = rng.integers(0x08, 0x39, resident, dtype=np.uint8)
         encoded[:resident, query * 32 : (query + 1) * 32] = background[:, None]
     scale[:resident] = rng.integers(256, 513, resident).astype(np.float32) / 512
+    if actual_key_lengths is not None:
+        # Place all winning cold tokens before the smallest valid K. A short-K
+        # row then still has exactly 2048 winners, with no quantized-score tie.
+        minimum_k = min(actual_key_lengths)
+        if resident + 4 * 256 + target > minimum_k:
+            raise ValueError("actual_k_fixture_insufficient_early_cold_space")
+        for q in range(4):
+            winners = resident + q * 256 + np.arange(target)
+            columns = q * 32 + np.arange(32)
+            encoded[np.ix_(winners, columns)] = 0x44
+            scale[winners] = 8.0
     if prefetch_decoys < 0:
         raise ValueError("prefetch_decoys must be nonnegative")
     logical, actual_misses, selected_cold, prefetched = [], [], set(), set()
@@ -121,6 +135,17 @@ def prepare_full_chain_fixture(
             f"hot_stride={hot_stride}; use --native-union-fit with enough "
             "resident capacity for all Q4 selected tokens"
         )
+    actual_key_admission = None
+    if actual_key_lengths is not None:
+        from actual_k_admission import score_oracle_for_actual_k
+        per_request, _ = score_oracle_for_actual_k(
+            np.stack(logical), order, actual_key_lengths, resident)
+        actual_key_admission = dict(
+            fixed_history=history,
+            key_lengths=list(actual_key_lengths),
+            requests=per_request,
+            cold_winners="all_in_shortest_valid_prefix",
+        )
     encoded.tofile(root / "arg1.bin")
     scale.tofile(root / "arg4.bin")
     np.save(root / "logical_scores.npy", np.stack(logical))
@@ -140,6 +165,7 @@ def prepare_full_chain_fixture(
             if cold_probe_per_query else []
         ),
         expected_final_supplement=len(selected_cold - prefetched),
+        actual_key_admission=actual_key_admission,
         native_union_admission=dict(
             enabled=bool(native_union_fit),
             hot_stride=hot_stride,
