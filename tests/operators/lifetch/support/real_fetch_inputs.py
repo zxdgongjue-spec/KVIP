@@ -21,8 +21,11 @@ def prepare_full_chain_fixture(
     from miss_fixture import build
 
     target = round(2048 * miss_percent / 100)
-    if actual_key_lengths is not None and (cold_probe_per_query or prefetch_decoys):
-        raise ValueError("P0-A2 actual-K fixture disallows cold probe and speculative decoys")
+    if actual_key_lengths is not None:
+        if not native_union_fit:
+            raise ValueError("P0-A2 actual K requires --native-union-fit")
+        if cold_probe_per_query or prefetch_decoys:
+            raise ValueError("P0-A2 actual-K fixture disallows cold probe and speculative decoys")
     if not 0 <= target <= min(2048, history - resident):
         raise ValueError("requested miss count exceeds available cold candidates")
     if cold_probe_per_query:
@@ -70,16 +73,42 @@ def prepare_full_chain_fixture(
         encoded[:resident, query * 32 : (query + 1) * 32] = background[:, None]
     scale[:resident] = rng.integers(256, 513, resident).astype(np.float32) / 512
     if actual_key_lengths is not None:
-        # Place all winning cold tokens before the smallest valid K. A short-K
-        # row then still has exactly 2048 winners, with no quantized-score tie.
+        # First K must have exactly 2048 strong winners. Longer K adds one
+        # strong cold winner per Q in each later interval. This displaces a
+        # uniquely ranked low-hot winner, making a full-History scan detectably
+        # incorrect for shorter requests (unlike K-invariant TopK fixtures).
         minimum_k = min(actual_key_lengths)
         if resident + 4 * 256 + target > minimum_k:
             raise ValueError("actual_k_fixture_insufficient_early_cold_space")
+        hot_count = 2048 - target
+        hot_sets = [
+            set(((np.arange(hot_count) + q * 128) % resident).tolist())
+            for q in range(4)
+        ]
+        common_hot = sorted(set.intersection(*hot_sets))
+        if len(common_hot) < 3:
+            raise ValueError("actual_k_fixture_insufficient_shared_hot_winners")
+        all_hot = np.fromiter(set.union(*hot_sets), dtype=np.int64)
+        scale[all_hot] = 1.0
+        # These are the only 3 low hot winners and have strictly ranked
+        # BF16 scores. Each successive larger K displaces one of them.
+        scale[common_hot[:3]] = [0.5, 0.625, 0.75]
         for q in range(4):
             winners = resident + q * 256 + np.arange(target)
             columns = q * 32 + np.arange(32)
             encoded[np.ix_(winners, columns)] = 0x44
             scale[winners] = 8.0
+        successive_k = sorted(set(actual_key_lengths))
+        if len(successive_k) > 4:
+            raise ValueError("actual_k_fixture_supports_at_most_four_distinct_K")
+        for lo, hi in zip(successive_k, successive_k[1:]):
+            if lo + 3 * 32 + 4 >= hi:
+                raise ValueError("actual_k_fixture_insufficient_later_cold_space")
+            for q in range(4):
+                # Ineligible at K=lo, eligible at K=hi.
+                token = lo + q * 32 + 4
+                encoded[token, q * 32 : (q + 1) * 32] = 0x44
+                scale[token] = 8.0
     if prefetch_decoys < 0:
         raise ValueError("prefetch_decoys must be nonnegative")
     logical, actual_misses, selected_cold, prefetched = [], [], set(), set()
@@ -98,7 +127,10 @@ def prepare_full_chain_fixture(
             # FP8 0x20 = 0.125; cold scale8 gives value1, above the
             # background threshold and below every final hot winner (>=1.5).
             encoded[np.ix_(candidates[take], np.unique(columns))] = 0x20
-        winners = (np.arange(2048 - cold) + query * hot_stride) % resident
+        # For variable K, later cold sentinels must NOT reduce the number
+        # of hot winners visible in the shortest request.
+        hot_winner_count = 2048 - (target if actual_key_lengths is not None else cold)
+        winners = (np.arange(hot_winner_count) + query * hot_stride) % resident
         encoded[np.ix_(winners, np.unique(columns))] = 0x44
         # Decode positive finite E4M3 values used by the actual input bytes.
         codes = encoded[:, columns]
@@ -144,7 +176,8 @@ def prepare_full_chain_fixture(
             fixed_history=history,
             key_lengths=list(actual_key_lengths),
             requests=per_request,
-            cold_winners="all_in_shortest_valid_prefix",
+            cold_winners="base_in_shortest_valid_prefix_plus_length_sensitive_later_winners",
+            length_sensitive_topk=True,
         )
     encoded.tofile(root / "arg1.bin")
     scale.tofile(root / "arg4.bin")

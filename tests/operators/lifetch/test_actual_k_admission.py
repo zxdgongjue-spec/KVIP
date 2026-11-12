@@ -50,6 +50,11 @@ def test_generated_mixed_k_fixture_has_strict_topk(tmp_path):
     derived, topk = score_oracle_for_actual_k(logical, order, lengths, 8192)
     assert topk.shape == (4, 4, 2048)
     assert all(x["unique_cold"] > 0 for x in derived)
+    # A truncated-K run must NOT produce the same TopK as a full-H scan.
+    # One late cold sentinel per Q is promoted on each longer K interval.
+    assert len({tuple(topk[i, 0]) for i in range(len(lengths))}) == 3
+    assert derived[0]["unique_cold"] < derived[1]["unique_cold"]
+    assert derived[1]["unique_cold"] < derived[2]["unique_cold"]
     assert derived == report["requests"]
     assert (json.loads((folder / "fixture.json").read_text())
             ["full_chain_fixture"]["actual_key_admission"]["requests"] == derived)
