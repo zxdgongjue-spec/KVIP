@@ -7,7 +7,10 @@ from pathlib import Path
 import numpy as np
 
 
-def prepare_full_chain_fixture(root, history, resident, miss_percent, prefetch_decoys=0, index_heads=64):
+def prepare_full_chain_fixture(
+    root, history, resident, miss_percent, prefetch_decoys=0,
+    index_heads=64, cold_probe_per_query=0,
+):
     """Reuse controlled cold masks, give each final TopK an unambiguous boundary.
 
     Hot feature bands independently choose exactly the remaining winners for
@@ -19,8 +22,19 @@ def prepare_full_chain_fixture(root, history, resident, miss_percent, prefetch_d
     target = round(2048 * miss_percent / 100)
     if not 0 <= target <= min(2048, history - resident):
         raise ValueError("requested miss count exceeds available cold candidates")
+    if cold_probe_per_query:
+        if cold_probe_per_query != 1 or target != 1 or index_heads != 32:
+            raise ValueError("cold probe requires one final miss per query and 32 index heads")
+        if prefetch_decoys:
+            raise ValueError("cold probe cannot be combined with speculative decoys")
+        if history - resident < 128:
+            raise ValueError("cold probe requires a complete first cold tile")
     tiles = (history - resident) // 128
-    build(root, 0, "dispersed", history, resident, min(256, 2 * (target + 0.125) / tiles), independent_queries=True)
+    # Cold probe overrides the naturally dispersed cold tokens with one strong
+    # winner per feature band inside the FIRST cold tile. This makes them
+    # observable by the earliest active post-resident Rotation window.
+    mean = 0 if cold_probe_per_query else min(256, 2 * (target + 0.125) / tiles)
+    build(root, 0, "dispersed", history, resident, mean, independent_queries=True)
     root = Path(root)
     encoded = np.fromfile(root / "arg1.bin", np.uint8).reshape(history, 128)
     scale = np.fromfile(root / "arg4.bin", np.float32)
@@ -37,6 +51,12 @@ def prepare_full_chain_fixture(root, history, resident, miss_percent, prefetch_d
         query_scale.tofile(root / "arg3.bin")
     elif index_heads != 64:
         raise ValueError("index_heads must be 32 or 64")
+    if cold_probe_per_query:
+        # Independent Q bands: only the matching query can score this token.
+        # Resident has 2047 winners after injecting one cold winner.
+        for query in range(4):
+            token = resident + 16 * query
+            encoded[token, query * 32 : (query + 1) * 32] = 0x44
     # Spread background scores before BF16 quantization instead of making all
     # nonwinning hot rows equal to the resident TopK threshold. Binary scales
     # keep the independent score oracle reproducible. Winner value3 stays
@@ -79,6 +99,8 @@ def prepare_full_chain_fixture(root, history, resident, miss_percent, prefetch_d
         mapped[order] = bits
         logical.append(mapped)
         actual_misses.append(int(cold))
+        if cold_probe_per_query and cold != 1:
+            raise AssertionError(f"cold probe has {cold} cold winners for query {query}")
         selected_cold.update((np.flatnonzero(bits[resident:] >= cutoff) + resident).tolist())
         resident_cutoff = np.partition(bits[:resident], -2048)[-2048]
         prefetched.update((np.flatnonzero(bits[resident:] > resident_cutoff)[:2048] + resident).tolist())
@@ -95,6 +117,11 @@ def prepare_full_chain_fixture(root, history, resident, miss_percent, prefetch_d
         final_boundary="exactly_2048_at_or_above_cutoff",
         temporal_trace=False,
         prefetch_decoys=prefetch_decoys,
+        cold_probe_per_query=cold_probe_per_query,
+        cold_probe_physical_tokens=(
+            [resident + 16 * query for query in range(4)]
+            if cold_probe_per_query else []
+        ),
         expected_final_supplement=len(selected_cold - prefetched),
     )
     (root / "fixture.json").write_text(json.dumps(config, indent=2))

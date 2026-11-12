@@ -46,6 +46,8 @@ def arguments(argv=None):
                    help="enable test-only V9 Event candidate/selected counters for nonzero-prefetch LI varlen")
     p.add_argument("--prefetch-payload-audit", action="store_true",
                    help="P1-C0: reconcile prefetch Row/CQ/mapping and DDR-to-HBM bytes in LI-only fixture")
+    p.add_argument("--cold-prefetch-probe", action="store_true",
+                   help="P1-C1: 1 strong cold TopK winner per query in first cold tile; cold-only prefetch")
     p.add_argument("--output", type=Path, default=ROOT / "tests/results/lifetch")
     a = p.parse_args(argv)
     if a.kvaf_root is None:
@@ -69,14 +71,21 @@ def arguments(argv=None):
         p.error("--epoch-audit-profile requires --li-only-varlen and --prefetch-tokens 64")
     if a.prefetch_payload_audit and not a.epoch_audit_profile:
         p.error("--prefetch-payload-audit requires --epoch-audit-profile")
+    if a.cold_prefetch_probe and (
+        not a.prefetch_payload_audit or round(2048 * a.miss_percent / 100) != 1
+    ):
+        p.error("--cold-prefetch-probe requires --prefetch-payload-audit and one final cold miss per query")
     if a.li_only_varlen and (
         batches != [4] or a.history != 8192 or a.resident != 2048 or a.index_heads != 32
-        or a.miss_percent != 0 or a.prefetch_tokens not in (0, 64) or a.runtime_shapes
+        or (round(2048 * a.miss_percent / 100) != 1 if a.cold_prefetch_probe
+            else a.miss_percent != 0)
+        or a.prefetch_tokens not in (0, 64) or a.runtime_shapes
         or a.resolver_compare or a.comparison_output or a.comparison_sfa
     ):
         p.error(
             "li-only-varlen requires batch=4, history=8192, resident=2048, "
-            "index-heads=32, miss-percent=0, prefetch-tokens=0 or 64, and no runtime/resolver comparisons"
+            "index-heads=32, miss-percent=0 (or one cold miss/query in cold probe), "
+            "prefetch-tokens=0 or 64, and no runtime/resolver comparisons"
         )
     return a
 
@@ -178,6 +187,8 @@ def main(argv=None):
                    help='enable test-only candidate/selected counters for nonzero-prefetch varlen')
     p.add_argument('--prefetch-payload-audit', action='store_true',
                    help='P1-C0: reconcile Row/CQ/mapping and compare prefetch HBM bytes with DDR')
+    p.add_argument('--cold-prefetch-probe', action='store_true',
+                   help='P1-C1: one cold TopK winner/query in first cold tile, cold-only prefetch')
     p.add_argument('--output', type=Path, default=ROOT / 'tests/results/lifetch')
     p.add_argument('--timeout-seconds', type=int, default=1800)
     a = p.parse_args(argv)
@@ -198,14 +209,22 @@ def main(argv=None):
         p.error('--epoch-audit-profile requires --li-only-varlen and --prefetch-tokens 64')
     if a.prefetch_payload_audit and not a.epoch_audit_profile:
         p.error('--prefetch-payload-audit requires --epoch-audit-profile')
+    if a.cold_prefetch_probe and (
+        not a.prefetch_payload_audit or round(2048 * a.miss_percent / 100) != 1
+    ):
+        p.error('--cold-prefetch-probe requires --prefetch-payload-audit and one final cold miss per query')
     if a.li_only_varlen and (
         a.transport != 'urma' or batches != [4] or a.history != 8192 or a.resident != 2048
-        or a.index_heads != 32 or a.miss_percent != 0 or a.prefetch_tokens not in (0, 64)
+        or a.index_heads != 32
+        or (round(2048 * a.miss_percent / 100) != 1 if a.cold_prefetch_probe
+            else a.miss_percent != 0)
+        or a.prefetch_tokens not in (0, 64)
         or a.runtime_shapes or a.resolver_compare or a.comparison_output or a.comparison_sfa
     ):
         p.error(
             'li-only-varlen requires URMA, batch=4, history=8192, resident=2048, '
-            'index-heads=32, miss-percent=0, prefetch-tokens=0 or 64, and no runtime/resolver comparisons'
+            'index-heads=32, miss-percent=0 (or one cold miss/query in cold probe), '
+            'prefetch-tokens=0 or 64, and no runtime/resolver comparisons'
         )
     state = ROOT / 'build/dependencies.json'
     kvaf_root = (a.kvaf_root or (Path(json.loads(state.read_text())['kvaf']) if state.exists()
@@ -220,6 +239,8 @@ def main(argv=None):
         common.append('--epoch-audit-profile')
     if a.prefetch_payload_audit:
         common.append('--prefetch-payload-audit')
+    if a.cold_prefetch_probe:
+        common.append('--cold-prefetch-probe')
     if a.transport == 'urma':
         command = [sys.executable, '-u', str(Path(__file__).resolve()), '--internal-urma', *common,
                    '--kvaf-root', str(kvaf_root), '--cann', a.cann, '--batches', a.batches,

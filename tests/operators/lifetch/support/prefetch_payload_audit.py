@@ -28,6 +28,7 @@ def audit_prefetch_mapping(
     output_stride,
     rounds,
     selected_for_post,
+    use_lru_slots=True,
 ):
     """Plan exact (request, token, logical slot, physical HBM slot) checks.
 
@@ -67,7 +68,7 @@ def audit_prefetch_mapping(
         "geometry": {
             "batch": int(batch), "history": int(history),
             "resident": int(resident), "output_stride": int(output_stride),
-            "rounds": int(rounds),
+            "rounds": int(rounds), "use_lru_slots": bool(use_lru_slots),
         },
         "selected_for_post_event_total": (
             None if selected_for_post is None else int(selected_for_post)
@@ -127,7 +128,7 @@ def audit_prefetch_mapping(
 
         for token, logical in zip(token_ids.tolist(), logical_slots.tolist()):
             physical = logical
-            if resident <= logical < resident + LRU_SLOTS:
+            if use_lru_slots and resident <= logical < resident + LRU_SLOTS:
                 ordinal = logical - resident
                 physical = int(lru_slots[row, ordinal])
             if not (resident <= logical < output_stride):

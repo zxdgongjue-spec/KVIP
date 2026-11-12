@@ -37,6 +37,7 @@ class LIFetchBinding:
         tail_bounds=None,
         output_stride=None,
         scratch=None,
+        enable_lru_slots=True,
     ):
         if resident > 131072:
             raise ValueError("LIFetch hot bitmap supports resident <= 131072")
@@ -125,6 +126,8 @@ class LIFetchBinding:
         self.fallback_valid = torch.ones((batch, 8192), dtype=torch.uint8, device=self.device)
         if final_strategy != "replicated":
             raise ValueError("Direct LRU slots use the existing replicated resolver")
+        if not enable_lru_slots and tail_bounds is not None:
+            raise ValueError("Cold-only diagnostic mode cannot share tail-bound LRU routing")
         self.reserved_hot.fill_(-1)
 
         def shared_input(value, shape, default):
@@ -184,7 +187,7 @@ class LIFetchBinding:
                 np.array([prefetch_limit, window_limit], dtype="<u4").view("u1"),
                 np.array(
                     [
-                        self.lru_slots.data_ptr(),
+                        self.lru_slots.data_ptr() if enable_lru_slots else 0,
                         self.reserved_hot.data_ptr(),
                         self.changes.data_ptr(),
                         self.query_ends.data_ptr(),
@@ -205,7 +208,10 @@ class LIFetchBinding:
             (
                 blob,
                 np.frombuffer(bytes(self.runtime_shape), dtype=np.uint8),
-                np.array([self.change_slots.data_ptr(), self.change_count.data_ptr()], dtype="<u8").view("u1"),
+                np.array([
+                    self.change_slots.data_ptr() if enable_lru_slots else 0,
+                    self.change_count.data_ptr(),
+                ], dtype="<u8").view("u1"),
             )
         )
         self.context = torch.from_numpy(blob.copy()).to(self.device)

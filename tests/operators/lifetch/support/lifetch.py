@@ -101,7 +101,9 @@ def run(args, run_dir):
         with native_log(folder / "native.log"):
             common, data, build = (folder / "fixture", folder / "input", shared_build)
             fixture_info = prepare_full_chain_fixture(
-                common, args.history, args.resident, args.miss_percent, index_heads=args.index_heads
+                common, args.history, args.resident, args.miss_percent,
+                index_heads=args.index_heads,
+                cold_probe_per_query=int(getattr(args, "cold_prefetch_probe", False)),
             )
             geometry = li_geometry(batch, "auto", args.intermediate_fetches, aics, 0)
             batch_inputs(common, data, batch, args.history, geometry["rotating_aic"])
@@ -284,11 +286,14 @@ def run_v9_li_varlen_only(
         prefetch_limit=args.prefetch_tokens,
         output_stride=owner.output.shape[1],
         query_ends=query_ends,
+        enable_lru_slots=not getattr(args, "cold_prefetch_probe", False),
     )
     topk = arguments[9].view(torch.int32).reshape(b, 4, 2048)
     stream = torch.npu.current_stream(device)
 
-    if getattr(args, "prefetch_payload_audit", False):
+    if getattr(args, "prefetch_payload_audit", False) and not getattr(
+        args, "cold_prefetch_probe", False
+    ):
         # Deterministic, injective *physical* victim slot mapping. The regular
         # LI-only fixture does not initialize this LRU policy array. Without
         # this seed, PhysicalSlot() can map every prefetch to physical slot 0.
@@ -394,15 +399,35 @@ def run_v9_li_varlen_only(
             torch.npu.synchronize,
         )
 
-        # The zero-miss fixture guarantees every native TopK is resident.
+        cold_probe = bool(getattr(args, "cold_prefetch_probe", False))
+        native_cold_winners = 0
         for row, q_len in enumerate(counts):
-            active = native_output[row, :q_len]
-            if active.numel() and (
-                bool(torch.any(active < 0).item()) or bool(torch.any(active >= resident).item())
-            ):
-                raise AssertionError(
-                    f"{scenario['name']}: native TopK escaped the resident range at row {row}"
-                )
+            for q in range(q_len):
+                ids = native_output[row, q]
+                if bool(torch.any(ids < 0).item()) or bool(torch.any(ids >= expected_k[row]).item()):
+                    raise AssertionError(
+                        f"{scenario['name']}: native LI emitted invalid ID in row={row} Q={q}"
+                    )
+                cold = ids[ids >= resident]
+                want_cold = int(cold_probe and expected_k[row] > resident)
+                if int(cold.numel()) != want_cold:
+                    raise AssertionError(
+                        f"{scenario['name']}: native cold winners={cold.numel()} "
+                        f"expected={want_cold} row={row} Q={q}"
+                    )
+                if want_cold:
+                    wanted_id = resident + 16 * q
+                    if not bool(torch.any(cold == wanted_id).item()):
+                        raise AssertionError(
+                            f"{scenario['name']}: missing expected cold winner "
+                            f"token={wanted_id}, row={row} Q={q}"
+                        )
+                native_cold_winners += int(cold.numel())
+        record_stage(
+            stage_log, scenario["name"], "native_cold_topk", "verified",
+            cold_probe=cold_probe,
+            cold_winners=native_cold_winners,
+        )
 
         def reset_v9_round():
             topk.fill_(0x5A5A5A5A)
@@ -552,6 +577,7 @@ def run_v9_li_varlen_only(
                 output_stride=int(owner.output.shape[1]),
                 rounds=int(rotating.rounds),
                 selected_for_post=epoch_selected_for_post,
+                use_lru_slots=not getattr(args, "cold_prefetch_probe", False),
             )
             plan["scenario"] = scenario["name"]
             plan["fixture_victim_policy"] = "identity_per_request"
@@ -593,6 +619,31 @@ def run_v9_li_varlen_only(
             )
             payload_path.write_text(json.dumps(plan, indent=2) + "\n")
             payload_summary = plan["summary"]
+            if cold_probe:
+                if payload_summary["cold_candidate_count"] < 1:
+                    plan["errors"].append(
+                        "P1-C1: no real cold KV prefetch was observed"
+                    )
+                if payload_summary["resident_candidate_count"]:
+                    plan["errors"].append(
+                        "P1-C1: cold-only diagnostic unexpectedly fetched resident tokens"
+                    )
+                for row_info in plan["rows"]:
+                    for record in row_info["mappings"]:
+                        allowed = {
+                            resident + 16 * q
+                            for q in range(counts[row_info["row"]])
+                            if expected_k[row_info["row"]] > resident
+                        }
+                        if record["token"] not in allowed:
+                            plan["errors"].append(
+                                f"row={row_info['row']}: unexpected cold token "
+                                f"{record['token']} not in {sorted(allowed)}"
+                            )
+                plan["summary"]["validation"] = (
+                    "PASS" if not plan["errors"] else "FAIL"
+                )
+                payload_path.write_text(json.dumps(plan, indent=2) + "\n")
             if plan["errors"]:
                 record_stage(
                     stage_log, scenario["name"], "prefetch_payload", "failed",
@@ -664,6 +715,7 @@ def run_v9_li_varlen_only(
             cq_completed_groups=payload_cq_groups,
             resident_prefetch_candidates=payload_hot_candidates,
             cold_prefetch_candidates=payload_cold_candidates,
+            native_cold_topk_winners=native_cold_winners,
         )
         summaries.append(
             {
@@ -685,6 +737,7 @@ def run_v9_li_varlen_only(
                 "prefetch_cq_completed_groups": payload_cq_groups,
                 "resident_prefetch_candidates": payload_hot_candidates,
                 "cold_prefetch_candidates": payload_cold_candidates,
+                "native_cold_topk_winners": native_cold_winners,
                 "result": "PASS",
             }
         )
@@ -700,6 +753,7 @@ def run_v9_li_varlen_only(
         "prefetch_limit": args.prefetch_tokens,
         "epoch_event_profiling": bool(getattr(args, "epoch_audit_profile", False)),
         "prefetch_payload_audit": bool(getattr(args, "prefetch_payload_audit", False)),
+        "cold_prefetch_probe": bool(getattr(args, "cold_prefetch_probe", False)),
         "length_buffers_stable": True,
         "rounds": summaries,
         "executed_stages": ["v9_init", "v9_li", "v9_wait"],
