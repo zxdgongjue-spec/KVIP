@@ -48,6 +48,15 @@ public:
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
         WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     }
+    __aicore__ inline void CompleteUnreachedRotation() {
+#if !defined(V9_UBMEM) || !V9_UBMEM
+        rotating::CompleteUnreachedEpoch(
+            runtimeShape_.batch, runtimeShape_.splitQ,
+            runtimeShape_.rounds, runtimeShape_.serviceAics,
+            runtimeShape_.serviceLanes, rotationContext_,
+            blockId_ / 2, blockId_ % 2);
+#endif
+    }
     __aicore__ inline void RotateFetch(uint32_t epoch) {
         // Join this producer's hit publication. Other producers remain free.
         PipeBarrier<PIPE_ALL>();

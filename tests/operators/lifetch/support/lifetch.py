@@ -248,7 +248,7 @@ def run_v9_li_varlen_only(
         aic_count=aics,
         soc=args.soc,
         device=args.device,
-        prefetch_limit=0,
+        prefetch_limit=args.prefetch_tokens,
     )
     inputs = QueryInputs(
         torch, b, device, pin_memory=True, history=history, index_heads=args.index_heads
@@ -276,7 +276,7 @@ def run_v9_li_varlen_only(
         resident=resident,
         aic_count=aics,
         intermediate_fetches=args.intermediate_fetches,
-        prefetch_limit=0,
+        prefetch_limit=args.prefetch_tokens,
         output_stride=owner.output.shape[1],
         query_ends=query_ends,
     )
@@ -436,6 +436,33 @@ def run_v9_li_varlen_only(
         if bool(np.any(rows[:, 11] != 0)) or bool(np.any(rows[:, 211] != 0)):
             raise AssertionError(f"{scenario['name']}: LI row error or pending WQE remains")
 
+        skipped_lanes = 0
+        completed_lanes = 0
+        if args.prefetch_tokens:
+            # Event is 128 bytes: begin/end(uint64), core/epoch/complete/skipped
+            # (uint32). Each epoch owns service_lanes independent AIV views.
+            epoch_words = (
+                rotating.events.cpu().numpy().view(np.uint32)
+                .reshape(rotating.rounds, rotating.service_lanes, 32)
+            )
+            completion = epoch_words[:, :, 6]
+            skipped = epoch_words[:, :, 7]
+            if not np.all(completion == 1) or not np.all((skipped == 0) | (skipped == 1)):
+                raise AssertionError(
+                    f"{scenario['name']}: nonzero prefetch left an incomplete/invalid epoch"
+                )
+            completed_lanes = int(completion.size)
+            skipped_lanes = int(np.count_nonzero(skipped))
+            record_stage(
+                stage_log,
+                scenario["name"],
+                "rotation_epochs",
+                "verified",
+                complete_lanes=completed_lanes,
+                skipped_lanes=skipped_lanes,
+                rounds=rotating.rounds,
+                service_lanes=rotating.service_lanes,
+            )
         record_stage(
             stage_log,
             scenario["name"],
@@ -489,6 +516,8 @@ def run_v9_li_varlen_only(
             active_queries_checked=active_queries,
             padded_queries_checked=padded_queries,
             length_buffers_stable=True,
+            epoch_completed_lanes=completed_lanes,
+            epoch_skipped_lanes=skipped_lanes,
         )
         summaries.append(
             {
@@ -499,6 +528,8 @@ def run_v9_li_varlen_only(
                 "padded_queries_checked": padded_queries,
                 "native_vs_v9_li": "PASS",
                 "prefetch_cq": "PASS",
+                "epoch_completed_lanes": completed_lanes,
+                "epoch_skipped_lanes": skipped_lanes,
                 "result": "PASS",
             }
         )
@@ -511,7 +542,7 @@ def run_v9_li_varlen_only(
         "resident": resident,
         "index_heads": args.index_heads,
         "topk": 2048,
-        "prefetch_limit": 0,
+        "prefetch_limit": args.prefetch_tokens,
         "length_buffers_stable": True,
         "rounds": summaries,
         "executed_stages": ["v9_init", "v9_li", "v9_wait"],

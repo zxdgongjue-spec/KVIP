@@ -138,6 +138,7 @@ protected:
     __aicore__ inline uint32_t GetS2BaseBlockNumOnMask(uint32_t s1gIdx, uint32_t actS1Size, uint32_t actS2SizeOrig);
     // ================================Process functions================================
     __aicore__ inline void ProcessMain();
+    __aicore__ inline void CloseUnreachedRotation();
     __aicore__ inline void ProcessBaseBlock(uint32_t loop, uint64_t s2LoopIdx,
                                             QLICommon::RunInfo runInfo, uint32_t qScaleLoop, uint32_t kScaleLoop);
     __aicore__ inline void ProcessInvalid();
@@ -604,10 +605,26 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Process()
     if (usedCoreNum == 0) {
         // 没有计算任务，直接清理输出
         ProcessInvalid();
+        CloseUnreachedRotation();
         return;
     }
 
     ProcessMain();
+    CloseUnreachedRotation();
+}
+
+template <typename QLIT>
+__aicore__ inline void QuantLightningIndexerKernel<QLIT>::CloseUnreachedRotation()
+{
+    if ASCEND_IS_AIV {
+        if (rotationEnabled_ && !rotationServed_) {
+            // SplitCore uses actual Q/K lengths. A core may have no LI work,
+            // or may finish before its fixed EpochAt trigger. Publish both
+            // AIV lanes as skipped so dependent epochs can make progress.
+            vectorService.CompleteUnreachedRotation();
+            rotationServed_ = true;
+        }
+    }
 }
 
 template <typename QLIT>

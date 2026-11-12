@@ -63,12 +63,12 @@ def arguments(argv=None):
         p.error("prefetch tokens must be 0..2048 and divisible by windows")
     if a.li_only_varlen and (
         batches != [4] or a.history != 8192 or a.resident != 2048 or a.index_heads != 32
-        or a.miss_percent != 0 or a.prefetch_tokens != 0 or a.runtime_shapes
+        or a.miss_percent != 0 or a.prefetch_tokens not in (0, 64) or a.runtime_shapes
         or a.resolver_compare or a.comparison_output or a.comparison_sfa
     ):
         p.error(
             "li-only-varlen requires batch=4, history=8192, resident=2048, "
-            "index-heads=32, miss-percent=0, prefetch-tokens=0, and no runtime/resolver comparisons"
+            "index-heads=32, miss-percent=0, prefetch-tokens=0 or 64, and no runtime/resolver comparisons"
         )
     return a
 
@@ -184,12 +184,12 @@ def main(argv=None):
         p.error('comparison snapshots require one batch and no runtime-shapes')
     if a.li_only_varlen and (
         a.transport != 'urma' or batches != [4] or a.history != 8192 or a.resident != 2048
-        or a.index_heads != 32 or a.miss_percent != 0 or a.prefetch_tokens != 0
+        or a.index_heads != 32 or a.miss_percent != 0 or a.prefetch_tokens not in (0, 64)
         or a.runtime_shapes or a.resolver_compare or a.comparison_output or a.comparison_sfa
     ):
         p.error(
             'li-only-varlen requires URMA, batch=4, history=8192, resident=2048, '
-            'index-heads=32, miss-percent=0, prefetch-tokens=0, and no runtime/resolver comparisons'
+            'index-heads=32, miss-percent=0, prefetch-tokens=0 or 64, and no runtime/resolver comparisons'
         )
     state = ROOT / 'build/dependencies.json'
     kvaf_root = (a.kvaf_root or (Path(json.loads(state.read_text())['kvaf']) if state.exists()

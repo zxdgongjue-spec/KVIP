@@ -801,6 +801,41 @@ if (rt_batchedRows) {
 }
 
 namespace rotating {
+// Publish a no-work epoch without pretending that any KV was fetched.
+// This also closes the dependency chain when a variable-length LI core never
+// reaches its statically assigned Trigger. Each (epoch,lane) has one owner.
+// Keep the previous-epoch wait: a skipped epoch must not allow a later service
+// to overtake an earlier producer that is updating the same row/queue state.
+__aicore__ inline void CompleteUnreachedEpoch(
+    uint32_t rt_batch, uint32_t rt_splitQ, uint32_t rt_rounds,
+    uint32_t rt_serviceAics, uint32_t rt_serviceLanes,
+    GM_ADDR pointer, uint32_t core, uint32_t sub) {
+    if (!rt_rounds || !rt_serviceAics || !rt_serviceLanes) return;
+    uint32_t rank = ServiceRank(rt_batch, rt_splitQ, core);
+    uint32_t epoch = rank / rt_serviceAics;
+    if (epoch >= rt_rounds) return;
+    uint32_t lane = ServiceLane(rt_batch, rt_splitQ, rt_serviceAics, core, sub);
+    if (lane >= rt_serviceLanes) return;
+    auto ctx = reinterpret_cast<__gm__ Context*>(pointer);
+    auto events = reinterpret_cast<__gm__ Event*>(ctx->events);
+    if (epoch) {
+        auto previous = reinterpret_cast<__gm__ volatile Event*>(events)
+            + (epoch - 1) * rt_serviceLanes + lane;
+        do {
+            kvaf_device::CleanCacheLines(
+                reinterpret_cast<__gm__ uint8_t*>(
+                    events + (epoch - 1) * rt_serviceLanes + lane), 64);
+        } while (!previous->complete);
+    }
+    auto event = events + epoch * rt_serviceLanes + lane;
+    event->core = core;
+    event->epoch = epoch;
+    event->skipped = 1;
+    // Completion means the no-op epoch is closed, NOT that a prefetch ran.
+    event->complete = 1;
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event), 64);
+}
+
 __aicore__ inline void Service(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_splitQ,uint32_t rt_rounds,uint32_t rt_serviceAics,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer, uint32_t epoch, uint32_t core,
     uint32_t lane, LocalTensor<uint32_t> scratch, LocalTensor<uint16_t> flags,
     LocalTensor<uint32_t> indices) {
