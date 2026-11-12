@@ -30,6 +30,8 @@ class UbmemBinding:
         prefetch_limit=512,
         window_limit=None,
     ):
+        if not 1 <= shape.batch <= 16:
+            raise ValueError(f"LIFetch supports BS1..16; received BS={shape.batch}; no legacy fallback")
         self.torch, self.lease, self.shape = torch, lease, shape
         self.library = ctypes.CDLL(str(library))
         self.device = arguments[0].device
@@ -44,6 +46,7 @@ class UbmemBinding:
         if lease.context["token_bytes"] != shape.token_bytes or lease.context["tokens_per_block"] != 128:
             raise ValueError("UBmem kernel and KVAF slot geometry differ")
         prefetch_limit, window_limit = prefetch_budget(prefetch_limit, window_limit, shape.intermediate_fetches)
+        self.prefetch_limit = prefetch_limit
         geometry = li_geometry(shape.batch, "auto", shape.intermediate_fetches, shape.aic_count)
         self.rounds, self.service_lanes = geometry["intermediate_fetches"], geometry["service_aivs_per_window"]
         self.final_workers = final_aivs(shape.batch, "auto", shape.aic_count)

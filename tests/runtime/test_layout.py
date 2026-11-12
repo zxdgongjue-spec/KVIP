@@ -77,7 +77,7 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
         commands.append(command)
         if command[1] == "--build":
             directory = Path(command[2])
-            for name in ("libv9_bridge.so", "libkvop_cache_update.so"):
+            for name in ("libv9_bridge.so",):
                 (directory / name).write_bytes(b"test library")
         return SimpleNamespace(returncode=0)
 
@@ -128,7 +128,6 @@ def test_actual_operator_cmake_resolves_relocated_sources(tmp_path):
             str(tmp_path / "build"),
             f"-DASCEND_CANN_PACKAGE_PATH={cann}",
             f"-DKVAF_INCLUDE={headers}",
-            "-DRESOLVER_COMPARE=1",
         ],
         check=True,
         capture_output=True,
@@ -152,7 +151,7 @@ def test_actual_operator_cmake_resolves_relocated_sources(tmp_path):
                 "prefetch.h",
                 "resolver.h",
                 "index_cache_update.h",
-            ) or include.startswith("resolver_reference/"):
+            ):
                 assert any((folder / include).is_file() for folder in [cpp.parent, *includes]), (cpp, include)
 
 

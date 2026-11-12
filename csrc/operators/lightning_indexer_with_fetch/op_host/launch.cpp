@@ -1,3 +1,4 @@
+#include "../op_kernel/pipeline_types.h"
 #include "api.h"
 #include "context.h"
 extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) { return rotating::PrepareShape(shape); }
@@ -7,11 +8,22 @@ extern "C" uint32_t v9_##name(void* bindings,void* stream,const rotating::Runtim
     if (!bindings || !stream || !shape) return 100000; \
     return aclrtlaunch_v9_##name##_kernel(blocks,stream,bindings); }
 ENTRY(init,shape->batch)
-ENTRY(li,shape->liCores)
-ENTRY(wait,shape->batch)
-ENTRY(resolve,shape->finalCores)
-ENTRY(fetch,shape->batch)
-ENTRY(probe,shape->serviceLanes)
+
+extern "C" uint32_t aclrtlaunch_v9_li_kernel(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_1(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_2(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_3(uint32_t,void*,void*);
+extern "C" uint32_t v9_li(void* bindings, void* stream, const rotating::RuntimeShape* shape) {
+#define LI_LAUNCH_0 aclrtlaunch_v9_li_kernel
+#define LI_LAUNCH_1 aclrtlaunch_v9_li_kernel_1
+#define LI_LAUNCH_2 aclrtlaunch_v9_li_kernel_2
+#define LI_LAUNCH_3 aclrtlaunch_v9_li_kernel_3
+#include "../../common/lifetch/li_launch.h"
+#undef LI_LAUNCH_0
+#undef LI_LAUNCH_1
+#undef LI_LAUNCH_2
+#undef LI_LAUNCH_3
+}
 extern "C" uint32_t v9_li_cores(const rotating::RuntimeShape* shape) { return shape->liCores; }
 extern "C" uint32_t v9_batch(const rotating::RuntimeShape* shape) { return shape->batch; }
 extern "C" uint32_t v9_history(const rotating::RuntimeShape* shape) { return shape->history; }
@@ -27,11 +39,6 @@ extern "C" uint32_t v9_final_workers(const rotating::RuntimeShape* shape) { retu
 extern "C" uint32_t v9_final_owner_bytes(const rotating::RuntimeShape* shape) { return shape->finalOwnerBytes; }
 extern "C" uint32_t v9_final_replicated(const rotating::RuntimeShape* shape) { return 1; }
 extern "C" uint32_t v9_token_bytes(const rotating::RuntimeShape* shape) { return shape->tokenBytes; }
-
-#if V9_RESOLVER_COMPARE
-ENTRY(resolve_original,shape->finalCores)
-ENTRY(resolve_adapted,shape->finalCores)
-#endif
 
 #include "api.h"
 #include <cstdint>
@@ -65,14 +72,42 @@ extern "C" uint32_t refactor_fetch_pack_args(void *output, uint32_t capacity,
     return 0;
 }
 
-extern "C" uint32_t kvop_direct_update_outputs_early(uint32_t,void*,void*);
-extern "C" uint32_t aclrtlaunch_v9_fetch_update_kernel(uint32_t,void*,void*,void*);
-extern "C" uint32_t kvip_lifetch_forward(void* bindings, void* update, void* stream,const rotating::RuntimeShape* shape) {
-    if (!bindings || !update || !stream || !shape) return 100000;
-    uint32_t result = v9_init(bindings, stream, shape);
-    if (!result) result = v9_li(bindings, stream, shape);
-    if (!result) result = v9_resolve(bindings, stream, shape);
-    if (!result) result = kvop_direct_update_outputs_early(shape->batch, update, stream);
-    if (!result) result = aclrtlaunch_v9_fetch_update_kernel(shape->batch, stream, bindings, update);
+extern "C" uint32_t aclrtlaunch_v9_streaming_resolve_update(uint32_t,void*,void*);
+extern "C" uint32_t kvip_lifetch_streaming_forward(void* bindings,void* update,void* workspace,void* stream,const rotating::RuntimeShape* shape,uint32_t workers) {
+    if(!bindings||!update||!workspace||!stream||!shape||shape->resident>131072||shape->batch<1||shape->batch>16||shape->finalWorkers!=4)return 100000;
+    if((workers!=1 && workers!=2 && workers!=4) || shape->batch*pipeline_ab::kResolveCores+4*workers>shape->aicCount*2)return 100000;
+    uint32_t result=v9_init(bindings,stream,shape);
+    if(!result)result=v9_li(bindings,stream,shape);
+    if(!result)result=aclrtlaunch_v9_streaming_resolve_update(shape->batch*pipeline_ab::kResolveCores+4*workers,stream,workspace);
     return result;
 }
+
+extern "C" uint32_t aclrtlaunch_kvip_transport_snapshot_kernel(uint32_t,void*,void*,void*,uint32_t);
+extern "C" uint32_t kvip_transport_snapshot(void* source, void* destination, uint32_t bytes, void* stream) {
+    if (!source || !destination || !stream || !bytes || bytes % 32 ||
+        reinterpret_cast<uintptr_t>(source) % 32 || bytes > 64U * 1024U * 1024U) return 100000;
+    return aclrtlaunch_kvip_transport_snapshot_kernel(1,stream,source,destination,bytes);
+}
+
+extern "C" uint32_t aclrtlaunch_v9_counter_calibration(uint32_t,void*,void*);
+extern "C" uint32_t kvip_counter_calibration(void* output,void* stream) {
+    if(!output || !stream)return 100000;
+    return aclrtlaunch_v9_counter_calibration(1,stream,output);
+}
+
+extern "C" uint32_t aclrtlaunch_v9_query_fetch_only(uint32_t,void*,void*,uint32_t);
+extern "C" uint32_t kvip_query_fetch_only(void* workspace,void* stream,uint32_t query) {
+    const uint32_t selected=query & 255U;
+    if(!workspace||!stream||selected>4||(query & ~511U))return 100000;
+    return aclrtlaunch_v9_query_fetch_only(selected==4?8:2,stream,workspace,query);
+}
+
+extern "C" uint32_t aclrtlaunch_v9_native_fetch_only(uint32_t,void*,void*,void*,uint32_t);
+extern "C" uint32_t kvip_native_fetch_only(void* workspace,void* counts,void* stream,uint32_t query) {
+    if(!workspace||!counts||!stream||query>4)return 100000;
+    return aclrtlaunch_v9_native_fetch_only(query==4?8:2,stream,workspace,counts,query);
+}
+
+extern "C" uint32_t kvip_streaming_resolver_cores(){return pipeline_ab::kResolveCores;}
+
+extern "C" uint32_t kvip_streaming_flag_count(){return pipeline_ab::kFlagCount;}

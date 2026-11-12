@@ -18,6 +18,7 @@ struct alignas(128) Row {
     uint32_t slots, requests, suppressed, error;
     uint32_t consumed[4];
     uint32_t epochCount[kMaxRounds], epochSuppressed[kMaxRounds];
+    // Sequence split stores S0 in consumed and the post-window S1 cursor here.
     uint32_t snapshot[kMaxRounds][4];
     uint32_t limit, prefetchLimit, queueLimit, pending;
     uint64_t initialHead;
@@ -93,4 +94,6 @@ V9_DEVICE inline int32_t EpochAt(uint32_t rt_batch,uint32_t rt_history,uint32_t 
     uint32_t rank=ServiceRank(rt_batch,rt_splitQ,core),epoch=rank/rt_serviceAics;
     return epoch<rt_rounds && Trigger(rt_history,rt_resident,rt_rounds,epoch)==tileEnd ? int32_t(epoch) : -1;
 }
+
+#include "../../common/lifetch/sequence_schedule.h"
 }

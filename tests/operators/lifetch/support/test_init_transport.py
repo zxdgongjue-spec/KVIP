@@ -25,7 +25,7 @@ def test_initialization_acquires_and_releases_selected_lease(monkeypatch, tmp_pa
     monkeypatch.setattr(kvip.adapters.kvaf, 'KvafGetLease', Mock(return_value=lease))
     monkeypatch.setattr(kvip.adapters.kvaf, 'UbmemLease', Mock(return_value=lease))
     monkeypatch.setattr(kvip.runtime.build, 'kvaf_build_paths', lambda path: ('cann', 'headers'))
-    monkeypatch.setattr(kvip.runtime.build, 'build_libraries', lambda **kwargs: ('library', 'update'))
+    monkeypatch.setattr(kvip.runtime.build, 'build_libraries', lambda **kwargs: ('library',))
     kernels = tmp_path / 'build-npu/bin'
     kernels.mkdir(parents=True)
     for name in ('kvaf_execute_batch_get_kernels.o', 'kvaf_execute_batch_put_kernels.o'):
