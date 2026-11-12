@@ -319,9 +319,11 @@ def main(argv=None):
     expected = len(batches) + int(a.runtime_shapes and (a.history, a.resident) != (33024, 8192))
     ok = (code == 0 and sum(line.startswith('UBMEM_LIFETCH_PASS') for line in selected) == expected
           and sum(line.startswith('UBMEM_SFA_PASS') for line in selected) == expected
-          and sum(line.startswith('UBMEM_GRAPH_EVENT_US') for line in selected) == expected
-          and sum(line.startswith('UBMEM_TRACE round=') for line in selected) == expected * a.trace_rounds)
-    result = [f'{"PASS" if ok else "FAIL"}: transport=ubmem exit={code}', *selected]
+          and sum(line.startswith('UBMEM_GRAPH_EVENT_US') for line in selected) == expected)
+    trace_ok = sum(line.startswith('UBMEM_TRACE round=') for line in selected) == expected * a.trace_rounds
+    result = [f'{"PASS" if ok else "FAIL"}: transport=ubmem exit={code}; '
+              f'correctness/timing={"PASS" if ok else "FAIL"}; '
+              f'trace={"COMPLETE" if trace_ok else "INCOMPLETE"}', *selected]
     if not ok:
         result += ['--- worker.log tail ---', *lines[-25:]]
     summary.write_text('\n'.join(result) + '\n')

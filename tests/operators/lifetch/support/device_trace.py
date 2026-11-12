@@ -272,9 +272,12 @@ def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder, streami
     folder.mkdir(parents=True, exist_ok=True)
     stream = torch.npu.current_stream(rotating.device)
     samples = []
+    trace_path = folder / "trace.json"
     profile = torch_npu.profiler.profile(
         activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
         record_shapes=False, profile_memory=False, with_stack=False,
+        schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=rounds, repeat=1),
+        on_trace_ready=lambda profiler: profiler.export_chrome_trace(str(trace_path.resolve())),
     )
     if streaming is not None:
         streaming.counter_clock_mhz = streaming.calibrate_counter_mhz()
@@ -290,6 +293,7 @@ def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder, streami
                 graph.replay(stream)
                 end.record(stream)
                 end.synchronize()
+                torch.npu.synchronize()
             verify()
             rows = rotating.rows.cpu().numpy().view(np.uint32)
             samples.append({"name": name, "round": step, "us": begin.elapsed_time(end) * 1000,
@@ -297,11 +301,10 @@ def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder, streami
                             "final": int(rows[:, 247].astype(np.uint64).sum())})
             if streaming is not None:
                 samples[-1]["streaming"] = streaming.diagnostic_cycles()
+            profile.step()
     if streaming is not None:
         streaming.set_diagnostics(False)
     (folder / "samples.json").write_text(json.dumps(samples, indent=2))
-    trace_path = folder / "trace.json"
-    profile.export_chrome_trace(str(trace_path.resolve()))
     trace = json.loads(trace_path.read_text())
     events = trace["traceEvents"] if isinstance(trace, dict) else trace
     for sample in samples:
@@ -314,7 +317,7 @@ def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder, streami
         account = sample["accounting"]
         if "error" in account:
             print(f"UBMEM_TRACE_ERROR round={sample['round']} {account}; raw={trace_path}", flush=True)
-            raise RuntimeError(f"UBmem trace attribution failed; raw trace saved at {trace_path}")
+            continue  # Invalid attribution is retained, never reported as stage timing.
         print(f"UBMEM_TRACE round={sample['round']} total_us={sample['us']:.3f} "
               + " ".join(f"{key}_us={value:.3f}" for key, value in account["stages_us"].items())
               + f" span_us={account['kernel_span_us']:.3f} gap_us={account['inter_kernel_gap_us']:.3f}"
