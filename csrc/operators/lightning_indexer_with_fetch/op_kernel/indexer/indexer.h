@@ -148,7 +148,8 @@ protected:
     __aicore__ inline bool ScoreRecent(uint32_t& loop, uint32_t qScaleLoop,
                                       uint32_t shard = 0, uint32_t shards = 1);
     __aicore__ inline void ProcessBaseBlock(uint32_t loop, uint64_t s2LoopIdx,
-                                            QLICommon::RunInfo runInfo, uint32_t qScaleLoop, uint32_t kScaleLoop);
+                                            QLICommon::RunInfo runInfo, uint32_t qScaleLoop, uint32_t kScaleLoop,
+                                            bool reuseQuery = false);
     __aicore__ inline void ProcessInvalid();
     // ================================Params Calc=====================================
     __aicore__ inline void CalcGS1LoopParams(uint32_t bN2Idx);
@@ -663,6 +664,9 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
         CalcRunInfo(loop, tile, info, 0, scaleLoop);
         info.isFirstS2InnerLoop = loop == 0 || (newQuery && tile == begin);
         info.isLastS2InnerLoop = last && tile + 1 == end;
+#if KVIP_RECENT_PIPELINE
+        info.reuseQuery = newQuery && tile == begin;
+#endif
         if ASCEND_IS_AIC {
             matmulService.ComputeMm1(info);
         } else {
@@ -671,9 +675,10 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
     }
 }
 
-// An independent score-only pass inside the existing LI launch. It releases
-// its query/scale banks before normal hot-first LI, and publishes no hit bits,
-// progress or service windows. The final scan keeps its original score/order.
+// A score-only range inside the existing LI launch. Keep Q/weights/query-scale
+// for the following resident range, but finish the key/scale tail because its
+// next physical address is discontinuous. No hit/progress/service is published.
+// KVIP_RECENT_PIPELINE=0 preserves the original release/reload boundary.
 template <typename QLIT>
 __aicore__ inline bool QuantLightningIndexerKernel<QLIT>::ScoreRecent(
     uint32_t& loop, uint32_t qScaleLoop, uint32_t shard, uint32_t shards)
@@ -701,6 +706,9 @@ __aicore__ inline bool QuantLightningIndexerKernel<QLIT>::ScoreRecent(
         if ((tile - tiles.begin) % QLICommon::KScaleTiles == 0) ++scaleLoop;
         QLICommon::RunInfo info;
         CalcRunInfo(loop, tile, info, qScaleLoop, scaleLoop);
+#if KVIP_RECENT_PIPELINE
+        info.retainQuery = true;
+#endif
         if ASCEND_IS_AIC {
             matmulService.ComputeMm1(info);
         } else {
@@ -805,13 +813,14 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()
         }
         for (uint32_t gS1LoopIdx = splitCoreInfo.gS1Start; gS1LoopIdx <= tempLoopInfo.gS1LoopEnd; gS1LoopIdx++) {
             CalcS2LoopParams(bN2LoopIdx, gS1LoopIdx);
-            ScoreRecent(gloop, qScaleLoop);
+            bool hadRecent = ScoreRecent(gloop, qScaleLoop);
             uint32_t kScaleLoop = 0;
             for (int s2LoopIdx = splitCoreInfo.s2Start; s2LoopIdx <= tempLoopInfo.s2LoopEnd; s2LoopIdx++) {
                 if ((s2LoopIdx - splitCoreInfo.s2Start) % QLICommon::KScaleTiles == 0) {
                     ++kScaleLoop;
                 }
-                ProcessBaseBlock(gloop, s2LoopIdx, runInfo, qScaleLoop, kScaleLoop);
+                ProcessBaseBlock(gloop, s2LoopIdx, runInfo, qScaleLoop, kScaleLoop,
+                                 hadRecent && s2LoopIdx == splitCoreInfo.s2Start);
                 ++gloop;
             }
             ++qScaleLoop;
@@ -835,9 +844,12 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()
 template <typename QLIT>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessBaseBlock(uint32_t loop, uint64_t s2LoopIdx,
                                                           QLICommon::RunInfo runInfo, uint32_t qScaleLoop,
-                                                          uint32_t kScaleLoop)
+                                                          uint32_t kScaleLoop, bool reuseQuery)
 {
     CalcRunInfo(loop, s2LoopIdx, runInfo, qScaleLoop, kScaleLoop);
+#if KVIP_RECENT_PIPELINE
+    runInfo.reuseQuery = reuseQuery;
+#endif
     if ASCEND_IS_AIC {
         matmulService.ComputeMm1(runInfo);
         if (!rotationServed_ && rotating::EpochAt(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.splitQ,runtimeShape_.rounds,runtimeShape_.serviceAics,s2LoopIdx + 1, aiCoreIdx) >= 0) {

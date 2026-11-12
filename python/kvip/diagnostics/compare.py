@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Compare current serial chains and resident/recent fusion on one frozen input.
+"""Compare current serial and fused chains on one frozen input.
 
-Each backend has its own process. A fused A/B pair shares one DDR import and
-uses the same production launcher, changing only its threshold range pointer.
+Each backend/mode has its own process. Fused variants share one DDR import and
+production launcher. Studies change the seed range or its pipeline/TopK work.
 """
 
 import argparse
@@ -25,6 +25,7 @@ def arguments(argv=None):
     p.add_argument("--serial-workers", type=int, default=32)
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--iterations", type=int, default=10)
+    p.add_argument("--study", choices=("threshold", "pipeline"), default="threshold")
     p.add_argument("--result-dir", type=Path, required=True)
     args = p.parse_args(argv)
     if args.device < 0 or args.warmup < 0 or args.iterations < 1 or not 1 <= args.serial_workers <= 48:
@@ -53,7 +54,7 @@ def read_means(result):
     return {name: sum(x[name] for x in samples) / len(samples) for name in names}
 
 
-def summarize(results):
+def summarize(results, study="threshold"):
     first = next(iter(results.values()))
     for result in results.values():
         if result.get("status") != "pass" or any(
@@ -73,10 +74,31 @@ def summarize(results):
             selection=result["selection_comparison"],
             workers=result["runtime_workers"],
             post_size=result.get("batch_get_post_size"),
+            tuning=result.get("tuning"),
         )
     effects = {}
     for transport in ("urma", "ubmem"):
         best = transport + "-serial"
+        if study == "pipeline":
+            before, pipeline, unified = (
+                table[f"{transport}-fused-{name}"] for name in ("before", "pipeline", "unified")
+            )
+            for variant in (pipeline, unified):
+                if any(
+                    variant["selection"][key] != before["selection"][key]
+                    for key in ("selected_set_sha256", "ordered_output_sha256")
+                ):
+                    raise ValueError("Pipeline/TopK A/B changed the final selection")
+                if any(variant["threshold"][key] != before["threshold"][key] for key in ("initial_keys", "final_keys")):
+                    raise ValueError("Pipeline/TopK A/B changed the threshold")
+            effects[transport] = dict(
+                serial_reference=best,
+                pipeline_reduction_pct=100 * (1 - pipeline["mean_us"] / before["mean_us"]),
+                unified_topk_incremental_reduction_pct=100 * (1 - unified["mean_us"] / pipeline["mean_us"]),
+                combined_reduction_pct=100 * (1 - unified["mean_us"] / before["mean_us"]),
+                combined_vs_serial_reduction_pct=100 * (1 - unified["mean_us"] / table[best]["mean_us"]),
+            )
+            continue
         before, after = (table[f"{transport}-fused-{policy}"] for policy in ("resident", "recent"))
         if any(
             before["selection"][key] != after["selection"][key]
@@ -90,6 +112,7 @@ def summarize(results):
         )
     return dict(
         status="pass",
+        study=study,
         kvip_commit=source_commit(),
         geometry=first["geometry"],
         snapshot_sha256=first["snapshot_sha256"],
@@ -113,6 +136,20 @@ def print_summary(summary):
             flush=True,
         )
     for transport, effect in summary["effects"].items():
+        if summary.get("study") == "pipeline":
+            print(
+                f"CHECK {transport} initial_threshold=unchanged_bit_exact final_scores=bit_exact "
+                "final_topk=unchanged_ordered KV_Index_outputs=verified",
+                flush=True,
+            )
+            print(
+                f"GAIN {transport} pipeline={effect['pipeline_reduction_pct']:.2f}% "
+                f"unified_topk_increment={effect['unified_topk_incremental_reduction_pct']:.2f}% "
+                f"combined={effect['combined_reduction_pct']:.2f}% "
+                f"combined_vs_serial={effect['combined_vs_serial_reduction_pct']:.2f}%",
+                flush=True,
+            )
+            continue
         a, b = (summary["table"][f"{transport}-fused-{p}"]["threshold"] for p in ("resident", "recent"))
         print(
             f"THRESHOLD {transport} gap_mean={a['mean_gap']:.7g}->{b['mean_gap']:.7g} "
@@ -167,13 +204,15 @@ def run(args):
             str(args.iterations),
             "--output",
             str(output),
+            "--study",
+            args.study,
         ]
         if mode == "serial":
             cmd += ["--serial-workers", str(args.serial_workers)]
         print(
             f"RUN {name}"
             + (
-                " resident/recent share DDR"
+                (" before/pipeline/unified share DDR" if args.study == "pipeline" else " resident/recent share DDR")
                 if mode == "fused"
                 else f" workers={args.serial_workers}"
                 + (f" post={post_size} inflight=2048" if transport == "urma" else "")
@@ -191,7 +230,7 @@ def run(args):
         else:
             results[name] = report
         log.unlink()
-    summary = summarize(results)
+    summary = summarize(results, args.study)
     summary["snapshot"] = str(args.snapshot.resolve())
     summary["manifest_sha256"] = file_digest(args.snapshot / "manifest.json")
     (args.result_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")

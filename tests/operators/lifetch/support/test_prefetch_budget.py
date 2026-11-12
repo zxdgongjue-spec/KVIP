@@ -105,6 +105,15 @@ def test_shared_hot_selector_invalidates_specialization_cache(tmp_path, monkeypa
     (shared / "op_kernel/indexer/indexer.h").write_text("// changed shared indexer\n")
     rebuilt = specialization.build_ubmem_library(**options)
     assert rebuilt != updated and len(calls) == 8
+    before = specialization.build_ubmem_library(**options, recent_pipeline=False, recent_unified_topk=False)
+    pipeline = specialization.build_ubmem_library(**options, recent_pipeline=True, recent_unified_topk=False)
+    assert len({rebuilt, before, pipeline}) == 3
+    assert specialization.build_ubmem_library(**options) == rebuilt
+    assert len(calls) == 12
+    assert "-DKVIP_RECENT_PIPELINE=0" in calls[-4]
+    assert "-DKVIP_RECENT_UNIFIED_TOPK=0" in calls[-4]
+    assert "-DKVIP_RECENT_PIPELINE=1" in calls[-2]
+    assert "-DKVIP_RECENT_UNIFIED_TOPK=0" in calls[-2]
 
 
 def test_service_chunk_assignment_covers_every_request_once(tmp_path):

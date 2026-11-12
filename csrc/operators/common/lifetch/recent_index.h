@@ -43,5 +43,19 @@ inline void Remap(__ubuf__ uint32_t* indices, __ubuf__ uint32_t* previous,
             (index - 2048 < count ? begin + index - 2048 : UINT32_MAX);
     }
 }
+
+// Resident and recent scores were packed into one existing TopK input bank.
+// Restore physical Index positions; the gap between the two GM ranges is not
+// part of the candidate set, and neither Index storage nor scoreGm is moved.
+__simt_vf__ __aicore__ LAUNCH_BOUND(512)
+inline void RemapUnified(__ubuf__ uint32_t* indices, uint32_t residentCount,
+                         uint32_t recentBegin, uint32_t recentCount) {
+    for (uint32_t i = threadIdx.x; i < 2048; i += 512) {
+        uint32_t index = indices[i];
+        indices[i] = index < residentCount ? index :
+            (index - residentCount < recentCount ?
+                recentBegin + index - residentCount : UINT32_MAX);
+    }
+}
 } // namespace kvip_recent_index
 #endif

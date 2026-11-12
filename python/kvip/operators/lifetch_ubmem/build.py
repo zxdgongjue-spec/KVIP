@@ -9,7 +9,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from kvip.runtime.build import build_failure
+from kvip.runtime.build import build_failure, recent_build_options
 
 
 @dataclass(frozen=True)
@@ -42,7 +42,6 @@ class UbmemGeometry:
         if (self.history - self.resident) // 128 <= min(self.intermediate_fetches, cores):
             raise ValueError("UBmem requires more cold tiles than active prefetch windows")
 
-
     def options(self, cann):
         # Kernel copy variants are packaged together. The other shape fields
         # are runtime parameters and must not affect the binary cache key.
@@ -68,7 +67,9 @@ def kvaf_source(build_dir):
     raise ValueError(f"KVAF source path is missing from {build_dir}/CMakeCache.txt")
 
 
-def build_ubmem_library(*, cache_dir, cann, shape, jobs=2, optimized=True):
+def build_ubmem_library(
+    *, cache_dir, cann, shape, jobs=2, optimized=True, recent_pipeline=True, recent_unified_topk=True
+):
     """Compile once before profiling/capture; never called by forward."""
     if not isinstance(shape, UbmemGeometry) or jobs < 1:
         raise ValueError("A validated UBmem shape and positive jobs are required")
@@ -78,6 +79,7 @@ def build_ubmem_library(*, cache_dir, cann, shape, jobs=2, optimized=True):
     kvaf_root = kvaf_source(Path(cache_dir).parent)
     kvaf_include = kvaf_root / "access_operator/include"
     options = shape.options(cann) | {"KVAF_INCLUDE": str(kvaf_include), "KVIP_STREAMING_UBMEM": "ON"}
+    options.update(recent_build_options(pipeline=recent_pipeline, unified_topk=recent_unified_topk))
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     shared_lifetch = source.parent / "lightning_indexer_with_fetch"
     directories = [source, source.parent / "common", shared_lifetch]

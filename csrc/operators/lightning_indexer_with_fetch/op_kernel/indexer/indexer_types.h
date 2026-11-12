@@ -21,6 +21,12 @@
 #if KVIP_LI_SCALE_TILES != 0 && KVIP_LI_SCALE_TILES != 8
 #error "KVIP_LI_SCALE_TILES must be 0 or 8"
 #endif
+#ifndef KVIP_RECENT_PIPELINE
+#define KVIP_RECENT_PIPELINE 1
+#endif
+#if KVIP_RECENT_PIPELINE != 0 && KVIP_RECENT_PIPELINE != 1
+#error "KVIP_RECENT_PIPELINE must be 0 or 1"
+#endif
 using namespace AscendC;
 namespace QLICommon {
 constexpr uint32_t KScaleTiles = KVIP_LI_SCALE_TILES ? KVIP_LI_SCALE_TILES : 16;
@@ -77,6 +83,12 @@ struct RunInfo {
 
     bool isFirstS2InnerLoop;
     bool isLastS2InnerLoop;
+    // A physical S2 range boundary need not end the query's lifetime. Keep
+    // the existing key/scale range flags while continuing the same Q banks.
+    bool reuseQuery = false;
+    bool retainQuery = false;
+    __aicore__ inline bool LoadQuery() const { return isFirstS2InnerLoop && !reuseQuery; }
+    __aicore__ inline bool ReleaseQuery() const { return isLastS2InnerLoop && !retainQuery; }
     bool isAllLoopEnd = false;
     bool isValid = false;
 };

@@ -37,7 +37,14 @@ def build_failure(log, stage, returncode):
     )
 
 
-def build_libraries(*, cache_dir, cann, headers, soc):
+def recent_build_options(*, pipeline=True, unified_topk=True):
+    """Compile-time A/B controls for the recent-Index seed only."""
+    if type(pipeline) is not bool or type(unified_topk) is not bool:
+        raise ValueError("Recent pipeline and unified TopK options must be boolean")
+    return dict(KVIP_RECENT_PIPELINE=int(pipeline), KVIP_RECENT_UNIFIED_TOPK=int(unified_topk))
+
+
+def build_libraries(*, cache_dir, cann, headers, soc, recent_pipeline=True, recent_unified_topk=True):
     """Build one shape-independent binary per source/toolchain/SoC."""
     root = Path(__file__).resolve().parents[3] / "csrc/operators"
     options = dict(
@@ -46,6 +53,7 @@ def build_libraries(*, cache_dir, cann, headers, soc):
         KVAF_INCLUDE=str(headers),
         SOC_VERSION=soc,
     )
+    options.update(recent_build_options(pipeline=recent_pipeline, unified_topk=recent_unified_topk))
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     for relative in (
         "version.info",
@@ -66,7 +74,7 @@ def build_libraries(*, cache_dir, cann, headers, soc):
     digest.update(shared_selector.read_bytes())
     directory = Path(cache_dir) / digest.hexdigest()[:20]
     directory.mkdir(parents=True, exist_ok=True)
-    libraries = directory / "libv9_bridge.so",
+    libraries = (directory / "libv9_bridge.so",)
     log = directory / "build.log"
     logging.getLogger("kvip").info("Universal LIFetch build: soc=%s log=%s", soc, log)
     with (directory / "build.lock").open("w") as lock:

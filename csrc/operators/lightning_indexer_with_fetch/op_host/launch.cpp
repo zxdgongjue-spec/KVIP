@@ -1,6 +1,14 @@
 #include "../op_kernel/pipeline_types.h"
 #include "api.h"
 #include "context.h"
+#ifndef KVIP_RECENT_PIPELINE
+#define KVIP_RECENT_PIPELINE 1
+#endif
+#ifndef KVIP_RECENT_UNIFIED_TOPK
+#define KVIP_RECENT_UNIFIED_TOPK 1
+#endif
+extern "C" uint32_t kvip_recent_pipeline() { return KVIP_RECENT_PIPELINE; }
+extern "C" uint32_t kvip_recent_unified_topk() { return KVIP_RECENT_UNIFIED_TOPK; }
 extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) { return rotating::PrepareShape(shape); }
 #define ENTRY(name, blocks) \
 extern "C" uint32_t aclrtlaunch_v9_##name##_kernel(uint32_t,void*,void*); \

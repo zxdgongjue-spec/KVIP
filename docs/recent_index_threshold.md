@@ -1,6 +1,6 @@
 # 用近期 Index 补齐融合算子的早阈值
 
-本次在最新 `main` 的融合执行路径上，只增加一种早阈值输入：resident 前缀加上近期 Index。URMA 与 UBmem 均保留当前串行实现和融合调度；对照时只切换是否使用这段近期 Index。离线工具读取以前采集的数据，历史记录中的优化参数只用于校验和溯源，不用于启用旧实现。
+本次在最新 `main` 的融合执行路径上，增加一种早阈值输入：resident 前缀加上近期 Index，并减少准备这一阈值时的重复搬运与TopK工作。URMA 与 UBmem 均保留当前串行实现和融合调度。`--study threshold`比较是否加入近期Index，`--study pipeline`在相同resident+recent候选上比较两项实现优化。离线工具读取以前采集的数据，历史记录中的优化参数只用于校验和溯源，不用于启用旧实现。
 
 当前已经完成 CPU 侧数据契约、统计和输入合并测试。100 轮统计结果及 NPU 耗时需要在持有原始数据的服务器运行后才能确定，本文不预设收益。
 
@@ -184,6 +184,56 @@ resident 物理前缀
 ```
 
 终端保留各路径耗时、miss、预取量、无效预取量及阈值变化。成功时临时native日志会移除；失败时显示必要的日志尾部。每组 `summary.json` 保留比较结果。耗时包含完整设备算子链及新增近期Index打分与合并，不包含快照恢复、CPU调度和输入H2D；`graph_payload_GBps`以整条设备链为分母，不能当作Fetch阶段的独立带宽。
+
+## 分别验证流水复用和统一TopK
+
+近期Index与resident使用同一份query、weights和query scale。原实现先完成近期段，再释放并重新加载这些输入来计算resident段；流水复用让它们跨这两个物理区间保持有效。Key和key scale仍在各物理段末尾归还缓冲，跨核完成信号与最终历史扫描保持原职责。
+
+原早阈值准备先对resident取TopK，再把近期分数与这2048项合并。统一TopK将resident和近期两个不重叠分数区间接成一个候选流，用现有精确TopK处理；它仍按每个query的因果末尾裁剪，范围不满足条件时保留原路径。完整历史打分、ScoreGM写入和最终TopK没有从计时中删除。
+
+`--study pipeline`自动运行以下三档；三档均启用resident+recent，预取预算均为512、每窗口64：
+
+| 结果名 | `KVIP_RECENT_PIPELINE` | `KVIP_RECENT_UNIFIED_TOPK` | 对照目的 |
+| --- | --- | --- | --- |
+| `before` | 0 | 0 | 本次近期阈值实现优化前的执行方式 |
+| `pipeline` | 1 | 0 | 单独计量跨段输入复用 |
+| `unified` | 1 | 1 | 在复用基础上计量统一TopK的增量 |
+
+这里的`before`已经计算近期阈值，不是只用resident的基线。每个后端的三档共享同一Runtime和DDR arena，各档在计时外恢复相同输入。两项编译开关进入构建缓存标识，加载后还会读取native getter核对实际开关。原始有效LI分数、早阈值及最终阈值要求逐bit相同，三档最终TopK要求顺序一致；合成KV字节与Index联动继续由原oracle验证。
+
+已有上一节五组输入和CPU服务后，可直接运行以下命令；无需重做CPU统计或输入合并：
+
+```bash
+(
+    set -euo pipefail
+    repo=/home/c00982601/CacheOS/vLLM-DSA
+    input_root="${RECENT_INPUT_ROOT:?设置为FIVE_INPUTS_READY输出的完整目录}"
+    kernel="${KVAF_BATCH_GET_KERNEL:?先加载当前KVIP/scripts/env.sh}"
+    build="${kernel%/bin/kvaf_execute_batch_get_kernels.o}"
+    test "$build" != "$kernel"
+    test -s "$build/bin/kvaf_execute_batch_get_kernels.o"
+    kvaf_server="${KVAF_SERVER:-127.0.0.1:28999}"
+    result="$input_root/pipeline-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    export PYTHONPATH="$repo/third_party/KVIP/python${PYTHONPATH:+:$PYTHONPATH}"
+    export ASCEND_RT_VISIBLE_DEVICES=4
+
+    for group in 2 7 10 17 4; do
+        /usr/local/python3.12.13/bin/python3 -B -m kvip.diagnostics.compare \
+            --snapshot "$input_root/g${group}-input" \
+            --build-dir "$build" \
+            --kvaf-server "$kvaf_server" \
+            --device 0 \
+            --soc Ascend950DT_9582 \
+            --serial-workers 32 \
+            --study pipeline \
+            --warmup 2 \
+            --iterations 10 \
+            --result-dir "$result/g${group}"
+    done
+)
+```
+
+每组包含两个当前串行基线和六个融合结果。`pipeline`收益以`before`为分母，统一TopK的增量以`pipeline`为分母，组合收益以`before`为分母；与串行的比较另列。三档固定顺序执行，短测仍可能受时钟、温度及外部负载影响。收益尚需服务器实测，不能把CPU模型或编译通过解释为性能通过，也不能将该单组设备链的变化直接换算成服务TPOT变化。
 
 ## 判定是否值得保留
 

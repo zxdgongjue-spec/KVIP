@@ -17,8 +17,12 @@ if(NOT EXISTS "${KVAF_INCLUDE}/ubmem/fused_batch_get_device.h")
 endif()
 include("${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake")
 set(KVIP_STREAMING_UBMEM ON)
+option(KVIP_RECENT_PIPELINE "Keep query state across recent/resident seed ranges" ON)
+option(KVIP_RECENT_UNIFIED_TOPK "Select the resident/recent seed TopK in one stream" ON)
 set(_streaming "${CMAKE_CURRENT_SOURCE_DIR}/../lightning_indexer_with_fetch")
 set(_definitions
+  KVIP_RECENT_PIPELINE=$<BOOL:${KVIP_RECENT_PIPELINE}>
+  KVIP_RECENT_UNIFIED_TOPK=$<BOOL:${KVIP_RECENT_UNIFIED_TOPK}>
   TOKEN_BYTES=656 SIM_Q=4 SIM_CAPTURE_HITS=1
   V9_UBMEM=1 V9_UBPIPE_DEPTH=8 V9_UBPIPE_ROWS=4 V9_WINDOW_UBPIPE_DEPTH=8
   V9_WINDOW_COPY_ENGINE=0 V9_WINDOW_SCAN_FUSED=0 V9_WINDOW_PREPARED_GROUPS=0

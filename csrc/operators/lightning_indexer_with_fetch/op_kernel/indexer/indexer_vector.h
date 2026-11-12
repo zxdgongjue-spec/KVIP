@@ -30,6 +30,13 @@
 #include "topk.h"
 #include "../../../common/lifetch/recent_index.h"
 
+#ifndef KVIP_RECENT_UNIFIED_TOPK
+#define KVIP_RECENT_UNIFIED_TOPK 1
+#endif
+#if KVIP_RECENT_UNIFIED_TOPK != 0 && KVIP_RECENT_UNIFIED_TOPK != 1
+#error "KVIP_RECENT_UNIFIED_TOPK must be 0 or 1"
+#endif
+
 namespace QLIKernel {
 using namespace QLICommon;
 constexpr uint32_t TRUNK_LEN_16K = 16384;
@@ -160,6 +167,56 @@ private:
     LocalTensor<uint16_t> classifyUB_;
     TBuf<TPosition::VECCALC> prefixThresholdBuf_;
     LocalTensor<uint16_t> prefixThreshold_;
+    __aicore__ inline bool TryUnifiedResidentTopK(uint32_t query, uint32_t scoreRow,
+                                                uint32_t residentCount, uint32_t availableEnd) {
+#if KVIP_RECENT_UNIFIED_TOPK
+        if constexpr (std::is_same_v<SCORE_T, uint16_t>) {
+            auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+            if (!ctx->thresholdBounds || residentCount < topkCount_) return false;
+            uint32_t end = ctx->queryEnds ?
+                reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)[query] : runtimeShape_.history;
+            end = Min(end, availableEnd);
+            auto bounds = reinterpret_cast<__gm__ int32_t*>(ctx->thresholdBounds) + (query / SIM_Q) * 2;
+            auto range = kvip_recent_index::Clip(bounds[0], bounds[1], runtimeShape_.resident,
+                                                runtimeShape_.history, end);
+            uint32_t recentCount = range.end - range.begin;
+            uint32_t total = residentCount + recentCount;
+            uint32_t aligned = QLICommon::Align(total, uint32_t(256));
+            // The existing merge and temporary-index banks both hold trunk+K.
+            // A 16K resident prefix plus up to 2K recent scores therefore needs
+            // one histogram selection, not resident TopK followed by K+recent.
+            // Keep the original exact merge for larger unions or unaligned
+            // resident prefixes; no added UB or dropped recent candidates.
+            if (!recentCount || residentCount % 16 != 0 ||
+                aligned > topkCountAlign256_ + trunkLen_) return false;
+            if (aligned != total) {
+                Duplicate(mrgValueLocal_[total / 256 * 256], SCORE_T(0),
+                          aligned - total / 256 * 256);
+            }
+            SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+            WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+            DataCopyExtParams copy{1, residentCount * uint32_t(sizeof(SCORE_T)), 0, 0, 0};
+            DataCopyPadExtParams<SCORE_T> pad{true, 0, 0, 0};
+            uint64_t row = uint64_t(scoreRow) * runtimeShape_.history;
+            DataCopyPad(mrgValueLocal_, scoreGm[row], copy, pad);
+            copy.blockLen = recentCount * uint32_t(sizeof(SCORE_T));
+            DataCopyPad(mrgValueLocal_[residentCount], scoreGm[row + range.begin], copy, pad);
+            SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+            WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+            topkOp_(mrgValueLocal_, indicesOutLocal_, scoreOutLocal_, aligned, 0, 1, true);
+            SetFlag<HardEvent::V_S>(EVENT_ID0);
+            WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            Simt::VF_CALL<kvip_recent_index::RemapUnified>(Simt::Dim3{512, 1, 1},
+                reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),
+                residentCount, range.begin, recentCount);
+            SetFlag<HardEvent::V_S>(EVENT_ID0);
+            WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            return true;
+        }
+#endif
+        return false;
+    }
+
     __aicore__ inline void MergeRecentScores(uint32_t query, uint32_t scoreRow, uint32_t availableEnd = UINT32_MAX) {
         auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
         if (!ctx->thresholdBounds) return;
@@ -199,8 +256,9 @@ private:
         }
     }
 
-    __aicore__ inline void SaveResident(uint32_t query, uint32_t scoreRow, bool publishProgress, uint32_t availableEnd) {
-        MergeRecentScores(query, scoreRow, availableEnd);
+    __aicore__ inline void SaveResident(uint32_t query, uint32_t scoreRow, bool publishProgress,
+                                      uint32_t availableEnd, bool recentMerged = false) {
+        if (!recentMerged) MergeRecentScores(query, scoreRow, availableEnd);
         auto src = (__local_mem__ uint16_t *)scoreOutLocal_.GetPhyAddr();
         auto dst = (__local_mem__ uint16_t *)prefixThreshold_.GetPhyAddr() + (query % 2) * 128;
         __VEC_SCOPE__ {
@@ -569,7 +627,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         return;
     }
 
-    if (info.isFirstS2InnerLoop) {
+    if (info.LoadQuery()) {
         WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_QSCALE + qScalepingpong);
         //weightsGm --> weightUB_
         int64_t weightGmOffset = info.tensorWeightsOffset + curAivS1Idx * kHeadNum_ * gSize_;
@@ -639,7 +697,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
                                         qScaleBase, UB_BANK_DEPTH_STRIDE / sizeof(SCALE_T),
                                         gSize_, curAivS1ProcNum);
     }
-    if (info.isFirstS2InnerLoop) {
+    if (info.LoadQuery()) {
         SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_QSCALE + qScalepingpong);
     }
 #if KVIP_LI_SCALE_TILES
@@ -921,7 +979,10 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
 
         AscendC::DataCopyPadExtParams<SCORE_T> padParams{true, 0, 0, 0};
-        if (validS2Len >= topkCount_) {
+        const bool recentMerged = prefixActive_ && TryUnifiedResidentTopK(
+            info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, vecOffset,
+            uint32_t(validS2Len), recentEnd);
+        if (!recentMerged && validS2Len >= topkCount_) {
             uint32_t s2LoopNum = (validS2Len + trunkLen_ - 1) / trunkLen_;
             if (s2LoopNum == 1) {
                 uint32_t validS2LenAlign = QLICommon::Align(validS2Len, (int32_t)256);
@@ -984,7 +1045,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
                     SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT1);
                 }
             }
-        } else {
+        } else if (!recentMerged) {
             AscendC::CreateVecIndex(indicesOutLocal_.ReinterpretCast<int32_t>(), (int32_t)zero, validS2Len);
         }
 
@@ -1006,7 +1067,8 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
         if (prefixActive_) {
             if (validS2Len < topkCount_) Duplicate(scoreOutLocal_, uint16_t(0), topkCount_);
-            SaveResident(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, vecOffset, queryRow == SIM_Q, recentEnd);
+            SaveResident(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, vecOffset,
+                         queryRow == SIM_Q, recentEnd, recentMerged);
         } else {
         AscendC::DataCopyPad(indiceOutGm[info.indiceOutOffset + (curS1Idx + rowIdx) * topkCount_], indicesOutLocal_.ReinterpretCast<int32_t>(), copyOutParams);
         }

@@ -99,8 +99,18 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
     assert len(commands) == 6
 
     selector.write_text("// updated shared LIDU selector\n")
-    assert build.build_libraries(**options) != updated
+    current = build.build_libraries(**options)
+    assert current != updated
     assert len(commands) == 8
+    before = build.build_libraries(**options, recent_pipeline=False, recent_unified_topk=False)
+    pipeline = build.build_libraries(**options, recent_pipeline=True, recent_unified_topk=False)
+    assert len({current, before, pipeline}) == 3
+    assert build.build_libraries(**options) == current
+    assert len(commands) == 12
+    assert "-DKVIP_RECENT_PIPELINE=0" in commands[-4]
+    assert "-DKVIP_RECENT_UNIFIED_TOPK=0" in commands[-4]
+    assert "-DKVIP_RECENT_PIPELINE=1" in commands[-2]
+    assert "-DKVIP_RECENT_UNIFIED_TOPK=0" in commands[-2]
 
 
 def test_actual_operator_cmake_resolves_relocated_sources(tmp_path):

@@ -125,11 +125,12 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         )
 
         logical = cpu_array(torch, update.logical_output)
+        ordered = logical.reshape(expected.shape).astype("<i4")
         if (
-            array_digest(np.sort(logical.reshape(expected.shape).astype("<i4"), axis=-1))
-            != bundle.selection_comparison["selected_set_sha256"]
+            array_digest(np.sort(ordered, axis=-1)) != bundle.selection_comparison["selected_set_sha256"]
+            or array_digest(ordered) != bundle.selection_comparison["ordered_output_sha256"]
         ):
-            raise AssertionError("Fused final selection changed during timed replay")
+            raise AssertionError("Fused final ordered selection changed during timed replay")
         reads.update(demand.classify(logical))
         return reads
 
@@ -143,11 +144,11 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         from kvip.diagnostics.selection import verify_fused_scores
 
         selected_expected, selection = verify_fused_scores(archive, cpu_array(torch, rotating.arguments[9]))
-        if (
-            bundle.selection_comparison
-            and selection["selected_set_sha256"] != bundle.selection_comparison["selected_set_sha256"]
+        if bundle.selection_comparison and any(
+            selection[key] != bundle.selection_comparison[key]
+            for key in ("selected_set_sha256", "ordered_output_sha256")
         ):
-            raise AssertionError("Fused TopK selection changed across eager/graph runs")
+            raise AssertionError("Fused ordered TopK selection changed across eager/graph runs")
         bundle.selection_comparison = selection
         reads = read_counts()
 
@@ -428,19 +429,40 @@ def release_context(context):
     context.runtime.shutdown()
 
 
+def study_cases(args):
+    """Ablate only the two new seed changes, with identical recent inputs."""
+    if getattr(args, "study", "threshold") == "pipeline":
+        return {
+            name: dict(recent_threshold=True, recent_pipeline=pipeline, recent_unified_topk=topk)
+            for name, pipeline, topk in (("before", False, False), ("pipeline", True, False), ("unified", True, True))
+        }
+    return {policy: {"recent_threshold": policy == "recent"} for policy in ("resident", "recent")}
+
+
+def verify_case_equivalence(cases, *, same_threshold):
+    first = next(iter(cases.values()))
+    for case in cases.values():
+        if (
+            case["selection_comparison"]["ordered_output_sha256"]
+            != first["selection_comparison"]["ordered_output_sha256"]
+        ):
+            raise AssertionError("Seed A/B changed the final ordered TopK outputs")
+        if same_threshold and any(
+            case["threshold_comparison"][key] != first["threshold_comparison"][key]
+            for key in ("initial_keys", "final_keys")
+        ):
+            raise AssertionError("Pipeline/TopK optimization changed exact threshold values")
+
+
 def run(args, archive, retained):
     context = allocate_context(args, archive, retained)
-    if args.mode == "fused" and args.threshold_policy == "both":
+    pipeline_study = getattr(args, "study", "threshold") == "pipeline"
+    if args.mode == "fused" and (args.threshold_policy == "both" or pipeline_study):
         cases = {}
-        for policy in ("resident", "recent"):
-            args.fused_tuning = {"recent_threshold": policy == "recent"}
-            cases[policy] = measure_case(args, archive, context, retained)
-        before, after = cases["resident"], cases["recent"]
-        if (
-            before["selection_comparison"]["ordered_output_sha256"]
-            != after["selection_comparison"]["ordered_output_sha256"]
-        ):
-            raise AssertionError("Threshold policy changed the final ordered TopK outputs")
+        for name, tuning in study_cases(args).items():
+            args.fused_tuning = tuning
+            cases[name] = measure_case(args, archive, context, retained)
+        verify_case_equivalence(cases, same_threshold=pipeline_study)
         result = dict(status="pass", transport=args.transport, mode=args.mode, cases=cases)
     else:
         result = measure_case(args, archive, context, retained)

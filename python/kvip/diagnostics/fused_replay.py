@@ -3,6 +3,7 @@
 
 from pathlib import Path
 from types import SimpleNamespace
+import ctypes
 
 from kvip.cache.index_storage import IndexCacheStorage
 
@@ -10,10 +11,10 @@ from kvip.cache.index_storage import IndexCacheStorage
 def validate_fused_tuning(value, transport):
     if transport not in ("ubmem", "urma") or not isinstance(value, dict):
         raise ValueError("Expected a tuning object and ubmem/urma transport")
-    if set(value) - {"recent_threshold"}:
-        raise ValueError("Only recent_threshold is changed in this production A/B comparison")
-    if "recent_threshold" in value and type(value["recent_threshold"]) is not bool:
-        raise ValueError("recent_threshold must be boolean")
+    if set(value) - {"recent_threshold", "recent_pipeline", "recent_unified_topk"}:
+        raise ValueError("Only recent-threshold seed options are changed in this production A/B comparison")
+    if any(type(flag) is not bool for flag in value.values()):
+        raise ValueError("Recent-threshold seed options must be boolean")
     return value
 
 
@@ -55,7 +56,14 @@ def create_fused(
     common = dict(
         batch=b, history=h, aics=g["aic_count"], windows=g["requested_windows"], device=device, index_heads=g["heads"]
     )
-    effective = dict(recent_threshold=tuning.get("recent_threshold", False), prefetch_limit=512, window_limit=64)
+    effective = dict(
+        recent_threshold=tuning.get("recent_threshold", False),
+        recent_pipeline=tuning.get("recent_pipeline", True),
+        recent_unified_topk=tuning.get("recent_unified_topk", True),
+        prefetch_limit=512,
+        window_limit=64,
+    )
+    build_options = {key: effective[key] for key in ("recent_pipeline", "recent_unified_topk")}
     threshold_bounds = None
     if effective["recent_threshold"]:
         # Immutable per-replay bounds; all scoring/merging occurs inside forward.
@@ -63,13 +71,15 @@ def create_fused(
         threshold_bounds = archive.tensor("pre.threshold_bounds", torch, device)
     if transport == "ubmem":
         shape = UbmemGeometry(b, h, r, g["heads"], g["token_bytes"], g["aic_count"], g["requested_windows"], soc)
-        library = build_ubmem_library(cache_dir=Path(build) / "lifetch_ubmem", cann=cann, shape=shape)
+        library = build_ubmem_library(cache_dir=Path(build) / "lifetch_ubmem", cann=cann, shape=shape, **build_options)
         workspace = UbmemWorkspace(torch, resident=r, **common)
     else:
         runtime_cann, headers = kvaf_build_paths(build)
         if runtime_cann.resolve() != Path(cann).resolve():
             raise ValueError("KVAF and fusion must use the same CANN build")
-        (library,) = build_libraries(cache_dir=Path(build) / "lifetch", cann=cann, headers=headers, soc=soc)
+        (library,) = build_libraries(
+            cache_dir=Path(build) / "lifetch", cann=cann, headers=headers, soc=soc, **build_options
+        )
         workspace = LIFetchWorkspace(torch, **common)
     storage = IndexCacheStorage(torch, g["owners"], h, r, device)
     output = archive.tensor("pre.output", torch, device)
@@ -126,6 +136,11 @@ def create_fused(
             **kwargs,
         )
         update_type = DirectIndexUpdate
+    for key, expected in build_options.items():
+        function = getattr(rotating.library, "kvip_" + key)
+        function.argtypes, function.restype = [], ctypes.c_uint32
+        if function() != int(expected):
+            raise RuntimeError(f"Loaded kernel does not match requested {key}={expected}")
     # Keep the archived output shape for generic state reset/oracle.
     rotating.output = output
     update = update_type(
