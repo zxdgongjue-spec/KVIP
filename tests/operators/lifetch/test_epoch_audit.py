@@ -88,12 +88,12 @@ def test_epoch_audit_profiled_counters_only_on_served_epochs():
     assert all(x["selected_for_post_count"] is None for x in skipped)
     assert all(x["posted_count"] == 0 for x in skipped)
     assert all(x["wait_cycles"] == 25 for x in skipped)
-    assert all(x["closure_publish_cycles"] == 10 for x in skipped)
+    assert all(x["closure_pre_publish_cycles"] == 10 for x in skipped)
     assert all(x["wait_polls"] == 3 for x in skipped)
-    assert result["summary"]["skipped_closure_publish_cycles_total"] == 50
+    assert result["summary"]["skipped_closure_pre_publish_cycles_total"] == 100
     assert result["summary"]["skipped_wait_polls_total"] == 30
     assert result["summary"]["empty_served_lanes"] == 0
-    assert "ClosureCycles" in format_rotation_table(result)
+    assert "ClosurePrePublishCycles" in format_rotation_table(result)
 
 
 def test_epoch_audit_does_not_mislabel_disabled_profiling_as_zero():

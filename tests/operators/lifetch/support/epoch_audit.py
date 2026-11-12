@@ -113,7 +113,7 @@ def audit_rotation_events(
                 "wait_cycles": None,
                 "wait_polls": None,
                 "service_cycles": None,
-                "closure_publish_cycles": None,
+                "closure_pre_publish_cycles": None,
                 "posted_count": None,
             }
 
@@ -160,8 +160,8 @@ def audit_rotation_events(
                         posted_count=0,
                     )
                     if begin and end >= begin:
-                        # Ends immediately before the final Event cache flush.
-                        entry["closure_publish_cycles"] = end - begin
+                        # Ends before complete publication and the final Event cache flush.
+                        entry["closure_pre_publish_cycles"] = end - begin
                 else:
                     candidate_count = int(words64[epoch, lane, 9])
                     posted_count = int(words64[epoch, lane, 10])
@@ -198,8 +198,8 @@ def audit_rotation_events(
             sum(e["wait_cycles"] or 0 for e in report["events"] if e["skipped"])
             if profiling_enabled else None
         ),
-        "skipped_closure_publish_cycles_total": (
-            sum(e["closure_publish_cycles"] or 0 for e in report["events"] if e["skipped"])
+        "skipped_closure_pre_publish_cycles_total": (
+            sum(e["closure_pre_publish_cycles"] or 0 for e in report["events"] if e["skipped"])
             if profiling_enabled else None
         ),
         "skipped_wait_polls_total": (
@@ -230,7 +230,7 @@ def _fmt_count(value):
 
 def format_rotation_table(report):
     lines = [
-        "Epoch Lane Core Expected Trigger Complete Skipped Candidate SelectedForPost WaitCycles WaitPolls ServiceCycles ClosureCycles",
+        "Epoch Lane Core Expected Trigger Complete Skipped Candidate SelectedForPost WaitCycles WaitPolls ServiceCycles ClosurePrePublishCycles",
     ]
     for entry in report["events"]:
         lines.append(
@@ -242,7 +242,7 @@ def format_rotation_table(report):
             f"{_fmt_count(entry['wait_cycles']):>10} "
             f"{_fmt_count(entry['wait_polls']):>9} "
             f"{_fmt_count(entry['service_cycles']):>13} "
-            f"{_fmt_count(entry['closure_publish_cycles']):>13}"
+            f"{_fmt_count(entry['closure_pre_publish_cycles']):>13}"
         )
     summary = report["summary"]
     lines.append(
