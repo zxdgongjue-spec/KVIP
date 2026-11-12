@@ -25,6 +25,7 @@ class UbmemBinding:
         row_owners,
         token_addresses,
         tail_bounds=None,
+        threshold_bounds=None,
         output_stride=None,
         scratch=None,
         prefetch_limit=512,
@@ -41,8 +42,8 @@ class UbmemBinding:
             raise ValueError("UBmem inputs must be contiguous on one NPU")
         version = self.library.kvip_ubmem_abi_version
         version.argtypes, version.restype = [], ctypes.c_uint32
-        if version() != 3:
-            raise ValueError("UBmem fusion ABI 3 is required")
+        if version() != 4:
+            raise ValueError("UBmem fusion ABI 4 is required")
         if lease.context["token_bytes"] != shape.token_bytes or lease.context["tokens_per_block"] != 128:
             raise ValueError("UBmem kernel and KVAF slot geometry differ")
         prefetch_limit, window_limit = prefetch_budget(prefetch_limit, window_limit, shape.intermediate_fetches)
@@ -51,15 +52,23 @@ class UbmemBinding:
         self.rounds, self.service_lanes = geometry["intermediate_fetches"], geometry["service_aivs_per_window"]
         self.final_workers = final_aivs(shape.batch, "auto", shape.aic_count)
         self.runtime_shape = RuntimeShape.prepare(
-            self.library, batch=shape.batch, history=shape.history, resident=shape.resident,
-            index_heads=shape.heads, aic_count=shape.aic_count, windows=shape.intermediate_fetches,
+            self.library,
+            batch=shape.batch,
+            history=shape.history,
+            resident=shape.resident,
+            index_heads=shape.heads,
+            aic_count=shape.aic_count,
+            windows=shape.intermediate_fetches,
             token_bytes=shape.token_bytes,
         )
-        if (self.runtime_shape.rounds, self.runtime_shape.serviceLanes, self.runtime_shape.finalWorkers,
-            self.runtime_shape.liCores) != (self.rounds, self.service_lanes, self.final_workers,
-                                           geometry["rotating_aic"]):
+        if (
+            self.runtime_shape.rounds,
+            self.runtime_shape.serviceLanes,
+            self.runtime_shape.finalWorkers,
+            self.runtime_shape.liCores,
+        ) != (self.rounds, self.service_lanes, self.final_workers, geometry["rotating_aic"]):
             raise ValueError("UBmem runtime scheduling mismatch")
-        for name, expected in (("context_bytes", 336), ("region_bytes", 128), ("status_bytes", 128)):
+        for name, expected in (("context_bytes", 344), ("region_bytes", 128), ("status_bytes", 128)):
             function = getattr(self.library, "kvip_ubmem_" + name)
             function.argtypes, function.restype = [], ctypes.c_uint32
             if function() != expected:
@@ -82,6 +91,14 @@ class UbmemBinding:
         self.output = output
         self.query_ends, self.hot_valid, self.row_owners = query_ends, hot_valid, row_owners
         self.token_addresses, self.tail_bounds = token_addresses, tail_bounds
+        self.threshold_bounds = threshold_bounds
+        if threshold_bounds is not None and (
+            threshold_bounds.device != self.device
+            or threshold_bounds.dtype != torch.int32
+            or tuple(threshold_bounds.shape) != (shape.batch, 2)
+            or not threshold_bounds.is_contiguous()
+        ):
+            raise ValueError("UBmem threshold bounds require contiguous int32 [B,2] on this NPU")
         for name, tensor, expected in (
             ("query_ends", query_ends, (shape.batch, 4)),
             ("row_owners", row_owners, (shape.batch,)),
@@ -158,9 +175,10 @@ class UbmemBinding:
                 np.asarray([prefetch_limit, window_limit], dtype="<u4").view("u1"),
                 np.asarray(extra, dtype="<u8").view("u1"),
                 np.frombuffer(bytes(self.runtime_shape), dtype=np.uint8),
+                np.asarray([0 if threshold_bounds is None else threshold_bounds.data_ptr()], dtype="<u8").view("u1"),
             )
         )
-        if blob.size != 336:
+        if blob.size != 344:
             raise AssertionError("UBmem Context ABI changed")
         self.context = torch.from_numpy(blob.copy()).to(self.device)
         self.arguments = tuple(arguments) + (self.context,)

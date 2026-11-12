@@ -89,6 +89,7 @@ public:
     rotating::RuntimeShape runtimeShape_;
     bool sequenceSplit_ = false;
     bool sequenceTopKOnly_ = false;
+    GM_ADDR rotationContext_ = nullptr;
 private:
     static constexpr uint32_t HEAD_DIM = 128;
     static constexpr uint32_t K_HEAD_NUM = 1;
@@ -143,7 +144,9 @@ protected:
     // ================================Process functions================================
     __aicore__ inline void ProcessMain();
     __aicore__ inline void ScanSequenceHalf(uint32_t begin, uint32_t end, uint32_t shard,
-                                           uint32_t& loop, uint32_t& scaleLoop, bool last);
+                                           uint32_t& loop, uint32_t& scaleLoop, bool last, bool newQuery = false);
+    __aicore__ inline bool ScoreRecent(uint32_t& loop, uint32_t qScaleLoop,
+                                      uint32_t shard = 0, uint32_t shards = 1);
     __aicore__ inline void ProcessBaseBlock(uint32_t loop, uint64_t s2LoopIdx,
                                             QLICommon::RunInfo runInfo, uint32_t qScaleLoop, uint32_t kScaleLoop);
     __aicore__ inline void ProcessInvalid();
@@ -649,7 +652,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessInvalid()
 
 template <typename QLIT>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
-    uint32_t begin, uint32_t end, uint32_t shard, uint32_t& loop, uint32_t& scaleLoop, bool last)
+    uint32_t begin, uint32_t end, uint32_t shard, uint32_t& loop, uint32_t& scaleLoop, bool last, bool newQuery)
 {
     splitCoreInfo.s2Start = begin;
     tempLoopInfo.s2LoopEnd = end - 1;
@@ -658,7 +661,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
         if ((tile - begin) % QLICommon::KScaleTiles == 0) ++scaleLoop;
         QLICommon::RunInfo info;
         CalcRunInfo(loop, tile, info, 0, scaleLoop);
-        info.isFirstS2InnerLoop = loop == 0;
+        info.isFirstS2InnerLoop = loop == 0 || (newQuery && tile == begin);
         info.isLastS2InnerLoop = last && tile + 1 == end;
         if ASCEND_IS_AIC {
             matmulService.ComputeMm1(info);
@@ -666,6 +669,48 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
             vectorService.ProcessVec1(info, shard, tile + 1 == end);
         }
     }
+}
+
+// An independent score-only pass inside the existing LI launch. It releases
+// its query/scale banks before normal hot-first LI, and publishes no hit bits,
+// progress or service windows. The final scan keeps its original score/order.
+template <typename QLIT>
+__aicore__ inline bool QuantLightningIndexerKernel<QLIT>::ScoreRecent(
+    uint32_t& loop, uint32_t qScaleLoop, uint32_t shard, uint32_t shards)
+{
+    auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+    if (!ctx->thresholdBounds) return false;
+    auto bounds = reinterpret_cast<__gm__ int32_t*>(ctx->thresholdBounds) + tempLoopInfo.bIdx * 2;
+    uint32_t end = tempLoopInfo.actS2Size;
+    if (ctx->queryEnds) {
+        auto ends = reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds) + tempLoopInfo.bIdx * SIM_Q;
+        uint32_t maximum = 0;
+        for (uint32_t q = 0; q < SIM_Q; ++q) if (ends[q] > maximum) maximum = ends[q];
+        if (maximum < end) end = maximum;
+    }
+    auto range = kvip_recent_index::Clip(bounds[0], bounds[1], resident_, runtimeShape_.history, end);
+    auto tiles = kvip_recent_index::Tiles(range, shard, shards);
+    if (tiles.begin == tiles.end) return false;
+    const uint32_t oldStart = splitCoreInfo.s2Start, oldEnd = tempLoopInfo.s2LoopEnd;
+    const uint32_t oldValid = tempLoopInfo.validS2Len;
+    splitCoreInfo.s2Start = tiles.begin;
+    tempLoopInfo.s2LoopEnd = tiles.end - 1;
+    tempLoopInfo.validS2Len = tiles.end * S2_BASE_SIZE;
+    uint32_t scaleLoop = 0;
+    for (uint32_t tile = tiles.begin; tile < tiles.end; ++tile, ++loop) {
+        if ((tile - tiles.begin) % QLICommon::KScaleTiles == 0) ++scaleLoop;
+        QLICommon::RunInfo info;
+        CalcRunInfo(loop, tile, info, qScaleLoop, scaleLoop);
+        if ASCEND_IS_AIC {
+            matmulService.ComputeMm1(info);
+        } else {
+            vectorService.ProcessVec1(info, 0, false, true);
+        }
+    }
+    splitCoreInfo.s2Start = oldStart;
+    tempLoopInfo.s2LoopEnd = oldEnd;
+    tempLoopInfo.validS2Len = oldValid;
+    return true;
 }
 
 template <typename QLIT>
@@ -700,8 +745,9 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
 
         uint32_t loop = 0, scaleLoop = 0;
         if constexpr (Phase == SequenceLiPhase::Hot) {
+            bool hadRecent = ScoreRecent(loop, 0, shard, 2);
             uint32_t half = resident_ / (2 * S2_BASE_SIZE);
-            ScanSequenceHalf(shard * half, (shard + 1) * half, shard, loop, scaleLoop, true);
+            ScanSequenceHalf(shard * half, (shard + 1) * half, shard, loop, scaleLoop, true, hadRecent);
         } else {
             uint32_t halfTokens = rotating::SequenceHalfWindow(runtimeShape_);
             uint32_t half = halfTokens / S2_BASE_SIZE;
@@ -759,6 +805,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()
         }
         for (uint32_t gS1LoopIdx = splitCoreInfo.gS1Start; gS1LoopIdx <= tempLoopInfo.gS1LoopEnd; gS1LoopIdx++) {
             CalcS2LoopParams(bN2LoopIdx, gS1LoopIdx);
+            ScoreRecent(gloop, qScaleLoop);
             uint32_t kScaleLoop = 0;
             for (int s2LoopIdx = splitCoreInfo.s2Start; s2LoopIdx <= tempLoopInfo.s2LoopEnd; s2LoopIdx++) {
                 if ((s2LoopIdx - splitCoreInfo.s2Start) % QLICommon::KScaleTiles == 0) {

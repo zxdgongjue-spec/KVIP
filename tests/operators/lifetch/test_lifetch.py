@@ -408,8 +408,10 @@ def test_runtime_tiling_matches_original_geometry(tmp_path):
     # Compile the actual host tiling and device-shared geometry helpers.
     (tmp_path / "batch_get_abi.h").write_text("")
     source.write_text("""
+#include <cstddef>
 #include "context.h"
-static_assert(sizeof(rotating::Context)==320,"context ABI");
+static_assert(sizeof(rotating::Context)==328,"context ABI");
+static_assert(offsetof(rotating::Context,thresholdBounds)==320,"threshold bounds appended");
 extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* s){return rotating::PrepareShape(s);}
 extern "C" uint32_t trigger(rotating::RuntimeShape* s,uint32_t e){return rotating::Trigger(s->history,s->resident,s->rounds,e);}
 extern "C" uint32_t core(rotating::RuntimeShape* s,uint32_t e,uint32_t g){return rotating::ServiceCore(s->batch,s->splitQ,s->serviceAics,e,g);}

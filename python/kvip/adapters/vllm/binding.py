@@ -80,6 +80,7 @@ def _bind_selectors(torch, policy, config):
             row_owners=workspace.inputs.row_owners,
             token_addresses=storage.addresses,
             tail_bounds=workspace.tail_bounds,
+            threshold_bounds=policy.threshold_bounds[group, : setup.batch],
             output_stride=policy.slot_capacity,
             scratch=scratch,
         )
@@ -175,6 +176,7 @@ def _bind_ubmem_selectors(torch, policy, config):
             row_owners=workspace.inputs.row_owners,
             token_addresses=storage.addresses,
             tail_bounds=workspace.tail_bounds,
+            threshold_bounds=policy.threshold_bounds[group, : setup.batch],
             output_stride=policy.slot_capacity,
             prefetch_limit=config.prefetch_tokens,
             window_limit=max(1, config.prefetch_tokens // setup.windows),

@@ -47,8 +47,10 @@ struct Context {
     // Optional serving layout: active row -> stable owner; addresses stay with
     // that owner's Index permutation. tailBounds[B,2] are [committed,write_end).
 
+    // Optional int32[B,2] Index-only seed range; independent of KV tailBounds.
+    uint64_t thresholdBounds;
 };
-static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 320,
+static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 328,
               "LIFetch runtime ABI layout changed");
 // Workload geometry is bound before capture and shared by host/device launches.
 #if defined(__CCE_AICORE__)

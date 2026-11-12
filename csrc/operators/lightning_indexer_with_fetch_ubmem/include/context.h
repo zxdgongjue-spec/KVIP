@@ -46,8 +46,10 @@ struct Context {
     uint64_t rowOwners, tokenAddresses, addressStride, outputStride, tailBounds;
     uint64_t changeSlots, changeCount;
     RuntimeShape shape;
+    // Optional int32[B,2] Index-only seed range; independent of KV tailBounds.
+    uint64_t thresholdBounds;
 };
-static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 336,
+static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 344,
               "V9 ABI layout changed");
 #if defined(__CCE_AICORE__)
 __aicore__ inline RuntimeShape LoadRuntimeShape(const __gm__ Context* ctx) {

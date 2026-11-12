@@ -51,7 +51,7 @@ def binding_fixture(transport="urma", batch=1, history=131072, resident=16384, h
         runtime_shape=RuntimeShape(
             batch=batch, history=history, resident=resident, indexHeads=heads, aicCount=32, finalWorkers=4
         ),
-        context=Tensor(np.zeros(320, dtype=np.uint8)),
+        context=Tensor(np.zeros(344 if transport == "ubmem" else 328, dtype=np.uint8)),
         hot_valid=Tensor(np.zeros(32, dtype=np.int32)),
         arguments=[Tensor(np.zeros(32, dtype=np.uint8)) for _ in range(15)],
         library=SimpleNamespace(
