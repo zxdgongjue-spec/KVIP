@@ -75,3 +75,29 @@ def test_saved_transport_comparison_uses_full_trace(tmp_path, capsys):
         (case / filename).write_text(json.dumps(dict(samples=samples) if transport == 'urma' else samples))
         assert summarize(root, transport) == {1: 70}
     assert 'missing per-core diagnostics' in capsys.readouterr().out
+
+
+def test_scale8_releases_partial_sequence_shard(tmp_path):
+    """Exercise the actual bank-release condition with BS2's 150-tile shard."""
+    import re
+    header = ROOT / 'csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_vector.h'
+    source = header.read_text()
+    condition = re.search(r'if \((\(info.s2Idx - info.s2Start \+ 1\).*?)\) \{', source, re.S)[1]
+    cpp = tmp_path / 'scale_bank.cpp'
+    cpp.write_text('''
+#include <cassert>
+namespace QLICommon {constexpr unsigned KScaleTiles=8;}
+struct Info {unsigned s2Idx,s2Start,validS2Len;bool isLastS2InnerLoop;};
+bool release(Info info) {unsigned s2BaseSize_=128;return ''' + condition + ''';}
+int main() {
+ // A non-final 19200-token shard has 150 tiles. Its tail must return the bank.
+ assert(release({277,128,278*128,false}));
+ assert(!release({276,128,278*128,false}));
+ assert(release({135,128,278*128,false}));
+ // The next shard has a different absolute start and the same partial tail.
+ assert(release({427,278,428*128,false}));
+}
+''')
+    exe = tmp_path / 'scale_bank'
+    subprocess.run(['c++', '-std=c++17', str(cpp), '-o', str(exe)], check=True)
+    subprocess.run([str(exe)], check=True)

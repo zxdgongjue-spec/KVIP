@@ -80,7 +80,7 @@ def build_ubmem_library(*, cache_dir, cann, shape, jobs=2, optimized=False):
     options = shape.options(cann) | {"KVAF_INCLUDE": str(kvaf_include), "KVIP_STREAMING_UBMEM": "ON" if optimized else "OFF"}
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     shared_lifetch = source.parent / "lightning_indexer_with_fetch"
-    directories = [source, source.parent / "common", shared_lifetch / "op_kernel/indexer"]
+    directories = [source, source.parent / "common", shared_lifetch]
     if optimized:
         directories.append(source.parent / "lightning_indexer_with_fetch_streaming_qworkers")
     for directory in directories:
@@ -88,10 +88,6 @@ def build_ubmem_library(*, cache_dir, cann, shape, jobs=2, optimized=False):
             if path.is_file() and (path.suffix in (".h", ".cpp", ".asc", ".cmake") or path.name == "CMakeLists.txt"):
                 digest.update(str(path.relative_to(source.parent)).encode())
                 digest.update(path.read_bytes())
-    for relative in ("op_kernel/index_cache_update.h", "include/runtime_shape.h"):
-        path = shared_lifetch / relative
-        digest.update(str(path.relative_to(source.parent)).encode())
-        digest.update(path.read_bytes())
     shared_selector = source.parent / "lidu/op_kernel/hot_slot_selection.h"
     digest.update(str(shared_selector.relative_to(source.parent)).encode())
     digest.update(shared_selector.read_bytes())

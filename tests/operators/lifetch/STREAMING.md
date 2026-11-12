@@ -146,3 +146,16 @@ arguments, subsequent runs are simply `git pull --ff-only` followed by
 itself. The public test launcher prepends the selected KVAF Python directory for
 its child process, so a previously sourced environment from another checkout
 cannot override `--kvaf-root`. No KVAF rebuild or kernel change is involved.
+
+
+## Main integration and shared implementation
+
+PR4 (main `84cc2dc`) is merged. LI/TopK headers, prefetch scanning, standard
+Index-update kernels and ABI are sourced from `lightning_indexer_with_fetch`;
+the streaming directory retains staged Resolver/Update/Fetch and its launches.
+`KVIP_STREAMING_LI` enables only the metadata classification extension in the
+shared LI header. Normal LI builds do not allocate the streaming metadata UB.
+PR4 scale/predicate/output options remain available; streaming compiler options
+retain their previously tested settings rather than silently enabling new tuning.
+The partial scale-bank release also handles sequence-shard ends for PR4 Scale8.
+UBmem build caching hashes shared sources so an old library cannot hide changes.

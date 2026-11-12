@@ -26,7 +26,7 @@ set(_definitions
   V9_DEDICATED_SERVICE=0 V9_SIMULATION=0 V9_LI2_PREFETCH=0 V9_BATCH_POST=2
   V9_PARTIAL_SCAN_SIMD=1 V9_USER_UB_BYTES=223232 ROTATION_PUBLISH_TILES=1)
 if(KVIP_STREAMING_UBMEM)
- list(APPEND _definitions KVIP_STREAMING_UBMEM=1 KVIP_FUSE_QUERY_WORK=1 KVIP_OUTPUT_WORKER=1)
+ list(APPEND _definitions KVIP_STREAMING_LI=1 KVIP_STREAMING_UBMEM=1 KVIP_FUSE_QUERY_WORK=1 KVIP_OUTPUT_WORKER=1)
 endif()
 set(_device_options)
 foreach(_definition IN LISTS _definitions)
@@ -56,7 +56,8 @@ foreach(_width IN ITEMS 656 2624)
   endif()
   ascendc_library(${_target} STATIC ${_sources})
   if(KVIP_STREAMING_UBMEM)
-    ascendc_include_directories(${_target} PRIVATE "${_streaming}/op_kernel")
+    ascendc_include_directories(${_target} PRIVATE "${_streaming}/op_kernel" "${_streaming}/op_kernel/indexer"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../lightning_indexer_with_fetch/op_kernel")
   endif()
   ascendc_include_directories(${_target} PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel"

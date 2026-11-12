@@ -23,7 +23,7 @@
 #include "lib/matmul_intf.h"
 #include "lib/matrix/matmul/tiling.h"
 #include "indexer_types.h"
-#include "indexer_vector.h"
+#include <indexer_vector.h>
 #include "indexer_cube.h"
 
 namespace QLIKernel {
@@ -647,7 +647,6 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessInvalid()
     }
 }
 
-#if !defined(V9_UBMEM) || !V9_UBMEM
 template <typename QLIT>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
     uint32_t begin, uint32_t end, uint32_t shard, uint32_t& loop, uint32_t& scaleLoop, bool last)
@@ -656,7 +655,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
     tempLoopInfo.s2LoopEnd = end - 1;
     tempLoopInfo.validS2Len = end * S2_BASE_SIZE;
     for (uint32_t tile = begin; tile < end; ++tile, ++loop) {
-        if ((tile - begin) % 16 == 0) ++scaleLoop;
+        if ((tile - begin) % QLICommon::KScaleTiles == 0) ++scaleLoop;
         QLICommon::RunInfo info;
         CalcRunInfo(loop, tile, info, 0, scaleLoop);
         info.isFirstS2InnerLoop = loop == 0;
@@ -715,7 +714,9 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
             }
             uint32_t begin = resident_ / S2_BASE_SIZE + shard * half;
             for (uint32_t epoch = 1; epoch < runtimeShape_.rounds; ++epoch, begin += 2 * half) {
-                ScanSequenceHalf(begin, begin + half, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
+                uint32_t end = begin + half;
+                if (end > runtimeShape_.history / S2_BASE_SIZE) end = runtimeShape_.history / S2_BASE_SIZE;
+                ScanSequenceHalf(begin, end, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
                 if ASCEND_IS_AIV {
                     if (serviceEpoch == epoch) vectorService.RotateFetch(epoch, halfTokens);
                 }
@@ -731,8 +732,6 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
         }
     }
 }
-
-#endif
 
 template <typename QLIT>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()

@@ -1,4 +1,9 @@
 #pragma once
+#if V9_UBMEM
+#include "../../lightning_indexer_with_fetch_ubmem/op_kernel/controller/prefetch.h"
+namespace kvaf_device { using ubmem_device::CleanCacheLines; constexpr uint32_t kInvalidArgs=0x20000, kCqTimeout=0x40000; }
+#else
+#pragma once
 
 // Imported from rotation_device.h
 
@@ -578,7 +583,8 @@ inline void PrepareCandidateWqes(uint32_t rt_resident,__ubuf__ uint32_t* ids,__u
 
 __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer,uint32_t epoch,uint32_t core,uint32_t lane,
     LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids,
-    uint32_t sequenceHalfWindow) {
+    uint32_t sequenceHalfWindow,bool captureIo) {
+    uint64_t firstDoorbell=0,lastDoorbell=0;
     auto ctx=reinterpret_cast<__gm__ Context*>(pointer);auto events=reinterpret_cast<__gm__ Event*>(ctx->events);
     auto event=events+epoch*rt_serviceLanes+lane;event->core=core;event->epoch=epoch;V9_FETCH_PROFILE(event->waitBegin=GetSystemCycle();)
     if(epoch) {
@@ -589,7 +595,8 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
     GlobalTensor<uint32_t> progressGm;
     progressGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress));
     auto work=flags.ReinterpretCast<uint32_t>();
-    const uint32_t windowEnd=Trigger(rt_history,rt_resident,rt_rounds,epoch)*128;
+    const uint32_t windowEnd=sequenceHalfWindow?SequenceWindowEnd(rt_history,rt_resident,sequenceHalfWindow,epoch):
+        Trigger(rt_history,rt_resident,rt_rounds,epoch)*128;
     // Each shard publishes an independent ready boundary. Snapshot whatever
     // has completed; the final resolver repairs selected tokens that were not
     // prefetched. Waiting for another shard here can stall its producer.
@@ -657,123 +664,13 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         const uint64_t entityAddress=state64.GetValue(0),queueAddress=state64.GetValue(1);
         const uint64_t addresses=state64.GetValue(2),output=state64.GetValue(3);
         const uint32_t lower=ctx->lruSlots?0:rt_resident;
-        const uint32_t shards=sequenceHalfWindow?2:1;
-        uint32_t consumed[2][4]{},begin[2][4]{},end[2][4]{};
-        uint32_t readyBegin[2]{},readyEnd[2]{};
-        uint32_t first=rt_history,last=lower;
-        bool aggregate=true;
-        for(uint32_t shard=0;shard<shards;++shard) {
-            uint32_t shardLower=shard?rt_resident+sequenceHalfWindow:lower;
-            readyBegin[shard]=rt_history;readyEnd[shard]=shardLower;
-            for(uint32_t q=0;q<4;++q) {
-                uint32_t prior=shard?(epoch?state.GetValue(80+(epoch-1)*4+q):0):state.GetValue(12+q);
-                uint32_t saved=cfg.GetValue(128+64*shard+b*4+q);
-                consumed[shard][q]=prior;
-                begin[shard][q]=prior>shardLower?prior:shardLower;
-                end[shard][q]=saved>prior?saved:prior;
-                if(begin[shard][q]<readyBegin[shard])readyBegin[shard]=begin[shard][q];
-                if(end[shard][q]>readyEnd[shard])readyEnd[shard]=end[shard][q];
-            }
-            if(readyBegin[shard]>=readyEnd[shard])continue;
-            if(readyBegin[shard]<first)first=readyBegin[shard];
-            if(readyEnd[shard]>last)last=readyEnd[shard];
-            if(readyBegin[shard]%128 || readyEnd[shard]%128)aggregate=false;
-            for(uint32_t q=0;q<4;++q)
-                if(begin[shard][q]!=readyBegin[shard] || end[shard][q]!=readyEnd[shard])aggregate=false;
-        }
-        V9_FETCH_PROFILE(uint64_t scanBegin=GetSystemCycle();)
-        uint32_t candidateCount=0,stop=last,wordCount=0;
-        GlobalTensor<uint8_t> bitmap;
-        bitmap.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(ctx->hits)+b*rt_history);
-        for(uint32_t base=(first/128)*128;first<last && base<last;) {
-            // Compact victim coordinates occupy [0,2048); the remaining
-            // hot bitmap is not written or read. Cold coordinates are unchanged.
-            if(ctx->lruSlots && base>=kLruSlots && base<rt_resident) {
-                base=rt_resident;continue;
-            }
-            uint32_t shard=0,scanEnd=last;
-            if(sequenceHalfWindow) {
-                auto slice=SequenceSliceAt(base,rt_resident,sequenceHalfWindow);
-                shard=slice.shard;
-                // Traverse absolute token order, but skip each shard's holes
-                // independently before applying the shared candidate budget.
-                if(readyBegin[shard]>=readyEnd[shard] || base>=readyEnd[shard]) {
-                    base=slice.end;continue;
-                }
-                uint32_t alignedBegin=(readyBegin[shard]/128)*128;
-                if(base<alignedBegin) {
-                    base=alignedBegin<slice.end?alignedBegin:slice.end;continue;
-                }
-                scanEnd=readyEnd[shard]<slice.end?readyEnd[shard]:slice.end;
-            }
-            uint32_t span=((scanEnd-base+127)/128)*128;
-            if(span>rt_scanTokens)span=rt_scanTokens;
-            if(ctx->lruSlots && base<kLruSlots && span>kLruSlots-base)span=kLruSlots-base;
-            if(aggregate) {
-                uint32_t room=((1792-wordCount)/8)*128;
-                if(!room) {stop=base;break;}
-                if(span>room)span=room;
-            }
-            // ready ends are 128-aligned; a capacity cutoff can leave a
-            // half-tile cursor, which is masked on the next service.
-            bool full=true;
-            for(uint32_t q=0;q<4;++q) {
-                uint32_t lo=begin[shard][q]>base?begin[shard][q]-base:0;
-                uint32_t hi=end[shard][q]>base?end[shard][q]-base:0;
-                cfg.SetValue(28+q,lo<span?lo:span);cfg.SetValue(24+q,hi<span?hi:span);
-                if(lo || hi<span)full=false;
-#if V9_PARTIAL_SCAN_SIMD
-                uint32_t clippedLo=lo<span?lo:span,clippedHi=hi<span?hi:span;
-                cfg.SetValue(80+q*4,clippedLo/16);cfg.SetValue(81+q*4,clippedHi/16);
-                cfg.SetValue(82+q*4,0x55555555U<<((clippedLo%16)*2));
-                cfg.SetValue(83+q*4,((1U<<((clippedHi%16)*2))-1U)&0x55555555U);
-#endif
-            }
-            DataCopyExtParams copy;copy.blockCount=4;copy.blockLen=span/4;
-            copy.srcStride=(rt_history-span)/4;copy.dstStride=0;
-            V9_FETCH_PROFILE(bitmapBytes+=span;)
-            DataCopyPadExtParams<uint8_t> padding{false,0,0,0};
-            DataCopyPad(scratch.ReinterpretCast<uint8_t>(),bitmap[base/4],copy,padding);
-            SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-            SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
-            if(full || V9_PARTIAL_SCAN_SIMD) {
-                uint32_t prior=aggregate?wordCount:0;
-                if(full)UnionWords<false>(reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work[prior].GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint32_t*>(work[2304+prior].GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),span/16,aggregate?base/16:0);
-                else UnionWords<true>(reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work[prior].GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint32_t*>(work[2304+prior].GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),span/16,aggregate?base/16:0);
-                SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-                uint32_t words=cfg.GetValue(72);wordCount+=words;
-                if(!aggregate && words)Simt::VF_CALL<ExpandWords>(Simt::Dim3{256,1,1},reinterpret_cast<__ubuf__ uint32_t*>(work[2304].GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),base,span,candidateCount,words);
-                else {cfg.SetValue(40,candidateCount);cfg.SetValue(48,span);}
-            } else Simt::VF_CALL<ScanPartial>(Simt::Dim3{256,1,1},reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),base,span,candidateCount);
-            SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-            candidateCount=cfg.GetValue(40);uint32_t scanned=cfg.GetValue(48);
-            // V_S above joins the scan; forward that dependency to MTE2.
-            // Do not consume LI's persistent V_MTE2 ping-pong credits.
-            SetFlag<HardEvent::S_MTE2>(EVENT_ID0);WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
-            if(scanned<span) { stop=base+scanned;break; }
-            base+=span;
-        }
-        if(aggregate && wordCount) {
-            Simt::VF_CALL<ExpandWords>(Simt::Dim3{256,1,1},reinterpret_cast<__ubuf__ uint32_t*>(work[2304].GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),0,stop,0,wordCount);
-            SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-            candidateCount=cfg.GetValue(40);stop=cfg.GetValue(48);
-        }
-        if(ctx->lruSlots && first<kLruSlots && candidateCount) {
-            Simt::VF_CALL<RestoreVictimTokens>(Simt::Dim3{256,1,1},
-                reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
-                reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots,candidateCount);
-            SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-        }
-
+#define KV_WINDOW_HISTORY rt_history
+#define KV_WINDOW_RESIDENT rt_resident
+#define KV_WINDOW_SCAN_TOKENS rt_scanTokens
+#include "../../common/lifetch/sequence_candidates.h"
+#undef KV_WINDOW_HISTORY
+#undef KV_WINDOW_RESIDENT
+#undef KV_WINDOW_SCAN_TOKENS
         V9_FETCH_PROFILE(scanTicks+=GetSystemCycle()-scanBegin;totalCandidates+=candidateCount;)
         V9_FETCH_PROFILE(uint64_t candidateBegin=GetSystemCycle(),postBegin=0;)
         uint32_t count=0,missing=0;
@@ -821,8 +718,10 @@ if (rt_batchedRows) {
                         reinterpret_cast<__ubuf__ uint32_t*>(work[512].GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work[1024].GetPhyAddr()),
                         map,reinterpret_cast<__gm__ uint64_t*>(addresses),count,rt_resident+slots,ctx,b);
                     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+                    if(captureIo && !firstDoorbell)firstDoorbell=GetSystemCycle();
                     if(SubmitWqesAt(rt_tokenBytes,entityAddress,queueAddress,output,work[1024],scratch,work,work[512],cfg,count,256,false,nullptr,pending))++pending;
                     else state.SetValue(11,kvaf_device::kInvalidArgs);
+                    if(captureIo)lastDoorbell=GetSystemCycle();
                     slots+=count;requests+=count;
                 }
 }
@@ -905,18 +804,21 @@ if (rt_batchedRows) {
         for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
             auto input=cfg[256+(b/rt_serviceLanes)*80];if(!input.GetValue(64))continue;
             auto in64=input.ReinterpretCast<uint64_t>();uint64_t db=in64.GetValue(8),head=in64.GetValue(25);
+            if(captureIo && !firstDoorbell)firstDoorbell=GetSystemCycle();
 #if V9_SIMULATION
             *reinterpret_cast<__gm__ uint64_t*>(db)=head;
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(db),64);
 #else
             st_dev(uint32_t(head),reinterpret_cast<__gm__ uint32_t*>(db),0);
 #endif
+            if(captureIo)lastDoorbell=GetSystemCycle();
         }
         V9_FETCH_PROFILE(postTicks+=GetSystemCycle()-begin;)
     }
 }
     V9_FETCH_PROFILE(event->scanTicks=scanTicks;event->candidateTicks=candidateTicks;event->postTicks=postTicks;)
     V9_FETCH_PROFILE(event->bitmapBytes=bitmapBytes;event->candidateCount=totalCandidates;event->postedCount=postedCount;)
+    if(captureIo){auto stamp=reinterpret_cast<__gm__ uint64_t*>(event->pad);stamp[0]=firstDoorbell;stamp[1]=lastDoorbell;}
     V9_FETCH_PROFILE(event->end=GetSystemCycle();)event->complete=1;
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event),V9_INTERMEDIATE_PROFILING?sizeof(Event):64);
 }
@@ -925,7 +827,9 @@ if (rt_batchedRows) {
 namespace rotating {
 __aicore__ inline void Service(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_splitQ,uint32_t rt_rounds,uint32_t rt_serviceAics,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer, uint32_t epoch, uint32_t core,
     uint32_t lane, LocalTensor<uint32_t> scratch, LocalTensor<uint16_t> flags,
-    LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow = 0) {
-    FastService(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow);
+    LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow = 0,bool captureIo = false) {
+    FastService(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow,captureIo);
 }
 }
+
+#endif

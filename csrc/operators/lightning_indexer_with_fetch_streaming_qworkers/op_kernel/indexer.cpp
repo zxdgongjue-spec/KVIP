@@ -6,7 +6,7 @@ struct QLITilingData {
     uint32_t keyStride0=16384,keyDequantScaleStride0=128;
     uint32_t resident,splitQ,aicCount;
 };
-#include "indexer/indexer.h"
+#include "../../lightning_indexer_with_fetch/op_kernel/indexer/indexer.h"
 namespace {
 using QLIKernel::SequenceLiPhase;
 

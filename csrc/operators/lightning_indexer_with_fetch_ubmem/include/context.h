@@ -77,9 +77,7 @@ UB_SCHEDULE_DEVICE inline int32_t EpochAt(uint32_t batch,uint32_t history,uint32
     uint32_t rank=split?(core%2)*batch+core/2:core,epoch=rank/serviceAics;
     return epoch<rounds && RuntimeTrigger(history,resident,rounds,epoch)==tile ? int32_t(epoch) : -1;
 }
-#if KVIP_STREAMING_UBMEM
 UB_SCHEDULE_DEVICE inline uint32_t ServiceRank(uint32_t batch,uint32_t split,uint32_t core) {return split?(core%2)*batch+core/2:core;}
 #include "../../common/lifetch/sequence_schedule.h"
-#endif
 #undef UB_SCHEDULE_DEVICE
 }
