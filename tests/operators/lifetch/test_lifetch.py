@@ -17,6 +17,7 @@ sys.path.insert(0, str(SUPPORT))
 from compare_transports import execute  # noqa: E402
 from runner import progress, supervise  # noqa: E402
 from actual_k_admission import parse_actual_key_lengths  # noqa: E402
+from actual_k_transitions import transition_schedule  # noqa: E402
 
 
 def arguments(argv=None):
@@ -39,6 +40,8 @@ def arguments(argv=None):
                    help="test-only: choose overlapping Q4 Hot TopK and admit only a union fitting Resident")
     p.add_argument("--actual-key-lengths", type=str,
                    help="P0-A2: CSV of per-request actual K within fixed History")
+    p.add_argument("--actual-k-transition-check", action="store_true",
+                   help="P0-A2.2a: same-Graph long-short-long K; reset Index/KV baseline each round")
     p.add_argument("--resolver-compare", action="store_true")
     p.add_argument("--trace-rounds", type=int, default=3)
     p.add_argument("--miss-percent", type=float, default=10)
@@ -82,6 +85,16 @@ def arguments(argv=None):
         not a.prefetch_payload_audit or round(2048 * a.miss_percent / 100) != 1
     ):
         p.error("--cold-prefetch-probe requires --prefetch-payload-audit and one final cold miss per query")
+    if a.actual_k_transition_check:
+        if not a.actual_key_lengths or not a.active_k_map_clear:
+            p.error("--actual-k-transition-check needs actual K and Active-K clear")
+        try:
+            transition_schedule(
+                parse_actual_key_lengths(a.actual_key_lengths, batches[0], a.history, a.resident),
+                a.history, a.resident,
+            )
+        except (ValueError, TypeError) as exc:
+            p.error(str(exc))
     if a.actual_key_lengths:
         if not a.native_union_fit:
             p.error("--actual-key-lengths requires --native-union-fit")
@@ -202,6 +215,8 @@ def main(argv=None):
                    help="test-only: admit a Q4 TopK union that fits Resident capacity")
     p.add_argument("--actual-key-lengths", type=str,
                    help="P0-A2: CSV of per-request actual K within fixed History")
+    p.add_argument("--actual-k-transition-check", action="store_true",
+                   help="P0-A2.2a: same-Graph long-short-long K; reset Index/KV baseline each round")
     p.add_argument('--resolver-compare', action='store_true', help='URMA resolver comparison')
     p.add_argument('--comparison-output', type=Path)
     p.add_argument('--comparison-sfa', type=Path)
@@ -271,6 +286,17 @@ def main(argv=None):
         common.append('--prefetch-payload-audit')
     if a.cold_prefetch_probe:
         common.append('--cold-prefetch-probe')
+    if a.actual_k_transition_check:
+        if not a.actual_key_lengths or not a.active_k_map_clear:
+            p.error('--actual-k-transition-check needs actual K and Active-K clear')
+        try:
+            transition_schedule(
+                parse_actual_key_lengths(a.actual_key_lengths, batches[0], a.history, a.resident),
+                a.history, a.resident,
+            )
+        except (ValueError, TypeError) as exc:
+            p.error(str(exc))
+        common.append('--actual-k-transition-check')
     if a.actual_key_lengths:
         if not a.native_union_fit:
             p.error('--actual-key-lengths requires --native-union-fit')

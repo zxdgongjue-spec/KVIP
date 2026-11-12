@@ -10,6 +10,7 @@ from device_trace import collect_core, core_summary
 from index_update import DirectCacheUpdate, permutation_records
 from native_miss_oracle import native_miss_oracle
 from actual_k_admission import parse_actual_key_lengths, score_oracle_for_actual_k
+from actual_k_transitions import transition_schedule
 from kvip.operators.lifetch.forward import LIFetchForward
 from kvip.runtime.loader import load_lifetch_library
 from prefetch_audit import actual_reads, completion_failures
@@ -221,6 +222,8 @@ def run(args, run_dir):
         line += "; actual_miss_pct_per_query=" + json.dumps(
             [round(count * 100 / 2048, 4) for count in fixture_info["final_misses_per_query"]]
         )
+        if report.get("dynamic_k_transition_report"):
+            line += "\nP0_A2_DYNAMIC_K_PASS=" + json.dumps(report["dynamic_k_transition_report"])
         if fixture_info.get("actual_key_admission"):
             line += "\nP0_A2_ACTUAL_K=" + json.dumps(fixture_info["actual_key_admission"]["key_lengths"])
             line += "; scope=static_per_request_K; stateful_K_transitions_not_yet_tested"
@@ -1278,6 +1281,65 @@ def run_device(
                 slot = int(p.next[0, slot])
             next_orders.append(order)
         update.set_order(next_orders)
+    dynamic_k_transition_report = None
+    if getattr(args, "actual_k_transition_check", False):
+        if actual_lengths is None or query_ends is None or not args.active_k_map_clear:
+            raise ValueError("Dynamic-K transition requires valid K and Active-K reset")
+        schedule = transition_schedule(key_lengths, h, r)
+        dynamic_k_transition_report = []
+        old_key_ptr = actual_key_buffer.data_ptr()
+        old_ends_ptr = rotating.query_ends.data_ptr()
+        # Same captured full Graph and V9 workspace; restore Index/KV baseline
+        # per stage, but deliberately keep Mapping across all K transitions.
+        for label, new_k in schedule:
+            _, expected_step = score_oracle_for_actual_k(
+                logical_scores, physical_order, new_k, r
+            )
+            reset()
+            reference[...] = expected_step
+            device_k = torch.tensor(new_k, dtype=torch.int32, device=device)
+            actual_key_buffer.copy_(device_k)
+            rotating.query_ends.copy_(device_k[:, None].expand(b, 4))
+            # Force stale-positive Mapping outside short K (not an actual
+            # Prefetch). The next long stage must clear it before using K.
+            for row, k in enumerate(new_k):
+                if k < h:
+                    rotating.mapping[row, k:].fill_(1)
+            stream.synchronize()
+            if actual_key_buffer.data_ptr() != old_key_ptr or rotating.query_ends.data_ptr() != old_ends_ptr:
+                raise AssertionError("Dynamic-K metadata pointer identity changed")
+            before_map = rotating.mapping.cpu().numpy().copy()
+            state["check_phase"] = "P0-A2.2a " + label
+            state["before_logical"] = update.logical.cpu().numpy().copy()
+            graph.replay()
+            stream.synchronize()
+            verify(True)
+            after_map = rotating.mapping.cpu().numpy()
+            for row, k in enumerate(new_k):
+                if not np.array_equal(after_map[row, k:], before_map[row, k:]):
+                    raise AssertionError(
+                        f"Dynamic-K Mapping suffix changed: {label} row={row} K={k}"
+                    )
+            read_check = actual_reads(
+                after_map, topk.cpu().numpy(),
+                rotating.rows.cpu().numpy().view(np.uint32), r,
+                actual_key_lengths=new_k,
+            )
+            dynamic_k_transition_report.append(dict(
+                stage=label, key_lengths=list(new_k),
+                graph_and_workspace_reused=True,
+                index_kv_restored_each_stage=True,
+                topk_kv_index_and_completion_pass=True,
+                stale_mapping_suffix_untouched=True,
+                prefetch_reconciled=True,
+                prefetch_requests=read_check["prefetch_hot"] + read_check["prefetch_cold"],
+                stale_out_of_k_entries=read_check["ignored_out_of_K_mapping"],
+            ))
+            print(f"P0_A2_DYNAMIC_K_STAGE_PASS {label}: K={list(new_k)}", flush=True)
+        state.pop("check_phase", None)
+        # Last stage restores initial K, preserving the subsequent SFA test.
+        if tuple(actual_key_buffer.cpu().tolist()) != tuple(key_lengths):
+            raise AssertionError("Dynamic-K final stage did not restore initial K")
     graph.reset()
     owner.graphs.remove(graph)
     forward = np.full((b, h), -1, np.int32)
@@ -1330,6 +1392,8 @@ def run_device(
         ),
         kernel="KVIP/csrc/operators/lightning_indexer_with_fetch; preserved core tiling, direct LRU interface",
         actual_key_lengths=list(key_lengths),
-        scope="fixed capacity History, per-request BSND actual K, Q4 shared request TopK; "
-              "static K during graph replay; no long-short-long transition or ABC growth",
+        dynamic_k_transition_report=dynamic_k_transition_report,
+        scope="fixed H and BSND K, Q4 shared TopK; static K for timing; "
+              "optional A2.2a same-Graph/workspace long-short-long with "
+              "Index/KV restored each stage; persistent cross-K Index not tested",
     )
