@@ -113,7 +113,7 @@ __aicore__ inline void FillRoundWords(uint64_t address,uint32_t words,
     }
     // Caller joins the whole fill group before reusing the shared UB value.
 }
-__aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t b,__gm__ uint32_t* actualKeyLengths) {
+__aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t b,__gm__ uint32_t* actualKeyLengths) {
     TPipe pipe;TBuf<TPosition::VECCALC> storage;pipe.InitBuffer(storage,4096*4);
     auto local=storage.Get<uint32_t>();
     Duplicate(local,uint32_t(0),4096);
@@ -196,7 +196,7 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
         auto ctx=GetContext(bindings);
         auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
         auto actualKeyLengths=reinterpret_cast<__gm__ uint32_t*>(a[6]);
-        InitializeRound(rt_batch,rt_history,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b,actualKeyLengths);
+        InitializeRound(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b,actualKeyLengths);
         auto args=GetArgs(ctx,b*2);
         auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
         auto entity=reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(args.channel_entity);
@@ -205,7 +205,6 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
         row->entity=args.channel_entity; row->queue=args.queue_state;
         const uint64_t prefix=4*2048*6+1024+4*uint64_t(rt_history)*2;
         const uint64_t tail=uint64_t(rt_history)*8+8192*64+512;
-        auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
         uint32_t owner=ctx->rowOwners ? reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b] : b;
         uint64_t outputStride=ctx->outputStride ? ctx->outputStride : rt_resident;
         row->addresses=ctx->tokenAddresses ? ctx->tokenAddresses+uint64_t(owner)*ctx->addressStride*8 : a[13]+rt_batch*prefix+b*tail;
