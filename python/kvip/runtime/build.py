@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import os
 import subprocess
 from pathlib import Path
 
@@ -40,12 +41,16 @@ def build_failure(log, stage, returncode):
 def build_libraries(*, cache_dir, cann, headers, soc):
     """Build one shape-independent binary per source/toolchain/SoC."""
     root = Path(__file__).resolve().parents[3] / "csrc/operators"
+    active_k_map_clear = os.environ.get("KVAF_LIFETCH_ACTIVE_K_MAP_CLEAR", "0")
+    if active_k_map_clear not in ("0", "1"):
+        raise ValueError("KVAF_LIFETCH_ACTIVE_K_MAP_CLEAR must be 0 or 1")
     options = dict(
         RUN_MODE="npu",
         ASCEND_CANN_PACKAGE_PATH=str(cann),
         KVAF_INCLUDE=str(headers),
         SOC_VERSION=soc,
         RESOLVER_COMPARE=0,
+        V9_ACTIVE_K_MAP_CLEAR=active_k_map_clear,
     )
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     for relative in (

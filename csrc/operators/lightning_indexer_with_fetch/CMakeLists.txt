@@ -15,6 +15,11 @@ set(V9_INTERMEDIATE_PROFILING 0 CACHE STRING "Profile V9 Rotation Epoch events (
 if(NOT V9_INTERMEDIATE_PROFILING MATCHES "^[01]$")
   message(FATAL_ERROR "V9_INTERMEDIATE_PROFILING must be 0 or 1")
 endif()
+# Opt-in varlen optimization. The logical mapping buffer retains full History capacity.
+set(V9_ACTIVE_K_MAP_CLEAR 0 CACHE STRING "Clear only the active per-request K prefix in v9_init (0 or 1)")
+if(NOT V9_ACTIVE_K_MAP_CLEAR MATCHES "^[01]$")
+  message(FATAL_ERROR "V9_ACTIVE_K_MAP_CLEAR must be 0 or 1")
+endif()
 include(${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
 ascendc_library(v9_kernel STATIC op_kernel/indexer.cpp op_kernel/lifecycle.cpp)
 ascendc_include_directories(v9_kernel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel
@@ -23,7 +28,8 @@ ascendc_include_directories(v9_kernel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/includ
 ascendc_compile_options(v9_kernel PRIVATE -DV9_RESOLVER_COMPARE=${RESOLVER_COMPARE} -O2 -g --cce-auto-sync=off
   -mllvm -user-reserved-ub-size=223232 -DV9_USER_UB_BYTES=223232
   -DV9_PARTIAL_SCAN_SIMD=1 -DV9_PROBE_EPOCH=0 -DV9_INTERMEDIATE_PROFILING=${V9_INTERMEDIATE_PROFILING}
-  -DV9_BATCH_POST=2 -DSIM_Q=4 -DSIM_CAPTURE_HITS=1 -DV9_SIMULATION=0 -DROTATION_PUBLISH_TILES=1)
+  -DV9_BATCH_POST=2 -DSIM_Q=4 -DSIM_CAPTURE_HITS=1 -DV9_SIMULATION=0 -DROTATION_PUBLISH_TILES=1
+  -DV9_ACTIVE_K_MAP_CLEAR=${V9_ACTIVE_K_MAP_CLEAR})
 add_library(v9_bridge SHARED op_host/launch.cpp)
 target_include_directories(v9_bridge PRIVATE ${KVAF_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_definitions(v9_bridge PRIVATE V9_RESOLVER_COMPARE=${RESOLVER_COMPARE})

@@ -135,7 +135,26 @@ __aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uin
     SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
     Duplicate(local,UINT32_MAX,4096);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+#if V9_ACTIVE_K_MAP_CLEAR
+    // QueryEnds are exclusive per-Q bounds published before v9_init on this
+    // stream. Every mapping reader in this round must be bounded by those
+    // lengths; the reserved hot prefix is kept clear for LRU/ABC handling.
+    // The next round clears its own (possibly longer) valid prefix, so stale
+    // entries outside this round's K range cannot become observable.
+    uint32_t clearTokens=rt_history;
+    if(ctx->queryEnds) {
+        auto ends=reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)+uint64_t(b)*4;
+        uint32_t activeEnd=rt_resident;
+        for(uint32_t q=0;q<4;++q) {
+            uint32_t bound=ends[q];
+            if(bound>activeEnd)activeEnd=bound;
+        }
+        if(activeEnd<rt_history)clearTokens=(activeEnd+127U)&~127U;
+    }
+    FillRoundWords(ctx->mapping+uint64_t(b)*rt_history*4,clearTokens,local);
+#else
     FillRoundWords(ctx->mapping+uint64_t(b)*rt_history*4,rt_history,local);
+#endif
     if(ctx->changes)FillRoundWords(ctx->changes+b*kChangeCapacity*4,kChangeCapacity,local);
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     // Copy only the candidate prefix; resolver writes extended destinations.
