@@ -116,6 +116,7 @@ def run(args, run_dir):
                 ASCEND_CANN_PACKAGE_PATH=args.cann,
                 KVAF_INCLUDE=find_headers(args.kvaf_root),
                 V9_INTERMEDIATE_PROFILING=int(getattr(args, "epoch_audit_profile", False)),
+                V9_ACTIVE_K_MAP_CLEAR=int(getattr(args, "active_k_map_clear", False)),
             )
             if not shared_build.exists():
                 command(

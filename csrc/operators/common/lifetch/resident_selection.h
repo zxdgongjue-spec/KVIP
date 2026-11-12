@@ -11,7 +11,8 @@ __simt_callee__ inline bool ResolveResidentPlan(
     __ubuf__ uint32_t* positions, uint32_t coldCount, __ubuf__ uint32_t* keys,
     __ubuf__ uint32_t* ranks, __ubuf__ uint16_t* ids, __ubuf__ uint32_t* slots,
     __ubuf__ uint32_t* cfg, __gm__ uint32_t* mapping, __gm__ uint32_t* lru,
-    uint32_t used, bool hasTail, uint32_t& count, uint32_t& candidateCount) {
+    uint32_t used, bool hasTail, uint32_t& count, uint32_t& candidateCount,
+    __gm__ Context* ctx, uint32_t batch) {
     uint32_t tid=threadIdx.x,lane=tid%warpSize,warp=tid/warpSize;
     uint32_t buckets=coldCount<=1024?2048U:(coldCount<=2048?4096U:8192U);
     for(uint32_t i=tid;i<buckets;i+=Threads){keys[i]=UINT32_MAX;ranks[i]=UINT32_MAX;}
@@ -20,6 +21,13 @@ __simt_callee__ inline bool ResolveResidentPlan(
     for(uint32_t i=tid;i<coldCount;i+=Threads){
         uint32_t pos=positions[i],token=selected[pos];
         if(token>=rt_history){asc_atomic_or(cfg+1,1U);continue;}
+#if V9_ACTIVE_K_MAP_CLEAR
+        // A stale mapping beyond the true query end must never be reused as a
+        // prefetch hit. Fail the final plan instead of silently returning it.
+        if(token>=QueryEnd(rt_history,ctx,batch*4U+pos/kTop)) {
+            asc_atomic_or(cfg+1,8U);loc[pos]=UINT32_MAX;continue;
+        }
+#endif
         if(pos>=2*kTop && selected[pos-2*kTop]==token){loc[pos]=UINT32_MAX-2;continue;}
         uint32_t slot=(used || hasTail)?asc_ldcg(mapping+token):UINT32_MAX;loc[pos]=slot;
         if(slot==UINT32_MAX){
@@ -29,6 +37,9 @@ __simt_callee__ inline bool ResolveResidentPlan(
         } else if(slot<rt_resident || slot>=kSlots+outputStride || (slot>=rt_resident+kLruSlots && slot<rt_resident+kSlots))asc_atomic_or(cfg+1,2U);
     }
     asc_syncthreads();
+#if V9_ACTIVE_K_MAP_CLEAR
+    if(cfg[1]) return false;
+#endif
     // Mark the first occurrence before replacing hash-table positions by ranks.
     uint32_t per=(coldCount+Threads-1)/Threads,localCount=0;
     for(uint32_t i=tid*per;i<(tid+1)*per && i<coldCount;++i){uint32_t pos=positions[i];

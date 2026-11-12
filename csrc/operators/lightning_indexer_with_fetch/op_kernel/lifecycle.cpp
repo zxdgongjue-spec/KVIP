@@ -45,6 +45,7 @@ V9_CQ_INLINE CqDrainResult DrainCq(Access& access, uint64_t consumer,
 #include "prefetch.h"
 #include "resolver.h"
 #include "index_cache_update.h"
+#include "mapping_clear_bounds.h"
 using namespace AscendC;
 using namespace rotating;
 // Extend fused CQ waits to 10x the native polling budget (not wall-clock time).
@@ -112,7 +113,7 @@ __aicore__ inline void FillRoundWords(uint64_t address,uint32_t words,
     }
     // Caller joins the whole fill group before reusing the shared UB value.
 }
-__aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t b) {
+__aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t b,__gm__ uint32_t* actualKeyLengths) {
     TPipe pipe;TBuf<TPosition::VECCALC> storage;pipe.InitBuffer(storage,4096*4);
     auto local=storage.Get<uint32_t>();
     Duplicate(local,uint32_t(0),4096);
@@ -136,21 +137,28 @@ __aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uin
     Duplicate(local,UINT32_MAX,4096);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
 #if V9_ACTIVE_K_MAP_CLEAR
-    // QueryEnds are exclusive per-Q bounds published before v9_init on this
-    // stream. Every mapping reader in this round must be bounded by those
-    // lengths; the reserved hot prefix is kept clear for LRU/ABC handling.
-    // The next round clears its own (possibly longer) valid prefix, so stale
-    // entries outside this round's K range cannot become observable.
-    uint32_t clearTokens=rt_history;
+    // Verify two independently bound Native-LI length sources before removing
+    // any initialization. Padded Q contributes zero to the maximum.
+    uint32_t maxQueryEnd=0;
+    bool validQueryEnds=ctx->queryEnds!=0;
     if(ctx->queryEnds) {
         auto ends=reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)+uint64_t(b)*4;
-        uint32_t activeEnd=rt_resident;
         for(uint32_t q=0;q<4;++q) {
             uint32_t bound=ends[q];
-            if(bound>activeEnd)activeEnd=bound;
+            if(bound>rt_history)validQueryEnds=false;
+            if(bound>maxQueryEnd)maxQueryEnd=bound;
         }
-        if(activeEnd<rt_history)clearTokens=(activeEnd+127U)&~127U;
     }
+    uint32_t actualKeyLength=actualKeyLengths ? actualKeyLengths[b] : 0U;
+    bool hasTail=ctx->tailBounds!=0;
+    uint32_t tailBegin=0,tailEnd=0;
+    if(hasTail) {
+        auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds)+uint64_t(b)*2;
+        tailBegin=bounds[0];tailEnd=bounds[1];
+    }
+    uint32_t clearTokens=rotating::ActiveKMappingClearTokens(
+        rt_history,rt_resident,ctx->queryEnds!=0,validQueryEnds,maxQueryEnd,
+        actualKeyLengths!=nullptr,actualKeyLength,hasTail,tailBegin,tailEnd);
     FillRoundWords(ctx->mapping+uint64_t(b)*rt_history*4,clearTokens,local);
 #else
     FillRoundWords(ctx->mapping+uint64_t(b)*rt_history*4,rt_history,local);
@@ -186,7 +194,9 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
     if ASCEND_IS_AIV {
         uint32_t b=GetBlockIdx(); if(b>=rt_batch) return;
         auto ctx=GetContext(bindings);
-        InitializeRound(rt_batch,rt_history,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b);
+        auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
+        auto actualKeyLengths=reinterpret_cast<__gm__ uint32_t*>(a[6]);
+        InitializeRound(rt_batch,rt_history,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b,actualKeyLengths);
         auto args=GetArgs(ctx,b*2);
         auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
         auto entity=reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(args.channel_entity);

@@ -32,6 +32,8 @@ def arguments(argv=None):
     p.add_argument("--intermediate-fetches", type=int, default=8)
     p.add_argument("--prefetch-tokens", type=int, default=512)
     p.add_argument("--runtime-shapes", action="store_true", help="one binary, four distinct runtime shapes")
+    p.add_argument("--active-k-map-clear", action="store_true",
+                   help="P0-A1 opt-in: CMake-build shortened v9_init mapping reset with safety guards")
     p.add_argument("--resolver-compare", action="store_true")
     p.add_argument("--trace-rounds", type=int, default=3)
     p.add_argument("--miss-percent", type=float, default=10)
@@ -178,6 +180,8 @@ def main(argv=None):
     p.add_argument('--iterations', type=int, default=20)
     p.add_argument('--trace-rounds', type=int, default=3, help='separate device profiling replays')
     p.add_argument('--runtime-shapes', action='store_true')
+    p.add_argument("--active-k-map-clear", action="store_true",
+                   help="P0-A1 opt-in: compile guarded active-K mapping clear")
     p.add_argument('--resolver-compare', action='store_true', help='URMA resolver comparison')
     p.add_argument('--comparison-output', type=Path)
     p.add_argument('--comparison-sfa', type=Path)
@@ -235,6 +239,8 @@ def main(argv=None):
               '--iterations', str(a.iterations)]
     if a.li_only_varlen:
         common.append('--li-only-varlen')
+    if a.active_k_map_clear:
+        common.append("--active-k-map-clear")
     if a.epoch_audit_profile:
         common.append('--epoch-audit-profile')
     if a.prefetch_payload_audit:
