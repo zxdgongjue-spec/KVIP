@@ -1,5 +1,7 @@
 """Actual mtp_xzw_0903 MTP union/LIDU/descriptor operator, not four Q1 calls."""
 
+import os
+
 import kvip
 from aiv1_fetch_support import PADDED_TOKENS, TOKEN_BYTES
 from mtp_fixture import QUERIES, SOURCE, TOPK
@@ -12,6 +14,9 @@ class NativeMtp:
         self.source_tokens, self.padded_tokens = source_tokens, padded_tokens
         self.torch, self.owner, self.fixture = torch, owner, fixture
         self.batch, self.hot = owner.batch, owner.resident_budget
+        # Test-only diagnostic. Profile status is stored in column 9 of
+        # each request's lane-0 profile; mode=1 can perturb timings.
+        self.diagnose = os.environ.get("KVAF_NATIVE_MTP_DIAG", "0") == "1"
         self.initial = owner.cache_map.clone()
         self.forward = self.initial.clone()
         self.reverse_initial = torch.arange(self.hot, dtype=torch.int32, device=device).repeat(self.batch, 1)
@@ -32,14 +37,20 @@ class NativeMtp:
         self.block_table = torch.arange(self.batch * self.hot // 128, dtype=torch.int32, device=device).reshape(
             self.batch, -1
         )
-        self.enabled = torch.zeros(1, dtype=torch.int32, device=device)
+        self.enabled = torch.full(
+            (1,), 1 if self.diagnose else 0, dtype=torch.int32, device=device
+        )
         self.destinations = torch.empty((self.batch * QUERIES, 1, TOPK), dtype=torch.int32, device=device)
         self.counts = torch.empty(self.batch + 1, dtype=torch.int32, device=device)
         self.indices = torch.empty(self.batch * QUERIES * TOPK, dtype=torch.int32, device=device)
         self.offsets = torch.empty_like(self.indices)
         self.outputs = torch.empty_like(self.indices)
         self.resident_lengths = torch.empty(self.batch, dtype=torch.int32, device=device)
-        self.profiling = torch.empty((self.batch, 8, 32), dtype=torch.int64, device=device)
+        self.profiling = (
+            torch.zeros((self.batch, 8, 32), dtype=torch.int64, device=device)
+            if self.diagnose
+            else torch.empty((self.batch, 8, 32), dtype=torch.int64, device=device)
+        )
         self.initial_payload = (
             torch.stack(
                 [owner.session.cpu_payload[row, ids] for row, ids in enumerate(self.reverse_initial.cpu().long())]
@@ -55,9 +66,61 @@ class NativeMtp:
         self.reverse.copy_(self.reverse_initial)
         self.cursors.zero_()
         self.output.copy_(self.initial_payload)
+        if self.diagnose:
+            self.profiling.zero_()
+            self.counts.fill_(-999)
+
+    @staticmethod
+    def _counts_invalid(counts, batch):
+        return any(value < 0 or value > QUERIES * TOPK for value in counts[:batch]) or (
+            counts[batch] != sum(counts[:batch])
+        )
+
+    def _invalid_counts_error(self, counts):
+        if not self.diagnose:
+            return ValueError(f"native_mtp_counts_invalid:{counts}")
+        profile = self.profiling.detach().cpu()
+        # Kernel PROFILE_STATUS is field 9; status is only published if the
+        # global Query Layout gate accepts all request rows. All-zero profile
+        # with negative counts suggests an early global validation failure.
+        statuses = profile[:, 0, 9].tolist()
+        codes = {
+            0: "STATUS_OK_OR_NOT_PROFILED",
+            -100: "QUERY_LAYOUT",
+            -101: "ROW_METADATA",
+            -102: "DUPLICATE_POOL_ROW",
+            -103: "TOPK_TOKEN",
+            -105: "COUNT_ACCOUNTING",
+            -106: "UNIQUE_MISS_CAPACITY",
+            -107: "INSUFFICIENT_EVICTION_SLOTS",
+            -109: "RESOLVED_SLOT",
+            -110: "DESTINATION_SLOT",
+            -111: "RESIDENT_BLOCK",
+        }
+        details = {
+            "counts": counts,
+            "native_profile_status": statuses,
+            "status_names": [codes.get(v, "UNKNOWN") for v in statuses],
+            "actual_query_cumulative": self.fixture["actual_query"].detach().cpu().tolist(),
+            "logical_and_candidate_lengths": self.fixture["actual_key"].detach().cpu().tolist(),
+            "resident_budgets": self.budgets.detach().cpu().tolist(),
+            "request_pool_rows": self.entries.detach().cpu().tolist(),
+            "selected_shape": list(self.destinations.shape),
+            "source_capacity": self.source_tokens,
+            "resident_capacity": self.hot,
+            "note": "Diagnostic profile mode=1 changes timing; statuses can be zero if the global gate exits before WriteProfile.",
+        }
+        return ValueError(f"native_mtp_counts_invalid:diagnostics={details}")
 
     def launch(self, selected):
         self.prepare(selected)
+        if self.diagnose:
+            # Do not invoke KVAF BatchGet if native LIDU has published -1
+            # counts; inspect the original kernel failure first.
+            self.torch.npu.synchronize()
+            counts = self.counts.detach().cpu().tolist()
+            if self._counts_invalid(counts, self.batch):
+                raise self._invalid_counts_error(counts)
         self.fetch()
 
     def prepare(self, selected):
@@ -115,8 +178,8 @@ class NativeMtp:
         forward = self.forward.cpu().long()
         output = self.output.cpu().reshape(self.batch, self.hot, TOKEN_BYTES)
         counts = self.counts.cpu().tolist()
-        if any(count < 0 or count > QUERIES * TOPK for count in counts[:-1]) or counts[-1] != sum(counts[:-1]):
-            raise ValueError(f"native_mtp_counts_invalid:{counts}")
+        if self._counts_invalid(counts, self.batch):
+            raise self._invalid_counts_error(counts)
         for row in range(self.batch):
             slots = forward[row, ids[row]]
             if bool(((ids[row] < 0) | (ids[row] >= self.source_tokens) | (slots < 0) | (slots >= self.hot)).any()):
