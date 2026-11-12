@@ -9,7 +9,7 @@ import numpy as np
 
 def prepare_full_chain_fixture(
     root, history, resident, miss_percent, prefetch_decoys=0,
-    index_heads=64, cold_probe_per_query=0,
+    index_heads=64, cold_probe_per_query=0, native_union_fit=False,
 ):
     """Reuse controlled cold masks, give each final TopK an unambiguous boundary.
 
@@ -69,6 +69,9 @@ def prepare_full_chain_fixture(
     if prefetch_decoys < 0:
         raise ValueError("prefetch_decoys must be nonnegative")
     logical, actual_misses, selected_cold, prefetched = [], [], set(), set()
+    # The legacy q*1024 hot shift spans every resident slot at R=4096.
+    # Optional Q4 overlap keeps the Native LIDU union within one R-sized cache.
+    hot_stride = 128 if native_union_fit else 1024
     order = np.load(root / "physical_to_logical.npy")
     for query in range(4):
         columns = np.arange(index_heads) % 32 + query * 32
@@ -81,7 +84,7 @@ def prepare_full_chain_fixture(
             # FP8 0x20 = 0.125; cold scale8 gives value1, above the
             # background threshold and below every final hot winner (>=1.5).
             encoded[np.ix_(candidates[take], np.unique(columns))] = 0x20
-        winners = (np.arange(2048 - cold) + query * 1024) % resident
+        winners = (np.arange(2048 - cold) + query * hot_stride) % resident
         encoded[np.ix_(winners, np.unique(columns))] = 0x44
         # Decode positive finite E4M3 values used by the actual input bytes.
         codes = encoded[:, columns]
@@ -104,6 +107,20 @@ def prepare_full_chain_fixture(
         selected_cold.update((np.flatnonzero(bits[resident:] >= cutoff) + resident).tolist())
         resident_cutoff = np.partition(bits[:resident], -2048)[-2048]
         prefetched.update((np.flatnonzero(bits[resident:] > resident_cutoff)[:2048] + resident).tolist())
+    # LIDU must materialize every query's TopK in one R-slot resident cache.
+    # Scores are in logical order; order maps physical token -> logical token.
+    physical_scores = np.stack(logical)[:, order]
+    selected_by_query = [np.argpartition(row, -2048)[-2048:] for row in physical_scores]
+    selected_union = np.unique(np.concatenate(selected_by_query))
+    unique_hot = int(np.count_nonzero(selected_union < resident))
+    unique_cold = int(np.count_nonzero(selected_union >= resident))
+    if selected_union.size > resident:
+        raise ValueError(
+            f"native_mtp_union_exceeds_resident: unique_topk={selected_union.size} "
+            f"hot={unique_hot} cold={unique_cold} resident={resident} "
+            f"hot_stride={hot_stride}; use --native-union-fit with enough "
+            "resident capacity for all Q4 selected tokens"
+        )
     encoded.tofile(root / "arg1.bin")
     scale.tofile(root / "arg4.bin")
     np.save(root / "logical_scores.npy", np.stack(logical))
@@ -123,6 +140,16 @@ def prepare_full_chain_fixture(
             if cold_probe_per_query else []
         ),
         expected_final_supplement=len(selected_cold - prefetched),
+        native_union_admission=dict(
+            enabled=bool(native_union_fit),
+            hot_stride=hot_stride,
+            unique_topk=int(selected_union.size),
+            unique_hot=unique_hot,
+            unique_cold=unique_cold,
+            resident_capacity=resident,
+            spare_slots=resident - int(selected_union.size),
+            admissible=True,
+        ),
     )
     (root / "fixture.json").write_text(json.dumps(config, indent=2))
     return config["full_chain_fixture"]

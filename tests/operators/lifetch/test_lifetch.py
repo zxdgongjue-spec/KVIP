@@ -34,6 +34,8 @@ def arguments(argv=None):
     p.add_argument("--runtime-shapes", action="store_true", help="one binary, four distinct runtime shapes")
     p.add_argument("--active-k-map-clear", action="store_true",
                    help="P0-A1 opt-in: CMake-build shortened v9_init mapping reset with safety guards")
+    p.add_argument("--native-union-fit", action="store_true",
+                   help="test-only: choose overlapping Q4 Hot TopK and admit only a union fitting Resident")
     p.add_argument("--resolver-compare", action="store_true")
     p.add_argument("--trace-rounds", type=int, default=3)
     p.add_argument("--miss-percent", type=float, default=10)
@@ -77,6 +79,8 @@ def arguments(argv=None):
         not a.prefetch_payload_audit or round(2048 * a.miss_percent / 100) != 1
     ):
         p.error("--cold-prefetch-probe requires --prefetch-payload-audit and one final cold miss per query")
+    if a.native_union_fit and a.li_only_varlen:
+        p.error("--native-union-fit is for the full-chain Native MTP baseline, not LI-only")
     if a.li_only_varlen and (
         batches != [4] or a.history != 8192 or a.resident != 2048 or a.index_heads != 32
         or (round(2048 * a.miss_percent / 100) != 1 if a.cold_prefetch_probe
@@ -182,6 +186,8 @@ def main(argv=None):
     p.add_argument('--runtime-shapes', action='store_true')
     p.add_argument("--active-k-map-clear", action="store_true",
                    help="P0-A1 opt-in: compile guarded active-K mapping clear")
+    p.add_argument("--native-union-fit", action="store_true",
+                   help="test-only: admit a Q4 TopK union that fits Resident capacity")
     p.add_argument('--resolver-compare', action='store_true', help='URMA resolver comparison')
     p.add_argument('--comparison-output', type=Path)
     p.add_argument('--comparison-sfa', type=Path)
@@ -217,6 +223,8 @@ def main(argv=None):
         not a.prefetch_payload_audit or round(2048 * a.miss_percent / 100) != 1
     ):
         p.error('--cold-prefetch-probe requires --prefetch-payload-audit and one final cold miss per query')
+    if a.native_union_fit and a.li_only_varlen:
+        p.error("--native-union-fit is for the full-chain Native MTP baseline, not LI-only")
     if a.li_only_varlen and (
         a.transport != 'urma' or batches != [4] or a.history != 8192 or a.resident != 2048
         or a.index_heads != 32
@@ -239,6 +247,8 @@ def main(argv=None):
               '--iterations', str(a.iterations)]
     if a.li_only_varlen:
         common.append('--li-only-varlen')
+    if a.native_union_fit:
+        common.append('--native-union-fit')
     if a.active_k_map_clear:
         common.append("--active-k-map-clear")
     if a.epoch_audit_profile:
@@ -247,6 +257,8 @@ def main(argv=None):
         common.append('--prefetch-payload-audit')
     if a.cold_prefetch_probe:
         common.append('--cold-prefetch-probe')
+    if a.native_union_fit and a.transport != 'urma':
+        p.error('--native-union-fit requires URMA')
     if a.transport == 'urma':
         command = [sys.executable, '-u', str(Path(__file__).resolve()), '--internal-urma', *common,
                    '--kvaf-root', str(kvaf_root), '--cann', a.cann, '--batches', a.batches,

@@ -104,6 +104,7 @@ def run(args, run_dir):
                 common, args.history, args.resident, args.miss_percent,
                 index_heads=args.index_heads,
                 cold_probe_per_query=int(getattr(args, "cold_prefetch_probe", False)),
+                native_union_fit=bool(getattr(args, "native_union_fit", False)),
             )
             geometry = li_geometry(batch, "auto", args.intermediate_fetches, aics, 0)
             batch_inputs(common, data, batch, args.history, geometry["rotating_aic"])
