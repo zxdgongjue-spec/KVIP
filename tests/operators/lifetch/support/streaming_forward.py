@@ -126,7 +126,7 @@ class StreamingForward:
     def set_diagnostics(self, enabled):
         # Existing prefetchCount field is unused by the streaming kernel; its
         # high bit gates timestamps only in the separate profiled pass.
-        value = np.asarray([512 | ((self.q_workers or 0) << 16) | (0x20000000 if self.legacy_layout else 0) | (0x10000000 if self.parallel_finalize else 0) | (0x08000000 if self.prepare_metadata else 0) | (0x80000000 if enabled else 0)], dtype='<u4').view('u1')
+        value = np.asarray([512 | ((self.q_workers or 0) << 16) | (0x20000000 if self.legacy_layout else 0) | (0x10000000 if self.parallel_finalize else 0) | (0x08000000 if self.prepare_metadata else 0) | (0x04000000 if getattr(self, "ubmem_overlap_fetch", False) else 0) | (0x80000000 if enabled else 0)], dtype='<u4').view('u1')
         self.workspace[96:100].copy_(self.torch.from_numpy(value.copy()))
 
     def diagnostic_cycles(self):
@@ -189,11 +189,16 @@ class StreamingForward:
                 fetch_detail["transport"] = "ubmem"
                 fetch_detail["ubmem_queries"] = [dict(
                     query_ready_wait=int(fetch[b,q*24+1]-fetch[b,q*24]),
-                    previous_query_copy_wait=int(fetch[b,q*24+2]-fetch[b,q*24+1]),
-                    kvaf_mte_get=int(fetch[b,q*24+4]-fetch[b,q*24+3]),
-                    completion_and_index_join=int(fetch[b,q*24+9]-fetch[b,q*24+4]))
+                    dependency_classify=int(fetch[b,q*24+2]-fetch[b,q*24+1]),
+                    safe_get=int(fetch[b,q*24+4]-fetch[b,q*24+3]),
+                    dependency_wait=int(fetch[b,q*24+6]-fetch[b,q*24+5]),
+                    conflict_get=int(fetch[b,q*24+8]-fetch[b,q*24+7]),
+                    safe_entries=int(fetch[b,q*24+21]), conflict_entries=int(fetch[b,q*24+15]),
+                    dependency_mask=int(fetch[b,q*24+19]),
+                    safe_calls=int(fetch[b,q*24+16]), conflict_calls=int(fetch[b,q*24+17]),
+                    completion_and_index_join=int(fetch[b,q*24+9]-fetch[b,q*24+8]))
                     for q in range(4)]
-                fetch_detail["note"] = "UBmem has no CQ; kvaf_mte_get includes pipeline drain"
+                fetch_detail["note"] = "UBmem safe/conflict Gets include KVAF MTE pipeline drain; no CQ"
             counts = [int(flags[b, phase, 1]) for phase in range(5)]
             final_counts = ([dict(total=int(post[0]), safe=int(post[5]), conflict=int(post[0]-post[5]))
                              for post in posts[b]] if posts is not None else None)

@@ -61,12 +61,16 @@ def summarize(root, transport):
                 print(f'    block={i} {role(i)} start={(c[0]-origin)/mhz:.3f} end={(c[1]-origin)/mhz:.3f} span={(c[1]-c[0])/mhz:.3f}')
             if transport == 'ubmem':
                 for q in range(4):
-                    fields = ('query_ready_wait', 'previous_query_copy_wait', 'kvaf_mte_get', 'completion_and_index_join')
+                    fields = (('query_ready_wait', 'dependency_classify', 'safe_get', 'dependency_wait', 'conflict_get', 'completion_and_index_join') if 'safe_get' in details[0]['fetch']['ubmem_queries'][q] else ('query_ready_wait', 'previous_query_copy_wait', 'kvaf_mte_get', 'completion_and_index_join'))
                     text = []
                     for field in fields:
                         values = [d['fetch']['ubmem_queries'][q][field]/mhz for d in details]
                         text.append(f'{field}=median:{statistics.median(values):.3f}/max:{max(values):.3f}')
                     print(f'    Q{q+1} per_request_us ' + ' '.join(text))
+                    query = details[0]['fetch']['ubmem_queries'][q]
+                    if 'safe_entries' in query:
+                        for field in ('safe_entries', 'conflict_entries', 'safe_calls', 'conflict_calls'):
+                            print(f'      {field}=' + str(sum(d['fetch']['ubmem_queries'][q][field] for d in details)))
     return result
 
 

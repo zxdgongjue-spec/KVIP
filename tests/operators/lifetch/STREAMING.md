@@ -98,3 +98,42 @@ are independent reference graphs. Full graph traces are printed separately.
 full attributions, reports per-BS fused medians and per-round last-finishing
 cores, Fetch-core spans, counts and UBmem Q-ready/previous-Q/MTE/join costs.
 It never runs the device. Pass one exact run directory for each transport.
+
+
+## UBmem concurrent Q copies and BS2 aligned LI
+
+`--optimized-resolve --ubmem-fetch-mode overlap` uses the existing KVAF device
+Get/MTE pipeline on each Q worker. It copies disjoint target sectors first and
+waits only for earlier Qs sharing a target sector before copying conflicts.
+656-byte rows in adjacent even/odd slots share a 32-byte write sector; 2624-byte
+rows do not. Classification checks all earlier Qs, including across empty Qs.
+Copy completion and Index completion are still both required before publishing
+valid slots. Errors and timeout publication remain enabled. URMA is unchanged.
+`--ubmem-fetch-mode serial` retains whole-Q ordering as an A/B control, using the
+same compiled library. BS1 still has one active request lane per Q; this change
+exposes parallelism across Qs rather than repartitioning one Q's entries.
+
+Run both modes, with full graph timing and separately profiled per-core/per-Q
+stages, using an existing UBmem CPU service:
+
+```bash
+bash tests/operators/lifetch/compare_ubmem_fetch.sh "$UBMEM_KVAF_ROOT" 4 "$UBMEM_SERVER" 1,2,4,8,16
+```
+
+The summary reports safe/conflicting entry and Get-call counts, classification,
+Q-ready wait, safe Get, dependency wait, conflicting Get, and Index/completion
+join time. Get timings include the KVAF MTE drain; UBmem does not wait on URMA
+CQs. Existing KV byte, native TopK/SFA, Index permutation, replay, owner remapping,
+packed-query and padding checks run in both modes. An incomplete profile is not
+performance evidence even if correctness passes.
+
+For H131072/R16384 BS2, four windows no longer force combined-LI fallback.
+Cold shard size is rounded up to 19200 tokens; the final shard clips at history.
+Cold windows contain 38400,38400,37888 tokens, with ends 54784,93184,131072;
+hot ends at16384. Both transports share this schedule and candidate scan bounds.
+LI tiling, total history, window count and prefetch budget stay unchanged.
+Other unsupported geometries still use the general path; it is not safe to delete
+that path for head64 or irregular per-request lengths as part of a BS2 fix.
+The A/B above isolates copy scheduling with this same LI schedule in both modes.
+Use pinned commit d975d39 with the same hardware command for a pre-change LI
+comparison; retain its checkout separately instead of replacing its sources.

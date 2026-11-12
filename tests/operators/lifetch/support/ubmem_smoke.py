@@ -87,6 +87,7 @@ def check_shape(
     trace_output=None,
     optimized=False,
     q_workers=2,
+    fetch_mode="overlap",
 ):
     batch, history, resident, token_bytes = shape.batch, shape.history, shape.resident, shape.token_bytes
     fixture = controlled_fixture(history, resident, shape.heads, miss_percent)
@@ -181,7 +182,11 @@ def check_shape(
         )
         if actual_triggers != expected_triggers:
             raise AssertionError(f"UBmem/URMA prefetch window mismatch: {actual_triggers} != {expected_triggers}")
-        print(f"UBMEM_WINDOW_TRIGGERS tokens={actual_triggers}", flush=True)
+        print(f"UBMEM_WINDOW_TRIGGERS general_tokens={actual_triggers}", flush=True)
+        if optimized:
+            half = ((history - resident) // 512 + rotating.rounds - 2) // (rotating.rounds - 1) * 256
+            windows = [min(history, resident + 2 * half * e) for e in range(rotating.rounds)]
+            print(f"UBMEM_LI_SEQUENCE_WINDOWS tokens={windows} half_tokens={half}", flush=True)
         update = UbmemIndexUpdate(
             torch,
             keys=storage.keys,
@@ -200,6 +205,7 @@ def check_shape(
         if optimized:
             from streaming_forward import StreamingForward
             forward = StreamingForward(rotating, update, torch, prefetch_tokens, fused_final=True, q_workers=q_workers)
+            forward.ubmem_overlap_fetch = fetch_mode == "overlap"
             forward.prepare_metadata = True
             forward.parallel_finalize = True
             forward.set_diagnostics(False)
@@ -493,6 +499,7 @@ def check_shape(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--optimized-resolve", action="store_true")
+    parser.add_argument("--ubmem-fetch-mode", choices=("serial", "overlap"), default="overlap")
     parser.add_argument("--q-workers", type=int, choices=(1, 2, 4), default=2)
     parser.add_argument("--build-dir", type=Path, required=True)
     parser.add_argument("--device", type=int, default=0)
@@ -524,6 +531,7 @@ def main():
     if args.optimized_resolve and (args.runtime_shapes or args.history != 131072 or args.resident != 16384
             or args.index_heads != 32 or max(args.batches) > 16 or max(args.prefetch_tokens) > 512):
         parser.error("optimized UBmem requires B1..16/H131072/R16384/heads32/prefetch<=512")
+    print(f"UBMEM_FETCH_MODE {args.ubmem_fetch_mode}", flush=True)
     import kvaf
     import torch
     import torch_npu  # noqa: F401
@@ -568,6 +576,7 @@ def main():
                 args.trace_output,
                 args.optimized_resolve,
                 args.q_workers,
+                args.ubmem_fetch_mode,
             )
 
 

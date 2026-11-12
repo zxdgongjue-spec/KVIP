@@ -185,6 +185,7 @@ def main(argv=None):
     p.add_argument('--parallel-fetch-finalize', action='store_true')
     p.add_argument('--prepare-update-metadata', action='store_true')
     p.add_argument('--optimized-resolve', action='store_true')
+    p.add_argument('--ubmem-fetch-mode', choices=('serial', 'overlap'), default='overlap')
     p.add_argument('--fused-final', action='store_true')
     p.add_argument('--q-workers', type=int, choices=(1, 2, 4))
     p.add_argument('--final-workers', type=int, choices=(1, 2, 4))
@@ -309,13 +310,13 @@ def main(argv=None):
     if a.comparison_sfa:
         command += ['--comparison-sfa', str(a.comparison_sfa)]
     if a.optimized_resolve:
-        command += ['--optimized-resolve', '--q-workers', str(a.q_workers)]
+        command += ['--optimized-resolve', '--q-workers', str(a.q_workers), '--ubmem-fetch-mode', a.ubmem_fetch_mode]
     print('UBmem stage traces use separate profiled replays outside graph timing.', flush=True)
     code = execute(command, log, a.timeout_seconds, 'ubmem')
     lines = log.read_text(errors='replace').splitlines()
     selected = [line for line in lines if line.startswith(('UBMEM_LIFETCH_PASS', 'UBMEM_SFA_PASS',
                 'UBMEM_GRAPH_EVENT_US', 'UBMEM_FETCH_COUNTS', 'UBMEM_WINDOW_TRIGGERS', 'UBMEM_RUNTIME_BINARY',
-                'UBMEM_TRACE'))]
+                'UBMEM_TRACE', 'UBMEM_FETCH_MODE', 'UBMEM_LI_SEQUENCE_WINDOWS'))]
     expected = len(batches) + int(a.runtime_shapes and (a.history, a.resident) != (33024, 8192))
     ok = (code == 0 and sum(line.startswith('UBMEM_LIFETCH_PASS') for line in selected) == expected
           and sum(line.startswith('UBMEM_SFA_PASS') for line in selected) == expected
