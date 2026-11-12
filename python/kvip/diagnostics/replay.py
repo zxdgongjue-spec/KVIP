@@ -19,7 +19,7 @@ def arguments(argv=None):
     p.add_argument("--transport", choices=("urma", "ubmem"), required=True)
     p.add_argument("--mode", choices=("serial", "fused"), required=True)
     p.add_argument("--threshold-policy", choices=("resident", "recent", "both"), default="resident")
-    p.add_argument("--study", choices=("threshold", "pipeline"), default="threshold")
+    p.add_argument("--study", choices=("threshold", "pipeline", "skip"), default="threshold")
     p.add_argument("--kvaf-server")
     p.add_argument("--device", type=int, default=0)
     p.add_argument("--soc", required=True)

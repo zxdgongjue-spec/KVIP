@@ -8,6 +8,10 @@
 #endif
 extern "C" uint32_t kvip_recent_pipeline() { return KVIP_RECENT_PIPELINE; }
 extern "C" uint32_t kvip_recent_unified_topk() { return KVIP_RECENT_UNIFIED_TOPK; }
+#ifndef KVIP_RECENT_SKIP
+#define KVIP_RECENT_SKIP 1
+#endif
+extern "C" uint32_t kvip_recent_skip() { return KVIP_RECENT_SKIP; }
 
 extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) { return rotating::PrepareShape(shape); }
 

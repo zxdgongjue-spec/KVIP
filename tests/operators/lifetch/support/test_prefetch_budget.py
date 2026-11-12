@@ -114,6 +114,12 @@ def test_shared_hot_selector_invalidates_specialization_cache(tmp_path, monkeypa
     assert "-DKVIP_RECENT_UNIFIED_TOPK=0" in calls[-4]
     assert "-DKVIP_RECENT_PIPELINE=1" in calls[-2]
     assert "-DKVIP_RECENT_UNIFIED_TOPK=0" in calls[-2]
+    no_skip = specialization.build_ubmem_library(**options, recent_skip=False)
+    assert no_skip not in {rebuilt, before, pipeline}
+    assert "-DKVIP_RECENT_SKIP=0" in calls[-2]
+    assert "-DKVIP_RECENT_SKIP=1" in calls[-4]
+    assert specialization.build_ubmem_library(**options, recent_skip=False) == no_skip
+    assert len(calls) == 14
 
 
 def test_service_chunk_assignment_covers_every_request_once(tmp_path):

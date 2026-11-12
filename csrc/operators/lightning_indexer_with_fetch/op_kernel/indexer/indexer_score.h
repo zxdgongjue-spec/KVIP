@@ -1046,6 +1046,39 @@ __simd_vf__ inline void ClassifyResidentScores(__ubuf__ uint16_t* scores,
         StoreAlign(hits + part, selected);
     }
 }
+
+// Recent scores remain at their physical Index positions. Each 128-token
+// tile overwrites a full 32-byte predicate, including zeroes for future keys.
+// Gather also permits a tile-aligned physical span whose cached score offset
+// is unaligned because the exact recent range begins inside another tile.
+__simd_vf__ inline void ClassifyRecentScoreTiles(__ubuf__ uint16_t* scores,
+    __ubuf__ uint16_t* threshold, __ubuf__ uint16_t* hits,
+    uint32_t scoreOffset, uint32_t begin, uint32_t count, uint32_t queryEnd) {
+    using namespace AscendC::MicroAPI;
+    auto all = CreateMask<uint16_t, MaskPattern::ALL>();
+    RegTensor<int16_t> sequence;
+    Arange(sequence, int16_t(0));
+    auto& lane = reinterpret_cast<RegTensor<uint16_t>&>(sequence);
+    RegTensor<uint16_t> offsets, values, limit;
+    LoadAlign<uint16_t, LoadDist::DIST_BRC_B16>(limit, threshold);
+    for (uint16_t part = 0; part < count; part += 128) {
+        uint32_t first = begin + part;
+        uint32_t visibleCount = queryEnd > first ? queryEnd - first : 0;
+        if (visibleCount > 128) visibleCount = 128;
+        if (visibleCount) {
+            Adds(offsets, lane, uint16_t(scoreOffset + part), all);
+            Gather(values, scores, offsets, all);
+        } else {
+            // Empty queries still clear the complete old physical bitmap.
+            Duplicate(values, uint16_t(0));
+        }
+        MaskReg selected, visible;
+        Compare<uint16_t, CMPMODE::GT>(selected, values, limit, all);
+        CompareScalar<uint16_t, CMPMODE::LT>(visible, lane, uint16_t(visibleCount), all);
+        MaskAnd(selected, selected, visible, all);
+        StoreAlign(hits + part, selected);
+    }
+}
 }
 
 #endif

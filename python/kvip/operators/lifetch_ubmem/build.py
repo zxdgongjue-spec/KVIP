@@ -68,7 +68,7 @@ def kvaf_source(build_dir):
 
 
 def build_ubmem_library(
-    *, cache_dir, cann, shape, jobs=2, optimized=True, recent_pipeline=True, recent_unified_topk=True
+    *, cache_dir, cann, shape, jobs=2, optimized=True, recent_pipeline=True, recent_unified_topk=True, recent_skip=True
 ):
     """Compile once before profiling/capture; never called by forward."""
     if not isinstance(shape, UbmemGeometry) or jobs < 1:
@@ -79,7 +79,7 @@ def build_ubmem_library(
     kvaf_root = kvaf_source(Path(cache_dir).parent)
     kvaf_include = kvaf_root / "access_operator/include"
     options = shape.options(cann) | {"KVAF_INCLUDE": str(kvaf_include), "KVIP_STREAMING_UBMEM": "ON"}
-    options.update(recent_build_options(pipeline=recent_pipeline, unified_topk=recent_unified_topk))
+    options.update(recent_build_options(pipeline=recent_pipeline, unified_topk=recent_unified_topk, skip=recent_skip))
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     shared_lifetch = source.parent / "lightning_indexer_with_fetch"
     directories = [source, source.parent / "common", shared_lifetch]

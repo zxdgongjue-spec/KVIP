@@ -430,13 +430,19 @@ def release_context(context):
 
 
 def study_cases(args):
-    """Ablate only the two new seed changes, with identical recent inputs."""
-    if getattr(args, "study", "threshold") == "pipeline":
+    """Keep each study's baseline explicit when production defaults advance."""
+    study = getattr(args, "study", "threshold")
+    if study == "skip":
         return {
-            name: dict(recent_threshold=True, recent_pipeline=pipeline, recent_unified_topk=topk)
+            name: dict(recent_threshold=True, recent_pipeline=True, recent_unified_topk=True, recent_skip=skip)
+            for name, skip in (("before", False), ("after", True))
+        }
+    if study == "pipeline":
+        return {
+            name: dict(recent_threshold=True, recent_pipeline=pipeline, recent_unified_topk=topk, recent_skip=False)
             for name, pipeline, topk in (("before", False, False), ("pipeline", True, False), ("unified", True, True))
         }
-    return {policy: {"recent_threshold": policy == "recent"} for policy in ("resident", "recent")}
+    return {policy: {"recent_threshold": policy == "recent", "recent_skip": True} for policy in ("resident", "recent")}
 
 
 def verify_case_equivalence(cases, *, same_threshold):
@@ -451,19 +457,25 @@ def verify_case_equivalence(cases, *, same_threshold):
             case["threshold_comparison"][key] != first["threshold_comparison"][key]
             for key in ("initial_keys", "final_keys")
         ):
-            raise AssertionError("Pipeline/TopK optimization changed exact threshold values")
+            raise AssertionError("Seed execution optimization changed exact threshold values")
 
 
 def run(args, archive, retained):
     context = allocate_context(args, archive, retained)
-    pipeline_study = getattr(args, "study", "threshold") == "pipeline"
-    if args.mode == "fused" and (args.threshold_policy == "both" or pipeline_study):
+    execution_study = getattr(args, "study", "threshold") in ("pipeline", "skip")
+    if args.mode == "fused" and (args.threshold_policy == "both" or execution_study):
         cases = {}
         for name, tuning in study_cases(args).items():
             args.fused_tuning = tuning
             cases[name] = measure_case(args, archive, context, retained)
-        verify_case_equivalence(cases, same_threshold=pipeline_study)
-        result = dict(status="pass", transport=args.transport, mode=args.mode, cases=cases)
+        verify_case_equivalence(cases, same_threshold=execution_study)
+        result = dict(
+            status="pass",
+            transport=args.transport,
+            mode=args.mode,
+            study=getattr(args, "study", "threshold"),
+            cases=cases,
+        )
     else:
         result = measure_case(args, archive, context, retained)
     release_context(context)

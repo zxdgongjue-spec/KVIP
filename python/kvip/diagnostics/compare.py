@@ -2,7 +2,7 @@
 """Compare current serial and fused chains on one frozen input.
 
 Each backend/mode has its own process. Fused variants share one DDR import and
-production launcher. Studies change the seed range or its pipeline/TopK work.
+production launcher. Studies change the seed range or its pipeline/TopK/score-reuse work.
 """
 
 import argparse
@@ -25,7 +25,7 @@ def arguments(argv=None):
     p.add_argument("--serial-workers", type=int, default=32)
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--iterations", type=int, default=10)
-    p.add_argument("--study", choices=("threshold", "pipeline"), default="threshold")
+    p.add_argument("--study", choices=("threshold", "pipeline", "skip"), default="threshold")
     p.add_argument("--result-dir", type=Path, required=True)
     args = p.parse_args(argv)
     if args.device < 0 or args.warmup < 0 or args.iterations < 1 or not 1 <= args.serial_workers <= 48:
@@ -71,6 +71,7 @@ def summarize(results, study="threshold"):
             reads=reads,
             graph_payload_GBps=reads["bytes"] / mean / 1000,
             threshold=result.get("threshold_comparison"),
+            score_comparison=result.get("score_comparison"),
             selection=result["selection_comparison"],
             workers=result["runtime_workers"],
             post_size=result.get("batch_get_post_size"),
@@ -79,6 +80,31 @@ def summarize(results, study="threshold"):
     effects = {}
     for transport in ("urma", "ubmem"):
         best = transport + "-serial"
+        if study == "skip":
+            before, after = (table[f"{transport}-fused-{name}"] for name in ("before", "after"))
+            for row, skip in ((before, False), (after, True)):
+                if not row["score_comparison"] or row["score_comparison"].get("status") != "bit_exact":
+                    raise ValueError("Skip A/B requires bit-exact validation against all captured valid LI scores")
+                expected = dict(recent_threshold=True, recent_pipeline=True, recent_unified_topk=True, recent_skip=skip)
+                if row["tuning"] is None or any(row["tuning"].get(key) is not value for key, value in expected.items()):
+                    raise ValueError("Skip A/B requires identical recent/pipeline/TopK settings and only skip changed")
+            if {k: v for k, v in before["tuning"].items() if k != "recent_skip"} != {
+                k: v for k, v in after["tuning"].items() if k != "recent_skip"
+            }:
+                raise ValueError("Skip A/B changed another tuning option or prefetch budget")
+            if any(
+                before["selection"][key] != after["selection"][key]
+                for key in ("selected_set_sha256", "ordered_output_sha256")
+            ):
+                raise ValueError("Skip A/B changed the final selection")
+            if any(before["threshold"][key] != after["threshold"][key] for key in ("initial_keys", "final_keys")):
+                raise ValueError("Skip A/B changed the threshold")
+            effects[transport] = dict(
+                serial_reference=best,
+                skip_reduction_pct=100 * (1 - after["mean_us"] / before["mean_us"]),
+                skip_vs_serial_reduction_pct=100 * (1 - after["mean_us"] / table[best]["mean_us"]),
+            )
+            continue
         if study == "pipeline":
             before, pipeline, unified = (
                 table[f"{transport}-fused-{name}"] for name in ("before", "pipeline", "unified")
@@ -136,6 +162,19 @@ def print_summary(summary):
             flush=True,
         )
     for transport, effect in summary["effects"].items():
+        if summary.get("study") == "skip":
+            print(
+                f"CHECK {transport} initial_threshold=unchanged_bit_exact final_scores=bit_exact "
+                "final_topk=unchanged_ordered KV_Index_outputs=verified",
+                flush=True,
+            )
+            print(
+                f"GAIN {transport} skip={effect['skip_reduction_pct']:.2f}% "
+                f"skip_vs_serial={effect['skip_vs_serial_reduction_pct']:.2f}% "
+                f"serial_reference={effect['serial_reference']}",
+                flush=True,
+            )
+            continue
         if summary.get("study") == "pipeline":
             print(
                 f"CHECK {transport} initial_threshold=unchanged_bit_exact final_scores=bit_exact "
@@ -212,7 +251,11 @@ def run(args):
         print(
             f"RUN {name}"
             + (
-                (" before/pipeline/unified share DDR" if args.study == "pipeline" else " resident/recent share DDR")
+                {
+                    "threshold": " resident/recent share DDR",
+                    "pipeline": " before/pipeline/unified share DDR",
+                    "skip": " before/after share DDR",
+                }[args.study]
                 if mode == "fused"
                 else f" workers={args.serial_workers}"
                 + (f" post={post_size} inflight=2048" if transport == "urma" else "")

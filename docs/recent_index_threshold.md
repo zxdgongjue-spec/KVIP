@@ -1,6 +1,6 @@
 # 用近期 Index 补齐融合算子的早阈值
 
-本次在最新 `main` 的融合执行路径上，增加一种早阈值输入：resident 前缀加上近期 Index，并减少准备这一阈值时的重复搬运与TopK工作。URMA 与 UBmem 均保留当前串行实现和融合调度。`--study threshold`比较是否加入近期Index，`--study pipeline`在相同resident+recent候选上比较两项实现优化。离线工具读取以前采集的数据，历史记录中的优化参数只用于校验和溯源，不用于启用旧实现。
+本次在最新 `main` 的融合执行路径上，增加一种早阈值输入：resident 前缀加上近期 Index，并减少准备这一阈值时的重复搬运、TopK和打分工作。URMA 与 UBmem 均保留当前串行实现和融合调度。`--study threshold`比较是否加入近期Index，`--study pipeline`在相同resident+recent候选上比较两项实现优化，`--study skip`单独比较是否复用已提前计算的近期分数。离线工具读取以前采集的数据，历史记录中的优化参数只用于校验和溯源，不用于启用旧实现。
 
 当前已经完成 CPU 侧数据契约、统计和输入合并测试。100 轮统计结果及 NPU 耗时需要在持有原始数据的服务器运行后才能确定，本文不预设收益。
 
@@ -191,7 +191,7 @@ resident 物理前缀
 
 原早阈值准备先对resident取TopK，再把近期分数与这2048项合并。统一TopK将resident和近期两个不重叠分数区间接成一个候选流，用现有精确TopK处理；它仍按每个query的因果末尾裁剪，范围不满足条件时保留原路径。完整历史打分、ScoreGM写入和最终TopK没有从计时中删除。
 
-`--study pipeline`自动运行以下三档；三档均启用resident+recent，预取预算均为512、每窗口64：
+`--study pipeline`自动运行以下三档；三档均启用resident+recent，预取预算均为512、每窗口64，并显式关闭`recent_skip`，保持原三档的对照语义：
 
 | 结果名 | `KVIP_RECENT_PIPELINE` | `KVIP_RECENT_UNIFIED_TOPK` | 对照目的 |
 | --- | --- | --- | --- |
@@ -234,6 +234,55 @@ resident 物理前缀
 ```
 
 每组包含两个当前串行基线和六个融合结果。`pipeline`收益以`before`为分母，统一TopK的增量以`pipeline`为分母，组合收益以`before`为分母；与串行的比较另列。三档固定顺序执行，短测仍可能受时钟、温度及外部负载影响。收益尚需服务器实测，不能把CPU模型或编译通过解释为性能通过，也不能将该单组设备链的变化直接换算成服务TPOT变化。
+
+## 单独验证近期分数复用
+
+计算早阈值时，近期区间已经产生了本轮真实分数。`recent_skip`让后续历史扫描复用这些分数，减少同一query与同一Index的重复计算；对应的分类、进度发布和窗口握手仍需完成。该开关保持原窗口协议与预取预算，不把需要等待的传输移到计时区间之外。
+
+阈值确定后，先用已有分数写出近期位置的物理候选位图，再扫描剩余区间。计算和分类共同采用向外对齐的128-token块，首尾多出的有效位置也一并处理，未来位置明确写零。只有本轮已经完整计分、分类的块才会被跳过；即使某个窗口全部跳过，仍在原窗口位置发布完成进度并执行Fetch服务。当前快路径覆盖完整history的Q4布局，其他布局保留原重算路径。近期KV并未因此成为hot hit，缺失数据仍按原Fetch协议拉取。
+
+`--study skip`只运行以下两档融合对照。两档都启用resident+recent、流水复用和统一TopK，只有`recent_skip`不同：
+
+| 结果名 | `recent_pipeline` | `recent_unified_topk` | `recent_skip` |
+| --- | --- | --- | --- |
+| `before` | true | true | false |
+| `after` | true | true | true |
+
+每个后端两档共享同一Runtime和DDR arena，恢复同一份冻结输入，继续验证全部有效分数、初始和最终阈值、每轮有序TopK及KV/Index输出。`kvip_recent_skip()`返回值必须与请求一致，防止加载旧二进制。原`pipeline`研究显式关闭该开关；`threshold`研究使用当前默认开启值，不再代表本节的skip-off基线。
+
+使用现有五组输入与CPU服务运行：
+
+```bash
+(
+    set -euo pipefail
+    repo=/home/c00982601/CacheOS/vLLM-DSA
+    input_root="${RECENT_INPUT_ROOT:?设置为FIVE_INPUTS_READY输出的完整目录}"
+    kernel="${KVAF_BATCH_GET_KERNEL:?先加载当前KVIP/scripts/env.sh}"
+    build="${kernel%/bin/kvaf_execute_batch_get_kernels.o}"
+    test "$build" != "$kernel"
+    test -s "$build/bin/kvaf_execute_batch_get_kernels.o"
+    kvaf_server="${KVAF_SERVER:-127.0.0.1:28999}"
+    result="$input_root/skip-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    export PYTHONPATH="$repo/third_party/KVIP/python${PYTHONPATH:+:$PYTHONPATH}"
+    export ASCEND_RT_VISIBLE_DEVICES=4
+
+    for group in 2 7 10 17 4; do
+        /usr/local/python3.12.13/bin/python3 -B -m kvip.diagnostics.compare \
+            --snapshot "$input_root/g${group}-input" \
+            --build-dir "$build" \
+            --kvaf-server "$kvaf_server" \
+            --device 0 \
+            --soc Ascend950DT_9582 \
+            --serial-workers 32 \
+            --study skip \
+            --warmup 2 \
+            --iterations 10 \
+            --result-dir "$result/g${group}"
+    done
+)
+```
+
+每组显示六行：两个当前串行基线及URMA、UBmem各自的before/after。`skip`收益以同后端before的整图平均耗时为分母，与串行的收益另列。实际预取量、final读取量及无效预取量仍从完成记录统计：计算推进速度改变后，异步预取与最终读取的分工和实际流量可能变化，不能预先假定两档搬运字节完全相等。整图计时包含复用所需的读取、分类、同步和完成处理；没有NPU实测前，不宣称达到35%目标。
 
 ## 判定是否值得保留
 

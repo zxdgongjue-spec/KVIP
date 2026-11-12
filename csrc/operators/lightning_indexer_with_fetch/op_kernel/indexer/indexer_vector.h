@@ -98,6 +98,8 @@ public:
     __aicore__ inline QLIVector(){};
     __aicore__ inline void ProcessVec1(const QLICommon::RunInfo &info, uint32_t progressShard = 0,
                                      bool publishShardEnd = false, bool scoreOnly = false);
+    __aicore__ inline void PublishScoreProgress(const QLICommon::RunInfo &info,
+                                               uint32_t progressShard = 0, bool publishShardEnd = false);
     __aicore__ inline void ProcessTopK(const QLICommon::RunInfo &info, uint32_t queryRow = SIM_Q);
     __aicore__ inline void SetPrefixStorage(GM_ADDR output) { prefixOutput_ = output; }
 #if KVIP_STREAMING_LI
@@ -256,6 +258,72 @@ private:
         }
     }
 
+    __aicore__ inline void PublishRecentHits(uint32_t query, uint32_t scoreRow,
+                                           uint32_t availableEnd, bool recentMerged) {
+#if KVIP_RECENT_SKIP
+        if constexpr (std::is_same_v<SCORE_T, uint16_t>) {
+            auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+            if (!ctx->thresholdBounds || !ctx->hits) return;
+            auto bounds = reinterpret_cast<__gm__ int32_t*>(ctx->thresholdBounds) + (query / SIM_Q) * 2;
+            uint32_t queryEnd = runtimeShape_.history, queryMax = runtimeShape_.history;
+            if (ctx->queryEnds) {
+                auto ends = reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds) + (query / SIM_Q) * SIM_Q;
+                queryEnd = ends[query % SIM_Q];
+                queryMax = 0;
+                for (uint32_t q = 0; q < SIM_Q; ++q) queryMax = Max(queryMax, ends[q]);
+            }
+            auto tiles = kvip_recent_index::ReusableTiles(bounds[0], bounds[1], runtimeShape_.resident,
+                runtimeShape_.history, availableEnd, queryMax);
+            if (tiles.begin == tiles.end) return;
+            queryEnd = Min(queryEnd, availableEnd);
+            auto cached = kvip_recent_index::Clip(bounds[0], bounds[1], runtimeShape_.resident,
+                                                  runtimeShape_.history, queryEnd);
+            uint32_t cachedBegin = (cached.begin + 127) / 128 * 128;
+            uint32_t cachedEnd = cached.end / 128 * 128;
+            // TopK has finished reading its input bank; unified TopK left the
+            // exact recent scores there. Its spare historical-index bank is
+            // reused for a 2048-score DMA block plus strided predicate tiles.
+            auto scoreChunk = topkSharedTmpLocal_.template ReinterpretCast<uint16_t>();
+            auto hits = scoreChunk[2048];
+            GlobalTensor<uint8_t> bitmap;
+            bitmap.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(ctx->hits) +
+                                    uint64_t(query) * (runtimeShape_.history / 4));
+            for (uint32_t begin = tiles.begin * 128; begin < tiles.end * 128;) {
+                uint32_t count = Min(uint32_t(2048), tiles.end * 128 - begin);
+                bool useCached = recentMerged && begin >= cachedBegin && begin < cachedEnd;
+                if (useCached) count = Min(count, cachedEnd - begin);
+                else if (recentMerged && begin < cachedBegin && cachedBegin < cachedEnd)
+                    count = Min(count, cachedBegin - begin);
+                auto input = scoreChunk;
+                uint32_t offset = 0;
+                if (useCached) {
+                    input = mrgValueLocal_;
+                    offset = runtimeShape_.resident + begin - cached.begin;
+                } else if (begin < queryEnd) {
+                    SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+                    WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+                    DataCopyExtParams copy{1, count * uint32_t(sizeof(SCORE_T)), 0, 0, 0};
+                    DataCopyPadExtParams<SCORE_T> pad{true, 0, 0, 0};
+                    DataCopyPad(scoreChunk, scoreGm[uint64_t(scoreRow) * runtimeShape_.history + begin], copy, pad);
+                    SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+                    WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+                }
+                vector1::ClassifyRecentScoreTiles(
+                    reinterpret_cast<__ubuf__ uint16_t*>(input.GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_[(query % 2) * 128].GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ uint16_t*>(hits.GetPhyAddr()), offset, begin, count, queryEnd);
+                SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+                WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+                DataCopyExtParams copy{uint16_t(count / 128), 32, 7, 0, 0};
+                DataCopyPad(bitmap[begin / 4], hits.template ReinterpretCast<uint8_t>(), copy);
+                SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
+                WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+                begin += count;
+            }
+        }
+#endif
+    }
+
     __aicore__ inline void SaveResident(uint32_t query, uint32_t scoreRow, bool publishProgress,
                                       uint32_t availableEnd, bool recentMerged = false) {
         if (!recentMerged) MergeRecentScores(query, scoreRow, availableEnd);
@@ -286,6 +354,7 @@ private:
         DataCopy(indices[q * 2048], indicesOutLocal_.template ReinterpretCast<int32_t>(), 2048);
         DataCopy(thresholds[q * 128], prefixThreshold_[(query % 2) * 128], 128);
         PipeBarrier<PIPE_ALL>();
+        PublishRecentHits(query, scoreRow, availableEnd, recentMerged);
         auto context = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
         if (context->lruSlots) {
             // TopK scratch is dead after the resident result is saved. Reuse
@@ -609,6 +678,39 @@ __aicore__ inline void QLIVector<QLIT>::GetKeyScale(const QLICommon::RunInfo &ru
 }
 
 template <typename QLIT>
+__aicore__ inline void QLIVector<QLIT>::PublishScoreProgress(
+    const QLICommon::RunInfo &info, uint32_t progressShard, bool publishShardEnd)
+{
+    // This publishes only completed physical score/hit tiles. A skipped recent
+    // tile has no GEMM/L0C bank to release and must not signal a fake CV/VC pair.
+    int64_t curS1Idx = info.gS1Idx * s1BaseSize_;
+    int64_t curS2Idx = info.s2Idx * s2BaseSize_;
+    int64_t curS1ProcNum = curS1Idx + s1BaseSize_ > info.actS1Size ? info.actS1Size % s1BaseSize_ : s1BaseSize_;
+    int64_t curAivS1Idx = curS1Idx + (blockId_ % 2) * CeilDiv(curS1ProcNum, 2);
+    int64_t curAivS1ProcNum = (blockId_ % 2 == 0) ? CeilDiv(curS1ProcNum, 2) : curS1ProcNum / 2;
+    if (!curAivS1ProcNum) return;
+    if (curS2Idx >= runtimeShape_.resident && (publishShardEnd || (info.s2Idx + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
+        rotating::IsTrigger(runtimeShape_.history,runtimeShape_.resident,runtimeShape_.rounds,info.s2Idx + 1))) {
+        const uint32_t tableBase = (info.s2Idx / 64) * 64;
+        if (tableBase != rotationProgressBase_) {
+            SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+            rotating::PrepareProgress(reinterpret_cast<__ubuf__ uint32_t*>(rotationProgress_.GetPhyAddr()), tableBase);
+            SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            rotationProgressBase_ = tableBase;
+        }
+        DataCopyExtParams publish;
+        publish.blockCount = curAivS1ProcNum; // Q2: one query/AIV; Q4: two
+        publish.blockLen = 32;
+        publish.srcStride = 0;
+        publish.dstStride = 96;
+        DataCopyPad(rotationProgressGm_[(info.bIdx * SIM_Q + curAivS1Idx) * 32 + progressShard * 16],
+            rotationProgress_[(info.s2Idx % 64) * 16], publish);
+    }
+}
+
+template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &info, uint32_t progressShard,
                                                    bool publishShardEnd, bool scoreOnly)
 {
@@ -737,25 +839,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     }
 #endif
 
-    if (!scoreOnly && curS2Idx >= runtimeShape_.resident && (publishShardEnd || (info.s2Idx + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
-        rotating::IsTrigger(runtimeShape_.history,runtimeShape_.resident,runtimeShape_.rounds,info.s2Idx + 1))) {
-        const uint32_t tableBase = (info.s2Idx / 64) * 64;
-        if (tableBase != rotationProgressBase_) {
-            SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
-            WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
-            rotating::PrepareProgress(reinterpret_cast<__ubuf__ uint32_t*>(rotationProgress_.GetPhyAddr()), tableBase);
-            SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
-            WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-            rotationProgressBase_ = tableBase;
-        }
-        DataCopyExtParams publish;
-        publish.blockCount = curAivS1ProcNum; // Q2: one query/AIV; Q4: two
-        publish.blockLen = 32;
-        publish.srcStride = 0;
-        publish.dstStride = 96;
-        DataCopyPad(rotationProgressGm_[(info.bIdx * SIM_Q + curAivS1Idx) * 32 + progressShard * 16],
-            rotationProgress_[(info.s2Idx % 64) * 16], publish);
-    }
+    if (!scoreOnly) PublishScoreProgress(info, progressShard, publishShardEnd);
     SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
     CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);   //V核处理完，通知C核可以把mm1Res搬运到UB
 }

@@ -173,7 +173,8 @@ def test_recent_does_not_change_final_topk_input():
     assert "scoreGm[vecOffset *" in final
     assert "if (prefixActive_)" in final
     score = function(source, "__aicore__ inline void QLIVector<QLIT>::ProcessVec1(")
-    assert score.count("!scoreOnly && curS2Idx >= runtimeShape_.resident") == 3
+    assert score.count("!scoreOnly && curS2Idx >= runtimeShape_.resident") == 2
+    assert "if (!scoreOnly) PublishScoreProgress(info, progressShard, publishShardEnd);" in score
 
 
 def test_native_score_pass_preserves_regular_scan_state(tmp_path):

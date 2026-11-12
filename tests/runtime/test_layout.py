@@ -111,6 +111,12 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
     assert "-DKVIP_RECENT_UNIFIED_TOPK=0" in commands[-4]
     assert "-DKVIP_RECENT_PIPELINE=1" in commands[-2]
     assert "-DKVIP_RECENT_UNIFIED_TOPK=0" in commands[-2]
+    no_skip = build.build_libraries(**options, recent_skip=False)
+    assert no_skip not in {current, before, pipeline}
+    assert "-DKVIP_RECENT_SKIP=0" in commands[-2]
+    assert "-DKVIP_RECENT_SKIP=1" in commands[-4]
+    assert build.build_libraries(**options, recent_skip=False) == no_skip
+    assert len(commands) == 14
 
 
 def test_actual_operator_cmake_resolves_relocated_sources(tmp_path):

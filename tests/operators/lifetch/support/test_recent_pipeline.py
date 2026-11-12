@@ -24,6 +24,7 @@ def native_model():
             "__aicore__ inline bool QuantLightningIndexerKernel<QLIT>::ScoreRecent(",
             "__aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(",
             "__aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessBaseBlock(",
+            "__aicore__ inline void QuantLightningIndexerKernel<QLIT>::FinishBaseBlock(",
         )
     )
     run_info = function((INDEXER / "indexer_types.h").read_text(), "struct RunInfo {") + ";"

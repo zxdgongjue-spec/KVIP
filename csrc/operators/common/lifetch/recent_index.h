@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 #include <stdint.h>
+#ifndef KVIP_RECENT_SKIP
+#define KVIP_RECENT_SKIP 1
+#endif
+#if KVIP_RECENT_SKIP != 0 && KVIP_RECENT_SKIP != 1
+#error "KVIP_RECENT_SKIP must be 0 or 1"
+#endif
 
 // Index-only seed geometry. This never changes KV tail bounds or residency.
 #if defined(__CCE_AICORE__)
@@ -26,6 +32,33 @@ KVIP_RECENT_DEVICE inline Range Tiles(Range range, uint32_t shard = 0,
     const uint32_t begin = range.begin / 128, end = (range.end + 127) / 128;
     const uint32_t count = end - begin;
     return {begin + count * shard / shards, begin + count * (shard + 1) / shards};
+}
+
+// Both early classification and the cold scheduler use this exact coverage,
+// including the 128-token halo. Partial-history/causal layouts keep rescoring.
+KVIP_RECENT_DEVICE inline Range ReusableTiles(int32_t begin, int32_t end,
+                                             uint32_t resident, uint32_t history,
+                                             uint32_t availableEnd, uint32_t queryMax) {
+#if KVIP_RECENT_SKIP
+    if (availableEnd == history && history % 128 == 0 && resident % 128 == 0)
+        return Tiles(Clip(begin, end, resident, history, queryMax));
+#endif
+    return {0, 0};
+}
+
+struct Remaining { Range first, second; };
+KVIP_RECENT_DEVICE inline Remaining Subtract(Range whole, Range skip) {
+    if (whole.begin >= whole.end) return {{0, 0}, {0, 0}};
+    if (skip.begin >= skip.end || skip.end <= whole.begin || skip.begin >= whole.end)
+        return {whole, {0, 0}};
+    uint32_t left = skip.begin > whole.begin ? skip.begin : whole.begin;
+    uint32_t right = skip.end < whole.end ? skip.end : whole.end;
+    return {{whole.begin, left}, {right, whole.end}};
+}
+KVIP_RECENT_DEVICE inline uint32_t Last(Remaining ranges) {
+    if (ranges.second.begin < ranges.second.end) return ranges.second.end - 1;
+    if (ranges.first.begin < ranges.first.end) return ranges.first.end - 1;
+    return UINT32_MAX;
 }
 } // namespace kvip_recent_index
 #undef KVIP_RECENT_DEVICE

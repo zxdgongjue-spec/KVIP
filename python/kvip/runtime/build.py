@@ -37,14 +37,16 @@ def build_failure(log, stage, returncode):
     )
 
 
-def recent_build_options(*, pipeline=True, unified_topk=True):
+def recent_build_options(*, pipeline=True, unified_topk=True, skip=True):
     """Compile-time A/B controls for the recent-Index seed only."""
-    if type(pipeline) is not bool or type(unified_topk) is not bool:
-        raise ValueError("Recent pipeline and unified TopK options must be boolean")
-    return dict(KVIP_RECENT_PIPELINE=int(pipeline), KVIP_RECENT_UNIFIED_TOPK=int(unified_topk))
+    if any(type(value) is not bool for value in (pipeline, unified_topk, skip)):
+        raise ValueError("Recent pipeline, unified TopK and skip options must be boolean")
+    return dict(
+        KVIP_RECENT_PIPELINE=int(pipeline), KVIP_RECENT_UNIFIED_TOPK=int(unified_topk), KVIP_RECENT_SKIP=int(skip)
+    )
 
 
-def build_libraries(*, cache_dir, cann, headers, soc, recent_pipeline=True, recent_unified_topk=True):
+def build_libraries(*, cache_dir, cann, headers, soc, recent_pipeline=True, recent_unified_topk=True, recent_skip=True):
     """Build one shape-independent binary per source/toolchain/SoC."""
     root = Path(__file__).resolve().parents[3] / "csrc/operators"
     options = dict(
@@ -53,7 +55,7 @@ def build_libraries(*, cache_dir, cann, headers, soc, recent_pipeline=True, rece
         KVAF_INCLUDE=str(headers),
         SOC_VERSION=soc,
     )
-    options.update(recent_build_options(pipeline=recent_pipeline, unified_topk=recent_unified_topk))
+    options.update(recent_build_options(pipeline=recent_pipeline, unified_topk=recent_unified_topk, skip=recent_skip))
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     for relative in (
         "version.info",

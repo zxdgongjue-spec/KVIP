@@ -147,6 +147,13 @@ protected:
                                            uint32_t& loop, uint32_t& scaleLoop, bool last, bool newQuery = false);
     __aicore__ inline bool ScoreRecent(uint32_t& loop, uint32_t qScaleLoop,
                                       uint32_t shard = 0, uint32_t shards = 1);
+    __aicore__ inline kvip_recent_index::Range ReusableRecentTiles();
+    __aicore__ inline void ScanRemainingSequence(uint32_t begin, uint32_t end, uint32_t shard,
+        kvip_recent_index::Range skip, uint32_t lastCompute, uint32_t& loop,
+        uint32_t& scaleLoop, bool& queryReady);
+    __aicore__ inline void ScanRemainingMain(uint32_t& loop, uint32_t qScaleLoop,
+        bool hadRecent, kvip_recent_index::Range skip);
+    __aicore__ inline void FinishBaseBlock(const QLICommon::RunInfo& runInfo);
     __aicore__ inline void ProcessBaseBlock(uint32_t loop, uint64_t s2LoopIdx,
                                             QLICommon::RunInfo runInfo, uint32_t qScaleLoop, uint32_t kScaleLoop,
                                             bool reuseQuery = false);
@@ -722,6 +729,112 @@ __aicore__ inline bool QuantLightningIndexerKernel<QLIT>::ScoreRecent(
 }
 
 template <typename QLIT>
+__aicore__ inline kvip_recent_index::Range QuantLightningIndexerKernel<QLIT>::ReusableRecentTiles()
+{
+#if !KVIP_RECENT_SKIP
+    return {0, 0};
+#else
+    // The same complete Q4/full-history score rows are available to the
+    // classifier. Other tilings retain the original compute path.
+    if (Q_LAYOUT_T != LI_LAYOUT::BSND || constInfo.attenMaskFlag || constInfo.isLDOpen ||
+        tempLoopInfo.actS1Size != SIM_Q || tempLoopInfo.actS2Size != runtimeShape_.history)
+        return {0, 0};
+    auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+    if (!ctx->thresholdBounds) return {0, 0};
+    auto bounds = reinterpret_cast<__gm__ int32_t*>(ctx->thresholdBounds) + tempLoopInfo.bIdx * 2;
+    uint32_t maximum = runtimeShape_.history;
+    if (ctx->queryEnds) {
+        maximum = 0;
+        auto ends = reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds) + tempLoopInfo.bIdx * SIM_Q;
+        for (uint32_t q = 0; q < SIM_Q; ++q) if (ends[q] > maximum) maximum = ends[q];
+    }
+    return kvip_recent_index::ReusableTiles(bounds[0], bounds[1], resident_,
+        runtimeShape_.history, tempLoopInfo.actS2Size, maximum);
+#endif
+}
+
+template <typename QLIT>
+__aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanRemainingSequence(
+    uint32_t begin, uint32_t end, uint32_t shard, kvip_recent_index::Range skip,
+    uint32_t lastCompute, uint32_t& loop, uint32_t& scaleLoop, bool& queryReady)
+{
+    auto remaining = kvip_recent_index::Subtract({begin, end}, skip);
+    for (uint32_t part = 0; part < 2; ++part) {
+        auto range = part == 0 ? remaining.first : remaining.second;
+        if (range.begin == range.end) continue;
+        splitCoreInfo.s2Start = range.begin;
+        tempLoopInfo.s2LoopEnd = range.end - 1;
+        tempLoopInfo.validS2Len = range.end * S2_BASE_SIZE;
+        for (uint32_t tile = range.begin; tile < range.end; ++tile, ++loop) {
+            // Restart physical grouping but keep ping-pong bank order across
+            // holes/windows, just like the original sequence-half scan.
+            if ((tile - range.begin) % QLICommon::KScaleTiles == 0) ++scaleLoop;
+            QLICommon::RunInfo info;
+            CalcRunInfo(loop, tile, info, 0, scaleLoop);
+            info.reuseQuery = queryReady;
+            info.retainQuery = tile != lastCompute;
+            if ASCEND_IS_AIC { matmulService.ComputeMm1(info); }
+            else { vectorService.ProcessVec1(info, shard, tile + 1 == end); }
+            queryReady = true;
+        }
+    }
+    // A fully/partly skipped window still publishes its original logical
+    // end. Its bitmap was completed before cold LI; no fake GEMM/CV credit.
+    if (begin < end && end - 1 >= skip.begin && end - 1 < skip.end) {
+        splitCoreInfo.s2Start = begin;
+        tempLoopInfo.s2LoopEnd = end - 1;
+        tempLoopInfo.validS2Len = end * S2_BASE_SIZE;
+        QLICommon::RunInfo info;
+        CalcRunInfo(loop, end - 1, info, 0, 0);
+        if ASCEND_IS_AIV { vectorService.PublishScoreProgress(info, shard, true); }
+    }
+}
+
+template <typename QLIT>
+__aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanRemainingMain(
+    uint32_t& loop, uint32_t qScaleLoop, bool hadRecent, kvip_recent_index::Range skip)
+{
+    uint32_t begin = splitCoreInfo.s2Start, end = tempLoopInfo.s2LoopEnd + 1;
+    uint32_t valid = tempLoopInfo.validS2Len;
+    auto remaining = kvip_recent_index::Subtract({begin, end}, skip);
+    uint32_t lastCompute = kvip_recent_index::Last(remaining), scaleLoop = 0;
+    bool queryReady = KVIP_RECENT_PIPELINE && hadRecent;
+    for (uint32_t tile = begin; tile < end; ++tile) {
+        bool compute = tile < skip.begin || tile >= skip.end;
+        QLICommon::RunInfo info;
+        if (compute) {
+            auto range = tile < skip.begin ? remaining.first : remaining.second;
+            splitCoreInfo.s2Start = range.begin;
+            tempLoopInfo.s2LoopEnd = range.end - 1;
+            tempLoopInfo.validS2Len = range.end * S2_BASE_SIZE;
+            if ((tile - range.begin) % QLICommon::KScaleTiles == 0) ++scaleLoop;
+            CalcRunInfo(loop, tile, info, qScaleLoop, scaleLoop);
+            info.reuseQuery = queryReady;
+            info.retainQuery = tile != lastCompute;
+            if ASCEND_IS_AIC { matmulService.ComputeMm1(info); }
+            else { vectorService.ProcessVec1(info); }
+            queryReady = true;
+            ++loop;
+        } else {
+            splitCoreInfo.s2Start = begin;
+            tempLoopInfo.s2LoopEnd = end - 1;
+            tempLoopInfo.validS2Len = valid;
+            CalcRunInfo(loop, tile, info, qScaleLoop, 0);
+            if ASCEND_IS_AIV { vectorService.PublishScoreProgress(info); }
+        }
+        // Service and final TopK follow the original logical tile sequence,
+        // independently of the shortened physical compute segments.
+        info.isLastS2InnerLoop = tile + 1 == end;
+        info.s2Start = begin;
+        info.validS2Len = valid;
+        FinishBaseBlock(info);
+    }
+    splitCoreInfo.s2Start = begin;
+    tempLoopInfo.s2LoopEnd = end - 1;
+    tempLoopInfo.validS2Len = valid;
+}
+
+template <typename QLIT>
 template <SequenceLiPhase Phase>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
 {
@@ -767,10 +880,23 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
                 if (serviceEpoch == 0) vectorService.RotateFetch(0, halfTokens);
             }
             uint32_t begin = resident_ / S2_BASE_SIZE + shard * half;
+            auto skip = ReusableRecentTiles();
+            uint32_t lastCompute = UINT32_MAX;
+            bool queryReady = false;
+            if (skip.begin < skip.end) {
+                for (uint32_t epoch = 1, first = begin; epoch < runtimeShape_.rounds; ++epoch, first += 2 * half) {
+                    uint32_t end = Min(first + half, runtimeShape_.history / S2_BASE_SIZE);
+                    uint32_t last = kvip_recent_index::Last(kvip_recent_index::Subtract({first, end}, skip));
+                    if (last != UINT32_MAX) lastCompute = last;
+                }
+            }
             for (uint32_t epoch = 1; epoch < runtimeShape_.rounds; ++epoch, begin += 2 * half) {
                 uint32_t end = begin + half;
                 if (end > runtimeShape_.history / S2_BASE_SIZE) end = runtimeShape_.history / S2_BASE_SIZE;
-                ScanSequenceHalf(begin, end, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
+                if (skip.begin < skip.end)
+                    ScanRemainingSequence(begin, end, shard, skip, lastCompute, loop, scaleLoop, queryReady);
+                else
+                    ScanSequenceHalf(begin, end, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
                 if ASCEND_IS_AIV {
                     if (serviceEpoch == epoch) vectorService.RotateFetch(epoch, halfTokens);
                 }
@@ -814,6 +940,12 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()
         for (uint32_t gS1LoopIdx = splitCoreInfo.gS1Start; gS1LoopIdx <= tempLoopInfo.gS1LoopEnd; gS1LoopIdx++) {
             CalcS2LoopParams(bN2LoopIdx, gS1LoopIdx);
             bool hadRecent = ScoreRecent(gloop, qScaleLoop);
+            auto skip = ReusableRecentTiles();
+            if (skip.begin < skip.end && splitCoreInfo.s2Start == 0) {
+                ScanRemainingMain(gloop, qScaleLoop, hadRecent, skip);
+                ++qScaleLoop;
+                continue;
+            }
             uint32_t kScaleLoop = 0;
             for (int s2LoopIdx = splitCoreInfo.s2Start; s2LoopIdx <= tempLoopInfo.s2LoopEnd; s2LoopIdx++) {
                 if ((s2LoopIdx - splitCoreInfo.s2Start) % QLICommon::KScaleTiles == 0) {
@@ -852,12 +984,22 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessBaseBlock(uint3
 #endif
     if ASCEND_IS_AIC {
         matmulService.ComputeMm1(runInfo);
+    } else {
+        vectorService.ProcessVec1(runInfo);
+    }
+    FinishBaseBlock(runInfo);
+}
+
+template <typename QLIT>
+__aicore__ inline void QuantLightningIndexerKernel<QLIT>::FinishBaseBlock(const QLICommon::RunInfo& runInfo)
+{
+    uint32_t s2LoopIdx = runInfo.s2Idx;
+    if ASCEND_IS_AIC {
         if (!rotationServed_ && rotating::EpochAt(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.splitQ,runtimeShape_.rounds,runtimeShape_.serviceAics,s2LoopIdx + 1, aiCoreIdx) >= 0) {
             CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(8);
             rotationServed_ = true;
         }
     } else {
-        vectorService.ProcessVec1(runInfo);
         if ((runInfo.s2Idx + 1) * 128 == resident_) {
             vectorService.ProcessResidentTopK(runInfo);
             vectorService.PrepareRotationProgress();

@@ -11,11 +11,20 @@ from kvip.cache.index_storage import IndexCacheStorage
 def validate_fused_tuning(value, transport):
     if transport not in ("ubmem", "urma") or not isinstance(value, dict):
         raise ValueError("Expected a tuning object and ubmem/urma transport")
-    if set(value) - {"recent_threshold", "recent_pipeline", "recent_unified_topk"}:
+    if set(value) - {"recent_threshold", "recent_pipeline", "recent_unified_topk", "recent_skip"}:
         raise ValueError("Only recent-threshold seed options are changed in this production A/B comparison")
     if any(type(flag) is not bool for flag in value.values()):
         raise ValueError("Recent-threshold seed options must be boolean")
     return value
+
+
+def verify_build_options(library, options):
+    """Reject a stale or mismatched binary before capturing its graph."""
+    for key, expected in options.items():
+        function = getattr(library, "kvip_" + key)
+        function.argtypes, function.restype = [], ctypes.c_uint32
+        if function() != int(expected):
+            raise RuntimeError(f"Loaded kernel does not match requested {key}={expected}")
 
 
 def create_fused(
@@ -60,10 +69,11 @@ def create_fused(
         recent_threshold=tuning.get("recent_threshold", False),
         recent_pipeline=tuning.get("recent_pipeline", True),
         recent_unified_topk=tuning.get("recent_unified_topk", True),
+        recent_skip=tuning.get("recent_skip", True),
         prefetch_limit=512,
         window_limit=64,
     )
-    build_options = {key: effective[key] for key in ("recent_pipeline", "recent_unified_topk")}
+    build_options = {key: effective[key] for key in ("recent_pipeline", "recent_unified_topk", "recent_skip")}
     threshold_bounds = None
     if effective["recent_threshold"]:
         # Immutable per-replay bounds; all scoring/merging occurs inside forward.
@@ -136,11 +146,7 @@ def create_fused(
             **kwargs,
         )
         update_type = DirectIndexUpdate
-    for key, expected in build_options.items():
-        function = getattr(rotating.library, "kvip_" + key)
-        function.argtypes, function.restype = [], ctypes.c_uint32
-        if function() != int(expected):
-            raise RuntimeError(f"Loaded kernel does not match requested {key}={expected}")
+    verify_build_options(rotating.library, build_options)
     # Keep the archived output shape for generic state reset/oracle.
     rotating.output = output
     update = update_type(
