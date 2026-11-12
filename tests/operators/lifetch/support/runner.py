@@ -40,7 +40,7 @@ def compiler_error(path, before=4, after=10):
     return []
 
 
-def supervise(command, run, heartbeat_seconds=20):
+def supervise(command, run, heartbeat_seconds=20, timeout_seconds=300):
     """Only a checked worker completion marker plus exit code zero means PASS."""
     run = Path(run)
     summary = run / "summary.log"
@@ -54,6 +54,7 @@ def supervise(command, run, heartbeat_seconds=20):
     status("RUNNING: starting worker")
     print(f"Summary: {summary}", flush=True)
     interrupted = False
+    timed_out = False
     with (run / "worker.log").open("w") as output:
         try:
             child = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
@@ -66,6 +67,15 @@ def supervise(command, run, heartbeat_seconds=20):
                     code = child.wait(timeout=heartbeat_seconds)
                     break
                 except subprocess.TimeoutExpired:
+                    if time.monotonic() - started >= timeout_seconds:
+                        timed_out = True
+                        os.killpg(child.pid, signal.SIGTERM)
+                        try:
+                            code = child.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            os.killpg(child.pid, signal.SIGKILL)
+                            code = child.wait()
+                        break
                     stage = (
                         (run / "stage.log").read_text().strip() if (run / "stage.log").exists() else "imports/startup"
                     )
@@ -89,6 +99,8 @@ def supervise(command, run, heartbeat_seconds=20):
         result = {}
     passed = code == 0 and result.get("exit_code") == 0 and not interrupted
     detail = f"exit_code={code}"
+    if timed_out:
+        detail += f"; timeout={timeout_seconds}s"
     if code < 0:
         detail += f" signal={signal.Signals(-code).name}"
     if not marker.exists():

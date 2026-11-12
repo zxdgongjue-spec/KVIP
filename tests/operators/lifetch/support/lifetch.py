@@ -342,6 +342,8 @@ def run_device(
             save(args.comparison_output, state["ids"], state["slots"], owner.output.cpu().numpy(),
                  rotating.mapping.cpu().numpy(), rotating.lru_slots.cpu().numpy(),
                  rotating.rows.cpu().numpy().view(np.uint32), owner.remote_token_addresses.cpu().numpy())
+        if read_label == "prototype_with_update" and args.trace_rounds:
+            collect_core(torch, rotating, graph, reset, check, args.trace_rounds, folder, full=True)
         if trace_core:
             core_trace.update(
                 collect_core(torch, rotating, graph, reset, check, args.trace_rounds or AUTO_CORE_TRACE_ROUNDS, folder)

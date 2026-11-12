@@ -60,14 +60,18 @@ def union(intervals):
     return merged
 
 
-def account(events, name, elapsed):
+def account(events, name, elapsed, full=False):
     scopes = [e for e in events if e.get("name") == name and e.get("ph") == "X"]
     if len(scopes) != 1:
         return dict(error=f"Expected one CPU replay scope, found {len(scopes)}")
     scope = scopes[0]
     origin = Decimal(str(scope["ts"]))
     start, end = 0.0, float(scope["dur"])
-    groups = {stage: [] for stage in STAGES}
+    kernels = ({stage: f"v9_{stage}_kernel" for stage in STAGES} if not full else
+               dict(init="v9_init_kernel", li="v9_li_kernel", resolve="v9_resolve_kernel",
+                    publish="kvop_direct_update_outputs_early_kernel", apply="kvop_direct_apply_owned_kernel",
+                    fetch="v9_fetch_update_kernel"))
+    groups = {stage: [] for stage in kernels}
     for event in events:
         n = event.get("name", "").lower()
         cat = (event.get("cat") or "").lower()
@@ -76,9 +80,8 @@ def account(events, name, elapsed):
         stage = next(
             (
                 key
-                for key in STAGES
-                if n == f"v9_{key}_kernel"
-                or (n.startswith(f"v9_{key}_kernel_") and n[len(f"v9_{key}_kernel_") :].isdigit())
+                for key, prefix in kernels.items()
+                if n == prefix or (n.startswith(prefix + "_") and n[len(prefix)+1:].isdigit())
             ),
             None,
         )
@@ -114,11 +117,12 @@ def account(events, name, elapsed):
     )
 
 
-def collect_core(torch, rotating, graph, reset, verify, rounds, folder):
+def collect_core(torch, rotating, graph, reset, verify, rounds, folder, full=False):
     """Profile the existing core graph separately from primary timing."""
     import torch_npu
     from torch.profiler import record_function
 
+    label = "full" if full else "core"
     stream = torch.npu.current_stream(rotating.device)
     samples = []
     profile = torch_npu.profiler.profile(
@@ -132,7 +136,7 @@ def collect_core(torch, rotating, graph, reset, verify, rounds, folder):
             reset()
             stream.synchronize()
             begin, end = [torch.npu.Event(enable_timing=True) for _ in range(2)]
-            name = f"kvop_core_{step}"
+            name = f"kvop_{label}_{step}"
             with record_function(name):
                 begin.record(stream)
                 graph.replay()
@@ -152,16 +156,16 @@ def collect_core(torch, rotating, graph, reset, verify, rounds, folder):
             )
     # Save events/counters before parsing, so collection never needs repeating
     # merely because a vendor trace schema differs.
-    (folder / "core_samples.json").write_text(json.dumps(samples, indent=2))
-    path = folder / "core_trace.json"
+    (folder / f"{label}_samples.json").write_text(json.dumps(samples, indent=2))
+    path = folder / f"{label}_trace.json"
     profile.export_chrome_trace(str(path.resolve()))
     trace = json.loads(path.read_text())
     events = trace["traceEvents"] if isinstance(trace, dict) else trace
     for sample in samples:
-        sample["accounting"] = account(events, sample["name"], sample["us"])
+        sample["accounting"] = account(events, sample["name"], sample["us"], full=full)
     result = dict(samples=samples, trace=str(path))
-    (folder / "core_attribution.json").write_text(json.dumps(result, indent=2))
-    (folder / "core_summary.log").write_text(core_summary(result) + "\n")
+    (folder / f"{label}_attribution.json").write_text(json.dumps(result, indent=2))
+    (folder / f"{label}_summary.log").write_text(core_summary(result).replace("CORE DEVICE TRACE", label.upper() + " DEVICE TRACE") + "\n")
     return result
 
 
