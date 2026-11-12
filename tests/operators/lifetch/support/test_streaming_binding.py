@@ -139,3 +139,44 @@ def test_layer_groups_share_only_ephemeral_storage():
     assert a.workspace.data_ptr() != b.workspace.data_ptr()
     assert a.rotating.context.data_ptr() != b.rotating.context.data_ptr()
     second.torch.empty.assert_not_called()
+
+
+def test_device_failure_invalidates_only_failed_owner(tmp_path):
+    """Execute the retained production error handler after removing old update."""
+    import subprocess
+    from pathlib import Path
+
+    header = Path(__file__).resolve().parents[4] / 'csrc/operators/lightning_indexer_with_fetch/op_kernel/index_cache_update.h'
+    source = tmp_path / 'failure.cpp'
+    source.write_text(r'''
+#include <cstdint>
+#include <cassert>
+#include <vector>
+#define __simt_vf__
+#define __aicore__
+#define __gm__
+#define LAUNCH_BOUND(x)
+struct { unsigned x; } threadIdx;
+template<class T> T asc_ldcg(T* p){return *p;}
+template<class T> void asc_stcg(T* p,T value){*p=value;}
+void asc_threadfence(){}
+''' + f'#include "{header}"\n' + r'''
+int main(){
+ uint64_t args[28]={};uint32_t status[2]={0,0},owners[2]={2,0};
+ std::vector<uint32_t> valid(3*1024,1);
+ args[6]=(uintptr_t)status;args[9]=(uintptr_t)owners;
+ args[16]=(uintptr_t)valid.data();args[25]=1024;
+ for(threadIdx.x=0;threadIdx.x<256;++threadIdx.x)CompleteEarlyUpdate<256>(args,0,0);
+ for(auto v:valid)assert(v==1);
+ for(threadIdx.x=0;threadIdx.x<256;++threadIdx.x)CompleteEarlyUpdate<256>(args,0,9);
+ assert(status[0]==4 && status[1]==0);
+ for(unsigned i=0;i<valid.size();++i)assert(valid[i]==(i<2048?1U:0U));
+ status[1]=2;
+ for(threadIdx.x=0;threadIdx.x<256;++threadIdx.x)CompleteEarlyUpdate<256>(args,1,0);
+ assert(status[1]==2);
+ for(unsigned i=0;i<1024;++i)assert(valid[i]==0 && valid[1024+i]==1);
+}
+''')
+    binary = tmp_path / 'failure'
+    subprocess.run(['c++', '-std=c++17', '-fsanitize=address,undefined', str(source), '-o', str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)

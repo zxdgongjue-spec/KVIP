@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-// Experimental single-worker Q4 resolver: each query's result is published
-// independently. This file is not used by the production forward path.
+// Single-worker Q4 resolver: publish each query independently.
 #pragma once
 namespace rotating {
-#if KVIP_FUSE_QUERY_WORK
 using StagedContextPointer=__ubuf__ Context*;
-#else
-using StagedContextPointer=__gm__ Context*;
-#endif
 constexpr uint32_t kStagedRankTag = 0x80000000U;
 
 // Resolve the original prefetch mapping without modifying it.
@@ -99,11 +94,7 @@ inline void StagedInitializeReady(__ubuf__ uint32_t* selected,__ubuf__ uint32_t*
     asc_syncthreads();
 }
 
-#if KVIP_FUSE_QUERY_WORK
 __simt_callee__
-#else
-__simt_vf__ __aicore__ LAUNCH_BOUND(512)
-#endif
 inline void StagedQuery(uint32_t query,uint32_t history,uint32_t resident,uint32_t bytes,
     uint32_t batch,uint32_t used,StagedContextPointer ctx,__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc,
     __ubuf__ uint32_t* keys,__ubuf__ uint32_t* ranks,__ubuf__ uint16_t* ids,__ubuf__ uint32_t* slots,

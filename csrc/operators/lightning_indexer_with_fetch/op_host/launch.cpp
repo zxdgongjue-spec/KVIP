@@ -8,10 +8,6 @@ extern "C" uint32_t v9_##name(void* bindings,void* stream,const rotating::Runtim
     if (!bindings || !stream || !shape) return 100000; \
     return aclrtlaunch_v9_##name##_kernel(blocks,stream,bindings); }
 ENTRY(init,shape->batch)
-ENTRY(wait,shape->batch)
-ENTRY(resolve,shape->finalCores)
-ENTRY(fetch,shape->batch)
-ENTRY(probe,shape->serviceLanes)
 
 extern "C" uint32_t aclrtlaunch_v9_li_kernel(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_1(uint32_t,void*,void*);
@@ -43,11 +39,6 @@ extern "C" uint32_t v9_final_workers(const rotating::RuntimeShape* shape) { retu
 extern "C" uint32_t v9_final_owner_bytes(const rotating::RuntimeShape* shape) { return shape->finalOwnerBytes; }
 extern "C" uint32_t v9_final_replicated(const rotating::RuntimeShape* shape) { return 1; }
 extern "C" uint32_t v9_token_bytes(const rotating::RuntimeShape* shape) { return shape->tokenBytes; }
-
-#if V9_RESOLVER_COMPARE
-ENTRY(resolve_original,shape->finalCores)
-ENTRY(resolve_adapted,shape->finalCores)
-#endif
 
 #include "api.h"
 #include <cstdint>
@@ -81,10 +72,6 @@ extern "C" uint32_t refactor_fetch_pack_args(void *output, uint32_t capacity,
     return 0;
 }
 
-extern "C" uint32_t kvop_direct_update_outputs_early(uint32_t,void*,void*);
-extern "C" uint32_t aclrtlaunch_v9_fetch_update_kernel(uint32_t,void*,void*,void*);
-// Isolated experiment: LI classifies final TopK, then two AIVs/request
-// overlap staged Resolver and Index update before the existing URMA join.
 extern "C" uint32_t aclrtlaunch_v9_streaming_resolve_update(uint32_t,void*,void*);
 extern "C" uint32_t kvip_lifetch_streaming_forward(void* bindings,void* update,void* workspace,void* stream,const rotating::RuntimeShape* shape,uint32_t workers) {
     if(!bindings||!update||!workspace||!stream||!shape||shape->resident>131072||shape->batch<1||shape->batch>16||shape->finalWorkers!=4)return 100000;

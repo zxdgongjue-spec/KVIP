@@ -2,7 +2,6 @@
 // Optional publication AIV. Raw change events remain owned by Resolver; this
 // worker owns service outputs, FinalPost and existing KVAF descriptor publication.
 #pragma once
-#if KVIP_OUTPUT_WORKER
 __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PreparePublicationOutputs(
  __gm__ int64_t* logical,__ubuf__ uint32_t* masks,uint32_t batchCount,uint32_t b,uint32_t q,
  __ubuf__ uint32_t* selected,__ubuf__ uint32_t* work){
@@ -94,4 +93,3 @@ __aicore__ inline void OutputWorker(__gm__ Args* a,uint32_t b){
  if(profile)kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ticks),32*8);
  pipe.Destroy();
 }
-#endif

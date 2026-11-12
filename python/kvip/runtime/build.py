@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Startup-only builds of the original LIFetch and Index-update targets."""
+"""Startup-only build of the unified LIFetch target."""
 
 import fcntl
 import hashlib
@@ -45,7 +45,6 @@ def build_libraries(*, cache_dir, cann, headers, soc):
         ASCEND_CANN_PACKAGE_PATH=str(cann),
         KVAF_INCLUDE=str(headers),
         SOC_VERSION=soc,
-        RESOLVER_COMPARE=0,
     )
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     for relative in (
@@ -67,7 +66,7 @@ def build_libraries(*, cache_dir, cann, headers, soc):
     digest.update(shared_selector.read_bytes())
     directory = Path(cache_dir) / digest.hexdigest()[:20]
     directory.mkdir(parents=True, exist_ok=True)
-    libraries = directory / "libv9_bridge.so", directory / "libkvop_cache_update.so"
+    libraries = directory / "libv9_bridge.so",
     log = directory / "build.log"
     logging.getLogger("kvip").info("Universal LIFetch build: soc=%s log=%s", soc, log)
     with (directory / "build.lock").open("w") as lock:

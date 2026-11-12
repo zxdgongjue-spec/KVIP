@@ -9,7 +9,6 @@ from kvip.operators.lifetch.geometry import final_aivs, li_geometry, prefetch_bu
 from kvip.operators.lifetch.tiling import RuntimeShape
 from kvip.operators.lifetch.workspace import rotation_spec
 
-
 class LIFetchBinding:
     def __init__(
         self,
@@ -215,7 +214,7 @@ class LIFetchBinding:
         self.arguments = tuple(arguments) + (self.context,)
         self.bindings = torch.tensor([x.data_ptr() for x in self.arguments], dtype=torch.uint64, device=self.device)
         self.functions = {}
-        for name in ("init", "li", "wait", "resolve", "fetch", "probe"):
+        for name in ("init", "li"):
             fn = getattr(self.library, "v9_" + name)
             fn.argtypes, fn.restype = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p], ctypes.c_uint32
             self.functions[name] = fn
@@ -242,21 +241,3 @@ class LIFetchBinding:
         result = self.functions[name](self.bindings.data_ptr(), stream.npu_stream, self.shape_pointer)
         if result:
             raise RuntimeError(f"v9_{name}_launch_failed:{result}")
-
-    def launch_compute(self):
-        self._call("init")
-        self._call("li")
-
-    def wait(self):
-        self._call("wait")
-
-    def launch_final_submit(self):
-        self._call("resolve")
-
-    def finish(self):
-        self._call("fetch")
-
-    def launch(self):
-        self.launch_compute()
-        self.launch_final_submit()
-        self.finish()

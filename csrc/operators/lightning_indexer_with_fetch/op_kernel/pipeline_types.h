@@ -1,8 +1,5 @@
 #pragma once
 #include <stdint.h>
-#ifndef KVIP_OUTPUT_WORKER
-#define KVIP_OUTPUT_WORKER 0
-#endif
 namespace pipeline_ab {
 constexpr uint32_t kResolveCores=KVIP_OUTPUT_WORKER?3:2;
 constexpr uint32_t kRawQueryFlag=12;
@@ -23,4 +20,19 @@ struct alignas(128) Args {
  uint32_t history, resident, prefetchCount, maxEvents;
  uint64_t queryBitmaps, queryErrors, updateBindings, denseShadow, packedFetch;
 };
+}
+
+namespace rotating {
+// Six uint32 banks, one uint16 first-occurrence-position bank, and control.
+// Storing a TopK position (0..8191) instead of its token saves 16 KiB without
+// narrowing token IDs. Recover tokens from selected[position] at address gather.
+constexpr uint32_t kFinalSlotsOffset = 4 * 8192 + 4096;
+constexpr uint32_t kFinalPositionsOffset = kFinalSlotsOffset + 8192;
+constexpr uint32_t kFinalControlOffset = kFinalPositionsOffset + 8192;
+constexpr uint32_t kFinalScratchWords = kFinalControlOffset + 2560;
+constexpr uint32_t kFinalScratchBytes = kFinalScratchWords * sizeof(uint32_t);
+static_assert(kFinalScratchBytes <= 223232,
+              "final scratch exceeds the compiler user UB reservation");
+static_assert(223232 + 6144 <= 229376,
+              "user plus CANN 9.1 compiler UB exceeds the SIMT limit");
 }

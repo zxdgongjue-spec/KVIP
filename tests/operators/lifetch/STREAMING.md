@@ -88,17 +88,12 @@ correctness and performance of this new UBmem path still require the command abo
 
 ## Interpreting URMA baselines and saved traces
 
-The default URMA operator on this branch includes the PR11 sequence-LI
-prerequisites. It is not pristine main `81b1472`. Compare against a pinned main
-checkout when reporting gains over main. The `prototype_with_update` metric is
-the optimized full graph; `prototype_core` and standalone update measurements
-are independent reference graphs. Full graph traces are printed separately.
-
-`support/compare_transport_tail.py --urma URMA_RUN --ubmem UBMEM_RUN` reads saved
-full attributions, reports per-BS fused medians and per-round last-finishing
-cores, Fetch-core spans, counts and UBmem Q-ready/previous-Q/MTE/join costs.
-It never runs the device. Pass one exact run directory for each transport.
-
+Both transports use the integrated public pipeline by default.
+`prototype_with_update` is its complete graph measurement; `native_chain`
+is the independent serial LI/LIDU/Get reference. Historical `prototype_core`
+and standalone Index update timings are no longer generated. Full graph
+profiling retains per-stage and per-core diagnostics. Saved older reports
+remain readable by the analysis tools.
 
 ## UBmem concurrent Q copies and BS2 aligned LI
 

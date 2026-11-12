@@ -198,8 +198,6 @@ def check_shape(
             status=torch.zeros(batch, dtype=torch.int32, device=device),
             query_inputs=workspace.inputs,
             outputs=torch.empty((2, batch * 4, 1, 2048), dtype=torch.int32, device=device),
-            plan_buffer=workspace.index_plan,
-            extended_work=workspace.index_work,
         )
         if optimized:
             from streaming_forward import StreamingForward

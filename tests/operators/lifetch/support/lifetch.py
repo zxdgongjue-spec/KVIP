@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 from device_trace import collect_core, core_summary
-from index_update import DirectCacheUpdate, permutation_records
+from index_update import DirectCacheUpdate
 from kvip.operators.lifetch.forward import LIFetchForward
 from kvip.runtime.loader import load_lifetch_library
 from prefetch_audit import actual_reads, completion_failures, score_rows, selected_bounds
@@ -105,7 +105,6 @@ def run(args, run_dir):
             (weights.view(np.uint32) >> 16).astype(np.uint16).tofile(data / "native_weights_bf16.bin")
             options = dict(
                 RUN_MODE="npu",
-                RESOLVER_COMPARE=int(args.resolver_compare),
                 SOC_VERSION=args.soc,
                 ASCEND_CANN_PACKAGE_PATH=args.cann,
                 KVAF_INCLUDE=find_headers(args.kvaf_root),
@@ -207,21 +206,12 @@ def run(args, run_dir):
             (run_dir / 'cases.log').write_text('\n'.join(summaries) + '\n')
             print(line, flush=True)
             continue
-        if args.resolver_compare:
-            from resolver import summary
-
-            line = summary(report)
-            summaries.append(line)
-            (run_dir / "cases.log").write_text("\n".join(summaries) + "\n")
-            print(line, flush=True)
-            continue
         times = report["timing"]
         line = (
             f"binary_sha256={built_digest} early_fetch={args.early_fetch} streaming={args.streaming} q_workers={args.q_workers}\nBS={batch} prototype PASS index_heads={args.index_heads} windows={geometry['intermediate_fetches']} requested_windows={args.intermediate_fetches} history={args.history} hot={args.resident} topk=2048 Q=4 graph=True\n"
             + "graph_p50_us="
             + ", ".join((f"{k}:{v['p50_us']:.3f}" for k, v in times.items()))
-            + f"\ncore_speedup={times['native_chain']['p50_us'] / times['prototype_core']['p50_us']:.3f}x"
-            + f" full_speedup={times['native_chain']['p50_us'] / times['prototype_with_update']['p50_us']:.3f}x"
+            + f"\nfull_speedup={times['native_chain']['p50_us'] / times['prototype_with_update']['p50_us']:.3f}x"
             + "; full=init + LI/Fetch/resolve + service output mapping + Index update; fixture restore/verification and SFA/LRU CPU excluded\n"
             + f"SFA_max_abs={report['sfa']['max_abs']:.6g}; stateful_rounds={report['stateful_rounds']} "
             + f"native_unique_misses={report['native_misses_per_request']}"
@@ -239,8 +229,6 @@ def run(args, run_dir):
         for label, samples in report.get("read_samples", {}).items():
             ranges = {key: [min(row[key] for row in samples), max(row[key] for row in samples)] for key in samples[0]}
             line += f"\nactual_reads {label}: min_max=" + json.dumps(ranges)
-        if report.get("core_trace"):
-            line += "\n" + core_summary(report["core_trace"])
         if report.get("full_trace"):
             line += "\n" + core_summary(report["full_trace"], label="full")
         if report.get("cache_update"):
@@ -334,12 +322,11 @@ def run_device(
             raise AssertionError(f"native Get work differs from logical misses: {counts[:-1]} != {expected}")
         state["native_misses"] = counts[:-1]
 
-    core_trace = {}
     full_trace = {}
     read_samples = {}
     split_samples = {}
 
-    def measure(call, reset, check, trace_core=False, read_label=None):
+    def measure(call, reset, check, read_label=None):
         state["check_phase"] = f"timing {read_label or getattr(call, '__name__', 'operation')}"
         reset()
         call()
@@ -404,9 +391,6 @@ def run_device(
                 if args.streaming:
                     pipeline.set_diagnostics(False)
                     stream.synchronize()
-        if trace_core and args.trace_rounds:
-            progress(folder.parent, f"BS={b}: core graph profiler ({args.trace_rounds} replays); logs={folder}")
-            core_trace.update(collect_core(torch, rotating, graph, reset, check, args.trace_rounds, folder))
         graph.reset()
         owner.graphs.remove(graph)
         return dict(p50_us=float(np.median(samples)), p99_us=float(np.percentile(samples, 99)), samples=len(samples))
@@ -435,7 +419,6 @@ def run_device(
         final_workers=args.final_workers or 0,
         prefetch_limit=args.prefetch_tokens,
         output_stride=owner.output.shape[1],
-        row_owners=torch.arange(b, dtype=torch.int32, device=device) if args.resolver_compare else None,
     )
     topk = arguments[9].view(torch.int32).reshape(b, 4, 2048)
     prefix = 4 * 2048 * 6 + 1024 + 4 * h * 2
@@ -450,7 +433,6 @@ def run_device(
         batch=b,
         history=h,
         hot=r,
-        library=build / "libkvop_cache_update.so",
         topk=topk,
         locations=rotating.locations,
         rotating=rotating,
@@ -481,9 +463,6 @@ def run_device(
         update.set_order(initial_orders)
         owner.reset()
         owner.mark_launched()
-
-    def core():
-        rotating.launch()
 
     def full():
         pipeline()
@@ -619,108 +598,48 @@ def run_device(
             if not torch.equal(hot_kv[row, mask], expected):
                 raise AssertionError(f"valid hot slot has mismatched Index/KV owner: request={row}")
 
-    if args.resolver_compare:
-        from resolver import run
-
-        return run(torch, args, rotating, owner, topk, initial_selected, reset, verify, folder)
-
-    def check_direct_update(orders, cold_start=False, label="regular"):
-        state["check_phase"] = f"{label}: fetch before Index update"
+    def check_pipeline(orders, cold_start=False, label="regular"):
+        state["check_phase"] = label
         reset()
         update.set_order(orders)
         if cold_start:
             rotating.hot_valid.zero_()
-        core()
+        full()
         stream.synchronize()
-        verify()
-        state["check_phase"] = f"{label}: after Index update"
-        source_data = [t.cpu().clone() for t in update.inputs[:4]]
-        changes = rotating.changes.cpu().numpy()
-        lru = rotating.change_slots.cpu().numpy()
-        expected = [t.clone() for t in source_data]
-        moved_rows = 0
-        expected_valid = rotating.hot_valid.cpu().numpy().copy()
-        for row in range(b):
-            records = permutation_records(lru[row], changes[row], h)
-            moved_rows += sum((dst != src for dst, src in records))
-            written = set(lru[row, changes[row] >= 0].tolist())
-            for dst, src in records:
-                if dst < r and dst != src and (dst not in written):
-                    expected_valid[row, dst] = 0
-            for dst, src in records:
-                for out, old in zip(expected, source_data):
-                    out[row, dst] = old[row, src]
-        update(topk, rotating.locations)
         verify(True)
-        for name, actual, wanted in zip(("Index", "scales", "addresses", "logical"), update.inputs[:4], expected):
-            if not torch.equal(actual.cpu(), wanted):
-                raise AssertionError(f"Producer-driven update mismatch: {name}")
-        valid = rotating.hot_valid.cpu().numpy()
-        if not np.array_equal(valid, expected_valid):
-            raise AssertionError("Index update hot validity mismatch")
+        verify_all_valid_hot()
+        # Validate every Index field against its logical owner, including rows
+        # outside current TopK. This checks the actual staged update, not an
+        # independently executed old planner.
         logical = update.logical.cpu().long()
-        hot_kv = owner.output[:, :r].cpu()
+        seeds = [saved[0].reshape(b, h, 128).cpu(), saved[1].view(torch.float32).reshape(b, h).cpu()]
+        address_seed = saved[2][b * prefix:].view(torch.int64).reshape(b, tail // 8)[:, :h].cpu()
         for row in range(b):
-            resident = torch.from_numpy(valid[row] != 0)
-            if not torch.equal(hot_kv[row, resident], owner.session.cpu_payload[row, logical[row, :r][resident]]):
-                raise AssertionError("Hot Index/KV ownership mismatch")
-        print(f"CHECK PASS {label}: {json.dumps(state['completion'])}; KV/Index/ownership verified", flush=True)
-        return dict(
-            transport=state["completion"],
-            moved_index_rows=moved_rows,
+            if not torch.equal(torch.sort(logical[row]).values, torch.arange(h)):
+                raise AssertionError("Index logical owners are not a permutation")
+            for name, tensor, seed in zip(("Index", "scales", "addresses"), update.inputs[:3], seeds + [address_seed]):
+                if not torch.equal(tensor[row].cpu(), seed[row, logical[row]]):
+                    raise AssertionError(f"Staged update field mismatch: {name}, request={row}")
+        changes = rotating.changes.cpu().numpy()
+        result = dict(transport=state["completion"],
             first_window_fetches=int(rotating.rows[:, 16].cpu().sum()),
             hot_changes=int(np.count_nonzero((changes >= 0) & (changes < r))),
-            cold_changes=int(np.count_nonzero(changes >= r)),
-        )
+            cold_changes=int(np.count_nonzero(changes >= r)))
+        print(f"CHECK PASS {label}: {json.dumps(result)}; full KV/Index/ownership verified", flush=True)
+        return result
 
-    snapshot_changes = check_direct_update(initial_orders)
-    cold_start_changes = check_direct_update(initial_orders, cold_start=True, label="cold-start")
+    snapshot_changes = check_pipeline(initial_orders)
+    cold_start_changes = check_pipeline(initial_orders, cold_start=True, label="cold-start")
     unlucky = []
     for row in range(b):
         selected_hot = list(dict.fromkeys(initial_selected[row].reshape(-1).tolist()))
         selected_hot = [x for x in selected_hot if x < r]
         seen = set(selected_hot)
         unlucky.append(selected_hot + [x for x in initial_orders[row] if x not in seen])
-    hot_case = check_direct_update(unlucky, label="hot-victim-collision")
+    hot_case = check_pipeline(unlucky, label="hot-victim-collision")
     restored_hot = hot_case["hot_changes"]
     if not hot_case["first_window_fetches"] or not restored_hot:
         raise AssertionError(f"First window did not Fetch former hot candidates into LRU slots: {hot_case}")
-
-    if args.streaming_fetch and args.q_workers is None:
-        # Same per-Q descriptors, with Q4 publication as the submission boundary.
-        # This runs only for correctness diagnosis, outside graph measurements.
-        state["check_phase"] = "streaming per-Q packing with deferred fetch"
-        reset()
-        pipeline.set_deferred_fetch(True)
-        try:
-            full()
-            stream.synchronize()
-            verify(True)
-            verify_all_valid_hot()
-            (folder / "streaming_isolation.log").write_text("PASS: per-Q packing with deferred fetch\n")
-            print("STREAMING ISOLATION PASS: per-Q packing, deferred fetch", flush=True)
-        finally:
-            pipeline.set_deferred_fetch(False)
-
-    if args.streaming:
-        # The standalone checks above use the baseline resolver/update. Exercise
-        # the actual streaming graph path as well, including the victim case.
-        streaming_checks = [("regular", initial_orders, False), ("hot-victim-collision", unlucky, False)]
-        if args.q_workers is not None:
-            streaming_checks.append(("cold-start", initial_orders, True))
-        for label, orders, cold_start in streaming_checks:
-            state["check_phase"] = f"streaming {label}"
-            print(f"STREAMING CHECK START {label}: resolver_cores/request={pipeline.resolver_cores}; "
-                  f"total_AIV={pipeline.resolver_cores*b+4*(args.q_workers or 0)}", flush=True)
-            reset()
-            update.set_order(orders)
-            if cold_start:
-                rotating.hot_valid.zero_()
-            full()
-            stream.synchronize()
-            verify(True)
-            verify_all_valid_hot()
-            print(f"STREAMING CHECK PASS {label}: selected KV and all valid hot KV/Index match", flush=True)
 
     if args.fetch_only_compare:
         # Capture a regular real resolver snapshot. Prefetch has completed;
@@ -768,34 +687,7 @@ def run_device(
             raise AssertionError("Round init unexpectedly rewrote producer-owned predicates")
 
     timings["round_init"] = measure(lambda: rotating._call("init"), init_reset, init_check)
-    timings["prototype_core"] = measure(core, reset, verify, trace_core=True, read_label="prototype_core")
     timings["prototype_with_update"] = measure(full, reset, lambda: verify(True), read_label="prototype_with_update")
-    reset()
-    header = b * (4 * 2048 * 6 + 1024)
-    arguments[13][header : header + b * h].fill_(255)
-    core()
-    stream.synchronize()
-    verify()
-
-    def update_reset():
-        reset()
-        core()
-        stream.synchronize()
-
-    timings["aiv_cache_update"] = measure(lambda: update(topk, rotating.locations), update_reset, lambda: verify(True))
-
-    def plan_check():
-        verify()
-        update.check_capacity()
-
-    timings["aiv_update_plan"] = measure(update.plan, update_reset, plan_check)
-
-    def apply_reset():
-        update_reset()
-        update.plan()
-        stream.synchronize()
-
-    timings["aiv_update_move"] = measure(update.apply, apply_reset, lambda: verify(True))
     reset()
     stream.synchronize()
     graph = torch.npu.NPUGraph()
@@ -849,7 +741,6 @@ def run_device(
         status="pass",
         counter_clock_mhz=counter_clock_mhz,
         timing=timings,
-        core_trace=core_trace,
         full_trace=full_trace,
         read_samples=read_samples,
         split_samples=split_samples,
@@ -858,24 +749,13 @@ def run_device(
         native_misses_per_request=state["native_misses"],
         cache_update=dict(
             swap_capacity_per_request=update.max_swaps,
-            index_swap_payload_bytes=snapshot_changes["moved_index_rows"] * 128,
             producer_cold_changes=snapshot_changes["cold_changes"],
             hot_kv_copy_payload_bytes=0,
-            moved_index_rows=snapshot_changes["moved_index_rows"],
-            field_read_write_bytes=snapshot_changes["moved_index_rows"] * (128 + 4 + 8 + 8) * 2,
-            update_effective_GBps=snapshot_changes["moved_index_rows"]
-            * (128 + 4 + 8 + 8)
-            * 2
-            / timings["aiv_cache_update"]["p50_us"]
-            / 1000,
-            update_target_20us=timings["aiv_cache_update"]["p50_us"] < 20,
-            update_copy_workers_per_request=4,
             cold_start_changes_checked=cold_start_changes,
             prefetch_tokens=args.prefetch_tokens,
             former_hot_changes_checked=restored_hot,
             first_window_fetches_checked=hot_case["first_window_fetches"],
-            scope=("Standalone update counters use baseline resolver, not streaming; " if args.streaming else "")
-            + "Producer records include final hot fallback; no temporary KV slots; zero KV copy",
+            scope="Actual streaming pipeline verified; no temporary KV slots; zero KV copy",
         ),
         kernel="KVIP/csrc/operators/lightning_indexer_with_fetch; preserved core tiling, direct LRU interface",
         scope="fixed Q4 shared history; graph kernel and AIV maintenance separately; no ABC growth",

@@ -49,7 +49,7 @@ def _bind_selectors(torch, policy, config):
                 headers=setup.headers,
                 soc=setup.soc,
             )
-        library, update_library = libraries[token_bytes]
+        (library,) = libraries[token_bytes]
         runtime = writer.runtimes[layer.geometry]
         if not isinstance(runtime, LeasedRuntime):
             lease = KvafGetLease(
@@ -85,7 +85,6 @@ def _bind_selectors(torch, policy, config):
         )
         update = DirectIndexUpdate(
             torch,
-            update_library,
             **index_update_arguments(policy, workspace, storage, rotating, group),
         )
         selectors[group] = bind_group_selector(torch, policy, workspace, setup, group, storage, rotating, update)
@@ -184,8 +183,6 @@ def _bind_ubmem_selectors(torch, policy, config):
         update = UbmemIndexUpdate(
             torch,
             **index_update_arguments(policy, workspace, storage, rotating, group),
-            plan_buffer=workspace.index_plan,
-            extended_work=workspace.index_work,
         )
         selectors[group] = bind_group_selector(
             torch, policy, workspace, setup, group, storage, rotating, update, ubmem=True

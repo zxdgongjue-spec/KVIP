@@ -15,10 +15,6 @@ uint32_t kvip_ubmem_abi_version();
 uint32_t kvip_ubmem_context_bytes();
 uint32_t kvip_ubmem_region_bytes();
 uint32_t kvip_ubmem_status_bytes();
-uint32_t kvip_ubmem_plan_words();
 uint32_t v9_init(void* bindings,void* stream,const rotating::RuntimeShape* shape);
 uint32_t v9_li(void* bindings,void* stream,const rotating::RuntimeShape* shape);
-uint32_t v9_resolve(void* bindings,void* stream,const rotating::RuntimeShape* shape);
-uint32_t v9_fetch(void* bindings,void* stream,const rotating::RuntimeShape* shape);
-uint32_t kvip_ubmem_update(void* update,void* stream,const rotating::RuntimeShape* shape);
 }

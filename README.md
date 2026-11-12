@@ -35,7 +35,7 @@ patches/kvaf-background-put.patch    # shared background Put binding compatibili
 patches/kvaf-ubmem-fused-lease.patch # optional mapped-region fused lease for KVAF UBmem
 tests/
   operators/lidu/
-  operators/lifetch/                 # single CLI, update tests, support and resolver_reference
+  operators/lifetch/                 # unified CLI, correctness/performance tests and diagnostics
   cache/                            # LRU / ABC
   adapters/                         # vLLM inputs / KVAF transport
   runtime/                          # package boundaries and relocation checks
@@ -174,28 +174,11 @@ fetches the conflicting ranges. Its inflight control and completion handling are
 reused without a separate final WQE submitter. The test also checks an empty hot cache, victim collisions,
 full Index/scale/address ownership, and multiple graph replays, outside timing.
 
-The CPU suite executes the production resolver and shared LIDU selector with
-empty/populated hot storage, duplicate queries, padding and ABC mappings. A CANN
-simulator fixture additionally executes the compiled planner/mover and resolver
-without network transport:
-
-```bash
-source /usr/local/Ascend/cann/set_env.sh
-cmake -S tests/operators/lifetch/simulator -B build/hot-fallback-sim \
-  -DASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/cann \
-  -DKVAF_INCLUDE="$PWD/third_party/KVAF/access_operator/demo/aiv_batch_get/include"
-cmake --build build/hot-fallback-sim -j2
-msprof op simulator --application="$PWD/build/hot-fallback-sim/update_sim 410 8" \
-  --soc-version=Ascend950PR_9599 --output=tests/results/update-sim-410-b8 --launch-count=2 --timeout=90
-msprof op simulator --application="$PWD/build/hot-fallback-sim/update_sim 3000 1" \
-  --soc-version=Ascend950PR_9599 --output=tests/results/update-sim-3000 --launch-count=2 --timeout=90
-msprof op simulator --application="$PWD/build/hot-fallback-sim/resolver_sim 3000" \
-  --soc-version=Ascend950PR_9599 --output=tests/results/resolver-sim-3000 --launch-count=1 --timeout=90
-```
-
-The fixtures require their own `PASS` line after all tensor checks. A profiler
-success message or a partial trace following timeout is not a correctness pass.
-Simulator times are device-model times, not hardware graph or TPOT measurements.
+The host suite checks classification, staged Index exchanges, Fetch control flow,
+and launch/error contracts. The NPU runner validates the actual full pipeline:
+cold starts, hot-victim collisions, every Index field, selected KV, all valid hot
+KV and repeated stateful graph replays. Historical replicated-resolver and
+standalone Index planner/mover fixtures were removed with their implementation.
 
 Independent LIDU and ABC device checks:
 
@@ -273,18 +256,13 @@ in a shared header used by LIFetch fallback as well. At the initial migration,
 retained LI/Fetch/resolver/update function bodies
 were compared after removing include paths, comments and whitespace. Both Q2 and
 Q4 materialized LI sources match the prior generation pipeline; the build no
-longer rewrites source files. LI/Fetch and Index update keep their separate
-compiler options. Unused non-quantized LI implementations and legacy simulator
-fixture entry points were omitted. Original resolver comparison sources are test
-only, disabled in normal builds.
+longer rewrites source files. The current pipeline uses shared LI classification
+and staged Resolver/Index update/Fetch. Old replicated-resolver and standalone
+Index update launchers and their build targets have been removed.
 
-`scripts/migration_sources.json` records source provenance and hashes of the
-migrated operator files. Hash checks detect accidental edits, not device correctness.
-CPU tests include host execution of the Index-update planner/mover and the unified
-launch ordering/error path. The hot-fallback change was compiled with CANN 9.1
-and checked with its operator simulator as described above. Hardware graph
-correctness and performance still require A5 validation; simulator results are
-not hardware measurements.
+`scripts/migration_sources.json` records the initial source provenance; its old
+hashes are historical, not an assertion that optimized files are unchanged.
+Hardware correctness and performance still require A5 validation.
 
 The imported CANN LI headers retain their original license notices; their license
 is reproduced in `LICENSE-CANN`. Apache-2.0 applies to files so marked.
@@ -295,7 +273,7 @@ Installation does not take device, batch, history, resident, heads or window cou
 Host tiling evaluates the original partition/window formulas when a launch object
 is bound, then stores its immutable parameters in the device Context before graph
 capture. No per-shape compilation is required. Index update reads history/resident
-from its bindings. ABI versions are now LIFetch 11 and Index update 3; rebuild both.
+from its bindings. Rebuild LIFetch after updating; it no longer depends on a separate Index update library.
 
 Supported runtime dimensions: batch 1–16 (also limited by the concurrently resident AIV budget),
 index heads 32/64, 1–32 requested windows, 256-aligned history/resident with
@@ -375,9 +353,10 @@ host models do not prove runtime correctness or performance.
 `kvip.LIFetch(rotating, update)` and `kvip.bind_selectors` use the same pipeline
 for URMA and UBmem: init, shared LI/final TopK classification, and fused
 per-query Resolver/Index update/Fetch. The old complete launch symbols and the
-separate experimental operator directory have been removed. Standalone stage
-entry points remain for correctness tests and native-reference measurements;
-they are not a selectable production fallback.
+separate experimental operator directory have been removed. Old standalone
+Resolve/Fetch/Index-update entry points are also removed. Native LI/LIDU/Get
+remains the independent serial reference. Init and LI launchers serve the shared
+full pipeline; Fetch-only diagnostics execute its actual Fetch worker.
 
 BS1–16 is supported; a larger batch raises an explicit error during binding.
 The default uses two Fetch AIVs per Q and three pipeline AIVs per request.
