@@ -235,6 +235,9 @@ def run_v9_li_varlen_only(
     from kvip.adapters.vllm.inputs import QueryInputs
     from stage_diagnostics import record_stage, run_synchronized_stage
     from epoch_audit import audit_rotation_events, format_rotation_table
+    from prefetch_payload_audit import (
+        audit_prefetch_mapping, verify_prefetch_payload,
+    )
 
     history, resident = args.history, args.resident
     stage_log = Path(folder) / "li-varlen-stage.jsonl"
@@ -284,6 +287,24 @@ def run_v9_li_varlen_only(
     )
     topk = arguments[9].view(torch.int32).reshape(b, 4, 2048)
     stream = torch.npu.current_stream(device)
+
+    if getattr(args, "prefetch_payload_audit", False):
+        # Deterministic, injective *physical* victim slot mapping. The regular
+        # LI-only fixture does not initialize this LRU policy array. Without
+        # this seed, PhysicalSlot() can map every prefetch to physical slot 0.
+        # This changes only test metadata, never the KVAF/LI production code.
+        if resident != 2048:
+            raise ValueError("P1-C0 identity victim fixture requires resident=2048")
+        rotating.lru_slots.copy_(
+            torch.arange(2048, dtype=torch.int32, device=device)
+            .unsqueeze(0).expand(b, 2048)
+        )
+        stream.synchronize()
+        record_stage(
+            stage_log, "setup", "victim_slot_fixture", "initialized",
+            mapping="identity_per_request", victim_slots=2048,
+            expected_physical_slots_unique=True,
+        )
 
     scenarios = (
         {
@@ -508,6 +529,95 @@ def run_v9_li_varlen_only(
             completion_verified=True,
         )
 
+        payload_audit_filename = None
+        payload_checked_tokens = None
+        payload_checked_bytes = None
+        payload_cq_groups = None
+        payload_hot_candidates = None
+        payload_cold_candidates = None
+        if getattr(args, "prefetch_payload_audit", False):
+            if epoch_selected_for_post is None or epoch_selected_for_post <= 0:
+                raise AssertionError(
+                    f"{scenario['name']}: P1-C0 expected nonzero profiled SelectedForPost"
+                )
+            payload_audit_filename = f"prefetch-payload-{scenario['name']}.json"
+            payload_path = Path(folder) / payload_audit_filename
+            plan = audit_prefetch_mapping(
+                rotating.mapping.cpu().numpy(),
+                rotating.lru_slots.cpu().numpy(),
+                rows,
+                status_words,
+                actual_k,
+                resident=resident,
+                output_stride=int(owner.output.shape[1]),
+                rounds=int(rotating.rounds),
+                selected_for_post=epoch_selected_for_post,
+            )
+            plan["scenario"] = scenario["name"]
+            plan["fixture_victim_policy"] = "identity_per_request"
+            payload_path.write_text(json.dumps(plan, indent=2) + "\n")
+            if plan["errors"]:
+                record_stage(
+                    stage_log, scenario["name"], "prefetch_mapping", "failed",
+                    audit_file=payload_audit_filename,
+                    errors=plan["errors"][:4],
+                )
+                raise AssertionError(
+                    f"{scenario['name']}: Row/CQ/mapping mismatch; "
+                    f"see {payload_audit_filename}: {plan['errors'][:3]}"
+                )
+            record_stage(
+                stage_log, scenario["name"], "prefetch_mapping", "verified",
+                audit_file=payload_audit_filename,
+                requests=plan["summary"]["requests"],
+                mapping_count=plan["summary"]["mapping_count"],
+                cq_completed_groups=plan["summary"]["cq_completed_groups"],
+            )
+
+            def read_hbm(row_index, slots):
+                indices = torch.as_tensor(slots, dtype=torch.int64, device=device)
+                return owner.output[row_index].index_select(0, indices).cpu().numpy()
+
+            def read_ddr(row_index, tokens):
+                source = owner.session.cpu_payload[row_index]
+                indices = torch.as_tensor(
+                    tokens, dtype=torch.int64, device=source.device
+                )
+                return source.index_select(0, indices).cpu().numpy()
+
+            plan = verify_prefetch_payload(
+                plan,
+                read_hbm=read_hbm,
+                read_ddr=read_ddr,
+                token_bytes=int(owner.output.shape[-1]),
+            )
+            payload_path.write_text(json.dumps(plan, indent=2) + "\n")
+            payload_summary = plan["summary"]
+            if plan["errors"]:
+                record_stage(
+                    stage_log, scenario["name"], "prefetch_payload", "failed",
+                    audit_file=payload_audit_filename,
+                    errors=plan["errors"][:4],
+                )
+                raise AssertionError(
+                    f"{scenario['name']}: DDR/HBM payload mismatch; "
+                    f"see {payload_audit_filename}: {plan['errors'][:3]}"
+                )
+            payload_checked_tokens = payload_summary["payload_tokens_checked"]
+            payload_checked_bytes = payload_summary["payload_bytes_checked"]
+            payload_cq_groups = payload_summary["cq_completed_groups"]
+            payload_hot_candidates = payload_summary["resident_candidate_count"]
+            payload_cold_candidates = payload_summary["cold_candidate_count"]
+            record_stage(
+                stage_log, scenario["name"], "prefetch_payload", "verified",
+                audit_file=payload_audit_filename,
+                payload_tokens_checked=payload_checked_tokens,
+                payload_bytes_checked=payload_checked_bytes,
+                cq_completed_groups=payload_cq_groups,
+                resident_candidate_count=payload_hot_candidates,
+                cold_candidate_count=payload_cold_candidates,
+            )
+
         active_queries = 0
         padded_queries = 0
         for row, q_len in enumerate(counts):
@@ -548,6 +658,12 @@ def run_v9_li_varlen_only(
             epoch_audit_file=epoch_audit_filename,
             epoch_candidate_count_observed=epoch_observed_candidates,
             epoch_selected_for_post_count_observed=epoch_selected_for_post,
+            payload_audit_file=payload_audit_filename,
+            payload_tokens_checked=payload_checked_tokens,
+            payload_bytes_checked=payload_checked_bytes,
+            cq_completed_groups=payload_cq_groups,
+            resident_prefetch_candidates=payload_hot_candidates,
+            cold_prefetch_candidates=payload_cold_candidates,
         )
         summaries.append(
             {
@@ -563,6 +679,12 @@ def run_v9_li_varlen_only(
                 "epoch_audit_file": epoch_audit_filename,
                 "epoch_candidate_count_observed": epoch_observed_candidates,
                 "epoch_selected_for_post_count_observed": epoch_selected_for_post,
+                "prefetch_payload_audit_file": payload_audit_filename,
+                "prefetch_payload_tokens_checked": payload_checked_tokens,
+                "prefetch_payload_bytes_checked": payload_checked_bytes,
+                "prefetch_cq_completed_groups": payload_cq_groups,
+                "resident_prefetch_candidates": payload_hot_candidates,
+                "cold_prefetch_candidates": payload_cold_candidates,
                 "result": "PASS",
             }
         )
@@ -577,6 +699,7 @@ def run_v9_li_varlen_only(
         "topk": 2048,
         "prefetch_limit": args.prefetch_tokens,
         "epoch_event_profiling": bool(getattr(args, "epoch_audit_profile", False)),
+        "prefetch_payload_audit": bool(getattr(args, "prefetch_payload_audit", False)),
         "length_buffers_stable": True,
         "rounds": summaries,
         "executed_stages": ["v9_init", "v9_li", "v9_wait"],

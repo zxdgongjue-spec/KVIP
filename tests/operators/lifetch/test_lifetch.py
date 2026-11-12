@@ -44,6 +44,8 @@ def arguments(argv=None):
                    help="run only custom v9 LI with two mixed-length forwards; requires the URMA test fixture")
     p.add_argument("--epoch-audit-profile", action="store_true",
                    help="enable test-only V9 Event candidate/selected counters for nonzero-prefetch LI varlen")
+    p.add_argument("--prefetch-payload-audit", action="store_true",
+                   help="P1-C0: reconcile prefetch Row/CQ/mapping and DDR-to-HBM bytes in LI-only fixture")
     p.add_argument("--output", type=Path, default=ROOT / "tests/results/lifetch")
     a = p.parse_args(argv)
     if a.kvaf_root is None:
@@ -65,6 +67,8 @@ def arguments(argv=None):
         p.error("prefetch tokens must be 0..2048 and divisible by windows")
     if a.epoch_audit_profile and (not a.li_only_varlen or a.prefetch_tokens != 64):
         p.error("--epoch-audit-profile requires --li-only-varlen and --prefetch-tokens 64")
+    if a.prefetch_payload_audit and not a.epoch_audit_profile:
+        p.error("--prefetch-payload-audit requires --epoch-audit-profile")
     if a.li_only_varlen and (
         batches != [4] or a.history != 8192 or a.resident != 2048 or a.index_heads != 32
         or a.miss_percent != 0 or a.prefetch_tokens not in (0, 64) or a.runtime_shapes
@@ -172,6 +176,8 @@ def main(argv=None):
                    help='run only custom v9 LI with two mixed-length forwards')
     p.add_argument('--epoch-audit-profile', action='store_true',
                    help='enable test-only candidate/selected counters for nonzero-prefetch varlen')
+    p.add_argument('--prefetch-payload-audit', action='store_true',
+                   help='P1-C0: reconcile Row/CQ/mapping and compare prefetch HBM bytes with DDR')
     p.add_argument('--output', type=Path, default=ROOT / 'tests/results/lifetch')
     p.add_argument('--timeout-seconds', type=int, default=1800)
     a = p.parse_args(argv)
@@ -190,6 +196,8 @@ def main(argv=None):
         p.error('comparison snapshots require one batch and no runtime-shapes')
     if a.epoch_audit_profile and (not a.li_only_varlen or a.prefetch_tokens != 64):
         p.error('--epoch-audit-profile requires --li-only-varlen and --prefetch-tokens 64')
+    if a.prefetch_payload_audit and not a.epoch_audit_profile:
+        p.error('--prefetch-payload-audit requires --epoch-audit-profile')
     if a.li_only_varlen and (
         a.transport != 'urma' or batches != [4] or a.history != 8192 or a.resident != 2048
         or a.index_heads != 32 or a.miss_percent != 0 or a.prefetch_tokens not in (0, 64)
@@ -210,6 +218,8 @@ def main(argv=None):
         common.append('--li-only-varlen')
     if a.epoch_audit_profile:
         common.append('--epoch-audit-profile')
+    if a.prefetch_payload_audit:
+        common.append('--prefetch-payload-audit')
     if a.transport == 'urma':
         command = [sys.executable, '-u', str(Path(__file__).resolve()), '--internal-urma', *common,
                    '--kvaf-root', str(kvaf_root), '--cann', a.cann, '--batches', a.batches,
