@@ -1,0 +1,686 @@
+diff --git a/access_operator/demo/aiv_batch_get/include/kvaf_batch_get_device.h b/access_operator/demo/aiv_batch_get/include/kvaf_batch_get_device.h
+index d1c0355..da086e6 100644
+--- a/access_operator/demo/aiv_batch_get/include/kvaf_batch_get_device.h
++++ b/access_operator/demo/aiv_batch_get/include/kvaf_batch_get_device.h
+@@ -6,6 +6,12 @@
+ #include "batch_get_schedule.h"
+ #undef KVAF_BATCH_GET_SCHEDULE_INLINE
+ 
++#ifndef KVAF_BATCH_GET_BULK_WQE
++#define KVAF_BATCH_GET_BULK_WQE 0
++#endif
++static_assert(!KVAF_BATCH_GET_BULK_WQE || KVAF_BATCH_GET_WQES_PER_POST == 32,
++              "Bulk WQE submission preserves the post32 stripe assignment");
++
+ // Graph-safe ExecuteBatchGet data path.  The Direct-HCCP transport and WQE
+ // protocol remain the verified KVAF ABI. The caller supplies a compact request
+ // prefix, so WQE materialization and round-robin multi-Jetty SQ submission can
+@@ -22,6 +28,12 @@ constexpr uint32_t kWqeBytes = 64U;
+ constexpr uint32_t kWqesPerPost = kvaf_batch_get::kWqesPerPost;
+ constexpr uint32_t kWqeBankBytes = kWqesPerPost * kWqeBytes;
+ constexpr uint32_t kWqeBankCount = 2U;
++// Bulk mode compacts each Jetty's original 32-request stripes into bounded
++// 512-WQE tiles. Two banks use 64 KiB, independent of request_capacity.
++constexpr uint32_t kBulkWqesPerPost = 512U;
++static_assert(kBulkWqesPerPost * kWqeBytes * kWqeBankCount <=
++                  KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES,
++              "Bulk WQE banks exceed configured local memory");
+ constexpr uint32_t kSqDepthShift = 15U;
+ constexpr uint32_t kSqDepthWqebbs = 1U << kSqDepthShift;
+ constexpr uint32_t kSqIndexMask = kSqDepthWqebbs - 1U;
+@@ -36,7 +48,10 @@ constexpr uint32_t kLocalMemoryBytes =
+ 
+ // UB layout. WQE banks are consumed by MTE3 while the vector pipeline fills
+ // the other bank. Validation scratch follows the two banks; the old compacted
+-// request arrays are no longer needed.
++// request arrays are no longer needed. Bulk mode aliases this storage with its
++// 64-KiB banks only AFTER validation has joined and scalar-consumed its result;
++// no validation scratch remains live while posting. The registered dynamic UB
++// size is KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES for both object variants.
+ constexpr uint32_t kValidationFailureIdsUbOffset =
+     kWqeBankBytes * kWqeBankCount;
+ constexpr uint32_t kValidationFailureIdsUbBytes =
+@@ -81,6 +96,7 @@ struct PreparedPost {
+   uint32_t sq_depth;
+   uint32_t wqe_count;
+   uint32_t event_id;
++  uint32_t ub_base_offset;
+ };
+ 
+ struct PendingPost {
+@@ -299,24 +315,15 @@ __aicore__ inline void RunBatchGetValidation(
+   }
+ }
+ 
+-__simt_vf__ __aicore__ LAUNCH_BOUND(KVAF_BATCH_GET_WQES_PER_POST)
+-inline void FillBatchGetReadWqes(
+-    __gm__ const int32_t *indices,
+-    __gm__ const int32_t *output_indices,
+-    __gm__ const int32_t *offsets,
+-    __gm__ const uint64_t *address_table, uint32_t request_begin,
+-    uint32_t request_offset,
+-    uint32_t token_bytes, uint64_t output_base, uint64_t current_head,
+-    uint32_t wqe_count, uint32_t completion_on_last_wqe,
+-    uint32_t ub_base_offset, uint32_t tp_id, uint32_t remote_token_id,
+-    uint32_t remote_token_value, uint32_t local_token_id,
+-    uint64_t remote_eid_low, uint64_t remote_eid_high) {
+-  const uint32_t slot = threadIdx.x;
+-  if (slot >= wqe_count) {
+-    return;
+-  }
+-
+-  const uint32_t request = request_begin + request_offset + slot;
++// Both posting policies use exactly the same WQE encoding. Only the mapping
++// from a tile lane to the original compact request prefix differs.
++__simt_callee__ inline void WriteBatchGetReadWqe(
++    __gm__ const int32_t *indices, __gm__ const int32_t *output_indices,
++    __gm__ const int32_t *offsets, __gm__ const uint64_t *address_table,
++    uint32_t request, uint32_t token_bytes, uint64_t output_base,
++    uint64_t wqe_pi, bool completion, uint32_t ub_base_offset,
++    uint32_t tp_id, uint32_t remote_token_id, uint32_t remote_token_value,
++    uint32_t local_token_id, uint64_t remote_eid_low, uint64_t remote_eid_high) {
+   const uint32_t table_index = static_cast<uint32_t>(indices[request]);
+   const uint32_t output_row =
+       static_cast<uint32_t>(output_indices[request]);
+@@ -324,11 +331,8 @@ inline void FillBatchGetReadWqes(
+       address_table[table_index] + static_cast<uint32_t>(offsets[request]);
+   const uint64_t local_address =
+       output_base + static_cast<uint64_t>(output_row) * token_bytes;
+-  const uint64_t wqe_pi = current_head + slot;
+   const uint32_t owner =
+       1U - static_cast<uint32_t>((wqe_pi >> kSqDepthShift) & 1ULL);
+-  const bool completion =
+-      completion_on_last_wqe != 0U && slot + 1U == wqe_count;
+   const uint32_t place_order = completion ? 0x2U : 0x1U;
+ 
+   uint32_t words[16];
+@@ -353,13 +357,59 @@ inline void FillBatchGetReadWqes(
+ 
+   __ubuf__ uint32_t *wqe_words =
+       reinterpret_cast<__ubuf__ uint32_t *>(
+-          get_imm(ub_base_offset + slot * kWqeBytes));
++          get_imm(ub_base_offset));
+ #pragma unroll
+   for (uint32_t word = 0U; word < 16U; ++word) {
+     wqe_words[word] = words[word];
+   }
+ }
+ 
++__simt_vf__ __aicore__ LAUNCH_BOUND(KVAF_BATCH_GET_WQES_PER_POST)
++inline void FillBatchGetReadWqes(
++    __gm__ const int32_t *indices, __gm__ const int32_t *output_indices,
++    __gm__ const int32_t *offsets, __gm__ const uint64_t *address_table,
++    uint32_t request_begin, uint32_t request_offset, uint32_t token_bytes,
++    uint64_t output_base, uint64_t current_head, uint32_t wqe_count,
++    uint32_t completion_on_last_wqe, uint32_t ub_base_offset, uint32_t tp_id,
++    uint32_t remote_token_id, uint32_t remote_token_value, uint32_t local_token_id,
++    uint64_t remote_eid_low, uint64_t remote_eid_high) {
++  const uint32_t slot = threadIdx.x;
++  if (slot < wqe_count) {
++    WriteBatchGetReadWqe(
++        indices, output_indices, offsets, address_table,
++        request_begin + request_offset + slot, token_bytes, output_base,
++        current_head + slot, completion_on_last_wqe && slot + 1U == wqe_count,
++        ub_base_offset + slot * kWqeBytes, tp_id, remote_token_id,
++        remote_token_value, local_token_id, remote_eid_low, remote_eid_high);
++  }
++}
++
++__simt_vf__ __aicore__ LAUNCH_BOUND(512)
++inline void FillBulkBatchGetReadWqes(
++    __gm__ const int32_t *indices, __gm__ const int32_t *output_indices,
++    __gm__ const int32_t *offsets, __gm__ const uint64_t *address_table,
++    uint32_t request_begin, uint32_t jetty_ordinal, uint32_t stripe_jetty,
++    uint32_t token_bytes, uint64_t output_base, uint64_t current_head,
++    uint32_t wqe_count, uint32_t completion_on_last_wqe, uint32_t ub_base_offset,
++    uint32_t tp_id, uint32_t remote_token_id, uint32_t remote_token_value,
++    uint32_t local_token_id, uint64_t remote_eid_low, uint64_t remote_eid_high) {
++  const uint32_t slot = threadIdx.x;
++  if (slot < wqe_count) {
++    const uint32_t ordinal = jetty_ordinal + slot;
++    // Preserve the exact post32 request order on each of the two Jettys.
++    const uint32_t request = request_begin +
++        (ordinal / kWqesPerPost) * (2U * kWqesPerPost) +
++        stripe_jetty * kWqesPerPost + ordinal % kWqesPerPost;
++    WriteBatchGetReadWqe(
++        indices, output_indices, offsets, address_table, request, token_bytes,
++        output_base, current_head + slot,
++        completion_on_last_wqe && slot + 1U == wqe_count,
++        ub_base_offset + slot * kWqeBytes, tp_id, remote_token_id,
++        remote_token_value, local_token_id, remote_eid_low, remote_eid_high);
++  }
++}
++
++template <bool Bulk>
+ __aicore__ inline void PreparePostVectorStage(
+     __gm__ const int32_t *indices,
+     __gm__ const int32_t *output_indices,
+@@ -368,7 +418,7 @@ __aicore__ inline void PreparePostVectorStage(
+     uint32_t request_offset,
+     uint32_t token_bytes, uint64_t output_base, uint64_t current_head,
+     uint32_t wqe_count, uint32_t completion_on_last_wqe,
+-    uint32_t bank_id, uint32_t wait_for_bank_reuse,
++    uint32_t bank_id, uint32_t wait_for_bank_reuse, uint32_t stripe_jetty,
+     __gm__ const KvafBatchGetDirectUrmaEntity *entity,
+     __gm__ KvafBatchGetQueueState *queue,
+     PreparedPost *prepared) {
+@@ -380,15 +430,26 @@ __aicore__ inline void PreparePostVectorStage(
+       *reinterpret_cast<__gm__ const uint64_t *>(entity->remote_eid);
+   const uint64_t remote_eid_high =
+       *reinterpret_cast<__gm__ const uint64_t *>(&(entity->remote_eid[8]));
+-  const uint32_t ub_base_offset = bank_id * kWqeBankBytes;
+-  AscendC::Simt::VF_CALL<FillBatchGetReadWqes>(
+-      AscendC::Simt::Dim3{kWqesPerPost, 1U, 1U}, indices, output_indices,
+-      offsets, address_table, request_begin, request_offset, token_bytes,
+-      output_base, current_head, wqe_count,
+-      completion_on_last_wqe, ub_base_offset,
+-      entity->tp_id, entity->remote_token_id,
+-      entity->remote_token_value, entity->local_token_id, remote_eid_low,
+-      remote_eid_high);
++  constexpr uint32_t stage_wqes = Bulk ? kBulkWqesPerPost : kWqesPerPost;
++  const uint32_t ub_base_offset = bank_id * stage_wqes * kWqeBytes;
++  if constexpr (Bulk) {
++    AscendC::Simt::VF_CALL<FillBulkBatchGetReadWqes>(
++        AscendC::Simt::Dim3{(wqe_count + 31U) & ~31U, 1U, 1U}, indices, output_indices,
++        offsets, address_table, request_begin, request_offset, stripe_jetty,
++        token_bytes, output_base, current_head, wqe_count,
++        completion_on_last_wqe, ub_base_offset, entity->tp_id,
++        entity->remote_token_id, entity->remote_token_value,
++        entity->local_token_id, remote_eid_low, remote_eid_high);
++  } else {
++    AscendC::Simt::VF_CALL<FillBatchGetReadWqes>(
++        AscendC::Simt::Dim3{kWqesPerPost, 1U, 1U}, indices, output_indices,
++        offsets, address_table, request_begin, request_offset, token_bytes,
++        output_base, current_head, wqe_count,
++        completion_on_last_wqe, ub_base_offset,
++        entity->tp_id, entity->remote_token_id,
++        entity->remote_token_value, entity->local_token_id, remote_eid_low,
++        remote_eid_high);
++  }
+   set_flag(PIPE_V, PIPE_MTE3, static_cast<event_t>(bank_id));
+ 
+   prepared->sq_base_address = entity->sq_va;
+@@ -399,12 +460,13 @@ __aicore__ inline void PreparePostVectorStage(
+   prepared->sq_depth = entity->sq_depth;
+   prepared->wqe_count = wqe_count;
+   prepared->event_id = bank_id;
++  prepared->ub_base_offset = ub_base_offset;
+ }
+ 
+ __aicore__ inline void CopyPreparedPostToSq(const PreparedPost *prepared) {
+   const uint32_t ring_head =
+       static_cast<uint32_t>(prepared->current_head & kSqIndexMask);
+-  const uint32_t ub_base_offset = prepared->event_id * kWqeBankBytes;
++  const uint32_t ub_base_offset = prepared->ub_base_offset;
+   if (ring_head + prepared->wqe_count <= prepared->sq_depth) {
+     CopyUbToGm(
+         reinterpret_cast<__gm__ void *>(
+@@ -459,6 +521,7 @@ __aicore__ inline void CommitPostScalarStage(const PendingPost *pending) {
+          reinterpret_cast<__gm__ uint32_t *>(pending->sq_db_address), 0);
+ }
+ 
++template <bool Bulk = false>
+ __aicore__ inline void PostDirectRequests(
+     __gm__ const int32_t *indices,
+     __gm__ const int32_t *output_indices,
+@@ -469,14 +532,37 @@ __aicore__ inline void PostDirectRequests(
+     __gm__ const KvafBatchGetDirectUrmaEntity *entities,
+     __gm__ KvafBatchGetQueueState *queues, uint32_t profile_enabled,
+     uint64_t *first_doorbell_cycle, uint64_t *last_wqe) {
++  if constexpr (Bulk) {
++    if (jettys_per_core != 2U || request_count <= 2U * kWqesPerPost) {
++      // Keep the full existing ABI. Tiny groups already need <=2 doorbells,
++      // so retain their original post32 vector scheduling as well.
++      PostDirectRequests<false>(
++          indices, output_indices, offsets, address_table, request_begin,
++          request_count, first_jetty, token_bytes, jettys_per_core, entities,
++          queues, profile_enabled, first_doorbell_cycle, last_wqe);
++      return;
++    }
++  }
++  constexpr uint32_t stage_wqes = Bulk ? kBulkWqesPerPost : kWqesPerPost;
+   PreparedPost prepared_posts[kWqeBankCount];
+   PendingPost pending_posts[kWqeBankCount];
+   uint64_t current_heads[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE];
+   for (uint32_t jetty = 0U; jetty < jettys_per_core; ++jetty) {
+     current_heads[jetty] = queues[jetty].sq_producer_index;
+   }
+-  const uint32_t total_posts =
+-      (request_count + kWqesPerPost - 1U) / kWqesPerPost;
++  const uint32_t logical_posts = kvaf_batch_get::PostCount(request_count);
++  uint32_t assigned[2] = {0U, 0U};
++  uint32_t total_posts = logical_posts;
++  if constexpr (Bulk) {
++    const kvaf_batch_get::Group group{request_begin, request_count, first_jetty};
++    assigned[0] = kvaf_batch_get::AssignedRequests(group, first_jetty, 2U);
++    assigned[1] = kvaf_batch_get::AssignedRequests(group, (first_jetty + 1U) % 2U, 2U);
++    // The first stripe's Jetty receives at least as many WQEs as the second,
++    // and their counts differ by <=32. Interleaving bounded tiles is therefore
++    // identical to the original double-bank pipeline (possibly one odd tail).
++    total_posts = (assigned[0] + stage_wqes - 1U) / stage_wqes +
++                  (assigned[1] + stage_wqes - 1U) / stage_wqes;
++  }
+ 
+   for (uint32_t post_index = 0U; post_index < total_posts; ++post_index) {
+     if (post_index != 0U) {
+@@ -491,26 +577,30 @@ __aicore__ inline void PostDirectRequests(
+ 
+     const uint32_t bank_id = post_index % kWqeBankCount;
+     const uint32_t jetty = (first_jetty + post_index) % jettys_per_core;
+-    const uint32_t request_offset = post_index * kWqesPerPost;
+-    uint32_t wqe_count = request_count - request_offset;
+-    if (wqe_count > kWqesPerPost) {
+-      wqe_count = kWqesPerPost;
++    const uint32_t request_offset = Bulk ?
++        (post_index / 2U) * stage_wqes : post_index * kWqesPerPost;
++    uint32_t wqe_count = Bulk ?
++        assigned[post_index % 2U] - request_offset : request_count - request_offset;
++    if (wqe_count > stage_wqes) {
++      wqe_count = stage_wqes;
+     }
+     const uint32_t completion_on_last_wqe =
+         post_index + jettys_per_core >= total_posts;
+     __gm__ const KvafBatchGetDirectUrmaEntity *const entity =
+         entities + jetty;
+     __gm__ KvafBatchGetQueueState *const queue = queues + jetty;
+-    PreparePostVectorStage(
++    PreparePostVectorStage<Bulk>(
+         indices, output_indices, offsets, address_table, request_begin,
+         request_offset, token_bytes,
+         entity->local_hbm_address,
+         current_heads[jetty], wqe_count, completion_on_last_wqe, bank_id,
+-        post_index >= kWqeBankCount, entity, queue,
++        post_index >= kWqeBankCount, post_index % 2U, entity, queue,
+         &prepared_posts[bank_id]);
+     current_heads[jetty] += wqe_count;
+ 
+-    if (post_index + 1U == total_posts) {
++    if ((!Bulk && post_index + 1U == total_posts) ||
++        (Bulk && completion_on_last_wqe &&
++         jetty == (first_jetty + logical_posts - 1U) % jettys_per_core)) {
+       const uint64_t last_pi = current_heads[jetty] - 1U;
+       const uint32_t last_owner =
+           1U - static_cast<uint32_t>((last_pi >> kSqDepthShift) & 1ULL);
+@@ -762,7 +852,8 @@ __aicore__ inline void KvafBatchGetDevice(
+       if (result != kSuccess) {
+         break;
+       }
+-      PostDirectRequests(indices, output_indices, offsets, address_table,
++      PostDirectRequests<KVAF_BATCH_GET_BULK_WQE != 0>(
++                         indices, output_indices, offsets, address_table,
+                          group.begin, group.count, group.first_jetty,
+                          args.token_bytes, jettys_per_core, entities,
+                          queues, static_cast<uint32_t>(profile_enabled),
+@@ -775,6 +866,8 @@ __aicore__ inline void KvafBatchGetDevice(
+       }
+       schedule.Posted(group);
+       ++counters.submitted_group_count;
++      // ABI-compatible logical 32/128-request stripe count. In the opt-in
++      // bulk object this is NOT the number of SQ doorbells or VF invocations.
+       total_posts += kvaf_batch_get::PostCount(group.count);
+       // Each group signals its last WQE on every participating Jetty. Keep
+       // route rotation across calls separate from the local two-bank pipeline.
+diff --git a/access_operator/demo/aiv_batch_get/kernel/CMakeLists.txt b/access_operator/demo/aiv_batch_get/kernel/CMakeLists.txt
+index 44b56ba..fe8f80b 100644
+--- a/access_operator/demo/aiv_batch_get/kernel/CMakeLists.txt
++++ b/access_operator/demo/aiv_batch_get/kernel/CMakeLists.txt
+@@ -46,3 +46,23 @@ add_custom_command(
+           "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"
+   VERBATIM)
+ add_custom_target(kvaf_execute_batch_get_post32_kernel DEPENDS "${KVAF_POST32_KERNEL_OBJECT}")
++
++# Independent opt-in object: identical V2 ABI and post32 striping/checkpoints,
++# with bounded bulk WQE generation and SQ submission for two Jettys per core.
++set(KVAF_BULK_KERNEL_TMP "${CMAKE_CURRENT_BINARY_DIR}/kvaf_execute_batch_get_bulk.tmp.o")
++set(KVAF_BULK_KERNEL_OBJECT "${KVAF_AIV_DEMO_BIN_DIR}/kvaf_execute_batch_get_bulk.o")
++add_custom_command(
++  OUTPUT "${KVAF_BULK_KERNEL_OBJECT}"
++  COMMAND "${CMAKE_COMMAND}" -E make_directory "${KVAF_AIV_DEMO_BIN_DIR}"
++  COMMAND "${KVAF_CCEC}" -c -x cce -O2 "${KVAF_URMA_SOURCE}" -o "${KVAF_BULK_KERNEL_TMP}"
++          -DKVAF_BATCH_GET_WQES_PER_POST=32 -DKVAF_BATCH_GET_BULK_WQE=1
++          ${KVAF_AIV_COMPILE_OPTIONS} ${KVAF_KERNEL_INCLUDES}
++  COMMAND "${KVAF_LLD}" ${KVAF_AIV_LINK_OPTIONS} "${KVAF_BULK_KERNEL_TMP}"
++          -o "${KVAF_BULK_KERNEL_OBJECT}"
++  DEPENDS "${KVAF_URMA_SOURCE}"
++          "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_abi.h"
++          "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_schedule.h"
++          "${KVAF_AIV_DEMO_INCLUDE_DIR}/kvaf_batch_get_device.h"
++          "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"
++  VERBATIM)
++add_custom_target(kvaf_execute_batch_get_bulk_kernel DEPENDS "${KVAF_BULK_KERNEL_OBJECT}")
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 2b024d2..d5630f9 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -133,3 +133,11 @@ target_link_libraries(kvaf_fused_batch_get_context_test PRIVATE
+   kvaf_runtime kvaf_meta_manager kvaf_peer_link)
+ add_test(NAME kvaf_fused_batch_get_context_host
+   COMMAND kvaf_fused_batch_get_context_test)
++
++add_executable(kvaf_batch_get_kernel_model_bulk_test batch_get_kernel_model_test.cc)
++target_include_directories(kvaf_batch_get_kernel_model_bulk_test PRIVATE
++    "${CMAKE_CURRENT_SOURCE_DIR}/aiv_model"
++    "${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include")
++target_compile_definitions(kvaf_batch_get_kernel_model_bulk_test PRIVATE
++    KVAF_BATCH_GET_WQES_PER_POST=32 KVAF_BATCH_GET_BULK_WQE=1)
++add_test(NAME kvaf_batch_get_kernel_model_bulk_test COMMAND kvaf_batch_get_kernel_model_bulk_test)
+diff --git a/tests/aiv_model/kernel_operator.h b/tests/aiv_model/kernel_operator.h
+index 068349e..fe2fb3c 100644
+--- a/tests/aiv_model/kernel_operator.h
++++ b/tests/aiv_model/kernel_operator.h
+@@ -1,15 +1,18 @@
+ #pragma once
+ 
+ // CPU-only shim for executing the actual .asc control flow. It models neither
+-// AIV pipeline timing nor DMA/cache visibility; those require CANN/A5 tests.
++// AIV pipeline timing or caches. SQ DMA is delayed until its event wait to
++// catch UB bank reuse before completion; hardware still requires CANN/A5 tests.
+ #include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
++#include <vector>
+ 
+ #define __aicore__
+ #define __global__
+ #define __gm__
+ #define __ubuf__
++#define __simt_callee__
+ #define __simt_vf__
+ #define LAUNCH_BOUND(n)
+ 
+@@ -17,6 +20,16 @@ namespace aiv_model {
+ alignas(64) inline uint8_t ub[160 * 1024];
+ inline uint32_t core = 0;
+ inline uint64_t cycle = 0;
++inline uint64_t vf_calls = 0, dma_calls = 0;
++struct Dma { void* destination; const void* source; uint64_t bytes; };
++inline std::vector<Dma> pending_dma;
++inline size_t completed_dma = 0;
++inline void CompleteDma(size_t end) {
++  while (completed_dma < end) {
++    const auto& dma = pending_dma[completed_dma++];
++    std::memcpy(dma.destination, dma.source, dma.bytes);
++  }
++}
+ void Poll(void* address);
+ void Doorbell(uint32_t value, uint32_t* address);
+ }  // namespace aiv_model
+@@ -25,12 +38,17 @@ inline struct { uint32_t x; } threadIdx;
+ enum { PIPE_S, PIPE_V, PIPE_MTE3 };
+ using event_t = uint32_t;
+ inline bool model_events[3][3][3]{};
++inline size_t model_event_dma[3][3][3]{};
+ inline void set_flag(int source, int target, event_t event) {
+   if (model_events[source][target][event]) std::abort();
+   model_events[source][target][event] = true;
++  model_event_dma[source][target][event] = aiv_model::pending_dma.size();
+ }
+ inline void wait_flag(int source, int target, event_t event) {
+   if (!model_events[source][target][event]) std::abort();
++  if (source == PIPE_MTE3) {
++    aiv_model::CompleteDma(model_event_dma[source][target][event]);
++  }
+   model_events[source][target][event] = false;
+ }
+ inline void set_loop_size_ubtoout(uint64_t) {}
+@@ -38,10 +56,17 @@ inline void set_loop1_stride_ubtoout(uint64_t) {}
+ inline void set_loop2_stride_ubtoout(uint64_t) {}
+ inline void set_atomic_none() {}
+ inline uintptr_t get_imm(uint32_t offset) {
++  if (offset >= sizeof(aiv_model::ub)) std::abort();
+   return reinterpret_cast<uintptr_t>(aiv_model::ub + offset);
+ }
+ inline void copy_ubuf_to_gm_align_v2(float* dst, float* src, uint64_t config, uint64_t) {
+-  std::memcpy(dst, src, config >> 25U);
++  const auto begin = reinterpret_cast<uintptr_t>(aiv_model::ub);
++  const auto address = reinterpret_cast<uintptr_t>(src);
++  const uint64_t bytes = config >> 25U;
++  if (address < begin || bytes % 32U ||
++      address + bytes > begin + sizeof(aiv_model::ub)) std::abort();
++  ++aiv_model::dma_calls;
++  aiv_model::pending_dma.push_back({dst, src, bytes});
+ }
+ inline void st_dev(uint32_t value, uint32_t* address, int) {
+   aiv_model::Doorbell(value, address);
+@@ -65,6 +90,7 @@ namespace Simt {
+ struct Dim3 { uint32_t x, y, z; };
+ template <auto Function, typename... Args>
+ void VF_CALL(Dim3 dim, Args... args) {
++  ++aiv_model::vf_calls;
+   for (threadIdx.x = 0; threadIdx.x < dim.x; ++threadIdx.x) Function(args...);
+ }
+ }  // namespace Simt
+diff --git a/tests/batch_get_kernel_model_test.cc b/tests/batch_get_kernel_model_test.cc
+index 9f97a44..ee97ec6 100644
+--- a/tests/batch_get_kernel_model_test.cc
++++ b/tests/batch_get_kernel_model_test.cc
+@@ -27,6 +27,7 @@ struct Queue {
+   uint64_t producer = 0, completed = 0, cq_producer = 0, cq_consumer = 0;
+   std::deque<uint64_t> checkpoints;
+   bool timeout = false, error = false;
++  std::vector<std::array<uint32_t, 16>> posted_wqes;
+ };
+ std::vector<Queue> hardware;
+ uint64_t doorbells = 0;
+@@ -43,7 +44,8 @@ void Doorbell(uint32_t value, uint32_t* address) {
+     if (address != &queue.sq_db) continue;
+     ++doorbells;
+     const uint32_t added = value - queue.sq_db;
+-    CHECK(added > 0 && added <= KVAF_BATCH_GET_WQES_PER_POST);
++    CHECK(added > 0 && added <= (KVAF_BATCH_GET_BULK_WQE ?
++                                   kBulkWqesPerPost : kWqesPerPost));
+     CHECK(queue.producer + added - queue.completed < 32768);
+     for (uint32_t i = 0; i < added; ++i) {
+       const uint64_t pi = queue.producer++;
+@@ -52,6 +54,9 @@ void Doorbell(uint32_t value, uint32_t* address) {
+       const bool signal = (wqe[0] & (1U << 21U)) != 0;
+       CHECK(((wqe[0] >> 16U) & 3U) == (signal ? 2U : 1U));
+       if (signal) queue.checkpoints.push_back(queue.producer);
++      std::array<uint32_t, 16> words;
++      std::copy(wqe, wqe + 16, words.begin());
++      queue.posted_wqes.push_back(words);
+     }
+     queue.sq_db = value;
+     return;
+@@ -89,7 +94,7 @@ void Poll(void* address) {
+ 
+ struct Fixture {
+   uint32_t capacity, cores, jettys;
+-  std::array<uint8_t, 16 * 16> remote;
++  std::vector<uint8_t> remote;
+   std::array<uint64_t, 16> addresses;
+   std::array<uint8_t, 16> valid;
+   std::vector<uint8_t> output;
+@@ -100,15 +105,20 @@ struct Fixture {
+   int32_t misses = 0;
+   KvafExecuteBatchGetKernelArgs args{};
+ 
+-  Fixture(uint32_t count, uint32_t c, uint32_t j, uint32_t budget)
+-      : capacity(count), cores(c), jettys(j), output(count * 16),
++  Fixture(uint32_t count, uint32_t c, uint32_t j, uint32_t budget,
++          uint32_t token_bytes = 16)
++      : capacity(count), cores(c), jettys(j), remote(16 * token_bytes),
++        output(count * token_bytes),
+         indices(count), offsets(count), rows(count), queues(c * j),
+         entities(c * j), statuses(c) {
++    CHECK(aiv_model::completed_dma == aiv_model::pending_dma.size());
++    aiv_model::pending_dma.clear();
++    aiv_model::completed_dma = 0;
+     aiv_model::hardware.clear();
+     aiv_model::hardware.resize(c * j);
+     for (uint32_t i = 0; i < remote.size(); ++i) remote[i] = (i * 7 + 1) % 251;
+     for (uint32_t i = 0; i < 16; ++i) {
+-      addresses[i] = reinterpret_cast<uint64_t>(remote.data() + 16 * i);
++      addresses[i] = reinterpret_cast<uint64_t>(remote.data() + token_bytes * i);
+       valid[i] = 1;
+     }
+     for (uint32_t i = 0; i < count; ++i) {
+@@ -147,7 +157,7 @@ struct Fixture {
+     args.core_status = reinterpret_cast<uint64_t>(statuses.data());
+     args.table_capacity = 16;
+     args.request_capacity = args.output_rows = count;
+-    args.token_bytes = 16;
++    args.token_bytes = token_bytes;
+     args.tokens_per_block = 1;
+     args.block_count = c;
+     args.jettys_per_core = j;
+@@ -178,10 +188,12 @@ struct Fixture {
+               kvaf_batch_get::CoreBudget(args.batch_get_max_inflight_total, cores, c));
+       }
+     }
++    CHECK(aiv_model::completed_dma == aiv_model::pending_dma.size());
+     if (expected) return;
+     for (uint32_t i = 0; i < capacity; ++i) {
+-      for (uint32_t byte = 0; byte < 16; ++byte) {
+-        CHECK(output[rows[i] * 16 + byte] == (i < count ? remote[indices[i] * 16 + byte] : 0));
++      for (uint32_t byte = 0; byte < args.token_bytes; ++byte) {
++        CHECK(output[rows[i] * args.token_bytes + byte] ==
++              (i < count ? remote[indices[i] * args.token_bytes + byte] : 0));
+       }
+     }
+     for (uint32_t i = 0; i < cores * jettys; ++i) {
+@@ -204,7 +216,96 @@ struct Fixture {
+   }
+ };
+ 
++#if KVAF_BATCH_GET_BULK_WQE
++struct PostTrace {
++  std::vector<std::vector<std::array<uint32_t, 16>>> wqes;
++  uint64_t doorbells, vf_calls, dma_calls, last_wqe;
++};
++
++template <bool Bulk>
++PostTrace TracePost(Fixture& f, uint32_t begin, uint32_t count,
++                   uint32_t first_jetty, uint64_t initial_pi) {
++  CHECK(aiv_model::completed_dma == aiv_model::pending_dma.size());
++  for (size_t j = 0; j < f.queues.size(); ++j) {
++    auto& q = f.queues[j];
++    auto& h = aiv_model::hardware[j];
++    q = {};
++    q.sq_producer_index = initial_pi;
++    h.producer = h.completed = initial_pi;
++    h.sq_db = static_cast<uint32_t>(initial_pi);
++    h.cq_producer = h.cq_consumer = h.cq_db = 0;
++    h.posted_wqes.clear();
++    CHECK(h.checkpoints.empty());
++    std::fill(h.sq.begin(), h.sq.end(), 0U);
++    h.cq.fill(0U);
++  }
++  const auto doorbells = aiv_model::doorbells;
++  const auto vfs = aiv_model::vf_calls;
++  const auto dmas = aiv_model::dma_calls;
++  uint64_t first_cycle = 0, last = 0;
++  ConfigureUbToGmCopy();
++  PostDirectRequests<Bulk>(f.indices.data(), f.rows.data(), f.offsets.data(),
++      f.addresses.data(), begin, count, first_jetty, f.args.token_bytes,
++      f.jettys, f.entities.data(), f.queues.data(), 1, &first_cycle, &last);
++  CHECK(aiv_model::completed_dma == aiv_model::pending_dma.size());
++  PostTrace trace{{}, aiv_model::doorbells - doorbells, aiv_model::vf_calls - vfs,
++                  aiv_model::dma_calls - dmas, last};
++  for (uint32_t j = 0; j < f.jettys; ++j) {
++    auto& h = aiv_model::hardware[j];
++    trace.wqes.push_back(h.posted_wqes);
++    // Each participating Jetty still has exactly one original tail CQ.
++    CHECK(h.checkpoints.size() == static_cast<size_t>(!h.posted_wqes.empty()));
++    if (!h.posted_wqes.empty()) {
++      uint32_t polls = 0;
++      CHECK(WaitForCompletion(&f.entities[j], &f.queues[j], &polls) == kSuccess);
++      CHECK(h.completed == h.producer);
++    }
++  }
++  for (const auto& source : model_events) {
++    for (const auto& target : source) for (bool event : target) CHECK(!event);
++  }
++  return trace;
++}
++
++void TestBulkEquivalence() {
++  Fixture f(40000, 1, 2, 0);
++  for (const uint64_t initial_pi : {0ULL, 32760ULL, (1ULL << 32) - 64ULL}) {
++    for (uint32_t first : {0U, 1U}) {
++      for (uint32_t count : {0U, 1U, 31U, 32U, 33U, 63U, 64U, 65U, 511U,
++                            512U, 513U, 991U, 992U, 993U, 1023U, 1024U, 1025U,
++                            2047U, 4097U, 12516U, 32767U}) {
++        const auto baseline = TracePost<false>(f, 37, count, first, initial_pi);
++        const auto bulk = TracePost<true>(f, 37, count, first, initial_pi);
++        CHECK(baseline.wqes == bulk.wqes);
++        CHECK(baseline.last_wqe == bulk.last_wqe);
++        CHECK(bulk.doorbells <= baseline.doorbells);
++        CHECK(bulk.vf_calls == bulk.doorbells);
++        CHECK(bulk.dma_calls <= baseline.dma_calls);
++        if (count > 64) CHECK(bulk.doorbells < baseline.doorbells);
++      }
++    }
++  }
++  // Actual G7 count: 32 cores, 12516 descriptors, exactly 32-stripe Jetty
++  // assignments retained; batching reduces 416 VF/doorbells to 64, not CQ.
++  Fixture g7(131072, 32, 2, 0, 656);
++  const auto before = aiv_model::doorbells;
++  const auto vfs = aiv_model::vf_calls;
++  g7.Run(12516);
++  CHECK(aiv_model::doorbells - before == 64);
++  CHECK(aiv_model::vf_calls - vfs == 64);
++  uint64_t checkpoints = 0, logical_posts = 0;
++  for (const auto& status : g7.statuses) {
++    checkpoints += status.profile.completion_count;
++    logical_posts += status.profile.total_posts;
++  }
++  CHECK(checkpoints == 64 && logical_posts == 416);
++}
++#endif
++
+ int main() {
++#if KVAF_BATCH_GET_BULK_WQE
++  TestBulkEquivalence();
++#endif
+   // The real B16/Q4 replay allocates 131072 descriptor slots but publishes
+   // only 5708 misses. Partition the dynamic prefix, never the capacity; both
+   // post policies must preserve every request and one checkpoint per Jetty.
+@@ -226,7 +327,7 @@ int main() {
+     }
+     CHECK(requests == 5708);
+     CHECK(aiv_model::doorbells - before ==
+-          (KVAF_BATCH_GET_WQES_PER_POST == 32 ? 192 : 64));
++          (KVAF_BATCH_GET_WQES_PER_POST == 32 && !KVAF_BATCH_GET_BULK_WQE ? 192 : 64));
+     f.Run(0);
+     f.Run(1);
+     f.Run(5708);
+@@ -250,11 +351,11 @@ int main() {
+   }
+ 
+   for (const auto& shape : {std::array<uint32_t, 3>{1, 1, 2048}, {1, 16, 2048},
+-                           {1, 64, 2048}, {4, 4, 2048}, {3, 3, 2049}, {1, 1, 2},
++                           {1, 64, 2048}, {1, 2, 0}, {1, 2, 2051}, {4, 2, 4096}, {4, 4, 2048}, {3, 3, 2049}, {1, 1, 2},
+                            {1, 16, 0}}) {
+     Fixture f(8193, shape[0], shape[1], shape[2]);
+     for (int repeat = 0; repeat < 2; ++repeat) {
+-      for (uint32_t count : {0U, 1U, 127U, 128U, 129U, 1024U, 2047U,
++      for (uint32_t count : {0U, 1U, 31U, 32U, 33U, 63U, 64U, 65U, 127U, 128U, 129U, 1023U, 1024U, 1025U, 2047U,
+                              2048U, 2049U, 3072U, 4096U, 8193U}) f.Run(count);
+     }
+   }
+@@ -275,7 +376,7 @@ int main() {
+     CHECK(f.statuses[0].profile.magic == 0);
+   }
+   {
+-    Fixture f(8193, 1, 1, 2048);
++    Fixture f(8193, 1, 2, 2048);
+     auto& q = f.queues[0];
+     auto& h = aiv_model::hardware[0];
+     q.magic = 0x4b564151U;
+@@ -285,6 +386,15 @@ int main() {
+     q.cq_consumer_index = h.cq_producer = h.cq_consumer = (1ULL << 22) - 1;
+     f.Run(8193);  // hardware doorbell counters wrap; software indices do not
+   }
++  // All original fail-before-post guards still apply to the bulk object.
++  {
++    Fixture f(1024, 1, 2, 0);
++    f.Run(1025, kInvalidArgs);
++    CHECK(aiv_model::hardware[0].producer == 0);
++    f.entities[0].sq_depth = 128;
++    f.Run(64, kInvalidEntity);
++    CHECK(aiv_model::hardware[0].producer == 0);
++  }
+   for (bool timeout : {false, true}) {
+     Fixture f(8193, 1, 2, 2048);
+     aiv_model::hardware[1].timeout = timeout;

@@ -50,6 +50,20 @@ def arguments(argv=None):
     )
     parser.add_argument("--ubmem-serial-workers", type=int, default=32)
     parser.add_argument(
+        "--ubmem-serial-dispatch",
+        choices=("scalar", "tiled"),
+        default="scalar",
+        help="UBmem serial Get dispatch; scalar keeps the existing kernel",
+    )
+    parser.add_argument(
+        "--urma-serial-dispatch", choices=("scalar", "bulk"), default="scalar", help="URMA serial Get dispatch"
+    )
+    parser.add_argument(
+        "--serial-dispatch-ablation",
+        action="store_true",
+        help="Run six cases: both UBmem and URMA serial dispatches, then the two fused paths",
+    )
+    parser.add_argument(
         "--urma-serial-post-size",
         type=int,
         choices=(32, 128),
@@ -92,6 +106,9 @@ def arguments(argv=None):
                 args.urma_fused_tuning,
                 args.ubmem_fused_variants,
                 args.urma_fused_variants,
+                args.ubmem_serial_dispatch != "scalar",
+                args.urma_serial_dispatch != "scalar",
+                args.serial_dispatch_ablation,
             )
         ):
             parser.error("Saved-result modes cannot be combined with capture/build/run options")
@@ -123,6 +140,22 @@ def arguments(argv=None):
     candidates = args.urma_serial_workers_candidates
     if candidates is not None and (len(set(candidates)) != 2 or any(not 1 <= n <= 48 for n in candidates)):
         parser.error("URMA serial candidates must be two distinct worker counts in 1..48")
+    if args.serial_dispatch_ablation and any(
+        (
+            candidates,
+            args.ubmem_fused_variants,
+            args.urma_fused_variants,
+            args.ubmem_serial_dispatch != "scalar",
+            args.urma_serial_dispatch != "scalar",
+        )
+    ):
+        parser.error(
+            "Serial dispatch ablation cannot combine with worker candidates, fused variants or a dispatch override"
+        )
+    if (args.urma_serial_dispatch == "bulk" or args.serial_dispatch_ablation) and (
+        args.urma_serial_post_size != 32 or args.urma_serial_max_inflight != 0
+    ):
+        parser.error("URMA bulk dispatch requires --urma-serial-post-size 32 and --urma-serial-max-inflight 0")
     from kvip.diagnostics.replay_runtime import validate_urma_serial_max_inflight
 
     try:
@@ -157,23 +190,38 @@ def arguments(argv=None):
 
 
 def case_plan(args):
-    """Keep the default four cases; a two-point URMA sweep adds just one run."""
+    """Yield transport, mode, worker override, dispatch override independently."""
     for transport, mode in CASES:
         candidates = getattr(args, "urma_serial_workers_candidates", None)
-        if (transport, mode) == ("urma", "serial") and candidates:
+        if mode == "serial" and getattr(args, "serial_dispatch_ablation", False):
+            for dispatch in ("scalar", "tiled" if transport == "ubmem" else "bulk"):
+                yield transport, mode, None, dispatch
+        elif (transport, mode) == ("urma", "serial") and candidates:
             for workers in candidates:
-                yield transport, mode, workers
+                yield transport, mode, workers, None
         else:
-            yield transport, mode, None
+            yield transport, mode, None, None
 
 
-def command(args, transport, mode, serial_workers=None):
+def command(args, transport, mode, serial_workers=None, serial_dispatch=None):
     build = getattr(args, transport + "_build_dir")
     name = f"{transport}-{mode}"
     if serial_workers is not None:
         if (transport, mode) != ("urma", "serial"):
             raise ValueError("Worker candidates apply only to URMA serial replay")
         name += f"-workers{serial_workers}"
+    if serial_dispatch is not None:
+        if (
+            mode != "serial"
+            or serial_workers is not None
+            or serial_dispatch
+            not in (
+                "scalar",
+                "tiled" if transport == "ubmem" else "bulk",
+            )
+        ):
+            raise ValueError("Invalid serial dispatch candidate")
+        name += f"-dispatch-{serial_dispatch}"
     result = args.result_dir / f"{name}.json"
     values = [
         sys.executable,
@@ -211,6 +259,8 @@ def command(args, transport, mode, serial_workers=None):
             values += ["--urma-serial-max-inflight", str(inflight)]
         if transport == "urma":
             values += ["--urma-serial-post-size", str(getattr(args, "urma_serial_post_size", 128))]
+        dispatch = serial_dispatch or getattr(args, transport + "_serial_dispatch", "scalar")
+        values += [f"--{transport}-serial-dispatch", dispatch]
     else:
         if getattr(args, "split_index_stages", False):
             values.append("--split-index-stages")
@@ -248,13 +298,22 @@ def stage_payload_rates(result):
 
 
 def summarize(results):
-    required = {"ubmem-serial", "ubmem-fused", "urma-fused"}
-    serial_cases = [
-        name for name, result in results.items() if (result.get("transport"), result.get("mode")) == ("urma", "serial")
-    ]
-    if not required.issubset(results) or not serial_cases or set(results) != required | set(serial_cases):
-        raise ValueError("All four cases are required")
-    first = results["ubmem-serial"]
+    required = {"ubmem-fused", "urma-fused"}
+    serial_cases = {
+        transport: [
+            name
+            for name, result in results.items()
+            if (result.get("transport"), result.get("mode")) == (transport, "serial")
+        ]
+        for transport in ("ubmem", "urma")
+    }
+    if (
+        not required.issubset(results)
+        or not all(serial_cases.values())
+        or set(results) != required | set(serial_cases["ubmem"]) | set(serial_cases["urma"])
+    ):
+        raise ValueError("Both fused paths and validated serial candidates for each transport are required")
+    first = results[serial_cases["ubmem"][0]]
     for name, result in results.items():
         if result.get("status") != "pass":
             raise ValueError(f"Case did not pass validation: {name}")
@@ -264,9 +323,27 @@ def summarize(results):
         if result.get("content", "full") != first.get("content", "full"):
             raise ValueError(f"Incomparable content: {name}")
         identity = f"{result['transport']}-{result['mode']}"
-        candidate = f"urma-serial-workers{result['runtime_workers']}"
-        if name != identity and not (identity == "urma-serial" and name == candidate):
+        worker_candidate = f"urma-serial-workers{result['runtime_workers']}"
+        dispatch = result.get(result["transport"] + "_batch_get_dispatch", "scalar")
+        dispatch_candidate = identity + "-dispatch-" + dispatch
+        if name != identity and not (
+            (identity == "urma-serial" and name == worker_candidate)
+            or (result["mode"] == "serial" and name == dispatch_candidate)
+        ):
             raise ValueError("Case identity mismatch")
+    if any("-dispatch-" in name for names in serial_cases.values() for name in names):
+        for transport, dispatches in (("ubmem", ("scalar", "tiled")), ("urma", ("scalar", "bulk"))):
+            expected = [f"{transport}-serial-dispatch-{dispatch}" for dispatch in dispatches]
+            if set(serial_cases[transport]) != set(expected):
+                raise ValueError("Dispatch ablation requires both candidates for both transports")
+            before, after = (results[name] for name in expected)
+            for key in ("runtime_workers", "batch_get_post_size", "batch_get_max_inflight_total", "jettys_per_core"):
+                if before.get(key) != after.get(key):
+                    raise ValueError(f"Dispatch candidates differ in {key}: {transport}")
+            if transport == "urma" and (
+                after.get("batch_get_post_size") != 32 or after.get("batch_get_max_inflight_total") != 0
+            ):
+                raise ValueError("URMA bulk evidence requires post size 32 and max inflight 0")
     table = {}
     for name, result in results.items():
         timing = result["timing"]
@@ -285,6 +362,8 @@ def summarize(results):
                     "batch_get_max_inflight_total_source",
                     "jettys_per_core",
                     "batch_get_post_size",
+                    "ubmem_batch_get_dispatch",
+                    "urma_batch_get_dispatch",
                 )
                 if key in result
             },
@@ -345,9 +424,23 @@ def summarize(results):
         table[name]["graph_normalized_payload_GBps"] = normalized
     ratios = {}
     demand_deltas = {}
-    selected_urma = min(serial_cases, key=lambda name: table[name]["mean_us"])
+    selected_serial = {
+        transport: min(names, key=lambda name: table[name]["mean_us"]) for transport, names in serial_cases.items()
+    }
+    serial_selection = {
+        transport: dict(
+            candidates=names,
+            selected=selected_serial[transport],
+            criterion="lowest validated device graph timing.mean_us among measured candidates",
+            improvement_over_first_percent=(
+                1 - table[selected_serial[transport]]["mean_us"] / table[names[0]]["mean_us"]
+            )
+            * 100,
+        )
+        for transport, names in serial_cases.items()
+    }
     for transport in ("ubmem", "urma"):
-        serial_case = "ubmem-serial" if transport == "ubmem" else selected_urma
+        serial_case = selected_serial[transport]
         serial, fused = table[serial_case]["mean_us"], table[f"{transport}-fused"]["mean_us"]
         target = min(serial * 0.65, serial / 1.5)
         ratios[transport] = dict(
@@ -371,7 +464,7 @@ def summarize(results):
             }
     selection_pairs = {}
     for mode in ("serial", "fused"):
-        names = ("ubmem-serial", selected_urma) if mode == "serial" else ("ubmem-fused", "urma-fused")
+        names = tuple(selected_serial.values()) if mode == "serial" else ("ubmem-fused", "urma-fused")
         selections = [table[name]["selection"] for name in names]
         if all(value is not None for value in selections):
             selection_pairs[mode] = selections[0]["selected_set_sha256"] == selections[1]["selected_set_sha256"]
@@ -395,13 +488,8 @@ def summarize(results):
             minimum_speedup=1.5,
             target_met=all(value["target_met"] for value in ratios.values()),
         ),
-        urma_serial_selection=dict(
-            candidates=serial_cases,
-            selected=selected_urma,
-            criterion="lowest validated device graph timing.mean_us among measured candidates",
-            improvement_over_first_percent=(1 - table[selected_urma]["mean_us"] / table[serial_cases[0]]["mean_us"])
-            * 100,
-        ),
+        serial_selection=serial_selection,
+        urma_serial_selection=serial_selection["urma"],
         same_selection_across_transports=selection_pairs,
         score_validation={
             name: result["score_comparison"] for name, result in results.items() if "score_comparison" in result
@@ -478,9 +566,48 @@ def summarize_saved(paths):
     return result
 
 
-def brief_stages(name, stages, rate):
+def stage_details(timing):
+    """Read saved statistics, deriving missing fields only from real samples."""
+    derived = {}
+    samples = timing.get("samples_us", timing.get("raw_samples"))
+    if samples is not None:
+        values = np.asarray(samples, dtype=np.float64)
+        if values.ndim != 1 or not len(values) or not np.all(np.isfinite(values)) or np.any(values <= 0):
+            raise ValueError("Saved stage samples must be finite positive microseconds")
+        derived = dict(
+            p50_us=float(np.median(values)),
+            mean_us=float(values.mean()),
+            min_us=float(values.min()),
+            max_us=float(values.max()),
+            count=len(values),
+        )
+    result = {}
+    for key in ("p50_us", "mean_us", "min_us", "max_us", "count"):
+        value = timing.get(key, derived.get(key))
+        if value is not None:
+            if isinstance(value, bool) or not np.isfinite(value) or value <= 0:
+                raise ValueError(f"Invalid saved stage statistic: {key}")
+            if key == "count" and (int(value) != value or (samples is not None and value != len(samples))):
+                raise ValueError("Saved stage count disagrees with its samples")
+        result[key] = value
+    return result
+
+
+def brief_stages(name, stages, rate, *, detailed=False):
     if stages:
-        emit("STAGES " + name + " " + " ".join(f"{key}={value['mean_us']:.2f}" for key, value in stages.items()))
+        if detailed:
+            emit(f"STAGES {name} (diagnostic us)")
+            emit(f"  {'stage':32s} {'p50':>10s} {'mean':>10s} {'min':>10s} {'max':>10s} {'n':>5s}")
+            for stage, timing in stages.items():
+                values = stage_details(timing)
+                columns = [
+                    "--" if values[key] is None else f"{values[key]:.3f}"
+                    for key in ("p50_us", "mean_us", "min_us", "max_us")
+                ]
+                count = "--" if values["count"] is None else str(int(values["count"]))
+                emit(f"  {stage:32s} " + " ".join(f"{value:>10s}" for value in columns) + f" {count:>5s}")
+        else:
+            emit("STAGES " + name + " " + " ".join(f"{key}={value['mean_us']:.2f}" for key, value in stages.items()))
     if rate:
         emit(
             f"STAGE_PAYLOAD {name} {rate['stage']}={rate['mean_us']:.3f}us "
@@ -488,7 +615,56 @@ def brief_stages(name, stages, rate):
         )
 
 
-def brief_report(summary, *, path=None):
+def brief_native_get(name, profile):
+    """Print saved native counters without interpreting cycles as latency."""
+    if profile.get("unit") != "native_cycles" or profile.get("included_in_headline") is not False:
+        raise ValueError("Native Get profile must be separate from headline timing and use native cycles")
+    totals, maxima = profile["totals"], profile["maxima"]
+    emit(
+        f"NATIVE_GET {name} active_cores={profile['active_cores']} "
+        f"requests={totals['active_requests']} logical_posts={totals['total_posts']} "
+        f"groups_submitted/completed={totals['submitted_group_count']}/{totals['completed_group_count']} "
+        f"completions={totals['completion_count']}"
+    )
+    emit(
+        f"  native_cycles post_active_sum/max={totals['post_active_cycles']}/{maxima['post_active_cycles']} "
+        f"drain_wait_sum/max={totals['drain_wait_cycles']}/{maxima['drain_wait_cycles']}"
+    )
+    cores = sorted(
+        (core for core in profile.get("cores", []) if core["active_requests"] > 0),
+        key=lambda core: (-core["drain_wait_cycles"], -core["post_active_cycles"], core["core"]),
+    )
+    for core in cores[:3]:
+        emit(
+            f"  slowest_by_drain core={core['core']} requests={core['active_requests']} "
+            f"post_active_cycles={core['post_active_cycles']} drain_wait_cycles={core['drain_wait_cycles']}"
+        )
+
+
+def print_serial_selection(summary):
+    """Keep every measured baseline visible; Get diagnostics do not select it."""
+    selections = summary.get("serial_selection", {"urma": summary.get("urma_serial_selection", {})})
+    for transport, selection in selections.items():
+        names = selection.get("candidates", [])
+        if len(names) < 2:
+            continue
+        for name in names:
+            row = summary["table"][name]
+            diagnostic = (summary.get("stage_diagnostics", {}).get(name) or {}).get("stages", {})
+            timing = stage_details(diagnostic.get("batch_get", {}))
+            get_mean = "--" if timing["mean_us"] is None else f"{timing['mean_us']:.3f}"
+            emit(
+                f"SERIAL_CANDIDATE {name} graph_mean={row['mean_us']:.3f}us "
+                f"graph_p50={row['p50_us']:.3f}us diagnostic_get_mean={get_mean}us"
+            )
+        emit(
+            f"SERIAL_SELECTED {transport}={selection['selected']} "
+            f"graph_improvement_over_first={selection['improvement_over_first_percent']:.2f}%; "
+            "fastest validated graph mean sets the fusion target"
+        )
+
+
+def brief_report(summary, *, path=None, stage_details=False):
     """Keep measured per-path demand visible without printing per-window counters."""
     if summary.get("status") != "pass" or "table" not in summary:
         raise ValueError("Brief comparison requires a successful four-path summary")
@@ -510,6 +686,7 @@ def brief_report(summary, *, path=None):
             f"{row['mean_read_bytes'] / (1 << 20):11.3f} "
             f"{row['graph_normalized_payload_GBps']['actual_transfers']:15.3f}"
         )
+    print_serial_selection(summary)
     for transport, value in summary["fusion_vs_serial"].items():
         emit(
             f"FUSION {transport}: speedup={value['serial_over_fused']:.3f}x "
@@ -533,12 +710,21 @@ def brief_report(summary, *, path=None):
                 )
                 if reads := variant.get("reads"):
                     emit("READS " + label + " " + " ".join(f"{key}={value:.1f}" for key, value in reads.items()))
-                brief_stages(label, variant.get("stages", {}), variant.get("stage_payload_rate", {}))
+                brief_stages(
+                    label, variant.get("stages", {}), variant.get("stage_payload_rate", {}), detailed=stage_details
+                )
         else:
             stages = (summary.get("stage_diagnostics", {}).get(name) or {}).get("stages", {})
-            brief_stages(name, stages, row.get("stage_payload_rate", {}))
+            brief_stages(name, stages, row.get("stage_payload_rate", {}), detailed=stage_details)
     if any(summary.get("stage_diagnostics", {}).values()):
         emit("STAGE_NOTE diagnostic us; events perturb overlap. URMA fused CQ wait is not complete Get duration.")
+    if stage_details and (profiles := summary.get("native_get_profiles")):
+        for name, profile in profiles.items():
+            brief_native_get(name, profile)
+        emit(
+            "NATIVE_GET_NOTE one extra instrumented replay; core sums/maxima are not additive wall latency or us; "
+            "bulk logical posts are not doorbell counts."
+        )
     if checks := summary.get("score_validation"):
         emit("LI_SCORE_CHECK " + " ".join(f"{name}={value['status']}" for name, value in checks.items()))
     if pairs := summary.get("same_selection_across_transports"):
@@ -548,6 +734,7 @@ def brief_report(summary, *, path=None):
 
 
 def display(summary):
+    print_serial_selection(summary)
     print("\ncase          mean_us     p50_us   read_MiB/round   runtime_workers")
     for name, row in summary["table"].items():
         print(
@@ -650,7 +837,7 @@ def main():
     if args.report_only is not None:
         if args.brief:
             try:
-                brief_report(json.loads(args.report_only.read_text()), path=args.report_only)
+                brief_report(json.loads(args.report_only.read_text()), path=args.report_only, stage_details=True)
             except (OSError, ValueError, KeyError, TypeError) as error:
                 raise SystemExit(f"FAILED reading comparison: {error}") from error
         else:
@@ -670,8 +857,8 @@ def main():
         flush=True,
     )
     results = {}
-    for transport, mode, workers in case_plan(args):
-        argv, result_file = command(args, transport, mode, workers)
+    for transport, mode, workers, dispatch in case_plan(args):
+        argv, result_file = command(args, transport, mode, workers, dispatch)
         name = result_file.stem
         print(f"CASE_BEGIN {name}: restore real DDR/pre-state, then measure", flush=True)
         # Keep successful native setup chatter out of the terminal. The temporary
@@ -714,6 +901,7 @@ def main():
         brief_report(summary, path=args.result_dir / "summary.json")
     elif args.quiet:
         compact_report(summary, path=args.result_dir / "summary.json")
+        print_serial_selection(summary)
     else:
         display(summary)
         print(f"\nResults: {args.result_dir / 'summary.json'}")

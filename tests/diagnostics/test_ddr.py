@@ -470,6 +470,56 @@ class ReplayRuntimeTest(unittest.TestCase):
         self.assertEqual(options["ubmem_page_mode"], "thp")
         self.assertEqual(options["ubmem_numa_node"], 2)
 
+    def test_tiled_dispatch_selects_optional_ubmem_serial_kernel_without_abi_change(self):
+        args = self.args("ubmem", "serial", serial_workers=32)
+        args.ubmem_serial_dispatch = "tiled"
+        optional = self.build / "bin/kvaf_ubmem_batch_get_tiled.o"
+        with self.assertRaises(FileNotFoundError):
+            create_runtime(args, self.archive, self.sdk, None, None, None, None, 32)
+        self.assertEqual(self.calls, [])
+        optional.write_bytes(b"tiled object")
+        create_runtime(args, self.archive, self.sdk, None, None, None, None, 32)
+        self.assertEqual(self.calls[-1][0][0], str(optional.resolve()))
+        self.assertEqual(self.calls[-1][1]["npu_core_count"], 32)
+        self.assertNotIn("ubmem_serial_dispatch", self.calls[-1][1])
+        self.assertEqual(runtime_worker_config(args, self.archive, 32)["ubmem_batch_get_dispatch"], "tiled")
+        baseline = self.args("ubmem", "serial")
+        self.assertEqual(runtime_worker_config(baseline, self.archive, 32)["ubmem_batch_get_dispatch"], "scalar")
+        self.assertEqual(get_kernel_path(baseline).name, "kvaf_ubmem_batch_get.o")
+        for transport, mode in (("ubmem", "fused"), ("urma", "serial"), ("urma", "fused")):
+            invalid = self.args(transport, mode)
+            invalid.ubmem_serial_dispatch = "tiled"
+            with self.assertRaisesRegex(ValueError, "only to UBmem serial"):
+                runtime_worker_config(invalid, self.archive, 32)
+        args.ubmem_serial_dispatch = "unknown"
+        with self.assertRaisesRegex(ValueError, "scalar or tiled"):
+            runtime_worker_config(args, self.archive, 32)
+
+    def test_bulk_dispatch_preserves_native_urma_abi_and_requires_post32_unbounded(self):
+        args = self.args("urma", "serial", serial_workers=32, urma_serial_max_inflight=0)
+        args.urma_serial_post_size = 32
+        args.urma_serial_dispatch = "bulk"
+        optional = self.build / "bin/kvaf_execute_batch_get_bulk.o"
+        with self.assertRaises(FileNotFoundError):
+            create_runtime(args, self.archive, self.sdk, None, None, None, None, 32)
+        self.assertEqual(self.calls, [])
+        optional.write_bytes(b"bulk object")
+        create_runtime(args, self.archive, self.sdk, None, None, None, None, 32)
+        self.assertEqual(self.calls[-1][0][0], str(optional.resolve()))
+        self.assertEqual(self.calls[-1][1]["jettys_per_core"], 2)
+        self.assertEqual(self.calls[-1][1]["batch_get_max_inflight_total"], 0)
+        self.assertNotIn("urma_serial_dispatch", self.calls[-1][1])
+        self.assertEqual(runtime_worker_config(args, self.archive, 32)["urma_batch_get_dispatch"], "bulk")
+        for post, inflight in ((128, 0), (32, None), (32, 2048)):
+            args.urma_serial_post_size, args.urma_serial_max_inflight = post, inflight
+            with self.assertRaisesRegex(ValueError, "post size 32 and max inflight 0"):
+                runtime_worker_config(args, self.archive, 32)
+        for transport, mode in (("ubmem", "serial"), ("ubmem", "fused"), ("urma", "fused")):
+            invalid = self.args(transport, mode)
+            invalid.urma_serial_dispatch = "bulk"
+            with self.assertRaisesRegex(ValueError, "only to URMA serial"):
+                runtime_worker_config(invalid, self.archive, 32)
+
     def test_invalid_selection_fails_before_native_construction(self):
         for override in (0, 49, True):
             with self.subTest(override=override), self.assertRaises(ValueError):

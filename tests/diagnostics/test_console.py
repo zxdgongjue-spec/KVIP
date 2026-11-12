@@ -233,7 +233,7 @@ from types import SimpleNamespace
 from kvip.diagnostics import compare
 args=SimpleNamespace(report_only=None,result_dir=Path({str(tmp_path / "results")!r}),quiet=True,device=4,warmup=2,iterations=10,stage_iterations=3)
 compare.arguments=lambda:args
-compare.case_plan=lambda args:[("urma","fused",None)]
+compare.case_plan=lambda args:[("urma","fused",None,None)]
 compare.command=lambda *args:([sys.executable,"-c","import os;os.write(2,b'native fatal evidence'+bytes([10]));os._exit(70)"],Path({str(output)!r}))
 compare.main()
 """,

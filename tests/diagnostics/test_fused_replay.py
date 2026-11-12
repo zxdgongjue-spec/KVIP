@@ -433,6 +433,48 @@ def test_replay_inflight_cli_only_accepts_urma_serial_uint32():
             arguments(base + ["--urma-serial-max-inflight", value])
 
 
+def test_replay_tiled_dispatch_is_explicit_ubmem_serial_only():
+    from kvip.diagnostics.replay import arguments
+
+    common = ["--snapshot", "/snapshot", "--build-dir", "/build", "--soc", "soc"]
+    serial = common + ["--mode", "serial"]
+    assert arguments(serial).ubmem_serial_dispatch == "scalar"
+    assert arguments(serial + ["--ubmem-serial-dispatch", "tiled"]).ubmem_serial_dispatch == "tiled"
+    for base in (
+        common,
+        serial + ["--inspect"],
+        serial + ["--transport", "urma", "--kvaf-server", "127.0.0.1:28880"],
+        ["--report-only", "/saved.json"],
+    ):
+        with pytest.raises(SystemExit):
+            arguments(base + ["--ubmem-serial-dispatch", "tiled"])
+
+
+def test_replay_bulk_dispatch_requires_explicit_urma_post32_and_inflight_zero():
+    from kvip.diagnostics.replay import arguments
+
+    common = ["--snapshot", "/snapshot", "--build-dir", "/build", "--soc", "soc"]
+    serial = common + ["--mode", "serial", "--transport", "urma", "--kvaf-server", "127.0.0.1:28880"]
+    bulk = ["--urma-serial-dispatch", "bulk"]
+    assert arguments(serial).urma_serial_dispatch == "scalar"
+    assert (
+        arguments(
+            serial + bulk + ["--urma-serial-post-size", "32", "--urma-serial-max-inflight", "0"]
+        ).urma_serial_dispatch
+        == "bulk"
+    )
+    for base in (
+        common,
+        serial,
+        serial + ["--urma-serial-post-size", "32"],
+        serial + ["--urma-serial-post-size", "128", "--urma-serial-max-inflight", "0"],
+        serial + ["--urma-serial-post-size", "32", "--urma-serial-max-inflight", "2048"],
+        ["--report-only", "/saved.json"],
+    ):
+        with pytest.raises(SystemExit):
+            arguments(base + bulk)
+
+
 def test_async_final_stages_expose_post_then_index_then_join_and_drain():
     calls = []
     library = Library(calls)

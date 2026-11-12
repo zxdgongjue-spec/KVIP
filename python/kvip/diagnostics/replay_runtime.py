@@ -21,11 +21,23 @@ def runtime_worker_config(args, archive, aics):
     if override is not None and (type(override) is not int or not 1 <= override <= 48):
         raise ValueError("serial_workers must be an integer in 1..48")
     inflight = getattr(args, "urma_serial_max_inflight", None)
+    dispatch = getattr(args, "ubmem_serial_dispatch", "scalar")
+    if dispatch not in ("scalar", "tiled"):
+        raise ValueError("UBmem serial dispatch must be scalar or tiled")
+    if dispatch != "scalar" and (args.transport, args.mode) != ("ubmem", "serial"):
+        raise ValueError("UBmem tiled dispatch applies only to UBmem serial replay")
     post_size = getattr(args, "urma_serial_post_size", 128)
     if type(post_size) is not int or post_size not in (32, 128):
         raise ValueError("URMA serial post size must be 32 or 128")
     if post_size != 128 and (args.transport, args.mode) != ("urma", "serial"):
         raise ValueError("URMA serial post size applies only to URMA serial replay")
+    urma_dispatch = getattr(args, "urma_serial_dispatch", "scalar")
+    if urma_dispatch not in ("scalar", "bulk"):
+        raise ValueError("URMA serial dispatch must be scalar or bulk")
+    if urma_dispatch != "scalar" and (args.transport, args.mode) != ("urma", "serial"):
+        raise ValueError("URMA bulk dispatch applies only to URMA serial replay")
+    if urma_dispatch == "bulk" and (post_size != 32 or inflight != 0):
+        raise ValueError("URMA bulk dispatch requires post size 32 and max inflight 0")
     if inflight is not None and (args.transport, args.mode) != ("urma", "serial"):
         raise ValueError("URMA serial max inflight applies only to URMA serial replay")
     if args.mode == "serial":
@@ -40,7 +52,10 @@ def runtime_worker_config(args, archive, aics):
                 batch_get_max_inflight_total_source="native_default" if inflight is None else "cli",
                 jettys_per_core=2,
                 batch_get_post_size=post_size,
+                urma_batch_get_dispatch=urma_dispatch,
             )
+        else:
+            config["ubmem_batch_get_dispatch"] = dispatch
         return config
     if override is not None:
         raise ValueError("serial_workers applies only to serial replay")
@@ -58,7 +73,13 @@ def runtime_worker_config(args, archive, aics):
 
 def get_kernel_path(args):
     if args.transport == "ubmem":
-        name = "kvaf_ubmem_batch_get.o"
+        name = (
+            "kvaf_ubmem_batch_get_tiled.o"
+            if getattr(args, "ubmem_serial_dispatch", "scalar") == "tiled"
+            else "kvaf_ubmem_batch_get.o"
+        )
+    elif args.mode == "serial" and getattr(args, "urma_serial_dispatch", "scalar") == "bulk":
+        name = "kvaf_execute_batch_get_bulk.o"
     elif args.mode == "serial" and getattr(args, "urma_serial_post_size", 128) == 32:
         name = "kvaf_execute_batch_get_post32.o"
     else:

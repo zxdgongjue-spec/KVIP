@@ -66,6 +66,11 @@ class DependencyPatchTests(unittest.TestCase):
         (self.root / "patches/kvaf-urma-get-post32.patch").write_text(
             diff("original\n", "optional post32\n", "unrelated.txt")
         )
+        (self.root / "patches/kvaf-urma-get-bulk.patch").write_text(
+            diff("optional post32\n", "optional post32 bulk\n", "unrelated.txt")
+        )
+        self.tiled = self.stages[5].replace("UBmem\n", "UBmem tiled\n")
+        (self.root / "patches/kvaf-ubmem-get-dispatch.patch").write_text(diff(self.stages[5], self.tiled))
         self.root_patch = patch.object(BUILD, "ROOT", self.root)
         self.revision_patch = patch.object(BUILD, "REVISION", revision)
         self.root_patch.start()
@@ -164,6 +169,152 @@ class DependencyPatchTests(unittest.TestCase):
         before = self.git("diff")
         BUILD.prepare_dependency(self.source, "ubmem")
         self.assertEqual(self.git("diff"), before)
+
+    def test_tiled_upgrade_repeat_preserves_real_index_and_unrelated_work(self):
+        BUILD.prepare_dependency(self.source, "ubmem")
+        (self.source / "unrelated.txt").write_text("staged user work\n")
+        self.git("add", "unrelated.txt")
+        (self.source / "notes.txt").write_text("untracked user work\n")
+        index = self.git("diff", "--cached")
+        BUILD.prepare_dependency(self.source, "ubmem", ubmem_get_tiled=True)
+        self.assertEqual(self.text(), self.tiled)
+        self.assertFalse(BUILD.applies(self.source, BUILD.UBMEM_PATCH, True))
+        self.assertTrue(BUILD.verify_applied_patch_stack(self.source, (BUILD.UBMEM_PATCH, BUILD.UBMEM_DISPATCH_PATCH)))
+        before = self.git("diff")
+        BUILD.prepare_dependency(self.source, "ubmem", ubmem_get_tiled=True)
+        BUILD.prepare_dependency(self.source, "ubmem")
+        self.assertEqual(self.git("diff"), before)
+        self.assertEqual(self.git("diff", "--cached"), index)
+        self.assertEqual((self.source / "notes.txt").read_text(), "untracked user work\n")
+
+    def test_tiled_fresh_conflict_and_wrong_transport(self):
+        with self.assertRaisesRegex(ValueError, "requires --transport ubmem"):
+            BUILD.prepare_dependency(self.source, ubmem_get_tiled=True)
+        BUILD.prepare_dependency(self.source, "ubmem", ubmem_get_tiled=True)
+        self.assertEqual(self.text(), self.tiled)
+        with self.assertRaisesRegex(RuntimeError, "separate URMA"):
+            BUILD.prepare_dependency(self.source)
+        (self.source / "runtime.txt").write_text(self.tiled.replace("UBmem tiled", "user change"))
+        before = self.git("diff")
+        with self.assertRaisesRegex(RuntimeError, "conflicts"):
+            BUILD.prepare_dependency(self.source, "ubmem", ubmem_get_tiled=True)
+        self.assertEqual(self.git("diff"), before)
+
+    def test_tiled_kernel_only_does_not_run_other_builds_or_switch_manifest(self):
+        (self.root / "build").mkdir()
+        manifest = self.root / "build/dependencies.json"
+        manifest.write_text("existing selected build")
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "build.py",
+                    "--transport",
+                    "ubmem",
+                    "--ubmem-get-tiled",
+                    "--get-kernel-only",
+                    "--kvaf-root",
+                    str(self.source),
+                ],
+            ),
+            patch.object(BUILD, "build_ubmem_tiled") as build,
+            patch.object(BUILD, "runtime_preflight") as preflight,
+            patch.object(BUILD, "build_lidu") as lidu,
+        ):
+            BUILD.main()
+        build.assert_called_once()
+        self.assertEqual(build.call_args.args[:2], (self.source.resolve() / "build-ubmem-npu", 2))
+        preflight.assert_not_called()
+        lidu.assert_not_called()
+        self.assertEqual(manifest.read_text(), "existing selected build")
+        self.assertEqual(self.text(), self.tiled)
+
+    def test_tiled_incremental_build_targets_only_the_optional_object(self):
+        build_dir = self.source / "build-ubmem-npu"
+        build_dir.mkdir()
+        with self.assertRaisesRegex(RuntimeError, "configured"):
+            BUILD.build_ubmem_tiled(build_dir, 2, {})
+        (build_dir / "CMakeCache.txt").touch()
+        (build_dir / "bin").mkdir()
+        (build_dir / "bin/kvaf_ubmem_batch_get_tiled.o").touch()
+        with patch.object(BUILD, "call") as run:
+            BUILD.build_ubmem_tiled(build_dir, 2, {"PYTHON": "serving-python"})
+        self.assertEqual(
+            run.call_args_list,
+            [
+                call(["cmake", "-S", self.source, "-B", build_dir], env={"PYTHON": "serving-python"}),
+                call(
+                    ["cmake", "--build", build_dir, "--target", "kvaf_ubmem_batch_get_tiled_kernel", "--parallel", 2],
+                    env={"PYTHON": "serving-python"},
+                ),
+            ],
+        )
+
+    def test_bulk_upgrade_repeat_and_wrong_transport(self):
+        with self.assertRaisesRegex(ValueError, "requires --transport urma"):
+            BUILD.prepare_dependency(self.source, "ubmem", urma_get_bulk=True)
+        BUILD.prepare_dependency(self.source, urma_get_bulk=True)
+        self.assertEqual((self.source / "unrelated.txt").read_text(), "optional post32 bulk\n")
+        self.assertFalse(BUILD.applies(self.source, BUILD.URMA_POST32_PATCH, True))
+        before, staged = self.git("diff"), self.git("diff", "--cached")
+        BUILD.prepare_dependency(self.source, urma_get_bulk=True)
+        BUILD.prepare_dependency(self.source, urma_get_post32=True)
+        BUILD.prepare_dependency(self.source)
+        self.assertEqual(self.git("diff"), before)
+        self.assertEqual(self.git("diff", "--cached"), staged)
+        with self.assertRaisesRegex(RuntimeError, "separate UBmem"):
+            BUILD.prepare_dependency(self.source, "ubmem")
+
+    def test_bulk_conflict_preserves_source(self):
+        BUILD.prepare_dependency(self.source, urma_get_post32=True)
+        (self.source / "unrelated.txt").write_text("user change\n")
+        before = self.git("diff")
+        with self.assertRaisesRegex(RuntimeError, "conflicts"):
+            BUILD.prepare_dependency(self.source, urma_get_bulk=True)
+        self.assertEqual(self.git("diff"), before)
+
+    def test_bulk_kernel_only_keeps_environment_and_skips_other_builds(self):
+        (self.root / "build").mkdir()
+        manifest = self.root / "build/dependencies.json"
+        manifest.write_text("existing selected build")
+        with (
+            patch.object(
+                sys, "argv", ["build.py", "--urma-get-bulk", "--get-kernel-only", "--kvaf-root", str(self.source)]
+            ),
+            patch.object(BUILD, "build_urma_bulk") as build,
+            patch.object(BUILD, "build_urma_post32") as baseline,
+            patch.object(BUILD, "runtime_preflight") as preflight,
+            patch.object(BUILD, "build_lidu") as lidu,
+        ):
+            BUILD.main()
+        build.assert_called_once()
+        self.assertEqual(build.call_args.args[:2], (self.source.resolve() / "build-npu", 2))
+        baseline.assert_not_called()
+        preflight.assert_not_called()
+        lidu.assert_not_called()
+        self.assertEqual(manifest.read_text(), "existing selected build")
+
+    def test_bulk_incremental_build_targets_only_the_optional_object(self):
+        build_dir = self.source / "build-npu"
+        build_dir.mkdir()
+        with self.assertRaisesRegex(RuntimeError, "configured"):
+            BUILD.build_urma_bulk(build_dir, 2, {})
+        (build_dir / "CMakeCache.txt").touch()
+        (build_dir / "bin").mkdir()
+        (build_dir / "bin/kvaf_execute_batch_get_bulk.o").touch()
+        with patch.object(BUILD, "call") as run:
+            BUILD.build_urma_bulk(build_dir, 2, {})
+        self.assertEqual(
+            run.call_args_list,
+            [
+                call(["cmake", "-S", self.source, "-B", build_dir], env={}),
+                call(
+                    ["cmake", "--build", build_dir, "--target", "kvaf_execute_batch_get_bulk_kernel", "--parallel", 2],
+                    env={},
+                ),
+            ],
+        )
 
     def test_legacy_three_patch_urma_upgrade(self):
         self.legacy()

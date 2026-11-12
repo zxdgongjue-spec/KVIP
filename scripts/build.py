@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,6 +16,8 @@ PATCHES = ("kvaf-reuse-device-ra", "kvaf-fused-context", "kvaf-fused-output-view
 UBMEM_PATCH = "kvaf-ubmem"
 BACKGROUND_PATCH = "kvaf-background-put"
 URMA_POST32_PATCH = "kvaf-urma-get-post32"
+URMA_BULK_PATCH = "kvaf-urma-get-bulk"
+UBMEM_DISPATCH_PATCH = "kvaf-ubmem-get-dispatch"
 
 
 def call(command, cwd=None, env=None):
@@ -52,7 +55,9 @@ def build_lidu(env, skip=False):
 
 def patch_path(name):
     directory = (
-        ROOT / "patches" if name in (BACKGROUND_PATCH, UBMEM_PATCH, URMA_POST32_PATCH) else ROOT / "scripts/patches"
+        ROOT / "patches"
+        if name in (BACKGROUND_PATCH, UBMEM_PATCH, URMA_POST32_PATCH, URMA_BULK_PATCH, UBMEM_DISPATCH_PATCH)
+        else ROOT / "scripts/patches"
     )
     return directory / (name + ".patch")
 
@@ -74,11 +79,41 @@ def apply_patch(root, name):
     call(["git", "apply", patch_path(name)], cwd=root)
 
 
-def prepare_dependency(root, transport="urma", urma_get_post32=False):
+def verify_applied_patch_stack(root, names):
+    """Verify oldest-to-newest patches using a private index, preserving user edits.
+
+    A later patch can alter an earlier patch's added files, preventing a direct
+    reverse check. Stage only this stack's paths in a disposable index and
+    reverse there; never reset or edit the checkout or its real index.
+    """
+    paths = set()
+    for name in names:
+        stat = subprocess.check_output(["git", "apply", "--numstat", str(patch_path(name))], text=True)
+        paths.update(line.split("\t", 2)[2] for line in stat.splitlines())
+    with tempfile.TemporaryDirectory(prefix="kvip-patch-check-") as directory:
+        env = dict(os.environ, GIT_INDEX_FILE=str(Path(directory) / "index"))
+        commands = [["read-tree", "HEAD"], ["add", "--", *sorted(paths)]]
+        commands += [["apply", "--cached", "--reverse", str(patch_path(name))] for name in reversed(names)]
+        for command in commands:
+            if subprocess.run(
+                ["git", "-C", str(root), *command],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode:
+                return False
+    return True
+
+
+def prepare_dependency(root, transport="urma", urma_get_post32=False, ubmem_get_tiled=False, urma_get_bulk=False):
     if transport not in ("urma", "ubmem"):
         raise ValueError("transport must be urma or ubmem")
     if urma_get_post32 and transport != "urma":
         raise ValueError("--urma-get-post32 requires --transport urma")
+    if ubmem_get_tiled and transport != "ubmem":
+        raise ValueError("--ubmem-get-tiled requires --transport ubmem")
+    if urma_get_bulk and transport != "urma":
+        raise ValueError("--urma-get-bulk requires --transport urma")
     if not root.exists():
         root.parent.mkdir(parents=True, exist_ok=True)
         call(["git", "clone", "--no-checkout", "https://gitcode.com/CacheOS/KVAF.git", root])
@@ -86,13 +121,28 @@ def prepare_dependency(root, transport="urma", urma_get_post32=False):
     head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
     if head != REVISION:
         raise RuntimeError(f"Expected KVAF {REVISION}, found {head}; existing checkout left unchanged")
+    if applies(root, UBMEM_DISPATCH_PATCH, True):
+        if transport != "ubmem":
+            raise RuntimeError("KVAF checkout already has the local UBmem patch; use a separate URMA checkout")
+        if not verify_applied_patch_stack(root, (UBMEM_PATCH, UBMEM_DISPATCH_PATCH)):
+            raise RuntimeError("KVAF UBmem patch stack conflicts with existing edits; checkout preserved")
+        print(f"KVAF UBmem tiled dependency already patched: {root} @ {head}", flush=True)
+        return
     # The UBmem patch changes common-patch contexts. Recognize it first, while
     # keeping the default URMA checkout on its original three-patch chain.
     if applies(root, UBMEM_PATCH, True):
         if transport != "ubmem":
             raise RuntimeError("KVAF checkout already has the local UBmem patch; use a separate URMA checkout")
+        if ubmem_get_tiled:
+            apply_patch(root, UBMEM_DISPATCH_PATCH)
         print(f"KVAF UBmem dependency already patched: {root} @ {head}", flush=True)
         return
+    bulk_applied = applies(root, URMA_BULK_PATCH, True)
+    if bulk_applied:
+        if transport != "urma":
+            raise RuntimeError("KVAF checkout has the URMA bulk patch; use a separate UBmem checkout")
+        if not verify_applied_patch_stack(root, (URMA_POST32_PATCH, URMA_BULK_PATCH)):
+            raise RuntimeError("KVAF URMA Get patch stack conflicts with existing edits; checkout preserved")
     # Applying output-views changes the parent patch's context: check newest first.
     if not applies(root, PATCHES[0], True):
         apply_patch(root, PATCHES[0])
@@ -106,22 +156,37 @@ def prepare_dependency(root, transport="urma", urma_get_post32=False):
         apply_patch(root, BACKGROUND_PATCH)
     if transport == "ubmem":
         apply_patch(root, UBMEM_PATCH)
-    elif urma_get_post32 and not applies(root, URMA_POST32_PATCH, True):
-        apply_patch(root, URMA_POST32_PATCH)
+        if ubmem_get_tiled:
+            apply_patch(root, UBMEM_DISPATCH_PATCH)
+    elif not bulk_applied:
+        if (urma_get_post32 or urma_get_bulk) and not applies(root, URMA_POST32_PATCH, True):
+            apply_patch(root, URMA_POST32_PATCH)
+        if urma_get_bulk:
+            apply_patch(root, URMA_BULK_PATCH)
     print(f"KVAF {transport} dependency ready: {root} @ {head}", flush=True)
 
 
-def build_urma_post32(build_dir, jobs, env):
+def build_get_object(build_dir, jobs, env, name, target):
     if not (build_dir / "CMakeCache.txt").is_file():
-        raise RuntimeError("--urma-get-post32 requires an existing configured URMA NPU build")
+        raise RuntimeError(f"{name} requires an existing configured NPU build")
     # An existing Make generator cannot build a newly added target until it is
     # reconfigured. Keep its toolchain/options in the existing cache.
     call(["cmake", "-S", build_dir.parent, "-B", build_dir], env=env)
-    call(
-        ["cmake", "--build", build_dir, "--target", "kvaf_execute_batch_get_post32_kernel", "--parallel", jobs], env=env
-    )
-    if not (build_dir / "bin/kvaf_execute_batch_get_post32.o").is_file():
-        raise RuntimeError("Optional URMA post32 kernel was not produced")
+    call(["cmake", "--build", build_dir, "--target", target, "--parallel", jobs], env=env)
+    if not (build_dir / "bin" / (name + ".o")).is_file():
+        raise RuntimeError(f"Optional Get kernel was not produced: {name}")
+
+
+def build_urma_post32(build_dir, jobs, env):
+    build_get_object(build_dir, jobs, env, "kvaf_execute_batch_get_post32", "kvaf_execute_batch_get_post32_kernel")
+
+
+def build_ubmem_tiled(build_dir, jobs, env):
+    build_get_object(build_dir, jobs, env, "kvaf_ubmem_batch_get_tiled", "kvaf_ubmem_batch_get_tiled_kernel")
+
+
+def build_urma_bulk(build_dir, jobs, env):
+    build_get_object(build_dir, jobs, env, "kvaf_execute_batch_get_bulk", "kvaf_execute_batch_get_bulk_kernel")
 
 
 def main():
@@ -135,20 +200,45 @@ def main():
     parser.add_argument("--jobs", type=int, default=2)
     parser.add_argument("--transport", choices=("urma", "ubmem"), default="urma")
     parser.add_argument("--urma-get-post32", action="store_true", help="Build the optional URMA 32-WQE Get object")
+    parser.add_argument("--urma-get-bulk", action="store_true", help="Build the optional URMA bulk-WQE Get object")
+    parser.add_argument(
+        "--ubmem-get-tiled", action="store_true", help="Build the optional UBmem tiled-dispatch Get object"
+    )
+    parser.add_argument(
+        "--get-kernel-only",
+        action="store_true",
+        help="Build only the selected optional Get object in an existing build; keep the selected runtime unchanged",
+    )
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be positive")
     if args.urma_get_post32 and args.transport != "urma":
         parser.error("--urma-get-post32 requires --transport urma")
-    if not args.prepare_only:
+    if args.ubmem_get_tiled and args.transport != "ubmem":
+        parser.error("--ubmem-get-tiled requires --transport ubmem")
+    if args.urma_get_bulk and args.transport != "urma":
+        parser.error("--urma-get-bulk requires --transport urma")
+    if args.get_kernel_only and not (args.ubmem_get_tiled or args.urma_get_post32 or args.urma_get_bulk):
+        parser.error("--get-kernel-only requires --ubmem-get-tiled, --urma-get-post32 or --urma-get-bulk")
+    if not args.prepare_only and not args.get_kernel_only:
         runtime_preflight()
     dependency = (args.kvaf_root or ROOT / "third_party/KVAF").resolve()
-    prepare_dependency(dependency, args.transport, urma_get_post32=args.urma_get_post32)
+    prepare_dependency(
+        dependency,
+        args.transport,
+        urma_get_post32=args.urma_get_post32,
+        ubmem_get_tiled=args.ubmem_get_tiled,
+        urma_get_bulk=args.urma_get_bulk,
+    )
     (ROOT / "build").mkdir(exist_ok=True)
     build_dir = dependency / ("build-ubmem-npu" if args.transport == "ubmem" else "build-npu")
     state = dict(kvaf=str(dependency), revision=REVISION, transport=args.transport, kvaf_build_dir=str(build_dir))
     if args.urma_get_post32:
         state["urma_get_post32"] = True
+    if args.ubmem_get_tiled:
+        state["ubmem_get_tiled"] = True
+    if args.urma_get_bulk:
+        state["urma_get_bulk"] = True
     if args.prepare_only:
         # Preparing source must not switch a working Python environment to an
         # unbuilt dependency. Select it only after the build succeeds.
@@ -162,6 +252,15 @@ def main():
         NANOVLLM_A5_OPS_BUILD_JOBS=str(args.jobs),
         NANOVLLM_A5_OPS_PYTHON=sys.executable,
     )
+    if args.get_kernel_only:
+        if args.ubmem_get_tiled:
+            build_ubmem_tiled(build_dir, args.jobs, env)
+        if args.urma_get_post32:
+            build_urma_post32(build_dir, args.jobs, env)
+        if args.urma_get_bulk:
+            build_urma_bulk(build_dir, args.jobs, env)
+        print("PASS: optional Get kernel built; selected runtime and other operators unchanged.", flush=True)
+        return
     if args.transport == "ubmem":
         if not args.skip_kvaf_build:
             call(
@@ -174,6 +273,8 @@ def main():
                 raise RuntimeError(f"UBmem kernel missing: {build_dir / 'bin' / name}")
         if not list((build_dir / "python/kvaf").glob("*.so")):
             raise RuntimeError(f"UBmem Python extension missing: {build_dir / 'python/kvaf'}")
+        if args.ubmem_get_tiled:
+            build_ubmem_tiled(build_dir, args.jobs, env)
         build_lidu(env, args.skip_lidu_build)
         call([sys.executable, "-m", "pip", "install", "--no-build-isolation", "-e", ROOT])
         sys.path.insert(0, str(ROOT / "python"))
@@ -208,6 +309,8 @@ def main():
             )
     if args.urma_get_post32:
         build_urma_post32(build_dir, args.jobs, env)
+    if args.urma_get_bulk:
+        build_urma_bulk(build_dir, args.jobs, env)
     build_lidu(env, args.skip_lidu_build)
     # Editable install intentionally retains csrc alongside the Python package.
     call([sys.executable, "-m", "pip", "install", "--no-build-isolation", "-e", ROOT])

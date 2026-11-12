@@ -40,10 +40,20 @@ def arguments(argv=None):
     parser.add_argument("--kvaf-server", help="Dedicated local CPU service, required for URMA replay")
     parser.add_argument("--serial-workers", type=int, help="Serial Get workers: service defaults UBmem=32, URMA=2")
     parser.add_argument(
+        "--ubmem-serial-dispatch",
+        choices=("scalar", "tiled"),
+        help="UBmem serial descriptor dispatch; tiled requires the optional Get object, default scalar",
+    )
+    parser.add_argument(
         "--urma-serial-post-size",
         type=int,
         choices=(32, 128),
         help="URMA serial WQEs per post; default 128, 32 requires the optional post32 kernel",
+    )
+    parser.add_argument(
+        "--urma-serial-dispatch",
+        choices=("scalar", "bulk"),
+        help="URMA serial WQE dispatch; bulk retains post32 Jetty assignment and requires max-inflight=0",
     )
     parser.add_argument(
         "--urma-serial-max-inflight",
@@ -103,6 +113,8 @@ def arguments(argv=None):
                 args.fused_variants,
                 args.ubmem_ablation,
                 args.service_ablation,
+                args.ubmem_serial_dispatch,
+                args.urma_serial_dispatch,
             )
         ):
             parser.error("--report-only cannot be combined with capture/build/output or run options")
@@ -154,10 +166,20 @@ def arguments(argv=None):
         parser.error("--active-batches requires --service-ablation")
     if args.serial_workers is not None and (args.mode != "serial" or not 1 <= args.serial_workers <= 48):
         parser.error("serial-workers requires serial mode and a value in 1..48")
+    if args.ubmem_serial_dispatch is not None and (args.inspect or (args.transport, args.mode) != ("ubmem", "serial")):
+        parser.error("--ubmem-serial-dispatch requires UBmem serial device replay")
+    if args.ubmem_serial_dispatch is None:
+        args.ubmem_serial_dispatch = "scalar"
     if args.urma_serial_post_size is not None and (args.inspect or (args.transport, args.mode) != ("urma", "serial")):
         parser.error("--urma-serial-post-size requires URMA serial device replay")
     if args.urma_serial_post_size is None:
         args.urma_serial_post_size = 128
+    if args.urma_serial_dispatch is not None and (args.inspect or (args.transport, args.mode) != ("urma", "serial")):
+        parser.error("--urma-serial-dispatch requires URMA serial device replay")
+    if args.urma_serial_dispatch is None:
+        args.urma_serial_dispatch = "scalar"
+    if args.urma_serial_dispatch == "bulk" and (args.urma_serial_post_size != 32 or args.urma_serial_max_inflight != 0):
+        parser.error("URMA bulk dispatch requires --urma-serial-post-size 32 --urma-serial-max-inflight 0")
     if args.urma_serial_max_inflight is not None:
         if args.inspect or (args.transport, args.mode) != ("urma", "serial"):
             parser.error("--urma-serial-max-inflight requires URMA serial device replay")
