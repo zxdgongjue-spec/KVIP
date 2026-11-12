@@ -5,9 +5,15 @@ The caller binds cache rows, LRU candidates and query positions before forward.
 This object neither allocates a Runtime nor selects replacement candidates.
 """
 
+import logging
+import os
 from copy import copy
 
 from kvip.operators.lifetch.forward import LIFetchForward
+
+
+_KVAF_LIFETCH_DIAG = os.environ.get("KVAF_LIFETCH_DIAG") == "1"
+_LOGGER = logging.getLogger("vllm")
 
 
 def group_scratch(policy, workspace, batch, group):
@@ -80,11 +86,25 @@ class VllmIndexSelector:
         self.attention_indices = None
         self.plans = None
         self.tail_source = None
+        self._diag_epoch = 0
+        self._diag_published_epoch = -1
 
     def prepare(self, plans, *, prepare_inputs=True):
         """CPU request layout, once per forward; no device readback."""
         self.plans = tuple(plans)
         self.decodes = tuple(p for p in self.plans if p.decode)
+        if _KVAF_LIFETCH_DIAG:
+            self._diag_epoch += 1
+            _LOGGER.warning(
+                "[LIFETCH_DIAG] SELECTOR_PREPARE selector_id=%s epoch=%s plans=%s "
+                "decodes=%s prepare_inputs=%s decode_counts=%s",
+                id(self),
+                self._diag_epoch,
+                len(self.plans),
+                len(self.decodes),
+                prepare_inputs,
+                tuple(p.stop - p.begin for p in self.decodes),
+            )
         if self.unique_active_owners:
             owners = [p.owner for p in self.decodes if p.stop > p.begin]
             if len(owners) != len(set(owners)):
@@ -101,12 +121,29 @@ class VllmIndexSelector:
             self.row_owners.copy_(self.inputs.row_owners)
 
     def __call__(self, query, weights, indexer, metadata, query_scale):
+        if _KVAF_LIFETCH_DIAG:
+            _LOGGER.warning(
+                "[LIFETCH_DIAG] SELECTOR_CALL selector_id=%s epoch=%s plans=%s "
+                "decodes=%s num_prefills=%s tokens=%s",
+                id(self),
+                self._diag_epoch,
+                len(self.plans or ()),
+                len(getattr(self, "decodes", ())),
+                getattr(metadata, "num_prefills", None),
+                weights.shape[0],
+            )
         if self.storage is not None:
             if self.plans and len(self.decodes) != len(self.plans):
                 self.storage.ingest_prefill(indexer.k_cache.kv_cache, metadata, self.plans, self.positions)
             else:
                 self.storage.ingest_decode(indexer.k_cache.kv_cache, metadata, self.inputs, self.row_owners)
         if self.plans and not self.decodes:
+            if _KVAF_LIFETCH_DIAG:
+                _LOGGER.warning(
+                    "[LIFETCH_DIAG] SELECTOR_NATIVE_PREFILL selector_id=%s epoch=%s",
+                    id(self),
+                    self._diag_epoch,
+                )
             return indexer.select_topk_native(query, weights, metadata, query_scale)
         self.inputs.pack(query, weights, query_scale)
         if self.tail_source is not None:
@@ -120,6 +157,17 @@ class VllmIndexSelector:
         # Index rows. No external gather/cast/mask or Q4 unpack is required.
         logical = self.update.logical_output[:token_count]
         self.attention_indices = self.update.slot_output[:token_count]
+        if _KVAF_LIFETCH_DIAG:
+            self._diag_published_epoch = self._diag_epoch
+            _LOGGER.warning(
+                "[LIFETCH_DIAG] SELECTOR_PUBLISH selector_id=%s epoch=%s "
+                "token_count=%s slot_shape=%s mixed=%s",
+                id(self),
+                self._diag_epoch,
+                token_count,
+                tuple(self.attention_indices.shape),
+                mixed,
+            )
         if not mixed:
             return logical
 
@@ -151,6 +199,17 @@ class VllmIndexSelector:
         return result
 
     def slots(self, token_count):
+        if _KVAF_LIFETCH_DIAG:
+            _LOGGER.warning(
+                "[LIFETCH_DIAG] SELECTOR_SLOTS selector_id=%s epoch=%s published_epoch=%s "
+                "requested=%s ready=%s slot_shape=%s",
+                id(self),
+                self._diag_epoch,
+                self._diag_published_epoch,
+                token_count,
+                self.attention_indices is not None,
+                tuple(self.attention_indices.shape) if self.attention_indices is not None else None,
+            )
         if self.attention_indices is None:
             raise RuntimeError("LIFetch selection must execute before SFA")
         if token_count > self.attention_indices.shape[0]:
