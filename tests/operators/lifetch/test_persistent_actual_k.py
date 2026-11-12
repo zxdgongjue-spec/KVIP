@@ -90,7 +90,7 @@ def test_state_oracle_rejects_boundary_ties():
     current = order.reshape(1, -1)
     with pytest.raises(ValueError, match="boundary_tie"):
         score_oracle_for_persistent_state(
-            scores, order, current, (2048,), 2048
+            scores, order, current, (4096,), 2048
         )
 
 
