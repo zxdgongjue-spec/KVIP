@@ -235,10 +235,14 @@ def run(args, run_dir):
         if fixture_info.get("actual_key_admission"):
             line += "\nP0_A2_ACTUAL_K=" + json.dumps(fixture_info["actual_key_admission"]["key_lengths"])
             line += (
-                "; scope=static_per_request_K; "
-                + ("dynamic_K_workspace_replay=PASS_index_kv_restored"
-                   if report.get("dynamic_k_transition_report")
-                   else "dynamic_K_workspace_replay=not_tested")
+                "; scope=per_request_actual_K; "
+                + (
+                    "dynamic_K_workspace_replay=PASS_long_short_long_reset"
+                    if report.get("dynamic_k_transition_report")
+                    else "dynamic_K_workspace_replay=PASS_persistent_growth_no_reset"
+                    if report.get("persistent_actual_k_report")
+                    else "dynamic_K_workspace_replay=not_tested"
+                )
             )
         native_reads = sum(report["native_misses_per_request"])
         line += f"\nactual_reads native: total={native_reads} unused=0 (final selected misses)"
