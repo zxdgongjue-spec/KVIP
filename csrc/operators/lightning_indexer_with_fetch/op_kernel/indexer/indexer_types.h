@@ -14,8 +14,17 @@
  */
 #ifndef QUANT_LIGHTNING_INDEXER_COMMON_H
 #define QUANT_LIGHTNING_INDEXER_COMMON_H
+// 0 preserves the historical 16-tile scale window; 8 selects the candidate.
+#ifndef KVIP_LI_SCALE_TILES
+#define KVIP_LI_SCALE_TILES 0
+#endif
+#if KVIP_LI_SCALE_TILES != 0 && KVIP_LI_SCALE_TILES != 8
+#error "KVIP_LI_SCALE_TILES must be 0 or 8"
+#endif
 using namespace AscendC;
 namespace QLICommon {
+constexpr uint32_t KScaleTiles = KVIP_LI_SCALE_TILES ? KVIP_LI_SCALE_TILES : 16;
+
 
 // 与tiling的layout保持一致
 enum class LI_LAYOUT : uint32_t {

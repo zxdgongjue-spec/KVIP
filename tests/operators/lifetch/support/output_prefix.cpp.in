@@ -1,0 +1,111 @@
+// CPU API model for exact source bodies; not an NPU scheduler/cache model.
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cstring>
+#include <iostream>
+#include <limits>
+#include <map>
+#include <random>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <vector>
+#define __gm__
+#define __ubuf__
+#define __aicore__
+#define __simt_vf__
+#define __simt_callee__
+#define LAUNCH_BOUND(x)
+constexpr uint32_t kCandidates=2048,kThreads=512;
+struct {uint32_t x=0;} threadIdx;
+void require(bool okay,const std::string& text){if(!okay)throw std::runtime_error(text);}
+enum class HardEvent {MTE2_V,V_MTE3,MTE3_S,S_V};
+using TEventID=uint32_t;
+using Event=std::pair<HardEvent,TEventID>;
+struct PendingCopy {void* dst;const void* src;size_t bytes;uint64_t issue;};
+struct State {
+  std::vector<PendingCopy> mte2,mte3;
+  std::map<Event,uint64_t> flags;
+  std::set<Event> allocated;
+  bool scalarDirty=false,vectorReady=false;
+  uint64_t issued=0,mte2Bytes=0,mte3Bytes=0,vfs=0,logicalReads=0,overlaps=0;
+  uintptr_t logicalBegin=0,logicalEnd=0;
+} state;
+bool overlap(const void* a,size_t n,const void* b,size_t m){auto x=reinterpret_cast<uintptr_t>(a),y=reinterpret_cast<uintptr_t>(b);return x<y+m&&y<x+n;}
+void assertReusable(void* dst,size_t n){
+  for(auto c:state.mte3)require(!overlap(dst,n,c.src,c.bytes),"UB overwritten while output DMA reads it");
+}
+struct Pipe {
+  template<HardEvent E>TEventID AllocEventID(){
+    for(TEventID id=2;id<10;++id)if(state.allocated.emplace(E,id).second)return id;
+    throw std::runtime_error("event pool exhausted");
+  }
+  template<HardEvent E>void ReleaseEventID(TEventID id){
+    require(!state.flags.count({E,id}),"event released before wait/drain");
+    require(state.allocated.erase({E,id})==1,"event lease missing");
+  }
+} pipeModel;
+Pipe* GetTPipePtr(){return &pipeModel;}
+template<HardEvent E>void SetFlag(TEventID id){
+  require(state.allocated.count({E,id}),"unallocated event");
+  require(state.flags.emplace(Event{E,id},state.issued).second,"event set twice");
+}
+template<HardEvent E>void WaitFlag(TEventID id){
+  auto i=state.flags.find({E,id});require(i!=state.flags.end(),"wait without matching event ID");
+  auto watermark=i->second;state.flags.erase(i);
+  auto flush=[&](std::vector<PendingCopy>& queue,bool input){
+    auto out=queue.begin();
+    for(auto c:queue){
+      if(c.issue<=watermark){if(input)assertReusable(c.dst,c.bytes);std::memcpy(c.dst,c.src,c.bytes);}
+      else *out++=c;
+    }
+    queue.erase(out,queue.end());
+  };
+  if constexpr(E==HardEvent::MTE2_V)flush(state.mte2,true);
+  else if constexpr(E==HardEvent::MTE3_S)flush(state.mte3,false);
+  else if constexpr(E==HardEvent::V_MTE3){
+    require(state.mte2.empty(),"output published before input completed");state.vectorReady=true;
+  }
+}
+template<class T>struct LocalTensor{
+  T* data;size_t count;
+  LocalTensor operator[](size_t i)const{require(i<=count,"UB offset");return {data+i,count-i};}
+  template<class U>LocalTensor<U> ReinterpretCast()const{return {reinterpret_cast<U*>(data),count*sizeof(T)/sizeof(U)};}
+  uintptr_t GetPhyAddr()const{return reinterpret_cast<uintptr_t>(data);}
+};
+template<class T>struct GlobalTensor{
+  T* data=nullptr;void SetGlobalBuffer(T* p){data=p;}
+  GlobalTensor operator[](size_t i)const{return {data+i};}
+};
+template<class T>void DataCopy(LocalTensor<T> dst,GlobalTensor<T> src,uint32_t n){
+  require(n<=dst.count,"MTE2 UB bounds");assertReusable(dst.data,n*sizeof(T));
+  if(!state.mte3.empty())++state.overlaps;
+  state.mte2.push_back({dst.data,src.data,n*sizeof(T),++state.issued});state.mte2Bytes+=n*sizeof(T);state.vectorReady=false;
+}
+template<class T>void DataCopy(GlobalTensor<T> dst,LocalTensor<T> src,uint32_t n){
+  require(n<=src.count,"MTE3 UB bounds");require(state.vectorReady,"MTE3 missing handoff");
+  state.mte3.push_back({dst.data,src.data,n*sizeof(T),++state.issued});state.mte3Bytes+=n*sizeof(T);
+}
+template<class T>void Duplicate(LocalTensor<T> dst,T value,uint32_t n){
+  require(n<=dst.count,"Duplicate UB bounds");assertReusable(dst.data,n*sizeof(T));
+  std::fill_n(dst.data,n,value);state.vectorReady=false;
+}
+template<class T>T asc_ldcg(T* p){auto a=reinterpret_cast<uintptr_t>(p);
+  if(a>=state.logicalBegin&&a<state.logicalEnd)++state.logicalReads;return *p;}
+template<class T>void asc_stcg(T* p,T v){*p=v;}
+inline uint32_t asc_atomic_cas(uint32_t* p,uint32_t old,uint32_t value){auto prior=*p;if(prior==old)*p=value;return prior;}
+inline void asc_atomic_or(uint32_t* p,uint32_t value){*p|=value;}
+inline void asc_syncthreads(){}
+inline void asc_threadfence(){}
+inline uint32_t asc_shfl_up(uint32_t v,uint32_t){return v;}
+#include "index_cache_update.h"
+namespace Simt{
+struct Dim3{uint32_t x,y,z;};
+template<auto Fn>void VF_CALL(Dim3 dim,int64_t* logical,int32_t* topk,int32_t* ids){
+  require(state.mte2.empty(),"VF before MTE2 wait");assertReusable(ids,2048*sizeof(int32_t));
+  require(dim.x==512,"wrong gather lanes");
+  ++state.vfs;for(uint32_t tid=0;tid<dim.x;++tid){threadIdx.x=tid;Fn(logical,topk,ids);}state.vectorReady=false;
+}
+}
+// @ACTUAL_PUBLISHERS@
