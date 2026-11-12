@@ -660,7 +660,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()
             CalcS2LoopParams(bN2LoopIdx, gS1LoopIdx);
             uint32_t kScaleLoop = 0;
             for (int s2LoopIdx = splitCoreInfo.s2Start; s2LoopIdx <= tempLoopInfo.s2LoopEnd; s2LoopIdx++) {
-                if ((s2LoopIdx - splitCoreInfo.s2Start) % 16 == 0) {
+                if ((s2LoopIdx - splitCoreInfo.s2Start) % QLICommon::KScaleTiles == 0) {
                     ++kScaleLoop;
                 }
                 ProcessBaseBlock(gloop, s2LoopIdx, runInfo, qScaleLoop, kScaleLoop);
