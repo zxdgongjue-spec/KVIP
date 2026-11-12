@@ -113,6 +113,7 @@ def run(args, run_dir):
                 SOC_VERSION=args.soc,
                 ASCEND_CANN_PACKAGE_PATH=args.cann,
                 KVAF_INCLUDE=find_headers(args.kvaf_root),
+                V9_INTERMEDIATE_PROFILING=int(getattr(args, "epoch_audit_profile", False)),
             )
             if not shared_build.exists():
                 command(
@@ -233,6 +234,7 @@ def run_v9_li_varlen_only(
     """Exercise only v9_init + v9_li + v9_wait with per-request Q/K lengths."""
     from kvip.adapters.vllm.inputs import QueryInputs
     from stage_diagnostics import record_stage, run_synchronized_stage
+    from epoch_audit import audit_rotation_events, format_rotation_table
 
     history, resident = args.history, args.resident
     stage_log = Path(folder) / "li-varlen-stage.jsonl"
@@ -438,21 +440,42 @@ def run_v9_li_varlen_only(
 
         skipped_lanes = 0
         completed_lanes = 0
+        epoch_audit_filename = None
+        epoch_observed_candidates = None
+        epoch_selected_for_post = None
         if args.prefetch_tokens:
-            # Event is 128 bytes: begin/end(uint64), core/epoch/complete/skipped
-            # (uint32). Each epoch owns service_lanes independent AIV views.
-            epoch_words = (
-                rotating.events.cpu().numpy().view(np.uint32)
-                .reshape(rotating.rounds, rotating.service_lanes, 32)
+            shape = rotating.runtime_shape
+            audit = audit_rotation_events(
+                rotating.events.cpu().numpy(),
+                batch=int(shape.batch),
+                split_q=int(shape.splitQ),
+                li_cores=int(shape.liCores),
+                rounds=int(shape.rounds),
+                service_aics=int(shape.serviceAics),
+                service_lanes=int(shape.serviceLanes),
+                history=int(shape.history),
+                resident=int(shape.resident),
+                profiling_enabled=bool(getattr(args, "epoch_audit_profile", False)),
             )
-            completion = epoch_words[:, :, 6]
-            skipped = epoch_words[:, :, 7]
-            if not np.all(completion == 1) or not np.all((skipped == 0) | (skipped == 1)):
+            audit["scenario"] = scenario["name"]
+            audit["binary_event_profiling"] = bool(getattr(args, "epoch_audit_profile", False))
+            epoch_audit_filename = f"epoch-audit-{scenario['name']}.json"
+            (Path(folder) / epoch_audit_filename).write_text(
+                json.dumps(audit, indent=2) + "\\n"
+            )
+            (Path(folder) / f"epoch-audit-{scenario['name']}.txt").write_text(
+                format_rotation_table(audit)
+            )
+            if audit["errors"]:
                 raise AssertionError(
-                    f"{scenario['name']}: nonzero prefetch left an incomplete/invalid epoch"
+                    f"{scenario['name']}: Rotation Event audit failed; "
+                    f"see {epoch_audit_filename}: {audit['errors'][:3]}"
                 )
-            completed_lanes = int(completion.size)
-            skipped_lanes = int(np.count_nonzero(skipped))
+            summary = audit["summary"]
+            completed_lanes = summary["complete_lanes"]
+            skipped_lanes = summary["skipped_lanes"]
+            epoch_observed_candidates = summary["candidate_count_observed"]
+            epoch_selected_for_post = summary["selected_for_post_count_observed"]
             record_stage(
                 stage_log,
                 scenario["name"],
@@ -462,6 +485,10 @@ def run_v9_li_varlen_only(
                 skipped_lanes=skipped_lanes,
                 rounds=rotating.rounds,
                 service_lanes=rotating.service_lanes,
+                profiling_enabled=bool(getattr(args, "epoch_audit_profile", False)),
+                candidate_count_observed=epoch_observed_candidates,
+                selected_for_post_count_observed=epoch_selected_for_post,
+                audit_file=epoch_audit_filename,
             )
         record_stage(
             stage_log,
@@ -518,6 +545,9 @@ def run_v9_li_varlen_only(
             length_buffers_stable=True,
             epoch_completed_lanes=completed_lanes,
             epoch_skipped_lanes=skipped_lanes,
+            epoch_audit_file=epoch_audit_filename,
+            epoch_candidate_count_observed=epoch_observed_candidates,
+            epoch_selected_for_post_count_observed=epoch_selected_for_post,
         )
         summaries.append(
             {
@@ -530,6 +560,9 @@ def run_v9_li_varlen_only(
                 "prefetch_cq": "PASS",
                 "epoch_completed_lanes": completed_lanes,
                 "epoch_skipped_lanes": skipped_lanes,
+                "epoch_audit_file": epoch_audit_filename,
+                "epoch_candidate_count_observed": epoch_observed_candidates,
+                "epoch_selected_for_post_count_observed": epoch_selected_for_post,
                 "result": "PASS",
             }
         )
@@ -543,6 +576,7 @@ def run_v9_li_varlen_only(
         "index_heads": args.index_heads,
         "topk": 2048,
         "prefetch_limit": args.prefetch_tokens,
+        "epoch_event_profiling": bool(getattr(args, "epoch_audit_profile", False)),
         "length_buffers_stable": True,
         "rounds": summaries,
         "executed_stages": ["v9_init", "v9_li", "v9_wait"],

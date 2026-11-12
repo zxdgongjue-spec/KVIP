@@ -42,6 +42,8 @@ def arguments(argv=None):
     p.add_argument("--comparison-sfa", type=Path)
     p.add_argument("--li-only-varlen", action="store_true",
                    help="run only custom v9 LI with two mixed-length forwards; requires the URMA test fixture")
+    p.add_argument("--epoch-audit-profile", action="store_true",
+                   help="enable test-only V9 Event candidate/selected counters for nonzero-prefetch LI varlen")
     p.add_argument("--output", type=Path, default=ROOT / "tests/results/lifetch")
     a = p.parse_args(argv)
     if a.kvaf_root is None:
@@ -61,6 +63,8 @@ def arguments(argv=None):
         p.error("windows must be 1..32")
     if not 0 <= a.prefetch_tokens <= 2048 or a.prefetch_tokens % a.intermediate_fetches:
         p.error("prefetch tokens must be 0..2048 and divisible by windows")
+    if a.epoch_audit_profile and (not a.li_only_varlen or a.prefetch_tokens != 64):
+        p.error("--epoch-audit-profile requires --li-only-varlen and --prefetch-tokens 64")
     if a.li_only_varlen and (
         batches != [4] or a.history != 8192 or a.resident != 2048 or a.index_heads != 32
         or a.miss_percent != 0 or a.prefetch_tokens not in (0, 64) or a.runtime_shapes
@@ -166,6 +170,8 @@ def main(argv=None):
     p.add_argument('--comparison-sfa', type=Path)
     p.add_argument('--li-only-varlen', action='store_true',
                    help='run only custom v9 LI with two mixed-length forwards')
+    p.add_argument('--epoch-audit-profile', action='store_true',
+                   help='enable test-only candidate/selected counters for nonzero-prefetch varlen')
     p.add_argument('--output', type=Path, default=ROOT / 'tests/results/lifetch')
     p.add_argument('--timeout-seconds', type=int, default=1800)
     a = p.parse_args(argv)
@@ -182,6 +188,8 @@ def main(argv=None):
         p.error('invalid geometry, prefetch budget, timing or timeout')
     if (a.comparison_output or a.comparison_sfa) and (len(batches) != 1 or a.runtime_shapes):
         p.error('comparison snapshots require one batch and no runtime-shapes')
+    if a.epoch_audit_profile and (not a.li_only_varlen or a.prefetch_tokens != 64):
+        p.error('--epoch-audit-profile requires --li-only-varlen and --prefetch-tokens 64')
     if a.li_only_varlen and (
         a.transport != 'urma' or batches != [4] or a.history != 8192 or a.resident != 2048
         or a.index_heads != 32 or a.miss_percent != 0 or a.prefetch_tokens not in (0, 64)
@@ -200,6 +208,8 @@ def main(argv=None):
               '--iterations', str(a.iterations)]
     if a.li_only_varlen:
         common.append('--li-only-varlen')
+    if a.epoch_audit_profile:
+        common.append('--epoch-audit-profile')
     if a.transport == 'urma':
         command = [sys.executable, '-u', str(Path(__file__).resolve()), '--internal-urma', *common,
                    '--kvaf-root', str(kvaf_root), '--cann', a.cann, '--batches', a.batches,
