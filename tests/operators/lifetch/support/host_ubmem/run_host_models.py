@@ -11,6 +11,8 @@ tests = Path(__file__).resolve().parent
 compiler = os.environ.get("CXX", "c++")
 common = {
     "SIM_HISTORY": 33024,
+    "KVIP_STREAMING_UBMEM": 1,
+    "KVIP_OUTPUT_WORKER": 1,
     "SIM_RESIDENT": 8192,
     "INDEX_HEADS": 64,
     "SIM_Q": 4,

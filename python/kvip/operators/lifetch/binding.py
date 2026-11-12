@@ -9,7 +9,6 @@ from kvip.operators.lifetch.geometry import final_aivs, li_geometry, prefetch_bu
 from kvip.operators.lifetch.tiling import RuntimeShape
 from kvip.operators.lifetch.workspace import rotation_spec
 
-
 class LIFetchBinding:
     def __init__(
         self,
@@ -40,6 +39,8 @@ class LIFetchBinding:
     ):
         if resident > 131072:
             raise ValueError("LIFetch hot bitmap supports resident <= 131072")
+        if not 1 <= batch <= 16:
+            raise ValueError(f"LIFetch supports BS1..16; received BS={batch}; no legacy fallback")
         self.torch, self.owner = torch, owner
         self.library = load_lifetch_library(library)
         self.device = arguments[0].device
@@ -90,11 +91,12 @@ class LIFetchBinding:
             if fn(self.shape_pointer) != expected:
                 raise ValueError(f"V9 binary contract mismatch: {name}")
         prefetch_limit, window_limit = prefetch_budget(prefetch_limit, window_limit, intermediate_fetches)
+        self.prefetch_limit = prefetch_limit
         geometry = li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)
         if geometry["logical_aic_tasks"] > aic_count or not geometry["intermediate_fetches"]:
             raise ValueError("Direct hot-first mode requires a window and concurrently resident LI tasks")
         contexts = owner.build_device_args(library)
-        required_queues = batch * (final_aivs(batch, li_tiling, aic_count, final_workers) + 1)
+        required_queues = max(batch * (final_aivs(batch, li_tiling, aic_count, final_workers) + 1), 2 * batch + 16)
         if contexts.shape[0] < required_queues:
             raise ValueError("V9 requires exclusive prefetch and per-final-AIV queues")
         self.rounds = li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)[
@@ -212,7 +214,7 @@ class LIFetchBinding:
         self.arguments = tuple(arguments) + (self.context,)
         self.bindings = torch.tensor([x.data_ptr() for x in self.arguments], dtype=torch.uint64, device=self.device)
         self.functions = {}
-        for name in ("init", "li", "wait", "resolve", "fetch", "probe"):
+        for name in ("init", "li"):
             fn = getattr(self.library, "v9_" + name)
             fn.argtypes, fn.restype = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p], ctypes.c_uint32
             self.functions[name] = fn
@@ -239,21 +241,3 @@ class LIFetchBinding:
         result = self.functions[name](self.bindings.data_ptr(), stream.npu_stream, self.shape_pointer)
         if result:
             raise RuntimeError(f"v9_{name}_launch_failed:{result}")
-
-    def launch_compute(self):
-        self._call("init")
-        self._call("li")
-
-    def wait(self):
-        self._call("wait")
-
-    def launch_final_submit(self):
-        self._call("resolve")
-
-    def finish(self):
-        self._call("fetch")
-
-    def launch(self):
-        self.launch_compute()
-        self.launch_final_submit()
-        self.finish()

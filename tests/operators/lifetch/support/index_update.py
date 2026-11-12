@@ -7,20 +7,6 @@ from kvip.operators.lifetch.index_update import DirectIndexUpdate
 import numpy as np
 
 
-def permutation_records(lru, changes, history):
-    """CPU oracle only: snapshot source rows before applying the permutation."""
-    active = [(int(dst), int(src)) for dst, src in zip(lru, changes) if src >= 0]
-    destinations = {dst for dst, _ in active}
-    sources = {src for _, src in active}
-    if len(destinations) != len(active) or len(sources) != len(active):
-        raise ValueError("Producer changes must have unique sources and destinations")
-    if any(not 0 <= x < history for pair in active for x in pair):
-        raise ValueError("Producer change outside Index storage")
-    outgoing = [dst for dst, _ in active if dst not in sources]
-    freed = [src for _, src in active if src not in destinations]
-    return active + list(zip(freed, outgoing))
-
-
 class DirectCacheUpdate(DirectIndexUpdate):
     def __init__(
         self,
@@ -33,7 +19,6 @@ class DirectCacheUpdate(DirectIndexUpdate):
         history,
         hot,
         *,
-        library,
         topk,
         locations,
         rotating,
@@ -60,8 +45,7 @@ class DirectCacheUpdate(DirectIndexUpdate):
         self.output_valid = torch.ones(batch * 4, dtype=torch.int64, device=self.device)
         super().__init__(
             torch,
-            library,
-            keys=keys.view(batch, history, 128),
+                keys=keys.view(batch, history, 128),
             scales=scales.view(batch, history),
             addresses=addresses,
             logical_ids=self.logical,
@@ -83,9 +67,6 @@ class DirectCacheUpdate(DirectIndexUpdate):
             reserved[row, slots] = np.arange(2048, dtype=np.int32)
         self.rotating.lru_slots.copy_(self.torch.from_numpy(candidates))
         self.rotating.reserved_hot.copy_(self.torch.from_numpy(reserved))
-
-    def __call__(self, topk=None, locations=None):
-        super().__call__()
 
     def check_capacity(self):
         status = self.status.cpu().tolist()

@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bind producer change records to stable service-owned Index rows."""
 
-import ctypes
-
-from kvip.operators.lifetch.workspace import WORK_WORDS, device_words
+from kvip.operators.lifetch.workspace import device_words
 
 
 def _update_pointers(keys, scales, addresses, logical_ids, row_owners, rotating, status, plan,
@@ -16,13 +14,13 @@ def _update_pointers(keys, scales, addresses, logical_ids, row_owners, rotating,
               addresses.stride(0), rotating.rows.data_ptr(), row_owners.data_ptr(),
               rotating.row_status.data_ptr(), rotating.final_posts.data_ptr(),
               prefetch_status.data_ptr(), final_status.data_ptr(), rotating.final_workers, status_size,
-              rotating.hot_valid.data_ptr(), plan.data_ptr()]
+              rotating.hot_valid.data_ptr(), 0 if plan is None else plan.data_ptr()]
     if query_inputs is not None:
         values.extend([rotating.arguments[9].data_ptr(), rotating.locations.data_ptr(),
                        query_inputs.unpack_indices.data_ptr(), query_inputs.output_valid.data_ptr(),
                        logical.data_ptr(), slots.data_ptr()])
     values.extend([0] * (24 - len(values)))
-    values.extend([history, resident, rotating.change_count.data_ptr(), work.data_ptr()])
+    values.extend([history, resident, rotating.change_count.data_ptr(), 0 if work is None else work.data_ptr()])
     return values
 
 
@@ -30,7 +28,6 @@ class DirectIndexUpdate:
     def __init__(
         self,
         torch,
-        library,
         *,
         keys,
         scales,
@@ -44,8 +41,8 @@ class DirectIndexUpdate:
     ):
         self.torch, self.device = torch, keys.device
         self.batch = row_owners.numel()
-        if not 1 <= self.batch <= 32:
-            raise ValueError("LIFetch update requires 1..32 active rows")
+        if not 1 <= self.batch <= 16:
+            raise ValueError("LIFetch update requires 1..16 active rows")
         self.storage = keys, scales, addresses, logical_ids, row_owners, rotating
         if any(t.device != self.device for t in self.storage[:-1]) or any(
             not t.is_contiguous() for t in (keys, scales, logical_ids, row_owners)
@@ -75,11 +72,6 @@ class DirectIndexUpdate:
                 or tuple(tensor.shape) != shape
             ):
                 raise ValueError(f"LIFetch producer {name} must be contiguous int32 with shape {shape}")
-        self.library = ctypes.CDLL(str(library))
-        version = self.library.kvop_direct_update_abi_version
-        version.argtypes, version.restype = [], ctypes.c_uint32
-        if version() != 3:
-            raise ValueError("Index update requires hot-only ABI 3")
         self.status = torch.zeros(self.batch, dtype=torch.int32, device=self.device) if status is None else status
         if (
             self.status.device != self.device
@@ -88,12 +80,7 @@ class DirectIndexUpdate:
             or not self.status.is_contiguous()
         ):
             raise ValueError("Index update status must be contiguous int32 [batch] on the cache device")
-        plan_words = self.library.kvop_direct_update_plan_words
-        plan_words.argtypes, plan_words.restype = [], ctypes.c_uint32
-        self.plan_buffer = torch.zeros((self.batch, plan_words()), dtype=torch.int32, device=self.device)
-        work_words = self.library.kvop_direct_update_work_words
-        work_words.argtypes, work_words.restype = [], ctypes.c_uint32
-        self.work_buffer = torch.empty((self.batch, work_words()), dtype=torch.int32, device=self.device)
+        self.plan_buffer = self.work_buffer = None  # Reserved ABI fields; no old planner workspace.
         self.logical_output = self.slot_output = None
         if query_inputs is not None:
             if outputs is None:
@@ -113,32 +100,6 @@ class DirectIndexUpdate:
             keys.shape[1], rotating.hot_valid.shape[1],
         )
         self.bindings = torch.tensor(pointers, dtype=torch.int64, device=self.device)
-        self.launch = (
-            self.library.kvop_direct_update_owned if query_inputs is None else self.library.kvop_direct_update_outputs
-        )
-        self.launch.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p]
-        self.launch.restype = ctypes.c_uint32
-
-    def __call__(self):
-        result = self.launch(
-            self.batch, self.bindings.data_ptr(), self.torch.npu.current_stream(self.device).npu_stream
-        )
-        if result:
-            raise RuntimeError(f"LIFetch Index update launch failed: {result}")
-
-    def _stage(self, name):
-        function = getattr(self.library, name)
-        function.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p]
-        function.restype = ctypes.c_uint32
-        result = function(self.batch, self.bindings.data_ptr(), self.torch.npu.current_stream(self.device).npu_stream)
-        if result:
-            raise RuntimeError(f"Index update {name} failed: {result}")
-
-    def plan(self):
-        self._stage("kvop_direct_plan_outputs")
-
-    def apply(self):
-        self._stage("kvop_direct_apply_owned")
 
 
 class UbmemIndexUpdate:
@@ -155,8 +116,6 @@ class UbmemIndexUpdate:
         status,
         query_inputs,
         outputs,
-        plan_buffer=None,
-        extended_work=None,
     ):
         self.torch, self.device, self.library = torch, keys.device, rotating.library
         batch, history = rotating.shape.batch, rotating.shape.history
@@ -178,27 +137,7 @@ class UbmemIndexUpdate:
                 raise ValueError(f"UBmem Index {name} must be contiguous {dtype} with shape {shape}")
         if keys.ndim != 3 or keys.shape[1:] != (history, 128) or keys.element_size() != 1 or not keys.is_contiguous():
             raise ValueError("UBmem Index keys must be contiguous bytes [owner, history, 128]")
-        words = self.library.kvip_ubmem_plan_words
-        words.argtypes, words.restype = [], ctypes.c_uint32
-        self.plan_buffer = (
-            torch.zeros((batch, words()), dtype=torch.int32, device=self.device) if plan_buffer is None else plan_buffer
-        )
-        self.extended_work = (
-            torch.empty((batch, WORK_WORDS), dtype=torch.int32, device=self.device)
-            if extended_work is None
-            else extended_work
-        )
-        for name, tensor, shape in (
-            ("plan_buffer", self.plan_buffer, (batch, words())),
-            ("extended_work", self.extended_work, (batch, WORK_WORDS)),
-        ):
-            if (
-                tensor.device != self.device
-                or tensor.dtype != torch.int32
-                or tuple(tensor.shape) != shape
-                or not tensor.is_contiguous()
-            ):
-                raise ValueError(f"UBmem Index {name} must be contiguous int32 with shape {shape}")
+        self.plan_buffer = self.extended_work = None
         self.status = status
         self.logical_output, self.slot_output = outputs.unbind(0)
         pointers = _update_pointers(

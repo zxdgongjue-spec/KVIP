@@ -1,4 +1,9 @@
 #pragma once
+#if V9_UBMEM
+#include "../../lightning_indexer_with_fetch_ubmem/op_kernel/controller/prefetch.h"
+namespace kvaf_device { using ubmem_device::CleanCacheLines; constexpr uint32_t kInvalidArgs=0x20000, kCqTimeout=0x40000; }
+#else
+#pragma once
 
 // Imported from rotation_device.h
 
@@ -577,7 +582,9 @@ inline void PrepareCandidateWqes(uint32_t rt_resident,__ubuf__ uint32_t* ids,__u
 // Same indexed-load pattern as v9 GatherCandidateMap; cold IDs pass through.
 
 __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer,uint32_t epoch,uint32_t core,uint32_t lane,
-    LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids) {
+    LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids,
+    uint32_t sequenceHalfWindow,bool captureIo) {
+    uint64_t firstDoorbell=0,lastDoorbell=0;
     auto ctx=reinterpret_cast<__gm__ Context*>(pointer);auto events=reinterpret_cast<__gm__ Event*>(ctx->events);
     auto event=events+epoch*rt_serviceLanes+lane;event->core=core;event->epoch=epoch;V9_FETCH_PROFILE(event->waitBegin=GetSystemCycle();)
     if(epoch) {
@@ -585,16 +592,22 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
         do { kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(events+(epoch-1)*rt_serviceLanes+lane),64); }
         while(!previous->complete);
     }
+    GlobalTensor<uint32_t> progressGm;
+    progressGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress));
+    auto work=flags.ReinterpretCast<uint32_t>();
+    const uint32_t windowEnd=sequenceHalfWindow?SequenceWindowEnd(rt_history,rt_resident,sequenceHalfWindow,epoch):
+        Trigger(rt_history,rt_resident,rt_rounds,epoch)*128;
+    // Each shard publishes an independent ready boundary. Snapshot whatever
+    // has completed; the final resolver repairs selected tokens that were not
+    // prefetched. Waiting for another shard here can stall its producer.
     V9_FETCH_PROFILE(event->begin=GetSystemCycle();)
     uint64_t postedCount=0; // Business state: controls batched WQE submission.
     V9_FETCH_PROFILE(uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0;)
-    auto work=flags.ReinterpretCast<uint32_t>();auto cfg=work[4096];
+    auto cfg=work[4096];
     auto rowStorage=ids;
     if(rt_batchedRows)ids=scratch[23808/4];
     // Freeze every ready snapshot before doing any batch work. Cap to the
     // scheduled boundary so slow service cannot chase newly produced history.
-    GlobalTensor<uint32_t> progressGm;
-    progressGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress));
     if(lane<rt_batch) {
         DataCopyExtParams gather;gather.blockCount=(rt_batch-lane+rt_serviceLanes-1)/rt_serviceLanes;
         gather.blockLen=4*sizeof(Progress);gather.srcStride=(rt_serviceLanes-1)*4*sizeof(Progress);gather.dstStride=0;
@@ -603,12 +616,21 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
         DataCopyPad(work,progressGm[lane*128],gather,padding);
         SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
         for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes)for(uint32_t q=0;q<4;++q) {
-            uint32_t end=work.GetValue((b/rt_serviceLanes)*128+q*32),cap=Trigger(rt_history,rt_resident,rt_rounds,epoch)*128;
+            uint32_t progress=(b/rt_serviceLanes)*128+q*32;
+            uint32_t end=work.GetValue(progress),cap=windowEnd;
             if(ctx->queryEnds) {
                 auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds);
                 uint32_t valid=bounds[b*4+q];
                 if(ctx->lruSlots && valid<rt_resident)valid=rt_resident;
                 if(cap>valid)cap=valid;
+            }
+            if(sequenceHalfWindow) {
+                // A separate hot phase has already published the hot bitmap.
+                if(end<rt_resident)end=rt_resident;
+                uint32_t high=work.GetValue(progress+16);
+                // Split-Q geometry limits the batch to 16, leaving this band
+                // disjoint from both the low snapshot and batched post input.
+                cfg.SetValue(192+b*4+q,high<cap?high:cap);
             }
             cfg.SetValue(128+b*4+q,end<cap?end:cap);
         }
@@ -642,18 +664,10 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         const uint64_t entityAddress=state64.GetValue(0),queueAddress=state64.GetValue(1);
         const uint64_t addresses=state64.GetValue(2),output=state64.GetValue(3);
         const uint32_t lower=ctx->lruSlots?0:rt_resident;
-        uint32_t end[4],first=rt_history,last=lower;
-        for(uint32_t q=0;q<4;++q) {
-            uint32_t saved=cfg.GetValue(128+b*4+q);
-            end[q]=saved>state.GetValue(12+q)?saved:state.GetValue(12+q);
-            uint32_t lo=state.GetValue(12+q)>lower?state.GetValue(12+q):lower;
-            if(lo<first)first=lo;if(end[q]>last)last=end[q];
-        }
-        V9_FETCH_PROFILE(uint64_t scanBegin=GetSystemCycle();)
 #define KV_WINDOW_HISTORY rt_history
 #define KV_WINDOW_RESIDENT rt_resident
 #define KV_WINDOW_SCAN_TOKENS rt_scanTokens
-#include "../../common/lifetch/window_candidates.h"
+#include "../../common/lifetch/sequence_candidates.h"
 #undef KV_WINDOW_HISTORY
 #undef KV_WINDOW_RESIDENT
 #undef KV_WINDOW_SCAN_TOKENS
@@ -704,8 +718,10 @@ if (rt_batchedRows) {
                         reinterpret_cast<__ubuf__ uint32_t*>(work[512].GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work[1024].GetPhyAddr()),
                         map,reinterpret_cast<__gm__ uint64_t*>(addresses),count,rt_resident+slots,ctx,b);
                     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+                    if(captureIo && !firstDoorbell)firstDoorbell=GetSystemCycle();
                     if(SubmitWqesAt(rt_tokenBytes,entityAddress,queueAddress,output,work[1024],scratch,work,work[512],cfg,count,256,false,nullptr,pending))++pending;
                     else state.SetValue(11,kvaf_device::kInvalidArgs);
+                    if(captureIo)lastDoorbell=GetSystemCycle();
                     slots+=count;requests+=count;
                 }
 }
@@ -717,9 +733,14 @@ if (rt_batchedRows) {
         state.SetValue(10,state.GetValue(10)+missing-count);
         state.SetValue(8,slots);state.SetValue(9,requests);state.SetValue(211,pending);
         for(uint32_t q=0;q<4;++q) {
-            uint32_t processed=end[q]<stop?end[q]:stop;
-            if(processed<state.GetValue(12+q))processed=state.GetValue(12+q);
-            state.SetValue(80+epoch*4+q,processed);state.SetValue(12+q,processed);
+            uint32_t processed=end[0][q]<stop?end[0][q]:stop;
+            if(processed<consumed[0][q])processed=consumed[0][q];
+            state.SetValue(12+q,processed);
+            if(sequenceHalfWindow) {
+                processed=end[1][q]<stop?end[1][q]:stop;
+                if(processed<consumed[1][q])processed=consumed[1][q];
+            }
+            state.SetValue(80+epoch*4+q,processed);
         }
         if(!rt_batchedRows) {
             SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
@@ -783,18 +804,21 @@ if (rt_batchedRows) {
         for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
             auto input=cfg[256+(b/rt_serviceLanes)*80];if(!input.GetValue(64))continue;
             auto in64=input.ReinterpretCast<uint64_t>();uint64_t db=in64.GetValue(8),head=in64.GetValue(25);
+            if(captureIo && !firstDoorbell)firstDoorbell=GetSystemCycle();
 #if V9_SIMULATION
             *reinterpret_cast<__gm__ uint64_t*>(db)=head;
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(db),64);
 #else
             st_dev(uint32_t(head),reinterpret_cast<__gm__ uint32_t*>(db),0);
 #endif
+            if(captureIo)lastDoorbell=GetSystemCycle();
         }
         V9_FETCH_PROFILE(postTicks+=GetSystemCycle()-begin;)
     }
 }
     V9_FETCH_PROFILE(event->scanTicks=scanTicks;event->candidateTicks=candidateTicks;event->postTicks=postTicks;)
     V9_FETCH_PROFILE(event->bitmapBytes=bitmapBytes;event->candidateCount=totalCandidates;event->postedCount=postedCount;)
+    if(captureIo){auto stamp=reinterpret_cast<__gm__ uint64_t*>(event->pad);stamp[0]=firstDoorbell;stamp[1]=lastDoorbell;}
     V9_FETCH_PROFILE(event->end=GetSystemCycle();)event->complete=1;
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event),V9_INTERMEDIATE_PROFILING?sizeof(Event):64);
 }
@@ -803,7 +827,9 @@ if (rt_batchedRows) {
 namespace rotating {
 __aicore__ inline void Service(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_splitQ,uint32_t rt_rounds,uint32_t rt_serviceAics,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer, uint32_t epoch, uint32_t core,
     uint32_t lane, LocalTensor<uint32_t> scratch, LocalTensor<uint16_t> flags,
-    LocalTensor<uint32_t> indices) {
-    FastService(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices);
+    LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow = 0,bool captureIo = false) {
+    FastService(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow,captureIo);
 }
 }
+
+#endif

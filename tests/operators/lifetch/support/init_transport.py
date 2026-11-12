@@ -53,7 +53,7 @@ def main(transport, argv=None):
         output = torch.zeros((128, 656), dtype=torch.uint8, device=device)
         if transport == 'urma':
             cann, headers = kvaf_build_paths(build)
-            library, _ = build_libraries(cache_dir=build / 'lifetch', cann=cann, headers=headers,
+            (library,) = build_libraries(cache_dir=build / 'lifetch', cann=cann, headers=headers,
                                          soc=args.soc or acl.get_soc_name())
             lease = KvafGetLease(torch, runtime, library, output, stream)
         else:

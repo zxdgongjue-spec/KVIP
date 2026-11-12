@@ -85,6 +85,9 @@ def check_shape(
     comparison_sfa=None,
     trace_rounds=0,
     trace_output=None,
+    optimized=False,
+    q_workers=2,
+    fetch_mode="overlap",
 ):
     batch, history, resident, token_bytes = shape.batch, shape.history, shape.resident, shape.token_bytes
     fixture = controlled_fixture(history, resident, shape.heads, miss_percent)
@@ -179,7 +182,11 @@ def check_shape(
         )
         if actual_triggers != expected_triggers:
             raise AssertionError(f"UBmem/URMA prefetch window mismatch: {actual_triggers} != {expected_triggers}")
-        print(f"UBMEM_WINDOW_TRIGGERS tokens={actual_triggers}", flush=True)
+        print(f"UBMEM_WINDOW_TRIGGERS general_tokens={actual_triggers}", flush=True)
+        if optimized:
+            half = ((history - resident) // 512 + rotating.rounds - 2) // (rotating.rounds - 1) * 256
+            windows = [min(history, resident + 2 * half * e) for e in range(rotating.rounds)]
+            print(f"UBMEM_LI_SEQUENCE_WINDOWS tokens={windows} half_tokens={half}", flush=True)
         update = UbmemIndexUpdate(
             torch,
             keys=storage.keys,
@@ -191,10 +198,16 @@ def check_shape(
             status=torch.zeros(batch, dtype=torch.int32, device=device),
             query_inputs=workspace.inputs,
             outputs=torch.empty((2, batch * 4, 1, 2048), dtype=torch.int32, device=device),
-            plan_buffer=workspace.index_plan,
-            extended_work=workspace.index_work,
         )
-        forward = LIFetchForward(rotating, update)
+        if optimized:
+            from streaming_forward import StreamingForward
+            forward = StreamingForward(rotating, update, torch, prefetch_tokens, fused_final=True, q_workers=q_workers)
+            forward.ubmem_overlap_fetch = fetch_mode == "overlap"
+            forward.prepare_metadata = True
+            forward.parallel_finalize = True
+            forward.set_diagnostics(False)
+        else:
+            forward = LIFetchForward(rotating, update)
 
         def verify(owners, *, phase, counts=None, padding=False):
             stream.synchronize()
@@ -449,7 +462,7 @@ def check_shape(
                 folder = trace_output / f"b{batch}-h{history}-r{resident}-w{token_bytes}"
                 collect_ubmem(torch, rotating, graph, restore_fixture,
                               lambda: verify(list(range(1, batch + 1)), phase="profiled_replay"),
-                              trace_rounds, folder)
+                              trace_rounds, folder, streaming=forward if optimized else None)
         graph.reset()
         graph = None
         lease.close()
@@ -484,6 +497,9 @@ def check_shape(
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--optimized-resolve", action="store_true")
+    parser.add_argument("--ubmem-fetch-mode", choices=("serial", "overlap"), default="overlap")
+    parser.add_argument("--q-workers", type=int, choices=(1, 2, 4), default=2)
     parser.add_argument("--build-dir", type=Path, required=True)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--kvaf-server", required=True, help="KVAF CPU service host:port")
@@ -511,6 +527,10 @@ def main():
         parser.error("trace-rounds requires iterations and trace-output")
     if not 0 <= args.miss_percent <= 100:
         parser.error("miss-percent must be in 0..100")
+    if any(not 1 <= batch <= 16 for batch in args.batches):
+        parser.error("LIFetch supports BS1..16; larger batches are not supported")
+    args.optimized_resolve = True
+    print(f"UBMEM_FETCH_MODE {args.ubmem_fetch_mode}", flush=True)
     import kvaf
     import torch
     import torch_npu  # noqa: F401
@@ -529,7 +549,7 @@ def main():
         cases.append((args.batches[0], 33024, 8192, args.token_bytes[0]))
     for batch, history, resident, token_bytes in cases:
         shape = UbmemGeometry(batch, history, resident, args.index_heads, token_bytes, aics, 8, args.soc)
-        library = build_ubmem_library(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape)
+        library = build_ubmem_library(cache_dir=build / "lifetch_ubmem", cann=cann, shape=shape, optimized=args.optimized_resolve)
         if selected_library is None:
             selected_library = library.resolve()
             print(f"UBMEM_RUNTIME_BINARY path={selected_library} sha256={hashlib.sha256(library.read_bytes()).hexdigest()}",
@@ -553,6 +573,9 @@ def main():
                 args.comparison_sfa,
                 args.trace_rounds,
                 args.trace_output,
+                args.optimized_resolve,
+                args.q_workers,
+                args.ubmem_fetch_mode,
             )
 
 

@@ -1,10 +1,22 @@
 // Shared LIFetch slot metadata helpers; included within namespace rotating.
 constexpr uint32_t kLruSlots = 2048;
 constexpr uint32_t kChangeCapacity = kLruSlots + kSlots;
-__simt_callee__ inline uint32_t OwnerRow(__gm__ Context* ctx,uint32_t b) {
+#if KVIP_FUSE_QUERY_WORK
+template<typename ContextPointer>
+__simt_callee__ inline uint32_t OwnerRow(ContextPointer ctx,uint32_t b)
+#else
+__simt_callee__ inline uint32_t OwnerRow(__gm__ Context* ctx,uint32_t b)
+#endif
+{
     return ctx->rowOwners ? asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)+b) : b;
 }
-__simt_callee__ inline uint32_t OutputStride(uint32_t rt_resident,__gm__ Context* ctx) {
+#if KVIP_FUSE_QUERY_WORK
+template<typename ContextPointer>
+__simt_callee__ inline uint32_t OutputStride(uint32_t rt_resident,ContextPointer ctx)
+#else
+__simt_callee__ inline uint32_t OutputStride(uint32_t rt_resident,__gm__ Context* ctx)
+#endif
+{
     return ctx->outputStride ? uint32_t(ctx->outputStride) : rt_resident;
 }
 __simt_callee__ inline bool IsTailToken(__gm__ Context* ctx,uint32_t b,uint32_t token) {
@@ -15,7 +27,12 @@ __simt_callee__ inline bool IsTailToken(__gm__ Context* ctx,uint32_t b,uint32_t 
 __simt_callee__ inline uint32_t QueryEnd(uint32_t rt_history,__gm__ Context* ctx,uint32_t query) {
     return ctx->queryEnds ? asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)+query) : rt_history;
 }
+#if KVIP_FUSE_QUERY_WORK
+template<typename ContextPointer>
+__simt_callee__ inline void StoreFallbackSource(uint32_t rt_history,uint32_t rt_tokenBytes,ContextPointer ctx,uint32_t batch,uint32_t dst,
+#else
 __simt_callee__ inline void StoreFallbackSource(uint32_t rt_history,uint32_t rt_tokenBytes,__gm__ Context* ctx,uint32_t batch,uint32_t dst,
+#endif
     uint32_t token,uint64_t remote,__gm__ int32_t* blocks,__gm__ int32_t* offsets) {
     if(ctx->fallbackAddresses) {
         asc_stcg(reinterpret_cast<__gm__ uint64_t*>(ctx->fallbackAddresses)+dst,remote);
