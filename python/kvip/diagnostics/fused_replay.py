@@ -1,0 +1,177 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Replay archived inputs through the current production streaming forward."""
+
+from pathlib import Path
+from types import SimpleNamespace
+
+from kvip.cache.index_storage import IndexCacheStorage
+
+
+def validate_fused_tuning(value, transport):
+    if transport not in ("ubmem", "urma") or not isinstance(value, dict):
+        raise ValueError("Expected a tuning object and ubmem/urma transport")
+    if set(value) - {"recent_threshold"}:
+        raise ValueError("Only recent_threshold is changed in this production A/B comparison")
+    if "recent_threshold" in value and type(value["recent_threshold"]) is not bool:
+        raise ValueError("recent_threshold must be boolean")
+    return value
+
+
+def create_fused(
+    torch,
+    runtime,
+    archive,
+    restored,
+    device_table,
+    build,
+    soc,
+    device,
+    stream,
+    cann,
+    aics,
+    *,
+    transport,
+    tuning=None,
+    split_index_stages=False,
+):
+    from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
+    from kvip.operators.lifetch.binding import LIFetchBinding
+    from kvip.operators.lifetch.forward import LIFetchForward
+    from kvip.operators.lifetch.index_update import DirectIndexUpdate, UbmemIndexUpdate
+    from kvip.operators.lifetch.workspace import LIFetchWorkspace, UbmemWorkspace
+    from kvip.operators.lifetch_ubmem.binding import UbmemBinding
+    from kvip.operators.lifetch_ubmem.build import UbmemGeometry, build_ubmem_library
+    from kvip.runtime.build import build_libraries, kvaf_build_paths
+
+    if split_index_stages:
+        raise ValueError("Streaming stages overlap; use the complete production graph timing")
+    tuning = validate_fused_tuning(tuning or {}, transport)
+    g = archive.manifest["geometry"]
+    b, h, r = (g[n] for n in ("batch", "history", "resident"))
+    if aics < g["aic_count"]:
+        raise ValueError("Replay device has fewer AICs than the recorded input")
+    if g["requested_windows"] != 8:
+        raise ValueError("This comparison uses current serving defaults: 8 windows, 512 prefetch tokens")
+    common = dict(
+        batch=b, history=h, aics=g["aic_count"], windows=g["requested_windows"], device=device, index_heads=g["heads"]
+    )
+    effective = dict(recent_threshold=tuning.get("recent_threshold", False), prefetch_limit=512, window_limit=64)
+    threshold_bounds = None
+    if effective["recent_threshold"]:
+        # Immutable per-replay bounds; all scoring/merging occurs inside forward.
+        # Never substitute the current ABC start: that would omit retired pages.
+        threshold_bounds = archive.tensor("pre.threshold_bounds", torch, device)
+    if transport == "ubmem":
+        shape = UbmemGeometry(b, h, r, g["heads"], g["token_bytes"], g["aic_count"], g["requested_windows"], soc)
+        library = build_ubmem_library(cache_dir=Path(build) / "lifetch_ubmem", cann=cann, shape=shape)
+        workspace = UbmemWorkspace(torch, resident=r, **common)
+    else:
+        runtime_cann, headers = kvaf_build_paths(build)
+        if runtime_cann.resolve() != Path(cann).resolve():
+            raise ValueError("KVAF and fusion must use the same CANN build")
+        (library,) = build_libraries(cache_dir=Path(build) / "lifetch", cann=cann, headers=headers, soc=soc)
+        workspace = LIFetchWorkspace(torch, **common)
+    storage = IndexCacheStorage(torch, g["owners"], h, r, device)
+    output = archive.tensor("pre.output", torch, device)
+    output_rows = output.view(-1, g["token_bytes"])
+    kwargs = dict(
+        query_ends=workspace.inputs.query_ends.view(b, 4),
+        hot_valid=storage.hot_valid,
+        row_owners=workspace.inputs.row_owners,
+        token_addresses=storage.addresses,
+        tail_bounds=workspace.tail_bounds,
+        threshold_bounds=threshold_bounds,
+        output_stride=g["output_stride"],
+        prefetch_limit=effective["prefetch_limit"],
+        window_limit=effective["window_limit"],
+    )
+    if transport == "ubmem":
+        lease = UbmemLease(torch, runtime, output_rows, stream)
+        lease.register_table(device_table)
+        rotating = UbmemBinding(
+            torch,
+            library,
+            workspace.arguments(storage),
+            lease,
+            output_rows,
+            shape=shape,
+            scratch=workspace.scratch,
+            **kwargs,
+        )
+        update_type = UbmemIndexUpdate
+    else:
+        lease = KvafGetLease(torch, runtime, library, output_rows, stream)
+        owner = KvafQueueView(lease, output_rows, device_table.addresses, device_table.valid)
+        workspace.allocate_rotation(
+            torch,
+            batch=b,
+            history=h,
+            resident=r,
+            aics=g["aic_count"],
+            windows=g["requested_windows"],
+            status_bytes=lease.sizes["status"],
+        )
+        rotating = LIFetchBinding(
+            torch,
+            library,
+            workspace.arguments(storage),
+            owner,
+            batch=b,
+            history=h,
+            resident=r,
+            aic_count=g["aic_count"],
+            intermediate_fetches=g["requested_windows"],
+            token_bytes=g["token_bytes"],
+            scratch=workspace.scratch,
+            **kwargs,
+        )
+        update_type = DirectIndexUpdate
+    # Keep the archived output shape for generic state reset/oracle.
+    rotating.output = output
+    update = update_type(
+        torch,
+        keys=storage.keys,
+        scales=storage.scales,
+        addresses=storage.addresses,
+        logical_ids=storage.logical_ids,
+        row_owners=workspace.inputs.row_owners,
+        rotating=rotating,
+        status=torch.zeros(b, dtype=torch.int32, device=device),
+        query_inputs=workspace.inputs,
+        outputs=torch.empty((2, b * 4, 1, 2048), dtype=torch.int32, device=device),
+    )
+    forward = LIFetchForward(rotating, update)
+    selector = SimpleNamespace(
+        storage=storage, inputs=workspace.inputs, rotating=rotating, update=update, topk=workspace.topk
+    )
+    return SimpleNamespace(
+        selector=selector,
+        rotating=rotating,
+        update=update,
+        forward=forward,
+        lease=lease,
+        library=library,
+        libraries=(library,),
+        workspace=workspace,
+        storage=storage,
+        output=output,
+        restored=restored,
+        device_table=device_table,
+        stage_calls=(),
+        tuning=effective,
+    )
+
+
+def _check_geometry(geometry, aics):
+    from kvip.operators.lifetch.geometry import final_aivs, li_geometry
+
+    if aics < geometry["aic_count"]:
+        raise ValueError("Replay device has fewer AICs than captured geometry")
+    shape = li_geometry(geometry["batch"], "auto", geometry["requested_windows"], geometry["aic_count"])
+    expected = dict(
+        rounds=shape["intermediate_fetches"],
+        service_lanes=shape["service_aivs_per_window"],
+        final_workers=final_aivs(geometry["batch"], "auto", geometry["aic_count"]),
+    )
+    if any(geometry[name] != value for name, value in expected.items()):
+        raise ValueError("Unsupported recorded Q4 scheduling geometry")
