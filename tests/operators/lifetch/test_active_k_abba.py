@@ -66,3 +66,34 @@ def test_negative_result_is_not_reported_as_positive():
     result = mod.paired_analysis(runs)
     assert not result["metrics"]["round_init"]["both_pairs_positive"]
     assert result["metrics"]["prototype_core"]["median_saved_us"] < 0
+
+
+def test_k_profiles_have_75_37p5_and_zero_percent_reduction():
+    assert mod.mapping_clear_geometry("short")["mapping_clear_reduction_pct_theoretical"] == 75
+    assert mod.mapping_clear_geometry("mixed")["mapping_clear_reduction_pct_theoretical"] == 37.5
+    assert mod.mapping_clear_geometry("full")["mapping_clear_reduction_pct_theoretical"] == 0
+    assert mod.mapping_clear_geometry("short")["mapping_copy_chunks_on"] == 32
+    assert mod.mapping_clear_geometry("mixed")["mapping_copy_chunks_on"] == 80
+    assert mod.mapping_clear_geometry("full")["mapping_copy_chunks_on"] == 128
+
+
+def test_k_profile_rejects_unknown_name():
+    with pytest.raises(ValueError, match="unknown Active-K profile"):
+        mod.mapping_clear_geometry("missing")
+
+
+def test_k_profile_appears_in_subprocess_command():
+    from types import SimpleNamespace
+    args = SimpleNamespace(
+        device=0, kvaf_server="127.0.0.1:28999",
+        kvaf_root=Path("/opt/KVAF"), cann="/opt/cann",
+        soc="Ascend950DT_9582", warmup=4, iterations=20,
+        k_profile="short",
+    )
+    command = mod.base_command(args, Path("/tmp/run"), enabled=True)
+    assert command[command.index("--actual-key-lengths") + 1] == "32768,32768,32768,32768"
+    assert "--active-k-map-clear" in command
+    args.k_profile = "full"
+    command = mod.base_command(args, Path("/tmp/run"), enabled=False)
+    assert command[command.index("--actual-key-lengths") + 1] == "131072,131072,131072,131072"
+    assert "--active-k-map-clear" not in command

@@ -23,7 +23,35 @@ FIXTURE_FILES = (
     "logical_scores.npy", "physical_to_logical.npy",
     "arg1.bin", "arg4.bin",
 )
-DEFAULT_K = "32768,65536,98304,131072"
+K_PROFILES = {
+    "short": (32768, 32768, 32768, 32768),
+    "mixed": (32768, 65536, 98304, 131072),
+    "full": (131072, 131072, 131072, 131072),
+}
+DEFAULT_K = ",".join(map(str, K_PROFILES["mixed"]))
+
+
+def profile_lengths(name):
+    if name not in K_PROFILES:
+        raise ValueError(f"unknown Active-K profile {name!r}")
+    return list(K_PROFILES[name])
+
+
+def mapping_clear_geometry(name, history=131072):
+    lengths = profile_lengths(name)
+    if len(lengths) != 4 or any(k > history or k < 8192 or k % 128 for k in lengths):
+        raise ValueError("Active-K profile geometry invalid")
+    base = history * len(lengths)
+    active = sum(lengths)
+    return {
+        "actual_key_lengths": lengths,
+        "mapping_tokens_off": base,
+        "mapping_tokens_on": active,
+        "mapping_bytes_saved_theoretical": 4 * (base - active),
+        "mapping_clear_reduction_pct_theoretical": 100 * (base - active) / base,
+        "mapping_copy_chunks_off": sum((history + 4095) // 4096 for _ in lengths),
+        "mapping_copy_chunks_on": sum((k + 4095) // 4096 for k in lengths),
+    }
 
 
 def sha256_file(path):
@@ -52,7 +80,7 @@ def base_command(args, run_output, enabled):
         "--prefetch-tokens", "512",
         "--intermediate-fetches", "8",
         "--native-union-fit",
-        "--actual-key-lengths", DEFAULT_K,
+        "--actual-key-lengths", ",".join(map(str, profile_lengths(args.k_profile))),
         "--warmup", str(args.warmup),
         "--iterations", str(args.iterations),
         "--trace-rounds", "0",
@@ -63,7 +91,7 @@ def base_command(args, run_output, enabled):
     return command
 
 
-def validate_completed_run(output, label, iterations):
+def validate_completed_run(output, label, iterations, k_profile="mixed"):
     """Fail closed: a run without all checks, or with wrong build, is invalid."""
     manifests = list(Path(output).glob("*/case0-b4-prototype-graph/report.json"))
     if len(manifests) != 1:
@@ -77,7 +105,7 @@ def validate_completed_run(output, label, iterations):
     r = json.loads(report_path.read_text())
     if r.get("status") != "pass" or r.get("stateful_rounds") != 3:
         raise RuntimeError(f"{label}: correctness/stateful verification not PASS")
-    if r.get("actual_key_lengths") != [32768, 65536, 98304, 131072]:
+    if r.get("actual_key_lengths") != profile_lengths(k_profile):
         raise RuntimeError(f"{label}: actual-K geometry changed")
     if r.get("dynamic_k_transition_report") is not None:
         raise RuntimeError(f"{label}: benchmark must exclude optional dynamic-transition checks")
@@ -89,7 +117,7 @@ def validate_completed_run(output, label, iterations):
     if not cmake.is_file() or f"V9_ACTIVE_K_MAP_CLEAR:STRING={expected}" not in cmake.read_text():
         raise RuntimeError(f"{label}: CMakeCache does not confirm opt-in switch")
     admission = r.get("fixture", {}).get("actual_key_admission") or {}
-    if admission.get("key_lengths") != [32768, 65536, 98304, 131072]:
+    if admission.get("key_lengths") != profile_lengths(k_profile):
         raise RuntimeError(f"{label}: independent actual-K oracle missing")
     if len(admission.get("requests", [])) != 4:
         raise RuntimeError(f"{label}: per-request oracle missing")
@@ -177,6 +205,11 @@ def main(argv=None):
     p.add_argument("--device", type=int, default=0)
     p.add_argument("--warmup", type=int, default=4)
     p.add_argument("--iterations", type=int, default=20)
+    p.add_argument(
+        "--k-profile", choices=tuple(K_PROFILES),
+        default="mixed",
+        help="short:75%%, mixed:37.5%%, full:0%% theoretical Mapping-clear reduction",
+    )
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--dry-run", action="store_true", help="print commands without launching workers")
     args = p.parse_args(argv)
@@ -203,10 +236,20 @@ def main(argv=None):
             finished = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, check=False)
         if finished.returncode != 0:
             raise RuntimeError(f"ABBA {label} run {i} failed, see {log_path}")
-        runs.append(validate_completed_run(root / f"{i}-{label.lower()}", label, args.iterations))
+        runs.append(validate_completed_run(
+            root / f"{i}-{label.lower()}", label, args.iterations,
+            args.k_profile,
+        ))
         print(f"ABBA {i}/4 {label}: PASS", flush=True)
     result = paired_analysis(runs)
+    result["k_profile"] = args.k_profile
+    result["k_geometry"] = mapping_clear_geometry(args.k_profile)
     (root / "abba_report.json").write_text(json.dumps(result, indent=2))
+    print(
+        f"K_PROFILE={args.k_profile} "
+        f"Mapping-clear theoretical reduction="
+        f"{result['k_geometry']['mapping_clear_reduction_pct_theoretical']:.1f}%"
+    )
     for metric, data in result["metrics"].items():
         print(
             f"{metric}: median_saved_us={data['median_saved_us']:.3f} "
