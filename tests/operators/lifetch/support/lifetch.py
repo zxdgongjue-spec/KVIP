@@ -9,6 +9,7 @@ import numpy as np
 from device_trace import collect_core, core_summary
 from index_update import DirectCacheUpdate, permutation_records
 from native_miss_oracle import native_miss_oracle
+from actual_k_admission import parse_actual_key_lengths, score_oracle_for_actual_k
 from kvip.operators.lifetch.forward import LIFetchForward
 from kvip.runtime.loader import load_lifetch_library
 from prefetch_audit import actual_reads, completion_failures
@@ -101,11 +102,16 @@ def run(args, run_dir):
         progress(run_dir, f"BS={batch}: {stage}; logs={folder}")
         with native_log(folder / "native.log"):
             common, data, build = (folder / "fixture", folder / "input", shared_build)
+            actual_lengths = parse_actual_key_lengths(
+                getattr(args, "actual_key_lengths", None), batch,
+                args.history, args.resident,
+            )
             fixture_info = prepare_full_chain_fixture(
                 common, args.history, args.resident, args.miss_percent,
                 index_heads=args.index_heads,
                 cold_probe_per_query=int(getattr(args, "cold_prefetch_probe", False)),
                 native_union_fit=bool(getattr(args, "native_union_fit", False)),
+                actual_key_lengths=actual_lengths,
             )
             geometry = li_geometry(batch, "auto", args.intermediate_fetches, aics, 0)
             batch_inputs(common, data, batch, args.history, geometry["rotating_aic"])
@@ -215,6 +221,9 @@ def run(args, run_dir):
         line += "; actual_miss_pct_per_query=" + json.dumps(
             [round(count * 100 / 2048, 4) for count in fixture_info["final_misses_per_query"]]
         )
+        if fixture_info.get("actual_key_admission"):
+            line += "\nP0_A2_ACTUAL_K=" + json.dumps(fixture_info["actual_key_admission"]["key_lengths"])
+            line += "; scope=static_per_request_K; stateful_K_transitions_not_yet_tested"
         native_reads = sum(report["native_misses_per_request"])
         line += f"\nactual_reads native: total={native_reads} unused=0 (final selected misses)"
         for label, samples in report.get("read_samples", {}).items():
@@ -795,12 +804,20 @@ def run_device(
     arguments[1] = arguments[1].repeat(b)
     arguments[4] = arguments[4].repeat(b)
     arguments[7].view(torch.int32).copy_(torch.arange(b * h // 128, device=device, dtype=torch.int32))
+    actual_lengths = parse_actual_key_lengths(
+        getattr(args, "actual_key_lengths", None), b, h, r
+    )
+    # arguments[6] is the exact P(6) pointer consumed by v9_li and v9_init.
+    # Alias its original 4-byte-per-request tensor as int32 for Native QLI.
+    actual_key_buffer = arguments[6].view(torch.int32).reshape(b)
+    if actual_lengths is not None:
+        actual_key_buffer.copy_(torch.tensor(actual_lengths, dtype=torch.int32, device=device))
     fixture = dict(
         query=arguments[0].view(torch.float8_e4m3fn).reshape(b, 4, args.index_heads, 128),
         key=arguments[1].view(torch.float8_e4m3fn).reshape(-1, 128, 1, 128),
         actual_query=torch.arange(1, b + 1, device=device, dtype=torch.int32) * 4,
         li_query_lengths=torch.full((b,), 4, device=device, dtype=torch.int32),
-        actual_key=torch.full((b,), h, device=device, dtype=torch.int32),
+        actual_key=actual_key_buffer,
         block_table=arguments[7].view(torch.int32).reshape(b, -1),
     )
     fixture["native_inputs"] = dict(
@@ -822,10 +839,24 @@ def run_device(
     logical_scores = np.load(folder / "fixture/logical_scores.npy")
     physical_order = np.load(folder / "fixture/physical_to_logical.npy")
     scores = logical_scores[:, physical_order]
-    expected_ids = np.stack([np.flatnonzero(row >= np.partition(row, -2048)[-2048]) for row in scores])
-    for row in initial_selected.reshape(b, 4, 2048):
-        if not np.array_equal(np.sort(row, axis=-1), expected_ids):
-            raise AssertionError("native LI differs from independent fixture score oracle")
+    key_lengths = actual_lengths or (h,) * b
+    if actual_lengths is None:
+        expected_ids = np.stack([
+            np.flatnonzero(row >= np.partition(row, -2048)[-2048])
+            for row in scores
+        ])
+        expected_by_row = np.broadcast_to(expected_ids, (b, 4, 2048))
+    else:
+        per_request_admission, expected_by_row = score_oracle_for_actual_k(
+            logical_scores, physical_order, key_lengths, r
+        )
+        (folder / "actual-k-oracle.json").write_text(json.dumps(dict(
+            fixed_history=h, actual_key_lengths=list(key_lengths),
+            requests=per_request_admission,
+        ), indent=2))
+    for row, want in zip(initial_selected.reshape(b, 4, 2048), expected_by_row):
+        if not np.array_equal(np.sort(row, axis=-1), want):
+            raise AssertionError("native LI differs from independent per-K score oracle")
     initial_orders = []
     policies = []
     for row in range(b):
@@ -934,6 +965,13 @@ def run_device(
     timings = {"native_chain": measure(native_call, native.reset, native_check)}
     reference = state["native_topk"].cpu().reshape(b, 4, 2048).numpy()
     owner.acquire()
+    query_ends = None
+    if actual_lengths is not None:
+        query_ends = torch.tensor(
+            [[k] * 4 for k in key_lengths], dtype=torch.int32, device=device
+        ).contiguous()
+        if actual_key_buffer.data_ptr() != arguments[6].data_ptr():
+            raise AssertionError("Native/V9 actual key length storage was copied")
     rotating = launch_module.LIFetchBinding(
         torch,
         build / "libv9_bridge.so",
@@ -947,6 +985,7 @@ def run_device(
         prefetch_limit=args.prefetch_tokens,
         output_stride=owner.output.shape[1],
         row_owners=torch.arange(b, dtype=torch.int32, device=device) if args.resolver_compare else None,
+        query_ends=query_ends,
     )
     topk = arguments[9].view(torch.int32).reshape(b, 4, 2048)
     prefix = 4 * 2048 * 6 + 1024 + 4 * h * 2
@@ -1239,7 +1278,7 @@ def run_device(
         topk=torch.from_numpy(after["topk"]).to(device),
         resident_table=table,
         cumulative_query=fixture["actual_query"],
-        logical_lens=torch.full((b,), h, device=device, dtype=torch.int32),
+        logical_lens=actual_key_buffer,
     )
     geom = SimpleNamespace(batch=b, queries=4, num_layers=1, layer_id=0, resident_blocks=b * (r + 8192) // 128)
     sfa = check_sfa(torch, tensors, geom, {"pool_rows": np.arange(b), "budgets": np.full(b, r + 8192)}, after,
@@ -1273,5 +1312,7 @@ def run_device(
             scope="Producer records include final hot fallback; no temporary KV slots; zero KV copy",
         ),
         kernel="KVIP/csrc/operators/lightning_indexer_with_fetch; preserved core tiling, direct LRU interface",
-        scope="fixed Q4 shared history; graph kernel and AIV maintenance separately; no ABC growth",
+        actual_key_lengths=list(key_lengths),
+        scope="fixed capacity History, per-request BSND actual K, Q4 shared request TopK; "
+              "static K during graph replay; no long-short-long transition or ABC growth",
     )

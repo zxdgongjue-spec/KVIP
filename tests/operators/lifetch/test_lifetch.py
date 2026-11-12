@@ -16,6 +16,7 @@ SUPPORT = ROOT / 'tests/operators/lifetch/support'
 sys.path.insert(0, str(SUPPORT))
 from compare_transports import execute  # noqa: E402
 from runner import progress, supervise  # noqa: E402
+from actual_k_admission import parse_actual_key_lengths  # noqa: E402
 
 
 def arguments(argv=None):
@@ -36,6 +37,8 @@ def arguments(argv=None):
                    help="P0-A1 opt-in: CMake-build shortened v9_init mapping reset with safety guards")
     p.add_argument("--native-union-fit", action="store_true",
                    help="test-only: choose overlapping Q4 Hot TopK and admit only a union fitting Resident")
+    p.add_argument("--actual-key-lengths", type=str,
+                   help="P0-A2: CSV of per-request actual K within fixed History")
     p.add_argument("--resolver-compare", action="store_true")
     p.add_argument("--trace-rounds", type=int, default=3)
     p.add_argument("--miss-percent", type=float, default=10)
@@ -79,6 +82,13 @@ def arguments(argv=None):
         not a.prefetch_payload_audit or round(2048 * a.miss_percent / 100) != 1
     ):
         p.error("--cold-prefetch-probe requires --prefetch-payload-audit and one final cold miss per query")
+    if a.actual_key_lengths:
+        if a.li_only_varlen or a.runtime_shapes or len(batches) != 1:
+            p.error("--actual-key-lengths requires one full-chain fixed-History batch")
+        try:
+            parse_actual_key_lengths(a.actual_key_lengths, batches[0], a.history, a.resident)
+        except ValueError as exc:
+            p.error(str(exc))
     if a.native_union_fit and a.li_only_varlen:
         p.error("--native-union-fit is for the full-chain Native MTP baseline, not LI-only")
     if a.li_only_varlen and (
@@ -188,6 +198,8 @@ def main(argv=None):
                    help="P0-A1 opt-in: compile guarded active-K mapping clear")
     p.add_argument("--native-union-fit", action="store_true",
                    help="test-only: admit a Q4 TopK union that fits Resident capacity")
+    p.add_argument("--actual-key-lengths", type=str,
+                   help="P0-A2: CSV of per-request actual K within fixed History")
     p.add_argument('--resolver-compare', action='store_true', help='URMA resolver comparison')
     p.add_argument('--comparison-output', type=Path)
     p.add_argument('--comparison-sfa', type=Path)
@@ -223,6 +235,13 @@ def main(argv=None):
         not a.prefetch_payload_audit or round(2048 * a.miss_percent / 100) != 1
     ):
         p.error('--cold-prefetch-probe requires --prefetch-payload-audit and one final cold miss per query')
+    if a.actual_key_lengths:
+        if a.li_only_varlen or a.runtime_shapes or len(batches) != 1:
+            p.error("--actual-key-lengths requires one full-chain fixed-History batch")
+        try:
+            parse_actual_key_lengths(a.actual_key_lengths, batches[0], a.history, a.resident)
+        except ValueError as exc:
+            p.error(str(exc))
     if a.native_union_fit and a.li_only_varlen:
         p.error("--native-union-fit is for the full-chain Native MTP baseline, not LI-only")
     if a.li_only_varlen and (
@@ -257,6 +276,14 @@ def main(argv=None):
         common.append('--prefetch-payload-audit')
     if a.cold_prefetch_probe:
         common.append('--cold-prefetch-probe')
+    if a.actual_key_lengths:
+        if a.transport != 'urma' or a.runtime_shapes or a.li_only_varlen or len(batches) != 1:
+            p.error('--actual-key-lengths requires full-chain URMA with one fixed-History batch')
+        try:
+            parse_actual_key_lengths(a.actual_key_lengths, batches[0], a.history, a.resident)
+        except ValueError as exc:
+            p.error(str(exc))
+        common.extend(['--actual-key-lengths', a.actual_key_lengths])
     if a.native_union_fit and a.transport != 'urma':
         p.error('--native-union-fit requires URMA')
     if a.transport == 'urma':
