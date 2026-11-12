@@ -83,6 +83,8 @@ def arguments(argv=None):
     ):
         p.error("--cold-prefetch-probe requires --prefetch-payload-audit and one final cold miss per query")
     if a.actual_key_lengths:
+        if not a.native_union_fit:
+            p.error("--actual-key-lengths requires --native-union-fit")
         if a.li_only_varlen or a.runtime_shapes or len(batches) != 1:
             p.error("--actual-key-lengths requires one full-chain fixed-History batch")
         try:
@@ -235,13 +237,6 @@ def main(argv=None):
         not a.prefetch_payload_audit or round(2048 * a.miss_percent / 100) != 1
     ):
         p.error('--cold-prefetch-probe requires --prefetch-payload-audit and one final cold miss per query')
-    if a.actual_key_lengths:
-        if a.li_only_varlen or a.runtime_shapes or len(batches) != 1:
-            p.error("--actual-key-lengths requires one full-chain fixed-History batch")
-        try:
-            parse_actual_key_lengths(a.actual_key_lengths, batches[0], a.history, a.resident)
-        except ValueError as exc:
-            p.error(str(exc))
     if a.native_union_fit and a.li_only_varlen:
         p.error("--native-union-fit is for the full-chain Native MTP baseline, not LI-only")
     if a.li_only_varlen and (
@@ -277,6 +272,8 @@ def main(argv=None):
     if a.cold_prefetch_probe:
         common.append('--cold-prefetch-probe')
     if a.actual_key_lengths:
+        if not a.native_union_fit:
+            p.error('--actual-key-lengths requires --native-union-fit')
         if a.transport != 'urma' or a.runtime_shapes or a.li_only_varlen or len(batches) != 1:
             p.error('--actual-key-lengths requires full-chain URMA with one fixed-History batch')
         try:
