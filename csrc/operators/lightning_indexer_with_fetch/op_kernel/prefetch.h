@@ -580,12 +580,15 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
     LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids) {
     auto ctx=reinterpret_cast<__gm__ Context*>(pointer);auto events=reinterpret_cast<__gm__ Event*>(ctx->events);
     auto event=events+epoch*rt_serviceLanes+lane;event->core=core;event->epoch=epoch;V9_FETCH_PROFILE(event->waitBegin=GetSystemCycle();)
+    uint32_t waitPolls=0;
     if(epoch) {
         auto previous=reinterpret_cast<__gm__ volatile Event*>(events)+(epoch-1)*rt_serviceLanes+lane;
-        do { kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(events+(epoch-1)*rt_serviceLanes+lane),64); }
-        while(!previous->complete);
+        do {
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(events+(epoch-1)*rt_serviceLanes+lane),64);
+            ++waitPolls;
+        } while(!previous->complete);
     }
-    V9_FETCH_PROFILE(event->begin=GetSystemCycle();)
+    V9_FETCH_PROFILE(event->pad[0]=waitPolls;event->begin=GetSystemCycle();)
     uint64_t postedCount=0; // Business state: controls batched WQE submission.
     V9_FETCH_PROFILE(uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0;)
     auto work=flags.ReinterpretCast<uint32_t>();auto cfg=work[4096];
@@ -818,6 +821,9 @@ __aicore__ inline void CompleteUnreachedEpoch(
     if (lane >= rt_serviceLanes) return;
     auto ctx = reinterpret_cast<__gm__ Context*>(pointer);
     auto events = reinterpret_cast<__gm__ Event*>(ctx->events);
+    auto event = events + epoch * rt_serviceLanes + lane;
+    V9_FETCH_PROFILE(event->waitBegin = GetSystemCycle();)
+    uint32_t waitPolls = 0;
     if (epoch) {
         auto previous = reinterpret_cast<__gm__ volatile Event*>(events)
             + (epoch - 1) * rt_serviceLanes + lane;
@@ -825,15 +831,28 @@ __aicore__ inline void CompleteUnreachedEpoch(
             kvaf_device::CleanCacheLines(
                 reinterpret_cast<__gm__ uint8_t*>(
                     events + (epoch - 1) * rt_serviceLanes + lane), 64);
+            ++waitPolls;
         } while (!previous->complete);
     }
-    auto event = events + epoch * rt_serviceLanes + lane;
+    V9_FETCH_PROFILE(event->begin = GetSystemCycle();)
     event->core = core;
     event->epoch = epoch;
     event->skipped = 1;
+    // No FastService ran: zero service counters, but keep candidate_count
+    // semantically unknown because the skipped window was never scanned.
+    event->scanTicks = 0;
+    event->candidateTicks = 0;
+    event->postTicks = 0;
+    event->bitmapBytes = 0;
+    event->candidateCount = 0;
+    event->postedCount = 0;
+    event->pad[0] = waitPolls;
+    V9_FETCH_PROFILE(event->end = GetSystemCycle();)
     // Completion means the no-op epoch is closed, NOT that a prefetch ran.
     event->complete = 1;
-    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event), 64);
+    kvaf_device::CleanCacheLines(
+        reinterpret_cast<__gm__ uint8_t*>(event),
+        V9_INTERMEDIATE_PROFILING ? sizeof(Event) : 64);
 }
 
 __aicore__ inline void Service(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_splitQ,uint32_t rt_rounds,uint32_t rt_serviceAics,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer, uint32_t epoch, uint32_t core,

@@ -111,7 +111,10 @@ def audit_rotation_events(
                 "candidate_cycles": None,
                 "post_cycles": None,
                 "wait_cycles": None,
+                "wait_polls": None,
                 "service_cycles": None,
+                "closure_publish_cycles": None,
+                "posted_count": None,
             }
 
             if complete != 1:
@@ -138,34 +141,48 @@ def audit_rotation_events(
                     f"epoch={epoch} lane={lane}: recorded epoch {recorded_epoch}"
                 )
 
-            # These six counters and timestamps are inside V9_FETCH_PROFILE.
-            # Skipped epochs bypass FastService, so leave its counters as null
-            # even in profiling builds.
-            if profiling_enabled and skipped == 0:
-                candidate_count = int(words64[epoch, lane, 9])
-                selected_count = int(words64[epoch, lane, 10])
-                entry.update(
-                    candidate_count=candidate_count,
-                    selected_for_post_count=selected_count,
-                    bitmap_bytes=int(words64[epoch, lane, 8]),
-                    scan_cycles=int(words64[epoch, lane, 5]),
-                    candidate_cycles=int(words64[epoch, lane, 6]),
-                    post_cycles=int(words64[epoch, lane, 7]),
-                )
+            # Event timing is captured for both FastService and skipped
+            # closure. Candidate counts remain null for skipped epochs because
+            # their windows were never scanned.
+            if profiling_enabled:
                 wait_begin = int(words64[epoch, lane, 4])
                 begin = int(words64[epoch, lane, 0])
                 end = int(words64[epoch, lane, 1])
+                entry["wait_polls"] = int(words[epoch, lane, 22])
                 if wait_begin and begin >= wait_begin:
                     entry["wait_cycles"] = begin - wait_begin
-                if begin and end >= begin:
-                    entry["service_cycles"] = end - begin
-                if selected_count > candidate_count:
-                    report["errors"].append(
-                        f"epoch={epoch} lane={lane}: selected {selected_count} "
-                        f"> candidate {candidate_count}"
+                if skipped:
+                    entry.update(
+                        bitmap_bytes=0,
+                        scan_cycles=0,
+                        candidate_cycles=0,
+                        post_cycles=0,
+                        posted_count=0,
                     )
-                candidate_total += candidate_count
-                selected_total += selected_count
+                    if begin and end >= begin:
+                        # Ends immediately before the final Event cache flush.
+                        entry["closure_publish_cycles"] = end - begin
+                else:
+                    candidate_count = int(words64[epoch, lane, 9])
+                    posted_count = int(words64[epoch, lane, 10])
+                    entry.update(
+                        candidate_count=candidate_count,
+                        selected_for_post_count=posted_count,
+                        posted_count=posted_count,
+                        bitmap_bytes=int(words64[epoch, lane, 8]),
+                        scan_cycles=int(words64[epoch, lane, 5]),
+                        candidate_cycles=int(words64[epoch, lane, 6]),
+                        post_cycles=int(words64[epoch, lane, 7]),
+                    )
+                    if begin and end >= begin:
+                        entry["service_cycles"] = end - begin
+                    if posted_count > candidate_count:
+                        report["errors"].append(
+                            f"epoch={epoch} lane={lane}: posted {posted_count} "
+                            f"> candidate {candidate_count}"
+                        )
+                    candidate_total += candidate_count
+                    selected_total += posted_count
 
             report["events"].append(entry)
 
@@ -177,6 +194,30 @@ def audit_rotation_events(
         "candidate_count_observed": candidate_total if profiling_enabled else None,
         "selected_for_post_count_observed": selected_total if profiling_enabled else None,
         "skipped_epoch_candidate_count": None,
+        "skipped_wait_cycles_total": (
+            sum(e["wait_cycles"] or 0 for e in report["events"] if e["skipped"])
+            if profiling_enabled else None
+        ),
+        "skipped_closure_publish_cycles_total": (
+            sum(e["closure_publish_cycles"] or 0 for e in report["events"] if e["skipped"])
+            if profiling_enabled else None
+        ),
+        "skipped_wait_polls_total": (
+            sum(e["wait_polls"] or 0 for e in report["events"] if e["skipped"])
+            if profiling_enabled else None
+        ),
+        "empty_served_lanes": (
+            sum(1 for e in report["events"] if not e["skipped"] and e["candidate_count"] == 0)
+            if profiling_enabled else None
+        ),
+        "candidate_served_lanes": (
+            sum(1 for e in report["events"] if not e["skipped"] and e["candidate_count"] > 0)
+            if profiling_enabled else None
+        ),
+        "posted_lanes": (
+            sum(1 for e in report["events"] if not e["skipped"] and (e["posted_count"] or 0) > 0)
+            if profiling_enabled else None
+        ),
         "confirmed_dma_completed": None,
         "validation": "PASS" if not report["errors"] else "FAIL",
     }
@@ -189,7 +230,7 @@ def _fmt_count(value):
 
 def format_rotation_table(report):
     lines = [
-        "Epoch Lane Core Expected Trigger Complete Skipped Candidate SelectedForPost",
+        "Epoch Lane Core Expected Trigger Complete Skipped Candidate SelectedForPost WaitCycles WaitPolls ServiceCycles ClosureCycles",
     ]
     for entry in report["events"]:
         lines.append(
@@ -197,7 +238,11 @@ def format_rotation_table(report):
             f"{entry['recorded_core']:4} {entry['expected_core']:8} "
             f"{entry['trigger_token']:7} {entry['complete']:8} "
             f"{entry['skipped']:7} {_fmt_count(entry['candidate_count']):>9} "
-            f"{_fmt_count(entry['selected_for_post_count']):>15}"
+            f"{_fmt_count(entry['selected_for_post_count']):>15} "
+            f"{_fmt_count(entry['wait_cycles']):>10} "
+            f"{_fmt_count(entry['wait_polls']):>9} "
+            f"{_fmt_count(entry['service_cycles']):>13} "
+            f"{_fmt_count(entry['closure_publish_cycles']):>13}"
         )
     summary = report["summary"]
     lines.append(

@@ -339,18 +339,21 @@ def run_v9_li_varlen_only(
             expected_physical_slots_unique=True,
         )
 
+    quarter = max(resident, (history // 4 // 128) * 128)
+    half = max(resident, (history // 2 // 128) * 128)
+    three_quarter = max(resident, ((history * 3 // 4) // 128) * 128)
     scenarios = (
         {
             "name": "mixed_qk_round1",
             "query_counts": (4, 2, 1, 0),
             "query_starts": (0, 4, 6, 7),
-            "key_lengths": (8192, 6144, 2048, 0),
+            "key_lengths": (history, three_quarter, quarter, 0),
         },
         {
             "name": "mixed_qk_round2",
             "query_counts": (1, 0, 3, 2),
             "query_starts": (0, 1, 1, 4),
-            "key_lengths": (4096, 0, 8192, 6144),
+            "key_lengths": (half, 0, history, three_quarter),
         },
     )
 

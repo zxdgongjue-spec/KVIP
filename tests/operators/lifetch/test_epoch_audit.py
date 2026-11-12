@@ -25,16 +25,18 @@ def synthetic_events(*, profiling=False):
             words[epoch, lane, 5] = epoch
             words[epoch, lane, 6] = 1
             words[epoch, lane, 7] = int(epoch in skipped_epochs)
-            if profiling and epoch not in skipped_epochs:
+            if profiling:
                 words64[epoch, lane, 0] = 200
-                words64[epoch, lane, 1] = 250
+                words64[epoch, lane, 1] = 210 if epoch in skipped_epochs else 250
                 words64[epoch, lane, 4] = 175
-                words64[epoch, lane, 5] = 10
-                words64[epoch, lane, 6] = 11
-                words64[epoch, lane, 7] = 12
-                words64[epoch, lane, 8] = 1024
-                words64[epoch, lane, 9] = 7
-                words64[epoch, lane, 10] = 2
+                words[epoch, lane, 22] = 3 if epoch in skipped_epochs else 2
+                if epoch not in skipped_epochs:
+                    words64[epoch, lane, 5] = 10
+                    words64[epoch, lane, 6] = 11
+                    words64[epoch, lane, 7] = 12
+                    words64[epoch, lane, 8] = 1024
+                    words64[epoch, lane, 9] = 7
+                    words64[epoch, lane, 10] = 2
     return data
 
 
@@ -81,9 +83,17 @@ def test_epoch_audit_profiled_counters_only_on_served_epochs():
     assert all(x["candidate_count"] == 7 for x in served)
     assert all(x["selected_for_post_count"] == 2 for x in served)
     assert all(x["wait_cycles"] == 25 and x["service_cycles"] == 50 for x in served)
+    assert all(x["wait_polls"] == 2 for x in served)
     assert all(x["candidate_count"] is None for x in skipped)
     assert all(x["selected_for_post_count"] is None for x in skipped)
-    assert "Candidate" in format_rotation_table(result)
+    assert all(x["posted_count"] == 0 for x in skipped)
+    assert all(x["wait_cycles"] == 25 for x in skipped)
+    assert all(x["closure_publish_cycles"] == 10 for x in skipped)
+    assert all(x["wait_polls"] == 3 for x in skipped)
+    assert result["summary"]["skipped_closure_publish_cycles_total"] == 50
+    assert result["summary"]["skipped_wait_polls_total"] == 30
+    assert result["summary"]["empty_served_lanes"] == 0
+    assert "ClosureCycles" in format_rotation_table(result)
 
 
 def test_epoch_audit_does_not_mislabel_disabled_profiling_as_zero():
