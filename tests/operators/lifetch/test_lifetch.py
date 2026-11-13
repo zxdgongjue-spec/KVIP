@@ -59,6 +59,9 @@ def arguments(argv=None):
                    help="P0-C3 test-only Q2 8K TopK Trunk; requires LI core perf, auto, prefetch=0")
     p.add_argument("--li-core-perf", action="store_true",
                    help="P0-C1: timed LI-only Graph replays after Native TopK check; prefetch=0")
+    p.add_argument("--li-s2-score-probe", action="store_true",
+                   help="P0-C5a A5 Q1/128K Score-only 1/2/4-AIC probe")
+    p.add_argument("--li-s2-score-cores", type=int, choices=(1, 2, 4), default=1)
     p.add_argument("--li-s2-slope-sweep", action="store_true",
                    help="P0-C4 LI-only fixed-H: Q1/Q4 isolated request, K=8/32/64/96/128K")
     p.add_argument("--li-core-sweep", action="store_true",
@@ -140,6 +143,17 @@ def arguments(argv=None):
         p.error('--li-q2-trunk8k-control requires LI-only --li-core-perf --li-tiling auto --prefetch-tokens 0')
     if a.li_core_perf and (not a.li_only_varlen or a.prefetch_tokens != 0):
         p.error('--li-core-perf requires --li-only-varlen --prefetch-tokens 0')
+    if a.li_s2_score_probe and (
+        not a.li_only_varlen or not a.li_core_perf
+        or a.li_tiling != 'q4' or a.prefetch_tokens != 0
+        or a.history != 131072 or a.resident != 8192
+        or a.index_heads != 32 or batches != [4] or a.miss_percent != 0
+        or a.li_core_sweep or a.li_s2_slope_sweep
+        or a.li_q2_trunk8k_control or a.epoch_audit_profile
+        or a.cold_prefetch_probe or a.prefetch_payload_audit
+    ):
+        p.error('--li-s2-score-probe requires LI-only --li-core-perf --li-tiling q4, '
+                'B4/H131072/R8192, Prefetch=0, Miss=0 and no other sweep')
     if a.li_s2_slope_sweep and (
         not a.li_only_varlen or not a.li_core_perf or a.prefetch_tokens != 0
         or a.history != 131072 or a.resident != 8192
@@ -282,6 +296,9 @@ def main(argv=None):
                    help='P0-C3 Q2 TopK Trunk 8K control (only LI core perf auto/prefetch=0)')
     p.add_argument('--li-core-perf', action='store_true',
                    help='P0-C1: LI-only device Event timing after TopK correctness, prefetch=0')
+    p.add_argument('--li-s2-score-probe', action='store_true',
+                   help='P0-C5a Score-only 1/2/4-AIC Q1 128K probe')
+    p.add_argument('--li-s2-score-cores', type=int, choices=(1, 2, 4), default=1)
     p.add_argument('--li-s2-slope-sweep', action='store_true',
                    help='P0-C4 Q1/Q4 single-request S2 length scaling (fixed H131K R8192)')
     p.add_argument('--li-core-sweep', action='store_true',
@@ -329,6 +346,17 @@ def main(argv=None):
         p.error('--li-q2-trunk8k-control requires LI-only --li-core-perf --li-tiling auto --prefetch-tokens 0')
     if a.li_core_perf and (not a.li_only_varlen or a.prefetch_tokens != 0):
         p.error('--li-core-perf requires --li-only-varlen --prefetch-tokens 0')
+    if a.li_s2_score_probe and (
+        not a.li_only_varlen or not a.li_core_perf
+        or a.li_tiling != 'q4' or a.prefetch_tokens != 0
+        or a.history != 131072 or a.resident != 8192
+        or a.index_heads != 32 or batches != [4] or a.miss_percent != 0
+        or a.li_core_sweep or a.li_s2_slope_sweep
+        or a.li_q2_trunk8k_control or a.epoch_audit_profile
+        or a.cold_prefetch_probe or a.prefetch_payload_audit
+    ):
+        p.error('--li-s2-score-probe requires LI-only --li-core-perf --li-tiling q4, '
+                'B4/H131072/R8192, Prefetch=0, Miss=0 and no other sweep')
     if a.li_s2_slope_sweep and (
         not a.li_only_varlen or not a.li_core_perf or a.prefetch_tokens != 0
         or a.history != 131072 or a.resident != 8192
@@ -378,6 +406,9 @@ def main(argv=None):
         common.append('--li-core-sweep')
     if a.li_s2_slope_sweep:
         common.append('--li-s2-slope-sweep')
+    if a.li_s2_score_probe:
+        common.append('--li-s2-score-probe')
+        common.extend(['--li-s2-score-cores', str(a.li_s2_score_cores)])
     if a.li_core_perf:
         common.append('--li-core-perf')
         common.extend(['--li-core-perf-graph-repeats', str(a.li_core_perf_graph_repeats)])

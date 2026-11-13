@@ -131,6 +131,8 @@ def run(args, run_dir):
                 V9_INTERMEDIATE_PROFILING=int(getattr(args, "epoch_audit_profile", False)),
                 V9_ACTIVE_K_MAP_CLEAR=int(getattr(args, "active_k_map_clear", False)),
                 V9_Q2_TRUNK8K_CONTROL=int(getattr(args, "li_q2_trunk8k_control", False)),
+                V9_S2_SCORE_PROBE=int(getattr(args, "li_s2_score_probe", False)),
+                V9_S2_SCORE_CORES=int(getattr(args, "li_s2_score_cores", 1)),
             )
             if not shared_build.exists():
                 command(
@@ -190,13 +192,24 @@ def run(args, run_dir):
                 )
                 (folder / "report.json").write_text(json.dumps(report, indent=2))
                 if args.li_only_varlen:
-                    line = (
-                        f"V9_LI_VARLEN_PASS batch={batch} history={history} resident={resident} "
-                        f"index_heads={heads} li_tiling={report['li_tiling']} "
-                        f"li_cores={report['li_cores']} rotation_epochs={report['rotation_epochs']} "
-                        f"scenarios={len(report['rounds'])}; "
-                        "scope=v9_init+v9_li+v9_wait; resolver/final-fetch/Index-update not tested"
-                    )
+                    if getattr(args, "li_s2_score_probe", False):
+                        score = report["score_probe"]
+                        line = (
+                            f"P0_C5A_SCORE_PASS cores={score['aic_groups']} "
+                            f"Q=1 K={score['actual_k']} "
+                            f"raw_score_equal={score['raw_score_equal']} "
+                            f"topk_unchanged={score['topk_unchanged']} "
+                            f"p50_us={score['p50_us']:.3f} "
+                            f"p95_us={score['p95_us']:.3f}"
+                        )
+                    else:
+                        line = (
+                            f"V9_LI_VARLEN_PASS batch={batch} history={history} resident={resident} "
+                            f"index_heads={heads} li_tiling={report['li_tiling']} "
+                            f"li_cores={report['li_cores']} rotation_epochs={report['rotation_epochs']} "
+                            f"scenarios={len(report['rounds'])}; "
+                            "scope=v9_init+v9_li+v9_wait; resolver/final-fetch/Index-update not tested"
+                        )
                     summaries.append(line)
                     (run_dir / "cases.log").write_text("\n".join(summaries) + "\n")
                     print(line, flush=True)
@@ -326,6 +339,14 @@ def run_v9_li_varlen_only(
     )
     topk = arguments[9].view(torch.int32).reshape(b, 4, 2048)
     stream = torch.npu.current_stream(device)
+    if getattr(args, "li_s2_score_probe", False):
+        from s2_score_device import run_s2_score_probe
+        return run_s2_score_probe(
+            args=args, torch=torch, device=device, owner=owner,
+            arguments=arguments, fixture=fixture, native_li=native_li,
+            torch_npu=torch_npu, rotating=rotating, topk=topk, stream=stream,
+            inputs=inputs, query_lengths=query_lengths, key_lengths=key_lengths,
+        )
 
     if getattr(args, "prefetch_payload_audit", False) and not getattr(
         args, "cold_prefetch_probe", False
