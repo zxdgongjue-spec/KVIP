@@ -338,13 +338,19 @@ def test_replay_cli_rejects_ambiguous_reference_options(tmp_path, mode):
 
 
 @pytest.mark.parametrize("transport", ["urma", "ubmem"])
-def test_upstream_factory_uses_old_builder_and_binding_signatures(tmp_path, monkeypatch, transport):
+@pytest.mark.parametrize("policy", ["resident", "recent", "candidate"])
+def test_upstream_factory_uses_old_builder_and_binding_signatures(tmp_path, monkeypatch, transport, policy):
     from kvip.adapters import kvaf
     from kvip.diagnostics import fused_replay
     from kvip.operators.lifetch import binding, forward, index_update, workspace
     from kvip.operators.lifetch_ubmem import binding as ub_binding, build as ub_build
     from kvip.runtime import build
 
+    if transport == "ubmem" and policy != "resident":
+        pytest.skip("The new experiment is URMA-only")
+    from kvip.diagnostics.pipeline_options import options_for
+
+    options = options_for("combined") if policy == "candidate" else None
     calls = []
     tensor = SimpleNamespace(view=lambda *args: tensor)
     inputs = SimpleNamespace(query_ends=tensor, row_owners=tensor)
@@ -370,11 +376,14 @@ def test_upstream_factory_uses_old_builder_and_binding_signatures(tmp_path, monk
 
     class Binding:
         def __init__(self, *args, **kwargs):
-            assert "threshold_bounds" not in kwargs
+            assert ("threshold_bounds" in kwargs) == (policy != "resident")
             calls.append(("binding", kwargs))
-            self.library = SimpleNamespace()  # Upstream has no recent option getters.
+            self.library = SimpleNamespace()
+            for key, value in (options or {}).items():
+                setattr(self.library, "kvip_" + key, lambda value=value: int(value))
 
-    def build_urma(*, cache_dir, cann, headers, soc):
+    def build_urma(*, cache_dir, cann, headers, soc, **kwargs):
+        assert kwargs == (options or {})
         calls.append(("urma_build", cache_dir))
         return (tmp_path / "upstream.so",)
 
@@ -428,10 +437,12 @@ def test_upstream_factory_uses_old_builder_and_binding_signatures(tmp_path, monk
         32,
         transport=transport,
         upstream=True,
+        tuning={"recent_threshold": policy != "resident"},
+        pipeline_options=options,
     )
     assert calls[0][0] == transport + "_build" and calls[1][0] == "binding"
-    assert not any(
-        bundle.tuning[name] for name in ("recent_threshold", "recent_pipeline", "recent_unified_topk", "recent_skip")
+    assert bundle.tuning == dict(recent_threshold=policy != "resident", prefetch_limit=512, window_limit=64) | (
+        options or {}
     )
     assert bundle.tuning["prefetch_limit"] == 512 and bundle.tuning["window_limit"] == 64
 

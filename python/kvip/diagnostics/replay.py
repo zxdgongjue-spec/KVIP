@@ -31,6 +31,7 @@ def arguments(argv=None):
             "local-victims",
             "register-kth",
             "overlap-victims",
+            "post-threshold",
         ),
         default="threshold",
     )
@@ -40,6 +41,12 @@ def arguments(argv=None):
     p.add_argument("--device", type=int, default=0)
     p.add_argument("--soc", required=True)
     p.add_argument("--serial-workers", type=int)
+    p.add_argument(
+        "--pipeline-variants",
+        nargs="+",
+        default=None,
+        choices=("control", "topk", "metadata", "ready", "init", "combined"),
+    )
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--iterations", type=int, default=10)
     p.add_argument(
@@ -61,8 +68,23 @@ def arguments(argv=None):
         p.error("Threshold policy changes only the fused path")
     if bool(args.upstream_root) != bool(args.upstream_revision):
         p.error("upstream-root and upstream-revision must be supplied together")
-    if args.upstream_root and (args.study != "threshold" or args.threshold_policy != "resident"):
-        p.error("Exact upstream replay requires study=threshold and threshold-policy=resident")
+    if args.upstream_root and (args.study not in ("threshold", "post-threshold") or args.threshold_policy == "both"):
+        p.error("Exact production replay requires threshold/post-threshold study and one threshold policy")
+    if args.study == "post-threshold":
+        if (
+            not args.upstream_root
+            or args.mode != "fused"
+            or args.transport != "urma"
+            or args.threshold_policy != "recent"
+        ):
+            p.error("post-threshold requires an exact production checkout and URMA fused recent policy")
+        if args.diagnostic_replays:
+            p.error("post-threshold measures uninstrumented production graphs only")
+        args.pipeline_variants = args.pipeline_variants or ["control", "topk", "metadata", "ready", "init", "combined"]
+        if len(set(args.pipeline_variants)) != len(args.pipeline_variants):
+            p.error("Pipeline variants must be unique")
+    elif args.pipeline_variants:
+        p.error("pipeline-variants requires study=post-threshold")
     if args.study in ("threshold-only", "seed-ub", "local-victims", "register-kth", "overlap-victims") and (
         args.transport != "urma" or args.mode != "fused"
     ):

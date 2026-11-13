@@ -437,6 +437,7 @@ def measure_case(args, archive, context, retained):
             tuning=tuning,
             split_index_stages=getattr(args, "split_index_stages", False),
             upstream=bool(getattr(args, "upstream_root", None)),
+            pipeline_options=getattr(args, "pipeline_options", None),
         )
         case_retained["bundle"] = bundle
         case_retained["buffers"] = buffer_addresses(bundle)
@@ -566,6 +567,8 @@ def release_context(context):
 def study_cases(args):
     """Keep each study's baseline explicit when production defaults advance."""
     study = getattr(args, "study", "threshold")
+    if study == "post-threshold":
+        return {name: {"recent_threshold": True} for name in args.pipeline_variants}
     if study == "overlap-victims":
         return {
             name: dict(
@@ -688,10 +691,15 @@ def run(args, archive, retained):
         "local-victims",
         "register-kth",
         "overlap-victims",
+        "post-threshold",
     )
     if args.mode == "fused" and (args.threshold_policy == "both" or execution_study):
         cases = {}
         for name, tuning in study_cases(args).items():
+            if args.study == "post-threshold":
+                from kvip.diagnostics.pipeline_options import options_for
+
+                args.pipeline_options = options_for(name)
             retained["progress"].update(variant=name, tuning=dict(tuning))
             phase(retained, "case_begin")
             emit(f"CASE_BEGIN {args.transport}-{args.mode}-{name}")

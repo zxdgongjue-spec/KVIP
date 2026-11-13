@@ -76,6 +76,7 @@ def create_fused(
     tuning=None,
     split_index_stages=False,
     upstream=False,
+    pipeline_options=None,
 ):
     from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
     from kvip.operators.lifetch.binding import LIFetchBinding
@@ -128,17 +129,23 @@ def create_fused(
             }
         )
     if upstream:
-        if any(tuning.values()):
-            raise ValueError("The exact upstream reference cannot accept feature options")
-        effective.update(
-            recent_threshold=False,
-            recent_pipeline=False,
-            recent_unified_topk=False,
-            recent_skip=False,
-            recent_profile=False,
-            recent_seed_ub=False,
+        if set(tuning) - {"recent_threshold"}:
+            raise ValueError("An exact production checkout cannot accept legacy experiment options")
+        effective = dict(
+            recent_threshold=tuning.get("recent_threshold", False),
+            prefetch_limit=512,
+            window_limit=64,
         )
-        build_options = {}  # The upstream builder API has no recent options.
+        build_options = {}  # Production owns its implementation; no legacy experiment flags.
+        if pipeline_options is not None:
+            from kvip.diagnostics.pipeline_options import validate_options
+
+            if transport != "urma" or not effective["recent_threshold"]:
+                raise ValueError("Pipeline options require the exact URMA recent production checkout")
+            build_options = validate_options(pipeline_options)
+            effective.update(build_options)
+    elif pipeline_options is not None:
+        raise ValueError("Pipeline variants cannot use legacy experiment production code")
     threshold_bounds = None
     if effective["recent_threshold"]:
         # Immutable per-replay bounds; all scoring/merging occurs inside forward.
@@ -169,7 +176,7 @@ def create_fused(
         prefetch_limit=effective["prefetch_limit"],
         window_limit=effective["window_limit"],
     )
-    if not upstream:
+    if not upstream or effective["recent_threshold"]:
         kwargs["threshold_bounds"] = threshold_bounds
     if transport == "ubmem":
         lease = UbmemLease(torch, runtime, output_rows, stream)
@@ -213,7 +220,7 @@ def create_fused(
         )
         update_type = DirectIndexUpdate
     verify_build_options(rotating.library, build_options)
-    if effective["recent_seed_ub"]:
+    if effective.get("recent_seed_ub", False):
         from kvip.diagnostics.seed_eligibility import predict_seed_eligibility
 
         if not predict_seed_eligibility(archive, rotating.runtime_shape)["predicted_eligible_queries"]:
