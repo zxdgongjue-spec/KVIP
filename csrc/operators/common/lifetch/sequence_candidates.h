@@ -23,7 +23,7 @@
             for(uint32_t q=0;q<4;++q)
                 if(begin[shard][q]!=readyBegin[shard] || end[shard][q]!=readyEnd[shard])aggregate=false;
         }
-        V9_FETCH_PROFILE(uint64_t scanBegin=GetSystemCycle();)
+        V9_FETCH_PROFILE(scanBegin=GetSystemCycle();)
         uint32_t candidateCount=0,stop=last,wordCount=0;
         GlobalTensor<uint8_t> bitmap;
         bitmap.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(ctx->hits)+b*KV_WINDOW_HISTORY);

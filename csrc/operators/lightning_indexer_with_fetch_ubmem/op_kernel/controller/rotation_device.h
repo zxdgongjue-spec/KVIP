@@ -42,10 +42,11 @@ __simd_callee__ inline void Visible(MicroAPI::RegTensor<uint16_t>& value,
 namespace rotating {
 __aicore__ inline void Service(GM_ADDR pointer, uint32_t epoch, uint32_t core,
     uint32_t lane, LocalTensor<uint32_t> scratch, LocalTensor<uint16_t> flags,
-    LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow=0) {
+    LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow=0,bool captureIo=false) {
     auto ctx=reinterpret_cast<__gm__ Context*>(pointer);
     const auto shape=LoadRuntimeShape(ctx);
     uint32_t rank=shape.splitQ?(core%2)*shape.batch+core/2:core;
-    FastService(pointer, epoch, core, (rank%shape.serviceAics)*2+lane, scratch, flags, indices, sequenceHalfWindow);
+    if(captureIo) FastService<true>(pointer, epoch, core, (rank%shape.serviceAics)*2+lane, scratch, flags, indices, sequenceHalfWindow);
+    else FastService<false>(pointer, epoch, core, (rank%shape.serviceAics)*2+lane, scratch, flags, indices, sequenceHalfWindow);
 }
 }
