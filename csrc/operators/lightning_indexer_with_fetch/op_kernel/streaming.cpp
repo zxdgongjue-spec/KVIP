@@ -8,6 +8,7 @@
 #include "staged_outputs.h"
 #include "pipeline_types.h"
 #include "publication_flags.h"
+#include "ready_batch_fetch.h"
 #include "shadow_exchange_parallel.h"
 #include "index_cache_update.h"
 using namespace AscendC;
@@ -360,6 +361,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(256) inline void PackFetchRanges(
 #include "staged_ubmem_fetch.h"
 #else
 constexpr uint32_t kBatchGetInflight = 2048;
+#include "ready_batch_device.h"
 // Each worker owns one KVAF queue. It gathers its shard of requests for one Q,
 // calls the native BatchGet once per safe/conflicting phase, then acknowledges
 // all rows covered by that call. The native scheduler owns WQE and CQ handling.
@@ -383,6 +385,14 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
  if(ctx->fallbackAddresses){args.address_table=ctx->fallbackAddresses;args.valid_table=ctx->fallbackValid;args.table_capacity=shape.batch*kSlots;}
  if(!args.batch_get_max_inflight_total)args.batch_get_max_inflight_total=kBatchGetInflight;
  uint64_t error=0;uint32_t completed=0;bool hasConflict=false;
+#if KVIP_READY_BATCH_FETCH
+ ReadyBatchIo io{};
+ io.a=a;io.ctx=ctx;io.shape=shape;io.args=args;io.packed=packed;io.ranges=ranges;
+ io.query=q;io.lane=lane;io.workers=workers;io.stride=stride;io.profile=profile;
+ if(profile)io.begin=GetSystemCycle();
+ const auto result=ready_fetch::Run(io,shape.batch,q,lane,workers,stride);
+ error=result.error;completed=result.completed;io.Finish(result);
+#else
  for(uint32_t phase=0;phase<2 && !error;++phase){
   if(phase && skipEmptyConflict && !hasConflict)break;
   uint64_t prepareStart=profile?GetSystemCycle():0;
@@ -465,6 +475,7 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
    ft[16+phase]=groups;ft[20]=3; // shared Q-worker group, not per-request time
   }
  }
+#endif
  if(a->prefetchCount & 0x10000000U){
   auto trace=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*256+
       uint64_t(kResolveCores*shape.batch+q*workers+lane)*32;

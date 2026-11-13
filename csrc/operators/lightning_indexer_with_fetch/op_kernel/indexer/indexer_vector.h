@@ -29,6 +29,7 @@
 #include "indexer_types.h"
 #include "indexer_score.h"
 #include "topk.h"
+#include "topk_prune_probe.h"
 #include "../../../common/lifetch/recent_index.h"
 
 namespace QLIKernel {
@@ -153,6 +154,37 @@ private:
     GM_ADDR streamingWorkspace_ = nullptr;
     bool streamingTopkOnly_ = false;
     bool streamingPrefetched_ = false;
+#if KVIP_TOPK_PRUNE_DIAGNOSTICS && !(defined(V9_UBMEM) && V9_UBMEM)
+    bool topkPruneProbeEnabled_ = false;
+    kvip_topk_probe::Record topkPruneProbe_;
+    __aicore__ inline void BeginTopkPruneProbe(uint32_t query, uint32_t validEnd) {
+        topkPruneProbeEnabled_ = false;
+        topkPruneProbe_ = {};
+        if (!streamingWorkspace_ || prefixActive_) return;
+        auto args = reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_);
+        if (!(args->prefetchCount & 0x80000000U) || !args->times || query >= runtimeShape_.batch * SIM_Q) return;
+        topkPruneProbeEnabled_ = true;
+        topkPruneProbe_.validEnd = validEnd;
+#if KVIP_FINAL_TOPK_PRUNE
+        topkPruneProbe_.status = kvip_topk_probe::GuardFallback;
+        topkPruneProbe_.reason = kvip_topk_probe::GuardReasons(
+            std::is_same_v<SCORE_T,uint16_t>, prefixActive_, streamingTopkOnly_, constInfo_.isLDOpen,
+            s1BaseSize_, runtimeShape_.splitQ, runtimeShape_.batch, runtimeShape_.aicCount,
+            topkCount_, trunkLen_, validEnd, runtimeShape_.resident,
+            2 * CeilDiv(constInfo_.mBaseSize,uint32_t(2)) * s2BaseSize_ * sizeof(QK_T));
+#endif
+        if (!validEnd) topkPruneProbe_.status = kvip_topk_probe::EmptyQuery;
+    }
+    __aicore__ inline void PublishTopkPruneProbe(uint32_t query) {
+        if (!topkPruneProbeEnabled_) return;
+        auto args = reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_);
+        auto row = reinterpret_cast<__gm__ uint64_t*>(args->times) +
+            uint64_t(runtimeShape_.batch) * 64 + uint64_t(query) * 16;
+        topkPruneProbe_.Store(row + 12);
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),128);
+        topkPruneProbeEnabled_ = false;
+    }
+#endif
     TBuf<TPosition::VECCALC> streamingValidBuf_, streamingReservedBuf_, streamingOutputBuf_, streamingBitmapBuf_;
     LocalTensor<uint32_t> streamingValid_, streamingReserved_, streamingOutput_, streamingBitmap_;
 #endif
@@ -962,6 +994,13 @@ __aicore__ inline bool QLIVector<QLIT>::TryPrunedFinalTopK(
             return false;
         PipeBarrier<PIPE_ALL>();
         const uint16_t threshold = prefixThreshold_.GetValue((query % 2) * 128);
+#if KVIP_TOPK_PRUNE_DIAGNOSTICS
+        if (topkPruneProbeEnabled_) {
+            topkPruneProbe_.threshold = threshold;
+            topkPruneProbe_.status = threshold ? kvip_topk_probe::Running : kvip_topk_probe::ZeroThreshold;
+            topkPruneProbe_.activated = threshold != 0;
+        }
+#endif
         // Zero padding is below every retained key. A zero lower bound cannot
         // prune and would make padded positions participate in tie ordering.
         if (!threshold) return false;
@@ -981,6 +1020,14 @@ __aicore__ inline bool QLIVector<QLIT>::TryPrunedFinalTopK(
                 reinterpret_cast<__ubuf__ uint16_t*>(positions.GetPhyAddr()),count,threshold);
             SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
             const uint32_t added = uint32_t(GetSpr<SpecialPurposeReg::AR>()) / sizeof(uint16_t);
+#if KVIP_TOPK_PRUNE_DIAGNOSTICS
+            if (topkPruneProbeEnabled_) {
+                topkPruneProbe_.visited += count;
+                ++topkPruneProbe_.blocks;
+                if (added <= count) topkPruneProbe_.survivors += added;
+                else topkPruneProbe_.status = kvip_topk_probe::InvalidCompaction;
+            }
+#endif
             if (added > count) return false;
             if (previousCount) DataCopy(mrgValueLocal_,scoreOutLocal_,topkCount_);
             PipeBarrier<PIPE_V>();
@@ -991,6 +1038,12 @@ __aicore__ inline bool QLIVector<QLIT>::TryPrunedFinalTopK(
             PipeBarrier<PIPE_V>();
             const uint32_t total = previousCount + added;
             const uint32_t aligned = QLICommon::Align(total,uint32_t(256));
+#if KVIP_TOPK_PRUNE_DIAGNOSTICS
+            if (topkPruneProbeEnabled_ && total >= topkCount_) {
+                topkPruneProbe_.radixInputs += aligned;
+                ++topkPruneProbe_.radixCalls;
+            }
+#endif
             if (aligned > total) kvip_final_topk::PadScores(
                 reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_.GetPhyAddr()),total,aligned);
             previousCount = topkOp_.SelectPruned(mrgValueLocal_,positions,
@@ -998,6 +1051,10 @@ __aicore__ inline bool QLIVector<QLIT>::TryPrunedFinalTopK(
         }
         // A valid Kth lower bound leaves at least K real candidates. Keep the
         // complete original path as a fail-closed fallback for other inputs.
+#if KVIP_TOPK_PRUNE_DIAGNOSTICS
+        if (topkPruneProbeEnabled_) topkPruneProbe_.status = previousCount == topkCount_ ?
+            kvip_topk_probe::Success : kvip_topk_probe::InsufficientCandidates;
+#endif
         return previousCount == topkCount_;
     }
 }
@@ -1065,6 +1122,9 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
             uint32_t bound = reinterpret_cast<__gm__ uint32_t*>(rotationContext->queryEnds)[query];
             validS2Len = Min(validS2Len, static_cast<int32_t>(bound));
         }
+#if KVIP_TOPK_PRUNE_DIAGNOSTICS && KVIP_STREAMING_LI && !(defined(V9_UBMEM) && V9_UBMEM)
+        if (!prefixActive_) BeginTopkPruneProbe(streamingQuery, validS2Len > 0 ? uint32_t(validS2Len) : 0U);
+#endif
         if (validS2Len <= 0) {
             WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
             Duplicate(indicesOutLocal_.ReinterpretCast<int32_t>(), neg, topkCount_);
@@ -1077,6 +1137,9 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
             AscendC::DataCopyPad(indiceOutGm[info.indiceOutOffset + (curS1Idx + rowIdx) * topkCount_], indicesOutLocal_.ReinterpretCast<int32_t>(), copyOutParams);
             SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
 #if KVIP_STREAMING_LI
+#if KVIP_TOPK_PRUNE_DIAGNOSTICS && !(defined(V9_UBMEM) && V9_UBMEM)
+            if (!prefixActive_) PublishTopkPruneProbe(streamingQuery);
+#endif
             if (!prefixActive_) EmitFinalClassification(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx);
 #endif
             continue;
@@ -1197,6 +1260,9 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         }
         SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
 #if KVIP_STREAMING_LI
+#if KVIP_TOPK_PRUNE_DIAGNOSTICS && !(defined(V9_UBMEM) && V9_UBMEM)
+        if (!prefixActive_) PublishTopkPruneProbe(streamingQuery);
+#endif
         if (!prefixActive_) EmitFinalClassification(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx);
 #endif
     }

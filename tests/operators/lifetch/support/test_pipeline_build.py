@@ -25,7 +25,7 @@ def test_pipeline_options_isolate_and_reuse_the_correct_binary(monkeypatch, tmp_
     assert build.build_libraries(**arguments) == baseline
     assert len(calls) == 2
     paths = {baseline}
-    for option in ("final_topk_prune", "selected_metadata", "early_fetch_ready", "compact_init"):
+    for option in ("final_topk_prune", "selected_metadata", "early_fetch_ready", "compact_init", "ready_batch_fetch", "topk_prune_diagnostics"):
         result = build.build_libraries(**arguments, **{option: True})
         assert result not in paths
         paths.add(result)

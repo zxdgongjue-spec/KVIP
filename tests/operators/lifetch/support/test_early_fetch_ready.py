@@ -13,7 +13,8 @@ import pytest
 
 
 @pytest.mark.parametrize('ubmem,early', [(0, 0), (0, 1), (1, 0), (1, 1)])
-def test_fetch_ready_precedes_output_dma_but_not_metadata_join(tmp_path, ubmem, early):
+@pytest.mark.parametrize('ready_batch', [0, 1])
+def test_fetch_ready_precedes_output_dma_but_not_metadata_join(tmp_path, ubmem, early, ready_batch):
     root = Path(__file__).resolve().parents[4]
     kernel_dir = root / 'csrc/operators/lightning_indexer_with_fetch/op_kernel'
     worker = (kernel_dir / 'output_worker.h').read_text()
@@ -96,7 +97,8 @@ void PreparePublicationOutputs(int64_t*,uint32_t*,uint32_t,uint32_t b,uint32_t q
  for(unsigned i=0;i<kTop;++i)work[64+i]=100000+b*10000+q*2048+i;
 }
 void PackPublicationEvents(Context*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t q,uint32_t,uint32_t,
- uint32_t count,uint32_t*,uint32_t*,uint32_t*,uint16_t*,uint32_t*,uint32_t* ctl,int32_t*,uint32_t){
+ uint32_t count,uint32_t*,uint32_t*,uint32_t*,uint16_t*,uint32_t*,uint32_t* ctl,int32_t* direct,uint32_t){
+ assert((direct==nullptr)==bool(KVIP_READY_BATCH_FETCH && !V9_UBMEM));
  assert(q==currentQuery);ctl[16]=count;ctl[17]=count;
  if(q==packErrorQuery)ctl[1]=16;
 }
@@ -231,6 +233,7 @@ int main(){
         shutil.which('clang++') or 'c++', '-std=c++17', '-O1',
         '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
         f'-DV9_UBMEM={ubmem}', f'-DKVIP_EARLY_FETCH_READY={early}',
+        f'-DKVIP_READY_BATCH_FETCH={ready_batch}',
         '-I', str(kernel_dir), str(source), '-o', str(exe),
     ], check=True)
     subprocess.run([str(exe)], check=True, timeout=20)

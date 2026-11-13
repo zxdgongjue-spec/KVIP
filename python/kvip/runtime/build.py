@@ -47,6 +47,8 @@ def build_libraries(
     selected_metadata=False,
     early_fetch_ready=False,
     compact_init=False,
+    ready_batch_fetch=False,
+    topk_prune_diagnostics=False,
 ):
     """Build one shape-independent binary per source/toolchain/SoC."""
     root = Path(__file__).resolve().parents[3] / "csrc/operators"
@@ -61,6 +63,8 @@ def build_libraries(
         SELECTED_METADATA=selected_metadata,
         EARLY_FETCH_READY=early_fetch_ready,
         COMPACT_INIT=compact_init,
+        READY_BATCH_FETCH=ready_batch_fetch,
+        TOPK_PRUNE_DIAGNOSTICS=topk_prune_diagnostics,
     )
     if any(type(value) is not bool for value in variants.values()):
         raise ValueError("LIFetch pipeline build options must be bool")
