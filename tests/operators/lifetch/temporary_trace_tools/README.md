@@ -146,3 +146,22 @@ candidate. This is a bounded CPU parameter search, not neural-network training.
 Old parameter files must be refitted. Use a new output directory such as
 `/tmp/lifetch-generator-v3`. The model still needs real-capture evaluation: a
 lower fitting loss alone does not establish realistic benchmark behavior.
+
+To isolate remaining version 3 errors without refitting, reuse its parameters:
+
+```bash
+python tests/operators/lifetch/temporary_trace_tools/fit_generator.py \
+  /tmp/lifetch-old-converted-v2 \
+  --parameters /tmp/lifetch-generator-v3/generator.json \
+  --output /tmp/lifetch-generator-v3-replacements
+```
+
+Every held-out request compares real Q + synthetic Index, synthetic Q + real
+Index, and synthetic both. Weights and query scales always travel with Q; key
+scales travel with Index. All modes use the same sampled real rows and generated
+operands. `summary.log` shows means and paired absolute errors;
+`replacement_comparison.json` also saves per-request metrics. Only aggregates
+are written, not real operands. Replacement effects are not additive causal
+contributions. Reuse the same seed/sample settings as the preceding run for a
+comparable synthetic-both reference. This adds two CPU scoring passes per
+held-out request, but `--parameters` skips the twelve-candidate fitting search.

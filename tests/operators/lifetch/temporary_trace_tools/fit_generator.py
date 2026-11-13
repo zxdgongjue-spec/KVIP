@@ -204,6 +204,32 @@ def tune(parameters, rows, top_fraction, seed):
     return dict(fit_requests=len(chosen), target=target, trials=trials, chosen=winner)
 
 
+def replacement_metrics(real, generated, top_fraction):
+    """Replace complete operand sides; never carry captured labels into synthetic rows."""
+    q_fields = ('query', 'weights', 'query_scale')
+    index_fields = ('keys', 'key_scale')
+    real_q = {name: real[name] for name in q_fields}
+    real_q.update({name: generated[name] for name in index_fields})
+    real_index = {name: generated[name] for name in q_fields}
+    real_index.update({name: real[name] for name in index_fields})
+    return dict(real_q_synthetic_index=metrics(real_q, top_fraction),
+                synthetic_q_real_index=metrics(real_index, top_fraction),
+                synthetic_both=metrics(generated, top_fraction))
+
+
+def replacement_summary(actual, experiments):
+    report = {}
+    for mode in experiments[0]:
+        report[mode] = {}
+        for key in actual[0]:
+            reference = np.array([r[key] for r in actual])
+            values = np.array([r[mode][key] for r in experiments])
+            report[mode][key] = dict(mean=float(values.mean()),
+                                    paired_bias=float((values-reference).mean()),
+                                    paired_mae=float(np.abs(values-reference).mean()))
+    return report
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('bundle_root', type=Path)
@@ -224,16 +250,21 @@ def main():
     held_out = [row for row in rows if row['capture'] not in fit_captures]
     parameters = json.loads(args.parameters.read_text()) if args.parameters else fit(train)
     search = None if args.parameters else tune(parameters, train, args.top_fraction, args.seed + 10000)
-    actual, synthetic, audits = [], [], []
+    actual, synthetic, audits, experiments = [], [], [], []
     for i, row in enumerate(held_out):
         audits.append(audit_topk(row))
         actual.append(metrics(row, args.top_fraction))
         generated = generate(parameters, len(row['keys']), args.seed + i)
-        synthetic.append(metrics(generated, args.top_fraction))
+        experiment = replacement_metrics(row, generated, args.top_fraction)
+        experiments.append(experiment)
+        synthetic.append(experiment['synthetic_both'])
         print(f'COMPARE {i + 1}/{len(held_out)}', flush=True)
     args.output.mkdir(parents=True)
     (args.output / 'tuning.json').write_text(json.dumps(search, indent=2, allow_nan=False))
     (args.output / 'generator.json').write_text(json.dumps(parameters, indent=2, allow_nan=False))
+    replacements = replacement_summary(actual, experiments)
+    (args.output / 'replacement_comparison.json').write_text(json.dumps(
+        dict(summary=replacements, real=actual, per_request=experiments), indent=2, allow_nan=False))
     comparison = {key: dict(real=float(np.mean([r[key] for r in actual])),
                             generated=float(np.mean([r[key] for r in synthetic]))) for key in actual[0]}
     (args.output / 'score_audit.json').write_text(json.dumps(audits, indent=2))
@@ -249,6 +280,19 @@ def main():
         real, generated = values['real'], values['generated']
         delta = f'{100 * (generated - real) / abs(real):+.2f}' if real and not key.endswith('_mean') else 'N/A'
         lines.append(f'{key:24s} | {real:12.2f} | {generated:12.2f} | {delta}')
+    keys = ('q_cosine', 'sample_top_jaccard', 'sample_union_ratio', 'score_p50',
+            'score_p90', 'score_p99', 'score_zero_pct')
+    lines += ['REPLACEMENT EXPERIMENTS: same held-out requests and generated operands',
+              'Metric | Real | Real Q + synthetic Index | Synthetic Q + real Index | Synthetic both']
+    for key in keys:
+        values = [comparison[key]['real']] + [replacements[mode][key]['mean'] for mode in replacements]
+        lines.append(f'{key:24s} | ' + ' | '.join(f'{value:12.2f}' for value in values))
+    lines += ['PAIRED ABSOLUTE ERROR: average per-request error (prevents cancellation)',
+              'Metric | Real Q + synthetic Index | Synthetic Q + real Index | Synthetic both']
+    for key in keys:
+        lines.append(f'{key:24s} | ' + ' | '.join(
+            f'{replacements[mode][key]["paired_mae"]:12.2f}' for mode in replacements))
+    lines += ['Mixed operands measure replacement sensitivity; errors are not additive causal contributions.']
     lines += ['PARAMETERS: generator.json (aggregate moments/conditional distributions only)',
               'COMPARE_JSON_BEGIN', json.dumps(comparison), 'COMPARE_JSON_END']
     (args.output / 'summary.log').write_text('\n'.join(lines) + '\n')

@@ -174,3 +174,26 @@ def test_cross_head_joint_variation_survives_generation():
     for seed in range(5):
         generated = generate(parameters, 128, seed)
         np.testing.assert_allclose(generated['weights'][:, 0], -generated['weights'][:, 1])
+
+
+def test_replacement_keeps_weight_scale_with_query(monkeypatch):
+    import fit_generator
+    names = ('query', 'weights', 'query_scale', 'keys', 'key_scale')
+    real = {name: np.array([i + 1.]) for i, name in enumerate(names)}
+    generated = {name: value * 10 for name, value in real.items()}
+    seen = []
+    def inspect(row, fraction):
+        seen.append(row)
+        return {'value': float(row['query'][0])}
+    monkeypatch.setattr(fit_generator, 'metrics', inspect)
+    fit_generator.replacement_metrics(real, generated, .1)
+    for name in names[:3]:
+        assert seen[0][name] is real[name]
+        assert seen[1][name] is generated[name]
+    for name in names[3:]:
+        assert seen[0][name] is generated[name]
+        assert seen[1][name] is real[name]
+    report = fit_generator.replacement_summary(
+        [{'value': 2.}, {'value': 2.}], [{'mode': {'value': 1.}}, {'mode': {'value': 3.}}])
+    assert report['mode']['value']['paired_bias'] == 0
+    assert report['mode']['value']['paired_mae'] == 1
