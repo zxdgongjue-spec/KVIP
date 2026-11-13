@@ -107,3 +107,25 @@ python experiments/split_core/check_history_replay.py --baseline tests/results/r
 ## 串行/Fusion3/分核统一表
 
 `python3 experiments/split_core/compare_pipelines.py`核对9条历史全链记录、各自对照和1条新main NOT_RUN行。`--write --plot`重建CSV与图（绘图需要matplotlib）。详见[可比范围与结果](../../docs/research/split_core/pipeline-comparison.md)。导入的Fusion3 capture不是本MR新执行的Model，单次whole-Model计数不换算物理时间。
+
+## 全通路分核审计与msprof trace
+
+[全通路审计](../../docs/research/split_core/end_to_end_schedule.md)区分当前条件P2/Final T1、固定3B角色与4W条带Fetch，以及旧serial6/Fusion3和独立P32/T8研究入口。[交互对比](../../docs/research/split_core/scheduling-traces.html)含本次TopK指令PIPE占用、历史Fusion3原始完成包络及静态依赖图。
+
+本次真实执行的是`msprof op simulator`，B1/Q4/H128K/G32/m205/V56，分别T1与T8。选中core0 V0/V1，获得3个官方trace.json，完整TopK oracle与Model正常footer通过。它不是当前整链或真机采集。旧serial6/Fusion3可视化是已归档B1/H8192/R4096/zero-miss raw的只读导入。
+
+精确本轮环境、命令、logging config、driver/score SHA及局限见`results/scheduling-trace-recipe.json`与`results/scheduling-trace-evidence.json`。只修改了本任务隔离config的logging mask0x1；`--core-id=0`仅控制解析，不能代替logging mask。采集时排他预约，完成后释放。source/SDK mapping warnings原样保留；PIPE图不声称完整源码hotspot或stall归因。
+
+原始官方Chrome trace和dump保留本机`.aiinfra/local/SPLIT-CORE-007`，不提交大型Trace；`exports/topk-t1-local.trace.json`、`topk-t8-local.trace.json`、`topk-t8-merge.trace.json`可拖入Chrome tracing或MindStudio Insight。仓库HTML是同PIPE原始区间的精确union视图，并非逐指令详细视图；每kernel独立归零，不把不同clock域或不同run拼为一次全链耗时。
+
+在拥有本次原始capture metadata及两个固定SHA历史raw包时，可离线重建可视化：
+
+```bash
+python3 experiments/split_core/scheduling_trace.py \
+  --current .aiinfra/local/SPLIT-CORE-007 \
+  --baseline-archive "$KVIP_FUSION3_ARCHIVE_DIR/mainv4-baseline-zero-b1-h32-r1.tar.gz" \
+  --fused-archive "$KVIP_FUSION3_ARCHIVE_DIR/mainv4-candidate-zero-b1-h32-r1.tar.gz" \
+  --output docs/research/split_core
+```
+
+只读摘要/原始文件校验不能替代当前streaming全链/NPU验收。当前完整生产路径的同128K输入前后trace仍待建立，不能拿这些小形状历史图或TopK图代替。

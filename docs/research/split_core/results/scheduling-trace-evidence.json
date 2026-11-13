@@ -1,0 +1,397 @@
+{
+  "schema_version": 1,
+  "source": {
+    "head": "f8155235c0bc4d946d1310f3fcc510053fdb0343",
+    "driver_sha256": "590c34b7e7403b291852d001c922b17b090834cc88517dc8b1ea27faa03af5c2",
+    "kernel_source_sha256": "72ad7ef31263a37e8af4d749c0c688c9c8c2b359ab9c1ce32ceae5dd7c583556",
+    "score_sha256": "dc2a9d09fea46b519d039ee8ca5c65142c6c240ecb0dc6987939d414885b5f41",
+    "config_sha256": "29dc949c0c47d3c45e7034986fdc5782552eb49fae5e679885b3493d42bd01ef",
+    "physical_npu": false,
+    "scope": "current TopK only, B1/Q4/H131072/G32/m205/T1 vs T8/V56; selected core0 family, not whole chain"
+  },
+  "tool": {
+    "command": [
+      "docker",
+      "exec",
+      "kvip-splitcore007",
+      "bash",
+      "-lc",
+      "/usr/local/Ascend/cann-9.1.0/bin/msprof op simulator --version"
+    ],
+    "recording": "transcribed from actual inspection output earlier in this task; not a profiling rerun",
+    "observed_output": "msopprof is part of MindStudio Operator-dev Tools.\nmsopprof vesion is 26.1.0-56632dc4a944410c791538451dc2156a151bd105\nmsopscommon version is b4ffdb3d6ba7acdb7bbfcf359f6e4dd5b587a4f4\n"
+  },
+  "current_scope": "NEW Model capture: TopK only B1/Q4/H131072/G32/m205/V56, log mask0x1, core0 V0/V1 only",
+  "historical_scope": "IMPORTED raw capture: B1/Q4/H8192/R4096/G32/zero-MISS/Service0/GM-copy; LI splitQ0, 1C/2V",
+  "historical_collector_exit_code": -15,
+  "historical_collector_status": "terminated; Model/oracle and raw coverage passed; not clean collector exit",
+  "physical_npu": false,
+  "variants": [
+    {
+      "shards": 1,
+      "whole_model_ticks": 50481,
+      "oracle_sha256": "e6dfbfdd7a5ea90ac28e5cc14f61b35d33d1775e7b41e788ab92dfc48cd72e4c",
+      "capture_log_sha256": "e64c8bbe4d5f3e9a4c2ec97760e3bb062ea27909663cf196aac31e1bc77ba6dc",
+      "warnings": [
+        "[WARN]  Currently, the root permission is used, which is unrecommended. Please ensure the security of the execution environment and programs.",
+        "[WARN]   path: /work/t1/profile/OPPROF_20261113024251_QKYTRPBKNQKYZPYF/device0/split_topk_local_1/0/dump/aicore_binary.o is not readable"
+      ]
+    },
+    {
+      "shards": 8,
+      "whole_model_ticks": 25910,
+      "oracle_sha256": "4ed61fe86a303c39eebd1b92f90d5005958ccb9fe4d9b7b9bb289409cdcc242a",
+      "capture_log_sha256": "2e0c5c0693564291b638df9abac527f98cc007e07bebcea12ded1257bb94ff38",
+      "warnings": [
+        "[WARN]  Currently, the root permission is used, which is unrecommended. Please ensure the security of the execution environment and programs.",
+        "[WARN]   path: /work/t8/profile/OPPROF_20261113024143_IXMFCXLOKBSDRHXS/device0/split_topk_local_1/0/dump/aicore_binary.o is not readable",
+        "[WARN]   path: /work/t8/profile/OPPROF_20261113024143_IXMFCXLOKBSDRHXS/device0/split_topk_merge_2/0/dump/aicore_binary.o is not readable"
+      ]
+    }
+  ],
+  "profiles": [
+    {
+      "label": "T1 local",
+      "shards": 1,
+      "phase": "local",
+      "raw_trace": ".aiinfra/local/SPLIT-CORE-007/exports/topk-t1-local.trace.json",
+      "raw_trace_sha256": "c5b2f2528b6ac19eb414dc449eb15b65521672d94f0985ad3fda57c84bb9e78d",
+      "raw_trace_bytes": 47491852,
+      "native_core_footers": [
+        {
+          "file": "core0.veccore0.instr_log.dump",
+          "sha256": "4757de8d9c5b49e5c485c8d6c81b032ebb787c024a39e2d3e58868774b7c0a30",
+          "core": 0,
+          "subcore": 1,
+          "start": 212,
+          "tick": 50358,
+          "block": 0,
+          "blocks": 4
+        },
+        {
+          "file": "core0.veccore1.instr_log.dump",
+          "sha256": "53e5c3cf2ad5085abdde73ff71ddd737e7e7e439fc81e8fe736edb66563962df",
+          "core": 0,
+          "subcore": 2,
+          "start": 213,
+          "tick": 49412,
+          "block": 1,
+          "blocks": 4
+        }
+      ],
+      "sampled_blocks": 2,
+      "launched_blocks": 4,
+      "vendor_clock": "original msprof simulator ts/dur (us fields); no hardware calibration",
+      "x_events": 53398,
+      "origin": 0.3799999952316284,
+      "end": 27.81444455496967
+    },
+    {
+      "label": "T8 local",
+      "shards": 8,
+      "phase": "local",
+      "raw_trace": ".aiinfra/local/SPLIT-CORE-007/exports/topk-t8-local.trace.json",
+      "raw_trace_sha256": "558d66a5fab26a2246a98f04ee0827b4bdc48504874a31d9998f79de281b3c0d",
+      "raw_trace_bytes": 6275112,
+      "native_core_footers": [
+        {
+          "file": "core0.veccore0.instr_log.dump",
+          "sha256": "21ac367eb70415e17f0ca590da0ce551945a5c67240a9c29c5c6cd379a856bcd",
+          "core": 0,
+          "subcore": 1,
+          "start": 209,
+          "tick": 9155,
+          "block": 0,
+          "blocks": 32
+        },
+        {
+          "file": "core0.veccore1.instr_log.dump",
+          "sha256": "23b8f36c8cbf2c62f2416720c4fde63a8f69a1f2c4c349f1ac113eaed6dfefdd",
+          "core": 0,
+          "subcore": 2,
+          "start": 210,
+          "tick": 10183,
+          "block": 1,
+          "blocks": 32
+        }
+      ],
+      "sampled_blocks": 2,
+      "launched_blocks": 32,
+      "vendor_clock": "original msprof simulator ts/dur (us fields); no hardware calibration",
+      "x_events": 7340,
+      "origin": 0.3777777850627899,
+      "end": 5.493888868018985
+    },
+    {
+      "label": "T8 merge",
+      "shards": 8,
+      "phase": "merge",
+      "raw_trace": ".aiinfra/local/SPLIT-CORE-007/exports/topk-t8-merge.trace.json",
+      "raw_trace_sha256": "510c8179c5156c55f09ef904b246a6dd8b045b22953d25091424cf69883781c6",
+      "raw_trace_bytes": 6473382,
+      "native_core_footers": [
+        {
+          "file": "core0.veccore0.instr_log.dump",
+          "sha256": "e0314f88512f8563bc07695a74e4d3df5e8291014eb2661a82d148f852f12d01",
+          "core": 0,
+          "subcore": 1,
+          "start": 11114,
+          "tick": 24560,
+          "block": 0,
+          "blocks": 4
+        },
+        {
+          "file": "core0.veccore1.instr_log.dump",
+          "sha256": "02aa9db7b1c32ca0daf5d3dd15f93c847a6cd3e5782eca2146905ca528e0af9d",
+          "core": 0,
+          "subcore": 2,
+          "start": 11115,
+          "tick": 25861,
+          "block": 1,
+          "blocks": 4
+        }
+      ],
+      "sampled_blocks": 2,
+      "launched_blocks": 4,
+      "vendor_clock": "original msprof simulator ts/dur (us fields); no hardware calibration",
+      "x_events": 8356,
+      "origin": 6.17722225189209,
+      "end": 14.165555967018008
+    }
+  ],
+  "historical": {
+    "serial6": {
+      "archive": "mainv4-baseline-zero-b1-h32-r1.tar.gz",
+      "archive_sha256": "70c1529c99d62e0d476dd904fbf4c151ab3805c0e7559f02be67cb1a96f698c4",
+      "canonical_rows": [
+        {
+          "kernel": "kvop_direct_apply_owned_kernel_1",
+          "stage": "Apply",
+          "raw_member": "mainv4-baseline-zero-b1-h32-r1/_model_raw_snapshot/kvop_direct_apply_owned_kernel_1/0/dump/core0.veccore0.instr_log.dump",
+          "raw_sha256": "1dc4e6c15cc6c74b92c8a7915cd315d5fefce55ce10b9c6b0aa998c170f5124d",
+          "core": 0,
+          "subcore": 1,
+          "start": 217938,
+          "tick": 220747,
+          "block": 0,
+          "blocks": 4
+        },
+        {
+          "kernel": "kvop_direct_apply_owned_kernel_1",
+          "stage": "Apply",
+          "raw_member": "mainv4-baseline-zero-b1-h32-r1/_model_raw_snapshot/kvop_direct_apply_owned_kernel_1/0/dump/core0.veccore1.instr_log.dump",
+          "raw_sha256": "a9c7413858a16a75414e4a675ee9b1ccd9193a05c957d6d160217c215e7c0d7c",
+          "core": 0,
+          "subcore": 2,
+          "start": 217939,
+          "tick": 220758,
+          "block": 1,
+          "blocks": 4
+        },
+        {
+          "kernel": "kvop_direct_apply_owned_kernel_1",
+          "stage": "Apply",
+          "raw_member": "mainv4-baseline-zero-b1-h32-r1/_model_raw_snapshot/kvop_direct_apply_owned_kernel_1/0/dump/core1.veccore0.instr_log.dump",
+          "raw_sha256": "3f133de8e516ab3e03b24523b2252c442001f28a6175a17e9a03afa6dd4cb279",
+          "core": 1,
+          "subcore": 1,
+          "start": 217940,
+          "tick": 220596,
+          "block": 2,
+          "blocks": 4
+        },
+        {
+          "kernel": "kvop_direct_apply_owned_kernel_1",
+          "stage": "Apply",
+          "raw_member": "mainv4-baseline-zero-b1-h32-r1/_model_raw_snapshot/kvop_direct_apply_owned_kernel_1/0/dump/core1.veccore1.instr_log.dump",
+          "raw_sha256": "149b395dfb8e6c0402aedcf05fde1ebb7394f0ee1ad7bba97235af9e69b0ffd2",
+          "core": 1,
+          "subcore": 2,
+          "start": 217941,
+          "tick": 220811,
+          "block": 3,
+          "blocks": 4
+        },
+        {
+          "kernel": "kvop_direct_update_outputs_early_kernel_3",
+          "stage": "PublishPlan",
+          "raw_member": "mainv4-baseline-zero-b1-h32-r1/_model_raw_snapshot/kvop_direct_update_outputs_early_kernel_3/0/dump/core0.veccore0.instr_log.dump",
+          "raw_sha256": "a0bdff1259cc8a24248036b68604dda82b81b4fba2752e5fe469b765b114abb4",
+          "core": 0,
+          "subcore": 1,
+          "start": 123068,
+          "tick": 217709,
+          "block": 0,
+          "blocks": 1
+        },
+        {
+          "kernel": "v9_fetch_update_kernel_1",
+          "stage": "FetchUpdate",
+          "raw_member": "mainv4-baseline-zero-b1-h32-r1/_model_raw_snapshot/v9_fetch_update_kernel_1/0/dump/core0.veccore0.instr_log.dump",
+          "raw_sha256": "a9e629ceb116d7512d82dd111c9d894d7b925c203725c0cc8356763d2e8413a9",
+          "core": 0,
+          "subcore": 1,
+          "start": 221027,
+          "tick": 238979,
+          "block": 0,
+          "blocks": 1
+        },
+        {
+          "kernel": "v9_init_kernel_2",
+          "stage": "Init",
+          "raw_member": "mainv4-baseline-zero-b1-h32-r1/_model_raw_snapshot/v9_init_kernel_2/0/dump/core0.veccore0.instr_log.dump",
+          "raw_sha256": "20fc4ddcbed6cd282de792292dcaa7ff0b49027d9b5c99607697217021b704e9",
+          "core": 0,
+          "subcore": 1,
+          "start": 211,
+          "tick": 13494,
+          "block": 0,
+          "blocks": 1
+        },
+        {
+          "kernel": "v9_li_kernel_0_mix_aic",
+          "stage": "LI",
+          "raw_member": "mainv4-baseline-zero-b1-h32-r1/_model_raw_snapshot/v9_li_kernel_0_mix_aic/0/dump/core0.cubecore0.instr_log.dump",
+          "raw_sha256": "443fa8a5ce2d52d86375a5f5a572f9abc95c7049afe36dd984c2e2f1667fb8d3",
+          "core": 0,
+          "subcore": 0,
+          "start": 13712,
+          "tick": 84489,
+          "block": 0,
+          "blocks": 1
+        },
+        {
+          "kernel": "v9_li_kernel_0_mix_aic",
+          "stage": "LI",
+          "raw_member": "mainv4-baseline-zero-b1-h32-r1/_model_raw_snapshot/v9_li_kernel_0_mix_aic/0/dump/core0.veccore0.instr_log.dump",
+          "raw_sha256": "6655241418c48ff99f618ae12ec94465a230c05abfd4e7e1dada8860e3b2fc55",
+          "core": 0,
+          "subcore": 1,
+          "start": 13713,
+          "tick": 93006,
+          "block": 0,
+          "blocks": 1
+        },
+        {
+          "kernel": "v9_li_kernel_0_mix_aic",
+          "stage": "LI",
+          "raw_member": "mainv4-baseline-zero-b1-h32-r1/_model_raw_snapshot/v9_li_kernel_0_mix_aic/0/dump/core0.veccore1.instr_log.dump",
+          "raw_sha256": "c164387168120d941b6e7c71d0082fb3725cf977e5eb8dc287691f8ca95f2849",
+          "core": 0,
+          "subcore": 2,
+          "start": 13714,
+          "tick": 93506,
+          "block": 0,
+          "blocks": 1
+        },
+        {
+          "kernel": "v9_resolve_kernel_4",
+          "stage": "Resolve",
+          "raw_member": "mainv4-baseline-zero-b1-h32-r1/_model_raw_snapshot/v9_resolve_kernel_4/0/dump/core0.veccore0.instr_log.dump",
+          "raw_sha256": "7301d3e86e33fe3773f508f2c52b5c7e5c1867f85f81b43c35f557c5fefaa882",
+          "core": 0,
+          "subcore": 1,
+          "start": 93758,
+          "tick": 122844,
+          "block": 0,
+          "blocks": 2
+        },
+        {
+          "kernel": "v9_resolve_kernel_4",
+          "stage": "Resolve",
+          "raw_member": "mainv4-baseline-zero-b1-h32-r1/_model_raw_snapshot/v9_resolve_kernel_4/0/dump/core0.veccore1.instr_log.dump",
+          "raw_sha256": "9f0a710be2d92a56af33dda66acfe43481bc663864d08f1f30a709d23f5d9b8d",
+          "core": 0,
+          "subcore": 2,
+          "start": 93759,
+          "tick": 119870,
+          "block": 1,
+          "blocks": 2
+        }
+      ],
+      "native_origin": 211,
+      "native_end": 238979,
+      "native_span": 238768,
+      "clock": "native Model start/tick; not vendor trace us or hardware time"
+    },
+    "Fusion3": {
+      "archive": "mainv4-candidate-zero-b1-h32-r1.tar.gz",
+      "archive_sha256": "b01b81860a69c3d7d1904ccf1dddd270861e72718ce5a2a9282b9e3aee9a3fc4",
+      "canonical_rows": [
+        {
+          "kernel": "v9_fusion3_tail_kernel_3",
+          "stage": "Fusion3 Tail",
+          "raw_member": "mainv4-candidate-zero-b1-h32-r1/_model_raw_snapshot/v9_fusion3_tail_kernel_3/0/dump/core0.veccore0.instr_log.dump",
+          "raw_sha256": "ccead58c41563dc062aff8f6ec74d579d2f6486909573d9c2cafd4bc0fe5b05c",
+          "core": 0,
+          "subcore": 1,
+          "start": 92765,
+          "tick": 182435,
+          "block": 0,
+          "blocks": 1
+        },
+        {
+          "kernel": "v9_init_kernel_4",
+          "stage": "Init",
+          "raw_member": "mainv4-candidate-zero-b1-h32-r1/_model_raw_snapshot/v9_init_kernel_4/0/dump/core0.veccore0.instr_log.dump",
+          "raw_sha256": "e6d16433fb6013afa63f1973c72bc50494aa504763eee268238b0de7d3475863",
+          "core": 0,
+          "subcore": 1,
+          "start": 215,
+          "tick": 13213,
+          "block": 0,
+          "blocks": 1
+        },
+        {
+          "kernel": "v9_li_kernel_0_mix_aic",
+          "stage": "LI",
+          "raw_member": "mainv4-candidate-zero-b1-h32-r1/_model_raw_snapshot/v9_li_kernel_0_mix_aic/0/dump/core0.cubecore0.instr_log.dump",
+          "raw_sha256": "eb1dc7e334b5fb8bef732a54bf546c6c7ac01ac04ae0161ca0978050b384af3e",
+          "core": 0,
+          "subcore": 0,
+          "start": 13431,
+          "tick": 83290,
+          "block": 0,
+          "blocks": 1
+        },
+        {
+          "kernel": "v9_li_kernel_0_mix_aic",
+          "stage": "LI",
+          "raw_member": "mainv4-candidate-zero-b1-h32-r1/_model_raw_snapshot/v9_li_kernel_0_mix_aic/0/dump/core0.veccore0.instr_log.dump",
+          "raw_sha256": "9569564a36138a31e17cfca0fe8f9a90bbe322a608dca8b5edcced1d1bfa52ac",
+          "core": 0,
+          "subcore": 1,
+          "start": 13432,
+          "tick": 91992,
+          "block": 0,
+          "blocks": 1
+        },
+        {
+          "kernel": "v9_li_kernel_0_mix_aic",
+          "stage": "LI",
+          "raw_member": "mainv4-candidate-zero-b1-h32-r1/_model_raw_snapshot/v9_li_kernel_0_mix_aic/0/dump/core0.veccore1.instr_log.dump",
+          "raw_sha256": "1374642eda1a7940493cec3d840d779e21cddc593e29cb69984168f00540d80c",
+          "core": 0,
+          "subcore": 2,
+          "start": 13433,
+          "tick": 92494,
+          "block": 0,
+          "blocks": 1
+        }
+      ],
+      "native_origin": 215,
+      "native_end": 182435,
+      "native_span": 182220,
+      "clock": "native Model start/tick; not vendor trace us or hardware time"
+    }
+  },
+  "limitations": [
+    "Current complete streaming has no matching full-chain capture",
+    "P32/T8 is not integrated into production Final/Service",
+    "Only selected core0 V0/V1, not all active blocks",
+    "Vendor trace and native Model counters shown in separate domains",
+    "Pipe occupancy is an exact interval union, not instruction details or stall attribution",
+    "Raw full Chrome trace stays local",
+    "Historical smoke is not the128K standard, and was not rerun in this task"
+  ]
+}

@@ -50,3 +50,7 @@ CPU/构建验证包括当前预算与F4布局、graph启动期分配/错误传�
 研究优先级是P/T联合规划、精确阈值的有界候选压缩、非均匀尾部、低桥接局部通路与range-ready/Service deadline联合计划。独立核池、队列、双缓冲已有先例，不作为首创。结构模型覆盖60场景，不等于60场景实测。
 
 导出包保留日志与数据hash、独立审查范围及旧计时撤回标识；不提交driver、运行库、权重或大型原始tensor。离线verifier只核摘要/日志/表一致性，完整数值复核需要按复现入口重放。重建的历史标准输入20个共享文件均与原输入hash一致，binary和Model计数仍需重新建立同binary控制。
+
+## 全通路分核审计与trace
+
+[源码审计、前后差异与依赖图](end_to_end_schedule.md)、[交互式trace对比](scheduling-traces.html)、[当前TopK msprof PIPE图](topk-msprof-pipes.png)和[历史serial6/Fusion3包络](historical-fusion3-native-envelope.png)已补充。当前生产是条件P2/T1＋固定3B角色与按batch条带Fetch；P32/T8尚未整链接入，也没有按miss字节动态均衡。新抓2轮TopK Model得到3份官方trace，选中core0 V0/V1；完整当前streaming硬件trace仍未采集。见`results/scheduling-trace-evidence.json`及capture recipe。
