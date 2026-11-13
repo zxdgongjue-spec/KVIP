@@ -1,5 +1,7 @@
 # 分核研究与KVIP主仓集成状态
 
+[状态机、同核复用与自适应分核方案](adaptive_scheduling_plan.md)进一步给出逐阶段工作量维度、42组适用区间、P/O复用与独立Index的混合设计、ready/credit负载均衡和归因实验方案。[42组结构计数](results/adaptive-standard42.csv)及[336行轴展开](results/adaptive-workloads.csv)由可重跑脚本生成；均未标定延迟，不代表新增Model执行或生产调度已接入。
+
 本分支基于KVIP主仓main **13d2898**，同步独立预算核心、60场景脚本、实验源码与结果。使用干净派生分支，提交供MR审查，保持Draft、不合入。
 
 ## 已接入核心的内容

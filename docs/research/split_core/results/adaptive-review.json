@@ -1,0 +1,35 @@
+{
+  "scope": "independent consultative review; not a formal aiinfra gate or hardware acceptance",
+  "source_base": "155fa9707d67fa95a028df485592240f0dd23138",
+  "reviewed_sha256": {
+    "docs/research/split_core/adaptive_scheduling_plan.md": "4f8aaa6e88f8321cbe69a73ce2a4a49e5a64d9d705a8af6c6dacc5772d594808",
+    "experiments/split_core/adaptive_plan.py": "9efd1eff0348e3e6f445f946cc01a903809c461a21d964ef9aba899c2abdba92"
+  },
+  "reviewers": [
+    {
+      "agent": "/root/source_audit",
+      "result": "accepted after corrections",
+      "coverage": "Source facts, all 20 source hashes, complete P2 eligibility and rounds, UB and dependency rules, 336/42 generated rows byte-for-byte",
+      "corrections": "cold-only admission vs hot-victim total; UINTMAX reset and log capacity; cooperative progress resource"
+    },
+    {
+      "agent": "/root/model_audit",
+      "result": "accepted after corrections",
+      "coverage": "Independent arithmetic, 240 static-entry-admissible and 96 inadmissible analytical rows, candidate interface crossover, actual 12-test CPU run",
+      "corrections": "normalize stage work by service rate; all CP comparisons use time; cold-only bound"
+    },
+    {
+      "agent": "/root/papers",
+      "result": "accepted after corrections",
+      "coverage": "Attribution, frozen experimental controls, literature applicability and distinction of hypotheses from evidence",
+      "corrections": "cold set C_b vs count M_b; repair may already cover non-prefetched demand; clock/time units and source links"
+    }
+  ],
+  "new_device_runs": 0,
+  "residuals": [
+    "No calibrated tail policy A/B or NPU measurement",
+    "B24/32 production ABI/owner/progress work remains proposed",
+    "Existing 42-case fixture is homogeneous across batch"
+  ],
+  "formatting_addendum": "CSV writer explicitly uses LF, no count or analytical semantics change; final CPU checks rerun"
+}

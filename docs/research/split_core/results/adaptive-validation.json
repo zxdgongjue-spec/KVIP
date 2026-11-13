@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "scope": "CPU structural accounting validation; no new Model/NPU execution",
+  "source_base": "155fa9707d67fa95a028df485592240f0dd23138",
+  "executed_utc": "2026-11-13T05:34:32.232934+00:00",
+  "platform": "macOS-27.2-arm64-arm-64bit",
+  "checks": [
+    {
+      "argv": [
+        "/Users/iantargaryen/Documents/ChatGPT/KVIP_split_core_opt/.aiinfra/local/SPLIT-CORE-003/venv/bin/python",
+        "-m",
+        "pytest",
+        "tests/runtime/test_split_core_planner.py",
+        "-q",
+        "-p",
+        "no:cacheprovider"
+      ],
+      "exit_code": 0,
+      "log": "docs/research/split_core/results/adaptive-pytest.log",
+      "sha256": "b33632f1430ce0b5613db6927aa9428be40f9ba4c14734049ef9438acb7ebe3a"
+    },
+    {
+      "argv": [
+        "/Users/iantargaryen/Documents/ChatGPT/KVIP_split_core_opt/.aiinfra/local/SPLIT-CORE-003/venv/bin/ruff",
+        "check",
+        "experiments/split_core/adaptive_plan.py",
+        "tests/runtime/test_split_core_planner.py"
+      ],
+      "exit_code": 0,
+      "log": "docs/research/split_core/results/adaptive-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    {
+      "argv": [
+        "/Users/iantargaryen/Documents/ChatGPT/KVIP_split_core_opt/.aiinfra/local/SPLIT-CORE-003/venv/bin/ruff",
+        "format",
+        "--check",
+        "experiments/split_core/adaptive_plan.py",
+        "tests/runtime/test_split_core_planner.py"
+      ],
+      "exit_code": 0,
+      "log": "docs/research/split_core/results/adaptive-format.log",
+      "sha256": "3bc53bf3e981a98a34a852e175bf9b77af841edea74fca595d9aedcbaf9a4938"
+    }
+  ],
+  "artifacts_sha256": {
+    "docs/research/split_core/adaptive_scheduling_plan.md": "4f8aaa6e88f8321cbe69a73ce2a4a49e5a64d9d705a8af6c6dacc5772d594808",
+    "experiments/split_core/adaptive_plan.py": "9efd1eff0348e3e6f445f946cc01a903809c461a21d964ef9aba899c2abdba92",
+    "tests/runtime/test_split_core_planner.py": "8d2f2d41c4027bf0d6f1c5f47a0a30e786b2746f793a954ba784d99e9285dc08",
+    "docs/research/split_core/results/adaptive-standard42.csv": "70f1885b9a6ae5a5dc21ffe325e5301642a22328c57ccaa873ddf09bb6d7134a",
+    "docs/research/split_core/results/adaptive-workloads.csv": "95186e72c6a1042543d107685bafb1127e2582d1f396ff7d7f4a9cfcf099249f",
+    "docs/research/split_core/results/adaptive-workloads.json": "4ff2382c740b08fff9cf671c0ef23380adf2e77b97410e2e99ec8ab622327c95"
+  },
+  "base_cases": 42,
+  "analytical_variants": 336,
+  "new_device_runs": 0,
+  "production_scheduler_changed": false,
+  "latency_calibrated": false,
+  "full_tail_policy_ab": "NOT_RUN",
+  "hardware_acceptance": "PENDING",
+  "independent_review_receipt": "adaptive-review.json"
+}

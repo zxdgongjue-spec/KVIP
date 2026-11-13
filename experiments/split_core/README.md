@@ -129,3 +129,9 @@ python3 experiments/split_core/scheduling_trace.py \
 ```
 
 只读摘要/原始文件校验不能替代当前streaming全链/NPU验收。当前完整生产路径的同128K输入前后trace仍待建立，不能拿这些小形状历史图或TopK图代替。
+## 自适应调度的结构计数
+
+`python3 experiments/split_core/adaptive_plan.py --output docs/research/split_core/results`
+读取当前客户42组定义，生成C32/V64、C28/V56 × G32/G64 × 656/2624B的336行分析。
+这不是设备执行器或延迟模拟器；实际prefetch/repair、DRAM流量和时间保持未知。
+参见[完整分阶段方案](../../docs/research/split_core/adaptive_scheduling_plan.md)。
