@@ -279,7 +279,8 @@ def main(argv=None):
     if a.native_union_fit and a.li_only_varlen:
         p.error("--native-union-fit is for the full-chain Native MTP baseline, not LI-only")
     if a.li_only_varlen and (
-        a.transport != 'urma' or batches != [4] or a.history != 8192 or a.resident != 2048
+        a.transport != 'urma' or batches != [4]
+        or a.history % 128 or a.resident % 128 or a.history <= a.resident
         or a.index_heads != 32
         or (round(2048 * a.miss_percent / 100) != 1 if a.cold_prefetch_probe
             else a.miss_percent != 0)
@@ -287,10 +288,17 @@ def main(argv=None):
         or a.runtime_shapes or a.resolver_compare or a.comparison_output or a.comparison_sfa
     ):
         p.error(
-            'li-only-varlen requires URMA, batch=4, history=8192, resident=2048, '
+            'li-only-varlen requires URMA, batch=4, 128-aligned history>resident, '
             'index-heads=32, miss-percent=0 (or one cold miss/query in cold probe), '
             'prefetch-tokens=0 or 64, and no runtime/resolver comparisons'
         )
+    # Keep P1-C0/C1 hardcoded fixtures isolated from the general B1 Epoch audit.
+    if a.li_only_varlen and a.prefetch_payload_audit and a.resident != 2048:
+        p.error('P1-C0 payload audit requires resident=2048')
+    if a.li_only_varlen and a.cold_prefetch_probe and (
+        a.history != 8192 or a.resident != 2048
+    ):
+        p.error('P1-C1 cold-prefetch probe retains its H8192/R2048 fixture')
     state = ROOT / 'build/dependencies.json'
     kvaf_root = (a.kvaf_root or (Path(json.loads(state.read_text())['kvaf']) if state.exists()
                                  else ROOT / 'third_party/KVAF')).resolve()
