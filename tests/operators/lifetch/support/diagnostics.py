@@ -513,17 +513,17 @@ def level_two_tables(result):
             continue
         tables = {}
         def emit(target, title, headers, rows, identity_columns):
-            if result.get('level', 2) >= 3:
+            if result.get('level', 2) >= 3 and target is not algorithm_lines:
                 target.append(diagnostic_table(title, headers, rows))
             else:
                 entry = tables.setdefault(title, (target, headers, [], identity_columns))
                 entry[2].extend(rows)
-        if result.get('level', 2) == 2:
-            label = (f"Source: {capture['source']} | samples={len(capture['samples'])}; "
+        label = (f"Source: {capture['source']} | samples={len(capture['samples'])}; "
                      'varying metrics: mean [min, max]; identical values shown once. '
                      'Core times are relative to each replay; Last is the last-finisher frequency.')
+        if result.get('level', 2) == 2:
             lines.append(label)
-            algorithm_lines.append(label)
+        algorithm_lines.append(label)
         for sample in capture['samples']:
             repeat = sample['repeat']
             if result.get('level', 2) >= 3:
@@ -537,8 +537,18 @@ def level_two_tables(result):
                     rows.append([core['block'], core['role'], core['start_us'], core['end_us'],
                                  core['duration_us'], '*' if core['block'] == timeline['last_block'] else ''])
                     # Intervals are retained individually; no addition of nested ranges.
+                    gaps = [stage for stage in core['stages'] if stage['name'].startswith('control_gap')]
+                    if gaps:
+                        phases.append([core['block'], 'control gaps: total', None, None,
+                                       sum(stage['duration_us'] for stage in gaps), None])
+                        phases.append([core['block'], 'control gaps: max', None, None,
+                                       max(stage['duration_us'] for stage in gaps), None])
                     for stage in core['stages']:
-                        phases.append([core['block'], stage['name'], stage['start_us'],
+                        if stage['name'].startswith('control_gap'):
+                            continue
+                        if core['role'].startswith('resolver') and stage['name'].endswith(('.output', '.descriptor')):
+                            continue
+                        phases.append([core['block'], stage['name'].replace('safe.prepare', 'safe.prepare (includes request waits)').replace('conflict.prepare', 'conflict.prepare (includes request waits)'), stage['start_us'],
                                        stage['end_us'], stage['duration_us'],
                                        stage['end_cycles'] - stage['start_cycles']
                                        if 'end_cycles' in stage and 'start_cycles' in stage else None])
@@ -577,16 +587,15 @@ def level_two_tables(result):
                 services = requests[0].get('prefetch_services', [])
                 service_rows, service_times = [], []
                 for event in services:
-                    identity = [event['event'], event['core'], event['epoch']]
+                    identity = [event['event'], event['core'], event['epoch'], event.get('lane')]
                     service_rows.append([*identity, event['bitmap_bytes'], event['candidate_count'], event['posted_count']])
                     for label, key in (('scan', 'scan_cycles'), ('candidates', 'candidate_cycles'), ('submit/copy', 'post_cycles')):
                         service_times.append([*identity, label, event[key], event[key] / mhz if mhz else None])
                 if service_rows and result.get('level', 2) >= 3:
-                    algorithm_lines.append(f"Source: {capture['source']} | repeat={repeat}")
-                    algorithm_lines.append(diagnostic_table('Prefetch service work',
-                        ['Event', 'Service core', 'Epoch', 'Bitmap bytes', 'Candidates', 'Posted'], service_rows))
+                    emit(algorithm_lines, 'Prefetch service work',
+                        ['Event', 'Core pair', 'Epoch', 'Lane', 'Bitmap bytes', 'Candidates', 'Posted'], service_rows, 4)
                     lines.append(diagnostic_table('Prefetch service steps (URMA submission / UBmem copy)',
-                        ['Event', 'Service core', 'Epoch', 'Step', 'Cycles', 'Duration us'], service_times))
+                        ['Event', 'Core pair', 'Epoch', 'Lane', 'Step', 'Cycles', 'Duration us'], service_times))
                 li_rows = []
                 for request in requests:
                     for q, values in enumerate(request.get('li', []), 1):
@@ -596,7 +605,7 @@ def level_two_tables(result):
                                         'wait_second', 'classify_second', 'bitmap_merge', 'publish')]])
                 if result.get('level', 2) >= 3:
                     lines.append(diagnostic_table('LI TopK classification (overlaps must not be summed)',
-                        ['Request', 'Q', 'Map wait', 'Barrier', 'Load1', 'Classify1', 'Wait2', 'Classify2', 'Bitmap', 'Publish'], li_rows))
+                        ['Request', 'Q', 'Map wait', 'Barrier', 'Load1', 'Classify1+pipe wait', 'Wait2', 'Classify2+pipe wait', 'Bitmap', 'Publish'], li_rows))
                 rows = []
                 for request in requests:
                     for q, producer in enumerate(request.get('producer', [])):
@@ -608,15 +617,10 @@ def level_two_tables(result):
                             *[us(producer.get(key)) for key in ('resolve', 'output', 'pack', 'publish')],
                             us(waits[q+1]) if len(waits) > q+1 else None,
                             us(update[q+1]) if len(update) > q+1 else None])
-                if result.get('level', 2) >= 3:
-                    lines.append(diagnostic_table('Per-Q resolver / update', ['Request', 'Q', 'Resolve', 'Output',
-                        'Descriptor', 'Publish', 'Update wait', 'Update apply'], rows))
-                else:
+                if result.get('level', 2) < 3:
                     emit(lines, 'Per-Q resolver / update',
                         ['Request', 'Q', 'Resolve', 'Update wait', 'Update apply'],
                         [[row[i] for i in (0, 1, 2, 6, 7)] for row in rows], 2)
-            if result.get('level', 2) >= 3:
-                algorithm_lines.append(f"Source: {capture['source']} | repeat={repeat}")
             traffic = []
             for request in sample.get('algorithm', {}).get('requests', []):
                 demand, cold = request.get('selected_unique'), request.get('initial_cold')

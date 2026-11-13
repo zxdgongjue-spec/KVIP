@@ -75,3 +75,14 @@ def test_trace_failure_preserves_unprofiled_partial_record(tmp_path):
     assert rows[0]['serial_mean_us'] == 100 and rows[0]['fused_mean_us'] == 80
     assert rows[0]['timing'] == 'COMPLETE' and not rows[0]['accepted']
     assert rows[0]['execution'] == 'INCOMPLETE'
+
+
+def test_late_assertion_overrides_prior_pass_but_preserves_timings(tmp_path):
+    from types import SimpleNamespace
+    from reporting import atomic_json, collect_results, record_case_failure
+    atomic_json(tmp_path / 'completed_timings.json', dict(batch=4, correctness='PASS', timing=dict(
+        native_chain=timing_summary([100]), prototype_with_update=timing_summary([80]))))
+    record_case_failure(tmp_path, AssertionError('TopK changed'))
+    rows = collect_results(tmp_path, SimpleNamespace(transport='urma', mode='diagnose', batches=(4,)), 1)
+    assert rows[0]['execution'] == 'FAILED' and rows[0]['correctness'] == 'FAIL'
+    assert rows[0]['fused_mean_us'] == 80 and not rows[0]['accepted']

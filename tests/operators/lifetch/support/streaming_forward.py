@@ -138,6 +138,7 @@ class StreamingForward(LIFetchForward):
                     continue  # Profiling-disabled events are not measured zero-work events.
                 words = event.view('<u4')
                 services.append(dict(event=event_index, core=int(words[4]), epoch=int(words[5]),
+                    lane=event_index % self.rotating.service_lanes,
                     begin_cycles=int(event[0]), end_cycles=int(event[1]),
                     scan_cycles=int(event[5]), candidate_cycles=int(event[6]), post_cycles=int(event[7]),
                     bitmap_bytes=int(event[8]), candidate_count=int(event[9]), posted_count=int(event[10])))

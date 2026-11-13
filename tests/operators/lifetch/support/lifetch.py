@@ -13,7 +13,7 @@ from kvip.operators.lifetch.forward import LIFetchForward
 from kvip.runtime.loader import load_lifetch_library
 from prefetch_audit import actual_reads, completion_failures, score_rows, selected_bounds
 from runner import progress
-from reporting import CorrectnessRecorder, atomic_json, timing_summary
+from reporting import CorrectnessRecorder, atomic_json, record_case_failure, timing_summary
 
 ROOT = Path(__file__).resolve().parents[4]
 SOURCE = ROOT / "csrc/operators/lightning_indexer_with_fetch"
@@ -191,7 +191,8 @@ def run(args, run_dir):
                     build_options={k: str(v) for k, v in options.items()},
                 )
                 (folder / "report.json").write_text(json.dumps(report, indent=2))
-            except BaseException:
+            except BaseException as error:
+                record_case_failure(folder, error)
                 (folder / "error.log").write_text(traceback.format_exc())
                 raise
             finally:
@@ -520,6 +521,7 @@ def run_device(
         for i, seed in zip((1, 4, 13), saved):
             arguments[i].copy_(seed)
         update.logical.copy_(update.identity)
+        state.pop("before_logical", None)
         rotating.hot_valid.fill_(1)
         if bench_only:
             rotating.lru_slots.copy_(order_snapshot[0])

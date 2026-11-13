@@ -174,6 +174,7 @@ def test_level_two_tables_keep_replay_core_and_query_identity():
     result['level'] = 3
     assert 'URMA group counters' in level_two_tables(result)
     assert 'Core work / wait intervals' in level_two_tables(result)
+    assert 'Per-Q resolver / update' not in level_two_tables(result)
     result['transport'] = 'ubmem'
     assert 'URMA group counters' not in level_two_tables(result)
 
@@ -213,6 +214,31 @@ def test_level_two_repeats_are_aggregated_without_mutating_raw_samples():
     assert 'repeat=' not in output
     assert result == original
     result['level'] = 3
-    assert level_two_tables(result).count('Demand and actual reads') == 3
+    assert level_two_tables(result).count('Demand and actual reads') == 1
     assert aggregate_diagnostic_rows([[3, 'fetch', 2., '*'], [3, 'fetch', 4., '']], 2) == [
         [3, 'fetch', '3.000 [2.000, 4.000]', '1/2']]
+
+
+def test_initial_reset_clears_stateful_logical_snapshot():
+    import ast
+    from pathlib import Path
+    from types import SimpleNamespace
+    # Execute the production reset with lightweight buffers; no NPU imports.
+    source = ast.parse(Path(__file__).with_name('lifetch.py').read_text())
+    reset = next(node for node in ast.walk(source) if isinstance(node, ast.FunctionDef)
+                 and node.name == 'reset' and 'update.logical' in ast.unparse(node))
+    class Buffer:
+        def copy_(self, value):
+            self.value = value
+        def fill_(self, value):
+            self.value = value
+    state = {'before_logical': [3, 2, 1], 'keep': 42}
+    logical = Buffer()
+    scope = dict(owner=SimpleNamespace(in_flight=False, reset=lambda: None, mark_launched=lambda: None),
+        saved=[], arguments=[], update=SimpleNamespace(logical=logical, identity=[0, 1, 2]),
+        state=state, rotating=SimpleNamespace(hot_valid=Buffer(), lru_slots=Buffer(), reserved_hot=Buffer()),
+        bench_only=True, order_snapshot=([], []))
+    exec(compile(ast.Module(body=[reset], type_ignores=[]), '<production reset>', 'exec'), scope)
+    scope['reset']()
+    assert logical.value == [0, 1, 2]
+    assert state == {'keep': 42}

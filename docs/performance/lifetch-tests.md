@@ -461,4 +461,9 @@ level2继承level1的统计含义，level3继承level2；同一字段不随level
 预取内部打点由诊断开关控制，两种 transport 均发布完整 Event；普通 bench 使用关闭打点的模板分支。采样结果保存在 `diagnostic.json`、`timeline.csv` 和 `level3_summary.log`，终端与对应 summary 使用同一组表格。cycles 按设备计数时钟换算为 µs，内部嵌套区间不累加为总耗时。
 
 
-Level2 每个 case 只打印一组汇总表：相同计数保留单值，波动指标显示 `mean [min, max]`。每核时间使用各次 replay 的相对时间，带宽在各次 replay 内计算后再汇总；Last 列显示该核最后结束的次数/采样数。Level3 展示逐次采样的完整明细，原始 JSON/CSV 保留全部采样。
+Level2 每个 case 只打印一组汇总表：相同计数保留单值，波动指标显示 `mean [min, max]`。每核时间使用各次 replay 的相对时间，带宽在各次 replay 内计算后再汇总；Last 列显示该核最后结束的次数/采样数。Level3 的算法表也按采样汇总，核时间线逐次展示；原始 JSON/CSV 保留全部采样。
+
+
+Level3 的算法与 KV 流量表同样按采样汇总一次；时间线保留逐次 replay。逐Q Resolver/Update 的耗时直接查看核时间线，不再重复打印同一张简表。预取服务使用 core pair、lane、epoch 标识；小控制间隙在终端显示总量及最大值，CSV 保留全部区间。Resolver 的占位 Output/Descriptor 时间戳不作为实际操作耗时展示，输出及打包耗时查看 output_pack 核。LI 分类区间标注管线等待，不能当作纯分类计算成本。
+
+若后续专项校验失败，最终结果显示 FAILED/FAIL；此前完成的性能样本保留，不能用此前的 PASS 替代整个测试的结果。
