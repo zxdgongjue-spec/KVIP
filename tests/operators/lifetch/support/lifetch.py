@@ -100,9 +100,17 @@ def run(args, run_dir):
         progress(run_dir, f"BS={batch}: {stage}; logs={folder}")
         with native_log(folder / "native.log"):
             common, data, build = (folder / "fixture", folder / "input", shared_build)
-            fixture_info = prepare_full_chain_fixture(
-                common, args.history, args.resident, args.miss_percent, index_heads=args.index_heads, seed=getattr(args, "seed", 20261104)
-            )
+            pool = getattr(args, 'shared_pool', None)
+            fixture_key = ('urma', args.history, args.resident, args.miss_percent, args.index_heads, getattr(args, 'seed', 20261104))
+            if pool is not None and fixture_key in pool.fixtures:
+                cached_path, fixture_info = pool.fixtures[fixture_key]
+                common.symlink_to(cached_path.resolve(), target_is_directory=True)
+            else:
+                fixture_info = prepare_full_chain_fixture(
+                    common, args.history, args.resident, args.miss_percent,
+                    index_heads=args.index_heads, seed=getattr(args, 'seed', 20261104))
+                if pool is not None:
+                    pool.fixtures[fixture_key] = (common, fixture_info)
             geometry = li_geometry(batch, "auto", args.intermediate_fetches, aics, 0)
             batch_inputs(common, data, batch, args.history, geometry["rotating_aic"])
             weights = np.fromfile(data / "arg2.bin", np.float32)

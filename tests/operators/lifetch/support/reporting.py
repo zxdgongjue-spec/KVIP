@@ -152,4 +152,8 @@ def collect_results(directory, config, exit_code):
     if not rows:
         rows.append(comparison_row(directory.name, None, None, 'NOT_RUN',
                                    execution='FAILED' if exit_code else 'INCOMPLETE'))
+    miss_order = {miss: index for index, miss in enumerate(misses)}
+    batch_order = {batch: index for index, batch in enumerate(getattr(config, 'batches', ()) or ())}
+    rows.sort(key=lambda row: (miss_order.get(row.get('miss_percent'), len(miss_order)),
+                               batch_order.get(row.get('batch'), len(batch_order))))
     return rows

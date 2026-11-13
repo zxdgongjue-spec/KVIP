@@ -180,3 +180,9 @@ bench只测串行和融合完整图，不重复测Get-only/init-only；不重复
 多轮及padding专项，这些继续由check覆盖。读取量只在末次采样统计。
 日志中 `BENCH WALL COSTS` 单位是秒，描述测试框架的恢复、等待及校验成本，
 不是kernel阶段耗时；URMA另存 `bench_wall_costs.json`，UBmem保存在report的wall_costs中。
+
+共享池准备阶段分别记录 transport_create_link、ddr_allocate、reference_generate_cpu、
+reference_upload_hbm、ddr_put、access_table 的墙钟秒数，写入 `pool_phases.json`，
+并在最终 `BENCH SHARED POOL` 中汇总。Put使用固定HBM源地址及全局偏移，分块仅改变
+DDR目标列表；CPU参考数据分块生成，字节内容不变。同一miss的Q/Index fixture跨BS复用。
+进度与最终表格均遵循命令中的miss、BS顺序，不按目录名字典序排列。

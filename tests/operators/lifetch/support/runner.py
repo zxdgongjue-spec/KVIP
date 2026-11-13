@@ -12,6 +12,8 @@ from pathlib import Path
 
 def progress(run, stage):
     (run / "stage.log").write_text(stage + "\n")
+    if run.name.startswith('miss') and (run.parent / 'config.json').is_file():
+        (run.parent / 'stage.log').write_text(f'{run.name}: {stage}\n')
     print(stage, flush=True)
 
 

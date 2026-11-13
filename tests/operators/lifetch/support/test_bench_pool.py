@@ -25,8 +25,8 @@ def test_pool_puts_once_and_retains_tables_until_all_cases_complete(tmp_path, mo
 
         def batch_put(self, keys, source, offsets, lengths):
             events.append(('put', keys))
-            assert len(keys) == source.shape[0]
-            assert offsets == [i * 128 * 656 for i in range(len(keys))]
+            assert len(keys) <= source.shape[0]
+            assert offsets == [i * 128 * 656 for i in keys]
 
         def prepare_access_table(self, keys):
             events.append(('table', len(keys)))
@@ -83,3 +83,40 @@ def test_native_payload_check_uses_device_reference_and_detects_corruption():
     with pytest.raises(ValueError, match='payload_mismatch'):
         native.verify(selected)
     assert reference[0, 100, 655] == 1
+
+
+def test_put_chunks_keep_one_registered_source_and_global_offsets(tmp_path, monkeypatch):
+    calls = []
+    class Runtime:
+        def __init__(self, *args, **kwargs):
+            pass
+        def link_to(self, *args):
+            pass
+        def initialize(self, *args):
+            pass
+        def batch_put(self, keys, source, offsets, lengths):
+            calls.append((source.data_ptr(), keys, offsets, lengths))
+        def prepare_access_table(self, keys):
+            return keys
+        def access_table_view(self, table, **kwargs):
+            return SimpleNamespace(addresses=torch.arange(len(table)), valid=torch.ones(len(table)))
+        def release_access_table(self, table):
+            pass
+        def shutdown(self):
+            pass
+    monkeypatch.setitem(sys.modules, 'kvaf', SimpleNamespace(NpuRuntime=Runtime))
+    monkeypatch.setattr(torch, 'npu', SimpleNamespace(synchronize=lambda: None), raising=False)
+    pool = BenchPool(SimpleNamespace(batches=(2,), history=16384, transport='urma',
+                                    kvaf_root=tmp_path, kvaf_server='test:1'))
+    pool.borrow(torch, torch.device('cpu'), 2, 16384, 2)
+    assert len(calls) == 2 and calls[0][0] == calls[1][0]
+    assert [key for _, keys, _, _ in calls for key in keys] == list(range(256))
+    for _, keys, offsets, lengths in calls:
+        assert offsets == [key * 128 * 656 for key in keys]
+        assert lengths == [128 * 656] * len(keys)
+    from contract_payload import payload
+    import numpy as np
+    for row in range(2):
+        assert np.array_equal(pool.cpu_payload[row].numpy(), payload(row, np.arange(16384)))
+    pool.release()
+    pool.close()

@@ -98,7 +98,13 @@ def check_shape(
 ):
     batch, history, resident, token_bytes = shape.batch, shape.history, shape.resident, shape.token_bytes
     checks = CorrectnessRecorder()
-    fixture = controlled_fixture(history, resident, shape.heads, miss_percent, seed=seed)
+    fixture_key = ('ubmem', history, resident, shape.heads, miss_percent, seed)
+    if shared_pool is not None and fixture_key in shared_pool.fixtures:
+        fixture = shared_pool.fixtures[fixture_key]
+    else:
+        fixture = controlled_fixture(history, resident, shape.heads, miss_percent, seed=seed)
+        if shared_pool is not None:
+            shared_pool.fixtures[fixture_key] = fixture
     expected_ids = fixture["expected"]
     cold_count = fixture["native_miss_union"]
     logical_scales = fixture["scales"]
@@ -700,6 +706,9 @@ def main(argv=None, *, shared_pool=None):
         elif library.resolve() != selected_library:
             raise AssertionError("Runtime shape change unexpectedly rebuilt UBmem LIFetch")
         for prefetch_tokens in args.prefetch_tokens:
+            if args.result_output is not None:
+                from runner import progress
+                progress(args.result_output.parent, f'UBmem BS={batch} miss={args.miss_percent:g}: paired benchmark')
             passed = check_shape(
                 kvaf,
                 torch,

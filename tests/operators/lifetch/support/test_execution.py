@@ -116,8 +116,20 @@ def test_matrix_dispatch_collects_twenty_pairs_without_npu(tmp_path, monkeypatch
         summary, = output.rglob('summary.json')
         rows = json.loads(summary.read_text())['cases']
         assert len(rows) == 20
+        assert [(row['miss_percent'], row['batch']) for row in rows] == [
+            (miss, bs) for miss in (3, 5, 10, 15) for bs in (1, 2, 4, 8, 16)]
         assert {(row['batch'], row['miss_percent']) for row in rows} == {
             (bs, miss) for bs in (1, 2, 4, 8, 16) for miss in (3, 5, 10, 15)}
         assert all(row['transport'] == transport and row['accepted'] for row in rows)
         assert all(row['serial_mean_us'] == 105 and row['fused_mean_us'] == 85 for row in rows)
         assert 'Serial p50/p99' in summary.with_name('summary.log').read_text()
+
+
+def test_nested_miss_progress_reaches_supervised_worker(tmp_path):
+    from runner import progress
+    (tmp_path / 'config.json').write_text('{}')
+    child = tmp_path / 'miss15'
+    child.mkdir()
+    progress(child, 'BS=8: paired benchmark')
+    assert (child / 'stage.log').read_text().strip() == 'BS=8: paired benchmark'
+    assert (tmp_path / 'stage.log').read_text().strip() == 'miss15: BS=8: paired benchmark'

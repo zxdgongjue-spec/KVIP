@@ -133,14 +133,23 @@ def run_config(path, shared_pool=None):
             for miss in misses:
                 child = path.parent / f'miss{miss:g}' / 'config.json'
                 atomic_json(child, {**json.loads(path.read_text()), 'miss_percent': miss})
+                progress(path.parent, f'BENCH START miss={miss:g} batches={config.batches}')
                 failed |= run_config(child, shared_pool=pool)
+                cases_log = child.parent / 'cases.log'
+                if cases_log.is_file():
+                    with (path.parent / 'cases.log').open('a') as output:
+                        output.write(cases_log.read_text())
+                progress(path.parent, f'BENCH DONE miss={miss:g}')
             pool.close()
             stats = dict(transport=config.transport, max_batch=max(config.batches),
                          cases=pool.borrows, runtime_workers=pool.workers,
                          put_bytes=max(config.batches) * config.history * 656,
-                         additional_case_put_bytes=0)
+                         additional_case_put_bytes=0, initialization_seconds=pool.phase_times)
             atomic_json(path.parent / 'pool.json', stats)
-            print(f'BENCH SHARED POOL: {stats}', flush=True)
+            pool_line = f'BENCH SHARED POOL: {stats}'
+            with (path.parent / 'cases.log').open('a') as output:
+                output.write(pool_line + '\n')
+            print(pool_line, flush=True)
         except BaseException:
             # Unknown transfer completion: retain registered buffers until process exit.
             import traceback
