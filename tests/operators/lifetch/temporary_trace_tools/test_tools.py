@@ -47,3 +47,20 @@ def test_current_schema_preserved(tmp_path):
     capture = load_score_capture(tmp_path/'output/schema4/manifest.json')
     assert capture.executable
     assert capture.arrays['real.keys'].shape == (1,4096,128)
+
+
+def test_padding_owners_and_topk_are_not_requests():
+    from collect_fit_targets import legacy_rows
+    arrays = {
+        'before.row_owners': np.array([1, -1, 0, 999]),
+        'before.logical_ids': np.tile(np.arange(4096), (2,1)),
+        'before.hot_valid': np.ones((2,2048), dtype=np.uint8),
+        'before.query_valid': np.array([[1,1,1,1],[0,0,0,0],[1,0,0,0],[0,0,0,0]]),
+        'after.logical_topk': np.full((4,4,2048), -1, dtype=np.int32),
+    }
+    arrays['after.logical_topk'][0] = np.arange(2048)
+    arrays['after.logical_topk'][2,0] = np.arange(2048)
+    rows = legacy_rows(arrays, {'sample':0})
+    assert [r['row'] for r in rows] == [0,2]
+    assert [r['active_queries'] for r in rows] == [4,1]
+    assert all(r['selected_unique'] == 2048 for r in rows)
