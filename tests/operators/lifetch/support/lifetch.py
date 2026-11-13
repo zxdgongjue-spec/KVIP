@@ -208,13 +208,13 @@ def run(args, run_dir):
                 native_bw = f"{old['effective_GBps']:.2f}" if old['effective_GBps'] is not None else '--'
                 fused_bw = f"{new['effective_GBps']:.2f}" if new['effective_GBps'] is not None else '--'
                 lines.append(f"{query} | {old['aiv']} | 2 | {old['count']} | {old['safe_count']}/{old['conflict_count']} | {old['bytes']} | "
-                             f"{old['p50_us']:.3f}/{old['p99_us']:.3f} | {native_bw} | "
-                             f"{new['p50_us']:.3f}/{new['p99_us']:.3f} | {fused_bw} | {delta:+.2f}%")
+                             f"{old['p50_us']:.2f}/{old['p99_us']:.2f} | {native_bw} | "
+                             f"{new['p50_us']:.2f}/{new['p99_us']:.2f} | {fused_bw} | {delta:+.2f}%")
             for r in results:
                 lines.extend(r.get('stages', []))
                 if r['version'] == 'fused_before':
                     after = next(x for x in results if x['query'] == r['query'] and x['version'] == 'fused')
-                    lines.append(f"FIX A/B {r['query']}: before={r['p50_us']:.3f} after={after['p50_us']:.3f} us change={(after['p50_us']/r['p50_us']-1)*100:+.2f}%")
+                    lines.append(f"FIX A/B {r['query']}: before={r['p50_us']:.2f} after={after['p50_us']:.2f} us change={(after['p50_us']/r['p50_us']-1)*100:+.2f}%")
             lines.append('Q1-Q4 are individual queries; Q4_all runs all four concurrently. Zero-entry cases measure launch/control only.')
             line = '\n'.join(lines)
             summaries.append(line)
@@ -225,8 +225,8 @@ def run(args, run_dir):
         line = (
             f"binary_sha256={built_digest} early_fetch={args.early_fetch} streaming={args.streaming} q_workers={args.q_workers}\nBS={batch} prototype {report.get('correctness', 'PASS')} index_heads={args.index_heads} windows={geometry['intermediate_fetches']} requested_windows={args.intermediate_fetches} history={args.history} hot={args.resident} topk=2048 Q=4 graph=True\n"
             + "graph_p50_us="
-            + ", ".join((f"{k}:{v['p50_us']:.3f}" for k, v in times.items()))
-            + f"\nfull_speedup={times['native_chain']['p50_us'] / times['prototype_with_update']['p50_us']:.3f}x"
+            + ", ".join((f"{k}:{v['p50_us']:.2f}" for k, v in times.items()))
+            + f"\nfull_speedup={times['native_chain']['p50_us'] / times['prototype_with_update']['p50_us']:.2f}x"
             + "; full=init + LI/Fetch/resolve + service output mapping + Index update; fixture restore/verification and SFA/LRU CPU excluded\n"
             + f"SFA_max_abs={report['sfa']['max_abs']:.6g}; stateful_rounds={report['stateful_rounds']} "
             + f"native_unique_misses={report['native_misses_per_request']}"

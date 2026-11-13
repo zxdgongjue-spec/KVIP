@@ -87,7 +87,7 @@ def test_level_one_requests_intervals_and_zero_bandwidth(tmp_path):
         assert report['trace'] == 'COMPLETE'
         log = (root / 'diagnostic_summary.log').read_text()
         assert 'request=0 initial_hot_valid=16384 selected_unique=2048 initial_cold=0' in log
-        assert 'start_us=0.000 end_us=10.000 duration_us=10.000' in log
+        assert 'start_us=0.00 end_us=10.00 duration_us=10.00' in log
         assert 'GB/s=N/A' in log
         assert 'window candidates' not in log
         assert not (root / 'timeline.csv').exists()
@@ -158,9 +158,9 @@ def test_level_two_tables_keep_replay_core_and_query_identity():
     sample['final_get_bandwidth'] = dict(groups=[dict(block=3, query=1, lane=0, entries=1, bytes=656)])
     output = level_two_tables(result)
     assert 'Per-Fetch-block effective bandwidth' in output
-    assert '0.109' in output  # 656 bytes / 6 us, decimal GB/s.
+    assert '0.11' in output  # 656 bytes / 6 us, decimal GB/s.
     for value in ('samples=1', 'fetch Q1 lane0', 'Window prefetch / unused',
-                  'Per-Q demand / repair', 'Per-Q resolver / update', '1.000', '2.000'):
+                  'Per-Q demand / repair', 'Per-Q resolver / update', '1.00', '2.00'):
         assert value in output
     assert 'URMA group counters' not in output
     assert 'Core work / wait intervals' not in output
@@ -191,7 +191,7 @@ def test_level_three_prefetch_counts_and_time_are_separated():
     assert 'Prefetch service work' in algorithm
     assert 'Prefetch service steps' not in algorithm
     assert 'Prefetch service steps' in timing
-    assert 'submit/copy' in timing and '3.000' in timing and 'Cycles' in timing
+    assert 'submit/copy' in timing and '3.00' in timing and 'Cycles' in timing
     result['level'] = 2
     assert 'Prefetch service' not in level_two_tables(result)
 
@@ -210,13 +210,13 @@ def test_level_two_repeats_are_aggregated_without_mutating_raw_samples():
     assert output.count('Demand and actual reads') == 1
     assert output.count('Window prefetch / unused') == 1
     assert output.count('Per-Q demand / repair') == 1
-    assert '6.000 [4.000, 8.000]' in output
+    assert '6.00 [4.00, 8.00]' in output
     assert 'repeat=' not in output
     assert result == original
     result['level'] = 3
     assert level_two_tables(result).count('Demand and actual reads') == 1
     assert aggregate_diagnostic_rows([[3, 'fetch', 2., '*'], [3, 'fetch', 4., '']], 2) == [
-        [3, 'fetch', '3.000 [2.000, 4.000]', '1/2']]
+        [3, 'fetch', '3.00 [2.00, 4.00]', '1/2']]
 
 
 def test_initial_reset_clears_stateful_logical_snapshot():
@@ -242,3 +242,12 @@ def test_initial_reset_clears_stateful_logical_snapshot():
     scope['reset']()
     assert logical.value == [0, 1, 2]
     assert state == {'keep': 42}
+
+
+def test_display_precision_preserves_integer_counts():
+    from diagnostics import format_metric
+    assert format_metric(2.539174847615422) == '2.54'
+    assert format_metric(23.755) == '23.75'
+    assert format_metric(0.0) == '0.00'
+    assert format_metric(59696) == '59696'
+    assert format_metric(None) == 'N/A'

@@ -10,6 +10,10 @@ from reporting import atomic_json
 from summarize_core_timeline import decode
 
 
+def format_metric(value):
+    return 'N/A' if value is None else f'{value:.2f}' if isinstance(value, float) else str(value)
+
+
 def distribution(values):
     data = np.asarray(values, dtype=np.float64)
     return dict(mean_us=float(data.mean()), p50_us=float(np.median(data)),
@@ -232,8 +236,8 @@ def summarize(directory, config):
     for capture in result['captures']:
         lines.append(f"source={capture['source']}")
         for stage, values in capture['stage_summary'].items():
-            lines.append(f"{stage}: mean={values['mean_us']:.3f} p50={values['p50_us']:.3f} "
-                         f"min={values['min_us']:.3f} max={values['max_us']:.3f} us n={values['samples']}")
+            lines.append(f"{stage}: mean={values['mean_us']:.2f} p50={values['p50_us']:.2f} "
+                         f"min={values['min_us']:.2f} max={values['max_us']:.2f} us n={values['samples']}")
     for capture in result['captures']:
         for sample in capture['samples']:
             repeat = sample.get('repeat', sample.get('round'))
@@ -244,15 +248,15 @@ def summarize(directory, config):
                 if stage not in capture['stage_summary']:
                     continue
                 for start, end in spans:
-                    lines.append(f'STAGE repeat={repeat} stage={stage} start_us={start-origin:.3f} '
-                                 f'end_us={end-origin:.3f} duration_us={end-start:.3f}')
+                    lines.append(f'STAGE repeat={repeat} stage={stage} start_us={start-origin:.2f} '
+                                 f'end_us={end-origin:.2f} duration_us={end-start:.2f}')
             lines.append(f"ACCOUNTING repeat={repeat} gap_us={accounting.get('inter_kernel_gap_us', 'N/A')} "
                          f"boundary_us={accounting.get('boundary_residual_us', 'N/A')}")
             for metric in ('prefetch_bandwidth', 'final_get_bandwidth', 'combined_observed_bandwidth'):
                 if metric in sample:
                     bandwidth = sample[metric]
                     lines.append(f"BANDWIDTH repeat={sample['repeat']} metric={metric} "
-                                 f"bytes={bandwidth['bytes']} span_us={bandwidth['span_us'] if bandwidth['span_us'] is not None else 'N/A'} GB/s={bandwidth['GBps'] if bandwidth['GBps'] is not None else 'N/A'}")
+                                 f"bytes={bandwidth['bytes']} span_us={format_metric(bandwidth['span_us'])} GB/s={format_metric(bandwidth['GBps'])}")
                     if bandwidth.get('note'):
                         lines.append(f"  scope: {bandwidth['note']}")
             algorithm = sample.get('algorithm', {})
@@ -275,8 +279,8 @@ def summarize(directory, config):
             lines.append(f"FETCH-ONLY {row['query']} {row['version']} "
                          f"aiv={row['aiv']} jettys/aiv={row['jettys_per_aiv']} "
                          f"entries={row['count']} bytes={row['bytes']} "
-                         f"mean/p50/p99_us={row['mean_us']:.3f}/{row['p50_us']:.3f}/{row['p99_us']:.3f} "
-                         f"GB/s={row['effective_GBps']}")
+                         f"mean/p50/p99_us={row['mean_us']:.2f}/{row['p50_us']:.2f}/{row['p99_us']:.2f} "
+                         f"GB/s={format_metric(row['effective_GBps'])}")
     lines.extend('INCOMPLETE: ' + value for value in result['missing'])
     lines.extend('N/A: ' + value for value in result['unavailable'])
     (directory / 'diagnostic_summary.log').write_text('\n'.join(lines) + '\n')
@@ -421,7 +425,7 @@ def algorithm_after(rotating, before):
 def level_one_tables(result):
     """Compact terminal view; raw intervals and scopes remain in diagnostic.json."""
     def cell(value):
-        return 'N/A' if value is None else f'{value:.3f}' if isinstance(value, float) else str(value)
+        return format_metric(value)
 
     def table(title, headers, rows):
         values = [headers, *[[cell(value) for value in row] for row in rows]]
@@ -467,7 +471,7 @@ def level_one_tables(result):
 
 def diagnostic_table(title, headers, rows):
     def cell(value):
-        return 'N/A' if value is None else f'{value:.3f}' if isinstance(value, float) else str(value)
+        return format_metric(value)
     values = [headers, *[[cell(value) for value in row] for row in rows]]
     widths = [max(len(row[i]) for row in values) for i in range(len(headers))]
     def line(row):
@@ -490,7 +494,7 @@ def aggregate_diagnostic_rows(rows, identity_columns):
             elif all(value == column[0] for value in column):
                 output.append(column[0])
             elif all(isinstance(value, (int, float)) for value in column):
-                output.append(f'{sum(column)/len(column):.3f} [{min(column):.3f}, {max(column):.3f}]')
+                output.append(f'{sum(column)/len(column):.2f} [{min(column):.2f}, {max(column):.2f}]')
             else:
                 output.append(' / '.join(dict.fromkeys('N/A' if value is None else str(value) for value in column)))
         result.append(output)
@@ -531,7 +535,7 @@ def level_two_tables(result):
             timeline = sample.get('timeline')
             if timeline:
                 if result.get('level', 2) >= 3:
-                    lines.append(f"Last block={timeline['last_block']} | observed span={timeline['observed_span_us']:.3f} us")
+                    lines.append(f"Last block={timeline['last_block']} | observed span={timeline['observed_span_us']:.2f} us")
                 rows, phases = [], []
                 for core in timeline['cores']:
                     rows.append([core['block'], core['role'], core['start_us'], core['end_us'],
