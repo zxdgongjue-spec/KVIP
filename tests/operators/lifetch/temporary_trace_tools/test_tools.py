@@ -217,3 +217,20 @@ def test_query_direction_and_weights_share_random_factors():
                                    result['weights'][:, 0], rtol=.07, atol=.02)
         np.testing.assert_allclose(result['query'][:, 1, 1] / 8,
                                    result['weights'][:, 1], rtol=.07, atol=.02)
+
+
+def test_compact_generator_needs_no_profile_and_is_reproducible():
+    from compact_generator import generate
+    first = generate(8192, seed=17)
+    second = generate(8192, seed=17)
+    assert first['query'].shape == (4, 32, 128)
+    assert first['keys'].shape == (8192, 128)
+    for name in first:
+        np.testing.assert_array_equal(first[name], second[name])
+        assert np.isfinite(first[name]).all()
+    zero = np.all(first['keys'] == 0, axis=1)
+    assert zero.sum() == round(8192 * .0099182)
+    assert np.all(first['key_scale'][zero] == 1)
+    assert not np.array_equal(first['query'], generate(8192, seed=18)['query'])
+    with pytest.raises(ValueError):
+        generate(1)

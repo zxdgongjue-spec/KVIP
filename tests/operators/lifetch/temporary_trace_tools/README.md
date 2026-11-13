@@ -187,3 +187,33 @@ python tests/operators/lifetch/temporary_trace_tools/fit_generator.py \
 All three replacement comparisons still run on held-out captures. Version 3
 parameter files must not be passed to this version. No additional Index-tail
 fix is claimed; the replacement table continues to measure that remaining error.
+
+### Compact built-in generator (no parameter transfer)
+
+The usable small generator is `compact_generator.py`. It needs **no real trace,
+no generator.json and no fitting step**. Constants were calibrated locally from
+the previously supplied aggregate logs, not copied from the version 4 model.
+It models a shared Index direction, negative-weight head alignment, correlated
+Q4, a small weak-scale tail, and paired zero-key/default-scale rows.
+
+```bash
+python tests/operators/lifetch/temporary_trace_tools/compact_generator.py \
+  --output /tmp/lifetch-compact --save-operands
+```
+
+`summary.log` compares 32 generated snapshots (8192 keys each) against the supplied
+real-log averages. `--save-operands` additionally saves one full-history synthetic
+operand set to `operands.npz`; `--history` defaults to 131072. Arrays are decoded
+float32; Q/keys are rounded to E4M3FN and weights to BF16. This NPZ is not the
+full replay schema: cache state and transport inputs are not included.
+Python callers can use `generate(history=131072, heads=32, seed=...)` directly.
+The default 32-head configuration is the calibrated one. The bench fixture has
+not been switched by this change.
+
+Local CPU evaluation (seed 20261104, 32 snapshots, 8192 keys) produced:
+Jaccard 0.91 vs reference 0.87; union ratio 1.10 vs 1.14; score p50 -2167.87
+vs -2037.68; p90 -1548.11 vs -1570.17; p99 -394.45 vs -477.53.
+This is comparison to aggregate reference logs, not paired validation against
+real tensors. Per-request, per-head, temporal, and cache-residency distributions
+are not reproduced by these few constants. In particular, weight/scale sharing
+across Q is a simplifying assumption, and overlap is slightly too high.
