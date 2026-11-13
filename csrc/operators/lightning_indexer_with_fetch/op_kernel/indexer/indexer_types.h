@@ -25,7 +25,6 @@ using namespace AscendC;
 namespace QLICommon {
 constexpr uint32_t KScaleTiles = KVIP_LI_SCALE_TILES ? KVIP_LI_SCALE_TILES : 16;
 
-
 // 与tiling的layout保持一致
 enum class LI_LAYOUT : uint32_t {
     BSND = 0,
@@ -77,6 +76,12 @@ struct RunInfo {
 
     bool isFirstS2InnerLoop;
     bool isLastS2InnerLoop;
+    // A physical S2 range boundary need not end the query's lifetime. Keep
+    // the existing key/scale range flags while continuing the same Q banks.
+    bool reuseQuery = false;
+    bool retainQuery = false;
+    __aicore__ inline bool LoadQuery() const { return isFirstS2InnerLoop && !reuseQuery; }
+    __aicore__ inline bool ReleaseQuery() const { return isLastS2InnerLoop && !retainQuery; }
     bool isAllLoopEnd = false;
     bool isValid = false;
 };

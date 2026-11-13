@@ -37,6 +37,7 @@ def _bind_selectors(torch, policy, config):
     if policy.indexer_selectors:
         raise RuntimeError("LIFetch selectors are already bound")
     launch_type = LIFetchBinding
+    threshold_bounds = getattr(policy, "threshold_bounds", None)
     libraries = {}
     selectors = {}
     for group, layer in enumerate(writer.groups):
@@ -80,6 +81,7 @@ def _bind_selectors(torch, policy, config):
             row_owners=workspace.inputs.row_owners,
             token_addresses=storage.addresses,
             tail_bounds=workspace.tail_bounds,
+            threshold_bounds=None if threshold_bounds is None else threshold_bounds[group, : setup.batch],
             output_stride=policy.slot_capacity,
             scratch=scratch,
         )

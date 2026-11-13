@@ -39,7 +39,7 @@ __aicore__ inline void OutputWorker(__gm__ Args* a,uint32_t b){
  auto ids=local[4*kSlots].ReinterpretCast<uint16_t>();
  auto slots=local[kFinalSlotsOffset],work=local[kFinalPositionsOffset],ctl=local[kFinalControlOffset];
  // Only counters and output masks need initialization. Context occupies
- // ctl[128:208]; clearing all 2560 words races its MTE2 snapshot when auto
+ // ctl[128:128+ceil(sizeof(Context)/32)*8]; clearing all 2560 words races its MTE2 snapshot when auto
  // synchronization is disabled. Keep the regions disjoint and explicitly
  // order Vector initialization before MTE2/SIMT consumers.
  constexpr uint32_t controlInitWords=64,contextOffset=128;
@@ -50,7 +50,7 @@ __aicore__ inline void OutputWorker(__gm__ Args* a,uint32_t b){
  bool enabled=u[20]&&u[21]&&u[22]&&u[23];
  auto logical=enabled?reinterpret_cast<__gm__ int64_t*>(u[3])+uint64_t(reinterpret_cast<__gm__ uint32_t*>(u[9])[b])*uint32_t(u[24]):nullptr;
  GlobalTensor<uint32_t> input;
- input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx));DataCopy(ctl[contextOffset],input,sizeof(Context)/4);
+ CopyContextSnapshot(ctl[contextOffset],ctx);
  auto staged=reinterpret_cast<__ubuf__ Context*>(ctl[contextOffset].GetPhyAddr());
  input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->selected)+b*kSlots);DataCopy(selected,input,kSlots);
  SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
