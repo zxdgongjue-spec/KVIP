@@ -16,6 +16,7 @@ VARIANTS = {
     "control-end": (),
     "metadata-end": ("selected_metadata",),
     "carry": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch"),
+    "window": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch"),
     "capacity": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch"),
     "tight": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch"),
     "direct": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "ready_direct_ranges"),
@@ -27,6 +28,7 @@ VARIANTS = {
 # every layer. Only prefetch admission changes; exact selection remains intact.
 ADMISSION = {
     "carry": (512, 64, 0, 1),
+    "window": (512, 128, 0, 1),
     "capacity": (768, 128, 0, 1),
     "tight": (768, 128, 1, 1),
     "direct": (768, 128, 0, 1),
