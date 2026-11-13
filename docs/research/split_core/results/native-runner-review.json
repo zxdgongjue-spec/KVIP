@@ -1,0 +1,36 @@
+{
+  "scope": "consultative independent source review and CPU validation, not formal gate or NPU acceptance",
+  "source_base": "daf06fe02a5cbbae52f9887c9e5b126723200dd8",
+  "reviewed_sha256": {
+    "docs/research/split_core/native_execution.md": "be10017bb205fff63d2ed747d56353ed5f5d45554025046833e329c33ae5fe5e",
+    "docs/research/split_core/stage_walkthrough.md": "2563440777fd771a984f45043598bf468f77c792a1d4077f9437b39474fc98a5",
+    "experiments/split_core/native_benchmark.py": "e54ed223963cb8477869ca6a31635dc51c5e0d7b44270787125be9276213100d",
+    "scripts/run_split_core_native.sh": "d4f01a84bdda993e99ea38071dc4d3b500c4058493ac967e0d387076e7888152",
+    "tests/runtime/test_split_core_native.py": "65fff10d299b0f168b9522d58e5e27c7fa259df7367036b2863e84e6db6efaad"
+  },
+  "reviewers": [
+    {
+      "agent": "/root/native_final_review",
+      "result": "accepted final code and native execution guide",
+      "independent_test": "34 passed in 0.56s",
+      "coverage": "actual harness outputs, strict URMA 14 arguments/fixture/BF16/unique misses, UBmem order, milliseconds, grouped launch, fail-closed lease"
+    },
+    {
+      "agent": "/root/stage_explainer",
+      "result": "accepted corrected walkthrough",
+      "coverage": "H/K/R vs M/D/E, T/W/V, C28/B16 mapping; corrected hypothetical prefetch to40 under B1cold admission64"
+    }
+  ],
+  "earlier_read_only_audits": [
+    "source_audit",
+    "model_audit",
+    "papers"
+  ],
+  "new_device_runs": 0,
+  "remaining": [
+    "No NPU run; actual transport/environment still required",
+    "No compatible serial6/Fusion3/new-split full42 runner",
+    "No production BS24/32 support",
+    "No raw event samples or stable P99 claim"
+  ]
+}

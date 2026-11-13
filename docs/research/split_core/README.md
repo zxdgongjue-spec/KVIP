@@ -1,5 +1,10 @@
 # 分核研究与KVIP主仓集成状态
 
+[Final到Output的算法例子与T/M/W/V解释](stage_walkthrough.md)用B1/Q4/10% miss区分H扫描、K分类、820个未满足位置、410个unique修复及8192个输出；同时说明大batch逻辑query数与实际核映射的区别。
+
+[可执行覆盖、真机分组脚本及指令/性能比较流程](native_execution.md)明确42组TopK与30组当前streaming的边界。新增真机入口按miss将30场景分为6个子进程，汇总毫秒与证据；未补齐历史serial6/Fusion3的全矩阵执行，也未执行新NPU测试。
+
+
 [状态机、同核复用与自适应分核方案](adaptive_scheduling_plan.md)进一步给出逐阶段工作量维度、42组适用区间、P/O复用与独立Index的混合设计、ready/credit负载均衡和归因实验方案。[42组结构计数](results/adaptive-standard42.csv)及[336行轴展开](results/adaptive-workloads.csv)由可重跑脚本生成；均未标定延迟，不代表新增Model执行或生产调度已接入。
 
 本分支基于KVIP主仓main **13d2898**，同步独立预算核心、60场景脚本、实验源码与结果。使用干净派生分支，提交供MR审查，保持Draft、不合入。

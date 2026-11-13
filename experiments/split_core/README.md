@@ -1,5 +1,7 @@
 # 分核实验与用例执行
 
+新增[真机分组入口与最快对比流程](../../docs/research/split_core/native_execution.md)：`bash scripts/run_split_core_native.sh plan --output tests/results/native-plan`可离线生成42行计划；`run`按miss分组执行当前streaming支持的30组并汇总event p50/p99毫秒，BS24/32显式标不支持。串行6/Fusion3/新分核三条完整通路尚无统一42组runner。
+
 当前集成与限制见 [研究入口](../../docs/research/split_core/README.md)。这里区分当前核心的组件验证、真实设备入口和81b1472历史实验；旧百分比不用于当前流式main。
 
 ## 当前42组：冒烟与客户用例
