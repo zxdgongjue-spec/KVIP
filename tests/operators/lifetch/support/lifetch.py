@@ -755,6 +755,79 @@ def run_v9_li_varlen_only(
         ):
             raise AssertionError("Q/K/query-end buffer addresses changed between forwards")
 
+        li_perf = None
+        if getattr(args, "li_core_perf", False):
+            if args.prefetch_tokens != 0:
+                raise AssertionError("P0-C1 LI-only profiling requires Prefetch=0")
+            # A valid warm state already exists after the correctness replay.
+            # Capture *only* v9_li. Do not include init, wait, Native QLI,
+            # KVAF setup, resets, CPU synchronization or Graph compilation.
+            # In Prefetch=0 the LI kernel does not enter Rotation Service.
+            graph = torch.npu.NPUGraph()
+            owner.graphs.append(graph)
+            capture_stream = torch.npu.Stream(device=device)
+            stream.synchronize()
+            with torch.npu.graph(graph, stream=capture_stream):
+                rotating._call("li")
+            capture_stream.synchronize()
+            graph.replay()
+            stream.synchronize()
+            # Replayed TopK must remain equivalent to the already-checked
+            # Native result before timing is allowed to contribute samples.
+            for row, q_len in enumerate(counts):
+                for query_index in range(q_len):
+                    actual = torch.sort(topk[row, query_index]).values
+                    expected = torch.sort(native_output[row, query_index]).values
+                    if not torch.equal(actual, expected):
+                        raise AssertionError(
+                            f"{scenario['name']}: captured LI Graph TopK mismatch "
+                            f"row={row} Q={query_index}"
+                        )
+                if topk[row, q_len:].numel() and not bool(
+                    torch.all(topk[row, q_len:] == -1).item()
+                ):
+                    raise AssertionError(f"{scenario['name']}: captured Graph padded output mismatch")
+
+            samples_us = []
+            for step in range(args.warmup + args.iterations):
+                start_event = torch.npu.Event(enable_timing=True)
+                end_event = torch.npu.Event(enable_timing=True)
+                start_event.record(stream)
+                graph.replay()
+                end_event.record(stream)
+                end_event.synchronize()
+                if step >= args.warmup:
+                    samples_us.append(float(start_event.elapsed_time(end_event) * 1000.0))
+            stream.synchronize()
+            if not samples_us or not all(np.isfinite(samples_us)):
+                raise AssertionError("P0-C1 device timing samples missing or invalid")
+            li_perf = dict(
+                scope="device_event_captured_v9_li_only",
+                warmup=args.warmup,
+                iterations=args.iterations,
+                samples_us=samples_us,
+                p50_us=float(np.median(samples_us)),
+                p95_us=float(np.percentile(samples_us, 95)),
+                minimum_us=float(np.min(samples_us)),
+                maximum_us=float(np.max(samples_us)),
+                initial_graph_topk_verified_against_native=True,
+                prefetch_disabled=True,
+                li_cores=int(rotating.runtime_shape.liCores),
+                split_q=int(rotating.runtime_shape.splitQ),
+            )
+            print(
+                "P0_C1_LI_GRAPH_TIMING "
+                f"scenario={scenario['name']} "
+                f"tiling={getattr(args, 'li_tiling', 'auto')} "
+                f"cores={li_perf['li_cores']} "
+                f"p50_us={li_perf['p50_us']:.3f} "
+                f"p95_us={li_perf['p95_us']:.3f}",
+                flush=True,
+            )
+            record_stage(
+                stage_log, scenario["name"], "li_graph_timing", "completed",
+                **{k: v for k, v in li_perf.items() if k != "samples_us"},
+            )
         record_stage(
             stage_log,
             scenario["name"],
@@ -784,6 +857,7 @@ def run_v9_li_varlen_only(
                 "active_queries_checked": active_queries,
                 "padded_queries_checked": padded_queries,
                 "native_vs_v9_li": "PASS",
+                "li_core_perf": li_perf,
                 "prefetch_cq": "PASS",
                 "epoch_completed_lanes": completed_lanes,
                 "epoch_skipped_lanes": skipped_lanes,
@@ -806,6 +880,7 @@ def run_v9_li_varlen_only(
         "soc": args.soc,
         "li_tiling": getattr(args, "li_tiling", "auto"),
         "li_core_sweep": bool(getattr(args, "li_core_sweep", False)),
+        "li_core_perf": bool(getattr(args, "li_core_perf", False)),
         "li_cores": int(rotating.runtime_shape.liCores),
         "rotation_epochs": int(rotating.runtime_shape.rounds),
         "batch": b,

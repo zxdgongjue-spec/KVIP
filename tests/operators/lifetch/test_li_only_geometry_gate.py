@@ -146,3 +146,40 @@ def test_li_core_sweep_scenarios_are_opt_in():
     for name in ("balanced_full_q4", "mixed_k_full_q4", "extreme_k_full_q4"):
         assert name in source
     assert 'if getattr(args, "li_core_sweep", False):' in source
+
+
+@pytest.mark.parametrize("tiling", ["auto", "q4"])
+def test_li_core_perf_forwarded_only_for_prefetch_zero(lifetch_cli, monkeypatch, tiling):
+    commands = []
+    monkeypatch.setattr(lifetch_cli.subprocess, "call", lambda command: commands.append(command) or 0)
+    args = cli_args(prefetch=0) + ["--li-core-perf", "--li-tiling", tiling]
+    assert lifetch_cli.main(args) == 0
+    assert "--li-core-perf" in commands[0]
+    worker = lifetch_cli.arguments(args[2:])
+    assert worker.li_core_perf
+    assert worker.li_tiling == tiling
+
+
+def test_li_core_perf_requires_prefetch_zero(lifetch_cli):
+    with pytest.raises(SystemExit) as exc:
+        lifetch_cli.main(cli_args(prefetch=64) + ["--li-core-perf"])
+    assert exc.value.code == 2
+
+
+def test_li_core_perf_rejects_full_chain(lifetch_cli):
+    args = cli_args(prefetch=0) + ["--li-core-perf"]
+    args.remove("--li-only-varlen")
+    with pytest.raises(SystemExit) as exc:
+        lifetch_cli.main(args)
+    assert exc.value.code == 2
+
+
+def test_li_core_perf_capture_isolated_from_v9_init_and_wait():
+    source = (Path(__file__).with_name("support") / "lifetch.py").read_text()
+    anchor = source.index('if getattr(args, "li_core_perf", False):')
+    begin = source.index("with torch.npu.graph(graph, stream=capture_stream):", anchor)
+    end = source.index("capture_stream.synchronize()", begin)
+    capture_body = source[begin:end]
+    assert 'rotating._call("li")' in capture_body
+    assert 'rotating._call("init")' not in capture_body
+    assert 'rotating._call("wait")' not in capture_body
