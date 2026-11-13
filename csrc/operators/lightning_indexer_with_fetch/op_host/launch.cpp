@@ -1,6 +1,11 @@
 #include "../op_kernel/pipeline_types.h"
 #include "api.h"
 #include "context.h"
+#include "pipeline_options.h"
+extern "C" uint32_t kvip_final_topk_prune() { return KVIP_FINAL_TOPK_PRUNE; }
+extern "C" uint32_t kvip_selected_metadata() { return KVIP_SELECTED_METADATA; }
+extern "C" uint32_t kvip_early_fetch_ready() { return KVIP_EARLY_FETCH_READY; }
+extern "C" uint32_t kvip_compact_init() { return KVIP_COMPACT_INIT; }
 extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) { return rotating::PrepareShape(shape); }
 #define ENTRY(name, blocks) \
 extern "C" uint32_t aclrtlaunch_v9_##name##_kernel(uint32_t,void*,void*); \

@@ -33,7 +33,9 @@ __aicore__ inline void OutputWorker(__gm__ Args* a,uint32_t b){
  auto ticks=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*256+uint64_t(b*kResolveCores+2)*32;
  uint32_t error=AwaitPublication(flags);
  if(profile)ticks[2]=GetSystemCycle();
- if(error){for(uint32_t q=0;q<4;++q){auto f=flags+q+1;f->count=0;f->error=error;f->ready=1;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(f),sizeof(BatchFlag));}return;}
+ if(error){for(uint32_t q=0;q<4;++q){auto f=flags+q+1;f->count=0;f->error=error;f->ready=1;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(f),sizeof(BatchFlag));}
+  if(kEarlyFetchReady){auto done=flags+kOutputsDoneFlag;done->count=0;done->error=error;done->ready=1;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(done),sizeof(BatchFlag));}
+  return;}
  TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,kFinalScratchBytes);
  auto local=scratch.Get<uint32_t>();auto selected=local,loc=local[kSlots],tokens=local[2*kSlots];
  auto ids=local[4*kSlots].ReinterpretCast<uint16_t>();
@@ -81,7 +83,10 @@ __aicore__ inline void OutputWorker(__gm__ Args* a,uint32_t b){
    Simt::VF_CALL<PackPublicationEvents>(Simt::Dim3{512,1,1},staged,shape.history,shape.resident,shape.tokenBytes,b,q,row->slots,kPrefetch+total,count,source,dest,FinalPtr(tokens),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(ctl),(a->prefetchCount&0x20000000U)?nullptr:direct,stride);
    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);error=ctl.GetValue(1);
    if(profile)ticks[7+q*6]=GetSystemCycle();
-   if(!error){PublishQueryOutputs(u,shape.batch,b,q,selected,loc,work);SyncFetchDescriptors(ctx,b*kSlots+q*kTop,count);}
+   if(!error){
+    if(!kEarlyFetchReady)PublishQueryOutputs(u,shape.batch,b,q,selected,loc,work);
+    SyncFetchDescriptors(ctx,b*kSlots+q*kTop,count);
+   }
    if(profile)ticks[8+q*6]=GetSystemCycle();
   }
   PrepareFinalFetch(shape.finalWorkers,shape.finalPostOffset,ctx,b,q,error?0:ctl.GetValue(16),b*kSlots+q*kTop,error,error?0:ctl.GetValue(17));
@@ -89,7 +94,12 @@ __aicore__ inline void OutputWorker(__gm__ Args* a,uint32_t b){
   auto f=flags+q+1;f->count=count;f->error=error;f->ready=1;
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(f),sizeof(BatchFlag));
   if(profile)ticks[9+q*6]=GetSystemCycle();
+  // Get consumes immutable descriptors/FinalPost, not these TND output rows.
+  // Keep output DMA and its completion fence after fetch-ready, and retain a
+  // separate all-output join before either reader may commit logical metadata.
+  if(kEarlyFetchReady && !error)PublishQueryOutputs(u,shape.batch,b,q,selected,loc,work);
  }
+ if(kEarlyFetchReady){auto done=flags+kOutputsDoneFlag;done->count=total;done->error=error;done->ready=1;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(done),sizeof(BatchFlag));}
  if(profile)kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ticks),32*8);
  pipe.Destroy();
 }

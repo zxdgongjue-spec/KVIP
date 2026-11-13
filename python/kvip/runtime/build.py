@@ -37,7 +37,17 @@ def build_failure(log, stage, returncode):
     )
 
 
-def build_libraries(*, cache_dir, cann, headers, soc):
+def build_libraries(
+    *,
+    cache_dir,
+    cann,
+    headers,
+    soc,
+    final_topk_prune=False,
+    selected_metadata=False,
+    early_fetch_ready=False,
+    compact_init=False,
+):
     """Build one shape-independent binary per source/toolchain/SoC."""
     root = Path(__file__).resolve().parents[3] / "csrc/operators"
     options = dict(
@@ -46,6 +56,15 @@ def build_libraries(*, cache_dir, cann, headers, soc):
         KVAF_INCLUDE=str(headers),
         SOC_VERSION=soc,
     )
+    variants = dict(
+        FINAL_TOPK_PRUNE=final_topk_prune,
+        SELECTED_METADATA=selected_metadata,
+        EARLY_FETCH_READY=early_fetch_ready,
+        COMPACT_INIT=compact_init,
+    )
+    if any(type(value) is not bool for value in variants.values()):
+        raise ValueError("LIFetch pipeline build options must be bool")
+    options.update({f"KVIP_{name}": "ON" if value else "OFF" for name, value in variants.items()})
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     for relative in (
         "version.info",
@@ -66,7 +85,7 @@ def build_libraries(*, cache_dir, cann, headers, soc):
     digest.update(shared_selector.read_bytes())
     directory = Path(cache_dir) / digest.hexdigest()[:20]
     directory.mkdir(parents=True, exist_ok=True)
-    libraries = directory / "libv9_bridge.so",
+    libraries = (directory / "libv9_bridge.so",)
     log = directory / "build.log"
     logging.getLogger("kvip").info("Universal LIFetch build: soc=%s log=%s", soc, log)
     with (directory / "build.lock").open("w") as lock:

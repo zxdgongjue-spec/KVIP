@@ -2,6 +2,7 @@
 #if defined(__CCE_AICORE__)
 #include "context.h"
 #include "pipeline_types.h"
+#include "round_init.h"
 
 #include <stdint.h>
 #include "prefetch.h"
@@ -23,16 +24,16 @@ __aicore__ inline KvafExecuteBatchGetKernelArgs GetArgs(__gm__ Context* ctx,uint
 __aicore__ inline void FillRoundWords(uint64_t address,uint32_t words,
     LocalTensor<uint32_t> local) {
     GlobalTensor<uint32_t> target;target.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(address));
-    for(uint32_t offset=0;offset<words;offset+=4096) {
-        uint32_t count=words-offset;if(count>4096)count=4096;
+    for(uint32_t offset=0;offset<words;offset+=kvip_round_init::kFillWords) {
+        uint32_t count=words-offset;if(count>kvip_round_init::kFillWords)count=kvip_round_init::kFillWords;
         DataCopy(target[offset],local,count);
     }
     // Caller joins the whole fill group before reusing the shared UB value.
 }
 __aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t b,__gm__ pipeline_ab::Args* streaming) {
-    TPipe pipe;TBuf<TPosition::VECCALC> storage;pipe.InitBuffer(storage,4096*4);
+    TPipe pipe;TBuf<TPosition::VECCALC> storage;pipe.InitBuffer(storage,kvip_round_init::kFillWords*4);
     auto local=storage.Get<uint32_t>();
-    Duplicate(local,uint32_t(0),4096);
+    Duplicate(local,uint32_t(0),kvip_round_init::kFillWords);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     FillRoundWords(ctx->rows+b*sizeof(Row),sizeof(Row)/4,local);
     FillRoundWords(ctx->progress+b*4*sizeof(Progress),4*sizeof(Progress)/4,local);
@@ -62,10 +63,11 @@ __aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uin
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->count),4);
     }
     SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
-    Duplicate(local,UINT32_MAX,4096);
+    Duplicate(local,UINT32_MAX,kvip_round_init::kFillWords);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     FillRoundWords(ctx->mapping+uint64_t(b)*rt_history*4,rt_history,local);
-    if(ctx->changes)FillRoundWords(ctx->changes+b*kChangeCapacity*4,kChangeCapacity,local);
+    if(ctx->changes)FillRoundWords(ctx->changes+b*kChangeCapacity*4,
+        kvip_round_init::ChangeWords(streaming != nullptr,kLruSlots,kChangeCapacity),local);
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     // Copy only the candidate prefix; resolver writes extended destinations.
     if(ctx->changeSlots) {

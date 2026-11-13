@@ -19,6 +19,7 @@
 #include "li_types.h"
 #include "topk_common.h"
 #include "topk_common.h"
+#include "final_topk_prune.h"
 
 #if !(defined(V9_UBMEM) && V9_UBMEM)
 #include "recent_threshold.h"
@@ -185,6 +186,35 @@ public:
         topkb16gather::HistogramsLowVFImpl<uint16_t>(histogram, values, high, loops, true);
         topkb16gather::FindKthVFImpl(output, histogram, high, low);
     }
+
+#if KVIP_FINAL_TOPK_PRUNE && !(defined(V9_UBMEM) && V9_UBMEM)
+    __aicore__ inline uint32_t SelectPruned(LocalTensor<uint16_t> input,
+        LocalTensor<uint16_t> positions, LocalTensor<uint32_t> output,
+        LocalTensor<uint16_t> scores, uint32_t count, uint32_t previousCount,
+        uint32_t blockBegin) {
+        PipeBarrier<PIPE_V>();
+        const bool selectedK = count >= topK;
+        if (selectedK) {
+            // count==K still requires the original GT/EQ ordering.
+            topkb16gather::LiTopKVF<true>(tmpIndexLocal, scores, input,
+                histogramsLocal, idxHighLocal, idxLowLocal, nkValueLocal,
+                topK, QLICommon::Align(count, uint32_t(256)));
+        }
+        PipeBarrier<PIPE_V>();
+        const uint32_t kept = selectedK ? topK : count;
+        Simt::VF_CALL<kvip_final_topk::RemapSelected>(Simt::Dim3{256,1,1},
+            reinterpret_cast<__ubuf__ uint16_t*>(tmpIndexLocal.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint16_t*>(positions.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(hisIndexLocal[1].GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(output.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint16_t*>(input.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint16_t*>(scores.GetPhyAddr()),
+            previousCount, kept, blockBegin, selectedK);
+        SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        if (kept) DataCopy(hisIndexLocal[1],output,QLICommon::Align(kept,uint32_t(8)));
+        return kept;
+    }
+#endif
 
     __aicore__ inline void operator()(LocalTensor<uint16_t>& mrgValueLocal, LocalTensor<uint32_t>& indicesOutLocal,
                                       LocalTensor<uint16_t>& hisValueLocal, uint32_t s2SeqLen, uint32_t loopIdx, uint32_t s2LoopNum, bool returnScores = false)

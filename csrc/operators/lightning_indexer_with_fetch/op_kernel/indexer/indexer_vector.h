@@ -2,6 +2,7 @@
 #if KVIP_STREAMING_LI
 #include "pipeline_types.h"
 #include "staged_topk_classify.h"
+#include "staged_selected_metadata.h"
 #endif
 /**
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
@@ -94,6 +95,9 @@ public:
     __aicore__ inline void PublishScoreProgress(const QLICommon::RunInfo &info,
                                                uint32_t progressShard = 0, bool publishShardEnd = false);
     __aicore__ inline void ProcessTopK(const QLICommon::RunInfo &info, uint32_t queryRow = SIM_Q);
+#if KVIP_FINAL_TOPK_PRUNE && KVIP_STREAMING_LI && !(defined(V9_UBMEM) && V9_UBMEM)
+    __aicore__ inline bool TryPrunedFinalTopK(uint32_t query, uint32_t scoreRow, uint32_t validEnd);
+#endif
     __aicore__ inline void SetPrefixStorage(GM_ADDR output) { prefixOutput_ = output; }
 #if KVIP_STREAMING_LI
     __aicore__ inline void SetStreamingWorkspace(GM_ADDR workspace) { streamingWorkspace_ = workspace; }
@@ -785,6 +789,11 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::BeginFinalMetadata(uint32_t query)
 {
+#if KVIP_SELECTED_METADATA && !(defined(V9_UBMEM) && V9_UBMEM)
+    // Final selected IDs are not available yet. The selective path loads
+    // their metadata inside EmitFinalClassification instead of preloading R.
+    (void)query;
+#else
     if (!streamingWorkspace_ || !streamingTopkOnly_ || prefixActive_ || runtimeShape_.resident!=16384) return;
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);uint32_t b=query/SIM_Q;
     if(b>=runtimeShape_.batch)return;
@@ -793,6 +802,7 @@ __aicore__ inline void QLIVector<QLIT>::BeginFinalMetadata(uint32_t query)
     if(ctx->hotValid){src.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*runtimeShape_.resident);DataCopy(streamingValid_,src,8192);}
     if(ctx->reservedHot){src.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->reservedHot)+uint64_t(b)*runtimeShape_.resident);DataCopy(streamingReserved_,src,8192);}
     streamingPrefetched_=true;
+#endif
 }
 
 template <typename QLIT>
@@ -839,12 +849,14 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     if(streamingTopkOnly_) {
         valid=streamingValid_;reserved=streamingReserved_;result=streamingOutput_;bitmap=streamingBitmap_;
     } else {
+#if !KVIP_SELECTED_METADATA || (defined(V9_UBMEM) && V9_UBMEM)
         uint32_t bytes=2*CeilDiv(constInfo_.mBaseSize,2)*s2BaseSize_*sizeof(QK_T);
         uint32_t mergeBytes=(topkCountAlign256_+trunkLen_)*sizeof(SCORE_T);
         if(bytes<8192*sizeof(uint32_t) || mergeBytes<8192*sizeof(uint32_t)) chunkSize=4096;
         if(bytes<chunkSize*sizeof(uint32_t) || mergeBytes<chunkSize*sizeof(uint32_t)) {errors[query*32]=4;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);return;}
         valid=resMm1UB_.template ReinterpretCast<uint32_t>();
         reserved=mrgValueLocal_.template ReinterpretCast<uint32_t>();
+#endif
         result=topkSharedTmpLocal_;bitmap=topkSharedTmpLocal_[2048];
     }
     constexpr uint32_t bitmapWords=rotating::kBitmapShards*rotating::kBitmapWords;
@@ -853,13 +865,28 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     auto row=reinterpret_cast<__gm__ rotating::Row*>(ctx->rows)+b;
     uint32_t used=row->slots,tailBegin=0,tailEnd=0;
     if(ctx->tailBounds){auto tail=reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds)+b*2;tailBegin=tail[0];tailEnd=tail[1];}
+    bool overlapSecond = false;
+#if KVIP_SELECTED_METADATA && !(defined(V9_UBMEM) && V9_UBMEM)
+    if(profile)liTicks[3]=GetSystemCycle();
+    Simt::VF_CALL<rotating::ClassifySelectedMetadata>(Simt::Dim3{512,1,1},
+        runtimeShape_.history,runtimeShape_.resident,b,owner,used,tailBegin,tailEnd,
+        ctx->tailBounds!=0,ctx,
+        reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),
+        reinterpret_cast<__ubuf__ uint32_t*>(result.GetPhyAddr()),
+        reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()),
+        reinterpret_cast<__ubuf__ uint32_t*>(bitmap[bitmapWords].GetPhyAddr()));
+    if(profile){
+        SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        liTicks[4]=GetSystemCycle();liTicks[5]=liTicks[4];liTicks[6]=liTicks[4];
+    }
+#else
     GlobalTensor<uint32_t> validGm,reservedGm;
     if(ctx->hotValid)validGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*runtimeShape_.resident);
     if(ctx->reservedHot)reservedGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->reservedHot)+uint64_t(b)*runtimeShape_.resident);
     // Match the validated TopK experiment: once TopK has finished, its merge
     // and temporary buffers are dead. Load the second metadata half there
     // while the vector pipe classifies the first half.
-    const bool overlapSecond = streamingTopkOnly_ && streamingPrefetched_ &&
+    overlapSecond = streamingTopkOnly_ && streamingPrefetched_ &&
         (topkCountAlign256_ + trunkLen_) * sizeof(SCORE_T) >= 8192 * sizeof(uint32_t) &&
         topkOp_.GetSharedTmpBufferSize() >= 8192 * sizeof(uint32_t);
     LocalTensor<uint32_t> secondValid,secondReserved;
@@ -899,6 +926,7 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
             liTicks[half==0?4:6]=GetSystemCycle();
         }
     }
+#endif
     if(profile)liTicks[10]=GetSystemCycle();
     Simt::VF_CALL<rotating::MergeClassifyBitmap>(Simt::Dim3{512,1,1},reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()),runtimeShape_.resident);
     if(profile){SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);liTicks[11]=GetSystemCycle();}
@@ -912,6 +940,66 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     errors[query*32]=bitmap.GetValue(bitmapWords);kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);
     if(profile){liTicks[7]=GetSystemCycle();liTicks[8]=overlapSecond?1:0;liTicks[9]=streamingTopkOnly_?1:0;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(liTicks),128);}
+}
+#endif
+
+#if KVIP_FINAL_TOPK_PRUNE && KVIP_STREAMING_LI && !(defined(V9_UBMEM) && V9_UBMEM)
+template <typename QLIT>
+__aicore__ inline bool QLIVector<QLIT>::TryPrunedFinalTopK(
+    uint32_t query, uint32_t scoreRow, uint32_t validEnd)
+{
+    if constexpr (!std::is_same_v<SCORE_T,uint16_t>) return false;
+    else {
+        // One complete Q2 task per AIC: no later Cube task can overwrite the
+        // dead result bank used for block-local u16 offsets. TopK-only phases
+        // have no such bank and retain the original path.
+        if (prefixActive_ || streamingTopkOnly_ || constInfo_.isLDOpen ||
+            s1BaseSize_ != 2 || !runtimeShape_.splitQ ||
+            runtimeShape_.batch * 2 != runtimeShape_.aicCount ||
+            topkCount_ != 2048 || trunkLen_ != 16384 ||
+            validEnd < runtimeShape_.resident || validEnd < topkCount_ ||
+            2 * CeilDiv(constInfo_.mBaseSize,uint32_t(2)) * s2BaseSize_ * sizeof(QK_T) < trunkLen_*2)
+            return false;
+        PipeBarrier<PIPE_ALL>();
+        const uint16_t threshold = prefixThreshold_.GetValue((query % 2) * 128);
+        // Zero padding is below every retained key. A zero lower bound cannot
+        // prune and would make padded positions participate in tie ordering.
+        if (!threshold) return false;
+        auto positions = resMm1UB_.template ReinterpretCast<uint16_t>();
+        uint32_t previousCount = 0;
+        const uint64_t rowOffset = uint64_t(scoreRow) *
+            QLICommon::Align(uint64_t(constInfo_.kSeqSize), uint64_t(s2BaseSize_));
+        DataCopyPadExtParams<uint16_t> pad{true,0,0,0};
+        for (uint32_t begin = 0; begin < validEnd; begin += trunkLen_) {
+            const uint32_t count = Min(trunkLen_,validEnd-begin);
+            SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+            DataCopyExtParams copy{1,count*uint32_t(sizeof(uint16_t)),0,0,0};
+            DataCopyPad(mrgValueLocal_[topkCount_],scoreGm[rowOffset+begin],copy,pad);
+            SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+            kvip_final_topk::CompactPositions(
+                reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_[topkCount_].GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint16_t*>(positions.GetPhyAddr()),count,threshold);
+            SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            const uint32_t added = uint32_t(GetSpr<SpecialPurposeReg::AR>()) / sizeof(uint16_t);
+            if (added > count) return false;
+            if (previousCount) DataCopy(mrgValueLocal_,scoreOutLocal_,topkCount_);
+            PipeBarrier<PIPE_V>();
+            if (added) kvip_final_topk::GatherScores(
+                reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_[topkCount_].GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint16_t*>(positions.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_[previousCount].GetPhyAddr()),added);
+            PipeBarrier<PIPE_V>();
+            const uint32_t total = previousCount + added;
+            const uint32_t aligned = QLICommon::Align(total,uint32_t(256));
+            if (aligned > total) kvip_final_topk::PadScores(
+                reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_.GetPhyAddr()),total,aligned);
+            previousCount = topkOp_.SelectPruned(mrgValueLocal_,positions,
+                indicesOutLocal_,scoreOutLocal_,total,previousCount,begin);
+        }
+        // A valid Kth lower bound leaves at least K real candidates. Keep the
+        // complete original path as a fail-closed fallback for other inputs.
+        return previousCount == topkCount_;
+    }
 }
 #endif
 
@@ -1011,6 +1099,12 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         }
 #endif
         AscendC::DataCopyPadExtParams<SCORE_T> padParams{true, 0, 0, 0};
+#if KVIP_FINAL_TOPK_PRUNE && KVIP_STREAMING_LI && !(defined(V9_UBMEM) && V9_UBMEM)
+        if (TryPrunedFinalTopK(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx,
+                              vecOffset, uint32_t(validS2Len))) {
+            // The normal output/publication path below remains unchanged.
+        } else
+#endif
         if (validS2Len >= topkCount_) {
             uint32_t s2LoopNum = (validS2Len + trunkLen_ - 1) / trunkLen_;
             if (s2LoopNum == 1) {
