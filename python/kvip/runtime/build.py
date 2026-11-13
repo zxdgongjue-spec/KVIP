@@ -56,6 +56,8 @@ def build_libraries(
     recent_unified_topk=True,
     recent_skip=False,
     recent_threshold_only=False,
+    recent_seed_ub=False,
+    recent_profile=True,
 ):
     """Build one shape-independent binary per source/toolchain/SoC."""
     root = Path(__file__).resolve().parents[3] / "csrc/operators"
@@ -69,6 +71,12 @@ def build_libraries(
     if type(recent_threshold_only) is not bool:
         raise ValueError("Recent threshold-only option must be boolean")
     options["KVIP_RECENT_THRESHOLD_ONLY"] = int(recent_threshold_only)
+    if type(recent_seed_ub) is not bool or type(recent_profile) is not bool:
+        raise ValueError("Recent seed-UB and profile options must be boolean")
+    if recent_seed_ub and not recent_threshold_only:
+        raise ValueError("Recent seed-UB requires threshold-only selection")
+    options["KVIP_RECENT_SEED_UB"] = int(recent_seed_ub)
+    options["KVIP_RECENT_PROFILE"] = int(recent_profile)
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     for relative in (
         "version.info",

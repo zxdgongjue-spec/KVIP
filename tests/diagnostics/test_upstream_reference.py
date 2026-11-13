@@ -514,3 +514,145 @@ def test_threshold_only_cli_runs_main_and_one_shared_arena_pair(tmp_path, monkey
     summary = compare.run(args)
     assert len(calls) == 3 and len(summary["table"]) == 4
     assert summary["study"] == "threshold-only"
+
+
+def test_graph_bandwidth_uses_complete_time_and_distinguishes_useful_payload(capsys):
+    reports = _threshold_only_reports()
+    source = reports["urma-recent-after"]
+    source["reads_samples"] = [
+        dict(source["reads_samples"][0], bytes=12000, useful_transfer_bytes=9000),
+        dict(source["reads_samples"][0], bytes=18000, useful_transfer_bytes=9000),
+    ]
+    source["timing"]["mean_us"] = 100
+    summary = compare.summarize(reports, "threshold-only")
+    row = summary["table"]["urma-recent-after"]
+    assert row["graph_total_GBps"] == row["graph_payload_GBps"] == pytest.approx(0.15)
+    assert row["graph_useful_GBps"] == pytest.approx(0.09)
+    assert row["payload_efficiency_pct"] == pytest.approx(60)
+    assert row["hardware_bandwidth_utilization_pct"] is None
+    compare.print_summary(summary)
+    output = capsys.readouterr().out
+    assert "total=0.150GB/s useful=0.090GB/s payload_efficiency=60.00% hardware_utilization=N/A" in output
+    assert "not isolated Fetch bandwidth" in output
+    for sample in source["reads_samples"]:
+        sample.update(bytes=0, useful_transfer_bytes=0)
+    empty = compare.summarize(reports, "threshold-only")["table"]["urma-recent-after"]
+    assert empty["graph_total_GBps"] == 0 and empty["graph_useful_GBps"] == 0
+    assert empty["payload_efficiency_pct"] is None
+
+
+def _seed_reports():
+    reports = {"urma-upstream-fused": _case(110, main=True)}
+    for name, tuning in replay_measure.study_cases(SimpleNamespace(study="seed-ub")).items():
+        reports[f"urma-recent-{name}"] = _case(
+            {"current": 120, "release": 115, "seed": 100}[name],
+            tuning=tuning | dict(prefetch_limit=512, window_limit=64),
+        )
+    for name in ("current", "release", "seed"):
+        reports[f"urma-recent-{name}"]["seed_ub_eligibility"] = dict(
+            predicted_eligible_queries=64, total_queries=64, predicted_fallback_queries=0
+        )
+    return reports
+
+
+def test_seed_plan_separates_marker_removal_and_seed_reuse_without_serial(capsys):
+    reports = _seed_reports()
+    summary = compare.summarize(reports, "seed-ub")
+    assert [row["display_name"] for row in summary["table"].values()] == [
+        "urma-main-resident",
+        "urma-current-kth",
+        "urma-release-kth",
+        "urma-seed-ub",
+    ]
+    effect = summary["effects"]["urma"]
+    assert effect["main_reference"] == "urma-upstream-fused"
+    assert "serial_reference" not in effect
+    assert effect["marker_removal_reduction_pct"] == pytest.approx(100 * (1 - 115 / 120))
+    assert effect["seed_reuse_reduction_pct"] == pytest.approx(100 * (1 - 100 / 115))
+    assert effect["seed_vs_main_reduction_pct"] == pytest.approx(100 * (1 - 100 / 110))
+    compare.print_summary(summary)
+    text = capsys.readouterr().out
+    assert "marker_removal=" in text and "seed_reuse=" in text and "seed_vs_main=" in text
+    assert "vs_serial" not in text
+
+
+@pytest.mark.parametrize(
+    "change", ["score", "ordered", "initial", "final", "profile", "seed", "budget", "instrumented", "serial"]
+)
+def test_seed_study_rejects_changed_contracts(change):
+    reports = _seed_reports()
+    row = reports["urma-recent-seed"]
+    if change == "score":
+        row["score_comparison"]["status"] = "unverified"
+    elif change == "ordered":
+        row["selection_comparison"]["ordered_output_sha256"] = "other"
+    elif change in ("initial", "final"):
+        row["threshold_comparison"][change + "_keys"] = [[0]]
+    elif change in ("profile", "seed"):
+        row["tuning"]["recent_profile" if change == "profile" else "recent_seed_ub"] = change == "profile"
+    elif change == "budget":
+        row["tuning"]["window_limit"] = 32
+    elif change == "instrumented":
+        row["native_diagnostics"] = {"count": 1}
+    else:
+        reports["urma-upstream-serial"] = _case(100, main=True)
+    with pytest.raises(ValueError):
+        compare.summarize(reports, "seed-ub")
+
+
+def test_seed_cli_runs_only_main_fused_and_feature_three_variants(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "validate_checkout", lambda root, revision: root)
+    base = _arguments(
+        tmp_path, ["--study", "seed-ub", "--upstream-root", str(tmp_path / "main"), "--upstream-revision", REVISION]
+    )
+    with pytest.raises(SystemExit):
+        compare.arguments(base + ["--diagnostic-replays", "1"])
+    with pytest.raises(SystemExit):
+        compare.arguments(base + ["--transports", "both"])
+    args, calls, reports = compare.arguments(base), [], _seed_reports()
+
+    def child(command, **kwargs):
+        calls.append(command)
+        parsed = replay.arguments(command[4:])
+        assert parsed.mode == "fused" and parsed.diagnostic_replays == 0
+        assert "--serial-workers" not in command
+        if parsed.upstream_root:
+            result = reports["urma-upstream-fused"]
+        else:
+            assert parsed.study == "seed-ub" and parsed.threshold_policy == "both"
+            with pytest.raises(SystemExit):
+                replay.arguments(command[4:] + ["--diagnostic-replays", "1"])
+            result = {"cases": {name: reports[f"urma-recent-{name}"] for name in ("current", "release", "seed")}}
+        parsed.output.write_text(json.dumps(result))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(compare.subprocess, "run", child)
+    monkeypatch.setattr(compare, "source_commit", lambda: "feature")
+    result = compare.run(args)
+    assert len(calls) == 2 and len(result["table"]) == 4
+    assert len(list(args.result_dir.glob("*.json"))) == 3
+
+
+def test_seed_runtime_is_shared_and_all_three_full_oracles_are_required(monkeypatch):
+    from kvip.diagnostics import seed_eligibility
+
+    monkeypatch.setattr(
+        seed_eligibility,
+        "predict_seed_eligibility",
+        lambda archive: dict(predicted_eligible_queries=64, total_queries=64, predicted_fallback_queries=0),
+    )
+    args = SimpleNamespace(study="seed-ub", mode="fused", transport="urma", threshold_policy="both")
+    calls, context, retained = [], object(), {}
+    monkeypatch.setattr(replay_measure, "allocate_context", lambda *args: calls.append("allocate") or context)
+    monkeypatch.setattr(replay_measure, "release_context", lambda received: calls.append(("release", received)))
+
+    def measure(received, archive, allocated, retained):
+        assert allocated is context
+        calls.append(dict(received.fused_tuning))
+        return _case(100, tuning=dict(received.fused_tuning))
+
+    monkeypatch.setattr(replay_measure, "measure_case", measure)
+    result = replay_measure.run(args, object(), retained)
+    assert list(result["cases"]) == ["current", "release", "seed"]
+    assert calls == ["allocate", *replay_measure.study_cases(args).values(), ("release", context)]
+    assert list(retained["completed_cases"]) == ["current", "release", "seed"]

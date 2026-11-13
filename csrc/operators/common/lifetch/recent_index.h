@@ -50,6 +50,29 @@ KVIP_RECENT_DEVICE inline Range ReusableTiles(int32_t begin, int32_t end,
     return {0, 0};
 }
 
+// One query/AIV can retain its early scores in the existing trunk+K bank.
+// Keep the actual batch-wide 128-token coverage; causal/unaligned halos are
+// removed only from this UB copy, never from the complete scoreGM output.
+struct SeedLayout {
+    bool enabled;
+    Range tiles, keep;
+    uint32_t words;
+};
+KVIP_RECENT_DEVICE inline SeedLayout MakeSeedLayout(int32_t begin, int32_t end,
+    uint32_t resident, uint32_t history, uint32_t availableEnd,
+    uint32_t queryEnd, uint32_t queryMax, uint32_t capacity) {
+    if (availableEnd != history || resident < 2048 || resident % 128 ||
+        queryEnd < resident || queryEnd > history || queryMax > history)
+        return {false, {0, 0}, {0, 0}, 0};
+    auto tiles = Tiles(Clip(begin, end, resident, history, queryMax));
+    uint32_t words = (resident + (tiles.end - tiles.begin) * 128 + 255) / 256 * 256;
+    if (words > capacity) return {false, {0, 0}, {0, 0}, 0};
+    auto exact = Clip(begin, end, resident, history, queryEnd);
+    Range keep = exact.begin < exact.end ?
+        Range{exact.begin - tiles.begin * 128, exact.end - tiles.begin * 128} : Range{0, 0};
+    return {true, tiles, keep, words};
+}
+
 struct Remaining { Range first, second; };
 KVIP_RECENT_DEVICE inline Remaining Subtract(Range whole, Range skip) {
     if (whole.begin >= whole.end) return {{0, 0}, {0, 0}};
@@ -92,6 +115,29 @@ inline void RemapUnified(__ubuf__ uint32_t* indices, uint32_t residentCount,
         indices[i] = index < residentCount ? index :
             (index - residentCount < recentCount ?
                 recentBegin + index - residentCount : UINT32_MAX);
+    }
+}
+} // namespace kvip_recent_index
+#endif
+
+#if defined(__CCE_AICORE__) && KVIP_RECENT_SEED_UB
+namespace kvip_recent_index {
+__simd_vf__ inline void MaskSeedPadding(__ubuf__ uint16_t* scores,
+    uint16_t count, uint16_t keepBegin, uint16_t keepEnd) {
+    using namespace AscendC::MicroAPI;
+    auto all = CreateMask<uint16_t, MaskPattern::ALL>();
+    RegTensor<int16_t> positions;
+    RegTensor<uint16_t> values, zero;
+    Duplicate(zero, uint16_t(0));
+    for (uint16_t offset = 0; offset < count; offset += 128) {
+        Arange(positions, static_cast<int16_t>(offset));
+        MaskReg after, before, keep;
+        CompareScalar<int16_t, CMPMODE::GE>(after, positions, static_cast<int16_t>(keepBegin), all);
+        CompareScalar<int16_t, CMPMODE::LT>(before, positions, static_cast<int16_t>(keepEnd), all);
+        MaskAnd(keep, after, before, all);
+        LoadAlign(values, scores + offset);
+        Select(values, values, zero, keep);
+        StoreAlign(scores + offset, values, all);
     }
 }
 } // namespace kvip_recent_index

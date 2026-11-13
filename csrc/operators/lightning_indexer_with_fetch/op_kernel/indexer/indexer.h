@@ -1029,6 +1029,12 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()
         }
         for (uint32_t gS1LoopIdx = splitCoreInfo.gS1Start; gS1LoopIdx <= tempLoopInfo.gS1LoopEnd; gS1LoopIdx++) {
             CalcS2LoopParams(bN2LoopIdx, gS1LoopIdx);
+#if KVIP_RECENT_SEED_UB && !(defined(V9_UBMEM) && V9_UBMEM)
+            if ASCEND_IS_AIV {
+                CalcRunInfo(gloop, splitCoreInfo.s2Start, runInfo, qScaleLoop, 0);
+                vectorService.BeginResidentSeed(runInfo);
+            }
+#endif
             bool hadRecent = ScoreRecent(gloop, qScaleLoop);
             auto skip = ReusableRecentTiles();
             if (skip.begin < skip.end && splitCoreInfo.s2Start == 0) {

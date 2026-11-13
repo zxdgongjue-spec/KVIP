@@ -30,6 +30,18 @@
 #include "topk.h"
 #include "../../../common/lifetch/recent_index.h"
 
+#ifndef KVIP_RECENT_SEED_UB
+#define KVIP_RECENT_SEED_UB 0
+#endif
+#ifndef KVIP_RECENT_PROFILE
+#define KVIP_RECENT_PROFILE 1
+#endif
+#if KVIP_RECENT_SEED_UB != 0 && KVIP_RECENT_SEED_UB != 1
+#error "KVIP_RECENT_SEED_UB must be 0 or 1"
+#endif
+#if KVIP_RECENT_PROFILE != 0 && KVIP_RECENT_PROFILE != 1
+#error "KVIP_RECENT_PROFILE must be 0 or 1"
+#endif
 #ifndef KVIP_RECENT_THRESHOLD_ONLY
 #define KVIP_RECENT_THRESHOLD_ONLY 0
 #endif
@@ -108,18 +120,50 @@ public:
                                                uint32_t progressShard = 0, bool publishShardEnd = false);
     __aicore__ inline void ReplayRecentScores(const QLICommon::RunInfo &info,
                                              uint32_t beginTile, uint32_t endTile);
+#if KVIP_RECENT_SEED_UB && !(defined(V9_UBMEM) && V9_UBMEM)
+    __aicore__ inline void BeginResidentSeed(const QLICommon::RunInfo& info) {
+        residentSeedActive_ = false;
+        if constexpr (std::is_same_v<SCORE_T, uint16_t>) {
+            if (Q_LAYOUT_T != LI_LAYOUT::BSND || s1BaseSize_ != 2 ||
+                info.actS1Size != SIM_Q || constInfo_.attenMaskFlag || constInfo_.isLDOpen ||
+                info.actS2Size != runtimeShape_.history || info.s2Idx != 0) return;
+            auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+            uint32_t query = info.bIdx * SIM_Q + info.gS1Idx * 2 + blockId_ % 2;
+            uint32_t end = runtimeShape_.history, maximum = end;
+            if (ctx->queryEnds) {
+                auto ends = reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds) + info.bIdx * SIM_Q;
+                end = ends[query % SIM_Q]; maximum = 0;
+                for (uint32_t q = 0; q < SIM_Q; ++q) maximum = Max(maximum, ends[q]);
+            }
+            int32_t first = 0, last = 0;
+            if (ctx->thresholdBounds) {
+                auto bounds = reinterpret_cast<__gm__ int32_t*>(ctx->thresholdBounds) + info.bIdx * 2;
+                first = bounds[0]; last = bounds[1];
+            }
+            residentSeed_ = kvip_recent_index::MakeSeedLayout(first, last, runtimeShape_.resident,
+                runtimeShape_.history, info.actS2Size, end, maximum, topkCountAlign256_ + trunkLen_);
+            residentSeedQuery_ = query;
+            residentSeedActive_ = residentSeed_.enabled;
+        }
+    }
+#endif
     __aicore__ inline void ProcessTopK(const QLICommon::RunInfo &info, uint32_t queryRow = SIM_Q);
     __aicore__ inline void SetPrefixStorage(GM_ADDR output) { prefixOutput_ = output; }
 #if KVIP_STREAMING_LI
     __aicore__ inline void SetStreamingWorkspace(GM_ADDR workspace) { streamingWorkspace_ = workspace; }
     __aicore__ inline void EmitFinalClassification(uint32_t query);
     __aicore__ inline void BeginFinalMetadata(uint32_t query);
+#if KVIP_RECENT_PROFILE
     __aicore__ inline void MarkTopK(uint32_t query, bool begin);
+#endif
 #endif
     __aicore__ inline void ProcessResidentTopK(QLICommon::RunInfo info, uint32_t queryRow = SIM_Q) {
         info.actS2Size = runtimeShape_.resident;
         prefixActive_ = true;
         ProcessTopK(info, queryRow);
+#if KVIP_RECENT_SEED_UB && !(defined(V9_UBMEM) && V9_UBMEM)
+        residentSeedActive_ = false;
+#endif
         prefixActive_ = false;
     }
 
@@ -172,6 +216,11 @@ private:
     LocalTensor<uint32_t> rotationProgress_;
     uint32_t rotationProgressBase_ = 0;
 
+#if KVIP_RECENT_SEED_UB && !(defined(V9_UBMEM) && V9_UBMEM)
+    bool residentSeedActive_ = false;
+    uint32_t residentSeedQuery_ = UINT32_MAX;
+    kvip_recent_index::SeedLayout residentSeed_{};
+#endif
     GM_ADDR prefixOutput_ = nullptr;
     bool prefixActive_ = false;
     TBuf<TPosition::VECCALC> classifyBuf_;
@@ -186,6 +235,21 @@ private:
         if (!thresholdOnly) return false;
 #endif
         if constexpr (std::is_same_v<SCORE_T, uint16_t>) {
+#if KVIP_RECENT_SEED_UB && !(defined(V9_UBMEM) && V9_UBMEM)
+            if (thresholdOnly && residentSeedActive_ && query == residentSeedQuery_ &&
+                residentCount == runtimeShape_.resident && availableEnd == runtimeShape_.history) {
+                residentSeedActive_ = false; // Service may reuse this bank next.
+                // ProcessTopK already joined score MTE3 -> MTE2. Complete the
+                // chain to V before masking any bytes still read by that DMA.
+                SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+                WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+                kvip_recent_index::MaskSeedPadding(
+                    reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_[runtimeShape_.resident].GetPhyAddr()),
+                    residentSeed_.words - runtimeShape_.resident, residentSeed_.keep.begin, residentSeed_.keep.end);
+                topkOp_.Threshold(mrgValueLocal_, prefixThreshold_[(query % 2) * 128], residentSeed_.words);
+                return true;
+            }
+#endif
             auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
             if ((!ctx->thresholdBounds && !thresholdOnly) || residentCount < topkCount_) return false;
             uint32_t end = ctx->queryEnds ?
@@ -868,6 +932,12 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         (__ubuf__ uint16_t *)prefixThreshold_.GetPhyAddr() + (curAivS1Idx % 2) * 128,
         (__ubuf__ uint16_t *)classifyUB_.GetPhyAddr() + pingpong * 256);
     } else {
+#if KVIP_RECENT_SEED_UB && !(defined(V9_UBMEM) && V9_UBMEM)
+        if (residentSeedActive_) {
+            uint32_t offset = scoreOnly ? runtimeShape_.resident + curS2Idx - residentSeed_.tiles.begin * 128 : curS2Idx;
+            outBase = mrgValueLocal_[offset];
+        }
+#endif
     vector1::BatchMulWeightAndReduceSum(outBase, UB_BANK_DEPTH_STRIDE / sizeof(SCORE_T),
                                         qkBase, qkVLstride, (uint32_t)(gSize_ * UB_BANK_DEPTH_STRIDE / sizeof(float)),
                                         weightBase, UB_BANK_DEPTH_STRIDE / sizeof(W_T), weightFloatBase,
@@ -921,6 +991,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
 }
 
 #if KVIP_STREAMING_LI
+#if KVIP_RECENT_PROFILE
 // Diagnostic replay only. These local pipeline joins intentionally perturb
 // overlap; use raw device-cycle intervals, never the uninstrumented graph time.
 // Early selection excludes score GEMMs. Final ends before metadata classification.
@@ -936,6 +1007,8 @@ __aicore__ inline void QLIVector<QLIT>::MarkTopK(uint32_t query, bool begin)
     ticks[(prefixActive_ ? 12 : 14) + (begin ? 0 : 1)] = GetSystemCycle();
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ticks), 128);
 }
+
+#endif
 
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::BeginFinalMetadata(uint32_t query)
@@ -1110,7 +1183,9 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
 #if KVIP_STREAMING_LI
         uint32_t streamingQuery = info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx;
         streamingPrefetched_ = false;
+#if KVIP_RECENT_PROFILE
         MarkTopK(streamingQuery, true);
+#endif
 #endif
 
         SCORE_T zero = 0;
@@ -1145,7 +1220,9 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
             AscendC::DataCopyPad(indiceOutGm[info.indiceOutOffset + (curS1Idx + rowIdx) * topkCount_], indicesOutLocal_.ReinterpretCast<int32_t>(), copyOutParams);
             SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
 #if KVIP_STREAMING_LI
+#if KVIP_RECENT_PROFILE
             MarkTopK(streamingQuery, false);
+#endif
     #if KVIP_STREAMING_LI
         if (!prefixActive_) EmitFinalClassification(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx);
 #endif
@@ -1167,7 +1244,9 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
                          vecOffset, queryRow == SIM_Q, recentEnd, false, true);
             SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
 #if KVIP_STREAMING_LI
+#if KVIP_RECENT_PROFILE
             MarkTopK(streamingQuery, false);
+#endif
 #endif
             continue;
         }
@@ -1268,7 +1347,9 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         }
         SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
 #if KVIP_STREAMING_LI
+#if KVIP_RECENT_PROFILE
         MarkTopK(streamingQuery, false);
+#endif
         if (!prefixActive_) EmitFinalClassification(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx);
 #endif
     }

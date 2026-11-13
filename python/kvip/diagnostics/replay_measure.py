@@ -320,7 +320,9 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
                         workers=bundle.forward.q_workers,
                         resolver_cores=bundle.forward.resolver_cores,
                         transport=args.transport,
-                        threshold_markers=not bool(getattr(args, "upstream_root", None)) and args.transport == "urma",
+                        threshold_markers=not bool(getattr(args, "upstream_root", None))
+                        and args.transport == "urma"
+                        and getattr(bundle, "tuning", {}).get("recent_profile", True),
                     ),
                     reads=diagnostic_reads,
                 )
@@ -527,6 +529,8 @@ def measure_case(args, archive, context, retained):
         ),
         **results,
     )
+    if prediction := retained.get("seed_ub_eligibility"):
+        result["seed_ub_eligibility"] = prediction
     if args.mode == "fused":
         if score_reference_result := getattr(bundle, "score_comparison", None):
             result["score_comparison"] = score_reference_result
@@ -562,6 +566,19 @@ def release_context(context):
 def study_cases(args):
     """Keep each study's baseline explicit when production defaults advance."""
     study = getattr(args, "study", "threshold")
+    if study == "seed-ub":
+        return {
+            name: dict(
+                recent_threshold=True,
+                recent_pipeline=True,
+                recent_unified_topk=True,
+                recent_skip=False,
+                recent_threshold_only=True,
+                recent_profile=profile,
+                recent_seed_ub=seed,
+            )
+            for name, profile, seed in (("current", True, False), ("release", False, False), ("seed", False, True))
+        }
     if study == "threshold-only":
         return {
             name: dict(
@@ -602,11 +619,22 @@ def verify_case_equivalence(cases, *, same_threshold):
 
 
 def run(args, archive, retained):
+    if getattr(args, "study", "threshold") == "seed-ub":
+        from kvip.diagnostics.seed_eligibility import predict_seed_eligibility
+
+        prediction = predict_seed_eligibility(archive)
+        retained["seed_ub_eligibility"] = prediction
+        emit(
+            f"SEED_UB_ELIGIBILITY predicted={prediction['predicted_eligible_queries']}/{prediction['total_queries']} "
+            f"fallback={prediction['predicted_fallback_queries']} not_runtime_observation"
+        )
+        if not prediction["predicted_eligible_queries"]:
+            raise ValueError("Seed-UB has no eligible queries; refusing an all-fallback comparison")
     phase(retained, "context_allocate")
     retained["geometry"] = getattr(archive, "manifest", {}).get("geometry", {})
     completed = retained.setdefault("completed_cases", {})
     context = allocate_context(args, archive, retained)
-    execution_study = getattr(args, "study", "threshold") in ("pipeline", "skip", "threshold-only")
+    execution_study = getattr(args, "study", "threshold") in ("pipeline", "skip", "threshold-only", "seed-ub")
     if args.mode == "fused" and (args.threshold_policy == "both" or execution_study):
         cases = {}
         for name, tuning in study_cases(args).items():

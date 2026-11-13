@@ -127,6 +127,22 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
     assert len(commands) == 16
     with pytest.raises(ValueError, match="threshold-only"):
         build.build_libraries(**options, recent_threshold_only=1)
+    release = build.build_libraries(**options, recent_threshold_only=True, recent_profile=False)
+    seed = build.build_libraries(**options, recent_threshold_only=True, recent_profile=False, recent_seed_ub=True)
+    assert len({threshold_only, release, seed}) == 3
+    assert "-DKVIP_RECENT_PROFILE=0" in commands[-4]
+    assert "-DKVIP_RECENT_SEED_UB=0" in commands[-4]
+    assert "-DKVIP_RECENT_PROFILE=0" in commands[-2]
+    assert "-DKVIP_RECENT_SEED_UB=1" in commands[-2]
+    assert (
+        build.build_libraries(**options, recent_threshold_only=True, recent_profile=False, recent_seed_ub=True) == seed
+    )
+    assert len(commands) == 20
+    with pytest.raises(ValueError, match="requires threshold-only"):
+        build.build_libraries(**options, recent_seed_ub=True)
+    for invalid in ({"recent_profile": 0}, {"recent_seed_ub": 1}):
+        with pytest.raises(ValueError, match="must be boolean"):
+            build.build_libraries(**options, **invalid)
 
 
 def test_actual_operator_cmake_resolves_relocated_sources(tmp_path):

@@ -26,7 +26,9 @@ def arguments(argv=None):
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--iterations", type=int, default=10)
     p.add_argument(
-        "--study", choices=("threshold", "pipeline", "skip", "upstream", "threshold-only"), default="threshold"
+        "--study",
+        choices=("threshold", "pipeline", "skip", "upstream", "threshold-only", "seed-ub"),
+        default="threshold",
     )
     p.add_argument("--transports", choices=("urma", "ubmem", "both"), default="urma")
     p.add_argument("--upstream-root", type=Path)
@@ -49,7 +51,7 @@ def arguments(argv=None):
         p.error("Invalid device, warmup, iterations or workers")
     if args.result_dir.exists():
         p.error("result-dir already exists; choose a new directory")
-    if args.study in ("upstream", "threshold-only"):
+    if args.study in ("upstream", "threshold-only", "seed-ub"):
         if not args.upstream_root or not args.upstream_revision:
             p.error("This study requires upstream-root and upstream-revision")
         from kvip.diagnostics.upstream import validate_checkout
@@ -59,9 +61,11 @@ def arguments(argv=None):
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             p.error(str(error))
     elif args.upstream_root or args.upstream_revision:
-        p.error("upstream-root/revision apply only to study=upstream or threshold-only")
-    if args.study == "threshold-only" and args.transports != "urma":
-        p.error("study=threshold-only requires --transports urma")
+        p.error("upstream-root/revision apply only to study=upstream, threshold-only or seed-ub")
+    if args.study in ("threshold-only", "seed-ub") and args.transports != "urma":
+        p.error(f"study={args.study} requires --transports urma")
+    if args.study == "seed-ub" and args.diagnostic_replays:
+        p.error("study=seed-ub excludes instrumented diagnostic replays")
     for root, object_name in ((args.build_dir, "kvaf_execute_batch_get_kernels.o"),):
         if root is not None and not (root / "bin" / object_name).is_file():
             p.error(f"Missing exact requested kernel: {root / 'bin' / object_name}")
@@ -88,10 +92,13 @@ def read_means(result):
 
 def display_name(name, study):
     """Keep saved result keys stable while spelling out the actual algorithms."""
-    if study in ("upstream", "threshold-only"):
+    if study in ("upstream", "threshold-only", "seed-ub"):
         for suffix, label in (
             ("upstream-serial", "main-serial"),
             ("upstream-fused", "main-resident"),
+            ("recent-current", "current-kth"),
+            ("recent-release", "release-kth"),
+            ("recent-seed", "seed-ub"),
             ("recent-before", "recent-recompute"),
             ("recent-after", "recent-kth-only" if study == "threshold-only" else "recent-score-replay"),
         ):
@@ -111,6 +118,68 @@ def traffic_change(before, after):
     )
 
 
+def summarize_seed_study(table, transport):
+    if transport != "urma":
+        raise ValueError("The seed-UB study supports only URMA")
+    main_key = f"{transport}-upstream-fused"
+    names = ("current", "release", "seed")
+    expected_keys = {main_key, *(f"{transport}-recent-{name}" for name in names)}
+    if set(table) != expected_keys:
+        raise ValueError("Seed-UB requires only main fusion and the three feature variants, no serial reference")
+    main = table[main_key]
+    provenance = main.get("production_source") or {}
+    if provenance.get("kind") != "exact_upstream_checkout" or not provenance.get("commit"):
+        raise ValueError("Main fusion must execute an exact verified upstream checkout")
+    from kvip.diagnostics.replay_measure import study_cases
+    from types import SimpleNamespace
+
+    expected = study_cases(SimpleNamespace(study="seed-ub"))
+    variants = {name: table[f"{transport}-recent-{name}"] for name in names}
+    for row in (main, *variants.values()):
+        if not row["score_comparison"] or row["score_comparison"].get("status") != "bit_exact":
+            raise ValueError("Seed-UB requires all captured valid LI scores to be bit exact")
+        if any(
+            row["selection"][key] != main["selection"][key] for key in ("selected_set_sha256", "ordered_output_sha256")
+        ):
+            raise ValueError("Seed-UB changed final ordered TopK")
+        if row["threshold"]["final_keys"] != main["threshold"]["final_keys"]:
+            raise ValueError("Seed-UB changed final threshold")
+        if row.get("native_diagnostics"):
+            raise ValueError("Seed-UB headline comparison excludes instrumented diagnostic replays")
+    current = variants["current"]
+    prediction = current.get("seed_ub_eligibility")
+    if not prediction or not prediction.get("predicted_eligible_queries"):
+        raise ValueError("Seed-UB requires nonzero predicted eligible queries")
+    if any(row.get("seed_ub_eligibility") != prediction for row in variants.values()):
+        raise ValueError("Seed-UB eligibility predictions differ between variants")
+    common_tuning = {
+        key: value
+        for key, value in (current["tuning"] or {}).items()
+        if key not in ("recent_profile", "recent_seed_ub")
+    }
+    for name, row in variants.items():
+        if row["tuning"] is None or any(row["tuning"].get(key) is not value for key, value in expected[name].items()):
+            raise ValueError(f"Wrong Seed-UB native options: {name}")
+        if {
+            key: value for key, value in row["tuning"].items() if key not in ("recent_profile", "recent_seed_ub")
+        } != common_tuning:
+            raise ValueError("Seed-UB changed an unrelated tuning option or budget")
+        if row["threshold"]["initial_keys"] != current["threshold"]["initial_keys"]:
+            raise ValueError("Seed-UB changed initial threshold")
+    return dict(
+        main_reference=main_key,
+        seed_ub_eligibility=prediction,
+        upstream_revision=provenance["commit"],
+        marker_removal_reduction_pct=reduction(current["mean_us"], variants["release"]["mean_us"]),
+        seed_reuse_reduction_pct=reduction(variants["release"]["mean_us"], variants["seed"]["mean_us"]),
+        **{
+            f"{name}_vs_main_reduction_pct": reduction(main["mean_us"], row["mean_us"])
+            for name, row in variants.items()
+        },
+        traffic_main_to_seed=traffic_change(main["reads"], variants["seed"]["reads"]),
+    )
+
+
 def summarize(results, study="threshold"):
     first = next(iter(results.values()))
     for result in results.values():
@@ -127,7 +196,11 @@ def summarize(results, study="threshold"):
             mean_us=mean,
             p50_us=result["timing"]["p50_us"],
             reads=reads,
-            graph_payload_GBps=reads["bytes"] / mean / 1000,
+            graph_payload_GBps=reads["bytes"] / mean / 1000,  # Compatibility alias.
+            graph_total_GBps=reads["bytes"] / mean / 1000,
+            graph_useful_GBps=reads["useful_transfer_bytes"] / mean / 1000,
+            payload_efficiency_pct=100 * reads["useful_transfer_bytes"] / reads["bytes"] if reads["bytes"] else None,
+            hardware_bandwidth_utilization_pct=None,
             threshold=result.get("threshold_comparison"),
             score_comparison=result.get("score_comparison"),
             selection=result["selection_comparison"],
@@ -137,12 +210,16 @@ def summarize(results, study="threshold"):
             timing=result["timing"],
             production_source=result.get("production_source"),
             native_diagnostics=result.get("native_diagnostics"),
+            seed_ub_eligibility=result.get("seed_ub_eligibility"),
         )
     effects = {}
     for transport in (value for value in ("urma", "ubmem") if any(key.startswith(value + "-") for key in table)):
         best = transport + "-serial"
+        if study == "seed-ub":
+            effects[transport] = summarize_seed_study(table, transport)
+            continue
         if study in ("skip", "upstream", "threshold-only"):
-            prefix = "recent" if study in ("upstream", "threshold-only") else "fused"
+            prefix = "recent" if study in ("upstream", "threshold-only", "seed-ub") else "fused"
             before, after = (table[f"{transport}-{prefix}-{name}"] for name in ("before", "after"))
             changed_option = "recent_threshold_only" if study == "threshold-only" else "recent_skip"
             label = "Threshold-only A/B" if study == "threshold-only" else "Skip A/B"
@@ -168,7 +245,7 @@ def summarize(results, study="threshold"):
                 raise ValueError("Skip A/B changed the final selection")
             if any(before["threshold"][key] != after["threshold"][key] for key in ("initial_keys", "final_keys")):
                 raise ValueError("Skip A/B changed the threshold")
-            if study in ("upstream", "threshold-only"):
+            if study in ("upstream", "threshold-only", "seed-ub"):
                 best = transport + "-upstream-serial"
                 main = table[transport + "-upstream-fused"]
                 for reference in (table[best], main):
@@ -195,7 +272,7 @@ def summarize(results, study="threshold"):
                     skip_reduction_pct=effects[transport]["optimization_reduction_pct"],
                     skip_vs_serial_reduction_pct=effects[transport]["optimization_vs_serial_reduction_pct"],
                 )
-            if study in ("upstream", "threshold-only"):
+            if study in ("upstream", "threshold-only", "seed-ub"):
                 effects[transport].update(
                     upstream_revision=main["production_source"]["commit"],
                     traffic_main_to_before=traffic_change(main["reads"], before["reads"]),
@@ -245,6 +322,12 @@ def summarize(results, study="threshold"):
         effects=effects,
         scope=first["scope"],
         timing_boundary=first["timing_boundary"],
+        bandwidth_accounting=dict(
+            graph_equivalent="Mean transferred payload bytes / mean complete-graph microseconds / 1000; decimal GB/s, not isolated Fetch bandwidth",
+            useful_payload="Transferred payload minus unused speculative prefetch; not unique cold demand",
+            payload_efficiency="Useful transferred bytes / total transferred bytes, not hardware bandwidth utilization",
+            hardware_bandwidth_utilization="N/A: no measured hardware reference or isolated transfer interval",
+        ),
     )
 
 
@@ -261,8 +344,60 @@ def print_summary(summary):
             f"{r['prefetch']:12.1f} {r['unused_prefetch']:16.1f} {waste:>7} {r['bytes'] / (1 << 20):15.3f}",
             flush=True,
         )
+        efficiency = row["payload_efficiency_pct"]
+        efficiency_text = "n/a" if efficiency is None else f"{efficiency:.2f}%"
+        print(
+            f"  GRAPH_BW total={row['graph_total_GBps']:.3f}GB/s useful={row['graph_useful_GBps']:.3f}GB/s "
+            f"payload_efficiency={efficiency_text} hardware_utilization=N/A",
+            flush=True,
+        )
+    print(
+        "BANDWIDTH_SCOPE complete-graph equivalent payload rates; not isolated Fetch bandwidth or link utilization.",
+        flush=True,
+    )
     for transport, effect in summary["effects"].items():
-        if summary.get("study") in ("upstream", "threshold-only"):
+        if summary.get("study") == "seed-ub":
+            prediction = effect["seed_ub_eligibility"]
+            print(
+                f"SEED_UB_ELIGIBILITY predicted={prediction['predicted_eligible_queries']}/{prediction['total_queries']} "
+                f"fallback={prediction['predicted_fallback_queries']} not_runtime_observation",
+                flush=True,
+            )
+            main = summary["table"][f"{transport}-upstream-fused"]["threshold"]
+            recent = summary["table"][f"{transport}-recent-seed"]["threshold"]
+            print(
+                f"THRESHOLD {transport} gap_mean={main['mean_gap']:.7g}->{recent['mean_gap']:.7g} "
+                f"equal_final={100 * main['equal_fraction']:.2f}%->{100 * recent['equal_fraction']:.2f}%",
+                flush=True,
+            )
+            print(
+                f"CHECK {transport} upstream={effect['upstream_revision']} all_fused_scores=bit_exact "
+                "all_fused_topk=unchanged_ordered recent_initial_threshold=unchanged_bit_exact KV_Index_outputs=verified",
+                flush=True,
+            )
+            print(
+                f"GAIN {transport} marker_removal={effect['marker_removal_reduction_pct']:.2f}% "
+                f"seed_reuse={effect['seed_reuse_reduction_pct']:.2f}% "
+                + " ".join(
+                    f"{name}_vs_main={effect[name + '_vs_main_reduction_pct']:.2f}%"
+                    for name in ("current", "release", "seed")
+                ),
+                flush=True,
+            )
+            traffic = effect["traffic_main_to_seed"]
+            print(
+                f"TRAFFIC {transport} main_to_seed "
+                + " ".join(
+                    f"{key}={value:.2f}%" if value is not None else f"{key}=n/a" for key, value in traffic.items()
+                ),
+                flush=True,
+            )
+            print(
+                "BASELINE exact main fusion; feature variants share one arena, no serial rerun or instrumented replay.",
+                flush=True,
+            )
+            continue
+        if summary.get("study") in ("upstream", "threshold-only", "seed-ub"):
             main, recent = (
                 summary["table"][f"{transport}-{name}"]["threshold"] for name in ("upstream-fused", "recent-after")
             )
@@ -352,13 +487,17 @@ def run(args):
         (transport, mode, reference)
         for transport in transports
         for mode, reference in (
-            (("serial", True), ("fused", True), ("fused", False))
-            if args.study in ("upstream", "threshold-only")
+            (("fused", True), ("fused", False))
+            if args.study == "seed-ub"
+            else (("serial", True), ("fused", True), ("fused", False))
+            if args.study in ("upstream", "threshold-only", "seed-ub")
             else (("serial", False), ("fused", False))
         )
     ]
     for transport, mode, reference in cases:
-        prefix = "upstream-" if reference else "recent-" if args.study in ("upstream", "threshold-only") else ""
+        prefix = (
+            "upstream-" if reference else "recent-" if args.study in ("upstream", "threshold-only", "seed-ub") else ""
+        )
         name = f"{transport}-{prefix}{mode}"
         paired = mode == "fused" and not reference
         child_study = "threshold" if reference else "skip" if args.study == "upstream" else args.study
@@ -411,6 +550,7 @@ def run(args):
                     "skip": " before/after share DDR",
                     "upstream": " recompute/score-replay share DDR",
                     "threshold-only": " recompute/kth-only share DDR",
+                    "seed-ub": " current-kth/release-kth/seed-ub share DDR",
                 }[args.study]
                 if paired
                 else f" workers={args.serial_workers}" + (" post=128 inflight=2048" if transport == "urma" else "")
@@ -437,7 +577,7 @@ def run(args):
             raise SystemExit(1)
         report = json.loads(output.read_text())
         if paired:
-            case_prefix = f"{transport}-recent" if args.study in ("upstream", "threshold-only") else name
+            case_prefix = f"{transport}-recent" if args.study in ("upstream", "threshold-only", "seed-ub") else name
             results.update({f"{case_prefix}-{key}": value for key, value in report["cases"].items()})
         else:
             results[name] = report

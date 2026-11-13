@@ -17,12 +17,18 @@ def validate_fused_tuning(value, transport):
         "recent_unified_topk",
         "recent_skip",
         "recent_threshold_only",
+        "recent_seed_ub",
+        "recent_profile",
     }:
         raise ValueError("Only recent-threshold seed options are changed in this production A/B comparison")
     if any(type(flag) is not bool for flag in value.values()):
         raise ValueError("Recent-threshold seed options must be boolean")
     if transport != "urma" and value.get("recent_threshold_only"):
         raise ValueError("recent_threshold_only is supported only by URMA")
+    if transport != "urma" and (value.get("recent_seed_ub") or value.get("recent_profile")):
+        raise ValueError("recent_seed_ub/recent_profile are supported only by URMA")
+    if value.get("recent_seed_ub") and not value.get("recent_threshold_only"):
+        raise ValueError("recent_seed_ub requires recent_threshold_only")
     return value
 
 
@@ -80,16 +86,27 @@ def create_fused(
         recent_unified_topk=tuning.get("recent_unified_topk", True),
         recent_skip=tuning.get("recent_skip", transport == "ubmem"),
         recent_threshold_only=tuning.get("recent_threshold_only", False),
+        recent_seed_ub=tuning.get("recent_seed_ub", False),
+        recent_profile=tuning.get("recent_profile", transport == "urma"),
         prefetch_limit=512,
         window_limit=64,
     )
     build_options = {key: effective[key] for key in ("recent_pipeline", "recent_unified_topk", "recent_skip")}
     if transport == "urma":
-        build_options["recent_threshold_only"] = effective["recent_threshold_only"]
+        build_options.update(
+            {key: effective[key] for key in ("recent_threshold_only", "recent_seed_ub", "recent_profile")}
+        )
     if upstream:
         if any(tuning.values()):
             raise ValueError("The exact upstream reference cannot accept feature options")
-        effective.update(recent_threshold=False, recent_pipeline=False, recent_unified_topk=False, recent_skip=False)
+        effective.update(
+            recent_threshold=False,
+            recent_pipeline=False,
+            recent_unified_topk=False,
+            recent_skip=False,
+            recent_profile=False,
+            recent_seed_ub=False,
+        )
         build_options = {}  # The upstream builder API has no recent options.
     threshold_bounds = None
     if effective["recent_threshold"]:
@@ -165,6 +182,11 @@ def create_fused(
         )
         update_type = DirectIndexUpdate
     verify_build_options(rotating.library, build_options)
+    if effective["recent_seed_ub"]:
+        from kvip.diagnostics.seed_eligibility import predict_seed_eligibility
+
+        if not predict_seed_eligibility(archive, rotating.runtime_shape)["predicted_eligible_queries"]:
+            raise ValueError("Seed-UB has no eligible queries; every query would use the fallback")
     # Keep the archived output shape for generic state reset/oracle.
     rotating.output = output
     update = update_type(

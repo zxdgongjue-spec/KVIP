@@ -12,13 +12,12 @@ import pytest
 from test_recent_index import COMMON, INDEXER, function
 
 
-def test_exact_kth_loader_preserves_scores_and_avoids_candidate_outputs(tmp_path):
+def threshold_model_source():
     vector = (INDEXER / "indexer_vector.h").read_text()
     topk = (INDEXER / "topk.h").read_text()
     loader = function(vector, "    __aicore__ inline bool TryUnifiedResidentTopK(")
     select = function(topk, "    __aicore__ inline void Threshold(")
-    cpp = tmp_path / "threshold.cpp"
-    cpp.write_text(
+    return (
         r"""
 #include <algorithm>
 #include <array>
@@ -157,6 +156,11 @@ int main(){
 }
 """
     )
+
+
+def test_exact_kth_loader_preserves_scores_and_avoids_candidate_outputs(tmp_path):
+    cpp = tmp_path / "threshold.cpp"
+    cpp.write_text(threshold_model_source())
     exe = tmp_path / "threshold"
     subprocess.run(
         [

@@ -17,6 +17,14 @@ extern "C" uint32_t kvip_recent_skip() { return KVIP_RECENT_SKIP; }
 #define KVIP_RECENT_THRESHOLD_ONLY 0
 #endif
 extern "C" uint32_t kvip_recent_threshold_only() { return KVIP_RECENT_THRESHOLD_ONLY; }
+#ifndef KVIP_RECENT_SEED_UB
+#define KVIP_RECENT_SEED_UB 0
+#endif
+#ifndef KVIP_RECENT_PROFILE
+#define KVIP_RECENT_PROFILE 1
+#endif
+extern "C" uint32_t kvip_recent_seed_ub() { return KVIP_RECENT_SEED_UB; }
+extern "C" uint32_t kvip_recent_profile() { return KVIP_RECENT_PROFILE; }
 extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) { return rotating::PrepareShape(shape); }
 #define ENTRY(name, blocks) \
 extern "C" uint32_t aclrtlaunch_v9_##name##_kernel(uint32_t,void*,void*); \
