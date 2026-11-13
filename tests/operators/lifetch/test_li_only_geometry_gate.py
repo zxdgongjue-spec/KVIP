@@ -220,3 +220,48 @@ def test_li_core_perf_graph_repeats_capture_scope():
     assert 'rotating._call("init")' not in capture
     assert 'rotating._call("wait")' not in capture
     assert "elapsed_us / graph_repeats" in source[anchor:]
+
+
+def test_li_q2_trunk_control_forwards_and_admits_auto(lifetch_cli, monkeypatch):
+    commands = []
+    monkeypatch.setattr(lifetch_cli.subprocess, "call", lambda cmd: commands.append(cmd) or 0)
+    args = cli_args(prefetch=0) + ["--li-core-perf", "--li-tiling", "auto",
+                                   "--li-q2-trunk8k-control"]
+    assert lifetch_cli.main(args) == 0
+    assert "--li-q2-trunk8k-control" in commands[0]
+    worker = lifetch_cli.arguments(args[2:])
+    assert worker.li_q2_trunk8k_control is True
+
+
+def test_li_q2_trunk_control_rejects_q4(lifetch_cli):
+    with pytest.raises(SystemExit) as exc:
+        lifetch_cli.main(cli_args(prefetch=0) + [
+            "--li-core-perf", "--li-tiling", "q4", "--li-q2-trunk8k-control"
+        ])
+    assert exc.value.code == 2
+
+
+def test_li_q2_trunk_control_rejects_prefetch(lifetch_cli):
+    with pytest.raises(SystemExit) as exc:
+        lifetch_cli.main(cli_args(prefetch=64) + [
+            "--li-core-perf", "--li-q2-trunk8k-control"
+        ])
+    assert exc.value.code == 2
+
+
+def test_li_q2_trunk_control_rejects_without_perf(lifetch_cli):
+    with pytest.raises(SystemExit) as exc:
+        lifetch_cli.main(cli_args(prefetch=0) + ["--li-q2-trunk8k-control"])
+    assert exc.value.code == 2
+
+
+def test_li_q2_trunk_control_compile_flag_is_opt_in():
+    root = Path(__file__).resolve().parents[3]
+    cmake_path = root / "csrc/operators/lightning_indexer_with_fetch/CMakeLists.txt"
+    kernel_path = root / "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_vector.h"
+    cmake_source = cmake_path.read_text()
+    kernel_source = kernel_path.read_text()
+    assert 'set(V9_Q2_TRUNK8K_CONTROL 0 CACHE STRING' in cmake_source
+    assert '-DV9_Q2_TRUNK8K_CONTROL=${V9_Q2_TRUNK8K_CONTROL}' in cmake_source
+    assert '#if defined(V9_Q2_TRUNK8K_CONTROL) && V9_Q2_TRUNK8K_CONTROL' in kernel_source
+    assert 'trunkLen_ = s1BaseSize_ == 2 ? TRUNK_LEN_16K : 8192;' in kernel_source

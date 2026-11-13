@@ -130,6 +130,7 @@ def run(args, run_dir):
                 KVAF_INCLUDE=find_headers(args.kvaf_root),
                 V9_INTERMEDIATE_PROFILING=int(getattr(args, "epoch_audit_profile", False)),
                 V9_ACTIVE_K_MAP_CLEAR=int(getattr(args, "active_k_map_clear", False)),
+                V9_Q2_TRUNK8K_CONTROL=int(getattr(args, "li_q2_trunk8k_control", False)),
             )
             if not shared_build.exists():
                 command(
@@ -846,6 +847,7 @@ def run_v9_li_varlen_only(
                 prefetch_disabled=True,
                 li_cores=int(rotating.runtime_shape.liCores),
                 split_q=int(rotating.runtime_shape.splitQ),
+                q2_trunk8k_control=bool(getattr(args, "li_q2_trunk8k_control", False)),
             )
             print(
                 "P0_C1_LI_GRAPH_TIMING "
@@ -912,6 +914,7 @@ def run_v9_li_varlen_only(
         "test": "custom_v9_li_variable_actual_qk_lengths",
         "soc": args.soc,
         "li_tiling": getattr(args, "li_tiling", "auto"),
+        "li_q2_trunk8k_control": bool(getattr(args, "li_q2_trunk8k_control", False)),
         "li_core_sweep": bool(getattr(args, "li_core_sweep", False)),
         "li_core_perf": bool(getattr(args, "li_core_perf", False)),
         "li_cores": int(rotating.runtime_shape.liCores),

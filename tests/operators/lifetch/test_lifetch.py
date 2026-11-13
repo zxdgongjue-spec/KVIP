@@ -55,6 +55,8 @@ def arguments(argv=None):
     p.add_argument("--comparison-sfa", type=Path)
     p.add_argument("--li-core-perf-graph-repeats", type=int, default=16,
                    help="P0-C1: capture N consecutive v9_li calls per device-timed graph; 1..64")
+    p.add_argument("--li-q2-trunk8k-control", action="store_true",
+                   help="P0-C3 test-only Q2 8K TopK Trunk; requires LI core perf, auto, prefetch=0")
     p.add_argument("--li-core-perf", action="store_true",
                    help="P0-C1: timed LI-only Graph replays after Native TopK check; prefetch=0")
     p.add_argument("--li-core-sweep", action="store_true",
@@ -129,6 +131,11 @@ def arguments(argv=None):
             p.error(str(exc))
     if not 1 <= a.li_core_perf_graph_repeats <= 64:
         p.error('--li-core-perf-graph-repeats must be 1..64')
+    if a.li_q2_trunk8k_control and (
+        not a.li_core_perf or a.li_tiling != 'auto'
+        or not a.li_only_varlen or a.prefetch_tokens != 0
+    ):
+        p.error('--li-q2-trunk8k-control requires LI-only --li-core-perf --li-tiling auto --prefetch-tokens 0')
     if a.li_core_perf and (not a.li_only_varlen or a.prefetch_tokens != 0):
         p.error('--li-core-perf requires --li-only-varlen --prefetch-tokens 0')
     if a.li_core_sweep and (not a.li_only_varlen or a.prefetch_tokens != 0):
@@ -262,6 +269,8 @@ def main(argv=None):
     p.add_argument('--comparison-sfa', type=Path)
     p.add_argument('--li-core-perf-graph-repeats', type=int, default=16,
                    help='P0-C1: capture N consecutive v9_li calls per timed graph; 1..64')
+    p.add_argument('--li-q2-trunk8k-control', action='store_true',
+                   help='P0-C3 Q2 TopK Trunk 8K control (only LI core perf auto/prefetch=0)')
     p.add_argument('--li-core-perf', action='store_true',
                    help='P0-C1: LI-only device Event timing after TopK correctness, prefetch=0')
     p.add_argument('--li-core-sweep', action='store_true',
@@ -302,6 +311,11 @@ def main(argv=None):
         p.error('--cold-prefetch-probe requires --prefetch-payload-audit and one final cold miss per query')
     if not 1 <= a.li_core_perf_graph_repeats <= 64:
         p.error('--li-core-perf-graph-repeats must be 1..64')
+    if a.li_q2_trunk8k_control and (
+        not a.li_core_perf or a.li_tiling != 'auto'
+        or not a.li_only_varlen or a.prefetch_tokens != 0
+    ):
+        p.error('--li-q2-trunk8k-control requires LI-only --li-core-perf --li-tiling auto --prefetch-tokens 0')
     if a.li_core_perf and (not a.li_only_varlen or a.prefetch_tokens != 0):
         p.error('--li-core-perf requires --li-only-varlen --prefetch-tokens 0')
     if a.li_core_sweep and (not a.li_only_varlen or a.prefetch_tokens != 0):
@@ -347,6 +361,8 @@ def main(argv=None):
     if a.li_core_perf:
         common.append('--li-core-perf')
         common.extend(['--li-core-perf-graph-repeats', str(a.li_core_perf_graph_repeats)])
+    if a.li_q2_trunk8k_control:
+        common.append('--li-q2-trunk8k-control')
     if a.native_union_fit:
         common.append('--native-union-fit')
     if a.active_k_map_clear:

@@ -330,7 +330,13 @@ __aicore__ inline void QLIVector<QLIT>::InitParams(const struct QLICommon::Const
     if constexpr (std::is_same_v<SCORE_T, uint32_t>) {
         trunkLen_ = TRUNK_LEN_6K;
     } else {
-        trunkLen_ = s1BaseSize_ == 2 ? TRUNK_LEN_16K : 8192; // Q2 retains native TopK; Q4 must fit the UB budget
+#if defined(V9_Q2_TRUNK8K_CONTROL) && V9_Q2_TRUNK8K_CONTROL
+        // P0-C3 controlled diagnostic: change ONLY Q2's Trunk length.
+        // Uses the existing Q4 8K TopK path, leaving SplitCore/Query intact.
+        trunkLen_ = 8192;
+#else
+        trunkLen_ = s1BaseSize_ == 2 ? TRUNK_LEN_16K : 8192; // Q2 native 16K, Q4 8K
+#endif
     }
     topkCount_ = constInfo.sparseCount;
     topkOp_.Init(topkCount_, trunkLen_);
