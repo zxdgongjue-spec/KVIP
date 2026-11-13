@@ -82,22 +82,6 @@ def test_fetch_only_is_automatic_only_for_level_three_fetch():
         assert worker.fetch_only_compare is False  # Never bypass full-graph timing.
 
 
-def test_bench_matrix_keeps_scalar_workers_and_all_cases():
-    from execution import bench_jobs
-    for transport in ('urma', 'ubmem'):
-        config = configuration(['bench', '--transport', transport, '--batches', '1,2,4,8,16',
-                                '--miss-percent', '3,5,10,15'])
-        jobs = bench_jobs(config)
-        assert len(jobs) == 4 and len({name for name, _ in jobs}) == 4
-        assert [(bs, job.miss_percent) for _, job in jobs for bs in job.batches] == [
-            (bs, miss) for miss in (3, 5, 10, 15) for bs in (1, 2, 4, 8, 16)]
-        for _, job in jobs:
-            worker = runner_options(job)
-            assert worker.trace_rounds == 0 and worker.transport == transport
-            assert worker.seed == config.seed and worker.iterations == config.iterations
-        assert config.miss_percent == (3, 5, 10, 15)
-
-
 def test_bench_matrix_rejects_invalid_percentages():
     import pytest
     for value in ('nan', 'inf', '3,nan', '3,101', '-1,3', '3,3.0', '3,'):
@@ -112,11 +96,13 @@ def test_matrix_dispatch_collects_twenty_pairs_without_npu(tmp_path, monkeypatch
 
     def launch(job, directory):
         directory.mkdir(parents=True)
-        for batch in job.batches:
-            atomic_json(directory / f'bs{batch}' / 'report.json', dict(
-                batch=batch, correctness='PASS', timing=dict(
-                    native_chain=timing_summary([100, 110]),
-                    prototype_with_update=timing_summary([80, 90]))))
+        assert job.miss_percent == (3, 5, 10, 15)
+        for miss in job.miss_percent:
+            for batch in job.batches:
+                atomic_json(directory / f'miss{miss}' / f'bs{batch}' / 'report.json', dict(
+                    batch=batch, miss_percent=miss, correctness='PASS', timing=dict(
+                        native_chain=timing_summary([100, 110]),
+                        prototype_with_update=timing_summary([80, 90]))))
         atomic_json(directory / 'worker-result.json', dict(exit_code=0))
         return 0
 

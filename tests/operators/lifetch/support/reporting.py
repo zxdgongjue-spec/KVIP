@@ -105,7 +105,8 @@ def collect_results(directory, config, exit_code):
     for path in sorted(reports):
         report = json.loads(path.read_text())
         batch = report.get('batch')
-        observed.add(batch)
+        miss = report.get('miss_percent', getattr(config, 'miss_percent', None))
+        observed.add((batch, miss))
         timing = report.get('timing', {})
         correct = report.get('correctness', report.get('status', 'NOT_RUN').upper())
         if report.get('serial_correctness', 'PASS') != 'PASS':
@@ -114,16 +115,20 @@ def collect_results(directory, config, exit_code):
                              timing.get('prototype_with_update'), correct,
                              execution=report.get('execution', 'INCOMPLETE' if path.name == 'completed_timings.json' else 'COMPLETED'))
         row.update(batch=batch, transport=config.transport, mode=config.mode, report=str(path),
-                   seed=getattr(config, 'seed', None), miss_percent=getattr(config, 'miss_percent', None),
+                   seed=getattr(config, 'seed', None), miss_percent=report.get('miss_percent', getattr(config, 'miss_percent', None)),
                    history=getattr(config, 'history', None), resident=getattr(config, 'resident', None),
                    prefetch_tokens=getattr(config, 'prefetch_tokens', None))
         rows.append(row)
-    for batch in (getattr(config, 'batches', ()) or ()):
-        if batch not in observed:
-            row = comparison_row(f'BS{batch}', None, None, 'NOT_RUN',
-                                 execution='FAILED' if exit_code else 'INCOMPLETE')
-            row.update(batch=batch, reason='missing structured case result')
-            rows.append(row)
+    misses = getattr(config, 'miss_percent', None)
+    misses = misses if isinstance(misses, (tuple, list)) else (misses,)
+    for miss in misses:
+        for batch in (getattr(config, 'batches', ()) or ()):
+            if (batch, miss) not in observed:
+                row = comparison_row(f'BS{batch}/miss{miss}', None, None, 'NOT_RUN',
+                                     execution='FAILED' if exit_code else 'INCOMPLETE')
+                row.update(batch=batch, miss_percent=miss, transport=config.transport,
+                           reason='missing structured case result')
+                rows.append(row)
     if exit_code and rows and all(row['execution'] == 'COMPLETED' for row in rows):
         row = comparison_row('worker', None, None, 'NOT_RUN', execution='FAILED')
         row['reason'] = f'worker exit={exit_code}; completed case timings retained'

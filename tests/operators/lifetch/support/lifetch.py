@@ -57,6 +57,7 @@ def run(args, run_dir):
     class FiniteSession(NativeFetchSession):
         @classmethod
         def open(cls, *pos, **kw):
+            kw["shared_pool"] = getattr(args, "shared_pool", None)
             kw["payload_factory"] = lambda t, b, h: t.from_numpy(np.stack([payload(i, np.arange(h)) for i in range(b)]))
             return super().open(*pos, **kw)
 
@@ -171,7 +172,7 @@ def run(args, run_dir):
                 )
                 failed |= report.get("correctness", "PASS") != "PASS"
                 report.update(
-                    batch=batch, history=args.history, resident=args.resident,
+                    batch=batch, history=args.history, resident=args.resident, miss_percent=args.miss_percent,
                     index_heads=args.index_heads, seed=args.seed if hasattr(args, 'seed') else 20261104,
                     fixture=fixture_info,
                     resources=resources,
@@ -376,7 +377,7 @@ def run_device(
         measured = timing_summary(samples)
         completed_timings[timing_name or read_label or getattr(call, '__name__', 'operation')] = measured
         atomic_json(folder / 'completed_timings.json', dict(
-            batch=b, timing=completed_timings, correctness=correctness.status, failures=correctness.failures))
+            batch=b, miss_percent=args.miss_percent, timing=completed_timings, correctness=correctness.status, failures=correctness.failures))
         if read_label == "prototype_with_update" and args.comparison_output:
             reset()
             stream.synchronize()

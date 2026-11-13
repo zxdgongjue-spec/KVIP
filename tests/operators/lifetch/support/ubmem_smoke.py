@@ -93,6 +93,7 @@ def check_shape(
     result_output=None,
     serial_compare=False,
     check_case=None,
+    shared_pool=None,
 ):
     batch, history, resident, token_bytes = shape.batch, shape.history, shape.resident, shape.token_bytes
     checks = CorrectnessRecorder()
@@ -106,25 +107,27 @@ def check_shape(
     slot_bytes = (block_bytes + 4095) // 4096 * 4096
     blocks = history // 128
     keys = list(range(batch * blocks))
-    source_cpu = np.concatenate([payload(owner, np.arange(history), token_bytes) for owner in range(1, batch + 1)])
-    source = torch.from_numpy(source_cpu).to(device)
-    runtime = kvaf.NpuRuntime(
-        str(build / "bin/kvaf_execute_batch_get_kernels.o"),
-        token_bytes,
-        128,
-        device_id=device_id,
-        npu_core_count=2,
-        batch_put_kernel_object_path=str(build / "bin/kvaf_execute_batch_put_kernels.o"),
-        transport="ubmem",
-    )
     table = lease = graph = None
     stream = torch.npu.current_stream(device)
+    if shared_pool is not None:
+        borrowed = shared_pool.borrow(torch, device, batch, history, 2)
+        runtime, table, device_table = borrowed.runtime, borrowed.table, borrowed.device_table
+        source_cpu = borrowed.cpu_payload.numpy().reshape(-1, token_bytes)
+        source = borrowed.cpu_payload.to(device).reshape(-1, token_bytes)
+    else:
+        source_cpu = np.concatenate([payload(owner, np.arange(history), token_bytes) for owner in range(1, batch + 1)])
+        source = torch.from_numpy(source_cpu).to(device)
+        runtime = kvaf.NpuRuntime(
+            str(build / "bin/kvaf_execute_batch_get_kernels.o"), token_bytes, 128,
+            device_id=device_id, npu_core_count=2,
+            batch_put_kernel_object_path=str(build / "bin/kvaf_execute_batch_put_kernels.o"), transport="ubmem")
     try:
-        runtime.link_to(args_server)
-        runtime.initialize((len(keys) + 2) * slot_bytes, slot_bytes)
-        runtime.batch_put(keys, source, [i * block_bytes for i in keys], [block_bytes] * len(keys))
-        table = runtime.prepare_access_table(keys)
-        device_table = runtime.access_table_view(table, device="npu")
+        if shared_pool is None:
+            runtime.link_to(args_server)
+            runtime.initialize((len(keys) + 2) * slot_bytes, slot_bytes)
+            runtime.batch_put(keys, source, [i * block_bytes for i in keys], [block_bytes] * len(keys))
+            table = runtime.prepare_access_table(keys)
+            device_table = runtime.access_table_view(table, device="npu")
         storage = IndexCacheStorage(torch, batch + 1, history, resident, device)
         key_tensor = torch.from_numpy(fixture["keys"]).to(device)
         scale_tensor = torch.from_numpy(fixture["scales"]).to(device)
@@ -568,10 +571,14 @@ def check_shape(
         graph = None
         lease.close()
         lease = None
-        runtime.release_access_table(table)
-        table = None
-        runtime.batch_free(keys)
-        runtime.shutdown()
+        if shared_pool is None:
+            runtime.release_access_table(table)
+            table = None
+            runtime.batch_free(keys)
+            runtime.shutdown()
+        else:
+            shared_pool.release()
+            table = None
     finally:
         # A failed fence deliberately leaves the lease and its buffers retained
         # by KVAF. Never continue freeing storage after uncertain completion.
@@ -583,10 +590,11 @@ def check_shape(
             graph.reset()
         if lease is not None:
             lease.close()
-        if table is not None:
-            runtime.release_access_table(table)
-        if runtime.initialized:
-            runtime.shutdown()
+        if shared_pool is None:
+            if table is not None:
+                runtime.release_access_table(table)
+            if runtime.initialized:
+                runtime.shutdown()
     print(
         f"UBMEM_LIFETCH_{checks.status} device={device_id} batch={batch} heads={shape.heads} "
         f"history={history} resident={resident} token_bytes={token_bytes} "
@@ -598,7 +606,7 @@ def check_shape(
     return checks.status == "PASS" and (serial_result is None or serial_result["correctness"] == "PASS")
 
 
-def main(argv=None):
+def main(argv=None, *, shared_pool=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--optimized-resolve", action="store_true")
     parser.add_argument("--ubmem-fetch-mode", choices=("serial", "overlap"), default="overlap")
@@ -692,6 +700,7 @@ def main(argv=None):
                 result_output=args.result_output,
                 serial_compare=args.serial_compare,
                 check_case=args.check_case,
+                shared_pool=shared_pool,
             )
             failed |= not passed
     return int(failed)

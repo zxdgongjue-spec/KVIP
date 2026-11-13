@@ -95,6 +95,7 @@ class NativeFetchSession:
         put_chunk_blocks: int = 0,
         npu_core_count: int = 32,
         payload_factory: Callable[[Any, int, int], Any] | None = None,
+        shared_pool=None,
     ) -> None:
         self.torch = torch
         self.graphs: list[Any] = []
@@ -120,46 +121,52 @@ class NativeFetchSession:
             for method in ("acquire_fused_batch_get_context", "release_fused_batch_get_context")
         ):
             raise ValueError("matching_kvaf_queue_health_lease_api_missing")
-        self.runtime = kvaf.NpuRuntime(
-            str(get_kernel),
-            batch_get_token_bytes=TOKEN_BYTES,
-            batch_get_tokens_per_block=BLOCK_SIZE,
-            device_id=int(device.index or 0),
-            npu_core_count=npu_core_count,
-            batch_put_kernel_object_path=str(put_kernel),
-            jettys_per_core=2,
-        )
-        self.runtime.link_to(server)
         qcap = candidate_tokens // BLOCK_SIZE
-        capacity = batch * qcap
-        block_bytes = BLOCK_SIZE * TOKEN_BYTES
-        self.runtime.initialize(capacity * block_bytes, block_bytes)
-        # Select the fixture before the first PUT: PreparePut reserves new
-        # remote slots and must not be used to overwrite an initialized pool.
-        self.cpu_payload = (payload if payload_factory is None else payload_factory)(torch, batch, candidate_tokens)
-        self.seed = self.cpu_payload.to(device).reshape(capacity, block_bytes)
-        # Current KVAF keys are physical DDR slot IDs, not arbitrary labels.
-        # Flat pool/layer/page order must match the access table below.
-        keys = list(range(capacity))
-        try:
-            chunk = put_chunk_blocks or capacity
-            if chunk < 1:
-                raise ValueError("put_chunk_blocks_must_be_nonnegative")
-            for begin in range(0, capacity, chunk):
-                end = min(begin + chunk, capacity)
-                self.runtime.batch_put(
-                    keys[begin:end],
-                    self.seed,
-                    [index * block_bytes for index in range(begin, end)],
-                    [block_bytes] * (end - begin),
-                )
-                torch.npu.synchronize()
-        except BaseException as error:
-            # GET queue health cannot establish completion of a failed PUT.
-            # Keep the registered seed alive and do not unwind its allocation.
-            self.quarantine("uncertain_batch_put_completion", error)
-        self.table = self.runtime.prepare_access_table(keys)
-        self.device_table = self.runtime.access_table_view(self.table, device="npu", capacity=capacity)
+        self.shared_pool = shared_pool
+        if shared_pool is not None:
+            borrowed = shared_pool.borrow(torch, device, batch, candidate_tokens, npu_core_count)
+            self.runtime, self.table = borrowed.runtime, borrowed.table
+            self.cpu_payload, self.device_table = borrowed.cpu_payload, borrowed.device_table
+        else:
+            self.runtime = kvaf.NpuRuntime(
+                str(get_kernel),
+                batch_get_token_bytes=TOKEN_BYTES,
+                batch_get_tokens_per_block=BLOCK_SIZE,
+                device_id=int(device.index or 0),
+                npu_core_count=npu_core_count,
+                batch_put_kernel_object_path=str(put_kernel),
+                jettys_per_core=2,
+            )
+            self.runtime.link_to(server)
+            capacity = batch * qcap
+            block_bytes = BLOCK_SIZE * TOKEN_BYTES
+            self.runtime.initialize(capacity * block_bytes, block_bytes)
+            # Select the fixture before the first PUT: PreparePut reserves new
+            # remote slots and must not be used to overwrite an initialized pool.
+            self.cpu_payload = (payload if payload_factory is None else payload_factory)(torch, batch, candidate_tokens)
+            self.seed = self.cpu_payload.to(device).reshape(capacity, block_bytes)
+            # Current KVAF keys are physical DDR slot IDs, not arbitrary labels.
+            # Flat pool/layer/page order must match the access table below.
+            keys = list(range(capacity))
+            try:
+                chunk = put_chunk_blocks or capacity
+                if chunk < 1:
+                    raise ValueError("put_chunk_blocks_must_be_nonnegative")
+                for begin in range(0, capacity, chunk):
+                    end = min(begin + chunk, capacity)
+                    self.runtime.batch_put(
+                        keys[begin:end],
+                        self.seed,
+                        [index * block_bytes for index in range(begin, end)],
+                        [block_bytes] * (end - begin),
+                    )
+                    torch.npu.synchronize()
+            except BaseException as error:
+                # GET queue health cannot establish completion of a failed PUT.
+                # Keep the registered seed alive and do not unwind its allocation.
+                self.quarantine("uncertain_batch_put_completion", error)
+            self.table = self.runtime.prepare_access_table(keys)
+            self.device_table = self.runtime.access_table_view(self.table, device="npu", capacity=capacity)
         if temporary_only:
             if cache_tokens != TOPK:
                 raise ValueError("v5_temporary_capacity_must_be_topk")
@@ -321,6 +328,10 @@ class NativeFetchSession:
             graph.reset()
         self.graphs.clear()
         if self.runtime is not None:
+            if getattr(self, 'shared_pool', None) is not None:
+                self.shared_pool.release()
+                self.runtime = self.table = None
+                return
             if self.table is not None:
                 self.runtime.release_access_table(self.table)
                 self.table = None

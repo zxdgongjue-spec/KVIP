@@ -16,15 +16,6 @@ from runner import progress
 ROOT = Path(__file__).resolve().parents[4]
 
 
-def bench_jobs(config):
-    """One isolated worker per miss rate; each reuses the shared runtime-shape build."""
-    misses = config.miss_percent if isinstance(getattr(config, 'miss_percent', None), tuple) else None
-    if misses is None:
-        return [(config.mode, config)]
-    return [(f'bench_miss{miss:g}', SimpleNamespace(**{**vars(config), 'miss_percent': miss}))
-            for miss in misses]
-
-
 def runner_options(config):
     """Translate workload options to the existing formal URMA test runner.
 
@@ -124,7 +115,7 @@ def launch(config, directory):
                      environment=environment)
 
 
-def run_config(path):
+def run_config(path, shared_pool=None):
     """Internal worker protocol; the sole user-facing entry remains test_lifetch."""
     import json
     from reporting import atomic_json
@@ -133,6 +124,32 @@ def run_config(path):
     config = SimpleNamespace(**json.loads(path.read_text()))
     config.kvaf_root = Path(config.kvaf_root).resolve()
     config.output = path.parent
+    if config.mode == 'bench' and config.input == 'synthetic' and shared_pool is None:
+        from bench_pool import BenchPool
+        pool = BenchPool(config)
+        misses = config.miss_percent if isinstance(config.miss_percent, list) else [config.miss_percent]
+        failed = 0
+        try:
+            for miss in misses:
+                child = path.parent / f'miss{miss:g}' / 'config.json'
+                atomic_json(child, {**json.loads(path.read_text()), 'miss_percent': miss})
+                failed |= run_config(child, shared_pool=pool)
+            pool.close()
+            stats = dict(transport=config.transport, max_batch=max(config.batches),
+                         cases=pool.borrows, runtime_workers=pool.workers,
+                         put_bytes=max(config.batches) * config.history * 656,
+                         additional_case_put_bytes=0)
+            atomic_json(path.parent / 'pool.json', stats)
+            print(f'BENCH SHARED POOL: {stats}', flush=True)
+        except BaseException:
+            # Unknown transfer completion: retain registered buffers until process exit.
+            import traceback
+            traceback.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(70)
+        atomic_json(path.parent / 'worker-result.json', dict(exit_code=failed))
+        return failed
     operation = getattr(config, 'operation', 'pipeline')
     if operation == 'contract':
         from correctness import check_contracts
@@ -174,7 +191,9 @@ def run_config(path):
         atomic_json(path.parent / 'worker-result.json', dict(exit_code=0))
         return 0
     if config.transport == 'urma':
-        code = run_worker(runner_options(config), path.parent)
+        options = runner_options(config)
+        options.shared_pool = shared_pool
+        code = run_worker(options, path.parent)
     else:
         from ubmem_smoke import main as run_ubmem
 
@@ -192,7 +211,7 @@ def run_config(path):
             argv += ['--check-case', config.check_case]
         if config.mode == 'diagnose':
             argv += ['--trace-rounds', str(config.iterations), '--trace-output', str(path.parent / 'trace')]
-        code = run_ubmem(argv) or 0
+        code = run_ubmem(argv, shared_pool=shared_pool) or 0
     atomic_json(path.parent / 'worker-result.json', dict(exit_code=code))
     return code
 
@@ -220,7 +239,7 @@ def dispatch(config):
     elif config.mode == 'check':
         jobs = check_jobs(config)
     else:
-        jobs = bench_jobs(config)
+        jobs = [(config.mode, config)]
     atomic_json(run / 'config.json', {key: str(value) if isinstance(value, Path) else value
                                     for key, value in vars(config).items()})
     rows, stopped = [], False

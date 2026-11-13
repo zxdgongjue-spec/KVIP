@@ -151,13 +151,17 @@ python tests/operators/lifetch/test_lifetch.py bench \
   --kvaf-root /vllm-workspace/vllm-ascend/third_party/KVAF \
   --kvaf-server 127.0.0.1:28885 \
   --batches 1,2,4,8,16 --miss-percent 3,5,10,15 \
-  --warmup 4 --iterations 50 --timeout-seconds 1200
+  --warmup 4 --iterations 50 --timeout-seconds 3600
 ```
 
 UBmem 使用同一命令，改为 `--transport ubmem` 并指定其 KVAF 目录和 CPU service。
 每种传输20组配对结果，每组包含串行和融合完整图性能。首轮按需构建，后续复用
 所选 KVAF 目录下的运行时 shape 构建缓存；不按 BS/miss 编译。
-每个 miss 使用独立 worker，超时预算对该 worker 内全部5个BS生效。
+整个合成 bench 使用一个 worker，共享最大 BS 的 DDR 和 runtime；超时预算对整组矩阵生效。
+DDR 分块 Put 一次，后续 case 不重复 Put；每个 case 仍独立创建并恢复 Index/hot/LRU/图。
+URMA runtime 固定40个worker、每worker两条Jetty；UBmem固定2个worker。
+这会改变旧测试按BS创建URMA runtime的资源配置，历史小BS串行性能不是严格同配置对照。
+启动及结束打印共享池统计，`cases/bench/pool.json`保存Put字节数、复用次数和worker数。
 
 运行结束自动输出大表及 `results.csv`、`summary.json`；每组保留原始计时数据。
 汇总包含 transport、BS、目标miss%、正确性、mean/p50/p99及按mean计算的改善比例。
