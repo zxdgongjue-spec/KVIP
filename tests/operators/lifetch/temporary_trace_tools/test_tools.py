@@ -76,7 +76,7 @@ def test_input_profile_decodes_bf16_and_excludes_padding(tmp_path):
     torch.save(dict(metadata=dict(schema=1,sample=0),before=dict(
         row_owners=torch.tensor([0,-1]),logical_ids=torch.arange(4096).reshape(1,-1),
         hot_valid=torch.ones(1,2048,dtype=torch.uint8),query_valid=torch.tensor([1,1,1,1,0,0,0,0]),
-        key_lengths=torch.tensor([4096,0]),unpack_indices=torch.arange(8),query=query,keys=torch.full((4096,128),0x38,dtype=torch.uint8),
+        query_ends=torch.full((8,),4096),key_lengths=torch.tensor([4096,0]),unpack_indices=torch.arange(8),query=query,keys=torch.full((4096,128),0x38,dtype=torch.uint8),
         weights=torch.ones(8,2,dtype=torch.bfloat16),query_scale=torch.ones(8,2),key_scale=torch.ones(4096)),
         after=dict(logical_topk=torch.arange(2048,dtype=torch.int32).repeat(2,4,1))),source)
     root=tmp_path/'converted'
@@ -112,3 +112,50 @@ def test_generator_reproducible_and_score_metrics():
     assert 0 <= measured['sample_top_jaccard'] <= 1
     identical = dict(row, query=np.repeat(row['query'][:1], 4, axis=0))
     assert metrics(identical, .1)['sample_top_jaccard'] == 1
+
+
+
+def test_joint_generator_preserves_zero_scale_pairing_and_negative_heads():
+    from fit_generator import fit, generate, score_values, audit_topk
+    row = dict(query=np.zeros((4, 2, 128), np.float32),
+               keys=np.zeros((256, 128), np.float32),
+               weights=np.tile([-4., 1.], (4, 1)).astype(np.float32),
+               query_scale=np.ones((4, 2), np.float32),
+               key_scale=np.full(256, .005, np.float32))
+    row['query'][:, 0, 0] = 8
+    row['query'][:, 1, 1] = 1
+    row['keys'][:240, 0] = 8
+    row['key_scale'][240:] = 1
+    generated = generate(fit([row, row]), 4096, 9)
+    high_scale = generated['key_scale'] > .5
+    assert high_scale.any()
+    assert np.all(generated['keys'][high_scale] == 0)
+    assert np.median(score_values(generated)) < 0
+    scores = score_values(row)
+    row['selected'] = scores == 0
+    row['eligible'] = np.ones(scores.shape, bool)
+    assert audit_topk(row) == dict(checked_queries=4, inversions=0)
+    row['selected'] = ~row['selected']
+    assert audit_topk(row)['inversions'] == 4
+
+
+def test_generator_cli_writes_comparison_and_audit(tmp_path, monkeypatch):
+    import fit_generator
+    rng = np.random.default_rng(3)
+    rows = []
+    for capture in ('a', 'b'):
+        row = dict(query=rng.normal(size=(4, 2, 128)).astype(np.float32),
+                   keys=rng.normal(size=(128, 128)).astype(np.float32),
+                   weights=np.ones((4, 2), np.float32), query_scale=np.ones((4, 2), np.float32),
+                   key_scale=np.ones(128, np.float32), capture=capture)
+        scores = fit_generator.score_values(row)
+        row['selected'] = scores >= np.sort(scores, axis=1)[:, -8, None]
+        row['eligible'] = np.ones(scores.shape, bool)
+        rows.append(row)
+    monkeypatch.setattr(fit_generator, 'samples', lambda *args: iter(rows))
+    output = tmp_path / 'result'
+    monkeypatch.setattr(sys, 'argv', ['fit_generator.py', str(tmp_path), '--output', str(output)])
+    fit_generator.main()
+    assert json.loads((output/'generator.json').read_text())['schema_version'] == 2
+    assert json.loads((output/'score_audit.json').read_text())[0]['inversions'] == 0
+    assert 'score_p99' in json.loads((output/'comparison.json').read_text())

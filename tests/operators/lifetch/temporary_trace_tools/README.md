@@ -117,10 +117,20 @@ To evaluate revised parameters, add `--parameters /path/to/generator.json` and
 choose a new output directory. Defaults: 8192 sampled keys/request, selection
 fraction 2048/131072. Configure `--sample-keys` and `--top-fraction` if needed.
 
-This first model uses quantile marginals and correlated Q ranks. Index coordinates
-and key scales are drawn independently; score and selected-overlap differences
-measure the remaining modeling error. It does not yet model cache residency,
-position-dependent distributions or temporal evolution. Sampled score/selection
-statistics are not full-history TopK, prefetch counts, or NPU correctness checks.
-The existing benchmark generator is unchanged. Numerical CPU scores are a
-mathematical proxy, not a device rounding oracle.
+Version 2 preserves aggregate Q coordinate means, cross-Q residual covariance,
+and per-head joint weight/scale/norm statistics. Index generation uses conditional
+coordinate means/covariances by scale bucket, with zero vectors in a separate
+class. Parameters contain aggregates, not individual captured Q/Index rows.
+The same command refits version 2; old version 1 parameter files are rejected.
+
+`SCORE AUDIT` compares sampled captured winners against sampled non-winners after
+BF16 score rounding and causal masking. Zero inversions are necessary before
+interpreting score-fit results; this sampled test is not full TopK verification.
+`score_audit.json` retains per-request counts. No conclusion about fitting quality
+is inferred from local regression tests: compare the real-capture output.
+
+The model does not yet represent cache residency or temporal evolution. Conditional
+Gaussian coordinates approximate higher-order structure, and scale correlation
+within each bucket is not retained. Sampled selection statistics are not full-history
+TopK or actual prefetch counts. The existing benchmark generator is unchanged.
+CPU scores approximate the mathematical operator, not instruction-level rounding.
