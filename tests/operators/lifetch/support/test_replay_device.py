@@ -86,7 +86,7 @@ def test_persistent_state_corruption_is_fatal(tmp_path, field):
         state.validate_index(inputs, state.output[1:].numpy())
 
 
-def test_urma_replay_allocates_complete_scratch_before_binding(monkeypatch):
+def test_urma_replay_allocates_complete_scratch_before_binding(monkeypatch, tmp_path):
     from kvip.adapters import kvaf
     from kvip.operators.lifetch import binding, workspace
     from kvip.operators.lifetch.geometry import final_aivs, li_geometry
@@ -108,6 +108,8 @@ def test_urma_replay_allocates_complete_scratch_before_binding(monkeypatch):
         pass
 
     def inspect_binding(*args, scratch, **kwargs):
+        assert kwargs['output_stride'] - kwargs['resident'] >= 384
+        assert kwargs['tail_bounds'].shape == (2, 2)
         assert set(scratch) == set(expected)
         for name, (size, dtype) in expected.items():
             assert tuple(scratch[name].shape) == size
@@ -116,8 +118,8 @@ def test_urma_replay_allocates_complete_scratch_before_binding(monkeypatch):
         raise BindingReached
 
     monkeypatch.setattr(binding, 'LIFetchBinding', inspect_binding)
-    initial = SimpleNamespace(geometry=dict(batch=2, history=12288, resident=4096,
-                                           output_stride=4224, token_bytes=656, heads=32))
+    from correctness import stateful_inputs
+    initial = next(iter(stateful_inputs(tmp_path)))
     with pytest.raises(BindingReached):
         FusedReplayState(torch, SimpleNamespace(transport='urma'),
                          SimpleNamespace(addresses=None, valid=None), None, initial, None, None,

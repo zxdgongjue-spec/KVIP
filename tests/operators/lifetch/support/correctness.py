@@ -157,7 +157,8 @@ def stateful_inputs(directory):
     for feature, begin in enumerate((4096, 6144, 8192)):
         keys[:, begin:begin + 2048, feature] = 0x38  # Exactly 1 in E4M3.
     geometry = dict(batch=batch, history=history, resident=resident, heads=heads,
-                    token_bytes=656, output_stride=resident + 128)
+                    # Serving bindings reserve three 128-token ABC pages, even with an empty tail.
+                    token_bytes=656, output_stride=resident + 3 * 128)
     manifest = Path(directory) / 'stateful_input.json'
     phases = ('load_A', 'hit_A', 'evict_A_with_BC', 'reload_A')
     atomic_json(manifest, dict(input='synthetic', geometry=geometry, phases=phases,
