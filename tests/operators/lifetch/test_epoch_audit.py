@@ -118,13 +118,13 @@ def test_epoch_audit_rejects_invalid_event_fields(field, value, error):
     assert any(error in message for message in result["errors"])
 
 
-def test_epoch_audit_rejects_selected_greater_than_candidate():
+def test_epoch_audit_rejects_posted_greater_than_candidate():
     data = synthetic_events(profiling=True)
     words64 = data.view(np.uint64).reshape(8, 2, 16)
     words64[0, 0, 10] = 100
     result = audit(data, profiling=True)
     assert result["summary"]["validation"] == "FAIL"
-    assert any("selected" in error for error in result["errors"])
+    assert any("posted" in error for error in result["errors"])
 
 
 def test_epoch_audit_rejects_wrong_abi_shape():
