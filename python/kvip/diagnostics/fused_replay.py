@@ -43,6 +43,7 @@ def create_fused(
     transport,
     tuning=None,
     split_index_stages=False,
+    upstream=False,
 ):
     from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
     from kvip.operators.lifetch.binding import LIFetchBinding
@@ -69,11 +70,16 @@ def create_fused(
         recent_threshold=tuning.get("recent_threshold", False),
         recent_pipeline=tuning.get("recent_pipeline", True),
         recent_unified_topk=tuning.get("recent_unified_topk", True),
-        recent_skip=tuning.get("recent_skip", True),
+        recent_skip=tuning.get("recent_skip", transport == "ubmem"),
         prefetch_limit=512,
         window_limit=64,
     )
     build_options = {key: effective[key] for key in ("recent_pipeline", "recent_unified_topk", "recent_skip")}
+    if upstream:
+        if any(tuning.values()):
+            raise ValueError("The exact upstream reference cannot accept feature options")
+        effective.update(recent_threshold=False, recent_pipeline=False, recent_unified_topk=False, recent_skip=False)
+        build_options = {}  # The upstream builder API has no recent options.
     threshold_bounds = None
     if effective["recent_threshold"]:
         # Immutable per-replay bounds; all scoring/merging occurs inside forward.
@@ -100,11 +106,12 @@ def create_fused(
         row_owners=workspace.inputs.row_owners,
         token_addresses=storage.addresses,
         tail_bounds=workspace.tail_bounds,
-        threshold_bounds=threshold_bounds,
         output_stride=g["output_stride"],
         prefetch_limit=effective["prefetch_limit"],
         window_limit=effective["window_limit"],
     )
+    if not upstream:
+        kwargs["threshold_bounds"] = threshold_bounds
     if transport == "ubmem":
         lease = UbmemLease(torch, runtime, output_rows, stream)
         lease.register_table(device_table)

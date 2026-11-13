@@ -758,6 +758,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanRemainingSequence(
     uint32_t begin, uint32_t end, uint32_t shard, kvip_recent_index::Range skip,
     uint32_t lastCompute, uint32_t& loop, uint32_t& scaleLoop, bool& queryReady)
 {
+#if defined(V9_UBMEM) && V9_UBMEM
     auto remaining = kvip_recent_index::Subtract({begin, end}, skip);
     for (uint32_t part = 0; part < 2; ++part) {
         auto range = part == 0 ? remaining.first : remaining.second;
@@ -788,12 +789,47 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanRemainingSequence(
         CalcRunInfo(loop, end - 1, info, 0, 0);
         if ASCEND_IS_AIV { vectorService.PublishScoreProgress(info, shard, true); }
     }
+#else
+    auto remaining = kvip_recent_index::Subtract({begin, end}, skip);
+    for (uint32_t part = 0; part < 3; ++part) {
+        auto range = part == 0 ? remaining.first : part == 2 ? remaining.second :
+            kvip_recent_index::Range{Max(begin, skip.begin), Min(end, skip.end)};
+        if (range.begin >= range.end) continue;
+        splitCoreInfo.s2Start = range.begin;
+        tempLoopInfo.s2LoopEnd = range.end - 1;
+        tempLoopInfo.validS2Len = range.end * S2_BASE_SIZE;
+        if (part == 1) {
+            // This intersection belongs to one original window/shard. Finish
+            // its predicates before publishing that window's original end.
+            QLICommon::RunInfo info;
+            CalcRunInfo(loop, range.begin, info, 0, 0);
+            if ASCEND_IS_AIV { vectorService.ReplayRecentScores(info, range.begin, range.end); }
+            for (uint32_t tile = range.begin; tile < range.end; ++tile) {
+                CalcRunInfo(loop, tile, info, 0, 0);
+                if ASCEND_IS_AIV { vectorService.PublishScoreProgress(info, shard, tile + 1 == end); }
+            }
+        } else {
+            const bool retain = range.end - 1 != lastCompute;
+            for (uint32_t tile = range.begin; tile < range.end; ++tile, ++loop) {
+                if ((tile - range.begin) % QLICommon::KScaleTiles == 0) ++scaleLoop;
+                QLICommon::RunInfo info;
+                CalcRunInfo(loop, tile, info, 0, scaleLoop);
+                info.reuseQuery = queryReady;
+                info.retainQuery = retain;
+                if ASCEND_IS_AIC { matmulService.ComputeMm1(info); }
+                else { vectorService.ProcessVec1(info, shard, tile + 1 == end); }
+            }
+            queryReady = true;
+        }
+    }
+#endif
 }
 
 template <typename QLIT>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanRemainingMain(
     uint32_t& loop, uint32_t qScaleLoop, bool hadRecent, kvip_recent_index::Range skip)
 {
+#if defined(V9_UBMEM) && V9_UBMEM
     uint32_t begin = splitCoreInfo.s2Start, end = tempLoopInfo.s2LoopEnd + 1;
     uint32_t valid = tempLoopInfo.validS2Len;
     auto remaining = kvip_recent_index::Subtract({begin, end}, skip);
@@ -832,6 +868,60 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanRemainingMain(
     splitCoreInfo.s2Start = begin;
     tempLoopInfo.s2LoopEnd = end - 1;
     tempLoopInfo.validS2Len = valid;
+#else
+    const uint32_t begin = splitCoreInfo.s2Start, end = tempLoopInfo.s2LoopEnd + 1;
+    const uint32_t valid = tempLoopInfo.validS2Len;
+    auto remaining = kvip_recent_index::Subtract({begin, end}, skip);
+    const uint32_t lastCompute = kvip_recent_index::Last(remaining);
+    uint32_t scaleLoop = 0;
+    bool queryReady = KVIP_RECENT_PIPELINE && hadRecent;
+    for (uint32_t part = 0; part < 3; ++part) {
+        auto range = part == 0 ? remaining.first : part == 2 ? remaining.second : skip;
+        if (range.begin >= range.end) continue;
+        splitCoreInfo.s2Start = range.begin;
+        tempLoopInfo.s2LoopEnd = range.end - 1;
+        tempLoopInfo.validS2Len = range.end * S2_BASE_SIZE;
+        if (part != 1) {
+            // Only two physical segments need new key/scale boundaries. The
+            // long normal scan has no per-tile skip decision or shape rewrites.
+            const bool retain = range.end - 1 != lastCompute;
+            for (uint32_t tile = range.begin; tile < range.end; ++tile, ++loop) {
+                if ((tile - range.begin) % QLICommon::KScaleTiles == 0) ++scaleLoop;
+                QLICommon::RunInfo info;
+                CalcRunInfo(loop, tile, info, qScaleLoop, scaleLoop);
+                info.reuseQuery = queryReady;
+                info.retainQuery = retain;
+                if ASCEND_IS_AIC { matmulService.ComputeMm1(info); }
+                else { vectorService.ProcessVec1(info); }
+                // Key/scale tail is physical; final TopK is logical.
+                info.isLastS2InnerLoop = tile + 1 == end;
+                FinishBaseBlock(info);
+            }
+            queryReady = true;
+        } else {
+            // Do not classify a future service window early. The saved score
+            // tiles are consumed in the original cold-scan/window order.
+            for (uint32_t first = range.begin; first < range.end;) {
+                uint32_t stop = first + 1;
+                while (stop < range.end && !rotating::IsTrigger(runtimeShape_.history,
+                    runtimeShape_.resident, runtimeShape_.rounds, stop)) ++stop;
+                QLICommon::RunInfo info;
+                CalcRunInfo(loop, first, info, qScaleLoop, 0);
+                if ASCEND_IS_AIV { vectorService.ReplayRecentScores(info, first, stop); }
+                for (uint32_t tile = first; tile < stop; ++tile) {
+                    CalcRunInfo(loop, tile, info, qScaleLoop, 0);
+                    info.isLastS2InnerLoop = tile + 1 == end;
+                    if ASCEND_IS_AIV { vectorService.PublishScoreProgress(info); }
+                    FinishBaseBlock(info);
+                }
+                first = stop;
+            }
+        }
+    }
+    splitCoreInfo.s2Start = begin;
+    tempLoopInfo.s2LoopEnd = end - 1;
+    tempLoopInfo.validS2Len = valid;
+#endif
 }
 
 template <typename QLIT>

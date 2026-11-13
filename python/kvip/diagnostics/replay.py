@@ -21,6 +21,8 @@ def arguments(argv=None):
     p.add_argument("--mode", choices=("serial", "fused"), required=True)
     p.add_argument("--threshold-policy", choices=("resident", "recent", "both"), default="resident")
     p.add_argument("--study", choices=("threshold", "pipeline", "skip"), default="threshold")
+    p.add_argument("--upstream-root", type=Path, help="Use production modules from this exact clean checkout")
+    p.add_argument("--upstream-revision", help="Full pinned upstream commit, required with upstream-root")
     p.add_argument("--kvaf-server")
     p.add_argument("--device", type=int, default=0)
     p.add_argument("--soc", required=True)
@@ -38,6 +40,10 @@ def arguments(argv=None):
         p.error("A local KVAF CPU service address is required for this runtime")
     if args.mode == "serial" and args.threshold_policy != "resident":
         p.error("Threshold policy changes only the fused path")
+    if bool(args.upstream_root) != bool(args.upstream_revision):
+        p.error("upstream-root and upstream-revision must be supplied together")
+    if args.upstream_root and (args.study != "threshold" or args.threshold_policy != "resident"):
+        p.error("Exact upstream replay requires study=threshold and threshold-policy=resident")
     args.fused_tuning = {"recent_threshold": args.threshold_policy == "recent"}
     return args
 
@@ -49,6 +55,12 @@ def main(argv=None):
     log = NativeLog(args.quiet, report_failure=False)
     try:
         with log:
+            if args.upstream_root:
+                from kvip.diagnostics.upstream import activate, verify_lidu_sources
+
+                feature_root = Path(__file__).resolve().parents[3]
+                args.lidu_provenance = verify_lidu_sources(args.upstream_root, feature_root)
+                args.production_source = activate(args.upstream_root, args.upstream_revision)
             from kvip.diagnostics.ddr import validate_pages
             from kvip.diagnostics.replay_measure import run
             from kvip.diagnostics.snapshot import validate_capture_inputs
@@ -63,7 +75,8 @@ def main(argv=None):
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with args.output.open("x") as stream:
             json.dump(result, stream, indent=2)
-        for name, case in result.get("cases", {args.threshold_policy: result}).items():
+        label = "upstream" if args.upstream_root else args.threshold_policy
+        for name, case in result.get("cases", {label: result}).items():
             emit(
                 f"REPLAY_PASS {args.transport}-{args.mode}-{name} "
                 f"mean_us={case['timing']['mean_us']:.3f} p50_us={case['timing']['p50_us']:.3f}"

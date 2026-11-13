@@ -8,12 +8,19 @@ import pytest
 from test_recent_index import COMMON, INDEXER, function
 
 
+@pytest.mark.parametrize("delayed", [False, True])
 @pytest.mark.parametrize("enabled", [0, 1])
-def test_recent_hits_physical_halos_causal_masks_and_cached_scores(tmp_path, enabled):
+def test_recent_hits_physical_halos_causal_masks_and_cached_scores(tmp_path, enabled, delayed):
     vector = (INDEXER / "indexer_vector.h").read_text()
     score = (INDEXER / "indexer_score.h").read_text()
     classify = function(score, "__simd_vf__ inline void ClassifyRecentScoreTiles(")
-    publish = function(vector, "    __aicore__ inline bool PublishRecentHits(")
+    publish = (
+        function(vector, "    __aicore__ inline void WriteRecentHits(")
+        + function(vector, "    __aicore__ inline bool PublishRecentHits(")
+        + function(vector, "__aicore__ inline void QLIVector<QLIT>::ReplayRecentScores(").replace(
+            "QLIVector<QLIT>::", ""
+        )
+    )
     cpp = tmp_path / "recent_hits.cpp"
     cpp.write_text(
         r"""
@@ -30,7 +37,10 @@ def test_recent_hits_physical_halos_causal_masks_and_cached_scores(tmp_path, ena
 #define __ubuf__
 #define __gm__
 #include "recent_index.h"
-constexpr unsigned SIM_Q=4,EVENT_ID0=0,V_MTE2_EVENT3=5;
+constexpr unsigned SIM_Q=4,EVENT_ID0=0,V_MTE2_EVENT3=5,PIPE_ALL=0;
+template<unsigned> void PipeBarrier(){}
+template<class A,class B> auto CeilDiv(A a,B b){return (a+b-1)/b;}
+namespace QLICommon {struct RunInfo {int64_t gS1Idx,actS1Size,bIdx;};}
 enum class HardEvent {V_MTE2,MTE2_V,V_MTE3,MTE3_V};
 bool credits[4][8]{};
 template<HardEvent D> void SetFlag(unsigned id){assert(!credits[unsigned(D)][id]);credits[unsigned(D)][id]=true;}
@@ -101,6 +111,7 @@ struct RuntimeShape {unsigned resident=16384,history=131328;};
 }
 struct Model {
  using SCORE_T=uint16_t;
+ unsigned s1BaseSize_=2,blockId_=0;
  rotating::Context ctx;rotating::RuntimeShape runtimeShape_;void* rotationContext_=&ctx;
  std::vector<uint32_t> scratch=std::vector<uint32_t>(2048,0xcccccccc);
  std::vector<uint16_t> cached=std::vector<uint16_t>(18432,0xdddd),threshold=std::vector<uint16_t>(256,32768),scores;
@@ -146,7 +157,20 @@ int main(){
    if(merged)std::copy(m.scores.begin()+q*h+exact.begin,m.scores.begin()+q*h+exact.end,m.cached.begin()+r);
    auto before=m.bitmap;
    scoreReads=bitmapWrites=0;
-   bool published=m.PublishRecentHits(q,q,available,merged);
+   bool published=false;
+#if MODEL_DELAYED
+   auto lateTiles=(m.ctx.thresholdBounds && m.ctx.hits)?ReusableTiles(bounds[0],bounds[1],r,h,available,qmax):Range{0,0};
+   if(lateTiles.begin<lateTiles.end){
+    m.blockId_=q%2;
+    // Each split-Q AIC owns two contiguous local score rows, not all Q4.
+    m.scoreGm={m.scores.data()+(q/2)*2*h,uint64_t(2*h)};
+    QLICommon::RunInfo info{int64_t(q/2),4,0};
+    m.ReplayRecentScores(info,lateTiles.begin,lateTiles.end);published=true;
+    m.scoreGm={m.scores.data(),m.scores.size()};
+   }
+#else
+   published=m.PublishRecentHits(q,q,available,merged);
+#endif
    assert(published==bool(bitmapWrites));
    auto tiles=(m.ctx.thresholdBounds && m.ctx.hits)?ReusableTiles(bounds[0],bounds[1],r,h,available,qmax):Range{0,0};
    unsigned expectedReads=0;
@@ -160,7 +184,9 @@ int main(){
    }
    if(tiles.end>tiles.begin){
     assert(bitmapWrites==tiles.end-tiles.begin);
+#if !MODEL_DELAYED
     if(merged && exact.begin%128==0 && exact.end%128==0 && qend>=exact.end)assert(scoreReads==0);
+#endif
    }else assert(scoreReads==0 && bitmapWrites==0);
    // No query writes a neighboring bitmap or resident victim coordinates.
    assert(std::equal(m.bitmap.begin(),m.bitmap.begin()+q*h/4,before.begin()));
@@ -172,6 +198,34 @@ int main(){
    }
   }
  }
+
+#if MODEL_DELAYED
+ // Both queries of a sequence-split AIV use distinct local score rows and
+ // alternating threshold banks. Also cover nonzero global batch/query IDs.
+ for(unsigned base:{2U,4U}){
+  Model m;const unsigned h=m.runtimeShape_.history,first=157,last=174;
+  m.s1BaseSize_=base;
+  m.bitmap.assign(12*h/4,0xff);m.ctx.hits=reinterpret_cast<uint64_t>(m.bitmap.data());
+  uint32_t ends[12];std::fill_n(ends,12,h);
+  ends[8]=last*128;ends[9]=last*128-7;ends[10]=first*128+129;ends[11]=0;
+  m.ctx.queryEnds=reinterpret_cast<uint64_t>(ends);
+  std::fill_n(m.threshold.data(),128,20000);std::fill_n(m.threshold.data()+128,128,50000);
+  for(auto& x:m.scores)x=uint16_t(rng()%65536);
+  auto original=m.scores;
+  for(unsigned group=0;group<4/base;++group)for(unsigned core=0;core<2;++core){
+   m.blockId_=core;m.scoreGm={m.scores.data()+group*base*h,uint64_t(base*h)};
+   QLICommon::RunInfo info{int64_t(group),4,2};m.ReplayRecentScores(info,first,last);
+  }
+  for(unsigned q=0;q<12;++q)for(unsigned physical=0;physical<h;++physical){
+   unsigned bits=(m.bitmap[q*h/4+physical/4]>>((physical%4)*2))&3;
+   if(q>=8 && physical>=first*128 && physical<last*128){
+    bool want=physical<ends[q] && m.scores[(q-8)*h+physical]>(q%2?50000:20000);
+    assert(bits==unsigned(want));
+   }else assert(bits==3);
+  }
+  assert(m.scores==original);
+ }
+#endif
  // Exercise an offset that is not DMA/vector-load aligned, exact threshold
  // ties, and old all-one masks. This is the production VF, not a reimplementation.
  std::vector<uint16_t> input(1024,32768),limit(128,32768),hits(256,0xffff);
@@ -186,8 +240,18 @@ int main(){
     exe = tmp_path / "recent_hits"
     subprocess.run(
         [
-            "c++", "-std=c++17", "-O1", "-g", "-fsanitize=address,undefined",
-            f"-DKVIP_RECENT_SKIP={enabled}", "-I", str(COMMON), str(cpp), "-o", str(exe),
+            "c++",
+            "-std=c++17",
+            "-O1",
+            "-g",
+            "-fsanitize=address,undefined",
+            f"-DKVIP_RECENT_SKIP={enabled}",
+            f"-DMODEL_DELAYED={int(delayed)}",
+            "-I",
+            str(COMMON),
+            str(cpp),
+            "-o",
+            str(exe),
         ],
         check=True,
     )
@@ -350,7 +414,7 @@ class PipelineGraph:
 def test_recent_predicate_victim_alias_has_cross_pipeline_handoff(cached):
     """Removing the native handoff permits a victim-ID overwrite before Gather."""
     source = (INDEXER / "indexer_vector.h").read_text()
-    recent = function(source, "    __aicore__ inline bool PublishRecentHits(")
+    recent = function(source, "    __aicore__ inline void WriteRecentHits(")
     save = function(source, "    __aicore__ inline void SaveResident(")
     assert "auto hits = scoreChunk[2048];" in recent
     assert "auto reservedChunk = scoreChunk[2048];" in save
@@ -369,7 +433,9 @@ def test_recent_predicate_victim_alias_has_cross_pipeline_handoff(cached):
     handoff = function(save, "            if (recentHitsPublished)")
     assert "SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);" in handoff
     assert "WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);" in handoff
-    victim_tail = save[save.index("DataCopy(reservedChunk.") : save.index("Simt::VF_CALL<rotating::GatherVictimScores>")]
+    victim_tail = save[
+        save.index("DataCopy(reservedChunk.") : save.index("Simt::VF_CALL<rotating::GatherVictimScores>")
+    ]
     assert save.index("if (recentHitsPublished)") < save.index("DataCopy(reservedChunk.")
 
     def trace(include_handoff):

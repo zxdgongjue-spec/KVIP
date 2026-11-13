@@ -1,0 +1,436 @@
+# SPDX-License-Identifier: Apache-2.0
+"""An upstream reference must execute upstream code, not feature flags set to zero."""
+
+import json
+from copy import deepcopy
+from pathlib import Path
+import subprocess
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+from kvip.diagnostics import upstream
+from kvip.diagnostics import compare, replay, replay_measure
+
+REVISION = "1" * 40
+
+
+def _source(tmp_path):
+    root = tmp_path / "upstream"
+    package = root / "python/kvip"
+    (package / "runtime").mkdir(parents=True)
+    (root / "csrc/operators").mkdir(parents=True)
+    (package / "__init__.py").write_text("ORIGIN = 'upstream initializer'\n")
+    (package / "runtime/__init__.py").write_text("")
+    (package / "runtime/build.py").write_text(
+        "from pathlib import Path\n"
+        "def native_source():\n"
+        "    return str(Path(__file__).resolve().parents[3] / 'csrc/operators')\n"
+    )
+    return root
+
+
+def _git(root, *args):
+    return subprocess.check_output(["git", "-C", str(root), *args], text=True, stderr=subprocess.PIPE).strip()
+
+
+def test_checkout_requires_exact_revision_and_unmodified_production_sources(tmp_path):
+    root = _source(tmp_path)
+    _git(root, "init", "-q")
+    _git(root, "add", ".")
+    _git(root, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture")
+    revision = _git(root, "rev-parse", "HEAD")
+    assert upstream.validate_checkout(root, revision) == root
+    with pytest.raises(ValueError, match="exactly"):
+        upstream.validate_checkout(root, REVISION)
+    with pytest.raises(ValueError, match="full 40-character"):
+        upstream.validate_checkout(root, revision[:8])
+    (root / "python/kvip/new_kernel.py").write_text("# untracked production code\n")
+    with pytest.raises(ValueError, match="modified or untracked"):
+        upstream.validate_checkout(root, revision=revision)
+    (root / "python/kvip/new_kernel.py").unlink()
+    (root / "python/kvip/__init__.py").write_text("ORIGIN = 'changed'\n")
+    with pytest.raises(ValueError, match="modified or untracked"):
+        upstream.validate_checkout(root, revision=revision)
+
+
+def test_fresh_process_loads_upstream_initializer_build_and_only_feature_diagnostics(tmp_path):
+    root = _source(tmp_path)
+    code = """
+import json, sys
+from pathlib import Path
+from types import SimpleNamespace
+from kvip.diagnostics import upstream
+from kvip.diagnostics import archive
+diagnostic = archive.__file__
+upstream.validate_checkout = lambda path, revision: Path(path).resolve()
+upstream.activate(sys.argv[1], sys.argv[2])
+import kvip
+from kvip.runtime import build
+assert kvip.ORIGIN == 'upstream initializer'
+assert str(Path(sys.argv[1]) / 'csrc/operators') == build.native_source()
+assert archive.__file__ == diagnostic
+try:
+    import kvip.cache.index_storage
+except ModuleNotFoundError:
+    pass
+else:
+    raise AssertionError('Production imports fell back to feature code')
+report = upstream.provenance(sys.argv[1], sys.argv[2])
+sys.modules['kvip.rogue'] = SimpleNamespace(__file__=diagnostic)
+try:
+    upstream.provenance(sys.argv[1], sys.argv[2])
+except RuntimeError as error:
+    assert 'Mixed production imports' in str(error)
+else:
+    raise AssertionError('Mixed production source was not rejected')
+print(json.dumps(report))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(root), REVISION], capture_output=True, text=True, check=True
+    )
+    report = json.loads(result.stdout)
+    assert report["commit"] == REVISION
+    assert set(report["python_modules"]) == {"kvip", "kvip.runtime", "kvip.runtime.build"}
+    assert all(Path(path).is_relative_to(root) for path in report["python_modules"].values())
+
+
+def test_activation_rejects_preloaded_production_before_mutating_package(tmp_path, monkeypatch):
+    root = _source(tmp_path)
+    monkeypatch.setattr(upstream, "validate_checkout", lambda path, revision: root)
+    monkeypatch.setitem(sys.modules, "kvip.fake_production", object())
+    original = sys.modules["kvip"]
+    with pytest.raises(RuntimeError, match="before production imports"):
+        upstream.activate(root, REVISION)
+    assert sys.modules["kvip"] is original
+
+
+def test_reused_lidu_requires_identical_actual_source_bytes(tmp_path, monkeypatch):
+    first, second = (tmp_path / name for name in ("main", "feature"))
+    relative = "csrc/operators/lidu/kernel.cpp"
+    for root in (first, second):
+        (root / relative).parent.mkdir(parents=True)
+        (root / relative).write_text("same source")
+    monkeypatch.setattr(upstream, "_git", lambda *args: relative)
+    report = upstream.verify_lidu_sources(first, second)
+    assert report["sources_identical"]
+    (second / relative).write_text("different source")
+    with pytest.raises(ValueError, match="sources differ"):
+        upstream.verify_lidu_sources(first, second)
+
+
+def _case(mean, *, tuning=None, main=False):
+    return dict(
+        status="pass",
+        snapshot_sha256="same",
+        geometry={},
+        scope="complete graph",
+        soc="A5",
+        device=0,
+        reads_samples=[
+            dict(
+                cold_miss_rate=0.1,
+                cold_demand=2,
+                selected_unique=20,
+                prefetch=2,
+                final=1,
+                unused_prefetch=1,
+                unused_prefetch_bytes=656,
+                bytes=1968,
+                useful_transfer_bytes=1312,
+            )
+        ],
+        timing=dict(mean_us=mean, p50_us=mean, count=10, min_us=mean, max_us=mean, samples_us=[mean] * 10),
+        runtime_workers=32,
+        selection_comparison=dict(selected_set_sha256="ids", ordered_output_sha256="ordered"),
+        threshold_comparison=dict(
+            initial_keys=[[39000 if main else 40000]],
+            final_keys=[[41000]],
+            mean_gap=2 if main else 1,
+            equal_fraction=0 if main else 0.5,
+        ),
+        score_comparison=dict(status="bit_exact"),
+        tuning=tuning,
+        timing_boundary="complete graph",
+        production_source=dict(kind="exact_upstream_checkout" if main else "feature_checkout", commit=REVISION),
+    )
+
+
+def _reports(transport="urma"):
+    result = {
+        f"{transport}-upstream-serial": _case(120, main=True),
+        f"{transport}-upstream-fused": _case(110, main=True),
+    }
+    for name, tuning in replay_measure.study_cases(SimpleNamespace(study="skip")).items():
+        result[f"{transport}-recent-{name}"] = _case(100 if name == "before" else 90, tuning=tuning)
+    return result
+
+
+def _arguments(tmp_path, extra=()):
+    build, snapshot = tmp_path / "build", tmp_path / "snapshot"
+    (build / "bin").mkdir(parents=True, exist_ok=True)
+    (build / "bin/kvaf_execute_batch_get_kernels.o").touch()
+    snapshot.mkdir(exist_ok=True)
+    (snapshot / "manifest.json").write_text("{}")
+    return [
+        "--snapshot",
+        str(snapshot),
+        "--build-dir",
+        str(build),
+        "--kvaf-server",
+        "127.0.0.1:29095",
+        "--result-dir",
+        str(tmp_path / "results"),
+        *extra,
+    ]
+
+
+def test_compare_defaults_to_urma_and_upstream_requires_explicit_pinned_source(tmp_path, monkeypatch):
+    args = compare.arguments(_arguments(tmp_path))
+    assert args.transports == "urma" and args.study == "threshold"
+    with pytest.raises(SystemExit):
+        compare.arguments(_arguments(tmp_path, ["--study", "upstream"]))
+    with pytest.raises(SystemExit):
+        compare.arguments(_arguments(tmp_path, ["--upstream-root", str(tmp_path), "--upstream-revision", REVISION]))
+    validated = []
+    monkeypatch.setattr(
+        upstream, "validate_checkout", lambda root, revision: validated.append((root, revision)) or root
+    )
+    args = compare.arguments(
+        _arguments(tmp_path, ["--study", "upstream", "--upstream-root", str(tmp_path), "--upstream-revision", REVISION])
+    )
+    assert validated == [(tmp_path, REVISION)]
+    assert args.transports == "urma"
+
+
+@pytest.mark.parametrize("transports", ["urma", "ubmem", "both"])
+def test_upstream_plan_uses_isolated_reference_processes_and_paired_recent_cases(
+    tmp_path, monkeypatch, capsys, transports
+):
+    monkeypatch.setattr(upstream, "validate_checkout", lambda root, revision: root)
+    args = compare.arguments(
+        _arguments(
+            tmp_path,
+            [
+                "--study",
+                "upstream",
+                "--transports",
+                transports,
+                "--upstream-root",
+                str(tmp_path / "main"),
+                "--upstream-revision",
+                REVISION,
+            ],
+        )
+    )
+    calls = []
+
+    def child(command, **kwargs):
+        calls.append(command)
+        backend, mode = (command[command.index("--" + key) + 1] for key in ("transport", "mode"))
+        reports = _reports(backend)
+        if "--upstream-root" in command:
+            assert command[command.index("--upstream-revision") + 1] == REVISION
+            assert command[command.index("--study") + 1] == "threshold"
+            assert command[command.index("--threshold-policy") + 1] == "resident"
+            result = reports[f"{backend}-upstream-{mode}"]
+        else:
+            assert mode == "fused" and command[command.index("--study") + 1] == "skip"
+            result = {"cases": {name: reports[f"{backend}-recent-{name}"] for name in ("before", "after")}}
+        assert ("--serial-workers" in command) is (mode == "serial")
+        Path(command[command.index("--output") + 1]).write_text(json.dumps(result))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(compare.subprocess, "run", child)
+    monkeypatch.setattr(compare, "source_commit", lambda: "feature")
+    summary = compare.run(args)
+    backends = 2 if transports == "both" else 1
+    assert len(calls) == 3 * backends and len(summary["table"]) == 4 * backends
+    for backend, effect in summary["effects"].items():
+        assert effect["serial_reference"] == backend + "-upstream-serial"
+        assert effect["skip_reduction_pct"] == pytest.approx(10)
+        assert effect["recent_after_vs_upstream_reduction_pct"] == pytest.approx(100 * (1 - 90 / 110))
+        assert summary["table"][backend + "-upstream-fused"]["timing"]["samples_us"] == [110] * 10
+    assert "upstream production sources" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("change", ["score", "ordered", "source", "revision", "recent_threshold", "final_threshold"])
+def test_upstream_summary_does_not_relax_correctness_or_mislabel_feature_flags_as_main(change):
+    reports = deepcopy(_reports())
+    main, before = reports["urma-upstream-fused"], reports["urma-recent-before"]
+    if change == "score":
+        main["score_comparison"]["status"] = "unverified"
+    elif change == "ordered":
+        main["selection_comparison"]["ordered_output_sha256"] = "different-but-tied"
+    elif change == "source":
+        main["production_source"]["kind"] = "feature_checkout"
+    elif change == "revision":
+        main["production_source"]["commit"] = "2" * 40
+    elif change == "recent_threshold":
+        before["threshold_comparison"]["initial_keys"] = [[123]]
+    else:
+        main["threshold_comparison"]["final_keys"] = [[123]]
+    with pytest.raises(ValueError):
+        compare.summarize(reports, "upstream")
+
+
+def test_replay_activates_upstream_before_context_allocation(tmp_path, monkeypatch):
+    from kvip.diagnostics import ddr, snapshot
+
+    args = SimpleNamespace(
+        upstream_root=tmp_path / "main",
+        upstream_revision=REVISION,
+        quiet=False,
+        output=tmp_path / "result.json",
+        snapshot=tmp_path,
+        transport="urma",
+        mode="serial",
+        study="threshold",
+        threshold_policy="resident",
+    )
+    calls = []
+    monkeypatch.setattr(replay, "arguments", lambda argv: args)
+    monkeypatch.setattr(upstream, "verify_lidu_sources", lambda *unused: calls.append("lidu_sources") or {})
+    monkeypatch.setattr(upstream, "activate", lambda *unused: calls.append("activate") or {})
+    monkeypatch.setattr(
+        replay,
+        "load_snapshot",
+        lambda path: SimpleNamespace(manifest={"content": "real_li_synthetic_kv", "ddr": {}}, directory=path),
+    )
+    monkeypatch.setattr(snapshot, "validate_capture_inputs", lambda archive: None)
+    monkeypatch.setattr(ddr, "validate_pages", lambda *unused: None)
+
+    def run(*unused):
+        assert calls == ["lidu_sources", "activate"]
+        calls.append("run")
+        return _case(100, main=True)
+
+    monkeypatch.setattr(replay_measure, "run", run)
+    replay.main([])
+    assert calls[-1] == "run" and args.output.is_file()
+
+
+@pytest.mark.parametrize("mode", ["serial", "fused"])
+def test_replay_cli_rejects_ambiguous_reference_options(tmp_path, mode):
+    base = [
+        "--snapshot",
+        str(tmp_path),
+        "--build-dir",
+        str(tmp_path),
+        "--transport",
+        "urma",
+        "--mode",
+        mode,
+        "--kvaf-server",
+        "127.0.0.1:29095",
+        "--soc",
+        "A5",
+        "--output",
+        str(tmp_path / "out.json"),
+    ]
+    with pytest.raises(SystemExit):
+        replay.arguments(base + ["--upstream-root", str(tmp_path)])
+    with pytest.raises(SystemExit):
+        replay.arguments(base + ["--upstream-root", str(tmp_path), "--upstream-revision", REVISION, "--study", "skip"])
+    parsed = replay.arguments(base + ["--upstream-root", str(tmp_path), "--upstream-revision", REVISION])
+    assert parsed.upstream_root == tmp_path and parsed.upstream_revision == REVISION
+
+
+@pytest.mark.parametrize("transport", ["urma", "ubmem"])
+def test_upstream_factory_uses_old_builder_and_binding_signatures(tmp_path, monkeypatch, transport):
+    from kvip.adapters import kvaf
+    from kvip.diagnostics import fused_replay
+    from kvip.operators.lifetch import binding, forward, index_update, workspace
+    from kvip.operators.lifetch_ubmem import binding as ub_binding, build as ub_build
+    from kvip.runtime import build
+
+    calls = []
+    tensor = SimpleNamespace(view=lambda *args: tensor)
+    inputs = SimpleNamespace(query_ends=tensor, row_owners=tensor)
+
+    class Workspace:
+        def __init__(self, *args, **kwargs):
+            self.inputs, self.scratch, self.tail_bounds, self.topk = inputs, object(), tensor, tensor
+
+        def arguments(self, storage):
+            return [tensor] * 14
+
+        def allocate_rotation(self, *args, **kwargs):
+            pass
+
+    class Lease:
+        sizes = {"status": 128}
+
+        def __init__(self, *args):
+            pass
+
+        def register_table(self, table):
+            pass
+
+    class Binding:
+        def __init__(self, *args, **kwargs):
+            assert "threshold_bounds" not in kwargs
+            calls.append(("binding", kwargs))
+            self.library = SimpleNamespace()  # Upstream has no recent option getters.
+
+    def build_urma(*, cache_dir, cann, headers, soc):
+        calls.append(("urma_build", cache_dir))
+        return (tmp_path / "upstream.so",)
+
+    def build_ubmem(*, cache_dir, cann, shape):
+        calls.append(("ubmem_build", cache_dir))
+        return tmp_path / "upstream.so"
+
+    monkeypatch.setattr(build, "build_libraries", build_urma)
+    monkeypatch.setattr(build, "kvaf_build_paths", lambda unused: (tmp_path, tmp_path))
+    monkeypatch.setattr(ub_build, "build_ubmem_library", build_ubmem)
+    monkeypatch.setattr(workspace, "LIFetchWorkspace", Workspace)
+    monkeypatch.setattr(workspace, "UbmemWorkspace", Workspace)
+    monkeypatch.setattr(kvaf, "KvafGetLease", Lease)
+    monkeypatch.setattr(kvaf, "UbmemLease", Lease)
+    monkeypatch.setattr(kvaf, "KvafQueueView", lambda *args: object())
+    monkeypatch.setattr(binding, "LIFetchBinding", Binding)
+    monkeypatch.setattr(ub_binding, "UbmemBinding", Binding)
+    monkeypatch.setattr(index_update, "DirectIndexUpdate", lambda *args, **kwargs: object())
+    monkeypatch.setattr(index_update, "UbmemIndexUpdate", lambda *args, **kwargs: object())
+    monkeypatch.setattr(forward, "LIFetchForward", lambda *args: object())
+    storage = SimpleNamespace(keys=tensor, scales=tensor, addresses=tensor, logical_ids=tensor, hot_valid=tensor)
+    monkeypatch.setattr(fused_replay, "IndexCacheStorage", lambda *args: storage)
+    archive = SimpleNamespace(
+        manifest={
+            "geometry": dict(
+                batch=16,
+                history=131328,
+                resident=16384,
+                heads=32,
+                token_bytes=656,
+                aic_count=32,
+                requested_windows=8,
+                output_stride=16896,
+                owners=17,
+            )
+        },
+        tensor=lambda *args: tensor,
+    )
+    torch = SimpleNamespace(zeros=lambda *args, **kwargs: tensor, empty=lambda *args, **kwargs: tensor, int32="int32")
+    bundle = fused_replay.create_fused(
+        torch,
+        object(),
+        archive,
+        {},
+        SimpleNamespace(addresses=tensor, valid=tensor),
+        tmp_path,
+        "Ascend950DT_9582",
+        object(),
+        object(),
+        tmp_path,
+        32,
+        transport=transport,
+        upstream=True,
+    )
+    assert calls[0][0] == transport + "_build" and calls[1][0] == "binding"
+    assert not any(
+        bundle.tuning[name] for name in ("recent_threshold", "recent_pipeline", "recent_unified_topk", "recent_skip")
+    )
+    assert bundle.tuning["prefetch_limit"] == 512 and bundle.tuning["window_limit"] == 64

@@ -100,6 +100,8 @@ public:
                                      bool publishShardEnd = false, bool scoreOnly = false);
     __aicore__ inline void PublishScoreProgress(const QLICommon::RunInfo &info,
                                                uint32_t progressShard = 0, bool publishShardEnd = false);
+    __aicore__ inline void ReplayRecentScores(const QLICommon::RunInfo &info,
+                                             uint32_t beginTile, uint32_t endTile);
     __aicore__ inline void ProcessTopK(const QLICommon::RunInfo &info, uint32_t queryRow = SIM_Q);
     __aicore__ inline void SetPrefixStorage(GM_ADDR output) { prefixOutput_ = output; }
 #if KVIP_STREAMING_LI
@@ -258,6 +260,56 @@ private:
         }
     }
 
+    // The caller supplies only tiles whose score-only pass has completed.
+    // Delayed callers must not use the TopK input cache: Fetch borrows that UB.
+    __aicore__ inline void WriteRecentHits(uint32_t query, uint32_t scoreRow,
+        kvip_recent_index::Range tiles, uint32_t queryEnd, bool recentMerged,
+        kvip_recent_index::Range cached) {
+        auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+        uint32_t cachedBegin = (cached.begin + 127) / 128 * 128;
+        uint32_t cachedEnd = cached.end / 128 * 128;
+        // TopK has finished reading its input bank; unified TopK left the
+        // exact recent scores there. Its spare historical-index bank is
+        // reused for a 2048-score DMA block plus strided predicate tiles.
+        auto scoreChunk = topkSharedTmpLocal_.template ReinterpretCast<uint16_t>();
+        auto hits = scoreChunk[2048];
+        GlobalTensor<uint8_t> bitmap;
+        bitmap.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(ctx->hits) +
+                                uint64_t(query) * (runtimeShape_.history / 4));
+        for (uint32_t begin = tiles.begin * 128; begin < tiles.end * 128;) {
+            uint32_t count = Min(uint32_t(2048), tiles.end * 128 - begin);
+            bool useCached = recentMerged && begin >= cachedBegin && begin < cachedEnd;
+            if (useCached) count = Min(count, cachedEnd - begin);
+            else if (recentMerged && begin < cachedBegin && cachedBegin < cachedEnd)
+                count = Min(count, cachedBegin - begin);
+            auto input = scoreChunk;
+            uint32_t offset = 0;
+            if (useCached) {
+                input = mrgValueLocal_;
+                offset = runtimeShape_.resident + begin - cached.begin;
+            } else if (begin < queryEnd) {
+                SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+                WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+                DataCopyExtParams copy{1, count * uint32_t(sizeof(SCORE_T)), 0, 0, 0};
+                DataCopyPadExtParams<SCORE_T> pad{true, 0, 0, 0};
+                DataCopyPad(scoreChunk, scoreGm[uint64_t(scoreRow) * runtimeShape_.history + begin], copy, pad);
+                SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+                WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+            }
+            vector1::ClassifyRecentScoreTiles(
+                reinterpret_cast<__ubuf__ uint16_t*>(input.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_[(query % 2) * 128].GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint16_t*>(hits.GetPhyAddr()), offset, begin, count, queryEnd);
+            SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            DataCopyExtParams copy{uint16_t(count / 128), 32, 7, 0, 0};
+            DataCopyPad(bitmap[begin / 4], hits.template ReinterpretCast<uint8_t>(), copy);
+            SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+            begin += count;
+        }
+    }
+
     __aicore__ inline bool PublishRecentHits(uint32_t query, uint32_t scoreRow,
                                            uint32_t availableEnd, bool recentMerged) {
 #if KVIP_RECENT_SKIP
@@ -278,48 +330,7 @@ private:
             queryEnd = Min(queryEnd, availableEnd);
             auto cached = kvip_recent_index::Clip(bounds[0], bounds[1], runtimeShape_.resident,
                                                   runtimeShape_.history, queryEnd);
-            uint32_t cachedBegin = (cached.begin + 127) / 128 * 128;
-            uint32_t cachedEnd = cached.end / 128 * 128;
-            // TopK has finished reading its input bank; unified TopK left the
-            // exact recent scores there. Its spare historical-index bank is
-            // reused for a 2048-score DMA block plus strided predicate tiles.
-            auto scoreChunk = topkSharedTmpLocal_.template ReinterpretCast<uint16_t>();
-            auto hits = scoreChunk[2048];
-            GlobalTensor<uint8_t> bitmap;
-            bitmap.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(ctx->hits) +
-                                    uint64_t(query) * (runtimeShape_.history / 4));
-            for (uint32_t begin = tiles.begin * 128; begin < tiles.end * 128;) {
-                uint32_t count = Min(uint32_t(2048), tiles.end * 128 - begin);
-                bool useCached = recentMerged && begin >= cachedBegin && begin < cachedEnd;
-                if (useCached) count = Min(count, cachedEnd - begin);
-                else if (recentMerged && begin < cachedBegin && cachedBegin < cachedEnd)
-                    count = Min(count, cachedBegin - begin);
-                auto input = scoreChunk;
-                uint32_t offset = 0;
-                if (useCached) {
-                    input = mrgValueLocal_;
-                    offset = runtimeShape_.resident + begin - cached.begin;
-                } else if (begin < queryEnd) {
-                    SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
-                    WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
-                    DataCopyExtParams copy{1, count * uint32_t(sizeof(SCORE_T)), 0, 0, 0};
-                    DataCopyPadExtParams<SCORE_T> pad{true, 0, 0, 0};
-                    DataCopyPad(scoreChunk, scoreGm[uint64_t(scoreRow) * runtimeShape_.history + begin], copy, pad);
-                    SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
-                    WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-                }
-                vector1::ClassifyRecentScoreTiles(
-                    reinterpret_cast<__ubuf__ uint16_t*>(input.GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_[(query % 2) * 128].GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint16_t*>(hits.GetPhyAddr()), offset, begin, count, queryEnd);
-                SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
-                WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-                DataCopyExtParams copy{uint16_t(count / 128), 32, 7, 0, 0};
-                DataCopyPad(bitmap[begin / 4], hits.template ReinterpretCast<uint8_t>(), copy);
-                SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
-                WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
-                begin += count;
-            }
+            WriteRecentHits(query, scoreRow, tiles, queryEnd, recentMerged, cached);
             return true;
         }
 #endif
@@ -356,7 +367,13 @@ private:
         DataCopy(indices[q * 2048], indicesOutLocal_.template ReinterpretCast<int32_t>(), 2048);
         DataCopy(thresholds[q * 128], prefixThreshold_[(query % 2) * 128], 128);
         PipeBarrier<PIPE_ALL>();
+#if defined(V9_UBMEM) && V9_UBMEM
         const bool recentHitsPublished = PublishRecentHits(query, scoreRow, availableEnd, recentMerged);
+#else
+        // URMA consumes the saved recent scores only when the ordinary cold
+        // scan reaches their window. Do not delay the resident-ready publish.
+        constexpr bool recentHitsPublished = false;
+#endif
         auto context = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
         if (context->lruSlots) {
             // TopK scratch is dead after the resident result is saved. Reuse
@@ -683,6 +700,29 @@ __aicore__ inline void QLIVector<QLIT>::GetKeyScale(const QLICommon::RunInfo &ru
         AscendC::DataCopyPad(kScaleUB[QLICommon::KScaleTiles * (runInfo.kScaleLoop % 2) * s2BaseSize_],
                                             kScaleGm[runInfo.tensorKeyScaleOffset],
                                             copyInParams, padParams);
+    }
+}
+
+template <typename QLIT>
+__aicore__ inline void QLIVector<QLIT>::ReplayRecentScores(
+    const QLICommon::RunInfo &info, uint32_t beginTile, uint32_t endTile)
+{
+    if (beginTile >= endTile) return;
+    // Fetch can reuse TopK scratch. Join its previous users before the score
+    // DMA, and never assume the unified-TopK input survived a service window.
+    PipeBarrier<PIPE_ALL>();
+    int64_t curS1Idx = info.gS1Idx * s1BaseSize_;
+    int64_t count = Min(int64_t(s1BaseSize_), info.actS1Size - curS1Idx);
+    int64_t first = curS1Idx + (blockId_ % 2) * CeilDiv(count, 2);
+    int64_t rows = blockId_ % 2 ? count / 2 : CeilDiv(count, 2);
+    auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+    for (int64_t i = 0; i < rows; ++i) {
+        uint32_t query = info.bIdx * SIM_Q + first + i;
+        uint32_t queryEnd = ctx->queryEnds ?
+            reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)[query] : runtimeShape_.history;
+        queryEnd = Min(queryEnd, runtimeShape_.history);
+        uint32_t scoreRow = (blockId_ % 2) * CeilDiv(s1BaseSize_, 2) + i;
+        WriteRecentHits(query, scoreRow, {beginTile, endTile}, queryEnd, false, {0, 0});
     }
 }
 

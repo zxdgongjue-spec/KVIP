@@ -159,6 +159,7 @@ def test_cli_saves_failure_before_retained_owner_exit(tmp_path, monkeypatch, cap
         transport="urma",
         mode="fused",
         study="skip",
+        upstream_root=None,
     )
     log = SimpleNamespace(failure_path=tmp_path / "native.log")
     monkeypatch.setattr(replay, "arguments", lambda argv: args)
@@ -220,6 +221,7 @@ def test_compare_uses_failed_json_instead_of_repeating_device_error_tail(tmp_pat
         warmup=2,
         iterations=10,
         study="skip",
+        transports="urma",
     )
 
     def child(command, stdout, **kwargs):

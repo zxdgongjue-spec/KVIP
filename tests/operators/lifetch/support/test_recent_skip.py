@@ -43,6 +43,9 @@ def skip_model():
         "template<class... Args> int EpochAt(Args...) {return -1;}",
         """
 struct RuntimeShape {unsigned history=131584,batch=2,resident=16384,splitQ=1,rounds=8,serviceAics=1;};
+bool IsTrigger(unsigned h,unsigned r,unsigned rounds,unsigned tile){
+ for(unsigned e=0;e<rounds;++e)if(tile==r/128+((h-r)/128)*e/(rounds-1))return true;return false;
+}
 unsigned ServiceRank(unsigned batch,unsigned split,unsigned core){return split?(core%2)*batch+core/2:core;}
 unsigned SequenceHalfWindow(const RuntimeShape& s){unsigned blocks=(s.history-s.resident)/512;return ((blocks+s.rounds-2)/(s.rounds-1))*256;}
 int EpochAt(unsigned b,unsigned h,unsigned r,unsigned split,unsigned rounds,unsigned service,unsigned tile,unsigned core){
@@ -56,22 +59,38 @@ int EpochAt(unsigned b,unsigned h,unsigned r,unsigned split,unsigned rounds,unsi
         "constexpr unsigned SIM_Q=4,S2_BASE_SIZE=128;\n"
         "enum class SequenceLiPhase {Hot,Threshold,Cold,Final};\n"
         "enum class LI_LAYOUT {BSND};\n"
-        "template<class T> T Min(T a,T b){return std::min(a,b);}",
+        "template<class T> T Min(T a,T b){return std::min(a,b);}\n"
+        "template<class T> T Max(T a,T b){return std::max(a,b);}",
     )
     code = code.replace("struct Cube {", "struct Cube {\n void AllocEventID(){} void FreeEventID(){drained();}")
     code = code.replace(
         "struct Vector {",
         """struct Vector {
  std::vector<unsigned> progress,services;unsigned residentCalls=0,finalCalls=0;
+ std::vector<bool> ready=std::vector<bool>(2048,false);
+ std::vector<std::pair<char,unsigned>> order;
+ std::vector<unsigned> replayed;std::vector<std::pair<unsigned,unsigned>> replayRanges;
+ void ReplayRecentScores(QLICommon::RunInfo info,unsigned begin,unsigned end){
+  assert(begin<end && info.s2Idx==begin);
+  // No later window is classified before the prior window's service boundary.
+  order.push_back({'R',begin});
+  replayRanges.push_back({begin,end});for(unsigned tile=begin;tile<end;++tile){replayed.push_back(tile);ready[tile]=true;}
+ }
+
  void AllocEventID(){} void FreeEventID(){drained();}
  void LoadSequenceSplitThresholds(unsigned){}
- void PublishScoreProgress(QLICommon::RunInfo info,unsigned=0,bool=false){progress.push_back(info.s2Idx+1);}
+ void PublishScoreProgress(QLICommon::RunInfo info,unsigned=0,bool=false){
+#if !defined(V9_UBMEM) || !V9_UBMEM
+  assert(ready[info.s2Idx]);
+#endif
+  order.push_back({'P',info.s2Idx+1});progress.push_back(info.s2Idx+1);
+ }
 """,
     )
     code = code.replace(
         "void ProcessVec1(QLICommon::RunInfo info,unsigned=0,bool=false,bool=false){\n  calls.push_back(info);",
         "void ProcessVec1(QLICommon::RunInfo info,unsigned=0,bool=false,bool scoreOnly=false){\n"
-        "  calls.push_back(info);if(!scoreOnly && info.s2Idx>=128)PublishScoreProgress(info);",
+        "  calls.push_back(info);if(!scoreOnly && info.s2Idx>=128){ready[info.s2Idx]=true;PublishScoreProgress(info);}",
     )
     code = code.replace(
         "void ProcessResidentTopK(QLICommon::RunInfo){}",
@@ -81,7 +100,8 @@ int EpochAt(unsigned b,unsigned h,unsigned r,unsigned split,unsigned rounds,unsi
         "void ProcessTopK(QLICommon::RunInfo){}", "void ProcessTopK(QLICommon::RunInfo,unsigned=4){++finalCalls;}"
     )
     code = code.replace(
-        "void RotateFetch(int) {assert(false);}", "void RotateFetch(int epoch,unsigned=0) {services.push_back(epoch);}"
+        "void RotateFetch(int) {assert(false);}",
+        "void RotateFetch(int epoch,unsigned=0) {order.push_back({'S',unsigned(epoch)});services.push_back(epoch);}",
     )
     code = code.replace(
         "struct {unsigned history=131328,batch=2,resident=16384,splitQ=1,rounds=8,serviceAics=8;} runtimeShape_;",
@@ -182,6 +202,21 @@ int main(){
   m.matmulService.drained();m.vectorService.drained();
   if(!aic){
    assert(m.vectorService.residentCalls==1 && m.vectorService.finalCalls==1);
+#if !defined(V9_UBMEM) || !V9_UBMEM
+   for(auto range:m.vectorService.replayRanges){
+    for(unsigned tile=range.first+1;tile<range.second;++tile)assert(!rotating::IsTrigger(h,16384,8,tile));
+   }
+   std::vector<unsigned> omitted;
+   for(unsigned tile=skip.begin;tile<skip.end;++tile)omitted.push_back(tile);
+   assert(m.vectorService.replayed==omitted);
+   // Classification starts only when the logical scan reaches that span;
+   // each original service boundary must already have been observed.
+   unsigned lastProgress=128;
+   for(auto event:m.vectorService.order){
+    if(event.first=='P')lastProgress=event.second;
+    if(event.first=='R')assert(event.second==lastProgress);
+   }
+#endif
    unsigned epoch=rotating::ServiceRank(2,1,core);
    assert(m.vectorService.services==std::vector<unsigned>{epoch});
    assert(m.vectorService.progress.size()==h/128-128);
@@ -216,6 +251,15 @@ int main(){
    unsigned epoch=rotating::ServiceRank(2,1,core);
    assert(m.vectorService.services==std::vector<unsigned>{epoch});
    assert(std::is_sorted(m.vectorService.progress.begin(),m.vectorService.progress.end()));
+#if !defined(V9_UBMEM) || !V9_UBMEM
+   std::vector<unsigned> omitted;
+   for(unsigned e=1,begin=128+shard*half;e<8;++e,begin+=2*half){
+    unsigned end=std::min(begin+half,h/128);
+    for(unsigned tile=begin;tile<end;++tile)if(tile>=skip.begin && tile<skip.end)omitted.push_back(tile);
+    for(auto range:m.vectorService.replayRanges)if(range.first>=begin && range.first<end)assert(range.second<=end);
+   }
+   assert(m.vectorService.replayed==omitted);
+#endif
   }
  }
  assert(ReusableTiles(16384,20001,16384,131584,131456,131000).end==0);
@@ -225,10 +269,11 @@ int main(){
     )
 
 
+@pytest.mark.parametrize("backend", ["urma", "ubmem"])
 @pytest.mark.parametrize("skip", [0, 1])
 @pytest.mark.parametrize("pipeline", [0, 1])
 @pytest.mark.parametrize("scale_tiles", [8, 16])
-def test_actual_main_and_sequence_skip(tmp_path, skip, pipeline, scale_tiles):
+def test_actual_main_and_sequence_skip(tmp_path, skip, pipeline, scale_tiles, backend):
     cpp = tmp_path / "skip.cpp"
     cpp.write_text(skip_model())
     exe = tmp_path / "skip"
@@ -240,6 +285,7 @@ def test_actual_main_and_sequence_skip(tmp_path, skip, pipeline, scale_tiles):
             "-g",
             "-fsanitize=address,undefined",
             f"-DKVIP_RECENT_SKIP={skip}",
+            f"-DV9_UBMEM={int(backend == 'ubmem')}",
             f"-DKVIP_RECENT_PIPELINE={pipeline}",
             f"-DMODEL_SCALE_TILES={scale_tiles}",
             "-I",

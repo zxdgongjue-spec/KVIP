@@ -2,7 +2,11 @@
 #pragma once
 #include <stdint.h>
 #ifndef KVIP_RECENT_SKIP
+#if defined(V9_UBMEM) && V9_UBMEM
 #define KVIP_RECENT_SKIP 1
+#else
+#define KVIP_RECENT_SKIP 0
+#endif
 #endif
 #if KVIP_RECENT_SKIP != 0 && KVIP_RECENT_SKIP != 1
 #error "KVIP_RECENT_SKIP must be 0 or 1"

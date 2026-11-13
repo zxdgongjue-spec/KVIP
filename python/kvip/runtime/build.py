@@ -37,7 +37,7 @@ def build_failure(log, stage, returncode):
     )
 
 
-def recent_build_options(*, pipeline=True, unified_topk=True, skip=True):
+def recent_build_options(*, pipeline=True, unified_topk=True, skip=False):
     """Compile-time A/B controls for the recent-Index seed only."""
     if any(type(value) is not bool for value in (pipeline, unified_topk, skip)):
         raise ValueError("Recent pipeline, unified TopK and skip options must be boolean")
@@ -46,7 +46,9 @@ def recent_build_options(*, pipeline=True, unified_topk=True, skip=True):
     )
 
 
-def build_libraries(*, cache_dir, cann, headers, soc, recent_pipeline=True, recent_unified_topk=True, recent_skip=True):
+def build_libraries(
+    *, cache_dir, cann, headers, soc, recent_pipeline=True, recent_unified_topk=True, recent_skip=False
+):
     """Build one shape-independent binary per source/toolchain/SoC."""
     root = Path(__file__).resolve().parents[3] / "csrc/operators"
     options = dict(

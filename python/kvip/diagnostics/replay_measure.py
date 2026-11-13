@@ -393,6 +393,7 @@ def measure_case(args, archive, context, retained):
             transport=args.transport,
             tuning=tuning,
             split_index_stages=getattr(args, "split_index_stages", False),
+            upstream=bool(getattr(args, "upstream_root", None)),
         )
         case_retained["bundle"] = bundle
         case_retained["buffers"] = buffer_addresses(bundle)
@@ -420,6 +421,21 @@ def measure_case(args, archive, context, retained):
         case_retained["bundle"] = bundle
     results = measure(torch, kvaf, stream, bundle, args, case_retained, runtime=runtime)
     phase(retained, "result_metadata")
+    upstream_root = getattr(args, "upstream_root", None)
+    if upstream_root:
+        from kvip.diagnostics.upstream import loaded_lidu_artifacts, provenance
+
+        production_source = provenance(upstream_root, args.upstream_revision)
+        production_source["lidu"] = dict(
+            getattr(args, "lidu_provenance", {}),
+            used_in_this_case=args.mode == "serial",
+            loaded_artifacts=loaded_lidu_artifacts(),
+            build_provenance="Source equality permits sharing; the installed binary was not rebuilt or independently attested",
+        )
+    else:
+        production_source = dict(
+            kind="feature_checkout", root=str(Path(__file__).resolve().parents[3]), commit=source_commit()
+        )
     library = getattr(bundle, "library", None)
     libraries = getattr(bundle, "libraries", (() if library is None else (library,)))
     result = dict(
@@ -441,8 +457,11 @@ def measure_case(args, archive, context, retained):
         library=str(library) if library is not None else None,
         library_sha256=file_digest(library) if library is not None else None,
         libraries=[dict(path=str(path), sha256=file_digest(path)) for path in libraries],
-        kvip_commit=source_commit(),
+        kvip_commit=production_source["commit"],
+        diagnostics_commit=source_commit(),
         capture_kvip_commit=archive.manifest.get("provenance", {}).get("kvip_commit", "unknown"),
+        production_source=production_source,
+        baseline_configuration="Unified replay workers/budget, not default vLLM service configuration or TPOT",
         **runtime_worker_config(args, archive, aics),
         warmup=args.warmup,
         address_relocation=restored["new_base"] - restored["old_base"],
@@ -556,7 +575,13 @@ def run(args, archive, retained):
             cases=cases,
         )
     else:
-        retained["progress"]["variant"] = args.threshold_policy if args.mode == "fused" else "serial"
+        retained["progress"]["variant"] = (
+            f"upstream-{args.mode}"
+            if getattr(args, "upstream_root", None)
+            else args.threshold_policy
+            if args.mode == "fused"
+            else "serial"
+        )
         result = measure_case(args, archive, context, retained)
         completed[retained["progress"]["variant"]] = result
     phase(retained, "context_release")

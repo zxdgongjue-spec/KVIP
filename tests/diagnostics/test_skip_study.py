@@ -199,6 +199,8 @@ def test_skip_cli_runs_four_children_and_preserves_serial_commands(tmp_path, mon
             "127.0.0.1:28999",
             "--study",
             "skip",
+            "--transports",
+            "both",
             "--result-dir",
             str(tmp_path / "results"),
         ]

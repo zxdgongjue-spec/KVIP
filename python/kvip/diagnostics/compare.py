@@ -25,13 +25,27 @@ def arguments(argv=None):
     p.add_argument("--serial-workers", type=int, default=32)
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--iterations", type=int, default=10)
-    p.add_argument("--study", choices=("threshold", "pipeline", "skip"), default="threshold")
+    p.add_argument("--study", choices=("threshold", "pipeline", "skip", "upstream"), default="threshold")
+    p.add_argument("--transports", choices=("urma", "ubmem", "both"), default="urma")
+    p.add_argument("--upstream-root", type=Path)
+    p.add_argument("--upstream-revision", help="Full pinned upstream commit for the upstream study")
     p.add_argument("--result-dir", type=Path, required=True)
     args = p.parse_args(argv)
     if args.device < 0 or args.warmup < 0 or args.iterations < 1 or not 1 <= args.serial_workers <= 48:
         p.error("Invalid device, warmup, iterations or workers")
     if args.result_dir.exists():
         p.error("result-dir already exists; choose a new directory")
+    if args.study == "upstream":
+        if not args.upstream_root or not args.upstream_revision:
+            p.error("study=upstream requires upstream-root and upstream-revision")
+        from kvip.diagnostics.upstream import validate_checkout
+
+        try:
+            args.upstream_root = validate_checkout(args.upstream_root, args.upstream_revision)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            p.error(str(error))
+    elif args.upstream_root or args.upstream_revision:
+        p.error("upstream-root/revision apply only to study=upstream")
     for root, object_name in ((args.build_dir, "kvaf_execute_batch_get_kernels.o"),):
         if root is not None and not (root / "bin" / object_name).is_file():
             p.error(f"Missing exact requested kernel: {root / 'bin' / object_name}")
@@ -76,12 +90,15 @@ def summarize(results, study="threshold"):
             workers=result["runtime_workers"],
             post_size=result.get("batch_get_post_size"),
             tuning=result.get("tuning"),
+            timing=result["timing"],
+            production_source=result.get("production_source"),
         )
     effects = {}
-    for transport in ("urma", "ubmem"):
+    for transport in (value for value in ("urma", "ubmem") if any(key.startswith(value + "-") for key in table)):
         best = transport + "-serial"
-        if study == "skip":
-            before, after = (table[f"{transport}-fused-{name}"] for name in ("before", "after"))
+        if study in ("skip", "upstream"):
+            prefix = "recent" if study == "upstream" else "fused"
+            before, after = (table[f"{transport}-{prefix}-{name}"] for name in ("before", "after"))
             for row, skip in ((before, False), (after, True)):
                 if not row["score_comparison"] or row["score_comparison"].get("status") != "bit_exact":
                     raise ValueError("Skip A/B requires bit-exact validation against all captured valid LI scores")
@@ -99,11 +116,33 @@ def summarize(results, study="threshold"):
                 raise ValueError("Skip A/B changed the final selection")
             if any(before["threshold"][key] != after["threshold"][key] for key in ("initial_keys", "final_keys")):
                 raise ValueError("Skip A/B changed the threshold")
+            if study == "upstream":
+                best = transport + "-upstream-serial"
+                main = table[transport + "-upstream-fused"]
+                for reference in (table[best], main):
+                    provenance = reference.get("production_source") or {}
+                    if provenance.get("kind") != "exact_upstream_checkout" or not provenance.get("commit"):
+                        raise ValueError("Upstream reference must execute an exact verified upstream checkout")
+                if table[best]["production_source"]["commit"] != main["production_source"]["commit"]:
+                    raise ValueError("Upstream serial and fused source revisions differ")
+                if not main["score_comparison"] or main["score_comparison"].get("status") != "bit_exact":
+                    raise ValueError("Upstream fused requires full captured-score bit-exact verification")
+                for key in ("selected_set_sha256", "ordered_output_sha256"):
+                    if main["selection"][key] != before["selection"][key]:
+                        raise ValueError("Upstream and recent fusion changed the final ordered TopK")
+                if main["threshold"]["final_keys"] != before["threshold"]["final_keys"]:
+                    raise ValueError("Upstream and recent fusion changed the final threshold")
             effects[transport] = dict(
                 serial_reference=best,
                 skip_reduction_pct=100 * (1 - after["mean_us"] / before["mean_us"]),
                 skip_vs_serial_reduction_pct=100 * (1 - after["mean_us"] / table[best]["mean_us"]),
             )
+            if study == "upstream":
+                effects[transport].update(
+                    upstream_revision=main["production_source"]["commit"],
+                    recent_before_vs_upstream_reduction_pct=100 * (1 - before["mean_us"] / main["mean_us"]),
+                    recent_after_vs_upstream_reduction_pct=100 * (1 - after["mean_us"] / main["mean_us"]),
+                )
             continue
         if study == "pipeline":
             before, pipeline, unified = (
@@ -139,7 +178,7 @@ def summarize(results, study="threshold"):
     return dict(
         status="pass",
         study=study,
-        kvip_commit=source_commit(),
+        diagnostics_commit=source_commit(),
         geometry=first["geometry"],
         snapshot_sha256=first["snapshot_sha256"],
         table=table,
@@ -162,6 +201,31 @@ def print_summary(summary):
             flush=True,
         )
     for transport, effect in summary["effects"].items():
+        if summary.get("study") == "upstream":
+            main, recent = (
+                summary["table"][f"{transport}-{name}"]["threshold"] for name in ("upstream-fused", "recent-after")
+            )
+            print(
+                f"THRESHOLD {transport} gap_mean={main['mean_gap']:.7g}->{recent['mean_gap']:.7g} "
+                f"equal_final={100 * main['equal_fraction']:.2f}%->{100 * recent['equal_fraction']:.2f}%",
+                flush=True,
+            )
+            print(
+                f"CHECK {transport} upstream={effect['upstream_revision']} all_fused_scores=bit_exact "
+                "all_fused_topk=unchanged_ordered recent_initial_threshold=unchanged_bit_exact KV_Index_outputs=verified",
+                flush=True,
+            )
+            print(
+                f"GAIN {transport} after_vs_recent_before={effect['skip_reduction_pct']:.2f}% "
+                f"after_vs_upstream_fused={effect['recent_after_vs_upstream_reduction_pct']:.2f}% "
+                f"after_vs_upstream_serial={effect['skip_vs_serial_reduction_pct']:.2f}%",
+                flush=True,
+            )
+            print(
+                "BASELINE upstream production sources; unified replay configuration, not default service TPOT.",
+                flush=True,
+            )
+            continue
         if summary.get("study") == "skip":
             print(
                 f"CHECK {transport} initial_threshold=unchanged_bit_exact final_scores=bit_exact "
@@ -211,9 +275,21 @@ def print_summary(summary):
 def run(args):
     args.result_dir.mkdir(parents=True, exist_ok=False)
     results = {}
-    cases = [(transport, mode, args.build_dir, 128) for transport in ("urma", "ubmem") for mode in ("serial", "fused")]
-    for transport, mode, build, post_size in cases:
-        name = f"{transport}-{mode}"
+    transports = ("urma", "ubmem") if args.transports == "both" else (args.transports,)
+    cases = [
+        (transport, mode, reference)
+        for transport in transports
+        for mode, reference in (
+            (("serial", True), ("fused", True), ("fused", False))
+            if args.study == "upstream"
+            else (("serial", False), ("fused", False))
+        )
+    ]
+    for transport, mode, reference in cases:
+        prefix = "upstream-" if reference else "recent-" if args.study == "upstream" else ""
+        name = f"{transport}-{prefix}{mode}"
+        paired = mode == "fused" and not reference
+        child_study = "threshold" if reference else "skip" if args.study == "upstream" else args.study
         output = args.result_dir / f"{name}.json"
         log = args.result_dir / f".{name}.log"
         cmd = [
@@ -224,13 +300,13 @@ def run(args):
             "--snapshot",
             str(args.snapshot),
             "--build-dir",
-            str(build),
+            str(args.build_dir),
             "--transport",
             transport,
             "--mode",
             mode,
             "--threshold-policy",
-            "both" if mode == "fused" else "resident",
+            "both" if paired else "resident",
             "--kvaf-server",
             args.kvaf_server,
             "--device",
@@ -244,21 +320,25 @@ def run(args):
             "--output",
             str(output),
             "--study",
-            args.study,
+            child_study,
         ]
+        if reference:
+            cmd += ["--upstream-root", str(args.upstream_root), "--upstream-revision", args.upstream_revision]
         if mode == "serial":
             cmd += ["--serial-workers", str(args.serial_workers)]
         print(
             f"RUN {name}"
             + (
-                {
+                f" exact_upstream={args.upstream_revision}"
+                if reference and mode == "fused"
+                else {
                     "threshold": " resident/recent share DDR",
                     "pipeline": " before/pipeline/unified share DDR",
                     "skip": " before/after share DDR",
+                    "upstream": " before/after share DDR",
                 }[args.study]
-                if mode == "fused"
-                else f" workers={args.serial_workers}"
-                + (f" post={post_size} inflight=2048" if transport == "urma" else "")
+                if paired
+                else f" workers={args.serial_workers}" + (" post=128 inflight=2048" if transport == "urma" else "")
             ),
             flush=True,
         )
@@ -281,8 +361,9 @@ def run(args):
                 failure_tail(log, message=f"{name} exit={process.returncode}; no structured failure report", lines=12)
             raise SystemExit(1)
         report = json.loads(output.read_text())
-        if mode == "fused":
-            results.update({f"{name}-{key}": value for key, value in report["cases"].items()})
+        if paired:
+            case_prefix = f"{transport}-recent" if args.study == "upstream" else name
+            results.update({f"{case_prefix}-{key}": value for key, value in report["cases"].items()})
         else:
             results[name] = report
         log.unlink()
@@ -291,10 +372,10 @@ def run(args):
     summary["manifest_sha256"] = file_digest(args.snapshot / "manifest.json")
     (args.result_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print_summary(summary)
-    print(
-        "ALLOCATOR current upstream: URMA CPU allocation / UBmem HAL allocation; each fused A/B shares one arena.",
-        flush=True,
+    allocators = " / ".join(
+        "URMA CPU allocation" if transport == "urma" else "UBmem HAL allocation" for transport in transports
     )
+    print(f"ALLOCATOR current runtime: {allocators}; each feature fused A/B shares one arena.", flush=True)
     print(f"COMPARE_PASS RESULTS={args.result_dir / 'summary.json'}", flush=True)
     return summary
 
