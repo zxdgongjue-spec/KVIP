@@ -1,6 +1,6 @@
 # LIFetch 测试设计与使用说明
 
-> 状态：设计稿，接口待实现并依据正式算子约束修正。命令及日志为设计示例。
+> 状态：统一入口与六个职责模块已实现；可执行命令见 tests/operators/lifetch/README.md。日志中的数值为展示示例。
 > 基准：已合入PR13的KVIP主线 `13d2898`，正式支持BS1～16。
 
 ## 1. 组织与统一入口
@@ -19,6 +19,8 @@ tests/operators/lifetch/
 ```
 
 按职责复用，URMA、UBmem共用输入、校验和报告，执行层保留必要的传输差异。初始化检查并入统一入口，测试调用正式算子。
+
+测试框架自身的CPU回归按相同六个职责放在上一级`tests/operators/test_lifetch_*.py`，不再为每个辅助函数建文件。两个C++ host模型放在`tests/operators/lifetch_models/`，由回归自动编译执行。历史trace转换也由唯一入口的`convert-trace SOURCE --output DIR`调用，实现在workloads中；不启动NPU。
 
 ```bash
 python tests/operators/lifetch/test_lifetch.py <all|check|bench|diagnose> [options]
@@ -63,7 +65,7 @@ all使用所选transport，不自动跑另一种传输；不依赖外部真实�
 
 ## 3. 接口定义
 
-以下为拟定接口，待实现后按正式能力修正。新增参数应服务于测试选择，不暴露历史优化开关。
+以下为统一测试接口。新增参数服务于测试选择，不暴露历史优化开关。
 
 ### 3.1 check
 

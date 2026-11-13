@@ -1,4 +1,7 @@
-"""Shared result accounting; correctness never hides completed timing samples."""
+# SPDX-License-Identifier: Apache-2.0
+"""Structured results and concise terminal tables."""
+from __future__ import annotations
+
 import csv
 import json
 import os

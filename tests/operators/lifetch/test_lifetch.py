@@ -5,13 +5,15 @@ import sys
 from pathlib import Path
 
 SUPPORT = Path(__file__).resolve().parent / 'support'
-sys.path.insert(0, str(SUPPORT))
+sys.path[:0] = [str(SUPPORT), str(Path(__file__).resolve().parents[3] / 'python')]
 from workloads import configuration  # noqa: E402
-from execution import dispatch  # noqa: E402
 
 
 def main(argv=None):
-    return dispatch(configuration(argv))
+    config = configuration(argv)
+    from execution import dispatch
+
+    return dispatch(config)
 
 
 if __name__ == '__main__':
