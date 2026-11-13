@@ -207,9 +207,7 @@ def run(args, run_dir):
                     lines.append(f"FIX A/B {r['query']}: before={r['p50_us']:.3f} after={after['p50_us']:.3f} us change={(after['p50_us']/r['p50_us']-1)*100:+.2f}%")
             lines.append('Q1-Q4 are individual queries; Q4_all runs all four concurrently. Zero-entry cases measure launch/control only.')
             line = '\n'.join(lines)
-            if report.get('wall_costs'):
-            line += "\nBENCH WALL COSTS seconds=" + json.dumps(report['wall_costs'])
-        summaries.append(line)
+            summaries.append(line)
             (run_dir / 'cases.log').write_text('\n'.join(summaries) + '\n')
             print(line, flush=True)
             continue
@@ -240,6 +238,8 @@ def run(args, run_dir):
             line += "\n" + core_summary(report["full_trace"], label="full")
         if report.get("cache_update"):
             line += "\ncache_update=" + json.dumps(report["cache_update"])
+        if report.get("wall_costs"):
+            line += "\nBENCH WALL COSTS seconds=" + json.dumps(report["wall_costs"])
         summaries.append(line)
         (run_dir / "cases.log").write_text("\n".join(summaries) + "\n")
         print(line, flush=True)
