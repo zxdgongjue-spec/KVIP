@@ -159,13 +159,18 @@ def test_level_two_tables_keep_replay_core_and_query_identity():
     output = level_two_tables(result)
     assert 'Per-Fetch-block effective bandwidth' in output
     assert '0.109' in output  # 656 bytes / 6 us, decimal GB/s.
-    for value in ('repeat=2', 'Last block=3', 'fetch Q1 lane0', 'Window prefetch / unused',
+    for value in ('samples=1', 'fetch Q1 lane0', 'Window prefetch / unused',
                   'Per-Q demand / repair', 'Per-Q resolver / update', '1.000', '2.000'):
         assert value in output
     assert 'URMA group counters' not in output
     assert 'Core work / wait intervals' not in output
     assert 'LI TopK classification' not in output
     assert output.index('ALGORITHM / KV TRAFFIC') < output.index('TIME BREAKDOWN')
+    result['captures'][0]['samples'] = [sample, sample, sample]
+    aggregated = level_two_tables(result)
+    for title in ('Active cores', 'Per-Fetch-block effective bandwidth', 'Per-Q resolver / update'):
+        assert aggregated.count(title) == 1
+    assert '3/3' in aggregated
     result['level'] = 3
     assert 'URMA group counters' in level_two_tables(result)
     assert 'Core work / wait intervals' in level_two_tables(result)
@@ -188,3 +193,26 @@ def test_level_three_prefetch_counts_and_time_are_separated():
     assert 'submit/copy' in timing and '3.000' in timing and 'Cycles' in timing
     result['level'] = 2
     assert 'Prefetch service' not in level_two_tables(result)
+
+
+def test_level_two_repeats_are_aggregated_without_mutating_raw_samples():
+    from copy import deepcopy
+    from diagnostics import level_two_tables, aggregate_diagnostic_rows
+    samples = [dict(repeat=i, requests=[], algorithm=dict(requests=[dict(request=0,
+        selected_unique=100, initial_cold=10, prefetch=value, final=3,
+        KV_read_bytes=656 * (value + 3), unused_prefetch=1, windows=[], queries=[])]))
+        for i, value in enumerate((4, 6, 8))]
+    result = dict(level=2, transport='urma', trace='COMPLETE', captures=[dict(
+        source='case', stage_summary={}, samples=samples)])
+    original = deepcopy(result)
+    output = level_two_tables(result)
+    assert output.count('Demand and actual reads') == 1
+    assert output.count('Window prefetch / unused') == 1
+    assert output.count('Per-Q demand / repair') == 1
+    assert '6.000 [4.000, 8.000]' in output
+    assert 'repeat=' not in output
+    assert result == original
+    result['level'] = 3
+    assert level_two_tables(result).count('Demand and actual reads') == 3
+    assert aggregate_diagnostic_rows([[3, 'fetch', 2., '*'], [3, 'fetch', 4., '']], 2) == [
+        [3, 'fetch', '3.000 [2.000, 4.000]', '1/2']]

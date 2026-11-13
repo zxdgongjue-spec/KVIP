@@ -476,6 +476,27 @@ def diagnostic_table(title, headers, rows):
                       *[line(row) for row in values[1:]]])
 
 
+def aggregate_diagnostic_rows(rows, identity_columns):
+    """Aggregate already-derived per-replay metrics, never raw timestamps."""
+    groups = {}
+    for row in rows:
+        groups.setdefault(tuple(row[:identity_columns]), []).append(row)
+    result = []
+    for identity, samples in groups.items():
+        output = list(identity)
+        for column in zip(*(row[identity_columns:] for row in samples)):
+            if all(value in ('', '*') for value in column):
+                output.append(f"{column.count('*')}/{len(column)}")
+            elif all(value == column[0] for value in column):
+                output.append(column[0])
+            elif all(isinstance(value, (int, float)) for value in column):
+                output.append(f'{sum(column)/len(column):.3f} [{min(column):.3f}, {max(column):.3f}]')
+            else:
+                output.append(' / '.join(dict.fromkeys('N/A' if value is None else str(value) for value in column)))
+        result.append(output)
+    return result
+
+
 def level_two_tables(result):
     """Same-replay tables, with no summed-overlap or synthetic decode trend."""
     lines = ['TIME BREAKDOWN | us; profiled passes are separate from performance samples.',
@@ -490,12 +511,27 @@ def level_two_tables(result):
                      ['Stage', 'Mean', 'p50', 'Min', 'Max'], stage_rows))
         if capture.get('path') == 'serial':
             continue
+        tables = {}
+        def emit(target, title, headers, rows, identity_columns):
+            if result.get('level', 2) >= 3:
+                target.append(diagnostic_table(title, headers, rows))
+            else:
+                entry = tables.setdefault(title, (target, headers, [], identity_columns))
+                entry[2].extend(rows)
+        if result.get('level', 2) == 2:
+            label = (f"Source: {capture['source']} | samples={len(capture['samples'])}; "
+                     'varying metrics: mean [min, max]; identical values shown once. '
+                     'Core times are relative to each replay; Last is the last-finisher frequency.')
+            lines.append(label)
+            algorithm_lines.append(label)
         for sample in capture['samples']:
             repeat = sample['repeat']
-            lines.append(f"\nSource: {capture['source']} | repeat={repeat}")
+            if result.get('level', 2) >= 3:
+                lines.append(f"\nSource: {capture['source']} | repeat={repeat}")
             timeline = sample.get('timeline')
             if timeline:
-                lines.append(f"Last block={timeline['last_block']} | observed span={timeline['observed_span_us']:.3f} us")
+                if result.get('level', 2) >= 3:
+                    lines.append(f"Last block={timeline['last_block']} | observed span={timeline['observed_span_us']:.3f} us")
                 rows, phases = [], []
                 for core in timeline['cores']:
                     rows.append([core['block'], core['role'], core['start_us'], core['end_us'],
@@ -506,7 +542,7 @@ def level_two_tables(result):
                                        stage['end_us'], stage['duration_us'],
                                        stage['end_cycles'] - stage['start_cycles']
                                        if 'end_cycles' in stage and 'start_cycles' in stage else None])
-                lines.append(diagnostic_table('Active cores', ['Block', 'Role', 'Start', 'End', 'Duration', 'Last'], rows))
+                emit(lines, 'Active cores', ['Block', 'Role', 'Start', 'End', 'Duration', 'Last'], rows, 2)
                 groups = sample.get('final_get_bandwidth', {}).get('groups', [])
                 rates = []
                 for group in groups:
@@ -520,8 +556,8 @@ def level_two_tables(result):
                     rates.append([group['block'], group['query'], group['lane'], group['entries'], group['bytes'],
                                   duration, group['bytes'] / duration / 1000 if duration else None])
                 if rates:
-                    lines.append(diagnostic_table('Per-Fetch-block effective bandwidth (Get call span, not link peak)',
-                        ['Block', 'Q', 'Lane', 'Reads', 'Bytes', 'Get span us', 'GB/s'], rates))
+                    emit(lines, 'Per-Fetch-block effective bandwidth (Get call span, not link peak)',
+                        ['Block', 'Q', 'Lane', 'Reads', 'Bytes', 'Get span us', 'GB/s'], rates, 3)
                 if result.get('level', 2) >= 3:
                     lines.append(diagnostic_table('Core work / wait intervals', ['Block', 'Phase', 'Start us', 'End us', 'Duration us', 'Cycles'], phases))
                     if result['transport'] == 'urma':
@@ -576,10 +612,11 @@ def level_two_tables(result):
                     lines.append(diagnostic_table('Per-Q resolver / update', ['Request', 'Q', 'Resolve', 'Output',
                         'Descriptor', 'Publish', 'Update wait', 'Update apply'], rows))
                 else:
-                    lines.append(diagnostic_table('Per-Q resolver / update',
+                    emit(lines, 'Per-Q resolver / update',
                         ['Request', 'Q', 'Resolve', 'Update wait', 'Update apply'],
-                        [[row[i] for i in (0, 1, 2, 6, 7)] for row in rows]))
-            algorithm_lines.append(f"Source: {capture['source']} | repeat={repeat}")
+                        [[row[i] for i in (0, 1, 2, 6, 7)] for row in rows], 2)
+            if result.get('level', 2) >= 3:
+                algorithm_lines.append(f"Source: {capture['source']} | repeat={repeat}")
             traffic = []
             for request in sample.get('algorithm', {}).get('requests', []):
                 demand, cold = request.get('selected_unique'), request.get('initial_cold')
@@ -588,8 +625,8 @@ def level_two_tables(result):
                     prefetch, final, request.get('KV_read_bytes'),
                     (prefetch+final)/cold if cold and prefetch is not None and final is not None else None,
                     unused, 100*unused/prefetch if prefetch and unused is not None else None])
-            algorithm_lines.append(diagnostic_table('Demand and actual reads',
-                ['Request', 'Demand', 'Cold', 'Cold miss %', 'Prefetch', 'Final', 'KV bytes', 'Read amplification', 'Unused', 'Unused %'], traffic))
+            emit(algorithm_lines, 'Demand and actual reads',
+                ['Request', 'Demand', 'Cold', 'Cold miss %', 'Prefetch', 'Final', 'KV bytes', 'Read amplification', 'Unused', 'Unused %'], traffic, 1)
             windows, queries = [], []
             for request in sample.get('algorithm', {}).get('requests', []):
                 for window in request.get('windows', []):
@@ -603,10 +640,12 @@ def level_two_tables(result):
                         query['cross_q_duplicate'], query['new_unique'], query['initial_local'],
                         None if query['initial_local'] is None else query['new_unique'] - query['initial_local'],
                         query['final_posted'], count.get('conflict')])
-            algorithm_lines.append(diagnostic_table('Window prefetch / unused', ['Request', 'Window', 'Posted', 'Bytes',
-                'Unused', 'Cumulative posted', 'Cumulative unused'], windows))
-            algorithm_lines.append(diagnostic_table('Per-Q demand / repair', ['Request', 'Q', 'Unique demand',
-                'Seen in earlier Qs', 'New demand', 'New: already local', 'New: initially cold', 'Final reads', 'Conflict reads'], queries))
+            emit(algorithm_lines, 'Window prefetch / unused', ['Request', 'Window', 'Posted', 'Bytes',
+                'Unused', 'Cumulative posted', 'Cumulative unused'], windows, 2)
+            emit(algorithm_lines, 'Per-Q demand / repair', ['Request', 'Q', 'Unique demand',
+                'Seen in earlier Qs', 'New demand', 'New: already local', 'New: initially cold', 'Final reads', 'Conflict reads'], queries, 2)
+        for title, (target, headers, rows, identity_columns) in tables.items():
+            target.append(diagnostic_table(title, headers, aggregate_diagnostic_rows(rows, identity_columns)))
     algorithm_lines.append('Demand: Unique = Seen in earlier Qs + New demand; New demand = already local + initially cold. Final reads are actual repairs, not initially cold minus prefetch counts.')
     return '\n\n'.join([f"DIAG level={result.get('level', 2)} transport={result['transport']} trace={result['trace']}",
                            *algorithm_lines, *lines])

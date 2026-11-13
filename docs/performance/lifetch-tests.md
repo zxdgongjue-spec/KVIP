@@ -425,7 +425,7 @@ level1终端按阶段耗时、每请求计数、有效带宽三张对齐表展�
 `level1_summary.log`保存同样的简表，`diagnostic_summary.log`和`diagnostic.json`保留原始区间与完整证据。
 预取提交时间戳缺失时，仅在已有服务起点与完成观察点有效的情况下提供service-span带宽，明确包含控制开销；不将其标为精确doorbell到CQ跨度。没有有效区间仍标INCOMPLETE。
 
-level2按每次采样独立展示算法与流量、阶段与活跃block及最晚结束block、逐Q Resolver/Update概览。内部步骤仅level3展示。`timeline.csv`从level2开始包含全部已定义步骤；`level2_summary.log`保存终端表格。
+level2汇总多次采样，展示算法与流量、阶段与活跃block及最晚结束次数、逐Q Resolver/Update概览。内部步骤仅level3展示。`timeline.csv`从level2开始包含全部已定义步骤；`level2_summary.log`保存终端表格。
 预取服务记录保留设备core/epoch字段、扫描/候选/提交周期、bitmap字节与计数，不将service core编号冒充请求编号。无有效打点记录显示N/A。URMA KVAF组计数每Fetch block只展示一次；UBmem不展示URMA CQ计数。资源几何取自实际捕获的block数，未采集的Jetty、在途上限及搬运配置明确标N/A。
 
 level2终端按理解顺序聚类：
@@ -459,3 +459,6 @@ level2继承level1的统计含义，level3继承level2；同一字段不随level
 - 预取服务步骤单列扫描、候选处理、提交/拷贝的 cycles 与 µs。URMA 的提交耗时与 UBmem 的拷贝耗时保留各自含义。
 
 预取内部打点由诊断开关控制，两种 transport 均发布完整 Event；普通 bench 使用关闭打点的模板分支。采样结果保存在 `diagnostic.json`、`timeline.csv` 和 `level3_summary.log`，终端与对应 summary 使用同一组表格。cycles 按设备计数时钟换算为 µs，内部嵌套区间不累加为总耗时。
+
+
+Level2 每个 case 只打印一组汇总表：相同计数保留单值，波动指标显示 `mean [min, max]`。每核时间使用各次 replay 的相对时间，带宽在各次 replay 内计算后再汇总；Last 列显示该核最后结束的次数/采样数。Level3 展示逐次采样的完整明细，原始 JSON/CSV 保留全部采样。
