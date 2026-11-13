@@ -1,0 +1,53 @@
+{
+  "matrix_version": "128k-q4-v2",
+  "scope": "42-case generation, CPU inputs and fresh CANN build; complete Model sweep not run",
+  "branch_scope": "clean KVIP upstream branch based on13d2898; private historical contracts not imported",
+  "source_files_sha256": {
+    "scripts/run_split_core_cases.py": "61c5b59bc172f562024285400d6100b869ad038bc1fce229a426ee4d2710c21a",
+    "scripts/generate_split_core_sim.py": "7fad32546ded77d4ff065da5d3157cc86aea7b8a66c6b20216ae69c57251c9b6",
+    "scripts/split_core_sim/cases.json": "a9d0b4f89d817f52f4bee8b135c43934ad6d046faac56eb13fa2709a9c7324e4",
+    "scripts/split_core_sim/smoke.sh": "0db16ffbaf6bfde8bda544ea891ddde0d3db5927f6080a49482bd32d266d0e89",
+    "scripts/split_core_sim/customer.sh": "327ebae1f669a74a80a898ed41d1a0bd38b8be3be907723b308d271e9b9ea0de",
+    "scripts/split_core_sim/compare.sh": "4f223bdbd00d6c16eaf2cdc1316b749ab150cbfbf89b2e50621de987168a2b9a",
+    "experiments/split_core/topk_host.cpp": "94ffeeb16ef0fa7ca8443159060b9787d4d34d3f90b0d5e74405dd4b08e1827c",
+    "tests/runtime/test_split_core_sim.py": "d2a74d0e8d4e9193b339d222a94ec0f568ad09661da461de05c4814faab5e44a",
+    "tests/runtime/test_independent_schedule.py": "1a77089d2616085695daf67ac381c8a2f612197ff2f0c6a7b32af53ec72b58f1"
+  },
+  "checks": {
+    "cpu_case_count": 42,
+    "cpu_status": "PASSED_CPU",
+    "independent_fp8_qk_cases": 4,
+    "pytest_passed": 220,
+    "pytest_subtests": 79,
+    "pytest_duration_seconds": 53.17,
+    "pytest_log": "customer-v2-pytest.log",
+    "pytest_log_sha256": "6c01b81a1adadd8c2ed789061123085da25d1db99754a4c9e8155d7c68f70960",
+    "generated_shell_syntax": "passed",
+    "generated_scripts_deterministic": "passed",
+    "reserved_argument_override_regressions": "passed"
+  },
+  "CANN_build": {
+    "status": "passed",
+    "driver_sha256": "590c34b7e7403b291852d001c922b17b090834cc88517dc8b1ea27faa03af5c2",
+    "host_source_sha256": "94ffeeb16ef0fa7ca8443159060b9787d4d34d3f90b0d5e74405dd4b08e1827c",
+    "kernel_source_sha256": "72ad7ef31263a37e8af4d749c0c688c9c8c2b359ab9c1ce32ceae5dd7c583556",
+    "capabilities": {
+      "scope": "AIV-only TopK",
+      "max_batch": 32,
+      "queries_per_request": 4,
+      "max_aiv_workers": 64
+    },
+    "scope": "fresh CANN build and capability CLI metadata query without Model LD_PRELOAD; no 42-case Model execution",
+    "initial_probe_failures": [
+      "missing devlib in capability probe LD_LIBRARY_PATH",
+      "Model preload constructor logs polluted capability JSON; metadata query now omits LD_PRELOAD"
+    ],
+    "branch_execution": "Imported fresh build from identical source hashes; not rebuilt in this worktree"
+  },
+  "not_run": [
+    "all 42 Model customer cases",
+    "new BS24/32 Model kernel execution",
+    "native NPU / full P32-T8 / Fetch-Service acceptance"
+  ],
+  "archived_evidence": "Older60-case CPU/Model records retain their original geometry and implementation scope."
+}

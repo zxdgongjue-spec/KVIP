@@ -1,7 +1,7 @@
 {
   "scope": "exported source/evidence; raw logs and historical source snapshots retain original whitespace",
   "files": {
-    "docs/research/split_core/README.md": "67e8230126a722178d33aac751979cc94d9e92b9809708e0f91d3ae5537b3e6f",
+    "docs/research/split_core/README.md": "e1bda58c770a201a340420487f3aacf0bb32585aa7d666701934940547e6eab1",
     "docs/research/split_core/build_split_core_matrix.py": "bebfb484ddde4061ac4c96fa6abb6afe4b4259f823d82f48c6fe73494e002b04",
     "docs/research/split_core/pipeline-comparison.csv": "85cb42a29beda43ed1926c548917c883f368c7b83f6ba118d40478b932608d72",
     "docs/research/split_core/pipeline-comparison.md": "da450955401284ab666eed0080969440290d12003472dad9b292c6d82c309fd1",
@@ -12,6 +12,11 @@
     "docs/research/split_core/results/current-core-smoke.json": "8e575eabe76bb1a4ec0c77b2be80aa8f704691c31bf6233389bd16adfa8547c4",
     "docs/research/split_core/results/current-core-smoke.log": "2254d7ea716e600851df0fd9b8d264fdd00e261f9fc565a55dd9ef3a1e5b0cd9",
     "docs/research/split_core/results/current-model-matrix.json": "202ff0bdb77602f85170a988d3fe0d973ce768ddd35785cac3071e7502fe410d",
+    "docs/research/split_core/results/customer-v2-cpu-matrix.json": "37700a8e7015f101072bc44ca5cb280f15f5f1f229e8dfeab892802c9f6fb1ad",
+    "docs/research/split_core/results/customer-v2-fp8-audit.json": "f5ec608dba5a8434600aa2bc427b2089c7efd2dc0324beb99e9de7849e330b5c",
+    "docs/research/split_core/results/customer-v2-model-plan.json": "e5bb0e747e1fcc975c62f248d69d653014c06140c6ce05ea6c925251998038c8",
+    "docs/research/split_core/results/customer-v2-pytest.log": "6c01b81a1adadd8c2ed789061123085da25d1db99754a4c9e8155d7c68f70960",
+    "docs/research/split_core/results/customer-v2-validation.json": "eb8757565efd54e4e6e6881d3c72294c88dc75b8612a2783c698ae935c316764",
     "docs/research/split_core/results/fusion3-captures.json": "725e5fc2dafc1d898102d2b09cd0a5ab6a02dfde893c2cc27aa29620d5f257a9",
     "docs/research/split_core/results/fusion3-direct-comparison.json": "b6a43261a3007c56701bb39c406f3444de7f4f4c6654ffbc13076f1af0466387",
     "docs/research/split_core/results/integration-validation.json": "433eb9e391c2bd0f97c7bf62306f9916edde67e7b12e4ab97f25e857a5d131ee",
@@ -71,7 +76,7 @@
     "docs/research/split_core/split_core_v2_results.png": "89df12fb54cb91f90cc395d478d75484202926157834430b8687e1ab1009823b",
     "docs/research/split_core/split_core_v2_results.svg": "8c3d8c03fb1b9e95c97a9fa6dba2d9f64a1312bbe7590f34f84ad02bcc73b734",
     "docs/research/split_core/split_core_v2_threshold_potential.csv": "c0db5ea34bc18423dd8ba4835eed06c4555638d36a1122a1c86cec172256917c",
-    "experiments/split_core/README.md": "bef922e3ac76328b33e9da269dd22bf050e4d4c6acc96f207fd7dfcce9f219e7",
+    "experiments/split_core/README.md": "c302ad32a469ae1011614b49e006732efdda429a958b18ab37dede01e85ccacb",
     "experiments/split_core/check_history_replay.py": "33bb30467f225b6ebe126a61326d74785ad1c1f8e642520772b9fc21ffdb4e60",
     "experiments/split_core/compare_pipelines.py": "522d6b6d8fc06ab40b45913a905a3cc58642f86661b0ab17f7557126c6e96b6d",
     "experiments/split_core/historical/CMakeLists.txt": "2d53f7db756ab3794cd5ce6eb2233fddc101518753213df274772ca2db7fc11d",
@@ -101,7 +106,15 @@
     "experiments/split_core/historical/source_manifest.json": "f0e61b8cac6baf1c09fdb8963f1e09afc080be5fd106c21f0a51549b877e3631",
     "experiments/split_core/historical/topk_v2.cpp": "54a56f2a7f10726b90678f50f08ae6a4c7ba98d4674689aa226f30c53f9e7fe5",
     "experiments/split_core/prepare_historical.py": "231c8a13e70792ab41a8af6cd37ce79567d2acf391298af1964f32bcd1b388d0",
-    "experiments/split_core/topk_host.cpp": "18935513ec3f72bf0b95ab599457e617d1db10698fc770d8a95b588c3109fec1",
-    "experiments/split_core/verify_results.py": "bb52d7a8f0eb6f622bfd32780e6d83c66bd82acaa564ee9a42f67268f67cef2f"
+    "experiments/split_core/topk_host.cpp": "94ffeeb16ef0fa7ca8443159060b9787d4d34d3f90b0d5e74405dd4b08e1827c",
+    "experiments/split_core/verify_results.py": "bb52d7a8f0eb6f622bfd32780e6d83c66bd82acaa564ee9a42f67268f67cef2f",
+    "scripts/generate_split_core_sim.py": "7fad32546ded77d4ff065da5d3157cc86aea7b8a66c6b20216ae69c57251c9b6",
+    "scripts/run_split_core_cases.py": "61c5b59bc172f562024285400d6100b869ad038bc1fce229a426ee4d2710c21a",
+    "scripts/split_core_sim/cases.json": "a9d0b4f89d817f52f4bee8b135c43934ad6d046faac56eb13fa2709a9c7324e4",
+    "scripts/split_core_sim/compare.sh": "4f223bdbd00d6c16eaf2cdc1316b749ab150cbfbf89b2e50621de987168a2b9a",
+    "scripts/split_core_sim/customer.sh": "327ebae1f669a74a80a898ed41d1a0bd38b8be3be907723b308d271e9b9ea0de",
+    "scripts/split_core_sim/smoke.sh": "0db16ffbaf6bfde8bda544ea891ddde0d3db5927f6080a49482bd32d266d0e89",
+    "tests/runtime/test_independent_schedule.py": "1a77089d2616085695daf67ac381c8a2f612197ff2f0c6a7b32af53ec72b58f1",
+    "tests/runtime/test_split_core_sim.py": "d2a74d0e8d4e9193b339d222a94ec0f568ad09661da461de05c4814faab5e44a"
   }
 }

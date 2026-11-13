@@ -2,44 +2,67 @@
 
 当前集成与限制见 [研究入口](../../docs/research/split_core/README.md)。这里区分当前核心的组件验证、真实设备入口和81b1472历史实验；旧百分比不用于当前流式main。
 
-## 60个基础场景
+## 当前42组：冒烟与客户用例
 
-BS1/2为small（24组），BS4/8为medium（24组），BS16为large（12组）；miss为3/5/10/15%，sequence为128K的30/50/100%。有效长度39322对应存储39424；另外两档为65536和131072。预算、G32/64、算法和重复次数另算展开维度。
+固定**sequence=131072（128K）、每request Q=4**；BS=1/2/4/8/16/24/32，miss目标=3/5/10/15/20/50%，共42组。small/medium/large为12/12/18组。smoke与customer使用相同42组完整清单，不自动抽成少量冒烟；区别仅在用途与结果标签。默认G32、T1、V56，每组Model执行一次，不做预热。
 
-```bash
-python scripts/run_split_core_cases.py plan --group all --output tests/results/split-plan
-python scripts/run_split_core_cases.py cpu --group all --output tests/results/split-cpu
-```
+旧60组（history30/50/100%、最大BS16）结果保持归档，不能作为这42组的通过证据。
 
-CPU入口生成真实FP8 Q/K，不通过交换预计算score伪造miss；每query整数miss为61/102/205/307，当前受控重叠U=2m。它验证fixture/数学语义，不能产生设备时延。结果明确区分NOT_RUN、PASSED_CPU、PASSED_MODEL、PASSED_NPU和FAILED。`--case`可只执行指定行，其余行仍保留NOT_RUN。
-
-## 当前核心AIV组件：CANN Model
-
-Linux环境需要匹配CANN9.1、Ascend950编译器和Model库；本仓不提供运行库或自动安装系统依赖。
+### 生成、预览、CPU验证
 
 ```bash
-cmake -S csrc/operators/split_topk -B build/split-topk \
-  -DRUN_MODE=sim -DSOC_VERSION=Ascend950PR_9599 \
-  -DASCEND_CANN_PACKAGE_PATH="$ASCEND_HOME_PATH"
-cmake --build build/split-topk -j2
-export LD_PRELOAD="$ASCEND_HOME_PATH/aarch64-linux/simulator/dav_3510/lib/libruntime_camodel.so"
-export LD_LIBRARY_PATH="$ASCEND_HOME_PATH/aarch64-linux/simulator/dav_3510/lib:$ASCEND_HOME_PATH/aarch64-linux/lib64:$LD_LIBRARY_PATH"
-python scripts/run_split_core_cases.py run --backend model --group small --budget 32/64 --shards 8 --model-driver build/split-topk/topk_sim --output tests/results/split-small
-python scripts/run_split_core_cases.py run --backend model --group medium --budget 28/56 --shards 4 --model-driver build/split-topk/topk_sim --output tests/results/split-medium
-python scripts/run_split_core_cases.py run --backend model --group large --budget 28/56 --shards 1 --model-driver build/split-topk/topk_sim --output tests/results/split-large
+python3 scripts/generate_split_core_sim.py
+KVIP_ACTION=plan bash scripts/split_core_sim/smoke.sh
+KVIP_ACTION=cpu bash scripts/split_core_sim/customer.sh
 ```
 
-脚本有排他租约，不抢占其他任务；超时结束自己的进程组。Model必须有唯一正常footer及host oracle，不能仅凭exit0标PASS。该组件只测精确TopK，AIC工作数为0，不包含QK、Service或native transport。完整query/range且每片至少K是当前模块限制；空/短range不能直接调用。history P/T gather实现已收敛到共享核心文件，但尚未接替新流式Final阶段。
+生成物为`cases.json`、`smoke.sh`、`customer.sh`及可选`compare.sh`。`plan`只写42行NOT_RUN；`cpu`校验实际FP8 Q/K、score与精确miss，不产生设备时延。CPU fixture为一组Q4种子；Model driver将其复制到每个request，不代表异构客户请求分布。
+
+### 上库前完整冒烟 / 客户仿真
+
+在匹配的Linux CANN Model环境执行：
+
+```bash
+export ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.1.0
+bash scripts/split_core_sim/smoke.sh
+bash scripts/split_core_sim/customer.sh
+# 客户矩阵使用T8，仍为42组：
+KVIP_TOPK_SHARDS=8 bash scripts/split_core_sim/customer.sh
+# 可选同输入策略/预算对照：42 × T1/T4/T8 × V56/V64 = 252条件
+bash scripts/split_core_sim/compare.sh
+```
+
+两个主入口各完整遍历42组。默认自动从当前源码构建`topk_sim`，先执行`--capabilities`核对Q4及BS32支持；旧BS16 driver必须重新构建。可用`KVIP_MODEL_DRIVER`指定已经重建的driver、`KVIP_BUILD_DIR`指定独立构建目录、`KVIP_SOC`指定Model匹配SoC、`KVIP_CANN_ARCH`指定SDK平台目录。`KVIP_OUTPUT`必须是全新目录，默认使用UTC时间及PID创建独立结果路径。
+
+只执行一个场景用于调试时，其他41行明确保留NOT_RUN：
+
+```bash
+KVIP_OUTPUT=tests/results/debug-b32-m50 bash scripts/split_core_sim/customer.sh --case b32-h100-m50
+```
+
+直接Python入口支持`--suite smoke|customer`、`--group small|medium|large|all`、`--shards 1|4|8`、`--budget 28/56|32/64`。每行显式记录Q、T、预算、heads、名义/实际miss、warmup=0、iterations=1和driver SHA。`--warmup/--iterations`只用于native，不会让Model自动重复。
+
+脚本逐case保留FAILED并继续遍历，整轮存在失败时返回非零；不能只凭exit0标PASS，必须同时有唯一正常Model footer与完整local/global oracle、guard及输入未改检查。`compare.sh`也会保留其他配置的执行机会，最后汇总失败退出码；各配置结果分目录保存，不将252次冒充42次。
+
+同一仿真资源必须独占。默认使用`/tmp/kvip-cann91-simulator.lease`，不抢占旧锁；跨容器时应将同一个共享租约路径bind mount，并通过`KVIP_SIM_LEASE_FILE`（直接Python为`--lease-file`）指定。容器各自的`/tmp`不能互斥。不得并发执行smoke/customer/compare或其他Model实验。
+
+### 实测边界
+
+这里仅测**AIV-only精确TopK**，AIC工作数为0；不含QK、完整LI、Service或native transport，也不是生产P32/T8。BS24/32只扩展该组件的query任务轮转，未放宽当前生产streaming的BS16上限。
+
+每query整数miss依次为61/102/205/307/410/1024，实际百分比为`100m/2048`。受控重叠U=2m；50%对应每request唯一冷token2048，恰到当前LRU容量边界。这不代表任意客户50% miss都有相同重叠，也不表示prefetch预算足以覆盖全部miss。
 
 ## 当前流式main：真实设备入口
 
-仅供以后装有Torch NPU、KVAF服务和匹配CANN的设备使用；本轮没有运行此入口。`--soc`应填写目标设备实际值。`--q-workers`是Fetch worker，和TopK分片T不同。
+仅供以后装有Torch NPU、KVAF服务和匹配CANN的设备使用；本轮没有运行此入口。当前native完整streaming只支持BS≤16，选择BS24/32会在创建结果/fixture/租约前拒绝；不能用native的`--shards`声称启用T8。`--soc`应填写目标设备实际值。`--q-workers`是Fetch worker，和TopK分片T不同。
 
 ```bash
 python scripts/run_split_core_cases.py run --backend native --transport ubmem --soc Ascend950PR_9599 --server 127.0.0.1:28880 --group small --budget 32/64 --output tests/results/native-small
 python scripts/run_split_core_cases.py run --backend native --transport ubmem --soc Ascend950PR_9599 --server 127.0.0.1:28880 --group medium --budget 28/56 --output tests/results/native-medium
-python scripts/run_split_core_cases.py run --backend native --transport urma --soc Ascend950PR_9599 --server 127.0.0.1:28885 --group large --budget 28/56 --output tests/results/native-large
+python scripts/run_split_core_cases.py run --backend native --transport urma --soc Ascend950PR_9599 --server 127.0.0.1:28885 --group large --case b16-h100-m10 --budget 28/56 --output tests/results/native-large
 ```
+
+上面large示例仅选BS16/miss10%一项，其余17行保留NOT_RUN；当前native不能整组运行含BS24/32的新large清单。
 
 原有`test_lifetch.py`保留完整数值/Index/payload检查；结果必须生成本次checked-output.npz，父脚本另验shape、范围、唯一性与hash。依赖目录可用`--kvaf-root`、`--cann`显式指定。未运行的配置保持NOT_RUN；没有NPU时不能用CPU检查替代此验收。
 

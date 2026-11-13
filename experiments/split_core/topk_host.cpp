@@ -26,11 +26,15 @@ struct Memory {
 };
 int main(int argc,char** argv) {
     try {
+        if(argc==2 && std::string(argv[1])=="--capabilities") {
+            std::cout<<"{\"scope\":\"AIV-only TopK\",\"max_batch\":32,\"queries_per_request\":4,\"max_aiv_workers\":64}\n";
+            return 0;
+        }
         if(argc!=9)throw std::runtime_error("topk_sim SCORE.bin OUT.json B H VALID MISS SHARDS VCAP");
         std::string file=argv[1],out=argv[2];
         uint32_t b=std::stoul(argv[3]),h=std::stoul(argv[4]),valid=std::stoul(argv[5]),
             miss=std::stoul(argv[6]),s=std::stoul(argv[7]),vcap=std::stoul(argv[8]),q=4*b,k=2048;
-        if(!b||b>16||h%256||valid>h||!s||s>16||h/256/s*256<k||!vcap||vcap>64)
+        if(!b||b>32||h%256||valid>h||!s||s>16||h/256/s*256<k||!vcap||vcap>64)
             throw std::runtime_error("shape");
         auto seed=read<uint16_t>(file);if(seed.size()!=4*h)throw std::runtime_error("seed size");
         std::vector<uint16_t> input(size_t(q)*h);

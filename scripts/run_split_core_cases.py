@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan or execute the 60 BS/miss/sequence cases, retaining unrun rows explicitly."""
+"""Plan or execute the fixed128K/Q4 42-case smoke/customer matrix."""
 
 import argparse
 import contextlib
@@ -19,19 +19,27 @@ SUPPORT = ROOT / "tests/operators/lifetch/support"
 sys.path[:0] = [str(ROOT / "python"), str(SUPPORT)]
 
 
+MATRIX_VERSION = "128k-q4-v2"
+BATCHES = (1, 2, 4, 8, 16, 24, 32)
+MISSES = (3, 5, 10, 15, 20, 50)
+
+
 def cases(group="all"):
-    batches = {"small": (1, 2), "medium": (4, 8), "large": (16,), "all": (1, 2, 4, 8, 16)}[group]
-    for batch, percent, miss in itertools.product(batches, (30, 50, 100), (3, 5, 10, 15)):
-        valid = {30: 39322, 50: 65536, 100: 131072}[percent]
+    batches = {"small": (1, 2), "medium": (4, 8), "large": (16, 24, 32), "all": BATCHES}[group]
+    for batch, miss in itertools.product(batches, MISSES):
+        count = round(2048 * miss / 100)
         yield dict(
-            case=f"b{batch}-h{percent}-m{miss}",
+            case=f"b{batch}-h100-m{miss}",
             batch=batch,
-            history_percent=percent,
-            valid_history=valid,
-            history=(valid + 255) // 256 * 256,
+            queries_per_request=4,
+            total_queries=4 * batch,
+            history_percent=100,
+            valid_history=131072,
+            history=131072,
             resident=16384,
             miss_percent=miss,
-            miss_per_query=round(2048 * miss / 100),
+            miss_per_query=count,
+            actual_miss_percent=100 * count / 2048,
         )
 
 
@@ -76,8 +84,10 @@ def prepare(case, directory, heads):
 
 
 @contextlib.contextmanager
-def lease(backend, device):
-    path = Path("/tmp/kvip-cann91-simulator.lease" if backend == "model" else f"/tmp/kvip-npu-{device}.lease")
+def lease(backend, device, lease_file=None):
+    path = Path(
+        lease_file or ("/tmp/kvip-cann91-simulator.lease" if backend == "model" else f"/tmp/kvip-npu-{device}.lease")
+    )
     owner = dict(task="split-core-matrix", pid=os.getpid(), lease=uuid.uuid4().hex)
     fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     with os.fdopen(fd, "w") as f:
@@ -89,9 +99,39 @@ def lease(backend, device):
             path.unlink()
 
 
+def driver_capabilities(driver):
+    # This metadata query does not call ACL. Avoid Model preload constructors;
+    # some SDKs still print loader notices, so require one capability JSON row.
+    env = dict(os.environ)
+    env.pop("LD_PRELOAD", None)
+    result = subprocess.run(
+        [str(driver.resolve()), "--capabilities"], check=True, text=True, capture_output=True, timeout=30, env=env
+    )
+    candidates = []
+    for line in result.stdout.splitlines():
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict) and value.get("scope") == "AIV-only TopK":
+            candidates.append(value)
+    if len(candidates) != 1:
+        raise ValueError("expected exactly one TopK capability JSON record")
+    return candidates[0]
+
+
 def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     p.add_argument("action", choices=("plan", "cpu", "run"))
+    p.add_argument(
+        "--suite",
+        choices=("smoke", "customer"),
+        default="customer",
+        help="Both suites cover all 42 cases; no silent smoke subset",
+    )
+    p.add_argument(
+        "--lease-file", type=Path, help="Shared exclusive lease path; mount the same path across Model containers"
+    )
     p.add_argument("--group", choices=("all", "small", "medium", "large"), default="all")
     p.add_argument("--backend", choices=("model", "native"), default="model")
     p.add_argument("--transport", choices=("urma", "ubmem"), default="ubmem")
@@ -108,8 +148,8 @@ def main(argv=None):
     p.add_argument("--case", action="append", help="Execute only named rows; other planned rows remain NOT_RUN")
     p.add_argument("--device", type=int, default=0)
     p.add_argument("--server", default="127.0.0.1:28880")
-    p.add_argument("--warmup", type=int, default=4)
-    p.add_argument("--iterations", type=int, default=20)
+    p.add_argument("--warmup", type=int, default=4, help="Native only; Model runs once without warmup")
+    p.add_argument("--iterations", type=int, default=20, help="Native only; Model runs once per condition")
     p.add_argument("--timeout", type=int, default=10800)
     p.add_argument("--output", type=Path, required=True)
     a = p.parse_args(argv)
@@ -123,11 +163,32 @@ def main(argv=None):
         p.error("Native execution requires the actual --soc")
     if a.case and not set(a.case) <= {x["case"] for x in cases(a.group)}:
         p.error("Unknown case in the selected group")
+    selected = [x for x in cases(a.group) if not a.case or x["case"] in a.case]
+    if a.action == "run" and a.backend == "native" and any(x["batch"] > 16 for x in selected):
+        p.error(
+            "BS24/32 are TopK component Model only; current native streaming supports BS1..16. Select supported --case or --group."
+        )
+    capabilities = None
+    if a.action == "run" and a.backend == "model":
+        try:
+            capabilities = driver_capabilities(a.model_driver)
+            assert capabilities["queries_per_request"] == 4
+            assert capabilities["max_batch"] >= max(x["batch"] for x in selected)
+            assert capabilities["scope"] == "AIV-only TopK"
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, AssertionError) as error:
+            p.error(f"Model driver capability check failed; rebuild current csrc/operators/split_topk target: {error}")
     a.output.mkdir(parents=True, exist_ok=False)
     c, v = map(int, a.budget.split("/"))
     rows = [
         {
             **x,
+            "suite": a.suite,
+            "matrix_version": MATRIX_VERSION,
+            "topk_shards": a.shards if a.backend == "model" else None,
+            "q_workers": a.q_workers if a.backend == "native" else None,
+            "warmup": 0 if a.backend == "model" else a.warmup,
+            "iterations": 1 if a.backend == "model" else a.iterations,
+            "aic_workers": 0 if a.backend == "model" else None,
             "aic_budget": c,
             "aiv_budget": v,
             "heads": a.heads,
@@ -158,21 +219,32 @@ def main(argv=None):
             subprocess.check_output(["git", "-c", "safe.directory=" + str(ROOT), "-C", str(ROOT), "diff", "HEAD"])
         ).hexdigest(),
         script_sha256=sha(__file__),
+        matrix_version=MATRIX_VERSION,
+        suite=a.suite,
+        topk_shards=a.shards if a.backend == "model" else None,
+        model_driver_capabilities=capabilities,
         physical_npu=a.backend == "native" and a.action == "run",
     )
     (a.output / "source.json").write_text(json.dumps(identity, indent=2) + "\n")
     cache = {}
-    manager = lease(a.backend, a.device) if a.action == "run" else contextlib.nullcontext()
+    manager = lease(a.backend, a.device, a.lease_file) if a.action == "run" else contextlib.nullcontext()
     failed = False
     with manager:
         for row in rows:
             if a.case and row["case"] not in a.case:
                 continue
             key = (row["history"], row["miss_percent"], a.heads)
-            if key not in cache:
-                folder = a.output / f"fixture-h{row['history_percent']}-m{row['miss_percent']}"
-                cache[key] = (folder, prepare(row, folder, a.heads))
-            folder, proof = cache[key]
+            try:
+                if key not in cache:
+                    folder = a.output / f"fixture-h{row['history_percent']}-m{row['miss_percent']}"
+                    cache[key] = (folder, prepare(row, folder, a.heads))
+                folder, proof = cache[key]
+            except Exception as error:
+                row["status"] = "FAILED"
+                row["error"] = f"fixture preparation: {error}"
+                failed = True
+                save()
+                continue
             row["fixture_proof"] = proof
             row["status"] = "PASSED_CPU"
             if a.action == "run":
@@ -264,6 +336,13 @@ def main(argv=None):
                         assert len(ticks) == 1 and "Model stopped successfully." in text
                         oracle = json.loads((run / "oracle.json").read_text())
                         assert oracle["status"] == "passed" and oracle["guards"]
+                        assert oracle["batch"] == row["batch"] and oracle["shards"] == a.shards
+                        assert oracle["history"] == row["history"] and oracle["valid"] == row["valid_history"]
+                        assert oracle["aiv_budget"] == v and oracle["aic_workers"] == 0
+                        assert oracle["miss_per_query"] == row["miss_per_query"]
+                        assert all(
+                            oracle[k] for k in ("selected_set_and_scores", "all_local_candidates", "input_unchanged")
+                        )
                         row["metric"] = int(ticks[0])
                         row["status"] = "PASSED_MODEL"
                     else:

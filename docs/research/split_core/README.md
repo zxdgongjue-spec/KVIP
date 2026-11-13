@@ -11,11 +11,17 @@
 
 **接入边界：**共享TopK模块是显式研究入口，尚未替换新main的Final classification/publication。当前生产入口保留新main条件化P2、每query完整选择T1；旧P32/T8 score-only原型没有被伪装成完整生产预取路径。今后接入T4/T8须保留locations、query bitmap/error发布和general fallback；恢复P32的resident阈值、Service及graph数据准备仍待实现。
 
-## 用例与验证
+## 当前42组用例（2026-11-13更新）
 
-[执行脚本与完整命令](../../../experiments/split_core/README.md)覆盖60个基础场景：BS1/2/4/8/16 × miss3/5/10/15% × sequence30/50/100%。small/medium/large分别24/24/12组。两档预算、G32/G64、算法和重复次数是额外维度。
+固定**sequence128K（131072）、Q4**；BS=1/2/4/8/16/24/32 × miss目标3/5/10/15/20/50%，共42组。small/medium/large为12/12/18组。冒烟与客户入口均遍历完整42组，不自动删减。执行方式见[仿真脚本与命令](../../../experiments/split_core/README.md)，清单见[cases.json](../../../scripts/split_core_sim/cases.json)。
 
-生成器修改真实FP8特征，逐query精确miss为61/102/205/307；当前受控重叠U=2m。30%有效长度39322与存储39424分开，native与fused使用同一可见上界。CPU60组已验证，G32/G64另有24组独立真实FP8解码、BF16与padding回归。
+`scripts/generate_split_core_sim.py`生成`smoke.sh`、`customer.sh`与可选`compare.sh`；默认T1/V56/G32，策略/预算对照为42×3×2=252条件。TopK host上限扩到BS32并提供capability检查，BS24/32不代表当前native完整streaming支持。
+
+名义miss3/5/10/15/20/50%对应每query整数61/102/205/307/410/1024。20%实际20.01953125%，50%准确50%；当前受控重叠U=2m，50%时U2048触及LRU容量边界。新矩阵42组CPU已通过，CANN新driver已编译并核对BS32/Q4能力；完整42组Model及新增BS24/32的kernel执行尚未运行。见`results/customer-v2-validation.json`与42行NOT_RUN的`customer-v2-model-plan.json`；旧结果不迁移为新矩阵通过。
+
+## 旧矩阵验证归档
+
+以下组件结果及`results/current-model-matrix.json`、`results/cpu-matrix.json`来自先前60组矩阵（BS≤16、history30/50/100%、miss≤15%），保留原版本与状态。它们不是新42组的完成记录。
 
 当前核心新增的Model组件观测如下；均有正常footer、local/global oracle、输入未改及guard检查，单次、无预热：
 

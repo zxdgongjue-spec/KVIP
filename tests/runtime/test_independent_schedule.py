@@ -59,10 +59,10 @@ def test_case_groups_and_unrun_status(tmp_path):
     spec = importlib.util.spec_from_file_location("split_cases", ROOT / "scripts/run_split_core_cases.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    assert [len(list(module.cases(g))) for g in ("small", "medium", "large", "all")] == [24, 24, 12, 60]
+    assert [len(list(module.cases(g))) for g in ("small", "medium", "large", "all")] == [12, 12, 18, 42]
     assert module.main(["plan", "--output", str(tmp_path / "plan")]) == 0
     rows = json.loads((tmp_path / "plan/results.json").read_text())
-    assert len({r["case"] for r in rows}) == 60
+    assert len({r["case"] for r in rows}) == 42
     assert all(r["status"] == "NOT_RUN" and r["metric"] is None for r in rows)
 
 
