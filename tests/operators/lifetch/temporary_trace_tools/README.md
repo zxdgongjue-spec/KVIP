@@ -84,3 +84,14 @@ python tests/operators/lifetch/support/calibration.py \
 6. **验证生成器**：实际运行LI，比较每Q/去重miss、Q交集、cutoff/ties、每窗口posted/unused/final、读放大及跨轮保留率。展示p10/p50/p90和窗口曲线，验收偏差阈值依据真实样本方差确定。
 
 工具没有修改当前生成器或任何kernel；实际历史数据应留在服务器，不提交仓库。
+
+
+## 第一轮：Q/Index 数值与相关性统计
+
+```bash
+python tests/operators/lifetch/temporary_trace_tools/profile_inputs.py   /tmp/lifetch-old-converted-v2 --output /tmp/lifetch-input-profile-v1
+```
+
+CPU执行，无训练、无NPU依赖。需要numpy和支持float8_e4m3fn的PyTorch。固定seed、每份输入抽样8192个Index向量及至多8192个标量，结果可复现；Q统计过滤padding并使用unpack_indices。Index先按物理池抽样，单列零向量比例及非零向量统计，不将“非零”误认为有效hot。输出profile.json（聚合统计）、layouts.json（布局元信息）、summary.log（回传日志及完整参数块），没有原始Q/Index值。
+
+本轮先据真实数值、scale和相关性选择生成器结构；分数重建、完整Q/Index联合模型及连续轮身份核验尚未在此脚本实现。summary末尾保留完整参数精度以供复制拟合，前面可读表格使用两位小数。

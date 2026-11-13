@@ -64,3 +64,27 @@ def test_padding_owners_and_topk_are_not_requests():
     assert [r['row'] for r in rows] == [0,2]
     assert [r['active_queries'] for r in rows] == [4,1]
     assert all(r['selected_unique'] == 2048 for r in rows)
+
+
+def test_input_profile_decodes_bf16_and_excludes_padding(tmp_path):
+    from profile_inputs import profile, decode
+    value=np.array([0x80,0x3f],dtype=np.uint8)
+    np.testing.assert_array_equal(decode(value,dict(original_dtype='torch.bfloat16',encoding='raw_bytes'),'weights'),[1.])
+    source=tmp_path/'pid1-sample0000.pt'
+    query=torch.zeros(8,2,128,dtype=torch.uint8)
+    query[:4]=0x38  # e4m3fn 1.0; padding zeros must not dilute Q statistics.
+    torch.save(dict(metadata=dict(schema=1,sample=0),before=dict(
+        row_owners=torch.tensor([0,-1]),logical_ids=torch.arange(4096).reshape(1,-1),
+        hot_valid=torch.ones(1,2048,dtype=torch.uint8),query_valid=torch.tensor([1,1,1,1,0,0,0,0]),
+        unpack_indices=torch.arange(8),query=query,keys=torch.full((4096,128),0x38,dtype=torch.uint8),
+        weights=torch.ones(8,2,dtype=torch.bfloat16),query_scale=torch.ones(8,2),key_scale=torch.ones(4096)),
+        after=dict(logical_topk=torch.arange(2048,dtype=torch.int32).repeat(2,4,1))),source)
+    root=tmp_path/'converted'
+    convert(source,root/'capture-00000')
+    (root/'index.json').write_text(json.dumps(dict(status='COMPLETE',captures=[dict(bundle='capture-00000')])))
+    result=profile(root,samples=16)
+    assert result['active_requests']==1
+    assert result['scalar']['query']['mean']==1.
+    np.testing.assert_allclose(result['q_cosine_mean'],np.ones((4,4)))
+    assert result['cold_rate']['mean']==0.
+    assert result==profile(root,samples=16)
