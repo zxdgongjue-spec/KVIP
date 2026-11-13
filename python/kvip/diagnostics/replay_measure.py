@@ -566,6 +566,22 @@ def release_context(context):
 def study_cases(args):
     """Keep each study's baseline explicit when production defaults advance."""
     study = getattr(args, "study", "threshold")
+    if study == "overlap-victims":
+        return {
+            name: dict(
+                recent_threshold=True,
+                recent_pipeline=True,
+                recent_unified_topk=True,
+                recent_skip=False,
+                recent_threshold_only=True,
+                recent_profile=False,
+                recent_seed_ub=False,
+                recent_local_victims=True,
+                recent_register_kth=True,
+                recent_overlap_victims=overlap,
+            )
+            for name, overlap in (("overlap", True), ("register", False))
+        }
     if study == "register-kth":
         # Measure the candidate first, then the established baseline, in one arena.
         return {
@@ -671,6 +687,7 @@ def run(args, archive, retained):
         "seed-ub",
         "local-victims",
         "register-kth",
+        "overlap-victims",
     )
     if args.mode == "fused" and (args.threshold_policy == "both" or execution_study):
         cases = {}

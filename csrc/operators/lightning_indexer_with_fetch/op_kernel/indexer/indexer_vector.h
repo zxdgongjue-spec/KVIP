@@ -48,6 +48,16 @@
 #if KVIP_RECENT_THRESHOLD_ONLY != 0 && KVIP_RECENT_THRESHOLD_ONLY != 1
 #error "KVIP_RECENT_THRESHOLD_ONLY must be 0 or 1"
 #endif
+#ifndef KVIP_RECENT_OVERLAP_VICTIMS
+#define KVIP_RECENT_OVERLAP_VICTIMS 0
+#endif
+#if KVIP_RECENT_OVERLAP_VICTIMS != 0 && KVIP_RECENT_OVERLAP_VICTIMS != 1
+#error "KVIP_RECENT_OVERLAP_VICTIMS must be 0 or 1"
+#endif
+#if KVIP_RECENT_OVERLAP_VICTIMS && !(defined(V9_UBMEM) && V9_UBMEM) && \
+    (!KVIP_RECENT_REGISTER_KTH || !KVIP_RECENT_LOCAL_VICTIMS || !KVIP_RECENT_THRESHOLD_ONLY)
+#error "KVIP_RECENT_OVERLAP_VICTIMS requires register Kth, local victims and threshold-only"
+#endif
 #ifndef KVIP_RECENT_UNIFIED_TOPK
 #define KVIP_RECENT_UNIFIED_TOPK 1
 #endif
@@ -223,6 +233,9 @@ private:
 #endif
     GM_ADDR prefixOutput_ = nullptr;
     bool prefixActive_ = false;
+#if KVIP_RECENT_OVERLAP_VICTIMS && !(defined(V9_UBMEM) && V9_UBMEM)
+    uint32_t residentVictimsQuery_ = UINT32_MAX;
+#endif
     TBuf<TPosition::VECCALC> classifyBuf_;
     LocalTensor<uint16_t> classifyUB_;
     TBuf<TPosition::VECCALC> prefixThresholdBuf_;
@@ -230,6 +243,9 @@ private:
     __aicore__ inline bool TryUnifiedResidentTopK(uint32_t query, uint32_t scoreRow,
                                                 uint32_t residentCount, uint32_t availableEnd,
                                                 bool thresholdOnly = false) {
+#if KVIP_RECENT_OVERLAP_VICTIMS && !(defined(V9_UBMEM) && V9_UBMEM)
+        residentVictimsQuery_ = UINT32_MAX;
+#endif
 #if KVIP_RECENT_UNIFIED_TOPK || KVIP_RECENT_THRESHOLD_ONLY
 #if !KVIP_RECENT_UNIFIED_TOPK
         if (!thresholdOnly) return false;
@@ -289,6 +305,22 @@ private:
             WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
 #if KVIP_RECENT_THRESHOLD_ONLY
             if (thresholdOnly) {
+#if KVIP_RECENT_OVERLAP_VICTIMS && !(defined(V9_UBMEM) && V9_UBMEM)
+                // Scores are already ready. Only the register selector leaves
+                // TopK scratch [4KiB,12KiB) unused, so this independent MTE2
+                // can overlap Kth on Vector. The four-VF fallback aliases it.
+                // The direct-score/seed-UB path above conservatively opts out.
+                if (ctx->lruSlots && end >= runtimeShape_.resident &&
+                    topkOp_.CanRegisterThreshold(aligned) &&
+                    kvip_recent_index::UseLocalVictims(true, runtimeShape_.resident,
+                                                      residentCount, availableEnd)) {
+                    GlobalTensor<uint32_t> victims;
+                    victims.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots) +
+                                            (query / SIM_Q) * 2048);
+                    DataCopy(topkSharedTmpLocal_[1024], victims, 2048);
+                    residentVictimsQuery_ = query;
+                }
+#endif
                 topkOp_.Threshold(mrgValueLocal_, prefixThreshold_[(query % 2) * 128], aligned);
                 return true;
             }
@@ -426,6 +458,10 @@ private:
     __aicore__ inline void SaveResident(uint32_t query, uint32_t scoreRow, bool publishProgress,
                                       uint32_t availableEnd, bool recentMerged = false,
                                       bool thresholdReady = false) {
+#if KVIP_RECENT_OVERLAP_VICTIMS && !(defined(V9_UBMEM) && V9_UBMEM)
+        const bool victimsQueued = thresholdReady && residentVictimsQuery_ == query;
+        residentVictimsQuery_ = UINT32_MAX; // Consume once, including empty/fallback queries.
+#endif
         if (!thresholdReady) {
             if (!recentMerged) MergeRecentScores(query, scoreRow, availableEnd);
             auto src = (__local_mem__ uint16_t *)scoreOutLocal_.GetPhyAddr();
@@ -486,7 +522,10 @@ private:
                 SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
                 WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
             }
-            DataCopy(reservedChunk.template ReinterpretCast<uint32_t>(), victims, 2048);
+#if KVIP_RECENT_OVERLAP_VICTIMS && !(defined(V9_UBMEM) && V9_UBMEM)
+            if (!victimsQueued)
+#endif
+                DataCopy(reservedChunk.template ReinterpretCast<uint32_t>(), victims, 2048);
             SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
 #if KVIP_RECENT_LOCAL_VICTIMS && !(defined(V9_UBMEM) && V9_UBMEM)
             if (kvip_recent_index::UseLocalVictims(thresholdReady,

@@ -22,7 +22,16 @@ def arguments(argv=None):
     p.add_argument("--threshold-policy", choices=("resident", "recent", "both"), default="resident")
     p.add_argument(
         "--study",
-        choices=("threshold", "pipeline", "skip", "threshold-only", "seed-ub", "local-victims", "register-kth"),
+        choices=(
+            "threshold",
+            "pipeline",
+            "skip",
+            "threshold-only",
+            "seed-ub",
+            "local-victims",
+            "register-kth",
+            "overlap-victims",
+        ),
         default="threshold",
     )
     p.add_argument("--upstream-root", type=Path, help="Use production modules from this exact clean checkout")
@@ -54,11 +63,11 @@ def arguments(argv=None):
         p.error("upstream-root and upstream-revision must be supplied together")
     if args.upstream_root and (args.study != "threshold" or args.threshold_policy != "resident"):
         p.error("Exact upstream replay requires study=threshold and threshold-policy=resident")
-    if args.study in ("threshold-only", "seed-ub", "local-victims", "register-kth") and (
+    if args.study in ("threshold-only", "seed-ub", "local-victims", "register-kth", "overlap-victims") and (
         args.transport != "urma" or args.mode != "fused"
     ):
         p.error(f"study={args.study} requires URMA fused replay")
-    if args.study in ("seed-ub", "local-victims", "register-kth") and args.diagnostic_replays:
+    if args.study in ("seed-ub", "local-victims", "register-kth", "overlap-victims") and args.diagnostic_replays:
         p.error(f"study={args.study} excludes instrumented diagnostic replays")
     args.fused_tuning = {"recent_threshold": args.threshold_policy == "recent"}
     return args

@@ -60,6 +60,7 @@ def build_libraries(
     recent_profile=True,
     recent_local_victims=False,
     recent_register_kth=False,
+    recent_overlap_victims=False,
 ):
     """Build one shape-independent binary per source/toolchain/SoC."""
     root = Path(__file__).resolve().parents[3] / "csrc/operators"
@@ -89,6 +90,11 @@ def build_libraries(
     if recent_register_kth and not recent_threshold_only:
         raise ValueError("Recent register-Kth requires threshold-only selection")
     options["KVIP_RECENT_REGISTER_KTH"] = int(recent_register_kth)
+    if type(recent_overlap_victims) is not bool:
+        raise ValueError("Recent overlap-victims option must be boolean")
+    if recent_overlap_victims and not (recent_threshold_only and recent_register_kth and recent_local_victims):
+        raise ValueError("Recent overlap-victims requires threshold-only, register-Kth and local-victims")
+    options["KVIP_RECENT_OVERLAP_VICTIMS"] = int(recent_overlap_victims)
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     for relative in (
         "version.info",

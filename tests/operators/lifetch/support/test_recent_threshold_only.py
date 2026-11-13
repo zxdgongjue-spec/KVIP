@@ -17,6 +17,7 @@ def threshold_model_source():
     topk = (INDEXER / "topk.h").read_text()
     loader = function(vector, "    __aicore__ inline bool TryUnifiedResidentTopK(")
     select = function(topk, "    __aicore__ inline void Threshold(")
+    eligible = function(topk, "    __aicore__ inline bool CanRegisterThreshold(")
     return (
         r"""
 #include <algorithm>
@@ -91,6 +92,7 @@ struct TopK {
  LocalTensor<uint32_t> histogramsLocal{scratch.data(),256},idxHighLocal{scratch.data()+256,256},idxLowLocal{scratch.data()+512,256};
  void operator()(Tensor<uint16_t>,Tensor<uint32_t>,Tensor<uint16_t>,unsigned,unsigned,unsigned,bool){++calls;assert(false);}
 """
+        + eligible
         + select
         + r"""
 };

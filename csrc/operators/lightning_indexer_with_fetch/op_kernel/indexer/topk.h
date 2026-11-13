@@ -167,12 +167,21 @@ public:
     // threshold is one 256-byte query bank, also used for the intermediate
     // rank by FindHighTargetBinVFImpl. FindKthVFImpl leaves its uint16 key at
     // the same address/layout consumed by the existing predicate broadcasts.
+    __aicore__ inline bool CanRegisterThreshold(uint32_t validLen) const
+    {
+#if KVIP_RECENT_REGISTER_KTH && !(defined(V9_UBMEM) && V9_UBMEM)
+        return topK && validLen >= topK && validLen <= 18432 && validLen % 256 == 0;
+#else
+        return false;
+#endif
+    }
+
     __aicore__ inline void Threshold(const LocalTensor<uint16_t>& input,
                                      const LocalTensor<uint16_t>& threshold,
                                      uint32_t validLen)
     {
 #if KVIP_RECENT_REGISTER_KTH && !(defined(V9_UBMEM) && V9_UBMEM)
-        if (topK && validLen >= topK && validLen <= 18432 && validLen % 256 == 0) {
+        if (CanRegisterThreshold(validLen)) {
             kvip_recent_threshold::RegisterThreshold(
                 reinterpret_cast<__ubuf__ uint16_t*>(input.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint16_t*>(threshold.GetPhyAddr()),

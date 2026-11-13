@@ -36,6 +36,7 @@ def arguments(argv=None):
             "seed-ub",
             "local-victims",
             "register-kth",
+            "overlap-victims",
         ),
         default="threshold",
     )
@@ -60,7 +61,7 @@ def arguments(argv=None):
         p.error("Invalid device, warmup, iterations or workers")
     if args.result_dir.exists():
         p.error("result-dir already exists; choose a new directory")
-    if args.study in ("upstream", "threshold-only", "seed-ub", "local-victims", "register-kth"):
+    if args.study in ("upstream", "threshold-only", "seed-ub", "local-victims", "register-kth", "overlap-victims"):
         if not args.upstream_root or not args.upstream_revision:
             p.error("This study requires upstream-root and upstream-revision")
         from kvip.diagnostics.upstream import validate_checkout
@@ -71,9 +72,12 @@ def arguments(argv=None):
             p.error(str(error))
     elif args.upstream_root or args.upstream_revision:
         p.error("upstream-root/revision require a study with an exact upstream reference")
-    if args.study in ("threshold-only", "seed-ub", "local-victims", "register-kth") and args.transports != "urma":
+    if (
+        args.study in ("threshold-only", "seed-ub", "local-victims", "register-kth", "overlap-victims")
+        and args.transports != "urma"
+    ):
         p.error(f"study={args.study} requires --transports urma")
-    if args.study in ("seed-ub", "local-victims", "register-kth") and args.diagnostic_replays:
+    if args.study in ("seed-ub", "local-victims", "register-kth", "overlap-victims") and args.diagnostic_replays:
         p.error(f"study={args.study} excludes instrumented diagnostic replays")
     for root, object_name in ((args.build_dir, "kvaf_execute_batch_get_kernels.o"),):
         if root is not None and not (root / "bin" / object_name).is_file():
@@ -101,7 +105,7 @@ def read_means(result):
 
 def display_name(name, study):
     """Keep saved result keys stable while spelling out the actual algorithms."""
-    if study in ("upstream", "threshold-only", "seed-ub", "local-victims", "register-kth"):
+    if study in ("upstream", "threshold-only", "seed-ub", "local-victims", "register-kth", "overlap-victims"):
         for suffix, label in (
             ("upstream-serial", "main-serial"),
             ("upstream-fused", "main-resident"),
@@ -110,6 +114,7 @@ def display_name(name, study):
             ("recent-seed", "seed-ub"),
             ("recent-local", "local-victims"),
             ("recent-register", "register-kth"),
+            ("recent-overlap", "overlap-victims"),
             ("recent-before", "recent-recompute"),
             ("recent-after", "recent-kth-only" if study == "threshold-only" else "recent-score-replay"),
         ):
@@ -152,7 +157,10 @@ def timing_comparisons(table, transport, study):
     def key(suffix):
         return f"{transport}-{suffix}"
 
-    if study == "register-kth":
+    if study == "overlap-victims":
+        pairs = [("overlap_victims", "recent-register", "recent-overlap", "step")]
+        pairs += [(name, "upstream-fused", f"recent-{name}", "main") for name in ("register", "overlap")]
+    elif study == "register-kth":
         pairs = [("register_kth", "recent-local", "recent-register", "step")]
         pairs += [(name, "upstream-fused", f"recent-{name}", "main") for name in ("local", "register")]
     elif study == "local-victims":
@@ -227,6 +235,7 @@ def summarize_execution_study(table, transport, study):
         "seed-ub": (("current", "release", "seed"), ("recent_profile", "recent_seed_ub")),
         "local-victims": (("release", "local"), ("recent_local_victims",)),
         "register-kth": (("local", "register"), ("recent_register_kth",)),
+        "overlap-victims": (("register", "overlap"), ("recent_overlap_victims",)),
     }[study]
     expected_keys = {main_key, *(f"{transport}-recent-{name}" for name in names)}
     if set(table) != expected_keys:
@@ -281,6 +290,11 @@ def summarize_execution_study(table, transport, study):
             seed_reuse_reduction_pct=reduction(variants["release"]["mean_us"], variants["seed"]["mean_us"]),
             traffic_main_to_seed=traffic_change(main["reads"], variants["seed"]["reads"]),
         )
+    elif study == "overlap-victims":
+        result.update(
+            overlap_victims_reduction_pct=reduction(current["mean_us"], variants["overlap"]["mean_us"]),
+            traffic_main_to_overlap=traffic_change(main["reads"], variants["overlap"]["reads"]),
+        )
     elif study == "register-kth":
         result.update(
             register_kth_reduction_pct=reduction(current["mean_us"], variants["register"]["mean_us"]),
@@ -330,13 +344,14 @@ def summarize(results, study="threshold"):
     effects = {}
     for transport in (value for value in ("urma", "ubmem") if any(key.startswith(value + "-") for key in table)):
         best = transport + "-serial"
-        if study in ("seed-ub", "local-victims", "register-kth"):
+        if study in ("seed-ub", "local-victims", "register-kth", "overlap-victims"):
             effects[transport] = summarize_execution_study(table, transport, study)
             continue
         if study in ("skip", "upstream", "threshold-only"):
             prefix = (
                 "recent"
-                if study in ("upstream", "threshold-only", "seed-ub", "local-victims", "register-kth")
+                if study
+                in ("upstream", "threshold-only", "seed-ub", "local-victims", "register-kth", "overlap-victims")
                 else "fused"
             )
             before, after = (table[f"{transport}-{prefix}-{name}"] for name in ("before", "after"))
@@ -364,7 +379,7 @@ def summarize(results, study="threshold"):
                 raise ValueError("Skip A/B changed the final selection")
             if any(before["threshold"][key] != after["threshold"][key] for key in ("initial_keys", "final_keys")):
                 raise ValueError("Skip A/B changed the threshold")
-            if study in ("upstream", "threshold-only", "seed-ub", "local-victims", "register-kth"):
+            if study in ("upstream", "threshold-only", "seed-ub", "local-victims", "register-kth", "overlap-victims"):
                 best = transport + "-upstream-serial"
                 main = table[transport + "-upstream-fused"]
                 for reference in (table[best], main):
@@ -391,7 +406,7 @@ def summarize(results, study="threshold"):
                     skip_reduction_pct=effects[transport]["optimization_reduction_pct"],
                     skip_vs_serial_reduction_pct=effects[transport]["optimization_vs_serial_reduction_pct"],
                 )
-            if study in ("upstream", "threshold-only", "seed-ub", "local-victims", "register-kth"):
+            if study in ("upstream", "threshold-only", "seed-ub", "local-victims", "register-kth", "overlap-victims"):
                 effects[transport].update(
                     upstream_revision=main["production_source"]["commit"],
                     traffic_main_to_before=traffic_change(main["reads"], before["reads"]),
@@ -434,8 +449,9 @@ def summarize(results, study="threshold"):
     for transport, effect in effects.items():
         effect["timing_comparisons"] = timing_comparisons(table, transport, study)
     execution_order = list(results)
-    if study == "register-kth":
-        table = {key: table[key] for key in ("urma-upstream-fused", "urma-recent-local", "urma-recent-register")}
+    if study in ("register-kth", "overlap-victims"):
+        names = ("local", "register") if study == "register-kth" else ("register", "overlap")
+        table = {key: table[key] for key in ("urma-upstream-fused", *(f"urma-recent-{name}" for name in names))}
     return dict(
         status="pass",
         study=study,
@@ -490,7 +506,7 @@ def print_summary(summary):
             f"payload_efficiency={efficiency_text} hardware_utilization=N/A",
             flush=True,
         )
-    if summary.get("study") == "register-kth":
+    if summary.get("study") in ("register-kth", "overlap-victims"):
         print(
             "EXECUTION_ORDER " + " -> ".join(display_name(key, summary["study"]) for key in summary["execution_order"]),
             flush=True,
@@ -500,8 +516,13 @@ def print_summary(summary):
         flush=True,
     )
     for transport, effect in summary["effects"].items():
-        if summary.get("study") in ("seed-ub", "local-victims", "register-kth"):
-            candidate = {"seed-ub": "seed", "local-victims": "local", "register-kth": "register"}[summary["study"]]
+        if summary.get("study") in ("seed-ub", "local-victims", "register-kth", "overlap-victims"):
+            candidate = {
+                "seed-ub": "seed",
+                "local-victims": "local",
+                "register-kth": "register",
+                "overlap-victims": "overlap",
+            }[summary["study"]]
             if prediction := effect.get("seed_ub_eligibility"):
                 print(
                     f"SEED_UB_ELIGIBILITY predicted={prediction['predicted_eligible_queries']}/{prediction['total_queries']} "
@@ -534,7 +555,14 @@ def print_summary(summary):
                 flush=True,
             )
             continue
-        if summary.get("study") in ("upstream", "threshold-only", "seed-ub", "local-victims", "register-kth"):
+        if summary.get("study") in (
+            "upstream",
+            "threshold-only",
+            "seed-ub",
+            "local-victims",
+            "register-kth",
+            "overlap-victims",
+        ):
             main, recent = (
                 summary["table"][f"{transport}-{name}"]["threshold"] for name in ("upstream-fused", "recent-after")
             )
@@ -604,9 +632,10 @@ def run(args):
         for transport in transports
         for mode, reference in (
             (("fused", True), ("fused", False))
-            if args.study in ("seed-ub", "local-victims", "register-kth")
+            if args.study in ("seed-ub", "local-victims", "register-kth", "overlap-victims")
             else (("serial", True), ("fused", True), ("fused", False))
-            if args.study in ("upstream", "threshold-only", "seed-ub", "local-victims", "register-kth")
+            if args.study
+            in ("upstream", "threshold-only", "seed-ub", "local-victims", "register-kth", "overlap-victims")
             else (("serial", False), ("fused", False))
         )
     ]
@@ -615,7 +644,8 @@ def run(args):
             "upstream-"
             if reference
             else "recent-"
-            if args.study in ("upstream", "threshold-only", "seed-ub", "local-victims", "register-kth")
+            if args.study
+            in ("upstream", "threshold-only", "seed-ub", "local-victims", "register-kth", "overlap-victims")
             else ""
         )
         name = f"{transport}-{prefix}{mode}"
@@ -673,6 +703,7 @@ def run(args):
                     "seed-ub": " current-kth/release-kth/seed-ub share DDR",
                     "local-victims": " release-kth/local-victims share DDR",
                     "register-kth": " register-kth then local-victims share DDR",
+                    "overlap-victims": " overlap-victims then register-kth share DDR",
                 }[args.study]
                 if paired
                 else f" workers={args.serial_workers}" + (" post=128 inflight=2048" if transport == "urma" else "")
@@ -699,13 +730,15 @@ def run(args):
             raise SystemExit(1)
         report = json.loads(output.read_text())
         if paired:
-            if args.study == "register-kth" and (
-                report.get("execution_order") != ["register", "local"] or list(report["cases"]) != ["register", "local"]
-            ):
-                raise ValueError("register-kth must execute candidate before local-victims in the shared arena")
+            if args.study in ("register-kth", "overlap-victims"):
+                order = ["register", "local"] if args.study == "register-kth" else ["overlap", "register"]
+                if report.get("execution_order") != order or list(report["cases"]) != order:
+                    baseline = "local-victims" if args.study == "register-kth" else "register-kth"
+                    raise ValueError(f"{args.study} must execute candidate before {baseline} in the shared arena")
             case_prefix = (
                 f"{transport}-recent"
-                if args.study in ("upstream", "threshold-only", "seed-ub", "local-victims", "register-kth")
+                if args.study
+                in ("upstream", "threshold-only", "seed-ub", "local-victims", "register-kth", "overlap-victims")
                 else name
             )
             results.update({f"{case_prefix}-{key}": value for key, value in report["cases"].items()})

@@ -21,6 +21,7 @@ def validate_fused_tuning(value, transport):
         "recent_profile",
         "recent_local_victims",
         "recent_register_kth",
+        "recent_overlap_victims",
     }:
         raise ValueError("Only recent-threshold seed options are changed in this production A/B comparison")
     if any(type(flag) is not bool for flag in value.values()):
@@ -31,6 +32,13 @@ def validate_fused_tuning(value, transport):
         raise ValueError("recent_seed_ub/recent_profile are supported only by URMA")
     if transport != "urma" and value.get("recent_local_victims"):
         raise ValueError("recent_local_victims is supported only by URMA")
+    if value.get("recent_overlap_victims"):
+        if transport != "urma":
+            raise ValueError("recent_overlap_victims is supported only by URMA")
+        if not all(value.get(key) for key in ("recent_register_kth", "recent_local_victims", "recent_threshold_only")):
+            raise ValueError(
+                "recent_overlap_victims requires recent_register_kth, recent_local_victims and recent_threshold_only"
+            )
     if transport != "urma" and value.get("recent_register_kth"):
         raise ValueError("recent_register_kth is supported only by URMA")
     if value.get("recent_register_kth") and not value.get("recent_threshold_only"):
@@ -100,6 +108,7 @@ def create_fused(
         recent_profile=tuning.get("recent_profile", transport == "urma"),
         recent_local_victims=tuning.get("recent_local_victims", False),
         recent_register_kth=tuning.get("recent_register_kth", False),
+        recent_overlap_victims=tuning.get("recent_overlap_victims", False),
         prefetch_limit=512,
         window_limit=64,
     )
@@ -114,6 +123,7 @@ def create_fused(
                     "recent_profile",
                     "recent_local_victims",
                     "recent_register_kth",
+                    "recent_overlap_victims",
                 )
             }
         )

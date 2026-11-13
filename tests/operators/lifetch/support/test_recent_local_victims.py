@@ -7,16 +7,14 @@ import pytest
 from test_recent_index import COMMON, INDEXER, function
 
 
-@pytest.mark.parametrize("enabled,ubmem", [(0, 0), (1, 0), (1, 1)])
-def test_local_victims_preserve_bitmap_and_publication(tmp_path, enabled, ubmem):
+def local_victims_model_source():
     vector = (INDEXER / "indexer_vector.h").read_text()
     score = (INDEXER / "indexer_score.h").read_text()
     save = function(vector, "    __aicore__ inline void SaveResident(")
     old = function(score, "__simd_vf__ inline void ClassifyResidentScores(")
     local = function(score, "__simd_vf__ inline void ClassifyLocalResidentScores(")
     gather = function((COMMON / "victim_ops.h").read_text(), "inline void GatherVictimScores(")
-    cpp = tmp_path / "local_victims.cpp"
-    cpp.write_text(
+    return (
         r"""
 #include <algorithm>
 #include <array>
@@ -209,6 +207,12 @@ int main(){
 }
 """
     )
+
+
+@pytest.mark.parametrize("enabled,ubmem", [(0, 0), (1, 0), (1, 1)])
+def test_local_victims_preserve_bitmap_and_publication(tmp_path, enabled, ubmem):
+    cpp = tmp_path / "local_victims.cpp"
+    cpp.write_text(local_victims_model_source())
     exe = tmp_path / "local_victims"
     subprocess.run(
         [
