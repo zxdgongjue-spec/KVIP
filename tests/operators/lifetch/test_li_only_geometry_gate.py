@@ -183,3 +183,40 @@ def test_li_core_perf_capture_isolated_from_v9_init_and_wait():
     assert 'rotating._call("li")' in capture_body
     assert 'rotating._call("init")' not in capture_body
     assert 'rotating._call("wait")' not in capture_body
+
+
+@pytest.mark.parametrize("repeats", [1, 8, 16, 32])
+def test_li_core_perf_graph_repeats_forwarded(lifetch_cli, monkeypatch, repeats):
+    commands = []
+    monkeypatch.setattr(lifetch_cli.subprocess, "call", lambda command: commands.append(command) or 0)
+    args = cli_args(prefetch=0) + [
+        "--li-core-perf", "--li-core-perf-graph-repeats", str(repeats)
+    ]
+    assert lifetch_cli.main(args) == 0
+    cmd = commands[0]
+    assert cmd[cmd.index("--li-core-perf-graph-repeats") + 1] == str(repeats)
+    worker = lifetch_cli.arguments(args[2:])
+    assert worker.li_core_perf_graph_repeats == repeats
+
+
+@pytest.mark.parametrize("repeats", [0, 65])
+def test_li_core_perf_graph_repeats_reject_out_of_range(lifetch_cli, repeats):
+    with pytest.raises(SystemExit) as exc:
+        lifetch_cli.main(
+            cli_args(prefetch=0) +
+            ["--li-core-perf", "--li-core-perf-graph-repeats", str(repeats)]
+        )
+    assert exc.value.code == 2
+
+
+def test_li_core_perf_graph_repeats_capture_scope():
+    source = (Path(__file__).with_name("support") / "lifetch.py").read_text()
+    anchor = source.index('if getattr(args, "li_core_perf", False):')
+    begin = source.index("with torch.npu.graph(graph, stream=capture_stream):", anchor)
+    end = source.index("capture_stream.synchronize()", begin)
+    capture = source[begin:end]
+    assert "for _ in range(graph_repeats)" in capture
+    assert 'rotating._call("li")' in capture
+    assert 'rotating._call("init")' not in capture
+    assert 'rotating._call("wait")' not in capture
+    assert "elapsed_us / graph_repeats" in source[anchor:]

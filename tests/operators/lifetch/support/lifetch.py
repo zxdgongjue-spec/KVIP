@@ -759,16 +759,22 @@ def run_v9_li_varlen_only(
         if getattr(args, "li_core_perf", False):
             if args.prefetch_tokens != 0:
                 raise AssertionError("P0-C1 LI-only profiling requires Prefetch=0")
-            # A valid warm state already exists after the correctness replay.
-            # Capture *only* v9_li. Do not include init, wait, Native QLI,
-            # KVAF setup, resets, CPU synchronization or Graph compilation.
-            # In Prefetch=0 the LI kernel does not enter Rotation Service.
+            # P0-C1 R1: the old one-LI Event interval was highly
+            # multimodal (0.26/1.9/3.8 ms) and can include Host submission
+            # gaps between start.record(), replay(), and end.record().
+            # Capture multiple *sequential* LI launches into ONE NPU Graph.
+            # The device stays busy long enough for End to be queued before
+            # the work finishes; divide the device interval by graph_repeats.
+            # This is a throughput-amortized LI cost, NOT standalone LI
+            # single-request service latency. Prefetch=0 disables Rotation.
+            graph_repeats = int(args.li_core_perf_graph_repeats)
             graph = torch.npu.NPUGraph()
             owner.graphs.append(graph)
             capture_stream = torch.npu.Stream(device=device)
             stream.synchronize()
             with torch.npu.graph(graph, stream=capture_stream):
-                rotating._call("li")
+                for _ in range(graph_repeats):
+                    rotating._call("li")
             capture_stream.synchronize()
             graph.replay()
             stream.synchronize()
@@ -788,16 +794,23 @@ def run_v9_li_varlen_only(
                 ):
                     raise AssertionError(f"{scenario['name']}: captured Graph padded output mismatch")
 
+            # Warm up the captured N-LI graph before timing. Each measured
+            # sample represents exactly graph_repeats sequential LI launches.
+            for _ in range(args.warmup):
+                graph.replay()
+            stream.synchronize()
             samples_us = []
-            for step in range(args.warmup + args.iterations):
+            graph_elapsed_us = []
+            for step in range(args.iterations):
                 start_event = torch.npu.Event(enable_timing=True)
                 end_event = torch.npu.Event(enable_timing=True)
                 start_event.record(stream)
                 graph.replay()
                 end_event.record(stream)
                 end_event.synchronize()
-                if step >= args.warmup:
-                    samples_us.append(float(start_event.elapsed_time(end_event) * 1000.0))
+                elapsed_us = float(start_event.elapsed_time(end_event) * 1000.0)
+                graph_elapsed_us.append(elapsed_us)
+                samples_us.append(elapsed_us / graph_repeats)
             stream.synchronize()
             # Multiple Graph replays must be non-destructive, not just the
             # first replay checked above. Verify after the final sample too.
@@ -818,10 +831,13 @@ def run_v9_li_varlen_only(
             if not samples_us or not all(np.isfinite(samples_us)):
                 raise AssertionError("P0-C1 device timing samples missing or invalid")
             li_perf = dict(
-                scope="device_event_captured_v9_li_only",
+                scope="device_event_graph_repeated_v9_li_amortized",
+                timing_method="graph_in_graph_sequential_li_repeats",
                 warmup=args.warmup,
                 iterations=args.iterations,
+                graph_repeats=graph_repeats,
                 samples_us=samples_us,
+                raw_graph_samples_us=graph_elapsed_us,
                 p50_us=float(np.median(samples_us)),
                 p95_us=float(np.percentile(samples_us, 95)),
                 minimum_us=float(np.min(samples_us)),
@@ -836,6 +852,7 @@ def run_v9_li_varlen_only(
                 f"scenario={scenario['name']} "
                 f"tiling={getattr(args, 'li_tiling', 'auto')} "
                 f"cores={li_perf['li_cores']} "
+                f"graph_repeats={graph_repeats} "
                 f"p50_us={li_perf['p50_us']:.3f} "
                 f"p95_us={li_perf['p95_us']:.3f}",
                 flush=True,
