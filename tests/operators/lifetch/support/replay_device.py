@@ -39,6 +39,10 @@ class FusedReplayState:
         self.lease = (UbmemLease(torch, runtime, output_rows, stream) if ubmem
                       else KvafGetLease(torch, runtime, library, output_rows, stream))
         try:
+            if not ubmem:
+                self.workspace.allocate_rotation(
+                    torch, batch=self.batch, history=self.history, resident=self.resident,
+                    aics=aics, windows=windows, status_bytes=self.lease.sizes['status'])
             binding = dict(
                 query_ends=self.workspace.inputs.query_ends.view(self.batch, 4),
                 hot_valid=self.storage.hot_valid, row_owners=self.workspace.inputs.row_owners,

@@ -84,3 +84,43 @@ def test_persistent_state_corruption_is_fatal(tmp_path, field):
         getattr(state.storage, field)[1, 3000] += 1
     with pytest.raises(RuntimeError, match='Replay'):
         state.validate_index(inputs, state.output[1:].numpy())
+
+
+def test_urma_replay_allocates_complete_scratch_before_binding(monkeypatch):
+    from kvip.adapters import kvaf
+    from kvip.operators.lifetch import binding, workspace
+    from kvip.operators.lifetch.geometry import final_aivs, li_geometry
+
+    real_workspace = workspace.LIFetchWorkspace
+    monkeypatch.setattr(workspace, 'LIFetchWorkspace',
+                        lambda torch, **kwargs: real_workspace(torch, pin_memory=False, **kwargs))
+    monkeypatch.setattr(torch, 'npu', SimpleNamespace(current_stream=lambda device: None), raising=False)
+    lease = SimpleNamespace(sizes={'status': 1536}, close=lambda: closed.append(True))
+    closed = []
+    monkeypatch.setattr(kvaf, 'KvafGetLease', lambda *args: lease)
+    monkeypatch.setattr(kvaf, 'KvafQueueView', lambda *args: None)
+    shape = li_geometry(2, 'auto', 8, 24)
+    expected = workspace.rotation_spec(2, 12288, 4096, final_aivs(2, 'auto', 24),
+                                      shape['intermediate_fetches'],
+                                      shape['service_aivs_per_window'], 1536)
+
+    class BindingReached(Exception):
+        pass
+
+    def inspect_binding(*args, scratch, **kwargs):
+        assert set(scratch) == set(expected)
+        for name, (size, dtype) in expected.items():
+            assert tuple(scratch[name].shape) == size
+            assert scratch[name].dtype == getattr(torch, dtype)
+            assert torch.count_nonzero(scratch[name]) == 0
+        raise BindingReached
+
+    monkeypatch.setattr(binding, 'LIFetchBinding', inspect_binding)
+    initial = SimpleNamespace(geometry=dict(batch=2, history=12288, resident=4096,
+                                           output_stride=4224, token_bytes=656, heads=32))
+    with pytest.raises(BindingReached):
+        FusedReplayState(torch, SimpleNamespace(transport='urma'),
+                         SimpleNamespace(addresses=None, valid=None), None, initial, None, None,
+                         device=torch.device('cpu'), aics=24, windows=8,
+                         prefetch_tokens=0, soc='Ascend950PR_9599')
+    assert closed == [True]
