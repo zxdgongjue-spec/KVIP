@@ -602,7 +602,5 @@ def level_two_tables(result):
             algorithm_lines.append(diagnostic_table('Per-Q demand / repair', ['Request', 'Q', 'Unique demand',
                 'Seen in earlier Qs', 'New demand', 'New: already local', 'New: initially cold', 'Final reads', 'Conflict reads'], queries))
     algorithm_lines.append('Demand: Unique = Seen in earlier Qs + New demand; New demand = already local + initially cold. Final reads are actual repairs, not initially cold minus prefetch counts.')
-    notices = ['INCOMPLETE: ' + value for value in dict.fromkeys(result['missing'])]
-    notices += ['N/A: ' + value for value in dict.fromkeys(result['unavailable'])]
     return '\n\n'.join([f"DIAG level={result.get('level', 2)} transport={result['transport']} trace={result['trace']}",
-                           *algorithm_lines, *lines, *notices])
+                           *algorithm_lines, *lines])
