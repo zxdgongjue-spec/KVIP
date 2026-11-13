@@ -100,7 +100,7 @@ def check_shape(
     expected_ids = fixture["expected"]
     cold_count = fixture["native_miss_union"]
     logical_scales = fixture["scales"]
-    logical_key_columns = fixture["keys"][:, 0]
+    logical_keys = fixture["keys"]
     device = torch.device(f"npu:{device_id}")
     block_bytes = 128 * token_bytes
     slot_bytes = (block_bytes + 4095) // 4096 * 4096
@@ -270,7 +270,7 @@ def check_shape(
                 raise RuntimeError("UBmem Index ownership is outside allocated history")
             addresses = storage.addresses.cpu().numpy()
             scales = storage.scales.cpu().numpy()
-            key_values = storage.keys[:, :, 0].contiguous().cpu().numpy()
+            key_values = storage.keys.cpu().numpy()
             counts = [4] * len(owners) if counts is None else counts
             output_row = 0
             for owner, count in zip(owners, counts):
@@ -281,7 +281,7 @@ def check_shape(
                     "Index addresses detached"
                 )
                 assert np.array_equal(scales[owner], logical_scales[ids[owner]]), "Index scales detached"
-                assert np.array_equal(key_values[owner], logical_key_columns[ids[owner]]), "Index keys detached"
+                assert np.array_equal(key_values[owner], logical_keys[ids[owner]]), "Index keys detached"
                 # Verify every valid persistent hot entry, not just selected rows.
                 hot_valid = storage.hot_valid[owner].cpu().numpy() != 0
                 hot_slots = np.flatnonzero(hot_valid)
@@ -452,7 +452,10 @@ def check_shape(
             forward()
             verify(list(range(1, batch + 1)), phase="cold-start")
             record_boundary('cold-start', np.zeros_like(before_valid), before_layout)
-            checks.check("boundary trigger coverage", lambda: require_boundary(check_case, boundary_phases))
+            from correctness import transfer_coverage
+            boundary_phases['transfer'] = transfer_coverage(
+                rotating.final_posts.cpu().numpy(), rotating.destinations.cpu().numpy(),
+                rotating.lru_slots.cpu().numpy(), output.shape[1], resident)
             for tensor, saved in zip(measured_buffers, initial_state):
                 tensor.copy_(saved)
         graph = kvaf.AclGraph()
@@ -484,12 +487,17 @@ def check_shape(
         # All-padding warmup is legal: owner zero can repeat in inactive rows.
         workspace.inputs.prepare([0] * batch, query_owners=[0] * batch)
         workspace.inputs.query_ends.zero_()
-        before = storage.logical_ids.clone()
+        padding_before = [tensor.clone() for tensor in measured_buffers]
         graph.replay(stream)
         verify([], phase="padding", padding=True)
         def verify_padding_unchanged():
-            assert torch.equal(storage.logical_ids, before), "Padding changed Index ownership"
-        checks.check('padding_ownership', verify_padding_unchanged)
+            assert all(torch.equal(tensor, saved) for tensor, saved in zip(measured_buffers, padding_before)), "Padding changed persistent state"
+            assert not rotating.rows[:, 9].cpu().count_nonzero() and not rotating.final_posts[:, :, 0].cpu().count_nonzero(), "Padding issued fetches"
+        padding_ok = checks.check('padding_ownership', verify_padding_unchanged)
+        boundary_phases['padding'] = 'PASS' if padding_ok else 'FAIL'
+        if check_case:
+            checks.check('boundary trigger coverage', lambda: require_boundary(check_case, boundary_phases))
+            atomic_json(result_output / f'b{batch}-h{history}-r{resident}-w{token_bytes}-p{prefetch_tokens}' / 'boundary_coverage.json', boundary_phases)
         if iterations:
             workspace.inputs.prepare([4] * batch, query_owners=list(range(1, batch + 1)))
             workspace.inputs.query_ends.fill_(history)

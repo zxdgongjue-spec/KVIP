@@ -110,7 +110,7 @@ PYTHONPATH=python python -m pytest -q tests/operators/lifetch/support
 | 内容 | 当前支持 | 补全工作与影响 |
 | --- | --- | --- |
 | all/check/bench/diagnose | 共用入口、默认矩阵、结果自动汇总；URMA/UBmem 运行分发已接入 | 尚未真机验收，不能据本地测试保证两种传输均可运行或性能无变化 |
-| check | 初始化 Put/Get、BS1/2/4/8/16、命中/全miss/预算0、跨Q重复/空补拉、冷启动、多轮命中→淘汰→重取、基本非法参数 | 现有冲突/兜底/padding 断言仍分散，尚未逐项形成统一覆盖报告；不能声称全部设计边界已验收 |
+| check | 初始化 Put/Get、BS1/2/4/8/16、命中/全miss/预算0、跨Q重复/空补拉、冷启动、多轮命中→淘汰→重取、基本非法参数 | boundary_regular 强制检查冲突描述符、候选外hot兜底及padding；coverage.json汇总实际证据。仍需URMA/UBmem真机通过后验收 |
 | bench | 同输入原生串行/融合完整图，mean/p50/p99、原始样本，保留可恢复数值失败的计时 | 合成生成器尚未拟合真实分布；其收益不能直接外推生产负载 |
 | diagnose 阶段 | 融合完整图与现有逐核/步骤打点；新增合成串行图的 LI/LIDU/Get 名称归因 | 串行归因未真机确认，未知内核名明确报 INCOMPLETE；LIDU 内地址准备不单独虚构耗时；真实回放的串行阶段采集尚未接入 |
 | diagnose 算法 | 需求、初始cold、预取、逐窗unused、逐Q补拉、实际字节和跨轮统计 | 缺少消费身份及公开窗口计数，不能精确归因 useful/redundant/refetched 或候选/预算抑制；完整补齐需额外诊断数据，当前不改算子 |
@@ -123,3 +123,19 @@ PYTHONPATH=python python -m pytest -q tests/operators/lifetch/support
 建议先在两种传输上分别运行 `check --suite basic --cases basic_bs1`，
 确认安装和运行链路后，再跑完整check、bench和diagnose。首次真机运行发生的框架/API适配
 错误属于本预览版待修项，不能把失败报告当作算子回归结论。
+
+
+## check 完整验收
+
+默认 check 包含 init、basic、boundary、stateful、contract；真实数据用例需显式提供
+`--suite real --snapshot /path/to/captured-round/manifest.json`，不随默认合成检查伪造执行。
+两种传输分别运行默认 check，返回码为零且所有用例 PASS 后，内置检查验收通过。
+真实数据能力还需实际 snapshot 的 real suite 通过。
+
+`boundary_regular` 的冷启动会触发预取目的槽冲突和 hot 池兜底：断言每请求有冲突
+描述符，且实际最终目的槽至少一个不在输入的2048个LRU候选中。这里证明的是
+冲突依赖处理分支，不承诺硬件执行时一定发生非零CQ等待。Padding清空全部Q，
+断言零读取、输出为-1、持久Index/有效位/KV未改变。UBmem另外保留混合Q数量及
+owner换序检查。覆盖证据自动打印并汇总到对应case的coverage.json。
+
+本地只校验测试逻辑、输入/状态管理及报告；NPU运行结果由完整命令验证。

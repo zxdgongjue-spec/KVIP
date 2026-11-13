@@ -36,13 +36,50 @@ def test_cross_query_empty_repair_and_cold_start_have_separate_evidence():
     regular = evidence(selected=(0, 4), final=(1, 0, 0, 0))
     cold = evidence(selected=(0, 4), valid=(0, 0, 0, 0), final=(2, 0, 0, 0))
     assert regular[0]['cross_query_duplicates'] == [0, 2, 2, 2]
-    require_boundary('boundary_regular', {'regular': regular, 'cold-start': cold})
+    extra = {'transfer': [dict(fallback_slots=1, conflicts=1)], 'padding': 'PASS'}
+    require_boundary('boundary_regular', {'regular': regular, 'cold-start': cold, **extra})
     with pytest.raises(AssertionError, match='clear validity'):
-        require_boundary('boundary_regular', {'regular': regular, 'cold-start': regular})
+        require_boundary('boundary_regular', {'regular': regular, 'cold-start': regular, **extra})
     with pytest.raises(AssertionError, match='no new repair'):
-        require_boundary('boundary_regular', {'regular': evidence(final=(0, 0, 1, 0)), 'cold-start': cold})
+        require_boundary('boundary_regular', {'regular': evidence(final=(0, 0, 1, 0)), 'cold-start': cold, **extra})
 
 
 def test_invalid_counter_data_is_not_a_correctness_assertion():
     with pytest.raises(ValueError, match='invalid counters'):
         evidence(posted=-1)
+
+
+def test_unknown_boundary_and_empty_evidence_cannot_pass():
+    import pytest
+    from correctness import require_boundary
+    with pytest.raises(ValueError, match='Unknown boundary'):
+        require_boundary('typo', {'regular': []})
+    with pytest.raises(AssertionError, match='no observed'):
+        require_boundary('all_hit_budget0', {'regular': []})
+
+
+def test_extended_contracts_use_production_validation():
+    from correctness import check_contracts
+    for transport in ('urma', 'ubmem'):
+        checks = check_contracts(transport)
+        assert all(row['correctness'] == 'PASS' for row in checks), checks
+        names = {row['case'] for row in checks}
+        assert {'reject_unaligned_history', 'reject_unaligned_resident',
+                'reject_no_cold_history', 'reject_window_budget481'} <= names
+        if transport == 'ubmem':
+            assert {'reject_heads', 'reject_token_bytes', 'reject_soc'} <= names
+
+
+def test_transfer_coverage_requires_real_outside_candidate_slots_and_conflicts():
+    from correctness import transfer_coverage, require_transfer_coverage
+    posts = np.zeros((1, 4, 6), dtype=np.int32)
+    posts[0, 0] = [3, 0, 0, 0, 0, 2]
+    result = transfer_coverage(posts, [0, 3, 1], [[0, 1]], 8, 4)
+    assert result == [dict(request=0, final=3, conflicts=1, fallback_slots=1)]
+    require_transfer_coverage(result)
+    for key in ('conflicts', 'fallback_slots'):
+        with pytest.raises(AssertionError):
+            require_transfer_coverage([dict(result[0], **{key: 0})])
+    posts[0, 0, 4] = 9
+    with pytest.raises(RuntimeError, match='range'):
+        transfer_coverage(posts, [0, 3, 1], [[0, 1]], 8, 4)

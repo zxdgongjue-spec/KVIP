@@ -67,6 +67,22 @@ def check_contracts(transport):
     for budget in (-1, 2049):
         rejected(f'reject_budget{budget}', lambda n=budget: prefetch_budget(n, intermediate_fetches=8))
     rejected('reject_windows0', lambda: prefetch_budget(512, intermediate_fetches=0))
+    from kvip.operators.lifetch.geometry import trigger_tokens, li_geometry
+    for name, history, resident in (
+        ('unaligned_history', 131073, 16384), ('unaligned_resident', 131072, 16385),
+        ('resident_too_small', 131072, 1024), ('no_cold_history', 16384, 16384),
+    ):
+        rejected(f'reject_{name}', lambda h=history, r=resident: trigger_tokens(2, h, r))
+    for cores in (0, 33):
+        rejected(f'reject_aic{cores}', lambda n=cores: li_geometry(2, aic_count=n))
+    for window in (0, 481):
+        rejected(f'reject_window_budget{window}', lambda n=window: prefetch_budget(512, window_limit=n))
+    if transport == 'ubmem':
+        defaults = dict(batch=2, history=131072, resident=16384, heads=32,
+                        token_bytes=656, aic_count=32, intermediate_fetches=8, soc='Ascend950PR_9599')
+        for key, value in (('heads', 16), ('token_bytes', 128), ('intermediate_fetches', 33),
+                           ('soc', 'invalid'), ('history', 211200)):
+            rejected(f'reject_{key}', lambda k=key, v=value: UbmemGeometry(**(defaults | {k: v})))
     return rows
 
 
@@ -102,7 +118,10 @@ def boundary_evidence(selected, initial_hot_valid, initial_layout, prefetch, fin
 
 def require_boundary(case, phases):
     """A named boundary passes only when measured inputs/counts prove it ran."""
+    if case not in {'all_hit_budget0', 'all_miss', 'prefetch_zero', 'boundary_regular'}:
+        raise ValueError(f'Unknown boundary case: {case}')
     regular = phases['regular']
+    assert regular, 'Boundary case has no observed requests'
     if case == 'all_hit_budget0':
         assert all(r['initial_cold'] == 0 and r['prefetch'] == 0 and r['final'] == 0
                    for r in regular), 'all-hit with zero budget must issue zero reads'
@@ -117,6 +136,8 @@ def require_boundary(case, phases):
     elif case == 'boundary_regular':
         assert all(sum(r['cross_query_duplicates'][1:]) > 0 and
                    r['final_by_query'][2:] == [0, 0] for r in regular), 'duplicate Q3/Q4 must issue no new repair'
+        require_transfer_coverage(phases.get('transfer', []))
+        assert phases.get('padding') == 'PASS', 'Padding was not checked'
         cold = phases['cold-start']
         assert all(r['initial_hot_valid'] == 0 and r['initial_cold'] == r['selected_unique'] and
                    r['prefetch'] + r['final'] >= r['selected_unique']
@@ -180,3 +201,34 @@ def require_stateful_round(source_round, hot_tokens, prefetch, final):
         assert expected <= tokens, f'round={source_round}: selected tokens are not persistent hot'
         if source_round == 3:
             assert not tokens.intersection(range(4096, 6144)), 'B/C failed to evict A'
+
+
+def transfer_coverage(posts, destinations, lru_slots, stride, resident):
+    """Prove conflict descriptors and fallback destinations from actual output."""
+    import numpy as np
+    posts, destinations, lru_slots = map(np.asarray, (posts, destinations, lru_slots))
+    destinations = destinations.reshape(-1)
+    evidence = []
+    for row in range(len(posts)):
+        slots, conflicts = [], 0
+        for post in posts[row]:
+            count, start, safe = map(int, (post[0], post[4], post[5]))
+            if not 0 <= safe <= count or start < 0 or start + count > len(destinations):
+                raise RuntimeError('Invalid final descriptor range')
+            raw = destinations[start:start + count].astype(np.int64)
+            if np.any(raw < 0):
+                raise RuntimeError('Negative final destination')
+            selected = raw % stride
+            if np.any(selected < 0) or np.any(selected >= resident):
+                raise RuntimeError('Final fetch did not target persistent hot slots')
+            slots.extend(selected.tolist())
+            conflicts += count - safe
+        fallback = len(set(slots) - set(map(int, lru_slots[row])))
+        evidence.append(dict(request=row, final=len(slots), conflicts=conflicts,
+                             fallback_slots=fallback))
+    return evidence
+
+
+def require_transfer_coverage(rows):
+    assert rows and all(row['fallback_slots'] > 0 for row in rows), 'Hot-pool fallback was not exercised'
+    assert all(row['conflicts'] > 0 for row in rows), 'Prefetch destination conflict was not exercised'

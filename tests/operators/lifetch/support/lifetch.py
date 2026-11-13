@@ -650,6 +650,12 @@ def run_device(
             state["ids"], before_valid, before_layout,
             rotating.rows[:, 9].cpu().numpy(), rotating.final_posts[:, :, 0].cpu().numpy())
         atomic_json(folder / "boundary_coverage.json", boundary_phases)
+        if cold_start:
+            from correctness import transfer_coverage
+            boundary_phases['transfer'] = transfer_coverage(
+                rotating.final_posts.cpu().numpy(), rotating.destinations.cpu().numpy(),
+                rotating.lru_slots.cpu().numpy(), owner.output.shape[1], r)
+            atomic_json(folder / "boundary_coverage.json", boundary_phases)
         changes = rotating.changes.cpu().numpy()
         result = dict(transport=state["completion"],
             first_window_fetches=int(rotating.rows[:, 16].cpu().sum()),
@@ -673,6 +679,33 @@ def run_device(
             assert hot_case["first_window_fetches"] and restored_hot, (
                 f"First window did not Fetch former hot candidates into LRU slots: {hot_case}")
         correctness.check("hot-victim-collision coverage", check_collision_coverage)
+
+    if getattr(args, "check_suite", None) == "boundary":
+        reset()
+        ends = rotating.query_ends.clone()
+        validity = update.output_valid.clone()
+        protected = (*update.inputs[:4], rotating.hot_valid, owner.output)
+        snapshots = [tensor.clone() for tensor in protected]
+        rotating.query_ends.zero_()
+        update.output_valid.zero_()
+        full()
+        stream.synchronize()
+        def check_padding():
+            rows = rotating.rows.cpu().numpy()
+            posts = rotating.final_posts.cpu().numpy()
+            statuses = rotating.row_status.cpu().numpy()
+            cq = [x.cpu().view(torch.uint64).numpy() for x in (rotating.prefetch_status, rotating.final_status)]
+            if completion_failures(rows, posts, statuses, *cq) or update.status.cpu().count_nonzero():
+                raise RuntimeError('Padding execution did not complete successfully')
+            owner.mark_completed(completion_verified=True)
+            assert not rows[:, 9].any() and not posts[:, :, 0].any(), 'Padding issued fetches'
+            assert all(torch.equal(tensor, saved_tensor) for tensor, saved_tensor in zip(protected, snapshots)), 'Padding changed persistent state'
+            assert (update.logical_output.cpu() == -1).all() and (update.slot_output.cpu() == -1).all(), 'Padding retained outputs'
+        passed = correctness.check('padding', check_padding)
+        boundary_phases['padding'] = 'PASS' if passed else 'FAIL'
+        rotating.query_ends.copy_(ends)
+        update.output_valid.copy_(validity)
+        atomic_json(folder / 'boundary_coverage.json', boundary_phases)
 
     if getattr(args, "check_suite", None) == "boundary":
         from correctness import require_boundary

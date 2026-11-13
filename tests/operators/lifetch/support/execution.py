@@ -240,6 +240,14 @@ def dispatch(config):
                 for row in records:
                     row['case'] = f"{name}/{row['case']}"
                 rows.extend(records)
+            if job.mode == 'check':
+                coverage = {str(path.relative_to(directory)): json.loads(path.read_text())
+                            for path in sorted(directory.rglob('boundary_coverage.json'))}
+                if coverage:
+                    atomic_json(directory / 'coverage.json', coverage)
+                    for source, phases in coverage.items():
+                        print(f'CHECK COVERAGE {name}: padding={phases.get("padding", "not_requested")} '
+                              f'transfer={phases.get("transfer", [])}; source={source}', flush=True)
             stopped = not (directory / 'worker-result.json').is_file()
             if job.mode == 'diagnose':
                 from diagnostics import summarize
