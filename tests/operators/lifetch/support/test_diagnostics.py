@@ -144,7 +144,8 @@ def test_level_two_tables_keep_replay_core_and_query_identity():
         update=[10, 30], update_wait=[5, 10], li=[],
         core_timeline_raw=dict(batch=1, resolver_cores=3, workers_per_query=2, clock_mhz=10))
     core = dict(block=3, role='fetch Q1 lane0', start_us=1., end_us=9., duration_us=8.,
-        stages=[dict(name='safe.KVAF_Get', start_us=2., end_us=8., duration_us=6.)],
+        stages=[dict(name='safe.KVAF_Get', start_us=2., end_us=8., duration_us=6.,
+                     start_cycles=20, end_cycles=80)],
         KVAF_counters=dict(safe_post_cycles=10, safe_CQ_cycles=20,
                           conflict_post_cycles=0, conflict_CQ_cycles=0))
     sample = dict(repeat=2, requests=[request], timeline=dict(cores=[core], last_block=3,
@@ -170,3 +171,20 @@ def test_level_two_tables_keep_replay_core_and_query_identity():
     assert 'Core work / wait intervals' in level_two_tables(result)
     result['transport'] = 'ubmem'
     assert 'URMA group counters' not in level_two_tables(result)
+
+
+def test_level_three_prefetch_counts_and_time_are_separated():
+    from diagnostics import level_two_tables
+    event = dict(event=2, core=7, epoch=1, bitmap_bytes=4096, candidate_count=80,
+                 posted_count=32, scan_cycles=100, candidate_cycles=200, post_cycles=300)
+    request = dict(batch=0, core_timeline_raw=dict(clock_mhz=100), prefetch_services=[event])
+    result = dict(level=3, transport='ubmem', trace='COMPLETE', captures=[dict(source='trace', stage_summary={},
+        samples=[dict(repeat=0, requests=[request], algorithm=dict(requests=[]))])])
+    text = level_two_tables(result)
+    algorithm, timing = text.split('TIME BREAKDOWN')
+    assert 'Prefetch service work' in algorithm
+    assert 'Prefetch service steps' not in algorithm
+    assert 'Prefetch service steps' in timing
+    assert 'submit/copy' in timing and '3.000' in timing and 'Cycles' in timing
+    result['level'] = 2
+    assert 'Prefetch service' not in level_two_tables(result)

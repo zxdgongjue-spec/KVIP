@@ -503,7 +503,9 @@ def level_two_tables(result):
                     # Intervals are retained individually; no addition of nested ranges.
                     for stage in core['stages']:
                         phases.append([core['block'], stage['name'], stage['start_us'],
-                                       stage['end_us'], stage['duration_us']])
+                                       stage['end_us'], stage['duration_us'],
+                                       stage['end_cycles'] - stage['start_cycles']
+                                       if 'end_cycles' in stage and 'start_cycles' in stage else None])
                 lines.append(diagnostic_table('Active cores', ['Block', 'Role', 'Start', 'End', 'Duration', 'Last'], rows))
                 groups = sample.get('final_get_bandwidth', {}).get('groups', [])
                 rates = []
@@ -521,7 +523,7 @@ def level_two_tables(result):
                     lines.append(diagnostic_table('Per-Fetch-block effective bandwidth (Get call span, not link peak)',
                         ['Block', 'Q', 'Lane', 'Reads', 'Bytes', 'Get span us', 'GB/s'], rates))
                 if result.get('level', 2) >= 3:
-                    lines.append(diagnostic_table('Core work / wait intervals', ['Block', 'Phase', 'Start', 'End', 'Duration'], phases))
+                    lines.append(diagnostic_table('Core work / wait intervals', ['Block', 'Phase', 'Start us', 'End us', 'Duration us', 'Cycles'], phases))
                     if result['transport'] == 'urma':
                         counters = []
                         for core in timeline['cores']:
@@ -537,15 +539,18 @@ def level_two_tables(result):
                 raw = requests[0].get('core_timeline_raw', {})
                 mhz = raw.get('clock_mhz')
                 services = requests[0].get('prefetch_services', [])
-                service_rows = []
+                service_rows, service_times = [], []
                 for event in services:
-                    service_rows.append([event['event'], event['core'], event['epoch'],
-                        *[event[key] / mhz if mhz else None for key in ('scan_cycles', 'candidate_cycles', 'post_cycles')],
-                        event['bitmap_bytes'], event['candidate_count'], event['posted_count']])
+                    identity = [event['event'], event['core'], event['epoch']]
+                    service_rows.append([*identity, event['bitmap_bytes'], event['candidate_count'], event['posted_count']])
+                    for label, key in (('scan', 'scan_cycles'), ('candidates', 'candidate_cycles'), ('submit/copy', 'post_cycles')):
+                        service_times.append([*identity, label, event[key], event[key] / mhz if mhz else None])
                 if service_rows and result.get('level', 2) >= 3:
                     algorithm_lines.append(f"Source: {capture['source']} | repeat={repeat}")
-                    algorithm_lines.append(diagnostic_table('Prefetch service records',
-                        ['Event', 'Service core', 'Epoch', 'Scan us', 'Candidates us', 'Post us', 'Bitmap bytes', 'Candidates', 'Posted'], service_rows))
+                    algorithm_lines.append(diagnostic_table('Prefetch service work',
+                        ['Event', 'Service core', 'Epoch', 'Bitmap bytes', 'Candidates', 'Posted'], service_rows))
+                    lines.append(diagnostic_table('Prefetch service steps (URMA submission / UBmem copy)',
+                        ['Event', 'Service core', 'Epoch', 'Step', 'Cycles', 'Duration us'], service_times))
                 li_rows = []
                 for request in requests:
                     for q, values in enumerate(request.get('li', []), 1):

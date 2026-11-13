@@ -448,3 +448,14 @@ Core work/wait全部内部区间、LI分类内部步骤、URMA提交/CQ细分以
 | 时间拆解 | 阶段耗时分布、整体有效带宽 | 增加Active cores、最晚结束核、每Fetch核带宽、逐Q处理/等待概览 | 增加完整核内区间、LI分类步骤、提交/CQ细分、Fetch-only对照 |
 
 level2继承level1的统计含义，level3继承level2；同一字段不随level改变口径。同义数据合表，不同时重复展示粗表和同内容明细表。尚无采集证据的字段不宣称已支持，原始采集状态保存在结构化结果中。
+
+
+### Level3 内部打点与展示
+
+仍按算法与 KV 流量、时间拆解两部分输出：
+
+- 算法与 KV 流量：逐请求、窗口、Q 的需求、预取、未使用预取、最终补拉；预取服务记录补充扫描 bitmap 字节、候选数和实际下发数，以 service core/epoch 标识。
+- 时间拆解：保留阶段与 Active cores；展开每核步骤的起止时间、耗时及 cycles，标出最晚结束核。LI 展开加载/分类/发布，Resolver 展开逐 Q 处理/输出/描述符/发布，Update 展开等待/交换/提交，Fetch 展开依赖等待/Get/完成发布。URMA 另列 Get 内部提交和 CQ 计数。
+- 预取服务步骤单列扫描、候选处理、提交/拷贝的 cycles 与 µs。URMA 的提交耗时与 UBmem 的拷贝耗时保留各自含义。
+
+预取内部打点由诊断开关控制，两种 transport 均发布完整 Event；普通 bench 使用关闭打点的模板分支。采样结果保存在 `diagnostic.json`、`timeline.csv` 和 `level3_summary.log`，终端与对应 summary 使用同一组表格。cycles 按设备计数时钟换算为 µs，内部嵌套区间不累加为总耗时。
