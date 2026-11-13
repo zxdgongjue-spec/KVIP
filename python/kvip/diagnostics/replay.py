@@ -9,6 +9,7 @@ import traceback
 
 from kvip.diagnostics.archive import load_snapshot
 from kvip.diagnostics.console import NativeLog, emit, flush_output, print_replay_failure
+from kvip.diagnostics.pipeline_options import DEFAULT_VARIANTS, VARIANTS
 
 _RETAINED = []
 
@@ -45,7 +46,7 @@ def arguments(argv=None):
         "--pipeline-variants",
         nargs="+",
         default=None,
-        choices=("control", "topk", "metadata", "ready", "init", "combined"),
+        choices=tuple(VARIANTS),
     )
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--iterations", type=int, default=10)
@@ -56,6 +57,7 @@ def arguments(argv=None):
         help="Separate instrumented fused graph replays after headline timing",
     )
     p.add_argument("--quiet", action="store_true")
+    p.add_argument("--topk-probe", action="store_true", help="After all headline cases, run one separately built pruning-counter graph without timing")
     p.add_argument("--output", type=Path, required=True)
     args = p.parse_args(argv)
     if args.warmup < 0 or args.iterations < 1 or args.device < 0 or args.diagnostic_replays < 0:
@@ -78,13 +80,13 @@ def arguments(argv=None):
             or args.threshold_policy != "recent"
         ):
             p.error("post-threshold requires an exact production checkout and URMA fused recent policy")
-        if args.diagnostic_replays:
-            p.error("post-threshold measures uninstrumented production graphs only")
-        args.pipeline_variants = args.pipeline_variants or ["control", "topk", "metadata", "ready", "init", "combined"]
+        args.pipeline_variants = args.pipeline_variants or list(DEFAULT_VARIANTS)
         if len(set(args.pipeline_variants)) != len(args.pipeline_variants):
             p.error("Pipeline variants must be unique")
     elif args.pipeline_variants:
         p.error("pipeline-variants requires study=post-threshold")
+    if args.topk_probe and args.study != "post-threshold":
+        p.error("topk-probe requires study=post-threshold")
     if args.study in ("threshold-only", "seed-ub", "local-victims", "register-kth", "overlap-victims") and (
         args.transport != "urma" or args.mode != "fused"
     ):

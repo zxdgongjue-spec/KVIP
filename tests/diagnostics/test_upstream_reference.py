@@ -338,7 +338,7 @@ def test_replay_cli_rejects_ambiguous_reference_options(tmp_path, mode):
 
 
 @pytest.mark.parametrize("transport", ["urma", "ubmem"])
-@pytest.mark.parametrize("policy", ["resident", "recent", "candidate"])
+@pytest.mark.parametrize("policy", ["resident", "recent", "candidate", "ready-batch4"])
 def test_upstream_factory_uses_old_builder_and_binding_signatures(tmp_path, monkeypatch, transport, policy):
     from kvip.adapters import kvaf
     from kvip.diagnostics import fused_replay
@@ -348,9 +348,12 @@ def test_upstream_factory_uses_old_builder_and_binding_signatures(tmp_path, monk
 
     if transport == "ubmem" and policy != "resident":
         pytest.skip("The new experiment is URMA-only")
-    from kvip.diagnostics.pipeline_options import options_for
+    from kvip.diagnostics.pipeline_options import options_for, q_workers_for
 
-    options = options_for("combined") if policy == "candidate" else None
+    options = (
+        options_for("combined") if policy == "candidate" else options_for(policy) if policy == "ready-batch4" else None
+    )
+    workers = q_workers_for(policy) if policy == "ready-batch4" else 2
     calls = []
     tensor = SimpleNamespace(view=lambda *args: tensor)
     inputs = SimpleNamespace(query_ends=tensor, row_owners=tensor)
@@ -403,7 +406,12 @@ def test_upstream_factory_uses_old_builder_and_binding_signatures(tmp_path, monk
     monkeypatch.setattr(ub_binding, "UbmemBinding", Binding)
     monkeypatch.setattr(index_update, "DirectIndexUpdate", lambda *args, **kwargs: object())
     monkeypatch.setattr(index_update, "UbmemIndexUpdate", lambda *args, **kwargs: object())
-    monkeypatch.setattr(forward, "LIFetchForward", lambda *args: object())
+
+    def make_forward(*args, **kwargs):
+        assert kwargs == ({"q_workers": 4} if workers == 4 else {})
+        return object()
+
+    monkeypatch.setattr(forward, "LIFetchForward", make_forward)
     storage = SimpleNamespace(keys=tensor, scales=tensor, addresses=tensor, logical_ids=tensor, hot_valid=tensor)
     monkeypatch.setattr(fused_replay, "IndexCacheStorage", lambda *args: storage)
     archive = SimpleNamespace(
@@ -439,11 +447,12 @@ def test_upstream_factory_uses_old_builder_and_binding_signatures(tmp_path, monk
         upstream=True,
         tuning={"recent_threshold": policy != "resident"},
         pipeline_options=options,
+        q_workers=workers,
     )
     assert calls[0][0] == transport + "_build" and calls[1][0] == "binding"
-    assert bundle.tuning == dict(recent_threshold=policy != "resident", prefetch_limit=512, window_limit=64) | (
-        options or {}
-    )
+    assert bundle.tuning == dict(
+        recent_threshold=policy != "resident", prefetch_limit=512, window_limit=64, q_workers=workers
+    ) | (options or {})
     assert bundle.tuning["prefetch_limit"] == 512 and bundle.tuning["window_limit"] == 64
 
 

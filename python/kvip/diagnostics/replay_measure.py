@@ -275,6 +275,25 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
     stream.synchronize()
     phase(retained, "first_replay_verify")
     verify()
+    if getattr(args, "probe_only", False):
+        from kvip.diagnostics.topk_probe import decode
+
+        phase(retained, "topk_probe_reset")
+        reset()
+        bundle.forward.times.zero_()
+        bundle.forward.set_options(diagnostics=True)
+        stream.synchronize()
+        phase(retained, "topk_probe_replay")
+        replay(graph)
+        stream.synchronize()
+        phase(retained, "topk_probe_verify")
+        verify()
+        result = dict(topk_probe=decode(cpu_array(torch, bundle.forward.times), bundle.forward.batch))
+        bundle.forward.set_options(diagnostics=False)
+        stream.synchronize()
+        for graph in reversed(graphs):
+            graph.reset()
+        return result
     begin, end = [torch.npu.Event(enable_timing=True) for _ in range(2)]
     retained["events"] = [begin, end]
     samples, reads = [], []
@@ -438,6 +457,8 @@ def measure_case(args, archive, context, retained):
             split_index_stages=getattr(args, "split_index_stages", False),
             upstream=bool(getattr(args, "upstream_root", None)),
             pipeline_options=getattr(args, "pipeline_options", None),
+            q_workers=getattr(args, "pipeline_q_workers", 2),
+            topk_probe=getattr(args, "probe_only", False),
         )
         case_retained["bundle"] = bundle
         case_retained["buffers"] = buffer_addresses(bundle)
@@ -697,9 +718,10 @@ def run(args, archive, retained):
         cases = {}
         for name, tuning in study_cases(args).items():
             if args.study == "post-threshold":
-                from kvip.diagnostics.pipeline_options import options_for
+                from kvip.diagnostics.pipeline_options import options_for, q_workers_for
 
                 args.pipeline_options = options_for(name)
+                args.pipeline_q_workers = q_workers_for(name)
             retained["progress"].update(variant=name, tuning=dict(tuning))
             phase(retained, "case_begin")
             emit(f"CASE_BEGIN {args.transport}-{args.mode}-{name}")
@@ -717,6 +739,24 @@ def run(args, archive, retained):
             cases=cases,
             execution_order=list(cases),
         )
+        if getattr(args, "topk_probe", False):
+            from kvip.diagnostics.pipeline_options import options_for
+
+            probe_args = SimpleNamespace(**vars(args))
+            probe_args.pipeline_options = options_for("topk")
+            probe_args.pipeline_q_workers = 2
+            probe_args.probe_only = True
+            probe_args.fused_tuning = {"recent_threshold": True}
+            retained["progress"].update(variant="topk-probe")
+            probe_result = measure_case(probe_args, archive, context, retained)
+            reference = next(iter(cases.values()))
+            for key in ("selected_set_sha256", "ordered_output_sha256"):
+                if probe_result["selection_comparison"][key] != reference["selection_comparison"][key]:
+                    raise ValueError("TopK probe changed the final ordered selection")
+            for key in ("initial_keys", "final_keys"):
+                if probe_result["threshold_comparison"][key] != reference["threshold_comparison"][key]:
+                    raise ValueError("TopK probe changed the threshold")
+            result["topk_probe_report"] = probe_result
     else:
         retained["progress"]["variant"] = (
             f"upstream-{args.mode}"

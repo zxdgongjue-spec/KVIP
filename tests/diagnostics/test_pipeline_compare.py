@@ -10,7 +10,8 @@ import pytest
 
 from kvip.diagnostics import pipeline_compare as compare
 from kvip.diagnostics import replay
-from kvip.diagnostics.pipeline_options import options_for
+from kvip.diagnostics import replay_measure
+from kvip.diagnostics.pipeline_options import DEFAULT_VARIANTS, options_for, q_workers_for, validate_options
 
 
 def _arguments(tmp_path, monkeypatch, variants=None):
@@ -94,6 +95,18 @@ def _case(args, name):
         )
         if role == "candidate":
             result["tuning"].update(options_for(name.removeprefix("candidate-")))
+        result["tuning"]["q_workers"] = q_workers_for(name.removeprefix("candidate-")) if role == "candidate" else 2
+        result["native_diagnostics"] = dict(
+            count=args.diagnostic_replays,
+            included_in_timing=False,
+            units="raw_device_cycles",
+            samples=[
+                dict(
+                    metrics={"cq_drain": dict(status="available", samples_cycles=[10, 20, 30])}, raw={"fetch": [[123]]}
+                )
+                for _ in range(args.diagnostic_replays)
+            ],
+        )
     return result
 
 
@@ -114,14 +127,14 @@ def test_commands_match_actual_replay_parser_and_only_four_processes(tmp_path, m
         assert parsed.upstream_root == getattr(args, job["role"] + "_root")
         assert parsed.upstream_revision == getattr(args, job["role"] + "_sha")
         assert parsed.transport == "urma" and parsed.threshold_policy == job["policy"]
-        assert parsed.mode == job["mode"] and parsed.diagnostic_replays == 0
+        assert parsed.mode == job["mode"] and parsed.diagnostic_replays == int(job["mode"] == "fused")
         if job["mode"] == "serial":
             assert parsed.serial_workers == 32
         else:
             assert parsed.serial_workers is None
         if job["role"] == "candidate":
             assert parsed.study == "post-threshold"
-            assert parsed.pipeline_variants == ["control", "topk", "metadata", "ready", "init", "combined"]
+            assert parsed.pipeline_variants == list(DEFAULT_VARIANTS)
         else:
             assert parsed.study == "threshold" and not parsed.pipeline_variants
 
@@ -176,6 +189,10 @@ def test_run_preserves_reverse_candidate_order_and_all_sources(tmp_path, monkeyp
     assert "vsControl_p50/mean%" in printed
     assert "TRAFFIC cold_miss%=10.0000 read_MiB=0.0038 unused_bytes=656.0 unused_MiB=0.0006" in printed
     assert "whole_graph_GBps=0.044" in printed and "not link bandwidth/utilization" in printed
+    assert "get_drain=20" in printed and "do not sum" in printed
+    assert json.loads((args.result_dir / "candidate.json").read_text())["cases"]["control"]["native_diagnostics"][
+        "samples"
+    ][0]["raw"] == {"fetch": [[123]]}
 
 
 def test_child_failure_retains_log_and_emits_only_last_30_lines(tmp_path, monkeypatch, capsys):
@@ -212,6 +229,8 @@ def test_child_failure_retains_log_and_emits_only_last_30_lines(tmp_path, monkey
         ("count", "incomplete or invalid"),
         ("mean", "retained samples"),
         ("scope", "scope differs"),
+        ("workers", "q_workers differs"),
+        ("profile", "diagnostic contract"),
     ],
 )
 def test_summary_rejects_unfair_or_invalid_results(tmp_path, monkeypatch, change, error):
@@ -238,8 +257,12 @@ def test_summary_rejects_unfair_or_invalid_results(tmp_path, monkeypatch, change
         target["timing"]["samples_us"].pop()
     elif change == "mean":
         target["timing"]["mean_us"] = 1
-    else:
+    elif change == "scope":
         target["scope"] = "fetch-only"
+    elif change == "workers":
+        target["tuning"]["q_workers"] = 4
+    else:
+        target["native_diagnostics"]["included_in_timing"] = True
     with pytest.raises(ValueError, match=error):
         compare.summarize(args, reports, compare.file_digest(args.snapshot / "manifest.json"))
 
@@ -279,6 +302,75 @@ def test_no_control_does_not_substitute_cross_arena_pr(tmp_path, monkeypatch, ca
     assert all(row["gains"]["vs_control"] is None for row in summary["table"].values())
     compare.print_summary(summary)
     assert "n/a" in capsys.readouterr().out
+
+
+def test_new_variants_worker_budget_and_control_end_drift(tmp_path, monkeypatch, capsys):
+    args = _arguments(tmp_path, monkeypatch)
+    reports = _reports(args)
+    reports["candidate-control-end"]["timing"].update(
+        mean_us=99, p50_us=99, min_us=99, max_us=99, samples_us=[99, 99, 99]
+    )
+    summary = compare.summarize(args, reports, compare.file_digest(args.snapshot / "manifest.json"))
+    assert summary["control_end_drift"]["mean"]["drift_pct"] == pytest.approx(10)
+    assert summary["control_end_drift"]["p50"]["delta_us"] == 9
+    assert summary["table"]["candidate-workers4"]["gains"]["vs_control"]["mean_reduction_pct"] == 0
+    assert summary["table"]["candidate-workers4"]["tuning"]["q_workers"] == 4
+    assert summary["table"]["candidate-control"]["tuning"]["q_workers"] == 2
+    assert summary["metadata_end_vs_control_end"]["mean"]["reduction_pct"] == pytest.approx(100 / 11)
+    compare.print_summary(summary)
+    printed = capsys.readouterr().out
+    assert "CONTROL_DRIFT mean=+9.000us/+10.00% p50=+9.000us/+10.00% no_correction" in printed
+    assert "END_PAIR metadata-end_vs_control-end mean=+9.09% p50=+9.09% no_drift_correction" in printed
+
+
+def test_ready_batch_dependencies_and_worker_options_are_independent():
+    expected = dict(
+        final_topk_prune=False,
+        selected_metadata=True,
+        early_fetch_ready=True,
+        compact_init=False,
+        ready_batch_fetch=True,
+    )
+    assert options_for("ready-batch") == options_for("ready-batch4") == expected
+    assert q_workers_for("ready-batch") == 2 and q_workers_for("ready-batch4") == 4
+    assert options_for("workers4") == options_for("metadata")
+    assert options_for("control-end") == options_for("control")
+    assert options_for("metadata-end") == options_for("metadata")
+    assert validate_options(expected) == expected
+    with pytest.raises(ValueError, match="requires"):
+        validate_options(expected | {"selected_metadata": False})
+    with pytest.raises(ValueError, match="bool"):
+        validate_options(expected | {"ready_batch_fetch": 1})
+
+
+def test_study_delivers_each_worker_count_and_reuses_one_arena(monkeypatch):
+    args = SimpleNamespace(
+        study="post-threshold",
+        mode="fused",
+        transport="urma",
+        threshold_policy="recent",
+        pipeline_variants=list(DEFAULT_VARIANTS),
+    )
+    context, allocated, calls = object(), [], []
+    monkeypatch.setattr(replay_measure, "allocate_context", lambda *args: allocated.append(context) or context)
+    monkeypatch.setattr(replay_measure, "release_context", lambda value: allocated.remove(value))
+
+    def measure(args, archive, passed_context, retained):
+        assert passed_context is context and len(allocated) == 1
+        name = retained["progress"]["variant"]
+        calls.append((name, args.pipeline_q_workers, dict(args.pipeline_options)))
+        return dict(
+            timing={"p50_us": 10},
+            selection_comparison={"ordered_output_sha256": "same"},
+            threshold_comparison={"initial_keys": [10], "final_keys": [20]},
+        )
+
+    monkeypatch.setattr(replay_measure, "measure_case", measure)
+    result = replay_measure.run(args, SimpleNamespace(manifest={}), {})
+    assert not allocated
+    assert result["execution_order"] == list(DEFAULT_VARIANTS)
+    assert calls == [(name, q_workers_for(name), options_for(name)) for name in DEFAULT_VARIANTS]
+    assert [row[1] for row in calls] == [2, 2, 2, 4, 4, 2, 2]
 
 
 def test_wrong_candidate_order_or_missing_case_is_rejected():

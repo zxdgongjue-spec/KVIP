@@ -11,12 +11,13 @@ import json
 import math
 import os
 from pathlib import Path
+from statistics import median
 import subprocess
 import sys
 
 from kvip.diagnostics.archive import file_digest, source_commit
 from kvip.diagnostics.compare import read_means, reduction, timing_spread
-from kvip.diagnostics.pipeline_options import OPTIONS, VARIANTS, options_for
+from kvip.diagnostics.pipeline_options import DEFAULT_VARIANTS, OPTIONS, VARIANTS, options_for, q_workers_for
 from kvip.diagnostics.upstream import validate_checkout
 
 
@@ -32,10 +33,14 @@ def arguments(argv=None):
     parser.add_argument("--soc", default="Ascend950DT_9582")
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=10)
-    parser.add_argument("--pipeline-variants", nargs="+", choices=tuple(VARIANTS), default=list(VARIANTS))
+    parser.add_argument(
+        "--diagnostic-replays", type=int, default=1, help="Separate fused diagnostic replays after headline timing"
+    )
+    parser.add_argument("--pipeline-variants", nargs="+", choices=tuple(VARIANTS), default=list(DEFAULT_VARIANTS))
     parser.add_argument("--result-dir", type=Path, required=True)
+    parser.add_argument("--topk-probe", action="store_true", help="Independent pruning-counter replay after all headline timings")
     args = parser.parse_args(argv)
-    if args.device < 0 or args.warmup < 0 or args.iterations < 1:
+    if args.device < 0 or args.warmup < 0 or args.iterations < 1 or args.diagnostic_replays < 0:
         parser.error("Require nonnegative device/warmup and positive iterations")
     if len(set(args.pipeline_variants)) != len(args.pipeline_variants):
         parser.error("pipeline-variants must be unique; order is preserved")
@@ -103,8 +108,12 @@ def command(args, job):
     ]
     if job["mode"] == "serial":
         result += ["--serial-workers", "32"]
+    else:
+        result += ["--diagnostic-replays", str(args.diagnostic_replays)]
     if job["role"] == "candidate":
         result += ["--pipeline-variants", *args.pipeline_variants]
+        if getattr(args, "topk_probe", False):
+            result += ["--topk-probe"]
     return result
 
 
@@ -166,12 +175,53 @@ def _validate_case(args, name, result, manifest_digest):
         if any(result.get(key) != value for key, value in serial.items()):
             raise ValueError("Main serial must use 32 workers, post=128, inflight=2048 and two jettys/core")
     else:
+        requested_workers = q_workers_for(name.removeprefix("candidate-")) if role == "candidate" else 2
+        if result.get("tuning", {}).get("q_workers") != requested_workers:
+            raise ValueError(f"{name}: fused q_workers differs from the requested variant")
         if result.get("score_comparison", {}).get("status") != "bit_exact":
             raise ValueError(f"{name}: fused captured LI scores were not verified bit-exact")
         threshold = result.get("threshold_comparison") or {}
         policy = "resident" if name == "main-resident" else "recent"
         if threshold.get("status") != "bit_exact" or threshold.get("policy") != policy:
             raise ValueError(f"{name}: initial threshold policy was not verified bit-exact")
+        if args.diagnostic_replays:
+            profile = result.get("native_diagnostics") or {}
+            if (
+                profile.get("included_in_timing") is not False
+                or profile.get("units") != "raw_device_cycles"
+                or profile.get("count") != args.diagnostic_replays
+                or len(profile.get("samples", [])) != args.diagnostic_replays
+            ):
+                raise ValueError(f"{name}: missing separate uninstrumented-headline diagnostic contract")
+
+
+def profile_summary(result):
+    """Pool only raw samples of the same role; never sum overlapping stages."""
+    profile = result.get("native_diagnostics")
+    if not profile:
+        return None
+    fields = {
+        "ready_wait": "fetch_query_ready_wait",
+        "get_post": "post_active",
+        "get_drain": "cq_drain",
+        "get_native": "fetch_native_get",
+        "get_pack": "fetch_pack",
+        "producer": "producer_span",
+        "index": "index_consumer_span",
+        "index_metadata": "index_metadata",
+        "dependency_wait": "fetch_dependency_wait",
+        "prefetch_join": "final_prefetch_join",
+    }
+    values = {}
+    for label, key in fields.items():
+        samples = []
+        for replay in profile["samples"]:
+            metric = replay.get("metrics", {}).get(key, {})
+            if metric.get("status") == "available":
+                samples.extend(metric["samples_cycles"])
+        values[label] = dict(count=len(samples), p50_cycles=float(median(samples)) if samples else None)
+    return dict(count=profile["count"], units="raw_device_cycles", included_in_timing=False, metrics=values,
+                ready_batch_counts=[item["ready_batch_counts"] for item in profile["samples"] if item.get("ready_batch_counts")])
 
 
 def summarize(args, results, manifest_digest):
@@ -201,7 +251,9 @@ def summarize(args, results, manifest_digest):
             tuning = result.get("tuning") or {}
             if {key: tuning.get(key) for key in OPTIONS} != expected_options:
                 raise ValueError(f"{name}: candidate build options differ")
-            if {key: value for key, value in tuning.items() if key not in OPTIONS} != pr.get("tuning"):
+            if {key: value for key, value in tuning.items() if key not in (*OPTIONS, "q_workers")} != {
+                key: value for key, value in pr.get("tuning", {}).items() if key != "q_workers"
+            }:
                 raise ValueError(f"{name}: candidate changed another tuning option or prefetch budget")
     table = {}
     control = results.get("candidate-control")
@@ -230,6 +282,7 @@ def summarize(args, results, manifest_digest):
             tuning=result.get("tuning"),
             selection_comparison=result["selection_comparison"],
             threshold_comparison=result.get("threshold_comparison"),
+            diagnostic_summary=profile_summary(result),
         )
         table[name]["gains"]["vs_control"] = (
             {
@@ -239,6 +292,29 @@ def summarize(args, results, manifest_digest):
             if control is not None and name.startswith("candidate-")
             else None
         )
+    control_end = results.get("candidate-control-end")
+    drift = None
+    if control is not None and control_end is not None:
+        drift = {
+            metric: dict(
+                start_us=control["timing"][metric + "_us"],
+                end_us=control_end["timing"][metric + "_us"],
+                delta_us=control_end["timing"][metric + "_us"] - control["timing"][metric + "_us"],
+                drift_pct=100 * (control_end["timing"][metric + "_us"] / control["timing"][metric + "_us"] - 1),
+            )
+            for metric in ("mean", "p50")
+        }
+    end_pair = None
+    metadata_end = results.get("candidate-metadata-end")
+    if metadata_end is not None and control_end is not None:
+        end_pair = {
+            metric: dict(
+                control_us=control_end["timing"][metric + "_us"],
+                metadata_us=metadata_end["timing"][metric + "_us"],
+                reduction_pct=reduction(control_end["timing"][metric + "_us"], metadata_end["timing"][metric + "_us"]),
+            )
+            for metric in ("mean", "p50")
+        }
     return dict(
         schema_version=1,
         status="pass",
@@ -252,6 +328,9 @@ def summarize(args, results, manifest_digest):
         execution_order=list(results),
         candidate_shared_arena_order=args.pipeline_variants,
         primary_candidate_comparison="vs_control" if control is not None else None,
+        control_end_drift=drift,
+        metadata_end_vs_control_end=end_pair,
+        diagnostic_replays_per_fused_case=args.diagnostic_replays,
         serial_configuration=dict(workers=32, post_size=128, max_inflight=2048, jettys_per_core=2),
         serial_fused_selected_sets_identical=(
             first["selection_comparison"]["selected_set_sha256"] == pr["selection_comparison"]["selected_set_sha256"]
@@ -263,6 +342,7 @@ def summarize(args, results, manifest_digest):
             "Main serial, main fused and PR fused use separate processes/arenas. Only candidate variants share one arena.",
             "Execution order is retained; no randomized order, confidence interval or cross-process physical-placement equivalence is claimed.",
             "All timing/read samples are retained. Mean/p50 tail heuristics are not significance tests.",
+            "Control-end drift is reported without correction. Instrumented role cycles are separate from headline timings and cannot be added into graph latency.",
             "Serial and fused TopK may differ only as accepted by the existing replay oracle; their measured cold/transfer counts remain separate.",
         ],
     )
@@ -287,6 +367,18 @@ def print_summary(summary):
             f"{serial['p50_reduction_pct']:+8.2f}/{serial['mean_reduction_pct']:+8.2f}",
             flush=True,
         )
+        profile = row["diagnostic_summary"]
+        if profile is not None:
+            fields = [
+                f"{key}=" + ("n/a" if value["p50_cycles"] is None else f"{value['p50_cycles']:.0f}")
+                for key, value in profile["metrics"].items()
+            ]
+            print("  PROFILE p50_cycles " + " ".join(fields), flush=True)
+            if profile["ready_batch_counts"]:
+                counts = profile["ready_batch_counts"]
+                print("  GET_BATCH " + " ".join(
+                    f"calls={item['native_calls']} requests={item['completed_requests']} workers={item['worker_count']}"
+                    for item in counts), flush=True)
         reads = row["reads"]
         print(
             f"  TRAFFIC cold_miss%={100 * reads['cold_miss_rate']:.4f} "
@@ -302,6 +394,25 @@ def print_summary(summary):
             )
     print("CHECK fused_scores=bit_exact fused_ordered_topk=unchanged candidate_thresholds=PR_bit_exact", flush=True)
     print("ORDER " + " -> ".join(summary["execution_order"]), flush=True)
+    if summary["control_end_drift"] is not None:
+        drift = summary["control_end_drift"]
+        print(
+            f"CONTROL_DRIFT mean={drift['mean']['delta_us']:+.3f}us/{drift['mean']['drift_pct']:+.2f}% "
+            f"p50={drift['p50']['delta_us']:+.3f}us/{drift['p50']['drift_pct']:+.2f}% no_correction",
+            flush=True,
+        )
+    if summary["metadata_end_vs_control_end"] is not None:
+        pair = summary["metadata_end_vs_control_end"]
+        print(
+            f"END_PAIR metadata-end_vs_control-end mean={pair['mean']['reduction_pct']:+.2f}% "
+            f"p50={pair['p50']['reduction_pct']:+.2f}% no_drift_correction",
+            flush=True,
+        )
+    if summary["diagnostic_replays_per_fused_case"]:
+        print(
+            "PROFILE_SCOPE separate instrumented replays; raw role cycles overlap: do not sum or convert to graph us.",
+            flush=True,
+        )
     print(
         "SCOPE candidate gains primarily vs same-arena control; baseline arenas are separate. "
         "whole_graph_GBps is not link bandwidth/utilization; gains are not significance tests.",
@@ -334,6 +445,7 @@ def run(args):
     python_root = str(Path(__file__).resolve().parents[2])
     env["PYTHONPATH"] = python_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     results = {}
+    probe_report = None
     for job in plan:
         name = job["name"]
         output, log = (args.result_dir / (name + suffix) for suffix in (".json", ".log"))
@@ -352,6 +464,14 @@ def run(args):
             for case_name, case in cases.items():
                 _validate_case(args, case_name, case, manifest_digest)
             results.update(cases)
+            if job["role"] == "candidate" and getattr(args, "topk_probe", False):
+                probe_report = report["topk_probe_report"]
+                reference = next(iter(cases.values()))
+                if "timing" in probe_report or probe_report.get("status") != "pass":
+                    raise ValueError("TopK probe must pass without contributing a latency sample")
+                for key in ("production_source", "snapshot_sha256", "score_comparison", "selection_comparison", "threshold_comparison"):
+                    if probe_report.get(key) != reference.get(key):
+                        raise ValueError(f"TopK probe differs from its checked production reference: {key}")
         except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
             provenance.update(
                 status="failed",
@@ -381,10 +501,16 @@ def run(args):
         )
         raise SystemExit(1) from error
     summary["result_files"] = {job["name"]: str(args.result_dir / (job["name"] + ".json")) for job in plan}
+    if probe_report is not None:
+        summary["topk_probe"] = probe_report["topk_probe"]
     (args.result_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     provenance.update(status="pass", completed_cases=list(results))
     provenance_path.write_text(json.dumps(provenance, indent=2) + "\n")
     print_summary(summary)
+    if probe_report is not None:
+        from kvip.diagnostics.topk_probe import print_summary as print_probe
+
+        print_probe(probe_report["topk_probe"])
     print(f"PIPELINE_COMPARE_PASS RESULT={args.result_dir / 'summary.json'}", flush=True)
     return summary
 

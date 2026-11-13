@@ -96,3 +96,17 @@ def test_compile_switches_reject_non_boolean_values(bad):
         recent_build_options(unified_topk=bad)
     with pytest.raises(ValueError, match="boolean"):
         validate_fused_tuning({"recent_pipeline": bad}, "ubmem")
+
+
+def test_four_query_workers_reserve_enough_queue_pairs_even_for_small_batch():
+    from types import SimpleNamespace
+    from kvip.diagnostics.replay_runtime import runtime_worker_config
+
+    args = SimpleNamespace(transport='urma', mode='fused', serial_workers=None,
+                           study='post-threshold', pipeline_variants=['control', 'workers4'])
+    for batch in (1, 4, 16):
+        archive = SimpleNamespace(manifest={'geometry': {'batch': batch, 'aic_count': 32}})
+        result = runtime_worker_config(args, archive, 32)
+        assert result['runtime_workers'] * 2 >= 2 * batch + 8 * 4
+        if batch == 16:
+            assert result['runtime_workers'] == 40

@@ -177,3 +177,21 @@ def test_grouped_urma_post_and_cq_counters_are_deduplicated_by_query_worker():
     queries[2, 0, 13] += 1
     with pytest.raises(ValueError, match="Replicated shared Q-worker"):
         native_profile.decode_profile(raw, batch=batch, workers=workers, resolver_cores=3, transport="urma")
+
+
+def test_ready_batch_native_durations_exclude_inter_call_wait_and_deduplicate():
+    batch, workers = 4, 2
+    raw = np.zeros(batch * 256 + (3 * batch + 4 * workers) * 32, dtype=np.int64)
+    q = raw[batch * 128:batch * 256].reshape(batch, 128)[:, :96].reshape(batch, 4, 24)
+    for b, query in np.ndindex(batch, 4):
+        q[b, query, [3, 4, 12, 13, 18, 19, 20, 21, 22, 23]] = [100, 900, 20, 300, 100, 60, 4, 600, 128, 2]
+    result = native_profile.decode_profile(raw, batch=batch, workers=workers, resolver_cores=3, transport='urma')
+    assert result['metrics']['fetch_batch_envelope']['median_cycles'] == 800
+    assert result['metrics']['fetch_native_get']['median_cycles'] == 600
+    assert result['metrics']['fetch_pack']['median_cycles'] == 60
+    assert result['metrics']['fetch_safe_submit_or_sync']['status'] == 'unavailable'
+    assert result['metrics']['cq_drain']['count'] == 8
+    assert result['ready_batch_counts'] == dict(native_calls=16, completed_requests=1024, worker_count=8)
+    q[2, 0, 23] = 9
+    with pytest.raises(ValueError, match='Replicated shared'):
+        native_profile.decode_profile(raw, batch=batch, workers=workers, resolver_cores=3, transport='urma')

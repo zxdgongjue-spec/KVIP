@@ -23,10 +23,15 @@ def runtime_worker_config(args, archive, aics):
     g = archive.manifest["geometry"]
     if aics < g["aic_count"]:
         raise ValueError("Replay NPU has fewer AICs than captured geometry")
+    q_workers = 2
+    if getattr(args, "study", None) == "post-threshold":
+        from kvip.diagnostics.pipeline_options import q_workers_for
+
+        q_workers = max([2, *(q_workers_for(name) for name in args.pipeline_variants)])
     workers = (
         2
         if args.transport == "ubmem"
-        else (max(g["batch"] * (final_aivs(g["batch"], "auto", aics) + 1), 2 * g["batch"] + 16) + 1) // 2
+        else (max(g["batch"] * (final_aivs(g["batch"], "auto", aics) + 1), 2 * g["batch"] + 8 * q_workers) + 1) // 2
     )
     return dict(runtime_workers=workers, runtime_workers_source="fused queue geometry")
 

@@ -57,11 +57,15 @@ def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_
     interval("fetch_dependency_wait", queries, 5, 6)
     get_queries = queries
     get_scope = "Per-request query Get intervals"
-    if transport == "urma" and np.any(queries[:, 20] == 3):
-        if np.any(queries[:, 20] != 3):
+    ready_batches = transport == "urma" and np.any(queries[:, 20] == 4)
+    if transport == "urma" and (np.any(queries[:, 20] == 3) or ready_batches):
+        mode = 4 if ready_batches else 3
+        if np.any(queries[:, 20] != mode):
             raise ValueError("Mixed grouped/per-request URMA diagnostic modes")
         shaped = queries.reshape(batch, 4, 24)
         fields = [3, 4, 7, 8, 12, 13, 14, 15, 16, 17]
+        if ready_batches:
+            fields += [18, 19, 21, 22, 23]
         for b in range(batch):
             if not np.array_equal(shaped[b][:, fields], shaped[b % workers][:, fields]):
                 raise ValueError("Replicated shared Q-worker timestamps disagree")
@@ -76,8 +80,20 @@ def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_
                 max_cycles=max(values),
                 samples_cycles=values,
             )
-    interval("fetch_safe_submit_or_sync", get_queries, 3, 4)
-    interval("fetch_conflict_get", get_queries, 7, 8)
+    if ready_batches:
+        # The first-start/last-end envelope contains inter-call polling/packing.
+        # Keep it distinct from the sum of actual native Get call durations.
+        interval("fetch_batch_envelope", get_queries, 3, 4)
+        for name, field in (("fetch_native_get", 21), ("fetch_pack", 19), ("fetch_ready_prepare", 18)):
+            values = [int(row[field]) for row in get_queries]
+            metrics[name] = dict(status="available", count=len(values), median_cycles=float(np.median(values)),
+                                 max_cycles=max(values), samples_cycles=values)
+        for name in ("fetch_safe_submit_or_sync", "fetch_conflict_get"):
+            metrics[name] = dict(status="unavailable", count=0, median_cycles=None, max_cycles=None, samples_cycles=[])
+        get_scope += "; ready-batch native time is the sum of calls, envelope includes between-call work; counts are deduplicated by worker"
+    else:
+        interval("fetch_safe_submit_or_sync", get_queries, 3, 4)
+        interval("fetch_conflict_get", get_queries, 7, 8)
     if transport == "urma":
         interval("final_prefetch_join", fetch, 96, 100)
         interval("final_index_and_query_join", fetch, 100, 97)
@@ -85,6 +101,11 @@ def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_
         interval("final_status", fetch, 98, 99)
     return dict(
         metrics=metrics,
+        ready_batch_counts=(dict(
+            native_calls=sum(int(row[23]) for row in get_queries),
+            completed_requests=sum(int(row[22]) for row in get_queries),
+            worker_count=len(get_queries),
+        ) if ready_batches else None),
         raw=dict(
             batch=batch,
             workers_per_query=workers,

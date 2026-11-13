@@ -77,6 +77,8 @@ def create_fused(
     split_index_stages=False,
     upstream=False,
     pipeline_options=None,
+    q_workers=2,
+    topk_probe=False,
 ):
     from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
     from kvip.operators.lifetch.binding import LIFetchBinding
@@ -89,6 +91,10 @@ def create_fused(
 
     if split_index_stages:
         raise ValueError("Streaming stages overlap; use the complete production graph timing")
+    if type(q_workers) is not int or q_workers not in (1, 2, 4):
+        raise ValueError("q_workers must be 1, 2 or 4")
+    if q_workers != 2 and (not upstream or pipeline_options is None or transport != "urma"):
+        raise ValueError("Nondefault q_workers requires an exact URMA pipeline candidate")
     tuning = validate_fused_tuning(tuning or {}, transport)
     g = archive.manifest["geometry"]
     b, h, r = (g[n] for n in ("batch", "history", "resident"))
@@ -135,6 +141,7 @@ def create_fused(
             recent_threshold=tuning.get("recent_threshold", False),
             prefetch_limit=512,
             window_limit=64,
+            q_workers=q_workers,
         )
         build_options = {}  # Production owns its implementation; no legacy experiment flags.
         if pipeline_options is not None:
@@ -144,8 +151,13 @@ def create_fused(
                 raise ValueError("Pipeline options require the exact URMA recent production checkout")
             build_options = validate_options(pipeline_options)
             effective.update(build_options)
+            if topk_probe:
+                build_options["topk_prune_diagnostics"] = True
+                effective["topk_prune_diagnostics"] = True
     elif pipeline_options is not None:
         raise ValueError("Pipeline variants cannot use legacy experiment production code")
+    if topk_probe and (not upstream or pipeline_options is None or not build_options.get("final_topk_prune")):
+        raise ValueError("TopK probe requires the exact production pruning candidate")
     threshold_bounds = None
     if effective["recent_threshold"]:
         # Immutable per-replay bounds; all scoring/merging occurs inside forward.
@@ -239,7 +251,7 @@ def create_fused(
         query_inputs=workspace.inputs,
         outputs=torch.empty((2, b * 4, 1, 2048), dtype=torch.int32, device=device),
     )
-    forward = LIFetchForward(rotating, update)
+    forward = LIFetchForward(rotating, update, **({"q_workers": q_workers} if q_workers != 2 else {}))
     selector = SimpleNamespace(
         storage=storage, inputs=workspace.inputs, rotating=rotating, update=update, topk=workspace.topk
     )
