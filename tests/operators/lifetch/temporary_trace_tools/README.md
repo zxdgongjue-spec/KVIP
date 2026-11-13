@@ -134,3 +134,15 @@ Gaussian coordinates approximate higher-order structure, and scale correlation
 within each bucket is not retained. Sampled selection statistics are not full-history
 TopK or actual prefetch counts. The existing benchmark generator is unchanged.
 CPU scores approximate the mathematical operator, not instruction-level rounding.
+
+Version 3 replaces independent per-head draws with joint cross-head Q residual
+covariance and joint weight/scale/norm covariance. A fixed 12-candidate search
+adjusts Q differences and conditional Index noise using four fitting snapshots.
+Its objective includes input standard deviations, Q cosine, score quantiles,
+selection overlap and union ratio. It never edits scores or TopK after generation.
+`tuning.json` saves every candidate and the fitting targets. Evaluation uses only
+the other captures and different random seeds; no evaluation metric selects a
+candidate. This is a bounded CPU parameter search, not neural-network training.
+Old parameter files must be refitted. Use a new output directory such as
+`/tmp/lifetch-generator-v3`. The model still needs real-capture evaluation: a
+lower fitting loss alone does not establish realistic benchmark behavior.

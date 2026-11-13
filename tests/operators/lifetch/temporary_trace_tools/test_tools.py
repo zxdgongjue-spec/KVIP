@@ -156,6 +156,21 @@ def test_generator_cli_writes_comparison_and_audit(tmp_path, monkeypatch):
     output = tmp_path / 'result'
     monkeypatch.setattr(sys, 'argv', ['fit_generator.py', str(tmp_path), '--output', str(output)])
     fit_generator.main()
-    assert json.loads((output/'generator.json').read_text())['schema_version'] == 2
+    assert json.loads((output/'generator.json').read_text())['schema_version'] == 3
     assert json.loads((output/'score_audit.json').read_text())[0]['inversions'] == 0
     assert 'score_p99' in json.loads((output/'comparison.json').read_text())
+
+
+def test_cross_head_joint_variation_survives_generation():
+    from fit_generator import fit, generate
+    rows = []
+    for level in (1., 2., 3., 4.):
+        weights = np.tile([level, -level], (4, 1)).astype(np.float32)
+        rows.append(dict(query=np.ones((4, 2, 128), np.float32),
+                         keys=np.ones((128, 128), np.float32), weights=weights,
+                         query_scale=np.ones((4, 2), np.float32),
+                         key_scale=np.ones(128, np.float32)))
+    parameters = fit(rows)
+    for seed in range(5):
+        generated = generate(parameters, 128, seed)
+        np.testing.assert_allclose(generated['weights'][:, 0], -generated['weights'][:, 1])
