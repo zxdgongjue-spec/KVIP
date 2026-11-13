@@ -363,6 +363,27 @@ def run_v9_li_varlen_only(
             "key_lengths": (half, 0, history, three_quarter),
         },
     )
+    if getattr(args, "li_core_sweep", False):
+        scenarios += (
+            {
+                "name": "balanced_full_q4",
+                "query_counts": (4, 4, 4, 4),
+                "query_starts": (0, 4, 8, 12),
+                "key_lengths": (history,) * 4,
+            },
+            {
+                "name": "mixed_k_full_q4",
+                "query_counts": (4, 4, 4, 4),
+                "query_starts": (0, 4, 8, 12),
+                "key_lengths": (quarter, half, three_quarter, history),
+            },
+            {
+                "name": "extreme_k_full_q4",
+                "query_counts": (4, 4, 4, 4),
+                "query_starts": (0, 4, 8, 12),
+                "key_lengths": (resident, resident, resident, history),
+            },
+        )
 
     summaries = []
     for scenario in scenarios:
@@ -784,6 +805,7 @@ def run_v9_li_varlen_only(
         "test": "custom_v9_li_variable_actual_qk_lengths",
         "soc": args.soc,
         "li_tiling": getattr(args, "li_tiling", "auto"),
+        "li_core_sweep": bool(getattr(args, "li_core_sweep", False)),
         "li_cores": int(rotating.runtime_shape.liCores),
         "rotation_epochs": int(rotating.runtime_shape.rounds),
         "batch": b,

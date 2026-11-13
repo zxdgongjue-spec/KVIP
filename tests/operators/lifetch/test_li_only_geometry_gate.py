@@ -120,3 +120,29 @@ def test_q4_rejects_non_li_only_scope(lifetch_cli):
     with pytest.raises(SystemExit) as exc:
         lifetch_cli.main(args)
     assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("tiling", ["auto", "q4"])
+def test_li_core_sweep_forwarded_in_both_cli_layers(lifetch_cli, monkeypatch, tiling):
+    commands = []
+    monkeypatch.setattr(lifetch_cli.subprocess, "call", lambda command: commands.append(command) or 0)
+    args = cli_args(prefetch=0) + ["--li-core-sweep", "--li-tiling", tiling]
+    assert lifetch_cli.main(args) == 0
+    assert "--li-core-sweep" in commands[0]
+    internal = lifetch_cli.arguments(args[2:])
+    assert internal.li_core_sweep is True
+    assert internal.li_tiling == tiling
+
+
+def test_li_core_sweep_requires_prefetch_zero(lifetch_cli):
+    with pytest.raises(SystemExit) as exc:
+        lifetch_cli.main(cli_args(prefetch=64) + ["--li-core-sweep"])
+    assert exc.value.code == 2
+
+
+def test_li_core_sweep_scenarios_are_opt_in():
+    path = Path(__file__).with_name("support") / "lifetch.py"
+    source = path.read_text()
+    for name in ("balanced_full_q4", "mixed_k_full_q4", "extreme_k_full_q4"):
+        assert name in source
+    assert 'if getattr(args, "li_core_sweep", False):' in source
