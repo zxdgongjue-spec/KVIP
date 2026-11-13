@@ -32,7 +32,7 @@ def payload(owner, tokens, token_bytes):
     )
 
 
-def controlled_fixture(history, resident, heads, miss_percent, seed=20261104):
+def controlled_fixture(history, resident, heads, miss_percent, seed=20261104, compact=False):
     """Use precisely the same deterministic Q4 fixture as URMA's A/B test."""
     support = Path(__file__).resolve().parent
     if str(support) not in sys.path:
@@ -41,7 +41,9 @@ def controlled_fixture(history, resident, heads, miss_percent, seed=20261104):
 
     with tempfile.TemporaryDirectory(prefix="kvip-ubmem-fixture-") as tmp:
         root = Path(tmp) / "fixture"
-        info = prepare_full_chain_fixture(root, history, resident, miss_percent, index_heads=heads, seed=seed)
+        from compact_fixture import prepare_compact_fixture
+        prepare_fixture = prepare_compact_fixture if compact else prepare_full_chain_fixture
+        info = prepare_fixture(root, history, resident, miss_percent, index_heads=heads, seed=seed)
         data = {
             "info": info,
             "order": np.load(root / "physical_to_logical.npy").astype(np.int64),
@@ -95,14 +97,15 @@ def check_shape(
     serial_compare=False,
     check_case=None,
     shared_pool=None,
+    compact=False,
 ):
     batch, history, resident, token_bytes = shape.batch, shape.history, shape.resident, shape.token_bytes
     checks = CorrectnessRecorder()
-    fixture_key = ('ubmem', history, resident, shape.heads, miss_percent, seed)
+    fixture_key = ('ubmem', compact, history, resident, shape.heads, miss_percent, seed)
     if shared_pool is not None and fixture_key in shared_pool.fixtures:
         fixture = shared_pool.fixtures[fixture_key]
     else:
-        fixture = controlled_fixture(history, resident, shape.heads, miss_percent, seed=seed)
+        fixture = controlled_fixture(history, resident, shape.heads, miss_percent, seed=seed, compact=compact)
         if shared_pool is not None:
             shared_pool.fixtures[fixture_key] = fixture
     expected_ids = fixture["expected"]
@@ -310,9 +313,12 @@ def check_shape(
                         f"slot={hot_slots[difference[0]]} byte={difference[1]}"
                     )
                 for query in range(count):
-                    assert np.array_equal(np.sort(logical[output_row]), expected_ids[query]), (
-                        "LI selected the wrong TopK set"
-                    )
+                    if compact:
+                        from compact_fixture import validate_topk
+                        validate_topk(logical[output_row], fixture['scores'][query, fixture['order']][None, :])
+                    else:
+                        assert np.array_equal(np.sort(logical[output_row]), expected_ids[query]), (
+                            "LI selected the wrong TopK set")
                     selected_slots = torch.from_numpy(slots[output_row].astype(np.int64)).to(device)
                     actual_device = torch.index_select(output[owner], 0, selected_slots)
                     expected_device = source.view(batch, history, token_bytes)[owner - 1,
@@ -371,6 +377,10 @@ def check_shape(
         if np.any(native_ids < 0) or np.any(native_ids >= history):
             raise RuntimeError("Native LI output is outside allocated history")
         def check_native_topk(selected=native_ids):
+            if compact:
+                from compact_fixture import validate_topk
+                validate_topk(selected, fixture['scores'][:, fixture['order']])
+                return
             assert np.all(np.sort(selected, axis=-1) == expected_ids[None, :, :]), (
                 "Native LI differs from the independent controlled TopK oracle")
         checks.check('native_topk', check_native_topk)
@@ -454,13 +464,17 @@ def check_shape(
             f"final_completed={int(first_counters[:, 4].sum())} "
             f"native_required={batch * cold_count} "
             f"requested_miss_pct={miss_percent:g} actual_misses_per_query={fixture['info']['final_misses_per_query']} "
-            f"Q4_union_per_request={cold_count} fixture=shared_urma_seed20261104",
+            f"Q4_union_per_request={cold_count} fixture={fixture['info']['model']}",
             flush=True,
         )
         def verify_cold_reads():
-            if cold_count:
+            required = np.full(batch, cold_count)
+            if compact:
+                ids = update.logical_output.cpu().numpy().reshape(batch, -1)
+                required = np.array([len(np.unique(row[row >= resident])) for row in ids])
+            if np.any(required):
                 assert np.any(first_counters[:, 1] + first_counters[:, 3]), "Fixture did not exercise a cold DDR fetch"
-            assert np.all(first_counters[:, 3] >= max(0, cold_count - prefetch_tokens)), (
+            assert np.all(first_counters[:, 3] >= np.maximum(0, required - prefetch_tokens)), (
                 "Final repair must fetch all missing TopK rows even beyond the speculative budget")
         checks.check('cold_read_coverage', verify_cold_reads)
         if check_case:
@@ -547,7 +561,7 @@ def check_shape(
             result = dict(
                 transport="ubmem", batch=batch, history=history, resident=resident,
                 index_heads=shape.heads, token_bytes=token_bytes, seed=seed,
-                prefetch_tokens=prefetch_tokens, miss_percent=miss_percent,
+                prefetch_tokens=prefetch_tokens, miss_percent=miss_percent, fixture=fixture["info"],
                 requested_windows=shape.intermediate_fetches, actual_windows=rotating.rounds,
                 timing=dict(prototype_with_update=measured),
                 execution="COMPLETED", correctness="NOT_RUN", boundary_coverage=boundary_phases,
@@ -638,6 +652,7 @@ def check_shape(
 def main(argv=None, *, shared_pool=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--optimized-resolve", action="store_true")
+    parser.add_argument("--compact-fixture", action="store_true")
     parser.add_argument("--ubmem-fetch-mode", choices=("serial", "overlap"), default="overlap")
     parser.add_argument("--q-workers", type=int, choices=(1, 2, 4), default=2)
     parser.add_argument("--build-dir", type=Path, required=True)
@@ -733,6 +748,7 @@ def main(argv=None, *, shared_pool=None):
                 serial_compare=args.serial_compare,
                 check_case=args.check_case,
                 shared_pool=shared_pool,
+                compact=args.compact_fixture,
             )
             failed |= not passed
     return int(failed)

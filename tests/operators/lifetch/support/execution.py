@@ -216,6 +216,8 @@ def run_config(path, shared_pool=None):
                 '--intermediate-fetches', str(config.intermediate_fetches),
                 '--warmup', str(config.warmup), '--iterations', str(config.iterations),
                 '--result-output', str(path.parent / 'cases'), '--serial-compare']
+        if config.mode in ('bench', 'diagnose'):
+            argv += ['--compact-fixture']
         if getattr(config, 'check_suite', None) == 'boundary':
             argv += ['--check-case', config.check_case]
         if config.mode == 'diagnose':

@@ -217,3 +217,27 @@ This is comparison to aggregate reference logs, not paired validation against
 real tensors. Per-request, per-head, temporal, and cache-residency distributions
 are not reproduced by these few constants. In particular, weight/scale sharing
 across Q is a simplifying assumption, and overlap is slightly too high.
+
+### Bench and diagnose integration
+
+`test_lifetch.py bench` and `diagnose` now use the built-in compact generator for
+both URMA and UBmem synthetic inputs. `check` keeps the controlled fixture.
+The generator lives in `support/compact_generator.py`; the old temporary entry
+for offline evaluation forwards to it. No parameter file is required.
+
+`--miss-percent` controls how much of the selected Q4 union resides in hot cache.
+It changes residency, not Q/Index values. Per-Q rates can differ from the target;
+the fixture report stores `actual_miss_percent_per_query` and the detailed logs
+show the measured counts. For example H131072/R16384/seed20261104/target10 gives
+9.67%, 9.86%, 9.77%, 9.96% in the CPU selection. Device cutoff ties can change the
+exact counts. The comparison table's Miss% remains the requested target.
+
+Native and fused paths use the same operand bytes. The independent numerical
+TopK check accepts cutoff ties and one BF16 relative spacing around the CPU
+cutoff for reduction differences; it still rejects duplicate/out-of-range IDs,
+low-score selections, and omitted above-cutoff winners. KV bytes, ownership,
+Index updates and SFA checks remain enabled. Controlled boundary coverage stays
+in check mode, rather than relying on the compact workload to force collisions.
+The fixture manifest identifies `compact_builtin_v1`; previous benchmark numbers
+from the controlled fixture must not be interpreted as an operator regression
+comparison against this new workload.

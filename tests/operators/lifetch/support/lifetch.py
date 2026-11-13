@@ -101,12 +101,15 @@ def run(args, run_dir):
         with native_log(folder / "native.log"):
             common, data, build = (folder / "fixture", folder / "input", shared_build)
             pool = getattr(args, 'shared_pool', None)
-            fixture_key = ('urma', args.history, args.resident, args.miss_percent, args.index_heads, getattr(args, 'seed', 20261104))
+            compact = getattr(args, 'mode', None) in ('bench', 'diagnose')
+            fixture_key = ('urma', compact, args.history, args.resident, args.miss_percent, args.index_heads, getattr(args, 'seed', 20261104))
             if pool is not None and fixture_key in pool.fixtures:
                 cached_path, fixture_info = pool.fixtures[fixture_key]
                 common.symlink_to(cached_path.resolve(), target_is_directory=True)
             else:
-                fixture_info = prepare_full_chain_fixture(
+                from compact_fixture import prepare_compact_fixture
+                prepare_fixture = prepare_compact_fixture if compact else prepare_full_chain_fixture
+                fixture_info = prepare_fixture(
                     common, args.history, args.resident, args.miss_percent,
                     index_heads=args.index_heads, seed=getattr(args, 'seed', 20261104))
                 if pool is not None:
@@ -312,10 +315,16 @@ def run_device(
     logical_scores = np.load(folder / "fixture/logical_scores.npy")
     physical_order = np.load(folder / "fixture/physical_to_logical.npy")
     scores = logical_scores[:, physical_order]
-    expected_ids = np.stack([np.flatnonzero(row >= np.partition(row, -2048)[-2048]) for row in scores])
-    for row in initial_selected.reshape(b, 4, 2048):
-        if not np.array_equal(np.sort(row, axis=-1), expected_ids):
-            raise AssertionError("native LI differs from independent fixture score oracle")
+    compact = getattr(args, 'mode', None) in ('bench', 'diagnose')
+    compact_scores = scores
+    from compact_fixture import validate_topk
+    if compact:
+        validate_topk(initial_selected, compact_scores)
+    else:
+        expected_ids = np.stack([np.flatnonzero(row >= np.partition(row, -2048)[-2048]) for row in scores])
+        for row in initial_selected.reshape(b, 4, 2048):
+            if not np.array_equal(np.sort(row, axis=-1), expected_ids):
+                raise AssertionError("native LI differs from independent fixture score oracle")
     initial_orders = []
     policies = []
     for row in range(b):
@@ -597,7 +606,9 @@ def run_device(
         if (slots < 0).any() or (slots >= (r if persistent else owner.output.shape[1])).any():
             raise RuntimeError("Fetch slot outside cache")
         state["ids"], state["slots"] = (ids, slots.numpy())
-        if not np.array_equal(np.sort(ids, axis=-1), np.sort(reference, axis=-1)):
+        if compact:
+            validate_topk(ids, compact_scores)
+        elif not np.array_equal(np.sort(ids, axis=-1), np.sort(reference, axis=-1)):
             raise AssertionError("TopK changed")
         if updated:
             if not np.array_equal(update.logical_output.cpu().numpy().reshape(b, 4, 2048), ids):
@@ -731,7 +742,7 @@ def run_device(
         return result
 
     snapshot_changes = check_pipeline(initial_orders)
-    cold_start_changes = (None if bench_only else
+    cold_start_changes = (None if bench_only or compact else
                           check_pipeline(initial_orders, cold_start=True, label="cold-start"))
     unlucky = []
     for row in range(b):
@@ -739,10 +750,10 @@ def run_device(
         selected_hot = [x for x in selected_hot if x < r]
         seen = set(selected_hot)
         unlucky.append(selected_hot + [x for x in initial_orders[row] if x not in seen])
-    hot_case = (dict(hot_changes=None, first_window_fetches=None) if bench_only else
+    hot_case = (dict(hot_changes=None, first_window_fetches=None) if bench_only or compact else
                 check_pipeline(unlucky, label="hot-victim-collision"))
     restored_hot = hot_case["hot_changes"]
-    if not bench_only and args.prefetch_tokens and args.miss_percent < 100:
+    if not bench_only and not compact and args.prefetch_tokens and args.miss_percent < 100:
         def check_collision_coverage():
             assert hot_case["first_window_fetches"] and restored_hot, (
                 f"First window did not Fetch former hot candidates into LRU slots: {hot_case}")
