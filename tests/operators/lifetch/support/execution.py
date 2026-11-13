@@ -1259,6 +1259,70 @@ class RealFetchSession:
         self.in_flight = True
 
 
+    def build_device_args(self, abi_library: Path):
+        """Serialize real header ABI, one independent single-jetty view/AIV.
+
+        The lease has two jettys per AIC worker. Each physical AIV gets exactly
+        one of them and private core status; no locks or shared SQ producer.
+        AIV-to-view indexing must use physical AIV identity, not batch row.
+        """
+        if self.lease is None or self.in_flight:
+            raise ValueError("build args requires an idle live lease")
+        lease = self.lease
+        if lease["jettys_per_core"] != 2:
+            raise ValueError("refactor requires two independent jettys per AIC worker")
+        lib = ctypes.CDLL(str(Path(abi_library).resolve()))
+        sizes = {}
+        for name in ("args", "status", "entity", "queue"):
+            fn = getattr(lib, f"refactor_fetch_{name}_bytes")
+            fn.argtypes, fn.restype = [], ctypes.c_uint32
+            sizes[name] = int(fn())
+            if sizes[name] <= 0:
+                raise ValueError(f"invalid native ABI size: {name}")
+        pack = lib.refactor_fetch_pack_args
+        pack.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint32]
+        pack.restype = ctypes.c_uint32
+        torch = self.torch
+        owners = lease["worker_count"] * 2
+        self.core_status = torch.zeros((owners, sizes["status"]), dtype=torch.uint8, device=self.device)
+        # Not consumed by prepared-WQE submission, but valid storage keeps the
+        # native args complete and available for final descriptor operations.
+        self.descriptor_scratch = torch.zeros((4, QUERIES * TOPK), dtype=torch.int32, device=self.device)
+        stride = QUERIES * TOPK * 4
+        blobs = []
+        for owner in range(owners):
+            values = [
+                self.ddr_block_addresses.data_ptr(),
+                self.ddr_valid.data_ptr(),
+                self.descriptor_scratch.data_ptr(),
+                self.descriptor_scratch.data_ptr() + stride,
+                self.descriptor_scratch.data_ptr() + 2 * stride,
+                self.descriptor_scratch.data_ptr() + 3 * stride,
+                self.output.data_ptr(),
+                self.core_status.data_ptr() + owner * sizes["status"],
+                lease["device_channel_entity"] + owner * sizes["entity"],
+                lease["device_queue_state"] + owner * sizes["queue"],
+                self.batch * self.geometry["blocks_per_row"],
+                QUERIES * TOPK,
+                self.geometry["output_tokens"],
+                TOKEN_BYTES,
+                BLOCK_TOKENS,
+                1,
+                1,
+            ]
+            fields = (ctypes.c_uint64 * len(values))(*values)
+            output = ctypes.create_string_buffer(sizes["args"])
+            result = pack(output, sizes["args"], fields, len(values))
+            if result:
+                raise ValueError(f"native ABI serialization failed: {result}")
+            blobs.extend(output.raw)
+        self.device_args = torch.tensor(blobs, dtype=torch.uint8, device=self.device).reshape(owners, sizes["args"])
+        self.abi_library = lib
+        self.abi_sizes = sizes
+        self.keepalive.extend([self.core_status, self.descriptor_scratch, self.device_args, lib])
+        self.torch.npu.synchronize()
+        return self.device_args
+
     def mark_completed(self, *, completion_verified: bool):
         # Caller must inspect device CQ/drain status, not merely stream.sync.
         if not completion_verified:

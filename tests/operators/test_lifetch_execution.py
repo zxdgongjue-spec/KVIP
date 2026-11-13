@@ -1302,3 +1302,44 @@ def test_real_fetch_owner_injects_session_without_loading_another_module(monkeyp
     assert owner.geometry['output_bytes'] == (2048 + 4 * 2048) * 656
     RealFetchSession.open(None, 'cpu', batch=1, history=4096, resident=2048, server='host:1')
     assert observed[-1] is NativeFetchSession
+
+
+def test_real_fetch_serializes_each_leased_queue(monkeypatch, tmp_path):
+    from execution import RealFetchSession
+
+    owner = RealFetchSession(torch, 'cpu', 1, 4096, 2048)
+    owner.lease = dict(worker_count=2, jettys_per_core=2,
+                       device_channel_entity=4096, device_queue_state=8192)
+    owner.ddr_block_addresses = torch.zeros(32, dtype=torch.int64)
+    owner.ddr_valid = torch.ones(32, dtype=torch.int32)
+    owner.output = torch.zeros((1, 1, 656), dtype=torch.uint8)
+    sizes = dict(args=64, status=32, entity=128, queue=256)
+    library = SimpleNamespace(**{
+        f'refactor_fetch_{name}_bytes': Mock(return_value=size)
+        for name, size in sizes.items()
+    })
+    packed = []
+
+    def pack(output, size, fields, count):
+        assert size == sizes['args'] and count == 17
+        packed.append(list(fields))
+        ctypes.memset(output, len(packed), size)
+        return 0
+
+    library.refactor_fetch_pack_args = Mock(side_effect=pack)
+    monkeypatch.setattr(init_transport.ctypes, 'CDLL', lambda _: library)
+    synchronize = Mock()
+    monkeypatch.setattr(torch, 'npu', SimpleNamespace(synchronize=synchronize), raising=False)
+    args = owner.build_device_args(tmp_path / 'abi.so')
+    assert args.shape == (4, 64)
+    assert args[:, 0].tolist() == [1, 2, 3, 4]
+    assert [fields[8] for fields in packed] == [4096 + i * 128 for i in range(4)]
+    assert [fields[9] for fields in packed] == [8192 + i * 256 for i in range(4)]
+    assert [fields[7] for fields in packed] == [owner.core_status.data_ptr() + i * 32 for i in range(4)]
+    assert all(fields[10:] == [32, 8192, owner.geometry['output_tokens'], 656, 128, 1, 1]
+               for fields in packed)
+    assert owner.abi_sizes == sizes
+    synchronize.assert_called_once()
+    owner.in_flight = True
+    with pytest.raises(ValueError, match='idle live lease'):
+        owner.build_device_args(tmp_path / 'abi.so')
