@@ -799,6 +799,22 @@ def run_v9_li_varlen_only(
                 if step >= args.warmup:
                     samples_us.append(float(start_event.elapsed_time(end_event) * 1000.0))
             stream.synchronize()
+            # Multiple Graph replays must be non-destructive, not just the
+            # first replay checked above. Verify after the final sample too.
+            for row, q_len in enumerate(counts):
+                for query_index in range(q_len):
+                    if not torch.equal(
+                        torch.sort(topk[row, query_index]).values,
+                        torch.sort(native_output[row, query_index]).values,
+                    ):
+                        raise AssertionError(
+                            f"{scenario['name']}: repeated LI Graph TopK mismatch "
+                            f"row={row} Q={query_index}"
+                        )
+                if topk[row, q_len:].numel() and not bool(
+                    torch.all(topk[row, q_len:] == -1).item()
+                ):
+                    raise AssertionError(f"{scenario['name']}: repeated Graph padded output mismatch")
             if not samples_us or not all(np.isfinite(samples_us)):
                 raise AssertionError("P0-C1 device timing samples missing or invalid")
             li_perf = dict(
