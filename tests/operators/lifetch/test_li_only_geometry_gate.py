@@ -306,3 +306,56 @@ def test_li_s2_slope_scenarios_have_q1_and_q4_and_five_k_lengths():
     assert 'for qcount in (1, 4)' in source
     assert 'for key_len in (resident, quarter, half, three_quarter, history)' in source
     assert '"query_counts": (qcount, 0, 0, 0)' in source
+
+
+@pytest.mark.parametrize("cores", [1, 2, 4])
+def test_s2_score_probe_cli_and_internal_worker(lifetch_cli, monkeypatch, cores):
+    commands = []
+    monkeypatch.setattr(lifetch_cli.subprocess, "call", lambda cmd: commands.append(cmd) or 0)
+    args = cli_args(prefetch=0) + [
+        "--li-s2-score-probe", "--li-s2-score-cores", str(cores),
+        "--li-core-perf", "--li-tiling", "q4",
+    ]
+    assert lifetch_cli.main(args) == 0
+    assert "--li-s2-score-probe" in commands[0]
+    assert commands[0][commands[0].index("--li-s2-score-cores") + 1] == str(cores)
+    worker = lifetch_cli.arguments(args[2:])
+    assert worker.li_s2_score_probe
+    assert worker.li_s2_score_cores == cores
+
+
+@pytest.mark.parametrize("extra", [
+    [],
+    ["--li-core-perf"],
+    ["--li-core-perf", "--li-tiling", "q4", "--li-core-sweep"],
+    ["--li-core-perf", "--li-tiling", "q4", "--li-s2-slope-sweep"],
+    ["--li-core-perf", "--li-tiling", "q4", "--epoch-audit-profile"],
+])
+def test_s2_score_probe_rejects_incompatible_modes(lifetch_cli, extra):
+    with pytest.raises(SystemExit) as exc:
+        lifetch_cli.main(cli_args(prefetch=0) + ["--li-s2-score-probe"] + extra)
+    assert exc.value.code == 2
+
+
+def test_s2_score_probe_rejects_nonzero_prefetch(lifetch_cli):
+    with pytest.raises(SystemExit) as exc:
+        lifetch_cli.main(cli_args(prefetch=64) + [
+            "--li-s2-score-probe", "--li-core-perf", "--li-tiling", "q4",
+        ])
+    assert exc.value.code == 2
+
+
+def test_s2_score_probe_kernel_is_separate_opt_in_entry():
+    root = Path(__file__).resolve().parents[3]
+    kernel = (root / "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer_s2_score.cpp").read_text()
+    cmake = (root / "csrc/operators/lightning_indexer_with_fetch/CMakeLists.txt").read_text()
+    host = (root / "csrc/operators/lightning_indexer_with_fetch/op_host/launch.cpp").read_text()
+    harness = (root / "tests/operators/lifetch/support/s2_score_device.py").read_text()
+    assert 'void v9_s2_score_kernel' in kernel
+    assert 'op.SetScoreOnlyS2(true);' in kernel
+    assert 'op.ConfigureSingleQueryScoreShard(groups);' in kernel
+    assert 'if(V9_S2_SCORE_PROBE)' in cmake
+    assert 'aclrtlaunch_v9_s2_score_kernel' in host
+    assert 'shape->history != 131072' in host
+    assert 'raw bits mismatch' in harness
+    assert '_stitch(' in harness
