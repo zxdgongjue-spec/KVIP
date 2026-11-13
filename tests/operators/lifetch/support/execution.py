@@ -2578,6 +2578,7 @@ def run_ubmem_case(
     result_output=None,
     serial_compare=False,
     check_case=None,
+    check_suite=None,
     shared_pool=None,
     compact=False,
 ):
@@ -3004,7 +3005,7 @@ def run_ubmem_case(
                 assert not rotating.rows[:, 9].cpu().count_nonzero() and not rotating.final_posts[:, :, 0].cpu().count_nonzero(), "Padding issued fetches"
             padding_ok = checks.check('padding_ownership', verify_padding_unchanged)
             boundary_phases['padding'] = 'PASS' if padding_ok else 'FAIL'
-            if check_case:
+            if check_suite == 'boundary':
                 checks.check('boundary trigger coverage', lambda: require_boundary(check_case, boundary_phases))
                 atomic_json(result_output / f'b{batch}-h{history}-r{resident}-w{token_bytes}-p{prefetch_tokens}' / 'boundary_coverage.json', boundary_phases)
         if iterations:
@@ -3156,6 +3157,7 @@ def run_ubmem(config, directory, *, shared_pool=None):
             trace_rounds=config.iterations if config.mode == 'diagnose' else 0,
             trace_output=directory / 'trace', seed=config.seed, result_output=directory / 'cases',
             serial_compare=True, check_case=getattr(config, 'check_case', None),
+            check_suite=getattr(config, 'check_suite', None),
             shared_pool=shared_pool, compact=config.mode in ('bench', 'diagnose'),
         )
         failed |= not passed
