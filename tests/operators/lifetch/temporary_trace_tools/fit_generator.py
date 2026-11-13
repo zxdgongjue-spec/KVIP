@@ -83,8 +83,6 @@ def draw_model(model, count, rng):
 def fit(rows):
     # Preserve coordinate directions and head identity instead of pooling all heads.
     q = np.stack([r['query'] for r in rows]).astype(np.float64)
-    mean = q.mean(0)
-    residual = (q - mean).transpose(0, 3, 1, 2).reshape(-1, QUERIES * q.shape[2])
     keys = np.concatenate([r['keys'] for r in rows])
     scales = np.concatenate([r['key_scale'] for r in rows])
     zero = np.all(keys == 0, axis=1)
@@ -97,30 +95,41 @@ def fit(rows):
             continue
         groups.append(dict(probability=float(mask.mean()), keys=covariance_model(keys[mask]),
                            scales=np.quantile(scales[mask], PROBABILITIES).tolist()))
-    # Joint per-head weight / scale / Q-norm variation, without raw input samples.
-    norms = np.linalg.norm(q, axis=-1)
-    heads = q.shape[2]
-    joint = covariance_model(np.stack([np.concatenate((r['weights'].ravel(),
-                  r['query_scale'].ravel(), norms[i].ravel())) for i, r in enumerate(rows)]))
-    return dict(schema_version=3, model='cross_head_conditional_index_v3',
-                heads=heads, probabilities=PROBABILITIES.tolist(), query_mean=mean.tolist(),
-                query_residual=covariance_model(residual), head_joint=joint, key_groups=groups,
-                tuning=dict(query_difference=1., key_noise=1.))
+    # One shared random coefficient vector drives Q directions, weights and scales.
+    # Thin SVD of a small snapshot matrix avoids a 16K x 16K covariance allocation.
+    fields = ('query', 'weights', 'query_scale')
+    blocks = [np.stack([r[name].ravel() for r in rows]).astype(np.float64) for name in fields]
+    units = [max(float(block.std()), 1e-8) for block in blocks]
+    values = np.concatenate([block/unit for block, unit in zip(blocks, units)], axis=1)
+    mean = values.mean(0)
+    centered = values - mean
+    _, singular, vectors = np.linalg.svd(centered, full_matrices=False)
+    rank = min(16, max(0, len(rows)-1), int(np.count_nonzero(singular > 1e-10)))
+    factors = singular[:rank, None] * vectors[:rank] / np.sqrt(len(rows))
+    energy = float(np.square(singular).sum())
+    joint = dict(mean=mean.tolist(), factors=factors.tolist(), units=units,
+                 rank=rank, retained_variance=float(np.square(singular[:rank]).sum()/energy) if energy else 1.)
+    return dict(schema_version=4, model='joint_q_weight_scale_v4',
+                heads=q.shape[2], probabilities=PROBABILITIES.tolist(),
+                q_joint=joint, key_groups=groups, tuning=dict(key_noise=1.))
 
 
 def generate(parameters, history, seed):
     """Only aggregate JSON is needed; never reads original tensor captures."""
-    if parameters.get('schema_version') != 3:
-        raise ValueError('Refit old parameters: cross-head model requires schema 3')
+    if parameters.get('schema_version') != 4:
+        raise ValueError('Refit old parameters: joint Q/weight/scale model requires schema 4')
     rng = np.random.default_rng(seed)
     heads = parameters['heads']
-    q = np.asarray(parameters['query_mean']) + draw_model(
-        parameters['query_residual'], WIDTH, rng).T.reshape(QUERIES, heads, WIDTH)
+    model = parameters['q_joint']
+    values = np.asarray(model['mean']).copy()
+    if model['rank']:
+        values += rng.standard_normal(model['rank']) @ np.asarray(model['factors'])
+    q_end = QUERIES * heads * WIDTH
+    w_end = q_end + QUERIES * heads
+    q = (values[:q_end] * model['units'][0]).reshape(QUERIES, heads, WIDTH)
+    weights = (values[q_end:w_end] * model['units'][1]).reshape(QUERIES, heads)
+    scales = np.maximum(values[w_end:] * model['units'][2], 0).reshape(QUERIES, heads)
     tuning = parameters['tuning']
-    q = q.mean(axis=0, keepdims=True) + tuning['query_difference'] * (q - q.mean(axis=0, keepdims=True))
-    joint = draw_model(parameters['head_joint'], 1, rng)[0].reshape(3, QUERIES, heads)
-    weights, scales = joint[0], np.maximum(joint[1], 0)
-    q *= (np.maximum(joint[2], 0) / np.maximum(np.linalg.norm(q, axis=2), 1e-12))[:, :, None]
     groups = parameters['key_groups']
     labels = rng.choice(len(groups), history, p=[g['probability'] for g in groups])
     keys, key_scale = np.empty((history, WIDTH), np.float32), np.empty(history, np.float32)
@@ -176,34 +185,6 @@ def metrics(row, top_fraction):
     return result
 
 
-def tune(parameters, rows, top_fraction, seed):
-    """Fixed twelve-candidate CPU search on fitting captures only."""
-    chosen = rows[::max(1, len(rows)//4)][:4]
-    target_rows = [metrics(r, top_fraction) for r in chosen]
-    target = {key: float(np.mean([r[key] for r in target_rows])) for key in target_rows[0]}
-    trials = []
-    best = float('inf')
-    for difference in (.4, .6, .8, 1.):
-        for noise in (.7, 1., 1.3):
-            parameters['tuning'] = dict(query_difference=difference, key_noise=noise)
-            measured = [metrics(generate(parameters, len(r['keys']), seed+i), top_fraction)
-                        for i, r in enumerate(chosen)]
-            mean = {key: float(np.mean([r[key] for r in measured])) for key in target}
-            # Explicit tolerances constrain input realism as well as score ranking.
-            tolerances = dict(sample_top_jaccard=.05, sample_union_ratio=.1, q_cosine=.03,
-                              query_std=max(target['query_std']*.05, 1e-6),
-                              keys_std=max(target['keys_std']*.05, 1e-6))
-            for key in ('score_p50', 'score_p90', 'score_p99'):
-                tolerances[key] = max(abs(target[key])*.2, abs(target['score_p50'])*.05, 1e-6)
-            loss = float(np.mean([((mean[k]-target[k])/tol)**2 for k, tol in tolerances.items()]))
-            trials.append(dict(parameters=dict(parameters['tuning']), loss=loss, metrics=mean))
-            print(f'TUNE {len(trials)}/12 loss={loss:.2f}', flush=True)
-            if loss < best:
-                best, winner = loss, dict(parameters['tuning'])
-    parameters['tuning'] = winner
-    return dict(fit_requests=len(chosen), target=target, trials=trials, chosen=winner)
-
-
 def replacement_metrics(real, generated, top_fraction):
     """Replace complete operand sides; never carry captured labels into synthetic rows."""
     q_fields = ('query', 'weights', 'query_scale')
@@ -249,7 +230,8 @@ def main():
     train = [row for row in rows if row['capture'] in fit_captures]
     held_out = [row for row in rows if row['capture'] not in fit_captures]
     parameters = json.loads(args.parameters.read_text()) if args.parameters else fit(train)
-    search = None if args.parameters else tune(parameters, train, args.top_fraction, args.seed + 10000)
+    search = dict(method='joint moments; no parameter search',
+                  rank=parameters['q_joint']['rank'], retained_variance=parameters['q_joint']['retained_variance'])
     actual, synthetic, audits, experiments = [], [], [], []
     for i, row in enumerate(held_out):
         audits.append(audit_topk(row))
@@ -269,7 +251,7 @@ def main():
                             generated=float(np.mean([r[key] for r in synthetic]))) for key in actual[0]}
     (args.output / 'score_audit.json').write_text(json.dumps(audits, indent=2))
     (args.output / 'comparison.json').write_text(json.dumps(comparison, indent=2, allow_nan=False))
-    lines = [f'MODEL {parameters["model"]} tuning={parameters["tuning"]}', f'FIT requests={len(train)} EVAL requests={len(held_out)} keys/request={args.sample_keys}',
+    lines = [f'MODEL {parameters["model"]} rank={search["rank"]} retained_variance={100*search["retained_variance"]:.2f}%', f'FIT requests={len(train)} EVAL requests={len(held_out)} keys/request={args.sample_keys}',
              'CPU sampled scores; sampled TopK ratio is not full-history TopK or device correctness.',
              'Capture split only: adjacent captures may share requests.',
              f'SCORE AUDIT sampled queries={sum(a["checked_queries"] for a in audits)} inversions={sum(a["inversions"] for a in audits)} (0 required before interpreting score fit)',

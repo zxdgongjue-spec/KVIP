@@ -156,7 +156,7 @@ def test_generator_cli_writes_comparison_and_audit(tmp_path, monkeypatch):
     output = tmp_path / 'result'
     monkeypatch.setattr(sys, 'argv', ['fit_generator.py', str(tmp_path), '--output', str(output)])
     fit_generator.main()
-    assert json.loads((output/'generator.json').read_text())['schema_version'] == 3
+    assert json.loads((output/'generator.json').read_text())['schema_version'] == 4
     assert json.loads((output/'score_audit.json').read_text())[0]['inversions'] == 0
     assert 'score_p99' in json.loads((output/'comparison.json').read_text())
 
@@ -197,3 +197,23 @@ def test_replacement_keeps_weight_scale_with_query(monkeypatch):
         [{'value': 2.}, {'value': 2.}], [{'mode': {'value': 1.}}, {'mode': {'value': 3.}}])
     assert report['mode']['value']['paired_bias'] == 0
     assert report['mode']['value']['paired_mae'] == 1
+
+
+def test_query_direction_and_weights_share_random_factors():
+    from fit_generator import fit, generate
+    rows = []
+    for level in (1., 2., 3., 4.):
+        q = np.zeros((4, 2, 128), np.float32)
+        q[:, 0, 0] = level * 8
+        q[:, 1, 1] = (5-level) * 8
+        rows.append(dict(query=q, keys=np.ones((128, 128), np.float32),
+                         weights=np.tile([level, 5-level], (4, 1)).astype(np.float32),
+                         query_scale=np.ones((4, 2), np.float32), key_scale=np.ones(128, np.float32)))
+    parameters = fit(rows)
+    assert parameters['q_joint']['rank'] == 1
+    for seed in range(5):
+        result = generate(parameters, 128, seed)
+        np.testing.assert_allclose(result['query'][:, 0, 0] / 8,
+                                   result['weights'][:, 0], rtol=.07, atol=.02)
+        np.testing.assert_allclose(result['query'][:, 1, 1] / 8,
+                                   result['weights'][:, 1], rtol=.07, atol=.02)

@@ -165,3 +165,25 @@ are written, not real operands. Replacement effects are not additive causal
 contributions. Reuse the same seed/sample settings as the preceding run for a
 comparable synthetic-both reference. This adds two CPU scoring passes per
 held-out request, but `--parameters` skips the twelve-candidate fitting search.
+
+### Current iteration: version 4
+
+Replacement results localized most overlap and central-score errors to generated
+Q operands. Version 4 therefore holds the conditional Index model fixed and
+samples Q coordinates, weights and query scales with the same random factors.
+It computes a thin SVD of the standardized fitting snapshots (at most 16 factors),
+without allocating a full coordinate covariance matrix. Exported means and
+covariance factors are aggregate statistics; no captured rows or sample
+coefficients are exported. This is not a privacy guarantee for those statistics.
+The log reports retained variance so truncation is visible.
+
+The version 3 parameter search and Q-difference shrinkage are removed. Refit with:
+
+```bash
+python tests/operators/lifetch/temporary_trace_tools/fit_generator.py \
+  /tmp/lifetch-old-converted-v2 --output /tmp/lifetch-generator-v4
+```
+
+All three replacement comparisons still run on held-out captures. Version 3
+parameter files must not be passed to this version. No additional Index-tail
+fix is claimed; the replacement table continues to measure that remaining error.
