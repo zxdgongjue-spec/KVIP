@@ -152,10 +152,19 @@ def test_level_two_tables_keep_replay_core_and_query_identity():
                       new_unique=2048, initial_local=2046, final_posted=1)])]))
     result = dict(level=2, transport='urma', trace='COMPLETE', missing=[], unavailable=[],
         captures=[dict(source='test', stage_summary={}, samples=[sample])])
+    sample['final_get_bandwidth'] = dict(groups=[dict(block=3, query=1, lane=0, entries=1, bytes=656)])
     output = level_two_tables(result)
+    assert 'Per-Fetch-block effective bandwidth' in output
+    assert '0.109' in output  # 656 bytes / 6 us, decimal GB/s.
     for value in ('repeat=2', 'Last block=3', 'fetch Q1 lane0', 'Window prefetch / unused',
                   'Per-Q demand / repair', 'Per-Q resolver / update', '1.000', '2.000'):
         assert value in output
-    assert 'URMA group counters' in output
+    assert 'URMA group counters' not in output
+    assert 'Core work / wait intervals' not in output
+    assert 'LI TopK classification' not in output
+    assert output.index('ALGORITHM / KV TRAFFIC') < output.index('TIME BREAKDOWN')
+    result['level'] = 3
+    assert 'URMA group counters' in level_two_tables(result)
+    assert 'Core work / wait intervals' in level_two_tables(result)
     result['transport'] = 'ubmem'
     assert 'URMA group counters' not in level_two_tables(result)

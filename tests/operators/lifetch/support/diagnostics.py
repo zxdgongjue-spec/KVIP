@@ -289,9 +289,11 @@ def summarize(directory, config):
         rendered = level_one_tables(result)
         (directory / 'level1_summary.log').write_text(rendered + '\n')
         print(rendered, flush=True)
-    elif config.level == 2:
+    elif config.level >= 2:
         rendered = level_two_tables(result)
-        (directory / 'level2_summary.log').write_text(rendered + '\n')
+        if config.level == 3:
+            rendered += '\n' + '\n'.join(line for line in lines if line.startswith('FETCH-ONLY'))
+        (directory / f'level{config.level}_summary.log').write_text(rendered + '\n')
         print(rendered, flush=True)
     else:
         print('\n'.join(lines), flush=True)
@@ -476,10 +478,16 @@ def diagnostic_table(title, headers, rows):
 
 def level_two_tables(result):
     """Same-replay tables, with no summed-overlap or synthetic decode trend."""
-    lines = [level_one_tables(result).replace('DIAG level=1', 'DIAG level=2', 1),
-             '\nLogical block IDs, not physical core IDs. Times below: us.',
-             'Waits include control/polling; Get intervals include transport and control.']
+    lines = ['TIME BREAKDOWN | us; profiled passes are separate from performance samples.',
+             'Logical block IDs, not physical core IDs. Waits include control/polling.']
+    algorithm_lines = ['ALGORITHM / KV TRAFFIC | per request, Q4 unique-demand basis.',
+        'Cold miss % = initial cold / unique demand; read amplification = (prefetch + final) / initial cold.',
+        'Unused % = unused prefetch / prefetch. Zero denominator => N/A. Repeats are not decode rounds.']
     for capture in result['captures']:
+        stage_rows = [[stage, values['mean_us'], values['p50_us'], values['min_us'], values['max_us']]
+                      for stage, values in capture['stage_summary'].items()]
+        lines.append(diagnostic_table(f"Stages: {capture.get('path', 'fused')} | {capture['source']}",
+                     ['Stage', 'Mean', 'p50', 'Min', 'Max'], stage_rows))
         if capture.get('path') == 'serial':
             continue
         for sample in capture['samples']:
@@ -497,34 +505,46 @@ def level_two_tables(result):
                         phases.append([core['block'], stage['name'], stage['start_us'],
                                        stage['end_us'], stage['duration_us']])
                 lines.append(diagnostic_table('Active cores', ['Block', 'Role', 'Start', 'End', 'Duration', 'Last'], rows))
-                lines.append(diagnostic_table('Core work / wait intervals', ['Block', 'Phase', 'Start', 'End', 'Duration'], phases))
-                if result['transport'] == 'urma':
-                    counters = []
-                    for core in timeline['cores']:
-                        values = core.get('KVAF_counters')
-                        if values:
-                            counters.append([core['block'], core['role'], *[
-                                values.get(key) / timeline['clock_mhz'] if values.get(key) is not None else None
-                                for key in ('safe_post_cycles', 'safe_CQ_cycles', 'conflict_post_cycles', 'conflict_CQ_cycles')]])
-                    lines.append(diagnostic_table('URMA group counters (once per Fetch block; nested in Get)',
-                        ['Block', 'Role', 'Safe submit', 'Safe CQ', 'Conflict submit', 'Conflict CQ'], counters))
+                groups = sample.get('final_get_bandwidth', {}).get('groups', [])
+                rates = []
+                for group in groups:
+                    core = next((core for core in timeline['cores'] if core['block'] == group['block']), None)
+                    if core is None:
+                        continue
+                    spans = [stage for stage in core['stages'] if stage['name'].endswith('.KVAF_Get')
+                             and stage['duration_us'] > 0]
+                    duration = (max(stage['end_us'] for stage in spans) - min(stage['start_us'] for stage in spans)
+                                if spans and group['entries'] else None)
+                    rates.append([group['block'], group['query'], group['lane'], group['entries'], group['bytes'],
+                                  duration, group['bytes'] / duration / 1000 if duration else None])
+                if rates:
+                    lines.append(diagnostic_table('Per-Fetch-block effective bandwidth (Get call span, not link peak)',
+                        ['Block', 'Q', 'Lane', 'Reads', 'Bytes', 'Get span us', 'GB/s'], rates))
+                if result.get('level', 2) >= 3:
+                    lines.append(diagnostic_table('Core work / wait intervals', ['Block', 'Phase', 'Start', 'End', 'Duration'], phases))
+                    if result['transport'] == 'urma':
+                        counters = []
+                        for core in timeline['cores']:
+                            values = core.get('KVAF_counters')
+                            if values:
+                                counters.append([core['block'], core['role'], *[
+                                    values.get(key) / timeline['clock_mhz'] if values.get(key) is not None else None
+                                    for key in ('safe_post_cycles', 'safe_CQ_cycles', 'conflict_post_cycles', 'conflict_CQ_cycles')]])
+                        lines.append(diagnostic_table('URMA group counters (once per Fetch block; nested in Get)',
+                            ['Block', 'Role', 'Safe submit', 'Safe CQ', 'Conflict submit', 'Conflict CQ'], counters))
             requests = sample.get('requests', [])
             if requests:
                 raw = requests[0].get('core_timeline_raw', {})
                 mhz = raw.get('clock_mhz')
-                lines.append(diagnostic_table('Observed resource geometry', ['BS', 'Resolver/update blocks per request',
-                    'Fetch blocks per Q', 'Total Fetch blocks', 'Clock MHz'], [[raw.get('batch'), raw.get('resolver_cores'),
-                    raw.get('workers_per_query'), 4 * raw['workers_per_query'] if 'workers_per_query' in raw else None, mhz]]))
                 services = requests[0].get('prefetch_services', [])
                 service_rows = []
                 for event in services:
                     service_rows.append([event['event'], event['core'], event['epoch'],
                         *[event[key] / mhz if mhz else None for key in ('scan_cycles', 'candidate_cycles', 'post_cycles')],
                         event['bitmap_bytes'], event['candidate_count'], event['posted_count']])
-                lines.append(diagnostic_table('Prefetch service records (device core/epoch fields; not request IDs)',
-                    ['Event', 'Service core', 'Epoch', 'Scan us', 'Candidates us', 'Post us', 'Bitmap bytes', 'Candidates', 'Posted'], service_rows))
-                if not services:
-                    lines.append('N/A: prefetch service counters not enabled by this kernel; window posted/unused counts remain available.')
+                if service_rows and result.get('level', 2) >= 3:
+                    lines.append(diagnostic_table('Prefetch service records',
+                        ['Event', 'Service core', 'Epoch', 'Scan us', 'Candidates us', 'Post us', 'Bitmap bytes', 'Candidates', 'Posted'], service_rows))
                 li_rows = []
                 for request in requests:
                     for q, values in enumerate(request.get('li', []), 1):
@@ -532,8 +552,9 @@ def level_two_tables(result):
                             values.get(key) / mhz if values.get(key) is not None and mhz else None
                             for key in ('mapping_wait', 'barrier', 'load_first', 'classify_first',
                                         'wait_second', 'classify_second', 'bitmap_merge', 'publish')]])
-                lines.append(diagnostic_table('LI TopK classification (overlaps must not be summed)',
-                    ['Request', 'Q', 'Map wait', 'Barrier', 'Load1', 'Classify1', 'Wait2', 'Classify2', 'Bitmap', 'Publish'], li_rows))
+                if result.get('level', 2) >= 3:
+                    lines.append(diagnostic_table('LI TopK classification (overlaps must not be summed)',
+                        ['Request', 'Q', 'Map wait', 'Barrier', 'Load1', 'Classify1', 'Wait2', 'Classify2', 'Bitmap', 'Publish'], li_rows))
                 rows = []
                 for request in requests:
                     for q, producer in enumerate(request.get('producer', [])):
@@ -545,26 +566,43 @@ def level_two_tables(result):
                             *[us(producer.get(key)) for key in ('resolve', 'output', 'pack', 'publish')],
                             us(waits[q+1]) if len(waits) > q+1 else None,
                             us(update[q+1]) if len(update) > q+1 else None])
-                lines.append(diagnostic_table('Per-Q resolver / update', ['Request', 'Q', 'Resolve', 'Output',
-                    'Descriptor', 'Publish', 'Update wait', 'Update apply'], rows))
-                fetch_rows = []
-                for request in requests:
-                    for q, counts in enumerate(request.get('final_counts') or [], 1):
-                        fetch_rows.append([request['batch'], q, counts['total'], counts['safe'], counts['conflict'],
-                            counts['total'] * raw['token_bytes'] if raw.get('token_bytes') else None])
-                lines.append(diagnostic_table('Per-Q Fetch tasks',
-                    ['Request', 'Q', 'Total', 'Safe', 'Conflict', 'KV bytes'], fetch_rows))
+                if result.get('level', 2) >= 3:
+                    lines.append(diagnostic_table('Per-Q resolver / update', ['Request', 'Q', 'Resolve', 'Output',
+                        'Descriptor', 'Publish', 'Update wait', 'Update apply'], rows))
+                else:
+                    lines.append(diagnostic_table('Per-Q resolver / update',
+                        ['Request', 'Q', 'Resolve', 'Update wait', 'Update apply'],
+                        [[row[i] for i in (0, 1, 2, 6, 7)] for row in rows]))
+            algorithm_lines.append(f"Source: {capture['source']} | repeat={repeat}")
+            traffic = []
+            for request in sample.get('algorithm', {}).get('requests', []):
+                demand, cold = request.get('selected_unique'), request.get('initial_cold')
+                prefetch, final, unused = request.get('prefetch'), request.get('final'), request.get('unused_prefetch')
+                traffic.append([request['request'], demand, cold, 100*cold/demand if demand and cold is not None else None,
+                    prefetch, final, request.get('KV_read_bytes'),
+                    (prefetch+final)/cold if cold and prefetch is not None and final is not None else None,
+                    unused, 100*unused/prefetch if prefetch and unused is not None else None])
+            algorithm_lines.append(diagnostic_table('Demand and actual reads',
+                ['Request', 'Demand', 'Cold', 'Cold miss %', 'Prefetch', 'Final', 'KV bytes', 'Read amplification', 'Unused', 'Unused %'], traffic))
             windows, queries = [], []
             for request in sample.get('algorithm', {}).get('requests', []):
                 for window in request.get('windows', []):
                     windows.append([request['request'], window['window'], window['posted'], window['bytes'],
                         window['unused'], window['cumulative_posted'], window['cumulative_unused']])
                 for query in request.get('queries', []):
-                    queries.append([request['request'], query['query'], query['topk'], query['unique'],
-                        query['cross_q_duplicate'], query['new_unique'], query['initial_local'], query['final_posted']])
-            lines.append(diagnostic_table('Window prefetch / unused', ['Request', 'Window', 'Posted', 'Bytes',
+                    owner = next((item for item in requests if item['batch'] == request['request']), {})
+                    counts = owner.get('final_counts') or []
+                    count = counts[query['query'] - 1] if len(counts) >= query['query'] else {}
+                    queries.append([request['request'], query['query'], query['unique'],
+                        query['cross_q_duplicate'], query['new_unique'], query['initial_local'],
+                        None if query['initial_local'] is None else query['new_unique'] - query['initial_local'],
+                        query['final_posted'], count.get('conflict')])
+            algorithm_lines.append(diagnostic_table('Window prefetch / unused', ['Request', 'Window', 'Posted', 'Bytes',
                 'Unused', 'Cumulative posted', 'Cumulative unused'], windows))
-            lines.append(diagnostic_table('Per-Q demand / repair', ['Request', 'Q', 'TopK', 'Unique',
-                'Cross-Q duplicates', 'New unique', 'Initially local', 'Final reads'], queries))
-    lines.append('N/A: Jetty/inflight limits and UBmem pipeline configuration are not captured; runtime capacity is not active worker count.')
-    return '\n\n'.join(lines)
+            algorithm_lines.append(diagnostic_table('Per-Q demand / repair', ['Request', 'Q', 'Unique demand',
+                'Seen in earlier Qs', 'New demand', 'New: already local', 'New: initially cold', 'Final reads', 'Conflict reads'], queries))
+    algorithm_lines.append('Demand: Unique = Seen in earlier Qs + New demand; New demand = already local + initially cold. Final reads are actual repairs, not initially cold minus prefetch counts.')
+    notices = ['INCOMPLETE: ' + value for value in dict.fromkeys(result['missing'])]
+    notices += ['N/A: ' + value for value in dict.fromkeys(result['unavailable'])]
+    return '\n\n'.join([f"DIAG level={result.get('level', 2)} transport={result['transport']} trace={result['trace']}",
+                           *algorithm_lines, *lines, *notices])

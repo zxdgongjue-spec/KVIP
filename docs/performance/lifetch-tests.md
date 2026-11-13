@@ -425,5 +425,14 @@ level1终端按阶段耗时、每请求计数、有效带宽三张对齐表展�
 `level1_summary.log`保存同样的简表，`diagnostic_summary.log`和`diagnostic.json`保留原始区间与完整证据。
 预取提交时间戳缺失时，仅在已有服务起点与完成观察点有效的情况下提供service-span带宽，明确包含控制开销；不将其标为精确doorbell到CQ跨度。没有有效区间仍标INCOMPLETE。
 
-level2在level1简表之后，按每次采样独立展示：活跃block及最晚结束block、各核工作/等待区间、LI分类、逐Q Resolver/Update、窗口预取/unused、逐Q需求/补拉。`timeline.csv`从level2开始包含全部已定义步骤；`level2_summary.log`保存终端表格。
+level2按每次采样独立展示算法与流量、阶段与活跃block及最晚结束block、逐Q Resolver/Update概览。内部步骤仅level3展示。`timeline.csv`从level2开始包含全部已定义步骤；`level2_summary.log`保存终端表格。
 预取服务记录保留设备core/epoch字段、扫描/候选/提交周期、bitmap字节与计数，不将service core编号冒充请求编号。无有效打点记录显示N/A。URMA KVAF组计数每Fetch block只展示一次；UBmem不展示URMA CQ计数。资源几何取自实际捕获的block数，未采集的Jetty、在途上限及搬运配置明确标N/A。
+
+level2终端按理解顺序聚类：
+
+1. **算法与KV流量**：每请求Q4去重需求/初始cold及miss率、预取/补拉/总字节、读取放大率、unused比例；随后展示窗口分布和逐Q新增需求/补拉。逐Q需求表合并冲突补拉数，不再重复独立Fetch任务表。
+2. **时间拆解**：阶段分布、Active cores及最晚结束核、每Fetch block的实际字节/Get调用跨度有效带宽、逐Q Resolver/Update概览。
+3. **缺失与限制**：集中列出一次。空预取服务表不展示；未知字段不填0。
+
+Cold miss率以Q4唯一需求为分母，与每Q TopK的miss参数不同。读取放大率=(预取+最终补拉)/初始唯一cold需求；unused比例=unused预取/实际预取。分母为0时N/A。
+Core work/wait全部内部区间、LI分类内部步骤、URMA提交/CQ细分以及有效预取服务内部记录仅在level3展示。level2不再单列资源几何表，原始几何和时钟留在结构化结果。每核Get调用跨度带宽包含控制间隙，不是链路峰值；各核带宽不可直接相加。
