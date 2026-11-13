@@ -12,6 +12,14 @@ ENTRY(wait,shape->batch)
 ENTRY(resolve,shape->finalCores)
 ENTRY(fetch,shape->batch)
 ENTRY(probe,shape->serviceLanes)
+#if defined(V9_S2_SCORE_PROBE) && V9_S2_SCORE_PROBE
+extern "C" uint32_t aclrtlaunch_v9_s2_score_kernel(uint32_t,void*,void*);
+extern "C" uint32_t v9_s2_score(void* bindings,void* stream,const rotating::RuntimeShape* shape) {
+    if (!bindings || !stream || !shape || shape->batch != 4 ||
+        shape->history != 131072 || shape->resident != 8192) return 100000;
+    return aclrtlaunch_v9_s2_score_kernel(V9_S2_SCORE_CORES,stream,bindings);
+}
+#endif
 extern "C" uint32_t v9_li_cores(const rotating::RuntimeShape* shape) { return shape->liCores; }
 extern "C" uint32_t v9_batch(const rotating::RuntimeShape* shape) { return shape->batch; }
 extern "C" uint32_t v9_history(const rotating::RuntimeShape* shape) { return shape->history; }

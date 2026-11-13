@@ -26,8 +26,20 @@ set(V9_Q2_TRUNK8K_CONTROL 0 CACHE STRING "LI-only P0-C3 Q2 TopK Trunk=8K (0 or 1
 if(NOT V9_Q2_TRUNK8K_CONTROL MATCHES "^[01]$")
   message(FATAL_ERROR "V9_Q2_TRUNK8K_CONTROL must be 0 or 1")
 endif()
+# P0-C5a is opt-in: build a separate Score-only diagnostic kernel,
+# while keeping the original v9_li_kernel implementation intact.
+set(V9_S2_SCORE_PROBE 0 CACHE STRING "Build isolated S2 Score-only diagnostic (0 or 1)")
+set(V9_S2_SCORE_CORES 1 CACHE STRING "Score-only diagnostic groups: 1, 2, or 4")
+if(NOT V9_S2_SCORE_PROBE MATCHES "^[01]$" OR
+   NOT V9_S2_SCORE_CORES MATCHES "^(1|2|4)$")
+  message(FATAL_ERROR "V9_S2_SCORE_PROBE=0/1 and V9_S2_SCORE_CORES=1/2/4 required")
+endif()
 include(${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
-ascendc_library(v9_kernel STATIC op_kernel/indexer.cpp op_kernel/lifecycle.cpp)
+set(V9_KERNEL_SOURCES op_kernel/indexer.cpp op_kernel/lifecycle.cpp)
+if(V9_S2_SCORE_PROBE)
+  list(APPEND V9_KERNEL_SOURCES op_kernel/indexer_s2_score.cpp)
+endif()
+ascendc_library(v9_kernel STATIC ${V9_KERNEL_SOURCES})
 ascendc_include_directories(v9_kernel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel
   ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/indexer ${KVAF_INCLUDE}
   ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)
@@ -35,10 +47,12 @@ ascendc_compile_options(v9_kernel PRIVATE -DV9_RESOLVER_COMPARE=${RESOLVER_COMPA
   -mllvm -user-reserved-ub-size=223232 -DV9_USER_UB_BYTES=223232
   -DV9_PARTIAL_SCAN_SIMD=1 -DV9_PROBE_EPOCH=0 -DV9_INTERMEDIATE_PROFILING=${V9_INTERMEDIATE_PROFILING}
   -DV9_BATCH_POST=2 -DSIM_Q=4 -DSIM_CAPTURE_HITS=1 -DV9_SIMULATION=0 -DROTATION_PUBLISH_TILES=1
-  -DV9_ACTIVE_K_MAP_CLEAR=${V9_ACTIVE_K_MAP_CLEAR} -DV9_Q2_TRUNK8K_CONTROL=${V9_Q2_TRUNK8K_CONTROL})
+  -DV9_ACTIVE_K_MAP_CLEAR=${V9_ACTIVE_K_MAP_CLEAR} -DV9_Q2_TRUNK8K_CONTROL=${V9_Q2_TRUNK8K_CONTROL}
+  -DV9_S2_SCORE_PROBE=${V9_S2_SCORE_PROBE} -DV9_S2_SCORE_CORES=${V9_S2_SCORE_CORES})
 add_library(v9_bridge SHARED op_host/launch.cpp)
 target_include_directories(v9_bridge PRIVATE ${KVAF_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_compile_definitions(v9_bridge PRIVATE V9_RESOLVER_COMPARE=${RESOLVER_COMPARE})
+target_compile_definitions(v9_bridge PRIVATE V9_RESOLVER_COMPARE=${RESOLVER_COMPARE}
+  V9_S2_SCORE_PROBE=${V9_S2_SCORE_PROBE} V9_S2_SCORE_CORES=${V9_S2_SCORE_CORES})
 target_link_libraries(v9_bridge PRIVATE v9_kernel host_intf_pub ascendcl)
 # Independent AIV target: does not change the LI/Fetch compilation options.
 ascendc_library(kvop_cache_update_kernel STATIC op_kernel/index_cache_update.cpp)

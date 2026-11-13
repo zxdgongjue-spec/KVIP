@@ -218,7 +218,10 @@ class LIFetchBinding:
         self.arguments = tuple(arguments) + (self.context,)
         self.bindings = torch.tensor([x.data_ptr() for x in self.arguments], dtype=torch.uint64, device=self.device)
         self.functions = {}
-        for name in ("init", "li", "wait", "resolve", "fetch", "probe"):
+        names = ["init", "li", "wait", "resolve", "fetch", "probe"]
+        if getattr(self.library, "v9_s2_score", None) is not None:
+            names.append("s2_score")  # P0-C5a diagnostic entry only
+        for name in names:
             fn = getattr(self.library, "v9_" + name)
             fn.argtypes, fn.restype = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p], ctypes.c_uint32
             self.functions[name] = fn

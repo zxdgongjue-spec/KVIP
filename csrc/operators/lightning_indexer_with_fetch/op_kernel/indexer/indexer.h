@@ -63,6 +63,13 @@ public:
                                 __gm__ uint8_t *workspace, const QLITilingData *__restrict tiling, TPipe *tPipe);
     __aicore__ inline void Process();
     __aicore__ inline void SetRotationEnabled(bool enabled) { rotationEnabled_ = enabled; }
+    // P0-C5a test-only: preserve V9's production SplitCore and TopK behavior.
+    __aicore__ inline void SetScoreOnlyS2(bool enabled) {
+        scoreOnlyS2_ = enabled;
+        if (enabled) rotationEnabled_ = false;
+    }
+    __aicore__ inline void ConfigureSingleQueryScoreShard(uint32_t coreCount);
+
 
     // =================================类型定义区=================================
     using Q_T = typename QLIT::queryType;
@@ -122,6 +129,7 @@ protected:
     uint32_t aiCoreIdx = 0U;
     bool rotationServed_ = false;
     bool rotationEnabled_ = true;
+    bool scoreOnlyS2_ = false;
     uint32_t usedCoreNum = 0U;
 
     QLICommon::ConstInfo constInfo{};
@@ -431,6 +439,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Init(__gm__ uint8_t *q
 
     InitTilingData(tiling);
     InitActualSeqLen(actualSeqLengthsQ, actualSeqLengthsK);
+    if ASCEND_IS_AIV { vectorService.SetScoreOnly(scoreOnlyS2_); }
 
     // 获取分核信息
     SplitCore(aiCoreIdx, usedCoreNum, splitCoreInfo);
@@ -599,13 +608,43 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::CalcRunInfo(uint32_t l
     runInfo.indiceOutOffset = indiceOutCoreOffset;
 }
 
+// P0-C5a: deliberately bypass the generic LD SplitCore path. The latter
+// rewrites s2End when trailing Batch rows are empty and cannot safely be used
+// as an isolated one-Query S2 shard. Configure AFTER Init/SplitCore.
+template <typename QLIT>
+__aicore__ inline void QuantLightningIndexerKernel<QLIT>::ConfigureSingleQueryScoreShard(uint32_t coreCount)
+{
+    uint32_t actualQ, actualK, originalK;
+    GetS1S2ActualSeqLen(0, actualQ, actualK, originalK);
+    if (!scoreOnlyS2_ || (coreCount != 1 && coreCount != 2 && coreCount != 4) ||
+        constInfo.batchSize != 4 || constInfo.qSeqSize != 4 ||
+        constInfo.kSeqSize != 131072 || actualQ != 1 || actualK != 131072 ||
+        aiCoreIdx >= coreCount) {
+        usedCoreNum = 0;
+        splitCoreInfo.isCoreEnable = false;
+        return;
+    }
+    const uint32_t totalTiles = actualK / S2_BASE_SIZE;
+    // [floor(total*i/N), floor(total*(i+1)/N)) yields exact, disjoint coverage.
+    const uint32_t begin = totalTiles * aiCoreIdx / coreCount;
+    const uint32_t end = totalTiles * (aiCoreIdx + 1) / coreCount;
+    usedCoreNum = coreCount;
+    splitCoreInfo = QLICommon::SplitCoreInfo{};
+    splitCoreInfo.isCoreEnable = true;
+    splitCoreInfo.bN2Start = splitCoreInfo.bN2End = 0;
+    splitCoreInfo.gS1Start = splitCoreInfo.gS1End = 0;
+    splitCoreInfo.s2Start = begin;
+    splitCoreInfo.s2End = end - 1;
+}
+
 template <typename QLIT>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Process()
 {
     if (usedCoreNum == 0) {
-        // 没有计算任务，直接清理输出
-        ProcessInvalid();
-        CloseUnreachedRotation();
+        if (!scoreOnlyS2_) {
+            ProcessInvalid();
+            CloseUnreachedRotation();
+        }
         return;
     }
 
@@ -672,7 +711,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()
     for (uint32_t bN2LoopIdx = splitCoreInfo.bN2Start; bN2LoopIdx <= splitCoreInfo.bN2End; bN2LoopIdx++) {
         CalcGS1LoopParams(bN2LoopIdx);
         if (tempLoopInfo.curActSeqLenIsZero) {
-            DealActSeqLenIsZero(tempLoopInfo.bIdx, tempLoopInfo.n2Idx, 0U);
+            if (!scoreOnlyS2_) DealActSeqLenIsZero(tempLoopInfo.bIdx, tempLoopInfo.n2Idx, 0U);
             continue;
         }
         for (uint32_t gS1LoopIdx = splitCoreInfo.gS1Start; gS1LoopIdx <= tempLoopInfo.gS1LoopEnd; gS1LoopIdx++) {
@@ -717,6 +756,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessBaseBlock(uint3
         }
     } else {
         vectorService.ProcessVec1(runInfo);
+        if (scoreOnlyS2_) return;  // Score GM is complete; never write final TopK or Epoch state.
         if ((runInfo.s2Idx + 1) * 128 == resident_) {
             vectorService.ProcessResidentTopK(runInfo);
             vectorService.PrepareRotationProgress();
