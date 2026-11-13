@@ -20,6 +20,10 @@
 #include "topk_common.h"
 #include "topk_common.h"
 
+#if !(defined(V9_UBMEM) && V9_UBMEM)
+#include "recent_threshold.h"
+#endif
+
 namespace topk {
 template<typename T>
 class LITopk {
@@ -150,6 +154,36 @@ public:
         nkValueLocal = idxLowLocal[256]; // 256: 固定偏移步长
         LocalTensor<uint32_t> tmpIndexLocalTmp = nkValueLocal[64]; // 64: 单核/单线程输出容量
         tmpIndexLocal = tmpIndexLocalTmp.template ReinterpretCast<uint16_t>();
+    }
+
+    // Exact sortable-u16 Kth selection. Reuse the same histogram stages as
+    // LiTopKVF; the caller needs no candidate IDs or selected-score gather.
+    // threshold is one 256-byte query bank, also used for the intermediate
+    // rank by FindHighTargetBinVFImpl. FindKthVFImpl leaves its uint16 key at
+    // the same address/layout consumed by the existing predicate broadcasts.
+    __aicore__ inline void Threshold(const LocalTensor<uint16_t>& input,
+                                     const LocalTensor<uint16_t>& threshold,
+                                     uint32_t validLen)
+    {
+#if !(defined(V9_UBMEM) && V9_UBMEM)
+        if (topK && validLen >= topK && validLen <= 18432 && validLen % 256 == 0) {
+            kvip_recent_threshold::RegisterThreshold(
+                reinterpret_cast<__ubuf__ uint16_t*>(input.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint16_t*>(threshold.GetPhyAddr()),
+                uint16_t(validLen / 256), uint16_t(validLen - topK + 1));
+            return;
+        }
+#endif
+        auto values = reinterpret_cast<__ubuf__ uint16_t*>(input.GetPhyAddr());
+        auto output = reinterpret_cast<__ubuf__ uint32_t*>(threshold.GetPhyAddr());
+        auto histogram = reinterpret_cast<__ubuf__ uint32_t*>(histogramsLocal.GetPhyAddr());
+        auto high = reinterpret_cast<__ubuf__ uint32_t*>(idxHighLocal.GetPhyAddr());
+        auto low = reinterpret_cast<__ubuf__ uint32_t*>(idxLowLocal.GetPhyAddr());
+        uint16_t loops = (validLen + 255) / 256;
+        topkb16gather::HistogramsHighVFImpl<uint16_t>(histogram, values, loops, true);
+        topkb16gather::FindHighTargetBinVFImpl(high, output, histogram, validLen - topK + 1);
+        topkb16gather::HistogramsLowVFImpl<uint16_t>(histogram, values, high, loops, true);
+        topkb16gather::FindKthVFImpl(output, histogram, high, low);
     }
 
     __aicore__ inline void operator()(LocalTensor<uint16_t>& mrgValueLocal, LocalTensor<uint32_t>& indicesOutLocal,

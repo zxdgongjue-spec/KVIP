@@ -34,6 +34,7 @@ class LIFetchBinding:
         row_owners=None,
         token_addresses=None,
         tail_bounds=None,
+        threshold_bounds=None,
         output_stride=None,
         scratch=None,
     ):
@@ -69,7 +70,7 @@ class LIFetchBinding:
             ("final_replicated", int(final_strategy == "replicated")),
             ("final_workers", final_aivs(batch, li_tiling, aic_count, final_workers)),
             ("aic_count", aic_count),
-            ("abi_version", 11),
+            ("abi_version", 12),
             (
                 "service_lanes",
                 li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)["service_aivs_per_window"],
@@ -83,7 +84,7 @@ class LIFetchBinding:
             ("history", history),
             ("resident", resident),
             ("simulation", 0),
-            ("context_bytes", 320),
+            ("context_bytes", 328),
             ("row_bytes", 1024),
         ):
             fn = getattr(self.library, "v9_" + name)
@@ -148,6 +149,7 @@ class LIFetchBinding:
         self.hot_valid = shared_input(hot_valid, (owner_count, resident), 1)
         self.row_owners = None if row_owners is None else shared_input(row_owners, (batch,), 0)
         self.tail_bounds = None if tail_bounds is None else shared_input(tail_bounds, (batch, 2), 0)
+        self.threshold_bounds = None if threshold_bounds is None else shared_input(threshold_bounds, (batch, 2), 0)
         self.token_addresses = token_addresses
         if token_addresses is not None and (
             token_addresses.device != self.device
@@ -207,9 +209,18 @@ class LIFetchBinding:
             (
                 blob,
                 np.frombuffer(bytes(self.runtime_shape), dtype=np.uint8),
-                np.array([self.change_slots.data_ptr(), self.change_count.data_ptr()], dtype="<u8").view("u1"),
+                np.array(
+                    [
+                        self.change_slots.data_ptr(),
+                        self.change_count.data_ptr(),
+                        0 if self.threshold_bounds is None else self.threshold_bounds.data_ptr(),
+                    ],
+                    dtype="<u8",
+                ).view("u1"),
             )
         )
+        if blob.size != 328:
+            raise AssertionError("LIFetch Context ABI changed")
         self.context = torch.from_numpy(blob.copy()).to(self.device)
         self.arguments = tuple(arguments) + (self.context,)
         self.bindings = torch.tensor([x.data_ptr() for x in self.arguments], dtype=torch.uint64, device=self.device)

@@ -12,6 +12,7 @@
 using namespace AscendC;
 using namespace rotating;
 using namespace pipeline_ab;
+#include "context_snapshot.h"
 #include "staged_fetch_worker.h"
 __simt_callee__
 inline void PublishQ(
@@ -141,8 +142,7 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  // GM and retain their original loads/stores and publication protocol.
  constexpr uint32_t contextWords=sizeof(Context)/sizeof(uint32_t),contextOffset=128;
  static_assert(contextOffset+contextWords<544,"Context snapshot overlaps prefix scratch");
- input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx));
- DataCopy(ctl[contextOffset],input,contextWords);
+ CopyContextSnapshot(ctl[contextOffset],ctx);
  auto stagedContext=reinterpret_cast<__ubuf__ Context*>(ctl[contextOffset].GetPhyAddr());
  input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->selected)+b*kSlots);DataCopy(selected,input,kSlots);
  input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*kSlots);DataCopy(loc,input,kSlots);
