@@ -19,6 +19,11 @@ extern "C" __global__ __aicore__ void v9_s2_score_kernel(GM_ADDR bindings) {
     auto a = reinterpret_cast<__gm__ uint64_t*>(bindings);
     auto ctx = reinterpret_cast<__gm__ rotating::Context*>(a[14]);
     auto shape = rotating::LoadRuntimeShape(ctx);
+    constexpr uint32_t groups = V9_S2_SCORE_CORES;
+    // Diagnostic is fail-closed if called outside the admitted ABI.
+    if (shape.batch != 4 || shape.history != 131072 || shape.resident != 8192 ||
+        shape.indexHeads != 32 || shape.splitQ != 0 || shape.aicCount < groups ||
+        ctx->prefetchLimit != 0) return;
     TPipe pipe;
     using Type = QLIType<fp8_e4m3fn_t,fp8_e4m3fn_t,int32_t,true,
         LI_LAYOUT::BSND,LI_LAYOUT::PA_BSND,bfloat16_t,float,float,uint16_t>;
@@ -26,7 +31,6 @@ extern "C" __global__ __aicore__ void v9_s2_score_kernel(GM_ADDR bindings) {
     op.runtimeShape_ = shape;
     op.SetScoreOnlyS2(true);
     // Do not split Query: Q1 is mapped to AIV lane 0 of each AIC group.
-    constexpr uint32_t groups = V9_S2_SCORE_CORES;
     QLITilingData tiling{shape.batch,shape.batch * 4,shape.indexHeads,4,
         shape.history,2048,groups,128,shape.history / 128,0,
         16384,128,shape.resident,0,shape.aicCount};
