@@ -804,3 +804,157 @@ def test_local_victims_exports_are_required_and_match_native_settings():
         verify_build_options(SimpleNamespace(), {"recent_local_victims": True})
     with pytest.raises(RuntimeError, match="recent_local_victims=True"):
         verify_build_options(SimpleNamespace(kvip_recent_local_victims=lambda: 0), {"recent_local_victims": True})
+
+
+def _register_reports():
+    reports = {"urma-upstream-fused": _case(110, main=True)}
+    for name, tuning in replay_measure.study_cases(SimpleNamespace(study="register-kth")).items():
+        reports[f"urma-recent-{name}"] = _case(
+            95 if name == "register" else 100, tuning=tuning | dict(prefetch_limit=512, window_limit=64)
+        )
+    return reports
+
+
+def test_register_kth_reports_execution_order_separately_from_display_and_gain(capsys):
+    cases = replay_measure.study_cases(SimpleNamespace(study="register-kth"))
+    assert list(cases) == ["register", "local"]
+    assert cases["local"] | {"recent_register_kth": True} == cases["register"]
+    assert all(cases["local"][key] for key in ("recent_threshold_only", "recent_local_victims"))
+    assert all(cases["local"][key] is False for key in ("recent_skip", "recent_profile", "recent_seed_ub"))
+    summary = compare.summarize(_register_reports(), "register-kth")
+    assert summary["execution_order"] == ["urma-upstream-fused", "urma-recent-register", "urma-recent-local"]
+    assert (
+        summary["display_order"]
+        == list(summary["table"])
+        == ["urma-upstream-fused", "urma-recent-local", "urma-recent-register"]
+    )
+    assert [row["display_name"] for row in summary["table"].values()] == [
+        "urma-main-resident",
+        "urma-local-victims",
+        "urma-register-kth",
+    ]
+    effect = summary["effects"]["urma"]
+    assert "serial_reference" not in effect and "seed_ub_eligibility" not in effect
+    assert effect["register_kth_reduction_pct"] == pytest.approx(5)
+    step = effect["timing_comparisons"]["register_kth"]
+    assert step["reference"] == "urma-recent-local" and step["candidate"] == "urma-recent-register"
+    compare.print_summary(summary)
+    text = capsys.readouterr().out
+    assert "MAIN_GAIN urma p50/mean local=" in text
+    assert "STEP_GAIN urma p50/mean register_kth=+5.00%/+5.00%" in text
+    assert "EXECUTION_ORDER urma-main-resident -> urma-register-kth -> urma-local-victims" in text
+    assert "SERIAL_REFERENCE_GAIN" not in text and "SEED_UB_ELIGIBILITY" not in text
+
+
+@pytest.mark.parametrize(
+    "change", ["score", "ordered", "initial", "final", "profile", "seed", "budget", "local", "register"]
+)
+def test_register_kth_requires_the_same_exact_oracle_and_only_changes_its_flag(change):
+    reports = _register_reports()
+    row = reports["urma-recent-register"]
+    if change == "score":
+        row["score_comparison"]["status"] = "unchecked"
+    elif change == "ordered":
+        row["selection_comparison"]["ordered_output_sha256"] = "other"
+    elif change in ("initial", "final"):
+        row["threshold_comparison"][change + "_keys"] = [[0]]
+    else:
+        field, value = {
+            "profile": ("recent_profile", True),
+            "seed": ("recent_seed_ub", True),
+            "budget": ("window_limit", 32),
+            "local": ("recent_local_victims", False),
+            "register": ("recent_register_kth", False),
+        }[change]
+        row["tuning"][field] = value
+    with pytest.raises(ValueError):
+        compare.summarize(reports, "register-kth")
+
+
+@pytest.mark.parametrize("wrong_order", [False, True])
+def test_register_kth_cli_runs_only_two_fused_processes_and_checks_child_order(tmp_path, monkeypatch, wrong_order):
+    monkeypatch.setattr(upstream, "validate_checkout", lambda root, revision: root)
+    base = _arguments(
+        tmp_path,
+        ["--study", "register-kth", "--upstream-root", str(tmp_path / "main"), "--upstream-revision", REVISION],
+    )
+    for extra in (["--diagnostic-replays", "1"], ["--transports", "both"]):
+        with pytest.raises(SystemExit):
+            compare.arguments(base + extra)
+    args, calls, reports = compare.arguments(base), [], _register_reports()
+
+    def child(command, **kwargs):
+        calls.append(command)
+        parsed = replay.arguments(command[4:])
+        assert parsed.mode == "fused" and parsed.diagnostic_replays == 0 and parsed.iterations == 10
+        assert "--serial-workers" not in command
+        if parsed.upstream_root:
+            result = reports["urma-upstream-fused"]
+        else:
+            assert parsed.study == "register-kth" and parsed.threshold_policy == "both"
+            for extra in (["--diagnostic-replays", "1"], ["--transport", "ubmem"], ["--mode", "serial"]):
+                with pytest.raises(SystemExit):
+                    replay.arguments(command[4:] + extra)
+            order = ["local", "register"] if wrong_order else ["register", "local"]
+            result = dict(execution_order=order, cases={name: reports[f"urma-recent-{name}"] for name in order})
+        parsed.output.write_text(json.dumps(result))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(compare.subprocess, "run", child)
+    monkeypatch.setattr(compare, "source_commit", lambda: "feature")
+    if wrong_order:
+        with pytest.raises(ValueError, match="candidate before local-victims"):
+            compare.run(args)
+        assert not (args.result_dir / "summary.json").exists()
+    else:
+        result = compare.run(args)
+        saved = json.loads((args.result_dir / "summary.json").read_text())
+        assert saved["execution_order"] == result["execution_order"] == list(reports)
+        assert len(result["table"]) == 3 and len(list(args.result_dir.glob("*.json"))) == 3
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("fail_local", [False, True])
+def test_register_kth_shares_runtime_measures_candidate_first_and_retains_partial_result(monkeypatch, fail_local):
+    args = SimpleNamespace(study="register-kth", mode="fused", transport="urma", threshold_policy="both")
+    calls, context, retained = [], object(), {}
+    monkeypatch.setattr(replay_measure, "allocate_context", lambda *args: calls.append("allocate") or context)
+    monkeypatch.setattr(replay_measure, "release_context", lambda received: calls.append(("release", received)))
+
+    def measure(received, archive, allocated, retained):
+        assert allocated is context
+        calls.append(dict(received.fused_tuning))
+        if fail_local and not received.fused_tuning["recent_register_kth"]:
+            raise RuntimeError("baseline device failure")
+        return _case(100, tuning=dict(received.fused_tuning))
+
+    monkeypatch.setattr(replay_measure, "measure_case", measure)
+    expected = ["allocate", *replay_measure.study_cases(args).values()]
+    if fail_local:
+        with pytest.raises(RuntimeError, match="baseline device failure"):
+            replay_measure.run(args, object(), retained)
+        assert list(retained["completed_cases"]) == ["register"]
+        assert retained["progress"]["variant"] == "local"
+        # Failed native owners stay alive for the outer fail-stop handler.
+        assert calls == expected
+    else:
+        result = replay_measure.run(args, object(), retained)
+        assert result["execution_order"] == list(result["cases"]) == ["register", "local"]
+        assert list(retained["completed_cases"]) == ["register", "local"]
+        assert calls == expected + [("release", context)]
+
+
+def test_register_kth_requires_urma_threshold_only_and_matching_native_export():
+    from kvip.diagnostics.fused_replay import validate_fused_tuning, verify_build_options
+
+    options = dict(recent_threshold_only=True, recent_register_kth=True)
+    assert validate_fused_tuning(options, "urma") == options
+    with pytest.raises(ValueError, match="only by URMA"):
+        validate_fused_tuning(options, "ubmem")
+    with pytest.raises(ValueError, match="requires recent_threshold_only"):
+        validate_fused_tuning(dict(recent_register_kth=True), "urma")
+    with pytest.raises(AttributeError, match="kvip_recent_register_kth"):
+        verify_build_options(SimpleNamespace(), {"recent_register_kth": True})
+    with pytest.raises(RuntimeError, match="recent_register_kth=True"):
+        verify_build_options(SimpleNamespace(kvip_recent_register_kth=lambda: 0), {"recent_register_kth": True})
+    verify_build_options(SimpleNamespace(kvip_recent_register_kth=lambda: 1), {"recent_register_kth": True})

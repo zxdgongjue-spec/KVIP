@@ -29,6 +29,10 @@ extern "C" uint32_t kvip_recent_profile() { return KVIP_RECENT_PROFILE; }
 #define KVIP_RECENT_LOCAL_VICTIMS 0
 #endif
 extern "C" uint32_t kvip_recent_local_victims() { return KVIP_RECENT_LOCAL_VICTIMS; }
+#ifndef KVIP_RECENT_REGISTER_KTH
+#define KVIP_RECENT_REGISTER_KTH 0
+#endif
+extern "C" uint32_t kvip_recent_register_kth() { return KVIP_RECENT_REGISTER_KTH; }
 extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) { return rotating::PrepareShape(shape); }
 #define ENTRY(name, blocks) \
 extern "C" uint32_t aclrtlaunch_v9_##name##_kernel(uint32_t,void*,void*); \

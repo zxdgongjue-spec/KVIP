@@ -566,6 +566,22 @@ def release_context(context):
 def study_cases(args):
     """Keep each study's baseline explicit when production defaults advance."""
     study = getattr(args, "study", "threshold")
+    if study == "register-kth":
+        # Measure the candidate first, then the established baseline, in one arena.
+        return {
+            name: dict(
+                recent_threshold=True,
+                recent_pipeline=True,
+                recent_unified_topk=True,
+                recent_skip=False,
+                recent_threshold_only=True,
+                recent_profile=False,
+                recent_seed_ub=False,
+                recent_local_victims=True,
+                recent_register_kth=register,
+            )
+            for name, register in (("register", True), ("local", False))
+        }
     if study == "local-victims":
         return {
             name: dict(
@@ -654,6 +670,7 @@ def run(args, archive, retained):
         "threshold-only",
         "seed-ub",
         "local-victims",
+        "register-kth",
     )
     if args.mode == "fused" and (args.threshold_policy == "both" or execution_study):
         cases = {}
@@ -673,6 +690,7 @@ def run(args, archive, retained):
             mode=args.mode,
             study=getattr(args, "study", "threshold"),
             cases=cases,
+            execution_order=list(cases),
         )
     else:
         retained["progress"]["variant"] = (

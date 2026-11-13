@@ -158,6 +158,27 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
         build.build_libraries(**options, recent_local_victims=True)
     with pytest.raises(ValueError, match="must be boolean"):
         build.build_libraries(**options, recent_local_victims=1)
+    register_kth = build.build_libraries(
+        **options, recent_threshold_only=True, recent_profile=False, recent_local_victims=True, recent_register_kth=True
+    )
+    assert register_kth not in {threshold_only, release, seed, local_victims}
+    assert "-DKVIP_RECENT_REGISTER_KTH=1" in commands[-2]
+    assert "-DKVIP_RECENT_REGISTER_KTH=0" in commands[-4]
+    assert (
+        build.build_libraries(
+            **options,
+            recent_threshold_only=True,
+            recent_profile=False,
+            recent_local_victims=True,
+            recent_register_kth=True,
+        )
+        == register_kth
+    )
+    assert len(commands) == 24
+    with pytest.raises(ValueError, match="requires threshold-only"):
+        build.build_libraries(**options, recent_register_kth=True)
+    with pytest.raises(ValueError, match="must be boolean"):
+        build.build_libraries(**options, recent_register_kth=1)
 
 
 def test_actual_operator_cmake_resolves_relocated_sources(tmp_path):

@@ -20,6 +20,16 @@
 #include "topk_common.h"
 #include "topk_common.h"
 
+#ifndef KVIP_RECENT_REGISTER_KTH
+#define KVIP_RECENT_REGISTER_KTH 0
+#endif
+#if KVIP_RECENT_REGISTER_KTH != 0 && KVIP_RECENT_REGISTER_KTH != 1
+#error "KVIP_RECENT_REGISTER_KTH must be 0 or 1"
+#endif
+#if KVIP_RECENT_REGISTER_KTH && !(defined(V9_UBMEM) && V9_UBMEM)
+#include "recent_threshold.h"
+#endif
+
 namespace topk {
 template<typename T>
 class LITopk {
@@ -161,6 +171,15 @@ public:
                                      const LocalTensor<uint16_t>& threshold,
                                      uint32_t validLen)
     {
+#if KVIP_RECENT_REGISTER_KTH && !(defined(V9_UBMEM) && V9_UBMEM)
+        if (topK && validLen >= topK && validLen <= 18432 && validLen % 256 == 0) {
+            kvip_recent_threshold::RegisterThreshold(
+                reinterpret_cast<__ubuf__ uint16_t*>(input.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint16_t*>(threshold.GetPhyAddr()),
+                uint16_t(validLen / 256), uint16_t(validLen - topK + 1));
+            return;
+        }
+#endif
         auto values = reinterpret_cast<__ubuf__ uint16_t*>(input.GetPhyAddr());
         auto output = reinterpret_cast<__ubuf__ uint32_t*>(threshold.GetPhyAddr());
         auto histogram = reinterpret_cast<__ubuf__ uint32_t*>(histogramsLocal.GetPhyAddr());
