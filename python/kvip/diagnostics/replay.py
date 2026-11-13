@@ -10,6 +10,7 @@ import traceback
 from kvip.diagnostics.archive import load_snapshot
 from kvip.diagnostics.console import NativeLog, emit, flush_output, print_replay_failure
 from kvip.diagnostics.pipeline_options import DEFAULT_VARIANTS, VARIANTS
+from kvip.diagnostics.system_profile import PROFILE_METRICS
 
 _RETAINED = []
 
@@ -57,13 +58,29 @@ def arguments(argv=None):
         help="Separate instrumented fused graph replays after headline timing",
     )
     p.add_argument("--quiet", action="store_true")
-    p.add_argument("--topk-probe", action="store_true", help="After all headline cases, run one separately built pruning-counter graph without timing")
+    p.add_argument("--profile-dir", type=Path, help="Independent system traces, outside headline timing")
+    p.add_argument("--profile-metrics", nargs="+", choices=PROFILE_METRICS, default=None)
+    p.add_argument(
+        "--topk-probe",
+        action="store_true",
+        help="After all headline cases, run one separately built pruning-counter graph without timing",
+    )
     p.add_argument("--output", type=Path, required=True)
     args = p.parse_args(argv)
     if args.warmup < 0 or args.iterations < 1 or args.device < 0 or args.diagnostic_replays < 0:
         p.error("Require nonnegative device/warmup and positive iterations")
     if args.output.exists():
         p.error("Output already exists")
+    if args.profile_metrics is not None and args.profile_dir is None:
+        p.error("profile-metrics requires profile-dir")
+    if args.profile_dir is not None:
+        if args.topk_probe or args.diagnostic_replays:
+            p.error("profile-dir cannot be combined with topk-probe or diagnostic-replays")
+        if args.profile_dir.exists() and not args.profile_dir.is_dir():
+            p.error("profile-dir must be a directory")
+        args.profile_metrics = args.profile_metrics or ["none"]
+        if len(set(args.profile_metrics)) != len(args.profile_metrics):
+            p.error("profile-metrics must be unique")
     if not args.kvaf_server:
         p.error("A local KVAF CPU service address is required for this runtime")
     if args.mode == "serial" and args.threshold_policy != "resident":
@@ -146,6 +163,7 @@ def main(argv=None):
             if active is not None
             else retained.get("buffers_variant"),
             completed_cases=retained.get("completed_cases", {}),
+            profile_manifests=active.get("system_profile_manifests", []) if active is not None else [],
             error=dict(type=type(error).__name__, message=str(error), traceback=traceback.format_exc()),
             native_log=str(log.failure_path) if log.failure_path else None,
         )

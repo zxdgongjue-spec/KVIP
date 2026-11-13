@@ -358,6 +358,23 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
             samples=diagnostic_samples,
             note="Separate instrumented replay with barriers/cache operations; intervals overlap and cannot be summed into graph latency or converted to microseconds without a measured clock.",
         )
+    if getattr(args, "profile_dir", None) is not None:
+        from kvip.diagnostics.system_profile import collect_system_profiles
+
+        variant = retained.get("progress", {}).get("variant", args.threshold_policy)
+        result["system_profiles"] = collect_system_profiles(
+            torch=torch,
+            reset=reset,
+            replay=lambda: replay(graph),
+            synchronize=stream.synchronize,
+            verify=verify,
+            directory=args.profile_dir,
+            case=f"{args.transport}-{args.mode}-{variant}",
+            metrics=args.profile_metrics,
+            metadata=retained["profile_metadata"],
+            retained=retained,
+            checkpoint=lambda name, step: phase(retained, name, step),
+        )
     phase(retained, "graph_reset")
     for graph in reversed(graphs):
         graph.reset()
@@ -484,6 +501,34 @@ def measure_case(args, archive, context, retained):
             transport=args.transport,
         )
         case_retained["bundle"] = bundle
+    if getattr(args, "profile_dir", None) is not None:
+        library = getattr(bundle, "library", None)
+        libraries = getattr(bundle, "libraries", (() if library is None else (library,)))
+        case_retained["profile_metadata"] = dict(
+            snapshot=str(archive.directory),
+            snapshot_sha256=file_digest(archive.directory / "manifest.json"),
+            content=archive.manifest.get("content"),
+            geometry=archive.manifest["geometry"],
+            production_source=getattr(args, "production_source", None)
+            or dict(
+                root=str(getattr(args, "upstream_root", None) or Path(__file__).resolve().parents[3]),
+                commit=getattr(args, "upstream_revision", None) or source_commit(),
+            ),
+            diagnostics_commit=source_commit(),
+            transport=args.transport,
+            mode=args.mode,
+            device=args.device,
+            soc=args.soc,
+            cann=str(cann),
+            kvaf_module=str(Path(kvaf.__file__).resolve()),
+            kvaf_build=str(build),
+            graph_backend="torch.npu.NPUGraph" if args.mode == "serial" else "kvaf.AclGraph",
+            tuning=dict(getattr(bundle, "tuning", {})),
+            pipeline_options=getattr(args, "pipeline_options", None),
+            pipeline_q_workers=getattr(args, "pipeline_q_workers", None),
+            runtime_configuration=runtime_worker_config(args, archive, aics),
+            libraries=[dict(path=str(path), sha256=file_digest(path)) for path in libraries],
+        )
     results = measure(torch, kvaf, stream, bundle, args, case_retained, runtime=runtime)
     phase(retained, "result_metadata")
     upstream_root = getattr(args, "upstream_root", None)
