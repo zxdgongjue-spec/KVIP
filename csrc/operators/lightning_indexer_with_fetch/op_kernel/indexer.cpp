@@ -40,7 +40,11 @@ __aicore__ inline void RunLi(GM_ADDR bindings) {
     QLITilingData tiling{shape.batch,shape.batch*4,shape.indexHeads,4,shape.history,
         2048,shape.liCores,128,shape.history/128,0,16384,128,shape.resident,
         splitSequence ? 0U : shape.splitQ,shape.aicCount};
-    if ASCEND_IS_AIV { op.vectorService.SetStreamingWorkspace(P(15)); }
+    if ASCEND_IS_AIV {
+        op.vectorService.SetStreamingWorkspace(P(15));
+        op.vectorService.SetAdmissionControls(
+            reinterpret_cast<__gm__ rotating::Context*>(a[14])->admissionControls);
+    }
     op.Init(P(0),P(1),P(2),P(3),P(4),P(5),P(6),P(7),P(9),P(12),&tiling,&pipe);
     if ASCEND_IS_AIV {
         op.vectorService.SetPrefixStorage(P(13));

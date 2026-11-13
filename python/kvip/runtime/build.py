@@ -48,6 +48,7 @@ def build_libraries(
     early_fetch_ready=False,
     compact_init=False,
     ready_batch_fetch=False,
+    ready_direct_ranges=False,
     topk_prune_diagnostics=False,
 ):
     """Build one shape-independent binary per source/toolchain/SoC."""
@@ -64,6 +65,7 @@ def build_libraries(
         EARLY_FETCH_READY=early_fetch_ready,
         COMPACT_INIT=compact_init,
         READY_BATCH_FETCH=ready_batch_fetch,
+        READY_DIRECT_RANGES=ready_direct_ranges,
         TOPK_PRUNE_DIAGNOSTICS=topk_prune_diagnostics,
     )
     if any(type(value) is not bool for value in variants.values()):

@@ -13,6 +13,7 @@ namespace kvaf_device { using ubmem_device::CleanCacheLines; constexpr uint32_t 
 #include "simt_api/device_sync_functions.h"
 #include "simt_api/device_warp_functions.h"
 #include "context.h"
+#include "admission_policy.h"
 #include "../../common/lifetch/prefetch_budget.h"
 
 // Imported from direct_slots.h
@@ -654,6 +655,9 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
 auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         if (rt_batchedRows) postInput.SetValue(64,0);
         if(state.GetValue(11))continue;
+        // Zero admission still reaches this service lane's completion
+        // publication below; final repair remains responsible for all misses.
+        if(ctx->admissionControls && !state.GetValue(209))continue;
         uint32_t slots=state.GetValue(8),requests=state.GetValue(9),pending=state.GetValue(211);
         uint32_t sequence=state.GetValue(246)+1;
         state.SetValue(246,sequence);state.SetValue(214+epoch,sequence);
@@ -672,8 +676,13 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         uint32_t count=0,missing=0;
         if(candidateCount) {
             auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;
+            uint32_t window=ctx->windowLimit;
+            if(ctx->admissionControls) {
+                auto controls=reinterpret_cast<const __gm__ int32_t*>(ctx->admissionControls)+b*4;
+                window=kvip_admission::WindowAllowance(uint32_t(controls[1]),epoch,requests,controls[3]!=0);
+            }
             uint32_t available=PrefetchAllowance(slots,requests,state.GetValue(208),
-                state.GetValue(209),state.GetValue(210),ctx->windowLimit);
+                state.GetValue(209),state.GetValue(210),window);
             if(!slots && !ctx->tailBounds) {
                 // No slot has ever been assigned: the OR bitmap already
                 // deduplicated tokens, so every candidate is a new miss.

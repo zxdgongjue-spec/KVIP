@@ -40,6 +40,24 @@ template <typename QLIT>
 class QLIVector {
 public:
     rotating::RuntimeShape runtimeShape_;
+#if !(defined(V9_UBMEM) && V9_UBMEM)
+    // Bound before InitBuffers; null keeps the original UB layout and path.
+    __aicore__ inline void SetAdmissionControls(uint64_t address) {
+        admissionControls_ = address;
+    }
+    __aicore__ inline void ConfigureAdmissionRows(uint32_t begin, uint32_t end, bool topkOnly) {
+        if (!admissionControls_ || topkOnly) return;
+        auto controls = reinterpret_cast<const __gm__ int32_t*>(admissionControls_);
+        // SplitCore can assign several rows when query lengths differ. Reserve
+        // gate storage only if one of this core's actual rows raises the gate.
+        for (uint32_t row = begin; row <= end; ++row) {
+            if (controls[row * 4 + 2] > 0) {
+                admissionEnabled_ = true;
+                break;
+            }
+        }
+    }
+#endif
     __aicore__ inline void SetRotationContext(GM_ADDR p) {
         rotationContext_ = p;
         runtimeShape_ = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(p));
@@ -79,6 +97,10 @@ public:
         DataCopy(prefixThreshold_, thresholds[(blockId_ % 2) * 256], 256);
         SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
         WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+#if !(defined(V9_UBMEM) && V9_UBMEM)
+        PrepareAdmissionThreshold(batch * SIM_Q + (blockId_ % 2) * 2);
+        PrepareAdmissionThreshold(batch * SIM_Q + (blockId_ % 2) * 2 + 1);
+#endif
     }
 
     // =================================类型定义区=================================
@@ -198,6 +220,28 @@ private:
     LocalTensor<uint16_t> classifyUB_;
     TBuf<TPosition::VECCALC> prefixThresholdBuf_;
     LocalTensor<uint16_t> prefixThreshold_;
+#if !(defined(V9_UBMEM) && V9_UBMEM)
+    uint64_t admissionControls_ = 0;
+    bool admissionEnabled_ = false;
+    TBuf<TPosition::VECCALC> admissionThresholdBuf_;
+    LocalTensor<uint16_t> admissionThreshold_;
+    LocalTensor<uint16_t> coldThreshold_;
+
+    __aicore__ inline void PrepareAdmissionThreshold(uint32_t query) {
+        if (!admissionEnabled_) return;
+        auto controls = reinterpret_cast<const __gm__ int32_t*>(admissionControls_) + (query / SIM_Q) * 4;
+        uint32_t steps = uint32_t(controls[2]);
+        coldThreshold_ = steps ? admissionThreshold_ : prefixThreshold_;
+        if (!steps) return;
+        // This key is deliberately separate: exact final TopK and hot-victim
+        // protection must continue to use the unmodified prefixThreshold_.
+        SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        uint16_t lower = prefixThreshold_.GetValue((query % 2) * 128);
+        uint16_t gate = kvip_admission::LiftKey(lower, steps);
+        admissionThreshold_.SetValue((query % 2) * 128, gate);
+        SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
+    }
+#endif
     __aicore__ inline bool TryResidentThreshold(uint32_t query, uint32_t scoreRow,
                                                 uint32_t residentCount, uint32_t availableEnd) {
         if constexpr (std::is_same_v<SCORE_T, uint16_t>) {
@@ -314,6 +358,9 @@ private:
         }
         DataCopy(thresholds[q * 128], prefixThreshold_[(query % 2) * 128], 128);
         PipeBarrier<PIPE_ALL>();
+#if !(defined(V9_UBMEM) && V9_UBMEM)
+        PrepareAdmissionThreshold(query);
+#endif
         auto context = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
         if (context->lruSlots) {
             // TopK scratch is dead after the resident result is saved. Reuse
@@ -448,6 +495,13 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe, bool topkOnly)
     }
     pipe->InitBuffer(prefixThresholdBuf_, 512);
     prefixThreshold_ = prefixThresholdBuf_.Get<uint16_t>();
+#if !(defined(V9_UBMEM) && V9_UBMEM)
+    coldThreshold_ = prefixThreshold_;
+    if (admissionEnabled_) {
+        pipe->InitBuffer(admissionThresholdBuf_, 512);
+        admissionThreshold_ = admissionThresholdBuf_.Get<uint16_t>();
+    }
+#endif
     if (!topkOnly) {
         pipe->InitBuffer(classifyBuf_, 1024);
         classifyUB_ = classifyBuf_.Get<uint16_t>();
@@ -762,7 +816,11 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
                                         kScaleBase, (uint32_t)0,
                                         qScaleBase, UB_BANK_DEPTH_STRIDE / sizeof(SCALE_T),
                                         gSize_, curAivS1ProcNum,
+#if !(defined(V9_UBMEM) && V9_UBMEM)
+        (__ubuf__ uint16_t *)coldThreshold_.GetPhyAddr() + (curAivS1Idx % 2) * 128,
+#else
         (__ubuf__ uint16_t *)prefixThreshold_.GetPhyAddr() + (curAivS1Idx % 2) * 128,
+#endif
         (__ubuf__ uint16_t *)classifyUB_.GetPhyAddr() + pingpong * 256);
     } else {
     vector1::BatchMulWeightAndReduceSum(outBase, UB_BANK_DEPTH_STRIDE / sizeof(SCORE_T),

@@ -2,6 +2,13 @@
 // Native adapter for the bounded-ready scheduler. Included after PackFetchRanges.
 #pragma once
 
+#ifndef KVIP_READY_DIRECT_RANGES
+#define KVIP_READY_DIRECT_RANGES 0
+#endif
+#if KVIP_READY_DIRECT_RANGES != 0 && KVIP_READY_DIRECT_RANGES != 1
+#error "KVIP_READY_DIRECT_RANGES must be 0 or 1"
+#endif
+
 struct ReadyBatchIo {
     __gm__ Args* a;
     __gm__ Context* ctx;
@@ -54,18 +61,43 @@ struct ReadyBatchIo {
     __aicore__ inline ready_fetch::Submitted Submit(
         const ready_fetch::Range* batch, uint32_t count, uint32_t size) {
         uint64_t packStart = profile ? Now() : 0;
-        for (uint32_t i = 0; i < count; ++i) {
-            SyncFetchDescriptors(ctx, batch[i].begin, batch[i].count);
-            ranges[3 * i] = batch[i].begin;
-            ranges[3 * i + 1] = batch[i].count;
-            ranges[3 * i + 2] = batch[i].output;
+#if KVIP_READY_DIRECT_RANGES
+        if (!batch || !count || count > shape.batch || !size || size > stride)
+            return {Invalid(), 0};
+        auto callArgs = args;
+        if (count == 1) {
+            const auto range = batch[0];
+            const uint32_t capacity = shape.batch * ready_fetch::kSlots;
+            if (range.output || range.count != size || range.begin >= capacity ||
+                size > ready_fetch::kTop - range.begin % ready_fetch::kTop ||
+                (range.begin % ready_fetch::kSlots) / ready_fetch::kTop != query ||
+                !ctx->sourceBlocks || !ctx->sourceOffsets || !ctx->destinations)
+                return {Invalid(), 0};
+            // Query publication freezes this canonical range. Acquire its
+            // descriptors before the synchronous native call; no producer may
+            // reuse them until this kernel completes. Queue/CQ ownership and
+            // the native validation/completion path are unchanged.
+            SyncFetchDescriptors(ctx, range.begin, size);
+            const uint64_t offset = uint64_t(range.begin) * sizeof(int32_t);
+            callArgs.indices = ctx->sourceBlocks + offset;
+            callArgs.offsets = ctx->sourceOffsets + offset;
+            callArgs.output_indices = ctx->destinations + offset;
+        } else
+#endif
+        {
+            for (uint32_t i = 0; i < count; ++i) {
+                SyncFetchDescriptors(ctx, batch[i].begin, batch[i].count);
+                ranges[3 * i] = batch[i].begin;
+                ranges[3 * i + 1] = batch[i].count;
+                ranges[3 * i + 2] = batch[i].output;
+            }
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ranges), uint64_t(count) * 12);
+            Simt::VF_CALL<PackFetchRanges>(Simt::Dim3{256, 1, 1}, ctx, packed, stride, ranges, count);
+            SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(packed), uint64_t(size) * 4);
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(packed + stride), uint64_t(size) * 4);
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(packed + 2 * stride), uint64_t(size) * 4);
         }
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ranges), uint64_t(count) * 12);
-        Simt::VF_CALL<PackFetchRanges>(Simt::Dim3{256, 1, 1}, ctx, packed, stride, ranges, count);
-        SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(packed), uint64_t(size) * 4);
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(packed + stride), uint64_t(size) * 4);
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(packed + 2 * stride), uint64_t(size) * 4);
         if (profile) packCycles += Now() - packStart;
 #if V9_SIMULATION
         return {Invalid(), 0};
@@ -84,7 +116,11 @@ struct ReadyBatchIo {
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&status->profile), sizeof(status->profile));
         }
         uint64_t start = profile ? Now() : 0;
+#if KVIP_READY_DIRECT_RANGES
+        kvaf_device::KvafBatchGetDevice(callArgs, 0, 0, size);
+#else
         kvaf_device::KvafBatchGetDevice(args, 0, 0, size);
+#endif
         uint64_t end = profile ? Now() : 0;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue), 2 * sizeof(*queue));
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status), sizeof(*status));

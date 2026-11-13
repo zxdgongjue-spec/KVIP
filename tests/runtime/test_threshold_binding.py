@@ -64,6 +64,10 @@ class Tensor:
     def zero_(self):
         return self.fill_(0)
 
+    def copy_(self, other):
+        self.values[...] = other.values
+        return self
+
 
 def fixture(monkeypatch, batch=2):
     history, resident, heads = 4096, 2048, 32
@@ -112,8 +116,8 @@ def fixture(monkeypatch, batch=2):
             Mock(side_effect=lambda p, a=attribute: getattr(ctypes.cast(p, ctypes.POINTER(RuntimeShape)).contents, a)),
         )
     for name, value in {
-        "abi_version": 12,
-        "context_bytes": 328,
+        "abi_version": 13,
+        "context_bytes": 336,
         "row_bytes": 1024,
         "simulation": 0,
         "final_replicated": 1,
@@ -159,7 +163,7 @@ def fixture(monkeypatch, batch=2):
 
 @pytest.mark.parametrize("batch", [1, 2, 16])
 def test_context_appends_retained_threshold_range(monkeypatch, batch):
-    bytes_, shape_offset, tail_offset, threshold_offset = 328, 224, 216, 320
+    bytes_, shape_offset, tail_offset, threshold_offset = 336, 224, 216, 320
     f = fixture(monkeypatch, batch)
     bound = f.construct()
     blob = bound.context.values.tobytes()
@@ -203,7 +207,7 @@ def test_threshold_range_rejects_wrong_tensor_contract(monkeypatch, bad):
     f.library.v9_li.assert_not_called()
 
 
-@pytest.mark.parametrize("field,value", [("v9_abi_version", 11), ("v9_context_bytes", 320)])
+@pytest.mark.parametrize("field,value", [("v9_abi_version", 12), ("v9_context_bytes", 328)])
 def test_old_native_abi_rejected_before_scratch_allocation(monkeypatch, field, value):
     f = fixture(monkeypatch)
     getattr(f.library, field).return_value = value
@@ -219,3 +223,54 @@ def test_binding_batch_limit_still_precedes_allocation(monkeypatch, batch):
         f.construct()
     f.torch.zeros.assert_not_called()
     f.library.kvip_prepare_shape.assert_not_called()
+
+
+def test_admission_controls_are_validated_and_keep_a_stable_address(monkeypatch):
+    f = fixture(monkeypatch)
+    values = np.array([[512, 64, 0, 0], [2048, 480, 65535, 1]], dtype=np.int32)
+    bound = f.construct(admission_controls=values)
+    pointer = bound.admission_controls.data_ptr()
+    assert int.from_bytes(bound.context.values[328:336].tobytes(), "little") == pointer
+    np.testing.assert_array_equal(bound.admission_controls.values, values)
+    values[0] = [0, 1, 2, 1]
+    bound.set_admission_controls(values)
+    assert bound.admission_controls.data_ptr() == pointer
+    bound.reset()
+    np.testing.assert_array_equal(bound.admission_controls.values, values)
+    bound.set_admission_controls(None)
+    assert bound.admission_controls is None
+    assert not bound.context.values[328:336].any()
+    bound.set_admission_controls(values)
+    assert bound.admission_controls.data_ptr() == pointer
+    np.testing.assert_array_equal(bound.admission_controls.values, values)
+
+
+@pytest.mark.parametrize("column,value", [(0, -1), (0, 2049), (1, 0), (1, 481), (2, -1), (2, 65536), (3, -1), (3, 2)])
+def test_admission_rejects_invalid_bounds_before_allocation(monkeypatch, column, value):
+    f = fixture(monkeypatch)
+    controls = np.tile(np.array([512, 64, 0, 0], dtype=np.int32), (2, 1))
+    controls[0, column] = value
+    with pytest.raises(ValueError, match="admission bounds"):
+        f.construct(admission_controls=controls)
+    f.torch.zeros.assert_not_called()
+
+
+@pytest.mark.parametrize("bad", [np.zeros((2, 4), dtype=np.int64), np.zeros((2, 3), dtype=np.int32),
+                                 np.zeros((2, 8), dtype=np.int32)[:, ::2], Tensor(np.zeros((2, 4), np.int32))])
+def test_admission_rejects_casts_and_hidden_device_readback(monkeypatch, bad):
+    f = fixture(monkeypatch)
+    bound = f.construct()
+    original = bound.context.values.copy()
+    with pytest.raises(ValueError, match="CPU int32"):
+        bound.set_admission_controls(bad)
+    np.testing.assert_array_equal(bound.context.values, original)
+    assert bound.admission_controls is None
+
+
+def test_admission_cannot_update_during_capture(monkeypatch):
+    f = fixture(monkeypatch)
+    bound = f.construct()
+    f.torch.npu = SimpleNamespace(is_current_stream_capturing=lambda: True)
+    with pytest.raises(RuntimeError, match="outside graph capture"):
+        bound.set_admission_controls(np.tile(np.array([512, 64, 0, 0], np.int32), (2, 1)))
+    assert bound.admission_controls is None

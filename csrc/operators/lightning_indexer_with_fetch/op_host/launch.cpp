@@ -7,6 +7,7 @@ extern "C" uint32_t kvip_selected_metadata() { return KVIP_SELECTED_METADATA; }
 extern "C" uint32_t kvip_early_fetch_ready() { return KVIP_EARLY_FETCH_READY; }
 extern "C" uint32_t kvip_compact_init() { return KVIP_COMPACT_INIT; }
 extern "C" uint32_t kvip_ready_batch_fetch() { return KVIP_READY_BATCH_FETCH; }
+extern "C" uint32_t kvip_ready_direct_ranges() { return KVIP_READY_DIRECT_RANGES; }
 extern "C" uint32_t kvip_topk_prune_diagnostics() { return KVIP_TOPK_PRUNE_DIAGNOSTICS; }
 extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) { return rotating::PrepareShape(shape); }
 #define ENTRY(name, blocks) \
@@ -39,7 +40,7 @@ extern "C" uint32_t v9_row_bytes(const rotating::RuntimeShape* shape) { return s
 extern "C" uint32_t v9_context_bytes(const rotating::RuntimeShape* shape) { return sizeof(rotating::Context); }
 extern "C" uint32_t v9_rounds(const rotating::RuntimeShape* shape) { return shape->rounds; }
 extern "C" uint32_t v9_simulation(const rotating::RuntimeShape* shape) { return 0; }
-extern "C" uint32_t v9_abi_version(const rotating::RuntimeShape* shape) { return 12; }
+extern "C" uint32_t v9_abi_version(const rotating::RuntimeShape* shape) { return 13; }
 extern "C" uint32_t v9_aic_count(const rotating::RuntimeShape* shape) { return shape->aicCount; }
 extern "C" uint32_t v9_service_lanes(const rotating::RuntimeShape* shape) { return shape->serviceLanes; }
 extern "C" uint32_t v9_final_workers(const rotating::RuntimeShape* shape) { return shape->finalWorkers; }

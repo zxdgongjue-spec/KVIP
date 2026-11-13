@@ -2,7 +2,7 @@
 #pragma once
 
 // The Context ABI is not necessarily a multiple of a 32-byte DMA block.
-// Copy exactly its bytes, including the trailing thresholdBounds pointer;
+// Copy exactly its bytes, including the optional admissionControls pointer;
 // callers join MTE2 before a SIMT consumer reads this local snapshot.
 __aicore__ inline void CopyContextSnapshot(
     LocalTensor<uint32_t> destination, __gm__ Context* context) {

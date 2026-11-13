@@ -129,7 +129,8 @@ int main(){
     compile_and_run(tmp_path, source, "scheduler")
 
 
-def test_native_adapter_queue_counts_errors_and_index_join(tmp_path):
+@pytest.mark.parametrize("direct", [0, 1])
+def test_native_adapter_queue_counts_errors_and_index_join(tmp_path, direct):
     streaming = (KERNEL / "streaming.cpp").read_text()
     entry = function(streaming, "__aicore__ inline void FetchQueryGroup(")
     source = (
@@ -149,7 +150,7 @@ constexpr uint64_t KVAF_AIV_BATCH_GET_PROFILE_MAGIC=10,KVAF_AIV_BATCH_GET_STATUS
 struct BatchFlag {uint32_t ready=0,error=0;};
 struct FinalPost {uint32_t count=0,descriptor=0,nonconflicting=0,error=0,pending=0,deferred=1;};
 struct RuntimeShape {uint32_t batch=16,finalWorkers=4,finalPostOffset=0,resident=16384;};
-struct Context {uint64_t count=0,fallbackAddresses=0,fallbackValid=0;RuntimeShape shape;FinalPost posts[64];};
+struct Context {uint64_t count=0,fallbackAddresses=0,fallbackValid=0,sourceBlocks=0,sourceOffsets=0,destinations=0;RuntimeShape shape;FinalPost posts[64];};
 struct Args {uint64_t context,flags,times,packedFetch;uint32_t prefetchCount;};
 struct KvafBatchGetQueueState {uint64_t initialized=1,completed_batch_count=41,poisoned=0;};
 struct Profile {uint64_t magic=0,post_active_cycles=3,drain_wait_cycles=5,submitted_group_count=1;};
@@ -245,7 +246,7 @@ int main(){
 }
 """
     )
-    compile_and_run(tmp_path, source, "adapter")
+    compile_and_run(tmp_path, f"#define KVIP_READY_DIRECT_RANGES {direct}\n" + source, "adapter")
 
 
 def test_candidate_disables_unconsumed_direct_layout_only_for_urma():

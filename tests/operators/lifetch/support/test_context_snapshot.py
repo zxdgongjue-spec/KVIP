@@ -7,7 +7,7 @@ import subprocess
 import pytest
 
 
-@pytest.mark.parametrize("backend,size,tail", [("urma", 328, 320)])
+@pytest.mark.parametrize("backend,size,tail", [("urma", 336, 328)])
 @pytest.mark.parametrize("caller", ["streaming.cpp", "output_worker.h"])
 def test_exact_context_dma(tmp_path, backend, size, tail, caller):
     root = Path(__file__).resolve().parents[4]
@@ -59,11 +59,13 @@ void DataCopyPad(LocalTensor<uint8_t> dst, GlobalTensor<uint8_t> src,
 #include "SNAPSHOT"
 int main(){
  static_assert(sizeof(Context)==SIZE);
- static_assert(offsetof(Context,thresholdBounds)==TAIL);
+ static_assert(offsetof(Context,thresholdBounds)==320);
+ static_assert(offsetof(Context,admissionControls)==TAIL);
  Context original{};
  auto bytes=reinterpret_cast<uint8_t*>(&original);
  for(unsigned i=0;i<sizeof(original);++i)bytes[i]=uint8_t(i*13+7);
  original.thresholdBounds=0x123456789abcdef0ULL;
+ original.admissionControls=0x13579bdf2468ace0ULL;
  alignas(32) uint32_t memory[640];
  std::memset(memory,0xa5,sizeof(memory));
  LocalTensor<uint32_t> ctl{memory};
@@ -78,6 +80,7 @@ int main(){
  Context restored{};
  std::memcpy(&restored,memory+contextOffset,sizeof(restored));
  assert(restored.thresholdBounds==original.thresholdBounds);
+ assert(restored.admissionControls==original.admissionControls);
  auto out=reinterpret_cast<uint8_t*>(memory);
  for(unsigned i=0;i<contextOffset*4;++i)assert(out[i]==0xa5);
  for(unsigned i=contextOffset*4+sizeof(Context);i<sizeof(memory);++i)assert(out[i]==0xa5);
