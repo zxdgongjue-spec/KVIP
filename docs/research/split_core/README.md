@@ -1,5 +1,7 @@
 # 分核研究与KVIP主仓集成状态
 
+[当前生产与split-core实验的完整策略对照](strategy_inventory.md)进一步核对是否按BS×Q分核、直方图Top2048及二次merge、Q4共享hash去重、M/D与实际核数的关系。当前没有按实际miss动态分配Resolve/Fetch核数。
+
 [Final到Output的算法例子与T/M/W/V解释](stage_walkthrough.md)用B1/Q4/10% miss区分H扫描、K分类、820个未满足位置、410个unique修复及8192个输出；同时说明大batch逻辑query数与实际核映射的区别。
 
 [可执行覆盖、真机分组脚本及指令/性能比较流程](native_execution.md)明确42组TopK与30组当前streaming的边界。新增真机入口按miss将30场景分为6个子进程，汇总毫秒与证据；未补齐历史serial6/Fusion3的全矩阵执行，也未执行新NPU测试。

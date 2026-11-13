@@ -1,0 +1,72 @@
+{
+  "scope": "Source audit and CPU mathematical reference; not kernel/hardware acceptance",
+  "source_base": "cf32f4dd27069aaeb56a8393bf05b9b2b4bf10fe",
+  "executed_utc": "2026-11-13T08:23:23.105047+00:00",
+  "artifacts_sha256": {
+    "docs/research/split_core/strategy_inventory.md": "ed125300d36c122ca8ccdc780bd6a06b8259278a5e8cd6c9399ed2acf7b55e98",
+    "docs/research/split_core/results/strategy-inventory.json": "f93abed4c60cd066b8d45f4811595367a86defd92c17fe0d825caebd66630d9d",
+    "docs/research/split_core/verify_strategy_inventory.py": "1254f772f451964e2c639aee528c4582b3d0b6d8c5ecf8f07fc1c2756717d189"
+  },
+  "checks": [
+    {
+      "argv": [
+        "python3",
+        "docs/research/split_core/verify_strategy_inventory.py"
+      ],
+      "exit_code": 0,
+      "log": "docs/research/split_core/results/strategy-inventory-check.log",
+      "sha256": "5ab189cf0ba69ca34d06c0b77f936621318b365843a6783a67077252aeed3313"
+    },
+    {
+      "argv": [
+        "/Users/iantargaryen/Documents/ChatGPT/KVIP_split_core_opt/.aiinfra/local/SPLIT-CORE-003/venv/bin/ruff",
+        "check",
+        "docs/research/split_core/verify_strategy_inventory.py"
+      ],
+      "exit_code": 0,
+      "log": "docs/research/split_core/results/strategy-inventory-lint.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    {
+      "argv": [
+        "/Users/iantargaryen/Documents/ChatGPT/KVIP_split_core_opt/.aiinfra/local/SPLIT-CORE-003/venv/bin/ruff",
+        "format",
+        "--check",
+        "docs/research/split_core/verify_strategy_inventory.py"
+      ],
+      "exit_code": 0,
+      "log": "docs/research/split_core/results/strategy-inventory-format.log",
+      "sha256": "fd2299c9f1c6dc869070883e281051bfe93aacf66c1a3b0069f45b4aa410ca50"
+    }
+  ],
+  "reviewers": [
+    {
+      "agent": "/root/stage_explainer",
+      "result": "accepted sections3-5 and JSON",
+      "coverage": "inner histogram selector, rolling selection, local/merge indices and BF16/tie boundary"
+    },
+    {
+      "agent": "/root/native_final_review",
+      "result": "accepted sections6-8 and JSON",
+      "coverage": "Q4 Ready hash, atomic first owner, prefix allocation, fixed Producer and six conditional examples"
+    },
+    {
+      "agent": "/root/stage_policy_audit",
+      "result": "accepted final corrected document",
+      "coverage": "production versus research, current stage maps, C28/C32 B16 examples and P2 conditions"
+    }
+  ],
+  "mathematical_checks": {
+    "histogram_and_merge": 15,
+    "mapping_shapes": 21,
+    "conditional_miss_examples": 6,
+    "q4_unique_example": true
+  },
+  "source_hashes": 19,
+  "source_links": 12,
+  "new_model_runs": 0,
+  "new_npu_runs": 0,
+  "production_code_changed": false,
+  "formal_aiinfra_gate": "NOT_RUN",
+  "hardware_acceptance": "PENDING"
+}
