@@ -11,10 +11,18 @@ from kvip.cache.index_storage import IndexCacheStorage
 def validate_fused_tuning(value, transport):
     if transport not in ("ubmem", "urma") or not isinstance(value, dict):
         raise ValueError("Expected a tuning object and ubmem/urma transport")
-    if set(value) - {"recent_threshold", "recent_pipeline", "recent_unified_topk", "recent_skip"}:
+    if set(value) - {
+        "recent_threshold",
+        "recent_pipeline",
+        "recent_unified_topk",
+        "recent_skip",
+        "recent_threshold_only",
+    }:
         raise ValueError("Only recent-threshold seed options are changed in this production A/B comparison")
     if any(type(flag) is not bool for flag in value.values()):
         raise ValueError("Recent-threshold seed options must be boolean")
+    if transport != "urma" and value.get("recent_threshold_only"):
+        raise ValueError("recent_threshold_only is supported only by URMA")
     return value
 
 
@@ -71,10 +79,13 @@ def create_fused(
         recent_pipeline=tuning.get("recent_pipeline", True),
         recent_unified_topk=tuning.get("recent_unified_topk", True),
         recent_skip=tuning.get("recent_skip", transport == "ubmem"),
+        recent_threshold_only=tuning.get("recent_threshold_only", False),
         prefetch_limit=512,
         window_limit=64,
     )
     build_options = {key: effective[key] for key in ("recent_pipeline", "recent_unified_topk", "recent_skip")}
+    if transport == "urma":
+        build_options["recent_threshold_only"] = effective["recent_threshold_only"]
     if upstream:
         if any(tuning.values()):
             raise ValueError("The exact upstream reference cannot accept feature options")

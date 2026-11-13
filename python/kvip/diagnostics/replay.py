@@ -20,7 +20,7 @@ def arguments(argv=None):
     p.add_argument("--transport", choices=("urma", "ubmem"), required=True)
     p.add_argument("--mode", choices=("serial", "fused"), required=True)
     p.add_argument("--threshold-policy", choices=("resident", "recent", "both"), default="resident")
-    p.add_argument("--study", choices=("threshold", "pipeline", "skip"), default="threshold")
+    p.add_argument("--study", choices=("threshold", "pipeline", "skip", "threshold-only"), default="threshold")
     p.add_argument("--upstream-root", type=Path, help="Use production modules from this exact clean checkout")
     p.add_argument("--upstream-revision", help="Full pinned upstream commit, required with upstream-root")
     p.add_argument("--kvaf-server")
@@ -29,10 +29,16 @@ def arguments(argv=None):
     p.add_argument("--serial-workers", type=int)
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--iterations", type=int, default=10)
+    p.add_argument(
+        "--diagnostic-replays",
+        type=int,
+        default=0,
+        help="Separate instrumented fused graph replays after headline timing",
+    )
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--output", type=Path, required=True)
     args = p.parse_args(argv)
-    if args.warmup < 0 or args.iterations < 1 or args.device < 0:
+    if args.warmup < 0 or args.iterations < 1 or args.device < 0 or args.diagnostic_replays < 0:
         p.error("Require nonnegative device/warmup and positive iterations")
     if args.output.exists():
         p.error("Output already exists")
@@ -44,6 +50,8 @@ def arguments(argv=None):
         p.error("upstream-root and upstream-revision must be supplied together")
     if args.upstream_root and (args.study != "threshold" or args.threshold_policy != "resident"):
         p.error("Exact upstream replay requires study=threshold and threshold-policy=resident")
+    if args.study == "threshold-only" and (args.transport != "urma" or args.mode != "fused"):
+        p.error("study=threshold-only requires URMA fused replay")
     args.fused_tuning = {"recent_threshold": args.threshold_policy == "recent"}
     return args
 

@@ -296,6 +296,47 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
     phase(retained, "final_verify")
     verify()  # Full score/Index/KV oracle after the final measured replay.
     result = dict(timing=statistics(samples), reads_samples=reads)
+    diagnostic_count = getattr(args, "diagnostic_replays", 0)
+    if diagnostic_count and args.mode == "fused":
+        from kvip.diagnostics.native_profile import decode_profile
+
+        diagnostic_samples = []
+        for step in range(diagnostic_count):
+            phase(retained, "diagnostic_reset", step)
+            reset()
+            bundle.forward.times.zero_()
+            bundle.forward.set_options(diagnostics=True)
+            stream.synchronize()
+            phase(retained, "diagnostic_replay_and_sync", step)
+            replay(graph)
+            stream.synchronize()
+            phase(retained, "diagnostic_verify", step)
+            diagnostic_reads = verify()
+            diagnostic_samples.append(
+                dict(
+                    **decode_profile(
+                        cpu_array(torch, bundle.forward.times),
+                        batch=bundle.forward.batch,
+                        workers=bundle.forward.q_workers,
+                        resolver_cores=bundle.forward.resolver_cores,
+                        transport=args.transport,
+                        threshold_markers=not bool(getattr(args, "upstream_root", None)) and args.transport == "urma",
+                    ),
+                    reads=diagnostic_reads,
+                )
+            )
+            # Only after successful completion; failures retain all owners and
+            # the enabled profile buffer for the existing fatal-exit path.
+            phase(retained, "diagnostic_disable", step)
+            bundle.forward.set_options(diagnostics=False)
+            stream.synchronize()
+        result["native_diagnostics"] = dict(
+            included_in_timing=False,
+            units="raw_device_cycles",
+            count=len(diagnostic_samples),
+            samples=diagnostic_samples,
+            note="Separate instrumented replay with barriers/cache operations; intervals overlap and cannot be summed into graph latency or converted to microseconds without a measured clock.",
+        )
     phase(retained, "graph_reset")
     for graph in reversed(graphs):
         graph.reset()
@@ -521,6 +562,17 @@ def release_context(context):
 def study_cases(args):
     """Keep each study's baseline explicit when production defaults advance."""
     study = getattr(args, "study", "threshold")
+    if study == "threshold-only":
+        return {
+            name: dict(
+                recent_threshold=True,
+                recent_pipeline=True,
+                recent_unified_topk=True,
+                recent_skip=False,
+                recent_threshold_only=threshold_only,
+            )
+            for name, threshold_only in (("before", False), ("after", True))
+        }
     if study == "skip":
         return {
             name: dict(recent_threshold=True, recent_pipeline=True, recent_unified_topk=True, recent_skip=skip)
@@ -554,7 +606,7 @@ def run(args, archive, retained):
     retained["geometry"] = getattr(archive, "manifest", {}).get("geometry", {})
     completed = retained.setdefault("completed_cases", {})
     context = allocate_context(args, archive, retained)
-    execution_study = getattr(args, "study", "threshold") in ("pipeline", "skip")
+    execution_study = getattr(args, "study", "threshold") in ("pipeline", "skip", "threshold-only")
     if args.mode == "fused" and (args.threshold_policy == "both" or execution_study):
         cases = {}
         for name, tuning in study_cases(args).items():

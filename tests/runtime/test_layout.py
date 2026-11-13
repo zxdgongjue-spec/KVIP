@@ -3,6 +3,8 @@
 import importlib
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -117,6 +119,14 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
     assert "-DKVIP_RECENT_SKIP=0" in commands[-4]
     assert build.build_libraries(**options, recent_skip=True) == with_skip
     assert len(commands) == 14
+    threshold_only = build.build_libraries(**options, recent_threshold_only=True)
+    assert threshold_only not in {current, before, pipeline, with_skip}
+    assert "-DKVIP_RECENT_THRESHOLD_ONLY=1" in commands[-2]
+    assert "-DKVIP_RECENT_THRESHOLD_ONLY=0" in commands[-4]
+    assert build.build_libraries(**options, recent_threshold_only=True) == threshold_only
+    assert len(commands) == 16
+    with pytest.raises(ValueError, match="threshold-only"):
+        build.build_libraries(**options, recent_threshold_only=1)
 
 
 def test_actual_operator_cmake_resolves_relocated_sources(tmp_path):

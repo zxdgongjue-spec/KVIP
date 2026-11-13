@@ -47,7 +47,15 @@ def recent_build_options(*, pipeline=True, unified_topk=True, skip=False):
 
 
 def build_libraries(
-    *, cache_dir, cann, headers, soc, recent_pipeline=True, recent_unified_topk=True, recent_skip=False
+    *,
+    cache_dir,
+    cann,
+    headers,
+    soc,
+    recent_pipeline=True,
+    recent_unified_topk=True,
+    recent_skip=False,
+    recent_threshold_only=False,
 ):
     """Build one shape-independent binary per source/toolchain/SoC."""
     root = Path(__file__).resolve().parents[3] / "csrc/operators"
@@ -58,6 +66,9 @@ def build_libraries(
         SOC_VERSION=soc,
     )
     options.update(recent_build_options(pipeline=recent_pipeline, unified_topk=recent_unified_topk, skip=recent_skip))
+    if type(recent_threshold_only) is not bool:
+        raise ValueError("Recent threshold-only option must be boolean")
+    options["KVIP_RECENT_THRESHOLD_ONLY"] = int(recent_threshold_only)
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     for relative in (
         "version.info",

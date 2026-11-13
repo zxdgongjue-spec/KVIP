@@ -30,6 +30,12 @@
 #include "topk.h"
 #include "../../../common/lifetch/recent_index.h"
 
+#ifndef KVIP_RECENT_THRESHOLD_ONLY
+#define KVIP_RECENT_THRESHOLD_ONLY 0
+#endif
+#if KVIP_RECENT_THRESHOLD_ONLY != 0 && KVIP_RECENT_THRESHOLD_ONLY != 1
+#error "KVIP_RECENT_THRESHOLD_ONLY must be 0 or 1"
+#endif
 #ifndef KVIP_RECENT_UNIFIED_TOPK
 #define KVIP_RECENT_UNIFIED_TOPK 1
 #endif
@@ -108,6 +114,7 @@ public:
     __aicore__ inline void SetStreamingWorkspace(GM_ADDR workspace) { streamingWorkspace_ = workspace; }
     __aicore__ inline void EmitFinalClassification(uint32_t query);
     __aicore__ inline void BeginFinalMetadata(uint32_t query);
+    __aicore__ inline void MarkTopK(uint32_t query, bool begin);
 #endif
     __aicore__ inline void ProcessResidentTopK(QLICommon::RunInfo info, uint32_t queryRow = SIM_Q) {
         info.actS2Size = runtimeShape_.resident;
@@ -172,17 +179,24 @@ private:
     TBuf<TPosition::VECCALC> prefixThresholdBuf_;
     LocalTensor<uint16_t> prefixThreshold_;
     __aicore__ inline bool TryUnifiedResidentTopK(uint32_t query, uint32_t scoreRow,
-                                                uint32_t residentCount, uint32_t availableEnd) {
-#if KVIP_RECENT_UNIFIED_TOPK
+                                                uint32_t residentCount, uint32_t availableEnd,
+                                                bool thresholdOnly = false) {
+#if KVIP_RECENT_UNIFIED_TOPK || KVIP_RECENT_THRESHOLD_ONLY
+#if !KVIP_RECENT_UNIFIED_TOPK
+        if (!thresholdOnly) return false;
+#endif
         if constexpr (std::is_same_v<SCORE_T, uint16_t>) {
             auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
-            if (!ctx->thresholdBounds || residentCount < topkCount_) return false;
+            if ((!ctx->thresholdBounds && !thresholdOnly) || residentCount < topkCount_) return false;
             uint32_t end = ctx->queryEnds ?
                 reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)[query] : runtimeShape_.history;
             end = Min(end, availableEnd);
-            auto bounds = reinterpret_cast<__gm__ int32_t*>(ctx->thresholdBounds) + (query / SIM_Q) * 2;
-            auto range = kvip_recent_index::Clip(bounds[0], bounds[1], runtimeShape_.resident,
-                                                runtimeShape_.history, end);
+            kvip_recent_index::Range range{0, 0};
+            if (ctx->thresholdBounds) {
+                auto bounds = reinterpret_cast<__gm__ int32_t*>(ctx->thresholdBounds) + (query / SIM_Q) * 2;
+                range = kvip_recent_index::Clip(bounds[0], bounds[1], runtimeShape_.resident,
+                                               runtimeShape_.history, end);
+            }
             uint32_t recentCount = range.end - range.begin;
             uint32_t total = residentCount + recentCount;
             uint32_t aligned = QLICommon::Align(total, uint32_t(256));
@@ -191,7 +205,7 @@ private:
             // one histogram selection, not resident TopK followed by K+recent.
             // Keep the original exact merge for larger unions or unaligned
             // resident prefixes; no added UB or dropped recent candidates.
-            if (!recentCount || residentCount % 16 != 0 ||
+            if ((!recentCount && !thresholdOnly) || residentCount % 16 != 0 ||
                 aligned > topkCountAlign256_ + trunkLen_) return false;
             if (aligned != total) {
                 Duplicate(mrgValueLocal_[total / 256 * 256], SCORE_T(0),
@@ -203,10 +217,18 @@ private:
             DataCopyPadExtParams<SCORE_T> pad{true, 0, 0, 0};
             uint64_t row = uint64_t(scoreRow) * runtimeShape_.history;
             DataCopyPad(mrgValueLocal_, scoreGm[row], copy, pad);
-            copy.blockLen = recentCount * uint32_t(sizeof(SCORE_T));
-            DataCopyPad(mrgValueLocal_[residentCount], scoreGm[row + range.begin], copy, pad);
+            if (recentCount) {
+                copy.blockLen = recentCount * uint32_t(sizeof(SCORE_T));
+                DataCopyPad(mrgValueLocal_[residentCount], scoreGm[row + range.begin], copy, pad);
+            }
             SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
             WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+#if KVIP_RECENT_THRESHOLD_ONLY
+            if (thresholdOnly) {
+                topkOp_.Threshold(mrgValueLocal_, prefixThreshold_[(query % 2) * 128], aligned);
+                return true;
+            }
+#endif
             topkOp_(mrgValueLocal_, indicesOutLocal_, scoreOutLocal_, aligned, 0, 1, true);
             SetFlag<HardEvent::V_S>(EVENT_ID0);
             WaitFlag<HardEvent::V_S>(EVENT_ID0);
@@ -338,20 +360,23 @@ private:
     }
 
     __aicore__ inline void SaveResident(uint32_t query, uint32_t scoreRow, bool publishProgress,
-                                      uint32_t availableEnd, bool recentMerged = false) {
-        if (!recentMerged) MergeRecentScores(query, scoreRow, availableEnd);
-        auto src = (__local_mem__ uint16_t *)scoreOutLocal_.GetPhyAddr();
-        auto dst = (__local_mem__ uint16_t *)prefixThreshold_.GetPhyAddr() + (query % 2) * 128;
-        __VEC_SCOPE__ {
-            MicroAPI::RegTensor<uint16_t> minimum, values, reduced;
-            auto mask = MicroAPI::CreateMask<uint16_t, MicroAPI::MaskPattern::ALL>();
-            MicroAPI::Duplicate(minimum, uint16_t(0xffff));
-            for (uint16_t part = 0; part < 16; ++part) {
-                MicroAPI::LoadAlign(values, src + part * 128);
-                MicroAPI::Min(minimum, minimum, values, mask);
+                                      uint32_t availableEnd, bool recentMerged = false,
+                                      bool thresholdReady = false) {
+        if (!thresholdReady) {
+            if (!recentMerged) MergeRecentScores(query, scoreRow, availableEnd);
+            auto src = (__local_mem__ uint16_t *)scoreOutLocal_.GetPhyAddr();
+            auto dst = (__local_mem__ uint16_t *)prefixThreshold_.GetPhyAddr() + (query % 2) * 128;
+            __VEC_SCOPE__ {
+                MicroAPI::RegTensor<uint16_t> minimum, values, reduced;
+                auto mask = MicroAPI::CreateMask<uint16_t, MicroAPI::MaskPattern::ALL>();
+                MicroAPI::Duplicate(minimum, uint16_t(0xffff));
+                for (uint16_t part = 0; part < 16; ++part) {
+                    MicroAPI::LoadAlign(values, src + part * 128);
+                    MicroAPI::Min(minimum, minimum, values, mask);
+                }
+                MicroAPI::ReduceMin(reduced, minimum, mask);
+                MicroAPI::StoreAlign(dst, reduced, mask);
             }
-            MicroAPI::ReduceMin(reduced, minimum, mask);
-            MicroAPI::StoreAlign(dst, reduced, mask);
         }
         SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
         WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
@@ -363,8 +388,10 @@ private:
         scores.SetGlobalBuffer((__gm__ uint16_t *)(prefixOutput_ + batch * rowBytes));
         indices.SetGlobalBuffer((__gm__ int32_t *)(prefixOutput_ + batch * rowBytes + count * 2));
         thresholds.SetGlobalBuffer((__gm__ uint16_t *)(prefixOutput_ + batch * rowBytes + count * 6));
-        DataCopy(scores[q * 2048], scoreOutLocal_, 2048);
-        DataCopy(indices[q * 2048], indicesOutLocal_.template ReinterpretCast<int32_t>(), 2048);
+        if (!thresholdReady) {
+            DataCopy(scores[q * 2048], scoreOutLocal_, 2048);
+            DataCopy(indices[q * 2048], indicesOutLocal_.template ReinterpretCast<int32_t>(), 2048);
+        }
         DataCopy(thresholds[q * 128], prefixThreshold_[(query % 2) * 128], 128);
         PipeBarrier<PIPE_ALL>();
 #if defined(V9_UBMEM) && V9_UBMEM
@@ -894,6 +921,22 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
 }
 
 #if KVIP_STREAMING_LI
+// Diagnostic replay only. These local pipeline joins intentionally perturb
+// overlap; use raw device-cycle intervals, never the uninstrumented graph time.
+// Early selection excludes score GEMMs. Final ends before metadata classification.
+template <typename QLIT>
+__aicore__ inline void QLIVector<QLIT>::MarkTopK(uint32_t query, bool begin)
+{
+    if (!streamingWorkspace_) return;
+    auto a = reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_);
+    if (!(a->prefetchCount & 0x80000000U) || !a->times || query >= runtimeShape_.batch * SIM_Q) return;
+    PipeBarrier<PIPE_ALL>();
+    auto ticks = reinterpret_cast<__gm__ uint64_t*>(a->times) +
+        uint64_t(runtimeShape_.batch) * 64 + uint64_t(query) * 16;
+    ticks[(prefixActive_ ? 12 : 14) + (begin ? 0 : 1)] = GetSystemCycle();
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ticks), 128);
+}
+
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::BeginFinalMetadata(uint32_t query)
 {
@@ -1067,6 +1110,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
 #if KVIP_STREAMING_LI
         uint32_t streamingQuery = info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx;
         streamingPrefetched_ = false;
+        MarkTopK(streamingQuery, true);
 #endif
 
         SCORE_T zero = 0;
@@ -1101,6 +1145,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
             AscendC::DataCopyPad(indiceOutGm[info.indiceOutOffset + (curS1Idx + rowIdx) * topkCount_], indicesOutLocal_.ReinterpretCast<int32_t>(), copyOutParams);
             SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
 #if KVIP_STREAMING_LI
+            MarkTopK(streamingQuery, false);
     #if KVIP_STREAMING_LI
         if (!prefixActive_) EmitFinalClassification(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx);
 #endif
@@ -1111,6 +1156,22 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         WaitFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);
         WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
 
+#if KVIP_RECENT_THRESHOLD_ONLY && !(defined(V9_UBMEM) && V9_UBMEM)
+        if (prefixActive_ && TryUnifiedResidentTopK(
+                info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, vecOffset,
+                uint32_t(validS2Len), recentEnd, true)) {
+            // Both persistent TopK credits were acquired above. Return them
+            // exactly as the full-list path, retaining all publication fences.
+            SetFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);
+            SaveResident(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx,
+                         vecOffset, queryRow == SIM_Q, recentEnd, false, true);
+            SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
+#if KVIP_STREAMING_LI
+            MarkTopK(streamingQuery, false);
+#endif
+            continue;
+        }
+#endif
         AscendC::DataCopyPadExtParams<SCORE_T> padParams{true, 0, 0, 0};
         const bool recentMerged = prefixActive_ && TryUnifiedResidentTopK(
             info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, vecOffset,
@@ -1207,6 +1268,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         }
         SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
 #if KVIP_STREAMING_LI
+        MarkTopK(streamingQuery, false);
         if (!prefixActive_) EmitFinalClassification(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx);
 #endif
     }

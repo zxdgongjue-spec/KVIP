@@ -1,0 +1,179 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Instrumented replay markers must never contaminate headline samples."""
+
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+from kvip.diagnostics import native_profile, replay_measure
+from kvip.diagnostics.fused_replay import validate_fused_tuning, verify_build_options
+
+
+def _raw():
+    raw = np.zeros(2 * 256 + (3 * 2 + 4 * 2) * 32, dtype=np.int64)
+    li = raw[128:256].reshape(8, 16)
+    li[:, 12] = 100
+    li[:, 13] = 100 + np.arange(8)
+    li[:, 14:16] = [200, 211]
+    return raw
+
+
+def test_profile_reports_role_median_max_without_summing_or_clock_conversion(capsys):
+    sample = native_profile.decode_profile(
+        _raw(), batch=2, workers=2, resolver_cores=3, transport="urma", threshold_markers=True
+    )
+    assert sample["metrics"]["early_threshold"] == dict(
+        status="available", count=8, median_cycles=3.5, max_cycles=7, samples_cycles=list(range(8))
+    )
+    assert sample["metrics"]["final_topk"]["median_cycles"] == 11
+    assert sample["metrics"]["fetch_dependency_wait"]["status"] == "unavailable"
+    native_profile.print_profile("urma-recent-kth-only", {"samples": [sample]})
+    output = capsys.readouterr().out
+    assert "raw_cycles_median/max" in output and "no cycle-to-us conversion" in output
+    assert "samples_cycles" not in output and "cores" not in output
+
+
+def test_old_main_slots_are_unavailable_even_if_they_contain_nonzero_values():
+    raw = _raw()
+    raw[128 + 13] = -1
+    sample = native_profile.decode_profile(raw, batch=2, workers=2, resolver_cores=3, transport="urma")
+    assert sample["metrics"]["early_threshold"]["status"] == "unavailable"
+    assert sample["metrics"]["final_topk"]["status"] == "unavailable"
+
+
+@pytest.mark.parametrize("change", ["missing", "reversed", "size"])
+def test_new_feature_markers_require_a_complete_valid_contract(change):
+    raw = _raw()
+    if change == "missing":
+        raw[128 + 12] = 0
+    elif change == "reversed":
+        raw[128 + 13] = 1
+    else:
+        raw = raw[:-1]
+    with pytest.raises(ValueError, match="diagnostic timestamps|timestamp layout"):
+        native_profile.decode_profile(
+            raw, batch=2, workers=2, resolver_cores=3, transport="urma", threshold_markers=True
+        )
+
+
+def test_threshold_only_flag_is_urma_only_and_native_export_must_match():
+    assert validate_fused_tuning({"recent_threshold_only": True}, "urma") == {"recent_threshold_only": True}
+    with pytest.raises(ValueError, match="only by URMA"):
+        validate_fused_tuning({"recent_threshold_only": True}, "ubmem")
+    library = SimpleNamespace(kvip_recent_threshold_only=lambda: 0)
+    with pytest.raises(RuntimeError, match="recent_threshold_only=True"):
+        verify_build_options(library, {"recent_threshold_only": True})
+
+
+@pytest.mark.parametrize("fail_profile", [False, True])
+def test_diagnostic_pass_follows_headline_events_and_keeps_failure_owners(monkeypatch, fail_profile):
+    state = dict(profile=False, events=0, completed=0, replays=0, verifies=0, resets=0, closed=False)
+    log, retained = [], {}
+
+    class Times:
+        def zero_(self):
+            log.append("zero")
+
+    class Forward:
+        batch, q_workers, resolver_cores = 2, 2, 3
+        times = Times()
+
+        def __call__(self):
+            assert not state["profile"]
+
+        def set_options(self, diagnostics=False):
+            assert state["completed"] == 3
+            state["profile"] = diagnostics
+            log.append(("profile", diagnostics))
+
+    class Event:
+        def __init__(self, **kwargs):
+            pass
+
+        def record(self, stream):
+            assert not state["profile"]
+            state["events"] += 1
+
+        def synchronize(self):
+            state["completed"] += 1
+
+        def elapsed_time(self, other):
+            return 0.01
+
+    class Graph:
+        def capture_begin(self, stream):
+            pass
+
+        def capture_end(self):
+            pass
+
+        def replay(self, stream):
+            state["replays"] += 1
+            log.append(("replay", state["profile"]))
+            if state["profile"] and fail_profile:
+                raise RuntimeError("profile device fault")
+
+        def reset(self):
+            state["closed"] = True
+
+    def verify():
+        state["verifies"] += 1
+        log.append(("verify", state["profile"]))
+        return {"checked": True}
+
+    def reset():
+        state["resets"] += 1
+
+    bundle = SimpleNamespace(
+        reset=reset, verify=verify, read_counts=lambda: {"reads": 1}, forward=Forward(), lease=None
+    )
+    args = SimpleNamespace(mode="fused", transport="urma", warmup=1, iterations=2, diagnostic_replays=1)
+    monkeypatch.setattr(replay_measure, "cpu_array", lambda *args: _raw())
+
+    def call():
+        return replay_measure.measure(
+            SimpleNamespace(npu=SimpleNamespace(Event=Event)),
+            SimpleNamespace(AclGraph=Graph),
+            SimpleNamespace(synchronize=lambda: log.append("sync")),
+            bundle,
+            args,
+            retained,
+        )
+
+    if fail_profile:
+        with pytest.raises(RuntimeError, match="profile device fault"):
+            call()
+        assert state["profile"] and not state["closed"]
+        assert retained["progress"] == {"phase": "diagnostic_replay_and_sync", "step": 0}
+        assert retained["graphs"]
+    else:
+        result = call()
+        assert result["timing"]["samples_us"] == [10, 10]
+        assert len(result["reads_samples"]) == 2
+        assert result["native_diagnostics"]["count"] == 1
+        assert result["native_diagnostics"]["included_in_timing"] is False
+        assert state["verifies"] == 4 and state["closed"] and not state["profile"]
+        assert log.index(("verify", False)) < log.index(("profile", True))
+        assert log.index(("verify", True)) < log.index(("profile", False))
+    assert state["events"] == 6 and state["replays"] == 5
+
+
+def test_grouped_urma_post_and_cq_counters_are_deduplicated_by_query_worker():
+    batch, workers = 4, 2
+    raw = np.zeros(batch * 256 + (3 * batch + 4 * workers) * 32, dtype=np.int64)
+    fetch = raw[batch * 128 : batch * 256].reshape(batch, 128)
+    queries = fetch[:, :96].reshape(batch, 4, 24)
+    for b, q in np.ndindex(batch, 4):
+        lane = b % workers
+        queries[b, q, [3, 4, 7, 8]] = [100, 120, 200, 300]
+        queries[b, q, [12, 13, 14, 15, 16, 17, 20]] = [10 + lane, 1, 20 + q, 2, 1, 1, 3]
+    sample = native_profile.decode_profile(raw, batch=batch, workers=workers, resolver_cores=3, transport="urma")
+    assert sample["metrics"]["post_active"] == dict(
+        status="available", count=8, median_cycles=32, max_cycles=34, samples_cycles=[30, 31, 32, 33, 31, 32, 33, 34]
+    )
+    assert sample["metrics"]["cq_drain"]["samples_cycles"] == [3] * 8
+    assert sample["metrics"]["fetch_conflict_get"]["count"] == 8
+    queries[2, 0, 13] += 1
+    with pytest.raises(ValueError, match="Replicated shared Q-worker"):
+        native_profile.decode_profile(raw, batch=batch, workers=workers, resolver_cores=3, transport="urma")

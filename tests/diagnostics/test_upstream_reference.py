@@ -434,3 +434,83 @@ def test_upstream_factory_uses_old_builder_and_binding_signatures(tmp_path, monk
         bundle.tuning[name] for name in ("recent_threshold", "recent_pipeline", "recent_unified_topk", "recent_skip")
     )
     assert bundle.tuning["prefetch_limit"] == 512 and bundle.tuning["window_limit"] == 64
+
+
+def _threshold_only_reports():
+    reports = _reports()
+    for name, tuning in replay_measure.study_cases(SimpleNamespace(study="threshold-only")).items():
+        reports[f"urma-recent-{name}"]["tuning"] = tuning | {"prefetch_limit": 512, "window_limit": 64}
+    return reports
+
+
+def test_threshold_only_study_changes_one_flag_and_preserves_native_input_checks(capsys):
+    reports = _threshold_only_reports()
+    before, after = (reports[f"urma-recent-{name}"] for name in ("before", "after"))
+    assert before["tuning"] | {"recent_threshold_only": True} == after["tuning"]
+    assert before["tuning"]["recent_skip"] is False
+    before["reads_samples"][0].update(prefetch=8, unused_prefetch=4, bytes=6560)
+    after["reads_samples"][0].update(prefetch=4, unused_prefetch=1, bytes=3936)
+    summary = compare.summarize(reports, "threshold-only")
+    assert [row["display_name"] for row in summary["table"].values()] == [
+        "urma-main-serial",
+        "urma-main-resident",
+        "urma-recent-recompute",
+        "urma-recent-kth-only",
+    ]
+    effect = summary["effects"]["urma"]
+    assert effect["optimization_reduction_pct"] == pytest.approx(10)
+    assert effect["traffic_before_to_after"] == pytest.approx(
+        dict(unused_prefetch_reduction_pct=75, total_read_bytes_reduction_pct=40)
+    )
+    assert summary["table"]["urma-recent-before"]["reads"]["prefetch_waste_pct"] == 50
+    compare.print_summary(summary)
+    printed = capsys.readouterr().out
+    assert "recent-kth-only" in printed and "unused_prefetch_reduction_pct=75.00%" in printed
+    assert "total_read_bytes_reduction_pct=40.00%" in printed and "waste%" in printed
+    assert compare.traffic_change({"unused_prefetch": 0, "bytes": 0}, {"unused_prefetch": 0, "bytes": 0}) == {
+        "unused_prefetch_reduction_pct": None,
+        "total_read_bytes_reduction_pct": None,
+    }
+
+
+@pytest.mark.parametrize("field", ["recent_skip", "recent_pipeline", "recent_threshold_only", "window_limit"])
+def test_threshold_only_summary_rejects_other_changes_or_missing_new_binary_flag(field):
+    reports = _threshold_only_reports()
+    reports["urma-recent-after"]["tuning"][field] = (
+        32 if field == "window_limit" else not reports["urma-recent-after"]["tuning"][field]
+    )
+    with pytest.raises(ValueError, match="Threshold-only A/B"):
+        compare.summarize(reports, "threshold-only")
+
+
+def test_threshold_only_cli_runs_main_and_one_shared_arena_pair(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "validate_checkout", lambda root, revision: root)
+    base = _arguments(
+        tmp_path,
+        ["--study", "threshold-only", "--upstream-root", str(tmp_path / "main"), "--upstream-revision", REVISION],
+    )
+    with pytest.raises(SystemExit):
+        compare.arguments(base + ["--transports", "both"])
+    with pytest.raises(SystemExit):
+        compare.arguments(base + ["--diagnostic-replays", "-1"])
+    args = compare.arguments(base + ["--diagnostic-replays", "1"])
+    calls, reports = [], _threshold_only_reports()
+
+    def child(command, **kwargs):
+        calls.append(command)
+        parsed = replay.arguments(command[4:])
+        if parsed.upstream_root:
+            assert parsed.study == "threshold" and parsed.threshold_policy == "resident"
+            result = reports[f"urma-upstream-{parsed.mode}"]
+        else:
+            assert parsed.study == "threshold-only" and parsed.threshold_policy == "both"
+            result = {"cases": {name: reports[f"urma-recent-{name}"] for name in ("before", "after")}}
+        assert parsed.diagnostic_replays == int(parsed.mode == "fused")
+        parsed.output.write_text(json.dumps(result))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(compare.subprocess, "run", child)
+    monkeypatch.setattr(compare, "source_commit", lambda: "feature")
+    summary = compare.run(args)
+    assert len(calls) == 3 and len(summary["table"]) == 4
+    assert summary["study"] == "threshold-only"

@@ -152,6 +152,27 @@ public:
         tmpIndexLocal = tmpIndexLocalTmp.template ReinterpretCast<uint16_t>();
     }
 
+    // Exact sortable-u16 Kth selection. Reuse the same histogram stages as
+    // LiTopKVF; the caller needs no candidate IDs or selected-score gather.
+    // threshold is one 256-byte query bank, also used for the intermediate
+    // rank by FindHighTargetBinVFImpl. FindKthVFImpl leaves its uint16 key at
+    // the same address/layout consumed by the existing predicate broadcasts.
+    __aicore__ inline void Threshold(const LocalTensor<uint16_t>& input,
+                                     const LocalTensor<uint16_t>& threshold,
+                                     uint32_t validLen)
+    {
+        auto values = reinterpret_cast<__ubuf__ uint16_t*>(input.GetPhyAddr());
+        auto output = reinterpret_cast<__ubuf__ uint32_t*>(threshold.GetPhyAddr());
+        auto histogram = reinterpret_cast<__ubuf__ uint32_t*>(histogramsLocal.GetPhyAddr());
+        auto high = reinterpret_cast<__ubuf__ uint32_t*>(idxHighLocal.GetPhyAddr());
+        auto low = reinterpret_cast<__ubuf__ uint32_t*>(idxLowLocal.GetPhyAddr());
+        uint16_t loops = (validLen + 255) / 256;
+        topkb16gather::HistogramsHighVFImpl<uint16_t>(histogram, values, loops, true);
+        topkb16gather::FindHighTargetBinVFImpl(high, output, histogram, validLen - topK + 1);
+        topkb16gather::HistogramsLowVFImpl<uint16_t>(histogram, values, high, loops, true);
+        topkb16gather::FindKthVFImpl(output, histogram, high, low);
+    }
+
     __aicore__ inline void operator()(LocalTensor<uint16_t>& mrgValueLocal, LocalTensor<uint32_t>& indicesOutLocal,
                                       LocalTensor<uint16_t>& hisValueLocal, uint32_t s2SeqLen, uint32_t loopIdx, uint32_t s2LoopNum, bool returnScores = false)
     {

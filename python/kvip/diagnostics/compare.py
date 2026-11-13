@@ -25,19 +25,33 @@ def arguments(argv=None):
     p.add_argument("--serial-workers", type=int, default=32)
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--iterations", type=int, default=10)
-    p.add_argument("--study", choices=("threshold", "pipeline", "skip", "upstream"), default="threshold")
+    p.add_argument(
+        "--study", choices=("threshold", "pipeline", "skip", "upstream", "threshold-only"), default="threshold"
+    )
     p.add_argument("--transports", choices=("urma", "ubmem", "both"), default="urma")
     p.add_argument("--upstream-root", type=Path)
     p.add_argument("--upstream-revision", help="Full pinned upstream commit for the upstream study")
+    p.add_argument(
+        "--diagnostic-replays",
+        type=int,
+        default=0,
+        help="Separate instrumented fused replays; excluded from headline timing",
+    )
     p.add_argument("--result-dir", type=Path, required=True)
     args = p.parse_args(argv)
-    if args.device < 0 or args.warmup < 0 or args.iterations < 1 or not 1 <= args.serial_workers <= 48:
+    if (
+        args.device < 0
+        or args.warmup < 0
+        or args.iterations < 1
+        or args.diagnostic_replays < 0
+        or not 1 <= args.serial_workers <= 48
+    ):
         p.error("Invalid device, warmup, iterations or workers")
     if args.result_dir.exists():
         p.error("result-dir already exists; choose a new directory")
-    if args.study == "upstream":
+    if args.study in ("upstream", "threshold-only"):
         if not args.upstream_root or not args.upstream_revision:
-            p.error("study=upstream requires upstream-root and upstream-revision")
+            p.error("This study requires upstream-root and upstream-revision")
         from kvip.diagnostics.upstream import validate_checkout
 
         try:
@@ -45,7 +59,9 @@ def arguments(argv=None):
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             p.error(str(error))
     elif args.upstream_root or args.upstream_revision:
-        p.error("upstream-root/revision apply only to study=upstream")
+        p.error("upstream-root/revision apply only to study=upstream or threshold-only")
+    if args.study == "threshold-only" and args.transports != "urma":
+        p.error("study=threshold-only requires --transports urma")
     for root, object_name in ((args.build_dir, "kvaf_execute_batch_get_kernels.o"),):
         if root is not None and not (root / "bin" / object_name).is_file():
             p.error(f"Missing exact requested kernel: {root / 'bin' / object_name}")
@@ -65,7 +81,34 @@ def read_means(result):
         "bytes",
         "useful_transfer_bytes",
     )
-    return {name: sum(x[name] for x in samples) / len(samples) for name in names}
+    means = {name: sum(x[name] for x in samples) / len(samples) for name in names}
+    means["prefetch_waste_pct"] = 100 * means["unused_prefetch"] / means["prefetch"] if means["prefetch"] else None
+    return means
+
+
+def display_name(name, study):
+    """Keep saved result keys stable while spelling out the actual algorithms."""
+    if study in ("upstream", "threshold-only"):
+        for suffix, label in (
+            ("upstream-serial", "main-serial"),
+            ("upstream-fused", "main-resident"),
+            ("recent-before", "recent-recompute"),
+            ("recent-after", "recent-kth-only" if study == "threshold-only" else "recent-score-replay"),
+        ):
+            if name.endswith(suffix):
+                return name[: -len(suffix)] + label
+    return name
+
+
+def reduction(before, after):
+    return 100 * (1 - after / before) if before else None
+
+
+def traffic_change(before, after):
+    return dict(
+        unused_prefetch_reduction_pct=reduction(before["unused_prefetch"], after["unused_prefetch"]),
+        total_read_bytes_reduction_pct=reduction(before["bytes"], after["bytes"]),
+    )
 
 
 def summarize(results, study="threshold"):
@@ -80,6 +123,7 @@ def summarize(results, study="threshold"):
         reads = read_means(result)
         mean = result["timing"]["mean_us"]
         table[name] = dict(
+            display_name=display_name(name, study),
             mean_us=mean,
             p50_us=result["timing"]["p50_us"],
             reads=reads,
@@ -92,23 +136,31 @@ def summarize(results, study="threshold"):
             tuning=result.get("tuning"),
             timing=result["timing"],
             production_source=result.get("production_source"),
+            native_diagnostics=result.get("native_diagnostics"),
         )
     effects = {}
     for transport in (value for value in ("urma", "ubmem") if any(key.startswith(value + "-") for key in table)):
         best = transport + "-serial"
-        if study in ("skip", "upstream"):
-            prefix = "recent" if study == "upstream" else "fused"
+        if study in ("skip", "upstream", "threshold-only"):
+            prefix = "recent" if study in ("upstream", "threshold-only") else "fused"
             before, after = (table[f"{transport}-{prefix}-{name}"] for name in ("before", "after"))
-            for row, skip in ((before, False), (after, True)):
+            changed_option = "recent_threshold_only" if study == "threshold-only" else "recent_skip"
+            label = "Threshold-only A/B" if study == "threshold-only" else "Skip A/B"
+            for row, enabled in ((before, False), (after, True)):
                 if not row["score_comparison"] or row["score_comparison"].get("status") != "bit_exact":
-                    raise ValueError("Skip A/B requires bit-exact validation against all captured valid LI scores")
-                expected = dict(recent_threshold=True, recent_pipeline=True, recent_unified_topk=True, recent_skip=skip)
+                    raise ValueError(f"{label} requires bit-exact validation against all captured valid LI scores")
+                expected = dict(
+                    recent_threshold=True, recent_pipeline=True, recent_unified_topk=True, recent_skip=False
+                )
+                expected[changed_option] = enabled
                 if row["tuning"] is None or any(row["tuning"].get(key) is not value for key, value in expected.items()):
-                    raise ValueError("Skip A/B requires identical recent/pipeline/TopK settings and only skip changed")
-            if {k: v for k, v in before["tuning"].items() if k != "recent_skip"} != {
-                k: v for k, v in after["tuning"].items() if k != "recent_skip"
+                    raise ValueError(
+                        f"{label} requires identical recent/pipeline/TopK settings and only {changed_option} changed"
+                    )
+            if {k: v for k, v in before["tuning"].items() if k != changed_option} != {
+                k: v for k, v in after["tuning"].items() if k != changed_option
             }:
-                raise ValueError("Skip A/B changed another tuning option or prefetch budget")
+                raise ValueError(f"{label} changed another tuning option or prefetch budget")
             if any(
                 before["selection"][key] != after["selection"][key]
                 for key in ("selected_set_sha256", "ordered_output_sha256")
@@ -116,7 +168,7 @@ def summarize(results, study="threshold"):
                 raise ValueError("Skip A/B changed the final selection")
             if any(before["threshold"][key] != after["threshold"][key] for key in ("initial_keys", "final_keys")):
                 raise ValueError("Skip A/B changed the threshold")
-            if study == "upstream":
+            if study in ("upstream", "threshold-only"):
                 best = transport + "-upstream-serial"
                 main = table[transport + "-upstream-fused"]
                 for reference in (table[best], main):
@@ -134,12 +186,20 @@ def summarize(results, study="threshold"):
                     raise ValueError("Upstream and recent fusion changed the final threshold")
             effects[transport] = dict(
                 serial_reference=best,
-                skip_reduction_pct=100 * (1 - after["mean_us"] / before["mean_us"]),
-                skip_vs_serial_reduction_pct=100 * (1 - after["mean_us"] / table[best]["mean_us"]),
+                optimization_reduction_pct=100 * (1 - after["mean_us"] / before["mean_us"]),
+                optimization_vs_serial_reduction_pct=100 * (1 - after["mean_us"] / table[best]["mean_us"]),
+                traffic_before_to_after=traffic_change(before["reads"], after["reads"]),
             )
-            if study == "upstream":
+            if study != "threshold-only":
+                effects[transport].update(
+                    skip_reduction_pct=effects[transport]["optimization_reduction_pct"],
+                    skip_vs_serial_reduction_pct=effects[transport]["optimization_vs_serial_reduction_pct"],
+                )
+            if study in ("upstream", "threshold-only"):
                 effects[transport].update(
                     upstream_revision=main["production_source"]["commit"],
+                    traffic_main_to_before=traffic_change(main["reads"], before["reads"]),
+                    traffic_main_to_after=traffic_change(main["reads"], after["reads"]),
                     recent_before_vs_upstream_reduction_pct=100 * (1 - before["mean_us"] / main["mean_us"]),
                     recent_after_vs_upstream_reduction_pct=100 * (1 - after["mean_us"] / main["mean_us"]),
                 )
@@ -190,18 +250,19 @@ def summarize(results, study="threshold"):
 
 def print_summary(summary):
     print(
-        "case                         mean_us    p50_us  cold_miss%   prefetched  unused_prefetch  total_read_MiB",
+        "case                         mean_us    p50_us  cold_miss%   prefetched  unused_prefetch  waste%  total_read_MiB",
         flush=True,
     )
     for name, row in summary["table"].items():
         r = row["reads"]
+        waste = "n/a" if r["prefetch_waste_pct"] is None else f"{r['prefetch_waste_pct']:.2f}"
         print(
-            f"{name:28} {row['mean_us']:9.3f} {row['p50_us']:9.3f} {100 * r['cold_miss_rate']:10.4f} "
-            f"{r['prefetch']:12.1f} {r['unused_prefetch']:16.1f} {r['bytes'] / (1 << 20):15.3f}",
+            f"{row['display_name']:28} {row['mean_us']:9.3f} {row['p50_us']:9.3f} {100 * r['cold_miss_rate']:10.4f} "
+            f"{r['prefetch']:12.1f} {r['unused_prefetch']:16.1f} {waste:>7} {r['bytes'] / (1 << 20):15.3f}",
             flush=True,
         )
     for transport, effect in summary["effects"].items():
-        if summary.get("study") == "upstream":
+        if summary.get("study") in ("upstream", "threshold-only"):
             main, recent = (
                 summary["table"][f"{transport}-{name}"]["threshold"] for name in ("upstream-fused", "recent-after")
             )
@@ -216,11 +277,17 @@ def print_summary(summary):
                 flush=True,
             )
             print(
-                f"GAIN {transport} after_vs_recent_before={effect['skip_reduction_pct']:.2f}% "
+                f"GAIN {transport} after_vs_recent_before={effect['optimization_reduction_pct']:.2f}% "
                 f"after_vs_upstream_fused={effect['recent_after_vs_upstream_reduction_pct']:.2f}% "
-                f"after_vs_upstream_serial={effect['skip_vs_serial_reduction_pct']:.2f}%",
+                f"after_vs_upstream_serial={effect['optimization_vs_serial_reduction_pct']:.2f}%",
                 flush=True,
             )
+            for pair in ("main_to_before", "main_to_after", "before_to_after"):
+                change = effect["traffic_" + pair]
+                values = " ".join(
+                    f"{key}={value:.2f}%" if value is not None else f"{key}=n/a" for key, value in change.items()
+                )
+                print(f"TRAFFIC {transport} {pair} {values}", flush=True)
             print(
                 "BASELINE upstream production sources; unified replay configuration, not default service TPOT.",
                 flush=True,
@@ -266,6 +333,11 @@ def print_summary(summary):
             f"serial_reference={effect['serial_reference']}",
             flush=True,
         )
+    for name, row in summary["table"].items():
+        if row.get("native_diagnostics"):
+            from kvip.diagnostics.native_profile import print_profile
+
+            print_profile(row["display_name"], row["native_diagnostics"])
     print(
         "TIMING complete device chain (recent scoring/merge included); excludes data restoration, CPU scheduler and input H2D.",
         flush=True,
@@ -281,12 +353,12 @@ def run(args):
         for transport in transports
         for mode, reference in (
             (("serial", True), ("fused", True), ("fused", False))
-            if args.study == "upstream"
+            if args.study in ("upstream", "threshold-only")
             else (("serial", False), ("fused", False))
         )
     ]
     for transport, mode, reference in cases:
-        prefix = "upstream-" if reference else "recent-" if args.study == "upstream" else ""
+        prefix = "upstream-" if reference else "recent-" if args.study in ("upstream", "threshold-only") else ""
         name = f"{transport}-{prefix}{mode}"
         paired = mode == "fused" and not reference
         child_study = "threshold" if reference else "skip" if args.study == "upstream" else args.study
@@ -322,6 +394,8 @@ def run(args):
             "--study",
             child_study,
         ]
+        if mode == "fused" and getattr(args, "diagnostic_replays", 0):
+            cmd += ["--diagnostic-replays", str(args.diagnostic_replays)]
         if reference:
             cmd += ["--upstream-root", str(args.upstream_root), "--upstream-revision", args.upstream_revision]
         if mode == "serial":
@@ -335,7 +409,8 @@ def run(args):
                     "threshold": " resident/recent share DDR",
                     "pipeline": " before/pipeline/unified share DDR",
                     "skip": " before/after share DDR",
-                    "upstream": " before/after share DDR",
+                    "upstream": " recompute/score-replay share DDR",
+                    "threshold-only": " recompute/kth-only share DDR",
                 }[args.study]
                 if paired
                 else f" workers={args.serial_workers}" + (" post=128 inflight=2048" if transport == "urma" else "")
@@ -362,7 +437,7 @@ def run(args):
             raise SystemExit(1)
         report = json.loads(output.read_text())
         if paired:
-            case_prefix = f"{transport}-recent" if args.study == "upstream" else name
+            case_prefix = f"{transport}-recent" if args.study in ("upstream", "threshold-only") else name
             results.update({f"{case_prefix}-{key}": value for key, value in report["cases"].items()})
         else:
             results[name] = report
