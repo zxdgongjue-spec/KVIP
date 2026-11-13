@@ -63,7 +63,7 @@ public:
 #else
         rotating::Service(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.splitQ,runtimeShape_.rounds,runtimeShape_.serviceAics,runtimeShape_.serviceLanes,runtimeShape_.tokenBytes,runtimeShape_.postThreads,runtimeShape_.postBank,runtimeShape_.batchedRows,runtimeShape_.scanTokens,rotationContext_, epoch, blockId_ / 2, blockId_ % 2,
 #endif
-#if (defined(V9_UBMEM) && V9_UBMEM) || !KVIP_STREAMING_LI
+#if !KVIP_STREAMING_LI
             topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow);
 #else
             topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow,
