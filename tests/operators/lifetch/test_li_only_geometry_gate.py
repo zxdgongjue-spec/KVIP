@@ -91,3 +91,32 @@ def test_p1_c1_cold_probe_stays_h8192_r2048(lifetch_cli, capsys):
         ))
     assert exc.value.code == 2
     assert "P1-C1 cold-prefetch probe retains its H8192/R2048 fixture" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("mode,expected", [("auto", False), ("q4", True)])
+def test_li_tiling_selection_is_forwarded_only_for_q4(lifetch_cli, monkeypatch, mode, expected):
+    commands = []
+    monkeypatch.setattr(lifetch_cli.subprocess, "call", lambda command: commands.append(command) or 0)
+    args = cli_args(prefetch=0) + ["--li-tiling", mode]
+    assert lifetch_cli.main(args) == 0
+    child = commands[0]
+    assert ("--li-tiling" in child) is expected
+    if expected:
+        assert child[child.index("--li-tiling") + 1] == "q4"
+    internal_args = args[2:]
+    assert lifetch_cli.arguments(internal_args).li_tiling == mode
+
+
+@pytest.mark.parametrize("prefetch", [64, 512])
+def test_q4_rejects_prefetch_to_isolate_li_kernel(lifetch_cli, prefetch):
+    with pytest.raises(SystemExit) as exc:
+        lifetch_cli.main(cli_args(prefetch=prefetch) + ["--li-tiling", "q4"])
+    assert exc.value.code == 2
+
+
+def test_q4_rejects_non_li_only_scope(lifetch_cli):
+    args = cli_args(prefetch=0) + ["--li-tiling", "q4"]
+    args.remove("--li-only-varlen")
+    with pytest.raises(SystemExit) as exc:
+        lifetch_cli.main(args)
+    assert exc.value.code == 2

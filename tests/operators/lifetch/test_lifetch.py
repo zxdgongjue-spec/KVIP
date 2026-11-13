@@ -53,6 +53,8 @@ def arguments(argv=None):
     p.add_argument("--warmup", type=int, default=4)
     p.add_argument("--comparison-output", type=Path)
     p.add_argument("--comparison-sfa", type=Path)
+    p.add_argument("--li-tiling", choices=("auto", "q4"), default="auto",
+                   help="P0-C0 test-only Q2(auto) vs Q4 core mapping, Prefetch=0")
     p.add_argument("--li-only-varlen", action="store_true",
                    help="run only custom v9 LI with two mixed-length forwards; requires the URMA test fixture")
     p.add_argument("--epoch-audit-profile", action="store_true",
@@ -119,6 +121,8 @@ def arguments(argv=None):
             parse_actual_key_lengths(a.actual_key_lengths, batches[0], a.history, a.resident)
         except ValueError as exc:
             p.error(str(exc))
+    if a.li_tiling == 'q4' and (not a.li_only_varlen or a.prefetch_tokens != 0):
+        p.error('--li-tiling q4 requires --li-only-varlen --prefetch-tokens 0')
     if a.native_union_fit and a.li_only_varlen:
         p.error("--native-union-fit is for the full-chain Native MTP baseline, not LI-only")
     if a.li_only_varlen and (
@@ -244,6 +248,8 @@ def main(argv=None):
     p.add_argument('--resolver-compare', action='store_true', help='URMA resolver comparison')
     p.add_argument('--comparison-output', type=Path)
     p.add_argument('--comparison-sfa', type=Path)
+    p.add_argument('--li-tiling', choices=('auto', 'q4'), default='auto',
+                   help='P0-C0 test-only Q2(auto) vs Q4 core mapping, Prefetch=0')
     p.add_argument('--li-only-varlen', action='store_true',
                    help='run only custom v9 LI with two mixed-length forwards')
     p.add_argument('--epoch-audit-profile', action='store_true',
@@ -276,6 +282,8 @@ def main(argv=None):
         not a.prefetch_payload_audit or round(2048 * a.miss_percent / 100) != 1
     ):
         p.error('--cold-prefetch-probe requires --prefetch-payload-audit and one final cold miss per query')
+    if a.li_tiling == 'q4' and (not a.li_only_varlen or a.prefetch_tokens != 0):
+        p.error('--li-tiling q4 requires --li-only-varlen --prefetch-tokens 0')
     if a.native_union_fit and a.li_only_varlen:
         p.error("--native-union-fit is for the full-chain Native MTP baseline, not LI-only")
     if a.li_only_varlen and (
@@ -308,6 +316,8 @@ def main(argv=None):
               '--iterations', str(a.iterations)]
     if a.li_only_varlen:
         common.append('--li-only-varlen')
+    if a.li_tiling != 'auto':
+        common.extend(['--li-tiling', a.li_tiling])
     if a.native_union_fit:
         common.append('--native-union-fit')
     if a.active_k_map_clear:

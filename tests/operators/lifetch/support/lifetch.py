@@ -118,7 +118,7 @@ def run(args, run_dir):
                 native_union_fit=bool(getattr(args, "native_union_fit", False)),
                 actual_key_lengths=actual_lengths,
             )
-            geometry = li_geometry(batch, "auto", args.intermediate_fetches, aics, 0)
+            geometry = li_geometry(batch, getattr(args, "li_tiling", "auto"), args.intermediate_fetches, aics, 0)
             batch_inputs(common, data, batch, args.history, geometry["rotating_aic"])
             weights = np.fromfile(data / "arg2.bin", np.float32)
             (weights.view(np.uint32) >> 16).astype(np.uint16).tofile(data / "native_weights_bf16.bin")
@@ -191,7 +191,9 @@ def run(args, run_dir):
                 if args.li_only_varlen:
                     line = (
                         f"V9_LI_VARLEN_PASS batch={batch} history={history} resident={resident} "
-                        f"index_heads={heads} rounds={len(report['rounds'])}; "
+                        f"index_heads={heads} li_tiling={report['li_tiling']} "
+                        f"li_cores={report['li_cores']} rotation_epochs={report['rotation_epochs']} "
+                        f"scenarios={len(report['rounds'])}; "
                         "scope=v9_init+v9_li+v9_wait; resolver/final-fetch/Index-update not tested"
                     )
                     summaries.append(line)
@@ -316,6 +318,7 @@ def run_v9_li_varlen_only(
         aic_count=aics,
         intermediate_fetches=args.intermediate_fetches,
         prefetch_limit=args.prefetch_tokens,
+        li_tiling=getattr(args, "li_tiling", "auto"),
         output_stride=owner.output.shape[1],
         query_ends=query_ends,
         enable_lru_slots=not getattr(args, "cold_prefetch_probe", False),
@@ -780,6 +783,9 @@ def run_v9_li_varlen_only(
     return {
         "test": "custom_v9_li_variable_actual_qk_lengths",
         "soc": args.soc,
+        "li_tiling": getattr(args, "li_tiling", "auto"),
+        "li_cores": int(rotating.runtime_shape.liCores),
+        "rotation_epochs": int(rotating.runtime_shape.rounds),
         "batch": b,
         "history": history,
         "resident": resident,
