@@ -196,7 +196,8 @@ def run(torch, owner, rotating, pipeline, args):
             owner.graphs.remove(graph)
             median = float(np.median(samples))
             rows.append(dict(query='Q4_all' if query == 4 else f'Q{query+1}', version=version,
-                             aiv=8 if query == 4 else 2, jettys_per_aiv=2,
+                             aiv=8 if query == 4 else 2,
+                             jettys_per_aiv=2 if version == 'native' else pipeline.fetch_jettys_per_aiv,
                              count=len(selected), bytes=len(selected)*TOKEN_BYTES, stages=stage_lines,
                              safe_count=int(counts[group_ids, 0].sum()),
                              conflict_count=int(counts[group_ids, 1].sum()),

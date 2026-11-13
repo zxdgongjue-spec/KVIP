@@ -513,8 +513,10 @@ def level_two_tables(result):
                 raw = requests[0].get('core_timeline_raw', {})
                 mhz = raw.get('clock_mhz')
                 lines.append(diagnostic_table('Observed resource geometry', ['BS', 'Resolver/update blocks per request',
-                    'Fetch blocks per Q', 'Total Fetch blocks', 'Clock MHz'], [[raw.get('batch'), raw.get('resolver_cores'),
-                    raw.get('workers_per_query'), 4 * raw['workers_per_query'] if 'workers_per_query' in raw else None, mhz]]))
+                    'Fetch blocks per Q', 'Total Fetch blocks', 'Fetch Jettys per AIV', 'Clock MHz'],
+                    [[raw.get('batch'), raw.get('resolver_cores'), raw.get('workers_per_query'),
+                      4 * raw['workers_per_query'] if 'workers_per_query' in raw else None,
+                      raw.get('fetch_jettys_per_aiv'), mhz]]))
                 services = requests[0].get('prefetch_services', [])
                 service_rows = []
                 for event in services:
@@ -566,5 +568,5 @@ def level_two_tables(result):
                 'Unused', 'Cumulative posted', 'Cumulative unused'], windows))
             lines.append(diagnostic_table('Per-Q demand / repair', ['Request', 'Q', 'TopK', 'Unique',
                 'Cross-Q duplicates', 'New unique', 'Initially local', 'Final reads'], queries))
-    lines.append('N/A: Jetty/inflight limits and UBmem pipeline configuration are not captured; runtime capacity is not active worker count.')
+    lines.append('N/A: Inflight limits and UBmem pipeline configuration are not captured; runtime capacity is not active worker count.')
     return '\n\n'.join(lines)

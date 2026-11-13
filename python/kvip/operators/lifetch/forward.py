@@ -5,9 +5,10 @@ from kvip.operators.lifetch.streaming import StreamingLIFetchForward
 
 
 class LIFetchForward(StreamingLIFetchForward):
-    def __init__(self, rotating, update, *, q_workers=2):
+    def __init__(self, rotating, update, *, q_workers=2, fetch_jettys_per_aiv=2):
         super().__init__(
-            rotating, update, rotating.torch, rotating.prefetch_limit, fused_final=True, q_workers=q_workers
+            rotating, update, rotating.torch, rotating.prefetch_limit, fused_final=True, q_workers=q_workers,
+            fetch_jettys_per_aiv=fetch_jettys_per_aiv,
         )
         # Prepare address/logical metadata as each Q arrives. Finalize ordering
         # remains the measured baseline; transport-specific resources stay leased.

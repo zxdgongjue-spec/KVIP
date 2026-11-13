@@ -7,7 +7,8 @@ import numpy as np
 
 
 class StreamingLIFetchForward:
-    def __init__(self, rotating, update, torch, prefetch_limit, *, fused_final=False, q_workers=None):
+    def __init__(self, rotating, update, torch, prefetch_limit, *, fused_final=False, q_workers=None,
+                 fetch_jettys_per_aiv=2):
         if rotating.device != update.device:
             raise ValueError("Fetch and Index update must use the same device")
         if update.bindings.numel() != 28:
@@ -33,7 +34,12 @@ class StreamingLIFetchForward:
         self.fused_final = fused_final
         if q_workers not in (1, 2, 4) or not fused_final:
             raise ValueError("LIFetch requires fused completion and 1/2/4 Fetch workers per query")
+        if type(fetch_jettys_per_aiv) is not int or fetch_jettys_per_aiv not in (1, 2):
+            raise ValueError("URMA final Fetch requires 1 or 2 Jettys per AIV")
+        if fetch_jettys_per_aiv == 1 and hasattr(rotating, "lease"):
+            raise ValueError("Single-Jetty final Fetch is only supported for URMA")
         self.q_workers = q_workers
+        self.fetch_jettys_per_aiv = fetch_jettys_per_aiv
         self.prefetch_limit = prefetch_limit
         self.legacy_layout = False
         self.parallel_finalize = False
@@ -98,7 +104,8 @@ class StreamingLIFetchForward:
             (
                 blob,
                 np.asarray([self.dense_shadow.data_ptr(), self.packed_fetch.data_ptr()], dtype="<u8").view("u1"),
-                np.zeros(112, dtype="u1"),
+                np.asarray([fetch_jettys_per_aiv], dtype="<u4").view("u1"),
+                np.zeros(108, dtype="u1"),
             )
         )
         if len(blob) != 256:

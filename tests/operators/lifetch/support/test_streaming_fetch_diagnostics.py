@@ -35,3 +35,4 @@ def test_native_jetty_audit_rotation_and_phases():
     assert a[-128:] == list(range(5000, 5128))
     assert b[-72:] == list(range(5128, 5200))
     assert sorted(a + b) == list(range(2500)) + list(range(5000, 5200))
+    assert split_native_jetty_descriptors(phases, jettys=1) == [phases[0] + phases[1]]

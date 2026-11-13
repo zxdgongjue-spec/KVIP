@@ -27,9 +27,11 @@ struct DeviceArgs {uint64_t indices=0,offsets=0,output_indices=0,miss_count=0,ad
  uint32_t request_capacity=0,table_capacity=0,batch_get_max_inflight_total=0,jettys_per_core=1;};
 struct Context {uint64_t sourceBlocks,sourceOffsets,destinations,count,fallbackAddresses=0,fallbackValid=0;};
 struct Shape {uint32_t batch=4,finalWorkers=4,finalPostOffset=0,resident=16384;};
-struct Args {uint64_t context=0,flags=0,times=0,packedFetch=0;uint32_t prefetchCount=0;};
+struct Args {uint64_t context=0,flags=0,times=0,packedFetch=0;uint32_t prefetchCount=0,fetchJettysPerAiv=0;};
 Shape LoadRuntimeShape(Context*){return {};}
 FinalPost posts[16];DeviceArgs deviceArgs[20];std::vector<std::vector<int32_t>> calls,offsetCalls,destCalls;
+KvafBatchGetQueueState queues[20];KvafBatchGetCoreStatus statuses[20];
+std::vector<unsigned> queueViews,jettyCounts,queueSyncBytes;
 FinalPost* FinalPostAt(uint32_t,Context*,uint32_t i){return posts+i;}
 unsigned FinalQueue(unsigned batch,unsigned workers,unsigned row,unsigned q){return q==0?row*2+1:batch*2+row*(workers-1)+q-1;}
 DeviceArgs GetArgs(Context*,unsigned i){return deviceArgs[i];}
@@ -43,10 +45,14 @@ void PublishQueryCompletion(Context*,BatchFlag*,uint32_t,uint32_t,uint32_t,uint3
 namespace Simt {struct Dim3{int x,y,z;};template<auto f,class... T>void VF_CALL(Dim3,T... a){f(a...);}}
 namespace kvaf_device {
 constexpr uint64_t kCqTimeout=6,kInvalidArgs=1;
-void CleanCacheLines(uint8_t*,uint64_t){}
+void CleanCacheLines(uint8_t* ptr,uint64_t bytes){
+ if(uintptr_t(ptr)>=uintptr_t(queues) && uintptr_t(ptr)<uintptr_t(queues+20))queueSyncBytes.push_back(bytes);
+}
 void WriteStatus(KvafBatchGetCoreStatus* s,uint64_t result,uint64_t processed,uint64_t completed,uint64_t,uint64_t,uint64_t,uint64_t){s->magic=123;s->result=result;s->processed_request_count=processed;s->completed_batch_count=completed;}
 void KvafBatchGetDevice(DeviceArgs a,unsigned,unsigned begin,unsigned n){
- assert(a.batch_get_max_inflight_total==2048 && a.jettys_per_core==2);auto status=(KvafBatchGetCoreStatus*)a.core_status;
+ assert(a.batch_get_max_inflight_total==2048);auto status=(KvafBatchGetCoreStatus*)a.core_status;
+ queueViews.push_back((KvafBatchGetQueueState*)a.queue_state-queues);
+ jettyCounts.push_back(a.jettys_per_core);
  calls.emplace_back((int32_t*)a.indices+begin,(int32_t*)a.indices+begin+n);
  offsetCalls.emplace_back((int32_t*)a.offsets+begin,(int32_t*)a.offsets+begin+n);
  destCalls.emplace_back((int32_t*)a.output_indices+begin,(int32_t*)a.output_indices+begin+n);
@@ -59,7 +65,6 @@ int main(){
  for(unsigned i=0;i<src.size();i++){src[i]=i;off[i]=i+1;dst[i]=i+2;}
  Context c{uint64_t(src.data()),uint64_t(off.data()),uint64_t(dst.data()),0};
  BatchFlag flags[4*kFlagCount];Args a{uint64_t(&c),uint64_t(flags),0,uint64_t(packed.data()),0};
- KvafBatchGetQueueState queues[20];KvafBatchGetCoreStatus statuses[20];
  for(int i=0;i<20;i++){deviceArgs[i].queue_state=uint64_t(&queues[i]);deviceArgs[i].core_status=uint64_t(&statuses[i]);}
  for(unsigned b=0;b<4;b++){flags[b*kFlagCount+1].ready=1;flags[b*kFlagCount+7].ready=1;
   auto &p=posts[b*4];p.count=2;p.nonconflicting=1;p.descriptor=b*kSlots;}
@@ -73,6 +78,17 @@ int main(){
  FetchQueryGroup(&a,0,1,2,false);assert(calls.size()==4);
  assert((calls[2]==std::vector<int32_t>{8192,24576}));
  assert((calls[3]==std::vector<int32_t>{8193,24577}));
+ assert((queueViews==std::vector<unsigned>{8,8,10,10}));
+ assert((jettyCounts==std::vector<unsigned>{2,2,2,2}));
+ assert(queueSyncBytes==std::vector<unsigned>(8,2*sizeof(*queues)));
+ // Single-Jetty mode keeps each lane's pair base and uses its first queue in both phases.
+ calls.clear();queueViews.clear();jettyCounts.clear();queueSyncBytes.clear();
+ a.fetchJettysPerAiv=1;
+ FetchQueryGroup(&a,0,0,2,false);
+ FetchQueryGroup(&a,0,1,2,false);
+ assert((queueViews==std::vector<unsigned>{8,8,10,10}));
+ assert((jettyCounts==std::vector<unsigned>{1,1,1,1}));
+ assert(queueSyncBytes==std::vector<unsigned>(8,sizeof(*queues)));
  // Direct producer output consumes the same descriptors without invoking packing.
  calls.clear();offsetCalls.clear();destCalls.clear();
  auto direct=packed.data()+8*(3*4*kTop+32);unsigned stride=4*kTop;
@@ -85,6 +101,7 @@ int main(){
  assert(calls.size()==2 && (calls[0]==std::vector<int32_t>{0,16384}) && (calls[1]==std::vector<int32_t>{1,16385}));
  assert((offsetCalls[1]==std::vector<int32_t>{2,16386}));
  assert((destCalls[1]==std::vector<int32_t>{3,16387}));
+ assert(jettyCounts.back()==1);
  // Mismatched publication counters fail closed.
  direct[6*stride]=3;calls.clear();FetchQueryGroup(&a,0,0,2,true);assert(calls.empty());
  // Invalid producer descriptors must fail closed without calling KVAF.
@@ -107,10 +124,9 @@ def test_prefetch_does_not_reset_owned_final_status():
     assert 'CompletePrefetch(ctx,b,true,profile?' in kernel
     assert 'if(initializeSpare)' in helper
     assert 'pair=2*shape.batch+2*(q*workers+lane)' in kernel
-    assert 'args.jettys_per_core=2' in kernel
     worker = kernel.split('__aicore__ inline void FetchQueryGroup(', 1)[1].split(
         '__aicore__ inline void FinalizeStreaming', 1)[0]
-    assert worker.count('reinterpret_cast<__gm__ uint8_t*>(queue),2*sizeof(*queue)') == 2
+    assert worker.count('reinterpret_cast<__gm__ uint8_t*>(queue),args.jettys_per_core*sizeof(*queue)') == 2
 
 
 def test_two_jetty_pairs_do_not_overlap_prefetch_or_each_other():

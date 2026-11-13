@@ -115,6 +115,16 @@ def test_runtime_workspace_scales_without_recompilation(history, resident, heads
     assert np.frombuffer(forward.workspace.values, dtype="<u4", count=1, offset=96)[0] & 0xFFFF == 2048
 
 
+def test_single_jetty_workspace_survives_diagnostic_updates():
+    rotating, update = binding_fixture()
+    forward = LIFetchForward(rotating, update, fetch_jettys_per_aiv=1)
+    for diagnostics in (False, True, False):
+        forward.set_options(diagnostics=diagnostics)
+        assert np.frombuffer(forward.workspace.values, dtype="<u4", count=1, offset=144)[0] == 1
+        forward()
+        assert rotating.library.kvip_lifetch_streaming_forward.call_args.args[5] == 2
+
+
 def test_device_and_aiv_budget_are_checked():
     rotating, update = binding_fixture(batch=16)
     update.device = 6

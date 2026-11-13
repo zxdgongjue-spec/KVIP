@@ -46,12 +46,13 @@ def test_invalid_timing_rejected(samples):
 def test_missing_batch_report_cannot_be_success(tmp_path):
     from types import SimpleNamespace
     from reporting import atomic_json, collect_results, timing_summary
-    config = SimpleNamespace(transport='urma', mode='bench', batches=(1, 2))
-    atomic_json(tmp_path / 'one/report.json', dict(batch=1, correctness='PASS', timing=dict(
+    config = SimpleNamespace(transport='urma', mode='bench', batches=(1, 2), fetch_jettys_per_aiv=1)
+    atomic_json(tmp_path / 'one/report.json', dict(batch=1, correctness='PASS', fetch_jettys_per_aiv=1, timing=dict(
         native_chain=timing_summary([10]), prototype_with_update=timing_summary([8]))))
     rows = collect_results(tmp_path, config, 0)
     assert len(rows) == 2
     assert rows[0]['accepted'] and not rows[1]['accepted']
+    assert rows[0]['fetch_jettys_per_aiv'] == 1
     assert rows[1]['batch'] == 2 and rows[1]['execution'] == 'INCOMPLETE'
 
 

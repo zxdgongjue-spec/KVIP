@@ -163,6 +163,10 @@ URMA runtime 固定40个worker、每worker两条Jetty；UBmem固定2个worker。
 这会改变旧测试按BS创建URMA runtime的资源配置，历史小BS串行性能不是严格同配置对照。
 启动及结束打印共享池统计，`cases/bench/pool.json`保存Put字节数、复用次数和worker数。
 
+合成 URMA 的 `bench` 和 `diagnose` 可用 `--fetch-jettys-per-aiv 1` 或 `2`（默认）
+设置融合最终 Fetch 每个 AIV 使用的 Jetty 数，每 Q 仍启动两个 Fetch AIV。
+`fetch_only.json` 分别记录 native 和 fused 的 Jetty 数，native 参考路径使用两条。
+
 运行结束自动输出大表及 `results.csv`、`summary.json`；每组保留原始计时数据。
 汇总包含 transport、BS、目标miss%、正确性、mean/p50/p99及按mean计算的改善比例。
 这里是算子链完整图，不是服务TPOT。实际miss和读取数量仍保留在各case报告中。

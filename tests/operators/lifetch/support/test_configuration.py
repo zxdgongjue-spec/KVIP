@@ -10,6 +10,7 @@ def test_defaults_and_check_has_no_geometry_options():
     bench = configuration(['bench'])
     assert bench.seed == 43 and bench.batches == (1, 4, 8, 16)
     assert bench.queries == 4
+    assert bench.fetch_jettys_per_aiv == 2
     with pytest.raises(SystemExit):
         configuration(['check', '--batches', '16'])
 
@@ -29,6 +30,9 @@ def test_real_preserves_source_selection_and_rejects_even_explicit_default_geome
     ['bench', '--batches', '1,1'], ['bench', '--trace-root', '/trace'],
     ['bench', '--input', 'real'], ['bench', '--seed', '-1'],
     ['diagnose', '--level', 'stage'], ['diagnose', '--stages', 'unknown'],
+    ['bench', '--fetch-jettys-per-aiv', '3'],
+    ['bench', '--transport', 'ubmem', '--fetch-jettys-per-aiv', '1'],
+    ['diagnose', '--input', 'real', '--fetch-jettys-per-aiv', '1'],
     ['diagnose', '--stages', 'all,fetch'],
     ['diagnose', '--algorithm-stats'], ['diagnose', '--fetch-bandwidth'],
 ])
@@ -42,6 +46,12 @@ def test_diagnose_reuses_bench_config_and_has_only_two_extra_selectors():
     assert args.stages == ('update', 'fetch')
     assert args.iterations == 20 and args.seed == 43
     assert 'algorithm_stats' not in vars(args)
+
+
+@pytest.mark.parametrize('mode', ['bench', 'diagnose'])
+def test_synthetic_urma_accepts_single_jetty(mode):
+    args = configuration([mode, '--batches', '16', '--miss-percent', '12.5', '--fetch-jettys-per-aiv', '1'])
+    assert args.fetch_jettys_per_aiv == 1
 
 
 @pytest.mark.parametrize('flag', ['--early-fetch', '--avoid-prefetch-slots', '--legacy-fetch-layout',

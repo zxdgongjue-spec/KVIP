@@ -34,7 +34,7 @@ def test_fetch_only_requires_both_paths_and_all_queries(tmp_path):
     missing = summarize(tmp_path, config)
     assert 'Fetch-only comparison results' in missing['missing']
     rows = [dict(query=query, version=version, aiv=8 if query == 'Q4_all' else 2,
-                 jettys_per_aiv=2, count=0, bytes=0, mean_us=12., p50_us=11.,
+                 jettys_per_aiv=2 if version == 'native' else 1, count=0, bytes=0, mean_us=12., p50_us=11.,
                  p99_us=13., effective_GBps=None, samples_us=[11., 13.])
             for query in ('Q1', 'Q2', 'Q3', 'Q4', 'Q4_all')
             for version in ('native', 'fused')]
@@ -42,7 +42,9 @@ def test_fetch_only_requires_both_paths_and_all_queries(tmp_path):
     complete = summarize(tmp_path, config)
     assert not any('Fetch-only' in item for item in complete['missing'])
     assert len(complete['fetch_only'][0]['rows']) == 10
-    assert 'FETCH-ONLY Q4_all fused' in (tmp_path / 'diagnostic_summary.log').read_text()
+    summary = (tmp_path / 'diagnostic_summary.log').read_text()
+    assert 'FETCH-ONLY Q4_all native aiv=8 jettys/aiv=2' in summary
+    assert 'FETCH-ONLY Q4_all fused aiv=8 jettys/aiv=1' in summary
     atomic_json(tmp_path / 'case/fetch_only.json', dict(status='PASS', rows=rows[:-1]))
     incomplete = summarize(tmp_path, config)
     assert any('incomplete Fetch-only' in item for item in incomplete['missing'])
@@ -140,7 +142,8 @@ def test_level_two_tables_keep_replay_core_and_query_identity():
     from diagnostics import level_two_tables
     request = dict(batch=0, producer=[dict(resolve=20, output=10, pack=5, publish=5)],
         update=[10, 30], update_wait=[5, 10], li=[],
-        core_timeline_raw=dict(batch=1, resolver_cores=3, workers_per_query=2, clock_mhz=10))
+        core_timeline_raw=dict(batch=1, resolver_cores=3, workers_per_query=2,
+                               fetch_jettys_per_aiv=1, clock_mhz=10))
     core = dict(block=3, role='fetch Q1 lane0', start_us=1., end_us=9., duration_us=8.,
         stages=[dict(name='safe.KVAF_Get', start_us=2., end_us=8., duration_us=6.)],
         KVAF_counters=dict(safe_post_cycles=10, safe_CQ_cycles=20,
@@ -154,7 +157,7 @@ def test_level_two_tables_keep_replay_core_and_query_identity():
         captures=[dict(source='test', stage_summary={}, samples=[sample])])
     output = level_two_tables(result)
     for value in ('repeat=2', 'Last block=3', 'fetch Q1 lane0', 'Window prefetch / unused',
-                  'Per-Q demand / repair', 'Per-Q resolver / update', '1.000', '2.000'):
+                  'Per-Q demand / repair', 'Per-Q resolver / update', 'Fetch Jettys per AIV', '1.000', '2.000'):
         assert value in output
     assert 'URMA group counters' in output
     result['transport'] = 'ubmem'

@@ -76,6 +76,8 @@ def configuration(argv=None):
             command.add_argument('--round-range', type=round_range)
             command.add_argument('--prefetch-tokens', type=int, default=512)
             command.add_argument('--intermediate-fetches', type=int, default=8)
+            command.add_argument('--fetch-jettys-per-aiv', type=int, choices=(1, 2),
+                                 help='Jettys per fused final Fetch AIV for synthetic URMA (default: 2)')
             command.add_argument('--warmup', type=int, default=4)
             command.add_argument('--iterations', type=int, default=20)
         if mode == 'diagnose':
@@ -94,6 +96,11 @@ def configuration(argv=None):
         if args.suite == ('all',):
             args.suite = CHECK_SUITES if args.snapshot else CHECK_SUITES[:-1]
     if args.mode in ('bench', 'diagnose'):
+        if args.input == 'synthetic' and args.transport == 'urma':
+            if args.fetch_jettys_per_aiv is None:
+                args.fetch_jettys_per_aiv = 2
+        elif args.fetch_jettys_per_aiv is not None:
+            parser.error('--fetch-jettys-per-aiv requires synthetic URMA')
         synthetic = dict(miss_percent=10., queries=4, batches=DEFAULT_BATCHES, seed=43,
                          history=131072, resident=16384, index_heads=32)
         real = ('trace_root', 'group', 'round_range')

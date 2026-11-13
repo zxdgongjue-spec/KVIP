@@ -359,7 +359,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(256) inline void PackFetchRanges(
 #include "staged_ubmem_fetch.h"
 #else
 constexpr uint32_t kBatchGetInflight = 2048;
-// Each worker owns one KVAF queue. It gathers its shard of requests for one Q,
+// Each worker reserves a private KVAF queue pair. It gathers requests for one Q,
 // calls the native BatchGet once per safe/conflicting phase, then acknowledges
 // all rows covered by that call. The native scheduler owns WQE and CQ handling.
 __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,uint32_t workers,bool skipEmptyConflict=true){
@@ -376,7 +376,9 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
  // The first 2*batch views include the independent prefetch queues. The
  // following views are paired, exclusively owned by this Q worker.
  uint32_t pair=2*shape.batch+2*(q*workers+lane);
- auto args=GetArgs(ctx,pair);args.jettys_per_core=2;
+ auto args=GetArgs(ctx,pair);
+ // Keep the pair stride even when only the first Jetty is active.
+ args.jettys_per_core=a->fetchJettysPerAiv==1U?1U:2U;
  args.indices=uint64_t(packed);args.offsets=uint64_t(packed+stride);args.output_indices=uint64_t(packed+2*stride);
  args.miss_count=ctx->count;args.request_capacity=stride;
  if(ctx->fallbackAddresses){args.address_table=ctx->fallbackAddresses;args.valid_table=ctx->fallbackValid;args.table_capacity=shape.batch*kSlots;}
@@ -438,12 +440,12 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(packed+2*stride),uint64_t(size)*4);
    auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args.queue_state);
    auto status=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(args.core_status);
-   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),2*sizeof(*queue));
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),args.jettys_per_core*sizeof(*queue));
    uint64_t oldProfile=0;
    if(profile){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),sizeof(*status));oldProfile=status->profile.magic;
     status->profile.magic=KVAF_AIV_BATCH_GET_PROFILE_MAGIC;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&status->profile),sizeof(status->profile));}
    start=GetSystemCycle();kvaf_device::KvafBatchGetDevice(args,0,0,size);end=GetSystemCycle();
-   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),2*sizeof(*queue));
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),args.jettys_per_core*sizeof(*queue));
    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),sizeof(*status));
    if(profile){postCycles=status->profile.post_active_cycles;waitCycles=status->profile.drain_wait_cycles;groups=status->profile.submitted_group_count;
     status->profile.magic=oldProfile;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&status->profile),sizeof(status->profile));}

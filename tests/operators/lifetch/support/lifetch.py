@@ -498,7 +498,10 @@ def run_device(
     )
     if args.streaming:
         from streaming_forward import StreamingForward
-        pipeline = StreamingForward(rotating, update, torch, args.prefetch_tokens, fused_final=args.fused_final, q_workers=args.q_workers)
+        pipeline = StreamingForward(
+            rotating, update, torch, args.prefetch_tokens, fused_final=args.fused_final, q_workers=args.q_workers,
+            fetch_jettys_per_aiv=getattr(args, "fetch_jettys_per_aiv", 2),
+        )
         pipeline.legacy_layout = args.legacy_fetch_layout
         pipeline.parallel_finalize = args.parallel_fetch_finalize
         pipeline.prepare_metadata = args.prepare_update_metadata
@@ -656,7 +659,8 @@ def run_device(
                         remote = rotating.fallback_addresses.cpu().numpy().reshape(-1).view(np.uint64)
                         report["actual_sq_writers"], report["final_wqe_comparison"] = audit_queue_writes(
                             owner, rows, posts, row, [item["slot"] for item in report["examples"]],
-                            destinations, remote, q_workers=args.q_workers)
+                            destinations, remote, q_workers=args.q_workers,
+                            fetch_jettys_per_aiv=pipeline.fetch_jettys_per_aiv)
                     except Exception as exc:
                         report["sq_audit_error"] = f"{type(exc).__name__}: {exc}"
                     report_path.write_text(json.dumps(report, indent=2) + "\n")
@@ -897,6 +901,7 @@ def run_device(
         timing=timings, wall_costs=wall_costs,
         full_trace=full_trace,
         fetch_only=fetch_only,
+        fetch_jettys_per_aiv=pipeline.fetch_jettys_per_aiv,
         read_samples=read_samples,
         split_samples=split_samples,
         sfa=sfa,

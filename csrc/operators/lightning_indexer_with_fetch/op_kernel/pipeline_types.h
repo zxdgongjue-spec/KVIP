@@ -1,4 +1,5 @@
 #pragma once
+#include <stddef.h>
 #include <stdint.h>
 namespace pipeline_ab {
 constexpr uint32_t kResolveCores=KVIP_OUTPUT_WORKER?3:2;
@@ -19,7 +20,10 @@ struct alignas(128) Args {
  uint64_t flags, eventsSrc, eventsDst, workerStatus, times;
  uint32_t history, resident, prefetchCount, maxEvents;
  uint64_t queryBitmaps, queryErrors, updateBindings, denseShadow, packedFetch;
+ uint32_t fetchJettysPerAiv;
 };
+static_assert(offsetof(Args, fetchJettysPerAiv) == 144 && sizeof(Args) == 256,
+              "LIFetch streaming workspace ABI changed");
 }
 
 namespace rotating {

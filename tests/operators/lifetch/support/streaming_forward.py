@@ -7,10 +7,11 @@ from kvip.operators.lifetch.forward import LIFetchForward
 
 
 class StreamingForward(LIFetchForward):
-    def __init__(self, rotating, update, torch, prefetch_limit, *, fused_final=True, q_workers=2):
+    def __init__(self, rotating, update, torch, prefetch_limit, *, fused_final=True, q_workers=2,
+                 fetch_jettys_per_aiv=2):
         if torch is not rotating.torch or prefetch_limit != rotating.prefetch_limit or not fused_final:
             raise ValueError("Diagnostics must use the exact public LIFetch binding and budget")
-        super().__init__(rotating, update, q_workers=q_workers)
+        super().__init__(rotating, update, q_workers=q_workers, fetch_jettys_per_aiv=fetch_jettys_per_aiv)
 
     def calibrate_counter_mhz(self):
         """Approximate cycle frequency against a long independent graph event."""
@@ -169,4 +170,6 @@ class StreamingForward(LIFetchForward):
                 cores=raw[self.batch*256:].reshape(self.resolver_cores*self.batch+4*self.q_workers, 32).tolist(),
                 producer_update=raw[:self.batch*64].reshape(self.batch, 64).tolist(),
                 fetch=fetch.tolist(), flags=flags.tolist())
+            if not hasattr(self.rotating, "ubmem_status"):
+                result[0]['core_timeline_raw']['fetch_jettys_per_aiv'] = self.fetch_jettys_per_aiv
         return result

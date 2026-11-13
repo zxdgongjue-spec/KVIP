@@ -134,6 +134,10 @@ def collect_results(directory, config, exit_code):
                    seed=getattr(config, 'seed', None), miss_percent=report.get('miss_percent', getattr(config, 'miss_percent', None)),
                    history=getattr(config, 'history', None), resident=getattr(config, 'resident', None),
                    prefetch_tokens=getattr(config, 'prefetch_tokens', None))
+        if config.transport == 'urma':
+            fetch_jettys = report.get('fetch_jettys_per_aiv', getattr(config, 'fetch_jettys_per_aiv', None))
+            if fetch_jettys is not None:
+                row['fetch_jettys_per_aiv'] = fetch_jettys
         rows.append(row)
     misses = getattr(config, 'miss_percent', None)
     misses = misses if isinstance(misses, (tuple, list)) else (misses,)

@@ -59,7 +59,8 @@ def split_native_jetty_descriptors(phases, jettys=2, inflight=2048):
     return result
 
 
-def audit_queue_writes(owner, rows, posts, row, bad_slots, destinations, remote_addresses, q_workers=None):
+def audit_queue_writes(owner, rows, posts, row, bad_slots, destinations, remote_addresses, q_workers=None,
+                       fetch_jettys_per_aiv=2):
     """Read already-completed SQ entries on failure; no device work is submitted."""
     import ctypes
 
@@ -109,7 +110,7 @@ def audit_queue_writes(owner, rows, posts, row, bad_slots, destinations, remote_
                         length = safe if phase == 0 else count - safe
                         indices.extend(range(start, start + length))
                     phases.append(indices)
-                for jetty, indices in enumerate(split_native_jetty_descriptors(phases)):
+                for jetty, indices in enumerate(split_native_jetty_descriptors(phases, jettys=fetch_jettys_per_aiv)):
                     if not indices:
                         continue
                     view = 2 * batch + 2 * (q * q_workers + lane) + jetty
