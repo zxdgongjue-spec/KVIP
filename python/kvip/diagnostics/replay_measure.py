@@ -80,7 +80,8 @@ def statistics(samples):
     )
 
 
-def fused_reads(torch, rotating, update, transport, width, demand=None, *, window_limit=None, active_rows=None):
+def fused_reads(torch, rotating, update, transport, width, demand=None, *, window_limit=None, active_rows=None,
+                admission_controls=None):
     rows = cpu_array(torch, rotating.rows)
     status = cpu_array(torch, rotating.row_status)
     posts = cpu_array(torch, rotating.final_posts)
@@ -126,7 +127,8 @@ def fused_reads(torch, rotating, update, transport, width, demand=None, *, windo
         result["prefetch_unclassified"] = prefetch - classified
     if window_limit is not None:
         result["prefetch_admission"] = prefetch_admission(
-            rows, window_limit=window_limit, rounds=rotating.rounds, active_rows=active_rows
+            rows, window_limit=window_limit, rounds=rotating.rounds, active_rows=active_rows,
+            admission_controls=admission_controls,
         )
     return result
 
@@ -167,6 +169,7 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
             demand,
             window_limit=bundle.tuning["window_limit"],
             active_rows=active_rows,
+            admission_controls=bundle.tuning.get("admission_controls"),
         )
 
         logical = cpu_array(torch, update.logical_output)
@@ -476,6 +479,7 @@ def measure_case(args, archive, context, retained):
             pipeline_options=getattr(args, "pipeline_options", None),
             q_workers=getattr(args, "pipeline_q_workers", 2),
             topk_probe=getattr(args, "probe_only", False),
+            admission_controls=getattr(args, "admission_controls", None),
         )
         case_retained["bundle"] = bundle
         case_retained["buffers"] = buffer_addresses(bundle)
@@ -763,10 +767,11 @@ def run(args, archive, retained):
         cases = {}
         for name, tuning in study_cases(args).items():
             if args.study == "post-threshold":
-                from kvip.diagnostics.pipeline_options import options_for, q_workers_for
+                from kvip.diagnostics.pipeline_options import admission_for, options_for, q_workers_for
 
                 args.pipeline_options = options_for(name)
                 args.pipeline_q_workers = q_workers_for(name)
+                args.admission_controls = admission_for(name)
             retained["progress"].update(variant=name, tuning=dict(tuning))
             phase(retained, "case_begin")
             emit(f"CASE_BEGIN {args.transport}-{args.mode}-{name}")

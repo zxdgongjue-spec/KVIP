@@ -3,8 +3,8 @@
 
 Suppressed candidates are Q4-unioned, mapping-deduplicated candidates examined
 in one request/window but not admitted. Their sum is not a global unique-token
-count or final cold-miss count. Exhausted windows skip scanning, so their unseen
-candidates are not included. A window-limit attribution requires positive
+count or final cold-miss count. Counters cannot count candidates in skipped
+windows. A window-limit attribution requires positive
 suppression and a *strictly* smaller window allowance than every remaining
 row/total/transport budget; ties stay explicitly unclassified.
 """
@@ -20,7 +20,7 @@ ADMISSION_ACCOUNTING = {
     ),
     "window_limited_epochs": "positive suppression with window_limit strictly below all other remaining budgets",
     "other_or_tied_limited_epochs": "positive suppression attributed to a row/total/transport limit or a tie, not separated further",
-    "budget_exhausted_epochs": "visited windows with zero admissible budget; scanning was skipped, so unseen candidates are unknown",
+    "budget_exhausted_epochs": "visited windows with zero admissible budget; suppression counts only candidates actually examined",
     "remaining_admissible_budget": (
         "sum of min(row-slot,total-prefetch,transport limits) minus admitted requests for active rows; "
         "unused capacity does not prove that raising a window limit improves useful prefetch"
@@ -28,8 +28,14 @@ ADMISSION_ACCOUNTING = {
 }
 
 
-def prefetch_admission(rows, *, window_limit, rounds, active_rows=None):
-    """Derive admission evidence from the already-read 1024-byte native Rows."""
+def prefetch_admission(rows, *, window_limit, rounds, active_rows=None, admission_controls=None):
+    """Read completed Rows using the immutable controls of this invocation.
+
+    Controls are integer [total, window, key_steps, carry], uniformly [4] or
+    exactly [B,4]. Native Row word 209 must match every supplied total. Credit
+    uses the logical epoch number, while prior posts follow recorded service
+    order. Suppression is counted even at zero allowance if scanning occurred.
+    """
     values = np.asarray(rows)
     if (
         values.ndim != 2
@@ -52,10 +58,26 @@ def prefetch_admission(rows, *, window_limit, rounds, active_rows=None):
     # limits=208:211, epochOrder=214, sequence=246. Signed tensor storage carries
     # uint32 words; widen before all sums/subtractions to avoid wraparound.
     words = values.view(np.uint32).astype(np.int64)
+    controls = None
+    if admission_controls is not None:
+        controls = np.asarray(admission_controls)
+        if controls.shape == (4,):
+            controls = np.broadcast_to(controls, (len(values), 4))
+        if controls.shape != (len(values), 4) or controls.dtype.kind not in "iu":
+            raise ValueError("Prefetch admission controls must be integer [4] or [B,4]")
+        if (np.any(controls < 0) or np.any(controls[:, 0] > 2048) or
+                np.any((controls[:, 1] < 1) | (controls[:, 1] > 480)) or
+                np.any(controls[:, 2] > 65535) or np.any(controls[:, 3] > 1)):
+            raise ValueError("Prefetch admission controls exceed native bounds")
+        controls = controls.astype(np.int64)
+        if not np.array_equal(words[:, 209], controls[:, 0]):
+            raise ValueError("Prefetch admission controls disagree with actual row totals")
     posted = words[:, 16 : 16 + rounds]
     suppressed = words[:, 48 : 48 + rounds]
     orders = words[:, 214 : 214 + rounds]
     visited = orders != 0
+    if controls is not None and np.any(visited & (controls[:, 0, None] == 0)):
+        raise ValueError("Zero-total admission controls must not visit prefetch windows")
     if any(np.any(words[:, start + rounds : start + 32]) for start in (16, 48, 214)):
         raise ValueError("Prefetch admission contains counters outside configured windows")
     counts = visited.sum(axis=1)
@@ -77,16 +99,22 @@ def prefetch_admission(rows, *, window_limit, rounds, active_rows=None):
     np.put_along_axis(prior, service_order, np.cumsum(ordered_posts, axis=1) - ordered_posts, axis=1)
     effective = words[:, 208:211].min(axis=1)
     remaining = effective[:, None] - prior
-    allowance = np.minimum(window_limit, np.maximum(remaining, 0))
+    window_caps = np.full_like(posted, window_limit)
+    if controls is not None:
+        base = controls[:, 1, None]
+        cumulative = (np.arange(rounds)[None, :] + 1) * base
+        carried = np.minimum(480, np.maximum(0, cumulative - prior))
+        window_caps = np.where(controls[:, 3, None] != 0, carried, base)
+    allowance = np.minimum(window_caps, np.maximum(remaining, 0))
     if np.any(posted > allowance) or np.any(words[:, 9] > effective):
         raise ValueError("Prefetch admission exceeds an actual row budget")
     limited = suppressed > 0
-    if np.any(limited & ((posted != allowance) | (allowance == 0))):
+    if np.any(limited & (posted != allowance)):
         raise ValueError("Prefetch suppression does not match the admitted allowance")
     # Strict inequality deliberately excludes simultaneous window/total limits.
-    window_limited = limited & (window_limit < remaining)
+    window_limited = limited & (window_caps < remaining)
     left = effective - words[:, 9]
-    return dict(
+    result = dict(
         rounds=rounds,
         window_limit=window_limit,
         packed_rows=len(values),
@@ -102,6 +130,11 @@ def prefetch_admission(rows, *, window_limit, rounds, active_rows=None):
         posted_by_epoch=posted.sum(axis=0).tolist(),
         suppressed_by_epoch=suppressed.sum(axis=0).tolist(),
     )
+    if controls is not None:
+        result["admission_controls"] = controls.tolist()
+        windows = controls[:, 1]
+        result["window_limit"] = int(windows[0]) if np.all(windows == windows[0]) else None
+    return result
 
 
 def mean_admission(samples):
@@ -117,7 +150,7 @@ def mean_admission(samples):
     result = {}
     for key in first:
         values = [block[key] for block in blocks]
-        if key in ("rounds", "window_limit", "packed_rows", "active_rows"):
+        if key in ("rounds", "window_limit", "packed_rows", "active_rows", "admission_controls"):
             if any(value != values[0] for value in values):
                 raise ValueError("Prefetch admission geometry changed between samples")
             result[key] = values[0]

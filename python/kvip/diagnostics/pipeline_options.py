@@ -1,6 +1,7 @@
 """Independent, opt-in variants on top of the consolidated recent-index PR."""
 
 OPTIONS = ("final_topk_prune", "selected_metadata", "early_fetch_ready", "compact_init", "ready_batch_fetch")
+OPTIONAL_OPTIONS = ("ready_direct_ranges",)
 DEFAULT_VARIANTS = ("control", "metadata", "ready-batch", "workers4", "ready-batch4", "metadata-end", "control-end")
 VARIANTS = {
     "control": (),
@@ -14,24 +15,48 @@ VARIANTS = {
     "ready-batch4": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch"),
     "control-end": (),
     "metadata-end": ("selected_metadata",),
+    "carry": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch"),
+    "capacity": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch"),
+    "tight": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch"),
+    "direct": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "ready_direct_ranges"),
+    "direct-tight": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "ready_direct_ranges"),
+    "ready-batch4-end": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch"),
+}
+
+# Fixed policies are controlled experiments, not a claim that one is best for
+# every layer. Only prefetch admission changes; exact selection remains intact.
+ADMISSION = {
+    "carry": (512, 64, 0, 1),
+    "capacity": (768, 128, 0, 1),
+    "tight": (768, 128, 1, 1),
+    "direct": (768, 128, 0, 1),
+    "direct-tight": (768, 128, 1, 1),
 }
 
 
+def admission_for(name):
+    return ADMISSION.get(name)
+
+
 def options_for(name):
-    return {key: key in VARIANTS[name] for key in OPTIONS}
+    values = {key: key in VARIANTS[name] for key in OPTIONS}
+    values.update({key: True for key in OPTIONAL_OPTIONS if key in VARIANTS[name]})
+    return values
 
 
 def q_workers_for(name):
     if name not in VARIANTS:
         raise ValueError(f"Unknown pipeline variant: {name}")
-    return 4 if name in ("workers4", "ready-batch4") else 2
+    return 4 if name in ("workers4", "ready-batch4", "ready-batch4-end", *ADMISSION) else 2
 
 
 def validate_options(options):
-    if not isinstance(options, dict) or set(options) != set(OPTIONS):
-        raise ValueError("Pipeline variants must specify exactly the five build options")
+    if not isinstance(options, dict) or not set(OPTIONS) <= set(options) <= set(OPTIONS + OPTIONAL_OPTIONS):
+        raise ValueError("Pipeline variants require the five base options and known optional options")
     if any(type(value) is not bool for value in options.values()):
         raise ValueError("Pipeline options must be bool")
     if options["ready_batch_fetch"] and not (options["selected_metadata"] and options["early_fetch_ready"]):
         raise ValueError("ready_batch_fetch requires selected_metadata and early_fetch_ready")
+    if options.get("ready_direct_ranges") and not options["ready_batch_fetch"]:
+        raise ValueError("ready_direct_ranges requires ready_batch_fetch")
     return dict(options)

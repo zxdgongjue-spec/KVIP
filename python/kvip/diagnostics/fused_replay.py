@@ -79,6 +79,7 @@ def create_fused(
     pipeline_options=None,
     q_workers=2,
     topk_probe=False,
+    admission_controls=None,
 ):
     from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
     from kvip.operators.lifetch.binding import LIFetchBinding
@@ -232,6 +233,13 @@ def create_fused(
         )
         update_type = DirectIndexUpdate
     verify_build_options(rotating.library, build_options)
+    if admission_controls is not None:
+        if not upstream or transport != "urma":
+            raise ValueError("Admission controls require an exact current URMA checkout")
+        rotating.set_admission_controls(
+            torch.tensor([admission_controls] * b, dtype=torch.int32, device="cpu")
+        )
+        effective["admission_controls"] = list(admission_controls)
     if effective.get("recent_seed_ub", False):
         from kvip.diagnostics.seed_eligibility import predict_seed_eligibility
 

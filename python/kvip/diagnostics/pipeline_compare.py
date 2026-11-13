@@ -17,7 +17,10 @@ import sys
 
 from kvip.diagnostics.archive import file_digest, source_commit
 from kvip.diagnostics.compare import read_means, reduction, timing_spread
-from kvip.diagnostics.pipeline_options import DEFAULT_VARIANTS, OPTIONS, VARIANTS, options_for, q_workers_for
+from kvip.diagnostics.pipeline_options import (
+    DEFAULT_VARIANTS, OPTIONS, OPTIONAL_OPTIONS, VARIANTS,
+    admission_for, options_for, q_workers_for,
+)
 from kvip.diagnostics.upstream import validate_checkout
 
 
@@ -39,6 +42,7 @@ def arguments(argv=None):
     parser.add_argument("--pipeline-variants", nargs="+", choices=tuple(VARIANTS), default=list(DEFAULT_VARIANTS))
     parser.add_argument("--result-dir", type=Path, required=True)
     parser.add_argument("--topk-probe", action="store_true", help="Independent pruning-counter replay after all headline timings")
+    parser.add_argument("--brief", action="store_true", help="Print one timing/traffic line per case; keep full JSON")
     args = parser.parse_args(argv)
     if args.device < 0 or args.warmup < 0 or args.iterations < 1 or args.diagnostic_replays < 0:
         parser.error("Require nonnegative device/warmup and positive iterations")
@@ -249,14 +253,19 @@ def summarize(args, results, manifest_digest):
                 raise ValueError(f"{name}: post-threshold optimization changed the early threshold")
             expected_options = options_for(name.removeprefix("candidate-"))
             tuning = result.get("tuning") or {}
-            if {key: tuning.get(key) for key in OPTIONS} != expected_options:
+            if any(tuning.get(key) != value for key, value in expected_options.items()):
                 raise ValueError(f"{name}: candidate build options differ")
-            if {key: value for key, value in tuning.items() if key not in (*OPTIONS, "q_workers")} != {
+            admission = admission_for(name.removeprefix("candidate-"))
+            if tuning.get("admission_controls") != (list(admission) if admission else None):
+                raise ValueError(f"{name}: candidate admission controls differ")
+            excluded = (*OPTIONS, *OPTIONAL_OPTIONS, "q_workers", "admission_controls")
+            if {key: value for key, value in tuning.items() if key not in excluded} != {
                 key: value for key, value in pr.get("tuning", {}).items() if key != "q_workers"
             }:
                 raise ValueError(f"{name}: candidate changed another tuning option or prefetch budget")
     table = {}
-    control = results.get("candidate-control")
+    control_name = "candidate-control" if "candidate-control" in results else "candidate-ready-batch4"
+    control = results.get(control_name)
     for name, result in results.items():
         reads = read_means(result)
         timing = result["timing"]
@@ -292,7 +301,7 @@ def summarize(args, results, manifest_digest):
             if control is not None and name.startswith("candidate-")
             else None
         )
-    control_end = results.get("candidate-control-end")
+    control_end = results.get("candidate-control-end" if control_name == "candidate-control" else "candidate-ready-batch4-end")
     drift = None
     if control is not None and control_end is not None:
         drift = {
@@ -328,6 +337,7 @@ def summarize(args, results, manifest_digest):
         execution_order=list(results),
         candidate_shared_arena_order=args.pipeline_variants,
         primary_candidate_comparison="vs_control" if control is not None else None,
+        control_name=control_name if control is not None else None,
         control_end_drift=drift,
         metadata_end_vs_control_end=end_pair,
         diagnostic_replays_per_fused_case=args.diagnostic_replays,
@@ -344,11 +354,25 @@ def summarize(args, results, manifest_digest):
             "All timing/read samples are retained. Mean/p50 tail heuristics are not significance tests.",
             "Control-end drift is reported without correction. Instrumented role cycles are separate from headline timings and cannot be added into graph latency.",
             "Serial and fused TopK may differ only as accepted by the existing replay oracle; their measured cold/transfer counts remain separate.",
+            "Admission controls are fixed before graph capture. Headline times include device gate/quota work, not a per-step CPU policy update or its H2D transfer.",
         ],
     )
 
 
-def print_summary(summary):
+def print_summary(summary, brief=False):
+    if brief:
+        print("case                   mean_us    p50_us  prefetch    final   unused  vsSerial_mean/p50%", flush=True)
+        for name, row in summary["table"].items():
+            reads, gains = row["reads"], row["gains"]["vs_serial"]
+            print(f"{name:22} {row['mean_us']:9.3f} {row['p50_us']:9.3f} "
+                  f"{reads['prefetch']:9.1f} {reads['final']:8.1f} {reads['unused_prefetch']:8.1f} "
+                  f"{gains['mean_reduction_pct']:+7.2f}/{gains['p50_reduction_pct']:+7.2f}", flush=True)
+        drift = summary["control_end_drift"]
+        if drift:
+            print(f"CONTROL_DRIFT {summary['control_name']} mean={drift['mean']['drift_pct']:+.2f}% "
+                  f"p50={drift['p50']['drift_pct']:+.2f}% no_correction", flush=True)
+        print("CHECK scores=bit_exact fused_ordered_topk=unchanged safe_thresholds=unchanged full_graph_us=true", flush=True)
+        return
     print(
         "case                  mean_us    p50_us  vsControl_p50/mean%  vsPR_p50/mean%  vsSerial_p50/mean%", flush=True
     )
@@ -506,7 +530,7 @@ def run(args):
     (args.result_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     provenance.update(status="pass", completed_cases=list(results))
     provenance_path.write_text(json.dumps(provenance, indent=2) + "\n")
-    print_summary(summary)
+    print_summary(summary, brief=getattr(args, "brief", False))
     if probe_report is not None:
         from kvip.diagnostics.topk_probe import print_summary as print_probe
 

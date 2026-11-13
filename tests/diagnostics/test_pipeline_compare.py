@@ -11,7 +11,7 @@ import pytest
 from kvip.diagnostics import pipeline_compare as compare
 from kvip.diagnostics import replay
 from kvip.diagnostics import replay_measure
-from kvip.diagnostics.pipeline_options import DEFAULT_VARIANTS, options_for, q_workers_for, validate_options
+from kvip.diagnostics.pipeline_options import DEFAULT_VARIANTS, admission_for, options_for, q_workers_for, validate_options
 
 
 def _arguments(tmp_path, monkeypatch, variants=None):
@@ -95,6 +95,9 @@ def _case(args, name):
         )
         if role == "candidate":
             result["tuning"].update(options_for(name.removeprefix("candidate-")))
+            admission = admission_for(name.removeprefix("candidate-"))
+            if admission is not None:
+                result["tuning"]["admission_controls"] = list(admission)
         result["tuning"]["q_workers"] = q_workers_for(name.removeprefix("candidate-")) if role == "candidate" else 2
         result["native_diagnostics"] = dict(
             count=args.diagnostic_replays,
@@ -115,6 +118,22 @@ def _reports(args):
         name: _case(args, name)
         for name in ["main-serial", "main-resident", "pr-recent", *("candidate-" + v for v in args.pipeline_variants)]
     }
+
+
+def test_admission_variants_check_controls_and_report_matching_drift(tmp_path, monkeypatch, capsys):
+    args = _arguments(tmp_path, monkeypatch,
+                      ["ready-batch4", "carry", "capacity", "tight", "direct", "ready-batch4-end"])
+    reports = _reports(args)
+    summary = compare.summarize(args, reports, compare.file_digest(args.snapshot / "manifest.json"))
+    assert summary["control_name"] == "candidate-ready-batch4"
+    assert summary["control_end_drift"]["p50"]["drift_pct"] == 0
+    compare.print_summary(summary, brief=True)
+    output = capsys.readouterr().out
+    assert "candidate-tight" in output and "vsSerial_mean/p50%" in output
+    assert "CONTROL_DRIFT" in output and "CHECK scores=bit_exact" in output
+    reports["candidate-capacity"]["tuning"]["admission_controls"][0] = 512
+    with pytest.raises(ValueError, match="admission controls"):
+        compare.summarize(args, reports, compare.file_digest(args.snapshot / "manifest.json"))
 
 
 def test_commands_match_actual_replay_parser_and_only_four_processes(tmp_path, monkeypatch):
