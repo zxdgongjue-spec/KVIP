@@ -79,15 +79,18 @@ def save_summary(directory, rows):
         writer.writeheader()
         writer.writerows(rows)
     temporary.replace(directory / 'results.csv')
-    lines = ['case | execution | correctness | serial mean us | fused mean us | reduction']
+    lines = ['case | transport | BS | miss% | execution | correctness | serial mean us | fused mean us | reduction | serial p50/p99 us | fused p50/p99 us']
     for row in rows:
         def number(key):
             value = row.get(key)
             return 'N/A' if value is None else f'{value:.3f}'
         reduction = row.get('reduction')
         delta = 'N/A' if reduction is None else f'{reduction:.2%}'
-        lines.append(f"{row['case']} | {row['execution']} | {row['correctness']} | "
-                     f"{number('serial_mean_us')} | {number('fused_mean_us')} | {delta}")
+        lines.append(f"{row['case']} | {row.get('transport', 'N/A')} | {row.get('batch', 'N/A')} | "
+                     f"{row.get('miss_percent', 'N/A')} | {row['execution']} | {row['correctness']} | "
+                     f"{number('serial_mean_us')} | {number('fused_mean_us')} | {delta} | "
+                     f"{number('serial_p50_us')}/{number('serial_p99_us')} | "
+                     f"{number('fused_p50_us')}/{number('fused_p99_us')}")
     (directory / 'summary.log').write_text('\n'.join(lines) + '\n')
 
 
@@ -111,7 +114,9 @@ def collect_results(directory, config, exit_code):
                              timing.get('prototype_with_update'), correct,
                              execution=report.get('execution', 'INCOMPLETE' if path.name == 'completed_timings.json' else 'COMPLETED'))
         row.update(batch=batch, transport=config.transport, mode=config.mode, report=str(path),
-                   seed=getattr(config, 'seed', None))
+                   seed=getattr(config, 'seed', None), miss_percent=getattr(config, 'miss_percent', None),
+                   history=getattr(config, 'history', None), resident=getattr(config, 'resident', None),
+                   prefetch_tokens=getattr(config, 'prefetch_tokens', None))
         rows.append(row)
     for batch in (getattr(config, 'batches', ()) or ()):
         if batch not in observed:

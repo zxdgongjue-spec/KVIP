@@ -80,3 +80,58 @@ def test_fetch_only_is_automatic_only_for_level_three_fetch():
         worker = runner_options(configuration(arguments))
         assert worker.diagnostic_fetch_only is expected
         assert worker.fetch_only_compare is False  # Never bypass full-graph timing.
+
+
+def test_bench_matrix_keeps_scalar_workers_and_all_cases():
+    from execution import bench_jobs
+    for transport in ('urma', 'ubmem'):
+        config = configuration(['bench', '--transport', transport, '--batches', '1,2,4,8,16',
+                                '--miss-percent', '3,5,10,15'])
+        jobs = bench_jobs(config)
+        assert len(jobs) == 4 and len({name for name, _ in jobs}) == 4
+        assert [(bs, job.miss_percent) for _, job in jobs for bs in job.batches] == [
+            (bs, miss) for miss in (3, 5, 10, 15) for bs in (1, 2, 4, 8, 16)]
+        for _, job in jobs:
+            worker = runner_options(job)
+            assert worker.trace_rounds == 0 and worker.transport == transport
+            assert worker.seed == config.seed and worker.iterations == config.iterations
+        assert config.miss_percent == (3, 5, 10, 15)
+
+
+def test_bench_matrix_rejects_invalid_percentages():
+    import pytest
+    for value in ('nan', 'inf', '3,nan', '3,101', '-1,3', '3,3.0', '3,'):
+        with pytest.raises(SystemExit):
+            configuration(['bench', f'--miss-percent={value}'])
+
+
+def test_matrix_dispatch_collects_twenty_pairs_without_npu(tmp_path, monkeypatch):
+    import json
+    import execution
+    from reporting import atomic_json, timing_summary
+
+    def launch(job, directory):
+        directory.mkdir(parents=True)
+        for batch in job.batches:
+            atomic_json(directory / f'bs{batch}' / 'report.json', dict(
+                batch=batch, correctness='PASS', timing=dict(
+                    native_chain=timing_summary([100, 110]),
+                    prototype_with_update=timing_summary([80, 90]))))
+        atomic_json(directory / 'worker-result.json', dict(exit_code=0))
+        return 0
+
+    monkeypatch.setattr(execution, 'launch', launch)
+    for transport in ('urma', 'ubmem'):
+        output = tmp_path / transport
+        config = configuration(['bench', '--transport', transport, '--batches', '1,2,4,8,16',
+                                '--miss-percent', '3,5,10,15', '--kvaf-server', 'test:1',
+                                '--output', str(output)])
+        assert execution.dispatch(config) == 0
+        summary, = output.rglob('summary.json')
+        rows = json.loads(summary.read_text())['cases']
+        assert len(rows) == 20
+        assert {(row['batch'], row['miss_percent']) for row in rows} == {
+            (bs, miss) for bs in (1, 2, 4, 8, 16) for miss in (3, 5, 10, 15)}
+        assert all(row['transport'] == transport and row['accepted'] for row in rows)
+        assert all(row['serial_mean_us'] == 105 and row['fused_mean_us'] == 85 for row in rows)
+        assert 'serial p50/p99 us' in summary.with_name('summary.log').read_text()

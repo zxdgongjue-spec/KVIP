@@ -4,7 +4,7 @@
 通过 `--transport` 选择传输。测试调用正式算子，不包含历史优化版本的开关。
 设计与完整字段定义见 [测试设计](../../../docs/performance/lifetch-tests.md)。
 
-当前重构在本地 CPU 环境验证中，尚未完成 NPU 验收。合成负载仍是可控的
+内置 check 已在 URMA、UBmem 真机通过；bench 矩阵待真机验收。合成负载仍是可控的
 Q/Index fixture；真实分布校准需要下文的 trace 统计反馈，不能视为已完成拟合。
 
 ## 准备与运行
@@ -139,3 +139,27 @@ PYTHONPATH=python python -m pytest -q tests/operators/lifetch/support
 owner换序检查。覆盖证据自动打印并汇总到对应case的coverage.json。
 
 本地只校验测试逻辑、输入/状态管理及报告；NPU运行结果由完整命令验证。
+
+## 合成 bench 矩阵验收
+
+暂沿用现有 Q/Index 生成器，不依赖 trace 或拟合结果。固定 Q4，串行与融合使用相同
+负载；多 miss 与多 BS 组成笛卡尔积。每个 transport 单独运行，依赖目录和服务需对应。
+
+```bash
+python tests/operators/lifetch/test_lifetch.py bench \
+  --transport urma --device 4 \
+  --kvaf-root /vllm-workspace/vllm-ascend/third_party/KVAF \
+  --kvaf-server 127.0.0.1:28885 \
+  --batches 1,2,4,8,16 --miss-percent 3,5,10,15 \
+  --warmup 4 --iterations 50 --timeout-seconds 1200
+```
+
+UBmem 使用同一命令，改为 `--transport ubmem` 并指定其 KVAF 目录和 CPU service。
+每种传输20组配对结果，每组包含串行和融合完整图性能。首轮按需构建，后续复用
+所选 KVAF 目录下的运行时 shape 构建缓存；不按 BS/miss 编译。
+每个 miss 使用独立 worker，超时预算对该 worker 内全部5个BS生效。
+
+运行结束自动输出大表及 `results.csv`、`summary.json`；每组保留原始计时数据。
+汇总包含 transport、BS、目标miss%、正确性、mean/p50/p99及按mean计算的改善比例。
+这里是算子链完整图，不是服务TPOT。实际miss和读取数量仍保留在各case报告中。
+设备执行失败会停止后续任务；已完成结果保留，未完成项不能当作性能样本。

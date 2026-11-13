@@ -1,5 +1,6 @@
 """Public test configuration, independent of ACL/PyTorch and device imports."""
 import argparse
+import math
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -13,6 +14,16 @@ def csv_values(value):
     if any(not item or item.strip() != item for item in values) or len(set(values)) != len(values):
         raise argparse.ArgumentTypeError('expected distinct comma-separated values')
     return tuple(values)
+
+
+def miss_values(value):
+    try:
+        values = tuple(float(item) for item in csv_values(value))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError('miss must be comma-separated percentages') from error
+    if any(not math.isfinite(item) or not 0 <= item <= 100 for item in values) or len(set(values)) != len(values):
+        raise argparse.ArgumentTypeError('miss percentages must be distinct finite values in 0..100')
+    return values[0] if len(values) == 1 else values
 
 
 def batch_values(value):
@@ -53,7 +64,7 @@ def configuration(argv=None):
         if mode in ('bench', 'diagnose'):
             command.add_argument('--input', choices=('synthetic', 'real'), default='synthetic')
             # None distinguishes absent arguments from explicitly supplied defaults on real input.
-            command.add_argument('--miss-percent', type=float)
+            command.add_argument('--miss-percent', type=miss_values if mode == 'bench' else float)
             command.add_argument('--queries', type=int)
             command.add_argument('--batches', type=batch_values)
             command.add_argument('--seed', type=int)
@@ -99,7 +110,8 @@ def configuration(argv=None):
             for key, default in synthetic.items():
                 if getattr(args, key) is None:
                     setattr(args, key, default)
-            if not 0 <= args.miss_percent <= 100 or args.queries != 4:
+            misses = args.miss_percent if isinstance(args.miss_percent, tuple) else (args.miss_percent,)
+            if any(not math.isfinite(miss) or not 0 <= miss <= 100 for miss in misses) or args.queries != 4:
                 parser.error('current full-chain fixture supports Q4 and miss in 0..100')
             if (args.history % 256 or args.resident % 256 or args.resident < 2048
                     or args.history <= args.resident + 4 or args.index_heads not in (32, 64)

@@ -16,6 +16,15 @@ from runner import progress
 ROOT = Path(__file__).resolve().parents[4]
 
 
+def bench_jobs(config):
+    """One isolated worker per miss rate; each reuses the shared runtime-shape build."""
+    misses = config.miss_percent if isinstance(getattr(config, 'miss_percent', None), tuple) else None
+    if misses is None:
+        return [(config.mode, config)]
+    return [(f'bench_miss{miss:g}', SimpleNamespace(**{**vars(config), 'miss_percent': miss}))
+            for miss in misses]
+
+
 def runner_options(config):
     """Translate workload options to the existing formal URMA test runner.
 
@@ -211,7 +220,7 @@ def dispatch(config):
     elif config.mode == 'check':
         jobs = check_jobs(config)
     else:
-        jobs = [(config.mode, config)]
+        jobs = bench_jobs(config)
     atomic_json(run / 'config.json', {key: str(value) if isinstance(value, Path) else value
                                     for key, value in vars(config).items()})
     rows, stopped = [], False
