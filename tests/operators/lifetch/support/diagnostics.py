@@ -453,15 +453,15 @@ def level_one_tables(result):
                 if metric:
                     bandwidth.append([label, repeat, name, metric['bytes'], metric['span_us'], metric['GBps']])
                     scopes[name] = metric.get('note', metric.get('scope', 'software-observed'))
-    lines += table('Stage distribution (overlapping stages must not be added)',
-                   ['Path', 'Stage', 'Mean', 'p50', 'Min', 'Max', 'N'], stages)
+    lines += ['ALGORITHM / KV TRAFFIC | per request, Q4 unique-demand basis.', '']
     lines += table('Per-request counts', ['Path', 'Repeat', 'Request', 'Hot', 'Demand', 'Cold',
                                           'Prefetch', 'Final', 'KV bytes'], counts)
+    lines += ['TIME BREAKDOWN | us; profiled passes are separate from performance samples.', '']
+    lines += table('Stage distribution (overlapping stages must not be added)',
+                   ['Path', 'Stage', 'Mean', 'p50', 'Min', 'Max', 'N'], stages)
     lines += table('Effective bandwidth (decimal GB/s)',
                    ['Path', 'Repeat', 'Scope', 'Bytes', 'Span us', 'GB/s'], bandwidth)
     lines += [f'{name}: {note}' for name, note in scopes.items()]
-    lines += ['INCOMPLETE: ' + value for value in dict.fromkeys(result['missing'])]
-    lines += ['N/A: ' + value for value in dict.fromkeys(result['unavailable'])]
     return '\n'.join(lines)
 
 
@@ -543,7 +543,8 @@ def level_two_tables(result):
                         *[event[key] / mhz if mhz else None for key in ('scan_cycles', 'candidate_cycles', 'post_cycles')],
                         event['bitmap_bytes'], event['candidate_count'], event['posted_count']])
                 if service_rows and result.get('level', 2) >= 3:
-                    lines.append(diagnostic_table('Prefetch service records',
+                    algorithm_lines.append(f"Source: {capture['source']} | repeat={repeat}")
+                    algorithm_lines.append(diagnostic_table('Prefetch service records',
                         ['Event', 'Service core', 'Epoch', 'Scan us', 'Candidates us', 'Post us', 'Bitmap bytes', 'Candidates', 'Posted'], service_rows))
                 li_rows = []
                 for request in requests:

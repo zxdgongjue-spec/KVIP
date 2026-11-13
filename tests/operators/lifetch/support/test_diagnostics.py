@@ -133,6 +133,8 @@ def test_level_one_terminal_is_tables_not_raw_dump(tmp_path, capsys):
     assert 'Stage distribution' in output and 'Per-request counts' in output
     assert 'Effective bandwidth' in output
     assert 'ACCOUNTING repeat=' not in output
+    assert output.index('ALGORITHM / KV TRAFFIC') < output.index('TIME BREAKDOWN')
+    assert 'N/A: ' not in output and 'INCOMPLETE: ' not in output
     assert (tmp_path / 'level1_summary.log').read_text().strip() == output.strip()
 
 
