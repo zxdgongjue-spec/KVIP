@@ -121,6 +121,7 @@ def account(events, name, elapsed, *, full=False, fused_final=False):
         event_us=elapsed,
         kernel_span_us=span,
         stages_us=durations,
+        intervals_us=groups,
         inter_kernel_gap_us=span - busy,
         boundary_residual_us=residual,
         note="Boundary residual includes event-to-kernel edges and clock measurement error; not proven CPU idle",
@@ -261,7 +262,7 @@ def account_ubmem(events, name, elapsed):
     busy = sum(end - start for start, end in intervals)
     overlap = sum(timings.values()) - busy
     timings["update"] = sum(timings[key] for key in ("update_owned", "update_outputs", "apply_owned"))
-    return {"stages_us": timings, "kernel_span_us": span, "inter_kernel_gap_us": span - busy,
+    return {"stages_us": timings, "intervals_us": stages, "kernel_span_us": span, "inter_kernel_gap_us": span - busy,
             "boundary_residual_us": elapsed - span, "overlap_us": overlap,
             "fetch_separate": bool(stages["fetch"]),
             "note": "resolve includes inline fetch when fetch_separate is false; boundary includes measurement edges"}

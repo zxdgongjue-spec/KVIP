@@ -165,9 +165,25 @@ synthetic参数与real选择参数二选一：real不接受合成负载参数BS/
 
 | level | 时间信息 | 算法信息 | Fetch信息 |
 | --- | --- | --- | --- |
-| 1 | 实际kernel/阶段起止及mean/p50/min/max，µs | 每轮/请求的初始cold、需求、总预取、补拉、总字节 | 预取/补拉/合并有效带宽及实际队列配置 |
-| 2 | level1 加所有活跃核、请求、Q的工作/等待和最晚结束核 | 每窗口候选/阈值/预取、逐Q去重/补拉、unused及跨轮趋势 | 每Q/核提交与完成区间、冲突/在途等待 |
+| 1 | 实际kernel/阶段起止及mean/p50/min/max，µs | 每轮/请求的初始cold、需求、总预取、补拉、总字节 | 预取/补拉/合并有效带宽（明确事件口径） |
+| 2 | level1 加所有活跃核、请求、Q的工作/等待和最晚结束核 | 每窗口候选/阈值/预取、逐Q去重/补拉、unused及跨轮趋势 | 每Q/核提交与完成区间、冲突/在途等待及实际队列/搬运配置 |
 | 3 | level2 加所选阶段全部已定义内部步骤的cycles、调用次数、处理量 | 同level2，保留详细身份关联以追踪分类结果 | 细分打包/提交/完成等待；选中fetch时自动追加Fetch-only对照 |
+
+level1逐采样展示每请求的有效hot、唯一需求、初始cold、预取、补拉和KV字节，以及各实际kernel的起止、持续时间、kernel间隙和边界残差。起止以该次路径首个kernel为零点，不能跨串行/融合两次回放拼接。
+
+当前level1带宽复用已有诊断时间戳，因此仍启用共用的设备打点开关；不额外启动Fetch-only、不输出逐核CSV，不声称设备内部细粒度写入已完全关闭。正式性能仍取独立无打点回放。最终Get带宽明确标记调用区间；精确提交到完成跨度尚缺时显示限制。零传输带宽为N/A，有传输却缺失带宽事件则标INCOMPLETE。队列和搬运配置属于level2/3。
+
+示例（数值仅演示格式）：
+
+```text
+DIAG level=1 transport=urma trace=COMPLETE
+li: mean=210.000 p50=210.000 min=209.000 max=211.000 us n=3
+STAGE repeat=0 stage=li start_us=10.000 end_us=220.000 duration_us=210.000
+ACCOUNTING repeat=0 gap_us=0.2 boundary_us=4.0
+  request=0 initial_hot_valid=16384 selected_unique=2253 initial_cold=410 prefetch=128 final=346 KV_read_bytes=310944
+BANDWIDTH repeat=0 metric=final_get_bandwidth bytes=226976 span_us=40.0 GB/s=5.6744
+  scope: Global elapsed span includes gaps/dependencies; not first WQE to hardware completion
+```
 
 ### 6.2 阶段及步骤
 

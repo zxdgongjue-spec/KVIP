@@ -108,6 +108,8 @@ def summarize(directory, config):
                     span = scope['interval_cycles'] / mhz
                     item['prefetch_bandwidth'] = dict(bytes=scope['bytes'], span_us=span,
                         GBps=scope['bytes'] / span / 1000, completion='software_observed',
+                        note=('URMA prefetch submission to software-observed CQ completion' if config.transport == 'urma'
+                              else 'UBmem prefetch start to software-observed copy completion'),
                         first_submit_cycles=scope['first_doorbell'], last_complete_cycles=scope['last_cq_observed'])
                 if raw:
                     try:
@@ -187,6 +189,27 @@ def summarize(directory, config):
         'window candidates/threshold/budget suppression: native threshold log not enabled by the current public operator',
         *([] if native_paths else ['serial stage attribution: no native stage capture in this run']),
     ]
+    if config.level == 1:
+        result['unavailable'] = [value for value in result['unavailable']
+                                 if not value.startswith(('useful/', 'window candidates/'))]
+    if 'fetch' in config.stages:
+        for capture in result['captures']:
+            if capture.get('path') == 'serial':
+                continue
+            for sample in capture['samples']:
+                if 'combined_observed_bandwidth' not in sample:
+                    only = ('final_get_bandwidth' if sample.get('prefetch') == 0 else
+                            'prefetch_bandwidth' if sample.get('final') == 0 else None)
+                    if only and only in sample:
+                        sample['combined_observed_bandwidth'] = dict(sample[only])
+                for metric in ('prefetch_bandwidth', 'final_get_bandwidth', 'combined_observed_bandwidth'):
+                    if metric not in sample and ((metric == 'prefetch_bandwidth' and sample.get('prefetch') == 0)
+                            or (metric == 'final_get_bandwidth' and sample.get('final') == 0)
+                            or (metric == 'combined_observed_bandwidth' and sample.get('prefetch') == 0 and sample.get('final') == 0)):
+                        sample[metric] = dict(bytes=0, span_us=None, GBps=None, note='No transfers; bandwidth N/A')
+                    if metric not in sample:
+                        result['missing'].append(
+                            f"{capture['source']} repeat={sample['repeat']}: {metric} unavailable")
     if config.level == 3 and 'fetch' in config.stages:
         fetch_paths = sorted(directory.rglob('fetch_only.json'))
         result['fetch_only'] = [dict(source=str(path), **json.loads(path.read_text()))
@@ -205,7 +228,8 @@ def summarize(directory, config):
         result['trace'] = 'INCOMPLETE'
     atomic_json(directory / 'diagnostic.json', result)
     lines = [f"DIAG level={config.level} transport={config.transport} trace={result['trace']}",
-             'Separate profiled pass; times are not added across overlapping cores.']
+             'Separate profiled pass; times are not added across overlapping cores.',
+             'Synthetic repeats restore the same state; they are not consecutive decode rounds.']
     for capture in result['captures']:
         lines.append(f"source={capture['source']}")
         for stage, values in capture['stage_summary'].items():
@@ -213,11 +237,23 @@ def summarize(directory, config):
                          f"min={values['min_us']:.3f} max={values['max_us']:.3f} us n={values['samples']}")
     for capture in result['captures']:
         for sample in capture['samples']:
+            repeat = sample.get('repeat', sample.get('round'))
+            accounting = sample.get('accounting', {})
+            intervals = accounting.get('intervals_us', {})
+            origin = min((start for spans in intervals.values() for start, end in spans), default=0)
+            for stage, spans in intervals.items():
+                if stage not in capture['stage_summary']:
+                    continue
+                for start, end in spans:
+                    lines.append(f'STAGE repeat={repeat} stage={stage} start_us={start-origin:.3f} '
+                                 f'end_us={end-origin:.3f} duration_us={end-start:.3f}')
+            lines.append(f"ACCOUNTING repeat={repeat} gap_us={accounting.get('inter_kernel_gap_us', 'N/A')} "
+                         f"boundary_us={accounting.get('boundary_residual_us', 'N/A')}")
             for metric in ('prefetch_bandwidth', 'final_get_bandwidth', 'combined_observed_bandwidth'):
                 if metric in sample:
                     bandwidth = sample[metric]
                     lines.append(f"BANDWIDTH repeat={sample['repeat']} metric={metric} "
-                                 f"bytes={bandwidth['bytes']} span_us={bandwidth['span_us']} GB/s={bandwidth['GBps']}")
+                                 f"bytes={bandwidth['bytes']} span_us={bandwidth['span_us'] if bandwidth['span_us'] is not None else 'N/A'} GB/s={bandwidth['GBps'] if bandwidth['GBps'] is not None else 'N/A'}")
                     if bandwidth.get('note'):
                         lines.append(f"  scope: {bandwidth['note']}")
             algorithm = sample.get('algorithm', {})
@@ -225,6 +261,10 @@ def summarize(directory, config):
             if totals:
                 lines.append(f"ALGORITHM repeat={sample['repeat']} source_round={sample.get('source_round', 'synthetic')} " + ' '.join(
                     f'{key}={value}' for key, value in totals.items()))
+                for request in algorithm['requests']:
+                    fields = ('initial_hot_valid', 'selected_unique', 'initial_cold', 'prefetch', 'final', 'KV_read_bytes')
+                    lines.append(f"  request={request['request']} " + ' '.join(
+                        f"{key}={request.get(key) if request.get(key) is not None else 'N/A'}" for key in fields))
                 if config.level >= 2:
                     for request in algorithm['requests']:
                         lines.append(f"  request={request['request']} "

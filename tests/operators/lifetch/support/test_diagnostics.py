@@ -70,3 +70,34 @@ def test_real_rounds_keep_separate_repeat_distributions(tmp_path):
     assert [capture['samples'][0]['source_round'] for capture in result['captures']] == [51, 52]
     assert 'source_round=51' in (tmp_path / 'diagnostic_summary.log').read_text()
     assert 'source_round=52' in (tmp_path / 'diagnostic_summary.log').read_text()
+
+
+def test_level_one_requests_intervals_and_zero_bandwidth(tmp_path):
+    for transport in ('urma', 'ubmem'):
+        root = tmp_path / transport
+        sample = dict(round=0, prefetch=0, final=0, algorithm=dict(
+            totals=dict(prefetch=0, final=0), requests=[dict(request=0,
+                initial_hot_valid=16384, selected_unique=2048, initial_cold=0,
+                prefetch=0, final=0, KV_read_bytes=0)]), accounting=dict(
+            stages_us=dict(li=10), intervals_us=dict(li=[[100, 110]]),
+            inter_kernel_gap_us=2, boundary_residual_us=3))
+        atomic_json(root / 'full_attribution.json', dict(samples=[sample]))
+        report = summarize(root, SimpleNamespace(iterations=1, level=1,
+                            stages=('li', 'fetch'), transport=transport))
+        assert report['trace'] == 'COMPLETE'
+        log = (root / 'diagnostic_summary.log').read_text()
+        assert 'request=0 initial_hot_valid=16384 selected_unique=2048 initial_cold=0' in log
+        assert 'start_us=0.000 end_us=10.000 duration_us=10.000' in log
+        assert 'GB/s=N/A' in log
+        assert 'window candidates' not in log
+        assert not (root / 'timeline.csv').exists()
+
+
+def test_level_one_missing_nonzero_transfer_timestamps_fails(tmp_path):
+    atomic_json(tmp_path / 'full_attribution.json', dict(samples=[dict(
+        round=0, prefetch=10, final=5, algorithm=dict(totals={}, requests=[]),
+        accounting=dict(stages_us=dict(resolve_update=20)))]))
+    result = summarize(tmp_path, SimpleNamespace(iterations=1, level=1,
+                       stages=('fetch',), transport='ubmem'))
+    assert result['trace'] == 'INCOMPLETE'
+    assert any('final_get_bandwidth unavailable' in value for value in result['missing'])
