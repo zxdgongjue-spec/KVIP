@@ -13,7 +13,8 @@ def test_incorrect_output_retains_measured_performance(tmp_path):
     assert not row['accepted']
     save_summary(tmp_path, [row])
     assert json.loads((tmp_path / 'summary.json').read_text())['cases'][0] == row
-    assert 'FAIL | 500.000 | 350.000 | 30.00%' in (tmp_path / 'summary.log').read_text()
+    text = (tmp_path / 'summary.log').read_text()
+    assert all(value in text for value in ('FAIL', '500.00', '350.00', '+30.00%'))
 
 
 def test_missing_timing_is_not_zero_or_success():

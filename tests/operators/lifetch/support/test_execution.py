@@ -120,4 +120,4 @@ def test_matrix_dispatch_collects_twenty_pairs_without_npu(tmp_path, monkeypatch
             (bs, miss) for bs in (1, 2, 4, 8, 16) for miss in (3, 5, 10, 15)}
         assert all(row['transport'] == transport and row['accepted'] for row in rows)
         assert all(row['serial_mean_us'] == 105 and row['fused_mean_us'] == 85 for row in rows)
-        assert 'serial p50/p99 us' in summary.with_name('summary.log').read_text()
+        assert 'Serial p50/p99' in summary.with_name('summary.log').read_text()

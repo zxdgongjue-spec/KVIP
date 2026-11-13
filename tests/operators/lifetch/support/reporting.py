@@ -79,18 +79,34 @@ def save_summary(directory, rows):
         writer.writeheader()
         writer.writerows(rows)
     temporary.replace(directory / 'results.csv')
-    lines = ['case | transport | BS | miss% | execution | correctness | serial mean us | fused mean us | reduction | serial p50/p99 us | fused p50/p99 us']
-    for row in rows:
+    headers = ['#', 'Transport', 'BS', 'Miss%', 'Execution', 'Check',
+               'Serial mean', 'Fused mean', 'Gain', 'Serial p50/p99', 'Fused p50/p99']
+    cells = []
+    for index, row in enumerate(rows, 1):
         def number(key):
             value = row.get(key)
-            return 'N/A' if value is None else f'{value:.3f}'
+            return '—' if value is None else f'{value:.2f}'
+        def percentiles(prefix):
+            return f"{number(prefix + '_p50_us')}/{number(prefix + '_p99_us')}"
+        miss = row.get('miss_percent')
         reduction = row.get('reduction')
-        delta = 'N/A' if reduction is None else f'{reduction:.2%}'
-        lines.append(f"{row['case']} | {row.get('transport', 'N/A')} | {row.get('batch', 'N/A')} | "
-                     f"{row.get('miss_percent', 'N/A')} | {row['execution']} | {row['correctness']} | "
-                     f"{number('serial_mean_us')} | {number('fused_mean_us')} | {delta} | "
-                     f"{number('serial_p50_us')}/{number('serial_p99_us')} | "
-                     f"{number('fused_p50_us')}/{number('fused_p99_us')}")
+        cells.append([str(index), row.get('transport') or '—', str(row.get('batch') or '—'),
+                      '—' if miss is None else f'{miss:g}', row['execution'], row['correctness'],
+                      number('serial_mean_us'), number('fused_mean_us'),
+                      '—' if reduction is None else f'{reduction:+.2%}',
+                      percentiles('serial'), percentiles('fused')])
+    widths = [max(len(line[col]) for line in [headers, *cells]) for col in range(len(headers))]
+    def formatted(line):
+        return ' | '.join(value.ljust(width) if col in (1, 4, 5) else value.rjust(width)
+                          for col, (value, width) in enumerate(zip(line, widths)))
+    separator = '-+-'.join('-' * width for width in widths)
+    lines = ['LIFetch comparison | time: us | Gain: reduction in mean time; positive is faster',
+             formatted(headers), separator, *(formatted(line) for line in cells), separator,
+             f"Completed: {sum(row['execution'] == 'COMPLETED' for row in rows)}/{len(rows)}; "
+             f"correctness PASS: {sum(row['correctness'] == 'PASS' for row in rows)}/{len(rows)}"]
+    for index, row in enumerate(rows, 1):
+        if row.get('mode') == 'check' or row['execution'] != 'COMPLETED' or row['correctness'] != 'PASS':
+            lines.append(f"[{index}] {row['case']}" + (f": {row['reason']}" if row.get('reason') else ''))
     (directory / 'summary.log').write_text('\n'.join(lines) + '\n')
 
 
