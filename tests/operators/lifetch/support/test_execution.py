@@ -1,4 +1,6 @@
 """Configuration adapters cannot silently change workloads or enable tracing."""
+import pytest
+
 from execution import runner_options
 from workloads import configuration
 
@@ -133,3 +135,27 @@ def test_nested_miss_progress_reaches_supervised_worker(tmp_path):
     progress(child, 'BS=8: paired benchmark')
     assert (child / 'stage.log').read_text().strip() == 'BS=8: paired benchmark'
     assert (tmp_path / 'stage.log').read_text().strip() == 'miss15: BS=8: paired benchmark'
+
+
+@pytest.mark.parametrize('show_details', [False, True])
+@pytest.mark.parametrize('exit_code', [0, 1])
+def test_supervisor_details_saved_and_failures_visible(tmp_path, capsys, show_details, exit_code):
+    import sys
+    from runner import supervise
+
+    (tmp_path / 'cases.log').write_text('DETAIL_COUNTERS prefetch=128\n')
+    program = (
+        'import json, pathlib, sys; '
+        'pathlib.Path(sys.argv[1]).write_text(json.dumps({"exit_code": int(sys.argv[2])})); '
+        'print("FAILURE_REASON" if int(sys.argv[2]) else "worker detail"); '
+        'sys.exit(int(sys.argv[2]))'
+    )
+    code = supervise([sys.executable, '-c', program,
+                      str(tmp_path / 'worker-result.json'), str(exit_code)],
+                     tmp_path, show_case_details=show_details)
+    output = capsys.readouterr().out
+    assert code == exit_code
+    assert ('DETAIL_COUNTERS' in output) == show_details
+    assert 'DETAIL_COUNTERS' in (tmp_path / 'summary.log').read_text()
+    if exit_code:
+        assert 'FAILURE_REASON' in output

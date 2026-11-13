@@ -161,7 +161,8 @@ def run(args, run_dir):
                 workers=workers,
             )
             try:
-                progress(run_dir, f"BS={batch}: graph A/B, AIV maintenance and stateful checks; logs={folder}")
+                stage = "graph A/B and correctness checks" if getattr(args, "mode", None) == "bench" else "graph A/B, AIV maintenance and stateful checks"
+                progress(run_dir, f"BS={batch}: {stage}; logs={folder}")
                 report = run_device(
                     args,
                     batch,

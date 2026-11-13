@@ -112,7 +112,7 @@ def launch(config, directory):
     command = [sys.executable, '-u', '-X', 'faulthandler', str(Path(__file__).resolve()),
                str(directory / 'config.json')]
     return supervise(command, directory, timeout_seconds=config.timeout_seconds,
-                     environment=environment)
+                     environment=environment, show_case_details=config.mode != 'bench')
 
 
 def run_config(path, shared_pool=None):

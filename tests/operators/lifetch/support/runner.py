@@ -42,7 +42,7 @@ def compiler_error(path, before=4, after=10):
     return []
 
 
-def supervise(command, run, heartbeat_seconds=20, timeout_seconds=300, environment=None):
+def supervise(command, run, heartbeat_seconds=20, timeout_seconds=300, environment=None, show_case_details=True):
     """Only a checked worker completion marker plus exit code zero means PASS."""
     run = Path(run)
     summary = run / "summary.log"
@@ -110,8 +110,9 @@ def supervise(command, run, heartbeat_seconds=20, timeout_seconds=300, environme
     stage = (run / "stage.log").read_text().strip() if (run / "stage.log").exists() else "startup"
     lines = [f"{'PASS' if passed else 'FAIL'}: {detail}; elapsed={time.monotonic() - started:.1f}s; stage={stage}"]
     cases = run / "cases.log"
-    if cases.exists():
-        lines.extend(cases.read_text().splitlines())
+    case_lines = cases.read_text().splitlines() if cases.exists() else []
+    if show_case_details:
+        lines.extend(case_lines)
     if not passed:
         for isolation in run.rglob("streaming_isolation.log"):
             lines.append(f"STREAMING ISOLATION: {isolation.read_text().strip()}")
@@ -141,6 +142,7 @@ def supervise(command, run, heartbeat_seconds=20, timeout_seconds=300, environme
             lines.append(f"--- {path.relative_to(run)} (tail) ---")
             lines.extend(log_tail(path))
     lines.append(f"Full logs: {run}")
-    summary.write_text("\n".join(lines) + "\n")
+    saved_lines = lines if show_case_details else [*lines, *case_lines]
+    summary.write_text("\n".join(saved_lines) + "\n")
     print("\n".join(lines), flush=True)
     return 0 if passed else 1
