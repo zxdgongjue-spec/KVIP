@@ -32,6 +32,12 @@ extern "C" __global__ __aicore__ void v9_s2_score_kernel(GM_ADDR bindings) {
         16384,128,shape.resident,0,shape.aicCount};
 #define P(i) reinterpret_cast<GM_ADDR>(a[i])
     op.Init(P(0),P(1),P(2),P(3),P(4),P(5),P(6),P(7),P(9),P(12),&tiling,&pipe);
+    // ProcessVec1 uses runtimeShape_.resident. Set the context even though
+    // this mode suppresses Hit and Progress publication.
+    if ASCEND_IS_AIV {
+        op.vectorService.SetRotationContext(P(14));
+        op.vectorService.SetPrefixStorage(P(13));
+    }
     op.ConfigureSingleQueryScoreShard(groups);
     op.Process();
 #undef P
