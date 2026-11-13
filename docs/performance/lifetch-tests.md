@@ -424,3 +424,6 @@ check要求正确性及指定分支覆盖通过；bench独立报告执行、计�
 level1终端按阶段耗时、每请求计数、有效带宽三张对齐表展示；不重复打印旧case摘要。
 `level1_summary.log`保存同样的简表，`diagnostic_summary.log`和`diagnostic.json`保留原始区间与完整证据。
 预取提交时间戳缺失时，仅在已有服务起点与完成观察点有效的情况下提供service-span带宽，明确包含控制开销；不将其标为精确doorbell到CQ跨度。没有有效区间仍标INCOMPLETE。
+
+level2在level1简表之后，按每次采样独立展示：活跃block及最晚结束block、各核工作/等待区间、LI分类、逐Q Resolver/Update、窗口预取/unused、逐Q需求/补拉。`timeline.csv`从level2开始包含全部已定义步骤；`level2_summary.log`保存终端表格。
+预取服务记录保留设备core/epoch字段、扫描/候选/提交周期、bitmap字节与计数，不将service core编号冒充请求编号。无有效打点记录显示N/A。URMA KVAF组计数每Fetch block只展示一次；UBmem不展示URMA CQ计数。资源几何取自实际捕获的block数，未采集的Jetty、在途上限及搬运配置明确标N/A。

@@ -134,3 +134,28 @@ def test_level_one_terminal_is_tables_not_raw_dump(tmp_path, capsys):
     assert 'Effective bandwidth' in output
     assert 'ACCOUNTING repeat=' not in output
     assert (tmp_path / 'level1_summary.log').read_text().strip() == output.strip()
+
+
+def test_level_two_tables_keep_replay_core_and_query_identity():
+    from diagnostics import level_two_tables
+    request = dict(batch=0, producer=[dict(resolve=20, output=10, pack=5, publish=5)],
+        update=[10, 30], update_wait=[5, 10], li=[],
+        core_timeline_raw=dict(batch=1, resolver_cores=3, workers_per_query=2, clock_mhz=10))
+    core = dict(block=3, role='fetch Q1 lane0', start_us=1., end_us=9., duration_us=8.,
+        stages=[dict(name='safe.KVAF_Get', start_us=2., end_us=8., duration_us=6.)],
+        KVAF_counters=dict(safe_post_cycles=10, safe_CQ_cycles=20,
+                          conflict_post_cycles=0, conflict_CQ_cycles=0))
+    sample = dict(repeat=2, requests=[request], timeline=dict(cores=[core], last_block=3,
+        observed_span_us=9., clock_mhz=10), algorithm=dict(requests=[dict(request=0,
+        windows=[dict(window=1, posted=2, bytes=1312, unused=1, cumulative_posted=2, cumulative_unused=1)],
+        queries=[dict(query=1, topk=2048, unique=2048, cross_q_duplicate=0,
+                      new_unique=2048, initial_local=2046, final_posted=1)])]))
+    result = dict(level=2, transport='urma', trace='COMPLETE', missing=[], unavailable=[],
+        captures=[dict(source='test', stage_summary={}, samples=[sample])])
+    output = level_two_tables(result)
+    for value in ('repeat=2', 'Last block=3', 'fetch Q1 lane0', 'Window prefetch / unused',
+                  'Per-Q demand / repair', 'Per-Q resolver / update', '1.000', '2.000'):
+        assert value in output
+    assert 'URMA group counters' in output
+    result['transport'] = 'ubmem'
+    assert 'URMA group counters' not in level_two_tables(result)

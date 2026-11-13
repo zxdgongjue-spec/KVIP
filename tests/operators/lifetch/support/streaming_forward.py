@@ -132,6 +132,16 @@ class StreamingForward(LIFetchForward):
         if self.q_workers and hasattr(self, "rotating"):
             events = self.rotating.events.cpu().numpy().reshape(-1, 128).view('<u8')
             ubmem = hasattr(self.rotating, "ubmem_status")
+            services = []
+            for event_index, event in enumerate(events):
+                if not int(event[0]) or int(event[1]) < int(event[0]):
+                    continue  # Profiling-disabled events are not measured zero-work events.
+                words = event.view('<u4')
+                services.append(dict(event=event_index, core=int(words[4]), epoch=int(words[5]),
+                    begin_cycles=int(event[0]), end_cycles=int(event[1]),
+                    scan_cycles=int(event[5]), candidate_cycles=int(event[6]), post_cycles=int(event[7]),
+                    bitmap_bytes=int(event[8]), candidate_count=int(event[9]), posted_count=int(event[10])))
+            result[0]['prefetch_services'] = services
             first = events[:, 0 if ubmem else 11]
             last = events[:, 1 if ubmem else 12]
             service_scope = ubmem or not np.any(first)
