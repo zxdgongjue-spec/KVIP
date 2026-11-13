@@ -101,3 +101,36 @@ def test_level_one_missing_nonzero_transfer_timestamps_fails(tmp_path):
                        stages=('fetch',), transport='ubmem'))
     assert result['trace'] == 'INCOMPLETE'
     assert any('final_get_bandwidth unavailable' in value for value in result['missing'])
+
+
+def test_byte_backed_topk_is_decoded_as_int32(monkeypatch):
+    import numpy as np
+    import diagnostics
+
+    class Tensor:
+        def __init__(self, data):
+            self.data = data
+        def cpu(self):
+            return self
+        def numpy(self):
+            return self.data
+
+    selected = np.arange(4 * 4 * 2048, dtype=np.int32).reshape(4, 4, 2048)
+    rotating = SimpleNamespace(runtime_shape=SimpleNamespace(batch=4, resident=16384, tokenBytes=656),
+        rounds=8, arguments=[None] * 9 + [Tensor(selected.view(np.uint8))],
+        mapping=Tensor(np.zeros((4, 1))), rows=Tensor(np.zeros((4, 256), dtype=np.uint32)),
+        final_posts=Tensor(np.zeros((4, 4, 6))))
+    monkeypatch.setattr(diagnostics, 'algorithm_counts', lambda mapping, tokens, *args, **kw: tokens)
+    assert np.array_equal(diagnostics.algorithm_after(rotating, {}), selected)
+
+
+def test_level_one_terminal_is_tables_not_raw_dump(tmp_path, capsys):
+    atomic_json(tmp_path / 'full_attribution.json', dict(samples=[dict(round=0,
+        prefetch=0, final=0, algorithm=dict(totals={}, requests=[]),
+        accounting=dict(stages_us=dict(li=12)))]))
+    summarize(tmp_path, SimpleNamespace(iterations=1, level=1, stages=('li',), transport='urma'))
+    output = capsys.readouterr().out
+    assert 'Stage distribution' in output and 'Per-request counts' in output
+    assert 'Effective bandwidth' in output
+    assert 'ACCOUNTING repeat=' not in output
+    assert (tmp_path / 'level1_summary.log').read_text().strip() == output.strip()

@@ -129,15 +129,19 @@ class StreamingForward(LIFetchForward):
                                input_and_bitmap=int(p[2]-p[1]), initialize=int(p[3]-p[2]),
                                metadata=int(u[23]-u[22]), consumer_start=int(u[10]),
                                consumer_finish=int(u[24]), producer_finish=int(p[8])))
-        if self.q_workers and hasattr(self, "rotating") and not hasattr(self.rotating, "ubmem_status"):
+        if self.q_workers and hasattr(self, "rotating"):
             events = self.rotating.events.cpu().numpy().reshape(-1, 128).view('<u8')
-            first = events[:, 11]
-            last = events[:, 12]
+            ubmem = hasattr(self.rotating, "ubmem_status")
+            first = events[:, 0 if ubmem else 11]
+            last = events[:, 1 if ubmem else 12]
+            service_scope = ubmem or not np.any(first)
+            if service_scope:
+                first, last = events[:, 0], events[:, 1]
             first_nonzero = first[first != 0]
             last_nonzero = last[last != 0]
             rows = self.rotating.rows.cpu().numpy().view(np.uint32).reshape(self.batch, -1)
             prefetch_count = int(rows[:, 9].astype(np.uint64).sum())
-            finish = [int(fetch[b, 103]) for b in range(self.batch) if int(rows[b, 9]) and int(fetch[b, 103])]
+            finish = [int(fetch[b, 103] or fetch[b, 100]) for b in range(self.batch) if int(rows[b, 9]) and int(fetch[b, 103] or fetch[b, 100])]
             if prefetch_count and len(first_nonzero) and finish:
                 start = int(first_nonzero.min())
                 end = max(finish)
@@ -145,7 +149,8 @@ class StreamingForward(LIFetchForward):
                     requests=prefetch_count, bytes=prefetch_count * self.rotating.runtime_shape.tokenBytes,
                     first_doorbell=start, last_doorbell=int(last_nonzero.max()),
                     last_cq_observed=end, interval_cycles=max(0, end - start),
-                    note='first doorbell to last CQ observed; includes polling delay and LI-window gaps')
+                    note=('Prefetch service entry to software-observed completion; submission timestamps unavailable, includes control gaps' if service_scope else
+                          'first doorbell to software-observed completion; join return used when CQ was already drained'))
         if self.q_workers:
             result[0]['core_timeline_raw'] = dict(
                 batch=self.batch, workers_per_query=self.q_workers, resolver_cores=self.resolver_cores,

@@ -108,8 +108,7 @@ def summarize(directory, config):
                     span = scope['interval_cycles'] / mhz
                     item['prefetch_bandwidth'] = dict(bytes=scope['bytes'], span_us=span,
                         GBps=scope['bytes'] / span / 1000, completion='software_observed',
-                        note=('URMA prefetch submission to software-observed CQ completion' if config.transport == 'urma'
-                              else 'UBmem prefetch start to software-observed copy completion'),
+                        note=scope.get('note', 'Prefetch start to software-observed completion'),
                         first_submit_cycles=scope['first_doorbell'], last_complete_cycles=scope['last_cq_observed'])
                 if raw:
                     try:
@@ -286,7 +285,12 @@ def summarize(directory, config):
             writer = csv.DictWriter(output, fieldnames=list(timeline_rows[0]))
             writer.writeheader()
             writer.writerows(timeline_rows)
-    print('\n'.join(lines), flush=True)
+    if config.level == 1:
+        rendered = level_one_tables(result)
+        (directory / 'level1_summary.log').write_text(rendered + '\n')
+        print(rendered, flush=True)
+    else:
+        print('\n'.join(lines), flush=True)
     return result
 
 
@@ -401,8 +405,55 @@ def algorithm_after(rotating, before):
     try:
         return algorithm_counts(
             rotating.mapping.cpu().numpy(),
-            rotating.arguments[9].cpu().numpy().reshape(shape.batch, 4, 2048),
+            rotating.arguments[9].cpu().numpy().view(np.int32).reshape(shape.batch, 4, 2048),
             rotating.rows.cpu().numpy().view(np.uint32), rotating.final_posts.cpu().numpy(),
             shape.resident, rotating.rounds, token_bytes=shape.tokenBytes, **before)
     except ValueError as error:
         return {'error': str(error)}
+
+
+def level_one_tables(result):
+    """Compact terminal view; raw intervals and scopes remain in diagnostic.json."""
+    def cell(value):
+        return 'N/A' if value is None else f'{value:.3f}' if isinstance(value, float) else str(value)
+
+    def table(title, headers, rows):
+        values = [headers, *[[cell(value) for value in row] for row in rows]]
+        widths = [max(len(row[i]) for row in values) for i in range(len(headers))]
+        def line(row):
+            return ' | '.join(value.ljust(width) for value, width in zip(row, widths))
+        return [title, line(values[0]), '-+-'.join('-' * width for width in widths),
+                *[line(row) for row in values[1:]], '']
+
+    lines = [f"DIAG level=1 transport={result['transport']} trace={result['trace']}",
+             'Times: us. Separate profiled replays; synthetic repeats are not decode rounds.', '']
+    stages, counts, bandwidth = [], [], []
+    scopes = {}
+    for index, capture in enumerate(result['captures'], 1):
+        path = capture.get('path', 'fused')
+        label = f'{index}:{path}'
+        lines.append(f"[{label}] {capture['source']}")
+        for stage, values in capture['stage_summary'].items():
+            stages.append([label, stage, values['mean_us'], values['p50_us'],
+                           values['min_us'], values['max_us'], values['samples']])
+        for sample in capture['samples']:
+            repeat = sample.get('repeat', sample.get('round'))
+            for request in sample.get('algorithm', {}).get('requests', []):
+                counts.append([label, repeat, request['request'], *[request.get(key) for key in
+                    ('initial_hot_valid', 'selected_unique', 'initial_cold', 'prefetch', 'final', 'KV_read_bytes')]])
+            for key, name in (('prefetch_bandwidth', 'prefetch'), ('final_get_bandwidth', 'final Get'),
+                              ('combined_observed_bandwidth', 'combined')):
+                metric = sample.get(key)
+                if metric:
+                    bandwidth.append([label, repeat, name, metric['bytes'], metric['span_us'], metric['GBps']])
+                    scopes[name] = metric.get('note', metric.get('scope', 'software-observed'))
+    lines += table('Stage distribution (overlapping stages must not be added)',
+                   ['Path', 'Stage', 'Mean', 'p50', 'Min', 'Max', 'N'], stages)
+    lines += table('Per-request counts', ['Path', 'Repeat', 'Request', 'Hot', 'Demand', 'Cold',
+                                          'Prefetch', 'Final', 'KV bytes'], counts)
+    lines += table('Effective bandwidth (decimal GB/s)',
+                   ['Path', 'Repeat', 'Scope', 'Bytes', 'Span us', 'GB/s'], bandwidth)
+    lines += [f'{name}: {note}' for name, note in scopes.items()]
+    lines += ['INCOMPLETE: ' + value for value in dict.fromkeys(result['missing'])]
+    lines += ['N/A: ' + value for value in dict.fromkeys(result['unavailable'])]
+    return '\n'.join(lines)

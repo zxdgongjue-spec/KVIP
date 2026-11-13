@@ -30,3 +30,12 @@ def test_cpu_launch_names_are_not_device_timings():
     trace = events()
     trace[-1]['cat'] = 'cpu_op'
     assert 'error' in account_native(trace, 'replay', 80)
+
+
+def test_native_known_device_names_without_category():
+    trace = events()
+    for event in trace:
+        event.pop('cat', None)
+    result = account_native(trace, 'replay', 100)
+    assert 'error' not in result
+    assert set(result['stages_us']) == {'li', 'lidu_prepare', 'fetch'}

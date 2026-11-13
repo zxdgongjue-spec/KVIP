@@ -467,7 +467,7 @@ def account_native(events, name, elapsed):
         'fetch': ('kvafexecutebatchgetaivkernelv2',),
     }
     for event in events:
-        if event.get('ph') != 'X' or 'kernel' not in (event.get('cat') or '').lower():
+        if event.get('ph') != 'X' or (event.get('cat') and 'kernel' not in event['cat'].lower()):
             continue
         begin = float(Decimal(str(event['ts'])) - origin)
         end = begin + float(event.get('dur', 0))
@@ -477,6 +477,8 @@ def account_native(events, name, elapsed):
         stage = next((stage for stage, names in aliases.items()
                       if any(normalized.startswith(prefix) for prefix in names)), None)
         if stage is None:
+            if not event.get('cat'):
+                continue  # Untagged CPU scopes are not evidence of device execution.
             unknown.append(dict(name=event['name'], start_us=begin, end_us=end))
         else:
             groups.setdefault(stage, []).append((begin, end))
