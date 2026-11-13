@@ -82,10 +82,12 @@ def test_p1_c0_payload_fixture_does_not_expand_silently(lifetch_cli):
     assert exc.value.code == 2
 
 
-def test_p1_c1_cold_probe_stays_h8192_r2048(lifetch_cli):
+def test_p1_c1_cold_probe_stays_h8192_r2048(lifetch_cli, capsys):
+    # R=2048 must pass the P1-C0 guard and reach the P1-C1 H=8192 guard.
     with pytest.raises(SystemExit) as exc:
         lifetch_cli.main(cli_args(
-            131072, 8192, 64, "--epoch-audit-profile", "--prefetch-payload-audit",
+            131072, 2048, 64, "--epoch-audit-profile", "--prefetch-payload-audit",
             "--cold-prefetch-probe", "--miss-percent", str(100 / 2048),
         ))
     assert exc.value.code == 2
+    assert "P1-C1 cold-prefetch probe retains its H8192/R2048 fixture" in capsys.readouterr().err
