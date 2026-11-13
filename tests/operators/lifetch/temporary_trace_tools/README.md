@@ -95,3 +95,32 @@ python tests/operators/lifetch/temporary_trace_tools/profile_inputs.py   /tmp/li
 CPU执行，无训练、无NPU依赖。需要numpy和支持float8_e4m3fn的PyTorch。固定seed、每份输入抽样8192个Index向量及至多8192个标量，结果可复现；Q统计过滤padding并使用unpack_indices。Index先按物理池抽样，单列零向量比例及非零向量统计，不将“非零”误认为有效hot。输出profile.json（聚合统计）、layouts.json（布局元信息）、summary.log（回传日志及完整参数块），没有原始Q/Index值。
 
 本轮先据真实数值、scale和相关性选择生成器结构；分数重建、完整Q/Index联合模型及连续轮身份核验尚未在此脚本实现。summary末尾保留完整参数精度以供复制拟合，前面可读表格使用两位小数。
+
+### Aggregate generator and comparison (first iteration)
+
+Run on CPU using converted legacy captures; no NPU, training, or tensor upload:
+
+```bash
+python tests/operators/lifetch/temporary_trace_tools/fit_generator.py \
+  /tmp/lifetch-old-converted-v2 --output /tmp/lifetch-generator-v1
+```
+
+The script samples matching key/scale positions from active owners and valid
+logical lengths. Alternating captures fit aggregate quantiles and Q correlations;
+the other captures compare real and generated operands using the same CPU score
+formula and sampled selection fraction. Adjacent captures may share requests:
+this is a capture split, not independent-request validation.
+
+Send `summary.log`. `generator.json` contains only aggregate parameters and can
+be versioned; `generate(parameters, history, seed)` needs no real tensors.
+To evaluate revised parameters, add `--parameters /path/to/generator.json` and
+choose a new output directory. Defaults: 8192 sampled keys/request, selection
+fraction 2048/131072. Configure `--sample-keys` and `--top-fraction` if needed.
+
+This first model uses quantile marginals and correlated Q ranks. Index coordinates
+and key scales are drawn independently; score and selected-overlap differences
+measure the remaining modeling error. It does not yet model cache residency,
+position-dependent distributions or temporal evolution. Sampled score/selection
+statistics are not full-history TopK, prefetch counts, or NPU correctness checks.
+The existing benchmark generator is unchanged. Numerical CPU scores are a
+mathematical proxy, not a device rounding oracle.

@@ -76,7 +76,7 @@ def test_input_profile_decodes_bf16_and_excludes_padding(tmp_path):
     torch.save(dict(metadata=dict(schema=1,sample=0),before=dict(
         row_owners=torch.tensor([0,-1]),logical_ids=torch.arange(4096).reshape(1,-1),
         hot_valid=torch.ones(1,2048,dtype=torch.uint8),query_valid=torch.tensor([1,1,1,1,0,0,0,0]),
-        unpack_indices=torch.arange(8),query=query,keys=torch.full((4096,128),0x38,dtype=torch.uint8),
+        key_lengths=torch.tensor([4096,0]),unpack_indices=torch.arange(8),query=query,keys=torch.full((4096,128),0x38,dtype=torch.uint8),
         weights=torch.ones(8,2,dtype=torch.bfloat16),query_scale=torch.ones(8,2),key_scale=torch.ones(4096)),
         after=dict(logical_topk=torch.arange(2048,dtype=torch.int32).repeat(2,4,1))),source)
     root=tmp_path/'converted'
@@ -88,3 +88,27 @@ def test_input_profile_decodes_bf16_and_excludes_padding(tmp_path):
     np.testing.assert_allclose(result['q_cosine_mean'],np.ones((4,4)))
     assert result['cold_rate']['mean']==0.
     assert result==profile(root,samples=16)
+    from fit_generator import samples
+    paired = list(samples(root, 128, 7))
+    assert len(paired) == 1
+    assert paired[0]['keys'].shape == (128, 128)
+    np.testing.assert_array_equal(paired[0]['key_scale'], np.ones(128))
+
+
+def test_generator_reproducible_and_score_metrics():
+    from fit_generator import fit, generate, metrics
+    rng = np.random.default_rng(7)
+    row = dict(query=rng.normal(size=(4, 2, 128)).astype(np.float32),
+               keys=rng.normal(size=(256, 128)).astype(np.float32),
+               weights=np.ones((4, 2), np.float32), query_scale=np.ones((4, 2), np.float32),
+               key_scale=np.ones(256, np.float32))
+    parameters = fit([row])
+    first = generate(parameters, 256, 7)
+    second = generate(json.loads(json.dumps(parameters)), 256, 7)
+    for key in first:
+        np.testing.assert_array_equal(first[key], second[key])
+    measured = metrics(first, .1)
+    assert all(np.isfinite(v) for v in measured.values())
+    assert 0 <= measured['sample_top_jaccard'] <= 1
+    identical = dict(row, query=np.repeat(row['query'][:1], 4, axis=0))
+    assert metrics(identical, .1)['sample_top_jaccard'] == 1
