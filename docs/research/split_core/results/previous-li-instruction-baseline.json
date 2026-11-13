@@ -1,0 +1,104 @@
+{
+  "scope": "Historical mixed LI kernel: QK/score and TopK, not pure score production",
+  "batch": 1,
+  "queries": 4,
+  "history": 8192,
+  "resident": 4096,
+  "heads": 32,
+  "miss_percent": 0,
+  "application_rerun": false,
+  "export_origin": "SDK offline parse of original device0 raw companions",
+  "original_archive": "mainv4-baseline-zero-b1-h32-r1.tar.gz",
+  "archive_sha256": "70c1529c99d62e0d476dd904fbf4c151ab3805c0e7559f02be67cb1a96f698c4",
+  "binary_sha256": "e2893a4e1f21fc28f3fbe9d3ba03dec5d4d86109325b13a7a2b1c80791c66d7b",
+  "export_log_sha256": "bb08287b300a86a1745378da7af32ea442961ec89b91e3803a9b80493edca525",
+  "pure_qk_score_instruction_count": null,
+  "comparable_to_current_h128k": false,
+  "exported_instruction_calls": 154159,
+  "raw_main_pc_records": 155644,
+  "cores": [
+    {
+      "core": "core0.cubecore0",
+      "exported_calls": 25079,
+      "raw_main_pc_records": 25814,
+      "pipes": {
+        "FLOWCTRL": 2047,
+        "MTE2": 132,
+        "FIXP": 128,
+        "CUBE": 64,
+        "MTE1": 128,
+        "SCALAR": 22580
+      },
+      "footer": {
+        "core": 0,
+        "subcore": 0,
+        "start": 13712,
+        "tick": 84489,
+        "kernel_id": 0,
+        "block": 0,
+        "block_dim": 1
+      },
+      "raw_sha256": "443fa8a5ce2d52d86375a5f5a572f9abc95c7049afe36dd984c2e2f1667fb8d3",
+      "csv_sha256": "ce0f74b9944daf7c0d43ab71b1df9526962be73dfceb04a99c865d04f4a59cde",
+      "csv_path": "full-export/OPPROF_20261113093603_IXXRDMWUKCNYQKZZ/simulator/core0.cubecore0/core0.cubecore0_instr_exe_20261113093612150.csv"
+    },
+    {
+      "core": "core0.veccore0",
+      "exported_calls": 64540,
+      "raw_main_pc_records": 64915,
+      "pipes": {
+        "FLOWCTRL": 1699,
+        "RVECLD": 12040,
+        "MTE3": 139,
+        "RVECEX": 26533,
+        "PUSHQ": 352,
+        "MTE2": 17,
+        "SCALAR": 19393,
+        "RVECSU": 3009,
+        "RVECST": 1094,
+        "RVECLP": 264
+      },
+      "footer": {
+        "core": 0,
+        "subcore": 1,
+        "start": 13713,
+        "tick": 93006,
+        "kernel_id": 0,
+        "block": 0,
+        "block_dim": 1
+      },
+      "raw_sha256": "6655241418c48ff99f618ae12ec94465a230c05abfd4e7e1dada8860e3b2fc55",
+      "csv_sha256": "baeb3f3d831fe3716740ac85eb931e087108a869b3259f724b8c37706699b239",
+      "csv_path": "full-export/OPPROF_20261113093603_IXXRDMWUKCNYQKZZ/simulator/core0.veccore0/core0.veccore0_instr_exe_20261113093612173.csv"
+    },
+    {
+      "core": "core0.veccore1",
+      "exported_calls": 64540,
+      "raw_main_pc_records": 64915,
+      "pipes": {
+        "FLOWCTRL": 1699,
+        "RVECLD": 12040,
+        "MTE3": 139,
+        "RVECEX": 26533,
+        "PUSHQ": 352,
+        "MTE2": 17,
+        "SCALAR": 19393,
+        "RVECSU": 3009,
+        "RVECST": 1094,
+        "RVECLP": 264
+      },
+      "footer": {
+        "core": 0,
+        "subcore": 2,
+        "start": 13714,
+        "tick": 93506,
+        "kernel_id": 0,
+        "block": 0,
+        "block_dim": 1
+      },
+      "raw_sha256": "c164387168120d941b6e7c71d0082fb3725cf977e5eb8dc287691f8ca95f2849",
+      "csv_sha256": "90aebb6e9f1721cc81d8f2f2b7c6153214d18666cd6fff747190d07159d4ccdf",
+      "csv_path": "full-export/OPPROF_20261113093603_IXXRDMWUKCNYQKZZ/simulator/core0.veccore1/core0.veccore1_instr_exe_20261113093612167.csv"
+    }
+  ]
+}

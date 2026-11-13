@@ -1,0 +1,3 @@
+PASS: rebuilt published JSON from nine complete raw captures and 548 canonical worker CSV/footer pairs (JSON key normalization applied)
+PASS: per-core offline-export logs, geometry, timer binaries, local/global oracle and raw phase clocks agree
+Counts: nine conditions, fifteen kernel launches, 548 worker CSVs; not NPU acceptance

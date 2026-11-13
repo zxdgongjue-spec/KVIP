@@ -137,3 +137,9 @@ python3 experiments/split_core/scheduling_trace.py \
 读取当前客户42组定义，生成C32/V64、C28/V56 × G32/G64 × 656/2624B的336行分析。
 这不是设备执行器或延迟模拟器；实际prefetch/repair、DRAM流量和时间保持未知。
 参见[完整分阶段方案](../../docs/research/split_core/adaptive_scheduling_plan.md)。
+
+## BS1/8/16与T1/T4/T8完整指令比较
+
+[九点实测报告](../../docs/research/split_core/topk_bqt_experiment.md)提供固定Q4/H128K/miss10%/V56的实际结果、同BS/T1对照、关键路径模型、每worker均衡度及旧LI指令基线。9组Model、15个kernel、548份活跃worker证据均已采集；不等同于42组或完整生产通路通过。
+
+`topk_bqt_results.py`校验原始Model/oracle/timers、逐worker完整footer、SDK离线export与canonical CSV，再汇总`call_count`。`plot_topk_bqt.py`绘制内核包络和每query导出调用数，以及九点同run的worker start/done图。完整命令、相同binary/input/config的SHA及collector恢复状态见报告和recipe；全量原始dump保留本机，不随MR发布。

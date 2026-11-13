@@ -1,0 +1,190 @@
+{
+  "scope": "Actual primary9 Model captures and filtered per-core offline export; no application rerun for historical LI",
+  "source": {
+    "head": "49fb6600c510255247e6590b387ad60bdc14ee23",
+    "driver_sha256": "590c34b7e7403b291852d001c922b17b090834cc88517dc8b1ea27faa03af5c2",
+    "kernel_sha256": "72ad7ef31263a37e8af4d749c0c688c9c8c2b359ab9c1ce32ceae5dd7c583556",
+    "host_source_sha256": "94ffeeb16ef0fa7ca8443159060b9787d4d34d3f90b0d5e74405dd4b08e1827c",
+    "score_sha256": "dc2a9d09fea46b519d039ee8ca5c65142c6c240ecb0dc6987939d414885b5f41",
+    "config_sha256": "f6786841a040e26ac7b5dfd95f0d787b3a65a2a132876d630ef6d99253fd88a0",
+    "physical_npu": false,
+    "B": [
+      1,
+      8,
+      16
+    ],
+    "Q": 4,
+    "H": 131072,
+    "miss_per_query": 205,
+    "T": [
+      1,
+      4,
+      8
+    ],
+    "V": 56,
+    "scope": "AIV-only Final TopK component; 28-bit dump mask; full observed block coverage required before total instructions"
+  },
+  "tool_version": "msopprof is part of MindStudio Operator-dev Tools.\nmsopprof vesion is 26.1.0-56632dc4a944410c791538451dc2156a151bd105\nmsopscommon version is b4ffdb3d6ba7acdb7bbfcf359f6e4dd5b587a4f4\n",
+  "config": {
+    "LOG": {
+      "rotating_file_size": 134217728,
+      "rotating_file_number": 2,
+      "flush_level": 2,
+      "core_enable_mask": [
+        "0x0fffffff"
+      ]
+    },
+    "L2CACHE": {
+      "cache_enable": 0,
+      "cache_set_size": 24,
+      "cache_way_size": 16384,
+      "cache_line_size": 512,
+      "cache_read_latency": 241,
+      "cache_write_latency": 96
+    },
+    "WRAPPER": {
+      "adapter_log_file_level": 6,
+      "aic_wrap_log_file_level": 6,
+      "cosim_log_file_level": 2,
+      "cosim_log_flush_level": 3,
+      "cosim_log_scr_level": 3
+    }
+  },
+  "config_stars": {
+    "stars": {
+      "ffts_mode": 3
+    },
+    "model_top": {
+      "sim_type": 0,
+      "num_aic": 32,
+      "num_aiv": 64
+    },
+    "pem": {
+      "parsim": 0,
+      "parsim_thd_limit": 0
+    }
+  },
+  "container_image": "sha256:556cd79602b2bd97b1d19652432601b9a18e04133a70731c395d44929fc21b8b",
+  "limits": {
+    "cpus": 4,
+    "memory_GiB": 7,
+    "memory_swap_total_GiB": 10
+  },
+  "primary_commands": [
+    {
+      "argv": [
+        "docker",
+        "exec",
+        "kvip-splitcore011",
+        "bash",
+        "-lc",
+        "export ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.1.0\nexport PATH=$ASCEND_HOME_PATH/bin:$ASCEND_HOME_PATH/tools/profiler/bin:$PATH\nexport LD_LIBRARY_PATH=$ASCEND_HOME_PATH/aarch64-linux/simulator/dav_3510/lib:$ASCEND_HOME_PATH/aarch64-linux/lib64:$ASCEND_HOME_PATH/aarch64-linux/devlib\nexport LD_PRELOAD=$ASCEND_HOME_PATH/aarch64-linux/simulator/dav_3510/lib/libruntime_camodel.so\ncd /work/b1-t1\nexec msprof op simulator --soc-version=Ascend950PR_9599 --kernel-name='split_topk_local|split_topk_merge' --launch-count=1 --core-id='0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27' --aic-metrics=PipeUtilization --timeout=15 --output=/work/b1-t1/profile /driver/topk_sim /fixture/score.bin /work/b1-t1/oracle.json 1 131072 131072 205 1 56\n"
+      ]
+    },
+    {
+      "argv": [
+        "docker",
+        "exec",
+        "kvip-splitcore011",
+        "bash",
+        "-lc",
+        "export ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.1.0\nexport PATH=$ASCEND_HOME_PATH/bin:$ASCEND_HOME_PATH/tools/profiler/bin:$PATH\nexport LD_LIBRARY_PATH=$ASCEND_HOME_PATH/aarch64-linux/simulator/dav_3510/lib:$ASCEND_HOME_PATH/aarch64-linux/lib64:$ASCEND_HOME_PATH/aarch64-linux/devlib\nexport LD_PRELOAD=$ASCEND_HOME_PATH/aarch64-linux/simulator/dav_3510/lib/libruntime_camodel.so\ncd /work/b1-t4\nexec msprof op simulator --soc-version=Ascend950PR_9599 --kernel-name='split_topk_local|split_topk_merge' --launch-count=2 --core-id=0 --aic-metrics=PipeUtilization --timeout=30 --output=/work/b1-t4/profile /driver/topk_sim /fixture/score.bin /work/b1-t4/oracle.json 1 131072 131072 205 4 56\n"
+      ]
+    },
+    {
+      "argv": [
+        "docker",
+        "exec",
+        "kvip-splitcore011",
+        "bash",
+        "-lc",
+        "export ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.1.0\nexport PATH=$ASCEND_HOME_PATH/bin:$ASCEND_HOME_PATH/tools/profiler/bin:$PATH\nexport LD_LIBRARY_PATH=$ASCEND_HOME_PATH/aarch64-linux/simulator/dav_3510/lib:$ASCEND_HOME_PATH/aarch64-linux/lib64:$ASCEND_HOME_PATH/aarch64-linux/devlib\nexport LD_PRELOAD=$ASCEND_HOME_PATH/aarch64-linux/simulator/dav_3510/lib/libruntime_camodel.so\ncd /work/b1-t8\nexec msprof op simulator --soc-version=Ascend950PR_9599 --kernel-name='split_topk_local|split_topk_merge' --launch-count=2 --core-id=0 --aic-metrics=PipeUtilization --timeout=30 --output=/work/b1-t8/profile /driver/topk_sim /fixture/score.bin /work/b1-t8/oracle.json 1 131072 131072 205 8 56\n"
+      ]
+    },
+    {
+      "argv": [
+        "docker",
+        "exec",
+        "kvip-splitcore011",
+        "bash",
+        "-lc",
+        "export ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.1.0\nexport PATH=$ASCEND_HOME_PATH/bin:$ASCEND_HOME_PATH/tools/profiler/bin:$PATH\nexport LD_LIBRARY_PATH=$ASCEND_HOME_PATH/aarch64-linux/simulator/dav_3510/lib:$ASCEND_HOME_PATH/aarch64-linux/lib64:$ASCEND_HOME_PATH/aarch64-linux/devlib\nexport LD_PRELOAD=$ASCEND_HOME_PATH/aarch64-linux/simulator/dav_3510/lib/libruntime_camodel.so\ncd /work/b8-t1\nexec msprof op simulator --soc-version=Ascend950PR_9599 --kernel-name='split_topk_local|split_topk_merge' --launch-count=1 --core-id=0 --aic-metrics=PipeUtilization --timeout=30 --output=/work/b8-t1/profile /driver/topk_sim /fixture/score.bin /work/b8-t1/oracle.json 8 131072 131072 205 1 56\n"
+      ]
+    },
+    {
+      "argv": [
+        "docker",
+        "exec",
+        "kvip-splitcore011",
+        "bash",
+        "-lc",
+        "export ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.1.0\nexport PATH=$ASCEND_HOME_PATH/bin:$ASCEND_HOME_PATH/tools/profiler/bin:$PATH\nexport LD_LIBRARY_PATH=$ASCEND_HOME_PATH/aarch64-linux/simulator/dav_3510/lib:$ASCEND_HOME_PATH/aarch64-linux/lib64:$ASCEND_HOME_PATH/aarch64-linux/devlib\nexport LD_PRELOAD=$ASCEND_HOME_PATH/aarch64-linux/simulator/dav_3510/lib/libruntime_camodel.so\ncd /work/b8-t4\nexec msprof op simulator --soc-version=Ascend950PR_9599 --kernel-name='split_topk_local|split_topk_merge' --launch-count=2 --core-id=0 --aic-metrics=PipeUtilization --timeout=30 --output=/work/b8-t4/profile /driver/topk_sim /fixture/score.bin /work/b8-t4/oracle.json 8 131072 131072 205 4 56\n"
+      ]
+    },
+    {
+      "argv": [
+        "docker",
+        "exec",
+        "kvip-splitcore011",
+        "bash",
+        "-lc",
+        "export ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.1.0\nexport PATH=$ASCEND_HOME_PATH/bin:$ASCEND_HOME_PATH/tools/profiler/bin:$PATH\nexport LD_LIBRARY_PATH=$ASCEND_HOME_PATH/aarch64-linux/simulator/dav_3510/lib:$ASCEND_HOME_PATH/aarch64-linux/lib64:$ASCEND_HOME_PATH/aarch64-linux/devlib\nexport LD_PRELOAD=$ASCEND_HOME_PATH/aarch64-linux/simulator/dav_3510/lib/libruntime_camodel.so\ncd /work/b8-t8\nexec msprof op simulator --soc-version=Ascend950PR_9599 --kernel-name='split_topk_local|split_topk_merge' --launch-count=2 --core-id=0 --aic-metrics=PipeUtilization --timeout=30 --output=/work/b8-t8/profile /driver/topk_sim /fixture/score.bin /work/b8-t8/oracle.json 8 131072 131072 205 8 56\n"
+      ]
+    },
+    {
+      "argv": [
+        "docker",
+        "exec",
+        "kvip-splitcore011",
+        "bash",
+        "-lc",
+        "export ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.1.0\nexport PATH=$ASCEND_HOME_PATH/bin:$ASCEND_HOME_PATH/tools/profiler/bin:$PATH\nexport LD_LIBRARY_PATH=$ASCEND_HOME_PATH/aarch64-linux/simulator/dav_3510/lib:$ASCEND_HOME_PATH/aarch64-linux/lib64:$ASCEND_HOME_PATH/aarch64-linux/devlib\nexport LD_PRELOAD=$ASCEND_HOME_PATH/aarch64-linux/simulator/dav_3510/lib/libruntime_camodel.so\ncd /work/b16-t1\nexec msprof op simulator --soc-version=Ascend950PR_9599 --kernel-name='split_topk_local|split_topk_merge' --launch-count=1 --core-id=0 --aic-metrics=PipeUtilization --timeout=30 --output=/work/b16-t1/profile /driver/topk_sim /fixture/score.bin /work/b16-t1/oracle.json 16 131072 131072 205 1 56\n"
+      ]
+    },
+    {
+      "argv": [
+        "docker",
+        "exec",
+        "kvip-splitcore011",
+        "bash",
+        "-lc",
+        "export ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.1.0\nexport PATH=$ASCEND_HOME_PATH/bin:$ASCEND_HOME_PATH/tools/profiler/bin:$PATH\nexport LD_LIBRARY_PATH=$ASCEND_HOME_PATH/aarch64-linux/simulator/dav_3510/lib:$ASCEND_HOME_PATH/aarch64-linux/lib64:$ASCEND_HOME_PATH/aarch64-linux/devlib\nexport LD_PRELOAD=$ASCEND_HOME_PATH/aarch64-linux/simulator/dav_3510/lib/libruntime_camodel.so\ncd /work/b16-t4\nexec msprof op simulator --soc-version=Ascend950PR_9599 --kernel-name='split_topk_local|split_topk_merge' --launch-count=2 --core-id=0 --aic-metrics=PipeUtilization --timeout=30 --output=/work/b16-t4/profile /driver/topk_sim /fixture/score.bin /work/b16-t4/oracle.json 16 131072 131072 205 4 56\n"
+      ]
+    },
+    {
+      "argv": [
+        "docker",
+        "exec",
+        "kvip-splitcore011",
+        "bash",
+        "-lc",
+        "export ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.1.0\nexport PATH=$ASCEND_HOME_PATH/bin:$ASCEND_HOME_PATH/tools/profiler/bin:$PATH\nexport LD_LIBRARY_PATH=$ASCEND_HOME_PATH/aarch64-linux/simulator/dav_3510/lib:$ASCEND_HOME_PATH/aarch64-linux/lib64:$ASCEND_HOME_PATH/aarch64-linux/devlib\nexport LD_PRELOAD=$ASCEND_HOME_PATH/aarch64-linux/simulator/dav_3510/lib/libruntime_camodel.so\ncd /work/b16-t8\nexec msprof op simulator --soc-version=Ascend950PR_9599 --kernel-name='split_topk_local|split_topk_merge' --launch-count=2 --core-id=0 --aic-metrics=PipeUtilization --timeout=30 --output=/work/b16-t8/profile /driver/topk_sim /fixture/score.bin /work/b16-t8/oracle.json 16 131072 131072 205 8 56\n"
+      ]
+    }
+  ],
+  "instruction_scope": "PipeUtilization-exported call_count; synchronization detail omitted; includes visible SIMT warp calls without multiplying lanes",
+  "collection_note": "LOG mask0x0fffffff is verified by actual block footer/CSV coverage, not assumed from undocumented bit mapping",
+  "export_template": "msprof op simulator --soc-version=Ascend950PR_9599 --export=FILTERED_NONEMPTY_ONE_CORE_DUMP --output=FRESH_DIR --core-id=CORE --aic-metrics=PipeUtilization",
+  "recovery_notes": [
+    "B1T1 collector143 after normal Model stop; full filtered per-core exports succeeded",
+    "B8T1 collector exit not persisted before v2 path-layout assertion; preserve null; normal Model footer/oracle and full per-core exports verified",
+    "SDK may move device0 raw directory to canonical output after online export; source binary owner-read restored without changing bytes",
+    "All nine use the same per-core offline export for instruction counting, independent of online parse selection"
+  ],
+  "raw_compaction": [
+    {
+      "index": "derived-compression.json",
+      "sha256": "5b96065cc9a6d74db1c25b1dea3937f6dde7d414201a2edb991f45f89f4b6fa8"
+    },
+    {
+      "index": "companion-compression.json",
+      "sha256": "001b93a4ee795e585ed23b027b95eb2f81495e3929b4b1977745a2285bfd3828"
+    },
+    {
+      "index": "hardlink-preservation.json",
+      "sha256": "ab2ed0ea0958d7f7945b15a5f60fe1689ceb6a5e340360339507e70622a587a6"
+    }
+  ],
+  "hardware_acceptance": "PENDING",
+  "matching_h128k_pure_score_baseline": "NOT_AVAILABLE"
+}

@@ -1,0 +1,45 @@
+{
+  "local": {
+    "created_utc": "2026-11-13T10:18:59.301816+00:00",
+    "scope": "Exported local instruction calls only, same binary/score fixture/metric; not latency prediction",
+    "fit_batches": [
+      1,
+      8
+    ],
+    "fit_fixed_worker_calls": {
+      "4": 612,
+      "8": 612
+    },
+    "per_request_local_work_calls": {
+      "1": 104348,
+      "4": 102488,
+      "8": 99656
+    },
+    "formula": "local_calls(B,T)=B*U[T]+612*min(4*B*T,56)",
+    "holdout_batch": 16,
+    "predicted_local_calls": {
+      "1": 1703840,
+      "4": 1674080,
+      "8": 1628768
+    },
+    "holdout_actuals_not_used": true,
+    "limitations": [
+      "Controlled Q4 score seed repeated across batch",
+      "No generalization to different H/score distributions/SDK/compiler",
+      "Merge fixed cost not identifiable from B<=8 where BQ<=56",
+      "Instruction count is not elapsed time"
+    ]
+  },
+  "total_t8": {
+    "created_utc": "2026-11-13T10:43:31.038190+00:00",
+    "scope": "T8/BS16 full exported calls prediction; not time prediction",
+    "merge_fixed_calls": 620.0,
+    "per_request_merge_work_t8": 14232.0,
+    "local_calls_prediction": 1628768,
+    "merge_calls_prediction": 262432.0,
+    "total_calls_prediction": 1891200.0,
+    "calibration": "merge B1/T4 and B16/T4; T8 per-request work from B1/T8",
+    "heldout_case": "b16-t8",
+    "heldout_actual_not_used": true
+  }
+}

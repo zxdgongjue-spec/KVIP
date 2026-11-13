@@ -1,0 +1,110 @@
+{
+  "status": "PASS_SCOPED_MODEL_EVIDENCE",
+  "formal_gate": "NOT_RUN: collaboration baseline remains DRAFT; advisory independent reviews do not replace formal gate",
+  "source_base_commit": "49fb6600c510255247e6590b387ad60bdc14ee23",
+  "scope": "Model Final TopK, not QK/score production or full streaming; PipeUtilization exported calls omit sync detail",
+  "physical_npu": false,
+  "hardware_acceptance": "PENDING",
+  "full_streaming_validation": "NOT_RUN",
+  "full_customer_42": "NOT_RUN",
+  "conditions": 9,
+  "kernel_launches": 15,
+  "worker_csvs": 548,
+  "offline_export_invocations": 274,
+  "exported_calls_conservation_total": 8611548,
+  "samples_per_condition": 1,
+  "warmup": 0,
+  "tests": [
+    {
+      "command": "/opt/anaconda3/bin/python3 -m pytest -q tests/runtime/test_topk_bqt_results.py",
+      "environment": "root with local raw captures",
+      "exit_code": 0,
+      "result": "13 passed",
+      "log": "bqt-pytest.log"
+    },
+    {
+      "command": "/opt/anaconda3/bin/python3 -m pytest -q tests/runtime/test_topk_bqt_results.py",
+      "environment": "clean public MR worktree without untracked raw captures",
+      "exit_code": 0,
+      "result": "12 passed, 1 skipped",
+      "skip_reason": "optional existing raw B1 replay is absent; portable nine-point bundle/timers test passed",
+      "log": "bqt-clean-pytest.log"
+    },
+    {
+      "command": "ruff check (three new Python files)",
+      "exit_code": 0,
+      "log": "bqt-ruff.log"
+    },
+    {
+      "command": "ruff format --check (three new Python files)",
+      "exit_code": 0,
+      "log": "bqt-format.log"
+    },
+    {
+      "command": "rebuild from full raw with public build(); compare after JSON key normalization",
+      "exit_code": 0,
+      "log": "bqt-raw-validation.log"
+    }
+  ],
+  "independent_reviews": [
+    {
+      "reviewer": "model_audit",
+      "status": "ACCEPT",
+      "scope": "Rebuilt all nine points, 548 CSV/footer pairs and timers; count model, PC groups, preregistered holdouts and portable tests verified"
+    },
+    {
+      "reviewer": "source_audit",
+      "status": "ACCEPT",
+      "scope": "All raw coverage/counters, old mixed LI154159, production boundary and latest report verified"
+    },
+    {
+      "reviewer": "papers",
+      "status": "ACCEPT",
+      "scope": "Final report/figures/metrics and reproducibility fixes verified; no NPU or full-pipeline claim"
+    }
+  ],
+  "bound_files": {
+    "experiments/split_core/topk_bqt_results.py": "d4af4b7293bde97967a082368b391a722a7fe0a3bcdab3433e41e0f442a9e0b8",
+    "experiments/split_core/plot_topk_bqt.py": "cae1cac3c127f8229c48d8eaf78bf49a9868e5d04c37765b11ddb6cc3ba1fea1",
+    "tests/runtime/test_topk_bqt_results.py": "5ea41050aef87f3cf08fa0b9856695af076184a7a1bbc3339f4f80fe14623fd8",
+    "docs/research/split_core/topk_bqt_experiment.md": "452664d5ec1d9aa1614c942cbeead5a2135dbee13339c954913bc266930ce6d5",
+    "docs/research/split_core/results/topk-bqt-results.json": "a168cbe33a4ce788b4e69d021e4fd9b66eb116cf4c37a65b59c85f46ad21e966",
+    "docs/research/split_core/results/topk-bqt-results.csv": "7876872a6513dc8b08cf4ce1ac11b2733dab92c49ff394a289e193dbbcbe706f",
+    "docs/research/split_core/results/topk-bqt-captures.json": "7ad03837491304687249e86e1085391c8e1e4d786384ed300384725e6d66bd85",
+    "docs/research/split_core/results/topk-bqt-recipe.json": "60543c566a12bb38ef0cd53c4350b8a17236e9f3e72cd99f6afb234aeedcd894",
+    "docs/research/split_core/results/topk-bqt-fixed-pcs.json": "8ebde9fed1044d6edb1dff7e55aed2e26531a8daf323557fbe1c0cf8ab532c0b",
+    "docs/research/split_core/results/topk-bqt-preregistered-predictions.json": "0cd914ee62eebb7895d9f495e445d6a4a1d3853ec45b9336b1113331a6ca284a",
+    "docs/research/split_core/results/previous-li-instruction-baseline.json": "d5f72e74c91166e0acd5c36ced5c632282ae4d8ee76eacf7bf178b9eb9b7015e",
+    "docs/research/split_core/results/topk-bqt-comparison.png": "5351e665871930a5bf0087075e329313cfc87b8eadfcee6b6471d3437f7ee85e",
+    "docs/research/split_core/results/topk-bqt-envelopes.png": "39afe0a3227c02246a0341d64cdc8f6dae2ccfd245956e50ab5f017730f28c7b"
+  },
+  "check_log_sha256": {
+    "bqt-clean-pytest.log": "41dc04b7ee9dd05967eef4e3a83570a6591cb2cdf4b0a8311815211cd2d31661",
+    "bqt-ruff.log": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+    "bqt-pytest.log": "49d6b854871093d27d29ab9582200004f1657b2fc87c6e88f9bf4342d292af48",
+    "bqt-format.log": "eee76f865de5a9f2456950f710ae5d5f9b5bd0ea02aa54f614c5eed6642a0bfd",
+    "bqt-raw-validation.log": "a6897776a85baef4444ab619ae4a25c513e848746373c629732f313074be2e18"
+  },
+  "source_paths_unchanged": [
+    "csrc",
+    "python",
+    "scripts"
+  ],
+  "resource_cleanup": {
+    "container": "kvip-splitcore011",
+    "container_stopped": true,
+    "compactors_stopped": true,
+    "common_model_lease_released": true,
+    "shared_model_lease_released": true,
+    "raw_retained": true
+  },
+  "limitations": [
+    "Whole Model includes Model-visible harness interactions; not CPU wall time or native device time",
+    "Kernel envelope excludes phase gaps; worker-body timing is another narrower proxy",
+    "PipeUtilization-exported call_count omits synchronization detail; no SIMT lane multiplication",
+    "Old LI baseline is H8192 mixed QK/score/TopK, not matched H128K pure-score instructions",
+    "Large raw dump and official CSV kept local; published hashes/metadata/logs/timers do not replace access to raw files for a complete replay"
+  ],
+  "verification_tooling_note": "First ad-hoc Python-object equality check failed on integer T keys versus serialized JSON string keys; normalized JSON equality succeeded without changing data or rerunning Model.",
+  "whitespace_check_scope": "New source/docs/data checked; original capture logs and generated Matplotlib SVG retain original whitespace. Initial broad diff check flagged SVG path line endings, not source defects."
+}

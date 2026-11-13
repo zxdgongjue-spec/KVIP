@@ -1,0 +1,3373 @@
+{
+  "scope": "Model and independent offline exports have separate statuses; no NPU",
+  "runs": [
+    {
+      "case": "b1-t1",
+      "batch": 1,
+      "shards": 1,
+      "status": "PASSED_MODEL_AND_OFFLINE_EXPORT",
+      "collector_exit": 143,
+      "collector_postprocess_recovered": true,
+      "exports": [
+        {
+          "phase": "local",
+          "core": 0,
+          "exit_code": 0,
+          "wall_seconds": 2.211511417,
+          "csv_paths": [
+            "b1-t1/exports/local/core0/OPPROF_20261113092609_KGUYEBMHZARKBPMU/simulator/core0.veccore1/core0.veccore1_instr_exe_20261113092610896.csv",
+            "b1-t1/exports/local/core0/OPPROF_20261113092609_KGUYEBMHZARKBPMU/simulator/core0.veccore0/core0.veccore0_instr_exe_20261113092610896.csv"
+          ],
+          "log_sha256": "96d9ffc2bb4a7c9bf04c7016d2be7197ba248df6afeb91d24d7657ece961845a"
+        },
+        {
+          "phase": "local",
+          "core": 1,
+          "exit_code": 0,
+          "wall_seconds": 1.8261379999999998,
+          "csv_paths": [
+            "b1-t1/exports/local/core1/OPPROF_20261113092611_CKUAYGBAZPLNMBTH/simulator/core1.veccore1/core1.veccore1_instr_exe_20261113092612802.csv",
+            "b1-t1/exports/local/core1/OPPROF_20261113092611_CKUAYGBAZPLNMBTH/simulator/core1.veccore0/core1.veccore0_instr_exe_20261113092612802.csv"
+          ],
+          "log_sha256": "d8f89ea32bebab0fd215067ae1b14f706eca2db8033c4dfceb2abe65aa161888"
+        }
+      ],
+      "model_capture_wall_seconds": 300.47238595899995,
+      "total_model_ticks": 50631,
+      "oracle": {
+        "status": "passed",
+        "scope": "AIV-only exact final TopK component",
+        "batch": 1,
+        "history": 131072,
+        "valid": 131072,
+        "miss_per_query": 205,
+        "shards": 1,
+        "aiv_budget": 56,
+        "local_workers": 4,
+        "merge_workers": 0,
+        "aic_workers": 0,
+        "guards": true,
+        "local_max_worker_cycle_delta": 47565,
+        "merge_max_worker_cycle_delta": 0,
+        "sum_phase_max_worker_cycle_delta": 47565,
+        "timing_scope": "worker-body only; excludes dispatch and init",
+        "selected_set_and_scores": true,
+        "all_local_candidates": true,
+        "input_unchanged": true,
+        "full_LI": false,
+        "transport": false
+      },
+      "capture_log_sha256": "7ba41fabbb7b474c5f31a56ad615eea386330daf833cd5cd54ef284ad2e76d5f"
+    },
+    {
+      "case": "b1-t4",
+      "batch": 1,
+      "shards": 4,
+      "status": "PASSED_MODEL_AND_OFFLINE_EXPORT",
+      "collector_exit": 0,
+      "collector_postprocess_recovered": true,
+      "exports": [
+        {
+          "phase": "local",
+          "core": 0,
+          "exit_code": 0,
+          "wall_seconds": 0.7213203750000048,
+          "csv_paths": [
+            "b1-t4/exports/local/core0/OPPROF_20261113092811_NHBOMMJAOYKSJEJS/simulator/core0.veccore1/core0.veccore1_instr_exe_20261113092812067.csv",
+            "b1-t4/exports/local/core0/OPPROF_20261113092811_NHBOMMJAOYKSJEJS/simulator/core0.veccore0/core0.veccore0_instr_exe_20261113092812067.csv"
+          ],
+          "log_sha256": "b43019166e7c9f56931db01af154bc2d2a0219645fb335db6a2bae42f9d92035"
+        },
+        {
+          "phase": "local",
+          "core": 1,
+          "exit_code": 0,
+          "wall_seconds": 0.7058169579999998,
+          "csv_paths": [
+            "b1-t4/exports/local/core1/OPPROF_20261113092812_KJILYAKQVVSHXRUF/simulator/core1.veccore1/core1.veccore1_instr_exe_20261113092812792.csv",
+            "b1-t4/exports/local/core1/OPPROF_20261113092812_KJILYAKQVVSHXRUF/simulator/core1.veccore0/core1.veccore0_instr_exe_20261113092812792.csv"
+          ],
+          "log_sha256": "dc94568808ffe8069dde9a54cb2a38d22f54b5b306bd2d6fc17a4782ad5e6dcb"
+        },
+        {
+          "phase": "local",
+          "core": 2,
+          "exit_code": 0,
+          "wall_seconds": 0.7111772920000021,
+          "csv_paths": [
+            "b1-t4/exports/local/core2/OPPROF_20261113092813_FBHMLZCDVECHKRXA/simulator/core2.veccore0/core2.veccore0_instr_exe_20261113092813510.csv",
+            "b1-t4/exports/local/core2/OPPROF_20261113092813_FBHMLZCDVECHKRXA/simulator/core2.veccore1/core2.veccore1_instr_exe_20261113092813510.csv"
+          ],
+          "log_sha256": "364f23501ce385dd81665b98708917fb68eece9fdf1379ff3a6e2281c485fe00"
+        },
+        {
+          "phase": "local",
+          "core": 3,
+          "exit_code": 0,
+          "wall_seconds": 0.718394208999996,
+          "csv_paths": [
+            "b1-t4/exports/local/core3/OPPROF_20261113092813_XLKTGIJOPZKPKTVC/simulator/core3.veccore0/core3.veccore0_instr_exe_20261113092814224.csv",
+            "b1-t4/exports/local/core3/OPPROF_20261113092813_XLKTGIJOPZKPKTVC/simulator/core3.veccore1/core3.veccore1_instr_exe_20261113092814224.csv"
+          ],
+          "log_sha256": "0a3fcbd543825038a031bc4be1e3f6149499d306fb51f1e431c7557d9345af58"
+        },
+        {
+          "phase": "local",
+          "core": 4,
+          "exit_code": 0,
+          "wall_seconds": 0.9524822500000028,
+          "csv_paths": [
+            "b1-t4/exports/local/core4/OPPROF_20261113092814_URWEIPEPLUZSCSCF/simulator/core4.veccore0/core4.veccore0_instr_exe_20261113092815212.csv",
+            "b1-t4/exports/local/core4/OPPROF_20261113092814_URWEIPEPLUZSCSCF/simulator/core4.veccore1/core4.veccore1_instr_exe_20261113092815212.csv"
+          ],
+          "log_sha256": "05c54106170b14f5935889c835ca8daa939824aa3f011fbf73b4045f08f84317"
+        },
+        {
+          "phase": "local",
+          "core": 5,
+          "exit_code": 0,
+          "wall_seconds": 0.8214003340000033,
+          "csv_paths": [
+            "b1-t4/exports/local/core5/OPPROF_20261113092815_QYACUDPPKLAJWBGG/simulator/core5.veccore0/core5.veccore0_instr_exe_20261113092816093.csv",
+            "b1-t4/exports/local/core5/OPPROF_20261113092815_QYACUDPPKLAJWBGG/simulator/core5.veccore1/core5.veccore1_instr_exe_20261113092816093.csv"
+          ],
+          "log_sha256": "a6aad05a618955ff002a4e3bef2f9a1c2f520efc6b943bbe7ff36edba31f5732"
+        },
+        {
+          "phase": "local",
+          "core": 6,
+          "exit_code": 0,
+          "wall_seconds": 0.8679238749999882,
+          "csv_paths": [
+            "b1-t4/exports/local/core6/OPPROF_20261113092816_BSBWQNSCNVRIMADJ/simulator/core6.veccore1/core6.veccore1_instr_exe_20261113092816961.csv",
+            "b1-t4/exports/local/core6/OPPROF_20261113092816_BSBWQNSCNVRIMADJ/simulator/core6.veccore0/core6.veccore0_instr_exe_20261113092816961.csv"
+          ],
+          "log_sha256": "de0f213e50f90246acfca214872ad171f04903ba9b3788582ae675f551641dcb"
+        },
+        {
+          "phase": "local",
+          "core": 7,
+          "exit_code": 0,
+          "wall_seconds": 0.7705111669999951,
+          "csv_paths": [
+            "b1-t4/exports/local/core7/OPPROF_20261113092817_PAOMQRMEPIIOOGPB/simulator/core7.veccore1/core7.veccore1_instr_exe_20261113092817845.csv",
+            "b1-t4/exports/local/core7/OPPROF_20261113092817_PAOMQRMEPIIOOGPB/simulator/core7.veccore0/core7.veccore0_instr_exe_20261113092817845.csv"
+          ],
+          "log_sha256": "f7325ea314165cbbffe850c94755c385dc99ee535f375a3ab59eee3cfb794f88"
+        },
+        {
+          "phase": "merge",
+          "core": 0,
+          "exit_code": 0,
+          "wall_seconds": 0.5000192919999904,
+          "csv_paths": [
+            "b1-t4/exports/merge/core0/OPPROF_20261113092818_LHESGXIMMDIEREWA/simulator/core0.veccore1/core0.veccore1_instr_exe_20261113092818385.csv",
+            "b1-t4/exports/merge/core0/OPPROF_20261113092818_LHESGXIMMDIEREWA/simulator/core0.veccore0/core0.veccore0_instr_exe_20261113092818385.csv"
+          ],
+          "log_sha256": "39d32d25762d4465eea0c62bdf42e3146639973835e3555782695b4df8a9d582"
+        },
+        {
+          "phase": "merge",
+          "core": 1,
+          "exit_code": 0,
+          "wall_seconds": 0.49137691699999664,
+          "csv_paths": [
+            "b1-t4/exports/merge/core1/OPPROF_20261113092818_JCBKERPSFMQKJZZQ/simulator/core1.veccore1/core1.veccore1_instr_exe_20261113092818931.csv",
+            "b1-t4/exports/merge/core1/OPPROF_20261113092818_JCBKERPSFMQKJZZQ/simulator/core1.veccore0/core1.veccore0_instr_exe_20261113092818931.csv"
+          ],
+          "log_sha256": "a1ec7398c43f0cfec862a164a04aea246821a499bfe003c4e00aca22edc0fa6e"
+        }
+      ],
+      "model_capture_wall_seconds": 118.36654899999999,
+      "total_model_ticks": 29925,
+      "oracle": {
+        "status": "passed",
+        "scope": "AIV-only exact final TopK component",
+        "batch": 1,
+        "history": 131072,
+        "valid": 131072,
+        "miss_per_query": 205,
+        "shards": 4,
+        "aiv_budget": 56,
+        "local_workers": 16,
+        "merge_workers": 4,
+        "aic_workers": 0,
+        "guards": true,
+        "local_max_worker_cycle_delta": 14041,
+        "merge_max_worker_cycle_delta": 9641,
+        "sum_phase_max_worker_cycle_delta": 23682,
+        "timing_scope": "worker-body only; excludes dispatch and init",
+        "selected_set_and_scores": true,
+        "all_local_candidates": true,
+        "input_unchanged": true,
+        "full_LI": false,
+        "transport": false
+      },
+      "capture_log_sha256": "cbdafc14185cdf2c004fb1f8df88bc2578b68dcad244f38af54c45d53086df69"
+    },
+    {
+      "case": "b1-t8",
+      "batch": 1,
+      "shards": 8,
+      "status": "PASSED_MODEL_AND_OFFLINE_EXPORT",
+      "collector_exit": 0,
+      "collector_postprocess_recovered": true,
+      "exports": [
+        {
+          "phase": "local",
+          "core": 0,
+          "exit_code": 0,
+          "wall_seconds": 0.5001644580000004,
+          "csv_paths": [
+            "b1-t8/exports/local/core0/OPPROF_20261113093021_XWTNTVGZYWVWXTRT/simulator/core0.veccore1/core0.veccore1_instr_exe_20261113093021882.csv",
+            "b1-t8/exports/local/core0/OPPROF_20261113093021_XWTNTVGZYWVWXTRT/simulator/core0.veccore0/core0.veccore0_instr_exe_20261113093021882.csv"
+          ],
+          "log_sha256": "98ad979e63e5eefa9f416ba4d674ffca46c4f333576de64a0a02f02c829c9146"
+        },
+        {
+          "phase": "local",
+          "core": 1,
+          "exit_code": 0,
+          "wall_seconds": 0.45315583300001094,
+          "csv_paths": [
+            "b1-t8/exports/local/core1/OPPROF_20261113093022_AKFXRLYTHTTIOSIS/simulator/core1.veccore1/core1.veccore1_instr_exe_20261113093022357.csv",
+            "b1-t8/exports/local/core1/OPPROF_20261113093022_AKFXRLYTHTTIOSIS/simulator/core1.veccore0/core1.veccore0_instr_exe_20261113093022357.csv"
+          ],
+          "log_sha256": "a5560da21943b74bb9c50604dc616afdda4328c03f5f79400a277e54ebdf7e7f"
+        },
+        {
+          "phase": "local",
+          "core": 2,
+          "exit_code": 0,
+          "wall_seconds": 0.5005552500000192,
+          "csv_paths": [
+            "b1-t8/exports/local/core2/OPPROF_20261113093022_CGEVRSADPCHZPEOW/simulator/core2.veccore0/core2.veccore0_instr_exe_20261113093022855.csv",
+            "b1-t8/exports/local/core2/OPPROF_20261113093022_CGEVRSADPCHZPEOW/simulator/core2.veccore1/core2.veccore1_instr_exe_20261113093022855.csv"
+          ],
+          "log_sha256": "76f16b91da306efae872d50987da4e2691ed952e7a9beab92bd12d55b992c30e"
+        },
+        {
+          "phase": "local",
+          "core": 3,
+          "exit_code": 0,
+          "wall_seconds": 0.4835312089999775,
+          "csv_paths": [
+            "b1-t8/exports/local/core3/OPPROF_20261113093023_NUVUWGWFOGLEZJFH/simulator/core3.veccore0/core3.veccore0_instr_exe_20261113093023337.csv",
+            "b1-t8/exports/local/core3/OPPROF_20261113093023_NUVUWGWFOGLEZJFH/simulator/core3.veccore1/core3.veccore1_instr_exe_20261113093023337.csv"
+          ],
+          "log_sha256": "b0cdfafbf78d904e07b097d8f112760f7eb2934efe192551dfd61e21196e81bc"
+        },
+        {
+          "phase": "local",
+          "core": 4,
+          "exit_code": 0,
+          "wall_seconds": 0.583107708,
+          "csv_paths": [
+            "b1-t8/exports/local/core4/OPPROF_20261113093023_RVGGYZLQIZTYFQDY/simulator/core4.veccore0/core4.veccore0_instr_exe_20261113093023968.csv",
+            "b1-t8/exports/local/core4/OPPROF_20261113093023_RVGGYZLQIZTYFQDY/simulator/core4.veccore1/core4.veccore1_instr_exe_20261113093023968.csv"
+          ],
+          "log_sha256": "c22c6caa74aba4b4cf383995774ce5ad116d1b3d97efb4ddaa80d78001462e16"
+        },
+        {
+          "phase": "local",
+          "core": 5,
+          "exit_code": 0,
+          "wall_seconds": 0.5008670830000028,
+          "csv_paths": [
+            "b1-t8/exports/local/core5/OPPROF_20261113093024_PVPADXWIJPFJIODE/simulator/core5.veccore0/core5.veccore0_instr_exe_20261113093024419.csv",
+            "b1-t8/exports/local/core5/OPPROF_20261113093024_PVPADXWIJPFJIODE/simulator/core5.veccore1/core5.veccore1_instr_exe_20261113093024419.csv"
+          ],
+          "log_sha256": "a52c4b1724874a71958d3f28bb35aac6d14b8d2327505d43fe6be7562855ef24"
+        },
+        {
+          "phase": "local",
+          "core": 6,
+          "exit_code": 0,
+          "wall_seconds": 0.503728499999994,
+          "csv_paths": [
+            "b1-t8/exports/local/core6/OPPROF_20261113093024_IGKCDLAHTPWCEPLX/simulator/core6.veccore1/core6.veccore1_instr_exe_20261113093024967.csv",
+            "b1-t8/exports/local/core6/OPPROF_20261113093024_IGKCDLAHTPWCEPLX/simulator/core6.veccore0/core6.veccore0_instr_exe_20261113093024967.csv"
+          ],
+          "log_sha256": "c6d33e9fa307f47decc5c6d457f024c14e57573ba8bd5f870096a60d5c0a0dd7"
+        },
+        {
+          "phase": "local",
+          "core": 7,
+          "exit_code": 0,
+          "wall_seconds": 0.4479393330000221,
+          "csv_paths": [
+            "b1-t8/exports/local/core7/OPPROF_20261113093025_OEMORGZENXHVTYIQ/simulator/core7.veccore1/core7.veccore1_instr_exe_20261113093025448.csv",
+            "b1-t8/exports/local/core7/OPPROF_20261113093025_OEMORGZENXHVTYIQ/simulator/core7.veccore0/core7.veccore0_instr_exe_20261113093025448.csv"
+          ],
+          "log_sha256": "fa412fe531e9fa07caa216f109a5fa13ff5727c74d48a31ee80620974659797c"
+        },
+        {
+          "phase": "local",
+          "core": 8,
+          "exit_code": 0,
+          "wall_seconds": 0.5644846669999879,
+          "csv_paths": [
+            "b1-t8/exports/local/core8/OPPROF_20261113093025_CRPYUHQJNEAPOXBN/simulator/core8.veccore1/core8.veccore1_instr_exe_20261113093025984.csv",
+            "b1-t8/exports/local/core8/OPPROF_20261113093025_CRPYUHQJNEAPOXBN/simulator/core8.veccore0/core8.veccore0_instr_exe_20261113093025984.csv"
+          ],
+          "log_sha256": "99ea730e6ec994d328b22c452087661319708d4183eae5f3925deb2c9a1e9354"
+        },
+        {
+          "phase": "local",
+          "core": 9,
+          "exit_code": 0,
+          "wall_seconds": 0.5097629159999997,
+          "csv_paths": [
+            "b1-t8/exports/local/core9/OPPROF_20261113093026_BGIXMGPFBVUAIZDV/simulator/core9.veccore1/core9.veccore1_instr_exe_20261113093026522.csv",
+            "b1-t8/exports/local/core9/OPPROF_20261113093026_BGIXMGPFBVUAIZDV/simulator/core9.veccore0/core9.veccore0_instr_exe_20261113093026522.csv"
+          ],
+          "log_sha256": "eaec8a373d69b3fcd9d21751dbc1158e878f362e21efd03a89177f3a456cb205"
+        },
+        {
+          "phase": "local",
+          "core": 10,
+          "exit_code": 0,
+          "wall_seconds": 0.4980044590000148,
+          "csv_paths": [
+            "b1-t8/exports/local/core10/OPPROF_20261113093026_MHSBSRIGRTZZXNFW/simulator/core10.veccore0/core10.veccore0_instr_exe_20261113093027055.csv",
+            "b1-t8/exports/local/core10/OPPROF_20261113093026_MHSBSRIGRTZZXNFW/simulator/core10.veccore1/core10.veccore1_instr_exe_20261113093027055.csv"
+          ],
+          "log_sha256": "6dbe6cc1b2ec58c8a73b735839f090861c687c4a660f18a7046439bec3308ab2"
+        },
+        {
+          "phase": "local",
+          "core": 11,
+          "exit_code": 0,
+          "wall_seconds": 0.4944385000000011,
+          "csv_paths": [
+            "b1-t8/exports/local/core11/OPPROF_20261113093027_WBKLOICZJOAFHLEJ/simulator/core11.veccore0/core11.veccore0_instr_exe_20261113093027533.csv",
+            "b1-t8/exports/local/core11/OPPROF_20261113093027_WBKLOICZJOAFHLEJ/simulator/core11.veccore1/core11.veccore1_instr_exe_20261113093027533.csv"
+          ],
+          "log_sha256": "c093f2c8531688a0ac02de001004287f7758ede9e78704cf98b264990178afd4"
+        },
+        {
+          "phase": "local",
+          "core": 12,
+          "exit_code": 0,
+          "wall_seconds": 0.5451230830000213,
+          "csv_paths": [
+            "b1-t8/exports/local/core12/OPPROF_20261113093027_XLUQIBVOPBQBTZIK/simulator/core12.veccore1/core12.veccore1_instr_exe_20261113093028114.csv",
+            "b1-t8/exports/local/core12/OPPROF_20261113093027_XLUQIBVOPBQBTZIK/simulator/core12.veccore0/core12.veccore0_instr_exe_20261113093028114.csv"
+          ],
+          "log_sha256": "9ea41af1f35dd874867be79ae08c9659bf082a45639a8449622feeb9a742d228"
+        },
+        {
+          "phase": "local",
+          "core": 13,
+          "exit_code": 0,
+          "wall_seconds": 0.5216921670000261,
+          "csv_paths": [
+            "b1-t8/exports/local/core13/OPPROF_20261113093028_YZWYPCIWRNSPQDDV/simulator/core13.veccore1/core13.veccore1_instr_exe_20261113093028620.csv",
+            "b1-t8/exports/local/core13/OPPROF_20261113093028_YZWYPCIWRNSPQDDV/simulator/core13.veccore0/core13.veccore0_instr_exe_20261113093028619.csv"
+          ],
+          "log_sha256": "f39270da0b93f23f875f379e508dadb8563d2a56a51ddcfdbf19cd600094794c"
+        },
+        {
+          "phase": "local",
+          "core": 14,
+          "exit_code": 0,
+          "wall_seconds": 0.5140678749999665,
+          "csv_paths": [
+            "b1-t8/exports/local/core14/OPPROF_20261113093028_RIKQVYOMWCLTEQIJ/simulator/core14.veccore1/core14.veccore1_instr_exe_20261113093029153.csv",
+            "b1-t8/exports/local/core14/OPPROF_20261113093028_RIKQVYOMWCLTEQIJ/simulator/core14.veccore0/core14.veccore0_instr_exe_20261113093029153.csv"
+          ],
+          "log_sha256": "8283b91c560a84474687d01bab434a8b2345f4700b4d146ea0779dce87515bfc"
+        },
+        {
+          "phase": "local",
+          "core": 15,
+          "exit_code": 0,
+          "wall_seconds": 0.46072800000001735,
+          "csv_paths": [
+            "b1-t8/exports/local/core15/OPPROF_20261113093029_BMRQIBFGGPYKIDBK/simulator/core15.veccore1/core15.veccore1_instr_exe_20261113093029686.csv",
+            "b1-t8/exports/local/core15/OPPROF_20261113093029_BMRQIBFGGPYKIDBK/simulator/core15.veccore0/core15.veccore0_instr_exe_20261113093029686.csv"
+          ],
+          "log_sha256": "1c6eaed7f79deb9a34d636cae7fc188bb45d8b5153544e639e2349ceb3f3305e"
+        },
+        {
+          "phase": "merge",
+          "core": 0,
+          "exit_code": 0,
+          "wall_seconds": 0.5137787920000392,
+          "csv_paths": [
+            "b1-t8/exports/merge/core0/OPPROF_20261113093029_XLUDXMXPJCPYSJFR/simulator/core0.veccore1/core0.veccore1_instr_exe_20261113093030169.csv",
+            "b1-t8/exports/merge/core0/OPPROF_20261113093029_XLUDXMXPJCPYSJFR/simulator/core0.veccore0/core0.veccore0_instr_exe_20261113093030169.csv"
+          ],
+          "log_sha256": "f25b2f1f2850f7a41f5ad0dccdbdd8420ca8918f44cbbb67cc9f124d93111006"
+        },
+        {
+          "phase": "merge",
+          "core": 1,
+          "exit_code": 0,
+          "wall_seconds": 0.4731075409999903,
+          "csv_paths": [
+            "b1-t8/exports/merge/core1/OPPROF_20261113093030_HUEYPJUKCYVRSQOD/simulator/core1.veccore1/core1.veccore1_instr_exe_20261113093030687.csv",
+            "b1-t8/exports/merge/core1/OPPROF_20261113093030_HUEYPJUKCYVRSQOD/simulator/core1.veccore0/core1.veccore0_instr_exe_20261113093030687.csv"
+          ],
+          "log_sha256": "3fede27d15ba00663db40d1c7bfa74c96ec029f1277911beb86795d98a9edbad"
+        }
+      ],
+      "model_capture_wall_seconds": 122.41430245799998,
+      "total_model_ticks": 26260,
+      "oracle": {
+        "status": "passed",
+        "scope": "AIV-only exact final TopK component",
+        "batch": 1,
+        "history": 131072,
+        "valid": 131072,
+        "miss_per_query": 205,
+        "shards": 8,
+        "aiv_budget": 56,
+        "local_workers": 32,
+        "merge_workers": 4,
+        "aic_workers": 0,
+        "guards": true,
+        "local_max_worker_cycle_delta": 8026,
+        "merge_max_worker_cycle_delta": 11984,
+        "sum_phase_max_worker_cycle_delta": 20010,
+        "timing_scope": "worker-body only; excludes dispatch and init",
+        "selected_set_and_scores": true,
+        "all_local_candidates": true,
+        "input_unchanged": true,
+        "full_LI": false,
+        "transport": false
+      },
+      "capture_log_sha256": "2d4adf4897b8d2c8288b54ea487be7a05582de2d370e109013e6bc34cbfa2660"
+    },
+    {
+      "case": "b8-t1",
+      "batch": 8,
+      "shards": 1,
+      "status": "PASSED_MODEL_AND_OFFLINE_EXPORT",
+      "collector_exit": null,
+      "collector_postprocess_recovered": true,
+      "exports": [
+        {
+          "phase": "local",
+          "core": 0,
+          "exit_code": 0,
+          "wall_seconds": 1.982739583,
+          "csv_paths": [
+            "b8-t1/exports/local/core0/OPPROF_20261113094220_UOVEQAPAXAVZQLND/simulator/core0.veccore1/core0.veccore1_instr_exe_20261113094221722.csv",
+            "b8-t1/exports/local/core0/OPPROF_20261113094220_UOVEQAPAXAVZQLND/simulator/core0.veccore0/core0.veccore0_instr_exe_20261113094221722.csv"
+          ],
+          "log_sha256": "750ca5c937b4b0edd3de5aa684bce4d68eaa740fe04563da6f52466d5366ac2a"
+        },
+        {
+          "phase": "local",
+          "core": 1,
+          "exit_code": 0,
+          "wall_seconds": 1.9997824999999998,
+          "csv_paths": [
+            "b8-t1/exports/local/core1/OPPROF_20261113094222_OXSEIMGOPPRVFAOT/simulator/core1.veccore1/core1.veccore1_instr_exe_20261113094223855.csv",
+            "b8-t1/exports/local/core1/OPPROF_20261113094222_OXSEIMGOPPRVFAOT/simulator/core1.veccore0/core1.veccore0_instr_exe_20261113094223855.csv"
+          ],
+          "log_sha256": "0cd73be25ea125f24c5d3279499735316b0da5fd5f7d9635b4777e73458beab4"
+        },
+        {
+          "phase": "local",
+          "core": 2,
+          "exit_code": 0,
+          "wall_seconds": 2.105484625,
+          "csv_paths": [
+            "b8-t1/exports/local/core2/OPPROF_20261113094224_AHVQZOXNSVTBXGEU/simulator/core2.veccore0/core2.veccore0_instr_exe_20261113094225984.csv",
+            "b8-t1/exports/local/core2/OPPROF_20261113094224_AHVQZOXNSVTBXGEU/simulator/core2.veccore1/core2.veccore1_instr_exe_20261113094225984.csv"
+          ],
+          "log_sha256": "0a98bf3fb46270bd307ee52a53d789c8dc39b0a2c73d9cb220fc3168106b87ac"
+        },
+        {
+          "phase": "local",
+          "core": 3,
+          "exit_code": 0,
+          "wall_seconds": 1.8635094590000003,
+          "csv_paths": [
+            "b8-t1/exports/local/core3/OPPROF_20261113094226_GPNXOHQOAFUCGJFP/simulator/core3.veccore0/core3.veccore0_instr_exe_20261113094228040.csv",
+            "b8-t1/exports/local/core3/OPPROF_20261113094226_GPNXOHQOAFUCGJFP/simulator/core3.veccore1/core3.veccore1_instr_exe_20261113094228040.csv"
+          ],
+          "log_sha256": "a453c51bafad7a2d4c18b48be59b33bc1f0b070fe091192ecd8ef304c9c17d21"
+        },
+        {
+          "phase": "local",
+          "core": 4,
+          "exit_code": 0,
+          "wall_seconds": 1.946487458,
+          "csv_paths": [
+            "b8-t1/exports/local/core4/OPPROF_20261113094228_OSVEMJPENGNSPUQL/simulator/core4.veccore0/core4.veccore0_instr_exe_20261113094230031.csv",
+            "b8-t1/exports/local/core4/OPPROF_20261113094228_OSVEMJPENGNSPUQL/simulator/core4.veccore1/core4.veccore1_instr_exe_20261113094230031.csv"
+          ],
+          "log_sha256": "4d99ceb8008f9bab1bc5d4d0f78ac99ec079f16528ca2bb09876877764027629"
+        },
+        {
+          "phase": "local",
+          "core": 5,
+          "exit_code": 0,
+          "wall_seconds": 1.7373589999999997,
+          "csv_paths": [
+            "b8-t1/exports/local/core5/OPPROF_20261113094230_WGJWGPTVJYAJLYAT/simulator/core5.veccore0/core5.veccore0_instr_exe_20261113094231889.csv",
+            "b8-t1/exports/local/core5/OPPROF_20261113094230_WGJWGPTVJYAJLYAT/simulator/core5.veccore1/core5.veccore1_instr_exe_20261113094231889.csv"
+          ],
+          "log_sha256": "dc29ccebe7aba581aa57eec84575af129c3342682b6584f903f4bf2b4252b559"
+        },
+        {
+          "phase": "local",
+          "core": 6,
+          "exit_code": 0,
+          "wall_seconds": 2.1678215420000004,
+          "csv_paths": [
+            "b8-t1/exports/local/core6/OPPROF_20261113094232_IMHOYOMTZGBYPIWZ/simulator/core6.veccore1/core6.veccore1_instr_exe_20261113094234306.csv",
+            "b8-t1/exports/local/core6/OPPROF_20261113094232_IMHOYOMTZGBYPIWZ/simulator/core6.veccore0/core6.veccore0_instr_exe_20261113094234306.csv"
+          ],
+          "log_sha256": "ba1557cac54c7dcfc95b4aff8069f5e51ae416759dfd8bf955eb2fa10337b486"
+        },
+        {
+          "phase": "local",
+          "core": 7,
+          "exit_code": 0,
+          "wall_seconds": 1.7710384170000015,
+          "csv_paths": [
+            "b8-t1/exports/local/core7/OPPROF_20261113094234_QJWAZFQGCUZWFLSS/simulator/core7.veccore1/core7.veccore1_instr_exe_20261113094236148.csv",
+            "b8-t1/exports/local/core7/OPPROF_20261113094234_QJWAZFQGCUZWFLSS/simulator/core7.veccore0/core7.veccore0_instr_exe_20261113094236148.csv"
+          ],
+          "log_sha256": "44ce88a3e26828b237a69d2191cc758ed6c7cab8e34dca5051d2a6f14903d6fe"
+        },
+        {
+          "phase": "local",
+          "core": 8,
+          "exit_code": 0,
+          "wall_seconds": 1.9961616249999992,
+          "csv_paths": [
+            "b8-t1/exports/local/core8/OPPROF_20261113094236_JEHVEWLBYNLHDMAQ/simulator/core8.veccore1/core8.veccore1_instr_exe_20261113094238232.csv",
+            "b8-t1/exports/local/core8/OPPROF_20261113094236_JEHVEWLBYNLHDMAQ/simulator/core8.veccore0/core8.veccore0_instr_exe_20261113094238232.csv"
+          ],
+          "log_sha256": "26389d7164690dffcd16c0a3e45788a258a1039060044b1fb73710bc30bf4f68"
+        },
+        {
+          "phase": "local",
+          "core": 9,
+          "exit_code": 0,
+          "wall_seconds": 1.8399137919999973,
+          "csv_paths": [
+            "b8-t1/exports/local/core9/OPPROF_20261113094238_XFMHFIGOKLZARKAK/simulator/core9.veccore1/core9.veccore1_instr_exe_20261113094240126.csv",
+            "b8-t1/exports/local/core9/OPPROF_20261113094238_XFMHFIGOKLZARKAK/simulator/core9.veccore0/core9.veccore0_instr_exe_20261113094240126.csv"
+          ],
+          "log_sha256": "79b1d89c1a99c62f3e8183bdc296ec2d21ecf3ed652cfe6fa8ae2a21277093bc"
+        },
+        {
+          "phase": "local",
+          "core": 10,
+          "exit_code": 0,
+          "wall_seconds": 1.9173015000000007,
+          "csv_paths": [
+            "b8-t1/exports/local/core10/OPPROF_20261113094240_FBDPIJVYVCQQFESL/simulator/core10.veccore0/core10.veccore0_instr_exe_20261113094242079.csv",
+            "b8-t1/exports/local/core10/OPPROF_20261113094240_FBDPIJVYVCQQFESL/simulator/core10.veccore1/core10.veccore1_instr_exe_20261113094242079.csv"
+          ],
+          "log_sha256": "51c984da8ff4c2eb8aa387a3bba03bd2db826fb71c7ace026027e2cb23a0a12f"
+        },
+        {
+          "phase": "local",
+          "core": 11,
+          "exit_code": 0,
+          "wall_seconds": 1.8738874999999986,
+          "csv_paths": [
+            "b8-t1/exports/local/core11/OPPROF_20261113094242_YQVKLUPKSOAQPRRH/simulator/core11.veccore0/core11.veccore0_instr_exe_20261113094243990.csv",
+            "b8-t1/exports/local/core11/OPPROF_20261113094242_YQVKLUPKSOAQPRRH/simulator/core11.veccore1/core11.veccore1_instr_exe_20261113094243990.csv"
+          ],
+          "log_sha256": "92d6e90e5ee73157b34216d91b9c9229c2bcac60216afc08ce6a07b480a1a83d"
+        },
+        {
+          "phase": "local",
+          "core": 12,
+          "exit_code": 0,
+          "wall_seconds": 1.768311875000002,
+          "csv_paths": [
+            "b8-t1/exports/local/core12/OPPROF_20261113094244_COBGFBZGQBJCVEPJ/simulator/core12.veccore1/core12.veccore1_instr_exe_20261113094245909.csv",
+            "b8-t1/exports/local/core12/OPPROF_20261113094244_COBGFBZGQBJCVEPJ/simulator/core12.veccore0/core12.veccore0_instr_exe_20261113094245909.csv"
+          ],
+          "log_sha256": "9885bcdbd3c7abdec7aa8a93193d25120127e8a5466d29f60565b42a9c15c545"
+        },
+        {
+          "phase": "local",
+          "core": 13,
+          "exit_code": 0,
+          "wall_seconds": 1.8361709589999968,
+          "csv_paths": [
+            "b8-t1/exports/local/core13/OPPROF_20261113094246_ZTNDGDHFBPFNFHSB/simulator/core13.veccore1/core13.veccore1_instr_exe_20261113094247785.csv",
+            "b8-t1/exports/local/core13/OPPROF_20261113094246_ZTNDGDHFBPFNFHSB/simulator/core13.veccore0/core13.veccore0_instr_exe_20261113094247785.csv"
+          ],
+          "log_sha256": "0de9b02cd5a63176b6181a696c2cb49ac70e35206a6e66ca9d77bc0a7cd08920"
+        },
+        {
+          "phase": "local",
+          "core": 14,
+          "exit_code": 0,
+          "wall_seconds": 1.8331221249999992,
+          "csv_paths": [
+            "b8-t1/exports/local/core14/OPPROF_20261113094248_YTIQCHEPCEOEUMBR/simulator/core14.veccore1/core14.veccore1_instr_exe_20261113094249596.csv",
+            "b8-t1/exports/local/core14/OPPROF_20261113094248_YTIQCHEPCEOEUMBR/simulator/core14.veccore0/core14.veccore0_instr_exe_20261113094249596.csv"
+          ],
+          "log_sha256": "ff86548c9ff75226b593fd2054428eea588c0630a872a403a08c19b330c3d696"
+        },
+        {
+          "phase": "local",
+          "core": 15,
+          "exit_code": 0,
+          "wall_seconds": 1.981766375000003,
+          "csv_paths": [
+            "b8-t1/exports/local/core15/OPPROF_20261113094250_MLIULDWHLSVCUAWM/simulator/core15.veccore1/core15.veccore1_instr_exe_20261113094251686.csv",
+            "b8-t1/exports/local/core15/OPPROF_20261113094250_MLIULDWHLSVCUAWM/simulator/core15.veccore0/core15.veccore0_instr_exe_20261113094251686.csv"
+          ],
+          "log_sha256": "aec3e920c69e1020da8afd86cec2c7ed9a94730515a5b6da132e2ce1962469b7"
+        }
+      ],
+      "model_capture_wall_seconds": null,
+      "collector_note": "Model and SDK output completed; collector return code was not persisted before path-layout assertion in v2",
+      "total_model_ticks": 53689,
+      "oracle": {
+        "status": "passed",
+        "scope": "AIV-only exact final TopK component",
+        "batch": 8,
+        "history": 131072,
+        "valid": 131072,
+        "miss_per_query": 205,
+        "shards": 1,
+        "aiv_budget": 56,
+        "local_workers": 32,
+        "merge_workers": 0,
+        "aic_workers": 0,
+        "guards": true,
+        "local_max_worker_cycle_delta": 48799,
+        "merge_max_worker_cycle_delta": 0,
+        "sum_phase_max_worker_cycle_delta": 48799,
+        "timing_scope": "worker-body only; excludes dispatch and init",
+        "selected_set_and_scores": true,
+        "all_local_candidates": true,
+        "input_unchanged": true,
+        "full_LI": false,
+        "transport": false
+      },
+      "capture_log_sha256": "2c885847fa3ba58ffd765bf306d0d84a451ce9bdc0d86a731b3d33be2e3767d5"
+    },
+    {
+      "case": "b8-t4",
+      "batch": 8,
+      "shards": 4,
+      "status": "PASSED_MODEL_AND_OFFLINE_EXPORT",
+      "collector_exit": 0,
+      "collector_postprocess_recovered": false,
+      "exports": [
+        {
+          "phase": "local",
+          "core": 0,
+          "exit_code": 0,
+          "wall_seconds": 1.5328916249999338,
+          "csv_paths": [
+            "b8-t4/exports/local/core0/OPPROF_20261113095433_MJEDFGCPWZRCYSQQ/simulator/core0.veccore1/core0.veccore1_instr_exe_20261113095434608.csv",
+            "b8-t4/exports/local/core0/OPPROF_20261113095433_MJEDFGCPWZRCYSQQ/simulator/core0.veccore0/core0.veccore0_instr_exe_20261113095434608.csv"
+          ],
+          "log_sha256": "656567aaec5eef7b3198f4aed115d5d2d01533faa31e82810f6316e4b3d44760"
+        },
+        {
+          "phase": "local",
+          "core": 1,
+          "exit_code": 0,
+          "wall_seconds": 1.3632073339999806,
+          "csv_paths": [
+            "b8-t4/exports/local/core1/OPPROF_20261113095434_MTPUNRGMBFZXJMSZ/simulator/core1.veccore1/core1.veccore1_instr_exe_20261113095436008.csv",
+            "b8-t4/exports/local/core1/OPPROF_20261113095434_MTPUNRGMBFZXJMSZ/simulator/core1.veccore0/core1.veccore0_instr_exe_20261113095436008.csv"
+          ],
+          "log_sha256": "ee362d8a6e2e67ade70f500543b4e32cd3b05131ca76e252db91b44835c7abfb"
+        },
+        {
+          "phase": "local",
+          "core": 2,
+          "exit_code": 0,
+          "wall_seconds": 1.8374339580000196,
+          "csv_paths": [
+            "b8-t4/exports/local/core2/OPPROF_20261113095436_GPMJXCRGLDIKMDRW/simulator/core2.veccore0/core2.veccore0_instr_exe_20261113095437848.csv",
+            "b8-t4/exports/local/core2/OPPROF_20261113095436_GPMJXCRGLDIKMDRW/simulator/core2.veccore1/core2.veccore1_instr_exe_20261113095437848.csv"
+          ],
+          "log_sha256": "12141eb3fbf039a3bee069894aae976b78e8a0cd7c3eaae71b4bae794cd3d700"
+        },
+        {
+          "phase": "local",
+          "core": 3,
+          "exit_code": 0,
+          "wall_seconds": 1.4536117499999364,
+          "csv_paths": [
+            "b8-t4/exports/local/core3/OPPROF_20261113095438_ORLFIPBEKQLUWNQH/simulator/core3.veccore0/core3.veccore0_instr_exe_20261113095439318.csv",
+            "b8-t4/exports/local/core3/OPPROF_20261113095438_ORLFIPBEKQLUWNQH/simulator/core3.veccore1/core3.veccore1_instr_exe_20261113095439318.csv"
+          ],
+          "log_sha256": "103a08a39d4c278e150317c5b1630db5e735737d3231ecf19dfd37bb6f796a31"
+        },
+        {
+          "phase": "local",
+          "core": 4,
+          "exit_code": 0,
+          "wall_seconds": 1.4424446250000074,
+          "csv_paths": [
+            "b8-t4/exports/local/core4/OPPROF_20261113095439_TYWIOTMMMUDTQLJV/simulator/core4.veccore0/core4.veccore0_instr_exe_20261113095440769.csv",
+            "b8-t4/exports/local/core4/OPPROF_20261113095439_TYWIOTMMMUDTQLJV/simulator/core4.veccore1/core4.veccore1_instr_exe_20261113095440769.csv"
+          ],
+          "log_sha256": "69ff03e72e122df7a58b69e670a96bbf5c6f572a846901ba5b5dd23956d9dc70"
+        },
+        {
+          "phase": "local",
+          "core": 5,
+          "exit_code": 0,
+          "wall_seconds": 1.4668651250000266,
+          "csv_paths": [
+            "b8-t4/exports/local/core5/OPPROF_20261113095441_XPYMIAOSDVXZMPIF/simulator/core5.veccore0/core5.veccore0_instr_exe_20261113095442227.csv",
+            "b8-t4/exports/local/core5/OPPROF_20261113095441_XPYMIAOSDVXZMPIF/simulator/core5.veccore1/core5.veccore1_instr_exe_20261113095442227.csv"
+          ],
+          "log_sha256": "3a9817585d92f5fb8878d3a27a455df45321f6e4fe9d9038477a126971d41490"
+        },
+        {
+          "phase": "local",
+          "core": 6,
+          "exit_code": 0,
+          "wall_seconds": 1.420695042000034,
+          "csv_paths": [
+            "b8-t4/exports/local/core6/OPPROF_20261113095442_LAHHFSJMICRFFJCA/simulator/core6.veccore1/core6.veccore1_instr_exe_20261113095443659.csv",
+            "b8-t4/exports/local/core6/OPPROF_20261113095442_LAHHFSJMICRFFJCA/simulator/core6.veccore0/core6.veccore0_instr_exe_20261113095443659.csv"
+          ],
+          "log_sha256": "207040d0529347b89cd16ad0c95ffd23f7b846df7509bef8e511338312bc41c1"
+        },
+        {
+          "phase": "local",
+          "core": 7,
+          "exit_code": 0,
+          "wall_seconds": 1.4707603749999407,
+          "csv_paths": [
+            "b8-t4/exports/local/core7/OPPROF_20261113095443_QYTPDRQBAIKYALMW/simulator/core7.veccore1/core7.veccore1_instr_exe_20261113095445155.csv",
+            "b8-t4/exports/local/core7/OPPROF_20261113095443_QYTPDRQBAIKYALMW/simulator/core7.veccore0/core7.veccore0_instr_exe_20261113095445155.csv"
+          ],
+          "log_sha256": "b8a6f044f56c8aab7d297bbc3a2172d450ea52d75385e15f8a7eeca2a08d0297"
+        },
+        {
+          "phase": "local",
+          "core": 8,
+          "exit_code": 0,
+          "wall_seconds": 1.0332231249999495,
+          "csv_paths": [
+            "b8-t4/exports/local/core8/OPPROF_20261113095445_TDIWKXFZJXQXSHTP/simulator/core8.veccore1/core8.veccore1_instr_exe_20261113095446232.csv",
+            "b8-t4/exports/local/core8/OPPROF_20261113095445_TDIWKXFZJXQXSHTP/simulator/core8.veccore0/core8.veccore0_instr_exe_20261113095446232.csv"
+          ],
+          "log_sha256": "f4d8b6b8b8edd3fb233c2b34f4a35345e91830af16bc243aae28ae10f2998f75"
+        },
+        {
+          "phase": "local",
+          "core": 9,
+          "exit_code": 0,
+          "wall_seconds": 1.2722961250000253,
+          "csv_paths": [
+            "b8-t4/exports/local/core9/OPPROF_20261113095446_OWRPRXDJAZBUJJXH/simulator/core9.veccore1/core9.veccore1_instr_exe_20261113095447541.csv",
+            "b8-t4/exports/local/core9/OPPROF_20261113095446_OWRPRXDJAZBUJJXH/simulator/core9.veccore0/core9.veccore0_instr_exe_20261113095447541.csv"
+          ],
+          "log_sha256": "f965c1a77f24b8c06d559b70ffe66a64c7ac5766cb65853fa6a0e12f7d9f05b7"
+        },
+        {
+          "phase": "local",
+          "core": 10,
+          "exit_code": 0,
+          "wall_seconds": 1.290826999999922,
+          "csv_paths": [
+            "b8-t4/exports/local/core10/OPPROF_20261113095447_SAZTTQCUMDBAZFOR/simulator/core10.veccore0/core10.veccore0_instr_exe_20261113095448716.csv",
+            "b8-t4/exports/local/core10/OPPROF_20261113095447_SAZTTQCUMDBAZFOR/simulator/core10.veccore1/core10.veccore1_instr_exe_20261113095448716.csv"
+          ],
+          "log_sha256": "6fe95884fc87359314a1f2f74ad7f473b546fb8f2176d0e6bcfcba3a4d1f4a93"
+        },
+        {
+          "phase": "local",
+          "core": 11,
+          "exit_code": 0,
+          "wall_seconds": 1.0429152089999434,
+          "csv_paths": [
+            "b8-t4/exports/local/core11/OPPROF_20261113095449_GMSUZHORJWNJMLWS/simulator/core11.veccore0/core11.veccore0_instr_exe_20261113095449853.csv",
+            "b8-t4/exports/local/core11/OPPROF_20261113095449_GMSUZHORJWNJMLWS/simulator/core11.veccore1/core11.veccore1_instr_exe_20261113095449853.csv"
+          ],
+          "log_sha256": "cb484dc452c5d06d2d74aab552c69859e611c51a717d1d48cfd3910a5159df28"
+        },
+        {
+          "phase": "local",
+          "core": 12,
+          "exit_code": 0,
+          "wall_seconds": 1.010456750000003,
+          "csv_paths": [
+            "b8-t4/exports/local/core12/OPPROF_20261113095450_TMBDYQBUFGIFYRPM/simulator/core12.veccore1/core12.veccore1_instr_exe_20261113095450910.csv",
+            "b8-t4/exports/local/core12/OPPROF_20261113095450_TMBDYQBUFGIFYRPM/simulator/core12.veccore0/core12.veccore0_instr_exe_20261113095450910.csv"
+          ],
+          "log_sha256": "963a662912046896be54eecfd073bffc7e6b023adabab04023b1dae2d9993f21"
+        },
+        {
+          "phase": "local",
+          "core": 13,
+          "exit_code": 0,
+          "wall_seconds": 1.035494791999895,
+          "csv_paths": [
+            "b8-t4/exports/local/core13/OPPROF_20261113095451_TQOAXSMFZZVXXOKX/simulator/core13.veccore1/core13.veccore1_instr_exe_20261113095451965.csv",
+            "b8-t4/exports/local/core13/OPPROF_20261113095451_TQOAXSMFZZVXXOKX/simulator/core13.veccore0/core13.veccore0_instr_exe_20261113095451965.csv"
+          ],
+          "log_sha256": "fa9fb38dd023285a207c7e935a26b0965b7d277bab3eb157c873e9fa1791d127"
+        },
+        {
+          "phase": "local",
+          "core": 14,
+          "exit_code": 0,
+          "wall_seconds": 1.0879836670000032,
+          "csv_paths": [
+            "b8-t4/exports/local/core14/OPPROF_20261113095452_FTGXZSLHQZPOSQLB/simulator/core14.veccore1/core14.veccore1_instr_exe_20261113095453041.csv",
+            "b8-t4/exports/local/core14/OPPROF_20261113095452_FTGXZSLHQZPOSQLB/simulator/core14.veccore0/core14.veccore0_instr_exe_20261113095453041.csv"
+          ],
+          "log_sha256": "dafacde9a6f3f62797c28150e4a090a405cb8e9ee05c00c41626a7fd141ceace"
+        },
+        {
+          "phase": "local",
+          "core": 15,
+          "exit_code": 0,
+          "wall_seconds": 1.0249182500000416,
+          "csv_paths": [
+            "b8-t4/exports/local/core15/OPPROF_20261113095453_VOASOJSFVFVYZBMY/simulator/core15.veccore1/core15.veccore1_instr_exe_20261113095454059.csv",
+            "b8-t4/exports/local/core15/OPPROF_20261113095453_VOASOJSFVFVYZBMY/simulator/core15.veccore0/core15.veccore0_instr_exe_20261113095454059.csv"
+          ],
+          "log_sha256": "07e37d69ec18b09f91928be0af1cd63e0de94162c0848922ced602aaa031300b"
+        },
+        {
+          "phase": "local",
+          "core": 16,
+          "exit_code": 0,
+          "wall_seconds": 1.30466745800004,
+          "csv_paths": [
+            "b8-t4/exports/local/core16/OPPROF_20261113095454_RJJFBTTVQTZPAGHB/simulator/core16.veccore0/core16.veccore0_instr_exe_20261113095455365.csv",
+            "b8-t4/exports/local/core16/OPPROF_20261113095454_RJJFBTTVQTZPAGHB/simulator/core16.veccore1/core16.veccore1_instr_exe_20261113095455364.csv"
+          ],
+          "log_sha256": "d665a898f2ef51f175f6a839c11e936d4b42054836f9171644f15532230a5e0b"
+        },
+        {
+          "phase": "local",
+          "core": 17,
+          "exit_code": 0,
+          "wall_seconds": 1.240981500000089,
+          "csv_paths": [
+            "b8-t4/exports/local/core17/OPPROF_20261113095455_LYNHETYWJPBDIMSD/simulator/core17.veccore0/core17.veccore0_instr_exe_20261113095456611.csv",
+            "b8-t4/exports/local/core17/OPPROF_20261113095455_LYNHETYWJPBDIMSD/simulator/core17.veccore1/core17.veccore1_instr_exe_20261113095456611.csv"
+          ],
+          "log_sha256": "923449cffe4b4a27425cd36552359e277cd29b80cb6dab20e300233e7e390615"
+        },
+        {
+          "phase": "local",
+          "core": 18,
+          "exit_code": 0,
+          "wall_seconds": 1.0720737909999798,
+          "csv_paths": [
+            "b8-t4/exports/local/core18/OPPROF_20261113095456_WPHJQQRHIHDQLUWW/simulator/core18.veccore0/core18.veccore0_instr_exe_20261113095457728.csv",
+            "b8-t4/exports/local/core18/OPPROF_20261113095456_WPHJQQRHIHDQLUWW/simulator/core18.veccore1/core18.veccore1_instr_exe_20261113095457728.csv"
+          ],
+          "log_sha256": "db7cb86fb63ee72ab8610bcecb123b7019a07ca7e58ab9ca122157c210390cd2"
+        },
+        {
+          "phase": "local",
+          "core": 19,
+          "exit_code": 0,
+          "wall_seconds": 1.0278561659999923,
+          "csv_paths": [
+            "b8-t4/exports/local/core19/OPPROF_20261113095458_PBEBFNYAHDEKVZZV/simulator/core19.veccore0/core19.veccore0_instr_exe_20261113095458821.csv",
+            "b8-t4/exports/local/core19/OPPROF_20261113095458_PBEBFNYAHDEKVZZV/simulator/core19.veccore1/core19.veccore1_instr_exe_20261113095458821.csv"
+          ],
+          "log_sha256": "3c96dfaca821765d14326d1ad3a3bf254d1455844ebcc7b65020c6a6c11ebeb5"
+        },
+        {
+          "phase": "local",
+          "core": 20,
+          "exit_code": 0,
+          "wall_seconds": 1.1190239580000707,
+          "csv_paths": [
+            "b8-t4/exports/local/core20/OPPROF_20261113095459_ROKOUTHLASDGSVEO/simulator/core20.veccore0/core20.veccore0_instr_exe_20261113095459859.csv",
+            "b8-t4/exports/local/core20/OPPROF_20261113095459_ROKOUTHLASDGSVEO/simulator/core20.veccore1/core20.veccore1_instr_exe_20261113095459859.csv"
+          ],
+          "log_sha256": "f2eca149f2d69b5ea7e6a93f2450050b9d0df7823ffe4f7ad7dc276e563ba341"
+        },
+        {
+          "phase": "local",
+          "core": 21,
+          "exit_code": 0,
+          "wall_seconds": 1.0652353330000324,
+          "csv_paths": [
+            "b8-t4/exports/local/core21/OPPROF_20261113095500_SKYYCRMVUJGTQVES/simulator/core21.veccore0/core21.veccore0_instr_exe_20261113095501015.csv",
+            "b8-t4/exports/local/core21/OPPROF_20261113095500_SKYYCRMVUJGTQVES/simulator/core21.veccore1/core21.veccore1_instr_exe_20261113095501015.csv"
+          ],
+          "log_sha256": "d34822afbdcbc9121e1084119db418dc46257bdc1af21856c8006b8950255746"
+        },
+        {
+          "phase": "local",
+          "core": 22,
+          "exit_code": 0,
+          "wall_seconds": 1.0555873330000622,
+          "csv_paths": [
+            "b8-t4/exports/local/core22/OPPROF_20261113095501_EVAHLHDJDMUTUWRE/simulator/core22.veccore1/core22.veccore1_instr_exe_20261113095502083.csv",
+            "b8-t4/exports/local/core22/OPPROF_20261113095501_EVAHLHDJDMUTUWRE/simulator/core22.veccore0/core22.veccore0_instr_exe_20261113095502083.csv"
+          ],
+          "log_sha256": "233464f5c648a34205f7261c48fbee6334d0963bd6bdb7f90b4645dc0ff69a2c"
+        },
+        {
+          "phase": "local",
+          "core": 23,
+          "exit_code": 0,
+          "wall_seconds": 1.0283940000000484,
+          "csv_paths": [
+            "b8-t4/exports/local/core23/OPPROF_20261113095502_ERTYRXHZYRPLLMXP/simulator/core23.veccore1/core23.veccore1_instr_exe_20261113095503137.csv",
+            "b8-t4/exports/local/core23/OPPROF_20261113095502_ERTYRXHZYRPLLMXP/simulator/core23.veccore0/core23.veccore0_instr_exe_20261113095503137.csv"
+          ],
+          "log_sha256": "151c02b86ef97069a39884696c6423386bb15f7765e7e2ffb01e7204884872a5"
+        },
+        {
+          "phase": "local",
+          "core": 24,
+          "exit_code": 0,
+          "wall_seconds": 1.3234325000000808,
+          "csv_paths": [
+            "b8-t4/exports/local/core24/OPPROF_20261113095503_ALYPUJPYTROILEEG/simulator/core24.veccore1/core24.veccore1_instr_exe_20261113095504500.csv",
+            "b8-t4/exports/local/core24/OPPROF_20261113095503_ALYPUJPYTROILEEG/simulator/core24.veccore0/core24.veccore0_instr_exe_20261113095504500.csv"
+          ],
+          "log_sha256": "7496646c72b295eb1884c19551a98a51032fcae7ba5fb4f315b42af102632bdb"
+        },
+        {
+          "phase": "local",
+          "core": 25,
+          "exit_code": 0,
+          "wall_seconds": 1.0302864579999778,
+          "csv_paths": [
+            "b8-t4/exports/local/core25/OPPROF_20261113095504_JLWOGJOTPRVCILOH/simulator/core25.veccore1/core25.veccore1_instr_exe_20261113095505548.csv",
+            "b8-t4/exports/local/core25/OPPROF_20261113095504_JLWOGJOTPRVCILOH/simulator/core25.veccore0/core25.veccore0_instr_exe_20261113095505548.csv"
+          ],
+          "log_sha256": "015a8c80f1e2680abbaaecc5bde18014b8cf2507010c4a462ee8d5b890cabf3c"
+        },
+        {
+          "phase": "local",
+          "core": 26,
+          "exit_code": 0,
+          "wall_seconds": 1.0301336250000759,
+          "csv_paths": [
+            "b8-t4/exports/local/core26/OPPROF_20261113095505_WTXMQWZSFTZRIZSF/simulator/core26.veccore0/core26.veccore0_instr_exe_20261113095506562.csv",
+            "b8-t4/exports/local/core26/OPPROF_20261113095505_WTXMQWZSFTZRIZSF/simulator/core26.veccore1/core26.veccore1_instr_exe_20261113095506562.csv"
+          ],
+          "log_sha256": "faaf5f1f4536cf007a9312e5eef8ec84f7d720af427952448b2380f99d24b060"
+        },
+        {
+          "phase": "local",
+          "core": 27,
+          "exit_code": 0,
+          "wall_seconds": 1.0649013749999767,
+          "csv_paths": [
+            "b8-t4/exports/local/core27/OPPROF_20261113095506_OUWRAMWNXTJQFRBP/simulator/core27.veccore0/core27.veccore0_instr_exe_20261113095507648.csv",
+            "b8-t4/exports/local/core27/OPPROF_20261113095506_OUWRAMWNXTJQFRBP/simulator/core27.veccore1/core27.veccore1_instr_exe_20261113095507648.csv"
+          ],
+          "log_sha256": "c37d77f5db2ca42fc8f12808e4a7c4f4f58d29dd326e33470f9999871b0dd99e"
+        },
+        {
+          "phase": "merge",
+          "core": 0,
+          "exit_code": 0,
+          "wall_seconds": 0.47181991699994796,
+          "csv_paths": [
+            "b8-t4/exports/merge/core0/OPPROF_20261113095507_LZTJIMFUMOSHEPSZ/simulator/core0.veccore1/core0.veccore1_instr_exe_20261113095508205.csv",
+            "b8-t4/exports/merge/core0/OPPROF_20261113095507_LZTJIMFUMOSHEPSZ/simulator/core0.veccore0/core0.veccore0_instr_exe_20261113095508205.csv"
+          ],
+          "log_sha256": "c72f841e9b1a5b09d61d4b3d08e98c910dd989b4933fa3287b61fce23651bbbf"
+        },
+        {
+          "phase": "merge",
+          "core": 1,
+          "exit_code": 0,
+          "wall_seconds": 0.47238320799999656,
+          "csv_paths": [
+            "b8-t4/exports/merge/core1/OPPROF_20261113095508_EQMFVRCUMMQKBQEH/simulator/core1.veccore1/core1.veccore1_instr_exe_20261113095508692.csv",
+            "b8-t4/exports/merge/core1/OPPROF_20261113095508_EQMFVRCUMMQKBQEH/simulator/core1.veccore0/core1.veccore0_instr_exe_20261113095508692.csv"
+          ],
+          "log_sha256": "2fa9759dddebed08c9b2d61e641c37f0d5532661fe6aac6d5c942649beef7219"
+        },
+        {
+          "phase": "merge",
+          "core": 2,
+          "exit_code": 0,
+          "wall_seconds": 0.5575713750000659,
+          "csv_paths": [
+            "b8-t4/exports/merge/core2/OPPROF_20261113095508_FADPSONSSQXAVMRE/simulator/core2.veccore0/core2.veccore0_instr_exe_20261113095509161.csv",
+            "b8-t4/exports/merge/core2/OPPROF_20261113095508_FADPSONSSQXAVMRE/simulator/core2.veccore1/core2.veccore1_instr_exe_20261113095509161.csv"
+          ],
+          "log_sha256": "f523f1df23adcd802fe252cf06a045eb26c07b15b299f7944d78bd71e043bec8"
+        },
+        {
+          "phase": "merge",
+          "core": 3,
+          "exit_code": 0,
+          "wall_seconds": 0.5031872499999963,
+          "csv_paths": [
+            "b8-t4/exports/merge/core3/OPPROF_20261113095509_MLIRVZNNIOQTHTGX/simulator/core3.veccore0/core3.veccore0_instr_exe_20261113095509764.csv",
+            "b8-t4/exports/merge/core3/OPPROF_20261113095509_MLIRVZNNIOQTHTGX/simulator/core3.veccore1/core3.veccore1_instr_exe_20261113095509764.csv"
+          ],
+          "log_sha256": "ae5b63d72e0ea82aa35d9a0076f793cd0ee14654f6c2c7ca69e39ba46046dd7a"
+        },
+        {
+          "phase": "merge",
+          "core": 4,
+          "exit_code": 0,
+          "wall_seconds": 0.5261364169999752,
+          "csv_paths": [
+            "b8-t4/exports/merge/core4/OPPROF_20261113095509_TDKCTMQFBTTMIOWH/simulator/core4.veccore0/core4.veccore0_instr_exe_20261113095510270.csv",
+            "b8-t4/exports/merge/core4/OPPROF_20261113095509_TDKCTMQFBTTMIOWH/simulator/core4.veccore1/core4.veccore1_instr_exe_20261113095510270.csv"
+          ],
+          "log_sha256": "5bd9651d18b80daacdac04455b4f72605e05ee5259a85a385a07930d12d7fda2"
+        },
+        {
+          "phase": "merge",
+          "core": 5,
+          "exit_code": 0,
+          "wall_seconds": 0.4685972500000162,
+          "csv_paths": [
+            "b8-t4/exports/merge/core5/OPPROF_20261113095510_QKAATTGYNNDXAPAS/simulator/core5.veccore0/core5.veccore0_instr_exe_20261113095510778.csv",
+            "b8-t4/exports/merge/core5/OPPROF_20261113095510_QKAATTGYNNDXAPAS/simulator/core5.veccore1/core5.veccore1_instr_exe_20261113095510778.csv"
+          ],
+          "log_sha256": "7fc0bfb110bb70f80996a5de26fa4437101da046b87e33a873f59572d928776b"
+        },
+        {
+          "phase": "merge",
+          "core": 6,
+          "exit_code": 0,
+          "wall_seconds": 0.4632003330000316,
+          "csv_paths": [
+            "b8-t4/exports/merge/core6/OPPROF_20261113095510_IKGRECIAEZYDCSYW/simulator/core6.veccore1/core6.veccore1_instr_exe_20261113095511295.csv",
+            "b8-t4/exports/merge/core6/OPPROF_20261113095510_IKGRECIAEZYDCSYW/simulator/core6.veccore0/core6.veccore0_instr_exe_20261113095511295.csv"
+          ],
+          "log_sha256": "6a9add3701678451c3dd333406f63009786ba0af4ac548f50f8d3255f70b8b95"
+        },
+        {
+          "phase": "merge",
+          "core": 7,
+          "exit_code": 0,
+          "wall_seconds": 0.5111130419999199,
+          "csv_paths": [
+            "b8-t4/exports/merge/core7/OPPROF_20261113095511_IJYHMEBUAWXRYZBT/simulator/core7.veccore1/core7.veccore1_instr_exe_20261113095511783.csv",
+            "b8-t4/exports/merge/core7/OPPROF_20261113095511_IJYHMEBUAWXRYZBT/simulator/core7.veccore0/core7.veccore0_instr_exe_20261113095511783.csv"
+          ],
+          "log_sha256": "33f83a175b0f0df0b2bdfe2d55d7e5d899e4b2b007e9b82c59f3d96fd6343897"
+        },
+        {
+          "phase": "merge",
+          "core": 8,
+          "exit_code": 0,
+          "wall_seconds": 0.44385254199994506,
+          "csv_paths": [
+            "b8-t4/exports/merge/core8/OPPROF_20261113095511_JTYIOIXHHFPZMIHX/simulator/core8.veccore1/core8.veccore1_instr_exe_20261113095512252.csv",
+            "b8-t4/exports/merge/core8/OPPROF_20261113095511_JTYIOIXHHFPZMIHX/simulator/core8.veccore0/core8.veccore0_instr_exe_20261113095512252.csv"
+          ],
+          "log_sha256": "540b63f6742697d81a0987ae23db926d3a1ab586b1195de4f64d0b59016c5008"
+        },
+        {
+          "phase": "merge",
+          "core": 9,
+          "exit_code": 0,
+          "wall_seconds": 0.4662189580000131,
+          "csv_paths": [
+            "b8-t4/exports/merge/core9/OPPROF_20261113095512_BCZSTFDDGOGJDWUK/simulator/core9.veccore1/core9.veccore1_instr_exe_20261113095512716.csv",
+            "b8-t4/exports/merge/core9/OPPROF_20261113095512_BCZSTFDDGOGJDWUK/simulator/core9.veccore0/core9.veccore0_instr_exe_20261113095512716.csv"
+          ],
+          "log_sha256": "19cff150e06b334d881b9d0a8e5f2a40a6f55a9146453ef68ff19eb6267de2ac"
+        },
+        {
+          "phase": "merge",
+          "core": 10,
+          "exit_code": 0,
+          "wall_seconds": 0.459672458,
+          "csv_paths": [
+            "b8-t4/exports/merge/core10/OPPROF_20261113095512_QAUGTJCJFPBPBADC/simulator/core10.veccore0/core10.veccore0_instr_exe_20261113095513198.csv",
+            "b8-t4/exports/merge/core10/OPPROF_20261113095512_QAUGTJCJFPBPBADC/simulator/core10.veccore1/core10.veccore1_instr_exe_20261113095513198.csv"
+          ],
+          "log_sha256": "373c66b75be45464b74347aaccbfc0353061d39df6a827273f905ca11605b366"
+        },
+        {
+          "phase": "merge",
+          "core": 11,
+          "exit_code": 0,
+          "wall_seconds": 0.6770292080000218,
+          "csv_paths": [
+            "b8-t4/exports/merge/core11/OPPROF_20261113095513_UKSTGIRWJMLZXWES/simulator/core11.veccore0/core11.veccore0_instr_exe_20261113095513859.csv",
+            "b8-t4/exports/merge/core11/OPPROF_20261113095513_UKSTGIRWJMLZXWES/simulator/core11.veccore1/core11.veccore1_instr_exe_20261113095513859.csv"
+          ],
+          "log_sha256": "2f813d1c6a0eba822883764c559e40846a1f105325654212a150dbf506808d3b"
+        },
+        {
+          "phase": "merge",
+          "core": 12,
+          "exit_code": 0,
+          "wall_seconds": 0.46058545899995806,
+          "csv_paths": [
+            "b8-t4/exports/merge/core12/OPPROF_20261113095514_HTYBDAGPRYAQQUXW/simulator/core12.veccore1/core12.veccore1_instr_exe_20261113095514376.csv",
+            "b8-t4/exports/merge/core12/OPPROF_20261113095514_HTYBDAGPRYAQQUXW/simulator/core12.veccore0/core12.veccore0_instr_exe_20261113095514376.csv"
+          ],
+          "log_sha256": "4a70fbf266fefe1c3cb8742286ba8d9afc7c655bd9277d1e4f6e9ae5c991bf79"
+        },
+        {
+          "phase": "merge",
+          "core": 13,
+          "exit_code": 0,
+          "wall_seconds": 0.5063998340000353,
+          "csv_paths": [
+            "b8-t4/exports/merge/core13/OPPROF_20261113095514_WFEHQDILIWYKWUMC/simulator/core13.veccore1/core13.veccore1_instr_exe_20261113095514877.csv",
+            "b8-t4/exports/merge/core13/OPPROF_20261113095514_WFEHQDILIWYKWUMC/simulator/core13.veccore0/core13.veccore0_instr_exe_20261113095514877.csv"
+          ],
+          "log_sha256": "fb004a57b1495b5bb0499a04feaa8cfe8132010c2a673e1a6cecf73e699c8c4a"
+        },
+        {
+          "phase": "merge",
+          "core": 14,
+          "exit_code": 0,
+          "wall_seconds": 0.46297712499995214,
+          "csv_paths": [
+            "b8-t4/exports/merge/core14/OPPROF_20261113095515_XXTUVJDRMFTDBBDG/simulator/core14.veccore1/core14.veccore1_instr_exe_20261113095515383.csv",
+            "b8-t4/exports/merge/core14/OPPROF_20261113095515_XXTUVJDRMFTDBBDG/simulator/core14.veccore0/core14.veccore0_instr_exe_20261113095515383.csv"
+          ],
+          "log_sha256": "4258eb5317f7b87711df3e7bcfff6c3d4d03f907f1b0dfd75b6a4f2aa4061332"
+        },
+        {
+          "phase": "merge",
+          "core": 15,
+          "exit_code": 0,
+          "wall_seconds": 0.4538327919999574,
+          "csv_paths": [
+            "b8-t4/exports/merge/core15/OPPROF_20261113095515_KEEIWOUBDAOTAIBL/simulator/core15.veccore1/core15.veccore1_instr_exe_20261113095515851.csv",
+            "b8-t4/exports/merge/core15/OPPROF_20261113095515_KEEIWOUBDAOTAIBL/simulator/core15.veccore0/core15.veccore0_instr_exe_20261113095515851.csv"
+          ],
+          "log_sha256": "1ac2d6fe98ce89539358c3d9a47dd93d66cdc12fc80b37db2aecc1687988ef77"
+        }
+      ],
+      "model_capture_wall_seconds": 535.612832291,
+      "total_model_ticks": 57777,
+      "oracle": {
+        "status": "passed",
+        "scope": "AIV-only exact final TopK component",
+        "batch": 8,
+        "history": 131072,
+        "valid": 131072,
+        "miss_per_query": 205,
+        "shards": 4,
+        "aiv_budget": 56,
+        "local_workers": 56,
+        "merge_workers": 32,
+        "aic_workers": 0,
+        "guards": true,
+        "local_max_worker_cycle_delta": 38838,
+        "merge_max_worker_cycle_delta": 9842,
+        "sum_phase_max_worker_cycle_delta": 48680,
+        "timing_scope": "worker-body only; excludes dispatch and init",
+        "selected_set_and_scores": true,
+        "all_local_candidates": true,
+        "input_unchanged": true,
+        "full_LI": false,
+        "transport": false
+      },
+      "capture_log_sha256": "27f91578a2890664fd9069bb80a0145297712b12b0c50ab0a66bae4476486d3c"
+    },
+    {
+      "case": "b8-t8",
+      "batch": 8,
+      "shards": 8,
+      "status": "PASSED_MODEL_AND_OFFLINE_EXPORT",
+      "collector_exit": 0,
+      "collector_postprocess_recovered": false,
+      "exports": [
+        {
+          "phase": "local",
+          "core": 0,
+          "exit_code": 0,
+          "wall_seconds": 1.5119301249999353,
+          "csv_paths": [
+            "b8-t8/exports/local/core0/OPPROF_20261113100439_XGUIUUIIDYGQUCPW/simulator/core0.veccore1/core0.veccore1_instr_exe_20261113100440677.csv",
+            "b8-t8/exports/local/core0/OPPROF_20261113100439_XGUIUUIIDYGQUCPW/simulator/core0.veccore0/core0.veccore0_instr_exe_20261113100440677.csv"
+          ],
+          "log_sha256": "d3a2d99e22bddf4c7b0fe53f61248ebdad5dce507cd87b4da5ac39fafb82424e"
+        },
+        {
+          "phase": "local",
+          "core": 1,
+          "exit_code": 0,
+          "wall_seconds": 1.2933071669999663,
+          "csv_paths": [
+            "b8-t8/exports/local/core1/OPPROF_20261113100440_ILSALXWTNAFGHCDE/simulator/core1.veccore1/core1.veccore1_instr_exe_20261113100441897.csv",
+            "b8-t8/exports/local/core1/OPPROF_20261113100440_ILSALXWTNAFGHCDE/simulator/core1.veccore0/core1.veccore0_instr_exe_20261113100441897.csv"
+          ],
+          "log_sha256": "8ab05a828ce67c2a9afda69696716d474e4bf4c1165b272e3f5c1773b50ee057"
+        },
+        {
+          "phase": "local",
+          "core": 2,
+          "exit_code": 0,
+          "wall_seconds": 1.2984765409999,
+          "csv_paths": [
+            "b8-t8/exports/local/core2/OPPROF_20261113100442_EVKCDXXEGNWXQXPV/simulator/core2.veccore0/core2.veccore0_instr_exe_20261113100443254.csv",
+            "b8-t8/exports/local/core2/OPPROF_20261113100442_EVKCDXXEGNWXQXPV/simulator/core2.veccore1/core2.veccore1_instr_exe_20261113100443254.csv"
+          ],
+          "log_sha256": "298caecbe9baa7eb9654a6901277522fd2e1a59c41a6a3b72834bddbf5885722"
+        },
+        {
+          "phase": "local",
+          "core": 3,
+          "exit_code": 0,
+          "wall_seconds": 1.3034166250001817,
+          "csv_paths": [
+            "b8-t8/exports/local/core3/OPPROF_20261113100443_ZAFOVTEVPZEPBJBB/simulator/core3.veccore0/core3.veccore0_instr_exe_20261113100444605.csv",
+            "b8-t8/exports/local/core3/OPPROF_20261113100443_ZAFOVTEVPZEPBJBB/simulator/core3.veccore1/core3.veccore1_instr_exe_20261113100444605.csv"
+          ],
+          "log_sha256": "ab98b50f785bf6482fc3681f69168c4e434755b210c52ecebcf1b4d3d315ac55"
+        },
+        {
+          "phase": "local",
+          "core": 4,
+          "exit_code": 0,
+          "wall_seconds": 1.1426891249998334,
+          "csv_paths": [
+            "b8-t8/exports/local/core4/OPPROF_20261113100444_DALWKPCWAQIRTBFJ/simulator/core4.veccore0/core4.veccore0_instr_exe_20261113100445764.csv",
+            "b8-t8/exports/local/core4/OPPROF_20261113100444_DALWKPCWAQIRTBFJ/simulator/core4.veccore1/core4.veccore1_instr_exe_20261113100445764.csv"
+          ],
+          "log_sha256": "0493fff48584983021c680eda5f353274600146e750945688b34d06c43130729"
+        },
+        {
+          "phase": "local",
+          "core": 5,
+          "exit_code": 0,
+          "wall_seconds": 1.2100403750000623,
+          "csv_paths": [
+            "b8-t8/exports/local/core5/OPPROF_20261113100446_GRFNSMKDLWRBLJKC/simulator/core5.veccore0/core5.veccore0_instr_exe_20261113100446955.csv",
+            "b8-t8/exports/local/core5/OPPROF_20261113100446_GRFNSMKDLWRBLJKC/simulator/core5.veccore1/core5.veccore1_instr_exe_20261113100446955.csv"
+          ],
+          "log_sha256": "132d5a10f981dc4cf97b14e74d4145ef5281f57ac0690bb5ded56c5b3d18c524"
+        },
+        {
+          "phase": "local",
+          "core": 6,
+          "exit_code": 0,
+          "wall_seconds": 1.2522289590001492,
+          "csv_paths": [
+            "b8-t8/exports/local/core6/OPPROF_20261113100447_LCBPZDFQHDDIDNQF/simulator/core6.veccore1/core6.veccore1_instr_exe_20261113100448240.csv",
+            "b8-t8/exports/local/core6/OPPROF_20261113100447_LCBPZDFQHDDIDNQF/simulator/core6.veccore0/core6.veccore0_instr_exe_20261113100448240.csv"
+          ],
+          "log_sha256": "fa965ba24740cc445f899e832d47588115ec85695711a645b3111f1fdf4f4f17"
+        },
+        {
+          "phase": "local",
+          "core": 7,
+          "exit_code": 0,
+          "wall_seconds": 1.1339160840000204,
+          "csv_paths": [
+            "b8-t8/exports/local/core7/OPPROF_20261113100448_CQZMJWVKEZFHRGXH/simulator/core7.veccore1/core7.veccore1_instr_exe_20261113100449413.csv",
+            "b8-t8/exports/local/core7/OPPROF_20261113100448_CQZMJWVKEZFHRGXH/simulator/core7.veccore0/core7.veccore0_instr_exe_20261113100449413.csv"
+          ],
+          "log_sha256": "2799bbe839716b06041d0412430cefa6c091eb5bf124e6a7603ff5a990482766"
+        },
+        {
+          "phase": "local",
+          "core": 8,
+          "exit_code": 0,
+          "wall_seconds": 1.420925417000035,
+          "csv_paths": [
+            "b8-t8/exports/local/core8/OPPROF_20261113100449_OLFMUDZQIWCJEYCM/simulator/core8.veccore1/core8.veccore1_instr_exe_20261113100450799.csv",
+            "b8-t8/exports/local/core8/OPPROF_20261113100449_OLFMUDZQIWCJEYCM/simulator/core8.veccore0/core8.veccore0_instr_exe_20261113100450799.csv"
+          ],
+          "log_sha256": "0f441aea3fe779246cbc4a6e4a01fcad2b26af3c6222492eb7f18dfa615e476b"
+        },
+        {
+          "phase": "local",
+          "core": 9,
+          "exit_code": 0,
+          "wall_seconds": 1.2322009160000107,
+          "csv_paths": [
+            "b8-t8/exports/local/core9/OPPROF_20261113100451_WVJWEXCYFBNBZZOM/simulator/core9.veccore1/core9.veccore1_instr_exe_20261113100452065.csv",
+            "b8-t8/exports/local/core9/OPPROF_20261113100451_WVJWEXCYFBNBZZOM/simulator/core9.veccore0/core9.veccore0_instr_exe_20261113100452065.csv"
+          ],
+          "log_sha256": "f468e6cd430828114a96a930282291bb501507c9281370672e0d1460e730dc4f"
+        },
+        {
+          "phase": "local",
+          "core": 10,
+          "exit_code": 0,
+          "wall_seconds": 1.2642656670000179,
+          "csv_paths": [
+            "b8-t8/exports/local/core10/OPPROF_20261113100452_FMXHYRMUGATIFYRE/simulator/core10.veccore0/core10.veccore0_instr_exe_20261113100453348.csv",
+            "b8-t8/exports/local/core10/OPPROF_20261113100452_FMXHYRMUGATIFYRE/simulator/core10.veccore1/core10.veccore1_instr_exe_20261113100453348.csv"
+          ],
+          "log_sha256": "544b95a2a9c8315d97dd08ade93e290a5d62450ea07d06c161301ef62b12ef92"
+        },
+        {
+          "phase": "local",
+          "core": 11,
+          "exit_code": 0,
+          "wall_seconds": 1.246881042000041,
+          "csv_paths": [
+            "b8-t8/exports/local/core11/OPPROF_20261113100453_TVMKVMMCGKLPPLSD/simulator/core11.veccore0/core11.veccore0_instr_exe_20261113100454614.csv",
+            "b8-t8/exports/local/core11/OPPROF_20261113100453_TVMKVMMCGKLPPLSD/simulator/core11.veccore1/core11.veccore1_instr_exe_20261113100454614.csv"
+          ],
+          "log_sha256": "c6bdbb24d66f76c8a59d0127f32f17368446a49286d0ddd3426cb88bd723de83"
+        },
+        {
+          "phase": "local",
+          "core": 12,
+          "exit_code": 0,
+          "wall_seconds": 1.1727501250002206,
+          "csv_paths": [
+            "b8-t8/exports/local/core12/OPPROF_20261113100454_RUYQMQRYCNBZROUB/simulator/core12.veccore1/core12.veccore1_instr_exe_20261113100455827.csv",
+            "b8-t8/exports/local/core12/OPPROF_20261113100454_RUYQMQRYCNBZROUB/simulator/core12.veccore0/core12.veccore0_instr_exe_20261113100455827.csv"
+          ],
+          "log_sha256": "ebecb3410f4b3201ad5db81b6d2be7f1004d669050ebcae3d05b7dccf1a18118"
+        },
+        {
+          "phase": "local",
+          "core": 13,
+          "exit_code": 0,
+          "wall_seconds": 1.2502357500000016,
+          "csv_paths": [
+            "b8-t8/exports/local/core13/OPPROF_20261113100456_FTWXKRLQEBUHVJLX/simulator/core13.veccore1/core13.veccore1_instr_exe_20261113100457046.csv",
+            "b8-t8/exports/local/core13/OPPROF_20261113100456_FTWXKRLQEBUHVJLX/simulator/core13.veccore0/core13.veccore0_instr_exe_20261113100457046.csv"
+          ],
+          "log_sha256": "161276db68e54aa6303b99a06c95bf62e97cda1bf3d85d85678ad82b37777a27"
+        },
+        {
+          "phase": "local",
+          "core": 14,
+          "exit_code": 0,
+          "wall_seconds": 1.5143886250000378,
+          "csv_paths": [
+            "b8-t8/exports/local/core14/OPPROF_20261113100457_RMQHKZLIDPVHMSVM/simulator/core14.veccore1/core14.veccore1_instr_exe_20261113100458324.csv",
+            "b8-t8/exports/local/core14/OPPROF_20261113100457_RMQHKZLIDPVHMSVM/simulator/core14.veccore0/core14.veccore0_instr_exe_20261113100458324.csv"
+          ],
+          "log_sha256": "51e537e27e1891b1ceca5a637b4131590dbbe6da54506ff98d3478a0de3de51f"
+        },
+        {
+          "phase": "local",
+          "core": 15,
+          "exit_code": 0,
+          "wall_seconds": 1.3172984170000746,
+          "csv_paths": [
+            "b8-t8/exports/local/core15/OPPROF_20261113100458_PVBBXYGTMZXZLRBF/simulator/core15.veccore1/core15.veccore1_instr_exe_20261113100459959.csv",
+            "b8-t8/exports/local/core15/OPPROF_20261113100458_PVBBXYGTMZXZLRBF/simulator/core15.veccore0/core15.veccore0_instr_exe_20261113100459959.csv"
+          ],
+          "log_sha256": "689d489db19f1df883da9877d58eae2fb5d13d154009bfa2742f4e147eb02602"
+        },
+        {
+          "phase": "local",
+          "core": 16,
+          "exit_code": 0,
+          "wall_seconds": 1.0152269580000848,
+          "csv_paths": [
+            "b8-t8/exports/local/core16/OPPROF_20261113100500_UUMBLAIACHYOQKFC/simulator/core16.veccore0/core16.veccore0_instr_exe_20261113100500988.csv",
+            "b8-t8/exports/local/core16/OPPROF_20261113100500_UUMBLAIACHYOQKFC/simulator/core16.veccore1/core16.veccore1_instr_exe_20261113100500988.csv"
+          ],
+          "log_sha256": "6e4b8059761619a1123c0689287c054ea0e3aec2d0fb75bdc674fd193bbfaaa0"
+        },
+        {
+          "phase": "local",
+          "core": 17,
+          "exit_code": 0,
+          "wall_seconds": 1.0402614170000106,
+          "csv_paths": [
+            "b8-t8/exports/local/core17/OPPROF_20261113100501_IWAVPQGAGYPMUDZX/simulator/core17.veccore0/core17.veccore0_instr_exe_20261113100502024.csv",
+            "b8-t8/exports/local/core17/OPPROF_20261113100501_IWAVPQGAGYPMUDZX/simulator/core17.veccore1/core17.veccore1_instr_exe_20261113100502024.csv"
+          ],
+          "log_sha256": "abeac7ba18ac24f29b84c5462edbc15044e1ea4ceaa86b6431b412ff85c5c1ec"
+        },
+        {
+          "phase": "local",
+          "core": 18,
+          "exit_code": 0,
+          "wall_seconds": 1.1149745420000272,
+          "csv_paths": [
+            "b8-t8/exports/local/core18/OPPROF_20261113100502_EBHTJEITQIZZWQJM/simulator/core18.veccore0/core18.veccore0_instr_exe_20261113100503233.csv",
+            "b8-t8/exports/local/core18/OPPROF_20261113100502_EBHTJEITQIZZWQJM/simulator/core18.veccore1/core18.veccore1_instr_exe_20261113100503233.csv"
+          ],
+          "log_sha256": "9f317d82fb44c7fe77bab48b732f8e4872f6a51d66bcccd0eaf2c966f02e7e39"
+        },
+        {
+          "phase": "local",
+          "core": 19,
+          "exit_code": 0,
+          "wall_seconds": 1.0769985419999557,
+          "csv_paths": [
+            "b8-t8/exports/local/core19/OPPROF_20261113100503_VTDUONYWPQBWTZDC/simulator/core19.veccore0/core19.veccore0_instr_exe_20261113100504292.csv",
+            "b8-t8/exports/local/core19/OPPROF_20261113100503_VTDUONYWPQBWTZDC/simulator/core19.veccore1/core19.veccore1_instr_exe_20261113100504292.csv"
+          ],
+          "log_sha256": "01450fdd2082efec6462d8beed1959db3c64122ea12731753ec7cdad9b7e2bc8"
+        },
+        {
+          "phase": "local",
+          "core": 20,
+          "exit_code": 0,
+          "wall_seconds": 1.0246372090000477,
+          "csv_paths": [
+            "b8-t8/exports/local/core20/OPPROF_20261113100504_PZAZTHICSKMGGSGE/simulator/core20.veccore0/core20.veccore0_instr_exe_20261113100505343.csv",
+            "b8-t8/exports/local/core20/OPPROF_20261113100504_PZAZTHICSKMGGSGE/simulator/core20.veccore1/core20.veccore1_instr_exe_20261113100505343.csv"
+          ],
+          "log_sha256": "532f7338ac25ccaccc42972fc272c7d50b3c80d96946647c08b765bafc89308e"
+        },
+        {
+          "phase": "local",
+          "core": 21,
+          "exit_code": 0,
+          "wall_seconds": 1.120261666000033,
+          "csv_paths": [
+            "b8-t8/exports/local/core21/OPPROF_20261113100505_GAWOASFAVXZMABXF/simulator/core21.veccore0/core21.veccore0_instr_exe_20261113100506440.csv",
+            "b8-t8/exports/local/core21/OPPROF_20261113100505_GAWOASFAVXZMABXF/simulator/core21.veccore1/core21.veccore1_instr_exe_20261113100506440.csv"
+          ],
+          "log_sha256": "c0432b22fced465cc2fc6a577cdd915d15fe44dac7975d6a687551e8c869f5e4"
+        },
+        {
+          "phase": "local",
+          "core": 22,
+          "exit_code": 0,
+          "wall_seconds": 1.0732071249999535,
+          "csv_paths": [
+            "b8-t8/exports/local/core22/OPPROF_20261113100506_GWOEOZVBWSWRIKOZ/simulator/core22.veccore1/core22.veccore1_instr_exe_20261113100507567.csv",
+            "b8-t8/exports/local/core22/OPPROF_20261113100506_GWOEOZVBWSWRIKOZ/simulator/core22.veccore0/core22.veccore0_instr_exe_20261113100507567.csv"
+          ],
+          "log_sha256": "80750133ce2f7f0a6ef0addd8fce8e853fc59757818a0ef3a2343d2416177cb4"
+        },
+        {
+          "phase": "local",
+          "core": 23,
+          "exit_code": 0,
+          "wall_seconds": 1.2342340420000255,
+          "csv_paths": [
+            "b8-t8/exports/local/core23/OPPROF_20261113100507_CTGZCLQGWCUSONLG/simulator/core23.veccore1/core23.veccore1_instr_exe_20261113100508788.csv",
+            "b8-t8/exports/local/core23/OPPROF_20261113100507_CTGZCLQGWCUSONLG/simulator/core23.veccore0/core23.veccore0_instr_exe_20261113100508788.csv"
+          ],
+          "log_sha256": "cd990882822e196dbe2f2948dcf98e912a0f451510c498f1914fda156460ea52"
+        },
+        {
+          "phase": "local",
+          "core": 24,
+          "exit_code": 0,
+          "wall_seconds": 1.0830184999999801,
+          "csv_paths": [
+            "b8-t8/exports/local/core24/OPPROF_20261113100509_ZQTPFICVNDULGMMD/simulator/core24.veccore1/core24.veccore1_instr_exe_20261113100509908.csv",
+            "b8-t8/exports/local/core24/OPPROF_20261113100509_ZQTPFICVNDULGMMD/simulator/core24.veccore0/core24.veccore0_instr_exe_20261113100509908.csv"
+          ],
+          "log_sha256": "fcd325607df82b0b6cfe3df7c4186c249f08aab69c924849188c7d3c0cfb3d6b"
+        },
+        {
+          "phase": "local",
+          "core": 25,
+          "exit_code": 0,
+          "wall_seconds": 1.179300124999827,
+          "csv_paths": [
+            "b8-t8/exports/local/core25/OPPROF_20261113100510_CUCBRBDUAEFDXCXL/simulator/core25.veccore1/core25.veccore1_instr_exe_20261113100511099.csv",
+            "b8-t8/exports/local/core25/OPPROF_20261113100510_CUCBRBDUAEFDXCXL/simulator/core25.veccore0/core25.veccore0_instr_exe_20261113100511099.csv"
+          ],
+          "log_sha256": "a7630ceb188af96cf03ee1c65d1c774ab80ddd040f0340e562851dc40c4b970b"
+        },
+        {
+          "phase": "local",
+          "core": 26,
+          "exit_code": 0,
+          "wall_seconds": 1.025025874999983,
+          "csv_paths": [
+            "b8-t8/exports/local/core26/OPPROF_20261113100511_LAHOIBWCSSXZMQDE/simulator/core26.veccore0/core26.veccore0_instr_exe_20261113100512165.csv",
+            "b8-t8/exports/local/core26/OPPROF_20261113100511_LAHOIBWCSSXZMQDE/simulator/core26.veccore1/core26.veccore1_instr_exe_20261113100512165.csv"
+          ],
+          "log_sha256": "cac965a78c98f562791c7706125f628127f8c2fe256e017b5850e4bf33bce0c9"
+        },
+        {
+          "phase": "local",
+          "core": 27,
+          "exit_code": 0,
+          "wall_seconds": 1.120113333000063,
+          "csv_paths": [
+            "b8-t8/exports/local/core27/OPPROF_20261113100512_OVHPXXXEBWWJOOMV/simulator/core27.veccore0/core27.veccore0_instr_exe_20261113100513216.csv",
+            "b8-t8/exports/local/core27/OPPROF_20261113100512_OVHPXXXEBWWJOOMV/simulator/core27.veccore1/core27.veccore1_instr_exe_20261113100513216.csv"
+          ],
+          "log_sha256": "ce8afc0fe49a7b76dbc60d1a8cff189b41c76a4f7702335f6fd3c9b783be4678"
+        },
+        {
+          "phase": "merge",
+          "core": 0,
+          "exit_code": 0,
+          "wall_seconds": 0.6289327090000825,
+          "csv_paths": [
+            "b8-t8/exports/merge/core0/OPPROF_20261113100513_HYGHALXYLABGPJLV/simulator/core0.veccore1/core0.veccore1_instr_exe_20261113100513916.csv",
+            "b8-t8/exports/merge/core0/OPPROF_20261113100513_HYGHALXYLABGPJLV/simulator/core0.veccore0/core0.veccore0_instr_exe_20261113100513916.csv"
+          ],
+          "log_sha256": "6d71fd2e0b67663d0a0ca1c86aebbedb5d4db162b830debf9d39bcacf9c4d6fe"
+        },
+        {
+          "phase": "merge",
+          "core": 1,
+          "exit_code": 0,
+          "wall_seconds": 0.5925416669999777,
+          "csv_paths": [
+            "b8-t8/exports/merge/core1/OPPROF_20261113100514_PINMRSRTHRLYDFWA/simulator/core1.veccore1/core1.veccore1_instr_exe_20261113100514539.csv",
+            "b8-t8/exports/merge/core1/OPPROF_20261113100514_PINMRSRTHRLYDFWA/simulator/core1.veccore0/core1.veccore0_instr_exe_20261113100514539.csv"
+          ],
+          "log_sha256": "b3d4bb5f62f448b2c770c44ff139d0226b144f6877287a9af732bdeaf810744a"
+        },
+        {
+          "phase": "merge",
+          "core": 2,
+          "exit_code": 0,
+          "wall_seconds": 0.5599859579999702,
+          "csv_paths": [
+            "b8-t8/exports/merge/core2/OPPROF_20261113100514_ZFWWNTTSEGRCSKPO/simulator/core2.veccore0/core2.veccore0_instr_exe_20261113100515153.csv",
+            "b8-t8/exports/merge/core2/OPPROF_20261113100514_ZFWWNTTSEGRCSKPO/simulator/core2.veccore1/core2.veccore1_instr_exe_20261113100515153.csv"
+          ],
+          "log_sha256": "ababb49e11564b620480be1b8dd8f227a71f21e2710efab7b8f03c10017a7577"
+        },
+        {
+          "phase": "merge",
+          "core": 3,
+          "exit_code": 0,
+          "wall_seconds": 0.6443580829998155,
+          "csv_paths": [
+            "b8-t8/exports/merge/core3/OPPROF_20261113100515_CLTOWDSBVOQAUQAT/simulator/core3.veccore0/core3.veccore0_instr_exe_20261113100515758.csv",
+            "b8-t8/exports/merge/core3/OPPROF_20261113100515_CLTOWDSBVOQAUQAT/simulator/core3.veccore1/core3.veccore1_instr_exe_20261113100515758.csv"
+          ],
+          "log_sha256": "510ad38e0bbceced226f5bf2c431c202dc02cd42982c1d1d0c27a7578b4d624c"
+        },
+        {
+          "phase": "merge",
+          "core": 4,
+          "exit_code": 0,
+          "wall_seconds": 0.6673085420000007,
+          "csv_paths": [
+            "b8-t8/exports/merge/core4/OPPROF_20261113100516_ULOFDNAQXNRXNZZL/simulator/core4.veccore0/core4.veccore0_instr_exe_20261113100516455.csv",
+            "b8-t8/exports/merge/core4/OPPROF_20261113100516_ULOFDNAQXNRXNZZL/simulator/core4.veccore1/core4.veccore1_instr_exe_20261113100516455.csv"
+          ],
+          "log_sha256": "b00cc1b32d7326c7e857b90144897b48035bf4e783d07226f0080b5d20282717"
+        },
+        {
+          "phase": "merge",
+          "core": 5,
+          "exit_code": 0,
+          "wall_seconds": 0.5635497499999929,
+          "csv_paths": [
+            "b8-t8/exports/merge/core5/OPPROF_20261113100516_IPKHOHIDVFHLALFM/simulator/core5.veccore0/core5.veccore0_instr_exe_20261113100517085.csv",
+            "b8-t8/exports/merge/core5/OPPROF_20261113100516_IPKHOHIDVFHLALFM/simulator/core5.veccore1/core5.veccore1_instr_exe_20261113100517085.csv"
+          ],
+          "log_sha256": "c29193b91a8438d86abfa9db1893f91425580a8561e4f5ea772cc1c236e99e8b"
+        },
+        {
+          "phase": "merge",
+          "core": 6,
+          "exit_code": 0,
+          "wall_seconds": 0.9939191660000688,
+          "csv_paths": [
+            "b8-t8/exports/merge/core6/OPPROF_20261113100517_ADCZTLCBHWZRTEJZ/simulator/core6.veccore1/core6.veccore1_instr_exe_20261113100518038.csv",
+            "b8-t8/exports/merge/core6/OPPROF_20261113100517_ADCZTLCBHWZRTEJZ/simulator/core6.veccore0/core6.veccore0_instr_exe_20261113100518038.csv"
+          ],
+          "log_sha256": "d05359349cd57c8e88119687d814a7ded3b9de4e5c5250a2d271824a1d9671c0"
+        },
+        {
+          "phase": "merge",
+          "core": 7,
+          "exit_code": 0,
+          "wall_seconds": 0.5609880419999627,
+          "csv_paths": [
+            "b8-t8/exports/merge/core7/OPPROF_20261113100518_IQNWIHJNYAUEYXCT/simulator/core7.veccore1/core7.veccore1_instr_exe_20261113100518636.csv",
+            "b8-t8/exports/merge/core7/OPPROF_20261113100518_IQNWIHJNYAUEYXCT/simulator/core7.veccore0/core7.veccore0_instr_exe_20261113100518636.csv"
+          ],
+          "log_sha256": "dc63a793a859a0ad7a39001ad5f4543e4d1b1a5f829015a7e28e70f2c798e284"
+        },
+        {
+          "phase": "merge",
+          "core": 8,
+          "exit_code": 0,
+          "wall_seconds": 0.5326182500000414,
+          "csv_paths": [
+            "b8-t8/exports/merge/core8/OPPROF_20261113100518_YEZQMKOOSQLOYKWU/simulator/core8.veccore1/core8.veccore1_instr_exe_20261113100519187.csv",
+            "b8-t8/exports/merge/core8/OPPROF_20261113100518_YEZQMKOOSQLOYKWU/simulator/core8.veccore0/core8.veccore0_instr_exe_20261113100519187.csv"
+          ],
+          "log_sha256": "7cd6cf90f1eb7e58868dd0c90aca9ba52108bd4e60e98a6b2a01619a262cb05a"
+        },
+        {
+          "phase": "merge",
+          "core": 9,
+          "exit_code": 0,
+          "wall_seconds": 0.5310852500001602,
+          "csv_paths": [
+            "b8-t8/exports/merge/core9/OPPROF_20261113100519_ELXILOXFHWLPHOUW/simulator/core9.veccore1/core9.veccore1_instr_exe_20261113100519736.csv",
+            "b8-t8/exports/merge/core9/OPPROF_20261113100519_ELXILOXFHWLPHOUW/simulator/core9.veccore0/core9.veccore0_instr_exe_20261113100519736.csv"
+          ],
+          "log_sha256": "dacc95c642d409e8b9e0b232ba3df92df72bf9756b1847ab8fdbc8d668c124f7"
+        },
+        {
+          "phase": "merge",
+          "core": 10,
+          "exit_code": 0,
+          "wall_seconds": 0.5150949999999739,
+          "csv_paths": [
+            "b8-t8/exports/merge/core10/OPPROF_20261113100519_UPFIUZZTXKQFSPJT/simulator/core10.veccore0/core10.veccore0_instr_exe_20261113100520301.csv",
+            "b8-t8/exports/merge/core10/OPPROF_20261113100519_UPFIUZZTXKQFSPJT/simulator/core10.veccore1/core10.veccore1_instr_exe_20261113100520301.csv"
+          ],
+          "log_sha256": "729f113a2235683e7cc1fa4703806dab9b2d1929f326532151617609bccbb32f"
+        },
+        {
+          "phase": "merge",
+          "core": 11,
+          "exit_code": 0,
+          "wall_seconds": 0.5424527080001553,
+          "csv_paths": [
+            "b8-t8/exports/merge/core11/OPPROF_20261113100520_GKEISYXKWHKIWUKE/simulator/core11.veccore0/core11.veccore0_instr_exe_20261113100520817.csv",
+            "b8-t8/exports/merge/core11/OPPROF_20261113100520_GKEISYXKWHKIWUKE/simulator/core11.veccore1/core11.veccore1_instr_exe_20261113100520817.csv"
+          ],
+          "log_sha256": "827085f0b5ec28d537b8a9edbe4f3742eb3e9589c1438fdf866cba0eac17d438"
+        },
+        {
+          "phase": "merge",
+          "core": 12,
+          "exit_code": 0,
+          "wall_seconds": 0.5758098339999833,
+          "csv_paths": [
+            "b8-t8/exports/merge/core12/OPPROF_20261113100521_AYGRCSDYFATCHTNG/simulator/core12.veccore1/core12.veccore1_instr_exe_20261113100521390.csv",
+            "b8-t8/exports/merge/core12/OPPROF_20261113100521_AYGRCSDYFATCHTNG/simulator/core12.veccore0/core12.veccore0_instr_exe_20261113100521390.csv"
+          ],
+          "log_sha256": "e374e743ae59e44deddada1a413e5c156608d891783a520891682668c20b2a6b"
+        },
+        {
+          "phase": "merge",
+          "core": 13,
+          "exit_code": 0,
+          "wall_seconds": 0.5138660840000284,
+          "csv_paths": [
+            "b8-t8/exports/merge/core13/OPPROF_20261113100521_JHTHRDXMJSCGUCYZ/simulator/core13.veccore1/core13.veccore1_instr_exe_20261113100521962.csv",
+            "b8-t8/exports/merge/core13/OPPROF_20261113100521_JHTHRDXMJSCGUCYZ/simulator/core13.veccore0/core13.veccore0_instr_exe_20261113100521962.csv"
+          ],
+          "log_sha256": "23779068eab3365114d0e7cb6c36fd878d2982cbc13f5b2aea9b03c14817c893"
+        },
+        {
+          "phase": "merge",
+          "core": 14,
+          "exit_code": 0,
+          "wall_seconds": 0.5172508749999452,
+          "csv_paths": [
+            "b8-t8/exports/merge/core14/OPPROF_20261113100522_GYEHRZZJOMKBEXFY/simulator/core14.veccore1/core14.veccore1_instr_exe_20261113100522471.csv",
+            "b8-t8/exports/merge/core14/OPPROF_20261113100522_GYEHRZZJOMKBEXFY/simulator/core14.veccore0/core14.veccore0_instr_exe_20261113100522471.csv"
+          ],
+          "log_sha256": "106fc51700ec27e5ee28eafa01081a153fb00fe205049608f88d5f66629e509f"
+        },
+        {
+          "phase": "merge",
+          "core": 15,
+          "exit_code": 0,
+          "wall_seconds": 0.5386225409999952,
+          "csv_paths": [
+            "b8-t8/exports/merge/core15/OPPROF_20261113100522_KUVZOJCITAOQGTSA/simulator/core15.veccore1/core15.veccore1_instr_exe_20261113100522998.csv",
+            "b8-t8/exports/merge/core15/OPPROF_20261113100522_KUVZOJCITAOQGTSA/simulator/core15.veccore0/core15.veccore0_instr_exe_20261113100522998.csv"
+          ],
+          "log_sha256": "fa6761e0723ccad991a0ba166f3e6feb944e1e4f6b564b36015304c37db3efb3"
+        }
+      ],
+      "model_capture_wall_seconds": 563.379535917,
+      "total_model_ticks": 56173,
+      "oracle": {
+        "status": "passed",
+        "scope": "AIV-only exact final TopK component",
+        "batch": 8,
+        "history": 131072,
+        "valid": 131072,
+        "miss_per_query": 205,
+        "shards": 8,
+        "aiv_budget": 56,
+        "local_workers": 56,
+        "merge_workers": 32,
+        "aic_workers": 0,
+        "guards": true,
+        "local_max_worker_cycle_delta": 34053,
+        "merge_max_worker_cycle_delta": 12117,
+        "sum_phase_max_worker_cycle_delta": 46170,
+        "timing_scope": "worker-body only; excludes dispatch and init",
+        "selected_set_and_scores": true,
+        "all_local_candidates": true,
+        "input_unchanged": true,
+        "full_LI": false,
+        "transport": false
+      },
+      "capture_log_sha256": "4bb9b8d3adace620206a549801e0845c164f17055a7401a381dfbff1ee03f1ac"
+    },
+    {
+      "case": "b16-t1",
+      "batch": 16,
+      "shards": 1,
+      "status": "PASSED_MODEL_AND_OFFLINE_EXPORT",
+      "collector_exit": 0,
+      "collector_postprocess_recovered": false,
+      "exports": [
+        {
+          "phase": "local",
+          "core": 0,
+          "exit_code": 0,
+          "wall_seconds": 3.8150023329999385,
+          "csv_paths": [
+            "b16-t1/exports/local/core0/OPPROF_20261113102056_ETAPNSPCEEBIQRGJ/simulator/core0.veccore1/core0.veccore1_instr_exe_20261113102059331.csv",
+            "b16-t1/exports/local/core0/OPPROF_20261113102056_ETAPNSPCEEBIQRGJ/simulator/core0.veccore0/core0.veccore0_instr_exe_20261113102059331.csv"
+          ],
+          "log_sha256": "47928b8c3aa7a133348e01ccd9a577266abf529cd3cd0c569d7fd6048e2eb7a4"
+        },
+        {
+          "phase": "local",
+          "core": 1,
+          "exit_code": 0,
+          "wall_seconds": 3.3035062089998064,
+          "csv_paths": [
+            "b16-t1/exports/local/core1/OPPROF_20261113102059_QNCWWSHQUTMPZUOH/simulator/core1.veccore1/core1.veccore1_instr_exe_20261113102102709.csv",
+            "b16-t1/exports/local/core1/OPPROF_20261113102059_QNCWWSHQUTMPZUOH/simulator/core1.veccore0/core1.veccore0_instr_exe_20261113102102709.csv"
+          ],
+          "log_sha256": "106deb31359ee2caae63252e6115e5021983ee5a149e8466ef55e16abcec41fe"
+        },
+        {
+          "phase": "local",
+          "core": 2,
+          "exit_code": 0,
+          "wall_seconds": 3.525737041999946,
+          "csv_paths": [
+            "b16-t1/exports/local/core2/OPPROF_20261113102103_TJACTADYZIIFASTE/simulator/core2.veccore0/core2.veccore0_instr_exe_20261113102105939.csv",
+            "b16-t1/exports/local/core2/OPPROF_20261113102103_TJACTADYZIIFASTE/simulator/core2.veccore1/core2.veccore1_instr_exe_20261113102105939.csv"
+          ],
+          "log_sha256": "849bea6e2ae15d797e9a2558c4a8110703d9b0c234200f2125a9936f8d1964f8"
+        },
+        {
+          "phase": "local",
+          "core": 3,
+          "exit_code": 0,
+          "wall_seconds": 3.902669207999679,
+          "csv_paths": [
+            "b16-t1/exports/local/core3/OPPROF_20261113102106_DFLMZIHLNKFOBMYF/simulator/core3.veccore0/core3.veccore0_instr_exe_20261113102110106.csv",
+            "b16-t1/exports/local/core3/OPPROF_20261113102106_DFLMZIHLNKFOBMYF/simulator/core3.veccore1/core3.veccore1_instr_exe_20261113102110104.csv"
+          ],
+          "log_sha256": "a3c84e230b0206320e30c5ba0432c7ae3c08861cacc524caccd61a67d2d7bae1"
+        },
+        {
+          "phase": "local",
+          "core": 4,
+          "exit_code": 0,
+          "wall_seconds": 2.109114458000022,
+          "csv_paths": [
+            "b16-t1/exports/local/core4/OPPROF_20261113102110_SRJGZXTFZFUKZVIE/simulator/core4.veccore0/core4.veccore0_instr_exe_20261113102112366.csv",
+            "b16-t1/exports/local/core4/OPPROF_20261113102110_SRJGZXTFZFUKZVIE/simulator/core4.veccore1/core4.veccore1_instr_exe_20261113102112366.csv"
+          ],
+          "log_sha256": "d9692fdefdfa9879c781a87dc95fcb4ada0a405a43ab68f02615e524bbb9b6a6"
+        },
+        {
+          "phase": "local",
+          "core": 5,
+          "exit_code": 0,
+          "wall_seconds": 1.8571973330003857,
+          "csv_paths": [
+            "b16-t1/exports/local/core5/OPPROF_20261113102112_ZJKKDNZBHKAOURPW/simulator/core5.veccore0/core5.veccore0_instr_exe_20261113102114241.csv",
+            "b16-t1/exports/local/core5/OPPROF_20261113102112_ZJKKDNZBHKAOURPW/simulator/core5.veccore1/core5.veccore1_instr_exe_20261113102114241.csv"
+          ],
+          "log_sha256": "0d2d2b78808349d2b50a08fd871b020c044c85b10eb3433b15d29f2193303b25"
+        },
+        {
+          "phase": "local",
+          "core": 6,
+          "exit_code": 0,
+          "wall_seconds": 2.469769667000037,
+          "csv_paths": [
+            "b16-t1/exports/local/core6/OPPROF_20261113102114_ZVXQOCGHMMFLZKZQ/simulator/core6.veccore1/core6.veccore1_instr_exe_20261113102116729.csv",
+            "b16-t1/exports/local/core6/OPPROF_20261113102114_ZVXQOCGHMMFLZKZQ/simulator/core6.veccore0/core6.veccore0_instr_exe_20261113102116730.csv"
+          ],
+          "log_sha256": "9097f2e0c447557763a330f6402a0bd0d78c524d3e60e1f15054d0301f1d9e7d"
+        },
+        {
+          "phase": "local",
+          "core": 7,
+          "exit_code": 0,
+          "wall_seconds": 1.7866624169996612,
+          "csv_paths": [
+            "b16-t1/exports/local/core7/OPPROF_20261113102117_XUVSNINCEXNIQMBE/simulator/core7.veccore1/core7.veccore1_instr_exe_20261113102118545.csv",
+            "b16-t1/exports/local/core7/OPPROF_20261113102117_XUVSNINCEXNIQMBE/simulator/core7.veccore0/core7.veccore0_instr_exe_20261113102118545.csv"
+          ],
+          "log_sha256": "870dab9ab2d66b438d542a5dbe8c7102123dcf5a91b7192c159f4b94b5f53e35"
+        },
+        {
+          "phase": "local",
+          "core": 8,
+          "exit_code": 0,
+          "wall_seconds": 1.929281833999994,
+          "csv_paths": [
+            "b16-t1/exports/local/core8/OPPROF_20261113102118_PPVJDFLJKPLLNATR/simulator/core8.veccore1/core8.veccore1_instr_exe_20261113102120477.csv",
+            "b16-t1/exports/local/core8/OPPROF_20261113102118_PPVJDFLJKPLLNATR/simulator/core8.veccore0/core8.veccore0_instr_exe_20261113102120477.csv"
+          ],
+          "log_sha256": "d83cdbc8c4558f86be11a372bc63312b67de12a92df53ae4199dc881dd436716"
+        },
+        {
+          "phase": "local",
+          "core": 9,
+          "exit_code": 0,
+          "wall_seconds": 1.9300105829997847,
+          "csv_paths": [
+            "b16-t1/exports/local/core9/OPPROF_20261113102120_BUVONFXBEHFIEXQP/simulator/core9.veccore1/core9.veccore1_instr_exe_20261113102122375.csv",
+            "b16-t1/exports/local/core9/OPPROF_20261113102120_BUVONFXBEHFIEXQP/simulator/core9.veccore0/core9.veccore0_instr_exe_20261113102122376.csv"
+          ],
+          "log_sha256": "3a7b58fe9de640754c774fe1e1d3b01d327e89989f81841e1f7a2c45f98d293b"
+        },
+        {
+          "phase": "local",
+          "core": 10,
+          "exit_code": 0,
+          "wall_seconds": 1.8279517910000322,
+          "csv_paths": [
+            "b16-t1/exports/local/core10/OPPROF_20261113102122_PTQSBGETKQRWURJW/simulator/core10.veccore0/core10.veccore0_instr_exe_20261113102124243.csv",
+            "b16-t1/exports/local/core10/OPPROF_20261113102122_PTQSBGETKQRWURJW/simulator/core10.veccore1/core10.veccore1_instr_exe_20261113102124243.csv"
+          ],
+          "log_sha256": "0501f772031b6a3c7fb3355490e26aae60a12428818ada1409b5cff1a048ddc2"
+        },
+        {
+          "phase": "local",
+          "core": 11,
+          "exit_code": 0,
+          "wall_seconds": 2.00327362500002,
+          "csv_paths": [
+            "b16-t1/exports/local/core11/OPPROF_20261113102124_YPEYFIYYBVLGEKHG/simulator/core11.veccore0/core11.veccore0_instr_exe_20261113102126292.csv",
+            "b16-t1/exports/local/core11/OPPROF_20261113102124_YPEYFIYYBVLGEKHG/simulator/core11.veccore1/core11.veccore1_instr_exe_20261113102126292.csv"
+          ],
+          "log_sha256": "08721ed0679f43311e0223c37040d72966ab2938896cd30c9c3a371abb842ff3"
+        },
+        {
+          "phase": "local",
+          "core": 12,
+          "exit_code": 0,
+          "wall_seconds": 1.9992112910003925,
+          "csv_paths": [
+            "b16-t1/exports/local/core12/OPPROF_20261113102126_IYLBNSYGXDNNAPKD/simulator/core12.veccore1/core12.veccore1_instr_exe_20261113102128297.csv",
+            "b16-t1/exports/local/core12/OPPROF_20261113102126_IYLBNSYGXDNNAPKD/simulator/core12.veccore0/core12.veccore0_instr_exe_20261113102128297.csv"
+          ],
+          "log_sha256": "5e5d8f933bd90fc3dcbb103773af20963aeb0b1b76a46b0731fd7e07062fbd0e"
+        },
+        {
+          "phase": "local",
+          "core": 13,
+          "exit_code": 0,
+          "wall_seconds": 1.8779228749999675,
+          "csv_paths": [
+            "b16-t1/exports/local/core13/OPPROF_20261113102128_DHDFUCTWWUTBYPUL/simulator/core13.veccore1/core13.veccore1_instr_exe_20261113102130229.csv",
+            "b16-t1/exports/local/core13/OPPROF_20261113102128_DHDFUCTWWUTBYPUL/simulator/core13.veccore0/core13.veccore0_instr_exe_20261113102130229.csv"
+          ],
+          "log_sha256": "dfda33dc8563fe1f6af0abcf67f5e9efd13d8c9c41ed1dfa77f1ab25ac05a2f4"
+        },
+        {
+          "phase": "local",
+          "core": 14,
+          "exit_code": 0,
+          "wall_seconds": 2.029930791999959,
+          "csv_paths": [
+            "b16-t1/exports/local/core14/OPPROF_20261113102130_AQRNLZEMJXPONIXU/simulator/core14.veccore1/core14.veccore1_instr_exe_20261113102132204.csv",
+            "b16-t1/exports/local/core14/OPPROF_20261113102130_AQRNLZEMJXPONIXU/simulator/core14.veccore0/core14.veccore0_instr_exe_20261113102132204.csv"
+          ],
+          "log_sha256": "2e81a734d6d1d33ee6018dc7d95cf1dfe1704e466d6f6adfa2d9850b78dda0ec"
+        },
+        {
+          "phase": "local",
+          "core": 15,
+          "exit_code": 0,
+          "wall_seconds": 2.5155294160003905,
+          "csv_paths": [
+            "b16-t1/exports/local/core15/OPPROF_20261113102132_YNODPEKDTFBWZVVK/simulator/core15.veccore1/core15.veccore1_instr_exe_20261113102134431.csv",
+            "b16-t1/exports/local/core15/OPPROF_20261113102132_YNODPEKDTFBWZVVK/simulator/core15.veccore0/core15.veccore0_instr_exe_20261113102134431.csv"
+          ],
+          "log_sha256": "89f7e926b9cad8bd5559cd18b0577cf03ba56a7e206f1e1dda0988612736ac3d"
+        },
+        {
+          "phase": "local",
+          "core": 16,
+          "exit_code": 0,
+          "wall_seconds": 2.2656811669999115,
+          "csv_paths": [
+            "b16-t1/exports/local/core16/OPPROF_20261113102135_CQMTDFMQCQTQAXAJ/simulator/core16.veccore0/core16.veccore0_instr_exe_20261113102137099.csv",
+            "b16-t1/exports/local/core16/OPPROF_20261113102135_CQMTDFMQCQTQAXAJ/simulator/core16.veccore1/core16.veccore1_instr_exe_20261113102137099.csv"
+          ],
+          "log_sha256": "50799a49b0abcb73654c620cb2dfcc77739ce97b3ef349ebc9f4a60d66157dda"
+        },
+        {
+          "phase": "local",
+          "core": 17,
+          "exit_code": 0,
+          "wall_seconds": 2.1287396669999907,
+          "csv_paths": [
+            "b16-t1/exports/local/core17/OPPROF_20261113102137_TQYMYROUZVPPMFRX/simulator/core17.veccore0/core17.veccore0_instr_exe_20261113102139196.csv",
+            "b16-t1/exports/local/core17/OPPROF_20261113102137_TQYMYROUZVPPMFRX/simulator/core17.veccore1/core17.veccore1_instr_exe_20261113102139197.csv"
+          ],
+          "log_sha256": "2d94bd006f526d452a60d64bb7fc33e0dc3ed44d127744adc1db9292fe08daa0"
+        },
+        {
+          "phase": "local",
+          "core": 18,
+          "exit_code": 0,
+          "wall_seconds": 1.8607277500000237,
+          "csv_paths": [
+            "b16-t1/exports/local/core18/OPPROF_20261113102139_PVEYDOBGJFWHXDWK/simulator/core18.veccore0/core18.veccore0_instr_exe_20261113102141087.csv",
+            "b16-t1/exports/local/core18/OPPROF_20261113102139_PVEYDOBGJFWHXDWK/simulator/core18.veccore1/core18.veccore1_instr_exe_20261113102141087.csv"
+          ],
+          "log_sha256": "3c67d1eaf553421dec61f9c7fabbf291b88e88b0bb06e16856b38de039015d27"
+        },
+        {
+          "phase": "local",
+          "core": 19,
+          "exit_code": 0,
+          "wall_seconds": 1.8073634580000544,
+          "csv_paths": [
+            "b16-t1/exports/local/core19/OPPROF_20261113102141_AIIOBKSERVMKLMMO/simulator/core19.veccore0/core19.veccore0_instr_exe_20261113102142875.csv",
+            "b16-t1/exports/local/core19/OPPROF_20261113102141_AIIOBKSERVMKLMMO/simulator/core19.veccore1/core19.veccore1_instr_exe_20261113102142875.csv"
+          ],
+          "log_sha256": "504b9caddec0dda419584282ef8b9ae9eaae722cf589407259d86aac59d4f993"
+        },
+        {
+          "phase": "local",
+          "core": 20,
+          "exit_code": 0,
+          "wall_seconds": 2.692061625000406,
+          "csv_paths": [
+            "b16-t1/exports/local/core20/OPPROF_20261113102143_WVDLSDXNFDOXKRXZ/simulator/core20.veccore0/core20.veccore0_instr_exe_20261113102145453.csv",
+            "b16-t1/exports/local/core20/OPPROF_20261113102143_WVDLSDXNFDOXKRXZ/simulator/core20.veccore1/core20.veccore1_instr_exe_20261113102145453.csv"
+          ],
+          "log_sha256": "4056c79014eea70c52af3ba112e2f1ff50ee1dd3b29b256998a834136c01ef08"
+        },
+        {
+          "phase": "local",
+          "core": 21,
+          "exit_code": 0,
+          "wall_seconds": 1.9628347910002049,
+          "csv_paths": [
+            "b16-t1/exports/local/core21/OPPROF_20261113102145_PQFHZFYQSZARFQFV/simulator/core21.veccore0/core21.veccore0_instr_exe_20261113102147578.csv",
+            "b16-t1/exports/local/core21/OPPROF_20261113102145_PQFHZFYQSZARFQFV/simulator/core21.veccore1/core21.veccore1_instr_exe_20261113102147578.csv"
+          ],
+          "log_sha256": "9aebf83c3d3d6b98df915036060c67b5e38cfe3025ee2ce540f5fb4c02a338dd"
+        },
+        {
+          "phase": "local",
+          "core": 22,
+          "exit_code": 0,
+          "wall_seconds": 1.9785204579998208,
+          "csv_paths": [
+            "b16-t1/exports/local/core22/OPPROF_20261113102147_RWQTEHGSPHFBDKVB/simulator/core22.veccore1/core22.veccore1_instr_exe_20261113102149564.csv",
+            "b16-t1/exports/local/core22/OPPROF_20261113102147_RWQTEHGSPHFBDKVB/simulator/core22.veccore0/core22.veccore0_instr_exe_20261113102149564.csv"
+          ],
+          "log_sha256": "20d2d624eabf92c45cc8a817bb7d1e5ce804033e1d2a54c89330add82aa9caea"
+        },
+        {
+          "phase": "local",
+          "core": 23,
+          "exit_code": 0,
+          "wall_seconds": 1.9492555420001736,
+          "csv_paths": [
+            "b16-t1/exports/local/core23/OPPROF_20261113102149_MJQYBRBFTGYRWBIZ/simulator/core23.veccore1/core23.veccore1_instr_exe_20261113102151490.csv",
+            "b16-t1/exports/local/core23/OPPROF_20261113102149_MJQYBRBFTGYRWBIZ/simulator/core23.veccore0/core23.veccore0_instr_exe_20261113102151490.csv"
+          ],
+          "log_sha256": "b70175b90b0d2b9ec7a4c2ac3b2e6ca48e136e08e557148f5fa200a35937cacc"
+        },
+        {
+          "phase": "local",
+          "core": 24,
+          "exit_code": 0,
+          "wall_seconds": 2.097110208000231,
+          "csv_paths": [
+            "b16-t1/exports/local/core24/OPPROF_20261113102151_YHKGQTOSEJWLCSFN/simulator/core24.veccore1/core24.veccore1_instr_exe_20261113102153656.csv",
+            "b16-t1/exports/local/core24/OPPROF_20261113102151_YHKGQTOSEJWLCSFN/simulator/core24.veccore0/core24.veccore0_instr_exe_20261113102153656.csv"
+          ],
+          "log_sha256": "a168a26f436021e02abe622e418301478926f3d93a1e7870e42855efdac0b692"
+        },
+        {
+          "phase": "local",
+          "core": 25,
+          "exit_code": 0,
+          "wall_seconds": 1.872375207999994,
+          "csv_paths": [
+            "b16-t1/exports/local/core25/OPPROF_20261113102153_NUFRJVHCKNLKAPMZ/simulator/core25.veccore1/core25.veccore1_instr_exe_20261113102155456.csv",
+            "b16-t1/exports/local/core25/OPPROF_20261113102153_NUFRJVHCKNLKAPMZ/simulator/core25.veccore0/core25.veccore0_instr_exe_20261113102155456.csv"
+          ],
+          "log_sha256": "5f66511ccb47df2015d23360f5ac43a10c3360f0d630deb421f96fa2e9fe0676"
+        },
+        {
+          "phase": "local",
+          "core": 26,
+          "exit_code": 0,
+          "wall_seconds": 1.9174065419997532,
+          "csv_paths": [
+            "b16-t1/exports/local/core26/OPPROF_20261113102155_PHRQUNDHEAMSENXO/simulator/core26.veccore0/core26.veccore0_instr_exe_20261113102157445.csv",
+            "b16-t1/exports/local/core26/OPPROF_20261113102155_PHRQUNDHEAMSENXO/simulator/core26.veccore1/core26.veccore1_instr_exe_20261113102157445.csv"
+          ],
+          "log_sha256": "48b47ee8bac33c1231b87509fda5e6c8663f337bf9efce68775317eec350ddbb"
+        },
+        {
+          "phase": "local",
+          "core": 27,
+          "exit_code": 0,
+          "wall_seconds": 2.0363868330000514,
+          "csv_paths": [
+            "b16-t1/exports/local/core27/OPPROF_20261113102157_OGBXSVJRFMZCMYBH/simulator/core27.veccore0/core27.veccore0_instr_exe_20261113102159520.csv",
+            "b16-t1/exports/local/core27/OPPROF_20261113102157_OGBXSVJRFMZCMYBH/simulator/core27.veccore1/core27.veccore1_instr_exe_20261113102159520.csv"
+          ],
+          "log_sha256": "5b163fe45c2199faf550ef273c3a7fca908200961347ff3b23e46b75c39e0922"
+        }
+      ],
+      "model_capture_wall_seconds": 932.7340703750001,
+      "total_model_ticks": 103437,
+      "oracle": {
+        "status": "passed",
+        "scope": "AIV-only exact final TopK component",
+        "batch": 16,
+        "history": 131072,
+        "valid": 131072,
+        "miss_per_query": 205,
+        "shards": 1,
+        "aiv_budget": 56,
+        "local_workers": 56,
+        "merge_workers": 0,
+        "aic_workers": 0,
+        "guards": true,
+        "local_max_worker_cycle_delta": 93629,
+        "merge_max_worker_cycle_delta": 0,
+        "sum_phase_max_worker_cycle_delta": 93629,
+        "timing_scope": "worker-body only; excludes dispatch and init",
+        "selected_set_and_scores": true,
+        "all_local_candidates": true,
+        "input_unchanged": true,
+        "full_LI": false,
+        "transport": false
+      },
+      "capture_log_sha256": "2893540b1e08076fa2ce77b5007db00e444ac8aaf3d7606701575fdeb6533f3a"
+    },
+    {
+      "case": "b16-t4",
+      "batch": 16,
+      "shards": 4,
+      "status": "PASSED_MODEL_AND_OFFLINE_EXPORT",
+      "collector_exit": 0,
+      "collector_postprocess_recovered": false,
+      "exports": [
+        {
+          "phase": "local",
+          "core": 0,
+          "exit_code": 0,
+          "wall_seconds": 2.448697291999906,
+          "csv_paths": [
+            "b16-t4/exports/local/core0/OPPROF_20261113103942_KGNGEAEFGLFDRUXY/simulator/core0.veccore1/core0.veccore1_instr_exe_20261113103944486.csv",
+            "b16-t4/exports/local/core0/OPPROF_20261113103942_KGNGEAEFGLFDRUXY/simulator/core0.veccore0/core0.veccore0_instr_exe_20261113103944486.csv"
+          ],
+          "log_sha256": "259a079122cfb4353c7c84246f2cf2877b8dac2def3a033dcf08521d830b297f"
+        },
+        {
+          "phase": "local",
+          "core": 1,
+          "exit_code": 0,
+          "wall_seconds": 2.272544166999978,
+          "csv_paths": [
+            "b16-t4/exports/local/core1/OPPROF_20261113103944_SJBKQTSWIVJLMXFB/simulator/core1.veccore1/core1.veccore1_instr_exe_20261113103946760.csv",
+            "b16-t4/exports/local/core1/OPPROF_20261113103944_SJBKQTSWIVJLMXFB/simulator/core1.veccore0/core1.veccore0_instr_exe_20261113103946761.csv"
+          ],
+          "log_sha256": "732613313c78baf0c949d8013ed39f37dddc3307fff168dd79dd77585f2f2295"
+        },
+        {
+          "phase": "local",
+          "core": 2,
+          "exit_code": 0,
+          "wall_seconds": 2.4754506250001214,
+          "csv_paths": [
+            "b16-t4/exports/local/core2/OPPROF_20261113103947_FIHRIJYBZCRNKWZW/simulator/core2.veccore0/core2.veccore0_instr_exe_20261113103949274.csv",
+            "b16-t4/exports/local/core2/OPPROF_20261113103947_FIHRIJYBZCRNKWZW/simulator/core2.veccore1/core2.veccore1_instr_exe_20261113103949275.csv"
+          ],
+          "log_sha256": "b22cd6a8584cb30761110efd0acae9726e27aaed975aa8d30640f4fbf4297999"
+        },
+        {
+          "phase": "local",
+          "core": 3,
+          "exit_code": 0,
+          "wall_seconds": 2.9111579170003097,
+          "csv_paths": [
+            "b16-t4/exports/local/core3/OPPROF_20261113103949_DQGCJPOQSOYAIEHL/simulator/core3.veccore0/core3.veccore0_instr_exe_20261113103952158.csv",
+            "b16-t4/exports/local/core3/OPPROF_20261113103949_DQGCJPOQSOYAIEHL/simulator/core3.veccore1/core3.veccore1_instr_exe_20261113103952158.csv"
+          ],
+          "log_sha256": "021638e52571462e74b6eff33753d003a46cb50e6918e8a7ac2c1f178e22c2f5"
+        },
+        {
+          "phase": "local",
+          "core": 4,
+          "exit_code": 0,
+          "wall_seconds": 2.2642775829999664,
+          "csv_paths": [
+            "b16-t4/exports/local/core4/OPPROF_20261113103952_HODNLWBONNDRFODJ/simulator/core4.veccore0/core4.veccore0_instr_exe_20261113103954436.csv",
+            "b16-t4/exports/local/core4/OPPROF_20261113103952_HODNLWBONNDRFODJ/simulator/core4.veccore1/core4.veccore1_instr_exe_20261113103954437.csv"
+          ],
+          "log_sha256": "17c5c15aea309fa45c2024b2192f0613ebd727290c791b1b1462e678ec3fd621"
+        },
+        {
+          "phase": "local",
+          "core": 5,
+          "exit_code": 0,
+          "wall_seconds": 2.6988588340000206,
+          "csv_paths": [
+            "b16-t4/exports/local/core5/OPPROF_20261113103954_WCPTZKQWHSKMYACE/simulator/core5.veccore0/core5.veccore0_instr_exe_20261113103957118.csv",
+            "b16-t4/exports/local/core5/OPPROF_20261113103954_WCPTZKQWHSKMYACE/simulator/core5.veccore1/core5.veccore1_instr_exe_20261113103957118.csv"
+          ],
+          "log_sha256": "164a3dca47b4b45a7bae15727e665ccfbe135f121cce6bed3d993831b0ad5741"
+        },
+        {
+          "phase": "local",
+          "core": 6,
+          "exit_code": 0,
+          "wall_seconds": 2.5464807920002386,
+          "csv_paths": [
+            "b16-t4/exports/local/core6/OPPROF_20261113103957_SULIUTIITOABRRQF/simulator/core6.veccore1/core6.veccore1_instr_exe_20261113103959741.csv",
+            "b16-t4/exports/local/core6/OPPROF_20261113103957_SULIUTIITOABRRQF/simulator/core6.veccore0/core6.veccore0_instr_exe_20261113103959741.csv"
+          ],
+          "log_sha256": "7a7f4396a83db9b75c0cb6179f94a11a602b160deddea5564215a71e3985e414"
+        },
+        {
+          "phase": "local",
+          "core": 7,
+          "exit_code": 0,
+          "wall_seconds": 2.4985837499998524,
+          "csv_paths": [
+            "b16-t4/exports/local/core7/OPPROF_20261113104000_RYTMESOQBJKXAWDL/simulator/core7.veccore1/core7.veccore1_instr_exe_20261113104002230.csv",
+            "b16-t4/exports/local/core7/OPPROF_20261113104000_RYTMESOQBJKXAWDL/simulator/core7.veccore0/core7.veccore0_instr_exe_20261113104002224.csv"
+          ],
+          "log_sha256": "50b9d33a2d2d77613db2f8720e8c7ef7473843ce95598a9127f08b81e59dedd3"
+        },
+        {
+          "phase": "local",
+          "core": 8,
+          "exit_code": 0,
+          "wall_seconds": 3.1593253750002077,
+          "csv_paths": [
+            "b16-t4/exports/local/core8/OPPROF_20261113104002_LQVFJNWYFXTZZKUR/simulator/core8.veccore1/core8.veccore1_instr_exe_20261113104005457.csv",
+            "b16-t4/exports/local/core8/OPPROF_20261113104002_LQVFJNWYFXTZZKUR/simulator/core8.veccore0/core8.veccore0_instr_exe_20261113104005457.csv"
+          ],
+          "log_sha256": "1d5752112abb99d2cbcbfc45b24f5aac8286097dae5cd1e423d4a5be9bb676b2"
+        },
+        {
+          "phase": "local",
+          "core": 9,
+          "exit_code": 0,
+          "wall_seconds": 2.613007166999978,
+          "csv_paths": [
+            "b16-t4/exports/local/core9/OPPROF_20261113104005_DYHZVWIFXPZJPHDC/simulator/core9.veccore1/core9.veccore1_instr_exe_20261113104008016.csv",
+            "b16-t4/exports/local/core9/OPPROF_20261113104005_DYHZVWIFXPZJPHDC/simulator/core9.veccore0/core9.veccore0_instr_exe_20261113104008016.csv"
+          ],
+          "log_sha256": "5bdb13e52571686658b9965f81c59f47fb4fc9c074a6fa30abc776961963ea49"
+        },
+        {
+          "phase": "local",
+          "core": 10,
+          "exit_code": 0,
+          "wall_seconds": 2.363184625000031,
+          "csv_paths": [
+            "b16-t4/exports/local/core10/OPPROF_20261113104008_KUMMMQEZPNAZLXWI/simulator/core10.veccore0/core10.veccore0_instr_exe_20261113104010456.csv",
+            "b16-t4/exports/local/core10/OPPROF_20261113104008_KUMMMQEZPNAZLXWI/simulator/core10.veccore1/core10.veccore1_instr_exe_20261113104010457.csv"
+          ],
+          "log_sha256": "ea4fa6fc3092be69baec09aa2944a3e8377a11dddc3115a9eed99066a4950ea2"
+        },
+        {
+          "phase": "local",
+          "core": 11,
+          "exit_code": 0,
+          "wall_seconds": 3.4760643330000676,
+          "csv_paths": [
+            "b16-t4/exports/local/core11/OPPROF_20261113104010_ZXLIZQISNQUUXCYH/simulator/core11.veccore0/core11.veccore0_instr_exe_20261113104013943.csv",
+            "b16-t4/exports/local/core11/OPPROF_20261113104010_ZXLIZQISNQUUXCYH/simulator/core11.veccore1/core11.veccore1_instr_exe_20261113104013943.csv"
+          ],
+          "log_sha256": "9a2d2d532ca4a7dfabc7d05dfe299c2353ba08ec9c2dca32b78518aff43c9a2b"
+        },
+        {
+          "phase": "local",
+          "core": 12,
+          "exit_code": 0,
+          "wall_seconds": 2.628252749999774,
+          "csv_paths": [
+            "b16-t4/exports/local/core12/OPPROF_20261113104014_RBQGBUZVDMLKUYJU/simulator/core12.veccore1/core12.veccore1_instr_exe_20261113104016616.csv",
+            "b16-t4/exports/local/core12/OPPROF_20261113104014_RBQGBUZVDMLKUYJU/simulator/core12.veccore0/core12.veccore0_instr_exe_20261113104016614.csv"
+          ],
+          "log_sha256": "4fd69f15156697e95dc73a0b26448a0e93d2434199d882cb2b97f5336ba7981f"
+        },
+        {
+          "phase": "local",
+          "core": 13,
+          "exit_code": 0,
+          "wall_seconds": 2.694996458999867,
+          "csv_paths": [
+            "b16-t4/exports/local/core13/OPPROF_20261113104016_QCCQDLGFFFEQXZSP/simulator/core13.veccore1/core13.veccore1_instr_exe_20261113104019283.csv",
+            "b16-t4/exports/local/core13/OPPROF_20261113104016_QCCQDLGFFFEQXZSP/simulator/core13.veccore0/core13.veccore0_instr_exe_20261113104019283.csv"
+          ],
+          "log_sha256": "36716ad082947bbd50558b8a0ceb89bcfc280b1eb2508d9fb2f1afc43b5558bb"
+        },
+        {
+          "phase": "local",
+          "core": 14,
+          "exit_code": 0,
+          "wall_seconds": 2.4756160420001834,
+          "csv_paths": [
+            "b16-t4/exports/local/core14/OPPROF_20261113104019_UVTDFJAKTEJEJRTM/simulator/core14.veccore1/core14.veccore1_instr_exe_20261113104021700.csv",
+            "b16-t4/exports/local/core14/OPPROF_20261113104019_UVTDFJAKTEJEJRTM/simulator/core14.veccore0/core14.veccore0_instr_exe_20261113104021700.csv"
+          ],
+          "log_sha256": "6dc429e1c94a9e08d00886d2ffcf314976de3505a329fb0b4b36808eb9b964c0"
+        },
+        {
+          "phase": "local",
+          "core": 15,
+          "exit_code": 0,
+          "wall_seconds": 3.2213311669997893,
+          "csv_paths": [
+            "b16-t4/exports/local/core15/OPPROF_20261113104022_XPGQWKXMPQTGRHCT/simulator/core15.veccore1/core15.veccore1_instr_exe_20261113104024911.csv",
+            "b16-t4/exports/local/core15/OPPROF_20261113104022_XPGQWKXMPQTGRHCT/simulator/core15.veccore0/core15.veccore0_instr_exe_20261113104024911.csv"
+          ],
+          "log_sha256": "8baf0b6d3c4a51079bf6af827e34c58c684356c8a23ddf68524e6cdf316acb3f"
+        },
+        {
+          "phase": "local",
+          "core": 16,
+          "exit_code": 0,
+          "wall_seconds": 2.0754639580000003,
+          "csv_paths": [
+            "b16-t4/exports/local/core16/OPPROF_20261113104025_GCDBMFOUFMUXSFLD/simulator/core16.veccore0/core16.veccore0_instr_exe_20261113104027080.csv",
+            "b16-t4/exports/local/core16/OPPROF_20261113104025_GCDBMFOUFMUXSFLD/simulator/core16.veccore1/core16.veccore1_instr_exe_20261113104027080.csv"
+          ],
+          "log_sha256": "9b45442d51c2dae1fc7747ce201feabca9e0422ed411d193a740d347b7ed46db"
+        },
+        {
+          "phase": "local",
+          "core": 17,
+          "exit_code": 0,
+          "wall_seconds": 2.3624670409999453,
+          "csv_paths": [
+            "b16-t4/exports/local/core17/OPPROF_20261113104027_HJYAZEYNOWRFDKPY/simulator/core17.veccore0/core17.veccore0_instr_exe_20261113104029400.csv",
+            "b16-t4/exports/local/core17/OPPROF_20261113104027_HJYAZEYNOWRFDKPY/simulator/core17.veccore1/core17.veccore1_instr_exe_20261113104029400.csv"
+          ],
+          "log_sha256": "6de16a9f49728136539cac92140d004de6a8d25f4db229fc7312c936f4d2f4e4"
+        },
+        {
+          "phase": "local",
+          "core": 18,
+          "exit_code": 0,
+          "wall_seconds": 2.5800064579998434,
+          "csv_paths": [
+            "b16-t4/exports/local/core18/OPPROF_20261113104029_AOVZBUBZKICZHOLM/simulator/core18.veccore0/core18.veccore0_instr_exe_20261113104032116.csv",
+            "b16-t4/exports/local/core18/OPPROF_20261113104029_AOVZBUBZKICZHOLM/simulator/core18.veccore1/core18.veccore1_instr_exe_20261113104032116.csv"
+          ],
+          "log_sha256": "02ca62d980f3d30944abd053009a9af525372761a5ce867449b1a64d370fdb29"
+        },
+        {
+          "phase": "local",
+          "core": 19,
+          "exit_code": 0,
+          "wall_seconds": 2.6204088750000665,
+          "csv_paths": [
+            "b16-t4/exports/local/core19/OPPROF_20261113104032_EXVTJIVJBJUTFUPI/simulator/core19.veccore0/core19.veccore0_instr_exe_20261113104034753.csv",
+            "b16-t4/exports/local/core19/OPPROF_20261113104032_EXVTJIVJBJUTFUPI/simulator/core19.veccore1/core19.veccore1_instr_exe_20261113104034753.csv"
+          ],
+          "log_sha256": "271b85cf15086193521dd461678ebf32c3bad2005077c579843bd2f1e2734113"
+        },
+        {
+          "phase": "local",
+          "core": 20,
+          "exit_code": 0,
+          "wall_seconds": 2.729000416999952,
+          "csv_paths": [
+            "b16-t4/exports/local/core20/OPPROF_20261113104035_VCHBCCQGUERDEMJH/simulator/core20.veccore0/core20.veccore0_instr_exe_20261113104037464.csv",
+            "b16-t4/exports/local/core20/OPPROF_20261113104035_VCHBCCQGUERDEMJH/simulator/core20.veccore1/core20.veccore1_instr_exe_20261113104037464.csv"
+          ],
+          "log_sha256": "3e1f05406e6f6f969d4062c243093059f8045fb902b8967ad3511139bedb8993"
+        },
+        {
+          "phase": "local",
+          "core": 21,
+          "exit_code": 0,
+          "wall_seconds": 2.198974041999918,
+          "csv_paths": [
+            "b16-t4/exports/local/core21/OPPROF_20261113104037_RSTKRSVBFHPFFXTC/simulator/core21.veccore0/core21.veccore0_instr_exe_20261113104039742.csv",
+            "b16-t4/exports/local/core21/OPPROF_20261113104037_RSTKRSVBFHPFFXTC/simulator/core21.veccore1/core21.veccore1_instr_exe_20261113104039742.csv"
+          ],
+          "log_sha256": "8e694012f2cbff0515a3759bb05905165348503e2d015c2356cb94655a02ca73"
+        },
+        {
+          "phase": "local",
+          "core": 22,
+          "exit_code": 0,
+          "wall_seconds": 1.9430646249998063,
+          "csv_paths": [
+            "b16-t4/exports/local/core22/OPPROF_20261113104040_AUTUGNOHQHRHYHJP/simulator/core22.veccore1/core22.veccore1_instr_exe_20261113104041680.csv",
+            "b16-t4/exports/local/core22/OPPROF_20261113104040_AUTUGNOHQHRHYHJP/simulator/core22.veccore0/core22.veccore0_instr_exe_20261113104041679.csv"
+          ],
+          "log_sha256": "1f3832ed7415e193b98c798d4c4506777505bf0c861e60a344aec933010607cc"
+        },
+        {
+          "phase": "local",
+          "core": 23,
+          "exit_code": 0,
+          "wall_seconds": 2.161170458000015,
+          "csv_paths": [
+            "b16-t4/exports/local/core23/OPPROF_20261113104042_MDNCFPYKXAFTICWV/simulator/core23.veccore1/core23.veccore1_instr_exe_20261113104043850.csv",
+            "b16-t4/exports/local/core23/OPPROF_20261113104042_MDNCFPYKXAFTICWV/simulator/core23.veccore0/core23.veccore0_instr_exe_20261113104043850.csv"
+          ],
+          "log_sha256": "ed856c7c5479090b3c8b7fa3f30c27aff3b6a1f3acb6806c61b76e492a889d89"
+        },
+        {
+          "phase": "local",
+          "core": 24,
+          "exit_code": 0,
+          "wall_seconds": 2.4223152080003274,
+          "csv_paths": [
+            "b16-t4/exports/local/core24/OPPROF_20261113104044_QMXHRKXCBOMDNXYW/simulator/core24.veccore1/core24.veccore1_instr_exe_20261113104046182.csv",
+            "b16-t4/exports/local/core24/OPPROF_20261113104044_QMXHRKXCBOMDNXYW/simulator/core24.veccore0/core24.veccore0_instr_exe_20261113104046180.csv"
+          ],
+          "log_sha256": "778104fb6a26fc012e00ef77bdf0c5023e64b78507dbc196a48f2e65aa20ab54"
+        },
+        {
+          "phase": "local",
+          "core": 25,
+          "exit_code": 0,
+          "wall_seconds": 2.572132333999889,
+          "csv_paths": [
+            "b16-t4/exports/local/core25/OPPROF_20261113104046_VYPMPSVNJVAVLVXG/simulator/core25.veccore1/core25.veccore1_instr_exe_20261113104048834.csv",
+            "b16-t4/exports/local/core25/OPPROF_20261113104046_VYPMPSVNJVAVLVXG/simulator/core25.veccore0/core25.veccore0_instr_exe_20261113104048835.csv"
+          ],
+          "log_sha256": "bfa73966ed4360eab2df7961cf461c370ea6954c2da7e663a54db0c7ea042345"
+        },
+        {
+          "phase": "local",
+          "core": 26,
+          "exit_code": 0,
+          "wall_seconds": 2.713698791999832,
+          "csv_paths": [
+            "b16-t4/exports/local/core26/OPPROF_20261113104049_MFEVDTWXUGMLMNLK/simulator/core26.veccore0/core26.veccore0_instr_exe_20261113104051545.csv",
+            "b16-t4/exports/local/core26/OPPROF_20261113104049_MFEVDTWXUGMLMNLK/simulator/core26.veccore1/core26.veccore1_instr_exe_20261113104051546.csv"
+          ],
+          "log_sha256": "7ffa6a0e48765e41a6164b6e1697b4bbc43280504e930d4b5ed4e387e2ae8904"
+        },
+        {
+          "phase": "local",
+          "core": 27,
+          "exit_code": 0,
+          "wall_seconds": 2.266840417000367,
+          "csv_paths": [
+            "b16-t4/exports/local/core27/OPPROF_20261113104051_JBSAQSOEVOXTMWLL/simulator/core27.veccore0/core27.veccore0_instr_exe_20261113104053814.csv",
+            "b16-t4/exports/local/core27/OPPROF_20261113104051_JBSAQSOEVOXTMWLL/simulator/core27.veccore1/core27.veccore1_instr_exe_20261113104053814.csv"
+          ],
+          "log_sha256": "c6f56f5a9a31912ff93853acda029b9b6efa6c085f673e289e2840b1ec29d606"
+        },
+        {
+          "phase": "merge",
+          "core": 0,
+          "exit_code": 0,
+          "wall_seconds": 0.8119014169997172,
+          "csv_paths": [
+            "b16-t4/exports/merge/core0/OPPROF_20261113104054_ABQTFKFCLOMVQGRK/simulator/core0.veccore1/core0.veccore1_instr_exe_20261113104054806.csv",
+            "b16-t4/exports/merge/core0/OPPROF_20261113104054_ABQTFKFCLOMVQGRK/simulator/core0.veccore0/core0.veccore0_instr_exe_20261113104054806.csv"
+          ],
+          "log_sha256": "c0affb052689c0e438665ae09bc6960fb7739e55625f0bbc7ba58f6af1e01d6a"
+        },
+        {
+          "phase": "merge",
+          "core": 1,
+          "exit_code": 0,
+          "wall_seconds": 0.6622718339999665,
+          "csv_paths": [
+            "b16-t4/exports/merge/core1/OPPROF_20261113104055_ONJODXMENLVRTEAE/simulator/core1.veccore1/core1.veccore1_instr_exe_20261113104055479.csv",
+            "b16-t4/exports/merge/core1/OPPROF_20261113104055_ONJODXMENLVRTEAE/simulator/core1.veccore0/core1.veccore0_instr_exe_20261113104055479.csv"
+          ],
+          "log_sha256": "1b3017d065d5709bcaceb0cf5cbe941bdd1da49180909968cbdfca0a127c941d"
+        },
+        {
+          "phase": "merge",
+          "core": 2,
+          "exit_code": 0,
+          "wall_seconds": 0.703576584000075,
+          "csv_paths": [
+            "b16-t4/exports/merge/core2/OPPROF_20261113104055_ZZPEAANTXIBDPBDC/simulator/core2.veccore0/core2.veccore0_instr_exe_20261113104056225.csv",
+            "b16-t4/exports/merge/core2/OPPROF_20261113104055_ZZPEAANTXIBDPBDC/simulator/core2.veccore1/core2.veccore1_instr_exe_20261113104056225.csv"
+          ],
+          "log_sha256": "71218aa5eb68c2193e79b4a61d2a8625492266342317d8611b7e33c5dfa15f0b"
+        },
+        {
+          "phase": "merge",
+          "core": 3,
+          "exit_code": 0,
+          "wall_seconds": 0.6573524170003111,
+          "csv_paths": [
+            "b16-t4/exports/merge/core3/OPPROF_20261113104056_SURKMFGTWDKDVALW/simulator/core3.veccore0/core3.veccore0_instr_exe_20261113104056846.csv",
+            "b16-t4/exports/merge/core3/OPPROF_20261113104056_SURKMFGTWDKDVALW/simulator/core3.veccore1/core3.veccore1_instr_exe_20261113104056846.csv"
+          ],
+          "log_sha256": "8feee1904c31768b27c7b71f0c07f8c224824149aa778b792d7dd2ff3fe15d89"
+        },
+        {
+          "phase": "merge",
+          "core": 4,
+          "exit_code": 0,
+          "wall_seconds": 0.6932170410000253,
+          "csv_paths": [
+            "b16-t4/exports/merge/core4/OPPROF_20261113104057_OKBGPBJZZUFEJTYG/simulator/core4.veccore0/core4.veccore0_instr_exe_20261113104057381.csv",
+            "b16-t4/exports/merge/core4/OPPROF_20261113104057_OKBGPBJZZUFEJTYG/simulator/core4.veccore1/core4.veccore1_instr_exe_20261113104057381.csv"
+          ],
+          "log_sha256": "769a9ef39f67d62661a76a6c939d394e37686282b7809805b7410bb113311e91"
+        },
+        {
+          "phase": "merge",
+          "core": 5,
+          "exit_code": 0,
+          "wall_seconds": 0.928137582999625,
+          "csv_paths": [
+            "b16-t4/exports/merge/core5/OPPROF_20261113104057_ELFYQVPZYKOUATNS/simulator/core5.veccore0/core5.veccore0_instr_exe_20261113104058583.csv",
+            "b16-t4/exports/merge/core5/OPPROF_20261113104057_ELFYQVPZYKOUATNS/simulator/core5.veccore1/core5.veccore1_instr_exe_20261113104058583.csv"
+          ],
+          "log_sha256": "2398f44e781a7b0c2e1bba07d1c5cb26048e4d9ffc206702fc11f7b3e2085004"
+        },
+        {
+          "phase": "merge",
+          "core": 6,
+          "exit_code": 0,
+          "wall_seconds": 0.6680047499999091,
+          "csv_paths": [
+            "b16-t4/exports/merge/core6/OPPROF_20261113104058_MOHMHWKWFQBFNZYX/simulator/core6.veccore1/core6.veccore1_instr_exe_20261113104059270.csv",
+            "b16-t4/exports/merge/core6/OPPROF_20261113104058_MOHMHWKWFQBFNZYX/simulator/core6.veccore0/core6.veccore0_instr_exe_20261113104059270.csv"
+          ],
+          "log_sha256": "1757cec44a603a5236108fdb1b956f2b4b1f673bddded6f5af0b762a17386510"
+        },
+        {
+          "phase": "merge",
+          "core": 7,
+          "exit_code": 0,
+          "wall_seconds": 0.5587825839998004,
+          "csv_paths": [
+            "b16-t4/exports/merge/core7/OPPROF_20261113104059_OYFJRMPUEKCASQLB/simulator/core7.veccore1/core7.veccore1_instr_exe_20261113104059864.csv",
+            "b16-t4/exports/merge/core7/OPPROF_20261113104059_OYFJRMPUEKCASQLB/simulator/core7.veccore0/core7.veccore0_instr_exe_20261113104059864.csv"
+          ],
+          "log_sha256": "a44940756c8b3b07dfeca364e4c7e9299adfe5426ddc43d84d5a4a347a9416d6"
+        },
+        {
+          "phase": "merge",
+          "core": 8,
+          "exit_code": 0,
+          "wall_seconds": 0.5000344169998243,
+          "csv_paths": [
+            "b16-t4/exports/merge/core8/OPPROF_20261113104100_SMTNHHBQDNQHDQZC/simulator/core8.veccore1/core8.veccore1_instr_exe_20261113104100397.csv",
+            "b16-t4/exports/merge/core8/OPPROF_20261113104100_SMTNHHBQDNQHDQZC/simulator/core8.veccore0/core8.veccore0_instr_exe_20261113104100397.csv"
+          ],
+          "log_sha256": "0834933e0eed146710fc3262bd3f4e6b2110dbb842e5c32c36683e06812a3c6c"
+        },
+        {
+          "phase": "merge",
+          "core": 9,
+          "exit_code": 0,
+          "wall_seconds": 0.6072973750001438,
+          "csv_paths": [
+            "b16-t4/exports/merge/core9/OPPROF_20261113104100_BGSRZKMXXANJIPEE/simulator/core9.veccore1/core9.veccore1_instr_exe_20261113104100930.csv",
+            "b16-t4/exports/merge/core9/OPPROF_20261113104100_BGSRZKMXXANJIPEE/simulator/core9.veccore0/core9.veccore0_instr_exe_20261113104100930.csv"
+          ],
+          "log_sha256": "7af6469ba31db2f3cac796ee5fb4798251b9889f97f47f730688973e017c0bcc"
+        },
+        {
+          "phase": "merge",
+          "core": 10,
+          "exit_code": 0,
+          "wall_seconds": 0.49097354199966503,
+          "csv_paths": [
+            "b16-t4/exports/merge/core10/OPPROF_20261113104101_KJKEIFPKPMJGUENG/simulator/core10.veccore0/core10.veccore0_instr_exe_20261113104101493.csv",
+            "b16-t4/exports/merge/core10/OPPROF_20261113104101_KJKEIFPKPMJGUENG/simulator/core10.veccore1/core10.veccore1_instr_exe_20261113104101493.csv"
+          ],
+          "log_sha256": "2c7410e1e4cde7c468e79780c3d16416e8d2f19625f79f454d468474f0421dde"
+        },
+        {
+          "phase": "merge",
+          "core": 11,
+          "exit_code": 0,
+          "wall_seconds": 0.5424579169998651,
+          "csv_paths": [
+            "b16-t4/exports/merge/core11/OPPROF_20261113104101_WJXTMWZQSBFABMQP/simulator/core11.veccore0/core11.veccore0_instr_exe_20261113104102017.csv",
+            "b16-t4/exports/merge/core11/OPPROF_20261113104101_WJXTMWZQSBFABMQP/simulator/core11.veccore1/core11.veccore1_instr_exe_20261113104102017.csv"
+          ],
+          "log_sha256": "000356ad0c8419e4a454ce5b4e836ba0153af52f2ac7ba74b88104c50d5d7555"
+        },
+        {
+          "phase": "merge",
+          "core": 12,
+          "exit_code": 0,
+          "wall_seconds": 0.5419195419999596,
+          "csv_paths": [
+            "b16-t4/exports/merge/core12/OPPROF_20261113104102_VTJMTWJWUVTNRWON/simulator/core12.veccore1/core12.veccore1_instr_exe_20261113104102621.csv",
+            "b16-t4/exports/merge/core12/OPPROF_20261113104102_VTJMTWJWUVTNRWON/simulator/core12.veccore0/core12.veccore0_instr_exe_20261113104102621.csv"
+          ],
+          "log_sha256": "30d8be1a908bb6539897a8ab234df1822ac69ce30c2ef644b85859f6e83cb853"
+        },
+        {
+          "phase": "merge",
+          "core": 13,
+          "exit_code": 0,
+          "wall_seconds": 0.5485642909998205,
+          "csv_paths": [
+            "b16-t4/exports/merge/core13/OPPROF_20261113104102_AMNNRYBCUDQUWUOJ/simulator/core13.veccore1/core13.veccore1_instr_exe_20261113104103145.csv",
+            "b16-t4/exports/merge/core13/OPPROF_20261113104102_AMNNRYBCUDQUWUOJ/simulator/core13.veccore0/core13.veccore0_instr_exe_20261113104103145.csv"
+          ],
+          "log_sha256": "b6a81528f75fc1040cc26d7bb71f4e1ffc0d84ce4386a73837259719e0567b0c"
+        },
+        {
+          "phase": "merge",
+          "core": 14,
+          "exit_code": 0,
+          "wall_seconds": 0.4516032080000514,
+          "csv_paths": [
+            "b16-t4/exports/merge/core14/OPPROF_20261113104103_QZFVGRFCMMCEISQQ/simulator/core14.veccore1/core14.veccore1_instr_exe_20261113104103656.csv",
+            "b16-t4/exports/merge/core14/OPPROF_20261113104103_QZFVGRFCMMCEISQQ/simulator/core14.veccore0/core14.veccore0_instr_exe_20261113104103656.csv"
+          ],
+          "log_sha256": "177c4bf5a417fc2d45abd5cd640cb4dfd41600a9217272aeb3cee2baa432b3ba"
+        },
+        {
+          "phase": "merge",
+          "core": 15,
+          "exit_code": 0,
+          "wall_seconds": 0.43584400000008827,
+          "csv_paths": [
+            "b16-t4/exports/merge/core15/OPPROF_20261113104103_EOZSZKHZQHRKJJHS/simulator/core15.veccore1/core15.veccore1_instr_exe_20261113104104089.csv",
+            "b16-t4/exports/merge/core15/OPPROF_20261113104103_EOZSZKHZQHRKJJHS/simulator/core15.veccore0/core15.veccore0_instr_exe_20261113104104088.csv"
+          ],
+          "log_sha256": "fc29510747d3682a6431a2bc6a78e5f558f66f381d31ccaf48a92c6f4a46834e"
+        },
+        {
+          "phase": "merge",
+          "core": 16,
+          "exit_code": 0,
+          "wall_seconds": 0.49078262499961056,
+          "csv_paths": [
+            "b16-t4/exports/merge/core16/OPPROF_20261113104104_CKRIEFXNVDKFQNOC/simulator/core16.veccore0/core16.veccore0_instr_exe_20261113104104560.csv",
+            "b16-t4/exports/merge/core16/OPPROF_20261113104104_CKRIEFXNVDKFQNOC/simulator/core16.veccore1/core16.veccore1_instr_exe_20261113104104560.csv"
+          ],
+          "log_sha256": "e090fc4f3201553bd956595eb12eabdf76d9982517d07ebe78483cdb265f1adb"
+        },
+        {
+          "phase": "merge",
+          "core": 17,
+          "exit_code": 0,
+          "wall_seconds": 0.4926573330003521,
+          "csv_paths": [
+            "b16-t4/exports/merge/core17/OPPROF_20261113104104_DCHCJYWCFXHGELYJ/simulator/core17.veccore0/core17.veccore0_instr_exe_20261113104105060.csv",
+            "b16-t4/exports/merge/core17/OPPROF_20261113104104_DCHCJYWCFXHGELYJ/simulator/core17.veccore1/core17.veccore1_instr_exe_20261113104105060.csv"
+          ],
+          "log_sha256": "4821a7acd32cf8b9047e1a19f5e406c240e2695dc46c357ce38c71e6f3cd9496"
+        },
+        {
+          "phase": "merge",
+          "core": 18,
+          "exit_code": 0,
+          "wall_seconds": 0.5431083329999637,
+          "csv_paths": [
+            "b16-t4/exports/merge/core18/OPPROF_20261113104105_RJXJSUVFEXYHMLHP/simulator/core18.veccore0/core18.veccore0_instr_exe_20261113104105661.csv",
+            "b16-t4/exports/merge/core18/OPPROF_20261113104105_RJXJSUVFEXYHMLHP/simulator/core18.veccore1/core18.veccore1_instr_exe_20261113104105661.csv"
+          ],
+          "log_sha256": "25362d182b150b40928ffaa6ad283b9a4d426f1d725bd8b3fd9d517e1ae5171b"
+        },
+        {
+          "phase": "merge",
+          "core": 19,
+          "exit_code": 0,
+          "wall_seconds": 0.5417931249999128,
+          "csv_paths": [
+            "b16-t4/exports/merge/core19/OPPROF_20261113104105_PJFMVCZIPVRCOLBX/simulator/core19.veccore0/core19.veccore0_instr_exe_20261113104106175.csv",
+            "b16-t4/exports/merge/core19/OPPROF_20261113104105_PJFMVCZIPVRCOLBX/simulator/core19.veccore1/core19.veccore1_instr_exe_20261113104106175.csv"
+          ],
+          "log_sha256": "d1bc2b07db8379cf2e60aad3f9960c4f13b8531df53860d3239c8ae79903f818"
+        },
+        {
+          "phase": "merge",
+          "core": 20,
+          "exit_code": 0,
+          "wall_seconds": 0.550747749999573,
+          "csv_paths": [
+            "b16-t4/exports/merge/core20/OPPROF_20261113104106_WIMVJLYTOUPVILPS/simulator/core20.veccore0/core20.veccore0_instr_exe_20261113104106739.csv",
+            "b16-t4/exports/merge/core20/OPPROF_20261113104106_WIMVJLYTOUPVILPS/simulator/core20.veccore1/core20.veccore1_instr_exe_20261113104106739.csv"
+          ],
+          "log_sha256": "96052ca2d3357ae5e896298d034c2828b604da85c7a27d6ff10fa674cfbef942"
+        },
+        {
+          "phase": "merge",
+          "core": 21,
+          "exit_code": 0,
+          "wall_seconds": 0.44207462499980466,
+          "csv_paths": [
+            "b16-t4/exports/merge/core21/OPPROF_20261113104106_NFVNFHJQNCEGBDFE/simulator/core21.veccore0/core21.veccore0_instr_exe_20261113104107253.csv",
+            "b16-t4/exports/merge/core21/OPPROF_20261113104106_NFVNFHJQNCEGBDFE/simulator/core21.veccore1/core21.veccore1_instr_exe_20261113104107253.csv"
+          ],
+          "log_sha256": "7e07c91381868d1535db89dd425d2a3a014c77cf35f086594396a1be3b9bfbee"
+        },
+        {
+          "phase": "merge",
+          "core": 22,
+          "exit_code": 0,
+          "wall_seconds": 0.744488666000052,
+          "csv_paths": [
+            "b16-t4/exports/merge/core22/OPPROF_20261113104107_AQDYWJFAJISZENAM/simulator/core22.veccore1/core22.veccore1_instr_exe_20261113104107985.csv",
+            "b16-t4/exports/merge/core22/OPPROF_20261113104107_AQDYWJFAJISZENAM/simulator/core22.veccore0/core22.veccore0_instr_exe_20261113104107985.csv"
+          ],
+          "log_sha256": "2a293951144e7b0184f4ee98cf54880937f0ea4b3ce47ca6b0d14a9223957884"
+        },
+        {
+          "phase": "merge",
+          "core": 23,
+          "exit_code": 0,
+          "wall_seconds": 0.596708832999866,
+          "csv_paths": [
+            "b16-t4/exports/merge/core23/OPPROF_20261113104108_ETVIDLZHPHOWCXCO/simulator/core23.veccore1/core23.veccore1_instr_exe_20261113104108577.csv",
+            "b16-t4/exports/merge/core23/OPPROF_20261113104108_ETVIDLZHPHOWCXCO/simulator/core23.veccore0/core23.veccore0_instr_exe_20261113104108577.csv"
+          ],
+          "log_sha256": "f212ac777a4d03517d4fbc39d1f33fba58ab48bcfb158954828e8d5a96fbdf84"
+        },
+        {
+          "phase": "merge",
+          "core": 24,
+          "exit_code": 0,
+          "wall_seconds": 0.48845295800038,
+          "csv_paths": [
+            "b16-t4/exports/merge/core24/OPPROF_20261113104108_RPCJQFIYPXTRWNOZ/simulator/core24.veccore1/core24.veccore1_instr_exe_20261113104109108.csv",
+            "b16-t4/exports/merge/core24/OPPROF_20261113104108_RPCJQFIYPXTRWNOZ/simulator/core24.veccore0/core24.veccore0_instr_exe_20261113104109108.csv"
+          ],
+          "log_sha256": "e35bae29d13fa7b12a38101419af7b7b5fe7263869e51077b584dfb9c9e9a690"
+        },
+        {
+          "phase": "merge",
+          "core": 25,
+          "exit_code": 0,
+          "wall_seconds": 0.503425082999911,
+          "csv_paths": [
+            "b16-t4/exports/merge/core25/OPPROF_20261113104109_CKLOBJLRJOXRDBGY/simulator/core25.veccore1/core25.veccore1_instr_exe_20261113104109608.csv",
+            "b16-t4/exports/merge/core25/OPPROF_20261113104109_CKLOBJLRJOXRDBGY/simulator/core25.veccore0/core25.veccore0_instr_exe_20261113104109608.csv"
+          ],
+          "log_sha256": "813b3574d22c59fc5e3a8d071560eb732a979680779b0d74b910f5f04f8ac0d9"
+        },
+        {
+          "phase": "merge",
+          "core": 26,
+          "exit_code": 0,
+          "wall_seconds": 0.5455522920001386,
+          "csv_paths": [
+            "b16-t4/exports/merge/core26/OPPROF_20261113104109_PJJWXIHLLIZIKCHI/simulator/core26.veccore0/core26.veccore0_instr_exe_20261113104110153.csv",
+            "b16-t4/exports/merge/core26/OPPROF_20261113104109_PJJWXIHLLIZIKCHI/simulator/core26.veccore1/core26.veccore1_instr_exe_20261113104110153.csv"
+          ],
+          "log_sha256": "a5614e2de6d3b7cd790814c0045b62364dbfce3341acbc9de6965c2d8cb47b12"
+        },
+        {
+          "phase": "merge",
+          "core": 27,
+          "exit_code": 0,
+          "wall_seconds": 0.49821641599965005,
+          "csv_paths": [
+            "b16-t4/exports/merge/core27/OPPROF_20261113104110_PAYAUQCXLPMWQIKU/simulator/core27.veccore0/core27.veccore0_instr_exe_20261113104110667.csv",
+            "b16-t4/exports/merge/core27/OPPROF_20261113104110_PAYAUQCXLPMWQIKU/simulator/core27.veccore1/core27.veccore1_instr_exe_20261113104110667.csv"
+          ],
+          "log_sha256": "a2edf8f0f11df50a7c9b171c7fd1de6cb016fe1627ea5651abba8cc05c0325cb"
+        }
+      ],
+      "model_capture_wall_seconds": 1062.5504738749996,
+      "total_model_ticks": 98156,
+      "oracle": {
+        "status": "passed",
+        "scope": "AIV-only exact final TopK component",
+        "batch": 16,
+        "history": 131072,
+        "valid": 131072,
+        "miss_per_query": 205,
+        "shards": 4,
+        "aiv_budget": 56,
+        "local_workers": 56,
+        "merge_workers": 56,
+        "aic_workers": 0,
+        "guards": true,
+        "local_max_worker_cycle_delta": 62553,
+        "merge_max_worker_cycle_delta": 18914,
+        "sum_phase_max_worker_cycle_delta": 81467,
+        "timing_scope": "worker-body only; excludes dispatch and init",
+        "selected_set_and_scores": true,
+        "all_local_candidates": true,
+        "input_unchanged": true,
+        "full_LI": false,
+        "transport": false
+      },
+      "capture_log_sha256": "40bc7e506a653d38358b47e7798c98711b6fe09026e78277caa840ee96347031"
+    },
+    {
+      "case": "b16-t8",
+      "batch": 16,
+      "shards": 8,
+      "status": "PASSED_MODEL_AND_OFFLINE_EXPORT",
+      "collector_exit": 0,
+      "collector_postprocess_recovered": false,
+      "exports": [
+        {
+          "phase": "local",
+          "core": 0,
+          "exit_code": 0,
+          "wall_seconds": 2.205504292000114,
+          "csv_paths": [
+            "b16-t8/exports/local/core0/OPPROF_20261113110001_PHOUOOFVCLTGORCU/simulator/core0.veccore1/core0.veccore1_instr_exe_20261113110003793.csv",
+            "b16-t8/exports/local/core0/OPPROF_20261113110001_PHOUOOFVCLTGORCU/simulator/core0.veccore0/core0.veccore0_instr_exe_20261113110003793.csv"
+          ],
+          "log_sha256": "d65f340a40c7026697a0e8b473ceaa43882585d9bc58990881b5047321210186"
+        },
+        {
+          "phase": "local",
+          "core": 1,
+          "exit_code": 0,
+          "wall_seconds": 2.73195454100005,
+          "csv_paths": [
+            "b16-t8/exports/local/core1/OPPROF_20261113110004_XVWVFTDJSINQMYIO/simulator/core1.veccore1/core1.veccore1_instr_exe_20261113110006485.csv",
+            "b16-t8/exports/local/core1/OPPROF_20261113110004_XVWVFTDJSINQMYIO/simulator/core1.veccore0/core1.veccore0_instr_exe_20261113110006485.csv"
+          ],
+          "log_sha256": "7f721a2196c00e42f316740b72a888faf0587a2642c45bba79ad56025cbbc1dc"
+        },
+        {
+          "phase": "local",
+          "core": 2,
+          "exit_code": 0,
+          "wall_seconds": 2.4816342499998427,
+          "csv_paths": [
+            "b16-t8/exports/local/core2/OPPROF_20261113110006_LLVKXVFWYWRESQYD/simulator/core2.veccore0/core2.veccore0_instr_exe_20261113110009022.csv",
+            "b16-t8/exports/local/core2/OPPROF_20261113110006_LLVKXVFWYWRESQYD/simulator/core2.veccore1/core2.veccore1_instr_exe_20261113110009022.csv"
+          ],
+          "log_sha256": "c022f3ea10c4bdc703f15b3d8f558656452ad0c2b68812d915cb4232c830fee2"
+        },
+        {
+          "phase": "local",
+          "core": 3,
+          "exit_code": 0,
+          "wall_seconds": 2.355652833000022,
+          "csv_paths": [
+            "b16-t8/exports/local/core3/OPPROF_20261113110009_ERHZKQXGUKDTXEQR/simulator/core3.veccore0/core3.veccore0_instr_exe_20261113110011368.csv",
+            "b16-t8/exports/local/core3/OPPROF_20261113110009_ERHZKQXGUKDTXEQR/simulator/core3.veccore1/core3.veccore1_instr_exe_20261113110011368.csv"
+          ],
+          "log_sha256": "b2ae6f38feb83b9743c958db0e5b458813c2df3a1923e2c5eac79fb2d569768a"
+        },
+        {
+          "phase": "local",
+          "core": 4,
+          "exit_code": 0,
+          "wall_seconds": 2.596464584000387,
+          "csv_paths": [
+            "b16-t8/exports/local/core4/OPPROF_20261113110011_BIMCQEYQMBZBSHJL/simulator/core4.veccore0/core4.veccore0_instr_exe_20261113110013817.csv",
+            "b16-t8/exports/local/core4/OPPROF_20261113110011_BIMCQEYQMBZBSHJL/simulator/core4.veccore1/core4.veccore1_instr_exe_20261113110013821.csv"
+          ],
+          "log_sha256": "58990e2ddbf555714d9caab8f9508fb7312cb12d9e4e91d6b27a12b767b501dd"
+        },
+        {
+          "phase": "local",
+          "core": 5,
+          "exit_code": 0,
+          "wall_seconds": 2.1944066249998286,
+          "csv_paths": [
+            "b16-t8/exports/local/core5/OPPROF_20261113110014_SKFTHTPGMXBJHURS/simulator/core5.veccore0/core5.veccore0_instr_exe_20261113110016289.csv",
+            "b16-t8/exports/local/core5/OPPROF_20261113110014_SKFTHTPGMXBJHURS/simulator/core5.veccore1/core5.veccore1_instr_exe_20261113110016289.csv"
+          ],
+          "log_sha256": "a678300e8c875f51281a1958ca67cb5177ee3e719834ff3446c8602e75527553"
+        },
+        {
+          "phase": "local",
+          "core": 6,
+          "exit_code": 0,
+          "wall_seconds": 2.6174109160001535,
+          "csv_paths": [
+            "b16-t8/exports/local/core6/OPPROF_20261113110016_KMUXONICJTXFMDCU/simulator/core6.veccore1/core6.veccore1_instr_exe_20261113110018838.csv",
+            "b16-t8/exports/local/core6/OPPROF_20261113110016_KMUXONICJTXFMDCU/simulator/core6.veccore0/core6.veccore0_instr_exe_20261113110018839.csv"
+          ],
+          "log_sha256": "7a77f98df296d9e01a34ae2562b737030a4c05f34f8de5dd07a098892c6eff11"
+        },
+        {
+          "phase": "local",
+          "core": 7,
+          "exit_code": 0,
+          "wall_seconds": 2.003673916999105,
+          "csv_paths": [
+            "b16-t8/exports/local/core7/OPPROF_20261113110019_JBIVDHBHXBCGWSNK/simulator/core7.veccore1/core7.veccore1_instr_exe_20261113110020947.csv",
+            "b16-t8/exports/local/core7/OPPROF_20261113110019_JBIVDHBHXBCGWSNK/simulator/core7.veccore0/core7.veccore0_instr_exe_20261113110020947.csv"
+          ],
+          "log_sha256": "14701f8fc1d28255a062824d815f4ee4ff7501f0a4863999893bba469f7b8999"
+        },
+        {
+          "phase": "local",
+          "core": 8,
+          "exit_code": 0,
+          "wall_seconds": 2.597066375000395,
+          "csv_paths": [
+            "b16-t8/exports/local/core8/OPPROF_20261113110021_XSIVDYSWDRFYMJAB/simulator/core8.veccore1/core8.veccore1_instr_exe_20261113110023525.csv",
+            "b16-t8/exports/local/core8/OPPROF_20261113110021_XSIVDYSWDRFYMJAB/simulator/core8.veccore0/core8.veccore0_instr_exe_20261113110023525.csv"
+          ],
+          "log_sha256": "26903de78696a9c6aada6d6afc8cd2b328741e33d1ebc8ae70155b6eb38ca689"
+        },
+        {
+          "phase": "local",
+          "core": 9,
+          "exit_code": 0,
+          "wall_seconds": 2.2868161249998593,
+          "csv_paths": [
+            "b16-t8/exports/local/core9/OPPROF_20261113110023_FBVHNIWJJZCRGJUW/simulator/core9.veccore1/core9.veccore1_instr_exe_20261113110025751.csv",
+            "b16-t8/exports/local/core9/OPPROF_20261113110023_FBVHNIWJJZCRGJUW/simulator/core9.veccore0/core9.veccore0_instr_exe_20261113110025751.csv"
+          ],
+          "log_sha256": "9911d3464a47ce09fac363f908e78dc2bb36046162a058f35e4ac31ce00d28b4"
+        },
+        {
+          "phase": "local",
+          "core": 10,
+          "exit_code": 0,
+          "wall_seconds": 1.946978916000262,
+          "csv_paths": [
+            "b16-t8/exports/local/core10/OPPROF_20261113110026_JKZMRLDNDYZADIOI/simulator/core10.veccore0/core10.veccore0_instr_exe_20261113110027792.csv",
+            "b16-t8/exports/local/core10/OPPROF_20261113110026_JKZMRLDNDYZADIOI/simulator/core10.veccore1/core10.veccore1_instr_exe_20261113110027792.csv"
+          ],
+          "log_sha256": "7772440ab3552713e38f9bfe55fa99acf04ec34317931c90597f4cd394dc72bc"
+        },
+        {
+          "phase": "local",
+          "core": 11,
+          "exit_code": 0,
+          "wall_seconds": 2.4607899169996017,
+          "csv_paths": [
+            "b16-t8/exports/local/core11/OPPROF_20261113110028_XMHKNGFXDVLJLETB/simulator/core11.veccore0/core11.veccore0_instr_exe_20261113110030137.csv",
+            "b16-t8/exports/local/core11/OPPROF_20261113110028_XMHKNGFXDVLJLETB/simulator/core11.veccore1/core11.veccore1_instr_exe_20261113110030137.csv"
+          ],
+          "log_sha256": "321c965acba4606aba28c902e4084f58b41ac097f7a87f2721472bd83c66ef5d"
+        },
+        {
+          "phase": "local",
+          "core": 12,
+          "exit_code": 0,
+          "wall_seconds": 2.5436724169994704,
+          "csv_paths": [
+            "b16-t8/exports/local/core12/OPPROF_20261113110030_SKGSLZFVQCYKSERT/simulator/core12.veccore1/core12.veccore1_instr_exe_20261113110032790.csv",
+            "b16-t8/exports/local/core12/OPPROF_20261113110030_SKGSLZFVQCYKSERT/simulator/core12.veccore0/core12.veccore0_instr_exe_20261113110032789.csv"
+          ],
+          "log_sha256": "e00bf42b5f5981e9dea3eeea00b6fac4f65e9f55020591106e325b3931b7d2f5"
+        },
+        {
+          "phase": "local",
+          "core": 13,
+          "exit_code": 0,
+          "wall_seconds": 2.368036249999932,
+          "csv_paths": [
+            "b16-t8/exports/local/core13/OPPROF_20261113110033_SWZYHVSBGPLULAXB/simulator/core13.veccore1/core13.veccore1_instr_exe_20261113110035182.csv",
+            "b16-t8/exports/local/core13/OPPROF_20261113110033_SWZYHVSBGPLULAXB/simulator/core13.veccore0/core13.veccore0_instr_exe_20261113110035182.csv"
+          ],
+          "log_sha256": "8bc97c367171b02f4d2a0cdf18fb217db8db0b57cd03f007d753434554e6fcd0"
+        },
+        {
+          "phase": "local",
+          "core": 14,
+          "exit_code": 0,
+          "wall_seconds": 2.222077624999656,
+          "csv_paths": [
+            "b16-t8/exports/local/core14/OPPROF_20261113110035_MOWPFHAJXSRMHBKB/simulator/core14.veccore1/core14.veccore1_instr_exe_20261113110037442.csv",
+            "b16-t8/exports/local/core14/OPPROF_20261113110035_MOWPFHAJXSRMHBKB/simulator/core14.veccore0/core14.veccore0_instr_exe_20261113110037442.csv"
+          ],
+          "log_sha256": "793b5de04a9173aa1f41dd3b9039f5703c6dbc63a649b0a9fe5d12dc9e357158"
+        },
+        {
+          "phase": "local",
+          "core": 15,
+          "exit_code": 0,
+          "wall_seconds": 2.1549638750002487,
+          "csv_paths": [
+            "b16-t8/exports/local/core15/OPPROF_20261113110037_TYAAJYUKXNTAOGTA/simulator/core15.veccore1/core15.veccore1_instr_exe_20261113110039616.csv",
+            "b16-t8/exports/local/core15/OPPROF_20261113110037_TYAAJYUKXNTAOGTA/simulator/core15.veccore0/core15.veccore0_instr_exe_20261113110039615.csv"
+          ],
+          "log_sha256": "2391236943363bae81d2322f200c35083101d8f4d8092223926c17daab0d478c"
+        },
+        {
+          "phase": "local",
+          "core": 16,
+          "exit_code": 0,
+          "wall_seconds": 2.3802425840003707,
+          "csv_paths": [
+            "b16-t8/exports/local/core16/OPPROF_20261113110039_IJVZEFSHFLXAZRED/simulator/core16.veccore0/core16.veccore0_instr_exe_20261113110041982.csv",
+            "b16-t8/exports/local/core16/OPPROF_20261113110039_IJVZEFSHFLXAZRED/simulator/core16.veccore1/core16.veccore1_instr_exe_20261113110041982.csv"
+          ],
+          "log_sha256": "9bc70e1d23dba19e3d6adbb2e4be554d0cc6576bd761c8825c7749f586b79c3c"
+        },
+        {
+          "phase": "local",
+          "core": 17,
+          "exit_code": 0,
+          "wall_seconds": 2.2603972500000964,
+          "csv_paths": [
+            "b16-t8/exports/local/core17/OPPROF_20261113110042_YHEAJVYAONDNTBQK/simulator/core17.veccore0/core17.veccore0_instr_exe_20261113110044178.csv",
+            "b16-t8/exports/local/core17/OPPROF_20261113110042_YHEAJVYAONDNTBQK/simulator/core17.veccore1/core17.veccore1_instr_exe_20261113110044178.csv"
+          ],
+          "log_sha256": "3023be25c0cf2df3fd78e206ac641da1dc88af8d551351fa274eb7b14869eb35"
+        },
+        {
+          "phase": "local",
+          "core": 18,
+          "exit_code": 0,
+          "wall_seconds": 2.498075458999665,
+          "csv_paths": [
+            "b16-t8/exports/local/core18/OPPROF_20261113110044_YZLPMTJTBWLJUCMV/simulator/core18.veccore0/core18.veccore0_instr_exe_20261113110046774.csv",
+            "b16-t8/exports/local/core18/OPPROF_20261113110044_YZLPMTJTBWLJUCMV/simulator/core18.veccore1/core18.veccore1_instr_exe_20261113110046774.csv"
+          ],
+          "log_sha256": "de19a9c5576544f823f01d5eb80f549512f34b4cc0845d838decf47b9d7e3ed2"
+        },
+        {
+          "phase": "local",
+          "core": 19,
+          "exit_code": 0,
+          "wall_seconds": 2.2853165840006113,
+          "csv_paths": [
+            "b16-t8/exports/local/core19/OPPROF_20261113110047_UHSTKABGSRKASDLD/simulator/core19.veccore0/core19.veccore0_instr_exe_20261113110049073.csv",
+            "b16-t8/exports/local/core19/OPPROF_20261113110047_UHSTKABGSRKASDLD/simulator/core19.veccore1/core19.veccore1_instr_exe_20261113110049073.csv"
+          ],
+          "log_sha256": "0dc3e82936003b9bcdf6d02747935ec1c4c77861360dfc1f46b9b29d4af8b1e2"
+        },
+        {
+          "phase": "local",
+          "core": 20,
+          "exit_code": 0,
+          "wall_seconds": 2.0531484160001128,
+          "csv_paths": [
+            "b16-t8/exports/local/core20/OPPROF_20261113110049_FIFBILDWPBEWEVGY/simulator/core20.veccore0/core20.veccore0_instr_exe_20261113110051175.csv",
+            "b16-t8/exports/local/core20/OPPROF_20261113110049_FIFBILDWPBEWEVGY/simulator/core20.veccore1/core20.veccore1_instr_exe_20261113110051175.csv"
+          ],
+          "log_sha256": "8a8eec8fe0e1ca2eb0f7fdea8beb52dc38c7cb62f96f8469ca6e520e9e935dc3"
+        },
+        {
+          "phase": "local",
+          "core": 21,
+          "exit_code": 0,
+          "wall_seconds": 2.238049917000353,
+          "csv_paths": [
+            "b16-t8/exports/local/core21/OPPROF_20261113110051_EKWKHLZSKUWRCWLV/simulator/core21.veccore0/core21.veccore0_instr_exe_20261113110053408.csv",
+            "b16-t8/exports/local/core21/OPPROF_20261113110051_EKWKHLZSKUWRCWLV/simulator/core21.veccore1/core21.veccore1_instr_exe_20261113110053410.csv"
+          ],
+          "log_sha256": "e190a7ba1cd1e1d15c9ef14dcee0f02e20e8f5cee9523e693c09e39ddd3d4d5b"
+        },
+        {
+          "phase": "local",
+          "core": 22,
+          "exit_code": 0,
+          "wall_seconds": 2.3297266250001485,
+          "csv_paths": [
+            "b16-t8/exports/local/core22/OPPROF_20261113110053_RZFQXZHFFWSTITUH/simulator/core22.veccore1/core22.veccore1_instr_exe_20261113110055669.csv",
+            "b16-t8/exports/local/core22/OPPROF_20261113110053_RZFQXZHFFWSTITUH/simulator/core22.veccore0/core22.veccore0_instr_exe_20261113110055669.csv"
+          ],
+          "log_sha256": "1e66d9c4011adbd113a48f7587c47444882ead4b6a4e9fc41ce91f2437e8d340"
+        },
+        {
+          "phase": "local",
+          "core": 23,
+          "exit_code": 0,
+          "wall_seconds": 2.319988000000194,
+          "csv_paths": [
+            "b16-t8/exports/local/core23/OPPROF_20261113110056_ECTRAPTVKJAODRTN/simulator/core23.veccore1/core23.veccore1_instr_exe_20261113110058091.csv",
+            "b16-t8/exports/local/core23/OPPROF_20261113110056_ECTRAPTVKJAODRTN/simulator/core23.veccore0/core23.veccore0_instr_exe_20261113110058091.csv"
+          ],
+          "log_sha256": "6aa09db6ba3dce23c8edeaed072a52a79ee613444397c1c74743b62df34a7c82"
+        },
+        {
+          "phase": "local",
+          "core": 24,
+          "exit_code": 0,
+          "wall_seconds": 2.0197086660000423,
+          "csv_paths": [
+            "b16-t8/exports/local/core24/OPPROF_20261113110058_VGSCGYSYNAOHZZIM/simulator/core24.veccore1/core24.veccore1_instr_exe_20261113110100132.csv",
+            "b16-t8/exports/local/core24/OPPROF_20261113110058_VGSCGYSYNAOHZZIM/simulator/core24.veccore0/core24.veccore0_instr_exe_20261113110100132.csv"
+          ],
+          "log_sha256": "47a24de93982ca88b1e635b301a413e6c950ae8b90ef1c4fa94191f65d10c7a9"
+        },
+        {
+          "phase": "local",
+          "core": 25,
+          "exit_code": 0,
+          "wall_seconds": 2.919430958999328,
+          "csv_paths": [
+            "b16-t8/exports/local/core25/OPPROF_20261113110100_PMDUWZJPNVRHIKOC/simulator/core25.veccore1/core25.veccore1_instr_exe_20261113110102998.csv",
+            "b16-t8/exports/local/core25/OPPROF_20261113110100_PMDUWZJPNVRHIKOC/simulator/core25.veccore0/core25.veccore0_instr_exe_20261113110102998.csv"
+          ],
+          "log_sha256": "6ee90a3707268c111506b7ac8ee14f85547c7c76023fcadf826024fb327a982f"
+        },
+        {
+          "phase": "local",
+          "core": 26,
+          "exit_code": 0,
+          "wall_seconds": 2.88753295800052,
+          "csv_paths": [
+            "b16-t8/exports/local/core26/OPPROF_20261113110103_EBMOLTKAKZQPTUVS/simulator/core26.veccore0/core26.veccore0_instr_exe_20261113110105888.csv",
+            "b16-t8/exports/local/core26/OPPROF_20261113110103_EBMOLTKAKZQPTUVS/simulator/core26.veccore1/core26.veccore1_instr_exe_20261113110105888.csv"
+          ],
+          "log_sha256": "49bf560181ad11651bbdc4454036083906ca2cd22e81f49bcb855d3db598113b"
+        },
+        {
+          "phase": "local",
+          "core": 27,
+          "exit_code": 0,
+          "wall_seconds": 2.1713657909995163,
+          "csv_paths": [
+            "b16-t8/exports/local/core27/OPPROF_20261113110106_JYZOAOBOLYGCXBGD/simulator/core27.veccore0/core27.veccore0_instr_exe_20261113110108121.csv",
+            "b16-t8/exports/local/core27/OPPROF_20261113110106_JYZOAOBOLYGCXBGD/simulator/core27.veccore1/core27.veccore1_instr_exe_20261113110108121.csv"
+          ],
+          "log_sha256": "2b33a816c42c858c85a141c804fdae797da7c20a4c0ee729147013e43489b841"
+        },
+        {
+          "phase": "merge",
+          "core": 0,
+          "exit_code": 0,
+          "wall_seconds": 0.839940958000625,
+          "csv_paths": [
+            "b16-t8/exports/merge/core0/OPPROF_20261113110108_FUYMXSQJZXFWIDEF/simulator/core0.veccore1/core0.veccore1_instr_exe_20261113110109121.csv",
+            "b16-t8/exports/merge/core0/OPPROF_20261113110108_FUYMXSQJZXFWIDEF/simulator/core0.veccore0/core0.veccore0_instr_exe_20261113110109121.csv"
+          ],
+          "log_sha256": "8db55eccb871298a26637d773ef61aa190ec43b3b84f34e28328b6fc2244b7f4"
+        },
+        {
+          "phase": "merge",
+          "core": 1,
+          "exit_code": 0,
+          "wall_seconds": 0.8208783329992002,
+          "csv_paths": [
+            "b16-t8/exports/merge/core1/OPPROF_20261113110109_IXPXLDYCCBKOIKOG/simulator/core1.veccore1/core1.veccore1_instr_exe_20261113110109931.csv",
+            "b16-t8/exports/merge/core1/OPPROF_20261113110109_IXPXLDYCCBKOIKOG/simulator/core1.veccore0/core1.veccore0_instr_exe_20261113110109931.csv"
+          ],
+          "log_sha256": "5e5097ef389743efd7f3e891d5866c2e1e11ae6ecb33ca2717ca8db01878e6ec"
+        },
+        {
+          "phase": "merge",
+          "core": 2,
+          "exit_code": 0,
+          "wall_seconds": 0.8019245829991632,
+          "csv_paths": [
+            "b16-t8/exports/merge/core2/OPPROF_20261113110110_LFXMWOVLTVQFFIWR/simulator/core2.veccore0/core2.veccore0_instr_exe_20261113110110797.csv",
+            "b16-t8/exports/merge/core2/OPPROF_20261113110110_LFXMWOVLTVQFFIWR/simulator/core2.veccore1/core2.veccore1_instr_exe_20261113110110797.csv"
+          ],
+          "log_sha256": "24351017bf116054c2ed8c4f5a2b63405f4a2e8c1330e8e5be38a740ede9a997"
+        },
+        {
+          "phase": "merge",
+          "core": 3,
+          "exit_code": 0,
+          "wall_seconds": 0.799892166999598,
+          "csv_paths": [
+            "b16-t8/exports/merge/core3/OPPROF_20261113110111_BHOKWHKSTWGQZLGN/simulator/core3.veccore0/core3.veccore0_instr_exe_20261113110111586.csv",
+            "b16-t8/exports/merge/core3/OPPROF_20261113110111_BHOKWHKSTWGQZLGN/simulator/core3.veccore1/core3.veccore1_instr_exe_20261113110111586.csv"
+          ],
+          "log_sha256": "616b286db4457f54d6953094e29dcec3196cc1781779c6399511b39acb3c0d31"
+        },
+        {
+          "phase": "merge",
+          "core": 4,
+          "exit_code": 0,
+          "wall_seconds": 0.7058302080004069,
+          "csv_paths": [
+            "b16-t8/exports/merge/core4/OPPROF_20261113110111_RMBQBOFNOBWBFZIB/simulator/core4.veccore0/core4.veccore0_instr_exe_20261113110112281.csv",
+            "b16-t8/exports/merge/core4/OPPROF_20261113110111_RMBQBOFNOBWBFZIB/simulator/core4.veccore1/core4.veccore1_instr_exe_20261113110112281.csv"
+          ],
+          "log_sha256": "42136df9da499d46427b00736d24d374b2681bbf304c7e4faefc4b7b6dc7a3eb"
+        },
+        {
+          "phase": "merge",
+          "core": 5,
+          "exit_code": 0,
+          "wall_seconds": 0.5859411249994082,
+          "csv_paths": [
+            "b16-t8/exports/merge/core5/OPPROF_20261113110112_YNGOGDFSISRFNZSW/simulator/core5.veccore0/core5.veccore0_instr_exe_20261113110112930.csv",
+            "b16-t8/exports/merge/core5/OPPROF_20261113110112_YNGOGDFSISRFNZSW/simulator/core5.veccore1/core5.veccore1_instr_exe_20261113110112930.csv"
+          ],
+          "log_sha256": "cd68d96dc77f7e66039d328eb4ea844aa629aba83c6dc019939d455665fa64ed"
+        },
+        {
+          "phase": "merge",
+          "core": 6,
+          "exit_code": 0,
+          "wall_seconds": 0.8017970829996557,
+          "csv_paths": [
+            "b16-t8/exports/merge/core6/OPPROF_20261113110113_FQPDWRMEPDMTDWXO/simulator/core6.veccore1/core6.veccore1_instr_exe_20261113110113773.csv",
+            "b16-t8/exports/merge/core6/OPPROF_20261113110113_FQPDWRMEPDMTDWXO/simulator/core6.veccore0/core6.veccore0_instr_exe_20261113110113773.csv"
+          ],
+          "log_sha256": "798804c48f6021e4296b44a3e29471a62a2003430ca09552fae06929909623b2"
+        },
+        {
+          "phase": "merge",
+          "core": 7,
+          "exit_code": 0,
+          "wall_seconds": 0.632028750000245,
+          "csv_paths": [
+            "b16-t8/exports/merge/core7/OPPROF_20261113110113_RFFCTEKRSJMBWNUM/simulator/core7.veccore1/core7.veccore1_instr_exe_20261113110114377.csv",
+            "b16-t8/exports/merge/core7/OPPROF_20261113110113_RFFCTEKRSJMBWNUM/simulator/core7.veccore0/core7.veccore0_instr_exe_20261113110114377.csv"
+          ],
+          "log_sha256": "f9f247d6b783ac32238aa6bee8a2cd67f49721bfecb6bf6d9d1ab8242b8f4115"
+        },
+        {
+          "phase": "merge",
+          "core": 8,
+          "exit_code": 0,
+          "wall_seconds": 0.5808841250000114,
+          "csv_paths": [
+            "b16-t8/exports/merge/core8/OPPROF_20261113110114_DYFEVXIDLMANYCDK/simulator/core8.veccore1/core8.veccore1_instr_exe_20261113110115003.csv",
+            "b16-t8/exports/merge/core8/OPPROF_20261113110114_DYFEVXIDLMANYCDK/simulator/core8.veccore0/core8.veccore0_instr_exe_20261113110115003.csv"
+          ],
+          "log_sha256": "751d7193cfa6886c724b6915a59c4528809f340b5cd02fc94bd0355ff39a91d0"
+        },
+        {
+          "phase": "merge",
+          "core": 9,
+          "exit_code": 0,
+          "wall_seconds": 0.718653416000052,
+          "csv_paths": [
+            "b16-t8/exports/merge/core9/OPPROF_20261113110115_AXKBBMWBRSQLOAVP/simulator/core9.veccore1/core9.veccore1_instr_exe_20261113110115663.csv",
+            "b16-t8/exports/merge/core9/OPPROF_20261113110115_AXKBBMWBRSQLOAVP/simulator/core9.veccore0/core9.veccore0_instr_exe_20261113110115663.csv"
+          ],
+          "log_sha256": "f43854712025f5d51d1d2d1c976d48826399e19b833c24a69c2cab3e52455eb6"
+        },
+        {
+          "phase": "merge",
+          "core": 10,
+          "exit_code": 0,
+          "wall_seconds": 0.5621606670001711,
+          "csv_paths": [
+            "b16-t8/exports/merge/core10/OPPROF_20261113110115_MZAVZDMSBQRZBPGX/simulator/core10.veccore0/core10.veccore0_instr_exe_20261113110116286.csv",
+            "b16-t8/exports/merge/core10/OPPROF_20261113110115_MZAVZDMSBQRZBPGX/simulator/core10.veccore1/core10.veccore1_instr_exe_20261113110116286.csv"
+          ],
+          "log_sha256": "c0cb92cc2eb3d8ca6a9e97c5ce64fd3d0c9264a4be89bd8e0702dcb818fa9b43"
+        },
+        {
+          "phase": "merge",
+          "core": 11,
+          "exit_code": 0,
+          "wall_seconds": 0.5675552920001792,
+          "csv_paths": [
+            "b16-t8/exports/merge/core11/OPPROF_20261113110116_BPJOWJSTKSEUOMVL/simulator/core11.veccore0/core11.veccore0_instr_exe_20261113110116887.csv",
+            "b16-t8/exports/merge/core11/OPPROF_20261113110116_BPJOWJSTKSEUOMVL/simulator/core11.veccore1/core11.veccore1_instr_exe_20261113110116887.csv"
+          ],
+          "log_sha256": "c0c281b0e951cc961c84bae15407c83ac2748972131478ee2a219cdd8387bd98"
+        },
+        {
+          "phase": "merge",
+          "core": 12,
+          "exit_code": 0,
+          "wall_seconds": 0.5585480409999946,
+          "csv_paths": [
+            "b16-t8/exports/merge/core12/OPPROF_20261113110117_IFAQGKIXLEXHQBHV/simulator/core12.veccore1/core12.veccore1_instr_exe_20261113110117440.csv",
+            "b16-t8/exports/merge/core12/OPPROF_20261113110117_IFAQGKIXLEXHQBHV/simulator/core12.veccore0/core12.veccore0_instr_exe_20261113110117441.csv"
+          ],
+          "log_sha256": "858af89462bd4435c24e37ccab4ccdcb2e16d6592d8848487807cc54a38f131f"
+        },
+        {
+          "phase": "merge",
+          "core": 13,
+          "exit_code": 0,
+          "wall_seconds": 0.6208051670000714,
+          "csv_paths": [
+            "b16-t8/exports/merge/core13/OPPROF_20261113110117_WKZSTFRNPCAMVPTM/simulator/core13.veccore1/core13.veccore1_instr_exe_20261113110118081.csv",
+            "b16-t8/exports/merge/core13/OPPROF_20261113110117_WKZSTFRNPCAMVPTM/simulator/core13.veccore0/core13.veccore0_instr_exe_20261113110118081.csv"
+          ],
+          "log_sha256": "995b42f5a836f7fa00a626da8fdfaf521e54096db85eae170037b6e70fea98b3"
+        },
+        {
+          "phase": "merge",
+          "core": 14,
+          "exit_code": 0,
+          "wall_seconds": 0.5151343340003223,
+          "csv_paths": [
+            "b16-t8/exports/merge/core14/OPPROF_20261113110118_PBLKYQWLSOZFZSDE/simulator/core14.veccore1/core14.veccore1_instr_exe_20261113110118628.csv",
+            "b16-t8/exports/merge/core14/OPPROF_20261113110118_PBLKYQWLSOZFZSDE/simulator/core14.veccore0/core14.veccore0_instr_exe_20261113110118628.csv"
+          ],
+          "log_sha256": "81701fcbbcb32dee9c37a6064bf60b1d2857a7a5f30a8a652572f1de382bc6d9"
+        },
+        {
+          "phase": "merge",
+          "core": 15,
+          "exit_code": 0,
+          "wall_seconds": 0.7160439999997834,
+          "csv_paths": [
+            "b16-t8/exports/merge/core15/OPPROF_20261113110118_YODMYCWWSYCLVLJG/simulator/core15.veccore1/core15.veccore1_instr_exe_20261113110119311.csv",
+            "b16-t8/exports/merge/core15/OPPROF_20261113110118_YODMYCWWSYCLVLJG/simulator/core15.veccore0/core15.veccore0_instr_exe_20261113110119311.csv"
+          ],
+          "log_sha256": "1d81b31e87c88fb8bebaf8966863610d11e985615dae2bf4a40d8335d4dba264"
+        },
+        {
+          "phase": "merge",
+          "core": 16,
+          "exit_code": 0,
+          "wall_seconds": 0.5560121670005174,
+          "csv_paths": [
+            "b16-t8/exports/merge/core16/OPPROF_20261113110119_OREJTBNBWISYYVCV/simulator/core16.veccore0/core16.veccore0_instr_exe_20261113110119932.csv",
+            "b16-t8/exports/merge/core16/OPPROF_20261113110119_OREJTBNBWISYYVCV/simulator/core16.veccore1/core16.veccore1_instr_exe_20261113110119932.csv"
+          ],
+          "log_sha256": "85bf13cc26797c0330e5bba55d25f78b2c74e8cfc12416bd2606f537171a1835"
+        },
+        {
+          "phase": "merge",
+          "core": 17,
+          "exit_code": 0,
+          "wall_seconds": 0.6300633340006243,
+          "csv_paths": [
+            "b16-t8/exports/merge/core17/OPPROF_20261113110120_RRTOSJOELTGBYZJM/simulator/core17.veccore0/core17.veccore0_instr_exe_20261113110120495.csv",
+            "b16-t8/exports/merge/core17/OPPROF_20261113110120_RRTOSJOELTGBYZJM/simulator/core17.veccore1/core17.veccore1_instr_exe_20261113110120495.csv"
+          ],
+          "log_sha256": "4cc9916b86418de679b3e482fe3d767a2a8a4038b68c9e8936937b5510103369"
+        },
+        {
+          "phase": "merge",
+          "core": 18,
+          "exit_code": 0,
+          "wall_seconds": 0.514879084000313,
+          "csv_paths": [
+            "b16-t8/exports/merge/core18/OPPROF_20261113110120_UMHPTIPZLDEKXURN/simulator/core18.veccore0/core18.veccore0_instr_exe_20261113110121080.csv",
+            "b16-t8/exports/merge/core18/OPPROF_20261113110120_UMHPTIPZLDEKXURN/simulator/core18.veccore1/core18.veccore1_instr_exe_20261113110121080.csv"
+          ],
+          "log_sha256": "c0f5ba3829a1582da6ca44f43e54be2cca2e1f24d3227b3fc8afac676df2ff07"
+        },
+        {
+          "phase": "merge",
+          "core": 19,
+          "exit_code": 0,
+          "wall_seconds": 0.5548937080002361,
+          "csv_paths": [
+            "b16-t8/exports/merge/core19/OPPROF_20261113110121_OPADPOPMHFJSOBQP/simulator/core19.veccore0/core19.veccore0_instr_exe_20261113110121666.csv",
+            "b16-t8/exports/merge/core19/OPPROF_20261113110121_OPADPOPMHFJSOBQP/simulator/core19.veccore1/core19.veccore1_instr_exe_20261113110121666.csv"
+          ],
+          "log_sha256": "7e6dbe55c6efdfcd186b23280438143e1fcae13416f40031f95942b888ee7bd7"
+        },
+        {
+          "phase": "merge",
+          "core": 20,
+          "exit_code": 0,
+          "wall_seconds": 0.5227420419996633,
+          "csv_paths": [
+            "b16-t8/exports/merge/core20/OPPROF_20261113110121_YSVXSCRLFRDIKUQM/simulator/core20.veccore0/core20.veccore0_instr_exe_20261113110122185.csv",
+            "b16-t8/exports/merge/core20/OPPROF_20261113110121_YSVXSCRLFRDIKUQM/simulator/core20.veccore1/core20.veccore1_instr_exe_20261113110122185.csv"
+          ],
+          "log_sha256": "2edf863c5ebb8fa74067466e04aa18daad1b684fae32afa1eac2d636eafe5610"
+        },
+        {
+          "phase": "merge",
+          "core": 21,
+          "exit_code": 0,
+          "wall_seconds": 0.5261953330000324,
+          "csv_paths": [
+            "b16-t8/exports/merge/core21/OPPROF_20261113110122_UKFYUCLQXWOYCIUN/simulator/core21.veccore0/core21.veccore0_instr_exe_20261113110122719.csv",
+            "b16-t8/exports/merge/core21/OPPROF_20261113110122_UKFYUCLQXWOYCIUN/simulator/core21.veccore1/core21.veccore1_instr_exe_20261113110122719.csv"
+          ],
+          "log_sha256": "9214a4b5f07f7f4ad33fa249d9bb3422677fc9e1ad00811ae86b7178d3499b05"
+        },
+        {
+          "phase": "merge",
+          "core": 22,
+          "exit_code": 0,
+          "wall_seconds": 0.7981322910000017,
+          "csv_paths": [
+            "b16-t8/exports/merge/core22/OPPROF_20261113110122_KQFIBURPGRXPYNRB/simulator/core22.veccore1/core22.veccore1_instr_exe_20261113110123492.csv",
+            "b16-t8/exports/merge/core22/OPPROF_20261113110122_KQFIBURPGRXPYNRB/simulator/core22.veccore0/core22.veccore0_instr_exe_20261113110123492.csv"
+          ],
+          "log_sha256": "935ca65bcc8d050b81bab342f092dcb6e0a6c9119b445ab3cf1884512e10dac9"
+        },
+        {
+          "phase": "merge",
+          "core": 23,
+          "exit_code": 0,
+          "wall_seconds": 0.5750195000000531,
+          "csv_paths": [
+            "b16-t8/exports/merge/core23/OPPROF_20261113110123_XOEACSKSGCBQWYAH/simulator/core23.veccore1/core23.veccore1_instr_exe_20261113110124128.csv",
+            "b16-t8/exports/merge/core23/OPPROF_20261113110123_XOEACSKSGCBQWYAH/simulator/core23.veccore0/core23.veccore0_instr_exe_20261113110124128.csv"
+          ],
+          "log_sha256": "0e47ad78243b47d3cb453b8564877f0f8e35745fb926a08610f47625b3017555"
+        },
+        {
+          "phase": "merge",
+          "core": 24,
+          "exit_code": 0,
+          "wall_seconds": 0.573176957999749,
+          "csv_paths": [
+            "b16-t8/exports/merge/core24/OPPROF_20261113110124_JVPUERTKGFFIBBZG/simulator/core24.veccore1/core24.veccore1_instr_exe_20261113110124661.csv",
+            "b16-t8/exports/merge/core24/OPPROF_20261113110124_JVPUERTKGFFIBBZG/simulator/core24.veccore0/core24.veccore0_instr_exe_20261113110124661.csv"
+          ],
+          "log_sha256": "1347383a1b49926b9ecbd36b4fd8523c808eda167ab45897e332127127398816"
+        },
+        {
+          "phase": "merge",
+          "core": 25,
+          "exit_code": 0,
+          "wall_seconds": 0.5688471249995928,
+          "csv_paths": [
+            "b16-t8/exports/merge/core25/OPPROF_20261113110124_MNGRAZLOGOSRVGTH/simulator/core25.veccore1/core25.veccore1_instr_exe_20261113110125242.csv",
+            "b16-t8/exports/merge/core25/OPPROF_20261113110124_MNGRAZLOGOSRVGTH/simulator/core25.veccore0/core25.veccore0_instr_exe_20261113110125242.csv"
+          ],
+          "log_sha256": "ac14201eb61acc847fa637fb1c2eb97930b98ba498c986bac4afd561410e75fa"
+        },
+        {
+          "phase": "merge",
+          "core": 26,
+          "exit_code": 0,
+          "wall_seconds": 0.6353915830004553,
+          "csv_paths": [
+            "b16-t8/exports/merge/core26/OPPROF_20261113110125_MYRRVNHZFABBMKPD/simulator/core26.veccore0/core26.veccore0_instr_exe_20261113110125887.csv",
+            "b16-t8/exports/merge/core26/OPPROF_20261113110125_MYRRVNHZFABBMKPD/simulator/core26.veccore1/core26.veccore1_instr_exe_20261113110125887.csv"
+          ],
+          "log_sha256": "5d60a34fafb0d9ef18064a4433696cbc6ef40a54133e43ec062724b3c30a43a1"
+        },
+        {
+          "phase": "merge",
+          "core": 27,
+          "exit_code": 0,
+          "wall_seconds": 0.6164247920005437,
+          "csv_paths": [
+            "b16-t8/exports/merge/core27/OPPROF_20261113110126_CVUDMSVUXIFJYHWL/simulator/core27.veccore0/core27.veccore0_instr_exe_20261113110126520.csv",
+            "b16-t8/exports/merge/core27/OPPROF_20261113110126_CVUDMSVUXIFJYHWL/simulator/core27.veccore1/core27.veccore1_instr_exe_20261113110126520.csv"
+          ],
+          "log_sha256": "d4b614f3138e0c631c586eaa2c8c525b5a081ca17970c0f5538132c36616ad9b"
+        }
+      ],
+      "model_capture_wall_seconds": 1131.0199432919999,
+      "total_model_ticks": 105436,
+      "oracle": {
+        "status": "passed",
+        "scope": "AIV-only exact final TopK component",
+        "batch": 16,
+        "history": 131072,
+        "valid": 131072,
+        "miss_per_query": 205,
+        "shards": 8,
+        "aiv_budget": 56,
+        "local_workers": 56,
+        "merge_workers": 56,
+        "aic_workers": 0,
+        "guards": true,
+        "local_max_worker_cycle_delta": 64389,
+        "merge_max_worker_cycle_delta": 23921,
+        "sum_phase_max_worker_cycle_delta": 88310,
+        "timing_scope": "worker-body only; excludes dispatch and init",
+        "selected_set_and_scores": true,
+        "all_local_candidates": true,
+        "input_unchanged": true,
+        "full_LI": false,
+        "transport": false
+      },
+      "capture_log_sha256": "d2c4cbcd363a57d6245669e36956ab541f47c014e381f18dae7a8f120029d5cb"
+    }
+  ],
+  "excluded_exploration": {
+    "case": "B1T1 storage-location/kernel-filter exploratory control",
+    "total_model_ticks": 50443,
+    "oracle": {
+      "status": "passed",
+      "scope": "AIV-only exact final TopK component",
+      "batch": 1,
+      "history": 131072,
+      "valid": 131072,
+      "miss_per_query": 205,
+      "shards": 1,
+      "aiv_budget": 56,
+      "local_workers": 4,
+      "merge_workers": 0,
+      "aic_workers": 0,
+      "guards": true,
+      "local_max_worker_cycle_delta": 47565,
+      "merge_max_worker_cycle_delta": 0,
+      "sum_phase_max_worker_cycle_delta": 47565,
+      "timing_scope": "worker-body only; excludes dispatch and init",
+      "selected_set_and_scores": true,
+      "all_local_candidates": true,
+      "input_unchanged": true,
+      "full_LI": false,
+      "transport": false
+    },
+    "reason_excluded": "Different storage location and kernel selection string; not pooled into primary nine points",
+    "log_sha256": "c96a61cdc85575bb575fad8e3ffd9048e83fcaaaed5364854b7fbb2c818a8a82"
+  }
+}

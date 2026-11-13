@@ -1,5 +1,7 @@
 # 分核研究与KVIP主仓集成状态
 
+[BS1/8/16 × T1/T4/T8九点Model实测](topk_bqt_experiment.md)固定Q4/H128K/miss10%/V56，新增15次TopK kernel与548份完整worker指令证据。按local＋merge内核包络，BS1/T8比T1降低49.30%，BS8/T8近持平（0.13%），BS16/T4降低9.95%；whole-Model及指令调用数同时保留。仅为独立TopK组件单次仿真；历史LI 154159调用另列范围，不能当作匹配128K的纯score基线。
+
 [当前生产与split-core实验的完整策略对照](strategy_inventory.md)进一步核对是否按BS×Q分核、直方图Top2048及二次merge、Q4共享hash去重、M/D与实际核数的关系。当前没有按实际miss动态分配Resolve/Fetch核数。
 
 [Final到Output的算法例子与T/M/W/V解释](stage_walkthrough.md)用B1/Q4/10% miss区分H扫描、K分类、820个未满足位置、410个unique修复及8192个输出；同时说明大batch逻辑query数与实际核映射的区别。
