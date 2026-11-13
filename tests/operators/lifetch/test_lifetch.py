@@ -59,6 +59,8 @@ def arguments(argv=None):
                    help="P0-C3 test-only Q2 8K TopK Trunk; requires LI core perf, auto, prefetch=0")
     p.add_argument("--li-core-perf", action="store_true",
                    help="P0-C1: timed LI-only Graph replays after Native TopK check; prefetch=0")
+    p.add_argument("--li-s2-slope-sweep", action="store_true",
+                   help="P0-C4 LI-only fixed-H: Q1/Q4 isolated request, K=8/32/64/96/128K")
     p.add_argument("--li-core-sweep", action="store_true",
                    help="P0-C0: extend LI-only tests to balanced, mixed and extreme Q4/K")
     p.add_argument("--li-tiling", choices=("auto", "q4"), default="auto",
@@ -138,6 +140,13 @@ def arguments(argv=None):
         p.error('--li-q2-trunk8k-control requires LI-only --li-core-perf --li-tiling auto --prefetch-tokens 0')
     if a.li_core_perf and (not a.li_only_varlen or a.prefetch_tokens != 0):
         p.error('--li-core-perf requires --li-only-varlen --prefetch-tokens 0')
+    if a.li_s2_slope_sweep and (
+        not a.li_only_varlen or not a.li_core_perf or a.prefetch_tokens != 0
+        or a.history != 131072 or a.resident != 8192
+        or a.miss_percent != 0 or a.li_core_sweep
+    ):
+        p.error('--li-s2-slope-sweep requires LI-only perf, B4/H131072/R8192, '
+                'prefetch=0/miss=0 and excludes --li-core-sweep')
     if a.li_core_sweep and (not a.li_only_varlen or a.prefetch_tokens != 0):
         p.error('--li-core-sweep requires --li-only-varlen --prefetch-tokens 0')
     if a.li_tiling == 'q4' and (not a.li_only_varlen or a.prefetch_tokens != 0):
@@ -273,6 +282,8 @@ def main(argv=None):
                    help='P0-C3 Q2 TopK Trunk 8K control (only LI core perf auto/prefetch=0)')
     p.add_argument('--li-core-perf', action='store_true',
                    help='P0-C1: LI-only device Event timing after TopK correctness, prefetch=0')
+    p.add_argument('--li-s2-slope-sweep', action='store_true',
+                   help='P0-C4 Q1/Q4 single-request S2 length scaling (fixed H131K R8192)')
     p.add_argument('--li-core-sweep', action='store_true',
                    help='P0-C0: balanced/mixed/extreme K with Q4; LI-only Prefetch=0')
     p.add_argument('--li-tiling', choices=('auto', 'q4'), default='auto',
@@ -318,6 +329,13 @@ def main(argv=None):
         p.error('--li-q2-trunk8k-control requires LI-only --li-core-perf --li-tiling auto --prefetch-tokens 0')
     if a.li_core_perf and (not a.li_only_varlen or a.prefetch_tokens != 0):
         p.error('--li-core-perf requires --li-only-varlen --prefetch-tokens 0')
+    if a.li_s2_slope_sweep and (
+        not a.li_only_varlen or not a.li_core_perf or a.prefetch_tokens != 0
+        or a.history != 131072 or a.resident != 8192
+        or a.miss_percent != 0 or a.li_core_sweep
+    ):
+        p.error('--li-s2-slope-sweep requires LI-only perf, B4/H131072/R8192, '
+                'prefetch=0/miss=0 and excludes --li-core-sweep')
     if a.li_core_sweep and (not a.li_only_varlen or a.prefetch_tokens != 0):
         p.error('--li-core-sweep requires --li-only-varlen --prefetch-tokens 0')
     if a.li_tiling == 'q4' and (not a.li_only_varlen or a.prefetch_tokens != 0):
@@ -358,6 +376,8 @@ def main(argv=None):
         common.extend(['--li-tiling', a.li_tiling])
     if a.li_core_sweep:
         common.append('--li-core-sweep')
+    if a.li_s2_slope_sweep:
+        common.append('--li-s2-slope-sweep')
     if a.li_core_perf:
         common.append('--li-core-perf')
         common.extend(['--li-core-perf-graph-repeats', str(a.li_core_perf_graph_repeats)])

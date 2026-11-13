@@ -265,3 +265,44 @@ def test_li_q2_trunk_control_compile_flag_is_opt_in():
     assert '-DV9_Q2_TRUNK8K_CONTROL=${V9_Q2_TRUNK8K_CONTROL}' in cmake_source
     assert '#if defined(V9_Q2_TRUNK8K_CONTROL) && V9_Q2_TRUNK8K_CONTROL' in kernel_source
     assert 'trunkLen_ = s1BaseSize_ == 2 ? TRUNK_LEN_16K : 8192;' in kernel_source
+
+
+@pytest.mark.parametrize("tiling", ["auto", "q4"])
+def test_li_s2_slope_sweep_forwarded_to_worker(lifetch_cli, monkeypatch, tiling):
+    commands = []
+    monkeypatch.setattr(lifetch_cli.subprocess, "call", lambda cmd: commands.append(cmd) or 0)
+    args = cli_args(prefetch=0) + [
+        "--li-s2-slope-sweep", "--li-core-perf", "--li-tiling", tiling
+    ]
+    assert lifetch_cli.main(args) == 0
+    assert "--li-s2-slope-sweep" in commands[0]
+    internal = lifetch_cli.arguments(args[2:])
+    assert internal.li_s2_slope_sweep is True
+    assert internal.li_tiling == tiling
+
+
+@pytest.mark.parametrize("extra", [
+    [],
+    ["--li-core-perf", "--li-core-sweep"],
+    ["--li-core-perf", "--history", "98304"],
+])
+def test_li_s2_slope_sweep_rejects_nonisolated_scope(lifetch_cli, extra):
+    with pytest.raises(SystemExit) as exc:
+        lifetch_cli.main(cli_args(prefetch=0) + ["--li-s2-slope-sweep"] + extra)
+    assert exc.value.code == 2
+
+
+def test_li_s2_slope_sweep_needs_prefetch_zero(lifetch_cli):
+    with pytest.raises(SystemExit) as exc:
+        lifetch_cli.main(
+            cli_args(prefetch=64) + ["--li-s2-slope-sweep", "--li-core-perf"]
+        )
+    assert exc.value.code == 2
+
+
+def test_li_s2_slope_scenarios_have_q1_and_q4_and_five_k_lengths():
+    source = (Path(__file__).with_name("support") / "lifetch.py").read_text()
+    assert 'if getattr(args, "li_s2_slope_sweep", False):' in source
+    assert 'for qcount in (1, 4)' in source
+    assert 'for key_len in (resident, quarter, half, three_quarter, history)' in source
+    assert '"query_counts": (qcount, 0, 0, 0)' in source

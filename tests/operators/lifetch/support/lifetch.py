@@ -386,6 +386,22 @@ def run_v9_li_varlen_only(
             },
         )
 
+    if getattr(args, "li_s2_slope_sweep", False):
+        # P0-C4: all Q/K work is in request 0; empty requests isolate the
+        # critical long S2 path. History, Resident, Graph and buffers remain
+        # fixed; only actual-K and actual-Q vary. No cold winners in this
+        # diagnostic: additional cold correctness probes are separate.
+        scenarios = tuple(
+            {
+                "name": f"s2_slope_q{qcount}_k{key_len // 1024}k",
+                "query_counts": (qcount, 0, 0, 0),
+                "query_starts": (0, qcount, qcount, qcount),
+                "key_lengths": (key_len, 0, 0, 0),
+            }
+            for qcount in (1, 4)
+            for key_len in (resident, quarter, half, three_quarter, history)
+        )
+
     summaries = []
     for scenario in scenarios:
         counts = scenario["query_counts"]
@@ -916,6 +932,7 @@ def run_v9_li_varlen_only(
         "li_tiling": getattr(args, "li_tiling", "auto"),
         "li_q2_trunk8k_control": bool(getattr(args, "li_q2_trunk8k_control", False)),
         "li_core_sweep": bool(getattr(args, "li_core_sweep", False)),
+        "li_s2_slope_sweep": bool(getattr(args, "li_s2_slope_sweep", False)),
         "li_core_perf": bool(getattr(args, "li_core_perf", False)),
         "li_cores": int(rotating.runtime_shape.liCores),
         "rotation_epochs": int(rotating.runtime_shape.rounds),
