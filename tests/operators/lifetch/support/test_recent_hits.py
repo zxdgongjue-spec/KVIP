@@ -1,6 +1,7 @@
 """Run the native recent-hit producer against CPU vector/DMA models."""
 
 import subprocess
+import re
 
 import pytest
 
@@ -12,7 +13,7 @@ def test_recent_hits_physical_halos_causal_masks_and_cached_scores(tmp_path, ena
     vector = (INDEXER / "indexer_vector.h").read_text()
     score = (INDEXER / "indexer_score.h").read_text()
     classify = function(score, "__simd_vf__ inline void ClassifyRecentScoreTiles(")
-    publish = function(vector, "    __aicore__ inline void PublishRecentHits(")
+    publish = function(vector, "    __aicore__ inline bool PublishRecentHits(")
     cpp = tmp_path / "recent_hits.cpp"
     cpp.write_text(
         r"""
@@ -145,7 +146,8 @@ int main(){
    if(merged)std::copy(m.scores.begin()+q*h+exact.begin,m.scores.begin()+q*h+exact.end,m.cached.begin()+r);
    auto before=m.bitmap;
    scoreReads=bitmapWrites=0;
-   m.PublishRecentHits(q,q,available,merged);
+   bool published=m.PublishRecentHits(q,q,available,merged);
+   assert(published==bool(bitmapWrites));
    auto tiles=(m.ctx.thresholdBounds && m.ctx.hits)?ReusableTiles(bounds[0],bounds[1],r,h,available,qmax):Range{0,0};
    unsigned expectedReads=0;
    for(unsigned physical=0;physical<h;++physical){
@@ -283,3 +285,130 @@ int main(){
         check=True,
     )
     subprocess.run([str(exe)], check=True)
+
+
+class PipelineGraph:
+    """Queue commands independently; CPU call order creates no cross-pipe edge."""
+
+    def __init__(self):
+        self.nodes = {}
+        self.last = {}
+        self.flags = {}
+
+    def command(self, name, pipe, access=None):
+        assert name not in self.nodes
+        previous = {self.last[pipe]} if pipe in self.last else set()
+        self.nodes[name] = dict(pipe=pipe, previous=previous, access=access)
+        self.last[pipe] = name
+        return name
+
+    def barrier(self, name):
+        previous = set(self.last.values())
+        self.command(name, "S")
+        self.nodes[name]["previous"] = previous
+        self.last = {pipe: name for pipe in ("S", "V", "MTE2", "MTE3")}
+
+    def events(self, source, label):
+        for number, (op, direction, event) in enumerate(
+            re.findall(r"(SetFlag|WaitFlag)<HardEvent::(\w+)>\((\w+)\)", source)
+        ):
+            producer, consumer = direction.split("_")
+            key = direction, event
+            name = self.command(f"{label}-{number}-{op}", producer if op == "SetFlag" else consumer)
+            if op == "SetFlag":
+                assert key not in self.flags
+                self.flags[key] = name
+            else:
+                self.nodes[name]["previous"].add(self.flags.pop(key))
+
+    def precedes(self, first, second):
+        pending = list(self.nodes[second]["previous"])
+        visited = set()
+        while pending:
+            node = pending.pop()
+            if node == first:
+                return True
+            if node not in visited:
+                visited.add(node)
+                pending.extend(self.nodes[node]["previous"])
+        return False
+
+    def dma_first_order(self):
+        """An allowed execution in which an independent MTE2 queue runs early."""
+        remaining, complete = set(self.nodes), []
+        priority = {"MTE2": 0, "V": 1, "MTE3": 2, "S": 3}
+        while remaining:
+            ready = [n for n in remaining if self.nodes[n]["previous"] <= set(complete)]
+            assert ready, "The modeled event dependency graph must not deadlock"
+            chosen = min(ready, key=lambda n: (priority[self.nodes[n]["pipe"]], n))
+            remaining.remove(chosen)
+            complete.append(chosen)
+        return complete
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_recent_predicate_victim_alias_has_cross_pipeline_handoff(cached):
+    """Removing the native handoff permits a victim-ID overwrite before Gather."""
+    source = (INDEXER / "indexer_vector.h").read_text()
+    recent = function(source, "    __aicore__ inline bool PublishRecentHits(")
+    save = function(source, "    __aicore__ inline void SaveResident(")
+    assert "auto hits = scoreChunk[2048];" in recent
+    assert "auto reservedChunk = scoreChunk[2048];" in save
+    assert "auto hitChunk = scoreChunk[6144];" in save
+    assert "topkSharedTmpLocal_.template ReinterpretCast<uint16_t>()" in recent
+    assert save.index("PipeBarrier<PIPE_ALL>();") < save.index("PublishRecentHits(")
+    # Actual aliases in bytes: recent predicate [4096,8192), victim IDs
+    # [4096,12288); the fresh victim predicate [12288,16384) is disjoint.
+    recent_hits, victim_ids = (4096, 8192), (4096, 12288)
+    assert max(recent_hits[0], victim_ids[0]) < min(recent_hits[1], victim_ids[1])
+
+    gm = recent[recent.index("} else if (begin < queryEnd)") : recent.index("vector1::ClassifyRecentScoreTiles(")]
+    gm_before, gm_after = gm.split("DataCopyPad(scoreChunk,", 1)
+    tail = recent[recent.index("vector1::ClassifyRecentScoreTiles(") : recent.index("begin += count;")]
+    before_copy, after_copy = tail.split("DataCopyPad(bitmap[begin / 4],", 1)
+    handoff = function(save, "            if (recentHitsPublished)")
+    assert "SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);" in handoff
+    assert "WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);" in handoff
+    victim_tail = save[save.index("DataCopy(reservedChunk.") : save.index("Simt::VF_CALL<rotating::GatherVictimScores>")]
+    assert save.index("if (recentHitsPublished)") < save.index("DataCopy(reservedChunk.")
+
+    def trace(include_handoff):
+        graph = PipelineGraph()
+        graph.command("old-topk", "V", ("scratch", "rw", 0, 48384))
+        graph.command("save-prefix", "MTE3", ("outputs", "r", 0, 12288))
+        graph.barrier("entry-PipeALL")
+        # Two iterations exercise cached/no-DMA and DMA scratch reuse. A V
+        # wait joins each MTE3 predicate reader before V overwrites its tile.
+        for iteration in range(2):
+            if not cached:
+                graph.events(gm_before, f"gm-before-{iteration}")
+                graph.command(f"score-dma-{iteration}", "MTE2", ("scratch", "w", 0, 4096))
+                graph.events(gm_after, f"gm-after-{iteration}")
+            graph.command(f"write-hits-{iteration}", "V", ("scratch", "w", *recent_hits))
+            graph.events(before_copy, f"copy-before-{iteration}")
+            graph.command(f"read-hits-{iteration}", "MTE3", ("scratch", "r", *recent_hits))
+            graph.events(after_copy, f"copy-after-{iteration}")
+        if include_handoff:
+            graph.events(handoff, "victim-handoff")
+        graph.command("write-victims", "MTE2", ("scratch", "w", *victim_ids))
+        graph.events(victim_tail, "victim-ready")
+        graph.command("gather-victims", "V", ("scratch", "r", *victim_ids))
+        assert not graph.flags
+        return graph
+
+    fixed = trace(True)
+    assert fixed.precedes("old-topk", "write-hits-0")
+    assert fixed.precedes("save-prefix", "write-hits-0")
+    assert fixed.precedes("read-hits-0", "write-hits-1")
+    assert fixed.precedes("write-hits-1", "write-victims")
+    assert fixed.precedes("read-hits-1", "write-victims")
+    assert fixed.precedes("write-victims", "gather-victims")
+    if not cached:
+        assert fixed.precedes("write-hits-0", "score-dma-1")
+    fixed.dma_first_order()
+
+    vulnerable = trace(False)
+    assert not vulnerable.precedes("write-hits-1", "write-victims")
+    assert not vulnerable.precedes("read-hits-1", "write-victims")
+    order = vulnerable.dma_first_order()
+    assert order.index("write-victims") < order.index("write-hits-1") < order.index("gather-victims")

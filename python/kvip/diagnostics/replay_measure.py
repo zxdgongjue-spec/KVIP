@@ -9,6 +9,7 @@ import sys
 import numpy as np
 
 from kvip.diagnostics.archive import array_digest, cpu_array, file_digest, source_commit
+from kvip.diagnostics.console import emit
 from kvip.diagnostics.demand import DEMAND_ACCOUNTING, SnapshotDemand
 from kvip.diagnostics.oracle import DecodeOracle
 from kvip.diagnostics.prefetch_admission import ADMISSION_ACCOUNTING, prefetch_admission
@@ -19,6 +20,50 @@ from kvip.diagnostics.snapshot import (
     post_state,
     relocate_snapshot_addresses,
 )
+
+
+def phase(retained, name, step=None):
+    """Host-only failure location; call outside the device event interval."""
+    retained.setdefault("progress", {}).update(phase=name, step=step)
+
+
+def buffer_addresses(bundle):
+    """Record allocation metadata without reading or synchronizing the NPU."""
+    rotating = getattr(bundle, "rotating", None)
+    storage = getattr(bundle, "storage", None)
+    forward = getattr(bundle, "forward", None)
+    tensors = {"output": getattr(bundle, "output", None)}
+    for name in ("keys", "scales", "addresses", "logical_ids", "hot_valid"):
+        tensors[name] = getattr(storage, name, None)
+    for name in ("context", "rows", "mapping", "locations", "destinations", "fallback_addresses", "row_owners"):
+        tensors[name] = getattr(rotating, name, None)
+    arguments = getattr(rotating, "arguments", ())
+    if len(arguments) >= 14:
+        tensors.update(query=arguments[0], compute=arguments[12], prefix=arguments[13], topk=arguments[9])
+    for name in ("workspace", "dense_shadow", "packed_fetch", "flags"):
+        tensors["streaming_" + name] = getattr(forward, name, None)
+    result = {}
+    for name, tensor in tensors.items():
+        if tensor is None:
+            continue
+        start = tensor.data_ptr()
+        size = tensor.numel() * tensor.element_size()
+        result[name] = dict(
+            address=hex(start), end=hex(start + size), bytes=size, shape=list(tensor.shape), dtype=str(tensor.dtype)
+        )
+    if rotating is not None and "compute" in result:
+        shape = rotating.runtime_shape
+        size = int(shape.batch) * 4 * int(shape.history) * 2
+        start = int(result["compute"]["address"], 16)
+        result["scoreGM"] = dict(
+            address=hex(start),
+            end=hex(start + size),
+            bytes=size,
+            shape=[int(shape.batch), 4, int(shape.history)],
+            dtype="uint16",
+            alias_of="compute",
+        )
+    return result
 
 
 def statistics(samples):
@@ -210,35 +255,48 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
         else:
             graph.replay(stream)
 
+    phase(retained, "eager_reset")
     reset()
+    phase(retained, "eager_forward_and_sync")
     bundle.forward()
     stream.synchronize()
+    phase(retained, "eager_verify")
     verify()
+    phase(retained, "capture_prepare")
     reset()
     stream.synchronize()
+    phase(retained, "graph_capture_and_fence")
     with lease.capture_scope() if lease is not None else nullcontext():
         graph = capture(bundle.forward)
+    phase(retained, "first_replay_reset")
     reset()  # Graph capture may execute the body.
+    phase(retained, "first_replay_and_sync")
     replay(graph)
     stream.synchronize()
+    phase(retained, "first_replay_verify")
     verify()
     begin, end = [torch.npu.Event(enable_timing=True) for _ in range(2)]
     retained["events"] = [begin, end]
     samples, reads = [], []
     for step in range(args.warmup + args.iterations):
+        phase(retained, "iteration_reset", step)
         reset()
         stream.synchronize()
+        phase(retained, "warmup_replay" if step < args.warmup else "timed_replay", step)
         begin.record(stream)
         replay(graph)
         end.record(stream)
         end.synchronize()
+        phase(retained, "iteration_read_counts", step)
         elapsed = begin.elapsed_time(end) * 1000
         counts = bundle.read_counts()
         if step >= args.warmup:
             samples.append(float(elapsed))
             reads.append(counts)
+    phase(retained, "final_verify")
     verify()  # Full score/Index/KV oracle after the final measured replay.
     result = dict(timing=statistics(samples), reads_samples=reads)
+    phase(retained, "graph_reset")
     for graph in reversed(graphs):
         graph.reset()
     return result
@@ -273,16 +331,21 @@ def allocate_context(args, archive, retained):
     if available < geometry["aic_count"]:
         raise ValueError("Replay device has fewer AICs than captured geometry")
     aics = geometry["aic_count"]
+    phase(retained, "runtime_create")
     runtime = create_runtime(args, archive, kvaf, torch, device, stream, cann, aics)
     retained["runtime"] = runtime
+    phase(retained, "runtime_link")
     runtime.link_to(args.kvaf_server)
+    phase(retained, "runtime_initialize")
     runtime.initialize(ddr["region_bytes"], ddr["slot_bytes"])
+    phase(retained, "ddr_import")
     restored = import_pages(
         runtime, archive.directory / "ddr", ddr, torch_module=torch, target_transport=args.transport
     )
     retained["restored"] = restored
     if restored["access_table"] is None:
         raise ValueError("Real-history replay requires published DDR pages")
+    phase(retained, "access_table")
     table = runtime.access_table_view(restored["access_table"], device="npu")
     retained["table"] = table
     return SimpleNamespace(
@@ -306,8 +369,9 @@ def measure_case(args, archive, context, retained):
     build, kvaf, torch = context.build, context.kvaf, context.torch
     device, stream, cann, aics = context.device, context.stream, context.cann, context.aics
     runtime, restored, table = context.runtime, context.restored, context.table
-    case_retained = {}
+    case_retained = {"progress": retained.setdefault("progress", {})}
     retained["active_case"] = case_retained
+    phase(retained, "bundle_create")
     if args.mode == "fused":
         from kvip.diagnostics.fused_replay import create_fused
 
@@ -331,6 +395,10 @@ def measure_case(args, archive, context, retained):
             split_index_stages=getattr(args, "split_index_stages", False),
         )
         case_retained["bundle"] = bundle
+        case_retained["buffers"] = buffer_addresses(bundle)
+        retained["buffers"] = case_retained["buffers"]
+        retained["buffers_variant"] = retained["progress"].get("variant")
+        phase(retained, "prepare_fused_state")
         prepare_fused_state(bundle, archive, restored, torch, device, args.transport)
     else:
         from kvip.diagnostics.serial_replay import create_serial
@@ -351,6 +419,7 @@ def measure_case(args, archive, context, retained):
         )
         case_retained["bundle"] = bundle
     results = measure(torch, kvaf, stream, bundle, args, case_retained, runtime=runtime)
+    phase(retained, "result_metadata")
     library = getattr(bundle, "library", None)
     libraries = getattr(bundle, "libraries", (() if library is None else (library,)))
     result = dict(
@@ -417,6 +486,7 @@ def measure_case(args, archive, context, retained):
     # measure() reset every captured graph first. A failing reset or lease
     # close leaves the active case and shared arena retained by the CLI.
     if bundle.lease is not None:
+        phase(retained, "lease_close")
         bundle.lease.close()
     case_retained.clear()
     del retained["active_case"]
@@ -461,13 +531,22 @@ def verify_case_equivalence(cases, *, same_threshold):
 
 
 def run(args, archive, retained):
+    phase(retained, "context_allocate")
+    retained["geometry"] = getattr(archive, "manifest", {}).get("geometry", {})
+    completed = retained.setdefault("completed_cases", {})
     context = allocate_context(args, archive, retained)
     execution_study = getattr(args, "study", "threshold") in ("pipeline", "skip")
     if args.mode == "fused" and (args.threshold_policy == "both" or execution_study):
         cases = {}
         for name, tuning in study_cases(args).items():
+            retained["progress"].update(variant=name, tuning=dict(tuning))
+            phase(retained, "case_begin")
+            emit(f"CASE_BEGIN {args.transport}-{args.mode}-{name}")
             args.fused_tuning = tuning
             cases[name] = measure_case(args, archive, context, retained)
+            completed[name] = cases[name]
+            emit(f"CASE_PASS {args.transport}-{args.mode}-{name} p50_us={cases[name]['timing']['p50_us']:.3f}")
+        phase(retained, "case_equivalence")
         verify_case_equivalence(cases, same_threshold=execution_study)
         result = dict(
             status="pass",
@@ -477,6 +556,9 @@ def run(args, archive, retained):
             cases=cases,
         )
     else:
+        retained["progress"]["variant"] = args.threshold_policy if args.mode == "fused" else "serial"
         result = measure_case(args, archive, context, retained)
+        completed[retained["progress"]["variant"]] = result
+    phase(retained, "context_release")
     release_context(context)
     return result

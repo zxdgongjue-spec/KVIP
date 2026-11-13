@@ -5,9 +5,10 @@ import argparse
 import json
 import os
 from pathlib import Path
+import traceback
 
 from kvip.diagnostics.archive import load_snapshot
-from kvip.diagnostics.console import NativeLog, emit, flush_output
+from kvip.diagnostics.console import NativeLog, emit, flush_output, print_replay_failure
 
 _RETAINED = []
 
@@ -43,9 +44,9 @@ def arguments(argv=None):
 
 def main(argv=None):
     args = arguments(argv)
-    retained = {}
+    retained = {"progress": {"variant": "unassigned", "phase": "input_validation", "step": None}}
     _RETAINED.append(retained)
-    log = NativeLog(args.quiet)
+    log = NativeLog(args.quiet, report_failure=False)
     try:
         with log:
             from kvip.diagnostics.ddr import validate_pages
@@ -58,6 +59,7 @@ def main(argv=None):
             if archive.manifest.get("content") != "real_li_synthetic_kv":
                 raise ValueError("This comparison requires real Q/Index and generated KV")
             result = run(args, archive, retained)
+        retained["progress"].update(phase="result_write", step=None)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with args.output.open("x") as stream:
             json.dump(result, stream, indent=2)
@@ -67,7 +69,34 @@ def main(argv=None):
                 f"mean_us={case['timing']['mean_us']:.3f} p50_us={case['timing']['p50_us']:.3f}"
             )
     except BaseException as error:
-        emit(f"REPLAY_FAILED {type(error).__name__}: {error}")
+        active = retained.get("active_case")
+        result = dict(
+            schema_version=2,
+            status="failed",
+            transport=args.transport,
+            mode=args.mode,
+            study=args.study,
+            snapshot=str(args.snapshot),
+            progress=dict(retained.get("progress", {})),
+            geometry=retained.get("geometry", {}),
+            buffers=active.get("buffers", {}) if active is not None else retained.get("buffers", {}),
+            buffers_variant=retained.get("progress", {}).get("variant")
+            if active is not None
+            else retained.get("buffers_variant"),
+            completed_cases=retained.get("completed_cases", {}),
+            error=dict(type=type(error).__name__, message=str(error), traceback=traceback.format_exc()),
+            native_log=str(log.failure_path) if log.failure_path else None,
+        )
+        save_error = None
+        try:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            with args.output.open("x") as stream:
+                json.dump(result, stream, indent=2)
+        except (OSError, TypeError, ValueError) as writing_error:
+            save_error = writing_error
+        print_replay_failure(result, result_path=args.output, log_path=log.failure_path)
+        if save_error is not None:
+            emit(f"Failure JSON could not be saved: {save_error}")
         flush_output()
         # Unknown device completion: preserve owners until process termination.
         os._exit(130 if isinstance(error, KeyboardInterrupt) else 70)

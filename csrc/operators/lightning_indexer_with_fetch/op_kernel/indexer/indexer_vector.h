@@ -258,12 +258,12 @@ private:
         }
     }
 
-    __aicore__ inline void PublishRecentHits(uint32_t query, uint32_t scoreRow,
+    __aicore__ inline bool PublishRecentHits(uint32_t query, uint32_t scoreRow,
                                            uint32_t availableEnd, bool recentMerged) {
 #if KVIP_RECENT_SKIP
         if constexpr (std::is_same_v<SCORE_T, uint16_t>) {
             auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
-            if (!ctx->thresholdBounds || !ctx->hits) return;
+            if (!ctx->thresholdBounds || !ctx->hits) return false;
             auto bounds = reinterpret_cast<__gm__ int32_t*>(ctx->thresholdBounds) + (query / SIM_Q) * 2;
             uint32_t queryEnd = runtimeShape_.history, queryMax = runtimeShape_.history;
             if (ctx->queryEnds) {
@@ -274,7 +274,7 @@ private:
             }
             auto tiles = kvip_recent_index::ReusableTiles(bounds[0], bounds[1], runtimeShape_.resident,
                 runtimeShape_.history, availableEnd, queryMax);
-            if (tiles.begin == tiles.end) return;
+            if (tiles.begin == tiles.end) return false;
             queryEnd = Min(queryEnd, availableEnd);
             auto cached = kvip_recent_index::Clip(bounds[0], bounds[1], runtimeShape_.resident,
                                                   runtimeShape_.history, queryEnd);
@@ -320,8 +320,10 @@ private:
                 WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
                 begin += count;
             }
+            return true;
         }
 #endif
+        return false;
     }
 
     __aicore__ inline void SaveResident(uint32_t query, uint32_t scoreRow, bool publishProgress,
@@ -354,7 +356,7 @@ private:
         DataCopy(indices[q * 2048], indicesOutLocal_.template ReinterpretCast<int32_t>(), 2048);
         DataCopy(thresholds[q * 128], prefixThreshold_[(query % 2) * 128], 128);
         PipeBarrier<PIPE_ALL>();
-        PublishRecentHits(query, scoreRow, availableEnd, recentMerged);
+        const bool recentHitsPublished = PublishRecentHits(query, scoreRow, availableEnd, recentMerged);
         auto context = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
         if (context->lruSlots) {
             // TopK scratch is dead after the resident result is saved. Reuse
@@ -369,6 +371,13 @@ private:
             uint32_t validEnd = context->queryEnds ?
                 reinterpret_cast<__gm__ uint32_t*>(context->queryEnds)[query] : runtimeShape_.history;
             if (validEnd > runtimeShape_.resident) validEnd = runtimeShape_.resident;
+            if (recentHitsPublished) {
+                // Recent predicates and victim IDs alias UB bytes [4096,8192).
+                // PublishRecentHits joins the MTE3 reader back to V; explicitly
+                // order that V completion before the independent MTE2 writer.
+                SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+                WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+            }
             DataCopy(reservedChunk.template ReinterpretCast<uint32_t>(), victims, 2048);
             SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
             Simt::VF_CALL<rotating::GatherVictimScores>(Simt::Dim3{256,1,1},

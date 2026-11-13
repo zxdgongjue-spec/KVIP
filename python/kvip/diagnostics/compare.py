@@ -12,7 +12,7 @@ import subprocess
 import sys
 
 from kvip.diagnostics.archive import file_digest, source_commit
-from kvip.diagnostics.console import failure_tail
+from kvip.diagnostics.console import failure_tail, print_replay_failure
 
 
 def arguments(argv=None):
@@ -265,7 +265,20 @@ def run(args):
         with log.open("w") as stream:
             process = subprocess.run(cmd, stdout=stream, stderr=subprocess.STDOUT, check=False)
         if process.returncode:
-            failure_tail(log, message=f"{name} exit={process.returncode}", lines=45)
+            try:
+                failure = json.loads(output.read_text())
+            except (OSError, ValueError):
+                failure = None
+            if isinstance(failure, dict) and failure.get("status") == "failed":
+                failure["comparison_log"] = str(log.resolve())
+                failure["child_exit_code"] = process.returncode
+                try:
+                    output.write_text(json.dumps(failure, indent=2) + "\n")
+                except OSError:
+                    pass  # Preserve the original error and already-saved child report.
+                print_replay_failure(failure, result_path=output, log_path=log)
+            else:
+                failure_tail(log, message=f"{name} exit={process.returncode}; no structured failure report", lines=12)
             raise SystemExit(1)
         report = json.loads(output.read_text())
         if mode == "fused":
