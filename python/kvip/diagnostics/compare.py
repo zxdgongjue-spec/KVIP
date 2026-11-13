@@ -27,7 +27,7 @@ def arguments(argv=None):
     p.add_argument("--iterations", type=int, default=10)
     p.add_argument(
         "--study",
-        choices=("threshold", "pipeline", "skip", "upstream", "threshold-only", "seed-ub"),
+        choices=("threshold", "pipeline", "skip", "upstream", "threshold-only", "seed-ub", "local-victims"),
         default="threshold",
     )
     p.add_argument("--transports", choices=("urma", "ubmem", "both"), default="urma")
@@ -51,7 +51,7 @@ def arguments(argv=None):
         p.error("Invalid device, warmup, iterations or workers")
     if args.result_dir.exists():
         p.error("result-dir already exists; choose a new directory")
-    if args.study in ("upstream", "threshold-only", "seed-ub"):
+    if args.study in ("upstream", "threshold-only", "seed-ub", "local-victims"):
         if not args.upstream_root or not args.upstream_revision:
             p.error("This study requires upstream-root and upstream-revision")
         from kvip.diagnostics.upstream import validate_checkout
@@ -61,11 +61,11 @@ def arguments(argv=None):
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             p.error(str(error))
     elif args.upstream_root or args.upstream_revision:
-        p.error("upstream-root/revision apply only to study=upstream, threshold-only or seed-ub")
-    if args.study in ("threshold-only", "seed-ub") and args.transports != "urma":
+        p.error("upstream-root/revision require a study with an exact upstream reference")
+    if args.study in ("threshold-only", "seed-ub", "local-victims") and args.transports != "urma":
         p.error(f"study={args.study} requires --transports urma")
-    if args.study == "seed-ub" and args.diagnostic_replays:
-        p.error("study=seed-ub excludes instrumented diagnostic replays")
+    if args.study in ("seed-ub", "local-victims") and args.diagnostic_replays:
+        p.error(f"study={args.study} excludes instrumented diagnostic replays")
     for root, object_name in ((args.build_dir, "kvaf_execute_batch_get_kernels.o"),):
         if root is not None and not (root / "bin" / object_name).is_file():
             p.error(f"Missing exact requested kernel: {root / 'bin' / object_name}")
@@ -92,13 +92,14 @@ def read_means(result):
 
 def display_name(name, study):
     """Keep saved result keys stable while spelling out the actual algorithms."""
-    if study in ("upstream", "threshold-only", "seed-ub"):
+    if study in ("upstream", "threshold-only", "seed-ub", "local-victims"):
         for suffix, label in (
             ("upstream-serial", "main-serial"),
             ("upstream-fused", "main-resident"),
             ("recent-current", "current-kth"),
             ("recent-release", "release-kth"),
             ("recent-seed", "seed-ub"),
+            ("recent-local", "local-victims"),
             ("recent-before", "recent-recompute"),
             ("recent-after", "recent-kth-only" if study == "threshold-only" else "recent-score-replay"),
         ):
@@ -111,6 +112,93 @@ def reduction(before, after):
     return 100 * (1 - after / before) if before else None
 
 
+def timing_spread(timing):
+    """Report a transparent tail heuristic, never delete or reweight samples."""
+    median, mean = timing["p50_us"], timing["mean_us"]
+    samples = timing.get("samples_us")
+    maximum = timing.get("max_us", max(samples) if samples else None)
+    minimum = timing.get("min_us", min(samples) if samples else None)
+    mean_ratio = mean / median
+    maximum_ratio = maximum / median if maximum is not None else None
+    reasons = []
+    if mean_ratio >= 1.10:
+        reasons.append("mean/p50>=1.10")
+    if maximum_ratio is not None and maximum_ratio >= 1.50:
+        reasons.append("max/p50>=1.50")
+    return dict(
+        flagged=bool(reasons),
+        reasons=reasons,
+        count=timing.get("count", len(samples) if samples is not None else None),
+        min_us=minimum,
+        max_us=maximum,
+        mean_to_p50=mean_ratio,
+        max_to_p50=maximum_ratio,
+        high_tail_samples=sum(value >= 1.5 * median for value in samples) if samples is not None else None,
+        interpretation="Heuristic timing-spread warning, not a significance test; every original sample is retained",
+    )
+
+
+def timing_comparisons(table, transport, study):
+    def key(suffix):
+        return f"{transport}-{suffix}"
+
+    if study == "local-victims":
+        pairs = [("local_victims", "recent-release", "recent-local", "step")]
+        pairs += [(name, "upstream-fused", f"recent-{name}", "main") for name in ("release", "local")]
+    elif study == "seed-ub":
+        pairs = [
+            ("marker_removal", "recent-current", "recent-release", "step"),
+            ("seed_reuse", "recent-release", "recent-seed", "step"),
+        ]
+        pairs += [(name, "upstream-fused", f"recent-{name}", "main") for name in ("current", "release", "seed")]
+    elif study in ("upstream", "threshold-only"):
+        pairs = [
+            ("after_vs_before", "recent-before", "recent-after", "step"),
+            ("after", "upstream-fused", "recent-after", "main"),
+            ("after_vs_serial", "upstream-serial", "recent-after", "serial_reference"),
+        ]
+    elif study == "skip":
+        pairs = [
+            ("skip", "fused-before", "fused-after", "step"),
+            ("skip_vs_serial", "serial", "fused-after", "serial_reference"),
+        ]
+    elif study == "pipeline":
+        pairs = [
+            ("pipeline", "fused-before", "fused-pipeline", "step"),
+            ("unified_topk_increment", "fused-pipeline", "fused-unified", "step"),
+            ("combined", "fused-before", "fused-unified", "step"),
+            ("combined_vs_serial", "serial", "fused-unified", "serial_reference"),
+        ]
+    else:
+        pairs = [
+            ("recent_vs_resident", "fused-resident", "fused-recent", "step"),
+            ("recent_vs_serial", "serial", "fused-recent", "serial_reference"),
+        ]
+    result = {}
+    for name, source, target, role in pairs:
+        before, after = table[key(source)], table[key(target)]
+        result[name] = dict(
+            reference=key(source),
+            candidate=key(target),
+            role=role,
+            p50_reduction_pct=reduction(before["p50_us"], after["p50_us"]),
+            mean_reduction_pct=reduction(before["mean_us"], after["mean_us"]),
+            timing_spread_flagged=before["timing_spread"]["flagged"] or after["timing_spread"]["flagged"],
+        )
+    return result
+
+
+def print_timing_gains(transport, effect):
+    for role in ("main", "step", "serial_reference"):
+        comparisons = [(name, value) for name, value in effect["timing_comparisons"].items() if value["role"] == role]
+        if comparisons:
+            values = " ".join(
+                f"{name}={value['p50_reduction_pct']:+.2f}%/{value['mean_reduction_pct']:+.2f}%"
+                for name, value in comparisons
+            )
+            print(f"{role.upper()}_GAIN {transport} p50/mean {values}", flush=True)
+
+
 def traffic_change(before, after):
     return dict(
         unused_prefetch_reduction_pct=reduction(before["unused_prefetch"], after["unused_prefetch"]),
@@ -118,14 +206,15 @@ def traffic_change(before, after):
     )
 
 
-def summarize_seed_study(table, transport):
+def summarize_execution_study(table, transport, study):
     if transport != "urma":
-        raise ValueError("The seed-UB study supports only URMA")
+        raise ValueError(f"The {study} study supports only URMA")
     main_key = f"{transport}-upstream-fused"
-    names = ("current", "release", "seed")
+    names = ("current", "release", "seed") if study == "seed-ub" else ("release", "local")
+    changed_options = ("recent_profile", "recent_seed_ub") if study == "seed-ub" else ("recent_local_victims",)
     expected_keys = {main_key, *(f"{transport}-recent-{name}" for name in names)}
     if set(table) != expected_keys:
-        raise ValueError("Seed-UB requires only main fusion and the three feature variants, no serial reference")
+        raise ValueError(f"{study} requires only main fusion and its feature variants, no serial reference")
     main = table[main_key]
     provenance = main.get("production_source") or {}
     if provenance.get("kind") != "exact_upstream_checkout" or not provenance.get("commit"):
@@ -133,51 +222,55 @@ def summarize_seed_study(table, transport):
     from kvip.diagnostics.replay_measure import study_cases
     from types import SimpleNamespace
 
-    expected = study_cases(SimpleNamespace(study="seed-ub"))
+    expected = study_cases(SimpleNamespace(study=study))
     variants = {name: table[f"{transport}-recent-{name}"] for name in names}
     for row in (main, *variants.values()):
         if not row["score_comparison"] or row["score_comparison"].get("status") != "bit_exact":
-            raise ValueError("Seed-UB requires all captured valid LI scores to be bit exact")
+            raise ValueError(f"{study} requires all captured valid LI scores to be bit exact")
         if any(
             row["selection"][key] != main["selection"][key] for key in ("selected_set_sha256", "ordered_output_sha256")
         ):
-            raise ValueError("Seed-UB changed final ordered TopK")
+            raise ValueError(f"{study} changed final ordered TopK")
         if row["threshold"]["final_keys"] != main["threshold"]["final_keys"]:
-            raise ValueError("Seed-UB changed final threshold")
+            raise ValueError(f"{study} changed final threshold")
         if row.get("native_diagnostics"):
-            raise ValueError("Seed-UB headline comparison excludes instrumented diagnostic replays")
-    current = variants["current"]
+            raise ValueError(f"{study} headline comparison excludes instrumented diagnostic replays")
+    current = variants[names[0]]
     prediction = current.get("seed_ub_eligibility")
-    if not prediction or not prediction.get("predicted_eligible_queries"):
-        raise ValueError("Seed-UB requires nonzero predicted eligible queries")
-    if any(row.get("seed_ub_eligibility") != prediction for row in variants.values()):
-        raise ValueError("Seed-UB eligibility predictions differ between variants")
-    common_tuning = {
-        key: value
-        for key, value in (current["tuning"] or {}).items()
-        if key not in ("recent_profile", "recent_seed_ub")
-    }
+    if study == "seed-ub":
+        if not prediction or not prediction.get("predicted_eligible_queries"):
+            raise ValueError("Seed-UB requires nonzero predicted eligible queries")
+        if any(row.get("seed_ub_eligibility") != prediction for row in variants.values()):
+            raise ValueError("Seed-UB eligibility predictions differ between variants")
+    common_tuning = {key: value for key, value in (current["tuning"] or {}).items() if key not in changed_options}
     for name, row in variants.items():
         if row["tuning"] is None or any(row["tuning"].get(key) is not value for key, value in expected[name].items()):
-            raise ValueError(f"Wrong Seed-UB native options: {name}")
-        if {
-            key: value for key, value in row["tuning"].items() if key not in ("recent_profile", "recent_seed_ub")
-        } != common_tuning:
-            raise ValueError("Seed-UB changed an unrelated tuning option or budget")
+            raise ValueError(f"Wrong {study} native options: {name}")
+        if {key: value for key, value in row["tuning"].items() if key not in changed_options} != common_tuning:
+            raise ValueError(f"{study} changed an unrelated tuning option or budget")
         if row["threshold"]["initial_keys"] != current["threshold"]["initial_keys"]:
-            raise ValueError("Seed-UB changed initial threshold")
-    return dict(
+            raise ValueError(f"{study} changed initial threshold")
+    result = dict(
         main_reference=main_key,
-        seed_ub_eligibility=prediction,
         upstream_revision=provenance["commit"],
-        marker_removal_reduction_pct=reduction(current["mean_us"], variants["release"]["mean_us"]),
-        seed_reuse_reduction_pct=reduction(variants["release"]["mean_us"], variants["seed"]["mean_us"]),
         **{
             f"{name}_vs_main_reduction_pct": reduction(main["mean_us"], row["mean_us"])
             for name, row in variants.items()
         },
-        traffic_main_to_seed=traffic_change(main["reads"], variants["seed"]["reads"]),
     )
+    if study == "seed-ub":
+        result.update(
+            seed_ub_eligibility=prediction,
+            marker_removal_reduction_pct=reduction(current["mean_us"], variants["release"]["mean_us"]),
+            seed_reuse_reduction_pct=reduction(variants["release"]["mean_us"], variants["seed"]["mean_us"]),
+            traffic_main_to_seed=traffic_change(main["reads"], variants["seed"]["reads"]),
+        )
+    else:
+        result.update(
+            local_victims_reduction_pct=reduction(current["mean_us"], variants["local"]["mean_us"]),
+            traffic_main_to_local=traffic_change(main["reads"], variants["local"]["reads"]),
+        )
+    return result
 
 
 def summarize(results, study="threshold"):
@@ -208,6 +301,7 @@ def summarize(results, study="threshold"):
             post_size=result.get("batch_get_post_size"),
             tuning=result.get("tuning"),
             timing=result["timing"],
+            timing_spread=timing_spread(result["timing"]),
             production_source=result.get("production_source"),
             native_diagnostics=result.get("native_diagnostics"),
             seed_ub_eligibility=result.get("seed_ub_eligibility"),
@@ -215,11 +309,11 @@ def summarize(results, study="threshold"):
     effects = {}
     for transport in (value for value in ("urma", "ubmem") if any(key.startswith(value + "-") for key in table)):
         best = transport + "-serial"
-        if study == "seed-ub":
-            effects[transport] = summarize_seed_study(table, transport)
+        if study in ("seed-ub", "local-victims"):
+            effects[transport] = summarize_execution_study(table, transport, study)
             continue
         if study in ("skip", "upstream", "threshold-only"):
-            prefix = "recent" if study in ("upstream", "threshold-only", "seed-ub") else "fused"
+            prefix = "recent" if study in ("upstream", "threshold-only", "seed-ub", "local-victims") else "fused"
             before, after = (table[f"{transport}-{prefix}-{name}"] for name in ("before", "after"))
             changed_option = "recent_threshold_only" if study == "threshold-only" else "recent_skip"
             label = "Threshold-only A/B" if study == "threshold-only" else "Skip A/B"
@@ -245,7 +339,7 @@ def summarize(results, study="threshold"):
                 raise ValueError("Skip A/B changed the final selection")
             if any(before["threshold"][key] != after["threshold"][key] for key in ("initial_keys", "final_keys")):
                 raise ValueError("Skip A/B changed the threshold")
-            if study in ("upstream", "threshold-only", "seed-ub"):
+            if study in ("upstream", "threshold-only", "seed-ub", "local-victims"):
                 best = transport + "-upstream-serial"
                 main = table[transport + "-upstream-fused"]
                 for reference in (table[best], main):
@@ -272,7 +366,7 @@ def summarize(results, study="threshold"):
                     skip_reduction_pct=effects[transport]["optimization_reduction_pct"],
                     skip_vs_serial_reduction_pct=effects[transport]["optimization_vs_serial_reduction_pct"],
                 )
-            if study in ("upstream", "threshold-only", "seed-ub"):
+            if study in ("upstream", "threshold-only", "seed-ub", "local-victims"):
                 effects[transport].update(
                     upstream_revision=main["production_source"]["commit"],
                     traffic_main_to_before=traffic_change(main["reads"], before["reads"]),
@@ -312,6 +406,8 @@ def summarize(results, study="threshold"):
             recent_vs_resident_reduction_pct=100 * (1 - after["mean_us"] / before["mean_us"]),
             recent_vs_serial_reduction_pct=100 * (1 - after["mean_us"] / table[best]["mean_us"]),
         )
+    for transport, effect in effects.items():
+        effect["timing_comparisons"] = timing_comparisons(table, transport, study)
     return dict(
         status="pass",
         study=study,
@@ -322,6 +418,7 @@ def summarize(results, study="threshold"):
         effects=effects,
         scope=first["scope"],
         timing_boundary=first["timing_boundary"],
+        timing_reporting="N/min/p50/mean/max include every sample; gains report both p50 and mean. Tail flags are heuristic (mean/p50>=1.10 or max/p50>=1.50), not significance tests or exclusions.",
         bandwidth_accounting=dict(
             graph_equivalent="Mean transferred payload bytes / mean complete-graph microseconds / 1000; decimal GB/s, not isolated Fetch bandwidth",
             useful_payload="Transferred payload minus unused speculative prefetch; not unique cold demand",
@@ -333,17 +430,29 @@ def summarize(results, study="threshold"):
 
 def print_summary(summary):
     print(
-        "case                         mean_us    p50_us  cold_miss%   prefetched  unused_prefetch  waste%  total_read_MiB",
+        "case                          N     min_us     p50_us    mean_us     max_us  cold_miss%  prefetched  unused_prefetch  waste%  read_MiB",
         flush=True,
     )
     for name, row in summary["table"].items():
         r = row["reads"]
         waste = "n/a" if r["prefetch_waste_pct"] is None else f"{r['prefetch_waste_pct']:.2f}"
+        spread = row["timing_spread"]
+        n = str(spread["count"]) if spread["count"] is not None else "n/a"
+        low = f"{spread['min_us']:.3f}" if spread["min_us"] is not None else "n/a"
+        high = f"{spread['max_us']:.3f}" if spread["max_us"] is not None else "n/a"
         print(
-            f"{row['display_name']:28} {row['mean_us']:9.3f} {row['p50_us']:9.3f} {100 * r['cold_miss_rate']:10.4f} "
-            f"{r['prefetch']:12.1f} {r['unused_prefetch']:16.1f} {waste:>7} {r['bytes'] / (1 << 20):15.3f}",
+            f"{row['display_name']:28} {n:>3} {low:>10} {row['p50_us']:10.3f} {row['mean_us']:10.3f} {high:>10} "
+            f"{100 * r['cold_miss_rate']:10.4f} {r['prefetch']:11.1f} {r['unused_prefetch']:16.1f} "
+            f"{waste:>7} {r['bytes'] / (1 << 20):9.3f}",
             flush=True,
         )
+        if spread["flagged"]:
+            ratio = f"{spread['max_to_p50']:.3f}" if spread["max_to_p50"] is not None else "n/a"
+            print(
+                f"  TIMING_NOTE tail_spread mean/p50={spread['mean_to_p50']:.3f} max/p50={ratio}; "
+                "all samples kept, not a significance test",
+                flush=True,
+            )
         efficiency = row["payload_efficiency_pct"]
         efficiency_text = "n/a" if efficiency is None else f"{efficiency:.2f}%"
         print(
@@ -356,15 +465,16 @@ def print_summary(summary):
         flush=True,
     )
     for transport, effect in summary["effects"].items():
-        if summary.get("study") == "seed-ub":
-            prediction = effect["seed_ub_eligibility"]
-            print(
-                f"SEED_UB_ELIGIBILITY predicted={prediction['predicted_eligible_queries']}/{prediction['total_queries']} "
-                f"fallback={prediction['predicted_fallback_queries']} not_runtime_observation",
-                flush=True,
-            )
+        if summary.get("study") in ("seed-ub", "local-victims"):
+            candidate = "seed" if summary["study"] == "seed-ub" else "local"
+            if prediction := effect.get("seed_ub_eligibility"):
+                print(
+                    f"SEED_UB_ELIGIBILITY predicted={prediction['predicted_eligible_queries']}/{prediction['total_queries']} "
+                    f"fallback={prediction['predicted_fallback_queries']} not_runtime_observation",
+                    flush=True,
+                )
             main = summary["table"][f"{transport}-upstream-fused"]["threshold"]
-            recent = summary["table"][f"{transport}-recent-seed"]["threshold"]
+            recent = summary["table"][f"{transport}-recent-{candidate}"]["threshold"]
             print(
                 f"THRESHOLD {transport} gap_mean={main['mean_gap']:.7g}->{recent['mean_gap']:.7g} "
                 f"equal_final={100 * main['equal_fraction']:.2f}%->{100 * recent['equal_fraction']:.2f}%",
@@ -375,18 +485,10 @@ def print_summary(summary):
                 "all_fused_topk=unchanged_ordered recent_initial_threshold=unchanged_bit_exact KV_Index_outputs=verified",
                 flush=True,
             )
+            print_timing_gains(transport, effect)
+            traffic = effect[f"traffic_main_to_{candidate}"]
             print(
-                f"GAIN {transport} marker_removal={effect['marker_removal_reduction_pct']:.2f}% "
-                f"seed_reuse={effect['seed_reuse_reduction_pct']:.2f}% "
-                + " ".join(
-                    f"{name}_vs_main={effect[name + '_vs_main_reduction_pct']:.2f}%"
-                    for name in ("current", "release", "seed")
-                ),
-                flush=True,
-            )
-            traffic = effect["traffic_main_to_seed"]
-            print(
-                f"TRAFFIC {transport} main_to_seed "
+                f"TRAFFIC {transport} main_to_{candidate} "
                 + " ".join(
                     f"{key}={value:.2f}%" if value is not None else f"{key}=n/a" for key, value in traffic.items()
                 ),
@@ -397,7 +499,7 @@ def print_summary(summary):
                 flush=True,
             )
             continue
-        if summary.get("study") in ("upstream", "threshold-only", "seed-ub"):
+        if summary.get("study") in ("upstream", "threshold-only", "seed-ub", "local-victims"):
             main, recent = (
                 summary["table"][f"{transport}-{name}"]["threshold"] for name in ("upstream-fused", "recent-after")
             )
@@ -411,12 +513,7 @@ def print_summary(summary):
                 "all_fused_topk=unchanged_ordered recent_initial_threshold=unchanged_bit_exact KV_Index_outputs=verified",
                 flush=True,
             )
-            print(
-                f"GAIN {transport} after_vs_recent_before={effect['optimization_reduction_pct']:.2f}% "
-                f"after_vs_upstream_fused={effect['recent_after_vs_upstream_reduction_pct']:.2f}% "
-                f"after_vs_upstream_serial={effect['optimization_vs_serial_reduction_pct']:.2f}%",
-                flush=True,
-            )
+            print_timing_gains(transport, effect)
             for pair in ("main_to_before", "main_to_after", "before_to_after"):
                 change = effect["traffic_" + pair]
                 values = " ".join(
@@ -434,12 +531,7 @@ def print_summary(summary):
                 "final_topk=unchanged_ordered KV_Index_outputs=verified",
                 flush=True,
             )
-            print(
-                f"GAIN {transport} skip={effect['skip_reduction_pct']:.2f}% "
-                f"skip_vs_serial={effect['skip_vs_serial_reduction_pct']:.2f}% "
-                f"serial_reference={effect['serial_reference']}",
-                flush=True,
-            )
+            print_timing_gains(transport, effect)
             continue
         if summary.get("study") == "pipeline":
             print(
@@ -447,13 +539,7 @@ def print_summary(summary):
                 "final_topk=unchanged_ordered KV_Index_outputs=verified",
                 flush=True,
             )
-            print(
-                f"GAIN {transport} pipeline={effect['pipeline_reduction_pct']:.2f}% "
-                f"unified_topk_increment={effect['unified_topk_incremental_reduction_pct']:.2f}% "
-                f"combined={effect['combined_reduction_pct']:.2f}% "
-                f"combined_vs_serial={effect['combined_vs_serial_reduction_pct']:.2f}%",
-                flush=True,
-            )
+            print_timing_gains(transport, effect)
             continue
         a, b = (summary["table"][f"{transport}-fused-{p}"]["threshold"] for p in ("resident", "recent"))
         print(
@@ -462,12 +548,7 @@ def print_summary(summary):
             "native_threshold=bit_exact final_scores=bit_exact final_selection=unchanged_ordered",
             flush=True,
         )
-        print(
-            f"GAIN {transport} recent_vs_resident={effect['recent_vs_resident_reduction_pct']:.2f}% "
-            f"recent_vs_serial={effect['recent_vs_serial_reduction_pct']:.2f}% "
-            f"serial_reference={effect['serial_reference']}",
-            flush=True,
-        )
+        print_timing_gains(transport, effect)
     for name, row in summary["table"].items():
         if row.get("native_diagnostics"):
             from kvip.diagnostics.native_profile import print_profile
@@ -488,15 +569,19 @@ def run(args):
         for transport in transports
         for mode, reference in (
             (("fused", True), ("fused", False))
-            if args.study == "seed-ub"
+            if args.study in ("seed-ub", "local-victims")
             else (("serial", True), ("fused", True), ("fused", False))
-            if args.study in ("upstream", "threshold-only", "seed-ub")
+            if args.study in ("upstream", "threshold-only", "seed-ub", "local-victims")
             else (("serial", False), ("fused", False))
         )
     ]
     for transport, mode, reference in cases:
         prefix = (
-            "upstream-" if reference else "recent-" if args.study in ("upstream", "threshold-only", "seed-ub") else ""
+            "upstream-"
+            if reference
+            else "recent-"
+            if args.study in ("upstream", "threshold-only", "seed-ub", "local-victims")
+            else ""
         )
         name = f"{transport}-{prefix}{mode}"
         paired = mode == "fused" and not reference
@@ -551,6 +636,7 @@ def run(args):
                     "upstream": " recompute/score-replay share DDR",
                     "threshold-only": " recompute/kth-only share DDR",
                     "seed-ub": " current-kth/release-kth/seed-ub share DDR",
+                    "local-victims": " release-kth/local-victims share DDR",
                 }[args.study]
                 if paired
                 else f" workers={args.serial_workers}" + (" post=128 inflight=2048" if transport == "urma" else "")
@@ -577,7 +663,11 @@ def run(args):
             raise SystemExit(1)
         report = json.loads(output.read_text())
         if paired:
-            case_prefix = f"{transport}-recent" if args.study in ("upstream", "threshold-only", "seed-ub") else name
+            case_prefix = (
+                f"{transport}-recent"
+                if args.study in ("upstream", "threshold-only", "seed-ub", "local-victims")
+                else name
+            )
             results.update({f"{case_prefix}-{key}": value for key, value in report["cases"].items()})
         else:
             results[name] = report

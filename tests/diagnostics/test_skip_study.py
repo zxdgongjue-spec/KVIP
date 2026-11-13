@@ -146,7 +146,7 @@ def test_skip_summary_reports_six_paths_and_allows_real_traffic_changes(capsys):
     assert summary["table"]["ubmem-fused-after"]["reads"]["final"] == 2
     compare.print_summary(summary)
     output = capsys.readouterr().out
-    assert "skip=10.00%" in output and "skip_vs_serial=25.00%" in output
+    assert "skip=+10.00%/+10.00%" in output and "skip_vs_serial=+25.00%/+25.00%" in output
     assert "final_topk=unchanged_ordered" in output
 
 

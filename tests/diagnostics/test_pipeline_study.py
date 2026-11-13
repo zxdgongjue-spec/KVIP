@@ -62,7 +62,7 @@ def test_study_changes_only_seed_execution_and_reports_each_increment(capsys):
     assert effect["combined_reduction_pct"] == pytest.approx(19)
     assert effect["combined_vs_serial_reduction_pct"] == pytest.approx(32.5)
     print_summary(result)
-    assert "combined=19.00%" in capsys.readouterr().out
+    assert "combined=+19.00%/+19.00%" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("field", ["initial_keys", "final_keys"])

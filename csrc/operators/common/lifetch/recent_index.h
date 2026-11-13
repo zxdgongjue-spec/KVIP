@@ -21,6 +21,14 @@
 namespace kvip_recent_index {
 struct Range { uint32_t begin, end; };
 
+// thresholdReady proves that the exact Kth loader retained its input. Both
+// the context and native causal bounds must cover the complete resident row.
+KVIP_RECENT_DEVICE inline bool UseLocalVictims(bool thresholdReady,
+    uint32_t resident, uint32_t validEnd, uint32_t availableEnd) {
+    return thresholdReady && resident >= 2048 && resident <= 16384 &&
+           validEnd == resident && availableEnd >= resident;
+}
+
 KVIP_RECENT_DEVICE inline Range Clip(int32_t begin, int32_t end,
                                     uint32_t resident, uint32_t history,
                                     uint32_t queryEnd) {

@@ -566,6 +566,20 @@ def release_context(context):
 def study_cases(args):
     """Keep each study's baseline explicit when production defaults advance."""
     study = getattr(args, "study", "threshold")
+    if study == "local-victims":
+        return {
+            name: dict(
+                recent_threshold=True,
+                recent_pipeline=True,
+                recent_unified_topk=True,
+                recent_skip=False,
+                recent_threshold_only=True,
+                recent_profile=False,
+                recent_seed_ub=False,
+                recent_local_victims=local,
+            )
+            for name, local in (("release", False), ("local", True))
+        }
     if study == "seed-ub":
         return {
             name: dict(
@@ -634,7 +648,13 @@ def run(args, archive, retained):
     retained["geometry"] = getattr(archive, "manifest", {}).get("geometry", {})
     completed = retained.setdefault("completed_cases", {})
     context = allocate_context(args, archive, retained)
-    execution_study = getattr(args, "study", "threshold") in ("pipeline", "skip", "threshold-only", "seed-ub")
+    execution_study = getattr(args, "study", "threshold") in (
+        "pipeline",
+        "skip",
+        "threshold-only",
+        "seed-ub",
+        "local-victims",
+    )
     if args.mode == "fused" and (args.threshold_policy == "both" or execution_study):
         cases = {}
         for name, tuning in study_cases(args).items():

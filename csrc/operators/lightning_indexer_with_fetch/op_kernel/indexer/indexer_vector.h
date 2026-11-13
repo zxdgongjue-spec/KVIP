@@ -488,17 +488,32 @@ private:
             }
             DataCopy(reservedChunk.template ReinterpretCast<uint32_t>(), victims, 2048);
             SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-            Simt::VF_CALL<rotating::GatherVictimScores>(Simt::Dim3{256,1,1},
-                reinterpret_cast<__ubuf__ uint32_t*>(reservedChunk.GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint32_t*>(scoreChunk.GetPhyAddr()),
-                reinterpret_cast<const __gm__ uint32_t*>(scoreGm.GetPhyAddr()) + scoreRow *
-                    QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_) / 2);
-            PipeBarrier<PIPE_V>();
-            vector1::ClassifyResidentScores(
-                reinterpret_cast<__ubuf__ uint16_t*>(scoreChunk.GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint16_t*>(reservedChunk.GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_[(query % 2) * 128].GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint16_t*>(hitChunk.GetPhyAddr()), validEnd);
+#if KVIP_RECENT_LOCAL_VICTIMS && !(defined(V9_UBMEM) && V9_UBMEM)
+            if (kvip_recent_index::UseLocalVictims(thresholdReady,
+                    runtimeShape_.resident, validEnd, availableEnd)) {
+                // Threshold() reads but never rearranges mrgValueLocal_. Its
+                // resident prefix is still live until this query is saved;
+                // no Service call can reuse the bank before SaveResident.
+                vector1::ClassifyLocalResidentScores(
+                    reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_.GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ uint16_t*>(reservedChunk.GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_[(query % 2) * 128].GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ uint16_t*>(hitChunk.GetPhyAddr()), validEnd);
+            } else
+#endif
+            {
+                Simt::VF_CALL<rotating::GatherVictimScores>(Simt::Dim3{256,1,1},
+                    reinterpret_cast<__ubuf__ uint32_t*>(reservedChunk.GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ uint32_t*>(scoreChunk.GetPhyAddr()),
+                    reinterpret_cast<const __gm__ uint32_t*>(scoreGm.GetPhyAddr()) + scoreRow *
+                        QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_) / 2);
+                PipeBarrier<PIPE_V>();
+                vector1::ClassifyResidentScores(
+                    reinterpret_cast<__ubuf__ uint16_t*>(scoreChunk.GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ uint16_t*>(reservedChunk.GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_[(query % 2) * 128].GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ uint16_t*>(hitChunk.GetPhyAddr()), validEnd);
+            }
             SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
             DataCopyExtParams copy;
             copy.blockCount = 16; copy.blockLen = 32;

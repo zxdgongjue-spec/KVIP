@@ -24,6 +24,12 @@
 #if KVIP_OPT_LI_REGISTER_PREDICATE != 0 && KVIP_OPT_LI_REGISTER_PREDICATE != 1
 #error "KVIP_OPT_LI_REGISTER_PREDICATE must be 0 or 1"
 #endif
+#ifndef KVIP_RECENT_LOCAL_VICTIMS
+#define KVIP_RECENT_LOCAL_VICTIMS 0
+#endif
+#if KVIP_RECENT_LOCAL_VICTIMS != 0 && KVIP_RECENT_LOCAL_VICTIMS != 1
+#error "KVIP_RECENT_LOCAL_VICTIMS must be 0 or 1"
+#endif
 
 namespace vector1 {
 
@@ -1046,6 +1052,40 @@ __simd_vf__ inline void ClassifyResidentScores(__ubuf__ uint16_t* scores,
         StoreAlign(hits + part, selected);
     }
 }
+
+#if KVIP_RECENT_LOCAL_VICTIMS && !(defined(V9_UBMEM) && V9_UBMEM)
+// The exact Kth path leaves its resident input intact in UB. Classify the
+// compact victim ordinals from that input without a SIMT gather from scoreGM.
+// Validate both halves of each uint32 ID before using its low half as an
+// offset; malformed IDs must neither wrap into the resident bank nor read it
+// out of bounds. The published bitmap is still indexed by victim ordinal.
+__simd_vf__ inline void ClassifyLocalResidentScores(__ubuf__ uint16_t* resident,
+    __ubuf__ uint16_t* victims, __ubuf__ uint16_t* threshold,
+    __ubuf__ uint16_t* hits, uint32_t end) {
+    using namespace AscendC::MicroAPI;
+    auto all = CreateMask<uint16_t, MaskPattern::ALL>();
+    RegTensor<int16_t> sequence;
+    Arange(sequence, int16_t(0));
+    auto& index = reinterpret_cast<RegTensor<uint16_t>&>(sequence);
+    RegTensor<uint16_t> offsets, positions, upper, values, limit, zero;
+    Muls(offsets, index, uint16_t(2), all);
+    Duplicate(zero, uint16_t(0));
+    LoadAlign<uint16_t, LoadDist::DIST_BRC_B16>(limit, threshold);
+    for (uint16_t part = 0; part < 2048; part += 128) {
+        Gather(positions, victims + part * 2, offsets, all);
+        Gather(upper, victims + part * 2 + 1, offsets, all);
+        MaskReg visible, small, selected;
+        CompareScalar<uint16_t, CMPMODE::LT>(visible, positions, uint16_t(end), all);
+        CompareScalar<uint16_t, CMPMODE::EQ>(small, upper, uint16_t(0), all);
+        MaskAnd(visible, visible, small, all);
+        Select(positions, positions, zero, visible);
+        Gather(values, resident, positions, all);
+        Compare<uint16_t, CMPMODE::GT>(selected, values, limit, all);
+        MaskAnd(selected, selected, visible, all);
+        StoreAlign(hits + part, selected);
+    }
+}
+#endif
 
 // Recent scores remain at their physical Index positions. Each 128-token
 // tile overwrites a full 32-byte predicate, including zeroes for future keys.

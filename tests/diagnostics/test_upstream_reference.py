@@ -572,7 +572,7 @@ def test_seed_plan_separates_marker_removal_and_seed_reuse_without_serial(capsys
     assert effect["seed_vs_main_reduction_pct"] == pytest.approx(100 * (1 - 100 / 110))
     compare.print_summary(summary)
     text = capsys.readouterr().out
-    assert "marker_removal=" in text and "seed_reuse=" in text and "seed_vs_main=" in text
+    assert "marker_removal=" in text and "seed_reuse=" in text and "MAIN_GAIN urma p50/mean" in text
     assert "vs_serial" not in text
 
 
@@ -656,3 +656,151 @@ def test_seed_runtime_is_shared_and_all_three_full_oracles_are_required(monkeypa
     assert list(result["cases"]) == ["current", "release", "seed"]
     assert calls == ["allocate", *replay_measure.study_cases(args).values(), ("release", context)]
     assert list(retained["completed_cases"]) == ["current", "release", "seed"]
+
+
+def test_tail_skew_keeps_all_samples_and_reports_p50_and_mean_gains(capsys):
+    reports = _seed_reports()
+    # Nine typical runs and one delayed run reproduce the observed G17 mean
+    # and median. This models a long tail without claiming its physical cause.
+    raw = [465.604] * 9 + [2128.204]
+    main = reports["urma-upstream-fused"]
+    main["timing"] = dict(
+        count=10, min_us=min(raw), p50_us=465.604, mean_us=sum(raw) / 10, max_us=max(raw), samples_us=list(raw)
+    )
+    release = reports["urma-recent-release"]
+    release["timing"].update(mean_us=456.812, p50_us=456.063)
+    summary = compare.summarize(reports, "seed-ub")
+    stored = summary["table"]["urma-upstream-fused"]
+    assert stored["timing"]["samples_us"] == raw
+    assert stored["mean_us"] == pytest.approx(631.864)
+    spread = stored["timing_spread"]
+    assert spread["flagged"] and spread["high_tail_samples"] == 1
+    assert spread["count"] == 10 and spread["max_us"] == 2128.204
+    assert spread["mean_to_p50"] == pytest.approx(631.864 / 465.604)
+    paired = summary["effects"]["urma"]["timing_comparisons"]["release"]
+    assert paired["p50_reduction_pct"] == pytest.approx(100 * (1 - 456.063 / 465.604))
+    assert paired["mean_reduction_pct"] == pytest.approx(100 * (1 - 456.812 / 631.864))
+    assert paired["timing_spread_flagged"] is True
+    compare.print_summary(summary)
+    text = capsys.readouterr().out
+    assert "release=+2.05%/+27.70%" in text
+    assert "TIMING_NOTE tail_spread" in text and "all samples kept, not a significance test" in text
+    line = next(line for line in text.splitlines() if line.startswith("urma-main-resident"))
+    assert all(value in line for value in ("10", "465.604", "631.864", "2128.204"))
+
+
+@pytest.mark.parametrize(
+    "timing,expected",
+    [
+        (dict(p50_us=100, mean_us=101, min_us=98, max_us=104, count=10), False),
+        (dict(p50_us=100, mean_us=120, min_us=98, max_us=140, count=10), True),
+        (dict(p50_us=100, mean_us=105, min_us=98, max_us=160, count=10), True),
+        (dict(p50_us=100, mean_us=100), False),
+    ],
+)
+def test_tail_warning_uses_explicit_rules_without_inventing_missing_extrema(timing, expected):
+    spread = compare.timing_spread(timing)
+    assert spread["flagged"] is expected
+    assert spread["high_tail_samples"] is None
+    assert spread["count"] == timing.get("count")
+    assert spread["max_us"] == timing.get("max_us")
+
+
+def _local_reports():
+    reports = {"urma-upstream-fused": _case(110, main=True)}
+    for name, tuning in replay_measure.study_cases(SimpleNamespace(study="local-victims")).items():
+        reports[f"urma-recent-{name}"] = _case(
+            100 if name == "release" else 95, tuning=tuning | dict(prefetch_limit=512, window_limit=64)
+        )
+    return reports
+
+
+def test_local_victims_changes_only_its_flag_and_uses_main_fusion_as_reference(capsys):
+    cases = replay_measure.study_cases(SimpleNamespace(study="local-victims"))
+    assert cases["release"] | {"recent_local_victims": True} == cases["local"]
+    assert cases["release"]["recent_threshold_only"] is True
+    assert all(cases["release"][key] is False for key in ("recent_skip", "recent_profile", "recent_seed_ub"))
+    summary = compare.summarize(_local_reports(), "local-victims")
+    assert [row["display_name"] for row in summary["table"].values()] == [
+        "urma-main-resident",
+        "urma-release-kth",
+        "urma-local-victims",
+    ]
+    effect = summary["effects"]["urma"]
+    assert "serial_reference" not in effect and "seed_ub_eligibility" not in effect
+    assert effect["local_victims_reduction_pct"] == pytest.approx(5)
+    compare.print_summary(summary)
+    text = capsys.readouterr().out
+    assert "MAIN_GAIN urma p50/mean release=" in text
+    assert "STEP_GAIN urma p50/mean local_victims=+5.00%/+5.00%" in text
+    assert "SEED_UB_ELIGIBILITY" not in text and "SERIAL_REFERENCE_GAIN" not in text
+
+
+@pytest.mark.parametrize("change", ["score", "ordered", "initial", "final", "profile", "seed", "budget", "local"])
+def test_local_victims_never_weakens_oracle_or_changes_another_option(change):
+    reports = _local_reports()
+    row = reports["urma-recent-local"]
+    if change == "score":
+        row["score_comparison"]["status"] = "unchecked"
+    elif change == "ordered":
+        row["selection_comparison"]["ordered_output_sha256"] = "other"
+    elif change in ("initial", "final"):
+        row["threshold_comparison"][change + "_keys"] = [[0]]
+    else:
+        field, value = {
+            "profile": ("recent_profile", True),
+            "seed": ("recent_seed_ub", True),
+            "budget": ("window_limit", 32),
+            "local": ("recent_local_victims", False),
+        }[change]
+        row["tuning"][field] = value
+    with pytest.raises(ValueError):
+        compare.summarize(reports, "local-victims")
+
+
+def test_local_victims_cli_has_two_fused_processes_and_no_profile_or_serial(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "validate_checkout", lambda root, revision: root)
+    base = _arguments(
+        tmp_path,
+        ["--study", "local-victims", "--upstream-root", str(tmp_path / "main"), "--upstream-revision", REVISION],
+    )
+    for extra in (["--diagnostic-replays", "1"], ["--transports", "both"]):
+        with pytest.raises(SystemExit):
+            compare.arguments(base + extra)
+    args, calls, reports = compare.arguments(base), [], _local_reports()
+
+    def child(command, **kwargs):
+        calls.append(command)
+        parsed = replay.arguments(command[4:])
+        assert parsed.mode == "fused" and parsed.diagnostic_replays == 0
+        assert "--serial-workers" not in command
+        if parsed.upstream_root:
+            result = reports["urma-upstream-fused"]
+        else:
+            assert parsed.study == "local-victims" and parsed.threshold_policy == "both"
+            with pytest.raises(SystemExit):
+                replay.arguments(command[4:] + ["--diagnostic-replays", "1"])
+            result = {"cases": {name: reports[f"urma-recent-{name}"] for name in ("release", "local")}}
+        parsed.output.write_text(json.dumps(result))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(compare.subprocess, "run", child)
+    monkeypatch.setattr(compare, "source_commit", lambda: "feature")
+    result = compare.run(args)
+    assert len(calls) == 2 and len(result["table"]) == 3
+    assert len(list(args.result_dir.glob("*.json"))) == 3
+
+
+def test_local_victims_exports_are_required_and_match_native_settings():
+    from kvip.diagnostics.fused_replay import validate_fused_tuning, verify_build_options
+
+    options = dict(recent_threshold_only=True, recent_local_victims=True)
+    assert validate_fused_tuning(options, "urma") == options
+    with pytest.raises(ValueError, match="only by URMA"):
+        validate_fused_tuning(options, "ubmem")
+    with pytest.raises(ValueError, match="requires recent_threshold_only"):
+        validate_fused_tuning(dict(recent_local_victims=True), "urma")
+    with pytest.raises(AttributeError, match="kvip_recent_local_victims"):
+        verify_build_options(SimpleNamespace(), {"recent_local_victims": True})
+    with pytest.raises(RuntimeError, match="recent_local_victims=True"):
+        verify_build_options(SimpleNamespace(kvip_recent_local_victims=lambda: 0), {"recent_local_victims": True})
