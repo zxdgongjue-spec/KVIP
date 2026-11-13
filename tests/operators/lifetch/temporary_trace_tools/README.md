@@ -241,3 +241,41 @@ in check mode, rather than relying on the compact workload to force collisions.
 The fixture manifest identifies `compact_builtin_v1`; previous benchmark numbers
 from the controlled fixture must not be interpreted as an operator regression
 comparison against this new workload.
+
+### Convert old real captures into executable snapshots
+
+```bash
+python tests/operators/lifetch/temporary_trace_tools/convert_replay.py \
+  /tmp/lifetch-old-converted-v2 --output /tmp/lifetch-real-replay
+```
+
+This consumes the existing lossless bundles; it does not require recapturing Q
+or Index. Each `capture-NNNNN/manifest.json` is a separate executable snapshot.
+The converter removes padded requests, preserves FP8/BF16 operand bits, selects
+owner-specific cache rows and packed queries, retains hot validity/LRU/ABC bounds,
+and reconstructs BF16 scores on CPU. It checks captured logical TopK against
+those scores, then tests the replay loader, logical remapping, and KV page plan.
+A failed output is marked invalid. `summary.json` lists the actual group and path.
+
+These are explicitly `lifetch_legacy_replay_snapshot`, not fabricated schema-4
+service captures. Request labels are local to a snapshot. Only source range
+`1:1` is accepted, and different snapshots must be run independently.
+Original KV payloads, DDR validity and page sharing were not captured: replay
+uses synthetic identity C8 payloads and independent published pages. Timing is
+therefore real-Q/Index snapshot timing under that reconstructed transport setup,
+not a reproduction of original service traffic or temporal cache evolution.
+
+```bash
+snapshot=/tmp/lifetch-real-replay/capture-00000
+group=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["metadata"]["group"])' "$snapshot/manifest.json")
+python tests/operators/lifetch/test_lifetch.py bench \
+  --transport urma --device 4 \
+  --kvaf-root /vllm-workspace/vllm-ascend/third_party/KVAF \
+  --kvaf-server 127.0.0.1:28885 \
+  --input real --trace-root "$snapshot" --group "$group" \
+  --round-range 1:1 --warmup 4 --iterations 20 --timeout-seconds 600
+```
+
+Both transport adapters consume the same replay assembly. For UBmem, use
+`--transport ubmem` and the existing UBmem KVAF root/server. Local CPU regression
+covers conversion and input validation; real transport execution requires NPU.

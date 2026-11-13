@@ -234,3 +234,54 @@ def test_compact_generator_needs_no_profile_and_is_reproducible():
     assert not np.array_equal(first['query'], generate(8192, seed=18)['query'])
     with pytest.raises(ValueError):
         generate(1)
+
+
+def test_legacy_executable_replay_preserves_real_bits_and_padding(tmp_path):
+    from real_fetch_inputs import prepare_full_chain_fixture
+    from convert_replay import convert as replay_convert
+    from replay_inputs import ReplaySequence, ReplayPagePlan
+    from trace_inputs import load_score_capture
+    root = tmp_path/'fixture'
+    prepare_full_chain_fixture(root, 8192, 4096, 10, index_heads=32)
+    def array(index, dtype, shape):
+        return np.fromfile(root/f'arg{index}.bin', dtype).reshape(shape)
+    order = np.load(root/'physical_to_logical.npy')
+    scores = np.load(root/'logical_scores.npy')
+    top = np.argpartition(scores, -2048, axis=1)[:, -2048:]
+    q = array(0, np.uint8, (4, 32, 128))
+    keys = array(1, np.uint8, (8192, 128))
+    source = tmp_path/'legacy.pt'
+    torch.save(dict(metadata=dict(schema=1, sample=0, group=3), before=dict(
+        query=torch.from_numpy(np.concatenate((q, np.zeros_like(q)))),
+        keys=torch.from_numpy(np.stack((np.zeros_like(keys), keys))),
+        key_scale=torch.from_numpy(np.stack((np.zeros(8192, np.float32), array(4, np.float32, (8192,))))),
+        weights=torch.from_numpy(np.tile(array(2, np.float32, (4,32)), (2,1))).to(torch.bfloat16),
+        query_scale=torch.from_numpy(np.tile(array(3, np.float32, (4,32)), (2,1))),
+        row_owners=torch.tensor([1,-1]), query_valid=torch.tensor([1,1,1,1,0,0,0,0]),
+        unpack_indices=torch.arange(8), logical_ids=torch.from_numpy(np.stack((order,order))),
+        hot_valid=torch.ones(2,4096,dtype=torch.int32),
+        query_ends=torch.full((8,),8192), tail_bounds=torch.tensor([[8192,8192],[0,0]]),
+        lru_slots=torch.arange(2048).repeat(2,1)),
+        after=dict(logical_topk=torch.from_numpy(np.stack((top,np.full_like(top,-1)))))), source)
+    bundle = tmp_path/'bundle'
+    convert(source,bundle)
+    output = tmp_path/'replay'
+    report = replay_convert(bundle,output)
+    assert report['batch'] == 1 and report['group'] == 3
+    capture = load_score_capture(output)
+    np.testing.assert_array_equal(capture.arrays['real.keys'][0], keys)
+    np.testing.assert_array_equal(capture.arrays['real.query'][0], q)
+    sequence = ReplaySequence(output,3,(1,1))
+    first = next(iter(sequence))
+    first.validate_topk(top[None].astype(np.int32))
+    replay_keys, replay_scales, valid = first.index_for_layout(first.captured_layout)
+    np.testing.assert_array_equal(replay_keys[0], keys)
+    assert ReplayPagePlan(sequence).page_count == 64
+    with pytest.raises(ValueError, match='independent'):
+        ReplaySequence(output,3,(1,2))
+    with pytest.raises(ValueError, match='group'):
+        ReplaySequence(output,0,(1,1))
+    with (output/'inputs.npz').open('ab') as stream:
+        stream.write(b'corruption')
+    with pytest.raises(ValueError, match='checksum'):
+        load_score_capture(output)

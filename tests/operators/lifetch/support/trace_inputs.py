@@ -73,7 +73,12 @@ def load_score_capture(manifest_path, *, require_real=True):
     if path.is_dir():
         path /= 'manifest.json'
     manifest = json.loads(path.read_text())
-    if (manifest.get('schema_version') != 4
+    legacy = manifest.get('kind') == 'lifetch_legacy_replay_snapshot'
+    if legacy:
+        if (manifest.get('schema_version') != 1 or manifest.get('status') != 'complete'
+                or manifest.get('provenance', {}).get('identity_scope') != 'independent_snapshot_only'):
+            raise ValueError('Invalid legacy executable snapshot')
+    elif (manifest.get('schema_version') != 4
             or manifest.get('kind') != 'kvaf_decode_score_trace'
             or manifest.get('content') != 'scores'
             or manifest.get('status') != 'complete'
@@ -92,6 +97,10 @@ def load_score_capture(manifest_path, *, require_real=True):
     if archive.stat().st_size != description['bytes'] or digest != description['sha256']:
         raise ValueError(f'Trace archive size/checksum differs: {archive}')
     expected = BASE_ARRAYS | SCORE_ARRAYS | (REAL_ARRAYS if real else frozenset())
+    if legacy:
+        if not real:
+            raise ValueError('Legacy replay requires real operands')
+        expected = REAL_ARRAYS | {name for name in BASE_ARRAYS if name.startswith('pre.')} | {'post.topk', 'post.score_keys'}
     with np.load(archive, allow_pickle=False) as source:
         if set(source.files) != expected or set(manifest['arrays']) != expected:
             raise ValueError('Missing or unexpected capture arrays')

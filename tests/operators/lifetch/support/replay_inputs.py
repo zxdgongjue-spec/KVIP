@@ -5,6 +5,8 @@ This layer supplies inputs, not a cache policy. Only the first captured hot/LRU
 state initializes a run. Later Index layouts come from the executing path.
 """
 from dataclasses import dataclass
+import json
+from pathlib import Path
 
 import numpy as np
 
@@ -140,6 +142,15 @@ def assemble_round(references):
 class ReplaySequence:
     """Lazy complete-sequence loader, repeatable without retaining every Q/Index."""
     def __init__(self, root, group, round_range):
+        snapshot = Path(root) / 'manifest.json'
+        if snapshot.is_file() and json.loads(snapshot.read_text()).get('kind') == 'lifetch_legacy_replay_snapshot':
+            if tuple(round_range) != (1, 1):
+                raise ValueError('Legacy snapshots are independent: use --round-range 1:1')
+            capture = load_score_capture(snapshot)
+            if capture.manifest['metadata']['group'] != group:
+                raise ValueError('Requested group differs from legacy snapshot')
+            self.rounds = self.from_snapshot(snapshot).rounds
+            return
         references = select_series(root, group, round_range)
         self.rounds = tuple(tuple(ref for ref in references if ref.source_round == number)
                             for number in range(round_range[0], round_range[1] + 1))
