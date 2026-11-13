@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from reporting import CorrectnessRecorder, timing_summary
 
 
-def measure_graph(torch, call, reset, validate, *, warmup, iterations, diagnose=None):
+def measure_graph(torch, call, reset, validate, *, warmup, iterations, diagnose=None, validate_each=True):
     """Restore outside events; preserve completed samples on numerical failures.
 
     validate must raise RuntimeError/ValueError for unsafe completion or invalid
@@ -39,7 +39,8 @@ def measure_graph(torch, call, reset, validate, *, warmup, iterations, diagnose=
             end.synchronize()
             if step >= warmup:
                 samples.append(start.elapsed_time(end) * 1000)
-            checks.check(f'replay{step}', validate)
+            if validate_each or step == warmup + iterations - 1:
+                checks.check(f'replay{step}', validate)
         if diagnose is not None:
             diagnose(graph, reset, lambda: checks.check('diagnostic', validate))
         return dict(timing=timing_summary(samples), correctness=checks.status,
@@ -49,7 +50,7 @@ def measure_graph(torch, call, reset, validate, *, warmup, iterations, diagnose=
 
 
 def measure_ubmem_serial(torch, torch_npu, runtime, device_table, workspace, storage,
-                         source_cpu, *, batch, history, resident, heads, warmup, iterations, trace_rounds=0, trace_folder=None):
+                         source_cpu, *, batch, history, resident, heads, warmup, iterations, trace_rounds=0, trace_folder=None, reference=None, bench_only=False):
     """Use NativeMtp and KVAF BatchGet before acquiring the fused UBmem lease.
 
     Serial state is independent. Both paths use identical real Q/K/scale tensors,
@@ -68,7 +69,7 @@ def measure_ubmem_serial(torch, torch_npu, runtime, device_table, workspace, sto
     forward[:, :resident] = torch.arange(resident, dtype=torch.int32, device=device)
     session = SimpleNamespace(runtime=runtime, device_table=device_table,
                               cpu_payload=torch.from_numpy(source_cpu.reshape(batch, history, 656)),
-                              batch_get_attempted=False)
+                              batch_get_attempted=False, reference=reference)
     owner = SimpleNamespace(batch=batch, resident_budget=resident, cache_map=forward,
                             lease=None, session=session)
     fixture = dict(
@@ -105,7 +106,7 @@ def measure_ubmem_serial(torch, torch_npu, runtime, device_table, workspace, sto
         from device_trace import collect_native
         collect_native(torch, graph, reset, verify, trace_rounds, trace_folder)
     return measure_graph(torch, call, native.reset, validate, warmup=warmup, iterations=iterations,
-                         diagnose=diagnose if trace_rounds and trace_folder else None)
+                         diagnose=diagnose if trace_rounds and trace_folder else None, validate_each=not bench_only)
 
 
 def measure_sequence(torch, rounds, graphs, reset, prepare, validate, *, warmup, iterations, save):

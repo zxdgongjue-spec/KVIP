@@ -63,3 +63,23 @@ def test_pool_puts_once_and_retains_tables_until_all_cases_complete(tmp_path, mo
     pool.close()
     assert events.count('create') == events.count('shutdown') == 1
     assert sorted(event[1] for event in events if isinstance(event, tuple) and event[0] == 'release_table') == [2, 4]
+
+
+def test_native_payload_check_uses_device_reference_and_detects_corruption():
+    from native_mtp import NativeMtp
+    native = NativeMtp.__new__(NativeMtp)
+    native.torch = torch
+    native.batch, native.hot, native.token_bytes, native.source_tokens = 1, 2048, 656, 2048
+    selected = torch.arange(2048).repeat(1, 4, 1)
+    native.destinations = selected.clone()
+    native.forward = torch.arange(2048).reshape(1, -1)
+    native.counts = torch.tensor([0, 0])
+    reference = torch.ones((1, 2048, 656), dtype=torch.uint8)
+    native.output = reference.clone().reshape(-1, 656)
+    # Deliberately different CPU data proves validation uses the retained reference.
+    native.owner = SimpleNamespace(session=SimpleNamespace(reference=reference, cpu_payload=torch.zeros_like(reference)))
+    assert native.verify(selected) == [0, 0]
+    native.output[100, 655] = 0
+    with pytest.raises(ValueError, match='payload_mismatch'):
+        native.verify(selected)
+    assert reference[0, 100, 655] == 1

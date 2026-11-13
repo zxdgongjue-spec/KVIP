@@ -127,6 +127,7 @@ class NativeFetchSession:
             borrowed = shared_pool.borrow(torch, device, batch, candidate_tokens, npu_core_count)
             self.runtime, self.table = borrowed.runtime, borrowed.table
             self.cpu_payload, self.device_table = borrowed.cpu_payload, borrowed.device_table
+            self.reference = borrowed.reference
         else:
             self.runtime = kvaf.NpuRuntime(
                 str(get_kernel),

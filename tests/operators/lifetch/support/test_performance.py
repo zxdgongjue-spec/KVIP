@@ -101,3 +101,15 @@ def test_sequence_persists_timing_before_unsafe_validation_failure():
     assert len(saved) == 1 and saved[0]['elapsed_us'] == 12.
     assert saved[0]['correctness'] == 'NOT_CHECKED'
     assert events.count('replay') == 1
+
+
+def test_bench_validation_is_bounded_independent_of_iterations():
+    torch, events = fake_device()
+    result = measure_graph(torch, lambda: None, lambda: events.append('restore'),
+                           lambda: events.append('check'), warmup=4, iterations=50,
+                           validate_each=False)
+    assert result['timing']['samples'] == 50
+    assert events.count('replay') == 54
+    assert events.count('check') == 2  # Before the timing loop and after its last replay.
+    assert events.count('restore') == 56
+    assert result['correctness'] == 'PASS'

@@ -2,6 +2,7 @@
 
 import json
 import traceback
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -206,7 +207,9 @@ def run(args, run_dir):
                     lines.append(f"FIX A/B {r['query']}: before={r['p50_us']:.3f} after={after['p50_us']:.3f} us change={(after['p50_us']/r['p50_us']-1)*100:+.2f}%")
             lines.append('Q1-Q4 are individual queries; Q4_all runs all four concurrently. Zero-entry cases measure launch/control only.')
             line = '\n'.join(lines)
-            summaries.append(line)
+            if report.get('wall_costs'):
+            line += "\nBENCH WALL COSTS seconds=" + json.dumps(report['wall_costs'])
+        summaries.append(line)
             (run_dir / 'cases.log').write_text('\n'.join(summaries) + '\n')
             print(line, flush=True)
             continue
@@ -329,14 +332,26 @@ def run_device(
             raise AssertionError(f"native Get work differs from logical misses: {counts[:-1]} != {expected}")
         state["native_misses"] = counts[:-1]
 
+    bench_only = getattr(args, "mode", None) == "bench"
+    wall_costs = {}
     full_trace = {}
     read_samples = {}
     split_samples = {}
 
     def measure(call, reset, check, read_label=None, timing_name=None):
-        raw_check = check
+        costs = dict(reset_s=0., validation_s=0., replay_wait_s=0., completion_s=0., reads_s=0.)
+        raw_check, raw_reset = check, reset
         def check():
-            return correctness.check(state["check_phase"], raw_check)
+            began = time.perf_counter()
+            try:
+                return correctness.check(state["check_phase"], raw_check)
+            finally:
+                costs['validation_s'] += time.perf_counter() - began
+        def reset():
+            began = time.perf_counter()
+            raw_reset()
+            stream.synchronize()
+            costs['reset_s'] += time.perf_counter() - began
         state["check_phase"] = f"timing {read_label or getattr(call, '__name__', 'operation')}"
         reset()
         call()
@@ -357,14 +372,27 @@ def run_device(
             reset()
             stream.synchronize()
             start, end = (torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True))
+            began = time.perf_counter()
             start.record(stream)
             graph.replay()
             end.record(stream)
             end.synchronize()
+            costs['replay_wait_s'] += time.perf_counter() - began
             if step >= args.warmup:
                 samples.append(start.elapsed_time(end) * 1000)
-            check()
-            if read_label and step >= args.warmup:
+            if not bench_only or step == args.warmup + args.iterations - 1:
+                check()
+            elif read_label == "prototype_with_update":
+                began = time.perf_counter()
+                verify(True, completion_only=True)
+                costs['completion_s'] += time.perf_counter() - began
+            elif bench_only:
+                began = time.perf_counter()
+                probe = owner.session.runtime.acquire_fused_batch_get_context(native.output, stream)
+                owner.session.runtime.release_fused_batch_get_context(probe, stream)
+                costs["completion_s"] += time.perf_counter() - began
+            if read_label and step >= args.warmup and (not bench_only or step == args.warmup + args.iterations - 1):
+                began = time.perf_counter()
                 split_samples.setdefault(read_label, []).append(dict(state["completion"]))
                 read_samples.setdefault(read_label, []).append(
                     actual_reads(
@@ -374,6 +402,10 @@ def run_device(
                         r,
                     )
                 )
+                costs['reads_s'] += time.perf_counter() - began
+        wall_costs[timing_name or read_label or 'operation'] = costs
+        atomic_json(folder / 'bench_wall_costs.json', wall_costs)
+        print(f'BENCH WALL COSTS {timing_name or read_label}: {json.dumps(costs)}', flush=True)
         measured = timing_summary(samples)
         completed_timings[timing_name or read_label or getattr(call, '__name__', 'operation')] = measured
         atomic_json(folder / 'completed_timings.json', dict(
@@ -419,8 +451,9 @@ def run_device(
     timings = {"native_chain": measure(native_call, native.reset, native_check, timing_name="native_chain")}
     # The previous native chain has prepared stable LIDU descriptors and maps.
     # Restore only the output so that the captured graph contains KVAF Get alone.
-    timings["native_get_only"] = measure(
-        native.fetch, lambda: native.output.copy_(native.initial_payload), native_check, timing_name="native_get_only")
+    if not bench_only:
+        timings["native_get_only"] = measure(
+            native.fetch, lambda: native.output.copy_(native.initial_payload), native_check, timing_name="native_get_only")
     reference = state["native_topk"].cpu().reshape(b, 4, 2048).numpy()
     owner.acquire()
     rotating = launch_module.LIFetchBinding(
@@ -469,6 +502,8 @@ def run_device(
         pipeline.counter_clock_mhz = counter_clock_mhz
         print(f"GetSystemCycle calibration: {counter_clock_mhz:.2f} MHz (independent long graph event)", flush=True)
     saved = [arguments[i].clone() for i in (1, 4, 13)]
+    update.set_order(initial_orders)
+    order_snapshot = (rotating.lru_slots.clone(), rotating.reserved_hot.clone())
 
     def reset():
         if owner.in_flight:
@@ -477,14 +512,18 @@ def run_device(
             arguments[i].copy_(seed)
         update.logical.copy_(update.identity)
         rotating.hot_valid.fill_(1)
-        update.set_order(initial_orders)
+        if bench_only:
+            rotating.lru_slots.copy_(order_snapshot[0])
+            rotating.reserved_hot.copy_(order_snapshot[1])
+        else:
+            update.set_order(initial_orders)
         owner.reset()
         owner.mark_launched()
 
     def full():
         pipeline()
 
-    def verify(updated=False, persistent=True):
+    def verify(updated=False, persistent=True, completion_only=False):
         rows = rotating.rows.cpu().numpy()
         posts = rotating.final_posts.cpu().numpy()
         statuses = rotating.row_status.cpu().numpy()
@@ -536,6 +575,8 @@ def run_device(
         owner.mark_completed(completion_verified=True)
         if updated:
             update.check_capacity()
+        if completion_only:
+            return
         selected = topk.cpu().numpy()
         if np.any(selected < 0) or np.any(selected >= h):
             raise RuntimeError("TopK contains out-of-range positions")
@@ -552,13 +593,20 @@ def run_device(
                 raise AssertionError("Service logical TopK output differs from pre-update IDs")
             if not torch.equal(update.slot_output.cpu().reshape(b, -1).long(), slots):
                 raise AssertionError("Service SFA slot output differs from Fetch destinations")
-        output = owner.output.cpu()
+        reference_device = getattr(owner.session, 'reference', None)
+        output = owner.output if reference_device is not None else owner.output.cpu()
         for row in range(b):
             if slots[row].min() < 0 or slots[row].max() >= (r if persistent else owner.output.shape[1]):
                 raise AssertionError("slot outside cache")
-            actual = output[row, slots[row]]
-            expected = owner.session.cpu_payload[row, ids[row].reshape(-1)]
+            if reference_device is not None:
+                actual = output[row, slots[row].to(device)]
+                expected = reference_device[row, torch.from_numpy(ids[row].reshape(-1)).to(device)]
+            else:
+                actual = output[row, slots[row]]
+                expected = owner.session.cpu_payload[row, ids[row].reshape(-1)]
             if not torch.equal(actual, expected):
+                actual, expected = actual.cpu(), expected.cpu()
+                output = output.cpu()
                 mismatches = (actual != expected).reshape(actual.shape[0], -1).any(dim=1)
                 positions = mismatches.nonzero().flatten()[:4].tolist()
                 lru = rotating.lru_slots[row].cpu().tolist()
@@ -613,11 +661,17 @@ def run_device(
         """Catch stale KV beyond the current TopK, including displaced slots."""
         valid = rotating.hot_valid.cpu().numpy().reshape(b, r)
         logical = update.logical.cpu().long()
-        hot_kv = owner.output[:, :r].cpu()
+        reference_device = getattr(owner.session, 'reference', None)
+        hot_kv = owner.output[:, :r] if reference_device is not None else owner.output[:, :r].cpu()
         for row in range(b):
             mask = torch.from_numpy(valid[row] != 0)
-            expected = owner.session.cpu_payload[row, logical[row, :r][mask]]
-            if not torch.equal(hot_kv[row, mask], expected):
+            if reference_device is not None:
+                expected = reference_device[row, logical[row, :r][mask].to(device)]
+                actual = hot_kv[row, mask.to(device)]
+            else:
+                expected = owner.session.cpu_payload[row, logical[row, :r][mask]]
+                actual = hot_kv[row, mask]
+            if not torch.equal(actual, expected):
                 raise AssertionError(f"valid hot slot has mismatched Index/KV owner: request={row}")
 
     def check_pipeline(orders, cold_start=False, label="regular"):
@@ -666,16 +720,18 @@ def run_device(
         return result
 
     snapshot_changes = check_pipeline(initial_orders)
-    cold_start_changes = check_pipeline(initial_orders, cold_start=True, label="cold-start")
+    cold_start_changes = (None if bench_only else
+                          check_pipeline(initial_orders, cold_start=True, label="cold-start"))
     unlucky = []
     for row in range(b):
         selected_hot = list(dict.fromkeys(initial_selected[row].reshape(-1).tolist()))
         selected_hot = [x for x in selected_hot if x < r]
         seen = set(selected_hot)
         unlucky.append(selected_hot + [x for x in initial_orders[row] if x not in seen])
-    hot_case = check_pipeline(unlucky, label="hot-victim-collision")
+    hot_case = (dict(hot_changes=None, first_window_fetches=None) if bench_only else
+                check_pipeline(unlucky, label="hot-victim-collision"))
     restored_hot = hot_case["hot_changes"]
-    if args.prefetch_tokens and args.miss_percent < 100:
+    if not bench_only and args.prefetch_tokens and args.miss_percent < 100:
         def check_collision_coverage():
             assert hot_case["first_window_fetches"] and restored_hot, (
                 f"First window did not Fetch former hot candidates into LRU slots: {hot_case}")
@@ -757,37 +813,39 @@ def run_device(
         if not (bitmap == 255).all():
             raise AssertionError("Round init unexpectedly rewrote producer-owned predicates")
 
-    timings["round_init"] = measure(lambda: rotating._call("init"), init_reset, init_check, timing_name="round_init")
+    if not bench_only:
+        timings["round_init"] = measure(lambda: rotating._call("init"), init_reset, init_check, timing_name="round_init")
     timings["prototype_with_update"] = measure(full, reset, lambda: verify(True), read_label="prototype_with_update")
-    reset()
-    stream.synchronize()
-    graph = torch.npu.NPUGraph()
-    owner.graphs.append(graph)
-    with torch.npu.graph(graph, stream=capture):
-        full()
-    capture.synchronize()
-    for step in range(3):
-        next_orders = []
-        if step:
-            owner.mark_launched()
-        state["before_logical"] = update.logical.cpu().numpy().copy()
-        graph.replay()
+    if not bench_only:
+        reset()
         stream.synchronize()
-        verify(True)
-        if args.streaming:
-            verify_all_valid_hot()
-        for row, p in enumerate(policies):
-            touched = state["slots"][row]
-            p.commit(touched[touched < r].astype(np.int32))
-            order = []
-            slot = int(p.head[0])
-            for _ in range(r):
-                order.append(slot)
-                slot = int(p.next[0, slot])
-            next_orders.append(order)
-        update.set_order(next_orders)
-    graph.reset()
-    owner.graphs.remove(graph)
+        graph = torch.npu.NPUGraph()
+        owner.graphs.append(graph)
+        with torch.npu.graph(graph, stream=capture):
+            full()
+        capture.synchronize()
+        for step in range(3):
+            next_orders = []
+            if step:
+                owner.mark_launched()
+            state["before_logical"] = update.logical.cpu().numpy().copy()
+            graph.replay()
+            stream.synchronize()
+            verify(True)
+            if args.streaming:
+                verify_all_valid_hot()
+            for row, p in enumerate(policies):
+                touched = state["slots"][row]
+                p.commit(touched[touched < r].astype(np.int32))
+                order = []
+                slot = int(p.head[0])
+                for _ in range(r):
+                    order.append(slot)
+                    slot = int(p.next[0, slot])
+                next_orders.append(order)
+            update.set_order(next_orders)
+        graph.reset()
+        owner.graphs.remove(graph)
     forward = np.full((b, h), -1, np.int32)
     logical = update.logical.cpu().numpy()
     for row in range(b):
@@ -827,13 +885,13 @@ def run_device(
         correctness_failures=correctness.failures,
         boundary_coverage=boundary_phases,
         counter_clock_mhz=counter_clock_mhz,
-        timing=timings,
+        timing=timings, wall_costs=wall_costs,
         full_trace=full_trace,
         fetch_only=fetch_only,
         read_samples=read_samples,
         split_samples=split_samples,
         sfa=sfa,
-        stateful_rounds=3,
+        stateful_rounds=0 if bench_only else 3,
         native_misses_per_request=state["native_misses"],
         cache_update=dict(
             swap_capacity_per_request=update.max_swaps,
@@ -843,7 +901,8 @@ def run_device(
             prefetch_tokens=args.prefetch_tokens,
             former_hot_changes_checked=restored_hot,
             first_window_fetches_checked=hot_case["first_window_fetches"],
-            scope="Actual streaming pipeline verified; no temporary KV slots; zero KV copy",
+            scope=("Bench regular checks; boundary/stateful checks belong to check mode" if bench_only else
+                   "Actual streaming pipeline verified; no temporary KV slots; zero KV copy"),
         ),
         kernel="KVIP/csrc/operators/lightning_indexer_with_fetch; preserved core tiling, direct LRU interface",
         scope="fixed Q4 shared history; graph kernel and AIV maintenance separately; no ABC growth",

@@ -7,6 +7,7 @@ import ctypes
 import hashlib
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -113,7 +114,7 @@ def check_shape(
         borrowed = shared_pool.borrow(torch, device, batch, history, 2)
         runtime, table, device_table = borrowed.runtime, borrowed.table, borrowed.device_table
         source_cpu = borrowed.cpu_payload.numpy().reshape(-1, token_bytes)
-        source = borrowed.cpu_payload.to(device).reshape(-1, token_bytes)
+        source = borrowed.reference.reshape(-1, token_bytes)
     else:
         source_cpu = np.concatenate([payload(owner, np.arange(history), token_bytes) for owner in range(1, batch + 1)])
         source = torch.from_numpy(source_cpu).to(device)
@@ -172,6 +173,7 @@ def check_shape(
                 torch, torch_npu, runtime, device_table, workspace, storage, source_cpu,
                 batch=batch, history=history, resident=resident, heads=shape.heads,
                 warmup=warmup, iterations=iterations, trace_rounds=trace_rounds,
+                reference=source.view(batch, history, token_bytes), bench_only=shared_pool is not None,
                 trace_folder=(result_output / f"b{batch}-h{history}-r{resident}-w{token_bytes}-p{prefetch_tokens}"
                               if result_output else None))
             if result_output:
@@ -234,7 +236,7 @@ def check_shape(
         else:
             forward = LIFetchForward(rotating, update)
 
-        def verify_outputs(owners, *, phase, counts=None, padding=False):
+        def verify_outputs(owners, *, phase, counts=None, padding=False, completion_only=False):
             stream.synchronize()
             index_status = update.status.cpu().tolist()
             if any(index_status):
@@ -254,6 +256,8 @@ def check_shape(
             if (np.any(counters[:, 0]) or not np.array_equal(counters[:, 1], counters[:, 2])
                     or not np.array_equal(counters[:, 3], counters[:, 4])):
                 raise RuntimeError(f"UBmem copy failed or incomplete: {counters.tolist()}")
+            if completion_only:
+                return
             assert np.all(counters[:, 1] <= prefetch_tokens), "Prefetch exceeded its total budget"
             epochs = rotating.rows.cpu().numpy()[:, 16 : 16 + rotating.rounds]
             assert np.all(epochs <= max(1, prefetch_tokens // shape.intermediate_fetches)), (
@@ -288,9 +292,12 @@ def check_shape(
                 # Verify every valid persistent hot entry, not just selected rows.
                 hot_valid = storage.hot_valid[owner].cpu().numpy() != 0
                 hot_slots = np.flatnonzero(hot_valid)
-                actual_hot = output[owner, :resident].cpu().numpy()[hot_slots]
-                expected_hot = payload(owner, ids[owner, hot_slots], token_bytes)
-                if not np.array_equal(actual_hot, expected_hot):
+                hot_indices = torch.from_numpy(hot_slots).to(device)
+                actual_device = output[owner, hot_indices]
+                expected_device = source.view(batch, history, token_bytes)[owner - 1,
+                    torch.from_numpy(ids[owner, hot_slots]).to(device)]
+                if not torch.equal(actual_device, expected_device):
+                    actual_hot, expected_hot = actual_device.cpu().numpy(), expected_device.cpu().numpy()
                     difference = np.argwhere(actual_hot != expected_hot)[0]
                     raise AssertionError(
                         f"Hot slot/Index mismatch: phase={phase} owner={owner} "
@@ -301,10 +308,12 @@ def check_shape(
                         "LI selected the wrong TopK set"
                     )
                     selected_slots = torch.from_numpy(slots[output_row].astype(np.int64)).to(device)
-                    actual = torch.index_select(output[owner], 0, selected_slots).cpu().numpy()
-                    expected = payload(owner, logical[output_row], token_bytes)
-                    mismatch = np.flatnonzero(np.any(actual != expected, axis=1))
-                    if mismatch.size:
+                    actual_device = torch.index_select(output[owner], 0, selected_slots)
+                    expected_device = source.view(batch, history, token_bytes)[owner - 1,
+                        torch.from_numpy(logical[output_row].astype(np.int64)).to(device)]
+                    if not torch.equal(actual_device, expected_device):
+                        actual, expected = actual_device.cpu().numpy(), expected_device.cpu().numpy()
+                        mismatch = np.flatnonzero(np.any(actual != expected, axis=1))
                         k = int(mismatch[0])
                         byte = int(np.flatnonzero(actual[k] != expected[k])[0])
                         raise AssertionError(
@@ -467,53 +476,63 @@ def check_shape(
             forward()
             graph.capture_end()
         lease.retain_graph(graph)
-        # Replay after changing active row ownership. Index rows and output HBM
-        # belong to stable owners, not capture-time packed row positions.
-        owners = list(range(batch, 0, -1))
-        workspace.inputs.prepare([4] * batch, query_owners=owners)
-        workspace.inputs.query_ends.fill_(history)
-        graph.replay(stream)
-        verify(owners, phase="graph_replay")
-        # Compact TND outputs no longer have the fixed four-row stride of
-        # their source request. Exercise all Q1..Q4 lengths at the requested
-        # batch, including an inactive/padded row when the batch permits it.
-        counts = mixed_query_counts(batch)
-        packed_owners = [owner if count else 0 for owner, count in zip(owners, counts)]
-        workspace.inputs.prepare(counts, query_owners=packed_owners)
-        ends = torch.tensor(
-            [[history if q < count else 0 for q in range(4)] for count in counts],
-            dtype=torch.int32, device=device,
-        )
-        workspace.inputs.query_ends.view(batch, 4).copy_(ends)
-        graph.replay(stream)
-        verify(packed_owners, phase="packed_queries", counts=counts)
-        # All-padding warmup is legal: owner zero can repeat in inactive rows.
-        workspace.inputs.prepare([0] * batch, query_owners=[0] * batch)
-        workspace.inputs.query_ends.zero_()
-        padding_before = [tensor.clone() for tensor in measured_buffers]
-        graph.replay(stream)
-        verify([], phase="padding", padding=True)
-        def verify_padding_unchanged():
-            assert all(torch.equal(tensor, saved) for tensor, saved in zip(measured_buffers, padding_before)), "Padding changed persistent state"
-            assert not rotating.rows[:, 9].cpu().count_nonzero() and not rotating.final_posts[:, :, 0].cpu().count_nonzero(), "Padding issued fetches"
-        padding_ok = checks.check('padding_ownership', verify_padding_unchanged)
-        boundary_phases['padding'] = 'PASS' if padding_ok else 'FAIL'
-        if check_case:
-            checks.check('boundary trigger coverage', lambda: require_boundary(check_case, boundary_phases))
-            atomic_json(result_output / f'b{batch}-h{history}-r{resident}-w{token_bytes}-p{prefetch_tokens}' / 'boundary_coverage.json', boundary_phases)
+        if shared_pool is None:
+            # Replay after changing active row ownership. Index rows and output HBM
+            # belong to stable owners, not capture-time packed row positions.
+            owners = list(range(batch, 0, -1))
+            workspace.inputs.prepare([4] * batch, query_owners=owners)
+            workspace.inputs.query_ends.fill_(history)
+            graph.replay(stream)
+            verify(owners, phase="graph_replay")
+            # Compact TND outputs no longer have the fixed four-row stride of
+            # their source request. Exercise all Q1..Q4 lengths at the requested
+            # batch, including an inactive/padded row when the batch permits it.
+            counts = mixed_query_counts(batch)
+            packed_owners = [owner if count else 0 for owner, count in zip(owners, counts)]
+            workspace.inputs.prepare(counts, query_owners=packed_owners)
+            ends = torch.tensor(
+                [[history if q < count else 0 for q in range(4)] for count in counts],
+                dtype=torch.int32, device=device,
+            )
+            workspace.inputs.query_ends.view(batch, 4).copy_(ends)
+            graph.replay(stream)
+            verify(packed_owners, phase="packed_queries", counts=counts)
+            # All-padding warmup is legal: owner zero can repeat in inactive rows.
+            workspace.inputs.prepare([0] * batch, query_owners=[0] * batch)
+            workspace.inputs.query_ends.zero_()
+            padding_before = [tensor.clone() for tensor in measured_buffers]
+            graph.replay(stream)
+            verify([], phase="padding", padding=True)
+            def verify_padding_unchanged():
+                assert all(torch.equal(tensor, saved) for tensor, saved in zip(measured_buffers, padding_before)), "Padding changed persistent state"
+                assert not rotating.rows[:, 9].cpu().count_nonzero() and not rotating.final_posts[:, :, 0].cpu().count_nonzero(), "Padding issued fetches"
+            padding_ok = checks.check('padding_ownership', verify_padding_unchanged)
+            boundary_phases['padding'] = 'PASS' if padding_ok else 'FAIL'
+            if check_case:
+                checks.check('boundary trigger coverage', lambda: require_boundary(check_case, boundary_phases))
+                atomic_json(result_output / f'b{batch}-h{history}-r{resident}-w{token_bytes}-p{prefetch_tokens}' / 'boundary_coverage.json', boundary_phases)
         if iterations:
             workspace.inputs.prepare([4] * batch, query_owners=list(range(1, batch + 1)))
             workspace.inputs.query_ends.fill_(history)
             elapsed = []
+            wall_costs = dict(reset_s=0., replay_wait_s=0., completion_s=0., validation_s=0.)
             for turn in range(warmup + iterations):
+                began = time.perf_counter()
                 for tensor, saved in zip(measured_buffers, initial_state):
                     tensor.copy_(saved)
+                stream.synchronize()
+                wall_costs["reset_s"] += time.perf_counter() - began
                 begin = torch.npu.Event(enable_timing=True)
                 end = torch.npu.Event(enable_timing=True)
+                began = time.perf_counter()
                 begin.record(stream)
                 graph.replay(stream)
                 end.record(stream)
                 end.synchronize()
+                wall_costs["replay_wait_s"] += time.perf_counter() - began
+                began = time.perf_counter()
+                verify_outputs([], phase="bench_completion", completion_only=True)
+                wall_costs["completion_s"] += time.perf_counter() - began
                 if turn >= warmup:
                     elapsed.append(begin.elapsed_time(end) * 1000)
             from reporting import atomic_json, timing_summary
@@ -535,7 +554,11 @@ def check_shape(
                            / "report.json") if result_output else None
             if report_path:
                 atomic_json(report_path, result)
+            began = time.perf_counter()
             verify(list(range(1, batch + 1)), phase="timed_replay")
+            wall_costs["validation_s"] += time.perf_counter() - began
+            result["wall_costs"] = wall_costs
+            print(f"BENCH WALL COSTS fused: {wall_costs}", flush=True)
             result['correctness'] = checks.status
             result['correctness_failures'] = checks.failures
             if report_path:

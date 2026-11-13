@@ -167,3 +167,16 @@ URMA runtime 固定40个worker、每worker两条Jetty；UBmem固定2个worker。
 汇总包含 transport、BS、目标miss%、正确性、mean/p50/p99及按mean计算的改善比例。
 这里是算子链完整图，不是服务TPOT。实际miss和读取数量仍保留在各case报告中。
 设备执行失败会停止后续任务；已完成结果保留，未完成项不能当作性能样本。
+
+### bench 校验与参考 KV
+
+合成 bench 在 HBM 保留与 DDR 内容相同的只读参考 KV（BS16/H131072/C8约1.28 GiB），
+初始化 DDR 时直接从该参考数据 Put。跨case复用参考，不修改模型算子。
+计时前后验证选中KV；正常路径在设备上比较，只获取比较结果，失败才读回字节现场。
+URMA每轮保留队列健康或融合完成状态检查；UBmem融合每轮检查搬运完成计数及Index状态。
+状态恢复仍在计时区间外；候选和预留槽使用HBM快照恢复。
+
+bench只测串行和融合完整图，不重复测Get-only/init-only；不重复执行冷启动、冲突、
+多轮及padding专项，这些继续由check覆盖。读取量只在末次采样统计。
+日志中 `BENCH WALL COSTS` 单位是秒，描述测试框架的恢复、等待及校验成本，
+不是kernel阶段耗时；URMA另存 `bench_wall_costs.json`，UBmem保存在report的wall_costs中。

@@ -119,7 +119,8 @@ class NativeMtp:
         # updated forward map, then check the exported slot set separately.
         exported = self.destinations.cpu().reshape(self.batch, QUERIES, TOPK).long()
         forward = self.forward.cpu().long()
-        output = self.output.cpu().reshape(self.batch, self.hot, self.token_bytes)
+        reference = getattr(self.owner.session, 'reference', None)
+        output = (self.output if reference is not None else self.output.cpu()).reshape(self.batch, self.hot, self.token_bytes)
         counts = self.counts.cpu().tolist()
         if any(count < 0 or count > QUERIES * TOPK for count in counts[:-1]) or counts[-1] != sum(counts[:-1]):
             raise ValueError(f"native_mtp_counts_invalid:{counts}")
@@ -131,8 +132,12 @@ class NativeMtp:
                 expected_slots = slots[q * TOPK : (q + 1) * TOPK]
                 if not self.torch.equal(expected_slots.sort().values, exported[row, q].sort().values):
                     raise ValueError(f"native_mtp_exported_slots_mismatch:row={row}:query={q}")
-            actual = output[row, slots]
-            expected = self.owner.session.cpu_payload[row, ids[row]]
+            if reference is not None:
+                actual = output[row, slots.to(output.device)]
+                expected = reference[row, ids[row].to(output.device)]
+            else:
+                actual = output[row, slots]
+                expected = self.owner.session.cpu_payload[row, ids[row]]
             if not self.torch.equal(actual, expected):
                 raise ValueError(f"native_mtp_payload_mismatch:row={row}")
         return counts

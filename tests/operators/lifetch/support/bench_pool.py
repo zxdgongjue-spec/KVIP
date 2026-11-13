@@ -38,7 +38,8 @@ class BenchPool:
             self.cpu_payload = torch.from_numpy(np.stack([
                 payload(row, np.arange(history)) for row in range(max(self.config.batches))]))
             # Bound staging memory; every DDR page is written exactly once.
-            flat = self.cpu_payload.reshape(capacity, block_bytes)
+            self.reference = self.cpu_payload.to(device)
+            flat = self.reference.reshape(capacity, block_bytes)
             for begin in range(0, capacity, 128):
                 end = min(begin + 128, capacity)
                 source = flat[begin:end].to(device)
@@ -62,7 +63,7 @@ class BenchPool:
             self.tables[batch] = (table, self.runtime.access_table_view(table, device='npu'))
         table, view = self.tables[batch]
         return SimpleNamespace(runtime=self.runtime, table=table,
-                               cpu_payload=self.cpu_payload[:batch],
+                               cpu_payload=self.cpu_payload[:batch], reference=self.reference[:batch],
                                device_table=view)
 
     def release(self):
