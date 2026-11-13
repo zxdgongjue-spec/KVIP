@@ -20,7 +20,7 @@ tests/operators/lifetch/
 
 按职责复用，URMA、UBmem共用输入、校验和报告，执行层保留必要的传输差异。初始化检查并入统一入口，测试调用正式算子。
 
-测试框架自身的CPU回归按相同六个职责放在上一级`tests/operators/test_lifetch_*.py`，不再为每个辅助函数建文件。两个C++ host模型放在`tests/operators/lifetch_models/`，由回归自动编译执行。历史trace转换也由唯一入口的`convert-trace SOURCE --output DIR`调用，实现在workloads中；不启动NPU。
+历史trace转换也由唯一入口的`convert-trace SOURCE --output DIR`调用，实现在workloads中；不启动NPU。
 
 ```bash
 python tests/operators/lifetch/test_lifetch.py <all|check|bench|diagnose> [options]

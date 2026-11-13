@@ -19,11 +19,6 @@ lifetch/
     reporting.py       # JSON、CSV、终端表格
 ```
 
-测试框架自身的 CPU 回归按同样六个职责合并到上一级的
-`tests/operators/test_lifetch_{workloads,execution,correctness,performance,diagnostics,reporting}.py`。
-`tests/operators/lifetch_models/` 的两个 C++ 文件分别验证实际 UBmem 搬运头文件和 host ABI；
-由 CPU 回归自动编译执行，不能用 Python 模型替代，也不是新的人工入口。
-
 ## 准备
 
 在 KVIP 根目录运行，使用已构建的 KVIP/KVAF 和已启动的对应 CPU service：
@@ -122,11 +117,4 @@ python tests/operators/lifetch/test_lifetch.py bench --input real \
   --transport urma --device 4 --kvaf-server 127.0.0.1:28885
 ```
 
-## 本地回归
-
-```bash
-python -m pytest tests/operators/test_lifetch_*.py -q
-```
-
-这些测试覆盖配置、输入格式/转换、状态和数值校验、计时边界、资源释放、报告及 C++ host 模型。
-本地回归不替代 NPU 上的正确性和性能验收。每次运行结果由唯一目录保存，失败也保留已完成 case。
+每次运行结果由唯一目录保存，失败也保留已完成 case。
