@@ -52,6 +52,16 @@ def prepare_full_chain_fixture(root, history, resident, miss_percent, prefetch_d
     order = np.load(root / "physical_to_logical.npy")
     for query in range(4):
         columns = np.arange(index_heads) % 32 + query * 32
+        # Per-window paired allocation can give the two queries different
+        # totals. Enforce the requested per-query count before choosing hot
+        # winners, especially at 100% where an excess creates a cutoff tie.
+        cold_rows = np.flatnonzero(encoded[resident:, query * 32]) + resident
+        if len(cold_rows) > target:
+            encoded[np.ix_(cold_rows[target:], np.unique(columns))] = 0
+        elif len(cold_rows) < target:
+            empty = np.flatnonzero(encoded[resident:, query * 32] == 0) + resident
+            take = np.linspace(0, len(empty) - 1, target - len(cold_rows), dtype=int)
+            encoded[np.ix_(empty[take], np.unique(columns))] = 0x44
         cold = np.count_nonzero(encoded[resident:, query * 32])
         candidates = np.flatnonzero(encoded[resident:, query * 32] == 0) + resident
         if prefetch_decoys > len(candidates):
