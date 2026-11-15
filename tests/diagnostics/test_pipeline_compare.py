@@ -138,6 +138,27 @@ def test_admission_variants_check_controls_and_report_matching_drift(tmp_path, m
         compare.summarize(args, reports, compare.file_digest(args.snapshot / "manifest.json"))
 
 
+def test_inverse_mapping_pairs_use_matching_same_arena_controls(tmp_path, monkeypatch, capsys):
+    variants = ["ready-batch4", "saturated-skip", "inverse-map", "inverse-map-skip",
+                "capacity", "capacity-inverse-map", "ready-batch4-end"]
+    args = _arguments(tmp_path, monkeypatch, variants)
+    reports = _reports(args)
+    for name, value in zip(variants, (100, 90, 80, 81, 70, 63, 99)):
+        timing = reports["candidate-" + name]["timing"]
+        timing.update(mean_us=value, p50_us=value, min_us=value, max_us=value,
+                      samples_us=[value] * 3)
+    summary = compare.summarize(args, reports, compare.file_digest(args.snapshot / "manifest.json"))
+    pairs = summary["inverse_mapping_pairs"]
+    assert pairs["inverse-map"]["mean_reduction_pct"] == pytest.approx(20)
+    for name in ("inverse-map-skip", "capacity-inverse-map"):
+        assert pairs[name]["mean_reduction_pct"] == pytest.approx(10)
+        assert pairs[name]["p50_reduction_pct"] == pytest.approx(10)
+    compare.print_summary(summary, brief=True)
+    output = capsys.readouterr().out
+    assert "PAIR inverse-map-skip_vs_saturated-skip mean=+10.00% p50=+10.00%" in output
+    assert "no_drift_correction" in output
+
+
 def test_prefetch_scheduling_variants_preserve_budget_and_measure_separate_roles(tmp_path, monkeypatch, capsys):
     variants = ["ready-batch4", "saturated-skip", "early-drain", "skip-drain",
                 "capacity", "capacity-skip-drain", "ready-batch4-end"]

@@ -361,6 +361,19 @@ def summarize(args, results, manifest_digest):
             )
             for metric in ("mean", "p50")
         }
+    mapping_pairs = {}
+    for experiment, baseline in (("inverse-map", "ready-batch4"),
+                                 ("inverse-map-skip", "saturated-skip"),
+                                 ("capacity-inverse-map", "capacity")):
+        candidate_row = table.get("candidate-" + experiment)
+        baseline_row = table.get("candidate-" + baseline)
+        if candidate_row is not None and baseline_row is not None:
+            mapping_pairs[experiment] = dict(
+                reference=baseline,
+                **{metric + "_reduction_pct": reduction(
+                    baseline_row[metric + "_us"], candidate_row[metric + "_us"]
+                ) for metric in ("mean", "p50")},
+            )
     return dict(
         schema_version=1,
         status="pass",
@@ -376,6 +389,7 @@ def summarize(args, results, manifest_digest):
         primary_candidate_comparison="vs_control" if control is not None else None,
         control_name=control_name if control is not None else None,
         control_end_drift=drift,
+        inverse_mapping_pairs=mapping_pairs,
         metadata_end_vs_control_end=end_pair,
         diagnostic_replays_per_fused_case=args.diagnostic_replays,
         serial_configuration=dict(workers=32, post_size=128, max_inflight=2048, jettys_per_core=2),
@@ -423,6 +437,9 @@ def print_summary(summary, brief=False):
                         f"Q{q['query']}(requests={q['requests']},calls={q['calls']},"
                         f"native_max_cycles={q['native_max_cycles']},active={q['active_workers']}/{q['worker_count']})"
                         for q in sample["queries"]), flush=True)
+        for name, pair in summary.get("inverse_mapping_pairs", {}).items():
+            print(f"PAIR {name}_vs_{pair['reference']} mean={pair['mean_reduction_pct']:+.2f}% "
+                  f"p50={pair['p50_reduction_pct']:+.2f}% same_arena_no_drift_correction", flush=True)
         drift = summary["control_end_drift"]
         if drift:
             print(f"CONTROL_DRIFT {summary['control_name']} mean={drift['mean']['drift_pct']:+.2f}% "
