@@ -1,7 +1,8 @@
 """Independent, opt-in variants on top of the consolidated recent-index PR."""
 
 OPTIONS = ("final_topk_prune", "selected_metadata", "early_fetch_ready", "compact_init", "ready_batch_fetch")
-OPTIONAL_OPTIONS = ("ready_direct_ranges", "adaptive_admission", "prefetch_gate")
+OPTIONAL_OPTIONS = ("ready_direct_ranges", "adaptive_admission", "prefetch_gate",
+                    "skip_exhausted_prefetch", "early_prefetch_drain")
 DEFAULT_VARIANTS = ("control", "metadata", "ready-batch", "workers4", "ready-batch4", "metadata-end", "control-end")
 VARIANTS = {
     "control": (),
@@ -22,6 +23,10 @@ VARIANTS = {
     "direct": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "ready_direct_ranges"),
     "direct-tight": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "ready_direct_ranges"),
     "ready-batch4-end": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch"),
+    "saturated-skip": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "skip_exhausted_prefetch"),
+    "early-drain": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "early_prefetch_drain"),
+    "skip-drain": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "skip_exhausted_prefetch", "early_prefetch_drain"),
+    "capacity-skip-drain": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "skip_exhausted_prefetch", "early_prefetch_drain"),
 }
 
 # Fixed policies are controlled experiments, not a claim that one is best for
@@ -33,6 +38,7 @@ ADMISSION = {
     "tight": (768, 128, 1, 1),
     "direct": (768, 128, 0, 1),
     "direct-tight": (768, 128, 1, 1),
+    "capacity-skip-drain": (768, 128, 0, 1),
 }
 
 
@@ -53,7 +59,8 @@ def options_for(name):
 def q_workers_for(name):
     if name not in VARIANTS:
         raise ValueError(f"Unknown pipeline variant: {name}")
-    return 4 if name in ("workers4", "ready-batch4", "ready-batch4-end", *ADMISSION) else 2
+    return 4 if name in ("workers4", "ready-batch4", "ready-batch4-end",
+                        "saturated-skip", "early-drain", "skip-drain", *ADMISSION) else 2
 
 
 def validate_options(options):

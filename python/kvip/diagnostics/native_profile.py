@@ -8,7 +8,8 @@ roles and requests; neither their sum nor their maximum is a graph latency.
 import numpy as np
 
 
-def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_markers=False):
+def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_markers=False,
+                   early_prefetch_drain=False):
     raw = np.asarray(raw)
     expected = batch * 256 + (resolver_cores * batch + 4 * workers) * 32
     if raw.dtype != np.int64 or raw.size != expected or batch < 1 or workers < 1:
@@ -48,6 +49,10 @@ def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_
     interval("li_final_classification", li_queries, 2, 7)
     producer = producer_update[:, :32]
     consumer = producer_update[:, 32:]
+    if early_prefetch_drain:
+        if transport != "urma":
+            raise ValueError("Early prefetch drain markers require URMA")
+        interval("early_prefetch_drain", consumer, 0, 1, required=True)
     interval("producer_span", producer, 1, 8)
     interval("index_consumer_span", consumer, 10, 24)
     interval("index_metadata", consumer, 22, 23)
@@ -122,6 +127,10 @@ def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_
             + "; post_active/CQ drain sum safe and conflict phases only within each worker, not across workers",
             scan="No standalone full-history scan or QK duration is derived from these markers",
             aggregation="Median/max across request/query role samples; overlapping intervals are not additive",
+            prefetch_completion=(
+                "early_prefetch_drain is the Consumer-owned CQ drain; final_prefetch_join is the later resolver acquire"
+                if early_prefetch_drain else "final_prefetch_join includes the resolver-owned CQ drain"
+            ),
         ),
     )
 

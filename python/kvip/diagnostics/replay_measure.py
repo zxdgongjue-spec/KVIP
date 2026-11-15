@@ -81,7 +81,7 @@ def statistics(samples):
 
 
 def fused_reads(torch, rotating, update, transport, width, demand=None, *, window_limit=None, active_rows=None,
-                admission_controls=None):
+                admission_controls=None, skip_exhausted_prefetch=False):
     rows = cpu_array(torch, rotating.rows)
     status = cpu_array(torch, rotating.row_status)
     posts = cpu_array(torch, rotating.final_posts)
@@ -130,6 +130,12 @@ def fused_reads(torch, rotating, update, transport, width, demand=None, *, windo
             rows, window_limit=window_limit, rounds=rotating.rounds, active_rows=active_rows,
             admission_controls=admission_controls,
         )
+    if skip_exhausted_prefetch:
+        events = cpu_array(torch, rotating.events)
+        if transport != "urma" or events.dtype != np.uint8 or events.shape[-1] != 128:
+            raise ValueError("Skipped-prefetch accounting requires the URMA Event ABI")
+        result["capacity_skipped_row_windows"] = int(events.view(np.uint32)[..., 7].sum(dtype=np.uint64))
+        result["suppression_scope"] = "Only scanned row/windows; capacity-skipped candidates were not enumerated"
     return result
 
 
@@ -170,6 +176,7 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
             window_limit=bundle.tuning["window_limit"],
             active_rows=active_rows,
             admission_controls=bundle.tuning.get("admission_controls"),
+            skip_exhausted_prefetch=bundle.tuning.get("skip_exhausted_prefetch", False),
         )
 
         logical = cpu_array(torch, update.logical_output)
@@ -345,6 +352,7 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
                         threshold_markers=not bool(getattr(args, "upstream_root", None))
                         and args.transport == "urma"
                         and getattr(bundle, "tuning", {}).get("recent_profile", True),
+                        early_prefetch_drain=getattr(bundle, "tuning", {}).get("early_prefetch_drain", False),
                     ),
                     reads=diagnostic_reads,
                 )

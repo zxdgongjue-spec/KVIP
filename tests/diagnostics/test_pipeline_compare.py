@@ -138,6 +138,30 @@ def test_admission_variants_check_controls_and_report_matching_drift(tmp_path, m
         compare.summarize(args, reports, compare.file_digest(args.snapshot / "manifest.json"))
 
 
+def test_prefetch_scheduling_variants_preserve_budget_and_measure_separate_roles(tmp_path, monkeypatch, capsys):
+    variants = ["ready-batch4", "saturated-skip", "early-drain", "skip-drain",
+                "capacity", "capacity-skip-drain", "ready-batch4-end"]
+    args = _arguments(tmp_path, monkeypatch, variants)
+    args.matched_before = True
+    assert compare.before_variants(args) == ["ready-batch4"]
+    for variant in variants:
+        assert q_workers_for(variant) == 4
+        assert "prefetch_gate" not in options_for(variant)
+    assert admission_for("capacity-skip-drain") == admission_for("capacity")
+    assert admission_for("skip-drain") is None
+    assert options_for("saturated-skip") == options_for("ready-batch4") | {"skip_exhausted_prefetch": True}
+    assert options_for("early-drain") == options_for("ready-batch4") | {"early_prefetch_drain": True}
+    reports = _reports(args)
+    for sample in reports["candidate-saturated-skip"]["reads_samples"]:
+        sample["capacity_skipped_row_windows"] = 12
+    summary = compare.summarize(args, reports, compare.file_digest(args.snapshot / "manifest.json"))
+    assert summary["table"]["candidate-saturated-skip"]["capacity_skipped_row_windows"] == 12
+    compare.print_summary(summary, brief=True)
+    output = capsys.readouterr().out
+    assert "SKIPPED_ROW_WINDOWS=12.0" in output
+    assert "ROLE_P50_CYCLES" in output and "early_prefetch_drain=na" in output
+
+
 def test_matched_before_uses_same_old_options_and_exact_parent_source(tmp_path, monkeypatch):
     args = _arguments(tmp_path, monkeypatch,
                       ["ready-batch4", "workers4", "carry", "tight", "ready-batch4-end"])

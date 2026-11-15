@@ -226,6 +226,7 @@ def profile_summary(result):
         "index_metadata": "index_metadata",
         "dependency_wait": "fetch_dependency_wait",
         "prefetch_join": "final_prefetch_join",
+        "early_prefetch_drain": "early_prefetch_drain",
     }
     values = {}
     for label, key in fields.items():
@@ -306,6 +307,9 @@ def summarize(args, results, manifest_digest):
             selection_comparison=result["selection_comparison"],
             threshold_comparison=result.get("threshold_comparison"),
             diagnostic_summary=profile_summary(result),
+            capacity_skipped_row_windows=sum(
+                item.get("capacity_skipped_row_windows", 0) for item in result["reads_samples"]
+            ) / len(result["reads_samples"]),
         )
         table[name]["gains"]["vs_control"] = (
             {
@@ -394,6 +398,15 @@ def print_summary(summary, brief=False):
             print(f"{name:22} {row['mean_us']:9.3f} {row['p50_us']:9.3f} "
                   f"{reads['prefetch']:9.1f} {reads['final']:8.1f} {reads['unused_prefetch']:8.1f} "
                   f"{gains['mean_reduction_pct']:+7.2f}/{gains['p50_reduction_pct']:+7.2f} {comparison:>19}", flush=True)
+            if row.get("capacity_skipped_row_windows"):
+                print(f"  SKIPPED_ROW_WINDOWS={row['capacity_skipped_row_windows']:.1f} suppression_counts=scanned_only", flush=True)
+            if row.get("diagnostic_summary"):
+                metrics = row["diagnostic_summary"]["metrics"]
+                fields = []
+                for key in ("producer", "index", "dependency_wait", "get_native", "prefetch_join", "early_prefetch_drain"):
+                    value = metrics[key]["p50_cycles"]
+                    fields.append(f"{key}={value:.0f}" if value is not None else f"{key}=na")
+                print("  ROLE_P50_CYCLES " + " ".join(fields), flush=True)
         drift = summary["control_end_drift"]
         if drift:
             print(f"CONTROL_DRIFT {summary['control_name']} mean={drift['mean']['drift_pct']:+.2f}% "

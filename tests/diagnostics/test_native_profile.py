@@ -42,6 +42,48 @@ def test_old_main_slots_are_unavailable_even_if_they_contain_nonzero_values():
     assert sample["metrics"]["final_topk"]["status"] == "unavailable"
 
 
+def test_early_drain_is_separate_from_later_resolver_join():
+    raw = _raw()
+    consumer = raw[:128].reshape(2, 64)[:, 32:]
+    consumer[:, :2] = [100, 180]
+    fetch = raw[256:512].reshape(2, 128)
+    fetch[:, 96:101] = [200, 260, 270, 280, 210]
+    sample = native_profile.decode_profile(
+        raw, batch=2, workers=2, resolver_cores=3, transport="urma", early_prefetch_drain=True
+    )
+    assert sample["metrics"]["early_prefetch_drain"]["samples_cycles"] == [80, 80]
+    assert sample["metrics"]["final_prefetch_join"]["samples_cycles"] == [10, 10]
+    assert sample["metrics"]["final_index_and_query_join"]["samples_cycles"] == [50, 50]
+    consumer[0, 1] = 0
+    with pytest.raises(ValueError, match="diagnostic timestamps"):
+        native_profile.decode_profile(
+            raw, batch=2, workers=2, resolver_cores=3, transport="urma", early_prefetch_drain=True
+        )
+    old = native_profile.decode_profile(raw, batch=2, workers=2, resolver_cores=3, transport="urma")
+    assert "early_prefetch_drain" not in old["metrics"]
+
+
+def test_capacity_skip_counter_does_not_become_a_zero_candidate_count(monkeypatch):
+    rows = np.zeros((1, 256), dtype=np.int32)
+    rows[0, 9] = 2
+    events = np.zeros((2, 1, 128), dtype=np.uint8)
+    events.view(np.uint32)[:, 0, 7] = [1, 3]
+    rotating = SimpleNamespace(
+        rows=rows, row_status=np.zeros((1, 32), dtype=np.int32),
+        final_posts=np.zeros((1, 4, 16), dtype=np.int32), events=events,
+        hot_valid=np.zeros((1, 4), dtype=np.int32),
+        arguments=[None] * 9 + [np.array([[0, 1]], dtype=np.int32)],
+    )
+    monkeypatch.setattr(replay_measure, "cpu_array", lambda torch, value: np.asarray(value))
+    monkeypatch.setattr(replay_measure, "mapping_values", lambda *args: np.array([[4, 5, -1, -1]]))
+    result = replay_measure.fused_reads(
+        None, rotating, SimpleNamespace(status=np.zeros(1)), "urma", 656, skip_exhausted_prefetch=True
+    )
+    assert result["capacity_skipped_row_windows"] == 4
+    assert result["transfers"] == 2 and result["bytes"] == 1312
+    assert "not enumerated" in result["suppression_scope"]
+
+
 @pytest.mark.parametrize("change", ["missing", "reversed", "size"])
 def test_new_feature_markers_require_a_complete_valid_contract(change):
     raw = _raw()
