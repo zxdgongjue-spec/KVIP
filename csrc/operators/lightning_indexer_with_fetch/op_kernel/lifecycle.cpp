@@ -120,12 +120,14 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
         row->prefetchLimit=ctx->prefetchLimit;
         row->queueLimit=entity->sq_depth>1 ? entity->sq_depth-1 : 0;
         row->error=queue->last_error;
+#if KVIP_ADAPTIVE_ADMISSION
         if(ctx->admissionControls) {
             auto input=reinterpret_cast<const __gm__ int32_t*>(ctx->admissionControls)+b*4;
             kvip_admission::Controls controls{input[0],input[1],input[2],input[3]};
             if(kvip_admission::Valid(controls))row->prefetchLimit=uint32_t(controls.total);
             else row->error=kvaf_device::kInvalidArgs;
         }
+#endif
         if(entity->sq_depth<2 || (entity->sq_depth&(entity->sq_depth-1)) || entity->cq_depth<2 ||
            !entity->sq_va || !entity->sq_db_va || ctx->prefetchLimit>kSlots ||
            ctx->windowLimit==0 || ctx->windowLimit>480)
@@ -136,7 +138,12 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
         if(!queue->initialized) {
             queue->magic=kvaf_device::kQueueMagic; queue->initialized=1;
         }
-        if(entity->sq_depth>(1U<<30) || row->initialHead>UINT64_MAX-row->prefetchLimit ||
+        if(entity->sq_depth>(1U<<30) ||
+#if KVIP_ADAPTIVE_ADMISSION
+           row->initialHead>UINT64_MAX-row->prefetchLimit ||
+#else
+           row->initialHead>UINT64_MAX-ctx->prefetchLimit ||
+#endif
            args.token_bytes!=rt_tokenBytes || args.tokens_per_block!=128 ||
            args.block_count!=1 || args.jettys_per_core!=1)
             row->error=kvaf_device::kInvalidArgs;

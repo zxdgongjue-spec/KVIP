@@ -23,6 +23,22 @@ def _admission_values(value, batch):
     return values.copy()
 
 
+def _require_admission_features(library, values):
+    """Reject controls the compiled kernel cannot honour before any upload."""
+    if values is None:
+        return
+    required = ["adaptive_admission"]
+    if np.any(values[:, 2] > 0):
+        required.append("prefetch_gate")
+    for name in required:
+        function = getattr(library, "kvip_" + name, None)
+        if function is None:
+            raise ValueError(f"URMA admission controls require a build with {name}=True")
+        function.argtypes, function.restype = [], ctypes.c_uint32
+        if function() != 1:
+            raise ValueError(f"URMA admission controls require a build with {name}=True")
+
+
 class LIFetchBinding:
     def __init__(
         self,
@@ -60,6 +76,7 @@ class LIFetchBinding:
         self.torch, self.owner, self.batch = torch, owner, batch
         admission_values = None if admission_controls is None else _admission_values(admission_controls, batch)
         self.library = load_lifetch_library(library)
+        _require_admission_features(self.library, admission_values)
         self.device = arguments[0].device
         if (
             len(arguments) != 14
@@ -257,6 +274,8 @@ class LIFetchBinding:
 
         Columns are total prefetch limit, per-window quota, upward sortable-key
         steps, and carry (0/1). ``None`` restores the original admission path.
+        Non-None controls require an adaptive_admission build; positive key
+        steps additionally require prefetch_gate. Both options default to off.
         Pass a contiguous NumPy array or CPU tensor. No NPU readback is used.
         Storage is retained across updates; allocate it before graph capture.
         Queue updates on the graph's stream after its preceding use completes.
@@ -267,6 +286,7 @@ class LIFetchBinding:
         if callable(capturing) and capturing():
             raise RuntimeError("Set URMA admission controls outside graph capture")
         checked = None if values is None else _admission_values(values, self.batch)
+        _require_admission_features(self.library, checked)
         previous = 0 if self.admission_controls is None else self.admission_controls.data_ptr()
         if checked is None:
             self.admission_controls = None

@@ -25,6 +25,13 @@ than choosing the policy with the smallest unused-prefetch count.
 `LIFetchBinding.set_admission_controls(cpu_int32_Bx4)` binds four values per
 packed request: `(total_limit, window_limit, key_steps, carry)`.
 
+Build with `adaptive_admission=True` to enable runtime quotas and carry.
+Add `prefetch_gate=True` only when positive key steps are needed; it requires
+adaptive admission. Both build flags default to false and are part of the
+binary cache key. The bridge exports both capabilities, and the constructor
+and setter reject controls that the selected binary cannot honour before
+allocating or changing their device table.
+
 * Total is 0..2048; window is 1..480; key steps are 0..65535; carry is 0 or 1.
 * Controls are immutable during execution. The setter rejects capture-time
   calls and device tensors. Update on the submission stream after prior users
@@ -34,10 +41,15 @@ packed request: `(total_limit, window_limit, key_steps, carry)`.
   Existing total, victim-slot and transport limits further bound this value.
 * Carry reuses earlier **unused credits**. It does not revisit candidates that
   an earlier window rejected; final repair handles those candidates.
-* `None` preserves the original fixed policy. There are new pointer/null
-  checks, but no new allocation, upload, barrier or kernel in that path.
-  Zero key steps reuse the original threshold tensor; positive steps require
-  a separate 512-byte local gate buffer and setup which are inside graph time.
+* With both flags off, the adaptive quota and score-gate code is absent from
+  the device compilation. `None` requires neither feature and leaves the
+  Context pointer zero. With flags on, `None` selects fixed policy but does
+  not remove the compiled feature code. Measure that control separately to
+  detect compiler effects even when the feature does no runtime work.
+* Without `prefetch_gate`, cold classification uses the original threshold
+  tensor directly. Positive steps use a separate 512-byte local gate buffer
+  and setup which are inside graph time. Zero steps are valid in an
+  admission-only build and do not require the score-gate feature.
 
 The original 512 setting is the request's *total* prefetch budget, with a
 64-token window limit. It is not 512 per window. The existing data structures
@@ -96,5 +108,9 @@ NPU replay must check bit-exact scores, unchanged ordered TopK/final thresholds,
 KV/Index state, zero outstanding transfers and each budget. Compare G2/G7/G10/
 G17/G4 using strong serial (32 workers, post 128, inflight 2048, two jettys/core).
 Record full-graph mean and median, real transfer counts and control drift.
+For source-regression attribution, compare the parent and new revision with
+the same selected-metadata, ready-fetch and worker settings; the PR default
+is a separate baseline. Keep adaptive admission and score gating off in that
+matched control. Then enable quota-only and gate-enabled builds separately.
 Fixed controls are uploaded before capture; device gate/quota work is timed,
 but per-step CPU planning/H2D and offline snapshot restoration are not.

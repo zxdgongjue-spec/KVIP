@@ -462,10 +462,6 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Init(__gm__ uint8_t *q
 
     if ASCEND_IS_AIV {
         vectorService.InitParams(constInfo, tiling, sequenceTopKOnly_);
-#if !(defined(V9_UBMEM) && V9_UBMEM)
-        vectorService.ConfigureAdmissionRows(splitCoreInfo.bN2Start, splitCoreInfo.bN2End,
-                                            sequenceTopKOnly_);
-#endif
         indiceOutGm.SetGlobalBuffer((__gm__ int32_t *)sparseIndices);
         weightsGm.SetGlobalBuffer((__gm__ W_T *)weights);
         qScaleGm.SetGlobalBuffer((__gm__ SCALE_T *)queryScale);

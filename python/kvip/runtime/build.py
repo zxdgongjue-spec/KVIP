@@ -49,6 +49,8 @@ def build_libraries(
     compact_init=False,
     ready_batch_fetch=False,
     ready_direct_ranges=False,
+    adaptive_admission=False,
+    prefetch_gate=False,
     topk_prune_diagnostics=False,
 ):
     """Build one shape-independent binary per source/toolchain/SoC."""
@@ -66,10 +68,14 @@ def build_libraries(
         COMPACT_INIT=compact_init,
         READY_BATCH_FETCH=ready_batch_fetch,
         READY_DIRECT_RANGES=ready_direct_ranges,
+        ADAPTIVE_ADMISSION=adaptive_admission,
+        PREFETCH_GATE=prefetch_gate,
         TOPK_PRUNE_DIAGNOSTICS=topk_prune_diagnostics,
     )
     if any(type(value) is not bool for value in variants.values()):
         raise ValueError("LIFetch pipeline build options must be bool")
+    if prefetch_gate and not adaptive_admission:
+        raise ValueError("prefetch_gate requires adaptive_admission=True")
     options.update({f"KVIP_{name}": "ON" if value else "OFF" for name, value in variants.items()})
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     for relative in (

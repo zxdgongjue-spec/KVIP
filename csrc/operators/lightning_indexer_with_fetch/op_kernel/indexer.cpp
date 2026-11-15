@@ -42,8 +42,10 @@ __aicore__ inline void RunLi(GM_ADDR bindings) {
         splitSequence ? 0U : shape.splitQ,shape.aicCount};
     if ASCEND_IS_AIV {
         op.vectorService.SetStreamingWorkspace(P(15));
+#if KVIP_PREFETCH_GATE
         op.vectorService.SetAdmissionControls(
             reinterpret_cast<__gm__ rotating::Context*>(a[14])->admissionControls);
+#endif
     }
     op.Init(P(0),P(1),P(2),P(3),P(4),P(5),P(6),P(7),P(9),P(12),&tiling,&pipe);
     if ASCEND_IS_AIV {

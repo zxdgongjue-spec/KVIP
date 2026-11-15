@@ -153,8 +153,6 @@ struct Model {
  Tensor<int32_t> indicesOutLocal_{indices.data(),2048};
  Model(){ctx.lruSlots=uint64_t(victims.data());ctx.hits=uint64_t(bitmap.data());ctx.queryEnds=uint64_t(ends.data());ctx.progress=uint64_t(progress.data());}
  void MergeRecentScores(unsigned,unsigned,unsigned){}
- // Null adaptive controls preserve the original victim/protection path.
- void PrepareAdmissionThreshold(unsigned){}
 """
         + save
         + r"""

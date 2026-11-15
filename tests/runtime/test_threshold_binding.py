@@ -125,6 +125,8 @@ def fixture(monkeypatch, batch=2):
         "li": 0,
     }.items():
         setattr(library, "v9_" + name, Mock(return_value=value))
+    library.kvip_adaptive_admission = Mock(return_value=0)
+    library.kvip_prefetch_gate = Mock(return_value=0)
     monkeypatch.setattr(urma, "load_lifetch_library", lambda path: library)
     metadata = dict(
         query_ends=Tensor(np.full((batch, 4), 3900, dtype=np.int32)),
@@ -227,6 +229,8 @@ def test_binding_batch_limit_still_precedes_allocation(monkeypatch, batch):
 
 def test_admission_controls_are_validated_and_keep_a_stable_address(monkeypatch):
     f = fixture(monkeypatch)
+    f.library.kvip_adaptive_admission.return_value = 1
+    f.library.kvip_prefetch_gate.return_value = 1
     values = np.array([[512, 64, 0, 0], [2048, 480, 65535, 1]], dtype=np.int32)
     bound = f.construct(admission_controls=values)
     pointer = bound.admission_controls.data_ptr()
@@ -274,3 +278,61 @@ def test_admission_cannot_update_during_capture(monkeypatch):
     with pytest.raises(RuntimeError, match="outside graph capture"):
         bound.set_admission_controls(np.tile(np.array([512, 64, 0, 0], np.int32), (2, 1)))
     assert bound.admission_controls is None
+
+
+@pytest.mark.parametrize("setter", [False, True])
+@pytest.mark.parametrize("missing", [False, True])
+def test_admission_rejects_a_disabled_or_missing_native_feature(monkeypatch, setter, missing):
+    f = fixture(monkeypatch)
+    if missing:
+        del f.library.kvip_adaptive_admission
+    values = np.tile(np.array([512, 64, 0, 0], np.int32), (2, 1))
+    if not setter:
+        with pytest.raises(ValueError, match="adaptive_admission=True"):
+            f.construct(admission_controls=values)
+        f.torch.zeros.assert_not_called()
+        f.library.kvip_prepare_shape.assert_not_called()
+    else:
+        bound = f.construct()
+        before = bound.context.values.copy()
+        with pytest.raises(ValueError, match="adaptive_admission=True"):
+            bound.set_admission_controls(values)
+        np.testing.assert_array_equal(before, bound.context.values)
+        assert bound.admission_controls is bound._admission_storage is None
+
+
+@pytest.mark.parametrize("setter", [False, True])
+@pytest.mark.parametrize("missing", [False, True])
+def test_positive_gate_rejected_before_control_mutation(monkeypatch, setter, missing):
+    f = fixture(monkeypatch)
+    f.library.kvip_adaptive_admission.return_value = 1
+    if missing:
+        del f.library.kvip_prefetch_gate
+    values = np.tile(np.array([512, 64, 0, 0], np.int32), (2, 1))
+    if not setter:
+        values[1, 2] = 1
+        with pytest.raises(ValueError, match="prefetch_gate=True"):
+            f.construct(admission_controls=values)
+        f.torch.zeros.assert_not_called()
+    else:
+        bound = f.construct(admission_controls=values)
+        before = bound.context.values.copy()
+        original = bound.admission_controls.values.copy()
+        values[1, 2] = 1
+        with pytest.raises(ValueError, match="prefetch_gate=True"):
+            bound.set_admission_controls(values)
+        np.testing.assert_array_equal(before, bound.context.values)
+        np.testing.assert_array_equal(original, bound.admission_controls.values)
+
+
+def test_zero_steps_need_no_gate_and_none_needs_neither_feature(monkeypatch):
+    f = fixture(monkeypatch)
+    bound = f.construct()
+    bound.set_admission_controls(None)
+    f.library.kvip_adaptive_admission.assert_not_called()
+    f.library.kvip_prefetch_gate.assert_not_called()
+    f.library.kvip_adaptive_admission.return_value = 1
+    values = np.tile(np.array([512, 64, 0, 1], np.int32), (2, 1))
+    bound.set_admission_controls(values)
+    f.library.kvip_prefetch_gate.assert_not_called()
+    assert bound.admission_controls is not None

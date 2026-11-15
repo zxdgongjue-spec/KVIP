@@ -4,6 +4,7 @@
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -25,7 +26,11 @@ def test_pipeline_options_isolate_and_reuse_the_correct_binary(monkeypatch, tmp_
     assert build.build_libraries(**arguments) == baseline
     assert len(calls) == 2
     paths = {baseline}
-    for option in ("final_topk_prune", "selected_metadata", "early_fetch_ready", "compact_init", "ready_batch_fetch", "ready_direct_ranges", "topk_prune_diagnostics"):
+    options = (
+        "final_topk_prune", "selected_metadata", "early_fetch_ready", "compact_init",
+        "ready_batch_fetch", "ready_direct_ranges", "adaptive_admission", "topk_prune_diagnostics",
+    )
+    for option in options:
         result = build.build_libraries(**arguments, **{option: True})
         assert result not in paths
         paths.add(result)
@@ -36,9 +41,25 @@ def test_pipeline_options_isolate_and_reuse_the_correct_binary(monkeypatch, tmp_
         previous = len(calls)
         assert build.build_libraries(**arguments, **{option: True}) == result
         assert len(calls) == previous
+    gated = build.build_libraries(**arguments, adaptive_admission=True, prefetch_gate=True)
+    assert gated not in paths
+    manifest = json.loads((gated[0].parent / "complete.json").read_text())
+    assert manifest["KVIP_ADAPTIVE_ADMISSION"] == manifest["KVIP_PREFETCH_GATE"] == "ON"
+    previous = len(calls)
+    assert build.build_libraries(**arguments, adaptive_admission=True, prefetch_gate=True) == gated
+    assert len(calls) == previous
 
 
 @pytest.mark.parametrize("value", (1, 0, "OFF", None))
-def test_pipeline_options_reject_ambiguous_values_before_build(tmp_path, value):
+@pytest.mark.parametrize("option", ("compact_init", "adaptive_admission", "prefetch_gate"))
+def test_pipeline_options_reject_ambiguous_values_before_build(tmp_path, value, option):
     with pytest.raises(ValueError, match="must be bool"):
-        build.build_libraries(cache_dir=tmp_path, cann=tmp_path, headers=tmp_path, soc="A5", compact_init=value)
+        build.build_libraries(cache_dir=tmp_path, cann=tmp_path, headers=tmp_path, soc="A5", **{option: value})
+
+
+def test_prefetch_gate_requires_admission_before_build(monkeypatch, tmp_path):
+    compile_ = Mock()
+    monkeypatch.setattr(build.subprocess, "run", compile_)
+    with pytest.raises(ValueError, match="prefetch_gate requires adaptive_admission"):
+        build.build_libraries(cache_dir=tmp_path, cann=tmp_path, headers=tmp_path, soc="A5", prefetch_gate=True)
+    compile_.assert_not_called()

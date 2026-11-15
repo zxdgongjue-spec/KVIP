@@ -2,6 +2,8 @@
 
 import subprocess
 
+import pytest
+
 from test_recent_index import COMMON, INDEXER, function
 
 
@@ -9,10 +11,6 @@ def test_admission_limits_and_independent_threshold(tmp_path):
     prepare = function(
         (INDEXER / "indexer_vector.h").read_text(),
         "    __aicore__ inline void PrepareAdmissionThreshold(",
-    )
-    configure = function(
-        (INDEXER / "indexer_vector.h").read_text(),
-        "    __aicore__ inline void ConfigureAdmissionRows(",
     )
     cpp = tmp_path / "admission.cpp"
     cpp.write_text(
@@ -39,12 +37,10 @@ template<class T> struct Tensor {
  void SetValue(unsigned i,T v){p->at(i)=v;}
 };
 struct Model {
- bool admissionEnabled_=false;
  uint64_t admissionControls_=0;
  std::array<uint16_t,256> prefixStorage{},gateStorage{};
- Tensor<uint16_t> prefixThreshold_{&prefixStorage},admissionThreshold_{&gateStorage},coldThreshold_{&prefixStorage};
+ Tensor<uint16_t> prefixThreshold_{&prefixStorage},admissionThreshold_{&gateStorage};
 """
-        + configure
         + prepare
         + r"""
 };
@@ -88,26 +84,20 @@ int main(){
  assert(rotating::PrefetchAllowance(10,10,2048,2048,10,480)==0);
  std::array<Controls,16> controls;
  for(unsigned row=0;row<controls.size();++row)controls[row]={512,64,int32_t(row*4311),int32_t(row%2)};
- Model model;model.admissionControls_=uint64_t(controls.data());
+ Model model;
  model.prefixStorage.fill(49000);model.gateStorage.fill(123);
- model.ConfigureAdmissionRows(0,0,false);assert(!model.admissionEnabled_);
- model.ConfigureAdmissionRows(1,15,true);assert(!model.admissionEnabled_);
+ // A gate-enabled binary always initializes its fixed gate, including null
+ // controls and zero steps. The baseline binary compiles this code out.
  model.PrepareAdmissionThreshold(0);
- assert(model.gateStorage[0]==123); // Zero-step policy does nothing.
- model.ConfigureAdmissionRows(0,1,false);assert(model.admissionEnabled_);
+ assert(model.gateStorage[0]==49000&&barriers==2);
+ model.admissionControls_=uint64_t(controls.data());
  for(unsigned query=0;query<64;++query){
   auto oldPrefix=model.prefixStorage,oldGate=model.gateStorage;unsigned oldBarriers=barriers;
   model.PrepareAdmissionThreshold(query);
   assert(model.prefixStorage==oldPrefix); // Exact Kth and victim protection are immutable.
   unsigned bank=(query%2)*128;
-  if(controls[query/4].keySteps){
-   assert(model.coldThreshold_.p==&model.gateStorage);
-   assert(model.gateStorage[bank]==LiftKey(49000,controls[query/4].keySteps));
-   assert(barriers==oldBarriers+2);
-  }else{
-   assert(model.coldThreshold_.p==&model.prefixStorage);
-   assert(model.gateStorage==oldGate&&barriers==oldBarriers);
-  }
+  assert(model.gateStorage[bank]==LiftKey(49000,controls[query/4].keySteps));
+  assert(barriers==oldBarriers+2);
   for(unsigned i=0;i<256;++i)if(i!=bank)assert(model.gateStorage[i]==oldGate[i]);
   assert(!credits[0]&&!credits[1]);
  }
@@ -132,3 +122,44 @@ def test_gate_is_not_used_as_an_exact_selection_bound():
     assert "prefixThreshold_.GetValue" in final
     assert "admissionThreshold_" not in victims
     assert "ClassifyLocalResidentScores" in victims and "prefixThreshold_" in victims
+
+
+@pytest.mark.parametrize("adaptive,gate", [(0, 0), (1, 0), (1, 1)])
+def test_native_admission_compiles_out_of_baseline(adaptive, gate):
+    """Preprocess real sources without CANN, checking the selected path."""
+    kernel = INDEXER.parent
+    sources = [kernel / "indexer.cpp", INDEXER / "indexer.h", INDEXER / "indexer_vector.h",
+               kernel / "lifecycle.cpp", kernel / "prefetch.h"]
+    expanded = []
+    for path in sources:
+        source = "\n".join(
+            line for line in path.read_text().splitlines()
+            if not line.lstrip().startswith("#include")
+        )
+        result = subprocess.run(
+            ["c++", "-E", "-P", "-x", "c++", "-D__CCE_AICORE__=1", "-DV9_UBMEM=0",
+             "-DKVIP_STREAMING_LI=1", f"-DKVIP_ADAPTIVE_ADMISSION={adaptive}",
+             f"-DKVIP_PREFETCH_GATE={gate}", "-"],
+            input=source, text=True, capture_output=True, check=True,
+        )
+        expanded.append(result.stdout)
+    li = "\n".join(expanded[:3])
+    if not gate:
+        assert "admissionControls" not in li
+        assert "PrepareAdmissionThreshold" not in li
+        assert "admissionThresholdBuf_" not in li
+        assert "coldThreshold_" not in li
+        assert "(__ubuf__ uint16_t *)prefixThreshold_.GetPhyAddr() + (curAivS1Idx % 2) * 128" in li
+    else:
+        assert "PrepareAdmissionThreshold" in li
+        assert "coldThreshold_" not in li and "admissionEnabled_" not in li
+        allocate = li.index("pipe->InitBuffer(admissionThresholdBuf_, 512)")
+        assert allocate > li.index("pipe->InitBuffer(topkSharedTmpBuf_, topkSharedTmpSize)")
+        assert allocate > li.index("pipe->InitBuffer(streamingBitmapBuf_")
+    tail = "\n".join(expanded[3:])
+    if not adaptive:
+        assert "admissionControls" not in tail
+        assert "WindowAllowance" not in tail
+    else:
+        assert "admissionControls" in tail
+        assert "WindowAllowance" in tail
