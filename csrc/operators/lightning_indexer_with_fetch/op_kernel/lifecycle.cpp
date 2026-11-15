@@ -65,6 +65,10 @@ __aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uin
     SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
     Duplicate(local,UINT32_MAX,kvip_round_init::kFillWords);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+#if KVIP_INVERSE_MAPPING && !V9_UBMEM
+    // A stale entry is accepted only if the freshly reset inverse agrees.
+    if(!KVIP_INVERSE_MAPPING_ACTIVE(ctx))
+#endif
     FillRoundWords(ctx->mapping+uint64_t(b)*rt_history*4,rt_history,local);
     if(ctx->changes)FillRoundWords(ctx->changes+b*kChangeCapacity*4,
         kvip_round_init::ChangeWords(streaming != nullptr,kLruSlots,kChangeCapacity),local);

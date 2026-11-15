@@ -20,6 +20,9 @@ inline void ClassifySelectedMetadata(uint32_t history, uint32_t resident,
     auto lru = reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots) + batch * kLruSlots;
     auto valid = reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid);
     auto reserved = reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot);
+#if KVIP_INVERSE_MAPPING && !V9_UBMEM
+    const auto view = LoadPrefetchMappingView(history, resident, batch, ctx, mapping);
+#endif
     for (uint32_t i = threadIdx.x; i < kTop; i += kClassifyThreads) {
         uint32_t token = indices[i];
         uint32_t slot = UINT32_MAX;
@@ -42,7 +45,12 @@ inline void ClassifySelectedMetadata(uint32_t history, uint32_t resident,
             (!reserved || asc_ldcg(reserved + uint64_t(batch) * resident + token) < 0)) {
             slot = token;
         } else if (used || hasTail) {
+#if KVIP_INVERSE_MAPPING && !V9_UBMEM
+            slot = ResolvePhysicalSlot(resident, lru,
+                ReadPrefetchMapping(view, token));
+#else
             slot = ResolvePhysicalSlot(resident, lru, asc_ldcg(mapping + token));
+#endif
         }
         locations[i] = slot;
         if (slot < resident) {

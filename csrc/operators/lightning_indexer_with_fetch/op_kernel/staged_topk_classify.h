@@ -15,6 +15,9 @@ inline void ClassifyTopkHalf(uint32_t history,uint32_t resident,uint32_t batch,
     const uint32_t words=(resident+31)/32,shards=4096/words<8?4096/words:8;
     auto mapping=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+uint64_t(batch)*history;
     auto lru=reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+batch*kLruSlots;
+#if KVIP_INVERSE_MAPPING && !V9_UBMEM
+    const auto view=LoadPrefetchMappingView(history,resident,batch,ctx,mapping);
+#endif
     for(uint32_t i=threadIdx.x;i<kTop;i+=kClassifyThreads){
         uint32_t token=indices[i];
         if(token==UINT32_MAX){if(!halfBase)locations[i]=UINT32_MAX;continue;}
@@ -26,7 +29,12 @@ inline void ClassifyTopkHalf(uint32_t history,uint32_t resident,uint32_t batch,
         uint32_t slot=UINT32_MAX;
         if(inHalf && !inTail && (!hasValid || valid[token-halfBase]) &&
            (!hasReserved || reserved[token-halfBase]<0))slot=token;
-        else if(used || hasTail)slot=ResolvePhysicalSlot(resident,lru,asc_ldcg(mapping+token));
+        else if(used || hasTail)
+#if KVIP_INVERSE_MAPPING && !V9_UBMEM
+            slot=ResolvePhysicalSlot(resident,lru,ReadPrefetchMapping(view,token));
+#else
+            slot=ResolvePhysicalSlot(resident,lru,asc_ldcg(mapping+token));
+#endif
         locations[i]=slot;
         if(slot<resident)asc_atomic_or(bitmap+(threadIdx.x%shards)*words+slot/32,1U<<(slot%32));
     }

@@ -8,14 +8,23 @@ constexpr uint32_t kStagedRankTag = 0x80000000U;
 // Resolve the original prefetch mapping without modifying it.
 __simt_callee__ inline uint32_t StagedKnownSlot(uint32_t token, uint32_t resident,
     uint32_t history, uint32_t used, uint32_t batch, __gm__ Context* ctx,
-    __ubuf__ uint32_t* valid, __ubuf__ int32_t* reservedLocal) {
+    __ubuf__ uint32_t* valid, __ubuf__ int32_t* reservedLocal
+#if KVIP_INVERSE_MAPPING && !V9_UBMEM
+    ,const PrefetchMappingView& view
+#endif
+    ) {
     if (token == UINT32_MAX) return UINT32_MAX;
     if (token >= history) return UINT32_MAX;
     bool isHot = token < resident && !IsTailToken(ctx, batch, token) &&
         (!ctx->hotValid || valid[token]) && (!ctx->reservedHot || reservedLocal[token] < 0);
     if (isHot) return token;
     auto mapping = reinterpret_cast<__gm__ uint32_t*>(ctx->mapping) + batch * history;
+#if KVIP_INVERSE_MAPPING && !V9_UBMEM
+    uint32_t slot = (used || ctx->tailBounds) ?
+        ReadPrefetchMapping(view, token) : UINT32_MAX;
+#else
     uint32_t slot = (used || ctx->tailBounds) ? asc_ldcg(mapping + token) : UINT32_MAX;
+#endif
     if (slot == UINT32_MAX) return slot;
     auto lru = reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots) + batch * kLruSlots;
     return ResolvePhysicalSlot(resident, lru, slot);
@@ -45,6 +54,10 @@ inline void StagedInitialize(uint32_t history,uint32_t resident,uint32_t batch,u
     for(uint32_t i=tid;i<(resident+31)/32;i+=512)bitmap[i]=0;
     asc_syncthreads();
     uint32_t localMissing=0;
+#if KVIP_INVERSE_MAPPING && !V9_UBMEM
+    const auto view=LoadPrefetchMappingView(history,resident,batch,ctx,
+        reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+uint64_t(batch)*history);
+#endif
     // Q1/Q2 are classified first, so Q3/Q4 can reuse an identical position
     // without repeating its mapping load or bitmap update. This is the same
     // same-position shortcut as the baseline; different positions still go
@@ -56,7 +69,11 @@ inline void StagedInitialize(uint32_t history,uint32_t resident,uint32_t batch,u
             if(half && token==selected[i-2*kTop]){loc[i]=loc[i-2*kTop];continue;}
             if(token!=UINT32_MAX && token>=history)asc_atomic_or(ctl+1,1U);
             uint32_t slot=StagedKnownSlot(token,resident,history,used,batch,ctx,keys,
-                reinterpret_cast<__ubuf__ int32_t*>(ids));
+                reinterpret_cast<__ubuf__ int32_t*>(ids)
+#if KVIP_INVERSE_MAPPING && !V9_UBMEM
+                ,view
+#endif
+                );
             loc[i]=slot;
             localMissing+=(token!=UINT32_MAX && token<history && slot==UINT32_MAX);
             // Ordinary hot hits are outside the candidate list. The fallback

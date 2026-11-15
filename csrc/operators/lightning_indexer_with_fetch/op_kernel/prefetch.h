@@ -29,6 +29,9 @@ namespace kvaf_device { using ubmem_device::CleanCacheLines; constexpr uint32_t 
 // virtual ABC tags remain disjoint from prefetch ordinals.
 namespace rotating {
 #include "../../common/lifetch/cache_metadata.h"
+#if KVIP_INVERSE_MAPPING
+#include "inverse_mapping.h"
+#endif
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm__ Context* ctx,uint32_t b) {
     // Use the existing SIMT launch: scalar cache-line writeback would race
@@ -37,6 +40,10 @@ inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm
         asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->changeCount)+b,kLruSlots);
         asc_threadfence();
     }
+#if KVIP_INVERSE_MAPPING
+    // Preserve changeCount publication above; ABC locations are now arithmetic.
+    if(KVIP_INVERSE_MAPPING_ACTIVE(ctx))return;
+#endif
     if(!ctx->tailBounds)return;
     auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds)+b*2;
     auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;
@@ -544,8 +551,20 @@ inline void ScanPartial(__ubuf__ uint32_t* input,__ubuf__ uint32_t* ids,__ubuf__
 // LIDU pattern: gather only candidate map entries, then SIMD squeeze misses.
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void GatherCandidateMap(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* slots,
-    __gm__ uint32_t* map,uint32_t count) {
-    for(uint32_t i=threadIdx.x;i<count;i+=256)slots[i]=asc_ldcg(map+ids[i]);
+    __gm__ uint32_t* map,uint32_t count
+#if KVIP_INVERSE_MAPPING
+    ,uint32_t history,uint32_t resident,uint32_t batch,__gm__ Context* ctx
+#endif
+    ) {
+#if KVIP_INVERSE_MAPPING
+    const auto view=LoadPrefetchMappingView(history,resident,batch,ctx,map);
+#endif
+    for(uint32_t i=threadIdx.x;i<count;i+=256)
+#if KVIP_INVERSE_MAPPING
+        slots[i]=ReadPrefetchMapping(view,ids[i]);
+#else
+        slots[i]=asc_ldcg(map+ids[i]);
+#endif
 }
 __simd_vf__ inline void CompactMisses(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* slots,
     __ubuf__ uint32_t* cfg,uint32_t count,uint32_t available) {
@@ -717,7 +736,11 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
                 missing=candidateCount;count=missing<available?missing:available;
             } else {
                 Simt::VF_CALL<GatherCandidateMap>(Simt::Dim3{256,1,1},
-                    reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),map,candidateCount);
+                    reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),map,candidateCount
+#if KVIP_INVERSE_MAPPING
+                    ,rt_history,rt_resident,b,ctx
+#endif
+                    );
                 SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
                 SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
                 CompactMisses(reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),

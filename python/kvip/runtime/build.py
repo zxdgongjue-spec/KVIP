@@ -53,6 +53,7 @@ def build_libraries(
     prefetch_gate=False,
     skip_exhausted_prefetch=False,
     early_prefetch_drain=False,
+    inverse_mapping=False,
     topk_prune_diagnostics=False,
 ):
     """Build one shape-independent binary per source/toolchain/SoC."""
@@ -74,6 +75,7 @@ def build_libraries(
         PREFETCH_GATE=prefetch_gate,
         SKIP_EXHAUSTED_PREFETCH=skip_exhausted_prefetch,
         EARLY_PREFETCH_DRAIN=early_prefetch_drain,
+        INVERSE_MAPPING=inverse_mapping,
         TOPK_PRUNE_DIAGNOSTICS=topk_prune_diagnostics,
     )
     if any(type(value) is not bool for value in variants.values()):
