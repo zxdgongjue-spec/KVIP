@@ -27,6 +27,20 @@ LIFETCH_SCHEDULE_DEVICE inline uint32_t SequenceWindowEnd(uint32_t history,uint3
     return end<history?end:history;
 }
 
+// In reverse mode progress and bitmap cursors still increase. Only cold
+// coordinates are mirrored; hot victim ordinals retain their original order.
+LIFETCH_SCHEDULE_DEVICE inline uint32_t ReverseColdWindowEnd(uint32_t history, uint32_t resident,
+    uint32_t half, uint32_t rounds, uint32_t epoch) {
+    return history + resident - SequenceWindowEnd(history, resident, half, rounds - 1 - epoch);
+}
+
+LIFETCH_SCHEDULE_DEVICE inline uint32_t ReverseColdFirstShard(uint32_t history, uint32_t resident,
+    uint32_t half, uint32_t rounds) {
+    // The final forward window may have a short high half. It becomes the
+    // low scan-coordinate half of the first reverse window.
+    return history - resident - half * (2 * rounds - 3);
+}
+
 struct SequenceSlice { uint32_t shard, end; };
 
 // Hot predicates belong to the shared prefix; cold halves alternate in S2.
@@ -34,5 +48,14 @@ LIFETCH_SCHEDULE_DEVICE inline SequenceSlice SequenceSliceAt(uint32_t token, uin
     if (token < resident) return {0, resident};
     uint32_t index = (token - resident) / half;
     return {index % 2, resident + (index + 1) * half};
+}
+
+LIFETCH_SCHEDULE_DEVICE inline SequenceSlice ReverseColdSliceAt(uint32_t token, uint32_t resident,
+    uint32_t half, uint32_t firstShard) {
+    if (token < resident) return {0, resident};
+    uint32_t cut = resident + firstShard;
+    if (token < cut) return {0, cut};
+    uint32_t index = (token - cut) / half;
+    return {(index + 1) % 2, cut + (index + 1) * half};
 }
 #undef LIFETCH_SCHEDULE_DEVICE

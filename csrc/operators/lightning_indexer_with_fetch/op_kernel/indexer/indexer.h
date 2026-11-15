@@ -88,6 +88,7 @@ public:
 public:
     rotating::RuntimeShape runtimeShape_;
     bool sequenceSplit_ = false;
+    bool reverseCold_ = false;
     bool sequenceTopKOnly_ = false;
 private:
     static constexpr uint32_t HEAD_DIM = 128;
@@ -651,13 +652,21 @@ template <typename QLIT>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
     uint32_t begin, uint32_t end, uint32_t shard, uint32_t& loop, uint32_t& scaleLoop, bool last)
 {
-    splitCoreInfo.s2Start = begin;
-    tempLoopInfo.s2LoopEnd = end - 1;
+    const bool reverse = reverseCold_ && begin >= resident_ / S2_BASE_SIZE;
+    const uint32_t mirror = (runtimeShape_.history + resident_) / S2_BASE_SIZE;
+    splitCoreInfo.s2Start = reverse ? mirror - begin - 1 : begin;
+    tempLoopInfo.s2LoopEnd = reverse ? splitCoreInfo.s2Start : end - 1;
     tempLoopInfo.validS2Len = end * S2_BASE_SIZE;
     for (uint32_t tile = begin; tile < end; ++tile, ++loop) {
         if ((tile - begin) % QLICommon::KScaleTiles == 0) ++scaleLoop;
         QLICommon::RunInfo info;
-        CalcRunInfo(loop, tile, info, 0, scaleLoop);
+        CalcRunInfo(loop, reverse ? mirror - tile - 1 : tile, info, 0, scaleLoop);
+        if (reverse) {
+            info.reverseScanTilePlusOne = tile + 1;
+            info.reverseScaleTiles = Min(uint32_t(QLICommon::KScaleTiles),
+                end - (tile - (tile - begin) % QLICommon::KScaleTiles));
+            info.s2Start = begin; // scale-bank cursor is in scan coordinates
+        }
         info.isFirstS2InnerLoop = loop == 0;
         info.isLastS2InnerLoop = last && tile + 1 == end;
         if ASCEND_IS_AIC {
@@ -716,15 +725,24 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
             QLICommon::RunInfo checkpointInfo;
             if ASCEND_IS_AIV { CalcRunInfo(0, 0, checkpointInfo, 0, 0); }
             for (uint32_t epoch = 1; epoch < runtimeShape_.rounds; ++epoch, begin += 2 * half) {
+                uint32_t start = begin;
                 uint32_t end = begin + half;
                 if (end > runtimeShape_.history / S2_BASE_SIZE) end = runtimeShape_.history / S2_BASE_SIZE;
-                ScanSequenceHalf(begin, end, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
+                uint32_t windowEnd = rotating::SequenceWindowEnd(runtimeShape_.history, resident_, halfTokens, epoch);
+                if (reverseCold_) {
+                    const uint32_t windowStart = rotating::ReverseColdWindowEnd(
+                        runtimeShape_.history, resident_, halfTokens, runtimeShape_.rounds, epoch - 1);
+                    windowEnd = rotating::ReverseColdWindowEnd(
+                        runtimeShape_.history, resident_, halfTokens, runtimeShape_.rounds, epoch);
+                    const uint32_t mid = windowEnd - halfTokens;
+                    start = (shard ? mid : windowStart) / S2_BASE_SIZE;
+                    end = (shard ? windowEnd : mid) / S2_BASE_SIZE;
+                }
+                ScanSequenceHalf(start, end, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
                 if ASCEND_IS_AIV {
                     if (serviceEpoch == epoch) vectorService.RotateFetch(epoch, halfTokens);
                     if (vectorService.IsTopkCheckpoint(epoch))
-                        vectorService.UpdateCheckpointTopk(checkpointInfo, epoch,
-                            rotating::SequenceWindowEnd(runtimeShape_.history, resident_, halfTokens, epoch),
-                            halfTokens, shard);
+                        vectorService.UpdateCheckpointTopk(checkpointInfo, epoch, windowEnd, halfTokens, shard);
                 }
             }
         }

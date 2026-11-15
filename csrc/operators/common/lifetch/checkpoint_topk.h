@@ -7,7 +7,7 @@ struct CheckpointTopk {
     uint32_t initialHotRank;
     uint32_t windowMask;
     uint32_t reuseFinal;
-    uint32_t reserved;
+    uint32_t reverseCold;
 };
 
 constexpr uint32_t kCheckpointEndOffset = 8; // uint16 words in each aligned threshold record

@@ -3,7 +3,8 @@
 import struct
 
 
-def checkpoint_topk_options(initial_hot_rank=2048, topk_checkpoints=(), reuse_checkpoint_topk=False):
+def checkpoint_topk_options(initial_hot_rank=2048, topk_checkpoints=(), reuse_checkpoint_topk=False,
+                            reverse_cold=False):
     windows = tuple(topk_checkpoints)
     if not isinstance(initial_hot_rank, int) or not 1 <= initial_hot_rank <= 2048:
         raise ValueError("initial_hot_rank must be in 1..2048")
@@ -12,14 +13,26 @@ def checkpoint_topk_options(initial_hot_rank=2048, topk_checkpoints=(), reuse_ch
         raise ValueError("topk_checkpoints requires up to six distinct increasing cold window indices in 1..30")
     if reuse_checkpoint_topk and not windows:
         raise ValueError("reuse_checkpoint_topk requires at least one checkpoint")
+    if reverse_cold and not reuse_checkpoint_topk:
+        raise ValueError("reverse_cold requires reuse_checkpoint_topk")
     return struct.pack("<4I", initial_hot_rank, sum(1 << window for window in windows),
-                       int(bool(reuse_checkpoint_topk)), 0)
+                       int(bool(reuse_checkpoint_topk)), int(bool(reverse_cold)))
 
 
 def check_checkpoint_windows(options, rounds):
     _, mask, _, _ = struct.unpack("<4I", options)
     if mask and mask >> max(0, rounds - 1):
         raise ValueError(f"TopK checkpoints must precede the final effective window ({rounds - 1})")
+
+
+def check_reverse_cold(shape):
+    cold = shape.history - shape.resident
+    blocks = cold // 512
+    windows = shape.rounds - 1
+    if (windows < 1 or not shape.splitQ or shape.indexHeads != 32 or shape.resident % 512
+            or cold % 512 or blocks < windows
+            or ((blocks + windows - 1) // windows) * (2 * windows - 1) >= 2 * blocks):
+        raise ValueError("reverse_cold requires sequence-split LI geometry")
 
 
 def prefetch_budget(prefetch_limit=512, window_limit=None, intermediate_fetches=8):

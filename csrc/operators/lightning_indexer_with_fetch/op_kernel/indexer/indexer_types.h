@@ -79,6 +79,8 @@ struct RunInfo {
     bool isLastS2InnerLoop;
     bool isAllLoopEnd = false;
     bool isValid = false;
+    uint32_t reverseScanTilePlusOne = 0;
+    uint32_t reverseScaleTiles = 0;
 };
 
 struct ConstInfo {

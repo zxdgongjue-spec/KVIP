@@ -363,6 +363,13 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
         while(!previous->complete);
     }
     V9_FETCH_PROFILE(event->begin=GetSystemCycle();)
+    const bool reverseCold = ctx->checkpointTopk.reverseCold && sequenceHalfWindow;
+    const uint32_t firstShardWidth = reverseCold ?
+        ReverseColdFirstShard(shape.history, shape.resident, sequenceHalfWindow, shape.rounds) : sequenceHalfWindow;
+    const uint32_t windowEnd = reverseCold ?
+        ReverseColdWindowEnd(shape.history, shape.resident, sequenceHalfWindow, shape.rounds, epoch) :
+        sequenceHalfWindow ? SequenceWindowEnd(shape.history, shape.resident, sequenceHalfWindow, epoch) :
+        RuntimeTrigger(shape.history,shape.resident,shape.rounds,epoch)*128;
 
     auto work=flags.ReinterpretCast<uint32_t>();auto cfg=work[4096];
     auto rowStorage=ids;
@@ -387,8 +394,8 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
         DataCopyPad(work,progressGm[firstBatch*128],gather,padding);
         SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
         for(uint32_t b=firstBatch;b<shape.batch && (b-firstBatch)/shape.serviceLanes<geometry.groups;b+=shape.serviceLanes)for(uint32_t q=0;q<4;++q) {
-            uint32_t end=work.GetValue(((b-firstBatch)/shape.serviceLanes)*128+q*32),cap=sequenceHalfWindow?SequenceWindowEnd(shape.history,shape.resident,sequenceHalfWindow,epoch):RuntimeTrigger(shape.history,shape.resident,shape.rounds,epoch)*128;
-            if(ctx->queryEnds) {
+            uint32_t end=work.GetValue(((b-firstBatch)/shape.serviceLanes)*128+q*32),cap=windowEnd;
+            if(ctx->queryEnds && !reverseCold) {
                 uint32_t bound=reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)[b*4+q];
                 // Compact victim predicates are clipped before publication.
                 if(ctx->lruSlots && bound<shape.resident)bound=shape.resident;

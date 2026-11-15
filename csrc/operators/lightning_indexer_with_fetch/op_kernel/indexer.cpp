@@ -24,8 +24,25 @@ __aicore__ inline void RunLi(GM_ADDR bindings) {
     using namespace AscendC; using namespace QLICommon;
     auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
 #define P(i) reinterpret_cast<GM_ADDR>(a[i])
-    auto shape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(a[14]));
+    auto ctx = reinterpret_cast<__gm__ rotating::Context*>(a[14]);
+    auto shape = rotating::LoadRuntimeShape(ctx);
     bool splitSequence = rotating::UseSequenceSplit(shape) && HasUniformLengths(shape, P(5), P(6));
+    bool reverse = ctx->checkpointTopk.reverseCold != 0;
+    if (reverse && !splitSequence) {
+        if constexpr (Phase == SequenceLiPhase::Hot) {
+            if ASCEND_IS_AIV {
+                if (P(15)) {
+                    auto workspace = reinterpret_cast<__gm__ pipeline_ab::Args*>(a[15]);
+                    auto errors = reinterpret_cast<__gm__ uint32_t*>(workspace->queryErrors);
+                    for (uint32_t q = GetBlockIdx(); q < shape.batch * 4; q += GetBlockNum() * 2) {
+                        errors[q * 32] = 16;
+                        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors + q * 32), 128);
+                    }
+                }
+            }
+        }
+        return;
+    }
     if constexpr (Phase != SequenceLiPhase::Hot) {
         if (!splitSequence) return;
     }
@@ -35,6 +52,7 @@ __aicore__ inline void RunLi(GM_ADDR bindings) {
     QLIKernel::QuantLightningIndexerKernel<Type> op;
     op.runtimeShape_ = shape;
     op.sequenceSplit_ = splitSequence;
+    op.reverseCold_ = reverse;
     op.sequenceTopKOnly_ = Phase == SequenceLiPhase::Threshold || Phase == SequenceLiPhase::Final;
     QLITilingData tiling{shape.batch,shape.batch*4,shape.indexHeads,4,shape.history,
         2048,shape.liCores,128,shape.history/128,0,16384,128,shape.resident,

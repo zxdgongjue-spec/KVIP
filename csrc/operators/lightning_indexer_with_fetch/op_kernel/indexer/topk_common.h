@@ -1133,7 +1133,45 @@ __simd_vf__ void FindRealIndexVFImpl(__ubuf__ uint32_t* outputIdxBuf,
  * @param topK topK元素
  * @param validLen 有效元素个数，按 256 对齐后的 topkCountAlign256_ + validTrunkLen
  */
-template<bool ISOUTVALUE> // 是否输出VALUE
+template <CMPMODE comparison>
+__simd_vf__ inline void FindReverseCheckpointIndices(__ubuf__ uint16_t* output,
+    __ubuf__ uint16_t* input, __ubuf__ uint16_t* hotTags, __ubuf__ uint32_t* cutoff,
+    uint16_t topK, uint16_t length)
+{
+    using namespace AscendC::MicroAPI;
+    if constexpr (comparison == CMPMODE::GT) ClearSpr<AscendC::SpecialPurposeReg::AR>();
+    auto all = CreateMask<uint16_t, MaskPattern::ALL>();
+    UnalignRegForStore alignment;
+    RegTensor<uint32_t> key;
+    LoadAlign<uint32_t, LoadDist::DIST_BRC_B16>(key, cutoff);
+    // New cold IDs fall between all hot IDs and all previously seen cold IDs.
+    // Keep ascending physical order within each score class to match A.
+    for (uint16_t segment = 0; segment < 3; ++segment) {
+        uint16_t begin = segment == 1 ? topK : 0;
+        uint16_t end = segment == 1 ? length : topK;
+        for (uint16_t i = begin; i < end; i += 128) {
+            RegTensor<uint16_t> values, selectedIndices;
+            RegTensor<int16_t> indices;
+            MaskReg keep;
+            LoadAlign(values, input + i);
+            Compare<uint16_t, comparison>(keep, values, reinterpret_cast<RegTensor<uint16_t>&>(key), all);
+            if (segment != 1) {
+                RegTensor<uint16_t> tags;
+                MaskReg sameSegment;
+                LoadAlign(tags, hotTags + i);
+                CompareScalar<uint16_t, CMPMODE::EQ>(sameSegment, tags, uint16_t(segment == 0), all);
+                MaskAnd(keep, keep, sameSegment, all);
+            }
+            Arange(indices, int16_t(i));
+            Squeeze<uint16_t, MicroAPI::GatherMaskMode::STORE_REG>(
+                selectedIndices, reinterpret_cast<RegTensor<uint16_t>&>(indices), keep);
+            StoreUnAlign<uint16_t, PostLiteral::POST_MODE_UPDATE>(output, selectedIndices, alignment);
+        }
+    }
+    StoreUnAlignPost(output, alignment);
+}
+
+template<bool ISOUTVALUE, bool REVERSE_CHECKPOINT = false>
 __aicore__ inline void LiTopKVF(const LocalTensor<uint16_t>& tmpIdxLocal,
                                 const LocalTensor<uint16_t>& outputValueLocal,
                                 const LocalTensor<uint16_t>& inputValueLocal,
@@ -1175,10 +1213,13 @@ __aicore__ inline void LiTopKVF(const LocalTensor<uint16_t>& tmpIdxLocal,
     // filter
     int32_t count = TopKGatherAlign(topK, (uint32_t)128) - topK / 128 * 128;
     AscendC::Duplicate(tmpIdxLocal[topK / 128 * 128], (uint16_t)(0), count);
-    // 输出大于k-value的值idx
-    FindIdxGTOutputVFImpl(tmpIdxBuf, inputValueBuf, (uint32_t)(0), nkValueBuf, inputLoopNum);
-    // 输出等于k-value的值idx
-    FindIdxEQOutputVFImpl(tmpIdxBuf, inputValueBuf, (uint32_t)(0), nkValueBuf, inputLoopNum);
+    if constexpr (REVERSE_CHECKPOINT) {
+        FindReverseCheckpointIndices<CMPMODE::GT>(tmpIdxBuf, inputValueBuf, outputValueBuf, nkValueBuf, topK, validLen);
+        FindReverseCheckpointIndices<CMPMODE::EQ>(tmpIdxBuf, inputValueBuf, outputValueBuf, nkValueBuf, topK, validLen);
+    } else {
+        FindIdxGTOutputVFImpl(tmpIdxBuf, inputValueBuf, (uint32_t)(0), nkValueBuf, inputLoopNum);
+        FindIdxEQOutputVFImpl(tmpIdxBuf, inputValueBuf, (uint32_t)(0), nkValueBuf, inputLoopNum);
+    }
 
     // 是否输出Value
     if constexpr (ISOUTVALUE) {
