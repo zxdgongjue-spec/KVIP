@@ -1,7 +1,7 @@
 """Independent, opt-in variants on top of the consolidated recent-index PR."""
 
 OPTIONS = ("final_topk_prune", "selected_metadata", "early_fetch_ready", "compact_init", "ready_batch_fetch")
-OPTIONAL_OPTIONS = ("ready_direct_ranges",)
+OPTIONAL_OPTIONS = ("ready_direct_ranges", "adaptive_admission", "prefetch_gate")
 DEFAULT_VARIANTS = ("control", "metadata", "ready-batch", "workers4", "ready-batch4", "metadata-end", "control-end")
 VARIANTS = {
     "control": (),
@@ -43,6 +43,10 @@ def admission_for(name):
 def options_for(name):
     values = {key: key in VARIANTS[name] for key in OPTIONS}
     values.update({key: True for key in OPTIONAL_OPTIONS if key in VARIANTS[name]})
+    if name in ADMISSION:
+        values["adaptive_admission"] = True
+        if ADMISSION[name][2]:
+            values["prefetch_gate"] = True
     return values
 
 
@@ -61,4 +65,6 @@ def validate_options(options):
         raise ValueError("ready_batch_fetch requires selected_metadata and early_fetch_ready")
     if options.get("ready_direct_ranges") and not options["ready_batch_fetch"]:
         raise ValueError("ready_direct_ranges requires ready_batch_fetch")
+    if options.get("prefetch_gate") and not options.get("adaptive_admission"):
+        raise ValueError("prefetch_gate requires adaptive_admission")
     return dict(options)

@@ -45,7 +45,7 @@ def _arguments(tmp_path, monkeypatch, variants=None):
 
 
 def _case(args, name):
-    role = "main" if name.startswith("main-") else "pr" if name == "pr-recent" else "candidate"
+    role = "main" if name.startswith("main-") else "pr" if name == "pr-recent" or name.startswith("before-") else "candidate"
     mode = "serial" if name == "main-serial" else "fused"
     mean = 120 if mode == "serial" else 110 if name == "main-resident" else 100 if name == "pr-recent" else 90
     sample = dict(
@@ -93,12 +93,12 @@ def _case(args, name):
                 final_keys=[[3]],
             ),
         )
-        if role == "candidate":
-            result["tuning"].update(options_for(name.removeprefix("candidate-")))
-            admission = admission_for(name.removeprefix("candidate-"))
+        if role == "candidate" or name.startswith("before-"):
+            result["tuning"].update(options_for(name.split("-", 1)[1]))
+            admission = admission_for(name.split("-", 1)[1])
             if admission is not None:
                 result["tuning"]["admission_controls"] = list(admission)
-        result["tuning"]["q_workers"] = q_workers_for(name.removeprefix("candidate-")) if role == "candidate" else 2
+        result["tuning"]["q_workers"] = q_workers_for(name.split("-", 1)[1]) if role == "candidate" or name.startswith("before-") else 2
         result["native_diagnostics"] = dict(
             count=args.diagnostic_replays,
             included_in_timing=False,
@@ -116,7 +116,9 @@ def _case(args, name):
 def _reports(args):
     return {
         name: _case(args, name)
-        for name in ["main-serial", "main-resident", "pr-recent", *("candidate-" + v for v in args.pipeline_variants)]
+        for name in ["main-serial", "main-resident", "pr-recent",
+                     *("before-" + v for v in compare.before_variants(args)),
+                     *("candidate-" + v for v in args.pipeline_variants)]
     }
 
 
@@ -133,6 +135,28 @@ def test_admission_variants_check_controls_and_report_matching_drift(tmp_path, m
     assert "CONTROL_DRIFT" in output and "CHECK scores=bit_exact" in output
     reports["candidate-capacity"]["tuning"]["admission_controls"][0] = 512
     with pytest.raises(ValueError, match="admission controls"):
+        compare.summarize(args, reports, compare.file_digest(args.snapshot / "manifest.json"))
+
+
+def test_matched_before_uses_same_old_options_and_exact_parent_source(tmp_path, monkeypatch):
+    args = _arguments(tmp_path, monkeypatch,
+                      ["ready-batch4", "workers4", "carry", "tight", "ready-batch4-end"])
+    args.matched_before = True
+    job = next(job for job in compare.jobs(args) if job["name"] == "before")
+    parsed = replay.arguments(compare.command(args, job)[4:])
+    assert parsed.upstream_revision == args.pr_sha
+    assert parsed.pipeline_variants == ["ready-batch4", "workers4"]
+    assert all("adaptive_admission" not in options_for(v) for v in parsed.pipeline_variants)
+    reports = _reports(args)
+    before_report = dict(status="pass", study="post-threshold", execution_order=job["variants"],
+                         cases={v: reports["before-" + v] for v in job["variants"]})
+    assert list(compare.unpack_report(job, before_report, job["variants"])) == ["before-ready-batch4", "before-workers4"]
+    summary = compare.summarize(args, reports, compare.file_digest(args.snapshot / "manifest.json"))
+    gain = summary["table"]["candidate-workers4"]["gains"]["vs_matched_before"]
+    assert gain["reference"] == "before-workers4"
+    assert gain["mean_reduction_pct"] == gain["p50_reduction_pct"] == 0
+    reports["before-ready-batch4"]["tuning"]["q_workers"] = 2
+    with pytest.raises(ValueError, match="q_workers"):
         compare.summarize(args, reports, compare.file_digest(args.snapshot / "manifest.json"))
 
 

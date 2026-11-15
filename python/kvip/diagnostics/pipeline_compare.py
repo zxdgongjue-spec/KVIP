@@ -43,6 +43,7 @@ def arguments(argv=None):
     parser.add_argument("--result-dir", type=Path, required=True)
     parser.add_argument("--topk-probe", action="store_true", help="Independent pruning-counter replay after all headline timings")
     parser.add_argument("--brief", action="store_true", help="Print one timing/traffic line per case; keep full JSON")
+    parser.add_argument("--matched-before", action="store_true", help="Also run the PR checkout with matching pre-existing candidate configurations")
     args = parser.parse_args(argv)
     if args.device < 0 or args.warmup < 0 or args.iterations < 1 or args.diagnostic_replays < 0:
         parser.error("Require nonnegative device/warmup and positive iterations")
@@ -65,13 +66,22 @@ def arguments(argv=None):
     return args
 
 
+def before_variants(args):
+    if not getattr(args, "matched_before", False):
+        return []
+    return [name for name in ("ready-batch4", "workers4", "metadata") if name in args.pipeline_variants]
+
+
 def jobs(args):
-    return [
+    plan = [
         dict(name="main-serial", role="main", mode="serial", policy="resident"),
         dict(name="main-resident", role="main", mode="fused", policy="resident"),
         dict(name="pr-recent", role="pr", mode="fused", policy="recent"),
-        dict(name="candidate", role="candidate", mode="fused", policy="recent"),
     ]
+    if variants := before_variants(args):
+        plan.append(dict(name="before", role="pr", mode="fused", policy="recent", variants=variants))
+    plan.append(dict(name="candidate", role="candidate", mode="fused", policy="recent"))
+    return plan
 
 
 def command(args, job):
@@ -108,15 +118,15 @@ def command(args, job):
         "--output",
         str(args.result_dir / (job["name"] + ".json")),
         "--study",
-        "post-threshold" if job["role"] == "candidate" else "threshold",
+        "post-threshold" if job["role"] == "candidate" or job["name"] == "before" else "threshold",
     ]
     if job["mode"] == "serial":
         result += ["--serial-workers", "32"]
     else:
         result += ["--diagnostic-replays", str(args.diagnostic_replays)]
-    if job["role"] == "candidate":
-        result += ["--pipeline-variants", *args.pipeline_variants]
-        if getattr(args, "topk_probe", False):
+    if job["role"] == "candidate" or job["name"] == "before":
+        result += ["--pipeline-variants", *job.get("variants", args.pipeline_variants)]
+        if job["role"] == "candidate" and getattr(args, "topk_probe", False):
             result += ["--topk-probe"]
     return result
 
@@ -124,7 +134,7 @@ def command(args, job):
 def unpack_report(job, report, variants):
     if report.get("status") != "pass":
         raise ValueError(f"{job['name']} did not produce a passing replay result")
-    if job["role"] != "candidate":
+    if job["role"] != "candidate" and job["name"] != "before":
         if "cases" in report:
             raise ValueError(f"{job['name']} must contain exactly one production case")
         return {job["name"]: report}
@@ -132,11 +142,12 @@ def unpack_report(job, report, variants):
         raise ValueError("Candidate study/order differs from the requested variants")
     if list(report.get("cases", {})) != variants:
         raise ValueError("Candidate case keys/order differ from the requested variants")
-    return {"candidate-" + name: report["cases"][name] for name in variants}
+    prefix = "before-" if job["name"] == "before" else "candidate-"
+    return {prefix + name: report["cases"][name] for name in variants}
 
 
 def _validate_case(args, name, result, manifest_digest):
-    role = "main" if name.startswith("main-") else "pr" if name == "pr-recent" else "candidate"
+    role = "main" if name.startswith("main-") else "pr" if name == "pr-recent" or name.startswith("before-") else "candidate"
     mode = "serial" if name == "main-serial" else "fused"
     expected = dict(
         transport="urma",
@@ -179,7 +190,7 @@ def _validate_case(args, name, result, manifest_digest):
         if any(result.get(key) != value for key, value in serial.items()):
             raise ValueError("Main serial must use 32 workers, post=128, inflight=2048 and two jettys/core")
     else:
-        requested_workers = q_workers_for(name.removeprefix("candidate-")) if role == "candidate" else 2
+        requested_workers = q_workers_for(name.split("-", 1)[1]) if role == "candidate" or name.startswith("before-") else 2
         if result.get("tuning", {}).get("q_workers") != requested_workers:
             raise ValueError(f"{name}: fused q_workers differs from the requested variant")
         if result.get("score_comparison", {}).get("status") != "bit_exact":
@@ -229,7 +240,9 @@ def profile_summary(result):
 
 
 def summarize(args, results, manifest_digest):
-    expected_order = ["main-serial", "main-resident", "pr-recent", *("candidate-" + v for v in args.pipeline_variants)]
+    expected_order = ["main-serial", "main-resident", "pr-recent",
+                      *("before-" + v for v in before_variants(args)),
+                      *("candidate-" + v for v in args.pipeline_variants)]
     if list(results) != expected_order:
         raise ValueError("Comparison is missing cases or has an unexpected execution order")
     first = results["main-serial"]
@@ -248,14 +261,15 @@ def summarize(args, results, manifest_digest):
             raise ValueError(f"{name}: fused final ordered TopK differs from PR")
         if result["threshold_comparison"]["final_keys"] != pr["threshold_comparison"]["final_keys"]:
             raise ValueError(f"{name}: fused final threshold differs from PR")
-        if name.startswith("candidate-"):
+        if name.startswith(("candidate-", "before-")):
             if result["threshold_comparison"]["initial_keys"] != pr["threshold_comparison"]["initial_keys"]:
                 raise ValueError(f"{name}: post-threshold optimization changed the early threshold")
-            expected_options = options_for(name.removeprefix("candidate-"))
+            variant = name.split("-", 1)[1]
+            expected_options = options_for(variant)
             tuning = result.get("tuning") or {}
             if any(tuning.get(key) != value for key, value in expected_options.items()):
                 raise ValueError(f"{name}: candidate build options differ")
-            admission = admission_for(name.removeprefix("candidate-"))
+            admission = admission_for(variant)
             if tuning.get("admission_controls") != (list(admission) if admission else None):
                 raise ValueError(f"{name}: candidate admission controls differ")
             excluded = (*OPTIONS, *OPTIONAL_OPTIONS, "q_workers", "admission_controls")
@@ -300,6 +314,16 @@ def summarize(args, results, manifest_digest):
             }
             if control is not None and name.startswith("candidate-")
             else None
+        )
+        matched = "before-" + name.removeprefix("candidate-")
+        if matched not in results:
+            matched = "before-ready-batch4"
+        reference = results.get(matched) if name.startswith("candidate-") else None
+        table[name]["gains"]["vs_matched_before"] = (
+            dict(reference=matched,
+                 mean_reduction_pct=reduction(reference["timing"]["mean_us"], timing["mean_us"]),
+                 p50_reduction_pct=reduction(reference["timing"]["p50_us"], timing["p50_us"]))
+            if reference else None
         )
     control_end = results.get("candidate-control-end" if control_name == "candidate-control" else "candidate-ready-batch4-end")
     drift = None
@@ -350,6 +374,7 @@ def summarize(args, results, manifest_digest):
             "Device complete-graph microseconds, not service TPOT or isolated Fetch latency.",
             "whole_graph_GBps is mean transferred bytes divided by mean complete-graph time; it is not link bandwidth or utilization.",
             "Main serial, main fused and PR fused use separate processes/arenas. Only candidate variants share one arena.",
+            "Optional before-* cases use the PR checkout and matching pre-existing options; their arena is separate from candidate. This controls source/configuration, not physical page placement.",
             "Execution order is retained; no randomized order, confidence interval or cross-process physical-placement equivalence is claimed.",
             "All timing/read samples are retained. Mean/p50 tail heuristics are not significance tests.",
             "Control-end drift is reported without correction. Instrumented role cycles are separate from headline timings and cannot be added into graph latency.",
@@ -361,12 +386,14 @@ def summarize(args, results, manifest_digest):
 
 def print_summary(summary, brief=False):
     if brief:
-        print("case                   mean_us    p50_us  prefetch    final   unused  vsSerial_mean/p50%", flush=True)
+        print("case                   mean_us    p50_us  prefetch    final   unused  vsSerial_mean/p50%  vsBefore_mean/p50%", flush=True)
         for name, row in summary["table"].items():
             reads, gains = row["reads"], row["gains"]["vs_serial"]
+            matched = row["gains"].get("vs_matched_before")
+            comparison = "n/a" if matched is None else f"{matched['mean_reduction_pct']:+7.2f}/{matched['p50_reduction_pct']:+7.2f}"
             print(f"{name:22} {row['mean_us']:9.3f} {row['p50_us']:9.3f} "
                   f"{reads['prefetch']:9.1f} {reads['final']:8.1f} {reads['unused_prefetch']:8.1f} "
-                  f"{gains['mean_reduction_pct']:+7.2f}/{gains['p50_reduction_pct']:+7.2f}", flush=True)
+                  f"{gains['mean_reduction_pct']:+7.2f}/{gains['p50_reduction_pct']:+7.2f} {comparison:>19}", flush=True)
         drift = summary["control_end_drift"]
         if drift:
             print(f"CONTROL_DRIFT {summary['control_name']} mean={drift['mean']['drift_pct']:+.2f}% "
@@ -484,7 +511,7 @@ def run(args):
             if process.returncode:
                 raise RuntimeError(f"child exit={process.returncode}")
             report = json.loads(output.read_text())
-            cases = unpack_report(job, report, args.pipeline_variants)
+            cases = unpack_report(job, report, job.get("variants", args.pipeline_variants))
             for case_name, case in cases.items():
                 _validate_case(args, case_name, case, manifest_digest)
             results.update(cases)
