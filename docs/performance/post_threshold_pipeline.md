@@ -42,6 +42,38 @@ real score bits, ordered TopK, thresholds, KV/Index outputs and full-graph
 mean/p50 for G2/G7/G10/G17/G4. Keep the strong serial reference at 32 workers,
 post size 128 and max inflight 2048, with LIDU and slot mapping included.
 
-Fetch queue ownership, Get worker allocation, bounded ready batching and
-adaptive rolling thresholds are unchanged. They require separate protocol and
-performance evidence; these options do not claim to implement them.
+The four options above leave Fetch queue ownership and Get worker allocation
+unchanged. Queue scheduling experiments are described separately below.
+
+## Prefetch scheduling experiments after admission isolation
+
+The following independently compiled options default to OFF. They preserve
+the current safe Kth, exact TopK, candidate/slot limits and final Get repair.
+
+* `KVIP_SKIP_EXHAUSTED_PREFETCH` stops bitmap/mapping candidate scans for a row
+  once its round-wide slot, request or transport limit is exhausted. A
+  temporary window limit is not sufficient to skip: later carry credits may
+  admit more work. Existing errors, outstanding requests and epoch completion
+  publication are retained. `Event.skipped` counts skipped row-windows;
+  candidate/suppression counters only describe the windows actually scanned.
+* `KVIP_EARLY_PREFETCH_DRAIN` transfers sole prefetch-CQ ownership from the
+  final resolver to the Index worker at streaming-kernel entry. That worker
+  uses the unchanged completion/error checker, then publishes flag 7 while
+  the resolver plans Q4 outputs. The resolver acquires this flag instead of
+  draining the same CQ again. It reacquires the modified Row cache lines;
+  they are disjoint from the resolver's final-state writes. The actual drain
+  can delay Index work if communication is still outstanding, so improvement
+  must be decided from the complete graph, not from earlier flag publication.
+
+Python build arguments are `skip_exhausted_prefetch` and
+`early_prefetch_drain`. Cache keys and native capability exports include both.
+There is no new Context/KVAF ABI, queue, kernel launch or runtime allocation.
+URMA alone uses these paths. The baseline branches compile out the new work.
+
+For instrumented replays, early drain uses Consumer-owned timestamp words
+0..4: begin, end, CQ polls, drain cycles and arrival. Finalize's timestamp 4
+still records its own later join completion; it must not precede timestamp 0.
+The early drain interval and Index/Fetch intervals overlap and are not additive.
+CPU sanitizer tests exercise exhausted-capacity boundaries, final repair,
+single CQ ownership, delayed/error publication and these timestamp contracts.
+They do not establish native CANN compilation, cache correctness or speedup.

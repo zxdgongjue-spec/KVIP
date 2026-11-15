@@ -16,6 +16,7 @@ using namespace rotating;
 using namespace pipeline_ab;
 #include "context_snapshot.h"
 #include "staged_fetch_worker.h"
+#include "early_prefetch_drain.h"
 __simt_callee__
 inline void PublishQ(
  __ubuf__ uint32_t* selected,__ubuf__ uint16_t* ids,__ubuf__ uint32_t* slots,
@@ -209,6 +210,11 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
  // Producer and consumer must not write the same cache lines.
  auto ticks=reinterpret_cast<__gm__ uint64_t*>(a->times)+b*64+32;auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  bool profile=(a->prefetchCount & 0x80000000U)!=0;
+#if KVIP_EARLY_PREFETCH_DRAIN && !V9_UBMEM
+ // No prefetch remains to be submitted after the LI kernel boundary. Join
+ // its CQ while the other two workers resolve slots and publish Q outputs.
+ CompletePrefetchEarly(a,b);
+#endif
  TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,SCRATCH_WORDS*4);auto local=scratch.Get<uint32_t>();
  auto work=reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr());
  uint32_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
@@ -518,6 +524,10 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
  bool profile=(a->prefetchCount & 0x80000000U)!=0;
  auto ft=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*128+uint64_t(b)*128+96;
  if(profile)ft[0]=GetSystemCycle();
+#if KVIP_EARLY_PREFETCH_DRAIN && !V9_UBMEM
+ // Consumer is the only CQ reader and flag-7 writer in this specialization.
+ error|=JoinEarlyPrefetch(a,b,ft,profile);
+#else
  // This request's resolver core owns its prefetch CQ; Q workers only wait
  // on this request's flag when a conflicting range exists.
  uint64_t polls=0,drain=0,arrival=0;
@@ -531,6 +541,7 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
 #endif
  if(profile){ft[4]=GetSystemCycle();ft[5]=polls;ft[6]=drain;ft[7]=arrival;}error|=row->error;flags[7].error=error;flags[7].ready=1;
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+7),sizeof(BatchFlag));
+#endif
  for(uint32_t f=6;f<12;++f){uint64_t start=GetSystemCycle();if(profile)ft[8+2*(f-6)]=start;while(true){
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+f),sizeof(BatchFlag));
   if(flags[f].ready){error|=flags[f].error;break;}

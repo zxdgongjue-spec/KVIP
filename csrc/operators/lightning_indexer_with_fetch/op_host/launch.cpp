@@ -10,6 +10,8 @@ extern "C" uint32_t kvip_ready_batch_fetch() { return KVIP_READY_BATCH_FETCH; }
 extern "C" uint32_t kvip_ready_direct_ranges() { return KVIP_READY_DIRECT_RANGES; }
 extern "C" uint32_t kvip_adaptive_admission() { return KVIP_ADAPTIVE_ADMISSION; }
 extern "C" uint32_t kvip_prefetch_gate() { return KVIP_PREFETCH_GATE; }
+extern "C" uint32_t kvip_skip_exhausted_prefetch() { return KVIP_SKIP_EXHAUSTED_PREFETCH; }
+extern "C" uint32_t kvip_early_prefetch_drain() { return KVIP_EARLY_PREFETCH_DRAIN; }
 extern "C" uint32_t kvip_topk_prune_diagnostics() { return KVIP_TOPK_PRUNE_DIAGNOSTICS; }
 extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) { return rotating::PrepareShape(shape); }
 #define ENTRY(name, blocks) \

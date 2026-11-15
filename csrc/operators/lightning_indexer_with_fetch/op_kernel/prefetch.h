@@ -17,6 +17,9 @@ namespace kvaf_device { using ubmem_device::CleanCacheLines; constexpr uint32_t 
 #if KVIP_ADAPTIVE_ADMISSION
 #include "admission_policy.h"
 #endif
+#if KVIP_SKIP_EXHAUSTED_PREFETCH
+#include "prefetch_exhaustion.h"
+#endif
 #include "../../common/lifetch/prefetch_budget.h"
 
 // Imported from direct_slots.h
@@ -585,6 +588,9 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
     uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0;
     uint64_t scanBegin=0,candidateBegin=0,postBegin=0,begin=0;
     uint64_t firstDoorbell=0,lastDoorbell=0;
+#if KVIP_SKIP_EXHAUSTED_PREFETCH
+    uint32_t exhaustedRows=0;
+#endif
     auto ctx=reinterpret_cast<__gm__ Context*>(pointer);auto events=reinterpret_cast<__gm__ Event*>(ctx->events);
     auto event=events+epoch*rt_serviceLanes+lane;event->core=core;event->epoch=epoch;V9_FETCH_PROFILE(event->waitBegin=GetSystemCycle();)
     if(epoch) {
@@ -658,6 +664,16 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
 auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         if (rt_batchedRows) postInput.SetValue(64,0);
         if(state.GetValue(11))continue;
+#if KVIP_SKIP_EXHAUSTED_PREFETCH
+        // No later window can admit another request once a round-wide
+        // capacity is exhausted. Keep SQ/pending/map/cursors untouched;
+        // final TopK repair does not depend on scanning these candidates.
+        if(kvip_prefetch::Exhausted(state.GetValue(8),state.GetValue(9),
+                state.GetValue(208),state.GetValue(209),state.GetValue(210))) {
+            ++exhaustedRows;
+            continue;
+        }
+#endif
 #if KVIP_ADAPTIVE_ADMISSION
         // Zero admission still reaches this service lane's completion
         // publication below; final repair remains responsible for all misses.
@@ -835,6 +851,12 @@ if (rt_batchedRows) {
 }
     V9_FETCH_PROFILE(event->scanTicks=scanTicks;event->candidateTicks=candidateTicks;event->postTicks=postTicks;)
     V9_FETCH_PROFILE(event->bitmapBytes=bitmapBytes;event->candidateCount=totalCandidates;event->postedCount=postedCount;)
+#if KVIP_SKIP_EXHAUSTED_PREFETCH
+    // candidateCount/suppressed count scanned candidates only. Expose the
+    // omitted row-windows without changing Event's existing ABI or claiming
+    // their unscanned candidate count is zero.
+    event->skipped=exhaustedRows;
+#endif
     if(captureIo){auto stamp=reinterpret_cast<__gm__ uint64_t*>(event->pad);stamp[0]=firstDoorbell;stamp[1]=lastDoorbell;}
     V9_FETCH_PROFILE(event->end=GetSystemCycle();)event->complete=1;
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event),captureIo?sizeof(Event):64);

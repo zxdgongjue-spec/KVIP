@@ -29,6 +29,7 @@ def test_pipeline_options_isolate_and_reuse_the_correct_binary(monkeypatch, tmp_
     options = (
         "final_topk_prune", "selected_metadata", "early_fetch_ready", "compact_init",
         "ready_batch_fetch", "ready_direct_ranges", "adaptive_admission", "topk_prune_diagnostics",
+        "skip_exhausted_prefetch", "early_prefetch_drain",
     )
     for option in options:
         result = build.build_libraries(**arguments, **{option: True})
@@ -51,7 +52,8 @@ def test_pipeline_options_isolate_and_reuse_the_correct_binary(monkeypatch, tmp_
 
 
 @pytest.mark.parametrize("value", (1, 0, "OFF", None))
-@pytest.mark.parametrize("option", ("compact_init", "adaptive_admission", "prefetch_gate"))
+@pytest.mark.parametrize("option", ("compact_init", "adaptive_admission", "prefetch_gate",
+                                    "skip_exhausted_prefetch", "early_prefetch_drain"))
 def test_pipeline_options_reject_ambiguous_values_before_build(tmp_path, value, option):
     with pytest.raises(ValueError, match="must be bool"):
         build.build_libraries(cache_dir=tmp_path, cann=tmp_path, headers=tmp_path, soc="A5", **{option: value})
