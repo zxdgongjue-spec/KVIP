@@ -63,6 +63,30 @@ def test_early_drain_is_separate_from_later_resolver_join():
     assert "early_prefetch_drain" not in old["metrics"]
 
 
+def test_index_role_interval_keeps_work_moved_before_init_in_scope():
+    raw = _raw()
+    consumer = raw[:128].reshape(2, 64)[:, 32:]
+    consumer[:, :2] = [100, 180]
+    consumer[:, 10] = 200
+    consumer[:, 24] = 260
+    roles = raw[512:].reshape(-1, 32)
+    roles[[1, 4], :2] = [90, 280]
+    sample = native_profile.decode_profile(
+        raw, batch=2, workers=2, resolver_cores=3, transport="urma", early_prefetch_drain=True
+    )
+    assert sample["metrics"]["index_role_span"]["samples_cycles"] == [190, 190]
+    assert sample["metrics"]["index_consumer_span"]["samples_cycles"] == [60, 60]
+    assert sample["metrics"]["early_prefetch_drain"]["samples_cycles"] == [80, 80]
+    assert "excludes early drain" in sample["scope"]["index"]
+    # The headline role time stays fixed when only the subinterval start moves.
+    consumer[:, 10] = 210
+    after = native_profile.decode_profile(
+        raw, batch=2, workers=2, resolver_cores=3, transport="urma", early_prefetch_drain=True
+    )
+    assert after["metrics"]["index_role_span"] == sample["metrics"]["index_role_span"]
+    assert after["metrics"]["index_consumer_span"]["median_cycles"] == 50
+
+
 def test_capacity_skip_counter_does_not_become_a_zero_candidate_count(monkeypatch):
     rows = np.zeros((1, 256), dtype=np.int32)
     rows[0, 9] = 2
@@ -234,6 +258,46 @@ def test_ready_batch_native_durations_exclude_inter_call_wait_and_deduplicate():
     assert result['metrics']['fetch_safe_submit_or_sync']['status'] == 'unavailable'
     assert result['metrics']['cq_drain']['count'] == 8
     assert result['ready_batch_counts'] == dict(native_calls=16, completed_requests=1024, worker_count=8)
+    assert result['metrics']['fetch_dependency_wait']['status'] == 'not_entered'
+    assert result['ready_batch_by_query'] == [
+        dict(query=i, requests=256, calls=4, native_max_cycles=600, active_workers=2, worker_count=2)
+        for i in range(4)
+    ]
     q[2, 0, 23] = 9
     with pytest.raises(ValueError, match='Replicated shared'):
         native_profile.decode_profile(raw, batch=batch, workers=workers, resolver_cores=3, transport='urma')
+
+
+def test_ready_query_load_and_conflict_wait_distinguish_idle_from_missing(capsys):
+    batch, workers = 4, 2
+    raw = np.zeros(batch * 256 + (3 * batch + 4 * workers) * 32, dtype=np.int64)
+    queries = raw[batch * 128:batch * 256].reshape(batch, 128)[:, :96].reshape(batch, 4, 24)
+    for b, q in np.ndindex(batch, 4):
+        lane = b % workers
+        requests = 100 * (q + 1) + lane if q < 3 or lane == 0 else 0
+        calls = q + 1 if requests else 0
+        cycles = 50 * calls + lane if requests else 0
+        queries[b, q, [20, 21, 22, 23]] = [4, cycles, requests, calls]
+    sample = native_profile.decode_profile(raw, batch=batch, workers=workers, resolver_cores=3, transport='urma')
+    rows = sample['ready_batch_by_query']
+    assert rows[0] == dict(query=0, requests=201, calls=2, native_max_cycles=51, active_workers=2, worker_count=2)
+    assert rows[3] == dict(query=3, requests=400, calls=4, native_max_cycles=200, active_workers=1, worker_count=2)
+    assert sum(row['requests'] for row in rows) == sample['ready_batch_counts']['completed_requests']
+    assert sum(row['calls'] for row in rows) == sample['ready_batch_counts']['native_calls']
+    native_profile.print_profile('ready', {'samples': [sample]})
+    assert 'fetch_dependency_wait=not_entered' in capsys.readouterr().out
+    # Per-request dependency timestamps are not replicated worker counters.
+    queries[2, 0, [5, 6]] = [100, 140]
+    entered = native_profile.decode_profile(raw, batch=batch, workers=workers, resolver_cores=3, transport='urma')
+    assert entered['metrics']['fetch_dependency_wait']['status'] == 'available'
+    assert entered['metrics']['fetch_dependency_wait']['samples_cycles'] == [40]
+
+
+@pytest.mark.parametrize('timestamps', [(0, 100), (100, 0), (100, 99)])
+def test_ready_conflict_partial_or_reversed_markers_are_not_hidden(timestamps):
+    raw = _raw()
+    queries = raw[256:512].reshape(2, 128)[:, :96].reshape(2, 4, 24)
+    queries[:, :, 20] = 4
+    queries[0, 0, [5, 6]] = timestamps
+    with pytest.raises(ValueError, match='fetch_dependency_wait'):
+        native_profile.decode_profile(raw, batch=2, workers=2, resolver_cores=3, transport='urma')

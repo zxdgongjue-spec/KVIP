@@ -162,6 +162,35 @@ def test_prefetch_scheduling_variants_preserve_budget_and_measure_separate_roles
     assert "ROLE_P50_CYCLES" in output and "early_prefetch_drain=na" in output
 
 
+def test_brief_report_keeps_zero_skip_and_not_entered_and_per_query_counts(tmp_path, monkeypatch, capsys):
+    args = _arguments(tmp_path, monkeypatch, ['ready-batch4', 'saturated-skip', 'ready-batch4-end'])
+    reports = _reports(args)
+    row = reports['candidate-saturated-skip']
+    for sample in row['reads_samples']:
+        sample['capacity_skipped_row_windows'] = 0
+    profile = row['native_diagnostics']['samples'][0]
+    profile['metrics']['fetch_dependency_wait'] = dict(status='not_entered', samples_cycles=[])
+    profile['metrics']['index_role_span'] = dict(status='available', samples_cycles=[70, 90])
+    profile['metrics']['index_consumer_span'] = dict(status='available', samples_cycles=[30, 50])
+    profile['ready_batch_by_query'] = [
+        dict(query=q, requests=100 + q, calls=q + 1, native_max_cycles=300 + q,
+             active_workers=2, worker_count=4) for q in range(4)
+    ]
+    summary = compare.summarize(args, reports, compare.file_digest(args.snapshot / 'manifest.json'))
+    assert summary['table']['candidate-ready-batch4']['capacity_skipped_row_windows'] is None
+    metrics = summary['table']['candidate-saturated-skip']['diagnostic_summary']['metrics']
+    assert metrics['dependency_wait']['status'] == 'not_entered'
+    assert metrics['index_total']['p50_cycles'] == 80
+    assert metrics['index']['p50_cycles'] == 40
+    compare.print_summary(summary, brief=True)
+    output = capsys.readouterr().out
+    assert output.count('SKIPPED_ROW_WINDOWS=0.0') == 1
+    assert 'dependency_wait=not_entered' in output
+    assert 'index_total=80 index=40' in output
+    assert 'Q0(requests=100,calls=1,native_max_cycles=300,active=2/4)' in output
+    assert 'index=InitShadow_to_commit_excluding_early_drain_and_status' in output
+
+
 def test_matched_before_uses_same_old_options_and_exact_parent_source(tmp_path, monkeypatch):
     args = _arguments(tmp_path, monkeypatch,
                       ["ready-batch4", "workers4", "carry", "tight", "ready-batch4-end"])

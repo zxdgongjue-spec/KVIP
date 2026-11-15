@@ -19,8 +19,58 @@ def decode_tagged_mapping(mapping, rows):
     return np.where(valid, raw & np.uint32(0x3FFFF), np.uint32(0xFFFFFFFF)).view(np.int32)
 
 
+def decode_inverse_mapping(mapping, sources, counts, tail_bounds, resident, output_stride):
+    """Normalize lazy mapping outside timing using the immutable prefetch log.
+
+    Final resolution may overwrite ``changes`` when it reuses a destination.
+    The producer's event-source prefix retains the original prefetch IDs.
+    Stale forward entries must not count as traffic in this invocation.
+    """
+    raw = np.asarray(mapping).view(np.uint32)
+    sources = np.asarray(sources)
+    counts = np.asarray(counts)
+    if (raw.ndim != 2 or sources.ndim != 2 or len(raw) != len(sources)
+            or counts.shape != (len(raw),) or sources.shape[1] < 2048
+            or np.any((counts < 0) | (counts > 2048))):
+        raise ValueError("Inverse mapping requires valid per-row prefetch records")
+    result = np.full(raw.shape, np.uint32(0xFFFFFFFF), dtype=np.uint32)
+    for b, n in enumerate(counts):
+        ids = sources[b, :int(n)].astype(np.int64)
+        slots = np.arange(int(n), dtype=np.uint32) + resident
+        if np.any((ids < 0) | (ids >= raw.shape[1])) or len(np.unique(ids)) != len(ids):
+            raise AssertionError("Prefetch records contain invalid or duplicate token IDs")
+        if not np.array_equal(raw[b, ids], slots):
+            raise AssertionError("Current prefetch records disagree with forward mapping")
+        result[b, ids] = slots
+    tail_tokens = output_stride - resident
+    if tail_tokens < 0:
+        raise ValueError("Output stride is smaller than the resident cache")
+    if tail_bounds is not None:
+        bounds = np.asarray(tail_bounds)
+        if bounds.shape != (len(raw), 2):
+            raise ValueError("Tail bounds do not match mapping rows")
+        if tail_tokens:
+            for b, (begin, end) in enumerate(bounds):
+                begin, end = int(begin), int(end)
+                stop = min(end, begin + tail_tokens, raw.shape[1])
+                if begin < 0 or end < begin:
+                    raise ValueError("Invalid tail bounds")
+                ids = np.arange(begin, stop, dtype=np.int64)
+                if np.any(result[b, ids] != np.uint32(0xFFFFFFFF)):
+                    raise AssertionError("An ABC-resident token was counted as prefetch")
+                result[b, ids] = resident + 8192 + ids % tail_tokens
+    return result.view(np.int32)
+
+
 def mapping_values(torch, rotating, rows=None):
     raw = cpu_array(torch, rotating.mapping)
+    if getattr(rotating, "inverse_mapping", False):
+        control = cpu_array(torch, rotating.rows) if rows is None else rows
+        return decode_inverse_mapping(
+            raw, cpu_array(torch, rotating.prefetch_sources), control[:, 8],
+            None if rotating.tail_bounds is None else cpu_array(torch, rotating.tail_bounds),
+            rotating.hot_valid.shape[1], rotating.output_stride,
+        )
     if not getattr(getattr(rotating, "shape", None), "tagged_map", False):
         return raw
     return decode_tagged_mapping(raw, cpu_array(torch, rotating.rows) if rows is None else rows)

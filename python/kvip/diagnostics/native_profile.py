@@ -49,6 +49,11 @@ def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_
     interval("li_final_classification", li_queries, 2, 7)
     producer = producer_update[:, :32]
     consumer = producer_update[:, 32:]
+    # The dedicated role markers bracket the entire Consumer, including an
+    # optional early CQ drain before InitShadow. Keep the older work interval
+    # separate so moving work across its start cannot look like saved time.
+    index_roles = cores[np.arange(batch) * resolver_cores + 1] if resolver_cores > 1 else cores[:0]
+    interval("index_role_span", index_roles, 0, 1)
     if early_prefetch_drain:
         if transport != "urma":
             raise ValueError("Early prefetch drain markers require URMA")
@@ -86,6 +91,13 @@ def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_
                 samples_cycles=values,
             )
     if ready_batches:
+        dependency = metrics["fetch_dependency_wait"]
+        if dependency["status"] == "unavailable" and np.all(queries[:, 5:7] == 0):
+            # The ready-worker profile tag establishes that these zero fields
+            # are initialized diagnostics. Prefetch() writes fields 5/6 only
+            # when it encounters a conflicting destination range.
+            dependency["status"] = "not_entered"
+            dependency["reason"] = "No ready-worker query entered the prefetch-conflict wait"
         # The first-start/last-end envelope contains inter-call polling/packing.
         # Keep it distinct from the sum of actual native Get call durations.
         interval("fetch_batch_envelope", get_queries, 3, 4)
@@ -111,6 +123,17 @@ def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_
             completed_requests=sum(int(row[22]) for row in get_queries),
             worker_count=len(get_queries),
         ) if ready_batches else None),
+        ready_batch_by_query=([
+            dict(
+                query=q,
+                requests=sum(int(row[22]) for row in shaped[: min(batch, workers), q]),
+                calls=sum(int(row[23]) for row in shaped[: min(batch, workers), q]),
+                native_max_cycles=max(int(row[21]) for row in shaped[: min(batch, workers), q]),
+                active_workers=sum(int(row[22]) > 0 for row in shaped[: min(batch, workers), q]),
+                worker_count=min(batch, workers),
+            )
+            for q in range(4)
+        ] if ready_batches else None),
         raw=dict(
             batch=batch,
             workers_per_query=workers,
@@ -127,6 +150,11 @@ def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_
             + "; post_active/CQ drain sum safe and conflict phases only within each worker, not across workers",
             scan="No standalone full-history scan or QK duration is derived from these markers",
             aggregation="Median/max across request/query role samples; overlapping intervals are not additive",
+            index=(
+                "index_role_span brackets Consumer role entry/exit, including early prefetch drain; "
+                "index_consumer_span brackets InitShadow through metadata commit and excludes early drain "
+                "and final status publication"
+            ),
             prefetch_completion=(
                 "early_prefetch_drain is the Consumer-owned CQ drain; final_prefetch_join is the later resolver acquire"
                 if early_prefetch_drain else "final_prefetch_join includes the resolver-owned CQ drain"
@@ -150,7 +178,9 @@ def print_profile(name, report):
         fields = []
         for key in names:
             metric = sample["metrics"].get(key)
-            if not metric or metric["status"] == "unavailable":
+            if metric and metric["status"] == "not_entered":
+                fields.append(f"{key}=not_entered")
+            elif not metric or metric["status"] == "unavailable":
                 fields.append(f"{key}=unavailable")
             else:
                 fields.append(f"{key}={metric['median_cycles']:.0f}/{metric['max_cycles']}")

@@ -260,6 +260,11 @@ def create_fused(
         outputs=torch.empty((2, b * 4, 1, 2048), dtype=torch.int32, device=device),
     )
     forward = LIFetchForward(rotating, update, **({"q_workers": q_workers} if q_workers != 2 else {}))
+    if effective.get("inverse_mapping", False):
+        # Untimed traffic accounting uses the producer's immutable prefetch
+        # prefix; final resolution may already have reused ``changes`` slots.
+        rotating.inverse_mapping = True
+        rotating.prefetch_sources = forward.events_src
     selector = SimpleNamespace(
         storage=storage, inputs=workspace.inputs, rotating=rotating, update=update, topk=workspace.topk
     )

@@ -2,7 +2,7 @@
 
 OPTIONS = ("final_topk_prune", "selected_metadata", "early_fetch_ready", "compact_init", "ready_batch_fetch")
 OPTIONAL_OPTIONS = ("ready_direct_ranges", "adaptive_admission", "prefetch_gate",
-                    "skip_exhausted_prefetch", "early_prefetch_drain")
+                    "skip_exhausted_prefetch", "early_prefetch_drain", "inverse_mapping")
 DEFAULT_VARIANTS = ("control", "metadata", "ready-batch", "workers4", "ready-batch4", "metadata-end", "control-end")
 VARIANTS = {
     "control": (),
@@ -27,6 +27,9 @@ VARIANTS = {
     "early-drain": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "early_prefetch_drain"),
     "skip-drain": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "skip_exhausted_prefetch", "early_prefetch_drain"),
     "capacity-skip-drain": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "skip_exhausted_prefetch", "early_prefetch_drain"),
+    "inverse-map": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "inverse_mapping"),
+    "inverse-map-skip": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "inverse_mapping", "skip_exhausted_prefetch"),
+    "capacity-inverse-map": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "inverse_mapping"),
 }
 
 # Fixed policies are controlled experiments, not a claim that one is best for
@@ -39,6 +42,7 @@ ADMISSION = {
     "direct": (768, 128, 0, 1),
     "direct-tight": (768, 128, 1, 1),
     "capacity-skip-drain": (768, 128, 0, 1),
+    "capacity-inverse-map": (768, 128, 0, 1),
 }
 
 
@@ -60,7 +64,8 @@ def q_workers_for(name):
     if name not in VARIANTS:
         raise ValueError(f"Unknown pipeline variant: {name}")
     return 4 if name in ("workers4", "ready-batch4", "ready-batch4-end",
-                        "saturated-skip", "early-drain", "skip-drain", *ADMISSION) else 2
+                        "saturated-skip", "early-drain", "skip-drain",
+                        "inverse-map", "inverse-map-skip", *ADMISSION) else 2
 
 
 def validate_options(options):

@@ -223,6 +223,7 @@ def profile_summary(result):
         "get_pack": "fetch_pack",
         "producer": "producer_span",
         "index": "index_consumer_span",
+        "index_total": "index_role_span",
         "index_metadata": "index_metadata",
         "dependency_wait": "fetch_dependency_wait",
         "prefetch_join": "final_prefetch_join",
@@ -230,14 +231,20 @@ def profile_summary(result):
     }
     values = {}
     for label, key in fields.items():
-        samples = []
+        samples, statuses = [], []
         for replay in profile["samples"]:
             metric = replay.get("metrics", {}).get(key, {})
+            statuses.append(metric.get("status", "unavailable"))
             if metric.get("status") == "available":
                 samples.extend(metric["samples_cycles"])
-        values[label] = dict(count=len(samples), p50_cycles=float(median(samples)) if samples else None)
+        status = "available" if samples else (
+            "not_entered" if statuses and all(value == "not_entered" for value in statuses) else "unavailable"
+        )
+        values[label] = dict(status=status, count=len(samples), p50_cycles=float(median(samples)) if samples else None)
     return dict(count=profile["count"], units="raw_device_cycles", included_in_timing=False, metrics=values,
-                ready_batch_counts=[item["ready_batch_counts"] for item in profile["samples"] if item.get("ready_batch_counts")])
+                ready_batch_counts=[item["ready_batch_counts"] for item in profile["samples"] if item.get("ready_batch_counts")],
+                ready_batch_by_query=[dict(replay=i + 1, queries=item["ready_batch_by_query"])
+                                      for i, item in enumerate(profile["samples"]) if item.get("ready_batch_by_query")])
 
 
 def summarize(args, results, manifest_digest):
@@ -307,9 +314,11 @@ def summarize(args, results, manifest_digest):
             selection_comparison=result["selection_comparison"],
             threshold_comparison=result.get("threshold_comparison"),
             diagnostic_summary=profile_summary(result),
-            capacity_skipped_row_windows=sum(
-                item.get("capacity_skipped_row_windows", 0) for item in result["reads_samples"]
-            ) / len(result["reads_samples"]),
+            capacity_skipped_row_windows=(sum(
+                item["capacity_skipped_row_windows"] for item in result["reads_samples"]
+            ) / len(result["reads_samples"]) if all(
+                "capacity_skipped_row_windows" in item for item in result["reads_samples"]
+            ) else None),
         )
         table[name]["gains"]["vs_control"] = (
             {
@@ -398,20 +407,30 @@ def print_summary(summary, brief=False):
             print(f"{name:22} {row['mean_us']:9.3f} {row['p50_us']:9.3f} "
                   f"{reads['prefetch']:9.1f} {reads['final']:8.1f} {reads['unused_prefetch']:8.1f} "
                   f"{gains['mean_reduction_pct']:+7.2f}/{gains['p50_reduction_pct']:+7.2f} {comparison:>19}", flush=True)
-            if row.get("capacity_skipped_row_windows"):
+            if row.get("capacity_skipped_row_windows") is not None:
                 print(f"  SKIPPED_ROW_WINDOWS={row['capacity_skipped_row_windows']:.1f} suppression_counts=scanned_only", flush=True)
-            if row.get("diagnostic_summary"):
+            if name.startswith("candidate-") and row.get("diagnostic_summary"):
                 metrics = row["diagnostic_summary"]["metrics"]
                 fields = []
-                for key in ("producer", "index", "dependency_wait", "get_native", "prefetch_join", "early_prefetch_drain"):
-                    value = metrics[key]["p50_cycles"]
-                    fields.append(f"{key}={value:.0f}" if value is not None else f"{key}=na")
+                for key in ("producer", "index_total", "index", "dependency_wait", "get_native", "prefetch_join", "early_prefetch_drain"):
+                    metric = metrics.get(key, {})
+                    value = metric.get("p50_cycles")
+                    absent = "not_entered" if metric.get("status") == "not_entered" else "na"
+                    fields.append(f"{key}={value:.0f}" if value is not None else f"{key}={absent}")
                 print("  ROLE_P50_CYCLES " + " ".join(fields), flush=True)
+                for sample in row["diagnostic_summary"].get("ready_batch_by_query", []):
+                    print(f"  GET_BY_Q replay={sample['replay']} " + " ".join(
+                        f"Q{q['query']}(requests={q['requests']},calls={q['calls']},"
+                        f"native_max_cycles={q['native_max_cycles']},active={q['active_workers']}/{q['worker_count']})"
+                        for q in sample["queries"]), flush=True)
         drift = summary["control_end_drift"]
         if drift:
             print(f"CONTROL_DRIFT {summary['control_name']} mean={drift['mean']['drift_pct']:+.2f}% "
                   f"p50={drift['p50']['drift_pct']:+.2f}% no_correction", flush=True)
         print("CHECK scores=bit_exact fused_ordered_topk=unchanged safe_thresholds=unchanged full_graph_us=true", flush=True)
+        if any(row.get("diagnostic_summary") for row in summary["table"].values()):
+            print("PROFILE_SCOPE separate_replay; index_total=role_entry_to_exit; "
+                  "index=InitShadow_to_commit_excluding_early_drain_and_status; cycles_are_not_additive", flush=True)
         return
     print(
         "case                  mean_us    p50_us  vsControl_p50/mean%  vsPR_p50/mean%  vsSerial_p50/mean%", flush=True
@@ -434,7 +453,8 @@ def print_summary(summary, brief=False):
         profile = row["diagnostic_summary"]
         if profile is not None:
             fields = [
-                f"{key}=" + ("n/a" if value["p50_cycles"] is None else f"{value['p50_cycles']:.0f}")
+                f"{key}=" + (("not_entered" if value.get("status") == "not_entered" else "n/a")
+                             if value["p50_cycles"] is None else f"{value['p50_cycles']:.0f}")
                 for key, value in profile["metrics"].items()
             ]
             print("  PROFILE p50_cycles " + " ".join(fields), flush=True)
