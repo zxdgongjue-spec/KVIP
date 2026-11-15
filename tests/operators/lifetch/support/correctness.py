@@ -96,6 +96,8 @@ def check_contracts(transport):
     rejected('reject_hot_checkpoint', lambda: checkpoint_topk_options(topk_checkpoints=(0,)))
     rejected('reject_unsorted_checkpoints', lambda: checkpoint_topk_options(topk_checkpoints=(2, 1)))
     rejected('reject_reuse_without_checkpoint', lambda: checkpoint_topk_options(reuse_checkpoint_topk=True))
+    rejected('reject_reverse_without_reuse', lambda: checkpoint_topk_options(
+        topk_checkpoints=(1, 2, 3, 4, 5, 6), reverse_cold=True))
     from kvip.operators.lifetch.geometry import li_geometry, trigger_tokens
     for name, history, resident in (
         ('unaligned_history', 131073, 16384), ('unaligned_resident', 131072, 16385),

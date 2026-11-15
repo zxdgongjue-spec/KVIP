@@ -5,7 +5,7 @@
         uint32_t first=KV_WINDOW_HISTORY,last=lower;
         bool aggregate=true;
         for(uint32_t shard=0;shard<shards;++shard) {
-            uint32_t shardLower=shard?KV_WINDOW_RESIDENT+sequenceHalfWindow:lower;
+            uint32_t shardLower=shard?KV_WINDOW_RESIDENT+firstShardWidth:lower;
             readyBegin[shard]=KV_WINDOW_HISTORY;readyEnd[shard]=shardLower;
             for(uint32_t q=0;q<4;++q) {
                 uint32_t prior=shard?(epoch?state.GetValue(80+(epoch-1)*4+q):0):state.GetValue(12+q);
@@ -35,7 +35,8 @@
             }
             uint32_t shard=0,scanEnd=last;
             if(sequenceHalfWindow) {
-                auto slice=SequenceSliceAt(base,KV_WINDOW_RESIDENT,sequenceHalfWindow);
+                auto slice=reverseCold ? ReverseColdSliceAt(base, KV_WINDOW_RESIDENT, sequenceHalfWindow, firstShardWidth) :
+                    SequenceSliceAt(base, KV_WINDOW_RESIDENT, sequenceHalfWindow);
                 shard=slice.shard;
                 // Traverse absolute token order, but skip each shard's holes
                 // independently before applying the shared candidate budget.
@@ -114,4 +115,10 @@
                 reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
                 reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots,candidateCount);
             SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        }
+        if (reverseCold && candidateCount) {
+            Simt::VF_CALL<RestoreReverseColdTokens>(Simt::Dim3{256,1,1},
+                reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()), candidateCount,
+                KV_WINDOW_RESIDENT, KV_WINDOW_HISTORY + KV_WINDOW_RESIDENT);
+            SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
         }

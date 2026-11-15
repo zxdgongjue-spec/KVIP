@@ -21,6 +21,15 @@
 #include "topk_common.h"
 
 namespace topk {
+__simt_vf__ __aicore__ LAUNCH_BOUND(256)
+inline void MarkHotTopkTags(__ubuf__ uint32_t* tags, const __ubuf__ uint32_t* ids,
+                            uint32_t topK, uint32_t resident)
+{
+    for (uint32_t i = threadIdx.x; i < topK / 2; i += 256) {
+        tags[i] = uint32_t(ids[2 * i] < resident) | (uint32_t(ids[2 * i + 1] < resident) << 16);
+    }
+}
+
 template<typename T>
 class LITopk {
 public:
@@ -141,10 +150,22 @@ public:
     // Keep history ahead of the new, ascending physical IDs. The selector
     // retains scan order within equal keys, including a tie at rank 2048.
     __aicore__ inline void MergeCheckpoint(LocalTensor<uint16_t>& input,
-        LocalTensor<uint16_t>& scores, uint32_t newBegin, uint32_t length, uint32_t merge)
+        LocalTensor<uint16_t>& scores, uint32_t newBegin, uint32_t length, uint32_t merge,
+        uint32_t reverseResident)
     {
-        topkb16gather::LiTopKVF<true>(tmpIndexLocal, scores, input, histogramsLocal,
-            idxHighLocal, idxLowLocal, nkValueLocal, topK, length);
+        if (reverseResident) {
+            // History scores are already in input; use the output buffer
+            // for hot tags until the selection writes the new scores there.
+            Simt::VF_CALL<MarkHotTopkTags>(Simt::Dim3{256,1,1},
+                reinterpret_cast<__ubuf__ uint32_t*>(scores.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(hisIndexLocal[merge % 2].GetPhyAddr()), topK, reverseResident);
+            PipeBarrier<PIPE_V>();
+            topkb16gather::LiTopKVF<true, true>(tmpIndexLocal, scores, input, histogramsLocal,
+                idxHighLocal, idxLowLocal, nkValueLocal, topK, length);
+        } else {
+            topkb16gather::LiTopKVF<true>(tmpIndexLocal, scores, input, histogramsLocal,
+                idxHighLocal, idxLowLocal, nkValueLocal, topK, length);
+        }
         PipeBarrier<PIPE_V>();
         topkb16gather::LiTopKGatherVF(hisIndexLocal[1 - merge % 2], scores, input, tmpIndexLocal,
             hisIndexLocal[merge % 2], topK, newBegin - topK, length);

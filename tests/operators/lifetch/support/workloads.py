@@ -117,6 +117,7 @@ def configuration(argv=None):
         command.add_argument('--initial-hot-rank', type=int, default=2048)
         command.add_argument('--topk-checkpoints', default=(), type=csv_values)
         command.add_argument('--reuse-checkpoint-topk', action='store_true')
+        command.add_argument('--reverse-cold', action='store_true')
         if mode == 'check':
             command.add_argument('--suite', type=csv_values, default=('all',))
             command.add_argument('--cases', type=csv_values)
@@ -153,7 +154,8 @@ def configuration(argv=None):
     try:
         args.checkpoint_topk = dict(initial_hot_rank=args.initial_hot_rank,
                                      topk_checkpoints=tuple(map(int, args.topk_checkpoints)),
-                                     reuse_checkpoint_topk=args.reuse_checkpoint_topk)
+                                     reuse_checkpoint_topk=args.reuse_checkpoint_topk,
+                                     reverse_cold=args.reverse_cold)
         checkpoint_topk_options(**args.checkpoint_topk)
     except ValueError as error:
         parser.error(str(error))

@@ -33,6 +33,32 @@ namespace QLIKernel {
 using namespace QLICommon;
 constexpr uint32_t TRUNK_LEN_16K = 16384;
 constexpr uint32_t TRUNK_LEN_6K = 6144;
+
+__simt_callee__ inline uint32_t ReverseColdHitWord(uint32_t bits, uint32_t start, uint32_t end)
+{
+    uint32_t n = end > start ? end - start : 0;
+    if (n < 16) bits &= (1U << (2 * n)) - 1;
+    bits = ((bits & 0x33333333U) << 2) | ((bits >> 2) & 0x33333333U);
+    bits = ((bits & 0x0f0f0f0fU) << 4) | ((bits >> 4) & 0x0f0f0f0fU);
+    bits = ((bits & 0x00ff00ffU) << 8) | ((bits >> 8) & 0x00ff00ffU);
+    return (bits << 16) | (bits >> 16);
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(32)
+inline void ReverseColdHits(__ubuf__ uint32_t* hits, uint32_t start,
+                            uint32_t queries, uint32_t end0, uint32_t end1)
+{
+    uint32_t tid = threadIdx.x;
+    if (tid >= queries * 4) return;
+    uint32_t q = tid / 4, word = tid % 4, other = 7 - word;
+    auto row = hits + q * 64;
+    uint32_t end = q ? end1 : end0;
+    uint32_t a = ReverseColdHitWord(row[word], start + word * 16, end);
+    uint32_t b = ReverseColdHitWord(row[other], start + other * 16, end);
+    row[other] = a;
+    row[word] = b;
+}
+
 template <typename QLIT>
 class QLIVector {
 public:
@@ -44,6 +70,7 @@ public:
         initialHotRank_ = context->checkpointTopk.initialHotRank;
         checkpointMask_ = context->checkpointTopk.windowMask;
         reuseCheckpointTopk_ = context->checkpointTopk.reuseFinal;
+        reverseCold_ = context->checkpointTopk.reverseCold;
         rotationProgressGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(
             reinterpret_cast<__gm__ rotating::Context*>(p)->progress));
     }
@@ -80,6 +107,13 @@ public:
         DataCopy(prefixThreshold_, thresholds[(blockId_ % 2) * 256], 256);
         SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
         WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+        if (reverseCold_) {
+            auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+            auto ends = reinterpret_cast<__gm__ const uint32_t*>(ctx->queryEnds);
+            uint32_t query = batch * SIM_Q + (blockId_ % 2) * 2;
+            reverseEnd0_ = ends ? ends[query] : runtimeShape_.history;
+            reverseEnd1_ = ends ? ends[query + 1] : runtimeShape_.history;
+        }
     }
 
     // =================================类型定义区=================================
@@ -173,6 +207,9 @@ private:
     uint32_t initialHotRank_ = 2048;
     uint32_t checkpointMask_ = 0;
     bool reuseCheckpointTopk_ = false;
+    bool reverseCold_ = false;
+    uint32_t reverseEnd0_ = 0;
+    uint32_t reverseEnd1_ = 0;
     __aicore__ inline void GetPrefixState(uint32_t query, GlobalTensor<uint16_t>& scores,
         GlobalTensor<uint32_t>& indices, GlobalTensor<uint16_t>& thresholds) {
         constexpr uint32_t count = SIM_Q * 2048;
@@ -207,7 +244,7 @@ private:
         profile.load += GetSystemCycle() - start;
     }
     __aicore__ inline void MergeCheckpointRange(uint32_t query, uint32_t scoreRow,
-        uint32_t begin, uint32_t end, bool final, TopkProfile& profile);
+        uint32_t begin, uint32_t end, uint32_t validEnd, bool final, TopkProfile& profile);
     __aicore__ inline bool ResumeCheckpointTopk(uint32_t query, uint32_t scoreRow, uint32_t end,
         TopkProfile& profile);
     __aicore__ inline void StoreTopkMinimum(uint32_t query) {
@@ -596,6 +633,9 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     auto s1BaseSizePerAIV = CeilDiv(s1BaseSize_, 2);
     int64_t curS1Idx = info.gS1Idx * s1BaseSize_;
     int64_t curS2Idx = info.s2Idx * s2BaseSize_;
+    const bool reverse = info.reverseScanTilePlusOne != 0;
+    const uint32_t scanTile = reverse ? info.reverseScanTilePlusOne - 1 : info.s2Idx;
+    const uint32_t scalePos = (scanTile - info.s2Start) % QLICommon::KScaleTiles;
     int64_t curS1ProcNum = curS1Idx + s1BaseSize_ > info.actS1Size ? info.actS1Size % s1BaseSize_ : s1BaseSize_;
     int64_t curAivS1Idx = curS1Idx + (blockId_ % 2) * CeilDiv(curS1ProcNum, 2);
     int64_t curAivS1ProcNum = (blockId_ % 2 == 0) ? CeilDiv(curS1ProcNum, 2) : curS1ProcNum / 2;
@@ -631,13 +671,13 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         WaitFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT_QSCALE + qScalepingpong);
     }
 
-    if ((info.s2Idx - info.s2Start) % QLICommon::KScaleTiles == 0) {
+    if (scalePos == 0) {
         WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_KSCALE + kScalepingpong);
-        uint32_t getLen = QLICommon::KScaleTiles * s2BaseSize_ > (info.validS2Len - info.s2Idx * s2BaseSize_)
-                                           ? info.validS2Len - info.s2Idx * s2BaseSize_
-                                           : QLICommon::KScaleTiles * s2BaseSize_;
+        uint32_t scaleStart = reverse ? (info.s2Idx + 1 - info.reverseScaleTiles) * s2BaseSize_ : curS2Idx;
+        uint32_t getLen = reverse ? info.reverseScaleTiles * s2BaseSize_ :
+            Min(uint32_t(QLICommon::KScaleTiles) * s2BaseSize_, info.validS2Len - info.s2Idx * s2BaseSize_);
         //kScaleGm  -->  kScaleUB_
-        GetKeyScale(info, kScaleUB_, info.bIdx, curS2Idx, getLen);
+        GetKeyScale(info, kScaleUB_, info.bIdx, scaleStart, getLen);
         SetFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT_KSCALE + kScalepingpong);
         WaitFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT_KSCALE + kScalepingpong);
     }
@@ -654,7 +694,8 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     auto weightBase = weightUB_[qScalepingpong * (UB_BANK_STRIDE / sizeof(W_T))];
     auto weightFloatBase = weightFloatUB_[qScalepingpong * (UB_BANK_STRIDE / sizeof(float))];
     auto qScaleBase = qScaleUB_[qScalepingpong * (UB_BANK_STRIDE / sizeof(SCALE_T))];
-    auto kScaleBase = kScaleUB_[kScalepingpong * QLICommon::KScaleTiles * s2BaseSize_ + ((info.s2Idx - info.s2Start) % QLICommon::KScaleTiles) * s2BaseSize_];
+    uint32_t scaleIndex = reverse ? info.reverseScaleTiles - 1 - scalePos : scalePos;
+    auto kScaleBase = kScaleUB_[(kScalepingpong * QLICommon::KScaleTiles + scaleIndex) * s2BaseSize_];
     auto qkBase = resMm1UB_[pingpong * (UB_BANK_STRIDE / sizeof(float))];
     auto qkVLstride = (UB_BANK_DEPTH_STRIDE / sizeof(float)) / 2 * constInfo_.mBaseSize;
 
@@ -682,13 +723,22 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     // Return the bank only after its last consumer, including a partial tail.
     // A sequence shard can end before the whole cold phase. Return its
     // partial bank too, before the next aligned shard reuses that bank.
-    if ((info.s2Idx - info.s2Start + 1) % QLICommon::KScaleTiles == 0 ||
-        (info.s2Idx + 1) * s2BaseSize_ >= info.validS2Len || info.isLastS2InnerLoop) {
+    const bool releaseScale = (scalePos + 1) % QLICommon::KScaleTiles == 0 ||
+        (info.s2Idx + 1) * s2BaseSize_ >= info.validS2Len || info.isLastS2InnerLoop;
 #else
-    if ((info.s2Idx - info.s2Start) % QLICommon::KScaleTiles == 0) {
+    const bool releaseScale = scalePos == 0;
 #endif
+    if (reverse ? scalePos + 1 == info.reverseScaleTiles : releaseScale) {
         SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_KSCALE + kScalepingpong);
     }
+#if SIM_CAPTURE_HITS
+    if (reverse) {
+        PipeBarrier<PIPE_V>();
+        Simt::VF_CALL<ReverseColdHits>(Simt::Dim3{32, 1, 1},
+            reinterpret_cast<__ubuf__ uint32_t*>(classifyUB_[pingpong * 256].GetPhyAddr()),
+            curS2Idx, curAivS1ProcNum, reverseEnd0_, reverseEnd1_);
+    }
+#endif
     SetFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
     WaitFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
     //outUB_ --->  scoreGm
@@ -710,14 +760,14 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         hitCopy.blockLen = 32;
         hitCopy.srcStride = 7; // classifyUB query stride is 256 bytes.
         hitCopy.dstStride = runtimeShape_.history / 4 - 32;
-        DataCopyPad(outputHits[(info.bIdx * SIM_Q + curAivS1Idx) * (runtimeShape_.history / 4) + curS2Idx / 4],
+        DataCopyPad(outputHits[(info.bIdx * SIM_Q + curAivS1Idx) * (runtimeShape_.history / 4) + scanTile * s2BaseSize_ / 4],
                     classifyUB_[pingpong * 256].template ReinterpretCast<uint8_t>(), hitCopy);
     }
 #endif
 
-    if (curS2Idx >= runtimeShape_.resident && (publishShardEnd || (info.s2Idx + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
-        rotating::IsTrigger(runtimeShape_.history,runtimeShape_.resident,runtimeShape_.rounds,info.s2Idx + 1))) {
-        const uint32_t tableBase = (info.s2Idx / 64) * 64;
+    if (curS2Idx >= runtimeShape_.resident && (publishShardEnd || (scanTile + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
+        rotating::IsTrigger(runtimeShape_.history,runtimeShape_.resident,runtimeShape_.rounds,scanTile + 1))) {
+        const uint32_t tableBase = (scanTile / 64) * 64;
         if (tableBase != rotationProgressBase_) {
             SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
             WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
@@ -732,7 +782,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         publish.srcStride = 0;
         publish.dstStride = 96;
         DataCopyPad(rotationProgressGm_[(info.bIdx * SIM_Q + curAivS1Idx) * 32 + progressShard * 16],
-            rotationProgress_[(info.s2Idx % 64) * 16], publish);
+            rotationProgress_[(scanTile % 64) * 16], publish);
     }
     SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
     CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);   //V核处理完，通知C核可以把mm1Res搬运到UB
@@ -874,7 +924,8 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
 
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::MergeCheckpointRange(
-    uint32_t query, uint32_t scoreRow, uint32_t begin, uint32_t end, bool final, TopkProfile& profile)
+    uint32_t query, uint32_t scoreRow, uint32_t begin, uint32_t end, uint32_t validEnd,
+    bool final, TopkProfile& profile)
 {
     GlobalTensor<uint16_t> scores, thresholds;
     GlobalTensor<uint32_t> indices;
@@ -889,8 +940,13 @@ __aicore__ inline void QLIVector<QLIT>::MergeCheckpointRange(
     if (final && begin == end) BeginFinalMetadata(query);
 #endif
     uint32_t merges = 0;
-    for (uint32_t start = begin; start < end; start += trunkLen_) {
-        const uint32_t count = Min(trunkLen_, end - start);
+    uint32_t mirror = runtimeShape_.history + runtimeShape_.resident;
+    for (uint32_t cursor = begin; cursor < end; cursor += trunkLen_) {
+        uint32_t nextCursor = Min(cursor + trunkLen_, end);
+        uint32_t start = reverseCold_ ? mirror - nextCursor : cursor;
+        uint32_t stop = reverseCold_ ? Min(mirror - cursor, validEnd) : nextCursor;
+        if (stop <= start) continue;
+        const uint32_t count = stop - start;
         const uint32_t aligned = QLICommon::Align(count, uint32_t(256));
         AscendC::DataCopy(mrgValueLocal_, scoreOutLocal_, topkCount_);
         auto next = mrgValueLocal_[topkCount_];
@@ -903,10 +959,11 @@ __aicore__ inline void QLIVector<QLIT>::MergeCheckpointRange(
         SetFlag<HardEvent::MTE2_V>(EVENT_ID0); WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
         RecordTopkLoad(profile, loadStart);
 #if KVIP_STREAMING_LI
-        if (final && start + count == end) BeginFinalMetadata(query);
+        if (final && nextCursor == end) BeginFinalMetadata(query);
 #endif
         uint64_t mergeStart = profile.start ? GetSystemCycle() : 0;
-        topkOp_.MergeCheckpoint(mrgValueLocal_, scoreOutLocal_, start, topkCount_ + aligned, merges++);
+        topkOp_.MergeCheckpoint(mrgValueLocal_, scoreOutLocal_, start, topkCount_ + aligned, merges++,
+            reverseCold_ ? runtimeShape_.resident : 0);
         PipeBarrier<PIPE_V>();
         RecordTopkMerge(profile, mergeStart);
     }
@@ -915,7 +972,7 @@ __aicore__ inline void QLIVector<QLIT>::MergeCheckpointRange(
 
 template <typename QLIT>
 __aicore__ inline bool QLIVector<QLIT>::ResumeCheckpointTopk(
-    uint32_t query, uint32_t scoreRow, uint32_t end, TopkProfile& profile)
+    uint32_t query, uint32_t scoreRow, uint32_t validEnd, TopkProfile& profile)
 {
     GlobalTensor<uint16_t> scores, thresholds;
     GlobalTensor<uint32_t> indices;
@@ -924,8 +981,9 @@ __aicore__ inline bool QLIVector<QLIT>::ResumeCheckpointTopk(
     SetFlag<HardEvent::MTE2_S>(EVENT_ID0); WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
     uint32_t savedEnd = mrgValueLocal_.template ReinterpretCast<uint32_t>().GetValue(
         lifetch::kCheckpointEndOffset / 2);
+    uint32_t end = reverseCold_ ? runtimeShape_.history : validEnd;
     if (savedEnd <= runtimeShape_.resident || savedEnd > end) return false;
-    MergeCheckpointRange(query, scoreRow, savedEnd, end, true, profile);
+    MergeCheckpointRange(query, scoreRow, savedEnd, end, validEnd, true, profile);
     return true;
 }
 
@@ -946,9 +1004,10 @@ __aicore__ inline void QLIVector<QLIT>::UpdateCheckpointTopk(
     for (uint32_t i = 0; i < localCount; ++i) {
         const uint32_t row = localBegin + i;
         const uint32_t query = info.bIdx * SIM_Q + first + row;
-        uint32_t end = Min(windowEnd, uint32_t(info.actS2Size));
-        if (bounds) end = Min(end, bounds[query]);
-        if (end <= runtimeShape_.resident) continue;
+        uint32_t validEnd = uint32_t(info.actS2Size);
+        if (bounds) validEnd = Min(validEnd, bounds[query]);
+        if (validEnd <= runtimeShape_.resident) continue;
+        uint32_t end = reverseCold_ ? windowEnd : Min(windowEnd, validEnd);
 
         GlobalTensor<uint16_t> scores, thresholds;
         GlobalTensor<uint32_t> indices;
@@ -975,7 +1034,8 @@ __aicore__ inline void QLIVector<QLIT>::UpdateCheckpointTopk(
                 SetFlag<HardEvent::MTE2_S>(EVENT_ID0); WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
             } while (progress.GetValue(0) < end);
         }
-        MergeCheckpointRange(query, (blockId_ % 2) * CeilDiv(s1BaseSize_, 2) + i, begin, end, false, profile);
+        MergeCheckpointRange(query, (blockId_ % 2) * CeilDiv(s1BaseSize_, 2) + i, begin, end,
+            validEnd, false, profile);
         StoreTopkMinimum(query);
         SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0); WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);

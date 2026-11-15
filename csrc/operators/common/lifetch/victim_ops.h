@@ -19,3 +19,11 @@ inline void RestoreVictimTokens(__ubuf__ uint32_t* ids,__gm__ uint32_t* victims,
         if(token<kLruSlots)ids[i]=asc_ldcg(victims+token);
     }
 }
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(256)
+inline void RestoreReverseColdTokens(__ubuf__ uint32_t* ids, uint32_t count,
+                                     uint32_t resident, uint32_t mirror) {
+    for (uint32_t i = threadIdx.x; i < count; i += 256) {
+        if (ids[i] >= resident) ids[i] = mirror - 1 - ids[i];
+    }
+}

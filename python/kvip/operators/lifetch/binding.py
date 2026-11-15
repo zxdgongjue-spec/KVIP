@@ -5,7 +5,9 @@ from kvip.runtime.loader import load_lifetch_library
 
 import numpy as np
 
-from kvip.operators.lifetch.geometry import check_checkpoint_windows, checkpoint_topk_options, final_aivs, li_geometry, prefetch_budget
+from kvip.operators.lifetch.geometry import (
+    check_checkpoint_windows, check_reverse_cold, checkpoint_topk_options, final_aivs, li_geometry, prefetch_budget,
+)
 from kvip.operators.lifetch.tiling import RuntimeShape
 from kvip.operators.lifetch.workspace import rotation_spec
 
@@ -39,8 +41,9 @@ class LIFetchBinding:
         initial_hot_rank=2048,
         topk_checkpoints=(),
         reuse_checkpoint_topk=False,
+        reverse_cold=False,
     ):
-        topk_options = checkpoint_topk_options(initial_hot_rank, topk_checkpoints, reuse_checkpoint_topk)
+        topk_options = checkpoint_topk_options(initial_hot_rank, topk_checkpoints, reuse_checkpoint_topk, reverse_cold)
         if resident > 131072:
             raise ValueError("LIFetch hot bitmap supports resident <= 131072")
         if not 1 <= batch <= 16:
@@ -73,7 +76,7 @@ class LIFetchBinding:
             ("final_replicated", int(final_strategy == "replicated")),
             ("final_workers", final_aivs(batch, li_tiling, aic_count, final_workers)),
             ("aic_count", aic_count),
-            ("abi_version", 13),
+            ("abi_version", 14),
             (
                 "service_lanes",
                 li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)["service_aivs_per_window"],
@@ -101,6 +104,8 @@ class LIFetchBinding:
         if geometry["logical_aic_tasks"] > aic_count or not geometry["intermediate_fetches"]:
             raise ValueError("Direct hot-first mode requires a window and concurrently resident LI tasks")
         check_checkpoint_windows(topk_options, self.runtime_shape.rounds)
+        if reverse_cold:
+            check_reverse_cold(self.runtime_shape)
         self.checkpoint_window_mask = int.from_bytes(topk_options[4:8], "little")
         contexts = owner.build_device_args(library)
         required_queues = max(batch * (final_aivs(batch, li_tiling, aic_count, final_workers) + 1), 2 * batch + 16)

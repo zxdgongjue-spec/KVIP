@@ -229,6 +229,7 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
             keyL1BufIdx_++;
         }
     } else if (s2BasicBlock_ == 256) {
+        const bool reverse = runInfo.reverseScanTilePlusOne != 0;
         // 第一个s2循环 keycache置为false
         if (runInfo.isFirstS2InnerLoop) {
             isKeyCacheValid_ = false;
@@ -240,10 +241,13 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
             if (!keyCacheHit) {
                 WaitFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + keyL1BufIdx_ % KEY_BUF_NUM);
                 // 缓存未命中，需要从GM搬到L1 min（256, 剩余s2）
-                uint64_t s2TotalRemainNum = runInfo.actS2Size - s2GmBaseOffset;
+                // Use both pages of the same ascending L1 load in either
+                // scan direction. The upper 128 rows are consumed first in D.
+                uint64_t loadStart = reverse ? s2GmBaseOffset / s2BasicBlock_ * s2BasicBlock_ : s2GmBaseOffset;
+                uint64_t s2TotalRemainNum = runInfo.actS2Size - loadStart;
                 uint64_t s2L1LoadSize = (s2TotalRemainNum < s2BasicBlock_) ? s2TotalRemainNum : s2BasicBlock_;
                 if (PAGE_ATTENTION) {
-                    KeyNd2NzForPA(s2L1LoadSize, s2GmBaseOffset + s2GmOffset, runInfo);
+                    KeyNd2NzForPA(s2L1LoadSize, loadStart + s2GmOffset, runInfo);
                 }else {
                     KeyNd2Nz(s2L1LoadSize, s2GmOffset, runInfo);
                 }
@@ -252,7 +256,7 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
                 WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
 
                 isKeyCacheValid_ = true;
-                keyGmStart_ = s2GmBaseOffset;
+                keyGmStart_ = loadStart;
                 keyLoadedSize_ = s2L1LoadSize;
             }
             uint64_t l1S2Offset = s2GmBaseOffset - keyGmStart_;
@@ -308,7 +312,8 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
                     SetFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT + queryL1Mte1BufIdx_ % QUERY_BUF_NUM);
                 }
             }
-            bool l1FullyUsed = (s2GmBaseOffset + s2ProcessSize >= keyGmStart_ + keyLoadedSize_);
+            bool l1FullyUsed = reverse ? s2GmBaseOffset == keyGmStart_ :
+                s2GmBaseOffset + s2ProcessSize >= keyGmStart_ + keyLoadedSize_;
             if (l1FullyUsed || runInfo.isLastS2InnerLoop) {
                 SetFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + keyL1BufIdx_ % KEY_BUF_NUM);
                 keyL1BufIdx_++;

@@ -591,7 +591,12 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
     GlobalTensor<uint32_t> progressGm;
     progressGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress));
     auto work=flags.ReinterpretCast<uint32_t>();
-    const uint32_t windowEnd=sequenceHalfWindow?SequenceWindowEnd(rt_history,rt_resident,sequenceHalfWindow,epoch):
+    const bool reverseCold = ctx->checkpointTopk.reverseCold && sequenceHalfWindow;
+    const uint32_t firstShardWidth = reverseCold ?
+        ReverseColdFirstShard(rt_history, rt_resident, sequenceHalfWindow, rt_rounds) : sequenceHalfWindow;
+    const uint32_t windowEnd = reverseCold ?
+        ReverseColdWindowEnd(rt_history, rt_resident, sequenceHalfWindow, rt_rounds, epoch) :
+        sequenceHalfWindow ? SequenceWindowEnd(rt_history, rt_resident, sequenceHalfWindow, epoch) :
         Trigger(rt_history,rt_resident,rt_rounds,epoch)*128;
     // Each shard publishes an independent ready boundary. Snapshot whatever
     // has completed; the final resolver repairs selected tokens that were not
@@ -614,7 +619,7 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
         for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes)for(uint32_t q=0;q<4;++q) {
             uint32_t progress=(b/rt_serviceLanes)*128+q*32;
             uint32_t end=work.GetValue(progress),cap=windowEnd;
-            if(ctx->queryEnds) {
+            if(ctx->queryEnds && !reverseCold) {
                 auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds);
                 uint32_t valid=bounds[b*4+q];
                 if(ctx->lruSlots && valid<rt_resident)valid=rt_resident;
