@@ -117,8 +117,8 @@ def summarize(run, required=False):
         lines += ['Original prefetch decisions retained in both paths; final TopK compute/wait reported separately.']
     if (run / 'experiment.txt').exists() and (run / 'experiment.txt').read_text().strip() == 'topk-prefetch':
         lines[1] = 'A=bitmap prefetch; B=latest TopK union prefetch. Both use incremental window/final TopK.'
-        lines += ['B scan = TopK ID load + local/mapped filtering + cross-Q union/expansion; bitmap bytes=0.',
-                  'B candidates are filtered unique tokens capped at 2048; compare actual reads/unused/final and full graph.']
+        lines += ['B middle scan = compact cold-ID load + cross-Q dedup; cold-ID export is included in Incremental. Hot window uses original bitmap.',
+                  'B middle candidates are unique cold TopK tokens capped at 2048; original map filtering/budget/post remain. Compare reads and full graph.']
     keys = sorted(set(cases['baseline']) | set(cases['incremental']), key=lambda k: (k[0], str(k[1])))
     for key in keys:
         lines += ['', f'BS={key[0]} miss={key[1]}%']

@@ -103,7 +103,7 @@ def main():
                 '        // Private experimental state; never consumed by ordinary LIFetch.\n'
                 '        auto windowMeta=reinterpret_cast<__gm__ uint64_t*>(context->incremental)+query*16;\n'
                 '        windowMeta[0]=reinterpret_cast<uint64_t>(scoreGm.GetPhyAddr())+uint64_t(scoreRow)*runtimeShape_.history*2;\n'
-                '        windowMeta[1]=uint64_t(runtimeShape_.resident)|(uint64_t(runtimeShape_.resident)<<32);windowMeta[2]=0;\n'
+                '        windowMeta[1]=uint64_t(runtimeShape_.resident)|(uint64_t(runtimeShape_.resident)<<32);windowMeta[2]=0;windowMeta[3]=0;\n'
                 '        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(windowMeta),128);\n'
                 '        auto privatePrefix=reinterpret_cast<GM_ADDR>(context->incremental)+runtimeShape_.batch*512+batch*rowBytes;\n'
                 '        GlobalTensor<uint16_t> windowScores;GlobalTensor<uint32_t> windowIds;\n'
@@ -172,21 +172,40 @@ def main():
             source=prefetch.read_text()
             anchor='// Same indexed-load pattern as v9 GatherCandidateMap; cold IDs pass through.'
             source=source.replace(anchor, '#include "topk_candidates.h"\n'+anchor)
-            start=source.index('    GlobalTensor<uint32_t> progressGm;',source.index('inline void FastService'))
+            start=source.index('    // Freeze every ready snapshot')
             end=source.index('    GlobalTensor<uint32_t> allRows;',start)
-            source=source[:start]+'''    auto work=flags.ReinterpretCast<uint32_t>();
-    auto cfg=work[4096];
-    auto rowStorage=ids;
-    if(rt_batchedRows)ids=scratch[23808/4];
-    V9_FETCH_PROFILE(event->begin=GetSystemCycle();)
-    uint64_t postedCount=0;
-'''+source[end:]
-            start=source.index('#define KV_WINDOW_HISTORY')
-            end=source.index('#undef KV_WINDOW_SCAN_TOKENS',start)+len('#undef KV_WINDOW_SCAN_TOKENS')
-            source=source[:start]+'#include "topk_candidate_service.h"'+source[end:]
+            source=source[:start]+source[start:end].replace('if(lane<rt_batch)', 'if(!epoch && lane<rt_batch)')+source[end:]
             start=source.index('        for(uint32_t q=0;q<4;++q) {\n            uint32_t processed=')
             end=source.index('        if(!rt_batchedRows)',start)
+            cursors=source[start:end]
             source=source[:start]+source[end:]
+            start=source.index('#define KV_WINDOW_HISTORY')
+            end=source.index('#undef KV_WINDOW_SCAN_TOKENS',start)+len('#undef KV_WINDOW_SCAN_TOKENS')
+            original=(repo/'csrc/operators/common/lifetch/sequence_candidates.h').read_text()
+            original=original.replace('uint32_t candidateCount=0,stop=last,wordCount=0;', 'candidateCount=0;uint32_t stop=last,wordCount=0;')
+            original=original.replace('KV_WINDOW_HISTORY','rt_history').replace('KV_WINDOW_RESIDENT','rt_resident').replace('KV_WINDOW_SCAN_TOKENS','rt_scanTokens')
+            source=source[:start]+'        uint32_t candidateCount=0;\n        if(!epoch) {\n'+original+cursors+'        } else {\n#include "topk_candidate_service.h"\n        }\n'+source[end:]
+            # Export cold IDs while the current Q TopK is still in UB. No
+            # eligibility rebuild, full-ID round trip, or map lookup here.
+            code=methods.read_text()
+            helper=Path(__file__).with_name('topk_export.h').read_text()
+            code=helper+code
+            code=code.replace('    if (!source || (end0<=prior[0] && (!half || end1<=prior[1]))) return;',
+                '    if (!source) return;\n'
+                '    if (end0<=prior[0] && (!half || end1<=prior[1])) {\n'
+                '        if(exportWindowCold_) {\n'
+                '            GlobalTensor<uint32_t> saved; saved.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(WindowTopkPrefix()+uint64_t(query/4)*prefixBytes+4*2048*2)+(query%4)*2048);\n'
+                '            PipeBarrier<PIPE_ALL>();DataCopy(indicesOutLocal_,saved,2048);\n'
+                '            SetFlag<HardEvent::MTE2_V>(EVENT_ID5);WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);ExportWindowCold(query);\n'
+                '        }\n        return;\n    }')
+            code=code.replace('    SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);\n    if(incrementalPipeline_',
+                '    if(exportWindowCold_)ExportWindowCold(query);\n'
+                '    SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);\n    if(incrementalPipeline_')
+            code=code.replace('    incrementalCalls_=0;incrementalScanned_=0;incrementalCandidates_=0;',
+                '    exportWindowCold_=epoch!=0;\n    incrementalCalls_=0;incrementalScanned_=0;incrementalCandidates_=0;')
+            code=code.replace('    // The producer\'s progress lookup table',
+                '    exportWindowCold_=false;\n    // The producer\'s progress lookup table')
+            methods.write_text(code)
             prefetch.write_text(source)
             for name in ('topk_candidates.h','topk_candidate_service.h'):
                 shutil.copyfile(Path(__file__).with_name(name),prefetch.parent/name)

@@ -175,23 +175,44 @@ bash tests/experiments/incremental_lifetch/compare_topk_prefetch.sh \
   /vllm-workspace/vllm-ascend/third_party/KVAF 4 127.0.0.1:28885 16 1 4
 ```
 
-A 固定为中间与最终增量 TopK、原位图预取；B 只替换预取候选来源。
-B 读取本窗口已经写回的四份 Top2048，不再重复采集生产者进度或扫描原始增量位图。
-先排除普通有效 hot 命中及已有预取/尾部映射，再用 UB 内的 token 集合跨 Q 去重，
-按固定的分片顺序展开最多2048个候选，接回原映射检查、预算、选槽、WQE提交和错误处理。
-保留无效 hot 和 LRU 预留 hot 的候选，避免误把可能被覆盖的槽当作安全命中。
-预算外的 token 可在后续窗口再次成为候选，最终缺失仍由 Resolver 补拉。
+A 固定为中间与最终增量 TopK、原位图预取；B 使用以下融合流程：
 
-复用服务 scratch：16 KiB 去重位集、8 KiB单Q输入；展开后输入已失效，
-继续复用原候选输出区。不新增算子或GM临时缓冲区；实验限定H131072/R16384。
-位集只存TopK token并集，不扫描LI分数位图。四Q共读取32 KiB索引；
-hot有效状态和预留信息合计128 KiB，分块读取一次，四Q复用2 KiB资格位集，避免逐token零散GM查询。
+- epoch 0 的 hot 预取保持原位图路径。
+- 中间窗口在每 Q 增量 TopK 的 ID 恢复后，直接复用 UB 输出，SIMD 压缩 cold ID。
+- 小候选列表暂存到已有 locations 工作区；计数使用已有增量元数据空位。
+- 预取服务只加载压缩结果，跨 Q 去重后直接输出候选，不扫描完整历史位集。
+- 后续映射过滤、预算、选槽、WQE 构造及提交复用原代码；只查一次映射。
 
-保留level3打点：B的scan区间现在表示TopK读取/过滤/去重/展开，bitmap bytes为0；
-候选数表示排除已有命中后的有界去重集合，不能再与A的原始位图候选数按同一含义比较。
-比较有效读取、无效读取、最终补拉、LI/完整图耗时，以及窗口服务总耗时。
-脚本自动汇总至 `tests/results/topk-prefetch/<run>/key_results.log`。
+删除每窗口 hot_valid/reserved 重读、完整 TopK ID 重读、全历史位集展开。
+本窗口没有新增分数时，从已保存的 TopK 导出候选，不能误用已被提交阶段覆盖的旧列表。
+不增加 GM 工作区或核数；实验限定 H131072/R16384。预算外的 token 后续可再次考虑，
+最终 Resolver 继续负责补拉；普通 hot 命中不参与中间 cold 预取。
 
-本地验证：完整融合算子设备编译通过；复用实际候选函数的模拟器测试通过跨Q重复、
-已映射过滤、无效/预留hot、查询边界、空padding以及8192个候选截断至2048的校验。
-端到端正确性和性能由上述真机A/B脚本验证。
+保留 level3 打点：B 的 Incremental 包括 cold ID 导出；中间 Scan 为压缩列表读取及去重，
+hot 窗口 Scan 保持原口径。比较整个 Incremental + Service、LI/完整图、实际读取和无效预取，
+不能只用 Scan 的下降代替总收益。脚本自动汇总至 `tests/results/topk-prefetch/<run>/key_results.log`。
+
+### 本地完整窗口验证
+
+```bash
+source /usr/local/Ascend/cann/set_env.sh
+python tests/experiments/incremental_lifetch/model_window.py \
+  --kvaf-root /work/KVAF --output /tmp/lifetch-window-model
+```
+
+直接提取 A/B 生成源码的增量方法，并调用实际 FastService；没有另写简化版 TopK 或提交逻辑。
+模型为 8 窗口中的第一个 cold 窗口：单 AIV、2 请求、8Q，每 Q 新增16384个分数、12个候选，
+包含跨 Q 重复及已有预取映射。A/B 均提交46条WQE；校验完整TopK分数/ID、去重、映射、
+目标槽、WQE、队列头和门铃，再复用同一状态运行一次，确认无新增分数时不重复提交。
+模拟器门铃写入普通设备内存，不模拟远端DDR/CQ完成；该窗口本身只提交异步预取。
+
+本地首轮实测（Ascend950PR_9599，1800 cycles/µs）：
+
+| 区间 | A cycles | B cycles | A µs | B µs |
+| --- | ---: | ---: | ---: | ---: |
+| 增量TopK及其窗口控制，B含候选导出 | 64798 | 68626 | 36.00 | 38.13 |
+| 完整预取服务 | 34719 | 27929 | 19.29 | 15.52 |
+| **合计** | **99517** | **96555** | **55.29** | **53.64** |
+
+同样提交数量下合计降低 **2.98%**。脚本保留trace、模型日志及result.json，
+且B合计不低于A时返回失败；真机端到端效果使用上面的A/B命令验证。
