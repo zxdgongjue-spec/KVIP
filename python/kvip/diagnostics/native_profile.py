@@ -9,7 +9,7 @@ import numpy as np
 
 
 def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_markers=False,
-                   early_prefetch_drain=False):
+                   early_prefetch_drain=False, init_route_markers=False):
     raw = np.asarray(raw)
     expected = batch * 256 + (resolver_cores * batch + 4 * workers) * 32
     if raw.dtype != np.int64 or raw.size != expected or batch < 1 or workers < 1:
@@ -49,6 +49,26 @@ def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_
     interval("li_final_classification", li_queries, 2, 7)
     producer = producer_update[:, :32]
     consumer = producer_update[:, 32:]
+    init_intervals = {
+        "init_total": (25, 31),
+        "init_route": (26, 27),
+        "init_fill": (28, 29),
+        "init_tail_setup": (29, 30),
+        "init_finish": (30, 31),
+    }
+    for name, (begin, end) in init_intervals.items():
+        if init_route_markers:
+            interval(name, consumer, begin, end, required=True)
+        else:
+            # These slots have no contract in older binaries, even when nonzero.
+            metrics[name] = dict(status="unavailable", count=0, median_cycles=None,
+                                 max_cycles=None, samples_cycles=[])
+    for name, rows in (("init_route_publish", consumer[:1]), ("init_route_probe", consumer[1:])):
+        if init_route_markers:
+            interval(name, rows, 26, 27, required=True)
+        else:
+            metrics[name] = dict(status="unavailable", count=0, median_cycles=None,
+                                 max_cycles=None, samples_cycles=[])
     # The dedicated role markers bracket the entire Consumer, including an
     # optional early CQ drain before InitShadow. Keep the older work interval
     # separate so moving work across its start cannot look like saved time.
@@ -150,6 +170,12 @@ def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_
             cores=cores.tolist(),
         ),
         scope=dict(
+            initialization=(
+                "Per-request init block cycles: total includes route decision, InitializeRound fills, "
+                "ABC/transport setup and final publication. Blocks overlap; route includes input "
+                "cache maintenance. route_publish is block 0; route_probe is blocks 1 onward. "
+                "No hardware clock conversion or sum across blocks."
+            ),
             early_threshold="Per-query causal preparation, recent-score load, Kth/full TopK and SaveResident bitmap/progress; excludes preceding recent/resident QK matmul",
             final_topk="Final TopK selection before final LI classification",
             get_counters=get_scope

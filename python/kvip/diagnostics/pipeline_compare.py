@@ -259,6 +259,13 @@ def profile_summary(result):
     if not profile:
         return None
     fields = {
+        "init_total": "init_total",
+        "init_route": "init_route",
+        "init_route_publish": "init_route_publish",
+        "init_route_probe": "init_route_probe",
+        "init_fill": "init_fill",
+        "init_tail_setup": "init_tail_setup",
+        "init_finish": "init_finish",
         "ready_wait": "fetch_query_ready_wait",
         "get_post": "post_active",
         "get_drain": "cq_drain",

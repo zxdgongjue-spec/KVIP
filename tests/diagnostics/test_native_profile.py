@@ -56,6 +56,43 @@ def test_output_packing_uses_publication_role_and_remains_separate_from_get_pack
     assert profile["metrics"]["fetch_query_ready_wait"]["status"] == "unavailable"
 
 
+def test_init_markers_separate_route_fill_and_tail_without_summing_blocks():
+    raw = _raw()
+    consumer = raw[:128].reshape(2, 64)[:, 32:]
+    consumer[:, 25:32] = [[100, 101, 121, 123, 163, 173, 180],
+                         [200, 202, 242, 244, 254, 274, 290]]
+    profile = native_profile.decode_profile(
+        raw, batch=2, workers=2, resolver_cores=3, transport="urma", init_route_markers=True
+    )
+    assert profile["metrics"]["init_total"]["samples_cycles"] == [80, 90]
+    assert profile["metrics"]["init_route"]["samples_cycles"] == [20, 40]
+    assert profile["metrics"]["init_route_publish"]["samples_cycles"] == [20]
+    assert profile["metrics"]["init_route_probe"]["samples_cycles"] == [40]
+    assert profile["metrics"]["init_fill"]["samples_cycles"] == [40, 10]
+    assert profile["metrics"]["init_tail_setup"]["samples_cycles"] == [10, 20]
+    assert profile["metrics"]["init_finish"]["samples_cycles"] == [7, 16]
+    assert profile["metrics"]["init_total"]["median_cycles"] == 85
+    assert profile["metrics"]["init_total"]["max_cycles"] == 90
+    assert "Blocks overlap" in profile["scope"]["initialization"]
+    consumer[:, 25:32] = -1
+    old = native_profile.decode_profile(raw, batch=2, workers=2, resolver_cores=3, transport="urma")
+    assert old["metrics"]["init_total"]["status"] == "unavailable"
+    assert old["metrics"]["init_route_publish"]["status"] == "unavailable"
+    assert old["metrics"]["init_route_probe"]["status"] == "unavailable"
+
+
+@pytest.mark.parametrize("bad", [0, 99])
+def test_init_marker_capability_requires_each_block_to_have_valid_markers(bad):
+    raw = _raw()
+    consumer = raw[:128].reshape(2, 64)[:, 32:]
+    consumer[:, 25:32] = [100, 101, 121, 123, 163, 173, 180]
+    consumer[1, 27] = bad
+    with pytest.raises(ValueError, match="diagnostic timestamps"):
+        native_profile.decode_profile(
+            raw, batch=2, workers=2, resolver_cores=3, transport="urma", init_route_markers=True
+        )
+
+
 def test_early_drain_is_separate_from_later_resolver_join():
     raw = _raw()
     consumer = raw[:128].reshape(2, 64)[:, 32:]

@@ -82,6 +82,20 @@ def test_capability_comes_from_loaded_binary_and_excludes_ubmem():
     assert not supports_low_miss_hot_hits(new, "ubmem")
 
 
+@pytest.mark.parametrize("transport,capability", [("urma", None), ("urma", 0), ("ubmem", 1)])
+def test_fast_route_probe_requires_the_loaded_kernel_feature(transport, capability):
+    from kvip.diagnostics.replay_measure import prepare_fused_state
+
+    library = SimpleNamespace()
+    if capability is not None:
+        library.kvip_auto_route_fast_probe = lambda: capability
+    bundle = SimpleNamespace(selector=None, update=None,
+                             rotating=SimpleNamespace(library=library),
+                             tuning={"auto_route_fast_probe": True})
+    with pytest.raises(ValueError, match="Fast route probe requires a capable loaded URMA build"):
+        prepare_fused_state(bundle, None, None, None, None, transport)
+
+
 @pytest.mark.parametrize("prefetch", [0, 1])
 def test_sparse_low_uses_actual_get_counters_and_never_reads_stale_mapping(monkeypatch, prefetch):
     from kvip.diagnostics import replay_measure
