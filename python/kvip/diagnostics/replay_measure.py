@@ -25,6 +25,12 @@ from kvip.diagnostics.snapshot import (
 def phase(retained, name, step=None):
     """Host-only failure location; call outside the device event interval."""
     retained.setdefault("progress", {}).update(phase=name, step=step)
+    # Native import/allocator failures may terminate before Python can write
+    # JSON. Emit only initialization checkpoints, never timed-loop chatter.
+    if name in {"context_allocate", "import_kvaf", "import_torch_npu", "device_select",
+                "device_resources", "runtime_create", "runtime_link", "runtime_initialize",
+                "ddr_import", "access_table"}:
+        emit(f"INIT_PHASE {name}")
 
 
 def buffer_addresses(bundle):
@@ -389,7 +395,9 @@ def allocate_context(args, archive, retained):
     """Import real DDR once; case graphs and leases are owned separately."""
     build = args.build_dir.resolve()
     sys.path.insert(0, str(build / "python"))
+    phase(retained, "import_kvaf")
     import kvaf
+    phase(retained, "import_torch_npu")
     import torch
     import torch_npu  # noqa: F401
 
@@ -403,6 +411,7 @@ def allocate_context(args, archive, retained):
         raise RuntimeError(f"Wrong KVAF module: {kvaf.__file__}")
     if not torch.npu.is_available():
         raise RuntimeError("Real NPU required; no CPU/simulator timing fallback")
+    phase(retained, "device_select")
     torch.npu.set_device(args.device)
     device = torch.device(f"npu:{args.device}")
     stream = torch.npu.Stream(device=device)
@@ -410,6 +419,7 @@ def allocate_context(args, archive, retained):
     retained["stream"] = stream
     geometry, ddr = archive.manifest["geometry"], archive.manifest["ddr"]
     cann = kvaf_cann(build) if args.transport == "ubmem" else kvaf_build_paths(build)[0]
+    phase(retained, "device_resources")
     available = query_device_resources(cann, args.device)["effective_aic"]
     if available < geometry["aic_count"]:
         raise ValueError("Replay device has fewer AICs than captured geometry")

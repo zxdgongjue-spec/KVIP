@@ -10,6 +10,37 @@ import pytest
 from kvip.diagnostics import compare, replay, replay_measure
 
 
+def test_native_exit_without_json_follows_recorded_spool(tmp_path, capsys):
+    from kvip.diagnostics.console import saved_failure
+
+    native = tmp_path / "native log with spaces.log"
+    native.write_text("startup\n" * 50 + "FATAL allocation failed\n" + "context\n" * 20 + "last native line\n")
+    outer = tmp_path / "outer.log"
+    outer.write_text(f"RUN_LOG {native} (temporary; removed on success)\nBUILD_VARIANTS_READY unique=6\n")
+    saved_failure(tmp_path / "absent.json", outer, returncode=137)
+    output = capsys.readouterr().err
+    assert "CHILD_EXIT_CODE=137" in output
+    assert "FATAL allocation failed" in output and "last native line" in output
+    assert "FAILURE_JSON_UNAVAILABLE" in output and "NATIVE_LOG_UNAVAILABLE" not in output
+    assert len(output.splitlines()) < 65
+
+
+def test_saved_failure_keeps_structured_phase_and_reads_native_log_once(tmp_path, capsys):
+    from kvip.diagnostics.console import saved_failure
+
+    native = tmp_path / "native.log"
+    native.write_text("ERROR runtime link failed\n")
+    result = tmp_path / "failed.json"
+    result.write_text(json.dumps(dict(status="failed", progress=dict(variant="unassigned", phase="runtime_link"),
+        error=dict(type="RuntimeError", message="link failure"), native_log=str(native))))
+    outer = tmp_path / "outer.log"
+    outer.write_text(f"RUN_LOG {native} (temporary; removed on success)\n")
+    saved_failure(result, outer)
+    output = capsys.readouterr().err
+    assert "phase=runtime_link" in output
+    assert output.count(f"NATIVE_LOG={native}\n") == 1
+
+
 def test_quiet_failure_preserves_first_compiler_diagnostic(tmp_path, capsys):
     from kvip.diagnostics.console import print_replay_failure
 

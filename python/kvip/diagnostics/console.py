@@ -2,9 +2,12 @@
 """CLI-only native output capture and saved-result summaries; never timed."""
 
 from collections import deque
+import argparse
 import ctypes
+import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import traceback
@@ -92,6 +95,76 @@ def print_replay_failure(report, *, result_path, log_path=None):
         emit(f"FAILURE_LOG {Path(log_path).resolve()}", file=sys.stderr)
 
 
+def saved_failure(result_path, outer_log, *, returncode=None):
+    """Inspect a saved exit, including native exits that bypass Python handlers.
+
+    Quiet replay writes its RUN_LOG path before importing the NPU runtime.
+    Follow that recorded path instead of guessing a build hash or displaying
+    only the two progress lines in the outer shell log. This never reruns work.
+    """
+    emit("FAILURE_DETAIL_BEGIN", file=sys.stderr)
+    if returncode is not None:
+        emit(f"CHILD_EXIT_CODE={returncode}", file=sys.stderr)
+    native_logs = []
+    try:
+        report = json.loads(Path(result_path).read_text())
+    except (OSError, ValueError) as error:
+        emit(f"FAILURE_JSON_UNAVAILABLE {result_path}: {error}", file=sys.stderr)
+    else:
+        if isinstance(report, dict) and report.get("status") == "failed":
+            print_replay_failure(report, result_path=result_path, log_path=report.get("native_log"))
+            if report.get("native_log"):
+                native_logs.append(Path(report["native_log"]))
+        else:
+            emit(f"RESULT_STATUS={report.get('status') if isinstance(report, dict) else 'invalid'}", file=sys.stderr)
+    outer_tail = deque(maxlen=12)
+    try:
+        with Path(outer_log).open(errors="replace") as stream:
+            for line in stream:
+                outer_tail.append(line)
+                match = re.match(r"^RUN_LOG (.+) \(temporary; removed on success\)\s*$", line)
+                if match:
+                    native_logs.append(Path(match.group(1)))
+    except OSError as error:
+        emit(f"OUTER_LOG_UNAVAILABLE {outer_log}: {error}", file=sys.stderr)
+    if outer_tail:
+        emit(f"OUTER_LOG_TAIL {outer_log}\n" + "".join(outer_tail), file=sys.stderr, end="")
+    for path in dict.fromkeys(native_logs):
+        emit(f"NATIVE_LOG={path}", file=sys.stderr)
+        tail, before, first = deque(maxlen=20), deque(maxlen=5), []
+        remaining = 0
+        try:
+            with path.open(errors="replace") as stream:
+                for line in stream:
+                    line = line.rstrip("\n")[:1200]
+                    tail.append(line)
+                    if not first and re.search(r"error|fatal|traceback|exception|aborted|segmentation|killed|terminate called|bad_alloc", line, re.I):
+                        first = [*before, line]
+                        remaining = 15
+                    elif remaining:
+                        first.append(line)
+                        remaining -= 1
+                    before.append(line)
+        except OSError as error:
+            emit(f"NATIVE_LOG_UNAVAILABLE: {error}", file=sys.stderr)
+            continue
+        if first:
+            emit("FIRST_NATIVE_ERROR_CONTEXT\n" + "\n".join(first), file=sys.stderr)
+        emit("NATIVE_LOG_TAIL\n" + "\n".join(tail), file=sys.stderr)
+    if not native_logs:
+        emit("NO_RECORDED_NATIVE_LOG", file=sys.stderr)
+    emit("FAILURE_DETAIL_END", file=sys.stderr)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Read retained replay failure evidence; no NPU use")
+    parser.add_argument("--result", type=Path, required=True)
+    parser.add_argument("--log", type=Path, required=True)
+    parser.add_argument("--returncode", type=int)
+    args = parser.parse_args()
+    saved_failure(args.result, args.log, returncode=args.returncode)
+
+
 class NativeLog:
     """Restore fds before an exception reaches the CLI's retained-owner _exit."""
 
@@ -152,3 +225,7 @@ class NativeLog:
             self.stdout.close()
             self.stderr.close()
         return False
+
+
+if __name__ == "__main__":
+    main()
