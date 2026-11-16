@@ -2,6 +2,7 @@
 // Publish each Q directly in the descriptor layout consumed by KVAF.
 #pragma once
 namespace rotating {
+template<bool AllSafe = false>
 __simt_callee__
 inline void PackStagedUrmaQuery(uint32_t history, uint32_t resident, uint32_t tokenBytes,
     uint32_t batch, uint32_t query, uint32_t used, uint32_t rangeBegin, uint32_t count,
@@ -25,11 +26,9 @@ inline void PackStagedUrmaQuery(uint32_t history, uint32_t resident, uint32_t to
         uint32_t begin=rangeBegin,end=begin+count;
         uint32_t own=end-begin,per=(own+511)/512;
         uint32_t safeBefore=tid*per,safeCount=own;
-#if KVIP_LOW_MISS_TAIL
         // Without speculative writes every destination is safe. Preserve
         // input order instead of loading reservations and partitioning it.
-        if(used) {
-#endif
+        if constexpr (!AllSafe) {
         uint32_t localSafe=0;
         for(uint32_t i=tid*per;i<(tid+1)*per && i<own;++i){
             uint32_t slot=slots[begin+i];
@@ -39,9 +38,7 @@ inline void PackStagedUrmaQuery(uint32_t history, uint32_t resident, uint32_t to
         }
         safeBefore=StagedPrefix(localSafe,ctl);
         safeCount=ctl[544+512/warpSize-1];
-#if KVIP_LOW_MISS_TAIL
         }
-#endif
         uint32_t conflictBefore=tid*per-safeBefore;
         // Reserve one contiguous range per phase, not one atomic per token.
         if(direct){
@@ -56,15 +53,11 @@ inline void PackStagedUrmaQuery(uint32_t history, uint32_t resident, uint32_t to
         for(uint32_t i=tid*per;i<(tid+1)*per && i<own;++i){
             uint32_t rank=begin+i,slot=slots[rank];
             if(slot>=resident){
-#if KVIP_LOW_MISS_TAIL
-                if(!used)asc_atomic_or(ctl+1,4U);
-#endif
+                if constexpr (AllSafe) asc_atomic_or(ctl+1,4U);
                 continue;
             }
             int32_t ordinal=-1;
-#if KVIP_LOW_MISS_TAIL
-            if(used)
-#endif
+            if constexpr (!AllSafe)
                 ordinal=asc_ldcg(reserved+slot);
             bool conflict=ordinal>=0 && uint32_t(ordinal)<used;
             uint32_t position=conflict?safeCount+conflictBefore++:safeBefore++;

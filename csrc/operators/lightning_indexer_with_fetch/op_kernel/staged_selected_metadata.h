@@ -8,29 +8,27 @@
 #endif
 
 namespace rotating {
+template<bool PreserveHot = false>
 __simt_vf__ __aicore__ LAUNCH_BOUND(kClassifyThreads)
 inline void ClassifySelectedMetadata(uint32_t history, uint32_t resident,
     uint32_t batch, uint32_t owner, uint32_t used,
     uint32_t tailBegin, uint32_t tailEnd, bool hasTail, __gm__ Context* ctx,
     __ubuf__ uint32_t* indices, __ubuf__ uint32_t* locations,
-    __ubuf__ uint32_t* bitmap, __ubuf__ uint32_t* error, bool noPrefetch = false) {
+    __ubuf__ uint32_t* bitmap, __ubuf__ uint32_t* error) {
     const uint32_t words = (resident + 31) / 32;
     const uint32_t shards = 4096 / words < 8 ? 4096 / words : 8;
     auto mapping = reinterpret_cast<__gm__ uint32_t*>(ctx->mapping) + uint64_t(batch) * history;
     auto lru = reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots) + batch * kLruSlots;
     auto valid = reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid);
     auto reserved = reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot);
-    // A candidate slot is still valid when the whole round disabled prefetch.
-    // Mark the hit in the existing Q4 protection bitmap before the resolver
-    // picks any replacement; a low prediction never limits exact final Get.
-#if KVIP_LOW_MISS_TAIL
-    const bool preserveHot = noPrefetch && used == 0;
-#else
-    constexpr bool preserveHot = false;
-    (void)noPrefetch;
-#endif
+    // Scalar dispatch chooses separate VF instances. The speculative instance
+    // retains its original classification without a per-token low-route test.
+    uint32_t tailTokens = 0;
+    if constexpr (PreserveHot) tailTokens = OutputStride(resident, ctx) - resident;
 #if KVIP_INVERSE_MAPPING && !V9_UBMEM
-    const auto view = LoadPrefetchMappingView(history, resident, batch, ctx, mapping);
+    PrefetchMappingView view;
+    if constexpr (!PreserveHot)
+        view = LoadPrefetchMappingView(history, resident, batch, ctx, mapping);
 #endif
     for (uint32_t i = threadIdx.x; i < kTop; i += kClassifyThreads) {
         uint32_t token = indices[i];
@@ -50,8 +48,13 @@ inline void ClassifySelectedMetadata(uint32_t history, uint32_t resident,
         // The speculative path keeps its conservative reservation protection.
         if (token < resident && !inTail &&
             (!valid || asc_ldcg(valid + uint64_t(owner) * resident + token)) &&
-            (preserveHot || !reserved || asc_ldcg(reserved + uint64_t(batch) * resident + token) < 0)) {
+            (PreserveHot || !reserved || asc_ldcg(reserved + uint64_t(batch) * resident + token) < 0)) {
             slot = token;
+        } else if constexpr (PreserveHot) {
+            // No speculative mapping exists in this round. Match the exact
+            // capacity-clipped ABC mapping without reading last round's table.
+            if (inTail && token - tailBegin < tailTokens)
+                slot = resident + token % tailTokens;
         } else if (used || hasTail) {
 #if KVIP_INVERSE_MAPPING && !V9_UBMEM
             slot = ResolvePhysicalSlot(resident, lru,

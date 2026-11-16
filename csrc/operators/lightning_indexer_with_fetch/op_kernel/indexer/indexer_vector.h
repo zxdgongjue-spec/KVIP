@@ -989,13 +989,24 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     bool overlapSecond = false;
 #if KVIP_SELECTED_METADATA && !(defined(V9_UBMEM) && V9_UBMEM)
     if(profile)liTicks[3]=GetSystemCycle();
-    Simt::VF_CALL<rotating::ClassifySelectedMetadata>(Simt::Dim3{512,1,1},
+#if KVIP_LOW_MISS_TAIL
+    if(noPrefetchRound_ && !used) {
+        Simt::VF_CALL<rotating::ClassifySelectedMetadata<true>>(Simt::Dim3{512,1,1},
+            runtimeShape_.history,runtimeShape_.resident,b,owner,used,tailBegin,tailEnd,
+            ctx->tailBounds!=0,ctx,
+            reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(result.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(bitmap[bitmapWords].GetPhyAddr()));
+    } else
+#endif
+    Simt::VF_CALL<rotating::ClassifySelectedMetadata<false>>(Simt::Dim3{512,1,1},
         runtimeShape_.history,runtimeShape_.resident,b,owner,used,tailBegin,tailEnd,
         ctx->tailBounds!=0,ctx,
         reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),
         reinterpret_cast<__ubuf__ uint32_t*>(result.GetPhyAddr()),
         reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()),
-        reinterpret_cast<__ubuf__ uint32_t*>(bitmap[bitmapWords].GetPhyAddr()),noPrefetchRound_);
+        reinterpret_cast<__ubuf__ uint32_t*>(bitmap[bitmapWords].GetPhyAddr()));
     if(profile){
         SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
         liTicks[4]=GetSystemCycle();liTicks[5]=liTicks[4];liTicks[6]=liTicks[4];

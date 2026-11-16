@@ -12,6 +12,7 @@ extern "C" uint32_t kvip_adaptive_admission() { return KVIP_ADAPTIVE_ADMISSION; 
 extern "C" uint32_t kvip_low_miss_skip() { return KVIP_LOW_MISS_SKIP; }
 extern "C" uint32_t kvip_low_miss_tail() { return KVIP_LOW_MISS_TAIL; }
 extern "C" uint32_t kvip_low_miss_hot_hits() { return KVIP_LOW_MISS_TAIL && KVIP_SELECTED_METADATA; }
+extern "C" uint32_t kvip_low_miss_sparse_init() { return KVIP_LOW_MISS_SPARSE_INIT; }
 extern "C" uint32_t kvip_auto_route() { return KVIP_AUTO_ROUTE; }
 extern "C" uint32_t kvip_prefetch_rank() { return KVIP_PREFETCH_RANK; }
 extern "C" uint32_t kvip_prefetch_gate() { return KVIP_PREFETCH_GATE; }

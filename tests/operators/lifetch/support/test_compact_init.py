@@ -13,7 +13,8 @@ OP = ROOT / "csrc/operators/lightning_indexer_with_fetch"
 
 
 @pytest.mark.parametrize("compact,ubmem", [(0, 0), (1, 0), (0, 1), (1, 1)])
-def test_round_init_dma_coverage_and_streaming_prefix(tmp_path, compact, ubmem):
+@pytest.mark.parametrize("sparse", [0, 1])
+def test_round_init_dma_coverage_and_streaming_prefix(tmp_path, compact, ubmem, sparse):
     lifecycle = (OP / "op_kernel/lifecycle.cpp").read_text()
     streaming = (OP / "op_kernel/streaming.cpp").read_text()
     prefetch = (OP / "op_kernel/prefetch.h").read_text()
@@ -175,8 +176,14 @@ int main(){
   auto& errors=make("queryErrors",batch*128);args.queryErrors=errors.address();
   uint32_t ds=batch*2048,meta=(3*batch+31)&~31U;
   auto& packed=make("packedFetch",4*fw*(3*ds+meta)+4*fw*(6*ds+64));args.packedFetch=packed.address();args.prefetchCount=fw<<16;
-  for(uint32_t replay=0;replay<2;++replay){
-   // Simulate a large successful prior round, then a smaller/empty one.
+  for(uint32_t replay=0;replay<3;++replay){
+   bool noPrefetch=replay==1;
+   bool clearMapping=kvip_round_init::ClearMapping(streaming,noPrefetch);
+   assert(clearMapping==!(KVIP_LOW_MISS_SPARSE_INIT&&!V9_UBMEM&&streaming&&noPrefetch));
+   if(noPrefetch)for(uint32_t i=0;i<mapping.n;++i)
+    mapping.data()[i]=i%2?16384+3:16384+kSlots+42; // Stale prefetch and ABC tags.
+   // High -> low -> high: skipped stale state must be cleared again as soon
+   // as prefetch is re-enabled, including after a wrong low prediction.
    // Every omitted suffix remains a valid-looking positive token, never -1.
    for(auto& r:regions){std::copy_n(r->data(),r->n,r->expected.begin());std::fill(r->writes.begin(),r->writes.end(),0);}
    for(uint32_t b=0;b<batch;++b){
@@ -186,16 +193,17 @@ int main(){
     std::copy_n(lru.data()+b*kLruSlots,kLruSlots,slots.expected.begin()+b*kChangeCapacity);
    }
    for(auto* r:{&rows,&progress,&owners,&status,&finalStatus,&events})r->mark(0,r->n,0);
-   count.mark(0,1,0);mapping.mark(0,mapping.n,UINT32_MAX);
+   count.mark(0,1,0);if(clearMapping)mapping.mark(0,mapping.n,UINT32_MAX);
    if(streaming){
     for(auto* r:{&flags,&workerStatus,&errors})r->mark(0,r->n,0);
     for(uint32_t g=0;g<4*fw;++g)packed.mark(4*fw*(3*ds+meta)+g*(6*ds+64)+6*ds,64,0);
    }
    dmaCalls=0;
-   for(uint32_t b=batch;b--;)InitializeRound(batch,history,rounds,lanes,finalWorkers,postOffset,&ctx,b,streaming?&args:nullptr);
+   for(uint32_t b=batch;b--;)InitializeRound(batch,history,rounds,lanes,finalWorkers,postOffset,&ctx,b,streaming?&args:nullptr,noPrefetch);
    assert(maxUbBytes==kvip_round_init::kFillWords*4);
    for(auto& r:regions)r->check();
-   for(auto* r:{&rows,&progress,&owners,&status,&finalStatus,&events,&mapping})for(auto n:r->writes)assert(n==1);
+   for(auto* r:{&rows,&progress,&owners,&status,&finalStatus,&events})for(auto n:r->writes)assert(n==1);
+   for(auto n:mapping.writes)assert(n==uint32_t(clearMapping));
    for(uint32_t b=0;b<batch;++b)for(uint32_t i=0;i<kChangeCapacity;++i){
     assert(changes.writes[b*kChangeCapacity+i]==uint32_t(!(compact&&streaming)||i<kLruSlots));
     assert(slots.writes[b*kChangeCapacity+i]==uint32_t(i<kLruSlots));
@@ -204,7 +212,7 @@ int main(){
     for(threadIdx.x=0;threadIdx.x<256;++threadIdx.x)InitializeTailMappings(history,16384,&ctx,b);
     assert(changeCount.data()[b]==kLruSlots);
     for(uint32_t t=0;t<history;++t)assert(mapping.data()[b*history+t]==
-      (t>=history-128?16384+kSlots+t%384:UINT32_MAX));
+      (t>=history-128?16384+kSlots+t%384:mapping.expected[b*history+t]));
     changes.data()[b*kChangeCapacity]=7;changes.data()[b*kChangeCapacity+kLruSlots-1]=9;
     // Holes deliberately remain below a positive changeCount; streaming
     // residency and prefetch publication may not interpret those records.
@@ -248,6 +256,12 @@ int main(){
             "-fsanitize=address,undefined",
             f"-DKVIP_COMPACT_INIT={compact}",
             f"-DV9_UBMEM={ubmem}",
+            f"-DKVIP_LOW_MISS_SPARSE_INIT={sparse}",
+            "-DKVIP_AUTO_ROUTE=1",
+            "-DKVIP_SELECTED_METADATA=1",
+            "-DKVIP_LOW_MISS_TAIL=1",
+            "-DKVIP_LOW_MISS_SKIP=1",
+            "-DKVIP_STREAMING_LI=1",
             "-I",
             str(tmp_path),
             "-I",

@@ -32,7 +32,25 @@ struct Fixture {
                128,192,1,1,512,64,0,0,{0,0,0}};
  Context ctx{uint64_t(&config),uint64_t(controls.data()),uint64_t(owners.data()),uint64_t(ends.data())};
  Fixture(){ends.fill(131072);for(unsigned b=0;b<16;++b){owners[b]=b+1;requests[b]={b+1,1,1,4};}}
- void check(unsigned mode){assert(Prepare(&ctx));for(unsigned b=0;b<16;++b){
+ void check(unsigned mode){
+  // Different init blocks can observe block 0 before or after publication.
+  // Neither pending nor controls may influence their read-only decisions.
+  std::memset(pending.data(),0xa5,sizeof(pending));controls.fill(-12345);
+  auto savedPending=pending;auto savedControls=controls;auto savedFeedback=feedback;
+  bool noPrefetch=true;assert(Evaluate<false>(&ctx,noPrefetch));assert(noPrefetch==(mode==0));
+  assert(!std::memcmp(savedPending.data(),pending.data(),sizeof(pending)));
+  assert(savedControls==controls&&!std::memcmp(savedFeedback.data(),feedback.data(),sizeof(feedback)));
+  assert(Prepare(&ctx));savedPending=pending;savedControls=controls;
+  for(unsigned block=0;block<16;++block){
+   noPrefetch=!bool(mode==0);assert(Evaluate<false>(&ctx,noPrefetch));assert(noPrefetch==(mode==0));
+   assert(!std::memcmp(savedPending.data(),pending.data(),sizeof(pending))&&savedControls==controls);
+  }
+  // A read-only block does not even dereference publication storage.
+  auto pendingAddress=config.pending,controlsAddress=ctx.admissionControls;
+  config.pending=ctx.admissionControls=1;
+  assert(Evaluate<false>(&ctx,noPrefetch)&&noPrefetch==(mode==0));
+  config.pending=pendingAddress;ctx.admissionControls=controlsAddress;
+  for(unsigned b=0;b<16;++b){
   assert(pending[b].mode==mode);assert(controls[b*4]==(mode?512:0));
   assert(controls[b*4+1]==64&&controls[b*4+2]==0&&controls[b*4+3]==0);}}
  void commit(unsigned reads){for(unsigned b=0;b<16;++b){pending[b].necessary=reads;assert(Commit(&config,b,0));}}
@@ -87,6 +105,16 @@ int main(){
  for(unsigned b=0;b<16;++b){q.requests[b].queries=2;q.ends[b*4+2]=q.ends[b*4+3]=0;}
  q.check(0); // Both work and estimated bytes halve: same decision.
  for(auto& end:q.ends)if(end)end/=4;q.check(1); // Less LI work changes the ratio.
+ // Owner-keyed feedback survives row reordering; a new request still starts high.
+ Fixture reordered;reordered.check(1);reordered.commit(80);reordered.next();
+ std::swap(reordered.requests[0],reordered.requests[15]);
+ std::swap(reordered.owners[0],reordered.owners[15]);
+ for(unsigned i=0;i<4;++i)std::swap(reordered.ends[i],reordered.ends[60+i]);
+ reordered.check(0);reordered.requests[0].generation=2;reordered.requests[0].step=1;reordered.check(1);
+ // A wrong low prediction changes no correctness work: actual successful
+ // demand becomes the next round's feedback and switches the same graph high.
+ Fixture recovery;recovery.check(1);recovery.commit(0);recovery.next();recovery.check(0);
+ recovery.commit(4096);recovery.next();recovery.check(1);
  // Current packed token bytes affect Get demand; the first changed shape is unknown.
  Fixture packed;packed.check(1);packed.commit(80);packed.next();packed.ctx.shape.tokenBytes=2624;
  packed.check(1);assert(packed.pending[0].reason==ShapeChange);packed.commit(80);packed.next();packed.check(1);
@@ -102,6 +130,9 @@ int main(){
  Fixture empty;empty.ends.fill(0);for(auto& r:empty.requests)r.queries=0;empty.check(1);
  for(unsigned b=0;b<16;++b)assert(!Commit(&empty.config,b,0));
  Fixture invalid;invalid.config.fullWindow=0;auto controls=invalid.controls;
+ bool noPrefetch=true;auto pending=invalid.pending;
+ assert(!Evaluate<false>(&invalid.ctx,noPrefetch)&&!noPrefetch);
+ assert(!std::memcmp(pending.data(),invalid.pending.data(),sizeof(pending))&&controls==invalid.controls);
  assert(!Prepare(&invalid.ctx));assert(controls==invalid.controls);
 }
 ''')

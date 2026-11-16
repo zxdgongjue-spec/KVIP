@@ -5,6 +5,9 @@
 #ifndef KVIP_COMPACT_INIT
 #define KVIP_COMPACT_INIT 0
 #endif
+#ifndef KVIP_LOW_MISS_SPARSE_INIT
+#define KVIP_LOW_MISS_SPARSE_INIT 0
+#endif
 
 #if defined(__CCE_AICORE__)
 #define KVIP_ROUND_INIT_DEVICE __aicore__
@@ -13,6 +16,19 @@
 #endif
 
 namespace kvip_round_init {
+#if KVIP_LOW_MISS_SPARSE_INIT && KVIP_AUTO_ROUTE && KVIP_SELECTED_METADATA && \
+    KVIP_LOW_MISS_TAIL && KVIP_LOW_MISS_SKIP && KVIP_STREAMING_LI && \
+    !(defined(V9_UBMEM) && V9_UBMEM)
+constexpr bool kSparseMapping = true;
+#else
+constexpr bool kSparseMapping = false;
+#endif
+KVIP_ROUND_INIT_DEVICE inline constexpr bool ClearMapping(bool streaming, bool noPrefetch) {
+    // With no admitted prefetch, selected-metadata classification resolves
+    // hot/ABC slots from current inputs and never reads the prefetch map.
+    // Legacy and high routes retain their full initialization contract.
+    return !(kSparseMapping && streaming && noPrefetch);
+}
 #if KVIP_COMPACT_INIT && !(defined(V9_UBMEM) && V9_UBMEM)
 constexpr unsigned kFillWords = 16384;
 KVIP_ROUND_INIT_DEVICE inline constexpr unsigned ChangeWords(bool streaming, unsigned prefix, unsigned capacity) {

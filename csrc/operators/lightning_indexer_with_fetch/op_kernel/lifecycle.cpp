@@ -31,7 +31,7 @@ __aicore__ inline void FillRoundWords(uint64_t address,uint32_t words,
     }
     // Caller joins the whole fill group before reusing the shared UB value.
 }
-__aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t b,__gm__ pipeline_ab::Args* streaming) {
+__aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t b,__gm__ pipeline_ab::Args* streaming,bool noPrefetch=false) {
     TPipe pipe;TBuf<TPosition::VECCALC> storage;pipe.InitBuffer(storage,kvip_round_init::kFillWords*4);
     auto local=storage.Get<uint32_t>();
     Duplicate(local,uint32_t(0),kvip_round_init::kFillWords);
@@ -66,11 +66,13 @@ __aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uin
     SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
     Duplicate(local,UINT32_MAX,kvip_round_init::kFillWords);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    if(kvip_round_init::ClearMapping(streaming != nullptr,noPrefetch)) {
 #if KVIP_INVERSE_MAPPING && !V9_UBMEM
-    // A stale entry is accepted only if the freshly reset inverse agrees.
-    if(!KVIP_INVERSE_MAPPING_ACTIVE(ctx))
+        // A stale entry is accepted only if the freshly reset inverse agrees.
+        if(!KVIP_INVERSE_MAPPING_ACTIVE(ctx))
 #endif
-    FillRoundWords(ctx->mapping+uint64_t(b)*rt_history*4,rt_history,local);
+        FillRoundWords(ctx->mapping+uint64_t(b)*rt_history*4,rt_history,local);
+    }
     if(ctx->changes)FillRoundWords(ctx->changes+b*kChangeCapacity*4,
         kvip_round_init::ChangeWords(streaming != nullptr,kLruSlots,kChangeCapacity),local);
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
@@ -105,8 +107,9 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
         auto ctx=GetContext(bindings);
         auto initBindings=reinterpret_cast<__gm__ uint64_t*>(bindings);
         auto streaming=reinterpret_cast<__gm__ pipeline_ab::Args*>(initBindings[15]);
+        bool noPrefetch=false;
 #if KVIP_AUTO_ROUTE
-        if (!b && ctx->autoRoute) {
+        if ((!b || kvip_round_init::kSparseMapping) && ctx->autoRoute) {
             auto config = reinterpret_cast<__gm__ kvip_auto_route::Config*>(ctx->autoRoute);
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(config),128);
             if (kvip_auto_route::Valid(config)) {
@@ -114,14 +117,24 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
                 kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(requests),rt_batch*32);
                 for (uint32_t i=0;i<rt_batch;++i) if (requests[i].owner<config->owners)
                     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(config->feedback)+requests[i].owner*128,128);
-                if (kvip_auto_route::Prepare(ctx)) {
-                    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(config->pending),rt_batch*128);
-                    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->admissionControls),rt_batch*16);
+                if constexpr (kvip_round_init::kSparseMapping) {
+                    if(ctx->rowOwners)kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->rowOwners),rt_batch*4);
+                    if(ctx->queryEnds)kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->queryEnds),rt_batch*16);
+                }
+                if (!b) {
+                    if (kvip_auto_route::Evaluate<true>(ctx,noPrefetch)) {
+                        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(config->pending),rt_batch*128);
+                        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->admissionControls),rt_batch*16);
+                    }
+                } else {
+                    // No inter-block polling: evaluate the same immutable
+                    // request/feedback inputs without touching block 0's writes.
+                    kvip_auto_route::Evaluate<false>(ctx,noPrefetch);
                 }
             }
         }
 #endif
-        InitializeRound(rt_batch,rt_history,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b,streaming);
+        InitializeRound(rt_batch,rt_history,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b,streaming,noPrefetch);
         auto args=GetArgs(ctx,b*2);
         auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
         auto entity=reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(args.channel_entity);

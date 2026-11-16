@@ -19,7 +19,7 @@ def test_zero_prefetch_packing_and_high_path_match_reference(tmp_path, compact):
         "inline void PackStagedUrmaQuery(",
     )
     # Keep all data/control operations; only collapse the SIMT partition width.
-    native = native.replace("511", "0").replace("512", "1")
+    native = "template<bool AllSafe = false>\n" + native.replace("511", "0").replace("512", "1")
     program = tmp_path / "pack.cpp"
     program.write_text(r"""
 #include <algorithm>
@@ -59,6 +59,10 @@ void StoreFallbackSource(uint32_t history,uint32_t bytes,Context* ctx,uint32_t b
  }else{blocks[output]=batch*(history/128)+token/128;offsets[output]=(token%128)*bytes;}
 }
 """ + native + r"""
+template<class... Args>void dispatch(bool low,uint32_t used,Args... args){
+ if(KVIP_LOW_MISS_TAIL&&low&&!used)PackStagedUrmaQuery<true>(args...);
+ else PackStagedUrmaQuery<false>(args...);
+}
 int main(){
  std::mt19937 rng(1704);
  constexpr uint32_t history=131072,resident=16384,batch=2,query=3,capacity=4*kSlots;
@@ -75,7 +79,7 @@ int main(){
  for(uint32_t i=0;i<kTop;++i){ids[i]=(i*31)%kTop;selected[i]=(i*59)%history;}
  for(auto& slot:slots)slot=rng()%resident;
  for(auto& value:reserved)value=rng()%3?-1:int32_t(rng()%2048);
- for(uint32_t used:{0U,1U,31U,2048U})for(uint32_t count:{0U,1U,31U,511U,512U,513U,2048U})
+ for(bool low:{false,true})for(uint32_t used:{0U,1U,31U,2048U})for(uint32_t count:{0U,1U,31U,511U,512U,513U,2048U})
  for(uint32_t begin:{0U,1793U,4096U})for(bool useFallback:{false,true})for(bool useDirect:{false,true}){
   constexpr uint32_t stride=8192,start=19;
   std::vector<int32_t> direct(6*stride+64,0);
@@ -90,12 +94,12 @@ int main(){
    bool conflict=ordinal>=0&&uint32_t(ordinal)<used;
    if(uint32_t(conflict)==phase){order.push_back(i);if(!phase)++safe;}
   }
-  PackStagedUrmaQuery(history,resident,656,batch,query,used,begin,count,&ctx,
+  dispatch(low,used,history,resident,656,batch,query,used,begin,count,&ctx,
    selected.data(),ids.data(),slots.data(),ctl.data(),useDirect?direct.data():nullptr,stride);
   assert(!ctl[1]&&ctl[16]==count&&ctl[17]==safe&&submitted==13+count);
   if(!count){assert(!prefixCalls&&!reservedLoads&&!ctl[18]&&!ctl[19]);continue;}
 #if KVIP_LOW_MISS_TAIL
-  if(!used)assert(!prefixCalls&&!reservedLoads);
+  if(low&&!used)assert(!prefixCalls&&!reservedLoads);
   else assert(prefixCalls==1&&reservedLoads==2*count);
 #else
   assert(prefixCalls==1&&reservedLoads==2*count);
@@ -126,7 +130,7 @@ int main(){
   if(fault==0)slots[0]=resident;
   if(fault==1)selected[ids[0]]=history;
   if(fault==2)direct[6*4096]=4096;
-  PackStagedUrmaQuery(history,resident,656,batch,query,used,0,32,&ctx,
+  dispatch(true,used,history,resident,656,batch,query,used,0,32,&ctx,
    selected.data(),ids.data(),slots.data(),ctl.data(),direct.data(),4096);
   assert(ctl[1]&(fault==0?4U:fault==1?1U:16U));assert(!submitted);
   slots[0]=savedSlot;selected[ids[0]]=savedToken;

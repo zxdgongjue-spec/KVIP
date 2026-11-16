@@ -54,10 +54,12 @@ KVIP_ROUTE_FN inline uint32_t ScaleReads(uint32_t necessary, uint32_t currentQue
     return numerator >> 2;
 }
 
-// One init block owns this decision and these control writes. No other init
-// block consumes them; the existing init -> LI launch edge publishes the result.
-template<class Context>
-KVIP_ROUTE_FN inline bool Prepare(KVIP_ROUTE_GM Context* ctx) {
+// Every init block may evaluate immutable requests and previous successful
+// feedback. Only block 0 publishes pending/control state; evaluating without
+// publication must never read that concurrently written state.
+template<bool Publish, class Context>
+KVIP_ROUTE_FN inline bool Evaluate(KVIP_ROUTE_GM Context* ctx, bool& noPrefetch) {
+    noPrefetch = false;
     auto c = reinterpret_cast<const KVIP_ROUTE_GM Config*>(ctx->autoRoute);
     if (!ctx->admissionControls || !Valid(c) || !ctx->shape.batch || ctx->shape.batch > 16)
         return false;
@@ -84,11 +86,13 @@ KVIP_ROUTE_FN inline bool Prepare(KVIP_ROUTE_GM Context* ctx) {
     }
     for (uint32_t b = 0; b < ctx->shape.batch; ++b) {
         auto r = requests + b;
-        auto p = pending + b;
-        auto words = reinterpret_cast<KVIP_ROUTE_GM uint64_t*>(p);
-        for (uint32_t i = 0; i < 16; ++i) words[i] = 0;
-        p->owner = r->owner; p->generation = r->generation; p->step = r->step;
-        p->queries = r->queries; p->tokenBytes = ctx->shape.tokenBytes;
+        if constexpr (Publish) {
+            auto p = pending + b;
+            auto words = reinterpret_cast<KVIP_ROUTE_GM uint64_t*>(p);
+            for (uint32_t i = 0; i < 16; ++i) words[i] = 0;
+            p->owner = r->owner; p->generation = r->generation; p->step = r->step;
+            p->queries = r->queries; p->tokenBytes = ctx->shape.tokenBytes;
+        }
         uint64_t q = 0, rowWork = 0;
         for (uint32_t i = 0; i < 4; ++i) {
             uint64_t end = ends ? ends[b * 4 + i] : (i < r->queries ? ctx->shape.history : 0);
@@ -96,7 +100,7 @@ KVIP_ROUTE_FN inline bool Prepare(KVIP_ROUTE_GM Context* ctx) {
             rowWork += end;
             if (end > ctx->shape.history) q = 100;
         }
-        p->scoreWork = rowWork;
+        if constexpr (Publish) pending[b].scoreWork = rowWork;
         if (!r->queries && !q) continue; // Padding cannot train an owner.
         ++active; work += rowWork;
         bool identity = r->owner < c->owners && r->owner == (owners ? owners[b] : b) &&
@@ -115,17 +119,20 @@ KVIP_ROUTE_FN inline bool Prepare(KVIP_ROUTE_GM Context* ctx) {
             auto f = feedback + r->owner;
             bool valid = f->valid == kValid && f->generation && f->step &&
                 f->queries >= 1 && f->queries <= 4 && f->necessary <= 8192 && f->mode <= 1;
-            p->previousStep = valid ? f->step : 0;
-            p->learnable = !valid || r->generation > f->generation ||
+            bool learnable = !valid || r->generation > f->generation ||
                 (r->generation == f->generation && r->step > f->step);
-            if (!p->learnable) rowReason = StaleStep;
+            if constexpr (Publish) {
+                pending[b].previousStep = valid ? f->step : 0;
+                pending[b].learnable = learnable;
+            }
+            if (!learnable) rowReason = StaleStep;
             else if (!valid || r->generation != f->generation) rowReason = Unknown;
             else if (r->step - f->step > c->maxStepGap) rowReason = StaleStep;
-            else if (f->tokenBytes != p->tokenBytes) rowReason = ShapeChange;
+            else if (f->tokenBytes != ctx->shape.tokenBytes) rowReason = ShapeChange;
             else {
                 uint64_t predicted = ScaleReads(uint32_t(f->necessary), uint32_t(r->queries),
                                                 uint32_t(f->queries));
-                bytes += predicted * p->tokenBytes;
+                bytes += predicted * ctx->shape.tokenBytes;
                 wasLow = wasLow && f->mode == 0;
                 predict = true;
             }
@@ -137,15 +144,24 @@ KVIP_ROUTE_FN inline bool Prepare(KVIP_ROUTE_GM Context* ctx) {
     }
     uint64_t budget = wasLow ? c->highBudget : c->lowBudget;
     uint64_t mode = known && active && work && bytes * 1024 <= budget * work ? 0 : 1;
+    noPrefetch = mode == 0;
     if (!active) reason = Unknown;
-    for (uint32_t b = 0; b < ctx->shape.batch; ++b) {
-        pending[b].mode = mode; pending[b].reason = reason;
-        controls[b * 4] = mode ? int32_t(c->fullTotal) : 0;
-        controls[b * 4 + 1] = int32_t(c->fullWindow);
-        controls[b * 4 + 2] = int32_t(c->fullSteps);
-        controls[b * 4 + 3] = int32_t(c->fullCarry);
+    if constexpr (Publish) {
+        for (uint32_t b = 0; b < ctx->shape.batch; ++b) {
+            pending[b].mode = mode; pending[b].reason = reason;
+            controls[b * 4] = mode ? int32_t(c->fullTotal) : 0;
+            controls[b * 4 + 1] = int32_t(c->fullWindow);
+            controls[b * 4 + 2] = int32_t(c->fullSteps);
+            controls[b * 4 + 3] = int32_t(c->fullCarry);
+        }
     }
     return true;
+}
+
+template<class Context>
+KVIP_ROUTE_FN inline bool Prepare(KVIP_ROUTE_GM Context* ctx) {
+    bool noPrefetch;
+    return Evaluate<true>(ctx, noPrefetch);
 }
 
 // Called only after this request's Get completion and Index update have joined.

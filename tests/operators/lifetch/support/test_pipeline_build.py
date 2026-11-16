@@ -56,7 +56,7 @@ def test_pipeline_options_isolate_and_reuse_the_correct_binary(monkeypatch, tmp_
 @pytest.mark.parametrize("value", (1, 0, "OFF", None))
 @pytest.mark.parametrize("option", ("compact_init", "adaptive_admission", "prefetch_gate",
                                     "skip_exhausted_prefetch", "early_prefetch_drain", "inverse_mapping",
-                                    "low_miss_skip", "low_miss_tail", "auto_route"))
+                                    "low_miss_skip", "low_miss_tail", "auto_route", "low_miss_sparse_init"))
 def test_pipeline_options_reject_ambiguous_values_before_build(tmp_path, value, option):
     with pytest.raises(ValueError, match="must be bool"):
         build.build_libraries(cache_dir=tmp_path, cann=tmp_path, headers=tmp_path, soc="A5", **{option: value})
@@ -143,6 +143,20 @@ def test_auto_route_requires_complete_tail_and_isolates_binary(monkeypatch, tmp_
     previous = len(calls)
     assert build.build_libraries(**args, **light, auto_route=True) == automatic
     assert len(calls) == previous
+    sparse_flags = dict(auto_route=True, low_miss_tail=True, selected_metadata=True, low_miss_sparse_init=True)
+    for missing in ("auto_route", "low_miss_tail", "selected_metadata"):
+        with pytest.raises(ValueError, match="low_miss_sparse_init requires"):
+            build.build_libraries(**args, **light, **(sparse_flags | {missing: False}))
+    assert len(calls) == previous
+    sparse = build.build_libraries(**args, **light, **sparse_flags)
+    assert sparse != automatic
+    manifest = json.loads((sparse[0].parent / "complete.json").read_text())
+    assert manifest["KVIP_LOW_MISS_SPARSE_INIT"] == "ON"
+    assert build.build_libraries(**args, **light, **sparse_flags) == sparse
+    assert len(calls) == previous + 2
+    with pytest.raises(ValueError, match="separate initialization policies"):
+        build.build_libraries(**args, **light, **sparse_flags, inverse_mapping=True)
+    assert len(calls) == previous + 2
 
 
 @pytest.mark.parametrize("rank", (-1, 2049, True, False, 1536.0, "1536", None))

@@ -84,6 +84,7 @@ template<class T> T asc_ldcg(T* p){
 namespace rotating {
 constexpr uint32_t kTop=2048,kLruSlots=2048,kSlots=8192;
 struct Context {uint64_t mapping,lruSlots,hotValid,reservedHot;};
+uint32_t OutputStride(uint32_t resident,Context*){return resident+512;}
 """
         + resolve
         + '\n}\n#include "staged_topk_classify.h"\n#include "staged_selected_metadata.h"\n'
@@ -207,14 +208,17 @@ struct {uint32_t x;} threadIdx;
 void asc_syncthreads(){}
 void asc_atomic_or(uint32_t* p,uint32_t v){*p|=v;}
 bool forbidReserved=false;
-uintptr_t reservedBegin=0,reservedEnd=0;
+uintptr_t reservedBegin=0,reservedEnd=0,mappingBegin=0,mappingEnd=0;
 template<class T>T asc_ldcg(T* p){
  assert(!forbidReserved || uintptr_t(p)<reservedBegin || uintptr_t(p)>=reservedEnd);
+ assert(!forbidReserved || uintptr_t(p)<mappingBegin || uintptr_t(p)>=mappingEnd);
  return *p;
 }
 namespace rotating {
 constexpr uint32_t kTop=2048,kLruSlots=2048,kSlots=8192;
 struct Context {uint64_t mapping,lruSlots,hotValid,reservedHot;};
+uint32_t tailCapacity=256;
+uint32_t OutputStride(uint32_t resident,Context*){return resident+tailCapacity;}
 ''' + resolve + '\n}\n#include "staged_topk_classify.h"\n#include "staged_selected_metadata.h"\n' + r'''
 int main(){using namespace rotating;
  constexpr uint32_t R=4096,H=8192,B=1,O=2,T=256;
@@ -222,6 +226,7 @@ int main(){using namespace rotating;
  std::vector<int32_t> reserved(2*R,-1);
  for(uint32_t i=0;i<kLruSlots;++i){lru[B*kLruSlots+i]=i*2;reserved[B*R+i*2]=i;}
  reservedBegin=uintptr_t(reserved.data());reservedEnd=reservedBegin+reserved.size()*4;
+ mappingBegin=uintptr_t(map.data());mappingEnd=mappingBegin+map.size()*4;
  valid[O*R+2]=0; // An invalid candidate remains a true miss.
  const uint32_t begin=R-128,end=R+128;
  for(uint32_t token=begin;token<end;++token)map[B*H+token]=R+kSlots+token%T;
@@ -231,14 +236,25 @@ int main(){using namespace rotating;
  for(uint32_t q=0;q<4;++q)for(uint32_t i=0;i<kTop;++i)
    selected[q*kTop+i]=q==3?2*i:q==0?H-1:(i*17+q)%H;
  selected[0]=UINT32_MAX;selected[1]=H;selected[2]=2;
- for(bool low:{false,true})for(uint32_t used:{0U,1U}){
+ for(uint32_t capacity:{0U,128U,256U})for(bool low:{false,true})for(uint32_t used:{0U,1U}){
+  tailCapacity=capacity;
+  // Poison all uninitialized locations, as sparse init intentionally retains
+  // the previous round's map. Only the high path consumes initialized entries.
+  std::fill(map.begin(),map.end(),low&&!used?uint32_t(R+kSlots+99):UINT32_MAX);
+  for(uint32_t token=begin;token<end&&token-begin<capacity;++token)
+   map[B*H+token]=R+kSlots+token%capacity;
   std::fill(unionBits.begin(),unionBits.end(),0);
   forbidReserved=low && !used;
   for(uint32_t q=0;q<4;++q){
    std::vector<uint32_t> bits(4104,0);
-   for(threadIdx.x=0;threadIdx.x<512;++threadIdx.x)
-    ClassifySelectedMetadata(H,R,B,O,used,begin,end,true,&ctx,selected.data()+q*kTop,
-      locations.data()+q*kTop,bits.data(),bits.data()+4096,low);
+   for(threadIdx.x=0;threadIdx.x<512;++threadIdx.x){
+    if(low&&!used)
+     ClassifySelectedMetadata<true>(H,R,B,O,used,begin,end,true,&ctx,selected.data()+q*kTop,
+       locations.data()+q*kTop,bits.data(),bits.data()+4096);
+    else
+     ClassifySelectedMetadata<false>(H,R,B,O,used,begin,end,true,&ctx,selected.data()+q*kTop,
+       locations.data()+q*kTop,bits.data(),bits.data()+4096);
+   }
    for(threadIdx.x=0;threadIdx.x<512;++threadIdx.x)MergeClassifyBitmap(bits.data(),R);
    assert(bits[4096]==uint32_t(q==0));
    for(uint32_t i=0;i<kTop;++i){
@@ -247,7 +263,9 @@ int main(){using namespace rotating;
      bool tail=token>=begin && token<end;
      if(token<R && !tail && valid[O*R+token] &&
         ((low&&!used)||reserved[B*R+token]<0))expected=token;
-     else expected=ResolvePhysicalSlot(R,lru.data()+B*kLruSlots,map[B*H+token]);
+     else if(low&&!used){
+      if(tail&&token-begin<capacity)expected=R+token%capacity;
+     }else expected=ResolvePhysicalSlot(R,lru.data()+B*kLruSlots,map[B*H+token]);
     }
     assert(locations[q*kTop+i]==expected);
     if(expected<R)assert(bits[expected/32]&(1U<<(expected%32)));
