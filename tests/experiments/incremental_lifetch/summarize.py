@@ -112,7 +112,7 @@ def summarize(run, required=False):
     if (run / 'experiment.txt').exists() and (run / 'experiment.txt').read_text().strip() == 'recent-index':
         manifest = json.loads((run / 'incremental-source/recent_experiment.json').read_text())
         lines[1] = 'A=current TopK-prefetch B; B=A + PR15 recent Index seed. Time: us.'
-        lines += [f"Recent range=[{manifest['recent_begin']},{manifest['recent_end']}); per-Q causal clipping.",
+        lines += [f"Configured ABC tail ({manifest['abc_tail_tokens']} tokens) range=[{manifest['recent_begin']},{manifest['recent_end']}); per-Q causal clipping.",
                   'Identical KV residency/input; Index-only early scoring, exact seed merge, no duplicate admission on later scan.',
                   'Incremental windows/final TopK, original correctness checks and level3 timing retained.']
     if (run / 'experiment.txt').exists() and (run / 'experiment.txt').read_text().strip() == 'window-topk-only':

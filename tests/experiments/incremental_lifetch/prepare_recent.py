@@ -12,10 +12,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path)
     parser.add_argument('--baseline', action='store_true')
-    parser.add_argument('--recent-tokens', type=int, default=384)
+    parser.add_argument('--abc-tail-tokens', type=int, default=384)
     args = parser.parse_args()
-    if not 128 <= args.recent_tokens <= 2048 or args.recent_tokens % 128:
-        parser.error('--recent-tokens must be a multiple of 128 in [128,2048]')
+    if not 0 <= args.abc_tail_tokens <= 2048:
+        parser.error('--abc-tail-tokens must be in [0,2048]')
     here = Path(__file__).resolve().parent
     # Both sides start from the exact current B, never the old bitmap baseline.
     subprocess.run([sys.executable, str(here / 'prepare.py'), str(args.output),
@@ -29,15 +29,15 @@ def main():
                         '-i', str(here / 'recent_seed.patch')], cwd=dest, check=True)
         shutil.copyfile(here / 'recent_seed.h', kernel / 'indexer/recent_seed.h')
         (kernel / 'indexer/recent_config.h').write_text(
-            f'#pragma once\n#define KVIP_RECENT_TOKENS {args.recent_tokens}\n')
+            f'#pragma once\n#define KVIP_RECENT_TOKENS {args.abc_tail_tokens}\n')
     manifest = dict(variant='A_current_B' if args.baseline else 'B_current_B_plus_recent',
-                    recent_tokens=args.recent_tokens, history=131072,
-                    recent_begin=131072-args.recent_tokens, recent_end=131072,
-                    semantics='Index-only early seed; identical KV residency in A/B',
+                    abc_tail_tokens=args.abc_tail_tokens, history=131072,
+                    recent_begin=131072-args.abc_tail_tokens, recent_end=131072,
+                    semantics='Configured current ABC tail length; Index-only seed, identical KV residency in A/B',
                     pr15_commit='4385ac75435c3e872b5e77a4b66e98f8fa5838a8',
                     frozen_current_b_sha256=frozen)
     (dest / 'recent_experiment.json').write_text(json.dumps(manifest, indent=2)+'\n')
-    print(f"Recent Index experiment: {manifest['variant']}; range="
+    print(f"Recent Index experiment: {manifest['variant']}; configured ABC tail="
           f"[{manifest['recent_begin']},{manifest['recent_end']}); causal clipping per Q")
 
 

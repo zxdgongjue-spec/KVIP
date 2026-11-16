@@ -297,15 +297,17 @@ bash tests/experiments/incremental_lifetch/compare_recent.sh \
 python tests/experiments/incremental_lifetch/summarize.py --experiment recent-index --require-detailed
 ```
 
-参数依次为 KVAF 路径、设备、服务地址、BS、miss%、窗口数、近期 Index 长度。
-默认 BS16、miss10%、4 窗口、384 个近期位置；近期长度支持 128～2048 的 128 倍数。
+参数依次为 KVAF 路径、设备、服务地址、BS、miss%、窗口数、ABC tail 长度（按目标场景的 `tail_bounds[:,1]-tail_bounds[:,0]` 输入）。
+默认 BS16、miss10%、4 窗口、ABC tail 长度 384；长度支持 0～2048，允许非 128 对齐的有效尾区长度；0 表示没有 ABC。
 输出位于 `tests/results/recent-index/<时间>/`，脚本结束自动生成 `key_results.log`。
 
 - A：当前 TopK 合并预取 B，代码保持不变；不再使用旧的位图预取 A。
 - B：A 加 PR15 (`4385ac7`) 的近期 Index 提前计分、Q/scale 复用和精确 TopK 合并。
   当前增量路径需要完整初始 TopK 分数和 ID，因此复用 PR15 的精确合并分支，
   不采用仅返回 Kth、没有完整 TopK 列表的快速分支。
-- 近期范围固定为 `[history-recent_tokens, history)`，再按每 Q 因果边界裁剪。
+- 提前计分范围按输入的 ABC tail 长度构造为 `[history-abc_tail_tokens, history)`，再按每 Q 因果边界裁剪。
+  该独立合成负载没有真实服务的 `tail_bounds`，因此长度由命令输入；它不是自动读取的实测 ABC 范围。
+  不额外包含已经退出当前 ABC 的前轮 token。
   这是合成负载上的 Index-only 对比；A/B 的 KV 驻留状态、数据、总预取预算和窗口配置一致，
   不把这段 KV 人为变为本地命中，不模拟 vLLM 的 ABC 环形区推进或真实 `threshold_bounds`。
 - 提前合并的近期 token 在后续增量处理中只屏蔽本地位图，防止重复进入 TopK；

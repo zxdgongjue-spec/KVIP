@@ -27,7 +27,7 @@ miss=${5:-10}
 default_windows=8
 if [[ "$mode" == recent-index ]]; then default_windows=4; fi
 windows=${6:-$default_windows}
-recent_tokens=${7:-384}
+abc_tail_tokens=${7:-384}
 if [[ ! "$windows" =~ ^[1-9][0-9]*$ ]]; then
   echo "WINDOWS must be a positive integer" >&2
   exit 2
@@ -37,8 +37,8 @@ mkdir -p "$run"
 printf '%s\n' "$mode" > "$run/experiment.txt"
 echo "Experiment: $mode; results=$run"
 if [[ "$mode" == recent-index ]]; then
-  python "$repo/tests/experiments/incremental_lifetch/prepare_recent.py" "$run/baseline-source" --baseline --recent-tokens "$recent_tokens"
-  python "$repo/tests/experiments/incremental_lifetch/prepare_recent.py" "$run/incremental-source" --recent-tokens "$recent_tokens"
+  python "$repo/tests/experiments/incremental_lifetch/prepare_recent.py" "$run/baseline-source" --baseline --abc-tail-tokens "$abc_tail_tokens"
+  python "$repo/tests/experiments/incremental_lifetch/prepare_recent.py" "$run/incremental-source" --abc-tail-tokens "$abc_tail_tokens"
 else
   python "$repo/tests/experiments/incremental_lifetch/prepare.py" "$run/incremental-source" "${prepare_flags[@]}"
   python "$repo/tests/experiments/incremental_lifetch/prepare.py" "$run/baseline-source" --baseline "${prepare_flags[@]}"
