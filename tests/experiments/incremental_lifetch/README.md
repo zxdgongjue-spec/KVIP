@@ -1,3 +1,6 @@
+最新预取选择实验见 [RANKED_PREFETCH.md](RANKED_PREFETCH.md)：
+A 保留当前 ABC 基线，B 增加逐窗口排名阈值和每 Q 配额，使用 `compare_ranked.sh`。
+
 # 增量位图 TopK：URMA 端到端 A/B
 
 ## 当前认可的优化基线（2026-11-16）

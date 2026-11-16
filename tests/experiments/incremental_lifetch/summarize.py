@@ -109,6 +109,10 @@ def detailed_trace(report, path, label, required=False):
 def summarize(run, required=False):
     cases = {v: load_cases(run / v) for v in ('baseline', 'incremental')}
     lines = [f'Run: {run}', 'A=baseline; B=incremental. Time: us; positive reduction means faster.']
+    if (run / 'experiment.txt').exists() and (run / 'experiment.txt').read_text().strip() == 'ranked-prefetch':
+        lines[1] = 'A=accepted ABC baseline; B=A + per-window score-rank threshold and per-Q highest-score quota.'
+        lines += ['Four-window ranks=1024,1365,1707,2048; 128/request/window gives 32/Q before cross-Q dedup.',
+                  'All windows including window 0 use ranked cold candidates; no redistribution after dedup/mapping filters.']
     if (run / 'experiment.txt').exists() and (run / 'experiment.txt').read_text().strip() == 'recent-index':
         manifest = json.loads((run / 'incremental-source/recent_experiment.json').read_text())
         lines[1] = 'A=current TopK-prefetch B; B=A + PR15 recent Index seed. Time: us.'
@@ -204,7 +208,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('run', nargs='?', type=Path, help='A/B result directory; default: latest window-topk-only run')
     parser.add_argument('--experiment', default='window-topk-only',
-                        choices=('window-topk-only', 'final-topk-only', 'topk-prefetch', 'recent-index'),
+                        choices=('window-topk-only', 'final-topk-only', 'topk-prefetch', 'recent-index', 'ranked-prefetch'),
                         help='Result family to search when run is omitted')
     parser.add_argument('--require-detailed', action='store_true', help='Fail if new A/B trace records are absent')
     args = parser.parse_args()
