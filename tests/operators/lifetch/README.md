@@ -85,6 +85,7 @@ python tests/operators/lifetch/test_lifetch.py diagnose \
 - level 3：逐核时间线、内部步骤和等待、LI 分类细节、可用的 Fetch-only 配对。
 
 `--stages li,resolve,update,fetch` 筛选展示，不跳过执行依赖。性能图与打点图分开采样。
+合成 URMA 的 `diagnose` 和 `bench` 共用同样的资源池配置、回放初态和校验节奏。性能采样保留逐轮完成检查，完整校验在首次执行、首次图回放和最后一轮进行。每个 case 先采集串行整图、独立 Get 和融合整图，再进行计数器校准和 profiler 回放。独立 Get 在获取融合队列 lease 之前执行。
 URMA 合成负载支持 Fetch-only；UBmem 和真实回放仍使用完整图诊断。
 `all` 执行默认 check 后，用同一次配对测试生成 bench 和 level 1 诊断，不另跑 report。
 
@@ -102,6 +103,29 @@ URMA 合成负载支持 Fetch-only；UBmem 和真实回放仍使用完整图诊�
 - 整图有效带宽用 `serial_read_bytes / serial_mean_us / 1000` 或 `fused_total_bytes_mean / fused_mean_us / 1000`。分段传输的 `GBps_p50` 先用同一轮的字节数除以该轮区间，再取各轮中位数。零条传输的带宽留空，缺少打点的阶段也留空。
 
 `--stages` 筛选诊断文本展示。CSV 保留已捕获的各个阶段。真实回放的分阶段记录按源轮次保存在 `diagnostic.json`。
+
+### URMA BatchGet 单算子 A/B
+
+在机头加载 CANN 和待比较的 KVAF 构建。以下命令在同一设备上沿用同一个 CPU service，
+用 LIFetch CSV 的 `serial_read_entries` 设置 `--miss-count`（这里为 4512）。
+
+```bash
+KVAF_ROOT=/vllm-workspace/vllm-ascend/third_party/KVAF
+export DEVICE_ID=4 KVAF_RUN_NPU_TESTS=1 KVAF_CPU_SERVICE_ADDR=127.0.0.1:28885
+export PYTHONPATH="$KVAF_ROOT/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
+export KVAF_BATCH_GET_KERNEL="$KVAF_ROOT/build-npu/bin/kvaf_execute_batch_get_kernels.o"
+export KVAF_BATCH_PUT_KERNEL="$KVAF_ROOT/build-npu/bin/kvaf_execute_batch_put_kernels.o"
+
+for cores in 2 40; do
+  python "$KVAF_ROOT/tests/python/test_npu_batch_get_perf.py" \
+    --transport urma --aiv-cores "$cores" --jettys-per-core 2 --max-inflight-total 2048 \
+    --token-bytes 656 --tokens-per-block 128 --table-capacity 16384 \
+    --request-length 4512 --miss-count 4512 --source-access-pattern random \
+    --output-access-pattern random --seed 43 --warmup 4 --iterations 50 --no-kernel-profile
+done
+```
+
+先在两次 KVAF 单测之间比较 `operation=batch_get` 的 p50、p99 和 `useful_GiBps`。此测试用固定 seed 生成合成描述符，得到同一类地址顺序下的核数对照。要复现 LIFetch 串行 Get，还需把 `NativeMtp` 的 `indices`、`offsets`、`outputs` 有效前缀原样回放到同样的表布局和输出槽位中，并统一用 NPU Event 计时。`--fetch-jettys-per-aiv` 控制的是融合最终 Fetch。
 
 ## 真实回放与旧 trace 转换
 

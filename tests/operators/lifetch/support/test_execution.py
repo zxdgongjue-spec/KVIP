@@ -135,6 +135,41 @@ def test_nested_miss_progress_reaches_supervised_worker(tmp_path):
     assert (tmp_path / 'stage.log').read_text().strip() == 'miss15: BS=8: paired benchmark'
 
 
+@pytest.mark.parametrize('mode', ['bench', 'diagnose'])
+def test_synthetic_urma_worker_reuses_the_performance_pool(tmp_path, monkeypatch, mode):
+    import json
+    import sys
+    from types import SimpleNamespace
+    import execution
+    from reporting import atomic_json
+
+    build = tmp_path / 'build-npu'
+    monkeypatch.setitem(sys.modules, 'kvaf', SimpleNamespace(__file__=str(build / 'python/kvaf/__init__.py')))
+    workers = []
+
+    def run_worker(options, directory):
+        pool = options.shared_pool
+        assert isinstance(pool, execution.BenchPool)
+        pool.workers = 40
+        pool.borrows += 1
+        assert options.batches == '16'
+        assert options.trace_rounds == (2 if mode == 'diagnose' else 0)
+        workers.append((pool, options.miss_percent))
+        return 0
+
+    monkeypatch.setattr(execution, 'run_worker', run_worker)
+    miss = '5,12.5' if mode == 'bench' else '12.5'
+    config = configuration([mode, '--transport', 'urma', '--kvaf-root', str(tmp_path),
+                            '--batches', '16', '--miss-percent', miss, '--iterations', '2'])
+    path = tmp_path / 'run/config.json'
+    atomic_json(path, dict(vars(config), kvaf_root=str(config.kvaf_root), output=str(config.output)))
+    assert execution.run_config(path) == 0
+    stats = json.loads(path.with_name('pool.json').read_text())
+    assert stats['runtime_workers'] == 40 and stats['cases'] == len(workers)
+    assert [miss for _, miss in workers] == ([5, 12.5] if mode == 'bench' else [12.5])
+    assert all(pool is workers[0][0] for pool, _ in workers)
+
+
 @pytest.mark.parametrize('show_details', [False, True])
 @pytest.mark.parametrize('exit_code', [0, 1])
 def test_supervisor_details_saved_and_failures_visible(tmp_path, capsys, show_details, exit_code):

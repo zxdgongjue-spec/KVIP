@@ -243,7 +243,8 @@ def run_config(path, shared_pool=None):
     config = SimpleNamespace(**json.loads(path.read_text()))
     config.kvaf_root = Path(config.kvaf_root).resolve()
     config.output = path.parent
-    if config.mode == 'bench' and config.input == 'synthetic' and shared_pool is None:
+    use_pool = config.mode == 'bench' or (config.mode == 'diagnose' and config.transport == 'urma')
+    if use_pool and config.input == 'synthetic' and shared_pool is None:
         pool = BenchPool(config)
         misses = config.miss_percent if isinstance(config.miss_percent, list) else [config.miss_percent]
         failed = 0
@@ -1869,7 +1870,22 @@ def run_urma_case(
     split_samples = {}
     fused_read_counts = []
 
-    def measure(call, reset, check, read_label=None, timing_name=None):
+    def capture_graph(call, reset):
+        reset()
+        stream.synchronize()
+        graph = torch.npu.NPUGraph()
+        owner.graphs.append(graph)
+        with torch.npu.graph(graph, stream=capture):
+            call()
+        capture.synchronize()
+        return graph
+
+    def check_native_completion():
+        runtime = owner.session.runtime
+        probe = runtime.acquire_fused_batch_get_context(native.output, stream)
+        runtime.release_fused_batch_get_context(probe, stream)
+
+    def measure(call, reset, check, *, timing_name, completion_check=None, keep_graph=False):
         costs = dict(reset_s=0., validation_s=0., replay_wait_s=0., completion_s=0., reads_s=0.)
         raw_check, raw_reset = check, reset
         def check():
@@ -1883,22 +1899,17 @@ def run_urma_case(
             raw_reset()
             stream.synchronize()
             costs['reset_s'] += time.perf_counter() - began
-        state["check_phase"] = f"timing {read_label or getattr(call, '__name__', 'operation')}"
+        state["check_phase"] = f"timing {timing_name}"
         reset()
         call()
         stream.synchronize()
         check()
-        reset()
-        stream.synchronize()
-        graph = torch.npu.NPUGraph()
-        owner.graphs.append(graph)
-        with torch.npu.graph(graph, stream=capture):
-            call()
-        capture.synchronize()
+        graph = capture_graph(call, reset)
         graph.replay()
         stream.synchronize()
         check()
         samples = []
+        count_reads = timing_name == 'prototype_with_update'
         for step in range(args.warmup + args.iterations):
             reset()
             stream.synchronize()
@@ -1911,23 +1922,19 @@ def run_urma_case(
             costs['replay_wait_s'] += time.perf_counter() - began
             if step >= args.warmup:
                 samples.append(start.elapsed_time(end) * 1000)
-            if not bench_only or step == args.warmup + args.iterations - 1:
+            validate = completion_check is None or step == args.warmup + args.iterations - 1
+            if validate:
                 check()
-            elif read_label == "prototype_with_update":
+            else:
                 began = time.perf_counter()
-                verify(True, completion_only=True)
-                costs['completion_s'] += time.perf_counter() - began
-            elif bench_only:
-                began = time.perf_counter()
-                probe = owner.session.runtime.acquire_fused_batch_get_context(native.output, stream)
-                owner.session.runtime.release_fused_batch_get_context(probe, stream)
+                completion_check()
                 costs["completion_s"] += time.perf_counter() - began
-            if read_label and step >= args.warmup:
-                fused_read_counts.append(dict(state['fused_read_count']))
-            if read_label and step >= args.warmup and (not bench_only or step == args.warmup + args.iterations - 1):
+            if count_reads and step >= args.warmup:
+                fused_read_counts.append(state['fused_read_count'])
+            if count_reads and step >= args.warmup and validate:
                 began = time.perf_counter()
-                split_samples.setdefault(read_label, []).append(dict(state["completion"]))
-                read_samples.setdefault(read_label, []).append(
+                split_samples.setdefault(timing_name, []).append(state["completion"])
+                read_samples.setdefault(timing_name, []).append(
                     actual_reads(
                         rotating.mapping.cpu().numpy(),
                         topk.cpu().numpy(),
@@ -1936,56 +1943,30 @@ def run_urma_case(
                     )
                 )
                 costs['reads_s'] += time.perf_counter() - began
-        wall_costs[timing_name or read_label or 'operation'] = costs
+        wall_costs[timing_name] = costs
         atomic_json(folder / 'bench_wall_costs.json', wall_costs)
-        print(f'BENCH WALL COSTS {timing_name or read_label}: {json.dumps(costs)}', flush=True)
-        measured = timing_summary(samples)
-        completed_timings[timing_name or read_label or getattr(call, '__name__', 'operation')] = measured
+        print(f'BENCH WALL COSTS {timing_name}: {json.dumps(costs)}', flush=True)
+        completed_timings[timing_name] = timing_summary(samples)
         atomic_json(folder / 'completed_timings.json', dict(
             batch=b, miss_percent=args.miss_percent, timing=completed_timings,
             correctness=correctness.status, failures=correctness.failures, token_bytes=TOKEN_BYTES,
             native_misses_per_request=state['native_misses'], fused_read_counts=fused_read_counts))
-        if read_label == "prototype_with_update" and None:
-            reset()
-            stream.synchronize()
-            graph.replay()
-            stream.synchronize()
-            check()
-            from diagnostics import save_transport_snapshot
-            save_transport_snapshot(None, state["ids"], state["slots"], owner.output.cpu().numpy(),
-                 rotating.mapping.cpu().numpy(), rotating.lru_slots.cpu().numpy(),
-                 rotating.rows.cpu().numpy().view(np.uint32), owner.remote_token_addresses.cpu().numpy())
-        if read_label == "prototype_with_update" and args.trace_rounds:
-            progress(folder.parent, f"BS={b}: full graph profiler ({args.trace_rounds} replays); logs={folder}")
-            pipeline.set_diagnostics(True)
-            stream.synchronize()
-            def trace_reset():
-                reset()
-                pipeline.times.zero_()
-            try:
-                full_trace.update(collect_core(torch, rotating, graph, trace_reset, check, args.trace_rounds, folder,
-                                               full=True, diagnostics=pipeline.diagnostic_cycles,
-                                               fused_final=True))
-            finally:
-                pipeline.set_diagnostics(False)
-                stream.synchronize()
-        if timing_name == 'native_chain' and args.trace_rounds:
-            from diagnostics import collect_native
-            collect_native(torch, graph, reset, check, args.trace_rounds, folder)
+        if keep_graph:
+            return graph
         graph.reset()
         owner.graphs.remove(graph)
-        return measured
 
     native.reset()
     native_call()
     stream.synchronize()
     native_check()
-    timings = {"native_chain": measure(native_call, native.reset, native_check, timing_name="native_chain")}
+    native_completion = check_native_completion if compact else None
+    measure(native_call, native.reset, native_check, timing_name="native_chain", completion_check=native_completion)
     # The previous native chain has prepared stable LIDU descriptors and maps.
     # Restore only the output so that the captured graph contains KVAF Get alone.
     if not bench_only:
-        timings["native_get_only"] = measure(
-            native.fetch, lambda: native.output.copy_(native.initial_payload), native_check, timing_name="native_get_only")
+        measure(native.fetch, lambda: native.output.copy_(native.initial_payload), native_check,
+                timing_name="native_get_only", completion_check=native_completion)
     reference = state["native_topk"].cpu().reshape(b, 4, 2048).numpy()
     owner.acquire()
     rotating = launch_module.LIFetchBinding(
@@ -2027,11 +2008,7 @@ def run_urma_case(
     pipeline.parallel_finalize = False
     pipeline.prepare_metadata = True
     pipeline.set_diagnostics(False)
-    counter_clock_mhz = (pipeline.calibrate_counter_mhz()
-                         if args.q_workers and not False else None)
-    if counter_clock_mhz is not None:
-        pipeline.counter_clock_mhz = counter_clock_mhz
-        print(f"GetSystemCycle calibration: {counter_clock_mhz:.2f} MHz (independent long graph event)", flush=True)
+    counter_clock_mhz = None
     saved = [arguments[i].clone() for i in (1, 4, 13)]
     update.set_order(initial_orders)
     order_snapshot = (rotating.lru_slots.clone(), rotating.reserved_hot.clone())
@@ -2043,7 +2020,7 @@ def run_urma_case(
             arguments[i].copy_(seed)
         update.logical.copy_(update.identity)
         rotating.hot_valid.fill_(1)
-        if bench_only:
+        if compact:
             rotating.lru_slots.copy_(order_snapshot[0])
             rotating.reserved_hot.copy_(order_snapshot[1])
         else:
@@ -2337,10 +2314,33 @@ def run_urma_case(
         if not (bitmap == 255).all():
             raise AssertionError("Round init unexpectedly rewrote producer-owned predicates")
 
+    fused_completion = (lambda: verify(True, completion_only=True)) if compact else None
+    fused_graph = measure(full, reset, lambda: verify(True), timing_name="prototype_with_update",
+                          completion_check=fused_completion, keep_graph=bool(args.trace_rounds))
+    if args.trace_rounds:
+        progress(folder.parent, f"BS={b}: full graph profiler ({args.trace_rounds} replays); logs={folder}")
+        counter_clock_mhz = pipeline.calibrate_counter_mhz()
+        pipeline.counter_clock_mhz = counter_clock_mhz
+        pipeline.set_diagnostics(True)
+        stream.synchronize()
+
+        def trace_reset():
+            reset()
+            pipeline.times.zero_()
+
+        state['check_phase'] = 'profile fused'
+        try:
+            full_trace.update(collect_core(
+                torch, rotating, fused_graph, trace_reset,
+                lambda: correctness.check('profile fused', lambda: verify(True)),
+                args.trace_rounds, folder, full=True, diagnostics=pipeline.diagnostic_cycles, fused_final=True))
+        finally:
+            pipeline.set_diagnostics(False)
+            stream.synchronize()
+        fused_graph.reset()
+        owner.graphs.remove(fused_graph)
     if not bench_only:
-        timings["round_init"] = measure(lambda: rotating._call("init"), init_reset, init_check, timing_name="round_init")
-    timings["prototype_with_update"] = measure(full, reset, lambda: verify(True), read_label="prototype_with_update")
-    if not bench_only:
+        measure(lambda: rotating._call("init"), init_reset, init_check, timing_name="round_init")
         reset()
         stream.synchronize()
         graph = torch.npu.NPUGraph()
@@ -2403,13 +2403,25 @@ def run_urma_case(
         verify_all_valid_hot()
         fetch_only = compare_fetch_only(torch, owner, rotating, pipeline, args)
         atomic_json(folder / "fetch_only.json", dict(status="PASS", rows=fetch_only))
+    if args.trace_rounds:
+        from diagnostics import collect_native
+
+        # Capture the serial graph against the unleased runtime after all fused work.
+        owner.release()
+        for index, initial in zip((1, 4), saved[:2]):
+            arguments[index].copy_(initial)
+        graph = capture_graph(native_call, native.reset)
+        collect_native(torch, graph, native.reset,
+                       lambda: correctness.check('profile native', native_check), args.trace_rounds, folder)
+        graph.reset()
+        owner.graphs.remove(graph)
     return dict(
         status=correctness.status.lower(),
         correctness=correctness.status,
         correctness_failures=correctness.failures,
         boundary_coverage=boundary_phases,
         counter_clock_mhz=counter_clock_mhz,
-        timing=timings, wall_costs=wall_costs,
+        timing=completed_timings, wall_costs=wall_costs,
         full_trace=full_trace,
         fetch_only=fetch_only,
         fetch_jettys_per_aiv=pipeline.fetch_jettys_per_aiv,
