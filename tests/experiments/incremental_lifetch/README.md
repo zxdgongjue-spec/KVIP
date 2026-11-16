@@ -144,3 +144,8 @@ B新增计算可能改变原预取观察到的进度，因此同时展示实际D
 python tests/experiments/incremental_lifetch/summarize.py \
   tests/results/window-topk-only/<时间> --require-detailed
 ```
+
+两个对比脚本均接受第六个位置参数 `WINDOWS`，默认8。例如
+`compare_window_topk.sh KVAF_ROOT DEVICE SERVER 16 1 4` 为BS16、miss1%、4个窗口。
+32 AIC预算下，每窗口8个AIC对应16个服务AIV；每个服务AIV处理一个请求的4Q。
+预取总预算仍为512，默认单窗口预算随窗口数从64调整为128。
