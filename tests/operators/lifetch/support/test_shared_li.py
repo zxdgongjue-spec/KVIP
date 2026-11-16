@@ -62,7 +62,7 @@ int main() {
 
 def test_saved_transport_comparison_uses_full_trace(tmp_path, capsys):
     import json
-    from compare_transport_tail import summarize
+    from diagnostics import summarize_transport_tail as summarize
     for transport, filename, stage in (
         ('urma', 'full_attribution.json', 'resolve_update'),
         ('ubmem', 'attribution.json', 'resolve_update_fetch'),

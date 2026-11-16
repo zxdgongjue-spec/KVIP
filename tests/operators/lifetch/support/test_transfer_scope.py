@@ -51,7 +51,7 @@ def test_empty_tasks_are_na_not_zero_bandwidth():
 
 def test_level_one_reports_final_and_combined_scope_without_summing_overlap(tmp_path, monkeypatch):
     # Core timestamp decoding has its own suite; this fixture isolates count/span aggregation.
-    monkeypatch.setattr("diagnostics.decode", lambda raw: {"cores": []})
+    monkeypatch.setattr("diagnostics.decode_timeline", lambda raw: {"cores": []})
     raw, details = capture()
     details[0]['core_timeline_raw'] = raw
     details[0]['prefetch_scope'] = dict(bytes=656, first_doorbell=50,
@@ -73,7 +73,7 @@ def test_invalid_cross_core_order_cannot_produce_global_bandwidth(tmp_path, monk
     details[0]['core_timeline_raw'] = raw
     def invalid(raw):
         raise ValueError('cross-core publication order violated')
-    monkeypatch.setattr('diagnostics.decode', invalid)
+    monkeypatch.setattr('diagnostics.decode_timeline', invalid)
     atomic_json(tmp_path / 'full_attribution.json', dict(samples=[dict(
         round=0, final=9, algorithm=dict(totals={}, requests=[]), streaming_cycles=details,
         accounting=dict(stages_us=dict(resolve_update=100)))]))

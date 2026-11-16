@@ -1,6 +1,6 @@
 import numpy as np
 
-from streaming_fetch_diagnostics import summarize_mismatches, split_native_jetty_descriptors
+from diagnostics import summarize_mismatches, split_native_jetty_descriptors
 
 
 def test_reports_actual_payload_and_both_writers():

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-import replay_execution
+import execution
 from reporting import timing_summary
 
 
@@ -16,8 +16,8 @@ def setup_run(monkeypatch, *, mode='bench'):
         def __iter__(self):
             return iter([initial])
     sequence = Sequence()
-    monkeypatch.setattr(replay_execution, 'ReplaySequence', lambda *args: sequence)
-    monkeypatch.setattr(replay_execution, 'ReplayPagePlan', lambda seq: SimpleNamespace(page_count=32))
+    monkeypatch.setattr(execution, 'ReplaySequence', lambda *args: sequence)
+    monkeypatch.setattr(execution, 'ReplayPagePlan', lambda seq: SimpleNamespace(page_count=32))
     return SimpleNamespace(trace_root='/trace', group=10, round_range=(1, 1), mode=mode)
 
 
@@ -32,9 +32,9 @@ def test_real_pair_saves_serial_before_fused_failure(tmp_path, monkeypatch):
             assert persisted['timing']['native_chain']['mean_us'] == 20
             raise RuntimeError('fused failed')
         return {'all_rounds': timing_summary([20, 20]), 'correctness': 'PASS'}
-    monkeypatch.setattr(replay_execution, 'run_path', run)
+    monkeypatch.setattr(execution, 'run_path', run)
     with pytest.raises(RuntimeError, match='fused failed'):
-        replay_execution.run_real(config, tmp_path)
+        execution.run_real(config, tmp_path)
     assert calls == [False, True]
     assert not (tmp_path / 'report.json').exists()
 
@@ -44,8 +44,8 @@ def test_real_numerical_failure_keeps_paired_timing(tmp_path, monkeypatch):
     def run(config, directory, sequence, pages, *, fused):
         return {'all_rounds': timing_summary([10 if fused else 20]),
                 'correctness': 'FAIL' if fused else 'PASS'}
-    monkeypatch.setattr(replay_execution, 'run_path', run)
-    assert replay_execution.run_real(config, tmp_path) == 1
+    monkeypatch.setattr(execution, 'run_path', run)
+    assert execution.run_real(config, tmp_path) == 1
     report = json.loads((tmp_path / 'report.json').read_text())
     assert report['correctness'] == 'FAIL' and report['execution'] == 'COMPLETED'
     assert report['timing']['prototype_with_update']['mean_us'] == 10
@@ -55,7 +55,7 @@ def test_real_numerical_failure_keeps_paired_timing(tmp_path, monkeypatch):
 @pytest.mark.parametrize('width', [656, 2624])
 def test_existing_native_mtp_supports_group_payload_width(monkeypatch, width):
     import torch
-    from native_mtp import NativeMtp
+    from execution import NativeMtp
     calls = []
     runtime = SimpleNamespace(batch_get=lambda *args: calls.append(args))
     device_table = SimpleNamespace(addresses=torch.ones(16, dtype=torch.int64), valid=torch.ones(16, dtype=torch.uint8))
@@ -75,7 +75,7 @@ def test_existing_native_mtp_supports_group_payload_width(monkeypatch, width):
 
 
 def test_native_li_keeps_synthetic_contract_and_supports_real_causal_q4():
-    from real_fetch_inputs import native_li
+    from execution import native_li
     calls = []
     def invoke(**kwargs):
         calls.append(kwargs)

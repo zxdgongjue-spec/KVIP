@@ -257,7 +257,7 @@ def test_public_selector_dispatches_transport(transport):
 
 @pytest.mark.parametrize("percent", [10, 30, 50])
 def test_controlled_fixture_matches_urma(percent):
-    from ubmem_smoke import controlled_fixture
+    from execution import controlled_fixture
 
     fixture = controlled_fixture(8192, 4096, 32, percent)
     order = fixture["order"]
@@ -267,7 +267,7 @@ def test_controlled_fixture_matches_urma(percent):
     assert len(fixture["info"]["final_misses_per_query"]) == 4
 
 def test_shared_q4_fixture_topk_and_lru_match_urma():
-    from ubmem_smoke import controlled_fixture, payload
+    from execution import controlled_fixture, layer_payload as payload
     from kvip.cache.lru import SlotLRU
 
     fixture = controlled_fixture(8192, 4096, 32, 10)
@@ -289,7 +289,7 @@ def test_shared_q4_fixture_topk_and_lru_match_urma():
     np.testing.assert_array_equal(payload(1, np.arange(3), 2624)[:, :656], payload(1, np.arange(3), 656))
 
 def test_mixed_query_counts_cover_padding_and_query_lengths():
-    from ubmem_smoke import mixed_query_counts
+    from execution import mixed_query_counts
 
     assert mixed_query_counts(2) == [1, 2]
     counts = mixed_query_counts(16)

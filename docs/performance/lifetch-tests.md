@@ -1,6 +1,6 @@
 # LIFetch 测试设计与使用说明
 
-> 状态：设计稿，接口待实现并依据正式算子约束修正。命令及日志为设计示例。
+> 状态：统一入口与六个职责模块已实现；可执行命令见 tests/operators/lifetch/README.md。日志中的数值为展示示例。
 > 基准：已合入PR13的KVIP主线 `13d2898`，正式支持BS1～16。
 
 ## 1. 组织与统一入口
@@ -19,6 +19,8 @@ tests/operators/lifetch/
 ```
 
 按职责复用，URMA、UBmem共用输入、校验和报告，执行层保留必要的传输差异。初始化检查并入统一入口，测试调用正式算子。
+
+历史trace转换也由唯一入口的`convert-trace SOURCE --output DIR`调用，实现在workloads中；不启动NPU。
 
 ```bash
 python tests/operators/lifetch/test_lifetch.py <all|check|bench|diagnose> [options]
@@ -63,7 +65,7 @@ all使用所选transport，不自动跑另一种传输；不依赖外部真实�
 
 ## 3. 接口定义
 
-以下为拟定接口，待实现后按正式能力修正。新增参数应服务于测试选择，不暴露历史优化开关。
+以下为统一测试接口。新增参数服务于测试选择，不暴露历史优化开关。
 
 ### 3.1 check
 
@@ -425,5 +427,45 @@ level1终端按阶段耗时、每请求计数、有效带宽三张对齐表展�
 `level1_summary.log`保存同样的简表，`diagnostic_summary.log`和`diagnostic.json`保留原始区间与完整证据。
 预取提交时间戳缺失时，仅在已有服务起点与完成观察点有效的情况下提供service-span带宽，明确包含控制开销；不将其标为精确doorbell到CQ跨度。没有有效区间仍标INCOMPLETE。
 
-level2在level1简表之后，按每次采样独立展示：活跃block及最晚结束block、各核工作/等待区间、LI分类、逐Q Resolver/Update、窗口预取/unused、逐Q需求/补拉。`timeline.csv`从level2开始包含全部已定义步骤；`level2_summary.log`保存终端表格。
+level2汇总多次采样，展示算法与流量、阶段与活跃block及最晚结束次数、逐Q Resolver/Update概览。内部步骤仅level3展示。`timeline.csv`从level2开始包含全部已定义步骤；`level2_summary.log`保存终端表格。
 预取服务记录保留设备core/epoch字段、扫描/候选/提交周期、bitmap字节与计数，不将service core编号冒充请求编号。无有效打点记录显示N/A。URMA KVAF组计数每Fetch block只展示一次；UBmem不展示URMA CQ计数。资源几何取自实际捕获的block数，未采集的Jetty、在途上限及搬运配置明确标N/A。
+
+level2终端按理解顺序聚类：
+
+1. **算法与KV流量**：每请求Q4去重需求/初始cold及miss率、预取/补拉/总字节、读取放大率、unused比例；随后展示窗口分布和逐Q新增需求/补拉。逐Q需求表合并冲突补拉数，不再重复独立Fetch任务表。
+2. **时间拆解**：阶段分布、Active cores及最晚结束核、每Fetch block的实际字节/Get调用跨度有效带宽、逐Q Resolver/Update概览。
+
+终端不另设“缺失与限制”部分。空预取服务表不展示；字段口径写在表头或说明中。
+
+Cold miss率以Q4唯一需求为分母，与每Q TopK的miss参数不同。读取放大率=(预取+最终补拉)/初始唯一cold需求；unused比例=unused预取/实际预取。分母为0时N/A。
+Core work/wait全部内部区间、LI分类内部步骤、URMA提交/CQ细分以及有效预取服务内部记录仅在level3展示。level2不再单列资源几何表，原始几何和时钟留在结构化结果。每核Get调用跨度带宽包含控制间隙，不是链路峰值；各核带宽不可直接相加。
+
+### 统一展示层级
+
+三个level始终只有两部分，顺序不变，不另设“缺失与限制”章节。单位和统计口径放在表头或字段说明。
+
+| 部分 | level1：总览 | level2：定位任务与依赖 | level3：定位内部操作 |
+| --- | --- | --- | --- |
+| 算法与KV流量 | 每轮/请求需求、cold、预取、补拉与字节 | 增加窗口分布、unused、跨Q重复、新增需求、冲突补拉 | 增加有效的服务扫描/候选/提交记录及已有身份关联 |
+| 时间拆解 | 阶段耗时分布、整体有效带宽 | 增加Active cores、最晚结束核、每Fetch核带宽、逐Q处理/等待概览 | 增加完整核内区间、LI分类步骤、提交/CQ细分、Fetch-only对照 |
+
+level2继承level1的统计含义，level3继承level2；同一字段不随level改变口径。同义数据合表，不同时重复展示粗表和同内容明细表。尚无采集证据的字段不宣称已支持，原始采集状态保存在结构化结果中。
+
+
+### Level3 内部打点与展示
+
+仍按算法与 KV 流量、时间拆解两部分输出：
+
+- 算法与 KV 流量：逐请求、窗口、Q 的需求、预取、未使用预取、最终补拉；预取服务记录补充扫描 bitmap 字节、候选数和实际下发数，以 service core/epoch 标识。
+- 时间拆解：保留阶段与 Active cores；展开每核步骤的起止时间、耗时及 cycles，标出最晚结束核。LI 展开加载/分类/发布，Resolver 展开逐 Q 处理/输出/描述符/发布，Update 展开等待/交换/提交，Fetch 展开依赖等待/Get/完成发布。URMA 另列 Get 内部提交和 CQ 计数。
+- 预取服务步骤单列扫描、候选处理、提交/拷贝的 cycles 与 µs。URMA 的提交耗时与 UBmem 的拷贝耗时保留各自含义。
+
+预取内部打点由诊断开关控制，两种 transport 均发布完整 Event；普通 bench 使用关闭打点的模板分支。采样结果保存在 `diagnostic.json`、`timeline.csv` 和 `level3_summary.log`，终端与对应 summary 使用同一组表格。cycles 按设备计数时钟换算为 µs，内部嵌套区间不累加为总耗时。
+
+
+Level2 每个 case 只打印一组汇总表：相同计数保留单值，波动指标显示 `mean [min, max]`。每核时间使用各次 replay 的相对时间，带宽在各次 replay 内计算后再汇总；Last 列显示该核最后结束的次数/采样数。Level3 的算法表也按采样汇总，核时间线逐次展示；原始 JSON/CSV 保留全部采样。
+
+
+Level3 的算法与 KV 流量表同样按采样汇总一次；时间线保留逐次 replay。逐Q Resolver/Update 的耗时直接查看核时间线，不再重复打印同一张简表。预取服务使用 core pair、lane、epoch 标识；小控制间隙在终端显示总量及最大值，CSV 保留全部区间。Resolver 的占位 Output/Descriptor 时间戳不作为实际操作耗时展示，输出及打包耗时查看 output_pack 核。LI 分类区间标注管线等待，不能当作纯分类计算成本。
+
+若后续专项校验失败，最终结果显示 FAILED/FAIL；此前完成的性能样本保留，不能用此前的 PASS 替代整个测试的结果。

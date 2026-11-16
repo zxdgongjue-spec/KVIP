@@ -1,4 +1,7 @@
-"""Shared result accounting; correctness never hides completed timing samples."""
+# SPDX-License-Identifier: Apache-2.0
+"""Structured results and concise terminal tables."""
+from __future__ import annotations
+
 import csv
 import json
 import os
@@ -161,3 +164,16 @@ def collect_results(directory, config, exit_code):
     rows.sort(key=lambda row: (miss_order.get(row.get('miss_percent'), len(miss_order)),
                                batch_order.get(row.get('batch'), len(batch_order))))
     return rows
+
+
+def record_case_failure(directory, error):
+    """Keep completed timing samples without carrying an obsolete overall PASS."""
+    path = Path(directory) / 'completed_timings.json'
+    if not path.exists():
+        return
+    report = json.loads(path.read_text())
+    report['prior_correctness'] = report.get('correctness', 'NOT_RUN')
+    report['correctness'] = 'FAIL' if isinstance(error, AssertionError) else 'INCOMPLETE'
+    report['execution'] = 'FAILED'
+    report['failure'] = f'{type(error).__name__}: {error}'
+    atomic_json(path, report)

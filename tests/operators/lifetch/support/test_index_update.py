@@ -94,7 +94,7 @@ class IndexUpdateTest(unittest.TestCase):
             self.make()
 
     def test_fixture_reuses_production_binding_with_padded_address_rows(self):
-        from index_update import DirectCacheUpdate
+        from execution import DirectCacheUpdate
 
         self.rotating.hot_valid = self.rotating.hot_valid[:2]
         self.rotating.arguments = [torch.zeros(1)] * 9 + [torch.zeros(2, 4, 2048, dtype=torch.int32)]

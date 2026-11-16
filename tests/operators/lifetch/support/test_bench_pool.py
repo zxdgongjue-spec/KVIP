@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from bench_pool import BenchPool
+from execution import BenchPool
 
 
 @pytest.mark.parametrize('transport,workers', [('urma', 40), ('ubmem', 2)])
@@ -66,7 +66,7 @@ def test_pool_puts_once_and_retains_tables_until_all_cases_complete(tmp_path, mo
 
 
 def test_native_payload_check_uses_device_reference_and_detects_corruption():
-    from native_mtp import NativeMtp
+    from execution import NativeMtp
     native = NativeMtp.__new__(NativeMtp)
     native.torch = torch
     native.batch, native.hot, native.token_bytes, native.source_tokens = 1, 2048, 656, 2048
@@ -114,7 +114,7 @@ def test_put_chunks_keep_one_registered_source_and_global_offsets(tmp_path, monk
     for _, keys, offsets, lengths in calls:
         assert offsets == [key * 128 * 656 for key in keys]
         assert lengths == [128 * 656] * len(keys)
-    from contract_payload import payload
+    from workloads import payload
     import numpy as np
     for row in range(2):
         assert np.array_equal(pool.cpu_payload[row].numpy(), payload(row, np.arange(16384)))

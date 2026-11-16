@@ -1,12 +1,8 @@
 import copy
-import importlib.util
-from pathlib import Path
 
 import pytest
 
-spec = importlib.util.spec_from_file_location('timeline', Path(__file__).with_name('summarize_core_timeline.py'))
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
+from diagnostics import decode_timeline
 
 
 def fixture():
@@ -35,7 +31,7 @@ def fixture():
 def test_same_replay_latest_core_and_stages():
     raw = fixture()
     raw['cores'][3][1] = 1100
-    result = module.decode(raw)
+    result = decode_timeline(raw)
     assert result['last_block'] == 3
     assert result['observed_span_us'] == 1
     assert result['cores'][3]['role'] == 'fetch Q2 lane0'
@@ -50,7 +46,7 @@ def test_incomplete_or_inconsistent_timeline_fails(mutation):
     if mutation == 'missing_wait': raw['fetch'][0][105] = 0
     if mutation == 'publication_order': raw['fetch'][0][1] = 130
     with pytest.raises(ValueError):
-        module.decode(raw)
+        decode_timeline(raw)
 
 
 def test_publication_core_preserves_fetch_roles_and_all_query_stages():
@@ -62,7 +58,7 @@ def test_publication_core_preserves_fetch_roles_and_all_query_stages():
         publisher[4+q*6:10+q*6] = list(range(140+q*30, 146+q*30))
     raw['cores'].insert(2, publisher)
     raw['flags'][0].extend([[1, 0, 0]] * 4)
-    result = module.decode(raw)
+    result = decode_timeline(raw)
     assert result['cores'][2]['role'] == 'output_pack b0'
     assert result['cores'][3]['role'] == 'fetch Q1 lane0'
     assert result['cores'][6]['role'] == 'fetch Q4 lane0'
@@ -72,4 +68,4 @@ def test_publication_core_preserves_fetch_roles_and_all_query_stages():
     assert stages[-1]['name'] == 'Q4.publish'
     raw['cores'][2][20] = 0
     with pytest.raises(ValueError):
-        module.decode(raw)
+        decode_timeline(raw)

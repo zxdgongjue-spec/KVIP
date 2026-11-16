@@ -1,7 +1,7 @@
 """Host model of the common final scheduler and UBmem descriptor boundary."""
 from pathlib import Path
 
-from device_trace import account_ubmem
+from diagnostics import account_ubmem
 
 ROOT = Path(__file__).resolve().parents[4]
 
@@ -45,7 +45,7 @@ def test_ubmem_profile_finishes_schedule_and_keeps_incomplete_trace(tmp_path, mo
     from contextlib import nullcontext
     from types import SimpleNamespace
     import numpy as np
-    from device_trace import collect_ubmem
+    from diagnostics import collect_ubmem
 
     class Profile:
         def __init__(self, **kwargs):

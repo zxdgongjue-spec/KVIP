@@ -1,6 +1,6 @@
 import numpy as np
 
-from real_fetch_inputs import prepare_full_chain_fixture
+from workloads import prepare_full_chain_fixture
 
 
 def test_seed_is_reproducible_and_changes_real_li_inputs(tmp_path):

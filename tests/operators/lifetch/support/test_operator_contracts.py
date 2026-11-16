@@ -46,7 +46,7 @@ count=0;shape.batch=17;assert(kvip_lifetch_streaming_forward((void*)1,(void*)2,(
 
 def test_default_fixture_preserves_requested_misses(tmp_path):
     import numpy as np
-    from real_fetch_inputs import prepare_full_chain_fixture
+    from workloads import prepare_full_chain_fixture
 
     root = tmp_path / "fixture"
     prepare_full_chain_fixture(root, 131072, 16384, 10, index_heads=32)
@@ -208,7 +208,7 @@ def test_install_and_cmake_default_to_concrete_a5_target():
 
 def test_completion_diagnostics_distinguish_transport_states():
     import numpy as np
-    from prefetch_audit import completion_failures
+    from diagnostics import completion_failures
 
     rows = np.zeros((2, 256), dtype=np.uint32)
     posts = np.zeros((2, 4, 32), dtype=np.uint32)

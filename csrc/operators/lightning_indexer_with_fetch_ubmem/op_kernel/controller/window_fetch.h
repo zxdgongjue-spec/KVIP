@@ -1,7 +1,7 @@
 #pragma once
 static_assert(V9_WINDOW_COPY_ENGINE >= 0 && V9_WINDOW_COPY_ENGINE <= 4,
               "Invalid UBmem window copy engine");
-#define V9_FETCH_PROFILE(...)
+#define V9_FETCH_PROFILE(...) if constexpr (captureIo) { __VA_ARGS__ }
 #include "device_utils.h"
 #include "../../../common/lifetch/prefetch_budget.h"
 
@@ -350,8 +350,11 @@ __aicore__ inline void CopyUbmemWindow(__gm__ Context* ctx,uint32_t firstBatch,
         ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),128);
     }
 }
+template<bool captureIo>
 __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,uint32_t lane,
     LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids,uint32_t sequenceHalfWindow=0) {
+    uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0,totalPosted=0;
+    uint64_t scanBegin=0,candidateBegin=0,postBegin=0,begin=0;
     auto ctx=reinterpret_cast<__gm__ Context*>(pointer);const auto shape=LoadRuntimeShape(ctx);const auto geometry=MakePostGeometry(shape.batch,shape.serviceLanes,V9_WINDOW_COPY_ENGINE==0 || V9_WINDOW_COPY_ENGINE==4);auto events=reinterpret_cast<__gm__ Event*>(ctx->events);
     auto event=events+epoch*shape.serviceLanes+lane;event->core=core;event->epoch=epoch;V9_FETCH_PROFILE(event->waitBegin=GetSystemCycle();)
     if(epoch) {
@@ -360,7 +363,7 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
         while(!previous->complete);
     }
     V9_FETCH_PROFILE(event->begin=GetSystemCycle();)
-    V9_FETCH_PROFILE(uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0,totalPosted=0;)
+
     auto work=flags.ReinterpretCast<uint32_t>();auto cfg=work[4096];
     auto rowStorage=ids;
     if constexpr(kBatchedRows)ids=scratch[23808/4];
@@ -442,7 +445,7 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
             uint32_t lo=state.GetValue(12+q)>lower?state.GetValue(12+q):lower;
             if(lo<first)first=lo;if(end[q]>last)last=end[q];
         }
-        V9_FETCH_PROFILE(uint64_t scanBegin=GetSystemCycle();)
+        V9_FETCH_PROFILE(scanBegin=GetSystemCycle();)
 #define KV_WINDOW_HISTORY shape.history
 #define KV_WINDOW_RESIDENT shape.resident
 #define KV_WINDOW_SCAN_TOKENS kScanTokens
@@ -452,7 +455,7 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
 #undef KV_WINDOW_SCAN_TOKENS
 #endif
         V9_FETCH_PROFILE(scanTicks+=GetSystemCycle()-scanBegin;totalCandidates+=candidateCount;)
-        V9_FETCH_PROFILE(uint64_t candidateBegin=GetSystemCycle(),postBegin=0;)
+        V9_FETCH_PROFILE(candidateBegin=GetSystemCycle();postBegin=0;)
         uint32_t count=0,missing=0;
         if(candidateCount) {
             auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*shape.history;
@@ -529,7 +532,7 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
         }
     }
     if(postedCount) {
-        V9_FETCH_PROFILE(uint64_t begin=GetSystemCycle();)
+        V9_FETCH_PROFILE(begin=GetSystemCycle();)
         CopyUbmemWindow(ctx,firstBatch,scratch,work,cfg,rowStorage,event
         );
         V9_FETCH_PROFILE(postTicks+=GetSystemCycle()-begin;)
@@ -550,6 +553,6 @@ __aicore__ inline void FastService(GM_ADDR pointer,uint32_t epoch,uint32_t core,
     V9_FETCH_PROFILE(event->bitmapBytes=bitmapBytes;event->candidateCount=totalCandidates;event->postedCount=totalPosted;)
     V9_FETCH_PROFILE(event->end=GetSystemCycle();)event->complete=1;
     ubmem_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event),
-        (V9_INTERMEDIATE_PROFILING || (V9_UBMEM && V9_WINDOW_COPY_ENGINE==1))?sizeof(Event):64);
+        (captureIo || (V9_UBMEM && V9_WINDOW_COPY_ENGINE==1))?sizeof(Event):64);
 }
 }

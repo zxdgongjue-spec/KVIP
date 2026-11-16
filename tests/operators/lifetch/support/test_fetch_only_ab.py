@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from fetch_only_ab import TOPK, build_group_plan
+from performance import TOPK, build_group_plan
 
 
 def test_plan_matches_per_query_worker_order_and_conflicts():

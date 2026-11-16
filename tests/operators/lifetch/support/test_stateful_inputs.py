@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 
 from correctness import stateful_inputs, require_stateful_round
-from replay_inputs import ReplayPagePlan
+from workloads import ReplayPagePlan
 
 
 def test_stateful_changes_query_only_and_has_exact_topk_without_ties(tmp_path):

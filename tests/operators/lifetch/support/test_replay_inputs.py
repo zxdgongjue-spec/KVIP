@@ -3,9 +3,9 @@ import json
 import numpy as np
 import pytest
 
-from replay_inputs import assemble_round
+from workloads import assemble_round
 from test_trace_inputs import capture_file
-from trace_inputs import CaptureReference
+from workloads import CaptureReference
 
 
 def reference(tmp_path, rank=0, number=1):
@@ -59,7 +59,7 @@ def test_replay_rejects_unaligned_or_duplicate_dp_inputs(tmp_path):
     ('pages', 'DDR page identity'),
 ])
 def test_sequence_rejects_invalid_continuity(tmp_path, monkeypatch, mutation, message):
-    import replay_inputs
+    import workloads
     first = reference(tmp_path)
     second = reference(tmp_path, number=2)
     initial = assemble_round([first])
@@ -70,10 +70,10 @@ def test_sequence_rejects_invalid_continuity(tmp_path, monkeypatch, mutation, me
         following.query_ends[0, 0] -= 1
     else:
         following.page_keys = (((0, 999), *following.page_keys[0][1:]),)
-    monkeypatch.setattr(replay_inputs, 'select_series', lambda *args: [first, second])
-    monkeypatch.setattr(replay_inputs, 'assemble_round',
+    monkeypatch.setattr(workloads, 'select_series', lambda *args: [first, second])
+    monkeypatch.setattr(workloads, 'assemble_round',
                         lambda refs: initial if refs[0].source_round == 1 else following)
-    sequence = replay_inputs.ReplaySequence(tmp_path, 10, (1, 2))
+    sequence = workloads.ReplaySequence(tmp_path, 10, (1, 2))
     iterator = iter(sequence)
     assert next(iterator) is initial
     with pytest.raises(ValueError, match=message):
@@ -81,10 +81,10 @@ def test_sequence_rejects_invalid_continuity(tmp_path, monkeypatch, mutation, me
 
 
 def test_sequence_iteration_does_not_carry_test_state_between_repetitions(tmp_path, monkeypatch):
-    import replay_inputs
+    import workloads
     references = [reference(tmp_path), reference(tmp_path, number=2)]
-    monkeypatch.setattr(replay_inputs, 'select_series', lambda *args: references)
-    sequence = replay_inputs.ReplaySequence(tmp_path, 10, (1, 2))
+    monkeypatch.setattr(workloads, 'select_series', lambda *args: references)
+    sequence = workloads.ReplaySequence(tmp_path, 10, (1, 2))
     first_pass = list(sequence)
     first_pass[0].captured_hot_valid[:] = 0
     first_pass[0].logical_keys[:] = 0
@@ -95,7 +95,7 @@ def test_sequence_iteration_does_not_carry_test_state_between_repetitions(tmp_pa
 
 
 def test_page_payload_preserves_aliases_and_later_abc_publication(tmp_path):
-    from replay_inputs import ReplayPagePlan
+    from workloads import ReplayPagePlan
     first = assemble_round([reference(tmp_path), reference(tmp_path, rank=1)])
     # Duplicate logical pages within DP0 model a shared captured page alias.
     first.page_keys = (((0, 0), (0, 0), *first.page_keys[0][2:]), first.page_keys[1])

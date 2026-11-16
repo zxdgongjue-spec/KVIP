@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from analyze_prefetch_pressure import analyze
+from diagnostics import analyze_prefetch_pressure as analyze
 
 
 class PressureTest(unittest.TestCase):
@@ -26,7 +26,7 @@ class PressureTest(unittest.TestCase):
                      dict(block=2,role='fetch Q1 lane0',start_us=0,end_us=40,stages=[],published_misses=[12],
                           KVAF_counters={'safe_post_cycles':2000,'safe_CQ_cycles':10000})]
             timeline = dict(cores=cores,last_block=0,clock_mhz=1000,observed_span_us=50)
-            with patch('analyze_prefetch_pressure.decode', return_value=timeline):
+            with patch('diagnostics.decode_timeline', return_value=timeline):
                 text, _, records = analyze(root,16,[15])
                 self.assertIn('native_reads=32',text)
                 self.assertIn('tail_after_fetch=10.000',text)

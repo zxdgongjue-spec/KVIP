@@ -3,7 +3,7 @@
 def test_snapshot_compares_kv_and_reports_prefetch_differences(tmp_path):
     import numpy as np
     import pytest
-    from transport_snapshot import save, compare as compare_snapshot
+    from diagnostics import save_transport_snapshot as save, compare_transport_snapshots as compare_snapshot
 
     ids = np.tile(np.arange(2048, dtype=np.int32), (1, 4, 1))
     slots = ids.copy()

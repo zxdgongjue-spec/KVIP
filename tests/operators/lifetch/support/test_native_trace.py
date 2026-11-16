@@ -1,4 +1,4 @@
-from device_trace import account_native
+from diagnostics import account_native
 
 
 def events():

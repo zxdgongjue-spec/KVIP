@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from device_trace import collect_replay
+from diagnostics import collect_replay
 
 
 def test_profile_sequence_resets_only_at_sequence_boundaries(tmp_path, monkeypatch):
@@ -69,7 +69,7 @@ def test_profile_sequence_resets_only_at_sequence_boundaries(tmp_path, monkeypat
         samples.append(old)
         return dict(totals=dict(prefetch=old, final=1), requests=[])
     monkeypatch.setattr('diagnostics.algorithm_after', algorithm_after)
-    monkeypatch.setattr('device_trace.account', lambda *args, **kwargs: dict(stages_us=dict(li=2)))
+    monkeypatch.setattr('diagnostics.account', lambda *args, **kwargs: dict(stages_us=dict(li=2)))
     config = SimpleNamespace(warmup=1, iterations=2, transport='urma')
     result = collect_replay(torch, state, SimpleNamespace(replay=replay), Sequence(), validate, config, tmp_path)
     assert log.count('reset') == 3  # One warmup sequence, two profiled sequences.

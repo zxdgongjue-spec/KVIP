@@ -1,16 +1,13 @@
 """Exercise offline calibration with the same on-disk schema as service capture."""
 import hashlib
 import json
-import subprocess
-import sys
-from pathlib import Path
 
 import numpy as np
 import pytest
 
-from calibration import capture_rows
+from diagnostics import calibrate_captures, capture_rows
 from test_trace_inputs import capture_file
-from trace_inputs import load_score_capture
+from workloads import load_score_capture
 
 
 def scored_capture(directory):
@@ -72,7 +69,7 @@ def test_short_threshold_prefix_uses_native_zero_sentinel(tmp_path):
     assert capture_rows(capture)[0][0]['queries'][0]['thresholds'][0]['key'] == 0
 
 
-def test_offline_cli_real_schema_and_temporal_statistics(tmp_path):
+def test_offline_calibration_real_schema_and_temporal_statistics(tmp_path):
     dp = tmp_path / 'dp2'
     dp.mkdir()
     rounds = []
@@ -102,12 +99,9 @@ def test_offline_cli_real_schema_and_temporal_statistics(tmp_path):
         completed_rounds=2, expected_rounds=2,
         request_owner_signature=[{'request_id': 'private-request', 'owner': 0}], rounds=rounds)))
     output = tmp_path / 'analysis'
-    command = [sys.executable, str(Path(__file__).with_name('calibration.py')),
-               '--trace-root', str(tmp_path), '--group', '10', '--round-range', '1:2', '--output', str(output)]
-    run = subprocess.run(command, text=True, capture_output=True, check=True)
-    assert 'adjacent_round_pairs=1' in run.stdout
-    targets = json.loads((output / 'fit_targets.json').read_text())
-    assert json.loads((output / 'analysis_status.json').read_text())['status'] == 'COMPLETE'
+    targets = calibrate_captures(tmp_path, 10, (1, 2), output)
+    assert 'adjacent_round_pairs=1' in (output / 'summary.log').read_text()
+    assert targets == json.loads((output / 'fit_targets.json').read_text())
     assert targets['fitted_generator'] is False
     assert targets['request_rounds'] == 2
     assert targets['temporal_jaccard']['mean'] == pytest.approx(2047 / 2049)
@@ -119,6 +113,6 @@ def test_offline_cli_real_schema_and_temporal_statistics(tmp_path):
     # Artifact corruption must fail before any fitting claims are produced.
     with (dp / '2/scores.npz').open('ab') as file:
         file.write(b'bad')
-    failed = subprocess.run(command, text=True, capture_output=True)
-    assert failed.returncode != 0 and 'checksum' in failed.stderr
-    assert json.loads((output / 'analysis_status.json').read_text())['status'] == 'FAILED'
+    with pytest.raises(ValueError, match='checksum'):
+        calibrate_captures(tmp_path, 10, (1, 2), tmp_path / 'corrupt-analysis')
+    assert not (tmp_path / 'corrupt-analysis/fit_targets.json').exists()

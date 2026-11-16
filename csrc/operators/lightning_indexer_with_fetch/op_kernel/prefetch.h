@@ -93,14 +93,7 @@ __simd_callee__ inline void Visible(MicroAPI::RegTensor<uint16_t>& value,
 
 // Imported from fetch_profiling.h
 
-#ifndef V9_INTERMEDIATE_PROFILING
-#define V9_INTERMEDIATE_PROFILING 1
-#endif
-#if V9_INTERMEDIATE_PROFILING
-#define V9_FETCH_PROFILE(...) __VA_ARGS__
-#else
-#define V9_FETCH_PROFILE(...)
-#endif
+#define V9_FETCH_PROFILE(...) if constexpr (captureIo) { __VA_ARGS__ }
 
 #include "kvaf_batch_get_device.h"
 
@@ -581,9 +574,12 @@ inline void PrepareCandidateWqes(uint32_t rt_resident,__ubuf__ uint32_t* ids,__u
 }
 // Same indexed-load pattern as v9 GatherCandidateMap; cold IDs pass through.
 
+template<bool captureIo>
 __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer,uint32_t epoch,uint32_t core,uint32_t lane,
     LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids,
-    uint32_t sequenceHalfWindow,bool captureIo) {
+    uint32_t sequenceHalfWindow) {
+    uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0;
+    uint64_t scanBegin=0,candidateBegin=0,postBegin=0,begin=0;
     uint64_t firstDoorbell=0,lastDoorbell=0;
     auto ctx=reinterpret_cast<__gm__ Context*>(pointer);auto events=reinterpret_cast<__gm__ Event*>(ctx->events);
     auto event=events+epoch*rt_serviceLanes+lane;event->core=core;event->epoch=epoch;V9_FETCH_PROFILE(event->waitBegin=GetSystemCycle();)
@@ -602,7 +598,7 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
     // prefetched. Waiting for another shard here can stall its producer.
     V9_FETCH_PROFILE(event->begin=GetSystemCycle();)
     uint64_t postedCount=0; // Business state: controls batched WQE submission.
-    V9_FETCH_PROFILE(uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0;)
+
     auto cfg=work[4096];
     auto rowStorage=ids;
     if(rt_batchedRows)ids=scratch[23808/4];
@@ -672,7 +668,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
 #undef KV_WINDOW_RESIDENT
 #undef KV_WINDOW_SCAN_TOKENS
         V9_FETCH_PROFILE(scanTicks+=GetSystemCycle()-scanBegin;totalCandidates+=candidateCount;)
-        V9_FETCH_PROFILE(uint64_t candidateBegin=GetSystemCycle(),postBegin=0;)
+        V9_FETCH_PROFILE(candidateBegin=GetSystemCycle();postBegin=0;)
         uint32_t count=0,missing=0;
         if(candidateCount) {
             auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;
@@ -759,7 +755,7 @@ if (rt_batchedRows) {
     }
 if (rt_batchedRows) {
     if(postedCount) {
-        V9_FETCH_PROFILE(uint64_t begin=GetSystemCycle();)
+        V9_FETCH_PROFILE(begin=GetSystemCycle();)
         uint32_t maxCount=0;
         for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
             uint32_t n=cfg.GetValue(256+(b/rt_serviceLanes)*80+64);if(n>maxCount)maxCount=n;
@@ -820,7 +816,7 @@ if (rt_batchedRows) {
     V9_FETCH_PROFILE(event->bitmapBytes=bitmapBytes;event->candidateCount=totalCandidates;event->postedCount=postedCount;)
     if(captureIo){auto stamp=reinterpret_cast<__gm__ uint64_t*>(event->pad);stamp[0]=firstDoorbell;stamp[1]=lastDoorbell;}
     V9_FETCH_PROFILE(event->end=GetSystemCycle();)event->complete=1;
-    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event),V9_INTERMEDIATE_PROFILING?sizeof(Event):64);
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event),captureIo?sizeof(Event):64);
 }
 }
 
@@ -828,7 +824,8 @@ namespace rotating {
 __aicore__ inline void Service(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_splitQ,uint32_t rt_rounds,uint32_t rt_serviceAics,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer, uint32_t epoch, uint32_t core,
     uint32_t lane, LocalTensor<uint32_t> scratch, LocalTensor<uint16_t> flags,
     LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow = 0,bool captureIo = false) {
-    FastService(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow,captureIo);
+    if(captureIo) FastService<true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow);
+    else FastService<false>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow);
 }
 }
 

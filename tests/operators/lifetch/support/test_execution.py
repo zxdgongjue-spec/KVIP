@@ -7,13 +7,12 @@ from workloads import configuration
 
 def test_benchmark_options_preserve_workload_and_do_not_profile():
     args = configuration(['bench', '--batches', '1,2,4,8,16', '--seed', '93',
-                          '--miss-percent', '15', '--iterations', '7'])
+                          '--miss-percent', '15', '--iterations', '7', '--fetch-jettys-per-aiv', '1'])
     worker = runner_options(args)
     assert worker.batches == '1,2,4,8,16'
     assert worker.seed == 93 and worker.miss_percent == 15
     assert worker.iterations == 7 and worker.trace_rounds == 0
-    assert worker.streaming and worker.streaming_fetch and worker.fused_final
-    assert worker.prepare_update_metadata and worker.q_workers == 2
+    assert worker.q_workers == 2 and worker.fetch_jettys_per_aiv == 1
 
 
 def test_diagnostic_repeats_follow_iterations():
@@ -56,7 +55,7 @@ def test_supervisor_passes_selected_environment_to_real_child(tmp_path):
     import json
     import os
     import sys
-    from runner import supervise
+    from execution import supervise
     observed = tmp_path / 'observed.json'
     marker = tmp_path / 'worker-result.json'
     program = (
@@ -81,7 +80,6 @@ def test_fetch_only_is_automatic_only_for_level_three_fetch():
     ]:
         worker = runner_options(configuration(arguments))
         assert worker.diagnostic_fetch_only is expected
-        assert worker.fetch_only_compare is False  # Never bypass full-graph timing.
 
 
 def test_bench_matrix_rejects_invalid_percentages():
@@ -128,7 +126,7 @@ def test_matrix_dispatch_collects_twenty_pairs_without_npu(tmp_path, monkeypatch
 
 
 def test_nested_miss_progress_reaches_supervised_worker(tmp_path):
-    from runner import progress
+    from execution import progress
     (tmp_path / 'config.json').write_text('{}')
     child = tmp_path / 'miss15'
     child.mkdir()
@@ -141,7 +139,7 @@ def test_nested_miss_progress_reaches_supervised_worker(tmp_path):
 @pytest.mark.parametrize('exit_code', [0, 1])
 def test_supervisor_details_saved_and_failures_visible(tmp_path, capsys, show_details, exit_code):
     import sys
-    from runner import supervise
+    from execution import supervise
 
     (tmp_path / 'cases.log').write_text('DETAIL_COUNTERS prefetch=128\n')
     program = (

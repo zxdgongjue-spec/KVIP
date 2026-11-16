@@ -7,7 +7,7 @@ import sys
 import numpy as np
 
 import pytest
-import init_transport
+from execution import initialize_transport
 import kvip.adapters.kvaf
 import kvip.runtime.build
 
@@ -57,7 +57,7 @@ def test_initialization_acquires_and_releases_selected_lease(monkeypatch, tmp_pa
     kernels.mkdir(parents=True)
     for name in ('kvaf_execute_batch_get_kernels.o', 'kvaf_execute_batch_put_kernels.o'):
         (kernels / name).touch()
-    assert init_transport.main(transport, ['--device', '5', '--kvaf-server', 'host:1',
+    assert initialize_transport(transport, ['--device', '5', '--kvaf-server', 'host:1',
                                            '--kvaf-root', str(tmp_path)]) == 0
     runtime.link_to.assert_called_once_with('host:1')
     runtime.initialize.assert_called_once()

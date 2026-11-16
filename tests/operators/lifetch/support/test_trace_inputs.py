@@ -4,7 +4,7 @@ import json
 import numpy as np
 import pytest
 
-from trace_inputs import (
+from workloads import (
     BASE_ARRAYS, REAL_ARRAYS, SCORE_ARRAYS, checked_path,
     load_score_capture, score_values,
 )
@@ -87,7 +87,7 @@ def test_tampered_archive_and_manifest_rejected(tmp_path):
 
 def test_prefix_topk_and_identity_validation(tmp_path):
     capture = load_score_capture(capture_file(tmp_path))
-    from trace_inputs import validate_inputs
+    from workloads import validate_inputs
     capture.arrays['post.topk'][0, 0, 0] = 4096
     with pytest.raises(ValueError, match='prefix'):
         validate_inputs(capture)
@@ -109,7 +109,7 @@ def test_path_escape_and_bf16_sortable_decoding(tmp_path):
 
 
 def test_series_uses_source_round_and_preserves_request_identity(tmp_path):
-    from trace_inputs import select_series
+    from workloads import select_series
     dp = tmp_path / 'dp2'
     dp.mkdir()
     rounds = []

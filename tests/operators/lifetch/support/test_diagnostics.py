@@ -89,7 +89,7 @@ def test_level_one_requests_intervals_and_zero_bandwidth(tmp_path):
         assert report['trace'] == 'COMPLETE'
         log = (root / 'diagnostic_summary.log').read_text()
         assert 'request=0 initial_hot_valid=16384 selected_unique=2048 initial_cold=0' in log
-        assert 'start_us=0.000 end_us=10.000 duration_us=10.000' in log
+        assert report['captures'][0]['samples'][0]['accounting']['intervals_us']['li'] == [[100, 110]]
         assert 'GB/s=N/A' in log
         assert 'window candidates' not in log
         assert not (root / 'timeline.csv').exists()
@@ -153,12 +153,14 @@ def test_level_two_tables_keep_replay_core_and_query_identity():
         windows=[dict(window=1, posted=2, bytes=1312, unused=1, cumulative_posted=2, cumulative_unused=1)],
         queries=[dict(query=1, topk=2048, unique=2048, cross_q_duplicate=0,
                       new_unique=2048, initial_local=2046, final_posted=1)])]))
-    result = dict(level=2, transport='urma', trace='COMPLETE', missing=[], unavailable=[],
+    result = dict(level=3, transport='urma', trace='COMPLETE', missing=[], unavailable=[],
         captures=[dict(source='test', stage_summary={}, samples=[sample])])
     output = level_two_tables(result)
     for value in ('repeat=2', 'Last block=3', 'fetch Q1 lane0', 'Window prefetch / unused',
-                  'Per-Q demand / repair', 'Per-Q resolver / update', 'Fetch Jettys per AIV', '1.000', '2.000'):
+                  'Per-Q demand / repair', 'Fetch Jettys per AIV', '1.00', '2.00'):
         assert value in output
+    assert 'Per-Q resolver / update' in level_two_tables(dict(result, level=2))
     assert 'URMA group counters' in output
     result['transport'] = 'ubmem'
+    del request['core_timeline_raw']['fetch_jettys_per_aiv']
     assert 'URMA group counters' not in level_two_tables(result)

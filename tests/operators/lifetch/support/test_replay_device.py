@@ -5,8 +5,8 @@ import numpy as np
 import pytest
 import torch
 
-from replay_device import FusedReplayState
-from replay_inputs import ReplayPagePlan, assemble_round
+from execution import FusedReplayState
+from workloads import ReplayPagePlan, assemble_round
 from test_replay_inputs import reference
 
 
