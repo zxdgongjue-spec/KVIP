@@ -167,3 +167,31 @@ A 保留原全历史最终 TopK；B 接续中间结果，只处理尚未覆盖�
 脚本自动校验、采集 level3、汇总完整图以及最终 TopK 的计算/等待/调用次数。
 结果位于 `tests/results/final-topk-only/`；重新汇总时向 `summarize.py` 传入该次目录。
 最终 TopK 的约 22 µs 是之前真机测量的参考，本次实际收益以 A/B 测量为准。
+
+## 最新 TopK 驱动预取
+
+```bash
+bash tests/experiments/incremental_lifetch/compare_topk_prefetch.sh \
+  /vllm-workspace/vllm-ascend/third_party/KVAF 4 127.0.0.1:28885 16 1 4
+```
+
+A 固定为中间与最终增量 TopK、原位图预取；B 只替换预取候选来源。
+B 读取本窗口已经写回的四份 Top2048，不再重复采集生产者进度或扫描原始增量位图。
+先排除普通有效 hot 命中及已有预取/尾部映射，再用 UB 内的 token 集合跨 Q 去重，
+按固定的分片顺序展开最多2048个候选，接回原映射检查、预算、选槽、WQE提交和错误处理。
+保留无效 hot 和 LRU 预留 hot 的候选，避免误把可能被覆盖的槽当作安全命中。
+预算外的 token 可在后续窗口再次成为候选，最终缺失仍由 Resolver 补拉。
+
+复用服务 scratch：16 KiB 去重位集、8 KiB单Q输入；展开后输入已失效，
+继续复用原候选输出区。不新增算子或GM临时缓冲区；实验限定H131072/R16384。
+位集只存TopK token并集，不扫描LI分数位图。四Q共读取32 KiB索引；
+hot有效状态和预留信息合计128 KiB，分块读取一次，四Q复用2 KiB资格位集，避免逐token零散GM查询。
+
+保留level3打点：B的scan区间现在表示TopK读取/过滤/去重/展开，bitmap bytes为0；
+候选数表示排除已有命中后的有界去重集合，不能再与A的原始位图候选数按同一含义比较。
+比较有效读取、无效读取、最终补拉、LI/完整图耗时，以及窗口服务总耗时。
+脚本自动汇总至 `tests/results/topk-prefetch/<run>/key_results.log`。
+
+本地验证：完整融合算子设备编译通过；复用实际候选函数的模拟器测试通过跨Q重复、
+已映射过滤、无效/预留hot、查询边界、空padding以及8192个候选截断至2048的校验。
+端到端正确性和性能由上述真机A/B脚本验证。

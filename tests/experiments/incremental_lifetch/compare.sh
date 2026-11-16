@@ -11,6 +11,10 @@ elif [[ ${1:-} == --final-topk-only ]]; then
   mode=final-topk-only
   prepare_flags=(--final-topk-only)
   shift
+elif [[ ${1:-} == --topk-prefetch ]]; then
+  mode=topk-prefetch
+  prepare_flags=(--topk-prefetch)
+  shift
 fi
 kvaf_root=${1:?Usage: compare.sh KVAF_ROOT DEVICE SERVER [BATCHES] [MISS] [WINDOWS]}
 device=${2:?Missing device}

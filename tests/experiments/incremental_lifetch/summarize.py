@@ -115,6 +115,10 @@ def summarize(run, required=False):
     if (run / 'experiment.txt').exists() and (run / 'experiment.txt').read_text().strip() == 'final-topk-only':
         lines[1] = 'A=window TopK + original final TopK; B=same windows + incremental final TopK. Time: us.'
         lines += ['Original prefetch decisions retained in both paths; final TopK compute/wait reported separately.']
+    if (run / 'experiment.txt').exists() and (run / 'experiment.txt').read_text().strip() == 'topk-prefetch':
+        lines[1] = 'A=bitmap prefetch; B=latest TopK union prefetch. Both use incremental window/final TopK.'
+        lines += ['B scan = TopK ID load + local/mapped filtering + cross-Q union/expansion; bitmap bytes=0.',
+                  'B candidates are filtered unique tokens capped at 2048; compare actual reads/unused/final and full graph.']
     keys = sorted(set(cases['baseline']) | set(cases['incremental']), key=lambda k: (k[0], str(k[1])))
     for key in keys:
         lines += ['', f'BS={key[0]} miss={key[1]}%']

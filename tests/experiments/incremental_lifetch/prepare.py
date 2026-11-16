@@ -59,7 +59,10 @@ def main():
     parser.add_argument('--baseline', action='store_true')
     parser.add_argument('--window-topk-only', action='store_true', help='Only add isolated incremental TopK to window service; keep original decisions and final TopK')
     parser.add_argument('--final-topk-only', action='store_true', help='Both paths run window TopK; only B consumes it for final TopK')
+    parser.add_argument('--topk-prefetch', action='store_true', help='Compare bitmap prefetch against latest TopK union; both use incremental final TopK')
     args = parser.parse_args()
+    if args.topk_prefetch:
+        args.final_topk_only = True
     if args.final_topk_only:
         args.window_topk_only = True
     repo = Path(__file__).resolve().parents[3]
@@ -135,7 +138,7 @@ def main():
         methods=vector.with_name('incremental_methods.h')
         code=methods.read_text()
         # No tail coalescing, final-TopK replacement or writes to the ordinary prefix.
-        if not args.final_topk_only or args.baseline:
+        if not args.final_topk_only or (args.baseline and not args.topk_prefetch):
             code=code[:code.index('__aicore__ inline void FinalIncremental')]
         a=code.index('    if(!PreviousServiceReady(epoch,lane)) {',code.index('__aicore__ inline bool AdvanceWindow'))
         b=code.index('    bool trace=',a)
@@ -155,19 +158,49 @@ def main():
         methods.write_text(code)
         replace(vector, "        // Join this producer's hit publication. Other producers remain free.",
                 "        AdvanceWindow(epoch,sequenceHalfWindow);\n        // Join this producer's hit publication. Other producers remain free.")
-        if args.final_topk_only and not args.baseline:
+        if args.final_topk_only and (not args.baseline or args.topk_prefetch):
             replace(vector, '        if (validS2Len >= topkCount_) {',
                     '        if (!prefixActive_ && validS2Len >= runtimeShape_.resident && validS2Len % 128 == 0) {\n'
                     '            FinalIncremental(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, validS2Len);\n'
                     '        } else if (validS2Len >= topkCount_) {')
+        if args.topk_prefetch and not args.baseline:
+            replace(binding, '        if resident > 131072:',
+                    '        if history != 131072 or resident != 16384:\n'
+                    '            raise ValueError("TopK prefetch experiment requires history=131072, resident=16384")\n'
+                    '        if resident > 131072:')
+            prefetch=op/'op_kernel/prefetch.h'
+            source=prefetch.read_text()
+            anchor='// Same indexed-load pattern as v9 GatherCandidateMap; cold IDs pass through.'
+            source=source.replace(anchor, '#include "topk_candidates.h"\n'+anchor)
+            start=source.index('    GlobalTensor<uint32_t> progressGm;',source.index('inline void FastService'))
+            end=source.index('    GlobalTensor<uint32_t> allRows;',start)
+            source=source[:start]+'''    auto work=flags.ReinterpretCast<uint32_t>();
+    auto cfg=work[4096];
+    auto rowStorage=ids;
+    if(rt_batchedRows)ids=scratch[23808/4];
+    V9_FETCH_PROFILE(event->begin=GetSystemCycle();)
+    uint64_t postedCount=0;
+'''+source[end:]
+            start=source.index('#define KV_WINDOW_HISTORY')
+            end=source.index('#undef KV_WINDOW_SCAN_TOKENS',start)+len('#undef KV_WINDOW_SCAN_TOKENS')
+            source=source[:start]+'#include "topk_candidate_service.h"'+source[end:]
+            start=source.index('        for(uint32_t q=0;q<4;++q) {\n            uint32_t processed=')
+            end=source.index('        if(!rt_batchedRows)',start)
+            source=source[:start]+source[end:]
+            prefetch.write_text(source)
+            for name in ('topk_candidates.h','topk_candidate_service.h'):
+                shutil.copyfile(Path(__file__).with_name(name),prefetch.parent/name)
         instrument(dest)
         # These production algorithms must remain byte-identical to the source.
         for relative in ('op_kernel/prefetch.h', 'op_kernel/indexer/indexer.h', 'op_kernel/streaming.cpp'):
+            if relative=='op_kernel/prefetch.h' and args.topk_prefetch and not args.baseline:
+                continue
             if (op/relative).read_bytes() != (repo/'csrc/operators/lightning_indexer_with_fetch'/relative).read_bytes():
                 raise RuntimeError(f'Unexpected production algorithm change: {relative}')
         print(f'TopK experiment: {dest}')
-        print('Final TopK: ' + ('incremental private state' if args.final_topk_only and not args.baseline else 'original full-history'))
-        print('Original prefetch decisions, resolver, update and Fetch retained.')
+        print('Final TopK: ' + ('incremental private state' if args.final_topk_only and (not args.baseline or args.topk_prefetch) else 'original full-history'))
+        print('Prefetch candidates: ' + ('latest TopK union' if args.topk_prefetch and not args.baseline else 'original bitmap'))
+        print('Resolver, update and Fetch retained.')
         return
     replace(vector, '        if (publishProgress) {', '        SeedIncremental(query,scoreRow);\n        if (publishProgress) {')
     replace(vector, '        // Join this producer\'s hit publication. Other producers remain free.',
