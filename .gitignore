@@ -8,3 +8,4 @@
 /csrc/operators/lidu/build/
 /csrc/operators/lidu/_custom_opp/
 /csrc/operators/lidu/torch_extension/build/
+/csrc/operators/lidu/torch_extension/nanovllm_dsa_lidu_fused_batch_get_prepare_mtp/_C*.so
