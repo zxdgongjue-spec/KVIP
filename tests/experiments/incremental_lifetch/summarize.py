@@ -106,6 +106,41 @@ def detailed_trace(report, path, label, required=False):
     return lines
 
 
+def window_reads(report, path, label, required=False):
+    trace_path = path.with_name('full_attribution.json')
+    trace = read(trace_path) if trace_path.exists() else report.get('full_trace', {})
+    samples = trace.get('samples', [])
+    totals = {}
+    for sample in samples:
+        algorithm = sample.get('algorithm', {})
+        requests = algorithm.get('requests', [])
+        if len(requests) != report['batch']:
+            if required:
+                raise ValueError(f'{path}: per-window admission identities missing')
+            return [f'{label}: no per-window admission records in this old run.']
+        current = {}
+        for request in requests:
+            for window in request['windows']:
+                key = window['window'] - 1
+                row = current.setdefault(key, [0, 0])
+                row[0] += window['posted']
+                row[1] += window['unused']
+        if sum(v[0] for v in current.values()) != algorithm['totals']['prefetch']:
+            raise ValueError(f'{path}: window sum differs from actual prefetch')
+        for epoch, row in current.items():
+            totals.setdefault(epoch, []).append(row)
+    rows = []
+    for epoch, values in sorted(totals.items()):
+        posted = sum(v[0] for v in values)
+        unused = sum(v[1] for v in values)
+        rows.append([label, epoch, number(posted/len(values)),
+                     f'{min(v[0] for v in values)}..{max(v[0] for v in values)}',
+                     number(unused/len(values)),
+                     '--' if not posted else f'{100*unused/posted:.2f}%'])
+    return (['Actual window transfers: whole batch; unused = absent from final Q4 union; rate = sum unused / sum posted. Zero posts => --.']
+            + table(['Path', 'Epoch', 'Posted mean', 'Posted min..max', 'Unused mean', 'Unused rate'], rows)) if rows else []
+
+
 def summarize(run, required=False):
     cases = {v: load_cases(run / v) for v in ('baseline', 'incremental')}
     lines = [f'Run: {run}', 'A=baseline; B=incremental. Time: us; positive reduction means faster.']
@@ -132,6 +167,9 @@ def summarize(run, required=False):
         lines[1] = 'A=bitmap prefetch; B=latest TopK union prefetch. Both use incremental window/final TopK.'
         lines += ['B middle scan = compact cold-ID load + cross-Q dedup; cold-ID export is included in Incremental. Hot window uses original bitmap.',
                   'B middle candidates are unique cold TopK tokens capped at 2048; original map filtering/budget/post remain. Compare reads and full graph.']
+    if (run / 'experiment.txt').exists() and (run / 'experiment.txt').read_text().strip() == 'ranked-miss':
+        lines[1] = 'A=cold selection with half-quota floor; B=true-miss selection with same floor and cap.'
+        lines += ['B excludes valid hot, prior prefetch and ABC-local mappings before threshold/floor/cap; cross-Q dedup follows.']
     keys = sorted(set(cases['baseline']) | set(cases['incremental']), key=lambda k: (k[0], str(k[1])))
     for key in keys:
         lines += ['', f'BS={key[0]} miss={key[1]}%']
@@ -191,6 +229,7 @@ def summarize(run, required=False):
             if key in cases[variant]:
                 report, path = cases[variant][key]
                 lines += detailed_trace(report, path, label, required)
+                lines += window_reads(report, path, label, required)
         if io:
             lines += ['DDR entries: whole batch, per-replay min..max; unused = fetched but absent from final TopK.']
             lines += table(['Path', 'Native', 'Prefetch hot', 'Prefetch cold', 'Final', 'Unused', 'Total', 'Conflict'], io)
@@ -211,7 +250,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('run', nargs='?', type=Path, help='A/B result directory; default: latest window-topk-only run')
     parser.add_argument('--experiment', default='window-topk-only',
-                        choices=('window-topk-only', 'final-topk-only', 'topk-prefetch', 'recent-index', 'ranked-prefetch', 'ranked-floor'),
+                        choices=('window-topk-only', 'final-topk-only', 'topk-prefetch', 'recent-index', 'ranked-prefetch', 'ranked-floor', 'ranked-miss'),
                         help='Result family to search when run is omitted')
     parser.add_argument('--require-detailed', action='store_true', help='Fail if new A/B trace records are absent')
     args = parser.parse_args()

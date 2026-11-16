@@ -15,9 +15,10 @@ def replace_once(text, old, new):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path)
+    parser.add_argument('--true-miss', action='store_true', help='Filter hot hits and prior admissions before rank/quota selection')
     parser.add_argument('--baseline', action='store_true')
     parser.add_argument('--minimum-half', action='store_true',
-                        help='Before dedup/mapping, lower the score threshold to admit quota/2 cold candidates')
+                        help='Lower the score threshold to admit quota/2 eligible candidates')
     parser.add_argument('--abc-tail-tokens', type=int, default=384)
     args = parser.parse_args()
     here = Path(__file__).resolve().parent
@@ -58,6 +59,17 @@ def main():
     if args.minimum_half:
         s=replace_once(s,'valid,rank,ctx->windowLimit/4);',
                        'valid,rank,ctx->windowLimit/4,true,nullptr,(ctx->windowLimit/4)/2);')
+    if args.true_miss:
+        start=s.index('    uint32_t count=kvip_prefetch_rank::Select(')
+        end=s.index('    mappedExport_=true;',start)
+        s=s[:start]+'''    uint32_t b=query/4;
+    uint32_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
+    auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+uint64_t(b)*runtimeShape_.history;
+    auto hot=ctx->hotValid?reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*runtimeShape_.resident:nullptr;
+    auto reserved=ctx->reservedHot?reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+uint64_t(b)*runtimeShape_.resident:nullptr;
+    uint32_t count=kvip_prefetch_rank::SelectMiss(indicesOutLocal_,scoreOutLocal_,compact,
+        topkSharedTmpLocal_[128],map,hot,reserved,runtimeShape_.resident,valid,
+        rank,ctx->windowLimit/4,nullptr,'''+('(ctx->windowLimit/4)/2' if args.minimum_half else '0')+');\n'+s[end:]
     methods.write_text(s)
     prefetch=kernel/'prefetch.h';s=prefetch.read_text()
     start=s.index('        if(!epoch) {',s.index('uint32_t candidateCount=0;'))
@@ -74,7 +86,8 @@ def main():
     e=e[:begin]+e[end:]
     execution.write_text(e)
     print('Ranked prefetch: all windows; rank 1024..2048; per-Q quota=windowLimit/4; '
-          f'minimum={"quota/2" if args.minimum_half else "0"} before dedup/mapping; no quota redistribution')
+          f'minimum={"quota/2" if args.minimum_half else "0"}; '
+          f'candidates={"unresolved miss before rank/quota" if args.true_miss else "cold before mapping"}; no quota redistribution')
 
 
 if __name__ == '__main__':

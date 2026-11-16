@@ -89,9 +89,11 @@ int main(){try{
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('output',type=Path)
+    p.add_argument('--miss',action='store_true',help='Compare cold floor vs true-miss floor, including indexed metadata loads')
     p.add_argument('--floor',action='store_true',help='Compare no lower bound vs quota/2; preserve old-export reference')
     p.add_argument('--summarize',action='store_true',help='Read output/model.log; all times use 1800 model cycles/us')
     args=p.parse_args();dest=args.output.resolve()
+    if args.miss: args.floor=True
     if args.summarize:
         rows=[]
         for line in (dest/'model.log').read_text().splitlines():
@@ -103,6 +105,7 @@ def main():
         if len(rows)!=expected:
             raise RuntimeError(f'Expected {expected} verified samples, got {len(rows)}')
         print('CANN simulator; 1800 cycles/us. One Q/sample; 4Q is 4 x the per-Q delta, not end-to-end LI.')
+        if args.miss: print('A=cold floor; B=true-miss floor. B total includes indexed map/hot/reserved filtering. Counts are before cross-Q dedup.')
         print('cold/Q | rank | before count | after count | before us/Q | after us/Q | added us/4Q' if args.floor else 'cold/Q | rank | v1 us/Q | optimized us/Q | old export us/Q | added us/4Q')
         counts=(0,12,64,256,2048,256,12,32,1024,20,16,1) if args.floor else (0,12,64,256,2048,256,12,32)
         for kind in range(len(counts)):
@@ -144,6 +147,45 @@ def main():
  if(mode==2)'''
         assert anchor in host
         host=host.replace(anchor,replacement)
+    if args.miss:
+        kernel=kernel.replace('GM_ADDR times)', 'GM_ADDR times,GM_ADDR mapping)')
+        kernel=kernel.replace('pipe.InitBuffer(tmp,14336)', 'pipe.InitBuffer(tmp,22528)')
+        call='kvip_prefetch_rank::Select(ids,scores,out,scratch,16384,131072,rank,32,true,stamp,mode==1?16:0)'
+        newcall='''(mode==1?kvip_prefetch_rank::SelectMiss(ids,scores,out,scratch,
+ reinterpret_cast<__gm__ uint32_t*>(mapping)+q*163840,
+ reinterpret_cast<__gm__ uint32_t*>(mapping)+q*163840+131072,
+ reinterpret_cast<__gm__ int32_t*>(mapping)+q*163840+147456,
+ 16384,131072,rank,32,stamp,16):kvip_prefetch_rank::Select(ids,scores,out,scratch,16384,131072,rank,32,true,stamp,16))'''
+        assert kernel.count(call)==2
+        kernel=kernel.replace(call,newcall)
+        # Measured total includes indexed metadata filtering, not just Select.
+        kernel=kernel.replace(' if(mode<2)count=', ' uint64_t whole=GetSystemCycle();\n if(mode<2)count=')
+        kernel=kernel.replace(' for(uint32_t j=0;j<5;++j)timing', ' if(mode<2)stamp[0]=whole;\n for(uint32_t j=0;j<5;++j)timing')
+        host=host.replace('uint32_t,void*,void*,void*,void*);', 'uint32_t,void*,void*,void*,void*,void*);')
+        host=host.replace(' void* in=upload(input);',''' std::vector<uint32_t> maps(12*163840,UINT32_MAX);
+ for(uint32_t q=0;q<12;++q){auto m=maps.data()+q*163840;
+ std::fill(m+131072,m+147456,1);
+ auto ids=input.data()+q*3072;auto scores=reinterpret_cast<uint16_t*>(ids+2048);
+ std::vector<uint32_t> cold;for(uint32_t i=0;i<2048;++i)if(ids[i]>=16384&&ids[i]<131072)cold.push_back(i);
+ std::stable_sort(cold.begin(),cold.end(),[&](auto a,auto b){return scores[a]>scores[b];});
+ for(uint32_t j=0;j<cold.size();++j)if(q==4||j<32)m[ids[cold[j]]]=16384+j;
+ // Cases 0/6 cover invalid hot and reserved-but-previously-valid hot.
+ if(q==0||q==6){for(uint32_t t=0;t<12;++t)m[131072+t]=0;for(uint32_t t=12;t<24;++t)m[147456+t]=0;m[0]=16384;}
+ // ABC-local tag is excluded just like an in-flight admission.
+ if(q==8&&!cold.empty())m[ids[cold.back()]]=16384+8192;
+ }
+ void* mapD=upload(maps);
+ void* in=upload(input);''')
+        host=host.replace('stream,in,out,t)', 'stream,in,out,t,mapD)')
+        host=host.replace(' if(mode==1){', ' if(mode<2){')
+        host=host.replace('if(ids[i]>=16384&&ids[i]<131072)allCold.push_back(i);','''if(ids[i]<131072){uint32_t token=ids[i];auto m=maps.data()+q*163840;
+ bool local=token<16384&&m[131072+token]!=0&&int32_t(m[147456+token])<0;
+ if(mode==0?token>=16384:(!local&&m[token]==UINT32_MAX))allCold.push_back(i);}''')
+        # Verify original TopK input stays untouched after both paths.
+        host=host.replace(' ck(aclrtMemcpy(timing.data(),timing.size()*8,t,timing.size()*8,ACL_MEMCPY_DEVICE_TO_HOST));',''' ck(aclrtMemcpy(timing.data(),timing.size()*8,t,timing.size()*8,ACL_MEMCPY_DEVICE_TO_HOST));
+ std::vector<uint32_t> unchanged(input.size());ck(aclrtMemcpy(unchanged.data(),unchanged.size()*4,in,unchanged.size()*4,ACL_MEMCPY_DEVICE_TO_HOST));
+ if(unchanged!=input)throw std::runtime_error("TopK input modified");
+''')
     (dest/'kernel.cpp').write_text(kernel);(dest/'main.cpp').write_text(host)
     cmake=CMAKE.replace('@OP@',str(dest)).replace('@KVAF@',str(dest)).replace('window_model','rank_model')
     (dest/'CMakeLists.txt').write_text(cmake)

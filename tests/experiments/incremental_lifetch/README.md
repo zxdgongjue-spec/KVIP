@@ -337,3 +337,43 @@ python tests/experiments/incremental_lifetch/summarize.py --experiment recent-in
 本地已核对 A 与当前 B 逐文件一致、脚本生成的 B 与编译输入一致，并通过 CANN 9.1
 Ascend950PR_9599 完整设备编译；30 组 CPU 集合模型检查覆盖近期长度、因果裁剪及重复 ID。
 真机正确性与性能由以上 A/B 命令验证，本地编译及集合检查不代表真机通过。
+
+### 真正 miss 的阈值预取 A/B
+
+```bash
+bash tests/experiments/incremental_lifetch/compare_ranked.sh --true-miss \
+  /vllm-workspace/vllm-ascend/third_party/KVAF \
+  4 127.0.0.1:28885 16 10 4 384
+python tests/experiments/incremental_lifetch/summarize.py \
+  --experiment ranked-miss --require-detailed
+```
+
+- A 固定为原 cold 筛选＋半配额保底；B 保留同样的窗口阈值、16～32/Q 配额，
+  将有效 hot、已有预取映射（包括在途）及 ABC 本地映射的排除移到筛选之前。
+  无效或 reserved 覆盖的 hot 且没有映射时也属于 miss。不足16条时全部保留。
+- 原窗口完成发布保证前一窗口 admission map 已就绪；使用同原服务的 indexed load，
+  不等待预取 CQ。阈值和上限复用现有寄存器直方图实现，完整 Top2048 不修改。
+  eligibility ID 占用8 KiB已有 TopK 临时空间，不增加 kernel UB 分配。
+- 跨Q去重、请求窗口/总预算和实际提交逻辑不变，实际预取量可低于各Q配额之和。
+- 汇总保留完整图、LI、收尾融合、最终TopK及逐窗口阶段耗时；新增 A/B 每个 epoch
+  实际提交量的均值/范围、误取量和误取率。统计整个BS，每条656字节。
+  误取定义为本次实际预取后未进入最终Q4并集；比例按所有采样的误取总数/预取总数，
+  不是平均各请求百分比。无预取显示 `--`。窗口之和与 admission 总数不符会报错。
+  每请求细节仍保存在 level3 的 algorithm records 中。
+
+本地共享筛选模块模型：`model_rank.py OUTPUT --miss` 生成 CANN 工程，
+构建并运行 `rank_model`，保存终端为 `OUTPUT/model.log`，再以
+`model_rank.py OUTPUT --miss --summarize` 汇总。12组输入×3路径包括已预取最高分项、
+全部已覆盖、ABC、无效/预留hot、同分、少于16条和padding；与CPU独立筛选结果比对。
+`model_window.py --ranked-miss --output OUTPUT --kvaf-root KVAF_ROOT --max-b-topk-cycles 100000`
+复用实际窗口与提交函数，检查TopK、去重、映射、槽位、WQE、doorbell和无新分数时不重复提交。
+模型时间按1800 cycles/µs换算；不包含网络DMA/CQ，不等同真机端到端耗时。
+
+2026-11-16 本地验证：36项筛选结果与CPU参考一致，融合设备编译通过；实际窗口模型
+每请求提交23条，TopK、映射、槽位、WQE、doorbell及相同进度重跑不重复提交均通过。
+当前版本是正确性修复，新增状态检查尚未优化：同输入暖态模型增加4.66～13.20 µs/Q，
+4Q顺序折算18.66～52.81 µs，并非完整图实测。256 cold候选用例的检查/打包
+由246增至24010 cycles，阈值与输出部分由1243变为1245 cycles。
+主要开销来自每Q对完整2048项进行SIMT离散状态读取；4Q重复查询相同hot/预取状态。
+该成本不代表算法必要成本，后续应复用分类或按请求批量准备状态。真机A/B用于验证
+实际预取和端到端变化，不将这一版标记为性能优化完成。

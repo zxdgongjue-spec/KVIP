@@ -1,7 +1,26 @@
 #pragma once
 #include "rank_threshold.h"
+#include "simt_api/asc_simt.h"
+#include "simt_api/device_functions.h"
 namespace kvip_prefetch_rank {
 using namespace AscendC;
+// Same uncached indexed-load pattern as FastService::GatherCandidateMap.
+// Predecessor service publication must complete before this read. The map
+// includes in-flight admissions and ABC-local tags, not only completed copies.
+__simt_vf__ __aicore__ LAUNCH_BOUND(256)
+inline void MissIds(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* eligible,
+    __gm__ uint32_t* map,__gm__ uint32_t* hotValid,__gm__ int32_t* reserved,
+    uint32_t resident,uint32_t valid) {
+    for(uint32_t i=threadIdx.x;i<2048;i+=256) {
+        uint32_t token=ids[i];bool miss=false;
+        if(token<valid) {
+            bool local=token<resident && (!hotValid || asc_ldcg(hotValid+token)!=0)
+                && (!reserved || asc_ldcg(reserved+token)<0);
+            miss=!local && asc_ldcg(map+token)==UINT32_MAX;
+        }
+        eligible[i]=miss?token:UINT32_MAX;
+    }
+}
 // Read-only complete TopK. Compact mode reduces the second rank selection to
 // cold scores only; dense mode is the first implementation used for local A/B.
 template<bool compact>
@@ -112,5 +131,20 @@ __aicore__ inline uint32_t Select(LocalTensor<uint32_t> ids,LocalTensor<uint16_t
     uint32_t count=scratch.GetValue(3208);
     if(clocks)clocks[4]=GetSystemCycle();
     return count<quota?count:quota;
+}
+// Uses 22 KiB of the existing dead TopK scratch (no additional UB allocation).
+// Full scores remain unchanged: only quota/floor selection uses miss IDs.
+__aicore__ inline uint32_t SelectMiss(LocalTensor<uint32_t> ids,LocalTensor<uint16_t> scores,
+    LocalTensor<uint32_t> output,LocalTensor<uint32_t> scratch,
+    __gm__ uint32_t* map,__gm__ uint32_t* hotValid,__gm__ int32_t* reserved,
+    uint32_t resident,uint32_t valid,uint32_t rank,uint32_t quota,
+    uint64_t* clocks=nullptr,uint32_t minimum=0) {
+    auto eligible=scratch[3584];
+    Simt::VF_CALL<MissIds>(Simt::Dim3{256,1,1},
+        reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
+        reinterpret_cast<__ubuf__ uint32_t*>(eligible.GetPhyAddr()),
+        map,hotValid,reserved,resident,valid);
+    PipeBarrier<PIPE_V>();
+    return Select(eligible,scores,output,scratch,0,valid,rank,quota,true,clocks,minimum);
 }
 } // namespace kvip_prefetch_rank

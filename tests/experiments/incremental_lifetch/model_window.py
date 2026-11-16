@@ -91,6 +91,7 @@ def main():
     parser.add_argument('--kvaf-root', required=True, type=Path)
     parser.add_argument('--cann-root', type=Path, default=Path('/usr/local/Ascend/cann'))
     parser.add_argument('--soc', default='Ascend950PR_9599')
+    parser.add_argument('--ranked-miss', action='store_true', help='Cold floor vs true-miss floor through the real window/submit path')
     parser.add_argument('--prepare-only', action='store_true')
     parser.add_argument('--max-b-topk-cycles', type=int, default=36000,
                         help='B incremental window must be below this cycle count (20 us at 1.8 GHz)')
@@ -105,6 +106,9 @@ def main():
         command = [sys.executable, str(here / 'prepare.py'), str(source), '--topk-prefetch']
         if label == 'a':
             command.append('--baseline')
+        if args.ranked_miss:
+            command = [sys.executable, str(here / 'prepare_ranked.py'), str(source), '--minimum-half']
+            if label == 'b': command.append('--true-miss')
         subprocess.run(command, check=True)
         op = source / 'csrc/operators/lightning_indexer_with_fetch'
         case = output / label
@@ -115,6 +119,8 @@ def main():
         kernel = KERNEL
         if (op / 'op_kernel/indexer/window_fast_vector.h').exists():
             kernel = kernel.replace('#include "incremental_vector_helpers.h"', '#include "incremental_vector_helpers.h"\n#include "window_fast_vector.h"')
+        if args.ranked_miss:
+            kernel = kernel.replace('#include "window_fast_vector.h"', '#include "window_fast_vector.h"\n#include "recent_seed.h"')
         (case / 'kernel.cpp').write_text(kernel)
         (case / 'main.cpp').write_text((here / 'window_model_host.cpp').read_text())
         (case / 'CMakeLists.txt').write_text(CMAKE.replace('@OP@', str(op)).replace('@KVAF@', str(args.kvaf_root.resolve() / 'access_operator/demo/aiv_batch_get/include')))
