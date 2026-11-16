@@ -56,6 +56,14 @@ def print_replay_failure(report, *, result_path, log_path=None):
         f"step={where.get('step')} {error.get('type', 'Error')}: {message[:400]}",
         file=sys.stderr,
     )
+    # The native builder already selects the first compiler error and context.
+    # Preserve it in concise mode instead of hiding it behind the first line.
+    diagnostic = error.get("message", "").partition("--- build diagnostic ---")[2]
+    if diagnostic:
+        emit("BUILD_DIAGNOSTIC_BEGIN", file=sys.stderr)
+        for line in diagnostic.strip().splitlines()[:35]:
+            emit(line[:1200], file=sys.stderr)
+        emit("BUILD_DIAGNOSTIC_END", file=sys.stderr)
     for name, case in report.get("completed_cases", {}).items():
         timing = case.get("timing", {})
         emit(

@@ -746,6 +746,10 @@ def verify_case_equivalence(cases, *, same_threshold):
 
 
 def run(args, archive, retained):
+    if getattr(args, "study", "threshold") == "scan-order":
+        from kvip.diagnostics.scan_options import prebuild
+
+        prebuild(args, retained)
     if getattr(args, "study", "threshold") == "seed-ub":
         from kvip.diagnostics.seed_eligibility import predict_seed_eligibility
 

@@ -35,3 +35,24 @@ def validate_options(options):
     if options["window_refilter"] and not options["rolling_threshold"]:
         raise ValueError("Window refilter requires rolling threshold")
     return dict(options)
+
+
+def prebuild(args, retained):
+    """Use the production builder before allocating/restoring any NPU arena."""
+    from pathlib import Path
+
+    from kvip.runtime.build import build_libraries, kvaf_build_paths
+    from kvip.diagnostics.console import emit
+
+    cann, headers = kvaf_build_paths(args.build_dir)
+    seen = set()
+    for name in args.scan_variants:
+        options = options_for(name)
+        key = tuple(options.values())
+        if key in seen:
+            continue
+        retained.setdefault("progress", {}).update(variant=name, phase="compile_preflight", step=None)
+        build_libraries(cache_dir=Path(args.build_dir) / "lifetch", cann=cann, headers=headers,
+                        soc=args.soc, **options)
+        seen.add(key)
+    emit(f"BUILD_VARIANTS_READY unique={len(seen)}")

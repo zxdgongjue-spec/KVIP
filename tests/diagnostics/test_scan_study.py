@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from kvip.diagnostics import replay, replay_measure, scan_report
+from kvip.diagnostics import replay, replay_measure, scan_report, scan_options
 from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, budgets_for, options_for, validate_options
 
 
@@ -15,6 +15,7 @@ def test_scan_study_reuses_one_arena_and_delivers_independent_options(monkeypatc
     args = SimpleNamespace(study="scan-order", mode="fused", transport="urma",
                            threshold_policy="recent", scan_variants=list(variants))
     context, allocated, calls = object(), [], []
+    monkeypatch.setattr(scan_options, "prebuild", lambda *a: None)
     monkeypatch.setattr(replay_measure, "allocate_context", lambda *a: allocated.append(context) or context)
     monkeypatch.setattr(replay_measure, "release_context", lambda c: allocated.remove(c))
 
@@ -152,3 +153,33 @@ def test_report_separates_saved_waste_from_added_repair_and_both_drifts(tmp_path
     assert "reverse->reverse-roll mean_gain=+5.00% p50_gain=-10.00%" in output
     assert "waste_save_MiB=+0.0031 waste_save=+50.00% repair_delta_MiB=+0.0031 total_save_MiB=+0.0000" in output
     assert "baseline_mean_drift=+2.00% baseline_p50_drift=-1.00%" in output
+
+
+def test_scan_compiles_unique_variants_before_allocating_arena(tmp_path, monkeypatch):
+    from kvip.runtime import build
+
+    args = SimpleNamespace(study="scan-order", mode="fused", transport="urma", threshold_policy="recent",
+                           scan_variants=list(ROLLING_VARIANTS), build_dir=tmp_path, soc="A5")
+    calls = []
+    monkeypatch.setattr(build, "kvaf_build_paths", lambda path: (path / "cann", path / "headers"))
+    monkeypatch.setattr(build, "build_libraries", lambda **kwargs: calls.append(kwargs))
+
+    def stop_before_allocation(*unused):
+        assert len(calls) == 5  # forward-end reuses forward's binary.
+        assert [tuple(call[key] for key in scan_options.OPTIONS) for call in calls] == [
+            tuple(options_for(name).values()) for name in ROLLING_VARIANTS[:-1]]
+        raise RuntimeError("stop before NPU allocation")
+
+    monkeypatch.setattr(replay_measure, "allocate_context", stop_before_allocation)
+    with pytest.raises(RuntimeError, match="stop before NPU allocation"):
+        replay_measure.run(args, SimpleNamespace(manifest={}), {})
+
+    def compiler_failure(**kwargs):
+        if kwargs["rolling_threshold"]:
+            raise RuntimeError("compiler diagnostic")
+
+    monkeypatch.setattr(build, "build_libraries", compiler_failure)
+    retained = {}
+    with pytest.raises(RuntimeError, match="compiler diagnostic"):
+        replay_measure.run(args, SimpleNamespace(manifest={}), retained)
+    assert retained["progress"] == dict(variant="reverse-roll", phase="compile_preflight", step=None)

@@ -10,6 +10,20 @@ import pytest
 from kvip.diagnostics import compare, replay, replay_measure
 
 
+def test_quiet_failure_preserves_first_compiler_diagnostic(tmp_path, capsys):
+    from kvip.diagnostics.console import print_replay_failure
+
+    message = ("LIFetch compile/link failed; full log: /build/build.log\n"
+               "--- build diagnostic ---\n"
+               "rolling_threshold_vector.h:29: error: no matching function for call to 'MaskOr'\n"
+               "note: requires 4 arguments, but 3 were provided\n" + "trailing\n" * 100)
+    print_replay_failure(dict(error=dict(type="RuntimeError", message=message)), result_path=tmp_path / "failed.json")
+    output = capsys.readouterr().err
+    assert "BUILD_DIAGNOSTIC_BEGIN" in output and "BUILD_DIAGNOSTIC_END" in output
+    assert "requires 4 arguments, but 3 were provided" in output
+    assert output.count("trailing\n") == 33
+
+
 def _case():
     return {"status": "pass", "timing": {"mean_us": 12.5, "p50_us": 12.0}, "complete_oracle": True}
 
