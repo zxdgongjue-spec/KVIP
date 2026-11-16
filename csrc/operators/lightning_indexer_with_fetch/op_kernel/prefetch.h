@@ -589,12 +589,12 @@ inline void GatherCandidateMap(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* slots,
 }
 __simd_vf__ inline void CompactMisses(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* slots,
     __ubuf__ uint32_t* cfg,uint32_t count,uint32_t available,
-    __ubuf__ uint32_t* destination=nullptr) {
+    __ubuf__ uint32_t* destination) {
     using namespace MicroAPI;
     auto all=CreateMask<uint32_t,MaskPattern::ALL>();auto lane=CreateMask<uint32_t,MaskPattern::VL1>();
     RegTensor<uint32_t> token,old,rank,index,written,flags,total,zeroIndex,broadcast,packed;
     Duplicate(written,uint32_t(0));Duplicate(zeroIndex,uint32_t(0));
-    uint32_t remaining=count;auto output=destination?destination:ids;ClearSpr<SpecialPurposeReg::AR>();UnalignRegForStore store;
+    uint32_t remaining=count;auto output=destination;ClearSpr<SpecialPurposeReg::AR>();UnalignRegForStore store;
     for(uint16_t i=0;i<count;i+=64) {
         auto valid=UpdateMask<uint32_t>(remaining);LoadAlign(token,ids+i);LoadAlign(old,slots+i);
         MaskReg miss,capacity;CompareScalar<uint32_t,CMPMODE::EQ>(miss,old,UINT32_MAX,valid);
@@ -776,7 +776,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
 #if KVIP_REFILTER_REFILL
                     reinterpret_cast<__ubuf__ uint32_t*>(selectedIds[count].GetPhyAddr())
 #else
-                    nullptr
+                    reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr())
 #endif
                 );
                 SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
