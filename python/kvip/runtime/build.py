@@ -50,6 +50,7 @@ def build_libraries(
     ready_batch_fetch=False,
     ready_direct_ranges=False,
     adaptive_admission=False,
+    low_miss_skip=False,
     prefetch_gate=False,
     prefetch_rank=0,
     skip_exhausted_prefetch=False,
@@ -73,6 +74,7 @@ def build_libraries(
         READY_BATCH_FETCH=ready_batch_fetch,
         READY_DIRECT_RANGES=ready_direct_ranges,
         ADAPTIVE_ADMISSION=adaptive_admission,
+        LOW_MISS_SKIP=low_miss_skip,
         PREFETCH_GATE=prefetch_gate,
         SKIP_EXHAUSTED_PREFETCH=skip_exhausted_prefetch,
         EARLY_PREFETCH_DRAIN=early_prefetch_drain,
@@ -83,6 +85,8 @@ def build_libraries(
         raise ValueError("LIFetch pipeline build options must be bool")
     if prefetch_gate and not adaptive_admission:
         raise ValueError("prefetch_gate requires adaptive_admission=True")
+    if low_miss_skip and not adaptive_admission:
+        raise ValueError("low_miss_skip requires adaptive_admission=True")
     if type(prefetch_rank) is not int or not 0 <= prefetch_rank <= 2048:
         raise ValueError("prefetch_rank must be an integer in 0..2048")
     if prefetch_rank and not prefetch_gate:

@@ -140,7 +140,7 @@ template<class T> struct Guard {
 };
 struct Model {
  using SCORE_T=uint16_t;using QK_T=float;
- bool prefixActive_=false,streamingTopkOnly_=false;
+ bool prefixActive_=false,streamingTopkOnly_=false,noPrefetchRound_=false;
  struct {bool isLDOpen=false;unsigned mBaseSize=64,kSeqSize=131328;} constInfo_;
  struct {unsigned splitQ=1,batch=16,aicCount=32,resident=16384;} runtimeShape_;
  unsigned s1BaseSize_=2,s2BaseSize_=128,topkCount_=2048,trunkLen_=16384;
@@ -194,12 +194,13 @@ int main(){
   for(unsigned pattern=0;pattern<7;++pattern)for(unsigned seed:{17U,29U})Check(n,pattern,seed,seed%4);
  // Original thresholds with zero/tiny domains and unsupported shapes must
  // bypass without touching dead Cube scratch or starting a DMA.
- for(unsigned mode=0;mode<8;++mode){Model m;m.prefixThreshold_.p[0]=99;unsigned before=dma;
+ for(unsigned mode=0;mode<9;++mode){Model m;m.prefixThreshold_.p[0]=99;unsigned before=dma,calls=selectCalls;
   unsigned end=131072;if(mode==0)m.prefixActive_=true;if(mode==1)m.streamingTopkOnly_=true;
   if(mode==2)m.constInfo_.isLDOpen=true;if(mode==3)m.runtimeShape_.aicCount=31;
   if(mode==4)m.s1BaseSize_=4;if(mode==5)m.constInfo_.mBaseSize=32;
   if(mode==6)end=16000;if(mode==7)m.prefixThreshold_.p[0]=0;
-  assert(!m.TryPrunedFinalTopK(0,0,end)&&dma==before);m.check();
+  if(mode==8)m.noPrefetchRound_=true;
+  assert(!m.TryPrunedFinalTopK(0,0,end)&&dma==before&&selectCalls==calls);m.check();
  }
  // A corrupt/high threshold cannot publish an incomplete final list.
  {Model m;std::fill(m.gm.begin(),m.gm.end(),1);m.prefixThreshold_.p[0]=2;

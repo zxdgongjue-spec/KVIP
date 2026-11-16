@@ -38,6 +38,7 @@ def native_model():
 #define __gm__
 bool cubeMode;
 #define ASCEND_IS_AIC (cubeMode)
+#define ASCEND_IS_AIV (!cubeMode)
 #define PIPE_FIX 0
 #define PIPE_V 0
 template<unsigned M,unsigned P> void CrossCoreWaitFlag(unsigned) {assert(false);}
@@ -84,9 +85,11 @@ struct Vector {
  bool qCredit[2]={true,true},kCredit[2]={true,true};
  int cachedOwner[2]={-1,-1};
  unsigned loads=0,emptyLanes=0,activeQueries=4,lane=0;
+ unsigned residentTopk=0,finalTopk=0,progress=0;
  std::vector<QLICommon::RunInfo> calls;
- void ProcessVec1(QLICommon::RunInfo info,unsigned=0,bool=false,bool=false){
-  calls.push_back(info);
+ std::vector<bool> scoreOnlyCalls;
+ void ProcessVec1(QLICommon::RunInfo info,unsigned=0,bool=false,bool scoreOnly=false){
+  calls.push_back(info);scoreOnlyCalls.push_back(scoreOnly);
   // Same early return as ProcessVec1: an empty AIV participates in CV/VC
   // credits but must not acquire/load any query or scale bank.
   unsigned per=(activeQueries+1)/2;
@@ -108,15 +111,15 @@ struct Vector {
    assert(!kCredit[k]);kCredit[k]=true;
   }
  }
- void ProcessResidentTopK(QLICommon::RunInfo){}
- void PrepareRotationProgress(){}
+ void ProcessResidentTopK(QLICommon::RunInfo){++residentTopk;}
+ void PrepareRotationProgress(){++progress;}
  void RotateFetch(int) {assert(false);}
- void ProcessTopK(QLICommon::RunInfo){}
+ void ProcessTopK(QLICommon::RunInfo){++finalTopk;}
  void drained(){assert(qCredit[0]&&qCredit[1]&&kCredit[0]&&kCredit[1]);}
 };
 struct Model {
  unsigned resident_=16384,aiCoreIdx=0;
- bool rotationServed_=false;
+ bool rotationServed_=false,noPrefetchRound_=false;
  struct {unsigned history=131328,batch=2,resident=16384,splitQ=1,rounds=8,serviceAics=8;} runtimeShape_;
  rotating::Context ctx;
  void* rotationContext_=&ctx;
@@ -182,6 +185,7 @@ int main(){
      assert(c.isLastS2InnerLoop==(i+1==n || i+1==n+end-begin));
      if(i<n)assert(c.retainQuery==true);
      if(i==n && had)assert(c.LoadQuery()==!true);
+     if(!aic)assert(m.vectorService.scoreOnlyCalls[previous+i]==(i<n));
     }
     m.matmulService.drained();m.vectorService.drained();
     m.tempLoopInfo.s2LoopEnd=1025;m.tempLoopInfo.validS2Len=131328;m.splitCoreInfo.s2Start=0;
@@ -195,6 +199,31 @@ int main(){
    if(aic)assert(m.matmulService.loads==expectedLoads*chunks);
    else if(!active || lane*((active+1)/2)>=active)assert(m.vectorService.loads==0);
    else assert(m.vectorService.loads==expectedLoads);
+  }
+ }
+ // A no-prefetch scan visits every history tile, retains exact final TopK,
+ // and keeps both query/scale banks balanced without resident seed work.
+ for(bool aic:{false,true})for(bool sequenceHalf:{false,true}){
+  cubeMode=aic;Model low;low.noPrefetchRound_=true;
+  unsigned loop=0,scale=0,end=low.runtimeShape_.history/128;
+  if(sequenceHalf){
+   low.ScanSequenceHalf(0,end,0,loop,scale,true,false);
+  }else{
+   for(unsigned tile=0;tile<end;++tile,++loop){
+    if(tile%QLICommon::KScaleTiles==0)++scale;
+    QLICommon::RunInfo info;
+    low.ProcessBaseBlock(loop,tile,info,0,scale,false);
+   }
+  }
+  const auto& calls=aic?low.matmulService.calls:low.vectorService.calls;
+  assert(calls.size()==end);
+  for(unsigned tile=0;tile<end;++tile)assert(calls[tile].s2Idx==tile);
+  low.matmulService.drained();low.vectorService.drained();
+  if(!aic){
+   assert(std::all_of(low.vectorService.scoreOnlyCalls.begin(),
+                     low.vectorService.scoreOnlyCalls.end(),[](bool value){return value;}));
+   assert(low.vectorService.residentTopk==0 && low.vectorService.progress==0);
+   assert(low.vectorService.finalTopk==(sequenceHalf?0:1));
   }
  }
  // Null bounds retain exactly the normal query lifetime.

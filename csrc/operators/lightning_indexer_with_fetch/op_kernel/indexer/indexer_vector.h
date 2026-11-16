@@ -40,6 +40,9 @@ template <typename QLIT>
 class QLIVector {
 public:
     rotating::RuntimeShape runtimeShape_;
+    __aicore__ inline void SetNoPrefetchRound(bool enabled) {
+        noPrefetchRound_ = enabled;
+    }
 #if KVIP_PREFETCH_GATE && !(defined(V9_UBMEM) && V9_UBMEM)
     // The separate gate is compiled out of baseline and quota-only builds.
     __aicore__ inline void SetAdmissionControls(uint64_t address) {
@@ -165,6 +168,7 @@ protected:
 
 private:
     GM_ADDR rotationContext_ = nullptr;
+    bool noPrefetchRound_ = false;
 #if KVIP_STREAMING_LI
     GM_ADDR streamingWorkspace_ = nullptr;
     bool streamingTopkOnly_ = false;
@@ -941,7 +945,7 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     // General LI combines score, window service and final TopK in one launch.
     // Wait for mapping publication, not for URMA completion. In sequence-split
     // mode the earlier LI kernels already form the publication boundary.
-    if (!streamingTopkOnly_) {
+    if (!streamingTopkOnly_ && !noPrefetchRound_) {
         auto events=reinterpret_cast<__gm__ rotating::Event*>(ctx->events);
         uint64_t started=GetSystemCycle();
         for(uint32_t i=0;i<runtimeShape_.rounds*runtimeShape_.serviceLanes;++i) {
@@ -1070,7 +1074,7 @@ __aicore__ inline bool QLIVector<QLIT>::TryPrunedFinalTopK(
         // One complete Q2 task per AIC: no later Cube task can overwrite the
         // dead result bank used for block-local u16 offsets. TopK-only phases
         // have no such bank and retain the original path.
-        if (prefixActive_ || streamingTopkOnly_ || constInfo_.isLDOpen ||
+        if (noPrefetchRound_ || prefixActive_ || streamingTopkOnly_ || constInfo_.isLDOpen ||
             s1BaseSize_ != 2 || !runtimeShape_.splitQ ||
             runtimeShape_.batch * 2 != runtimeShape_.aicCount ||
             topkCount_ != 2048 || trunkLen_ != 16384 ||

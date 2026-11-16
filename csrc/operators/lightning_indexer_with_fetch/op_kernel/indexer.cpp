@@ -1,6 +1,7 @@
 #include "kernel_operator.h"
 #if defined(__CCE_AICORE__)
 #include "context.h"
+#include "low_miss_mode.h"
 struct QLITilingData {
     uint32_t bSize,tSize,gSize,s1Size,s2Size,sparseCount,usedCoreNum,blockSize,maxBlockNumPerBatch,sparseMode;
     uint32_t keyStride0=16384,keyDequantScaleStride0=128;
@@ -24,10 +25,17 @@ __aicore__ inline void RunLi(GM_ADDR bindings) {
     using namespace AscendC; using namespace QLICommon;
     auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
 #define P(i) reinterpret_cast<GM_ADDR>(a[i])
-    auto shape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(a[14]));
+    auto ctx = reinterpret_cast<__gm__ rotating::Context*>(a[14]);
+    auto shape = rotating::LoadRuntimeShape(ctx);
+    const bool noPrefetch = rotating::NoPrefetchRound(ctx);
     bool splitSequence = rotating::UseSequenceSplit(shape) && HasUniformLengths(shape, P(5), P(6));
     if constexpr (Phase != SequenceLiPhase::Hot) {
         if (!splitSequence) return;
+    }
+    if constexpr (Phase == SequenceLiPhase::Threshold) {
+        // There is no speculative threshold consumer in an exact-only round.
+        // Return before allocating buffers or issuing any cross-core signals.
+        if (noPrefetch) return;
     }
     TPipe pipe;
     using Type=QLIType<fp8_e4m3fn_t,fp8_e4m3fn_t,int32_t,true,LI_LAYOUT::BSND,LI_LAYOUT::PA_BSND,
@@ -36,12 +44,14 @@ __aicore__ inline void RunLi(GM_ADDR bindings) {
     op.runtimeShape_ = shape;
     op.rotationContext_ = P(14);
     op.sequenceSplit_ = splitSequence;
+    op.noPrefetchRound_ = noPrefetch;
     op.sequenceTopKOnly_ = Phase == SequenceLiPhase::Threshold || Phase == SequenceLiPhase::Final;
     QLITilingData tiling{shape.batch,shape.batch*4,shape.indexHeads,4,shape.history,
         2048,shape.liCores,128,shape.history/128,0,16384,128,shape.resident,
         splitSequence ? 0U : shape.splitQ,shape.aicCount};
     if ASCEND_IS_AIV {
         op.vectorService.SetStreamingWorkspace(P(15));
+        op.vectorService.SetNoPrefetchRound(noPrefetch);
 #if KVIP_PREFETCH_GATE
         op.vectorService.SetAdmissionControls(
             reinterpret_cast<__gm__ rotating::Context*>(a[14])->admissionControls);

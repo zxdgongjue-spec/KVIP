@@ -89,6 +89,7 @@ public:
     rotating::RuntimeShape runtimeShape_;
     bool sequenceSplit_ = false;
     bool sequenceTopKOnly_ = false;
+    bool noPrefetchRound_ = false;
     GM_ADDR rotationContext_ = nullptr;
 private:
     static constexpr uint32_t HEAD_DIM = 128;
@@ -667,7 +668,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
         if ASCEND_IS_AIC {
             matmulService.ComputeMm1(info);
         } else {
-            vectorService.ProcessVec1(info, shard, tile + 1 == end);
+            vectorService.ProcessVec1(info, shard, tile + 1 == end, noPrefetchRound_);
         }
     }
 }
@@ -747,7 +748,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
 
         uint32_t loop = 0, scaleLoop = 0;
         if constexpr (Phase == SequenceLiPhase::Hot) {
-            bool hadRecent = ScoreRecent(loop, 0, shard, 2);
+            bool hadRecent = !noPrefetchRound_ && ScoreRecent(loop, 0, shard, 2);
             uint32_t half = resident_ / (2 * S2_BASE_SIZE);
             ScanSequenceHalf(shard * half, (shard + 1) * half, shard, loop, scaleLoop, true, hadRecent);
         } else {
@@ -756,9 +757,11 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
             uint32_t serviceEpoch = rotating::ServiceRank(runtimeShape_.batch, runtimeShape_.splitQ,
                                                           aiCoreIdx) / runtimeShape_.serviceAics;
             if ASCEND_IS_AIV {
-                vectorService.LoadSequenceSplitThresholds(batch);
-                vectorService.PrepareRotationProgress();
-                if (serviceEpoch == 0) vectorService.RotateFetch(0, halfTokens);
+                if (!noPrefetchRound_) {
+                    vectorService.LoadSequenceSplitThresholds(batch);
+                    vectorService.PrepareRotationProgress();
+                    if (serviceEpoch == 0) vectorService.RotateFetch(0, halfTokens);
+                }
             }
             uint32_t begin = resident_ / S2_BASE_SIZE + shard * half;
             for (uint32_t epoch = 1; epoch < runtimeShape_.rounds; ++epoch, begin += 2 * half) {
@@ -766,7 +769,8 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
                 if (end > runtimeShape_.history / S2_BASE_SIZE) end = runtimeShape_.history / S2_BASE_SIZE;
                 ScanSequenceHalf(begin, end, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
                 if ASCEND_IS_AIV {
-                    if (serviceEpoch == epoch) vectorService.RotateFetch(epoch, halfTokens);
+                    if (!noPrefetchRound_ && serviceEpoch == epoch)
+                        vectorService.RotateFetch(epoch, halfTokens);
                 }
             }
         }
@@ -807,7 +811,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()
         }
         for (uint32_t gS1LoopIdx = splitCoreInfo.gS1Start; gS1LoopIdx <= tempLoopInfo.gS1LoopEnd; gS1LoopIdx++) {
             CalcS2LoopParams(bN2LoopIdx, gS1LoopIdx);
-            bool hadRecent = ScoreRecent(gloop, qScaleLoop);
+            bool hadRecent = !noPrefetchRound_ && ScoreRecent(gloop, qScaleLoop);
             uint32_t kScaleLoop = 0;
             for (int s2LoopIdx = splitCoreInfo.s2Start; s2LoopIdx <= tempLoopInfo.s2LoopEnd; s2LoopIdx++) {
                 if ((s2LoopIdx - splitCoreInfo.s2Start) % QLICommon::KScaleTiles == 0) {
@@ -845,7 +849,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessBaseBlock(uint3
     if ASCEND_IS_AIC {
         matmulService.ComputeMm1(runInfo);
     } else {
-        vectorService.ProcessVec1(runInfo);
+        vectorService.ProcessVec1(runInfo, 0, false, noPrefetchRound_);
     }
     FinishBaseBlock(runInfo);
 }
@@ -853,6 +857,14 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessBaseBlock(uint3
 template <typename QLIT>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::FinishBaseBlock(const QLICommon::RunInfo& runInfo)
 {
+    if (noPrefetchRound_) {
+        // Cube and vector both skip flag 8. The ordinary per-tile CV/VC
+        // handshake remains in ComputeMm1/ProcessVec1, including the last tile.
+        if ASCEND_IS_AIV {
+            if (runInfo.isLastS2InnerLoop) vectorService.ProcessTopK(runInfo);
+        }
+        return;
+    }
     uint32_t s2LoopIdx = runInfo.s2Idx;
     if ASCEND_IS_AIC {
         if (!rotationServed_ && rotating::EpochAt(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.splitQ,runtimeShape_.rounds,runtimeShape_.serviceAics,s2LoopIdx + 1, aiCoreIdx) >= 0) {

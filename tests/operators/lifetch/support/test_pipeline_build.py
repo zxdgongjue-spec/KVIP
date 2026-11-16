@@ -53,7 +53,8 @@ def test_pipeline_options_isolate_and_reuse_the_correct_binary(monkeypatch, tmp_
 
 @pytest.mark.parametrize("value", (1, 0, "OFF", None))
 @pytest.mark.parametrize("option", ("compact_init", "adaptive_admission", "prefetch_gate",
-                                    "skip_exhausted_prefetch", "early_prefetch_drain", "inverse_mapping"))
+                                    "skip_exhausted_prefetch", "early_prefetch_drain", "inverse_mapping",
+                                    "low_miss_skip"))
 def test_pipeline_options_reject_ambiguous_values_before_build(tmp_path, value, option):
     with pytest.raises(ValueError, match="must be bool"):
         build.build_libraries(cache_dir=tmp_path, cann=tmp_path, headers=tmp_path, soc="A5", **{option: value})
@@ -65,6 +66,30 @@ def test_prefetch_gate_requires_admission_before_build(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="prefetch_gate requires adaptive_admission"):
         build.build_libraries(cache_dir=tmp_path, cann=tmp_path, headers=tmp_path, soc="A5", prefetch_gate=True)
     compile_.assert_not_called()
+
+
+def test_low_miss_skip_requires_admission_and_isolates_binary(monkeypatch, tmp_path):
+    calls = []
+
+    def compile_command(command, **kwargs):
+        calls.append(command)
+        if command[1] == "--build":
+            (Path(command[2]) / "libv9_bridge.so").write_bytes(b"fixture")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(build.subprocess, "run", compile_command)
+    args = dict(cache_dir=tmp_path, cann=tmp_path, headers=tmp_path, soc="A5")
+    with pytest.raises(ValueError, match="low_miss_skip requires adaptive_admission"):
+        build.build_libraries(**args, low_miss_skip=True)
+    assert not calls
+    ordinary = build.build_libraries(**args, adaptive_admission=True)
+    light = build.build_libraries(**args, adaptive_admission=True, low_miss_skip=True)
+    assert ordinary != light
+    manifest = json.loads((light[0].parent / "complete.json").read_text())
+    assert manifest["KVIP_LOW_MISS_SKIP"] == "ON"
+    previous = len(calls)
+    assert build.build_libraries(**args, adaptive_admission=True, low_miss_skip=True) == light
+    assert len(calls) == previous
 
 
 @pytest.mark.parametrize("rank", (-1, 2049, True, False, 1536.0, "1536", None))
