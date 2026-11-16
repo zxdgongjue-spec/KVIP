@@ -149,3 +149,5 @@ python tests/experiments/incremental_lifetch/summarize.py \
 `compare_window_topk.sh KVAF_ROOT DEVICE SERVER 16 1 4` 为BS16、miss1%、4个窗口。
 32 AIC预算下，每窗口8个AIC对应16个服务AIV；每个服务AIV处理一个请求的4Q。
 预取总预算仍为512，默认单窗口预算随窗口数从64调整为128。
+
+`summarize.py` 不传路径时默认读取 `tests/results/window-topk-only/` 下最新的实验目录。汇总旧增量实验时，显式传入对应结果目录。

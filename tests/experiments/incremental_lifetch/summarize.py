@@ -189,12 +189,12 @@ def summarize(run, required=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('run', nargs='?', type=Path, help='A/B result directory; default: latest run')
+    parser.add_argument('run', nargs='?', type=Path, help='A/B result directory; default: latest window-topk-only run')
     parser.add_argument('--require-detailed', action='store_true', help='Fail if new A/B trace records are absent')
     args = parser.parse_args()
     run = args.run
     if run is None:
-        root = Path(__file__).resolve().parents[3] / 'tests/results/incremental-lifetch'
+        root = Path(__file__).resolve().parents[3] / 'tests/results/window-topk-only'
         runs = sorted(p for p in root.glob('*') if p.is_dir())
         if not runs:
             parser.error(f'No runs under {root}')
