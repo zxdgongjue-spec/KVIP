@@ -176,6 +176,9 @@ private:
     TBuf<TPosition::VECCALC> rollingBuf_;
     LocalTensor<uint16_t> rollingState_;
     bool rollingReady_[2]{};
+#if KVIP_ROLLING_BATCHED
+    uint32_t rollingPending_[2]{};
+#endif
     uint32_t rollingEnds_[2]{}, rollingBegin_[2]{}, rollingEnd_[2]{};
     __aicore__ inline void PublishRolling(uint32_t query) {
         DataCopyExtParams copy{1, 32, 0, 0, 0};
@@ -191,6 +194,9 @@ private:
                                                 uint32_t residentCount, uint32_t availableEnd) {
 #if KVIP_ROLLING_THRESHOLD
         rollingReady_[query % 2] = false;
+#if KVIP_ROLLING_BATCHED
+        rollingPending_[query % 2] = 0;
+#endif
 #endif
         if constexpr (std::is_same_v<SCORE_T, uint16_t>) {
             auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
@@ -237,6 +243,11 @@ private:
                 kvip_rolling::Seed(reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_.GetPhyAddr()), total,
                     reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_[bank * 128].GetPhyAddr()),
                     reinterpret_cast<__ubuf__ uint16_t*>(rollingState_[bank * kvip_rolling::kStateWords].GetPhyAddr()));
+#if KVIP_ROLLING_BATCHED
+                // Anchor is immutable after seeding; join once rather than
+                // fencing its load at every subsequent 128-score tile.
+                PipeBarrier<PIPE_V>();
+#endif
                 rollingReady_[bank] = true;
                 rollingEnds_[bank] = end; rollingBegin_[bank] = range.begin; rollingEnd_[bank] = range.end;
             }
@@ -781,6 +792,11 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
             rollingMask1 = kvip_rolling::TileMask(curS2Idx, rollingEnds_[1], rollingBegin_[1], rollingEnd_[1]);
         rollingAdvance = rotating::IsTrigger(runtimeShape_.history, runtimeShape_.resident,
                                              runtimeShape_.rounds, info.s2Idx + 1);
+#if KVIP_ROLLING_BATCHED
+        rollingMask0 = kvip_rolling::BatchMask(rollingMask0, rollingPending_[bank], rollingAdvance);
+        if (curAivS1ProcNum == 2)
+            rollingMask1 = kvip_rolling::BatchMask(rollingMask1, rollingPending_[1], rollingAdvance);
+#endif
     }
 #endif
     if (!scoreOnly && curS2Idx >= runtimeShape_.resident) {

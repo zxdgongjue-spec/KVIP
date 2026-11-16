@@ -5,6 +5,12 @@
 #ifndef KVIP_ROLLING_THRESHOLD
 #define KVIP_ROLLING_THRESHOLD 0
 #endif
+#ifndef KVIP_ROLLING_BATCHED
+#define KVIP_ROLLING_BATCHED 0
+#endif
+#if KVIP_ROLLING_BATCHED && !KVIP_ROLLING_THRESHOLD
+#error "Batched histogram requires the rolling threshold"
+#endif
 #ifndef KVIP_WINDOW_REFILTER
 #define KVIP_WINDOW_REFILTER 0
 #endif
@@ -18,7 +24,10 @@
 namespace kvip_rolling {
 constexpr uint32_t kBins = 256, kTop = 2048;
 // A capped reverse CDF plus a broadcast copy of the immutable seed key.
-constexpr uint32_t kStateWords = kBins + 128;
+constexpr uint32_t kCdfWords = kBins + 128;
+constexpr uint32_t kBatchTiles = 8;
+// Eight packed 128-byte score-bin vectors, per Q. No GM scratch or extra DMA.
+constexpr uint32_t kStateWords = kCdfWords + (KVIP_ROLLING_BATCHED ? kBatchTiles * 64 : 0);
 // Progress.end[0..7] is the normal tile publication. [8..15] is padding
 // in the non-sequence schedule and occupies a separate 32-byte DMA stripe.
 constexpr uint32_t kProgressThreshold = 8;
@@ -36,6 +45,12 @@ KVIP_ROLLING_DEVICE inline uint32_t TileMask(uint32_t tile, uint32_t end,
     lo = lo < 128 ? lo : 128;
     hi = hi < 128 ? hi : 128;
     return valid | (lo << 8) | (hi << 16);
+}
+// The low 24 bits retain the causal/seed mask; the high byte is the batch slot.
+KVIP_ROLLING_DEVICE inline uint32_t BatchMask(uint32_t mask, uint32_t& pending, bool advance) {
+    uint32_t packed = mask | (pending << 24);
+    pending = (advance || pending + 1 == kBatchTiles) ? 0 : pending + 1;
+    return packed;
 }
 #undef KVIP_ROLLING_DEVICE
 } // namespace kvip_rolling

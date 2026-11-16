@@ -6,6 +6,8 @@ These cover numerical/visibility contracts, not CANN instruction latency.
 from pathlib import Path
 import subprocess
 
+import pytest
+
 from test_recent_register_kth import register_model_source
 from test_recent_index import function, INDEXER
 
@@ -25,7 +27,9 @@ def execute(tmp_path, source, name):
     subprocess.run([str(binary)], check=True, timeout=60)
 
 
-def test_actual_cdf_saturation_ties_causal_tail_and_seed_dedup(tmp_path):
+@pytest.mark.parametrize("batched", [0, 1])
+@pytest.mark.parametrize("reverse", [0, 1])
+def test_actual_cdf_saturation_ties_causal_tail_and_seed_dedup(tmp_path, batched, reverse):
     model = register_model_source('#include "recent_index.h"')
     model = model[:model.index('#include "recent_threshold.h"')]
     model = model.replace("{DIST_DINTLV_B8}", "{DIST_DINTLV_B8,DIST_BRC_B16}")
@@ -98,23 +102,39 @@ int main(){
   auto seed=truth;seed.resize((seed.size()+255)/256*256,0);
   kvip_rolling::Seed(seed.data(),truth.size(),threshold.data(),storage.data()+16);
   const unsigned end=values.size()-71;
-  unsigned previous=initial;
-  for(unsigned tile=n;tile<values.size();tile+=128){
+  unsigned previous=initial,pending=0,expectedHistograms=0,batchCount=0;
+  histograms=0;
+  std::vector<unsigned> tiles;
+  for(unsigned block=n;block<values.size();block+=2048)tiles.push_back(block);
+  if(REVERSE_TEST)std::reverse(tiles.begin(),tiles.end());
+  unsigned ordinal=0;
+  for(unsigned block:tiles)for(unsigned tile=block;tile<block+2048;tile+=128){
    RegTensor<uint16_t> score;LoadAlign(score,values.data()+tile);
    unsigned mask=kvip_rolling::TileMask(tile,end,recentBegin,recentEnd);
    for(unsigned i=tile;i<std::min(tile+128,end);++i)
     if(i<recentBegin||i>=recentEnd)truth.push_back(values[i]);
-   bool advance=(tile+128)%16384==0;
+   // An odd 137-tile window exercises partial and odd batches, including
+   // reversed block boundaries and the final partial causal tile.
+   bool advance=(++ordinal)%137==0 || ordinal*128==values.size()-n;
+   ++batchCount;
+   if(KVIP_ROLLING_BATCHED){
+    mask=kvip_rolling::BatchMask(mask,pending,advance);
+    if(batchCount==8||advance){expectedHistograms+=2*((batchCount+1)/2);batchCount=0;}
+   }else{expectedHistograms+=2;}
    kvip_rolling::Observe(score,storage.data()+16,threshold.data(),mask,advance);
    if(advance){unsigned exact=kth(truth),expected=std::min(exact,unsigned(initial)+255);
     assert(threshold[0]==expected&&threshold[0]>=previous&&threshold[0]<=exact);
     previous=threshold[0];for(auto key:threshold)assert(key==expected);}
+   assert(threshold[0]==previous);
    for(unsigned bin=0;bin<256;++bin)assert(storage[16+bin]<=2048);
   }
+  assert(histograms==expectedHistograms);
+  if(KVIP_ROLLING_BATCHED)assert(pending==0&&histograms<ordinal*1.05);
   for(unsigned i=0;i<16;++i)assert(storage[i]==0xa55a&&storage[16+kvip_rolling::kStateWords+i]==0xa55a);
  }
 }
 '''
+    source = f"#define KVIP_ROLLING_BATCHED {batched}\n#define REVERSE_TEST {reverse}\n" + source
     execute(tmp_path, source, "rolling_cdf")
 
 

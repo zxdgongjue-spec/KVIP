@@ -2,7 +2,7 @@
 
 This opt-in experiment extends `perf/urma-fused-scan-admission`, based on main
 `532df2c8` plus PR15. It does not change graph routing, KVAF, Index layout, the
-window count, or the final TopK implementation. Both new options default off.
+window count, or the final TopK implementation. All experiment options default off.
 
 ## Why this experiment
 
@@ -92,3 +92,42 @@ the actual last rolling key outside timing. Restore, CPU/H2D input preparation
 and verification are excluded from the device-graph timing; all new seed,
 counting, publication and refilter work is included. No NPU speedup for these
 two additions has been measured locally.
+
+
+## Batched counter update
+
+The measured `bc2266f` five-group run passed the numerical checks but added
+127–136 us of mean graph time for rolling thresholds. G7/G17 wasted bytes fell
+21.72%/25.10%, while total bytes fell only 2.82%/3.64%. Refilter recovered
+15–28 us but did not beat the no-rolling baseline. G2 traffic did not change;
+its refilter timing gain cannot be explained by reduced reads alone. The
+forward-repeat mean drift ranged from -0.35% to +0.44% (p50 -0.11% to +0.64%).
+These options remain experiments, not enabled performance defaults.
+
+`KVIP_ROLLING_BATCHED` keeps the same thresholds, scan order, candidates and
+publication boundaries. It changes only how the counts are accumulated:
+
+- Encode each live 128-score tile into 128 bin bytes in dedicated UB scratch.
+- Flush every eight tiles, or immediately at a native window boundary. A
+  partial batch cannot delay the boundary threshold or last-tile classification.
+- Load the CDF once per batch. Feed two packed tiles (256 lanes) to each
+  histogram instruction, retaining CDF registers across the batch.
+- Saturate once at the end: previous count <=2048 plus <=1024 observations is
+  safe in uint16. Saturated addition is associative, including BF16 ties.
+
+For a full batch this halves histogram instructions, reduces CDF loads/stores
+and its store/load fence to one eighth, and adds 128 bytes of UB writes/reads
+per tile. The two-query AIV gains 2 KiB of scratch after existing allocations;
+there are no new HBM transfers, launches, peer barriers or Index calculations.
+The immutable seed is fenced once after initialization. Final TopK and the
+512/64 admission limits are unchanged. Partial-batch overhead means the exact
+instruction savings depend on native window lengths.
+
+Host lane tests execute the real native helper in forward/reverse block order,
+with odd 137-tile window boundaries, seed deduplication, partial causal tiles,
+large histories, range overflow and ties. They check every window against an
+independent exact Kth and count histogram calls. Device speed remains to be
+measured, since additional branching/register pressure can offset savings.
+The controlled replay retains the previous `reverse-refilter` implementation
+and compares it against `reverse-batch-ref` in the same restored arena, plus
+no-rolling and forward-repeat controls. All batching cost is inside timing.
