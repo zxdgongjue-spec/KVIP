@@ -50,6 +50,6 @@ cmake --build /absolute/new/build --target staged_routes -j2
 
 CPU验证包含全部42标准规格、精确Q/H覆盖、物理预算、B24/32 Index ABI、公共Forward和旧融合/UBmem入口、动态owner、共享score与profiling events。CPU/mock不能替代device验证。
 
-Model功能烟测采用H8192/R6144/G32、每Q miss205、C4/V16/W2，同一fixture覆盖B1/history、B1/BSQ、B3/BSQ。B3覆盖两score waves和两个owner waves。driver核验真实score、全resident θ、Final集合、dedup、Index四字段置换、hot656B payload、guards和completion。原始源码/binary/config/fixture/log hash与结果摘要见 `results/score-integration-validation.json`。
+Model功能烟测采用H8192/R6400/G32、每Q miss205、C4/V16/W2，同一fixture覆盖B1/history、B1/BSQ、B3/BSQ。B3覆盖两score waves和两个owner waves。driver核验真实score、全resident θ、Final集合、dedup、Index四字段置换、hot656B payload、guards和completion。原始源码/binary/config/fixture/log hash与结果摘要见 `results/score-integration-validation.json`。
 
 Model中prefetch预算为0，最终BatchGet使用受控同步GM-copy；它不证明真实URMA/CQE/DMA、非零prefetch异步正确性或真机速度。完整42场景Model矩阵以及NPU/KVAF整链验收仍pending；新路径不设为默认。本文没有将独立TopK测量当score或整链提速证据。

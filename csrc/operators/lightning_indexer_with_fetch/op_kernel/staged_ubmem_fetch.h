@@ -141,7 +141,7 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,
  }
  if(profile)trace[13]=GetSystemCycle();
  Simt::VF_CALL<PublishQueryCompletion>(Simt::Dim3{256,1,1},ctx,flags,shape.batch,
-   shape.resident,shape.finalPostOffset,q,lane,workers,error,completed);
+   shape.resident,shape.finalPostOffset,q,lane,workers,error,completed,0,shape.batch);
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  if(profile)trace[14]=trace[15]=GetSystemCycle();
  if(profile)for(uint32_t b=lane;b<shape.batch;b+=workers){

@@ -677,6 +677,7 @@ extern "C" __global__ __aicore__ void v9_native_fetch_only(GM_ADDR arg,GM_ADDR r
 
 #endif
 
+#if !V9_UBMEM
 // Opt-in whole-owner waves preserve the four-query union and all tail joins.
 // Same-stream launch boundaries protect shared packing counters between waves.
 extern "C" __global__ __aicore__ void v9_staged_clear_packed(GM_ADDR arg) {
@@ -707,3 +708,4 @@ extern "C" __global__ __aicore__ void v9_streaming_owner_wave(GM_ADDR arg,uint32
  }
 #endif
 }
+#endif
