@@ -179,10 +179,11 @@ private:
     uint32_t rollingEnds_[2]{}, rollingBegin_[2]{}, rollingEnd_[2]{};
     __aicore__ inline void PublishRolling(uint32_t query) {
         DataCopyExtParams copy{1, 32, 0, 0, 0};
-        GlobalTensor<uint16_t> output;
-        output.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(rotationProgressGm_.GetPhyAddr())
-                               + query * 64 + kvip_rolling::kProgressThreshold * 2);
-        DataCopyPad(output, prefixThreshold_[(query % 2) * 128], copy);
+        // Keep the existing writable GM tensor. GetPhyAddr() returns const;
+        // the two 256-byte UB banks can instead be viewed as u32 for this copy.
+        auto thresholds = prefixThreshold_.template ReinterpretCast<uint32_t>();
+        DataCopyPad(rotationProgressGm_[query * 32 + kvip_rolling::kProgressThreshold],
+                    thresholds[(query % 2) * 64], copy);
     }
 #endif
     GM_ADDR scoreStorage_ = nullptr;

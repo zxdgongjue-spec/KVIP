@@ -156,3 +156,54 @@ int main(){
 }
 '''
     execute(tmp_path, source, "rolling_refilter")
+
+
+def test_actual_threshold_publication_uses_writable_tensor_and_only_its_stripe(tmp_path):
+    publish = function((INDEXER / "indexer_vector.h").read_text(),
+                       "    __aicore__ inline void PublishRolling(")
+    source = r'''
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+#define __aicore__
+#define __gm__
+#include "rolling_threshold.h"
+template<class T> struct LocalTensor {
+ T* p;unsigned n;
+ LocalTensor operator[](unsigned i)const{assert(i<=n);return {p+i,n-i};}
+ template<class U> LocalTensor<U> ReinterpretCast()const {
+  assert(uintptr_t(p)%alignof(U)==0);return {reinterpret_cast<U*>(p),unsigned(n*sizeof(T)/sizeof(U))};}
+};
+template<class T> struct GlobalTensor {
+ T* p;unsigned n;
+ // Match the const GM address exposed by CANN, not a permissive T* stub.
+ const T* GetPhyAddr()const{return p;}
+ GlobalTensor operator[](unsigned i)const{assert(i<=n);return {p+i,n-i};}
+};
+struct DataCopyExtParams{unsigned blockCount,blockLen,srcStride,dstStride,rsv;};
+template<class T> void DataCopyPad(GlobalTensor<T> dst,LocalTensor<T> src,DataCopyExtParams copy){
+ assert(copy.blockCount==1&&copy.blockLen==32&&!copy.srcStride&&!copy.dstStride);
+ assert(copy.blockLen<=dst.n*sizeof(T)&&copy.blockLen<=src.n*sizeof(T));
+ std::memcpy(dst.p,src.p,copy.blockLen);
+}
+struct Kernel {
+ GlobalTensor<uint32_t> rotationProgressGm_;
+ LocalTensor<uint16_t> prefixThreshold_;
+''' + publish + r'''
+};
+int main(){
+ std::array<uint32_t,64*32+32> gm;
+ alignas(32) std::array<uint32_t,128> ub;
+ std::fill_n(ub.data(),64,0x12341234U);std::fill_n(ub.data()+64,64,0x56785678U);
+ Kernel kernel{{gm.data()+16,64*32},{reinterpret_cast<uint16_t*>(ub.data()),256}};
+ for(unsigned query=0;query<64;++query){
+  gm.fill(0xa55aa55aU);kernel.PublishRolling(query);
+  unsigned begin=16+query*32+kvip_rolling::kProgressThreshold;
+  for(unsigned i=0;i<gm.size();++i)
+   assert(gm[i]==(i>=begin&&i<begin+8?ub[(query%2)*64]:0xa55aa55aU));
+ }
+}
+'''
+    execute(tmp_path, source, "rolling_publication")
