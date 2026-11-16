@@ -44,6 +44,7 @@ extern "C" __global__ __aicore__ void window_model(GM_ADDR context,GM_ADDR timin
 #if defined(__CCE_AICORE__)
  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
  if ASCEND_IS_AIV {
+ uint64_t options=reinterpret_cast<__gm__ uint64_t*>(timing)[7];
  TPipe pipe;Adapter a;TBuf<TPosition::VECCALC> input,ids,values,old,scratch,map,meta,liLive;
  a.rotationContext_=context;a.runtimeShape_=rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(context));
  pipe.InitBuffer(liLive,90624);a.topkOp_.Init(2048,8192);
@@ -52,11 +53,11 @@ extern "C" __global__ __aicore__ void window_model(GM_ADDR context,GM_ADDR timin
  a.incrementalMetadata_=meta.Get<uint64_t>();a.mrgValueLocal_=input.Get<uint16_t>();a.indicesOutLocal_=ids.Get<uint32_t>();
  a.scoreOutLocal_=values.Get<uint16_t>();a.incrementalOld_=old.Get<uint32_t>();a.incrementalNew_=map.Get<uint16_t>();a.topkSharedTmpLocal_=scratch.Get<uint32_t>();
  a.topkOp_.InitBuffers(a.topkSharedTmpLocal_,a.indicesOutLocal_);
- pipe.InitBuffer(a.incrementalInputBuf_,a.kIncrementalInputBytes);a.incrementalInput_=a.incrementalInputBuf_.Get<uint16_t>();a.incrementalPipeline_=true;
+ pipe.InitBuffer(a.incrementalInputBuf_,a.kIncrementalInputBytes);a.incrementalInput_=a.incrementalInputBuf_.Get<uint16_t>();a.incrementalPipeline_=(options&2)==0;
  PipeBarrier<PIPE_ALL>();uint64_t t0=GetSystemCycle();
  a.AdvanceWindow(1,8192);
  PipeBarrier<PIPE_ALL>();uint64_t t1=GetSystemCycle();
- rotating::FastService<true>(2,131072,16384,8,1,656,256,240,1,23808,context,1,0,0,a.topkSharedTmpLocal_,a.mrgValueLocal_,a.indicesOutLocal_,8192);
+ if(!(options&1))rotating::FastService<true>(2,131072,16384,8,1,656,256,240,1,23808,context,1,0,0,a.topkSharedTmpLocal_,a.mrgValueLocal_,a.indicesOutLocal_,8192);
  PipeBarrier<PIPE_ALL>();uint64_t t2=GetSystemCycle();
  auto result=reinterpret_cast<__gm__ uint64_t*>(timing);result[0]=t0;result[1]=t1;result[2]=t2;
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(result),64);
@@ -91,6 +92,9 @@ def main():
     parser.add_argument('--cann-root', type=Path, default=Path('/usr/local/Ascend/cann'))
     parser.add_argument('--soc', default='Ascend950PR_9599')
     parser.add_argument('--prepare-only', action='store_true')
+    parser.add_argument('--max-b-topk-cycles', type=int, default=36000,
+                        help='B incremental window must be below this cycle count (20 us at 1.8 GHz)')
+    parser.add_argument('--stress', action='store_true', help='Also check B with sparse/dense candidates, unequal progress and no preloading')
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -108,7 +112,10 @@ def main():
         methods = (op / 'op_kernel/indexer/incremental_methods.h').read_text()
         methods = methods[:methods.index('__aicore__ inline void FinalIncremental')]
         (case / 'actual_methods.h').write_text(methods)
-        (case / 'kernel.cpp').write_text(KERNEL)
+        kernel = KERNEL
+        if (op / 'op_kernel/indexer/window_fast_vector.h').exists():
+            kernel = kernel.replace('#include "incremental_vector_helpers.h"', '#include "incremental_vector_helpers.h"\n#include "window_fast_vector.h"')
+        (case / 'kernel.cpp').write_text(kernel)
         (case / 'main.cpp').write_text((here / 'window_model_host.cpp').read_text())
         (case / 'CMakeLists.txt').write_text(CMAKE.replace('@OP@', str(op)).replace('@KVAF@', str(args.kvaf_root.resolve() / 'access_operator/demo/aiv_batch_get/include')))
         if args.prepare_only:
@@ -129,10 +136,22 @@ def main():
         if not match or 'PASS unchanged progress' not in log:
             raise RuntimeError(f'Incomplete model checks: {case}')
         results[label] = {name: int(value) for name, value in re.findall(r'(\w+)=(\d+)', match[1])}
+    if args.stress and not args.prepare_only:
+        case = output / 'b'
+        for label, extra in (('stress', []), ('stress-no-preload', ['--no-preload'])):
+            trace = case / label
+            trace.mkdir()
+            with (case / f'{label}.log').open('w') as log:
+                subprocess.run([str(case / 'build/window_model'), '--stress', *extra],
+                               cwd=trace, env=env, check=True, stdout=log, stderr=subprocess.STDOUT)
+            print('\n'.join(line for line in (case / f'{label}.log').read_text().splitlines()
+                            if line.startswith(('PASS', 'CYCLES'))), flush=True)
     if results:
         (output / 'result.json').write_text(json.dumps(results, indent=2) + '\n')
         a, b = results['a']['total'], results['b']['total']
         print(f'TopK + prefetch cycles: A={a} B={b}; reduction={(a-b)/a*100:.2f}%', flush=True)
+        if results['b']['topk'] >= args.max_b_topk_cycles:
+            raise RuntimeError(f"B incremental window exceeded target: {results['b']['topk']} cycles")
         if b >= a:
             raise RuntimeError('Fusion did not beat serial window processing')
     print(f'Results: {output}')

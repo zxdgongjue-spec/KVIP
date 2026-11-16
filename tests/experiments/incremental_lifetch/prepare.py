@@ -205,6 +205,14 @@ def main():
                 '    exportWindowCold_=epoch!=0;\n    incrementalCalls_=0;incrementalScanned_=0;incrementalCandidates_=0;')
             code=code.replace('    // The producer\'s progress lookup table',
                 '    exportWindowCold_=false;\n    // The producer\'s progress lookup table')
+            # Keep A frozen; B uses the same state ABI and TopK primitive with
+            # batched progress loads, sparse tile compaction and overlapped output.
+            tail = code[code.index('__aicore__ inline void FinalIncremental'):]
+            code = Path(__file__).with_name('window_fast.h').read_text() + tail
+            shutil.copyfile(Path(__file__).with_name('window_fast_vector.h'),
+                            vector.parent / 'window_fast_vector.h')
+            replace(vector, '#include "incremental_vector_helpers.h"',
+                    '#include "incremental_vector_helpers.h"\n#include "window_fast_vector.h"')
             methods.write_text(code)
             prefetch.write_text(source)
             for name in ('topk_candidates.h','topk_candidate_service.h'):
