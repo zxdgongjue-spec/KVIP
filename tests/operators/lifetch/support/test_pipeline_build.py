@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Different native experiments must never reuse one another's cached binary."""
 
+import fcntl
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -175,3 +177,106 @@ def test_prefetch_rank_requires_gate_and_isolates_binary(monkeypatch, tmp_path):
         count = len(calls)
         assert build.build_libraries(**args, prefetch_gate=True, prefetch_rank=rank) == result
         assert len(calls) == count
+
+
+def test_interrupted_build_cleans_only_failed_variant_without_replacing_lock(monkeypatch, tmp_path):
+    cache = tmp_path / "cache"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep").write_text("not a build artifact")
+    directory = None
+    attempt = 0
+    lock_inode = None
+
+    def compile_command(command, **kwargs):
+        nonlocal directory, attempt, lock_inode
+        build_dir = Path(command[2] if command[1] == "--build" else command[command.index("-B") + 1])
+        assert len(kwargs["pass_fds"]) == 1
+        assert os.fstat(kwargs["pass_fds"][0]).st_ino == (build_dir / "build.lock").stat().st_ino
+        if command[1] != "--build":
+            if attempt:
+                assert not (directory / "preprocess").exists()
+                assert not (directory / "outside-link").exists()
+                assert not (directory / "libv9_bridge.so").exists()
+                assert (directory / "build.lock").stat().st_ino == lock_inode
+                with (directory / "build.lock").open() as probe:
+                    with pytest.raises(BlockingIOError):
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return SimpleNamespace(returncode=0)
+        directory = Path(command[2])
+        attempt += 1
+        if attempt == 1:
+            lock_inode = (directory / "build.lock").stat().st_ino
+            stale = directory / "preprocess"
+            stale.mkdir()
+            (stale / "indexer.cpp.o").touch()
+            (stale / "build.stamp").touch()
+            (directory / "libv9_bridge.so").touch()
+            (directory / "outside-link").symlink_to(outside, target_is_directory=True)
+            return SimpleNamespace(returncode=2)
+        (directory / "libv9_bridge.so").write_bytes(b"rebuilt fixture")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(build.subprocess, "run", compile_command)
+    args = dict(cache_dir=cache, cann=tmp_path, headers=tmp_path / "headers", soc="A5")
+    with pytest.raises(RuntimeError, match="compile/link failed"):
+        build.build_libraries(**args)
+    assert not (directory / "complete.json").exists()
+    neighbor = cache / "other-variant"
+    neighbor.mkdir()
+    (neighbor / "keep").write_text("valid cached binary")
+    result = build.build_libraries(**args)
+    assert result[0].read_bytes() == b"rebuilt fixture"
+    assert (neighbor / "keep").read_text() == "valid cached binary"
+    assert (outside / "keep").read_text() == "not a build artifact"
+    assert (directory / "build.lock").stat().st_ino == lock_inode
+    assert build.build_libraries(**args) == result
+    assert attempt == 2
+
+
+@pytest.mark.parametrize("invalid", ("missing", "truncated", "different_options", "empty_library"))
+def test_invalid_complete_record_rebuilds_instead_of_reusing_binary(monkeypatch, tmp_path, invalid):
+    calls = []
+
+    def compile_command(command, **kwargs):
+        calls.append(command)
+        if command[1] == "--build":
+            (Path(command[2]) / "libv9_bridge.so").write_bytes(b"fixture")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(build.subprocess, "run", compile_command)
+    args = dict(cache_dir=tmp_path / "cache", cann=tmp_path, headers=tmp_path / "headers", soc="A5")
+    (library,) = build.build_libraries(**args)
+    marker = library.parent / "complete.json"
+    expected = json.loads(marker.read_text())
+    if invalid == "missing":
+        marker.unlink()
+    elif invalid == "truncated":
+        marker.write_text('{"RUN_MODE":')
+    elif invalid == "different_options":
+        marker.write_text(json.dumps(dict(expected, SOC_VERSION="wrong")))
+    else:
+        library.write_bytes(b"")
+    assert build.build_libraries(**args) == (library,)
+    assert len(calls) == 4
+    assert json.loads(marker.read_text()) == expected
+    assert library.stat().st_size > 0
+    assert not list(library.parent.glob(".complete-*"))
+
+
+def test_complete_marker_is_published_atomically(monkeypatch, tmp_path):
+    replace = Path.replace
+    observed = []
+
+    def publish(path, destination):
+        assert path.name.startswith(".complete-")
+        assert not destination.exists()
+        assert json.loads(path.read_text()) == {"SOC_VERSION": "A5"}
+        observed.append(path)
+        return replace(path, destination)
+
+    monkeypatch.setattr(Path, "replace", publish)
+    build._publish_complete(tmp_path, {"SOC_VERSION": "A5"})
+    assert len(observed) == 1
+    assert json.loads((tmp_path / "complete.json").read_text()) == {"SOC_VERSION": "A5"}
+    assert not list(tmp_path.glob(".complete-*"))

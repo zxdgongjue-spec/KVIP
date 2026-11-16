@@ -5,7 +5,9 @@ import fcntl
 import hashlib
 import json
 import logging
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -35,6 +37,38 @@ def build_failure(log, stage, returncode):
     return RuntimeError(
         f"LIFetch {stage} failed (exit={returncode}); full log: {log}\n--- build diagnostic ---\n{excerpt}"
     )
+
+
+def _cache_complete(directory, libraries, options):
+    try:
+        recorded = json.loads((directory / "complete.json").read_text())
+        return recorded == options and all(path.is_file() and path.stat().st_size > 0 for path in libraries)
+    except (OSError, ValueError):
+        return False
+
+
+def _clear_incomplete(directory):
+    """Under build.lock, discard only this variant's interrupted build outputs."""
+    for path in directory.iterdir():
+        # Keep the inode: another builder may already be waiting on this lock.
+        if path.name == "build.lock":
+            continue
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+
+def _publish_complete(directory, options):
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=directory, prefix=".complete-", delete=False) as output:
+            temporary = Path(output.name)
+            output.write(json.dumps(options, indent=2) + "\n")
+        temporary.replace(directory / "complete.json")
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def build_libraries(
@@ -126,7 +160,8 @@ def build_libraries(
     logging.getLogger("kvip").info("Universal LIFetch build: soc=%s log=%s", soc, log)
     with (directory / "build.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if not (directory / "complete.json").is_file() or not all(p.is_file() for p in libraries):
+        if not _cache_complete(directory, libraries, options):
+            _clear_incomplete(directory)
             with log.open("w") as output:
                 source = root / "lightning_indexer_with_fetch"
                 for command in (
@@ -135,12 +170,16 @@ def build_libraries(
                 ):
                     output.write(json.dumps(command) + "\n")
                     output.flush()
-                    result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT, check=False)
+                    # Keep the same lock alive if the Python parent is killed
+                    # while CMake is still writing this variant's artifacts.
+                    result = subprocess.run(
+                        command, stdout=output, stderr=subprocess.STDOUT, check=False, pass_fds=(lock.fileno(),),
+                    )
                     if result.returncode:
                         output.flush()
                         stage = "compile/link" if command[1] == "--build" else "configure"
                         raise build_failure(log, stage, result.returncode)
-            if not all(p.is_file() for p in libraries):
+            if not all(p.is_file() and p.stat().st_size > 0 for p in libraries):
                 raise RuntimeError(f"LIFetch build did not produce the required libraries; see {log}")
-            (directory / "complete.json").write_text(json.dumps(options, indent=2) + "\n")
+            _publish_complete(directory, options)
     return libraries
