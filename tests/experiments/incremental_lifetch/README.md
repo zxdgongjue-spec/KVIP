@@ -255,3 +255,66 @@ python tests/experiments/incremental_lifetch/model_window.py \
 固定的 8Q/每 Q 新增 16384 位置、12 个候选用例，B 的增量窗口必须低于 36000 cycles，
 即该模型时钟下的 20 µs；超出则脚本报错。这一门槛不适用于稠密边界测试或更大的窗口。
 真机仍使用上面的 `compare_topk_prefetch.sh`，保留完整图及 level3 打点。
+
+### 已知性能问题：10% miss 的增量 TopK 未达到 20 µs
+
+2026-11-16 真机结果：BS16、Q4、H131072/R16384、4 个窗口、miss=10%。
+每个窗口有 16 个服务 lane，每 lane 负责一个请求的 4Q；所有窗口均执行，无跳过。
+结果目录：`tests/results/topk-prefetch/20261116_201826_2123380`。
+A 为位图预取，B 为最新 TopK 合并预取；两者均使用中间及最终增量 TopK，A 不是原始主线。
+
+**B 在该场景未达到增量处理低于 20 µs 的性能指标，问题尚未解决。**
+Incremental 区间包含增量 TopK、cold-ID 导出和窗口控制，不包含后续预取服务。
+下表为已执行 lane 事件的平均值/最大值，单位 µs。
+
+| 窗口 | A 增量处理 | B 增量处理 | B 每 Q 平均增量候选数 | A 预取服务 | B 预取服务 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 31.31 / 35.44 | 35.13 / 38.99 | 246.81 | 15.18 | 11.58 |
+| 2 | 29.08 / 34.60 | 32.50 / 47.84 | 99.89 | 14.27 | 9.50 |
+| 3 | 31.90 / 42.76 | 31.48 / 37.00 | 68.72 | 12.74 | 8.54 |
+
+最终 TopK 每 Q 平均计算时间 A/B 为 4.50/6.77 µs，最大值为 6.25/9.39 µs；
+两者每轮均调用 64 次，显式等待均约 0.53 µs。该计算区间包括输入、压缩、合并及 ID 恢复。
+LI 的 profiled 平均耗时 A/B 为 277.34/277.32 µs，未体现预期的约 15 µs 收益。
+完整图 mean 为 649.94/518.61 µs，B 相对 A 降低 20.21%，但比自身串行参考
+500.73 µs 慢 3.57%；后半段 profiled 耗时由 331.56 降至 194.50 µs。
+
+此前 19.41 µs 仅来自单 AIV、8Q、每 Q 新增 16384 分数且 12 个候选的固定仿真用例，
+不能作为该真机场景已达标的证据。本次每 Q 平均扫描约 29636～35838 个分数；
+每核总扫描量仍与该模型接近，不能单凭每 Q 序列变长解释差异。
+
+待验证的实现原因：稀疏路径以“非空 128-score 块数 × 128”估算候选容量上界。
+少量候选分散在多个块时，也可能超出容量判断，先标记非空块再回退到全段 Count/Compact，
+产生重复扫描。当前日志没有该分支触发计数，因此尚未确认其对差值的贡献。
+后续需核对分支次数、扫描/压缩耗时以及最终 TopK 的额外开销；本次仅记录问题，不修改算子。
+
+### 当前 B 与 B＋近期 ABC Index 提前计分
+
+```bash
+bash tests/experiments/incremental_lifetch/compare_recent.sh \
+  /vllm-workspace/vllm-ascend/third_party/KVAF \
+  4 127.0.0.1:28885 16 10 4 384
+python tests/experiments/incremental_lifetch/summarize.py --experiment recent-index --require-detailed
+```
+
+参数依次为 KVAF 路径、设备、服务地址、BS、miss%、窗口数、近期 Index 长度。
+默认 BS16、miss10%、4 窗口、384 个近期位置；近期长度支持 128～2048 的 128 倍数。
+输出位于 `tests/results/recent-index/<时间>/`，脚本结束自动生成 `key_results.log`。
+
+- A：当前 TopK 合并预取 B，代码保持不变；不再使用旧的位图预取 A。
+- B：A 加 PR15 (`4385ac7`) 的近期 Index 提前计分、Q/scale 复用和精确 TopK 合并。
+  当前增量路径需要完整初始 TopK 分数和 ID，因此复用 PR15 的精确合并分支，
+  不采用仅返回 Kth、没有完整 TopK 列表的快速分支。
+- 近期范围固定为 `[history-recent_tokens, history)`，再按每 Q 因果边界裁剪。
+  这是合成负载上的 Index-only 对比；A/B 的 KV 驻留状态、数据、总预取预算和窗口配置一致，
+  不把这段 KV 人为变为本地命中，不模拟 vLLM 的 ABC 环形区推进或真实 `threshold_bounds`。
+- 提前合并的近期 token 在后续增量处理中只屏蔽本地位图，防止重复进入 TopK；
+  原始 GM 位图、分数计算、Resolver/Index update/Fetch 保持原路径。
+- 保留完整图串行参考、正确性检查、逐窗口增量/服务时间、最终 TopK 等待/计算以及读取量统计。
+  `recent_experiment.json` 保存范围、PR 来源和 A 的 kernel 文件校验值。
+
+生产源码不变：`prepare_recent.py` 先生成当前 B 的隔离副本，再仅在实验 B 应用
+`recent_seed.patch` 和 `recent_seed.h`。不扩展生产 Context ABI，不改 KVAF。
+本地已核对 A 与当前 B 逐文件一致、脚本生成的 B 与编译输入一致，并通过 CANN 9.1
+Ascend950PR_9599 完整设备编译；30 组 CPU 集合模型检查覆盖近期长度、因果裁剪及重复 ID。
+真机正确性与性能由以上 A/B 命令验证，本地编译及集合检查不代表真机通过。

@@ -109,6 +109,12 @@ def detailed_trace(report, path, label, required=False):
 def summarize(run, required=False):
     cases = {v: load_cases(run / v) for v in ('baseline', 'incremental')}
     lines = [f'Run: {run}', 'A=baseline; B=incremental. Time: us; positive reduction means faster.']
+    if (run / 'experiment.txt').exists() and (run / 'experiment.txt').read_text().strip() == 'recent-index':
+        manifest = json.loads((run / 'incremental-source/recent_experiment.json').read_text())
+        lines[1] = 'A=current TopK-prefetch B; B=A + PR15 recent Index seed. Time: us.'
+        lines += [f"Recent range=[{manifest['recent_begin']},{manifest['recent_end']}); per-Q causal clipping.",
+                  'Identical KV residency/input; Index-only early scoring, exact seed merge, no duplicate admission on later scan.',
+                  'Incremental windows/final TopK, original correctness checks and level3 timing retained.']
     if (run / 'experiment.txt').exists() and (run / 'experiment.txt').read_text().strip() == 'window-topk-only':
         lines[1] = 'A=original LIFetch; B=original LIFetch + private window TopK only. Time: us.'
         lines += ['Same seed initialization and profiling in A/B; intermediate results do not affect prefetch or final TopK.']
@@ -197,11 +203,14 @@ def summarize(run, required=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('run', nargs='?', type=Path, help='A/B result directory; default: latest window-topk-only run')
+    parser.add_argument('--experiment', default='window-topk-only',
+                        choices=('window-topk-only', 'final-topk-only', 'topk-prefetch', 'recent-index'),
+                        help='Result family to search when run is omitted')
     parser.add_argument('--require-detailed', action='store_true', help='Fail if new A/B trace records are absent')
     args = parser.parse_args()
     run = args.run
     if run is None:
-        root = Path(__file__).resolve().parents[3] / 'tests/results/window-topk-only'
+        root = Path(__file__).resolve().parents[3] / 'tests/results' / args.experiment
         runs = sorted(p for p in root.glob('*') if p.is_dir())
         if not runs:
             parser.error(f'No runs under {root}')
