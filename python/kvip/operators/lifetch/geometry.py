@@ -1,5 +1,24 @@
 """Native Q4/Q2 geometry scaled to the active logical device's AIC budget."""
 
+import struct
+
+
+def checkpoint_topk_options(topk_checkpoints=(), reuse_checkpoint_topk=False):
+    windows = tuple(topk_checkpoints)
+    if (len(windows) > 6 or any(not isinstance(window, int) or not 1 <= window <= 30 for window in windows)
+            or windows != tuple(sorted(set(windows)))):
+        raise ValueError("topk_checkpoints requires up to six distinct increasing cold window indices in 1..30")
+    if reuse_checkpoint_topk and not windows:
+        raise ValueError("reuse_checkpoint_topk requires at least one checkpoint")
+    return struct.pack("<4I", 0, sum(1 << window for window in windows),
+                       int(bool(reuse_checkpoint_topk)), 0)
+
+
+def check_checkpoint_windows(options, rounds):
+    _, mask, _, _ = struct.unpack("<4I", options)
+    if mask and mask >> max(0, rounds - 1):
+        raise ValueError(f"TopK checkpoints must precede the final effective window ({rounds - 1})")
+
 
 def prefetch_budget(prefetch_limit=512, window_limit=None, intermediate_fetches=8):
     """Limit speculative fetches only; final TopK repair has its own capacity."""

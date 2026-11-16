@@ -5,7 +5,7 @@ import ctypes
 
 import numpy as np
 
-from kvip.operators.lifetch.geometry import final_aivs, li_geometry, prefetch_budget
+from kvip.operators.lifetch.geometry import check_checkpoint_windows, checkpoint_topk_options, final_aivs, li_geometry, prefetch_budget
 from kvip.operators.lifetch.tiling import RuntimeShape
 from kvip.operators.lifetch.workspace import device_words, ubmem_rotation_spec
 
@@ -29,7 +29,10 @@ class UbmemBinding:
         scratch=None,
         prefetch_limit=512,
         window_limit=None,
+        topk_checkpoints=(),
+        reuse_checkpoint_topk=False,
     ):
+        topk_options = checkpoint_topk_options(topk_checkpoints, reuse_checkpoint_topk)
         if not 1 <= shape.batch <= 16:
             raise ValueError(f"LIFetch supports BS1..16; received BS={shape.batch}; no legacy fallback")
         self.torch, self.lease, self.shape = torch, lease, shape
@@ -41,12 +44,13 @@ class UbmemBinding:
             raise ValueError("UBmem inputs must be contiguous on one NPU")
         version = self.library.kvip_ubmem_abi_version
         version.argtypes, version.restype = [], ctypes.c_uint32
-        if version() != 3:
-            raise ValueError("UBmem fusion ABI 3 is required")
+        if version() != 5:
+            raise ValueError("UBmem fusion ABI 5 is required")
         if lease.context["token_bytes"] != shape.token_bytes or lease.context["tokens_per_block"] != 128:
             raise ValueError("UBmem kernel and KVAF slot geometry differ")
         prefetch_limit, window_limit = prefetch_budget(prefetch_limit, window_limit, shape.intermediate_fetches)
         self.prefetch_limit = prefetch_limit
+        self.window_limit = window_limit
         geometry = li_geometry(shape.batch, "auto", shape.intermediate_fetches, shape.aic_count)
         self.rounds, self.service_lanes = geometry["intermediate_fetches"], geometry["service_aivs_per_window"]
         self.final_workers = final_aivs(shape.batch, "auto", shape.aic_count)
@@ -59,7 +63,9 @@ class UbmemBinding:
             self.runtime_shape.liCores) != (self.rounds, self.service_lanes, self.final_workers,
                                            geometry["rotating_aic"]):
             raise ValueError("UBmem runtime scheduling mismatch")
-        for name, expected in (("context_bytes", 336), ("region_bytes", 128), ("status_bytes", 128)):
+        check_checkpoint_windows(topk_options, self.runtime_shape.rounds)
+        self.checkpoint_window_mask = int.from_bytes(topk_options[4:8], "little")
+        for name, expected in (("context_bytes", 352), ("region_bytes", 128), ("status_bytes", 128)):
             function = getattr(self.library, "kvip_ubmem_" + name)
             function.argtypes, function.restype = [], ctypes.c_uint32
             if function() != expected:
@@ -158,9 +164,10 @@ class UbmemBinding:
                 np.asarray([prefetch_limit, window_limit], dtype="<u4").view("u1"),
                 np.asarray(extra, dtype="<u8").view("u1"),
                 np.frombuffer(bytes(self.runtime_shape), dtype=np.uint8),
+                np.frombuffer(topk_options, dtype=np.uint8),
             )
         )
-        if blob.size != 336:
+        if blob.size != 352:
             raise AssertionError("UBmem Context ABI changed")
         self.context = torch.from_numpy(blob.copy()).to(self.device)
         self.arguments = tuple(arguments) + (self.context,)

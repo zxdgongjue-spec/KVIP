@@ -17,7 +17,7 @@ def timing_summary(samples):
     if not np.isfinite(values).all() or (values <= 0).any():
         raise ValueError('timing samples must be finite positive microseconds')
     return dict(mean_us=float(values.mean()), p50_us=float(np.median(values)),
-                p99_us=float(np.percentile(values, 99)), samples=len(values),
+                p95_us=float(np.percentile(values, 95)), p99_us=float(np.percentile(values, 99)), samples=len(values),
                 samples_us=values.tolist())
 
 
@@ -59,7 +59,7 @@ def comparison_row(case_id, serial, fused, correctness, execution='COMPLETED'):
     row = dict(case=case_id, execution=execution, correctness=correctness,
                timing='COMPLETE' if serial and fused else 'INCOMPLETE')
     for name, timing in [('serial', serial), ('fused', fused)]:
-        for metric in ('mean_us', 'p50_us', 'p99_us', 'samples'):
+        for metric in ('mean_us', 'p50_us', 'p95_us', 'p99_us', 'samples'):
             row[f'{name}_{metric}'] = timing.get(metric) if timing else None
     if serial and fused:
         row['reduction'] = 1 - fused['mean_us'] / serial['mean_us']
@@ -83,14 +83,14 @@ def save_summary(directory, rows):
         writer.writerows(rows)
     temporary.replace(directory / 'results.csv')
     headers = ['#', 'Transport', 'BS', 'Miss%', 'Execution', 'Check',
-               'Serial mean', 'Fused mean', 'Gain', 'Serial p50/p99', 'Fused p50/p99']
+               'Serial mean', 'Fused mean', 'Gain', 'Serial p50/p95/p99', 'Fused p50/p95/p99']
     cells = []
     for index, row in enumerate(rows, 1):
         def number(key):
             value = row.get(key)
             return '—' if value is None else f'{value:.2f}'
         def percentiles(prefix):
-            return f"{number(prefix + '_p50_us')}/{number(prefix + '_p99_us')}"
+            return '/'.join(number(f'{prefix}_{q}_us') for q in ('p50', 'p95', 'p99'))
         miss = row.get('miss_percent')
         reduction = row.get('reduction')
         cells.append([str(index), row.get('transport') or '—', str(row.get('batch') or '—'),

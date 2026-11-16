@@ -1958,7 +1958,7 @@ def run_urma_case(
             try:
                 full_trace.update(collect_core(torch, rotating, graph, trace_reset, check, args.trace_rounds, folder,
                                                full=True, diagnostics=pipeline.diagnostic_cycles,
-                                               fused_final=True))
+                                               fused_final=True, pipeline=pipeline))
             finally:
                 pipeline.set_diagnostics(False)
                 stream.synchronize()
@@ -1994,6 +1994,7 @@ def run_urma_case(
         final_workers=0,
         prefetch_limit=args.prefetch_tokens,
         output_stride=owner.output.shape[1],
+        **args.checkpoint_topk,
     )
     topk = arguments[9].view(torch.int32).reshape(b, 4, 2048)
     prefix = 4 * 2048 * 6 + 1024 + 4 * h * 2
@@ -2581,6 +2582,7 @@ def run_ubmem_case(
     check_suite=None,
     shared_pool=None,
     compact=False,
+    checkpoint_topk=None,
 ):
     batch, history, resident, token_bytes = shape.batch, shape.history, shape.resident, shape.token_bytes
     checks = CorrectnessRecorder()
@@ -2688,6 +2690,7 @@ def run_ubmem_case(
             output_stride=stride,
             scratch=workspace.scratch,
             prefetch_limit=prefetch_tokens,
+            **(checkpoint_topk or {}),
         )
         # Check the compiled UBmem schedule against the URMA runtime contract,
         # including epoch zero at the end of the hot region.
@@ -3159,6 +3162,7 @@ def run_ubmem(config, directory, *, shared_pool=None):
             serial_compare=True, check_case=getattr(config, 'check_case', None),
             check_suite=getattr(config, 'check_suite', None),
             shared_pool=shared_pool, compact=config.mode in ('bench', 'diagnose'),
+            checkpoint_topk=config.checkpoint_topk,
         )
         failed |= not passed
     return int(failed)
@@ -3172,7 +3176,7 @@ class FusedReplayState:
     state must not have live graphs or unfinished device work.
     """
     def __init__(self, torch, runtime, table, library, initial, pages, addresses,
-                 *, device, aics, windows, prefetch_tokens, soc):
+                 *, device, aics, windows, prefetch_tokens, soc, checkpoint_topk):
         from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
         from kvip.cache.index_storage import IndexCacheStorage
         from kvip.operators.lifetch.binding import LIFetchBinding
@@ -3208,6 +3212,7 @@ class FusedReplayState:
                 hot_valid=self.storage.hot_valid, row_owners=self.workspace.inputs.row_owners,
                 token_addresses=self.storage.addresses, tail_bounds=self.workspace.tail_bounds,
                 output_stride=self.stride, scratch=self.workspace.scratch,
+                **checkpoint_topk,
             )
             if ubmem:
                 self.lease.register_table(table)
@@ -3553,7 +3558,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
             state = FusedReplayState(
                 torch, runtime, view, library, initial, pages, logical_addresses,
                 device=device, aics=aics, windows=config.intermediate_fetches,
-                prefetch_tokens=config.prefetch_tokens, soc=soc)
+                prefetch_tokens=config.prefetch_tokens, soc=soc, checkpoint_topk=config.checkpoint_topk)
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
         checks = CorrectnessRecorder()
@@ -3763,6 +3768,13 @@ class StreamingForward(LIFetchForward):
         fetch = raw[self.batch * 128:self.batch * (256 if self.q_workers else 224)].reshape(self.batch, 128 if self.q_workers else 96) if self.fused_final else None
         flags = self.flags.cpu().numpy()
         posts = (self.rotating.final_posts.cpu().numpy() if hasattr(self, "rotating") else None)
+        prefix_bytes = 4 * 2048 * 6 + 4 * 256
+        checkpoint = None
+        mask = self.rotating.checkpoint_window_mask
+        if mask:
+            prefix = self.rotating.arguments[13][:self.batch * prefix_bytes].cpu().numpy()
+            checkpoint = prefix.reshape(self.batch, prefix_bytes)[:, -4 * 256:].copy()
+            checkpoint = checkpoint.reshape(self.batch, 4, 256)[:, :, 64:].copy().view('<u8')
         result = []
         for b in range(self.batch):
             p, u = rows[b, :32], rows[b, 32:]
@@ -3776,6 +3788,15 @@ class StreamingForward(LIFetchForward):
                                     wait_second=int(t[5]-t[4]), classify_second=int(t[6]-t[5]),
                                     bitmap_merge=int(t[11]-t[10]), publish=int(t[7]-t[11]),
                                     overlap=bool(t[8]), topk_only=bool(t[9])))
+                if t[12]:
+                    queries[-1]['final_topk'] = dict(
+                        start=int(t[12]), end=int(t[13]), load_with_wait=int(t[14]), vector_with_wait=int(t[15]))
+                if checkpoint is not None:
+                    windows = [window for window in range(1, 31) if mask & (1 << window)]
+                    queries[-1]['checkpoint_topk'] = [
+                        dict(window=window, start=int(ticks[0]), end=int(ticks[1]),
+                             load_with_wait=int(ticks[2]), vector_with_wait=int(ticks[3]))
+                        for window, ticks in zip(windows, checkpoint[b, q].reshape(-1, 4)) if ticks[0]]
             producer = []
             for q in range(4):
                 t = p[10+5*q:15+5*q]

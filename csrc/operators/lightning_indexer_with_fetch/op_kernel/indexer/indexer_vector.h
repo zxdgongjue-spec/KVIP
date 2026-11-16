@@ -39,7 +39,10 @@ public:
     rotating::RuntimeShape runtimeShape_;
     __aicore__ inline void SetRotationContext(GM_ADDR p) {
         rotationContext_ = p;
-        runtimeShape_ = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(p));
+        auto context = reinterpret_cast<__gm__ rotating::Context*>(p);
+        runtimeShape_ = rotating::LoadRuntimeShape(context);
+        checkpointMask_ = context->checkpointTopk.windowMask;
+        reuseCheckpointTopk_ = context->checkpointTopk.reuseFinal;
         rotationProgressGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(
             reinterpret_cast<__gm__ rotating::Context*>(p)->progress));
     }
@@ -91,6 +94,13 @@ public:
     __aicore__ inline void ProcessVec1(const QLICommon::RunInfo &info, uint32_t progressShard = 0,
                                      bool publishShardEnd = false);
     __aicore__ inline void ProcessTopK(const QLICommon::RunInfo &info, uint32_t queryRow = SIM_Q);
+    __aicore__ inline bool IsTopkCheckpoint(uint32_t epoch) const {
+        return epoch != 0 && epoch + 1 < runtimeShape_.rounds && (checkpointMask_ & (1U << epoch));
+    }
+    __aicore__ inline bool HasTopkCheckpoints() const { return checkpointMask_ != 0; }
+    __aicore__ inline void UpdateCheckpointTopk(const QLICommon::RunInfo &info, uint32_t epoch,
+                                               uint32_t windowEnd,
+                                               uint32_t halfWindow, uint32_t shard);
     __aicore__ inline void SetPrefixStorage(GM_ADDR output) { prefixOutput_ = output; }
 #if KVIP_STREAMING_LI
     __aicore__ inline void SetStreamingWorkspace(GM_ADDR workspace) { streamingWorkspace_ = workspace; }
@@ -159,7 +169,46 @@ private:
     LocalTensor<uint16_t> classifyUB_;
     TBuf<TPosition::VECCALC> prefixThresholdBuf_;
     LocalTensor<uint16_t> prefixThreshold_;
-    __aicore__ inline void SaveResident(uint32_t query, uint32_t scoreRow, bool publishProgress) {
+    uint32_t checkpointMask_ = 0;
+    bool reuseCheckpointTopk_ = false;
+    __aicore__ inline void GetPrefixState(uint32_t query, GlobalTensor<uint16_t>& scores,
+        GlobalTensor<uint32_t>& indices, GlobalTensor<uint16_t>& thresholds) {
+        constexpr uint32_t count = SIM_Q * 2048;
+        constexpr uint32_t rowBytes = count * 6 + SIM_Q * 256;
+        auto row = prefixOutput_ + query / SIM_Q * rowBytes;
+        uint32_t q = query % SIM_Q;
+        scores.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(row) + q * 2048);
+        indices.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(row + count * 2) + q * 2048);
+        thresholds.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(row + count * 6) + q * 128);
+    }
+    struct TopkProfile {
+        uint64_t start;
+        uint64_t load;
+        uint64_t merge;
+    };
+    __aicore__ inline uint64_t TopkCycle() const {
+#if KVIP_STREAMING_LI
+        if (!prefixActive_ && streamingWorkspace_ &&
+            (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U))
+            return GetSystemCycle();
+#endif
+        return 0;
+    }
+    __aicore__ inline void RecordTopkMerge(TopkProfile& profile, uint64_t start) {
+        if (!profile.start) return;
+        SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        profile.merge += GetSystemCycle() - start;
+    }
+    __aicore__ inline void RecordTopkLoad(TopkProfile& profile, uint64_t start) {
+        if (!profile.start) return;
+        SetFlag<HardEvent::MTE2_S>(EVENT_ID0); WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        profile.load += GetSystemCycle() - start;
+    }
+    __aicore__ inline void MergeCheckpointRange(uint32_t query, uint32_t scoreRow,
+        uint32_t begin, uint32_t end, bool final, TopkProfile& profile);
+    __aicore__ inline bool ResumeCheckpointTopk(uint32_t query, uint32_t scoreRow, uint32_t end,
+        TopkProfile& profile);
+    __aicore__ inline void StoreTopkMinimum(uint32_t query) {
         auto src = (__local_mem__ uint16_t *)scoreOutLocal_.GetPhyAddr();
         auto dst = (__local_mem__ uint16_t *)prefixThreshold_.GetPhyAddr() + (query % 2) * 128;
         __VEC_SCOPE__ {
@@ -173,19 +222,29 @@ private:
             MicroAPI::ReduceMin(reduced, minimum, mask);
             MicroAPI::StoreAlign(dst, reduced, mask);
         }
+    }
+    __aicore__ inline void SaveResident(uint32_t query, uint32_t scoreRow,
+                                        bool publishProgress) {
+        StoreTopkMinimum(query);
+        auto localThreshold = prefixThreshold_[(query % 2) * lifetch::kThresholdRecordWords];
+        if (checkpointMask_) {
+            constexpr uint32_t profileWord = 4 * lifetch::kCheckpointProfileOffset;
+            Duplicate(localThreshold[profileWord], uint16_t(0), lifetch::kThresholdRecordWords - profileWord);
+            SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            localThreshold.template ReinterpretCast<uint32_t>().SetValue(lifetch::kCheckpointEndOffset / 2, 0);
+        }
         SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
         WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
-        constexpr uint32_t count = SIM_Q * 2048;
-        constexpr uint32_t rowBytes = count * 6 + SIM_Q * 256;
-        uint32_t batch = query / SIM_Q, q = query % SIM_Q;
+        if (checkpointMask_) {
+            SetFlag<HardEvent::S_MTE3>(EVENT_ID0); WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        }
+        uint32_t batch = query / SIM_Q;
         GlobalTensor<uint16_t> scores, thresholds;
-        GlobalTensor<int32_t> indices;
-        scores.SetGlobalBuffer((__gm__ uint16_t *)(prefixOutput_ + batch * rowBytes));
-        indices.SetGlobalBuffer((__gm__ int32_t *)(prefixOutput_ + batch * rowBytes + count * 2));
-        thresholds.SetGlobalBuffer((__gm__ uint16_t *)(prefixOutput_ + batch * rowBytes + count * 6));
-        DataCopy(scores[q * 2048], scoreOutLocal_, 2048);
-        DataCopy(indices[q * 2048], indicesOutLocal_.template ReinterpretCast<int32_t>(), 2048);
-        DataCopy(thresholds[q * 128], prefixThreshold_[(query % 2) * 128], 128);
+        GlobalTensor<uint32_t> indices;
+        GetPrefixState(query, scores, indices, thresholds);
+        DataCopy(scores, scoreOutLocal_, 2048);
+        DataCopy(indices, indicesOutLocal_, 2048);
+        DataCopy(thresholds, localThreshold, lifetch::kThresholdRecordWords);
         PipeBarrier<PIPE_ALL>();
         auto context = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
         if (context->lruSlots) {
@@ -796,6 +855,142 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
 #endif
 
 template <typename QLIT>
+__aicore__ inline void QLIVector<QLIT>::MergeCheckpointRange(
+    uint32_t query, uint32_t scoreRow, uint32_t begin, uint32_t end, bool final, TopkProfile& profile)
+{
+    GlobalTensor<uint16_t> scores, thresholds;
+    GlobalTensor<uint32_t> indices;
+    GetPrefixState(query, scores, indices, thresholds);
+    uint64_t loadStart = profile.start ? GetSystemCycle() : 0;
+    DataCopy(scoreOutLocal_, scores, topkCount_);
+    DataCopy(indicesOutLocal_, indices, topkCount_);
+    SetFlag<HardEvent::MTE2_V>(EVENT_ID0); WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+    RecordTopkLoad(profile, loadStart);
+
+#if KVIP_STREAMING_LI
+    if (final && begin == end) BeginFinalMetadata(query);
+#endif
+    uint32_t merges = 0;
+    for (uint32_t start = begin; start < end; start += trunkLen_) {
+        const uint32_t count = Min(trunkLen_, end - start);
+        const uint32_t aligned = QLICommon::Align(count, uint32_t(256));
+        AscendC::DataCopy(mrgValueLocal_, scoreOutLocal_, topkCount_);
+        auto next = mrgValueLocal_[topkCount_];
+        if (aligned != count) Duplicate(next[count / 256 * 256], uint16_t(0), 256);
+        SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3); WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+        loadStart = profile.start ? GetSystemCycle() : 0;
+        DataCopyExtParams copy{1, count * 2, 0, 0, 0};
+        DataCopyPadExtParams<uint16_t> padding{true, 0, 0, 0};
+        DataCopyPad(next, scoreGm[uint64_t(scoreRow) * runtimeShape_.history + start], copy, padding);
+        SetFlag<HardEvent::MTE2_V>(EVENT_ID0); WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+        RecordTopkLoad(profile, loadStart);
+#if KVIP_STREAMING_LI
+        if (final && start + count == end) BeginFinalMetadata(query);
+#endif
+        uint64_t mergeStart = profile.start ? GetSystemCycle() : 0;
+        topkOp_.MergeCheckpoint(mrgValueLocal_, scoreOutLocal_, start, topkCount_ + aligned, merges++);
+        PipeBarrier<PIPE_V>();
+        RecordTopkMerge(profile, mergeStart);
+    }
+    topkOp_.FinalizeCheckpointIndices(merges);
+}
+
+template <typename QLIT>
+__aicore__ inline bool QLIVector<QLIT>::ResumeCheckpointTopk(
+    uint32_t query, uint32_t scoreRow, uint32_t end, TopkProfile& profile)
+{
+    GlobalTensor<uint16_t> scores, thresholds;
+    GlobalTensor<uint32_t> indices;
+    GetPrefixState(query, scores, indices, thresholds);
+    DataCopy(mrgValueLocal_, thresholds, 16);
+    SetFlag<HardEvent::MTE2_S>(EVENT_ID0); WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+    uint32_t savedEnd = mrgValueLocal_.template ReinterpretCast<uint32_t>().GetValue(
+        lifetch::kCheckpointEndOffset / 2);
+    if (savedEnd <= runtimeShape_.resident || savedEnd > end) return false;
+    MergeCheckpointRange(query, scoreRow, savedEnd, end, true, profile);
+    return true;
+}
+
+template <typename QLIT>
+__aicore__ inline void QLIVector<QLIT>::UpdateCheckpointTopk(
+    const QLICommon::RunInfo& info, uint32_t epoch, uint32_t windowEnd, uint32_t halfWindow, uint32_t shard)
+{
+    const uint32_t first = info.gS1Idx * s1BaseSize_;
+    const uint32_t queries = Min(s1BaseSize_, uint32_t(info.actS1Size) - first);
+    const uint32_t group = CeilDiv(queries, 2);
+    const uint32_t localBegin = (blockId_ % 2) * group;
+    const uint32_t localCount = blockId_ % 2 ? queries / 2 : group;
+    auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+    auto bounds = reinterpret_cast<__gm__ const uint32_t*>(ctx->queryEnds);
+    bool usedScoreBuffer = false;
+    // All score/bitmap/progress stores for this producer precede the checkpoint.
+    PipeBarrier<PIPE_ALL>();
+    for (uint32_t i = 0; i < localCount; ++i) {
+        const uint32_t row = localBegin + i;
+        const uint32_t query = info.bIdx * SIM_Q + first + row;
+        uint32_t end = Min(windowEnd, uint32_t(info.actS2Size));
+        if (bounds) end = Min(end, bounds[query]);
+        if (end <= runtimeShape_.resident) continue;
+
+        GlobalTensor<uint16_t> scores, thresholds;
+        GlobalTensor<uint32_t> indices;
+        GetPrefixState(query, scores, indices, thresholds);
+        auto threshold = prefixThreshold_[(query % 2) * lifetch::kThresholdRecordWords];
+        auto cursor = threshold.template ReinterpretCast<uint32_t>();
+        if (halfWindow && shard != 0) {
+            // The peer publishes the cursor and threshold in the same DMA.
+            do {
+                DataCopy(threshold, thresholds, 16);
+                SetFlag<HardEvent::MTE2_S>(EVENT_ID0); WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            } while (cursor.GetValue(lifetch::kCheckpointEndOffset / 2) < end);
+            continue;
+        }
+
+        uint32_t begin = Max(runtimeShape_.resident, cursor.GetValue(lifetch::kCheckpointEndOffset / 2));
+        if (begin >= end) continue;
+        TopkProfile profile{TopkCycle(), 0, 0};
+        if (halfWindow && end > windowEnd - halfWindow) {
+            // Shard 1's published end covers its score DMA, including ABC hits.
+            auto progress = mrgValueLocal_.template ReinterpretCast<uint32_t>();
+            do {
+                DataCopy(progress, rotationProgressGm_[query * 32 + 16], 8);
+                SetFlag<HardEvent::MTE2_S>(EVENT_ID0); WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            } while (progress.GetValue(0) < end);
+        }
+        MergeCheckpointRange(query, (blockId_ % 2) * CeilDiv(s1BaseSize_, 2) + i, begin, end, false, profile);
+        StoreTopkMinimum(query);
+        SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        SetFlag<HardEvent::V_MTE3>(EVENT_ID0); WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        DataCopy(scores, scoreOutLocal_, topkCount_);
+        DataCopy(indices, indicesOutLocal_, topkCount_);
+        if (halfWindow) {
+            // Publish for the sibling only after the saved state is visible.
+            SetFlag<HardEvent::MTE3_S>(EVENT_ID0); WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        }
+        cursor.SetValue(lifetch::kCheckpointEndOffset / 2, end);
+        SetFlag<HardEvent::S_MTE3>(EVENT_ID0); WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        DataCopy(thresholds, threshold, 16);
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0); WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        if (profile.start) {
+            uint32_t ordinal = 0;
+            for (uint32_t mask = checkpointMask_ & ((1U << epoch) - 1); mask; mask &= mask - 1) ++ordinal;
+            auto ticks = mrgValueLocal_.template ReinterpretCast<uint64_t>();
+            ticks.SetValue(0, profile.start);
+            ticks.SetValue(1, GetSystemCycle());
+            ticks.SetValue(2, profile.load);
+            ticks.SetValue(3, profile.merge);
+            SetFlag<HardEvent::S_MTE3>(EVENT_ID0); WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+            DataCopy(thresholds[4 * (lifetch::kCheckpointProfileOffset + 4 * ordinal)],
+                     ticks.template ReinterpretCast<uint16_t>(), 16);
+            SetFlag<HardEvent::MTE3_S>(EVENT_ID0); WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        }
+        usedScoreBuffer = true;
+    }
+    // During cold scanning this UB normally holds the progress write table.
+    if (usedScoreBuffer) PrepareRotationProgress();
+}
+
+template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &info, uint32_t queryRow)
 {
     SetFlag<HardEvent::MTE3_MTE2>(MTE3_MTE2_EVENT);
@@ -832,8 +1027,8 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
     for (uint32_t i = 0; i < curAivS1ProcNum; i++) {
         uint32_t rowIdx = queryRow < SIM_Q ? queryRow : blockId_ % 2 * CeilDiv(curS1ProcNum, 2) + i;
         uint32_t vecOffset = queryRow < SIM_Q ? queryRow : blockId_ % 2 * CeilDiv(s1BaseSize_, 2) + i;
-#if KVIP_STREAMING_LI
         uint32_t streamingQuery = info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx;
+#if KVIP_STREAMING_LI
         streamingPrefetched_ = false;
 #endif
 
@@ -858,7 +1053,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
             Duplicate(indicesOutLocal_.ReinterpretCast<int32_t>(), neg, topkCount_);
             if (prefixActive_) {
                 Duplicate(scoreOutLocal_, uint16_t(0), topkCount_);
-                SaveResident(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, vecOffset, queryRow == SIM_Q);
+                SaveResident(streamingQuery, vecOffset, queryRow == SIM_Q);
             }
             SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
             WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
@@ -874,9 +1069,13 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
 
         WaitFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);
         WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
+        TopkProfile profile{TopkCycle(), 0, 0};
 
         AscendC::DataCopyPadExtParams<SCORE_T> padParams{true, 0, 0, 0};
-        if (validS2Len >= topkCount_) {
+        if (!prefixActive_ && reuseCheckpointTopk_ && validS2Len > runtimeShape_.resident &&
+            ResumeCheckpointTopk(streamingQuery, vecOffset, validS2Len, profile)) {
+            // The prefix and uncaptured tail merged into the regular index output.
+        } else if (validS2Len >= topkCount_) {
             uint32_t s2LoopNum = (validS2Len + trunkLen_ - 1) / trunkLen_;
             if (s2LoopNum == 1) {
                 uint32_t validS2LenAlign = QLICommon::Align(validS2Len, (int32_t)256);
@@ -885,21 +1084,29 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
                 WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
                 copyInParams.blockLen = validS2Len * sizeof(SCORE_T); // byte
                 AscendC::DataCopyPadExtParams<SCORE_T> padParams{true, 0, 0, 0};
+                uint64_t loadStart = profile.start ? GetSystemCycle() : 0;
                 AscendC::DataCopyPad(mrgValueLocal_, scoreGm[vecOffset * QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_)], copyInParams, padParams);
                 SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
                 WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+                RecordTopkLoad(profile, loadStart);
 #if KVIP_STREAMING_LI
                 BeginFinalMetadata(streamingQuery);
 #endif
+                uint64_t mergeStart = profile.start ? GetSystemCycle() : 0;
                 topkOp_(mrgValueLocal_, indicesOutLocal_, scoreOutLocal_, validS2LenAlign, 0, 1, prefixActive_);
+                RecordTopkMerge(profile, mergeStart);
             } else {
                 for (uint32_t loopIdx = 0; loopIdx < s2LoopNum; loopIdx++) {
                     if (loopIdx == 0) {
                         copyInParams.blockLen = trunkLen_ * sizeof(SCORE_T); // byte
+                        uint64_t loadStart = profile.start ? GetSystemCycle() : 0;
                         AscendC::DataCopyPad(mrgValueLocal_, scoreGm[vecOffset * QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_)], copyInParams, padParams);
                         SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
                         WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+                        RecordTopkLoad(profile, loadStart);
+                        uint64_t mergeStart = profile.start ? GetSystemCycle() : 0;
                         topkOp_(mrgValueLocal_, indicesOutLocal_, scoreOutLocal_, trunkLen_, loopIdx, s2LoopNum);
+                        RecordTopkMerge(profile, mergeStart);
                         continue;
                     }
                     SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT2);
@@ -929,13 +1136,17 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
                         WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
                     }
                     WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT1);
+                    uint64_t loadStart = profile.start ? GetSystemCycle() : 0;
                     AscendC::DataCopyPad(mrgValueLocal_[topkCountAlign256_], scoreGm[offset], copyInParams, padParams);
                     SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
                     WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+                    RecordTopkLoad(profile, loadStart);
 #if KVIP_STREAMING_LI
                     if (loopIdx+1 == s2LoopNum) BeginFinalMetadata(streamingQuery);
 #endif
+                    uint64_t mergeStart = profile.start ? GetSystemCycle() : 0;
                     topkOp_(mrgValueLocal_, indicesOutLocal_, scoreOutLocal_, QLICommon::Align(topkCountAlign256_ + validTrunkLen, (uint32_t)256), loopIdx, s2LoopNum);
+                    RecordTopkMerge(profile, mergeStart);
                     SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT1);
                 }
             }
@@ -961,9 +1172,21 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
         if (prefixActive_) {
             if (validS2Len < topkCount_) Duplicate(scoreOutLocal_, uint16_t(0), topkCount_);
-            SaveResident(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, vecOffset, queryRow == SIM_Q);
+            SaveResident(streamingQuery, vecOffset, queryRow == SIM_Q);
         } else {
-        AscendC::DataCopyPad(indiceOutGm[info.indiceOutOffset + (curS1Idx + rowIdx) * topkCount_], indicesOutLocal_.ReinterpretCast<int32_t>(), copyOutParams);
+#if KVIP_STREAMING_LI
+            if (profile.start) {
+                auto a = reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_);
+                auto ticks = reinterpret_cast<__gm__ uint64_t*>(a->times) +
+                    uint64_t(runtimeShape_.batch) * 64 + uint64_t(streamingQuery) * 16;
+                ticks[12] = profile.start;
+                ticks[13] = GetSystemCycle();
+                ticks[14] = profile.load;
+                ticks[15] = profile.merge;
+                // EmitFinalClassification publishes the entire 128-byte row.
+            }
+#endif
+            AscendC::DataCopyPad(indiceOutGm[info.indiceOutOffset + (curS1Idx + rowIdx) * topkCount_], indicesOutLocal_.ReinterpretCast<int32_t>(), copyOutParams);
         }
         SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
 #if KVIP_STREAMING_LI
