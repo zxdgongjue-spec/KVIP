@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Execute descriptor packing with/without the zero-prefetch fast path.
+"""Execute the original descriptor packing for both graph routes.
 
 One virtual lane runs the complete partition. This checks descriptor order,
 validation and publication counters, not SIMT concurrency or cache visibility.
@@ -13,13 +13,13 @@ from test_recent_index import INDEXER, function
 
 
 @pytest.mark.parametrize("compact", [0, 1])
-def test_zero_prefetch_packing_and_high_path_match_reference(tmp_path, compact):
+def test_original_packing_matches_reference_in_both_routes(tmp_path, compact):
     native = function(
         (INDEXER.parent / "staged_urma_pack.h").read_text(),
         "inline void PackStagedUrmaQuery(",
     )
     # Keep all data/control operations; only collapse the SIMT partition width.
-    native = "template<bool AllSafe = false>\n" + native.replace("511", "0").replace("512", "1")
+    native = native.replace("511", "0").replace("512", "1")
     program = tmp_path / "pack.cpp"
     program.write_text(r"""
 #include <algorithm>
@@ -60,8 +60,7 @@ void StoreFallbackSource(uint32_t history,uint32_t bytes,Context* ctx,uint32_t b
 }
 """ + native + r"""
 template<class... Args>void dispatch(bool low,uint32_t used,Args... args){
- if(KVIP_LOW_MISS_TAIL&&low&&!used)PackStagedUrmaQuery<true>(args...);
- else PackStagedUrmaQuery<false>(args...);
+ PackStagedUrmaQuery(args...);
 }
 int main(){
  std::mt19937 rng(1704);
@@ -98,12 +97,7 @@ int main(){
    selected.data(),ids.data(),slots.data(),ctl.data(),useDirect?direct.data():nullptr,stride);
   assert(!ctl[1]&&ctl[16]==count&&ctl[17]==safe&&submitted==13+count);
   if(!count){assert(!prefixCalls&&!reservedLoads&&!ctl[18]&&!ctl[19]);continue;}
-#if KVIP_LOW_MISS_TAIL
-  if(low&&!used)assert(!prefixCalls&&!reservedLoads);
-  else assert(prefixCalls==1&&reservedLoads==2*count);
-#else
   assert(prefixCalls==1&&reservedLoads==2*count);
-#endif
   for(uint32_t position=0;position<count;++position){
    uint32_t rank=begin+order[position],token=selected[ids[rank%kTop]],slot=slots[rank];
    uint32_t output=batch*kSlots+query*kTop+position;

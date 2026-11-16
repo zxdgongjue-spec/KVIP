@@ -248,12 +248,8 @@ int main(){using namespace rotating;
   for(uint32_t q=0;q<4;++q){
    std::vector<uint32_t> bits(4104,0);
    for(threadIdx.x=0;threadIdx.x<512;++threadIdx.x){
-    if(low&&!used)
-     ClassifySelectedMetadata<true>(H,R,B,O,used,begin,end,true,&ctx,selected.data()+q*kTop,
-       locations.data()+q*kTop,bits.data(),bits.data()+4096);
-    else
-     ClassifySelectedMetadata<false>(H,R,B,O,used,begin,end,true,&ctx,selected.data()+q*kTop,
-       locations.data()+q*kTop,bits.data(),bits.data()+4096);
+    ClassifySelectedMetadata(H,R,B,O,used,begin,end,true,&ctx,selected.data()+q*kTop,
+      locations.data()+q*kTop,bits.data(),bits.data()+4096,low);
    }
    for(threadIdx.x=0;threadIdx.x<512;++threadIdx.x)MergeClassifyBitmap(bits.data(),R);
    assert(bits[4096]==uint32_t(q==0));

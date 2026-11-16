@@ -87,6 +87,7 @@ def build_libraries(
     low_miss_skip=False,
     low_miss_tail=False,
     low_miss_sparse_init=False,
+    auto_route_fast_probe=False,
     auto_route=False,
     prefetch_gate=False,
     prefetch_rank=0,
@@ -114,6 +115,7 @@ def build_libraries(
         LOW_MISS_SKIP=low_miss_skip,
         LOW_MISS_TAIL=low_miss_tail,
         LOW_MISS_SPARSE_INIT=low_miss_sparse_init,
+        AUTO_ROUTE_FAST_PROBE=auto_route_fast_probe,
         AUTO_ROUTE=auto_route,
         PREFETCH_GATE=prefetch_gate,
         SKIP_EXHAUSTED_PREFETCH=skip_exhausted_prefetch,
@@ -135,6 +137,8 @@ def build_libraries(
         raise ValueError("low_miss_sparse_init requires auto_route, low_miss_tail and selected_metadata")
     if low_miss_sparse_init and inverse_mapping:
         raise ValueError("low_miss_sparse_init and inverse_mapping are separate initialization policies")
+    if auto_route_fast_probe and not low_miss_sparse_init:
+        raise ValueError("auto_route_fast_probe requires low_miss_sparse_init")
     if type(prefetch_rank) is not int or not 0 <= prefetch_rank <= 2048:
         raise ValueError("prefetch_rank must be an integer in 0..2048")
     if prefetch_rank and not prefetch_gate:

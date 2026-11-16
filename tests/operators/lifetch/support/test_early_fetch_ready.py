@@ -105,10 +105,9 @@ void PreparePublicationOutputs(int64_t*,uint32_t*,uint32_t,uint32_t b,uint32_t q
  std::fill_n(work,8,0);work[0]=1U<<(b*4+q);
  for(unsigned i=0;i<kTop;++i)work[64+i]=100000+b*10000+q*2048+i;
 }
-template<bool AllSafe>void PackPublicationEvents(Context*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t q,uint32_t used,uint32_t,
+void PackPublicationEvents(Context*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t q,uint32_t used,uint32_t,
  uint32_t count,uint32_t*,uint32_t*,uint32_t*,uint16_t*,uint32_t*,uint32_t* ctl,int32_t* direct,uint32_t){
  assert((direct==nullptr)==bool(KVIP_READY_BATCH_FETCH && !V9_UBMEM));
- assert(AllSafe==bool(KVIP_LOW_MISS_TAIL&&!V9_UBMEM&&noPrefetchMode&&!used));
  assert(q==currentQuery);ctl[16]=count;ctl[17]=count;
  if(q==packErrorQuery)ctl[1]=16;
 }
@@ -208,7 +207,7 @@ int main(){
  for(bool low:{false,true})for(unsigned used:{0U,8U})for(unsigned b:{0U,1U}){
   noPrefetchMode=low;usedSlots=used;
   reset();runWorker(b);assert(fetchReads==4 && outputCopies==8 && dma.empty());
-  assert(controlRefreshes==unsigned(KVIP_AUTO_ROUTE && !used));
+  assert(controlRefreshes==0); // Publication no longer reads routing controls.
   for(unsigned q=0;q<4;++q){assert(flags[b*kFlagCount+q+1].ready);assert(slotOut[(b*4+q)*kTop]==b*10000+q*kTop);}
   assert(!JoinProducer(flags+b*kFlagCount));assert(!JoinConsumer(flags+b*kFlagCount));assert(metadataCommits==1);
   auto error=flags[b*kFlagCount+kOutputCompletionFlag].error;ProducerDone(flags+b*kFlagCount,77);

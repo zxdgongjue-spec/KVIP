@@ -107,6 +107,16 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
         auto ctx=GetContext(bindings);
         auto initBindings=reinterpret_cast<__gm__ uint64_t*>(bindings);
         auto streaming=reinterpret_cast<__gm__ pipeline_ab::Args*>(initBindings[15]);
+        // Reserved suffix of the Consumer's diagnostic row. Init precedes
+        // Consumer at a graph kernel boundary; neither writer touches the
+        // other's words. No timestamps are collected in headline timing.
+        bool profile=streaming && streaming->times && (streaming->prefetchCount & 0x80000000U);
+        auto ticks=profile?reinterpret_cast<__gm__ uint64_t*>(streaming->times)+uint64_t(b)*64+32:nullptr;
+        if(profile) {
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ticks+16),128);
+            ticks[25]=GetSystemCycle();
+            ticks[26]=GetSystemCycle();
+        }
         bool noPrefetch=false;
 #if KVIP_AUTO_ROUTE
         if ((!b || kvip_round_init::kSparseMapping) && ctx->autoRoute) {
@@ -134,7 +144,9 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
             }
         }
 #endif
+        if(profile) { ticks[27]=GetSystemCycle(); ticks[28]=GetSystemCycle(); }
         InitializeRound(rt_batch,rt_history,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b,streaming,noPrefetch);
+        if(profile)ticks[29]=GetSystemCycle();
         auto args=GetArgs(ctx,b*2);
         auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
         auto entity=reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(args.channel_entity);
@@ -149,6 +161,10 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
         row->addresses=ctx->tokenAddresses ? ctx->tokenAddresses+uint64_t(owner)*ctx->addressStride*8 : a[13]+rt_batch*prefix+b*tail;
         row->output=args.output+uint64_t(owner)*outputStride*rt_tokenBytes;
         Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},rt_history,rt_resident,ctx,b);
+        if(profile) {
+            SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            ticks[30]=GetSystemCycle();
+        }
         row->initialHead=queue->sq_producer_index;
         row->limit=kSlots;
         row->prefetchLimit=ctx->prefetchLimit;
@@ -201,6 +217,10 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
 #endif
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),sizeof(*row));
+        if(profile) {
+            ticks[31]=GetSystemCycle();
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ticks+16),128);
+        }
     }
 #endif
 }

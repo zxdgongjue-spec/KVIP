@@ -2,9 +2,6 @@
 // Optional publication AIV. Raw change events remain owned by Resolver; this
 // worker owns service outputs, FinalPost and existing KVAF descriptor publication.
 #pragma once
-#if KVIP_LOW_MISS_TAIL && !V9_UBMEM
-#include "../include/low_miss_mode.h"
-#endif
 __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PreparePublicationOutputs(
  __gm__ int64_t* logical,__ubuf__ uint32_t* masks,uint32_t batchCount,uint32_t b,uint32_t q,
  __ubuf__ uint32_t* selected,__ubuf__ uint32_t* work){
@@ -12,7 +9,6 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PreparePublicationOutputs(
  asc_syncthreads();
  if(logical)PrepareStagedQueryOutputs(logical,masks,batchCount,b,q,selected,work,work+64);
 }
-template<bool AllSafe = false>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PackPublicationEvents(
  StagedContextPointer ctx,uint32_t history,uint32_t resident,uint32_t bytes,uint32_t b,
  uint32_t q,uint32_t used,uint32_t begin,uint32_t count,
@@ -21,7 +17,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PackPublicationEvents(
  __gm__ int32_t* direct,uint32_t stride){
  for(uint32_t i=threadIdx.x;i<count;i+=512){tokens[i]=asc_ldcg(source+begin+i);slots[i]=asc_ldcg(dest+begin+i);ids[i]=uint16_t(i);}
  asc_syncthreads();
- PackStagedUrmaQuery<AllSafe>(history,resident,bytes,b,q,used,0,count,ctx,tokens,ids,slots,ctl,direct,stride);
+ PackStagedUrmaQuery(history,resident,bytes,b,q,used,0,count,ctx,tokens,ids,slots,ctl,direct,stride);
 }
 __aicore__ inline uint32_t AwaitPublication(__gm__ BatchFlag* flag){
  uint64_t start=GetSystemCycle();
@@ -64,18 +60,6 @@ __aicore__ inline void OutputWorker(__gm__ Args* a,uint32_t b){
   reinterpret_cast<__gm__ int64_t*>(u[20]),reinterpret_cast<__gm__ int64_t*>(u[21]),shape.batch,b,FinalPtr(ctl[kOutputMasksOffset]),enabled);
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
-#if KVIP_LOW_MISS_TAIL && !V9_UBMEM
- bool allSafe=false;
- if(!row->slots) {
-#if KVIP_AUTO_ROUTE
-  // Init publishes device-written controls; refresh them on this consumer
-  // core just as LI does before selecting the same invocation's route.
-  if(ctx->autoRoute && ctx->admissionControls)
-   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->admissionControls),shape.batch*16);
-#endif
-  allSafe=NoPrefetchRound(ctx);
- }
-#endif
  auto source=reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+b*a->maxEvents;
  auto dest=reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+b*a->maxEvents;
  uint32_t total=0,workers=(a->prefetchCount>>16)&0xffU,stride=shape.batch*kTop,meta=(3*shape.batch+31)&~31U;
@@ -101,12 +85,7 @@ __aicore__ inline void OutputWorker(__gm__ Args* a,uint32_t b){
    // reservation in this whole-shard layout is not a publication boundary.
    direct=nullptr;
 #endif
-#if KVIP_LOW_MISS_TAIL && !V9_UBMEM
-   if(allSafe)
-    Simt::VF_CALL<PackPublicationEvents<true>>(Simt::Dim3{512,1,1},staged,shape.history,shape.resident,shape.tokenBytes,b,q,row->slots,kPrefetch+total,count,source,dest,FinalPtr(tokens),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(ctl),(a->prefetchCount&0x20000000U)?nullptr:direct,stride);
-   else
-#endif
-    Simt::VF_CALL<PackPublicationEvents<false>>(Simt::Dim3{512,1,1},staged,shape.history,shape.resident,shape.tokenBytes,b,q,row->slots,kPrefetch+total,count,source,dest,FinalPtr(tokens),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(ctl),(a->prefetchCount&0x20000000U)?nullptr:direct,stride);
+   Simt::VF_CALL<PackPublicationEvents>(Simt::Dim3{512,1,1},staged,shape.history,shape.resident,shape.tokenBytes,b,q,row->slots,kPrefetch+total,count,source,dest,FinalPtr(tokens),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(ctl),(a->prefetchCount&0x20000000U)?nullptr:direct,stride);
    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);error=ctl.GetValue(1);
    if(profile)ticks[7+q*6]=GetSystemCycle();
    if(!error){

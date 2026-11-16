@@ -2,6 +2,10 @@
 #pragma once
 #include <stdint.h>
 
+#ifndef KVIP_AUTO_ROUTE_FAST_PROBE
+#define KVIP_AUTO_ROUTE_FAST_PROBE 0
+#endif
+
 #if defined(__CCE_AICORE__)
 #define KVIP_ROUTE_FN __aicore__
 #define KVIP_ROUTE_GM __gm__
@@ -138,8 +142,23 @@ KVIP_ROUTE_FN inline bool Evaluate(KVIP_ROUTE_GM Context* ctx, bool& noPrefetch)
             }
         }
         if (!predict) {
+            if constexpr (!Publish && KVIP_AUTO_ROUTE_FAST_PROBE) {
+                // One untrusted active row forces the whole graph high. This
+                // read-only init block has no pending records left to publish.
+                return true;
+            }
             known = false;
             if (reason == Predicted) reason = rowReason;
+        }
+        if constexpr (!Publish && KVIP_AUTO_ROUTE_FAST_PROBE) {
+            // Remaining rows can only increase bytes. Their total score work
+            // cannot exceed B * Q4 * history. Once wasLow is false it stays
+            // false, so the entry budget is already an upper bound as well.
+            // B<=16, Q<=4, uint32 history/tokenBytes, necessary<=8192 and
+            // budgets<=65535 keep both products below 2^62 (no division).
+            const uint64_t maximumWork = uint64_t(ctx->shape.batch) * 4 * ctx->shape.history;
+            const uint64_t maximumBudget = wasLow ? c->highBudget : c->lowBudget;
+            if (bytes * 1024 > maximumBudget * maximumWork) return true;
         }
     }
     uint64_t budget = wasLow ? c->highBudget : c->lowBudget;

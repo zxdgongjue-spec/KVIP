@@ -3,18 +3,22 @@
 from pathlib import Path
 import subprocess
 
+import pytest
+
 from test_recent_index import function
 
 
 INCLUDE = Path(__file__).resolve().parents[4] / "csrc/operators/lightning_indexer_with_fetch/include"
 
 
-def test_auto_route_decision_identity_and_success_commit(tmp_path):
+@pytest.mark.parametrize("fast_probe", [0, 1])
+def test_auto_route_decision_identity_and_success_commit(tmp_path, fast_probe):
     source = tmp_path / "route.cpp"
     source.write_text(r'''
 #include <array>
 #include <cassert>
 #include <cstring>
+#include <random>
 #include "auto_route.h"
 using namespace kvip_auto_route;
 struct Context {
@@ -129,6 +133,38 @@ int main(){
  }
  Fixture empty;empty.ends.fill(0);for(auto& r:empty.requests)r.queries=0;empty.check(1);
  for(unsigned b=0;b<16;++b)assert(!Commit(&empty.config,b,0));
+ // Read-only pruning must agree with the publishing decision even with
+ // mixed query counts, hysteresis, padding, request changes and extreme
+ // uint32 geometry. Publication still processes every request for feedback.
+ std::mt19937_64 rng(32491);
+ for(unsigned trial=0;trial<5000;++trial){
+  Fixture fuzz;
+  fuzz.ctx.shape.batch=1+rng()%16;
+  fuzz.ctx.shape.history=1+rng()%UINT32_MAX;
+  fuzz.ctx.shape.tokenBytes=(trial%3==0?UINT32_MAX:trial%3==1?656:2624);
+  fuzz.config.lowBudget=1+rng()%65534;
+  fuzz.config.highBudget=fuzz.config.lowBudget+1+rng()%(65535-fuzz.config.lowBudget);
+  fuzz.config.learning=trial%19!=0;
+  for(unsigned b=0;b<fuzz.ctx.shape.batch;++b){
+   auto& request=fuzz.requests[b];auto& prior=fuzz.feedback[b+1];
+   request={b+1,2,100,1+rng()%4};
+   prior={2,99,rng()%8193,1+rng()%4,0,fuzz.ctx.shape.tokenBytes,rng()%2,kValid,{}};
+   for(unsigned q=0;q<4;++q)fuzz.ends[4*b+q]=q<request.queries?1+rng()%fuzz.ctx.shape.history:0;
+   switch(rng()%23){
+    case 0:request.generation=3;break;
+    case 1:request.step=99;break;
+    case 2:prior.valid=0;break;
+    case 3:prior.tokenBytes^=1;break;
+    case 4:request.queries=0;for(unsigned q=0;q<4;++q)fuzz.ends[4*b+q]=0;break;
+    case 5:if(b){request.owner=1;fuzz.owners[b]=1;}break;
+   }
+  }
+  assert(Prepare(&fuzz.ctx));bool expectedLow=fuzz.pending[0].mode==0;
+  auto saved=fuzz.feedback;auto pending=fuzz.pending;auto controls=fuzz.controls;
+  bool low=!expectedLow;assert(Evaluate<false>(&fuzz.ctx,low)&&low==expectedLow);
+  assert(!std::memcmp(saved.data(),fuzz.feedback.data(),sizeof(saved)));
+  assert(!std::memcmp(pending.data(),fuzz.pending.data(),sizeof(pending))&&controls==fuzz.controls);
+ }
  Fixture invalid;invalid.config.fullWindow=0;auto controls=invalid.controls;
  bool noPrefetch=true;auto pending=invalid.pending;
  assert(!Evaluate<false>(&invalid.ctx,noPrefetch)&&!noPrefetch);
@@ -139,6 +175,7 @@ int main(){
     binary = tmp_path / "route"
     subprocess.run([
         "c++", "-std=c++17", "-O1", "-g", "-fsanitize=address,undefined",
+        f"-DKVIP_AUTO_ROUTE_FAST_PROBE={fast_probe}",
         "-I", str(INCLUDE), str(source), "-o", str(binary),
     ], check=True)
     subprocess.run([str(binary)], check=True)

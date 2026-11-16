@@ -230,6 +230,9 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
  // Producer and consumer must not write the same cache lines.
  auto ticks=reinterpret_cast<__gm__ uint64_t*>(a->times)+b*64+32;auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  bool profile=(a->prefetchCount & 0x80000000U)!=0;
+ // Init wrote this line in the preceding kernel. Refresh before the
+ // Consumer updates words 22..24, preserving diagnostic words 25..31.
+ if(profile)kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ticks+16),128);
 #if KVIP_EARLY_PREFETCH_DRAIN && !V9_UBMEM
  // No prefetch remains to be submitted after the LI kernel boundary. Join
  // its CQ while the other two workers resolve slots and publish Q outputs.

@@ -56,7 +56,8 @@ def test_pipeline_options_isolate_and_reuse_the_correct_binary(monkeypatch, tmp_
 @pytest.mark.parametrize("value", (1, 0, "OFF", None))
 @pytest.mark.parametrize("option", ("compact_init", "adaptive_admission", "prefetch_gate",
                                     "skip_exhausted_prefetch", "early_prefetch_drain", "inverse_mapping",
-                                    "low_miss_skip", "low_miss_tail", "auto_route", "low_miss_sparse_init"))
+                                    "low_miss_skip", "low_miss_tail", "auto_route", "low_miss_sparse_init",
+                                    "auto_route_fast_probe"))
 def test_pipeline_options_reject_ambiguous_values_before_build(tmp_path, value, option):
     with pytest.raises(ValueError, match="must be bool"):
         build.build_libraries(cache_dir=tmp_path, cann=tmp_path, headers=tmp_path, soc="A5", **{option: value})
@@ -157,6 +158,15 @@ def test_auto_route_requires_complete_tail_and_isolates_binary(monkeypatch, tmp_
     with pytest.raises(ValueError, match="separate initialization policies"):
         build.build_libraries(**args, **light, **sparse_flags, inverse_mapping=True)
     assert len(calls) == previous + 2
+    with pytest.raises(ValueError, match="auto_route_fast_probe requires"):
+        build.build_libraries(**args, **light, auto_route_fast_probe=True)
+    assert len(calls) == previous + 2
+    fast = build.build_libraries(**args, **light, **sparse_flags, auto_route_fast_probe=True)
+    assert fast != sparse
+    manifest = json.loads((fast[0].parent / "complete.json").read_text())
+    assert manifest["KVIP_AUTO_ROUTE_FAST_PROBE"] == "ON"
+    assert build.build_libraries(**args, **light, **sparse_flags, auto_route_fast_probe=True) == fast
+    assert len(calls) == previous + 4
 
 
 @pytest.mark.parametrize("rank", (-1, 2049, True, False, 1536.0, "1536", None))
