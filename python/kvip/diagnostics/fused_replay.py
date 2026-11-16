@@ -186,6 +186,14 @@ def create_fused(
         )
         if sequence_split:
             raise ValueError("This snapshot uses sequence-split LI; reverse scan is not implemented for that schedule")
+        if build_options.get("rolling_threshold"):
+            import numpy as np
+
+            ends = archive.array("pre.query_ends").reshape(b, 4)
+            bounds = archive.array("pre.threshold_bounds")
+            counts = np.maximum(0, np.minimum(bounds[:, 1, None], ends) - np.maximum(bounds[:, 0, None], r))
+            if r % 16 or r < 2048 or np.any(ends < r) or np.any((r + counts + 255)//256*256 > 18432):
+                raise ValueError("Rolling experiment requires every query to use the resident+recent exact-Kth seed")
         ends = archive.array("pre.query_ends").reshape(b, 4).min(axis=1)
         if ((ends // 2048) * 2048 <= ((r + 2047) // 2048) * 2048).any():
             raise ValueError("Snapshot has no full causal cold blocks to reverse")

@@ -200,6 +200,10 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         from kvip.diagnostics.threshold_check import verify_initial_threshold
 
         bundle.threshold_comparison = verify_initial_threshold(torch, bundle, archive)
+        if bundle.tuning.get("rolling_threshold"):
+            from kvip.diagnostics.rolling_check import verify as verify_rolling
+
+            bundle.rolling_threshold_check = verify_rolling(torch, bundle, archive)
         state = post_state(torch, selector)
         oracle.verify(state, address_delta=delta, expected_topk=selected_expected)
         reads.update(demand.classify(state["logical_output"]))
@@ -607,6 +611,8 @@ def measure_case(args, archive, context, retained):
             result["score_comparison"] = score_reference_result
         result["tuning"] = dict(bundle.tuning)
         result["threshold_comparison"] = bundle.threshold_comparison
+        if rolling_check := getattr(bundle, "rolling_threshold_check", None):
+            result["rolling_threshold_check"] = rolling_check
         result["prefetch_admission_accounting"] = ADMISSION_ACCOUNTING
         result["reserved_metadata"] = dict(
             dense_bytes_per_group=int(archive.array("pre.reserved_hot").nbytes),
