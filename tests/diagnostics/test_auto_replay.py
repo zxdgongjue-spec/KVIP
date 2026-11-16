@@ -47,7 +47,7 @@ def test_repacking_preserves_tnd_query_mapping_and_owner_state():
 
 def test_auto_options_are_explicit_and_runtime_mode_is_not_guessed_from_static_quota():
     for name in ("auto", "auto-end", "auto-tail", "auto-tail-end", "auto-tail-sparse", "auto-tail-sparse-fast",
-                 "auto-tail-row-publish", "auto-tail-row-direct"):
+                 "auto-tail-row-publish", "auto-tail-row-direct", "auto-tail-row-simt", "auto-tail-compact"):
         values = validate_options(options_for(name))
         assert values["auto_route"] and q_workers_for(name) == 4
         with pytest.raises(ValueError, match="auto_route requires"):
@@ -89,6 +89,25 @@ def test_sparse_init_preserves_route_policy_and_requires_the_safe_consumers():
     for missing in ("low_miss_tail", "selected_metadata", "early_fetch_ready"):
         with pytest.raises(ValueError):
             validate_options(direct | {missing: False})
+
+
+def test_low_parity_variants_keep_policy_workers_and_direct_index_fixed():
+    from kvip.diagnostics.pipeline_options import admission_for
+
+    before = options_for("auto-tail-row-direct")
+    simt = options_for("auto-tail-row-simt")
+    compact = options_for("auto-tail-compact")
+    assert simt == before | {"auto_route_simt": True}
+    assert compact == simt | {"low_miss_compact_plan": True}
+    for name in ("auto-tail-row-simt", "auto-tail-compact"):
+        assert admission_for(name) == (512, 64, 0, 0)
+        assert q_workers_for(name) == 4
+        assert validate_options(options_for(name)) == options_for(name)
+    with pytest.raises(ValueError, match="auto_route_simt requires"):
+        validate_options(simt | {"auto_route_row_publish": False})
+    for missing in ("auto_route", "low_miss_tail", "selected_metadata", "early_fetch_ready"):
+        with pytest.raises(ValueError):
+            validate_options(compact | {missing: False})
 
 
 def test_low_tail_options_keep_identical_query_workers_and_manual_admission():

@@ -87,6 +87,8 @@ def test_capability_comes_from_loaded_binary_and_excludes_ubmem():
     ("auto_route_fast_probe", "Fast route probe"),
     ("auto_route_row_publish", "Row route publication"),
     ("low_miss_direct_index", "Direct Index update"),
+    ("auto_route_simt", "SIMT route decision"),
+    ("low_miss_compact_plan", "Compact low plan"),
 ])
 def test_route_variants_require_the_loaded_kernel_feature(transport, capability, option, label):
     from kvip.diagnostics.replay_measure import prepare_fused_state

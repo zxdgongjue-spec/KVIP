@@ -179,6 +179,14 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         feature = getattr(rotating.library, "kvip_low_miss_direct_index", None)
         if transport != "urma" or feature is None or not feature():
             raise ValueError("Direct Index update requires a capable loaded URMA build")
+    if bundle.tuning.get("auto_route_simt"):
+        feature = getattr(rotating.library, "kvip_auto_route_simt", None)
+        if transport != "urma" or feature is None or not feature():
+            raise ValueError("SIMT route decision requires a capable loaded URMA build")
+    if bundle.tuning.get("low_miss_compact_plan"):
+        feature = getattr(rotating.library, "kvip_low_miss_compact_plan", None)
+        if transport != "urma" or feature is None or not feature():
+            raise ValueError("Compact low plan requires a capable loaded URMA build")
     seeds = []
     for name, target in (persistent_tensors(selector) | input_tensors(selector)).items():
         seed = (
@@ -430,6 +438,8 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
         row_route_publish = bool(args.transport == "urma" and row_publish and row_publish())
         direct_index = getattr(library, "kvip_low_miss_direct_index", None)
         direct_index_markers = bool(args.transport == "urma" and direct_index and direct_index())
+        compact_plan = getattr(library, "kvip_low_miss_compact_plan", None)
+        compact_plan_markers = bool(args.transport == "urma" and compact_plan and compact_plan())
         diagnostic_samples = []
         for step in range(diagnostic_count):
             phase(retained, "diagnostic_reset", step)
@@ -461,6 +471,7 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
                         init_route_markers=init_route_markers,
                         row_route_publish=row_route_publish,
                         direct_index_markers=direct_index_markers,
+                        compact_plan_markers=compact_plan_markers,
                     ),
                     reads=diagnostic_reads,
                     **({"auto_route": auto.record(diagnostic_reads)} if auto is not None else {}),

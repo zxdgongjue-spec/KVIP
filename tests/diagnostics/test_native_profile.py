@@ -127,6 +127,25 @@ def test_invalid_direct_index_counters_are_not_reported_as_saved_work(counts):
         )
 
 
+def test_compact_plan_counts_actual_rows_without_relabeling_latency():
+    raw = _raw()
+    producer = raw[:128].reshape(2, 64)[:, :32]
+    producer[:, 9] = [1, 0]
+    result = native_profile.decode_profile(
+        raw, batch=2, workers=2, resolver_cores=3, transport="urma", compact_plan_markers=True
+    )
+    assert result["compact_plan_counts"] == dict(active_rows=1, fallback_rows=1, rows=[True, False])
+    assert "compact_plan" not in result["metrics"]
+    assert "publication only" in result["scope"]["compact_plan"]
+    producer[:, 9] = -1
+    old = native_profile.decode_profile(raw, batch=2, workers=2, resolver_cores=3, transport="urma")
+    assert old["compact_plan_counts"] is None
+    with pytest.raises(ValueError, match="Invalid compact low plan counters"):
+        native_profile.decode_profile(
+            raw, batch=2, workers=2, resolver_cores=3, transport="urma", compact_plan_markers=True
+        )
+
+
 def test_early_drain_is_separate_from_later_resolver_join():
     raw = _raw()
     consumer = raw[:128].reshape(2, 64)[:, 32:]

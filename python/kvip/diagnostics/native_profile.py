@@ -10,7 +10,7 @@ import numpy as np
 
 def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_markers=False,
                    early_prefetch_drain=False, init_route_markers=False, row_route_publish=False,
-                   direct_index_markers=False):
+                   direct_index_markers=False, compact_plan_markers=False):
     raw = np.asarray(raw)
     expected = batch * 256 + (resolver_cores * batch + 4 * workers) * 32
     if raw.dtype != np.int64 or raw.size != expected or batch < 1 or workers < 1:
@@ -82,6 +82,15 @@ def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_
             direct_events=sum(int(value) for value in events),
             rows=[dict(row=b, direct=bool(eligible[b]), events=int(events[b]))
                   for b in range(batch)],
+        )
+    compact_plan_counts = None
+    if compact_plan_markers:
+        active = producer[:, 9]
+        if transport != "urma" or np.any(active > 1):
+            raise ValueError("Invalid compact low plan counters")
+        rows = int(np.count_nonzero(active))
+        compact_plan_counts = dict(
+            active_rows=rows, fallback_rows=batch - rows, rows=[bool(value) for value in active]
         )
     # The dedicated role markers bracket the entire Consumer, including an
     # optional early CQ drain before InitShadow. Keep the older work interval
@@ -159,6 +168,7 @@ def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_
     return dict(
         metrics=metrics,
         direct_index_counts=direct_index_counts,
+        compact_plan_counts=compact_plan_counts,
         ready_batch_counts=(dict(
             native_calls=sum(int(row[23]) for row in get_queries),
             completed_requests=sum(int(row[22]) for row in get_queries),
@@ -200,6 +210,11 @@ def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_
             + "; post_active/CQ drain sum safe and conflict phases only within each worker, not across workers",
             scan="No standalone full-history scan or QK duration is derived from these markers",
             aggregation="Median/max across request/query role samples; overlapping intervals are not additive",
+            compact_plan=(
+                "Capability-gated Producer slot9 records actual compact-plan execution, not duration. "
+                "Producer span includes the complete compact plan. Per-query Producer markers may "
+                "cover publication only; never compare them alone as equivalent planning cost."
+            ),
             index=(
                 "index_role_span brackets Consumer role entry/exit, including early prefetch drain; "
                 "index_consumer_span brackets the common work start through metadata commit and excludes early drain "
