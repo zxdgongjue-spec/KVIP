@@ -176,6 +176,12 @@ private:
     TBuf<TPosition::VECCALC> rollingBuf_;
     LocalTensor<uint16_t> rollingState_;
     bool rollingReady_[2]{};
+#if KVIP_ROLLING_WINDOWED
+    TBuf<TPosition::VECCALC> rollingWindowBuf_;
+    LocalTensor<SCORE_T> rollingWindow_;
+    uint32_t rollingWindowCount_ = 0, rollingReverseEnd_ = 0;
+    uint32_t rollingWindowEpoch_ = 1, rollingWindowTrigger_ = 0;
+#endif
 #if KVIP_ROLLING_BATCHED
     uint32_t rollingPending_[2]{};
 #endif
@@ -194,6 +200,12 @@ private:
                                                 uint32_t residentCount, uint32_t availableEnd) {
 #if KVIP_ROLLING_THRESHOLD
         rollingReady_[query % 2] = false;
+#if KVIP_ROLLING_WINDOWED
+        rollingWindowCount_ = 0;
+        rollingWindowEpoch_ = 1;
+        rollingWindowTrigger_ = rotating::Trigger(runtimeShape_.history, runtimeShape_.resident,
+                                                 runtimeShape_.rounds, rollingWindowEpoch_);
+#endif
 #if KVIP_ROLLING_BATCHED
         rollingPending_[query % 2] = 0;
 #endif
@@ -250,6 +262,15 @@ private:
 #endif
                 rollingReady_[bank] = true;
                 rollingEnds_[bank] = end; rollingBegin_[bank] = range.begin; rollingEnd_[bank] = range.end;
+#if KVIP_ROLLING_WINDOWED
+                uint32_t stop = runtimeShape_.history;
+                if (ctx->queryEnds) {
+                    auto ends = reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds) + (query / SIM_Q) * SIM_Q;
+                    for (uint32_t q = 0; q < SIM_Q; ++q) stop = Min(stop, ends[q]);
+                }
+                rollingReverseEnd_ = stop / 2048 * 2048;
+                PipeBarrier<PIPE_V>();
+#endif
             }
 #endif
             return true;
@@ -502,6 +523,12 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe, bool topkOnly)
     // Append, do not shift Fixpipe or any existing scratch-bank offsets.
     pipe->InitBuffer(rollingBuf_, 2 * kvip_rolling::kStateWords * sizeof(uint16_t));
     rollingState_ = rollingBuf_.Get<uint16_t>();
+#if KVIP_ROLLING_WINDOWED
+    if (!topkOnly) {
+        pipe->InitBuffer(rollingWindowBuf_, kvip_rolling::kWindowScores * sizeof(SCORE_T));
+        rollingWindow_ = rollingWindowBuf_.Get<SCORE_T>();
+    }
+#endif
 #endif
 
 #if KVIP_STREAMING_LI
@@ -787,17 +814,24 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     const uint32_t bank = curAivS1Idx % 2;
     if (!scoreOnly && curS2Idx >= runtimeShape_.resident && rollingReady_[bank]) {
         rolling = reinterpret_cast<__ubuf__ uint16_t*>(rollingState_[bank * kvip_rolling::kStateWords].GetPhyAddr());
+#if KVIP_ROLLING_WINDOWED
+        rollingAdvance = info.s2Idx + 1 == rollingWindowTrigger_;
+#else
         rollingMask0 = kvip_rolling::TileMask(curS2Idx, rollingEnds_[bank], rollingBegin_[bank], rollingEnd_[bank]);
         if (curAivS1ProcNum == 2)
             rollingMask1 = kvip_rolling::TileMask(curS2Idx, rollingEnds_[1], rollingBegin_[1], rollingEnd_[1]);
         rollingAdvance = rotating::IsTrigger(runtimeShape_.history, runtimeShape_.resident,
                                              runtimeShape_.rounds, info.s2Idx + 1);
+#endif
 #if KVIP_ROLLING_BATCHED
         rollingMask0 = kvip_rolling::BatchMask(rollingMask0, rollingPending_[bank], rollingAdvance);
         if (curAivS1ProcNum == 2)
             rollingMask1 = kvip_rolling::BatchMask(rollingMask1, rollingPending_[1], rollingAdvance);
 #endif
     }
+#endif
+#if KVIP_ROLLING_WINDOWED
+    if (rolling) outBase = rollingWindow_[rollingWindowCount_];
 #endif
     if (!scoreOnly && curS2Idx >= runtimeShape_.resident) {
     vector1::BatchClassifyScore(outBase, UB_BANK_DEPTH_STRIDE / sizeof(SCORE_T),
@@ -817,6 +851,23 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
                                         qScaleBase, UB_BANK_DEPTH_STRIDE / sizeof(SCALE_T),
                                         gSize_, curAivS1ProcNum);
     }
+#if KVIP_ROLLING_WINDOWED
+    if (rolling) {
+        rollingWindowCount_ += 128;
+        if (rollingAdvance) {
+            kvip_rolling::ObserveWindow(
+                reinterpret_cast<__ubuf__ uint16_t*>(rollingWindow_.GetPhyAddr()), rollingWindowCount_,
+                rolling, reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_[bank * 128].GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint16_t*>(classifyUB_[pingpong * 256].GetPhyAddr()),
+                (info.s2Idx + 1) * 128 - rollingWindowCount_, rollingEnds_[bank],
+                rollingBegin_[bank], rollingEnd_[bank],
+                (runtimeShape_.resident + 2047) / 2048 * 2048, rollingReverseEnd_);
+            rollingWindowCount_ = 0;
+            rollingWindowTrigger_ = rotating::Trigger(runtimeShape_.history, runtimeShape_.resident,
+                                                     runtimeShape_.rounds, ++rollingWindowEpoch_);
+        }
+    }
+#endif
     if (info.LoadQuery()) {
         SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_QSCALE + qScalepingpong);
     }

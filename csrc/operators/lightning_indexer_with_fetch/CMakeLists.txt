@@ -8,10 +8,14 @@ set(ASCEND_CANN_PACKAGE_PATH /usr/local/Ascend/cann CACHE PATH "CANN installatio
 set(KVAF_INCLUDE "" CACHE PATH "KVAF device interface headers")
 option(KVIP_REVERSE_COLD "Reverse complete 2K cold Index blocks in non-sequence-split URMA LI" OFF)
 option(KVIP_ROLLING_THRESHOLD "Capped BF16 CDF in the native LI score VF" OFF)
+option(KVIP_ROLLING_WINDOWED "Accumulate raw LI scores at existing window boundaries" OFF)
 option(KVIP_ROLLING_BATCHED "Batch eight LI score tiles per CDF update" OFF)
 option(KVIP_WINDOW_REFILTER "Recheck cold candidates against rolling Kth before admission" OFF)
-if((KVIP_WINDOW_REFILTER OR KVIP_ROLLING_BATCHED) AND NOT KVIP_ROLLING_THRESHOLD)
+if((KVIP_WINDOW_REFILTER OR KVIP_ROLLING_BATCHED OR KVIP_ROLLING_WINDOWED) AND NOT KVIP_ROLLING_THRESHOLD)
   message(FATAL_ERROR "Window refilter and batched counts require rolling threshold")
+endif()
+if(KVIP_ROLLING_BATCHED AND KVIP_ROLLING_WINDOWED)
+  message(FATAL_ERROR "Select either batch or window accumulation")
 endif()
 if(NOT EXISTS "${KVAF_INCLUDE}/kvaf_batch_get_device.h")
   message(FATAL_ERROR "Set KVAF_INCLUDE to the patched KVAF aiv_batch_get/include directory")
@@ -30,6 +34,7 @@ ascendc_include_directories(v9_kernel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/includ
 ascendc_compile_options(v9_kernel PRIVATE -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WORKER=$<BOOL:${KVIP_OUTPUT_WORKER}> -DKVIP_FUSE_QUERY_WORK=$<BOOL:${KVIP_FUSE_QUERY_WORK}> -O2 -g --cce-auto-sync=off
   -DKVIP_REVERSE_COLD=$<BOOL:${KVIP_REVERSE_COLD}>
   -DKVIP_ROLLING_THRESHOLD=$<BOOL:${KVIP_ROLLING_THRESHOLD}>
+  -DKVIP_ROLLING_WINDOWED=$<BOOL:${KVIP_ROLLING_WINDOWED}>
   -DKVIP_ROLLING_BATCHED=$<BOOL:${KVIP_ROLLING_BATCHED}>
   -DKVIP_WINDOW_REFILTER=$<BOOL:${KVIP_WINDOW_REFILTER}>
   -mllvm -user-reserved-ub-size=223232 -DV9_USER_UB_BYTES=223232
@@ -39,5 +44,5 @@ add_library(v9_bridge SHARED op_host/launch.cpp)
 target_include_directories(v9_bridge PRIVATE ${KVAF_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/include ${_base}/include)
 target_compile_definitions(v9_bridge PRIVATE KVIP_OUTPUT_WORKER=$<BOOL:${KVIP_OUTPUT_WORKER}>)
 target_compile_definitions(v9_bridge PRIVATE KVIP_REVERSE_COLD=$<BOOL:${KVIP_REVERSE_COLD}>)
-target_compile_definitions(v9_bridge PRIVATE KVIP_ROLLING_BATCHED=$<BOOL:${KVIP_ROLLING_BATCHED}> KVIP_ROLLING_THRESHOLD=$<BOOL:${KVIP_ROLLING_THRESHOLD}> KVIP_WINDOW_REFILTER=$<BOOL:${KVIP_WINDOW_REFILTER}>)
+target_compile_definitions(v9_bridge PRIVATE KVIP_ROLLING_WINDOWED=$<BOOL:${KVIP_ROLLING_WINDOWED}> KVIP_ROLLING_BATCHED=$<BOOL:${KVIP_ROLLING_BATCHED}> KVIP_ROLLING_THRESHOLD=$<BOOL:${KVIP_ROLLING_THRESHOLD}> KVIP_WINDOW_REFILTER=$<BOOL:${KVIP_WINDOW_REFILTER}>)
 target_link_libraries(v9_bridge PRIVATE v9_kernel host_intf_pub ascendcl)

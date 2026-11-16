@@ -846,7 +846,7 @@ __simd_callee__ inline void ReduceSumFinalizeClassify(AscendC::MicroAPI::RegTens
     AscendC::MicroAPI::RegTensor<uint16_t> regOut;
     FloatToSortableKey<bfloat16_t>(regOut, regSumBF16, bf16Ctx, maskAllB16);
     AscendC::MicroAPI::StoreAlign<uint16_t, AscendC::MicroAPI::StoreDist::DIST_NORM>(out_, regOut, maskAllB16);
-#if KVIP_ROLLING_THRESHOLD
+#if KVIP_ROLLING_THRESHOLD && !KVIP_ROLLING_WINDOWED
     kvip_rolling::Observe(regOut, rolling, threshold, mask0, advance);
     if (advance) MicroAPI::LocalMemBar<MicroAPI::MemType::VEC_STORE, MicroAPI::MemType::VEC_LOAD>();
 #endif
@@ -889,7 +889,7 @@ __simd_callee__ inline void ReduceSum2FinalizeClassify(AscendC::MicroAPI::RegTen
     FloatX2ToSortableKey<bfloat16_t>(regOut[0], regOut[1], regSumBF16[0], regSumBF16[1], bf16Ctx, maskAllB16);
     AscendC::MicroAPI::StoreAlign<uint16_t, AscendC::MicroAPI::StoreDist::DIST_NORM>(out0_, regOut[0], maskAllB16);
     AscendC::MicroAPI::StoreAlign<uint16_t, AscendC::MicroAPI::StoreDist::DIST_NORM>(out1_, regOut[1], maskAllB16);
-#if KVIP_ROLLING_THRESHOLD
+#if KVIP_ROLLING_THRESHOLD && !KVIP_ROLLING_WINDOWED
     kvip_rolling::Observe(regOut[0], rolling, threshold, mask0, advance);
     kvip_rolling::Observe(regOut[1], rolling ? rolling + kvip_rolling::kStateWords : nullptr,
                          threshold + 128, mask1, advance);

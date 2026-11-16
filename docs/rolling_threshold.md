@@ -131,3 +131,52 @@ measured, since additional branching/register pressure can offset savings.
 The controlled replay retains the previous `reverse-refilter` implementation
 and compares it against `reverse-batch-ref` in the same restored arena, plus
 no-rolling and forward-repeat controls. All batching cost is inside timing.
+
+## Window accumulation: move bookkeeping out of each score tile
+
+`KVIP_ROLLING_WINDOWED` is an alternative to eight-tile batching, not an
+additional nested batch. The original score VF writes directly into a dedicated
+36 KiB UB buffer, and the original score DMA reads that same buffer. There is
+no extra score copy per tile, no new Index read, and no new GM score pass.
+
+At the existing window boundary, one VF reads the accumulated raw scores,
+encodes two tiles together, and retains the CDF in registers until the whole
+window is counted. Full cold tiles use Max/Sub/Min/Sub encoding; causal-tail
+and recent-overlap tiles additionally mask ineligible lanes. The resident+recent
+seed uses the same paired histogram helper. A scalar next-trigger counter
+replaces the rolling code's repeated search over all window triggers. The
+existing progress/Fetch schedule still uses its own unchanged trigger logic.
+
+The last tile is classified again after selecting the new Kth, preserving the
+old update-before-classify rule at each boundary. Counts are capped once per
+window: previous count <=2048 plus <=18432 scores cannot overflow uint16.
+Reverse addressing still maps complete 2048-position blocks; neither the
+window count nor the 512/64 budgets change. Sorted final outputs remain the
+responsibility of the original exact TopK path.
+
+This opt-in variant requires H32, split-Q, no sequence splitting, and at most
+18432 raw scores per cold window. The host launcher and replay reject other
+shapes before launch. The raw buffer is not allocated for TopK-only kernels.
+Its allocation follows existing scratch buffers and does not alias their
+storage or change Fixpipe offsets.
+
+For the recorded history=131328, resident=16384, eight native epochs, each
+query has 898 cold tiles and seven cold-window boundaries. CDF loads/stores
+fall from 898 to seven per query, compared with 114 for the eight-tile variant.
+Histogram instructions are approximately halved, including the seed. These
+are operation counts, not a claim of equal percentage latency savings. The
+new UB reads, boundary VF, boundary bitmap reclassification, and additional UB
+occupancy all remain inside device-graph timing. The boundary burst can delay
+publication; only the full native replay can determine the net result.
+
+The CPU audit checks all window thresholds using archived score keys and an
+independent prefix TopK, without loading KV/Index tensors or allocating an NPU
+arena. Host lane tests also execute the actual native helper under ASan/UBSan.
+On the device, compare the original forward fused path at both ends, the prior
+per-tile and eight-tile implementations, then window accumulation with/without
+refilter and with/without reverse scan. Report waste, final repair, total
+bytes, mean and median together. A candidate must beat the faster baseline
+repeat in both mean and median by more than max(1%, observed repeat drift).
+This is a conservative screening rule, not a confidence interval or automatic
+runtime selection. An unsuccessful group stays on the original fused path.
+All new options remain off by default until hardware evidence supports them.

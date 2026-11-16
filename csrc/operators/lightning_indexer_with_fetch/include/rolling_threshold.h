@@ -5,6 +5,12 @@
 #ifndef KVIP_ROLLING_THRESHOLD
 #define KVIP_ROLLING_THRESHOLD 0
 #endif
+#ifndef KVIP_ROLLING_WINDOWED
+#define KVIP_ROLLING_WINDOWED 0
+#endif
+#if KVIP_ROLLING_WINDOWED && !KVIP_ROLLING_THRESHOLD
+#error "Window histogram requires rolling threshold"
+#endif
 #ifndef KVIP_ROLLING_BATCHED
 #define KVIP_ROLLING_BATCHED 0
 #endif
@@ -21,7 +27,11 @@
 #error "Rolling threshold experiment is URMA only"
 #endif
 
+#if KVIP_ROLLING_WINDOWED && KVIP_ROLLING_BATCHED
+#error "Select either window or eight-tile accumulation"
+#endif
 namespace kvip_rolling {
+constexpr uint32_t kWindowScores = 18432;
 constexpr uint32_t kBins = 256, kTop = 2048;
 // A capped reverse CDF plus a broadcast copy of the immutable seed key.
 constexpr uint32_t kCdfWords = kBins + 128;

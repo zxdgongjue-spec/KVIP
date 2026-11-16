@@ -3,6 +3,7 @@
 #include "context.h"
 #include "cold_scan.h"
 #include "rolling_threshold.h"
+extern "C" uint32_t kvip_rolling_windowed() { return KVIP_ROLLING_WINDOWED; }
 extern "C" uint32_t kvip_rolling_batched() { return KVIP_ROLLING_BATCHED; }
 extern "C" uint32_t kvip_rolling_threshold() { return KVIP_ROLLING_THRESHOLD; }
 extern "C" uint32_t kvip_window_refilter() { return KVIP_WINDOW_REFILTER; }
@@ -26,6 +27,12 @@ extern "C" uint32_t v9_li(void* bindings, void* stream, const rotating::RuntimeS
     // The refilter's per-row threshold snapshot uses the existing Q2/16K
     // scratch layout. Larger non-split-Q batches have a smaller scratch bank.
     if (!shape || !shape->splitQ || shape->batch > 16 || rotating::UseSequenceSplit(*shape)) return 100000;
+#if KVIP_ROLLING_WINDOWED
+    if (shape->indexHeads != 32 || shape->rounds < 2 || shape->history < shape->resident ||
+        shape->resident % 128 || shape->history % 128 ||
+        ((shape->history - shape->resident) / 128 + shape->rounds - 2) / (shape->rounds - 1) * 128 >
+            kvip_rolling::kWindowScores) return 100000;
+#endif
 #endif
 #define LI_LAUNCH_0 aclrtlaunch_v9_li_kernel
 #define LI_LAUNCH_1 aclrtlaunch_v9_li_kernel_1

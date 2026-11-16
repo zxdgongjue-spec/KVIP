@@ -27,9 +27,9 @@ def execute(tmp_path, source, name):
     subprocess.run([str(binary)], check=True, timeout=60)
 
 
-@pytest.mark.parametrize("batched", [0, 1])
+@pytest.mark.parametrize("batched,windowed", [(0, 0), (1, 0), (0, 1)])
 @pytest.mark.parametrize("reverse", [0, 1])
-def test_actual_cdf_saturation_ties_causal_tail_and_seed_dedup(tmp_path, batched, reverse):
+def test_actual_cdf_saturation_ties_causal_tail_and_seed_dedup(tmp_path, batched, windowed, reverse):
     model = register_model_source('#include "recent_index.h"')
     model = model[:model.index('#include "recent_threshold.h"')]
     model = model.replace("{DIST_DINTLV_B8}", "{DIST_DINTLV_B8,DIST_BRC_B16}")
@@ -102,11 +102,13 @@ int main(){
   auto seed=truth;seed.resize((seed.size()+255)/256*256,0);
   kvip_rolling::Seed(seed.data(),truth.size(),threshold.data(),storage.data()+16);
   const unsigned end=values.size()-71;
-  unsigned previous=initial,pending=0,expectedHistograms=0,batchCount=0;
+  unsigned previous=initial,pending=0,expectedHistograms=0,batchCount=0,windowCount=0;
+  std::array<uint16_t,kvip_rolling::kWindowScores> window{};
+  std::array<uint16_t,128> windowHits{};
   histograms=0;
   std::vector<unsigned> tiles;
   for(unsigned block=n;block<values.size();block+=2048)tiles.push_back(block);
-  if(REVERSE_TEST)std::reverse(tiles.begin(),tiles.end());
+  if(REVERSE_TEST)std::reverse(tiles.begin(),tiles.end()-1);
   unsigned ordinal=0;
   for(unsigned block:tiles)for(unsigned tile=block;tile<block+2048;tile+=128){
    RegTensor<uint16_t> score;LoadAlign(score,values.data()+tile);
@@ -117,11 +119,24 @@ int main(){
    // reversed block boundaries and the final partial causal tile.
    bool advance=(++ordinal)%137==0 || ordinal*128==values.size()-n;
    ++batchCount;
-   if(KVIP_ROLLING_BATCHED){
+   if(KVIP_ROLLING_WINDOWED){
+    assert(windowCount+128<=window.size());
+    std::copy_n(values.data()+tile,128,window.data()+windowCount);windowCount+=128;
+    if(advance){expectedHistograms+=2*((batchCount+1)/2);batchCount=0;}
+   }else if(KVIP_ROLLING_BATCHED){
     mask=kvip_rolling::BatchMask(mask,pending,advance);
     if(batchCount==8||advance){expectedHistograms+=2*((batchCount+1)/2);batchCount=0;}
    }else{expectedHistograms+=2;}
+#if KVIP_ROLLING_WINDOWED
+   if(advance){
+    kvip_rolling::ObserveWindow(window.data(),windowCount,storage.data()+16,threshold.data(),windowHits.data(),
+      n+ordinal*128-windowCount,end,recentBegin,recentEnd,n,end/2048*2048);
+    windowCount=0;
+    for(unsigned i=0;i<128;++i)assert(windowHits[i]==unsigned(score.v[i]>=threshold[0]&&score.v[i]>initial));
+   }
+#else
    kvip_rolling::Observe(score,storage.data()+16,threshold.data(),mask,advance);
+#endif
    if(advance){unsigned exact=kth(truth),expected=std::min(exact,unsigned(initial)+255);
     assert(threshold[0]==expected&&threshold[0]>=previous&&threshold[0]<=exact);
     previous=threshold[0];for(auto key:threshold)assert(key==expected);}
@@ -129,12 +144,13 @@ int main(){
    for(unsigned bin=0;bin<256;++bin)assert(storage[16+bin]<=2048);
   }
   assert(histograms==expectedHistograms);
-  if(KVIP_ROLLING_BATCHED)assert(pending==0&&histograms<ordinal*1.05);
+  if(KVIP_ROLLING_BATCHED||KVIP_ROLLING_WINDOWED)assert(pending==0&&windowCount==0&&histograms<ordinal*1.05);
   for(unsigned i=0;i<16;++i)assert(storage[i]==0xa55a&&storage[16+kvip_rolling::kStateWords+i]==0xa55a);
  }
 }
 '''
-    source = f"#define KVIP_ROLLING_BATCHED {batched}\n#define REVERSE_TEST {reverse}\n" + source
+    source = (f"#define KVIP_ROLLING_BATCHED {batched}\n#define KVIP_ROLLING_WINDOWED {windowed}\n"
+              f"#define KVIP_REVERSE_COLD {reverse}\n#define REVERSE_TEST {reverse}\n") + source
     execute(tmp_path, source, "rolling_cdf")
 
 
