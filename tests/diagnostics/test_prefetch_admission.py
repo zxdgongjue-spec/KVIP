@@ -53,6 +53,23 @@ def test_controls_override_fixed_geometry_and_uniform_equals_expanded():
     assert uniform["admission_controls"] == [[512, 128, 1, 0]] * 2
 
 
+def test_auto_zero_budget_keeps_configured_row_limit_without_relaxing_static_checks():
+    data = rows([[0, 0]], [[0, 0]], total=512, visited=[[False, False]])
+    with pytest.raises(ValueError, match="actual row totals"):
+        prefetch_admission(data, window_limit=64, rounds=2, admission_controls=[0, 64, 0, 0])
+    result = prefetch_admission(data, window_limit=64, rounds=2,
+                                admission_controls=[0, 64, 0, 0], configured_row_limit=512)
+    assert result["configured_row_limit"] == 512 and result["effective_budget"] == 0
+    assert result["remaining_admissible_budget"] == result["visited_epochs"] == 0
+    with pytest.raises(ValueError, match="actual row totals"):
+        prefetch_admission(data, window_limit=64, rounds=2,
+                           admission_controls=[0, 64, 0, 0], configured_row_limit=256)
+    bad = rows([[1, 0]], [[0, 0]], total=512, visited=[[True, False]])
+    with pytest.raises(ValueError, match="Zero-total"):
+        prefetch_admission(bad, window_limit=64, rounds=2,
+                           admission_controls=[0, 64, 0, 0], configured_row_limit=512)
+
+
 def test_carried_quota_subtracts_all_prior_posts():
     data = rows([[0, 10, 374, 128]], [[0, 0, 5, 3]])
     report = prefetch_admission(data, window_limit=64, rounds=4,

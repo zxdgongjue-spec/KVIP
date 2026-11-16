@@ -217,6 +217,12 @@ def create_fused(
             windows=g["requested_windows"],
             status_bytes=lease.sizes["status"],
         )
+        if effective.get("auto_route"):
+            from kvip.operators.lifetch.auto_route import AutoRouteState
+
+            state = AutoRouteState(torch, device, b, g["owners"])
+            state.set_learning(False)
+            kwargs["auto_route"] = state
         rotating = LIFetchBinding(
             torch,
             library,
@@ -236,9 +242,13 @@ def create_fused(
     if admission_controls is not None:
         if not upstream or transport != "urma":
             raise ValueError("Admission controls require an exact current URMA checkout")
-        rotating.set_admission_controls(
-            torch.tensor([admission_controls] * b, dtype=torch.int32, device="cpu")
-        )
+        if effective.get("auto_route"):
+            if tuple(admission_controls) != rotating.auto_route.full_controls:
+                raise ValueError("Auto route owns controls; replay must match its configured full policy")
+        else:
+            rotating.set_admission_controls(
+                torch.tensor([admission_controls] * b, dtype=torch.int32, device="cpu")
+            )
         effective["admission_controls"] = list(admission_controls)
     if effective.get("recent_seed_ub", False):
         from kvip.diagnostics.seed_eligibility import predict_seed_eligibility

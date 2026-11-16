@@ -338,7 +338,7 @@ def test_replay_cli_rejects_ambiguous_reference_options(tmp_path, mode):
 
 
 @pytest.mark.parametrize("transport", ["urma", "ubmem"])
-@pytest.mark.parametrize("policy", ["resident", "recent", "candidate", "ready-batch4"])
+@pytest.mark.parametrize("policy", ["resident", "recent", "candidate", "ready-batch4", "auto"])
 def test_upstream_factory_uses_old_builder_and_binding_signatures(tmp_path, monkeypatch, transport, policy):
     from kvip.adapters import kvaf
     from kvip.diagnostics import fused_replay
@@ -348,12 +348,12 @@ def test_upstream_factory_uses_old_builder_and_binding_signatures(tmp_path, monk
 
     if transport == "ubmem" and policy != "resident":
         pytest.skip("The new experiment is URMA-only")
-    from kvip.diagnostics.pipeline_options import options_for, q_workers_for
+    from kvip.diagnostics.pipeline_options import admission_for, options_for, q_workers_for
 
     options = (
-        options_for("combined") if policy == "candidate" else options_for(policy) if policy == "ready-batch4" else None
+        options_for("combined") if policy == "candidate" else options_for(policy) if policy in ("ready-batch4", "auto") else None
     )
-    workers = q_workers_for(policy) if policy == "ready-batch4" else 2
+    workers = q_workers_for(policy) if policy in ("ready-batch4", "auto") else 2
     calls = []
     tensor = SimpleNamespace(view=lambda *args: tensor)
     inputs = SimpleNamespace(query_ends=tensor, row_owners=tensor)
@@ -382,8 +382,23 @@ def test_upstream_factory_uses_old_builder_and_binding_signatures(tmp_path, monk
             assert ("threshold_bounds" in kwargs) == (policy != "resident")
             calls.append(("binding", kwargs))
             self.library = SimpleNamespace()
+            self.auto_route = kwargs.get("auto_route")
             for key, value in (options or {}).items():
                 setattr(self.library, "kvip_" + key, lambda value=value: int(value))
+
+        def set_admission_controls(self, value):
+            pytest.fail("Auto route must never call the manual admission setter")
+
+    class AutoState:
+        full_controls = (512, 64, 0, 0)
+
+        def __init__(self, *args):
+            pass
+
+        def set_learning(self, value):
+            assert value is False
+
+    monkeypatch.setitem(sys.modules, "kvip.operators.lifetch.auto_route", SimpleNamespace(AutoRouteState=AutoState))
 
     def build_urma(*, cache_dir, cann, headers, soc, **kwargs):
         assert kwargs == (options or {})
@@ -448,11 +463,12 @@ def test_upstream_factory_uses_old_builder_and_binding_signatures(tmp_path, monk
         tuning={"recent_threshold": policy != "resident"},
         pipeline_options=options,
         q_workers=workers,
+        admission_controls=admission_for("auto") if policy == "auto" else None,
     )
     assert calls[0][0] == transport + "_build" and calls[1][0] == "binding"
     assert bundle.tuning == dict(
         recent_threshold=policy != "resident", prefetch_limit=512, window_limit=64, q_workers=workers
-    ) | (options or {})
+    ) | (options or {}) | ({"admission_controls": [512, 64, 0, 0]} if policy == "auto" else {})
     assert bundle.tuning["prefetch_limit"] == 512 and bundle.tuning["window_limit"] == 64
 
 

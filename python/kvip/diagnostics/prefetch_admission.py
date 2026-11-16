@@ -28,7 +28,8 @@ ADMISSION_ACCOUNTING = {
 }
 
 
-def prefetch_admission(rows, *, window_limit, rounds, active_rows=None, admission_controls=None):
+def prefetch_admission(rows, *, window_limit, rounds, active_rows=None, admission_controls=None,
+                       configured_row_limit=None):
     """Read completed Rows using the immutable controls of this invocation.
 
     Controls are integer [total, window, key_steps, carry], uniformly [4] or
@@ -70,8 +71,17 @@ def prefetch_admission(rows, *, window_limit, rounds, active_rows=None, admissio
                 np.any(controls[:, 2] > 65535) or np.any(controls[:, 3] > 1)):
             raise ValueError("Prefetch admission controls exceed native bounds")
         controls = controls.astype(np.int64)
-        if not np.array_equal(words[:, 209], controls[:, 0]):
+        expected_totals = controls[:, 0]
+        if configured_row_limit is not None:
+            if type(configured_row_limit) is not int or not 1 <= configured_row_limit <= 2048:
+                raise ValueError("Auto configured row limit must be in 1..2048")
+            if not np.all(controls[:, 0] == controls[0, 0]):
+                raise ValueError("Auto effective budget must be batch-uniform")
+            expected_totals = np.full(len(values), configured_row_limit)
+        if not np.array_equal(words[:, 209], expected_totals):
             raise ValueError("Prefetch admission controls disagree with actual row totals")
+    elif configured_row_limit is not None:
+        raise ValueError("Auto configured row limit requires effective admission controls")
     posted = words[:, 16 : 16 + rounds]
     suppressed = words[:, 48 : 48 + rounds]
     orders = words[:, 214 : 214 + rounds]
@@ -98,6 +108,8 @@ def prefetch_admission(rows, *, window_limit, rounds, active_rows=None, admissio
     prior = np.empty_like(posted)
     np.put_along_axis(prior, service_order, np.cumsum(ordered_posts, axis=1) - ordered_posts, axis=1)
     effective = words[:, 208:211].min(axis=1)
+    if configured_row_limit is not None:
+        effective = np.minimum(effective, controls[:, 0])
     remaining = effective[:, None] - prior
     window_caps = np.full_like(posted, window_limit)
     if controls is not None:
@@ -134,6 +146,8 @@ def prefetch_admission(rows, *, window_limit, rounds, active_rows=None, admissio
         result["admission_controls"] = controls.tolist()
         windows = controls[:, 1]
         result["window_limit"] = int(windows[0]) if np.all(windows == windows[0]) else None
+    if configured_row_limit is not None:
+        result.update(configured_row_limit=configured_row_limit, effective_budget=int(controls[0, 0]))
     return result
 
 

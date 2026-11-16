@@ -60,6 +60,8 @@ def arguments(argv=None):
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--check-mode-switch", action="store_true",
                    help="Untimed light-low replay: one captured graph, quotas 0/512/0, restore before each")
+    p.add_argument("--check-auto-route", action="store_true",
+                   help="Untimed device-feedback lifecycle checks on the auto variant")
     p.add_argument("--profile-dir", type=Path, help="Independent system traces, outside headline timing")
     p.add_argument("--profile-metrics", nargs="+", choices=PROFILE_METRICS, default=None)
     p.add_argument(
@@ -108,6 +110,11 @@ def arguments(argv=None):
         p.error("topk-probe requires study=post-threshold")
     if args.check_mode_switch and (args.study != "post-threshold" or "light-low" not in args.pipeline_variants):
         p.error("check-mode-switch requires post-threshold with light-low")
+    auto = args.study == "post-threshold" and any(name in ("auto", "auto-end") for name in args.pipeline_variants)
+    if args.check_auto_route and not auto:
+        p.error("check-auto-route requires post-threshold with auto or auto-end")
+    if auto and (args.diagnostic_replays or args.profile_dir or args.topk_probe):
+        p.error("Auto routing currently requires diagnostic-replays=0 and no profile/topk-probe")
     if args.study in ("threshold-only", "seed-ub", "local-victims", "register-kth", "overlap-victims") and (
         args.transport != "urma" or args.mode != "fused"
     ):
@@ -155,6 +162,12 @@ def main(argv=None):
                 emit("MODE_SWITCH_PASS one_graph quotas=0/512/0 captured_addresses=unchanged "
                      "low_threshold_sentinel=unchanged "
                      "snapshot_restore_each=true untimed=true continuous_service_state=not_tested")
+            if route := case.get("auto_route"):
+                emit(f"AUTO_ROUTE_PASS {name} low_steps={route['low_steps']} high_steps={route['high_steps']} "
+                     "feedback=device_previous_success capture_warmup_learning=false device_policy_in_timing=true")
+                if route.get("lifecycle"):
+                    emit("AUTO_LIFECYCLE_PASS one_graph feedback_reset=false packed_row_reorder=true "
+                         "prediction_fault_injection=true rejection=identity_not_transport_fault snapshot_restore_each=true")
     except BaseException as error:
         active = retained.get("active_case")
         result = dict(

@@ -14,7 +14,7 @@ from kvip.diagnostics import replay_measure
 from kvip.diagnostics.pipeline_options import DEFAULT_VARIANTS, admission_for, options_for, q_workers_for, validate_options
 
 
-def _arguments(tmp_path, monkeypatch, variants=None):
+def _arguments(tmp_path, monkeypatch, variants=None, diagnostic_replays=None):
     monkeypatch.setattr(compare, "validate_checkout", lambda path, sha: Path(path).resolve())
     monkeypatch.setattr(compare, "source_commit", lambda: "4" * 40)
     build, snapshot = tmp_path / "build", tmp_path / "snapshot"
@@ -41,6 +41,8 @@ def _arguments(tmp_path, monkeypatch, variants=None):
         argv += [f"--{role}-root", str(tmp_path / role), f"--{role}-sha", sha * 40]
     if variants is not None:
         argv += ["--pipeline-variants", *variants]
+    if diagnostic_replays is not None:
+        argv += ["--diagnostic-replays", str(diagnostic_replays)]
     return compare.arguments(argv)
 
 
@@ -199,6 +201,39 @@ def test_mode_switch_flag_only_reaches_candidate_and_requires_proof(tmp_path, mo
     reports["candidate-light-low"]["mode_switch_check"]["graph_captures"] = 3
     with pytest.raises(ValueError, match="same-graph"):
         compare.summarize(args, reports, digest)
+
+
+def test_auto_parser_and_summary_keep_cold_start_traffic_and_dynamic_low_threshold(tmp_path, monkeypatch, capsys):
+    args = _arguments(tmp_path, monkeypatch, ["light-low", "light-high", "auto"], diagnostic_replays=0)
+    args.check_auto_route = True
+    for job in compare.jobs(args):
+        parsed = replay.arguments(compare.command(args, job)[4:])
+        assert parsed.check_auto_route == (job["role"] == "candidate")
+    reports = _reports(args)
+    case = reports["candidate-auto"]
+    case["tuning"]["auto_low_active"] = True
+    case["threshold_comparison"].update(status="not_computed", initial_keys=None)
+    for reads in case["reads_samples"][1:]:
+        reads.update(prefetch=0, final=5, unused_prefetch=0, unused_prefetch_bytes=0, bytes=3280)
+    case["auto_route"] = dict(
+        status="pass", capture_and_warmup_learning=False, decision_and_feedback_in_timing=True,
+        low_steps=2, high_steps=1, lifecycle={"status": "pass"},
+        samples=[dict(mode="high", observed_prefetch=4), dict(mode="low", observed_prefetch=0),
+                 dict(mode="low", observed_prefetch=0)])
+    digest = compare.file_digest(args.snapshot / "manifest.json")
+    summary = compare.summarize(args, reports, digest)
+    assert summary["table"]["candidate-auto"]["reads"]["prefetch"] == pytest.approx(4 / 3)
+    compare.print_summary(summary, brief=True)
+    output = capsys.readouterr().out
+    assert "AUTO_ROUTE_PASS low_steps=2 high_steps=1" in output
+    assert "EARLY_THRESHOLD_NOT_COMPUTED candidate-light-low prefetch=0" in output
+    assert "EARLY_THRESHOLD_NOT_COMPUTED candidate-auto" not in output
+    case["auto_route"]["capture_and_warmup_learning"] = True
+    with pytest.raises(ValueError, match="automatic route"):
+        compare.summarize(args, reports, digest)
+    args.diagnostic_replays = 1
+    with pytest.raises(SystemExit):
+        replay.arguments(compare.command(args, compare.jobs(args)[-1])[4:])
 
 
 def test_inverse_mapping_pairs_use_matching_same_arena_controls(tmp_path, monkeypatch, capsys):

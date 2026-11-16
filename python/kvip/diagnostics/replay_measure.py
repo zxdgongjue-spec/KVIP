@@ -82,7 +82,7 @@ def statistics(samples):
 
 
 def fused_reads(torch, rotating, update, transport, width, demand=None, *, window_limit=None, active_rows=None,
-                admission_controls=None, skip_exhausted_prefetch=False):
+                admission_controls=None, skip_exhausted_prefetch=False, configured_row_limit=None):
     rows = cpu_array(torch, rotating.rows)
     status = cpu_array(torch, rotating.row_status)
     posts = cpu_array(torch, rotating.final_posts)
@@ -130,6 +130,7 @@ def fused_reads(torch, rotating, update, transport, width, demand=None, *, windo
         result["prefetch_admission"] = prefetch_admission(
             rows, window_limit=window_limit, rounds=rotating.rounds, active_rows=active_rows,
             admission_controls=admission_controls,
+            configured_row_limit=configured_row_limit,
         )
     if skip_exhausted_prefetch:
         events = cpu_array(torch, rotating.events)
@@ -152,6 +153,8 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         if target.shape != seed.shape or target.dtype != seed.dtype:
             raise ValueError(f"Replay binding differs from captured tensor: {name}")
         seeds.append((target, seed))
+    if getattr(rotating, "threshold_bounds", None) is not None:
+        seeds.append((rotating.threshold_bounds, archive.tensor("pre.threshold_bounds", torch, device)))
     oracle = DecodeOracle(archive)
     demand = SnapshotDemand(archive)
     expected = archive.array("post.logical_output").reshape(archive.manifest["geometry"]["batch"] * 4, 2048)
@@ -167,6 +170,8 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         # Production init resets round-local work; never rewind transport queues.
 
     def read_counts():
+        if getattr(bundle, "auto_replay", None) is not None:
+            bundle.auto_replay.observe()
         reads = fused_reads(
             torch,
             rotating,
@@ -176,8 +181,11 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
             demand,
             window_limit=bundle.tuning["window_limit"],
             active_rows=active_rows,
-            admission_controls=bundle.tuning.get("admission_controls"),
+            admission_controls=(bundle.auto_replay.latest["controls"] if getattr(bundle, "auto_replay", None)
+                                else bundle.tuning.get("admission_controls")),
             skip_exhausted_prefetch=bundle.tuning.get("skip_exhausted_prefetch", False),
+            configured_row_limit=(bundle.auto_replay.state.full_controls[0]
+                                  if getattr(bundle, "auto_replay", None) else None),
         )
 
         logical = cpu_array(torch, update.logical_output)
@@ -309,10 +317,13 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
         return result
     begin, end = [torch.npu.Event(enable_timing=True) for _ in range(2)]
     retained["events"] = [begin, end]
-    samples, reads = [], []
+    samples, reads, auto_samples = [], [], []
+    auto = getattr(bundle, "auto_replay", None)
     for step in range(args.warmup + args.iterations):
         phase(retained, "iteration_reset", step)
         reset()
+        if auto is not None:
+            auto.begin(step=max(0, step - args.warmup + 1), learning=step >= args.warmup)
         stream.synchronize()
         phase(retained, "warmup_replay" if step < args.warmup else "timed_replay", step)
         begin.record(stream)
@@ -325,10 +336,27 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
         if step >= args.warmup:
             samples.append(float(elapsed))
             reads.append(counts)
+            if auto is not None:
+                auto_samples.append(auto.record(counts))
     phase(retained, "final_verify")
     verify()  # Full score/Index/KV oracle after the final measured replay.
     result = dict(timing=statistics(samples), reads_samples=reads)
-    if getattr(args, "check_mode_switch", False) and early_threshold_skipped(getattr(bundle, "tuning", {})):
+    if auto is not None:
+        config = cpu_array(torch, auto.state.config)
+        result["auto_route"] = dict(
+            status="pass", samples=auto_samples, low_steps=sum(row["mode"] == "low" for row in auto_samples),
+            high_steps=sum(row["mode"] == "high" for row in auto_samples),
+            low_budget=int(config[5]), high_budget=int(config[6]), budget_units="Get_bytes * 1024 / active_score_positions",
+            feedback_source="Previous successful device completion; no oracle counts uploaded",
+            capture_and_warmup_learning=False, decision_and_feedback_in_timing=True,
+            metadata_h2d_in_timing=False, snapshot_restored_each_step=True,
+            cold_start_us=samples[0], steady_timing=statistics(samples[1:]) if len(samples) > 1 else None,
+            scope="One frozen input with evolving device feedback, not a live multi-step request trajectory")
+        if getattr(args, "check_auto_route", False):
+            phase(retained, "auto_route_lifecycle")
+            result["auto_route"]["lifecycle"] = check_auto_route(torch, stream, bundle, lambda: replay(graph), args.iterations)
+    if (getattr(args, "check_mode_switch", False) and auto is None
+            and early_threshold_skipped(getattr(bundle, "tuning", {}))):
         phase(retained, "mode_switch_check")
         result["mode_switch_check"] = check_mode_switch(torch, stream, bundle, lambda: replay(graph))
     diagnostic_count = getattr(args, "diagnostic_replays", 0)
@@ -501,6 +529,10 @@ def measure_case(args, archive, context, retained):
         retained["buffers_variant"] = retained["progress"].get("variant")
         phase(retained, "prepare_fused_state")
         prepare_fused_state(bundle, archive, restored, torch, device, args.transport)
+        if bundle.tuning.get("auto_route"):
+            from kvip.diagnostics.auto_replay import AutoReplay
+
+            bundle.auto_replay = AutoReplay(torch, bundle, archive)
     else:
         from kvip.diagnostics.serial_replay import create_serial
 
@@ -734,6 +766,65 @@ def study_cases(args):
             for name, pipeline, topk in (("before", False, False), ("pipeline", True, False), ("unified", True, True))
         }
     return {policy: {"recent_threshold": policy == "recent", "recent_skip": True} for policy in ("resident", "recent")}
+
+
+def check_auto_route(torch, stream, bundle, replay, last_step):
+    """Same captured graph, real packed-row reorder, device-owned feedback."""
+    from kvip.diagnostics.auto_replay import RowPermutation, requests_for
+
+    auto = bundle.auto_replay
+    original = auto.archive
+    pointers = buffer_addresses(bundle)
+    rows = []
+
+    def run(name, step, *, learning=True, generation=1, reject=False, archive=None, expected_mode=None):
+        stream.synchronize()
+        selected = original if archive is None else archive
+        if selected is not auto.archive:
+            prepare_fused_state(bundle, selected, bundle.restored, torch, bundle.rotating.device, "urma")
+            auto.archive = selected
+        if buffer_addresses(bundle) != pointers:
+            raise AssertionError("Auto lifecycle changed a captured input address")
+        requests = requests_for(selected, generation=generation, step=step)
+        if reject:
+            requests[:, 3] = 3  # Safe identity/Q mismatch; never inject a transport fault.
+        auto.begin(step=step, learning=learning, requests=requests)
+        bundle.reset()
+        stream.synchronize()
+        replay()
+        stream.synchronize()
+        reads = bundle.verify()
+        observation = auto.record(reads)
+        if (not learning or reject or name in ("duplicate", "backward", "old-generation")) and observation["learned_owners"]:
+            raise AssertionError("Rejected lifecycle step learned new feedback")
+        if expected_mode is not None and observation["mode"] != expected_mode:
+            raise AssertionError("Prediction fault did not exercise the requested graph mode")
+        rows.append(dict(name=name, **observation))
+
+    run("learning-disabled", last_step + 1, learning=False)
+    run("duplicate", last_step)
+    run("backward", max(0, last_step - 1))
+    run("identity-rejected", last_step + 1, reject=True)
+    run("resume", last_step + 1)
+    run("new-generation", 1, generation=2)
+    run("old-generation", last_step + 2)
+    run("new-generation-resume", 2, generation=2)
+    order = np.arange(bundle.rotating.batch)[::-1]
+    run("packed-row-reorder", 3, generation=2, archive=RowPermutation(original, order))
+    run("restore-row-order", 4, generation=2)
+    # Deliberately corrupt only the predicted demand, after every headline
+    # sample. These fault injections are not the normal learning mechanism.
+    auto.inject_prediction_fault(0)
+    run("prediction_fault_injection_low", 5, generation=2, expected_mode="low")
+    run("prediction_fault_recovery_low", 6, generation=2)
+    auto.inject_prediction_fault(8192)
+    run("prediction_fault_injection_high", 7, generation=2, expected_mode="high")
+    run("prediction_fault_recovery_high", 8, generation=2)
+    return dict(status="pass", graph_captures=1, captured_addresses_unchanged=True,
+                sequence=rows, included_in_timing=False, snapshot_restored_before_each=True,
+                feedback_reset=False, real_packed_row_reorder=True,
+                prediction_fault_injection=True,
+                scope="Untimed prediction fault injection and identity rejection, not a real transport fault; frozen payload restored, not consecutive service cache evolution")
 
 
 def check_mode_switch(torch, stream, bundle, replay):

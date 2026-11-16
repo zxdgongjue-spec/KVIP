@@ -46,6 +46,7 @@ def arguments(argv=None):
     parser.add_argument("--matched-before", action="store_true", help="Also run the PR checkout with matching pre-existing candidate configurations")
     parser.add_argument("--check-mode-switch", action="store_true",
                         help="Verify one light-low graph with quotas 0/512/0; restore snapshot outside timing")
+    parser.add_argument("--check-auto-route", action="store_true", help="Verify device feedback and request lifecycle on auto variants")
     args = parser.parse_args(argv)
     if args.device < 0 or args.warmup < 0 or args.iterations < 1 or args.diagnostic_replays < 0:
         parser.error("Require nonnegative device/warmup and positive iterations")
@@ -53,6 +54,11 @@ def arguments(argv=None):
         parser.error("pipeline-variants must be unique; order is preserved")
     if args.check_mode_switch and "light-low" not in args.pipeline_variants:
         parser.error("check-mode-switch requires the light-low variant")
+    auto = any(name in ("auto", "auto-end") for name in args.pipeline_variants)
+    if args.check_auto_route and not auto:
+        parser.error("check-auto-route requires auto or auto-end")
+    if auto and (args.diagnostic_replays or args.topk_probe):
+        parser.error("auto requires diagnostic-replays=0 and no topk-probe")
     if args.result_dir.exists():
         parser.error("result-dir already exists; choose a new directory")
     for role in ("main", "pr", "candidate"):
@@ -134,6 +140,8 @@ def command(args, job):
             result += ["--topk-probe"]
         if job["role"] == "candidate" and getattr(args, "check_mode_switch", False):
             result += ["--check-mode-switch"]
+        if job["role"] == "candidate" and getattr(args, "check_auto_route", False):
+            result += ["--check-auto-route"]
     return result
 
 
@@ -207,9 +215,20 @@ def _validate_case(args, name, result, manifest_digest):
         status = "not_computed" if skipped else "bit_exact"
         if threshold.get("status") != status or threshold.get("policy") != policy:
             raise ValueError(f"{name}: initial threshold policy was not verified bit-exact")
+        automatic = bool(result.get("tuning", {}).get("auto_route"))
         if skipped and (threshold.get("initial_keys") is not None or
-                        any(row["prefetch"] != 0 for row in result["reads_samples"])):
+                        (not automatic and any(row["prefetch"] != 0 for row in result["reads_samples"]))):
             raise ValueError(f"{name}: low mode must skip early threshold and issue zero prefetch reads")
+        if automatic:
+            route = result.get("auto_route", {})
+            samples = route.get("samples", [])
+            if (route.get("status") != "pass" or len(samples) != args.iterations
+                    or route.get("capture_and_warmup_learning") is not False
+                    or route.get("decision_and_feedback_in_timing") is not True
+                    or any(row["mode"] == "low" and row["observed_prefetch"] != 0 for row in samples)):
+                raise ValueError(f"{name}: incomplete automatic route validation")
+            if getattr(args, "check_auto_route", False) and route.get("lifecycle", {}).get("status") != "pass":
+                raise ValueError(f"{name}: missing auto lifecycle validation")
         if name == "candidate-light-low" and getattr(args, "check_mode_switch", False):
             switch = result.get("mode_switch_check", {})
             rows = switch.get("sequence", [])
@@ -309,7 +328,7 @@ def summarize(args, results, manifest_digest):
             gate = result["threshold_comparison"].get("prefetch_gate", {})
             if rank and (gate.get("status") != "bit_exact" or gate.get("rank") != rank):
                 raise ValueError(f"{name}: speculative rank gate was not verified")
-            excluded = (*OPTIONS, *OPTIONAL_OPTIONS, *NUMERIC_OPTIONS, "q_workers", "admission_controls")
+            excluded = (*OPTIONS, *OPTIONAL_OPTIONS, *NUMERIC_OPTIONS, "q_workers", "admission_controls", "auto_low_active")
             if {key: value for key, value in tuning.items() if key not in excluded} != {
                 key: value for key, value in pr.get("tuning", {}).items() if key != "q_workers"
             }:
@@ -343,6 +362,7 @@ def summarize(args, results, manifest_digest):
             selection_comparison=result["selection_comparison"],
             threshold_comparison=result.get("threshold_comparison"),
             mode_switch_check=result.get("mode_switch_check"),
+            auto_route=result.get("auto_route"),
             diagnostic_summary=profile_summary(result),
             capacity_skipped_row_windows=(sum(
                 item["capacity_skipped_row_windows"] for item in result["reads_samples"]
@@ -483,7 +503,8 @@ def print_summary(summary, brief=False):
         print(f"LIGHT_HIGH_DRIFT mean={drift['mean']['drift_pct']:+.2f}% "
               f"p50={drift['p50']['drift_pct']:+.2f}% no_correction", flush=True)
     skipped = [name for name, row in summary["table"].items()
-               if (row.get("threshold_comparison") or {}).get("status") == "not_computed"]
+               if (row.get("threshold_comparison") or {}).get("status") == "not_computed"
+               and not row.get("auto_route")]
     if skipped:
         print("EARLY_THRESHOLD_NOT_COMPUTED " + ",".join(skipped) + " prefetch=0; final_scores_topk_kv_index=verified", flush=True)
     for row in summary["table"].values():
@@ -491,6 +512,12 @@ def print_summary(summary, brief=False):
             print("MODE_SWITCH_PASS one_graph quotas=0/512/0 captured_addresses=unchanged "
                   "low_threshold_sentinel=unchanged "
                   "snapshot_restore_each=true untimed=true continuous_service_state=not_tested", flush=True)
+        if route := row.get("auto_route"):
+            print(f"AUTO_ROUTE_PASS low_steps={route['low_steps']} high_steps={route['high_steps']} "
+                  "feedback=device_previous_success capture_warmup_learning=false device_policy_in_timing=true", flush=True)
+            if route.get("lifecycle"):
+                print("AUTO_LIFECYCLE_PASS one_graph feedback_reset=false packed_row_reorder=true "
+                      "prediction_fault_injection=true rejection=identity_not_transport_fault snapshot_restore_each=true", flush=True)
     if brief:
         print("case                   mean_us    p50_us  prefetch    final   unused  vsSerial_mean/p50%  vsBefore_mean/p50%", flush=True)
         for name, row in summary["table"].items():
