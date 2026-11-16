@@ -2,12 +2,31 @@
 """One public LIFetch pipeline for URMA and UBmem."""
 
 from kvip.operators.lifetch.streaming import StreamingLIFetchForward
+from kvip.operators.lifetch.staged import StagedLIFetchForward
 
 
-class LIFetchForward(StreamingLIFetchForward):
-    def __init__(self, rotating, update, *, q_workers=2, aiv_budget=None):
-        super().__init__(
-            rotating, update, rotating.torch, rotating.prefetch_limit, fused_final=True, q_workers=q_workers, aiv_budget=aiv_budget
+class LIFetchForward(StagedLIFetchForward):
+    def __init__(self, rotating, update, *, q_workers=2, aiv_budget=None, score_route=None):
+        self.staged_score = getattr(rotating, "staged", False)
+        route = (
+            getattr(rotating, "score_route", "auto" if self.staged_score else "legacy")
+            if score_route is None
+            else score_route
+        )
+        if self.staged_score:
+            super().__init__(rotating, update, q_workers=q_workers, aiv_budget=aiv_budget, route=route)
+            return
+        if route != "legacy":
+            raise ValueError("Prepare LIFetchBinding(score_route=...) before enabling split score")
+        StreamingLIFetchForward.__init__(
+            self,
+            rotating,
+            update,
+            rotating.torch,
+            rotating.prefetch_limit,
+            fused_final=True,
+            q_workers=q_workers,
+            aiv_budget=aiv_budget,
         )
         # Prepare address/logical metadata as each Q arrives. Finalize ordering
         # remains the measured baseline; transport-specific resources stay leased.
@@ -15,3 +34,8 @@ class LIFetchForward(StreamingLIFetchForward):
         self.ubmem_overlap_fetch = hasattr(rotating, "lease")
         self.parallel_finalize = self.ubmem_overlap_fetch
         self.set_options()
+
+    def __call__(self):
+        if self.staged_score:
+            return StagedLIFetchForward.__call__(self)
+        return StreamingLIFetchForward.__call__(self)

@@ -5,12 +5,26 @@ import ctypes
 
 import numpy as np
 
-from kvip.operators.lifetch.schedule import StreamingSchedule
+from kvip.operators.lifetch.schedule import StreamingSchedule, StagedStreamingSchedule
 from kvip.runtime.device import query_device_resources
+from kvip.operators.lifetch.workspace import device_words
 
 
 class StreamingLIFetchForward:
-    def __init__(self, rotating, update, torch, prefetch_limit, *, fused_final=False, q_workers=None, aiv_budget=None):
+    def __init__(
+        self,
+        rotating,
+        update,
+        torch,
+        prefetch_limit,
+        *,
+        fused_final=False,
+        q_workers=None,
+        aiv_budget=None,
+        _staged=False,
+    ):
+        if getattr(rotating, "staged", False) and not _staged:
+            raise ValueError("Use StagedLIFetchForward with a staged LIFetchBinding")
         if rotating.device != update.device:
             raise ValueError("Fetch and Index update must use the same device")
         if update.bindings.numel() != 28:
@@ -19,7 +33,7 @@ class StreamingLIFetchForward:
         shape = rotating.runtime_shape
         self.batch, self.history, self.resident = shape.batch, shape.history, shape.resident
         self.shape_pointer = ctypes.byref(shape)
-        if not 1 <= self.batch <= 16:
+        if not 1 <= self.batch <= (32 if _staged else 16):
             raise ValueError(f"LIFetch supports BS1..16; received BS={self.batch}; no legacy fallback")
         if not (
             2048 <= self.resident <= 131072
@@ -60,7 +74,9 @@ class StreamingLIFetchForward:
             raise ValueError("Requested AIV budget exceeds the actual device")
         if shape.aicCount > int(physical["aic"]):
             raise ValueError("Requested AIC budget exceeds the actual device")
-        self.schedule = StreamingSchedule(b, int(shape.aicCount), aiv_budget, int(shape.liCores), q_workers)
+        self.schedule = (StagedStreamingSchedule if _staged else StreamingSchedule)(
+            b, int(shape.aicCount), aiv_budget, int(shape.liCores), q_workers
+        )
         if not hasattr(rotating, "lease") and getattr(rotating, "queue_count", 0) < self.schedule.urma_queues:
             raise ValueError("URMA queues do not cover the requested Fetch workers")
         if shape.finalWorkers != 4:
@@ -119,10 +135,8 @@ class StreamingLIFetchForward:
         if len(blob) != 256:
             raise AssertionError(f"LIFetch workspace ABI size={len(blob)}, expected 256")
         self.workspace = torch.from_numpy(blob.copy()).to(device)
-        rotating.bindings = torch.tensor(
-            [x.data_ptr() for x in rotating.arguments] + [self.workspace.data_ptr()],
-            dtype=torch.uint64,
-            device=device,
+        rotating.bindings = device_words(
+            torch, [x.data_ptr() for x in rotating.arguments] + [self.workspace.data_ptr()], device
         )
         self.function.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_uint32] * 2
         self.function.restype = ctypes.c_uint32

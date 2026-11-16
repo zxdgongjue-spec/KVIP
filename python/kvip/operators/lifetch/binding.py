@@ -7,7 +7,8 @@ import numpy as np
 
 from kvip.operators.lifetch.geometry import final_aivs, li_geometry, prefetch_budget
 from kvip.operators.lifetch.tiling import RuntimeShape
-from kvip.operators.lifetch.workspace import rotation_spec
+from kvip.operators.lifetch.workspace import rotation_spec, device_words
+
 
 class LIFetchBinding:
     def __init__(
@@ -36,11 +37,20 @@ class LIFetchBinding:
         tail_bounds=None,
         output_stride=None,
         scratch=None,
+        staged=False,
+        aiv_budget=None,
+        q_workers=2,
+        score_route="legacy",
     ):
+        if score_route not in ("legacy", "auto", "history", "bsq"):
+            raise ValueError("score_route must be legacy, auto, history or bsq")
+        staged = staged or score_route != "legacy"
+        if staged and (final_workers not in (0, 4) or intermediate_fetches < 2):
+            raise ValueError("Split score requires four Final records and Hot/Cold windows")
         if resident > 131072:
             raise ValueError("LIFetch hot bitmap supports resident <= 131072")
-        if not 1 <= batch <= 16:
-            raise ValueError(f"LIFetch supports BS1..16; received BS={batch}; no legacy fallback")
+        if not 1 <= batch <= (32 if staged else 16):
+            raise ValueError(f"LIFetch supports BS1..{32 if staged else 16}; received BS={batch}")
         self.torch, self.owner = torch, owner
         self.library = load_lifetch_library(library)
         self.device = arguments[0].device
@@ -50,6 +60,14 @@ class LIFetchBinding:
             or any(x.device != self.device or not x.is_contiguous() for x in arguments)
         ):
             raise ValueError("V9 requires 14 contiguous input buffers on the same NPU")
+        if staged and aiv_budget is None:
+            from kvip.runtime.device import query_device_resources
+
+            ordinal = self.device.index if self.device.index is not None else torch.npu.current_device()
+            aiv_budget = int(query_device_resources("", ordinal)["aiv"])
+        self.staged = staged
+        self.score_route = "auto" if staged and score_route == "legacy" else score_route
+        self.aiv_budget = aiv_budget
         self.runtime_shape = RuntimeShape.prepare(
             self.library,
             batch=batch,
@@ -62,8 +80,20 @@ class LIFetchBinding:
             service_aics=service_aics,
             final_workers=final_workers,
             token_bytes=token_bytes,
+            staged=staged,
+            aiv_budget=aiv_budget,
+            q_workers=q_workers,
         )
         self.shape_pointer = ctypes.byref(self.runtime_shape)
+        if staged:
+            geometry = dict(
+                logical_aic_tasks=self.runtime_shape.liCores,
+                rotating_aic=self.runtime_shape.liCores,
+                service_aivs_per_window=self.runtime_shape.serviceLanes,
+                intermediate_fetches=self.runtime_shape.rounds,
+            )
+        else:
+            geometry = li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)
         for name, expected in (
             ("token_bytes", token_bytes),
             ("final_replicated", int(final_strategy == "replicated")),
@@ -72,13 +102,13 @@ class LIFetchBinding:
             ("abi_version", 11),
             (
                 "service_lanes",
-                li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)["service_aivs_per_window"],
+                geometry["service_aivs_per_window"],
             ),
             (
                 "rounds",
-                li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)["intermediate_fetches"],
+                geometry["intermediate_fetches"],
             ),
-            ("li_cores", li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)["rotating_aic"]),
+            ("li_cores", geometry["rotating_aic"]),
             ("batch", batch),
             ("history", history),
             ("resident", resident),
@@ -92,7 +122,6 @@ class LIFetchBinding:
                 raise ValueError(f"V9 binary contract mismatch: {name}")
         prefetch_limit, window_limit = prefetch_budget(prefetch_limit, window_limit, intermediate_fetches)
         self.prefetch_limit = prefetch_limit
-        geometry = li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)
         if geometry["logical_aic_tasks"] > aic_count or not geometry["intermediate_fetches"]:
             raise ValueError("Direct hot-first mode requires a window and concurrently resident LI tasks")
         contexts = owner.build_device_args(library)
@@ -100,12 +129,8 @@ class LIFetchBinding:
         required_queues = 2 * batch  # Forward checks the separate Fetch-worker range.
         if contexts.shape[0] < required_queues:
             raise ValueError("V9 requires exclusive prefetch and per-final-AIV queues")
-        self.rounds = li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)[
-            "intermediate_fetches"
-        ]
-        self.service_lanes = li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)[
-            "service_aivs_per_window"
-        ]
+        self.rounds = geometry["intermediate_fetches"]
+        self.service_lanes = geometry["service_aivs_per_window"]
 
         self.final_workers = final_aivs(batch, li_tiling, aic_count, final_workers)
         spec = rotation_spec(
@@ -213,7 +238,7 @@ class LIFetchBinding:
         )
         self.context = torch.from_numpy(blob.copy()).to(self.device)
         self.arguments = tuple(arguments) + (self.context,)
-        self.bindings = torch.tensor([x.data_ptr() for x in self.arguments], dtype=torch.uint64, device=self.device)
+        self.bindings = device_words(torch, [x.data_ptr() for x in self.arguments], self.device)
         self.functions = {}
         for name in ("init", "li"):
             fn = getattr(self.library, "v9_" + name)

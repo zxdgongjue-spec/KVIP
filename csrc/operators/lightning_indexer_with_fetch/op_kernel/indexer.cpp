@@ -84,3 +84,6 @@ extern "C" __global__ __aicore__ void v9_li_kernel_3(GM_ADDR bindings) {
     if ASCEND_IS_AIV { RunLi<SequenceLiPhase::Final>(bindings); }
 #endif
 }
+#if defined(__CCE_AICORE__)
+#include "staged_indexer.h"
+#endif

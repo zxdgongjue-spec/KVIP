@@ -36,6 +36,20 @@ def _bind_selectors(torch, policy, config):
         raise RuntimeError("LIFetch requires profiled workspace and bound service caches")
     if policy.indexer_selectors:
         raise RuntimeError("LIFetch selectors are already bound")
+    score_route = getattr(config, "lifetch_score_route", "legacy")
+    if score_route not in ("legacy", "auto", "history", "bsq"):
+        raise ValueError("lifetch_score_route must be legacy, auto, history or bsq")
+    split_score = score_route != "legacy"
+    aiv_budget = query_device_resources("", policy.pool.device.index)["aiv"] if split_score else None
+    if split_score:
+        workspace.reserve_split_score(
+            torch,
+            resident=policy.history_capacity,
+            aics=setup.aics,
+            aivs=aiv_budget,
+            windows=setup.windows,
+            route=score_route,
+        )
     launch_type = LIFetchBinding
     libraries = {}
     selectors = {}
@@ -82,6 +96,8 @@ def _bind_selectors(torch, policy, config):
             tail_bounds=workspace.tail_bounds,
             output_stride=policy.slot_capacity,
             scratch=scratch,
+            score_route=score_route,
+            aiv_budget=aiv_budget,
         )
         update = DirectIndexUpdate(
             torch,
@@ -91,12 +107,13 @@ def _bind_selectors(torch, policy, config):
     policy.indexer_selectors = selectors
     logging.getLogger("vllm").info(
         "KVAF decode backend=li_fetch groups=%s batch_capacity=%s history_capacity=%s hot_tokens=%s "
-        "requested_windows=%s; shared Runtime queues and original LRU candidates",
+        "requested_windows=%s score_route=%s; shared Runtime queues and original LRU candidates",
         len(selectors),
         setup.batch,
         policy.fused_index_storage[0].history,
         policy.history_capacity,
         setup.windows,
+        score_route,
     )
 
 

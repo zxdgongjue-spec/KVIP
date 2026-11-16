@@ -118,3 +118,78 @@ extern "C" uint32_t kvip_lifetch_streaming_forward(void* bindings,void* update,v
  void* stream,const rotating::RuntimeShape* shape,uint32_t workers) {
  return kvip_lifetch_streaming_forward_v2(bindings,update,workspace,stream,shape,workers,shape?2*shape->aicCount:0);
 }
+
+#include "../../common/lifetch/staged_schedule.h"
+extern "C" uint32_t aclrtlaunch_v9_staged_prepare(uint32_t,void*,void*,void*,void*,uint32_t,uint32_t,uint32_t);
+extern "C" uint32_t aclrtlaunch_v9_staged_score(uint32_t,void*,void*,uint32_t,uint32_t,uint32_t,uint32_t);
+extern "C" uint32_t aclrtlaunch_v9_staged_scatter(uint32_t,void*,void*,void*,void*,uint32_t,uint32_t,uint32_t,uint32_t);
+extern "C" uint32_t aclrtlaunch_v9_staged_topk(uint32_t,void*,void*,void*,uint32_t,uint32_t);
+extern "C" uint32_t aclrtlaunch_v9_staged_progress(uint32_t,void*,void*,void*,uint32_t,uint32_t);
+extern "C" uint32_t aclrtlaunch_v9_staged_service(uint32_t,void*,void*,uint32_t);
+extern "C" uint32_t aclrtlaunch_v9_staged_clear_packed(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_streaming_owner_wave(uint32_t,void*,void*,uint32_t,uint32_t);
+extern "C" uint32_t kvip_prepare_staged_shape(rotating::RuntimeShape* shape,uint32_t v,uint32_t w) {
+    return kvip_staged::PrepareShape(shape,v,w);
+}
+// All task arrays are immutable host inputs, prepared before graph capture.
+// Device wave bindings reference original FP8 input pages and private scratch.
+extern "C" uint32_t kvip_lifetch_staged_forward(void* bindings,void* workspace,void* stream,
+    const rotating::RuntimeShape* s,const kvip_staged::Plan* p) {
+    if(!bindings || !workspace || !stream || !s || !p || !p->canonical || !p->hot || !p->cold ||
+       !p->hotCount || !p->coldCount || s->finalWorkers!=4 || s->splitQ || s->serviceLanes!=2 ||
+       s->serviceAics!=1 || s->batch<1 || s->batch>32 || s->rounds<2) return 100000;
+    rotating::RuntimeShape prepared=*s;
+    if(kvip_staged::PrepareShape(&prepared,p->aivBudget,p->fetchWorkers) || std::memcmp(&prepared,s,sizeof(*s)))return 100000;
+    uint32_t capacity=kvip_staged::OwnerCapacity(p->aivBudget,p->fetchWorkers);
+    if(!capacity || p->aivBudget<s->batch)return 100000;
+    auto validate=[&](const kvip_staged::ScoreWave* ws,uint32_t n){
+        for(uint32_t i=0;i<n;++i)if(!ws[i].bindings || !ws[i].scores || !ws[i].tasks || !ws[i].rows ||
+            ws[i].rows>s->aicCount || 2*ws[i].rows>p->aivBudget || ws[i].stride%128 || !ws[i].stride ||
+            (ws[i].queryGroup!=2 && ws[i].queryGroup!=4))return false;
+        return true;
+    };
+    if(!validate(p->hot,p->hotCount) || !validate(p->cold,p->coldCount))return 100000;
+    // Validate every epoch before mutating device state.
+    uint32_t epochs=0,last=s->resident;
+    for(uint32_t i=0;i<p->coldCount;++i)if(p->cold[i].readyEnd){
+        uint32_t e=p->cold[i].readyEnd;
+        if(e<=last || e>s->history || e%128)return 100000;
+        last=e;++epochs;
+    }
+    if(last!=s->history || epochs!=s->rounds-1)return 100000;
+    uint32_t result=v9_init(bindings,stream,s);
+    auto scoreWave=[&](const kvip_staged::ScoreWave& w){
+        uint32_t r=aclrtlaunch_v9_staged_prepare(w.rows,stream,bindings,reinterpret_cast<void*>(w.bindings),reinterpret_cast<void*>(w.tasks),w.rows,w.stride,w.queryGroup);
+        if(!r)r=aclrtlaunch_v9_staged_score(w.rows,stream,reinterpret_cast<void*>(w.bindings),w.rows,w.stride,s->indexHeads,w.queryGroup);
+        if(!r)r=aclrtlaunch_v9_staged_scatter(w.rows,stream,reinterpret_cast<void*>(w.scores),reinterpret_cast<void*>(p->canonical),
+            reinterpret_cast<void*>(w.tasks),w.rows,w.stride,s->history,w.queryGroup);
+        return r;
+    };
+    for(uint32_t i=0;!result && i<p->hotCount;++i)result=scoreWave(p->hot[i]);
+    for(uint32_t q=0;!result && q<s->batch*4;q+=p->aivBudget){
+        uint32_t n=s->batch*4-q;if(n>p->aivBudget)n=p->aivBudget;
+        result=aclrtlaunch_v9_staged_topk(n,stream,bindings,reinterpret_cast<void*>(p->canonical),q,1);
+    }
+    if(!result)result=aclrtlaunch_v9_staged_progress(s->batch,stream,bindings,reinterpret_cast<void*>(p->canonical),s->resident,s->resident);
+    if(!result)result=aclrtlaunch_v9_staged_service(s->serviceLanes,stream,bindings,0);
+    uint32_t begin=s->resident,epoch=1;
+    for(uint32_t i=0;!result && i<p->coldCount;++i){
+        result=scoreWave(p->cold[i]);
+        if(!result && p->cold[i].readyEnd){
+            uint32_t end=p->cold[i].readyEnd;
+            result=aclrtlaunch_v9_staged_progress(s->batch,stream,bindings,reinterpret_cast<void*>(p->canonical),begin,end);
+            if(!result)result=aclrtlaunch_v9_staged_service(s->serviceLanes,stream,bindings,epoch++);
+            begin=end;
+        }
+    }
+    for(uint32_t q=0;!result && q<s->batch*4;q+=p->aivBudget){
+        uint32_t n=s->batch*4-q;if(n>p->aivBudget)n=p->aivBudget;
+        result=aclrtlaunch_v9_staged_topk(n,stream,bindings,reinterpret_cast<void*>(p->canonical),q,0);
+    }
+    for(uint32_t b=0;!result && b<s->batch;b+=capacity){
+        uint32_t n=s->batch-b;if(n>capacity)n=capacity;
+        result=aclrtlaunch_v9_staged_clear_packed(4*p->fetchWorkers,stream,workspace);
+        if(!result)result=aclrtlaunch_v9_streaming_owner_wave(3*n+4*p->fetchWorkers,stream,workspace,b,n);
+    }
+    return result;
+}

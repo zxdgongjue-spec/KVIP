@@ -5,6 +5,15 @@ import numpy as np
 
 from kvip.operators.lifetch import geometry as tiling_geometry
 from kvip.adapters.vllm.inputs import QueryInputs
+from kvip.operators.lifetch.schedule import split_score_tasks
+
+
+def score_buffer(pool, torch, device, name, shape, dtype, *layout):
+    key = ("split_score", name, tuple(shape), dtype, str(device), *layout)
+    if key not in pool:
+        pool[key] = torch.empty(shape, dtype=dtype, device=device)
+    return pool[key]
+
 
 def rotation_spec(batch, history, resident, final, rounds, lanes, status_bytes):
     """Single source of truth for the persistent-address scratch ABI."""
@@ -31,12 +40,15 @@ def rotation_spec(batch, history, resident, final, rounds, lanes, status_bytes):
     spec["fallback_addresses"] = ((batch, 8192), "int64")
     return spec
 
+
 class LIFetchWorkspace:
     def __init__(self, torch, *, batch, history, aics, windows, device, pin_memory=True, index_heads=64):
         if history % 256:
             raise ValueError("Original LIFetch history must align to 256 tokens")
         geometry = tiling_geometry.li_geometry(batch, "auto", windows, aics)
-        self.inputs = self._make_inputs(torch, batch, device, pin_memory=pin_memory, history=history, index_heads=index_heads)
+        self.inputs = self._make_inputs(
+            torch, batch, device, pin_memory=pin_memory, history=history, index_heads=index_heads
+        )
         self.query_lengths = torch.full((batch,), 4, dtype=torch.int32, device=device)
         self.key_lengths = torch.full((batch,), history, dtype=torch.int32, device=device)
         self.topk = torch.full((batch, 4, 2048), -1, dtype=torch.int32, device=device)
@@ -53,6 +65,7 @@ class LIFetchWorkspace:
         self.prefix_storage = torch.zeros(batch * (prefix_bytes + tail_bytes), dtype=torch.uint8, device=device)
         self.prefix_reset = self.prefix_storage[: batch * prefix_bytes]
         self.scratch = {}
+        self.streaming_scratch = {}
 
     def _make_inputs(self, torch, batch, device, **kwargs):
         return QueryInputs(torch, batch, device, **kwargs)
@@ -85,6 +98,7 @@ class LIFetchWorkspace:
     @property
     def nbytes(self):
         scratch_bytes = sum(t.numel() * t.element_size() for t in self.scratch.values())
+        scratch_bytes += sum(t.numel() * t.element_size() for t in self.streaming_scratch.values())
         return (
             self.inputs.nbytes
             + scratch_bytes
@@ -101,6 +115,56 @@ class LIFetchWorkspace:
                 )
             )
         )
+
+    def reserve_split_score(self, torch, *, resident, aics, aivs, windows, route="auto"):
+        """Reserve numerical score buffers before profiling/capture.
+
+        Forward reuses these views across serial layer groups. Small immutable
+        per-group bindings are still constructed during selector startup.
+        """
+        batch = self.topk.shape[0]
+        history = int(self.block_history)
+        if not (
+            2048 <= resident < history
+            and resident % 256 == 0
+            and 2 <= windows <= 32
+            and (history - resident) // 128 >= windows - 1
+        ):
+            raise ValueError("Unsupported split score resident/windows")
+        split_score_tasks(batch, 0, resident, aics, aivs, route)
+        device = self.topk.device
+        pool = self.streaming_scratch
+        events = self.scratch.get("events")
+        if events is not None:
+            shape = (windows, 2, 128)
+            if events.numel() >= windows * 2 * 128:
+                self.scratch["events"] = events.view(-1)[: windows * 2 * 128].view(shape)
+            else:
+                self.scratch["events"] = torch.zeros(shape, dtype=torch.uint8, device=device)
+        score_buffer(pool, torch, device, "canonical", (batch, 4, history), torch.uint16)
+        ranges = [(0, resident)]
+        begin = resident
+        for epoch in range(1, windows):
+            end = resident + ((history - resident) // 128 * epoch // (windows - 1)) * 128
+            ranges.append((begin, end))
+            begin = end
+        cap = min(aics, aivs // 2)
+        for begin, end in ranges:
+            qg, _, tasks = split_score_tasks(batch, begin, end, aics, aivs, route)
+            for first in range(0, len(tasks), cap):
+                ts = tasks[first : first + cap]
+                rows = len(ts)
+                stride = max(t[3] - t[2] for t in ts)
+                layout = (begin, end, qg, first)
+                for name, shape, dtype in (
+                    ("query", (rows * qg * self.inputs.index_heads * 128,), torch.uint8),
+                    ("weights", (rows * qg * self.inputs.index_heads,), torch.bfloat16),
+                    ("qscale", (rows * qg * self.inputs.index_heads,), torch.float32),
+                    ("pages", (rows * stride // 128,), torch.int32),
+                    ("scores", (rows * qg * stride,), torch.uint16),
+                    ("selected", (rows * qg * 2048,), torch.int32),
+                ):
+                    score_buffer(pool, torch, device, name, shape, dtype, *layout)
 
     def arguments(self, storage):
         if storage.history != int(self.block_history):
@@ -126,10 +190,12 @@ class LIFetchWorkspace:
     def block_history(self):
         return self.inputs.block_table.shape[1] * 128
 
+
 def device_words(torch, words, device):
     """Upload uint64_t ABI words through NPU-supported int64 storage, without casting their bits."""
     values = np.asarray(words, dtype="<u8").view("<i8")
     return torch.from_numpy(values).to(device)
+
 
 class UbmemQueryInputs(QueryInputs):
     def prepare(self, query_counts, *, query_starts=None, query_owners=None):
@@ -141,22 +207,37 @@ class UbmemQueryInputs(QueryInputs):
                 raise ValueError("UBmem active rows must use distinct stable owners")
         return super().prepare(counts, query_starts=query_starts, query_owners=owners)
 
+
 def ubmem_rotation_spec(batch, history, resident, aics, windows):
     shape = tiling_geometry.li_geometry(batch, "auto", windows, aics)
     final = tiling_geometry.final_aivs(batch, "auto", aics)
     spec = rotation_spec(
-        batch, history, resident, final, shape["intermediate_fetches"],
-        shape["service_aivs_per_window"], status_bytes=0,
+        batch,
+        history,
+        resident,
+        final,
+        shape["intermediate_fetches"],
+        shape["service_aivs_per_window"],
+        status_bytes=0,
     )
     del spec["final_status"]  # URMA completion queues only.
     # aclnnInplaceZero lacks uint64 support. Preserve the ABI bits in int64.
     spec["ubmem_status"] = ((batch, 16), "int64")
     return spec
 
+
 class UbmemWorkspace(LIFetchWorkspace):
     def __init__(self, torch, *, batch, history, resident, aics, windows, device, index_heads=64, pin_memory=True):
-        super().__init__(torch, batch=batch, history=history, aics=aics, windows=windows,
-                         device=device, index_heads=index_heads, pin_memory=pin_memory)
+        super().__init__(
+            torch,
+            batch=batch,
+            history=history,
+            aics=aics,
+            windows=windows,
+            device=device,
+            index_heads=index_heads,
+            pin_memory=pin_memory,
+        )
         self.scratch = {
             name: torch.zeros(size, dtype=getattr(torch, dtype), device=device)
             for name, (size, dtype) in ubmem_rotation_spec(batch, history, resident, aics, windows).items()

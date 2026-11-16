@@ -45,6 +45,9 @@ class RuntimeShape(ctypes.Structure):
         service_aics=0,
         final_workers=0,
         token_bytes=656,
+        staged=False,
+        aiv_budget=64,
+        q_workers=2,
     ):
         shape = cls(
             batch=batch,
@@ -58,9 +61,9 @@ class RuntimeShape(ctypes.Structure):
             finalWorkers=final_workers,
             tokenBytes=token_bytes,
         )
-        function = library.kvip_prepare_shape
-        function.argtypes = [ctypes.POINTER(cls)]
+        function = library.kvip_prepare_staged_shape if staged else library.kvip_prepare_shape
+        function.argtypes = [ctypes.POINTER(cls)] + ([ctypes.c_uint32, ctypes.c_uint32] if staged else [])
         function.restype = ctypes.c_uint32
-        if function(ctypes.byref(shape)):
+        if function(ctypes.byref(shape), *([aiv_budget, q_workers] if staged else [])):
             raise ValueError("Unsupported LIFetch runtime shape or core/queue budget")
         return shape

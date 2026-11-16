@@ -89,6 +89,9 @@ public:
     rotating::RuntimeShape runtimeShape_;
     bool sequenceSplit_ = false;
     bool sequenceTopKOnly_ = false;
+    // Opt-in research entry; normal streaming launches leave this disabled.
+    bool scoreOnly_ = false;
+    uint32_t scoreQueryGroup_ = 4;
 private:
     static constexpr uint32_t HEAD_DIM = 128;
     static constexpr uint32_t K_HEAD_NUM = 1;
@@ -190,7 +193,8 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::InitTilingData(const Q
     constInfo.s2BaseSize = S2_BASE_SIZE;
     constInfo.s1BaseSize = S1_BASE_SIZE;
 
-    if (tilingData->splitQ && constInfo.tSize <= 2 * tilingData->aicCount) {
+    if ((scoreOnly_ && scoreQueryGroup_ == 2) ||
+        (tilingData->splitQ && constInfo.tSize <= 2 * tilingData->aicCount)) {
         constInfo.mBaseSize /= 2;
         constInfo.s1BaseSize /= 2;
     }
@@ -438,7 +442,12 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Init(__gm__ uint8_t *q
     InitActualSeqLen(actualSeqLengthsQ, actualSeqLengthsK);
 
     // 获取分核信息
-    if (sequenceSplit_) {
+    if (scoreOnly_) {
+        // One prepared virtual row per mixed worker; no hidden H split.
+        splitCoreInfo.bN2Start = splitCoreInfo.bN2End = aiCoreIdx;
+        splitCoreInfo.s2End = actualSeqLengthsGm.GetValue(aiCoreIdx) / S2_BASE_SIZE - 1;
+        splitCoreInfo.isCoreEnable = aiCoreIdx < usedCoreNum;
+    } else if (sequenceSplit_) {
         splitCoreInfo.bN2Start = aiCoreIdx / 2;
         splitCoreInfo.bN2End = splitCoreInfo.bN2Start;
         splitCoreInfo.s2End = constInfo.kSeqSize / constInfo.s2BaseSize - 1;
@@ -458,6 +467,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Init(__gm__ uint8_t *q
     offset += GetBlockNum() * singleCoreScoreSize;
 
     if ASCEND_IS_AIV {
+        vectorService.scoreOnly_ = scoreOnly_;
         vectorService.InitParams(constInfo, tiling, sequenceTopKOnly_);
         indiceOutGm.SetGlobalBuffer((__gm__ int32_t *)sparseIndices);
         weightsGm.SetGlobalBuffer((__gm__ W_T *)weights);
@@ -791,6 +801,11 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessBaseBlock(uint3
                                                           uint32_t kScaleLoop)
 {
     CalcRunInfo(loop, s2LoopIdx, runInfo, qScaleLoop, kScaleLoop);
+    if (scoreOnly_) {
+        if ASCEND_IS_AIC { matmulService.ComputeMm1(runInfo); }
+        else { vectorService.ProcessVec1(runInfo); }
+        return;
+    }
     if ASCEND_IS_AIC {
         matmulService.ComputeMm1(runInfo);
         if (!rotationServed_ && rotating::EpochAt(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.splitQ,runtimeShape_.rounds,runtimeShape_.serviceAics,s2LoopIdx + 1, aiCoreIdx) >= 0) {

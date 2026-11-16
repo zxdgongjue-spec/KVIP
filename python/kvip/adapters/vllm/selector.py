@@ -22,9 +22,14 @@ def group_scratch(policy, workspace, batch, group):
 def index_update_arguments(policy, workspace, storage, rotating, group):
     """Bind persistent Index and output buffers shared by both transports."""
     return dict(
-        keys=storage.keys, scales=storage.scales, addresses=storage.addresses,
-        logical_ids=storage.logical_ids, row_owners=workspace.inputs.row_owners,
-        rotating=rotating, status=policy.fused_errors[group], query_inputs=workspace.inputs,
+        keys=storage.keys,
+        scales=storage.scales,
+        addresses=storage.addresses,
+        logical_ids=storage.logical_ids,
+        row_owners=workspace.inputs.row_owners,
+        rotating=rotating,
+        status=policy.fused_errors[group],
+        query_inputs=workspace.inputs,
         outputs=policy.fused_outputs[group],
     )
 
@@ -35,9 +40,15 @@ def bind_group_selector(torch, policy, workspace, setup, group, storage, rotatin
         workspace.streaming_scratch = {}
     rotating.streaming_scratch = workspace.streaming_scratch
     selector = VllmIndexSelector(
-        torch, inputs=workspace.inputs, rotating=rotating, update=update,
-        logical_ids=storage.logical_ids, row_owners=workspace.inputs.row_owners,
-        prefix_workspace=workspace.prefix_reset, storage=storage, unique_active_owners=ubmem,
+        torch,
+        inputs=workspace.inputs,
+        rotating=rotating,
+        update=update,
+        logical_ids=storage.logical_ids,
+        row_owners=workspace.inputs.row_owners,
+        prefix_workspace=workspace.prefix_reset,
+        storage=storage,
+        unique_active_owners=ubmem or getattr(rotating, "staged", False),
     )
     selector.tail_source = policy.abc_descriptors[group, : setup.batch, 2:4]
     return selector
@@ -91,7 +102,7 @@ class VllmIndexSelector:
         if self.unique_active_owners:
             owners = [p.owner for p in self.decodes if p.stop > p.begin]
             if len(owners) != len(set(owners)):
-                raise ValueError("UBmem active decode rows must have distinct stable owners")
+                raise ValueError("LIFetch active decode rows must have distinct stable owners")
         if self.storage is not None:
             self.storage.prepare(self.plans)
         if prepare_inputs:
