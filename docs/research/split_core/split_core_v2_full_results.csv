@@ -1,3 +1,0 @@
-candidate,shards,baseline_ticks,candidate_ticks,tick_reduction_percent,captured_raw_outputs_byte_identical,scope,baseline_evidence,candidate_evidence
-pooled-topk-s4,4,1340222,1326365,1.0339331842038058,True,same-binary full compute mock chain; CA Model only,results/model-records.json#20261112-131643-full-chain/baseline-q2,results/model-records.json#20261112-131643-full-chain/pooled-topk-s4
-pooled-topk-s8,8,1340222,1330102,0.7550987821420607,True,same-binary full compute mock chain; CA Model only,results/model-records.json#20261112-131643-full-chain/baseline-q2,results/model-records.json#20261112-144041-full-chain/pooled-topk-s8

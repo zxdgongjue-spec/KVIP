@@ -13,10 +13,10 @@ cases, owner_waves, stage_tasks = staged_routes.cases, staged_routes.owner_waves
 
 class StagedRoutes(unittest.TestCase):
     def test_all_default_cases_and_exact_cover(self):
-        import json
-
-        defaults = json.loads((ROOT / "scripts/split_core_sim/cases.json").read_text())
-        self.assertEqual(list(cases()), defaults["cases"])
+        self.assertEqual(
+            [(x["batch"], x["miss_percent"]) for x in cases()],
+            [(b, m) for b in (1, 2, 4, 8, 16, 24, 32) for m in (3, 5, 10, 15, 20, 50)],
+        )
         self.assertEqual(len(list(cases())), 42)
         for case in cases():
             b = case["batch"]

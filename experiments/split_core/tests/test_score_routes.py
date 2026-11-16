@@ -153,19 +153,24 @@ for(auto t:s.tasks)std::cout<<t.owner<<","<<t.queryBegin<<","<<t.queryCount<<","
             routes.measured_choices([{**h, "score_ms": float("nan")}])
         self.assertTrue(all(r["score_ms"] is None and r["status"] == "NOT_RUN" for r in routes.boundary_matrix()))
 
-    def test_both_versions_stage_without_mutating_history(self):
-        source = HERE / "historical/source_manifest.json"
+    def test_current_source_is_copied_without_mutation(self):
+        source = ROOT / prepare.OP / "op_kernel/indexer/indexer.h"
         before = source.read_bytes()
         with tempfile.TemporaryDirectory() as d:
-            for version in routes.VERSIONS:
-                out = Path(d) / version
-                result = prepare.prepare(out, version)
-                kernel = (out / prepare.OP / "op_kernel/indexer/indexer.h").read_text()
-                self.assertIn("scoreOnly_", kernel)
-                self.assertIn("scoreQueryGroup_", kernel)
-                self.assertIn("splitCoreInfo.bN2Start = splitCoreInfo.bN2End = aiCoreIdx", kernel)
-                self.assertEqual(result["version"], version)
+            out = Path(d) / "current"
+            result = prepare.prepare(out)
+            kernel = (out / prepare.OP / "op_kernel/indexer/indexer.h").read_text()
+            self.assertIn("scoreOnly_", kernel)
+            self.assertIn("scoreQueryGroup_", kernel)
+            self.assertIn("splitCoreInfo.bN2Start = splitCoreInfo.bN2End = aiCoreIdx", kernel)
+            self.assertEqual(result["version"], "current")
+            self.assertEqual((out / prepare.OP / "op_kernel/indexer/indexer.h").read_bytes(), before)
         self.assertEqual(source.read_bytes(), before)
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "removed-history"
+            with self.assertRaises(ValueError):
+                prepare.prepare(out, "historical")
+            self.assertFalse(out.exists())
 
     def test_runner_rejects_empty_selection_before_lease_or_output(self):
         with tempfile.TemporaryDirectory() as d:

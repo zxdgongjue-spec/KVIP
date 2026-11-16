@@ -52,7 +52,9 @@ cmake --build /absolute/new/build --target staged_routes -j2
 
 CPU验证包含全部42标准规格、精确Q/H覆盖、物理预算、B24/32 Index ABI、公共Forward和旧融合/UBmem入口、动态owner、共享score与profiling events。CPU/mock不能替代device验证。
 
-最终版本的三项Model功能烟测均通过并正常结束。采用H8192/R6400/G32、每Q miss205、C4/V16/W2，同一fixture覆盖B1/history、B1/BSQ、B3/BSQ。B3覆盖两score waves和两个owner waves。driver核验真实score、全resident θ、Final集合、dedup、Index四字段置换、hot656B payload、guards和completion。原始源码/binary/config/fixture/log hash与结果摘要见 `results/score-integration-validation.json`；此前错误补取计数断言、旧打包导致的B3超时和中断诊断均保留。
+main统一测试入口的paired native benchmark保留B≤16，URMA `bench/check --score-route auto/history/bsq`可显式验证新路由；UBmem仅接受legacy。staged的逐核timeline解码尚未接入统一diagnose，因此非legacy的diagnose/all会在配置时拒绝。生产binding与独立staged验证工具仍支持B≤32。
+
+历史r5版本（`ecf4e8e`）的三项Model功能烟测均通过并正常结束。采用H8192/R6400/G32、每Q miss205、C4/V16/W2，同一fixture覆盖B1/history、B1/BSQ、B3/BSQ。B3覆盖两score waves和两个owner waves。driver核验真实score、全resident θ、Final集合、dedup、Index四字段置换、hot656B payload、guards和completion。精简结果和log/binary hash见 `results/score-integration-validation.json`，完整源码/config/fixture/hash与失败记录由该摘要链接到原提交归档。清理并合入main测试重构后的版本另行运行CPU与构建检查，不沿用旧Model通过作为新源码证明。
 
 该小尺寸fixture的每owner cold并集为410；另有563个选中resident token落在预留LRU区。prefetch0且无tail映射时，旧缓存契约将这些reserved hot token也计入补取，因此独立输入oracle要求去重补取总数973。driver同时检查row/worker计数，不能用cold数替代最终补取数；完整Final集合、映射和payload检查仍保留。
 

@@ -17,7 +17,7 @@ endif()
 file(READ "${STAGED_SOURCE}/staged-source.json" _source_manifest)
 string(JSON _producer GET "${_source_manifest}" producer)
 string(JSON _transport GET "${_source_manifest}" model_transport)
-if(NOT _producer STREQUAL SCORE_VERSION OR NOT _transport STREQUAL "synchronous GM adapter")
+if(NOT SCORE_VERSION STREQUAL current OR NOT _producer STREQUAL SCORE_VERSION OR NOT _transport STREQUAL "synchronous GM adapter")
  message(FATAL_ERROR "Driver version/transport differs from prepared source")
 endif()
 include(${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
@@ -29,17 +29,13 @@ ascendc_library(tail STATIC ${TAIL}/op_kernel/indexer.cpp ${TAIL}/op_kernel/stag
 foreach(target producer tail)
  if(target STREQUAL producer)
   set(OP ${PRODUCER})
-  if(SCORE_VERSION STREQUAL historical)
-   set(STREAMING 0)
-  else()
-   set(STREAMING 1)
-  endif()
+  set(STREAMING 1)
  else()
   set(OP ${TAIL})
   set(STREAMING 1)
  endif()
  ascendc_include_directories(${target} PRIVATE ${OP}/include ${OP}/op_kernel ${OP}/op_kernel/indexer
-  ${KVAF_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/../historical/full ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)
+  ${KVAF_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/../model_support ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)
  ascendc_compile_options(${target} PRIVATE -O2 -g --cce-auto-sync=off -mllvm -user-reserved-ub-size=223232
   -DV9_USER_UB_BYTES=223232 -DKVIP_STREAMING_LI=${STREAMING} -DSIM_Q=4 -DSIM_CAPTURE_HITS=1
   -DKVIP_OUTPUT_WORKER=1 -DKVIP_FUSE_QUERY_WORK=1 -DV9_SIMULATION=0 -DROTATION_PUBLISH_TILES=1
@@ -48,7 +44,7 @@ foreach(target producer tail)
 endforeach()
 add_executable(staged_routes ../staged_host.cpp ${TAIL}/op_host/launch.cpp)
 target_include_directories(staged_routes PRIVATE ${TAIL}/include ${TAIL}/op_kernel ${KVAF_INCLUDE}
- ${CMAKE_CURRENT_SOURCE_DIR}/../historical/full ${STAGED_SOURCE}/tail/csrc/operators/common/lifetch)
+ ${CMAKE_CURRENT_SOURCE_DIR}/../model_support ${STAGED_SOURCE}/tail/csrc/operators/common/lifetch)
 # Same integration function, selecting the independently compiled versioned producer.
 target_compile_definitions(staged_routes PRIVATE KVIP_OUTPUT_WORKER=1
  aclrtlaunch_v9_staged_score=aclrtlaunch_split_score_only SCORE_VERSION="${SCORE_VERSION}" STAGED_RUN_MODE="${RUN_MODE}")

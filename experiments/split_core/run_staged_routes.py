@@ -10,24 +10,24 @@ import subprocess
 import time
 from staged_routes import cases, fixture, stage_tasks, owner_waves
 from staged_oracle import check_case
-from run_split_core_cases import lease
+from cases import lease
 
 
 def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def main():
+def main(argv=None):
     p = argparse.ArgumentParser(allow_abbrev=False)
     p.add_argument("action", choices=("plan", "cpu", "run"))
     p.add_argument("--output", required=True, type=Path)
     p.add_argument("--driver", type=Path)
     p.add_argument("--case", action="append")
     p.add_argument("--route", choices=("auto", "history", "bsq"), default="auto")
-    p.add_argument("--version", choices=("current", "historical"), default="current")
+    p.add_argument("--version", choices=("current",), default="current")
     p.add_argument("--timeout", type=int, default=10800)
     p.add_argument("--lease-file", type=Path)
-    a = p.parse_args()
+    a = p.parse_args(argv)
     a.output.mkdir(parents=True, exist_ok=False)
     specs = list(cases())
     names = {x["case"] for x in specs}

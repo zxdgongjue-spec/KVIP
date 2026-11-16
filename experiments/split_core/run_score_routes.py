@@ -157,7 +157,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--driver", required=True)
     p.add_argument("--output", required=True)
-    p.add_argument("--version", required=True, choices=("current", "historical"))
+    p.add_argument("--version", choices=("current",), default="current")
     p.add_argument("--run-mode", required=True, choices=("sim", "npu"))
     p.add_argument("--config", required=True, help="actual Model config or native environment manifest")
     p.add_argument("--batches", type=int, nargs="+", default=[1, 2, 4, 8, 16, 24, 32])

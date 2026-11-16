@@ -8,3 +8,9 @@
 /csrc/operators/lidu/build/
 /csrc/operators/lidu/_custom_opp/
 /csrc/operators/lidu/torch_extension/build/
+
+# Generated split-core validation artifacts stay local.
+/experiments/split_core/results/
+/docs/research/split_core/results/*.log
+/docs/research/split_core/results/**/*.log
+/docs/research/split_core/results/**/*.bin

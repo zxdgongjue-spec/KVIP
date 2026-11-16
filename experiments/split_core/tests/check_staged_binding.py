@@ -57,7 +57,7 @@ class Monkey:
         self.saved = []
 
 
-f = runpy.run_path(str(ROOT / "tests/operators/lifetch/support/test_streaming_binding.py"))
+f = runpy.run_path(str(ROOT / "tests/runtime/test_lifetch_binding.py"))
 count = 0
 
 
@@ -85,7 +85,7 @@ with tempfile.TemporaryDirectory() as d:
     run("test_device_failure_invalidates_only_failed_owner", Path(d))
 run("test_c28_b16_uses_four_records_with_independent_v56", "MONKEY")
 run("test_queue_requirement_tracks_fetch_workers")
-s = runpy.run_path(str(ROOT / "tests/operators/lifetch/support/test_shared_li.py"))
+s = runpy.run_path(str(ROOT / "tests/runtime/test_lifetch_kernel_contracts.py"))
 for name in ("test_shared_li_dispatch_and_shard_boundaries", "test_scale8_releases_partial_sequence_shard"):
     with tempfile.TemporaryDirectory() as d:
         s[name](Path(d))

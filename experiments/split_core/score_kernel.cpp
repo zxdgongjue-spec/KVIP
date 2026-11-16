@@ -1,4 +1,4 @@
-// Both source versions compile this entry against their own indexer headers.
+// Compile this validation entry against the current indexer headers.
 // Each launch is a bounded wave of virtual (owner, query-group, history) rows.
 #include "kernel_operator.h"
 #if defined(__CCE_AICORE__)

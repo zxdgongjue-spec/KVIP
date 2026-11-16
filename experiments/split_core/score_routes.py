@@ -6,7 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 
-VERSIONS = ("current", "historical")
+VERSIONS = ("current",)
 
 
 def plan(batch, history=131072, heads=32, cube=32, vector=64, mode="auto", producers=None, query_group=4):

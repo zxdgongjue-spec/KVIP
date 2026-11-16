@@ -12,7 +12,7 @@ sys.path[:0] = [str(ROOT / "python"), str(ROOT / "tests/operators/lifetch/suppor
 def run(device):
     import torch
     import torch_npu  # noqa: F401
-    from native_mtp import NativeMtp
+    from execution import NativeMtp
 
     torch.npu.set_device(device)
     device = torch.device(f"npu:{device}")

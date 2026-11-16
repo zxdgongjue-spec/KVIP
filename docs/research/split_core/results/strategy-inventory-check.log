@@ -1,1 +1,0 @@
-{"scope": "CPU mathematical reference and source/document consistency only", "source_hashes": 19, "source_links": 12, "histogram_and_local_merge_reference_checks": 15, "mapping_shapes": 21, "conditional_miss_examples": 6, "q4_first_owner_example": "passed", "model_runs": 0, "npu_runs": 0}

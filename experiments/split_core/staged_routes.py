@@ -1,15 +1,13 @@
 """Full staged route plans and the existing 128K/Q4 default fixture adapter."""
 
-import ctypes
-import importlib
 from dataclasses import dataclass
 import json
 from pathlib import Path
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path[:0] = [str(ROOT / "scripts"), str(ROOT / "tests/operators/lifetch/support")]
-cases = importlib.import_module("run_split_core_cases").cases
+sys.path.insert(0, str(ROOT / "tests/operators/lifetch/support"))
+from cases import cases as cases  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -64,7 +62,7 @@ def owner_waves(batch, v=56, workers=2):
 
 def fixture(output, miss, h=131072, r=16384, heads=32):
     import numpy as np
-    from real_fetch_inputs import prepare_full_chain_fixture
+    from workloads import prepare_full_chain_fixture
 
     output = Path(output)
     info = prepare_full_chain_fixture(output, h, r, miss, index_heads=heads, exact_miss=True)
@@ -81,17 +79,3 @@ def fixture(output, miss, h=131072, r=16384, heads=32):
         + "\n"
     )
     return info
-
-
-class ScoreWave(ctypes.Structure):
-    _fields_ = [(x, ctypes.c_uint64) for x in ("bindings", "scores", "tasks")] + [
-        (x, ctypes.c_uint32) for x in ("rows", "stride", "queryGroup", "readyEnd")
-    ]
-
-
-class Plan(ctypes.Structure):
-    _fields_ = [
-        ("canonical", ctypes.c_uint64),
-        ("hot", ctypes.POINTER(ScoreWave)),
-        ("cold", ctypes.POINTER(ScoreWave)),
-    ] + [(x, ctypes.c_uint32) for x in ("hotCount", "coldCount", "aivBudget", "fetchWorkers")]

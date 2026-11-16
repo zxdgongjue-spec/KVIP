@@ -29,6 +29,6 @@ C28/V56、H128K/Q4的初始auto策略：
 
 旧默认P2需要splitQ资源条件、G32、每request实际query数量4且Key长度H、512-token对齐与最后tile排空条件。两个AIC/request各算完整Q4，分别处理resident以及每个Cold窗口的一半。否则一般query/tile分核。`splitQ=1`本身不代表启用了history P2；各Q的queryEnds仍可以动态裁剪。
 
-`score_schedule.h`和`experiments/split_core/score_*`是独立score-only双版本研究adapter，按256-token对齐、使用host重建canonical，不执行完整Service/TopK链路。它们不是生产staged的forward实现。固定81b1472的historical producer仅用于明确标注的研究/Model对照；生产库始终使用当前producer。独立TopK的T是选择阶段分片，与score的P、tail Fetch的W不同。
+`score_schedule.h`和`experiments/split_core/score_*`是当前算子的独立score-only验证adapter，按256-token对齐、使用host重建canonical，不执行完整Service/TopK链路。生产staged按128-token tile切片并在设备完成scatter。历史双版本回放和独立TopK工具已移出当前MR，保留在Git历史；TopK的T与score的P、tail Fetch的W分别控制不同阶段。
 
 完整接入顺序、内存预留和验证边界见 [staged_integration.md](staged_integration.md)。

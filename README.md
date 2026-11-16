@@ -152,7 +152,7 @@ Graph-mode native/fused comparison using real DDR and the current service LRU:
 ```bash
 cd /vllm-workspace/KVIP
 source scripts/env.sh
-python tests/operators/lifetch/test_lifetch.py --transport urma --device 5 --kvaf-server 127.0.0.1:28885 --batches 16 --history 131072 --resident 16384 --index-heads 32 --miss-percent 10 --intermediate-fetches 8 --prefetch-tokens 512 --warmup 4 --iterations 20 --trace-rounds 3
+python tests/operators/lifetch/test_lifetch.py diagnose --transport urma --device 5 --kvaf-server 127.0.0.1:28885 --batches 16 --history 131072 --resident 16384 --index-heads 32 --miss-percent 10 --intermediate-fetches 8 --prefetch-tokens 512 --warmup 4 --iterations 20 --level 2
 ```
 
 This uses Q4, TopK 2048, and reports the actual quantized miss fraction. Full-path
@@ -189,64 +189,30 @@ python tests/cache/test_abc.py --device 5
 
 ## LIFetch tests
 
-All LIFetch test code lives under `tests/operators/lifetch`. The three public
-entry points are:
-
-```bash
-python tests/operators/lifetch/test_init_urma.py --device 5 --kvaf-server 127.0.0.1:28905
-python tests/operators/lifetch/test_init_ubmem.py --device 5 --kvaf-server 127.0.0.1:28905
-python tests/operators/lifetch/test_lifetch.py --transport ubmem --device 5 \
-  --kvaf-server 127.0.0.1:28905 --soc Ascend950PR_9599 --batches 16 \
-  --history 131072 --resident 16384 --index-heads 32 --miss-percent 10 \
-  --intermediate-fetches 8 --prefetch-tokens 512 --warmup 4 --iterations 20
-```
-
-Select `--transport urma` for URMA using the same workload arguments. Both
-paths check numerical results and report graph timing; UBmem currently reports
-the full graph rather than individual stage traces. The initialization commands
-connect to KVAF and acquire/release their transport leases, but do not execute
-LIFetch. Auxiliary CPU models, fixtures and detailed test implementations live
-under `support/`; they are not NPU accuracy or performance tests.
-
-## URMA / UBmem matched single-operator check
-
-Build one KVAF checkout with both transports and start its CPU service. The
-example uses NPU 5 and its URMA device `udmac0d1e3`; adjust the device and SoC
-for the machine. Port 28905 must be free. Logs remain under this checkout.
+The single entry is `tests/operators/lifetch/test_lifetch.py`. Choose `check`,
+`bench`, `diagnose`, or `all`; select URMA/UBmem with `--transport`.
+SoC detection is automatic. Set an explicit KVAF root when it is not the
+checkout's `third_party/KVAF`. No historical source checkout is created.
 
 ```bash
 source /usr/local/Ascend/cann/set_env.sh
-bash scripts/build.sh --transport ubmem --kvaf-root "$PWD/third_party/KVAF-ubmem-review" --soc Ascend950PR_9599 --jobs 2
 source scripts/env.sh
-mkdir -p tests/results
-nohup third_party/KVAF-ubmem-review/build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28905 --ub-device udmac0d1e3 \
-  > tests/results/kvaf-ubmem-review-service.log 2>&1 < /dev/null &
+python tests/operators/lifetch/test_lifetch.py check --suite init \
+  --transport urma --device 5 --kvaf-server 127.0.0.1:28905
+python tests/operators/lifetch/test_lifetch.py bench --transport ubmem \
+  --device 5 --kvaf-server 127.0.0.1:28905 --batches 1,2,4,8,16
+python tests/operators/lifetch/test_lifetch.py diagnose --transport urma \
+  --device 5 --kvaf-server 127.0.0.1:28905 --batches 16 --level 2
 ```
 
-```bash
-python tests/operators/lifetch/support/compare_transports.py \
-  --device 5 --soc Ascend950PR_9599 \
-  --kvaf-root "$PWD/third_party/KVAF-ubmem-review" \
-  --urma-server 127.0.0.1:28905 --ubmem-server 127.0.0.1:28905 \
-  --batch 16 --history 131072 --resident 16384 --index-heads 32 \
-  --miss-percent 10 30 50 --warmup 4 --iterations 20
-```
-
-The runner first checks batch, width and history changes against one binary, then
-uses the same controlled Q4 LI fixture, Index permutation, LRU
-candidate order and 656-byte KV payload. UBmem checks native LI, KV bytes,
-Index/slot ownership, real SFA, eager, graph replay and padded rows. Timed graph
-replays restore the fixture before the event pair. UBmem and URMA use different
-output strides and capture implementations, so their reported events are not a
-same-process paired experiment. The post-timing snapshots compare logical TopK,
-selected KV bytes and SFA output. Each snapshot also records per-token prefetch
-mapping, source addresses, target slots and per-window counts; epoch attribution
-is reconstructed from the recorded per-request execution order and allocation
-ordinal. Differences in speculative work are reported, not treated as a numerical
-failure. Raw DDR virtual addresses belong to separate allocations and cannot be
-compared as identical addresses. Detailed snapshots and a summary are in
-`tests/results/ubmem-compare`. NPU results are not yet established by host tests.
+Initialization tests execute Put/Get and recreate resources. Bench records
+unprofiled paired graph timings; diagnose performs a separate profiled pass.
+Completed timing remains visible when numerical validation fails. Missing
+cases, execution errors and incomplete traces are reported explicitly.
+Host models and regression tests live under `support/`.
+See [test design](docs/performance/lifetch-tests.md) for the target interfaces
+and measurement definitions; real trace replay and diagnostic completeness
+are still being integrated on this branch.
 
 ## Migration evidence and limits
 
@@ -289,11 +255,11 @@ compiled library (the runner prints and checks its SHA256):
 ```bash
 cd /vllm-workspace/KVIP
 source scripts/env.sh
-python tests/operators/lifetch/test_lifetch.py --transport urma --device 5 --kvaf-server 127.0.0.1:28885 --runtime-shapes --miss-percent 10 --warmup 4 --iterations 20 --trace-rounds 3
+python tests/operators/lifetch/test_lifetch.py bench --transport urma --device 5 --kvaf-server 127.0.0.1:28885 --batches 1,2,4,8,16 --miss-percent 10 --warmup 4 --iterations 20
 ```
 
-The matrix includes B1/B8/B16, history 65536/131072, resident 8192/16384,
-32/64 heads and 4/8 requested windows, using real 656-byte KV records. Each case
+The command covers BS1/2/4/8/16 with 656-byte KV records. History, resident,
+heads and requested windows can be selected for separate benchmark runs. Each case
 retains native/fused byte checks, SFA checks, stateful checks and graph timings.
 The runtime conversion changes scalar plumbing and generated code; preserved
 formulas alone do not prove unchanged device performance. A5 validation is required.
@@ -365,21 +331,15 @@ The public binding allocates before graph capture. Service layer groups reuse
 stream-ordered temporary storage while retaining distinct Index and launch
 bindings. KVAF patches and transport-specific leases are unchanged.
 
-The unit-test runner now uses this public entry by default. `--optimized-resolve`
-is accepted for command compatibility and no longer selects a separate kernel.
-For each transport, run with its matching KVAF build and server:
+The unified test entry uses this production pipeline. For a full stage trace:
 
 ```bash
-python tests/operators/lifetch/test_lifetch.py \
+python tests/operators/lifetch/test_lifetch.py diagnose \
   --transport urma --kvaf-root /path/to/KVAF --kvaf-server 127.0.0.1:28885 \
   --device 4 --batches 1,2,4,8,16 --miss-percent 10 \
-  --warmup 4 --iterations 20 --trace-rounds 3 --timeout-seconds 600
+  --warmup 4 --iterations 20 --level 2 --timeout-seconds 600
 ```
 
-For UBmem, replace `--transport urma` with `--transport ubmem`, use its server
-address and add `--soc Ascend950PR_9599` (or the actual device SoC).
-Use `--runtime-shapes` to exercise additional history/hot/head configurations
-without recompilation. Run additional budgets with `--prefetch-tokens 0` and
-`--prefetch-tokens 2048`. Full graph timing, byte/SFA checks, stateful ownership
-checks and per-core diagnostics are retained. Host checks and device compilation
-do not substitute for these NPU runs.
+Use `--transport ubmem` with its matching runtime and service. Both transports
+select the current formal implementation; there is no public optimization switch.
+Host checks and compilation do not replace validation on NPU hardware.

@@ -1,4 +1,4 @@
-"""Isolated two-producer/one-current-tail build; archived evidence stays unchanged."""
+"""Prepare current score and tail sources for isolated Model validation."""
 
 import argparse
 import hashlib
@@ -11,7 +11,7 @@ from prepare_score_source import ROOT, OP, prepare
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--version", choices=("current", "historical"), required=True)
+    p.add_argument("--version", choices=("current",), default="current")
     p.add_argument("--model", action="store_true")
     a = p.parse_args()
     a.output.mkdir(parents=True, exist_ok=False)

@@ -56,11 +56,14 @@ int main(){
 
 
 def test_case_groups_and_unrun_status(tmp_path):
-    spec = importlib.util.spec_from_file_location("split_cases", ROOT / "scripts/run_split_core_cases.py")
+    spec = importlib.util.spec_from_file_location("split_cases", ROOT / "experiments/split_core/cases.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     assert [len(list(module.cases(g))) for g in ("small", "medium", "large", "all")] == [12, 12, 18, 42]
-    assert module.main(["plan", "--output", str(tmp_path / "plan")]) == 0
+    sys.path.insert(0, str(ROOT / "experiments/split_core"))
+    from run_staged_routes import main
+
+    assert main(["plan", "--output", str(tmp_path / "plan")]) == 0
     rows = json.loads((tmp_path / "plan/results.json").read_text())
     assert len({r["case"] for r in rows}) == 42
     assert all(r["status"] == "NOT_RUN" and r["metric"] is None for r in rows)
@@ -71,7 +74,7 @@ def test_case_groups_and_unrun_status(tmp_path):
 @pytest.mark.parametrize("miss", (3, 5, 10, 15))
 def test_exact_real_fp8_fixture(tmp_path, heads, valid, shape, miss):
     sys.path.insert(0, str(ROOT / "tests/operators/lifetch/support"))
-    from real_fetch_inputs import prepare_full_chain_fixture
+    from workloads import prepare_full_chain_fixture
 
     root = tmp_path / "fixture"
     info = prepare_full_chain_fixture(root, shape, 16384, miss, index_heads=heads, exact_miss=True, valid_history=valid)
@@ -105,7 +108,7 @@ def test_exact_real_fp8_fixture(tmp_path, heads, valid, shape, miss):
 @pytest.mark.parametrize("miss", (3, 5, 10, 15))
 def test_partial_padding_without_exact_mode(tmp_path, miss):
     sys.path.insert(0, str(ROOT / "tests/operators/lifetch/support"))
-    from real_fetch_inputs import prepare_full_chain_fixture
+    from workloads import prepare_full_chain_fixture
 
     root = tmp_path / "partial"
     prepare_full_chain_fixture(root, 39424, 16384, miss, index_heads=32, valid_history=39322)
