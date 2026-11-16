@@ -1,6 +1,15 @@
 """Native Q4/Q2 geometry scaled to the active logical device's AIC budget."""
 
 
+import struct
+
+
+def initial_hot_rank_options(rank):
+    if not isinstance(rank, int) or not 1 <= rank <= 2048:
+        raise ValueError("initial_hot_rank must be in 1..2048")
+    return struct.pack("<4I", rank, 0, 0, 0)
+
+
 def prefetch_budget(prefetch_limit=512, window_limit=None, intermediate_fetches=8):
     """Limit speculative fetches only; final TopK repair has its own capacity."""
     if not isinstance(intermediate_fetches, int) or intermediate_fetches < 1:

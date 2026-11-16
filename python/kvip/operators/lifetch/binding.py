@@ -5,7 +5,7 @@ from kvip.runtime.loader import load_lifetch_library
 
 import numpy as np
 
-from kvip.operators.lifetch.geometry import final_aivs, li_geometry, prefetch_budget
+from kvip.operators.lifetch.geometry import final_aivs, initial_hot_rank_options, li_geometry, prefetch_budget
 from kvip.operators.lifetch.tiling import RuntimeShape
 from kvip.operators.lifetch.workspace import rotation_spec
 
@@ -36,7 +36,9 @@ class LIFetchBinding:
         tail_bounds=None,
         output_stride=None,
         scratch=None,
+        initial_hot_rank=2048,
     ):
+        rank_options = initial_hot_rank_options(initial_hot_rank)
         if resident > 131072:
             raise ValueError("LIFetch hot bitmap supports resident <= 131072")
         if not 1 <= batch <= 16:
@@ -69,7 +71,7 @@ class LIFetchBinding:
             ("final_replicated", int(final_strategy == "replicated")),
             ("final_workers", final_aivs(batch, li_tiling, aic_count, final_workers)),
             ("aic_count", aic_count),
-            ("abi_version", 11),
+            ("abi_version", 12),
             (
                 "service_lanes",
                 li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)["service_aivs_per_window"],
@@ -83,7 +85,7 @@ class LIFetchBinding:
             ("history", history),
             ("resident", resident),
             ("simulation", 0),
-            ("context_bytes", 320),
+            ("context_bytes", 352),
             ("row_bytes", 1024),
         ):
             fn = getattr(self.library, "v9_" + name)
@@ -208,6 +210,8 @@ class LIFetchBinding:
                 blob,
                 np.frombuffer(bytes(self.runtime_shape), dtype=np.uint8),
                 np.array([self.change_slots.data_ptr(), self.change_count.data_ptr()], dtype="<u8").view("u1"),
+                np.frombuffer(rank_options, dtype=np.uint8),
+                np.zeros(16, dtype=np.uint8),
             )
         )
         self.context = torch.from_numpy(blob.copy()).to(self.device)

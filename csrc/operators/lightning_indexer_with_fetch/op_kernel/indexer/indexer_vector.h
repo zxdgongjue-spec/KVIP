@@ -39,7 +39,9 @@ public:
     rotating::RuntimeShape runtimeShape_;
     __aicore__ inline void SetRotationContext(GM_ADDR p) {
         rotationContext_ = p;
-        runtimeShape_ = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(p));
+        auto context = reinterpret_cast<__gm__ rotating::Context*>(p);
+        runtimeShape_ = rotating::LoadRuntimeShape(context);
+        initialHotRank_ = context->initialHotRank;
         rotationProgressGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(
             reinterpret_cast<__gm__ rotating::Context*>(p)->progress));
     }
@@ -159,7 +161,9 @@ private:
     LocalTensor<uint16_t> classifyUB_;
     TBuf<TPosition::VECCALC> prefixThresholdBuf_;
     LocalTensor<uint16_t> prefixThreshold_;
-    __aicore__ inline void SaveResident(uint32_t query, uint32_t scoreRow, bool publishProgress) {
+    uint32_t initialHotRank_ = 2048;
+    __aicore__ inline void SaveResident(uint32_t query, uint32_t scoreRow, uint32_t validLength,
+                                        bool publishProgress) {
         auto src = (__local_mem__ uint16_t *)scoreOutLocal_.GetPhyAddr();
         auto dst = (__local_mem__ uint16_t *)prefixThreshold_.GetPhyAddr() + (query % 2) * 128;
         __VEC_SCOPE__ {
@@ -173,8 +177,28 @@ private:
             MicroAPI::ReduceMin(reduced, minimum, mask);
             MicroAPI::StoreAlign(dst, reduced, mask);
         }
+        auto localThreshold = prefixThreshold_[(query % 2) * 128];
+        if (initialHotRank_ && initialHotRank_ != topkCount_ && initialHotRank_ <= validLength) {
+            uint16_t key;
+            if (validLength >= topkCount_) {
+                key = topkOp_.RankKey(scoreOutLocal_, topkCount_, initialHotRank_);
+            } else {
+                const uint32_t aligned = QLICommon::Align(validLength, uint32_t(256));
+                Duplicate(mrgValueLocal_, uint16_t(0), aligned);
+                SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3); WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+                DataCopyExtParams copy{1, validLength * 2, 0, 0, 0};
+                DataCopyPadExtParams<uint16_t> padding{true, 0, 0, 0};
+                DataCopyPad(mrgValueLocal_, scoreGm[scoreRow * runtimeShape_.history], copy, padding);
+                SetFlag<HardEvent::MTE2_V>(EVENT_ID0); WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+                key = topkOp_.RankKey(mrgValueLocal_, aligned, initialHotRank_);
+            }
+            localThreshold.SetValue(0, key);
+        }
         SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
         WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
+        if (initialHotRank_ != topkCount_ && initialHotRank_ <= validLength) {
+            SetFlag<HardEvent::S_MTE3>(EVENT_ID0); WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        }
         constexpr uint32_t count = SIM_Q * 2048;
         constexpr uint32_t rowBytes = count * 6 + SIM_Q * 256;
         uint32_t batch = query / SIM_Q, q = query % SIM_Q;
@@ -858,7 +882,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
             Duplicate(indicesOutLocal_.ReinterpretCast<int32_t>(), neg, topkCount_);
             if (prefixActive_) {
                 Duplicate(scoreOutLocal_, uint16_t(0), topkCount_);
-                SaveResident(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, vecOffset, queryRow == SIM_Q);
+                SaveResident(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, vecOffset, 0, queryRow == SIM_Q);
             }
             SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
             WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
@@ -961,7 +985,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
         if (prefixActive_) {
             if (validS2Len < topkCount_) Duplicate(scoreOutLocal_, uint16_t(0), topkCount_);
-            SaveResident(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, vecOffset, queryRow == SIM_Q);
+            SaveResident(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, vecOffset, validS2Len, queryRow == SIM_Q);
         } else {
         AscendC::DataCopyPad(indiceOutGm[info.indiceOutOffset + (curS1Idx + rowIdx) * topkCount_], indicesOutLocal_.ReinterpretCast<int32_t>(), copyOutParams);
         }

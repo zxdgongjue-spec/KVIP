@@ -1994,6 +1994,7 @@ def run_urma_case(
         final_workers=0,
         prefetch_limit=args.prefetch_tokens,
         output_stride=owner.output.shape[1],
+        initial_hot_rank=args.initial_hot_rank,
     )
     topk = arguments[9].view(torch.int32).reshape(b, 4, 2048)
     prefix = 4 * 2048 * 6 + 1024 + 4 * h * 2
@@ -2581,6 +2582,7 @@ def run_ubmem_case(
     check_suite=None,
     shared_pool=None,
     compact=False,
+    initial_hot_rank=2048,
 ):
     batch, history, resident, token_bytes = shape.batch, shape.history, shape.resident, shape.token_bytes
     checks = CorrectnessRecorder()
@@ -2688,6 +2690,7 @@ def run_ubmem_case(
             output_stride=stride,
             scratch=workspace.scratch,
             prefetch_limit=prefetch_tokens,
+            initial_hot_rank=initial_hot_rank,
         )
         # Check the compiled UBmem schedule against the URMA runtime contract,
         # including epoch zero at the end of the hot region.
@@ -3159,6 +3162,7 @@ def run_ubmem(config, directory, *, shared_pool=None):
             serial_compare=True, check_case=getattr(config, 'check_case', None),
             check_suite=getattr(config, 'check_suite', None),
             shared_pool=shared_pool, compact=config.mode in ('bench', 'diagnose'),
+            initial_hot_rank=config.initial_hot_rank,
         )
         failed |= not passed
     return int(failed)
@@ -3172,7 +3176,7 @@ class FusedReplayState:
     state must not have live graphs or unfinished device work.
     """
     def __init__(self, torch, runtime, table, library, initial, pages, addresses,
-                 *, device, aics, windows, prefetch_tokens, soc):
+                 *, device, aics, windows, prefetch_tokens, soc, initial_hot_rank):
         from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
         from kvip.cache.index_storage import IndexCacheStorage
         from kvip.operators.lifetch.binding import LIFetchBinding
@@ -3207,7 +3211,7 @@ class FusedReplayState:
                 query_ends=self.workspace.inputs.query_ends.view(self.batch, 4),
                 hot_valid=self.storage.hot_valid, row_owners=self.workspace.inputs.row_owners,
                 token_addresses=self.storage.addresses, tail_bounds=self.workspace.tail_bounds,
-                output_stride=self.stride, scratch=self.workspace.scratch,
+                output_stride=self.stride, scratch=self.workspace.scratch, initial_hot_rank=initial_hot_rank,
             )
             if ubmem:
                 self.lease.register_table(table)
@@ -3553,7 +3557,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
             state = FusedReplayState(
                 torch, runtime, view, library, initial, pages, logical_addresses,
                 device=device, aics=aics, windows=config.intermediate_fetches,
-                prefetch_tokens=config.prefetch_tokens, soc=soc)
+                prefetch_tokens=config.prefetch_tokens, soc=soc, initial_hot_rank=config.initial_hot_rank)
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
         checks = CorrectnessRecorder()

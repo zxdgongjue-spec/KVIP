@@ -47,7 +47,7 @@ extern "C" uint32_t v9_li(void* bindings,void* stream,const rotating::RuntimeSha
  return 100000;
 }
 #define VALUE(name,value) extern "C" uint32_t name() {return value;}
-VALUE(kvip_ubmem_abi_version,3)
+VALUE(kvip_ubmem_abi_version,4)
 VALUE(kvip_ubmem_context_bytes,sizeof(rotating::Context))
 VALUE(kvip_ubmem_region_bytes,sizeof(rotating::UbmemRegion))
 VALUE(kvip_ubmem_status_bytes,rotating::kUbmemStatusWords*sizeof(uint64_t))
