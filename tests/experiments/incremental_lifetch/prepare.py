@@ -20,7 +20,9 @@ def main():
     dest.mkdir(parents=True, exist_ok=False)
     for directory in ('csrc', 'python', 'tests/operators', 'scripts'):
         shutil.copytree(repo / directory, dest / directory,
-                        ignore=shutil.ignore_patterns('__pycache__', '_custom_opp', 'results'))
+                        ignore=shutil.ignore_patterns(
+                            '__pycache__', '_custom_opp', 'results',
+                            'build', 'build-*', 'build_*', 'CMakeFiles'))
     # Installed LIDU is shared read-only, as in the previous A/B experiments.
     vendor = repo / 'csrc/operators/lidu/_custom_opp'
     if vendor.exists():
