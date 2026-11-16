@@ -995,7 +995,7 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
         reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),
         reinterpret_cast<__ubuf__ uint32_t*>(result.GetPhyAddr()),
         reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()),
-        reinterpret_cast<__ubuf__ uint32_t*>(bitmap[bitmapWords].GetPhyAddr()));
+        reinterpret_cast<__ubuf__ uint32_t*>(bitmap[bitmapWords].GetPhyAddr()),noPrefetchRound_);
     if(profile){
         SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
         liTicks[4]=GetSystemCycle();liTicks[5]=liTicks[4];liTicks[6]=liTicks[4];

@@ -183,3 +183,90 @@ int main(){using namespace rotating;std::mt19937 rng(451);
         check=True,
     )
     subprocess.run([str(binary)], check=True)
+
+
+def test_no_prefetch_preserves_candidate_hits_and_q4_protection(tmp_path):
+    resolve = function(
+        (ROOT / "csrc/operators/common/lifetch/cache_metadata.h").read_text(),
+        "__simt_callee__ inline uint32_t ResolvePhysicalSlot(",
+    )
+    source = tmp_path / "no_prefetch_metadata.cpp"
+    source.write_text(r'''
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
+#include <vector>
+#define __simt_vf__
+#define __simt_callee__
+#define __aicore__
+#define __ubuf__
+#define __gm__
+#define LAUNCH_BOUND(x)
+#define KVIP_LOW_MISS_TAIL 1
+struct {uint32_t x;} threadIdx;
+void asc_syncthreads(){}
+void asc_atomic_or(uint32_t* p,uint32_t v){*p|=v;}
+bool forbidReserved=false;
+uintptr_t reservedBegin=0,reservedEnd=0;
+template<class T>T asc_ldcg(T* p){
+ assert(!forbidReserved || uintptr_t(p)<reservedBegin || uintptr_t(p)>=reservedEnd);
+ return *p;
+}
+namespace rotating {
+constexpr uint32_t kTop=2048,kLruSlots=2048,kSlots=8192;
+struct Context {uint64_t mapping,lruSlots,hotValid,reservedHot;};
+''' + resolve + '\n}\n#include "staged_topk_classify.h"\n#include "staged_selected_metadata.h"\n' + r'''
+int main(){using namespace rotating;
+ constexpr uint32_t R=4096,H=8192,B=1,O=2,T=256;
+ std::vector<uint32_t> valid(3*R,1),map(2*H,UINT32_MAX),lru(2*kLruSlots);
+ std::vector<int32_t> reserved(2*R,-1);
+ for(uint32_t i=0;i<kLruSlots;++i){lru[B*kLruSlots+i]=i*2;reserved[B*R+i*2]=i;}
+ reservedBegin=uintptr_t(reserved.data());reservedEnd=reservedBegin+reserved.size()*4;
+ valid[O*R+2]=0; // An invalid candidate remains a true miss.
+ const uint32_t begin=R-128,end=R+128;
+ for(uint32_t token=begin;token<end;++token)map[B*H+token]=R+kSlots+token%T;
+ Context ctx{uint64_t(map.data()),uint64_t(lru.data()),uint64_t(valid.data()),uint64_t(reserved.data())};
+ std::vector<uint32_t> selected(4*kTop),locations(4*kTop),unionBits((R+31)/32);
+ // All candidate slots are selected somewhere in Q4, including last-query-only hits.
+ for(uint32_t q=0;q<4;++q)for(uint32_t i=0;i<kTop;++i)
+   selected[q*kTop+i]=q==3?2*i:q==0?H-1:(i*17+q)%H;
+ selected[0]=UINT32_MAX;selected[1]=H;selected[2]=2;
+ for(bool low:{false,true})for(uint32_t used:{0U,1U}){
+  std::fill(unionBits.begin(),unionBits.end(),0);
+  forbidReserved=low && !used;
+  for(uint32_t q=0;q<4;++q){
+   std::vector<uint32_t> bits(4104,0);
+   for(threadIdx.x=0;threadIdx.x<512;++threadIdx.x)
+    ClassifySelectedMetadata(H,R,B,O,used,begin,end,true,&ctx,selected.data()+q*kTop,
+      locations.data()+q*kTop,bits.data(),bits.data()+4096,low);
+   for(threadIdx.x=0;threadIdx.x<512;++threadIdx.x)MergeClassifyBitmap(bits.data(),R);
+   assert(bits[4096]==uint32_t(q==0));
+   for(uint32_t i=0;i<kTop;++i){
+    uint32_t token=selected[q*kTop+i],expected=UINT32_MAX;
+    if(token<H){
+     bool tail=token>=begin && token<end;
+     if(token<R && !tail && valid[O*R+token] &&
+        ((low&&!used)||reserved[B*R+token]<0))expected=token;
+     else expected=ResolvePhysicalSlot(R,lru.data()+B*kLruSlots,map[B*H+token]);
+    }
+    assert(locations[q*kTop+i]==expected);
+    if(expected<R)assert(bits[expected/32]&(1U<<(expected%32)));
+   }
+   for(uint32_t w=0;w<unionBits.size();++w)unionBits[w]|=bits[w];
+  }
+  // Every known Q4 hot output is protected before any query can choose a victim.
+  for(uint32_t slot:locations)if(slot<R)assert(unionBits[slot/32]&(1U<<(slot%32)));
+  if(low&&!used){
+   assert(locations[2]==UINT32_MAX);
+   assert(locations[3*kTop+32]==64);
+   assert(unionBits[64/32]&(1U<<(64%32)));
+  }else assert(locations[3*kTop+32]==UINT32_MAX);
+ }
+}
+''')
+    binary = tmp_path / "no_prefetch_metadata"
+    subprocess.run([
+        "c++", "-std=c++17", "-O1", "-g", "-fsanitize=address,undefined",
+        "-I", str(OPERATOR), str(source), "-o", str(binary),
+    ], check=True)
+    subprocess.run([str(binary)], check=True)

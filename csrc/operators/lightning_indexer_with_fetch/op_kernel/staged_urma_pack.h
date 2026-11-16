@@ -23,15 +23,25 @@ inline void PackStagedUrmaQuery(uint32_t history, uint32_t resident, uint32_t to
     uint32_t ownerBase=OwnerRow(ctx,batch)*OutputStride(resident,ctx);
     for(uint32_t worker=0;worker<1;++worker){
         uint32_t begin=rangeBegin,end=begin+count;
-        uint32_t own=end-begin,per=(own+511)/512,localSafe=0;
+        uint32_t own=end-begin,per=(own+511)/512;
+        uint32_t safeBefore=tid*per,safeCount=own;
+#if KVIP_LOW_MISS_TAIL
+        // Without speculative writes every destination is safe. Preserve
+        // input order instead of loading reservations and partitioning it.
+        if(used) {
+#endif
+        uint32_t localSafe=0;
         for(uint32_t i=tid*per;i<(tid+1)*per && i<own;++i){
             uint32_t slot=slots[begin+i];
             if(slot>=resident){asc_atomic_or(ctl+1,4U);continue;}
             int32_t ordinal=asc_ldcg(reserved+slot);
             localSafe+=!(ordinal>=0 && uint32_t(ordinal)<used);
         }
-        uint32_t safeBefore=StagedPrefix(localSafe,ctl);
-        uint32_t safeCount=ctl[544+512/warpSize-1];
+        safeBefore=StagedPrefix(localSafe,ctl);
+        safeCount=ctl[544+512/warpSize-1];
+#if KVIP_LOW_MISS_TAIL
+        }
+#endif
         uint32_t conflictBefore=tid*per-safeBefore;
         // Reserve one contiguous range per phase, not one atomic per token.
         if(direct){
@@ -45,8 +55,17 @@ inline void PackStagedUrmaQuery(uint32_t history, uint32_t resident, uint32_t to
         }
         for(uint32_t i=tid*per;i<(tid+1)*per && i<own;++i){
             uint32_t rank=begin+i,slot=slots[rank];
-            if(slot>=resident)continue;
-            int32_t ordinal=asc_ldcg(reserved+slot);
+            if(slot>=resident){
+#if KVIP_LOW_MISS_TAIL
+                if(!used)asc_atomic_or(ctl+1,4U);
+#endif
+                continue;
+            }
+            int32_t ordinal=-1;
+#if KVIP_LOW_MISS_TAIL
+            if(used)
+#endif
+                ordinal=asc_ldcg(reserved+slot);
             bool conflict=ordinal>=0 && uint32_t(ordinal)<used;
             uint32_t position=conflict?safeCount+conflictBefore++:safeBefore++;
             uint32_t output=batch*kSlots+query*kTop+position;

@@ -13,13 +13,22 @@ inline void ClassifySelectedMetadata(uint32_t history, uint32_t resident,
     uint32_t batch, uint32_t owner, uint32_t used,
     uint32_t tailBegin, uint32_t tailEnd, bool hasTail, __gm__ Context* ctx,
     __ubuf__ uint32_t* indices, __ubuf__ uint32_t* locations,
-    __ubuf__ uint32_t* bitmap, __ubuf__ uint32_t* error) {
+    __ubuf__ uint32_t* bitmap, __ubuf__ uint32_t* error, bool noPrefetch = false) {
     const uint32_t words = (resident + 31) / 32;
     const uint32_t shards = 4096 / words < 8 ? 4096 / words : 8;
     auto mapping = reinterpret_cast<__gm__ uint32_t*>(ctx->mapping) + uint64_t(batch) * history;
     auto lru = reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots) + batch * kLruSlots;
     auto valid = reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid);
     auto reserved = reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot);
+    // A candidate slot is still valid when the whole round disabled prefetch.
+    // Mark the hit in the existing Q4 protection bitmap before the resolver
+    // picks any replacement; a low prediction never limits exact final Get.
+#if KVIP_LOW_MISS_TAIL
+    const bool preserveHot = noPrefetch && used == 0;
+#else
+    constexpr bool preserveHot = false;
+    (void)noPrefetch;
+#endif
 #if KVIP_INVERSE_MAPPING && !V9_UBMEM
     const auto view = LoadPrefetchMappingView(history, resident, batch, ctx, mapping);
 #endif
@@ -37,12 +46,11 @@ inline void ClassifySelectedMetadata(uint32_t history, uint32_t resident,
         }
         bool inTail = hasTail && token >= tailBegin && token < tailEnd;
         // hotValid and reservedHot are read-only throughout this LI launch.
-        // Keep the exact old short-circuit order; invalid/tail/cold tokens must
-        // never index resident-only metadata. Nonnegative reservations always
-        // prevent a direct hot hit, including ordinals not yet prefetched.
+        // Invalid/tail/cold tokens must never index resident-only metadata.
+        // The speculative path keeps its conservative reservation protection.
         if (token < resident && !inTail &&
             (!valid || asc_ldcg(valid + uint64_t(owner) * resident + token)) &&
-            (!reserved || asc_ldcg(reserved + uint64_t(batch) * resident + token) < 0)) {
+            (preserveHot || !reserved || asc_ldcg(reserved + uint64_t(batch) * resident + token) < 0)) {
             slot = token;
         } else if (used || hasTail) {
 #if KVIP_INVERSE_MAPPING && !V9_UBMEM
