@@ -62,7 +62,51 @@ def counts(samples, name):
     return str(lo) if lo == hi else f'{lo}..{hi}'
 
 
-def summarize(run):
+def detailed_trace(report, path, label, required=False):
+    trace_path = path.with_name('full_attribution.json')
+    trace = read(trace_path) if trace_path.exists() else report.get('full_trace', {})
+    samples = trace.get('samples', [])
+    if not samples or not any('final_topk' in s for s in samples):
+        if required:
+            raise ValueError(f'{path}: detailed TopK records missing')
+        return [f'{label}: detailed TopK records absent (old run).']
+    mhz = report.get('counter_clock_mhz')
+    if not mhz or mhz <= 0:
+        raise ValueError(f'{path}: missing device counter clock')
+    final, windows = [], {}
+    for sample in samples:
+        records = sample.get('final_topk', [])
+        if len(records) != report['batch'] * 4 or any(not r['present'] or r['end'] < r['begin'] or r['compute_cycles'] < 0 for r in records):
+            raise ValueError(f'{path}: incomplete/invalid final TopK trace')
+        final.extend(records)
+        for w in sample['incremental_windows']:
+            windows.setdefault(w['epoch'], []).append(w)
+    mean = lambda rows, name: statistics.mean(r[name] for r in rows)
+    lines = [f'{label} final TopK: compute includes input/compact/merge/ID recovery; excludes explicit wait and final classification.',
+             'Per-query durations; block totals below sum sequential queries, not parallel cores.']
+    lines += table(['Path', 'Final Q calls/replay', 'TopK calls/replay', 'Wait mean/max us per Q', 'Compute mean/max us per Q'], [[label, report['batch']*4, number(sum(r['topk_calls'] for r in final)/len(samples)), f"{mean(final,'wait_cycles')/mhz:.2f}/{max(r['wait_cycles'] for r in final)/mhz:.2f}", f"{mean(final,'compute_cycles')/mhz:.2f}/{max(r['compute_cycles'] for r in final)/mhz:.2f}"]])
+    rows = []
+    for q in sorted({r['query'] for r in final}):
+        rr = [r for r in final if r['query'] == q]
+        rows.append([q//4, q%4+1, rr[0]['block'], number(mean(rr,'wait_cycles')/mhz), number(mean(rr,'compute_cycles')/mhz), number(mean(rr,'topk_calls'))])
+    lines += table(['Request','Q','Block','Wait us','Compute us','TopK calls'], rows)
+    rows=[]
+    for block in sorted({r['block'] for r in final}):
+        rr=[r for r in final if r['block']==block]
+        rows.append([block, number(sum(r['wait_cycles'] for r in rr)/len(samples)/mhz), number(sum(r['compute_cycles'] for r in rr)/len(samples)/mhz), number(sum(r['topk_calls'] for r in rr)/len(samples))])
+    lines += table(['Final block','Wait us/replay','Compute us/replay','TopK calls/replay'], rows)
+    lines += ['Window costs: mean/max over executed lane events; counts averaged per replay. Incremental and service are separate intervals.']
+    rows=[]
+    for epoch, rr in sorted(windows.items()):
+        active=[r for r in rr if r['service_calls']]
+        def duration(name):
+            return '--' if not active else f'{mean(active,name)/mhz:.2f}/{max(r[name] for r in active)/mhz:.2f}'
+        rows.append([epoch, number(len(rr)/len(samples)), number(sum(r['skipped'] for r in rr)/len(samples)), number(len(active)/len(samples)), number(sum(r['topk_calls'] for r in rr)/len(samples)), duration('cycles'), duration('service_wait_cycles'), duration('service_cycles'), duration('scan_cycles'), duration('candidate_cycles'), duration('post_cycles')])
+    lines += table(['Epoch','Attempts','Skipped','Service calls','Incremental TopK calls','Incremental mean/max us','Service wait mean/max us','Service mean/max us','Scan mean/max us','Candidate mean/max us','Post mean/max us'],rows)
+    return lines
+
+
+def summarize(run, required=False):
     cases = {v: load_cases(run / v) for v in ('baseline', 'incremental')}
     lines = [f'Run: {run}', 'A=baseline; B=incremental. Time: us; positive reduction means faster.']
     keys = sorted(set(cases['baseline']) | set(cases['incremental']), key=lambda k: (k[0], str(k[1])))
@@ -120,6 +164,10 @@ def summarize(run):
                                  number(statistics.mean(max((w['cycles'] for w in g), default=0) for g in groups)/(mhz or 1))])
                 lines += ['B incremental windows: averages across profiled replays; calls sum all service lanes.']
                 lines += table(['Epoch', 'Active lanes', 'Skipped lanes', 'TopK calls', 'Slowest lane us' if mhz else 'Slowest lane cycles'], rows)
+        for variant, label in (('baseline', 'A'), ('incremental', 'B')):
+            if key in cases[variant]:
+                report, path = cases[variant][key]
+                lines += detailed_trace(report, path, label, required)
         if io:
             lines += ['DDR entries: whole batch, per-replay min..max; unused = fetched but absent from final TopK.']
             lines += table(['Path', 'Native', 'Prefetch hot', 'Prefetch cold', 'Final', 'Unused', 'Total', 'Conflict'], io)
@@ -139,6 +187,7 @@ def summarize(run):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('run', nargs='?', type=Path, help='A/B result directory; default: latest run')
+    parser.add_argument('--require-detailed', action='store_true', help='Fail if new A/B trace records are absent')
     args = parser.parse_args()
     run = args.run
     if run is None:
@@ -150,7 +199,7 @@ def main():
     run = run.resolve()
     if not run.is_dir():
         parser.error(f'Not a directory: {run}')
-    text = summarize(run)
+    text = summarize(run, args.require_detailed)
     output = run / 'key_results.log'
     output.write_text(text)
     print(text, end='')

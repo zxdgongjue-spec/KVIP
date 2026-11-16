@@ -11,9 +11,52 @@ def replace(path, old, new):
     path.write_text(source.replace(old, new))
 
 
+
+def instrument(dest):
+    vector = dest / 'csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_vector.h'
+    replace(vector, '    rotating::RuntimeShape runtimeShape_;',
+            '    uint32_t traceCalls_=0; uint64_t traceExtraWait_=0;\n    rotating::RuntimeShape runtimeShape_;')
+    replace(vector, '        WaitFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);',
+            '        bool finalTrace=!prefixActive_ && streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U);\n'
+            '        uint64_t finalBegin=finalTrace?GetSystemCycle():0; traceCalls_=0;traceExtraWait_=0;\n'
+            '        WaitFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);')
+    replace(vector, '        WaitFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);\n        WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);',
+            '        WaitFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);\n'
+            '        WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);\n'
+            '        uint64_t finalWait=finalTrace?GetSystemCycle()-finalBegin:0;')
+    replace(vector, '        if (validS2Len < topkCount_) {',
+            '        if(finalTrace) {\n'
+            '            PipeBarrier<PIPE_ALL>(); uint64_t finalEnd=GetSystemCycle();\n'
+            '            auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);\n'
+            '            uint32_t query=info.indiceOutOffset/topkCount_+curS1Idx+rowIdx;\n'
+            '            auto record=reinterpret_cast<__gm__ uint64_t*>(ctx->incremental)+query*16;\n'
+            '            record[8]=finalBegin;record[9]=finalEnd;record[10]=finalWait+traceExtraWait_;\n'
+            '            record[11]=traceCalls_;record[12]=blockId_;record[13]=1;\n'
+            '            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(record),128);\n'
+            '        }\n'
+            '        if (validS2Len < topkCount_) {')
+    vector.write_text(vector.read_text().replace('topkOp_(', '++traceCalls_; topkOp_('))
+    methods=vector.with_name('incremental_methods.h')
+    if methods.exists():
+        text=methods.read_text().replace('    topkOp_(', '    ++traceCalls_; topkOp_(')
+        text=text.replace('    if(runtimeShape_.rounds) {',
+            '    bool trace=streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U);\n'
+            '    uint64_t waitStart=trace?GetSystemCycle():0;\n    if(runtimeShape_.rounds) {')
+        text=text.replace('    uint32_t half=rotating::UseSequenceSplit',
+            '    if(trace)traceExtraWait_+=GetSystemCycle()-waitStart;\n    uint32_t half=rotating::UseSequenceSplit')
+        methods.write_text(text)
+    replace(dest / 'tests/operators/lifetch/support/diagnostics.py',
+            '            samples[-1]["algorithm"] = algorithm_after(rotating, algorithm_initial)\n            if diagnostics is not None:',
+            '            event_words = rotating.events.cpu().numpy().view(np.uint64).reshape(-1,16)\n'
+            '            samples[-1]["incremental_windows"] = [dict(epoch=i//rotating.events.shape[1], lane=i%rotating.events.shape[1], skipped=int(w[3]>>np.uint64(32)), cycles=int(w[14])-int(w[13]), topk_calls=int(w[15]), service_cycles=int(w[1])-int(w[0]), service_wait_cycles=int(w[0])-int(w[4]) if w[0] else 0, service_calls=int(w[1]>0), scan_cycles=int(w[5]), candidate_cycles=int(w[6]), post_cycles=int(w[7])) for i,w in enumerate(event_words)]\n'
+            '            samples[-1]["final_topk"] = [dict(query=i, block=int(w[12]), present=int(w[13]), begin=int(w[8]), end=int(w[9]), wait_cycles=int(w[10]), compute_cycles=int(w[9])-int(w[8])-int(w[10]), topk_calls=int(w[11])) for i,w in enumerate(rotating.incremental.cpu().numpy().reshape(-1,16))]\n'
+            '            samples[-1]["algorithm"] = algorithm_after(rotating, algorithm_initial)\n            if diagnostics is not None:')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path)
+    parser.add_argument('--baseline', action='store_true')
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[3]
     dest = args.output.resolve()
@@ -41,6 +84,10 @@ def main():
             '        self.incremental = torch.zeros((batch, 4, 16), dtype=torch.int64, device=self.device)\n'
             '        blob = np.concatenate((blob, np.array([self.incremental.data_ptr()], dtype="<u8").view("u1")))\n'
             '        self.context = torch.from_numpy(blob.copy()).to(self.device)')
+    if args.baseline:
+        instrument(dest)
+        print(f'Instrumented baseline: {dest}')
+        return
     vector = op / 'op_kernel/indexer/indexer_vector.h'
     for name in ('methods.h', 'vector_helpers.h'):
         shutil.copyfile(Path(__file__).with_name(name), vector.parent / ('incremental_' + name))
@@ -105,11 +152,7 @@ def main():
             '            uint32_t end=(work.GetValue(progress)<uint32_t(cursor)?work.GetValue(progress):uint32_t(cursor)),cap=windowEnd;')
     replace(prefetch, 'uint32_t high=work.GetValue(progress+16);',
             'uint32_t high=(work.GetValue(progress+16)<uint32_t(cursor>>32)?work.GetValue(progress+16):uint32_t(cursor>>32));')
-    replace(dest / 'tests/operators/lifetch/support/diagnostics.py',
-            '            samples[-1]["algorithm"] = algorithm_after(rotating, algorithm_initial)\n            if diagnostics is not None:',
-            '            event_words = rotating.events.cpu().numpy().view(np.uint64).reshape(-1,16)\n'
-            '            samples[-1]["incremental_windows"] = [dict(epoch=i//rotating.events.shape[1], lane=i%rotating.events.shape[1], skipped=int(w[3]>>np.uint64(32)), cycles=int(w[14])-int(w[13]), topk_calls=int(w[15])) for i,w in enumerate(event_words)]\n'
-            '            samples[-1]["algorithm"] = algorithm_after(rotating, algorithm_initial)\n            if diagnostics is not None:')
+    instrument(dest)
     print(f'Experimental URMA source: {dest}')
     print('Bitmap producer, LI tiling, resolver, Index update and KVAF transport are unchanged.')
 
