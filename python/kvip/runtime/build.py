@@ -51,6 +51,7 @@ def build_libraries(
     ready_direct_ranges=False,
     adaptive_admission=False,
     prefetch_gate=False,
+    prefetch_rank=0,
     skip_exhausted_prefetch=False,
     early_prefetch_drain=False,
     inverse_mapping=False,
@@ -82,6 +83,11 @@ def build_libraries(
         raise ValueError("LIFetch pipeline build options must be bool")
     if prefetch_gate and not adaptive_admission:
         raise ValueError("prefetch_gate requires adaptive_admission=True")
+    if type(prefetch_rank) is not int or not 0 <= prefetch_rank <= 2048:
+        raise ValueError("prefetch_rank must be an integer in 0..2048")
+    if prefetch_rank and not prefetch_gate:
+        raise ValueError("prefetch_rank requires prefetch_gate=True")
+    options["KVIP_PREFETCH_RANK"] = str(prefetch_rank)
     options.update({f"KVIP_{name}": "ON" if value else "OFF" for name, value in variants.items()})
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     for relative in (

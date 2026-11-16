@@ -26,8 +26,8 @@ than choosing the policy with the smallest unused-prefetch count.
 packed request: `(total_limit, window_limit, key_steps, carry)`.
 
 Build with `adaptive_admission=True` to enable runtime quotas and carry.
-Add `prefetch_gate=True` only when positive key steps are needed; it requires
-adaptive admission. Both build flags default to false and are part of the
+Add `prefetch_gate=True` for positive key steps or the rank-based gate below;
+it requires adaptive admission. Both build flags default to false and are part of the
 binary cache key. The bridge exports both capabilities, and the constructor
 and setter reject controls that the selected binary cannot honour before
 allocating or changing their device table.
@@ -56,6 +56,37 @@ The original 512 setting is the request's *total* prefetch budget, with a
 already support 2048 speculative slots plus 8192 final Q4 slots. Runtime limits
 remain enforced. The appended URMA Context pointer changes its bridge ABI to
 13 (336 bytes). The separately built UBmem Context is unchanged.
+
+## Seed-rank gate without changing final TopK
+
+`build_libraries(prefetch_rank=0)` disables this experiment by default. Values
+1..2048 require `prefetch_gate=True` and `adaptive_admission=True`; the bridge
+exports the integer through `kvip_prefetch_rank()`. A positive rank cannot be
+combined with nonzero runtime `key_steps`, and clearing runtime controls with
+`None` does not disable the compiled rank policy.
+
+The same resident plus recent-Index seed produces two thresholds: its exact
+2048th-largest key remains the safe bound for resident protection and final
+selection; its Kth-largest key is used only for cold prefetch admission. Smaller
+K raises the gate. Final TopK still selects 2048 entries, and final Fetch repairs
+selected tokens that were not prefetched. The existing threshold bank keeps the
+safe key at `[0]` and the independent gate at `[1]` for sequence-split execution,
+without changing the Context ABI or allocating another buffer.
+
+The two selectors share the high-byte histogram and read the input once in the
+low-byte pass. This keeps two input passes but increases histogram operations
+from four to six per 256 scores. The fallback path obtains the gate from the
+already materialized seed TopK2048 list. Both selection and publication remain
+inside measured graph time. Use `prefetch_rank=2048` as the matched dual-selector
+control, then compare 1792/1536 with identical quota, worker and build settings;
+also retain the original rank-zero full-graph baseline.
+
+A stricter gate can reduce unused reads while increasing final repair, especially
+at BF16 score ties. Report useful prefetch, unused prefetch, final reads and the
+complete graph's mean/median together. CPU tests establish exact rank outputs,
+unchanged safe thresholds and split publication, but do not establish NPU speedup.
+The best rank must be checked against the captured score distribution and real
+full-chain timings; fewer speculative bytes alone are not evidence of a benefit.
 
 ## Host planning without a new device synchronization
 

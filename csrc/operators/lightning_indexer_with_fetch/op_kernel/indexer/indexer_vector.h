@@ -86,8 +86,13 @@ public:
         SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
         WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
 #if KVIP_PREFETCH_GATE && !(defined(V9_UBMEM) && V9_UBMEM)
+#if KVIP_PREFETCH_RANK
+        PrepareAdmissionThreshold(batch * SIM_Q + (blockId_ % 2) * 2, false, true);
+        PrepareAdmissionThreshold(batch * SIM_Q + (blockId_ % 2) * 2 + 1, false, true);
+#else
         PrepareAdmissionThreshold(batch * SIM_Q + (blockId_ % 2) * 2);
         PrepareAdmissionThreshold(batch * SIM_Q + (blockId_ % 2) * 2 + 1);
+#endif
 #endif
     }
 
@@ -213,7 +218,30 @@ private:
     TBuf<TPosition::VECCALC> admissionThresholdBuf_;
     LocalTensor<uint16_t> admissionThreshold_;
 
-    __aicore__ inline void PrepareAdmissionThreshold(uint32_t query) {
+    __aicore__ inline void PrepareAdmissionThreshold(uint32_t query
+#if KVIP_PREFETCH_RANK
+        , bool thresholdReady = false, bool fromStored = false
+#endif
+        ) {
+#if KVIP_PREFETCH_RANK
+        const uint32_t bank = (query % 2) * 128;
+        if (!thresholdReady && !fromStored) {
+            // The legacy path already materialized the exact seed TopK2048.
+            // Rank<=2048 over this list is also exact for the complete seed.
+            kvip_recent_threshold::RegisterThreshold(
+                reinterpret_cast<__ubuf__ uint16_t*>(scoreOutLocal_.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint16_t*>(admissionThreshold_[bank].GetPhyAddr()),
+                8, uint16_t(2048 - KVIP_PREFETCH_RANK + 1));
+        }
+        SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        // Existing bank[0] is the exact safe bound. No consumer broadcasts
+        // bank[1]; persist the independent gate there for sequence-split LI.
+        const uint16_t gate = fromStored ? prefixThreshold_.GetValue(bank + 1) :
+            admissionThreshold_.GetValue(bank);
+        admissionThreshold_.SetValue(bank, gate);
+        if (!fromStored) prefixThreshold_.SetValue(bank + 1, gate);
+        SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
+#else
         uint32_t steps = 0;
         if (admissionControls_) {
             auto controls = reinterpret_cast<const __gm__ int32_t*>(admissionControls_) + (query / SIM_Q) * 4;
@@ -226,6 +254,7 @@ private:
         uint16_t gate = kvip_admission::LiftKey(lower, steps);
         admissionThreshold_.SetValue((query % 2) * 128, gate);
         SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
+#endif
     }
 #endif
     __aicore__ inline bool TryResidentThreshold(uint32_t query, uint32_t scoreRow,
@@ -265,7 +294,16 @@ private:
             }
             SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
             WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+#if KVIP_PREFETCH_RANK && !(defined(V9_UBMEM) && V9_UBMEM)
+            kvip_recent_threshold::RegisterThresholdPair(
+                reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_[(query % 2) * 128].GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint16_t*>(admissionThreshold_[(query % 2) * 128].GetPhyAddr()),
+                uint16_t(aligned / 256), uint16_t(aligned - topkCount_ + 1),
+                uint16_t(aligned - KVIP_PREFETCH_RANK + 1));
+#else
             topkOp_.Threshold(mrgValueLocal_, prefixThreshold_[(query % 2) * 128], aligned);
+#endif
             return true;
         }
         return false;
@@ -328,6 +366,9 @@ private:
                 MicroAPI::StoreAlign(dst, reduced, mask);
             }
         }
+#if KVIP_PREFETCH_RANK && !(defined(V9_UBMEM) && V9_UBMEM)
+        PrepareAdmissionThreshold(query, thresholdReady);
+#endif
         SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
         WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
         constexpr uint32_t count = SIM_Q * 2048;
@@ -344,7 +385,7 @@ private:
         }
         DataCopy(thresholds[q * 128], prefixThreshold_[(query % 2) * 128], 128);
         PipeBarrier<PIPE_ALL>();
-#if KVIP_PREFETCH_GATE && !(defined(V9_UBMEM) && V9_UBMEM)
+#if KVIP_PREFETCH_GATE && !KVIP_PREFETCH_RANK && !(defined(V9_UBMEM) && V9_UBMEM)
         PrepareAdmissionThreshold(query);
 #endif
         auto context = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);

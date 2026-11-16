@@ -336,3 +336,25 @@ def test_zero_steps_need_no_gate_and_none_needs_neither_feature(monkeypatch):
     bound.set_admission_controls(values)
     f.library.kvip_prefetch_gate.assert_not_called()
     assert bound.admission_controls is not None
+
+
+@pytest.mark.parametrize("setter", [False, True])
+def test_rank_gate_rejects_key_steps_before_upload(monkeypatch, setter):
+    f = fixture(monkeypatch)
+    f.library.kvip_adaptive_admission.return_value = 1
+    f.library.kvip_prefetch_gate.return_value = 1
+    f.library.kvip_prefetch_rank = Mock(return_value=1536)
+    values = np.tile(np.array([512, 64, 0, 0], np.int32), (2, 1))
+    if setter:
+        bound = f.construct(admission_controls=values)
+        before = bound.admission_controls.values.copy()
+    values[1, 2] = 1
+    with pytest.raises(ValueError, match="prefetch_rank cannot be combined"):
+        if setter:
+            bound.set_admission_controls(values)
+        else:
+            f.construct(admission_controls=values)
+    if setter:
+        np.testing.assert_array_equal(before, bound.admission_controls.values)
+    else:
+        f.torch.zeros.assert_not_called()

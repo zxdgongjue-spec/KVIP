@@ -65,3 +65,37 @@ def test_prefetch_gate_requires_admission_before_build(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="prefetch_gate requires adaptive_admission"):
         build.build_libraries(cache_dir=tmp_path, cann=tmp_path, headers=tmp_path, soc="A5", prefetch_gate=True)
     compile_.assert_not_called()
+
+
+@pytest.mark.parametrize("rank", (-1, 2049, True, False, 1536.0, "1536", None))
+def test_prefetch_rank_rejects_invalid_values(tmp_path, rank):
+    with pytest.raises(ValueError, match="prefetch_rank must be an integer"):
+        build.build_libraries(cache_dir=tmp_path, cann=tmp_path, headers=tmp_path,
+                              soc="A5", prefetch_rank=rank)
+
+
+def test_prefetch_rank_requires_gate_and_isolates_binary(monkeypatch, tmp_path):
+    calls = []
+
+    def compile_command(command, **kwargs):
+        calls.append(command)
+        if command[1] == "--build":
+            (Path(command[2]) / "libv9_bridge.so").write_bytes(b"fixture")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(build.subprocess, "run", compile_command)
+    args = dict(cache_dir=tmp_path / "cache", cann=tmp_path,
+                headers=tmp_path / "headers", soc="A5", adaptive_admission=True)
+    with pytest.raises(ValueError, match="prefetch_rank requires prefetch_gate"):
+        build.build_libraries(**args, prefetch_rank=1536)
+    assert not calls
+    paths = set()
+    for rank in (0, 2048, 1792, 1536):
+        result = build.build_libraries(**args, prefetch_gate=True, prefetch_rank=rank)
+        assert result not in paths
+        paths.add(result)
+        manifest = json.loads((result[0].parent / "complete.json").read_text())
+        assert manifest["KVIP_PREFETCH_RANK"] == str(rank)
+        count = len(calls)
+        assert build.build_libraries(**args, prefetch_gate=True, prefetch_rank=rank) == result
+        assert len(calls) == count

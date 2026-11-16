@@ -24,6 +24,9 @@ KVIP_ADMISSION_DEVICE inline bool Valid(const Controls& c) {
     return c.total >= 0 && c.total <= int32_t(kTotalLimit) &&
         c.window >= 1 && c.window <= int32_t(kWindowLimit) &&
         c.keySteps >= 0 && c.keySteps <= int32_t(kKeyLimit) &&
+#if KVIP_PREFETCH_RANK
+        c.keySteps == 0 &&
+#endif
         (c.carry == 0 || c.carry == 1);
 }
 

@@ -92,4 +92,68 @@ __simd_vf__ inline void RegisterThreshold(__ubuf__ uint16_t* input,
     Add(key, key, low, all16);
     StoreAlign(output, key, all16);
 }
+#if KVIP_PREFETCH_RANK
+// Two exact ranks over the same resident/recent scores. Share the entire high
+// histogram and load the input only once in the low-byte pass. The safe K2048
+// key and speculative gate remain separate, including BF16 ties.
+__simd_vf__ inline void RegisterThresholdPair(__ubuf__ uint16_t* input,
+    __ubuf__ uint16_t* safeOutput, __ubuf__ uint16_t* gateOutput,
+    uint16_t loops, uint16_t safeBottomK, uint16_t gateBottomK) {
+    auto all16 = CreateMask<uint16_t, MaskPattern::ALL>();
+    auto all8 = CreateMask<uint8_t, MaskPattern::ALL>();
+    RegTensor<uint16_t> lower, upper, lowBytes, highBytes;
+    Duplicate(lower, uint16_t(0));
+    Duplicate(upper, uint16_t(0));
+    for (uint16_t tile = 0; tile < loops; ++tile) {
+        LoadAlign<uint16_t, LoadDist::DIST_DINTLV_B8>(lowBytes, highBytes, input + tile * 256);
+        Histograms<uint8_t, uint16_t, HistogramsBinType::BIN0, HistogramsType::ACCUMULATE>(
+            lower, reinterpret_cast<RegTensor<uint8_t>&>(highBytes), all8);
+        Histograms<uint8_t, uint16_t, HistogramsBinType::BIN1, HistogramsType::ACCUMULATE>(
+            upper, reinterpret_cast<RegTensor<uint8_t>&>(highBytes), all8);
+    }
+    RegTensor<uint16_t> safeRank, gateRank, safeHigh, gateHigh, previous;
+    Duplicate(safeRank, safeBottomK);
+    Duplicate(gateRank, gateBottomK);
+    FirstCdfBin(safeHigh, lower, upper, safeRank);
+    CountBelowBin(previous, lower, upper, safeHigh);
+    Sub(safeRank, safeRank, previous, all16);
+    FirstCdfBin(gateHigh, lower, upper, gateRank);
+    CountBelowBin(previous, lower, upper, gateHigh);
+    Sub(gateRank, gateRank, previous, all16);
+    RegTensor<uint16_t> safeBroadcast, gateBroadcast, gateLower, gateUpper;
+    Muls(safeBroadcast, safeHigh, uint16_t(257), all16);
+    Muls(gateBroadcast, gateHigh, uint16_t(257), all16);
+    Duplicate(lower, uint16_t(0));
+    Duplicate(upper, uint16_t(0));
+    Duplicate(gateLower, uint16_t(0));
+    Duplicate(gateUpper, uint16_t(0));
+    for (uint16_t tile = 0; tile < loops; ++tile) {
+        LoadAlign<uint16_t, LoadDist::DIST_DINTLV_B8>(lowBytes, highBytes, input + tile * 256);
+        MaskReg selected;
+        Compare<uint8_t, CMPMODE::EQ>(selected,
+            reinterpret_cast<RegTensor<uint8_t>&>(highBytes),
+            reinterpret_cast<RegTensor<uint8_t>&>(safeBroadcast), all8);
+        Histograms<uint8_t, uint16_t, HistogramsBinType::BIN0, HistogramsType::ACCUMULATE>(
+            lower, reinterpret_cast<RegTensor<uint8_t>&>(lowBytes), selected);
+        Histograms<uint8_t, uint16_t, HistogramsBinType::BIN1, HistogramsType::ACCUMULATE>(
+            upper, reinterpret_cast<RegTensor<uint8_t>&>(lowBytes), selected);
+        Compare<uint8_t, CMPMODE::EQ>(selected,
+            reinterpret_cast<RegTensor<uint8_t>&>(highBytes),
+            reinterpret_cast<RegTensor<uint8_t>&>(gateBroadcast), all8);
+        Histograms<uint8_t, uint16_t, HistogramsBinType::BIN0, HistogramsType::ACCUMULATE>(
+            gateLower, reinterpret_cast<RegTensor<uint8_t>&>(lowBytes), selected);
+        Histograms<uint8_t, uint16_t, HistogramsBinType::BIN1, HistogramsType::ACCUMULATE>(
+            gateUpper, reinterpret_cast<RegTensor<uint8_t>&>(lowBytes), selected);
+    }
+    RegTensor<uint16_t> low, key;
+    FirstCdfBin(low, lower, upper, safeRank);
+    Muls(key, safeHigh, uint16_t(256), all16);
+    Add(key, key, low, all16);
+    StoreAlign(safeOutput, key, all16);
+    FirstCdfBin(low, gateLower, gateUpper, gateRank);
+    Muls(key, gateHigh, uint16_t(256), all16);
+    Add(key, key, low, all16);
+    StoreAlign(gateOutput, key, all16);
+}
+#endif
 } // namespace kvip_recent_threshold

@@ -29,6 +29,11 @@ def _require_admission_features(library, values):
         return
     required = ["adaptive_admission"]
     if np.any(values[:, 2] > 0):
+        rank = getattr(library, "kvip_prefetch_rank", None)
+        if rank is not None:
+            rank.argtypes, rank.restype = [], ctypes.c_uint32
+            if rank() != 0:
+                raise ValueError("prefetch_rank cannot be combined with nonzero key_steps")
         required.append("prefetch_gate")
     for name in required:
         function = getattr(library, "kvip_" + name, None)
@@ -273,7 +278,8 @@ class LIFetchBinding:
         """Update optional URMA int32[B,4] controls outside graph capture.
 
         Columns are total prefetch limit, per-window quota, upward sortable-key
-        steps, and carry (0/1). ``None`` restores the original admission path.
+        steps, and carry (0/1). ``None`` clears these runtime overrides;
+        a compiled prefetch_rank remains active and requires zero key steps.
         Non-None controls require an adaptive_admission build; positive key
         steps additionally require prefetch_gate. Both options default to off.
         Pass a contiguous NumPy array or CPU tensor. No NPU readback is used.
