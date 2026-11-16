@@ -170,6 +170,9 @@ def summarize(run, required=False):
     if (run / 'experiment.txt').exists() and (run / 'experiment.txt').read_text().strip() == 'ranked-miss':
         lines[1] = 'A=cold selection with half-quota floor; B=true-miss selection with same floor and cap.'
         lines += ['B excludes valid hot, prior prefetch and ABC-local mappings before threshold/floor/cap; cross-Q dedup follows.']
+    if (run / 'experiment.txt').exists() and (run / 'experiment.txt').read_text().strip() == 'ranked-bitmap':
+        lines[1] = 'A=indexed true-miss selection; B=same selection using maintained covered bitmap.'
+        lines += ['Same threshold/floor/cap and cross-Q dedup; bitmap initialization is included in init, admission maintenance in prefetch service.']
     keys = sorted(set(cases['baseline']) | set(cases['incremental']), key=lambda k: (k[0], str(k[1])))
     for key in keys:
         lines += ['', f'BS={key[0]} miss={key[1]}%']
@@ -250,7 +253,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('run', nargs='?', type=Path, help='A/B result directory; default: latest window-topk-only run')
     parser.add_argument('--experiment', default='window-topk-only',
-                        choices=('window-topk-only', 'final-topk-only', 'topk-prefetch', 'recent-index', 'ranked-prefetch', 'ranked-floor', 'ranked-miss'),
+                        choices=('window-topk-only', 'final-topk-only', 'topk-prefetch', 'recent-index', 'ranked-prefetch', 'ranked-floor', 'ranked-miss', 'ranked-bitmap'),
                         help='Result family to search when run is omitted')
     parser.add_argument('--require-detailed', action='store_true', help='Fail if new A/B trace records are absent')
     args = parser.parse_args()

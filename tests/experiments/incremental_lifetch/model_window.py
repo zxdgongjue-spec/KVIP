@@ -91,12 +91,14 @@ def main():
     parser.add_argument('--kvaf-root', required=True, type=Path)
     parser.add_argument('--cann-root', type=Path, default=Path('/usr/local/Ascend/cann'))
     parser.add_argument('--soc', default='Ascend950PR_9599')
+    parser.add_argument('--bitmap-miss', action='store_true', help='Indexed true-miss A vs maintained bitmap B; validate initialization and admission updates')
     parser.add_argument('--ranked-miss', action='store_true', help='Cold floor vs true-miss floor through the real window/submit path')
     parser.add_argument('--prepare-only', action='store_true')
     parser.add_argument('--max-b-topk-cycles', type=int, default=36000,
                         help='B incremental window must be below this cycle count (20 us at 1.8 GHz)')
     parser.add_argument('--stress', action='store_true', help='Also check B with sparse/dense candidates, unequal progress and no preloading')
     args = parser.parse_args()
+    if args.bitmap_miss: args.ranked_miss=True
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     here = Path(__file__).resolve().parent
@@ -108,7 +110,8 @@ def main():
             command.append('--baseline')
         if args.ranked_miss:
             command = [sys.executable, str(here / 'prepare_ranked.py'), str(source), '--minimum-half']
-            if label == 'b': command.append('--true-miss')
+            if label == 'b' or args.bitmap_miss: command.append('--true-miss')
+            if label == 'b' and args.bitmap_miss: command.append('--bitmap-miss')
         subprocess.run(command, check=True)
         op = source / 'csrc/operators/lightning_indexer_with_fetch'
         case = output / label
@@ -121,8 +124,42 @@ def main():
             kernel = kernel.replace('#include "incremental_vector_helpers.h"', '#include "incremental_vector_helpers.h"\n#include "window_fast_vector.h"')
         if args.ranked_miss:
             kernel = kernel.replace('#include "window_fast_vector.h"', '#include "window_fast_vector.h"\n#include "recent_seed.h"')
+        if args.bitmap_miss and label == 'b':
+            kernel=kernel.replace(' PipeBarrier<PIPE_ALL>();uint64_t t0=',''' if(!reinterpret_cast<__gm__ uint64_t*>(timing)[6]) {
+ auto ctx=reinterpret_cast<__gm__ rotating::Context*>(context);
+ uint64_t begin=GetSystemCycle();
+ for(uint32_t b=0;b<2;++b){
+ auto covered=reinterpret_cast<__gm__ uint32_t*>(kvip_prefetch_rank::CoveredAddress(ctx->incremental,2,131072,b));
+ kvip_prefetch_rank::InitializeCovered(a.topkSharedTmpLocal_,covered,
+ reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+b*16384,
+ reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+b*16384,16384,131072);
+ Simt::VF_CALL<rotating::InitializeTailMappings>(Simt::Dim3{256,1,1},131072,16384,ctx,b);
+ }
+ PipeBarrier<PIPE_ALL>();auto stamps=reinterpret_cast<__gm__ uint64_t*>(timing);
+ stamps[3]=begin;stamps[4]=GetSystemCycle();stamps[6]=1;
+ }
+ PipeBarrier<PIPE_ALL>();uint64_t t0=''')
         (case / 'kernel.cpp').write_text(kernel)
-        (case / 'main.cpp').write_text((here / 'window_model_host.cpp').read_text())
+        host=(here / 'window_model_host.cpp').read_text()
+        if args.bitmap_miss:
+            host=host.replace('(B*512+B*(4*K*6+1024))/8','(B*512+B*(4*K*6+1024)+B*H/8)/8')
+            host=host.replace('uint32_t mapped=*wanted[b].begin();mapping[b*H+mapped]=R;wanted[b].erase(mapped);', 'wanted[b].insert(17);wanted[b].insert(33);')
+            host=host.replace('r.slots=1;r.requests=1;', 'r.slots=0;r.requests=0;')
+            host=host.replace('lru[b*2048+1+i]', 'lru[b*2048+i]')
+            host=host.replace(' void* contextD=upload',''' std::vector<uint32_t> hot(B*R,1),reserved(B*R,UINT32_MAX),bounds(B*2);
+ for(uint32_t b=0;b<B;++b){hot[b*R+17]=0;reserved[b*R+33]=0;bounds[b*2]=H-384;bounds[b*2+1]=H;}
+ ctx.hotValid=(uint64_t)upload(hot);ctx.reservedHot=(uint64_t)upload(reserved);ctx.tailBounds=(uint64_t)upload(bounds);ctx.outputStride=R+384;
+ void* contextD=upload''')
+            if label=='b':
+                host=host.replace(' auto rr=read<rotating::Row>',''' auto finalMap=read<uint32_t>(mapD,B*H);
+ auto bitmapBase=reinterpret_cast<uint32_t*>(result.data())+(B*512+B*(4*K*6+1024))/4;
+ for(uint32_t b=0;b<B;++b)for(uint32_t t=0;t<H;++t){
+ bool expected=(t<R&&hot[b*R+t]&&int32_t(reserved[b*R+t])<0)||finalMap[b*H+t]!=UINT32_MAX;
+ bool actual=(bitmapBase[b*H/32+t/32]>>(t%32))&1U;
+ if(actual!=expected)throw std::runtime_error("covered bitmap token="+std::to_string(t));}
+ printf("PASS covered bitmap: hot validity, reserved, ABC tail and actual WQE admissions; init cycles=%llu\\n",(unsigned long long)(times[4]-times[3]));
+ auto rr=read<rotating::Row>''')
+        (case / 'main.cpp').write_text(host)
         (case / 'CMakeLists.txt').write_text(CMAKE.replace('@OP@', str(op)).replace('@KVAF@', str(args.kvaf_root.resolve() / 'access_operator/demo/aiv_batch_get/include')))
         if args.prepare_only:
             continue

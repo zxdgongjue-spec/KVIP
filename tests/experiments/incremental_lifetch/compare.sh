@@ -15,6 +15,9 @@ elif [[ ${1:-} == --topk-prefetch ]]; then
   mode=topk-prefetch
   prepare_flags=(--topk-prefetch)
   shift
+elif [[ ${1:-} == --ranked-bitmap ]]; then
+  mode=ranked-bitmap
+  shift
 elif [[ ${1:-} == --ranked-miss ]]; then
   mode=ranked-miss
   shift
@@ -34,7 +37,7 @@ server=${3:?Missing server}
 batches=${4:-16}
 miss=${5:-10}
 default_windows=8
-if [[ "$mode" == recent-index || "$mode" == ranked-prefetch || "$mode" == ranked-floor || "$mode" == ranked-miss ]]; then default_windows=4; fi
+if [[ "$mode" == recent-index || "$mode" == ranked-prefetch || "$mode" == ranked-floor || "$mode" == ranked-miss || "$mode" == ranked-bitmap ]]; then default_windows=4; fi
 windows=${6:-$default_windows}
 abc_tail_tokens=${7:-384}
 if [[ ! "$windows" =~ ^[1-9][0-9]*$ ]]; then
@@ -45,7 +48,10 @@ run="$repo/tests/results/$mode/$(date +%Y%m%d_%H%M%S)_$$"
 mkdir -p "$run"
 printf '%s\n' "$mode" > "$run/experiment.txt"
 echo "Experiment: $mode; results=$run"
-if [[ "$mode" == ranked-miss ]]; then
+if [[ "$mode" == ranked-bitmap ]]; then
+  python "$repo/tests/experiments/incremental_lifetch/prepare_ranked.py" "$run/baseline-source" --minimum-half --true-miss --abc-tail-tokens "$abc_tail_tokens"
+  python "$repo/tests/experiments/incremental_lifetch/prepare_ranked.py" "$run/incremental-source" --minimum-half --bitmap-miss --abc-tail-tokens "$abc_tail_tokens"
+elif [[ "$mode" == ranked-miss ]]; then
   python "$repo/tests/experiments/incremental_lifetch/prepare_ranked.py" "$run/baseline-source" --minimum-half --abc-tail-tokens "$abc_tail_tokens"
   python "$repo/tests/experiments/incremental_lifetch/prepare_ranked.py" "$run/incremental-source" --minimum-half --true-miss --abc-tail-tokens "$abc_tail_tokens"
 elif [[ "$mode" == ranked-floor ]]; then

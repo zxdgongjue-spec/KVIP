@@ -89,10 +89,15 @@ int main(){try{
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('output',type=Path)
+    p.add_argument('--bitmap',action='store_true',help='Indexed miss vs bitmap miss; default: only representative case 3')
+    p.add_argument('--case',type=int,choices=range(12),help='Run one fixture instead of the full correctness matrix')
     p.add_argument('--miss',action='store_true',help='Compare cold floor vs true-miss floor, including indexed metadata loads')
     p.add_argument('--floor',action='store_true',help='Compare no lower bound vs quota/2; preserve old-export reference')
     p.add_argument('--summarize',action='store_true',help='Read output/model.log; all times use 1800 model cycles/us')
     args=p.parse_args();dest=args.output.resolve()
+    if args.bitmap:
+        args.miss=True
+        if args.case is None: args.case=3
     if args.miss: args.floor=True
     if args.summarize:
         rows=[]
@@ -101,19 +106,23 @@ def main():
                 prefix, separator, stages = line.partition(' cycles ')
                 line = prefix + separator + stages.replace(' rank=', ' rank_cycles=')
                 rows.append({k:int(v) for k,v in re.findall(r'(kind|rank|rank_cycles|mode|count|pack|cap|emit|total)=(\d+)',line)})
-        expected=36 if args.floor else 24
+        expected=3 if args.case is not None else (36 if args.floor else 24)
         if len(rows)!=expected:
             raise RuntimeError(f'Expected {expected} verified samples, got {len(rows)}')
         print('CANN simulator; 1800 cycles/us. One Q/sample; 4Q is 4 x the per-Q delta, not end-to-end LI.')
-        if args.miss: print('A=cold floor; B=true-miss floor. B total includes indexed map/hot/reserved filtering. Counts are before cross-Q dedup.')
+        if args.bitmap: print('A=indexed true-miss; B=covered bitmap, including 16 KiB GM load. Compare pack cycles as state check + packing.')
+        elif args.miss: print('A=cold floor; B=true-miss floor. B total includes indexed map/hot/reserved filtering. Counts are before cross-Q dedup.')
         print('cold/Q | rank | before count | after count | before us/Q | after us/Q | added us/4Q' if args.floor else 'cold/Q | rank | v1 us/Q | optimized us/Q | old export us/Q | added us/4Q')
         counts=(0,12,64,256,2048,256,12,32,1024,20,16,1) if args.floor else (0,12,64,256,2048,256,12,32)
-        for kind in range(len(counts)):
+        for kind in ([args.case] if args.case is not None else range(len(counts))):
             for rank in (1024 if args.floor and kind==3 else 1024+(1024*(kind%4)+1)//3,):
                 r={v['mode']:v for v in rows if v['kind']==kind and v['rank']==rank}
                 a,b,old=(r[m]['total']/1800 for m in (0,1,2))
                 if args.floor:
                     print(f"{counts[kind]:6} | {rank:4} | {r[0]['count']:12} | {r[1]['count']:11} | {a:11.2f} | {b:10.2f} | {(b-a)*4:11.2f}")
+                    if args.bitmap:
+                        print(f"  check+pack us/Q: A={r[0]['pack']/1800:.3f} B={r[1]['pack']/1800:.3f}; B cycles={r[1]['pack']}")
+                        if r[1]['pack']>=1800: raise RuntimeError('State check + pack exceeds 1 us target')
                     continue
                 print(f'{counts[kind]:6} | {rank:4} | {a:7.2f} | {b:14.2f} | {old:15.2f} | {(b-old)*4:11.2f}')
         return
@@ -186,6 +195,28 @@ def main():
  std::vector<uint32_t> unchanged(input.size());ck(aclrtMemcpy(unchanged.data(),unchanged.size()*4,in,unchanged.size()*4,ACL_MEMCPY_DEVICE_TO_HOST));
  if(unchanged!=input)throw std::runtime_error("TopK input modified");
 ''')
+    if args.bitmap:
+        kernel=kernel.replace('pipe.InitBuffer(ob,8192)','pipe.InitBuffer(ob,16384)').replace('pipe.InitBuffer(tmp,22528)','pipe.InitBuffer(tmp,25600)')
+        kernel=kernel.replace('q*163840','q*167936')
+        indexed='kvip_prefetch_rank::SelectMiss(ids,scores,out,scratch,reinterpret_cast<__gm__ uint32_t*>(mapping)+q*167936,reinterpret_cast<__gm__ uint32_t*>(mapping)+q*167936+131072,reinterpret_cast<__gm__ int32_t*>(mapping)+q*167936+147456,16384,131072,rank,32,stamp,16)'
+        kernel=kernel.replace('kvip_prefetch_rank::Select(ids,scores,out,scratch,16384,131072,rank,32,true,stamp,16)',indexed)
+        old='''kvip_prefetch_rank::SelectMiss(ids,scores,out,scratch,
+ reinterpret_cast<__gm__ uint32_t*>(mapping)+q*167936,
+ reinterpret_cast<__gm__ uint32_t*>(mapping)+q*167936+131072,
+ reinterpret_cast<__gm__ int32_t*>(mapping)+q*167936+147456,
+ 16384,131072,rank,32,stamp,16)'''
+        if kernel.count(old)!=2: raise RuntimeError('Miss model call pattern changed')
+        kernel=kernel.replace(old,'kvip_prefetch_rank::SelectBitmap(ids,scores,out,scratch,reinterpret_cast<__gm__ uint32_t*>(mapping)+q*167936+163840,131072,131072,rank,32,stamp,16)')
+        host=host.replace('12*163840','12*167936').replace('q*163840','q*167936')
+        host=host.replace(' void* mapD=upload(maps);',''' for(uint32_t q=0;q<12;++q){auto m=maps.data()+q*167936;auto bits=m+163840;std::fill(bits,bits+4096,0);
+ for(uint32_t t=0;t<131072;++t)if(m[t]!=UINT32_MAX||(t<16384&&m[131072+t]!=0&&int32_t(m[147456+t])<0))bits[t/32]|=1U<<(t%32);}
+ void* mapD=upload(maps);''')
+        host=host.replace('if(mode==0?token>=16384:(!local&&m[token]==UINT32_MAX))','if(!local&&m[token]==UINT32_MAX)')
+    if args.case is not None:
+        if not args.floor: raise ValueError('--case requires --floor, --miss or --bitmap')
+        kernel=kernel.replace('for(uint32_t q=0;q<12;++q)',f'for(uint32_t q={args.case};q<{args.case+1};++q)')
+        anchor='for(uint32_t q=0;q<12;++q){auto ids=input.data()+q*3072;auto scores=reinterpret_cast<uint16_t*>(ids+2048);uint32_t rank='
+        host=host.replace(anchor,anchor.replace('q=0;q<12',f'q={args.case};q<{args.case+1}'))
     (dest/'kernel.cpp').write_text(kernel);(dest/'main.cpp').write_text(host)
     cmake=CMAKE.replace('@OP@',str(dest)).replace('@KVAF@',str(dest)).replace('window_model','rank_model')
     (dest/'CMakeLists.txt').write_text(cmake)

@@ -15,12 +15,14 @@ def replace_once(text, old, new):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path)
+    parser.add_argument('--bitmap-miss', action='store_true', help='Use maintained covered bitmap instead of per-Q indexed GM checks')
     parser.add_argument('--true-miss', action='store_true', help='Filter hot hits and prior admissions before rank/quota selection')
     parser.add_argument('--baseline', action='store_true')
     parser.add_argument('--minimum-half', action='store_true',
                         help='Lower the score threshold to admit quota/2 eligible candidates')
     parser.add_argument('--abc-tail-tokens', type=int, default=384)
     args = parser.parse_args()
+    if args.bitmap_miss: args.true_miss=True
     here = Path(__file__).resolve().parent
     subprocess.run([sys.executable, str(here/'prepare_recent.py'), str(args.output),
                     '--abc-tail-tokens', str(args.abc_tail_tokens)], check=True)
@@ -70,11 +72,60 @@ def main():
     uint32_t count=kvip_prefetch_rank::SelectMiss(indicesOutLocal_,scoreOutLocal_,compact,
         topkSharedTmpLocal_[128],map,hot,reserved,runtimeShape_.resident,valid,
         rank,ctx->windowLimit/4,nullptr,'''+('(ctx->windowLimit/4)/2' if args.minimum_half else '0')+');\n'+s[end:]
+    if args.bitmap_miss:
+        start=s.index('    uint32_t b=query/4;')
+        end=s.index('    mappedExport_=true;',start)
+        s=s[:start]+'''    uint32_t b=query/4;
+    auto covered=reinterpret_cast<__gm__ uint32_t*>(kvip_prefetch_rank::CoveredAddress(
+        ctx->incremental,runtimeShape_.batch,runtimeShape_.history,b));
+    uint32_t count=kvip_prefetch_rank::SelectBitmap(indicesOutLocal_,scoreOutLocal_,compact,
+        topkSharedTmpLocal_[128],covered,runtimeShape_.history,valid,rank,ctx->windowLimit/4,nullptr,'''+('(ctx->windowLimit/4)/2' if args.minimum_half else '0')+');\n'+s[end:]
     methods.write_text(s)
     prefetch=kernel/'prefetch.h';s=prefetch.read_text()
     start=s.index('        if(!epoch) {',s.index('uint32_t candidateCount=0;'))
     end=s.index('#include "topk_candidate_service.h"',start)+len('#include "topk_candidate_service.h"\n        }')
     s=s[:start]+'#include "topk_candidate_service.h"'+s[end:]
+    if args.bitmap_miss:
+        s=s.replace('#include "context.h"', '#include "context.h"\n#include "indexer/ranked_candidates.h"')
+        # Map publication and bitmap publication belong to the same producer
+        # epoch; AdvanceWindow already waits for its predecessor event.
+        anchor='                    asc_stcg(map+token,slot);'
+        s=replace_once(s,anchor,anchor+'''
+                    asc_atomic_or(reinterpret_cast<__gm__ uint32_t*>(kvip_prefetch_rank::CoveredAddressSimt(
+                        ctx->incremental,rt_batch,rt_history,b))+token/32,1U<<(token%32));''')
+        anchor='slots[i]=PhysicalSlot(rt_resident,ctx,batch,slot);asc_stcg(map+token,slot);'
+        s=replace_once(s,anchor,anchor+'''
+        asc_atomic_or(reinterpret_cast<__gm__ uint32_t*>(kvip_prefetch_rank::CoveredAddressSimt(
+            ctx->incremental,ctx->shape.batch,ctx->shape.history,batch))+token/32,1U<<(token%32));''')
+        anchor='    asc_threadfence();\n}\n\n// Resolver workers'
+        if anchor not in s: raise RuntimeError('Tail mapping publication changed')
+        s=s.replace(anchor,'''    auto covered=reinterpret_cast<__gm__ uint32_t*>(kvip_prefetch_rank::CoveredAddressSimt(
+        ctx->incremental,ctx->shape.batch,rt_history,b));
+    if(end>rt_history)end=rt_history;
+    if(end>begin && end-begin>tailTokens)end=begin+tailTokens;
+    for(uint32_t word=begin/32+threadIdx.x;begin<end && word<(end+31)/32;word+=256){
+        uint32_t low=begin>word*32?begin-word*32:0;
+        uint32_t high=end-word*32;if(high>32)high=32;
+        uint32_t mask=(UINT32_MAX<<low)&(UINT32_MAX>>(32-high));
+        asc_atomic_or(covered+word,mask);
+    }
+'''+anchor)
+        lifecycle=kernel/'lifecycle.cpp';c=lifecycle.read_text()
+        anchor='    pipe.Destroy();\n}\n#endif\nextern "C" __global__ __aicore__ void v9_init_kernel'
+        init='''    uint32_t resident=ctx->shape.resident;
+    uint32_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
+    auto hot=ctx->hotValid?reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*resident:nullptr;
+    auto reserved=ctx->reservedHot?reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+uint64_t(b)*resident:nullptr;
+    kvip_prefetch_rank::InitializeCovered(local,reinterpret_cast<__gm__ uint32_t*>(
+        kvip_prefetch_rank::CoveredAddress(ctx->incremental,rt_batch,rt_history,b)),hot,reserved,resident,rt_history);
+'''
+        c=replace_once(c,anchor,init+anchor);lifecycle.write_text(c)
+        binding=args.output/'python/kvip/operators/lifetch/binding.py';c=binding.read_text()
+        c=replace_once(c,'torch.empty(batch*(512+4*2048*6+1024),', 'torch.empty(batch*(512+4*2048*6+1024+(history+255)//256*32),')
+        c=replace_once(c,'        self.window_topk_storage =','''        if history > 131072 or resident % 512:
+            raise ValueError("Ranked bitmap experiment requires history<=131072 and resident aligned to 512")
+        self.window_topk_storage =''')
+        binding.write_text(c)
     prefetch.write_text(s)
     # Cold-only window 0 deliberately does not prefetch former resident tokens.
     # Preserve the cold-start/hot-victim KV, Index and ownership checks, but

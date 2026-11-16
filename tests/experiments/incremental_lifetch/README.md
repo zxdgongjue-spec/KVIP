@@ -377,3 +377,48 @@ python tests/experiments/incremental_lifetch/summarize.py \
 主要开销来自每Q对完整2048项进行SIMT离散状态读取；4Q重复查询相同hot/预取状态。
 该成本不代表算法必要成本，后续应复用分类或按请求批量准备状态。真机A/B用于验证
 实际预取和端到端变化，不将这一版标记为性能优化完成。
+
+### 真正 miss 状态检查的位图优化
+
+```bash
+bash tests/experiments/incremental_lifetch/compare_ranked.sh --bitmap-miss \
+  /vllm-workspace/vllm-ascend/third_party/KVAF \
+  4 127.0.0.1:28885 16 10 4 384
+python tests/experiments/incremental_lifetch/summarize.py \
+  --experiment ranked-bitmap --require-detailed
+```
+
+A 是上述正确的 indexed true-miss 实现，B 只改变状态读取方式；阈值、半配额保底、
+上限、跨Q去重及提交预算不变。每请求维护一份 covered bitmap，标记有效且未预留的
+hot、ABC 本地映射、已经接纳的预取（含在途）。每轮初始化；预取 admission 发布映射时
+同步置位，沿用原窗口完成依赖，不新增 CQ 等待。每 Q 批量读取位图，在 UB 内检查并打包。
+
+H=131072 时，增加16 KiB GM/请求（BS16共256 KiB），复用已有 UB scratch 和候选输出
+缓冲，不增加 UB 分配。实验限定 history<=131072、resident 按512对齐。
+初始化需要额外读取 hot/reserved 元数据，计入完整图 init；置位维护计入预取服务。
+不得把单Q收益直接当作完整图收益。
+
+单个代表用例（2048 TopK、256 cold、已有覆盖项、rank1024、上限32、保底16）
+的共享 helper 模型按1800 cycles/µs换算：
+
+| 操作 | A | B |
+| --- | ---: | ---: |
+| 状态检查＋候选打包 | 12.94 µs | 0.79 µs |
+| 包含阈值筛选和输出 | 13.64 µs | 1.48 µs |
+| 输出候选数 | 16 | 16 |
+
+B 的1422 cycles包含16 KiB位图读取；候选ID与独立CPU参考一致。
+复现工程：`model_rank.py OUTPUT --bitmap`，默认只跑代表用例，不展开整套矩阵；
+构建并运行生成的 `rank_model`，输出保存为 `OUTPUT/model.log` 后，
+`model_rank.py OUTPUT --bitmap --summarize` 会校验正确性及检查打包<1800 cycles。
+`model_window.py --bitmap-miss --output OUTPUT --kvaf-root KVAF_ROOT` 则使用真正窗口、
+初始化及 admission 实现，校验位图与映射、实际WQE、重复窗口不重复预取。
+以上为仿真模型时间，真机完整图及逐窗口实际预取量/误取率使用前述AB命令验证。
+
+本次实际窗口模型通过：两个请求全部 bitmap 位与 hot/reserved/ABC/admission map
+逐项一致，每请求26条真实WQE正确，相同进度再次执行没有重复预取。
+新增初始化（含ABC映射）两个请求串行共97554 cycles，即54.20 µs，平均27.10 µs/请求/轮；
+这是额外成本，不包含在0.79 µs/Q中。正式初始化按请求并行，不能乘BS估算init时延。
+窗口TopK及筛选共63245 cycles（35.14 µs/8Q），后续原预取服务29689 cycles
+（16.49 µs/2请求）；含实际 admission bitmap 更新，不包含网络DMA/CQ。
+融合算子CANN 9.1设备编译通过；真机端到端收益仍由AB测定。
