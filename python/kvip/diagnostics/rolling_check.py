@@ -5,7 +5,7 @@ import numpy as np
 from kvip.diagnostics.archive import cpu_array
 
 
-def reference(scores, ends, resident, bounds, progress, initial, rounds, reverse):
+def reference(scores, ends, resident, bounds, progress, initial, rounds, reverse, first_window=False):
     b, q, history = scores.shape
     expected = np.empty((b, q), dtype=np.uint16)
     exact = np.empty((b, q), dtype=np.uint16)
@@ -16,6 +16,8 @@ def reference(scores, ends, resident, bounds, progress, initial, rounds, reverse
         for query in range(q):
             ready = int(progress[row, query, 0])
             boundary = max((t for t in triggers if t <= ready), default=resident)
+            if first_window:
+                boundary = min(boundary, triggers[1])
             scanned = np.arange(resident, boundary, dtype=np.int64)
             if reverse:
                 mask = (scanned >= begin) & (scanned < stop)
@@ -44,6 +46,7 @@ def verify(torch, bundle, archive):
         archive.array("post.score_keys"), archive.array("pre.query_ends").reshape(initial.shape),
         g["resident"], archive.array("pre.threshold_bounds"), progress, initial,
         int(bundle.rotating.runtime_shape.rounds), bundle.tuning["reverse_cold"],
+        first_window=bundle.tuning.get("rolling_first_window", False),
     )
     if not np.array_equal(actual, expected):
         row, query = np.argwhere(actual != expected)[0]
@@ -51,6 +54,7 @@ def verify(torch, bundle, archive):
     if np.any(actual < initial) or np.any(actual > final):
         raise AssertionError("Rolling threshold escaped the seed/final Kth bounds")
     return dict(status="bit_exact", queries=actual.size,
+                scope="first_cold_window_frozen" if bundle.tuning.get("rolling_first_window") else "all_scanned_windows",
                 tightened_queries=int(np.count_nonzero(actual > initial)),
                 capped_queries=int(np.count_nonzero(exact.astype(np.int32)-initial > 255)),
                 mean_final_gap_keys=float(np.mean(final.astype(np.int32)-actual)),

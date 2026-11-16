@@ -20,7 +20,7 @@ def audit(scores, ends, resident, bounds, rounds, reverse):
         raise ValueError("Window exceeds native 18432-score UB allocation")
     counters = dict(queries=batch*queries, boundaries=0, capped=0,
                     histogram_tile=0, histogram_window=0,
-                    cdf_tile=0, cdf_batch=0, cdf_window=0, fast_tiles=0, tiles=0)
+                    cdf_tile=0, cdf_batch=0, cdf_window=0, fast_tiles=0, tiles=0, histogram_first=0)
     all_keys = []
     for row in range(batch):
         scan = np.arange(resident, history, dtype=np.int64)
@@ -41,6 +41,7 @@ def audit(scores, ends, resident, bounds, rounds, reverse):
             truth = list(seed)
             counters["histogram_tile"] += 2*((len(seed)+127)//128+cold_tiles)
             counters["histogram_window"] += 2*((len(seed)+255)//256)
+            counters["histogram_first"] += 2*((len(seed)+255)//256)
             counters["cdf_tile"] += cold_tiles
             counters["tiles"] += cold_tiles
             tiles = scan[::128]
@@ -66,6 +67,15 @@ def audit(scores, ends, resident, bounds, rounds, reverse):
                 expected = min(exact, initial+255)
                 if actual != expected:
                     raise AssertionError(f"Window Kth changed row={row} q={query}: {actual} != {expected}")
+                if not keys:
+                    counters["histogram_first"] += 2*((stop-start+255)//256)
+                elif keys[0] > actual:
+                    raise AssertionError("Frozen first-window threshold exceeds a later prefix Kth")
+                # The compact strict cutoff must retain exactly the same keys,
+                # including BF16 ties at the raised Kth boundary.
+                cutoff = max(initial, actual-1)
+                if not np.array_equal((values > initial) & (values >= actual), values > cutoff):
+                    raise AssertionError("Compact admission changed the candidate set")
                 keys.append(actual)
                 counters["boundaries"] += 1
                 counters["capped"] += exact > initial+255
@@ -101,6 +111,10 @@ def main():
                   f"CDF_updates={result['cdf_tile']}->{result['cdf_batch']}->{result['cdf_window']} "
                   f"full_tile_fast_path={100*result['fast_tiles']/result['tiles']:.2f}% "
                   "window_UB=36KiB/AIV counts_only_not_latency", flush=True)
+            print(f"CPU_LEAN compact_admission=exact first_window_bound=safe "
+                  f"hist_all={result['histogram_window']} hist_first={result['histogram_first']} "
+                  f"count_reduction={100*(1-result['histogram_first']/result['histogram_window']):.2f}% "
+                  "not_latency_prediction", flush=True)
     finally:
         archive.close()
 

@@ -7,10 +7,10 @@ import numpy as np
 import pytest
 
 from kvip.diagnostics import replay, replay_measure, scan_report, scan_options
-from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, budgets_for, options_for, validate_options
+from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, budgets_for, options_for, validate_options
 
 
-@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS])
+@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS])
 def test_scan_study_reuses_one_arena_and_delivers_independent_options(monkeypatch, variants):
     args = SimpleNamespace(study="scan-order", mode="fused", transport="urma",
                            threshold_policy="recent", scan_variants=list(variants))
@@ -34,7 +34,7 @@ def test_scan_study_reuses_one_arena_and_delivers_independent_options(monkeypatc
     assert calls == [(name, options_for(name), budgets_for(name)) for name in variants]
 
 
-@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS])
+@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS])
 def test_actual_command_line_accepts_scan_variants(tmp_path, variants):
     args = replay.arguments([
         "--snapshot", str(tmp_path / "input"), "--build-dir", str(tmp_path / "build"),
@@ -69,9 +69,9 @@ def test_report_uses_full_chain_and_keeps_mean_and_median_separate(tmp_path, cap
 
 def test_rolling_experiment_does_not_change_budgets_or_enable_pipeline_options():
     assert {budgets_for(name) for name in ROLLING_VARIANTS} == {(512, 64)}
-    assert options_for("reverse-refilter") == dict(reverse_cold=True, rolling_threshold=True, window_refilter=True, rolling_batched=False, rolling_windowed=False)
+    assert options_for("reverse-refilter") == dict(reverse_cold=True, rolling_threshold=True, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False)
     with pytest.raises(ValueError, match="requires rolling"):
-        validate_options(dict(reverse_cold=True, rolling_threshold=False, window_refilter=True, rolling_batched=False, rolling_windowed=False))
+        validate_options(dict(reverse_cold=True, rolling_threshold=False, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False))
 
 
 def test_rolling_reference_uses_unique_seed_and_only_scanned_causal_positions():
@@ -224,3 +224,51 @@ def test_window_control_keeps_old_binaries_and_requires_a_real_latency_gain(tmp_
     assert "GATE reverse-window KEEP_BASELINE" in output
     assert "GATE reverse-window-ref CANDIDATE" in output
     assert "GATE forward-window-ref KEEP_BASELINE" in output
+
+
+def test_lean_report_does_not_call_a_frozen_threshold_full_prefix_exact(tmp_path, capsys):
+    assert options_for("reverse-first-ref")["rolling_first_window"]
+    assert not options_for("reverse-compact-ref")["rolling_first_window"]
+    assert not options_for("reverse-window-ref")["rolling_compact"]
+    assert {budgets_for(name) for name in LEAN_VARIANTS} == {(512,64)}
+    data = rolling_report(tmp_path)
+    case = data["cases"]["reverse-refilter"]
+    data["execution_order"] = list(LEAN_VARIANTS)
+    data["cases"] = {name: json.loads(json.dumps(case)) for name in LEAN_VARIANTS}
+    data["cases"]["reverse-first-ref"]["rolling_threshold_check"]["scope"] = "first_cold_window_frozen"
+    path = tmp_path / "result.json"
+    path.write_text(json.dumps(data))
+    scan_report.report(path, require_lean=True)
+    output = capsys.readouterr().out
+    assert "first_cold_window_frozen" in output
+    assert "CHANGE reverse-window-ref->reverse-compact-ref" in output
+    assert "CHANGE reverse-compact-ref->reverse-first-ref" in output
+    assert "GATE reverse-first-ref KEEP_BASELINE" in output
+
+
+def test_frozen_reference_does_not_include_unobserved_future_scores():
+    from kvip.diagnostics.rolling_check import reference
+    scores = np.zeros((1, 4, 32768), dtype=np.uint16)
+    scores[:, :, :16384] = 100
+    scores[:, :, 16384:18688] = 110
+    scores[:, :, 20000:] = 130
+    ends = np.full((1, 4), 32768)
+    bounds = np.array([[16384,16384]])
+    progress = np.zeros((1,4,32), dtype=np.uint32)
+    progress[:,:,0] = 32768
+    initial = np.full((1,4),100,dtype=np.uint16)
+    frozen, _ = reference(scores, ends, 16384, bounds, progress, initial, 8, False, first_window=True)
+    full, _ = reference(scores, ends, 16384, bounds, progress, initial, 8, False)
+    assert np.all(frozen==110) and np.all(full==130)
+
+
+def test_lean_gate_requires_beating_reverse_not_only_forward(capsys):
+    cases = {name: dict(timing=dict(mean_us=100, p50_us=100)) for name in LEAN_VARIANTS}
+    cases["reverse"]["timing"] = dict(mean_us=90, p50_us=90)
+    cases["reverse-compact-ref"]["timing"] = dict(mean_us=95, p50_us=95)
+    cases["reverse-first-ref"]["timing"] = dict(mean_us=85, p50_us=85)
+    scan_report.check_acceptance(cases, ("reverse", "reverse-compact-ref", "reverse-first-ref"))
+    text = capsys.readouterr().out
+    assert "GATE reverse CANDIDATE" in text
+    assert "GATE reverse-compact-ref KEEP_BASELINE" in text
+    assert "GATE reverse-first-ref CANDIDATE" in text
