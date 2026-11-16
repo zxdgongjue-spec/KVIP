@@ -85,6 +85,7 @@ namespace rotating {
 constexpr uint32_t kTop=2048,kLruSlots=2048,kSlots=8192;
 struct Context {uint64_t mapping,lruSlots,hotValid,reservedHot;};
 uint32_t OutputStride(uint32_t resident,Context*){return resident+512;}
+uint32_t TailCapacity(uint32_t resident,Context* ctx){return OutputStride(resident,ctx)-resident;}
 """
         + resolve
         + '\n}\n#include "staged_topk_classify.h"\n#include "staged_selected_metadata.h"\n'
@@ -219,6 +220,7 @@ constexpr uint32_t kTop=2048,kLruSlots=2048,kSlots=8192;
 struct Context {uint64_t mapping,lruSlots,hotValid,reservedHot;};
 uint32_t tailCapacity=256;
 uint32_t OutputStride(uint32_t resident,Context*){return resident+tailCapacity;}
+uint32_t TailCapacity(uint32_t resident,Context* ctx){return OutputStride(resident,ctx)-resident;}
 ''' + resolve + '\n}\n#include "staged_topk_classify.h"\n#include "staged_selected_metadata.h"\n' + r'''
 int main(){using namespace rotating;
  constexpr uint32_t R=4096,H=8192,B=1,O=2,T=256;

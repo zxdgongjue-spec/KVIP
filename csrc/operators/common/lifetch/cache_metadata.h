@@ -24,6 +24,22 @@ __simt_callee__ inline bool IsTailToken(__gm__ Context* ctx,uint32_t b,uint32_t 
     auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds)+b*2;
     return token>=asc_ldcg(bounds) && token<asc_ldcg(bounds+1);
 }
+#if KVIP_FUSE_QUERY_WORK
+template<typename ContextPointer>
+__simt_callee__ inline uint32_t TailCapacity(uint32_t resident,ContextPointer ctx)
+#else
+__simt_callee__ inline uint32_t TailCapacity(uint32_t resident,__gm__ Context* ctx)
+#endif
+{
+#if KVIP_LOW_MISS_READ_THROUGH && !V9_UBMEM
+    // Temporary slots enlarge the owner stride, never the ABC ring modulus.
+    if(ctx->readThrough) {
+        auto config=reinterpret_cast<__gm__ uint64_t*>(ctx->readThrough);
+        return uint32_t(asc_ldcg(config+1))-resident;
+    }
+#endif
+    return OutputStride(resident,ctx)-resident;
+}
 __simt_callee__ inline uint32_t QueryEnd(uint32_t rt_history,__gm__ Context* ctx,uint32_t query) {
     return ctx->queryEnds ? asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)+query) : rt_history;
 }

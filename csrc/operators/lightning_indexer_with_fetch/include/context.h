@@ -54,8 +54,17 @@ struct Context {
     uint64_t admissionControls;
     // Optional device-only previous-success predictor, see auto_route.h.
     uint64_t autoRoute;
+#if KVIP_LOW_MISS_READ_THROUGH
+    // Opt-in ABI extension: fixed original ABC span and separate temporary KV.
+    uint64_t readThrough;
+#endif
 };
-static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 344,
+static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) ==
+#if KVIP_LOW_MISS_READ_THROUGH
+              352,
+#else
+              344,
+#endif
               "LIFetch runtime ABI layout changed");
 // Workload geometry is bound before capture and shared by host/device launches.
 #if defined(__CCE_AICORE__)

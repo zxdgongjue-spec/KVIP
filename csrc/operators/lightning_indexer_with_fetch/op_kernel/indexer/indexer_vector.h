@@ -934,6 +934,21 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     auto errors=reinterpret_cast<__gm__ uint32_t*>(a->queryErrors);
     uint32_t b=query/SIM_Q;
+#if KVIP_LOW_MISS_READ_THROUGH && !V9_UBMEM
+    // Low read-through does not reserve or overwrite hot slots. Its single
+    // tail producer classifies the exact selection and emits descriptors;
+    // no LI-side reservation bitmap or intermediate location table is needed.
+    if(noPrefetchRound_ && ctx->readThrough && b<runtimeShape_.batch && errors) {
+        errors[query*32]=0;
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);
+        if ((a->prefetchCount & 0x80000000U) && a->times) {
+            auto ticks=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(runtimeShape_.batch)*64+uint64_t(query)*16;
+            for (uint32_t i=0;i<16;++i) ticks[i]=0;
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ticks),128);
+        }
+        return;
+    }
+#endif
     if (b>=runtimeShape_.batch || runtimeShape_.resident>131072 ||
         !a->queryBitmaps || !a->queryErrors || !ctx->mapping || !ctx->lruSlots) {
         if (errors && b<runtimeShape_.batch) { errors[query*32]=1; kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128); }

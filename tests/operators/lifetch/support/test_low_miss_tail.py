@@ -153,7 +153,7 @@ struct BatchFlag {uint32_t ready=0,count=0,error=0;};
 struct FinalPost {uint32_t count=0,descriptor=0,pending=0,error=0,deferred=0;};
 uint32_t OwnerRow(Context*,uint32_t b){return 3-b;}
 uint32_t OutputStride(uint32_t resident,Context*){return resident+512;}
-""" + function(source, "inline void PublishQueryCompletion(")
+""" + "template <bool ReadThrough = false>\n" + function(source, "inline void PublishQueryCompletion(")
         + "\n" + function(source, "inline void PublishPrefetchResidency(") + r"""
 int main(){
  constexpr uint32_t batch=4,resident=16384,stride=resident+512;

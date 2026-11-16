@@ -140,7 +140,7 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,
    if(GetSystemCycle()-start>5000000000ULL){error|=kUbmemIncomplete;break;}}
  }
  if(profile)trace[13]=GetSystemCycle();
- Simt::VF_CALL<PublishQueryCompletion>(Simt::Dim3{256,1,1},ctx,flags,shape.batch,
+ Simt::VF_CALL<PublishQueryCompletion<false>>(Simt::Dim3{256,1,1},ctx,flags,shape.batch,
    shape.resident,shape.finalPostOffset,q,lane,workers,error,completed);
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  if(profile)trace[14]=trace[15]=GetSystemCycle();

@@ -92,6 +92,7 @@ def build_libraries(
     auto_route_simt=False,
     low_miss_direct_index=False,
     low_miss_compact_plan=False,
+    low_miss_read_through=False,
     auto_route=False,
     prefetch_gate=False,
     prefetch_rank=0,
@@ -124,6 +125,7 @@ def build_libraries(
         AUTO_ROUTE_SIMT=auto_route_simt,
         LOW_MISS_DIRECT_INDEX=low_miss_direct_index,
         LOW_MISS_COMPACT_PLAN=low_miss_compact_plan,
+        LOW_MISS_READ_THROUGH=low_miss_read_through,
         AUTO_ROUTE=auto_route,
         PREFETCH_GATE=prefetch_gate,
         SKIP_EXHAUSTED_PREFETCH=skip_exhausted_prefetch,
@@ -157,6 +159,8 @@ def build_libraries(
         raise ValueError("low_miss_direct_index requires low_miss_tail, selected_metadata and early_fetch_ready")
     if low_miss_compact_plan and not (auto_route and low_miss_tail and selected_metadata and early_fetch_ready):
         raise ValueError("low_miss_compact_plan requires auto_route, low_miss_tail, selected_metadata and early_fetch_ready")
+    if low_miss_read_through and not (auto_route and low_miss_tail and selected_metadata and early_fetch_ready):
+        raise ValueError("low_miss_read_through requires auto_route, low_miss_tail, selected_metadata and early_fetch_ready")
     if type(prefetch_rank) is not int or not 0 <= prefetch_rank <= 2048:
         raise ValueError("prefetch_rank must be an integer in 0..2048")
     if prefetch_rank and not prefetch_gate:

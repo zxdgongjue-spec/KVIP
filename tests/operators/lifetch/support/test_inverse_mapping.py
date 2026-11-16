@@ -35,6 +35,7 @@ namespace rotating {
 constexpr uint32_t kSlots=8192,kLruSlots=2048,kChangeCapacity=10240;
 """
         + function(metadata, "__simt_callee__ inline uint32_t OutputStride(uint32_t rt_resident,__gm__ Context* ctx)").replace("#endif\n", "")
+        + function(metadata, "__simt_callee__ inline uint32_t TailCapacity(uint32_t resident,__gm__ Context* ctx)").replace("#endif\n{", "{")
         + function(metadata, "__simt_callee__ inline void RecordChange(")
         + function(metadata, "__simt_callee__ inline uint32_t ResolvePhysicalSlot(")
         + '\n#include "inverse_mapping.h"\n#define KVIP_INVERSE_MAPPING 0\n'

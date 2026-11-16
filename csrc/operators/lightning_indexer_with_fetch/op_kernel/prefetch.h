@@ -48,7 +48,7 @@ inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm
     auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds)+b*2;
     auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;
     uint32_t begin=asc_ldcg(bounds),end=asc_ldcg(bounds+1);
-    const uint32_t tailTokens=OutputStride(rt_resident,ctx)-rt_resident;
+    const uint32_t tailTokens=TailCapacity(rt_resident,ctx);
     for(uint32_t i=threadIdx.x;i<tailTokens;i+=256) {
         uint32_t token=begin+i;
         if(token<end && token<rt_history)

@@ -23,7 +23,7 @@ inline void ClassifySelectedMetadata(uint32_t history, uint32_t resident,
     // One VF serves both routes. Keep the per-invocation predicate uniform;
     // zero speculative writes is required before retaining reserved hot hits.
     preserveHot = preserveHot && !used;
-    uint32_t tailTokens = preserveHot ? OutputStride(resident, ctx) - resident : 0;
+    uint32_t tailTokens = preserveHot ? TailCapacity(resident, ctx) : 0;
 #if KVIP_INVERSE_MAPPING && !V9_UBMEM
     PrefetchMappingView view;
     if (!preserveHot)

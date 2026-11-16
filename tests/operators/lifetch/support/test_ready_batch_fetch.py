@@ -132,7 +132,7 @@ int main(){
 @pytest.mark.parametrize("direct", [0, 1])
 def test_native_adapter_queue_counts_errors_and_index_join(tmp_path, direct):
     streaming = (KERNEL / "streaming.cpp").read_text()
-    entry = function(streaming, "__aicore__ inline void FetchQueryGroup(")
+    entry = "template <bool ReadThrough = false>\n" + function(streaming, "__aicore__ inline void FetchQueryGroup(")
     source = (
         r"""
 #include <algorithm>
@@ -207,6 +207,7 @@ void PackFetchRanges(Context*,int32_t* packed,uint32_t stride,uint32_t* ranges,u
   uint32_t out=ranges[3*r+2]+i;packed[out]=ranges[3*r]+i;packed[stride+out]=0;packed[2*stride+out]=packed[out];
  }
 }
+template <bool ReadThrough = false>
 void PublishQueryCompletion(Context* ctx,BatchFlag* flags,uint32_t batch,uint32_t,uint32_t,uint32_t q,
  uint32_t lane,uint32_t workers,uint64_t error,uint32_t completed){
  ++publicationCalls;assert(batch==16&&q==2&&completed==(failCall?1U:2U));

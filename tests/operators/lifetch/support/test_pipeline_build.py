@@ -192,6 +192,12 @@ def test_auto_route_requires_complete_tail_and_isolates_binary(monkeypatch, tmp_
     parallel_flags = row_flags | dict(low_miss_direct_index=True, auto_route_simt=True)
     parallel = build.build_libraries(**args, **parallel_flags)
     compact = build.build_libraries(**args, **parallel_flags, low_miss_compact_plan=True)
+    read_through = build.build_libraries(**args, **row_flags, low_miss_read_through=True)
+    assert read_through not in (automatic, sparse, fast, row, direct, parallel, compact)
+    recorded = json.loads((read_through[0].parent / "complete.json").read_text())
+    assert recorded["KVIP_LOW_MISS_READ_THROUGH"] == "ON"
+    assert recorded["KVIP_AUTO_ROUTE_SIMT"] == "OFF"
+    assert recorded["KVIP_LOW_MISS_COMPACT_PLAN"] == "OFF"
     assert len({automatic, sparse, fast, row, direct, parallel, compact}) == 7
     manifest = json.loads((compact[0].parent / "complete.json").read_text())
     assert manifest["KVIP_AUTO_ROUTE_SIMT"] == "ON"
@@ -201,13 +207,15 @@ def test_auto_route_requires_complete_tail_and_isolates_binary(monkeypatch, tmp_
     assert len(calls) == count
 
 
+@pytest.mark.parametrize("feature", ("low_miss_compact_plan", "low_miss_read_through"))
 @pytest.mark.parametrize("missing", ("auto_route", "low_miss_tail", "selected_metadata", "early_fetch_ready"))
-def test_compact_plan_requires_complete_auto_path(monkeypatch, tmp_path, missing):
+def test_compact_plan_requires_complete_auto_path(monkeypatch, tmp_path, missing, feature):
     compile_ = Mock()
     monkeypatch.setattr(build.subprocess, "run", compile_)
     flags = dict(adaptive_admission=True, low_miss_skip=True, low_miss_tail=True,
                  selected_metadata=True, ready_batch_fetch=True, early_fetch_ready=True,
-                 auto_route=True, low_miss_compact_plan=True)
+                 auto_route=True)
+    flags[feature] = True
     flags[missing] = False
     with pytest.raises(ValueError, match="requires"):
         build.build_libraries(cache_dir=tmp_path, cann=tmp_path, headers=tmp_path,

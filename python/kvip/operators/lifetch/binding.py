@@ -72,6 +72,7 @@ class LIFetchBinding:
         threshold_bounds=None,
         admission_controls=None,
         auto_route=None,
+        low_scratch_config=None,
         output_stride=None,
         scratch=None,
     ):
@@ -89,6 +90,13 @@ class LIFetchBinding:
             admission_controls = np.tile(np.array(auto_route.full_controls, dtype=np.int32), (batch, 1))
         admission_values = None if admission_controls is None else _admission_values(admission_controls, batch)
         self.library = load_lifetch_library(library)
+        feature = getattr(self.library, "kvip_low_miss_read_through", None)
+        read_through_build = False
+        if feature is not None:
+            feature.argtypes, feature.restype = [], ctypes.c_uint32
+            read_through_build = feature() == 1
+        if low_scratch_config is not None and (not read_through_build or auto_route is None):
+            raise ValueError("Temporary low-miss KV requires low_miss_read_through=True and auto_route")
         if auto_route is not None:
             feature = getattr(self.library, "kvip_auto_route", None)
             if feature is None:
@@ -137,7 +145,7 @@ class LIFetchBinding:
             ("history", history),
             ("resident", resident),
             ("simulation", 0),
-            ("context_bytes", 344),
+            ("context_bytes", 352 if read_through_build else 344),
             ("row_bytes", 1024),
         ):
             fn = getattr(self.library, "v9_" + name)
@@ -216,7 +224,22 @@ class LIFetchBinding:
         ):
             raise ValueError("Token addresses must match the stable-owner Index storage")
         self.output_stride = resident if output_stride is None else output_stride
-        tail_tokens = self.output_stride - resident
+        self.low_scratch_config = None
+        original_stride = self.output_stride
+        if low_scratch_config is not None:
+            if getattr(getattr(low_scratch_config, "device", None), "type", "cpu") != "cpu":
+                raise ValueError("Temporary KV configuration must be a CPU uint64[4] table")
+            config = np.asarray(low_scratch_config)
+            if (config.dtype != np.uint64 or config.shape != (4,) or
+                    not config.flags.c_contiguous):
+                raise ValueError("Temporary KV configuration must be contiguous CPU uint64[4]")
+            magic, original_stride, start, capacity = map(int, config)
+            if (magic != 0x52544831 or original_stride < resident or
+                    start != original_stride or capacity != 8192 or
+                    self.output_stride != start + capacity):
+                raise ValueError("Temporary KV must reserve 8192 disjoint slots after the original hot/ABC region")
+            self.low_scratch_config = torch.from_numpy(config.copy().view(np.int64)).to(self.device)
+        tail_tokens = original_stride - resident
         if tail_tokens < 0 or tail_tokens % 128:
             raise ValueError("Output stride must preserve hot and optional ABC slots")
         if tail_bounds is not None and tail_tokens < 384:
@@ -278,7 +301,10 @@ class LIFetchBinding:
                 ).view("u1"),
             )
         )
-        if blob.size != 344:
+        if read_through_build:
+            pointer = 0 if self.low_scratch_config is None else self.low_scratch_config.data_ptr()
+            blob = np.concatenate((blob, np.array([pointer], dtype="<u8").view("u1")))
+        if blob.size != (352 if read_through_build else 344):
             raise AssertionError("LIFetch Context ABI changed")
         self.context = torch.from_numpy(blob.copy()).to(self.device)
         self.arguments = tuple(arguments) + (self.context,)

@@ -21,7 +21,7 @@ __simt_callee__ inline PrefetchMappingView LoadPrefetchMappingView(uint32_t hist
     if (!KVIP_INVERSE_MAPPING_ACTIVE(ctx)) return view;
     view.inverse = reinterpret_cast<__gm__ uint32_t*>(ctx->changes) +
         uint64_t(batch) * kChangeCapacity;
-    view.tailTokens = OutputStride(resident, ctx) - resident;
+    view.tailTokens = TailCapacity(resident, ctx);
     if (ctx->tailBounds && view.tailTokens) {
         auto bounds = reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds) + batch * 2;
         view.tailBegin = asc_ldcg(bounds);

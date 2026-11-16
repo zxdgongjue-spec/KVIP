@@ -112,6 +112,10 @@ __aicore__ inline void SyncFetchDescriptors(__gm__ Context* ctx, uint32_t begin,
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->fallbackAddresses)+uint64_t(begin)*8,uint64_t(count)*8);
 }
 #include "output_worker.h"
+#if KVIP_LOW_MISS_READ_THROUGH && !V9_UBMEM
+#include "low_miss_mode.h"
+#include "read_through.h"
+#endif
 __aicore__ inline uint32_t Producer(__gm__ Args* a, uint32_t b) {
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
@@ -460,13 +464,14 @@ inline void PublishStreamingResidency(uint32_t resident,uint32_t postOffset,__gm
 // One VF handles every request assigned to this Q worker. All slot stores
 // complete before any completion flag is released. The scalar caller has joined
 // Index update; failure is reported without publishing successful residency.
+template <bool ReadThrough = false>
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void PublishQueryCompletion(__gm__ Context* ctx,__gm__ BatchFlag* flags,
  uint32_t batch,uint32_t resident,uint32_t postOffset,uint32_t q,uint32_t lane,
  uint32_t workers,uint64_t error,uint32_t completed) {
  for(uint32_t b=lane;b<batch;b+=workers){
   auto post=reinterpret_cast<__gm__ FinalPost*>(ctx->owners+postOffset)+b*4+q;
-  if(!error && ctx->hotValid){
+  if(!ReadThrough && !error && ctx->hotValid){
    auto valid=reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+OwnerRow(ctx,b)*resident;
    uint32_t base=OwnerRow(ctx,b)*OutputStride(resident,ctx);
    auto destinations=reinterpret_cast<__gm__ int32_t*>(ctx->destinations);
@@ -526,10 +531,11 @@ constexpr uint32_t kBatchGetInflight = 2048;
 // Each worker owns one KVAF queue. It gathers its shard of requests for one Q,
 // calls the native BatchGet once per safe/conflicting phase, then acknowledges
 // all rows covered by that call. The native scheduler owns WQE and CQ handling.
+template <bool ReadThrough = false>
 __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,uint32_t workers,bool skipEmptyConflict=true){
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  if(lane>=shape.batch)return;
- bool directLayout=skipEmptyConflict && !(a->prefetchCount & 0x20000000U);
+ bool directLayout=!ReadThrough && skipEmptyConflict && !(a->prefetchCount & 0x20000000U);
  auto allFlags=reinterpret_cast<__gm__ BatchFlag*>(a->flags);
  bool profile=(a->prefetchCount & 0x80000000U)!=0;
  uint32_t stride=shape.batch*kTop;
@@ -642,14 +648,14 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
       uint64_t(kResolveCores*shape.batch+q*workers+lane)*32;
   if(profile)trace[12]=GetSystemCycle();
   // Update may invalidate displaced hot slots. Publish only after it finishes.
-  for(uint32_t b=lane;b<shape.batch;b+=workers){
+  if constexpr (!ReadThrough) for(uint32_t b=lane;b<shape.batch;b+=workers){
    auto flag=allFlags+b*kFlagCount+6;uint64_t start=GetSystemCycle();
    while(true){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flag),sizeof(*flag));
     if(flag->ready){error|=flag->error;break;}
     if(GetSystemCycle()-start>5000000000ULL){error|=kvaf_device::kCqTimeout;break;}}
   }
   if(profile)trace[13]=GetSystemCycle();
-  Simt::VF_CALL<PublishQueryCompletion>(Simt::Dim3{256,1,1},ctx,allFlags,shape.batch,
+  Simt::VF_CALL<PublishQueryCompletion<ReadThrough>>(Simt::Dim3{256,1,1},ctx,allFlags,shape.batch,
       shape.resident,shape.finalPostOffset,q,lane,workers,error,completed);
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
   uint64_t published=profile?GetSystemCycle():0;
@@ -672,13 +678,18 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
  }
 }
 #endif
+template <bool ReadThrough = false>
 __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b,uint32_t usefulPrefetch){
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
  auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;uint64_t error=0;
  bool profile=(a->prefetchCount & 0x80000000U)!=0;
  auto ft=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*128+uint64_t(b)*128+96;
+ if constexpr (ReadThrough) {
+  if(profile)for(uint32_t i=0;i<32;++i)ft[i]=0;
+ }
  if(profile)ft[0]=GetSystemCycle();
+ if constexpr (!ReadThrough) {
 #if KVIP_EARLY_PREFETCH_DRAIN && !V9_UBMEM
  // Consumer is the only CQ reader and flag-7 writer in this specialization.
  error|=JoinEarlyPrefetch(a,b,ft,profile);
@@ -697,12 +708,13 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b,uint32_t usef
  if(profile){ft[4]=GetSystemCycle();ft[5]=polls;ft[6]=drain;ft[7]=arrival;}error|=row->error;flags[7].error=error;flags[7].ready=1;
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+7),sizeof(BatchFlag));
 #endif
- for(uint32_t f=6;f<12;++f){uint64_t start=GetSystemCycle();if(profile)ft[8+2*(f-6)]=start;while(true){
+ }
+ for(uint32_t f=ReadThrough?8:6;f<12;++f){uint64_t start=GetSystemCycle();if(profile)ft[8+2*(f-6)]=start;while(true){
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+f),sizeof(BatchFlag));
   if(flags[f].ready){error|=flags[f].error;break;}
   if(GetSystemCycle()-start>5000000000ULL){error|=kvaf_device::kCqTimeout;break;}}
   if(profile)ft[9+2*(f-6)]=GetSystemCycle();
-  if(f==6 && (a->prefetchCount & 0x10000000U)){
+  if(!ReadThrough && f==6 && (a->prefetchCount & 0x10000000U)){
    if(profile)ft[20]=GetSystemCycle();
    if(!error
 #if KVIP_LOW_MISS_TAIL
@@ -738,7 +750,7 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b,uint32_t usef
  }
  if(row->pending || total!=info[1])error|=kvaf_device::kInvalidArgs;
  if(profile)ft[1]=GetSystemCycle();
- if(!error && !updateError && !(a->prefetchCount & 0x10000000U)){
+ if(!ReadThrough && !error && !updateError && !(a->prefetchCount & 0x10000000U)){
   Simt::VF_CALL<PublishStreamingResidency>(Simt::Dim3{256,1,1},shape.resident,shape.finalPostOffset,ctx,b);
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  }
@@ -796,12 +808,27 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
   bool profile=(a->prefetchCount & 0x80000000U)!=0;
   auto trace=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*256+uint64_t(block)*32;
   if(profile)trace[0]=GetSystemCycle();
+#if KVIP_LOW_MISS_READ_THROUGH && !V9_UBMEM
+  const bool readThrough=read_through::Active(reinterpret_cast<__gm__ Context*>(a->context));
+#endif
   if(block<shape.batch*kResolveCores){uint32_t b=block/kResolveCores,role=block%kResolveCores;
+#if KVIP_LOW_MISS_READ_THROUGH && !V9_UBMEM
+   if(readThrough){
+    if(role==0){read_through::Producer(a,b);FinalizeStreaming<true>(a,b,0);}
+    else if(profile)for(uint32_t i=2;i<32;++i)trace[i]=0;
+   }else
+#endif
+   {
    if(role==0){uint32_t useful=Producer(a,b);FinalizeStreaming(a,b,useful);}else if(role==1)Consumer(a,b);
    else OutputWorker(a,b);
+   }
   }
   else {uint32_t lane=block-shape.batch*kResolveCores,q=lane/workers,part=lane%workers;
    if(q<4 && part<workers){
+#if KVIP_LOW_MISS_READ_THROUGH && !V9_UBMEM
+    if(readThrough)FetchQueryGroup<true>(a,q,part,workers);
+    else
+#endif
     FetchQueryGroup(a,q,part,workers);
    }}
   if(profile){trace[1]=GetSystemCycle();kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(trace),32*8);}
