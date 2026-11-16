@@ -58,6 +58,8 @@ def arguments(argv=None):
         help="Separate instrumented fused graph replays after headline timing",
     )
     p.add_argument("--quiet", action="store_true")
+    p.add_argument("--check-mode-switch", action="store_true",
+                   help="Untimed light-low replay: one captured graph, quotas 0/512/0, restore before each")
     p.add_argument("--profile-dir", type=Path, help="Independent system traces, outside headline timing")
     p.add_argument("--profile-metrics", nargs="+", choices=PROFILE_METRICS, default=None)
     p.add_argument(
@@ -104,6 +106,8 @@ def arguments(argv=None):
         p.error("pipeline-variants requires study=post-threshold")
     if args.topk_probe and args.study != "post-threshold":
         p.error("topk-probe requires study=post-threshold")
+    if args.check_mode_switch and (args.study != "post-threshold" or "light-low" not in args.pipeline_variants):
+        p.error("check-mode-switch requires post-threshold with light-low")
     if args.study in ("threshold-only", "seed-ub", "local-victims", "register-kth", "overlap-victims") and (
         args.transport != "urma" or args.mode != "fused"
     ):
@@ -147,6 +151,10 @@ def main(argv=None):
                 f"REPLAY_PASS {args.transport}-{args.mode}-{name} "
                 f"mean_us={case['timing']['mean_us']:.3f} p50_us={case['timing']['p50_us']:.3f}"
             )
+            if case.get("mode_switch_check"):
+                emit("MODE_SWITCH_PASS one_graph quotas=0/512/0 captured_addresses=unchanged "
+                     "low_threshold_sentinel=unchanged "
+                     "snapshot_restore_each=true untimed=true continuous_service_state=not_tested")
     except BaseException as error:
         active = retained.get("active_case")
         result = dict(

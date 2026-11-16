@@ -19,7 +19,7 @@ from kvip.diagnostics.archive import file_digest, source_commit
 from kvip.diagnostics.compare import read_means, reduction, timing_spread
 from kvip.diagnostics.pipeline_options import (
     DEFAULT_VARIANTS, OPTIONS, OPTIONAL_OPTIONS, NUMERIC_OPTIONS, VARIANTS,
-    admission_for, options_for, q_workers_for,
+    admission_for, early_threshold_skipped, options_for, q_workers_for,
 )
 from kvip.diagnostics.upstream import validate_checkout
 
@@ -44,11 +44,15 @@ def arguments(argv=None):
     parser.add_argument("--topk-probe", action="store_true", help="Independent pruning-counter replay after all headline timings")
     parser.add_argument("--brief", action="store_true", help="Print one timing/traffic line per case; keep full JSON")
     parser.add_argument("--matched-before", action="store_true", help="Also run the PR checkout with matching pre-existing candidate configurations")
+    parser.add_argument("--check-mode-switch", action="store_true",
+                        help="Verify one light-low graph with quotas 0/512/0; restore snapshot outside timing")
     args = parser.parse_args(argv)
     if args.device < 0 or args.warmup < 0 or args.iterations < 1 or args.diagnostic_replays < 0:
         parser.error("Require nonnegative device/warmup and positive iterations")
     if len(set(args.pipeline_variants)) != len(args.pipeline_variants):
         parser.error("pipeline-variants must be unique; order is preserved")
+    if args.check_mode_switch and "light-low" not in args.pipeline_variants:
+        parser.error("check-mode-switch requires the light-low variant")
     if args.result_dir.exists():
         parser.error("result-dir already exists; choose a new directory")
     for role in ("main", "pr", "candidate"):
@@ -128,6 +132,8 @@ def command(args, job):
         result += ["--pipeline-variants", *job.get("variants", args.pipeline_variants)]
         if job["role"] == "candidate" and getattr(args, "topk_probe", False):
             result += ["--topk-probe"]
+        if job["role"] == "candidate" and getattr(args, "check_mode_switch", False):
+            result += ["--check-mode-switch"]
     return result
 
 
@@ -197,8 +203,26 @@ def _validate_case(args, name, result, manifest_digest):
             raise ValueError(f"{name}: fused captured LI scores were not verified bit-exact")
         threshold = result.get("threshold_comparison") or {}
         policy = "resident" if name == "main-resident" else "recent"
-        if threshold.get("status") != "bit_exact" or threshold.get("policy") != policy:
+        skipped = early_threshold_skipped(result.get("tuning", {}))
+        status = "not_computed" if skipped else "bit_exact"
+        if threshold.get("status") != status or threshold.get("policy") != policy:
             raise ValueError(f"{name}: initial threshold policy was not verified bit-exact")
+        if skipped and (threshold.get("initial_keys") is not None or
+                        any(row["prefetch"] != 0 for row in result["reads_samples"])):
+            raise ValueError(f"{name}: low mode must skip early threshold and issue zero prefetch reads")
+        if name == "candidate-light-low" and getattr(args, "check_mode_switch", False):
+            switch = result.get("mode_switch_check", {})
+            rows = switch.get("sequence", [])
+            if (switch.get("status") != "pass" or switch.get("graph_captures") != 1
+                    or switch.get("captured_addresses_unchanged") is not True
+                    or switch.get("snapshot_restored_before_each") is not True
+                    or switch.get("included_in_timing") is not False
+                    or [row.get("quota") for row in rows] != [0, 512, 0]
+                    or [row.get("threshold") for row in rows] != ["not_computed", "bit_exact", "not_computed"]
+                    or any(row.get("prefetch") != 0 for row in rows if row.get("quota") == 0)
+                    or any(row.get("threshold_sentinel_unchanged") is not True for row in rows if row.get("quota") == 0)
+                    or any(row.get("ordered_output_sha256") != result["selection_comparison"]["ordered_output_sha256"] for row in rows)):
+                raise ValueError(f"{name}: incomplete same-graph mode-switch validation")
         if args.diagnostic_replays:
             profile = result.get("native_diagnostics") or {}
             if (
@@ -270,7 +294,8 @@ def summarize(args, results, manifest_digest):
         if result["threshold_comparison"]["final_keys"] != pr["threshold_comparison"]["final_keys"]:
             raise ValueError(f"{name}: fused final threshold differs from PR")
         if name.startswith(("candidate-", "before-")):
-            if result["threshold_comparison"]["initial_keys"] != pr["threshold_comparison"]["initial_keys"]:
+            if (not early_threshold_skipped(result.get("tuning", {}))
+                    and result["threshold_comparison"]["initial_keys"] != pr["threshold_comparison"]["initial_keys"]):
                 raise ValueError(f"{name}: post-threshold optimization changed the early threshold")
             variant = name.split("-", 1)[1]
             expected_options = options_for(variant)
@@ -317,6 +342,7 @@ def summarize(args, results, manifest_digest):
             tuning=result.get("tuning"),
             selection_comparison=result["selection_comparison"],
             threshold_comparison=result.get("threshold_comparison"),
+            mode_switch_check=result.get("mode_switch_check"),
             diagnostic_summary=profile_summary(result),
             capacity_skipped_row_windows=(sum(
                 item["capacity_skipped_row_windows"] for item in result["reads_samples"]
@@ -393,6 +419,21 @@ def summarize(args, results, manifest_digest):
                     baseline_row[metric + "_us"], candidate_row[metric + "_us"]
                 ) for metric in ("mean", "p50")},
             )
+    light_pairs = {}
+    for experiment, baseline in (("light-low", "quota-zero"), ("light-high", "ready-batch4")):
+        candidate_row, baseline_row = table.get("candidate-" + experiment), table.get("candidate-" + baseline)
+        if candidate_row is not None and baseline_row is not None:
+            light_pairs[experiment] = dict(reference=baseline, **{
+                metric + "_reduction_pct": reduction(baseline_row[metric + "_us"], candidate_row[metric + "_us"])
+                for metric in ("mean", "p50")})
+    light_drift = None
+    if "candidate-light-high" in table and "candidate-light-high-end" in table:
+        light_drift = {metric: dict(
+            start_us=table["candidate-light-high"][metric + "_us"],
+            end_us=table["candidate-light-high-end"][metric + "_us"],
+            drift_pct=100 * (table["candidate-light-high-end"][metric + "_us"] /
+                             table["candidate-light-high"][metric + "_us"] - 1))
+            for metric in ("mean", "p50")}
     return dict(
         schema_version=1,
         status="pass",
@@ -410,6 +451,8 @@ def summarize(args, results, manifest_digest):
         control_end_drift=drift,
         inverse_mapping_pairs=mapping_pairs,
         prefetch_rank_pairs=rank_pairs,
+        light_mode_pairs=light_pairs,
+        light_high_end_drift=light_drift,
         metadata_end_vs_control_end=end_pair,
         diagnostic_replays_per_fused_case=args.diagnostic_replays,
         serial_configuration=dict(workers=32, post_size=128, max_inflight=2048, jettys_per_core=2),
@@ -427,11 +470,27 @@ def summarize(args, results, manifest_digest):
             "Control-end drift is reported without correction. Instrumented role cycles are separate from headline timings and cannot be added into graph latency.",
             "Serial and fused TopK may differ only as accepted by the existing replay oracle; their measured cold/transfer counts remain separate.",
             "Admission controls are fixed before graph capture. Headline times include device gate/quota work, not a per-step CPU policy update or its H2D transfer.",
+            "Optional mode-switch verification reuses one graph with quotas 0/512/0, restoring the snapshot before each untimed replay. It is not a learned selector or a proof of consecutive service-state evolution.",
         ],
     )
 
 
 def print_summary(summary, brief=False):
+    for name, pair in summary.get("light_mode_pairs", {}).items():
+        print(f"LIGHT_PAIR {name}_vs_{pair['reference']} mean={pair['mean_reduction_pct']:+.2f}% "
+              f"p50={pair['p50_reduction_pct']:+.2f}% same_arena_no_drift_correction", flush=True)
+    if drift := summary.get("light_high_end_drift"):
+        print(f"LIGHT_HIGH_DRIFT mean={drift['mean']['drift_pct']:+.2f}% "
+              f"p50={drift['p50']['drift_pct']:+.2f}% no_correction", flush=True)
+    skipped = [name for name, row in summary["table"].items()
+               if (row.get("threshold_comparison") or {}).get("status") == "not_computed"]
+    if skipped:
+        print("EARLY_THRESHOLD_NOT_COMPUTED " + ",".join(skipped) + " prefetch=0; final_scores_topk_kv_index=verified", flush=True)
+    for row in summary["table"].values():
+        if row.get("mode_switch_check"):
+            print("MODE_SWITCH_PASS one_graph quotas=0/512/0 captured_addresses=unchanged "
+                  "low_threshold_sentinel=unchanged "
+                  "snapshot_restore_each=true untimed=true continuous_service_state=not_tested", flush=True)
     if brief:
         print("case                   mean_us    p50_us  prefetch    final   unused  vsSerial_mean/p50%  vsBefore_mean/p50%", flush=True)
         for name, row in summary["table"].items():
@@ -474,7 +533,7 @@ def print_summary(summary, brief=False):
         if drift:
             print(f"CONTROL_DRIFT {summary['control_name']} mean={drift['mean']['drift_pct']:+.2f}% "
                   f"p50={drift['p50']['drift_pct']:+.2f}% no_correction", flush=True)
-        print("CHECK scores=bit_exact fused_ordered_topk=unchanged safe_thresholds=unchanged full_graph_us=true", flush=True)
+        print("CHECK scores=bit_exact fused_ordered_topk=unchanged computed_safe_thresholds=unchanged full_graph_us=true", flush=True)
         if any(row.get("diagnostic_summary") for row in summary["table"].values()):
             print("PROFILE_SCOPE separate_replay; index_total=role_entry_to_exit; "
                   "index=InitShadow_to_commit_excluding_early_drain_and_status; cycles_are_not_additive", flush=True)
@@ -523,7 +582,7 @@ def print_summary(summary, brief=False):
             print(
                 f"  TIMING_NOTE {name}: {';'.join(row['timing_spread']['reasons'])}; all samples retained", flush=True
             )
-    print("CHECK fused_scores=bit_exact fused_ordered_topk=unchanged candidate_thresholds=PR_bit_exact", flush=True)
+    print("CHECK fused_scores=bit_exact fused_ordered_topk=unchanged computed_candidate_thresholds=PR_bit_exact", flush=True)
     print("ORDER " + " -> ".join(summary["execution_order"]), flush=True)
     if summary["control_end_drift"] is not None:
         drift = summary["control_end_drift"]

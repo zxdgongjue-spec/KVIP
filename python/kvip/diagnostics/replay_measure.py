@@ -12,6 +12,7 @@ from kvip.diagnostics.archive import array_digest, cpu_array, file_digest, sourc
 from kvip.diagnostics.console import emit
 from kvip.diagnostics.demand import DEMAND_ACCOUNTING, SnapshotDemand
 from kvip.diagnostics.oracle import DecodeOracle
+from kvip.diagnostics.pipeline_options import early_threshold_skipped
 from kvip.diagnostics.prefetch_admission import ADMISSION_ACCOUNTING, prefetch_admission
 from kvip.diagnostics.snapshot import (
     input_tensors,
@@ -180,6 +181,8 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         )
 
         logical = cpu_array(torch, update.logical_output)
+        if early_threshold_skipped(bundle.tuning) and reads["prefetch"] != 0:
+            raise AssertionError("Low-miss skip issued speculative prefetch reads")
         ordered = logical.reshape(expected.shape).astype("<i4")
         if (
             array_digest(np.sort(ordered, axis=-1)) != bundle.selection_comparison["selected_set_sha256"]
@@ -325,6 +328,9 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
     phase(retained, "final_verify")
     verify()  # Full score/Index/KV oracle after the final measured replay.
     result = dict(timing=statistics(samples), reads_samples=reads)
+    if getattr(args, "check_mode_switch", False) and early_threshold_skipped(getattr(bundle, "tuning", {})):
+        phase(retained, "mode_switch_check")
+        result["mode_switch_check"] = check_mode_switch(torch, stream, bundle, lambda: replay(graph))
     diagnostic_count = getattr(args, "diagnostic_replays", 0)
     if diagnostic_count and args.mode == "fused":
         from kvip.diagnostics.native_profile import decode_profile
@@ -730,19 +736,64 @@ def study_cases(args):
     return {policy: {"recent_threshold": policy == "recent", "recent_skip": True} for policy in ("resident", "recent")}
 
 
+def check_mode_switch(torch, stream, bundle, replay):
+    """Exercise one captured graph; controls/H2D and snapshot restore are untimed."""
+    from kvip.diagnostics.threshold_check import poison_early_thresholds, verify_early_threshold_sentinel
+
+    rotating = bundle.rotating
+    original = list(bundle.tuning["admission_controls"])
+    if original != [0, 64, 0, 0]:
+        raise AssertionError("Mode-switch check must start and end in light-low")
+    address = rotating.admission_controls.data_ptr()
+    buffers = buffer_addresses(bundle)
+    rows = []
+    for quota in (0, 512, 0):
+        stream.synchronize()
+        controls = [quota, 64, 0, 0]
+        rotating.set_admission_controls(torch.tensor([controls] * rotating.batch, dtype=torch.int32, device="cpu"))
+        if rotating.admission_controls.data_ptr() != address or buffer_addresses(bundle) != buffers:
+            raise AssertionError("Mode switch changed a captured tensor address")
+        bundle.tuning["admission_controls"] = controls
+        bundle.reset()
+        if quota == 0:
+            poison_early_thresholds(bundle)
+        stream.synchronize()
+        replay()
+        stream.synchronize()
+        if quota == 0:
+            verify_early_threshold_sentinel(torch, bundle)
+        reads = bundle.verify()
+        expected = "not_computed" if quota == 0 else "bit_exact"
+        if bundle.threshold_comparison["status"] != expected or (quota == 0 and reads["prefetch"] != 0):
+            raise AssertionError("Same-graph replay did not validate the requested mode")
+        rows.append(dict(quota=quota, prefetch=reads["prefetch"], final=reads["final"],
+                         threshold=bundle.threshold_comparison["status"],
+                         threshold_sentinel_unchanged=True if quota == 0 else None,
+                         ordered_output_sha256=bundle.selection_comparison["ordered_output_sha256"]))
+    return dict(status="pass", controls_address=address, captured_addresses_unchanged=True,
+                graph_captures=1, sequence=rows, included_in_timing=False,
+                snapshot_restored_before_each=True,
+                scope="Mode switching and round-state reset only; not consecutive service-state evolution")
+
+
 def verify_case_equivalence(cases, *, same_threshold):
     first = next(iter(cases.values()))
+    computed = [case for case in cases.values() if not early_threshold_skipped(case.get("tuning", {}))]
+    threshold_reference = computed[0] if computed else first
     for case in cases.values():
         if (
             case["selection_comparison"]["ordered_output_sha256"]
             != first["selection_comparison"]["ordered_output_sha256"]
         ):
             raise AssertionError("Seed A/B changed the final ordered TopK outputs")
-        if same_threshold and any(
-            case["threshold_comparison"][key] != first["threshold_comparison"][key]
-            for key in ("initial_keys", "final_keys")
-        ):
-            raise AssertionError("Seed execution optimization changed exact threshold values")
+        if same_threshold:
+            if case["threshold_comparison"]["final_keys"] != first["threshold_comparison"]["final_keys"]:
+                raise AssertionError("Seed execution optimization changed exact threshold values")
+            if early_threshold_skipped(case.get("tuning", {})):
+                if case["threshold_comparison"].get("status") != "not_computed" or case["threshold_comparison"]["initial_keys"] is not None:
+                    raise AssertionError("Skipped early threshold must be reported as not computed")
+            elif case["threshold_comparison"]["initial_keys"] != threshold_reference["threshold_comparison"]["initial_keys"]:
+                raise AssertionError("Seed execution optimization changed exact threshold values")
 
 
 def run(args, archive, retained):
@@ -803,6 +854,8 @@ def run(args, archive, retained):
             probe_args = SimpleNamespace(**vars(args))
             probe_args.pipeline_options = options_for("topk")
             probe_args.pipeline_q_workers = 2
+            probe_args.admission_controls = None
+            probe_args.check_mode_switch = False
             probe_args.probe_only = True
             probe_args.fused_tuning = {"recent_threshold": True}
             retained["progress"].update(variant="topk-probe")

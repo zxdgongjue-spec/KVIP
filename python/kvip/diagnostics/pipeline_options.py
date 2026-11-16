@@ -2,7 +2,7 @@
 
 OPTIONS = ("final_topk_prune", "selected_metadata", "early_fetch_ready", "compact_init", "ready_batch_fetch")
 OPTIONAL_OPTIONS = ("ready_direct_ranges", "adaptive_admission", "prefetch_gate",
-                    "skip_exhausted_prefetch", "early_prefetch_drain", "inverse_mapping")
+                    "skip_exhausted_prefetch", "early_prefetch_drain", "inverse_mapping", "low_miss_skip")
 NUMERIC_OPTIONS = ("prefetch_rank",)
 DEFAULT_VARIANTS = ("control", "metadata", "ready-batch", "workers4", "ready-batch4", "metadata-end", "control-end")
 VARIANTS = {
@@ -31,6 +31,10 @@ VARIANTS = {
     "inverse-map": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "inverse_mapping"),
     "inverse-map-skip": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "inverse_mapping", "skip_exhausted_prefetch"),
     "capacity-inverse-map": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "inverse_mapping"),
+    "quota-zero": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch"),
+    "light-low": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "low_miss_skip"),
+    "light-high": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "low_miss_skip"),
+    "light-high-end": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "low_miss_skip"),
 }
 
 # The exact selection remains Top2048. These ranks only admit speculative
@@ -51,6 +55,10 @@ ADMISSION = {
     "direct-tight": (768, 128, 1, 1),
     "capacity-skip-drain": (768, 128, 0, 1),
     "capacity-inverse-map": (768, 128, 0, 1),
+    "quota-zero": (0, 64, 0, 0),
+    "light-low": (0, 64, 0, 0),
+    "light-high": (512, 64, 0, 0),
+    "light-high-end": (512, 64, 0, 0),
 }
 for _name in RANKS:
     ADMISSION[_name] = (768, 128, 0, 1) if _name.startswith("capacity-") else (512, 64, 0, 0)
@@ -95,4 +103,14 @@ def validate_options(options):
         raise ValueError("ready_direct_ranges requires ready_batch_fetch")
     if options.get("prefetch_gate") and not options.get("adaptive_admission"):
         raise ValueError("prefetch_gate requires adaptive_admission")
+    if options.get("low_miss_skip") and not options.get("adaptive_admission"):
+        raise ValueError("low_miss_skip requires adaptive_admission")
     return dict(options)
+
+
+def early_threshold_skipped(tuning):
+    """Replay supplies the same validated controls to every active row."""
+    tuning = tuning or {}
+    controls = tuning.get("admission_controls")
+    return bool(tuning.get("low_miss_skip") and tuning.get("adaptive_admission")
+                and controls is not None and len(controls) == 4 and controls[0] == 0)

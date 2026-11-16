@@ -98,6 +98,11 @@ def _case(args, name):
             admission = admission_for(name.split("-", 1)[1])
             if admission is not None:
                 result["tuning"]["admission_controls"] = list(admission)
+            if name == "candidate-light-low":
+                result["threshold_comparison"].update(status="not_computed", initial_keys=None)
+            if admission is not None and admission[0] == 0:
+                for reads in result["reads_samples"]:
+                    reads.update(prefetch=0, final=5, unused_prefetch=0, unused_prefetch_bytes=0, bytes=3280)
         result["tuning"]["q_workers"] = q_workers_for(name.split("-", 1)[1]) if role == "candidate" or name.startswith("before-") else 2
         rank = result["tuning"].get("prefetch_rank", 0)
         if rank:
@@ -142,6 +147,58 @@ def test_admission_variants_check_controls_and_report_matching_drift(tmp_path, m
     reports["candidate-capacity"]["tuning"]["admission_controls"][0] = 512
     with pytest.raises(ValueError, match="admission controls"):
         compare.summarize(args, reports, compare.file_digest(args.snapshot / "manifest.json"))
+
+
+def test_light_variants_keep_full_oracle_and_separate_skip_from_zero_quota(tmp_path, monkeypatch, capsys):
+    variants = ["ready-batch4", "quota-zero", "light-low", "light-high", "light-high-end"]
+    args = _arguments(tmp_path, monkeypatch, variants)
+    reports = _reports(args)
+    for name in variants[1:]:
+        options = validate_options(options_for(name))
+        assert options["adaptive_admission"] and q_workers_for(name) == 4
+        assert bool(options.get("low_miss_skip")) == (name != "quota-zero")
+    with pytest.raises(ValueError, match="low_miss_skip requires"):
+        validate_options(options_for("light-low") | {"adaptive_admission": False})
+    for name, value in (("quota-zero", 100), ("light-low", 70), ("light-high", 90), ("light-high-end", 99)):
+        reports["candidate-" + name]["timing"].update(
+            mean_us=value, p50_us=value, samples_us=[value] * 3, min_us=value, max_us=value)
+    digest = compare.file_digest(args.snapshot / "manifest.json")
+    summary = compare.summarize(args, reports, digest)
+    assert summary["light_mode_pairs"]["light-low"]["mean_reduction_pct"] == pytest.approx(30)
+    assert summary["light_high_end_drift"]["p50"]["drift_pct"] == pytest.approx(10)
+    compare.print_summary(summary, brief=True)
+    output = capsys.readouterr().out
+    assert "EARLY_THRESHOLD_NOT_COMPUTED candidate-light-low prefetch=0" in output
+    assert "LIGHT_PAIR light-low_vs_quota-zero mean=+30.00% p50=+30.00%" in output
+    reports["candidate-light-low"]["reads_samples"][0]["prefetch"] = 1
+    with pytest.raises(ValueError, match="zero prefetch"):
+        compare.summarize(args, reports, digest)
+    reports["candidate-light-low"]["reads_samples"][0]["prefetch"] = 0
+    reports["candidate-light-high"]["threshold_comparison"].update(status="not_computed", initial_keys=None)
+    with pytest.raises(ValueError, match="bit-exact"):
+        compare.summarize(args, reports, digest)
+
+
+def test_mode_switch_flag_only_reaches_candidate_and_requires_proof(tmp_path, monkeypatch):
+    args = _arguments(tmp_path, monkeypatch, ["light-low", "light-high"])
+    args.check_mode_switch = True
+    for job in compare.jobs(args):
+        parsed = replay.arguments(compare.command(args, job)[4:])
+        assert parsed.check_mode_switch == (job["role"] == "candidate")
+    reports = _reports(args)
+    digest = compare.file_digest(args.snapshot / "manifest.json")
+    with pytest.raises(ValueError, match="same-graph"):
+        compare.summarize(args, reports, digest)
+    reports["candidate-light-low"]["mode_switch_check"] = dict(
+        status="pass", graph_captures=1, captured_addresses_unchanged=True,
+        snapshot_restored_before_each=True, included_in_timing=False,
+        sequence=[dict(quota=quota, prefetch=prefetch, threshold=status, ordered_output_sha256="ordered",
+                       threshold_sentinel_unchanged=True if quota == 0 else None)
+                  for quota, prefetch, status in ((0, 0, "not_computed"), (512, 4, "bit_exact"), (0, 0, "not_computed"))])
+    compare.summarize(args, reports, digest)
+    reports["candidate-light-low"]["mode_switch_check"]["graph_captures"] = 3
+    with pytest.raises(ValueError, match="same-graph"):
+        compare.summarize(args, reports, digest)
 
 
 def test_inverse_mapping_pairs_use_matching_same_arena_controls(tmp_path, monkeypatch, capsys):

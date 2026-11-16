@@ -9,6 +9,7 @@ from kvip.diagnostics.replay_runtime import create_runtime, runtime_worker_confi
 from kvip.diagnostics.selection import verify_fused_scores
 from kvip.diagnostics.threshold_check import reference_thresholds
 from kvip.diagnostics import threshold_check
+from kvip.diagnostics import replay_measure
 
 
 def test_recent_threshold_excludes_future_deduplicates_prefix_and_covers_retired_page():
@@ -59,6 +60,100 @@ def test_rank_threshold_is_distinct_from_safe_bound_and_respects_causal_seed(mon
     banks[0, 0, 0] += 1
     with pytest.raises(AssertionError, match="Early threshold differs"):
         threshold_check.verify_initial_threshold(None, bundle, archive)
+
+
+def test_low_mode_does_not_read_stale_early_threshold_but_keeps_final_reference(monkeypatch):
+    scores = np.tile(np.arange(4096, dtype=np.uint16), (1, 4, 1))
+    ends = np.full((1, 4), 4096, np.int32)
+    arrays = {"post.score_keys": scores, "pre.query_ends": ends}
+    archive = SimpleNamespace(array=arrays.__getitem__)
+    bundle = SimpleNamespace(tuning=dict(
+        recent_threshold=True, adaptive_admission=True, low_miss_skip=True,
+        admission_controls=[0, 64, 0, 0]))
+    monkeypatch.setattr(threshold_check, "cpu_array", lambda *args: pytest.fail("Skipped scratch was read"))
+    report = threshold_check.verify_initial_threshold(None, bundle, archive)
+    assert report["status"] == "not_computed" and report["initial_keys"] is None
+    assert report["final_keys"] == [[2048] * 4]
+
+
+@pytest.mark.parametrize("relocate", [False, True])
+def test_one_graph_switch_restores_snapshot_and_rejects_address_changes(monkeypatch, relocate):
+    calls = []
+    address = [123]
+    rotating = SimpleNamespace(batch=2, admission_controls=SimpleNamespace(data_ptr=lambda: address[0]))
+    bundle = SimpleNamespace(rotating=rotating, tuning={"admission_controls": [0, 64, 0, 0]},
+                             selection_comparison={"ordered_output_sha256": "unchanged"})
+
+    def controls(values):
+        calls.append(("controls", values[0][0]))
+        if relocate:
+            address[0] += 1
+
+    def verify():
+        quota = bundle.tuning["admission_controls"][0]
+        bundle.threshold_comparison = {"status": "not_computed" if quota == 0 else "bit_exact"}
+        calls.append(("verify", quota))
+        return dict(prefetch=0 if quota == 0 else 20, final=30)
+
+    rotating.set_admission_controls = controls
+    bundle.reset, bundle.verify = lambda: calls.append("restore"), verify
+    torch = SimpleNamespace(int32="int32", tensor=lambda rows, **kwargs: rows)
+    stream = SimpleNamespace(synchronize=lambda: calls.append("sync"))
+    monkeypatch.setattr(replay_measure, "buffer_addresses", lambda unused: {"output": 456})
+    monkeypatch.setattr(threshold_check, "poison_early_thresholds", lambda unused: calls.append("poison"))
+    monkeypatch.setattr(threshold_check, "verify_early_threshold_sentinel", lambda *unused: calls.append("check_sentinel"))
+    replay = lambda: calls.append("same_graph_replay")
+    if relocate:
+        with pytest.raises(AssertionError, match="captured tensor address"):
+            replay_measure.check_mode_switch(torch, stream, bundle, replay)
+        assert "same_graph_replay" not in calls
+        return
+    report = replay_measure.check_mode_switch(torch, stream, bundle, replay)
+    assert report["graph_captures"] == 1 and report["included_in_timing"] is False
+    assert report["snapshot_restored_before_each"] is True
+    assert [row["quota"] for row in report["sequence"]] == [0, 512, 0]
+    assert [row["threshold"] for row in report["sequence"]] == ["not_computed", "bit_exact", "not_computed"]
+    assert calls.count("same_graph_replay") == calls.count("restore") == 3
+    assert calls.count("poison") == calls.count("check_sentinel") == 2
+    assert bundle.tuning["admission_controls"] == [0, 64, 0, 0]
+
+
+def test_threshold_sentinel_changes_only_two_bytes_per_query_and_detects_seed_publication(monkeypatch):
+    class ByteArray(np.ndarray):
+        def fill_(self, value):
+            self.fill(value)
+
+    batch = 2
+    row_bytes, offset = 4 * 2048 * 6 + 1024, 4 * 2048 * 6
+    raw = np.zeros(batch * (row_bytes + 8192), np.uint8).view(ByteArray)
+    arguments = [None] * 14
+    arguments[13] = raw
+    bundle = SimpleNamespace(rotating=SimpleNamespace(arguments=arguments, batch=batch))
+    monkeypatch.setattr(threshold_check, "cpu_array", lambda torch, tensor: tensor)
+    threshold_check.poison_early_thresholds(bundle)
+    expected = np.zeros_like(raw)
+    for row in range(batch):
+        for query in range(4):
+            start = row * row_bytes + offset + query * 256
+            expected[start:start + 2] = 0xA5
+    np.testing.assert_array_equal(raw, expected)
+    threshold_check.verify_early_threshold_sentinel(None, bundle)
+    raw[offset] = 0
+    with pytest.raises(AssertionError, match="sentinel"):
+        threshold_check.verify_early_threshold_sentinel(None, bundle)
+
+
+def test_only_computed_thresholds_match_but_all_final_selections_match():
+    normal = dict(tuning={}, threshold_comparison={"initial_keys": [2], "final_keys": [3]},
+                  selection_comparison={"ordered_output_sha256": "same"})
+    low = dict(tuning=dict(low_miss_skip=True, adaptive_admission=True, admission_controls=[0, 64, 0, 0]),
+               threshold_comparison={"status": "not_computed", "initial_keys": None, "final_keys": [3]},
+               selection_comparison={"ordered_output_sha256": "same"})
+    cases = {"low": low, "normal": normal}
+    replay_measure.verify_case_equivalence(cases, same_threshold=True)
+    low["threshold_comparison"]["final_keys"] = [4]
+    with pytest.raises(AssertionError, match="exact threshold"):
+        replay_measure.verify_case_equivalence(cases, same_threshold=True)
 
 
 @pytest.mark.parametrize("rank", [True, 0, 2049, 1.5])

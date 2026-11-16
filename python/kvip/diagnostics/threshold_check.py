@@ -4,8 +4,31 @@
 import numpy as np
 
 from kvip.diagnostics.archive import cpu_array
+from kvip.diagnostics.pipeline_options import early_threshold_skipped
 from kvip.diagnostics.recent_threshold import recent_positions
 from kvip.diagnostics.score_trace import sortable_to_bf16
+
+_THRESHOLD_OFFSET = 4 * 2048 * 6
+_PREFIX_ROW_BYTES = _THRESHOLD_OFFSET + 1024
+_SENTINEL_BYTE = 0xA5
+
+
+def poison_early_thresholds(bundle):
+    """Untimed probe: overwrite only each query's two-byte threshold scalar."""
+    prefix = bundle.rotating.arguments[13].reshape(-1)
+    for row in range(bundle.rotating.batch):
+        for query in range(4):
+            start = row * _PREFIX_ROW_BYTES + _THRESHOLD_OFFSET + query * 256
+            prefix[start:start + 2].fill_(_SENTINEL_BYTE)
+
+
+def verify_early_threshold_sentinel(torch, bundle):
+    """Detect a seed publication even when its speculative Get budget is zero."""
+    batch = bundle.rotating.batch
+    raw = cpu_array(torch, bundle.rotating.arguments[13].reshape(-1)[:batch * _PREFIX_ROW_BYTES])
+    keys = raw.reshape(batch, _PREFIX_ROW_BYTES)[:, _THRESHOLD_OFFSET:].copy().view(np.uint16).reshape(batch, 4, 128)[:, :, 0]
+    if not np.all(keys == (_SENTINEL_BYTE * 257)):
+        raise AssertionError("Low-mode replay overwrote the skipped early-threshold sentinel")
 
 
 def reference_thresholds(scores, query_ends, resident, bounds=None, *, rank=2048):
@@ -33,13 +56,21 @@ def reference_thresholds(scores, query_ends, resident, bounds=None, *, rank=2048
 
 
 def verify_initial_threshold(torch, bundle, archive):
+    scores = archive.array("post.score_keys")
+    ends = archive.array("pre.query_ends")
+    final = reference_thresholds(scores, ends, scores.shape[-1])
+    if early_threshold_skipped(bundle.tuning):
+        # This branch does not publish an early threshold. Never label stale
+        # prefix scratch as computed/verified; final scores and TopK are still
+        # checked by the complete replay oracle.
+        return dict(status="not_computed", policy="recent", initial_keys=None,
+                    final_keys=final.tolist(), included_in_timing=False,
+                    reason="low_miss_skip with zero prefetch quota for all rows")
     b = archive.manifest["geometry"]["batch"]
-    row_bytes = 4 * 2048 * 6 + 1024
+    row_bytes = _PREFIX_ROW_BYTES
     raw = cpu_array(torch, bundle.rotating.arguments[13].reshape(-1)[: b * row_bytes]).reshape(b, row_bytes)
     # SaveResident publishes one uint16 scalar in each query's 256-byte bank.
     actual = raw[:, 4 * 2048 * 6 :].copy().view(np.uint16).reshape(b, 4, 128)[:, :, 0]
-    scores = archive.array("post.score_keys")
-    ends = archive.array("pre.query_ends")
     resident = archive.manifest["geometry"]["resident"]
     bounds = archive.array("pre.threshold_bounds") if bundle.tuning["recent_threshold"] else None
     expected = reference_thresholds(scores, ends, resident, bounds)
@@ -49,7 +80,6 @@ def verify_initial_threshold(torch, bundle, archive):
         raise AssertionError(
             f"Early threshold differs: row={row} q={q} actual={actual[row, q]} expected={expected[row, q]}"
         )
-    final = reference_thresholds(scores, ends, scores.shape[-1])
 
     def floats(keys):
         return (sortable_to_bf16(keys).astype(np.uint32) << 16).view(np.float32)
