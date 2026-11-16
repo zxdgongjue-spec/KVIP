@@ -1,12 +1,19 @@
 """Execute the production 32-lane publisher with real CPU thread barriers."""
 
+import shutil
 import subprocess
+
+import pytest
 
 from test_auto_route import INCLUDE
 from test_recent_index import function
 
 
 def test_parallel_route_full_publication(tmp_path):
+    api = tmp_path / "simt_api"
+    api.mkdir()
+    for header in ("asc_simt.h", "device_functions.h", "device_sync_functions.h"):
+        (api / header).write_text("#pragma once\n")
     source = tmp_path / "parallel-route.cpp"
     source.write_text(r'''
 #include <algorithm>
@@ -85,9 +92,76 @@ int main(){
     binary = tmp_path / "parallel-route"
     subprocess.run([
         "c++", "-std=c++17", "-O1", "-g", "-pthread", "-fsanitize=address,undefined",
-        "-I", str(INCLUDE), str(source), "-o", str(binary),
+        "-I", str(tmp_path), "-I", str(INCLUDE), str(source), "-o", str(binary),
     ], check=True)
     subprocess.run([str(binary)], check=True)
+
+
+@pytest.mark.parametrize("regression", [None, "missing_sync", "ub_assignment", "const_load"])
+def test_parallel_route_device_api_and_address_spaces(tmp_path, regression):
+    """Keep GM/UB types distinct and match CANN's mutable load overloads.
+
+    This is a Clang frontend check, not a substitute for Bisheng compilation.
+    Negative controls ensure the shim rejects all three observed hazards.
+    """
+    compiler = shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("Address-space regression requires Clang")
+    api = tmp_path / "simt_api"
+    api.mkdir()
+    (api / "asc_simt.h").write_text(
+        "#pragma once\nstruct ThreadIndex {uint32_t x;}; extern ThreadIndex threadIdx;\n"
+    )
+    (api / "device_functions.h").write_text("""#pragma once
+uint64_t asc_ldcg(__gm__ uint64_t*);
+uint32_t asc_ldcg(__gm__ uint32_t*);
+void asc_stcg(__gm__ uint64_t*, uint64_t);
+void asc_stcg(__gm__ int32_t*, int32_t);
+""")
+    (api / "device_sync_functions.h").write_text(
+        "#pragma once\nvoid asc_syncthreads();\nvoid asc_threadfence();\n"
+    )
+    header = (INCLUDE / "auto_route_simt.h").read_text()
+    if regression == "missing_sync":
+        header = header.replace('#include "simt_api/device_sync_functions.h"', "")
+    elif regression == "ub_assignment":
+        header = header.replace(
+            "scratch->requests[lane].owner=ParallelLoad(&r->owner);",
+            "scratch->requests[lane]={ParallelLoad(&r->owner), 0, 0, 0};",
+        )
+    elif regression == "const_load":
+        header = header.replace("asc_ldcg(const_cast<KVIP_ROUTE_SIMT_GM T*>(p))", "asc_ldcg(p)")
+    (tmp_path / "auto_route_simt.h").write_text(header)
+    source = tmp_path / "address-spaces.cpp"
+    source.write_text(r'''
+#include <cstdint>
+#define __CCE_AICORE__ 1
+#define __simt_vf__
+#define __simt_callee__
+#define __aicore__
+#define __gm__ __attribute__((address_space(1)))
+#define __ubuf__ __attribute__((address_space(3)))
+#define LAUNCH_BOUND(n)
+#include "auto_route_simt.h"
+struct Context {
+ uint64_t autoRoute,admissionControls,rowOwners,queryEnds;
+ struct {uint32_t batch,history,tokenBytes;} shape;
+};
+void instantiate(__gm__ Context* ctx, __ubuf__ uint32_t* words) {
+ kvip_auto_route::EvaluateParallel(ctx,0,words);
+}
+''')
+    result = subprocess.run([
+        compiler, "-std=c++17", "-fsyntax-only", "-Werror",
+        "-I", str(tmp_path), "-I", str(INCLUDE), str(source),
+    ], capture_output=True, text=True)
+    if regression is None:
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode != 0, f"Shim failed to reject {regression}"
+        expected = {"missing_sync": "asc_syncthreads", "ub_assignment": "no viable overloaded '='",
+                    "const_load": "asc_ldcg"}
+        assert expected[regression] in result.stderr, result.stderr
 
 
 def test_parallel_route_keeps_scalar_cache_visibility():

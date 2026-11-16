@@ -3,6 +3,9 @@
 #include "auto_route.h"
 
 #if defined(__CCE_AICORE__)
+#include "simt_api/asc_simt.h"
+#include "simt_api/device_functions.h"
+#include "simt_api/device_sync_functions.h"
 #define KVIP_ROUTE_SIMT_FN __simt_callee__
 #define KVIP_ROUTE_SIMT_UB __ubuf__
 #define KVIP_ROUTE_SIMT_GM __gm__
@@ -13,9 +16,11 @@
 #endif
 
 namespace kvip_auto_route {
-KVIP_ROUTE_SIMT_FN inline uint64_t ParallelLoad(const KVIP_ROUTE_SIMT_GM uint64_t* p) {
+template<class T>
+KVIP_ROUTE_SIMT_FN inline T ParallelLoad(const KVIP_ROUTE_SIMT_GM T* p) {
 #if defined(__CCE_AICORE__)
-    return asc_ldcg(p);
+    // CANN's load overloads take mutable GM pointers even for read-only loads.
+    return asc_ldcg(const_cast<KVIP_ROUTE_SIMT_GM T*>(p));
 #else
     return *p;
 #endif
@@ -122,7 +127,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(32) inline void EvaluateParallel(
     auto c=&scratch->config;
     if(!lane){scratch->noPrefetch=0;scratch->valid=0;}
     if(lane<16)reinterpret_cast<KVIP_ROUTE_SIMT_UB uint64_t*>(c)[lane]=
-        asc_ldcg(reinterpret_cast<const KVIP_ROUTE_SIMT_GM uint64_t*>(ctx->autoRoute)+lane);
+        ParallelLoad(reinterpret_cast<const KVIP_ROUTE_SIMT_GM uint64_t*>(ctx->autoRoute)+lane);
     asc_syncthreads();
     if(!lane)scratch->valid=ParallelValid(c) && batch && batch<=16 && publishRow<batch &&
         c->pending%128==0 && ctx->admissionControls && ctx->admissionControls%128==0;
@@ -132,12 +137,16 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(32) inline void EvaluateParallel(
     for(uint32_t i=0;i<4;++i)scratch->ends[lane][i]=0;
     if(lane<batch){
         auto r=reinterpret_cast<const KVIP_ROUTE_SIMT_GM Request*>(c->requests)+lane;
-        scratch->requests[lane]={ParallelLoad(&r->owner),ParallelLoad(&r->generation),
-            ParallelLoad(&r->step),ParallelLoad(&r->queries)};
+        // UB-resident objects cannot invoke the implicit local-memory
+        // assignment operator in the device compiler.
+        scratch->requests[lane].owner=ParallelLoad(&r->owner);
+        scratch->requests[lane].generation=ParallelLoad(&r->generation);
+        scratch->requests[lane].step=ParallelLoad(&r->step);
+        scratch->requests[lane].queries=ParallelLoad(&r->queries);
         scratch->owners[lane]=ctx->rowOwners?
-            asc_ldcg(reinterpret_cast<const KVIP_ROUTE_SIMT_GM uint32_t*>(ctx->rowOwners)+lane):lane;
+            ParallelLoad(reinterpret_cast<const KVIP_ROUTE_SIMT_GM uint32_t*>(ctx->rowOwners)+lane):lane;
         for(uint32_t i=0;i<4;++i)scratch->ends[lane][i]=ctx->queryEnds?
-            asc_ldcg(reinterpret_cast<const KVIP_ROUTE_SIMT_GM uint32_t*>(ctx->queryEnds)+lane*4+i):
+            ParallelLoad(reinterpret_cast<const KVIP_ROUTE_SIMT_GM uint32_t*>(ctx->queryEnds)+lane*4+i):
             (i<scratch->requests[lane].queries?ctx->shape.history:0);
     }
     asc_syncthreads();
