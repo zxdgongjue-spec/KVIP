@@ -23,7 +23,16 @@ __simt_callee__ inline bool insert(__ubuf__ uint32_t* table,uint32_t k){uint32_t
 __simt_callee__ inline bool contains(__ubuf__ uint32_t* table,uint32_t k){uint32_t h=(k*0x9e3779b9U)>>21;for(uint32_t i=0;i<SET;++i){uint32_t old=table[h];if(old==k)return true;if(old==EMPTY)return false;h=(h+1)&(SET-1);}return false;}
 __simt_callee__ inline void InvalidateFreedHot(__gm__ uint32_t* valid,uint32_t dst,uint32_t resident){if(dst<resident)asc_stcg(valid+dst,uint32_t(0));}
 __simt_callee__ inline uint32_t prefix(uint32_t x,__ubuf__ uint32_t* scan){uint32_t tid=threadIdx.x,lane=tid%32,warp=tid/32,v=x;for(uint32_t d=1;d<32;d*=2){uint32_t p=asc_shfl_up(v,d);if(lane>=d)v+=p;}if(lane==31)scan[warp]=v;asc_syncthreads();if(!warp){uint32_t p=lane<16?scan[lane]:0;for(uint32_t d=1;d<32;d*=2){uint32_t t=asc_shfl_up(p,d);if(lane>=d)p+=t;}scan[lane]=p;}asc_syncthreads();return v-x+(warp?scan[warp-1]:0);}
-__simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void InitShadow(__ubuf__ uint32_t* m){for(uint32_t i=threadIdx.x;i<4*MAP;i+=THREADS)m[i]=EMPTY;if(threadIdx.x<128)m[CONTROL+threadIdx.x]=0;asc_syncthreads();}
+__simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void InitShadow(__ubuf__ uint32_t* m){
+#if KVIP_LOW_MISS_TAIL
+ // An EMPTY key makes its value unreachable. A successful put writes the
+ // value before the existing thread join, so stale values need no clearing.
+ for(uint32_t i=threadIdx.x;i<MAP;i+=THREADS){m[KEYS_POS+i]=EMPTY;m[KEYS_ROW+i]=EMPTY;}
+#else
+ for(uint32_t i=threadIdx.x;i<4*MAP;i+=THREADS)m[i]=EMPTY;
+#endif
+ if(threadIdx.x<128)m[CONTROL+threadIdx.x]=0;asc_syncthreads();
+}
 template<bool PrepareMetadata=false>
 __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void ApplyBatch(__gm__ uint32_t* sources,__gm__ uint32_t* destinations,uint32_t begin,uint32_t count,__gm__ uint64_t* keys,__gm__ uint32_t* scales,__gm__ uint32_t* valid,uint32_t resident,__ubuf__ uint32_t* m,
  __gm__ uint64_t* addresses=nullptr,__gm__ uint64_t* logical=nullptr,

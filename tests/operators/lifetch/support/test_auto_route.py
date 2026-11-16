@@ -39,6 +39,10 @@ struct Fixture {
  void next(){for(auto& r:requests)++r.step;}
 };
 int main(){
+ // All supported Q changes use exactly the same rounded-up read prediction.
+ for(unsigned reads=0;reads<=8192;++reads)for(unsigned q=1;q<=4;++q)
+  for(unsigned previous=1;previous<=4;++previous)
+   assert(ScaleReads(reads,q,previous)==(uint64_t(reads)*q+previous-1)/previous);
  Fixture f;f.check(1);for(auto& p:f.pending)assert(p.reason==Unknown&&p.learnable);
  f.commit(80);f.next();f.check(0); // 1280 useful reads, below enter threshold.
  for(auto& p:f.pending)assert(p.reason==Predicted);
@@ -62,6 +66,18 @@ int main(){
  duplicate.owners[1]=duplicate.owners[0];duplicate.check(1);
  assert(!duplicate.pending[0].learnable&&!duplicate.pending[1].learnable);
  assert(!Commit(&duplicate.config,0,0)&&!Commit(&duplicate.config,1,0));
+ // IDs outside the bitmask fast path retain the full-width duplicate check.
+ Fixture wide;std::array<Feedback,128> wideFeedback{};
+ wide.config.owners=128;wide.config.feedback=uint64_t(wideFeedback.data());
+ wide.requests[0].owner=wide.owners[0]=67;wide.check(1);
+ assert(wide.pending[0].learnable);wide.pending[0].necessary=10;
+ assert(Commit(&wide.config,0,0)&&wideFeedback[67].valid==kValid);
+ wide.next();wide.requests[1].owner=wide.owners[1]=67;wide.check(1);
+ assert(!wide.pending[0].learnable&&!wide.pending[1].learnable);
+ // An inactive owner can share a live row's slot without rejecting that row.
+ Fixture padding;padding.requests[1].owner=padding.owners[1]=padding.owners[0];
+ padding.requests[1].queries=0;for(unsigned i=4;i<8;++i)padding.ends[i]=0;
+ padding.check(1);assert(padding.pending[0].learnable&&!padding.pending[1].learnable);
  // Capture/warmup may run the full graph but cannot populate predictor state.
  Fixture warm;warm.config.learning=0;warm.check(1);warm.pending[0].necessary=10;
  assert(warm.pending[0].reason==LearningDisabled&&!Commit(&warm.config,0,0));
@@ -108,9 +124,18 @@ def test_auto_route_device_publication_order():
     assert final.index("for(uint32_t f=6;f<12;++f)") < commit
     assert final.index("uint32_t updateError=*updateStatus") < commit
     assert "if(kvip_auto_route::Commit(config,b,error|updateError))kvaf_device::CleanCacheLines(record,128)" in final
-    producer = function(source, "__aicore__ inline void Producer(")
-    write = producer.index("pending->usefulPrefetch=")
-    assert producer[:write].rfind("CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(pending),128)") >= 0
+    producer = function(source, "__aicore__ inline uint32_t Producer(")
+    assert "auto_route::Config" not in producer
+    assert "auto_route::Pending" not in producer
+    assert "usefulPrefetch=ctl.GetValue(8)" in producer
+    assert "return usefulPrefetch;" in producer
+    assert "uint32_t useful=Producer(a,b);FinalizeStreaming(a,b,useful)" in source
+    write = final.index("pending->usefulPrefetch=")
+    assert final[:write].rfind("CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(pending),128)") >= 0
+    assert final[:write].rfind("CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),kRowStatusWords*4)") >= 0
+    assert "pending->necessary=uint64_t(info[1])+pending->usefulPrefetch" in final
+    assert "pending->usefulPrefetch=usefulPrefetch" in final
+    assert final.index("CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(pending),128)", commit) > commit
     indexer = (kernel / "indexer.cpp").read_text()
     assert indexer.index("CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->admissionControls)") < indexer.index("rotating::NoPrefetchRound(ctx)")
 

@@ -23,7 +23,7 @@ def test_fetch_ready_precedes_output_dma_but_not_metadata_join(tmp_path, ubmem, 
     publish = streaming[streaming.index('__aicore__ inline void PublishQueryOutputs'):]
     publish = publish[:publish.index('// The producer and Fetch AIV')]
     producer_join = streaming.split(' uint64_t publishWait=GetSystemCycle();', 1)[1].split(' status[0]=', 1)[0]
-    consumer_join = streaming.split(' if(!error){uint64_t start=GetSystemCycle();while(true)', 1)[1].split('\n if(!error){auto update=', 1)[0]
+    consumer_join = streaming.split(' if(!error){uint64_t start=GetSystemCycle();while(true)', 1)[1].split('\n if(!error\n', 1)[0]
     input_error = streaming.split(' if(inputError){', 1)[1].split('\n TPipe pipe;', 1)[0]
     producer_done = streaming.split(' if(!kEarlyFetchReady){flags[5].error=status[0];', 1)[1].split('\n}', 1)[0]
     lifecycle = (kernel_dir / 'lifecycle.cpp').read_text()
@@ -131,9 +131,10 @@ void CleanCacheLines(uint8_t* ptr,uint64_t){
 #include "FINAL_POST_HEADER"
 /*PUBLISH_OUTPUTS*/
 /*OUTPUT_WORKER*/
-void ProducerInputError(Args* a,Context* ctx,uint32_t b,uint32_t inputError){
+uint32_t ProducerInputError(Args* a,Context* ctx,uint32_t b,uint32_t inputError){
  auto flags=reinterpret_cast<BatchFlag*>(a->flags)+b*kFlagCount;
  if(inputError){/*PRODUCER_ERROR*/
+ return 0;
 }
 uint32_t JoinProducer(BatchFlag* flags){
  uint32_t control[2]{};LocalTensor<uint32_t> ctl{control};
@@ -146,7 +147,8 @@ uint32_t JoinConsumer(BatchFlag* flags){
  if(!error)++metadataCommits;
  return error;
 }
-void ProducerDone(BatchFlag* flags,uint32_t error){
+uint32_t ProducerDone(BatchFlag* flags,uint32_t error){
+ uint32_t usefulPrefetch=0;
  uint32_t status[]{error};
  if(!kEarlyFetchReady){flags[5].error=status[0];/*PRODUCER_DONE*/
 }

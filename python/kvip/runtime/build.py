@@ -51,6 +51,7 @@ def build_libraries(
     ready_direct_ranges=False,
     adaptive_admission=False,
     low_miss_skip=False,
+    low_miss_tail=False,
     auto_route=False,
     prefetch_gate=False,
     prefetch_rank=0,
@@ -76,6 +77,7 @@ def build_libraries(
         READY_DIRECT_RANGES=ready_direct_ranges,
         ADAPTIVE_ADMISSION=adaptive_admission,
         LOW_MISS_SKIP=low_miss_skip,
+        LOW_MISS_TAIL=low_miss_tail,
         AUTO_ROUTE=auto_route,
         PREFETCH_GATE=prefetch_gate,
         SKIP_EXHAUSTED_PREFETCH=skip_exhausted_prefetch,
@@ -89,6 +91,8 @@ def build_libraries(
         raise ValueError("prefetch_gate requires adaptive_admission=True")
     if low_miss_skip and not adaptive_admission:
         raise ValueError("low_miss_skip requires adaptive_admission=True")
+    if low_miss_tail and not low_miss_skip:
+        raise ValueError("low_miss_tail requires low_miss_skip=True")
     if auto_route and not (low_miss_skip and ready_batch_fetch and early_fetch_ready):
         raise ValueError("auto_route requires low_miss_skip, ready_batch_fetch and early_fetch_ready")
     if type(prefetch_rank) is not int or not 0 <= prefetch_rank <= 2048:

@@ -103,7 +103,7 @@ int main(){
   assert(drains==unsigned(KVIP_EARLY_PREFETCH_DRAIN));
   assert(flags[b*kFlagCount+7].ready==unsigned(KVIP_EARLY_PREFETCH_DRAIN));
   for(unsigned q=0;q<4;++q)assert(!flags[b*kFlagCount+q+1].ready);
-  role=2;assert(FinalizerPrefix(&a,b)==error);
+  role=2;assert(FinalizerPrefix(&a,b,0)==error);
   assert(drains==1&&flags[b*kFlagCount+7].ready);
   assert(rows[b].slots==113&&rows[b].finalHead==991&&rows[b].finalRequests==77);
   assert(rows[b].pending==(error?5U:0U));
@@ -115,18 +115,18 @@ int main(){
     assert(saved[1]>=saved[0]&&saved[1]<=ft[0]);assert(saved[4]==ft[7]);
     assert(uintptr_t(saved)/128!=uintptr_t(ft)/128);}
    // A second join is read-only: it never drains CQ or rewrites flag 7.
-   assert(FinalizerPrefix(&a,b)==error);assert(drains==1&&releases==1);
+   assert(FinalizerPrefix(&a,b,0)==error);assert(drains==1&&releases==1);
   }
  }
 #if KVIP_EARLY_PREFETCH_DRAIN
  // Finalizer may arrive first. Its acquire observes Consumer publication.
  reset(0,true,32);a.prefetchCount=0x80000000U;role=2;
  onPoll=[&]{role=1;ConsumerPrefix(&a,b);role=2;};
- assert(FinalizerPrefix(&a,b)==32);assert(drains==1&&releases==1);
+ assert(FinalizerPrefix(&a,b,0)==32);assert(drains==1&&releases==1);
  assert(rowAcquired&&pendingAcquired);
  // A missing owner times out; it does not steal CQ or publish success.
  reset(0,false,0);a.prefetchCount=0;role=2;timeout=true;
- assert(FinalizerPrefix(&a,b)==kvaf_device::kCqTimeout);
+ assert(FinalizerPrefix(&a,b,0)==kvaf_device::kCqTimeout);
  assert(drains==0&&releases==0&&!flags[7].ready);
 #endif
 }

@@ -105,7 +105,7 @@ __aicore__ inline void SyncFetchDescriptors(__gm__ Context* ctx, uint32_t begin,
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->fallbackAddresses)+uint64_t(begin)*8,uint64_t(count)*8);
 }
 #include "output_worker.h"
-__aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
+__aicore__ inline uint32_t Producer(__gm__ Args* a, uint32_t b) {
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
  auto ticks=reinterpret_cast<__gm__ uint64_t*>(a->times)+b*64;
@@ -119,12 +119,20 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  if(inputError){auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*32;status[0]=inputError;status[1]=0;
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),128);
   for(uint32_t q=0;q<kFlagCount;++q){if(q==6 || (q>=7 && q<12) || (kEarlyFetchReady && q==kOutputsDoneFlag))continue;flags[q].count=0;flags[q].error=inputError;flags[q].ready=1;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+q),sizeof(BatchFlag));}
-  return;}
+  return 0;}
  TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,kFinalScratchBytes);auto local=scratch.Get<uint32_t>();
+#if KVIP_LOW_MISS_TAIL
+ // LI has finished publishing row->slots at the preceding kernel edge. With
+ // no prefetch there is no event payload; keep the flag/error publication.
+ if(row->slots) {
+#endif
  Simt::VF_CALL<PublishPrefetch>(Simt::Dim3{512,1,1},reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+b*10240,
   reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+b*10240,reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+b*a->maxEvents,
   reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+b*a->maxEvents,row->slots);
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+#if KVIP_LOW_MISS_TAIL
+ }
+#endif
  flags[0].count=row->slots;flags[0].ready=1;if(profile)ticks[0]=GetSystemCycle();
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&flags[0]),sizeof(BatchFlag));
  auto selected=local,loc=local[kSlots],keys=local[2*kSlots],ranks=local[3*kSlots];
@@ -199,18 +207,11 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  while(true){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+kOutputCompletionFlag),sizeof(BatchFlag));if(flags[kOutputCompletionFlag].ready)break;if(GetSystemCycle()-publishWait>5000000000ULL){ctl.SetValue(1,8);break;}}
  if(flags[kOutputCompletionFlag].error)ctl.SetValue(1,ctl.GetValue(1)|flags[kOutputCompletionFlag].error);
  status[0]=ctl.GetValue(1);status[1]=ctl.GetValue(0);status[2]=b*kSlots;status[3]=0;status[4]=0;
+ // Producer and finalizer execute consecutively on this same core. Keep
+ // this small result in a scalar instead of publishing a pending cache line.
+ uint32_t usefulPrefetch=0;
 #if KVIP_AUTO_ROUTE
- if(ctx->autoRoute){
-  auto config=reinterpret_cast<__gm__ kvip_auto_route::Config*>(ctx->autoRoute);
-  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(config),128);
-  if(kvip_auto_route::Valid(config)){
-   auto pending=reinterpret_cast<__gm__ kvip_auto_route::Pending*>(config->pending)+b;
-   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(pending),128);
-   pending->usefulPrefetch=ctl.GetValue(8);
-   pending->necessary=uint64_t(status[1])+pending->usefulPrefetch;
-   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(pending),128);
-  }
- }
+ if(ctx->autoRoute)usefulPrefetch=ctl.GetValue(8);
 #endif
  row->finalBegin=0;row->finalRequests=status[1];row->finalHead=0;row->finalPending=status[1]?1:0;row->finalEnd=GetSystemCycle();
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row)+960,64);
@@ -222,6 +223,7 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  pipe.Destroy();
  if(!kEarlyFetchReady){flags[5].error=status[0];flags[5].ready=1;
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&flags[5]),sizeof(BatchFlag));}
+ return usefulPrefetch;
 }
 __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
  auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;auto status=reinterpret_cast<__gm__ uint32_t*>(a->workerStatus)+b*32;
@@ -236,7 +238,8 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
  TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,SCRATCH_WORDS*4);auto local=scratch.Get<uint32_t>();
  auto work=reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr());
  uint32_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
- if(profile)ticks[10]=GetSystemCycle();Simt::VF_CALL<InitShadow>(Simt::Dim3{THREADS,1,1},work);
+ if(profile)ticks[10]=GetSystemCycle();
+ Simt::VF_CALL<InitShadow>(Simt::Dim3{THREADS,1,1},work);
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  uint32_t total=0,error=0,seen=0;bool denseMode=false;
  auto dense=reinterpret_cast<__gm__ uint32_t*>(a->denseShadow)+uint64_t(b)*shape.history*6;
@@ -252,6 +255,14 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
   if(error)break;
   uint32_t count=flags[publication].count;
   if(flags[publication].error){error=flags[publication].error;break;}
+#if KVIP_LOW_MISS_TAIL
+  // A successful empty publication changes neither Index nor address state.
+  // Wait/check its flag above even when it is empty, so failures propagate.
+  if(!count){
+   if(profile){ticks[12+2*phase]=GetSystemCycle();ticks[13+2*phase]=ticks[12+2*phase];}
+   continue;
+  }
+#endif
   uint32_t begin=phase?kPrefetch+total:0;
   auto source=reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+b*a->maxEvents;
   auto dest=reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+b*a->maxEvents;
@@ -279,7 +290,11 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
   error=local.GetValue(CONTROL);if(profile)ticks[13+2*phase]=GetSystemCycle();if(phase)total+=count;
  }
  if(!error){uint64_t start=GetSystemCycle();while(true){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+kOutputCompletionFlag),sizeof(BatchFlag));if(flags[kOutputCompletionFlag].ready){error=flags[kOutputCompletionFlag].error;break;}if(GetSystemCycle()-start>5000000000ULL){error=8;break;}}}
- if(!error){auto update=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);uint64_t addressStride=update[7];if(profile)ticks[22]=GetSystemCycle();
+ if(!error
+#if KVIP_LOW_MISS_TAIL
+    && seen
+#endif
+ ){auto update=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);uint64_t addressStride=update[7];if(profile)ticks[22]=GetSystemCycle();
   if(prepareMetadata && !denseMode){
    static_assert(2*MAP*sizeof(uint64_t)<=4*CHUNK*16*sizeof(uint32_t),"Metadata staging exceeds dead key/scale staging");
    GlobalTensor<uint64_t> source;source.SetGlobalBuffer(prepared);
@@ -291,7 +306,9 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
   else if(denseMode)Simt::VF_CALL<CommitDenseMetadata>(Simt::Dim3{THREADS,1,1},reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(owner)*addressStride,reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*a->history,dense,reinterpret_cast<__gm__ uint64_t*>(dense+2*shape.history),shape.history);
   else Simt::VF_CALL<CommitMetadata>(Simt::Dim3{THREADS,1,1},reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(owner)*addressStride,reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*a->history,work);
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);if(profile)ticks[23]=GetSystemCycle();}
- status[0]=error;status[1]=total;status[2]=local.GetValue(CONTROL+4);if(profile)ticks[24]=GetSystemCycle();
+ status[0]=error;status[1]=total;
+ status[2]=local.GetValue(CONTROL+4);
+ if(profile)ticks[24]=GetSystemCycle();
  if(a->updateBindings){auto u=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);Simt::VF_CALL<PublishStreamingUpdateStatus>(Simt::Dim3{32,1,1},reinterpret_cast<__gm__ uint32_t*>(u[6]),b,error);SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);}
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),128);
  if(profile)kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ticks),256);pipe.Destroy();
@@ -535,7 +552,7 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
  }
 }
 #endif
-__aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
+__aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b,uint32_t usefulPrefetch){
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
  auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;uint64_t error=0;
@@ -567,7 +584,11 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
   if(profile)ft[9+2*(f-6)]=GetSystemCycle();
   if(f==6 && (a->prefetchCount & 0x10000000U)){
    if(profile)ft[20]=GetSystemCycle();
-   if(!error){Simt::VF_CALL<PublishPrefetchResidency>(Simt::Dim3{256,1,1},ctx,b,shape.resident);
+   if(!error
+#if KVIP_LOW_MISS_TAIL
+      && row->slots
+#endif
+   ){Simt::VF_CALL<PublishPrefetchResidency>(Simt::Dim3{256,1,1},ctx,b,shape.resident);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);}
    if(profile)ft[21]=GetSystemCycle();
   }
@@ -629,11 +650,14 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
   if(kvip_auto_route::Valid(config)){
    auto pending=reinterpret_cast<__gm__ kvip_auto_route::Pending*>(config->pending)+b;
    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(pending),128);
+   pending->usefulPrefetch=usefulPrefetch;
+   pending->necessary=uint64_t(info[1])+pending->usefulPrefetch;
    if(pending->owner<config->owners){
     auto record=reinterpret_cast<__gm__ uint8_t*>(config->feedback)+pending->owner*128;
     kvaf_device::CleanCacheLines(record,128);
     if(kvip_auto_route::Commit(config,b,error|updateError))kvaf_device::CleanCacheLines(record,128);
    }
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(pending),128);
   }
  }
 #endif
@@ -653,7 +677,7 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
   auto trace=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*256+uint64_t(block)*32;
   if(profile)trace[0]=GetSystemCycle();
   if(block<shape.batch*kResolveCores){uint32_t b=block/kResolveCores,role=block%kResolveCores;
-   if(role==0){Producer(a,b);FinalizeStreaming(a,b);}else if(role==1)Consumer(a,b);
+   if(role==0){uint32_t useful=Producer(a,b);FinalizeStreaming(a,b,useful);}else if(role==1)Consumer(a,b);
    else OutputWorker(a,b);
   }
   else {uint32_t lane=block-shape.batch*kResolveCores,q=lane/workers,part=lane%workers;

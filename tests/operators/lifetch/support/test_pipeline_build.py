@@ -54,7 +54,7 @@ def test_pipeline_options_isolate_and_reuse_the_correct_binary(monkeypatch, tmp_
 @pytest.mark.parametrize("value", (1, 0, "OFF", None))
 @pytest.mark.parametrize("option", ("compact_init", "adaptive_admission", "prefetch_gate",
                                     "skip_exhausted_prefetch", "early_prefetch_drain", "inverse_mapping",
-                                    "low_miss_skip", "auto_route"))
+                                    "low_miss_skip", "low_miss_tail", "auto_route"))
 def test_pipeline_options_reject_ambiguous_values_before_build(tmp_path, value, option):
     with pytest.raises(ValueError, match="must be bool"):
         build.build_libraries(cache_dir=tmp_path, cann=tmp_path, headers=tmp_path, soc="A5", **{option: value})
@@ -90,6 +90,31 @@ def test_low_miss_skip_requires_admission_and_isolates_binary(monkeypatch, tmp_p
     previous = len(calls)
     assert build.build_libraries(**args, adaptive_admission=True, low_miss_skip=True) == light
     assert len(calls) == previous
+
+
+def test_low_miss_tail_requires_light_path_and_isolates_binary(monkeypatch, tmp_path):
+    calls = []
+
+    def compile_command(command, **kwargs):
+        calls.append(command)
+        if command[1] == "--build":
+            (Path(command[2]) / "libv9_bridge.so").write_bytes(b"fixture")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(build.subprocess, "run", compile_command)
+    args = dict(cache_dir=tmp_path, cann=tmp_path, headers=tmp_path, soc="A5")
+    with pytest.raises(ValueError, match="low_miss_tail requires low_miss_skip"):
+        build.build_libraries(**args, low_miss_tail=True)
+    assert not calls
+    light = dict(adaptive_admission=True, low_miss_skip=True)
+    before = build.build_libraries(**args, **light)
+    after = build.build_libraries(**args, **light, low_miss_tail=True)
+    assert before != after
+    manifest = json.loads((after[0].parent / "complete.json").read_text())
+    assert manifest["KVIP_LOW_MISS_TAIL"] == "ON"
+    count = len(calls)
+    assert build.build_libraries(**args, **light, low_miss_tail=True) == after
+    assert len(calls) == count
 
 
 def test_auto_route_requires_complete_tail_and_isolates_binary(monkeypatch, tmp_path):

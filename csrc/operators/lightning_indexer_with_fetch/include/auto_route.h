@@ -43,6 +43,17 @@ KVIP_ROUTE_FN inline bool Valid(const KVIP_ROUTE_GM Config* c) {
         c->fullWindow && c->fullWindow <= 480 && c->fullSteps <= 65535 && c->fullCarry <= 1;
 }
 
+// Called only after validating previousQueries/currentQueries in 1..4 and
+// necessary <= 8192. Constant small divisors avoid a device-side uint64 divide.
+KVIP_ROUTE_FN inline uint32_t ScaleReads(uint32_t necessary, uint32_t currentQueries,
+                                       uint32_t previousQueries) {
+    uint32_t numerator = necessary * currentQueries + previousQueries - 1;
+    if (previousQueries == 1) return numerator;
+    if (previousQueries == 2) return numerator >> 1;
+    if (previousQueries == 3) return numerator / 3;
+    return numerator >> 2;
+}
+
 // One init block owns this decision and these control writes. No other init
 // block consumes them; the existing init -> LI launch edge publishes the result.
 template<class Context>
@@ -58,6 +69,19 @@ KVIP_ROUTE_FN inline bool Prepare(KVIP_ROUTE_GM Context* ctx) {
     auto ends = reinterpret_cast<const KVIP_ROUTE_GM uint32_t*>(ctx->queryEnds);
     uint64_t bytes = 0, work = 0, active = 0, reason = Predicted;
     bool known = true, wasLow = true;
+    // The common owner table fits in one word: detect duplicate active owners
+    // in one pass instead of rereading B request records for every row. Larger
+    // owner tables retain the same exact fallback; no IDs are truncated.
+    uint64_t seenOwners = 0, duplicateOwners = 0;
+    bool smallOwners = true;
+    for (uint32_t b = 0; b < ctx->shape.batch; ++b) {
+        if (!requests[b].queries) continue;
+        uint64_t owner = requests[b].owner;
+        if (owner >= 64) { smallOwners = false; break; }
+        uint64_t bit = uint64_t(1) << owner;
+        duplicateOwners |= seenOwners & bit;
+        seenOwners |= bit;
+    }
     for (uint32_t b = 0; b < ctx->shape.batch; ++b) {
         auto r = requests + b;
         auto p = pending + b;
@@ -77,8 +101,12 @@ KVIP_ROUTE_FN inline bool Prepare(KVIP_ROUTE_GM Context* ctx) {
         ++active; work += rowWork;
         bool identity = r->owner < c->owners && r->owner == (owners ? owners[b] : b) &&
             r->generation && r->step && r->queries >= 1 && r->queries <= 4 && q == r->queries;
-        for (uint32_t j = 0; j < ctx->shape.batch; ++j)
-            if (j != b && requests[j].queries && requests[j].owner == r->owner) identity = false;
+        if (smallOwners) {
+            if (r->owner >= 64 || (duplicateOwners & (uint64_t(1) << r->owner))) identity = false;
+        } else {
+            for (uint32_t j = 0; j < ctx->shape.batch; ++j)
+                if (j != b && requests[j].queries && requests[j].owner == r->owner) identity = false;
+        }
         uint64_t rowReason = Predicted;
         bool predict = false;
         if (!identity) rowReason = InvalidIdentity;
@@ -95,7 +123,8 @@ KVIP_ROUTE_FN inline bool Prepare(KVIP_ROUTE_GM Context* ctx) {
             else if (r->step - f->step > c->maxStepGap) rowReason = StaleStep;
             else if (f->tokenBytes != p->tokenBytes) rowReason = ShapeChange;
             else {
-                uint64_t predicted = (f->necessary * r->queries + f->queries - 1) / f->queries;
+                uint64_t predicted = ScaleReads(uint32_t(f->necessary), uint32_t(r->queries),
+                                                uint32_t(f->queries));
                 bytes += predicted * p->tokenBytes;
                 wasLow = wasLow && f->mode == 0;
                 predict = true;
