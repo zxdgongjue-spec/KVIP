@@ -46,13 +46,27 @@ def test_repacking_preserves_tnd_query_mapping_and_owner_state():
 
 
 def test_auto_options_are_explicit_and_runtime_mode_is_not_guessed_from_static_quota():
-    for name in ("auto", "auto-end", "auto-tail", "auto-tail-end"):
+    for name in ("auto", "auto-end", "auto-tail", "auto-tail-end", "auto-tail-sparse"):
         values = validate_options(options_for(name))
         assert values["auto_route"] and q_workers_for(name) == 4
         with pytest.raises(ValueError, match="auto_route requires"):
             validate_options(values | {"low_miss_skip": False})
         assert not early_threshold_skipped(values | {"admission_controls": [0, 64, 0, 0]})
         assert early_threshold_skipped(values | {"auto_low_active": True})
+
+
+def test_sparse_init_preserves_route_policy_and_requires_the_safe_consumers():
+    from kvip.diagnostics.pipeline_options import admission_for
+
+    base = options_for("auto-tail")
+    sparse = options_for("auto-tail-sparse")
+    assert sparse == base | {"low_miss_sparse_init": True}
+    assert admission_for("auto-tail-sparse") == admission_for("auto-tail")
+    assert q_workers_for("auto-tail-sparse") == q_workers_for("auto-tail")
+    with pytest.raises(ValueError, match="low_miss_sparse_init requires"):
+        validate_options(sparse | {"auto_route": False})
+    with pytest.raises(ValueError, match="separate initialization policies"):
+        validate_options(sparse | {"inverse_mapping": True})
 
 
 def test_low_tail_options_keep_identical_query_workers_and_manual_admission():

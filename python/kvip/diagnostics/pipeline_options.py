@@ -2,7 +2,8 @@
 
 OPTIONS = ("final_topk_prune", "selected_metadata", "early_fetch_ready", "compact_init", "ready_batch_fetch")
 OPTIONAL_OPTIONS = ("ready_direct_ranges", "adaptive_admission", "prefetch_gate",
-                    "skip_exhausted_prefetch", "early_prefetch_drain", "inverse_mapping", "low_miss_skip", "auto_route", "low_miss_tail")
+                    "skip_exhausted_prefetch", "early_prefetch_drain", "inverse_mapping", "low_miss_skip", "auto_route", "low_miss_tail",
+                    "low_miss_sparse_init")
 NUMERIC_OPTIONS = ("prefetch_rank",)
 DEFAULT_VARIANTS = ("control", "metadata", "ready-batch", "workers4", "ready-batch4", "metadata-end", "control-end")
 VARIANTS = {
@@ -42,6 +43,7 @@ VARIANTS = {
     "light-high-tail-end": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "low_miss_skip", "low_miss_tail"),
     "auto-tail": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "low_miss_skip", "auto_route", "low_miss_tail"),
     "auto-tail-end": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "low_miss_skip", "auto_route", "low_miss_tail"),
+    "auto-tail-sparse": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "low_miss_skip", "auto_route", "low_miss_tail", "low_miss_sparse_init"),
 }
 
 # The exact selection remains Top2048. These ranks only admit speculative
@@ -73,6 +75,7 @@ ADMISSION = {
     "light-high-tail-end": (512, 64, 0, 0),
     "auto-tail": (512, 64, 0, 0),
     "auto-tail-end": (512, 64, 0, 0),
+    "auto-tail-sparse": (512, 64, 0, 0),
 }
 for _name in RANKS:
     ADMISSION[_name] = (768, 128, 0, 1) if _name.startswith("capacity-") else (512, 64, 0, 0)
@@ -125,6 +128,11 @@ def validate_options(options):
     if options.get("low_miss_tail") and not all(options.get(key) for key in (
             "low_miss_skip", "selected_metadata", "ready_batch_fetch", "early_fetch_ready")):
         raise ValueError("low_miss_tail requires low_miss_skip, selected_metadata, ready_batch_fetch and early_fetch_ready")
+    if options.get("low_miss_sparse_init") and not all(options.get(key) for key in (
+            "auto_route", "low_miss_tail", "selected_metadata")):
+        raise ValueError("low_miss_sparse_init requires auto_route, low_miss_tail and selected_metadata")
+    if options.get("low_miss_sparse_init") and options.get("inverse_mapping"):
+        raise ValueError("low_miss_sparse_init and inverse_mapping are separate initialization policies")
     return dict(options)
 
 

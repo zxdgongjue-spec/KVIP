@@ -116,6 +116,11 @@ class SnapshotDemand:
             self.requests.append((tnd_rows, forward, lru))
             self.prefetch_requests[int(row)] = (ids[owner], forward, lru)
 
+    @staticmethod
+    def empty_prefetch_counts():
+        categories = ("cold", "candidate_hot", "other_hot", "abc")
+        return {prefix + category: 0 for prefix in ("prefetch_", "unused_prefetch_") for category in categories}
+
     def classify_prefetch(self, mapping, selected):
         """Classify completed prefetch mappings, using pre-call residency.
 
@@ -127,7 +132,7 @@ class SnapshotDemand:
         if mapping.ndim != 2 or mapping.shape[1] != self.history or selected.shape[0] != len(mapping):
             raise ValueError("Prefetch mapping and selected rows differ from captured geometry")
         categories = ("cold", "candidate_hot", "other_hot", "abc")
-        result = {prefix + category: 0 for prefix in ("prefetch_", "unused_prefetch_") for category in categories}
+        result = self.empty_prefetch_counts()
         for row, values in enumerate(mapping):
             fetched = np.flatnonzero((values >= self.resident) & (values < self.resident + 2048))
             if not len(fetched):

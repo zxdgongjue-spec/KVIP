@@ -264,6 +264,7 @@ def profile_summary(result):
         "get_drain": "cq_drain",
         "get_native": "fetch_native_get",
         "get_pack": "fetch_pack",
+        "publication_pack": "publication_pack",
         "producer": "producer_span",
         "index": "index_consumer_span",
         "index_total": "index_role_span",

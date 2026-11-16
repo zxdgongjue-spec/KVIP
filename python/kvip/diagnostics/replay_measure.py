@@ -85,7 +85,7 @@ def statistics(samples):
 
 
 def fused_reads(torch, rotating, update, transport, width, demand=None, *, window_limit=None, active_rows=None,
-                admission_controls=None, skip_exhausted_prefetch=False, configured_row_limit=None):
+                admission_controls=None, skip_exhausted_prefetch=False, configured_row_limit=None, sparse_low=False):
     rows = cpu_array(torch, rotating.rows)
     status = cpu_array(torch, rotating.row_status)
     posts = cpu_array(torch, rotating.final_posts)
@@ -102,15 +102,22 @@ def fused_reads(torch, rotating, update, transport, width, demand=None, *, windo
             raise AssertionError("Resolver and UBmem transfer counters disagree")
         if int(completed[:, 5].sum()) != (prefetch + final) * width:
             raise AssertionError("UBmem payload-byte accounting mismatch")
-    mapping = mapping_values(torch, rotating, rows)
-    selected = cpu_array(torch, rotating.arguments[9])
-    resident = rotating.hot_valid.shape[1]
     unused = 0
-    for row, topk in zip(mapping, selected):
-        # ABC mappings use resident+8192+offset and were already resident;
-        # only the 2048 reserved hot-slot mapping range represents prefetch.
-        fetched = np.flatnonzero((row >= resident) & (row < resident + 2048))
-        unused += int(np.count_nonzero(~np.isin(fetched, topk.reshape(-1))))
+    if sparse_low:
+        if transport != "urma" or prefetch != 0 or np.any(rows[:, 9]):
+            raise AssertionError("Sparse low route must have zero actual speculative transfers")
+        # This route deliberately leaves old map words untouched. Actual
+        # completed Get counters, rather than stale map entries, own traffic.
+        mapping = selected = None
+    else:
+        mapping = mapping_values(torch, rotating, rows)
+        selected = cpu_array(torch, rotating.arguments[9])
+        resident = rotating.hot_valid.shape[1]
+        for row, topk in zip(mapping, selected):
+            # ABC mappings were already resident; only the 2048 reserved
+            # hot-slot mapping range represents speculative prefetch.
+            fetched = np.flatnonzero((row >= resident) & (row < resident + 2048))
+            unused += int(np.count_nonzero(~np.isin(fetched, topk.reshape(-1))))
     if unused > prefetch:
         raise AssertionError("Unused prefetch exceeds completed prefetch transfers")
     result = dict(
@@ -124,7 +131,9 @@ def fused_reads(torch, rotating, update, transport, width, demand=None, *, windo
         useful_transfer_bytes=(prefetch + final - unused) * width,
     )
     if demand is not None:
-        result.update(demand.classify_prefetch(mapping, selected))
+        classified_counts = (demand.empty_prefetch_counts() | {"prefetch_classified": 0}
+                             if sparse_low else demand.classify_prefetch(mapping, selected))
+        result.update(classified_counts)
         classified = result["prefetch_classified"]
         if classified > prefetch:
             raise AssertionError("Prefetch mappings exceed completed transfer count")
@@ -154,6 +163,10 @@ def supports_low_miss_hot_hits(rotating, transport):
 def prepare_fused_state(bundle, archive, restored, torch, device, transport):
     selector, rotating, update = bundle.selector, bundle.rotating, bundle.update
     bundle.tuning["low_miss_hot_hits"] = supports_low_miss_hot_hits(rotating, transport)
+    if bundle.tuning.get("low_miss_sparse_init"):
+        feature = getattr(rotating.library, "kvip_low_miss_sparse_init", None)
+        if transport != "urma" or feature is None or not feature():
+            raise ValueError("Sparse init requires a capable loaded URMA build")
     seeds = []
     for name, target in (persistent_tensors(selector) | input_tensors(selector)).items():
         seed = (
@@ -197,6 +210,7 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
             skip_exhausted_prefetch=bundle.tuning.get("skip_exhausted_prefetch", False),
             configured_row_limit=(bundle.auto_replay.state.full_controls[0]
                                   if getattr(bundle, "auto_replay", None) else None),
+            sparse_low=bool(bundle.tuning.get("low_miss_sparse_init") and early_threshold_skipped(bundle.tuning)),
         )
 
         logical = cpu_array(torch, update.logical_output)
@@ -852,6 +866,11 @@ def check_auto_route(torch, stream, bundle, replay, last_step):
             requests[:, 3] = 3  # Safe identity/Q mismatch; never inject a transport fault.
         auto.begin(step=step, learning=learning, requests=requests)
         bundle.reset()
+        sparse = bool(bundle.tuning.get("low_miss_sparse_init"))
+        if sparse:
+            # Fault injection only, outside headline timing. Low must ignore
+            # these convincing stale prefetch tags; high must reset them.
+            bundle.rotating.mapping.fill_(bundle.rotating.hot_valid.shape[1])
         stream.synchronize()
         replay()
         stream.synchronize()
@@ -861,7 +880,19 @@ def check_auto_route(torch, stream, bundle, replay, last_step):
             raise AssertionError("Rejected lifecycle step learned new feedback")
         if expected_mode is not None and observation["mode"] != expected_mode:
             raise AssertionError("Prediction fault did not exercise the requested graph mode")
-        rows.append(dict(name=name, **observation))
+        if sparse and observation["mode"] == "low":
+            mapping = cpu_array(torch, bundle.rotating.mapping).reshape(bundle.rotating.batch, -1)
+            resident = bundle.rotating.hot_valid.shape[1]
+            bounds = selected.array("pre.tail_bounds")
+            capacity = selected.manifest["geometry"]["output_stride"] - resident
+            for row, (start, stop) in zip(mapping, bounds):
+                expected = np.full(row.shape, resident, dtype=row.dtype)
+                ids = np.arange(int(start), min(int(stop), int(start) + capacity, len(row)))
+                if len(ids):
+                    expected[ids] = resident + 8192 + ids % capacity
+                if not np.array_equal(row, expected):
+                    raise AssertionError("Sparse low init changed unused history-map words")
+        rows.append(dict(name=name, **observation, poisoned_history_map=sparse))
 
     run("learning-disabled", last_step + 1, learning=False)
     run("duplicate", last_step)

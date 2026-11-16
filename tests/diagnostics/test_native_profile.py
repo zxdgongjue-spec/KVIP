@@ -42,6 +42,20 @@ def test_old_main_slots_are_unavailable_even_if_they_contain_nonzero_values():
     assert sample["metrics"]["final_topk"]["status"] == "unavailable"
 
 
+def test_output_packing_uses_publication_role_and_remains_separate_from_get_pack():
+    raw = _raw()
+    cores = raw[512:].reshape(-1, 32)
+    for row in (2, 5):
+        for query in range(4):
+            cores[row, 6 + query * 6] = 100 + query * 100
+            cores[row, 7 + query * 6] = 110 + query * 101
+    profile = native_profile.decode_profile(raw, batch=2, workers=2, resolver_cores=3, transport="urma")
+    assert profile["metrics"]["publication_pack"]["samples_cycles"] == [10, 11, 12, 13] * 2
+    assert profile["metrics"]["publication_pack"]["median_cycles"] == 11.5
+    assert profile["metrics"]["producer_span"]["status"] == "unavailable"
+    assert profile["metrics"]["fetch_query_ready_wait"]["status"] == "unavailable"
+
+
 def test_early_drain_is_separate_from_later_resolver_join():
     raw = _raw()
     consumer = raw[:128].reshape(2, 64)[:, 32:]

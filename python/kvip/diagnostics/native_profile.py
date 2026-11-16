@@ -54,6 +54,12 @@ def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_
     # separate so moving work across its start cannot look like saved time.
     index_roles = cores[np.arange(batch) * resolver_cores + 1] if resolver_cores > 1 else cores[:0]
     interval("index_role_span", index_roles, 0, 1)
+    publication_roles = cores[np.arange(batch) * resolver_cores + 2] if resolver_cores > 2 else cores[:0]
+    publication_queries = publication_roles[:, 4:28].reshape(-1, 6)
+    # OutputWorker ticks bracket descriptor packing after raw-query readiness.
+    # This includes the location DMA; it is distinct from the Get worker's
+    # later ready-batch packing, which is reported as fetch_pack below.
+    interval("publication_pack", publication_queries, 2, 3)
     if early_prefetch_drain:
         if transport != "urma":
             raise ValueError("Early prefetch drain markers require URMA")

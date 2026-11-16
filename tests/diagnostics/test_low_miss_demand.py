@@ -80,3 +80,26 @@ def test_capability_comes_from_loaded_binary_and_excludes_ubmem():
     assert not supports_low_miss_hot_hits(off, "urma")
     assert supports_low_miss_hot_hits(new, "urma")
     assert not supports_low_miss_hot_hits(new, "ubmem")
+
+
+@pytest.mark.parametrize("prefetch", [0, 1])
+def test_sparse_low_uses_actual_get_counters_and_never_reads_stale_mapping(monkeypatch, prefetch):
+    from kvip.diagnostics import replay_measure
+
+    demand, _ = selection()
+    rows = np.zeros((1, 256), dtype=np.int32)
+    rows[0, 9], rows[0, 247] = prefetch, 2
+    rotating = SimpleNamespace(rows=rows, row_status=np.zeros((1, 32), dtype=np.int32),
+                               final_posts=np.zeros((1, 4, 16), dtype=np.int32))
+    update = SimpleNamespace(status=np.zeros(1))
+    monkeypatch.setattr(replay_measure, "cpu_array", lambda torch, value: np.asarray(value))
+    monkeypatch.setattr(replay_measure, "mapping_values", lambda *args: pytest.fail("Read stale sparse map"))
+    if prefetch:
+        with pytest.raises(AssertionError, match="zero actual speculative"):
+            replay_measure.fused_reads(None, rotating, update, "urma", 656, demand, sparse_low=True)
+    else:
+        result = replay_measure.fused_reads(None, rotating, update, "urma", 656, demand, sparse_low=True)
+        assert result["final"] == result["useful_transfers"] == 2
+        assert result["bytes"] == 1312
+        assert result["prefetch"] == result["unused_prefetch"] == result["prefetch_classified"] == 0
+        assert result["prefetch_unclassified"] == 0
