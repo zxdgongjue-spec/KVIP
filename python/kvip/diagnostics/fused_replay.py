@@ -77,6 +77,8 @@ def create_fused(
     split_index_stages=False,
     upstream=False,
     pipeline_options=None,
+    admission=None,
+    scan_options=None,
     q_workers=2,
     topk_probe=False,
 ):
@@ -158,6 +160,35 @@ def create_fused(
         raise ValueError("Pipeline variants cannot use legacy experiment production code")
     if topk_probe and (not upstream or pipeline_options is None or not build_options.get("final_topk_prune")):
         raise ValueError("TopK probe requires the exact production pruning candidate")
+    if scan_options is not None:
+        from kvip.diagnostics.scan_options import validate_options
+
+        if not upstream or pipeline_options is not None or transport != "urma" or not effective["recent_threshold"]:
+            raise ValueError("Scan options require standalone exact URMA recent production")
+        build_options = validate_options(scan_options)
+        effective.update(build_options)
+    if admission is not None:
+        if not upstream or scan_options is None or transport != "urma":
+            raise ValueError("Admission experiment requires exact URMA production source")
+        if tuple(admission) not in ((512, 64), (1024, 128)):
+            raise ValueError("Unsupported scan experiment budget")
+        effective["prefetch_limit"], effective["window_limit"] = admission
+    if scan_options is not None:
+        # This first implementation deliberately keeps sequence-split unchanged.
+        # Reject an all-fallback timing, rather than label it a reverse scan.
+        blocks = (h - r) // 512
+        rounds = min(g["requested_windows"], b * (2 if 2 * b <= aics else 1))
+        half_blocks = (blocks + rounds - 2) // (rounds - 1)
+        sequence_split = (
+            2 * b <= aics and g["heads"] == 32 and r % 512 == 0
+            and (h - r) % 512 == 0 and h - r >= 512 * (rounds - 1)
+            and half_blocks * (2 * rounds - 3) < 2 * blocks
+        )
+        if sequence_split:
+            raise ValueError("This snapshot uses sequence-split LI; reverse scan is not implemented for that schedule")
+        ends = archive.array("pre.query_ends").reshape(b, 4).min(axis=1)
+        if ((ends // 2048) * 2048 <= ((r + 2047) // 2048) * 2048).any():
+            raise ValueError("Snapshot has no full causal cold blocks to reverse")
     threshold_bounds = None
     if effective["recent_threshold"]:
         # Immutable per-replay bounds; all scoring/merging occurs inside forward.

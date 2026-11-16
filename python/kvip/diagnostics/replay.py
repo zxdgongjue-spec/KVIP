@@ -11,6 +11,7 @@ from kvip.diagnostics.archive import load_snapshot
 from kvip.diagnostics.console import NativeLog, emit, flush_output, print_replay_failure
 from kvip.diagnostics.pipeline_options import DEFAULT_VARIANTS, VARIANTS
 from kvip.diagnostics.system_profile import PROFILE_METRICS
+from kvip.diagnostics.scan_options import DEFAULT_VARIANTS as SCAN_DEFAULTS, VARIANTS as SCAN_VARIANTS
 
 _RETAINED = []
 
@@ -34,6 +35,7 @@ def arguments(argv=None):
             "register-kth",
             "overlap-victims",
             "post-threshold",
+            "scan-order",
         ),
         default="threshold",
     )
@@ -49,6 +51,7 @@ def arguments(argv=None):
         default=None,
         choices=tuple(VARIANTS),
     )
+    p.add_argument("--scan-variants", nargs="+", choices=tuple(SCAN_VARIANTS))
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--iterations", type=int, default=10)
     p.add_argument(
@@ -87,7 +90,7 @@ def arguments(argv=None):
         p.error("Threshold policy changes only the fused path")
     if bool(args.upstream_root) != bool(args.upstream_revision):
         p.error("upstream-root and upstream-revision must be supplied together")
-    if args.upstream_root and (args.study not in ("threshold", "post-threshold") or args.threshold_policy == "both"):
+    if args.upstream_root and (args.study not in ("threshold", "post-threshold", "scan-order") or args.threshold_policy == "both"):
         p.error("Exact production replay requires threshold/post-threshold study and one threshold policy")
     if args.study == "post-threshold":
         if (
@@ -102,6 +105,14 @@ def arguments(argv=None):
             p.error("Pipeline variants must be unique")
     elif args.pipeline_variants:
         p.error("pipeline-variants requires study=post-threshold")
+    if args.study == "scan-order":
+        if not args.upstream_root or args.transport != "urma" or args.mode != "fused" or args.threshold_policy != "recent":
+            p.error("scan-order requires an exact production checkout and URMA fused recent policy")
+        args.scan_variants = args.scan_variants or list(SCAN_DEFAULTS)
+        if len(set(args.scan_variants)) != len(args.scan_variants):
+            p.error("scan-variants must be unique")
+    elif args.scan_variants:
+        p.error("scan-variants requires study=scan-order")
     if args.topk_probe and args.study != "post-threshold":
         p.error("topk-probe requires study=post-threshold")
     if args.study in ("threshold-only", "seed-ub", "local-victims", "register-kth", "overlap-victims") and (

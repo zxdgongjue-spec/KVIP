@@ -474,6 +474,8 @@ def measure_case(args, archive, context, retained):
             split_index_stages=getattr(args, "split_index_stages", False),
             upstream=bool(getattr(args, "upstream_root", None)),
             pipeline_options=getattr(args, "pipeline_options", None),
+            admission=getattr(args, "scan_admission", None),
+            scan_options=getattr(args, "scan_options", None),
             q_workers=getattr(args, "pipeline_q_workers", 2),
             topk_probe=getattr(args, "probe_only", False),
         )
@@ -525,6 +527,8 @@ def measure_case(args, archive, context, retained):
             graph_backend="torch.npu.NPUGraph" if args.mode == "serial" else "kvaf.AclGraph",
             tuning=dict(getattr(bundle, "tuning", {})),
             pipeline_options=getattr(args, "pipeline_options", None),
+            admission=getattr(args, "scan_admission", None),
+            scan_options=getattr(args, "scan_options", None),
             pipeline_q_workers=getattr(args, "pipeline_q_workers", None),
             runtime_configuration=runtime_worker_config(args, archive, aics),
             libraries=[dict(path=str(path), sha256=file_digest(path)) for path in libraries],
@@ -633,6 +637,8 @@ def release_context(context):
 def study_cases(args):
     """Keep each study's baseline explicit when production defaults advance."""
     study = getattr(args, "study", "threshold")
+    if study == "scan-order":
+        return {name: {"recent_threshold": True} for name in args.scan_variants}
     if study == "post-threshold":
         return {name: {"recent_threshold": True} for name in args.pipeline_variants}
     if study == "overlap-victims":
@@ -758,6 +764,7 @@ def run(args, archive, retained):
         "register-kth",
         "overlap-victims",
         "post-threshold",
+        "scan-order",
     )
     if args.mode == "fused" and (args.threshold_policy == "both" or execution_study):
         cases = {}
@@ -767,6 +774,11 @@ def run(args, archive, retained):
 
                 args.pipeline_options = options_for(name)
                 args.pipeline_q_workers = q_workers_for(name)
+            if args.study == "scan-order":
+                from kvip.diagnostics.scan_options import budgets_for, options_for
+
+                args.scan_options = options_for(name)
+                args.scan_admission = budgets_for(name)
             retained["progress"].update(variant=name, tuning=dict(tuning))
             phase(retained, "case_begin")
             emit(f"CASE_BEGIN {args.transport}-{args.mode}-{name}")
