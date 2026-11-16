@@ -1,4 +1,5 @@
 #include "context.h"
+#include "../../include/cold_scan.h"
 /**
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
@@ -85,6 +86,7 @@ public:
     static constexpr uint32_t SYNC_C1_V1_FLAG = 4;
     static constexpr uint32_t SYNC_V1_C1_FLAG = 5;
     uint32_t resident_=0;
+    kvip_cold_scan::Range coldScan_{0, 0};
 public:
     rotating::RuntimeShape runtimeShape_;
     bool sequenceSplit_ = false;
@@ -552,6 +554,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::CalcRunInfo(uint32_t l
     runInfo.bIdx = tempLoopInfo.bIdx;
     runInfo.gS1Idx = tempLoopInfo.gS1Idx;
     runInfo.s2Idx = s2LoopIdx;
+    runInfo.keyS2Idx = s2LoopIdx;
     runInfo.s2Start = splitCoreInfo.s2Start;
     runInfo.bN2Idx = tempLoopInfo.bN2Idx;
     runInfo.isValid = s2LoopIdx <= tempLoopInfo.s2LoopEnd;
@@ -807,6 +810,17 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()
         }
         for (uint32_t gS1LoopIdx = splitCoreInfo.gS1Start; gS1LoopIdx <= tempLoopInfo.gS1LoopEnd; gS1LoopIdx++) {
             CalcS2LoopParams(bN2LoopIdx, gS1LoopIdx);
+#if KVIP_REVERSE_COLD
+            // Compute once per request/Q block, not once per Index tile.
+            auto scanContext = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+            uint32_t ends[4] = {runtimeShape_.history, runtimeShape_.history,
+                                runtimeShape_.history, runtimeShape_.history};
+            if (scanContext->queryEnds) {
+                auto bounds = reinterpret_cast<__gm__ uint32_t*>(scanContext->queryEnds) + tempLoopInfo.bIdx * 4;
+                for (uint32_t q = 0; q < 4; ++q) ends[q] = bounds[q];
+            }
+            coldScan_ = kvip_cold_scan::Bounds(resident_, runtimeShape_.history, ends);
+#endif
             bool hadRecent = ScoreRecent(gloop, qScaleLoop);
             uint32_t kScaleLoop = 0;
             for (int s2LoopIdx = splitCoreInfo.s2Start; s2LoopIdx <= tempLoopInfo.s2LoopEnd; s2LoopIdx++) {
@@ -841,6 +855,14 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessBaseBlock(uint3
                                                           uint32_t kScaleLoop, bool reuseQuery)
 {
     CalcRunInfo(loop, s2LoopIdx, runInfo, qScaleLoop, kScaleLoop);
+#if KVIP_REVERSE_COLD
+    const uint32_t physical = kvip_cold_scan::Remap(uint32_t(s2LoopIdx) * 128, coldScan_) / 128;
+    runInfo.keyS2Idx = physical;
+    runInfo.tensorKeyOffset -= uint64_t(s2LoopIdx) * 128 * constInfo.kHeadNum * constInfo.headDim;
+    runInfo.tensorKeyOffset += uint64_t(physical) * 128 * constInfo.kHeadNum * constInfo.headDim;
+    runInfo.tensorKeyScaleOffset -= uint64_t(s2LoopIdx) * 128 * constInfo.kHeadNum;
+    runInfo.tensorKeyScaleOffset += uint64_t(physical) * 128 * constInfo.kHeadNum;
+#endif
     runInfo.reuseQuery = reuseQuery;
     if ASCEND_IS_AIC {
         matmulService.ComputeMm1(runInfo);

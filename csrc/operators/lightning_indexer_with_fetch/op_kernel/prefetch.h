@@ -13,6 +13,7 @@ namespace kvaf_device { using ubmem_device::CleanCacheLines; constexpr uint32_t 
 #include "simt_api/device_sync_functions.h"
 #include "simt_api/device_warp_functions.h"
 #include "context.h"
+#include "cold_scan.h"
 #include "../../common/lifetch/prefetch_budget.h"
 
 // Imported from direct_slots.h
@@ -449,6 +450,15 @@ __simd_vf__ inline void UnionWords(__ubuf__ uint32_t* masks,__ubuf__ uint32_t* i
 }
 // Each SIMT thread owns consecutive bitmap words. A two-level prefix sum
 // assigns stable, token-ordered output positions without per-candidate atomics.
+__simt_callee__ inline uint32_t DecodeScanToken(uint32_t token, __ubuf__ uint32_t* cfg) {
+#if KVIP_REVERSE_COLD
+    // cfg[60:62] is disjoint from the scan counters and warp-prefix scratch.
+    const uint32_t begin = cfg[60], end = cfg[61];
+    if (token >= begin && token < end)
+        return begin + end - 2048 - (token & ~2047U) + (token & 2047U);
+#endif
+    return token;
+}
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void ExpandWords(__ubuf__ uint32_t* input,__ubuf__ uint32_t* wordIndices,__ubuf__ uint32_t* ids,
     __ubuf__ uint32_t* cfg,uint32_t base,uint32_t span,uint32_t oldCount,uint32_t words) {
@@ -480,7 +490,7 @@ inline void ExpandWords(__ubuf__ uint32_t* input,__ubuf__ uint32_t* wordIndices,
         uint32_t bits=word<words?input[word]:0;
         while(bits) {
             uint32_t offset=wordIndices[word]*16+uint32_t(__ffs(int32_t(bits))-1)/2;
-            if(rank<kCandidateCapacity)ids[rank]=base+offset;
+            if(rank<kCandidateCapacity)ids[rank]=DecodeScanToken(base+offset,cfg);
             uint32_t select=0U-uint32_t(rank==kCandidateCapacity);
             stopValue=(stopValue&~select)|(offset&select);
             ++rank;bits&=bits-1;
@@ -527,7 +537,7 @@ inline void ScanPartial(__ubuf__ uint32_t* input,__ubuf__ uint32_t* ids,__ubuf__
         uint32_t w=tid*perThread+i,bits=w<words?ReadyWord(input,cfg,w,words):0;
         while(bits) {
             uint32_t offset=w*16+uint32_t(__ffs(int32_t(bits))-1)/2;
-            if(rank<kCandidateCapacity)ids[rank]=base+offset;
+            if(rank<kCandidateCapacity)ids[rank]=DecodeScanToken(base+offset,cfg);
             uint32_t select=0U-uint32_t(rank==kCandidateCapacity);
             stop=(stop&~select)|(offset&select);++rank;bits&=bits-1;
         }
@@ -660,6 +670,17 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         const uint64_t entityAddress=state64.GetValue(0),queueAddress=state64.GetValue(1);
         const uint64_t addresses=state64.GetValue(2),output=state64.GetValue(3);
         const uint32_t lower=ctx->lruSlots?0:rt_resident;
+#if KVIP_REVERSE_COLD
+        uint32_t ends[4] = {rt_history,rt_history,rt_history,rt_history};
+        if(ctx->queryEnds) {
+            auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)+b*4;
+            for(uint32_t q=0;q<4;++q)ends[q]=bounds[q];
+        }
+        // Sequence-split LI retains its original ordering in this experiment.
+        auto range=sequenceHalfWindow?kvip_cold_scan::Range{0,0}:
+            kvip_cold_scan::Bounds(rt_resident,rt_history,ends);
+        cfg.SetValue(60,range.begin);cfg.SetValue(61,range.end);
+#endif
 #define KV_WINDOW_HISTORY rt_history
 #define KV_WINDOW_RESIDENT rt_resident
 #define KV_WINDOW_SCAN_TOKENS rt_scanTokens

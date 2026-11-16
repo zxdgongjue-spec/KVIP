@@ -37,7 +37,7 @@ def build_failure(log, stage, returncode):
     )
 
 
-def build_libraries(*, cache_dir, cann, headers, soc):
+def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False):
     """Build one shape-independent binary per source/toolchain/SoC."""
     root = Path(__file__).resolve().parents[3] / "csrc/operators"
     options = dict(
@@ -45,6 +45,7 @@ def build_libraries(*, cache_dir, cann, headers, soc):
         ASCEND_CANN_PACKAGE_PATH=str(cann),
         KVAF_INCLUDE=str(headers),
         SOC_VERSION=soc,
+        KVIP_REVERSE_COLD="ON" if reverse_cold else "OFF",
     )
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     for relative in (

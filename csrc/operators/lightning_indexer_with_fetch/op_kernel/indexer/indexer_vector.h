@@ -656,7 +656,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     auto kScalepingpong = (info.kScaleLoop % 2);
     auto s1BaseSizePerAIV = CeilDiv(s1BaseSize_, 2);
     int64_t curS1Idx = info.gS1Idx * s1BaseSize_;
-    int64_t curS2Idx = info.s2Idx * s2BaseSize_;
+    int64_t curS2Idx = info.keyS2Idx * s2BaseSize_;
     int64_t curS1ProcNum = curS1Idx + s1BaseSize_ > info.actS1Size ? info.actS1Size % s1BaseSize_ : s1BaseSize_;
     int64_t curAivS1Idx = curS1Idx + (blockId_ % 2) * CeilDiv(curS1ProcNum, 2);
     int64_t curAivS1ProcNum = (blockId_ % 2 == 0) ? CeilDiv(curS1ProcNum, 2) : curS1ProcNum / 2;
@@ -694,8 +694,8 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
 
     if ((info.s2Idx - info.s2Start) % QLICommon::KScaleTiles == 0) {
         WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_KSCALE + kScalepingpong);
-        uint32_t getLen = QLICommon::KScaleTiles * s2BaseSize_ > (info.validS2Len - info.s2Idx * s2BaseSize_)
-                                           ? info.validS2Len - info.s2Idx * s2BaseSize_
+        uint32_t getLen = QLICommon::KScaleTiles * s2BaseSize_ > (info.validS2Len - info.keyS2Idx * s2BaseSize_)
+                                           ? info.validS2Len - info.keyS2Idx * s2BaseSize_
                                            : QLICommon::KScaleTiles * s2BaseSize_;
         //kScaleGm  -->  kScaleUB_
         GetKeyScale(info, kScaleUB_, info.bIdx, curS2Idx, getLen);
@@ -771,7 +771,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         hitCopy.blockLen = 32;
         hitCopy.srcStride = 7; // classifyUB query stride is 256 bytes.
         hitCopy.dstStride = runtimeShape_.history / 4 - 32;
-        DataCopyPad(outputHits[(info.bIdx * SIM_Q + curAivS1Idx) * (runtimeShape_.history / 4) + curS2Idx / 4],
+        DataCopyPad(outputHits[(info.bIdx * SIM_Q + curAivS1Idx) * (runtimeShape_.history / 4) + info.s2Idx * s2BaseSize_ / 4],
                     classifyUB_[pingpong * 256].template ReinterpretCast<uint8_t>(), hitCopy);
     }
 #endif

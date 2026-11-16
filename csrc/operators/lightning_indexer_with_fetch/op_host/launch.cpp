@@ -1,6 +1,8 @@
 #include "../op_kernel/pipeline_types.h"
 #include "api.h"
 #include "context.h"
+#include "cold_scan.h"
+extern "C" uint32_t kvip_reverse_cold() { return KVIP_REVERSE_COLD; }
 extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) { return rotating::PrepareShape(shape); }
 #define ENTRY(name, blocks) \
 extern "C" uint32_t aclrtlaunch_v9_##name##_kernel(uint32_t,void*,void*); \

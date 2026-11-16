@@ -56,6 +56,7 @@ struct RunInfo {
     uint32_t n2Idx = 0;
     uint32_t gS1Idx;
     uint32_t s2Idx;
+    uint32_t keyS2Idx; // Physical Index tile; s2Idx remains monotonic scan progress.
     uint32_t s2Start;  // S2的起始位置
     uint32_t validS2Len;
     uint32_t qScaleLoop;
