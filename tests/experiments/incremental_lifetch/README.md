@@ -36,3 +36,14 @@ bash tests/experiments/incremental_lifetch/compare.sh \
 
 本实验入口用于 URMA、Q4、heads32、H131072/R16384 的合成负载对比；
 不是 UBmem 或模型服务适配。未运行本地仿真，真机正确性和性能由上述 A/B 验证。
+
+## 提炼已有日志（无需 NPU）
+
+```bash
+# 默认最近一次 A/B，也可在末尾指定某次结果目录。
+python tests/experiments/incremental_lifetch/summarize.py
+```
+
+输出正确性、完整图 mean/p50/p99、阶段耗时 A/B 差值、预取/补取/无用读取和
+冲突数量，保存为该次结果目录的 `key_results.log`。阶段使用全部有效打点轮次
+的平均值（包括 round 0）；独立于无打点图计时。中途失败时保留已有一侧结果。
