@@ -1,6 +1,6 @@
 """Independent URMA scan-order/admission experiment; no graph-route changes."""
 
-OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill")
+OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill", "compact_out_of_place")
 DEFAULT_VARIANTS = ("forward", "reverse", "forward-wide", "reverse-wide", "forward-end")
 VARIANTS = {name: ("reverse_cold",) if name.startswith("reverse") else () for name in DEFAULT_VARIANTS}
 ROLLING_VARIANTS = ("forward", "reverse", "reverse-roll", "reverse-refilter", "forward-refilter", "forward-end")
@@ -40,6 +40,17 @@ SAFE_VARIANTS = ("forward", "reverse", "reverse-window-ref", "reverse-safe-ref",
 VARIANTS.update({
     "reverse-safe-ref": ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_windowed", "refilter_safe"),
     "reverse-refill-ref": ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_windowed", "refilter_safe", "refilter_refill"),
+})
+
+
+ECONOMY_VARIANTS = ("forward", "reverse", "reverse-out", "reverse-compact-safe",
+                    "reverse-first", "reverse-first-safe", "reverse-end", "forward-end")
+VARIANTS.update({
+    "reverse-out": ("reverse_cold", "compact_out_of_place"),
+    "reverse-compact-safe": ("reverse_cold", "compact_out_of_place", "rolling_threshold", "rolling_windowed", "rolling_compact", "window_refilter", "refilter_safe"),
+    "reverse-first": ("reverse_cold", "compact_out_of_place", "rolling_threshold", "rolling_windowed", "rolling_compact", "rolling_first_window"),
+    "reverse-first-safe": ("reverse_cold", "compact_out_of_place", "rolling_threshold", "rolling_windowed", "rolling_compact", "rolling_first_window", "window_refilter", "refilter_safe"),
+    "reverse-end": ("reverse_cold",),
 })
 
 

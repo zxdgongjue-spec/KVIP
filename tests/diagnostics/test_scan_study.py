@@ -7,10 +7,10 @@ import numpy as np
 import pytest
 
 from kvip.diagnostics import replay, replay_measure, scan_report, scan_options
-from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, budgets_for, options_for, validate_options
+from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, budgets_for, options_for, validate_options
 
 
-@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS])
+@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS])
 def test_scan_study_reuses_one_arena_and_delivers_independent_options(monkeypatch, variants):
     args = SimpleNamespace(study="scan-order", mode="fused", transport="urma",
                            threshold_policy="recent", scan_variants=list(variants))
@@ -34,7 +34,7 @@ def test_scan_study_reuses_one_arena_and_delivers_independent_options(monkeypatc
     assert calls == [(name, options_for(name), budgets_for(name)) for name in variants]
 
 
-@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS])
+@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS])
 def test_actual_command_line_accepts_scan_variants(tmp_path, variants):
     args = replay.arguments([
         "--snapshot", str(tmp_path / "input"), "--build-dir", str(tmp_path / "build"),
@@ -69,9 +69,9 @@ def test_report_uses_full_chain_and_keeps_mean_and_median_separate(tmp_path, cap
 
 def test_rolling_experiment_does_not_change_budgets_or_enable_pipeline_options():
     assert {budgets_for(name) for name in ROLLING_VARIANTS} == {(512, 64)}
-    assert options_for("reverse-refilter") == dict(reverse_cold=True, rolling_threshold=True, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False)
+    assert options_for("reverse-refilter") == dict(reverse_cold=True, rolling_threshold=True, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False, compact_out_of_place=False)
     with pytest.raises(ValueError, match="requires rolling"):
-        validate_options(dict(reverse_cold=True, rolling_threshold=False, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False))
+        validate_options(dict(reverse_cold=True, rolling_threshold=False, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False, compact_out_of_place=False))
 
 
 def test_rolling_reference_uses_unique_seed_and_only_scanned_causal_positions():
@@ -309,3 +309,39 @@ def test_safe_refill_controls_keep_budget_and_do_not_enable_other_experiments(tm
     assert "GATE reverse-refill-ref KEEP_BASELINE" in output
     with pytest.raises(ValueError, match="controls were not measured"):
         scan_report.load_report(path, require_lean=True)
+
+
+def test_economy_report_uses_original_baseline_and_separates_increment(tmp_path, capsys):
+    assert {budgets_for(n) for n in ECONOMY_VARIANTS} == {(512, 64)}
+    assert not any(options_for("forward").values())
+    assert options_for("reverse-end") == options_for("reverse")
+    assert options_for("reverse-out")["compact_out_of_place"]
+    assert not options_for("reverse-out")["rolling_threshold"]
+    for n in ECONOMY_VARIANTS:
+        assert not options_for(n)["refilter_refill"]
+        validate_options(options_for(n))
+    assert not options_for("reverse-first")["window_refilter"]
+    assert options_for("reverse-first-safe")["refilter_safe"]
+    data = rolling_report(tmp_path)
+    template = data["cases"]["forward"]
+    data["execution_order"] = list(ECONOMY_VARIANTS)
+    data["cases"] = {n: json.loads(json.dumps(template)) for n in ECONOMY_VARIANTS}
+    for case in data["cases"].values():
+        case["reads_samples"][0].update(prefetch=50, unused_prefetch=10)
+    data["cases"]["forward-end"]["timing"].update(mean_us=99, p50_us=89)
+    data["cases"]["reverse"]["timing"].update(mean_us=90, p50_us=80)
+    data["cases"]["reverse-end"]["timing"].update(mean_us=91, p50_us=81)
+    data["cases"]["reverse-out"]["timing"].update(mean_us=80, p50_us=79.9)
+    path = tmp_path / "result.json"
+    path.write_text(json.dumps(data))
+    scan_report.report(path, require_economy=True, expected_native="1"*40)
+    output = capsys.readouterr().out
+    assert "BASELINE unchanged_forward" in output
+    # Mean improves beyond both controls; median does not beat reverse drift.
+    assert "GATE reverse-out KEEP_BASELINE vs_original_mean/p50=+19.19/+10.22% vs_reverse_mean/p50=+11.11/+0.12%" in output
+    assert "GATE reverse CANDIDATE" in output
+    assert "useful_pre_delta=+0.0 repair_delta_KiB=+0.00" in output
+    data["cases"]["reverse-first"]["rolling_threshold_check"]["status"] = "failed"
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="oracle has not passed"):
+        scan_report.report(path, require_economy=True)

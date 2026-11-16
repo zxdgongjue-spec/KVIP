@@ -6,15 +6,15 @@ import json
 from pathlib import Path
 from statistics import mean
 
-from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, options_for
+from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, options_for
 
 
-def load_report(path, *, require_rolling=False, require_batched=False, require_windowed=False, require_lean=False, require_safe=False, expected_native=None, snapshot=None):
+def load_report(path, *, require_rolling=False, require_batched=False, require_windowed=False, require_lean=False, require_safe=False, require_economy=False, expected_native=None, snapshot=None):
     data = json.loads(path.read_text())
     order = tuple(data.get("execution_order", ()))
-    if data.get("status") != "pass" or order not in (DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS):
+    if data.get("status") != "pass" or order not in (DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS):
         raise ValueError("Missing or incomplete controlled scan experiment")
-    if require_rolling and order not in (ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS):
+    if require_rolling and order not in (ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS):
         raise ValueError("Old scan/budget experiment: rolling/refilter cases were not measured")
     if require_batched and order != BATCHED_VARIANTS:
         raise ValueError("Batched histogram variants were not measured")
@@ -24,6 +24,8 @@ def load_report(path, *, require_rolling=False, require_batched=False, require_w
         raise ValueError("Compact and first-window controls were not measured")
     if require_safe and order != SAFE_VARIANTS:
         raise ValueError("Safe/refill controls were not measured")
+    if require_economy and order != ECONOMY_VARIANTS:
+        raise ValueError("Economy controls were not measured")
     digest = None if snapshot is None else hashlib.sha256((snapshot / "manifest.json").read_bytes()).hexdigest()
     for name in order:
         case = data["cases"][name]
@@ -31,7 +33,7 @@ def load_report(path, *, require_rolling=False, require_batched=False, require_w
             raise ValueError(f"{name}: native revision does not match {expected_native}")
         if digest and case.get("snapshot_sha256") != digest:
             raise ValueError(f"{name}: snapshot manifest does not match")
-        if (require_rolling or require_batched or require_windowed or require_lean or require_safe) and options_for(name)["rolling_threshold"]:
+        if (require_rolling or require_batched or require_windowed or require_lean or require_safe or require_economy) and options_for(name)["rolling_threshold"]:
             if case.get("rolling_threshold_check", {}).get("status") != "bit_exact":
                 raise ValueError(f"{name}: rolling threshold oracle has not passed")
     return data
@@ -53,8 +55,8 @@ def reduction(before, after):
     return f"{100 * (1 - after / before):+.2f}%" if before else "n/a"
 
 
-def report(path, *, require_rolling=False, require_batched=False, require_windowed=False, require_lean=False, require_safe=False, expected_native=None, snapshot=None, check_only=False):
-    data = load_report(path, require_rolling=require_rolling, require_batched=require_batched, require_windowed=require_windowed, require_lean=require_lean, require_safe=require_safe, expected_native=expected_native, snapshot=snapshot)
+def report(path, *, require_rolling=False, require_batched=False, require_windowed=False, require_lean=False, require_safe=False, require_economy=False, expected_native=None, snapshot=None, check_only=False):
+    data = load_report(path, require_rolling=require_rolling, require_batched=require_batched, require_windowed=require_windowed, require_lean=require_lean, require_safe=require_safe, require_economy=require_economy, expected_native=expected_native, snapshot=snapshot)
     if check_only:
         return
     order = data["execution_order"]
@@ -63,6 +65,10 @@ def report(path, *, require_rolling=False, require_batched=False, require_window
     readers = sorted({case.get("diagnostics_commit", "unknown") for case in cases.values()})
     print(f"SOURCE native={','.join(natives)} reader={','.join(readers)}")
     print(f"RESULT_FILE={path}")
+    if tuple(order) == ECONOMY_VARIANTS:
+        from kvip.diagnostics.scan_economy_report import report as economy_report
+        economy_report(cases, order)
+        return
     transfers = {name: traffic(cases[name]) for name in order}
     baseline = cases["forward"]["timing"]
     print("variant            mean_us   p50_us  mean_gain%  waste_MiB repair_MiB total_MiB useful_GB/s")
@@ -196,12 +202,13 @@ def main():
     parser.add_argument("--require-windowed", action="store_true")
     parser.add_argument("--require-lean", action="store_true")
     parser.add_argument("--require-safe", action="store_true")
+    parser.add_argument("--require-economy", action="store_true")
     parser.add_argument("--expected-native")
     parser.add_argument("--snapshot", type=Path)
     parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args()
     try:
-        report(args.result, require_rolling=args.require_rolling, require_batched=args.require_batched, require_windowed=args.require_windowed, require_lean=args.require_lean, require_safe=args.require_safe, expected_native=args.expected_native,
+        report(args.result, require_rolling=args.require_rolling, require_batched=args.require_batched, require_windowed=args.require_windowed, require_lean=args.require_lean, require_safe=args.require_safe, require_economy=args.require_economy, expected_native=args.expected_native,
                snapshot=args.snapshot, check_only=args.check_only)
     except (OSError, ValueError, KeyError) as error:
         parser.exit(1, f"REPORT_REJECTED: {error}\n")

@@ -186,6 +186,8 @@ def create_fused(
         )
         if sequence_split:
             raise ValueError("This snapshot uses sequence-split LI; reverse scan is not implemented for that schedule")
+        if build_options.get("compact_out_of_place") and (b > 16 or 2 * b > aics or g["heads"] != 32):
+            raise ValueError("Disjoint compact scratch requires H32 split-Q B1..16")
         if build_options.get("rolling_threshold"):
             import numpy as np
 
