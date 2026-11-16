@@ -64,7 +64,8 @@ the final Kth. Unready score rows are never read.
 
 ## Scope and validation
 
-Persistent rolling state currently supports the non-sequence-split schedule.
+Persistent rolling state currently supports B1..16 with split-Q and the
+non-sequence-split schedule, retaining its existing 16K scratch bank.
 The native launcher rejects sequence splitting when rolling is enabled. The
 replay also requires all queries to use PR15's exact resident+recent seed fast
 path; it must not label a silent fallback as an optimization result.

@@ -22,7 +22,9 @@ extern "C" uint32_t v9_li(void* bindings, void* stream, const rotating::RuntimeS
 #if KVIP_ROLLING_THRESHOLD
     // The persistent histogram belongs to one Q producer. Do not silently
     // use an unseeded state when a different kernel owns each sequence shard.
-    if (!shape || rotating::UseSequenceSplit(*shape)) return 100000;
+    // The refilter's per-row threshold snapshot uses the existing Q2/16K
+    // scratch layout. Larger non-split-Q batches have a smaller scratch bank.
+    if (!shape || !shape->splitQ || shape->batch > 16 || rotating::UseSequenceSplit(*shape)) return 100000;
 #endif
 #define LI_LAUNCH_0 aclrtlaunch_v9_li_kernel
 #define LI_LAUNCH_1 aclrtlaunch_v9_li_kernel_1
