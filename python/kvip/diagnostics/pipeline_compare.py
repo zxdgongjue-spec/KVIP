@@ -18,7 +18,7 @@ import sys
 from kvip.diagnostics.archive import file_digest, source_commit
 from kvip.diagnostics.compare import read_means, reduction, timing_spread
 from kvip.diagnostics.pipeline_options import (
-    DEFAULT_VARIANTS, OPTIONS, OPTIONAL_OPTIONS, VARIANTS,
+    DEFAULT_VARIANTS, OPTIONS, OPTIONAL_OPTIONS, NUMERIC_OPTIONS, VARIANTS,
     admission_for, options_for, q_workers_for,
 )
 from kvip.diagnostics.upstream import validate_checkout
@@ -280,7 +280,11 @@ def summarize(args, results, manifest_digest):
             admission = admission_for(variant)
             if tuning.get("admission_controls") != (list(admission) if admission else None):
                 raise ValueError(f"{name}: candidate admission controls differ")
-            excluded = (*OPTIONS, *OPTIONAL_OPTIONS, "q_workers", "admission_controls")
+            rank = expected_options.get("prefetch_rank", 0)
+            gate = result["threshold_comparison"].get("prefetch_gate", {})
+            if rank and (gate.get("status") != "bit_exact" or gate.get("rank") != rank):
+                raise ValueError(f"{name}: speculative rank gate was not verified")
+            excluded = (*OPTIONS, *OPTIONAL_OPTIONS, *NUMERIC_OPTIONS, "q_workers", "admission_controls")
             if {key: value for key, value in tuning.items() if key not in excluded} != {
                 key: value for key, value in pr.get("tuning", {}).items() if key != "q_workers"
             }:
@@ -374,6 +378,21 @@ def summarize(args, results, manifest_digest):
                     baseline_row[metric + "_us"], candidate_row[metric + "_us"]
                 ) for metric in ("mean", "p50")},
             )
+    rank_pairs = {}
+    for experiment, baseline in (("rank2048", "ready-batch4"),
+                                 ("rank1792", "rank2048"),
+                                 ("rank1536", "rank2048"),
+                                 ("capacity-rank2048", "capacity"),
+                                 ("capacity-rank1792", "capacity-rank2048")):
+        candidate_row = table.get("candidate-" + experiment)
+        baseline_row = table.get("candidate-" + baseline)
+        if candidate_row is not None and baseline_row is not None:
+            rank_pairs[experiment] = dict(
+                reference=baseline,
+                **{metric + "_reduction_pct": reduction(
+                    baseline_row[metric + "_us"], candidate_row[metric + "_us"]
+                ) for metric in ("mean", "p50")},
+            )
     return dict(
         schema_version=1,
         status="pass",
@@ -390,6 +409,7 @@ def summarize(args, results, manifest_digest):
         control_name=control_name if control is not None else None,
         control_end_drift=drift,
         inverse_mapping_pairs=mapping_pairs,
+        prefetch_rank_pairs=rank_pairs,
         metadata_end_vs_control_end=end_pair,
         diagnostic_replays_per_fused_case=args.diagnostic_replays,
         serial_configuration=dict(workers=32, post_size=128, max_inflight=2048, jettys_per_core=2),
@@ -423,6 +443,13 @@ def print_summary(summary, brief=False):
                   f"{gains['mean_reduction_pct']:+7.2f}/{gains['p50_reduction_pct']:+7.2f} {comparison:>19}", flush=True)
             if row.get("capacity_skipped_row_windows") is not None:
                 print(f"  SKIPPED_ROW_WINDOWS={row['capacity_skipped_row_windows']:.1f} suppression_counts=scanned_only", flush=True)
+            gate = (row.get("threshold_comparison") or {}).get("prefetch_gate")
+            if gate:
+                prefetch = reads["prefetch"]
+                waste = f"{100 * reads['unused_prefetch'] / prefetch:.2f}%" if prefetch else "n/a"
+                print(f"  GATE rank={gate['rank']} verified=bit_exact "
+                      f"above_final={gate['above_final_queries']}/{gate['queries']} "
+                      f"mean_raise_steps={gate['mean_raise_key_steps']:.3f} waste_of_prefetch={waste}", flush=True)
             if name.startswith("candidate-") and row.get("diagnostic_summary"):
                 metrics = row["diagnostic_summary"]["metrics"]
                 fields = []
@@ -439,6 +466,9 @@ def print_summary(summary, brief=False):
                         for q in sample["queries"]), flush=True)
         for name, pair in summary.get("inverse_mapping_pairs", {}).items():
             print(f"PAIR {name}_vs_{pair['reference']} mean={pair['mean_reduction_pct']:+.2f}% "
+                  f"p50={pair['p50_reduction_pct']:+.2f}% same_arena_no_drift_correction", flush=True)
+        for name, pair in summary.get("prefetch_rank_pairs", {}).items():
+            print(f"RANK_PAIR {name}_vs_{pair['reference']} mean={pair['mean_reduction_pct']:+.2f}% "
                   f"p50={pair['p50_reduction_pct']:+.2f}% same_arena_no_drift_correction", flush=True)
         drift = summary["control_end_drift"]
         if drift:

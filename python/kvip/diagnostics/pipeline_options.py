@@ -3,6 +3,7 @@
 OPTIONS = ("final_topk_prune", "selected_metadata", "early_fetch_ready", "compact_init", "ready_batch_fetch")
 OPTIONAL_OPTIONS = ("ready_direct_ranges", "adaptive_admission", "prefetch_gate",
                     "skip_exhausted_prefetch", "early_prefetch_drain", "inverse_mapping")
+NUMERIC_OPTIONS = ("prefetch_rank",)
 DEFAULT_VARIANTS = ("control", "metadata", "ready-batch", "workers4", "ready-batch4", "metadata-end", "control-end")
 VARIANTS = {
     "control": (),
@@ -32,6 +33,13 @@ VARIANTS = {
     "capacity-inverse-map": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "inverse_mapping"),
 }
 
+# The exact selection remains Top2048. These ranks only admit speculative
+# cold transfers, with an explicit K2048 control for the enabled gate build.
+RANKS = {"rank2048": 2048, "rank1792": 1792, "rank1536": 1536,
+         "capacity-rank2048": 2048, "capacity-rank1792": 1792}
+for _name in RANKS:
+    VARIANTS[_name] = ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "prefetch_gate")
+
 # Fixed policies are controlled experiments, not a claim that one is best for
 # every layer. Only prefetch admission changes; exact selection remains intact.
 ADMISSION = {
@@ -44,6 +52,8 @@ ADMISSION = {
     "capacity-skip-drain": (768, 128, 0, 1),
     "capacity-inverse-map": (768, 128, 0, 1),
 }
+for _name in RANKS:
+    ADMISSION[_name] = (768, 128, 0, 1) if _name.startswith("capacity-") else (512, 64, 0, 0)
 
 
 def admission_for(name):
@@ -57,6 +67,8 @@ def options_for(name):
         values["adaptive_admission"] = True
         if ADMISSION[name][2]:
             values["prefetch_gate"] = True
+    if name in RANKS:
+        values["prefetch_rank"] = RANKS[name]
     return values
 
 
@@ -69,10 +81,14 @@ def q_workers_for(name):
 
 
 def validate_options(options):
-    if not isinstance(options, dict) or not set(OPTIONS) <= set(options) <= set(OPTIONS + OPTIONAL_OPTIONS):
+    if not isinstance(options, dict) or not set(OPTIONS) <= set(options) <= set(OPTIONS + OPTIONAL_OPTIONS + NUMERIC_OPTIONS):
         raise ValueError("Pipeline variants require the five base options and known optional options")
-    if any(type(value) is not bool for value in options.values()):
+    if any(type(value) is not bool for key, value in options.items() if key not in NUMERIC_OPTIONS):
         raise ValueError("Pipeline options must be bool")
+    if "prefetch_rank" in options:
+        rank = options["prefetch_rank"]
+        if type(rank) is not int or not 1 <= rank <= 2048 or not options.get("prefetch_gate"):
+            raise ValueError("prefetch_rank requires an integer in 1..2048 and prefetch_gate")
     if options["ready_batch_fetch"] and not (options["selected_metadata"] and options["early_fetch_ready"]):
         raise ValueError("ready_batch_fetch requires selected_metadata and early_fetch_ready")
     if options.get("ready_direct_ranges") and not options["ready_batch_fetch"]:

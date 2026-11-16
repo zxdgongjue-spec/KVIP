@@ -99,6 +99,12 @@ def _case(args, name):
             if admission is not None:
                 result["tuning"]["admission_controls"] = list(admission)
         result["tuning"]["q_workers"] = q_workers_for(name.split("-", 1)[1]) if role == "candidate" or name.startswith("before-") else 2
+        rank = result["tuning"].get("prefetch_rank", 0)
+        if rank:
+            result["threshold_comparison"]["prefetch_gate"] = dict(
+                status="bit_exact", rank=rank, keys=[[3]], queries=1,
+                above_final_queries=0, mean_raise_key_steps=1,
+            )
         result["native_diagnostics"] = dict(
             count=args.diagnostic_replays,
             included_in_timing=False,
@@ -157,6 +163,51 @@ def test_inverse_mapping_pairs_use_matching_same_arena_controls(tmp_path, monkey
     output = capsys.readouterr().out
     assert "PAIR inverse-map-skip_vs_saturated-skip mean=+10.00% p50=+10.00%" in output
     assert "no_drift_correction" in output
+
+
+def test_rank_gate_pairs_separate_feature_overhead_from_threshold_effect(tmp_path, monkeypatch, capsys):
+    variants = ["ready-batch4", "rank2048", "rank1792", "rank1536",
+                "capacity", "capacity-rank2048", "capacity-rank1792", "ready-batch4-end"]
+    args = _arguments(tmp_path, monkeypatch, variants)
+    reports = _reports(args)
+    for name, value in zip(variants, (100, 110, 99, 88, 90, 100, 80, 98)):
+        reports["candidate-" + name]["timing"].update(
+            mean_us=value, p50_us=value, min_us=value, max_us=value, samples_us=[value] * 3)
+    digest = compare.file_digest(args.snapshot / "manifest.json")
+    summary = compare.summarize(args, reports, digest)
+    pairs = summary["prefetch_rank_pairs"]
+    assert pairs["rank2048"]["mean_reduction_pct"] == pytest.approx(-10)
+    assert pairs["rank1792"]["mean_reduction_pct"] == pytest.approx(10)
+    assert pairs["rank1536"]["p50_reduction_pct"] == pytest.approx(20)
+    assert pairs["capacity-rank1792"]["reference"] == "capacity-rank2048"
+    assert summary["control_end_drift"]["p50"]["drift_pct"] == pytest.approx(-2)
+    compare.print_summary(summary, brief=True)
+    output = capsys.readouterr().out
+    assert "RANK_PAIR rank1792_vs_rank2048 mean=+10.00% p50=+10.00%" in output
+    assert "GATE rank=1792 verified=bit_exact" in output
+    assert "waste_of_prefetch=25.00%" in output
+    del reports["candidate-rank1792"]["threshold_comparison"]["prefetch_gate"]
+    with pytest.raises(ValueError, match="rank gate was not verified"):
+        compare.summarize(args, reports, digest)
+
+
+@pytest.mark.parametrize("name,rank,control", [
+    ("rank2048", 2048, (512, 64, 0, 0)),
+    ("rank1792", 1792, (512, 64, 0, 0)),
+    ("rank1536", 1536, (512, 64, 0, 0)),
+    ("capacity-rank1792", 1792, (768, 128, 0, 1)),
+])
+def test_rank_gate_options_preserve_protection_and_budget(name, rank, control):
+    options = validate_options(options_for(name))
+    assert options["prefetch_rank"] == rank
+    assert options["prefetch_gate"] and options["adaptive_admission"]
+    assert not options["final_topk_prune"]
+    assert admission_for(name) == control and q_workers_for(name) == 4
+    for bad in (True, 0, 2049, 1536.0):
+        with pytest.raises(ValueError, match="prefetch_rank"):
+            validate_options(options | {"prefetch_rank": bad})
+    with pytest.raises(ValueError, match="prefetch_rank"):
+        validate_options(options | {"prefetch_gate": False})
 
 
 def test_prefetch_scheduling_variants_preserve_budget_and_measure_separate_roles(tmp_path, monkeypatch, capsys):

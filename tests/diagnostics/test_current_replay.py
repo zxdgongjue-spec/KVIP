@@ -8,6 +8,7 @@ from kvip.diagnostics.compare import summarize
 from kvip.diagnostics.replay_runtime import create_runtime, runtime_worker_config
 from kvip.diagnostics.selection import verify_fused_scores
 from kvip.diagnostics.threshold_check import reference_thresholds
+from kvip.diagnostics import threshold_check
 
 
 def test_recent_threshold_excludes_future_deduplicates_prefix_and_covers_retired_page():
@@ -21,6 +22,49 @@ def test_recent_threshold_excludes_future_deduplicates_prefix_and_covers_retired
     assert np.all(hot == 0x8000) and np.all(recent == 0xBF80)
     overlap = reference_thresholds(scores, ends, 4096, np.array([[2000, 5100]], np.int32))
     np.testing.assert_array_equal(recent, overlap)
+
+
+def test_rank_threshold_is_distinct_from_safe_bound_and_respects_causal_seed(monkeypatch):
+    scores = np.tile(np.arange(8192, dtype=np.uint16) + 0x8000, (1, 4, 1))
+    ends = np.array([[5097, 5098, 5099, 5100]], np.int32)
+    bounds = np.array([[4960, 6200]], np.int32)
+    safe = reference_thresholds(scores, ends, 4096, bounds)
+    gate = reference_thresholds(scores, ends, 4096, bounds, rank=1792)
+    np.testing.assert_array_equal(gate.astype(np.int32) - safe, 256)
+    # Future scores are much larger but must not enter either threshold.
+    original = gate.copy()
+    scores[:, :, 6000:] = 0xFFFF
+    np.testing.assert_array_equal(reference_thresholds(scores, ends, 4096, bounds, rank=1792), original)
+    row_bytes = 4 * 2048 * 6 + 1024
+    raw = np.zeros((1, row_bytes), dtype=np.uint8)
+    banks = raw[:, 4 * 2048 * 6:].view(np.uint16).reshape(1, 4, 128)
+    banks[:, :, 0], banks[:, :, 1] = safe, gate
+    arguments = [None] * 14
+    arguments[13] = raw
+    bundle = SimpleNamespace(
+        rotating=SimpleNamespace(arguments=arguments),
+        tuning=dict(recent_threshold=True, prefetch_rank=1792),
+    )
+    arrays = {"post.score_keys": scores, "pre.query_ends": ends, "pre.threshold_bounds": bounds}
+    archive = SimpleNamespace(manifest={"geometry": {"batch": 1, "resident": 4096}}, array=arrays.__getitem__)
+    monkeypatch.setattr(threshold_check, "cpu_array", lambda torch, tensor: tensor)
+    report = threshold_check.verify_initial_threshold(None, bundle, archive)
+    assert report["status"] == "bit_exact"
+    assert report["prefetch_gate"]["rank"] == 1792
+    assert report["prefetch_gate"]["mean_raise_key_steps"] == 256
+    banks[0, 0, 1] += 1
+    with pytest.raises(AssertionError, match="speculative gate differs"):
+        threshold_check.verify_initial_threshold(None, bundle, archive)
+    banks[:, :, 1] = gate
+    banks[0, 0, 0] += 1
+    with pytest.raises(AssertionError, match="Early threshold differs"):
+        threshold_check.verify_initial_threshold(None, bundle, archive)
+
+
+@pytest.mark.parametrize("rank", [True, 0, 2049, 1.5])
+def test_reference_rejects_invalid_speculative_ranks(rank):
+    with pytest.raises(ValueError, match="rank"):
+        reference_thresholds(np.zeros((1, 4, 2048), np.uint16), np.full((1, 4), 2048), 2048, rank=rank)
 
 
 def _archive():

@@ -76,7 +76,7 @@ def _requests(archive):
         readable = addresses[owners[row]] != 0
         eligible = (np.isin(positions, lru) | (positions >= resident)) & readable & (slots < resident)
         selected = np.zeros(history, dtype=bool)
-        thresholds, final_keys, resident_keys = [], [], []
+        thresholds, final_keys, resident_keys, seed_keys = [], [], [], []
         for q in range(4):
             end = int(ends[row, q])
             keys = scores[row, q, :end]
@@ -100,6 +100,7 @@ def _requests(archive):
             if not hot <= tau <= final:
                 raise ValueError("Resident/recent threshold is not a valid lower bound")
             thresholds.append(tau)
+            seed_keys.append(keys[seed])
             resident_keys.append(hot)
             final_keys.append(final)
             selected[physical] = True
@@ -113,17 +114,17 @@ def _requests(archive):
                              resident=resident,
                              selected=selected, needed=needed, cold=cold, candidate_hot=candidate_hot,
                              tau=np.asarray(thresholds), final=np.asarray(final_keys),
-                             resident_tau=np.asarray(resident_keys)))
+                             resident_tau=np.asarray(resident_keys), seed_keys=seed_keys))
     return requests, demand.classify(output), array_digest(output)
 
 
-def _gate(request, boost):
+def _gate(request, boost=0, limits=None):
     gate = np.zeros(request["eligible"].shape, dtype=bool)
     for q, end in enumerate(request["ends"]):
         # Ordered BF16 key steps, not a relative score percentage. A boost is
         # allowed only for speculative admission, never final TopK pruning.
         lower = int(request["tau"][q])
-        limit = min(65535, lower + boost)
+        limit = min(65535, lower + boost) if limits is None else int(limits[q])
         prefix = min(request["resident"], int(end))
         # Resident victim protection must use the exact, unboosted lower bound.
         gate[:prefix] |= request["scores"][q, :prefix].astype(np.int32) > lower
@@ -149,7 +150,13 @@ def admit(gate, available, total, window, carry, weights, order=None):
     return fetched
 
 
-def survey(archive, profiles, phase_weights=None):
+def survey(archive, profiles, phase_weights=None, gate_ranks=None, gate_profile="baseline"):
+    ranks = [] if gate_ranks is None else list(gate_ranks)
+    if any(isinstance(rank, bool) or not isinstance(rank, (int, np.integer))
+           or not 1 <= rank <= TOPK for rank in ranks) or len(set(ranks)) != len(ranks):
+        raise ValueError("Gate ranks must be distinct integers between 1 and 2048")
+    if gate_profile not in ("baseline", "total768"):
+        raise ValueError("Gate profile must be baseline or total768")
     requests, demand, selection_hash = _requests(archive)
     g = archive.manifest["geometry"]
     windows, resident, width = (g[name] for name in ("rounds", "resident", "token_bytes"))
@@ -158,14 +165,24 @@ def survey(archive, profiles, phase_weights=None):
     weights = np.ones(windows) if phase_weights is None else np.asarray(phase_weights, dtype=float)
     if weights.shape != (windows,) or not np.isfinite(weights).all() or np.any(weights < 0):
         raise ValueError("Phase weights must contain one finite nonnegative value per window")
-    result = []
-    for name in profiles:
-        boost, total, window, carry = PROFILES[name]
+    result, rank_result = [], []
+    policies = [(name, *PROFILES[name], None) for name in profiles]
+    policies += [(f"rank{rank}", *PROFILES[gate_profile], rank) for rank in ranks]
+    for name, boost, total, window, carry, rank in policies:
+        raises = []
         counts = dict(eligible_candidates=0, useful_prefetch=0, unused_prefetch=0, final_missing=0,
                       cold_prefetch=0, candidate_hot_prefetch=0, selected_suppressed_by_boost=0,
-                      selected_excluded_by_gate=0, boosted_above_final_queries=0)
+                      selected_excluded_by_gate=0, boosted_above_final_queries=0,
+                      selected_suppressed_by_gate=0, threshold_over_final_queries=0)
         for r in requests:
-            gate = _gate(r, boost)
+            # The rank is selected by the caller, never by final TopK or future
+            # scores. Reuse exactly the current resident+recent seed; K2048 is
+            # still the safe threshold for victim protection and exact TopK.
+            limits = (np.asarray([int(np.partition(keys, len(keys) - rank)[-rank])
+                                  for keys in r["seed_keys"]]) if rank is not None
+                      else np.minimum(65535, r["tau"] + boost))
+            raises.extend((limits - r["tau"]).tolist())
+            gate = _gate(r, limits=limits)
             base = _gate(r, 0)
             positions = np.arange(len(gate))
             # Match Trigger(): epoch 0 covers resident only, followed by the
@@ -176,16 +193,25 @@ def survey(archive, profiles, phase_weights=None):
             useful = fetched & r["needed"]
             values = (gate.sum(), useful.sum(), (fetched & ~r["selected"]).sum(),
                       (r["needed"] & ~fetched).sum(), (fetched & r["cold"]).sum(),
-                      (fetched & r["candidate_hot"]).sum(), (base & ~gate & r["needed"]).sum(),
-                      (r["needed"] & ~gate).sum(), np.count_nonzero(r["tau"] + boost > r["final"]))
+                      (fetched & r["candidate_hot"]).sum(),
+                      (base & ~gate & r["needed"]).sum() if rank is None else 0,
+                      (r["needed"] & ~gate).sum(),
+                      np.count_nonzero(limits > r["final"]) if rank is None else 0,
+                      (base & ~gate & r["needed"]).sum(), np.count_nonzero(limits > r["final"]))
             for key, value in zip(counts, values):
                 counts[key] += int(value)
         prefetched = counts["useful_prefetch"] + counts["unused_prefetch"]
         assert counts["useful_prefetch"] + counts["final_missing"] == demand["selected_read_demand"]
-        result.append(dict(name=name, key_boost=boost, total_per_request=total, window_per_request=window,
-                           carry_unused_credits=carry, **counts, prefetch_bytes=prefetched * width,
-                           unused_bytes=counts["unused_prefetch"] * width,
-                           final_bytes=counts["final_missing"] * width))
+        row = dict(name=name, key_boost=boost, total_per_request=total, window_per_request=window,
+                   carry_unused_credits=carry, **counts, admitted=prefetched,
+                   final_estimate=counts["final_missing"], prefetch_bytes=prefetched * width,
+                   unused_bytes=counts["unused_prefetch"] * width,
+                   final_bytes=counts["final_missing"] * width)
+        if rank is None:
+            result.append(row)
+        else:
+            rank_result.append(dict(row, gate_rank=int(rank), safe_rank=TOPK,
+                                    gate_profile=gate_profile, mean_raise_steps=float(np.mean(raises))))
     tau = np.concatenate([r["tau"] for r in requests])
     final = np.concatenate([r["final"] for r in requests])
     hot = np.concatenate([r["resident_tau"] for r in requests])
@@ -196,6 +222,7 @@ def survey(archive, profiles, phase_weights=None):
                                     recent_gap_mean_steps=float(np.mean(final - tau)),
                                     recent_gap_p95_steps=float(np.quantile(final - tau, .95))),
                 selection_sha256=selection_hash, phase_weights=weights.tolist(), profiles=result,
+                gate_profiles=rank_result,
                 scope=("CPU counterfactual, frozen cache, exact captured TopK IDs. "
                        "No NPU time or transport performance."),
                 ordering=("Equal tile-progress windows using Trigger boundaries; epoch 0 covers resident LRU order; "
@@ -204,7 +231,9 @@ def survey(archive, profiles, phase_weights=None):
                           "go to final repair, never revisited. Not actual producer timing/admission order."),
                 threshold=("Resident+recent exact current-score Kth; ordered-key boosts affect cold speculative "
                            "strict-> admission only. Resident victim protection uses the unboosted threshold. "
-                           "Full TopK is unchanged; ties use captured IDs, never recomputed tie choices."),
+                           "Gate-rank variants use only that same initial seed, the declared fixed quota profile, and never "
+                           "choose their rank from final TopK. Full TopK is unchanged; ties use captured IDs, "
+                           "never recomputed tie choices."),
                 limitation=("No closed-loop cache evolution, credit timing, URMA throughput, "
                             "or 100-round boost simulation from CSV summaries."))
 
@@ -212,14 +241,19 @@ def survey(archive, profiles, phase_weights=None):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--snapshot", type=Path, required=True)
-    p.add_argument("--profiles", nargs="+", choices=PROFILES, default=list(PROFILES))
+    p.add_argument("--profiles", nargs="+", choices=PROFILES)
+    p.add_argument("--gate-ranks", nargs="+", type=int,
+                   help="Independent cold admission ranks from the resident+recent seed; safe K remains 2048")
+    p.add_argument("--gate-profile", choices=("baseline", "total768"), default="baseline",
+                   help="Unchanged quota policy shared by all gate-rank variants")
     p.add_argument("--phase-weights", nargs="+", type=float)
     p.add_argument("--output", type=Path)
     args = p.parse_args(argv)
     archive = None
     try:
         archive = load_snapshot(args.snapshot)
-        report = survey(archive, args.profiles, args.phase_weights)
+        profiles = args.profiles if args.profiles is not None else ([] if args.gate_ranks else list(PROFILES))
+        report = survey(archive, profiles, args.phase_weights, args.gate_ranks, args.gate_profile)
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
@@ -227,10 +261,20 @@ def main(argv=None):
         d = report["demand"]
         print(f"DEMAND cold={d['cold_demand']} candidate_hot={d['candidate_hot_refetch']} "
               f"miss={100*d['cold_miss_rate']:.4f}%")
+        thresholds = report["threshold_keys"]
+        print(f"THRESHOLD recent_equal={thresholds['exact_final_queries']}/{thresholds['queries']} "
+              f"mean_gap_steps={thresholds['recent_gap_mean_steps']:.3f} "
+              f"p95_gap_steps={thresholds['recent_gap_p95_steps']:.3f}")
         for row in report["profiles"]:
             print(f"{row['name']:<12} eligible={row['eligible_candidates']} useful={row['useful_prefetch']} "
                   f"unused={row['unused_prefetch']} final={row['final_missing']} "
                   f"boost_suppressed={row['selected_suppressed_by_boost']}")
+        for row in report["gate_profiles"]:
+            print(f"RANK_GATE rank={row['gate_rank']} safe_rank={row['safe_rank']} quota={row['gate_profile']} "
+                  f"admitted={row['admitted']} useful={row['useful_prefetch']} "
+                  f"unused={row['unused_prefetch']} final_estimate={row['final_estimate']} "
+                  f"mean_raise_steps={row['mean_raise_steps']:.3f} "
+                  f"threshold_over_final_queries={row['threshold_over_final_queries']}")
     except (ValueError, KeyError, OSError) as error:
         p.exit(2, f"ADMISSION_CPU_FAILED: {error}\n")
     finally:

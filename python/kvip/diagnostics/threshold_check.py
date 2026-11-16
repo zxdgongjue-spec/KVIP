@@ -8,7 +8,9 @@ from kvip.diagnostics.recent_threshold import recent_positions
 from kvip.diagnostics.score_trace import sortable_to_bf16
 
 
-def reference_thresholds(scores, query_ends, resident, bounds=None):
+def reference_thresholds(scores, query_ends, resident, bounds=None, *, rank=2048):
+    if type(rank) is not int or not 1 <= rank <= 2048:
+        raise ValueError("Threshold rank must be an integer in 1..2048")
     scores, ends = np.asarray(scores), np.asarray(query_ends).reshape(scores.shape[:2])
     if scores.dtype != np.uint16 or scores.ndim != 3 or scores.shape[1] != 4:
         raise ValueError("Expected sortable BF16 [B,4,H] scores")
@@ -25,8 +27,8 @@ def reference_thresholds(scores, query_ends, resident, bounds=None):
         if not 0 <= end <= scores.shape[2]:
             raise ValueError("Invalid query causal end")
         positions = np.arange(min(resident, end)) if bounds is None else recent_positions(resident, bounds[b], end)
-        if len(positions) >= 2048:
-            result[b, q] = np.partition(scores[b, q, positions], len(positions) - 2048)[-2048]
+        if len(positions) >= rank:
+            result[b, q] = np.partition(scores[b, q, positions], len(positions) - rank)[-rank]
     return result
 
 
@@ -53,7 +55,7 @@ def verify_initial_threshold(torch, bundle, archive):
         return (sortable_to_bf16(keys).astype(np.uint32) << 16).view(np.float32)
 
     early_value, final_value = floats(expected), floats(final)
-    return dict(
+    report = dict(
         status="bit_exact",
         policy="recent" if bounds is not None else "resident",
         initial_keys=actual.tolist(),
@@ -62,3 +64,19 @@ def verify_initial_threshold(torch, bundle, archive):
         equal_fraction=float(np.mean(actual == final)),
         included_in_timing=False,
     )
+    rank = bundle.tuning.get("prefetch_rank", 0)
+    if rank:
+        gate = raw[:, 4 * 2048 * 6 :].copy().view(np.uint16).reshape(b, 4, 128)[:, :, 1]
+        expected_gate = reference_thresholds(scores, ends, resident, bounds, rank=rank)
+        if not np.array_equal(gate, expected_gate):
+            raise AssertionError(f"Native speculative gate differs from seed rank {rank}")
+        if np.any(gate < actual):
+            raise AssertionError("Speculative rank gate fell below the safe K2048 threshold")
+        report["prefetch_gate"] = dict(
+            status="bit_exact", rank=rank, keys=gate.tolist(), queries=int(gate.size),
+            above_final_queries=int(np.count_nonzero(gate > final)),
+            equal_final_queries=int(np.count_nonzero(gate == final)),
+            mean_raise_key_steps=float(np.mean(gate.astype(np.int32) - actual.astype(np.int32))),
+            included_in_timing=False,
+        )
+    return report

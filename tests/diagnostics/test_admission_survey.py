@@ -136,3 +136,74 @@ def test_cli_reads_materialized_schema_and_writes_only_cpu_counts(snapshot, tmp_
     assert [row["name"] for row in report["profiles"]] == ["baseline", "boost2"]
     assert "ADMISSION_CPU_PASS" in capsys.readouterr().out
     assert "NPU time" in report["scope"]
+
+
+def test_rank2048_matches_the_unboosted_gate_without_changing_quotas(snapshot):
+    report = survey(snapshot, ["baseline"], gate_ranks=[2048, 1792, 1536])
+    original = report["profiles"][0]
+    ranks = report["gate_profiles"]
+    assert [row["gate_rank"] for row in ranks] == [2048, 1792, 1536]
+    for name, value in original.items():
+        if name != "name":
+            assert ranks[0][name] == value
+    for row in ranks:
+        assert row["safe_rank"] == 2048
+        assert row["gate_profile"] == "baseline"
+        assert (row["total_per_request"], row["window_per_request"], row["carry_unused_credits"]) == (512, 64, False)
+        assert row["admitted"] == row["useful_prefetch"] + row["unused_prefetch"]
+        assert row["useful_prefetch"] + row["final_estimate"] == report["demand"]["selected_read_demand"]
+    assert report["phase_weights"] == [1.0] * snapshot.manifest["geometry"]["rounds"]
+    assert ranks[0]["mean_raise_steps"] == 0.0
+
+
+def test_stricter_rank_keeps_resident_protection_and_repairs_selected_cold_ties(snapshot):
+    before = snapshot.array("post.logical_output").copy()
+    report = survey(snapshot, [], gate_ranks=[2048, 1536, 1])
+    zero, strict, top = report["gate_profiles"]
+    # Fixture's 2048th seed score is below the final threshold. Rank 1536
+    # reaches the final boundary: strict admission excludes tied cold tokens,
+    # but they remain exact demand and must appear in final repair.
+    assert zero["cold_prefetch"] > strict["cold_prefetch"]
+    assert strict["selected_suppressed_by_gate"] > 0
+    assert strict["final_estimate"] > zero["final_estimate"]
+    assert strict["candidate_hot_prefetch"] == zero["candidate_hot_prefetch"]
+    assert strict["threshold_over_final_queries"] == 0
+    assert strict["mean_raise_steps"] > 0
+    # Top-1 comes only from the early seed. It may exceed final Kth; do not
+    # clamp against future/full-history information or silently pick a rank.
+    assert top["threshold_over_final_queries"] == snapshot.manifest["geometry"]["batch"] * 4
+    np.testing.assert_array_equal(before, snapshot.array("post.logical_output"))
+
+
+@pytest.mark.parametrize("ranks", [[0], [2049], [-1], [True], [1536.5], [2048, 2048]])
+def test_invalid_gate_rank_fails_closed(snapshot, ranks):
+    with pytest.raises(ValueError, match="Gate ranks"):
+        survey(snapshot, [], gate_ranks=ranks)
+
+
+def test_rank_capacity_profile_matches_the_original_768_control(snapshot):
+    report = survey(snapshot, ["total768"], gate_ranks=[2048, 1536], gate_profile="total768")
+    control, = report["profiles"]
+    same, strict = report["gate_profiles"]
+    for name, value in control.items():
+        if name != "name":
+            assert same[name] == value
+    assert strict["gate_profile"] == "total768"
+    assert (strict["total_per_request"], strict["window_per_request"], strict["carry_unused_credits"]) == (768, 128, True)
+    with pytest.raises(ValueError, match="Gate profile"):
+        survey(snapshot, [], gate_ranks=[2048], gate_profile="boost1")
+
+
+def test_gate_rank_cli_only_prints_requested_counterfactuals(snapshot, tmp_path, capsys):
+    output = tmp_path / "rank-gates.json"
+    main(["--snapshot", str(snapshot.directory), "--gate-ranks", "2048", "1792", "1536",
+          "--output", str(output)])
+    report = json.loads(output.read_text())
+    assert report["profiles"] == []
+    assert len(report["gate_profiles"]) == 3
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 6
+    assert lines[2].startswith("THRESHOLD recent_equal=")
+    assert all("RANK_GATE" in row and "final_estimate=" in row and
+               "threshold_over_final_queries=" in row and "mean_raise_steps=" in row for row in lines[3:])
+    assert "npu_timing=false" in lines[0]
