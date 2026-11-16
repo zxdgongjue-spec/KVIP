@@ -2,7 +2,7 @@
 
 OPTIONS = ("final_topk_prune", "selected_metadata", "early_fetch_ready", "compact_init", "ready_batch_fetch")
 OPTIONAL_OPTIONS = ("ready_direct_ranges", "adaptive_admission", "prefetch_gate",
-                    "skip_exhausted_prefetch", "early_prefetch_drain", "inverse_mapping", "low_miss_skip", "auto_route")
+                    "skip_exhausted_prefetch", "early_prefetch_drain", "inverse_mapping", "low_miss_skip", "auto_route", "low_miss_tail")
 NUMERIC_OPTIONS = ("prefetch_rank",)
 DEFAULT_VARIANTS = ("control", "metadata", "ready-batch", "workers4", "ready-batch4", "metadata-end", "control-end")
 VARIANTS = {
@@ -37,6 +37,11 @@ VARIANTS = {
     "light-high-end": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "low_miss_skip"),
     "auto": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "low_miss_skip", "auto_route"),
     "auto-end": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "low_miss_skip", "auto_route"),
+    "light-low-tail": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "low_miss_skip", "low_miss_tail"),
+    "light-high-tail": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "low_miss_skip", "low_miss_tail"),
+    "light-high-tail-end": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "low_miss_skip", "low_miss_tail"),
+    "auto-tail": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "low_miss_skip", "auto_route", "low_miss_tail"),
+    "auto-tail-end": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "low_miss_skip", "auto_route", "low_miss_tail"),
 }
 
 # The exact selection remains Top2048. These ranks only admit speculative
@@ -63,6 +68,11 @@ ADMISSION = {
     "light-high-end": (512, 64, 0, 0),
     "auto": (512, 64, 0, 0),
     "auto-end": (512, 64, 0, 0),
+    "light-low-tail": (0, 64, 0, 0),
+    "light-high-tail": (512, 64, 0, 0),
+    "light-high-tail-end": (512, 64, 0, 0),
+    "auto-tail": (512, 64, 0, 0),
+    "auto-tail-end": (512, 64, 0, 0),
 }
 for _name in RANKS:
     ADMISSION[_name] = (768, 128, 0, 1) if _name.startswith("capacity-") else (512, 64, 0, 0)
@@ -112,7 +122,14 @@ def validate_options(options):
     if options.get("auto_route") and not all(options.get(key) for key in (
             "low_miss_skip", "adaptive_admission", "ready_batch_fetch", "early_fetch_ready")):
         raise ValueError("auto_route requires low_miss_skip, adaptive_admission, ready_batch_fetch and early_fetch_ready")
+    if options.get("low_miss_tail") and not all(options.get(key) for key in (
+            "low_miss_skip", "selected_metadata", "ready_batch_fetch", "early_fetch_ready")):
+        raise ValueError("low_miss_tail requires low_miss_skip, selected_metadata, ready_batch_fetch and early_fetch_ready")
     return dict(options)
+
+
+def is_auto_variant(name):
+    return "auto_route" in VARIANTS[name]
 
 
 def early_threshold_skipped(tuning):

@@ -9,7 +9,7 @@ import traceback
 
 from kvip.diagnostics.archive import load_snapshot
 from kvip.diagnostics.console import NativeLog, emit, flush_output, print_replay_failure
-from kvip.diagnostics.pipeline_options import DEFAULT_VARIANTS, VARIANTS
+from kvip.diagnostics.pipeline_options import DEFAULT_VARIANTS, VARIANTS, is_auto_variant
 from kvip.diagnostics.system_profile import PROFILE_METRICS
 
 _RETAINED = []
@@ -110,11 +110,11 @@ def arguments(argv=None):
         p.error("topk-probe requires study=post-threshold")
     if args.check_mode_switch and (args.study != "post-threshold" or "light-low" not in args.pipeline_variants):
         p.error("check-mode-switch requires post-threshold with light-low")
-    auto = args.study == "post-threshold" and any(name in ("auto", "auto-end") for name in args.pipeline_variants)
+    auto = args.study == "post-threshold" and any(is_auto_variant(name) for name in args.pipeline_variants)
     if args.check_auto_route and not auto:
-        p.error("check-auto-route requires post-threshold with auto or auto-end")
-    if auto and (args.diagnostic_replays or args.profile_dir or args.topk_probe):
-        p.error("Auto routing currently requires diagnostic-replays=0 and no profile/topk-probe")
+        p.error("check-auto-route requires post-threshold with an automatic route variant")
+    if auto and (args.profile_dir or args.topk_probe):
+        p.error("Auto routing currently excludes profile/topk-probe")
     if args.study in ("threshold-only", "seed-ub", "local-victims", "register-kth", "overlap-victims") and (
         args.transport != "urma" or args.mode != "fused"
     ):

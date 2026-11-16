@@ -75,6 +75,7 @@ def statistics(samples):
         count=len(values),
         mean_us=float(values.mean()),
         p50_us=float(np.median(values)),
+        p95_us=float(np.percentile(values, 95)),
         min_us=float(values.min()),
         max_us=float(values.max()),
         samples_us=values.tolist(),
@@ -351,10 +352,10 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
             capture_and_warmup_learning=False, decision_and_feedback_in_timing=True,
             metadata_h2d_in_timing=False, snapshot_restored_each_step=True,
             cold_start_us=samples[0], steady_timing=statistics(samples[1:]) if len(samples) > 1 else None,
+            steady_by_mode={mode: statistics([
+                elapsed for elapsed, row in zip(samples[1:], auto_samples[1:]) if row["mode"] == mode
+            ]) for mode in ("low", "high") if any(row["mode"] == mode for row in auto_samples[1:])},
             scope="One frozen input with evolving device feedback, not a live multi-step request trajectory")
-        if getattr(args, "check_auto_route", False):
-            phase(retained, "auto_route_lifecycle")
-            result["auto_route"]["lifecycle"] = check_auto_route(torch, stream, bundle, lambda: replay(graph), args.iterations)
     if (getattr(args, "check_mode_switch", False) and auto is None
             and early_threshold_skipped(getattr(bundle, "tuning", {}))):
         phase(retained, "mode_switch_check")
@@ -367,6 +368,10 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
         for step in range(diagnostic_count):
             phase(retained, "diagnostic_reset", step)
             reset()
+            if auto is not None:
+                # Advance from the measured device feedback. Disabling learning
+                # would force high mode and profile the wrong path for low cases.
+                auto.begin(step=args.iterations + step + 1, learning=True)
             bundle.forward.times.zero_()
             bundle.forward.set_options(diagnostics=True)
             stream.synchronize()
@@ -389,6 +394,7 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
                         early_prefetch_drain=getattr(bundle, "tuning", {}).get("early_prefetch_drain", False),
                     ),
                     reads=diagnostic_reads,
+                    **({"auto_route": auto.record(diagnostic_reads)} if auto is not None else {}),
                 )
             )
             # Only after successful completion; failures retain all owners and
@@ -402,6 +408,11 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
             count=len(diagnostic_samples),
             samples=diagnostic_samples,
             note="Separate instrumented replay with barriers/cache operations; intervals overlap and cannot be summed into graph latency or converted to microseconds without a measured clock.",
+        )
+    if auto is not None and getattr(args, "check_auto_route", False):
+        phase(retained, "auto_route_lifecycle")
+        result["auto_route"]["lifecycle"] = check_auto_route(
+            torch, stream, bundle, lambda: replay(graph), args.iterations + diagnostic_count
         )
     if getattr(args, "profile_dir", None) is not None:
         from kvip.diagnostics.system_profile import collect_system_profiles

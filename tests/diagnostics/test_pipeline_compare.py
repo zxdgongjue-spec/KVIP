@@ -232,8 +232,30 @@ def test_auto_parser_and_summary_keep_cold_start_traffic_and_dynamic_low_thresho
     with pytest.raises(ValueError, match="automatic route"):
         compare.summarize(args, reports, digest)
     args.diagnostic_replays = 1
-    with pytest.raises(SystemExit):
-        replay.arguments(compare.command(args, compare.jobs(args)[-1])[4:])
+    parsed = replay.arguments(compare.command(args, compare.jobs(args)[-1])[4:])
+    assert parsed.diagnostic_replays == 1 and parsed.check_auto_route
+
+
+@pytest.mark.parametrize("variant", ["auto", "auto-end", "auto-tail", "auto-tail-end"])
+def test_auto_diagnostics_accept_all_auto_variants_without_forcing_high_mode(tmp_path, monkeypatch, variant):
+    args = _arguments(tmp_path, monkeypatch, [variant], diagnostic_replays=2)
+    args.check_auto_route = True
+    parsed = replay.arguments(compare.command(args, compare.jobs(args)[-1])[4:])
+    assert parsed.pipeline_variants == [variant]
+    assert parsed.diagnostic_replays == 2 and parsed.check_auto_route
+
+
+def test_forced_tail_controls_preserve_order_and_workers(tmp_path, monkeypatch):
+    variants = ["light-high-tail", "light-low", "light-low-tail", "auto", "auto-tail",
+                "auto-tail-end", "light-high-tail-end"]
+    args = _arguments(tmp_path, monkeypatch, variants, diagnostic_replays=2)
+    parsed = replay.arguments(compare.command(args, compare.jobs(args)[-1])[4:])
+    assert parsed.pipeline_variants == variants
+    for name in ("light-high-tail", "light-high-tail-end"):
+        assert q_workers_for(name) == 4
+        assert options_for(name)["low_miss_tail"]
+        assert not options_for(name).get("auto_route", False)
+        assert admission_for(name) == (512, 64, 0, 0)
 
 
 def test_inverse_mapping_pairs_use_matching_same_arena_controls(tmp_path, monkeypatch, capsys):

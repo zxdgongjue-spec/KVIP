@@ -19,7 +19,7 @@ from kvip.diagnostics.archive import file_digest, source_commit
 from kvip.diagnostics.compare import read_means, reduction, timing_spread
 from kvip.diagnostics.pipeline_options import (
     DEFAULT_VARIANTS, OPTIONS, OPTIONAL_OPTIONS, NUMERIC_OPTIONS, VARIANTS,
-    admission_for, early_threshold_skipped, options_for, q_workers_for,
+    admission_for, early_threshold_skipped, is_auto_variant, options_for, q_workers_for,
 )
 from kvip.diagnostics.upstream import validate_checkout
 
@@ -54,11 +54,11 @@ def arguments(argv=None):
         parser.error("pipeline-variants must be unique; order is preserved")
     if args.check_mode_switch and "light-low" not in args.pipeline_variants:
         parser.error("check-mode-switch requires the light-low variant")
-    auto = any(name in ("auto", "auto-end") for name in args.pipeline_variants)
+    auto = any(is_auto_variant(name) for name in args.pipeline_variants)
     if args.check_auto_route and not auto:
-        parser.error("check-auto-route requires auto or auto-end")
-    if auto and (args.diagnostic_replays or args.topk_probe):
-        parser.error("auto requires diagnostic-replays=0 and no topk-probe")
+        parser.error("check-auto-route requires an automatic route variant")
+    if auto and args.topk_probe:
+        parser.error("auto excludes topk-probe")
     if args.result_dir.exists():
         parser.error("result-dir already exists; choose a new directory")
     for role in ("main", "pr", "candidate"):

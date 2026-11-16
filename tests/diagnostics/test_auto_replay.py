@@ -46,13 +46,28 @@ def test_repacking_preserves_tnd_query_mapping_and_owner_state():
 
 
 def test_auto_options_are_explicit_and_runtime_mode_is_not_guessed_from_static_quota():
-    for name in ("auto", "auto-end"):
+    for name in ("auto", "auto-end", "auto-tail", "auto-tail-end"):
         values = validate_options(options_for(name))
         assert values["auto_route"] and q_workers_for(name) == 4
         with pytest.raises(ValueError, match="auto_route requires"):
             validate_options(values | {"low_miss_skip": False})
         assert not early_threshold_skipped(values | {"admission_controls": [0, 64, 0, 0]})
         assert early_threshold_skipped(values | {"auto_low_active": True})
+
+
+def test_low_tail_options_keep_identical_query_workers_and_manual_admission():
+    from kvip.diagnostics.pipeline_options import admission_for
+
+    values = validate_options(options_for("light-low-tail"))
+    assert values["low_miss_tail"] and q_workers_for("light-low-tail") == 4
+    assert admission_for("light-low-tail") == admission_for("light-low")
+    with pytest.raises(ValueError, match="low_miss_tail requires"):
+        validate_options(values | {"low_miss_skip": False})
+    for name in ("light-high-tail", "light-high-tail-end"):
+        high = validate_options(options_for(name))
+        assert high == values
+        assert q_workers_for(name) == 4
+        assert admission_for(name) == admission_for("light-high")
 
 
 class Tensor:
@@ -128,3 +143,88 @@ def test_prepare_never_reads_device_feedback_or_selects_a_mode(monkeypatch):
     value.begin(step=1, learning=True)
     np.testing.assert_array_equal(state.feedback.value, previous)
     np.testing.assert_array_equal(bundle.rotating.admission_controls.value, [[512, 64, 0, 0]] * 2)
+
+
+def test_diagnostics_advance_measured_feedback_before_lifecycle_without_timing_them(monkeypatch):
+    from kvip.diagnostics import replay_measure, native_profile
+
+    log = []
+    config = np.zeros(16, np.int64)
+    config[5:7] = (128, 192)
+
+    class Automatic:
+        state = SimpleNamespace(config=config)
+        step = 0
+        learning = False
+
+        def begin(self, *, step, learning):
+            self.step, self.learning = step, learning
+            log.append(("begin", step, learning))
+
+        def record(self, reads):
+            return dict(mode="high" if self.step == 1 else "low", observed_prefetch=0)
+
+    automatic = Automatic()
+
+    class Forward:
+        batch, q_workers, resolver_cores = 2, 4, 3
+        times = SimpleNamespace(zero_=lambda: None)
+        diagnostics = False
+
+        def __call__(self):
+            pass
+
+        def set_options(self, *, diagnostics):
+            self.diagnostics = diagnostics
+
+    forward = Forward()
+
+    class Graph:
+        def capture_begin(self, stream):
+            pass
+
+        def capture_end(self):
+            pass
+
+        def replay(self, stream):
+            log.append(("replay", automatic.step, automatic.learning, forward.diagnostics))
+
+        def reset(self):
+            log.append("graph_reset")
+
+    class Event:
+        def __init__(self, **unused):
+            pass
+
+        def record(self, stream):
+            assert not forward.diagnostics
+
+        def synchronize(self):
+            pass
+
+        def elapsed_time(self, other):
+            return [0.0, 0.010, 0.020, 0.030][automatic.step]
+
+    def lifecycle(torch, stream, bundle, replay, last_step):
+        assert last_step == 5
+        assert log[-1] == ("replay", 5, True, True)
+        log.append("lifecycle")
+        return {"status": "pass"}
+
+    monkeypatch.setattr(replay_measure, "cpu_array", lambda torch, value: config if value is config else None)
+    monkeypatch.setattr(replay_measure, "check_auto_route", lifecycle)
+    monkeypatch.setattr(native_profile, "decode_profile", lambda *args, **kwargs: {})
+    bundle = SimpleNamespace(reset=lambda: None, verify=lambda: {}, read_counts=lambda: {},
+                             forward=forward, lease=None, auto_replay=automatic)
+    args = SimpleNamespace(mode="fused", transport="urma", warmup=0, iterations=3,
+                           diagnostic_replays=2, check_auto_route=True)
+    result = replay_measure.measure(SimpleNamespace(npu=SimpleNamespace(Event=Event)),
+                                    SimpleNamespace(AclGraph=Graph),
+                                    SimpleNamespace(synchronize=lambda: None), bundle, args, {})
+    assert result["timing"]["samples_us"] == [10, 20, 30]
+    assert result["timing"]["p95_us"] == 29
+    assert result["auto_route"]["steady_by_mode"]["low"]["samples_us"] == [20, 30]
+    assert result["auto_route"]["steady_timing"]["p50_us"] == 25
+    assert [row["auto_route"]["mode"] for row in result["native_diagnostics"]["samples"]] == ["low", "low"]
+    assert result["native_diagnostics"]["included_in_timing"] is False
+    assert log[-2:] == ["lifecycle", "graph_reset"]
