@@ -7,10 +7,10 @@ import numpy as np
 import pytest
 
 from kvip.diagnostics import replay, replay_measure, scan_report, scan_options
-from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, budgets_for, options_for, validate_options
+from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, budgets_for, options_for, validate_options
 
 
-@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS])
+@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS])
 def test_scan_study_reuses_one_arena_and_delivers_independent_options(monkeypatch, variants):
     args = SimpleNamespace(study="scan-order", mode="fused", transport="urma",
                            threshold_policy="recent", scan_variants=list(variants))
@@ -34,7 +34,7 @@ def test_scan_study_reuses_one_arena_and_delivers_independent_options(monkeypatc
     assert calls == [(name, options_for(name), budgets_for(name)) for name in variants]
 
 
-@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS])
+@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS])
 def test_actual_command_line_accepts_scan_variants(tmp_path, variants):
     args = replay.arguments([
         "--snapshot", str(tmp_path / "input"), "--build-dir", str(tmp_path / "build"),
@@ -69,9 +69,9 @@ def test_report_uses_full_chain_and_keeps_mean_and_median_separate(tmp_path, cap
 
 def test_rolling_experiment_does_not_change_budgets_or_enable_pipeline_options():
     assert {budgets_for(name) for name in ROLLING_VARIANTS} == {(512, 64)}
-    assert options_for("reverse-refilter") == dict(reverse_cold=True, rolling_threshold=True, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False)
+    assert options_for("reverse-refilter") == dict(reverse_cold=True, rolling_threshold=True, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False)
     with pytest.raises(ValueError, match="requires rolling"):
-        validate_options(dict(reverse_cold=True, rolling_threshold=False, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False))
+        validate_options(dict(reverse_cold=True, rolling_threshold=False, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False))
 
 
 def test_rolling_reference_uses_unique_seed_and_only_scanned_causal_positions():
@@ -272,3 +272,40 @@ def test_lean_gate_requires_beating_reverse_not_only_forward(capsys):
     assert "GATE reverse CANDIDATE" in text
     assert "GATE reverse-compact-ref KEEP_BASELINE" in text
     assert "GATE reverse-first-ref CANDIDATE" in text
+
+
+def test_safe_refill_controls_keep_budget_and_do_not_enable_other_experiments(tmp_path, capsys):
+    assert {budgets_for(name) for name in SAFE_VARIANTS} == {(512, 64)}
+    assert not options_for("reverse-window-ref")["refilter_safe"]
+    assert options_for("reverse-safe-ref")["refilter_safe"]
+    assert not options_for("reverse-safe-ref")["refilter_refill"]
+    assert options_for("reverse-refill-ref")["refilter_refill"]
+    for name in SAFE_VARIANTS:
+        options = options_for(name)
+        assert not options["rolling_compact"] and not options["rolling_first_window"]
+        validate_options(options)
+    options = options_for("reverse-refill-ref")
+    options["refilter_safe"] = False
+    with pytest.raises(ValueError, match="requires visibility-safe"):
+        validate_options(options)
+
+    data = rolling_report(tmp_path)
+    case = data["cases"]["forward"]
+    data["execution_order"] = list(SAFE_VARIANTS)
+    data["cases"] = {name: json.loads(json.dumps(case)) for name in SAFE_VARIANTS}
+    for case in data["cases"].values():
+        case["reads_samples"][0].update(
+            prefetch=15, unused_prefetch=10, prefetch_cold=5, unused_prefetch_cold=3,
+            prefetch_admission=dict(rounds=8, window_limit=64, packed_rows=16, active_rows=16,
+                                    remaining_admissible_budget=8000, posted_by_epoch=[1]*7+[8]))
+    path = tmp_path / "result.json"
+    path.write_text(json.dumps(data))
+    scan_report.report(path, require_safe=True)
+    output = capsys.readouterr().out
+    assert "reverse-window-ref->reverse-safe-ref" in output
+    assert "reverse-safe-ref->reverse-refill-ref" in output
+    assert "useful_prefetch=5.0 cold_prefetch_pct=66.67%" in output
+    assert "not before-last or completion overlap" in output
+    assert "GATE reverse-refill-ref KEEP_BASELINE" in output
+    with pytest.raises(ValueError, match="controls were not measured"):
+        scan_report.load_report(path, require_lean=True)

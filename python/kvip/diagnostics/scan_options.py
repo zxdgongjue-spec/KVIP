@@ -1,6 +1,6 @@
 """Independent URMA scan-order/admission experiment; no graph-route changes."""
 
-OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window")
+OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill")
 DEFAULT_VARIANTS = ("forward", "reverse", "forward-wide", "reverse-wide", "forward-end")
 VARIANTS = {name: ("reverse_cold",) if name.startswith("reverse") else () for name in DEFAULT_VARIANTS}
 ROLLING_VARIANTS = ("forward", "reverse", "reverse-roll", "reverse-refilter", "forward-refilter", "forward-end")
@@ -35,6 +35,14 @@ VARIANTS.update({
 })
 
 
+SAFE_VARIANTS = ("forward", "reverse", "reverse-window-ref", "reverse-safe-ref",
+                 "reverse-refill-ref", "forward-end")
+VARIANTS.update({
+    "reverse-safe-ref": ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_windowed", "refilter_safe"),
+    "reverse-refill-ref": ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_windowed", "refilter_safe", "refilter_refill"),
+})
+
+
 def options_for(name):
     return {key: key in VARIANTS[name] for key in OPTIONS}
 
@@ -64,6 +72,10 @@ def validate_options(options):
         raise ValueError("Compact/first-window options require window accumulation")
     if options["rolling_first_window"] and not options["rolling_compact"]:
         raise ValueError("First-window correction requires compact admission")
+    if options["refilter_safe"] and not options["window_refilter"]:
+        raise ValueError("Visibility-safe admission requires window refilter")
+    if options["refilter_refill"] and not options["refilter_safe"]:
+        raise ValueError("Same-window refill requires visibility-safe admission")
     return dict(options)
 
 
