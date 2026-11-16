@@ -110,6 +110,63 @@ def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_
     interval("producer_span", producer, 1, 8)
     interval("index_consumer_span", consumer, 10, 24)
     interval("index_metadata", consumer, 22, 23)
+    # These markers predate the direct-Index capability, which gives us a
+    # conservative version boundary. Do not interpret older unversioned slots.
+    detail = {
+        "producer_setup": (producer, 1, 2),
+        "producer_initialize": (producer, 2, 3),
+        "producer_first_query_ready": (producer, 1, 4),
+        "producer_after_last_query": (producer, 7, 8),
+        "index_initial_wait_and_setup": (consumer, 10, 12),
+    }
+    for name, (rows, begin, end) in detail.items():
+        if direct_index_markers:
+            interval(name, rows, begin, end)
+        else:
+            metrics[name] = dict(status="unavailable", count=0, median_cycles=None,
+                                 max_cycles=None, samples_cycles=[])
+    producer_queries = producer[:, 10:30].reshape(batch * 4, 5)
+    if direct_index_markers:
+        # Compact Q4 computes outside these per-query intervals; exclude its
+        # rows rather than presenting publication-only time as fast planning.
+        plan_rows = producer_queries
+        if compact_plan_markers:
+            plan_rows = producer[:, 10:30][producer[:, 9] == 0].reshape(-1, 5)
+        interval("producer_query_plan", plan_rows, 0, 1)
+        interval("producer_query_location_dma", producer_queries, 3, 4)
+    else:
+        for name in ("producer_query_plan", "producer_query_location_dma"):
+            metrics[name] = dict(status="unavailable", count=0, median_cycles=None,
+                                 max_cycles=None, samples_cycles=[])
+
+    index_apply, index_control = [], []
+    if direct_index_markers:
+        for row in consumer:
+            # A successful empty phase stamps an equal start/end. Metadata
+            # may be absent when the request has no changes at all.
+            pairs = [(int(row[12 + 2 * p]), int(row[13 + 2 * p])) for p in range(5)]
+            if not any(start or stop for start, stop in pairs):
+                continue
+            if any(start == 0 or stop < start for start, stop in pairs):
+                raise ValueError("Invalid production diagnostic timestamps: index apply phases")
+            begin, end = int(row[10]), int(row[24])
+            meta_begin, meta_end = int(row[22]), int(row[23])
+            if (begin == 0 or end < begin or
+                    (meta_begin == 0 and meta_end != 0) or meta_end < meta_begin):
+                raise ValueError("Invalid production diagnostic timestamps: index control remainder")
+            apply = sum(stop - start for start, stop in pairs)
+            control = end - begin - apply - (meta_end - meta_begin)
+            if control < 0:
+                raise ValueError("Index work exceeds its enclosing role interval")
+            index_apply.append(apply)
+            index_control.append(control)
+    for name, values in (("index_apply_total", index_apply),
+                         ("index_wait_and_control", index_control)):
+        metrics[name] = dict(
+            status="available" if values else "unavailable", count=len(values),
+            median_cycles=float(np.median(values)) if values else None,
+            max_cycles=max(values) if values else None, samples_cycles=values,
+        )
     queries = fetch[:, :96].reshape(-1, 24)
     interval("fetch_query_ready_wait", queries, 0, 1)
     interval("fetch_prepare", queries, 1, 2)
@@ -210,6 +267,13 @@ def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_
             + "; post_active/CQ drain sum safe and conflict phases only within each worker, not across workers",
             scan="No standalone full-history scan or QK duration is derived from these markers",
             aggregation="Median/max across request/query role samples; overlapping intervals are not additive",
+            producer_detail=(
+                "Capability-gated existing markers: setup includes validation, input/context copies and bitmap merge; "
+                "initialize covers StagedInitializeReady. Query plan includes the VF and its fence; compact Q4 rows "
+                "are excluded because their planning precedes these markers. First-query-ready ends at the raw "
+                "Q0 publication timestamp, before its scalar cache-line release. After-last-query includes that "
+                "release, OutputWorker completion wait and final bookkeeping; it is not pure planner work."
+            ),
             compact_plan=(
                 "Capability-gated Producer slot9 records actual compact-plan execution, not duration. "
                 "Producer span includes the complete compact plan. Per-query Producer markers may "
@@ -219,7 +283,10 @@ def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_
                 "index_role_span brackets Consumer role entry/exit, including early prefetch drain; "
                 "index_consumer_span brackets the common work start through metadata commit and excludes early drain "
                 "and final status publication. Direct Index counters, when capability-gated, count actual "
-                "direct-path rows/events and are not timing intervals"
+                "direct-path rows/events and are not timing intervals. index_apply_total sums only the five "
+                "nonoverlapping apply intervals within one Consumer. index_wait_and_control subtracts those and "
+                "metadata from that same Consumer's span; it includes waiting, shadow setup and scalar control, "
+                "not only CQ wait. Medians of components must not be added to reconstruct the median total."
             ),
             prefetch_completion=(
                 "early_prefetch_drain is the Consumer-owned CQ drain; final_prefetch_join is the later resolver acquire"

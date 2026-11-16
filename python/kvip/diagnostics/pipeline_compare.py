@@ -229,6 +229,12 @@ def _validate_case(args, name, result, manifest_digest):
                 raise ValueError(f"{name}: incomplete automatic route validation")
             if getattr(args, "check_auto_route", False) and route.get("lifecycle", {}).get("status") != "pass":
                 raise ValueError(f"{name}: missing auto lifecycle validation")
+            if result.get("tuning", {}).get("low_miss_read_through") and getattr(args, "check_auto_route", False):
+                carry = route["lifecycle"].get("persistent_carry", {})
+                if (carry.get("status") != "pass" or carry.get("persistent_reset_between_steps") is not False
+                        or carry.get("snapshot_restores") != 1
+                        or [row.get("mode") for row in carry.get("sequence", [])] != ["low", "low", "high"]):
+                    raise ValueError(f"{name}: read-through requires the non-restored low/low/high carry check")
         if name == "candidate-light-low" and getattr(args, "check_mode_switch", False):
             switch = result.get("mode_switch_check", {})
             rows = switch.get("sequence", [])
@@ -273,9 +279,18 @@ def profile_summary(result):
         "get_pack": "fetch_pack",
         "publication_pack": "publication_pack",
         "producer": "producer_span",
+        "producer_setup": "producer_setup",
+        "producer_initialize": "producer_initialize",
+        "producer_first_query_ready": "producer_first_query_ready",
+        "producer_query_plan": "producer_query_plan",
+        "producer_query_location_dma": "producer_query_location_dma",
+        "producer_after_last_query": "producer_after_last_query",
         "index": "index_consumer_span",
         "index_total": "index_role_span",
         "index_metadata": "index_metadata",
+        "index_apply_total": "index_apply_total",
+        "index_wait_and_control": "index_wait_and_control",
+        "index_initial_wait_and_setup": "index_initial_wait_and_setup",
         "dependency_wait": "fetch_dependency_wait",
         "prefetch_join": "final_prefetch_join",
         "early_prefetch_drain": "early_prefetch_drain",
@@ -530,6 +545,9 @@ def print_summary(summary, brief=False):
             if route.get("lifecycle"):
                 print("AUTO_LIFECYCLE_PASS one_graph feedback_reset=false packed_row_reorder=true "
                       "prediction_fault_injection=true rejection=identity_not_transport_fault snapshot_restore_each=true", flush=True)
+                if route["lifecycle"].get("persistent_carry"):
+                    print("READ_THROUGH_CARRY_PASS one_graph low/repacked-low/high persistent_reset_between_steps=false "
+                          "hot_abc_index=verified selected_KV_bytes=verified untimed=true", flush=True)
     if brief:
         print("case                   mean_us    p50_us  prefetch    final   unused  vsSerial_mean/p50%  vsBefore_mean/p50%", flush=True)
         for name, row in summary["table"].items():

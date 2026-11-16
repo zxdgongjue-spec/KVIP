@@ -4,6 +4,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 import ctypes
+import numpy as np
 
 from kvip.cache.index_storage import IndexCacheStorage
 
@@ -178,6 +179,16 @@ def create_fused(
         workspace = LIFetchWorkspace(torch, **common)
     storage = IndexCacheStorage(torch, g["owners"], h, r, device)
     output = archive.tensor("pre.output", torch, device)
+    low_scratch_config = None
+    output_stride = g["output_stride"]
+    if effective.get("low_miss_read_through"):
+        # Preserve every owner's hot/ABC row; the extra slots are independent
+        # of the ABC ring and cover the full Q4 TopK union after a misprediction.
+        low_scratch_config = np.array([0x52544831, output_stride, output_stride, 8192], dtype=np.uint64)
+        expanded = output.new_zeros((g["owners"], output_stride + 8192, g["token_bytes"]))
+        expanded[:, :output_stride].copy_(output.reshape(g["owners"], output_stride, g["token_bytes"]))
+        output = expanded
+        output_stride += 8192
     output_rows = output.view(-1, g["token_bytes"])
     kwargs = dict(
         query_ends=workspace.inputs.query_ends.view(b, 4),
@@ -185,12 +196,14 @@ def create_fused(
         row_owners=workspace.inputs.row_owners,
         token_addresses=storage.addresses,
         tail_bounds=workspace.tail_bounds,
-        output_stride=g["output_stride"],
+        output_stride=output_stride,
         prefetch_limit=effective["prefetch_limit"],
         window_limit=effective["window_limit"],
     )
     if not upstream or effective["recent_threshold"]:
         kwargs["threshold_bounds"] = threshold_bounds
+    if low_scratch_config is not None:
+        kwargs["low_scratch_config"] = low_scratch_config
     if transport == "ubmem":
         lease = UbmemLease(torch, runtime, output_rows, stream)
         lease.register_table(device_table)
@@ -255,7 +268,8 @@ def create_fused(
 
         if not predict_seed_eligibility(archive, rotating.runtime_shape)["predicted_eligible_queries"]:
             raise ValueError("Seed-UB has no eligible queries; every query would use the fallback")
-    # Keep the archived output shape for generic state reset/oracle.
+    # Read-through has an enlarged owner stride; reset/oracle preserve the
+    # original ABC capacity explicitly rather than interpreting spill as ABC.
     rotating.output = output
     update = update_type(
         torch,

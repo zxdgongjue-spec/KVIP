@@ -110,6 +110,76 @@ def test_low_parity_variants_keep_policy_workers_and_direct_index_fixed():
             validate_options(compact | {missing: False})
 
 
+def test_read_through_is_opt_in_and_excludes_failed_promotion_experiments():
+    from kvip.diagnostics.pipeline_options import admission_for
+
+    expected = options_for("auto-tail-row-publish") | {"low_miss_read_through": True}
+    for name in ("auto-read-through", "auto-read-through-end"):
+        assert options_for(name) == expected
+        assert validate_options(expected) == expected
+        assert q_workers_for(name) == 4
+        assert admission_for(name) == admission_for("auto-tail-row-publish")
+    for key in ("low_miss_direct_index", "auto_route_simt", "low_miss_compact_plan"):
+        with pytest.raises(ValueError):
+            validate_options(expected | {key: True})
+    for key in ("auto_route", "low_miss_tail", "low_miss_sparse_init", "selected_metadata"):
+        with pytest.raises(ValueError):
+            validate_options(expected | {key: False})
+
+
+def test_read_through_carry_replays_one_graph_without_persistent_restore(monkeypatch):
+    from kvip.diagnostics import replay_measure
+
+    original, arrays = archive()
+    original.tensor = lambda name, torch, device: original.array(name)
+    query = arrays["pre.query"].copy()
+    inputs = SimpleNamespace(copy_=lambda value: query.__setitem__(slice(None), value))
+    persistent = {"resets": 0, "replays": 0}
+    modes, seen_queries = [], []
+
+    class Permutation(RowPermutation):
+        def tensor(self, name, torch, device):
+            return self.array(name)
+
+    class Auto:
+        archive = original
+        mode = None
+
+        def inject_prediction_fault(self, count):
+            self.mode = "low" if count == 0 else "high"
+
+        def begin(self, *, step, learning, requests):
+            assert learning and np.all(requests[:, 1:3] == [2, step])
+
+        def record(self, reads):
+            return dict(mode=self.mode)
+
+    automatic = Auto()
+    bundle = SimpleNamespace(
+        auto_replay=automatic, rotating=SimpleNamespace(batch=2, device=0, threshold_bounds=None),
+        restored={}, selector=None, verify=lambda: {},
+        reset=lambda: persistent.update(resets=persistent["resets"] + 1))
+    monkeypatch.setattr(auto_replay, "RowPermutation", Permutation)
+    monkeypatch.setattr(replay_measure, "buffer_addresses", lambda bundle: {"same_address": 1})
+    monkeypatch.setattr(replay_measure, "prepare_fused_state", lambda *args: None)
+    monkeypatch.setattr(replay_measure, "input_tensors", lambda selector: {"query": inputs})
+
+    def replay():
+        assert persistent["resets"] == 1
+        persistent["replays"] += 1
+        modes.append(automatic.mode)
+        seen_queries.append(query.copy())
+
+    result = replay_measure.check_read_through_carry(
+        None, SimpleNamespace(synchronize=lambda: None), bundle, replay)
+    assert modes == ["low", "low", "high"]
+    assert persistent == {"resets": 1, "replays": 3}
+    np.testing.assert_array_equal(seen_queries[0], seen_queries[2])
+    np.testing.assert_array_equal(seen_queries[1], RowPermutation(original, [1, 0]).array("pre.query"))
+    assert result["persistent_reset_between_steps"] is False
+    assert automatic.archive is original
+
+
 def test_low_tail_options_keep_identical_query_workers_and_manual_admission():
     from kvip.diagnostics.pipeline_options import admission_for
 

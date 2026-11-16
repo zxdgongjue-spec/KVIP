@@ -191,6 +191,77 @@ def test_index_role_interval_keeps_work_moved_before_init_in_scope():
     assert after["metrics"]["index_consumer_span"]["median_cycles"] == 50
 
 
+def _tail_details():
+    raw = _raw()
+    producer = raw[:128].reshape(2, 64)[:, :32]
+    consumer = raw[:128].reshape(2, 64)[:, 32:]
+    producer[:, 1:4] = [100, 150, 170]
+    producer[:, 8] = 450
+    for q in range(4):
+        start = 180 + q * 50
+        producer[:, 10 + 5 * q:15 + 5 * q] = [start, start + 10, start + 10, start + 20, start + 25]
+        producer[:, 4 + q] = start + 30
+    consumer[:, 10] = 100
+    consumer[:, 24] = 500
+    for phase in range(5):
+        consumer[:, 12 + 2 * phase:14 + 2 * phase] = [150 + phase * 50, 160 + phase * 50]
+    consumer[:, 22:24] = [440, 460]
+    return raw, producer, consumer
+
+
+def test_tail_details_separate_planning_from_output_wait_and_index_apply():
+    raw, producer, consumer = _tail_details()
+    sample = native_profile.decode_profile(
+        raw, batch=2, workers=2, resolver_cores=3, transport="urma", direct_index_markers=True
+    )
+    values = sample["metrics"]
+    assert values["producer_setup"]["samples_cycles"] == [50, 50]
+    assert values["producer_initialize"]["samples_cycles"] == [20, 20]
+    assert values["producer_first_query_ready"]["samples_cycles"] == [110, 110]
+    assert values["producer_query_plan"]["samples_cycles"] == [10] * 8
+    assert values["producer_query_location_dma"]["samples_cycles"] == [5] * 8
+    assert values["producer_after_last_query"]["samples_cycles"] == [90, 90]
+    assert values["index_apply_total"]["samples_cycles"] == [50, 50]
+    assert values["index_wait_and_control"]["samples_cycles"] == [330, 330]
+    assert values["index_initial_wait_and_setup"]["samples_cycles"] == [50, 50]
+    assert "not only CQ wait" in sample["scope"]["index"]
+
+    # Delayed publication/completion grows the enclosing spans but cannot be
+    # mislabeled as longer query planning or longer Index copying.
+    producer[:, 8] += 100
+    consumer[:, 12:25] += 80
+    after = native_profile.decode_profile(
+        raw, batch=2, workers=2, resolver_cores=3, transport="urma", direct_index_markers=True
+    )["metrics"]
+    assert after["producer_query_plan"] == values["producer_query_plan"]
+    assert after["producer_after_last_query"]["samples_cycles"] == [190, 190]
+    assert after["index_apply_total"] == values["index_apply_total"]
+    assert after["index_wait_and_control"]["samples_cycles"] == [410, 410]
+
+
+def test_compact_planning_is_not_misreported_as_fast_per_query_planning():
+    raw, producer, _ = _tail_details()
+    producer[:, 9] = [1, 0]
+    sample = native_profile.decode_profile(
+        raw, batch=2, workers=2, resolver_cores=3, transport="urma",
+        direct_index_markers=True, compact_plan_markers=True,
+    )
+    assert sample["metrics"]["producer_query_plan"]["samples_cycles"] == [10] * 4
+    assert sample["metrics"]["producer_query_location_dma"]["samples_cycles"] == [5] * 8
+    old = native_profile.decode_profile(raw, batch=2, workers=2, resolver_cores=3, transport="urma")
+    assert old["metrics"]["producer_query_plan"]["status"] == "unavailable"
+    assert old["metrics"]["index_apply_total"]["status"] == "unavailable"
+
+
+def test_index_detail_rejects_work_outside_enclosing_span():
+    raw, _, consumer = _tail_details()
+    consumer[:, 24] = 160
+    with pytest.raises(ValueError, match="Index work exceeds"):
+        native_profile.decode_profile(
+            raw, batch=2, workers=2, resolver_cores=3, transport="urma", direct_index_markers=True
+        )
+
+
 def test_capacity_skip_counter_does_not_become_a_zero_candidate_count(monkeypatch):
     rows = np.zeros((1, 256), dtype=np.int32)
     rows[0, 9] = 2

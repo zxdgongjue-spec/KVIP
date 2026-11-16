@@ -85,14 +85,36 @@ class DecodeOracle:
             result[index] = self.payload[record, within : within + self.width]
         return result
 
-    def verify(self, state, *, address_delta=0, expected_topk=None):
+    def verify_frozen(self, state, *, address_delta=0, output_stride):
+        """A read-through low round may change spill bytes, not persistent KV/Index."""
+        for name in ("keys", "key_scales", "logical_ids", "hot_valid"):
+            actual, expected = np.ascontiguousarray(state[name]), np.ascontiguousarray(self.pre[name])
+            if not np.array_equal(actual.view(np.uint8), expected.view(np.uint8)):
+                raise AssertionError(f"Read-through low changed persistent {name}")
+        expected = self.pre["addresses"].view(np.uint64).copy()
+        for owner in np.unique(self.owners):
+            mask = expected[owner] != 0
+            expected[owner, mask] = expected[owner, mask] - np.uint64(self.ddr["region_base"]) + np.uint64(
+                self.ddr["region_base"] + address_delta)
+        if not np.array_equal(state["addresses"].view(np.uint64), expected):
+            raise AssertionError("Read-through low changed persistent addresses")
+        output = state["output"].reshape(self.owner_count, output_stride, self.width)
+        if not np.array_equal(output[:, :self.stride].view(np.uint8), self.output.view(np.uint8)):
+            raise AssertionError("Read-through low overwrote persistent hot/ABC payload")
+        return dict(status="pass", persistent_index_unchanged=True, hot_abc_bytes_unchanged=True,
+                    scratch_slots=output_stride - self.stride)
+
+    def verify(self, state, *, address_delta=0, expected_topk=None, output_stride=None):
         logical = state["logical_output"].reshape(self.batch * 4, 2048)
         slots = state["slot_output"].reshape(self.batch * 4, 2048)
         ids = state["logical_ids"]
+        stride = self.stride if output_stride is None else output_stride
+        if type(stride) is not int or stride < self.stride:
+            raise ValueError("Replay output stride cannot truncate the captured hot/ABC arena")
         output = (
             state["output"]
-            .reshape(-1, self.width)[: self.owner_count * self.stride]
-            .reshape(self.owner_count, self.stride, self.width)
+            .reshape(-1, self.width)[: self.owner_count * stride]
+            .reshape(self.owner_count, stride, self.width)
         )
         identity = np.arange(self.history)
         for owner in range(self.owner_count):
@@ -137,7 +159,7 @@ class DecodeOracle:
                 raise AssertionError("Logical TopK violates its packed query causal boundary")
             if len(np.unique(logical[row])) != 2048:
                 raise AssertionError("Valid query does not contain 2048 unique logical selections")
-            if np.any(slots[row] < 0) or np.any(slots[row] >= self.stride):
+            if np.any(slots[row] < 0) or np.any(slots[row] >= stride):
                 raise AssertionError("Selected slot is outside the registered owner output")
             hot_slots = slots[row] < self.resident
             if np.any(state["hot_valid"][owner, slots[row, hot_slots]] == 0) or not np.array_equal(

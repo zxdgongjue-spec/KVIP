@@ -4,7 +4,7 @@ OPTIONS = ("final_topk_prune", "selected_metadata", "early_fetch_ready", "compac
 OPTIONAL_OPTIONS = ("ready_direct_ranges", "adaptive_admission", "prefetch_gate",
                     "skip_exhausted_prefetch", "early_prefetch_drain", "inverse_mapping", "low_miss_skip", "auto_route", "low_miss_tail",
                     "low_miss_sparse_init", "auto_route_fast_probe", "auto_route_row_publish",
-                    "low_miss_direct_index", "auto_route_simt", "low_miss_compact_plan")
+                    "low_miss_direct_index", "auto_route_simt", "low_miss_compact_plan", "low_miss_read_through")
 NUMERIC_OPTIONS = ("prefetch_rank",)
 DEFAULT_VARIANTS = ("control", "metadata", "ready-batch", "workers4", "ready-batch4", "metadata-end", "control-end")
 VARIANTS = {
@@ -50,6 +50,8 @@ VARIANTS = {
     "auto-tail-row-direct": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "low_miss_skip", "auto_route", "low_miss_tail", "low_miss_sparse_init", "auto_route_row_publish", "low_miss_direct_index"),
     "auto-tail-row-simt": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "low_miss_skip", "auto_route", "low_miss_tail", "low_miss_sparse_init", "auto_route_row_publish", "low_miss_direct_index", "auto_route_simt"),
     "auto-tail-compact": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "low_miss_skip", "auto_route", "low_miss_tail", "low_miss_sparse_init", "auto_route_row_publish", "low_miss_direct_index", "auto_route_simt", "low_miss_compact_plan"),
+    "auto-read-through": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "low_miss_skip", "auto_route", "low_miss_tail", "low_miss_sparse_init", "auto_route_row_publish", "low_miss_read_through"),
+    "auto-read-through-end": ("selected_metadata", "early_fetch_ready", "ready_batch_fetch", "low_miss_skip", "auto_route", "low_miss_tail", "low_miss_sparse_init", "auto_route_row_publish", "low_miss_read_through"),
 }
 
 # The exact selection remains Top2048. These ranks only admit speculative
@@ -87,6 +89,8 @@ ADMISSION = {
     "auto-tail-row-direct": (512, 64, 0, 0),
     "auto-tail-row-simt": (512, 64, 0, 0),
     "auto-tail-compact": (512, 64, 0, 0),
+    "auto-read-through": (512, 64, 0, 0),
+    "auto-read-through-end": (512, 64, 0, 0),
 }
 for _name in RANKS:
     ADMISSION[_name] = (768, 128, 0, 1) if _name.startswith("capacity-") else (512, 64, 0, 0)
@@ -158,6 +162,11 @@ def validate_options(options):
     if options.get("low_miss_compact_plan") and not all(options.get(key) for key in (
             "auto_route", "low_miss_tail", "selected_metadata", "early_fetch_ready")):
         raise ValueError("low_miss_compact_plan requires auto_route, low_miss_tail, selected_metadata and early_fetch_ready")
+    if options.get("low_miss_read_through"):
+        if not all(options.get(key) for key in ("auto_route", "low_miss_tail", "low_miss_sparse_init", "selected_metadata")):
+            raise ValueError("low_miss_read_through requires auto_route, low_miss_tail, low_miss_sparse_init and selected_metadata")
+        if any(options.get(key) for key in ("low_miss_direct_index", "auto_route_simt", "low_miss_compact_plan")):
+            raise ValueError("low_miss_read_through does not use direct Index, SIMT route or compact promotion")
     return dict(options)
 
 

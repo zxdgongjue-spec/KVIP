@@ -181,6 +181,9 @@ def main(argv=None):
                 if route.get("lifecycle"):
                     emit("AUTO_LIFECYCLE_PASS one_graph feedback_reset=false packed_row_reorder=true "
                          "prediction_fault_injection=true rejection=identity_not_transport_fault snapshot_restore_each=true")
+                    if route["lifecycle"].get("persistent_carry"):
+                        emit("READ_THROUGH_CARRY_PASS one_graph low/repacked-low/high persistent_reset_between_steps=false "
+                             "hot_abc_index=verified selected_KV_bytes=verified untimed=true")
     except BaseException as error:
         active = retained.get("active_case")
         result = dict(

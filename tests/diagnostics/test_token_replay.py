@@ -195,6 +195,50 @@ def test_existing_oracle_checks_synthetic_payload_and_index_alignment(token_trac
             DecodeOracle(archive).verify(changed, expected_topk=expected)
 
 
+def test_read_through_spill_preserves_abc_modulo_and_persistent_state(token_trace, tmp_path):
+    archive = materialize_token_trace(token_trace, tmp_path / "read-through")
+    oracle, g = DecodeOracle(archive), archive.manifest["geometry"]
+    stride = g["output_stride"] + 8192
+    state = {name: archive.array("pre." + name).copy()
+             for name in ("keys", "key_scales", "addresses", "logical_ids", "hot_valid")}
+    state["output"] = np.zeros((g["owners"], stride, g["token_bytes"]), dtype=np.uint8)
+    state["output"][:, :g["output_stride"]] = oracle.output
+    selected = archive.array("post.logical_output").copy()
+    state["logical_output"], state["slot_output"] = selected, np.empty_like(selected)
+    metadata = archive.array("pre.metadata")
+    spill = [{} for _ in range(g["owners"])]
+    for row, tokens in enumerate(selected):
+        packed = int(metadata[2, row]) // 4
+        owner = int(oracle.owners[packed])
+        begin, end = archive.array("pre.tail_bounds")[packed]
+        for k, token in enumerate(tokens):
+            physical = int(oracle.inverse[owner, token])
+            if begin <= token < end:
+                slot = g["resident"] + int(token) % (g["output_stride"] - g["resident"])
+            elif physical < g["resident"] and state["hot_valid"][owner, physical]:
+                slot = physical
+            else:
+                slot = spill[owner].setdefault(int(token), g["output_stride"] + len(spill[owner]))
+                state["output"][owner, slot] = oracle.expected(owner, [token])[0]
+            state["slot_output"][row, k] = slot
+    assert any(spill)
+    oracle.verify(state, expected_topk=selected, output_stride=stride)
+    assert oracle.verify_frozen(state, output_stride=stride)["status"] == "pass"
+    for fault in ("hot", "abc", "index", "spill"):
+        changed = {name: value.copy() for name, value in state.items()}
+        owner = next(i for i, slots in enumerate(spill) if slots)
+        if fault == "index":
+            changed["keys"][owner, 0, 0] ^= 1
+        else:
+            slot = {"hot": 0, "abc": g["resident"], "spill": next(iter(spill[owner].values()))}[fault]
+            changed["output"][owner, slot, 0] ^= 1
+        with pytest.raises(AssertionError):
+            if fault == "spill":
+                oracle.verify(changed, expected_topk=selected, output_stride=stride)
+            else:
+                oracle.verify_frozen(changed, output_stride=stride)
+
+
 @pytest.mark.parametrize("fault", ["duplicate", "future", "causal_permutation", "availability", "owner", "slot"])
 def test_rejects_nonreplayable_token_contract(token_trace, tmp_path, fault):
     arrays = {name: values.copy() for name, values in token_trace.arrays.items()}

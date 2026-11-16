@@ -38,7 +38,7 @@ def buffer_addresses(bundle):
     tensors = {"output": getattr(bundle, "output", None)}
     for name in ("keys", "scales", "addresses", "logical_ids", "hot_valid"):
         tensors[name] = getattr(storage, name, None)
-    for name in ("context", "rows", "mapping", "locations", "destinations", "fallback_addresses", "row_owners"):
+    for name in ("context", "rows", "mapping", "locations", "destinations", "fallback_addresses", "row_owners", "low_scratch_config"):
         tensors[name] = getattr(rotating, name, None)
     arguments = getattr(rotating, "arguments", ())
     if len(arguments) >= 14:
@@ -187,6 +187,10 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         feature = getattr(rotating.library, "kvip_low_miss_compact_plan", None)
         if transport != "urma" or feature is None or not feature():
             raise ValueError("Compact low plan requires a capable loaded URMA build")
+    if bundle.tuning.get("low_miss_read_through"):
+        feature = getattr(rotating.library, "kvip_low_miss_read_through", None)
+        if transport != "urma" or feature is None or not feature():
+            raise ValueError("Read-through low requires a capable loaded URMA build")
     seeds = []
     for name, target in (persistent_tensors(selector) | input_tensors(selector)).items():
         seed = (
@@ -194,6 +198,11 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
             if name == "addresses"
             else archive.tensor("pre." + name, torch, device)
         )
+        if name == "output" and bundle.tuning.get("low_miss_read_through"):
+            geometry = archive.manifest["geometry"]
+            original = seed.reshape(geometry["owners"], geometry["output_stride"], geometry["token_bytes"])
+            seed = target.new_zeros(target.shape)
+            seed[:, :geometry["output_stride"]].copy_(original)
         if target.shape != seed.shape or target.dtype != seed.dtype:
             raise ValueError(f"Replay binding differs from captured tensor: {name}")
         seeds.append((target, seed))
@@ -267,7 +276,10 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
 
         bundle.threshold_comparison = verify_initial_threshold(torch, bundle, archive)
         state = post_state(torch, selector)
-        oracle.verify(state, address_delta=delta, expected_topk=selected_expected)
+        stride = rotating.output_stride if bundle.tuning.get("low_miss_read_through") else None
+        oracle.verify(state, address_delta=delta, expected_topk=selected_expected, output_stride=stride)
+        if bundle.tuning.get("low_miss_read_through") and early_threshold_skipped(bundle.tuning):
+            bundle.read_through_check = oracle.verify_frozen(state, address_delta=delta, output_stride=stride)
         reads.update(fused_demand(bundle, demand, state["logical_output"], reads))
         return reads
 
@@ -746,6 +758,15 @@ def measure_case(args, archive, context, retained):
         result["tuning"] = dict(bundle.tuning)
         result["threshold_comparison"] = bundle.threshold_comparison
         result["prefetch_admission_accounting"] = ADMISSION_ACCOUNTING
+        if bundle.tuning.get("low_miss_read_through"):
+            old_stride = archive.manifest["geometry"]["output_stride"]
+            result["read_through"] = dict(
+                original_hot_abc_stride=old_stride, output_stride=bundle.rotating.output_stride,
+                scratch_slots_per_owner=8192,
+                scratch_bytes=int(archive.manifest["geometry"]["owners"] * 8192 * archive.manifest["geometry"]["token_bytes"]),
+                low_persistent_check=getattr(bundle, "read_through_check", None),
+                policy="Low rounds read exact cold demand into temporary spill, without promoting KV or modifying Index. High rounds retain the original promotion path.",
+                limitation="Frozen-input timing excludes future cache-policy effects; the carry check is functional, not a changing-query trajectory benchmark.")
         result["reserved_metadata"] = dict(
             dense_bytes_per_group=int(archive.array("pre.reserved_hot").nbytes),
             compact_lru_bytes_per_group=int(archive.array("pre.lru_slots").nbytes),
@@ -946,11 +967,52 @@ def check_auto_route(torch, stream, bundle, replay, last_step):
     auto.inject_prediction_fault(8192)
     run("prediction_fault_injection_high", 7, generation=2, expected_mode="high")
     run("prediction_fault_recovery_high", 8, generation=2)
-    return dict(status="pass", graph_captures=1, captured_addresses_unchanged=True,
+    result = dict(status="pass", graph_captures=1, captured_addresses_unchanged=True,
                 sequence=rows, included_in_timing=False, snapshot_restored_before_each=True,
                 feedback_reset=False, real_packed_row_reorder=True,
                 prediction_fault_injection=True,
                 scope="Untimed prediction fault injection and identity rejection, not a real transport fault; frozen payload restored, not consecutive service cache evolution")
+    if bundle.tuning.get("low_miss_read_through"):
+        result["persistent_carry"] = check_read_through_carry(torch, stream, bundle, replay)
+    return result
+
+
+def check_read_through_carry(torch, stream, bundle, replay):
+    """Carry real persistent state through low/repacked-low/high without resetting it."""
+    from kvip.diagnostics.auto_replay import RowPermutation, requests_for
+
+    auto, original = bundle.auto_replay, bundle.auto_replay.archive
+    pointers, rows = buffer_addresses(bundle), []
+    bundle.reset()
+    order = np.arange(bundle.rotating.batch)[::-1]
+    for step, (name, archive, mode) in enumerate((
+            ("low", original, "low"),
+            ("low-repacked", RowPermutation(original, order), "low"),
+            ("high-after-low", original, "high")), start=9):
+        prepare_fused_state(bundle, archive, bundle.restored, torch, bundle.rotating.device, "urma")
+        auto.archive = archive
+        # Only request inputs change. Do not restore hot bytes or any persistent
+        # Index tensor between these three invocations of the captured graph.
+        for field, target in input_tensors(bundle.selector).items():
+            target.copy_(archive.tensor("pre." + field, torch, bundle.rotating.device))
+        if bundle.rotating.threshold_bounds is not None:
+            bundle.rotating.threshold_bounds.copy_(archive.tensor("pre.threshold_bounds", torch, bundle.rotating.device))
+        auto.inject_prediction_fault(0 if mode == "low" else 8192)
+        auto.begin(step=step, learning=True, requests=requests_for(archive, generation=2, step=step))
+        stream.synchronize()
+        if buffer_addresses(bundle) != pointers:
+            raise AssertionError("Read-through carry changed captured tensor addresses")
+        replay()
+        stream.synchronize()
+        reads = bundle.verify()
+        observed = auto.record(reads)
+        if observed["mode"] != mode:
+            raise AssertionError("Read-through carry did not exercise the requested graph route")
+        rows.append(dict(name=name, **observed, persistent_state_verified=True))
+    return dict(status="pass", graph_captures=1, snapshot_restores=1,
+                persistent_reset_between_steps=False, captured_addresses_unchanged=True,
+                sequence=rows, included_in_timing=False,
+                scope="Same Q/KV payload with real packed-row reorder; low freezes hot/Index, high resumes from that state. This is not a 100-round changing-query performance measurement.")
 
 
 def check_mode_switch(torch, stream, bundle, replay):
