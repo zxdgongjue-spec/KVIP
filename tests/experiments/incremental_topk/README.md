@@ -63,3 +63,44 @@ CANN 9.1，Ascend950PR_9599 软件 Model，1 AIV、8 Q、每Q旧2048＋新增122
 这些是带打点版本的 Model 时间，不是真机测量；本次 Model 的
 GetSystemCycle 返回0，因此分段 ticks 不用于估时。真机应使用上面的 graph
 测时入口。实验包含 GM 输入加载、筛选、ID映射和结果写回，不包含 LI 打分与通信。
+
+## 稀疏候选：六组对比
+
+编译一次后运行下面的循环；仍为单AIV、2请求×Q4。
+
+```bash
+for mode in bitmap compact; do
+  for pct in 10 20 50; do
+    "$build/incremental_topk" --device 4 --blocks 1 --rows 8 \
+      --new-scores 12288 --mode "$mode" --candidate-percent "$pct" \
+      --warmup 4 --iterations 50 | tee "$build/${mode}-${pct}.log"
+  done
+done
+```
+
+- `bitmap`：读完整新增分数和一位/token的位图，在UB中用warp前缀和展开、压缩，
+  再调用公共TopK。计时包含位图展开与压缩。
+- `compact`：直接读已压缩分数及原token ID。计时不包含上游生成压缩输入的成本。
+- 两版使用相同seed、相同分数和随机分散的候选位置。保留比例表示可能参与TopK的
+  新分数比例，不是最终入选比例，更不是缓存miss率。
+- 10/20/50%分别保留1229/2458/6144项；筛选长度向256对齐，尾部填最小sortable key。
+  所有排除项严格低于旧Top2048最低分；候选项不低于该分数。CPU参考仍使用全部新增分数，
+  不依赖位图过滤，核验输出分数集合、原ID、唯一性及对应关系。
+- 核内`select_ticks`在bitmap模式包含压缩和TopK。模型时间从profiler读取，
+  真机graph计时使用无打点版本。默认不指定`--mode`仍为原dense实验。
+
+每Q逻辑输入（含旧Top2048和ID）：bitmap恒定37.50 KiB；compact三档分别为
+19.50/27.00/48.00 KiB（含256对齐padding）。两版均输出12 KiB。
+
+本地CANN 9.1 / Ascend950PR_9599 Model，seed43，单AIV顺序处理8Q，六组全部校验PASS：
+
+| 候选比例 | 新候选/Q | bitmap总耗时 | compact总耗时 | bitmap平均/Q | compact平均/Q |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 10% | 1229 | 35.71 µs | 18.29 µs | 4.46 µs | 2.29 µs |
+| 20% | 2458 | 46.76 µs | 20.58 µs | 5.85 µs | 2.57 µs |
+| 50% | 6144 | 84.39 µs | 26.67 µs | 10.55 µs | 3.33 µs |
+
+取profiler的duration_time（包含模型stall），不是running_time。
+当前bitmap收集实现没有带来收益；已压缩输入能降低筛选耗时，但上游压缩代价仍需在集成时计入。
+前面的29.14 µs全量结果使用原始均匀分数；本组为了精确控制候选比例修改了门槛以下分数，
+因此六组内部是配对对比，与旧全量结果的差值只作参考。

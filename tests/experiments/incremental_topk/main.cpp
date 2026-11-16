@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
-extern "C" uint32_t aclrtlaunch_incremental_topk_kernel(uint32_t,void*,void*,void*,void*,void*,void*,uint32_t,uint32_t,uint32_t);
+extern "C" uint32_t aclrtlaunch_incremental_topk_kernel(uint32_t,void*,void*,void*,void*,void*,void*,void*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
 static void check(int code) { if(code) throw std::runtime_error("ACL error " + std::to_string(code)); }
 template<class T> void* upload(const std::vector<T>& v) {
     void* p=nullptr; check(aclrtMalloc(&p,v.size()*sizeof(T),ACL_MEM_MALLOC_HUGE_FIRST));
@@ -19,17 +19,19 @@ template<class T> std::vector<T> read(void* p,size_t n) {
     std::vector<T> v(n);check(aclrtMemcpy(v.data(),n*sizeof(T),p,n*sizeof(T),ACL_MEMCPY_DEVICE_TO_HOST));return v;
 }
 int main(int argc,char** argv) { try {
-    uint32_t device=0,blocks=1,rows=8,added=12288,warmup=4,iterations=50,seed=43; bool sim=false; std::string inputFile;
+    uint32_t device=0,blocks=1,rows=8,added=12288,warmup=4,iterations=50,seed=43; bool sim=false; std::string inputFile; uint32_t mode=0,percent=100;
     for(int i=1;i<argc;++i) {
         std::string a=argv[i];if(a=="--sim"){sim=true;continue;}
         if(i+1==argc)throw std::runtime_error("missing value: "+a);
+        if(a=="--mode"){std::string m=argv[++i];if(m!="dense"&&m!="bitmap"&&m!="compact")throw std::runtime_error("invalid mode");mode=m=="bitmap"?1:m=="compact"?2:0;continue;}
         if(a=="--input"){inputFile=argv[++i];continue;}
         auto v=std::stoul(argv[++i]);
         if(a=="--device")device=v;else if(a=="--blocks")blocks=v;else if(a=="--rows")rows=v;
         else if(a=="--new-scores")added=v;else if(a=="--warmup")warmup=v;
-        else if(a=="--iterations")iterations=v;else if(a=="--seed")seed=v;
+        else if(a=="--iterations")iterations=v;else if(a=="--seed")seed=v;else if(a=="--candidate-percent")percent=v;
         else throw std::runtime_error("unknown option: "+a);
     }
+    if(!percent||percent>100)throw std::runtime_error("candidate-percent:1..100");
     if(!blocks||blocks>64||!rows||rows>64||!added||added>16384||added%256||!iterations)
         throw std::runtime_error("blocks/rows:1..64, new-scores:256..16384 multiple of256, iterations>0");
     constexpr uint32_t K=2048,oldHistory=16384;
@@ -51,10 +53,37 @@ int main(int argc,char** argv) { try {
         for(uint32_t i=0;i<K;++i){source[row*width+i]=history[ids[i]];oldIds[row*K+i]=ids[i];}
         for(uint32_t i=K;i<width;++i)source[row*width+i]=full.empty()?random(rng):full[size_t(row)*(oldHistory+added)+oldHistory+i-K];
     }
+    const uint32_t candidates=(added*percent+50)/100,padded=(candidates+255)/256*256;
+    std::vector<uint32_t> masks(n*added/32,0);
+    // Randomly placed eligible entries. All omitted scores are below the old
+    // TopK minimum, so full-input TopK remains an independent exact reference.
+    if(mode){
+        for(uint32_t row=0;row<n;++row){
+            std::vector<uint32_t> order(added);std::iota(order.begin(),order.end(),0);
+            std::shuffle(order.begin(),order.end(),rng);
+            for(uint32_t i=0;i<candidates;++i)masks[row*(added/32)+order[i]/32]|=1U<<(order[i]%32);
+            const uint16_t threshold=source[row*width+K-1];
+            if(!threshold)throw std::runtime_error("fixture requires positive sortable old threshold");
+            for(uint32_t i=0;i<added;++i){auto& score=source[row*width+K+i];
+                if(!(masks[row*(added/32)+i/32]&(1U<<(i%32))))score=threshold-1;
+                else score=std::max(score,threshold);}
+        }
+    }
+    auto deviceScores=source;auto deviceIds=oldIds;
+    if(mode==2){
+        deviceScores.assign(n*(K+padded),0);deviceIds.assign(n*(K+padded),0);
+        for(uint32_t row=0;row<n;++row){uint32_t out=row*(K+padded);
+            for(uint32_t i=0;i<K;++i){deviceScores[out+i]=source[row*width+i];deviceIds[out+i]=oldIds[row*K+i];}
+            uint32_t rank=K;
+            for(uint32_t i=0;i<added;++i)if(masks[row*(added/32)+i/32]&(1U<<(i%32))){
+                deviceScores[out+rank]=source[row*width+K+i];deviceIds[out+rank++]=oldHistory+i;}
+        }
+    }
+    std::printf("CASE mode=%s candidates=%u/%u percent=%u padded=%u blocks=%u rows/AIV=%u\n",mode==1?"bitmap":mode==2?"compact":"dense",candidates,added,percent,padded,blocks,rows);
     check(aclInit(nullptr));check(aclrtSetDevice(device));aclrtStream stream;check(aclrtCreateStream(&stream));
-    void* s=upload(source);void* old=upload(oldIds);void* values=upload(std::vector<uint16_t>(n*K));
+    void* s=upload(deviceScores);void* old=upload(deviceIds);void* mask=upload(masks);void* values=upload(std::vector<uint16_t>(n*K));
     void* ids=upload(std::vector<uint32_t>(n*K));void* ticks=upload(std::vector<uint64_t>(n*5));
-    auto launch=[&](uint32_t profile){check(aclrtlaunch_incremental_topk_kernel(blocks,stream,s,old,values,ids,ticks,rows,added,profile));};
+    auto launch=[&](uint32_t profile){check(aclrtlaunch_incremental_topk_kernel(blocks,stream,s,old,values,ids,ticks,mask,rows,added,profile,mode,candidates));};
     auto verify=[&](){
         auto actual=read<uint16_t>(values,n*K);auto actualIds=read<uint32_t>(ids,n*K);
         for(uint32_t row=0;row<n;++row) {
@@ -100,6 +129,6 @@ int main(int argc,char** argv) { try {
     }
     for(uint32_t b=0;b<blocks;++b)std::printf("BLOCK %u span_ticks=%llu\n",b,
         (unsigned long long)(trace[((b+1)*rows-1)*5+4]-trace[b*rows*5]));
-    for(void* p:{s,old,values,ids,ticks})check(aclrtFree(p));
+    for(void* p:{s,old,values,ids,ticks,mask})check(aclrtFree(p));
     check(aclrtDestroyStream(stream));check(aclrtResetDevice(device));check(aclFinalize());return 0;
 } catch(const std::exception& e){std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}}
