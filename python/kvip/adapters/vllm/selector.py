@@ -72,7 +72,7 @@ class VllmIndexSelector:
         self.torch = torch
         self.inputs, self.rotating, self.update = inputs, rotating, update
         self.forward = forward_factory(rotating, update)
-        self.unique_active_owners = unique_active_owners
+        self.unique_active_owners = unique_active_owners or getattr(rotating, "staged", False)
         self.logical_ids, self.row_owners = logical_ids, row_owners
         self.prefix_workspace = prefix_workspace
         self.storage, self.positions = storage, None

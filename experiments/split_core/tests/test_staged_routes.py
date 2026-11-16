@@ -126,12 +126,30 @@ class StagedRoutes(unittest.TestCase):
         sys.path.insert(0, str(ROOT / "python"))
         from kvip.adapters.vllm.selector import VllmIndexSelector
 
-        selector = object.__new__(VllmIndexSelector)
         owners = torch.zeros(3, dtype=torch.int32)
-        selector.inputs = SimpleNamespace(row_owners=owners, prepare=Mock())
-        selector.row_owners = owners
-        selector.storage = None
-        selector.unique_active_owners = True
+        inputs = SimpleNamespace(
+            batch=3,
+            row_owners=owners,
+            prepare=Mock(),
+            query=torch.zeros(1),
+            weights=torch.zeros(1),
+            scale=torch.ones(1),
+        )
+        topk = torch.zeros((3, 4, 2048), dtype=torch.int32)
+        args = [None] * 10
+        args[0], args[2], args[3], args[9] = inputs.query, inputs.weights, inputs.scale, topk
+        rotating = SimpleNamespace(staged=True, arguments=args, locations=topk)
+        selector = VllmIndexSelector(
+            torch,
+            inputs=inputs,
+            rotating=rotating,
+            update=object(),
+            logical_ids=torch.zeros((8, 8192), dtype=torch.int64),
+            row_owners=owners,
+            prefix_workspace=torch.zeros(1),
+            forward_factory=lambda *a: object(),
+        )
+        self.assertTrue(selector.unique_active_owners)
 
         def plan(owner, count):
             return SimpleNamespace(owner=owner, begin=0, stop=count, decode=True)
