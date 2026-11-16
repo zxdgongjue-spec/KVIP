@@ -112,6 +112,9 @@ def summarize(run, required=False):
     if (run / 'experiment.txt').exists() and (run / 'experiment.txt').read_text().strip() == 'window-topk-only':
         lines[1] = 'A=original LIFetch; B=original LIFetch + private window TopK only. Time: us.'
         lines += ['Same seed initialization and profiling in A/B; intermediate results do not affect prefetch or final TopK.']
+    if (run / 'experiment.txt').exists() and (run / 'experiment.txt').read_text().strip() == 'final-topk-only':
+        lines[1] = 'A=window TopK + original final TopK; B=same windows + incremental final TopK. Time: us.'
+        lines += ['Original prefetch decisions retained in both paths; final TopK compute/wait reported separately.']
     keys = sorted(set(cases['baseline']) | set(cases['incremental']), key=lambda k: (k[0], str(k[1])))
     for key in keys:
         lines += ['', f'BS={key[0]} miss={key[1]}%']

@@ -151,3 +151,19 @@ python tests/experiments/incremental_lifetch/summarize.py \
 预取总预算仍为512，默认单窗口预算随窗口数从64调整为128。
 
 `summarize.py` 不传路径时默认读取 `tests/results/window-topk-only/` 下最新的实验目录。汇总旧增量实验时，显式传入对应结果目录。
+
+## 最终 TopK 增量对比
+
+```bash
+bash tests/experiments/incremental_lifetch/compare_final_topk.sh \
+  /vllm-workspace/vllm-ascend/third_party/KVAF 4 127.0.0.1:28885 16 1 4
+```
+
+A/B 都执行同样的中间窗口增量 TopK，使用独立的状态缓冲区。
+A 保留原全历史最终 TopK；B 接续中间结果，只处理尚未覆盖的分数。
+原预取筛选、最终分类、Resolver、Index 更新和 Fetch 保持原样。
+不满足增量输入对齐条件的 query 保留原最终 TopK。
+
+脚本自动校验、采集 level3、汇总完整图以及最终 TopK 的计算/等待/调用次数。
+结果位于 `tests/results/final-topk-only/`；重新汇总时向 `summarize.py` 传入该次目录。
+最终 TopK 的约 22 µs 是之前真机测量的参考，本次实际收益以 A/B 测量为准。

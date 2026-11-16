@@ -58,7 +58,10 @@ def main():
     parser.add_argument('output', type=Path)
     parser.add_argument('--baseline', action='store_true')
     parser.add_argument('--window-topk-only', action='store_true', help='Only add isolated incremental TopK to window service; keep original decisions and final TopK')
+    parser.add_argument('--final-topk-only', action='store_true', help='Both paths run window TopK; only B consumes it for final TopK')
     args = parser.parse_args()
+    if args.final_topk_only:
+        args.window_topk_only = True
     repo = Path(__file__).resolve().parents[3]
     dest = args.output.resolve()
     dest.mkdir(parents=True, exist_ok=False)
@@ -107,7 +110,7 @@ def main():
                 '        DataCopy(windowScores,scoreOutLocal_,2048);DataCopy(windowIds,indicesOutLocal_,2048);\n'
                 '        SetFlag<HardEvent::MTE3_S>(EVENT_ID5);WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);\n'
                 '        if (publishProgress) {')
-    if args.baseline:
+    if args.baseline and not args.final_topk_only:
         instrument(dest)
         print(f'Instrumented baseline: {dest}')
         return
@@ -132,7 +135,8 @@ def main():
         methods=vector.with_name('incremental_methods.h')
         code=methods.read_text()
         # No tail coalescing, final-TopK replacement or writes to the ordinary prefix.
-        code=code[:code.index('__aicore__ inline void FinalIncremental')]
+        if not args.final_topk_only or args.baseline:
+            code=code[:code.index('__aicore__ inline void FinalIncremental')]
         a=code.index('    if(!PreviousServiceReady(epoch,lane)) {',code.index('__aicore__ inline bool AdvanceWindow'))
         b=code.index('    bool trace=',a)
         code=code[:a]+"""    // Same predecessor dependency as original FastService, moved before the
@@ -151,13 +155,19 @@ def main():
         methods.write_text(code)
         replace(vector, "        // Join this producer's hit publication. Other producers remain free.",
                 "        AdvanceWindow(epoch,sequenceHalfWindow);\n        // Join this producer's hit publication. Other producers remain free.")
+        if args.final_topk_only and not args.baseline:
+            replace(vector, '        if (validS2Len >= topkCount_) {',
+                    '        if (!prefixActive_ && validS2Len >= runtimeShape_.resident && validS2Len % 128 == 0) {\n'
+                    '            FinalIncremental(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, validS2Len);\n'
+                    '        } else if (validS2Len >= topkCount_) {')
         instrument(dest)
         # These production algorithms must remain byte-identical to the source.
         for relative in ('op_kernel/prefetch.h', 'op_kernel/indexer/indexer.h', 'op_kernel/streaming.cpp'):
             if (op/relative).read_bytes() != (repo/'csrc/operators/lightning_indexer_with_fetch'/relative).read_bytes():
                 raise RuntimeError(f'Unexpected production algorithm change: {relative}')
-        print(f'Window TopK only: {dest}')
-        print('Private TopK state only; original prefetch, final TopK, resolver, update and Fetch retained.')
+        print(f'TopK experiment: {dest}')
+        print('Final TopK: ' + ('incremental private state' if args.final_topk_only and not args.baseline else 'original full-history'))
+        print('Original prefetch decisions, resolver, update and Fetch retained.')
         return
     replace(vector, '        if (publishProgress) {', '        SeedIncremental(query,scoreRow);\n        if (publishProgress) {')
     replace(vector, '        // Join this producer\'s hit publication. Other producers remain free.',

@@ -7,6 +7,10 @@ if [[ ${1:-} == --window-topk-only ]]; then
   mode=window-topk-only
   prepare_flags=(--window-topk-only)
   shift
+elif [[ ${1:-} == --final-topk-only ]]; then
+  mode=final-topk-only
+  prepare_flags=(--final-topk-only)
+  shift
 fi
 kvaf_root=${1:?Usage: compare.sh KVAF_ROOT DEVICE SERVER [BATCHES] [MISS] [WINDOWS]}
 device=${2:?Missing device}
