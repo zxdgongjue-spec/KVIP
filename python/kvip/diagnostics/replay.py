@@ -10,6 +10,7 @@ import traceback
 from kvip.diagnostics.archive import load_snapshot
 from kvip.diagnostics.console import NativeLog, emit, flush_output, print_replay_failure
 from kvip.diagnostics.pipeline_options import DEFAULT_VARIANTS, VARIANTS, is_auto_variant
+from kvip.diagnostics.replay_journal import ReplayJournal
 from kvip.diagnostics.system_profile import PROFILE_METRICS
 
 _RETAINED = []
@@ -125,9 +126,19 @@ def arguments(argv=None):
     return args
 
 
+def finish_checkpoint(retained, *, status, report):
+    """A journal write failure must not change the actual replay outcome."""
+    try:
+        retained["journal"].finish(retained["progress"], status=status, report=report)
+    except (OSError, TypeError, ValueError) as error:
+        emit(f"Replay completion checkpoint could not be saved: {error}")
+
+
 def main(argv=None):
     args = arguments(argv)
     retained = {"progress": {"variant": "unassigned", "phase": "input_validation", "step": None}}
+    retained["journal"] = ReplayJournal(args.output)
+    retained["journal"].phase(retained["progress"])
     _RETAINED.append(retained)
     log = NativeLog(args.quiet, report_failure=False)
     try:
@@ -149,9 +160,11 @@ def main(argv=None):
                 raise ValueError("This comparison requires real Q/Index and generated KV")
             result = run(args, archive, retained)
         retained["progress"].update(phase="result_write", step=None)
+        retained["journal"].phase(retained["progress"])
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with args.output.open("x") as stream:
             json.dump(result, stream, indent=2)
+        finish_checkpoint(retained, status="complete", report=args.output)
         label = "upstream" if args.upstream_root else args.threshold_policy
         for name, case in result.get("cases", {label: result}).items():
             emit(
@@ -184,6 +197,9 @@ def main(argv=None):
             if active is not None
             else retained.get("buffers_variant"),
             completed_cases=retained.get("completed_cases", {}),
+            checkpoints=dict(
+                cases=str(retained["journal"].directory), progress=str(retained["journal"].progress),
+            ),
             profile_manifests=active.get("system_profile_manifests", []) if active is not None else [],
             error=dict(type=type(error).__name__, message=str(error), traceback=traceback.format_exc()),
             native_log=str(log.failure_path) if log.failure_path else None,
@@ -198,6 +214,7 @@ def main(argv=None):
         print_replay_failure(result, result_path=args.output, log_path=log.failure_path)
         if save_error is not None:
             emit(f"Failure JSON could not be saved: {save_error}")
+        finish_checkpoint(retained, status="failed", report=args.output if save_error is None else None)
         flush_output()
         # Unknown device completion: preserve owners until process termination.
         os._exit(130 if isinstance(error, KeyboardInterrupt) else 70)

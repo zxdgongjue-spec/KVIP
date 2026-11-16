@@ -26,6 +26,8 @@ from kvip.diagnostics.snapshot import (
 def phase(retained, name, step=None):
     """Host-only failure location; call outside the device event interval."""
     retained.setdefault("progress", {}).update(phase=name, step=step)
+    if journal := retained.get("journal"):
+        journal.phase(retained["progress"])
 
 
 def buffer_addresses(bundle):
@@ -320,6 +322,7 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
     retained["events"] = [begin, end]
     samples, reads, auto_samples = [], [], []
     auto = getattr(bundle, "auto_replay", None)
+    phase(retained, "timed_measurement")
     for step in range(args.warmup + args.iterations):
         phase(retained, "iteration_reset", step)
         reset()
@@ -504,7 +507,7 @@ def measure_case(args, archive, context, retained):
     build, kvaf, torch = context.build, context.kvaf, context.torch
     device, stream, cann, aics = context.device, context.stream, context.cann, context.aics
     runtime, restored, table = context.runtime, context.restored, context.table
-    case_retained = {"progress": retained.setdefault("progress", {})}
+    case_retained = {"progress": retained.setdefault("progress", {}), "journal": retained.get("journal")}
     retained["active_case"] = case_retained
     phase(retained, "bundle_create")
     if args.mode == "fused":
@@ -543,6 +546,7 @@ def measure_case(args, archive, context, retained):
         if bundle.tuning.get("auto_route"):
             from kvip.diagnostics.auto_replay import AutoReplay
 
+            phase(retained, "auto_route_prepare")
             bundle.auto_replay = AutoReplay(torch, bundle, archive)
     else:
         from kvip.diagnostics.serial_replay import create_serial
@@ -675,14 +679,31 @@ def measure_case(args, archive, context, retained):
     if args.transport == "urma" and args.mode == "serial":
         kernel = get_kernel_path(args)
         result["get_kernel"] = dict(path=str(kernel), sha256=file_digest(kernel))
-    # measure() reset every captured graph first. A failing reset or lease
-    # close leaves the active case and shared arena retained by the CLI.
+    release_case(bundle, retained)
+    return result
+
+
+def release_case(bundle, retained):
+    """After graph reset, close the lease before breaking Python owner cycles."""
+    # A failing graph reset or lease close must keep every owner alive until
+    # the CLI's fatal exit; do not put this cleanup in a finally block.
     if bundle.lease is not None:
         phase(retained, "lease_close")
         bundle.lease.close()
-    case_retained.clear()
+    # verify/read_counts capture bundle, and AutoReplay points back to bundle.
+    # Refcounting otherwise cannot release their large tensors between cases.
+    for name in ("reset", "verify", "read_counts", "auto_replay"):
+        if hasattr(bundle, name):
+            delattr(bundle, name)
+    retained["active_case"].clear()
     del retained["active_case"]
-    return result
+
+
+def checkpoint_case(retained, name, result):
+    retained.setdefault("completed_cases", {})[name] = result
+    if journal := retained.get("journal"):
+        journal.case(name, result)
+    phase(retained, "case_complete")
 
 
 def release_context(context):
@@ -912,7 +933,7 @@ def run(args, archive, retained):
             raise ValueError("Seed-UB has no eligible queries; refusing an all-fallback comparison")
     phase(retained, "context_allocate")
     retained["geometry"] = getattr(archive, "manifest", {}).get("geometry", {})
-    completed = retained.setdefault("completed_cases", {})
+    retained.setdefault("completed_cases", {})
     context = allocate_context(args, archive, retained)
     execution_study = getattr(args, "study", "threshold") in (
         "pipeline",
@@ -938,7 +959,7 @@ def run(args, archive, retained):
             emit(f"CASE_BEGIN {args.transport}-{args.mode}-{name}")
             args.fused_tuning = tuning
             cases[name] = measure_case(args, archive, context, retained)
-            completed[name] = cases[name]
+            checkpoint_case(retained, name, cases[name])
             emit(f"CASE_PASS {args.transport}-{args.mode}-{name} p50_us={cases[name]['timing']['p50_us']:.3f}")
         phase(retained, "case_equivalence")
         verify_case_equivalence(cases, same_threshold=execution_study)
@@ -979,7 +1000,7 @@ def run(args, archive, retained):
             else "serial"
         )
         result = measure_case(args, archive, context, retained)
-        completed[retained["progress"]["variant"]] = result
+        checkpoint_case(retained, retained["progress"]["variant"], result)
     phase(retained, "context_release")
     release_context(context)
     return result
