@@ -38,6 +38,10 @@
 #ifndef KVIP_REFILTER_SAFE
 #define KVIP_REFILTER_SAFE 0
 #endif
+// Independent of threshold estimation: only changes compact output location.
+#ifndef KVIP_COMPACT_OUT_OF_PLACE
+#define KVIP_COMPACT_OUT_OF_PLACE 0
+#endif
 #ifndef KVIP_REFILTER_REFILL
 #define KVIP_REFILTER_REFILL 0
 #endif

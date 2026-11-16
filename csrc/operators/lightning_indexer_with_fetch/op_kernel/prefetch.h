@@ -733,16 +733,18 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
 #endif
         auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;
         uint32_t count=0,missing=0;
-#if KVIP_REFILTER_REFILL
+#if KVIP_REFILTER_REFILL || KVIP_COMPACT_OUT_OF_PLACE
         // Existing Q2/16K work tensor: cfg[1536:2016] is disjoint from
         // bitmap words, frozen Q4 progress, thresholds and batched post inputs.
         // Window allowance is validated <=480. No new UB/GM allocation.
         auto selectedIds=cfg[1536];
+#else
+        auto selectedIds=ids;
+#endif
+#if KVIP_REFILTER_REFILL
         const uint32_t allowance=PrefetchAllowance(slots,requests,state.GetValue(208),
             state.GetValue(209),state.GetValue(210),ctx->windowLimit);
         for(;;) {
-#else
-        auto selectedIds=ids;
 #endif
 #define KV_WINDOW_HISTORY rt_history
 #define KV_WINDOW_RESIDENT rt_resident
@@ -764,6 +766,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
                 // No slot has ever been assigned: the OR bitmap already
                 // deduplicated tokens, so every candidate is a new miss.
                 missing=candidateCount;count=missing<available?missing:available;
+                selectedIds=ids; // No compaction on this existing all-miss shortcut.
             } else {
                 Simt::VF_CALL<GatherCandidateMap>(Simt::Dim3{256,1,1},
                     reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),map,candidateCount,
@@ -773,7 +776,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
                 SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
                 CompactMisses(reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
                     reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),candidateCount,available,
-#if KVIP_REFILTER_REFILL
+#if KVIP_REFILTER_REFILL || KVIP_COMPACT_OUT_OF_PLACE
                     reinterpret_cast<__ubuf__ uint32_t*>(selectedIds[count].GetPhyAddr())
 #else
                     reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr())

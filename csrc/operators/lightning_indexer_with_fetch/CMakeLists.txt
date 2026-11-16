@@ -19,6 +19,7 @@ if(KVIP_ROLLING_FIRST_WINDOW AND NOT KVIP_ROLLING_COMPACT)
 endif()
 option(KVIP_ROLLING_BATCHED "Batch eight LI score tiles per CDF update" OFF)
 option(KVIP_WINDOW_REFILTER "Recheck cold candidates against rolling Kth before admission" OFF)
+option(KVIP_COMPACT_OUT_OF_PLACE "Compact admitted IDs into disjoint existing UB scratch" OFF)
 option(KVIP_REFILTER_SAFE "Keep candidates with a causal query score not yet published" OFF)
 option(KVIP_REFILTER_REFILL "Refill filtered candidate batches within the frozen window" OFF)
 if(KVIP_REFILTER_SAFE AND NOT KVIP_WINDOW_REFILTER)
@@ -54,6 +55,7 @@ ascendc_compile_options(v9_kernel PRIVATE -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WO
   -DKVIP_ROLLING_FIRST_WINDOW=$<BOOL:${KVIP_ROLLING_FIRST_WINDOW}>
   -DKVIP_ROLLING_WINDOWED=$<BOOL:${KVIP_ROLLING_WINDOWED}>
   -DKVIP_ROLLING_BATCHED=$<BOOL:${KVIP_ROLLING_BATCHED}>
+  -DKVIP_COMPACT_OUT_OF_PLACE=$<BOOL:${KVIP_COMPACT_OUT_OF_PLACE}>
   -DKVIP_REFILTER_SAFE=$<BOOL:${KVIP_REFILTER_SAFE}>
   -DKVIP_REFILTER_REFILL=$<BOOL:${KVIP_REFILTER_REFILL}>
   -DKVIP_WINDOW_REFILTER=$<BOOL:${KVIP_WINDOW_REFILTER}>
@@ -68,3 +70,4 @@ target_compile_definitions(v9_bridge PRIVATE KVIP_ROLLING_WINDOWED=$<BOOL:${KVIP
 target_compile_definitions(v9_bridge PRIVATE KVIP_ROLLING_COMPACT=$<BOOL:${KVIP_ROLLING_COMPACT}> KVIP_ROLLING_FIRST_WINDOW=$<BOOL:${KVIP_ROLLING_FIRST_WINDOW}>)
 target_link_libraries(v9_bridge PRIVATE v9_kernel host_intf_pub ascendcl)
 target_compile_definitions(v9_bridge PRIVATE KVIP_REFILTER_SAFE=$<BOOL:${KVIP_REFILTER_SAFE}> KVIP_REFILTER_REFILL=$<BOOL:${KVIP_REFILTER_REFILL}>)
+target_compile_definitions(v9_bridge PRIVATE KVIP_COMPACT_OUT_OF_PLACE=$<BOOL:${KVIP_COMPACT_OUT_OF_PLACE}>)

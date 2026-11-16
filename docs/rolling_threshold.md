@@ -254,3 +254,33 @@ lane models, ASAN and UBSAN. They cover Q4 publication skew, ties, causal ends,
 all publication masks, capacity cutoffs, unaligned append boundaries and budget
 limits. Bitmap DMA enumeration is mocked in the refill test; remote CANN build
 and five-snapshot output/threshold/transport validation remain required.
+
+## Isolate compaction from admission policy
+
+Host20 f72ce09 measurements do not establish a benefit over the original fused
+path for either safe refilter or refill. Safe refilter improves useful prefetch
+in G7/G10/G17 but its incremental mean changes are below 1%. Refill saves about
+12--16 us against safe refilter, including 14 us in G2 with unchanged traffic.
+It also reduces useful prefetch in G7/G10/G17. This is not evidence of a better
+prefetch policy: refill also changed compaction from overlapping input/output
+to disjoint UB storage, and asynchronous progress can differ between variants.
+
+`compact_out_of_place` isolates that storage change. It needs no rolling score
+buffer, refilter or refill loop. The same VF reads the same IDs and flags and
+writes the same stable selected prefix into existing `cfg[1536:2016]` storage.
+Submission reads this prefix directly; no extra copy kernel, allocation, sort,
+budget or publication boundary is introduced. The original all-miss shortcut
+continues to submit its unmodified input list. Default is OFF. Only H32 split-Q
+B1..16 without sequence splitting is allowed until another layout is proved.
+This is an alias/scheduling hypothesis, not a demonstrated device optimization.
+
+Replay separately compares reverse-only, reverse plus disjoint compaction,
+compact windowed safe refilter, and first-window-only correction with/without
+safe refilter. Refill is disabled throughout. Both unchanged forward and
+reverse-only controls run at the start and end. Headline gains are relative to
+the faster unchanged-forward repeat, independently for mean and median; extra
+gain beyond reverse-only is reported separately. A traffic reduction alone is
+not enough to retain a candidate. CPU tests compare the actual compact VF with
+an independent stable-selection oracle, in-place and disjoint destinations,
+tail lengths, capacity limits and guard regions. Device compilation and timing
+remain part of remote validation.

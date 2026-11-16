@@ -299,8 +299,8 @@ int main(){
     execute(tmp_path, source, "rolling_publication")
 
 
-@pytest.mark.parametrize("refill", [0, 1])
-def test_actual_refill_loop_fills_only_frozen_window_without_budget_growth(tmp_path, refill):
+@pytest.mark.parametrize("refill,out_of_place", [(0,0), (0,1), (1,0), (1,1)])
+def test_actual_refill_loop_fills_only_frozen_window_without_budget_growth(tmp_path, refill, out_of_place):
     """Run the native admission loop and VF; mock only bitmap DMA/enumeration."""
     text = (NATIVE / "op_kernel/prefetch.h").read_text()
     decoder = function(text, "inline uint32_t DecodeScanToken(")
@@ -394,6 +394,27 @@ void run(unsigned limit,bool hits){
  for(unsigned i=4096+1536+count;i<storage.size();++i)assert(storage[i]==0xa5a5a5a5);
  for(auto value:mapData)assert(value==UINT32_MAX);
 }
-int main(){for(bool hits:{false,true})for(unsigned limit:{0U,1U,7U,64U,119U,120U,480U})run(limit,hits);}
+void compactEquivalence(){
+ for(unsigned count:{0U,1U,63U,64U,65U,127U,128U,2047U,2048U})
+ for(unsigned limit:{0U,1U,63U,64U,480U})for(unsigned pattern=0;pattern<4;++pattern){
+  std::array<uint32_t,2048> ids,slots,reference;
+  std::vector<uint32_t> expected;
+  for(unsigned i=0;i<2048;++i){
+   ids[i]=2047-i;slots[i]=(pattern==0||(pattern==2&&i%2)||(pattern==3&&(i*17%43)<7))?UINT32_MAX:3;
+   if(i<count&&slots[i]==UINT32_MAX)expected.push_back(ids[i]);
+  }
+  reference=ids;
+  std::array<uint32_t,128> cfg{};std::array<uint32_t,512> dst;dst.fill(0xabcddcbaU);
+  CompactMisses(ids.data(),slots.data(),cfg.data(),count,limit,dst.data()+16);
+  assert(cfg[56]==expected.size()&&ids==reference);
+  unsigned n=std::min(unsigned(expected.size()),limit);
+  for(unsigned i=0;i<n;++i)assert(dst[16+i]==expected[i]);
+  for(unsigned i=0;i<16;++i)assert(dst[i]==0xabcddcbaU);
+  for(unsigned i=16+n;i<512;++i)assert(dst[i]==0xabcddcbaU);
+  CompactMisses(ids.data(),slots.data(),cfg.data(),count,limit,ids.data());
+  assert(cfg[56]==expected.size());for(unsigned i=0;i<n;++i)assert(ids[i]==dst[16+i]);
+ }
+}
+int main(){compactEquivalence();for(bool hits:{false,true})for(unsigned limit:{0U,1U,7U,64U,119U,120U,480U})run(limit,hits);}
 '''
-    execute(tmp_path, f"#define KVIP_REFILTER_REFILL {refill}\n" + source, "refill_loop")
+    execute(tmp_path, f"#define KVIP_REFILTER_REFILL {refill}\n#define KVIP_COMPACT_OUT_OF_PLACE {out_of_place}\n" + source, "refill_loop")

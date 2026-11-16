@@ -39,7 +39,7 @@ def build_failure(log, stage, returncode):
 
 def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False,
                     rolling_threshold=False, window_refilter=False, rolling_batched=False, rolling_windowed=False,
-                    rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False):
+                    rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False, compact_out_of_place=False):
     """Build one shape-independent binary per source/toolchain/SoC."""
     if (window_refilter or rolling_batched or rolling_windowed) and not rolling_threshold:
         raise ValueError("Window refilter and batched counts require rolling threshold")
@@ -59,6 +59,7 @@ def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False,
         ASCEND_CANN_PACKAGE_PATH=str(cann),
         KVAF_INCLUDE=str(headers),
         SOC_VERSION=soc,
+        KVIP_COMPACT_OUT_OF_PLACE="ON" if compact_out_of_place else "OFF",
         KVIP_REFILTER_SAFE="ON" if refilter_safe else "OFF",
         KVIP_REFILTER_REFILL="ON" if refilter_refill else "OFF",
         KVIP_REVERSE_COLD="ON" if reverse_cold else "OFF",

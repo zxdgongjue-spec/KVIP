@@ -3,6 +3,7 @@
 #include "context.h"
 #include "cold_scan.h"
 #include "rolling_threshold.h"
+extern "C" uint32_t kvip_compact_out_of_place() { return KVIP_COMPACT_OUT_OF_PLACE; }
 extern "C" uint32_t kvip_refilter_safe() { return KVIP_REFILTER_SAFE; }
 extern "C" uint32_t kvip_refilter_refill() { return KVIP_REFILTER_REFILL; }
 extern "C" uint32_t kvip_rolling_compact() { return KVIP_ROLLING_COMPACT; }
@@ -25,6 +26,12 @@ extern "C" uint32_t aclrtlaunch_v9_li_kernel_1(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_2(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_3(uint32_t,void*,void*);
 extern "C" uint32_t v9_li(void* bindings, void* stream, const rotating::RuntimeShape* shape) {
+#if KVIP_COMPACT_OUT_OF_PLACE
+    // cfg[1536:2016] fits the existing split-Q/16K work bank. Other
+    // geometries need their own scratch proof before enabling this option.
+    if (!shape || !shape->splitQ || shape->batch > 16 || shape->indexHeads != 32 ||
+        rotating::UseSequenceSplit(*shape)) return 100000;
+#endif
 #if KVIP_ROLLING_THRESHOLD
     // The persistent histogram belongs to one Q producer. Do not silently
     // use an unseeded state when a different kernel owns each sequence shard.
