@@ -6,16 +6,18 @@ import json
 from pathlib import Path
 from statistics import mean
 
-from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS
+from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, options_for
 
 
-def load_report(path, *, require_rolling=False, expected_native=None, snapshot=None):
+def load_report(path, *, require_rolling=False, require_batched=False, expected_native=None, snapshot=None):
     data = json.loads(path.read_text())
     order = tuple(data.get("execution_order", ()))
-    if data.get("status") != "pass" or order not in (DEFAULT_VARIANTS, ROLLING_VARIANTS):
+    if data.get("status") != "pass" or order not in (DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, options_for):
         raise ValueError("Missing or incomplete controlled scan experiment")
-    if require_rolling and order != ROLLING_VARIANTS:
+    if require_rolling and order not in (ROLLING_VARIANTS, BATCHED_VARIANTS):
         raise ValueError("Old scan/budget experiment: rolling/refilter cases were not measured")
+    if require_batched and order != BATCHED_VARIANTS:
+        raise ValueError("Batched histogram variants were not measured")
     digest = None if snapshot is None else hashlib.sha256((snapshot / "manifest.json").read_bytes()).hexdigest()
     for name in order:
         case = data["cases"][name]
@@ -23,7 +25,7 @@ def load_report(path, *, require_rolling=False, expected_native=None, snapshot=N
             raise ValueError(f"{name}: native revision does not match {expected_native}")
         if digest and case.get("snapshot_sha256") != digest:
             raise ValueError(f"{name}: snapshot manifest does not match")
-        if require_rolling and name in ("reverse-roll", "reverse-refilter", "forward-refilter"):
+        if (require_rolling or require_batched) and options_for(name)["rolling_threshold"]:
             if case.get("rolling_threshold_check", {}).get("status") != "bit_exact":
                 raise ValueError(f"{name}: rolling threshold oracle has not passed")
     return data
@@ -45,8 +47,8 @@ def reduction(before, after):
     return f"{100 * (1 - after / before):+.2f}%" if before else "n/a"
 
 
-def report(path, *, require_rolling=False, expected_native=None, snapshot=None, check_only=False):
-    data = load_report(path, require_rolling=require_rolling, expected_native=expected_native, snapshot=snapshot)
+def report(path, *, require_rolling=False, require_batched=False, expected_native=None, snapshot=None, check_only=False):
+    data = load_report(path, require_rolling=require_rolling, require_batched=require_batched, expected_native=expected_native, snapshot=snapshot)
     if check_only:
         return
     order = data["execution_order"]
@@ -78,17 +80,31 @@ def report(path, *, require_rolling=False, expected_native=None, snapshot=None, 
         pairs = (("forward", "reverse"), ("reverse", "reverse-roll"),
                  ("reverse-roll", "reverse-refilter"), ("forward", "forward-refilter"),
                  ("forward-refilter", "reverse-refilter"))
+    if tuple(order) == BATCHED_VARIANTS:
+        pairs = (("reverse", "reverse-batch"), ("reverse-batch", "reverse-batch-ref"),
+                 ("reverse-refilter", "reverse-batch-ref"))
     for left, right in pairs:
         a, b = cases[left]["timing"], cases[right]["timing"]
-        print(f"CHANGE {left}->{right} mean_gain={100*(1-b['mean_us']/a['mean_us']):+.2f}% "
-              f"p50_gain={100*(1-b['p50_us']/a['p50_us']):+.2f}%")
+        timing_change = (f"CHANGE {left}->{right} mean_gain={100*(1-b['mean_us']/a['mean_us']):+.2f}% "
+                         f"p50_gain={100*(1-b['p50_us']/a['p50_us']):+.2f}%")
         a, b = transfers[left], transfers[right]
+        if tuple(order) == BATCHED_VARIANTS:
+            print(f"{timing_change} waste_save_MiB={(a['waste']-b['waste'])/2**20:+.4f} "
+                  f"repair_delta_MiB={(b['repair']-a['repair'])/2**20:+.4f} "
+                  f"total_save_MiB={(a['total']-b['total'])/2**20:+.4f}")
+            continue
+        print(timing_change)
         print(f"  BYTES waste_save_MiB={(a['waste']-b['waste'])/2**20:+.4f} "
               f"waste_save={reduction(a['waste'], b['waste'])} "
               f"repair_delta_MiB={(b['repair']-a['repair'])/2**20:+.4f} "
               f"total_save_MiB={(a['total']-b['total'])/2**20:+.4f} "
               f"total_save={reduction(a['total'], b['total'])}")
-    for name in order:
+    checks = {name: cases[name]["rolling_threshold_check"] for name in order
+              if cases[name].get("rolling_threshold_check")}
+    if tuple(order) == BATCHED_VARIANTS:
+        print("ROLLING_CHECK " + " ".join(
+            f"{name}={check['status']}/capped:{check['capped_queries']}" for name, check in checks.items()))
+    for name in (() if tuple(order) == BATCHED_VARIANTS else order):
         check = cases[name].get("rolling_threshold_check")
         if check:
             print(f"THRESHOLD {name} bounded_CDF={check['status']} "
@@ -102,12 +118,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("result", type=Path)
     parser.add_argument("--require-rolling", action="store_true")
+    parser.add_argument("--require-batched", action="store_true")
     parser.add_argument("--expected-native")
     parser.add_argument("--snapshot", type=Path)
     parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args()
     try:
-        report(args.result, require_rolling=args.require_rolling, expected_native=args.expected_native,
+        report(args.result, require_rolling=args.require_rolling, require_batched=args.require_batched, expected_native=args.expected_native,
                snapshot=args.snapshot, check_only=args.check_only)
     except (OSError, ValueError, KeyError) as error:
         parser.exit(1, f"REPORT_REJECTED: {error}\n")

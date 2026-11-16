@@ -7,10 +7,10 @@ import numpy as np
 import pytest
 
 from kvip.diagnostics import replay, replay_measure, scan_report, scan_options
-from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, budgets_for, options_for, validate_options
+from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, budgets_for, options_for, validate_options
 
 
-@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS])
+@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS])
 def test_scan_study_reuses_one_arena_and_delivers_independent_options(monkeypatch, variants):
     args = SimpleNamespace(study="scan-order", mode="fused", transport="urma",
                            threshold_policy="recent", scan_variants=list(variants))
@@ -34,7 +34,7 @@ def test_scan_study_reuses_one_arena_and_delivers_independent_options(monkeypatc
     assert calls == [(name, options_for(name), budgets_for(name)) for name in variants]
 
 
-@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS])
+@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS])
 def test_actual_command_line_accepts_scan_variants(tmp_path, variants):
     args = replay.arguments([
         "--snapshot", str(tmp_path / "input"), "--build-dir", str(tmp_path / "build"),
@@ -69,9 +69,9 @@ def test_report_uses_full_chain_and_keeps_mean_and_median_separate(tmp_path, cap
 
 def test_rolling_experiment_does_not_change_budgets_or_enable_pipeline_options():
     assert {budgets_for(name) for name in ROLLING_VARIANTS} == {(512, 64)}
-    assert options_for("reverse-refilter") == dict(reverse_cold=True, rolling_threshold=True, window_refilter=True)
+    assert options_for("reverse-refilter") == dict(reverse_cold=True, rolling_threshold=True, window_refilter=True, rolling_batched=False)
     with pytest.raises(ValueError, match="requires rolling"):
-        validate_options(dict(reverse_cold=True, rolling_threshold=False, window_refilter=True))
+        validate_options(dict(reverse_cold=True, rolling_threshold=False, window_refilter=True, rolling_batched=False))
 
 
 def test_rolling_reference_uses_unique_seed_and_only_scanned_causal_positions():
@@ -183,3 +183,25 @@ def test_scan_compiles_unique_variants_before_allocating_arena(tmp_path, monkeyp
     with pytest.raises(RuntimeError, match="compiler diagnostic"):
         replay_measure.run(args, SimpleNamespace(manifest={}), retained)
     assert retained["progress"] == dict(variant="reverse-roll", phase="compile_preflight", step=None)
+
+
+def test_batch_options_keep_old_control_and_require_new_oracle(tmp_path, capsys):
+    assert not options_for("reverse-refilter")["rolling_batched"]
+    assert options_for("reverse-batch-ref")["rolling_batched"]
+    assert not options_for("reverse-batch")["window_refilter"]
+    assert {budgets_for(name) for name in BATCHED_VARIANTS} == {(512, 64)}
+    data = rolling_report(tmp_path)
+    path = tmp_path / "result.json"
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="Batched histogram variants were not measured"):
+        scan_report.load_report(path, require_batched=True)
+    case = data["cases"]["reverse-refilter"]
+    data["execution_order"] = list(BATCHED_VARIANTS)
+    data["cases"] = {name: dict(case) for name in BATCHED_VARIANTS}
+    path.write_text(json.dumps(data))
+    scan_report.report(path, require_batched=True)
+    assert "CHANGE reverse-refilter->reverse-batch-ref" in capsys.readouterr().out
+    data["cases"]["reverse-batch"].pop("rolling_threshold_check")
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="oracle has not passed"):
+        scan_report.load_report(path, require_batched=True)

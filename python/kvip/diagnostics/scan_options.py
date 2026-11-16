@@ -1,13 +1,21 @@
 """Independent URMA scan-order/admission experiment; no graph-route changes."""
 
-OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter")
+OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched")
 DEFAULT_VARIANTS = ("forward", "reverse", "forward-wide", "reverse-wide", "forward-end")
 VARIANTS = {name: ("reverse_cold",) if name.startswith("reverse") else () for name in DEFAULT_VARIANTS}
 ROLLING_VARIANTS = ("forward", "reverse", "reverse-roll", "reverse-refilter", "forward-refilter", "forward-end")
 VARIANTS.update({
     "reverse-roll": ("reverse_cold", "rolling_threshold"),
-    "reverse-refilter": OPTIONS,
+    "reverse-refilter": ("reverse_cold", "rolling_threshold", "window_refilter"),
     "forward-refilter": ("rolling_threshold", "window_refilter"),
+})
+
+BATCHED_VARIANTS = ("forward", "reverse", "reverse-refilter", "reverse-batch",
+                    "reverse-batch-ref", "forward-batch-ref", "forward-end")
+VARIANTS.update({
+    "reverse-batch": ("reverse_cold", "rolling_threshold", "rolling_batched"),
+    "reverse-batch-ref": OPTIONS,
+    "forward-batch-ref": ("rolling_threshold", "window_refilter", "rolling_batched"),
 })
 
 
@@ -29,10 +37,10 @@ def q_workers_for(name):
 
 def validate_options(options):
     if not isinstance(options, dict) or set(options) != set(OPTIONS):
-        raise ValueError("Scan experiment requires exactly reverse_cold/rolling_threshold/window_refilter")
+        raise ValueError("Scan experiment requires exactly reverse_cold/rolling_threshold/window_refilter/rolling_batched")
     if any(type(value) is not bool for value in options.values()):
         raise ValueError("Scan build options must be bool")
-    if options["window_refilter"] and not options["rolling_threshold"]:
+    if (options["window_refilter"] or options["rolling_batched"]) and not options["rolling_threshold"]:
         raise ValueError("Window refilter requires rolling threshold")
     return dict(options)
 
