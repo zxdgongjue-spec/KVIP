@@ -96,17 +96,40 @@ inline void StagedInitialize(uint32_t history,uint32_t resident,uint32_t batch,u
 }
 
 // Prepare only the hash needed by the resolver. LI produced loc and bitmap.
+#if KVIP_LOW_MISS_DIRECT_INDEX
+__simt_callee__ inline bool StagedDirectIndexSource(
+    uint32_t token,uint32_t location,uint32_t resident,uint32_t history) {
+    return token==UINT32_MAX || location!=UINT32_MAX ||
+        (token>=resident && token<history);
+}
+template<bool CheckDirect>
+#endif
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
 inline void StagedInitializeReady(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc,
     __ubuf__ uint32_t* keys,__ubuf__ uint32_t* ranks,__ubuf__ uint32_t* ctl
 #if KVIP_AUTO_ROUTE
     ,__ubuf__ uint32_t* lru,uint32_t used,uint32_t resident,bool recordFeedback
 #endif
+#if KVIP_LOW_MISS_DIRECT_INDEX
+    ,uint32_t directResident,uint32_t directHistory
+#endif
     ) {
     uint32_t tid=threadIdx.x,missing=0;
     if(tid<8)ctl[tid]=0;
-    for(uint32_t i=tid;i<kSlots;i+=512)
-        missing += selected[i]!=UINT32_MAX && loc[i]==UINT32_MAX;
+#if KVIP_LOW_MISS_DIRECT_INDEX
+    // The proof covers all Qs before any Index row changes. An invalid hot
+    // source can alias a later destination and must keep permutation planning.
+    uint32_t invalidDirect=0;
+    if constexpr(CheckDirect){if(!tid)ctl[9]=0;}
+#endif
+    for(uint32_t i=tid;i<kSlots;i+=512){
+        bool pending=selected[i]!=UINT32_MAX && loc[i]==UINT32_MAX;
+        missing+=pending;
+#if KVIP_LOW_MISS_DIRECT_INDEX
+        if constexpr(CheckDirect)invalidDirect |= !StagedDirectIndexSource(
+            selected[i],loc[i],directResident,directHistory);
+#endif
+    }
     uint32_t counts=missing;
 #if KVIP_AUTO_ROUTE
     // Ordinary hot hits exclude every reserved LRU candidate. A protected
@@ -119,7 +142,11 @@ inline void StagedInitializeReady(__ubuf__ uint32_t* selected,__ubuf__ uint32_t*
     }
     counts|=useful<<16;
 #endif
-    asc_syncthreads();StagedPrefix(counts,ctl);
+    asc_syncthreads();
+#if KVIP_LOW_MISS_DIRECT_INDEX
+    if constexpr(CheckDirect){if(invalidDirect)asc_atomic_or(ctl+9,1U);}
+#endif
+    StagedPrefix(counts,ctl);
     uint32_t n=ctl[544+512/warpSize-1];
 #if KVIP_AUTO_ROUTE
     n&=0xffffU;

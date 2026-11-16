@@ -10,6 +10,9 @@
 #include "publication_flags.h"
 #include "ready_batch_fetch.h"
 #include "shadow_exchange_parallel.h"
+#if KVIP_LOW_MISS_DIRECT_INDEX
+#include "disjoint_index.h"
+#endif
 #include "index_cache_update.h"
 using namespace AscendC;
 using namespace rotating;
@@ -169,11 +172,28 @@ __aicore__ inline uint32_t Producer(__gm__ Args* a, uint32_t b) {
  );
  PipeBarrier<PIPE_V>();
  if(profile)ticks[2]=GetSystemCycle();
+#if KVIP_LOW_MISS_DIRECT_INDEX
+ // Compile the high-prefetch prepass without any direct-exchange proof work.
+ if(!row->slots){
+  Simt::VF_CALL<StagedInitializeReady<true>>(Simt::Dim3{512,1,1},FinalPtr(selected),FinalPtr(loc),FinalPtr(keys),FinalPtr(ranks),FinalPtr(ctl)
+#if KVIP_AUTO_ROUTE
+   ,FinalPtr(work[4096]),row->slots,shape.resident,ctx->autoRoute!=0
+#endif
+   ,shape.resident,shape.history);
+ }else{
+  Simt::VF_CALL<StagedInitializeReady<false>>(Simt::Dim3{512,1,1},FinalPtr(selected),FinalPtr(loc),FinalPtr(keys),FinalPtr(ranks),FinalPtr(ctl)
+#if KVIP_AUTO_ROUTE
+   ,FinalPtr(work[4096]),row->slots,shape.resident,ctx->autoRoute!=0
+#endif
+   ,shape.resident,shape.history);
+ }
+#else
  Simt::VF_CALL<StagedInitializeReady>(Simt::Dim3{512,1,1},FinalPtr(selected),FinalPtr(loc),FinalPtr(keys),FinalPtr(ranks),FinalPtr(ctl)
 #if KVIP_AUTO_ROUTE
   ,FinalPtr(work[4096]),row->slots,shape.resident,ctx->autoRoute!=0
 #endif
  );
+#endif
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  if(profile)ticks[3]=GetSystemCycle();
  GlobalTensor<uint32_t> output;output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*kSlots);
@@ -197,6 +217,10 @@ __aicore__ inline uint32_t Producer(__gm__ Args* a, uint32_t b) {
   SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
   if(profile)ticks[14+q*5]=GetSystemCycle();
   uint32_t published=KVIP_OUTPUT_WORKER?kRawQueryFlag+q:q+1;
+#if KVIP_LOW_MISS_DIRECT_INDEX
+  // Q0 publishes a proof over the full selected Q4 set, not just Q0 misses.
+  if(!q)flags[published].reserved[0]=!row->slots && !ctl.GetValue(9);
+#endif
   flags[published].count=added;flags[published].error=error;flags[published].ready=1;
   if(profile)ticks[4+q]=GetSystemCycle();status[4+q]=added;status[8+q]=total;
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&flags[published]),sizeof(BatchFlag));
@@ -242,9 +266,32 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
  auto work=reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr());
  uint32_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
  if(profile)ticks[10]=GetSystemCycle();
+ uint32_t total=0,error=0,seen=0;bool denseMode=false;
+#if KVIP_LOW_MISS_DIRECT_INDEX
+ bool directIndex=false;
+ uint32_t directChunks=0;
+ if(profile){ticks[2]=0;ticks[3]=0;}
+ auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
+ if(!row->slots){
+  // Empty-prefetch rows have no Index work before Q0. Defer shadow-map
+  // initialization until its all-Q proof arrives; other rows are unchanged.
+  uint64_t wait=GetSystemCycle();
+  while(true){
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+kRawQueryFlag),sizeof(BatchFlag));
+   if(flags[kRawQueryFlag].ready)break;
+   if(GetSystemCycle()-wait>5000000000ULL){error=8;break;}
+  }
+  if(!error){error=flags[kRawQueryFlag].error;
+   directIndex=!error && flags[kRawQueryFlag].reserved[0]==1;}
+ }
+ if(profile)ticks[2]=directIndex;
+ if(!directIndex){
+#endif
  Simt::VF_CALL<InitShadow>(Simt::Dim3{THREADS,1,1},work);
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
- uint32_t total=0,error=0,seen=0;bool denseMode=false;
+#if KVIP_LOW_MISS_DIRECT_INDEX
+ }
+#endif
  auto dense=reinterpret_cast<__gm__ uint32_t*>(a->denseShadow)+uint64_t(b)*shape.history*6;
  bool prepareMetadata=(a->prefetchCount & 0x08000000U)!=0;
  auto update=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);
@@ -270,6 +317,21 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
   auto source=reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+b*a->maxEvents;
   auto dest=reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+b*a->maxEvents;
   if(profile)ticks[12+2*phase]=GetSystemCycle();
+#if KVIP_LOW_MISS_DIRECT_INDEX
+  if(directIndex){
+   Simt::VF_CALL<ApplyDisjointIndex>(Simt::Dim3{THREADS,1,1},source,dest,begin,count,
+    shape.resident,shape.history,
+    reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*a->history*16,
+    reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*a->history,work);
+   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+   error=local.GetValue(CONTROL);
+   if(!error){seen+=count;directChunks+=(count+CHUNK-1)/CHUNK;
+    if(phase)total+=count;
+    if(profile)ticks[3]+=count;}
+   if(profile)ticks[13+2*phase]=GetSystemCycle();
+   continue;
+  }
+#endif
   // Each exchange introduces at most two new positions into either map.
   // Switch before exact saturation as well: retain an empty probe terminator.
   if(!denseMode && uint64_t(seen+count)*2>=MAP){
@@ -298,6 +360,14 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
     && seen
 #endif
  ){auto update=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);uint64_t addressStride=update[7];if(profile)ticks[22]=GetSystemCycle();
+#if KVIP_LOW_MISS_DIRECT_INDEX
+  if(directIndex){
+   auto source=reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+b*a->maxEvents;
+   auto dest=reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+b*a->maxEvents;
+   Simt::VF_CALL<CommitDisjointMetadata>(Simt::Dim3{THREADS,1,1},source,dest,
+    kPrefetch,total,addresses,logical);
+  }else{
+#endif
   if(prepareMetadata && !denseMode){
    static_assert(2*MAP*sizeof(uint64_t)<=4*CHUNK*16*sizeof(uint32_t),"Metadata staging exceeds dead key/scale staging");
    GlobalTensor<uint64_t> source;source.SetGlobalBuffer(prepared);
@@ -308,8 +378,15 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
   if(prepareMetadata)Simt::VF_CALL<CommitPreparedMetadata>(Simt::Dim3{THREADS,1,1},addresses,logical,prepared,shape.history,work,dense,denseMode);
   else if(denseMode)Simt::VF_CALL<CommitDenseMetadata>(Simt::Dim3{THREADS,1,1},reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(owner)*addressStride,reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*a->history,dense,reinterpret_cast<__gm__ uint64_t*>(dense+2*shape.history),shape.history);
   else Simt::VF_CALL<CommitMetadata>(Simt::Dim3{THREADS,1,1},reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(owner)*addressStride,reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*a->history,work);
+#if KVIP_LOW_MISS_DIRECT_INDEX
+  }
+#endif
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);if(profile)ticks[23]=GetSystemCycle();}
  status[0]=error;status[1]=total;
+#if KVIP_LOW_MISS_DIRECT_INDEX
+ if(directIndex)status[2]=directChunks;
+ else
+#endif
  status[2]=local.GetValue(CONTROL+4);
  if(profile)ticks[24]=GetSystemCycle();
  if(a->updateBindings){auto u=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);Simt::VF_CALL<PublishStreamingUpdateStatus>(Simt::Dim3{32,1,1},reinterpret_cast<__gm__ uint32_t*>(u[6]),b,error);SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);}

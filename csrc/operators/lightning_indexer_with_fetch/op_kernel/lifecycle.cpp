@@ -131,6 +131,17 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
                     if(ctx->rowOwners)kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->rowOwners),rt_batch*4);
                     if(ctx->queryEnds)kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->queryEnds),rt_batch*16);
                 }
+#if KVIP_AUTO_ROUTE_ROW_PUBLISH
+                if (kvip_auto_route::CanPublishRows(ctx)) {
+                    if (kvip_auto_route::Evaluate<true,true>(ctx,noPrefetch,b)) {
+                        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(config->pending)+b*128,128);
+                        if (b%8==0) {
+                            uint32_t rows=rt_batch-b;if(rows>8)rows=8;
+                            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->admissionControls)+b*16,rows*16);
+                        }
+                    }
+                } else
+#endif
                 if (!b) {
                     if (kvip_auto_route::Evaluate<true>(ctx,noPrefetch)) {
                         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(config->pending),rt_batch*128);
@@ -173,8 +184,8 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
 #if KVIP_ADAPTIVE_ADMISSION
 #if KVIP_AUTO_ROUTE
         if (ctx->autoRoute) {
-            // Block 0 owns controls. Other init blocks never read its writes;
-            // a low round performs no prefetch, so this full limit is unused.
+            // Init blocks do not read controls written by another block.
+            // A low round performs no prefetch, so this full limit is unused.
             auto config = reinterpret_cast<__gm__ kvip_auto_route::Config*>(ctx->autoRoute);
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(config),128);
             if (kvip_auto_route::Valid(config)) row->prefetchLimit=uint32_t(config->fullTotal);

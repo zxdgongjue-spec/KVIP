@@ -14,6 +14,8 @@ extern "C" uint32_t kvip_low_miss_tail() { return KVIP_LOW_MISS_TAIL; }
 extern "C" uint32_t kvip_low_miss_hot_hits() { return KVIP_LOW_MISS_TAIL && KVIP_SELECTED_METADATA; }
 extern "C" uint32_t kvip_low_miss_sparse_init() { return KVIP_LOW_MISS_SPARSE_INIT; }
 extern "C" uint32_t kvip_auto_route_fast_probe() { return KVIP_AUTO_ROUTE_FAST_PROBE; }
+extern "C" uint32_t kvip_auto_route_row_publish() { return KVIP_AUTO_ROUTE_ROW_PUBLISH; }
+extern "C" uint32_t kvip_low_miss_direct_index() { return KVIP_LOW_MISS_DIRECT_INDEX; }
 extern "C" uint32_t kvip_init_route_profile() { return 1; }
 extern "C" uint32_t kvip_auto_route() { return KVIP_AUTO_ROUTE; }
 extern "C" uint32_t kvip_prefetch_rank() { return KVIP_PREFETCH_RANK; }

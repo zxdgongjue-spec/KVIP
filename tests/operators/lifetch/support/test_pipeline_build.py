@@ -57,7 +57,8 @@ def test_pipeline_options_isolate_and_reuse_the_correct_binary(monkeypatch, tmp_
 @pytest.mark.parametrize("option", ("compact_init", "adaptive_admission", "prefetch_gate",
                                     "skip_exhausted_prefetch", "early_prefetch_drain", "inverse_mapping",
                                     "low_miss_skip", "low_miss_tail", "auto_route", "low_miss_sparse_init",
-                                    "auto_route_fast_probe"))
+                                    "auto_route_fast_probe", "auto_route_row_publish",
+                                    "low_miss_direct_index"))
 def test_pipeline_options_reject_ambiguous_values_before_build(tmp_path, value, option):
     with pytest.raises(ValueError, match="must be bool"):
         build.build_libraries(cache_dir=tmp_path, cann=tmp_path, headers=tmp_path, soc="A5", **{option: value})
@@ -167,6 +168,36 @@ def test_auto_route_requires_complete_tail_and_isolates_binary(monkeypatch, tmp_
     assert manifest["KVIP_AUTO_ROUTE_FAST_PROBE"] == "ON"
     assert build.build_libraries(**args, **light, **sparse_flags, auto_route_fast_probe=True) == fast
     assert len(calls) == previous + 4
+
+    with pytest.raises(ValueError, match="auto_route_row_publish requires"):
+        build.build_libraries(**args, **light, auto_route_row_publish=True)
+    with pytest.raises(ValueError, match="row publication requires complete evaluation"):
+        build.build_libraries(**args, **light, **sparse_flags,
+                              auto_route_row_publish=True, auto_route_fast_probe=True)
+    row_flags = light | sparse_flags | dict(auto_route_row_publish=True)
+    row = build.build_libraries(**args, **row_flags)
+    assert row not in (automatic, sparse, fast)
+    direct = build.build_libraries(**args, **row_flags, low_miss_direct_index=True)
+    assert direct not in (automatic, sparse, fast, row)
+    manifest = json.loads((direct[0].parent / "complete.json").read_text())
+    assert manifest["KVIP_AUTO_ROUTE_ROW_PUBLISH"] == "ON"
+    assert manifest["KVIP_LOW_MISS_DIRECT_INDEX"] == "ON"
+    count = len(calls)
+    assert build.build_libraries(**args, **row_flags, low_miss_direct_index=True) == direct
+    assert len(calls) == count
+
+
+@pytest.mark.parametrize("missing", ("low_miss_tail", "selected_metadata", "early_fetch_ready"))
+def test_direct_index_requires_proved_streaming_path(monkeypatch, tmp_path, missing):
+    compile_ = Mock()
+    monkeypatch.setattr(build.subprocess, "run", compile_)
+    flags = dict(adaptive_admission=True, low_miss_skip=True, low_miss_tail=True,
+                 selected_metadata=True, early_fetch_ready=True, low_miss_direct_index=True)
+    flags[missing] = False
+    with pytest.raises(ValueError, match="low_miss_direct_index requires"):
+        build.build_libraries(cache_dir=tmp_path, cann=tmp_path, headers=tmp_path,
+                              soc="A5", **flags)
+    compile_.assert_not_called()
 
 
 @pytest.mark.parametrize("rank", (-1, 2049, True, False, 1536.0, "1536", None))

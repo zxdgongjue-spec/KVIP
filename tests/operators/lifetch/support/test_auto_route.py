@@ -16,6 +16,7 @@ def test_auto_route_decision_identity_and_success_commit(tmp_path, fast_probe):
     source = tmp_path / "route.cpp"
     source.write_text(r'''
 #include <array>
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <random>
@@ -28,14 +29,35 @@ struct Context {
 struct Fixture {
  std::array<Request,16> requests{};
  std::array<Feedback,17> feedback{};
- std::array<Pending,16> pending{};
- std::array<int32_t,64> controls{};
+ alignas(128) std::array<Pending,16> pending{};
+ alignas(128) std::array<int32_t,64> controls{};
  std::array<uint32_t,16> owners{};
  std::array<uint32_t,64> ends{};
  Config config{1,17,uint64_t(requests.data()),uint64_t(feedback.data()),uint64_t(pending.data()),
                128,192,1,1,512,64,0,0,{0,0,0}};
  Context ctx{uint64_t(&config),uint64_t(controls.data()),uint64_t(owners.data()),uint64_t(ends.data())};
  Fixture(){ends.fill(131072);for(unsigned b=0;b<16;++b){owners[b]=b+1;requests[b]={b+1,1,1,4};}}
+ void checkRows(){
+  const auto expectedPending=pending;const auto expectedControls=controls;const auto expectedFeedback=feedback;
+  assert(CanPublishRows(&ctx));
+  std::memset(pending.data(),0xa5,sizeof(pending));controls.fill(-12345);
+  // Reverse order exercises publication before block0 and before other rows.
+  // Each call owns its Pending cache line and at most one control cache line.
+  for(unsigned n=ctx.shape.batch;n;--n){unsigned b=n-1;
+   auto oldPending=pending;auto oldControls=controls;
+   bool low=expectedPending[b].mode!=0;
+   assert((Evaluate<true,true>(&ctx,low,b))&&low==(expectedPending[b].mode==0));
+   assert(!std::memcmp(&pending[b],&expectedPending[b],sizeof(Pending)));
+   for(unsigned j=0;j<16;++j)if(j!=b)assert(!std::memcmp(&pending[j],&oldPending[j],sizeof(Pending)));
+   for(unsigned j=0;j<64;++j){bool writes=b%8==0&&j>=b*4&&j<std::min(b+8,ctx.shape.batch)*4;
+    assert(controls[j]==(writes?expectedControls[j]:oldControls[j]));}
+   assert(!std::memcmp(feedback.data(),expectedFeedback.data(),sizeof(feedback)));
+  }
+  assert(!std::memcmp(pending.data(),expectedPending.data(),ctx.shape.batch*sizeof(Pending)));
+  assert(std::equal(controls.begin(),controls.begin()+ctx.shape.batch*4,expectedControls.begin()));
+  // Restore the untouched capacity suffix, as publishing only active rows does.
+  pending=expectedPending;controls=expectedControls;
+ }
  void check(unsigned mode){
   // Different init blocks can observe block 0 before or after publication.
   // Neither pending nor controls may influence their read-only decisions.
@@ -44,7 +66,7 @@ struct Fixture {
   bool noPrefetch=true;assert(Evaluate<false>(&ctx,noPrefetch));assert(noPrefetch==(mode==0));
   assert(!std::memcmp(savedPending.data(),pending.data(),sizeof(pending)));
   assert(savedControls==controls&&!std::memcmp(savedFeedback.data(),feedback.data(),sizeof(feedback)));
-  assert(Prepare(&ctx));savedPending=pending;savedControls=controls;
+  assert(Prepare(&ctx));checkRows();savedPending=pending;savedControls=controls;
   for(unsigned block=0;block<16;++block){
    noPrefetch=!bool(mode==0);assert(Evaluate<false>(&ctx,noPrefetch));assert(noPrefetch==(mode==0));
    assert(!std::memcmp(savedPending.data(),pending.data(),sizeof(pending))&&savedControls==controls);
@@ -159,12 +181,24 @@ int main(){
     case 5:if(b){request.owner=1;fuzz.owners[b]=1;}break;
    }
   }
-  assert(Prepare(&fuzz.ctx));bool expectedLow=fuzz.pending[0].mode==0;
+  assert(Prepare(&fuzz.ctx));fuzz.checkRows();bool expectedLow=fuzz.pending[0].mode==0;
   auto saved=fuzz.feedback;auto pending=fuzz.pending;auto controls=fuzz.controls;
   bool low=!expectedLow;assert(Evaluate<false>(&fuzz.ctx,low)&&low==expectedLow);
   assert(!std::memcmp(saved.data(),fuzz.feedback.data(),sizeof(saved)));
   assert(!std::memcmp(pending.data(),fuzz.pending.data(),sizeof(pending))&&controls==fuzz.controls);
  }
+ // A row-local writer must not touch unaligned publication storage or an
+ // out-of-range row. The real init kernel uses the original single writer.
+ Fixture alignment;assert(CanPublishRows(&alignment.ctx));
+ bool low=true;auto pendingAddress=alignment.config.pending,controlsAddress=alignment.ctx.admissionControls;
+ auto savedPending=alignment.pending;auto savedControls=alignment.controls;
+ alignment.config.pending+=8;
+ assert(!CanPublishRows(&alignment.ctx));assert((!Evaluate<true,true>(&alignment.ctx,low,0))&&!low);
+ alignment.config.pending=pendingAddress;alignment.ctx.admissionControls+=4;low=true;
+ assert(!CanPublishRows(&alignment.ctx));assert((!Evaluate<true,true>(&alignment.ctx,low,0))&&!low);
+ alignment.ctx.admissionControls=controlsAddress;low=true;
+ assert((!Evaluate<true,true>(&alignment.ctx,low,16))&&!low);
+ assert(!std::memcmp(savedPending.data(),alignment.pending.data(),sizeof(savedPending))&&savedControls==alignment.controls);
  Fixture invalid;invalid.config.fullWindow=0;auto controls=invalid.controls;
  bool noPrefetch=true;auto pending=invalid.pending;
  assert(!Evaluate<false>(&invalid.ctx,noPrefetch)&&!noPrefetch);
@@ -211,7 +245,8 @@ def test_auto_route_device_publication_order():
 def test_actual_prefetch_usefulness_counter_excludes_waste(tmp_path):
     kernel = INCLUDE.parent / "op_kernel"
     source = function((kernel / "resolver_staged_dma2.h").read_text(), "inline void StagedInitializeReady(")
-    counter = source[source.index("uint32_t counts=missing;"):source.index("asc_syncthreads();StagedPrefix(counts,ctl);")]
+    start = source.index("uint32_t counts=missing;")
+    counter = source[start:source.index("asc_syncthreads();", start)]
     cpp = tmp_path / "useful.cpp"
     cpp.write_text(r'''
 #include <algorithm>

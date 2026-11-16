@@ -59,14 +59,20 @@ KVIP_ROUTE_FN inline uint32_t ScaleReads(uint32_t necessary, uint32_t currentQue
 }
 
 // Every init block may evaluate immutable requests and previous successful
-// feedback. Only block 0 publishes pending/control state; evaluating without
-// publication must never read that concurrently written state.
-template<bool Publish, class Context>
-KVIP_ROUTE_FN inline bool Evaluate(KVIP_ROUTE_GM Context* ctx, bool& noPrefetch) {
+// feedback. A publishing evaluator writes all rows or only its assigned row;
+// no evaluator reads pending/control state written by another init block.
+template<bool Publish, bool RowOnly = false, class Context>
+KVIP_ROUTE_FN inline bool Evaluate(KVIP_ROUTE_GM Context* ctx, bool& noPrefetch,
+                                   uint32_t publishRow = UINT32_MAX) {
     noPrefetch = false;
     auto c = reinterpret_cast<const KVIP_ROUTE_GM Config*>(ctx->autoRoute);
     if (!ctx->admissionControls || !Valid(c) || !ctx->shape.batch || ctx->shape.batch > 16)
         return false;
+    if constexpr (RowOnly) {
+        static_assert(Publish, "A row-local evaluator must publish its row");
+        if (publishRow >= ctx->shape.batch || c->pending % 128 || ctx->admissionControls % 128)
+            return false;
+    }
     auto requests = reinterpret_cast<const KVIP_ROUTE_GM Request*>(c->requests);
     auto feedback = reinterpret_cast<const KVIP_ROUTE_GM Feedback*>(c->feedback);
     auto pending = reinterpret_cast<KVIP_ROUTE_GM Pending*>(c->pending);
@@ -90,7 +96,8 @@ KVIP_ROUTE_FN inline bool Evaluate(KVIP_ROUTE_GM Context* ctx, bool& noPrefetch)
     }
     for (uint32_t b = 0; b < ctx->shape.batch; ++b) {
         auto r = requests + b;
-        if constexpr (Publish) {
+        const bool writeRow = Publish && (!RowOnly || b == publishRow);
+        if (writeRow) {
             auto p = pending + b;
             auto words = reinterpret_cast<KVIP_ROUTE_GM uint64_t*>(p);
             for (uint32_t i = 0; i < 16; ++i) words[i] = 0;
@@ -104,7 +111,7 @@ KVIP_ROUTE_FN inline bool Evaluate(KVIP_ROUTE_GM Context* ctx, bool& noPrefetch)
             rowWork += end;
             if (end > ctx->shape.history) q = 100;
         }
-        if constexpr (Publish) pending[b].scoreWork = rowWork;
+        if (writeRow) pending[b].scoreWork = rowWork;
         if (!r->queries && !q) continue; // Padding cannot train an owner.
         ++active; work += rowWork;
         bool identity = r->owner < c->owners && r->owner == (owners ? owners[b] : b) &&
@@ -125,7 +132,7 @@ KVIP_ROUTE_FN inline bool Evaluate(KVIP_ROUTE_GM Context* ctx, bool& noPrefetch)
                 f->queries >= 1 && f->queries <= 4 && f->necessary <= 8192 && f->mode <= 1;
             bool learnable = !valid || r->generation > f->generation ||
                 (r->generation == f->generation && r->step > f->step);
-            if constexpr (Publish) {
+            if (writeRow) {
                 pending[b].previousStep = valid ? f->step : 0;
                 pending[b].learnable = learnable;
             }
@@ -166,15 +173,39 @@ KVIP_ROUTE_FN inline bool Evaluate(KVIP_ROUTE_GM Context* ctx, bool& noPrefetch)
     noPrefetch = mode == 0;
     if (!active) reason = Unknown;
     if constexpr (Publish) {
-        for (uint32_t b = 0; b < ctx->shape.batch; ++b) {
-            pending[b].mode = mode; pending[b].reason = reason;
-            controls[b * 4] = mode ? int32_t(c->fullTotal) : 0;
-            controls[b * 4 + 1] = int32_t(c->fullWindow);
-            controls[b * 4 + 2] = int32_t(c->fullSteps);
-            controls[b * 4 + 3] = int32_t(c->fullCarry);
+        if constexpr (RowOnly) {
+            pending[publishRow].mode = mode; pending[publishRow].reason = reason;
+            // Eight 16-byte control rows share one cache line. Only its first
+            // row's block writes the line; Pending records have distinct lines.
+            if (publishRow % 8 == 0) {
+                const uint32_t end = publishRow + 8 < ctx->shape.batch ? publishRow + 8 : ctx->shape.batch;
+                for (uint32_t b = publishRow; b < end; ++b) {
+                    controls[b * 4] = mode ? int32_t(c->fullTotal) : 0;
+                    controls[b * 4 + 1] = int32_t(c->fullWindow);
+                    controls[b * 4 + 2] = int32_t(c->fullSteps);
+                    controls[b * 4 + 3] = int32_t(c->fullCarry);
+                }
+            }
+        } else {
+            for (uint32_t b = 0; b < ctx->shape.batch; ++b) {
+                pending[b].mode = mode; pending[b].reason = reason;
+                controls[b * 4] = mode ? int32_t(c->fullTotal) : 0;
+                controls[b * 4 + 1] = int32_t(c->fullWindow);
+                controls[b * 4 + 2] = int32_t(c->fullSteps);
+                controls[b * 4 + 3] = int32_t(c->fullCarry);
+            }
         }
     }
     return true;
+}
+
+template<class Context>
+KVIP_ROUTE_FN inline bool CanPublishRows(const KVIP_ROUTE_GM Context* ctx) {
+    auto c = reinterpret_cast<const KVIP_ROUTE_GM Config*>(ctx->autoRoute);
+    // This checks cache-line ownership only. The caller and Evaluate validate
+    // the configuration; avoid repeating that full validation on every block.
+    return c && c->pending && ctx->admissionControls && !(c->pending % 128) &&
+        !(ctx->admissionControls % 128);
 }
 
 template<class Context>
