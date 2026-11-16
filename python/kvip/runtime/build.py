@@ -89,7 +89,9 @@ def build_libraries(
     low_miss_sparse_init=False,
     auto_route_fast_probe=False,
     auto_route_row_publish=False,
+    auto_route_simt=False,
     low_miss_direct_index=False,
+    low_miss_compact_plan=False,
     auto_route=False,
     prefetch_gate=False,
     prefetch_rank=0,
@@ -119,7 +121,9 @@ def build_libraries(
         LOW_MISS_SPARSE_INIT=low_miss_sparse_init,
         AUTO_ROUTE_FAST_PROBE=auto_route_fast_probe,
         AUTO_ROUTE_ROW_PUBLISH=auto_route_row_publish,
+        AUTO_ROUTE_SIMT=auto_route_simt,
         LOW_MISS_DIRECT_INDEX=low_miss_direct_index,
+        LOW_MISS_COMPACT_PLAN=low_miss_compact_plan,
         AUTO_ROUTE=auto_route,
         PREFETCH_GATE=prefetch_gate,
         SKIP_EXHAUSTED_PREFETCH=skip_exhausted_prefetch,
@@ -147,8 +151,12 @@ def build_libraries(
         raise ValueError("auto_route_row_publish requires low_miss_sparse_init")
     if auto_route_row_publish and auto_route_fast_probe:
         raise ValueError("row publication requires complete evaluation, not fast probes")
+    if auto_route_simt and not auto_route_row_publish:
+        raise ValueError("auto_route_simt requires auto_route_row_publish")
     if low_miss_direct_index and not (low_miss_tail and selected_metadata and early_fetch_ready):
         raise ValueError("low_miss_direct_index requires low_miss_tail, selected_metadata and early_fetch_ready")
+    if low_miss_compact_plan and not (auto_route and low_miss_tail and selected_metadata and early_fetch_ready):
+        raise ValueError("low_miss_compact_plan requires auto_route, low_miss_tail, selected_metadata and early_fetch_ready")
     if type(prefetch_rank) is not int or not 0 <= prefetch_rank <= 2048:
         raise ValueError("prefetch_rank must be an integer in 0..2048")
     if prefetch_rank and not prefetch_gate:

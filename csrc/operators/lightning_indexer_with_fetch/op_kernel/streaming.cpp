@@ -4,6 +4,10 @@
 #if defined(__CCE_AICORE__)
 #include "resolver.h"
 #include "resolver_staged_dma2.h"
+#if KVIP_LOW_MISS_COMPACT_PLAN
+#include "resolver_compact_q4.h"
+#include "low_miss_mode.h"
+#endif
 #include "staged_urma_pack.h"
 #include "staged_outputs.h"
 #include "pipeline_types.h"
@@ -113,7 +117,7 @@ __aicore__ inline uint32_t Producer(__gm__ Args* a, uint32_t b) {
  auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
  auto ticks=reinterpret_cast<__gm__ uint64_t*>(a->times)+b*64;
  bool profile=(a->prefetchCount & 0x80000000U)!=0;
- if(profile)ticks[1]=GetSystemCycle();
+ if(profile){ticks[1]=GetSystemCycle();ticks[9]=0;}
  uint32_t inputError=0;
  if(!a->queryBitmaps || !a->queryErrors || !a->updateBindings || !a->packedFetch || !ctx->hotValid || !ctx->changeCount || row->slots>kPrefetch ||
     shape.history!=a->history || shape.resident!=a->resident || shape.resident>131072 || shape.finalWorkers!=4 || a->maxEvents<kPrefetch+kSlots)inputError=1;
@@ -198,23 +202,59 @@ __aicore__ inline uint32_t Producer(__gm__ Args* a, uint32_t b) {
  if(profile)ticks[3]=GetSystemCycle();
  GlobalTensor<uint32_t> output;output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*kSlots);
  auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*32;
+#if KVIP_LOW_MISS_COMPACT_PLAN
+ // The graph reuses these addresses. Refresh the init-published decision on
+ // this Producer AIV rather than relying on the LI core's private cache.
+ if(ctx->admissionControls && shape.batch && shape.batch<=16)
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->admissionControls),shape.batch*16);
+ const bool compactPlan=NoPrefetchRound(ctx) && !row->slots;
+ uint32_t compactPublished=0;
+ if(compactPlan){
+  if(profile)ticks[9]=1;
+  Simt::VF_CALL<ResolveCompactQ4>(Simt::Dim3{512,1,1},stagedContext,
+   shape.history,shape.resident,b,FinalPtr(selected),FinalPtr(loc),FinalPtr(keys),
+   FinalPtr(ranks),FinalPtr(slots),FinalPtr(work),FinalPtr(ctl),eventSource,eventDest);
+  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+  if(!ctl.GetValue(1)){
+   // All Q slots are ready: one DMA and fence replace four round trips.
+   SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+   DataCopy(output,loc,kSlots);
+   SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+  }
+ }
+#endif
 
  for(uint32_t q=0;q<4 && !ctl.GetValue(1);++q){
   if(profile)ticks[10+q*5]=GetSystemCycle();
   uint32_t fw=(a->prefetchCount>>16)&0xffU,ds=shape.batch*kTop,meta=(3*shape.batch+31)&~31U;
   auto direct=reinterpret_cast<__gm__ int32_t*>(a->packedFetch)+4*fw*(3*ds+meta)+(q*fw+b%fw)*(6*ds+64);
+#if KVIP_LOW_MISS_COMPACT_PLAN
+  if(!compactPlan){
+#endif
   Simt::VF_CALL<ResolveQueryWork>(Simt::Dim3{512,1,1},stagedContext,shape.history,shape.resident,shape.tokenBytes,row->slots,
     shape.batch,b,q,logicalRow,unpack,outputValid,eventSource,eventDest,
     FinalPtr(selected),FinalPtr(loc),FinalPtr(keys),FinalPtr(ranks),
     reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(work),FinalPtr(ctl),
     (a->prefetchCount & 0x20000000U)?nullptr:direct,ds);
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+#if KVIP_LOW_MISS_COMPACT_PLAN
+  }
+#endif
   if(profile)ticks[11+q*5]=GetSystemCycle();
   uint32_t total=ctl.GetValue(0),added=ctl.GetValue(2+q),error=ctl.GetValue(1);
+#if KVIP_LOW_MISS_COMPACT_PLAN
+  if(compactPlan){compactPublished+=added;total=compactPublished;}
+#endif
   if(profile)ticks[12+q*5]=ticks[11+q*5];
   if(profile)ticks[13+q*5]=GetSystemCycle();
+#if KVIP_LOW_MISS_COMPACT_PLAN
+  if(!compactPlan){
+#endif
   SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);DataCopy(output[q*kTop],loc[q*kTop],kTop);
   SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+#if KVIP_LOW_MISS_COMPACT_PLAN
+  }
+#endif
   if(profile)ticks[14+q*5]=GetSystemCycle();
   uint32_t published=KVIP_OUTPUT_WORKER?kRawQueryFlag+q:q+1;
 #if KVIP_LOW_MISS_DIRECT_INDEX

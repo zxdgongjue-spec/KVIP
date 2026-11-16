@@ -4,6 +4,9 @@
 #include "pipeline_types.h"
 #include "round_init.h"
 #include "auto_route.h"
+#if KVIP_AUTO_ROUTE_SIMT
+#include "auto_route_simt.h"
+#endif
 
 #include <stdint.h>
 #include "prefetch.h"
@@ -31,9 +34,28 @@ __aicore__ inline void FillRoundWords(uint64_t address,uint32_t words,
     }
     // Caller joins the whole fill group before reusing the shared UB value.
 }
-__aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t b,__gm__ pipeline_ab::Args* streaming,bool noPrefetch=false) {
+__aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t b,__gm__ pipeline_ab::Args* streaming,bool noPrefetch=false
+#if KVIP_AUTO_ROUTE_SIMT
+    ,bool parallelRoute=false,__gm__ uint64_t* routeTicks=nullptr
+#endif
+    ) {
     TPipe pipe;TBuf<TPosition::VECCALC> storage;pipe.InitBuffer(storage,kvip_round_init::kFillWords*4);
     auto local=storage.Get<uint32_t>();
+#if KVIP_AUTO_ROUTE_SIMT
+    if(parallelRoute){
+        Simt::VF_CALL<kvip_auto_route::EvaluateParallel<Context>>(Simt::Dim3{32,1,1},ctx,b,
+            reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
+        SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        noPrefetch=local.GetValue(0)!=0;
+        if(local.GetValue(1)){
+            auto config=reinterpret_cast<__gm__ kvip_auto_route::Config*>(ctx->autoRoute);
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(config->pending)+b*128,128);
+            if(b%8==0){uint32_t rows=rt_batch-b;if(rows>8)rows=8;
+                kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->admissionControls)+b*16,rows*16);}
+        }
+        if(routeTicks){routeTicks[27]=GetSystemCycle();routeTicks[28]=GetSystemCycle();}
+    }
+#endif
     Duplicate(local,uint32_t(0),kvip_round_init::kFillWords);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     FillRoundWords(ctx->rows+b*sizeof(Row),sizeof(Row)/4,local);
@@ -118,8 +140,21 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
             ticks[26]=GetSystemCycle();
         }
         bool noPrefetch=false;
+#if KVIP_AUTO_ROUTE_SIMT
+        bool parallelRoute=false;
+        if(ctx->autoRoute){
+            // The VF bypasses scalar caches, but this alignment check still
+            // reads Config on the scalar pipe before choosing either route.
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->autoRoute),128);
+            parallelRoute=kvip_auto_route::CanPublishRows(ctx);
+        }
+#endif
 #if KVIP_AUTO_ROUTE
-        if ((!b || kvip_round_init::kSparseMapping) && ctx->autoRoute) {
+        if ((!b || kvip_round_init::kSparseMapping) && ctx->autoRoute
+#if KVIP_AUTO_ROUTE_SIMT
+            && !parallelRoute
+#endif
+            ) {
             auto config = reinterpret_cast<__gm__ kvip_auto_route::Config*>(ctx->autoRoute);
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(config),128);
             if (kvip_auto_route::Valid(config)) {
@@ -156,7 +191,11 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
         }
 #endif
         if(profile) { ticks[27]=GetSystemCycle(); ticks[28]=GetSystemCycle(); }
-        InitializeRound(rt_batch,rt_history,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b,streaming,noPrefetch);
+        InitializeRound(rt_batch,rt_history,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b,streaming,noPrefetch
+#if KVIP_AUTO_ROUTE_SIMT
+            ,parallelRoute,ticks
+#endif
+            );
         if(profile)ticks[29]=GetSystemCycle();
         auto args=GetArgs(ctx,b*2);
         auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
@@ -167,6 +206,12 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
         const uint64_t prefix=4*2048*6+1024+4*uint64_t(rt_history)*2;
         const uint64_t tail=uint64_t(rt_history)*8+8192*64+512;
         auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
+#if KVIP_AUTO_ROUTE_SIMT
+        // SIMT loaded the current owner with asc_ldcg; that does not refresh
+        // the scalar cache used here to select this request's output arena.
+        if(parallelRoute && ctx->rowOwners)
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->rowOwners)+b*sizeof(uint32_t),sizeof(uint32_t));
+#endif
         uint32_t owner=ctx->rowOwners ? reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b] : b;
         uint64_t outputStride=ctx->outputStride ? ctx->outputStride : rt_resident;
         row->addresses=ctx->tokenAddresses ? ctx->tokenAddresses+uint64_t(owner)*ctx->addressStride*8 : a[13]+rt_batch*prefix+b*tail;

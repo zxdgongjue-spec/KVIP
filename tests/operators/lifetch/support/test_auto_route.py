@@ -21,6 +21,7 @@ def test_auto_route_decision_identity_and_success_commit(tmp_path, fast_probe):
 #include <cstring>
 #include <random>
 #include "auto_route.h"
+#include "auto_route_simt.h"
 using namespace kvip_auto_route;
 struct Context {
  uint64_t autoRoute,admissionControls,rowOwners,queryEnds;
@@ -37,7 +38,19 @@ struct Fixture {
                128,192,1,1,512,64,0,0,{0,0,0}};
  Context ctx{uint64_t(&config),uint64_t(controls.data()),uint64_t(owners.data()),uint64_t(ends.data())};
  Fixture(){ends.fill(131072);for(unsigned b=0;b<16;++b){owners[b]=b+1;requests[b]={b+1,1,1,4};}}
+ void checkParallel(){
+  assert(ParallelValid(&config)==Valid(&config));
+  std::array<ParallelRow,32> rows{};std::array<uint32_t,4> padding{};
+  for(unsigned b=0;b<32;++b)EvaluateParallelRow(&config,ctx.shape.batch,ctx.shape.history,
+   ctx.shape.tokenBytes,b,requests.data(),b<16?owners[b]:0,b<16?ends.data()+4*b:padding.data(),
+   reinterpret_cast<const Feedback*>(config.feedback),&rows[b]);
+  for(unsigned distance=16;distance;distance>>=1)
+   for(unsigned b=0;b<distance;++b)CombineParallelRows(&rows[b],&rows[b+distance]);
+  for(unsigned b=0;b<ctx.shape.batch;++b){FinishParallelRow(&config,&rows[0],&rows[b].pending);
+   assert(!std::memcmp(&rows[b].pending,&pending[b],sizeof(Pending)));}
+ }
  void checkRows(){
+  checkParallel();
   const auto expectedPending=pending;const auto expectedControls=controls;const auto expectedFeedback=feedback;
   assert(CanPublishRows(&ctx));
   std::memset(pending.data(),0xa5,sizeof(pending));controls.fill(-12345);
@@ -179,6 +192,13 @@ int main(){
     case 3:prior.tokenBytes^=1;break;
     case 4:request.queries=0;for(unsigned q=0;q<4;++q)fuzz.ends[4*b+q]=0;break;
     case 5:if(b){request.owner=1;fuzz.owners[b]=1;}break;
+    case 6:prior.necessary=8193;break;
+    case 7:prior.queries=0;break;
+    case 8:prior.mode=2;break;
+    case 9:prior.generation=UINT64_MAX;break;
+    case 10:prior.step=UINT64_MAX;break;
+    case 11:request.step=UINT64_MAX;break;
+    case 12:prior.generation=0;break;
    }
   }
   assert(Prepare(&fuzz.ctx));fuzz.checkRows();bool expectedLow=fuzz.pending[0].mode==0;

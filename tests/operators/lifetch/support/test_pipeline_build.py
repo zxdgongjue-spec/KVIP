@@ -58,7 +58,8 @@ def test_pipeline_options_isolate_and_reuse_the_correct_binary(monkeypatch, tmp_
                                     "skip_exhausted_prefetch", "early_prefetch_drain", "inverse_mapping",
                                     "low_miss_skip", "low_miss_tail", "auto_route", "low_miss_sparse_init",
                                     "auto_route_fast_probe", "auto_route_row_publish",
-                                    "low_miss_direct_index"))
+                                    "auto_route_simt", "low_miss_direct_index",
+                                    "low_miss_compact_plan"))
 def test_pipeline_options_reject_ambiguous_values_before_build(tmp_path, value, option):
     with pytest.raises(ValueError, match="must be bool"):
         build.build_libraries(cache_dir=tmp_path, cann=tmp_path, headers=tmp_path, soc="A5", **{option: value})
@@ -185,6 +186,33 @@ def test_auto_route_requires_complete_tail_and_isolates_binary(monkeypatch, tmp_
     count = len(calls)
     assert build.build_libraries(**args, **row_flags, low_miss_direct_index=True) == direct
     assert len(calls) == count
+    with pytest.raises(ValueError, match="auto_route_simt requires"):
+        build.build_libraries(**args, **light, **sparse_flags, auto_route_simt=True)
+    assert len(calls) == count
+    parallel_flags = row_flags | dict(low_miss_direct_index=True, auto_route_simt=True)
+    parallel = build.build_libraries(**args, **parallel_flags)
+    compact = build.build_libraries(**args, **parallel_flags, low_miss_compact_plan=True)
+    assert len({automatic, sparse, fast, row, direct, parallel, compact}) == 7
+    manifest = json.loads((compact[0].parent / "complete.json").read_text())
+    assert manifest["KVIP_AUTO_ROUTE_SIMT"] == "ON"
+    assert manifest["KVIP_LOW_MISS_COMPACT_PLAN"] == "ON"
+    count = len(calls)
+    assert build.build_libraries(**args, **parallel_flags, low_miss_compact_plan=True) == compact
+    assert len(calls) == count
+
+
+@pytest.mark.parametrize("missing", ("auto_route", "low_miss_tail", "selected_metadata", "early_fetch_ready"))
+def test_compact_plan_requires_complete_auto_path(monkeypatch, tmp_path, missing):
+    compile_ = Mock()
+    monkeypatch.setattr(build.subprocess, "run", compile_)
+    flags = dict(adaptive_admission=True, low_miss_skip=True, low_miss_tail=True,
+                 selected_metadata=True, ready_batch_fetch=True, early_fetch_ready=True,
+                 auto_route=True, low_miss_compact_plan=True)
+    flags[missing] = False
+    with pytest.raises(ValueError, match="requires"):
+        build.build_libraries(cache_dir=tmp_path, cann=tmp_path, headers=tmp_path,
+                              soc="A5", **flags)
+    compile_.assert_not_called()
 
 
 @pytest.mark.parametrize("missing", ("low_miss_tail", "selected_metadata", "early_fetch_ready"))
