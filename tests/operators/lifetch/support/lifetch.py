@@ -535,7 +535,7 @@ def run_device(
     def full():
         pipeline()
 
-    def verify(updated=False, persistent=True, completion_only=False):
+    def verify(updated=False, persistent=True, completion_only=False, *, before_logical=None):
         rows = rotating.rows.cpu().numpy()
         posts = rotating.final_posts.cpu().numpy()
         statuses = rotating.row_status.cpu().numpy()
@@ -592,8 +592,9 @@ def run_device(
         selected = topk.cpu().numpy()
         if np.any(selected < 0) or np.any(selected >= h):
             raise RuntimeError("TopK contains out-of-range positions")
-        logical = state.get("before_logical", np.broadcast_to(np.arange(h), (b, h)))
-        ids = np.take_along_axis(logical, selected.reshape(b, -1), axis=1).reshape(b, 4, 2048)
+        if before_logical is None:
+            before_logical = np.broadcast_to(np.arange(h), (b, h))
+        ids = np.take_along_axis(before_logical, selected.reshape(b, -1), axis=1).reshape(b, 4, 2048)
         slots = rotating.locations.reshape(b, -1).cpu().long()
         if (slots < 0).any() or (slots >= (r if persistent else owner.output.shape[1])).any():
             raise RuntimeError("Fetch slot outside cache")
@@ -841,10 +842,10 @@ def run_device(
             next_orders = []
             if step:
                 owner.mark_launched()
-            state["before_logical"] = update.logical.cpu().numpy().copy()
+            before_logical = update.logical.cpu().numpy().copy()
             graph.replay()
             stream.synchronize()
-            verify(True)
+            verify(True, before_logical=before_logical)
             if args.streaming:
                 verify_all_valid_hot()
             for row, p in enumerate(policies):
@@ -885,6 +886,7 @@ def run_device(
         # preparation or tracing enters the full-graph performance samples.
         from fetch_only_ab import run as run_fetch_only
 
+        state["check_phase"] = "diagnostic fetch-only snapshot"
         reset()
         full()
         stream.synchronize()
