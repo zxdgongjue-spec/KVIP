@@ -138,6 +138,23 @@ public:
         return nkValueLocal.template ReinterpretCast<uint16_t>().GetValue(0);
     }
 
+    // Keep history ahead of the new, ascending physical IDs. The selector
+    // retains scan order within equal keys, including a tie at rank 2048.
+    __aicore__ inline void MergeCheckpoint(LocalTensor<uint16_t>& input,
+        LocalTensor<uint16_t>& scores, uint32_t newBegin, uint32_t length, uint32_t merge)
+    {
+        topkb16gather::LiTopKVF<true>(tmpIndexLocal, scores, input, histogramsLocal,
+            idxHighLocal, idxLowLocal, nkValueLocal, topK, length);
+        PipeBarrier<PIPE_V>();
+        topkb16gather::LiTopKGatherVF(hisIndexLocal[1 - merge % 2], scores, input, tmpIndexLocal,
+            hisIndexLocal[merge % 2], topK, newBegin - topK, length);
+    }
+
+    __aicore__ inline void FinalizeCheckpointIndices(uint32_t merges)
+    {
+        if (merges % 2) AscendC::DataCopy(hisIndexLocal[0], hisIndexLocal[1], topK);
+    }
+
     __aicore__ inline uint32_t GetSharedTmpBufferSize()
     {
         // 2 * QLICommon::Align(topK, (uint32_t)256):两块hisIndexLocal；3 * 256：histogramsLocal idxHighLocal idxLowLocal；64：nkValueLocal

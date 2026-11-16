@@ -114,8 +114,9 @@ def configuration(argv=None):
         command.add_argument('--kvaf-server')
         command.add_argument('--output', type=Path, default=ROOT / 'tests/results/lifetch')
         command.add_argument('--timeout-seconds', type=int, default=300)
-        if mode != 'all':
-            command.add_argument('--initial-hot-rank', type=int, default=2048)
+        command.add_argument('--initial-hot-rank', type=int, default=2048)
+        command.add_argument('--topk-checkpoints', default=(), type=csv_values)
+        command.add_argument('--reuse-checkpoint-topk', action='store_true')
         if mode == 'check':
             command.add_argument('--suite', type=csv_values, default=('all',))
             command.add_argument('--cases', type=csv_values)
@@ -146,14 +147,16 @@ def configuration(argv=None):
     args = parser.parse_args(argv)
     if args.mode == 'convert-trace':
         return args
-    if hasattr(args, 'initial_hot_rank'):
-        from kvip.operators.lifetch.geometry import initial_hot_rank_options
-        try:
-            initial_hot_rank_options(args.initial_hot_rank)
-        except ValueError as error:
-            parser.error(str(error))
     if args.device < 0 or args.timeout_seconds <= 0:
         parser.error('device must be nonnegative and timeout positive')
+    from kvip.operators.lifetch.geometry import checkpoint_topk_options
+    try:
+        args.checkpoint_topk = dict(initial_hot_rank=args.initial_hot_rank,
+                                     topk_checkpoints=tuple(map(int, args.topk_checkpoints)),
+                                     reuse_checkpoint_topk=args.reuse_checkpoint_topk)
+        checkpoint_topk_options(**args.checkpoint_topk)
+    except ValueError as error:
+        parser.error(str(error))
     if args.mode == 'check':
         if 'all' in args.suite and len(args.suite) != 1:
             parser.error('suite all cannot be combined with individual suites')

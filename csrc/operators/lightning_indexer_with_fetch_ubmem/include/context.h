@@ -5,6 +5,7 @@ static_assert(V9_UBPIPE_ROWS == 1 || V9_UBPIPE_ROWS == 4, "Invalid UBmem rows pe
 static_assert(V9_UBPIPE_DEPTH != 1 || V9_UBPIPE_ROWS == 1, "Serial UBmem requires one row per stage");
 #include "ubmem_abi.h"
 #include "../../lightning_indexer_with_fetch/include/runtime_shape.h"
+#include "../../common/lifetch/checkpoint_topk.h"
 namespace rotating {
 constexpr uint32_t kTop = 2048, kSlots = 8192, kTokenBytes = TOKEN_BYTES;
 constexpr uint32_t kMaxRounds = 32, kRowStatusWords = 32, kFinalStateWords = 288;
@@ -46,7 +47,7 @@ struct Context {
     uint64_t rowOwners, tokenAddresses, addressStride, outputStride, tailBounds;
     uint64_t changeSlots, changeCount;
     RuntimeShape shape;
-    uint32_t initialHotRank, reservedHotRank[3];
+    lifetch::CheckpointTopk checkpointTopk;
 };
 static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 352,
               "V9 ABI layout changed");

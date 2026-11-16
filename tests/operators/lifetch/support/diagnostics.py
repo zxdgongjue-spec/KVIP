@@ -317,7 +317,8 @@ def summarize(directory, config):
 
 
 def algorithm_counts(mapping, selected, rows, posts, resident, windows, *,
-                     hot_valid=None, lru_slots=None, logical_ids=None, tail_bounds=None, token_bytes=656):
+                     hot_valid=None, lru_slots=None, logical_ids=None, tail_bounds=None, token_bytes=656,
+                     final_sources=None, prefetch_limit=None, window_limit=None):
     """Reconcile existing admission records, not hypothetical transfer savings.
 
     The prefetch map stores resident+admission_ordinal; ABC uses a separate
@@ -356,14 +357,25 @@ def algorithm_counts(mapping, selected, rows, posts, resident, windows, *,
         final = int(rows[row, 247])
         if np.any(final_counts < 0) or int(final_counts.sum()) != final:
             raise ValueError('Per-Q final counts do not match final total')
+        final_hot = None
+        if final_sources is not None:
+            sources = np.asarray(final_sources)[row, 2048:2048 + final]
+            if (len(sources) != final or np.any((sources < 0) | (sources >= history))
+                    or len(np.unique(sources)) != final or not np.isin(sources, positions).all()):
+                raise ValueError('Resolver final READ identities do not match the unique selected tokens')
+            final_hot = int((sources < resident).sum())
         unused = ~np.isin(fetched_ids, demand)
         window_rows, begin = [], 0
         for epoch, count in enumerate(epochs):
             end = begin + int(count)
             unused_count = int(unused[begin:end].sum())
+            suppressed = int(rows[row, 48 + epoch])
             window_rows.append(dict(window=epoch + 1, posted=int(count),
                                     bytes=int(count) * token_bytes, unused=unused_count,
                                     selected_members=int(count) - unused_count,
+                                    unmapped_candidates=int(count) + suppressed,
+                                    unposted_candidates=suppressed, window_limit=window_limit,
+                                    request_budget_left=None if prefetch_limit is None else prefetch_limit-end,
                                     cumulative_posted=end, cumulative_unused=int(unused[:end].sum())))
             begin = end
         local = None
@@ -396,17 +408,29 @@ def algorithm_counts(mapping, selected, rows, posts, resident, windows, *,
         requests.append(dict(request=row, selected_unique=len(demand), initial_cold=cold,
                              initial_hot_valid=None if local is None else initial_hot_count,
                              candidate_hot=candidate_hot, prefetch=posted, final=final,
+                             final_hot=final_hot, final_cold=None if final_hot is None else final-final_hot,
                              KV_read_bytes=(posted + final) * token_bytes,
                              unused_prefetch=int(unused.sum()),
+                             prefetch_unique=len(np.unique(fetched_ids)),
+                             false_positive_unique=len(np.unique(fetched_ids[unused])),
                              selected_prefetch=posted - int(unused.sum()),
                              useful=None, redundant=None, refetched=None,
                              windows=window_rows, queries=query_rows))
     totals = {key: sum(item[key] for item in requests) for key in
-              ('selected_unique', 'prefetch', 'final', 'KV_read_bytes', 'unused_prefetch', 'selected_prefetch')}
+              ('selected_unique', 'prefetch', 'final', 'KV_read_bytes', 'unused_prefetch', 'selected_prefetch',
+               'prefetch_unique', 'false_positive_unique')}
     totals['initial_cold'] = None if hot_valid is None else sum(item['initial_cold'] for item in requests)
     totals['cold_miss_rate'] = (None if totals['initial_cold'] is None or not totals['selected_unique']
                                else totals['initial_cold'] / totals['selected_unique'])
-    return dict(requests=requests, totals=totals,
+    totals['unused_prefetch_ratio'] = totals['unused_prefetch'] / totals['prefetch'] if totals['prefetch'] else 0.0
+    totals['false_positive_ratio'] = (totals['false_positive_unique'] / totals['prefetch_unique']
+                                      if totals['prefetch_unique'] else 0.0)
+    totals['final_hot'] = None if final_sources is None else sum(row['final_hot'] for row in requests)
+    totals['final_cold'] = None if final_sources is None else totals['final'] - totals['final_hot']
+    topk_digest = hashlib.sha256(np.sort(np.take_along_axis(
+        logical_ids, selected.reshape(batch, -1), axis=1).reshape(batch, 4, 2048), axis=-1)
+        .astype('<i8').tobytes()).hexdigest()
+    return dict(requests=requests, totals=totals, topk_set_sha256=topk_digest,
                 attribution='unused is exact membership; useful/redundant/refetched lack consumption identity')
 
 
@@ -422,14 +446,16 @@ def algorithm_before(rotating):
                 tail_bounds=None if rotating.tail_bounds is None else rotating.tail_bounds.cpu().numpy().copy())
 
 
-def algorithm_after(rotating, before):
+def algorithm_after(rotating, before, pipeline=None):
     shape = rotating.runtime_shape
     try:
         return algorithm_counts(
             rotating.mapping.cpu().numpy(),
             rotating.arguments[9].cpu().numpy().view(np.int32).reshape(shape.batch, 4, 2048),
             rotating.rows.cpu().numpy().view(np.uint32), rotating.final_posts.cpu().numpy(),
-            shape.resident, rotating.rounds, token_bytes=shape.tokenBytes, **before)
+            shape.resident, rotating.rounds, token_bytes=shape.tokenBytes,
+            prefetch_limit=rotating.prefetch_limit, window_limit=rotating.window_limit,
+            final_sources=None if pipeline is None else pipeline.events_src.cpu().numpy(), **before)
     except ValueError as error:
         return {'error': str(error)}
 
@@ -799,7 +825,8 @@ def decode_final_detail(owner_words, status_words):
     return detail
 
 
-def collect_core(torch, rotating, graph, reset, verify, rounds, folder, *, full=False, diagnostics=None, fused_final=False):
+def collect_core(torch, rotating, graph, reset, verify, rounds, folder, *, full=False, diagnostics=None, fused_final=False,
+                 pipeline=None):
     """Profile the existing core graph separately from primary timing."""
     import torch_npu
     from torch.profiler import record_function
@@ -841,7 +868,7 @@ def collect_core(torch, rotating, graph, reset, verify, rounds, folder, *, full=
                     epochs=rows[:, 16 : 16 + rotating.rounds].astype(np.uint64).sum(axis=0).tolist(),
                 )
             )
-            samples[-1]["algorithm"] = algorithm_after(rotating, algorithm_initial)
+            samples[-1]["algorithm"] = algorithm_after(rotating, algorithm_initial, pipeline)
             if diagnostics is not None:
                 samples[-1]["streaming_cycles"] = diagnostics()
     # Save events/counters before parsing, so collection never needs repeating
@@ -963,7 +990,7 @@ def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder, streami
             samples.append({"name": name, "round": step, "us": begin.elapsed_time(end) * 1000,
                             "prefetch": int(rows[:, 9].astype(np.uint64).sum()),
                             "final": int(rows[:, 247].astype(np.uint64).sum())})
-            samples[-1]["algorithm"] = algorithm_after(rotating, algorithm_initial)
+            samples[-1]["algorithm"] = algorithm_after(rotating, algorithm_initial, streaming)
             if streaming is not None:
                 samples[-1]["streaming"] = streaming.diagnostic_cycles()
             profile.step()
@@ -1041,7 +1068,7 @@ def collect_replay(torch, state, graph, sequence, validate, config, folder):
                         end.record(stream)
                         end.synchronize()
                     good = checks.check(name, lambda: validate(inputs))
-                    algorithm = algorithm_after(rotating, before)
+                    algorithm = algorithm_after(rotating, before, pipeline)
                     totals = algorithm.get('totals', {})
                     sample = dict(name=name, round=repeat, source_round=inputs.source_round,
                                   scheduler_round=inputs.scheduler_round,

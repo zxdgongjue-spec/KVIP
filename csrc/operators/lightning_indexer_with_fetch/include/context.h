@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include "batch_get_abi.h"
 #include "runtime_shape.h"
+#include "../../common/lifetch/checkpoint_topk.h"
 namespace rotating {
 constexpr uint32_t kTop=2048, kSlots=8192, kMaxRounds=32, kRowStatusWords=32;
 constexpr bool kFinalReplicated=true;
@@ -44,7 +45,8 @@ struct Context {
     uint64_t rowOwners, tokenAddresses, addressStride, outputStride, tailBounds;
     RuntimeShape shape;
     uint64_t changeSlots, changeCount; // Extended direct-hot producer records, ABI 3.
-    uint32_t initialHotRank, reservedHotRank[7];
+    lifetch::CheckpointTopk checkpointTopk;
+    uint32_t checkpointPadding[4];
     // Optional serving layout: active row -> stable owner; addresses stay with
     // that owner's Index permutation. tailBounds[B,2] are [committed,write_end).
 
