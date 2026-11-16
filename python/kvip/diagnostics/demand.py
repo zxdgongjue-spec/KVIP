@@ -15,10 +15,13 @@ DEMAND_ACCOUNTING = {
     "cold_demand": "selected payload absent from both initial valid hot slots and initial ABC",
     "candidate_hot_refetch": (
         "selected initial-hot payload in an LRU candidate slot; required refetch in serial LIDU, "
-        "potential refetch demand in fusion, not an observed transfer counter"
+        "potential refetch demand in fusion, not an observed transfer counter. "
+        "Zero in the verified low route when the loaded kernel can reuse these valid hot hits"
     ),
+    "initial_candidate_hot_selected": "fusion's initial selected valid hot payloads in LRU candidate slots, before route adjustment",
+    "reserved_hot_reused": "initial candidate hot payloads retained by the capable no-prefetch low route; zero otherwise",
     "cold_miss_rate": "cold_demand / selected_unique (fraction, not percent)",
-    "hot_hit": "selected initial valid hot payload outside the LRU candidate slots and ABC",
+    "hot_hit": "selected initial valid hot payload outside ABC; excludes candidates unless the low route reuses them",
     "abc_hit": "selected initial ABC payload; takes precedence over any hot copy",
     "selected_read_demand": "cold_demand + candidate_hot_refetch; potential demand, not fusion's observed I/O",
     "transfer_accounting": (

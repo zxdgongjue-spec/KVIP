@@ -144,8 +144,16 @@ def fused_reads(torch, rotating, update, transport, width, demand=None, *, windo
     return result
 
 
+def supports_low_miss_hot_hits(rotating, transport):
+    # Old auto-tail binaries deliberately refetch reserved hot slots. Inspect
+    # the loaded library's capability, not a version name or shared flag.
+    hot_hits = getattr(getattr(rotating, "library", None), "kvip_low_miss_hot_hits", None)
+    return bool(transport == "urma" and hot_hits is not None and hot_hits())
+
+
 def prepare_fused_state(bundle, archive, restored, torch, device, transport):
     selector, rotating, update = bundle.selector, bundle.rotating, bundle.update
+    bundle.tuning["low_miss_hot_hits"] = supports_low_miss_hot_hits(rotating, transport)
     seeds = []
     for name, target in (persistent_tensors(selector) | input_tensors(selector)).items():
         seed = (
@@ -200,7 +208,7 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
             or array_digest(ordered) != bundle.selection_comparison["ordered_output_sha256"]
         ):
             raise AssertionError("Fused final ordered selection changed during timed replay")
-        reads.update(demand.classify(logical))
+        reads.update(fused_demand(bundle, demand, logical, reads))
         return reads
 
     def verify():
@@ -226,12 +234,34 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         bundle.threshold_comparison = verify_initial_threshold(torch, bundle, archive)
         state = post_state(torch, selector)
         oracle.verify(state, address_delta=delta, expected_topk=selected_expected)
-        reads.update(demand.classify(state["logical_output"]))
+        reads.update(fused_demand(bundle, demand, state["logical_output"], reads))
         return reads
 
     bundle.reset, bundle.verify, bundle.read_counts = reset, verify, read_counts
     bundle.seeds, bundle.oracle = seeds, oracle
     bundle.selection_comparison = {}
+
+
+def fused_demand(bundle, demand, logical, reads):
+    """Count reserved-hot reuse only after the capable low route proves its Get demand."""
+    classified = demand.classify(logical)
+    candidate = classified["candidate_hot_refetch"]
+    classified.update(initial_candidate_hot_selected=candidate, reserved_hot_reused=0)
+    if not bundle.tuning.get("low_miss_hot_hits") or not early_threshold_skipped(bundle.tuning):
+        return classified
+    # Initial valid-hot/ABC are the only hits. Invalid hot payloads already
+    # count as cold. The unchanged oracle still checks all KV bytes and maps.
+    expected = classified["cold_demand"]
+    if (reads["prefetch"] != 0 or reads["unused_prefetch"] != 0
+            or reads["final"] != expected or reads["useful_transfers"] != expected):
+        raise AssertionError(
+            "Low-route Get differs from initial cold/invalid-hot demand: "
+            f"expected={expected} prefetch={reads['prefetch']} final={reads['final']} "
+            f"useful={reads['useful_transfers']}"
+        )
+    classified.update(candidate_hot_refetch=0, selected_read_demand=expected, reserved_hot_reused=candidate)
+    classified["hot_hit"] += candidate
+    return classified
 
 
 def verify_score_keys(actual, expected, query_ends):
