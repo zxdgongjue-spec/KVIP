@@ -17,6 +17,7 @@ using namespace pipeline_ab;
 #include "context_snapshot.h"
 #include "staged_fetch_worker.h"
 #include "early_prefetch_drain.h"
+#include "auto_route.h"
 __simt_callee__
 inline void PublishQ(
  __ubuf__ uint32_t* selected,__ubuf__ uint16_t* ids,__ubuf__ uint32_t* slots,
@@ -160,7 +161,11 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  );
  PipeBarrier<PIPE_V>();
  if(profile)ticks[2]=GetSystemCycle();
- Simt::VF_CALL<StagedInitializeReady>(Simt::Dim3{512,1,1},FinalPtr(selected),FinalPtr(loc),FinalPtr(keys),FinalPtr(ranks),FinalPtr(ctl));
+ Simt::VF_CALL<StagedInitializeReady>(Simt::Dim3{512,1,1},FinalPtr(selected),FinalPtr(loc),FinalPtr(keys),FinalPtr(ranks),FinalPtr(ctl)
+#if KVIP_AUTO_ROUTE
+  ,FinalPtr(work[4096]),row->slots,shape.resident,ctx->autoRoute!=0
+#endif
+ );
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  if(profile)ticks[3]=GetSystemCycle();
  GlobalTensor<uint32_t> output;output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*kSlots);
@@ -194,6 +199,19 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  while(true){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+kOutputCompletionFlag),sizeof(BatchFlag));if(flags[kOutputCompletionFlag].ready)break;if(GetSystemCycle()-publishWait>5000000000ULL){ctl.SetValue(1,8);break;}}
  if(flags[kOutputCompletionFlag].error)ctl.SetValue(1,ctl.GetValue(1)|flags[kOutputCompletionFlag].error);
  status[0]=ctl.GetValue(1);status[1]=ctl.GetValue(0);status[2]=b*kSlots;status[3]=0;status[4]=0;
+#if KVIP_AUTO_ROUTE
+ if(ctx->autoRoute){
+  auto config=reinterpret_cast<__gm__ kvip_auto_route::Config*>(ctx->autoRoute);
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(config),128);
+  if(kvip_auto_route::Valid(config)){
+   auto pending=reinterpret_cast<__gm__ kvip_auto_route::Pending*>(config->pending)+b;
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(pending),128);
+   pending->usefulPrefetch=ctl.GetValue(8);
+   pending->necessary=uint64_t(status[1])+pending->usefulPrefetch;
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(pending),128);
+  }
+ }
+#endif
  row->finalBegin=0;row->finalRequests=status[1];row->finalHead=0;row->finalPending=status[1]?1:0;row->finalEnd=GetSystemCycle();
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row)+960,64);
  // Publish failure to every remaining reader, never leave the consumer waiting.
@@ -604,6 +622,21 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
   Simt::VF_CALL<CompleteEarlyUpdate<256>>(Simt::Dim3{256,1,1},update,b,error);
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  }
+#if KVIP_AUTO_ROUTE
+ if(ctx->autoRoute){
+  auto config=reinterpret_cast<__gm__ kvip_auto_route::Config*>(ctx->autoRoute);
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(config),128);
+  if(kvip_auto_route::Valid(config)){
+   auto pending=reinterpret_cast<__gm__ kvip_auto_route::Pending*>(config->pending)+b;
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(pending),128);
+   if(pending->owner<config->owners){
+    auto record=reinterpret_cast<__gm__ uint8_t*>(config->feedback)+pending->owner*128;
+    kvaf_device::CleanCacheLines(record,128);
+    if(kvip_auto_route::Commit(config,b,error|updateError))kvaf_device::CleanCacheLines(record,128);
+   }
+  }
+ }
+#endif
  if(profile){ft[3]=GetSystemCycle();kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ft),32*8);}
 }
 

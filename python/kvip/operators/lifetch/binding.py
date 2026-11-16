@@ -71,6 +71,7 @@ class LIFetchBinding:
         tail_bounds=None,
         threshold_bounds=None,
         admission_controls=None,
+        auto_route=None,
         output_stride=None,
         scratch=None,
     ):
@@ -79,8 +80,22 @@ class LIFetchBinding:
         if not 1 <= batch <= 16:
             raise ValueError(f"LIFetch supports BS1..16; received BS={batch}; no legacy fallback")
         self.torch, self.owner, self.batch = torch, owner, batch
+        self.auto_route = auto_route
+        if auto_route is not None:
+            from kvip.operators.lifetch.auto_route import AutoRouteState
+            if not isinstance(auto_route, AutoRouteState) or admission_controls is not None:
+                raise ValueError("Auto route requires its own state and owns admission controls")
+            auto_route.validate_binding(batch, batch if hot_valid is None else hot_valid.shape[0], arguments[0].device)
+            admission_controls = np.tile(np.array(auto_route.full_controls, dtype=np.int32), (batch, 1))
         admission_values = None if admission_controls is None else _admission_values(admission_controls, batch)
         self.library = load_lifetch_library(library)
+        if auto_route is not None:
+            feature = getattr(self.library, "kvip_auto_route", None)
+            if feature is None:
+                raise ValueError("Auto route requires an auto_route=True build")
+            feature.argtypes, feature.restype = [], ctypes.c_uint32
+            if feature() != 1:
+                raise ValueError("Auto route requires an auto_route=True build")
         _require_admission_features(self.library, admission_values)
         self.device = arguments[0].device
         if (
@@ -108,7 +123,7 @@ class LIFetchBinding:
             ("final_replicated", int(final_strategy == "replicated")),
             ("final_workers", final_aivs(batch, li_tiling, aic_count, final_workers)),
             ("aic_count", aic_count),
-            ("abi_version", 13),
+            ("abi_version", 14),
             (
                 "service_lanes",
                 li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)["service_aivs_per_window"],
@@ -122,7 +137,7 @@ class LIFetchBinding:
             ("history", history),
             ("resident", resident),
             ("simulation", 0),
-            ("context_bytes", 336),
+            ("context_bytes", 344),
             ("row_bytes", 1024),
         ):
             fn = getattr(self.library, "v9_" + name)
@@ -257,12 +272,13 @@ class LIFetchBinding:
                         self.change_count.data_ptr(),
                         0 if self.threshold_bounds is None else self.threshold_bounds.data_ptr(),
                         0 if self.admission_controls is None else self.admission_controls.data_ptr(),
+                        0 if self.auto_route is None else self.auto_route.config.data_ptr(),
                     ],
                     dtype="<u8",
                 ).view("u1"),
             )
         )
-        if blob.size != 336:
+        if blob.size != 344:
             raise AssertionError("LIFetch Context ABI changed")
         self.context = torch.from_numpy(blob.copy()).to(self.device)
         self.arguments = tuple(arguments) + (self.context,)
@@ -288,6 +304,8 @@ class LIFetchBinding:
         CPU validation and H2D belong to caller preparation time, not a free
         part of kernel timing. Never change this table while a graph uses it.
         """
+        if self.auto_route is not None:
+            raise RuntimeError("Auto route owns admission controls; update request metadata instead")
         capturing = getattr(getattr(self.torch, "npu", None), "is_current_stream_capturing", None)
         if callable(capturing) and capturing():
             raise RuntimeError("Set URMA admission controls outside graph capture")

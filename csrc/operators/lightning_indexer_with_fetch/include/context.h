@@ -52,8 +52,10 @@ struct Context {
     // Optional int32[B,4]: total, window, sortable-key steps, carry.
     // Stable storage is bound before capture; updates precede graph execution.
     uint64_t admissionControls;
+    // Optional device-only previous-success predictor, see auto_route.h.
+    uint64_t autoRoute;
 };
-static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 336,
+static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 344,
               "LIFetch runtime ABI layout changed");
 // Workload geometry is bound before capture and shared by host/device launches.
 #if defined(__CCE_AICORE__)

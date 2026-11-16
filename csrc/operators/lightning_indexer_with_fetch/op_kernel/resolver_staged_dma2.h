@@ -98,13 +98,33 @@ inline void StagedInitialize(uint32_t history,uint32_t resident,uint32_t batch,u
 // Prepare only the hash needed by the resolver. LI produced loc and bitmap.
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
 inline void StagedInitializeReady(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc,
-    __ubuf__ uint32_t* keys,__ubuf__ uint32_t* ranks,__ubuf__ uint32_t* ctl) {
+    __ubuf__ uint32_t* keys,__ubuf__ uint32_t* ranks,__ubuf__ uint32_t* ctl
+#if KVIP_AUTO_ROUTE
+    ,__ubuf__ uint32_t* lru,uint32_t used,uint32_t resident,bool recordFeedback
+#endif
+    ) {
     uint32_t tid=threadIdx.x,missing=0;
     if(tid<8)ctl[tid]=0;
     for(uint32_t i=tid;i<kSlots;i+=512)
         missing += selected[i]!=UINT32_MAX && loc[i]==UINT32_MAX;
-    asc_syncthreads();StagedPrefix(missing,ctl);
+    uint32_t counts=missing;
+#if KVIP_AUTO_ROUTE
+    // Ordinary hot hits exclude every reserved LRU candidate. A protected
+    // slot in the actually prefetched prefix therefore represents one useful
+    // transfer, deduplicated across all four queries by the existing bitmap.
+    uint32_t useful=0;
+    if(recordFeedback)for(uint32_t i=tid;i<used;i+=512){
+        uint32_t slot=lru[i];
+        useful+=slot<resident && (ctl[1024+slot/32]&(1U<<(slot%32)))!=0;
+    }
+    counts|=useful<<16;
+#endif
+    asc_syncthreads();StagedPrefix(counts,ctl);
     uint32_t n=ctl[544+512/warpSize-1];
+#if KVIP_AUTO_ROUTE
+    n&=0xffffU;
+    if(!tid)ctl[8]=ctl[544+512/warpSize-1]>>16;
+#endif
     uint32_t buckets=n<=1024?2048U:(n<=2048?4096U:8192U);
     if(!tid)ctl[7]=buckets;
     for(uint32_t i=tid;i<buckets;i+=512){keys[i]=UINT32_MAX;ranks[i]=UINT32_MAX;}

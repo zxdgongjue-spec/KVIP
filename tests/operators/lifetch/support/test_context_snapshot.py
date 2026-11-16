@@ -1,4 +1,4 @@
-"""Run the production Context snapshot copy including the appended URMA threshold pointer."""
+"""Run the production Context snapshot copy including the appended URMA route pointer."""
 
 from pathlib import Path
 import shutil
@@ -7,7 +7,7 @@ import subprocess
 import pytest
 
 
-@pytest.mark.parametrize("backend,size,tail", [("urma", 336, 328)])
+@pytest.mark.parametrize("backend,size,tail", [("urma", 344, 336)])
 @pytest.mark.parametrize("caller", ["streaming.cpp", "output_worker.h"])
 def test_exact_context_dma(tmp_path, backend, size, tail, caller):
     root = Path(__file__).resolve().parents[4]
@@ -60,12 +60,14 @@ void DataCopyPad(LocalTensor<uint8_t> dst, GlobalTensor<uint8_t> src,
 int main(){
  static_assert(sizeof(Context)==SIZE);
  static_assert(offsetof(Context,thresholdBounds)==320);
- static_assert(offsetof(Context,admissionControls)==TAIL);
+ static_assert(offsetof(Context,admissionControls)==328);
+ static_assert(offsetof(Context,autoRoute)==TAIL);
  Context original{};
  auto bytes=reinterpret_cast<uint8_t*>(&original);
  for(unsigned i=0;i<sizeof(original);++i)bytes[i]=uint8_t(i*13+7);
  original.thresholdBounds=0x123456789abcdef0ULL;
  original.admissionControls=0x13579bdf2468ace0ULL;
+ original.autoRoute=0x2468ace013579bdfULL;
  alignas(32) uint32_t memory[640];
  std::memset(memory,0xa5,sizeof(memory));
  LocalTensor<uint32_t> ctl{memory};

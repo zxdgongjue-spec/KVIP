@@ -64,7 +64,7 @@ class Tensor:
     def zero_(self):
         return self.fill_(0)
 
-    def copy_(self, other):
+    def copy_(self, other, **kwargs):
         self.values[...] = other.values
         return self
 
@@ -116,8 +116,8 @@ def fixture(monkeypatch, batch=2):
             Mock(side_effect=lambda p, a=attribute: getattr(ctypes.cast(p, ctypes.POINTER(RuntimeShape)).contents, a)),
         )
     for name, value in {
-        "abi_version": 13,
-        "context_bytes": 336,
+        "abi_version": 14,
+        "context_bytes": 344,
         "row_bytes": 1024,
         "simulation": 0,
         "final_replicated": 1,
@@ -127,6 +127,7 @@ def fixture(monkeypatch, batch=2):
         setattr(library, "v9_" + name, Mock(return_value=value))
     library.kvip_adaptive_admission = Mock(return_value=0)
     library.kvip_prefetch_gate = Mock(return_value=0)
+    library.kvip_auto_route = Mock(return_value=0)
     monkeypatch.setattr(urma, "load_lifetch_library", lambda path: library)
     metadata = dict(
         query_ends=Tensor(np.full((batch, 4), 3900, dtype=np.int32)),
@@ -165,7 +166,7 @@ def fixture(monkeypatch, batch=2):
 
 @pytest.mark.parametrize("batch", [1, 2, 16])
 def test_context_appends_retained_threshold_range(monkeypatch, batch):
-    bytes_, shape_offset, tail_offset, threshold_offset = 336, 224, 216, 320
+    bytes_, shape_offset, tail_offset, threshold_offset = 344, 224, 216, 320
     f = fixture(monkeypatch, batch)
     bound = f.construct()
     blob = bound.context.values.tobytes()

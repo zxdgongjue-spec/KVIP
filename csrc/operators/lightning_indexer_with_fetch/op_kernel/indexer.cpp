@@ -27,6 +27,10 @@ __aicore__ inline void RunLi(GM_ADDR bindings) {
 #define P(i) reinterpret_cast<GM_ADDR>(a[i])
     auto ctx = reinterpret_cast<__gm__ rotating::Context*>(a[14]);
     auto shape = rotating::LoadRuntimeShape(ctx);
+#if KVIP_AUTO_ROUTE
+    if (ctx->autoRoute && ctx->admissionControls)
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->admissionControls),shape.batch*16);
+#endif
     const bool noPrefetch = rotating::NoPrefetchRound(ctx);
     bool splitSequence = rotating::UseSequenceSplit(shape) && HasUniformLengths(shape, P(5), P(6));
     if constexpr (Phase != SequenceLiPhase::Hot) {

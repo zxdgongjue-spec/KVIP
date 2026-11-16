@@ -3,6 +3,7 @@
 #include "context.h"
 #include "pipeline_types.h"
 #include "round_init.h"
+#include "auto_route.h"
 
 #include <stdint.h>
 #include "prefetch.h"
@@ -104,6 +105,22 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
         auto ctx=GetContext(bindings);
         auto initBindings=reinterpret_cast<__gm__ uint64_t*>(bindings);
         auto streaming=reinterpret_cast<__gm__ pipeline_ab::Args*>(initBindings[15]);
+#if KVIP_AUTO_ROUTE
+        if (!b && ctx->autoRoute) {
+            auto config = reinterpret_cast<__gm__ kvip_auto_route::Config*>(ctx->autoRoute);
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(config),128);
+            if (kvip_auto_route::Valid(config)) {
+                auto requests = reinterpret_cast<__gm__ kvip_auto_route::Request*>(config->requests);
+                kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(requests),rt_batch*32);
+                for (uint32_t i=0;i<rt_batch;++i) if (requests[i].owner<config->owners)
+                    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(config->feedback)+requests[i].owner*128,128);
+                if (kvip_auto_route::Prepare(ctx)) {
+                    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(config->pending),rt_batch*128);
+                    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->admissionControls),rt_batch*16);
+                }
+            }
+        }
+#endif
         InitializeRound(rt_batch,rt_history,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b,streaming);
         auto args=GetArgs(ctx,b*2);
         auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
@@ -125,6 +142,16 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
         row->queueLimit=entity->sq_depth>1 ? entity->sq_depth-1 : 0;
         row->error=queue->last_error;
 #if KVIP_ADAPTIVE_ADMISSION
+#if KVIP_AUTO_ROUTE
+        if (ctx->autoRoute) {
+            // Block 0 owns controls. Other init blocks never read its writes;
+            // a low round performs no prefetch, so this full limit is unused.
+            auto config = reinterpret_cast<__gm__ kvip_auto_route::Config*>(ctx->autoRoute);
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(config),128);
+            if (kvip_auto_route::Valid(config)) row->prefetchLimit=uint32_t(config->fullTotal);
+            else row->error=kvaf_device::kInvalidArgs;
+        } else
+#endif
         if(ctx->admissionControls) {
             auto input=reinterpret_cast<const __gm__ int32_t*>(ctx->admissionControls)+b*4;
             kvip_admission::Controls controls{input[0],input[1],input[2],input[3]};

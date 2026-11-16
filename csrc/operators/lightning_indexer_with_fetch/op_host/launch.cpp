@@ -10,6 +10,7 @@ extern "C" uint32_t kvip_ready_batch_fetch() { return KVIP_READY_BATCH_FETCH; }
 extern "C" uint32_t kvip_ready_direct_ranges() { return KVIP_READY_DIRECT_RANGES; }
 extern "C" uint32_t kvip_adaptive_admission() { return KVIP_ADAPTIVE_ADMISSION; }
 extern "C" uint32_t kvip_low_miss_skip() { return KVIP_LOW_MISS_SKIP; }
+extern "C" uint32_t kvip_auto_route() { return KVIP_AUTO_ROUTE; }
 extern "C" uint32_t kvip_prefetch_rank() { return KVIP_PREFETCH_RANK; }
 extern "C" uint32_t kvip_prefetch_gate() { return KVIP_PREFETCH_GATE; }
 extern "C" uint32_t kvip_skip_exhausted_prefetch() { return KVIP_SKIP_EXHAUSTED_PREFETCH; }
@@ -47,7 +48,7 @@ extern "C" uint32_t v9_row_bytes(const rotating::RuntimeShape* shape) { return s
 extern "C" uint32_t v9_context_bytes(const rotating::RuntimeShape* shape) { return sizeof(rotating::Context); }
 extern "C" uint32_t v9_rounds(const rotating::RuntimeShape* shape) { return shape->rounds; }
 extern "C" uint32_t v9_simulation(const rotating::RuntimeShape* shape) { return 0; }
-extern "C" uint32_t v9_abi_version(const rotating::RuntimeShape* shape) { return 13; }
+extern "C" uint32_t v9_abi_version(const rotating::RuntimeShape* shape) { return 14; }
 extern "C" uint32_t v9_aic_count(const rotating::RuntimeShape* shape) { return shape->aicCount; }
 extern "C" uint32_t v9_service_lanes(const rotating::RuntimeShape* shape) { return shape->serviceLanes; }
 extern "C" uint32_t v9_final_workers(const rotating::RuntimeShape* shape) { return shape->finalWorkers; }
