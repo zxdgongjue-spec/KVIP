@@ -5,7 +5,7 @@ import numpy as np
 from kvip.diagnostics.archive import cpu_array
 
 
-def reference(scores, ends, resident, bounds, progress, initial, rounds, reverse, first_window=False):
+def reference(scores, ends, resident, bounds, progress, initial, rounds, reverse, first_window=False, reuse_seed=False):
     b, q, history = scores.shape
     expected = np.empty((b, q), dtype=np.uint16)
     exact = np.empty((b, q), dtype=np.uint16)
@@ -31,7 +31,9 @@ def reference(scores, ends, resident, bounds, progress, initial, rounds, reverse
                 raise ValueError("Rolling oracle requires at least 2048 seed positions")
             key = int(np.partition(values, len(values)-2048)[-2048])
             exact[row, query] = key
-            expected[row, query] = min(key, int(initial[row, query])+255)
+            seed = int(initial[row, query])
+            limit = (seed | 255) if reuse_seed else seed + 255
+            expected[row, query] = min(key, limit)
     return expected, exact
 
 
@@ -47,15 +49,18 @@ def verify(torch, bundle, archive):
         g["resident"], archive.array("pre.threshold_bounds"), progress, initial,
         int(bundle.rotating.runtime_shape.rounds), bundle.tuning["reverse_cold"],
         first_window=bundle.tuning.get("rolling_first_window", False),
+        reuse_seed=bundle.tuning.get("rolling_reuse_seed", False),
     )
     if not np.array_equal(actual, expected):
         row, query = np.argwhere(actual != expected)[0]
         raise AssertionError(f"Rolling Kth differs row={row} query={query}: {actual[row,query]} != {expected[row,query]}")
     if np.any(actual < initial) or np.any(actual > final):
         raise AssertionError("Rolling threshold escaped the seed/final Kth bounds")
+    cap = (initial.astype(np.int32) | 255) if bundle.tuning.get("rolling_reuse_seed") else initial.astype(np.int32) + 255
     return dict(status="bit_exact", queries=actual.size,
                 scope="first_cold_window_frozen" if bundle.tuning.get("rolling_first_window") else "all_scanned_windows",
                 tightened_queries=int(np.count_nonzero(actual > initial)),
-                capped_queries=int(np.count_nonzero(exact.astype(np.int32)-initial > 255)),
+                capped_queries=int(np.count_nonzero(exact.astype(np.int32) > cap)),
+                cap_mode="seed_byte_end" if bundle.tuning.get("rolling_reuse_seed") else "seed_plus_255",
                 mean_final_gap_keys=float(np.mean(final.astype(np.int32)-actual)),
                 last_keys=actual.tolist(), included_in_timing=False)

@@ -35,9 +35,15 @@ def report(cases, order):
         g = gain(t, original)
         print(f"{name:23} {t['mean_us']:8.3f} {t['p50_us']:8.3f} {g['mean_us']:10.2f} {g['p50_us']:9.2f} "
               f"{useful_prefetch(case):10.1f} {b['repair']/2**20:10.4f} {b['waste']/2**20:9.4f} {b['total']/2**20:9.4f}")
-    for left, right in (("reverse", "reverse-out"), ("reverse-out", "reverse-compact-safe"),
-                        ("reverse-compact-safe", "reverse-first-safe"),
-                        ("reverse-out", "reverse-first"), ("reverse-first", "reverse-first-safe")):
+    if "reverse-first-reuse" in cases:
+        pairs = (("reverse", "reverse-first-in"), ("reverse-first-in", "reverse-first-reuse"),
+                 ("reverse-window-in", "reverse-window-reuse"),
+                 ("reverse-first-reuse", "reverse-window-reuse"))
+    else:
+        pairs = (("reverse", "reverse-out"), ("reverse-out", "reverse-compact-safe"),
+                 ("reverse-compact-safe", "reverse-first-safe"),
+                 ("reverse-out", "reverse-first"), ("reverse-first", "reverse-first-safe"))
+    for left, right in pairs:
         a, b = traffic(cases[left]), traffic(cases[right])
         g = gain(cases[right]["timing"], cases[left]["timing"])
         print(f"INCREMENT {left}->{right} mean_gain={g['mean_us']:+.2f}% p50_gain={g['p50_us']:+.2f}% "
@@ -66,7 +72,8 @@ def report(cases, order):
         check = cases[name].get("rolling_threshold_check")
         if check:
             print(f"ROLLING {name} {check['status']} scope={check.get('scope','all_scanned_windows')} "
-                  f"last_key_gap={check['mean_final_gap_keys']:.3f} capped={check['capped_queries']}")
+                  f"last_key_gap={check['mean_final_gap_keys']:.3f} capped={check['capped_queries']} "
+                  f"cap={check.get('cap_mode','seed_plus_255')}")
     print("DECISION " + ("retest_candidates="+",".join(candidates) if candidates else "keep_original_fused"))
     print("NOTE positive delta=more work/bytes; useful_pre includes all prefetch windows; no completion-overlap claim")
     print("NOTE gates screen full graph mean AND median beyond repeat drift/1%; not statistical proof")

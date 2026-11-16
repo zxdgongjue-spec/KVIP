@@ -7,10 +7,10 @@ import numpy as np
 import pytest
 
 from kvip.diagnostics import replay, replay_measure, scan_report, scan_options
-from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, budgets_for, options_for, validate_options
+from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, budgets_for, options_for, validate_options
 
 
-@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS])
+@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS])
 def test_scan_study_reuses_one_arena_and_delivers_independent_options(monkeypatch, variants):
     args = SimpleNamespace(study="scan-order", mode="fused", transport="urma",
                            threshold_policy="recent", scan_variants=list(variants))
@@ -34,7 +34,7 @@ def test_scan_study_reuses_one_arena_and_delivers_independent_options(monkeypatc
     assert calls == [(name, options_for(name), budgets_for(name)) for name in variants]
 
 
-@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS])
+@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS])
 def test_actual_command_line_accepts_scan_variants(tmp_path, variants):
     args = replay.arguments([
         "--snapshot", str(tmp_path / "input"), "--build-dir", str(tmp_path / "build"),
@@ -69,9 +69,9 @@ def test_report_uses_full_chain_and_keeps_mean_and_median_separate(tmp_path, cap
 
 def test_rolling_experiment_does_not_change_budgets_or_enable_pipeline_options():
     assert {budgets_for(name) for name in ROLLING_VARIANTS} == {(512, 64)}
-    assert options_for("reverse-refilter") == dict(reverse_cold=True, rolling_threshold=True, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False, compact_out_of_place=False)
+    assert options_for("reverse-refilter") == dict(reverse_cold=True, rolling_threshold=True, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False, compact_out_of_place=False, rolling_reuse_seed=False)
     with pytest.raises(ValueError, match="requires rolling"):
-        validate_options(dict(reverse_cold=True, rolling_threshold=False, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False, compact_out_of_place=False))
+        validate_options(dict(reverse_cold=True, rolling_threshold=False, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False, compact_out_of_place=False, rolling_reuse_seed=False))
 
 
 def test_rolling_reference_uses_unique_seed_and_only_scanned_causal_positions():
@@ -345,3 +345,47 @@ def test_economy_report_uses_original_baseline_and_separates_increment(tmp_path,
     path.write_text(json.dumps(data))
     with pytest.raises(ValueError, match="oracle has not passed"):
         scan_report.report(path, require_economy=True)
+
+
+def test_reused_seed_oracle_caps_only_when_exact_kth_leaves_seed_byte():
+    from kvip.diagnostics.rolling_check import reference
+    scores = np.zeros((1, 4, 16384), dtype=np.uint16)
+    scores[:, :, :2048] = 254
+    scores[:, :, 2048:4096] = 260
+    initial = np.full((1, 4), 254, dtype=np.uint16)
+    progress = np.zeros((1, 4, 32), dtype=np.uint32)
+    progress[:, :, 0] = 4096
+    args = scores, np.full((1, 4), 16384), 2048, np.array([[16000, 16000]]), progress, initial, 8, False
+    old, exact = reference(*args)
+    reused, _ = reference(*args, reuse_seed=True)
+    assert np.all(old == 260) and np.all(exact == 260)
+    assert np.all(reused == 255) and np.all(reused >= initial) and np.all(reused <= exact)
+    scores[:, :, :2048] = 250
+    scores[:, :, 2048:4096] = 253
+    args = (*args[:5], np.full((1, 4), 250, dtype=np.uint16), *args[6:])
+    reused, exact = reference(*args, reuse_seed=True)
+    assert np.array_equal(reused, exact)
+
+
+def test_seed_variants_exclude_negative_controls_and_report_caps(tmp_path, capsys):
+    data = rolling_report(tmp_path)
+    template = data["cases"]["forward"]
+    data["execution_order"] = list(SEED_VARIANTS)
+    data["cases"] = {n: json.loads(json.dumps(template)) for n in SEED_VARIANTS}
+    for n, case in data["cases"].items():
+        flags = options_for(n)
+        validate_options(flags)
+        assert not flags["compact_out_of_place"] and not flags["refilter_refill"]
+        if flags["rolling_threshold"]:
+            assert flags["refilter_safe"]
+        case["reads_samples"][0].update(prefetch=10, unused_prefetch=2)
+        case["rolling_threshold_check"]["cap_mode"] = "seed_byte_end" if flags["rolling_reuse_seed"] else "seed_plus_255"
+    path = tmp_path / "result.json"
+    path.write_text(json.dumps(data))
+    scan_report.report(path, require_seed=True)
+    output = capsys.readouterr().out
+    assert "reverse-first-in->reverse-first-reuse" in output
+    assert "reverse-window-in->reverse-window-reuse" in output
+    assert "cap=seed_byte_end" in output
+    with pytest.raises(ValueError, match="Economy controls"):
+        scan_report.load_report(path, require_economy=True)

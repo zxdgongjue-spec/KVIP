@@ -1,6 +1,6 @@
 """Independent URMA scan-order/admission experiment; no graph-route changes."""
 
-OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill", "compact_out_of_place")
+OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill", "compact_out_of_place", "rolling_reuse_seed")
 DEFAULT_VARIANTS = ("forward", "reverse", "forward-wide", "reverse-wide", "forward-end")
 VARIANTS = {name: ("reverse_cold",) if name.startswith("reverse") else () for name in DEFAULT_VARIANTS}
 ROLLING_VARIANTS = ("forward", "reverse", "reverse-roll", "reverse-refilter", "forward-refilter", "forward-end")
@@ -54,6 +54,18 @@ VARIANTS.update({
 })
 
 
+SEED_VARIANTS = ("forward", "reverse", "reverse-first-in", "reverse-first-reuse",
+                 "reverse-window-in", "reverse-window-reuse", "reverse-end", "forward-end")
+for _name in SEED_VARIANTS[2:6]:
+    _flags = ("reverse_cold", "rolling_threshold", "rolling_windowed", "rolling_compact",
+              "window_refilter", "refilter_safe")
+    if "first" in _name:
+        _flags += ("rolling_first_window",)
+    if _name.endswith("reuse"):
+        _flags += ("rolling_reuse_seed",)
+    VARIANTS[_name] = _flags
+
+
 def options_for(name):
     return {key: key in VARIANTS[name] for key in OPTIONS}
 
@@ -83,6 +95,8 @@ def validate_options(options):
         raise ValueError("Compact/first-window options require window accumulation")
     if options["rolling_first_window"] and not options["rolling_compact"]:
         raise ValueError("First-window correction requires compact admission")
+    if options["rolling_reuse_seed"] and not options["rolling_compact"]:
+        raise ValueError("Seed reuse requires compact window accumulation")
     if options["refilter_safe"] and not options["window_refilter"]:
         raise ValueError("Visibility-safe admission requires window refilter")
     if options["refilter_refill"] and not options["refilter_safe"]:
