@@ -74,6 +74,13 @@ def test_init_markers_separate_route_fill_and_tail_without_summing_blocks():
     assert profile["metrics"]["init_total"]["median_cycles"] == 85
     assert profile["metrics"]["init_total"]["max_cycles"] == 90
     assert "Blocks overlap" in profile["scope"]["initialization"]
+    distributed = native_profile.decode_profile(
+        raw, batch=2, workers=2, resolver_cores=3, transport="urma",
+        init_route_markers=True, row_route_publish=True,
+    )
+    assert distributed["metrics"] == profile["metrics"]
+    assert "both intervals may include publishing one pending row" in distributed["scope"]["initialization"]
+    assert "Only block 0 publishes" in profile["scope"]["initialization"]
     consumer[:, 25:32] = -1
     old = native_profile.decode_profile(raw, batch=2, workers=2, resolver_cores=3, transport="urma")
     assert old["metrics"]["init_total"]["status"] == "unavailable"
@@ -90,6 +97,33 @@ def test_init_marker_capability_requires_each_block_to_have_valid_markers(bad):
     with pytest.raises(ValueError, match="diagnostic timestamps"):
         native_profile.decode_profile(
             raw, batch=2, workers=2, resolver_cores=3, transport="urma", init_route_markers=True
+        )
+
+
+def test_direct_index_counters_are_capability_gated_and_not_latencies():
+    raw = _raw()
+    consumer = raw[:128].reshape(2, 64)[:, 32:]
+    consumer[:, 2:4] = [[1, 19], [0, 0]]
+    profile = native_profile.decode_profile(
+        raw, batch=2, workers=2, resolver_cores=3, transport="urma", direct_index_markers=True
+    )
+    assert profile["direct_index_counts"] == dict(
+        direct_rows=1, fallback_rows=1, direct_events=19,
+        rows=[dict(row=0, direct=True, events=19), dict(row=1, direct=False, events=0)],
+    )
+    assert "direct_index" not in profile["metrics"]
+    consumer[:, 2:4] = -1
+    old = native_profile.decode_profile(raw, batch=2, workers=2, resolver_cores=3, transport="urma")
+    assert old["direct_index_counts"] is None
+
+
+@pytest.mark.parametrize("counts", [(2, 1), (1, 8193), (0, 1), (-1, 0)])
+def test_invalid_direct_index_counters_are_not_reported_as_saved_work(counts):
+    raw = _raw()
+    raw[:128].reshape(2, 64)[0, 34:36] = counts
+    with pytest.raises(ValueError, match="Invalid direct Index update counters"):
+        native_profile.decode_profile(
+            raw, batch=2, workers=2, resolver_cores=3, transport="urma", direct_index_markers=True
         )
 
 

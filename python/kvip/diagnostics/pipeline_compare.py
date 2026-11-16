@@ -293,6 +293,8 @@ def profile_summary(result):
         )
         values[label] = dict(status=status, count=len(samples), p50_cycles=float(median(samples)) if samples else None)
     return dict(count=profile["count"], units="raw_device_cycles", included_in_timing=False, metrics=values,
+                direct_index_counts=[item["direct_index_counts"] for item in profile["samples"]
+                                     if item.get("direct_index_counts") is not None],
                 ready_batch_counts=[item["ready_batch_counts"] for item in profile["samples"] if item.get("ready_batch_counts")],
                 ready_batch_by_query=[dict(replay=i + 1, queries=item["ready_batch_by_query"])
                                       for i, item in enumerate(profile["samples"]) if item.get("ready_batch_by_query")])

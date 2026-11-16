@@ -83,16 +83,21 @@ def test_capability_comes_from_loaded_binary_and_excludes_ubmem():
 
 
 @pytest.mark.parametrize("transport,capability", [("urma", None), ("urma", 0), ("ubmem", 1)])
-def test_fast_route_probe_requires_the_loaded_kernel_feature(transport, capability):
+@pytest.mark.parametrize("option,label", [
+    ("auto_route_fast_probe", "Fast route probe"),
+    ("auto_route_row_publish", "Row route publication"),
+    ("low_miss_direct_index", "Direct Index update"),
+])
+def test_route_variants_require_the_loaded_kernel_feature(transport, capability, option, label):
     from kvip.diagnostics.replay_measure import prepare_fused_state
 
     library = SimpleNamespace()
     if capability is not None:
-        library.kvip_auto_route_fast_probe = lambda: capability
+        setattr(library, "kvip_" + option, lambda: capability)
     bundle = SimpleNamespace(selector=None, update=None,
                              rotating=SimpleNamespace(library=library),
-                             tuning={"auto_route_fast_probe": True})
-    with pytest.raises(ValueError, match="Fast route probe requires a capable loaded URMA build"):
+                             tuning={option: True})
+    with pytest.raises(ValueError, match=label + " requires a capable loaded URMA build"):
         prepare_fused_state(bundle, None, None, None, None, transport)
 
 

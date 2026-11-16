@@ -9,7 +9,8 @@ import numpy as np
 
 
 def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_markers=False,
-                   early_prefetch_drain=False, init_route_markers=False):
+                   early_prefetch_drain=False, init_route_markers=False, row_route_publish=False,
+                   direct_index_markers=False):
     raw = np.asarray(raw)
     expected = batch * 256 + (resolver_cores * batch + 4 * workers) * 32
     if raw.dtype != np.int64 or raw.size != expected or batch < 1 or workers < 1:
@@ -69,6 +70,19 @@ def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_
         else:
             metrics[name] = dict(status="unavailable", count=0, median_cycles=None,
                                  max_cycles=None, samples_cycles=[])
+    direct_index_counts = None
+    if direct_index_markers:
+        eligible, events = consumer[:, 2], consumer[:, 3]
+        if (transport != "urma" or np.any(eligible > 1) or np.any(events > 8192)
+                or np.any((eligible == 0) & (events != 0))):
+            raise ValueError("Invalid direct Index update counters")
+        rows = int(np.count_nonzero(eligible))
+        direct_index_counts = dict(
+            direct_rows=rows, fallback_rows=batch - rows,
+            direct_events=sum(int(value) for value in events),
+            rows=[dict(row=b, direct=bool(eligible[b]), events=int(events[b]))
+                  for b in range(batch)],
+        )
     # The dedicated role markers bracket the entire Consumer, including an
     # optional early CQ drain before InitShadow. Keep the older work interval
     # separate so moving work across its start cannot look like saved time.
@@ -144,6 +158,7 @@ def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_
         interval("final_status", fetch, 98, 99)
     return dict(
         metrics=metrics,
+        direct_index_counts=direct_index_counts,
         ready_batch_counts=(dict(
             native_calls=sum(int(row[23]) for row in get_queries),
             completed_requests=sum(int(row[22]) for row in get_queries),
@@ -173,8 +188,11 @@ def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_
             initialization=(
                 "Per-request init block cycles: total includes route decision, InitializeRound fills, "
                 "ABC/transport setup and final publication. Blocks overlap; route includes input "
-                "cache maintenance. route_publish is block 0; route_probe is blocks 1 onward. "
-                "No hardware clock conversion or sum across blocks."
+                "cache maintenance. Stable field names route_publish/route_probe denote block 0/blocks 1 onward; "
+                + ("row publication is enabled, so both intervals may include publishing one pending row. "
+                   "Control writes use cache-line owners; unaligned inputs use the legacy fallback. "
+                   if row_route_publish else "Only block 0 publishes pending/control state. ")
+                + "No hardware clock conversion or sum across blocks."
             ),
             early_threshold="Per-query causal preparation, recent-score load, Kth/full TopK and SaveResident bitmap/progress; excludes preceding recent/resident QK matmul",
             final_topk="Final TopK selection before final LI classification",
@@ -184,8 +202,9 @@ def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_
             aggregation="Median/max across request/query role samples; overlapping intervals are not additive",
             index=(
                 "index_role_span brackets Consumer role entry/exit, including early prefetch drain; "
-                "index_consumer_span brackets InitShadow through metadata commit and excludes early drain "
-                "and final status publication"
+                "index_consumer_span brackets the common work start through metadata commit and excludes early drain "
+                "and final status publication. Direct Index counters, when capability-gated, count actual "
+                "direct-path rows/events and are not timing intervals"
             ),
             prefetch_completion=(
                 "early_prefetch_drain is the Consumer-owned CQ drain; final_prefetch_join is the later resolver acquire"

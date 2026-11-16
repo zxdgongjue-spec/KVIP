@@ -171,6 +171,14 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         feature = getattr(rotating.library, "kvip_auto_route_fast_probe", None)
         if transport != "urma" or feature is None or not feature():
             raise ValueError("Fast route probe requires a capable loaded URMA build")
+    if bundle.tuning.get("auto_route_row_publish"):
+        feature = getattr(rotating.library, "kvip_auto_route_row_publish", None)
+        if transport != "urma" or feature is None or not feature():
+            raise ValueError("Row route publication requires a capable loaded URMA build")
+    if bundle.tuning.get("low_miss_direct_index"):
+        feature = getattr(rotating.library, "kvip_low_miss_direct_index", None)
+        if transport != "urma" or feature is None or not feature():
+            raise ValueError("Direct Index update requires a capable loaded URMA build")
     seeds = []
     for name, target in (persistent_tensors(selector) | input_tensors(selector)).items():
         seed = (
@@ -418,6 +426,10 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
         library = getattr(getattr(bundle, "rotating", None), "library", None)
         init_profile = getattr(library, "kvip_init_route_profile", None)
         init_route_markers = bool(args.transport == "urma" and init_profile and init_profile())
+        row_publish = getattr(library, "kvip_auto_route_row_publish", None)
+        row_route_publish = bool(args.transport == "urma" and row_publish and row_publish())
+        direct_index = getattr(library, "kvip_low_miss_direct_index", None)
+        direct_index_markers = bool(args.transport == "urma" and direct_index and direct_index())
         diagnostic_samples = []
         for step in range(diagnostic_count):
             phase(retained, "diagnostic_reset", step)
@@ -447,6 +459,8 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
                         and getattr(bundle, "tuning", {}).get("recent_profile", True),
                         early_prefetch_drain=getattr(bundle, "tuning", {}).get("early_prefetch_drain", False),
                         init_route_markers=init_route_markers,
+                        row_route_publish=row_route_publish,
+                        direct_index_markers=direct_index_markers,
                     ),
                     reads=diagnostic_reads,
                     **({"auto_route": auto.record(diagnostic_reads)} if auto is not None else {}),
