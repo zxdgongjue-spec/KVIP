@@ -671,8 +671,9 @@ __aicore__ inline void QLIVector<QLIT>::BeginFinalMetadata(uint32_t query)
     if(b>=runtimeShape_.batch)return;
     uint32_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
     GlobalTensor<uint32_t> src;
-    if(ctx->hotValid){src.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*runtimeShape_.resident);DataCopy(streamingValid_,src,8192);}
-    if(ctx->reservedHot){src.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->reservedHot)+uint64_t(b)*runtimeShape_.resident);DataCopy(streamingReserved_,src,8192);}
+    uint32_t count=runtimeShape_.resident<8192?runtimeShape_.resident:8192;
+    if(ctx->hotValid){src.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*runtimeShape_.resident);DataCopy(streamingValid_,src,count);}
+    if(ctx->reservedHot){src.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->reservedHot)+uint64_t(b)*runtimeShape_.resident);DataCopy(streamingReserved_,src,count);}
     streamingPrefetched_=true;
 }
 
@@ -741,6 +742,7 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     // and temporary buffers are dead. Load the second metadata half there
     // while the vector pipe classifies the first half.
     const bool overlapSecond = streamingTopkOnly_ && streamingPrefetched_ &&
+        runtimeShape_.resident>8192 && runtimeShape_.resident<=16384 &&
         (topkCountAlign256_ + trunkLen_) * sizeof(SCORE_T) >= 8192 * sizeof(uint32_t) &&
         topkOp_.GetSharedTmpBufferSize() >= 8192 * sizeof(uint32_t);
     LocalTensor<uint32_t> secondValid,secondReserved;
@@ -755,8 +757,9 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
         SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT2);WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT2);
         secondValid=mrgValueLocal_.template ReinterpretCast<uint32_t>();
         secondReserved=topkSharedTmpLocal_;
-        if(ctx->hotValid)DataCopy(secondValid,validGm[8192],8192);
-        if(ctx->reservedHot)DataCopy(secondReserved,reservedGm[8192],8192);
+        uint32_t secondCount=runtimeShape_.resident-8192;
+        if(ctx->hotValid)DataCopy(secondValid,validGm[8192],secondCount);
+        if(ctx->reservedHot)DataCopy(secondReserved,reservedGm[8192],secondCount);
     }
     for(uint32_t half=0;half<(runtimeShape_.resident+chunkSize-1)/chunkSize;++half){
         uint32_t count=runtimeShape_.resident-half*chunkSize; if(count>chunkSize)count=chunkSize;

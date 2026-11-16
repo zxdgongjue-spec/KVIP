@@ -80,6 +80,11 @@ static void Run(const std::string& out,uint32_t batch,uint32_t h,uint32_t r,uint
  ctx.queryEnds=m.put(std::vector<uint32_t>(batch*4,h));ctx.prefetchLimit=0;ctx.windowLimit=448;
  std::vector<uint32_t> lru(batch*2048),slots(batch*10240,UINT32_MAX),changes(batch*10240,UINT32_MAX);
  auto lruSeed=ReadFixture<uint32_t>("lru.bin");if(lruSeed.empty()){lruSeed.resize(2048);std::iota(lruSeed.begin(),lruSeed.end(),r-2048);}
+ std::set<uint32_t> reservedTokens(lruSeed.begin(),lruSeed.end()),repair=cold;
+ require(lruSeed.size()==2048 && reservedTokens.size()==2048 && *reservedTokens.rbegin()<r,"LRU fixture");
+ // With prefetch0 and no tail mappings, selected reserved hot tokens also
+ // require repair under the existing cache contract; cold count is separate.
+ for(auto t:expected)if(reservedTokens.count(t))repair.insert(t);
  std::vector<int32_t> reserved(uint64_t(batch)*r,-1);std::vector<uint32_t> owners(batch);std::iota(owners.begin(),owners.end(),0);
  for(uint32_t b=0;b<batch;++b)for(uint32_t i=0;i<2048;++i){uint32_t t=lruSeed[i];lru[b*2048+i]=slots[b*10240+i]=t;reserved[b*r+t]=i;}
  ctx.lruSlots=m.put(lru);ctx.reservedHot=m.put(reserved);ctx.changeSlots=m.put(slots);ctx.changes=m.put(changes);ctx.changeCount=m.put(std::vector<uint32_t>(batch,2048));ctx.rowOwners=m.put(owners);
@@ -141,8 +146,18 @@ static void Run(const std::string& out,uint32_t batch,uint32_t h,uint32_t r,uint
  auto states=m.get<uint32_t>(ctx.rowStatus,batch*32),workerStates=m.get<uint32_t>(tail.workerStatus,batch*32),updateStates=m.get<uint32_t>(update[6],batch);
  auto flags=m.get<pipeline_ab::BatchFlag>(tail.flags,batch*16);auto posts=m.get<FinalPost>(ctx.owners+s.finalPostOffset,batch*4);
  auto keyAfter=m.get<uint8_t>(keysGm,keys.size());auto scaleAfter=m.get<float>(scalesGm,scales.size());
+ // Preserve the observed boundary on failure, before any assertion unwinds ACL.
+ std::ofstream diagnostic(out+"/diagnostic.json");diagnostic<<"{\"expected_unique_cold\":"<<cold.size()<<",\"expected_unique_repair\":"<<repair.size()<<",\"owners\":[";
+ for(uint32_t b=0;b<batch;++b){if(b)diagnostic<<",";std::set<uint32_t> actualCold;
+  diagnostic<<"{\"owner\":"<<b<<",\"row_count\":"<<states[b*32+1]<<",\"worker_count\":"<<workerStates[b*32+1]<<",\"final_sets\":[";
+  for(uint32_t q=0;q<4;++q){if(q)diagnostic<<",";auto begin=selected.begin()+b*8192+q*2048;
+   std::set<uint32_t> got(begin,begin+2048),want(expected.begin()+q*2048,expected.begin()+(q+1)*2048);
+   uint32_t missing=0,extra=0;for(auto t:want)missing+=!got.count(t);for(auto t:got){extra+=!want.count(t);if(t>=r)actualCold.insert(t);}
+   diagnostic<<"{\"query\":"<<q<<",\"size\":"<<got.size()<<",\"missing\":"<<missing<<",\"extra\":"<<extra<<"}";
+  }diagnostic<<"],\"actual_unique_cold\":"<<actualCold.size()<<"}";
+ }diagnostic<<"]}\n";diagnostic.close();require(bool(diagnostic),"diagnostic write");
  for(uint32_t b=0;b<batch;++b){require(!states[b*32] && !workerStates[b*32] && !updateStates[b],"tail status b"+std::to_string(b));
-  require(states[b*32+1]==cold.size(),"dedup miss count");
+  require(states[b*32+1]==repair.size() && workerStates[b*32+1]==repair.size(),"dedup repair count expected="+std::to_string(repair.size())+" row="+std::to_string(states[b*32+1])+" worker="+std::to_string(workerStates[b*32+1]));
   for(uint32_t q=0;q<4;++q){auto begin=selected.begin()+b*8192+q*2048;std::set<uint32_t> got(begin,begin+2048),want(expected.begin()+q*2048,expected.begin()+(q+1)*2048);require(got==want,"global Final set");
    require(flags[b*16+8+q].ready && !flags[b*16+8+q].error && !posts[b*4+q].error && !posts[b*4+q].deferred,"completion join");
    for(uint32_t i=0;i<2048;++i){uint32_t pos=b*8192+q*2048+i,t=selected[pos],slot=loc[pos];require(slot<r,"resolved hot slot");
@@ -165,6 +180,7 @@ static void Run(const std::string& out,uint32_t batch,uint32_t h,uint32_t r,uint
   for(uint32_t i=0;i<128;++i)require(raw[uint64_t(wave.rows)*wave.queryGroup*wave.stride+i]==0x5a5a,"wave score guard");}
  for(uint32_t i=0;i<128;++i){require(selected[batch*8192+i]==0x5a5a5a5a && loc[batch*8192+i]==0x5a5a5a5a && outLogical[batch*8192+i]==0x5a5a5a5a && outSlots[batch*8192+i]==0x5a5a5a5a,"output guard");require(keyAfter[uint64_t(batch)*h*128+i]==0x5a,"key guard");}
  std::ofstream report(out+"/correctness.json");report<<"{\"status\":\"PASSED\",\"producer\":\""<<SCORE_VERSION<<"\",\"batch\":"<<batch<<",\"history\":"<<h<<",\"resident\":"<<r<<",\"miss_per_query\":"<<miss
+ <<",\"unique_cold\":"<<cold.size()<<",\"unique_reserved_hot_repair\":"<<repair.size()-cold.size()<<",\"unique_repair\":"<<repair.size()
  <<",\"score_keys\":"<<uint64_t(batch)*4*h<<",\"owner_waves\":"<<(batch+kvip_staged::OwnerCapacity(v,2)-1)/kvip_staged::OwnerCapacity(v,2)
  <<",\"hot_score_waves\":"<<hot.size()<<",\"cold_score_waves\":"<<coldWaves.size()<<",\"score_route\":\""<<forced<<"\",\"prefetch_budget\":0,\"all_index_fields\":true,\"all_hot_payload\":true,\"guards\":true,\"completion\":true,\"physical_npu\":false,\"transport\":\"GM adapter\",\"host_wall_ms\":"<<wall<<"}\n";
  require(bool(report),"report write");std::cout<<"STAGED_FULL_ORACLE_PASSED B="<<batch<<" miss="<<miss<<"\n";

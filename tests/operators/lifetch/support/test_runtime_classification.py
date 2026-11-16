@@ -34,7 +34,7 @@ uint32_t ResolvePhysicalSlot(uint32_t resident,uint32_t* lru,uint32_t slot){
         + f'#include "{header}"\n'
         + r"""
 int main(){using namespace rotating;
- for(uint32_t resident:{2048U,8192U,16384U,33024U,131072U}){
+ for(uint32_t resident:{2048U,6400U,8192U,16384U,33024U,131072U}){
   uint32_t history=resident+32768,words=resident/32;
   std::vector<uint32_t> valid(resident,1),map(history,UINT32_MAX),lru(2048),indices(2048),loc(2048,0),bits(4104),expected(words);
   std::vector<int32_t> reserved(resident,-1);
