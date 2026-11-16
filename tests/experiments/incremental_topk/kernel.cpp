@@ -14,31 +14,32 @@ inline void MapIds(__ubuf__ uint32_t* selected, __ubuf__ uint32_t* old) {
         selected[i] = id < K ? old[id] : 16384 + id - K;
     }
 }
-// Stable bitmap expansion: warp prefix plus eight warp totals, no per-item atomics.
+// LI's uint16 predicate storage: 128 scores per 32-byte mask (two bits/score).
+// Consume the native mask directly; vector Squeeze packs 128 lanes at a time.
+__simd_vf__ inline void Compact(__ubuf__ uint16_t* raw, __ubuf__ uint16_t* bitmap,
+    __ubuf__ uint16_t* packed, __ubuf__ uint16_t* mapping, uint32_t added) {
+    using namespace MicroAPI;
+    RegTensor<uint16_t> values,result;RegTensor<int16_t> indices;
+    MaskReg selected;UnalignRegForStore scoreStore,idStore;
+    ClearSpr<SpecialPurposeReg::AR>();
+    for(uint16_t i=0;i<added;i+=128){
+        LoadAlign(selected,bitmap+i/8);
+        LoadAlign(values,raw+i);
+        Squeeze<uint16_t,MicroAPI::GatherMaskMode::STORE_REG>(result,values,selected);
+        StoreUnAlign<uint16_t,PostLiteral::POST_MODE_UPDATE>(packed,result,scoreStore);
+    }
+    StoreUnAlignPost(packed,scoreStore);
+    ClearSpr<SpecialPurposeReg::AR>();
+    for(uint16_t i=0;i<added;i+=128){
+        LoadAlign(selected,bitmap+i/8);Arange(indices,int16_t(i));
+        Squeeze<uint16_t,MicroAPI::GatherMaskMode::STORE_REG>(result,reinterpret_cast<RegTensor<uint16_t>&>(indices),selected);
+        StoreUnAlign<uint16_t,PostLiteral::POST_MODE_UPDATE>(mapping,result,idStore);
+    }
+    StoreUnAlignPost(mapping,idStore);
+}
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
-inline void Compact(__ubuf__ uint16_t* raw, __ubuf__ uint32_t* bitmap,
-    __ubuf__ uint16_t* packed, __ubuf__ uint32_t* mapping,
-    __ubuf__ uint32_t* totals, uint32_t added, uint32_t padded) {
-    const uint32_t tid=threadIdx.x,lane=tid%warpSize,warp=tid/warpSize;
-    for(uint32_t i=tid;i<padded;i+=256)packed[K+i]=0;
-    const uint32_t words=added/32,perThread=(words+255)/256;
-    uint32_t count=0;
-    for(uint32_t i=0;i<perThread;++i){uint32_t w=tid*perThread+i;
-        if(w<words)count+=uint32_t(__popc(bitmap[w]));}
-    uint32_t inclusive=count;
-    for(uint32_t delta=1;delta<warpSize;delta*=2){
-        uint32_t prior=asc_shfl_up(inclusive,delta);if(lane>=delta)inclusive+=prior;}
-    if(lane==warpSize-1)totals[warp]=inclusive;
-    asc_syncthreads();
-    if(!tid){uint32_t sum=0;for(uint32_t w=0;w<256/warpSize;++w){
-        uint32_t n=totals[w];totals[w]=sum;sum+=n;}}
-    asc_syncthreads();
-    uint32_t rank=totals[warp]+inclusive-count;
-    for(uint32_t i=0;i<perThread;++i){uint32_t w=tid*perThread+i;
-        uint32_t bits=w<words?bitmap[w]:0;
-        while(bits){uint32_t id=w*32+uint32_t(__ffs(int32_t(bits))-1);
-            packed[K+rank]=raw[id];mapping[K+rank]=16384+id;
-            ++rank;bits&=bits-1;}}
+inline void MapBitmap(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* old,__ubuf__ uint16_t* addedIds){
+    for(uint32_t i=threadIdx.x;i<K;i+=256){uint32_t id=selected[i];selected[i]=id<K?old[id]:16384+addedIds[id-K];}
 }
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void MapPacked(__ubuf__ uint32_t* selected,__ubuf__ uint32_t* mapping){
@@ -54,8 +55,8 @@ __aicore__ inline void Run(GM_ADDR scores, GM_ADDR oldIds, GM_ADDR outScores,
     pipe.InitBuffer(inputBuf, (K + MaxNew) * 2);
     pipe.InitBuffer(idsBuf, K * 4);
     pipe.InitBuffer(scoresBuf, K * 2);
-    pipe.InitBuffer(oldBuf, (Mode ? K + MaxNew : K) * 4);
-    if constexpr(Mode==1){pipe.InitBuffer(rawBuf,MaxNew*2);pipe.InitBuffer(maskBuf,MaxNew/8);pipe.InitBuffer(prefixBuf,256);}
+    pipe.InitBuffer(oldBuf, (Mode==2 ? K + MaxNew : K) * 4);
+    if constexpr(Mode==1){pipe.InitBuffer(rawBuf,MaxNew*2);pipe.InitBuffer(maskBuf,MaxNew/4);pipe.InitBuffer(prefixBuf,MaxNew*2);}
     pipe.InitBuffer(scratchBuf, select.GetSharedTmpBufferSize());
     auto input = inputBuf.Get<uint16_t>(); auto ids = idsBuf.Get<uint32_t>();
     auto values = scoresBuf.Get<uint16_t>(); auto old = oldBuf.Get<uint32_t>();
@@ -76,7 +77,7 @@ __aicore__ inline void Run(GM_ADDR scores, GM_ADDR oldIds, GM_ADDR outScores,
         if constexpr(Mode==1){
             DataCopy(input,source[row*(K+added)],K);
             DataCopy(rawBuf.Get<uint16_t>(),source[row*(K+added)+K],added);
-            DataCopy(maskBuf.Get<uint32_t>(),maskSource[row*(added/32)],added/32);
+            DataCopy(maskBuf.Get<uint32_t>(),maskSource[row*(added/16)],added/16);
             DataCopy(old,sourceIds[row*K],K);
         }else{
             DataCopy(input, source[row * width], width);
@@ -85,18 +86,22 @@ __aicore__ inline void Run(GM_ADDR scores, GM_ADDR oldIds, GM_ADDR outScores,
         SetFlag<HardEvent::MTE2_V>(EVENT_ID0); WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
         if constexpr(Profile) t1=GetSystemCycle();
         if constexpr(Mode==1){
-            Simt::VF_CALL<Compact>(Simt::Dim3{256,1,1},
+            Duplicate(input[K],uint16_t(0),padded);PipeBarrier<PIPE_V>();
+            Compact(
                 reinterpret_cast<__ubuf__ uint16_t*>(rawBuf.Get<uint16_t>().GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint32_t*>(maskBuf.Get<uint32_t>().GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint16_t*>(input.GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint32_t*>(old.GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint32_t*>(prefixBuf.Get<uint32_t>().GetPhyAddr()),added,padded);
+                reinterpret_cast<__ubuf__ uint16_t*>(maskBuf.Get<uint16_t>().GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint16_t*>(input[K].GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint16_t*>(prefixBuf.Get<uint16_t>().GetPhyAddr()),added);
             PipeBarrier<PIPE_V>();
         }
         select(input, ids, values, width, 0, 1, true);
         PipeBarrier<PIPE_V>();
         if constexpr(Profile) t2=GetSystemCycle();
-        if constexpr(Mode) Simt::VF_CALL<MapPacked>(Simt::Dim3{256,1,1},
+        if constexpr(Mode==1) Simt::VF_CALL<MapBitmap>(Simt::Dim3{256,1,1},
+            reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(old.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint16_t*>(prefixBuf.Get<uint16_t>().GetPhyAddr()));
+        else if constexpr(Mode==2) Simt::VF_CALL<MapPacked>(Simt::Dim3{256,1,1},
             reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(old.GetPhyAddr()));
         else Simt::VF_CALL<MapIds>(Simt::Dim3{256,1,1},

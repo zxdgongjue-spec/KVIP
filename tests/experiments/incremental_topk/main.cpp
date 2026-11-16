@@ -54,19 +54,19 @@ int main(int argc,char** argv) { try {
         for(uint32_t i=K;i<width;++i)source[row*width+i]=full.empty()?random(rng):full[size_t(row)*(oldHistory+added)+oldHistory+i-K];
     }
     const uint32_t candidates=(added*percent+50)/100,padded=(candidates+255)/256*256;
-    std::vector<uint32_t> masks(n*added/32,0);
+    std::vector<uint32_t> masks(n*added/16,0);
     // Randomly placed eligible entries. All omitted scores are below the old
     // TopK minimum, so full-input TopK remains an independent exact reference.
     if(mode){
         for(uint32_t row=0;row<n;++row){
             std::vector<uint32_t> order(added);std::iota(order.begin(),order.end(),0);
             std::shuffle(order.begin(),order.end(),rng);
-            for(uint32_t i=0;i<candidates;++i)masks[row*(added/32)+order[i]/32]|=1U<<(order[i]%32);
+            for(uint32_t i=0;i<candidates;++i)masks[row*(added/16)+order[i]/16]|=1U<<(2*(order[i]%16));
             const uint16_t threshold=source[row*width+K-1];
-            if(!threshold)throw std::runtime_error("fixture requires positive sortable old threshold");
+            if(!threshold||threshold==65535)throw std::runtime_error("fixture requires positive sortable old threshold");
             for(uint32_t i=0;i<added;++i){auto& score=source[row*width+K+i];
-                if(!(masks[row*(added/32)+i/32]&(1U<<(i%32))))score=threshold-1;
-                else score=std::max(score,threshold);}
+                if(!(masks[row*(added/16)+i/16]&(1U<<(2*(i%16)))))score=threshold-1;
+                else score=std::max(score,uint16_t(threshold+1));}
         }
     }
     auto deviceScores=source;auto deviceIds=oldIds;
@@ -75,7 +75,7 @@ int main(int argc,char** argv) { try {
         for(uint32_t row=0;row<n;++row){uint32_t out=row*(K+padded);
             for(uint32_t i=0;i<K;++i){deviceScores[out+i]=source[row*width+i];deviceIds[out+i]=oldIds[row*K+i];}
             uint32_t rank=K;
-            for(uint32_t i=0;i<added;++i)if(masks[row*(added/32)+i/32]&(1U<<(i%32))){
+            for(uint32_t i=0;i<added;++i)if(masks[row*(added/16)+i/16]&(1U<<(2*(i%16)))){
                 deviceScores[out+rank]=source[row*width+K+i];deviceIds[out+rank++]=oldHistory+i;}
         }
     }
