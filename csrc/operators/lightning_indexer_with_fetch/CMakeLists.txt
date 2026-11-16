@@ -7,6 +7,11 @@ set(SOC_VERSION Ascend950PR_9599 CACHE STRING "Target SoC, not runtime device or
 set(ASCEND_CANN_PACKAGE_PATH /usr/local/Ascend/cann CACHE PATH "CANN installation")
 set(KVAF_INCLUDE "" CACHE PATH "KVAF device interface headers")
 option(KVIP_REVERSE_COLD "Reverse complete 2K cold Index blocks in non-sequence-split URMA LI" OFF)
+option(KVIP_ROLLING_THRESHOLD "Capped BF16 CDF in the native LI score VF" OFF)
+option(KVIP_WINDOW_REFILTER "Recheck cold candidates against rolling Kth before admission" OFF)
+if(KVIP_WINDOW_REFILTER AND NOT KVIP_ROLLING_THRESHOLD)
+  message(FATAL_ERROR "Window refilter requires rolling threshold")
+endif()
 if(NOT EXISTS "${KVAF_INCLUDE}/kvaf_batch_get_device.h")
   message(FATAL_ERROR "Set KVAF_INCLUDE to the patched KVAF aiv_batch_get/include directory")
 endif()
@@ -23,6 +28,8 @@ ascendc_include_directories(v9_kernel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/includ
   ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)
 ascendc_compile_options(v9_kernel PRIVATE -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WORKER=$<BOOL:${KVIP_OUTPUT_WORKER}> -DKVIP_FUSE_QUERY_WORK=$<BOOL:${KVIP_FUSE_QUERY_WORK}> -O2 -g --cce-auto-sync=off
   -DKVIP_REVERSE_COLD=$<BOOL:${KVIP_REVERSE_COLD}>
+  -DKVIP_ROLLING_THRESHOLD=$<BOOL:${KVIP_ROLLING_THRESHOLD}>
+  -DKVIP_WINDOW_REFILTER=$<BOOL:${KVIP_WINDOW_REFILTER}>
   -mllvm -user-reserved-ub-size=223232 -DV9_USER_UB_BYTES=223232
   -DV9_PARTIAL_SCAN_SIMD=1 -DV9_PROBE_EPOCH=0 -DV9_INTERMEDIATE_PROFILING=0
   -DV9_BATCH_POST=2 -DSIM_Q=4 -DSIM_CAPTURE_HITS=1 -DV9_SIMULATION=0 -DROTATION_PUBLISH_TILES=1)
@@ -30,4 +37,5 @@ add_library(v9_bridge SHARED op_host/launch.cpp)
 target_include_directories(v9_bridge PRIVATE ${KVAF_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/include ${_base}/include)
 target_compile_definitions(v9_bridge PRIVATE KVIP_OUTPUT_WORKER=$<BOOL:${KVIP_OUTPUT_WORKER}>)
 target_compile_definitions(v9_bridge PRIVATE KVIP_REVERSE_COLD=$<BOOL:${KVIP_REVERSE_COLD}>)
+target_compile_definitions(v9_bridge PRIVATE KVIP_ROLLING_THRESHOLD=$<BOOL:${KVIP_ROLLING_THRESHOLD}> KVIP_WINDOW_REFILTER=$<BOOL:${KVIP_WINDOW_REFILTER}>)
 target_link_libraries(v9_bridge PRIVATE v9_kernel host_intf_pub ascendcl)

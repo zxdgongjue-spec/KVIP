@@ -37,8 +37,10 @@ def build_failure(log, stage, returncode):
     )
 
 
-def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False):
+def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False, rolling_threshold=False, window_refilter=False):
     """Build one shape-independent binary per source/toolchain/SoC."""
+    if window_refilter and not rolling_threshold:
+        raise ValueError("Window refilter requires rolling threshold")
     root = Path(__file__).resolve().parents[3] / "csrc/operators"
     options = dict(
         RUN_MODE="npu",
@@ -46,6 +48,8 @@ def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False):
         KVAF_INCLUDE=str(headers),
         SOC_VERSION=soc,
         KVIP_REVERSE_COLD="ON" if reverse_cold else "OFF",
+        KVIP_ROLLING_THRESHOLD="ON" if rolling_threshold else "OFF",
+        KVIP_WINDOW_REFILTER="ON" if window_refilter else "OFF",
     )
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     for relative in (

@@ -62,10 +62,18 @@ public:
         rotating::Service(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.splitQ,runtimeShape_.rounds,runtimeShape_.serviceAics,runtimeShape_.serviceLanes,runtimeShape_.tokenBytes,runtimeShape_.postThreads,runtimeShape_.postBank,runtimeShape_.batchedRows,runtimeShape_.scanTokens,rotationContext_, epoch, blockId_ / 2, blockId_ % 2,
 #endif
 #if !KVIP_STREAMING_LI
-            topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow);
+            topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow
+#if KVIP_WINDOW_REFILTER
+            , false, scoreStorage_
+#endif
+            );
 #else
             topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow,
-            streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U));
+            streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U)
+#if KVIP_WINDOW_REFILTER
+            , scoreStorage_
+#endif
+            );
 #endif
     }
     __aicore__ inline void LoadSequenceSplitThresholds(uint32_t batch) {
@@ -78,6 +86,8 @@ public:
         SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
         WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
     }
+
+    __aicore__ inline void SetScoreStorage(GM_ADDR address) { scoreStorage_ = address; }
 
     // =================================类型定义区=================================
     static constexpr LI_LAYOUT Q_LAYOUT_T = QLIT::layout;
@@ -162,8 +172,25 @@ private:
     LocalTensor<uint16_t> classifyUB_;
     TBuf<TPosition::VECCALC> prefixThresholdBuf_;
     LocalTensor<uint16_t> prefixThreshold_;
+#if KVIP_ROLLING_THRESHOLD
+    TBuf<TPosition::VECCALC> rollingBuf_;
+    LocalTensor<uint16_t> rollingState_;
+    bool rollingReady_[2]{};
+    uint32_t rollingEnds_[2]{}, rollingBegin_[2]{}, rollingEnd_[2]{};
+    __aicore__ inline void PublishRolling(uint32_t query) {
+        DataCopyExtParams copy{1, 32, 0, 0, 0};
+        GlobalTensor<uint16_t> output;
+        output.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(rotationProgressGm_.GetPhyAddr())
+                               + query * 64 + kvip_rolling::kProgressThreshold * 2);
+        DataCopyPad(output, prefixThreshold_[(query % 2) * 128], copy);
+    }
+#endif
+    GM_ADDR scoreStorage_ = nullptr;
     __aicore__ inline bool TryResidentThreshold(uint32_t query, uint32_t scoreRow,
                                                 uint32_t residentCount, uint32_t availableEnd) {
+#if KVIP_ROLLING_THRESHOLD
+        rollingReady_[query % 2] = false;
+#endif
         if constexpr (std::is_same_v<SCORE_T, uint16_t>) {
             auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
             if (!kvip_recent_index::BoundsAddress(ctx) || residentCount < topkCount_) return false;
@@ -200,6 +227,19 @@ private:
             SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
             WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
             topkOp_.Threshold(mrgValueLocal_, prefixThreshold_[(query % 2) * 128], aligned);
+#if KVIP_ROLLING_THRESHOLD
+            if (topkCount_ == kvip_rolling::kTop) {
+                // The recent interval is already in this union: never count
+                // it a second time when the main scan reaches it.
+                const uint32_t bank = query % 2;
+                PipeBarrier<PIPE_V>();
+                kvip_rolling::Seed(reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_.GetPhyAddr()), total,
+                    reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_[bank * 128].GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ uint16_t*>(rollingState_[bank * kvip_rolling::kStateWords].GetPhyAddr()));
+                rollingReady_[bank] = true;
+                rollingEnds_[bank] = end; rollingBegin_[bank] = range.begin; rollingEnd_[bank] = range.end;
+            }
+#endif
             return true;
         }
         return false;
@@ -337,6 +377,10 @@ private:
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ready),128);
 #endif
         }
+#if KVIP_ROLLING_THRESHOLD
+        PublishRolling(query);
+        SetFlag<HardEvent::MTE3_V>(EVENT_ID0); WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+#endif
     }
 
     __aicore__ inline void GetKeyScale(const QLICommon::RunInfo &runInfo, LocalTensor<SCALE_T> &kScaleUB,
@@ -442,6 +486,11 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe, bool topkOnly)
     pipe->InitBuffer(topkSharedTmpBuf_, topkSharedTmpSize);
     topkSharedTmpLocal_ = topkSharedTmpBuf_.Get<uint32_t>();
     topkOp_.InitBuffers(topkSharedTmpLocal_, indicesOutLocal_);
+#if KVIP_ROLLING_THRESHOLD
+    // Append, do not shift Fixpipe or any existing scratch-bank offsets.
+    pipe->InitBuffer(rollingBuf_, 2 * kvip_rolling::kStateWords * sizeof(uint16_t));
+    rollingState_ = rollingBuf_.Get<uint16_t>();
+#endif
 
 #if KVIP_STREAMING_LI
     // Keep every original TopK buffer at its original UB offset. The extra
@@ -719,6 +768,20 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     auto qkBase = resMm1UB_[pingpong * (UB_BANK_STRIDE / sizeof(float))];
     auto qkVLstride = (UB_BANK_DEPTH_STRIDE / sizeof(float)) / 2 * constInfo_.mBaseSize;
 
+    __ubuf__ uint16_t* rolling = nullptr;
+    uint32_t rollingMask0 = 0, rollingMask1 = 0;
+    bool rollingAdvance = false;
+#if KVIP_ROLLING_THRESHOLD
+    const uint32_t bank = curAivS1Idx % 2;
+    if (!scoreOnly && curS2Idx >= runtimeShape_.resident && rollingReady_[bank]) {
+        rolling = reinterpret_cast<__ubuf__ uint16_t*>(rollingState_[bank * kvip_rolling::kStateWords].GetPhyAddr());
+        rollingMask0 = kvip_rolling::TileMask(curS2Idx, rollingEnds_[bank], rollingBegin_[bank], rollingEnd_[bank]);
+        if (curAivS1ProcNum == 2)
+            rollingMask1 = kvip_rolling::TileMask(curS2Idx, rollingEnds_[1], rollingBegin_[1], rollingEnd_[1]);
+        rollingAdvance = rotating::IsTrigger(runtimeShape_.history, runtimeShape_.resident,
+                                             runtimeShape_.rounds, info.s2Idx + 1);
+    }
+#endif
     if (!scoreOnly && curS2Idx >= runtimeShape_.resident) {
     vector1::BatchClassifyScore(outBase, UB_BANK_DEPTH_STRIDE / sizeof(SCORE_T),
                                         qkBase, qkVLstride, (uint32_t)(gSize_ * UB_BANK_DEPTH_STRIDE / sizeof(float)),
@@ -727,7 +790,8 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
                                         qScaleBase, UB_BANK_DEPTH_STRIDE / sizeof(SCALE_T),
                                         gSize_, curAivS1ProcNum,
         (__ubuf__ uint16_t *)prefixThreshold_.GetPhyAddr() + (curAivS1Idx % 2) * 128,
-        (__ubuf__ uint16_t *)classifyUB_.GetPhyAddr() + pingpong * 256);
+        (__ubuf__ uint16_t *)classifyUB_.GetPhyAddr() + pingpong * 256,
+        rolling, rollingMask0, rollingMask1, rollingAdvance);
     } else {
     vector1::BatchMulWeightAndReduceSum(outBase, UB_BANK_DEPTH_STRIDE / sizeof(SCORE_T),
                                         qkBase, qkVLstride, (uint32_t)(gSize_ * UB_BANK_DEPTH_STRIDE / sizeof(float)),
@@ -776,6 +840,10 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     }
 #endif
 
+#if KVIP_ROLLING_THRESHOLD
+    if (rollingAdvance)
+        for (uint32_t q = 0; q < curAivS1ProcNum; ++q) PublishRolling(info.bIdx * SIM_Q + curAivS1Idx + q);
+#endif
     if (!scoreOnly) PublishScoreProgress(info, progressShard, publishShardEnd);
     SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
     CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);   //V核处理完，通知C核可以把mm1Res搬运到UB

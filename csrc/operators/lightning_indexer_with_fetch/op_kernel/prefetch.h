@@ -14,6 +14,7 @@ namespace kvaf_device { using ubmem_device::CleanCacheLines; constexpr uint32_t 
 #include "simt_api/device_warp_functions.h"
 #include "context.h"
 #include "cold_scan.h"
+#include "rolling_threshold.h"
 #include "../../common/lifetch/prefetch_budget.h"
 
 // Imported from direct_slots.h
@@ -557,8 +558,27 @@ inline void ScanPartial(__ubuf__ uint32_t* input,__ubuf__ uint32_t* ids,__ubuf__
 // LIDU pattern: gather only candidate map entries, then SIMD squeeze misses.
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void GatherCandidateMap(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* slots,
-    __gm__ uint32_t* map,uint32_t count) {
-    for(uint32_t i=threadIdx.x;i<count;i+=256)slots[i]=asc_ldcg(map+ids[i]);
+    __gm__ uint32_t* map,uint32_t count, __gm__ uint32_t* scores = nullptr,
+    __ubuf__ uint32_t* cfg = nullptr, uint32_t history = 0) {
+    for(uint32_t i=threadIdx.x;i<count;i+=256) {
+        const uint32_t token=ids[i]; uint32_t slot=asc_ldcg(map+token);
+#if KVIP_WINDOW_REFILTER
+        if (scores && slot==UINT32_MAX) {
+            // The candidate list is already de-duplicated and restored to
+            // physical coordinates. Reuse its existing map-gather launch.
+            bool keep=false;
+            const uint32_t scan=DecodeScanToken(token,cfg[60],cfg[61]);
+            for(uint32_t q=0;q<4 && !keep;++q) {
+                if(scan>=cfg[100+q] || token>=cfg[104+q])continue;
+                uint32_t pair=asc_ldcg(scores+(uint64_t(q)*history+token)/2);
+                uint32_t score=(pair>>((token&1)*16))&0xffffU;
+                keep=score>=cfg[96+q]; // Keep boundary ties; final TopK decides IDs.
+            }
+            if(!keep)slot=0; // UB-only rejection, never mutate the cache map.
+        }
+#endif
+        slots[i]=slot;
+    }
 }
 __simd_vf__ inline void CompactMisses(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* slots,
     __ubuf__ uint32_t* cfg,uint32_t count,uint32_t available) {
@@ -597,7 +617,7 @@ inline void PrepareCandidateWqes(uint32_t rt_resident,__ubuf__ uint32_t* ids,__u
 template<bool captureIo>
 __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer,uint32_t epoch,uint32_t core,uint32_t lane,
     LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids,
-    uint32_t sequenceHalfWindow) {
+    uint32_t sequenceHalfWindow, GM_ADDR rollingScores = nullptr) {
     uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0;
     uint64_t scanBegin=0,candidateBegin=0,postBegin=0,begin=0;
     uint64_t firstDoorbell=0,lastDoorbell=0;
@@ -634,6 +654,9 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
         for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes)for(uint32_t q=0;q<4;++q) {
             uint32_t progress=(b/rt_serviceLanes)*128+q*32;
             uint32_t end=work.GetValue(progress),cap=windowEnd;
+#if KVIP_WINDOW_REFILTER
+            cfg.SetValue(1024+b*4+q,work.GetValue(progress+kvip_rolling::kProgressThreshold)&0xffffU);
+#endif
             if(ctx->queryEnds) {
                 auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds);
                 uint32_t valid=bounds[b*4+q];
@@ -680,7 +703,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         const uint64_t entityAddress=state64.GetValue(0),queueAddress=state64.GetValue(1);
         const uint64_t addresses=state64.GetValue(2),output=state64.GetValue(3);
         const uint32_t lower=ctx->lruSlots?0:rt_resident;
-#if KVIP_REVERSE_COLD
+#if KVIP_REVERSE_COLD || KVIP_WINDOW_REFILTER
         uint32_t ends[4] = {rt_history,rt_history,rt_history,rt_history};
         if(ctx->queryEnds) {
             auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)+b*4;
@@ -690,7 +713,15 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         auto range=sequenceHalfWindow?kvip_cold_scan::Range{0,0}:
             kvip_cold_scan::Bounds(rt_resident,rt_history,ends);
         // Unused control words, disjoint from counters and warp-prefix scratch.
-        cfg.SetValue(60,range.begin);cfg.SetValue(61,range.end);
+        cfg.SetValue(60,KVIP_REVERSE_COLD?range.begin:0);
+        cfg.SetValue(61,KVIP_REVERSE_COLD?range.end:0);
+#if KVIP_WINDOW_REFILTER
+        for(uint32_t q=0;q<4;++q) {
+            cfg.SetValue(96+q,cfg.GetValue(1024+b*4+q));
+            cfg.SetValue(100+q,cfg.GetValue(128+b*4+q));
+            cfg.SetValue(104+q,ends[q]);
+        }
+#endif
 #endif
 #define KV_WINDOW_HISTORY rt_history
 #define KV_WINDOW_RESIDENT rt_resident
@@ -706,13 +737,15 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
             auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;
             uint32_t available=PrefetchAllowance(slots,requests,state.GetValue(208),
                 state.GetValue(209),state.GetValue(210),ctx->windowLimit);
-            if(!slots && !ctx->tailBounds) {
+            if(!slots && !ctx->tailBounds && !rollingScores) {
                 // No slot has ever been assigned: the OR bitmap already
                 // deduplicated tokens, so every candidate is a new miss.
                 missing=candidateCount;count=missing<available?missing:available;
             } else {
                 Simt::VF_CALL<GatherCandidateMap>(Simt::Dim3{256,1,1},
-                    reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),map,candidateCount);
+                    reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),map,candidateCount,
+                    rollingScores ? reinterpret_cast<__gm__ uint32_t*>(rollingScores)+uint64_t(b)*4*rt_history/2 : nullptr,
+                    reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),rt_history);
                 SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
                 SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
                 CompactMisses(reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
@@ -855,9 +888,9 @@ if (rt_batchedRows) {
 namespace rotating {
 __aicore__ inline void Service(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_splitQ,uint32_t rt_rounds,uint32_t rt_serviceAics,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer, uint32_t epoch, uint32_t core,
     uint32_t lane, LocalTensor<uint32_t> scratch, LocalTensor<uint16_t> flags,
-    LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow = 0,bool captureIo = false) {
-    if(captureIo) FastService<true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow);
-    else FastService<false>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow);
+    LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow = 0,bool captureIo = false, GM_ADDR rollingScores = nullptr) {
+    if(captureIo) FastService<true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow, rollingScores);
+    else FastService<false>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow, rollingScores);
 }
 }
 

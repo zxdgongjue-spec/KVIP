@@ -2,6 +2,9 @@
 #include "api.h"
 #include "context.h"
 #include "cold_scan.h"
+#include "rolling_threshold.h"
+extern "C" uint32_t kvip_rolling_threshold() { return KVIP_ROLLING_THRESHOLD; }
+extern "C" uint32_t kvip_window_refilter() { return KVIP_WINDOW_REFILTER; }
 extern "C" uint32_t kvip_reverse_cold() { return KVIP_REVERSE_COLD; }
 extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) { return rotating::PrepareShape(shape); }
 #define ENTRY(name, blocks) \
@@ -16,6 +19,11 @@ extern "C" uint32_t aclrtlaunch_v9_li_kernel_1(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_2(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_3(uint32_t,void*,void*);
 extern "C" uint32_t v9_li(void* bindings, void* stream, const rotating::RuntimeShape* shape) {
+#if KVIP_ROLLING_THRESHOLD
+    // The persistent histogram belongs to one Q producer. Do not silently
+    // use an unseeded state when a different kernel owns each sequence shard.
+    if (!shape || rotating::UseSequenceSplit(*shape)) return 100000;
+#endif
 #define LI_LAUNCH_0 aclrtlaunch_v9_li_kernel
 #define LI_LAUNCH_1 aclrtlaunch_v9_li_kernel_1
 #define LI_LAUNCH_2 aclrtlaunch_v9_li_kernel_2

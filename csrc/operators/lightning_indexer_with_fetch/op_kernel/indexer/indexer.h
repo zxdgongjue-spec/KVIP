@@ -474,6 +474,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Init(__gm__ uint8_t *q
         blockTableGm.SetGlobalBuffer((__gm__ int32_t *)blockTable);
         vectorService.InitVecInputTensor(weightsGm, qScaleGm, kScaleGm, indiceOutGm, blockTableGm);
         vectorService.InitVecWorkspaceTensor(scoreGm);
+        vectorService.SetScoreStorage(workspace);
     } else {
         matmulService.InitParams(constInfo);
         queryGm.SetGlobalBuffer((__gm__ Q_T *)query);
