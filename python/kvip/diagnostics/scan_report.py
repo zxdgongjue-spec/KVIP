@@ -77,7 +77,7 @@ def report(path, *, require_rolling=False, require_batched=False, require_window
     selected = mean(row["selected_unique"] for row in reads)
     drift = 100 * (cases["forward-end"]["timing"]["mean_us"] / baseline["mean_us"] - 1)
     median_drift = 100 * (cases["forward-end"]["timing"]["p50_us"] / baseline["p50_us"] - 1)
-    print(f"CHECK ordered_TopK=identical thresholds=identical cold_miss={100*cold/selected:.4f}% "
+    print(f"CHECK ordered_TopK=identical initial/final_thresholds=identical cold_miss={100*cold/selected:.4f}% "
           f"baseline_mean_drift={drift:+.2f}% baseline_p50_drift={median_drift:+.2f}%")
     pairs = (("forward", "reverse"), ("forward-wide", "reverse-wide"), ("reverse", "reverse-wide"))
     if tuple(order) == ROLLING_VARIANTS:
