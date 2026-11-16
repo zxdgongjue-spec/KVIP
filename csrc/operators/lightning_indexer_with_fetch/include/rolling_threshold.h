@@ -11,6 +11,18 @@
 #if KVIP_ROLLING_WINDOWED && !KVIP_ROLLING_THRESHOLD
 #error "Window histogram requires rolling threshold"
 #endif
+#ifndef KVIP_ROLLING_COMPACT
+#define KVIP_ROLLING_COMPACT 0
+#endif
+#ifndef KVIP_ROLLING_FIRST_WINDOW
+#define KVIP_ROLLING_FIRST_WINDOW 0
+#endif
+#if (KVIP_ROLLING_COMPACT || KVIP_ROLLING_FIRST_WINDOW) && !KVIP_ROLLING_WINDOWED
+#error "Compact admission and first-window correction require window accumulation"
+#endif
+#if KVIP_ROLLING_FIRST_WINDOW && !KVIP_ROLLING_COMPACT
+#error "First-window correction requires compact admission"
+#endif
 #ifndef KVIP_ROLLING_BATCHED
 #define KVIP_ROLLING_BATCHED 0
 #endif
@@ -34,7 +46,8 @@ namespace kvip_rolling {
 constexpr uint32_t kWindowScores = 18432;
 constexpr uint32_t kBins = 256, kTop = 2048;
 // A capped reverse CDF plus a broadcast copy of the immutable seed key.
-constexpr uint32_t kCdfWords = kBins + 128;
+constexpr uint32_t kAdmission = kBins + 128;
+constexpr uint32_t kCdfWords = kAdmission + (KVIP_ROLLING_COMPACT ? 128 : 0);
 constexpr uint32_t kBatchTiles = 8;
 // Eight packed 128-byte score-bin vectors, per Q. No GM scratch or extra DMA.
 constexpr uint32_t kStateWords = kCdfWords + (KVIP_ROLLING_BATCHED ? kBatchTiles * 64 : 0);

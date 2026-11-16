@@ -796,6 +796,9 @@ __simd_callee__ inline void ClassifyRollingScore(AscendC::MicroAPI::RegTensor<ui
     AscendC::MicroAPI::MaskReg& all, __ubuf__ uint16_t* state) {
 #if KVIP_ROLLING_THRESHOLD
     if (state) {
+#if KVIP_ROLLING_COMPACT
+        ClassifyScore(score, state + kvip_rolling::kAdmission, hits, all);
+#else
         using namespace AscendC::MicroAPI;
         RegTensor<uint16_t> limit, anchor;
         MaskReg current, original;
@@ -804,6 +807,7 @@ __simd_callee__ inline void ClassifyRollingScore(AscendC::MicroAPI::RegTensor<ui
         Compare<uint16_t, CMPMODE::GT>(original, score, anchor, all);
         MaskAnd(current, current, original, all);
         StoreAlign(hits, current);
+#endif
         return;
     }
 #endif

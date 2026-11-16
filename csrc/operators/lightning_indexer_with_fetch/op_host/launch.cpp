@@ -3,6 +3,8 @@
 #include "context.h"
 #include "cold_scan.h"
 #include "rolling_threshold.h"
+extern "C" uint32_t kvip_rolling_compact() { return KVIP_ROLLING_COMPACT; }
+extern "C" uint32_t kvip_rolling_first_window() { return KVIP_ROLLING_FIRST_WINDOW; }
 extern "C" uint32_t kvip_rolling_windowed() { return KVIP_ROLLING_WINDOWED; }
 extern "C" uint32_t kvip_rolling_batched() { return KVIP_ROLLING_BATCHED; }
 extern "C" uint32_t kvip_rolling_threshold() { return KVIP_ROLLING_THRESHOLD; }

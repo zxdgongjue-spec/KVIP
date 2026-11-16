@@ -180,3 +180,40 @@ repeat in both mean and median by more than max(1%, observed repeat drift).
 This is a conservative screening rule, not a confidence interval or automatic
 runtime selection. An unsuccessful group stays on the original fused path.
 All new options remain off by default until hardware evidence supports them.
+
+
+## Window-cost follow-up (2026-11-16)
+
+The five host20 snapshots passed the complete oracle at 8c82df1, but the
+windowed rolling variants did not beat the original fused baseline. In
+particular, G2 transferred effectively the same bytes and still paid 46 us
+against the faster baseline repeat. Reduced histogram counts are not a speedup.
+
+Two opt-in controls now separate exact execution savings from less frequent
+threshold estimation. Both default OFF and retain the native 8-window protocol,
+512/64 budgets, exact final TopK and final repair. Neither changes graph routing.
+
+- `rolling_compact` requires windowed accumulation. At each boundary it computes
+  `cutoff=max(seed,max(current,1)-1)` once. The live score classifier uses the
+  original one-load, one-strict-compare operation. This is exactly equivalent to
+  `score>seed && score>=current`, including BF16 boundary ties and zero keys.
+  It also returns the Cube QK buffer on PIPE_V immediately after its last score
+  consumer at a histogram boundary. The histogram uses separate score UB;
+  score/bitmap DMA and Fetch progress are not published early. This removes
+  unnecessary buffer retention; device overlap savings still require measurement.
+- `rolling_first_window` additionally requires compact admission. It counts the
+  seed and first cold window once, then freezes that conservative Kth. Remaining
+  six cold windows use the original ping-pong score buffers, without collecting,
+  histogramming or publishing another rolling threshold. This deliberately
+  relaxes later admission, so additional waste/repair must be reported alongside
+  the saved work. The independent oracle checks the frozen prefix, not full-prefix
+  exactness. Final output selection remains exact.
+
+Validation compares forward, reverse only, old windowed+refilter, compact,
+first-window and forward repeat on each of G2/G7/G10/G17/G4. Compact controls
+have identical Kth values; first-window values are bounded by seed and final Kth.
+A candidate is retained only if full graph mean and median beat the faster
+forward repeat by more than the measured drift/1% screening margin. Independent
+instrumented replays are labelled raw cycles, not summed as graph microseconds.
+CPU lane models verify arithmetic, masks and memory bounds. They do not model
+CANN instruction scheduling or prove a positive NPU latency result.

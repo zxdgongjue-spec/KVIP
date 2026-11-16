@@ -831,7 +831,9 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     }
 #endif
 #if KVIP_ROLLING_WINDOWED
-    if (rolling) outBase = rollingWindow_[rollingWindowCount_];
+    const bool collectWindow = rolling &&
+        (!KVIP_ROLLING_FIRST_WINDOW || rollingWindowEpoch_ == 1);
+    if (collectWindow) outBase = rollingWindow_[rollingWindowCount_];
 #endif
     if (!scoreOnly && curS2Idx >= runtimeShape_.resident) {
     vector1::BatchClassifyScore(outBase, UB_BANK_DEPTH_STRIDE / sizeof(SCORE_T),
@@ -851,8 +853,16 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
                                         qScaleBase, UB_BANK_DEPTH_STRIDE / sizeof(SCALE_T),
                                         gSize_, curAivS1ProcNum);
     }
+#if KVIP_ROLLING_COMPACT
+    // Scoring is the last reader of this QK buffer. Release it on PIPE_V
+    // before the boundary histogram so Cube can start its next producer.
+    // Output/bitmap DMA and publication retain their original ordering.
+    if (rollingAdvance)
+        CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(
+            QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);
+#endif
 #if KVIP_ROLLING_WINDOWED
-    if (rolling) {
+    if (collectWindow) {
         rollingWindowCount_ += 128;
         if (rollingAdvance) {
             kvip_rolling::ObserveWindow(
@@ -863,8 +873,10 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
                 rollingBegin_[bank], rollingEnd_[bank],
                 (runtimeShape_.resident + 2047) / 2048 * 2048, rollingReverseEnd_);
             rollingWindowCount_ = 0;
-            rollingWindowTrigger_ = rotating::Trigger(runtimeShape_.history, runtimeShape_.resident,
-                                                     runtimeShape_.rounds, ++rollingWindowEpoch_);
+            ++rollingWindowEpoch_;
+            rollingWindowTrigger_ = KVIP_ROLLING_FIRST_WINDOW ? UINT32_MAX :
+                rotating::Trigger(runtimeShape_.history, runtimeShape_.resident,
+                                  runtimeShape_.rounds, rollingWindowEpoch_);
         }
     }
 #endif
@@ -914,6 +926,9 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
 #endif
     if (!scoreOnly) PublishScoreProgress(info, progressShard, publishShardEnd);
     SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
+#if KVIP_ROLLING_COMPACT
+    if (!rollingAdvance)
+#endif
     CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);   //V核处理完，通知C核可以把mm1Res搬运到UB
 }
 

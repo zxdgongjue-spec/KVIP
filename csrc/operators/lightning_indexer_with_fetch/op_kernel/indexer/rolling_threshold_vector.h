@@ -7,6 +7,21 @@
 namespace kvip_rolling {
 using namespace AscendC::MicroAPI;
 
+// Collapse (score > seed && score >= current) to one strict comparison.
+// Compute this once per update, not once per 128-score tile. Clamp before
+// subtracting so a zero threshold cannot wrap to 65535.
+__simd_callee__ inline void SaveAdmission(__ubuf__ uint16_t* state,
+    RegTensor<uint16_t>& key, RegTensor<uint16_t>& anchor) {
+#if KVIP_ROLLING_COMPACT
+    auto all = CreateMask<uint16_t, MaskPattern::ALL>();
+    RegTensor<uint16_t> one, cutoff;
+    Duplicate(one, uint16_t(1));
+    Max(cutoff, key, one, all); Sub(cutoff, cutoff, one, all);
+    Max(cutoff, cutoff, anchor, all);
+    StoreAlign(state + kAdmission, cutoff, all);
+#endif
+}
+
 // Count descending sortable BF16 keys, saturating every CDF entry at K.
 // Each update adds <=128, hence no u16 overflow even for arbitrarily long
 // histories. Clamping keys above seed+255 gives a conservative lower bound
@@ -133,6 +148,7 @@ __simd_vf__ inline void ObserveWindow(__ubuf__ uint16_t* input, uint32_t count,
     Sub(key, cap, bin, all); Add(key, key, anchor, all);
     StoreAlign(state, lower, all); StoreAlign(state + 128, upper, all);
     StoreAlign(threshold, key, all);
+    SaveAdmission(state, key, anchor);
     LoadAlign(a, input + count - 128);
     MaskReg current, original;
     Compare<uint16_t, CMPMODE::GE>(current, a, key, all);
@@ -211,6 +227,7 @@ __simd_vf__ inline void Seed(__ubuf__ uint16_t* input, uint32_t count,
 #endif
     StoreAlign(state, lower, all); StoreAlign(state + 128, upper, all);
     StoreAlign(state + kBins, anchor, all);
+    SaveAdmission(state, anchor, anchor);
 }
 } // namespace kvip_rolling
 #endif
