@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 #include "rolling_threshold.h"
-#include "recent_threshold.h"
 
 #if KVIP_ROLLING_THRESHOLD
+#include "recent_threshold.h"
 namespace kvip_rolling {
 using namespace AscendC::MicroAPI;
 
