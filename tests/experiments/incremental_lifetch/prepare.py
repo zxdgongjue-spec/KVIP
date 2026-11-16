@@ -48,7 +48,7 @@ def instrument(dest):
     replace(dest / 'tests/operators/lifetch/support/diagnostics.py',
             '            samples[-1]["algorithm"] = algorithm_after(rotating, algorithm_initial)\n            if diagnostics is not None:',
             '            event_words = rotating.events.cpu().numpy().view(np.uint64).reshape(-1,16)\n'
-            '            samples[-1]["incremental_windows"] = [dict(epoch=i//rotating.events.shape[1], lane=i%rotating.events.shape[1], skipped=int(w[3]>>np.uint64(32)), cycles=int(w[14])-int(w[13]), topk_calls=int(w[15]), service_cycles=int(w[1])-int(w[0]), service_wait_cycles=int(w[0])-int(w[4]) if w[0] else 0, service_calls=int(w[1]>0), scan_cycles=int(w[5]), candidate_cycles=int(w[6]), post_cycles=int(w[7])) for i,w in enumerate(event_words)]\n'
+            '            samples[-1]["incremental_windows"] = [dict(epoch=i//rotating.events.shape[1], lane=i%rotating.events.shape[1], skipped=int(w[3]>>np.uint64(32)), cycles=int(w[14])-int(w[13]), topk_calls=int(w[15])&65535, scanned=(int(w[15])>>16)&16777215, candidates=int(w[15])>>40, service_cycles=int(w[1])-int(w[0]), service_wait_cycles=int(w[0])-int(w[4]) if w[0] else 0, service_calls=int(w[1]>0), scan_cycles=int(w[5]), candidate_cycles=int(w[6]), post_cycles=int(w[7])) for i,w in enumerate(event_words)]\n'
             '            samples[-1]["final_topk"] = [dict(query=i, block=int(w[12]), present=int(w[13]), begin=int(w[8]), end=int(w[9]), wait_cycles=int(w[10]), compute_cycles=int(w[9])-int(w[8])-int(w[10]), topk_calls=int(w[11])) for i,w in enumerate(rotating.incremental.cpu().numpy().reshape(-1,16))]\n'
             '            samples[-1]["algorithm"] = algorithm_after(rotating, algorithm_initial)\n            if diagnostics is not None:')
 
@@ -57,6 +57,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path)
     parser.add_argument('--baseline', action='store_true')
+    parser.add_argument('--window-topk-only', action='store_true', help='Only add isolated incremental TopK to window service; keep original decisions and final TopK')
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[3]
     dest = args.output.resolve()
@@ -84,6 +85,28 @@ def main():
             '        self.incremental = torch.zeros((batch, 4, 16), dtype=torch.int64, device=self.device)\n'
             '        blob = np.concatenate((blob, np.array([self.incremental.data_ptr()], dtype="<u8").view("u1")))\n'
             '        self.context = torch.from_numpy(blob.copy()).to(self.device)')
+    if args.window_topk_only:
+        # Identical seed allocation/copy in A and B. Original prefix output and
+        # thresholds remain untouched; only B consumes this private state.
+        replace(binding,
+                '        self.incremental = torch.zeros((batch, 4, 16), dtype=torch.int64, device=self.device)',
+                '        self.window_topk_storage = torch.empty(batch*(512+4*2048*6+1024), dtype=torch.uint8, device=self.device)\n'
+                '        self.incremental = self.window_topk_storage[:batch*512].view(torch.int64).view(batch,4,16)')
+        vector = op / 'op_kernel/indexer/indexer_vector.h'
+        replace(vector, '        if (publishProgress) {',
+                '        // Private experimental state; never consumed by ordinary LIFetch.\n'
+                '        auto windowMeta=reinterpret_cast<__gm__ uint64_t*>(context->incremental)+query*16;\n'
+                '        windowMeta[0]=reinterpret_cast<uint64_t>(scoreGm.GetPhyAddr())+uint64_t(scoreRow)*runtimeShape_.history*2;\n'
+                '        windowMeta[1]=uint64_t(runtimeShape_.resident)|(uint64_t(runtimeShape_.resident)<<32);windowMeta[2]=0;\n'
+                '        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(windowMeta),128);\n'
+                '        auto privatePrefix=reinterpret_cast<GM_ADDR>(context->incremental)+runtimeShape_.batch*512+batch*rowBytes;\n'
+                '        GlobalTensor<uint16_t> windowScores;GlobalTensor<uint32_t> windowIds;\n'
+                '        windowScores.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(privatePrefix)+q*2048);\n'
+                '        windowIds.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(privatePrefix+count*2)+q*2048);\n'
+                '        SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);\n'
+                '        DataCopy(windowScores,scoreOutLocal_,2048);DataCopy(windowIds,indicesOutLocal_,2048);\n'
+                '        SetFlag<HardEvent::MTE3_S>(EVENT_ID5);WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);\n'
+                '        if (publishProgress) {')
     if args.baseline:
         instrument(dest)
         print(f'Instrumented baseline: {dest}')
@@ -95,10 +118,47 @@ def main():
     replace(vector, '    rotating::RuntimeShape runtimeShape_;',
             '    rotating::RuntimeShape runtimeShape_;\n#include "incremental_methods.h"')
     replace(vector, '    if (!topkOnly) Duplicate(kScaleUB_',
-            '    pipe->InitBuffer(incrementalIdsBuf_, trunkLen_*2 + ((topkOnly && streamingWorkspace_) ? 0 : 2048*4));\n'
+            '    pipe->InitBuffer(incrementalIdsBuf_, trunkLen_*2 + ((topkOnly && streamingWorkspace_) ? 0 : 2048*4) + 1024);\n'
             '    incrementalNew_ = incrementalIdsBuf_.Get<uint16_t>();\n'
             '    incrementalOld_ = (topkOnly && streamingWorkspace_) ? streamingOutput_ : incrementalNew_[trunkLen_].template ReinterpretCast<uint32_t>();\n'
+            '    incrementalMetadata_ = incrementalNew_[trunkLen_ + ((topkOnly && streamingWorkspace_) ? 0 : 4096)].template ReinterpretCast<uint64_t>();\n'
+            '    if (!topkOnly) {\n'
+            '        uint32_t used=2*CeilDiv(constInfo_.mBaseSize,2)*s2BaseSize_*sizeof(QK_T)+1536+6*CeilDiv(s1BaseSize_,2)*UB_BANK_DEPTH_STRIDE+2*s2BaseSize_*QLICommon::KScaleTiles*sizeof(SCALE_T)+2*CeilDiv(s1BaseSize_,2)*s2BaseSize_*sizeof(SCORE_T)+(topkCountAlign256_+trunkLen_)*sizeof(SCORE_T)+(topkCountAlign256_+64)*4+topkCountAlign256_*sizeof(SCORE_T)+topkSharedTmpSize+trunkLen_*2+8192+1024;\n'
+            '        incrementalPipeline_=used+kIncrementalInputBytes<=223232;\n'
+            '        if(incrementalPipeline_){pipe->InitBuffer(incrementalInputBuf_,kIncrementalInputBytes);incrementalInput_=incrementalInputBuf_.Get<uint16_t>();}\n'
+            '    }\n'
             '    if (!topkOnly) Duplicate(kScaleUB_')
+    if args.window_topk_only:
+        methods=vector.with_name('incremental_methods.h')
+        code=methods.read_text()
+        # No tail coalescing, final-TopK replacement or writes to the ordinary prefix.
+        code=code[:code.index('__aicore__ inline void FinalIncremental')]
+        a=code.index('    if(!PreviousServiceReady(epoch,lane)) {',code.index('__aicore__ inline bool AdvanceWindow'))
+        b=code.index('    bool trace=',a)
+        code=code[:a]+"""    // Same predecessor dependency as original FastService, moved before the
+    // added calculation so private per-lane state cannot have two writers.
+    if(epoch) {
+        auto previous=reinterpret_cast<__gm__ volatile rotating::Event*>(ctx->events)+(epoch-1)*runtimeShape_.serviceLanes+lane;
+        do {kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ rotating::Event*>(previous)),64);}while(!previous->complete);
+    }
+"""+code[b:]
+        code=code.replace('prefixOutput_', 'WindowTopkPrefix()')
+        code="""__aicore__ inline GM_ADDR WindowTopkPrefix() {
+    auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+    return reinterpret_cast<GM_ADDR>(ctx->incremental)+runtimeShape_.batch*512;
+}
+"""+code
+        methods.write_text(code)
+        replace(vector, "        // Join this producer's hit publication. Other producers remain free.",
+                "        AdvanceWindow(epoch,sequenceHalfWindow);\n        // Join this producer's hit publication. Other producers remain free.")
+        instrument(dest)
+        # These production algorithms must remain byte-identical to the source.
+        for relative in ('op_kernel/prefetch.h', 'op_kernel/indexer/indexer.h', 'op_kernel/streaming.cpp'):
+            if (op/relative).read_bytes() != (repo/'csrc/operators/lightning_indexer_with_fetch'/relative).read_bytes():
+                raise RuntimeError(f'Unexpected production algorithm change: {relative}')
+        print(f'Window TopK only: {dest}')
+        print('Private TopK state only; original prefetch, final TopK, resolver, update and Fetch retained.')
+        return
     replace(vector, '        if (publishProgress) {', '        SeedIncremental(query,scoreRow);\n        if (publishProgress) {')
     replace(vector, '        // Join this producer\'s hit publication. Other producers remain free.',
             '        if(!AdvanceWindow(epoch,sequenceHalfWindow))return;\n        // Join this producer\'s hit publication. Other producers remain free.')

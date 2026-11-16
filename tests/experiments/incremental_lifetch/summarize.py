@@ -101,14 +101,17 @@ def detailed_trace(report, path, label, required=False):
         active=[r for r in rr if r['service_calls']]
         def duration(name):
             return '--' if not active else f'{mean(active,name)/mhz:.2f}/{max(r[name] for r in active)/mhz:.2f}'
-        rows.append([epoch, number(len(rr)/len(samples)), number(sum(r['skipped'] for r in rr)/len(samples)), number(len(active)/len(samples)), number(sum(r['topk_calls'] for r in rr)/len(samples)), duration('cycles'), duration('service_wait_cycles'), duration('service_cycles'), duration('scan_cycles'), duration('candidate_cycles'), duration('post_cycles')])
-    lines += table(['Epoch','Attempts','Skipped','Service calls','Incremental TopK calls','Incremental mean/max us','Service wait mean/max us','Service mean/max us','Scan mean/max us','Candidate mean/max us','Post mean/max us'],rows)
+        rows.append([epoch, number(len(rr)/len(samples)), number(sum(r['skipped'] for r in rr)/len(samples)), number(len(active)/len(samples)), number(sum(r['topk_calls'] for r in rr)/len(samples)), number(sum(r.get('scanned',0) for r in rr)/len(samples)), number(sum(r.get('candidates',0) for r in rr)/len(samples)), duration('cycles'), duration('service_wait_cycles'), duration('service_cycles'), duration('scan_cycles'), duration('candidate_cycles'), duration('post_cycles')])
+    lines += table(['Epoch','Attempts','Skipped','Service calls','Incremental TopK calls','Scanned scores','Candidates','Incremental mean/max us','Service wait mean/max us','Service mean/max us','Scan mean/max us','Candidate mean/max us','Post mean/max us'],rows)
     return lines
 
 
 def summarize(run, required=False):
     cases = {v: load_cases(run / v) for v in ('baseline', 'incremental')}
     lines = [f'Run: {run}', 'A=baseline; B=incremental. Time: us; positive reduction means faster.']
+    if (run / 'experiment.txt').exists() and (run / 'experiment.txt').read_text().strip() == 'window-topk-only':
+        lines[1] = 'A=original LIFetch; B=original LIFetch + private window TopK only. Time: us.'
+        lines += ['Same seed initialization and profiling in A/B; intermediate results do not affect prefetch or final TopK.']
     keys = sorted(set(cases['baseline']) | set(cases['incremental']), key=lambda k: (k[0], str(k[1])))
     for key in keys:
         lines += ['', f'BS={key[0]} miss={key[1]}%']

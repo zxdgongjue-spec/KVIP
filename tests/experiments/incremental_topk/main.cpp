@@ -19,7 +19,7 @@ template<class T> std::vector<T> read(void* p,size_t n) {
     std::vector<T> v(n);check(aclrtMemcpy(v.data(),n*sizeof(T),p,n*sizeof(T),ACL_MEMCPY_DEVICE_TO_HOST));return v;
 }
 int main(int argc,char** argv) { try {
-    uint32_t device=0,blocks=1,rows=8,added=12288,warmup=4,iterations=50,seed=43; bool sim=false; std::string inputFile; uint32_t mode=0,percent=100;
+    uint32_t device=0,blocks=1,rows=8,added=12288,warmup=4,iterations=50,seed=43; bool sim=false; std::string inputFile; uint32_t mode=0,percent=100,candidateOverride=UINT32_MAX;
     for(int i=1;i<argc;++i) {
         std::string a=argv[i];if(a=="--sim"){sim=true;continue;}
         if(i+1==argc)throw std::runtime_error("missing value: "+a);
@@ -28,7 +28,7 @@ int main(int argc,char** argv) { try {
         auto v=std::stoul(argv[++i]);
         if(a=="--device")device=v;else if(a=="--blocks")blocks=v;else if(a=="--rows")rows=v;
         else if(a=="--new-scores")added=v;else if(a=="--warmup")warmup=v;
-        else if(a=="--iterations")iterations=v;else if(a=="--seed")seed=v;else if(a=="--candidate-percent")percent=v;
+        else if(a=="--iterations")iterations=v;else if(a=="--seed")seed=v;else if(a=="--candidate-percent")percent=v;else if(a=="--candidate-count")candidateOverride=v;
         else throw std::runtime_error("unknown option: "+a);
     }
     if(!percent||percent>100)throw std::runtime_error("candidate-percent:1..100");
@@ -53,7 +53,9 @@ int main(int argc,char** argv) { try {
         for(uint32_t i=0;i<K;++i){source[row*width+i]=history[ids[i]];oldIds[row*K+i]=ids[i];}
         for(uint32_t i=K;i<width;++i)source[row*width+i]=full.empty()?random(rng):full[size_t(row)*(oldHistory+added)+oldHistory+i-K];
     }
-    const uint32_t candidates=(added*percent+50)/100,padded=(candidates+255)/256*256;
+    const uint32_t candidates=candidateOverride==UINT32_MAX?(added*percent+50)/100:candidateOverride;
+    if(candidates>added)throw std::runtime_error("candidate-count exceeds new-scores");
+    const uint32_t padded=(candidates+255)/256*256;
     std::vector<uint32_t> masks(n*added/16,0);
     // Randomly placed eligible entries. All omitted scores are below the old
     // TopK minimum, so full-input TopK remains an independent exact reference.
