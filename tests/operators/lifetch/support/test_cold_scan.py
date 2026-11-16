@@ -39,7 +39,7 @@ int main() {
    unsigned token=kvip_cold_scan::Remap(scan,range);
    assert(token<history && !seen[token]++);
    assert(kvip_cold_scan::Remap(token,range)==scan);
-   assert(DecodeScanToken(scan,cfg)==token);
+   assert(DecodeScanToken(scan,cfg[60],cfg[61])==token);
    if(scan<resident || scan>=range.end)assert(scan==token);
    for(unsigned q=0;q<4;++q)assert((scan<ends[q])==(token<ends[q]));
    reverse[token]=forward[token]; // LI stores at physical, not scan coordinates.
@@ -58,7 +58,7 @@ int main() {
     unsigned hi=resident+(history-resident)*(window+1)/8;
     for(unsigned scan=lo;scan<std::min(hi,qEnd);++scan) {
      auto physical=kvip_cold_scan::Remap(scan,range);
-     if(forward[physical]>threshold)actual.push_back(DecodeScanToken(scan,cfg));
+     if(forward[physical]>threshold)actual.push_back(DecodeScanToken(scan,cfg[60],cfg[61]));
     }
    }
    std::sort(actual.begin(),actual.end());assert(expected==actual);
