@@ -29,10 +29,11 @@ class UbmemBinding:
         scratch=None,
         prefetch_limit=512,
         window_limit=None,
+        initial_hot_rank=2048,
         topk_checkpoints=(),
         reuse_checkpoint_topk=False,
     ):
-        topk_options = checkpoint_topk_options(topk_checkpoints, reuse_checkpoint_topk)
+        topk_options = checkpoint_topk_options(initial_hot_rank, topk_checkpoints, reuse_checkpoint_topk)
         if not 1 <= shape.batch <= 16:
             raise ValueError(f"LIFetch supports BS1..16; received BS={shape.batch}; no legacy fallback")
         self.torch, self.lease, self.shape = torch, lease, shape

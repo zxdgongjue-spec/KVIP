@@ -114,6 +114,7 @@ def configuration(argv=None):
         command.add_argument('--kvaf-server')
         command.add_argument('--output', type=Path, default=ROOT / 'tests/results/lifetch')
         command.add_argument('--timeout-seconds', type=int, default=300)
+        command.add_argument('--initial-hot-rank', type=int, default=2048)
         command.add_argument('--topk-checkpoints', default=(), type=csv_values)
         command.add_argument('--reuse-checkpoint-topk', action='store_true')
         if mode == 'check':
@@ -150,7 +151,8 @@ def configuration(argv=None):
         parser.error('device must be nonnegative and timeout positive')
     from kvip.operators.lifetch.geometry import checkpoint_topk_options
     try:
-        args.checkpoint_topk = dict(topk_checkpoints=tuple(map(int, args.topk_checkpoints)),
+        args.checkpoint_topk = dict(initial_hot_rank=args.initial_hot_rank,
+                                     topk_checkpoints=tuple(map(int, args.topk_checkpoints)),
                                      reuse_checkpoint_topk=args.reuse_checkpoint_topk)
         checkpoint_topk_options(**args.checkpoint_topk)
     except ValueError as error:

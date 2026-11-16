@@ -36,10 +36,11 @@ class LIFetchBinding:
         tail_bounds=None,
         output_stride=None,
         scratch=None,
+        initial_hot_rank=2048,
         topk_checkpoints=(),
         reuse_checkpoint_topk=False,
     ):
-        topk_options = checkpoint_topk_options(topk_checkpoints, reuse_checkpoint_topk)
+        topk_options = checkpoint_topk_options(initial_hot_rank, topk_checkpoints, reuse_checkpoint_topk)
         if resident > 131072:
             raise ValueError("LIFetch hot bitmap supports resident <= 131072")
         if not 1 <= batch <= 16:

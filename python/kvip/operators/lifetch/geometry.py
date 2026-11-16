@@ -3,14 +3,16 @@
 import struct
 
 
-def checkpoint_topk_options(topk_checkpoints=(), reuse_checkpoint_topk=False):
+def checkpoint_topk_options(initial_hot_rank=2048, topk_checkpoints=(), reuse_checkpoint_topk=False):
     windows = tuple(topk_checkpoints)
+    if not isinstance(initial_hot_rank, int) or not 1 <= initial_hot_rank <= 2048:
+        raise ValueError("initial_hot_rank must be in 1..2048")
     if (len(windows) > 6 or any(not isinstance(window, int) or not 1 <= window <= 30 for window in windows)
             or windows != tuple(sorted(set(windows)))):
         raise ValueError("topk_checkpoints requires up to six distinct increasing cold window indices in 1..30")
     if reuse_checkpoint_topk and not windows:
         raise ValueError("reuse_checkpoint_topk requires at least one checkpoint")
-    return struct.pack("<4I", 0, sum(1 << window for window in windows),
+    return struct.pack("<4I", initial_hot_rank, sum(1 << window for window in windows),
                        int(bool(reuse_checkpoint_topk)), 0)
 
 

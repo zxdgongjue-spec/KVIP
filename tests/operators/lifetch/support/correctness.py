@@ -91,6 +91,8 @@ def check_contracts(transport):
     for budget in (-1, 2049):
         rejected(f'reject_budget{budget}', lambda n=budget: prefetch_budget(n, intermediate_fetches=8))
     rejected('reject_windows0', lambda: prefetch_budget(512, intermediate_fetches=0))
+    rejected('reject_hot_rank0', lambda: checkpoint_topk_options(initial_hot_rank=0))
+    rejected('reject_hot_rank2049', lambda: checkpoint_topk_options(initial_hot_rank=2049))
     rejected('reject_hot_checkpoint', lambda: checkpoint_topk_options(topk_checkpoints=(0,)))
     rejected('reject_unsorted_checkpoints', lambda: checkpoint_topk_options(topk_checkpoints=(2, 1)))
     rejected('reject_reuse_without_checkpoint', lambda: checkpoint_topk_options(reuse_checkpoint_topk=True))

@@ -41,6 +41,7 @@ public:
         rotationContext_ = p;
         auto context = reinterpret_cast<__gm__ rotating::Context*>(p);
         runtimeShape_ = rotating::LoadRuntimeShape(context);
+        initialHotRank_ = context->checkpointTopk.initialHotRank;
         checkpointMask_ = context->checkpointTopk.windowMask;
         reuseCheckpointTopk_ = context->checkpointTopk.reuseFinal;
         rotationProgressGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(
@@ -169,6 +170,7 @@ private:
     LocalTensor<uint16_t> classifyUB_;
     TBuf<TPosition::VECCALC> prefixThresholdBuf_;
     LocalTensor<uint16_t> prefixThreshold_;
+    uint32_t initialHotRank_ = 2048;
     uint32_t checkpointMask_ = 0;
     bool reuseCheckpointTopk_ = false;
     __aicore__ inline void GetPrefixState(uint32_t query, GlobalTensor<uint16_t>& scores,
@@ -223,10 +225,26 @@ private:
             MicroAPI::StoreAlign(dst, reduced, mask);
         }
     }
-    __aicore__ inline void SaveResident(uint32_t query, uint32_t scoreRow,
+    __aicore__ inline void SaveResident(uint32_t query, uint32_t scoreRow, uint32_t validLength,
                                         bool publishProgress) {
         StoreTopkMinimum(query);
         auto localThreshold = prefixThreshold_[(query % 2) * lifetch::kThresholdRecordWords];
+        if (initialHotRank_ && initialHotRank_ != topkCount_ && initialHotRank_ <= validLength) {
+            uint16_t key;
+            if (validLength >= topkCount_) {
+                key = topkOp_.RankKey(scoreOutLocal_, topkCount_, initialHotRank_);
+            } else {
+                const uint32_t aligned = QLICommon::Align(validLength, uint32_t(256));
+                Duplicate(mrgValueLocal_, uint16_t(0), aligned);
+                SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3); WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+                DataCopyExtParams copy{1, validLength * 2, 0, 0, 0};
+                DataCopyPadExtParams<uint16_t> padding{true, 0, 0, 0};
+                DataCopyPad(mrgValueLocal_, scoreGm[scoreRow * runtimeShape_.history], copy, padding);
+                SetFlag<HardEvent::MTE2_V>(EVENT_ID0); WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+                key = topkOp_.RankKey(mrgValueLocal_, aligned, initialHotRank_);
+            }
+            localThreshold.SetValue(0, key);
+        }
         if (checkpointMask_) {
             constexpr uint32_t profileWord = 4 * lifetch::kCheckpointProfileOffset;
             Duplicate(localThreshold[profileWord], uint16_t(0), lifetch::kThresholdRecordWords - profileWord);
@@ -235,7 +253,7 @@ private:
         }
         SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
         WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
-        if (checkpointMask_) {
+        if (checkpointMask_ || (initialHotRank_ && initialHotRank_ != topkCount_)) {
             SetFlag<HardEvent::S_MTE3>(EVENT_ID0); WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
         }
         uint32_t batch = query / SIM_Q;
@@ -1053,7 +1071,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
             Duplicate(indicesOutLocal_.ReinterpretCast<int32_t>(), neg, topkCount_);
             if (prefixActive_) {
                 Duplicate(scoreOutLocal_, uint16_t(0), topkCount_);
-                SaveResident(streamingQuery, vecOffset, queryRow == SIM_Q);
+                SaveResident(streamingQuery, vecOffset, 0, queryRow == SIM_Q);
             }
             SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
             WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
@@ -1172,7 +1190,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
         if (prefixActive_) {
             if (validS2Len < topkCount_) Duplicate(scoreOutLocal_, uint16_t(0), topkCount_);
-            SaveResident(streamingQuery, vecOffset, queryRow == SIM_Q);
+            SaveResident(streamingQuery, vecOffset, validS2Len, queryRow == SIM_Q);
         } else {
 #if KVIP_STREAMING_LI
             if (profile.start) {

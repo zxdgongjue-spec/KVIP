@@ -121,6 +121,23 @@ private:
 template<>
 class LITopk<uint16_t> {
 public:
+    __aicore__ inline uint16_t RankKey(LocalTensor<uint16_t> input, uint32_t length, uint32_t rank)
+    {
+        auto scores = reinterpret_cast<__ubuf__ uint16_t*>(input.GetPhyAddr());
+        auto bins = reinterpret_cast<__ubuf__ uint32_t*>(histogramsLocal.GetPhyAddr());
+        auto high = reinterpret_cast<__ubuf__ uint32_t*>(idxHighLocal.GetPhyAddr());
+        auto low = reinterpret_cast<__ubuf__ uint32_t*>(idxLowLocal.GetPhyAddr());
+        auto kth = reinterpret_cast<__ubuf__ uint32_t*>(nkValueLocal.GetPhyAddr());
+        const uint16_t repeats = length / 256;
+        topkb16gather::HistogramsHighVFImpl<uint16_t>(bins, scores, repeats, true);
+        topkb16gather::FindHighTargetBinVFImpl(high, kth, bins, length - rank + 1);
+        topkb16gather::HistogramsLowVFImpl<uint16_t>(bins, scores, high, repeats, true);
+        topkb16gather::FindKthVFImpl(kth, bins, high, low);
+        SetFlag<HardEvent::V_S>(EVENT_ID0);
+        WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        return nkValueLocal.template ReinterpretCast<uint16_t>().GetValue(0);
+    }
+
     // Keep history ahead of the new, ascending physical IDs. The selector
     // retains scan order within equal keys, including a tie at rank 2048.
     __aicore__ inline void MergeCheckpoint(LocalTensor<uint16_t>& input,

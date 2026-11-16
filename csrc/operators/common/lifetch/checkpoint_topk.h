@@ -4,7 +4,7 @@
 
 namespace lifetch {
 struct CheckpointTopk {
-    uint32_t reservedPrefix;
+    uint32_t initialHotRank;
     uint32_t windowMask;
     uint32_t reuseFinal;
     uint32_t reserved;
