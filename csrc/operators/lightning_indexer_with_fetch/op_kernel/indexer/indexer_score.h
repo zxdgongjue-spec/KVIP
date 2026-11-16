@@ -802,7 +802,7 @@ __simd_callee__ inline void ClassifyRollingScore(AscendC::MicroAPI::RegTensor<ui
         LoadAlign(limit, threshold); LoadAlign(anchor, state + kvip_rolling::kBins);
         Compare<uint16_t, CMPMODE::GE>(current, score, limit, all);
         Compare<uint16_t, CMPMODE::GT>(original, score, anchor, all);
-        MaskAnd(current, current, original);
+        MaskAnd(current, current, original, all);
         StoreAlign(hits, current);
         return;
     }

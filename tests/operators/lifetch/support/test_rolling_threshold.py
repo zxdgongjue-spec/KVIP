@@ -56,8 +56,11 @@ template<class T> MaskReg UpdateMask(uint32_t& n){MaskReg m;unsigned take=std::m
  std::fill_n(m.v.begin(),take,true);n-=take;return m;}
 template<class T,int C> void CompareScalar(MaskReg& r,RegTensor<T>& a,T value,MaskReg mask){
  RegTensor<T> b;Duplicate(b,value);Compare<T,C>(r,a,b,mask);}
-inline void MaskAnd(MaskReg& r,MaskReg a,MaskReg b){for(unsigned i=0;i<256;++i)r.v[i]=a.v[i]&&b.v[i];}
-inline void MaskOr(MaskReg& r,MaskReg a,MaskReg b){for(unsigned i=0;i<256;++i)r.v[i]=a.v[i]||b.v[i];}
+// Match CANN's required fourth execution-mask argument; no permissive overload.
+inline void MaskAnd(MaskReg& r,MaskReg& a,MaskReg& b,MaskReg& mask){
+ for(unsigned i=0;i<256;++i)r.v[i]=mask.v[i]&&(a.v[i]&&b.v[i]);}
+inline void MaskOr(MaskReg& r,MaskReg& a,MaskReg& b,MaskReg& mask){
+ for(unsigned i=0;i<256;++i)r.v[i]=mask.v[i]&&(a.v[i]||b.v[i]);}
 template<class T> void DeInterleave(RegTensor<T>& a,RegTensor<T>& b,RegTensor<T> x,RegTensor<T> y){
  unsigned n=x.v.size();for(unsigned i=0;i<n/2;++i){a.v[i]=x.v[2*i];b.v[i]=x.v[2*i+1];
  a.v[i+n/2]=y.v[2*i];b.v[i+n/2]=y.v[2*i+1];}}

@@ -26,9 +26,9 @@ __simd_callee__ inline void Accumulate(RegTensor<uint16_t>& score,
     CompareScalar<uint16_t, CMPMODE::LT>(valid, index, uint16_t(tileMask & 255), all);
     CompareScalar<uint16_t, CMPMODE::LT>(left, index, uint16_t((tileMask >> 8) & 255), all);
     CompareScalar<uint16_t, CMPMODE::GE>(right, index, uint16_t((tileMask >> 16) & 255), all);
-    MaskOr(outside, left, right); MaskAnd(valid, valid, outside);
+    MaskOr(outside, left, right, all); MaskAnd(valid, valid, outside, all);
     Compare<uint16_t, CMPMODE::GE>(admitted, score, anchor, all);
-    MaskAnd(valid, valid, admitted);
+    MaskAnd(valid, valid, admitted, all);
     // Invalid lanes affect only the floor bin, which cannot raise the seed.
     Select(encoded, encoded, cap, valid);
     RegTensor<uint8_t> bytes, discarded;
