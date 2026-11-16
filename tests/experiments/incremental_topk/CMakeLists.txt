@@ -1,0 +1,16 @@
+cmake_minimum_required(VERSION 3.16)
+project(incremental_topk LANGUAGES C CXX)
+set(CMAKE_BUILD_TYPE Release)
+set(RUN_MODE npu CACHE STRING "npu or sim")
+set(SOC_VERSION Ascend950PR_9599 CACHE STRING "Target SoC")
+set(ASCEND_CANN_PACKAGE_PATH /usr/local/Ascend/cann CACHE PATH "CANN")
+include(${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
+get_filename_component(REPO "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
+ascendc_library(incremental_kernel STATIC kernel.cpp)
+ascendc_include_directories(incremental_kernel PRIVATE
+  ${REPO}/csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer
+  ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)
+ascendc_compile_options(incremental_kernel PRIVATE -O2 --cce-auto-sync=off -mllvm -user-reserved-ub-size=223232)
+add_executable(incremental_topk main.cpp)
+target_link_libraries(incremental_topk PRIVATE incremental_kernel host_intf_pub ascendcl)
+target_link_options(incremental_topk PRIVATE -Wl,--allow-shlib-undefined)
