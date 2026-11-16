@@ -1,5 +1,9 @@
 #pragma once
-// Included after the indexer types by indexer.cpp and the standalone experiment.
+// Keep all entry points in an AIV-only translation unit: legacy CANN CMake
+// applies KERNEL_TASK_TYPE_DEFAULT to every kernel in the source file.
+#ifndef KVIP_STAGED_VECTOR_ENTRY
+#error "Include staged_indexer.h only from staged_vector.cpp"
+#endif
 #include "../../common/lifetch/staged_schedule.h"
 namespace kvip_staged_device {
 using namespace AscendC;
@@ -110,28 +114,6 @@ extern "C" __global__ __aicore__ void v9_staged_service(GM_ADDR bindings,uint32_
     }
 }
 
-extern "C" __global__ __aicore__ void v9_staged_score(
-    GM_ADDR bindings,uint32_t rows,uint32_t stride,uint32_t heads,uint32_t queryGroup) {
-#if defined(__CCE_AICORE__)
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
-    using namespace AscendC; using namespace QLICommon;
-    TPipe pipe;
-    auto a = reinterpret_cast<__gm__ uint64_t*>(bindings);
-#define P(i) reinterpret_cast<GM_ADDR>(a[i])
-    using Type=QLIType<fp8_e4m3fn_t,fp8_e4m3fn_t,int32_t,true,LI_LAYOUT::BSND,LI_LAYOUT::PA_BSND,
-        bfloat16_t,float,float,uint16_t>;
-    QLIKernel::QuantLightningIndexerKernel<Type> op;
-    op.scoreOnly_=true; op.scoreQueryGroup_=queryGroup;
-    op.runtimeShape_={}; op.runtimeShape_.batch=rows; op.runtimeShape_.history=stride;
-    op.runtimeShape_.resident=stride; op.runtimeShape_.indexHeads=heads;
-    op.vectorService.runtimeShape_=op.runtimeShape_;
-    QLITilingData tiling{rows,rows*queryGroup,heads,queryGroup,stride,2048,rows,128,
-        stride/128,0,16384,128,stride,0,rows};
-    op.Init(P(0),P(1),P(2),P(3),P(4),P(5),P(6),P(7),P(9),P(12),&tiling,&pipe);
-    op.Process(); pipe.Destroy();
-#undef P
-#endif
-}
 __simt_vf__ __aicore__ LAUNCH_BOUND(256) inline void StagedPreparePages(__gm__ uint32_t* input,
     __gm__ uint32_t* output,uint32_t owner,uint32_t begin,uint32_t length,uint32_t row,uint32_t stride,uint32_t history) {
  for(uint32_t p=threadIdx.x;p<length/128;p+=256)

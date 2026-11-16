@@ -24,7 +24,8 @@ include(${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake/ascendc
 set(PRODUCER ${STAGED_SOURCE}/producer/csrc/operators/lightning_indexer_with_fetch)
 set(TAIL ${STAGED_SOURCE}/tail/csrc/operators/lightning_indexer_with_fetch)
 ascendc_library(producer STATIC ../score_kernel.cpp)
-ascendc_library(tail STATIC ${TAIL}/op_kernel/indexer.cpp ${TAIL}/op_kernel/lifecycle.cpp ${TAIL}/op_kernel/streaming.cpp)
+ascendc_library(tail STATIC ${TAIL}/op_kernel/indexer.cpp ${TAIL}/op_kernel/staged_vector.cpp
+ ${TAIL}/op_kernel/lifecycle.cpp ${TAIL}/op_kernel/streaming.cpp)
 foreach(target producer tail)
  if(target STREQUAL producer)
   set(OP ${PRODUCER})
