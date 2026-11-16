@@ -191,6 +191,10 @@ def create_fused(
 
             if b > 16 or 2 * b > aics:
                 raise ValueError("Rolling experiment requires B1..16 split-Q scratch geometry")
+            if build_options.get("rolling_windowed"):
+                window_tokens = ((h-r)//128 + rounds-2)//(rounds-1)*128
+                if g["heads"] != 32 or window_tokens > 18432:
+                    raise ValueError("Window accumulation requires H32 and <=18432 scores per window")
             ends = archive.array("pre.query_ends").reshape(b, 4)
             bounds = archive.array("pre.threshold_bounds")
             counts = np.maximum(0, np.minimum(bounds[:, 1, None], ends) - np.maximum(bounds[:, 0, None], r))

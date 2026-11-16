@@ -6,18 +6,20 @@ import json
 from pathlib import Path
 from statistics import mean
 
-from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, options_for
+from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, options_for
 
 
-def load_report(path, *, require_rolling=False, require_batched=False, expected_native=None, snapshot=None):
+def load_report(path, *, require_rolling=False, require_batched=False, require_windowed=False, expected_native=None, snapshot=None):
     data = json.loads(path.read_text())
     order = tuple(data.get("execution_order", ()))
-    if data.get("status") != "pass" or order not in (DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, options_for):
+    if data.get("status") != "pass" or order not in (DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS):
         raise ValueError("Missing or incomplete controlled scan experiment")
-    if require_rolling and order not in (ROLLING_VARIANTS, BATCHED_VARIANTS):
+    if require_rolling and order not in (ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS):
         raise ValueError("Old scan/budget experiment: rolling/refilter cases were not measured")
     if require_batched and order != BATCHED_VARIANTS:
         raise ValueError("Batched histogram variants were not measured")
+    if require_windowed and order != WINDOWED_VARIANTS:
+        raise ValueError("Window accumulation variants were not measured")
     digest = None if snapshot is None else hashlib.sha256((snapshot / "manifest.json").read_bytes()).hexdigest()
     for name in order:
         case = data["cases"][name]
@@ -25,7 +27,7 @@ def load_report(path, *, require_rolling=False, require_batched=False, expected_
             raise ValueError(f"{name}: native revision does not match {expected_native}")
         if digest and case.get("snapshot_sha256") != digest:
             raise ValueError(f"{name}: snapshot manifest does not match")
-        if (require_rolling or require_batched) and options_for(name)["rolling_threshold"]:
+        if (require_rolling or require_batched or require_windowed) and options_for(name)["rolling_threshold"]:
             if case.get("rolling_threshold_check", {}).get("status") != "bit_exact":
                 raise ValueError(f"{name}: rolling threshold oracle has not passed")
     return data
@@ -47,8 +49,8 @@ def reduction(before, after):
     return f"{100 * (1 - after / before):+.2f}%" if before else "n/a"
 
 
-def report(path, *, require_rolling=False, require_batched=False, expected_native=None, snapshot=None, check_only=False):
-    data = load_report(path, require_rolling=require_rolling, require_batched=require_batched, expected_native=expected_native, snapshot=snapshot)
+def report(path, *, require_rolling=False, require_batched=False, require_windowed=False, expected_native=None, snapshot=None, check_only=False):
+    data = load_report(path, require_rolling=require_rolling, require_batched=require_batched, require_windowed=require_windowed, expected_native=expected_native, snapshot=snapshot)
     if check_only:
         return
     order = data["execution_order"]
@@ -83,12 +85,15 @@ def report(path, *, require_rolling=False, require_batched=False, expected_nativ
     if tuple(order) == BATCHED_VARIANTS:
         pairs = (("reverse", "reverse-batch"), ("reverse-batch", "reverse-batch-ref"),
                  ("reverse-refilter", "reverse-batch-ref"))
+    if tuple(order) == WINDOWED_VARIANTS:
+        pairs = (("reverse-refilter", "reverse-window-ref"), ("reverse-batch-ref", "reverse-window-ref"),
+                 ("reverse-window", "reverse-window-ref"), ("forward", "forward-window-ref"))
     for left, right in pairs:
         a, b = cases[left]["timing"], cases[right]["timing"]
         timing_change = (f"CHANGE {left}->{right} mean_gain={100*(1-b['mean_us']/a['mean_us']):+.2f}% "
                          f"p50_gain={100*(1-b['p50_us']/a['p50_us']):+.2f}%")
         a, b = transfers[left], transfers[right]
-        if tuple(order) == BATCHED_VARIANTS:
+        if tuple(order) in (BATCHED_VARIANTS, WINDOWED_VARIANTS):
             print(f"{timing_change} waste_save_MiB={(a['waste']-b['waste'])/2**20:+.4f} "
                   f"repair_delta_MiB={(b['repair']-a['repair'])/2**20:+.4f} "
                   f"total_save_MiB={(a['total']-b['total'])/2**20:+.4f}")
@@ -101,17 +106,36 @@ def report(path, *, require_rolling=False, require_batched=False, expected_nativ
               f"total_save={reduction(a['total'], b['total'])}")
     checks = {name: cases[name]["rolling_threshold_check"] for name in order
               if cases[name].get("rolling_threshold_check")}
-    if tuple(order) == BATCHED_VARIANTS:
+    if tuple(order) in (BATCHED_VARIANTS, WINDOWED_VARIANTS):
         print("ROLLING_CHECK " + " ".join(
             f"{name}={check['status']}/capped:{check['capped_queries']}" for name, check in checks.items()))
-    for name in (() if tuple(order) == BATCHED_VARIANTS else order):
+    for name in (() if tuple(order) in (BATCHED_VARIANTS, WINDOWED_VARIANTS) else order):
         check = cases[name].get("rolling_threshold_check")
         if check:
             print(f"THRESHOLD {name} bounded_CDF={check['status']} "
                   f"tightened={check['tightened_queries']}/{check['queries']} "
                   f"capped={check['capped_queries']} mean_key_gap_to_final={check['mean_final_gap_keys']:.3f}")
+    if tuple(order) == WINDOWED_VARIANTS:
+        check_acceptance(cases)
     print("NOTE saves>0=less bytes; repair_delta>0=more final repair; drift>0=slower baseline repeat")
     print("NOTE useful_GB/s=useful_bytes/full_graph_time; not link utilization or coldEarly/lead")
+
+
+def check_acceptance(cases):
+    """Conservative screening, not statistical significance or auto-deployment."""
+    first, last = (cases[name]["timing"] for name in ("forward", "forward-end"))
+    margins = {key: max(1.0, 100*abs(last[key]/first[key]-1)) for key in ("mean_us", "p50_us")}
+    accepted = []
+    for name in ("reverse-window", "reverse-window-ref", "forward-window-ref"):
+        timing = cases[name]["timing"]
+        gain = {key: 100*(1-timing[key]/min(first[key],last[key])) for key in margins}
+        ok = all(gain[key] > margins[key] for key in margins)
+        if ok:
+            accepted.append(name)
+        print(f"GATE {name} {'CANDIDATE' if ok else 'KEEP_BASELINE'} "
+              f"mean_gain={gain['mean_us']:+.2f}% p50_gain={gain['p50_us']:+.2f}% "
+              f"required_mean>{margins['mean_us']:.2f}% required_p50>{margins['p50_us']:.2f}%")
+    print("DECISION " + ("retest_candidates="+",".join(accepted) if accepted else "keep_original_fused"))
 
 
 def main():
@@ -119,12 +143,13 @@ def main():
     parser.add_argument("result", type=Path)
     parser.add_argument("--require-rolling", action="store_true")
     parser.add_argument("--require-batched", action="store_true")
+    parser.add_argument("--require-windowed", action="store_true")
     parser.add_argument("--expected-native")
     parser.add_argument("--snapshot", type=Path)
     parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args()
     try:
-        report(args.result, require_rolling=args.require_rolling, require_batched=args.require_batched, expected_native=args.expected_native,
+        report(args.result, require_rolling=args.require_rolling, require_batched=args.require_batched, require_windowed=args.require_windowed, expected_native=args.expected_native,
                snapshot=args.snapshot, check_only=args.check_only)
     except (OSError, ValueError, KeyError) as error:
         parser.exit(1, f"REPORT_REJECTED: {error}\n")

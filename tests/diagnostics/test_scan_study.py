@@ -7,10 +7,10 @@ import numpy as np
 import pytest
 
 from kvip.diagnostics import replay, replay_measure, scan_report, scan_options
-from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, budgets_for, options_for, validate_options
+from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, budgets_for, options_for, validate_options
 
 
-@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS])
+@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS])
 def test_scan_study_reuses_one_arena_and_delivers_independent_options(monkeypatch, variants):
     args = SimpleNamespace(study="scan-order", mode="fused", transport="urma",
                            threshold_policy="recent", scan_variants=list(variants))
@@ -34,7 +34,7 @@ def test_scan_study_reuses_one_arena_and_delivers_independent_options(monkeypatc
     assert calls == [(name, options_for(name), budgets_for(name)) for name in variants]
 
 
-@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS])
+@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS])
 def test_actual_command_line_accepts_scan_variants(tmp_path, variants):
     args = replay.arguments([
         "--snapshot", str(tmp_path / "input"), "--build-dir", str(tmp_path / "build"),
@@ -69,9 +69,9 @@ def test_report_uses_full_chain_and_keeps_mean_and_median_separate(tmp_path, cap
 
 def test_rolling_experiment_does_not_change_budgets_or_enable_pipeline_options():
     assert {budgets_for(name) for name in ROLLING_VARIANTS} == {(512, 64)}
-    assert options_for("reverse-refilter") == dict(reverse_cold=True, rolling_threshold=True, window_refilter=True, rolling_batched=False)
+    assert options_for("reverse-refilter") == dict(reverse_cold=True, rolling_threshold=True, window_refilter=True, rolling_batched=False, rolling_windowed=False)
     with pytest.raises(ValueError, match="requires rolling"):
-        validate_options(dict(reverse_cold=True, rolling_threshold=False, window_refilter=True, rolling_batched=False))
+        validate_options(dict(reverse_cold=True, rolling_threshold=False, window_refilter=True, rolling_batched=False, rolling_windowed=False))
 
 
 def test_rolling_reference_uses_unique_seed_and_only_scanned_causal_positions():
@@ -205,3 +205,22 @@ def test_batch_options_keep_old_control_and_require_new_oracle(tmp_path, capsys)
     path.write_text(json.dumps(data))
     with pytest.raises(ValueError, match="oracle has not passed"):
         scan_report.load_report(path, require_batched=True)
+
+
+def test_window_control_keeps_old_binaries_and_requires_a_real_latency_gain(tmp_path, capsys):
+    assert {budgets_for(name) for name in WINDOWED_VARIANTS} == {(512, 64)}
+    assert not options_for("reverse-batch-ref")["rolling_windowed"]
+    assert options_for("reverse-window-ref")["rolling_windowed"]
+    assert not options_for("reverse-window-ref")["rolling_batched"]
+    data = rolling_report(tmp_path)
+    case = data["cases"]["reverse-refilter"]
+    cases = {name: json.loads(json.dumps(case)) for name in WINDOWED_VARIANTS}
+    cases["forward-end"]["timing"].update(mean_us=102, p50_us=89)
+    # Mean alone is insufficient; lower bytes alone are also insufficient.
+    cases["reverse-window"]["timing"].update(mean_us=95, p50_us=91)
+    cases["reverse-window-ref"]["timing"].update(mean_us=94, p50_us=84)
+    scan_report.check_acceptance(cases)
+    output = capsys.readouterr().out
+    assert "GATE reverse-window KEEP_BASELINE" in output
+    assert "GATE reverse-window-ref CANDIDATE" in output
+    assert "GATE forward-window-ref KEEP_BASELINE" in output
