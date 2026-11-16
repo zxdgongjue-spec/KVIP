@@ -91,6 +91,8 @@ def main():
     parser.add_argument('--kvaf-root', required=True, type=Path)
     parser.add_argument('--cann-root', type=Path, default=Path('/usr/local/Ascend/cann'))
     parser.add_argument('--soc', default='Ascend950PR_9599')
+    parser.add_argument('--profile-selection', action='store_true', help='Measure per-Q check/pack; tagged B must stay below 1800 cycles including bitmap loads')
+    parser.add_argument('--tagged-miss', action='store_true', help='Prefix-tagged hot residency and admission-only bitmap through actual window/submit')
     parser.add_argument('--bitmap-miss', action='store_true', help='Indexed true-miss A vs maintained bitmap B; validate initialization and admission updates')
     parser.add_argument('--ranked-miss', action='store_true', help='Cold floor vs true-miss floor through the real window/submit path')
     parser.add_argument('--prepare-only', action='store_true')
@@ -98,7 +100,10 @@ def main():
                         help='B incremental window must be below this cycle count (20 us at 1.8 GHz)')
     parser.add_argument('--stress', action='store_true', help='Also check B with sparse/dense candidates, unequal progress and no preloading')
     args = parser.parse_args()
+    if args.tagged_miss: args.bitmap_miss=True
     if args.bitmap_miss: args.ranked_miss=True
+    if args.profile_selection and not args.bitmap_miss:
+        parser.error('--profile-selection requires --bitmap-miss or --tagged-miss')
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     here = Path(__file__).resolve().parent
@@ -111,13 +116,18 @@ def main():
         if args.ranked_miss:
             command = [sys.executable, str(here / 'prepare_ranked.py'), str(source), '--minimum-half']
             if label == 'b' or args.bitmap_miss: command.append('--true-miss')
-            if label == 'b' and args.bitmap_miss: command.append('--bitmap-miss')
+            if label == 'b' and args.bitmap_miss: command.append('--tagged-miss' if args.tagged_miss else '--bitmap-miss')
         subprocess.run(command, check=True)
         op = source / 'csrc/operators/lightning_indexer_with_fetch'
         case = output / label
         case.mkdir()
         methods = (op / 'op_kernel/indexer/incremental_methods.h').read_text()
         methods = methods[:methods.index('__aicore__ inline void FinalIncremental')]
+        if args.tagged_miss and label == 'b':
+            # Prefix tagging is validated separately; this model starts from saved prefix state.
+            methods=methods[methods.index('bool incrementalIdsPending_'):]
+        if args.profile_selection:
+            methods=methods.replace('rankTrace_=trace;', 'rankTrace_=true;')
         (case / 'actual_methods.h').write_text(methods)
         kernel = KERNEL
         if (op / 'op_kernel/indexer/window_fast_vector.h').exists():
@@ -139,6 +149,10 @@ def main():
  stamps[3]=begin;stamps[4]=GetSystemCycle();stamps[6]=1;
  }
  PipeBarrier<PIPE_ALL>();uint64_t t0=''')
+        if args.tagged_miss and label == 'b':
+            begin=kernel.index(' kvip_prefetch_rank::InitializeCovered(')
+            end=kernel.index(' Simt::VF_CALL<rotating::InitializeTailMappings>',begin)
+            kernel=kernel[:begin]+kernel[end:]
         (case / 'kernel.cpp').write_text(kernel)
         host=(here / 'window_model_host.cpp').read_text()
         if args.bitmap_miss:
@@ -159,6 +173,23 @@ def main():
  if(actual!=expected)throw std::runtime_error("covered bitmap token="+std::to_string(t));}
  printf("PASS covered bitmap: hot validity, reserved, ABC tail and actual WQE admissions; init cycles=%llu\\n",(unsigned long long)(times[4]-times[3]));
  auto rr=read<rotating::Row>''')
+        if args.tagged_miss and label == 'b':
+            host=host.replace(' void* privateD=upload(privateState);', '''
+ for(uint32_t q=0;q<Q;++q){auto p=reinterpret_cast<uint8_t*>(privateState.data())+B*512+(q/4)*(4*K*6+1024);
+ auto ids=reinterpret_cast<uint32_t*>(p+4*K*2)+(q%4)*K;
+ for(uint32_t i=0;i<K;++i)if(ids[i]<R&&ids[i]!=17&&ids[i]!=33)ids[i]|=0x80000000U;}
+ void* privateD=upload(privateState);''')
+            host=host.replace('uint32_t id=ids[i];uint16_t value=', '''uint32_t tag=ids[i],id=tag&0x3fffffffU;
+ if(bool(tag&0x80000000U)!=(id<R&&id!=17&&id!=33))throw std::runtime_error("lost residency tag");
+ uint16_t value=''')
+            host=host.replace('bool expected=(t<R&&hot[b*R+t]&&int32_t(reserved[b*R+t])<0)||finalMap[b*H+t]!=UINT32_MAX;',
+                              'bool expected=finalMap[b*H+t]>=R&&finalMap[b*H+t]<R+8192;')
+            host=host.replace('PASS covered bitmap: hot validity, reserved, ABC tail and actual WQE admissions;',
+                              'PASS admission-only bitmap and hot tags: hot validity, reserved, ABC tail and actual WQE admissions;')
+        if args.profile_selection:
+            anchor=' // Same progress and TopK state:'
+            host=host.replace(anchor, ''' for(uint32_t q=0;q<Q;++q)printf("PACK q=%u calls=%llu check_pack_cycles=%llu rank_emit_cycles=%llu\\n",q,(unsigned long long)result[q*16+7],(unsigned long long)result[q*16+5],(unsigned long long)result[q*16+6]);
+'''+anchor)
         (case / 'main.cpp').write_text(host)
         (case / 'CMakeLists.txt').write_text(CMAKE.replace('@OP@', str(op)).replace('@KVAF@', str(args.kvaf_root.resolve() / 'access_operator/demo/aiv_batch_get/include')))
         if args.prepare_only:
@@ -169,16 +200,24 @@ def main():
         run = case / 'trace'
         run.mkdir()
         env = dict(os.environ)
-        env['LD_LIBRARY_PATH'] = str(args.cann_root / 'tools/simulator' / args.soc / 'lib') + ':' + env.get('LD_LIBRARY_PATH', '')
+        simulator=args.cann_root/'tools/simulator'/args.soc/'lib'
+        if not simulator.exists(): simulator=args.cann_root/'aarch64-linux/simulator/dav_3510/lib'
+        env['LD_LIBRARY_PATH'] = str(simulator) + ':' + env.get('LD_LIBRARY_PATH', '')
         print(f'RUNNING {label}: exact TopK + prefetch; log={case / "model.log"}', flush=True)
         with (case / 'model.log').open('w') as log:
             subprocess.run([str(case / 'build/window_model')], cwd=run, env=env, check=True, stdout=log, stderr=subprocess.STDOUT)
         log = (case / 'model.log').read_text()
-        print('\n'.join(line for line in log.splitlines() if line.startswith(('PASS', 'CYCLES'))), flush=True)
+        print('\n'.join(line for line in log.splitlines() if line.startswith(('PASS', 'CYCLES', 'PACK'))), flush=True)
         match = re.search(r'CYCLES (.*)', log)
         if not match or 'PASS unchanged progress' not in log:
             raise RuntimeError(f'Incomplete model checks: {case}')
         results[label] = {name: int(value) for name, value in re.findall(r'(\w+)=(\d+)', match[1])}
+        if args.profile_selection:
+            pack=[int(value) for value in re.findall(r'PACK q=\d+ calls=1 check_pack_cycles=(\d+)',log)]
+            if len(pack)!=8: raise RuntimeError('Missing per-Q selection measurements')
+            results[label]['check_pack_max']=max(pack)
+            if args.tagged_miss and label=='b' and max(pack)>=1800:
+                raise RuntimeError(f'Tagged check/pack exceeds 1 us: {max(pack)} cycles')
     if args.stress and not args.prepare_only:
         case = output / 'b'
         for label, extra in (('stress', []), ('stress-no-preload', ['--no-preload'])):
@@ -188,12 +227,12 @@ def main():
                 subprocess.run([str(case / 'build/window_model'), '--stress', *extra],
                                cwd=trace, env=env, check=True, stdout=log, stderr=subprocess.STDOUT)
             print('\n'.join(line for line in (case / f'{label}.log').read_text().splitlines()
-                            if line.startswith(('PASS', 'CYCLES'))), flush=True)
+                            if line.startswith(('PASS', 'CYCLES', 'PACK'))), flush=True)
     if results:
         (output / 'result.json').write_text(json.dumps(results, indent=2) + '\n')
         a, b = results['a']['total'], results['b']['total']
         print(f'TopK + prefetch cycles: A={a} B={b}; reduction={(a-b)/a*100:.2f}%', flush=True)
-        if results['b']['topk'] >= args.max_b_topk_cycles:
+        if not args.tagged_miss and results['b']['topk'] >= args.max_b_topk_cycles:
             raise RuntimeError(f"B incremental window exceeded target: {results['b']['topk']} cycles")
         if b >= a:
             raise RuntimeError('Fusion did not beat serial window processing')

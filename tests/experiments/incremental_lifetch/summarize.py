@@ -19,7 +19,7 @@ def number(value):
 
 def table(headers, rows):
     rows = [[str(v) for v in row] for row in rows]
-    widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
+    widths = [max([len(h), *(len(r[i]) for r in rows)]) for i, h in enumerate(headers)]
     return [' | '.join(v.ljust(w) for v, w in zip(row, widths))
             for row in [headers, ['-' * w for w in widths], *rows]]
 
@@ -62,7 +62,7 @@ def counts(samples, name):
     return str(lo) if lo == hi else f'{lo}..{hi}'
 
 
-def detailed_trace(report, path, label, required=False):
+def detailed_trace(report, path, label, required=False, require_selection=False):
     trace_path = path.with_name('full_attribution.json')
     trace = read(trace_path) if trace_path.exists() else report.get('full_trace', {})
     samples = trace.get('samples', [])
@@ -103,6 +103,28 @@ def detailed_trace(report, path, label, required=False):
             return '--' if not active else f'{mean(active,name)/mhz:.2f}/{max(r[name] for r in active)/mhz:.2f}'
         rows.append([epoch, number(len(rr)/len(samples)), number(sum(r['skipped'] for r in rr)/len(samples)), number(len(active)/len(samples)), number(sum(r['topk_calls'] for r in rr)/len(samples)), number(sum(r.get('scanned',0) for r in rr)/len(samples)), number(sum(r.get('candidates',0) for r in rr)/len(samples)), duration('cycles'), duration('service_wait_cycles'), duration('service_cycles'), duration('scan_cycles'), duration('candidate_cycles'), duration('post_cycles')])
     lines += table(['Epoch','Attempts','Skipped','Service calls','Incremental TopK calls','Scanned scores','Candidates','Incremental mean/max us','Service wait mean/max us','Service mean/max us','Scan mean/max us','Candidate mean/max us','Post mean/max us'],rows)
+    selection=[r for sample in samples for r in sample.get('rank_selection', []) if r['calls']]
+    if require_selection and any(len(s.get('rank_selection', [])) != report['batch'] * 4
+                                 or any(r['calls'] <= 0 or r['check_pack_cycles'] < 0 or r['rank_emit_cycles'] < 0
+                                        for r in s['rank_selection']) for s in samples):
+        raise ValueError(f'{path}: incomplete/invalid per-Q miss-selection counters')
+    if selection:
+        total_calls=sum(r['calls'] for r in selection)
+        lines += ['Miss selection: per-call averages; check/pack includes state loads and synchronization. Rank/emit follows it.',
+                  *table(['Path','Calls/replay','Check+pack mean us','Largest per-Q average us','Rank+emit mean us'],
+                         [[label,number(total_calls/len(samples)),
+                           number(sum(r['check_pack_cycles'] for r in selection)/total_calls/mhz),
+                           number(max(r['check_pack_cycles']/r['calls'] for r in selection)/mhz),
+                           number(sum(r['rank_emit_cycles'] for r in selection)/total_calls/mhz)]])]
+    classification=[q for sample in samples for request in sample.get('streaming_cycles', []) for q in request.get('li', [])]
+    if require_selection and len(classification) != len(samples) * report['batch'] * 4:
+        raise ValueError(f'{path}: incomplete prefix/final classification counters')
+    if classification:
+        keys=('mapping_wait','barrier','load_first','classify_first','wait_second','classify_second','bitmap_merge','publish')
+        lines += ['Prefix tag and final classification are separate per-Q intervals; preloaded metadata can overlap TopK. Whole LI above is the comparison criterion.',
+                  *table(['Path','Prefix tag mean/max us','Final classify+publish mean/max us'],
+                         [[label,f"{statistics.mean(q.get('prefix_tag_cycles',0) for q in classification)/mhz:.2f}/{max(q.get('prefix_tag_cycles',0) for q in classification)/mhz:.2f}",
+                           f"{statistics.mean(sum(q[k] for k in keys) for q in classification)/mhz:.2f}/{max(sum(q[k] for k in keys) for q in classification)/mhz:.2f}"]])]
     return lines
 
 
@@ -173,6 +195,10 @@ def summarize(run, required=False):
     if (run / 'experiment.txt').exists() and (run / 'experiment.txt').read_text().strip() == 'ranked-bitmap':
         lines[1] = 'A=indexed true-miss selection; B=same selection using maintained covered bitmap.'
         lines += ['Same threshold/floor/cap and cross-Q dedup; bitmap initialization is included in init, admission maintenance in prefetch service.']
+    if (run / 'experiment.txt').exists() and (run / 'experiment.txt').read_text().strip() == 'ranked-tagged':
+        lines[1] = 'A=indexed true-miss selection; B=prefix hot tags + admission-only bitmap. Same rank/floor/cap.'
+        lines += ['B init clears admissions only; hot/reserved classification is carried by private TopK IDs and restored at final output.',
+                  'Compare init, whole LI and prefetch post costs as well as check/pack; graph timing excludes separate diagnostic replays.']
     keys = sorted(set(cases['baseline']) | set(cases['incremental']), key=lambda k: (k[0], str(k[1])))
     for key in keys:
         lines += ['', f'BS={key[0]} miss={key[1]}%']
@@ -231,7 +257,8 @@ def summarize(run, required=False):
         for variant, label in (('baseline', 'A'), ('incremental', 'B')):
             if key in cases[variant]:
                 report, path = cases[variant][key]
-                lines += detailed_trace(report, path, label, required)
+                require_selection = required and (run / 'experiment.txt').exists() and (run / 'experiment.txt').read_text().strip() == 'ranked-tagged'
+                lines += detailed_trace(report, path, label, required, require_selection)
                 lines += window_reads(report, path, label, required)
         if io:
             lines += ['DDR entries: whole batch, per-replay min..max; unused = fetched but absent from final TopK.']
@@ -253,7 +280,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('run', nargs='?', type=Path, help='A/B result directory; default: latest window-topk-only run')
     parser.add_argument('--experiment', default='window-topk-only',
-                        choices=('window-topk-only', 'final-topk-only', 'topk-prefetch', 'recent-index', 'ranked-prefetch', 'ranked-floor', 'ranked-miss', 'ranked-bitmap'),
+                        choices=('window-topk-only', 'final-topk-only', 'topk-prefetch', 'recent-index', 'ranked-prefetch', 'ranked-floor', 'ranked-miss', 'ranked-bitmap', 'ranked-tagged'),
                         help='Result family to search when run is omitted')
     parser.add_argument('--require-detailed', action='store_true', help='Fail if new A/B trace records are absent')
     args = parser.parse_args()

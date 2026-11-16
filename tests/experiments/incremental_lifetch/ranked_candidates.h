@@ -224,13 +224,16 @@ __aicore__ inline uint32_t SelectMiss(LocalTensor<uint32_t> ids,LocalTensor<uint
     __gm__ uint32_t* map,__gm__ uint32_t* hotValid,__gm__ int32_t* reserved,
     uint32_t resident,uint32_t valid,uint32_t rank,uint32_t quota,
     uint64_t* clocks=nullptr,uint32_t minimum=0) {
+    uint64_t begin=clocks?GetSystemCycle():0;
     auto eligible=scratch[3584];
     Simt::VF_CALL<MissIds>(Simt::Dim3{256,1,1},
         reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
         reinterpret_cast<__ubuf__ uint32_t*>(eligible.GetPhyAddr()),
         map,hotValid,reserved,resident,valid);
     PipeBarrier<PIPE_V>();
-    return Select(eligible,scores,output,scratch,0,valid,rank,quota,true,clocks,minimum);
+    uint32_t count=Select(eligible,scores,output,scratch,0,valid,rank,quota,true,clocks,minimum);
+    if(clocks)clocks[0]=begin;
+    return count;
 }
 // scratch >= 25 KiB, output >= 16 KiB. Bitmap bank dies before rank selection.
 // Reading the complete 16-KiB bitmap is included in clocks[0..1].
@@ -254,4 +257,38 @@ __aicore__ inline uint32_t SelectBitmap(LocalTensor<uint32_t> ids,LocalTensor<ui
     if(clocks)clocks[0]=begin;
     return count;
 }
+
+// Private incremental IDs retain stable local residency from the prefix.
+// Both tags are outside the supported history range; UINT32_MAX stays padding.
+constexpr uint32_t kHotTag=0x80000000U,kTailTag=0x40000000U,kTokenMask=0x3fffffffU;
+__simd_vf__ inline void TagResidentHalf(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* hot,
+    __ubuf__ int32_t* reserved,uint32_t base,uint32_t size,uint32_t tailBegin,uint32_t tailEnd) {
+    using namespace MicroAPI;auto all=CreateMask<uint32_t,MaskPattern::ALL>();
+    RegTensor<uint32_t> id,offset,safe,zero,valid,tagged,hotTag,tailTag;
+    RegTensor<int32_t> res;MaskReg ge,lt,inside,live,free,take,tail;
+    Duplicate(zero,uint32_t(0));Duplicate(hotTag,kHotTag);Duplicate(tailTag,kTailTag);
+    for(uint16_t i=0;i<2048;i+=64) {
+        LoadAlign(id,ids+i);
+        CompareScalar<uint32_t,CMPMODE::GE>(ge,id,base,all);CompareScalar<uint32_t,CMPMODE::LT>(lt,id,base+size,all);MaskAnd(inside,ge,lt,all);
+        Adds(offset,id,uint32_t(0-base),all);Select(safe,offset,zero,inside);
+        Gather(valid,hot,safe,all);Gather(res,reserved,safe,all);
+        CompareScalar<uint32_t,CMPMODE::NE>(live,valid,uint32_t(0),all);CompareScalar<int32_t,CMPMODE::LT>(free,res,int32_t(0),all);
+        MaskAnd(take,live,free,all);MaskAnd(take,take,inside,all);
+        Or(tagged,id,hotTag,all);Select(tagged,tagged,id,take);
+        CompareScalar<uint32_t,CMPMODE::GE>(ge,id,tailBegin,all);CompareScalar<uint32_t,CMPMODE::LT>(lt,id,tailEnd,all);MaskAnd(tail,ge,lt,all);
+        Or(offset,id,tailTag,all);Select(tagged,offset,tagged,tail);StoreAlign(ids+i,tagged,all);
+    }
+}
+__simd_vf__ inline void RestorePublicIds(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* locations,uint32_t resident) {
+    using namespace MicroAPI;auto all=CreateMask<uint32_t,MaskPattern::ALL>();
+    RegTensor<uint32_t> id,raw,mask,hot,local,invalid,slot;MaskReg bounded,tagged,padding,known;
+    Duplicate(mask,kTokenMask);Duplicate(hot,kHotTag);Duplicate(invalid,UINT32_MAX);
+    for(uint16_t i=0;i<2048;i+=64) {
+        LoadAlign(id,ids+i);And(raw,id,mask,all);And(local,id,hot,all);
+        CompareScalar<uint32_t,CMPMODE::NE>(tagged,local,uint32_t(0),all);CompareScalar<uint32_t,CMPMODE::LT>(bounded,raw,resident,all);MaskAnd(known,tagged,bounded,all);
+        Select(slot,raw,invalid,known);StoreAlign(locations+i,slot,all);
+        CompareScalar<uint32_t,CMPMODE::EQ>(padding,id,UINT32_MAX,all);Select(raw,id,raw,padding);StoreAlign(ids+i,raw,all);
+    }
+}
+
 } // namespace kvip_prefetch_rank

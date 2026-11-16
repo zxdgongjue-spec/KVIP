@@ -378,47 +378,79 @@ python tests/experiments/incremental_lifetch/summarize.py \
 该成本不代表算法必要成本，后续应复用分类或按请求批量准备状态。真机A/B用于验证
 实际预取和端到端变化，不将这一版标记为性能优化完成。
 
-### 真正 miss 状态检查的位图优化
+### 真正 miss：复用 TopK 的 hot 分类
+
+使用 `--tagged-miss` 对比正确的 indexed true-miss 路径与新实现：
 
 ```bash
-bash tests/experiments/incremental_lifetch/compare_ranked.sh --bitmap-miss \
+source /usr/local/Ascend/cann/set_env.sh
+source scripts/env.sh
+bash tests/experiments/incremental_lifetch/compare_ranked.sh --tagged-miss \
   /vllm-workspace/vllm-ascend/third_party/KVAF \
   4 127.0.0.1:28885 16 10 4 384
 python tests/experiments/incremental_lifetch/summarize.py \
-  --experiment ranked-bitmap --require-detailed
+  --experiment ranked-tagged --require-detailed
 ```
 
-A 是上述正确的 indexed true-miss 实现，B 只改变状态读取方式；阈值、半配额保底、
-上限、跨Q去重及提交预算不变。每请求维护一份 covered bitmap，标记有效且未预留的
-hot、ABC 本地映射、已经接纳的预取（含在途）。每轮初始化；预取 admission 发布映射时
-同步置位，沿用原窗口完成依赖，不新增 CQ 等待。每 Q 批量读取位图，在 UB 内检查并打包。
+A/B 的 miss 定义、窗口阈值、半配额保底、上限和跨 Q 去重相同。
+B 在首次 TopK 中标记有效且未预留的 hot 和 ABC 本地位置；标记随私有增量 ID
+传递，最终还原普通 ID。最终分类复用 hot 标记，保留映射解析、保护位图和错误检查。
+这些 hot/reserved 状态在 LI 内不变，后续 Index 更新仍在 LI 结束后执行。
 
-H=131072 时，增加16 KiB GM/请求（BS16共256 KiB），复用已有 UB scratch 和候选输出
-缓冲，不增加 UB 分配。实验限定 history<=131072、resident 按512对齐。
-初始化需要额外读取 hot/reserved 元数据，计入完整图 init；置位维护计入预取服务。
-不得把单Q收益直接当作完整图收益。
+新增 bitmap **只记录本轮实际接纳的预取**。init 复用原清零缓冲，不读取或重建
+hot/reserved；发布预取映射时同步置位。H=131072 时增加16 KiB GM/请求，
+不增加 UB 分配。实验限定 history<=131072、resident 按512对齐。
 
-单个代表用例（2048 TopK、256 cold、已有覆盖项、rank1024、上限32、保底16）
-的共享 helper 模型按1800 cycles/µs换算：
+汇总包括完整图、init/LI/融合收尾、每窗口预取数量及误取率、提交耗时，以及：
 
-| 操作 | A | B |
+- 状态读取＋检查＋候选打包：含位图加载和同步，按实际调用数统计。
+- 阈值筛选＋候选输出：与前项分开，避免把整个筛选误称为不足1 µs。
+- 首次 hot 标记和最终分类：分别展示；重叠搬运以整个 LI 耗时判断。
+
+以上打点仅在独立诊断回放启用，不在正式图计时中采集。
+
+本地 CANN 9.1、Ascend950PR_9599 模型，按1800 cycles/µs换算：
+
+| 对照范围 | A | B |
 | --- | ---: | ---: |
-| 状态检查＋候选打包 | 12.94 µs | 0.79 µs |
-| 包含阈值筛选和输出 | 13.64 µs | 1.48 µs |
-| 输出候选数 | 16 | 16 |
+| 实际 init，BS16 几何、单请求单 AIV | 19.60 µs | 19.53 µs |
+| hot 分类＋最终分类，含两半 hot/无效/预留/ABC/padding | 14.88 µs | 11.70 µs |
+| 实际窗口内状态检查＋打包，8 Q | — | 0.74～0.79 µs/Q |
 
-B 的1422 cycles包含16 KiB位图读取；候选ID与独立CPU参考一致。
-复现工程：`model_rank.py OUTPUT --bitmap`，默认只跑代表用例，不展开整套矩阵；
-构建并运行生成的 `rank_model`，输出保存为 `OUTPUT/model.log` 后，
-`model_rank.py OUTPUT --bitmap --summarize` 会校验正确性及检查打包<1800 cycles。
-`model_window.py --bitmap-miss --output OUTPUT --kvaf-root KVAF_ROOT` 则使用真正窗口、
-初始化及 admission 实现，校验位图与映射、实际WQE、重复窗口不重复预取。
-以上为仿真模型时间，真机完整图及逐窗口实际预取量/误取率使用前述AB命令验证。
+init 校验完整映射、ABC 和 LRU；分类校验位置、保护位图、公开 ID 及错误码。
+实际窗口使用生产增量合并和预取提交函数，校验两个请求各26条 WQE、映射、槽位、
+门铃和重复窗口不重复提交。模型不模拟网络 DMA/CQ，端到端性能使用上面的真机命令。
 
-本次实际窗口模型通过：两个请求全部 bitmap 位与 hot/reserved/ABC/admission map
-逐项一致，每请求26条真实WQE正确，相同进度再次执行没有重复预取。
-新增初始化（含ABC映射）两个请求串行共97554 cycles，即54.20 µs，平均27.10 µs/请求/轮；
-这是额外成本，不包含在0.79 µs/Q中。正式初始化按请求并行，不能乘BS估算init时延。
-窗口TopK及筛选共63245 cycles（35.14 µs/8Q），后续原预取服务29689 cycles
-（16.49 µs/2请求）；含实际 admission bitmap 更新，不包含网络DMA/CQ。
-融合算子CANN 9.1设备编译通过；真机端到端收益仍由AB测定。
+提交维护复用跨 Q 去重已经生成的位图；发生预算截断时，在最后一段去重函数内
+仅保留实际接纳项。逐 Q 已完成 miss 检查，且上一窗口提交已完成，因此删除服务中
+重复的映射查询。批量发布前仍校验队列，保留错误处理；没有新增 UB 或 kernel。
+
+同口径提交隔离模型（单 AIV、两个请求，以下均为两个请求合计）：
+
+| 输入与范围 | 原 indexed 路径 A | 新路径 B |
+| --- | ---: | ---: |
+| 每请求128候选、全部接纳：预取服务 | 14.43 µs | 12.49 µs |
+| 其中提交 | 6.37 µs | 6.22 µs |
+| 每请求128候选、预算64：预取服务 | 14.05 µs | 12.93 µs |
+| 其中提交 | 6.00 µs | 5.78 µs |
+
+完整位图与实际映射逐项比对，未接纳候选不得置位；同字多 bit、bit31、旧 bit 保留
+另有检查。多段输入验证257个去重候选只接纳128个，余下129个不置位；队列容量
+不足时验证保留错误且不发布 WQE/映射/位图。该隔离模型只测服务，不与真机图耗时混算。
+
+在装有 CANN 仿真环境的机器上，复现窗口和每 Q 打包检查：
+
+```bash
+python tests/experiments/incremental_lifetch/model_window.py \
+  --tagged-miss --profile-selection --output /tmp/ranked-tagged-window \
+  --kvaf-root /work/KVAF
+```
+
+该窗口模型从已标记的 prefix 状态开始，检查标记跨增量合并保留；
+`--profile-selection` 检查 B 的8个 Q各自小于1800 cycles。
+首次标记和最终还原另有本地实际函数模型验证，完整流程由真机 AB 检查。
+
+### 旧版 covered bitmap 实验（不采用）
+
+旧 `--bitmap-miss` 每轮从 hot/reserved 构建完整 covered bitmap，虽然打包约0.79 µs/Q，
+但 init 明显增加，不作为当前方案。保留入口仅供复现历史对照。
