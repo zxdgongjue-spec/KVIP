@@ -103,6 +103,23 @@ def summarize(run):
             if rows:
                 lines += table(['Stage', 'A mean', 'B mean', 'B-A'], rows)
             lines += ['Trace samples: ' + '; '.join(f'{k}={v[1]}/{v[2]} valid' for k, v in profiles.items())]
+        if key in cases['incremental']:
+            report, path = cases['incremental'][key]
+            trace_path = path.with_name('full_attribution.json')
+            trace = read(trace_path) if trace_path.exists() else report.get('full_trace', {})
+            windows = [r['incremental_windows'] for r in trace.get('samples', []) if 'incremental_windows' in r]
+            if windows:
+                mhz = report.get('counter_clock_mhz')
+                rows = []
+                for epoch in sorted({w['epoch'] for sample in windows for w in sample}):
+                    groups = [[w for w in sample if w['epoch'] == epoch] for sample in windows]
+                    rows.append([epoch,
+                                 number(statistics.mean(sum(not w['skipped'] for w in g) for g in groups)),
+                                 number(statistics.mean(sum(w['skipped'] for w in g) for g in groups)),
+                                 number(statistics.mean(sum(w['topk_calls'] for w in g) for g in groups)),
+                                 number(statistics.mean(max((w['cycles'] for w in g), default=0) for g in groups)/(mhz or 1))])
+                lines += ['B incremental windows: averages across profiled replays; calls sum all service lanes.']
+                lines += table(['Epoch', 'Active lanes', 'Skipped lanes', 'TopK calls', 'Slowest lane us' if mhz else 'Slowest lane cycles'], rows)
         if io:
             lines += ['DDR entries: whole batch, per-replay min..max; unused = fetched but absent from final TopK.']
             lines += table(['Path', 'Native', 'Prefetch hot', 'Prefetch cold', 'Final', 'Unused', 'Total', 'Conflict'], io)

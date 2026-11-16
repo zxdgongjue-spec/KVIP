@@ -7,7 +7,7 @@ constexpr uint32_t K = 2048;
 // LI's uint16 predicate storage: 128 scores per 32-byte mask (two bits/score).
 // Consume the native mask directly; vector Squeeze packs 128 lanes at a time.
 __simd_vf__ inline void Compact(__ubuf__ uint16_t* raw, __ubuf__ uint16_t* bitmap,
-    __ubuf__ uint16_t* packed, __ubuf__ uint16_t* mapping, uint32_t added) {
+    __ubuf__ uint16_t* packed, __ubuf__ uint16_t* mapping, uint32_t added, uint16_t base = 0) {
     using namespace MicroAPI;
     RegTensor<uint16_t> values,result;RegTensor<int16_t> indices;
     MaskReg selected;UnalignRegForStore scoreStore,idStore;
@@ -21,7 +21,7 @@ __simd_vf__ inline void Compact(__ubuf__ uint16_t* raw, __ubuf__ uint16_t* bitma
     StoreUnAlignPost(packed,scoreStore);
     ClearSpr<SpecialPurposeReg::AR>();
     for(uint16_t i=0;i<added;i+=128){
-        LoadAlign(selected,bitmap+i/8);Arange(indices,int16_t(i));
+        LoadAlign(selected,bitmap+i/8);Arange(indices,int16_t(base+i));
         Squeeze<uint16_t,MicroAPI::GatherMaskMode::STORE_REG>(result,reinterpret_cast<RegTensor<uint16_t>&>(indices),selected);
         StoreUnAlign<uint16_t,PostLiteral::POST_MODE_UPDATE>(mapping,result,idStore);
     }

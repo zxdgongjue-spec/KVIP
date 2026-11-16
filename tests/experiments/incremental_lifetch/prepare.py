@@ -54,7 +54,7 @@ def main():
             '    if (!topkOnly) Duplicate(kScaleUB_')
     replace(vector, '        if (publishProgress) {', '        SeedIncremental(query,scoreRow);\n        if (publishProgress) {')
     replace(vector, '        // Join this producer\'s hit publication. Other producers remain free.',
-            '        AdvanceWindow(epoch,sequenceHalfWindow);\n        // Join this producer\'s hit publication. Other producers remain free.')
+            '        if(!AdvanceWindow(epoch,sequenceHalfWindow))return;\n        // Join this producer\'s hit publication. Other producers remain free.')
     replace(vector, '        if (validS2Len >= topkCount_) {',
             '        if (!prefixActive_ && validS2Len >= runtimeShape_.resident && validS2Len % 128 == 0) {\n'
             '            FinalIncremental(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, validS2Len);\n'
@@ -90,6 +90,13 @@ def main():
     replace(prefetch, 'if(!slots && !ctx->tailBounds) {', 'if(false) { // Incremental candidates always need the current TopK cutoff filter.')
     replace(prefetch, 'reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),map,candidateCount);',
             'reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),map,candidateCount,ctx,b,rt_resident,sequenceHalfWindow);')
+    replace(prefetch, '        const uint32_t lower=ctx->lruSlots?0:rt_resident;',
+            '        uint32_t previousEpoch=epoch;\n'
+            '        while(previousEpoch && events[(previousEpoch-1)*rt_serviceLanes+lane].skipped)--previousEpoch;\n'
+            '        const uint32_t lower=ctx->lruSlots?0:rt_resident;')
+    replace(dest / 'csrc/operators/common/lifetch/sequence_candidates.h',
+            '(epoch?state.GetValue(80+(epoch-1)*4+q):0)',
+            '(previousEpoch?state.GetValue(80+(previousEpoch-1)*4+q):0)')
     # Expose only observed score boundaries: producers may advance while the
     # service core computes TopK. Later tiles belong to the following update.
     replace(prefetch, 'uint32_t end=work.GetValue(progress),cap=windowEnd;',
@@ -98,6 +105,11 @@ def main():
             '            uint32_t end=(work.GetValue(progress)<uint32_t(cursor)?work.GetValue(progress):uint32_t(cursor)),cap=windowEnd;')
     replace(prefetch, 'uint32_t high=work.GetValue(progress+16);',
             'uint32_t high=(work.GetValue(progress+16)<uint32_t(cursor>>32)?work.GetValue(progress+16):uint32_t(cursor>>32));')
+    replace(dest / 'tests/operators/lifetch/support/diagnostics.py',
+            '            samples[-1]["algorithm"] = algorithm_after(rotating, algorithm_initial)\n            if diagnostics is not None:',
+            '            event_words = rotating.events.cpu().numpy().view(np.uint64).reshape(-1,16)\n'
+            '            samples[-1]["incremental_windows"] = [dict(epoch=i//rotating.events.shape[1], lane=i%rotating.events.shape[1], skipped=int(w[3]>>np.uint64(32)), cycles=int(w[14])-int(w[13]), topk_calls=int(w[15])) for i,w in enumerate(event_words)]\n'
+            '            samples[-1]["algorithm"] = algorithm_after(rotating, algorithm_initial)\n            if diagnostics is not None:')
     print(f'Experimental URMA source: {dest}')
     print('Bitmap producer, LI tiling, resolver, Index update and KVAF transport are unchanged.')
 
