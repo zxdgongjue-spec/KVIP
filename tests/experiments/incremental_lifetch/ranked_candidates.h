@@ -61,7 +61,7 @@ __simd_vf__ inline void Emit(__ubuf__ uint32_t* ids,__ubuf__ uint16_t* scores,
 __aicore__ inline uint32_t Select(LocalTensor<uint32_t> ids,LocalTensor<uint16_t> scores,
     LocalTensor<uint32_t> output,LocalTensor<uint32_t> scratch,
     uint32_t resident,uint32_t valid,uint32_t rank,uint32_t quota,bool compact=true,
-    uint64_t* clocks=nullptr) {
+    uint64_t* clocks=nullptr,uint32_t minimum=0) {
     auto p=reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr());
     auto full=reinterpret_cast<__ubuf__ uint16_t*>(p+3072);
     auto cold=reinterpret_cast<__ubuf__ uint16_t*>(p+2048);
@@ -76,23 +76,36 @@ __aicore__ inline uint32_t Select(LocalTensor<uint32_t> ids,LocalTensor<uint16_t
     uint32_t n=scratch.GetValue(3200);
     if(clocks)clocks[1]=GetSystemCycle();
     if(!quota||!n){if(clocks)clocks[2]=clocks[3]=clocks[4]=clocks[1];return 0;}
+    minimum=minimum<quota?minimum:quota;
     uint32_t threshold=0;
     // Last window accepts the full Top2048; its minimum cannot reject any input.
-    if(rank<2048) {
+    if(rank<2048 && !(minimum && n<=minimum)) {
         RegisterThreshold(score,full,8,2048-rank+1);
         SetFlag<HardEvent::V_S>(EVENT_ID4);WaitFlag<HardEvent::V_S>(EVENT_ID4);
         threshold=scratch.template ReinterpretCast<uint16_t>().GetValue(6144);
     }
     if(clocks)clocks[2]=GetSystemCycle();
     uint32_t capThreshold=0;
-    if(!compact||n>quota){
-        uint32_t padded=compact?(n+255)/256*256:2048;
+    uint32_t padded=compact?(n+255)/256*256:2048;
+    bool capNeeded=!compact||n>quota;
+    // Reuse the packed cold scores for both ranks; no additional sort or buffer.
+    if(capNeeded || (minimum && n>minimum && threshold)) {
         Narrow(p,cold,compact?n:2048,padded);PipeBarrier<PIPE_V>();
+    }
+    if(capNeeded){
         RegisterThreshold(cold,cap,padded/256,padded-quota+1);
         SetFlag<HardEvent::V_S>(EVENT_ID4);WaitFlag<HardEvent::V_S>(EVENT_ID4);
         capThreshold=scratch.template ReinterpretCast<uint16_t>().GetValue(6272);
-        if(capThreshold>threshold)threshold=capThreshold;
     }
+    // If Top32 already dominates the window threshold, at least 32 candidates
+    // qualify. Top16 cannot change the result; avoid that selection entirely.
+    if(minimum && n>minimum && threshold>capThreshold) {
+        RegisterThreshold(cold,full,padded/256,padded-minimum+1);
+        SetFlag<HardEvent::V_S>(EVENT_ID4);WaitFlag<HardEvent::V_S>(EVENT_ID4);
+        uint32_t floorThreshold=scratch.template ReinterpretCast<uint16_t>().GetValue(6144);
+        if(floorThreshold<threshold)threshold=floorThreshold;
+    }
+    if(capThreshold>threshold)threshold=capThreshold;
     if(clocks)clocks[3]=GetSystemCycle();
     Emit(id,score,out,stats+8,resident,valid,threshold);
     SetFlag<HardEvent::V_S>(EVENT_ID4);WaitFlag<HardEvent::V_S>(EVENT_ID4);

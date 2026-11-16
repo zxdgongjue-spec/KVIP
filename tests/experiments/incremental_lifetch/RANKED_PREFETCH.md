@@ -94,3 +94,57 @@ python tests/experiments/incremental_lifetch/model_rank.py /tmp/rank-model --sum
 该集成采样在最后一次循环分支优化之前：增量TopK+筛选43953 cycles（24.42 µs），
 后续service26039 cycles（14.47 µs）。它不是新筛选的单独耗时，也不是网络完成耗时。
 最终版完整融合算子通过 CANN 设备编译。真机完整图 A/B 尚待运行。
+
+## 可选的半配额下限
+
+`--minimum-half` 在同一份高性能筛选实现中增加下限。配额32时：
+
+- cold候选超过16条：使用 `min(窗口排名阈值, cold Top16阈值)`。
+- cold候选不超过16条：全部保留；零候选仍为零。
+- 继续受Top32截断约束；同分时输出16～32条，按原顺序处理边界同分。
+- 这个下限位于跨Q去重和已预取映射过滤之前，不保证实际提交至少16条。
+
+原Top32阈值已经高于窗口阈值时，至少32条候选满足要求，不再计算Top16。
+不足16条时也跳过窗口排名阈值。其余情况复用已有压缩分数和临时阈值缓冲，
+最多增加一次现有直方图阈值选择；不重复压缩、不新增排序或UB分配。
+
+原有不带下限的实验保持可运行。比较“无下限”与“半配额下限”：
+
+```bash
+bash tests/experiments/incremental_lifetch/compare_ranked.sh --minimum-half \
+  /vllm-workspace/vllm-ascend/third_party/KVAF \
+  4 127.0.0.1:28885 16 10 4 384
+python tests/experiments/incremental_lifetch/summarize.py --experiment ranked-floor
+```
+
+本地模块对比沿用上面的编译/运行命令，生成与汇总时增加 `--floor`：
+
+```bash
+python tests/experiments/incremental_lifetch/model_rank.py /tmp/rank-floor-model --floor
+# 按上面的 CANN simulator 命令编译和运行 /tmp/rank-floor-model。
+python tests/experiments/incremental_lifetch/model_rank.py /tmp/rank-floor-model --floor --summarize
+```
+
+该模式覆盖12组输入，分别检查无下限、有下限、原cold导出，共36项。
+无下限和有下限两条路径均先执行一次不计时预热，再测量相同输入的阶段cycles。
+
+### 半配额下限的本地测量
+
+CANN simulator，1800 cycles/µs；输入TopK已在UB，双方先预热。
+36/36校验通过；完整融合算子设备编译通过。以下是同一实现中下限开关的差值，
+不与上文未逐路径预热的绝对时间混用。4Q列为单Q差值乘4，不是端到端时间。
+
+| cold/Q与场景 | 原输出→新输出 | 原cycles/Q | 新cycles/Q | 新增µs/Q | 新增µs/4Q |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 64，原本能选满32 | 32→32 | 1296 | 1302 | 0.00 | 0.01 |
+| 256，被窗口阈值全部排除 | 0→16 | 1299 | 1491 | 0.11 | 0.43 |
+| 1024，被窗口阈值全部排除 | 0→16 | 1443 | 1703 | 0.14 | 0.58 |
+| 20，被窗口阈值全部排除 | 0→16 | 1065 | 1312 | 0.14 | 0.55 |
+| 256个cold同分且低于窗口阈值 | 0→32 | 1299 | 1491 | 0.11 | 0.43 |
+| 12，被窗口阈值全部排除 | 0→12 | 1069 | 729 | -0.19 | -0.76 |
+| 16，被窗口阈值全部排除 | 0→16 | 1064 | 729 | -0.19 | -0.74 |
+| 0 | 0→0 | 244 | 244 | 0.00 | 0.00 |
+
+例如1024个cold的场景，原配额阈值阶段400 cycles，加入下限后656 cycles，
+增加256 cycles（0.14 µs）；压缩与输出等公共阶段合计相差4 cycles，
+所以整个筛选净增加260 cycles/Q。复用了同一份压缩分数和阈值缓冲。

@@ -16,6 +16,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path)
     parser.add_argument('--baseline', action='store_true')
+    parser.add_argument('--minimum-half', action='store_true',
+                        help='Before dedup/mapping, lower the score threshold to admit quota/2 cold candidates')
     parser.add_argument('--abc-tail-tokens', type=int, default=384)
     args = parser.parse_args()
     here = Path(__file__).resolve().parent
@@ -53,6 +55,9 @@ def main():
             savedScores.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(WindowTopkPrefix()+uint64_t(query/4)*prefixBytes)+(query%4)*2048);
             PipeBarrier<PIPE_ALL>();DataCopy(indicesOutLocal_,saved,2048);DataCopy(scoreOutLocal_,savedScores,2048);''')
     s=replace_once(s,'runtimeShape_.resident,mappedValid_);','runtimeShape_.resident,mappedValid_,!exportWindowCold_);')
+    if args.minimum_half:
+        s=replace_once(s,'valid,rank,ctx->windowLimit/4);',
+                       'valid,rank,ctx->windowLimit/4,true,nullptr,(ctx->windowLimit/4)/2);')
     methods.write_text(s)
     prefetch=kernel/'prefetch.h';s=prefetch.read_text()
     start=s.index('        if(!epoch) {',s.index('uint32_t candidateCount=0;'))
@@ -68,7 +73,8 @@ def main():
     end=e.index('    if getattr(args, "check_suite", None) == "boundary":',begin)
     e=e[:begin]+e[end:]
     execution.write_text(e)
-    print('Ranked prefetch: all windows; rank 1024..2048; per-Q quota=windowLimit/4; no quota redistribution')
+    print('Ranked prefetch: all windows; rank 1024..2048; per-Q quota=windowLimit/4; '
+          f'minimum={"quota/2" if args.minimum_half else "0"} before dedup/mapping; no quota redistribution')
 
 
 if __name__ == '__main__':
