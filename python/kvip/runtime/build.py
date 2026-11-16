@@ -39,7 +39,7 @@ def build_failure(log, stage, returncode):
 
 def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False,
                     rolling_threshold=False, window_refilter=False, rolling_batched=False, rolling_windowed=False,
-                    rolling_compact=False, rolling_first_window=False):
+                    rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False):
     """Build one shape-independent binary per source/toolchain/SoC."""
     if (window_refilter or rolling_batched or rolling_windowed) and not rolling_threshold:
         raise ValueError("Window refilter and batched counts require rolling threshold")
@@ -49,12 +49,18 @@ def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False,
         raise ValueError("Compact/first-window options require window accumulation")
     if rolling_first_window and not rolling_compact:
         raise ValueError("First-window correction requires compact admission")
+    if refilter_safe and not window_refilter:
+        raise ValueError("Visibility-safe admission requires window refilter")
+    if refilter_refill and not refilter_safe:
+        raise ValueError("Same-window refill requires visibility-safe admission")
     root = Path(__file__).resolve().parents[3] / "csrc/operators"
     options = dict(
         RUN_MODE="npu",
         ASCEND_CANN_PACKAGE_PATH=str(cann),
         KVAF_INCLUDE=str(headers),
         SOC_VERSION=soc,
+        KVIP_REFILTER_SAFE="ON" if refilter_safe else "OFF",
+        KVIP_REFILTER_REFILL="ON" if refilter_refill else "OFF",
         KVIP_REVERSE_COLD="ON" if reverse_cold else "OFF",
         KVIP_ROLLING_THRESHOLD="ON" if rolling_threshold else "OFF",
         KVIP_ROLLING_COMPACT="ON" if rolling_compact else "OFF",

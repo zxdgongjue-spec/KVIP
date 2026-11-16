@@ -19,6 +19,14 @@ if(KVIP_ROLLING_FIRST_WINDOW AND NOT KVIP_ROLLING_COMPACT)
 endif()
 option(KVIP_ROLLING_BATCHED "Batch eight LI score tiles per CDF update" OFF)
 option(KVIP_WINDOW_REFILTER "Recheck cold candidates against rolling Kth before admission" OFF)
+option(KVIP_REFILTER_SAFE "Keep candidates with a causal query score not yet published" OFF)
+option(KVIP_REFILTER_REFILL "Refill filtered candidate batches within the frozen window" OFF)
+if(KVIP_REFILTER_SAFE AND NOT KVIP_WINDOW_REFILTER)
+  message(FATAL_ERROR "Visibility-safe admission requires window refilter")
+endif()
+if(KVIP_REFILTER_REFILL AND NOT KVIP_REFILTER_SAFE)
+  message(FATAL_ERROR "Same-window refill requires visibility-safe admission")
+endif()
 if((KVIP_WINDOW_REFILTER OR KVIP_ROLLING_BATCHED OR KVIP_ROLLING_WINDOWED) AND NOT KVIP_ROLLING_THRESHOLD)
   message(FATAL_ERROR "Window refilter and batched counts require rolling threshold")
 endif()
@@ -46,6 +54,8 @@ ascendc_compile_options(v9_kernel PRIVATE -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WO
   -DKVIP_ROLLING_FIRST_WINDOW=$<BOOL:${KVIP_ROLLING_FIRST_WINDOW}>
   -DKVIP_ROLLING_WINDOWED=$<BOOL:${KVIP_ROLLING_WINDOWED}>
   -DKVIP_ROLLING_BATCHED=$<BOOL:${KVIP_ROLLING_BATCHED}>
+  -DKVIP_REFILTER_SAFE=$<BOOL:${KVIP_REFILTER_SAFE}>
+  -DKVIP_REFILTER_REFILL=$<BOOL:${KVIP_REFILTER_REFILL}>
   -DKVIP_WINDOW_REFILTER=$<BOOL:${KVIP_WINDOW_REFILTER}>
   -mllvm -user-reserved-ub-size=223232 -DV9_USER_UB_BYTES=223232
   -DV9_PARTIAL_SCAN_SIMD=1 -DV9_PROBE_EPOCH=0 -DV9_INTERMEDIATE_PROFILING=0
@@ -57,3 +67,4 @@ target_compile_definitions(v9_bridge PRIVATE KVIP_REVERSE_COLD=$<BOOL:${KVIP_REV
 target_compile_definitions(v9_bridge PRIVATE KVIP_ROLLING_WINDOWED=$<BOOL:${KVIP_ROLLING_WINDOWED}> KVIP_ROLLING_BATCHED=$<BOOL:${KVIP_ROLLING_BATCHED}> KVIP_ROLLING_THRESHOLD=$<BOOL:${KVIP_ROLLING_THRESHOLD}> KVIP_WINDOW_REFILTER=$<BOOL:${KVIP_WINDOW_REFILTER}>)
 target_compile_definitions(v9_bridge PRIVATE KVIP_ROLLING_COMPACT=$<BOOL:${KVIP_ROLLING_COMPACT}> KVIP_ROLLING_FIRST_WINDOW=$<BOOL:${KVIP_ROLLING_FIRST_WINDOW}>)
 target_link_libraries(v9_bridge PRIVATE v9_kernel host_intf_pub ascendcl)
+target_compile_definitions(v9_bridge PRIVATE KVIP_REFILTER_SAFE=$<BOOL:${KVIP_REFILTER_SAFE}> KVIP_REFILTER_REFILL=$<BOOL:${KVIP_REFILTER_REFILL}>)

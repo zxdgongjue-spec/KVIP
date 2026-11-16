@@ -35,6 +35,18 @@
 #if KVIP_WINDOW_REFILTER && !KVIP_ROLLING_THRESHOLD
 #error "Window refilter requires the rolling threshold"
 #endif
+#ifndef KVIP_REFILTER_SAFE
+#define KVIP_REFILTER_SAFE 0
+#endif
+#ifndef KVIP_REFILTER_REFILL
+#define KVIP_REFILTER_REFILL 0
+#endif
+#if KVIP_REFILTER_SAFE && !KVIP_WINDOW_REFILTER
+#error "Visibility-safe admission requires window refilter"
+#endif
+#if KVIP_REFILTER_REFILL && !KVIP_REFILTER_SAFE
+#error "Same-window refill requires visibility-safe admission"
+#endif
 #if defined(V9_UBMEM) && V9_UBMEM && KVIP_ROLLING_THRESHOLD
 #error "Rolling threshold experiment is URMA only"
 #endif

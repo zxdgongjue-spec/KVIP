@@ -569,7 +569,14 @@ inline void GatherCandidateMap(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* slots,
             bool keep=false;
             const uint32_t scan=DecodeScanToken(token,cfg[60],cfg[61]);
             for(uint32_t q=0;q<4 && !keep;++q) {
+#if KVIP_REFILTER_SAFE
+                if(token>=cfg[104+q])continue;
+                // Q4 union: unknown is not below Kth. Reuse this loop,
+                // keep the ID and never read that query's unpublished GM.
+                if(scan>=cfg[100+q]) {keep=true;break;}
+#else
                 if(scan>=cfg[100+q] || token>=cfg[104+q])continue;
+#endif
                 uint32_t pair=asc_ldcg(scores+(uint64_t(q)*history+token)/2);
                 uint32_t score=(pair>>((token&1)*16))&0xffffU;
                 keep=score>=cfg[96+q]; // Keep boundary ties; final TopK decides IDs.
@@ -581,12 +588,13 @@ inline void GatherCandidateMap(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* slots,
     }
 }
 __simd_vf__ inline void CompactMisses(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* slots,
-    __ubuf__ uint32_t* cfg,uint32_t count,uint32_t available) {
+    __ubuf__ uint32_t* cfg,uint32_t count,uint32_t available,
+    __ubuf__ uint32_t* destination=nullptr) {
     using namespace MicroAPI;
     auto all=CreateMask<uint32_t,MaskPattern::ALL>();auto lane=CreateMask<uint32_t,MaskPattern::VL1>();
     RegTensor<uint32_t> token,old,rank,index,written,flags,total,zeroIndex,broadcast,packed;
     Duplicate(written,uint32_t(0));Duplicate(zeroIndex,uint32_t(0));
-    uint32_t remaining=count;auto output=ids;ClearSpr<SpecialPurposeReg::AR>();UnalignRegForStore store;
+    uint32_t remaining=count;auto output=destination?destination:ids;ClearSpr<SpecialPurposeReg::AR>();UnalignRegForStore store;
     for(uint16_t i=0;i<count;i+=64) {
         auto valid=UpdateMask<uint32_t>(remaining);LoadAlign(token,ids+i);LoadAlign(old,slots+i);
         MaskReg miss,capacity;CompareScalar<uint32_t,CMPMODE::EQ>(miss,old,UINT32_MAX,valid);
@@ -723,6 +731,19 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         }
 #endif
 #endif
+        auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;
+        uint32_t count=0,missing=0;
+#if KVIP_REFILTER_REFILL
+        // Existing Q2/16K work tensor: cfg[1536:2016] is disjoint from
+        // bitmap words, frozen Q4 progress, thresholds and batched post inputs.
+        // Window allowance is validated <=480. No new UB/GM allocation.
+        auto selectedIds=cfg[1536];
+        const uint32_t allowance=PrefetchAllowance(slots,requests,state.GetValue(208),
+            state.GetValue(209),state.GetValue(210),ctx->windowLimit);
+        for(;;) {
+#else
+        auto selectedIds=ids;
+#endif
 #define KV_WINDOW_HISTORY rt_history
 #define KV_WINDOW_RESIDENT rt_resident
 #define KV_WINDOW_SCAN_TOKENS rt_scanTokens
@@ -732,12 +753,14 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
 #undef KV_WINDOW_SCAN_TOKENS
         V9_FETCH_PROFILE(scanTicks+=GetSystemCycle()-scanBegin;totalCandidates+=candidateCount;)
         V9_FETCH_PROFILE(candidateBegin=GetSystemCycle();postBegin=0;)
-        uint32_t count=0,missing=0;
         if(candidateCount) {
-            auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;
+#if KVIP_REFILTER_REFILL
+            uint32_t available=allowance-count;
+#else
             uint32_t available=PrefetchAllowance(slots,requests,state.GetValue(208),
                 state.GetValue(209),state.GetValue(210),ctx->windowLimit);
-            if(!slots && !ctx->tailBounds && !rollingScores) {
+#endif
+            if(!KVIP_REFILTER_REFILL && !slots && !ctx->tailBounds && !rollingScores) {
                 // No slot has ever been assigned: the OR bitmap already
                 // deduplicated tokens, so every candidate is a new miss.
                 missing=candidateCount;count=missing<available?missing:available;
@@ -749,11 +772,35 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
                 SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
                 SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
                 CompactMisses(reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),candidateCount,available);
+                    reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),candidateCount,available,
+#if KVIP_REFILTER_REFILL
+                    reinterpret_cast<__ubuf__ uint32_t*>(selectedIds[count].GetPhyAddr())
+#else
+                    nullptr
+#endif
+                );
                 SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-                missing=cfg.GetValue(56);count=missing<available?missing:available;
+                uint32_t found=cfg.GetValue(56);
+                missing+=found;count+=found<available?found:available;
             }
             V9_FETCH_PROFILE(candidateTicks+=GetSystemCycle()-candidateBegin;)
+        }
+        for(uint32_t q=0;q<4;++q) {
+            uint32_t processed=end[0][q]<stop?end[0][q]:stop;
+            if(processed<consumed[0][q])processed=consumed[0][q];
+            state.SetValue(12+q,processed);
+            if(sequenceHalfWindow) {
+                processed=end[1][q]<stop?end[1][q]:stop;
+                if(processed<consumed[1][q])processed=consumed[1][q];
+            }
+            state.SetValue(80+epoch*4+q,processed);
+        }
+#if KVIP_REFILTER_REFILL
+            // Continue only through already-frozen progress. Never wait for
+            // another Q, enlarge the budget, or resnapshot advancing producers.
+            if(count>=allowance || stop>=last || stop<=first)break;
+        }
+#endif
             if(count) {
                 V9_FETCH_PROFILE(postBegin=GetSystemCycle();)
 if (rt_batchedRows) {
@@ -769,13 +816,13 @@ if (rt_batchedRows) {
                 GlobalTensor<uint32_t> jobs;
                 jobs.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*8192);
                 SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
-                DataCopy(jobs,ids,((count+7)/8)*8);
+                DataCopy(jobs,selectedIds,((count+7)/8)*8);
                 SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
                 slots+=count;requests+=count;
 } else {
                 {
                     Simt::VF_CALL<PrepareCandidateWqes>(Simt::Dim3{256,1,1},rt_resident,
-                        reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),
+                        reinterpret_cast<__ubuf__ uint32_t*>(selectedIds.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),
                         reinterpret_cast<__ubuf__ uint32_t*>(work[512].GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work[1024].GetPhyAddr()),
                         map,reinterpret_cast<__gm__ uint64_t*>(addresses),count,rt_resident+slots,ctx,b);
                     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
@@ -787,22 +834,11 @@ if (rt_batchedRows) {
                 }
 }
             }
-        }
         V9_FETCH_PROFILE(if(postBegin)postTicks+=GetSystemCycle()-postBegin;)
         postedCount+=count;
         state.SetValue(16+epoch,count);state.SetValue(48+epoch,missing-count);
         state.SetValue(10,state.GetValue(10)+missing-count);
         state.SetValue(8,slots);state.SetValue(9,requests);state.SetValue(211,pending);
-        for(uint32_t q=0;q<4;++q) {
-            uint32_t processed=end[0][q]<stop?end[0][q]:stop;
-            if(processed<consumed[0][q])processed=consumed[0][q];
-            state.SetValue(12+q,processed);
-            if(sequenceHalfWindow) {
-                processed=end[1][q]<stop?end[1][q]:stop;
-                if(processed<consumed[1][q])processed=consumed[1][q];
-            }
-            state.SetValue(80+epoch*4+q,processed);
-        }
         if(!rt_batchedRows) {
             SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
             DataCopy(rowGm,state,256);

@@ -217,3 +217,40 @@ forward repeat by more than the measured drift/1% screening margin. Independent
 instrumented replays are labelled raw cycles, not summed as graph microseconds.
 CPU lane models verify arithmetic, masks and memory bounds. They do not model
 CANN instruction scheduling or prove a positive NPU latency result.
+
+## Visibility-safe second filtering and same-window refill
+
+The legacy submission filter skips queries whose score publication has not
+reached a candidate. If all other Q4 scores fall below the current Kth, it drops
+that candidate even though an unpublished query may ultimately select it. Final
+repair keeps outputs correct, hiding this admission false negative.
+
+`refilter_safe` keeps an ID as soon as any causal-valid Q is unknown, without
+waiting or reading its unpublished score. Causal-invalid queries are excluded;
+known scores keep equality ties. The existing four-query gather loop does this
+without a second pass. A candidate is rejected only when every valid query is
+known and below its own safe lower-bound threshold. Thus a final-selected ID
+cannot be rejected by this filter. Budget contention and service scheduling can
+still defer an admitted candidate; the rule is not a completion-time guarantee.
+
+`refilter_refill` additionally continues after a 2048-entry candidate/bitmap
+scratch cutoff when the frozen window has unexamined candidates and admission
+capacity remains. It does not resnapshot progress, wait, sort, or grow the 64/512
+budgets. It appends to 480 existing UB words at `cfg[1536:2016]`, disjoint from
+bitmap words, Q4 progress/thresholds and batched post metadata. No new memory
+allocation or copy kernel is introduced. The host already limits rolling modes
+to split-Q batches <=16; the public window limit is <=480.
+
+Both options default off. Keep the legacy filter as an explicit control, then
+measure safe-only and safe+refill separately. Refill can do additional bitmap
+work; conservative unknown handling can admit more speculative traffic. Neither
+is a speedup claim until complete graph mean and median improve beyond repeated
+baseline drift. Report useful prefetch, final repair, waste and total bytes;
+all-prefetch cold coverage must not be called pre-last-window coverage or link
+utilization. Original forward and reverse-only controls retain their budgets.
+
+Host tests run the actual gather, compact VF and refill orchestration with CPU
+lane models, ASAN and UBSAN. They cover Q4 publication skew, ties, causal ends,
+all publication masks, capacity cutoffs, unaligned append boundaries and budget
+limits. Bitmap DMA enumeration is mocked in the refill test; remote CANN build
+and five-snapshot output/threshold/transport validation remain required.

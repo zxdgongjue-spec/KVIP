@@ -184,7 +184,8 @@ int main(){
     execute(tmp_path, source, "rolling_cdf")
 
 
-def test_actual_candidate_filter_preserves_visibility_and_boundary_ties(tmp_path):
+@pytest.mark.parametrize("safe", [0, 1])
+def test_actual_candidate_filter_preserves_visibility_and_boundary_ties(tmp_path, safe):
     prefetch = (NATIVE / "op_kernel/prefetch.h").read_text()
     decoder = function(prefetch, "__simt_callee__ inline uint32_t DecodeScanToken(")
     gather = function(prefetch, "inline void GatherCandidateMap(")
@@ -214,14 +215,37 @@ int main(){
  put(3,6146,102);map[6147]=17; // already resident, not a miss
  for(threadIdx.x=0;threadIdx.x<256;++threadIdx.x)
   GatherCandidateMap(ids.data(),slots.data(),map.data(),ids.size(),scores.data(),cfg.data(),h);
- assert(slots[0]==UINT32_MAX&&slots[1]==0&&slots[2]==0&&slots[3]==UINT32_MAX&&slots[4]==17);
+ assert(slots[0]==UINT32_MAX&&slots[1]==0&&slots[2]==(KVIP_REFILTER_SAFE?UINT32_MAX:0)&&slots[3]==UINT32_MAX&&slots[4]==17);
+ // A candidate from Q0 can be useful to Q3 even if Q0's threshold rose.
+ // Keep it when Q3 is not ready; do not wait or read its unpublished score.
+ cfg[103]=2048;put(3,6145,150);
+ for(threadIdx.x=0;threadIdx.x<256;++threadIdx.x)
+  GatherCandidateMap(ids.data(),slots.data(),map.data(),ids.size(),scores.data(),cfg.data(),h);
+ assert(slots[1]==(KVIP_REFILTER_SAFE?UINT32_MAX:0));
+ // A causal-invalid query is different from an unknown valid query.
+ cfg[107]=6145;
+ for(threadIdx.x=0;threadIdx.x<256;++threadIdx.x)
+  GatherCandidateMap(ids.data(),slots.data(),map.data(),ids.size(),scores.data(),cfg.data(),h);
+ assert(slots[1]==0);
+
  assert(map[6144]==UINT32_MAX&&map[6145]==UINT32_MAX); // no cache mutation
+#if KVIP_REFILTER_SAFE
+ // Every final-selected token is admissible under any Q4 publication mask:
+ // known score >= final Kth >= rolling Kth, or unknown and kept conservatively.
+ std::fill(scores.begin(),scores.end(),0);
+ for(unsigned winner=0;winner<4;++winner)for(unsigned mask=0;mask<16;++mask){
+  std::fill(scores.begin(),scores.end(),0);put(winner,6145,110);
+  for(unsigned q=0;q<4;++q){cfg[96+q]=100;cfg[100+q]=(mask&(1U<<q))?4096:2048;cfg[104+q]=8192;}
+  threadIdx.x=1;GatherCandidateMap(ids.data(),slots.data(),map.data(),ids.size(),scores.data(),cfg.data(),h);
+  assert(slots[1]==UINT32_MAX);
+ }
+#endif
  // No rolling state is the unchanged original map gather.
  for(threadIdx.x=0;threadIdx.x<256;++threadIdx.x)GatherCandidateMap(ids.data(),slots.data(),map.data(),ids.size());
  for(unsigned i=0;i<ids.size();++i)assert(slots[i]==map[ids[i]]);
 }
 '''
-    execute(tmp_path, source, "rolling_refilter")
+    execute(tmp_path, f"#define KVIP_REFILTER_SAFE {safe}\n" + source, "rolling_refilter")
 
 
 def test_actual_threshold_publication_uses_writable_tensor_and_only_its_stripe(tmp_path):
@@ -273,3 +297,103 @@ int main(){
 }
 '''
     execute(tmp_path, source, "rolling_publication")
+
+
+@pytest.mark.parametrize("refill", [0, 1])
+def test_actual_refill_loop_fills_only_frozen_window_without_budget_growth(tmp_path, refill):
+    """Run the native admission loop and VF; mock only bitmap DMA/enumeration."""
+    text = (NATIVE / "op_kernel/prefetch.h").read_text()
+    decoder = function(text, "inline uint32_t DecodeScanToken(")
+    gather = function(text, "inline void GatherCandidateMap(")
+    compact = function(text, "inline void CompactMisses(")
+    first = text.index("        auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;", text.index("inline void FastService"))
+    last = text.index("            if(count) {", first)
+    body = text[first:last].replace('#include "../../common/lifetch/sequence_candidates.h"', r'''
+        // Exact candidate-capacity boundary; ready limits never advance.
+        uint32_t first=state.GetValue(12),last=cfg.GetValue(128),stop=last;
+        uint32_t candidateCount=std::min(2048U,last-first);
+        uint32_t consumed[2][4]{},end[2][4]{};
+        for(unsigned q=0;q<4;++q){consumed[0][q]=state.GetValue(12+q);end[0][q]=last;}
+        for(unsigned i=0;i<candidateCount;++i)ids.SetValue(i,first+i);
+        stop=first+candidateCount; ++chunks;
+        assert(chunks<=4);
+''')
+    source = r'''
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cstdint>
+#include <vector>
+#define __ubuf__
+#define __gm__
+#define __simt_callee__
+#define KVIP_WINDOW_REFILTER 1
+#define KVIP_REFILTER_SAFE 1
+#define KVIP_REVERSE_COLD 0
+#define V9_FETCH_PROFILE(...)
+struct {unsigned x;} threadIdx;
+template<class T>T asc_ldcg(T* p){return *p;}
+namespace MicroAPI {
+enum class MaskPattern{ALL,VL1};enum class CMPMODE{EQ,LT};enum class MaskMergeMode{ZEROING};
+enum class GatherMaskMode{STORE_REG};enum class PostLiteral{POST_MODE_UPDATE};enum class SpecialPurposeReg{AR};
+struct MaskReg{std::array<bool,64> v{};};
+template<class T>struct RegTensor{std::array<T,64> v{};unsigned n=64;};
+struct UnalignRegForStore{};
+template<class T,MaskPattern P>MaskReg CreateMask(){MaskReg m;std::fill_n(m.v.begin(),P==MaskPattern::ALL?64:1,true);return m;}
+template<class T>MaskReg UpdateMask(unsigned& n){MaskReg m;unsigned take=std::min(n,64U);std::fill_n(m.v.begin(),take,true);n-=take;return m;}
+template<class T>void Duplicate(RegTensor<T>& r,T n){r.v.fill(n);}
+template<class T,MaskMergeMode>void Duplicate(RegTensor<T>& r,T n,MaskReg m){for(unsigned i=0;i<64;++i)r.v[i]=m.v[i]?n:0;}
+template<class T>void LoadAlign(RegTensor<T>& r,T* p){std::copy_n(p,64,r.v.begin());}
+template<class T,CMPMODE C>void CompareScalar(MaskReg& r,RegTensor<T> a,T v,MaskReg m){for(unsigned i=0;i<64;++i)r.v[i]=m.v[i]&&(C==CMPMODE::EQ?a.v[i]==v:a.v[i]<v);}
+void Unsqueeze(RegTensor<uint32_t>& r,MaskReg m){unsigned n=0;for(unsigned i=0;i<64;++i){r.v[i]=n;n+=m.v[i];}}
+void Add(RegTensor<uint32_t>& r,RegTensor<uint32_t> a,RegTensor<uint32_t> b,MaskReg m){for(unsigned i=0;i<64;++i)if(m.v[i])r.v[i]=a.v[i]+b.v[i];}
+void ReduceSum(RegTensor<uint32_t>& r,RegTensor<uint32_t> a,MaskReg m){unsigned n=0;for(unsigned i=0;i<64;++i)if(m.v[i])n+=a.v[i];r.v[0]=n;}
+void Gather(RegTensor<uint32_t>& r,RegTensor<uint32_t> a,RegTensor<uint32_t> idx){for(unsigned i=0;i<64;++i)r.v[i]=a.v[idx.v[i]];}
+void MaskAnd(MaskReg& r,MaskReg a,MaskReg b,MaskReg m){for(unsigned i=0;i<64;++i)r.v[i]=m.v[i]&&a.v[i]&&b.v[i];}
+template<class T,GatherMaskMode>void Squeeze(RegTensor<T>& r,RegTensor<T> a,MaskReg m){r.n=0;for(unsigned i=0;i<64;++i)if(m.v[i])r.v[r.n++]=a.v[i];}
+template<SpecialPurposeReg>void ClearSpr(){}
+template<class T,PostLiteral>void StoreUnAlign(T*& p,RegTensor<T> a,UnalignRegForStore&){std::copy_n(a.v.begin(),a.n,p);p+=a.n;}
+template<class T>void StoreUnAlignPost(T*,UnalignRegForStore&){}
+template<class T>void StoreAlign(T* p,RegTensor<T> a,MaskReg m){for(unsigned i=0;i<64;++i)if(m.v[i])p[i]=a.v[i];}
+}
+using namespace MicroAPI;
+enum class HardEvent{V_S,S_V};constexpr unsigned EVENT_ID0=0;
+template<HardEvent>void SetFlag(unsigned){} template<HardEvent>void WaitFlag(unsigned){}
+namespace Simt {
+struct Dim3{unsigned x,y,z;};
+template<auto F,class... A>void VF_CALL(Dim3 d,A... a){for(threadIdx.x=0;threadIdx.x<d.x;++threadIdx.x)F(a...);}
+}
+template<class T>struct Tensor {
+ T* p;unsigned size;
+ T* GetPhyAddr(){return p;}
+ T GetValue(unsigned i){assert(i<size);return p[i];}
+ void SetValue(unsigned i,T v){assert(i<size);p[i]=v;}
+ Tensor operator[](unsigned i){assert(i<size);return {p+i,size-i};}
+};
+uint32_t PrefetchAllowance(unsigned slots,unsigned requests,unsigned row,unsigned total,unsigned transport,unsigned window){return std::min({row-slots,total-requests,transport-requests,window});}
+''' + decoder + '\n' + gather + '\n' + compact + r'''
+void run(unsigned limit,bool hits){
+ const unsigned b=0,rt_history=8192,epoch=3;unsigned chunks=0;
+ const unsigned slots=0,requests=0,sequenceHalfWindow=0;
+ std::vector<uint32_t> storage(9216,0xa5a5a5a5),idData(2048,0),stateData(256,0),mapData(rt_history,UINT32_MAX),scores(4*rt_history/2,0);
+ Tensor<uint32_t> work{storage.data(),unsigned(storage.size())},cfg=work[4096];
+ Tensor<uint32_t> ids{idData.data(),2048},state{stateData.data(),256};
+ struct Context{uint64_t mapping,tailBounds;unsigned windowLimit;} context{uint64_t(mapData.data()),1,limit};
+ auto ctx=&context;auto rollingScores=reinterpret_cast<uint8_t*>(scores.data());
+ for(unsigned q=0;q<4;++q){cfg.SetValue(96+q,100);cfg.SetValue(100+q,5000);cfg.SetValue(104+q,5000);cfg.SetValue(128+q,5000);}
+ cfg.SetValue(60,0);cfg.SetValue(61,0);
+ if(hits)for(unsigned i=4090;i<4210;++i)scores[i/2]|=100U<<((i%2)*16);
+ for(unsigned i=208;i<=210;++i)state.SetValue(i,512);
+''' + body + r'''
+ assert(count==(KVIP_REFILTER_REFILL&&hits?std::min(120U,limit):0));
+ assert(missing==(KVIP_REFILTER_REFILL&&limit&&hits?(limit<=6?6U:120U):0));
+ for(unsigned i=0;i<count;++i)assert(selectedIds.GetValue(i)==4090+i);
+ assert(chunks==(KVIP_REFILTER_REFILL&&limit?(hits&&limit<=6?2:3):1));
+ for(unsigned q=0;q<4;++q){assert(cfg.GetValue(128+q)==5000);assert(state.GetValue(12+q)<=5000);}
+ // The appended list stays within its 480-word band, even for partial VF stores.
+ for(unsigned i=4096+1536+count;i<storage.size();++i)assert(storage[i]==0xa5a5a5a5);
+ for(auto value:mapData)assert(value==UINT32_MAX);
+}
+int main(){for(bool hits:{false,true})for(unsigned limit:{0U,1U,7U,64U,119U,120U,480U})run(limit,hits);}
+'''
+    execute(tmp_path, f"#define KVIP_REFILTER_REFILL {refill}\n" + source, "refill_loop")
