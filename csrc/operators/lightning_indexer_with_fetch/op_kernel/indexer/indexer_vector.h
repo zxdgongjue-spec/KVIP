@@ -245,16 +245,22 @@ private:
             }
             SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
             WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
-            topkOp_.Threshold(mrgValueLocal_, prefixThreshold_[(query % 2) * 128], aligned);
+            topkOp_.Threshold(mrgValueLocal_, prefixThreshold_[(query % 2) * 128], aligned
+#if KVIP_ROLLING_REUSE_SEED
+                , reinterpret_cast<__ubuf__ uint16_t*>(rollingState_[(query % 2) * kvip_rolling::kStateWords].GetPhyAddr())
+#endif
+                );
 #if KVIP_ROLLING_THRESHOLD
             if (topkCount_ == kvip_rolling::kTop) {
                 // The recent interval is already in this union: never count
                 // it a second time when the main scan reaches it.
                 const uint32_t bank = query % 2;
                 PipeBarrier<PIPE_V>();
+#if !KVIP_ROLLING_REUSE_SEED
                 kvip_rolling::Seed(reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_.GetPhyAddr()), total,
                     reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_[bank * 128].GetPhyAddr()),
                     reinterpret_cast<__ubuf__ uint16_t*>(rollingState_[bank * kvip_rolling::kStateWords].GetPhyAddr()));
+#endif
 #if KVIP_ROLLING_BATCHED
                 // Anchor is immutable after seeding; join once rather than
                 // fencing its load at every subsequent 128-score tile.

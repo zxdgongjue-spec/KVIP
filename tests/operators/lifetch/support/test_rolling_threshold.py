@@ -27,9 +27,11 @@ def execute(tmp_path, source, name):
     subprocess.run([str(binary)], check=True, timeout=60)
 
 
-@pytest.mark.parametrize("batched,windowed,compact,first", [(0, 0, 0, 0), (1, 0, 0, 0), (0, 1, 0, 0), (0, 1, 1, 0), (0, 1, 1, 1)])
+@pytest.mark.parametrize("batched,windowed,compact,first,reuse", [
+    (0, 0, 0, 0, 0), (1, 0, 0, 0, 0), (0, 1, 0, 0, 0),
+    (0, 1, 1, 0, 0), (0, 1, 1, 1, 0), (0, 1, 1, 0, 1), (0, 1, 1, 1, 1)])
 @pytest.mark.parametrize("reverse", [0, 1])
-def test_actual_cdf_saturation_ties_causal_tail_and_seed_dedup(tmp_path, batched, windowed, compact, first, reverse):
+def test_actual_cdf_saturation_ties_causal_tail_and_seed_dedup(tmp_path, batched, windowed, compact, first, reuse, reverse):
     model = register_model_source('#include "recent_index.h"')
     model = model[:model.index('#include "recent_threshold.h"')]
     model = model.replace("{DIST_DINTLV_B8}", "{DIST_DINTLV_B8,DIST_BRC_B16}")
@@ -51,6 +53,10 @@ def test_actual_cdf_saturation_ties_causal_tail_and_seed_dedup(tmp_path, batched
 #define KVIP_ROLLING_THRESHOLD 1
 ''' + model + r'''
 namespace AscendC::MicroAPI {
+template<class T> void Gather(RegTensor<T>& r,T* p,RegTensor<uint16_t>& index,MaskReg mask){
+ for(unsigned i=0;i<r.v.size();++i)if(mask.v[i]){assert(index.v[i]<256);r.v[i]=p[index.v[i]];}}
+template<class T> void And(RegTensor<T>& r,RegTensor<T>& a,RegTensor<T>& b,MaskReg mask){
+ for(unsigned i=0;i<r.v.size();++i)if(mask.v[i])r.v[i]=a.v[i]&b.v[i];}
 enum class MemType {VEC_STORE,VEC_LOAD};
 template<MemType,MemType> void LocalMemBar(){}
 template<class T> void LoadAlign(RegTensor<T>& r,T* p){std::copy_n(p,r.v.size(),r.v.begin());}
@@ -126,7 +132,20 @@ int main(){
   std::array<uint16_t,128> threshold;threshold.fill(initial);
   std::array<uint16_t,kvip_rolling::kStateWords+32> storage;storage.fill(0xa55a);
   auto seed=truth;seed.resize((seed.size()+255)/256*256,0);
+#if KVIP_ROLLING_REUSE_SEED
+  unsigned seedHistograms=histograms;
+  kvip_recent_threshold::RegisterThreshold(seed.data(),threshold.data(),seed.size()/256,
+      seed.size()-2048+1,storage.data()+16);
+  assert(threshold[0]==initial);
+  assert(histograms-seedHistograms==4*seed.size()/256); // No third score pass.
+  for(unsigned j=0;j<256;++j){
+   unsigned key=(unsigned(initial)&0xff00)+255-j;
+   unsigned count=std::count_if(seed.begin(),seed.end(),[&](auto value){return value>=key;});
+   assert(storage[16+j]==std::min(count,2048U));
+  }
+#else
   kvip_rolling::Seed(seed.data(),truth.size(),threshold.data(),storage.data()+16);
+#endif
   const unsigned end=values.size()-71;
   bool frozen=false;
   unsigned previous=initial,pending=0,expectedHistograms=0,batchCount=0,windowCount=0;
@@ -164,7 +183,9 @@ int main(){
 #else
    kvip_rolling::Observe(score,storage.data()+16,threshold.data(),mask,advance);
 #endif
-   if(advance && !frozen){unsigned exact=kth(truth),expected=std::min(exact,unsigned(initial)+255);
+   if(advance && !frozen){unsigned exact=kth(truth);
+    unsigned cap=KVIP_ROLLING_REUSE_SEED?(unsigned(initial)|255U):unsigned(initial)+255;
+    unsigned expected=std::min(exact,cap);
     assert(threshold[0]==expected&&threshold[0]>=previous&&threshold[0]<=exact);
     previous=threshold[0];for(auto key:threshold)assert(key==expected);
     if(KVIP_ROLLING_FIRST_WINDOW)frozen=true;}
@@ -179,7 +200,7 @@ int main(){
 }
 '''
     source = (f"#define KVIP_ROLLING_BATCHED {batched}\n#define KVIP_ROLLING_WINDOWED {windowed}\n"
-              f"#define KVIP_ROLLING_COMPACT {compact}\n#define KVIP_ROLLING_FIRST_WINDOW {first}\n"
+              f"#define KVIP_ROLLING_REUSE_SEED {reuse}\n#define KVIP_ROLLING_COMPACT {compact}\n#define KVIP_ROLLING_FIRST_WINDOW {first}\n"
               f"#define KVIP_REVERSE_COLD {reverse}\n#define REVERSE_TEST {reverse}\n") + source
     execute(tmp_path, source, "rolling_cdf")
 

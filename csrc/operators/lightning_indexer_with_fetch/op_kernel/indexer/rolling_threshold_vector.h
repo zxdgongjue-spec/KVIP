@@ -139,13 +139,20 @@ __simd_vf__ inline void ObserveWindow(__ubuf__ uint16_t* input, uint32_t count,
     RegTensor<uint16_t> lower, upper, anchor, a;
     LoadAlign(lower, state); LoadAlign(upper, state + 128);
     LoadAlign(anchor, state + kBins);
-    AccumulateWindow(input, count, lower, upper, anchor, scanBegin, end,
+#if KVIP_ROLLING_REUSE_SEED
+    RegTensor<uint16_t> histogramAnchor;
+    RegTensor<uint16_t> byteMask; Duplicate(byteMask, uint16_t(0xff00));
+    And(histogramAnchor, anchor, byteMask, all);
+#else
+    auto& histogramAnchor = anchor;
+#endif
+    AccumulateWindow(input, count, lower, upper, histogramAnchor, scanBegin, end,
                      recentBegin, recentEnd, reverseBegin, reverseEnd);
     // A window adds <=18432 to capped counts <=2048: no uint16 overflow.
     RegTensor<uint16_t> rank, bin, cap, key;
     Duplicate(rank, uint16_t(kTop)); Duplicate(cap, uint16_t(255));
     kvip_recent_threshold::FirstCdfBin(bin, lower, upper, rank);
-    Sub(key, cap, bin, all); Add(key, key, anchor, all);
+    Sub(key, cap, bin, all); Add(key, key, histogramAnchor, all);
     StoreAlign(state, lower, all); StoreAlign(state + 128, upper, all);
     StoreAlign(threshold, key, all);
     SaveAdmission(state, key, anchor);

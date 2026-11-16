@@ -3,6 +3,7 @@
 #include "context.h"
 #include "cold_scan.h"
 #include "rolling_threshold.h"
+extern "C" uint32_t kvip_rolling_reuse_seed() { return KVIP_ROLLING_REUSE_SEED; }
 extern "C" uint32_t kvip_compact_out_of_place() { return KVIP_COMPACT_OUT_OF_PLACE; }
 extern "C" uint32_t kvip_refilter_safe() { return KVIP_REFILTER_SAFE; }
 extern "C" uint32_t kvip_refilter_refill() { return KVIP_REFILTER_REFILL; }

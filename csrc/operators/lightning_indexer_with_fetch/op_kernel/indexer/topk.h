@@ -163,14 +163,22 @@ public:
     // the same address/layout consumed by the existing predicate broadcasts.
     __aicore__ inline void Threshold(const LocalTensor<uint16_t>& input,
                                      const LocalTensor<uint16_t>& threshold,
-                                     uint32_t validLen)
+                                     uint32_t validLen
+#if KVIP_ROLLING_REUSE_SEED
+                                     , __ubuf__ uint16_t* rollingState = nullptr
+#endif
+                                     )
     {
 #if !(defined(V9_UBMEM) && V9_UBMEM)
         if (topK && validLen >= topK && validLen <= 18432 && validLen % 256 == 0) {
             kvip_recent_threshold::RegisterThreshold(
                 reinterpret_cast<__ubuf__ uint16_t*>(input.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint16_t*>(threshold.GetPhyAddr()),
-                uint16_t(validLen / 256), uint16_t(validLen - topK + 1));
+                uint16_t(validLen / 256), uint16_t(validLen - topK + 1)
+#if KVIP_ROLLING_REUSE_SEED
+                , rollingState
+#endif
+                );
             return;
         }
 #endif

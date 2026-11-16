@@ -284,3 +284,39 @@ not enough to retain a candidate. CPU tests compare the actual compact VF with
 an independent stable-selection oracle, in-place and disjoint destinations,
 tail lengths, capacity limits and guard regions. Device compilation and timing
 remain part of remote validation.
+
+## Reuse the seed selector's histogram
+
+The 5ade2b1 host20 run did not confirm disjoint compaction as a speedup: all
+five means/medians were worse than reverse-only. First-window correction saves
+29--43 us over compact all-window safe refilter but remains slower than the
+unchanged fused baseline. G7/G17 also lose useful prefetch and increase waste
+when later threshold updates are omitted. These controls stay opt-in.
+
+`rolling_reuse_seed` removes the extra resident+recent histogram pass. The
+exact seed selector has already computed the cumulative low-byte distribution
+for the high byte containing Kth, plus the number of keys in earlier bytes.
+Before discarding these registers, it exports a descending CDF into the
+existing rolling state. Two 128-lane gathers and constant-size arithmetic
+replace reloading/re-encoding/re-histogramming roughly 16K--18K seed scores per
+query. The initial Kth and resident classification are unchanged. There is no
+additional allocation, Index read, kernel or final TopK change. Memory barriers
+separate the 512-byte temporary ascending CDF from its descending overwrite.
+
+This reuses a narrower score interval: `[seed & 0xff00, seed | 0xff]`, whereas
+the old histogram spans `[seed, seed+255]`. Within the reused byte, threshold
+selection is exact. If a later prefix Kth exceeds it, the threshold stays at
+the byte upper bound. It cannot over-tighten or remove a final-selected token;
+the tradeoff is potentially more speculative traffic. Replay reports the cap
+mode, capped query count, final-key gap, waste, repair and complete latency.
+`bit_exact` means agreement with this explicitly capped reference, not an
+assertion that the cap was never reached. First-window and all-window variants
+are compared independently against their non-reuse controls and the original
+forward/reverse controls. Both compaction separation and refill are off.
+
+Native host lane tests execute the seed exporter and window accumulator under
+ASan/UBSan. They compare the exported CDF with direct counts, test all later
+prefix thresholds against an independent Kth, cover ties/padding/extreme keys,
+reverse scan and first-window freezing, and verify that exporting the seed
+adds zero histogram operations. They do not establish CANN compilation or a
+positive NPU timing result. The option defaults off.

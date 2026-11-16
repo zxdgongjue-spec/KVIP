@@ -14,6 +14,12 @@
 #ifndef KVIP_ROLLING_COMPACT
 #define KVIP_ROLLING_COMPACT 0
 #endif
+#ifndef KVIP_ROLLING_REUSE_SEED
+#define KVIP_ROLLING_REUSE_SEED 0
+#endif
+#if KVIP_ROLLING_REUSE_SEED && !KVIP_ROLLING_COMPACT
+#error "Seed histogram reuse requires compact window accumulation"
+#endif
 #ifndef KVIP_ROLLING_FIRST_WINDOW
 #define KVIP_ROLLING_FIRST_WINDOW 0
 #endif
