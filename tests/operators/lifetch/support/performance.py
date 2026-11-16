@@ -107,14 +107,25 @@ def measure_ubmem_serial(torch, torch_npu, runtime, device_table, workspace, sto
 
     def validate():
         counts = native.verify(state['selected'])
+        state['misses_per_request'] = counts[:-1]
         expected = [len(np.unique(row[row >= resident])) for row in initial]
         assert counts[:-1] == expected, f'native miss counts {counts[:-1]} != {expected}'
 
     def diagnose(graph, reset, verify):
         from diagnostics import collect_native
         collect_native(torch, graph, reset, verify, trace_rounds, trace_folder)
-    return measure_graph(torch, call, native.reset, validate, warmup=warmup, iterations=iterations,
-                         diagnose=diagnose if trace_rounds and trace_folder else None, validate_each=not bench_only)
+    result = measure_graph(torch, call, native.reset, validate, warmup=warmup, iterations=iterations,
+                           diagnose=diagnose if trace_rounds and trace_folder else None, validate_each=not bench_only)
+    result['misses_per_request'] = state.get('misses_per_request')
+    if trace_rounds:
+        get_only = measure_graph(torch, native.fetch, lambda: native.output.copy_(native.initial_payload),
+                                 validate, warmup=warmup, iterations=iterations)
+        result['get_only'] = get_only['timing']
+        if get_only['correctness'] != 'PASS':
+            result['correctness'] = get_only['correctness']
+            result['failures'].extend(dict(failure, check=f"get_only/{failure['check']}")
+                                      for failure in get_only['failures'])
+    return result
 
 
 def measure_sequence(torch, rounds, graphs, reset, prepare, validate, *, warmup, iterations, save):

@@ -2,7 +2,7 @@
 import pytest
 
 from diagnostics import final_transfer_scope, summarize
-from reporting import atomic_json
+from reporting import add_profile_metrics, atomic_json
 from types import SimpleNamespace
 
 
@@ -50,8 +50,9 @@ def test_empty_tasks_are_na_not_zero_bandwidth():
 
 
 def test_level_one_reports_final_and_combined_scope_without_summing_overlap(tmp_path, monkeypatch):
-    # Core timestamp decoding has its own suite; this fixture isolates count/span aggregation.
-    monkeypatch.setattr("diagnostics.decode_timeline", lambda raw: {"cores": []})
+    cores = [dict(role='resolver+finalize b0', stages=[dict(name='Q1.resolve', start_us=3, end_us=7)]),
+             dict(role='resolver+finalize b1', stages=[dict(name='Q1.resolve', start_us=6, end_us=9)])]
+    monkeypatch.setattr('diagnostics.decode_timeline', lambda raw: dict(cores=cores))
     raw, details = capture()
     details[0]['core_timeline_raw'] = raw
     details[0]['prefetch_scope'] = dict(bytes=656, first_doorbell=50,
@@ -66,6 +67,12 @@ def test_level_one_reports_final_and_combined_scope_without_summing_overlap(tmp_
     assert sample['combined_observed_bandwidth']['span_us'] == 45
     assert sample['combined_observed_bandwidth']['bytes'] == 10 * 656
     assert 'metric=final_get_bandwidth' in (tmp_path / 'diagnostic_summary.log').read_text()
+    row = dict(report=str(tmp_path / 'report.json'))
+    add_profile_metrics([row], result)
+    assert row['fused_profiled_resolver_span_p50_us'] == 6
+    assert row['fused_profiled_final_get_bytes_mean'] == 9 * 656
+    assert row['fused_profiled_transfer_span_p50_us'] == 45
+    assert row['fused_profiled_transfer_GBps_p50'] == pytest.approx(10 * 656 / 45 / 1000)
 
 
 def test_invalid_cross_core_order_cannot_produce_global_bandwidth(tmp_path, monkeypatch):

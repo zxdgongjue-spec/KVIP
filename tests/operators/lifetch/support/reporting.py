@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -16,9 +17,12 @@ def timing_summary(samples):
         raise ValueError('timing samples must be a nonempty vector')
     if not np.isfinite(values).all() or (values <= 0).any():
         raise ValueError('timing samples must be finite positive microseconds')
+    return dict(_timing_distribution(values), samples_us=values.tolist())
+
+
+def _timing_distribution(values):
     return dict(mean_us=float(values.mean()), p50_us=float(np.median(values)),
-                p99_us=float(np.percentile(values, 99)), samples=len(values),
-                samples_us=values.tolist())
+                p99_us=float(np.percentile(values, 99)), samples=len(values))
 
 
 def atomic_json(path, value):
@@ -113,6 +117,90 @@ def save_summary(directory, rows):
     (directory / 'summary.log').write_text('\n'.join(lines) + '\n')
 
 
+def add_transfer_counts(row, report):
+    serial_misses = report.get('native_misses_per_request')
+    fused_counts = report.get('fused_read_counts', [])
+    if not fused_counts:
+        # Older synthetic URMA reports already contain measured read samples.
+        fused_counts = [dict(prefetch=sample['total'] - sample['final'], final=sample['final'])
+                        for sample in report.get('read_samples', {}).get('prototype_with_update', [])]
+    if serial_misses is None and not fused_counts:
+        return
+    width = row['token_bytes'] = report.get('token_bytes', 656)
+    if serial_misses is not None:
+        row['serial_read_entries'] = sum(serial_misses)
+        row['serial_read_bytes'] = row['serial_read_entries'] * width
+    if fused_counts:
+        row['fused_read_count_samples'] = len(fused_counts)
+        phases = dict(prefetch=[sample['prefetch'] for sample in fused_counts],
+                      final=[sample['final'] for sample in fused_counts],
+                      total=[sample['prefetch'] + sample['final'] for sample in fused_counts])
+        for phase, counts in phases.items():
+            prefix = f'fused_{phase}'
+            mean = sum(counts) / len(counts)
+            row[f'{prefix}_entries_mean'] = mean
+            row[f'{prefix}_entries_min'] = min(counts)
+            row[f'{prefix}_entries_max'] = max(counts)
+            row[f'{prefix}_bytes_mean'] = mean * width
+
+
+def add_profile_metrics(rows, diagnostic):
+    """Join each case to its own profiled replays, independently of timing and correctness."""
+    captures = {Path(capture['source']).resolve(): capture['samples'] for capture in diagnostic['captures']}
+    stage_order = dict(
+        serial=('total', 'li', 'lidu_prepare', 'get'),
+        fused=('total', 'init', 'li', 'resolve_update', 'resolve_update_fetch', 'resolver_span',
+               'output_pack_span', 'index_apply_span', 'prefetch_span', 'final_get_span',
+               'transfer_span', 'finalize_span'),
+    )
+    transfer_phases = (('prefetch_bandwidth', 'prefetch'), ('final_get_bandwidth', 'final_get'),
+                       ('combined_observed_bandwidth', 'transfer'))
+    for row in rows:
+        if 'report' not in row:
+            continue
+        folder = Path(row['report']).parent
+        paths = dict(serial=folder / 'native_attribution.json',
+                     fused=Path(row.get('fused_attribution', folder / 'full_attribution.json')))
+        for path, source in paths.items():
+            samples = captures.get(source.resolve())
+            if not samples:
+                continue
+            times = defaultdict(list)
+            transfers = defaultdict(list)
+            for sample in samples:
+                accounting = sample.get('accounting', {})
+                stages = dict(accounting.get('stages_us', {}), **sample.get('core_phase_spans_us', {}))
+                if path == 'serial' and 'fetch' in stages:
+                    stages['get'] = stages.pop('fetch')
+                if not accounting.get('error'):
+                    for name in ('inter_kernel_gap', 'boundary_residual'):
+                        stages[name] = accounting.get(f'{name}_us')
+                stages['total'] = sample.get('us', accounting.get('event_us'))
+                for name, value in stages.items():
+                    if value is not None and np.isfinite(value):
+                        times[name].append(value)
+                for metric, phase in transfer_phases:
+                    scope = sample.get(metric, {})
+                    if scope.get('span_us') and scope.get('GBps') is not None:
+                        times[f'{phase}_span'].append(scope['span_us'])
+                        transfers[phase].append(scope)
+            prefix = f'{path}_profiled'
+            stages = dict.fromkeys((*stage_order[path], 'inter_kernel_gap', 'boundary_residual', *times))
+            for stage in stages:
+                values = times[stage]
+                distribution = (_timing_distribution(np.asarray(values)) if values else
+                                dict(mean_us=None, p50_us=None, p99_us=None, samples=0))
+                for key, value in distribution.items():
+                    row[f'{prefix}_{stage}_{key}'] = value
+            if path == 'fused':
+                for _, phase in transfer_phases:
+                    scopes = transfers[phase]
+                    row[f'{prefix}_{phase}_bytes_mean'] = (
+                        sum(scope['bytes'] for scope in scopes) / len(scopes) if scopes else None)
+                    row[f'{prefix}_{phase}_GBps_p50'] = (
+                        float(np.median([scope['GBps'] for scope in scopes])) if scopes else None)
+
+
 def collect_results(directory, config, exit_code):
     """Read structured worker results; log PASS strings are not evidence."""
     directory = Path(directory)
@@ -141,6 +229,12 @@ def collect_results(directory, config, exit_code):
             fetch_jettys = report.get('fetch_jettys_per_aiv', getattr(config, 'fetch_jettys_per_aiv', None))
             if fetch_jettys is not None:
                 row['fetch_jettys_per_aiv'] = fetch_jettys
+        if report.get('fused_attribution'):
+            row['fused_attribution'] = str((path.parent / report['fused_attribution']).resolve())
+        if timing.get('native_get_only'):
+            for key in ('mean_us', 'p50_us', 'p99_us', 'samples'):
+                row[f'serial_get_only_{key}'] = timing['native_get_only'].get(key)
+        add_transfer_counts(row, report)
         rows.append(row)
     misses = getattr(config, 'miss_percent', None)
     misses = misses if isinstance(misses, (tuple, list)) else (misses,)

@@ -79,6 +79,23 @@ def final_transfer_scope(raw, requests, transport):
     return result
 
 
+def core_phase_spans(cores):
+    """First matching marker to last across workers. The phases can overlap."""
+    phases = (
+        ('resolver_span', 'resolver+finalize ', r'Q[1-4]\.resolve'),
+        ('output_pack_span', 'output_pack ', r'Q[1-4]\.(locations_and_pack|output_and_sync)'),
+        ('index_apply_span', 'index_update ', r'apply\.(prefetch|Q[1-4])'),
+        ('finalize_span', 'resolver+finalize ', r'prefetch_residency|residency|status'),
+    )
+    spans = {}
+    for phase, role, pattern in phases:
+        stages = [stage for core in cores if core['role'].startswith(role)
+                  for stage in core['stages'] if re.fullmatch(pattern, stage['name'])]
+        if stages:
+            spans[phase] = max(stage['end_us'] for stage in stages) - min(stage['start_us'] for stage in stages)
+    return spans
+
+
 def summarize(directory, config):
     directory = Path(directory)
     paths = sorted([*directory.rglob('full_attribution.json'), *directory.rglob('attribution.json')])
@@ -97,6 +114,8 @@ def summarize(directory, config):
         for sample in samples:
             item = dict(repeat=sample['round'], accounting=sample.get('accounting', {}),
                         prefetch=sample.get('prefetch'), final=sample.get('final'))
+            if 'us' in sample:
+                item['us'] = sample['us']
             if 'algorithm' in sample:
                 item['algorithm'] = sample['algorithm']
                 if 'error' in sample['algorithm']:
@@ -117,9 +136,14 @@ def summarize(directory, config):
                     stage_values.setdefault(stage, []).append(duration)
             details = sample.get('streaming_cycles', sample.get('streaming', []))
             if details:
+                decoded = None
                 scope = details[0].get('prefetch_scope')
                 raw = details[0].get('core_timeline_raw')
                 mhz = raw.get('clock_mhz') if raw else None
+                if (raw and scope and sample.get('prefetch') is not None
+                        and scope['bytes'] != sample['prefetch'] * raw['token_bytes']):
+                    result['missing'].append(f'{path}: prefetch scope bytes differ from device total')
+                    scope = None
                 if scope and mhz and scope.get('interval_cycles', 0) > 0:
                     span = scope['interval_cycles'] / mhz
                     item['prefetch_bandwidth'] = dict(bytes=scope['bytes'], span_us=span,
@@ -128,15 +152,16 @@ def summarize(directory, config):
                         first_submit_cycles=scope['first_doorbell'], last_complete_cycles=scope['last_cq_observed'])
                 if raw:
                     try:
-                        decode_timeline(raw)  # Validate core bounds and cross-core publication ordering before global spans.
-                        item['final_get_bandwidth'] = final_transfer_scope(raw, details, config.transport)
+                        decoded = decode_timeline(raw)  # Validate core bounds and publication ordering before global spans.
+                        item['core_phase_spans_us'] = core_phase_spans(decoded['cores'])
+                        final = final_transfer_scope(raw, details, config.transport)
+                        if sample.get('final') is not None and final['entries'] != sample['final']:
+                            raise ValueError('final scope entries differ from device total')
+                        item['final_get_bandwidth'] = final
                     except (KeyError, TypeError, ValueError) as error:
                         item.pop('prefetch_bandwidth', None)
                         result['missing'].append(f'{path} repeat={sample["round"]}: final Get scope: {error}')
                     else:
-                        final = item['final_get_bandwidth']
-                        if sample.get('final') is not None and final['entries'] != sample['final']:
-                            result['missing'].append(f'{path}: final scope entries differ from device total')
                         if scope and mhz and final['entries'] and final['span_us']:
                             begin = min(scope['first_doorbell'], final['first_cycles'])
                             end = max(scope['last_cq_observed'], final['last_cycles'])
@@ -150,28 +175,22 @@ def summarize(directory, config):
                 if config.level >= 2:
                     # Counts/durations retain their request and query association.
                     item['requests'] = details
-                    if raw:
-                        try:
-                            decoded = decode_timeline(raw)
-                        except ValueError as error:
-                            result['missing'].append(f'{path} repeat={sample["round"]}: {error}')
-                        else:
-                            if config.transport == 'ubmem':
-                                for core in decoded['cores']:
-                                    core.pop('KVAF_counters', None)  # UBmem fields are not URMA CQ cycles.
-                                    for stage in core['stages']:
-                                        stage['name'] = stage['name'].replace('prefetch_CQ_join', 'prefetch_completion_join')
-                            item['timeline'] = decoded
+                    if decoded:
+                        if config.transport == 'ubmem':
                             for core in decoded['cores']:
+                                core.pop('KVAF_counters', None)  # UBmem fields are not URMA CQ cycles.
+                                for stage in core['stages']:
+                                    stage['name'] = stage['name'].replace('prefetch_CQ_join', 'prefetch_completion_join')
+                        item['timeline'] = decoded
+                        for core in decoded['cores']:
+                            timeline_rows.append(dict(capture=str(path), repeat=sample['round'],
+                                block=core['block'], role=core['role'], step='whole_core',
+                                start_us=core['start_us'], end_us=core['end_us'], duration_us=core['duration_us']))
+                            for stage in core['stages']:
                                 timeline_rows.append(dict(capture=str(path), repeat=sample['round'],
-                                    block=core['block'], role=core['role'], step='whole_core',
-                                    start_us=core['start_us'], end_us=core['end_us'], duration_us=core['duration_us']))
-                                if config.level >= 2:
-                                    for stage in core['stages']:
-                                        timeline_rows.append(dict(capture=str(path), repeat=sample['round'],
-                                            block=core['block'], role=core['role'], step=stage['name'],
-                                            start_us=stage['start_us'], end_us=stage['end_us'], duration_us=stage['duration_us']))
-                    else:
+                                    block=core['block'], role=core['role'], step=stage['name'],
+                                    start_us=stage['start_us'], end_us=stage['end_us'], duration_us=stage['duration_us']))
+                    elif not raw:
                         result['missing'].append(f'{path} repeat={sample["round"]}: per-core records')
             elif config.level >= 2:
                 result['missing'].append(f'{path} repeat={sample["round"]}: detailed counters')
@@ -1092,7 +1111,7 @@ def account_native(events, name, elapsed):
     aliases = {
         'li': ('quantlightningindexer',),
         'lidu_prepare': ('a5lidufusedbatchgetpreparemtp',),
-        'fetch': ('kvafexecutebatchgetaivkernelv2',),
+        'fetch': ('kvafexecutebatchgetaivkernelv2', 'kvafexecutebatchgetubmemkernelv2'),
     }
     for event in events:
         if event.get('ph') != 'X' or (event.get('cat') and 'kernel' not in event['cat'].lower()):

@@ -88,6 +88,21 @@ python tests/operators/lifetch/test_lifetch.py diagnose \
 URMA 合成负载支持 Fetch-only；UBmem 和真实回放仍使用完整图诊断。
 `all` 执行默认 check 后，用同一次配对测试生成 bench 和 level 1 诊断，不另跑 report。
 
+### 性能对比 CSV
+
+合成负载的 `results.csv` 每行对应一组 BS / miss。`bench` 和 `diagnose` 都写入
+整图耗时与实际传输量。`serial_read_entries` 是 LIDU 去重后交给 BatchGet 的条数。
+`fused_prefetch_*`、`fused_final_*`、`fused_total_*` 分别统计预取、最终补拉和总读取量，
+包含每轮平均、最小和最大条数及平均字节数。`fused_read_count_samples` 是统计所用的计时轮数。
+
+`diagnose --level 1` 已能在同一张表写出阶段数据。时间列含 `mean_us`、`p50_us`、`p99_us` 和 `samples`。
+
+- `serial_get_only_*` 是独立 BatchGet 图的事件计时。`serial_profiled_*` 给出 LI、LIDU（含描述符准备）、Get、核间空隙和事件边界余量。
+- `fused_profiled_*` 给出 Init、LI 和 Resolve/Update/Fetch 所在的融合 kernel 时间。`resolver_span`、`output_pack_span`、`index_apply_span` 和 `finalize_span` 取各阶段首尾标记的全局区间，可能互相重叠。预取、最终 Get 和二者合并区间例如 `fused_profiled_final_get_span_p50_us`。
+- 整图有效带宽用 `serial_read_bytes / serial_mean_us / 1000` 或 `fused_total_bytes_mean / fused_mean_us / 1000`。分段传输的 `GBps_p50` 先用同一轮的字节数除以该轮区间，再取各轮中位数。零条传输的带宽留空，缺少打点的阶段也留空。
+
+`--stages` 筛选诊断文本展示。CSV 保留已捕获的各个阶段。真实回放的分阶段记录按源轮次保存在 `diagnostic.json`。
+
 ## 真实回放与旧 trace 转换
 
 已有 schema-4 `dp*/series.json` 可直接连续回放，必须包含真实 Q、Index keys/scales、weights、query scale：

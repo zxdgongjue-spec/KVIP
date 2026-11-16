@@ -331,7 +331,7 @@ def dispatch(config):
     import time
 
     from correctness import check_jobs
-    from reporting import atomic_json, collect_results, comparison_row, save_summary
+    from reporting import add_profile_metrics, atomic_json, collect_results, comparison_row, save_summary
     from workloads import configuration
 
     if config.mode == 'convert-trace':
@@ -369,6 +369,7 @@ def dispatch(config):
                 raise ValueError('Specify --kvaf-server HOST:PORT; no test service address is configured')
             code = launch(job, directory)
             checks = directory / 'checks.json'
+            records = []
             if checks.is_file():
                 for check in json.loads(checks.read_text()):
                     row = comparison_row(f"{name}/{check['case']}", None, None,
@@ -393,6 +394,7 @@ def dispatch(config):
             if job.mode == 'diagnose':
                 from diagnostics import summarize
                 diagnostic = summarize(directory, job)
+                add_profile_metrics(records, diagnostic)
                 if diagnostic['trace'] != 'COMPLETE':
                     rows[-1]['accepted'] = False
                     rows[-1]['trace'] = diagnostic['trace']
@@ -1865,6 +1867,7 @@ def run_urma_case(
     full_trace = {}
     read_samples = {}
     split_samples = {}
+    fused_read_counts = []
 
     def measure(call, reset, check, read_label=None, timing_name=None):
         costs = dict(reset_s=0., validation_s=0., replay_wait_s=0., completion_s=0., reads_s=0.)
@@ -1919,6 +1922,8 @@ def run_urma_case(
                 probe = owner.session.runtime.acquire_fused_batch_get_context(native.output, stream)
                 owner.session.runtime.release_fused_batch_get_context(probe, stream)
                 costs["completion_s"] += time.perf_counter() - began
+            if read_label and step >= args.warmup:
+                fused_read_counts.append(dict(state['fused_read_count']))
             if read_label and step >= args.warmup and (not bench_only or step == args.warmup + args.iterations - 1):
                 began = time.perf_counter()
                 split_samples.setdefault(read_label, []).append(dict(state["completion"]))
@@ -1937,7 +1942,9 @@ def run_urma_case(
         measured = timing_summary(samples)
         completed_timings[timing_name or read_label or getattr(call, '__name__', 'operation')] = measured
         atomic_json(folder / 'completed_timings.json', dict(
-            batch=b, miss_percent=args.miss_percent, timing=completed_timings, correctness=correctness.status, failures=correctness.failures))
+            batch=b, miss_percent=args.miss_percent, timing=completed_timings,
+            correctness=correctness.status, failures=correctness.failures, token_bytes=TOKEN_BYTES,
+            native_misses_per_request=state['native_misses'], fused_read_counts=fused_read_counts))
         if read_label == "prototype_with_update" and None:
             reset()
             stream.synchronize()
@@ -2096,6 +2103,8 @@ def run_urma_case(
             native_deferred_rows=int(np.count_nonzero(statuses[:, 3])),
             completed_checkpoints=int(statuses[:, 4].astype(np.uint64).sum()),
         )
+        state['fused_read_count'] = dict(prefetch=int(rows[:, 9].astype(np.uint64).sum()),
+                                         final=state['completion']['final_reads'])
         owner.mark_completed(completion_verified=True)
         if updated:
             update.check_capacity()
@@ -2406,6 +2415,8 @@ def run_urma_case(
         fetch_jettys_per_aiv=pipeline.fetch_jettys_per_aiv,
         read_samples=read_samples,
         split_samples=split_samples,
+        fused_read_counts=fused_read_counts,
+        token_bytes=TOKEN_BYTES,
         sfa=sfa,
         stateful_rounds=0 if bench_only else 3,
         native_misses_per_request=state["native_misses"],
@@ -2750,7 +2761,8 @@ def run_ubmem_case(
                     or not np.array_equal(counters[:, 3], counters[:, 4])):
                 raise RuntimeError(f"UBmem copy failed or incomplete: {counters.tolist()}")
             if completion_only:
-                return
+                return dict(prefetch=int(counters[:, 2].sum(dtype=np.uint64)),
+                            final=int(counters[:, 4].sum(dtype=np.uint64)))
             assert np.all(counters[:, 1] <= prefetch_tokens), "Prefetch exceeded its total budget"
             epochs = rotating.rows.cpu().numpy()[:, 16 : 16 + rotating.rounds]
             assert np.all(epochs <= max(1, prefetch_tokens // shape.intermediate_fetches)), (
@@ -3018,6 +3030,7 @@ def run_ubmem_case(
             workspace.inputs.prepare([4] * batch, query_owners=list(range(1, batch + 1)))
             workspace.inputs.query_ends.fill_(history)
             elapsed = []
+            fused_read_counts = []
             wall_costs = dict(reset_s=0., replay_wait_s=0., completion_s=0., validation_s=0.)
             for turn in range(warmup + iterations):
                 began = time.perf_counter()
@@ -3034,10 +3047,11 @@ def run_ubmem_case(
                 end.synchronize()
                 wall_costs["replay_wait_s"] += time.perf_counter() - began
                 began = time.perf_counter()
-                verify_outputs([], phase="bench_completion", completion_only=True)
+                transfer_counts = verify_outputs([], phase="bench_completion", completion_only=True)
                 wall_costs["completion_s"] += time.perf_counter() - began
                 if turn >= warmup:
                     elapsed.append(begin.elapsed_time(end) * 1000)
+                    fused_read_counts.append(transfer_counts)
             from reporting import atomic_json, timing_summary
 
             measured = timing_summary(elapsed)
@@ -3048,13 +3062,21 @@ def run_ubmem_case(
                 requested_windows=shape.intermediate_fetches, actual_windows=rotating.rounds,
                 timing=dict(prototype_with_update=measured),
                 execution="COMPLETED", correctness="NOT_RUN", boundary_coverage=boundary_phases,
+                fused_read_counts=fused_read_counts,
             )
             if serial_result is not None:
                 result["timing"]["native_chain"] = serial_result["timing"]
+                if 'get_only' in serial_result:
+                    result['timing']['native_get_only'] = serial_result['get_only']
+                result['native_misses_per_request'] = serial_result.get('misses_per_request')
                 result["serial_correctness"] = serial_result["correctness"]
                 result["serial_failures"] = serial_result["failures"]
             report_path = (result_output / f"b{batch}-h{history}-r{resident}-w{token_bytes}-p{prefetch_tokens}"
                            / "report.json") if result_output else None
+            if trace_rounds:
+                profile_folder = trace_output / f"b{batch}-h{history}-r{resident}-w{token_bytes}"
+                if report_path:
+                    result['fused_attribution'] = os.path.relpath(profile_folder / 'attribution.json', report_path.parent)
             if report_path:
                 atomic_json(report_path, result)
             began = time.perf_counter()
@@ -3080,10 +3102,9 @@ def run_ubmem_case(
                     for tensor, saved in zip(measured_buffers, initial_state):
                         tensor.copy_(saved)
 
-                folder = trace_output / f"b{batch}-h{history}-r{resident}-w{token_bytes}"
                 collect_ubmem(torch, rotating, graph, restore_fixture,
                               lambda: verify(list(range(1, batch + 1)), phase="profiled_replay"),
-                              trace_rounds, folder, streaming=forward)
+                              trace_rounds, profile_folder, streaming=forward)
                 result['correctness'] = checks.status
                 result['correctness_failures'] = checks.failures
                 if report_path:
