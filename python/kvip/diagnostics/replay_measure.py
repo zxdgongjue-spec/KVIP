@@ -4,6 +4,7 @@
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+import os
 import sys
 
 import numpy as np
@@ -31,6 +32,36 @@ def phase(retained, name, step=None):
                 "device_resources", "runtime_create", "runtime_link", "runtime_initialize",
                 "ddr_import", "access_table"}:
         emit(f"INIT_PHASE {name}")
+
+
+def record_memory(torch, device, retained, name):
+    """Best-effort allocation checkpoints, outside graph timing and without a fence."""
+    row = dict(checkpoint=name, variant=retained.get("progress", {}).get("variant"),
+               pid=os.getpid(), device=str(device), visible_devices=os.environ.get("ASCEND_RT_VISIBLE_DEVICES"))
+    try:
+        free, total = torch.npu.mem_get_info(device)
+        row.update(free_bytes=int(free), total_bytes=int(total),
+                   allocated_bytes=int(torch.npu.memory_allocated(device)),
+                   reserved_bytes=int(torch.npu.memory_reserved(device)))
+    except Exception as error:
+        # An unavailable diagnostic must not replace the original device error.
+        row["error"] = f"{type(error).__name__}: {error}"
+    retained.setdefault("memory_samples", []).append(row)
+    return row
+
+
+def release_case(bundle, retained):
+    """Break fused verifier cycles only after graphs and transport have completed."""
+    if bundle.lease is not None:
+        phase(retained, "lease_close")
+        bundle.lease.close()
+    # verify/read_counts capture bundle itself; clearing the owner dictionary
+    # alone leaves all its NPU tensors alive until Python's cyclic GC runs.
+    for name in ("reset", "verify", "read_counts", "seeds", "oracle"):
+        if hasattr(bundle, name):
+            setattr(bundle, name, None)
+    retained["active_case"].clear()
+    del retained["active_case"]
 
 
 def buffer_addresses(bundle):
@@ -272,12 +303,14 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
     stream.synchronize()
     phase(retained, "eager_verify")
     verify()
+    record_memory(torch, getattr(args, "device", 0), retained, "eager_ready")
     phase(retained, "capture_prepare")
     reset()
     stream.synchronize()
     phase(retained, "graph_capture_and_fence")
     with lease.capture_scope() if lease is not None else nullcontext():
         graph = capture(bundle.forward)
+    record_memory(torch, getattr(args, "device", 0), retained, "graph_captured")
     phase(retained, "first_replay_reset")
     reset()  # Graph capture may execute the body.
     phase(retained, "first_replay_and_sync")
@@ -424,6 +457,7 @@ def allocate_context(args, archive, retained):
     phase(retained, "device_select")
     torch.npu.set_device(args.device)
     device = torch.device(f"npu:{args.device}")
+    record_memory(torch, device, retained, "device_ready")
     stream = torch.npu.Stream(device=device)
     torch.npu.set_stream(stream)
     retained["stream"] = stream
@@ -441,6 +475,7 @@ def allocate_context(args, archive, retained):
     runtime.link_to(args.kvaf_server)
     phase(retained, "runtime_initialize")
     runtime.initialize(ddr["region_bytes"], ddr["slot_bytes"])
+    record_memory(torch, device, retained, "runtime_ready")
     phase(retained, "ddr_import")
     restored = import_pages(
         runtime, archive.directory / "ddr", ddr, torch_module=torch, target_transport=args.transport
@@ -451,6 +486,7 @@ def allocate_context(args, archive, retained):
     phase(retained, "access_table")
     table = runtime.access_table_view(restored["access_table"], device="npu")
     retained["table"] = table
+    record_memory(torch, device, retained, "ddr_import_ready")
     return SimpleNamespace(
         build=build,
         kvaf=kvaf,
@@ -472,12 +508,16 @@ def measure_case(args, archive, context, retained):
     build, kvaf, torch = context.build, context.kvaf, context.torch
     device, stream, cann, aics = context.device, context.stream, context.cann, context.aics
     runtime, restored, table = context.runtime, context.restored, context.table
-    case_retained = {"progress": retained.setdefault("progress", {})}
+    case_retained = {
+        "progress": retained.setdefault("progress", {}),
+        "memory_samples": retained.setdefault("memory_samples", []),
+    }
     if getattr(args, "compare_layout", False):
         case_retained["layout_references"] = retained.setdefault("layout_references", {})
         case_retained["address_delta"] = restored["new_base"] - restored["old_base"]
     retained["active_case"] = case_retained
     phase(retained, "bundle_create")
+    record_memory(torch, device, retained, "before_bundle")
     if args.mode == "fused":
         from kvip.diagnostics.fused_replay import create_fused
 
@@ -507,6 +547,7 @@ def measure_case(args, archive, context, retained):
             topk_probe=getattr(args, "probe_only", False),
         )
         case_retained["bundle"] = bundle
+        record_memory(torch, device, retained, "bundle_ready")
         case_retained["buffers"] = buffer_addresses(bundle)
         retained["buffers"] = case_retained["buffers"]
         retained["buffers_variant"] = retained["progress"].get("variant")
@@ -530,6 +571,7 @@ def measure_case(args, archive, context, retained):
             transport=args.transport,
         )
         case_retained["bundle"] = bundle
+    record_memory(torch, device, retained, "inputs_ready")
     if getattr(args, "profile_dir", None) is not None:
         library = getattr(bundle, "library", None)
         libraries = getattr(bundle, "libraries", (() if library is None else (library,)))
@@ -650,11 +692,9 @@ def measure_case(args, archive, context, retained):
         result["get_kernel"] = dict(path=str(kernel), sha256=file_digest(kernel))
     # measure() reset every captured graph first. A failing reset or lease
     # close leaves the active case and shared arena retained by the CLI.
-    if bundle.lease is not None:
-        phase(retained, "lease_close")
-        bundle.lease.close()
-    case_retained.clear()
-    del retained["active_case"]
+    release_case(bundle, retained)
+    del bundle
+    record_memory(torch, device, retained, "case_released")
     return result
 
 
@@ -864,4 +904,5 @@ def run(args, archive, retained):
         completed[retained["progress"]["variant"]] = result
     phase(retained, "context_release")
     release_context(context)
+    result["memory_samples"] = retained.get("memory_samples", [])
     return result

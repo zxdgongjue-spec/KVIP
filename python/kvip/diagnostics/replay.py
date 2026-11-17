@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import sys
 import traceback
 
 from kvip.diagnostics.archive import load_snapshot
@@ -167,6 +168,11 @@ def main(argv=None):
                 f"mean_us={case['timing']['mean_us']:.3f} p50_us={case['timing']['p50_us']:.3f}"
             )
     except BaseException as error:
+        torch = sys.modules.get("torch")
+        if torch is not None and retained.get("stream") is not None:
+            from kvip.diagnostics.replay_measure import record_memory
+
+            record_memory(torch, args.device, retained, "failure")
         active = retained.get("active_case")
         result = dict(
             schema_version=2,
@@ -182,6 +188,7 @@ def main(argv=None):
             if active is not None
             else retained.get("buffers_variant"),
             completed_cases=retained.get("completed_cases", {}),
+            memory_samples=retained.get("memory_samples", []),
             profile_manifests=active.get("system_profile_manifests", []) if active is not None else [],
             error=dict(type=type(error).__name__, message=str(error), traceback=traceback.format_exc()),
             native_log=str(log.failure_path) if log.failure_path else None,

@@ -67,6 +67,15 @@ def print_replay_failure(report, *, result_path, log_path=None):
         for line in diagnostic.strip().splitlines()[:35]:
             emit(line[:1200], file=sys.stderr)
         emit("BUILD_DIAGNOSTIC_END", file=sys.stderr)
+    for sample in report.get("memory_samples", [])[-12:]:
+        label = f"MEMORY {sample['checkpoint']} variant={sample.get('variant')}"
+        if "free_bytes" in sample:
+            emit(label + " " + " ".join(
+                f"{key}_GiB={sample[key + '_bytes'] / 2**30:.3f}"
+                for key in ("free", "allocated", "reserved")
+            ), file=sys.stderr)
+        else:
+            emit(label + f" unavailable={sample.get('error')}", file=sys.stderr)
     for name, case in report.get("completed_cases", {}).items():
         timing = case.get("timing", {})
         emit(

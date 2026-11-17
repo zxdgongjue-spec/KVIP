@@ -2,12 +2,82 @@
 """Failure checkpoints must survive native errors without changing timing."""
 
 import json
+import gc
 from pathlib import Path
 from types import SimpleNamespace
+import weakref
 
 import pytest
 
 from kvip.diagnostics import compare, replay, replay_measure
+
+
+@pytest.mark.parametrize("close_fails", [False, True])
+def test_fused_bundle_released_without_waiting_for_gc(close_fails):
+    class Allocation:
+        pass
+
+    def make():
+        allocation = Allocation()
+        reference = weakref.ref(allocation)
+        bundle = SimpleNamespace(output=allocation)
+
+        def close():
+            if close_fails:
+                raise RuntimeError("fence failed")
+
+        bundle.lease = SimpleNamespace(close=close)
+        bundle.verify = lambda: bundle.output
+        bundle.read_counts = lambda: bundle.output
+        bundle.reset = lambda: allocation
+        bundle.seeds = [allocation]
+        bundle.oracle = object()
+        return bundle, reference
+
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        bundle, reference = make()
+        retained = {"active_case": {"bundle": bundle, "graphs": []}}
+        if close_fails:
+            with pytest.raises(RuntimeError, match="fence failed"):
+                replay_measure.release_case(bundle, retained)
+            assert retained["active_case"]["bundle"] is bundle
+            assert bundle.verify() is reference()
+            # The real CLI retains owners until exit when completion is unknown.
+            bundle.lease.close = lambda: None
+        replay_measure.release_case(bundle, retained)
+        assert "active_case" not in retained
+        del bundle
+        assert reference() is None, "Completed case still retains its allocation"
+    finally:
+        if enabled:
+            gc.enable()
+
+
+def test_memory_checkpoints_keep_only_numbers_and_do_not_synchronize(monkeypatch, capsys):
+    from kvip.diagnostics.console import print_replay_failure
+
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "4")
+    torch = SimpleNamespace(npu=SimpleNamespace(
+        mem_get_info=lambda device: (20 << 30, 92 << 30),
+        memory_allocated=lambda device: 6 << 30,
+        memory_reserved=lambda device: 7 << 30,
+    ))
+    retained = {"progress": {"variant": "reverse"}}
+    row = replay_measure.record_memory(torch, "npu:0", retained, "before_bundle")
+    assert row["visible_devices"] == "4" and row["device"] == "npu:0"
+    assert row["free_bytes"] == 20 << 30
+    json.dumps(retained)
+    print_replay_failure(retained, result_path="failed.json")
+    assert "free_GiB=20.000 allocated_GiB=6.000 reserved_GiB=7.000" in capsys.readouterr().err
+
+    def fail(device):
+        raise RuntimeError("device unavailable")
+
+    torch.npu.mem_get_info = fail
+    row = replay_measure.record_memory(torch, 0, retained, "failure")
+    assert row["error"] == "RuntimeError: device unavailable"
 
 
 def test_native_exit_without_json_follows_recorded_spool(tmp_path, capsys):
