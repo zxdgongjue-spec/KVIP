@@ -7,6 +7,14 @@ set(SOC_VERSION Ascend950PR_9599 CACHE STRING "Target SoC, not runtime device or
 set(ASCEND_CANN_PACKAGE_PATH /usr/local/Ascend/cann CACHE PATH "CANN installation")
 set(KVAF_INCLUDE "" CACHE PATH "KVAF device interface headers")
 option(KVIP_INCREMENTAL_TOPK "Producer compact pairs, incremental TopK and direct pending lists" OFF)
+option(KVIP_INCREMENTAL_WINDOW "Fixed-address per-window incremental score staging" OFF)
+option(KVIP_INCREMENTAL_REGISTER "Register Kth for incremental window selection" OFF)
+if(KVIP_INCREMENTAL_WINDOW AND NOT KVIP_INCREMENTAL_TOPK)
+  message(FATAL_ERROR "Window staging requires incremental TopK")
+endif()
+if(KVIP_INCREMENTAL_REGISTER AND NOT KVIP_INCREMENTAL_WINDOW)
+  message(FATAL_ERROR "Register selection requires incremental window staging")
+endif()
 option(KVIP_REVERSE_COLD "Reverse complete 2K cold Index blocks in non-sequence-split URMA LI" OFF)
 option(KVIP_ROLLING_THRESHOLD "Capped BF16 CDF in the native LI score VF" OFF)
 option(KVIP_ROLLING_WINDOWED "Accumulate raw LI scores at existing window boundaries" OFF)
@@ -63,6 +71,8 @@ ascendc_include_directories(v9_kernel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/includ
   ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/indexer ${KVAF_INCLUDE}
   ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)
 ascendc_compile_options(v9_kernel PRIVATE -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WORKER=$<BOOL:${KVIP_OUTPUT_WORKER}> -DKVIP_FUSE_QUERY_WORK=$<BOOL:${KVIP_FUSE_QUERY_WORK}> -O2 -g --cce-auto-sync=off
+  -DKVIP_INCREMENTAL_WINDOW=$<BOOL:${KVIP_INCREMENTAL_WINDOW}>
+  -DKVIP_INCREMENTAL_REGISTER=$<BOOL:${KVIP_INCREMENTAL_REGISTER}>
   -DKVIP_INCREMENTAL_TOPK=$<BOOL:${KVIP_INCREMENTAL_TOPK}>
   -DKVIP_REVERSE_COLD=$<BOOL:${KVIP_REVERSE_COLD}>
   -DKVIP_ROLLING_THRESHOLD=$<BOOL:${KVIP_ROLLING_THRESHOLD}>
@@ -97,3 +107,5 @@ target_compile_definitions(v9_bridge PRIVATE KVIP_ROLLING_SPARSE=$<BOOL:${KVIP_R
 target_compile_definitions(v9_bridge PRIVATE KVIP_ROLLING_BOUNDARY=$<BOOL:${KVIP_ROLLING_BOUNDARY}>)
 
 target_compile_definitions(v9_bridge PRIVATE KVIP_INCREMENTAL_TOPK=$<BOOL:${KVIP_INCREMENTAL_TOPK}>)
+
+target_compile_definitions(v9_bridge PRIVATE KVIP_INCREMENTAL_WINDOW=$<BOOL:${KVIP_INCREMENTAL_WINDOW}> KVIP_INCREMENTAL_REGISTER=$<BOOL:${KVIP_INCREMENTAL_REGISTER}>)

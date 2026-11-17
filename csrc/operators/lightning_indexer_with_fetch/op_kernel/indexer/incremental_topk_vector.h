@@ -8,6 +8,29 @@ namespace kvip_incremental {
 using namespace AscendC;
 using namespace AscendC::MicroAPI;
 
+// Fixed 128-lane destination, no compaction count or scalar readback. Only
+// causally invalid/already-seeded positions become zero. Lower scores need no
+// extra cutoff comparison: the retained K precede the window and the exact
+// boundary selection removes them. Even at Kth=0, retained valid zeros fill
+// all remaining ties before any masked/padded zero could enter the result.
+__simd_callee__ inline void StoreWindow(RegTensor<uint16_t>& score,
+    __ubuf__ uint16_t* output, uint32_t laneMask) {
+    auto all = CreateMask<uint16_t, MaskPattern::ALL>();
+    RegTensor<uint16_t> zero, value;
+    RegTensor<int16_t> lanes;
+    Arange(lanes, int16_t(0));
+    auto& index = reinterpret_cast<RegTensor<uint16_t>&>(lanes);
+    MaskReg valid, left, right, outside;
+    CompareScalar<uint16_t, CMPMODE::LT>(valid, index, uint16_t(laneMask & 255), all);
+    CompareScalar<uint16_t, CMPMODE::LT>(left, index, uint16_t((laneMask >> 8) & 255), all);
+    CompareScalar<uint16_t, CMPMODE::GE>(right, index, uint16_t((laneMask >> 16) & 255), all);
+    MaskOr(outside, left, right, all);
+    MaskAnd(valid, valid, outside, all);
+    Duplicate(zero, uint16_t(0));
+    Select(value, score, zero, valid);
+    StoreAlign(output, value, all);
+}
+
 // Called with the live score register inside the existing scoring VF. No
 // second score DMA, histogram, or random score lookup at submission time.
 __simd_callee__ inline void Compact(RegTensor<uint16_t>& score,
@@ -72,7 +95,11 @@ inline void Remap(__ubuf__ uint32_t* selected, __ubuf__ uint32_t* previous,
         } else if (position < kTop) {
             selected[i] = previous[position];
         } else {
+#if KVIP_INCREMENTAL_WINDOW
+            uint32_t token = scanBegin + position - kTop;
+#else
             uint32_t token = scanBegin + offsets[position - kTop];
+#endif
 #if KVIP_REVERSE_COLD
             if (token >= reverseBegin && token < reverseEnd)
                 token = reverseBegin + reverseEnd - 2048 - (token & ~2047U) + (token & 2047U);

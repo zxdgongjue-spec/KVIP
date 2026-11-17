@@ -929,13 +929,17 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         (__ubuf__ uint16_t *)classifyUB_.GetPhyAddr() + pingpong * 256,
         rolling, rollingMask0, rollingMask1, rollingAdvance
 #if KVIP_INCREMENTAL_TOPK
+#if KVIP_INCREMENTAL_WINDOW
+        , incrementalTile ? reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_[2048+info.s2Idx*128-incrementalBegin_].GetPhyAddr()) : nullptr,
+#else
         , incrementalTile ? reinterpret_cast<__ubuf__ uint16_t*>(incrementalScores_[2048+incrementalCount_].GetPhyAddr()) : nullptr,
+#endif
         incrementalTile ? reinterpret_cast<__ubuf__ uint16_t*>(incrementalOffsets_[incrementalCount_].GetPhyAddr()) : nullptr,
         uint16_t(info.s2Idx*128-incrementalBegin_),
         kvip_rolling::TileMask(curS2Idx,incrementalEnd_,incrementalRecentBegin_,incrementalRecentEnd_)
 #endif
         );
-#if KVIP_INCREMENTAL_TOPK
+#if KVIP_INCREMENTAL_TOPK && !KVIP_INCREMENTAL_WINDOW
     if(incrementalTile)incrementalCount_+=GetSpr<SpecialPurposeReg::AR>()/sizeof(uint16_t);
 #endif
     } else {
@@ -1046,7 +1050,12 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     const bool incrementalBoundary = incrementalTile && (info.isLastS2InnerLoop ||
         info.s2Idx+1==rotating::Trigger(runtimeShape_.history,runtimeShape_.resident,
                                        runtimeShape_.rounds,incrementalEpoch_));
+#if KVIP_INCREMENTAL_WINDOW
+    if (incrementalBoundary) {
+        incrementalCount_ = (info.s2Idx+1)*128-incrementalBegin_;
+#else
     if(incrementalTile && (incrementalBoundary || incrementalCount_+128>kvip_incremental::kChunk)) {
+#endif
         // Score VF was the last QK reader. Let Cube refill before selection;
         // retain the existing output/progress DMA ordering independently.
         CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4,PIPE_V>(

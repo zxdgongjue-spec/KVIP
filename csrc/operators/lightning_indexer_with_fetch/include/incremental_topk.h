@@ -4,6 +4,18 @@
 #ifndef KVIP_INCREMENTAL_TOPK
 #define KVIP_INCREMENTAL_TOPK 0
 #endif
+#ifndef KVIP_INCREMENTAL_WINDOW
+#define KVIP_INCREMENTAL_WINDOW 0
+#endif
+#ifndef KVIP_INCREMENTAL_REGISTER
+#define KVIP_INCREMENTAL_REGISTER 0
+#endif
+#if KVIP_INCREMENTAL_WINDOW && !KVIP_INCREMENTAL_TOPK
+#error "Window staging requires incremental TopK"
+#endif
+#if KVIP_INCREMENTAL_REGISTER && !KVIP_INCREMENTAL_WINDOW
+#error "Register selection requires incremental window staging"
+#endif
 #if KVIP_INCREMENTAL_TOPK && (KVIP_ROLLING_THRESHOLD || KVIP_WINDOW_REFILTER)
 #error "Incremental selection replaces, rather than layers on, rolling/refilter"
 #endif

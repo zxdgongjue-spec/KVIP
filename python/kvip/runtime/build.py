@@ -40,8 +40,13 @@ def build_failure(log, stage, returncode):
 def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False,
                     rolling_threshold=False, window_refilter=False, rolling_batched=False, rolling_windowed=False,
                     rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False,
-                    compact_out_of_place=False, rolling_reuse_seed=False, rolling_fast_path=False, rolling_sparse=False, rolling_boundary=False, incremental_topk=False):
+                    compact_out_of_place=False, rolling_reuse_seed=False, rolling_fast_path=False, rolling_sparse=False, rolling_boundary=False, incremental_topk=False,
+                    incremental_window=False, incremental_register=False):
     """Build one shape-independent binary per source/toolchain/SoC."""
+    if incremental_window and not incremental_topk:
+        raise ValueError("Window staging requires incremental TopK")
+    if incremental_register and not incremental_window:
+        raise ValueError("Register selection requires incremental window staging")
     if incremental_topk and (rolling_threshold or window_refilter):
         raise ValueError("Incremental TopK replaces rolling/refilter")
     if (window_refilter or rolling_batched or rolling_windowed) and not rolling_threshold:
@@ -70,6 +75,8 @@ def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False,
         ASCEND_CANN_PACKAGE_PATH=str(cann),
         KVAF_INCLUDE=str(headers),
         SOC_VERSION=soc,
+        KVIP_INCREMENTAL_WINDOW="ON" if incremental_window else "OFF",
+        KVIP_INCREMENTAL_REGISTER="ON" if incremental_register else "OFF",
         KVIP_INCREMENTAL_TOPK="ON" if incremental_topk else "OFF",
         KVIP_ROLLING_REUSE_SEED="ON" if rolling_reuse_seed else "OFF",
         KVIP_ROLLING_BOUNDARY="ON" if rolling_boundary else "OFF",

@@ -3,6 +3,8 @@
 #include "context.h"
 #include "cold_scan.h"
 #include "rolling_threshold.h"
+extern "C" uint32_t kvip_incremental_window() { return KVIP_INCREMENTAL_WINDOW; }
+extern "C" uint32_t kvip_incremental_register() { return KVIP_INCREMENTAL_REGISTER; }
 extern "C" uint32_t kvip_incremental_topk() { return KVIP_INCREMENTAL_TOPK; }
 extern "C" uint32_t kvip_rolling_boundary() { return KVIP_ROLLING_BOUNDARY; }
 extern "C" uint32_t kvip_rolling_sparse() { return KVIP_ROLLING_SPARSE; }
@@ -55,6 +57,11 @@ extern "C" uint32_t v9_li(void* bindings, void* stream, const rotating::RuntimeS
         rotating::UseSequenceSplit(*shape) || shape->resident != 16384 || shape->rounds != 9 ||
         shape->history <= shape->resident ||
         ((shape->history - shape->resident)/128+7)/8*128 > 65535) return 100001;
+#if KVIP_INCREMENTAL_WINDOW
+    // Split-Q/H32 uses a 16K trunk. The dead merge scratch is K+16K u16.
+    if (shape->history % 128 ||
+        ((shape->history-shape->resident)/128+7)/8*128 > 16384) return 100001;
+#endif
 #endif
 #define LI_LAUNCH_0 aclrtlaunch_v9_li_kernel
 #define LI_LAUNCH_1 aclrtlaunch_v9_li_kernel_1

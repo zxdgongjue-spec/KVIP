@@ -59,6 +59,17 @@
         SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
         PipeBarrier<PIPE_V>();
         const uint32_t size = QLICommon::Align(2048 + incrementalCount_, uint32_t(256));
+#if KVIP_INCREMENTAL_WINDOW
+        // Tiles write fixed positions after the retained K. Every position is
+        // written once, including masked zeros. Consume before RotateFetch,
+        // which reuses this scratch only at the same completed window boundary.
+        DataCopy(mrgValueLocal_, incrementalScores_, 2048);
+        PipeBarrier<PIPE_V>();
+        if (size > 2048 + incrementalCount_) {
+            kvip_incremental::ZeroTail(reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_.GetPhyAddr()),
+                                      2048+incrementalCount_,size);
+        }
+#else
         // Source and output banks are disjoint. Padding is less than every
         // selected nonzero key; real zero-score ties precede padding.
         Duplicate(mrgValueLocal_, uint16_t(0), size);
@@ -72,6 +83,7 @@
             kvip_incremental::ZeroTail(reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_.GetPhyAddr()),
                                       2048+incrementalCount_,size);
         }
+#endif
         topkOp_(mrgValueLocal_, indicesOutLocal_, scoreOutLocal_, size, 0, 1, true);
         PipeBarrier<PIPE_V>();
         Simt::VF_CALL<kvip_incremental::Remap>(Simt::Dim3{256,1,1},

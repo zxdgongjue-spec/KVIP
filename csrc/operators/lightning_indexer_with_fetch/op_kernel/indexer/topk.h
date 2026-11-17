@@ -204,7 +204,25 @@ public:
     {
         if (s2LoopNum == 1) {
             if (returnScores) {
+#if KVIP_INCREMENTAL_REGISTER
+            // Same exact Kth and stable >Kth / ==Kth ID ordering. Keep the
+            // two byte CDFs in registers instead of four separate VF stages
+            // and intermediate histogram copies. Only incremental calls
+            // request scores with s2LoopNum=1 in this opt-in build.
+            auto cutoff = nkValueLocal.ReinterpretCast<uint16_t>();
+            Threshold(mrgValueLocal, cutoff, s2SeqLen);
+            PipeBarrier<PIPE_V>();
+            auto idx = reinterpret_cast<__ubuf__ uint16_t*>(tmpIndexLocal.GetPhyAddr());
+            auto values = reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal.GetPhyAddr());
+            auto kth = reinterpret_cast<__ubuf__ uint32_t*>(nkValueLocal.GetPhyAddr());
+            topkb16gather::FindIdxGTOutputVFImpl(idx, values, uint16_t(0), kth, uint16_t(s2SeqLen / 128));
+            topkb16gather::FindIdxEQOutputVFImpl(idx, values, uint16_t(0), kth, uint16_t(s2SeqLen / 128));
+            topkb16gather::FindValueOutputVFImpl(
+                reinterpret_cast<__ubuf__ uint16_t*>(hisValueLocal.GetPhyAddr()),
+                values, idx, uint16_t(topK / 128));
+#else
             topkb16gather::LiTopKVF<true>(tmpIndexLocal, hisValueLocal, mrgValueLocal, histogramsLocal, idxHighLocal, idxLowLocal, nkValueLocal, topK, s2SeqLen);
+#endif
             } else {
             topkb16gather::LiTopKVF<false>(tmpIndexLocal, hisValueLocal, mrgValueLocal, histogramsLocal, idxHighLocal, idxLowLocal, nkValueLocal, topK, s2SeqLen);
             }
