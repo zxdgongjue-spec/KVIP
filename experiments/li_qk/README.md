@@ -49,6 +49,16 @@ Q1 使用现有 Q2 的最小 M/Fixpipe 物理对齐布局，actual qlen=1。Cube
 
 ## 构建与 A5 执行
 
+一键脚本为`run_a5.sh`，在原A5容器与Python环境中执行。默认拉取MR14源分支并固定实验提交`0c1d483`，建立新worktree，检查依赖，构建，执行7点，汇总并打包；失败停止并打包已生成日志。原checkout和每次结果均保留。CANN路径优先从当前环境识别；KVAF优先使用原checkout的`third_party/KVAF`。
+
+```bash
+bash experiments/li_qk/run_a5.sh \
+  --repo /home/w00568585/wt-mr14 \
+  --kvaf-include /path/to/KVAF/access_operator/demo/aiv_batch_get/include
+```
+
+脚本可单独下载后用`bash run_a5.sh`执行。依赖在默认位置时无需参数；路径不同时传`--cann-root`/`--kvaf-include`。实际可用预算不同时传`--aics 28 --aivs 56`，SDK对照加`--sdk-reference`。使用`--help`查看参数。它记录npu-smi，但不自动推断资源预算或排除其它工具的设备占用；在device 5空闲时执行。
+
 在包含此目录及 MR14 `20adb7e` LI 源码的 checkout 中，启用原 CANN/TorchNPU 环境。替换 CANN、SoC 与 KVAF include 路径为实际值；使用新构建目录，避免 CANN 增量对象二次转换的问题。
 
 ```bash
