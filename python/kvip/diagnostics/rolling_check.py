@@ -37,6 +37,36 @@ def reference(scores, ends, resident, bounds, progress, initial, rounds, reverse
     return expected, exact
 
 
+def sparse_work(scores, ends, resident, bounds, progress, initial, rounds, reverse):
+    """Count histogram inputs, not cycles; compaction still visits every tile."""
+    b, q, history = scores.shape
+    triggers = [resident + ((history-resident)//128)*e//(rounds-1)*128 for e in range(rounds)]
+    scanned = admitted = dense_calls = sparse_calls = windows = 0
+    for row in range(b):
+        begin = (resident + 2047)//2048*2048
+        stop = min(history, int(ends[row].min()))//2048*2048
+        for query in range(q):
+            for start, end in zip(triggers, triggers[1:]):
+                if end > int(progress[row, query, 0]):
+                    break
+                positions = np.arange(start, end, dtype=np.int64)
+                scanned += len(positions)
+                dense_calls += 2*((len(positions)+255)//256)
+                windows += 1
+                if reverse:
+                    mask = (positions >= begin) & (positions < stop)
+                    token = positions[mask]
+                    positions[mask] = begin + stop - 2048 - (token//2048)*2048 + token%2048
+                valid = (positions < ends[row, query]) & (
+                    (positions < bounds[row, 0]) | (positions >= bounds[row, 1]))
+                count = int(np.count_nonzero(scores[row, query, positions[valid]] > initial[row, query]))
+                admitted += count
+                sparse_calls += 2*((count+255)//256)
+    return dict(scanned_scores=scanned, histogram_scores=admitted, windows=windows,
+                dense_histogram_calls=dense_calls, sparse_histogram_calls=sparse_calls,
+                scope="CPU counts; excludes compaction and synchronization cost, not latency")
+
+
 def verify(torch, bundle, archive):
     comparison = bundle.threshold_comparison
     initial = np.array(comparison["initial_keys"], dtype=np.uint16)
@@ -57,10 +87,19 @@ def verify(torch, bundle, archive):
     if np.any(actual < initial) or np.any(actual > final):
         raise AssertionError("Rolling threshold escaped the seed/final Kth bounds")
     cap = (initial.astype(np.int32) | 255) if bundle.tuning.get("rolling_reuse_seed") else initial.astype(np.int32) + 255
-    return dict(status="bit_exact", queries=actual.size,
+    result = dict(status="bit_exact", queries=actual.size,
                 scope="first_cold_window_frozen" if bundle.tuning.get("rolling_first_window") else "all_scanned_windows",
                 tightened_queries=int(np.count_nonzero(actual > initial)),
                 capped_queries=int(np.count_nonzero(exact.astype(np.int32) > cap)),
                 cap_mode="seed_byte_end" if bundle.tuning.get("rolling_reuse_seed") else "seed_plus_255",
                 mean_final_gap_keys=float(np.mean(final.astype(np.int32)-actual)),
                 last_keys=actual.tolist(), included_in_timing=False)
+    if bundle.tuning.get("rolling_sparse"):
+        if not hasattr(bundle, "sparse_work"):
+            bundle.sparse_work = sparse_work(
+                archive.array("post.score_keys"), archive.array("pre.query_ends").reshape(initial.shape),
+                g["resident"], archive.array("pre.threshold_bounds"), progress, initial,
+                int(bundle.rotating.runtime_shape.rounds), bundle.tuning["reverse_cold"],
+            )
+        result["work_counts"] = bundle.sparse_work
+    return result

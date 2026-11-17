@@ -42,7 +42,11 @@ def report(cases, order):
         g = gain(t, original)
         print(f"{name:23} {t['mean_us']:8.3f} {t['p50_us']:8.3f} {g['mean_us']:10.2f} {g['p50_us']:9.2f} "
               f"{useful_prefetch(case):10.1f} {b['repair']/2**20:10.4f} {b['waste']/2**20:9.4f} {b['total']/2**20:9.4f}")
-    if "reverse-window-fast" in cases:
+    if "reverse-sparse" in cases:
+        pairs = (("reverse", "reverse-window-fast"),
+                 ("reverse-window-fast", "reverse-sparse-ref"),
+                 ("reverse-sparse", "reverse-sparse-ref"))
+    elif "reverse-window-fast" in cases:
         pairs = (("reverse", "reverse-window-in"),
                  ("reverse-window-in", "reverse-window-reuse"),
                  ("reverse-window-reuse", "reverse-window-fast"))
@@ -87,6 +91,10 @@ def report(cases, order):
             print(f"ROLLING {name} {check['status']} scope={check.get('scope','all_scanned_windows')} "
                   f"last_key_gap={check['mean_final_gap_keys']:.3f} capped={check['capped_queries']} "
                   f"cap={check.get('cap_mode','seed_plus_255')}")
+            if work := check.get("work_counts"):
+                print(f"WORK {name} histogram_scores={work['histogram_scores']}/{work['scanned_scores']} "
+                      f"histogram_calls={work['dense_histogram_calls']}->{work['sparse_histogram_calls']} "
+                      "CPU_counts_not_latency; compaction/synchronization are in graph timing")
     if "reverse-window-fast" in cases:
         for name in order:
             for sample in cases[name].get("native_diagnostics", {}).get("samples", []):
@@ -97,7 +105,7 @@ def report(cases, order):
                     if metric.get("status") == "available":
                         fields.append(f"{label}={metric['median_cycles']:.0f}/{metric['max_cycles']}")
                 print(f"PROFILE {name} cycles_p50/max " + " ".join(fields))
-        print("PROFILE_SCOPE separate instrumented replay; overlapping cycles, not additive graph time")
+        print("PROFILE_SCOPE separate instrumented replay; producer=index producer (not full LI); overlapping cycles, not additive graph time")
     print("DECISION " + ("retest_candidates="+",".join(candidates) if candidates else "keep_original_fused"))
     print("NOTE positive delta=more work/bytes; useful_pre includes all prefetch windows; no completion-overlap claim")
     if "reverse-window-fast" in cases:

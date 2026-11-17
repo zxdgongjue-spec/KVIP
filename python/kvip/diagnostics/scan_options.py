@@ -1,6 +1,6 @@
 """Independent URMA scan-order/admission experiment; no graph-route changes."""
 
-OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill", "compact_out_of_place", "rolling_reuse_seed", "rolling_fast_path")
+OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill", "compact_out_of_place", "rolling_reuse_seed", "rolling_fast_path", "rolling_sparse")
 DEFAULT_VARIANTS = ("forward", "reverse", "forward-wide", "reverse-wide", "forward-end")
 VARIANTS = {name: ("reverse_cold",) if name.startswith("reverse") else () for name in DEFAULT_VARIANTS}
 ROLLING_VARIANTS = ("forward", "reverse", "reverse-roll", "reverse-refilter", "forward-refilter", "forward-end")
@@ -70,6 +70,15 @@ FAST_VARIANTS = ("forward", "reverse", "reverse-window-in", "reverse-window-reus
 VARIANTS["reverse-window-fast"] = VARIANTS["reverse-window-reuse"] + ("rolling_fast_path",)
 
 
+SPARSE_VARIANTS = ("forward", "reverse", "reverse-window-fast", "reverse-sparse",
+                   "reverse-sparse-ref", "reverse-end", "forward-end")
+VARIANTS["reverse-sparse-ref"] = VARIANTS["reverse-window-fast"] + ("rolling_sparse",)
+VARIANTS["reverse-sparse"] = tuple(
+    flag for flag in VARIANTS["reverse-sparse-ref"]
+    if flag not in ("window_refilter", "refilter_safe")
+)
+
+
 def options_for(name):
     return {key: key in VARIANTS[name] for key in OPTIONS}
 
@@ -101,6 +110,8 @@ def validate_options(options):
         raise ValueError("First-window correction requires compact admission")
     if options["rolling_reuse_seed"] and not options["rolling_compact"]:
         raise ValueError("Seed reuse requires compact window accumulation")
+    if options["rolling_sparse"] and not options["rolling_fast_path"]:
+        raise ValueError("Sparse window counts require packed seed reuse")
     if options["rolling_fast_path"] and not options["rolling_reuse_seed"]:
         raise ValueError("Packed byte accumulation requires seed histogram reuse")
     if options["refilter_safe"] and not options["window_refilter"]:
