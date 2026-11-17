@@ -53,6 +53,20 @@ class IncrementalTopK:
         return [int(token) for token in self.ids if eligible[token] and int(token) not in posted]
 
 
+class WindowTopK(IncrementalTopK):
+    """Fixed window positions, one boundary selection, no tile cutoff work.
+
+    The simulator omits causal/seed exclusions, which the device zero-masks.
+    Retained valid K entries precede those zeros, so even at Kth=0 invalid
+    positions cannot enter K. Scores below the old Kth lose at selection.
+    """
+    def append(self, scores, ids):
+        self.scores, self.ids, self.threshold = select(
+            np.r_[self.scores, scores], np.r_[self.ids, ids], self.k)
+        self.merges += 1
+
+
+
 def verify_rank(scores, ids, k=TOP):
     if len(ids) != k or len(np.unique(ids)) != k:
         raise AssertionError("Duplicate or missing TopK IDs")
@@ -61,9 +75,10 @@ def verify_rank(scores, ids, k=TOP):
         raise AssertionError("Incremental selection lost an exact TopK rank")
 
 
-def simulate(scores, seed, windows, eligible, *, k=TOP, budget=512, window_budget=64):
+def simulate(scores, seed, windows, eligible, *, k=TOP, budget=512, window_budget=64, window_staging=False):
     """Q4 union, immutable window lists, retained unsubmitted entries, final repair."""
-    keepers = [IncrementalTopK(s[seed[q]], seed[q], k=k) for q, s in enumerate(scores)]
+    keeper_type = WindowTopK if window_staging else IncrementalTopK
+    keepers = [keeper_type(s[seed[q]], seed[q], k=k) for q, s in enumerate(scores)]
     seen = [set(map(int, seed[q])) for q in range(len(scores))]
     posted = set()
     thresholds, publication = [], []
@@ -198,6 +213,7 @@ def verify(torch, bundle, archive):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--snapshot", type=Path, required=True)
+    parser.add_argument("--window-staging", action="store_true")
     args = parser.parse_args()
     from kvip.diagnostics.archive import TensorArchive
     from kvip.diagnostics.recent_threshold import recent_positions
@@ -211,12 +227,12 @@ def main():
             valid = [scores[row, q, :int(ends[row, q])] for q in range(4)]
             seed = [recent_positions(g["resident"], bounds[row], len(s)) for s in valid]
             windows = scan_windows(g["history"], g["resident"], ends[row], reverse)
-            result = simulate(valid, seed, windows, eligibility(archive, row))
+            result = simulate(valid, seed, windows, eligibility(archive, row), window_staging=args.window_staging)
             assert result["total"] == len(result["selected"]) + result["waste"]
             assert result["useful"] + result["repair"] == len(result["selected"])
             merges += result["merges"]
             compacted += result["compacted"]
-        print(f"CPU_INCREMENTAL {'reverse' if reverse else 'forward'} PASS queries={g['batch']*4} cold_windows=8 exact_score_ranks=YES retry_and_traffic_identity=YES timing=NOT_SIMULATED", flush=True)
+        print(f"CPU_INCREMENTAL {'reverse' if reverse else 'forward'} PASS queries={g['batch']*4} window_staging={args.window_staging} cold_windows=8 exact_score_ranks=YES retry_and_traffic_identity=YES timing=NOT_SIMULATED", flush=True)
 
 
 if __name__ == "__main__":

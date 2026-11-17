@@ -42,7 +42,11 @@ def report(cases, order):
         g = gain(t, original)
         print(f"{name:23} {t['mean_us']:8.3f} {t['p50_us']:8.3f} {g['mean_us']:10.2f} {g['p50_us']:9.2f} "
               f"{useful_prefetch(case):10.1f} {b['repair']/2**20:10.4f} {b['waste']/2**20:9.4f} {b['total']/2**20:9.4f}")
-    if "reverse-incremental" in cases:
+    if "reverse-inc-register" in cases:
+        pairs = (("reverse-incremental", "reverse-inc-window"),
+                 ("reverse-inc-window", "reverse-inc-register"),
+                 ("forward", "reverse-inc-register"), ("reverse", "reverse-inc-register"))
+    elif "reverse-incremental" in cases:
         pairs = (("forward", "reverse-incremental"), ("reverse", "reverse-incremental"))
     elif "reverse-boundary" in cases:
         pairs = (("reverse", "reverse-window-fast"),
@@ -91,7 +95,7 @@ def report(cases, order):
     samples = cases["forward"]["reads_samples"]
     cold, selected = (mean(s[k] for s in samples) for k in ("cold_demand", "selected_unique"))
     if "reverse-incremental" in cases:
-        for name in ("forward", "reverse", "reverse-incremental"):
+        for name in (n for n in order if not n.endswith("-end")):
             case = cases[name]
             selected = mean(r["selected_unique"] for r in case["reads_samples"])
             cold = mean(r["cold_demand"] for r in case["reads_samples"])

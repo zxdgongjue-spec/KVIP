@@ -206,6 +206,9 @@ def create_fused(
                 raise ValueError("Rolling experiment requires every query to use the resident+recent exact-Kth seed")
             if build_options.get("incremental_topk") and (rounds != 9 or r != 16384 or g["heads"] != 32):
                 raise ValueError("Incremental selection requires resident16384, H32 and eight cold windows")
+            if build_options.get("incremental_window") and (
+                    h % 128 or ((h-r)//128+7)//8*128 > 16384):
+                raise ValueError("Incremental window staging requires aligned history and <=16384 positions per window")
         ends = archive.array("pre.query_ends").reshape(b, 4).min(axis=1)
         if ((ends // 2048) * 2048 <= ((r + 2047) // 2048) * 2048).any():
             raise ValueError("Snapshot has no full causal cold blocks to reverse")

@@ -1,6 +1,6 @@
 """Independent URMA scan-order/admission experiment; no graph-route changes."""
 
-OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill", "compact_out_of_place", "rolling_reuse_seed", "rolling_fast_path", "rolling_sparse", "rolling_boundary", "incremental_topk")
+OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill", "compact_out_of_place", "rolling_reuse_seed", "rolling_fast_path", "rolling_sparse", "rolling_boundary", "incremental_topk", "incremental_window", "incremental_register")
 DEFAULT_VARIANTS = ("forward", "reverse", "forward-wide", "reverse-wide", "forward-end")
 VARIANTS = {name: ("reverse_cold",) if name.startswith("reverse") else () for name in DEFAULT_VARIANTS}
 ROLLING_VARIANTS = ("forward", "reverse", "reverse-roll", "reverse-refilter", "forward-refilter", "forward-end")
@@ -92,6 +92,14 @@ INCREMENTAL_VARIANTS = ("forward", "reverse", "reverse-incremental", "reverse-en
 VARIANTS["reverse-incremental"] = ("reverse_cold", "incremental_topk")
 
 
+INCREMENTAL_WINDOW_VARIANTS = (
+    "forward", "reverse", "reverse-incremental", "reverse-inc-window",
+    "reverse-inc-register", "reverse-end", "forward-end",
+)
+VARIANTS["reverse-inc-window"] = ("reverse_cold", "incremental_topk", "incremental_window")
+VARIANTS["reverse-inc-register"] = VARIANTS["reverse-inc-window"] + ("incremental_register",)
+
+
 def options_for(name):
     return {key: key in VARIANTS[name] for key in OPTIONS}
 
@@ -113,6 +121,10 @@ def validate_options(options):
         raise ValueError("Scan experiment options do not match the selected native interface")
     if any(type(value) is not bool for value in options.values()):
         raise ValueError("Scan build options must be bool")
+    if options["incremental_window"] and not options["incremental_topk"]:
+        raise ValueError("Window staging requires incremental TopK")
+    if options["incremental_register"] and not options["incremental_window"]:
+        raise ValueError("Register selection requires incremental window staging")
     if options["incremental_topk"] and (options["rolling_threshold"] or options["window_refilter"]):
         raise ValueError("Incremental TopK replaces rolling/refilter")
     if (options["window_refilter"] or options["rolling_batched"] or options["rolling_windowed"]) and not options["rolling_threshold"]:

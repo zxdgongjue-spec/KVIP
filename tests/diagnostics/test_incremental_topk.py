@@ -4,9 +4,10 @@ import pytest
 from kvip.diagnostics.incremental_topk import IncrementalTopK, simulate, verify_rank
 
 
+@pytest.mark.parametrize("window_staging", [False, True])
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("distribution", ["uniform", "ties", "zero", "ascending", "descending"])
-def test_prefix_and_final_ranks(reverse, distribution):
+def test_prefix_and_final_ranks(reverse, distribution, window_staging):
     rng = np.random.default_rng(42)
     n, k = 8193, 128
     values = rng.integers(0, 65536 if distribution == "uniform" else 8, (4, n), dtype=np.uint16)
@@ -18,7 +19,7 @@ def test_prefix_and_final_ranks(reverse, distribution):
     seed = [np.r_[np.arange(512), np.arange(n-260, len(s))] for s in scores]
     order = np.arange(512, n)[::-1 if reverse else 1]
     result = simulate(scores, seed, np.array_split(order, 8), np.arange(n) % 3 != 0,
-                      k=k, budget=31, window_budget=7)
+                      k=k, budget=31, window_budget=7, window_staging=window_staging)
     assert result["total"] == len(result["selected"]) + result["waste"]
     assert result["useful"] + result["repair"] == len(result["selected"])
     flat = sum(result["publication"], [])
@@ -168,3 +169,40 @@ def test_full_bs16_q4_history_131584_with_eight_cold_windows():
         assert result["total"] == len(result["selected"]) + result["waste"]
         assert result["prefetch"] <= 512
         assert len(result["publication"]) == 9
+
+
+def test_window_staging_keeps_valid_zero_ties_before_rejected_positions():
+    from kvip.diagnostics.incremental_topk import WindowTopK
+    for positive in (0, 1, 17, 127, 128, 257):
+        values = np.zeros(4096, dtype=np.uint16)
+        values[1024:1024+positive] = 65535
+        state = WindowTopK(values[:256], np.arange(256), k=128)
+        state.append(values[256:], np.arange(256, 4096))
+        verify_rank(values, state.ids, 128)
+        assert np.count_nonzero(state.ids >= 256) == min(positive,128)
+
+
+def test_window_report_requires_each_incremental_oracle(tmp_path, capsys):
+    import json
+    from kvip.diagnostics import scan_report
+    from kvip.diagnostics.scan_options import INCREMENTAL_WINDOW_VARIANTS, options_for
+    cases = {}
+    for name in INCREMENTAL_WINDOW_VARIANTS:
+        cases[name] = dict(
+            geometry=dict(rounds=9, token_bytes=656), timing=dict(mean_us=100,p50_us=99),
+            reads_samples=[dict(prefetch=5,unused_prefetch=1,unused_prefetch_bytes=656,
+                final=3,bytes=5248,useful_transfer_bytes=4592,cold_demand=6,selected_unique=60)],
+            selection_comparison=dict(total_replacements=0))
+        if options_for(name)["incremental_topk"]:
+            cases[name]["incremental_check"]=dict(status="exact_prefix_ranks_and_pending")
+    data = dict(status="pass", execution_order=list(INCREMENTAL_WINDOW_VARIANTS), cases=cases)
+    path = tmp_path / "result.json"
+    path.write_text(json.dumps(data))
+    scan_report.report(path, require_incremental_window=True)
+    output = capsys.readouterr().out
+    assert "INCREMENT reverse-incremental->reverse-inc-window" in output
+    assert "INCREMENT reverse-inc-window->reverse-inc-register" in output
+    del cases["reverse-inc-register"]["incremental_check"]
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError,match="reverse-inc-register.*oracle"):
+        scan_report.report(path, require_incremental_window=True)
