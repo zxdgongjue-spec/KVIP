@@ -556,10 +556,11 @@ inline void ScanPartial(__ubuf__ uint32_t* input,__ubuf__ uint32_t* ids,__ubuf__
     if(stop<span)asc_atomic_min(cfg+48,stop);
 }
 // LIDU pattern: gather only candidate map entries, then SIMD squeeze misses.
+// VF_CALL invokes a function pointer; every argument must be explicit.
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void GatherCandidateMap(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* slots,
-    __gm__ uint32_t* map,uint32_t count, __gm__ uint32_t* scores = nullptr,
-    __ubuf__ uint32_t* cfg = nullptr, uint32_t history = 0) {
+    __gm__ uint32_t* map,uint32_t count, __gm__ uint32_t* scores,
+    __ubuf__ uint32_t* cfg, uint32_t history) {
     for(uint32_t i=threadIdx.x;i<count;i+=256) {
         const uint32_t token=ids[i]; uint32_t slot=asc_ldcg(map+token);
 #if KVIP_WINDOW_REFILTER
@@ -794,7 +795,9 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
             SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
             Simt::VF_CALL<GatherCandidateMap>(Simt::Dim3{256,1,1},
                 reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),map,candidates);
+                reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),map,candidates,
+                static_cast<__gm__ uint32_t*>(nullptr),
+                reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),rt_history);
             PipeBarrier<PIPE_V>();
             CompactMisses(reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),

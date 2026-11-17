@@ -372,7 +372,7 @@ int main(){
  }
 #endif
  // No rolling state is the unchanged original map gather.
- for(threadIdx.x=0;threadIdx.x<256;++threadIdx.x)GatherCandidateMap(ids.data(),slots.data(),map.data(),ids.size());
+ for(threadIdx.x=0;threadIdx.x<256;++threadIdx.x)GatherCandidateMap(ids.data(),slots.data(),map.data(),ids.size(),nullptr,cfg.data(),h);
  for(unsigned i=0;i<ids.size();++i)assert(slots[i]==map[ids[i]]);
 }
 '''
