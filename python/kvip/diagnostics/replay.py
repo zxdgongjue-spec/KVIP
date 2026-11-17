@@ -63,6 +63,10 @@ def arguments(argv=None):
                    help="Untimed light-low replay: one captured graph, quotas 0/512/0, restore before each")
     p.add_argument("--check-auto-route", action="store_true",
                    help="Untimed device-feedback lifecycle checks on the auto variant")
+    p.add_argument("--post-index-wait-first", action="store_true",
+                   help="Offline same-binary control: drain CQ before the complete Index update")
+    p.add_argument("--calibrate-counter", action="store_true",
+                   help="After headline timing, calibrate device cycles with three independent long graph events")
     p.add_argument("--profile-dir", type=Path, help="Independent system traces, outside headline timing")
     p.add_argument("--profile-metrics", nargs="+", choices=PROFILE_METRICS, default=None)
     p.add_argument(
@@ -116,6 +120,12 @@ def arguments(argv=None):
         p.error("check-auto-route requires post-threshold with an automatic route variant")
     if auto and (args.profile_dir or args.topk_probe):
         p.error("Auto routing currently excludes profile/topk-probe")
+    if args.post_index_wait_first and (
+        args.study != "post-threshold" or args.pipeline_variants != ["auto-post-index"]
+    ):
+        p.error("post-index-wait-first requires only the auto-post-index variant")
+    if args.calibrate_counter and (args.mode != "fused" or not args.diagnostic_replays):
+        p.error("calibrate-counter requires fused mode and separate diagnostic-replays")
     if args.study in ("threshold-only", "seed-ub", "local-victims", "register-kth", "overlap-victims") and (
         args.transport != "urma" or args.mode != "fused"
     ):

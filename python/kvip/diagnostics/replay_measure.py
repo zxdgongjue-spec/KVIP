@@ -260,16 +260,26 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
             from kvip.diagnostics.post_index_profile import decode_post_index
 
             diagnostic = bool(getattr(bundle, "post_index_diagnostics", False))
+            low_active = early_threshold_skipped(bundle.tuning)
             detail = (cpu_array(torch, bundle.forward.times)[bundle.forward.batch * 256:].reshape(-1, 32)
-                      if diagnostic else None)
+                      if diagnostic and low_active else None)
+            from kvip.diagnostics.post_index_profile import INDEX_DETAIL_SAME_VF_MAGIC
+
+            events = (tuple(cpu_array(torch, value) for value in
+                            (bundle.forward.events_src, bundle.forward.events_dst))
+                      if detail is not None and np.any(detail[:, 2] == INDEX_DETAIL_SAME_VF_MAGIC) else None)
             reads["post_index"] = decode_post_index(
                 cpu_array(torch, bundle.forward.post_index),
-                active=early_threshold_skipped(bundle.tuning),
+                active=low_active,
                 diagnostic=diagnostic,
                 index_detail=detail,
+                events=events,
             )
             if reads["post_index"]["active"] and reads["post_index"]["submitted_requests"] != reads["final"]:
                 raise AssertionError("Post-Index per-core request count differs from verified final Get")
+            if reads["post_index"]["active"] and reads["post_index"]["wait_first"] != bool(
+                    getattr(bundle.forward, "post_index_wait_first", False)):
+                raise AssertionError("Post-Index device execution order differs from the configured control")
         return reads
 
     def verify():
@@ -525,6 +535,12 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
             samples=diagnostic_samples,
             note="Separate instrumented replay with barriers/cache operations; intervals overlap and cannot be summed into graph latency or converted to microseconds without a measured clock.",
         )
+        if getattr(args, "calibrate_counter", False):
+            from kvip.diagnostics.counter_clock import calibrate_counter
+
+            phase(retained, "counter_calibration")
+            result["native_diagnostics"]["counter_calibration"] = calibrate_counter(
+                torch, library, bundle.rotating.device, stream)
     if auto is not None and getattr(args, "check_auto_route", False):
         phase(retained, "auto_route_lifecycle")
         result["auto_route"]["lifecycle"] = check_auto_route(
@@ -654,6 +670,12 @@ def measure_case(args, archive, context, retained):
         case_retained["buffers"] = buffer_addresses(bundle)
         retained["buffers"] = case_retained["buffers"]
         retained["buffers_variant"] = retained["progress"].get("variant")
+        if getattr(args, "post_index_wait_first", False):
+            feature = getattr(bundle.rotating.library, "kvip_post_index_order_control", None)
+            if not bundle.tuning.get("low_miss_post_index") or feature is None or feature() != 1:
+                raise ValueError("Post-Index order control requires a capable loaded production library")
+            bundle.forward.post_index_wait_first = True
+            bundle.forward.set_options()
         phase(retained, "prepare_fused_state")
         prepare_fused_state(bundle, archive, restored, torch, device, args.transport)
         if bundle.tuning.get("auto_route"):
@@ -763,6 +785,7 @@ def measure_case(args, archive, context, retained):
             else "Current URMA CPU allocation; page policy is supplied to the local CPU service, physical coverage is not measured"
         ),
         graph_backend="torch.npu.NPUGraph" if args.mode == "serial" else "kvaf.AclGraph",
+        post_index_wait_first=bool(getattr(args, "post_index_wait_first", False)),
         selection_comparison=bundle.selection_comparison,
         demand_accounting=DEMAND_ACCOUNTING,
         representation=(

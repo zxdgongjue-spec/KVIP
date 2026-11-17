@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from kvip.diagnostics.post_index_profile import INDEX_DETAIL_MAGIC, decode_post_index
+from kvip.diagnostics.post_index_profile import INDEX_DETAIL_MAGIC, INDEX_DETAIL_SAME_VF_MAGIC, decode_post_index
 from kvip.diagnostics.native_profile import decode_profile
 
 
@@ -123,7 +123,7 @@ def test_rejects_errors_or_misleading_phase_data(fault):
     elif fault == "incomplete":
         raw[4, 15] -= 1
     elif fault == "bad-fallback":
-        raw[:, 2] = 2
+        raw[:, 2] = 4
     elif fault == "mixed-fallback":
         raw[0, 2] = 1
     elif fault == "timed-ticks":
@@ -134,6 +134,70 @@ def test_rejects_errors_or_misleading_phase_data(fault):
         raw[0, 9] = 0
     with pytest.raises(ValueError):
         decode_post_index(raw, active=True, diagnostic=diagnostic)
+
+
+def test_wait_first_control_masks_order_bit_and_separates_cq_barrier():
+    raw = data(True)
+    raw[:, 2] = 2
+    raw[:, 9] = 158
+    detail = detail_data(raw)
+    detail[:, 7] = 158
+    result = decode_post_index(raw, active=True, diagnostic=True, index_detail=detail)
+    assert result["wait_first"] and not result["fallback"] and result["fallback_cores"] == 0
+    assert result["phase_policy"] == "post_then_cq_then_index"
+    spans = result["index_work"]["per_core_cycles"]
+    assert spans["cq_wait"]["p50"] == 3
+    assert spans["cq_barrier"]["p50"] == 2
+    assert spans["index_setup"]["p50"] == 0
+    assert result["index_work"]["global_span_cycles"]["index_work"] == 15
+    detail[0, 7] = 161
+    with pytest.raises(ValueError, match="timestamps"):
+        decode_post_index(raw, active=True, diagnostic=True, index_detail=detail)
+
+
+def pix2_data():
+    raw = data(True)
+    raw[:, 11] = np.arange(64) % 16
+    source = np.arange(16*10240, dtype=np.int32).reshape(16, 10240)
+    destination = source.copy()
+    destination[:, 2048::2] += 1
+    detail = detail_data(raw)
+    detail[:, 2] = INDEX_DETAIL_SAME_VF_MAGIC
+    detail[:, 8] = detail[:, 10] = 0
+    total = sum(map(int, raw[:, 1]))
+    detail[:, 9] = np.diff([total*core//64 for core in range(65)])
+    return raw, detail, (source, destination)
+
+
+def test_pix2_counts_after_replay_without_instrumenting_index_vf():
+    raw, detail, events = pix2_data()
+    result = decode_post_index(raw, active=True, diagnostic=True, index_detail=detail, events=events)["index_work"]
+    assert result["abi"] == "PIX2" and result["index_implementation"] == "headline_same_VF"
+    assert result["count_source"] == "post_replay_CPU_event_readback"
+    assert result["moved_tuples"]["total"] == sum(range(64)) // 2
+    assert result["logical_index_rw_bytes"] == result["moved_tuples"]["total"]*592
+    assert decode_post_index(raw, active=False, diagnostic=True, index_detail=object(), events=object())["status"] == "not_entered"
+
+
+@pytest.mark.parametrize("fault", ["missing", "dtype", "shape", "row", "capacity", "assigned", "mixed"])
+def test_pix2_fails_closed_if_cpu_counts_do_not_match_device_ranges(fault):
+    raw, detail, events = pix2_data()
+    if fault == "missing":
+        events = None
+    elif fault == "dtype":
+        events = (events[0].astype(np.int64), events[1])
+    elif fault == "shape":
+        events = (events[0][:, :100], events[1][:, :100])
+    elif fault == "row":
+        raw[0, 11] = 1
+    elif fault == "capacity":
+        raw[0, 1] = raw[0, 15] = 8193
+    elif fault == "assigned":
+        detail[0, 9] += 1
+    elif fault == "mixed":
+        detail[0, 2] = INDEX_DETAIL_MAGIC
+    with pytest.raises(ValueError):
+        decode_post_index(raw, active=True, diagnostic=True, index_detail=detail, events=events)
 
 
 def test_new_low_tail_cannot_reinterpret_old_consumer_or_get_timestamps():
