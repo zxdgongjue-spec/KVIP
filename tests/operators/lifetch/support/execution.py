@@ -3367,9 +3367,40 @@ class FusedReplayState:
         """Check completion before using outputs; then full-byte KV identity."""
         status = self.update.status.cpu().numpy()
         if np.any(status):
-            detail = dict(completion=status.tolist(),
+            flags = self.forward.flags.cpu().numpy()
+            workers = self.forward.worker_status.cpu().numpy()
+            sources = self.forward.events_src.cpu().numpy()
+            destinations = self.forward.events_dst.cpu().numpy()
+            event_checks = []
+            for row in range(self.batch):
+                consumed = 0
+                for phase in range(5):
+                    publication = (12 + phase - 1 if self.forward.resolver_cores == 3 and phase else phase)
+                    count = int(flags[row, publication, 1])
+                    begin = 2048 + consumed if phase else 0
+                    src = sources[row, begin:begin + count]
+                    dst = destinations[row, begin:begin + count]
+                    bad = (src < 0) | (src >= self.history) | (dst < 0) | (dst >= self.resident)
+                    duplicates = []
+                    for offset in range(0, count, 512):
+                        for name, values in (('source', src), ('destination', dst)):
+                            unique, counts = np.unique(values[offset:offset + 512], return_counts=True)
+                            repeated = unique[counts > 1]
+                            if len(repeated):
+                                duplicates.append(dict(chunk=offset // 512, field=name, values=repeated[:8].tolist()))
+                    event_checks.append(dict(request=row, phase=phase, count=count,
+                                             invalid=int(bad.sum()), duplicates=duplicates))
+                    if phase:
+                        consumed += count
+            detail = dict(completion=status.tolist(), index_update=workers[:, :12].tolist(),
+                          flags=flags[:, :, :3].tolist(), event_checks=event_checks,
                           resolver=self.rotating.row_status.cpu().tolist(),
                           final_posts=self.rotating.final_posts.cpu().tolist())
+            if hasattr(self, 'failure_directory'):
+                np.savez_compressed(self.failure_directory / 'completion_failure.npz',
+                                    flags=flags, worker_status=workers, sources=sources,
+                                    destinations=destinations, completion=status)
+                atomic_json(self.failure_directory / 'completion_failure.json', detail)
             print('REPLAY COMPLETION AUDIT: ' + json.dumps(detail), flush=True)
             raise RuntimeError(f'Replay Index/Fetch completion failed: {status.tolist()}')
         ids = self.update.logical_output.cpu().numpy().reshape(self.batch, 4, 2048)
@@ -3627,6 +3658,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
                 prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024))
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
+        if fused:
+            state.failure_directory = directory
         replay_stage('binding and initial inputs ready')
         checks = CorrectnessRecorder()
         def validate(inputs):
