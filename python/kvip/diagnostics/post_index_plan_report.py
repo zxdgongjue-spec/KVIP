@@ -79,9 +79,18 @@ def summarize(directory, group):
               "approximate=true headline_excluded=true")
         for number, sample in enumerate(diagnostics.get("samples", []), 1):
             phase = sample.get("reads", {}).get("post_index", {})
+            metrics = sample.get("metrics", {})
+            init_li = " ".join(
+                f"{name}={metrics[name]['median_cycles']:g}/{metrics[name]['max_cycles']}"
+                for name in ("init_total", "init_route", "init_fill", "init_tail_setup", "init_finish",
+                             "li_final_mapping_wait", "li_final_classification")
+                if metrics.get(name, {}).get("status") == "available"
+            )
+            if init_li:
+                print(f"INIT_LI {role} sample={number} cycles_p50/max {init_li} "
+                      "overlapping_not_additive=true headline_excluded=true")
             if not phase.get("active"):
                 print(f"PHASE_END {role} sample={number} LOW_not_entered=true")
-                metrics = sample.get("metrics", {})
                 fields = []
                 for name in ("index_apply_total", "index_wait_and_control",
                              "fetch_native_get", "cq_drain", "final_index_and_query_join"):
@@ -115,7 +124,9 @@ def summarize(directory, group):
                  for candidate in candidate_times for serial in serial_times)
     goal = all(all(c <= .65 * s for c, s in zip(candidate, serial))
                for candidate in candidate_times for serial in serial_times)
-    print("CHECK correctness=PASS lifecycle=PASS prediction_recovery=PASS identical_low_traffic=PASS")
+    traffic_status = "PASS" if _low_traffic(reference) else "not_applicable"
+    print("CHECK correctness=PASS lifecycle=PASS prediction_recovery=PASS "
+          f"identical_low_traffic={traffic_status}")
     print(f"OBSERVED all_brackets_mean_and_p50_parity={str(parity).lower()} reduction_ge35pct={str(goal).lower()}")
     print("SCOPE snapshot_restored_each_step=true device_learning_in_timing=true phase_ends_not_additive=true")
     print(f"RESULT_END G{group}")

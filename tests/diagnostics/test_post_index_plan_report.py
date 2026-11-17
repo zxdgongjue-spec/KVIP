@@ -57,6 +57,51 @@ def test_report_prints_existing_finalizer_ticks_without_adding_them_to_headline(
     assert "STEADY_mean/p50=305.000/305.000" in output
 
 
+def test_existing_init_li_metrics_are_reported_without_new_measurements(tmp_path, capsys):
+    rows = inputs()
+    metrics = dict(
+        init_total=dict(status="available", median_cycles=19000., max_cycles=21000),
+        init_route=dict(status="available", median_cycles=10000., max_cycles=11500),
+        init_fill=dict(status="unavailable", median_cycles=None, max_cycles=None),
+        li_final_classification=dict(status="available", median_cycles=9000.5, max_cycles=11000),
+    )
+    for sample in rows["after"]["native_diagnostics"]["samples"]:
+        sample["metrics"] = metrics
+    write(tmp_path, rows)
+    summarize(tmp_path, 2)
+    output = capsys.readouterr().out
+    line = next(line for line in output.splitlines() if line.startswith("INIT_LI after sample=1"))
+    assert "init_total=19000/21000" in line and "init_route=10000/11500" in line
+    assert "li_final_classification=9000.5/11000" in line and "init_fill=" not in line
+    assert "overlapping_not_additive=true headline_excluded=true" in line
+    assert "STEADY_mean/p50=305.000/305.000" in output
+    assert "identical_low_traffic=PASS" in output
+
+
+def test_all_high_does_not_claim_empty_low_traffic_pass(tmp_path, capsys):
+    rows = inputs()
+    for role, item in rows.items():
+        if role.startswith("serial"):
+            continue
+        item["auto_route"].update(low_steps=0, high_steps=3)
+        for observed, reads in zip(item["auto_route"]["samples"], item["reads_samples"]):
+            observed["mode"] = "high"
+            reads["post_index"] = dict(status="not_entered", active=False)
+        for sample in item["native_diagnostics"]["samples"]:
+            sample["reads"]["post_index"] = dict(status="not_entered", active=False)
+    write(tmp_path, rows)
+    summarize(tmp_path, 2)
+    output = capsys.readouterr().out
+    assert "identical_low_traffic=not_applicable" in output
+    assert "identical_low_traffic=PASS" not in output
+    assert "correctness=PASS lifecycle=PASS prediction_recovery=PASS" in output
+    # HIGH-only measurement must still enforce the device lifecycle contract.
+    rows["after"]["auto_route"]["lifecycle"]["graph_captures"] = 2
+    write(tmp_path, rows)
+    with pytest.raises(ValueError):
+        summarize(tmp_path, 2)
+
+
 @pytest.mark.parametrize("fault", ["source", "binary", "missing-binary", "traffic", "lifecycle", "weak-serial",
                                   "ordered", "wait-first", "missing-diagnostics", "clock"])
 def test_refuse_false_success(tmp_path, fault):
