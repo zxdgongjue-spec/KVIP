@@ -550,6 +550,42 @@ def aggregate_diagnostic_rows(rows, identity_columns):
     return result
 
 
+def resolver_phase_rows(timeline):
+    """Partition each resolver core's existing stamps; never add other cores."""
+    rows = []
+    for core in timeline['cores']:
+        if not core['role'].startswith('resolver'):
+            continue
+        buckets = [0.] * 10
+        for stage in core['stages']:
+            name = stage['name']
+            if name in ('input_and_bitmap', 'initialize'):
+                index = 0
+            elif name.startswith('Q') and name.endswith('.resolve'):
+                index = 1
+            elif name.startswith('Q') and name.endswith(('.output', '.descriptor', '.publish')):
+                index = 2
+            elif name in ('prefetch_CQ_join', 'prefetch_completion_join'):
+                index = 3
+            elif name == 'wait.index_update':
+                index = 4
+            elif name == 'wait.prefetch_ready':
+                index = 5
+            elif name.startswith('wait.Q') and name.endswith('_fetch'):
+                index = 6
+            elif name in ('prefetch_residency', 'residency'):
+                index = 7
+            elif name == 'status':
+                index = 8
+            else:
+                # Includes bookkeeping between stamps; not assumed idle or CQ wait.
+                index = 9
+            buckets[index] += stage['duration_us']
+        rows.append([core['block'], *buckets, core['duration_us'],
+                     sum(buckets) - core['duration_us']])
+    return rows
+
+
 def level_two_tables(result):
     """Same-replay tables, with no summed-overlap or synthetic decode trend."""
     lines = ['TIME BREAKDOWN | us; graph and stages below share each profiled replay. Detailed stamps OFF. The final performance table is unprofiled.',
@@ -620,6 +656,10 @@ def level_two_tables(result):
                                        stage['end_cycles'] - stage['start_cycles']
                                        if 'end_cycles' in stage and 'start_cycles' in stage else None])
                 emit(lines, 'Active cores', ['Block', 'Role', 'Start', 'End', 'Duration', 'Last'], rows, 2)
+                emit(lines, 'Resolver phase breakdown (us; same core/replay; Other includes unstamped bookkeeping)',
+                     ['Block', 'Input/init', 'Q1-Q4 resolve', 'Q output/publish', 'Prefetch completion',
+                      'Wait update', 'Wait prefetch flag', 'Wait Q Fetch', 'Residency', 'Status',
+                      'Other/control', 'Total', 'Delta'], resolver_phase_rows(timeline), 1)
                 groups = sample.get('final_get_bandwidth', {}).get('groups', [])
                 rates = []
                 for group in groups:
