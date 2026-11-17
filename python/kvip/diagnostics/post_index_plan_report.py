@@ -81,6 +81,16 @@ def summarize(directory, group):
             phase = sample.get("reads", {}).get("post_index", {})
             if not phase.get("active"):
                 print(f"PHASE_END {role} sample={number} LOW_not_entered=true")
+                metrics = sample.get("metrics", {})
+                fields = []
+                for name in ("index_apply_total", "index_wait_and_control",
+                             "fetch_native_get", "cq_drain", "final_index_and_query_join"):
+                    metric = metrics.get(name, {})
+                    if metric.get("status") == "available":
+                        fields.append(f"{name}={metric['median_cycles']:g}/{metric['max_cycles']}")
+                if fields:
+                    print(f"HIGH_DIAGNOSTIC {role} sample={number} cycles_p50/max "
+                          + " ".join(fields) + " overlapping_not_additive=true")
                 continue
             require(diagnostics.get("included_in_timing") is False, f"{role}: diagnostics entered headline")
             ends = phase.get("phase_end_from_first_begin_cycles", {})
