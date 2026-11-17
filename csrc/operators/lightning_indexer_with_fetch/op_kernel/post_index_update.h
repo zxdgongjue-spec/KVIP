@@ -55,37 +55,47 @@ inline void ApplyPlan(
     uint32_t moved = 0, row = batch, rowBegin = 0, rowEnd = 0, owner = 0;
     uint64_t rowError = 0;
     for (uint32_t i = first + threadIdx.x / 16; i < end; i += kThreads / 16) {
-        if (i >= rowEnd) {
-            // First locate a row by binary search; later events only advance
-            // across boundaries (including empty requests). Cache both bounds
-            // so an event never reloads the row's prefix just to get its ID.
-            if (row == batch) {
-                uint32_t lo = 0, hi = batch;
-                while (lo < hi) {
-                    uint32_t mid = (lo + hi) / 2;
-                    if (i >= asc_ldcg(prefix + mid + 1)) lo = mid + 1;
-                    else hi = mid;
+        uint32_t src = 0, dst = 0;
+        if (!field) {
+            if (i >= rowEnd) {
+                // First locate a row by binary search; later events only advance
+                // across boundaries (including empty requests). Cache both bounds
+                // so an event never reloads the row's prefix just to get its ID.
+                if (row == batch) {
+                    uint32_t lo = 0, hi = batch;
+                    while (lo < hi) {
+                        uint32_t mid = (lo + hi) / 2;
+                        if (i >= asc_ldcg(prefix + mid + 1)) lo = mid + 1;
+                        else hi = mid;
+                    }
+                    row = lo;
+                } else {
+                    while (row < batch && i >= asc_ldcg(prefix + row + 1)) ++row;
                 }
-                row = lo;
-            } else {
-                while (row < batch && i >= asc_ldcg(prefix + row + 1)) ++row;
+                rowBegin = asc_ldcg(prefix + row);
+                rowEnd = asc_ldcg(prefix + row + 1);
+                owner = rowOwners ? asc_ldcg(rowOwners + row) : row;
+                rowError = 0;
+                // A failed Post cancels this request's swaps, even if this AIV
+                // originally posted for a different request. All posted queues
+                // are still drained by the scalar caller after the Index barrier.
+                for (uint32_t peer = row; peer < cores; peer += batch)
+                    rowError |= asc_ldcg(records + uint64_t(peer) * 16);
             }
-            rowBegin = asc_ldcg(prefix + row);
-            rowEnd = asc_ldcg(prefix + row + 1);
-            owner = rowOwners ? asc_ldcg(rowOwners + row) : row;
-            rowError = 0;
-            // A failed Post cancels this request's swaps, even if this AIV
-            // originally posted for a different request. All posted queues
-            // are still drained by the scalar caller after the Index barrier.
-            for (uint32_t peer = row; peer < cores; peer += batch)
-                rowError |= asc_ldcg(records + uint64_t(peer) * 16);
+            if (!rowError) {
+                const uint64_t event = uint64_t(row) * eventStride + eventOffset + i - rowBegin;
+                src = asc_ldcg(sources + event);
+                dst = asc_ldcg(destinations + event);
+            }
         }
-        if (rowError) continue;
-        const uint64_t event = uint64_t(row) * eventStride + eventOffset + i - rowBegin;
-        uint32_t src = asc_ldcg(sources + event), dst = asc_ldcg(destinations + event);
+        // Every active 16-thread group reaches both broadcasts together. Its
+        // lane 0 has classified the event; failed rows use a no-swap sentinel.
+        src = asc_shfl(src, 0, 16);
+        dst = asc_shfl(dst, 0, 16);
         if (src == dst) continue;
-        uint64_t source = (uint64_t(owner) * history + src) * 16 + field;
-        uint64_t destination = (uint64_t(owner) * history + dst) * 16 + field;
+        const uint32_t eventOwner = asc_shfl(owner, 0, 16);
+        uint64_t source = (uint64_t(eventOwner) * history + src) * 16 + field;
+        uint64_t destination = (uint64_t(eventOwner) * history + dst) * 16 + field;
         uint64_t a = asc_ldcg(keys + source), b = asc_ldcg(keys + destination);
         asc_stcg(keys + source, b);
         asc_stcg(keys + destination, a);

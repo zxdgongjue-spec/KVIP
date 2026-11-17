@@ -54,6 +54,17 @@ def test_post_index_workspace_keeps_default_abi_and_graph_pointers(monkeypatch, 
     assert forward.workspace.data_ptr() == workspace_pointer
     assert int.from_bytes(forward.workspace.values[144:152], "little") == pointer
     assert f.library.kvip_lifetch_streaming_forward.call_count == 2
+    # Offline order control survives diagnostic toggles without changing graph
+    # addresses. Ordinary callers retain the original overlap order by default.
+    for wait_first in (False, True, False):
+        forward.post_index_wait_first = wait_first
+        for diagnostics in (True, False):
+            forward.set_options(diagnostics=diagnostics)
+            flags = int.from_bytes(forward.workspace.values[96:100], "little")
+            assert flags == (512 | (1 << 16) | (0x02000000 if wait_first else 0)
+                             | (0x80000000 if diagnostics else 0))
+            assert forward.workspace.data_ptr() == workspace_pointer
+            assert int.from_bytes(forward.workspace.values[144:152], "little") == pointer
 
 
 def test_post_index_requires_every_physical_aiv_to_have_an_exclusive_queue(monkeypatch):

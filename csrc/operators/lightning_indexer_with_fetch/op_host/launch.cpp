@@ -20,6 +20,7 @@ extern "C" uint32_t kvip_low_miss_direct_index() { return KVIP_LOW_MISS_DIRECT_I
 extern "C" uint32_t kvip_low_miss_compact_plan() { return KVIP_LOW_MISS_COMPACT_PLAN; }
 extern "C" uint32_t kvip_low_miss_read_through() { return KVIP_LOW_MISS_READ_THROUGH; }
 extern "C" uint32_t kvip_low_miss_post_index() { return KVIP_LOW_MISS_POST_INDEX; }
+extern "C" uint32_t kvip_post_index_order_control() { return KVIP_LOW_MISS_POST_INDEX; }
 extern "C" uint32_t kvip_init_route_profile() { return 1; }
 extern "C" uint32_t kvip_auto_route() { return KVIP_AUTO_ROUTE; }
 extern "C" uint32_t kvip_prefetch_rank() { return KVIP_PREFETCH_RANK; }

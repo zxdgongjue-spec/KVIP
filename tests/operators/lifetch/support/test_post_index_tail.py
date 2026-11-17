@@ -37,11 +37,42 @@ def test_collective_tail_uses_batch_scheduled_mixed_vector_kernel():
     assert "OwnerRow(ctx" not in tail
     assert "16384 * 4" not in tail
     assert "prefix[i % batch + 1] += uint32_t(records[i].count)" in tail
-    assert "ApplyPlan<false>" in tail and "ApplyPlan<true>" in tail
+    assert "ApplyPlan<false>" in tail
+    assert "Simt::VF_CALL<post_index::ValidatePlan>" not in tail
     # OutputWorker's old diagnostic slots overlap the per-core scratch. Only
     # initialize the new ABI after those writers finish at the first barrier.
-    assert tail.index("OutputWorker(a") < tail.index("SyncAll();") < tail.index("trace[2] = 0x50495831U")
+    assert tail.index("OutputWorker(a") < tail.index("SyncAll();") < tail.index("trace[2] = 0x50495832U")
     assert tail.count("RowError(records,") == 1  # one final join after every CQ
+
+
+def test_cq_control_relocates_one_join_inside_the_same_tail():
+    repo = Path(__file__).resolve().parents[4]
+    tail = (repo / "csrc/operators/lightning_indexer_with_fetch/op_kernel/post_index_tail.h").read_text()
+
+    def body_after(marker):
+        start = tail.index("{", tail.index(marker))
+        depth = 1
+        end = start + 1
+        while depth:
+            depth += (tail[end] == "{") - (tail[end] == "}")
+            end += 1
+        return tail[start + 1:end - 1]
+
+    before = body_after("if (waitFirst)")
+    after = body_after("if (!waitFirst)")
+    for branch in (before, after):
+        assert branch.count("post_index_transport::Wait(transport)") == 1
+        assert branch.count("SyncAll();") == 1
+        assert branch.index("record->error = error") < branch.index("SyncAll();")
+    # Five common barriers plus exactly one relocated CQ barrier. The
+    # offline control stays inside the existing kernel, not a new graph node.
+    assert tail.count("SyncAll();") == 7
+    index = tail.index("Simt::VF_CALL<post_index::ApplyPlan<false>>")
+    assert tail.index("if (waitFirst)") < index < tail.index("if (!waitFirst)")
+    assert tail.index("record->completed = transport.completed", index) < tail.index("if (!waitFirst)")
+    assert tail.index("if (!waitFirst)") < tail.index("RowError(records,")
+    assert "blocking = (records[0].fallback & 1U) != 0" in tail
+    assert "record->fallback = uint64_t(blocking) | (waitFirst ? 2U : 0U)" in tail
 
 
 def test_whole_tail_header_and_q4_pack(tmp_path):
@@ -71,6 +102,9 @@ template<class T>T asc_ldcg(T* p){return *p;}
 template<class T>void asc_stcg(T* p,T value){*p=value;}
 void asc_atomic_or(uint32_t* p,uint32_t value){*p|=value;}
 void asc_atomic_add(uint32_t* p,uint32_t value){*p+=value;}
+// Run below exercises failure paths only, so Index VF is never reached.
+// The separate update model tests the real half-warp broadcast semantics.
+template<class T>T asc_shfl(T value,int,int){return value;}
 enum class HardEvent {V_S};
 template<HardEvent>void SetFlag(uint32_t){}
 template<HardEvent>void WaitFlag(uint32_t){}
@@ -87,7 +121,8 @@ struct TPipe {
  template<TPosition P>void InitBuffer(TBuf<P>& buf,uint32_t bytes){buf.storage.resize((bytes+7)/8);}
  void Destroy(){}
 };
-void SyncAll(){}
+unsigned crossCoreBarriers=0;
+void SyncAll(){++crossCoreBarriers;}
 struct Context {
  RuntimeShape shape;
  uint64_t sourceBlocks,sourceOffsets,destinations,rowStatus,fallbackAddresses,fallbackValid,rows,rowOwners;
@@ -115,6 +150,9 @@ int main(){
  std::mt19937 random(1117);
  constexpr uint32_t batch=16,cores=64;
  std::vector<int32_t> blocks(batch*kSlots),offsets(batch*kSlots),destinations(batch*kSlots);
+ constexpr uint32_t resident=16384,history=131328,eventOffset=2048;
+ std::vector<uint32_t> indexSources(eventOffset+kSlots),indexDestinations(eventOffset+kSlots);
+ for(uint32_t i=0;i<kSlots;++i){indexSources[eventOffset+i]=resident+i;indexDestinations[eventOffset+i]=i;}
  std::vector<int32_t> packed(batch*9*kSlots,-1);
  std::vector<uint64_t> addresses(batch*kSlots);
  std::vector<uint8_t> valid(batch*kSlots,1);
@@ -144,7 +182,8 @@ int main(){
     uint32_t begin=uint64_t(total)*lane/lanes,end=uint64_t(total)*(lane+1)/lanes;
     assert(end-begin<=(total+lanes-1)/lanes);
     uint32_t error=0;
-    Simt::VF_CALL<Pack>(Simt::Dim3{256,1,1},&ctx,b,begin,end-begin,n[0],n[1],n[2],n[3],out,
+    Simt::VF_CALL<Pack>(Simt::Dim3{256,1,1},&ctx,b,begin,end-begin,n[0],n[1],n[2],n[3],
+      indexSources.data(),indexDestinations.data(),eventOffset,resident,history,out,
       batch*kSlots,outputRows,656,remoteBase,remoteBytes,localBytes,&error);
     assert(!error);
    }
@@ -161,10 +200,13 @@ int main(){
    }
   }
  }
- auto check=[&](uint64_t remote=remoteBytes,uint64_t local=localBytes){
+ auto check=[&](uint64_t remote=remoteBytes,uint64_t local=localBytes,
+                uint32_t residentRows=resident,uint32_t historyRows=history,
+                uint32_t begin=0,uint32_t count=1,uint32_t q0=1){
   uint32_t error=0;
   std::fill(packed.begin(),packed.end(),-1);
-  Simt::VF_CALL<Pack>(Simt::Dim3{256,1,1},&ctx,0,0,1,1,0,0,0,packed.data(),
+  Simt::VF_CALL<Pack>(Simt::Dim3{256,1,1},&ctx,0,begin,count,q0,0,0,0,
+    indexSources.data(),indexDestinations.data(),eventOffset,residentRows,historyRows,packed.data(),
     batch*kSlots,outputRows,656,remoteBase,remote,local,&error);
   if(error)assert(packed[0]==-1&&packed[kSlots]==-1&&packed[2*kSlots]==-1);
   return error;
@@ -185,6 +227,19 @@ int main(){
  ++addresses[0];assert(check()==kvaf_device::kInvalidLookup);
  addresses[0]=UINT64_MAX;assert(check()==kvaf_device::kInvalidLookup);
  addresses[0]=remoteBase;assert(check(655)==kvaf_device::kInvalidLookup);
+ // Combined packing preserves the old Index-plan validation, including
+ // invalid-resident self-refill and empty-plan geometry checks.
+ indexSources[eventOffset]=history;assert(check()==1);
+ indexSources[eventOffset]=resident;indexDestinations[eventOffset]=resident;assert(check()==1);
+ indexSources[eventOffset]=5;indexDestinations[eventOffset]=6;assert(check()==1);
+ indexDestinations[eventOffset]=5;assert(!check());
+ indexSources[eventOffset]=resident;indexDestinations[eventOffset]=0;
+ assert(check(remoteBytes,localBytes,history+1,history)==1);
+ assert(check(remoteBytes,localBytes,resident,history,2,0,1)==1);
+ assert(check(remoteBytes,localBytes,resident,history,0,2,1)==1);
+ assert(check(remoteBytes,localBytes,resident,history,0,0,kTop+1)==1);
+ assert(!check(remoteBytes,localBytes,resident,history,0,0,0));
+ assert(check(remoteBytes,localBytes,history+1,history,0,0,0)==1);
 
  // Execute the production Run error path, with otherwise usable descriptors
  // and native entities. A pre-existing row error or a speculative write must
@@ -214,17 +269,31 @@ int main(){
  args.packedFetch=reinterpret_cast<uint64_t>(packed.data());args.maxEvents=10240;
  args.eventsSrc=reinterpret_cast<uint64_t>(eventSources.data());args.eventsDst=reinterpret_cast<uint64_t>(eventDestinations.data());
  args.updateBindings=reinterpret_cast<uint64_t>(update.data());
- for(uint32_t fault:{1U,2U}){
+ for(bool waitFirst:{false,true})for(uint32_t fault:{1U,2U,3U,4U,5U,6U,7U,8U}){
+  args.prefetchCount=waitFirst?0x02000000U:0;
+  crossCoreBarriers=0;
   row={};row.error=fault==1?0x4000:0;row.slots=fault==2?1:0;
   records={};records[0].active=1;status[0]=0;status[1]=2;
+  ctx.shape.resident=fault==6?4097:2048;
   for(uint32_t q=0;q<4;++q){finalPosts[q]={};finalPosts[q].descriptor=q*kTop;}
   finalPosts[0].count=2;
   eventSources[2048]=2048;eventSources[2049]=2049;
   eventDestinations[2048]=1;eventDestinations[2049]=2;
+  if(fault==3)eventSources[2048]=4096;
+  if(fault==4)eventDestinations[2048]=2048;
+  if(fault==5)eventSources[2048]=0;
+  if(fault==6){status[1]=0;finalPosts[0].count=0;}
+  if(fault==7)status[1]=1;
+  if(fault==8)finalPosts[0].count=kTop+1;
   auto before=aiv_model::testDoorbells;
   Run(&args,0);
   assert(aiv_model::testDoorbells==before);
   assert(records[0].error==(fault==1?0x4000:kvaf_device::kInvalidArgs));
+  assert(records[0].globalError==records[0].error);
+  assert(records[0].completed==0&&records[0].active==1);
+  assert(records[0].fallback==(waitFirst?2U:0U));
+  assert(crossCoreBarriers==6);
+  for(const auto& post:finalPosts)assert(post.error==records[0].error&&post.pending==0);
   assert(queue.sq_producer_index==0&&!queue.poisoned);
  }
  std::puts("POST_INDEX_TAIL_TYPES_PACK_PASS");

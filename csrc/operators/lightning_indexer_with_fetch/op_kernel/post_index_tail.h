@@ -29,20 +29,36 @@ __aicore__ inline uint64_t RowError(__gm__ Record* records, uint32_t b,
     return error;
 }
 
-// Pack a balanced slice of the request's Q4 union. The canonical ranges may
-// be discontinuous; one native call consumes a contiguous private range.
+// Validate and pack one balanced slice of the request's Q4 union. The same
+// event slice supplies Index exchanges and Get descriptors, so both checks
+// share one VF and finish before the collective pre-Post error barrier.
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void Pack(__gm__ Context* ctx, uint32_t b, uint32_t begin, uint32_t count,
                  uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3,
+                 __gm__ uint32_t* eventSources, __gm__ uint32_t* eventDestinations,
+                 uint32_t eventOffset, uint32_t resident, uint32_t history,
                  __gm__ int32_t* packed, uint32_t tableCapacity,
                  uint32_t outputRows, uint32_t tokenBytes, uint64_t remoteBase,
                  uint64_t remoteBytes, uint64_t localBytes, __ubuf__ uint32_t* error) {
+    const uint64_t total = uint64_t(c0) + c1 + c2 + c3;
+    if (!threadIdx.x)
+        error[0] = c0 > kTop || c1 > kTop || c2 > kTop || c3 > kTop ||
+                   total > kSlots || resident > history || begin > total ||
+                   count > total - begin ? 1U : 0U;
+    asc_syncthreads();
+    if (error[0]) return;
     auto blocks = reinterpret_cast<__gm__ int32_t*>(ctx->sourceBlocks);
     auto offsets = reinterpret_cast<__gm__ int32_t*>(ctx->sourceOffsets);
     auto destinations = reinterpret_cast<__gm__ int32_t*>(ctx->destinations);
     auto addresses = reinterpret_cast<__gm__ uint64_t*>(ctx->fallbackAddresses);
     auto valid = reinterpret_cast<__gm__ uint8_t*>(ctx->fallbackValid);
     for (uint32_t i = threadIdx.x; i < count; i += 256) {
+        const uint32_t event = eventOffset + begin + i;
+        uint32_t src = asc_ldcg(eventSources + event);
+        uint32_t dst = asc_ldcg(eventDestinations + event);
+        if (src >= history || dst >= resident || (src != dst && src < resident)) {
+            asc_atomic_or(error, 1U); continue;
+        }
         uint32_t index = begin + i, q = 0;
         if (index >= c0) { index -= c0; q = 1;
             if (index >= c1) { index -= c1; q = 2;
@@ -86,6 +102,9 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
     auto records = reinterpret_cast<__gm__ Record*>(a->postIndex);
     auto record = records + block;
     const bool profile = (a->prefetchCount & 0x80000000U) != 0;
+    // Offline overlap control, fixed before graph capture. Normal service
+    // keeps this false; both orders maintain exactly the same Index state.
+    const bool waitFirst = (a->prefetchCount & 0x02000000U) != 0;
     auto trace = reinterpret_cast<__gm__ uint64_t*>(a->times) +
                  uint64_t(batch) * 256 + uint64_t(block) * 32;
     // Existing packed workspace has at least 9*batch*8192 words. The first
@@ -118,9 +137,9 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
     if (profile) {
         record->planDone = GetSystemCycle();
         // Old OutputWorker diagnostic rows share this scratch allocation.
-        // Initialize PIX1 only after every old producer/worker writer joined.
+        // Initialize Index markers after every old producer/worker writer joined.
         for (uint32_t i = 2; i <= 10; ++i) trace[i] = 0;
-        trace[2] = 0x50495831U;  // PIX1: all-AIV Index work/barrier diagnostics
+        trace[2] = 0x50495832U;  // PIX2: production VF, event counts read offline
     }
 
     auto info = reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus) + b * kRowStatusWords;
@@ -142,9 +161,10 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
         counts[q] = post->count <= kTop ? post->count : 0;
         total += counts[q];
     }
-    if (total != info[1] || total > kSlots) error |= 1;
-    const uint32_t begin = uint64_t(total) * lane / lanes;
-    const uint32_t end = uint64_t(total) * (lane + 1) / lanes;
+    if (total != info[1] || total > kSlots || shape.resident > shape.history ||
+        !lanes || lane >= lanes) error |= 1;
+    const uint32_t begin = lanes ? uint64_t(total) * lane / lanes : 0;
+    const uint32_t end = lanes ? uint64_t(total) * (lane + 1) / lanes : 0;
     record->count = end - begin;
     auto packed = reinterpret_cast<__gm__ int32_t*>(a->packedFetch) + uint64_t(b) * 3 * kSlots;
     auto sources = reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc) + b * a->maxEvents;
@@ -161,24 +181,19 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
     args.tokens_per_block = 1;
     bool blocking = false;
     if (!error) error = post_index_transport::Preflight(args, 0, end - begin, blocking);
-    if (!error) {
+    if (!error && end > begin) {
         TPipe pipe; TBuf<TPosition::VECCALC> scratch;
         pipe.InitBuffer(scratch, 64); auto local = scratch.Get<uint32_t>();
-        Simt::VF_CALL<post_index::ValidatePlan>(Simt::Dim3{512,1,1}, sources, destinations,
-            kPrefetch, total, shape.resident, shape.history, lane, lanes,
+        auto entity = reinterpret_cast<__gm__ const KvafBatchGetDirectUrmaEntity*>(args.channel_entity);
+        Simt::VF_CALL<Pack>(Simt::Dim3{256,1,1}, ctx, b, begin, end - begin,
+            counts[0], counts[1], counts[2], counts[3], sources, destinations,
+            kPrefetch, shape.resident, shape.history, packed,
+            args.table_capacity, args.output_rows, args.token_bytes,
+            entity->remote_host_ddr_address, entity->remote_host_ddr_size,
+            entity->local_hbm_size,
             reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
         SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
         error |= local.GetValue(0);
-        if (!error && end > begin) {
-            auto entity = reinterpret_cast<__gm__ const KvafBatchGetDirectUrmaEntity*>(args.channel_entity);
-            Simt::VF_CALL<Pack>(Simt::Dim3{256,1,1}, ctx, b, begin, end - begin,
-                counts[0], counts[1], counts[2], counts[3], packed,
-                args.table_capacity, args.output_rows, args.token_bytes,
-                entity->remote_host_ddr_address, entity->remote_host_ddr_size,
-                entity->local_hbm_size, reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
-            SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
-            error |= local.GetValue(0);
-        }
         pipe.Destroy();
     }
     record->error = error; record->fallback = blocking;
@@ -204,8 +219,9 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
     const uint32_t indexFirst = uint64_t(prefix[batch]) * block / cores;
     const uint32_t indexEnd = uint64_t(prefix[batch]) * (block + 1) / cores;
     error |= records[0].globalError;
-    blocking = records[0].fallback != 0;
-    record->fallback = blocking; record->globalError = records[0].globalError;
+    blocking = (records[0].fallback & 1U) != 0;
+    record->fallback = uint64_t(blocking) | (waitFirst ? 2U : 0U);
+    record->globalError = records[0].globalError;
     post_index_transport::State transport;
     if (profile) record->postBegin = GetSystemCycle();
     if (!error) error = blocking ?
@@ -218,60 +234,53 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
     record->error = error; Flush(record);
     // No AIV enters Index maintenance before all Post calls have returned.
     SyncAll();
-    if (profile) trace[3] = trace[4] = GetSystemCycle();
+    if (profile) trace[3] = GetSystemCycle();
+    if (waitFirst) {
+        error |= post_index_transport::Wait(transport);
+        if (profile) trace[7] = record->cqDone = GetSystemCycle();
+        record->error = error; Flush(record);
+        // This is the same join used after CQ in the overlapping order,
+        // relocated before Index so communication is fully drained first.
+        SyncAll();
+    }
+    if (profile) trace[4] = GetSystemCycle();
     if (!records[0].globalError && indexEnd > indexFirst) {
         auto update = reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);
         // Owner loads are SIMT-only. Pass base arrays and let each VF thread
         // find the request owning its global event, without scalar OwnerRow.
-        if (profile) {
-            TPipe pipe; TBuf<TPosition::VECCALC> scratch;
-            pipe.InitBuffer(scratch, 64); auto local = scratch.Get<uint32_t>();
-            Simt::VF_CALL<post_index::ApplyPlan<true>>(Simt::Dim3{512,1,1},
-                reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc),
-                reinterpret_cast<__gm__ uint32_t*>(a->eventsDst),
-                kPrefetch, a->maxEvents, shape.history, prefix, batch, indexFirst, indexEnd,
-                reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners),
-                reinterpret_cast<__gm__ uint64_t*>(records), cores,
-                reinterpret_cast<__gm__ uint64_t*>(a->keys),
-                reinterpret_cast<__gm__ uint32_t*>(a->scales),
-                reinterpret_cast<__gm__ uint64_t*>(a->addresses),
-                reinterpret_cast<__gm__ uint64_t*>(a->logical), uint32_t(update[7]),
-                reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
-            SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
-            trace[8] = local.GetValue(0);
-            pipe.Destroy();
-        } else {
-            Simt::VF_CALL<post_index::ApplyPlan<false>>(Simt::Dim3{512,1,1},
-                reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc),
-                reinterpret_cast<__gm__ uint32_t*>(a->eventsDst),
-                kPrefetch, a->maxEvents, shape.history, prefix, batch, indexFirst, indexEnd,
-                reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners),
-                reinterpret_cast<__gm__ uint64_t*>(records), cores,
-                reinterpret_cast<__gm__ uint64_t*>(a->keys),
-                reinterpret_cast<__gm__ uint32_t*>(a->scales),
-                reinterpret_cast<__gm__ uint64_t*>(a->addresses),
-                reinterpret_cast<__gm__ uint64_t*>(a->logical), uint32_t(update[7]),
-                static_cast<__ubuf__ uint32_t*>(nullptr));
-            SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
-        }
+        // Timing diagnostics use the production VF too: no diagnostic TPipe,
+        // UB atomics or tuple counter inside the measured Index interval.
+        Simt::VF_CALL<post_index::ApplyPlan<false>>(Simt::Dim3{512,1,1},
+            reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc),
+            reinterpret_cast<__gm__ uint32_t*>(a->eventsDst),
+            kPrefetch, a->maxEvents, shape.history, prefix, batch, indexFirst, indexEnd,
+            reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners),
+            reinterpret_cast<__gm__ uint64_t*>(records), cores,
+            reinterpret_cast<__gm__ uint64_t*>(a->keys),
+            reinterpret_cast<__gm__ uint32_t*>(a->scales),
+            reinterpret_cast<__gm__ uint64_t*>(a->addresses),
+            reinterpret_cast<__gm__ uint64_t*>(a->logical), uint32_t(update[7]),
+            static_cast<__ubuf__ uint32_t*>(nullptr));
+        SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
     }
     if (profile) {
         trace[9] = indexEnd - indexFirst;
-        trace[10] = trace[8] * 592;  // two reads+writes of key/scale/address/id
         trace[5] = record->indexDone = GetSystemCycle();
     }
-    record->error = error; Flush(record);
+    record->completed = transport.completed; record->error = error; Flush(record);
     SyncAll();
     if (profile) trace[6] = GetSystemCycle();
     // A peer/Index failure must never strand a successfully posted queue.
-    error |= post_index_transport::Wait(transport);
-    if (profile) {
-        trace[7] = GetSystemCycle();
-        if (!blocking) record->cqDone = trace[7];
+    if (!waitFirst) {
+        error |= post_index_transport::Wait(transport);
+        if (profile) {
+            trace[7] = GetSystemCycle();
+            if (!blocking) record->cqDone = trace[7];
+        }
+        record->completed = transport.completed; record->error = error;
+        Flush(record);
+        SyncAll();
     }
-    record->completed = transport.completed; record->error = error;
-    Flush(record);
-    SyncAll();
     if (block < batch) {
         const uint32_t row = block;
         error = RowError(records, row, batch, cores);

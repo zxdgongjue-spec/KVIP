@@ -22,6 +22,7 @@ def test_parallel_post_index_preserves_complete_rows_and_self_refills(tmp_path, 
     source = tmp_path / "post_index_update.cpp"
     source.write_text(r'''
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstdint>
 #include <numeric>
@@ -36,7 +37,35 @@ def test_parallel_post_index_preserves_complete_rows_and_self_refills(tmp_path, 
 struct {uint32_t x=0;} threadIdx;
 void asc_syncthreads(){}
 void asc_threadfence(){}
-template<class T>T asc_ldcg(T* p){return *p;}
+struct LoadRange {uintptr_t begin,end;};
+std::vector<LoadRange> leaderOnly;
+std::vector<uint64_t> metadataReads;
+template<class T>void Watch(T* p,size_t n){
+ leaderOnly.push_back({reinterpret_cast<uintptr_t>(p),reinterpret_cast<uintptr_t>(p+n)});
+ metadataReads.push_back(0);
+}
+template<class T>T asc_ldcg(T* p){
+ uintptr_t address=reinterpret_cast<uintptr_t>(p);
+ for(size_t i=0;i<leaderOnly.size();++i)if(address>=leaderOnly[i].begin&&address<leaderOnly[i].end){
+  assert(threadIdx.x%16==0);++metadataReads[i];
+ }
+ return *p;
+}
+// Execute each group's leader first and record its shuffle values. Followers
+// consume the same call sequence, including self/error skips and later events.
+std::array<std::vector<uint32_t>,32> broadcasts;
+size_t shufflePosition=0;
+void BeginLane(){
+ shufflePosition=0;
+ if(threadIdx.x%16==0)broadcasts[threadIdx.x/16].clear();
+}
+uint32_t asc_shfl(uint32_t value,int source,int width){
+ assert(source==0&&width==16);
+ auto& history=broadcasts[threadIdx.x/16];
+ if(threadIdx.x%16==0)history.push_back(value);
+ assert(shufflePosition<history.size());
+ return history[shufflePosition++];
+}
 template<class T>void asc_stcg(T* p,T value){*p=value;}
 void asc_atomic_or(uint32_t* p,uint32_t value){*p|=value;}
 void asc_atomic_add(uint32_t* p,uint32_t value){*p+=value;}
@@ -82,9 +111,11 @@ int main(){using namespace post_index;
     // Reverse shard order proves no shard depends on another shard's writes.
     uint32_t prefix[]={0,n};
     std::vector<uint64_t> records(lanes*16);
-    for(uint32_t lane=lanes;lane--;)for(threadIdx.x=0;threadIdx.x<kThreads;++threadIdx.x)
+    for(uint32_t lane=lanes;lane--;)for(threadIdx.x=0;threadIdx.x<kThreads;++threadIdx.x){
+     BeginLane();
      ApplyPlan<false>(src.data(),dst.data(),0,n,H,prefix,1,n*lane/lanes,n*(lane+1)/lanes,
        nullptr,records.data(),lanes,keys.data(),scales.data(),addresses.data(),logical.data(),H,nullptr);
+    }
     assert(hotValid==oldValid&&kv==oldKv); // Index cannot declare CQ success.
     for(uint32_t i=0;i<H;++i){
      assert(scales[i]==oldScales[permutation[i]]);
@@ -160,6 +191,9 @@ int main(){using namespace post_index;
    for(bool profiled:{false,true}){
     keys=initialKeys;addr=initialAddr;ids=initialIds;scales=initialScales;
     uint32_t sumMoved=0,minAssigned=UINT32_MAX,maxAssigned=0;
+    leaderOnly.clear();metadataReads.clear();
+    Watch(s.data(),s.size());Watch(d.data(),d.size());Watch(prefix.data(),prefix.size());
+    Watch(owners.data(),owners.size());Watch(records.data(),records.size());
     for(uint32_t core=cores;core--;){
      uint32_t first=prefix.back()*core/cores,end=prefix.back()*(core+1)/cores,counter=0;
      minAssigned=std::min(minAssigned,end-first);maxAssigned=std::max(maxAssigned,end-first);
@@ -167,6 +201,7 @@ int main(){using namespace post_index;
      // Only each group's lane 0 changes scalar metadata and adds its count;
      // thread 0 initializes the diagnostic counter before other groups run.
      for(threadIdx.x=0;threadIdx.x<kThreads;++threadIdx.x){
+      BeginLane();
       if(profiled)ApplyPlan<true>(s.data(),d.data(),OFFSET,STRIDE,BH,prefix.data(),batch,first,end,
         owners.data(),records.data(),cores,keys.data(),scales.data(),addr.data(),ids.data(),AS,&counter);
       else ApplyPlan<false>(s.data(),d.data(),OFFSET,STRIDE,BH,prefix.data(),batch,first,end,
@@ -174,6 +209,9 @@ int main(){using namespace post_index;
      }
      assert(counter<=end-first);sumMoved+=counter;
     }
+    uint32_t validEvents=prefix.back()-(failed?prefix[badRow+1]-prefix[badRow]:0);
+    assert(metadataReads[0]==validEvents&&metadataReads[1]==validEvents);
+    leaderOnly.clear();metadataReads.clear();
     assert(maxAssigned-minAssigned<=1);
     assert(!profiled||sumMoved==expectedMoved);
     assert(keys==expectedKeys&&addr==expectedAddr&&ids==expectedIds&&scales==expectedScales);

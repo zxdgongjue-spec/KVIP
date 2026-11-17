@@ -144,6 +144,7 @@ class StreamingLIFetchForward:
             | (0x10000000 if self.parallel_finalize else 0)
             | (0x08000000 if self.prepare_metadata else 0)
             | (0x04000000 if getattr(self, "ubmem_overlap_fetch", False) else 0)
+            | (0x02000000 if getattr(self, "post_index_wait_first", False) else 0)
             | (0x80000000 if diagnostics else 0)
             | (0x40000000 if deferred_fetch else 0)
         )
