@@ -54,7 +54,13 @@ def test_actual_cdf_saturation_ties_causal_tail_and_seed_dedup(tmp_path, batched
 #define __ubuf__
 #define KVIP_ROLLING_THRESHOLD 1
 ''' + model + r'''
-namespace AscendC {enum class SpecialPurposeReg {AR};}
+// CANN exposes both the scalar GatherMask mode and the register GatherMask
+// mode. Production headers also import AscendC; keep that lookup environment
+// so an unqualified enum cannot pass host tests and fail the NPU compiler.
+namespace AscendC {
+enum class SpecialPurposeReg {AR};
+enum class GatherMaskMode : uint8_t {VERSION_V1=0,VERSION_V2=1};
+}
 namespace AscendC::MicroAPI {
 enum class GatherMaskMode {STORE_REG};enum class PostLiteral {POST_MODE_UPDATE};
 struct UnalignRegForStore {};
@@ -93,6 +99,7 @@ template<class T> void DeInterleave(RegTensor<T>& a,RegTensor<T>& b,RegTensor<T>
  unsigned n=x.v.size();for(unsigned i=0;i<n/2;++i){a.v[i]=x.v[2*i];b.v[i]=x.v[2*i+1];
  a.v[i+n/2]=y.v[2*i];b.v[i+n/2]=y.v[2*i+1];}}
 }
+using namespace AscendC;
 #include "rolling_threshold_vector.h"
 ''' + classify + r'''
 using namespace AscendC::MicroAPI;

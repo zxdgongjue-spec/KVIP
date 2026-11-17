@@ -130,7 +130,8 @@ __simd_vf__ inline void CompactWindow(__ubuf__ uint16_t* input, uint32_t count,
     LoadAlign(seed, state + kBins);
     RegTensor<int16_t> sequence; Arange(sequence, int16_t(0));
     auto& index = reinterpret_cast<RegTensor<uint16_t>&>(sequence);
-    ClearSpr<AscendC::SpecialPurposeReg::AR>(); UnalignRegForStore store;
+    AscendC::MicroAPI::ClearSpr<AscendC::SpecialPurposeReg::AR>();
+    AscendC::MicroAPI::UnalignRegForStore store;
     for (uint16_t offset = 0; offset < count; offset += 128) {
         uint32_t tile = scanBegin + offset;
 #if KVIP_REVERSE_COLD
@@ -150,10 +151,12 @@ __simd_vf__ inline void CompactWindow(__ubuf__ uint16_t* input, uint32_t count,
             MaskOr(outside, left, right, all); MaskAnd(valid, valid, outside, all);
             MaskAnd(selected, selected, valid, all);
         }
-        Squeeze<uint16_t, GatherMaskMode::STORE_REG>(packed, score, selected);
-        StoreUnAlign<uint16_t, PostLiteral::POST_MODE_UPDATE>(output, packed, store);
+        AscendC::MicroAPI::Squeeze<uint16_t, AscendC::MicroAPI::GatherMaskMode::STORE_REG>(
+            packed, score, selected);
+        AscendC::MicroAPI::StoreUnAlign<uint16_t, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+            output, packed, store);
     }
-    StoreUnAlignPost(output, store);
+    AscendC::MicroAPI::StoreUnAlignPost(output, store);
     // The caller obtains the compacted byte count from AR, as in native LIDU.
 }
 
