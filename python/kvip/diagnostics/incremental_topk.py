@@ -121,8 +121,28 @@ def eligibility(archive, row):
     """Frozen physical Index eligibility; submitted-map exclusion is dynamic."""
     g = archive.manifest["geometry"]
     r, h = g["resident"], g["history"]
-    owner = int(archive.array("pre.row_owners")[row])
-    hot = archive.array("pre.hot_valid")[owner] != 0
+    tensors = archive.manifest["tensors"]
+    if "pre.metadata" in tensors:
+        # The service snapshot packs int32 owner IDs in metadata's int64
+        # storage, just like SnapshotDemand and the native binding. A separate
+        # row_owners tensor is optional and absent from the original captures.
+        metadata = archive.array("pre.metadata")
+        if metadata.shape != (5, g["batch"] * 4) or metadata.dtype != np.int64:
+            raise ValueError("Invalid packed snapshot metadata")
+        owners = metadata[4].view(np.int32)[:g["batch"]]
+        if "pre.row_owners" in tensors and not np.array_equal(owners, archive.array("pre.row_owners")):
+            raise ValueError("Snapshot row_owners disagrees with packed metadata")
+    elif "pre.row_owners" in tensors:
+        owners = archive.array("pre.row_owners")
+    else:
+        raise ValueError("Snapshot needs pre.metadata or pre.row_owners")
+    hot_rows = archive.array("pre.hot_valid")
+    if (owners.shape != (g["batch"],) or owners.dtype != np.int32 or
+            hot_rows.ndim != 2 or hot_rows.shape[1] != r or
+            np.any(owners < 0) or np.any(owners >= len(hot_rows))):
+        raise ValueError("Snapshot owner IDs or hot-cache geometry are invalid")
+    owner = int(owners[row])
+    hot = hot_rows[owner] != 0
     reserved = archive.array("pre.reserved_hot")[row] >= 0
     eligible = np.ones(h, dtype=bool)
     eligible[:r] = ~hot | reserved

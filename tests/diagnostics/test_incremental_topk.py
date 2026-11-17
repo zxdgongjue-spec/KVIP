@@ -102,7 +102,8 @@ def test_incremental_report_requires_oracle_and_uses_both_controls(tmp_path, cap
     assert "GATE reverse-incremental KEEP_BASELINE" in capsys.readouterr().out
 
 
-def test_frozen_archive_cpu_command(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("owner_format", ["packed", "separate", "both"])
+def test_frozen_archive_cpu_command(tmp_path, monkeypatch, capsys, owner_format):
     import json
     import sys
     from kvip.diagnostics.archive import TensorArchive
@@ -115,7 +116,12 @@ def test_frozen_archive_cpu_command(tmp_path, monkeypatch, capsys):
     archive.save("pre.query_ends", np.array([[n-3,n-2,n-1,n]], dtype=np.int32))
     archive.save("pre.threshold_bounds", np.array([[n-128,n]], dtype=np.int32))
     archive.save("pre.tail_bounds", np.array([[n-64,n]], dtype=np.int32))
-    archive.save("pre.row_owners", np.array([1], dtype=np.int32))
+    if owner_format != "packed":
+        archive.save("pre.row_owners", np.array([1], dtype=np.int32))
+    if owner_format != "separate":
+        metadata = np.zeros((5,4),dtype=np.int64)
+        metadata[4].view(np.int32)[0] = 1
+        archive.save("pre.metadata", metadata)
     archive.save("pre.hot_valid", np.ones((2,r),dtype=np.int32))
     archive.save("pre.reserved_hot", np.full((1,r),-1,dtype=np.int32))
     (tmp_path/"manifest.json").write_text(json.dumps(manifest))
@@ -124,6 +130,25 @@ def test_frozen_archive_cpu_command(tmp_path, monkeypatch, capsys):
     output = capsys.readouterr().out
     assert "CPU_INCREMENTAL forward PASS" in output
     assert "CPU_INCREMENTAL reverse PASS" in output
+
+
+def test_packed_owner_mapping_uses_int32_view_and_actual_owner(tmp_path):
+    from kvip.diagnostics.archive import TensorArchive
+    from kvip.diagnostics.incremental_topk import eligibility
+
+    manifest = dict(geometry=dict(batch=2, resident=4, history=8))
+    archive = TensorArchive(tmp_path, manifest)
+    metadata = np.zeros((5,8),dtype=np.int64)
+    metadata[4].view(np.int32)[:2] = [2,1]
+    archive.save("pre.metadata", metadata)
+    archive.save("pre.hot_valid", np.array([[0,0,0,0], [1,0,1,1], [0,1,1,1]],dtype=np.int32))
+    archive.save("pre.reserved_hot", np.array([[-1,-1,0,-1], [-1,-1,-1,-1]],dtype=np.int32))
+    archive.save("pre.tail_bounds", np.array([[6,8],[7,8]],dtype=np.int32))
+    np.testing.assert_array_equal(eligibility(archive,0), [True,False,True,False,True,True,False,False])
+    np.testing.assert_array_equal(eligibility(archive,1), [False,True,False,False,True,True,True,False])
+    archive.save("pre.row_owners", np.array([1,2],dtype=np.int32))
+    with pytest.raises(ValueError, match="disagrees"):
+        eligibility(archive,0)
 
 
 def test_full_bs16_q4_history_131584_with_eight_cold_windows():
