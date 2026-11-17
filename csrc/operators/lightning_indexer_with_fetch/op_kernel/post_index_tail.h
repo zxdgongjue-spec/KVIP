@@ -250,7 +250,7 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
         // find the request owning its global event, without scalar OwnerRow.
         // Timing diagnostics use the production VF too: no diagnostic TPipe,
         // UB atomics or tuple counter inside the measured Index interval.
-        Simt::VF_CALL<post_index::ApplyPlan<false>>(Simt::Dim3{512,1,1},
+        Simt::VF_CALL<post_index::ApplyPlan<false>>(Simt::Dim3{post_index::kThreads,1,1},
             reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc),
             reinterpret_cast<__gm__ uint32_t*>(a->eventsDst),
             kPrefetch, a->maxEvents, shape.history, prefix, batch, indexFirst, indexEnd,

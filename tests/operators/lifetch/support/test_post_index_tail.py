@@ -88,6 +88,7 @@ def test_whole_tail_header_and_q4_pack(tmp_path):
     source.write_text(r'''
 #include "batch_get_model.h"
 #include <cstddef>
+#include <cstdlib>
 #include <array>
 #include <random>
 #define KVIP_OUTPUT_WORKER 1
@@ -105,6 +106,8 @@ void asc_atomic_add(uint32_t* p,uint32_t value){*p+=value;}
 // Run below exercises failure paths only, so Index VF is never reached.
 // The separate update model tests the real half-warp broadcast semantics.
 template<class T>T asc_shfl(T value,int,int){return value;}
+uint32_t asc_ballot(int32_t){std::abort();}
+int __popc(uint32_t value){return __builtin_popcount(value);}
 enum class HardEvent {V_S};
 template<HardEvent>void SetFlag(uint32_t){}
 template<HardEvent>void WaitFlag(uint32_t){}

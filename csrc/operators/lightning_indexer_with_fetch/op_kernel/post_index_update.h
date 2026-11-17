@@ -2,7 +2,8 @@
 #pragma once
 
 namespace post_index {
-constexpr uint32_t kThreads = 512;
+constexpr uint32_t kThreads = 256;
+constexpr uint32_t kEventThreads = 8;
 constexpr uint32_t kMaxEvents = 8192;
 
 // Run before posting any Get, then join every AIV's error result. The compact
@@ -51,36 +52,56 @@ inline void ApplyPlan(
         if (!threadIdx.x) work[0] = 0;
         asc_syncthreads();
     }
-    const uint32_t field = threadIdx.x % 16;
+    const uint32_t field = threadIdx.x % kEventThreads;
     uint32_t moved = 0, row = batch, rowBegin = 0, rowEnd = 0, owner = 0;
     uint64_t rowError = 0;
-    for (uint32_t i = first + threadIdx.x / 16; i < end; i += kThreads / 16) {
+    // Each eight-lane group covers B<=16 with two register banks. This
+    // retains four independent event groups per warp without uint4 ABI values.
+    const uint32_t initialEvent = first + threadIdx.x / kEventThreads;
+    uint32_t initialRow = batch, initialBegin = 0, initialEnd = 0;
+    uint64_t initialError = 0;
+    uint32_t initialOwner = 0;
+    if (initialEvent < end) {
+        const uint32_t boundaryLo = field < batch ? asc_ldcg(prefix + field + 1) : UINT32_MAX;
+        const uint32_t boundaryHi = field + 8 < batch ? asc_ldcg(prefix + field + 9) : UINT32_MAX;
+        const uint32_t ownerLo = field < batch && rowOwners ? asc_ldcg(rowOwners + field) : field;
+        const uint32_t ownerHi = field + 8 < batch && rowOwners ? asc_ldcg(rowOwners + field + 8) : field + 8;
+        const uint32_t shift = (threadIdx.x % 32) & (32 - kEventThreads);
+        const uint32_t lo = (asc_ballot(field < batch && initialEvent >= boundaryLo) >> shift) & 0xffU;
+        const uint32_t hi = (asc_ballot(field + 8 < batch && initialEvent >= boundaryHi) >> shift) & 0xffU;
+        initialRow = __popc(lo) + __popc(hi);
+        const uint32_t previous = initialRow ? initialRow - 1 : 0;
+        initialBegin = asc_shfl(previous < 8 ? boundaryLo : boundaryHi, previous & 7, kEventThreads);
+        if (!initialRow) initialBegin = 0;
+        initialEnd = asc_shfl(initialRow < 8 ? boundaryLo : boundaryHi, initialRow & 7, kEventThreads);
+        initialOwner = asc_shfl(initialRow < 8 ? ownerLo : ownerHi, initialRow & 7, kEventThreads);
+        uint64_t error = 0;
+        for (uint32_t peer = initialRow + field * batch; peer < cores; peer += kEventThreads * batch)
+            error |= asc_ldcg(records + uint64_t(peer) * 16);
+        initialError = (asc_ballot(error != 0) >> shift) & 0xffU;
+    }
+    for (uint32_t i = first + threadIdx.x / kEventThreads; i < end; i += kThreads / kEventThreads) {
         uint32_t src = 0, dst = 0;
         if (!field) {
             if (i >= rowEnd) {
-                // First locate a row by binary search; later events only advance
-                // across boundaries (including empty requests). Cache both bounds
-                // so an event never reloads the row's prefix just to get its ID.
+                // Reuse the collectively located first row. Later events only
+                // advance across boundaries, including empty requests. Keep both
+                // bounds so the same row never reloads its prefix per event.
                 if (row == batch) {
-                    uint32_t lo = 0, hi = batch;
-                    while (lo < hi) {
-                        uint32_t mid = (lo + hi) / 2;
-                        if (i >= asc_ldcg(prefix + mid + 1)) lo = mid + 1;
-                        else hi = mid;
-                    }
-                    row = lo;
+                    row = initialRow;
+                    rowBegin = initialBegin;
+                    rowEnd = initialEnd;
+                    rowError = initialError;
+                    owner = initialOwner;
                 } else {
                     while (row < batch && i >= asc_ldcg(prefix + row + 1)) ++row;
+                    rowBegin = asc_ldcg(prefix + row);
+                    rowEnd = asc_ldcg(prefix + row + 1);
+                    rowError = 0;
+                    for (uint32_t peer = row; peer < cores; peer += batch)
+                        rowError |= asc_ldcg(records + uint64_t(peer) * 16);
+                    owner = rowOwners ? asc_ldcg(rowOwners + row) : row;
                 }
-                rowBegin = asc_ldcg(prefix + row);
-                rowEnd = asc_ldcg(prefix + row + 1);
-                owner = rowOwners ? asc_ldcg(rowOwners + row) : row;
-                rowError = 0;
-                // A failed Post cancels this request's swaps, even if this AIV
-                // originally posted for a different request. All posted queues
-                // are still drained by the scalar caller after the Index barrier.
-                for (uint32_t peer = row; peer < cores; peer += batch)
-                    rowError |= asc_ldcg(records + uint64_t(peer) * 16);
             }
             if (!rowError) {
                 const uint64_t event = uint64_t(row) * eventStride + eventOffset + i - rowBegin;
@@ -88,17 +109,20 @@ inline void ApplyPlan(
                 dst = asc_ldcg(destinations + event);
             }
         }
-        // Every active 16-thread group reaches both broadcasts together. Its
+        // Every active eight-thread group reaches both broadcasts together. Its
         // lane 0 has classified the event; failed rows use a no-swap sentinel.
-        src = asc_shfl(src, 0, 16);
-        dst = asc_shfl(dst, 0, 16);
+        src = asc_shfl(src, 0, kEventThreads);
+        dst = asc_shfl(dst, 0, kEventThreads);
         if (src == dst) continue;
-        const uint32_t eventOwner = asc_shfl(owner, 0, 16);
+        const uint32_t eventOwner = asc_shfl(owner, 0, kEventThreads);
         uint64_t source = (uint64_t(eventOwner) * history + src) * 16 + field;
         uint64_t destination = (uint64_t(eventOwner) * history + dst) * 16 + field;
         uint64_t a = asc_ldcg(keys + source), b = asc_ldcg(keys + destination);
+        uint64_t c = asc_ldcg(keys + source + 8), d = asc_ldcg(keys + destination + 8);
         asc_stcg(keys + source, b);
         asc_stcg(keys + destination, a);
+        asc_stcg(keys + source + 8, d);
+        asc_stcg(keys + destination + 8, c);
         if (!field) {
             uint64_t sourceRow = uint64_t(owner) * history + src;
             uint64_t destRow = uint64_t(owner) * history + dst;
@@ -114,7 +138,7 @@ inline void ApplyPlan(
         }
     }
     if constexpr (Profile) {
-        // One addition per 16-thread group, not one atomic per event.
+        // One addition per eight-thread group, not one atomic per event.
         if (!field && moved) asc_atomic_add(work, moved);
     }
     // hotValid remains untouched until the transport's successful CQ drain.
