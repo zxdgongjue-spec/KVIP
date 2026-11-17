@@ -11,6 +11,10 @@ option(KVIP_ROLLING_THRESHOLD "Capped BF16 CDF in the native LI score VF" OFF)
 option(KVIP_ROLLING_WINDOWED "Accumulate raw LI scores at existing window boundaries" OFF)
 option(KVIP_ROLLING_COMPACT "One comparison per tile and early QK-buffer release" OFF)
 option(KVIP_ROLLING_REUSE_SEED "Reuse the exact seed selector CDF within its byte range" OFF)
+option(KVIP_ROLLING_FAST_PATH "Packed byte histogram and visibility-first admission" OFF)
+if(KVIP_ROLLING_FAST_PATH AND NOT KVIP_ROLLING_REUSE_SEED)
+  message(FATAL_ERROR "Packed byte accumulation requires seed histogram reuse")
+endif()
 if(KVIP_ROLLING_REUSE_SEED AND NOT KVIP_ROLLING_COMPACT)
   message(FATAL_ERROR "Seed reuse requires compact window accumulation")
 endif()
@@ -57,6 +61,7 @@ ascendc_compile_options(v9_kernel PRIVATE -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WO
   -DKVIP_ROLLING_THRESHOLD=$<BOOL:${KVIP_ROLLING_THRESHOLD}>
   -DKVIP_ROLLING_COMPACT=$<BOOL:${KVIP_ROLLING_COMPACT}>
   -DKVIP_ROLLING_REUSE_SEED=$<BOOL:${KVIP_ROLLING_REUSE_SEED}>
+  -DKVIP_ROLLING_FAST_PATH=$<BOOL:${KVIP_ROLLING_FAST_PATH}>
   -DKVIP_ROLLING_FIRST_WINDOW=$<BOOL:${KVIP_ROLLING_FIRST_WINDOW}>
   -DKVIP_ROLLING_WINDOWED=$<BOOL:${KVIP_ROLLING_WINDOWED}>
   -DKVIP_ROLLING_BATCHED=$<BOOL:${KVIP_ROLLING_BATCHED}>
@@ -78,3 +83,4 @@ target_compile_definitions(v9_bridge PRIVATE KVIP_REFILTER_SAFE=$<BOOL:${KVIP_RE
 target_compile_definitions(v9_bridge PRIVATE KVIP_COMPACT_OUT_OF_PLACE=$<BOOL:${KVIP_COMPACT_OUT_OF_PLACE}>)
 
 target_compile_definitions(v9_bridge PRIVATE KVIP_ROLLING_REUSE_SEED=$<BOOL:${KVIP_ROLLING_REUSE_SEED}>)
+target_compile_definitions(v9_bridge PRIVATE KVIP_ROLLING_FAST_PATH=$<BOOL:${KVIP_ROLLING_FAST_PATH}>)

@@ -568,12 +568,21 @@ inline void GatherCandidateMap(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* slots,
             // physical coordinates. Reuse its existing map-gather launch.
             bool keep=false;
             const uint32_t scan=DecodeScanToken(token,cfg[60],cfg[61]);
+#if KVIP_ROLLING_FAST_PATH && KVIP_REFILTER_SAFE
+            // Any unknown, causal-valid Q already forces conservative keep.
+            // Check that decision before issuing any random score loads.
+            if(scan>=cfg[108])
+                for(uint32_t q=0;q<4 && !keep;++q)
+                    keep = token<cfg[104+q] && scan>=cfg[100+q];
+#endif
             for(uint32_t q=0;q<4 && !keep;++q) {
 #if KVIP_REFILTER_SAFE
                 if(token>=cfg[104+q])continue;
+#if !KVIP_ROLLING_FAST_PATH
                 // Q4 union: unknown is not below Kth. Reuse this loop,
                 // keep the ID and never read that query's unpublished GM.
                 if(scan>=cfg[100+q]) {keep=true;break;}
+#endif
 #else
                 if(scan>=cfg[100+q] || token>=cfg[104+q])continue;
 #endif
@@ -724,11 +733,22 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         cfg.SetValue(60,KVIP_REVERSE_COLD?range.begin:0);
         cfg.SetValue(61,KVIP_REVERSE_COLD?range.end:0);
 #if KVIP_WINDOW_REFILTER
+#if KVIP_ROLLING_FAST_PATH
+        uint32_t allReady=UINT32_MAX;
+#endif
         for(uint32_t q=0;q<4;++q) {
             cfg.SetValue(96+q,cfg.GetValue(1024+b*4+q));
             cfg.SetValue(100+q,cfg.GetValue(128+b*4+q));
             cfg.SetValue(104+q,ends[q]);
+#if KVIP_ROLLING_FAST_PATH
+            uint32_t ready=cfg.GetValue(128+b*4+q);
+            allReady=allReady<ready?allReady:ready;
+#endif
         }
+#if KVIP_ROLLING_FAST_PATH
+        // Existing free word immediately after Q4 causal ends. No new DMA.
+        cfg.SetValue(108,allReady);
+#endif
 #endif
 #endif
         auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;

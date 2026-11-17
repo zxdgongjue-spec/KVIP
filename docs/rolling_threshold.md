@@ -320,3 +320,44 @@ prefix thresholds against an independent Kth, cover ties/padding/extreme keys,
 reverse scan and first-window freezing, and verify that exporting the seed
 adds zero histogram operations. They do not establish CANN compilation or a
 positive NPU timing result. The option defaults off.
+
+## Remove redundant encoding and guaranteed-keep score reads
+
+`rolling_fast_path` requires `rolling_reuse_seed` and is OFF by default.
+It adds no sampling, sorting, window, transport budget or graph-routing change.
+The existing 36 KiB window buffer and histogram instructions remain; this is
+an execution-cost reduction, not a claim that histogram overhead disappears.
+
+The reused seed has a byte-aligned score range. For a full valid 256-score
+pair outside the recent interval, use the selector's deinterleaving load to
+obtain packed low/high bytes. Complement the low bytes and clamp according
+to the high byte. Hoist the anchor byte and constants outside the window
+loop. This replaces two u16 encodings and their subsequent packing. Partial,
+causal-tail and recent-overlap pairs retain the old masked path. Every encoded
+byte and published threshold is identical to the seed-reuse control, including
+its explicitly reported upper-byte cap. No extra Index read is introduced.
+
+The service already snapshots Q4 readiness. Compute their minimum once in
+an unused existing control word. A candidate before that minimum is known to
+all Qs. Otherwise check for an unknown causal-valid Q before reading scores:
+such a candidate must be retained under the existing safe-union rule. This
+avoids random score loads whose results cannot alter the decision. Once all
+valid Qs are known, the normal score checks retain ties and may reject the ID.
+No wait, cache mutation or extra DMA is added. When all Qs are known this still
+adds a branch, so the full graph measurement decides whether it pays off.
+
+Host lane tests execute the native functions under ASan/UBSan, exhaust the
+16-bit input-key domain at four byte anchors, validate odd windows and reverse
+blocks against independent prefix Kth, and exercise all Q4 visibility masks.
+A late unknown Q requires zero score loads instead of three in the targeted
+fixture. This is a source-level load count, not an NPU latency prediction.
+
+Replay uses eight **cold** windows plus the resident publication (9 native
+rounds) throughout. Compare unchanged forward and reverse controls, full
+window correction, seed reuse, and the fast path, then repeat both controls.
+Restore and verification stay outside timing; all seed export, histogram,
+publication, filtering and final repair work remain inside the measured graph.
+One separately instrumented replay exposes producer/post/join/drain cycles;
+these overlapping intervals must not be summed into graph microseconds.
+Do not enable the added work on a workload where it loses to reverse-only or
+unchanged forward. Reduced waste without lower full latency is insufficient.

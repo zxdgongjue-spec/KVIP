@@ -27,11 +27,12 @@ def execute(tmp_path, source, name):
     subprocess.run([str(binary)], check=True, timeout=60)
 
 
-@pytest.mark.parametrize("batched,windowed,compact,first,reuse", [
-    (0, 0, 0, 0, 0), (1, 0, 0, 0, 0), (0, 1, 0, 0, 0),
-    (0, 1, 1, 0, 0), (0, 1, 1, 1, 0), (0, 1, 1, 0, 1), (0, 1, 1, 1, 1)])
+@pytest.mark.parametrize("batched,windowed,compact,first,reuse,fast", [
+    (0, 0, 0, 0, 0, 0), (1, 0, 0, 0, 0, 0), (0, 1, 0, 0, 0, 0),
+    (0, 1, 1, 0, 0, 0), (0, 1, 1, 1, 0, 0), (0, 1, 1, 0, 1, 0),
+    (0, 1, 1, 1, 1, 0), (0, 1, 1, 0, 1, 1), (0, 1, 1, 1, 1, 1)])
 @pytest.mark.parametrize("reverse", [0, 1])
-def test_actual_cdf_saturation_ties_causal_tail_and_seed_dedup(tmp_path, batched, windowed, compact, first, reuse, reverse):
+def test_actual_cdf_saturation_ties_causal_tail_and_seed_dedup(tmp_path, batched, windowed, compact, first, reuse, fast, reverse):
     model = register_model_source('#include "recent_index.h"')
     model = model[:model.index('#include "recent_threshold.h"')]
     model = model.replace("{DIST_DINTLV_B8}", "{DIST_DINTLV_B8,DIST_BRC_B16}")
@@ -53,6 +54,10 @@ def test_actual_cdf_saturation_ties_causal_tail_and_seed_dedup(tmp_path, batched
 #define KVIP_ROLLING_THRESHOLD 1
 ''' + model + r'''
 namespace AscendC::MicroAPI {
+template<class T> void ShiftRights(RegTensor<T>& r,RegTensor<T>& a,int16_t n,MaskReg mask){
+ for(unsigned i=0;i<r.v.size();++i)if(mask.v[i])r.v[i]=a.v[i]>>n;}
+template<class T> void Xor(RegTensor<T>& r,RegTensor<T>& a,RegTensor<T>& b,MaskReg mask){
+ for(unsigned i=0;i<r.v.size();++i)if(mask.v[i])r.v[i]=a.v[i]^b.v[i];}
 template<class T> void Gather(RegTensor<T>& r,T* p,RegTensor<uint16_t>& index,MaskReg mask){
  for(unsigned i=0;i<r.v.size();++i)if(mask.v[i]){assert(index.v[i]<256);r.v[i]=p[index.v[i]];}}
 template<class T> void And(RegTensor<T>& r,RegTensor<T>& a,RegTensor<T>& b,MaskReg mask){
@@ -80,6 +85,23 @@ template<class T> void DeInterleave(RegTensor<T>& a,RegTensor<T>& b,RegTensor<T>
 using namespace AscendC::MicroAPI;
 uint16_t kth(std::vector<uint16_t> a){std::nth_element(a.begin(),a.end()-2048,a.end());return a[a.size()-2048];}
 int main(){
+#if KVIP_ROLLING_FAST_PATH
+ // Exhaust every input key, including both byte-range saturation edges.
+ for(unsigned byte:{0U,1U,127U,255U}){
+  RegTensor<uint16_t> seedByte,ones,zero;
+  Duplicate(seedByte,uint16_t(byte*257));Duplicate(ones,uint16_t(65535));Duplicate(zero,uint16_t(0));
+  std::array<uint16_t,256> input;
+  for(unsigned start=0;start<65536;start+=256){
+   for(unsigned i=0;i<256;++i)input[i]=start+i;
+   RegTensor<uint8_t> encoded;
+   kvip_rolling::EncodeFullPair(encoded,input.data(),seedByte,ones,zero);
+   for(unsigned i=0;i<256;++i){
+    int delta=std::clamp(int(input[i])-int(byte*256),0,255);
+    assert(encoded.v[i]==255-delta);
+   }
+  }
+ }
+#endif
  {
   RegTensor<uint16_t> score;for(unsigned i=0;i<128;++i)score.v[i]=i;
   auto all=CreateMask<uint16_t,MaskPattern::ALL>();
@@ -200,13 +222,14 @@ int main(){
 }
 '''
     source = (f"#define KVIP_ROLLING_BATCHED {batched}\n#define KVIP_ROLLING_WINDOWED {windowed}\n"
+              f"#define KVIP_ROLLING_FAST_PATH {fast}\n"
               f"#define KVIP_ROLLING_REUSE_SEED {reuse}\n#define KVIP_ROLLING_COMPACT {compact}\n#define KVIP_ROLLING_FIRST_WINDOW {first}\n"
               f"#define KVIP_REVERSE_COLD {reverse}\n#define REVERSE_TEST {reverse}\n") + source
     execute(tmp_path, source, "rolling_cdf")
 
 
-@pytest.mark.parametrize("safe", [0, 1])
-def test_actual_candidate_filter_preserves_visibility_and_boundary_ties(tmp_path, safe):
+@pytest.mark.parametrize("safe,fast", [(0, 0), (1, 0), (1, 1)])
+def test_actual_candidate_filter_preserves_visibility_and_boundary_ties(tmp_path, safe, fast):
     prefetch = (NATIVE / "op_kernel/prefetch.h").read_text()
     decoder = function(prefetch, "__simt_callee__ inline uint32_t DecodeScanToken(")
     gather = function(prefetch, "inline void GatherCandidateMap(")
@@ -222,16 +245,22 @@ def test_actual_candidate_filter_preserves_visibility_and_boundary_ties(tmp_path
 #define KVIP_REVERSE_COLD 1
 #define KVIP_WINDOW_REFILTER 1
 struct {unsigned x;} threadIdx;
-template<class T> T asc_ldcg(T* p){return *p;}
+uintptr_t scoreBegin=0,scoreEnd=0;unsigned scoreLoads=0;
+template<class T> T asc_ldcg(T* p){
+ auto address=reinterpret_cast<uintptr_t>(p);
+ if(address>=scoreBegin&&address<scoreEnd)++scoreLoads;
+ return *p;}
 ''' + decoder + '\n' + gather + r'''
 int main(){
  constexpr unsigned h=8192;
  std::vector<uint32_t> map(h,UINT32_MAX),scores(4*h/2,0),cfg(128,0);
+ scoreBegin=reinterpret_cast<uintptr_t>(scores.data());scoreEnd=scoreBegin+scores.size()*4;
  cfg[60]=2048;cfg[61]=8192;
  auto put=[&](unsigned q,unsigned token,unsigned score){
   auto& word=scores[(q*h+token)/2];word|=score<<((token%2)*16);};
  std::array<uint32_t,5> ids{6144,6145,2048,6146,6147},slots{};
  for(unsigned q=0;q<4;++q){cfg[96+q]=100;cfg[100+q]=4096;cfg[104+q]=8192;}
+ cfg[108]=4096;
  put(0,6144,100);put(1,6145,99);put(2,2048,65535); // future scan position, must not admit
  put(3,6146,102);map[6147]=17; // already resident, not a miss
  for(threadIdx.x=0;threadIdx.x<256;++threadIdx.x)
@@ -240,6 +269,10 @@ int main(){
  // A candidate from Q0 can be useful to Q3 even if Q0's threshold rose.
  // Keep it when Q3 is not ready; do not wait or read its unpublished score.
  cfg[103]=2048;put(3,6145,150);
+ cfg[108]=2048;
+ scoreLoads=0;
+ threadIdx.x=1;GatherCandidateMap(ids.data(),slots.data(),map.data(),ids.size(),scores.data(),cfg.data(),h);
+ assert(scoreLoads==(KVIP_ROLLING_FAST_PATH?0:3));
  for(threadIdx.x=0;threadIdx.x<256;++threadIdx.x)
   GatherCandidateMap(ids.data(),slots.data(),map.data(),ids.size(),scores.data(),cfg.data(),h);
  assert(slots[1]==(KVIP_REFILTER_SAFE?UINT32_MAX:0));
@@ -257,6 +290,7 @@ int main(){
  for(unsigned winner=0;winner<4;++winner)for(unsigned mask=0;mask<16;++mask){
   std::fill(scores.begin(),scores.end(),0);put(winner,6145,110);
   for(unsigned q=0;q<4;++q){cfg[96+q]=100;cfg[100+q]=(mask&(1U<<q))?4096:2048;cfg[104+q]=8192;}
+  cfg[108]=*std::min_element(cfg.begin()+100,cfg.begin()+104);
   threadIdx.x=1;GatherCandidateMap(ids.data(),slots.data(),map.data(),ids.size(),scores.data(),cfg.data(),h);
   assert(slots[1]==UINT32_MAX);
  }
@@ -266,7 +300,7 @@ int main(){
  for(unsigned i=0;i<ids.size();++i)assert(slots[i]==map[ids[i]]);
 }
 '''
-    execute(tmp_path, f"#define KVIP_REFILTER_SAFE {safe}\n" + source, "rolling_refilter")
+    execute(tmp_path, f"#define KVIP_REFILTER_SAFE {safe}\n#define KVIP_ROLLING_FAST_PATH {fast}\n" + source, "rolling_refilter")
 
 
 def test_actual_threshold_publication_uses_writable_tensor_and_only_its_stripe(tmp_path):

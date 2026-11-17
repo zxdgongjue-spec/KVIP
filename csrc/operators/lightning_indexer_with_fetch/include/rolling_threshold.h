@@ -17,6 +17,12 @@
 #ifndef KVIP_ROLLING_REUSE_SEED
 #define KVIP_ROLLING_REUSE_SEED 0
 #endif
+#ifndef KVIP_ROLLING_FAST_PATH
+#define KVIP_ROLLING_FAST_PATH 0
+#endif
+#if KVIP_ROLLING_FAST_PATH && !KVIP_ROLLING_REUSE_SEED
+#error "Packed byte accumulation requires the reused seed histogram"
+#endif
 #if KVIP_ROLLING_REUSE_SEED && !KVIP_ROLLING_COMPACT
 #error "Seed histogram reuse requires compact window accumulation"
 #endif

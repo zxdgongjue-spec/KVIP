@@ -66,6 +66,29 @@ __simd_callee__ inline void Accumulate(RegTensor<uint16_t>& score,
 }
 
 #if KVIP_ROLLING_WINDOWED
+#if KVIP_ROLLING_FAST_PATH
+// The reused seed fixes a byte-aligned range. Decode both bytes directly
+// with the selector's existing load pattern, rather than encoding 128 u16
+// scores twice and interleaving them. Higher bytes clamp to bin 0, lower
+// bytes to bin 255. This is identical to WindowEncode, not sampling.
+__simd_callee__ inline void EncodeFullPair(RegTensor<uint8_t>& bytes,
+    __ubuf__ uint16_t* input, RegTensor<uint16_t>& seedByte,
+    RegTensor<uint16_t>& ones, RegTensor<uint16_t>& zero) {
+    auto all16 = CreateMask<uint16_t, MaskPattern::ALL>();
+    auto all8 = CreateMask<uint8_t, MaskPattern::ALL>();
+    RegTensor<uint16_t> low, high, inverted;
+    LoadAlign<uint16_t, LoadDist::DIST_DINTLV_B8>(low, high, input);
+    Xor(inverted, low, ones, all16);
+    auto& high8 = reinterpret_cast<RegTensor<uint8_t>&>(high);
+    auto& seed8 = reinterpret_cast<RegTensor<uint8_t>&>(seedByte);
+    MaskReg above, below;
+    Compare<uint8_t, CMPMODE::GT>(above, high8, seed8, all8);
+    Compare<uint8_t, CMPMODE::LT>(below, high8, seed8, all8);
+    Select(bytes, reinterpret_cast<RegTensor<uint8_t>&>(zero),
+           reinterpret_cast<RegTensor<uint8_t>&>(inverted), above);
+    Select(bytes, reinterpret_cast<RegTensor<uint8_t>&>(ones), bytes, below);
+}
+#endif
 // Common full-cold tiles need neither lane clipping nor seed-range masks.
 // Max before unsigned subtraction maps below-seed keys to the floor bin.
 __simd_callee__ inline void WindowEncode(RegTensor<uint16_t>& encoded,
@@ -98,6 +121,13 @@ __simd_callee__ inline void AccumulateWindow(__ubuf__ uint16_t* input, uint32_t 
     uint32_t reverseBegin, uint32_t reverseEnd) {
     RegTensor<uint16_t> a, b, encodedA, encodedB;
     RegTensor<uint8_t> bytes, discarded;
+#if KVIP_ROLLING_FAST_PATH
+    auto full16 = CreateMask<uint16_t, MaskPattern::ALL>();
+    RegTensor<uint16_t> seedByte, ones, zero;
+    ShiftRights(seedByte, anchor, int16_t(8), full16);
+    Muls(seedByte, seedByte, uint16_t(257), full16);
+    Duplicate(ones, uint16_t(65535)); Duplicate(zero, uint16_t(0));
+#endif
     for (uint16_t offset = 0; offset < count; offset += 256) {
         uint32_t first = scanBegin + offset, second = first + 128;
 #if KVIP_REVERSE_COLD
@@ -105,6 +135,15 @@ __simd_callee__ inline void AccumulateWindow(__ubuf__ uint16_t* input, uint32_t 
             first = reverseBegin + reverseEnd - 2048 - (first & ~2047U) + (first & 2047U);
         if (second >= reverseBegin && second < reverseEnd)
             second = reverseBegin + reverseEnd - 2048 - (second & ~2047U) + (second & 2047U);
+#endif
+#if KVIP_ROLLING_FAST_PATH
+        const bool firstFull = first + 128 <= end &&
+            (first >= recentEnd || first + 128 <= recentBegin);
+        const bool secondFull = second + 128 <= end &&
+            (second >= recentEnd || second + 128 <= recentBegin);
+        if (offset + 128 < count && firstFull && secondFull) {
+            EncodeFullPair(bytes, input + offset, seedByte, ones, zero);
+        } else {
 #endif
         LoadAlign(a, input + offset);
         WindowEncode(encodedA, a, anchor, first, end, recentBegin, recentEnd);
@@ -116,6 +155,9 @@ __simd_callee__ inline void AccumulateWindow(__ubuf__ uint16_t* input, uint32_t 
         }
         DeInterleave(bytes, discarded, reinterpret_cast<RegTensor<uint8_t>&>(encodedA),
                       reinterpret_cast<RegTensor<uint8_t>&>(encodedB));
+#if KVIP_ROLLING_FAST_PATH
+        }
+#endif
         uint32_t lanes = offset + 128 < count ? 256 : 128;
         auto valid = UpdateMask<uint8_t>(lanes);
         Histograms<uint8_t, uint16_t, HistogramsBinType::BIN0, HistogramsType::ACCUMULATE>(lower, bytes, valid);
