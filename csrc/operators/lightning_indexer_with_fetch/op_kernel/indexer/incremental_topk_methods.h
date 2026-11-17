@@ -65,7 +65,9 @@
         PipeBarrier<PIPE_V>();
         // scoreOut also backs the original progress table. Recreate that
         // table on its next publication, never publish TopK scores as progress.
+#if !KVIP_INCREMENTAL_PROGRESS
         rotationProgressBase_ = UINT32_MAX;
+#endif
     }
 
     __aicore__ inline void SeedIncremental(uint32_t query, uint32_t residentCount,
@@ -110,8 +112,12 @@
         incrementalPacked_ = false;
 #endif
         if (!incrementalCount_) return;
-        // A prior tile may still be copying the progress table from scoreOut.
+        // The original progress table aliases scoreOut. With an independent
+        // bank, score/progress DMA sources are disjoint from selector outputs.
+        // PublishIncremental still joins its own payload/header transfers.
+#if !KVIP_INCREMENTAL_PROGRESS
         SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+#endif
         PipeBarrier<PIPE_V>();
         auto offsets = reinterpret_cast<__ubuf__ uint16_t*>(incrementalOffsets_.GetPhyAddr());
 #if KVIP_INCREMENTAL_PREFILTER
@@ -191,7 +197,9 @@
             DataCopy(incrementalScores_, scoreOutLocal_, 2048);
             DataCopy(incrementalIds_, indicesOutLocal_, 2048);
             PipeBarrier<PIPE_V>();
+#if !KVIP_INCREMENTAL_PROGRESS
             rotationProgressBase_ = UINT32_MAX;
+#endif
             incrementalStrict_ += incrementalCount_;
             incrementalCount_ = 0;
             return;

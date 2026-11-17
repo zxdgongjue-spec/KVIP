@@ -45,9 +45,15 @@ public:
             reinterpret_cast<__gm__ rotating::Context*>(p)->progress));
     }
     __aicore__ inline void PrepareRotationProgress() {
-        // Prefix scores have been published; this 4KB output is dead until final TopK.
+        // Join prefix publication before choosing the progress staging bank.
         PipeBarrier<PIPE_ALL>();
+#if KVIP_INCREMENTAL_PROGRESS
+        // Fixed-window staging leaves this existing 4 KiB chunk bank unused.
+        // A separate bank removes the scoreOut/progress write-after-read hazard.
+        rotationProgress_ = incrementalScores_[kvip_incremental::kTop].template ReinterpretCast<uint32_t>();
+#else
         rotationProgress_ = scoreOutLocal_.template ReinterpretCast<uint32_t>();
+#endif
         rotationProgressBase_ = (runtimeShape_.resident / 128 / 64) * 64;
         rotating::PrepareProgress(reinterpret_cast<__ubuf__ uint32_t*>(rotationProgress_.GetPhyAddr()), rotationProgressBase_);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);

@@ -25,6 +25,12 @@
 #ifndef KVIP_INCREMENTAL_INPLACE
 #define KVIP_INCREMENTAL_INPLACE 0
 #endif
+#ifndef KVIP_INCREMENTAL_PROGRESS
+#define KVIP_INCREMENTAL_PROGRESS 0
+#endif
+#if KVIP_INCREMENTAL_PROGRESS && !KVIP_INCREMENTAL_WINDOW
+#error "Independent progress bank requires fixed-window incremental staging"
+#endif
 #if KVIP_INCREMENTAL_INPLACE && (!KVIP_INCREMENTAL_LIGHT || !KVIP_INCREMENTAL_TIES)
 #error "In-place boundary updates require light state and exact tie updates"
 #endif
