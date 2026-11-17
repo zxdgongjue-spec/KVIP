@@ -27,12 +27,13 @@ def execute(tmp_path, source, name):
     subprocess.run([str(binary)], check=True, timeout=60)
 
 
-@pytest.mark.parametrize("batched,windowed,compact,first,reuse,fast", [
-    (0, 0, 0, 0, 0, 0), (1, 0, 0, 0, 0, 0), (0, 1, 0, 0, 0, 0),
-    (0, 1, 1, 0, 0, 0), (0, 1, 1, 1, 0, 0), (0, 1, 1, 0, 1, 0),
-    (0, 1, 1, 1, 1, 0), (0, 1, 1, 0, 1, 1), (0, 1, 1, 1, 1, 1)])
+@pytest.mark.parametrize("batched,windowed,compact,first,reuse,fast,sparse", [
+    (0, 0, 0, 0, 0, 0, 0), (1, 0, 0, 0, 0, 0, 0), (0, 1, 0, 0, 0, 0, 0),
+    (0, 1, 1, 0, 0, 0, 0), (0, 1, 1, 1, 0, 0, 0), (0, 1, 1, 0, 1, 0, 0),
+    (0, 1, 1, 1, 1, 0, 0), (0, 1, 1, 0, 1, 1, 0), (0, 1, 1, 1, 1, 1, 0),
+    (0, 1, 1, 0, 1, 1, 1), (0, 1, 1, 1, 1, 1, 1)])
 @pytest.mark.parametrize("reverse", [0, 1])
-def test_actual_cdf_saturation_ties_causal_tail_and_seed_dedup(tmp_path, batched, windowed, compact, first, reuse, fast, reverse):
+def test_actual_cdf_saturation_ties_causal_tail_and_seed_dedup(tmp_path, batched, windowed, compact, first, reuse, fast, sparse, reverse):
     model = register_model_source('#include "recent_index.h"')
     model = model[:model.index('#include "recent_threshold.h"')]
     model = model.replace("{DIST_DINTLV_B8}", "{DIST_DINTLV_B8,DIST_BRC_B16}")
@@ -53,7 +54,17 @@ def test_actual_cdf_saturation_ties_causal_tail_and_seed_dedup(tmp_path, batched
 #define __ubuf__
 #define KVIP_ROLLING_THRESHOLD 1
 ''' + model + r'''
+namespace AscendC {enum class SpecialPurposeReg {AR};}
 namespace AscendC::MicroAPI {
+enum class GatherMaskMode {STORE_REG};enum class PostLiteral {POST_MODE_UPDATE};
+struct UnalignRegForStore {};
+unsigned arBytes=0,squeezeCount=0;
+template<AscendC::SpecialPurposeReg> void ClearSpr(){arBytes=0;}
+template<class T,GatherMaskMode> void Squeeze(RegTensor<T>& r,RegTensor<T>& a,MaskReg mask){
+ squeezeCount=0;for(unsigned i=0;i<a.v.size();++i)if(mask.v[i])r.v[squeezeCount++]=a.v[i];}
+template<class T,PostLiteral> void StoreUnAlign(T*& p,RegTensor<T>& r,UnalignRegForStore&){
+ std::copy_n(r.v.begin(),squeezeCount,p);p+=squeezeCount;arBytes+=squeezeCount*sizeof(T);}
+template<class T> void StoreUnAlignPost(T*&,UnalignRegForStore&){}
 template<class T> void ShiftRights(RegTensor<T>& r,RegTensor<T>& a,int16_t n,MaskReg mask){
  for(unsigned i=0;i<r.v.size();++i)if(mask.v[i])r.v[i]=a.v[i]>>n;}
 template<class T> void Xor(RegTensor<T>& r,RegTensor<T>& a,RegTensor<T>& b,MaskReg mask){
@@ -193,15 +204,40 @@ int main(){
    if(KVIP_ROLLING_WINDOWED && !frozen){
     assert(windowCount+128<=window.size());
     std::copy_n(values.data()+tile,128,window.data()+windowCount);windowCount+=128;
-    if(advance){expectedHistograms+=2*((batchCount+1)/2);batchCount=0;}
+    if(advance){if(!KVIP_ROLLING_SPARSE)expectedHistograms+=2*((batchCount+1)/2);batchCount=0;}
    }else if(!KVIP_ROLLING_WINDOWED && KVIP_ROLLING_BATCHED){
     mask=kvip_rolling::BatchMask(mask,pending,advance);
     if(batchCount==8||advance){expectedHistograms+=2*((batchCount+1)/2);batchCount=0;}
    }else if(!KVIP_ROLLING_WINDOWED){expectedHistograms+=2;}
 #if KVIP_ROLLING_WINDOWED
    if(advance && !frozen){
-    kvip_rolling::ObserveWindow(window.data(),windowCount,storage.data()+16,threshold.data(),windowHits.data(),
+#if KVIP_ROLLING_SPARSE
+    const auto originalWindow=window;
+    std::array<uint16_t,kvip_rolling::kWindowScores+32> compacted;compacted.fill(0xa55a);
+    kvip_rolling::CompactWindow(window.data(),windowCount,compacted.data()+16,storage.data()+16,
       n+ordinal*128-windowCount,end,recentBegin,recentEnd,n,end/2048*2048);
+    unsigned sparseCount=arBytes/2;
+    std::vector<uint16_t> expectedSparse;
+    for(unsigned offset=0;offset<windowCount;offset+=128){
+     unsigned physical=n+ordinal*128-windowCount+offset;
+     if(REVERSE_TEST && physical>=n && physical<end/2048*2048)
+      physical=n+end/2048*2048-2048-(physical&~2047U)+(physical&2047U);
+     for(unsigned lane=0;lane<128;++lane)
+      if(physical+lane<end && (physical+lane<recentBegin||physical+lane>=recentEnd) && window[offset+lane]>initial)
+       expectedSparse.push_back(window[offset+lane]);
+    }
+    assert(sparseCount==expectedSparse.size());
+    assert(std::equal(expectedSparse.begin(),expectedSparse.end(),compacted.begin()+16));
+    assert(window==originalWindow);
+    for(unsigned i=0;i<16;++i)assert(compacted[i]==0xa55a&&compacted[16+kvip_rolling::kWindowScores+i]==0xa55a);
+    expectedHistograms+=2*((sparseCount+255)/256);
+#endif
+    kvip_rolling::ObserveWindow(window.data(),windowCount,storage.data()+16,threshold.data(),windowHits.data(),
+      n+ordinal*128-windowCount,end,recentBegin,recentEnd,n,end/2048*2048
+#if KVIP_ROLLING_SPARSE
+      ,compacted.data()+16,sparseCount
+#endif
+      );
     windowCount=0;
     for(unsigned i=0;i<128;++i)assert(windowHits[i]==unsigned(score.v[i]>=threshold[0]&&score.v[i]>initial));
    }
@@ -225,7 +261,7 @@ int main(){
 }
 '''
     source = (f"#define KVIP_ROLLING_BATCHED {batched}\n#define KVIP_ROLLING_WINDOWED {windowed}\n"
-              f"#define KVIP_ROLLING_FAST_PATH {fast}\n"
+              f"#define KVIP_ROLLING_FAST_PATH {fast}\n#define KVIP_ROLLING_SPARSE {sparse}\n"
               f"#define KVIP_ROLLING_REUSE_SEED {reuse}\n#define KVIP_ROLLING_COMPACT {compact}\n#define KVIP_ROLLING_FIRST_WINDOW {first}\n"
               f"#define KVIP_REVERSE_COLD {reverse}\n#define REVERSE_TEST {reverse}\n") + source
     execute(tmp_path, source, "rolling_cdf")

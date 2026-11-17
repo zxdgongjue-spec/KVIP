@@ -115,6 +115,68 @@ __simd_callee__ inline void WindowEncode(RegTensor<uint16_t>& encoded,
     }
 }
 
+#if KVIP_ROLLING_SPARSE
+// Initial resident+recent Kth guarantees >=K seed scores at every key <=seed.
+// Such cold scores cannot change a later Kth. Compact only scores >seed, with
+// the same causal/recent exclusions, into the idle TopK merge buffer. The
+// source remains untouched because its last tile still feeds score DMA.
+__simd_vf__ inline void CompactWindow(__ubuf__ uint16_t* input, uint32_t count,
+    __ubuf__ uint16_t* output, __ubuf__ uint16_t* state,
+    uint32_t scanBegin, uint32_t end, uint32_t recentBegin, uint32_t recentEnd,
+    uint32_t reverseBegin, uint32_t reverseEnd) {
+    LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
+    auto all = CreateMask<uint16_t, MaskPattern::ALL>();
+    RegTensor<uint16_t> score, seed, packed;
+    LoadAlign(seed, state + kBins);
+    RegTensor<int16_t> sequence; Arange(sequence, int16_t(0));
+    auto& index = reinterpret_cast<RegTensor<uint16_t>&>(sequence);
+    ClearSpr<AscendC::SpecialPurposeReg::AR>(); UnalignRegForStore store;
+    for (uint16_t offset = 0; offset < count; offset += 128) {
+        uint32_t tile = scanBegin + offset;
+#if KVIP_REVERSE_COLD
+        if (tile >= reverseBegin && tile < reverseEnd)
+            tile = reverseBegin + reverseEnd - 2048 - (tile & ~2047U) + (tile & 2047U);
+#endif
+        LoadAlign(score, input + offset);
+        MaskReg selected; Compare<uint16_t, CMPMODE::GT>(selected, score, seed, all);
+        if (tile + 128 > end || (tile < recentEnd && tile + 128 > recentBegin)) {
+            uint32_t n = end > tile ? end - tile : 0; if (n > 128) n = 128;
+            uint32_t lo = recentBegin > tile ? recentBegin - tile : 0; if (lo > 128) lo = 128;
+            uint32_t hi = recentEnd > tile ? recentEnd - tile : 0; if (hi > 128) hi = 128;
+            MaskReg valid, left, right, outside;
+            CompareScalar<uint16_t, CMPMODE::LT>(valid, index, uint16_t(n), all);
+            CompareScalar<uint16_t, CMPMODE::LT>(left, index, uint16_t(lo), all);
+            CompareScalar<uint16_t, CMPMODE::GE>(right, index, uint16_t(hi), all);
+            MaskOr(outside, left, right, all); MaskAnd(valid, valid, outside, all);
+            MaskAnd(selected, selected, valid, all);
+        }
+        Squeeze<uint16_t, GatherMaskMode::STORE_REG>(packed, score, selected);
+        StoreUnAlign<uint16_t, PostLiteral::POST_MODE_UPDATE>(output, packed, store);
+    }
+    StoreUnAlignPost(output, store);
+    // The caller obtains the compacted byte count from AR, as in native LIDU.
+}
+
+__simd_callee__ inline void AccumulateSparse(__ubuf__ uint16_t* input, uint32_t count,
+    RegTensor<uint16_t>& lower, RegTensor<uint16_t>& upper, RegTensor<uint16_t>& anchor) {
+    auto all = CreateMask<uint16_t, MaskPattern::ALL>();
+    RegTensor<uint16_t> seedByte, ones, zero, top;
+    ShiftRights(seedByte, anchor, int16_t(8), all);
+    Muls(seedByte, seedByte, uint16_t(257), all);
+    Duplicate(ones, uint16_t(65535)); Duplicate(zero, uint16_t(0));
+    RegTensor<uint8_t> bytes;
+    for (uint16_t offset = 0; offset < count; offset += 256) {
+        EncodeFullPair(bytes, input + offset, seedByte, ones, zero);
+        uint32_t remaining = count - offset;
+        auto valid = UpdateMask<uint8_t>(remaining);
+        Histograms<uint8_t, uint16_t, HistogramsBinType::BIN0, HistogramsType::ACCUMULATE>(lower, bytes, valid);
+        Histograms<uint8_t, uint16_t, HistogramsBinType::BIN1, HistogramsType::ACCUMULATE>(upper, bytes, valid);
+    }
+    Duplicate(top, uint16_t(kTop));
+    Min(lower, lower, top, all); Min(upper, upper, top, all);
+}
+#endif
+
 __simd_callee__ inline void AccumulateWindow(__ubuf__ uint16_t* input, uint32_t count,
     RegTensor<uint16_t>& lower, RegTensor<uint16_t>& upper, RegTensor<uint16_t>& anchor,
     uint32_t scanBegin, uint32_t end, uint32_t recentBegin, uint32_t recentEnd,
@@ -175,7 +237,8 @@ __simd_callee__ inline void AccumulateWindow(__ubuf__ uint16_t* input, uint32_t 
 __simd_vf__ inline void ObserveWindow(__ubuf__ uint16_t* input, uint32_t count,
     __ubuf__ uint16_t* state, __ubuf__ uint16_t* threshold, __ubuf__ uint16_t* hits,
     uint32_t scanBegin, uint32_t end, uint32_t recentBegin, uint32_t recentEnd,
-    uint32_t reverseBegin, uint32_t reverseEnd) {
+    uint32_t reverseBegin, uint32_t reverseEnd,
+    __ubuf__ uint16_t* sparse = nullptr, uint32_t sparseCount = 0) {
     LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
     auto all = CreateMask<uint16_t, MaskPattern::ALL>();
     RegTensor<uint16_t> lower, upper, anchor, a;
@@ -188,8 +251,12 @@ __simd_vf__ inline void ObserveWindow(__ubuf__ uint16_t* input, uint32_t count,
 #else
     auto& histogramAnchor = anchor;
 #endif
+#if KVIP_ROLLING_SPARSE
+    AccumulateSparse(sparse, sparseCount, lower, upper, histogramAnchor);
+#else
     AccumulateWindow(input, count, lower, upper, histogramAnchor, scanBegin, end,
                      recentBegin, recentEnd, reverseBegin, reverseEnd);
+#endif
     // A window adds <=18432 to capped counts <=2048: no uint16 overflow.
     RegTensor<uint16_t> rank, bin, cap, key;
     Duplicate(rank, uint16_t(kTop)); Duplicate(cap, uint16_t(255));

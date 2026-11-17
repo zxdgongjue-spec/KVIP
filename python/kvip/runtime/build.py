@@ -40,7 +40,7 @@ def build_failure(log, stage, returncode):
 def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False,
                     rolling_threshold=False, window_refilter=False, rolling_batched=False, rolling_windowed=False,
                     rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False,
-                    compact_out_of_place=False, rolling_reuse_seed=False, rolling_fast_path=False):
+                    compact_out_of_place=False, rolling_reuse_seed=False, rolling_fast_path=False, rolling_sparse=False):
     """Build one shape-independent binary per source/toolchain/SoC."""
     if (window_refilter or rolling_batched or rolling_windowed) and not rolling_threshold:
         raise ValueError("Window refilter and batched counts require rolling threshold")
@@ -52,6 +52,8 @@ def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False,
         raise ValueError("First-window correction requires compact admission")
     if rolling_reuse_seed and not rolling_compact:
         raise ValueError("Seed reuse requires compact window accumulation")
+    if rolling_sparse and not rolling_fast_path:
+        raise ValueError("Sparse window counts require packed seed reuse")
     if rolling_fast_path and not rolling_reuse_seed:
         raise ValueError("Packed byte accumulation requires seed histogram reuse")
     if refilter_safe and not window_refilter:
@@ -65,6 +67,7 @@ def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False,
         KVAF_INCLUDE=str(headers),
         SOC_VERSION=soc,
         KVIP_ROLLING_REUSE_SEED="ON" if rolling_reuse_seed else "OFF",
+        KVIP_ROLLING_SPARSE="ON" if rolling_sparse else "OFF",
         KVIP_ROLLING_FAST_PATH="ON" if rolling_fast_path else "OFF",
         KVIP_COMPACT_OUT_OF_PLACE="ON" if compact_out_of_place else "OFF",
         KVIP_REFILTER_SAFE="ON" if refilter_safe else "OFF",

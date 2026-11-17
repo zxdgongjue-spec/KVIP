@@ -20,6 +20,12 @@
 #ifndef KVIP_ROLLING_FAST_PATH
 #define KVIP_ROLLING_FAST_PATH 0
 #endif
+#ifndef KVIP_ROLLING_SPARSE
+#define KVIP_ROLLING_SPARSE 0
+#endif
+#if KVIP_ROLLING_SPARSE && !KVIP_ROLLING_FAST_PATH
+#error "Sparse window counts require packed seed reuse"
+#endif
 #if KVIP_ROLLING_FAST_PATH && !KVIP_ROLLING_REUSE_SEED
 #error "Packed byte accumulation requires the reused seed histogram"
 #endif

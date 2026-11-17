@@ -871,13 +871,28 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     if (collectWindow) {
         rollingWindowCount_ += 128;
         if (rollingAdvance) {
+#if KVIP_ROLLING_SPARSE
+            // SaveResident has finished with this merge bank. Final TopK will
+            // reload it from score GM; preserve rollingWindow's score DMA input.
+            auto sparse = reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_.GetPhyAddr());
+            kvip_rolling::CompactWindow(
+                reinterpret_cast<__ubuf__ uint16_t*>(rollingWindow_.GetPhyAddr()), rollingWindowCount_,
+                sparse, rolling, (info.s2Idx + 1) * 128 - rollingWindowCount_, rollingEnds_[bank],
+                rollingBegin_[bank], rollingEnd_[bank],
+                (runtimeShape_.resident + 2047) / 2048 * 2048, rollingReverseEnd_);
+            const uint32_t sparseCount = GetSpr<SpecialPurposeReg::AR>() / sizeof(uint16_t);
+#endif
             kvip_rolling::ObserveWindow(
                 reinterpret_cast<__ubuf__ uint16_t*>(rollingWindow_.GetPhyAddr()), rollingWindowCount_,
                 rolling, reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_[bank * 128].GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint16_t*>(classifyUB_[pingpong * 256].GetPhyAddr()),
                 (info.s2Idx + 1) * 128 - rollingWindowCount_, rollingEnds_[bank],
                 rollingBegin_[bank], rollingEnd_[bank],
-                (runtimeShape_.resident + 2047) / 2048 * 2048, rollingReverseEnd_);
+                (runtimeShape_.resident + 2047) / 2048 * 2048, rollingReverseEnd_
+#if KVIP_ROLLING_SPARSE
+                , sparse, sparseCount
+#endif
+                );
             rollingWindowCount_ = 0;
             ++rollingWindowEpoch_;
             rollingWindowTrigger_ = KVIP_ROLLING_FIRST_WINDOW ? UINT32_MAX :
