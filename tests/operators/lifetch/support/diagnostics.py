@@ -914,9 +914,7 @@ def collect_details(torch, rotating, graph, reset, verify, rounds, folder, pipel
                 records = rotating.rank_progress.cpu().tolist()
                 bounds = rotating.query_ends.cpu().tolist()
                 sample['rank_progress'] = [
-                    [b, q + 1, epoch, 100 * (word & ((1 << 18) - 1)) / max(bounds[b][q], 1),
-                     100 * ((word >> 18) & ((1 << 18) - 1)) / max(bounds[b][q], 1),
-                     (word >> 36) & 4095]
+                    [b, q + 1, epoch, *decode_rank_progress(word, bounds[b][q])]
                     for b, queries in enumerate(records) for q, epochs in enumerate(queries)
                     for epoch, word in enumerate(epochs[:rotating.rounds]) if word]
             samples.append(sample)
@@ -924,6 +922,17 @@ def collect_details(torch, rotating, graph, reset, verify, rounds, folder, pipel
         pipeline.set_diagnostics(False)
         stream.synchronize()
     (folder / 'detail_samples.json').write_text(json.dumps(samples, indent=2))
+
+
+def decode_rank_progress(word, bound):
+    # Accept both the original 18-bit capture and extended long-history capture.
+    if word & (1 << 63):
+        mask = (1 << 26) - 1
+        ready, covered, rank = word & mask, (word >> 26) & mask, ((word >> 52) & 2047) + 1
+    else:
+        mask = (1 << 18) - 1
+        ready, covered, rank = word & mask, (word >> 18) & mask, (word >> 36) & 4095
+    return [100 * ready / max(bound, 1), 100 * covered / max(bound, 1), rank]
 
 
 def collect_core(torch, rotating, graph, reset, verify, rounds, folder, *, full=False, diagnostics=None, fused_final=False):
@@ -975,9 +984,7 @@ def collect_core(torch, rotating, graph, reset, verify, rounds, folder, *, full=
                 records = rotating.rank_progress.cpu().tolist()
                 bounds = rotating.query_ends.cpu().tolist()
                 samples[-1]["rank_progress"] = [
-                    [b, q + 1, epoch, 100 * (word & ((1 << 18) - 1)) / max(bounds[b][q], 1),
-                     100 * ((word >> 18) & ((1 << 18) - 1)) / max(bounds[b][q], 1),
-                     (word >> 36) & 4095]
+                    [b, q + 1, epoch, *decode_rank_progress(word, bounds[b][q])]
                     for b, queries in enumerate(records) for q, epochs in enumerate(queries)
                     for epoch, word in enumerate(epochs[:rotating.rounds]) if word
                 ]

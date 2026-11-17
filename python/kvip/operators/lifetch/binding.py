@@ -41,8 +41,8 @@ class LIFetchBinding:
         if not isinstance(prefetch_rank_start, int) or not 1 <= prefetch_rank_start <= 2048:
             raise ValueError("prefetch_rank_start must be an integer in 1..2048")
         self.prefetch_rank_start = prefetch_rank_start
-        if history > 131072:
-            raise ValueError("Ranked LIFetch requires history<=131072")
+        if history >= (1 << 26):
+            raise ValueError("Ranked LIFetch history must fit the 26-bit progress counter")
         if resident > 131072:
             raise ValueError("LIFetch hot bitmap supports resident <= 131072")
         if not 1 <= batch <= 16:

@@ -51,6 +51,8 @@ __aicore__ inline void ExportWindowCold(uint32_t query) {
     if(rankTrace_ && rankedEpoch_<32) {
         uint32_t ready=kvip_coverage::Covered(uint32_t(rankReady_),uint32_t(rankReady_>>32),runtimeShape_.resident,valid,rankHalf_,tailBegin,tailEnd);
         uint64_t record=uint64_t(ready)|(uint64_t(coveredCount)<<18)|(uint64_t(rank)<<36);
+        if(runtimeShape_.history>=(1U<<18))
+            record=(1ULL<<63)|uint64_t(ready)|(uint64_t(coveredCount)<<26)|(uint64_t(rank-1)<<52);
         auto trace=reinterpret_cast<__gm__ uint64_t*>(ctx->incremental+
             runtimeShape_.batch*(512+4*2048*6+1024+(runtimeShape_.history+255)/256*32));
         trace[query*32+rankedEpoch_]=record;
