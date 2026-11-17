@@ -162,11 +162,14 @@ def test_scan_compiles_unique_variants_before_allocating_arena(tmp_path, monkeyp
     args = SimpleNamespace(study="scan-order", mode="fused", transport="urma", threshold_policy="recent",
                            scan_variants=list(ROLLING_VARIANTS), build_dir=tmp_path, soc="A5")
     calls = []
+    verified = []
     monkeypatch.setattr(build, "kvaf_build_paths", lambda path: (path / "cann", path / "headers"))
-    monkeypatch.setattr(build, "build_libraries", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(build, "build_libraries", lambda **kwargs: calls.append(kwargs) or (tmp_path / "bridge.so",))
+    monkeypatch.setattr(scan_options, "verify_library", lambda path, options: verified.append(options))
 
     def stop_before_allocation(*unused):
         assert len(calls) == 5  # forward-end reuses forward's binary.
+        assert verified == [options_for(name) for name in ROLLING_VARIANTS[:-1]]
         assert [tuple(call[key] for key in scan_options.OPTIONS) for call in calls] == [
             tuple(options_for(name).values()) for name in ROLLING_VARIANTS[:-1]]
         raise RuntimeError("stop before NPU allocation")
@@ -178,6 +181,7 @@ def test_scan_compiles_unique_variants_before_allocating_arena(tmp_path, monkeyp
     def compiler_failure(**kwargs):
         if kwargs["rolling_threshold"]:
             raise RuntimeError("compiler diagnostic")
+        return (tmp_path / "bridge.so",)
 
     monkeypatch.setattr(build, "build_libraries", compiler_failure)
     retained = {}

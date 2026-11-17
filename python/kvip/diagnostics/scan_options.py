@@ -189,6 +189,28 @@ def validate_options(options):
     return dict(options)
 
 
+def verify_library(path, options):
+    """Check the real host ABI in a child so registrations cannot accumulate."""
+    import json
+    import subprocess
+    import sys
+
+    check = (
+        "import ctypes,json,sys; "
+        "from kvip.diagnostics.fused_replay import verify_build_options; "
+        "verify_build_options(ctypes.CDLL(sys.argv[1]),json.loads(sys.argv[2]))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", check, str(path), json.dumps(options)],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    if result.returncode:
+        detail = (result.stderr or result.stdout)[-4000:]
+        raise RuntimeError(
+            f"LIFetch ABI preflight failed (exit={result.returncode}): {path}\n{detail}"
+        )
+
+
 def prebuild(args, retained):
     """Use the production builder before allocating/restoring any NPU arena."""
     from pathlib import Path
@@ -204,7 +226,9 @@ def prebuild(args, retained):
         if key in seen:
             continue
         retained.setdefault("progress", {}).update(variant=name, phase="compile_preflight", step=None)
-        build_libraries(cache_dir=Path(args.build_dir) / "lifetch", cann=cann, headers=headers,
-                        soc=args.soc, **options)
+        library, = build_libraries(cache_dir=Path(args.build_dir) / "lifetch", cann=cann,
+                                   headers=headers, soc=args.soc, **options)
+        retained["progress"].update(phase="abi_preflight")
+        verify_library(library, options)
         seen.add(key)
-    emit(f"BUILD_VARIANTS_READY unique={len(seen)}")
+    emit(f"BUILD_VARIANTS_READY unique={len(seen)} abi=verified")
