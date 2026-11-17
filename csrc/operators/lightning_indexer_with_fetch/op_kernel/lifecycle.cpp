@@ -36,7 +36,6 @@ __aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uin
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     FillRoundWords(ctx->incremental+b*512,128,local);
     FillRoundWords(kvip_prefetch_rank::CoveredAddress(ctx->incremental,rt_batch,rt_history,b),(rt_history+255)/256*8,local);
-    FillRoundWords(ctx->rows+b*sizeof(Row),sizeof(Row)/4,local);
     FillRoundWords(ctx->progress+b*4*sizeof(Progress),4*sizeof(Progress)/4,local);
     FillRoundWords(ctx->owners+b*128,32,local);
     FillRoundWords(ctx->owners+rt_batch*128+b*rt_finalWorkers*kFinalStateWords*4,rt_finalWorkers*kFinalStateWords,local);
@@ -119,10 +118,22 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
             mapPipe.Destroy();
             if(begin<end) Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},rt_history,rt_resident,ctx,b,begin,end);
         }
+        // A separate shard clears the per-round state while the owner
+        // initializes the row. The next kernel waits for all init blocks.
+        if(part==1) {
+            auto initBindings=reinterpret_cast<__gm__ uint64_t*>(bindings);
+            auto streaming=reinterpret_cast<__gm__ pipeline_ab::Args*>(initBindings[15]);
+            InitializeRound(rt_batch,rt_history,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b,streaming);
+        }
         if(part) return;
-        auto initBindings=reinterpret_cast<__gm__ uint64_t*>(bindings);
-        auto streaming=reinterpret_cast<__gm__ pipeline_ab::Args*>(initBindings[15]);
-        InitializeRound(rt_batch,rt_history,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b,streaming);
+        TPipe rowPipe; TBuf<TPosition::VECCALC> rowStorage;
+        rowPipe.InitBuffer(rowStorage,sizeof(Row));
+        auto rowLocal=rowStorage.Get<uint32_t>();
+        Duplicate(rowLocal,uint32_t(0),sizeof(Row)/4);
+        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        FillRoundWords(ctx->rows+b*sizeof(Row),sizeof(Row)/4,rowLocal);
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        rowPipe.Destroy();
         auto args=GetArgs(ctx,b*2);
         auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
         auto entity=reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(args.channel_entity);
