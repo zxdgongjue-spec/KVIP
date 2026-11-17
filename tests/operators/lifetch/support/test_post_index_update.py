@@ -8,13 +8,16 @@ cross-kernel/cache ordering and Get/CQ completion still require the NPU replay.
 
 import subprocess
 
+import pytest
+
 from test_recent_index import INDEXER
 
 
-def test_parallel_post_index_preserves_complete_rows_and_self_refills(tmp_path):
+@pytest.mark.parametrize("threads", [16, 512])
+def test_parallel_post_index_preserves_complete_rows_and_self_refills(tmp_path, threads):
     kernel = INDEXER.parent
     header = (kernel / "post_index_update.h").read_text().replace(
-        "constexpr uint32_t kThreads = 512;", "constexpr uint32_t kThreads = 1;"
+        "constexpr uint32_t kThreads = 512;", f"constexpr uint32_t kThreads = {threads};"
     )
     source = tmp_path / "post_index_update.cpp"
     source.write_text(r'''
@@ -36,6 +39,7 @@ void asc_threadfence(){}
 template<class T>T asc_ldcg(T* p){return *p;}
 template<class T>void asc_stcg(T* p,T value){*p=value;}
 void asc_atomic_or(uint32_t* p,uint32_t value){*p|=value;}
+void asc_atomic_add(uint32_t* p,uint32_t value){*p+=value;}
 ''' + header + r'''
 int main(){using namespace post_index;
  constexpr uint32_t R=16384,H=32768;
@@ -71,11 +75,16 @@ int main(){using namespace post_index;
     keys=oldKeys;scales=oldScales;addresses=oldAddresses;logical=oldLogical;
     std::vector<uint32_t> work(16384);
     for(uint32_t lane=0;lane<lanes;++lane){
-     ValidatePlan(src.data(),dst.data(),0,n,R,H,lane,lanes,work.data());assert(!work[0]);
+     for(threadIdx.x=0;threadIdx.x<kThreads;++threadIdx.x)
+      ValidatePlan(src.data(),dst.data(),0,n,R,H,lane,lanes,work.data());
+     assert(!work[0]);
     }
     // Reverse shard order proves no shard depends on another shard's writes.
-    for(uint32_t lane=lanes;lane--;)
-     ApplyPlan(src.data(),dst.data(),0,n,R,H,keys.data(),scales.data(),addresses.data(),logical.data(),lane,lanes,work.data());
+    uint32_t prefix[]={0,n};
+    std::vector<uint64_t> records(lanes*16);
+    for(uint32_t lane=lanes;lane--;)for(threadIdx.x=0;threadIdx.x<kThreads;++threadIdx.x)
+     ApplyPlan<false>(src.data(),dst.data(),0,n,H,prefix,1,n*lane/lanes,n*(lane+1)/lanes,
+       nullptr,records.data(),lanes,keys.data(),scales.data(),addresses.data(),logical.data(),H,nullptr);
     assert(hotValid==oldValid&&kv==oldKv); // Index cannot declare CQ success.
     for(uint32_t i=0;i<H;++i){
      assert(scales[i]==oldScales[permutation[i]]);
@@ -102,6 +111,7 @@ int main(){using namespace post_index;
   }
  }
  // Unsupported hot-to-hot dependencies must be rejected before all posting.
+ threadIdx.x=0;
  uint32_t work[4],src,dst;
  for(auto pair:std::vector<std::pair<uint32_t,uint32_t>>{{0,1},{H,0},{R,R}}){
   src=pair.first;dst=pair.second;ValidatePlan(&src,&dst,0,1,R,H,0,1,work);assert(work[0]);
@@ -110,6 +120,66 @@ int main(){using namespace post_index;
  ValidatePlan(&src,&dst,0,8193,R,H,0,1,work);assert(work[0]);
  ValidatePlan(&src,&dst,0,1,R,H,0,0,work);assert(work[0]);
  ValidatePlan(&src,&dst,0,1,R,H,1,1,work);assert(work[0]);
+ // Uneven requests and empty rows must spread across all AIVs. Physical
+ // owners are deliberately permuted, and the DDR address stride differs.
+ constexpr uint32_t BH=512,BR=128,AS=544,STRIDE=144,OFFSET=5;
+ for(uint32_t batch:{1U,3U,16U})for(uint32_t cores:{16U,32U,64U}){
+  std::vector<uint32_t> prefix(batch+1),owners(batch),s(batch*STRIDE),d(batch*STRIDE);
+  std::vector<uint64_t> records(cores*16),keys(batch*BH*16),addr(batch*AS),ids(batch*BH);
+  std::vector<uint32_t> scales(batch*BH);
+  for(uint32_t row=0;row<batch;++row){
+   owners[row]=batch-1-row;
+   uint32_t n=batch==1?111:(row%4==0?0:row%4==1?111:row%4==2?1:17);
+   prefix[row+1]=prefix[row]+n;
+   for(uint32_t i=0;i<n;++i){d[row*STRIDE+OFFSET+i]=i;s[row*STRIDE+OFFSET+i]=(row%3==0||i%7==0)?i:BR+i;}
+  }
+  for(uint32_t row=0;row<batch;++row)for(uint32_t i=0;i<BH;++i){
+   ids[row*BH+i]=row*BH+i;scales[row*BH+i]=(row*BH+i)*13;
+   for(uint32_t f=0;f<16;++f)keys[(row*BH+i)*16+f]=(row*BH+i)*17+f;
+  }
+  for(uint32_t i=0;i<addr.size();++i)addr[i]=0x100000+uint64_t(i)*656;
+  const auto initialKeys=keys,initialAddr=addr,initialIds=ids;const auto initialScales=scales;
+  for(bool failed:{false,true}){
+   keys=initialKeys;addr=initialAddr;ids=initialIds;scales=initialScales;
+   std::fill(records.begin(),records.end(),0);
+   const uint32_t badRow=batch==1?0:1;
+   if(failed)records[(badRow+batch<cores?badRow+batch:badRow)*16]=4;
+   auto expectedKeys=keys,expectedAddr=addr,expectedIds=ids;auto expectedScales=scales;
+   uint32_t expectedMoved=0;
+   for(uint32_t row=0;row<batch;++row){
+    if(failed&&row==badRow)continue;
+    for(uint32_t i=0;i<prefix[row+1]-prefix[row];++i){
+     uint32_t a=s[row*STRIDE+OFFSET+i],b=d[row*STRIDE+OFFSET+i];
+     if(a!=b)++expectedMoved;
+     for(uint32_t f=0;f<16;++f)std::swap(expectedKeys[(owners[row]*BH+a)*16+f],expectedKeys[(owners[row]*BH+b)*16+f]);
+     std::swap(expectedAddr[owners[row]*AS+a],expectedAddr[owners[row]*AS+b]);
+     std::swap(expectedIds[owners[row]*BH+a],expectedIds[owners[row]*BH+b]);
+     std::swap(expectedScales[owners[row]*BH+a],expectedScales[owners[row]*BH+b]);
+    }
+   }
+   for(bool profiled:{false,true}){
+    keys=initialKeys;addr=initialAddr;ids=initialIds;scales=initialScales;
+    uint32_t sumMoved=0,minAssigned=UINT32_MAX,maxAssigned=0;
+    for(uint32_t core=cores;core--;){
+     uint32_t first=prefix.back()*core/cores,end=prefix.back()*(core+1)/cores,counter=0;
+     minAssigned=std::min(minAssigned,end-first);maxAssigned=std::max(maxAssigned,end-first);
+     // Execute either one or the real 32 independent 16-thread groups.
+     // Only each group's lane 0 changes scalar metadata and adds its count;
+     // thread 0 initializes the diagnostic counter before other groups run.
+     for(threadIdx.x=0;threadIdx.x<kThreads;++threadIdx.x){
+      if(profiled)ApplyPlan<true>(s.data(),d.data(),OFFSET,STRIDE,BH,prefix.data(),batch,first,end,
+        owners.data(),records.data(),cores,keys.data(),scales.data(),addr.data(),ids.data(),AS,&counter);
+      else ApplyPlan<false>(s.data(),d.data(),OFFSET,STRIDE,BH,prefix.data(),batch,first,end,
+        owners.data(),records.data(),cores,keys.data(),scales.data(),addr.data(),ids.data(),AS,nullptr);
+     }
+     assert(counter<=end-first);sumMoved+=counter;
+    }
+    assert(maxAssigned-minAssigned<=1);
+    assert(!profiled||sumMoved==expectedMoved);
+    assert(keys==expectedKeys&&addr==expectedAddr&&ids==expectedIds&&scales==expectedScales);
+   }
+  }
+ }
 }
 ''')
     binary = tmp_path / "post_index_update"

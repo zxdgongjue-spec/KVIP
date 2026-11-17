@@ -33,6 +33,14 @@ def test_collective_tail_uses_batch_scheduled_mixed_vector_kernel():
     assert "ValidateBatchGetRequests" not in transport
     assert "args.tokens_per_block = 1" in tail
     assert tail.index("post_index_transport::Preflight(args") < tail.index("Simt::VF_CALL<Pack>")
+    assert "OwnerRow(ctx" not in tail
+    assert "16384 * 4" not in tail
+    assert "prefix[i % batch + 1] += uint32_t(records[i].count)" in tail
+    assert "ApplyPlan<false>" in tail and "ApplyPlan<true>" in tail
+    # OutputWorker's old diagnostic slots overlap the per-core scratch. Only
+    # initialize the new ABI after those writers finish at the first barrier.
+    assert tail.index("OutputWorker(a") < tail.index("SyncAll();") < tail.index("trace[2] = 0x50495831U")
+    assert tail.count("RowError(records,") == 1  # one final join after every CQ
 
 
 def test_whole_tail_header_and_q4_pack(tmp_path):
@@ -61,6 +69,7 @@ void asc_threadfence(){}
 template<class T>T asc_ldcg(T* p){return *p;}
 template<class T>void asc_stcg(T* p,T value){*p=value;}
 void asc_atomic_or(uint32_t* p,uint32_t value){*p|=value;}
+void asc_atomic_add(uint32_t* p,uint32_t value){*p+=value;}
 enum class HardEvent {V_S};
 template<HardEvent>void SetFlag(uint32_t){}
 template<HardEvent>void WaitFlag(uint32_t){}
@@ -80,11 +89,12 @@ struct TPipe {
 void SyncAll(){}
 struct Context {
  RuntimeShape shape;
- uint64_t sourceBlocks,sourceOffsets,destinations,rowStatus,fallbackAddresses,fallbackValid,rows;
+ uint64_t sourceBlocks,sourceOffsets,destinations,rowStatus,fallbackAddresses,fallbackValid,rows,rowOwners;
 };
 struct alignas(64) Row {uint64_t entity,queue,addresses,output;uint32_t slots,requests,suppressed,error;};
 RuntimeShape LoadRuntimeShape(Context* ctx){return ctx->shape;}
-uint32_t OwnerRow(Context*,uint32_t b){return b;}
+// Negative control: scalar code must never call the SIMT-only owner helper.
+uint32_t OwnerRow(Context*,uint32_t)=delete;
 struct FinalPost {uint32_t count,pending,error,deferred,descriptor;};
 FinalPost finalPosts[4]{};
 FinalPost* FinalPostAt(uint32_t,Context*,uint32_t index){return finalPosts+index;}
@@ -104,7 +114,7 @@ int main(){
  std::mt19937 random(1117);
  constexpr uint32_t batch=16,cores=64;
  std::vector<int32_t> blocks(batch*kSlots),offsets(batch*kSlots),destinations(batch*kSlots);
- std::vector<int32_t> packed(batch*3*kSlots,-1);
+ std::vector<int32_t> packed(batch*9*kSlots,-1);
  std::vector<uint64_t> addresses(batch*kSlots);
  std::vector<uint8_t> valid(batch*kSlots,1);
  constexpr uint64_t remoteBase=0x10000000,remoteBytes=uint64_t(batch)*kSlots*656;

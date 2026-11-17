@@ -22,6 +22,19 @@ Missing KV whose Index is already resident refills its own hot slot; it still
 counts as a real Get. Cold positions swap with unique, unselected hot slots.
 Consequently different Index events have disjoint endpoints and can execute
 on all participating AIVs without constructing a permutation/shadow map.
+Index work is partitioned across the whole batch, rather than reserving a
+fixed group of cores for each request. The existing preflight reduction also
+constructs at most 17 prefix offsets from the request counts. Each AIV then
+reads its balanced range directly from the original event arrays; self-refills
+are skipped. There is no per-event compact-list write or 64-KiB ID staging
+buffer. Sixteen SIMT threads exchange one 128-byte key row, and the first
+thread also exchanges its scale, address and logical ID. Owner lookup stays
+inside SIMT, where the indexed-load primitives are legal.
+
+This balances assigned events, not necessarily actual non-self exchanges.
+When self-refills dominate, some cores can still do less work. The added prefix
+lookup must be included in timing; source-level reductions alone do not prove
+a speedup over the existing automatic route or strong serial baseline.
 The finalizer omits empty prefetch completion, obsolete role-flag polling and
 queue diagnostics belonging to the old worker layout. It retains completion
 counts, output validation, failure invalidation and success-only feedback.
@@ -55,6 +68,10 @@ capture. It adds no KV scratch arena and retains the 256-byte streaming Args
 ABI. Headline samples do not read clocks in this record. Optional separate
 diagnostic replays record plan/pack/Post/Index/CQ boundaries; overlapping
 cross-core intervals cannot be summed into graph latency.
+Additional markers reuse the existing per-core diagnostic area to separate
+Post-barrier wait, Index work, Index-barrier wait and CQ wait. They also record
+assigned events and actual exchanges per AIV. An exchange implies 592 bytes
+of logical tuple reads/writes; this is not a measured HBM-bus traffic count.
 
 ## Validation and expected effect
 

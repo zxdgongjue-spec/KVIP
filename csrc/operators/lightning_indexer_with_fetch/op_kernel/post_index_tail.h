@@ -86,6 +86,12 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
     auto records = reinterpret_cast<__gm__ Record*>(a->postIndex);
     auto record = records + block;
     const bool profile = (a->prefetchCount & 0x80000000U) != 0;
+    auto trace = reinterpret_cast<__gm__ uint64_t*>(a->times) +
+                 uint64_t(batch) * 256 + uint64_t(block) * 32;
+    // Existing packed workspace has at least 9*batch*8192 words. The first
+    // 3*batch*8192 hold Get descriptors; only batch+1 more words are needed.
+    auto prefix = reinterpret_cast<__gm__ uint32_t*>(a->packedFetch) +
+                  uint64_t(batch) * 3 * kSlots;
     // Preserve init's decision; timestamps are zero in headline samples.
     auto words = reinterpret_cast<__gm__ uint64_t*>(record);
     // Peers can still be reading the entry decision. Never transiently clear
@@ -109,7 +115,13 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
     // TND outputs use the old logical table. Every reader finishes here,
     // before any Index tuple or logical/address mapping can be exchanged.
     SyncAll();
-    if (profile) record->planDone = GetSystemCycle();
+    if (profile) {
+        record->planDone = GetSystemCycle();
+        // Old OutputWorker diagnostic rows share this scratch allocation.
+        // Initialize PIX1 only after every old producer/worker writer joined.
+        for (uint32_t i = 2; i <= 10; ++i) trace[i] = 0;
+        trace[2] = 0x50495831U;  // PIX1: all-AIV Index work/barrier diagnostics
+    }
 
     auto info = reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus) + b * kRowStatusWords;
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info), 128);
@@ -175,15 +187,22 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
     SyncAll();
     if (!block) {
         uint64_t anyError = 0, anyBlocking = 0;
+        for (uint32_t i = 0; i <= batch; ++i) prefix[i] = 0;
         for (uint32_t i = 0; i < cores; ++i) {
             Flush(records + i);
             anyError |= records[i].error; anyBlocking |= records[i].fallback;
+            prefix[i % batch + 1] += uint32_t(records[i].count);
         }
+        for (uint32_t i = 1; i <= batch; ++i) prefix[i] += prefix[i - 1];
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(prefix), (batch + 1) * sizeof(uint32_t));
         record->globalError = anyError; record->fallback = anyBlocking;
         Flush(record);
     }
     SyncAll();
     Flush(records);
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(prefix), (batch + 1) * sizeof(uint32_t));
+    const uint32_t indexFirst = uint64_t(prefix[batch]) * block / cores;
+    const uint32_t indexEnd = uint64_t(prefix[batch]) * (block + 1) / cores;
     error |= records[0].globalError;
     blocking = records[0].fallback != 0;
     record->fallback = blocking; record->globalError = records[0].globalError;
@@ -199,28 +218,57 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
     record->error = error; Flush(record);
     // No AIV enters Index maintenance before all Post calls have returned.
     SyncAll();
-    error |= RowError(records, b, batch, cores);
-    if (!error && total) {
-        const uint32_t owner = OwnerRow(ctx, b);
+    if (profile) trace[3] = trace[4] = GetSystemCycle();
+    if (!records[0].globalError && indexEnd > indexFirst) {
         auto update = reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);
-        TPipe pipe; TBuf<TPosition::VECCALC> scratch;
-        pipe.InitBuffer(scratch, 16384 * 4); auto local = scratch.Get<uint32_t>();
-        Simt::VF_CALL<post_index::ApplyPlan>(Simt::Dim3{512,1,1}, sources, destinations,
-            kPrefetch, total, shape.resident, shape.history,
-            reinterpret_cast<__gm__ uint64_t*>(a->keys) + uint64_t(owner) * shape.history * 16,
-            reinterpret_cast<__gm__ uint32_t*>(a->scales) + uint64_t(owner) * shape.history,
-            reinterpret_cast<__gm__ uint64_t*>(a->addresses) + uint64_t(owner) * update[7],
-            reinterpret_cast<__gm__ uint64_t*>(a->logical) + uint64_t(owner) * shape.history,
-            lane, lanes, reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
-        SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
-        pipe.Destroy();
+        // Owner loads are SIMT-only. Pass base arrays and let each VF thread
+        // find the request owning its global event, without scalar OwnerRow.
+        if (profile) {
+            TPipe pipe; TBuf<TPosition::VECCALC> scratch;
+            pipe.InitBuffer(scratch, 64); auto local = scratch.Get<uint32_t>();
+            Simt::VF_CALL<post_index::ApplyPlan<true>>(Simt::Dim3{512,1,1},
+                reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc),
+                reinterpret_cast<__gm__ uint32_t*>(a->eventsDst),
+                kPrefetch, a->maxEvents, shape.history, prefix, batch, indexFirst, indexEnd,
+                reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners),
+                reinterpret_cast<__gm__ uint64_t*>(records), cores,
+                reinterpret_cast<__gm__ uint64_t*>(a->keys),
+                reinterpret_cast<__gm__ uint32_t*>(a->scales),
+                reinterpret_cast<__gm__ uint64_t*>(a->addresses),
+                reinterpret_cast<__gm__ uint64_t*>(a->logical), uint32_t(update[7]),
+                reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
+            SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            trace[8] = local.GetValue(0);
+            pipe.Destroy();
+        } else {
+            Simt::VF_CALL<post_index::ApplyPlan<false>>(Simt::Dim3{512,1,1},
+                reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc),
+                reinterpret_cast<__gm__ uint32_t*>(a->eventsDst),
+                kPrefetch, a->maxEvents, shape.history, prefix, batch, indexFirst, indexEnd,
+                reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners),
+                reinterpret_cast<__gm__ uint64_t*>(records), cores,
+                reinterpret_cast<__gm__ uint64_t*>(a->keys),
+                reinterpret_cast<__gm__ uint32_t*>(a->scales),
+                reinterpret_cast<__gm__ uint64_t*>(a->addresses),
+                reinterpret_cast<__gm__ uint64_t*>(a->logical), uint32_t(update[7]),
+                static_cast<__ubuf__ uint32_t*>(nullptr));
+            SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        }
     }
-    if (profile) record->indexDone = GetSystemCycle();
+    if (profile) {
+        trace[9] = indexEnd - indexFirst;
+        trace[10] = trace[8] * 592;  // two reads+writes of key/scale/address/id
+        trace[5] = record->indexDone = GetSystemCycle();
+    }
     record->error = error; Flush(record);
     SyncAll();
+    if (profile) trace[6] = GetSystemCycle();
     // A peer/Index failure must never strand a successfully posted queue.
     error |= post_index_transport::Wait(transport);
-    if (profile && !blocking) record->cqDone = GetSystemCycle();
+    if (profile) {
+        trace[7] = GetSystemCycle();
+        if (!blocking) record->cqDone = trace[7];
+    }
     record->completed = transport.completed; record->error = error;
     Flush(record);
     SyncAll();
