@@ -85,8 +85,24 @@ def summarize(args):
             ends = phases["phase_end_from_first_begin_cycles"]
             values = " ".join(f"{name}={ends[name]}" for name in ("plan", "pack", "post", "index", "cq"))
             print(f"PHASE_END sample={number} unit=cycles policy={phases['phase_policy']} {values}")
+            detail = phases.get("index_work", {})
+            if detail.get("status") == "available":
+                assigned, moved = detail["assigned_events"], detail["moved_tuples"]
+                counts = " ".join(
+                    f"{name}={row['total']} min/p50/max={row['min']}/{row['p50']:g}/{row['max']} "
+                    f"active={row['active_cores']}/{detail['core_count']}"
+                    for name, row in (("assigned", assigned), ("moved", moved))
+                )
+                print(f"INDEX_WORK sample={number} {counts} "
+                      f"logical_index_rw_bytes={detail['logical_index_rw_bytes']}")
+                spans = " ".join(f"{name}={row['p50']:g}/{row['max']}"
+                                 for name, row in detail["per_core_cycles"].items())
+                print(f"INDEX_CYCLES sample={number} p50/max {spans}")
+            else:
+                print(f"INDEX_WORK sample={number} unavailable：该二进制未提供PIX1诊断")
     if candidate.get("native_diagnostics", {}).get("samples"):
         print("PHASE边界是各阶段最晚完成时间相对最早begin；包含同步，不能相加或当作完整耗时。")
+        print("INDEX字节为每个非self交换592B的逻辑读写量，未计L2/协议；独立诊断cycles不换算带宽。")
     parity = all(all(c <= b for c, b in zip(timing(candidate, True), timing(cases[role], True)))
                  for role in ("serial", "serial-end"))
     goal = all(all(c <= .65*b for c, b in zip(timing(candidate, True), timing(cases[role], True)))

@@ -6,7 +6,9 @@ from types import SimpleNamespace
 import pytest
 
 from kvip.diagnostics.pipeline_options import options_for
+from kvip.diagnostics.post_index_profile import decode_post_index
 from kvip.diagnostics.post_index_report import ROLES, summarize
+from test_post_index_profile import data, detail_data
 from test_read_through_report import case
 
 
@@ -52,6 +54,27 @@ def test_capacity_fallback_is_correct_but_does_not_fulfil_async_order(tmp_path, 
     output = capsys.readouterr().out
     assert "correctness=PASS" in output
     assert "POST_INDEX_ORDER low_samples=2 fallback_samples=1 diagnostic_fallback_samples=0 fulfilled=false" in output
+
+
+@pytest.mark.parametrize("detailed", [False, True])
+def test_report_distinguishes_versioned_index_work_and_unavailable_old_binary(tmp_path, capsys, detailed):
+    values = reports()
+    raw = data(True)
+    phases = decode_post_index(raw, active=True, diagnostic=True,
+                               index_detail=detail_data(raw) if detailed else None)
+    values["post-index"]["native_diagnostics"] = dict(samples=[dict(reads=dict(post_index=phases))])
+    write(tmp_path, values)
+    summarize(SimpleNamespace(directory=tmp_path, group=2))
+    output = capsys.readouterr().out
+    if detailed:
+        assert "assigned=2016 min/p50/max=31/31.5/32 active=64/64" in output
+        assert "moved=992 min/p50/max=0/15.5/31 active=62/64" in output
+        assert "logical_index_rw_bytes=587264" in output
+        assert "INDEX_CYCLES sample=1 p50/max post_barrier=5/5" in output
+        assert "index_work=15/15" in output and "cq_wait=20/30" in output
+    else:
+        assert "INDEX_WORK sample=1 unavailable" in output
+        assert "INDEX_CYCLES" not in output
 
 
 @pytest.mark.parametrize("fault", ["missing-flag", "read-through", "compact", "weak-serial", "different-input",

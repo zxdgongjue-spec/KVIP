@@ -259,10 +259,14 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         if bundle.tuning.get("low_miss_post_index"):
             from kvip.diagnostics.post_index_profile import decode_post_index
 
+            diagnostic = bool(getattr(bundle, "post_index_diagnostics", False))
+            detail = (cpu_array(torch, bundle.forward.times)[bundle.forward.batch * 256:].reshape(-1, 32)
+                      if diagnostic else None)
             reads["post_index"] = decode_post_index(
                 cpu_array(torch, bundle.forward.post_index),
                 active=early_threshold_skipped(bundle.tuning),
-                diagnostic=bool(getattr(bundle, "post_index_diagnostics", False)),
+                diagnostic=diagnostic,
+                index_detail=detail,
             )
             if reads["post_index"]["active"] and reads["post_index"]["submitted_requests"] != reads["final"]:
                 raise AssertionError("Post-Index per-core request count differs from verified final Get")

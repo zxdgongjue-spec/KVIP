@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from kvip.diagnostics.post_index_profile import decode_post_index
+from kvip.diagnostics.post_index_profile import INDEX_DETAIL_MAGIC, decode_post_index
 from kvip.diagnostics.native_profile import decode_profile
 
 
@@ -36,6 +36,80 @@ def test_diagnostic_uses_latest_end_and_same_core_durations_not_sum():
     assert result["fallback"] and result["fallback_cores"] == 64
     assert result["phase_policy"] == "bounded_sync_get_then_index"
     assert "cq" not in result["per_core_phase_cycles"]
+
+
+def detail_data(raw):
+    detail = np.zeros((len(raw), 32), dtype=np.int64)
+    detail[:, 2] = INDEX_DETAIL_MAGIC
+    detail[:, 3:8] = [155, 160, 175, 190, 210]
+    detail[:, 7] = raw[:, 9]
+    detail[:, 9] = sum(raw[:, 1]) // len(raw)
+    detail[:sum(raw[:, 1]) % len(raw), 9] += 1
+    detail[:, 8] = np.arange(len(raw)) // 2
+    detail[:, 10] = detail[:, 8] * 592
+    return detail
+
+
+def test_index_detail_separates_actual_work_from_two_barriers_and_cq():
+    raw = data(True)
+    detail = detail_data(raw)
+    result = decode_post_index(raw, active=True, diagnostic=True, index_detail=detail)["index_work"]
+    assert result["assigned_events"]["total"] == sum(range(64))
+    assert result["moved_tuples"] == dict(min=0, p50=15.5, max=31, mean=15.5,
+                                          total=992, active_cores=62, samples=list(np.arange(64) // 2))
+    assert result["assigned_events"]["max"] - result["assigned_events"]["min"] == 1
+    assert result["logical_index_rw_bytes"] == 992 * 592
+    cycles = result["per_core_cycles"]
+    assert cycles["post_barrier"]["p50"] == 5
+    assert cycles["index_setup"]["p50"] == 5
+    assert cycles["index_work"]["p50"] == 15
+    assert cycles["index_publish"]["p50"] == 5
+    assert cycles["index_barrier"]["p50"] == 10
+    assert cycles["cq_wait"]["p50"] == 20 and cycles["cq_wait"]["max"] == 30
+    assert "total" not in cycles["index_work"]
+    raw[:, 2] = 1
+    raw[:, 9] = raw[:, 7]
+    fallback = decode_post_index(raw, active=True, diagnostic=True, index_detail=detail)["index_work"]
+    assert "cq_wait" not in fallback["per_core_cycles"]
+    assert fallback["per_core_cycles"]["cq_finalize"]["p50"] == 20
+
+
+def test_index_detail_without_magic_never_interprets_old_role_data():
+    raw = data(True)
+    for detail in (None, np.full((64, 32), -1, dtype=np.int64)):
+        result = decode_post_index(raw, active=True, diagnostic=True, index_detail=detail)
+        assert result["index_work"]["status"] == "unavailable"
+    assert decode_post_index(raw, active=False, diagnostic=True, index_detail=object()) == dict(status="not_entered", active=False)
+
+
+@pytest.mark.parametrize("fault", ["shape", "partial", "clock", "post-clock", "index-clock", "cq-clock",
+                                   "assigned", "unbalanced", "moved", "bytes"])
+def test_index_detail_rejects_incomplete_or_misleading_work_data(fault):
+    raw = data(True)
+    detail = detail_data(raw)
+    if fault == "shape":
+        detail = detail[:, :31]
+    elif fault == "partial":
+        detail[0, 2] = 0
+    elif fault == "clock":
+        detail[0, 4] = 0
+    elif fault == "post-clock":
+        detail[0, 3] = raw[0, 7] - 1
+    elif fault == "index-clock":
+        detail[0, 5:7] = 181
+    elif fault == "cq-clock":
+        detail[0, 7] += 1
+    elif fault == "assigned":
+        detail[0, 9] += 1
+    elif fault == "unbalanced":
+        detail[0, 9] += 2
+        detail[1, 9] -= 2
+    elif fault == "moved":
+        detail[0, 8] = detail[0, 9] + 1
+    elif fault == "bytes":
+        detail[0, 10] = 592
+    with pytest.raises(ValueError):
+        decode_post_index(raw, active=True, diagnostic=True, index_detail=detail)
 
 
 @pytest.mark.parametrize("fault", ["error", "global-error", "incomplete", "bad-fallback", "mixed-fallback", "timed-ticks", "ordering", "missing"])
