@@ -261,8 +261,12 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
 
             diagnostic = bool(getattr(bundle, "post_index_diagnostics", False))
             low_active = early_threshold_skipped(bundle.tuning)
-            detail = (cpu_array(torch, bundle.forward.times)[bundle.forward.batch * 256:].reshape(-1, 32)
-                      if diagnostic and low_active else None)
+            raw_times = (cpu_array(torch, bundle.forward.times)
+                         if diagnostic and low_active else None)
+            batch = bundle.forward.batch
+            detail = raw_times[batch * 256:].reshape(-1, 32) if raw_times is not None else None
+            finalization = (raw_times[batch * 128:batch * 256].reshape(batch, 128)[:, 96:100]
+                            if raw_times is not None else None)
             from kvip.diagnostics.post_index_profile import INDEX_DETAIL_SAME_VF_MAGIC
 
             events = (tuple(cpu_array(torch, value) for value in
@@ -274,6 +278,7 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
                 diagnostic=diagnostic,
                 index_detail=detail,
                 events=events,
+                finalization_detail=finalization,
             )
             if reads["post_index"]["active"] and reads["post_index"]["submitted_requests"] != reads["final"]:
                 raise AssertionError("Post-Index per-core request count differs from verified final Get")

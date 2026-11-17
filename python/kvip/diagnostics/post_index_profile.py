@@ -107,7 +107,40 @@ def decode_index_work(raw, records, *, fallback, wait_first=False, events=None):
     )
 
 
-def decode_post_index(raw, *, active, diagnostic=False, index_detail=None, events=None):
+def decode_finalization(raw, records, *, start):
+    """Decode existing row-finalizer ticks after the all-core completion join."""
+    if raw is None:
+        return dict(status="unavailable", reason="No row-finalization readback in this report")
+    raw = np.asarray(raw)
+    batch = int(records[:, 11].max()) + 1
+    if (not 1 <= batch <= len(records)
+            or not np.array_equal(records[:, 11], np.arange(len(records)) % batch)
+            or raw.dtype != np.int64 or raw.shape != (batch, 4)):
+        raise ValueError("Unexpected post-Index row-finalization layout")
+    ticks = raw.view(np.uint64)
+    completed = max(int(records[:, 8].max()), int(records[:, 9].max()))
+    if (np.any(ticks == 0) or np.any(ticks[:, 1:] < ticks[:, :-1])
+            or int(ticks[:, 0].min()) < completed):
+        raise ValueError("Invalid post-Index finalization timestamps or incomplete all-core join")
+    end = int(ticks[:, 3].max())
+    intervals = dict(publication=ticks[:, 2] - ticks[:, 1],
+                     state_feedback=ticks[:, 3] - ticks[:, 2])
+    return dict(
+        status="available", row_count=batch, rows=ticks.tolist(),
+        finalize_end_from_first_begin_cycles=end - start,
+        post_cq_tail_cycles=end - completed,
+        per_row_cycles={name: {key: value for key, value in _distribution(values).items()
+                              if key not in ("total", "active_cores")}
+                        for name, values in intervals.items()},
+        scope=("Separate diagnostic replay using existing finalizer ticks. Post-CQ tail starts at the "
+               "latest all-core Index/CQ completion and includes the CQ join, row reduction, residency "
+               "publication, status and feedback. It is not pure VF time or headline graph latency. "
+               "Per-row intervals overlap and must not be summed."),
+    )
+
+
+def decode_post_index(raw, *, active, diagnostic=False, index_detail=None, events=None,
+                      finalization_detail=None):
     if not active:
         # High uses the original tail. Its unused low workspace may be stale.
         return dict(status="not_entered", active=False)
@@ -166,5 +199,10 @@ def decode_post_index(raw, *, active, diagnostic=False, index_detail=None, event
     if fallback:
         result["cq_scope"] = "Included in bounded synchronous Get; no independent post-Index CQ wait"
     result["index_work"] = decode_index_work(index_detail, rows, fallback=fallback, wait_first=wait_first, events=events)
+    result["finalization"] = decode_finalization(finalization_detail, rows, start=start)
+    if result["finalization"]["status"] == "available":
+        result["phase_end_from_first_begin_cycles"]["finalize_end"] = (
+            result["finalization"]["finalize_end_from_first_begin_cycles"]
+        )
     result["scope"] = "Separate instrumented replay; phase boundaries include synchronization. Cross-core/overlapping intervals must not be summed or substituted for graph latency."
     return result

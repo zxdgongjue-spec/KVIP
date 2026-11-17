@@ -179,6 +179,76 @@ def test_pix2_counts_after_replay_without_instrumenting_index_vf():
     assert decode_post_index(raw, active=False, diagnostic=True, index_detail=object(), events=object())["status"] == "not_entered"
 
 
+def finalization_data():
+    raw, _, _ = pix2_data()
+    finalization = np.tile([230, 240, 250, 270], (16, 1)).astype(np.int64)
+    finalization[15] = [235, 245, 265, 300]
+    return raw, finalization
+
+
+def test_finalization_includes_all_core_join_and_keeps_row_intervals_separate():
+    raw, detail = finalization_data()
+    result = decode_post_index(raw, active=True, diagnostic=True, finalization_detail=detail)
+    finalization = result["finalization"]
+    assert finalization["row_count"] == 16
+    assert result["phase_end_from_first_begin_cycles"]["finalize_end"] == 200
+    assert finalization["finalize_end_from_first_begin_cycles"] == 200
+    assert finalization["post_cq_tail_cycles"] == 80  # Last CQ=220, last finalizer=300.
+    assert finalization["per_row_cycles"]["publication"] == dict(
+        min=10, p50=10., max=20, mean=10.625, samples=[10] * 15 + [20])
+    assert finalization["per_row_cycles"]["state_feedback"] == dict(
+        min=20, p50=20., max=35, mean=20.9375, samples=[20] * 15 + [35])
+    assert "not pure VF" in finalization["scope"]
+    assert "must not be summed" in finalization["scope"]
+
+
+@pytest.mark.parametrize("flags", [1, 2, 3])
+def test_finalization_uses_latest_index_for_blocking_or_wait_first(flags):
+    raw, detail = finalization_data()
+    raw[:, 2] = flags
+    raw[:, 9] = 150 if flags & 1 else 158
+    detail[:] = [180, 180, 190, 200]
+    result = decode_post_index(raw, active=True, diagnostic=True, finalization_detail=detail)
+    assert result["finalization"]["post_cq_tail_cycles"] == 20
+    assert result["finalization"]["finalize_end_from_first_begin_cycles"] == 100
+
+
+@pytest.mark.parametrize("fault", ["dtype", "shape", "batch", "row_assignment", "zero",
+                                  "order01", "order12", "order23", "other_core_cq", "other_core_index"])
+def test_finalization_rejects_bad_rows_and_cross_core_overlap(fault):
+    raw, detail = finalization_data()
+    if fault == "dtype":
+        detail = detail.astype(np.int32)
+    elif fault == "shape":
+        detail = detail[:, :3]
+    elif fault == "batch":
+        detail = detail[:15]
+    elif fault == "row_assignment":
+        raw[0, 11] = 1
+    elif fault == "zero":
+        detail[0, 0] = 0
+    elif fault.startswith("order"):
+        begin, end = map(int, fault[-2:])
+        detail[0, begin] = detail[0, end] + 1
+    elif fault == "other_core_cq":
+        detail[0, 0] = 215  # Later than this row's core but earlier than core 1 CQ.
+    elif fault == "other_core_index":
+        raw[:, 2] = 2
+        raw[:, 9] = 158
+        raw[63, 8] = 240  # Finalizer row 0 must also wait for this core's Index.
+    with pytest.raises(ValueError, match="finalization"):
+        decode_post_index(raw, active=True, diagnostic=True, finalization_detail=detail)
+
+
+def test_finalization_old_reports_and_high_stale_data_remain_compatible():
+    raw, _ = finalization_data()
+    result = decode_post_index(raw, active=True, diagnostic=True)
+    assert result["finalization"]["status"] == "unavailable"
+    assert "finalize_end" not in result["phase_end_from_first_begin_cycles"]
+    assert decode_post_index(raw, active=False, diagnostic=True, finalization_detail=object()) == dict(
+        status="not_entered", active=False)
+
+
 @pytest.mark.parametrize("fault", ["missing", "dtype", "shape", "row", "capacity", "assigned", "mixed"])
 def test_pix2_fails_closed_if_cpu_counts_do_not_match_device_ranges(fault):
     raw, detail, events = pix2_data()

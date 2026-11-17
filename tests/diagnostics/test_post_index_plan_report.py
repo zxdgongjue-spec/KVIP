@@ -5,7 +5,9 @@ import json
 import pytest
 
 from kvip.diagnostics.post_index_plan_report import ROLES, summarize
+from kvip.diagnostics.post_index_profile import decode_post_index
 from test_post_index_order_report import reports
+from test_post_index_profile import finalization_data
 from test_read_through_report import case
 
 
@@ -37,6 +39,22 @@ def test_full_graph_brackets_and_unmixed_diagnostics(tmp_path, capsys):
     assert "DRIFT after" in output and "DRIFT before" in output and "DRIFT serial" in output
     assert "all_brackets_mean_and_p50_parity=true reduction_ge35pct=false" in output
     assert "PHASE_END after" in output and "phase_ends_not_additive=true" in output
+    assert "FINALIZE after sample=1 unavailable=true" in output
+
+
+def test_report_prints_existing_finalizer_ticks_without_adding_them_to_headline(tmp_path, capsys):
+    rows = inputs()
+    raw, detail = finalization_data()
+    decoded = decode_post_index(raw, active=True, diagnostic=True, finalization_detail=detail)
+    for role in ("before", "after"):
+        for sample in rows[role]["native_diagnostics"]["samples"]:
+            sample["reads"]["post_index"]["finalization"] = decoded["finalization"]
+    write(tmp_path, rows)
+    summarize(tmp_path, 2)
+    output = capsys.readouterr().out
+    assert "FINALIZE after sample=1 cycles finalize_end=200 post_cq_tail=80" in output
+    assert "scope=join_reduction_publication_feedback headline_excluded=true" in output
+    assert "STEADY_mean/p50=305.000/305.000" in output
 
 
 @pytest.mark.parametrize("fault", ["source", "binary", "missing-binary", "traffic", "lifecycle", "weak-serial",

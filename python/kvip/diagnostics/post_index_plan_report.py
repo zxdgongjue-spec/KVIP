@@ -101,6 +101,14 @@ def summarize(directory, group):
                               for name in ("index_work", "index_barrier", "cq_wait") if name in intervals)
             print(f"PHASE_END {role} sample={number} cumulative_cycles {fields}")
             print(f"INDEX_CQ {role} sample={number} cycles {detail}")
+            finalization = phase.get("finalization", {})
+            if finalization.get("status") == "available":
+                print(f"FINALIZE {role} sample={number} cycles "
+                      f"finalize_end={finalization['finalize_end_from_first_begin_cycles']} "
+                      f"post_cq_tail={finalization['post_cq_tail_cycles']} "
+                      "scope=join_reduction_publication_feedback headline_excluded=true")
+            else:
+                print(f"FINALIZE {role} sample={number} unavailable=true")
     candidate_times = [timing(cases[role], True) for role in ("after", "after-end")]
     serial_times = [timing(cases[role], True) for role in ("serial", "serial-end")]
     parity = all(all(c <= s for c, s in zip(candidate, serial))
