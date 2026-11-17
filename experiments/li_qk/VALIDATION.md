@@ -43,5 +43,7 @@
 - 七项CPU检查通过：C++/Python几何与唯一覆盖、局部TopK精确合并/tie/无效尾、局部θ不能代替唯一θ、resident候选＋Cold GT θ的Final覆盖性质、B16任务量、汇总拒绝不完整/跨binary/fixture混比、opcode区分GM与UB。
 - H32K/R8K/P4的C0/C1/C2/C3完整数值控制均PASS（结构适配resident）；同binary/fixture下C1 whole ticks为C0的0.3997，C2为1.0960。
 - 最终代码复用原resident primitive；B1/H128K/R16K/P4完整后处理C0/C1全部PASS，whole ticks1135835/243506。Final＋classification＋并集C0/C2全部PASS，whole ticks83149/96339；resident参考单点PASS。动态日志mask0xffffffff，实际ELF/entry/launch验证。
+- B16/H8K/R4K/P2四组正交控制PASS，whole ticks C0/C1/C2/C3=107992/73975/175426/140404；resident_parts=2研究适配器数值PASS（性能成本尚非相同prefix输出控制）。B1/H4096/R2048/P2的C2 Final边界用例PASS，最后分片有效长度2045/2046/2047/2048，验证无效候选、合并、真实token映射和guard。最终代码11项Model capture，与v3四项结构控制分别存档，共15项。
+- 共享目录脚本通过真实本地bundle发布/verify/help、脚本/包/commit篡改拒绝、重复发布保留旧release检查；未执行CANN或NPU。生成的七个tail入口元数据均为K_TYPE_AIV。
 - compiled C++/headers与CANN950 Model、fresh `RUN_MODE=npu`构建的SHA相符，binary/library SHA也验证。Python统计/脚本随后完善，不沿用旧Python分类标签解释GM访存。
 - 模型输入是已有最终score，mapping/LRU固定，只验证隔离后处理契约；不模拟动态Service/URMA/Index，也未实现producer/consumer常驻融合。没有真实A5时间或msprof，脚本供服务器采集。

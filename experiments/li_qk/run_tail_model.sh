@@ -21,6 +21,7 @@ capture_tail target_all --history 131072 --resident 16384 --parts 4 --controls C
 capture_tail target_final --history 131072 --resident 16384 --parts 4 --stage final --controls C0 C2 --fixture "$LI_TAIL_OUT/target_all/fixture"
 capture_tail batch16_smoke --batch 16 --history 8192 --resident 4096 --parts 2 --controls C0 C1 C2 C3
 capture_tail resident_split --history 32768 --resident 8192 --parts 4 --resident-parts 2 --stage resident --controls C0 --fixture "$LI_TAIL_OUT/resident_reference/fixture"
+capture_tail short_candidate_guard --history 4096 --resident 2048 --parts 2 --stage final --controls C2
 python3 - "$LI_TAIL_OUT" "$LI_TAIL_HERE" <<'PY'
 import csv,json,subprocess,sys
 from pathlib import Path

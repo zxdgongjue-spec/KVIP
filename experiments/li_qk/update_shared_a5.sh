@@ -120,7 +120,7 @@ LI_TAIL_RELEASE=$(cd "$LI_TAIL_ROOT/current" && pwd -P)
 [[ $(git hash-object --no-filters "$LI_TAIL_RELEASE/run_tail_a5.sh") == "$(cat "$LI_TAIL_RELEASE/TAIL_SCRIPT_BLOB")" ]] || {
     echo 'ERROR: shared post-score launcher hash mismatch' >&2; exit 1;
 }
-exec bash "$LI_TAIL_RELEASE/run_tail_a5.sh" --share-root "$LI_TAIL_ROOT" "$@"
+exec bash "$LI_TAIL_RELEASE/run_tail_a5.sh" --share-root "$LI_TAIL_ROOT" --release-root "$LI_TAIL_RELEASE" "$@"
 LI_TAIL_ENTRY_END
 bash -n "$LI_SHARE/run_tail_in_container.sh.pending"
 mv "$LI_SHARE/run_tail_in_container.sh.pending" "$LI_SHARE/run_tail_in_container.sh"

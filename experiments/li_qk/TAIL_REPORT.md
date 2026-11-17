@@ -34,6 +34,8 @@ s_{bqk}=\operatorname{sortableBF16}\left(
 
 实际转换、累加和BF16舍入以`ReduceSum2LoopBody/ReduceSum2Finalize`为准。qScale合入weight，token kScale在head归约后应用，最后转换sortable uint16 key。沿H切分不改变每个key的D/G累加次序；沿D/G再分核则会引入浮点规约和舍入问题，不能混为一谈。
 
+这里的key/history位置是QK矩阵的列维，即GEMM的N维；GEMM归约K维是D128。用户所说的history/K分核与Stream-K论文的GEMM split-K并非同一维度，只借鉴其工作量均衡原则。
+
 每个Q4/G32/H128 tile有128×128个FP32 QK结果，共64KiB；两个AIV各接收Q2/G32/H128的32KiB，双缓冲各约64KiB。最终只有Q4×H128×2B=1024B key。完整H128K若把全部QK中间值展开将是64MiB/request，当前通路按tile在UB消费，不能把这64MiB计为最终score GM矩阵。
 
 ## 数据规模与可分核维度
@@ -151,6 +153,8 @@ Cold issued指令39698→47328，增加约19.2%，但issue包络235346→40070�
 
 上述五项全部MODEL_PASSED，exit0，输出oracle/guards/输入只读检查通过；每项一次capture，未建立重复采样置信区间。完整receipt、命令、binary/fixture SHA与PC证明见`tests/results/li-tail-20261117/final-controls/`。
 
+78.6%是相对于MR14 Separate型的单owner GM Cold控制；main/legacy的Cold已在producer归约中分类，不能把这个比值写成相对库上P2的收益。resident/Final的独立入口还使用每Q一AIV、topkOnly16K trunk，这些也与融合kernel的实际分工不同。最终生产收益必须比较同一输入下legacy与显式history/direct通路的完整LI/LIFetch和ConsumerReady。
+
 完整H128K控制的阶段issue包络与指令数如下。resident项已包含唯一θ、prefix score/index输出及LRU predicate，不再有独立θ/Hot适配kernel。
 
 | 阶段 | C0 issued数 | C1 issued数 | C0全核issue包络 | C1全核issue包络 |
@@ -167,7 +171,18 @@ H128K Final分核将局部选择issue包络50165→18146，但新增gather19043�
 
 B1/H32K/R8K的resident_parts=2研究管线正确性PASS，whole ticks84869；原primitive控制为17454。前者多了局部选择、GM候选gather/merge/map、独立θ/Hot适配，且尚未补齐相同prefix输出成本。这是研究结构的观测，不能将比值冒充生产resident路径的严格性能对照；当前实现也没有接入生产的依据。
 
-B16/H8K/R4K/P2缩小几何中，C0/C3完整后处理均PASS，whole ticks107992/140404（组合慢30.0%）。C1/C2正在单独补测，用于区分Cold收益与Final代价；不得把该缩小几何写成B16/H128K性能。
+B16/H8K/R4K/P2缩小几何，四组完整后处理全部PASS，同binary/fixture的正交结果如下；不得把该缩小几何写成B16/H128K性能。
+
+| 控制 | whole Model ticks | 相对C0 | 全AIV issued指令 |
+|---|---:|---:|---:|
+| C0 | 107992 | 1.0000 | 997143 |
+| C1，只有Cold分核 | 73975 | 0.6850，下降31.5% | 1041644 |
+| C2，只有Final分核 | 175426 | 1.6244，慢62.4% | 1522987 |
+| C3，Cold＋Final分核 | 140404 | 1.3001，慢30.0% | 1567450 |
+
+Cold的并行收益真实存在，Final的候选中转和两波工作将它抵消。阶段应独立选择分片数，不能因为score或Cold变快就统一增加T_R/T_F。本轮最终代码共有11项Model capture完整通过，加上v3四项结构控制共15项；原始数据分binary、几何和阶段范围保存。
+
+额外的B1/H4096/R2048/P2 Final边界用例C2通过，whole ticks73461、全AIV issued指令71432。四Q最后一片的有效长度分别为2045/2046/2047/2048，验证不足2048时的无效候选填充、根合并、真实token映射及guard。该点没有配对C0，只用于正确性检查。15项统一汇总见`tests/results/li-tail-20261117/summary-delivery/rows.csv`；每项都有实际ELF/entry/launch归因及阶段CSV。
 
 ## 论文可借鉴的具体原则
 
@@ -178,6 +193,27 @@ B16/H8K/R4K/P2缩小几何中，C0/C3完整后处理均PASS，whole ticks107992/
 CUDA SM/warp共享内存和Ascend AIC/AIV独立UB不等价。跨Ascend核只能通过明确GM输出/flag/可见性协议传递候选或计数；不能假设跨stream必然重叠，也不能把AIC改作任意向量TopK核。RadiK的浮点重标度不能直接施加到既有uint16 key，除非证明完整排序与tie语义不变。
 
 ## 更有价值的持续分核路线
+
+目标依赖如下；段级Service消费和跨owner Final流水属于后续生产设计，本轮实验没有实现这些重叠。
+
+```mermaid
+flowchart LR
+  H[resident score 分片完整] --> R[每Q resident TopK / 唯一 theta]
+  R --> HB[四Q LRU Hot predicate 完成]
+  R --> C[Cold producer: key归约 + canonical + predicate]
+  HB --> S[唯一 owner Service 可开始 Hot admission]
+  C --> D[段级 ready / 连续前缀]
+  D -->|新段就绪后增量消费| S
+  C --> A[本 owner 有效 history 完整]
+  A --> F[私有 Final 数值选择]
+  S --> M[Service 关闭 / mapping 稳定 / scratch 释放]
+  F --> X[Final classification]
+  M --> X
+  X --> U[四Q保护并集 / dedup /唯一slot规划]
+  U --> T[Output / safe-conflict Fetch / CQ join / Index commit]
+```
+
+同一个B1的resident合并门槛仍可能让部分核短暂等待；B16可以安排其它owner的Hot/Cold工作来覆盖等待。不能把两个不同stream的提交顺序当作A5真实重叠，也不能让同组AIC继续依赖已经被改作Final的AIV。资源预算、CV/VC drain和私有输出生命周期必须一起设计。最终目标是ConsumerReady提前，不是让所有64 AIV在每个阶段都忙。
 
 ### 第一优先级：Cold继续继承producer并行
 
@@ -197,6 +233,8 @@ CUDA SM/warp共享内存和Ascend AIC/AIV独立UB不等价。跨Ascend核只能�
 
 P_hot/P_cold、T_R、T_F、Fetch W独立选择。以B1/P4为例，局部候选score+token共192KiB；高8bit局部histogram为4Q×4片×256×4B=16KiB，但后者需要额外读取/低位选择与tie配额，必须实测。B16已有64个真实Q，可先用Q维并行；再分H会增加局部选择waves和合并。
 
+Final下一版应让局部TopK返回UB中的选中key与index，直接转换真实token并写候选；merge在自己的kernel中消费候选token映射，消除独立gather/map启动及相应GM中转。本轮测的是score完整后串行启动的GM分片实现；producer内局部TopK融合、提前执行与重叠需要另测，尤其要验证它是否增加AIV压力并阻塞AIC的CV/VC流水。
+
 固定B1/Q4/H128K，候选通信规模如下；尚未测量的P仅用于计算规模，不能视为性能结论。
 
 | Final分片T_F | 每片H | 每Q合并候选数 | 四Q候选score+token | 四Q高8bit局部histogram |
@@ -210,6 +248,8 @@ P_hot/P_cold、T_R、T_F、Fetch W独立选择。以B1/P4为例，局部候选sc
 本轮局部选择另外写int32索引、gather读取索引和key、merge读取候选key、map再读token；上表只计候选表示本身，不是总GM流量。T_F=32的候选表示已大于完整1MiB score，说明将score的32核参数直接套给Final可能适得其反。
 
 调参还要按实际window长度计算：整段H128K/P32每片H4K，若W8每窗约H16K仍用P32，每片仅H512。整段score的最优分片数不能直接套给每个短window。当前数据支持Cold持续分核的方向，没有确定全局最优P_cold；先保留Final/T_R=1，单独扫描P_cold，再在A5比较DirectPredicate和原legacy的完整ConsumerReady。
+
+B16默认resident/Final已经各有64个真实Q任务，可占满64 AIV。再取T_F=2变为128个任务、两波；理想计算量只是由一波完整H变成两波H/2，额外候选传输和merge却仍在关键路径上。Cold单owner控制只有16个任务，P2后变64个任务，反而存在继承history并行的空间。这是应分别调参的结构原因，完整H128K的实际幅度仍需A5。
 
 ### Final分类和owner闭包
 
@@ -247,3 +287,5 @@ Model复现见`run_tail_model.sh`。`tail_instructions.py`使用实际kernel起�
 Model ticks不能换算A5微秒。issue窗口含等待空档，不是活跃周期、最后指令完成时间或算法耗时百分比。常规事件计时与msprof分开。FullH与smoke、B1与B16、不同binary、独立consumer与真实依赖链分别统计。
 
 所有已通过的控制逐项核验readonly score、完整resident θ、Hot/Cold bitmap、TopK唯一/合法/严格高于Kth必选/tie、真实token转换、Final locations/bitmap/error和四Q并集；没有模拟动态Service映射、URMA或Index状态机。只有A5真机的score/LI/ConsumerReady数据能决定生产接入收益。
+
+fresh CANN9.1.0/Ascend950PR_9599 NPU构建成功；七个tail入口的实际生成元数据均为K_TYPE_AIV，compiled C++/headers与Model/NPU receipt一致。共享发布脚本通过真实本地Git bundle校验、脚本/包/commit篡改拒绝、重复发布保留旧release检查；这些编排检查没有执行NPU。原七项score与七项launcher回归检查通过，新增七项tail CPU检查通过。

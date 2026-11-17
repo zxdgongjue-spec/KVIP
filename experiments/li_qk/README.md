@@ -183,7 +183,7 @@ done
 
 ## Score后的持续分核控制
 
-需求见 [TAIL_PROMPT.md](TAIL_PROMPT.md)，源码/阶段规模/论文依据/实测见 [TAIL_REPORT.md](TAIL_REPORT.md)。新入口读取相同的最终sortable score，不运行QK、Fetch、Service或Index：C0原Cold＋原Final，C1只分Cold，C2只分Final，C3两者都分；默认resident仍调用原TopK/θ/Hot primitive。C0是隔离后处理控制，不是SDK或生产P2整链。
+需求见 [TAIL_PROMPT.md](TAIL_PROMPT.md)，源码/阶段规模/论文依据/实测见 [TAIL_REPORT.md](TAIL_REPORT.md)。新入口读取相同的最终sortable score，不运行QK、Fetch、Service或Index：C0单owner GM Cold＋库上Final primitive，C1只分Cold，C2只分Final，C3两者都分；默认resident仍调用原TopK/θ/Hot primitive。C0是隔离后处理控制，不是SDK或生产P2整链。
 
 ```bash
 # 宿主机更新已确认的共享目录

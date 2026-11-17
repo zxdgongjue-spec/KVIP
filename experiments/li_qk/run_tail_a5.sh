@@ -2,6 +2,7 @@
 # Physical A5 only; read the frozen bundle from the existing shared mount.
 set -Eeuo pipefail
 LI_TAIL_SHARE=/home/w00568585/li_qk_shared
+LI_TAIL_RELEASE_DIR=
 LI_TAIL_OUTPUT_ROOT=/home/w00568585
 LI_TAIL_CANN=${ASCEND_CANN_PACKAGE_PATH:-${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}}
 LI_TAIL_KVAF=/home/w00568585/wt-mr14/third_party/KVAF/access_operator/demo/aiv_batch_get/include
@@ -30,6 +31,7 @@ Run in the original A5 container after the host updates li_qk_shared.
   --verify-only         Verify the shared release without building/running kernels
   --device N            Physical device (default 5)
   --share-root PATH     Published shared package root
+  --release-root PATH   Pin an immutable release (set by the shared launcher)
   --output-root PATH    Parent of fresh result directory
   --cann-root PATH      Matching CANN installation
   --kvaf-include PATH   Compatible KVAF headers; no Fetch is launched
@@ -50,12 +52,12 @@ while (($#)); do
     [[ $LI_TAIL_CONTROL =~ ^C[0-3]$ ]] || die "Unknown control: $LI_TAIL_CONTROL"
    done
    shift 2 ;;
-  --batch|--history|--resident|--parts|--resident-parts|--device|--share-root|--output-root|--cann-root|--kvaf-include|--soc|--python)
+  --batch|--history|--resident|--parts|--resident-parts|--device|--share-root|--release-root|--output-root|--cann-root|--kvaf-include|--soc|--python)
    (($#>=2)) || die "Missing value: $1"
    case "$1" in
     --batch) LI_TAIL_BATCH=$2 ;; --history) LI_TAIL_HISTORY=$2 ;; --resident) LI_TAIL_RESIDENT=$2 ;;
     --parts) LI_TAIL_PARTS=$2 ;; --resident-parts) LI_TAIL_RPARTS=$2 ;; --device) LI_TAIL_DEVICE=$2 ;;
-    --share-root) LI_TAIL_SHARE=$2 ;; --output-root) LI_TAIL_OUTPUT_ROOT=$2 ;; --cann-root) LI_TAIL_CANN=$2 ;;
+    --share-root) LI_TAIL_SHARE=$2 ;; --release-root) LI_TAIL_RELEASE_DIR=$2 ;; --output-root) LI_TAIL_OUTPUT_ROOT=$2 ;; --cann-root) LI_TAIL_CANN=$2 ;;
     --kvaf-include) LI_TAIL_KVAF=$2 ;; --soc) LI_TAIL_SOC=$2 ;; --python) LI_TAIL_PYTHON=$2 ;;
    esac
    shift 2 ;;
@@ -67,7 +69,7 @@ for LI_TAIL_NUM in "$LI_TAIL_BATCH" "$LI_TAIL_HISTORY" "$LI_TAIL_RESIDENT" "$LI_
 done
 [[ ${LD_PRELOAD:-} != *camodel* && ${LD_PRELOAD:-} != *cmodel* ]] || die 'Physical A5 required; Model preload rejected'
 command -v git >/dev/null || die 'Command unavailable: git'
-LI_TAIL_RELEASE=$(cd "$LI_TAIL_SHARE/current" && pwd -P) || die 'Update the shared package on the host first'
+LI_TAIL_RELEASE=$(cd "${LI_TAIL_RELEASE_DIR:-$LI_TAIL_SHARE/current}" && pwd -P) || die 'Update the shared package on the host first'
 [[ $(git hash-object --no-filters "$LI_TAIL_RELEASE/li_qk_mr14_offline.bundle") == "$(cat "$LI_TAIL_RELEASE/BUNDLE_BLOB")" ]] || die 'Published bundle hash mismatch'
 LI_TAIL_PUBLISHED=$(git bundle list-heads "$LI_TAIL_RELEASE/li_qk_mr14_offline.bundle" refs/remotes/origin/codex/split-core-unified-comparison)
 [[ ${LI_TAIL_PUBLISHED%% *} == "$(cat "$LI_TAIL_RELEASE/SOURCE_COMMIT")" ]] || die 'Published bundle commit mismatch'
