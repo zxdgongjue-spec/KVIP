@@ -3,8 +3,9 @@
 
 Suppressed candidates are Q4-unioned, mapping-deduplicated candidates examined
 in one request/window but not admitted. Their sum is not a global unique-token
-count or final cold-miss count. Exhausted windows skip scanning, so their unseen
-candidates are not included. A window-limit attribution requires positive
+count or final cold-miss count. An exhausted window may still scan and report
+candidates with zero posts; a zero count alone does not establish skipped work.
+A window-limit attribution requires positive
 suppression and a *strictly* smaller window allowance than every remaining
 row/total/transport budget; ties stay explicitly unclassified.
 """
@@ -20,7 +21,9 @@ ADMISSION_ACCOUNTING = {
     ),
     "window_limited_epochs": "positive suppression with window_limit strictly below all other remaining budgets",
     "other_or_tied_limited_epochs": "positive suppression attributed to a row/total/transport limit or a tie, not separated further",
-    "budget_exhausted_epochs": "visited windows with zero admissible budget; scanning was skipped, so unseen candidates are unknown",
+    "budget_exhausted_epochs": "visited windows with zero admissible budget; scanning may still occur",
+    "exhausted_with_observed_candidates": "zero-budget windows reporting positive examined/suppressed candidates",
+    "exhausted_suppressed_candidates": "examined candidates suppressed in zero-budget windows; not globally unique demand",
     "remaining_admissible_budget": (
         "sum of min(row-slot,total-prefetch,transport limits) minus admitted requests for active rows; "
         "unused capacity does not prove that raising a window limit improves useful prefetch"
@@ -81,10 +84,18 @@ def prefetch_admission(rows, *, window_limit, rounds, active_rows=None):
     if np.any(posted > allowance) or np.any(words[:, 9] > effective):
         raise ValueError("Prefetch admission exceeds an actual row budget")
     limited = suppressed > 0
-    if np.any(limited & ((posted != allowance) | (allowance == 0))):
-        raise ValueError("Prefetch suppression does not match the admitted allowance")
+    mismatch = limited & (posted != allowance)
+    if np.any(mismatch):
+        row, epoch = map(int, np.argwhere(mismatch)[0])
+        raise ValueError(
+            "Prefetch suppression does not match the admitted allowance: "
+            f"row={row} epoch={epoch} posted={posted[row, epoch]} "
+            f"suppressed={suppressed[row, epoch]} allowance={allowance[row, epoch]} "
+            f"prior={prior[row, epoch]} limits={words[row, 208:211].tolist()}"
+        )
     # Strict inequality deliberately excludes simultaneous window/total limits.
     window_limited = limited & (window_limit < remaining)
+    exhausted = visited & (allowance == 0)
     left = effective - words[:, 9]
     return dict(
         rounds=rounds,
@@ -95,7 +106,9 @@ def prefetch_admission(rows, *, window_limit, rounds, active_rows=None):
         unvisited_epochs=int((~visited).sum()),
         window_limited_epochs=int(window_limited.sum()),
         other_or_tied_limited_epochs=int((limited & ~window_limited).sum()),
-        budget_exhausted_epochs=int((visited & (allowance == 0)).sum()),
+        budget_exhausted_epochs=int(exhausted.sum()),
+        exhausted_with_observed_candidates=int((exhausted & limited).sum()),
+        exhausted_suppressed_candidates=int(suppressed[exhausted].sum()),
         suppressed_candidates=int(suppressed.sum()),
         remaining_admissible_budget=int(left[active].sum()),
         rows_suppressed_with_budget_left=int(np.count_nonzero(active & (left > 0) & (words[:, 10] > 0))),
