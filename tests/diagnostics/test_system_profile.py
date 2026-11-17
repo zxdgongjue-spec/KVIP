@@ -193,7 +193,8 @@ def cli(tmp_path, *extra):
     [
         ["--profile-metrics", "Memory"],
         ["--profile-dir", "profiles", "--profile-metrics", "Memory", "Memory"],
-        ["--profile-dir", "profiles", "--diagnostic-replays", "1"],
+        ["--profile-dir", "profiles", "--profile-metrics", "available-pipeline", "none"],
+        ["--profile-variants", "forward"],
         ["--profile-dir", "profiles", "--topk-probe"],
         ["--profile-dir", "profiles", "--profile-metrics", "Unknown"],
     ],
@@ -213,7 +214,46 @@ def test_cli_defaults_to_timeline_and_accepts_metric_sets(tmp_path):
     assert args.profile_metrics == ["none", "PipeUtilization", "Memory"]
 
 
-def test_measure_profiles_only_after_headline_and_before_graph_reset(tmp_path, monkeypatch):
+def test_available_pipeline_keeps_timeline_and_reports_unsupported_metric(capsys):
+    result = system_profile.profile_configurations(fake_npu([]), ["available-pipeline"])
+    assert [name for name, _ in result] == ["none", "PipeUtilization"]
+    assert "unavailable=ResourceConflictRatio" in capsys.readouterr().out
+    with pytest.raises(ValueError, match="only metric"):
+        system_profile.profile_configurations(fake_npu([]), ["available-pipeline", "none"])
+
+
+def test_cli_accepts_separate_counter_and_system_replays_with_isolation(tmp_path):
+    args = cli(tmp_path, "--profile-dir", str(tmp_path / "profiles"), "--profile-variants", "reverse",
+               "--diagnostic-replays", "1", "--isolate-variants", "--study", "scan-order",
+               "--scan-variants", "forward", "reverse", "--threshold-policy", "recent",
+               "--upstream-root", str(tmp_path / "source"), "--upstream-revision", "a" * 40)
+    assert args.profile_variants == ["reverse"] and args.isolate_variants
+    with pytest.raises(SystemExit):
+        cli(tmp_path, "--profile-dir", str(tmp_path / "profiles"), "--profile-variants", "reverse",
+            "--study", "scan-order", "--scan-variants", "forward", "--threshold-policy", "recent")
+
+
+def test_timeline_preserves_overlap_and_uses_one_canonical_export(tmp_path):
+    events = [dict(ph="X", cat="kernel", name=name, ts=start, dur=duration) for name, start, duration in (
+        ("v9_li_kernel", 10, 100), ("v9_li_kernel_1", 15, 80), ("v9_streaming_resolve_update", 12, 120))]
+    events += [dict(ph="X", cat="cpu_op", name="ignored", ts=0, dur=9999),
+               dict(ph="X", cat="kernel", name="bad", ts=1, dur=float("nan"))]
+    (tmp_path / "trace_view.json").write_text(json.dumps(dict(traceEvents=events, displayTimeUnit="ns")))
+    (tmp_path / "other_trace.json").write_text(json.dumps(events))
+    result = system_profile.summarize_timeline(tmp_path, system_profile.inspect_artifacts(tmp_path, "none"))
+    assert result["device"]["span_us"] == 122
+    assert result["li"] == dict(count=2, span_us=100, sum_us=180)
+    assert result["streaming"]["span_us"] == 120
+    assert len(result["kernels"]) == 3
+    assert result["included_in_headline_timing"] is False
+    # Without one canonical export, refuse to add duplicate timestamps.
+    (tmp_path / "trace_view.json").rename(tmp_path / "second_trace.json")
+    result = system_profile.summarize_timeline(tmp_path, system_profile.inspect_artifacts(tmp_path, "none"))
+    assert result["status"] == "unavailable"
+
+
+@pytest.mark.parametrize("diagnostics", [0, 1])
+def test_measure_profiles_only_after_headline_and_before_graph_reset(tmp_path, monkeypatch, diagnostics):
     events = []
 
     class Graph:
@@ -246,10 +286,24 @@ def test_measure_profiles_only_after_headline_and_before_graph_reset(tmp_path, m
     monkeypatch.setattr(
         system_profile, "collect_system_profiles", lambda **kwargs: original(**kwargs, npu=fake_npu(events))
     )
+    from kvip.diagnostics import native_profile
+    monkeypatch.setattr(native_profile, "decode_profile", lambda *a, **k: dict(metrics={}))
+    monkeypatch.setattr(replay_measure, "cpu_array", lambda *a: [])
+
+    class Forward:
+        batch, q_workers, resolver_cores = 16, 4, 32
+        times = SimpleNamespace(zero_=lambda: events.append("zero_counters"))
+
+        def __call__(self):
+            events.append("forward")
+
+        def set_options(self, *, diagnostics):
+            events.append("counters_on" if diagnostics else "counters_off")
+
     bundle = SimpleNamespace(
         reset=lambda: events.append("reset"),
         verify=lambda: events.append("verify"),
-        forward=lambda: events.append("forward"),
+        forward=Forward(),
         read_counts=lambda: {},
         lease=None,
     )
@@ -270,12 +324,13 @@ def test_measure_profiles_only_after_headline_and_before_graph_reset(tmp_path, m
             iterations=1,
             profile_dir=tmp_path,
             profile_metrics=["none"],
+            diagnostic_replays=diagnostics,
         ),
         {"progress": {"variant": "ready-batch4"}, "profile_metadata": {}},
     )
     assert result["timing"]["samples_us"] == [10.0]
     assert events[-10:] == [
-        "verify",
+        "sync" if diagnostics else "verify",
         "reset",
         "sync",
         "start",
@@ -287,3 +342,7 @@ def test_measure_profiles_only_after_headline_and_before_graph_reset(tmp_path, m
         "graph_reset",
     ]
     assert events.count("event") == 2
+    if diagnostics:
+        assert events.index("event_sync") < events.index("counters_on")
+        assert events.index("counters_off") < events.index("start")
+        assert result["native_diagnostics"]["included_in_timing"] is False

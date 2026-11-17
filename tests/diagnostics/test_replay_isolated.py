@@ -90,6 +90,23 @@ def test_child_command_does_not_forward_isolation(tmp_path):
     assert child.scan_variants == ["reverse"] and not child.isolate_variants
 
 
+def test_isolated_profile_subset_keeps_exports_outside_disposable_child_directory(tmp_path):
+    args = arguments(tmp_path)
+    args.profile_dir = tmp_path / "persistent_profiles"
+    args.profile_metrics = ["available-pipeline"]
+    args.profile_variants = ["reverse"]
+    for name in args.scan_variants:
+        cmd = replay_isolated.command(args, name, tmp_path / "temporary" / f"{name}.json")
+        child = replay.arguments(cmd[6:])
+        assert child.diagnostic_replays == 1
+        assert child.profile_variants is None
+        if name == "reverse":
+            assert child.profile_dir == args.profile_dir
+            assert child.profile_metrics == ["available-pipeline"]
+        else:
+            assert child.profile_dir is None and child.profile_metrics is None
+
+
 def test_compile_failure_starts_no_device_children(tmp_path, monkeypatch):
     args = arguments(tmp_path)
 

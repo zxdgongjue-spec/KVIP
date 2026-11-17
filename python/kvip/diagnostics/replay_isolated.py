@@ -26,6 +26,10 @@ def command(args, name, output):
     for key, value in values.items():
         if value is not None:
             result.extend(("--" + key.replace("_", "-"), str(value)))
+    selected = getattr(args, "profile_variants", None)
+    if getattr(args, "profile_dir", None) is not None and (selected is None or name in selected):
+        result.extend(("--profile-dir", str(args.profile_dir)))
+        result.extend(("--profile-metrics", *(args.profile_metrics or ["none"])))
     # Never forward isolate-variants: each child owns exactly one device context.
     result.extend(("--scan-variants", name, "--quiet"))
     return result

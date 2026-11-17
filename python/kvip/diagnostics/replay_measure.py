@@ -415,10 +415,13 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
             samples=diagnostic_samples,
             note="Separate instrumented replay with barriers/cache operations; intervals overlap and cannot be summed into graph latency or converted to microseconds without a measured clock.",
         )
-    if getattr(args, "profile_dir", None) is not None:
+    variant = retained.get("progress", {}).get("variant", getattr(args, "threshold_policy", "unassigned"))
+    selected_profiles = getattr(args, "profile_variants", None)
+    if getattr(args, "profile_dir", None) is not None and (
+        selected_profiles is None or variant in selected_profiles
+    ):
         from kvip.diagnostics.system_profile import collect_system_profiles
 
-        variant = retained.get("progress", {}).get("variant", args.threshold_policy)
         result["system_profiles"] = collect_system_profiles(
             torch=torch,
             reset=reset,

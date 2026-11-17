@@ -4,6 +4,7 @@
 import csv
 import importlib
 import json
+import math
 from pathlib import Path
 import platform
 import re
@@ -11,6 +12,7 @@ import re
 from kvip.diagnostics.console import emit
 
 PROFILE_METRICS = (
+    "available-pipeline",
     "none",
     "PipeUtilization",
     "ArithmeticUtilization",
@@ -30,6 +32,16 @@ def profile_configurations(npu, metrics):
     if experimental is None:
         experimental = importlib.import_module("torch_npu.profiler.experimental_config")
     supported = experimental.supported_ai_core_metrics()
+    if "available-pipeline" in metrics:
+        if list(metrics) != ["available-pipeline"]:
+            raise ValueError("available-pipeline must be the only metric selector")
+        wanted = ("PipeUtilization", "ResourceConflictRatio")
+        chosen = [name for name in wanted
+                  if getattr(api.AiCMetrics, name, None) is not None
+                  and getattr(api.AiCMetrics, name) in supported]
+        emit("PROFILE_METRICS selected=" + ",".join(["none", *chosen])
+             + " unavailable=" + (",".join(name for name in wanted if name not in chosen) or "none"))
+        metrics = ["none", *chosen]
     configurations = []
     for name in metrics:
         if name not in PROFILE_METRICS:
@@ -58,6 +70,54 @@ def profile_configurations(npu, metrics):
             raise RuntimeError(f"torch_npu changed the requested {name}/Text/raw-data configuration")
         configurations.append((name, config))
     return configurations
+
+
+def summarize_timeline(directory, artifacts):
+    """Read one canonical Chrome trace, avoiding duplicate CANN exports.
+
+    Chrome trace ts/dur values are microseconds (displayTimeUnit is a viewer
+    preference). Intervals may overlap: neither kernel sums nor spans are an
+    uninstrumented graph duration. Retain names/times to audit this distinction.
+    """
+    candidates = [row for row in artifacts["trace_files"] if row.get("device_events")]
+    canonical = [row for row in candidates if Path(row["path"]).name == "trace_view.json"]
+    if canonical:
+        candidates = canonical
+    if len(candidates) != 1:
+        return dict(status="unavailable", reason="Expected one unambiguous device trace", candidates=candidates)
+    path = directory / candidates[0]["path"]
+    try:
+        data = json.loads(path.read_text())
+        events = data.get("traceEvents", []) if isinstance(data, dict) else data
+        kernels = []
+        for event in events:
+            if not isinstance(event, dict) or event.get("ph") != "X":
+                continue
+            if not any(word in str(event.get("cat", "")).lower() for word in ("kernel", "aicore", "ai_core")):
+                continue
+            start, duration = float(event["ts"]), float(event["dur"])
+            if not (math.isfinite(start) and math.isfinite(duration) and duration > 0):
+                continue
+            kernels.append(dict(name=str(event.get("name", "unknown")), start_us=start, duration_us=duration,
+                                pid=event.get("pid"), tid=event.get("tid")))
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        return dict(status="unavailable", reason=str(error), trace=str(path))
+    if not kernels:
+        return dict(status="unavailable", reason="No complete device kernel intervals", trace=str(path))
+
+    def envelope(rows):
+        if not rows:
+            return None
+        return dict(count=len(rows), sum_us=sum(row["duration_us"] for row in rows),
+                    span_us=max(row["start_us"] + row["duration_us"] for row in rows)
+                    - min(row["start_us"] for row in rows))
+
+    return dict(status="available", trace=str(path), units="us", included_in_headline_timing=False,
+                scope="Independent profiler replay; overlapping kernel intervals must not be added",
+                device=envelope(kernels),
+                li=envelope([row for row in kernels if "v9_li_kernel" in row["name"]]),
+                streaming=envelope([row for row in kernels if "v9_streaming_resolve_update" in row["name"]]),
+                kernels=kernels)
 
 
 def inspect_artifacts(directory, metric):
@@ -226,6 +286,8 @@ def collect_system_profiles(
             checkpoint("profile_verify", step)
             verify()
             report.update(status="captured", correctness="passed", artifacts=inspect_artifacts(target, name))
+            if name == "none":
+                report["timeline"] = summarize_timeline(target, report["artifacts"])
             save()
         except BaseException as error:
             report.update(status="failed", error=dict(type=type(error).__name__, message=str(error)))

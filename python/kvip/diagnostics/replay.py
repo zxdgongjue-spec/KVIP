@@ -70,6 +70,8 @@ def arguments(argv=None):
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--profile-dir", type=Path, help="Independent system traces, outside headline timing")
     p.add_argument("--profile-metrics", nargs="+", choices=PROFILE_METRICS, default=None)
+    p.add_argument("--profile-variants", nargs="+", choices=tuple(SCAN_VARIANTS),
+                   help="Capture system traces only for these scan variants; all headline cases still run")
     p.add_argument(
         "--topk-probe",
         action="store_true",
@@ -84,13 +86,15 @@ def arguments(argv=None):
     if args.profile_metrics is not None and args.profile_dir is None:
         p.error("profile-metrics requires profile-dir")
     if args.profile_dir is not None:
-        if args.topk_probe or args.diagnostic_replays:
-            p.error("profile-dir cannot be combined with topk-probe or diagnostic-replays")
+        if args.topk_probe:
+            p.error("profile-dir cannot be combined with topk-probe")
         if args.profile_dir.exists() and not args.profile_dir.is_dir():
             p.error("profile-dir must be a directory")
         args.profile_metrics = args.profile_metrics or ["none"]
         if len(set(args.profile_metrics)) != len(args.profile_metrics):
             p.error("profile-metrics must be unique")
+        if "available-pipeline" in args.profile_metrics and len(args.profile_metrics) != 1:
+            p.error("available-pipeline must be the only metric selector")
     if not args.kvaf_server:
         p.error("A local KVAF CPU service address is required for this runtime")
     if args.mode == "serial" and args.threshold_policy != "resident":
@@ -120,14 +124,19 @@ def arguments(argv=None):
             p.error("scan-variants must be unique")
     elif args.scan_variants:
         p.error("scan-variants requires study=scan-order")
+    if args.profile_variants is not None and (
+        args.profile_dir is None or args.study != "scan-order"
+        or not set(args.profile_variants) <= set(args.scan_variants)
+    ):
+        p.error("profile-variants requires profile-dir and a subset of scan-variants")
     if (args.cold_windows is not None or args.compare_layout) and args.study != "scan-order":
         p.error("cold-windows/compare-layout requires study=scan-order")
     if args.compare_layout and args.scan_variants != ["forward", "reverse", "reverse-end", "forward-end"]:
         p.error("compare-layout requires forward reverse reverse-end forward-end")
     if args.isolate_variants and (
-        args.study != "scan-order" or args.compare_layout or args.profile_dir is not None or args.topk_probe
+        args.study != "scan-order" or args.compare_layout or args.topk_probe
     ):
-        p.error("isolate-variants requires scan-order without compare-layout/profile-dir/topk-probe")
+        p.error("isolate-variants requires scan-order without compare-layout/topk-probe")
     if args.topk_probe and args.study != "post-threshold":
         p.error("topk-probe requires study=post-threshold")
     if args.study in ("threshold-only", "seed-ub", "local-victims", "register-kth", "overlap-victims") and (

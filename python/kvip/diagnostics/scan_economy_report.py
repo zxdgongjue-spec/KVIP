@@ -126,20 +126,39 @@ def report(cases, order):
                 print(f"WORK {name} histogram_scores={work['histogram_scores']}/{work['scanned_scores']} "
                       f"histogram_calls={work['dense_histogram_calls']}->{work['sparse_histogram_calls']} "
                       "CPU_counts_not_latency; compaction/synchronization are in graph timing")
-    if "reverse-window-fast" in cases:
+    if any(case.get("native_diagnostics") for case in cases.values()):
         profiled = False
         for name in order:
             for sample in cases[name].get("native_diagnostics", {}).get("samples", []):
                 profiled = True
                 fields = []
-                for label, key in (("producer", "producer_span"), ("post", "post_active"),
-                                   ("join", "final_prefetch_join"), ("drain", "cq_drain")):
+                for label, key in (("metadata_producer", "producer_span"),
+                                   ("LI_mapping_wait", "li_final_mapping_wait"),
+                                   ("fetch_dependency", "fetch_dependency_wait"),
+                                   ("prefetch_join", "final_prefetch_join"),
+                                   ("post", "post_active"), ("drain", "cq_drain")):
                     metric = sample["metrics"].get(key, {})
                     if metric.get("status") == "available":
                         fields.append(f"{label}={metric['median_cycles']:.0f}/{metric['max_cycles']}")
                 print(f"PROFILE {name} cycles_p50/max " + " ".join(fields))
         if profiled:
             print("PROFILE_SCOPE separate instrumented replay; producer=index producer (not full LI); overlapping cycles, not additive graph time")
+    for name in order:
+        for entry in cases[name].get("system_profiles", {}).get("passes", []):
+            if entry["metric"] == "none":
+                timeline = entry.get("timeline", {})
+                fields = []
+                for key in ("device", "li", "streaming"):
+                    interval = timeline.get(key)
+                    fields.append(f"{key}_span_us={interval['span_us']:.3f}" if interval
+                                  else f"{key}_span_us=unavailable")
+                print(f"TIMELINE {name} " + " ".join(fields) + " independent_profile_not_headline")
+            else:
+                artifacts = entry.get("artifacts", {})
+                columns = sorted({column for table in artifacts.get("csv_files", [])
+                                  for column in table.get("counter_columns_with_values", [])})
+                print(f"PMU {name} metric={entry['metric']} exported_columns={len(columns)} "
+                      "values_in_saved_CSV_not_validated_utilization")
     if "reverse-inc-prefilter" in cases or "reverse-inc-ties" in cases or "reverse-inc-light" in cases:
         print("CHECK incremental_variants_vs_dense window_lists_and_final_order=IDENTICAL; actual transfer timing/counters may vary")
     print("DECISION " + ("retest_candidates="+",".join(candidates) if candidates else "keep_original_fused"))

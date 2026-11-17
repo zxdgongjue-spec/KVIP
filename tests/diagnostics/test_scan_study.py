@@ -414,7 +414,7 @@ def test_fast_path_controls_and_eight_window_report(tmp_path, capsys):
     scan_report.report(path, require_fast=True)
     output = capsys.readouterr().out
     assert "reverse-window-reuse->reverse-window-fast" in output
-    assert "PROFILE reverse-window-fast cycles_p50/max producer=100/200" in output
+    assert "PROFILE reverse-window-fast cycles_p50/max metadata_producer=100/200" in output
     assert "REVERSE_NONREGRESSION KEEP" in output
     data["cases"]["forward"]["geometry"]["rounds"] = 8
     path.write_text(json.dumps(data))
@@ -440,6 +440,14 @@ def test_sparse_study_separates_histogram_and_submission_filter(tmp_path, capsys
     for case in data["cases"].values():
         case["geometry"]["rounds"] = 9
         case["reads_samples"][0].update(prefetch=20, unused_prefetch=10)
+    data["cases"]["reverse-sparse"]["native_diagnostics"] = {
+        "samples": [{"metrics": {"fetch_dependency_wait": {
+            "status": "available", "median_cycles": 20, "max_cycles": 40}}}]}
+    data["cases"]["reverse-sparse"]["system_profiles"] = {"passes": [
+        {"metric": "none", "timeline": {"device": {"span_us": 600}, "li": {"span_us": 500}}},
+        {"metric": "PipeUtilization", "artifacts": {"csv_files": [
+            {"counter_columns_with_values": ["aiv_vec_ratio"]}]}},
+    ]}
     path = tmp_path / "sparse.json"
     path.write_text(json.dumps(data))
     scan_report.report(path, require_sparse=True)
@@ -447,6 +455,9 @@ def test_sparse_study_separates_histogram_and_submission_filter(tmp_path, capsys
     assert "reverse-window-fast->reverse-sparse-ref" in output
     assert "reverse-sparse->reverse-sparse-ref" in output
     assert "vs_original_mean/p50=" in output and "vs_reverse_mean/p50=" in output
+    assert "PROFILE reverse-sparse cycles_p50/max fetch_dependency=20/40" in output
+    assert "TIMELINE reverse-sparse device_span_us=600.000 li_span_us=500.000 streaming_span_us=unavailable" in output
+    assert "PMU reverse-sparse metric=PipeUtilization exported_columns=1" in output
     with pytest.raises(ValueError, match="Packed histogram"):
         scan_report.load_report(path, require_fast=True)
     data["cases"]["reverse-sparse"]["geometry"]["rounds"] = 8
