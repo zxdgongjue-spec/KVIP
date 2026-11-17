@@ -1,74 +1,75 @@
-# 真实 score trace：解析与回放导出
+# 全量真实 trace 解析与测试
 
-在 KVIP 仓库根目录执行，仅需 Python 3.11+ 和 NumPy，不启动 NPU。
-工具复用 `tests/operators/lifetch/support/workloads.py` 的 schema-4 校验和回放装配。
-不支持把只有分数的记录转换成真实 Q/Index。
+在 KVIP 根目录运行。解析/导出只需 Python 3.11+、NumPy，不启动 NPU。
+默认扫描所有轮次、所有组和所有 DP，不需要选择 round/group/layer。
 
-## 1. 找到实际可用的样本
+## 全量扫描与转换
 
 ```bash
 python scripts/lifetch_score_trace.py \
-  --root /home/c00982601/CacheOS/ubmem-validation
+  --root /home/c00982601/CacheOS/ubmem-validation \
+  --output /tmp/lifetch-real-suite
 ```
 
-可传整个数据父目录，也可直接传含 `dp0/series.json` 等文件的 `trace` 目录。
-打印每个 `TRACE_ROOT` 下保存真实 Q/Index 的 round、group、DP、合计 BS 和原始 token 字节数。
-此步骤只读取元数据；文档中的 24 节点目录不一定存在于当前机器。
+输出目录必须是新目录，并位于输入目录树之外。省略 `--output` 只列出清单。
 
-说明文档列出的代表样本如下，最终以脚本重算为准：
+- **READY**：真实 Q/Index 完整，转换为可执行的一轮前态快照。
+- **SCORE_ONLY**：分数和状态可分析，缺少 Q/Index，不能执行 LI；保留 CPU 分析结果。
+- **FAILED**：记录缺失、格式/校验不通过或无法回放，报告具体原因。
+- **EMPTY**：采集计划存在，但没有已登记记录或 manifest，不代表有分数数据。
 
-| 来源 | 采集 round | group | 文档 cold miss |
-|---|---:|---:|---:|
-| real-input-r51-g2g7 | 2 | 2 | 2.12% |
-| real-input-r51-g2g7 | 2 | 7 | 19.82% |
-| score-trace | 51 | 10 | 3.33% |
-| real-input-r51-miss5-miss10 | 2 | 17 | 5.77% |
-| real-input-r51-miss5-miss10 | 2 | 4 | 9.81% |
+`status=capturing`、`completed_rounds=0`、`rounds=[]` 和
+`awaiting a real scheduled decode batch` 表示尚未登记实际采集轮。
+`real_input_rounds=[26,51,76]` 是计划，不能据此宣称这些输入已经保存。
+未登记到 series 的 manifest 会列入 `unindexed`，不静默忽略或伪造完整系列。
 
-## 2. 解析和导出
+转换输出：
 
-将 `trace` 设置为第一步打印的真实目录，并选择该目录列出的 round/group。
-以下以低 miss G2 为例：
+- `suite.json`：全部来源、记录状态、逐请求 miss 统计、可执行测试清单。
+- `case*-r*-g*.log`：每个采集轮/组的详细 CPU 解析或失败原因。
+- `case*-r*-g*/`：READY 输入；所有 DP 在运行时合并，最大 BS16。
 
-```bash
-trace=/实际路径/real-input-r51-g2g7.dKZUcF/trace
-python scripts/lifetch_score_trace.py --root "$trace" --round 2 --group 2
-python scripts/lifetch_score_trace.py --root "$trace" --round 2 --group 2 \
-  --layer-index 0 --output /tmp/lifetch-g2-real
-```
+默认将四层组的合成 KV 投影为单层 656B；真实 Q、Index、权重、分数、初始 hot、
+ABC 和页槽编号保持原样。共享组只测试一次，不把共享同一 LI 输入的四层重复计为四份负载。
+归档历史搬运记录仍是原组口径；回放搬运量由运行时重新统计。
+每个采集轮独立恢复前态，不把跳跃采样误作连续 decode 状态演进。
 
-默认选中所有 DP；DP8、每卡 BS2 会在回放入口合并为单卡 BS16。
-可用 `--dp-ranks 0 1` 只选两个 DP。合并后的 BS 必须不超过 16。
-`--layer-index 0` 将合成 KV 投影到单层 656B；不指定则保留原始 656B/2624B。
-真实 Q、Index、权重、分数、初始缓存状态和页槽编号不改动，不重算分数。
-归档中的历史搬运记录仍是原始层组口径，新的回放搬运量由运行时重新统计。
-
-输出逐请求统计和总计：
-
-- Demand：Q1～Q4 的 captured TopK 并集，跨 Q 去重。
-- Hot：调用前有效 hot 槽中的需求；ABC-only：仅 ABC 尾部命中的需求。
-- Cold：Demand − Hot − ABC-only；总 miss 率按总 cold / 总 demand 计算。
-- Candidate hot：有效 hot 命中中位于 LRU 候选槽的数量，不是实际补取次数。
-- Cold w/o DDR：cold 需求中没有有效 DDR 地址的数量；非零不能导出成功。
-
-转换校验包括归档哈希、数组形状、TopK 与原始分数的一致性、逻辑映射和页共享装配。
-不同 DP 的页地址空间隔离，同一 DP 的页别名保留。
-每个输出是独立前态的一轮，归一化为回放 round 1；原始采集轮和调度轮保留在元数据中。
-`conversion.json` 保存来源、统计和 COMPLETE/FAILED 状态。输出目录必须是新目录。
-
-## 3. 当前统一入口回放
+## 一次运行全部真实输入
 
 ```bash
-python tests/operators/lifetch/test_lifetch.py diagnose --level 2 \
+python scripts/lifetch_score_trace.py \
+  --run-suite /tmp/lifetch-real-suite \
+  --output /tmp/lifetch-real-results \
+  -- \
   --transport urma --device 4 \
   --kvaf-root /vllm-workspace/vllm-ascend/third_party/KVAF \
   --kvaf-server 127.0.0.1:28885 \
-  --input real --trace-root /tmp/lifetch-g2-real --group 2 \
-  --round-range 1:1 --intermediate-fetches 4 \
-  --prefetch-tokens 1024 --prefetch-rank-start 1024 \
+  --intermediate-fetches 4 --prefetch-tokens 1024 --prefetch-rank-start 1024 \
   --warmup 4 --iterations 20 --timeout-seconds 600
 ```
 
-切换数据时对应修改 trace-root/group；不传 `--miss-percent`，命中状态来自采集。
-各样本比较时保持窗口、预算、设备和计时参数一致。真实 KV 未采集，搬运验证使用
-确定性合成 C8 KV；真实 LI 输入与选集保留。CPU 转换成功不代替真机正确性验证。
+自动调用统一入口的 `bench --input real`，保留真实回放正确性校验，比较串行和融合。
+单个 case 失败后继续执行其余 case。没有 READY 输入时明确报错，不生成空 PASS。
+所有设备任务仍逐 case 启动，当前不跨真实输入复用 DDR 会话。
+
+结果保存在 `suite_results.json` 和汇总 `results.csv`，包括采集轮、组、执行/正确性状态、
+串行与融合 mean/p50/p99 和收益。每个 case 的完整终端输出保存在同名 `.log`。
+
+需要详细打点时，在 `--run-suite` 后加 `--mode diagnose`，末尾的测试参数加 `--level 2`
+或 `--level 3`。UBmem 使用同一入口，把运行参数换成相应 transport、KVAF 路径和设备即可。
+`--` 后只传运行参数；输入选择、group、round-range 和输出路径由清单控制。
+
+## 统计口径与验证
+
+- Demand：captured Q1～Q4 TopK 并集，跨 Q 去重。
+- Hot：调用前有效 hot 槽中的需求；ABC-only：仅 ABC 尾部命中的需求。
+- Cold：Demand − Hot − ABC-only；总 miss 率按总 cold / 总 demand 计算。
+- Candidate hot：有效 hot 命中中位于 LRU 候选槽的数量，不等于实际补取次数。
+- Cold w/o DDR：cold 需求中没有有效 DDR 地址的数量，非零不能导出成功。
+
+复用现有 schema-4 的归档哈希、数组形状、TopK 与分数一致性、逻辑映射和页共享校验。
+不同 DP 的页空间隔离，同一 DP 的页别名保留。未保存真实 KV，搬运验证使用确定性 C8 KV。
+CPU 校验不代替真机正确性验证。
+
+可选单样本兼容接口仍保留：`--root TRACE --round 2 --group 2 --layer-index 0 --output NEW_DIR`。
+正常全量测试无需这些选择参数。
