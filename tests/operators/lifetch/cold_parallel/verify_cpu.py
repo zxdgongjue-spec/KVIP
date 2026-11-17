@@ -442,7 +442,7 @@ class Checks(unittest.TestCase):
 
     def test_11_model_plan_matches_actual_dispatch(self):
         sys.path.insert(0,str(TASK))
-        from run_model_controls import configs
+        from run_model_controls import configs,validate_result
         from simulate_schedule import execute
         lib,tags,_=LIB
         for matrix in ('smoke','full'):
@@ -454,6 +454,18 @@ class Checks(unittest.TestCase):
                     r['aics'],r['aivs'],batch=r['batch'],history=r['history'],resident=r['resident'],route=r['route'],
                     workers=r['workers'],splitter=split_score_tasks,compact=True)
                 self.assertEqual(out['cold_predicate_comparisons'],r['batch']*4*(r['history']-r['resident']))
+        row=configs('smoke')[1]
+        proof=dict(status='PASSED',batch=row['batch'],history=row['history'],resident=row['resident'],
+                   score_route=row['route'],prefetch_budget=0,cold_bitmap_bytes_checked=row['batch']*(row['history']-row['resident']),
+                   model_clock_start=710,model_clock_end=2912,forward_model_cycles=2202,
+                   all_index_fields=True,all_hot_payload=True,guards=True,completion=True)
+        footer='Total tick: 3000\nModel stopped successfully.\n'
+        self.assertEqual(validate_result(row,proof,footer,0),(True,3000))
+        for field,value in (('model_clock_start',0),('model_clock_end',3001),('forward_model_cycles',1),
+                            ('cold_bitmap_bytes_checked',0),('score_route','legacy'),('completion',False)):
+            self.assertFalse(validate_result(row,dict(proof,**{field:value}),footer,0)[0])
+        self.assertFalse(validate_result(row,proof,footer+footer,0)[0])
+        self.assertFalse(validate_result(row,proof,footer,124)[0])
 
 if __name__=='__main__':
     with tempfile.TemporaryDirectory(prefix='kvip-cold-cpu-') as d:

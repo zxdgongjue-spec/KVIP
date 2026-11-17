@@ -46,6 +46,21 @@ def configs(matrix):
 
 def digest(path):return hashlib.sha256(path.read_bytes()).hexdigest()
 
+def validate_result(row,proof,log,exit_code):
+    """Accept only a complete oracle with an independently bounded clock."""
+    ticks=re.findall(r'Total tick:\s*(\d+)',log)
+    whole=int(ticks[0]) if len(ticks)==1 else None
+    start,end=proof.get('model_clock_start',0),proof.get('model_clock_end',0)
+    expected_bitmap=0 if row['route']=='legacy' else row['batch']*(row['history']-row['resident'])
+    valid=(exit_code==0 and proof.get('status')=='PASSED' and whole is not None
+           and 'Model stopped successfully.' in log and 0<start<end<=whole
+           and proof.get('forward_model_cycles')==end-start
+           and all(proof.get(k)==row[k] for k in ('batch','history','resident'))
+           and proof.get('score_route')==row['route'] and proof.get('prefetch_budget')==0
+           and proof.get('cold_bitmap_bytes_checked')==expected_bitmap
+           and all(proof.get(k) is True for k in ('all_index_fields','all_hot_payload','guards','completion')))
+    return valid,whole
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('action',choices=('plan','run'));p.add_argument('--matrix',choices=('smoke','full'),default='smoke')
@@ -54,10 +69,16 @@ def main():
     p.add_argument('--timeout',type=int,default=3600);p.add_argument('--driver',default='build/staged_routes')
     p.add_argument('--source-manifest',default='source-v2/staged-source.json')
     p.add_argument('--host-relink-receipt',default='host-relink.json')
+    p.add_argument('--aic-budget',type=int);p.add_argument('--aiv-budget',type=int)
     a=p.parse_args();a.work=a.work.resolve();a.output=a.output.resolve()
     a.output.relative_to(a.work)
     rows=configs(a.matrix);names={x['name'] for x in rows}
-    for row in rows:row['status']='NOT_RUN'
+    if (a.aic_budget is not None and not 1<=a.aic_budget<=32) or (a.aiv_budget is not None and not 2<=a.aiv_budget<=64):
+        p.error('invalid independent AIC/AIV budget')
+    for row in rows:
+        row['status']='NOT_RUN'
+        if a.aic_budget is not None:row['aics']=a.aic_budget
+        if a.aiv_budget is not None:row['aivs']=a.aiv_budget
     if a.case and not set(a.case)<=names:p.error('unknown case')
     if a.timeout<1:p.error('positive timeout required')
     if a.action=='plan':print(json.dumps(rows,indent=2));return
@@ -84,6 +105,12 @@ def main():
         [binary.parent/'lib/libproducer.a',binary.parent/'lib/libtail.a'] if x.exists()}
     receipt=a.work/a.host_relink_receipt
     metadata['host_relink_receipt']=json.loads(receipt.read_text()) if receipt.exists() else None
+    if metadata['host_relink_receipt'] and metadata['host_relink_receipt'].get('binary_sha256')!=binary_sha:
+        raise RuntimeError('host relink receipt does not match the driver binary')
+    model_shape=metadata['model_config']['config_stars.json']['model_top']
+    if any(row['aics']>model_shape['num_aic'] or row['aivs']>model_shape['num_aiv']
+           for row in rows if not a.case or row['name'] in a.case):
+        raise RuntimeError('application budgets exceed the configured Model resources')
     metadata['runner_sha256']=digest(Path(__file__).resolve())
     (a.output/'manifest.json').write_text(json.dumps(metadata,indent=2)+'\n')
     with lease('model',0):
@@ -102,14 +129,19 @@ def main():
             (a.output/'results.json').write_text(json.dumps(rows,indent=2)+'\n')
             log=a.output/(row['name']+'.log');print('Running '+row['name'],flush=True)
             with log.open('w') as out:
-                result=subprocess.run(cmd,stdout=out,stderr=subprocess.STDOUT,timeout=a.timeout+60)
-            row.update(exit_code=result.returncode,host_wall_seconds=time.monotonic()-start,log_sha256=digest(log))
+                try:
+                    result=subprocess.run(cmd,stdout=out,stderr=subprocess.STDOUT,timeout=a.timeout+60)
+                    exit_code=result.returncode
+                except subprocess.TimeoutExpired:
+                    # docker exec can outlive its client. Stop only this driver,
+                    # then preserve TIMEOUT instead of leaving an obsolete RUNNING row.
+                    subprocess.run(['docker','exec',a.container,'pkill','-KILL','-f','^/work/'+re.escape(a.driver)+' '],check=False)
+                    exit_code=124
+            row.update(exit_code=exit_code,host_wall_seconds=time.monotonic()-start,log_sha256=digest(log))
             proof_path=dest/'correctness.json';proof=json.loads(proof_path.read_text()) if proof_path.exists() else {}
-            text=log.read_text(errors='replace');ticks=re.findall(r'Total tick:\s*(\d+)',text)
-            valid=(result.returncode==0 and proof.get('status')=='PASSED' and proof.get('forward_model_cycles',0)>0
-                   and len(ticks)==1 and 'Model stopped successfully.' in text)
-            row.update(status='MODEL_PASSED' if valid else ('TIMEOUT' if result.returncode==124 else 'FAILED'),
-                       proof=proof,whole_model_ticks=int(ticks[0]) if len(ticks)==1 else None)
+            valid,whole=validate_result(row,proof,log.read_text(errors='replace'),exit_code)
+            row.update(status='MODEL_PASSED' if valid else ('TIMEOUT' if exit_code==124 else 'FAILED'),
+                       proof=proof,whole_model_ticks=whole)
             (a.output/'results.json').write_text(json.dumps(rows,indent=2)+'\n')
             print(row['name']+' '+row['status'],flush=True)
             if not valid:raise RuntimeError('Model failed; see '+str(log))

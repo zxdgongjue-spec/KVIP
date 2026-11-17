@@ -43,6 +43,8 @@ staged_routes FIXTURE OUTPUT B H R C V MISS ROUTE DEVICE \
 
 POST为separate/scatter/direct，PREPARE为wave/invocation/phase，SERVICE为separate/inline；ROUTE另支持完整legacy控制。legacy需要默认post/prepare/service和Ph/Pc=0。每种配置保留全score/θ/Final/Index/payload/guard/completion验证；legacy使用原融合约定，不要求落盘全量canonical。两个共同Model-only clock kernel夹住forward，排除上传和oracle回读，输出raw clock及`forward_model_cycles`。必须确认正常footer、完整oracle和计时有效后才能比较。
 
+clock的scalar GM写入后显式clean/invalidate所属cache line。旧probe曾出现设备SYS_CNT非零、Host回读全零，不能采用那些周期；修复已由独立十次probe的serial/parsim4正常结束验证。probe通过不代表score或整链通过。完整driver在计时外逐字节核对全部Cold bitmap，即使prefetch0时未使用的predicate也验收；失败先写`failure.txt`和已取得的`clock.json`，防止异常清理隐藏原始断言。forward周期包含两个共同probe之间的成本，未扣除估计开销。
+
 CANN9.1设备源发生变化时使用**新的build目录**；本地观察到增量流程会二次link已转换的device object，报unknown file type。保留失败日志，重新准备快照、fresh build，不以旧device library的成功替代新源码编译。
 
 `tests/operators/lifetch/cold_parallel/run_model_controls.py`在已有隔离容器中串行运行生产score完整控制。约定repo→`/repo`只读，指定work→`/work`可写，KVAF include只读；work中准备`source-v2/staged-source.json`、`build/staged_routes`、`fixture-smoke`和`fixture-full`。fixture分别使用H8192/R6400与H131072/R16384，miss10/heads32；可用`staged_routes.fixture`生成。manifest记录binary/library/source/fixture哈希及Model配置，共用宿主全局Model租约。
@@ -60,3 +62,5 @@ python3 tests/operators/lifetch/cold_parallel/run_model_controls.py run \
 ```
 
 `--case`重复选点，未选项保留NOT_RUN；`--source-manifest`/`--driver`可调整work内路径。W8另比较staged_before_W8、inline_auto_W8、inline_Ph4_Pc8_W8与inline_Ph26_Pc26_W8。Model仅prefetch0/同步GM final Fetch，H8192 smoke不满足legacy sequence-split长history门禁；只有H128K完整控制能验证该门禁下P2。宿主耗时不是设备耗时，Model周期不是A5/URMA微秒数。实际Model结果和配置见[本轮报告](../../docs/research/split_core/optimization_exploration_20261117.md)。
+
+应用预算可用`--aic-budget 32 --aiv-budget 64`覆盖，必须不超过Model配置和实际launch需求；默认full预算28/56。`--host-relink-receipt`保存host重链接收据路径。接受结果要求唯一正常footer、完整oracle、正确route/fixture/Cold字节数，且`0 < start < end <= whole_model_ticks`、`forward_model_cycles=end-start`。timeout保留TIMEOUT与原日志，未执行项保留NOT_RUN，不将缺测计为通过。

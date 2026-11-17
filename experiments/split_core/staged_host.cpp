@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -15,8 +16,13 @@
 #include <set>
 #include <stdexcept>
 #include <vector>
-static void check(uint32_t c){if(c)throw std::runtime_error("ACL error "+std::to_string(c));}
-static void require(bool c,const std::string& s){if(!c)throw std::runtime_error(s);}
+static std::string lastFailure;
+static void check(uint32_t c){if(c){lastFailure="ACL error "+std::to_string(c);throw std::runtime_error(lastFailure);}}
+static void require(bool c,const std::string& s){if(!c){lastFailure=s;throw std::runtime_error(s);}}
+struct FailureLog {
+ std::string path;
+ ~FailureLog(){if(std::uncaught_exceptions()>0){try{std::ofstream(path)<<lastFailure<<"\n";}catch(...){}}}
+};
 struct Memory {
  std::vector<void*> allocations;
  template<class T> uint64_t put(const std::vector<T>& v){void* p=nullptr;size_t n=v.size()*sizeof(T);require(n,"empty allocation");
@@ -36,7 +42,7 @@ static uint32_t choice(const std::string& value,const std::vector<std::string>& 
  auto at=std::find(names.begin(),names.end(),value);require(at!=names.end(),"invalid option "+value);return at-names.begin();
 }
 static void Run(const std::string& out,uint32_t batch,uint32_t h,uint32_t r,uint32_t c,uint32_t v,uint32_t miss,aclrtStream stream,const std::string& forced,const Options& options){
- using namespace rotating;Memory m;
+ using namespace rotating;Memory m;FailureLog failure{out+"/failure.txt"};
  RuntimeShape s{};s.batch=batch;s.history=h;s.resident=r;s.indexHeads=32;s.aicCount=c;s.tokenBytes=656;s.rounds=options.windows;
  require(forced=="legacy" || forced=="history" || forced=="bsq" || forced=="auto","invalid route");
  if(forced=="legacy"){
@@ -161,7 +167,9 @@ static void Run(const std::string& out,uint32_t batch,uint32_t h,uint32_t r,uint
  if(forced=="legacy")check(kvip_lifetch_streaming_forward_v2((void*)bindings,(void*)updateGm,(void*)workspace,stream,&s,options.workers,v));
  else check(kvip_lifetch_staged_forward((void*)bindings,(void*)workspace,stream,&s,&plan));
  check(aclrtlaunch_kvip_model_clock(1,stream,(void*)clock,1));check(aclrtSynchronizeStream(stream));
- auto modelClock=m.get<uint64_t>(clock,2);require(modelClock[1]>modelClock[0],"invalid Model forward clock");
+ auto modelClock=m.get<uint64_t>(clock,2);
+ {std::ofstream raw(out+"/clock.json");raw<<"{\"start\":"<<modelClock[0]<<",\"end\":"<<modelClock[1]<<"}\n";}
+ require(modelClock[1]>modelClock[0],"invalid Model forward clock");
  double wall=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
  auto scores=m.get<uint16_t>(canonical,uint64_t(batch)*4*h+128);if(forced!="legacy")for(size_t i=0;i<uint64_t(batch)*4*h;++i)require(scores[i]==oracle[i%(4*h)],"score mismatch "+std::to_string(i));
  for(size_t i=uint64_t(batch)*4*h;i<scores.size();++i)require(scores[i]==0x5a5a,"score guard");
