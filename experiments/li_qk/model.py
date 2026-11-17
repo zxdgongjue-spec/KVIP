@@ -24,6 +24,7 @@ def main():
     p.add_argument('--timeout',type=int,default=900)
     p.add_argument('--fixture',type=Path,help='reuse an existing exact B16/H/G32 fixture')
     p.add_argument('--parsim',type=int,default=4,help='Model host threads; no change to simulated 32/64 topology')
+    p.add_argument('--work-grain',type=int,default=2048)
     a=p.parse_args();a.build=a.build.resolve();a.output=a.output.resolve();a.model_lib=a.model_lib.resolve()
     configs=suite_cases('batch16');stages=a.stage or ['score','scatter','topk']
     rows=[]
@@ -31,7 +32,8 @@ def main():
         name=f"T{c['history_parts']}_{c['schedule']}"
         if a.case and name not in a.case:continue
         for stage in stages:
-            rows.append(dict(c,name=name+'_'+stage,stage=stage,geometry=geometry(c['history_parts'],1,a.history,30,60,16,c['schedule'])))
+            grain=a.work_grain if c['schedule']=='balanced' else 2048
+            rows.append(dict(c,name=name+'_'+stage,stage=stage,geometry=geometry(c['history_parts'],1,a.history,30,60,16,c['schedule'],grain,stage=='score')))
     if a.action=='plan':print(json.dumps(rows,indent=2));return
     if a.timeout<1 or a.parsim<1 or not 0<=int(a.core_mask,16)<=0xffffffff:p.error('valid timeout, threads and 32-bit core mask required')
     build=json.loads((a.build/'build-manifest.json').read_text());driver=a.build/'build/li_qk'
@@ -67,7 +69,7 @@ def main():
             receipt.write_text(json.dumps(manifest,indent=2)+'\n')
             for row in rows:
                 work=a.output/row['name'];work.mkdir();dest=work/'oracle'
-                argv=[str(driver),str(fixture),str(dest),str(a.history),'32','30','60',str(row['history_parts']),'1','0','1','0','16',row['schedule'],'li']
+                argv=[str(driver),str(fixture),str(dest),str(a.history),'32','30','60',str(row['history_parts']),'1','0','1','0','16',row['schedule'],'li',str(row['geometry']['work_grain'])]
                 row.update(argv=argv,status='RUNNING');receipt.write_text(json.dumps(manifest,indent=2)+'\n')
                 print('Model '+row['name'],flush=True);started=time.monotonic()
                 with (work/'run.log').open('w') as f:

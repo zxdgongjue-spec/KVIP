@@ -116,12 +116,14 @@ class Launcher(unittest.TestCase):
                 cmd[cmd.index('--suite')+1]=suite
                 cmd[cmd.index('--aics')+1]='32';cmd[cmd.index('--aivs')+1]='64'
                 cmd.append('--profile')
+                if suite=='batch16':cmd+=['--work-grain','128']
                 r=subprocess.run(cmd,env=env,text=True,capture_output=True)
                 self.assertEqual(r.returncode,0,r.stdout+r.stderr)
                 actions=[json.loads(s) for s in calls.read_text().splitlines()]
                 self.assertEqual([x[0] for x in actions],['plan','build','run','summarize','profile'])
                 for call in (actions[0],actions[2],actions[4]):
                     self.assertEqual(call[call.index('--suite')+1],suite)
+                    self.assertEqual(call[call.index('--work-grain')+1],'128' if suite=='batch16' else '2048')
                 for key,value in (('--aics','30' if suite=='batch16' else '32'),('--aivs','60' if suite=='batch16' else '64')):
                     self.assertEqual(actions[2][actions[2].index(key)+1],value)
                 self.assertNotEqual(actions[2][actions[2].index('--output')+1],actions[4][actions[4].index('--output')+1])

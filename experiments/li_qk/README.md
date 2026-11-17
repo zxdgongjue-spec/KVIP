@@ -156,3 +156,27 @@ python3 experiments/li_qk/map_model_pcs.py /work/model-results/T2_balanced_all \
 要求对应case的原manifest与相同captured build，输出入口/ELF/SHA证明、kernel PC范围及动态统计。独立consumer的image基址会变化，不能复用完整链的硬编码地址。结果中的`capture_complete`反映原case是否完整PASS；部分超时日志不能当完整统计。
 
 本轮实际结果与限制见`EXTENSION_REPORT.md`：B16/H8K三控制组完整LI通过，修复了balanced片段切换时AIV1 credits残留；H128K独立scatter/TopK通过；H128K完整score600秒超时。仅开core0日志，没有全核score统计或真实A5 msprof trace。
+
+## G32 执行粒度与全核 Model 补测
+
+新增结果见 [GRAIN_REPORT.md](GRAIN_REPORT.md)。七次独立 balanced score Model 全部 PASS，覆盖30 AIC/60 AIV；固定H8192的同binary/fixture三点，grain2048→512/128的issue窗口包络缩短14.1%/15.6%。这是Model结果，未换算A5微秒；完整H128K仅补充静态计划，旧完整score超时结论仍有效。
+
+`--work-grain` 仅改变 B16 balanced 的任务分配量子，默认2048，允许128..65536的2次幂，要求H对齐2×grain。普通T1/T2 waves保持原计划。连续块会合并，不是每grain重做初始化；内部计算tile仍是H128。
+
+宿主机照旧用`update_shared_a5.sh`更新，容器执行`run_in_container.sh --suite batch16 --work-grain 512 --profile`即可补测。2048/512/128三个配置各产生独立结果；同轮B16 T1配对，Final固定64 AIV，score固定30/60。
+
+严格控制为同一binary时，先按前文构建一次，再运行以下循环（替换构建与输出路径）：
+
+```bash
+for li_grain in 2048 512 128; do
+  python3 experiments/li_qk/run.py run \
+    --build /path/to/same-npu-build --suite batch16 \
+    --aics 30 --aivs 60 --device 5 --history 131072 \
+    --work-grain "$li_grain" --warmup 4 --iterations 20 --rounds 3 \
+    --output "/home/w00568585/li_b16_grain_${li_grain}_new"
+done
+```
+
+每次输出必须不存在。确定性fixture生成器保持不变，检查三个manifest的fixture hashes一致。单独`profile.py run`也支持`--work-grain`。
+
+全核七点Model脚本是 [run_granularity_model.sh](run_granularity_model.sh)，汇总为 [grain_summary.py](grain_summary.py)。报告同时解释128计算tile、分配量子、连续片段、canonical与Final，及尚未实施的初始化复用和producer直写方向。

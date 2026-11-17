@@ -68,14 +68,16 @@ def make_fixture(output,batch,history,heads):
     (output/'fixture.json').write_text(json.dumps(meta,indent=2)+'\n');return meta
 
 
-def geometry(t,qp,history=131072,aics=32,aivs=64,batch=1,schedule="waves"):
-    if t not in (1,2,4,8,16,32) or qp not in (1,2,4) or history<2048 or history>210944 or history%256:
+def geometry(t,qp,history=131072,aics=32,aivs=64,batch=1,schedule="waves",work_grain=2048,score_only=False):
+    minimum=256 if score_only and schedule=='balanced' else 2048
+    if t not in (1,2,4,8,16,32) or qp not in (1,2,4) or history<minimum or history>210944 or history%256:
         raise ValueError('T=1/2/4/8/16/32, Qparts=1/2/4, aligned history 2048..210944 required')
-    if not 1<=aics<=32 or not 2<=aivs<=64 or history//256<t:
+    if not 1<=aics<=32 or not 2<=aivs<=64 or (schedule!='balanced' and history//256<t):
         raise ValueError('valid AIC/AIV budget and nonempty shards required')
     if batch not in (1,16) or schedule not in ('waves','balanced') or (batch==16 and (t>2 or qp!=1)):
         raise ValueError('B1 axes or B16 T1/T2 Q4 required')
     group=4//qp;physical=max(2,group);capacity=min(aics,aivs//2)
+    if schedule!='balanced' and work_grain!=2048:raise ValueError('work grain applies to balanced score only')
     tasks=[dict(query_begin=q,query_count=group,begin=history//256*s//t*256,end=history//256*(s+1)//t*256)
            for b in range(batch) for q in range(0,4,group) for s in range(t)]
     if batch>1:
@@ -83,21 +85,22 @@ def geometry(t,qp,history=131072,aics=32,aivs=64,batch=1,schedule="waves"):
     logical_tasks=len(tasks)
     core_blocks=[]
     if schedule=="balanced":
-        if (batch,t,qp,capacity)!=(16,2,1,30) or history%4096:
-            raise ValueError("balanced requires B16/T2/Q4,30 groups,H multiple of4096")
-        total=batch*history//2048;half=history//4096;cores=[]
+        if ((batch,t,qp,capacity)!=(16,2,1,30) or not 128<=work_grain<=65536 or
+                work_grain&(work_grain-1) or history%(2*work_grain)):
+            raise ValueError("balanced requires B16/T2/Q4,30 groups,power-of-two grain128..65536,H multiple of2*grain")
+        total=batch*history//work_grain;half=history//(2*work_grain);cores=[]
         for c in range(capacity):
             lo=total*c//capacity;hi=total*(c+1)//capacity;core_blocks.append(hi-lo);pieces=[]
             while lo<hi:
-                logical=lo//half;end=min(hi,(logical+1)*half);begin=(logical%2*half+lo%half)*2048
-                pieces.append(dict(query_begin=0,query_count=4,begin=begin,end=begin+(end-lo)*2048,owner=logical//2));lo=end
+                logical=lo//half;end=min(hi,(logical+1)*half);begin=(logical%2*half+lo%half)*work_grain
+                pieces.append(dict(query_begin=0,query_count=4,begin=begin,end=begin+(end-lo)*work_grain,owner=logical//2));lo=end
             cores.append(pieces)
         tasks=[cores[c][slot] if slot<len(cores[c]) else dict(query_begin=0,query_count=0,begin=0,end=0,owner=0)
                for slot in range(max(map(len,cores))) for c in range(capacity)]
     lengths=[r['end']-r['begin'] for r in tasks]
     waves=[tasks[i:i+capacity] for i in range(0,len(tasks),capacity)]
     logical=batch*4*32*history*128
-    return dict(batch=batch,schedule=schedule,logical_tasks=logical_tasks,active_segments=sum(x>0 for x in lengths),core_blocks=core_blocks,history_parts=t,query_parts=qp,logical_query_group=group,physical_query_tile=physical,
+    return dict(batch=batch,schedule=schedule,work_grain=work_grain,logical_tasks=logical_tasks,active_segments=sum(x>0 for x in lengths),core_blocks=core_blocks,history_parts=t,query_parts=qp,logical_query_group=group,physical_query_tile=physical,
                 tasks=len(tasks),capacity=capacity,score_waves=1 if schedule=="balanced" else len(waves),score_slots=len(waves),score_launches=1 if schedule=="balanced" else len(waves),row_stride=max(lengths),
                 key_tokens_per_task=sorted(set(lengths)),task_map=tasks,
                 useful_aivs_peak=max(len(w) for w in waves)*(1 if group==1 else 2),
@@ -167,6 +170,8 @@ def write_summary(output):
             raise ValueError('unaccepted scope/correctness: '+str(path))
         if r.get('schedule','waves')!=item.get('schedule','waves') or r.get('phase','both')!='both' or r.get('model_stage','all')!='all':
             raise ValueError('unaccepted schedule/isolated profiling report')
+        if r.get('work_grain',2048)!=(manifest.get('work_grain',2048) if item.get('schedule')=='balanced' else 2048):
+            raise ValueError('unaccepted work grain')
         for name in ('score','li'):
             v=r[name+'_p50_us'];samples=r[name+'_samples_us']
             if not isinstance(v,(int,float)) or not math.isfinite(v) or v<=0 or len(samples)!=manifest['iterations']:
@@ -175,7 +180,7 @@ def write_summary(output):
             if not math.isclose(v,statistics.median(samples),rel_tol=1e-8):raise ValueError('p50 does not match samples')
         if sha(output/item['name']/'score-keys.bin')!=manifest['fixture']['hashes']['oracle']:raise ValueError('canonical oracle SHA mismatch')
         if item['round']==0:continue
-        row=dict(round=item['round'],batch=manifest.get('batch',1),schedule=item.get('schedule','waves'),history_parts=item['history_parts'],query_parts=item['query_parts'],
+        row=dict(round=item['round'],batch=manifest.get('batch',1),schedule=item.get('schedule','waves'),work_grain=r.get('work_grain',2048),history_parts=item['history_parts'],query_parts=item['query_parts'],
                  score_p50_us=r['score_p50_us'],li_p50_us=r['li_p50_us'],score_waves=r['score_waves'],
                  physical_query_tile=r['physical_query_tile'],report=str(path))
         rows.append(row)
@@ -200,7 +205,7 @@ def write_summary(output):
         t,qp=config['history_parts'],config['query_parts']
         rr=[r for r in rows if key(r)==key(config)]
         if len(rr)!=manifest['rounds']:raise ValueError('missing measured configuration')
-        row=dict(batch=manifest.get('batch',1),schedule=config['schedule'],history_parts=t,query_parts=qp,logical_query_group=4//qp,
+        row=dict(batch=manifest.get('batch',1),schedule=config['schedule'],work_grain=rr[0]['work_grain'],history_parts=t,query_parts=qp,logical_query_group=4//qp,
                  reference='B16 T1: one group per owner' if manifest.get('batch',1)==16 else 'B1 T1: one group total',
                  score_p50_mean_us=statistics.mean(r['score_p50_us'] for r in rr),
                  li_p50_mean_us=statistics.mean(r['li_p50_us'] for r in rr),
@@ -250,11 +255,12 @@ def run(a):
                 t,qp=config['history_parts'],config['query_parts']
                 name=f'r{round_no}_T{t}_Qp{qp}'+('_balanced' if config['schedule']=='balanced' else '')
                 cmd=[str(driver),str(a.output/'fixture'),str(a.output/name),str(a.history),'32',str(a.aics),str(a.aivs),
-                     str(t),str(qp),str(a.warmup),str(a.iterations),str(a.device),str(batch),config['schedule']]
+                     str(t),str(qp),str(a.warmup),str(a.iterations),str(a.device),str(batch),config['schedule'],'both',
+                     str(a.work_grain if config['schedule']=='balanced' else 2048)]
                 cases.append(dict(name=name,round=round_no,history_parts=t,query_parts=qp,schedule=config['schedule'],argv=cmd))
         info=subprocess.run(['npu-smi','info'],capture_output=True,text=True)
         manifest=dict(scope='standalone LI; score and numeric score+canonical+global TopK; no Fetch/Service/Index',
-                      saved_lifetch_commit='20adb7e',suite=a.suite,history=a.history,heads=32,batch=batch,queries=4,
+                      saved_lifetch_commit='20adb7e',suite=a.suite,work_grain=a.work_grain,history=a.history,heads=32,batch=batch,queries=4,
                       warmup=a.warmup,iterations=a.iterations,rounds=a.rounds,requested_aics=a.aics,requested_aivs=a.aivs,
                       fixture=fixture,build_manifest_sha256=sha(build_path),build_manifest=b,cases=cases,sdk_cases=sdk_cases,
                       native_reference_source_sha256=sha(HERE/'native_li.py') if a.sdk_reference else None,
@@ -288,6 +294,7 @@ def main():
     for name in ('plan','run'):
         s=subs.add_parser(name);s.add_argument('--history',type=int,default=131072);s.add_argument('--aics',type=int,default=32);s.add_argument('--aivs',type=int,default=64)
         s.add_argument('--suite',choices=('orthogonal7','orthogonal8','batch16'),default='orthogonal7')
+        s.add_argument('--work-grain',type=int,default=2048,help='balanced work allocation quantum; hardware score tile remains128')
         if name=='plan':s.add_argument('--details',action='store_true',help='include every query/history task interval')
         if name=='run':
             s.add_argument('--build',type=Path,required=True);s.add_argument('--output',type=Path,required=True);s.add_argument('--device',type=int,default=5)
@@ -300,7 +307,8 @@ def main():
         if hasattr(a,key):setattr(a,key,getattr(a,key).resolve())
     if a.action in ('plan','run'):
         configs=suite_cases(a.suite)
-        rows=[geometry(c['history_parts'],c['query_parts'],a.history,a.aics,a.aivs,c['batch'],c['schedule']) for c in configs]
+        if a.suite!='batch16' and a.work_grain!=2048:p.error('work grain applies to batch16 balanced only')
+        rows=[geometry(c['history_parts'],c['query_parts'],a.history,a.aics,a.aivs,c['batch'],c['schedule'],a.work_grain if c['schedule']=='balanced' else 2048) for c in configs]
         if a.suite=='orthogonal8' and min(a.aics,a.aivs//2)<32:p.error('K32 suite requires32 AIC/64 AIV; use orthogonal7 for smaller budgets')
         if a.suite=='batch16' and min(a.aics,a.aivs//2)!=30:p.error('batch16 suite requires --aics30 --aivs60 (or64)')
     if a.action=='plan':

@@ -21,13 +21,14 @@ def main():
     p.add_argument('--history',type=int,default=131072)
     p.add_argument('--metrics',choices=('PipeUtilization','Memory','ResourceConflictRatio'),default='PipeUtilization')
     p.add_argument('--timeout',type=int,default=900)
+    p.add_argument('--work-grain',type=int,default=2048)
     a=p.parse_args();a.build=a.build.resolve();a.output=a.output.resolve()
     configs=suite_cases('batch16') if a.suite=='batch16' else [dict(batch=1,history_parts=16 if a.suite=='orthogonal7' else 32,query_parts=1,schedule='waves')]
     cases=[]
     for c in configs:
         c=dict(c);b=c['batch'];c.update(aics=30 if b==16 else 32,aivs=60 if b==16 else 64)
         c['name']=f"B{b}_T{c['history_parts']}_{c['schedule']}"
-        c['geometry']=geometry(c['history_parts'],1,a.history,c['aics'],c['aivs'],b,c['schedule']);cases.append(c)
+        c['geometry']=geometry(c['history_parts'],1,a.history,c['aics'],c['aivs'],b,c['schedule'],a.work_grain if c['schedule']=='balanced' else 2048);cases.append(c)
     if a.action=='plan':print(json.dumps(cases,indent=2));return
     if any(x in os.environ.get('LD_PRELOAD','') for x in ('camodel','cmodel')):p.error('physical A5 profile rejects Model preload')
     profiler=shutil.which('msprof')
@@ -48,7 +49,7 @@ def main():
                 fixtures[b]=make_fixture(a.output/f'fixture_b{b}',b,a.history,32)
             c['fixture']=fixtures[b];folder=a.output/c['name'];folder.mkdir()
             command=[str(driver),str(a.output/f'fixture_b{b}'),str(folder/'oracle'),str(a.history),'32',
-                     str(c['aics']),str(c['aivs']),str(c['history_parts']),'1','4','5',str(a.device),str(b),c['schedule'],'li']
+                     str(c['aics']),str(c['aivs']),str(c['history_parts']),'1','4','5',str(a.device),str(b),c['schedule'],'li',str(c['geometry']['work_grain'])]
             # File preserves argv safely even when paths contain shell metacharacters.
             app=folder/'application.sh';app.write_text('#!/usr/bin/env bash\nset -euo pipefail\nexec '+shlex.join(command)+'\n');app.chmod(0o700)
             argv=[profiler,'--application='+shlex.quote(str(app)),'--output='+str(folder/'trace'),

@@ -180,7 +180,7 @@ static void Run(const std::string& fixture,const std::string& output,const li_qk
     std::ofstream report(output+"/report.json");report<<std::setprecision(10);
     report<<"{\"status\":\"PASS\",\"run_mode\":\""<<LI_QK_RUN_MODE<<"\",\"batch\":"<<p.batch<<",\"queries\":4,\"history\":"<<h<<",\"heads\":"<<g
       <<",\"history_parts\":"<<p.historyParts<<",\"query_parts\":"<<p.queryParts<<",\"logical_query_group\":"<<p.queryGroup<<",\"physical_query_tile\":"<<p.physicalGroup
-      <<",\"schedule\":\""<<(p.balanced?"balanced":"waves")<<"\",\"phase\":\""<<phase<<"\",\"capacity\":"<<p.capacity<<",\"tasks\":"<<p.tasks.size()<<",\"score_waves\":"<<(p.balanced?1:waves.size())<<",\"score_slots\":"<<waves.size()<<",\"score_launches\":"<<((modelStage=="all" || modelStage=="score")?(p.balanced?1:waves.size()):0)
+      <<",\"schedule\":\""<<(p.balanced?"balanced":"waves")<<"\",\"work_grain\":"<<p.workGrain<<",\"phase\":\""<<phase<<"\",\"capacity\":"<<p.capacity<<",\"tasks\":"<<p.tasks.size()<<",\"score_waves\":"<<(p.balanced?1:waves.size())<<",\"score_slots\":"<<waves.size()<<",\"score_launches\":"<<((modelStage=="all" || modelStage=="score")?(p.balanced?1:waves.size()):0)
       <<",\"scatter_launches\":"<<((modelStage=="all" || modelStage=="scatter") && !alias?waves.size():0)<<",\"canonical_alias\":"<<(alias?"true":"false")<<",\"topk_launches\":"<<(topkChecked?1:0)<<",\"fetch_launches\":0,\"final_topk_aivs\":"<<queries<<",\"k\":2048,\"warmup\":"<<warmup<<",\"iterations\":"<<iterations
       <<",\"score_p50_us\":";if(native && !scoreUs.empty())report<<Median(scoreUs);else report<<"null";
     report<<",\"li_p50_us\":";if(native)report<<Median(liUs);else report<<"null";
@@ -193,11 +193,13 @@ int main(int argc,char** argv){try {
     if(argc==2 && std::string(argv[1])=="--capabilities"){
         std::cout<<"{\"run_mode\":\""<<LI_QK_RUN_MODE<<"\",\"scope\":\"standalone LI QK controls\",\"fetch_launches\":0,\"queries\":4,\"batch\":1,\"k\":2048}\n";return 0;
     }
-    Require(argc==12 || argc==14 || argc==15,"li_qk FIXTURE OUTPUT H HEADS C V T QPARTS WARMUP ITERATIONS DEVICE [BATCH waves|balanced [both|li]]");
+    Require(argc==12 || argc==14 || argc==15 || argc==16,"li_qk FIXTURE OUTPUT H HEADS C V T QPARTS WARMUP ITERATIONS DEVICE [BATCH waves|balanced [both|li [WORK_GRAIN]]]");
     auto number=[](const char* s){size_t used=0;uint64_t n=std::stoull(s,&used);Require(s[used]==0&&n<=UINT32_MAX,"integer required");return uint32_t(n);};
-    std::string schedule=argc>=14?argv[13]:"waves",phase=argc==15?argv[14]:"both";
+    std::string schedule=argc>=14?argv[13]:"waves",phase=argc>=15?argv[14]:"both";
     Require(schedule=="waves" || schedule=="balanced","schedule waves|balanced");Require(phase=="both" || phase=="li","phase both|li");
-    auto p=li_qk::MakePlan(number(argv[3]),number(argv[4]),number(argv[5]),number(argv[6]),number(argv[7]),number(argv[8]),argc>=14?number(argv[12]):1,schedule=="balanced");
+    const char* modelStage=std::getenv("LI_QK_MODEL_STAGE");
+    bool shortScore=std::string(LI_QK_RUN_MODE)=="sim" && modelStage && std::string(modelStage)=="score";
+    auto p=li_qk::MakePlan(number(argv[3]),number(argv[4]),number(argv[5]),number(argv[6]),number(argv[7]),number(argv[8]),argc>=14?number(argv[12]):1,schedule=="balanced",argc==16?number(argv[15]):2048,shortScore);
     uint32_t warmup=number(argv[9]),iterations=number(argv[10]);Require((warmup>=1 || (std::string(LI_QK_RUN_MODE)=="sim" && phase=="li"))&&warmup<=100&&iterations>=1&&iterations<=1000,"warmup 1..100, iterations 1..1000");
     Require(!std::filesystem::exists(argv[2]),"fresh output required");std::filesystem::create_directories(argv[2]);
     Check(aclInit(nullptr));Check(aclrtSetDevice(number(argv[11])));aclrtStream stream=nullptr;Check(aclrtCreateStream(&stream));

@@ -6,6 +6,7 @@ LI_REPO=/home/w00568585/wt-mr14
 LI_REF=FETCH_HEAD
 LI_SUITE=orthogonal8
 LI_PROFILE=0
+LI_WORK_GRAIN=2048
 LI_BRANCH=codex/split-core-unified-comparison
 LI_WORK_ROOT=/home/w00568585
 LI_OUTPUT_ROOT=/home/w00568585
@@ -38,6 +39,7 @@ Run in the existing A5 container; B1/Q4/H131072 eight points, or B16/30-core con
   --output-root PATH   Parent of new results directory (default /home/w00568585)
   --suite NAME         orthogonal7, orthogonal8 (default), or batch16
   --profile            Also collect separate msprof LI traces after benchmark
+  --work-grain N       Balanced allocation quantum in tokens (default 2048)
   --sdk-reference      Also measure SDK standalone LI; requires torch_npu
   --no-proxy           Bypass proxy only for this Git fetch; leaves Git config unchanged
   --skip-fetch         Use the selected local commit without any network fetch
@@ -56,10 +58,10 @@ while (($#)); do
         --profile) LI_PROFILE=1; shift ;;
         --no-proxy) LI_NO_PROXY=1; shift ;;
         --skip-fetch) LI_SKIP_FETCH=1; shift ;;
-        --suite|--repo|--ref|--cann-root|--kvaf-include|--soc|--device|--aics|--aivs|--python|--work-root|--output-root|--git-bundle)
+        --work-grain|--suite|--repo|--ref|--cann-root|--kvaf-include|--soc|--device|--aics|--aivs|--python|--work-root|--output-root|--git-bundle)
             (($# >= 2)) && [[ -n $2 ]] || die "Missing value for $1"
             case "$1" in
-                --suite) LI_SUITE=$2 ;; --repo) LI_REPO=$2 ;; --ref) LI_REF=$2 ;;
+                --work-grain) LI_WORK_GRAIN=$2 ;; --suite) LI_SUITE=$2 ;; --repo) LI_REPO=$2 ;; --ref) LI_REF=$2 ;;
                 --cann-root) LI_CANN=$2 ;; --kvaf-include) LI_KVAF=$2 ;;
                 --soc) LI_SOC=$2 ;; --device) LI_DEVICE=$2 ;;
                 --aics) LI_AICS=$2 ;; --aivs) LI_AIVS=$2 ;;
@@ -72,6 +74,9 @@ while (($#)); do
     esac
 done
 [[ $LI_SUITE == orthogonal7 || $LI_SUITE == orthogonal8 || $LI_SUITE == batch16 ]] || die "Unknown suite: $LI_SUITE"
+[[ $LI_WORK_GRAIN =~ ^[1-9][0-9]*$ && ${#LI_WORK_GRAIN} -le 5 ]] || die 'Invalid work grain'
+((LI_WORK_GRAIN >= 128 && LI_WORK_GRAIN <= 65536 && (LI_WORK_GRAIN & (LI_WORK_GRAIN-1)) == 0)) || die 'Work grain must be power-of-two128..65536'
+[[ $LI_SUITE == batch16 || $LI_WORK_GRAIN == 2048 ]] || die 'Work grain applies to batch16 only'
 if [[ $LI_SUITE == batch16 ]]; then LI_AICS=30; LI_AIVS=60; fi
 if ((LI_SKIP_FETCH)) && [[ $LI_REF == FETCH_HEAD ]]; then die "--skip-fetch requires an explicit --ref COMMIT"; fi
 for LI_NUM in "$LI_DEVICE" "$LI_AICS" "$LI_AIVS"; do
@@ -185,6 +190,7 @@ if [[ -n $LI_BUNDLE ]] || ((LI_SKIP_FETCH == 0)); then
     git -C "$LI_REPO" merge-base --is-ancestor "$LI_COMMIT" FETCH_HEAD || die 'Selected revision is not on the fetched MR14 branch'
 fi
 printf 'resolved_commit=%s\n' "$LI_COMMIT" >> "$LI_OUT/launcher-config.txt"
+printf 'suite=%s\nwork_grain=%s\n' "$LI_SUITE" "$LI_WORK_GRAIN" >> "$LI_OUT/launcher-config.txt"
 run_logged worktree.log git -C "$LI_REPO" worktree add --detach "$LI_WT" "$LI_COMMIT"
 cd "$LI_WT"
 [[ -f experiments/li_qk/run.py ]] || die 'Selected revision does not contain the standalone LI controls'
@@ -192,17 +198,17 @@ cd "$LI_WT"
 run_logged npu-smi.log npu-smi info
 run_logged cpu-check.log "$LI_PYTHON" experiments/li_qk/test_controls.py
 "$LI_PYTHON" experiments/li_qk/run.py plan --details --history 131072 \
-    --suite "$LI_SUITE" --aics "$LI_AICS" --aivs "$LI_AIVS" > "$LI_OUT/plan.json"
+    --suite "$LI_SUITE" --work-grain "$LI_WORK_GRAIN" --aics "$LI_AICS" --aivs "$LI_AIVS" > "$LI_OUT/plan.json"
 run_logged build-console.log "$LI_PYTHON" experiments/li_qk/run.py build \
     --cann-root "$LI_CANN" --soc "$LI_SOC" --kvaf-include "$LI_KVAF" --output "$LI_OUT/build"
-LI_RUN_ARGS=(--suite "$LI_SUITE" --build "$LI_OUT/build" --device "$LI_DEVICE" --history 131072
+LI_RUN_ARGS=(--suite "$LI_SUITE" --work-grain "$LI_WORK_GRAIN" --build "$LI_OUT/build" --device "$LI_DEVICE" --history 131072
     --aics "$LI_AICS" --aivs "$LI_AIVS" --warmup 4 --iterations 20 --rounds 3
     --output "$LI_OUT/results")
 if ((LI_SDK)); then LI_RUN_ARGS+=(--sdk-reference); fi
 run_logged runner.log "$LI_PYTHON" experiments/li_qk/run.py run "${LI_RUN_ARGS[@]}"
 run_logged summarize.log "$LI_PYTHON" experiments/li_qk/run.py summarize "$LI_OUT/results"
 if ((LI_PROFILE)); then
-    run_logged profile.log "$LI_PYTHON" experiments/li_qk/profile.py run --build "$LI_OUT/build" --output "$LI_OUT/msprof" --device "$LI_DEVICE" --suite "$LI_SUITE"
+    run_logged profile.log "$LI_PYTHON" experiments/li_qk/profile.py run --build "$LI_OUT/build" --output "$LI_OUT/msprof" --device "$LI_DEVICE" --suite "$LI_SUITE" --work-grain "$LI_WORK_GRAIN"
 fi
 printf '\nSelected-suite summary (ratios < 1 indicate acceleration):\n'
 cat "$LI_OUT/results/summary.csv"

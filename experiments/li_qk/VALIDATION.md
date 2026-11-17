@@ -25,3 +25,13 @@
 - B16/H131072独立scatter与TopK PASS，使用GM预填oracle。完整score600秒TIMEOUT；没有完整score正确性或全核指令统计。
 - 动态issue日志仅physical core0，经实际入口PC与相同ELF核验；逐kernel/core分类与opcode占比已保存。Model whole ticks不是A5微秒或算法时间占比。
 - 新`profile.py`提供物理A5独立msprof collect/export及oracle/预期kernel检查；本地没有A5，尚无真实msprof trace。真机命令见报告。
+
+## G32 / 30核粒度补测
+
+本轮结果见`GRAIN_REPORT.md`，证据根为`tests/results/li-granularity-20261117/`：
+
+- 七项CPU检查、七项launcher检查通过；新增grain128..65536校验、C++/Python一致覆盖、短history仅Model score入口许可、参数与summary转交核验。
+- CANN950 Model七次独立balanced score全部PASS，开全核mask0xffffffff，实际30 AIC/60 AIV。四个短H探针，三个固定H8192/grain2048/512/128控制点；固定H使用同binary和相同fixture。
+- 全核issue窗口包络40759→35002→34402；缩短14.12%/15.60%。总Init46→58→60、总指令增加。issue窗口含等待，不等于活跃周期/完成时间，也不是A5微秒。
+- Model与fresh NPU构建的compiled C++/headers及共享device source SHA均与当前代码一致，binary/library SHA核验一致；NPU receipt所有wrapper SHA与最终代码一致。Model receipt的部分Python wrapper随后补充统计/参数检查，各capture保留实际argv、geometry、Model配置与fixture SHA。
+- 原完整H128K score超时状态未改变，未有真实A5 msprof；本轮未实施producer直写canonical、初始化复用或Final并发。

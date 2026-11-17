@@ -209,5 +209,24 @@ class Controls(unittest.TestCase):
             b=controls.make_small_fixture(d/'all-owner',16,4096,32)
             self.assertEqual(a['hashes'],b['hashes'])
 
+    def test_07_work_grain_and_short_score_coverage(self):
+        points=[(h,128) for h in (256,512,1024,2048,4096,8192,131072)]+[(8192,512),(8192,2048)]
+        with tempfile.TemporaryDirectory() as folder:
+            d=Path(folder)
+            code='#include "plan.h"\n#include <iostream>\nint main(int argc,char** argv){auto p=li_qk::MakePlan(std::stoul(argv[1]),32,30,60,2,1,16,true,std::stoul(argv[2]),true);for(auto t:p.tasks)std::cout<<t.queryBegin<<","<<t.queryCount<<","<<t.begin<<","<<t.end<<","<<t.owner<<"\\n";}'
+            (d/'plan.cpp').write_text(code)
+            subprocess.run(['c++','-std=c++17','-I'+str(HERE),str(d/'plan.cpp'),'-o',str(d/'plan')],check=True,capture_output=True)
+            for h,grain in points:
+                p=controls.geometry(2,1,h,30,60,16,'balanced',grain,True)
+                cover=np.zeros((16,h),np.uint8)
+                for t in p['task_map']:cover[t['owner'],t['begin']:t['end']]+=1
+                self.assertTrue(np.all(cover==1))
+                self.assertLessEqual(max(p['core_blocks'])-min(p['core_blocks']),1)
+                actual=[list(map(int,x.split(','))) for x in subprocess.check_output([str(d/'plan'),str(h),str(grain)],text=True).splitlines()]
+                self.assertEqual(actual,[list(t.values()) for t in p['task_map']])
+        with self.assertRaises(ValueError):controls.geometry(2,1,256,30,60,16,'balanced',128)
+        with self.assertRaises(ValueError):controls.geometry(2,1,8192,30,60,16,'balanced',192,True)
+        with self.assertRaises(ValueError):controls.geometry(1,1,8192,30,60,16,'waves',128)
+
 
 if __name__=='__main__':unittest.main(verbosity=2)

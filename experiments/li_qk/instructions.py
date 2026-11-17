@@ -29,7 +29,7 @@ def analyze(folder,pc_map=None):
     if not files:raise ValueError('no dynamic instruction issue logs')
     rows=[];ops=[];coverage=[]
     for path in files:
-        counters=Counter();opcount=Counter();pc=Counter();kernel_totals=Counter();first=None;last=None;unparsed=0;total=0;resets=0;previous=None;active_kernel=None
+        counters=Counter();opcount=Counter();pc=Counter();kernel_totals=Counter();kernel_bounds={};first=None;last=None;unparsed=0;total=0;resets=0;previous=None;active_kernel=None
         open_file=gzip.open if path.suffix=='.gz' else open
         with open_file(path,'rt',errors='replace') as f:
             for line in f:
@@ -46,9 +46,11 @@ def analyze(folder,pc_map=None):
                 if previous is not None and i<previous:resets+=1
                 previous=i;total+=1;first=tick if first is None else min(first,tick);last=tick if last is None else max(last,tick)
                 kernel_totals[kernel]+=1;counters[(kernel,pipe,classify(pipe,op))]+=1;opcount[(kernel,pipe,op)]+=1;pc[addr]+=1
+                bounds=kernel_bounds.setdefault(kernel,[tick,tick]);bounds[0]=min(bounds[0],tick);bounds[1]=max(bounds[1],tick)
         core=path.name.split('.instr_log')[0]
         coverage.append(dict(file=path.name,core=core,instructions=total,unparsed_lines=unparsed,id_order_decreases=resets,
-                             first_issue_tick=first,last_issue_tick=last,pc_count=len(pc),kernel_counts=dict(kernel_totals)))
+                             first_issue_tick=first,last_issue_tick=last,pc_count=len(pc),kernel_counts=dict(kernel_totals),
+                             kernel_issue_windows={k:dict(first=b[0],last=b[1],span=b[1]-b[0]) for k,b in kernel_bounds.items()}))
         for (kernel,pipe,category),count in counters.items():rows.append(dict(core=core,kernel=kernel,pipeline=pipe,category=category,count=count,share_of_kernel_core_instructions=count/kernel_totals[kernel],share_of_core_instructions=count/total))
         for (kernel,pipe,op),count in opcount.items():ops.append(dict(core=core,kernel=kernel,pipeline=pipe,opcode=op,count=count,share_of_kernel_core_instructions=count/kernel_totals[kernel],share_of_core_instructions=count/total))
     if not sum(x['instructions'] for x in coverage):raise ValueError('empty/unrecognized instruction logs')
