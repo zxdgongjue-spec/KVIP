@@ -500,3 +500,9 @@ python tests/operators/lifetch/test_lifetch.py diagnose \
 Level 3 的 `Per-Q prefetch rank / progress` 展示各请求、Q、窗口的 Score 完成比例、
 TopK 覆盖比例和排名。仅诊断回放采集，bench 不启用这些打点。
 上述合成负载命令没有 ABC bounds；包含 ABC 的服务负载通过原有 replay 输入传入。
+
+URMA 合成负载的 bench 与 diagnose 共用 DDR/session 资源池、输入生成器及 LRU 快照恢复。
+两者均先完成串行、融合的无打点图性能采样，再执行 diagnose 的校准、profiler 和独立 Get 测试。
+每轮检查完成状态，采样前和末次采样后做完整正确性校验；check 保留逐轮完整校验。
+`sampling_protocol.json` 记录输入参数、预热/采样次数和计时边界，`report.json` 保存每次性能采样的
+`fused_read_counts`。Profiler 阶段数据仍来自独立回放，不替代完整图性能样本。
