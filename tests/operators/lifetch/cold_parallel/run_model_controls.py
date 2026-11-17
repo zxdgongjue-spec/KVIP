@@ -30,6 +30,7 @@ def configs(matrix):
             ('direct','direct','wave','separate',0,0),
             ('direct_phase','direct','phase','separate',0,0),
             ('inline_auto','direct','phase','inline',0,0),
+            ('scatter_inline_auto','scatter','phase','inline',0,0),
             ('inline_Ph4_Pc4' if matrix=='smoke' else 'inline_Ph4_Pc8','direct','phase','inline',4,4 if matrix=='smoke' else 8),
             ('inline_Ph4_Pc4' if matrix=='smoke' else 'inline_Ph8_Pc16','direct','phase','inline',4 if matrix=='smoke' else 8,4 if matrix=='smoke' else 16),
             ('inline_Ph2_Pc4' if matrix=='smoke' else ('inline_Ph26_Pc28' if windows==2 else 'inline_Ph26_Pc26'),

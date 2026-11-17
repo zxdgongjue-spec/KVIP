@@ -148,3 +148,21 @@ python3 tests/operators/lifetch/cold_parallel/plot_exploration.py \
 ```
 
 绘图需要matplotlib；源码调度需要NumPy、C++17。详细结论和实际Model边界见[探索报告](../../../../docs/research/split_core/optimization_exploration_20261117.md)。Model的生产score完整driver说明见[experiment README](../../../../experiments/split_core/README.md)。源码计数/条件分析/Model周期/A5微秒数分别记录，不能互相替代。
+
+## 补测 scatter 与 direct 的打包粒度
+
+默认短名单仍是 direct。补测可加 `--candidate-posts direct,scatter`，同时保留P2、原staged及逐项控制；`run_a5_budget.py`也接受该选项。默认32/64完整计划仍为160case，加两种post后为256case。低分片大task下，scatter的4096-key pack调用较少，但保留更多GM中转，不能仅按字节大小选direct。先用两个分片点补测：
+
+```bash
+python3 tests/operators/lifetch/cold_parallel/run_controls.py \
+  --matrix tuning --repo "$PWD" --kvaf-root /path/to/KVAF --device 5 \
+  --windows 2 --prefetch 0,512 --partition-pairs 4:8,8:16 \
+  --candidate-posts direct,scatter --prepares phase --fetch-workers 2 \
+  --aic-budget 32 --aiv-budget 64 \
+  --output /home/w00568585/mr14_pack_grain_W2 --execute
+
+python3 tests/operators/lifetch/cold_parallel/summarize_controls.py \
+  /home/w00568585/mr14_pack_grain_W2
+```
+
+该补测为80case，计数含一轮丢弃＋三轮测量。预算不足时降低分片及预算；与主实验使用不同output，保持串行。然后固定较优组合独立复跑，必要时补W8。Model入口新增`scatter_inline_auto_W2/W8`，按同fixture、同budget与direct/phase/inline比较；没有设备测量前不宣布哪一条更快。

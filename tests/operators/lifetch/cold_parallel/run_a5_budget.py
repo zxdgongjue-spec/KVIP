@@ -24,6 +24,7 @@ def main():
     parser.add_argument('--windows', choices=('2', '8', '2,8'), default='2,8')
     parser.add_argument('--prefetch', default='0,512')
     parser.add_argument('--fetch-workers', default='2')
+    parser.add_argument('--candidate-posts', default='direct', help='direct,scatter for the secondary pack-grain comparison')
     parser.add_argument('--rounds', type=int, default=3)
     parser.add_argument('--warmup', type=int, default=4)
     parser.add_argument('--iterations', type=int, default=20)
@@ -48,6 +49,7 @@ def main():
                 '--aic-budget', str(args.aic_budget), '--aiv-budget', str(args.aiv_budget),
                 '--windows', str(windows), '--prefetch', args.prefetch,
                 '--fetch-workers', args.fetch_workers, '--prepares', 'phase',
+                '--candidate-posts', args.candidate_posts,
                 '--partition-pairs', ','.join(f'{ph}:{pc}' for ph, pc in pairs),
                 '--rounds', str(args.rounds), '--warmup', str(args.warmup),
                 '--iterations', str(args.iterations), '--timeout', str(args.timeout)]

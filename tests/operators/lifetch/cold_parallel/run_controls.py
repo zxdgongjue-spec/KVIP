@@ -22,8 +22,10 @@ def commands(a):
                             ('legacy','separate','wave','separate'),('history','separate','wave','separate'),
                             ('history','direct','wave','separate'),('history','direct','phase','separate'),
                             ('history','direct','phase','inline')))
-                        modes.extend(('history','direct',prepare,'inline',hot,cold,workers)
-                                     for hot,cold in pairs for prepare in a.prepares)
+                        posts=getattr(a,'candidate_posts',['direct'])
+                        if 'scatter' in posts:modes.append(('history','scatter','phase','inline',0,0,workers))
+                        modes.extend(('history',post,prepare,'inline',hot,cold,workers)
+                                     for post in posts for hot,cold in pairs for prepare in a.prepares)
                 modes=list(dict.fromkeys(modes));rng.shuffle(modes)
                 for route,post,prepare,service,hot,cold,workers in modes:
                     name=f'r{round_no}_W{windows}_pf{pf}_{route}_{post}_{prepare}'
@@ -58,10 +60,12 @@ def main(argv=None):
     p.add_argument('--partition-pairs',type=lambda s:[tuple(int(v) for v in x.split(':')) for x in s.split(',')],
                    help='explicit P_hot:P_cold shortlist; overrides the partition Cartesian grid')
     p.add_argument('--prepares',type=lambda s:s.split(','),default=['phase','invocation'])
+    p.add_argument('--candidate-posts',type=lambda s:s.split(','),default=['direct'],
+                   help='tuning candidates: direct,scatter; retains matched P2/staged controls')
     p.add_argument('--fetch-workers',type=lambda s:[int(v) for v in s.split(',')],default=[2])
     p.add_argument('--execute',action='store_true');a=p.parse_args(argv)
     a.repo=a.repo.resolve();a.kvaf_root=a.kvaf_root.resolve();a.output=a.output.resolve()
-    lists=(a.windows,a.prefetch,a.hot_partitions,a.cold_partitions,a.prepares,a.fetch_workers)
+    lists=(a.windows,a.prefetch,a.hot_partitions,a.cold_partitions,a.prepares,a.fetch_workers,a.candidate_posts)
     if any(not values or len(set(values))!=len(values) for values in lists):p.error('experiment lists must be nonempty and unique')
     if a.device<0 or a.timeout<=0 or not 0<=a.aic_budget<=32 or (a.aiv_budget is not None and not 2<=a.aiv_budget<=64):
         p.error('invalid device, timeout or hardware budget')
@@ -70,7 +74,8 @@ def main(argv=None):
         p.error('partition pairs must be unique P_hot:P_cold values')
     partitions=[x for pair in a.partition_pairs for x in pair] if a.partition_pairs else a.hot_partitions+a.cold_partitions
     if (any(not 1<=x<=32 for x in partitions) or
-        any(x not in (1,2,4) for x in a.fetch_workers) or any(x not in ('phase','invocation','wave') for x in a.prepares)):
+        any(x not in (1,2,4) for x in a.fetch_workers) or any(x not in ('phase','invocation','wave') for x in a.prepares)
+        or any(x not in ('direct','scatter') for x in a.candidate_posts)):
         p.error('valid partition, prepare and Fetch lists required')
     if a.matrix=='tuning' and a.aic_budget and max(partitions)>a.aic_budget:
         p.error('requested partition exceeds AIC budget')

@@ -439,6 +439,11 @@ class Checks(unittest.TestCase):
         for _,_,cmd in commands:
             c=configuration(cmd[2:])
             if c.score_hot_partitions:self.assertIn((c.score_hot_partitions,c.score_cold_partitions),args.partition_pairs)
+        args.candidate_posts=['direct','scatter']
+        extended=list(run_controls.commands(args));self.assertEqual(len(extended),20)
+        self.assertEqual({configuration(cmd[2:]).score_post for _,_,cmd in extended
+                          if configuration(cmd[2:]).score_hot_partitions},{'direct','scatter'})
+        for _,_,cmd in extended:configuration(cmd[2:])
 
     def test_11_model_plan_matches_actual_dispatch(self):
         sys.path.insert(0,str(TASK))
