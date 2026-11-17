@@ -2,6 +2,7 @@
 """Read one G2 level-3 run; print aggregate counters and three critical cores."""
 import argparse
 from collections import Counter, defaultdict
+from decimal import Decimal
 import json
 from pathlib import Path
 import statistics
@@ -15,6 +16,45 @@ def stats(values):
     values = [v for v in values if isinstance(v, (int, float))]
     return [statistics.mean(values), statistics.median(values), min(values), max(values), len(values)] if values else [None]*5
 
+
+
+def li_kernel_breakdown(capture):
+    """Read the same measured graph trace, preserving individual LI launches."""
+    source = Path(capture['source'])
+    trace_path = source.with_name('trace.json')
+    if not trace_path.is_file():
+        return {}, f'missing trace: {trace_path}'
+    document = json.loads(trace_path.read_text())
+    events = document.get('traceEvents', []) if isinstance(document, dict) else document
+    scopes = [e for e in events if e.get('ph') == 'X' and e.get('name') == 'lifetch_measured_graph']
+    if len(scopes) != 1:
+        return {}, f'expected one measured graph scope, found {len(scopes)}'
+    scope = scopes[0]
+    origin = Decimal(str(scope['ts']))
+    duration = float(scope['dur'])
+    phases = {'v9_li_kernel': 'kernel 0: hot/ABC',
+              'v9_li_kernel_1': 'kernel 1: resident TopK',
+              'v9_li_kernel_2': 'kernel 2: cold/prefetch',
+              'v9_li_kernel_3': 'kernel 3: final TopK'}
+    data = defaultdict(list)
+    for event in events:
+        name = str(event.get('name', '')).lower()
+        category = str(event.get('cat') or '').lower()
+        if event.get('ph') != 'X' or (category and 'kernel' not in category):
+            continue
+        # Only accept the four concrete names; unknown numeric suffixes can
+        # be dispatch identifiers, so never guess which kernel they denote.
+        phase = phases.get(name)
+        if phase is None:
+            continue
+        start = float(Decimal(str(event['ts'])) - origin)
+        end = start + float(event.get('dur', 0))
+        if 0 <= start <= end <= duration:
+            data[phase].append(end-start)
+    calls = capture.get('graph_calls')
+    errors = [f'{name}: {len(data.get(name, []))}/{calls} launches'
+              for name in phases.values() if calls and len(data.get(name, [])) != calls]
+    return {phase: data[phase] for phase in phases.values() if phase in data}, '; '.join(errors)
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -42,8 +82,14 @@ def main():
             data = json.loads(p.read_text())
             if data.get('path') == name:
                 t = data.get('all_rounds', {})
-                table('UNPROFILED full graph', ['Path','Check','Mean','p50','p99','N'],
-                      [[name,data.get('correctness'),*[t.get(k) for k in ('mean_us','p50_us','p99_us','samples')]]])
+                if t.get('timing_protocol') == 'one_profiled_graph':
+                    table('Full graph: event and profiler from same execution (us)',
+                          ['Path','Check','Event mean','Profiler mean','Profiler p50','Profiler p99','N'],
+                          [[name,data.get('correctness'),*[t.get(k) for k in
+                            ('event_mean_us','profiler_mean_us','p50_us','p99_us','samples')]]])
+                else:
+                    table('Full graph: legacy timing (us)', ['Path','Check','Mean','p50','p99','N'],
+                          [[name,data.get('correctness'),*[t.get(k) for k in ('mean_us','p50_us','p99_us','samples')]]])
                 if data.get('failures'):
                     lines.append('FAILURES '+json.dumps(data['failures'][:3]))
     for capture in result.get('captures', []):
@@ -61,6 +107,14 @@ def main():
                     values[k].append(v)
         table(f'{label}: PROFILER stages/accounting (us; same-pass, not detailed stamps)',
               ['Metric','Mean','p50','Min','Max','N'], [[k,*stats(v)] for k,v in values.items()])
+        if label == 'fused' and capture.get('graph_accounting') and config.get('transport') == 'urma':
+            li_phases, issue = li_kernel_breakdown(capture)
+            if li_phases:
+                table('LI kernel durations: same profiled graph (us)',
+                      ['Kernel','Mean','p50','Min','Max','N'],
+                      [[k,*stats(v)] for k,v in li_phases.items()])
+            if issue:
+                lines.append('LI KERNEL TRACE: '+issue+'; check raw event names and source trace.')
         totals = defaultdict(list)
         for s in samples:
             for k,v in s.get('algorithm', {}).get('totals', {}).items():
