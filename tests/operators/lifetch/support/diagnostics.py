@@ -140,11 +140,13 @@ def summarize(directory, config):
                         decode_timeline(raw)  # Validate core bounds and cross-core publication ordering before global spans.
                         item['final_get_bandwidth'] = final_transfer_scope(raw, details, config.transport)
                     except (KeyError, TypeError, ValueError) as error:
-                        item.pop('prefetch_bandwidth', None)
                         result['missing'].append(f'{path} repeat={sample["round"]}: final Get scope: {error}')
                     else:
                         final = item['final_get_bandwidth']
-                        if sample.get('final') is not None and final['entries'] != sample['final']:
+                        expected_final = (sum(row['total'] for request in details
+                                              for row in (request.get('final_counts') or []))
+                                          if detail_sample else sample.get('final'))
+                        if expected_final is not None and final['entries'] != expected_final:
                             result['missing'].append(f'{path}: final scope entries differ from device total')
                         if scope and mhz and final['entries'] and final['span_us']:
                             begin = min(scope['first_doorbell'], final['first_cycles'])
@@ -584,7 +586,15 @@ def level_two_tables(result):
             if result.get('level', 2) >= 3 and sample.get('rank_progress'):
                 emit(algorithm_lines, 'Per-Q prefetch rank / progress',
                      ['Request', 'Q', 'Window', 'Score ready %', 'TopK covered %', 'Rank'],
-                     sample['rank_progress'])
+                     sample['rank_progress'], 3)
+            bandwidth_rows = []
+            for key, label in (('prefetch_bandwidth', 'prefetch'),
+                               ('final_get_bandwidth', 'final Get'),
+                               ('combined_observed_bandwidth', 'combined')):
+                metric = sample.get(key, {})
+                bandwidth_rows.append([label, metric.get('bytes'), metric.get('span_us'), metric.get('GBps')])
+            emit(lines, 'Effective bandwidth (decimal GB/s; separate instrumented replays)',
+                 ['Scope', 'Bytes', 'Span us', 'GB/s'], bandwidth_rows, 1)
             timeline = sample.get('timeline')
             if timeline:
                 if result.get('level', 2) >= 3:
