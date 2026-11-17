@@ -306,12 +306,17 @@ def test_exact_tie_replacement_preserves_dense_selection_order(count):
     assert tie.fast_ties == fast
 
 
-def test_state_report_checks_both_new_variants(tmp_path,capsys):
+@pytest.mark.parametrize("light", [False, True])
+def test_state_report_checks_both_new_variants(tmp_path,capsys,light):
     import json
     from kvip.diagnostics import scan_report
-    from kvip.diagnostics.scan_options import INCREMENTAL_STATE_VARIANTS,options_for
+    from kvip.diagnostics.scan_options import INCREMENTAL_STATE_VARIANTS,INCREMENTAL_LIGHT_VARIANTS,options_for
+    variants = INCREMENTAL_LIGHT_VARIANTS if light else INCREMENTAL_STATE_VARIANTS
+    required = {"require_incremental_light" if light else "require_incremental_state": True}
+    candidate = "reverse-inc-light-ties" if light else "reverse-inc-ties"
+    pair = "reverse-inc-light->reverse-inc-light-ties" if light else "reverse-inc-direct->reverse-inc-ties"
     cases = {}
-    for name in INCREMENTAL_STATE_VARIANTS:
+    for name in variants:
         cases[name] = dict(
             geometry=dict(rounds=9,token_bytes=656),timing=dict(mean_us=100,p50_us=99),
             reads_samples=[dict(prefetch=5,unused_prefetch=1,unused_prefetch_bytes=656,
@@ -320,12 +325,25 @@ def test_state_report_checks_both_new_variants(tmp_path,capsys):
         if options_for(name)["incremental_topk"]:
             cases[name]["incremental_check"]=dict(status="exact_prefix_ranks_and_pending",prefix_lists_sha256="same-prefix")
     path=tmp_path/"result.json"
-    path.write_text(json.dumps(dict(status="pass",execution_order=list(INCREMENTAL_STATE_VARIANTS),cases=cases)))
-    scan_report.report(path,require_incremental_state=True)
+    path.write_text(json.dumps(dict(status="pass",execution_order=list(variants),cases=cases)))
+    scan_report.report(path,**required)
     output=capsys.readouterr().out
-    assert "INCREMENT reverse-inc-direct->reverse-inc-ties" in output
+    assert "INCREMENT " + pair in output
     assert "window_lists_and_final_order=IDENTICAL" in output
-    cases["reverse-inc-ties"]["incremental_check"]["prefix_lists_sha256"]="different"
-    path.write_text(json.dumps(dict(status="pass",execution_order=list(INCREMENTAL_STATE_VARIANTS),cases=cases)))
+    cases[candidate]["incremental_check"]["prefix_lists_sha256"]="different"
+    path.write_text(json.dumps(dict(status="pass",execution_order=list(variants),cases=cases)))
     with pytest.raises(AssertionError,match="prefix_lists_sha256"):
-        scan_report.report(path,require_incremental_state=True)
+        scan_report.report(path,**required)
+
+
+def test_light_variants_require_direct_and_preserve_controls():
+    from kvip.diagnostics.scan_options import INCREMENTAL_LIGHT_VARIANTS, options_for, validate_options
+    assert INCREMENTAL_LIGHT_VARIANTS[:3] == ("forward", "reverse", "reverse-inc-register")
+    for name in INCREMENTAL_LIGHT_VARIANTS:
+        options = options_for(name)
+        validate_options(options)
+        assert options["incremental_light"] == name.startswith("reverse-inc-light")
+    options = options_for("reverse-inc-light")
+    options["incremental_direct"] = False
+    with pytest.raises(ValueError, match="Light"):
+        validate_options(options)

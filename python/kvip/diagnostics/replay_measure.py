@@ -804,7 +804,7 @@ def verify_prefilter_equivalence(cases):
     reference = cases.get("reverse-inc-register")
     if reference is None:
         return
-    for name in ("reverse-inc-prefilter", "reverse-inc-direct", "reverse-inc-ties"):
+    for name in ("reverse-inc-prefilter", "reverse-inc-direct", "reverse-inc-ties", "reverse-inc-light", "reverse-inc-light-ties"):
         if name in cases:
             verify_incremental_state_pair(reference, cases[name])
 

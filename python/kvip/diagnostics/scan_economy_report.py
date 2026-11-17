@@ -42,7 +42,11 @@ def report(cases, order):
         g = gain(t, original)
         print(f"{name:23} {t['mean_us']:8.3f} {t['p50_us']:8.3f} {g['mean_us']:10.2f} {g['p50_us']:9.2f} "
               f"{useful_prefetch(case):10.1f} {b['repair']/2**20:10.4f} {b['waste']/2**20:9.4f} {b['total']/2**20:9.4f}")
-    if "reverse-inc-ties" in cases:
+    if "reverse-inc-light" in cases:
+        pairs = (("reverse-inc-register", "reverse-inc-light"),
+                 ("reverse-inc-light", "reverse-inc-light-ties"),
+                 ("forward", "reverse-inc-light-ties"), ("reverse", "reverse-inc-light-ties"))
+    elif "reverse-inc-ties" in cases:
         pairs = (("reverse-inc-register", "reverse-inc-direct"),
                  ("reverse-inc-direct", "reverse-inc-ties"),
                  ("forward", "reverse-inc-ties"), ("reverse", "reverse-inc-ties"))
@@ -136,7 +140,7 @@ def report(cases, order):
                 print(f"PROFILE {name} cycles_p50/max " + " ".join(fields))
         if profiled:
             print("PROFILE_SCOPE separate instrumented replay; producer=index producer (not full LI); overlapping cycles, not additive graph time")
-    if "reverse-inc-prefilter" in cases or "reverse-inc-ties" in cases:
+    if "reverse-inc-prefilter" in cases or "reverse-inc-ties" in cases or "reverse-inc-light" in cases:
         print("CHECK incremental_variants_vs_dense window_lists_and_final_order=IDENTICAL; actual transfer timing/counters may vary")
     print("DECISION " + ("retest_candidates="+",".join(candidates) if candidates else "keep_original_fused"))
     print("NOTE positive delta=more work/bytes; useful_pre includes all prefetch windows; no completion-overlap claim")
