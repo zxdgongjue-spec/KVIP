@@ -15,6 +15,9 @@ LI_AICS=32
 LI_AIVS=64
 LI_PYTHON=python3
 LI_SDK=0
+LI_NO_PROXY=0
+LI_SKIP_FETCH=0
+LI_BUNDLE=
 LI_OUT=
 
 usage() {
@@ -32,6 +35,9 @@ Run in the existing A5 container; fixed B1/Q4/H131072, seven orthogonal points.
   --work-root PATH     Parent of new detached worktree (default /home/w00568585)
   --output-root PATH   Parent of new results directory (default /home/w00568585)
   --sdk-reference      Also measure SDK standalone LI; requires torch_npu
+  --no-proxy           Bypass proxy only for this Git fetch; leaves Git config unchanged
+  --skip-fetch         Use the selected local commit without any network fetch
+  --git-bundle PATH    Import the supplied MR14 offline bundle instead of using HTTPS
   -h, --help           Show usage without fetching or running anything
 
 Always creates new worktree/build/results directories. Does not reset the source checkout.
@@ -43,7 +49,9 @@ while (($#)); do
     case "$1" in
         -h|--help) usage; exit 0 ;;
         --sdk-reference) LI_SDK=1; shift ;;
-        --repo|--ref|--cann-root|--kvaf-include|--soc|--device|--aics|--aivs|--python|--work-root|--output-root)
+        --no-proxy) LI_NO_PROXY=1; shift ;;
+        --skip-fetch) LI_SKIP_FETCH=1; shift ;;
+        --repo|--ref|--cann-root|--kvaf-include|--soc|--device|--aics|--aivs|--python|--work-root|--output-root|--git-bundle)
             (($# >= 2)) && [[ -n $2 ]] || die "Missing value for $1"
             case "$1" in
                 --repo) LI_REPO=$2 ;; --ref) LI_REF=$2 ;;
@@ -52,6 +60,7 @@ while (($#)); do
                 --aics) LI_AICS=$2 ;; --aivs) LI_AIVS=$2 ;;
                 --python) LI_PYTHON=$2 ;; --work-root) LI_WORK_ROOT=$2 ;;
                 --output-root) LI_OUTPUT_ROOT=$2 ;;
+                --git-bundle) LI_BUNDLE=$2 ;;
             esac
             shift 2 ;;
         *) die "Unknown option: $1 (see --help)" ;;
@@ -68,6 +77,10 @@ done
 LI_PYTHON=$(command -v "$LI_PYTHON")
 LI_REPO=$(cd "$LI_REPO" && pwd -P) || die 'Existing checkout directory unavailable'
 git -C "$LI_REPO" rev-parse --git-dir >/dev/null || die 'Existing KVIP Git checkout required'
+if [[ -n $LI_BUNDLE ]]; then
+    [[ -f $LI_BUNDLE ]] || die 'Offline Git bundle file unavailable'
+    LI_BUNDLE=$(cd "$(dirname "$LI_BUNDLE")" && pwd -P)/$(basename "$LI_BUNDLE")
+fi
 
 LI_CMAKE_REL=compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake
 if [[ -z $LI_CANN ]]; then
@@ -127,9 +140,39 @@ run_logged() { local LI_LOG=$1; shift; "$@" 2>&1 | tee "$LI_OUT/$LI_LOG"; }
 printf 'repo=%s\nrequested_ref=%s\ncann=%s\nkvaf_include=%s\nsoc=%s\ndevice=%s\naics=%s\naivs=%s\npython=%s\nsdk_reference=%s\nworktree=%s\n' \
     "$LI_REPO" "$LI_REF" "$LI_CANN" "$LI_KVAF" "$LI_SOC" "$LI_DEVICE" "$LI_AICS" "$LI_AIVS" "$LI_PYTHON" "$LI_SDK" "$LI_WT" > "$LI_OUT/launcher-config.txt"
 printf 'Results directory: %s\n' "$LI_OUT"
-run_logged fetch.log git -C "$LI_REPO" fetch origin "$LI_BRANCH"
-LI_COMMIT=$(git -C "$LI_REPO" rev-parse --verify --end-of-options "$LI_REF^{commit}")
-git -C "$LI_REPO" merge-base --is-ancestor "$LI_COMMIT" FETCH_HEAD || die 'Selected revision is not on the fetched MR14 branch'
+if [[ -n $LI_BUNDLE ]]; then
+    printf 'fetch_mode=offline_bundle\n' >> "$LI_OUT/launcher-config.txt"
+    run_logged bundle-verify.log git -C "$LI_REPO" bundle verify "$LI_BUNDLE"
+    run_logged fetch.log git -C "$LI_REPO" fetch "$LI_BUNDLE" "refs/remotes/origin/$LI_BRANCH"
+elif ((LI_SKIP_FETCH)); then
+    printf 'fetch_mode=local_commit\n' >> "$LI_OUT/launcher-config.txt"
+    printf 'Skipped network fetch; using selected local commit %s\n' "$LI_REF" | tee "$LI_OUT/fetch.log"
+elif ((LI_NO_PROXY)); then
+    printf 'fetch_mode=direct_https\n' >> "$LI_OUT/launcher-config.txt"
+    if run_logged fetch.log env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+        -u http_proxy -u https_proxy -u all_proxy \
+        git -c http.proxy= -c remote.origin.proxy= -C "$LI_REPO" fetch origin "$LI_BRANCH"; then
+        :
+    else
+        LI_FETCH_RC=$?
+        printf 'ERROR: Direct Git fetch failed. Use --git-bundle PATH if the container cannot reach GitCode, or --skip-fetch if the selected commit exists locally\n' >&2
+        exit "$LI_FETCH_RC"
+    fi
+else
+    printf 'fetch_mode=configured_https\n' >> "$LI_OUT/launcher-config.txt"
+    if run_logged fetch.log git -C "$LI_REPO" fetch origin "$LI_BRANCH"; then
+        :
+    else
+        LI_FETCH_RC=$?
+        printf 'ERROR: Git fetch failed before LI build/run. For CONNECT tunnel errors, retry with --no-proxy; --git-bundle PATH is also supported\n' >&2
+        exit "$LI_FETCH_RC"
+    fi
+fi
+LI_COMMIT=$(git -C "$LI_REPO" rev-parse --verify --end-of-options "$LI_REF^{commit}") || \
+    die 'Selected experiment commit is absent locally; import the supplied bundle or fetch MR14 first'
+if [[ -n $LI_BUNDLE ]] || ((LI_SKIP_FETCH == 0)); then
+    git -C "$LI_REPO" merge-base --is-ancestor "$LI_COMMIT" FETCH_HEAD || die 'Selected revision is not on the fetched MR14 branch'
+fi
 printf 'resolved_commit=%s\n' "$LI_COMMIT" >> "$LI_OUT/launcher-config.txt"
 run_logged worktree.log git -C "$LI_REPO" worktree add --detach "$LI_WT" "$LI_COMMIT"
 cd "$LI_WT"

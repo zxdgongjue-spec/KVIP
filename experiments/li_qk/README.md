@@ -59,6 +59,14 @@ bash experiments/li_qk/run_a5.sh \
 
 脚本可单独下载后用`bash run_a5.sh`执行。依赖在默认位置时无需参数；路径不同时传`--cann-root`/`--kvaf-include`。实际可用预算不同时传`--aics 28 --aivs 56`，SDK对照加`--sdk-reference`。使用`--help`查看参数。它记录npu-smi，但不自动推断资源预算或排除其它工具的设备占用；在device 5空闲时执行。
 
+若`fetch.log`报`CONNECT tunnel failed, response 400`，错误发生在Git拉取阶段，尚未构建/运行LI。可给更新后的脚本加`--no-proxy`，仅此次fetch清除代理环境及Git代理配置覆盖；不修改持久配置，也不关闭TLS校验。容器无法直连GitCode时，将提供的`li_qk_mr14_offline.bundle`放入容器并执行：
+
+```bash
+bash run_a5.sh --git-bundle /path/to/li_qk_mr14_offline.bundle
+```
+
+离线包需要包含`refs/remotes/origin/codex/split-core-unified-comparison`，脚本验证后从本地文件导入。已经具有`0c1d483`时也可用`--skip-fetch`完全跳过联网；缺少该提交则明确失败，不改用旧版代码。下载文件中的`--git-bundle`路径与依赖路径均可自定义。
+
 在包含此目录及 MR14 `20adb7e` LI 源码的 checkout 中，启用原 CANN/TorchNPU 环境。替换 CANN、SoC 与 KVAF include 路径为实际值；使用新构建目录，避免 CANN 增量对象二次转换的问题。
 
 ```bash

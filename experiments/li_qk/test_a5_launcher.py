@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -112,6 +113,61 @@ class Launcher(unittest.TestCase):
         self.assertEqual(r.returncode,0); self.assertIn('seven orthogonal',r.stdout)
         r = subprocess.run(['bash',str(SCRIPT),'--aics','0'],text=True,capture_output=True)
         self.assertNotEqual(r.returncode,0); self.assertIn('Supported budget',r.stderr)
+
+    def test_offline_commit_and_bundle_with_unreachable_origin(self):
+        for mode in ('local', 'bundle'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as folder:
+                base=Path(folder); cmd,env,repo,calls=self.setup_fixture(base)
+                def git(*args):
+                    return subprocess.check_output(['git','-C',str(repo),*args],text=True,stderr=subprocess.STDOUT).strip()
+                if mode=='bundle':
+                    bundle=base/'offline code.bundle'
+                    ref='refs/remotes/origin/codex/split-core-unified-comparison'
+                    git('update-ref',ref,git('rev-parse','HEAD'))
+                    git('bundle','create',str(bundle),ref)
+                    cmd+=['--git-bundle',str(bundle)]
+                else: cmd.append('--skip-fetch')
+                git('remote','set-url','origin','https://offline.invalid/KVIP.git')
+                r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=30)
+                self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+                self.assertEqual([json.loads(s)[0] for s in calls.read_text().splitlines()],['plan','build','run','summarize'])
+                out=next(p for p in (base/'outputs').iterdir() if p.is_dir())
+                self.assertIn('fetch_mode='+('offline_bundle' if mode=='bundle' else 'local_commit'),(out/'launcher-config.txt').read_text())
+                self.assertTrue((out/'results/summary.csv').is_file())
+
+    def test_direct_fetch_clears_only_process_proxy_settings(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base=Path(folder); cmd,env,repo,calls=self.setup_fixture(base)
+            real_git=shutil.which('git'); proof=base/'proxy-proof.json'
+            wrapper=base/'bin/git'
+            wrapper.write_text('#!/usr/bin/env python3\n'+
+                'import json, os, sys\nfrom pathlib import Path\n'+
+                'if "fetch" in sys.argv and "origin" in sys.argv:\n'+
+                '    keys=("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy")\n'+
+                '    ok=not any(k in os.environ for k in keys) and "http.proxy=" in sys.argv and "remote.origin.proxy=" in sys.argv\n'+
+                '    Path('+repr(str(proof))+').write_text(json.dumps({"proxy_cleared":ok}))\n'+
+                '    if not ok: sys.exit(91)\n'+
+                'os.execv('+repr(real_git)+', ['+repr(real_git)+']+sys.argv[1:])\n')
+            wrapper.chmod(0o755)
+            for key in ('HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy'):
+                env[key]='http://test.invalid:1'
+            subprocess.run([real_git,'-C',str(repo),'config','remote.origin.proxy','http://test.invalid:1'],check=True)
+            cmd.append('--no-proxy')
+            r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=30)
+            self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+            self.assertTrue(json.loads(proof.read_text())['proxy_cleared'])
+            saved=subprocess.check_output([real_git,'-C',str(repo),'config','remote.origin.proxy'],text=True).strip()
+            self.assertEqual(saved,'http://test.invalid:1')
+
+    def test_skip_fetch_rejects_absent_commit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base=Path(folder); cmd,env,repo,calls=self.setup_fixture(base)
+            cmd[cmd.index('--ref')+1]='0000000000000000000000000000000000000001'
+            cmd.append('--skip-fetch')
+            r=subprocess.run(cmd,env=env,text=True,capture_output=True)
+            self.assertNotEqual(r.returncode,0)
+            self.assertIn('absent locally',r.stderr)
+            self.assertFalse(calls.exists())
 
 
 if __name__ == '__main__': unittest.main(verbosity=2)
