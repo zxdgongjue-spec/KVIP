@@ -392,6 +392,10 @@ python tests/experiments/incremental_lifetch/summarize.py \
   --experiment ranked-tagged --require-detailed
 ```
 
+可在上述 `compare_ranked.sh` 命令末尾加 `--prefetch-tokens 1024`，
+同时调整 A/B 的每请求总预取预算；省略时为512。4窗口下，1024对应每窗口256、
+每 Q 上限64、保底32；候选不足时取实际数量，跨 Q 去重后实际读取可能更少。
+
 A/B 的 miss 定义、窗口阈值、半配额保底、上限和跨 Q 去重相同。
 B 在首次 TopK 中标记有效且未预留的 hot 和 ABC 本地位置；标记随私有增量 ID
 传递，最终还原普通 ID。最终分类复用 hot 标记，保留映射解析、保护位图和错误检查。

@@ -34,7 +34,23 @@ elif [[ ${1:-} == --recent-index ]]; then
   mode=recent-index
   shift
 fi
-kvaf_root=${1:?Usage: compare.sh KVAF_ROOT DEVICE SERVER [BATCHES] [MISS] [WINDOWS]}
+prefetch_tokens=512
+positional=()
+while (($#)); do
+  case "$1" in
+    --prefetch-tokens)
+      if [[ ! ${2:-} =~ ^[0-9]+$ ]]; then
+        echo "--prefetch-tokens requires a nonnegative integer" >&2
+        exit 2
+      fi
+      prefetch_tokens=$2
+      shift 2
+      ;;
+    *) positional+=("$1"); shift ;;
+  esac
+done
+set -- "${positional[@]}"
+kvaf_root=${1:?Usage: compare.sh KVAF_ROOT DEVICE SERVER [BATCHES] [MISS] [WINDOWS] [ABC_TAIL_TOKENS] [--prefetch-tokens N]}
 device=${2:?Missing device}
 server=${3:?Missing server}
 batches=${4:-16}
@@ -50,7 +66,7 @@ fi
 run="$repo/tests/results/$mode/$(date +%Y%m%d_%H%M%S)_$$"
 mkdir -p "$run"
 printf '%s\n' "$mode" > "$run/experiment.txt"
-echo "Experiment: $mode; results=$run"
+echo "Experiment: $mode; prefetch_tokens=$prefetch_tokens; results=$run"
 if [[ "$mode" == ranked-tagged ]]; then
   python "$repo/tests/experiments/incremental_lifetch/prepare_ranked.py" "$run/baseline-source" --minimum-half --true-miss --abc-tail-tokens "$abc_tail_tokens"
   python "$repo/tests/experiments/incremental_lifetch/prepare_ranked.py" "$run/incremental-source" --minimum-half --tagged-miss --abc-tail-tokens "$abc_tail_tokens"
@@ -75,7 +91,7 @@ else
 fi
 common=(--transport urma --device "$device" --kvaf-root "$kvaf_root" --kvaf-server "$server"
   --batches "$batches" --miss-percent "$miss" --history 131072 --resident 16384 --index-heads 32
-  --prefetch-tokens 512 --intermediate-fetches "$windows" --warmup 4 --iterations 20 --timeout-seconds 600)
+  --prefetch-tokens "$prefetch_tokens" --intermediate-fetches "$windows" --warmup 4 --iterations 20 --timeout-seconds 600)
 for variant in baseline incremental; do
   source_root="$run/baseline-source"
   if [[ "$variant" == incremental ]]; then source_root="$run/incremental-source"; fi
