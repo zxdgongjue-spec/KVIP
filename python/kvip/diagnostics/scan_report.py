@@ -6,15 +6,15 @@ import json
 from pathlib import Path
 from statistics import mean
 
-from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS, INCREMENTAL_VARIANTS, INCREMENTAL_WINDOW_VARIANTS, INCREMENTAL_PREFILTER_VARIANTS, INCREMENTAL_STATE_VARIANTS, INCREMENTAL_LIGHT_VARIANTS, options_for
+from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS, INCREMENTAL_VARIANTS, INCREMENTAL_WINDOW_VARIANTS, INCREMENTAL_PREFILTER_VARIANTS, INCREMENTAL_STATE_VARIANTS, INCREMENTAL_LIGHT_VARIANTS, INCREMENTAL_INPLACE_VARIANTS, options_for
 
 
-def load_report(path, *, require_rolling=False, require_batched=False, require_windowed=False, require_lean=False, require_safe=False, require_economy=False, require_seed=False, require_fast=False, require_sparse=False, require_boundary=False, require_incremental=False, require_incremental_window=False, require_incremental_prefilter=False, require_incremental_state=False, require_incremental_light=False, expected_native=None, snapshot=None):
+def load_report(path, *, require_rolling=False, require_batched=False, require_windowed=False, require_lean=False, require_safe=False, require_economy=False, require_seed=False, require_fast=False, require_sparse=False, require_boundary=False, require_incremental=False, require_incremental_window=False, require_incremental_prefilter=False, require_incremental_state=False, require_incremental_light=False, require_incremental_inplace=False, expected_native=None, snapshot=None):
     data = json.loads(path.read_text())
     order = tuple(data.get("execution_order", ()))
-    if data.get("status") != "pass" or order not in (DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS, INCREMENTAL_VARIANTS, INCREMENTAL_WINDOW_VARIANTS, INCREMENTAL_PREFILTER_VARIANTS, INCREMENTAL_STATE_VARIANTS, INCREMENTAL_LIGHT_VARIANTS):
+    if data.get("status") != "pass" or order not in (DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS, INCREMENTAL_VARIANTS, INCREMENTAL_WINDOW_VARIANTS, INCREMENTAL_PREFILTER_VARIANTS, INCREMENTAL_STATE_VARIANTS, INCREMENTAL_LIGHT_VARIANTS, INCREMENTAL_INPLACE_VARIANTS):
         raise ValueError("Missing or incomplete controlled scan experiment")
-    if require_rolling and order not in (ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS, INCREMENTAL_VARIANTS, INCREMENTAL_WINDOW_VARIANTS, INCREMENTAL_PREFILTER_VARIANTS, INCREMENTAL_STATE_VARIANTS, INCREMENTAL_LIGHT_VARIANTS):
+    if require_rolling and order not in (ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS, INCREMENTAL_VARIANTS, INCREMENTAL_WINDOW_VARIANTS, INCREMENTAL_PREFILTER_VARIANTS, INCREMENTAL_STATE_VARIANTS, INCREMENTAL_LIGHT_VARIANTS, INCREMENTAL_INPLACE_VARIANTS):
         raise ValueError("Old scan/budget experiment: rolling/refilter cases were not measured")
     if require_batched and order != BATCHED_VARIANTS:
         raise ValueError("Batched histogram variants were not measured")
@@ -26,6 +26,8 @@ def load_report(path, *, require_rolling=False, require_batched=False, require_w
         raise ValueError("Safe/refill controls were not measured")
     if require_economy and order != ECONOMY_VARIANTS:
         raise ValueError("Economy controls were not measured")
+    if require_incremental_inplace and order != INCREMENTAL_INPLACE_VARIANTS:
+        raise ValueError("In-place report requires original, reverse, register and tie controls")
     if require_incremental_light and order != INCREMENTAL_LIGHT_VARIANTS:
         raise ValueError("Light state report requires dense and original controls")
     if require_incremental_state and order != INCREMENTAL_STATE_VARIANTS:
@@ -44,20 +46,20 @@ def load_report(path, *, require_rolling=False, require_batched=False, require_w
         raise ValueError("Packed histogram controls were not measured")
     if require_seed and order != SEED_VARIANTS:
         raise ValueError("Seed reuse controls were not measured")
-    if require_incremental or require_incremental_window or require_incremental_prefilter or require_incremental_state or require_incremental_light:
+    if require_incremental or require_incremental_window or require_incremental_prefilter or require_incremental_state or require_incremental_light or require_incremental_inplace:
         for name in order:
             if not options_for(name)["incremental_topk"]:
                 continue
             candidate = data["cases"][name]
             if candidate.get("incremental_check", {}).get("status") != "exact_prefix_ranks_and_pending":
                 raise ValueError(f"{name}: Incremental device prefix/pending oracle has not passed")
-    if require_incremental_prefilter or require_incremental_state or require_incremental_light:
+    if require_incremental_prefilter or require_incremental_state or require_incremental_light or require_incremental_inplace:
         from kvip.diagnostics.replay_measure import verify_prefilter_equivalence
         verify_prefilter_equivalence(data["cases"])
     digest = None if snapshot is None else hashlib.sha256((snapshot / "manifest.json").read_bytes()).hexdigest()
     for name in order:
         case = data["cases"][name]
-        if (require_fast or require_sparse or require_boundary or require_incremental or require_incremental_window or require_incremental_prefilter or require_incremental_state or require_incremental_light) and case.get("geometry", {}).get("rounds") != 9:
+        if (require_fast or require_sparse or require_boundary or require_incremental or require_incremental_window or require_incremental_prefilter or require_incremental_state or require_incremental_light or require_incremental_inplace) and case.get("geometry", {}).get("rounds") != 9:
             raise ValueError(f"{name}: expected resident plus eight cold windows")
         if expected_native and case.get("production_source", {}).get("commit") != expected_native:
             raise ValueError(f"{name}: native revision does not match {expected_native}")
@@ -85,8 +87,8 @@ def reduction(before, after):
     return f"{100 * (1 - after / before):+.2f}%" if before else "n/a"
 
 
-def report(path, *, require_rolling=False, require_batched=False, require_windowed=False, require_lean=False, require_safe=False, require_economy=False, require_seed=False, require_fast=False, require_sparse=False, require_boundary=False, require_incremental=False, require_incremental_window=False, require_incremental_prefilter=False, require_incremental_state=False, require_incremental_light=False, expected_native=None, snapshot=None, check_only=False):
-    data = load_report(path, require_rolling=require_rolling, require_batched=require_batched, require_windowed=require_windowed, require_lean=require_lean, require_safe=require_safe, require_economy=require_economy, require_seed=require_seed, require_fast=require_fast, require_sparse=require_sparse, require_boundary=require_boundary, require_incremental=require_incremental, require_incremental_window=require_incremental_window, require_incremental_prefilter=require_incremental_prefilter, require_incremental_state=require_incremental_state, require_incremental_light=require_incremental_light, expected_native=expected_native, snapshot=snapshot)
+def report(path, *, require_rolling=False, require_batched=False, require_windowed=False, require_lean=False, require_safe=False, require_economy=False, require_seed=False, require_fast=False, require_sparse=False, require_boundary=False, require_incremental=False, require_incremental_window=False, require_incremental_prefilter=False, require_incremental_state=False, require_incremental_light=False, require_incremental_inplace=False, expected_native=None, snapshot=None, check_only=False):
+    data = load_report(path, require_rolling=require_rolling, require_batched=require_batched, require_windowed=require_windowed, require_lean=require_lean, require_safe=require_safe, require_economy=require_economy, require_seed=require_seed, require_fast=require_fast, require_sparse=require_sparse, require_boundary=require_boundary, require_incremental=require_incremental, require_incremental_window=require_incremental_window, require_incremental_prefilter=require_incremental_prefilter, require_incremental_state=require_incremental_state, require_incremental_light=require_incremental_light, require_incremental_inplace=require_incremental_inplace, expected_native=expected_native, snapshot=snapshot)
     if check_only:
         return
     order = data["execution_order"]
@@ -95,7 +97,7 @@ def report(path, *, require_rolling=False, require_batched=False, require_window
     readers = sorted({case.get("diagnostics_commit", "unknown") for case in cases.values()})
     print(f"SOURCE native={','.join(natives)} reader={','.join(readers)}")
     print(f"RESULT_FILE={path}")
-    if tuple(order) in (ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS, INCREMENTAL_VARIANTS, INCREMENTAL_WINDOW_VARIANTS, INCREMENTAL_PREFILTER_VARIANTS, INCREMENTAL_STATE_VARIANTS, INCREMENTAL_LIGHT_VARIANTS):
+    if tuple(order) in (ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS, INCREMENTAL_VARIANTS, INCREMENTAL_WINDOW_VARIANTS, INCREMENTAL_PREFILTER_VARIANTS, INCREMENTAL_STATE_VARIANTS, INCREMENTAL_LIGHT_VARIANTS, INCREMENTAL_INPLACE_VARIANTS):
         from kvip.diagnostics.scan_economy_report import report as economy_report
         economy_report(cases, order)
         return
@@ -239,6 +241,7 @@ def main():
     parser.add_argument("--require-boundary", action="store_true")
     parser.add_argument("--require-incremental-window", action="store_true")
     parser.add_argument("--require-incremental-prefilter", action="store_true")
+    parser.add_argument("--require-incremental-inplace", action="store_true")
     parser.add_argument("--require-incremental-light", action="store_true")
     parser.add_argument("--require-incremental-state", action="store_true")
     parser.add_argument("--require-incremental", action="store_true")
@@ -247,7 +250,7 @@ def main():
     parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args()
     try:
-        report(args.result, require_rolling=args.require_rolling, require_batched=args.require_batched, require_windowed=args.require_windowed, require_lean=args.require_lean, require_safe=args.require_safe, require_economy=args.require_economy, require_seed=args.require_seed, require_fast=args.require_fast, require_sparse=args.require_sparse, require_boundary=args.require_boundary, require_incremental=args.require_incremental, require_incremental_window=args.require_incremental_window, require_incremental_prefilter=args.require_incremental_prefilter, require_incremental_state=args.require_incremental_state, require_incremental_light=args.require_incremental_light, expected_native=args.expected_native,
+        report(args.result, require_rolling=args.require_rolling, require_batched=args.require_batched, require_windowed=args.require_windowed, require_lean=args.require_lean, require_safe=args.require_safe, require_economy=args.require_economy, require_seed=args.require_seed, require_fast=args.require_fast, require_sparse=args.require_sparse, require_boundary=args.require_boundary, require_incremental=args.require_incremental, require_incremental_window=args.require_incremental_window, require_incremental_prefilter=args.require_incremental_prefilter, require_incremental_state=args.require_incremental_state, require_incremental_light=args.require_incremental_light, require_incremental_inplace=args.require_incremental_inplace, expected_native=args.expected_native,
                snapshot=args.snapshot, check_only=args.check_only)
     except (OSError, ValueError, KeyError, AssertionError) as error:
         parser.exit(1, f"REPORT_REJECTED: {error}\n")

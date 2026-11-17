@@ -807,7 +807,7 @@ def verify_prefilter_equivalence(cases):
     reference = cases.get("reverse-inc-register")
     if reference is None:
         return
-    for name in ("reverse-inc-prefilter", "reverse-inc-direct", "reverse-inc-ties", "reverse-inc-light", "reverse-inc-light-ties"):
+    for name in ("reverse-inc-prefilter", "reverse-inc-direct", "reverse-inc-ties", "reverse-inc-light", "reverse-inc-light-ties", "reverse-inc-inplace"):
         if name in cases:
             verify_incremental_state_pair(reference, cases[name])
 
@@ -824,7 +824,7 @@ def verify_case_equivalence(cases, *, same_threshold):
     verify_prefilter_equivalence(cases)
     first = next(iter(cases.values()))
     for case in cases.values():
-        incremental = case.get("tuning", {}).get("incremental_topk", False)
+        incremental = (case.get("tuning") or {}).get("incremental_topk", False)
         if incremental:
             # The actual native score table and each selected rank have already
             # been checked by verify_fused_scores. Arrival-order kth ties can

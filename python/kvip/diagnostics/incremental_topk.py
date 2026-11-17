@@ -102,7 +102,7 @@ class PrefilterWindowTopK(WindowTopK):
 class TieWindowTopK(PrefilterWindowTopK):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.fast_ties = 0
+        self.fast_ties = self.inplace_windows = 0
 
     def select_window(self, scores, ids):
         strict = int(np.count_nonzero(self.scores > self.threshold))
@@ -113,6 +113,7 @@ class TieWindowTopK(PrefilterWindowTopK):
             self.scores = np.r_[self.scores[:strict], scores, self.scores[strict:keep]]
             self.ids = np.r_[self.ids[:strict], ids, self.ids[strict:keep]]
             self.fast_ties += 1
+            self.inplace_windows += int(self.k - strict <= 256)
             return
         super().select_window(scores, ids)
 
@@ -156,6 +157,7 @@ def simulate(scores, seed, windows, eligible, *, k=TOP, budget=512, window_budge
         merges=sum(v.merges for v in keepers), compacted=sum(v.compacted for v in keepers),
         window_candidates=[n for v in keepers for n in getattr(v, "counts", [])],
         tie_fast_windows=sum(getattr(v, "fast_ties", 0) for v in keepers),
+        inplace_windows=sum(getattr(v, "inplace_windows", 0) for v in keepers),
         dense_windows=sum(getattr(v, "dense", 0) for v in keepers),
         empty_windows=sum(getattr(v, "empty", 0) for v in keepers),
         selection_items=sum(getattr(v, "input_items", 0) for v in keepers),
@@ -287,7 +289,7 @@ def main():
     archive = TensorArchive(args.snapshot, manifest)
     g, scores, ends, bounds = inputs(archive)
     for reverse in (False, True):
-        merges = compacted = dense = empty = items = control_items = fast = 0
+        merges = compacted = dense = empty = items = control_items = fast = inplace = 0
         candidates = []
         for row in range(g["batch"]):
             valid = [scores[row, q, :int(ends[row, q])] for q in range(4)]
@@ -302,6 +304,7 @@ def main():
                         raise AssertionError(f"Prefilter changed exact whole-window {key} row={row} reverse={reverse}")
                 candidates.extend(result["window_candidates"])
                 fast += result["tie_fast_windows"]
+                inplace += result["inplace_windows"]
                 dense += result["dense_windows"]
                 empty += result["empty_windows"]
                 items += result["selection_items"]
@@ -319,6 +322,7 @@ def main():
         if args.tie_fast:
             print(f"CPU_TIES {'reverse' if reverse else 'forward'} PASS "
                   f"skip_Kth_nonempty={fast}/{len(candidates)-empty} empty={empty} "
+                  f"short_suffix_windows={inplace}/{len(candidates)} "
                   "thresholds_ordered_lists_traffic=IDENTICAL timing=NOT_SIMULATED", flush=True)
         print(f"CPU_INCREMENTAL {'reverse' if reverse else 'forward'} PASS queries={g['batch']*4} window_staging={args.window_staging} cold_windows=8 exact_score_ranks=YES retry_and_traffic_identity=YES timing=NOT_SIMULATED", flush=True)
 
