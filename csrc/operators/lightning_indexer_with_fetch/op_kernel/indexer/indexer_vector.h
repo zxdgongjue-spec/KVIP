@@ -700,15 +700,12 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
 #endif
         SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_QSCALE + qScalepingpong);
     }
-#if KVIP_LI_SCALE_TILES
+    // Bank lifetime is independent of the number of prefetched scale tiles.
     // Return the bank only after its last consumer, including a partial tail.
     // A sequence shard can end before the whole cold phase. Return its
     // partial bank too, before the next aligned shard reuses that bank.
     if ((info.s2Idx - info.s2Start + 1) % QLICommon::KScaleTiles == 0 ||
         (info.s2Idx + 1) * s2BaseSize_ >= info.validS2Len || info.isLastS2InnerLoop) {
-#else
-    if ((info.s2Idx - info.s2Start) % QLICommon::KScaleTiles == 0) {
-#endif
         SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_KSCALE + kScalepingpong);
     }
     SetFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
