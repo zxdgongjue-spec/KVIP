@@ -63,21 +63,7 @@ __aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uin
         *reinterpret_cast<__gm__ uint32_t*>(ctx->count)=0;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->count),4);
     }
-    SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
-    Duplicate(local,UINT32_MAX,4096);
-    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-    if(ctx->changes)FillRoundWords(ctx->changes+b*kChangeCapacity*4,kChangeCapacity,local);
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
-    // Copy only the candidate prefix; resolver writes extended destinations.
-    if(ctx->changeSlots) {
-        GlobalTensor<uint32_t> source,target;
-        source.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots);
-        target.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+b*kChangeCapacity);
-        DataCopy(local,source,kLruSlots);
-        SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-        DataCopy(target,local,kLruSlots);
-        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
-    }
     pipe.Destroy();
 }
 #endif
@@ -104,16 +90,34 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
         uint32_t chunk=((rt_history+127)/128)*32;
         uint32_t begin=part*chunk;
         uint32_t end=begin+chunk<rt_history ? begin+chunk : rt_history;
-        if(begin<end) {
+        if(begin<end || ctx->changes || (part==3 && ctx->changeSlots)) {
             TPipe mapPipe; TBuf<TPosition::VECCALC> mapStorage;
             mapPipe.InitBuffer(mapStorage,4096*4);
             auto local=mapStorage.Get<uint32_t>();
             Duplicate(local,UINT32_MAX,4096);
             SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-            FillRoundWords(ctx->mapping+(uint64_t(b)*rt_history+begin)*4,end-begin,local);
+            if(begin<end) FillRoundWords(ctx->mapping+(uint64_t(b)*rt_history+begin)*4,end-begin,local);
+            // All four workers clear disjoint aligned changes ranges. This
+            // also runs when the corresponding mapping range is empty.
+            if(ctx->changes) {
+                constexpr uint32_t changeChunk=kChangeCapacity/4;
+                static_assert(kChangeCapacity%4==0 && changeChunk%8==0,"unaligned change shards");
+                FillRoundWords(ctx->changes+(uint64_t(b)*kChangeCapacity+part*changeChunk)*4,changeChunk,local);
+            }
             SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            // The next kernel observes the completed LRU copy at the launch
+            // boundary; it does not depend on the owner's row initialization.
+            if(part==3 && ctx->changeSlots) {
+                GlobalTensor<uint32_t> source,target;
+                source.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots);
+                target.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+b*kChangeCapacity);
+                DataCopy(local,source,kLruSlots);
+                SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+                DataCopy(target,local,kLruSlots);
+                SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            }
             mapPipe.Destroy();
-            Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},rt_history,rt_resident,ctx,b,begin,end);
+            if(begin<end) Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},rt_history,rt_resident,ctx,b,begin,end);
         }
         if(part) return;
         auto initBindings=reinterpret_cast<__gm__ uint64_t*>(bindings);
