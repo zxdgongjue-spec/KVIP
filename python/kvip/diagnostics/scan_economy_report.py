@@ -42,7 +42,11 @@ def report(cases, order):
         g = gain(t, original)
         print(f"{name:23} {t['mean_us']:8.3f} {t['p50_us']:8.3f} {g['mean_us']:10.2f} {g['p50_us']:9.2f} "
               f"{useful_prefetch(case):10.1f} {b['repair']/2**20:10.4f} {b['waste']/2**20:9.4f} {b['total']/2**20:9.4f}")
-    if "reverse-sparse" in cases:
+    if "reverse-boundary" in cases:
+        pairs = (("reverse", "reverse-window-fast"),
+                 ("reverse-window-fast", "reverse-boundary-ref"),
+                 ("reverse-boundary", "reverse-boundary-ref"))
+    elif "reverse-sparse" in cases:
         pairs = (("reverse", "reverse-window-fast"),
                  ("reverse-window-fast", "reverse-sparse-ref"),
                  ("reverse-sparse", "reverse-sparse-ref"))
@@ -96,8 +100,10 @@ def report(cases, order):
                       f"histogram_calls={work['dense_histogram_calls']}->{work['sparse_histogram_calls']} "
                       "CPU_counts_not_latency; compaction/synchronization are in graph timing")
     if "reverse-window-fast" in cases:
+        profiled = False
         for name in order:
             for sample in cases[name].get("native_diagnostics", {}).get("samples", []):
+                profiled = True
                 fields = []
                 for label, key in (("producer", "producer_span"), ("post", "post_active"),
                                    ("join", "final_prefetch_join"), ("drain", "cq_drain")):
@@ -105,7 +111,8 @@ def report(cases, order):
                     if metric.get("status") == "available":
                         fields.append(f"{label}={metric['median_cycles']:.0f}/{metric['max_cycles']}")
                 print(f"PROFILE {name} cycles_p50/max " + " ".join(fields))
-        print("PROFILE_SCOPE separate instrumented replay; producer=index producer (not full LI); overlapping cycles, not additive graph time")
+        if profiled:
+            print("PROFILE_SCOPE separate instrumented replay; producer=index producer (not full LI); overlapping cycles, not additive graph time")
     print("DECISION " + ("retest_candidates="+",".join(candidates) if candidates else "keep_original_fused"))
     print("NOTE positive delta=more work/bytes; useful_pre includes all prefetch windows; no completion-overlap claim")
     if "reverse-window-fast" in cases:

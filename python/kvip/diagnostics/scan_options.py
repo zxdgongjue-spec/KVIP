@@ -1,6 +1,6 @@
 """Independent URMA scan-order/admission experiment; no graph-route changes."""
 
-OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill", "compact_out_of_place", "rolling_reuse_seed", "rolling_fast_path", "rolling_sparse")
+OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill", "compact_out_of_place", "rolling_reuse_seed", "rolling_fast_path", "rolling_sparse", "rolling_boundary")
 DEFAULT_VARIANTS = ("forward", "reverse", "forward-wide", "reverse-wide", "forward-end")
 VARIANTS = {name: ("reverse_cold",) if name.startswith("reverse") else () for name in DEFAULT_VARIANTS}
 ROLLING_VARIANTS = ("forward", "reverse", "reverse-roll", "reverse-refilter", "forward-refilter", "forward-end")
@@ -79,6 +79,15 @@ VARIANTS["reverse-sparse"] = tuple(
 )
 
 
+BOUNDARY_VARIANTS = ("forward", "reverse", "reverse-window-fast", "reverse-boundary",
+                     "reverse-boundary-ref", "reverse-end", "forward-end")
+VARIANTS["reverse-boundary-ref"] = VARIANTS["reverse-window-fast"] + ("rolling_boundary",)
+VARIANTS["reverse-boundary"] = tuple(
+    flag for flag in VARIANTS["reverse-boundary-ref"]
+    if flag not in ("window_refilter", "refilter_safe")
+)
+
+
 def options_for(name):
     return {key: key in VARIANTS[name] for key in OPTIONS}
 
@@ -110,6 +119,9 @@ def validate_options(options):
         raise ValueError("First-window correction requires compact admission")
     if options["rolling_reuse_seed"] and not options["rolling_compact"]:
         raise ValueError("Seed reuse requires compact window accumulation")
+    if options["rolling_boundary"] and (not options["rolling_fast_path"] or
+            options["rolling_sparse"] or options["rolling_first_window"] or options["rolling_batched"]):
+        raise ValueError("Boundary readback requires dense fast window counts and every window")
     if options["rolling_sparse"] and not options["rolling_fast_path"]:
         raise ValueError("Sparse window counts require packed seed reuse")
     if options["rolling_fast_path"] and not options["rolling_reuse_seed"]:

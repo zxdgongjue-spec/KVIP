@@ -7,10 +7,10 @@ import numpy as np
 import pytest
 
 from kvip.diagnostics import replay, replay_measure, scan_report, scan_options
-from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, budgets_for, options_for, validate_options
+from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS, budgets_for, options_for, validate_options
 
 
-@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS])
+@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS])
 def test_scan_study_reuses_one_arena_and_delivers_independent_options(monkeypatch, variants):
     args = SimpleNamespace(study="scan-order", mode="fused", transport="urma",
                            threshold_policy="recent", scan_variants=list(variants))
@@ -34,7 +34,7 @@ def test_scan_study_reuses_one_arena_and_delivers_independent_options(monkeypatc
     assert calls == [(name, options_for(name), budgets_for(name)) for name in variants]
 
 
-@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS])
+@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS])
 def test_actual_command_line_accepts_scan_variants(tmp_path, variants):
     args = replay.arguments([
         "--snapshot", str(tmp_path / "input"), "--build-dir", str(tmp_path / "build"),
@@ -69,9 +69,9 @@ def test_report_uses_full_chain_and_keeps_mean_and_median_separate(tmp_path, cap
 
 def test_rolling_experiment_does_not_change_budgets_or_enable_pipeline_options():
     assert {budgets_for(name) for name in ROLLING_VARIANTS} == {(512, 64)}
-    assert options_for("reverse-refilter") == dict(reverse_cold=True, rolling_threshold=True, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False, compact_out_of_place=False, rolling_reuse_seed=False, rolling_fast_path=False, rolling_sparse=False)
+    assert options_for("reverse-refilter") == dict(reverse_cold=True, rolling_threshold=True, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False, compact_out_of_place=False, rolling_reuse_seed=False, rolling_fast_path=False, rolling_sparse=False, rolling_boundary=False)
     with pytest.raises(ValueError, match="requires rolling"):
-        validate_options(dict(reverse_cold=True, rolling_threshold=False, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False, compact_out_of_place=False, rolling_reuse_seed=False, rolling_fast_path=False, rolling_sparse=False))
+        validate_options(dict(reverse_cold=True, rolling_threshold=False, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False, compact_out_of_place=False, rolling_reuse_seed=False, rolling_fast_path=False, rolling_sparse=False, rolling_boundary=False))
 
 
 def test_rolling_reference_uses_unique_seed_and_only_scanned_causal_positions():
@@ -469,3 +469,39 @@ def test_sparse_work_counts_exclude_recent_future_and_seed_ties(reverse):
     assert work["scanned_scores"] == 4*(16384-2048)
     assert work["windows"] == 4*8
     assert work["sparse_histogram_calls"] <= 4*4  # A block may straddle a window.
+
+
+def test_boundary_readback_controls_and_eight_window_report(tmp_path, capsys):
+    plain, filtered = (options_for(n) for n in ("reverse-boundary", "reverse-boundary-ref"))
+    assert {k for k in plain if plain[k] != filtered[k]} == {"window_refilter", "refilter_safe"}
+    assert plain["rolling_boundary"] and plain["rolling_fast_path"]
+    assert not plain["rolling_sparse"]
+    with pytest.raises(ValueError, match="Boundary readback"):
+        validate_options(dict(plain, rolling_sparse=True))
+    assert not plain["window_refilter"] and not plain["refilter_safe"]
+    assert not any(options_for("forward").values())
+    assert {budgets_for(n) for n in BOUNDARY_VARIANTS} == {(512, 64)}
+    for name in BOUNDARY_VARIANTS:
+        validate_options(options_for(name))
+    with pytest.raises(ValueError, match="Boundary readback"):
+        validate_options(dict(plain, rolling_fast_path=False))
+    data = rolling_report(tmp_path)
+    template = data["cases"]["forward"]
+    data["execution_order"] = list(BOUNDARY_VARIANTS)
+    data["cases"] = {n: json.loads(json.dumps(template)) for n in BOUNDARY_VARIANTS}
+    for case in data["cases"].values():
+        case["geometry"]["rounds"] = 9
+        case["reads_samples"][0].update(prefetch=20, unused_prefetch=10)
+    path = tmp_path / "boundary.json"
+    path.write_text(json.dumps(data))
+    scan_report.report(path, require_boundary=True)
+    output = capsys.readouterr().out
+    assert "reverse-window-fast->reverse-boundary-ref" in output
+    assert "reverse-boundary->reverse-boundary-ref" in output
+    assert "vs_original_mean/p50=" in output and "vs_reverse_mean/p50=" in output
+    with pytest.raises(ValueError, match="Packed histogram"):
+        scan_report.load_report(path, require_fast=True)
+    data["cases"]["reverse-boundary"]["geometry"]["rounds"] = 8
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="eight cold windows"):
+        scan_report.load_report(path, require_boundary=True)
