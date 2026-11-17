@@ -114,6 +114,9 @@ def save_summary(directory, rows):
              formatted(headers), separator, *(formatted(line) for line in cells), separator,
              f"Completed: {sum(row['execution'] == 'COMPLETED' for row in rows)}/{len(rows)}; "
              f"correctness PASS: {sum(row['correctness'] == 'PASS' for row in rows)}/{len(rows)}"]
+    worker_counts = sorted({row['q_workers'] for row in rows if row.get('q_workers') is not None})
+    if worker_counts:
+        lines.append('Fetch AIV workers per query: ' + ', '.join(map(str, worker_counts)))
     if batched:
         stage_rows = []
         for index, row in enumerate(rows, 1):
@@ -164,7 +167,8 @@ def collect_results(directory, config, exit_code):
         row.update(batch=batch, transport=config.transport, mode=config.mode, report=str(path),
                    seed=getattr(config, 'seed', None), miss_percent=report.get('miss_percent', getattr(config, 'miss_percent', None)),
                    history=getattr(config, 'history', None), resident=getattr(config, 'resident', None),
-                   prefetch_tokens=getattr(config, 'prefetch_tokens', None))
+                   prefetch_tokens=getattr(config, 'prefetch_tokens', None),
+                   q_workers=report.get('q_workers', getattr(config, 'q_workers', 2)))
         rows.append(row)
     misses = getattr(config, 'miss_percent', None)
     misses = misses if isinstance(misses, (tuple, list)) else (misses,)

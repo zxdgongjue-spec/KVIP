@@ -135,6 +135,8 @@ def configuration(argv=None):
             command.add_argument('--prefetch-rank-start', type=int, default=1024,
                                  help='URMA initial admission rank (1..2048); progresses to 2048 by per-Q coverage')
             command.add_argument('--intermediate-fetches', type=int, default=8)
+            command.add_argument('--q-workers', type=int, choices=(1, 2, 4), default=2,
+                                 help='URMA Fetch AIV workers per query (experimental)')
             command.add_argument('--warmup', type=int, default=4, help='whole-graph warmup repetitions')
             command.add_argument('--iterations', type=int, default=20, help='independent complete invocations captured in one measured graph')
         if mode == 'diagnose':
@@ -158,6 +160,8 @@ def configuration(argv=None):
         if args.suite == ('all',):
             args.suite = CHECK_SUITES if args.snapshot else CHECK_SUITES[:-1]
     if args.mode in ('bench', 'diagnose'):
+        if args.transport != 'urma' and args.q_workers != 2:
+            parser.error('--q-workers other than 2 requires URMA')
         synthetic = dict(miss_percent=10., queries=4, batches=DEFAULT_BATCHES, seed=43,
                          history=131072, resident=16384, index_heads=32)
         real = ('trace_root', 'group', 'round_range')

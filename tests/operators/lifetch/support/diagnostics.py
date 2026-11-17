@@ -246,6 +246,8 @@ def summarize(directory, config):
                                 for path in fetch_paths]
         if config.transport == 'ubmem':
             result['unavailable'].append('Fetch-only: UNSUPPORTED for UBmem standalone worker')
+        elif getattr(config, 'q_workers', 2) != 2:
+            result['unavailable'].append('Fetch-only: UNSUPPORTED for per-Q worker counts other than 2')
         elif not fetch_paths:
             result['missing'].append('Fetch-only comparison results')
         for comparison in result['fetch_only']:

@@ -3219,7 +3219,7 @@ class FusedReplayState:
     state must not have live graphs or unfinished device work.
     """
     def __init__(self, torch, runtime, table, library, initial, pages, addresses,
-                 *, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None):
+                 *, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None, q_workers=2):
         from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
         from kvip.cache.index_storage import IndexCacheStorage
         from kvip.operators.lifetch.binding import LIFetchBinding
@@ -3267,6 +3267,10 @@ class FusedReplayState:
                                               prefetch_limit=prefetch_tokens, **binding)
             else:
                 owner = KvafQueueView(self.lease, output_rows, table.addresses, table.valid)
+                required_views = 2 * self.batch + 8 * q_workers
+                available_views = int(owner.context['worker_count']) * 2
+                if available_views < required_views:
+                    raise ValueError(f'Fetch requires {required_views} queue views, got {available_views}')
                 self.rotating = LIFetchBinding(
                     torch, library, self.workspace.arguments(self.storage), owner,
                     batch=self.batch, history=self.history, resident=self.resident,
@@ -3281,7 +3285,7 @@ class FusedReplayState:
                 query_inputs=self.workspace.inputs,
                 status=torch.zeros(self.batch, dtype=torch.int32, device=device),
                 outputs=torch.zeros((2, self.batch * 4, 1, 2048), dtype=torch.int32, device=device))
-            self.forward = StreamingForward(self.rotating, self.update, torch, prefetch_tokens)
+            self.forward = StreamingForward(self.rotating, self.update, torch, prefetch_tokens, q_workers=q_workers)
             self.reset()
         except BaseException:
             if self.owns_lease:
@@ -3764,7 +3768,8 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                             for epoch, word in enumerate(epochs[:state.rotating.rounds]) if word]
                     details.append(sample)
                 atomic_json(directory / 'diagnose' / f'round-{inputs.source_round}' / 'detail_samples.json', details)
-        if fused and config.mode == 'diagnose' and config.level == 3 and config.transport == 'urma' and 'fetch' in config.stages:
+        if (fused and config.mode == 'diagnose' and config.level == 3 and config.transport == 'urma'
+                and 'fetch' in config.stages and getattr(config, 'q_workers', 2) == 2):
             from performance import compare_fetch_only
             first = states[0]
             first.forward.set_diagnostics(False)
@@ -3897,7 +3902,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 torch, runtime, view, library, initial, pages, logical_addresses,
                 device=device, aics=aics, windows=config.intermediate_fetches,
                 prefetch_tokens=config.prefetch_tokens, soc=soc,
-                prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024))
+                prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024),
+                q_workers=getattr(config, 'q_workers', 2))
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
         if config.mode in ('bench', 'diagnose') and g.get('sparse_mode') == 0 and not fused:
@@ -3943,7 +3949,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                         torch, runtime, view, library, initial, pages, logical_addresses,
                         device=device, aics=aics, windows=config.intermediate_fetches,
                         prefetch_tokens=config.prefetch_tokens, soc=soc,
-                        prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease)
+                        prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease,
+                        q_workers=getattr(config, 'q_workers', 2))
                     replica.failure_directory = directory
                 else:
                     replica = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
@@ -3954,7 +3961,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 result['correctness'] = 'FAIL'
                 result['failures'] = checks.failures + result['failures']
             result.update(transport=config.transport, path='fused' if fused else 'serial',
-                          runtime_workers=shared_pool.workers if borrowed else workers, geometry=g,
+                          runtime_workers=shared_pool.workers if borrowed else workers,
+                          q_workers=getattr(config, 'q_workers', 2) if fused else None, geometry=g,
                           input_paths=[str(ref.manifest_path) for refs in sequence.rounds for ref in refs])
             atomic_json(directory / 'path_result.json', result)
             return result
@@ -4091,6 +4099,7 @@ def run_synthetic_batch(config, directory, *, shared_pool=None):
                 results[name] = run_path(config, folder / name, sequence, pages,
                                          fused=name == 'fused', shared_pool=pool)
                 report = dict(batch=batch, miss_percent=config.miss_percent, input='synthetic',
+                              q_workers=config.q_workers,
                               correctness='NOT_RUN', execution='INCOMPLETE',
                               timing={'native_chain': results['serial']['all_rounds']})
                 if 'fused' in results:
@@ -4119,7 +4128,8 @@ def run_real(config, directory):
     for name in ('serial', 'fused'):
         results[name] = run_path(config, directory / name, sequence, pages, fused=name == 'fused')
         # Preserve completed serial timing even if the fused worker later fails.
-        report = dict(batch=initial.geometry['batch'], input='real', correctness='NOT_RUN',
+        report = dict(batch=initial.geometry['batch'], input='real',
+                      q_workers=getattr(config, 'q_workers', 2), correctness='NOT_RUN',
                       execution='INCOMPLETE', timing={'native_chain': results['serial']['all_rounds']})
         if 'fused' in results:
             report.update(execution='COMPLETED',
