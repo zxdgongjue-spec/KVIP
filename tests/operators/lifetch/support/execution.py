@@ -526,6 +526,12 @@ def supervise(command, run, heartbeat_seconds=20, timeout_seconds=300, environme
                 lines.append(f"STREAMING FETCH KV AUDIT: {json.dumps(compact)}; details={audit}")
             except (OSError, ValueError, KeyError) as error:
                 lines.append(f"Could not read streaming fetch audit {audit}: {error}")
+        for result_path in sorted(run.rglob('path_result.json')):
+            result = json.loads(result_path.read_text())
+            for failure in result.get('failures', [])[:4]:
+                lines.append(f"REPLAY CHECK FAILURE {result.get('path', '')}: {json.dumps(failure)}")
+        for audit_path in sorted(run.rglob('score_failure.json')):
+            lines.append('REPLAY SCORE AUDIT: ' + audit_path.read_text())
         # At most four short tails, including exceptions before native logging.
         logs = [p for p in run.rglob("*.log") if p.name in ("native.log", "error.log", "build.log", "configure.log")]
         logs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
@@ -3311,6 +3317,7 @@ class FusedReplayState:
         if inputs.identities != self.initial.identities or inputs.geometry != self.initial.geometry:
             raise ValueError('Replay request geometry changed after binding')
         layout = self.storage.logical_ids[1:].cpu().numpy()
+        self.input_layout = layout.copy()
         keys, scales, valid = inputs.index_for_layout(layout)
         self.upload(self.storage.keys[1:], keys)
         self.upload(self.storage.scales[1:], scales)
@@ -3442,6 +3449,36 @@ class FusedReplayState:
             inputs.validate_topk(ids)
         except AssertionError as error:
             failures.append(str(error))
+            if hasattr(self.rotating, 'incremental'):
+                meta = self.rotating.incremental.cpu().numpy().view(np.uint64)
+                raw = self.workspace.compute.cpu().numpy().view(np.uint16)
+                base = self.workspace.compute.data_ptr()
+                audit = []
+                for row in range(self.batch):
+                    layout = self.input_layout[row]
+                    inverse = np.argsort(layout)
+                    for q in range(4):
+                        offset = (int(meta[row, q, 0]) - base) // 2
+                        if offset < 0 or offset + self.history > len(raw):
+                            continue
+                        scores = raw[offset:offset + self.history][inverse]
+                        valid = inputs.logical_score_valid[row, q]
+                        population = scores[valid]
+                        cutoff = int(np.partition(population, len(population) - 2048)[-2048])
+                        selected = ids[row, q]
+                        missing = int(np.sum(population > cutoff) - np.sum(scores[selected] > cutoff))
+                        below = int(np.sum(scores[selected] < cutoff))
+                        reference = inputs.logical_score_keys[row, q]
+                        mismatch = np.flatnonzero(valid & (scores != reference))
+                        if missing or below or len(mismatch):
+                            audit.append(dict(request=row, query=q + 1, device_cutoff=cutoff,
+                                missing_above=missing, below_cutoff=below,
+                                score_mismatches=int(len(mismatch)),
+                                examples=[dict(token=int(i), device=int(scores[i]), reference=int(reference[i]))
+                                          for i in mismatch[:8]]))
+                print('REPLAY SCORE AUDIT: ' + json.dumps(audit), flush=True)
+                if getattr(self, 'failure_directory', None):
+                    atomic_json(self.failure_directory / 'score_failure.json', audit)
         for row in range(self.batch):
             expected = self.pages.token_payload(row, ids[row].reshape(-1))
             actual = output[row, slots[row].reshape(-1)]
@@ -3730,6 +3767,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
                 result['correctness'] = 'FAIL'
                 result['failures'].extend(result['diagnostic']['failures'])
             atomic_json(directory / 'path_result.json', result)
+        for failure in result.get('failures', []):
+            print('REPLAY CHECK FAILURE: ' + json.dumps(failure), flush=True)
         return result
     except BaseException as error:
         if pending:

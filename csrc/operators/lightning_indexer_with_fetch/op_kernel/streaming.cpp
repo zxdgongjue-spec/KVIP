@@ -234,8 +234,9 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
   auto dest=reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+b*a->maxEvents;
   if(profile)ticks[12+2*phase]=GetSystemCycle();
   // Each exchange introduces at most two new positions into either map.
-  // Switch before exact saturation as well: retain an empty probe terminator.
-  if(!denseMode && uint64_t(seen+count)*2>=MAP){
+  // Bound linear-probe cost as well as capacity. Near-full maps can make
+  // one Q1 exchange hundreds of microseconds slower than dense lookup.
+  if(!denseMode && uint64_t(seen+count)*2>=MAP*3/4){
    if(!a->denseShadow){error=1;break;}
    if(prepareMetadata){
     Simt::VF_CALL<ExpandPreparedMetadata>(Simt::Dim3{THREADS,1,1},prepared,shape.history,work);

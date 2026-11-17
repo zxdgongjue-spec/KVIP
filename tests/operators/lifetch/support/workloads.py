@@ -780,7 +780,15 @@ class ReplayRound:
                 population = scores[valid]
                 cutoff = np.partition(population, len(population) - 2048)[-2048]
                 if np.min(scores[ids]) != cutoff or np.sum(scores[ids] > cutoff) != np.sum(population > cutoff):
-                    raise AssertionError(f'Replay TopK ranking differs: request={row} Q={query + 1}')
+                    chosen = np.zeros(len(scores), dtype=bool)
+                    chosen[ids] = True
+                    missing = np.flatnonzero(valid & ~chosen & (scores > cutoff))
+                    below = ids[scores[ids] < cutoff]
+                    detail = dict(cutoff=int(cutoff), selected_min=int(np.min(scores[ids])),
+                                  missing_above=int(len(missing)), below_cutoff=int(len(below)),
+                                  missing=[(int(i), int(scores[i])) for i in missing[:8]],
+                                  below=[(int(i), int(scores[i])) for i in below[:8]])
+                    raise AssertionError(f'Replay TopK ranking differs: request={row} Q={query + 1}; {detail}')
 
     def index_for_layout(self, layout):
         """Map real LI input to a path's current layout without resetting residency."""
