@@ -98,6 +98,19 @@ if(KVIP_OUTPUT_WORKER AND NOT KVIP_FUSE_QUERY_WORK)
 endif()
 set(_base "${CMAKE_CURRENT_SOURCE_DIR}")
 ascendc_library(v9_kernel STATIC op_kernel/indexer.cpp op_kernel/lifecycle.cpp op_kernel/streaming.cpp)
+if(KVIP_LOW_MISS_POST_INDEX AND RUN_MODE STREQUAL "npu")
+  # Legacy CANN replaces the source entry with an inline _origin function.
+  # Apply the kernel-only attribute after wrapper generation, before either
+  # device compiler starts. Do not modify the installed SDK or other entries.
+  ExternalProject_Add_Step(v9_kernel_preprocess tail_batch_schedule
+    COMMAND ${CMAKE_COMMAND}
+      "-DGENERATED_SOURCE=${CMAKE_BINARY_DIR}/auto_gen/v9_kernel/auto_gen_streaming.cpp"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/set_tail_schedule.cmake"
+    DEPENDEES build
+    DEPENDERS install
+    ALWAYS TRUE
+  )
+endif()
 ascendc_include_directories(v9_kernel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel
   ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/indexer ${KVAF_INCLUDE}
   ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)

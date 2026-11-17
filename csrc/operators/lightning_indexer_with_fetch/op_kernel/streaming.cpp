@@ -810,18 +810,14 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b,uint32_t usef
 #include "post_index_tail.h"
 #endif
 #endif
-#if KVIP_LOW_MISS_POST_INDEX && !V9_UBMEM
-// All AIVs participate in phase barriers. Batch scheduling prevents another
-// stream from occupying a subset while this invocation waits for its peers.
-// Legacy host-stub extraction expects the return type after __aicore__.
-extern "C" __schedmode__(1) __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
-#else
+// CMake applies batch scheduling to the generated entry for Post/Index/CQ.
+// Legacy CANN includes this function as an inline _origin implementation;
+// kernel-only scheduling attributes must not be placed on that implementation.
 extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
-#endif
 #if defined(__CCE_AICORE__)
 #if KVIP_LOW_MISS_POST_INDEX && !V9_UBMEM
  // Vector-only mixed scheduling enables the hardware cross-core barrier.
- // AIV_ONLY does not enable that scheduler, even with __schedmode__(1).
+ // AIV_ONLY does not enable that scheduler, even with batch scheduling.
  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
 #else
  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);

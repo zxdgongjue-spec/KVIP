@@ -91,6 +91,25 @@ def test_pipeline_options_isolate_and_reuse_the_correct_binary(monkeypatch, tmp_
     assert len(calls) == previous
 
 
+def test_cmake_helper_change_invalidates_cached_binary(monkeypatch, tmp_path):
+    def compile_command(command, **kwargs):
+        if command[1] == "--build":
+            (Path(command[2]) / "libv9_bridge.so").write_bytes(b"compiled fixture")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(build.subprocess, "run", compile_command)
+    # Include paths use the same source-file hashing as the operator directory.
+    helper = tmp_path / "headers" / "set_tail_schedule.cmake"
+    helper.parent.mkdir()
+    helper.write_text("# first helper revision\n")
+    args = dict(cache_dir=tmp_path / "cache", cann=tmp_path, headers=helper.parent, soc="A5")
+    first = build.build_libraries(**args)
+    helper.write_text("# changed scheduling helper\n")
+    second = build.build_libraries(**args)
+    assert second != first
+    assert build.build_libraries(**args) == second
+
+
 @pytest.mark.parametrize("value", (1, 0, "OFF", None))
 @pytest.mark.parametrize("option", ("compact_init", "adaptive_admission", "prefetch_gate",
                                     "skip_exhausted_prefetch", "early_prefetch_drain", "inverse_mapping",

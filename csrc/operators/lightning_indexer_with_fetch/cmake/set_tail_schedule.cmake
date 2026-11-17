@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# Legacy CANN loses source entry attributes while generating an inline origin
+# and a new kernel. Scope batch scheduling to the latter, in our build only.
+if(NOT DEFINED GENERATED_SOURCE OR NOT EXISTS "${GENERATED_SOURCE}")
+  message(FATAL_ERROR "Missing generated Post/Index/CQ entry: ${GENERATED_SOURCE}")
+endif()
+file(READ "${GENERATED_SOURCE}" _source)
+set(_kernel "auto_gen_v9_streaming_resolve_update_kernel")
+set(_entry "extern \"C\"[ \t\r\n]+(__schedmode__\\(1\\)[ \t\r\n]+)?__global__[ \t\r\n]+\\[aicore\\][ \t\r\n]+void[ \t\r\n]+${_kernel}[ \t\r\n]*\\([^{}]*\\)[ \t\r\n]*\\{")
+string(REGEX MATCHALL "${_entry}" _matches "${_source}")
+list(LENGTH _matches _count)
+if(NOT _count EQUAL 1)
+  message(FATAL_ERROR "Expected one supported generated ${_kernel} definition; found ${_count}")
+endif()
+list(GET _matches 0 _declaration)
+if(NOT _declaration MATCHES "__schedmode__")
+  string(REPLACE "extern \"C\"" "extern \"C\" __schedmode__(1)" _scheduled "${_declaration}")
+  string(REPLACE "${_declaration}" "${_scheduled}" _source "${_source}")
+  file(WRITE "${GENERATED_SOURCE}" "${_source}")
+endif()
