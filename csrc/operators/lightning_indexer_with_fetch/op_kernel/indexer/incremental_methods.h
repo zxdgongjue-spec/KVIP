@@ -26,7 +26,10 @@ __aicore__ inline void TagResident(uint32_t query) {
     if(ctx->hotValid)h.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*runtimeShape_.resident);
     if(ctx->reservedHot)r.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->reservedHot)+uint64_t(b)*runtimeShape_.resident);
     for(uint32_t base=0;base<runtimeShape_.resident;base+=chunk){
-        if(base){SetFlag<HardEvent::V_MTE2>(EVENT_ID4);WaitFlag<HardEvent::V_MTE2>(EVENT_ID4);}
+        // EVENT_ID4 already carries ProcessTopK's next-query signal here.
+        // Use the balanced scratch-copy event so this wait cannot consume
+        // that older signal and overwrite metadata still read by tagging.
+        if(base){SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);}
         uint32_t n=Min(chunk,runtimeShape_.resident-base);
         if(!base && streamingTopkOnly_ && streamingPrefetched_) {}
         else {if(ctx->hotValid)DataCopy(hot,h[base],n);if(ctx->reservedHot)DataCopy(reserved,r[base],n);}
