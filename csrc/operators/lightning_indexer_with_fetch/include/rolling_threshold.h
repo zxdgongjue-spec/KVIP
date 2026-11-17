@@ -23,6 +23,9 @@
 #ifndef KVIP_ROLLING_SPARSE
 #define KVIP_ROLLING_SPARSE 0
 #endif
+#ifndef KVIP_ROLLING_BOUNDARY
+#define KVIP_ROLLING_BOUNDARY 0
+#endif
 #if KVIP_ROLLING_SPARSE && !KVIP_ROLLING_FAST_PATH
 #error "Sparse window counts require packed seed reuse"
 #endif
@@ -43,6 +46,9 @@
 #endif
 #ifndef KVIP_ROLLING_BATCHED
 #define KVIP_ROLLING_BATCHED 0
+#endif
+#if KVIP_ROLLING_BOUNDARY && (!KVIP_ROLLING_FAST_PATH || KVIP_ROLLING_SPARSE || KVIP_ROLLING_FIRST_WINDOW || KVIP_ROLLING_BATCHED)
+#error "Boundary readback requires dense fast window counts and every window"
 #endif
 #if KVIP_ROLLING_BATCHED && !KVIP_ROLLING_THRESHOLD
 #error "Batched histogram requires the rolling threshold"

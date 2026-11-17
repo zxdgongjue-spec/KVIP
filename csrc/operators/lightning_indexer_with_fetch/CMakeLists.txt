@@ -12,6 +12,7 @@ option(KVIP_ROLLING_WINDOWED "Accumulate raw LI scores at existing window bounda
 option(KVIP_ROLLING_COMPACT "One comparison per tile and early QK-buffer release" OFF)
 option(KVIP_ROLLING_REUSE_SEED "Reuse the exact seed selector CDF within its byte range" OFF)
 option(KVIP_ROLLING_FAST_PATH "Packed byte histogram and visibility-first admission" OFF)
+option(KVIP_ROLLING_BOUNDARY "Read existing score GM only at window boundaries" OFF)
 option(KVIP_ROLLING_SPARSE "Compact above-seed scores before window histogram updates" OFF)
 if(KVIP_ROLLING_SPARSE AND NOT KVIP_ROLLING_FAST_PATH)
   message(FATAL_ERROR "Sparse window counts require packed seed reuse")
@@ -65,6 +66,7 @@ ascendc_compile_options(v9_kernel PRIVATE -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WO
   -DKVIP_ROLLING_THRESHOLD=$<BOOL:${KVIP_ROLLING_THRESHOLD}>
   -DKVIP_ROLLING_COMPACT=$<BOOL:${KVIP_ROLLING_COMPACT}>
   -DKVIP_ROLLING_REUSE_SEED=$<BOOL:${KVIP_ROLLING_REUSE_SEED}>
+  -DKVIP_ROLLING_BOUNDARY=$<BOOL:${KVIP_ROLLING_BOUNDARY}>
   -DKVIP_ROLLING_SPARSE=$<BOOL:${KVIP_ROLLING_SPARSE}>
   -DKVIP_ROLLING_FAST_PATH=$<BOOL:${KVIP_ROLLING_FAST_PATH}>
   -DKVIP_ROLLING_FIRST_WINDOW=$<BOOL:${KVIP_ROLLING_FIRST_WINDOW}>
@@ -90,3 +92,4 @@ target_compile_definitions(v9_bridge PRIVATE KVIP_COMPACT_OUT_OF_PLACE=$<BOOL:${
 target_compile_definitions(v9_bridge PRIVATE KVIP_ROLLING_REUSE_SEED=$<BOOL:${KVIP_ROLLING_REUSE_SEED}>)
 target_compile_definitions(v9_bridge PRIVATE KVIP_ROLLING_FAST_PATH=$<BOOL:${KVIP_ROLLING_FAST_PATH}>)
 target_compile_definitions(v9_bridge PRIVATE KVIP_ROLLING_SPARSE=$<BOOL:${KVIP_ROLLING_SPARSE}>)
+target_compile_definitions(v9_bridge PRIVATE KVIP_ROLLING_BOUNDARY=$<BOOL:${KVIP_ROLLING_BOUNDARY}>)

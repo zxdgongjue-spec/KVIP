@@ -129,3 +129,40 @@ int main(){
          "-I", str(NATIVE / "include"), str(cpp), "-o", str(binary)], check=True,
     )
     subprocess.run([str(binary)], check=True, timeout=30)
+
+
+def test_window_runs_cover_exact_physical_keys_without_duplicates(tmp_path):
+    program = r'''
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
+#include <random>
+#include <vector>
+#include "cold_scan.h"
+int main(){
+ std::mt19937 rng(32);
+ for(unsigned trial=0;trial<2500;++trial){
+  unsigned resident=(rng()%160)*128,history=resident+128+(rng()%2000)*128;
+  unsigned ends[4]={history-87,history-83,history-62,history-1};
+  auto range=kvip_cold_scan::Bounds(resident,history,ends);
+  if(trial%3==0)range={0,0};
+  unsigned lo=rng()%history,hi=lo+rng()%(history-lo+1);
+  auto runs=kvip_cold_scan::WindowRuns(lo,hi,range);
+  assert(runs.count<=5);
+  std::vector<unsigned> expected,actual;
+  for(unsigned i=lo;i<hi;++i)expected.push_back(kvip_cold_scan::Remap(i,range));
+  for(unsigned r=0;r<runs.count;++r){
+   auto span=runs.spans[r];assert(span.begin<span.end && span.end<=history);
+   for(unsigned i=span.begin;i<span.end;++i)actual.push_back(i);
+  }
+  std::sort(expected.begin(),expected.end());std::sort(actual.begin(),actual.end());
+  assert(expected==actual);assert(std::adjacent_find(actual.begin(),actual.end())==actual.end());
+ }
+}
+'''
+    cpp = tmp_path / "window_runs.cpp"
+    cpp.write_text(program)
+    binary = cpp.with_suffix("")
+    subprocess.run(["c++", "-std=c++17", "-O1", "-fsanitize=address,undefined",
+                    "-I", str(NATIVE / "include"), str(cpp), "-o", str(binary)], check=True)
+    subprocess.run([str(binary)], check=True, timeout=30)

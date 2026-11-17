@@ -794,7 +794,7 @@ __simd_callee__ inline void ClassifyScore(AscendC::MicroAPI::RegTensor<uint16_t>
 __simd_callee__ inline void ClassifyRollingScore(AscendC::MicroAPI::RegTensor<uint16_t>& score,
     __ubuf__ uint16_t* threshold, __ubuf__ uint16_t* hits,
     AscendC::MicroAPI::MaskReg& all, __ubuf__ uint16_t* state) {
-#if KVIP_ROLLING_THRESHOLD
+#if KVIP_ROLLING_THRESHOLD && !KVIP_ROLLING_BOUNDARY
     if (state) {
 #if KVIP_ROLLING_COMPACT
         ClassifyScore(score, state + kvip_rolling::kAdmission, hits, all);

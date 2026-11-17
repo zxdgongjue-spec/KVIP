@@ -27,13 +27,13 @@ def execute(tmp_path, source, name):
     subprocess.run([str(binary)], check=True, timeout=60)
 
 
-@pytest.mark.parametrize("batched,windowed,compact,first,reuse,fast,sparse", [
-    (0, 0, 0, 0, 0, 0, 0), (1, 0, 0, 0, 0, 0, 0), (0, 1, 0, 0, 0, 0, 0),
-    (0, 1, 1, 0, 0, 0, 0), (0, 1, 1, 1, 0, 0, 0), (0, 1, 1, 0, 1, 0, 0),
-    (0, 1, 1, 1, 1, 0, 0), (0, 1, 1, 0, 1, 1, 0), (0, 1, 1, 1, 1, 1, 0),
-    (0, 1, 1, 0, 1, 1, 1), (0, 1, 1, 1, 1, 1, 1)])
+@pytest.mark.parametrize("batched,windowed,compact,first,reuse,fast,sparse,boundary", [
+    (0, 0, 0, 0, 0, 0, 0, 0), (1, 0, 0, 0, 0, 0, 0, 0), (0, 1, 0, 0, 0, 0, 0, 0),
+    (0, 1, 1, 0, 0, 0, 0, 0), (0, 1, 1, 1, 0, 0, 0, 0), (0, 1, 1, 0, 1, 0, 0, 0),
+    (0, 1, 1, 1, 1, 0, 0, 0), (0, 1, 1, 0, 1, 1, 0, 0), (0, 1, 1, 1, 1, 1, 0, 0),
+    (0, 1, 1, 0, 1, 1, 1, 0), (0, 1, 1, 1, 1, 1, 1, 0), (0, 1, 1, 0, 1, 1, 0, 1)])
 @pytest.mark.parametrize("reverse", [0, 1])
-def test_actual_cdf_saturation_ties_causal_tail_and_seed_dedup(tmp_path, batched, windowed, compact, first, reuse, fast, sparse, reverse):
+def test_actual_cdf_saturation_ties_causal_tail_and_seed_dedup(tmp_path, batched, windowed, compact, first, reuse, fast, sparse, boundary, reverse):
     model = register_model_source('#include "recent_index.h"')
     model = model[:model.index('#include "recent_threshold.h"')]
     model = model.replace("{DIST_DINTLV_B8}", "{DIST_DINTLV_B8,DIST_BRC_B16}")
@@ -103,6 +103,17 @@ using namespace AscendC;
 #include "rolling_threshold_vector.h"
 ''' + classify + r'''
 using namespace AscendC::MicroAPI;
+#include "cold_scan.h"
+void CheckClassify(RegTensor<uint16_t>& score,uint16_t* threshold,uint16_t* hits,
+                   MaskReg& all,uint16_t* state){
+#if KVIP_ROLLING_BOUNDARY
+ std::array<uint16_t,128> cutoff;
+ std::copy_n(state+kvip_rolling::kAdmission,128,cutoff.data());
+ ClassifyRollingScore(score,cutoff.data(),hits,all,nullptr);
+#else
+ ClassifyRollingScore(score,threshold,hits,all,state);
+#endif
+}
 uint16_t kth(std::vector<uint16_t> a){std::nth_element(a.begin(),a.end()-2048,a.end());return a[a.size()-2048];}
 int main(){
 #if KVIP_ROLLING_FAST_PATH
@@ -130,11 +141,11 @@ int main(){
   std::fill_n(state.data()+kvip_rolling::kBins,128,80);
   RegTensor<uint16_t> limit,anchor;LoadAlign(limit,threshold.data());Duplicate(anchor,uint16_t(80));
   kvip_rolling::SaveAdmission(state.data(),limit,anchor);
-  ClassifyRollingScore(score,threshold.data(),hits.data(),all,state.data());
+  CheckClassify(score,threshold.data(),hits.data(),all,state.data());
   for(unsigned i=0;i<128;++i)assert(hits[i]==unsigned(i>=90));
   threshold.fill(80);Duplicate(limit,uint16_t(80));
   kvip_rolling::SaveAdmission(state.data(),limit,anchor);
-  ClassifyRollingScore(score,threshold.data(),hits.data(),all,state.data());
+  CheckClassify(score,threshold.data(),hits.data(),all,state.data());
   for(unsigned i=0;i<128;++i)assert(hits[i]==unsigned(i>80));
  }
 
@@ -153,7 +164,7 @@ int main(){
    auto all=CreateMask<uint16_t,MaskPattern::ALL>();
    for(unsigned offset=0;offset<65536;offset+=128){
     for(unsigned lane=0;lane<128;++lane)score.v[lane]=offset+lane;
-    ClassifyRollingScore(score,threshold.data(),hits.data(),all,state.data());
+    CheckClassify(score,threshold.data(),hits.data(),all,state.data());
     for(unsigned lane=0;lane<128;++lane)
      assert(hits[lane]==unsigned(offset+lane>seed && offset+lane>=kthKey));
    }
@@ -239,12 +250,31 @@ int main(){
     for(unsigned i=0;i<16;++i)assert(compacted[i]==0xa55a&&compacted[16+kvip_rolling::kWindowScores+i]==0xa55a);
     expectedHistograms+=2*((sparseCount+255)/256);
 #endif
+#if KVIP_ROLLING_BOUNDARY
+    expectedHistograms-=2*((windowCount/128+1)/2);
+    unsigned scanBegin=n+ordinal*128-windowCount;
+    auto reverse=REVERSE_TEST?kvip_cold_scan::Range{n,end/2048*2048}:kvip_cold_scan::Range{0,0};
+    auto runs=kvip_cold_scan::WindowRuns(scanBegin,scanBegin+windowCount,reverse);
+    for(unsigned r=0;r<runs.count;++r){
+     auto span=runs.spans[r];unsigned count=span.end-span.begin;
+     expectedHistograms+=2*((count/128+1)/2);
+     kvip_rolling::ObserveWindow(values.data()+span.begin,count,storage.data()+16,threshold.data(),windowHits.data(),
+       span.begin,end,recentBegin,recentEnd,0,0);
+    }
+    auto classifierThreshold=threshold;
+    kvip_rolling::FinishBoundary(values.data()+tile,storage.data()+16,classifierThreshold.data(),windowHits.data());
+    for(unsigned lane=0;lane<128;++lane){
+     assert(storage[16+kvip_rolling::kAdmission+lane]==threshold[lane]);
+     assert(classifierThreshold[lane]==std::max(unsigned(initial),std::max(unsigned(threshold[lane]),1U)-1));
+    }
+#else
     kvip_rolling::ObserveWindow(window.data(),windowCount,storage.data()+16,threshold.data(),windowHits.data(),
       n+ordinal*128-windowCount,end,recentBegin,recentEnd,n,end/2048*2048
 #if KVIP_ROLLING_SPARSE
       ,compacted.data()+16,sparseCount
 #endif
       );
+#endif
     windowCount=0;
     for(unsigned i=0;i<128;++i)assert(windowHits[i]==unsigned(score.v[i]>=threshold[0]&&score.v[i]>initial));
    }
@@ -268,7 +298,7 @@ int main(){
 }
 '''
     source = (f"#define KVIP_ROLLING_BATCHED {batched}\n#define KVIP_ROLLING_WINDOWED {windowed}\n"
-              f"#define KVIP_ROLLING_FAST_PATH {fast}\n#define KVIP_ROLLING_SPARSE {sparse}\n"
+              f"#define KVIP_ROLLING_FAST_PATH {fast}\n#define KVIP_ROLLING_SPARSE {sparse}\n#define KVIP_ROLLING_BOUNDARY {boundary}\n"
               f"#define KVIP_ROLLING_REUSE_SEED {reuse}\n#define KVIP_ROLLING_COMPACT {compact}\n#define KVIP_ROLLING_FIRST_WINDOW {first}\n"
               f"#define KVIP_REVERSE_COLD {reverse}\n#define REVERSE_TEST {reverse}\n") + source
     execute(tmp_path, source, "rolling_cdf")

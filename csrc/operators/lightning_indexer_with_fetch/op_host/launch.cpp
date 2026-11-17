@@ -3,6 +3,7 @@
 #include "context.h"
 #include "cold_scan.h"
 #include "rolling_threshold.h"
+extern "C" uint32_t kvip_rolling_boundary() { return KVIP_ROLLING_BOUNDARY; }
 extern "C" uint32_t kvip_rolling_sparse() { return KVIP_ROLLING_SPARSE; }
 extern "C" uint32_t kvip_rolling_fast_path() { return KVIP_ROLLING_FAST_PATH; }
 extern "C" uint32_t kvip_rolling_reuse_seed() { return KVIP_ROLLING_REUSE_SEED; }

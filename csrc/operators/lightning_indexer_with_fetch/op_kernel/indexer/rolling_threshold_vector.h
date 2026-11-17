@@ -277,6 +277,26 @@ __simd_vf__ inline void ObserveWindow(__ubuf__ uint16_t* input, uint32_t count,
 }
 #endif
 
+// Preserve the true Kth for the consumer, but give the unchanged strict
+// classifier a cutoff equivalent to score>seed && score>=Kth. Only the window
+// boundary executes this conversion; ordinary LI tiles need no state loads.
+__simd_vf__ inline void FinishBoundary(__ubuf__ uint16_t* lastTile,
+    __ubuf__ uint16_t* state, __ubuf__ uint16_t* threshold, __ubuf__ uint16_t* hits) {
+    LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
+    auto all = CreateMask<uint16_t, MaskPattern::ALL>();
+    RegTensor<uint16_t> key, anchor, one, cutoff, score;
+    LoadAlign(key, threshold); LoadAlign(anchor, state + kBins);
+    Duplicate(one, uint16_t(1));
+    Max(cutoff, key, one, all); Sub(cutoff, cutoff, one, all);
+    Max(cutoff, cutoff, anchor, all);
+    StoreAlign(state + kAdmission, key, all);
+    StoreAlign(threshold, cutoff, all);
+    LoadAlign(score, lastTile);
+    MaskReg selected;
+    Compare<uint16_t, CMPMODE::GT>(selected, score, cutoff, all);
+    StoreAlign(hits, selected);
+}
+
 // Runs inside the existing score/classify VF, using its live score register.
 __simd_callee__ inline void Observe(RegTensor<uint16_t>& score,
     __ubuf__ uint16_t* state, __ubuf__ uint16_t* threshold,

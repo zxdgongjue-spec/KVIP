@@ -180,19 +180,74 @@ private:
     TBuf<TPosition::VECCALC> rollingWindowBuf_;
     LocalTensor<SCORE_T> rollingWindow_;
     uint32_t rollingWindowCount_ = 0, rollingReverseEnd_ = 0;
+    uint32_t rollingWindowBegin_ = 0;
     uint32_t rollingWindowEpoch_ = 1, rollingWindowTrigger_ = 0;
 #endif
 #if KVIP_ROLLING_BATCHED
     uint32_t rollingPending_[2]{};
 #endif
     uint32_t rollingEnds_[2]{}, rollingBegin_[2]{}, rollingEnd_[2]{};
+#if KVIP_ROLLING_BOUNDARY
+    __aicore__ inline void UpdateBoundary(const QLICommon::RunInfo& info, uint32_t query,
+        uint64_t scoreRow, LocalTensor<SCORE_T> lastTile, LocalTensor<uint16_t> hits) {
+        uint32_t bank = query % 2, end = (info.s2Idx + 1) * 128;
+        kvip_cold_scan::Range reverse{0, 0};
+#if KVIP_REVERSE_COLD
+        reverse = {(runtimeShape_.resident + 2047) / 2048 * 2048, rollingReverseEnd_};
+#endif
+        auto runs = kvip_cold_scan::WindowRuns(rollingWindowBegin_, end, reverse);
+        // The final tile's score write must finish before its readback. Join
+        // old scratch users independently; Cube can continue after QK release.
+        SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+        SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+        WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+        uint32_t offset = 0;
+        DataCopyPadExtParams<SCORE_T> pad{false, 0, 0, 0};
+        for (uint32_t i = 0; i < runs.count; ++i) {
+            auto span = runs.spans[i];
+            DataCopyExtParams copy{1, (span.end - span.begin) * uint32_t(sizeof(SCORE_T)), 0, 0, 0};
+            DataCopyPad(mrgValueLocal_[offset], scoreGm[scoreRow + span.begin], copy, pad);
+            offset += span.end - span.begin;
+        }
+        SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+        WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+        auto state = reinterpret_cast<__ubuf__ uint16_t*>(
+            rollingState_[bank * kvip_rolling::kStateWords].GetPhyAddr());
+        auto threshold = reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_[bank * 128].GetPhyAddr());
+        auto scratchHits = reinterpret_cast<__ubuf__ uint16_t*>(indicesOutLocal_.GetPhyAddr());
+        offset = 0;
+        for (uint32_t i = 0; i < runs.count; ++i) {
+            auto span = runs.spans[i];
+            kvip_rolling::ObserveWindow(
+                reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_[offset].GetPhyAddr()),
+                span.end - span.begin, state, threshold, scratchHits,
+                span.begin, rollingEnds_[bank], rollingBegin_[bank], rollingEnd_[bank], 0, 0);
+            offset += span.end - span.begin;
+        }
+        kvip_rolling::FinishBoundary(reinterpret_cast<__ubuf__ uint16_t*>(lastTile.GetPhyAddr()),
+            state, threshold, reinterpret_cast<__ubuf__ uint16_t*>(hits.GetPhyAddr()));
+        SetFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + info.loop % 2);
+        WaitFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + info.loop % 2);
+        rollingWindowBegin_ = end;
+        ++rollingWindowEpoch_;
+        rollingWindowTrigger_ = rotating::Trigger(runtimeShape_.history, runtimeShape_.resident,
+                                                  runtimeShape_.rounds, rollingWindowEpoch_);
+    }
+#endif
     __aicore__ inline void PublishRolling(uint32_t query) {
         DataCopyExtParams copy{1, 32, 0, 0, 0};
         // Keep the existing writable GM tensor. GetPhyAddr() returns const;
         // the two 256-byte UB banks can instead be viewed as u32 for this copy.
+#if KVIP_ROLLING_BOUNDARY
+        auto thresholds = rollingState_[(query % 2) * kvip_rolling::kStateWords +
+                                        kvip_rolling::kAdmission].template ReinterpretCast<uint32_t>();
+        DataCopyPad(rotationProgressGm_[query * 32 + kvip_rolling::kProgressThreshold], thresholds, copy);
+#else
         auto thresholds = prefixThreshold_.template ReinterpretCast<uint32_t>();
         DataCopyPad(rotationProgressGm_[query * 32 + kvip_rolling::kProgressThreshold],
                     thresholds[(query % 2) * 64], copy);
+#endif
     }
 #endif
     GM_ADDR scoreStorage_ = nullptr;
@@ -202,6 +257,7 @@ private:
         rollingReady_[query % 2] = false;
 #if KVIP_ROLLING_WINDOWED
         rollingWindowCount_ = 0;
+        rollingWindowBegin_ = runtimeShape_.resident;
         rollingWindowEpoch_ = 1;
         rollingWindowTrigger_ = rotating::Trigger(runtimeShape_.history, runtimeShape_.resident,
                                                  runtimeShape_.rounds, rollingWindowEpoch_);
@@ -529,7 +585,7 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe, bool topkOnly)
     // Append, do not shift Fixpipe or any existing scratch-bank offsets.
     pipe->InitBuffer(rollingBuf_, 2 * kvip_rolling::kStateWords * sizeof(uint16_t));
     rollingState_ = rollingBuf_.Get<uint16_t>();
-#if KVIP_ROLLING_WINDOWED
+#if KVIP_ROLLING_WINDOWED && !KVIP_ROLLING_BOUNDARY
     if (!topkOnly) {
         pipe->InitBuffer(rollingWindowBuf_, kvip_rolling::kWindowScores * sizeof(SCORE_T));
         rollingWindow_ = rollingWindowBuf_.Get<SCORE_T>();
@@ -816,7 +872,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     __ubuf__ uint16_t* rolling = nullptr;
     uint32_t rollingMask0 = 0, rollingMask1 = 0;
     bool rollingAdvance = false;
-#if KVIP_ROLLING_THRESHOLD
+#if KVIP_ROLLING_THRESHOLD && !KVIP_ROLLING_BOUNDARY
     const uint32_t bank = curAivS1Idx % 2;
     if (!scoreOnly && curS2Idx >= runtimeShape_.resident && rollingReady_[bank]) {
         rolling = reinterpret_cast<__ubuf__ uint16_t*>(rollingState_[bank * kvip_rolling::kStateWords].GetPhyAddr());
@@ -836,7 +892,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
 #endif
     }
 #endif
-#if KVIP_ROLLING_WINDOWED
+#if KVIP_ROLLING_WINDOWED && !KVIP_ROLLING_BOUNDARY
     const bool collectWindow = rolling &&
         (!KVIP_ROLLING_FIRST_WINDOW || rollingWindowEpoch_ == 1);
     if (collectWindow) outBase = rollingWindow_[rollingWindowCount_];
@@ -859,7 +915,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
                                         qScaleBase, UB_BANK_DEPTH_STRIDE / sizeof(SCALE_T),
                                         gSize_, curAivS1ProcNum);
     }
-#if KVIP_ROLLING_COMPACT
+#if KVIP_ROLLING_COMPACT && !KVIP_ROLLING_BOUNDARY
     // Scoring is the last reader of this QK buffer. Release it on PIPE_V
     // before the boundary histogram so Cube can start its next producer.
     // Output/bitmap DMA and publication retain their original ordering.
@@ -867,7 +923,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(
             QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);
 #endif
-#if KVIP_ROLLING_WINDOWED
+#if KVIP_ROLLING_WINDOWED && !KVIP_ROLLING_BOUNDARY
     if (collectWindow) {
         rollingWindowCount_ += 128;
         if (rollingAdvance) {
@@ -926,6 +982,16 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     copyOutParams.srcStride = (UB_BANK_DEPTH_STRIDE - copyOutParams.blockLen) / 32;
     copyOutParams.dstStride = (QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_) - s2BaseSize_) * sizeof(SCORE_T);
     DataCopyPad(scoreGm[vec1OutGmOffset], outBase, copyOutParams);
+#if KVIP_ROLLING_BOUNDARY
+    rollingAdvance = !scoreOnly && info.s2Idx + 1 == rollingWindowTrigger_ &&
+                     rollingReady_[curAivS1Idx % 2];
+    if (rollingAdvance) {
+        CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(
+            QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);
+        UpdateBoundary(info, curAivS1Idx, vec1OutGmOffset - curS2Idx,
+                       outBase, classifyUB_[pingpong * 256]);
+    }
+#endif
 #if SIM_CAPTURE_HITS
     if (!scoreOnly && curS2Idx >= runtimeShape_.resident) {
         constexpr uint32_t prefixBytes = SIM_Q * 2048 * 6 + SIM_Q * 256;
