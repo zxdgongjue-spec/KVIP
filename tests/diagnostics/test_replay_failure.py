@@ -269,6 +269,7 @@ def test_buffer_metadata_never_reads_tensor_values_or_syncs():
 def test_cli_saves_failure_before_retained_owner_exit(tmp_path, monkeypatch, capsys):
     args = SimpleNamespace(
         quiet=True,
+        isolate_variants=False,
         output=tmp_path / "failed.json",
         snapshot=tmp_path / "input",
         transport="urma",

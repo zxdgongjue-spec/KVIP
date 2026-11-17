@@ -57,6 +57,8 @@ def arguments(argv=None):
                    help="Eight cold windows plus the resident publication (9 native rounds)")
     p.add_argument("--compare-layout", action="store_true",
                    help="Compare persistent post-state outside timing, including repeat drift")
+    p.add_argument("--isolate-variants", action="store_true",
+                   help="Run scan variants sequentially in fresh processes to bound NPU resource lifetime")
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--iterations", type=int, default=10)
     p.add_argument(
@@ -122,6 +124,10 @@ def arguments(argv=None):
         p.error("cold-windows/compare-layout requires study=scan-order")
     if args.compare_layout and args.scan_variants != ["forward", "reverse", "reverse-end", "forward-end"]:
         p.error("compare-layout requires forward reverse reverse-end forward-end")
+    if args.isolate_variants and (
+        args.study != "scan-order" or args.compare_layout or args.profile_dir is not None or args.topk_probe
+    ):
+        p.error("isolate-variants requires scan-order without compare-layout/profile-dir/topk-probe")
     if args.topk_probe and args.study != "post-threshold":
         p.error("topk-probe requires study=post-threshold")
     if args.study in ("threshold-only", "seed-ub", "local-victims", "register-kth", "overlap-victims") and (
@@ -136,6 +142,10 @@ def arguments(argv=None):
 
 def main(argv=None):
     args = arguments(argv)
+    if args.isolate_variants:
+        from kvip.diagnostics.replay_isolated import run
+
+        return run(args)
     retained = {"progress": {"variant": "unassigned", "phase": "input_validation", "step": None}}
     _RETAINED.append(retained)
     log = NativeLog(args.quiet, report_failure=False)
