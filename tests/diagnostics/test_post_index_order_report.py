@@ -90,3 +90,97 @@ def test_order_control_requires_exact_variant_and_calibration_is_diagnostic_only
                    ["--pipeline-variants", "auto-post-index", "--calibrate-counter"]):
         with pytest.raises(SystemExit):
             replay.arguments(base + suffix)
+
+
+def test_high_prefetch_schedule_variation_does_not_reject_identical_low_work(tmp_path, capsys):
+    values = reports()
+    item = values["overlap"]
+    high = item["reads_samples"][0]
+    high.update(prefetch=20, final=945, transfers=965, bytes=965*656,
+                unused_prefetch=10, useful_transfers=955)
+    item["auto_route"]["samples"][0].update(observed_prefetch=20, observed_final=945)
+    write(tmp_path, values)
+    summarize(SimpleNamespace(directory=tmp_path, group=2))
+    output = capsys.readouterr().out
+    gains = [line for line in output.splitlines() if line.startswith("ORDER_GAIN ")]
+    assert len(gains) == 4 and all(" STEADY " in line for line in gains)
+    assert not any(" ALL " in line for line in gains)
+    assert "identical_low_traffic=PASS" in output
+    assert "identical_traffic=PASS" not in output
+
+
+def test_consistent_but_different_low_traffic_is_rejected(tmp_path):
+    values = reports()
+    item = values["overlap"]
+    low = item["reads_samples"][1]
+    low.update(final=956, transfers=956, bytes=956*656, useful_transfers=956)
+    low["post_index"].update(submitted_requests=956, completed_requests=956)
+    item["auto_route"]["samples"][1].update(observed_final=956, observed_useful_get=956, necessary_get=956)
+    write(tmp_path, values)
+    with pytest.raises(ValueError, match="LOW Get traffic changed"):
+        summarize(SimpleNamespace(directory=tmp_path, group=2))
+
+
+@pytest.mark.parametrize("reason", ["steady_contains_high_route", "steady_blocking_fallback"])
+def test_order_gain_requires_all_steady_samples_low_and_asynchronous(tmp_path, capsys, reason):
+    values = reports()
+    for item in values.values():
+        if reason == "steady_contains_high_route":
+            item["auto_route"].update(low_steps=1, high_steps=2)
+            item["auto_route"]["samples"][1]["mode"] = "high"
+            item["reads_samples"][1]["post_index"] = dict(status="not_entered", active=False)
+        else:
+            item["reads_samples"][1]["post_index"]["fallback"] = True
+    write(tmp_path, values)
+    summarize(SimpleNamespace(directory=tmp_path, group=2))
+    output = capsys.readouterr().out
+    assert not any(line.startswith("ORDER_GAIN ") for line in output.splitlines())
+    assert f"ORDER_COMPARISON unavailable reason={reason}" in output
+    assert "order_gain_valid=false" in output
+
+
+def references(root, *, fault=None):
+    before, end = case("before"), case("before")
+    end["timing"].update(samples_us=[410., 390., 400.], mean_us=400., p50_us=400.)
+    # The last observed route is not a compile/runtime policy.
+    before["tuning"]["auto_low_active"] = False
+    end["tuning"]["auto_low_active"] = True
+    if fault == "source":
+        end["kvip_commit"] = end["production_source"]["commit"] = "d"*40
+    elif fault == "tuning":
+        end["tuning"]["prefetch_rank"] = 1024
+    elif fault == "selection":
+        end["selection_comparison"]["ordered_output_sha256"] = "changed"
+    elif fault == "route":
+        end["auto_route"].update(low_steps=1, high_steps=2)
+        end["auto_route"]["samples"][1]["mode"] = "high"
+    elif fault == "low-traffic":
+        end["reads_samples"][1].update(final=956, transfers=956, bytes=956*656, useful_transfers=956)
+        end["auto_route"]["samples"][1].update(observed_final=956, observed_useful_get=956, necessary_get=956)
+    for name, item in (("before", before), ("before-end", end)):
+        (root/f"{name}.json").write_text(json.dumps(dict(status="pass", cases={name: item})))
+    return dict(before=root/"before.json", before_end=root/"before-end.json")
+
+
+def test_before_end_reports_both_controls_and_unadjusted_drift(tmp_path, capsys):
+    write(tmp_path, reports())
+    summarize(SimpleNamespace(directory=tmp_path, group=2, **references(tmp_path)))
+    output = capsys.readouterr().out
+    assert "GAIN_vs_before overlap STEADY_mean/p50=+0.00%/+0.00%" in output
+    assert "GAIN_vs_before-end overlap STEADY_mean/p50=+5.06%/+5.06%" in output
+    assert "DRIFT before end/first STEADY_mean/p50=+5.33%/+5.33% unadjusted=true" in output
+    assert "REFERENCE_SCOPE before=first_end_bracketed" in output
+    assert "single_point_not_bracketed" not in output
+
+
+@pytest.mark.parametrize("fault", ["source", "tuning", "selection", "route", "low-traffic"])
+def test_before_end_rejects_changed_source_policy_or_output(tmp_path, capsys, fault):
+    write(tmp_path, reports())
+    with pytest.raises(ValueError):
+        summarize(SimpleNamespace(directory=tmp_path, group=2, **references(tmp_path, fault=fault)))
+    assert "GAIN_vs_before" not in capsys.readouterr().out
+
+
+def test_before_end_cannot_be_used_without_before(tmp_path):
+    with pytest.raises(ValueError, match="--before-end requires --before"):
+        summarize(SimpleNamespace(directory=tmp_path, group=2, before_end=tmp_path/"end.json"))

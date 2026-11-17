@@ -12,6 +12,17 @@ from kvip.diagnostics.read_through_report import change, load_case, pair, requir
 ROLES = ("wait-first", "overlap", "overlap-end", "wait-first-end")
 
 
+def _tuning(case):
+    # This value is a last-observed device decision, not a build policy.
+    return {key: value for key, value in case.get("tuning", {}).items() if key != "auto_low_active"}
+
+
+def _low_traffic(case):
+    return [tuple(read[key] for key in ("prefetch", "final", "transfers", "bytes"))
+            for observed, read in zip(case["auto_route"]["samples"], case["reads_samples"])
+            if observed["mode"] == "low"]
+
+
 def _validate(case, role):
     expected = role.startswith("wait-first")
     require(case.get("post_index_wait_first") is expected, f"{role}: missing/mismatched execution order")
@@ -78,6 +89,8 @@ def _print_diagnostics(case, role):
 
 
 def summarize(args):
+    require(getattr(args, "before_end", None) is None or getattr(args, "before", None) is not None,
+            "--before-end requires --before")
     root = Path(args.directory)
     cases = {role: load_case(str(root / f"g{args.group}-{role}.json"), role) for role in ROLES}
     first = cases["wait-first"]
@@ -87,6 +100,7 @@ def summarize(args):
         for key in ("snapshot_sha256", "kvaf_build", "device", "soc", "warmup", "geometry", "kvip_commit", "library_sha256"):
             require(case.get(key) is not None and case[key] == first.get(key), f"{role}: differing {key}")
         require(case["library_sha256"], f"{role}: binary digest is required")
+        require(_tuning(case) == _tuning(first), f"{role}: differing tuning")
         require(len(case["_samples"]) == len(first["_samples"]), f"{role}: differing sample count")
         for key in ("ordered_output_sha256", "selected_set_sha256"):
             require(case["selection_comparison"].get(key) is not None
@@ -94,10 +108,14 @@ def summarize(args):
                     f"{role}: different exact TopK selection")
         require([row["mode"] for row in case["auto_route"]["samples"]]
                 == [row["mode"] for row in first["auto_route"]["samples"]], f"{role}: route decisions changed")
-        require([[row[key] for key in ("prefetch", "final", "transfers", "bytes")]
-                 for row in case["reads_samples"]]
-                == [[row[key] for key in ("prefetch", "final", "transfers", "bytes")]
-                    for row in first["reads_samples"]], f"{role}: Get traffic changed")
+        # The first HIGH replay may issue different speculative reads as the
+        # concurrent LI/Fetch schedule varies. It is not the LOW order control.
+        require(_low_traffic(case) == _low_traffic(first), f"{role}: LOW Get traffic changed")
+    steady_all_low = all(all(row["mode"] == "low" for row in case["auto_route"]["samples"][1:])
+                         for case in cases.values())
+    steady_blocking = any(read.get("post_index", {}).get("fallback", False)
+                          for case in cases.values() for read in case["reads_samples"][1:])
+    order_gain_valid = steady_all_low and not steady_blocking
     print(f"RESULT_BEGIN G{args.group} same_binary=true all_Index_and_Get_work=retained units=us")
     for role, case in cases.items():
         all_mean, all_p50 = timing(case, False)
@@ -107,43 +125,67 @@ def summarize(args):
               f"STEADY_mean/p50={steady_mean:.3f}/{steady_p50:.3f} "
               f"low/high={route['low_steps']}/{route['high_steps']} "
               f"fallback={sum(row['fallback'] for row in lows[role])}/{len(lows[role])}")
-    for candidate in ("overlap", "overlap-end"):
-        for control in ("wait-first", "wait-first-end"):
-            for steady in (False, True):
-                a, b = timing(cases[control], steady), timing(cases[candidate], steady)
+    if order_gain_valid:
+        for candidate in ("overlap", "overlap-end"):
+            for control in ("wait-first", "wait-first-end"):
+                a, b = timing(cases[control], True), timing(cases[candidate], True)
                 delta = tuple(x-y for x, y in zip(a, b))
-                print(f"ORDER_GAIN {candidate}_vs_{control} {'STEADY' if steady else 'ALL'} "
+                print(f"ORDER_GAIN {candidate}_vs_{control} STEADY "
                       f"mean/p50={pair(change(a, b))} saved_us={delta[0]:.3f}/{delta[1]:.3f}")
+    else:
+        reason = "steady_contains_high_route" if not steady_all_low else "steady_blocking_fallback"
+        print(f"ORDER_COMPARISON unavailable reason={reason} overlap_gain_not_inferred=true")
     for role in ("wait-first", "overlap"):
         drift = tuple(-x for x in change(timing(cases[role], True), timing(cases[role+'-end'], True)))
         print(f"DRIFT {role} end/first STEADY_mean/p50={pair(drift)} unadjusted=true")
     references = {}
-    for label in ("serial", "serial-end", "before"):
+    for label in ("serial", "serial-end", "before", "before-end"):
         path = getattr(args, label.replace("-", "_"), None)
         if path is None:
             continue
         reference = references[label] = load_case(str(path), label)
         for key in ("snapshot_sha256", "kvaf_build", "device", "soc", "warmup", "geometry"):
             require(reference.get(key) == first.get(key), f"{label}: differing {key}")
+        if label.startswith("before"):
+            for key in ("selected_set_sha256", "ordered_output_sha256"):
+                require(reference.get("selection_comparison", {}).get(key)
+                        == first["selection_comparison"][key], f"{label}: differing exact output/selection")
+            require([row["mode"] for row in reference["auto_route"]["samples"]]
+                    == [row["mode"] for row in first["auto_route"]["samples"]],
+                    f"{label}: route decisions changed")
+            require(_low_traffic(reference) == _low_traffic(first), f"{label}: LOW Get traffic changed")
+    for label in ("serial", "before"):
+        if label in references and label + "-end" in references:
+            start, end = references[label], references[label + "-end"]
+            require(start["kvip_commit"] == end["kvip_commit"], f"{label}: first/end source differs")
+            require(_tuning(start) == _tuning(end), f"{label}: first/end tuning differs")
+            require(len(start["_samples"]) == len(end["_samples"]), f"{label}: first/end sample counts differ")
+    for label, reference in references.items():
         print(f"REFERENCE {label} ALL_mean/p50={timing(reference, False)[0]:.3f}/{timing(reference, False)[1]:.3f} "
               f"STEADY_mean/p50={timing(reference, True)[0]:.3f}/{timing(reference, True)[1]:.3f}")
         for role in ("overlap", "overlap-end"):
             print(f"GAIN_vs_{label} {role} STEADY_mean/p50={pair(change(timing(reference, True), timing(cases[role], True)))}")
     if "serial" in references and "serial-end" in references:
         start, end = references["serial"], references["serial-end"]
-        require(start["kvip_commit"] == end["kvip_commit"], "Serial first/end source differs")
         drift = tuple(-x for x in change(timing(start, True), timing(end, True)))
         print(f"DRIFT serial end/first STEADY_mean/p50={pair(drift)} unadjusted=true")
-    if "before" in references:
+    if "before-end" in references:
+        start, end = references["before"], references["before-end"]
+        drift = tuple(-x for x in change(timing(start, True), timing(end, True)))
+        print(f"DRIFT before end/first STEADY_mean/p50={pair(drift)} unadjusted=true")
+        print("REFERENCE_SCOPE before=first_end_bracketed")
+    elif "before" in references:
         print("REFERENCE_SCOPE before=single_point_not_bracketed")
     for role, case in cases.items():
         _print_diagnostics(case, role)
     fallback = (any(row["fallback"] for rows in lows.values() for row in rows)
                 or any(row.get("reads", {}).get("post_index", {}).get("fallback", False)
                        for case in cases.values() for row in case.get("native_diagnostics", {}).get("samples", [])))
-    print(f"CHECK correctness=PASS lifecycle=PASS prediction_recovery=PASS identical_traffic=PASS "
+    print(f"CHECK correctness=PASS lifecycle=PASS prediction_recovery=PASS identical_low_traffic=PASS "
+          f"steady_all_low={str(steady_all_low).lower()} order_gain_valid={str(order_gain_valid).lower()} "
           f"async_order_exercised={str(bool(lows['wait-first']) and not fallback).lower()}")
-    print("解释：完整图的同次序对照差值才是净掩盖收益；校准后的Index跨度含核间启动差异，不能当作Index理论极限。")
+    print("解释：ORDER_GAIN仅比较STEADY全LOW、相同Get工作且无阻塞回退的完整图；ALL只列总耗时，不用于推断掩盖。")
+    print("校准后的Index跨度含核间启动差异，不能当作Index理论极限；收益和漂移分别报告，不用漂移校正制造加速。")
     print("PIX2与headline使用相同Index VF；GetSystemCycle边界仍有诊断扰动。逻辑字节不是HBM总线流量。")
     print(f"RESULT_END G{args.group}")
 
@@ -155,6 +197,7 @@ def main():
     parser.add_argument("--serial", type=Path)
     parser.add_argument("--serial-end", type=Path)
     parser.add_argument("--before", type=Path)
+    parser.add_argument("--before-end", type=Path)
     args = parser.parse_args()
     try:
         summarize(args)
