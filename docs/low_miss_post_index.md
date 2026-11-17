@@ -39,9 +39,11 @@ counts, output validation, failure invalidation and success-only feedback.
   slice cannot fit in one SQ window, the whole invocation uses bounded native
   Get before Index. This is an explicitly counted fallback, not an async
   timing result. A real queue/descriptor error is not silently retried.
-- Any successfully posted queue is drained even when a peer reports an
-  error. A failed request invalidates its owner's hot validity and does not
-  commit successful predictor feedback.
+- Every successfully posted queue reaches its CQ wait even when a peer
+  reports an error. A CQ timeout poisons the queue and forbids reuse; it does
+  not establish that outstanding DMA has stopped. The blocking fallback
+  retains KVAF's original failure handling. A failed request invalidates its
+  owner's hot validity and does not commit successful predictor feedback.
 - Hardware `SyncAll` uses vector-only mixed scheduling
   (`KERNEL_TYPE_MIX_AIV_1_0`) and batch scheduling. Every launched AIV follows
   the same phase barriers; no CPU synchronization or extra graph node is
