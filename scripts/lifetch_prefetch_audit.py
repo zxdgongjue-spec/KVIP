@@ -10,8 +10,26 @@ import sys
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tests/operators/lifetch/support'))
-from diagnostics import capture_rows, diagnostic_table
+from diagnostics import diagnostic_table
 from workloads import load_score_capture, select_series
+
+
+
+def validate_transfers(capture):
+    """Validate only the records used here, not optional timing/threshold arrays."""
+    a, g = capture.arrays, capture.manifest['geometry']
+    records = np.asarray(a['post.prefetch_records'])
+    if records.ndim != 2 or records.shape[1] != 3 or records.dtype.kind not in 'iu':
+        raise ValueError(f"Unsupported prefetch_records: shape={records.shape}, dtype={records.dtype}; expected [request, physical_position, logical_token]")
+    if (np.any(records[:, 0] < 0) or np.any(records[:, 0] >= g['batch'])
+            or np.any(records[:, 1:] < 0) or np.any(records[:, 1:] >= g['history'])):
+        raise ValueError('Prefetch record request/position/token outside capture bounds')
+    requests = records[:, 0].astype(np.int64)
+    positions = records[:, 1].astype(np.int64)
+    if not np.array_equal(a['pre.logical_ids'][requests, positions], records[:, 2]):
+        raise ValueError('Prefetch logical tokens differ from captured pre-Index mapping')
+    # Repeated tokens are deliberately accepted: this audit counts them.
+    return records
 
 
 def main():
@@ -61,6 +79,10 @@ def main():
         if bounds:
             lines.append(f'Conditional lower bound on initially-local selected prefetch: mean={statistics.mean(bounds):.2f}, min={min(bounds):.2f}, max={max(bounds):.2f}; assumes no repeated token transfers.')
     lines.append('Current saved counters do not contain per-transfer token lists. They cannot prove absence of repeated hardware reads or exact hot-refetch attribution.')
+    output=path.parent/'prefetch_hot_audit.log'
+    output.write_text('\n\n'.join(lines)+'\n')
+    print('\n\n'.join(lines), flush=True)
+    lines = []
     lines.append('B: ORIGINAL CAPTURE (not this run). Exact recorded identities; captured algorithm may differ.')
     root = Path(config['trace_root']).resolve()
     if not root.exists():
@@ -69,8 +91,12 @@ def main():
         refs = select_series(root,config['group'],tuple(config['round_range']))
         rows = []
         for ref in refs:
-            cap = load_score_capture(ref.manifest_path)
-            capture_rows(cap)  # Existing shape, ordinal, count and logical-identity checks.
+            try:
+                cap = load_score_capture(ref.manifest_path)
+                records = validate_transfers(cap)
+            except (ValueError, KeyError, OSError) as error:
+                lines.append(f'SOURCE AUDIT FAILED {ref.manifest_path}: {error}')
+                continue
             a,g = cap.arrays,cap.manifest['geometry']
             for row in range(g['batch']):
                 layout = a['pre.logical_ids'][row]
@@ -79,7 +105,6 @@ def main():
                 tail = set(range(lo,hi)); local=hot|tail
                 reserved = hot & set(map(int,layout[a['pre.lru_slots'][row]]))
                 demand = set(map(int,layout[a['post.topk'][row]].reshape(-1)))
-                records = a['post.prefetch_records']
                 tokens = list(map(int,records[records[:,0]==row,2]))
                 counts = Counter(tokens)
                 # Exclusive classes; ABC has precedence over reserved hot.
@@ -97,8 +122,8 @@ def main():
         for number, selected in by_round.items():
             sums=[sum(r[i] for r in selected) for i in range(3,len(headers))]
             lines.append(diagnostic_table(f'Original capture round={number}: batch total',headers[3:],[sums]))
-    output=path.parent/'prefetch_hot_audit.log'
-    output.write_text('\n\n'.join(lines)+'\n')
+    with output.open('a') as stream:
+        stream.write('\n\n'.join(lines)+'\n')
     print('\n\n'.join(lines));print(f'Saved: {output}')
 
 
