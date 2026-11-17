@@ -2,6 +2,7 @@
 """Independent torch_npu system traces; never part of headline timing."""
 
 import csv
+from decimal import Decimal, InvalidOperation
 import importlib
 import json
 import math
@@ -73,7 +74,7 @@ def profile_configurations(npu, metrics):
 
 
 def summarize_timeline(directory, artifacts):
-    """Read one canonical Chrome trace, avoiding duplicate CANN exports.
+    """Read one canonical device export, avoiding duplicate CANN exports.
 
     Chrome trace ts/dur values are microseconds (displayTimeUnit is a viewer
     preference). Intervals may overlap: neither kernel sums nor spans are an
@@ -83,6 +84,8 @@ def summarize_timeline(directory, artifacts):
     canonical = [row for row in candidates if Path(row["path"]).name == "trace_view.json"]
     if canonical:
         candidates = canonical
+    if not candidates:
+        return _csv_timeline(Path(directory), artifacts)
     if len(candidates) != 1:
         return dict(status="unavailable", reason="Expected one unambiguous device trace", candidates=candidates)
     path = directory / candidates[0]["path"]
@@ -104,6 +107,48 @@ def summarize_timeline(directory, artifacts):
         return dict(status="unavailable", reason=str(error), trace=str(path))
     if not kernels:
         return dict(status="unavailable", reason="No complete device kernel intervals", trace=str(path))
+    return _timeline_summary(path, kernels, "chrome_trace")
+
+
+def _csv_timeline(directory, artifacts):
+    candidates = [row for row in artifacts.get("csv_files", [])
+                  if Path(row["path"]).name == "kernel_details.csv"]
+    canonical = [row for row in candidates if "ASCEND_PROFILER_OUTPUT" in Path(row["path"]).parts]
+    candidates = canonical or candidates
+    if len(candidates) != 1:
+        return dict(status="unavailable", reason="Expected one unambiguous kernel_details.csv",
+                    candidates=candidates)
+    path = directory / candidates[0]["path"]
+    try:
+        kernels = []
+        with path.open(newline="", encoding="utf-8-sig") as source:
+            reader = csv.DictReader(source)
+            required = {"Name", "Start Time(us)", "Duration(us)"}
+            if not required <= set(reader.fieldnames or []):
+                raise ValueError("Unrecognized kernel_details.csv columns")
+            for row in reader:
+                start, duration = Decimal(row["Start Time(us)"].strip()), Decimal(row["Duration(us)"].strip())
+                if not (start.is_finite() and duration.is_finite() and duration > 0):
+                    continue
+                kernels.append(dict(name=row["Name"].strip(), start_us=start, duration_us=float(duration),
+                                    device=row.get("Device_id", "").strip(),
+                                    wait_us=row.get("Wait Time(us)", "").strip(),
+                                    blocks=row.get("Block Num", "").strip()))
+        if not kernels:
+            raise ValueError("No complete device kernel intervals")
+        origin = min(row["start_us"] for row in kernels)
+        # Epoch microseconds can exceed 1e15. Subtract before float conversion;
+        # otherwise sub-microsecond launch gaps lose precision.
+        for row in kernels:
+            row["start_us"] = float(row["start_us"] - origin)
+    except (OSError, ValueError, TypeError, KeyError, InvalidOperation, csv.Error) as error:
+        return dict(status="unavailable", reason=str(error), trace=str(path))
+    result = _timeline_summary(path, kernels, "kernel_details.csv")
+    result["origin_us"] = str(origin)
+    return result
+
+
+def _timeline_summary(path, kernels, source_format):
 
     def envelope(rows):
         if not rows:
@@ -112,9 +157,11 @@ def summarize_timeline(directory, artifacts):
                     span_us=max(row["start_us"] + row["duration_us"] for row in rows)
                     - min(row["start_us"] for row in rows))
 
-    return dict(status="available", trace=str(path), units="us", included_in_headline_timing=False,
+    return dict(status="available", trace=str(path), source_format=source_format,
+                units="us", included_in_headline_timing=False,
                 scope="Independent profiler replay; overlapping kernel intervals must not be added",
                 device=envelope(kernels),
+                init=envelope([row for row in kernels if "v9_init_kernel" in row["name"]]),
                 li=envelope([row for row in kernels if "v9_li_kernel" in row["name"]]),
                 streaming=envelope([row for row in kernels if "v9_streaming_resolve_update" in row["name"]]),
                 kernels=kernels)
@@ -161,6 +208,10 @@ def inspect_artifacts(directory, metric):
             try:
                 with path.open(newline="", encoding="utf-8-sig") as source:
                     reader = csv.DictReader(source)
+                    entry["kernel_timing_schema"] = (
+                        path.name == "kernel_details.csv"
+                        and {"Name", "Start Time(us)", "Duration(us)"} <= set(reader.fieldnames or ())
+                    )
                     columns = [
                         name for name in reader.fieldnames or () if any(token in name.lower() for token in tokens)
                     ]
@@ -183,7 +234,8 @@ def inspect_artifacts(directory, metric):
             except (OSError, ValueError, csv.Error) as error:
                 entry["inspection_error"] = str(error)
             tables.append(entry)
-    device_events = any(entry.get("device_events", 0) for entry in traces)
+    device_events = (any(entry.get("device_events", 0) for entry in traces)
+                     or any(entry.get("kernel_timing_schema", False) for entry in tables))
     counters = metric == "none" or any(entry["counter_columns_with_values"] for entry in tables)
     return dict(
         status="exports_present_review_required"
