@@ -63,6 +63,7 @@ void producerCalls(Tensor<uint32_t> indicesOutLocal_,Tensor<uint32_t> incrementa
  uint32_t residentCount=16384,begin=129024,query=0;
  uint32_t incrementalBegin_=16384,incrementalReverseBegin_=16384,incrementalReverseEnd_=129024;
  uint32_t incrementalTailBegin_=129024,incrementalTailEnd_=129536;
+ auto offsets=incrementalOffsets_.GetPhyAddr();
  struct{uint32_t resident;}runtimeShape_{16384};
  PRODUCER_CALLS
 }

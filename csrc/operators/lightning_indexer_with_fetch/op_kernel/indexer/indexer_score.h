@@ -860,7 +860,7 @@ __simd_callee__ inline void ReduceSumFinalizeClassify(AscendC::MicroAPI::RegTens
 #if KVIP_INCREMENTAL_TOPK
     if (compactValues) {
 #if KVIP_INCREMENTAL_WINDOW
-        kvip_incremental::StoreWindow(regOut, compactValues, compactMask);
+        kvip_incremental::StoreWindow(regOut, compactValues, compactMask, threshold);
 #else
         kvip_incremental::Compact(regOut, threshold, compactValues, compactIds, compactOffset, compactMask);
 #endif

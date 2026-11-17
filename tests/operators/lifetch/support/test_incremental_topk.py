@@ -7,11 +7,12 @@ import pytest
 from test_recent_index import INDEXER, function
 
 
-@pytest.mark.parametrize("window", [0, 1])
-def test_actual_compact_pairs_padding_and_physical_remap(tmp_path, window):
+@pytest.mark.parametrize("window,prefilter", [(0, 0), (1, 0), (1, 1)])
+def test_actual_compact_pairs_padding_and_physical_remap(tmp_path, window, prefilter):
     text = (INDEXER / "incremental_topk_vector.h").read_text()
     methods = "\n".join(function(text, name) for name in (
         "__simd_callee__ inline void StoreWindow(",
+        "template<bool positions>\n__simd_vf__ inline void PackWindow(",
         "__simd_callee__ inline void Compact(",
         "__simd_vf__ inline void ZeroTail(",
         "__simd_vf__ inline void BroadcastThreshold(",
@@ -101,14 +102,26 @@ int main(){
   // Execute actual fixed-address store with poisoned neighbors and AR. It
   // must overwrite all 128 lanes, leave AR unchanged, and preserve guards.
   score.fill(0xbeef); ar=0x123456;
-  StoreWindow(input,score.data()+64,valid|(lo<<8)|(hi<<16));
+  StoreWindow(input,score.data()+64,valid|(lo<<8)|(hi<<16),&threshold);
   for(unsigned i=0;i<256;++i){
    unsigned j=i-64;
    uint16_t expected=i>=64&&i<192 ?
-     (j<valid&&(j<lo||j>=hi) ? input.v[j] : 0) : 0xbeef;
+     (j<valid&&(j<lo||j>=hi)&&(!KVIP_INCREMENTAL_PREFILTER||input.v[j]>threshold) ? input.v[j] : 0) : 0xbeef;
    assert(score[i]==expected);
   }
   assert(ar==0x123456);
+ }
+ // Pack full/dense/empty windows without per-tile scalar counts. The 2048
+ // boundary is a storage capacity, not a limit on accepted candidates.
+ for(unsigned count:{0U,1U,127U,128U,2047U,2048U,2049U,16383U,16384U}){
+  std::vector<uint16_t> raw(16384,0),packedScores(16384+128,0xbeef),packedOffsets(16384+128,0xbeef);
+  std::vector<unsigned> order(16384);for(unsigned i=0;i<16384;++i)order[i]=i;
+  std::shuffle(order.begin(),order.end(),gen);
+  for(unsigned i=0;i<count;++i)raw[order[i]]=uint16_t(1+gen()%65535);
+  PackWindow<false>(raw.data(),packedScores.data(),16384);assert(ar==2*count);
+  PackWindow<true>(raw.data(),packedOffsets.data(),16384);assert(ar==2*count);
+  unsigned n=0;for(unsigned i=0;i<16384;++i)if(raw[i]){assert(packedScores[n]==raw[i]&&packedOffsets[n]==i);++n;}
+  for(unsigned i=n;i<packedScores.size();++i)assert(packedScores[i]==0xbeef&&packedOffsets[i]==0xbeef);
  }
  std::array<uint16_t,4096> values;values.fill(0xffff);
  for(unsigned n=2048;n<4096;++n){
@@ -121,11 +134,16 @@ int main(){
  std::array<uint32_t,2048> ids,old,flags,selected;std::array<uint16_t,2048> offsets;
  for(unsigned i=0;i<2048;++i){ids[i]=i%2?2048+i:i;old[i]=i+3;offsets[i]=uint16_t(2*i);}
  for(threadIdx.x=0;threadIdx.x<256;++threadIdx.x)Remap(ids.data(),old.data(),offsets.data(),20000,16384,129024,0,0,0,0);
- for(unsigned i=0;i<2048;++i){unsigned token=20000+(KVIP_INCREMENTAL_WINDOW?i:2*i);unsigned physical=16384+129024-2048-(token&~2047U)+(token&2047U);assert(ids[i]==(i%2?(physical|kNeedsFetch):old[i]));flags[i]=i%3==0;}
+ for(unsigned i=0;i<2048;++i){unsigned token=20000+((KVIP_INCREMENTAL_WINDOW&&!KVIP_INCREMENTAL_PREFILTER)?i:2*i);unsigned physical=16384+129024-2048-(token&~2047U)+(token&2047U);assert(ids[i]==(i%2?(physical|kNeedsFetch):old[i]));flags[i]=i%3==0;}
  for(unsigned i=0;i<2048;++i)ids[i]=(ids[i]&kIdMask)|(flags[i]?kNeedsFetch:0);
  CompactIds(ids.data(),selected.data());unsigned n=0;
  for(unsigned i=0;i<2048;++i)if(flags[i])assert(selected[n++]==(ids[i]&kIdMask));assert(ar==4*n);
  UntagIds(ids.data(),selected.data());for(unsigned i=0;i<2048;++i)assert(selected[i]==(ids[i]&kIdMask));
+#if KVIP_INCREMENTAL_PREFILTER
+ for(unsigned i=0;i<2048;++i)ids[i]=2048+i;
+ for(threadIdx.x=0;threadIdx.x<256;++threadIdx.x)Remap(ids.data(),old.data(),nullptr,20000,16384,129024,0,0,0,0);
+ for(unsigned i=0;i<2048;++i){unsigned token=20000+i;assert(ids[i]==((16384+129024-2048-(token&~2047U)+(token&2047U))|kNeedsFetch));}
+#endif
  for(unsigned i=0;i<2048;++i)ids[i]=i+16000;
  for(threadIdx.x=0;threadIdx.x<256;++threadIdx.x)Remap(ids.data(),old.data(),offsets.data(),0,0,0,16384,128000,0,0);
  for(unsigned i=0;i<2048;++i)assert(ids[i]==(i+16000<16384?i+16000:128000+i+16000-16384));
@@ -134,6 +152,6 @@ int main(){
     source = tmp_path / "incremental.cpp"
     source.write_text(model)
     binary = source.with_suffix("")
-    subprocess.run(["c++", "-std=c++17", "-O1", "-fsanitize=address,undefined", f"-DKVIP_INCREMENTAL_WINDOW={window}",
+    subprocess.run(["c++", "-std=c++17", "-O1", "-fsanitize=address,undefined", f"-DKVIP_INCREMENTAL_WINDOW={window}", f"-DKVIP_INCREMENTAL_PREFILTER={prefilter}",
                     str(source), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=30)

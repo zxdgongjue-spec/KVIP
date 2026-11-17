@@ -10,6 +10,12 @@
 #ifndef KVIP_INCREMENTAL_REGISTER
 #define KVIP_INCREMENTAL_REGISTER 0
 #endif
+#ifndef KVIP_INCREMENTAL_PREFILTER
+#define KVIP_INCREMENTAL_PREFILTER 0
+#endif
+#if KVIP_INCREMENTAL_PREFILTER && !KVIP_INCREMENTAL_REGISTER
+#error "Window prefilter requires register window selection"
+#endif
 #if KVIP_INCREMENTAL_WINDOW && !KVIP_INCREMENTAL_TOPK
 #error "Window staging requires incremental TopK"
 #endif

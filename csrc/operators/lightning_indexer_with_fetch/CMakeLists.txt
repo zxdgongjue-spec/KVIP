@@ -9,6 +9,10 @@ set(KVAF_INCLUDE "" CACHE PATH "KVAF device interface headers")
 option(KVIP_INCREMENTAL_TOPK "Producer compact pairs, incremental TopK and direct pending lists" OFF)
 option(KVIP_INCREMENTAL_WINDOW "Fixed-address per-window incremental score staging" OFF)
 option(KVIP_INCREMENTAL_REGISTER "Register Kth for incremental window selection" OFF)
+option(KVIP_INCREMENTAL_PREFILTER "Fixed tile filtering and boundary-only sparse compaction" OFF)
+if(KVIP_INCREMENTAL_PREFILTER AND NOT KVIP_INCREMENTAL_REGISTER)
+  message(FATAL_ERROR "Window prefilter requires register window selection")
+endif()
 if(KVIP_INCREMENTAL_WINDOW AND NOT KVIP_INCREMENTAL_TOPK)
   message(FATAL_ERROR "Window staging requires incremental TopK")
 endif()
@@ -73,6 +77,7 @@ ascendc_include_directories(v9_kernel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/includ
 ascendc_compile_options(v9_kernel PRIVATE -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WORKER=$<BOOL:${KVIP_OUTPUT_WORKER}> -DKVIP_FUSE_QUERY_WORK=$<BOOL:${KVIP_FUSE_QUERY_WORK}> -O2 -g --cce-auto-sync=off
   -DKVIP_INCREMENTAL_WINDOW=$<BOOL:${KVIP_INCREMENTAL_WINDOW}>
   -DKVIP_INCREMENTAL_REGISTER=$<BOOL:${KVIP_INCREMENTAL_REGISTER}>
+  -DKVIP_INCREMENTAL_PREFILTER=$<BOOL:${KVIP_INCREMENTAL_PREFILTER}>
   -DKVIP_INCREMENTAL_TOPK=$<BOOL:${KVIP_INCREMENTAL_TOPK}>
   -DKVIP_REVERSE_COLD=$<BOOL:${KVIP_REVERSE_COLD}>
   -DKVIP_ROLLING_THRESHOLD=$<BOOL:${KVIP_ROLLING_THRESHOLD}>
@@ -109,3 +114,5 @@ target_compile_definitions(v9_bridge PRIVATE KVIP_ROLLING_BOUNDARY=$<BOOL:${KVIP
 target_compile_definitions(v9_bridge PRIVATE KVIP_INCREMENTAL_TOPK=$<BOOL:${KVIP_INCREMENTAL_TOPK}>)
 
 target_compile_definitions(v9_bridge PRIVATE KVIP_INCREMENTAL_WINDOW=$<BOOL:${KVIP_INCREMENTAL_WINDOW}> KVIP_INCREMENTAL_REGISTER=$<BOOL:${KVIP_INCREMENTAL_REGISTER}>)
+
+target_compile_definitions(v9_bridge PRIVATE KVIP_INCREMENTAL_PREFILTER=$<BOOL:${KVIP_INCREMENTAL_PREFILTER}>)

@@ -4,6 +4,7 @@
 #include "cold_scan.h"
 #include "rolling_threshold.h"
 extern "C" uint32_t kvip_incremental_window() { return KVIP_INCREMENTAL_WINDOW; }
+extern "C" uint32_t kvip_incremental_prefilter() { return KVIP_INCREMENTAL_PREFILTER; }
 extern "C" uint32_t kvip_incremental_register() { return KVIP_INCREMENTAL_REGISTER; }
 extern "C" uint32_t kvip_incremental_topk() { return KVIP_INCREMENTAL_TOPK; }
 extern "C" uint32_t kvip_rolling_boundary() { return KVIP_ROLLING_BOUNDARY; }

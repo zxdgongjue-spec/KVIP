@@ -58,6 +58,27 @@
         // A prior tile may still be copying the progress table from scoreOut.
         SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
         PipeBarrier<PIPE_V>();
+        auto offsets = reinterpret_cast<__ubuf__ uint16_t*>(incrementalOffsets_.GetPhyAddr());
+#if KVIP_INCREMENTAL_PREFILTER
+        auto packed = topkSharedTmpLocal_.template ReinterpretCast<uint16_t>();
+        auto window = reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_[2048].GetPhyAddr());
+        kvip_incremental::PackWindow<false>(window,
+            reinterpret_cast<__ubuf__ uint16_t*>(packed.GetPhyAddr()), incrementalCount_);
+        const uint32_t admitted = GetSpr<SpecialPurposeReg::AR>() / sizeof(uint16_t);
+        if (!admitted) {
+            incrementalCount_ = 0;
+            return; // K scores/IDs and threshold are already exact; retry list still publishes.
+        }
+        if (admitted <= kvip_incremental::kChunk) {
+            PipeBarrier<PIPE_V>();
+            kvip_incremental::PackWindow<true>(window, offsets, incrementalCount_);
+            PipeBarrier<PIPE_V>();
+            DataCopy(mrgValueLocal_[2048], packed, QLICommon::Align(admitted, uint32_t(16)));
+            incrementalCount_ = admitted;
+        } else {
+            offsets = nullptr; // Preserve all fixed positions; never truncate a dense window.
+        }
+#endif
         const uint32_t size = QLICommon::Align(2048 + incrementalCount_, uint32_t(256));
 #if KVIP_INCREMENTAL_WINDOW
         // Tiles write fixed positions after the retained K. Every position is
@@ -89,7 +110,7 @@
         Simt::VF_CALL<kvip_incremental::Remap>(Simt::Dim3{256,1,1},
             reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(incrementalIds_.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ uint16_t*>(incrementalOffsets_.GetPhyAddr()),
+            offsets,
             incrementalBegin_,incrementalReverseBegin_,incrementalReverseEnd_,0,0,incrementalTailBegin_,incrementalTailEnd_);
         SaveIncremental(bank);
         incrementalCount_ = 0;

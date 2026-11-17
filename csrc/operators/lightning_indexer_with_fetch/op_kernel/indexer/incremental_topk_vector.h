@@ -9,12 +9,13 @@ using namespace AscendC;
 using namespace AscendC::MicroAPI;
 
 // Fixed 128-lane destination, no compaction count or scalar readback. Only
-// causally invalid/already-seeded positions become zero. Lower scores need no
-// extra cutoff comparison: the retained K precede the window and the exact
-// boundary selection removes them. Even at Kth=0, retained valid zeros fill
-// all remaining ties before any masked/padded zero could enter the result.
+// causally invalid/already-seeded positions become zero in the dense control.
+// The prefilter additionally zeros scores <= the window-start Kth; the retained
+// K precede the window, so those scores cannot improve its exact selection.
+// Even at Kth=0, retained valid zeros fill all remaining ties before any
+// masked/padded zero could enter the result.
 __simd_callee__ inline void StoreWindow(RegTensor<uint16_t>& score,
-    __ubuf__ uint16_t* output, uint32_t laneMask) {
+    __ubuf__ uint16_t* output, uint32_t laneMask, __ubuf__ uint16_t* cutoff) {
     auto all = CreateMask<uint16_t, MaskPattern::ALL>();
     RegTensor<uint16_t> zero, value;
     RegTensor<int16_t> lanes;
@@ -26,9 +27,47 @@ __simd_callee__ inline void StoreWindow(RegTensor<uint16_t>& score,
     CompareScalar<uint16_t, CMPMODE::GE>(right, index, uint16_t((laneMask >> 16) & 255), all);
     MaskOr(outside, left, right, all);
     MaskAnd(valid, valid, outside, all);
+#if KVIP_INCREMENTAL_PREFILTER
+    // Current window's Kth is fixed until its boundary. Keep only strict
+    // improvements: existing K precede new equal-score entries in tie order.
+    RegTensor<uint16_t> threshold;
+    MaskReg admitted;
+    LoadAlign<uint16_t, LoadDist::DIST_BRC_B16>(threshold, cutoff);
+    Compare<uint16_t, CMPMODE::GT>(admitted, score, threshold, all);
+    MaskAnd(valid, valid, admitted, all);
+#endif
     Duplicate(zero, uint16_t(0));
     Select(value, score, zero, valid);
     StoreAlign(output, value, all);
+}
+
+// One uninterrupted VF over the completed window. Scalar code reads AR
+// only after the score pass, never after a 128-lane tile. Scores first go to
+// the selector's idle scratch (>=32 KiB); offsets are produced only when the
+// admitted count fits the 2048-entry persistent offset bank. A dense window
+// keeps the original fixed-position scores, without truncation.
+template<bool positions>
+__simd_vf__ inline void PackWindow(__ubuf__ uint16_t* input,
+    __ubuf__ uint16_t* output, uint32_t count) {
+    auto all = CreateMask<uint16_t, MaskPattern::ALL>();
+    RegTensor<uint16_t> value, packed;
+    RegTensor<int16_t> offset;
+    MaskReg admitted;
+    UnalignRegForStore store;
+    ClearSpr<AscendC::SpecialPurposeReg::AR>();
+    for (uint16_t base = 0; base < count; base += 128) {
+        LoadAlign(value, input + base);
+        CompareScalar<uint16_t, CMPMODE::GT>(admitted, value, uint16_t(0), all);
+        if constexpr (positions) {
+            Arange(offset, int16_t(base));
+            Squeeze<uint16_t, AscendC::MicroAPI::GatherMaskMode::STORE_REG>(
+                packed, reinterpret_cast<RegTensor<uint16_t>&>(offset), admitted);
+        } else {
+            Squeeze<uint16_t, AscendC::MicroAPI::GatherMaskMode::STORE_REG>(packed, value, admitted);
+        }
+        StoreUnAlign<uint16_t, PostLiteral::POST_MODE_UPDATE>(output, packed, store);
+    }
+    StoreUnAlignPost(output, store);
 }
 
 // Called with the live score register inside the existing scoring VF. No
@@ -95,7 +134,9 @@ inline void Remap(__ubuf__ uint32_t* selected, __ubuf__ uint32_t* previous,
         } else if (position < kTop) {
             selected[i] = previous[position];
         } else {
-#if KVIP_INCREMENTAL_WINDOW
+#if KVIP_INCREMENTAL_PREFILTER
+            uint32_t token = scanBegin + (offsets ? offsets[position - kTop] : position - kTop);
+#elif KVIP_INCREMENTAL_WINDOW
             uint32_t token = scanBegin + position - kTop;
 #else
             uint32_t token = scanBegin + offsets[position - kTop];
