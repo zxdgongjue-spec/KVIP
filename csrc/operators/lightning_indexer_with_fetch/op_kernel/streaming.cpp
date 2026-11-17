@@ -159,7 +159,12 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
   ,unpack,outputValid,shape.batch,b,FinalPtr(ctl[kOutputMasksOffset]),outputEnabled && !KVIP_OUTPUT_WORKER
  );
  PipeBarrier<PIPE_V>();
- if(profile)ticks[2]=GetSystemCycle();
+ if(profile){
+  // PIPE_V orders the following vector work, but does not wait on scalar
+  // control.  Join the merge before recording its profiling boundary.
+  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+  ticks[2]=GetSystemCycle();
+ }
  Simt::VF_CALL<StagedInitializeReady>(Simt::Dim3{512,1,1},FinalPtr(selected),FinalPtr(loc),FinalPtr(keys),FinalPtr(ranks),FinalPtr(ctl));
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  if(profile)ticks[3]=GetSystemCycle();
