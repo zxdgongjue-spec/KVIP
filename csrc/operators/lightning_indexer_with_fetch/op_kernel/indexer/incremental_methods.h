@@ -12,7 +12,16 @@ __aicore__ inline void TagResident(uint32_t query) {
         tailEnd=Min(tailEnd,Min(runtimeShape_.history,tailBegin+capacity));}
     LocalTensor<uint32_t> hot,reserved;uint32_t chunk;
     if(streamingTopkOnly_){hot=streamingValid_;reserved=streamingReserved_;chunk=8192;}
-    else {PipeBarrier<PIPE_ALL>();hot=resMm1UB_.template ReinterpretCast<uint32_t>();reserved=mrgValueLocal_.template ReinterpretCast<uint32_t>();chunk=4096;}
+    else {
+        PipeBarrier<PIPE_ALL>();
+        // ProcessVec1 has returned the MM result banks to the AIC. Fixpipe
+        // may already write the next tile there while resident TopK runs;
+        // an AIV pipe barrier cannot reclaim those cross-core buffers.
+        // TopK is finished here, so its scratch is private until tagging ends.
+        hot=topkSharedTmpLocal_;
+        reserved=mrgValueLocal_.template ReinterpretCast<uint32_t>();
+        chunk=4096;
+    }
     GlobalTensor<uint32_t> h,r;
     if(ctx->hotValid)h.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*runtimeShape_.resident);
     if(ctx->reservedHot)r.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->reservedHot)+uint64_t(b)*runtimeShape_.resident);
@@ -38,6 +47,9 @@ bool mappedExport_=false;uint32_t mappedValid_=0;
 bool exportWindowCold_=false;bool rankTrace_=false;
 uint32_t rankedEpoch_=0;
 __aicore__ inline void ExportWindowCold(uint32_t query) {
+    // Even a window with zero newly compacted scores exports the saved TopK.
+    // Its output bank may still feed the preceding Q's asynchronous DMA.
+    JoinColdOutput();
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     uint32_t valid=ctx->queryEnds?reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)[query]:runtimeShape_.history;
     if(valid>runtimeShape_.history)valid=runtimeShape_.history;
