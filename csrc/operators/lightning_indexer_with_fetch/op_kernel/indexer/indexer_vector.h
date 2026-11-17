@@ -261,6 +261,17 @@ private:
             if (validEnd > runtimeShape_.resident) validEnd = runtimeShape_.resident;
             DataCopy(reservedChunk.template ReinterpretCast<uint32_t>(), victims, 2048);
             SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+#if !V9_UBMEM
+            if (recentMerged && streamingWorkspace_) {
+                Simt::VF_CALL<rotating::GatherVictimScoresUb>(Simt::Dim3{256,1,1},
+                    reinterpret_cast<__ubuf__ uint32_t*>(reservedChunk.GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ uint32_t*>(scoreChunk.GetPhyAddr()),
+                    reinterpret_cast<const __ubuf__ uint16_t*>(mrgValueLocal_.GetPhyAddr()),
+                    reinterpret_cast<const __gm__ uint32_t*>(scoreGm.GetPhyAddr()) + scoreRow *
+                        QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_) / 2,
+                    runtimeShape_.resident);
+            } else
+#endif
             Simt::VF_CALL<rotating::GatherVictimScores>(Simt::Dim3{256,1,1},
                 reinterpret_cast<__ubuf__ uint32_t*>(reservedChunk.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(scoreChunk.GetPhyAddr()),
