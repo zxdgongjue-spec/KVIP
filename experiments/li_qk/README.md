@@ -49,6 +49,8 @@ Q1 使用现有 Q2 的最小 M/Fixpipe 物理对齐布局，actual qlen=1。Cube
 
 ## 构建与 A5 执行
 
+宿主机同步入口为`sync_a5_host.sh`。在A5容器外执行`bash sync_a5_host.sh --no-proxy`，脚本自动创建固定目录`/tmp/li_qk_sync`，同步MR14，生成启动脚本和离线包，用`docker cp`复制到目标容器，并在目标容器内验证文件。无需查找临时目录后缀。宿主机也无法联网时，使用`--offline-bundle /path/to/li_qk_mr14_offline.bundle`导入已下载的代码包。`--container`可指定实际容器；同步完成后按打印的两条命令进入该容器并运行实验。
+
 一键脚本为`run_a5.sh`，在原A5容器与Python环境中执行。默认拉取MR14源分支并固定实验提交`0c1d483`，建立新worktree，检查依赖，构建，执行7点，汇总并打包；失败停止并打包已生成日志。原checkout和每次结果均保留。CANN路径优先从当前环境识别；KVAF优先使用原checkout的`third_party/KVAF`。
 
 ```bash
