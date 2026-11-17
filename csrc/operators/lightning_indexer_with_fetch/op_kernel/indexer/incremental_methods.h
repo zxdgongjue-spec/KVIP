@@ -240,6 +240,7 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
     uint32_t ends[2]={end0,end1};
     rankEnd0_=prior[0];rankEnd1_=prior[1];
     if (!source) return;
+    const uint32_t callsBefore=incrementalCalls_;
     mappedExport_=false;
     if (end0<=prior[0] && (!half || end1<=prior[1])) {
         JoinColdOutput();
@@ -431,10 +432,15 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
     PreloadIncremental(half);
     FlushIncremental(packed,packBase,false);
     PipeBarrier<PIPE_V>();
-    if(!mappedExport_)lifetch_incremental::Minimum(reinterpret_cast<__ubuf__ uint16_t*>(scoreOutLocal_.GetPhyAddr()),
-        reinterpret_cast<__ubuf__ uint32_t*>(topkSharedTmpLocal_.GetPhyAddr()));
-    SetFlag<HardEvent::V_S>(EVENT_ID5);WaitFlag<HardEvent::V_S>(EVENT_ID5);
-    uint32_t threshold=topkSharedTmpLocal_.template ReinterpretCast<uint16_t>().GetValue(0);
+    // A nonzero cutoff already describes the unchanged TopK when this
+    // window did not flush any candidates. Final TopK keeps its old path.
+    uint32_t threshold=cutoff;
+    if(!exportWindowCold_ || mappedExport_ || !cutoff || incrementalCalls_!=callsBefore) {
+        if(!mappedExport_)lifetch_incremental::Minimum(reinterpret_cast<__ubuf__ uint16_t*>(scoreOutLocal_.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(topkSharedTmpLocal_.GetPhyAddr()));
+        SetFlag<HardEvent::V_S>(EVENT_ID5);WaitFlag<HardEvent::V_S>(EVENT_ID5);
+        threshold=topkSharedTmpLocal_.template ReinterpretCast<uint16_t>().GetValue(0);
+    }
     rankEnd0_=prior[0];rankEnd1_=prior[1];
     if(exportWindowCold_)ExportWindowCold(query);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
