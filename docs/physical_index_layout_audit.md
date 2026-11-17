@@ -77,3 +77,18 @@ its own investigation. No live service or generated future query is invented.
 transfer and state summaries. Mean and median are separate; conservative gain
 uses the slower reverse result and faster forward result. Both drift references
 are reported.
+
+## Follow-up: rolling/refilter execution cost
+
+For the cost study use `--cold-windows 8` with variants `forward reverse
+reverse-window-in reverse-window-reuse reverse-window-fast reverse-end
+forward-end`. Do not pass `--compare-layout`: that audit intentionally accepts
+only its four unchanged direction controls. All cases still run the existing
+TopK/threshold/Index/KV oracle. `scan_report --require-fast` rejects a missing
+rolling oracle or geometry other than resident plus eight cold windows.
+
+The original and reverse-only controls bracket the added work; full-window,
+seed-reuse and packed-byte/visibility-first variants isolate its incremental
+cost. All allocations and restored inputs are shared through the existing
+replay context. No vLLM service is required. One optional diagnostic replay is
+reported in raw role cycles separately from the uninstrumented mean/median.

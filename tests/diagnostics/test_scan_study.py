@@ -7,10 +7,10 @@ import numpy as np
 import pytest
 
 from kvip.diagnostics import replay, replay_measure, scan_report, scan_options
-from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, budgets_for, options_for, validate_options
+from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, budgets_for, options_for, validate_options
 
 
-@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS])
+@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS])
 def test_scan_study_reuses_one_arena_and_delivers_independent_options(monkeypatch, variants):
     args = SimpleNamespace(study="scan-order", mode="fused", transport="urma",
                            threshold_policy="recent", scan_variants=list(variants))
@@ -34,7 +34,7 @@ def test_scan_study_reuses_one_arena_and_delivers_independent_options(monkeypatc
     assert calls == [(name, options_for(name), budgets_for(name)) for name in variants]
 
 
-@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS])
+@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS])
 def test_actual_command_line_accepts_scan_variants(tmp_path, variants):
     args = replay.arguments([
         "--snapshot", str(tmp_path / "input"), "--build-dir", str(tmp_path / "build"),
@@ -69,9 +69,9 @@ def test_report_uses_full_chain_and_keeps_mean_and_median_separate(tmp_path, cap
 
 def test_rolling_experiment_does_not_change_budgets_or_enable_pipeline_options():
     assert {budgets_for(name) for name in ROLLING_VARIANTS} == {(512, 64)}
-    assert options_for("reverse-refilter") == dict(reverse_cold=True, rolling_threshold=True, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False, compact_out_of_place=False, rolling_reuse_seed=False)
+    assert options_for("reverse-refilter") == dict(reverse_cold=True, rolling_threshold=True, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False, compact_out_of_place=False, rolling_reuse_seed=False, rolling_fast_path=False)
     with pytest.raises(ValueError, match="requires rolling"):
-        validate_options(dict(reverse_cold=True, rolling_threshold=False, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False, compact_out_of_place=False, rolling_reuse_seed=False))
+        validate_options(dict(reverse_cold=True, rolling_threshold=False, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False, compact_out_of_place=False, rolling_reuse_seed=False, rolling_fast_path=False))
 
 
 def test_rolling_reference_uses_unique_seed_and_only_scanned_causal_positions():
@@ -389,3 +389,33 @@ def test_seed_variants_exclude_negative_controls_and_report_caps(tmp_path, capsy
     assert "cap=seed_byte_end" in output
     with pytest.raises(ValueError, match="Economy controls"):
         scan_report.load_report(path, require_economy=True)
+
+
+def test_fast_path_controls_and_eight_window_report(tmp_path, capsys):
+    flags = options_for("reverse-window-fast")
+    assert flags["rolling_fast_path"] and flags["rolling_reuse_seed"] and flags["refilter_safe"]
+    assert not flags["refilter_refill"] and not flags["compact_out_of_place"]
+    assert {budgets_for(n) for n in FAST_VARIANTS} == {(512, 64)}
+    with pytest.raises(ValueError, match="seed histogram"):
+        validate_options(dict(flags, rolling_reuse_seed=False))
+    data = rolling_report(tmp_path)
+    template = data["cases"]["forward"]
+    data["execution_order"] = list(FAST_VARIANTS)
+    data["cases"] = {n: json.loads(json.dumps(template)) for n in FAST_VARIANTS}
+    for name, case in data["cases"].items():
+        case["geometry"]["rounds"] = 9
+        case["reads_samples"][0].update(prefetch=20, unused_prefetch=10)
+        case["rolling_threshold_check"].update(scope="all_scanned_windows", cap_mode="seed_byte_end")
+        case["native_diagnostics"] = {"samples": [{"metrics": {"producer_span": {
+            "status": "available", "median_cycles": 100, "max_cycles": 200}}}]}
+    path = tmp_path / "result.json"
+    path.write_text(json.dumps(data))
+    scan_report.report(path, require_fast=True)
+    output = capsys.readouterr().out
+    assert "reverse-window-reuse->reverse-window-fast" in output
+    assert "PROFILE reverse-window-fast cycles_p50/max producer=100/200" in output
+    assert "REVERSE_NONREGRESSION KEEP" in output
+    data["cases"]["forward"]["geometry"]["rounds"] = 8
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="eight cold windows"):
+        scan_report.load_report(path, require_fast=True)

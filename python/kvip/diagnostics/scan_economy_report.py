@@ -24,6 +24,13 @@ def useful_prefetch(case):
 def report(cases, order):
     original, drift = control(cases, "forward")
     reverse, reverse_drift = control(cases, "reverse")
+    if "reverse-window-fast" in cases:
+        conservative = {
+            key: 100 * (1 - max(cases[n]["timing"][key] for n in ("reverse", "reverse-end")) / original[key])
+            for key in ("mean_us", "p50_us")
+        }
+        print("REVERSE_NONREGRESSION " + ("KEEP" if min(conservative.values()) >= 0 else "KEEP_FORWARD") +
+              f" mean/p50={conservative['mean_us']:+.2f}/{conservative['p50_us']:+.2f}%")
     print("BASELINE unchanged_forward; headline gains use faster first/end independently for mean/p50")
     for name, reference, change in (("forward", original, drift), ("reverse", reverse, reverse_drift)):
         print(f"CONTROL {name} mean_us={reference['mean_us']:.3f} p50_us={reference['p50_us']:.3f} "
@@ -35,7 +42,11 @@ def report(cases, order):
         g = gain(t, original)
         print(f"{name:23} {t['mean_us']:8.3f} {t['p50_us']:8.3f} {g['mean_us']:10.2f} {g['p50_us']:9.2f} "
               f"{useful_prefetch(case):10.1f} {b['repair']/2**20:10.4f} {b['waste']/2**20:9.4f} {b['total']/2**20:9.4f}")
-    if "reverse-first-reuse" in cases:
+    if "reverse-window-fast" in cases:
+        pairs = (("reverse", "reverse-window-in"),
+                 ("reverse-window-in", "reverse-window-reuse"),
+                 ("reverse-window-reuse", "reverse-window-fast"))
+    elif "reverse-first-reuse" in cases:
         pairs = (("reverse", "reverse-first-in"), ("reverse-first-in", "reverse-first-reuse"),
                  ("reverse-window-in", "reverse-window-reuse"),
                  ("reverse-first-reuse", "reverse-window-reuse"))
@@ -58,7 +69,9 @@ def report(cases, order):
         g = gain(cases[name]["timing"], original)
         inc = gain(cases[name]["timing"], reverse)
         passes = all(g[k] > max(1.0, abs(drift[k])) for k in g)
-        if name != "reverse":
+        if name == "reverse" and "reverse-window-fast" in cases:
+            passes = min(conservative.values()) >= 0
+        elif name != "reverse":
             passes &= all(inc[k] > max(1.0, abs(reverse_drift[k])) for k in inc)
         if passes:
             candidates.append(name)
@@ -74,6 +87,20 @@ def report(cases, order):
             print(f"ROLLING {name} {check['status']} scope={check.get('scope','all_scanned_windows')} "
                   f"last_key_gap={check['mean_final_gap_keys']:.3f} capped={check['capped_queries']} "
                   f"cap={check.get('cap_mode','seed_plus_255')}")
+    if "reverse-window-fast" in cases:
+        for name in order:
+            for sample in cases[name].get("native_diagnostics", {}).get("samples", []):
+                fields = []
+                for label, key in (("producer", "producer_span"), ("post", "post_active"),
+                                   ("join", "final_prefetch_join"), ("drain", "cq_drain")):
+                    metric = sample["metrics"].get(key, {})
+                    if metric.get("status") == "available":
+                        fields.append(f"{label}={metric['median_cycles']:.0f}/{metric['max_cycles']}")
+                print(f"PROFILE {name} cycles_p50/max " + " ".join(fields))
+        print("PROFILE_SCOPE separate instrumented replay; overlapping cycles, not additive graph time")
     print("DECISION " + ("retest_candidates="+",".join(candidates) if candidates else "keep_original_fused"))
     print("NOTE positive delta=more work/bytes; useful_pre includes all prefetch windows; no completion-overlap claim")
-    print("NOTE gates screen full graph mean AND median beyond repeat drift/1%; not statistical proof")
+    if "reverse-window-fast" in cases:
+        print("NOTE reverse gate requires nonregression only; new filtering must beat original AND reverse beyond drift/1%")
+    else:
+        print("NOTE gates screen full graph mean AND median beyond repeat drift/1%; not statistical proof")

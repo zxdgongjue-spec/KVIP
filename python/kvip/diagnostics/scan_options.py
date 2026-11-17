@@ -1,6 +1,6 @@
 """Independent URMA scan-order/admission experiment; no graph-route changes."""
 
-OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill", "compact_out_of_place", "rolling_reuse_seed")
+OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill", "compact_out_of_place", "rolling_reuse_seed", "rolling_fast_path")
 DEFAULT_VARIANTS = ("forward", "reverse", "forward-wide", "reverse-wide", "forward-end")
 VARIANTS = {name: ("reverse_cold",) if name.startswith("reverse") else () for name in DEFAULT_VARIANTS}
 ROLLING_VARIANTS = ("forward", "reverse", "reverse-roll", "reverse-refilter", "forward-refilter", "forward-end")
@@ -65,6 +65,10 @@ for _name in SEED_VARIANTS[2:6]:
         _flags += ("rolling_reuse_seed",)
     VARIANTS[_name] = _flags
 
+FAST_VARIANTS = ("forward", "reverse", "reverse-window-in", "reverse-window-reuse",
+                 "reverse-window-fast", "reverse-end", "forward-end")
+VARIANTS["reverse-window-fast"] = VARIANTS["reverse-window-reuse"] + ("rolling_fast_path",)
+
 
 def options_for(name):
     return {key: key in VARIANTS[name] for key in OPTIONS}
@@ -97,6 +101,8 @@ def validate_options(options):
         raise ValueError("First-window correction requires compact admission")
     if options["rolling_reuse_seed"] and not options["rolling_compact"]:
         raise ValueError("Seed reuse requires compact window accumulation")
+    if options["rolling_fast_path"] and not options["rolling_reuse_seed"]:
+        raise ValueError("Packed byte accumulation requires seed histogram reuse")
     if options["refilter_safe"] and not options["window_refilter"]:
         raise ValueError("Visibility-safe admission requires window refilter")
     if options["refilter_refill"] and not options["refilter_safe"]:
