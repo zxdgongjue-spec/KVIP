@@ -3560,6 +3560,9 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
     runtime = kvaf.NpuRuntime(str(build / 'bin/kvaf_execute_batch_get_kernels.o'), width, 128, **kwargs)
     state = graph = table = None
     pending = False
+    def replay_stage(label):
+        progress(directory.parent, f"REPLAY {'fused' if fused else 'serial'}: {label}")
+    replay_stage('transport initialization')
     try:
         block_bytes = 128 * width
         slot_bytes = ((block_bytes + 4095) // 4096 * 4096
@@ -3575,6 +3578,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
                               [block_bytes] * len(ids))
             stream.synchronize()
             pending = False
+        replay_stage('DDR Put completed; access table and binding')
         table = runtime.prepare_access_table(list(range(pages.page_count)))
         view = runtime.access_table_view(table, device='npu')
         indices = torch.from_numpy(pages.page_indices.reshape(-1).astype(np.int64)).to(device)
@@ -3597,6 +3601,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
                 prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024))
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
+        replay_stage('binding and initial inputs ready')
         checks = CorrectnessRecorder()
         def validate(inputs):
             nonlocal pending
@@ -3611,8 +3616,10 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
             else:
                 pending = False
         pending = True
+        replay_stage('first eager forward and device completion')
         state.forward()
         stream.synchronize()
+        replay_stage('first eager completed; correctness check')
         checks.check('eager', lambda: validate(initial))
         state.reset()
         stream.synchronize()
@@ -3620,6 +3627,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
         capture_stream = torch.npu.Stream()
         scope = state.lease.capture_scope() if fused else nullcontext()
         pending = True
+        replay_stage('graph capture')
         with scope:
             with torch.npu.graph(graph, stream=capture_stream):
                 state.forward()
@@ -3638,6 +3646,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
                 pending = True
                 graph.replay()
         graphs = {refs[0].source_round: TrackedGraph() for refs in sequence.rounds}
+        replay_stage('graph warmup and measurement')
         result = measure_sequence(torch, sequence, graphs, state.reset, state.prepare, validate,
                                   warmup=config.warmup, iterations=config.iterations, save=save)
         stream.synchronize()
