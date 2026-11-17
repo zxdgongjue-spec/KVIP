@@ -3,6 +3,8 @@
 #include "post_index_transport.h"
 #include "post_index_update.h"
 #include "post_index_prepare.h"
+#include "low_q4_outputs_mte.h"
+#include "post_index_finalize.h"
 
 namespace pipeline_ab {
 namespace post_index_tail {
@@ -47,7 +49,8 @@ __aicore__ inline void PublishPostFailure(__gm__ uint32_t* prefix, uint32_t row,
 // share one VF and finish before the collective pre-Post error barrier.
 template<bool BuildPrefix = false>
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
-inline void Pack(__gm__ Context* ctx, uint32_t b, uint32_t begin, uint32_t count,
+inline void Pack(__gm__ Context* ctx, __gm__ Args* args,
+                 uint32_t block, uint32_t cores, uint32_t b, uint32_t begin, uint32_t count,
                  uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3,
                  __gm__ uint32_t* eventSources, __gm__ uint32_t* eventDestinations,
                  uint32_t eventOffset, uint32_t resident, uint32_t history,
@@ -74,6 +77,11 @@ inline void Pack(__gm__ Context* ctx, uint32_t b, uint32_t begin, uint32_t count
     auto destinations = reinterpret_cast<__gm__ int32_t*>(ctx->destinations);
     auto addresses = reinterpret_cast<__gm__ uint64_t*>(ctx->fallbackAddresses);
     auto valid = reinterpret_cast<__gm__ uint8_t*>(ctx->fallbackValid);
+    auto row = reinterpret_cast<__gm__ Row*>(ctx->rows) + b;
+    auto tokenAddresses = reinterpret_cast<__gm__ uint64_t*>(row->addresses);
+    const uint32_t owner = ctx->rowOwners ?
+        asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners) + b) : b;
+    const uint64_t ownerBase = uint64_t(owner) * (ctx->outputStride ? ctx->outputStride : resident);
     for (uint32_t i = threadIdx.x; i < count; i += 256) {
         const uint32_t event = eventOffset + begin + i;
         uint32_t src = asc_ldcg(eventSources + event);
@@ -88,27 +96,34 @@ inline void Pack(__gm__ Context* ctx, uint32_t b, uint32_t begin, uint32_t count
             }
         }
         const uint32_t source = b * kSlots + q * kTop + index;
-        int32_t block = asc_ldcg(blocks + source), offset = asc_ldcg(offsets + source);
-        int32_t destination = asc_ldcg(destinations + source);
-        // Fallback rows are frozen TOKEN addresses, not 128-token block bases.
-        // Validate while these descriptors are already in registers. The
-        // scalar caller reads one error word, not a 1024-entry reduction.
-        if (block < 0 || uint32_t(block) >= tableCapacity || offset != 0 ||
-            !asc_ldcg(valid + block)) {
+        // Freeze original addresses directly from the exact event plan. No
+        // intermediate canonical descriptor table is loaded and repacked.
+        if (source >= tableCapacity || !tokenAddresses || !addresses || !valid ||
+            !asc_ldcg(valid + source)) {
             asc_atomic_or(error, uint32_t(kvaf_device::kInvalidLookup)); continue;
         }
-        if (destination < 0 || uint32_t(destination) >= outputRows || !tokenBytes ||
+        const uint64_t destination = ownerBase + dst;
+        if (destination >= outputRows || destination > INT32_MAX || !tokenBytes ||
             localBytes < tokenBytes || uint64_t(destination) > (localBytes - tokenBytes) / tokenBytes) {
             asc_atomic_or(error, uint32_t(kvaf_device::kInvalidOutput)); continue;
         }
-        uint64_t address = asc_ldcg(addresses + block);
+        uint64_t address = asc_ldcg(tokenAddresses + src);
         if (remoteBytes < tokenBytes || address < remoteBase || address - remoteBase > remoteBytes - tokenBytes) {
             asc_atomic_or(error, uint32_t(kvaf_device::kInvalidLookup)); continue;
         }
-        asc_stcg(packed + begin + i, block);
-        asc_stcg(packed + kSlots + begin + i, offset);
-        asc_stcg(packed + 2 * kSlots + begin + i, destination);
+        asc_stcg(addresses + source, address);
+        // Retain descriptor visibility for diagnostics and residency. Both
+        // representations are generated from registers in this same pass.
+        asc_stcg(blocks + source, int32_t(source));
+        asc_stcg(offsets + source, int32_t(0));
+        asc_stcg(destinations + source, int32_t(destination));
+        asc_stcg(packed + begin + i, int32_t(source));
+        asc_stcg(packed + kSlots + begin + i, int32_t(0));
+        asc_stcg(packed + 2 * kSlots + begin + i, int32_t(destination));
     }
+    asc_syncthreads();
+    if (!threadIdx.x && count && !error[0])
+        asc_atomic_add(reinterpret_cast<__gm__ uint32_t*>(ctx->count), count);
     asc_threadfence();
 }
 
@@ -135,9 +150,8 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
     auto prefix = reinterpret_cast<__gm__ uint32_t*>(a->packedFetch) +
                   uint64_t(batch) * 3 * kSlots;
     if (!block) {
-        // Producer<true> never writes packedFetch. OutputWorker's first direct
-        // table is at least 512B beyond prefix, so these two 64B lines are free
-        // before the first join. Later prefix writers are SIMT-only: a scalar
+        // The exact producer does not write packedFetch, so these two 64B
+        // lines are free before the first join. Later prefix writers are SIMT-only: a scalar
         // dirty-line writeback could overwrite another AIV's error atomic.
         prefix[post_index_prepare::kErrorWord] = 0;
         prefix[post_index_prepare::kErrorWord + 1] = 0;
@@ -162,23 +176,20 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(t), 25 * 8);
         }
         Producer<true>(a, block);
-    } else if (block < 2 * batch) {
-        OutputWorker(a, block - batch);
     }
-    // TND outputs use the old logical table. Every reader finishes here,
-    // before any Index tuple or logical/address mapping can be exchanged.
+    // Publish all Q4 plans. Parallel output/descriptor construction below
+    // still sees the original logical/address tables until the next join.
     SyncAll();
     if (profile) {
         record->planDone = GetSystemCycle();
-        // Old OutputWorker diagnostic rows share this scratch allocation.
-        // Initialize Index markers after every old producer/worker writer joined.
+        // Initialize Index markers after all request plan writers have joined.
         for (uint32_t i = 2; i <= 10; ++i) trace[i] = 0;
         trace[2] = 0x50495832U;  // PIX2: production VF, event counts read offline
     }
 
     auto info = reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus) + b * kRowStatusWords;
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info), 128);
-    uint32_t counts[4] = {}, total = 0;
+    uint32_t counts[4] = {}, total = 0, publishedTotal = 0;
     uint64_t error = info[0];
     auto row = reinterpret_cast<__gm__ Row*>(ctx->rows) + b;
     // Init/LI can reject queue or geometry inputs independently of the
@@ -192,6 +203,7 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post), sizeof(*post));
         error |= post->error;
         if (post->count > kTop || post->descriptor != b * kSlots + q * kTop) error |= 1;
+        publishedTotal += post->count;
         counts[q] = post->count <= kTop ? post->count : 0;
         total += counts[q];
     }
@@ -215,25 +227,29 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
     args.tokens_per_block = 1;
     bool blocking = false;
     if (!error) error = post_index_transport::Preflight(args, 0, end - begin, blocking);
-    if (!error && end > begin) {
+    if (!error) {
         TPipe pipe; TBuf<TPosition::VECCALC> scratch;
         pipe.InitBuffer(scratch, 64); auto local = scratch.Get<uint32_t>();
-        auto entity = reinterpret_cast<__gm__ const KvafBatchGetDirectUrmaEntity*>(args.channel_entity);
+        // Empty slices still own TND output elements. They never dereference
+        // an entity that zero-count native preflight did not validate.
+        auto entity = end > begin ?
+            reinterpret_cast<__gm__ const KvafBatchGetDirectUrmaEntity*>(args.channel_entity) : nullptr;
+        const uint64_t remoteBase = entity ? entity->remote_host_ddr_address : 0;
+        const uint64_t remoteBytes = entity ? entity->remote_host_ddr_size : 0;
+        const uint64_t localBytes = entity ? entity->local_hbm_size : 0;
         if (!block) {
-            Simt::VF_CALL<Pack<true>>(Simt::Dim3{256,1,1}, ctx, b, begin, end - begin,
+            Simt::VF_CALL<Pack<true>>(Simt::Dim3{256,1,1}, ctx, a, block, cores, b, begin, end - begin,
                 counts[0], counts[1], counts[2], counts[3], sources, destinations,
                 kPrefetch, shape.resident, shape.history, packed,
                 args.table_capacity, args.output_rows, args.token_bytes,
-                entity->remote_host_ddr_address, entity->remote_host_ddr_size,
-                entity->local_hbm_size,
+                remoteBase, remoteBytes, localBytes,
                 reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
         } else {
-            Simt::VF_CALL<Pack<false>>(Simt::Dim3{256,1,1}, ctx, b, begin, end - begin,
+            Simt::VF_CALL<Pack<false>>(Simt::Dim3{256,1,1}, ctx, a, block, cores, b, begin, end - begin,
                 counts[0], counts[1], counts[2], counts[3], sources, destinations,
                 kPrefetch, shape.resident, shape.history, packed,
                 args.table_capacity, args.output_rows, args.token_bytes,
-                entity->remote_host_ddr_address, entity->remote_host_ddr_size,
-                entity->local_hbm_size,
+                remoteBase, remoteBytes, localBytes,
                 reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
         }
         SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
@@ -244,6 +260,10 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
         // must not dereference a channel entity that preflight did not accept.
         Simt::VF_CALL<post_index_prepare::PrepareOnly>(Simt::Dim3{32,1,1}, ctx, prefix);
         SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
+    }
+    if (!error) {
+        for (uint32_t outputRow = block; outputRow < batch * 4; outputRow += cores)
+            error |= low_q4_outputs_mte::Publish(ctx, a, outputRow);
     }
     if (error || blocking) {
         Simt::VF_CALL<post_index_prepare::PublishPreflight>(
@@ -351,27 +371,7 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
         for (uint32_t i = row; i < cores; i += batch) completed += records[i].completed;
         auto rowInfo = reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus) + row * kRowStatusWords;
         if (!error && completed != rowInfo[1]) error = kvaf_device::kInvalidArgs;
-        auto update = reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);
-        // Preserve a nonzero failure when publishing the 32-bit status ABI.
-        const uint32_t errorCode = uint32_t(error) ? uint32_t(error) :
-                                   (error ? kvaf_device::kInvalidArgs : 0U);
-        Simt::VF_CALL<PublishStreamingUpdateStatus>(Simt::Dim3{32,1,1},
-            reinterpret_cast<__gm__ uint32_t*>(update[6]), row, errorCode);
-        SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
-        for (uint32_t q = 0; q < 4; ++q) {
-            auto post = FinalPostAt(shape.finalPostOffset, ctx, row * 4 + q);
-            post->pending = error ? 0 : post->count;
-            post->deferred = 0; post->error = errorCode;
-            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post), sizeof(*post));
-        }
-        if (!error && (a->prefetchCount & 0x10000000U)) {
-            Simt::VF_CALL<PublishStreamingResidency>(Simt::Dim3{256,1,1},
-                shape.resident, shape.finalPostOffset, ctx, row);
-            SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
-        }
-        // The original finalizer publishes residency only on success,
-        // invalidates the whole owner on failure and commits success feedback.
-        FinalizeStreaming<false, true>(a, row, 0);
+        post_index_finalize::Finish(a, row, publishedTotal, error);
     }
 }
 }  // namespace post_index_tail

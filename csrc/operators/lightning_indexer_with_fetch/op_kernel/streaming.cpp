@@ -130,7 +130,7 @@ __aicore__ inline uint32_t Producer(__gm__ Args* a, uint32_t b) {
   for(uint32_t q=0;q<4;++q){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+q*32),128);inputError|=errors[q*32];}}
  if(inputError){auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*32;status[0]=inputError;status[1]=0;
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),128);
-  for(uint32_t q=0;q<kFlagCount;++q){if(q==6 || (q>=7 && q<12) || (kEarlyFetchReady && q==kOutputsDoneFlag))continue;flags[q].count=0;flags[q].error=inputError;flags[q].ready=1;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+q),sizeof(BatchFlag));}
+  if constexpr (!PostIndex) for(uint32_t q=0;q<kFlagCount;++q){if(q==6 || (q>=7 && q<12) || (kEarlyFetchReady && q==kOutputsDoneFlag))continue;flags[q].count=0;flags[q].error=inputError;flags[q].ready=1;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+q),sizeof(BatchFlag));}
   return 0;}
  TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,kFinalScratchBytes);auto local=scratch.Get<uint32_t>();
 #if KVIP_LOW_MISS_TAIL
@@ -145,8 +145,13 @@ __aicore__ inline uint32_t Producer(__gm__ Args* a, uint32_t b) {
 #if KVIP_LOW_MISS_TAIL
  }
 #endif
- flags[0].count=row->slots;flags[0].ready=1;if(profile)ticks[0]=GetSystemCycle();
- kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&flags[0]),sizeof(BatchFlag));
+ if constexpr (!PostIndex) {
+  flags[0].count=row->slots;flags[0].ready=1;
+  if(profile)ticks[0]=GetSystemCycle();
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&flags[0]),sizeof(BatchFlag));
+ } else {
+  if(profile)ticks[0]=GetSystemCycle();
+ }
  auto selected=local,loc=local[kSlots],keys=local[2*kSlots],ranks=local[3*kSlots];
  auto ids=local[4*kSlots].ReinterpretCast<uint16_t>();
  auto slots=local[kStagedSlotsOffset],work=local[kStagedPositionsOffset],ctl=local[kStagedControlOffset];
@@ -184,7 +189,7 @@ __aicore__ inline uint32_t Producer(__gm__ Args* a, uint32_t b) {
 #if KVIP_LOW_MISS_DIRECT_INDEX
  // Compile the high-prefetch prepass without any direct-exchange proof work.
  if(!row->slots){
-  Simt::VF_CALL<StagedInitializeReady<true>>(Simt::Dim3{512,1,1},FinalPtr(selected),FinalPtr(loc),FinalPtr(keys),FinalPtr(ranks),FinalPtr(ctl)
+  Simt::VF_CALL<StagedInitializeReady<!PostIndex>>(Simt::Dim3{512,1,1},FinalPtr(selected),FinalPtr(loc),FinalPtr(keys),FinalPtr(ranks),FinalPtr(ctl)
 #if KVIP_AUTO_ROUTE
    ,FinalPtr(work[4096]),row->slots,shape.resident,ctx->autoRoute!=0
 #endif
@@ -231,6 +236,32 @@ __aicore__ inline uint32_t Producer(__gm__ Args* a, uint32_t b) {
   }
  }
 #endif
+
+ if constexpr (PostIndex) {
+  // Exact Q4 planning has no early Fetch consumer. Publish the complete plan
+  // once; the existing all-core join replaces four query handshakes and the
+  // separate output worker. Original metadata remains immutable until that
+  // join's descriptor/output phase has finished on every AIV.
+  const uint32_t error=ctl.GetValue(1);
+  status[0]=error;status[1]=error?0:ctl.GetValue(0);status[2]=b*kSlots;
+  status[3]=0;status[4]=0;
+  for(uint32_t q=0;q<4;++q) {
+   const uint32_t count=error?0:ctl.GetValue(2+q);
+   PrepareFinalFetch(shape.finalWorkers,shape.finalPostOffset,ctx,b,q,count,
+                     b*kSlots+q*kTop,error,count);
+  }
+  row->finalBegin=0;row->finalRequests=status[1];row->finalHead=0;
+  row->finalPending=status[1]?1:0;row->finalEnd=GetSystemCycle();
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),128);
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row)+960,64);
+  if(profile) {
+   for(uint32_t i=10;i<30;++i)ticks[i]=0;
+   ticks[8]=GetSystemCycle();
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ticks),256);
+  }
+  pipe.Destroy();
+  return 0;
+ }
 
  for(uint32_t q=0;q<4 && !ctl.GetValue(1);++q){
   if(profile)ticks[10+q*5]=GetSystemCycle();

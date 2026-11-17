@@ -28,7 +28,7 @@ def test_collective_tail_uses_batch_scheduled_mixed_vector_kernel():
     # Init's route decision is immutable until every AIV has selected the
     # collective branch; a transient zero lets late AIVs miss the barrier.
     assert "if (i != 14) words[i] = 0" in tail
-    assert "FinalizeStreaming<false, true>" in tail
+    assert "post_index_finalize::Finish" in tail
     transport = (kernel / "post_index_transport.h").read_text()
     assert "RunBatchGetValidation(" not in transport
     assert "ValidateBatchGetRequests" not in transport
@@ -43,9 +43,10 @@ def test_collective_tail_uses_batch_scheduled_mixed_vector_kernel():
     assert tail.index("prefix[post_index_prepare::kErrorWord] = 0") < tail.index("Producer<true>(a")
     assert "ApplyPlan<false>" in tail
     assert "Simt::VF_CALL<post_index::ValidatePlan>" not in tail
-    # OutputWorker's old diagnostic slots overlap the per-core scratch. Only
-    # initialize the new ABI after those writers finish at the first barrier.
-    assert tail.index("OutputWorker(a") < tail.index("SyncAll();") < tail.index("trace[2] = 0x50495832U")
+    # No per-Q output worker remains in the exact low path. The first join
+    # publishes all Q4 plans before parallel output/descriptor construction.
+    assert "OutputWorker(a" not in tail
+    assert tail.index("Producer<true>(a") < tail.index("SyncAll();") < tail.index("trace[2] = 0x50495832U")
     assert tail.count("RowError(records,") == 1  # one final join after every CQ
 
 
@@ -81,13 +82,20 @@ def test_cq_control_relocates_one_join_inside_the_same_tail():
 
 def test_whole_tail_header_and_q4_pack(tmp_path):
     repo = Path(__file__).resolve().parents[4]
-    kvaf = Path(os.environ.get("KVAF_LEGACY_SOURCE_ROOT", repo.parent / "ubmem-pr" / "KVAF-urma-check"))
+    kvaf = Path(os.environ.get("KVAF_LEGACY_SOURCE_ROOT", repo.parent / "KVAF"))
     native = kvaf / "access_operator/demo/aiv_batch_get"
     model = kvaf / "tests/aiv_model"
     if not (model / "kernel_operator.h").is_file():
         pytest.skip("Set KVAF_LEGACY_SOURCE_ROOT to the original fused-context KVAF checkout")
     compiler = shutil.which("clang++") or shutil.which("g++")
     assert compiler
+    kernel = repo / "csrc/operators/lightning_indexer_with_fetch/op_kernel"
+    tail_source = (kernel / "post_index_tail.h").read_text()
+    # Keep the complete real Run/Pack implementation. The two leaf helpers
+    # have independent byte-level tests, so stub their effects here to keep
+    # this model focused on transport rejection and collective control.
+    for helper in ("low_q4_outputs_mte.h", "post_index_finalize.h"):
+        tail_source = tail_source.replace(f'#include "{helper}"', "")
     source = tmp_path / "post_index_tail.cpp"
     source.write_text(r'''
 #include "batch_get_model.h"
@@ -148,7 +156,9 @@ void SyncAll(){++crossCoreBarriers;if(barrierHook)barrierHook(crossCoreBarriers)
 struct Context {
  RuntimeShape shape;
  uint64_t sourceBlocks,sourceOffsets,destinations,rowStatus,fallbackAddresses,fallbackValid,rows,rowOwners;
+ uint64_t outputStride,count,selected,locations;
 };
+namespace rotating {using ::Context;using ::kSlots;using ::kTop;}
 struct alignas(64) Row {uint64_t entity,queue,addresses,output;uint32_t slots,requests,suppressed,error;};
 RuntimeShape LoadRuntimeShape(Context* ctx){return ctx->shape;}
 // Negative control: scalar code must never call the SIMT-only owner helper.
@@ -161,10 +171,21 @@ KvafExecuteBatchGetKernelArgs GetArgs(Context*,uint32_t){return nativeArgs;}
 template<bool>uint32_t Producer(Args*,uint32_t){return 0;}
 void OutputWorker(Args*,uint32_t){}
 uint32_t publishedUpdateStatus=0;
-void PublishStreamingUpdateStatus(uint32_t*,uint32_t,uint32_t error){publishedUpdateStatus=error;}
-void PublishStreamingResidency(uint32_t,uint32_t,Context*,uint32_t){}
-template<bool=false,bool=false>void FinalizeStreaming(Args*,uint32_t,uint32_t){}
-#include "post_index_tail.h"
+namespace pipeline_ab {
+namespace low_q4_outputs_mte {
+uint32_t Publish(Context*,Args*,uint32_t){return 0;}
+}
+namespace post_index_finalize {
+void Finish(Args*,uint32_t,uint32_t total,uint64_t error){
+ uint32_t actual=0;for(const auto& post:finalPosts)actual+=post.count;
+ assert(total==actual);
+ const uint32_t code=uint32_t(error)?uint32_t(error):(error?kvaf_device::kInvalidArgs:0U);
+ publishedUpdateStatus=code;
+ for(auto& post:finalPosts){post.pending=0;post.deferred=0;post.error=code;}
+}
+}
+}
+''' + tail_source + r'''
 
 int main(){
  using namespace pipeline_ab::post_index_tail;
@@ -180,11 +201,20 @@ int main(){
  std::vector<uint64_t> addresses(batch*kSlots);
  std::vector<uint8_t> valid(batch*kSlots,1);
  constexpr uint64_t remoteBase=0x10000000,remoteBytes=uint64_t(batch)*kSlots*656;
- constexpr uint32_t outputRows=batch*kSlots+8192;
+ constexpr uint32_t outputStride=resident+512,outputRows=batch*outputStride;
  constexpr uint64_t localBytes=uint64_t(outputRows)*656;
  for(uint32_t i=0;i<batch*kSlots;++i){blocks[i]=i;offsets[i]=0;destinations[i]=i+8192;addresses[i]=remoteBase+uint64_t(i)*656;}
 
  Context ctx{};
+ ctx.shape.batch=batch;ctx.shape.history=history;ctx.shape.resident=resident;
+ ctx.outputStride=outputStride;
+ std::vector<uint64_t> tokenAddresses(history);
+ for(uint32_t i=0;i<history;++i)tokenAddresses[i]=remoteBase+uint64_t(i%kSlots)*656;
+ std::array<Row,batch> planRows{};
+ for(auto& row:planRows)row.addresses=reinterpret_cast<uint64_t>(tokenAddresses.data());
+ ctx.rows=reinterpret_cast<uint64_t>(planRows.data());
+ uint32_t packedCount=0;ctx.count=reinterpret_cast<uint64_t>(&packedCount);
+ Args packArgs{};
  ctx.sourceBlocks=reinterpret_cast<uint64_t>(blocks.data());
  ctx.sourceOffsets=reinterpret_cast<uint64_t>(offsets.data());
  ctx.destinations=reinterpret_cast<uint64_t>(destinations.data());
@@ -205,7 +235,7 @@ int main(){
     uint32_t begin=uint64_t(total)*lane/lanes,end=uint64_t(total)*(lane+1)/lanes;
     assert(end-begin<=(total+lanes-1)/lanes);
     uint32_t error=0;
-    Simt::VF_CALL<Pack<false>>(Simt::Dim3{256,1,1},&ctx,b,begin,end-begin,n[0],n[1],n[2],n[3],
+    Simt::VF_CALL<Pack<false>>(Simt::Dim3{256,1,1},&ctx,&packArgs,b+lane*batch,lanes*batch,b,begin,end-begin,n[0],n[1],n[2],n[3],
       indexSources.data(),indexDestinations.data(),eventOffset,resident,history,out,
       batch*kSlots,outputRows,656,remoteBase,remoteBytes,localBytes,&error);
     assert(!error);
@@ -216,6 +246,9 @@ int main(){
     assert(out[cursor]==blocks[src]);
     assert(out[kSlots+cursor]==offsets[src]);
     assert(out[2*kSlots+cursor]==destinations[src]);
+    assert(blocks[src]==int32_t(src)&&offsets[src]==0);
+    assert(destinations[src]==int32_t(b*outputStride+cursor));
+    assert(addresses[src]==tokenAddresses[indexSources[eventOffset+cursor]]);
    }
    for(uint32_t i=total;i<kSlots;++i){
     assert(out[i]==-1 && out[kSlots+i]==-1 && out[2*kSlots+i]==-1);
@@ -228,28 +261,28 @@ int main(){
                 uint32_t begin=0,uint32_t count=1,uint32_t q0=1){
   uint32_t error=0;
   std::fill(packed.begin(),packed.end(),-1);
-  Simt::VF_CALL<Pack<false>>(Simt::Dim3{256,1,1},&ctx,0,begin,count,q0,0,0,0,
+  Simt::VF_CALL<Pack<false>>(Simt::Dim3{256,1,1},&ctx,&packArgs,0,64,0,begin,count,q0,0,0,0,
     indexSources.data(),indexDestinations.data(),eventOffset,residentRows,historyRows,packed.data(),
     batch*kSlots,outputRows,656,remoteBase,remote,local,&error);
   if(error)assert(packed[0]==-1&&packed[kSlots]==-1&&packed[2*kSlots]==-1);
   return error;
  };
  assert(!check());
- blocks[0]=-1;assert(check()==kvaf_device::kInvalidLookup);
- blocks[0]=batch*kSlots;assert(check()==kvaf_device::kInvalidLookup);blocks[0]=0;
+ // Prior canonical tables can contain arbitrary old values: construction
+ // must use current exact events, not read back/repack stale descriptors.
+ blocks[0]=-1;offsets[0]=-1;destinations[0]=-1;
+ assert(!check());assert(blocks[0]==0&&offsets[0]==0&&destinations[0]==0);
  valid[0]=0;assert(check()==kvaf_device::kInvalidLookup);valid[0]=1;
- offsets[0]=1;assert(check()==kvaf_device::kInvalidLookup);
- offsets[0]=-1;assert(check()==kvaf_device::kInvalidLookup);offsets[0]=0;
- destinations[0]=-1;assert(check()==kvaf_device::kInvalidOutput);
- destinations[0]=outputRows;assert(check()==kvaf_device::kInvalidOutput);destinations[0]=8192;
+ ctx.outputStride=UINT64_C(1)<<34;
+ uint32_t owner=1;ctx.rowOwners=reinterpret_cast<uint64_t>(&owner);
+ assert(check()==kvaf_device::kInvalidOutput);ctx.rowOwners=0;ctx.outputStride=outputStride;
  assert(check(remoteBytes,655)==kvaf_device::kInvalidOutput);
- addresses[0]=remoteBase-1;assert(check()==kvaf_device::kInvalidLookup);
- // A frozen per-token address at the very end is legal; validating a full
- // 128-token block here would incorrectly reject this legitimate read.
- addresses[0]=remoteBase+remoteBytes-656;assert(!check());
- ++addresses[0];assert(check()==kvaf_device::kInvalidLookup);
- addresses[0]=UINT64_MAX;assert(check()==kvaf_device::kInvalidLookup);
- addresses[0]=remoteBase;assert(check(655)==kvaf_device::kInvalidLookup);
+ tokenAddresses[resident]=remoteBase-1;assert(check()==kvaf_device::kInvalidLookup);
+ // A frozen address at the final token in the arena remains legal.
+ tokenAddresses[resident]=remoteBase+remoteBytes-656;assert(!check());
+ ++tokenAddresses[resident];assert(check()==kvaf_device::kInvalidLookup);
+ tokenAddresses[resident]=UINT64_MAX;assert(check()==kvaf_device::kInvalidLookup);
+ tokenAddresses[resident]=remoteBase;assert(check(655)==kvaf_device::kInvalidLookup);
  // Combined packing preserves the old Index-plan validation, including
  // invalid-resident self-refill and empty-plan geometry checks.
  indexSources[eventOffset]=history;assert(check()==1);
@@ -263,6 +296,10 @@ int main(){
  assert(check(remoteBytes,localBytes,resident,history,0,0,kTop+1)==1);
  assert(!check(remoteBytes,localBytes,resident,history,0,0,0));
  assert(check(remoteBytes,localBytes,history+1,history,0,0,0)==1);
+
+
+ // Exact output bytes, padding, reorder and duplicate queries are exercised
+ // by test_low_q4_outputs_mte.py using the real scalar DMA and SIMT helpers.
 
  // Execute the production Run error path, with otherwise usable descriptors
  // and native entities. A pre-existing row error or a speculative write must
@@ -297,7 +334,7 @@ int main(){
   nativeArgs.channel_entity=fault==9?0:reinterpret_cast<uint64_t>(&entity);
   entity.magic=fault==10?0:kvaf_device::kEntityMagic;
   crossCoreBarriers=0;
-  row={};row.error=fault==1?0x4000:0;row.slots=fault==2?1:0;
+  row={};row.addresses=reinterpret_cast<uint64_t>(tokenAddresses.data());row.error=fault==1?0x4000:0;row.slots=fault==2?1:0;
   records={};records[0].active=1;status[0]=0;status[1]=2;
   ctx.shape.resident=fault==6?4097:2048;
   for(uint32_t q=0;q<4;++q){finalPosts[q]={};finalPosts[q].descriptor=q*kTop;}

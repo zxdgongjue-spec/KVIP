@@ -216,4 +216,7 @@ def test_compact_wiring_keeps_high_path_and_completion_contract():
     assert "if(!compactPlan){" in producer
     assert "VF_CALL<ResolveQueryWork>" in producer
     assert "if(profile)ticks[9]=1" in producer
-    assert producer.index("flags+kOutputCompletionFlag") < producer.index("row->finalRequests=")
+    # The high path still joins OutputWorker before final publication. The
+    # PostIndex specialization now publishes once and returns before that
+    # legacy query loop, so inspect the last (high-path) assignment here.
+    assert producer.index("flags+kOutputCompletionFlag") < producer.rindex("row->finalRequests=")
