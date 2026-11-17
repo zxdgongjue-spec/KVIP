@@ -91,6 +91,8 @@ def summarize(directory, config):
         content = json.loads(path.read_text())
         samples = content['samples'] if isinstance(content, dict) else content
         capture = dict(source=str(path), samples=[], stage_summary={})
+        detail_path = path.parent / 'detail_samples.json'
+        detail_samples = json.loads(detail_path.read_text()) if detail_path.exists() and config.level >= 2 else []
         stage_values = {}
         if len(samples) != config.iterations:
             result['missing'].append(f'{path}: expected {config.iterations} repeats, got {len(samples)}')
@@ -115,7 +117,14 @@ def summarize(directory, config):
                 if stage in config.stages or ('resolve_update' in stage and
                                                set(config.stages) & {'resolve', 'update', 'fetch', 'finalize'}):
                     stage_values.setdefault(stage, []).append(duration)
-            details = sample.get('streaming_cycles', sample.get('streaming', []))
+            detail_sample = next((row for row in detail_samples if row['round'] == sample['round']), None)
+            details = (detail_sample['streaming_cycles'] if detail_sample else
+                       sample.get('streaming_cycles', sample.get('streaming', [])))
+            if detail_sample:
+                item['detail_source'] = str(detail_path)
+                item['detail_repeat'] = detail_sample['round']
+                if 'rank_progress' in detail_sample:
+                    item['rank_progress'] = detail_sample['rank_progress']
             if details:
                 scope = details[0].get('prefetch_scope')
                 raw = details[0].get('core_timeline_raw')
@@ -434,6 +443,30 @@ def algorithm_after(rotating, before):
         return {'error': str(error)}
 
 
+def same_replay_table(capture):
+    samples = capture['samples']
+    names = list(dict.fromkeys(name for sample in samples
+                              for name in sample.get('accounting', {}).get('stages_us', {})))
+    rows = []
+    for sample in samples:
+        accounting = sample.get('accounting', {})
+        if not accounting or 'error' in accounting:
+            continue
+        stages = accounting['stages_us']
+        gap = accounting['inter_kernel_gap_us']
+        boundary = accounting['boundary_residual_us']
+        overlap = accounting.get('overlap_us',
+            sum(stages.values()) - (accounting['kernel_span_us'] - gap))
+        total = sum(stages.values()) - overlap + gap + boundary
+        event = accounting['event_us']
+        rows.append([sample.get('repeat', sample.get('round')), *[stages.get(name, 0.) for name in names],
+                     overlap, gap, boundary, total, event, total - event])
+    return diagnostic_table(
+        'Same-replay graph accounting (us): sum(stages) - overlap + gap + boundary = graph event. '
+        'Boundary is the event remainder, not attributed CPU time.',
+        ['Repeat', *names, 'Overlap', 'Gap', 'Boundary', 'Reconstructed', 'Graph event', 'Delta'], rows)
+
+
 def level_one_tables(result):
     """Compact terminal view; raw intervals and scopes remain in diagnostic.json."""
     def cell(value):
@@ -472,9 +505,11 @@ def level_one_tables(result):
     lines += ['ALGORITHM / KV TRAFFIC | per request, Q4 unique-demand basis.', '']
     lines += table('Per-request counts', ['Path', 'Repeat', 'Request', 'Hot', 'Demand', 'Cold',
                                           'Prefetch', 'Final', 'KV bytes'], counts)
-    lines += ['TIME BREAKDOWN | us; profiled passes are separate from performance samples.', '']
+    lines += ['TIME BREAKDOWN | us; graph and stages below share each profiled replay. Detailed stamps OFF. The final performance table is unprofiled.', '']
     lines += table('Stage distribution (overlapping stages must not be added)',
                    ['Path', 'Stage', 'Mean', 'p50', 'Min', 'Max', 'N'], stages)
+    for capture in result['captures']:
+        lines += [f"Graph: {capture.get('path', 'fused')} | {capture['source']}", same_replay_table(capture), '']
     lines += table('Effective bandwidth (decimal GB/s)',
                    ['Path', 'Repeat', 'Scope', 'Bytes', 'Span us', 'GB/s'], bandwidth)
     lines += [f'{name}: {note}' for name, note in scopes.items()]
@@ -515,12 +550,14 @@ def aggregate_diagnostic_rows(rows, identity_columns):
 
 def level_two_tables(result):
     """Same-replay tables, with no summed-overlap or synthetic decode trend."""
-    lines = ['TIME BREAKDOWN | us; profiled passes are separate from performance samples.',
+    lines = ['TIME BREAKDOWN | us; graph and stages below share each profiled replay. Detailed stamps OFF. The final performance table is unprofiled.',
              'Logical block IDs, not physical core IDs. Waits include control/polling.']
     algorithm_lines = ['ALGORITHM / KV TRAFFIC | per request, Q4 unique-demand basis.',
         'Cold miss % = initial cold / unique demand; read amplification = (prefetch + final) / initial cold.',
         'Unused % = unused prefetch / prefetch. Zero denominator => N/A. Repeats are not decode rounds.']
+    lines.append('Kernel-stage tables: detailed device stamps OFF. Core/bandwidth details: separate instrumented replays; repeat IDs are local to that pass.')
     for capture in result['captures']:
+        lines.append(same_replay_table(capture))
         stage_rows = [[stage, values['mean_us'], values['p50_us'], values['min_us'], values['max_us']]
                       for stage, values in capture['stage_summary'].items()]
         lines.append(diagnostic_table(f"Stages: {capture.get('path', 'fused')} | {capture['source']}",
@@ -803,6 +840,42 @@ def decode_final_detail(owner_words, status_words):
     return detail
 
 
+def collect_details(torch, rotating, graph, reset, verify, rounds, folder, pipeline, *, ubmem=False):
+    """Separate instrumented replays; never contribute to kernel-stage timing."""
+    stream = torch.npu.current_stream(rotating.device)
+    pipeline.counter_clock_mhz = pipeline.calibrate_counter_mhz()
+    samples = []
+    try:
+        pipeline.set_diagnostics(True)
+        for step in range(rounds):
+            reset()
+            pipeline.times.zero_()
+            if hasattr(rotating, 'rank_progress'):
+                rotating.rank_progress.zero_()
+            stream.synchronize()
+            if ubmem:
+                graph.replay(stream)
+            else:
+                graph.replay()
+            stream.synchronize()
+            verify()
+            sample = dict(round=step, streaming_cycles=pipeline.diagnostic_cycles())
+            if hasattr(rotating, 'rank_progress'):
+                records = rotating.rank_progress.cpu().tolist()
+                bounds = rotating.query_ends.cpu().tolist()
+                sample['rank_progress'] = [
+                    [b, q + 1, epoch, 100 * (word & ((1 << 18) - 1)) / max(bounds[b][q], 1),
+                     100 * ((word >> 18) & ((1 << 18) - 1)) / max(bounds[b][q], 1),
+                     (word >> 36) & 4095]
+                    for b, queries in enumerate(records) for q, epochs in enumerate(queries)
+                    for epoch, word in enumerate(epochs[:rotating.rounds]) if word]
+            samples.append(sample)
+    finally:
+        pipeline.set_diagnostics(False)
+        stream.synchronize()
+    (folder / 'detail_samples.json').write_text(json.dumps(samples, indent=2))
+
+
 def collect_core(torch, rotating, graph, reset, verify, rounds, folder, *, full=False, diagnostics=None, fused_final=False):
     """Profile the existing core graph separately from primary timing."""
     import torch_npu
@@ -819,7 +892,7 @@ def collect_core(torch, rotating, graph, reset, verify, rounds, folder, *, full=
     with profile:
         for step in range(rounds):
             reset()
-            if hasattr(rotating, "rank_progress"):
+            if diagnostics is not None and hasattr(rotating, "rank_progress"):
                 rotating.rank_progress.zero_()
             stream.synchronize()
             algorithm_initial = algorithm_before(rotating)
@@ -848,7 +921,7 @@ def collect_core(torch, rotating, graph, reset, verify, rounds, folder, *, full=
                 )
             )
             samples[-1]["algorithm"] = algorithm_after(rotating, algorithm_initial)
-            if hasattr(rotating, "rank_progress"):
+            if diagnostics is not None and hasattr(rotating, "rank_progress"):
                 records = rotating.rank_progress.cpu().tolist()
                 bounds = rotating.query_ends.cpu().tolist()
                 samples[-1]["rank_progress"] = [
@@ -943,7 +1016,7 @@ def account_ubmem(events, name, elapsed):
             "note": "resolve includes inline fetch when fetch_separate is false; boundary includes measurement edges"}
 
 
-def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder, streaming=None):
+def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder, streaming=None, level=1):
     """Collect a separately profiled graph replay; never included in event timing."""
     import torch_npu
     from torch.profiler import record_function
@@ -959,8 +1032,7 @@ def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder, streami
         on_trace_ready=lambda profiler: profiler.export_chrome_trace(str(trace_path.resolve())),
     )
     if streaming is not None:
-        streaming.counter_clock_mhz = streaming.calibrate_counter_mhz()
-        streaming.set_diagnostics(True)
+        streaming.set_diagnostics(False)
     with profile:
         for step in range(rounds):
             reset()
@@ -980,8 +1052,6 @@ def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder, streami
                             "prefetch": int(rows[:, 9].astype(np.uint64).sum()),
                             "final": int(rows[:, 247].astype(np.uint64).sum())})
             samples[-1]["algorithm"] = algorithm_after(rotating, algorithm_initial)
-            if streaming is not None:
-                samples[-1]["streaming"] = streaming.diagnostic_cycles()
             profile.step()
     if streaming is not None:
         streaming.set_diagnostics(False)
@@ -994,6 +1064,8 @@ def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder, streami
         if "error" not in account and hasattr(rotating.library, "v9_fetch_workers") and not account["fetch_separate"] and not account["stages_us"].get("resolve_update_fetch"):
             account["error"] = "Separate fetch kernel expected but absent from trace"
     (folder / "attribution.json").write_text(json.dumps(samples, indent=2))
+    if streaming is not None and level >= 2:
+        collect_details(torch, rotating, graph, reset, verify, rounds, folder, streaming, ubmem=True)
     for sample in samples:
         account = sample["accounting"]
         if "error" in account:
@@ -1028,8 +1100,7 @@ def collect_replay(torch, state, graph, sequence, validate, config, folder):
             stream.synchronize()
             checks.check(f'warmup={repeat} source_round={inputs.source_round}',
                          lambda: validate(inputs))
-    pipeline.counter_clock_mhz = pipeline.calibrate_counter_mhz()
-    pipeline.set_diagnostics(True)
+    pipeline.set_diagnostics(False)
     trace_path = folder / 'trace.json'
     samples = []
     profile = torch_npu.profiler.profile(
@@ -1064,10 +1135,6 @@ def collect_replay(torch, state, graph, sequence, validate, config, folder):
                                   identities=inputs.identities, us=begin.elapsed_time(end) * 1000,
                                   correctness='PASS' if good else 'FAIL', algorithm=algorithm,
                                   prefetch=totals.get('prefetch'), final=totals.get('final'))
-                    try:
-                        sample['streaming_cycles'] = pipeline.diagnostic_cycles()
-                    except (ValueError, AssertionError) as error:
-                        sample['diagnostic_error'] = str(error)
                     samples.append(sample)
                     atomic_json(folder / 'samples.json', samples)
                     profile.step()
@@ -1079,9 +1146,31 @@ def collect_replay(torch, state, graph, sequence, validate, config, folder):
         sample['accounting'] = (account_ubmem(events, sample['name'], sample['us'])
                                if config.transport == 'ubmem' else
                                account(events, sample['name'], sample['us'], full=True, fused_final=True))
+    detail_samples = []
+    if config.level >= 2:
+        pipeline.counter_clock_mhz = pipeline.calibrate_counter_mhz()
+        try:
+            pipeline.set_diagnostics(True)
+            for repeat in range(config.iterations):
+                state.reset()
+                for inputs in sequence:
+                    state.prepare(inputs)
+                    pipeline.times.zero_()
+                    stream.synchronize()
+                    graph.replay()
+                    stream.synchronize()
+                    checks.check(f'detail={repeat} source={inputs.source_round}', lambda: validate(inputs))
+                    detail_samples.append(dict(round=repeat, source_round=inputs.source_round,
+                                               streaming_cycles=pipeline.diagnostic_cycles()))
+        finally:
+            pipeline.set_diagnostics(False)
+            stream.synchronize()
     # Each source round has its own repeat distribution. Never pool different
     # decode rounds under the same synthetic-case summary.
     for source_round in sorted({sample['source_round'] for sample in samples}):
+        if detail_samples:
+            atomic_json(folder / f'round-{source_round}' / 'detail_samples.json',
+                        [sample for sample in detail_samples if sample['source_round'] == source_round])
         atomic_json(folder / f'round-{source_round}' / 'full_attribution.json', dict(
             samples=[sample for sample in samples if sample['source_round'] == source_round]))
     return dict(correctness=checks.status, failures=checks.failures,

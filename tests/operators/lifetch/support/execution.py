@@ -2319,9 +2319,7 @@ def run_urma_case(
                           completion_check=fused_completion, keep_graph=bool(args.trace_rounds))
     if args.trace_rounds:
         progress(folder.parent, f"BS={b}: full graph profiler ({args.trace_rounds} replays); logs={folder}")
-        counter_clock_mhz = pipeline.calibrate_counter_mhz()
-        pipeline.counter_clock_mhz = counter_clock_mhz
-        pipeline.set_diagnostics(True)
+        pipeline.set_diagnostics(False)
         stream.synchronize()
 
         def trace_reset():
@@ -2333,7 +2331,13 @@ def run_urma_case(
             full_trace.update(collect_core(
                 torch, rotating, fused_graph, trace_reset,
                 lambda: correctness.check('profile fused', lambda: verify(True)),
-                args.trace_rounds, folder, full=True, diagnostics=pipeline.diagnostic_cycles, fused_final=True))
+                args.trace_rounds, folder, full=True, fused_final=True))
+            if args.level >= 2:
+                from diagnostics import collect_details
+                collect_details(torch, rotating, fused_graph, trace_reset,
+                                lambda: correctness.check('detail fused', lambda: verify(True)),
+                                args.trace_rounds, folder, pipeline)
+                counter_clock_mhz = pipeline.counter_clock_mhz
         finally:
             pipeline.set_diagnostics(False)
             stream.synchronize()
@@ -2606,6 +2610,7 @@ def run_ubmem_case(
     iterations=0,
     trace_rounds=0,
     trace_output=None,
+    diagnostic_level=1,
     q_workers=2,
     seed=20261104,
     result_output=None,
@@ -3110,7 +3115,7 @@ def run_ubmem_case(
                 folder = trace_output / f"b{batch}-h{history}-r{resident}-w{token_bytes}"
                 collect_ubmem(torch, rotating, graph, restore_fixture,
                               lambda: verify(list(range(1, batch + 1)), phase="profiled_replay"),
-                              trace_rounds, folder, streaming=forward)
+                              trace_rounds, folder, streaming=forward, level=diagnostic_level)
                 result['correctness'] = checks.status
                 result['correctness_failures'] = checks.failures
                 if report_path:
@@ -3188,7 +3193,7 @@ def run_ubmem(config, directory, *, shared_pool=None):
             prefetch_tokens=config.prefetch_tokens, args_server=config.kvaf_server,
             miss_percent=config.miss_percent, warmup=config.warmup, iterations=config.iterations,
             trace_rounds=config.iterations if config.mode == 'diagnose' else 0,
-            trace_output=directory / 'trace', seed=config.seed, result_output=directory / 'cases',
+            diagnostic_level=config.level, trace_output=directory / 'trace', seed=config.seed, result_output=directory / 'cases',
             serial_compare=True, check_case=getattr(config, 'check_case', None),
             check_suite=getattr(config, 'check_suite', None),
             shared_pool=shared_pool, compact=config.mode in ('bench', 'diagnose'),
