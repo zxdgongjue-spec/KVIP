@@ -7,6 +7,45 @@ namespace kvip_incremental {
 using namespace AscendC;
 using namespace AscendC::MicroAPI;
 
+// The strict prefix is unchanged when new winners only replace boundary ties.
+// Move the surviving tie suffix backwards, then insert the new winners. Read
+// each source vector before its overlapping stores; never gather from a bank
+// that an earlier iteration has overwritten. No extra persistent UB is needed.
+__simd_vf__ inline void AppendBoundary(__ubuf__ uint16_t* scores,
+    __ubuf__ uint32_t* ids, __ubuf__ uint16_t* newScores,
+    __ubuf__ uint32_t* newIds, uint32_t strict, uint32_t admitted) {
+    auto all = CreateMask<uint32_t, MaskPattern::ALL>();
+    RegTensor<uint16_t> key16;
+    LoadAlign<uint16_t, LoadDist::DIST_BRC_B16>(key16, scores + strict);
+    RegTensor<uint32_t> key, mask, zero;
+    Duplicate(mask, uint32_t(0xffff));
+    Duplicate(zero, uint32_t(0));
+    And(key, reinterpret_cast<RegTensor<uint32_t>&>(key16), mask, all);
+    for (int32_t base = kTop - 64; base >= int32_t(strict / 64 * 64); base -= 64) {
+        RegTensor<int32_t> sequence;
+        Arange(sequence, base);
+        auto& lane = reinterpret_cast<RegTensor<uint32_t>&>(sequence);
+        MaskReg write, fresh, beforeEnd;
+        CompareScalar<uint32_t, CMPMODE::GE>(write, lane, strict, all);
+        CompareScalar<uint32_t, CMPMODE::LT>(beforeEnd, lane, strict + admitted, all);
+        MaskAnd(fresh, write, beforeEnd, all);
+        RegTensor<uint32_t> oldIndex, newIndex, oldId, newId, id, score;
+        Adds(oldIndex, lane, uint32_t(0) - admitted, all);
+        Select(oldIndex, zero, oldIndex, beforeEnd);
+        Adds(newIndex, lane, uint32_t(0) - strict, all);
+        Select(newIndex, newIndex, zero, fresh);
+        Gather(oldId, ids, oldIndex, all);
+        Gather(newId, newIds, newIndex, all);
+        GatherU16(score, newScores, newIndex);
+        Select(id, newId, oldId, fresh);
+        Select(score, score, key, fresh);
+        LocalMemBar<MemType::VEC_LOAD, MemType::VEC_STORE>();
+        StoreAlign(ids + base, id, write);
+        StoreAlign<uint16_t, StoreDist::DIST_PACK_B32>(
+            scores + base, reinterpret_cast<RegTensor<uint16_t>&>(score), write);
+    }
+}
+
 // Convert only the newly admitted offsets. The retained K IDs already carry
 // their physical position and fixed hot/ABC eligibility tag.
 __simd_vf__ inline void MapNewIds(__ubuf__ uint16_t* offsets,

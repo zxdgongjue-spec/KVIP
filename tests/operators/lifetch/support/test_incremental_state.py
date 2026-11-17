@@ -8,12 +8,17 @@ from test_incremental_prefilter import prefilter_model_source
 from test_recent_index import INDEXER, function
 
 
+@pytest.mark.parametrize("inplace", [0, 1])
 @pytest.mark.parametrize("light", [0, 1])
 @pytest.mark.parametrize("ties", [0, 1])
-def test_actual_direct_and_tie_boundary_match_full_selection(tmp_path, ties, light):
+def test_actual_direct_and_tie_boundary_match_full_selection(tmp_path, ties, light, inplace):
+    if inplace and not (light and ties):
+        pytest.skip("In-place updates require light state and boundary ties")
     source = prefilter_model_source()
     vector = (INDEXER / "incremental_state_vector.h").read_text()
     additions = r'''
+enum class MemType {VEC_LOAD,VEC_STORE};
+template<MemType,MemType>void LocalMemBar(){}
 enum class StoreDist {DIST_PACK_B32};
 template<class T,StoreDist>void StoreAlign(T* p,RegTensor<T>& a,MaskReg mask){
  static_assert(sizeof(T)==2);
@@ -50,8 +55,7 @@ void FindIdxEQOutputVFImpl(uint16_t* out,uint16_t* values,uint16_t begin,uint32_
 }
 }
 '''.replace("FUNCTIONS", "\n".join(function(vector, name) for name in (
-        "__simd_callee__ inline void GatherU16(",
-        "template<bool tieUpdate>\n__simd_vf__ inline void Materialize(")))
+        "template<bool tieUpdate>\n__simd_vf__ inline void Materialize(",)))
     source = source.replace("struct Selector {", additions + "\nstruct Selector {")
     source = source.replace(" uint32_t* scratch;unsigned calls=0;uint16_t threshold=0;", r'''
  uint32_t* scratch;unsigned calls=0;uint16_t threshold=0;
@@ -69,10 +73,11 @@ void FindIdxEQOutputVFImpl(uint16_t* out,uint16_t* values,uint16_t begin,uint32_
     source = source.replace(" void SaveIncremental(unsigned){", helper + "\n void SaveIncremental(unsigned){")
     light_source = (INDEXER / "incremental_light.h").read_text()
     light_functions = "\n".join(function(light_source, name) for name in (
+        "__simd_vf__ inline void AppendBoundary(",
         "__simd_vf__ inline void MapNewIds(", "__simd_vf__ inline void TieOrdinals(",
         "__simd_vf__ inline void GatherIds(", "__simd_vf__ inline void ListHeader(",
     ))
-    source = source.replace("using ::kTop;", "using ::kTop; constexpr unsigned kMappedWord=4928;\n" + light_functions, 1)
+    source = source.replace("using ::kTop;", "using ::kTop; constexpr unsigned kMappedWord=4928;\n" + function(vector, "__simd_callee__ inline void GatherU16(") + "\n" + light_functions, 1)
     source = source.replace("enum class CMPMODE{GT,LT,GE,NE};", "enum class CMPMODE{GT,LT,GE,NE,EQ};")
     source = source.replace("a.v[i]!=b.v[i]);", "C==CMPMODE::EQ?a.v[i]==b.v[i]:a.v[i]!=b.v[i]);")
     source = source.replace("enum class LoadDist{DIST_BRC_B16};", "enum class LoadDist{DIST_BRC_B16,DIST_UNPACK_B16};")
@@ -87,11 +92,12 @@ void FindIdxEQOutputVFImpl(uint16_t* out,uint16_t* values,uint16_t begin,uint32_
     source = source.replace("   unsigned calls=s.topkOp_.calls;", """
    unsigned calls=s.topkOp_.calls;
    bool fast=KVIP_INCREMENTAL_TIES&&admitted>0&&admitted<=2048&&admitted<2048-s.incrementalStrict_;
+   bool inplaceFast=KVIP_INCREMENTAL_INPLACE&&fast&&s.incrementalStrict_>=2048-256;
 """)
     source = source.replace("calls+(admitted?1:0)", "calls+(admitted&&!fast?1:0)")
     source = source.replace("   assert(s.incrementalCount_==0&&s.kth==kth);", """
    assert(s.incrementalCount_==0&&s.kth==kth);
-   if(admitted){
+   if(admitted && !inplaceFast){
     unsigned n=0;for(auto id:s.ids)if(id&kNeedsFetch)assert(s.scratch[32+n++]==(id&kIdMask));
     assert(s.incrementalPacked_&&s.incrementalPending_==n);
    }else assert(!s.incrementalPacked_);
@@ -143,6 +149,6 @@ namespace Simt {
     exe = cpp.with_suffix("")
     subprocess.run(["c++", "-std=c++17", "-O1", "-fsanitize=address,undefined",
                     "-DKVIP_INCREMENTAL_WINDOW=1", "-DKVIP_INCREMENTAL_PREFILTER=1",
-                    "-DKVIP_INCREMENTAL_DIRECT=1", f"-DKVIP_INCREMENTAL_TIES={ties}", f"-DKVIP_INCREMENTAL_LIGHT={light}",
+                    "-DKVIP_INCREMENTAL_DIRECT=1", f"-DKVIP_INCREMENTAL_INPLACE={inplace}", f"-DKVIP_INCREMENTAL_TIES={ties}", f"-DKVIP_INCREMENTAL_LIGHT={light}",
                     str(cpp), "-o", str(exe)], check=True)
     subprocess.run([str(exe)], check=True, timeout=30)

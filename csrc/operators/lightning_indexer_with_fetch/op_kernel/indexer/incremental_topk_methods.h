@@ -134,6 +134,25 @@
             offsets = nullptr; // Preserve all fixed positions; never truncate a dense window.
         }
 #endif
+#if KVIP_INCREMENTAL_INPLACE
+        // CANN 9.2 Model: short suffixes win; moving long tie runs regresses.
+        if (incrementalStrict_ >= kvip_incremental::kTop - 256 && offsets && incrementalCount_ < kvip_incremental::kTop - incrementalStrict_) {
+            auto fresh = reinterpret_cast<__ubuf__ uint32_t*>(
+                topkSharedTmpLocal_[kvip_incremental::kMappedWord].GetPhyAddr());
+            kvip_incremental::MapNewIds(offsets, fresh, incrementalCount_, incrementalBegin_,
+                incrementalReverseBegin_, incrementalReverseEnd_, incrementalTailBegin_, incrementalTailEnd_);
+            PipeBarrier<PIPE_V>();
+            kvip_incremental::AppendBoundary(
+                reinterpret_cast<__ubuf__ uint16_t*>(incrementalScores_.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(incrementalIds_.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_[2048].GetPhyAddr()),
+                fresh, incrementalStrict_, incrementalCount_);
+            PipeBarrier<PIPE_V>();
+            incrementalStrict_ += incrementalCount_;
+            incrementalCount_ = 0;
+            return; // Kth and strict prefix unchanged; publication compacts the updated IDs.
+        }
+#endif
         const uint32_t size = QLICommon::Align(2048 + incrementalCount_, uint32_t(256));
 #if KVIP_INCREMENTAL_WINDOW
         // Tiles write fixed positions after the retained K. Every position is

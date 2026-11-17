@@ -150,3 +150,12 @@ claim of bit-identical baseline tie IDs or model output. Defaults stay off;
 CPU validation is not evidence of CANN compilation or NPU speedup. Compare full
 graph mean and median against both unchanged forward and pure reverse, with
 first/end controls, before considering promotion.
+
+`incremental_inplace=True` is an opt-in scan-study variant requiring the light
+state and exact boundary-tie paths. When new strict winners fit into the old
+Kth tie suffix and that suffix has at most 256 entries, it preserves the strict prefix and updates only that suffix
+backwards in place. Kth, ordered IDs and the published pending list remain
+identical to the register-selection control. Other windows keep the existing
+selector. The original forward and reverse variants keep this flag disabled.
+Measure the complete graph: a faster isolated state-update probe does not
+predict LI/Fetch overlap or URMA completion time.

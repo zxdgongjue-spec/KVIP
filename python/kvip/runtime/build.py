@@ -41,8 +41,10 @@ def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False,
                     rolling_threshold=False, window_refilter=False, rolling_batched=False, rolling_windowed=False,
                     rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False,
                     compact_out_of_place=False, rolling_reuse_seed=False, rolling_fast_path=False, rolling_sparse=False, rolling_boundary=False, incremental_topk=False,
-                    incremental_window=False, incremental_register=False, incremental_prefilter=False, incremental_direct=False, incremental_ties=False, incremental_light=False):
+                    incremental_window=False, incremental_register=False, incremental_prefilter=False, incremental_direct=False, incremental_ties=False, incremental_light=False, incremental_inplace=False):
     """Build one shape-independent binary per source/toolchain/SoC."""
+    if incremental_inplace and not (incremental_light and incremental_ties):
+        raise ValueError("In-place boundary updates require light state and exact tie updates")
     if incremental_light and not incremental_direct:
         raise ValueError("Light incremental state requires direct selection")
     if incremental_ties and not incremental_direct:
@@ -86,6 +88,7 @@ def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False,
         KVIP_INCREMENTAL_WINDOW="ON" if incremental_window else "OFF",
         KVIP_INCREMENTAL_REGISTER="ON" if incremental_register else "OFF",
         KVIP_INCREMENTAL_PREFILTER="ON" if incremental_prefilter else "OFF",
+        KVIP_INCREMENTAL_INPLACE="ON" if incremental_inplace else "OFF",
         KVIP_INCREMENTAL_LIGHT="ON" if incremental_light else "OFF",
         KVIP_INCREMENTAL_DIRECT="ON" if incremental_direct else "OFF",
         KVIP_INCREMENTAL_TIES="ON" if incremental_ties else "OFF",

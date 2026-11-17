@@ -22,6 +22,12 @@
 #ifndef KVIP_INCREMENTAL_LIGHT
 #define KVIP_INCREMENTAL_LIGHT 0
 #endif
+#ifndef KVIP_INCREMENTAL_INPLACE
+#define KVIP_INCREMENTAL_INPLACE 0
+#endif
+#if KVIP_INCREMENTAL_INPLACE && (!KVIP_INCREMENTAL_LIGHT || !KVIP_INCREMENTAL_TIES)
+#error "In-place boundary updates require light state and exact tie updates"
+#endif
 #if KVIP_INCREMENTAL_LIGHT && !KVIP_INCREMENTAL_DIRECT
 #error "Light incremental state requires direct selection"
 #endif
