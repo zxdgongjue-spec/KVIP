@@ -19,6 +19,12 @@
 #ifndef KVIP_INCREMENTAL_TIES
 #define KVIP_INCREMENTAL_TIES 0
 #endif
+#ifndef KVIP_INCREMENTAL_LIGHT
+#define KVIP_INCREMENTAL_LIGHT 0
+#endif
+#if KVIP_INCREMENTAL_LIGHT && !KVIP_INCREMENTAL_DIRECT
+#error "Light incremental state requires direct selection"
+#endif
 #if KVIP_INCREMENTAL_DIRECT && !KVIP_INCREMENTAL_PREFILTER
 #error "Direct incremental state requires window prefilter"
 #endif
@@ -39,6 +45,9 @@
 #endif
 namespace kvip_incremental {
 constexpr uint32_t kTop = 2048;
+// Ordinals occupy [11520,19712) for K+up to K compact scores. This
+// scratch tail also fits the smallest (6K-trunk) selector allocation.
+constexpr uint32_t kMappedWord = 4928;
 constexpr uint32_t kNeedsFetch = 0x80000000U;
 constexpr uint32_t kIdMask = 0x7fffffffU;
 constexpr uint32_t kChunk = 2048;

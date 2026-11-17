@@ -14,9 +14,9 @@ __simd_callee__ inline void GatherU16(RegTensor<uint32_t>& result,
     auto all = CreateMask<uint32_t, MaskPattern::ALL>();
     RegTensor<uint32_t> wordIndex, word, upper, odd, one, lowMask;
     Duplicate(one, uint32_t(1)); Duplicate(lowMask, uint32_t(0xffff));
-    ShiftRights(wordIndex, index, uint32_t(1), all);
+    ShiftRights(wordIndex, index, int16_t(1), all);
     Gather(word, reinterpret_cast<__ubuf__ uint32_t*>(base), wordIndex, all);
-    ShiftRights(upper, word, uint32_t(16), all);
+    ShiftRights(upper, word, int16_t(16), all);
     And(odd, index, one, all);
     MaskReg high;
     CompareScalar<uint32_t, CMPMODE::NE>(high, odd, uint32_t(0), all);

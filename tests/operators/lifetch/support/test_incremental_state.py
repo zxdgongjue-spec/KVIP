@@ -8,8 +8,9 @@ from test_incremental_prefilter import prefilter_model_source
 from test_recent_index import INDEXER, function
 
 
+@pytest.mark.parametrize("light", [0, 1])
 @pytest.mark.parametrize("ties", [0, 1])
-def test_actual_direct_and_tie_boundary_match_full_selection(tmp_path, ties):
+def test_actual_direct_and_tie_boundary_match_full_selection(tmp_path, ties, light):
     source = prefilter_model_source()
     vector = (INDEXER / "incremental_state_vector.h").read_text()
     additions = r'''
@@ -18,7 +19,7 @@ template<class T,StoreDist>void StoreAlign(T* p,RegTensor<T>& a,MaskReg mask){
  static_assert(sizeof(T)==2);
  for(unsigned i=0;i<64;++i)if(mask.v[i])p[i]=a.v[2*i];
 }
-template<class T>void ShiftRights(RegTensor<T>& r,RegTensor<T>& a,T s,MaskReg m){
+template<class T>void ShiftRights(RegTensor<T>& r,RegTensor<T>& a,int16_t s,MaskReg m){
  for(unsigned i=0;i<r.v.size();++i)if(m.v[i])r.v[i]=a.v[i]>>s;
 }
 template<class T>void Add(RegTensor<T>& r,RegTensor<T>& a,RegTensor<T>& b,MaskReg m){
@@ -54,15 +55,30 @@ void FindIdxEQOutputVFImpl(uint16_t* out,uint16_t* values,uint16_t begin,uint32_
     source = source.replace("struct Selector {", additions + "\nstruct Selector {")
     source = source.replace(" uint32_t* scratch;unsigned calls=0;uint16_t threshold=0;", r'''
  uint32_t* scratch;unsigned calls=0;uint16_t threshold=0;
- std::array<uint32_t,64> key{};std::array<uint16_t,18432> ordinal{};
- Tensor<uint16_t> ThresholdResult(){return {reinterpret_cast<uint16_t*>(key.data()),128};}
- Tensor<uint16_t> IncrementalOrdinals(){return {ordinal.data(),18432};}
+ // Match LITopk's real shared-scratch aliases, including the Kth header.
+ Tensor<uint16_t> ThresholdResult(){return {reinterpret_cast<uint16_t*>(scratch+2816),128};}
+ Tensor<uint16_t> IncrementalOrdinals(){return {reinterpret_cast<uint16_t*>(scratch+2880),18432};}
  void Threshold(Tensor<uint16_t> input,Tensor<uint16_t> cutoff,unsigned size){
   auto sorted=std::vector<uint16_t>(input.p,input.p+size);
   std::sort(sorted.begin(),sorted.end(),std::greater<uint16_t>());
   threshold=sorted[2047];std::fill_n(cutoff.p,128,threshold);++calls;
  }
 ''')
+    methods = (INDEXER / "incremental_topk_methods.h").read_text()
+    helper = function(methods, "    template<bool ties>\n    __aicore__ inline void MaterializeIncremental(")
+    source = source.replace(" void SaveIncremental(unsigned){", helper + "\n void SaveIncremental(unsigned){")
+    light_source = (INDEXER / "incremental_light.h").read_text()
+    light_functions = "\n".join(function(light_source, name) for name in (
+        "__simd_vf__ inline void MapNewIds(", "__simd_vf__ inline void TieOrdinals(",
+        "__simd_vf__ inline void GatherIds(", "__simd_vf__ inline void ListHeader(",
+    ))
+    source = source.replace("using ::kTop;", "using ::kTop; constexpr unsigned kMappedWord=4928;\n" + light_functions, 1)
+    source = source.replace("enum class CMPMODE{GT,LT,GE,NE};", "enum class CMPMODE{GT,LT,GE,NE,EQ};")
+    source = source.replace("a.v[i]!=b.v[i]);", "C==CMPMODE::EQ?a.v[i]==b.v[i]:a.v[i]!=b.v[i]);")
+    source = source.replace("enum class LoadDist{DIST_BRC_B16};", "enum class LoadDist{DIST_BRC_B16,DIST_UNPACK_B16};")
+    source = source.replace("template<class T,LoadDist>void LoadAlign(RegTensor<T>& r,T* p){r.v.fill(*p);}",
+        "template<class T,LoadDist L>void LoadAlign(RegTensor<T>& r,T* p){if constexpr(L==LoadDist::DIST_UNPACK_B16){auto q=reinterpret_cast<uint32_t*>(r.v.data());for(unsigned i=0;i<64;++i)q[i]=p[i];}else r.v.fill(*p);}")
+    source = source.replace("namespace topkb16gather {", "namespace topkb16gather {\nvoid FindValueOutputVFImpl(uint16_t* out,uint16_t* in,uint16_t* indices,uint16_t loops){for(unsigned i=0;i<loops*128;++i)out[i]=in[indices[i]];}\n")
     # Alternate sparse/empty windows with dense ones so a full Kth update
     # is followed by the tie fast path, exercising the retained strict count.
     source = source.replace("unsigned admitted=std::min(count,extent);",
@@ -127,6 +143,6 @@ namespace Simt {
     exe = cpp.with_suffix("")
     subprocess.run(["c++", "-std=c++17", "-O1", "-fsanitize=address,undefined",
                     "-DKVIP_INCREMENTAL_WINDOW=1", "-DKVIP_INCREMENTAL_PREFILTER=1",
-                    "-DKVIP_INCREMENTAL_DIRECT=1", f"-DKVIP_INCREMENTAL_TIES={ties}",
+                    "-DKVIP_INCREMENTAL_DIRECT=1", f"-DKVIP_INCREMENTAL_TIES={ties}", f"-DKVIP_INCREMENTAL_LIGHT={light}",
                     str(cpp), "-o", str(exe)], check=True)
     subprocess.run([str(exe)], check=True, timeout=30)

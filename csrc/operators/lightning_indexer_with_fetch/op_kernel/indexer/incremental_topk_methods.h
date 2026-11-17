@@ -18,6 +18,44 @@
     uint32_t incrementalStrict_ = 0;
 #endif
 
+#if KVIP_INCREMENTAL_DIRECT
+    template<bool ties>
+    __aicore__ inline void MaterializeIncremental(__ubuf__ uint16_t* idx,
+                                                 __ubuf__ uint16_t* offsets) {
+        auto values = reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_.GetPhyAddr());
+        auto previous = reinterpret_cast<__ubuf__ uint32_t*>(incrementalIds_.GetPhyAddr());
+        auto scores = reinterpret_cast<__ubuf__ uint16_t*>(scoreOutLocal_.GetPhyAddr());
+        auto ids = reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr());
+        auto pending = reinterpret_cast<__ubuf__ uint32_t*>(topkSharedTmpLocal_[32].GetPhyAddr());
+        uint32_t strict = 0;
+#if KVIP_INCREMENTAL_TIES
+        if constexpr (ties) strict = incrementalStrict_;
+#endif
+#if KVIP_INCREMENTAL_LIGHT
+        if (offsets) {
+            auto fresh = reinterpret_cast<__ubuf__ uint32_t*>(
+                topkSharedTmpLocal_[kvip_incremental::kMappedWord].GetPhyAddr());
+            if constexpr (ties) {
+                idx = reinterpret_cast<__ubuf__ uint16_t*>(topkOp_.IncrementalOrdinals().GetPhyAddr());
+                kvip_incremental::TieOrdinals(idx, uint16_t(strict), uint16_t(incrementalCount_));
+                PipeBarrier<PIPE_V>();
+            }
+            kvip_incremental::MapNewIds(offsets, fresh, incrementalCount_, incrementalBegin_,
+                incrementalReverseBegin_, incrementalReverseEnd_, incrementalTailBegin_, incrementalTailEnd_);
+            topkb16gather::FindValueOutputVFImpl(scores, values, idx, uint16_t(2048 / 128));
+            PipeBarrier<PIPE_V>();
+            kvip_incremental::GatherIds(idx, previous, fresh, ids, pending);
+            return;
+        }
+#endif
+        // Dense windows retain every original position; no compact-ID buffer
+        // is large enough for them. Keep the exact general remapping path.
+        kvip_incremental::Materialize<ties>(idx, values, previous, offsets, scores, ids, pending,
+            strict, incrementalCount_, incrementalBegin_, incrementalReverseBegin_, incrementalReverseEnd_,
+            incrementalTailBegin_, incrementalTailEnd_);
+    }
+#endif
+
     __aicore__ inline void SaveIncremental(uint32_t bank) {
         PipeBarrier<PIPE_V>();
         DataCopy(incrementalScores_, scoreOutLocal_, 2048);
@@ -127,14 +165,7 @@
         if (offsets && incrementalCount_ < kvip_incremental::kTop - incrementalStrict_) {
             // All new strict improvements fit in the old Kth tie group and
             // at least one old tie survives. Kth is therefore exactly unchanged.
-            kvip_incremental::Materialize<true>(nullptr,
-                reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_.GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint32_t*>(incrementalIds_.GetPhyAddr()), offsets,
-                reinterpret_cast<__ubuf__ uint16_t*>(scoreOutLocal_.GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint32_t*>(topkSharedTmpLocal_[32].GetPhyAddr()),
-                incrementalStrict_, incrementalCount_, incrementalBegin_,
-                incrementalReverseBegin_, incrementalReverseEnd_, incrementalTailBegin_, incrementalTailEnd_);
+            MaterializeIncremental<true>(nullptr, offsets);
             incrementalPending_ = GetSpr<SpecialPurposeReg::AR>() / sizeof(uint32_t);
             incrementalPacked_ = true;
             PipeBarrier<PIPE_V>();
@@ -160,13 +191,7 @@
 #endif
         topkb16gather::FindIdxEQOutputVFImpl(idx, values, uint16_t(0), kth, uint16_t(size / 128));
         PipeBarrier<PIPE_V>();
-        kvip_incremental::Materialize<false>(idx, values,
-            reinterpret_cast<__ubuf__ uint32_t*>(incrementalIds_.GetPhyAddr()), offsets,
-            reinterpret_cast<__ubuf__ uint16_t*>(scoreOutLocal_.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ uint32_t*>(topkSharedTmpLocal_[32].GetPhyAddr()),
-            0, 0, incrementalBegin_, incrementalReverseBegin_, incrementalReverseEnd_,
-            incrementalTailBegin_, incrementalTailEnd_);
+        MaterializeIncremental<false>(idx, offsets);
         incrementalPending_ = GetSpr<SpecialPurposeReg::AR>() / sizeof(uint32_t);
         incrementalPacked_ = true;
 #else
@@ -203,16 +228,23 @@
         const uint32_t count = GetSpr<SpecialPurposeReg::AR>() / sizeof(uint32_t);
         auto header = flags[2048];
 #endif
+#if KVIP_INCREMENTAL_LIGHT
+        kvip_incremental::ListHeader(reinterpret_cast<__ubuf__ uint32_t*>(header.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_[(query%2)*128].GetPhyAddr()), count, epoch+1);
+#else
         Duplicate(header,uint32_t(0),32);
         SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
         header.SetValue(0,count);
         // Reuse this already-transferred header for untimed prefix validation.
         header.SetValue(1,prefixThreshold_.GetValue((query%2)*128));
         header.SetValue(2,epoch+1);
+#endif
         GlobalTensor<uint32_t> output;
         output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->incrementalLists) +
             uint64_t(query*runtimeShape_.rounds+epoch)*kvip_incremental::kListWords);
+#if !KVIP_INCREMENTAL_LIGHT
         SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+#endif
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
 #if KVIP_INCREMENTAL_DIRECT
         DataCopy(output,header,32+(count+7)/8*8);
@@ -222,11 +254,15 @@
         DataCopy(output,header,32);
 #endif
         SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+#if KVIP_INCREMENTAL_LIGHT
+        DataCopy(rotationProgressGm_[query*32+kvip_incremental::kReadyWord],header[8],8);
+#else
         header.SetValue(0,epoch+1);
         SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
         // DMA only this 32-byte stripe; scalar cache-line writeback could
         // overwrite the adjacent normal progress stripe with a stale value.
         DataCopy(rotationProgressGm_[query*32+kvip_incremental::kReadyWord],header,8);
+#endif
         SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
     }
 #endif
