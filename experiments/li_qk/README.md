@@ -49,6 +49,10 @@ Q1 使用现有 Q2 的最小 M/Fixpipe 物理对齐布局，actual qlen=1。Cube
 
 ## 构建与 A5 执行
 
+当前服务器已确认`/home/w00568585 → /home/w00568585`共享映射。推荐在宿主机执行`bash update_shared_a5.sh`，固定更新`/home/w00568585/li_qk_shared`，不要求Docker CLI、不编译或运行NPU；容器中执行`bash /home/w00568585/li_qk_shared/run_in_container.sh`，沿用原Python/CANN环境进行7点真机实验。
+
+可先给容器启动命令加`--verify-only`，确认共享文件和哈希可见；它只验证映射，不跑实验。宿主机更新器支持`--no-proxy`和`--offline-bundle PATH`。使用不可变release目录，容器一次固定一个release，避免宿主机后续更新覆盖正在使用的代码包；宿主机Git缓存不用于容器worktree。脚本使用已有挂载，不创建新映射。
+
 代码准备入口为`sync_a5_host.sh`。执行`bash sync_a5_host.sh --no-proxy`，脚本自动创建固定目录`/tmp/li_qk_sync`，同步MR14，生成启动脚本和离线包。可用容器CLI时自动识别Docker/Podman/nerdctl并复制到目标容器；没有CLI时只准备本地文件，不因缺少Docker而失败。可用`--runtime`显式选择工具，nerdctl可加`--namespace`。`--container`指定实际容器。
 
 当前终端已能访问NPU/CANN时，可直接执行`bash sync_a5_host.sh --no-proxy --run-here`同步并运行，不需要容器管理工具。`run-here`指当前登录的A5真机终端，先检查`npu-smi info`与Model preload，再构建`RUN_MODE=npu`并使用ACL设备事件计时；不切换成Model/CPU计算。设备5是否可用还由实际ACL运行检查。只准备源码用`--sync-only`。运行参数放在`--`后，例如`--run-here -- --kvaf-include /path/to/include`。默认使用原KVIP checkout，缺少该目录时使用新建的bare仓库建立实验worktree。网络不可用时将`--no-proxy`换成`--offline-bundle /path/to/li_qk_mr14_offline.bundle`。
