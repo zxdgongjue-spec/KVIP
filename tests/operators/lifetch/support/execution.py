@@ -3377,9 +3377,27 @@ class FusedReplayState:
         for row in range(self.batch):
             mask = slots[row] < self.resident
             selected_slots = slots[row][mask]
-            if (np.any(hot_valid[row, selected_slots] == 0)
-                    or not np.array_equal(layout[row, selected_slots], ids[row][mask])):
-                raise RuntimeError(f'Replay selected hot mapping invalid: request={row}')
+            selected_ids = ids[row][mask]
+            invalid = hot_valid[row, selected_slots] == 0
+            wrong_owner = layout[row, selected_slots] != selected_ids
+            bad = invalid | wrong_owner
+            if np.any(bad):
+                positions = np.argwhere(mask)
+                examples = []
+                for index in np.flatnonzero(bad)[:16]:
+                    q, position = positions[index]
+                    slot, token = int(selected_slots[index]), int(selected_ids[index])
+                    expected = self.pages.token_payload(row, np.asarray([token]))[0]
+                    examples.append(dict(query=int(q) + 1, position=int(position),
+                                         token=token, slot=slot,
+                                         hot_valid=int(hot_valid[row, slot]),
+                                         slot_token=int(layout[row, slot]),
+                                         kv_matches=bool(np.array_equal(output[row, slot], expected))))
+                detail = dict(request=row, round=inputs.source_round,
+                              invalid_positions=int(invalid.sum()),
+                              wrong_owner_positions=int(wrong_owner.sum()), examples=examples)
+                print('REPLAY HOT MAPPING AUDIT: ' + json.dumps(detail), flush=True)
+                raise RuntimeError(f'Replay selected hot mapping invalid: {json.dumps(detail)}')
         failures = []
         try:
             inputs.validate_topk(ids)
