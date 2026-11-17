@@ -3,7 +3,9 @@
 set -Eeuo pipefail
 
 LI_REPO=/home/w00568585/wt-mr14
-LI_REF=0c1d483
+LI_REF=FETCH_HEAD
+LI_SUITE=orthogonal8
+LI_PROFILE=0
 LI_BRANCH=codex/split-core-unified-comparison
 LI_WORK_ROOT=/home/w00568585
 LI_OUTPUT_ROOT=/home/w00568585
@@ -23,9 +25,9 @@ LI_OUT=
 usage() {
     cat <<'USAGE'
 Usage: bash run_a5.sh [options]
-Run in the existing A5 container; fixed B1/Q4/H131072, seven orthogonal points.
+Run in the existing A5 container; B1/Q4/H131072 eight points, or B16/30-core controls.
   --repo PATH          Existing KVIP checkout (default /home/w00568585/wt-mr14)
-  --ref COMMIT         Experiment revision on MR14 (default 0c1d483)
+  --ref COMMIT         Experiment revision on MR14 (default fetched MR14 head)
   --cann-root PATH     CANN root containing compiler/tikcpp; auto-detected if omitted
   --kvaf-include PATH  Directory containing kvaf_batch_get_device.h and batch_get_abi.h
   --soc NAME           Actual CANN SoC (default Ascend950PR_9599)
@@ -34,6 +36,8 @@ Run in the existing A5 container; fixed B1/Q4/H131072, seven orthogonal points.
   --python PATH        Existing Python environment executable (default python3)
   --work-root PATH     Parent of new detached worktree (default /home/w00568585)
   --output-root PATH   Parent of new results directory (default /home/w00568585)
+  --suite NAME         orthogonal7, orthogonal8 (default), or batch16
+  --profile            Also collect separate msprof LI traces after benchmark
   --sdk-reference      Also measure SDK standalone LI; requires torch_npu
   --no-proxy           Bypass proxy only for this Git fetch; leaves Git config unchanged
   --skip-fetch         Use the selected local commit without any network fetch
@@ -49,12 +53,13 @@ while (($#)); do
     case "$1" in
         -h|--help) usage; exit 0 ;;
         --sdk-reference) LI_SDK=1; shift ;;
+        --profile) LI_PROFILE=1; shift ;;
         --no-proxy) LI_NO_PROXY=1; shift ;;
         --skip-fetch) LI_SKIP_FETCH=1; shift ;;
-        --repo|--ref|--cann-root|--kvaf-include|--soc|--device|--aics|--aivs|--python|--work-root|--output-root|--git-bundle)
+        --suite|--repo|--ref|--cann-root|--kvaf-include|--soc|--device|--aics|--aivs|--python|--work-root|--output-root|--git-bundle)
             (($# >= 2)) && [[ -n $2 ]] || die "Missing value for $1"
             case "$1" in
-                --repo) LI_REPO=$2 ;; --ref) LI_REF=$2 ;;
+                --suite) LI_SUITE=$2 ;; --repo) LI_REPO=$2 ;; --ref) LI_REF=$2 ;;
                 --cann-root) LI_CANN=$2 ;; --kvaf-include) LI_KVAF=$2 ;;
                 --soc) LI_SOC=$2 ;; --device) LI_DEVICE=$2 ;;
                 --aics) LI_AICS=$2 ;; --aivs) LI_AIVS=$2 ;;
@@ -66,11 +71,17 @@ while (($#)); do
         *) die "Unknown option: $1 (see --help)" ;;
     esac
 done
+[[ $LI_SUITE == orthogonal7 || $LI_SUITE == orthogonal8 || $LI_SUITE == batch16 ]] || die "Unknown suite: $LI_SUITE"
+if [[ $LI_SUITE == batch16 ]]; then LI_AICS=30; LI_AIVS=60; fi
+if ((LI_SKIP_FETCH)) && [[ $LI_REF == FETCH_HEAD ]]; then die "--skip-fetch requires an explicit --ref COMMIT"; fi
 for LI_NUM in "$LI_DEVICE" "$LI_AICS" "$LI_AIVS"; do
     [[ $LI_NUM =~ ^(0|[1-9][0-9]*)$ && ${#LI_NUM} -le 3 ]] || die 'Device/budgets must be nonnegative integers'
 done
 ((LI_AICS >= 1 && LI_AICS <= 32 && LI_AIVS >= 2 && LI_AIVS <= 64)) || die 'Supported budget: AIC 1..32, AIV 2..64'
-[[ ${LD_PRELOAD:-} != *libruntime_camodel* ]] || die 'Use the physical A5 environment, without Model preload'
+if [[ $LI_SUITE == orthogonal8 ]]; then
+    ((LI_AICS == 32 && LI_AIVS == 64)) || die 'orthogonal8 K32 requires 32 AIC/64 AIV'
+fi
+[[ ${LD_PRELOAD:-} != *libruntime_camodel* && ${LD_PRELOAD:-} != *libruntime_cmodel* ]] || die 'Use the physical A5 environment, without Model preload'
 for LI_CMD in git tar tee mktemp "$LI_PYTHON"; do
     command -v "$LI_CMD" >/dev/null || die "Command unavailable: $LI_CMD"
 done
@@ -181,15 +192,18 @@ cd "$LI_WT"
 run_logged npu-smi.log npu-smi info
 run_logged cpu-check.log "$LI_PYTHON" experiments/li_qk/test_controls.py
 "$LI_PYTHON" experiments/li_qk/run.py plan --details --history 131072 \
-    --aics "$LI_AICS" --aivs "$LI_AIVS" > "$LI_OUT/plan.json"
+    --suite "$LI_SUITE" --aics "$LI_AICS" --aivs "$LI_AIVS" > "$LI_OUT/plan.json"
 run_logged build-console.log "$LI_PYTHON" experiments/li_qk/run.py build \
     --cann-root "$LI_CANN" --soc "$LI_SOC" --kvaf-include "$LI_KVAF" --output "$LI_OUT/build"
-LI_RUN_ARGS=(--build "$LI_OUT/build" --device "$LI_DEVICE" --history 131072
+LI_RUN_ARGS=(--suite "$LI_SUITE" --build "$LI_OUT/build" --device "$LI_DEVICE" --history 131072
     --aics "$LI_AICS" --aivs "$LI_AIVS" --warmup 4 --iterations 20 --rounds 3
     --output "$LI_OUT/results")
 if ((LI_SDK)); then LI_RUN_ARGS+=(--sdk-reference); fi
 run_logged runner.log "$LI_PYTHON" experiments/li_qk/run.py run "${LI_RUN_ARGS[@]}"
 run_logged summarize.log "$LI_PYTHON" experiments/li_qk/run.py summarize "$LI_OUT/results"
-printf '\nSeven-point summary (ratios < 1 indicate acceleration):\n'
+if ((LI_PROFILE)); then
+    run_logged profile.log "$LI_PYTHON" experiments/li_qk/profile.py run --build "$LI_OUT/build" --output "$LI_OUT/msprof" --device "$LI_DEVICE" --suite "$LI_SUITE"
+fi
+printf '\nSelected-suite summary (ratios < 1 indicate acceleration):\n'
 cat "$LI_OUT/results/summary.csv"
 printf '\nCompleted. Summary: %s/results/summary.csv\n' "$LI_OUT"

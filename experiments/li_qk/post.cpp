@@ -26,7 +26,7 @@ extern "C" __global__ __aicore__ void li_qk_scatter(
             uint32_t n=t->end-t->begin-x;if(n>4096)n=4096;
             DataCopy(local,src[(uint64_t(row)*physicalGroup+q)*stride+x],n);
             SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-            DataCopy(dst[(uint64_t(t->queryBegin)+q)*history+t->begin+x],local,n);
+            DataCopy(dst[(uint64_t(t->owner)*4+t->queryBegin+q)*history+t->begin+x],local,n);
             SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
         }
         pipe.Destroy();
@@ -34,11 +34,11 @@ extern "C" __global__ __aicore__ void li_qk_scatter(
 #endif
 }
 extern "C" __global__ __aicore__ void li_qk_topk(
-    GM_ADDR canonical,GM_ADDR indices,GM_ADDR context,uint32_t history,uint32_t heads) {
+    GM_ADDR canonical,GM_ADDR indices,GM_ADDR context,uint32_t history,uint32_t heads,uint32_t queries) {
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     if ASCEND_IS_AIV {
-        using namespace AscendC;using namespace QLICommon;uint32_t q=GetBlockIdx();if(q>=4)return;
+        using namespace AscendC;using namespace QLICommon;uint32_t globalQ=GetBlockIdx();if(globalQ>=queries)return;uint32_t q=globalQ%4,owner=globalQ/4;
         using Type=QLIType<fp8_e4m3fn_t,fp8_e4m3fn_t,int32_t,true,LI_LAYOUT::BSND,LI_LAYOUT::PA_BSND,
                           bfloat16_t,float,float,uint16_t>;
         TPipe pipe;QLIKernel::QLIVector<Type> op;ConstInfo c{};
@@ -48,12 +48,12 @@ extern "C" __global__ __aicore__ void li_qk_topk(
         QLITilingData tiling{};op.InitParams(c,&tiling,true);
         GlobalTensor<uint16_t> scores;GlobalTensor<int32_t> output,pages;
         GlobalTensor<bfloat16_t> weights;GlobalTensor<float> qs,ks;
-        scores.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(canonical));
-        output.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(indices));
+        scores.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(canonical)+uint64_t(owner)*4*history);
+        output.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(indices)+uint64_t(owner)*4*2048);
         op.InitVecInputTensor(weights,qs,ks,output,pages);op.InitVecWorkspaceTensor(scores);
         // Only the shape and optional queryEnds are read; no queues/Service.
         op.SetRotationContext(context);op.InitBuffers(&pipe,true);
-        RunInfo info{};info.actS1Size=4;info.actS2Size=info.actS2SizeOrig=info.validS2Len=history;
+        RunInfo info{};info.bIdx=owner;info.actS1Size=4;info.actS2Size=info.actS2SizeOrig=info.validS2Len=history;
         op.AllocEventID();op.ProcessTopK(info,q);op.FreeEventID();pipe.Destroy();
     }
 #endif

@@ -1,4 +1,4 @@
-# B1/Q4：独立 LI 的 Q/K 分核控制实验
+# B1/Q4 与 B16：独立 LI 的 Q/K 分核控制实验
 
 旧 LIFetch 优化保存在提交 `20adb7e` 与本地分支 `codex/mr14-lifetch-saved-20adb7e`。此目录作为 MR14 的独立 LI 控制实验补充，不修改原生产 kernel 或默认路由。
 
@@ -49,7 +49,7 @@ Q1 使用现有 Q2 的最小 M/Fixpipe 物理对齐布局，actual qlen=1。Cube
 
 ## 构建与 A5 执行
 
-当前服务器已确认`/home/w00568585 → /home/w00568585`共享映射。推荐在宿主机执行`bash update_shared_a5.sh`，固定更新`/home/w00568585/li_qk_shared`，不要求Docker CLI、不编译或运行NPU；容器中执行`bash /home/w00568585/li_qk_shared/run_in_container.sh`，沿用原Python/CANN环境进行7点真机实验。
+当前服务器已确认`/home/w00568585 → /home/w00568585`共享映射。推荐在宿主机执行`bash update_shared_a5.sh`，固定更新`/home/w00568585/li_qk_shared`，不要求Docker CLI、不编译或运行NPU；容器中执行`bash /home/w00568585/li_qk_shared/run_in_container.sh`，沿用原Python/CANN环境。默认八点；原七点加`--suite orthogonal7`，B16控制组加`--suite batch16`。
 
 可先给容器启动命令加`--verify-only`，确认共享文件和哈希可见；它只验证映射，不跑实验。宿主机更新器支持`--no-proxy`和`--offline-bundle PATH`。使用不可变release目录，容器一次固定一个release，避免宿主机后续更新覆盖正在使用的代码包；宿主机Git缓存不用于容器worktree。脚本使用已有挂载，不创建新映射。
 
@@ -57,7 +57,7 @@ Q1 使用现有 Q2 的最小 M/Fixpipe 物理对齐布局，actual qlen=1。Cube
 
 当前终端已能访问NPU/CANN时，可直接执行`bash sync_a5_host.sh --no-proxy --run-here`同步并运行，不需要容器管理工具。`run-here`指当前登录的A5真机终端，先检查`npu-smi info`与Model preload，再构建`RUN_MODE=npu`并使用ACL设备事件计时；不切换成Model/CPU计算。设备5是否可用还由实际ACL运行检查。只准备源码用`--sync-only`。运行参数放在`--`后，例如`--run-here -- --kvaf-include /path/to/include`。默认使用原KVIP checkout，缺少该目录时使用新建的bare仓库建立实验worktree。网络不可用时将`--no-proxy`换成`--offline-bundle /path/to/li_qk_mr14_offline.bundle`。
 
-一键脚本为`run_a5.sh`，在原A5容器与Python环境中执行。默认拉取MR14源分支并固定实验提交`0c1d483`，建立新worktree，检查依赖，构建，执行7点，汇总并打包；失败停止并打包已生成日志。原checkout和每次结果均保留。CANN路径优先从当前环境识别；KVAF优先使用原checkout的`third_party/KVAF`。
+一键脚本为`run_a5.sh`，在原A5容器与Python环境中执行。默认拉取MR14源分支并固定本次FETCH_HEAD，建立新worktree，检查依赖，构建，执行所选套件，汇总并打包；失败停止并打包已生成日志。原checkout和每次结果均保留。CANN路径优先从当前环境识别；KVAF优先使用原checkout的`third_party/KVAF`。
 
 ```bash
 bash experiments/li_qk/run_a5.sh \
@@ -65,7 +65,7 @@ bash experiments/li_qk/run_a5.sh \
   --kvaf-include /path/to/KVAF/access_operator/demo/aiv_batch_get/include
 ```
 
-脚本可单独下载后用`bash run_a5.sh`执行。依赖在默认位置时无需参数；路径不同时传`--cann-root`/`--kvaf-include`。实际可用预算不同时传`--aics 28 --aivs 56`，SDK对照加`--sdk-reference`。使用`--help`查看参数。它记录npu-smi，但不自动推断资源预算或排除其它工具的设备占用；在device 5空闲时执行。
+脚本可单独下载后用`bash run_a5.sh`执行。依赖在默认位置时无需参数；路径不同时传`--cann-root`/`--kvaf-include`。八点要求32/64；实际预算例如28/56时使用`--suite orthogonal7 --aics 28 --aivs 56`。SDK对照加`--sdk-reference`。使用`--help`查看参数。它记录npu-smi，但不自动推断资源预算或排除其它工具的设备占用；在device 5空闲时执行。
 
 若`fetch.log`报`CONNECT tunnel failed, response 400`，错误发生在Git拉取阶段，尚未构建/运行LI。可给更新后的脚本加`--no-proxy`，仅此次fetch清除代理环境及Git代理配置覆盖；不修改持久配置，也不关闭TLS校验。容器无法直连GitCode时，将提供的`li_qk_mr14_offline.bundle`放入容器并执行：
 
@@ -73,7 +73,7 @@ bash experiments/li_qk/run_a5.sh \
 bash run_a5.sh --git-bundle /path/to/li_qk_mr14_offline.bundle
 ```
 
-离线包需要包含`refs/remotes/origin/codex/split-core-unified-comparison`，脚本验证后从本地文件导入。已经具有`0c1d483`时也可用`--skip-fetch`完全跳过联网；缺少该提交则明确失败，不改用旧版代码。下载文件中的`--git-bundle`路径与依赖路径均可自定义。
+离线包需要包含`refs/remotes/origin/codex/split-core-unified-comparison`，脚本验证后从本地文件导入。已有所需新提交时也可用`--skip-fetch --ref COMMIT`完全跳过联网；缺少指定提交则明确失败，不改用旧版代码。下载文件中的`--git-bundle`路径与依赖路径均可自定义。
 
 在包含此目录及 MR14 `20adb7e` LI 源码的 checkout 中，启用原 CANN/TorchNPU 环境。替换 CANN、SoC 与 KVAF include 路径为实际值；使用新构建目录，避免 CANN 增量对象二次转换的问题。
 
@@ -100,4 +100,59 @@ python3 experiments/li_qk/run.py summarize \
 
 `summary.csv/json`保存7组 score/LI微秒数和相对串行比值；`measurements.csv`保留每轮结果。manifest绑定fixture、源码快照、构建binary/library、预算请求、命令、npu-smi输出。完整score key SHA必须等于独立oracle；TopK核验唯一、合法、包含所有严格大于Kth阈值的元素，允许阈值处合法tie，guard和输入只读检查在计时外完成。
 
-本机没有A5。CPU host/stub、源码覆盖和 CANN 编译各自报告，不当作设备数值、同步或性能验收；A5性能列由上述真机脚本生成。普通事件计时与 msprof 分开采集，trace中应只有score、必要的scatter与全局TopK；启用SDK时另有SDK QLI。
+本机没有A5。CPU host/stub、源码覆盖、CANN编译与Model各自报告，不能当作A5性能验收；A5性能列由上述真机脚本生成。普通事件计时与 msprof 分开采集，trace中应只有score、必要的scatter与全局TopK；启用SDK时另有SDK QLI。实际Model验证范围见`EXTENSION_REPORT.md`。
+
+## K32 与 B16/30 AIC 扩展（2026-11-17）
+
+设计要求见 `EXTENSION_PROMPT.md`。原七点仍用 `--suite orthogonal7`，新增八点用 `--suite orthogonal8`；八点必须 32 AIC/64 AIV，K32 的每个 task 是 Q4×H4096。`run_a5.sh` 默认改为八点，并使用本次拉取的 MR14 revision，避免仍执行旧的 `0c1d483`。共享目录 launcher 固定使用发布 release 的 `SOURCE_COMMIT`。
+
+按已经确认的共享挂载，在宿主机运行最新 `update_shared_a5.sh`，随后在 A5 容器运行：
+
+```bash
+# B1：原七点 + K32；最后单独采集 K32 msprof
+bash /home/w00568585/li_qk_shared/run_in_container.sh --suite orthogonal8 --profile
+
+# B16：三个控制组；只使用 30 个 AIC 核组执行 score
+bash /home/w00568585/li_qk_shared/run_in_container.sh --suite batch16 --profile
+```
+
+B16 的对照组为 T1（16 task，owner 间并行，每 owner 单核），候选为 T2 普通 waves（32 task，30+2 两波）与 T2 balanced。每轮均按 B16 T1 配对，不使用 B1 时间归一化。上述 `batch16` 自动固定 score 预算为 30 AIC/60 AIV；Final TopK 独立使用 64 AIV，每个真实 query 一核。该预算针对 score，并非整条 LI 都限制在 60 AIV。
+
+balanced 将 32 个逻辑 half-task 展平为 1024 个 2048-key 块，30 个核组分别处理 34/35 块（H69632/H71680）。每核独立消费 owner/half 边界的片段列表，一次 score kernel 启动内完成；不同 owner 的 query/weight/scale、真实输出地址保持分离。**均衡意味着每 owner 的两个逻辑 half 可再细分和迁移到不同物理核；不再固定每 owner 恰好由两个物理核完成。** 要严格固定两核/owner，就必须接受 30+2 调度或另做串行 owner 配对。此实现保留 scatter，片段切换仍有 QLI/TPipe 初始化和 CV/VC drain 成本，不能仅凭块数均衡宣称提速。
+
+`profile.py` 是独立的真机采集入口，要求 NPU binary，保留 `msprof --application`、`--aic-metrics=PipeUtilization`、export 命令、正确性和 trace。profile 的 warmup4/iterations5 LI-only 调用不会写入常规 benchmark summary。需要单独重采时：
+
+```bash
+python3 experiments/li_qk/profile.py run --suite batch16 --device 5 \
+  --build /home/w00568585/li_qk_结果目录/build \
+  --output /home/w00568585/li_qk_b16_msprof_新目录
+```
+
+### 仿真动态指令采集
+
+在专用 CANN950 simulator 容器构建 `--run-mode sim`，然后执行（路径按容器内实际位置替换）：
+
+```bash
+python3 experiments/li_qk/model.py run --build /work/model-build \
+  --output /work/b16-model-new --history 131072 \
+  --model-lib /usr/local/Ascend/cann-9.1.0/aarch64-linux/simulator/dav_3510/lib \
+  --timeout 900
+```
+
+默认分别采集三个方案的 score/scatter/TopK；`--stage all` 额外验证真实完整链，`--history 8192` 仅为缩小尺寸 smoke。默认日志只开 physical core0，`--core-mask 0xffffffff` 才采集全部核组，需要足够磁盘。所有 Model 指令占比只针对已记录的核，不能当作全设备时间占比；配置与已记录核覆盖写入 manifest。scatter/TopK 单阶段运行在 GM 中预填相同的 oracle score，不能用它证明 producer/consumer 重叠。
+
+`instructions.py` 按 kernel stage 目录分别统计 AIC/AIV 的动态 issue 指令、pipeline、opcode 和 unknown。不混算 AIC 与 AIV 分母；可用 `--pc-map` 提供经过 ELF symbol/section 与运行时 entry PC 校验的区间。共享 VF 只能在已确认串行 kernel 边界的日志中归属当前 score kernel；没有可靠映射时保留 unmapped。PC 没有可靠源码映射时，不填算法子过程的时间占比。旋转日志、退出失败或超时必须保留并标明；Model ticks 不能换算为 A5 微秒。原始 dump 逐 case 压缩保存。
+
+如需进一步区分带宽与流水线利用率，给 `profile.py` 加 `--metrics Memory` 或 `--metrics ResourceConflictRatio`，分别使用新输出目录。动态指令数量的百分比不等于这些硬件利用率。
+
+自动验证PC映射并统计已采集的Model日志（不会重新执行kernel）：
+
+```bash
+python3 experiments/li_qk/map_model_pcs.py /work/model-results/T2_balanced_all \
+  --build /work/model-build --objdump /path/to/ccec_compiler/bin/llvm-objdump \
+  --output /work/model-results/T2_balanced_all/verified-kernel-instructions
+```
+
+要求对应case的原manifest与相同captured build，输出入口/ELF/SHA证明、kernel PC范围及动态统计。独立consumer的image基址会变化，不能复用完整链的硬编码地址。结果中的`capture_complete`反映原case是否完整PASS；部分超时日志不能当完整统计。
+
+本轮实际结果与限制见`EXTENSION_REPORT.md`：B16/H8K三控制组完整LI通过，修复了balanced片段切换时AIV1 credits残留；H128K独立scatter/TopK通过；H128K完整score600秒超时。仅开core0日志，没有全核score统计或真实A5 msprof trace。

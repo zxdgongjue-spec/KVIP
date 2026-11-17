@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build or run seven orthogonal B1/Q4 LI controls. No LIFetch/transport calls."""
+"""Build or run orthogonal B1/Q4 and balanced B16 LI controls. No LIFetch/transport calls."""
 import argparse
 import csv
 import hashlib
@@ -16,38 +16,98 @@ import time
 ROOT=Path(__file__).resolve().parents[2]
 HERE=Path(__file__).resolve().parent
 sys.path.insert(0,str(ROOT/'experiments/split_core'))
-from score_routes import make_fixture
+from score_routes import make_fixture as make_small_fixture, score_oracle
 from prepare_score_source import prepare
 
 # Shared T1/Qparts1 baseline; sweep each axis separately, never a Cartesian grid.
 POINTS=((1,1),(2,1),(4,1),(8,1),(16,1),(1,2),(1,4))
 
+def suite_cases(suite):
+    if suite in ('orthogonal7','orthogonal8'):
+        return [dict(batch=1,history_parts=t,query_parts=q,schedule='waves')
+                for t,q in POINTS+(((32,1),) if suite=='orthogonal8' else ())]
+    if suite=='batch16':
+        return [dict(batch=16,history_parts=t,query_parts=1,schedule=s)
+                for t,s in ((1,'waves'),(2,'waves'),(2,'balanced'))]
+    raise ValueError('unknown suite')
 
-def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def geometry(t,qp,history=131072,aics=32,aivs=64):
-    if t not in (1,2,4,8,16) or qp not in (1,2,4) or history<2048 or history>210944 or history%256:
-        raise ValueError('T=1/2/4/8/16, Qparts=1/2/4, aligned history 2048..210944 required')
+def sha(path):
+    h=hashlib.sha256()
+    with Path(path).open('rb') as f:
+        for block in iter(lambda:f.read(1024*1024),b''):h.update(block)
+    return h.hexdigest()
+
+
+def make_fixture(output,batch,history,heads):
+    if batch==1:return make_small_fixture(output,batch,history,heads)
+    # B16/H128K: avoid an all-owner float32 decoded key and dot temporary.
+    # Owner-wise oracle generation is outside all device timing intervals.
+    import numpy as np
+    output=Path(output);output.mkdir(parents=True,exist_ok=False)
+    rng=np.random.default_rng(20261115);query=np.zeros((batch,4,heads,128),np.uint8)
+    for b in range(batch):
+        for q in range(4):
+            for g in range(heads):query[b,q,g,(g*7+q*13+b)%128]=0x38 if (b+q+g)%3 else 0xB8
+    key=np.memmap(output/'key.bin',mode='w+',dtype=np.uint8,shape=(batch,history,128))
+    codes=np.array([0x00,0x20,0x30,0x38,0x40,0xB0,0xB8],np.uint8)
+    for b in range(batch):key[b]=rng.choice(codes,(history,128))
+    key.flush()
+    wf=rng.choice(np.array([0.25,0.5,1,-0.5],np.float32),(batch,4,heads))
+    weight=(wf.view(np.uint32)>>16).astype(np.uint16)
+    qs=rng.choice(np.array([0.5,1,2],np.float32),weight.shape)
+    ks=rng.choice(np.array([0.5,1,2],np.float32),(batch,history))
+    oracle=np.memmap(output/'oracle.bin',mode='w+',dtype=np.uint16,shape=(batch,4,history))
+    for b in range(batch):oracle[b]=score_oracle(query[b:b+1],key[b:b+1],weight[b:b+1],qs[b:b+1],ks[b:b+1])[0]
+    oracle.flush()
+    for name,value in dict(query=query,weight=weight,qscale=qs,kscale=ks).items():value.tofile(output/(name+'.bin'))
+    meta=dict(batch=batch,history=history,heads=heads,seed=20261115,
+              numerical_domain='finite sparse dyadic FP8, BF16 weights, signed per-owner data',
+              hashes={name:sha(output/(name+'.bin')) for name in ('query','key','weight','qscale','kscale','oracle')})
+    (output/'fixture.json').write_text(json.dumps(meta,indent=2)+'\n');return meta
+
+
+def geometry(t,qp,history=131072,aics=32,aivs=64,batch=1,schedule="waves"):
+    if t not in (1,2,4,8,16,32) or qp not in (1,2,4) or history<2048 or history>210944 or history%256:
+        raise ValueError('T=1/2/4/8/16/32, Qparts=1/2/4, aligned history 2048..210944 required')
     if not 1<=aics<=32 or not 2<=aivs<=64 or history//256<t:
         raise ValueError('valid AIC/AIV budget and nonempty shards required')
+    if batch not in (1,16) or schedule not in ('waves','balanced') or (batch==16 and (t>2 or qp!=1)):
+        raise ValueError('B1 axes or B16 T1/T2 Q4 required')
     group=4//qp;physical=max(2,group);capacity=min(aics,aivs//2)
     tasks=[dict(query_begin=q,query_count=group,begin=history//256*s//t*256,end=history//256*(s+1)//t*256)
-           for q in range(0,4,group) for s in range(t)]
+           for b in range(batch) for q in range(0,4,group) for s in range(t)]
+    if batch>1:
+        for i,task in enumerate(tasks):task["owner"]=i//(qp*t)
+    logical_tasks=len(tasks)
+    core_blocks=[]
+    if schedule=="balanced":
+        if (batch,t,qp,capacity)!=(16,2,1,30) or history%4096:
+            raise ValueError("balanced requires B16/T2/Q4,30 groups,H multiple of4096")
+        total=batch*history//2048;half=history//4096;cores=[]
+        for c in range(capacity):
+            lo=total*c//capacity;hi=total*(c+1)//capacity;core_blocks.append(hi-lo);pieces=[]
+            while lo<hi:
+                logical=lo//half;end=min(hi,(logical+1)*half);begin=(logical%2*half+lo%half)*2048
+                pieces.append(dict(query_begin=0,query_count=4,begin=begin,end=begin+(end-lo)*2048,owner=logical//2));lo=end
+            cores.append(pieces)
+        tasks=[cores[c][slot] if slot<len(cores[c]) else dict(query_begin=0,query_count=0,begin=0,end=0,owner=0)
+               for slot in range(max(map(len,cores))) for c in range(capacity)]
     lengths=[r['end']-r['begin'] for r in tasks]
     waves=[tasks[i:i+capacity] for i in range(0,len(tasks),capacity)]
-    logical=4*32*history*128
-    return dict(history_parts=t,query_parts=qp,logical_query_group=group,physical_query_tile=physical,
-                tasks=len(tasks),capacity=capacity,score_waves=len(waves),row_stride=max(lengths),
+    logical=batch*4*32*history*128
+    return dict(batch=batch,schedule=schedule,logical_tasks=logical_tasks,active_segments=sum(x>0 for x in lengths),core_blocks=core_blocks,history_parts=t,query_parts=qp,logical_query_group=group,physical_query_tile=physical,
+                tasks=len(tasks),capacity=capacity,score_waves=1 if schedule=="balanced" else len(waves),score_slots=len(waves),score_launches=1 if schedule=="balanced" else len(waves),row_stride=max(lengths),
                 key_tokens_per_task=sorted(set(lengths)),task_map=tasks,
                 useful_aivs_peak=max(len(w) for w in waves)*(1 if group==1 else 2),
                 allocated_aiv_groups_peak=2*max(len(w) for w in waves),
                 logical_qk_macs=logical,cube_macs_with_q_alignment=logical*(2 if group==1 else 1),
-                logical_key_read_payload_bytes=qp*history*128,
-                score_output_bytes=4*history*2,
+                logical_key_read_payload_bytes=batch*qp*history*128,
+                score_output_bytes=batch*4*history*2,
                 scratch_score_bytes=len(tasks)*physical*max(lengths)*2,
                 canonical_alias=t==1 and physical==group and len(waves)==1,
-                final_topk_aivs=4,k=2048,fetch_launches=0)
+                final_topk_aivs=batch*4,k=2048,fetch_launches=0)
 
 
 def build(a):
@@ -56,7 +116,7 @@ def build(a):
     a.output.mkdir(parents=True)
     before={str(p.relative_to(ROOT)):sha(p) for p in HERE.iterdir() if p.suffix in ('.cpp','.h','.txt','.py')}
     source=prepare(a.output/'source')
-    commands=[['cmake','-S',str(HERE),'-B',str(a.output/'build'),'-DRUN_MODE=npu',
+    commands=[['cmake','-S',str(HERE),'-B',str(a.output/'build'),'-DRUN_MODE='+a.run_mode,
                '-DSOC_VERSION='+a.soc,'-DASCEND_CANN_PACKAGE_PATH='+str(a.cann_root),
                '-DSCORE_SOURCE='+str(a.output/'source'),'-DKVAF_INCLUDE='+str(a.kvaf_include)],
               ['cmake','--build',str(a.output/'build'),'-j',str(a.jobs)]]
@@ -80,10 +140,12 @@ def build(a):
 
 def write_summary(output):
     manifest=json.loads((output/'manifest.json').read_text());planned=manifest['cases'];rows=[]
-    expected_points={(rnd,t,qp) for rnd in range(manifest['rounds']+1) for t,qp in POINTS}
-    actual_points=[(r['round'],r['history_parts'],r['query_parts']) for r in planned]
+    configs=suite_cases(manifest.get('suite','orthogonal7'))
+    key=lambda r:(r['history_parts'],r['query_parts'],r.get('schedule','waves'))
+    expected_points={(rnd,*key(c)) for rnd in range(manifest['rounds']+1) for c in configs}
+    actual_points=[(r['round'],*key(r)) for r in planned]
     if len(actual_points)!=len(expected_points) or set(actual_points)!=expected_points:
-        raise ValueError('exactly seven orthogonal points required in every round including r0')
+        raise ValueError('exactly the selected suite points required in every round including r0 (seven orthogonal by default)')
     if len({r['name'] for r in planned})!=len(planned):raise ValueError('duplicate case name')
     receipts={p.stem.removesuffix('.receipt'):p for p in output.glob('*.receipt.json')}
     sdk_cases=manifest.get('sdk_cases',[])
@@ -100,9 +162,11 @@ def write_summary(output):
         if sha(path)!=receipt['report_sha256']:raise ValueError('report changed')
         r=json.loads(path.read_text())
         required=('status','run_mode','batch','queries','history','heads','history_parts','query_parts','fetch_launches','warmup','iterations')
-        expected=('PASS','npu',1,4,manifest['history'],32,item['history_parts'],item['query_parts'],0,manifest['warmup'],manifest['iterations'])
+        expected=('PASS','npu',manifest.get('batch',1),4,manifest['history'],32,item['history_parts'],item['query_parts'],0,manifest['warmup'],manifest['iterations'])
         if tuple(r[k] for k in required)!=expected or not all(r[k] for k in ('guards','inputs_unchanged','topk_threshold_oracle')):
             raise ValueError('unaccepted scope/correctness: '+str(path))
+        if r.get('schedule','waves')!=item.get('schedule','waves') or r.get('phase','both')!='both' or r.get('model_stage','all')!='all':
+            raise ValueError('unaccepted schedule/isolated profiling report')
         for name in ('score','li'):
             v=r[name+'_p50_us'];samples=r[name+'_samples_us']
             if not isinstance(v,(int,float)) or not math.isfinite(v) or v<=0 or len(samples)!=manifest['iterations']:
@@ -111,7 +175,7 @@ def write_summary(output):
             if not math.isclose(v,statistics.median(samples),rel_tol=1e-8):raise ValueError('p50 does not match samples')
         if sha(output/item['name']/'score-keys.bin')!=manifest['fixture']['hashes']['oracle']:raise ValueError('canonical oracle SHA mismatch')
         if item['round']==0:continue
-        row=dict(round=item['round'],history_parts=item['history_parts'],query_parts=item['query_parts'],
+        row=dict(round=item['round'],batch=manifest.get('batch',1),schedule=item.get('schedule','waves'),history_parts=item['history_parts'],query_parts=item['query_parts'],
                  score_p50_us=r['score_p50_us'],li_p50_us=r['li_p50_us'],score_waves=r['score_waves'],
                  physical_query_tile=r['physical_query_tile'],report=str(path))
         rows.append(row)
@@ -132,10 +196,12 @@ def write_summary(output):
         if any(not isinstance(x,(int,float)) or not math.isfinite(x) or x<=0 for x in samples) or not math.isclose(v,statistics.median(samples),rel_tol=1e-8):raise ValueError('invalid SDK timing')
         sdk[item['round']]=v
     summary=[]
-    for t,qp in POINTS:
-        rr=[r for r in rows if (r['history_parts'],r['query_parts'])==(t,qp)]
+    for config in configs:
+        t,qp=config['history_parts'],config['query_parts']
+        rr=[r for r in rows if key(r)==key(config)]
         if len(rr)!=manifest['rounds']:raise ValueError('missing measured configuration')
-        row=dict(history_parts=t,query_parts=qp,logical_query_group=4//qp,
+        row=dict(batch=manifest.get('batch',1),schedule=config['schedule'],history_parts=t,query_parts=qp,logical_query_group=4//qp,
+                 reference='B16 T1: one group per owner' if manifest.get('batch',1)==16 else 'B1 T1: one group total',
                  score_p50_mean_us=statistics.mean(r['score_p50_us'] for r in rr),
                  li_p50_mean_us=statistics.mean(r['li_p50_us'] for r in rr),
                  score_over_serial_mean=statistics.mean(r['score_over_serial'] for r in rr),
@@ -156,7 +222,7 @@ def write_summary(output):
 
 def run(a):
     if a.output.exists():raise ValueError('fresh experiment output required')
-    if 'libruntime_camodel' in os.environ.get('LD_PRELOAD',''):raise ValueError('A5 controls reject Model preload')
+    if any(x in os.environ.get('LD_PRELOAD','') for x in ('libruntime_camodel','libruntime_cmodel')):raise ValueError('A5 controls reject Model preload')
     driver=a.build/'build/li_qk';build_path=a.build/'build-manifest.json'
     b=json.loads(build_path.read_text())
     if b['status']!='BUILT' or sha(driver)!=b['binary_sha256']:raise ValueError('unaccepted or changed build')
@@ -170,7 +236,8 @@ def run(a):
     try:
         os.write(fd,json.dumps(dict(pid=os.getpid(),device=a.device)).encode());os.close(fd)
         a.output.mkdir(parents=True)
-        fixture=make_fixture(a.output/'fixture',1,a.history,32)
+        configs=suite_cases(a.suite);batch=configs[0]['batch']
+        fixture=make_fixture(a.output/'fixture',batch,a.history,32)
         rng=random.Random(1417);cases=[];sdk_cases=[]
         for round_no in range(a.rounds+1):
             if a.sdk_reference:
@@ -178,15 +245,16 @@ def run(a):
                 cmd=[sys.executable,str(HERE/'native_li.py'),str(a.output/'fixture'),str(a.output/name),
                      '--device',str(a.device),'--warmup',str(a.warmup),'--iterations',str(a.iterations)]
                 sdk_cases.append(dict(name=name,round=round_no,argv=cmd))
-            pairs=list(POINTS);rng.shuffle(pairs)
-            for t,qp in pairs:
-                name=f'r{round_no}_T{t}_Qp{qp}'
+            pairs=list(configs);rng.shuffle(pairs)
+            for config in pairs:
+                t,qp=config['history_parts'],config['query_parts']
+                name=f'r{round_no}_T{t}_Qp{qp}'+('_balanced' if config['schedule']=='balanced' else '')
                 cmd=[str(driver),str(a.output/'fixture'),str(a.output/name),str(a.history),'32',str(a.aics),str(a.aivs),
-                     str(t),str(qp),str(a.warmup),str(a.iterations),str(a.device)]
-                cases.append(dict(name=name,round=round_no,history_parts=t,query_parts=qp,argv=cmd))
+                     str(t),str(qp),str(a.warmup),str(a.iterations),str(a.device),str(batch),config['schedule']]
+                cases.append(dict(name=name,round=round_no,history_parts=t,query_parts=qp,schedule=config['schedule'],argv=cmd))
         info=subprocess.run(['npu-smi','info'],capture_output=True,text=True)
         manifest=dict(scope='standalone LI; score and numeric score+canonical+global TopK; no Fetch/Service/Index',
-                      saved_lifetch_commit='20adb7e',history=a.history,heads=32,batch=1,queries=4,
+                      saved_lifetch_commit='20adb7e',suite=a.suite,history=a.history,heads=32,batch=batch,queries=4,
                       warmup=a.warmup,iterations=a.iterations,rounds=a.rounds,requested_aics=a.aics,requested_aivs=a.aivs,
                       fixture=fixture,build_manifest_sha256=sha(build_path),build_manifest=b,cases=cases,sdk_cases=sdk_cases,
                       native_reference_source_sha256=sha(HERE/'native_li.py') if a.sdk_reference else None,
@@ -216,9 +284,10 @@ def run(a):
 def main():
     p=argparse.ArgumentParser(description=__doc__);subs=p.add_subparsers(dest='action',required=True)
     b=subs.add_parser('build');b.add_argument('--output',type=Path,required=True);b.add_argument('--cann-root',type=Path,required=True)
-    b.add_argument('--soc',required=True);b.add_argument('--kvaf-include',type=Path,required=True);b.add_argument('--jobs',type=int,default=4)
+    b.add_argument('--soc',required=True);b.add_argument('--kvaf-include',type=Path,required=True);b.add_argument('--jobs',type=int,default=4);b.add_argument('--run-mode',choices=('npu','sim'),default='npu')
     for name in ('plan','run'):
         s=subs.add_parser(name);s.add_argument('--history',type=int,default=131072);s.add_argument('--aics',type=int,default=32);s.add_argument('--aivs',type=int,default=64)
+        s.add_argument('--suite',choices=('orthogonal7','orthogonal8','batch16'),default='orthogonal7')
         if name=='plan':s.add_argument('--details',action='store_true',help='include every query/history task interval')
         if name=='run':
             s.add_argument('--build',type=Path,required=True);s.add_argument('--output',type=Path,required=True);s.add_argument('--device',type=int,default=5)
@@ -230,15 +299,19 @@ def main():
     for key in ('output','build','cann_root','kvaf_include'):
         if hasattr(a,key):setattr(a,key,getattr(a,key).resolve())
     if a.action in ('plan','run'):
-        rows=[geometry(t,q,a.history,a.aics,a.aivs) for t,q in POINTS]
+        configs=suite_cases(a.suite)
+        rows=[geometry(c['history_parts'],c['query_parts'],a.history,a.aics,a.aivs,c['batch'],c['schedule']) for c in configs]
+        if a.suite=='orthogonal8' and min(a.aics,a.aivs//2)<32:p.error('K32 suite requires32 AIC/64 AIV; use orthogonal7 for smaller budgets')
+        if a.suite=='batch16' and min(a.aics,a.aivs//2)!=30:p.error('batch16 suite requires --aics30 --aivs60 (or64)')
     if a.action=='plan':
         if not a.details:rows=[{k:v for k,v in r.items() if k!='task_map'} for r in rows]
-        print(json.dumps(dict(status='NOT_RUN',batch=1,queries=4,history=a.history,heads=32,cases=rows),indent=2));return
+        print(json.dumps(dict(status='NOT_RUN',suite=a.suite,batch=configs[0]['batch'],queries=4,history=a.history,heads=32,cases=rows),indent=2));return
     if a.action=='summarize':write_summary(a.output);return
     if a.action=='build':
         if a.jobs<1:p.error('positive build jobs required')
         build(a);return
     if a.device<0 or a.rounds<1 or not 1<=a.warmup<=100 or not 1<=a.iterations<=1000 or a.timeout<1:p.error('valid sampling and device required')
+    if a.sdk_reference and a.suite=='batch16':p.error('SDK fixture adapter supports B1 only')
     a.lease=(a.lease or Path(f'/tmp/kvip-li-qk-device-{a.device}.lease')).resolve()
     run(a)
 

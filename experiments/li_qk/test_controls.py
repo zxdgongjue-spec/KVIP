@@ -44,18 +44,22 @@ static std::vector<unsigned short> oracle;
 static void load(){if(!oracle.empty())return;std::ifstream f(getenv("LI_QK_ORACLE"),std::ios::binary|std::ios::ate);auto n=f.tellg()/2;oracle.resize(n);f.seekg(0);f.read((char*)oracle.data(),n*2);}
 extern "C" unsigned aclrtlaunch_li_qk_score(unsigned,void*,void* binding,unsigned rows,unsigned stride,unsigned heads,unsigned group){
  mark('S');load();auto a=(unsigned long long*)binding;auto query=(unsigned char*)a[0];auto qlen=(unsigned*)a[5];auto klen=(unsigned*)a[6];auto pages=(int*)a[7];auto out=(unsigned short*)a[12];unsigned physical=group==1?2:group;
- for(unsigned r=0;r<rows;++r)for(unsigned q=0;q<qlen[r];++q){auto base=query+(r*physical+q)*heads*128;unsigned d=0;while(d<128&&!base[d])++d;unsigned realQ=d/13;unsigned begin=pages[r*stride/128]*128;
-  for(unsigned x=0;x<klen[r];++x)out[(r*physical+q)*stride+x]=oracle[realQ*(oracle.size()/4)+begin+x];}
+ for(unsigned r=0;r<rows;++r)for(unsigned q=0;q<qlen[r];++q){auto base=query+(r*physical+q)*heads*128;unsigned d=0;while(d<128&&!base[d])++d;unsigned h=oracle.size()/(4*(getenv("LI_QK_BATCH")?atoi(getenv("LI_QK_BATCH")):1));unsigned begin=pages[r*stride/128]*128;unsigned owner=begin/h;unsigned realQ=(d+128-owner)%128/13;
+  for(unsigned x=0;x<klen[r];++x)out[(r*physical+q)*stride+x]=oracle[(owner*4+realQ)*h+begin%h+x];}
  if(getenv("LI_QK_CORRUPT_PADDING")&&group==1)out[stride]=0;
  return 0;
 }
+extern "C" unsigned aclrtlaunch_li_qk_score_balanced(unsigned,void* stream,void* list,unsigned slots,unsigned rows,unsigned stride,unsigned heads,unsigned group){
+ mark('B');auto bindings=(unsigned long long*)list;
+ for(unsigned slot=0;slot<slots;++slot)aclrtlaunch_li_qk_score(rows,stream,(void*)bindings[slot],rows,stride,heads,group);return 0;
+}
 extern "C" unsigned aclrtlaunch_li_qk_scatter(unsigned,void*,void* input,void* canonical,void* tasks,unsigned rows,unsigned stride,unsigned h,unsigned physical){
  mark('C');auto src=(unsigned short*)input;auto dst=(unsigned short*)canonical;auto t=(li_qk::Task*)tasks;
- for(unsigned r=0;r<rows;++r)for(unsigned q=0;q<t[r].queryCount;++q)std::copy_n(src+(r*physical+q)*stride,t[r].end-t[r].begin,dst+(t[r].queryBegin+q)*h+t[r].begin);return 0;
+ for(unsigned r=0;r<rows;++r)for(unsigned q=0;q<t[r].queryCount;++q)std::copy_n(src+(r*physical+q)*stride,t[r].end-t[r].begin,dst+(t[r].owner*4+t[r].queryBegin+q)*h+t[r].begin);return 0;
 }
-extern "C" unsigned aclrtlaunch_li_qk_topk(unsigned,void*,void* canonical,void* indices,void*,unsigned h,unsigned){
+extern "C" unsigned aclrtlaunch_li_qk_topk(unsigned,void*,void* canonical,void* indices,void*,unsigned h,unsigned,unsigned queries){
  mark('K');auto src=(unsigned short*)canonical;auto dst=(int*)indices;
- for(unsigned q=0;q<4;++q){std::vector<int> order(h);std::iota(order.begin(),order.end(),0);std::partial_sort(order.begin(),order.begin()+2048,order.end(),[&](int a,int b){return src[q*h+a]>src[q*h+b]||(src[q*h+a]==src[q*h+b]&&a<b);});std::copy_n(order.begin(),2048,dst+q*2048);}return 0;
+ for(unsigned q=0;q<queries;++q){std::vector<int> order(h);std::iota(order.begin(),order.end(),0);std::partial_sort(order.begin(),order.begin()+2048,order.end(),[&](int a,int b){return src[q*h+a]>src[q*h+b]||(src[q*h+a]==src[q*h+b]&&a<b);});std::copy_n(order.begin(),2048,dst+q*2048);}return 0;
 }
 '''
 
@@ -145,10 +149,65 @@ class Controls(unittest.TestCase):
     def test_04_scope_and_invalid_geometry(self):
         import re
         launches=set(re.findall(r'aclrtlaunch_\w+', (HERE/'host.cpp').read_text()))
-        self.assertEqual(launches,{'aclrtlaunch_li_qk_score','aclrtlaunch_li_qk_scatter','aclrtlaunch_li_qk_topk'})
+        self.assertEqual(launches,{'aclrtlaunch_li_qk_score','aclrtlaunch_li_qk_scatter','aclrtlaunch_li_qk_topk','aclrtlaunch_li_qk_score_balanced'})
         self.assertIn('-DKVIP_STREAMING_LI=0',(HERE/'CMakeLists.txt').read_text())
-        for kw in (dict(t=0,qp=1),dict(t=32,qp=1),dict(t=1,qp=3),dict(t=1,qp=1,aivs=1)):
+        for kw in (dict(t=0,qp=1),dict(t=64,qp=1),dict(t=1,qp=3),dict(t=1,qp=1,aivs=1)):
             with self.assertRaises(ValueError):controls.geometry(**kw)
+
+    def test_05_balanced_cpp_python_and_b16_host(self):
+        import os
+        for history in (8192,131072):
+            p=controls.geometry(2,1,history,30,60,16,'balanced')
+            self.assertLessEqual(max(p['core_blocks'])-min(p['core_blocks']),1)
+            cover=np.zeros((16,history),np.uint8)
+            for r in p['task_map']:
+                cover[r['owner'],r['begin']:r['end']]+=1
+            self.assertTrue(np.all(cover==1))
+            if history==131072:
+                self.assertEqual(set(p['core_blocks']),{34,35})
+                self.assertEqual(p['active_segments'],60)
+        p=controls.geometry(2,1,8192,30,60,16,'balanced')
+        with tempfile.TemporaryDirectory() as folder:
+            d=Path(folder);(d/'acl').mkdir();(d/'acl/acl.h').write_text(ACL_STUB);(d/'launch.cpp').write_text(LAUNCH_STUB)
+            (d/'batch_get_abi.h').write_text('#pragma once\n')
+            subprocess.run(['c++','-std=c++17','-O2','-DLI_QK_RUN_MODE="cpu_stub"','-I'+str(d),'-I'+str(HERE),
+                '-I'+str(ROOT/'csrc/operators/lightning_indexer_with_fetch/include'),'-I'+str(ROOT/'csrc/operators/common/lifetch'),
+                str(HERE/'host.cpp'),str(d/'launch.cpp'),'-o',str(d/'driver')],check=True,capture_output=True)
+            fixture=d/'fixture';meta=controls.make_fixture(fixture,16,8192,32)
+            env=dict(os.environ,LI_QK_ORACLE=str(fixture/'oracle.bin'),LI_QK_LAUNCH_LOG=str(d/'calls'),LI_QK_BATCH='16')
+            for t,schedule in ((1,'waves'),(2,'waves'),(2,'balanced')):
+                out=d/f'T{t}_{schedule}'
+                result=subprocess.run([str(d/'driver'),str(fixture),str(out),'8192','32','30','60',str(t),'1','1','1','0','16',schedule],env=env,capture_output=True,text=True)
+                self.assertEqual(result.returncode,0,result.stderr)
+                report=json.loads((out/'report.json').read_text())
+                self.assertEqual(report['batch'],16);self.assertEqual(report['final_topk_aivs'],64)
+                self.assertEqual(report['score_launches'],1 if schedule=='balanced' else (2 if t==2 else 1))
+                self.assertEqual(controls.sha(out/'score-keys.bin'),meta['hashes']['oracle'])
+            code='#include "plan.h"\n#include <iostream>\nint main(int argc,char** argv){auto p=li_qk::MakePlan(std::stoul(argv[1]),32,30,60,2,1,16,true);for(auto t:p.tasks)std::cout<<t.queryBegin<<","<<t.queryCount<<","<<t.begin<<","<<t.end<<","<<t.owner<<"\\n";}'
+            (d/'plan.cpp').write_text(code)
+            subprocess.run(['c++','-std=c++17','-I'+str(HERE),str(d/'plan.cpp'),'-o',str(d/'plan')],check=True,capture_output=True)
+            for history in (8192,131072):
+                p=controls.geometry(2,1,history,30,60,16,'balanced')
+                actual=[list(map(int,x.split(','))) for x in subprocess.check_output([str(d/'plan'),str(history)],text=True).splitlines()]
+                self.assertEqual(actual,[list(t.values()) for t in p['task_map']])
+        k32=controls.geometry(32,1)
+        self.assertEqual(k32['score_waves'],1);self.assertEqual(k32['key_tokens_per_task'],[4096])
+
+    def test_06_dynamic_issue_denominators_and_fixture_equivalence(self):
+        from instructions import analyze
+        with tempfile.TemporaryDirectory() as folder:
+            d=Path(folder)
+            lines=[('CUBE','MMAD',10),('MTE2','WAIT_FLAG',9),('SCALAR','ADD',11),('RVECEX','RV_VRELU',12)]
+            (d/'core0.cubecore0.instr_log.dump').write_text(''.join(
+                f'[info] [00001000] (PC: 0x1000) {pipe} : (Binary: 0x1) (ID: {i:06}) {op} X0\n' for pipe,op,i in lines))
+            r=analyze(d)
+            self.assertEqual(r['coverage'][0]['instructions'],4)
+            self.assertEqual(r['coverage'][0]['id_order_decreases'],1)
+            self.assertAlmostEqual(sum(x['share_of_core_instructions'] for x in r['categories']),1)
+            self.assertEqual({x['category'] for x in r['categories']},{'cube_math','sync_control','scalar_control_address','vector_math'})
+            a=controls.make_fixture(d/'chunked',16,4096,32)
+            b=controls.make_small_fixture(d/'all-owner',16,4096,32)
+            self.assertEqual(a['hashes'],b['hashes'])
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

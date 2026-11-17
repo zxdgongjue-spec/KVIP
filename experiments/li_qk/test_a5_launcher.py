@@ -37,6 +37,7 @@ class Launcher(unittest.TestCase):
         repo = base/'original checkout'; repo.mkdir()
         op = repo/'experiments/li_qk'; op.mkdir(parents=True)
         (op/'run.py').write_text(BACKEND)
+        (op/'profile.py').write_text("import json,os,sys\nfrom pathlib import Path\nwith Path(os.environ['LI_LAUNCHER_TEST_CALLS']).open('a') as f: f.write(json.dumps(['profile',*sys.argv[2:]])+'\\n')\n")
         (op/'test_controls.py').write_text("print('FAKE CPU CHECK: orchestration only')\n")
         (repo/'preserve.txt').write_text('committed\n')
         def git(*args):
@@ -63,7 +64,7 @@ class Launcher(unittest.TestCase):
         cmd = ['bash',str(SCRIPT),'--repo',str(repo),'--ref',ref,
                '--cann-root',str(cann),'--kvaf-include',str(include),
                '--python',sys.executable,'--work-root',str(base/'worktrees'),
-               '--output-root',str(base/'outputs'),'--aics','28','--aivs','56']
+               '--output-root',str(base/'outputs'),'--aics','28','--aivs','56','--suite','orthogonal7']
         return cmd, env, repo, calls
 
     def test_success_and_sdk_argument_forwarding(self):
@@ -108,11 +109,31 @@ class Launcher(unittest.TestCase):
                 self.assertFalse((out/'results/summary.csv').exists())
                 self.assertEqual((repo/'preserve.txt').read_text(),'uncommitted work to preserve\n')
 
+    def test_extended_suites_and_separate_profile_forwarding(self):
+        for suite in ('orthogonal8','batch16'):
+            with self.subTest(suite=suite), tempfile.TemporaryDirectory() as folder:
+                base=Path(folder);cmd,env,repo,calls=self.setup_fixture(base)
+                cmd[cmd.index('--suite')+1]=suite
+                cmd[cmd.index('--aics')+1]='32';cmd[cmd.index('--aivs')+1]='64'
+                cmd.append('--profile')
+                r=subprocess.run(cmd,env=env,text=True,capture_output=True)
+                self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+                actions=[json.loads(s) for s in calls.read_text().splitlines()]
+                self.assertEqual([x[0] for x in actions],['plan','build','run','summarize','profile'])
+                for call in (actions[0],actions[2],actions[4]):
+                    self.assertEqual(call[call.index('--suite')+1],suite)
+                for key,value in (('--aics','30' if suite=='batch16' else '32'),('--aivs','60' if suite=='batch16' else '64')):
+                    self.assertEqual(actions[2][actions[2].index(key)+1],value)
+                self.assertNotEqual(actions[2][actions[2].index('--output')+1],actions[4][actions[4].index('--output')+1])
+                self.assertEqual((repo/'preserve.txt').read_text(),'uncommitted work to preserve\n')
+
     def test_help_and_invalid_budget_without_side_effects(self):
         r = subprocess.run(['bash',str(SCRIPT),'--help'],text=True,capture_output=True)
-        self.assertEqual(r.returncode,0); self.assertIn('seven orthogonal',r.stdout)
+        self.assertEqual(r.returncode,0); self.assertIn('orthogonal8',r.stdout)
         r = subprocess.run(['bash',str(SCRIPT),'--aics','0'],text=True,capture_output=True)
         self.assertNotEqual(r.returncode,0); self.assertIn('Supported budget',r.stderr)
+        r = subprocess.run(['bash',str(SCRIPT),'--suite','orthogonal8','--aics','28','--aivs','56'],text=True,capture_output=True)
+        self.assertNotEqual(r.returncode,0);self.assertIn('K32 requires',r.stderr)
 
     def test_offline_commit_and_bundle_with_unreachable_origin(self):
         for mode in ('local', 'bundle'):

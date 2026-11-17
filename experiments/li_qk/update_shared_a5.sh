@@ -88,7 +88,7 @@ if [[ ${1:-} == --help || ${1:-} == -h ]]; then
     printf 'All arguments forward to the LI runner: --device 5 --aics 32 --aivs 64 --kvaf-include PATH --cann-root PATH\n'
     exit 0
 fi
-[[ ${LD_PRELOAD:-} != *libruntime_camodel* ]] || { echo 'ERROR: physical NPU execution required; Model preload is not allowed' >&2; exit 1; }
+[[ ${LD_PRELOAD:-} != *libruntime_camodel* && ${LD_PRELOAD:-} != *libruntime_cmodel* ]] || { echo 'ERROR: physical NPU execution required; Model preload is not allowed' >&2; exit 1; }
 command -v npu-smi >/dev/null || { echo 'ERROR: use the A5 container with NPU/driver/CANN access' >&2; exit 1; }
 npu-smi info
 # Do not use the host cache's worktree links from inside the container.
@@ -98,7 +98,7 @@ if ! git -C "$LI_REPO" rev-parse --git-dir >/dev/null 2>&1; then
     git init --bare "$LI_REPO"
 fi
 exec bash "$LI_RELEASE/run_li_qk_a5.sh" --repo "$LI_REPO" \
-    --git-bundle "$LI_RELEASE/li_qk_mr14_offline.bundle" "$@"
+    --git-bundle "$LI_RELEASE/li_qk_mr14_offline.bundle" --ref "$(cat "$LI_RELEASE/SOURCE_COMMIT")" "$@"
 LI_CONTAINER_ENTRY_END
 bash -n "$LI_SHARE/run_in_container.sh.pending"
 mv "$LI_SHARE/run_in_container.sh.pending" "$LI_SHARE/run_in_container.sh"
@@ -106,4 +106,4 @@ if [[ -e $LI_SHARE/current && ! -L $LI_SHARE/current ]]; then die 'current must 
 ln -sfn "releases/$(basename "$LI_RELEASE")" "$LI_SHARE/current"
 printf '\nHost code update complete: %s\nShared directory: %s\n' "$LI_HEAD" "$LI_SHARE"
 printf 'In the A5 container, verify the existing mapping:\n  bash %q/run_in_container.sh --verify-only\n' "$LI_SHARE"
-printf 'Then run the seven-point physical NPU experiment:\n  bash %q/run_in_container.sh\n' "$LI_SHARE"
+printf 'Then run the physical NPU experiment (default B1 eight points; --suite batch16 for B16/30-core):\n  bash %q/run_in_container.sh\n' "$LI_SHARE"

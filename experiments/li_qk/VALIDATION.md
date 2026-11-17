@@ -14,3 +14,14 @@
 - 共享目录入口`update_shared_a5.sh`通过Bash语法检查和本地Docker已有挂载验证：宿主机只更新文件、容器从映射目录读取并校验哈希、重复更新保留旧release、容器中损坏的代码包/脚本被拒绝。没有运行NPU kernel。当前部署使用已确认的`/home/w00568585 → /home/w00568585`映射，真机计时只在容器启动脚本正常运行后生成。
 
 本地完整日志、7点计划、构建哈希及元数据保存在`tests/results/li-qk-controls-20261117/`。交付包包含`validation/`中的检查记录，不附带跨CANN版本复用的二进制。A5性能结果由`run.py run`和`summarize`生成。
+
+## K32 / B16 扩展的后续验证
+
+以上是原七点的历史记录。本轮新增验证以`EXTENSION_REPORT.md`为准，证据根为`tests/results/li-qk-extension-20261117/`：
+
+- 六项CPU检查、七项launcher检查通过；B16/H8192和H131072的owner/history覆盖及C++/Python任务表一致。新增套件/profile独立输出与30/60预算转交有编排检查。
+- CANN9.1.0/Ascend950PR_9599全新NPU构建通过；最新C++/header SHA与构建receipt相符。
+- CANN950 Model B16/H8192完整LI三控制组PASS；balanced先发现错误，再增加片段CV/VC fence并重新完整验证PASS。失败版不作为性能结果。
+- B16/H131072独立scatter与TopK PASS，使用GM预填oracle。完整score600秒TIMEOUT；没有完整score正确性或全核指令统计。
+- 动态issue日志仅physical core0，经实际入口PC与相同ELF核验；逐kernel/core分类与opcode占比已保存。Model whole ticks不是A5微秒或算法时间占比。
+- 新`profile.py`提供物理A5独立msprof collect/export及oracle/预期kernel检查；本地没有A5，尚无真实msprof trace。真机命令见报告。
