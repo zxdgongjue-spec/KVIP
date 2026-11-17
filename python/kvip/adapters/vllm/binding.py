@@ -40,6 +40,8 @@ def _bind_selectors(torch, policy, config):
     libraries = {}
     selectors = {}
     for group, layer in enumerate(writer.groups):
+        if not policy.owns_lidu[group]:
+            continue  # Split tail: fetched by KVAF Get, no LI selector.
         storage = policy.fused_index_storage[group]
         token_bytes = layer.geometry[0]
         if token_bytes not in libraries:
@@ -108,7 +110,15 @@ def prepare_workspace(torch, policy, config, device_id, soc, index_heads=64):
     aics = query_device_resources(cann, device_id)["effective_aic"]
     batch, history = policy.pool.max_requests - 1, policy.fused_index_storage[0].history
     shapes, libraries = {}, {}
-    for width in sorted(set(policy.group_sizes)):
+    # A split tail segment is fetched by KVAF Get, so it never launches the
+    # fused op. Only LIDU-owning groups need a row-width shape/library; giving
+    # a tail its own width here would build a kernel nobody launches.
+    owned = {
+        policy.group_sizes[group]
+        for group in range(len(policy.group_sizes))
+        if policy.owns_lidu[group]
+    }
+    for width in sorted(owned):
         token_bytes = 656 * width
         shape = UbmemGeometry(
             batch,
@@ -156,6 +166,8 @@ def _bind_ubmem_selectors(torch, policy, config):
         raise RuntimeError("UBmem selectors are already bound")
     selectors = {}
     for group, layer in enumerate(writer.groups):
+        if not policy.owns_lidu[group]:
+            continue  # Split tail: fetched by KVAF Get, no LI selector.
         storage, output = policy.fused_index_storage[group], policy.bytes_outputs[group]
         token_bytes = layer.geometry[0]
         runtime = writer.runtimes[layer.geometry]
