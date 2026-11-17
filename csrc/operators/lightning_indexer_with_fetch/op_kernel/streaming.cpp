@@ -6,6 +6,9 @@
 #include "resolver_staged_dma2.h"
 #if KVIP_LOW_MISS_COMPACT_PLAN || KVIP_LOW_MISS_POST_INDEX
 #include "resolver_compact_q4.h"
+#if KVIP_LOW_MISS_POST_INDEX
+#include "resolver_low_q4.h"
+#endif
 #include "low_miss_mode.h"
 #endif
 #include "staged_urma_pack.h"
@@ -126,9 +129,11 @@ __aicore__ inline uint32_t Producer(__gm__ Args* a, uint32_t b) {
  uint32_t inputError=0;
  if(!a->queryBitmaps || !a->queryErrors || !a->updateBindings || !a->packedFetch || !ctx->hotValid || !ctx->changeCount || row->slots>kPrefetch ||
     shape.history!=a->history || shape.resident!=a->resident || shape.resident>131072 || shape.finalWorkers!=4 || a->maxEvents<kPrefetch+kSlots)inputError=1;
+ if constexpr(PostIndex)if(!shape.resident || shape.resident>shape.history)inputError=1;
  if(!inputError){auto errors=reinterpret_cast<__gm__ uint32_t*>(a->queryErrors)+(b*4)*32;
   for(uint32_t q=0;q<4;++q){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+q*32),128);inputError|=errors[q*32];}}
  if(inputError){auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*32;status[0]=inputError;status[1]=0;
+  if constexpr(PostIndex){for(uint32_t q=0;q<4;++q)status[5+q]=0;status[9]=0;}
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),128);
   if constexpr (!PostIndex) for(uint32_t q=0;q<kFlagCount;++q){if(q==6 || (q>=7 && q<12) || (kEarlyFetchReady && q==kOutputsDoneFlag))continue;flags[q].count=0;flags[q].error=inputError;flags[q].ready=1;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+q),sizeof(BatchFlag));}
   return 0;}
@@ -158,12 +163,18 @@ __aicore__ inline uint32_t Producer(__gm__ Args* a, uint32_t b) {
  // Bind immutable metadata once on scalar control instead of reloading the
  // pointer chain in every SIMT warp and query. Official maps remain unchanged
  // until the consumer has observed the final Q publication.
- auto u=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);
- bool outputEnabled=u[20] && u[21] && u[22] && u[23];
- auto logicalRow=outputEnabled?reinterpret_cast<__gm__ int64_t*>(u[3])+
-    uint64_t(reinterpret_cast<__gm__ uint32_t*>(u[9])[b])*uint32_t(u[24]):nullptr;
- auto unpack=reinterpret_cast<__gm__ int64_t*>(u[20]);
- auto outputValid=reinterpret_cast<__gm__ int64_t*>(u[21]);
+ bool outputEnabled=false;
+ __gm__ int64_t* logicalRow=nullptr;
+ __gm__ int64_t* unpack=nullptr;
+ __gm__ int64_t* outputValid=nullptr;
+ if constexpr (!PostIndex) {
+  auto u=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);
+  outputEnabled=u[20] && u[21] && u[22] && u[23];
+  logicalRow=outputEnabled?reinterpret_cast<__gm__ int64_t*>(u[3])+
+     uint64_t(reinterpret_cast<__gm__ uint32_t*>(u[9])[b])*uint32_t(u[24]):nullptr;
+  unpack=reinterpret_cast<__gm__ int64_t*>(u[20]);
+  outputValid=reinterpret_cast<__gm__ int64_t*>(u[21]);
+ }
  auto eventSource=reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+b*a->maxEvents;
  auto eventDest=reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+b*a->maxEvents;
  GlobalTensor<uint32_t> input;
@@ -224,9 +235,17 @@ __aicore__ inline uint32_t Producer(__gm__ Args* a, uint32_t b) {
  uint32_t compactPublished=0;
  if(compactPlan){
   if(profile)ticks[9]=1;
-  Simt::VF_CALL<ResolveCompactQ4<PostIndex>>(Simt::Dim3{512,1,1},stagedContext,
-   shape.history,shape.resident,b,FinalPtr(selected),FinalPtr(loc),FinalPtr(keys),
-   FinalPtr(ranks),FinalPtr(slots),FinalPtr(work),FinalPtr(ctl),eventSource,eventDest);
+  if constexpr (PostIndex) {
+#if KVIP_LOW_MISS_POST_INDEX
+   Simt::VF_CALL<ResolveLowQ4>(Simt::Dim3{512,1,1},stagedContext,
+    shape.history,shape.resident,b,FinalPtr(selected),FinalPtr(loc),FinalPtr(keys),
+    FinalPtr(ranks),FinalPtr(slots),FinalPtr(work),FinalPtr(ctl),eventSource,eventDest);
+#endif
+  } else {
+   Simt::VF_CALL<ResolveCompactQ4<false>>(Simt::Dim3{512,1,1},stagedContext,
+    shape.history,shape.resident,b,FinalPtr(selected),FinalPtr(loc),FinalPtr(keys),
+    FinalPtr(ranks),FinalPtr(slots),FinalPtr(work),FinalPtr(ctl),eventSource,eventDest);
+  }
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
   if(!ctl.GetValue(1)){
    // All Q slots are ready: one DMA and fence replace four round trips.
@@ -244,12 +263,8 @@ __aicore__ inline uint32_t Producer(__gm__ Args* a, uint32_t b) {
   // join's descriptor/output phase has finished on every AIV.
   const uint32_t error=ctl.GetValue(1);
   status[0]=error;status[1]=error?0:ctl.GetValue(0);status[2]=b*kSlots;
-  status[3]=0;status[4]=0;
-  for(uint32_t q=0;q<4;++q) {
-   const uint32_t count=error?0:ctl.GetValue(2+q);
-   PrepareFinalFetch(shape.finalWorkers,shape.finalPostOffset,ctx,b,q,count,
-                     b*kSlots+q*kTop,error,count);
-  }
+  status[3]=0;status[4]=0;status[9]=1;
+  for(uint32_t q=0;q<4;++q)status[5+q]=error?0:ctl.GetValue(2+q);
   row->finalBegin=0;row->finalRequests=status[1];row->finalHead=0;
   row->finalPending=status[1]?1:0;row->finalEnd=GetSystemCycle();
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),128);

@@ -28,6 +28,17 @@ inline void PublishState(__gm__ rotating::Context* ctx, __gm__ uint64_t* update,
     }
     if (threadIdx.x < 4) {
         auto post = reinterpret_cast<__gm__ FinalPost*>(ctx->owners + postOffset) + batch * 4 + threadIdx.x;
+        // Exact planning publishes Q counts in rowStatus once. Materialize
+        // the legacy FinalPost ABI here, avoiding four earlier scalar stores.
+        // Early input rejection never prepared a plan; preserve its init state.
+        auto info = reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus) + batch * kRowStatusWords;
+        if (asc_ldcg(info + 9)) {
+            const uint32_t count = asc_ldcg(info + 5 + threadIdx.x);
+            asc_stcg(&post->count, count);
+            asc_stcg(&post->nonconflicting, count);
+            asc_stcg(&post->descriptor, batch * 8192 + threadIdx.x * 2048);
+            asc_stcg(&post->head, uint64_t(0));
+        }
         // Write the final state directly. No intermediate pending=count state
         // is published only to be reread and immediately cleared by Finalize.
         asc_stcg(&post->pending, 0U);

@@ -23,6 +23,20 @@ constexpr bool kSparseMapping = true;
 #else
 constexpr bool kSparseMapping = false;
 #endif
+KVIP_ROUND_INIT_DEVICE inline constexpr bool LowPostIndexRound(bool streaming, bool noPrefetch, bool postIndex) {
+#if KVIP_LOW_MISS_POST_INDEX && !(defined(V9_UBMEM) && V9_UBMEM)
+    return streaming && noPrefetch && postIndex;
+#else
+    return false;
+#endif
+}
+KVIP_ROUND_INIT_DEVICE inline constexpr bool ClearEvents(bool lowPostIndex) {
+#if KVIP_SKIP_EXHAUSTED_PREFETCH
+    return true;
+#else
+    return !lowPostIndex;
+#endif
+}
 KVIP_ROUND_INIT_DEVICE inline constexpr bool ClearMapping(bool streaming, bool noPrefetch) {
     // With no admitted prefetch, selected-metadata classification resolves
     // hot/ABC slots from current inputs and never reads the prefetch map.

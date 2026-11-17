@@ -144,6 +144,7 @@ void CleanCacheLines(uint8_t* ptr,uint64_t){
 #include "FINAL_POST_HEADER"
 /*PUBLISH_OUTPUTS*/
 /*OUTPUT_WORKER*/
+template<bool PostIndex=false>
 uint32_t ProducerInputError(Args* a,Context* ctx,uint32_t b,uint32_t inputError){
  auto flags=reinterpret_cast<BatchFlag*>(a->flags)+b*kFlagCount;
  if(inputError){/*PRODUCER_ERROR*/
@@ -236,6 +237,13 @@ int main(){
  Args args{};args.flags=uint64_t(flags);ProducerInputError(&args,&ctx,0,64);
  assert(flags[0].ready && flags[4].ready && flags[15].ready);
  assert(kEarlyFetchReady ? !flags[5].ready : flags[5].ready);
+ // Exact low planning has no per-query waiters. Its error path must clear
+ // the reused Q counts while leaving these legacy publication flags alone.
+ reset();std::fill_n(status,32,99);
+ ProducerInputError<true>(&args,&ctx,0,64);
+ assert(status[0]==64 && status[1]==0);
+ for(unsigned q=0;q<4;++q)assert(status[5+q]==0);
+ for(const auto& f:flags)assert(!f.ready);
  // The actual lifecycle flag fill includes the reused slot and clears stale
  // success/error from the prior invocation, without touching the other batch.
  flags[5].ready=1;flags[5].error=123;flags[kFlagCount+5].ready=1;

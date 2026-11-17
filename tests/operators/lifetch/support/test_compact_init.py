@@ -13,8 +13,8 @@ OP = ROOT / "csrc/operators/lightning_indexer_with_fetch"
 
 
 @pytest.mark.parametrize("compact,ubmem", [(0, 0), (1, 0), (0, 1), (1, 1)])
-@pytest.mark.parametrize("sparse", [0, 1])
-def test_round_init_dma_coverage_and_streaming_prefix(tmp_path, compact, ubmem, sparse):
+@pytest.mark.parametrize("sparse,post_index,skip_events", [(0, 0, 0), (1, 0, 0), (1, 1, 0), (1, 1, 1)])
+def test_round_init_dma_coverage_and_streaming_prefix(tmp_path, compact, ubmem, sparse, post_index, skip_events):
     lifecycle = (OP / "op_kernel/lifecycle.cpp").read_text()
     streaming = (OP / "op_kernel/streaming.cpp").read_text()
     prefetch = (OP / "op_kernel/prefetch.h").read_text()
@@ -146,6 +146,7 @@ template<class T>void DataCopy(LocalTensor<T> dst,GlobalTensor<T> src,uint32_t c
 }
 namespace kvaf_device {void CleanCacheLines(uint8_t*,uint32_t count){assert(count==4);}}
 """
+        + function(lifecycle, "__simt_vf__ __aicore__ LAUNCH_BOUND(32)\ninline void InitializeLowChangeCount(")
         + function(lifecycle, "__aicore__ inline void FillRoundWords(")
         + "\n"
         + function(lifecycle, "__aicore__ inline void InitializeRound(")
@@ -153,7 +154,7 @@ namespace kvaf_device {void CleanCacheLines(uint8_t*,uint32_t count){assert(coun
 int main(){
  const bool compact=KVIP_COMPACT_INIT&&!V9_UBMEM;
  assert(kvip_round_init::kFillWords==(compact?16384U:4096U));
- for(uint32_t batch:{1U,2U,16U})for(bool streaming:{false,true}){
+ for(uint32_t batch:{1U,2U,16U})for(bool streaming:{false,true})for(bool postBound:{false,true}){
   uint32_t history=batch==1?33024:batch==2?131328:210944,rounds=batch==1?0:8,lanes=4,fw=2;
   uint32_t finalWorkers=4,postOffset=batch*128+batch*finalWorkers*kFinalStateWords*4;
   regions.clear();Context ctx{};pipeline_ab::Args args{};
@@ -177,9 +178,10 @@ int main(){
   auto& workerStatus=make("workerStatus",batch*32);args.workerStatus=workerStatus.address();
   auto& errors=make("queryErrors",batch*128);args.queryErrors=errors.address();
   uint32_t ds=batch*2048,meta=(3*batch+31)&~31U;
-  auto& packed=make("packedFetch",4*fw*(3*ds+meta)+4*fw*(6*ds+64));args.packedFetch=packed.address();args.prefetchCount=fw<<16;
+  auto& packed=make("packedFetch",4*fw*(3*ds+meta)+4*fw*(6*ds+64));args.packedFetch=packed.address();args.prefetchCount=fw<<16;args.postIndex=postBound;
   for(uint32_t replay=0;replay<3;++replay){
    bool noPrefetch=replay==1;
+   const bool lowPostIndex=KVIP_LOW_MISS_POST_INDEX&&!V9_UBMEM&&streaming&&noPrefetch&&postBound;
    bool clearMapping=kvip_round_init::ClearMapping(streaming,noPrefetch);
    assert(clearMapping==!(KVIP_LOW_MISS_SPARSE_INIT&&!V9_UBMEM&&streaming&&noPrefetch));
    if(noPrefetch)for(uint32_t i=0;i<mapping.n;++i)
@@ -194,27 +196,35 @@ int main(){
     changes.mark(b*kChangeCapacity,clear,UINT32_MAX);
     std::copy_n(lru.data()+b*kLruSlots,kLruSlots,slots.expected.begin()+b*kChangeCapacity);
    }
-   for(auto* r:{&rows,&progress,&owners,&status,&finalStatus,&events})r->mark(0,r->n,0);
+   for(auto* r:{&rows,&status,&finalStatus})r->mark(0,r->n,0);
+   if(!lowPostIndex){progress.mark(0,progress.n,0);owners.mark(0,owners.n,0);}
+   else owners.mark(postOffset/4,batch*finalWorkers*sizeof(FinalPost)/4,0);
+   if(!lowPostIndex||KVIP_SKIP_EXHAUSTED_PREFETCH)events.mark(0,events.n,0);
    count.mark(0,1,0);if(clearMapping)mapping.mark(0,mapping.n,UINT32_MAX);
-   if(streaming){
-    for(auto* r:{&flags,&workerStatus,&errors})r->mark(0,r->n,0);
+   if(streaming)errors.mark(0,errors.n,0);
+   if(streaming&&!lowPostIndex){
+    for(auto* r:{&flags,&workerStatus})r->mark(0,r->n,0);
     for(uint32_t g=0;g<4*fw;++g)packed.mark(4*fw*(3*ds+meta)+g*(6*ds+64)+6*ds,64,0);
    }
    dmaCalls=0;
    for(uint32_t b=batch;b--;)InitializeRound(batch,history,rounds,lanes,finalWorkers,postOffset,&ctx,b,streaming?&args:nullptr,noPrefetch);
    assert(maxUbBytes==kvip_round_init::kFillWords*4);
    for(auto& r:regions)r->check();
-   for(auto* r:{&rows,&progress,&owners,&status,&finalStatus,&events})for(auto n:r->writes)assert(n==1);
+   for(auto* r:{&rows,&status,&finalStatus})for(auto n:r->writes)assert(n==1);
+   for(auto n:progress.writes)assert(n==uint32_t(!lowPostIndex));
+   for(auto n:events.writes)assert(n==uint32_t(!lowPostIndex||KVIP_SKIP_EXHAUSTED_PREFETCH));
+   for(uint32_t i=0;i<owners.n;++i)assert(owners.writes[i]==uint32_t(!lowPostIndex||i>=postOffset/4));
    for(auto n:mapping.writes)assert(n==uint32_t(clearMapping));
    for(uint32_t b=0;b<batch;++b)for(uint32_t i=0;i<kChangeCapacity;++i){
     assert(changes.writes[b*kChangeCapacity+i]==uint32_t(!(compact&&streaming)||i<kLruSlots));
     assert(slots.writes[b*kChangeCapacity+i]==uint32_t(i<kLruSlots));
    }
    for(uint32_t b=0;b<batch;++b){
-    for(threadIdx.x=0;threadIdx.x<256;++threadIdx.x)InitializeTailMappings(history,16384,&ctx,b);
+    if(lowPostIndex){for(threadIdx.x=0;threadIdx.x<32;++threadIdx.x)InitializeLowChangeCount(changeCount.data(),b);}
+    else for(threadIdx.x=0;threadIdx.x<256;++threadIdx.x)InitializeTailMappings(history,16384,&ctx,b);
     assert(changeCount.data()[b]==kLruSlots);
     for(uint32_t t=0;t<history;++t)assert(mapping.data()[b*history+t]==
-      (t>=history-128?16384+kSlots+t%384:mapping.expected[b*history+t]));
+      (!lowPostIndex&&t>=history-128?16384+kSlots+t%384:mapping.expected[b*history+t]));
     changes.data()[b*kChangeCapacity]=7;changes.data()[b*kChangeCapacity+kLruSlots-1]=9;
     // Holes deliberately remain below a positive changeCount; streaming
     // residency and prefetch publication may not interpret those records.
@@ -259,6 +269,8 @@ int main(){
             f"-DKVIP_COMPACT_INIT={compact}",
             f"-DV9_UBMEM={ubmem}",
             f"-DKVIP_LOW_MISS_SPARSE_INIT={sparse}",
+            f"-DKVIP_LOW_MISS_POST_INDEX={post_index}",
+            f"-DKVIP_SKIP_EXHAUSTED_PREFETCH={skip_events}",
             "-DKVIP_AUTO_ROUTE=1",
             "-DKVIP_SELECTED_METADATA=1",
             "-DKVIP_LOW_MISS_TAIL=1",

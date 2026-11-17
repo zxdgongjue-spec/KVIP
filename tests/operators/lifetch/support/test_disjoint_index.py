@@ -149,7 +149,9 @@ def test_direct_consumer_keeps_join_and_error_contract():
     source = (INDEXER.parent / "streaming.cpp").read_text()
     producer = function(source, "inline uint32_t Producer(")
     consumer = function(source, "inline void Consumer(")
-    assert producer.index("VF_CALL<StagedInitializeReady<true>>") < producer.index("reserved[0]=")
+    # The legacy/high Producer is the PostIndex=false specialization, so this
+    # retains its direct-source proof while the exact low path owns its setup.
+    assert producer.index("VF_CALL<StagedInitializeReady<!PostIndex>>") < producer.index("reserved[0]=")
     assert "!row->slots && !ctl.GetValue(9)" in producer
     assert "VF_CALL<StagedInitializeReady<false>>" in producer
     assert consumer.index("flags[kRawQueryFlag].error") < consumer.index("reserved[0]==1")

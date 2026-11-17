@@ -47,7 +47,9 @@ def test_collective_tail_uses_batch_scheduled_mixed_vector_kernel():
     # publishes all Q4 plans before parallel output/descriptor construction.
     assert "OutputWorker(a" not in tail
     assert tail.index("Producer<true>(a") < tail.index("SyncAll();") < tail.index("trace[2] = 0x50495832U")
-    assert tail.count("RowError(records,") == 1  # one final join after every CQ
+    # The completion VF reduces every peer only after the existing CQ join;
+    # the scalar tail no longer reads the same records before that VF.
+    assert "RowError(records," not in tail
 
 
 def test_cq_control_relocates_one_join_inside_the_same_tail():
@@ -75,7 +77,7 @@ def test_cq_control_relocates_one_join_inside_the_same_tail():
     index = tail.index("Simt::VF_CALL<post_index::ApplyPlan<false>>")
     assert tail.index("if (waitFirst)") < index < tail.index("if (!waitFirst)")
     assert tail.index("record->completed = transport.completed", index) < tail.index("if (!waitFirst)")
-    assert tail.index("if (!waitFirst)") < tail.index("RowError(records,")
+    assert tail.index("if (!waitFirst)") < tail.index("post_index_finalize::Finish")
     assert "blocking = (prefix[post_index_prepare::kBlockingWord] & 1U) != 0" in tail
     assert "record->fallback = uint64_t(blocking) | (waitFirst ? 2U : 0U)" in tail
 
@@ -176,12 +178,17 @@ namespace low_q4_outputs_mte {
 uint32_t Publish(Context*,Args*,uint32_t){return 0;}
 }
 namespace post_index_finalize {
-void Finish(Args*,uint32_t,uint32_t total,uint64_t error){
- uint32_t actual=0;for(const auto& post:finalPosts)actual+=post.count;
+void Finish(Args* args,uint32_t row,uint32_t total,uint64_t error){
+ auto ctx=reinterpret_cast<Context*>(args->context);
+ auto info=reinterpret_cast<uint32_t*>(ctx->rowStatus)+row*kRowStatusWords;
+ uint32_t actual=0;for(uint32_t q=0;q<4;++q)actual+=info[5+q];
  assert(total==actual);
  const uint32_t code=uint32_t(error)?uint32_t(error):(error?kvaf_device::kInvalidArgs:0U);
  publishedUpdateStatus=code;
- for(auto& post:finalPosts){post.pending=0;post.deferred=0;post.error=code;}
+ for(uint32_t q=0;q<4;++q){auto& post=finalPosts[q];
+  if(info[9]){post.count=info[5+q];post.descriptor=row*kSlots+q*kTop;}
+  post.pending=0;post.deferred=0;post.error=code;
+ }
 }
 }
 }
@@ -347,6 +354,8 @@ int main(){
   if(fault==6){status[1]=0;finalPosts[0].count=0;}
   if(fault==7)status[1]=1;
   if(fault==8)finalPosts[0].count=kTop+1;
+  for(uint32_t q=0;q<4;++q)status[5+q]=finalPosts[q].count;
+  status[9]=1;
   auto failureMask=reinterpret_cast<uint32_t*>(packed.data())+3*kSlots+post_index::kFailureMaskWord;
   *failureMask=UINT32_MAX;
   auto before=aiv_model::testDoorbells;

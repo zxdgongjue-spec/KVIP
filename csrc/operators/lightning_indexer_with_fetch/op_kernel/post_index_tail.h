@@ -25,16 +25,6 @@ __aicore__ inline void Flush(__gm__ Record* row) {
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row), sizeof(Record));
 }
 
-__aicore__ inline uint64_t RowError(__gm__ Record* records, uint32_t b,
-                                   uint32_t batch, uint32_t cores) {
-    uint64_t error = 0;
-    for (uint32_t i = b; i < cores; i += batch) {
-        Flush(records + i);
-        error |= records[i].error;
-    }
-    return error;
-}
-
 // Rare failure publication replaces repeated per-event sibling-record loads.
 // The caller retains the existing cross-core join after this VF completes.
 __aicore__ inline void PublishPostFailure(__gm__ uint32_t* prefix, uint32_t row,
@@ -199,12 +189,13 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
     error |= row->error;
     if (row->slots) error |= kvaf_device::kInvalidArgs;
     for (uint32_t q = 0; q < 4; ++q) {
-        auto post = FinalPostAt(shape.finalPostOffset, ctx, b * 4 + q);
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post), sizeof(*post));
-        error |= post->error;
-        if (post->count > kTop || post->descriptor != b * kSlots + q * kTop) error |= 1;
-        publishedTotal += post->count;
-        counts[q] = post->count <= kTop ? post->count : 0;
+        // Producer publishes these counts and its error in this same 128B
+        // row before the collective join. FinalPost is an output ABI, not a
+        // second plan: avoid four dependent cache-line acquisitions per AIV.
+        const uint32_t count = info[5 + q];
+        if (count > kTop) error |= 1;
+        publishedTotal += count;
+        counts[q] = count <= kTop ? count : 0;
         total += counts[q];
     }
     if (total != info[1] || total > kSlots || shape.resident > shape.history ||
@@ -366,9 +357,13 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
     }
     if (block < batch) {
         const uint32_t row = block;
-        error = RowError(records, row, batch, cores);
+        error = 0;
         uint32_t completed = 0;
-        for (uint32_t i = row; i < cores; i += batch) completed += records[i].completed;
+        for (uint32_t peer = row; peer < cores; peer += batch) {
+            Flush(records + peer);
+            error |= records[peer].error;
+            completed += uint32_t(records[peer].completed);
+        }
         auto rowInfo = reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus) + row * kRowStatusWords;
         if (!error && completed != rowInfo[1]) error = kvaf_device::kInvalidArgs;
         post_index_finalize::Finish(a, row, publishedTotal, error);

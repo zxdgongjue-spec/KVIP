@@ -21,6 +21,7 @@ def test_compact_q4_matches_staged_resolver(tmp_path):
            .replace("544+512/warpSize-1", "544+kTestThreads/warpSize-1"))
     compact = (kernel / "resolver_compact_q4.h").read_text().replace(
         "constexpr uint32_t kCompactThreads=512;", "constexpr uint32_t kCompactThreads=kTestThreads;")
+    low = (kernel / "resolver_low_q4.h").read_text()
     hot = kernel.parent.parent / "lidu/op_kernel/hot_slot_selection.h"
     program = tmp_path / "compact.cpp"
     program.write_text(r'''
@@ -78,7 +79,7 @@ uint32_t StagedPrefix(uint32_t local,uint32_t* ctl){
  if(!threadIdx.x)for(uint32_t i=1;i<kTestThreads;++i)ctl[544+i]+=ctl[543+i];
  asc_syncthreads();return threadIdx.x?ctl[543+threadIdx.x]:0;
 }
-''' + old + '\n' + compact + r'''
+''' + old + '\n' + compact + '\n' + low + r'''
 struct State {
  uint32_t resident,history,changeCount=0;
  std::vector<uint32_t> selected,loc,keys,ranks,slots,work,ctl,changes,changeSlots,src,dst,lru;
@@ -97,6 +98,15 @@ template<class F>void run(F f){std::vector<std::thread> workers;
  for(auto& worker:workers)worker.join();}
 int main(){
  std::mt19937 rng(138);
+ // Initialization failures must propagate before any stale scratch access.
+ // Null payloads make an accidental hash/location read fail under ASAN.
+ for(uint32_t error:{1U,8U,0x80000000U}){
+  std::vector<uint32_t> ctl(8192,0xdeadbeefU);ctl[1]=error;
+  auto rejected=ctl;
+  run([&]{rotating::ResolveLowQ4(nullptr,64,32,0,
+   nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,ctl.data(),nullptr,nullptr);});
+  assert(ctl==rejected);
+ }
  for(uint32_t mode=0;mode<28;++mode){
   uint32_t resident=mode==22?131072:16384,history=mode==23?(1U<<24):resident+16384;
   State base(resident,history);
@@ -183,8 +193,16 @@ int main(){
    expectedCounts[q]=expectedSource.size()-before;
   }
   post.ctl[9]=1; // The old proof rejects invalid hot sources; the new one repairs them.
+  State cached(post);
   run([&]{rotating::ResolveCompactQ4<true>(&post.ctx,history,resident,0,post.selected.data(),post.loc.data(),
    post.keys.data(),post.ranks.data(),post.slots.data(),post.work.data(),post.ctl.data(),post.src.data(),post.dst.data());});
+  run([&]{rotating::ResolveLowQ4(&cached.ctx,history,resident,0,cached.selected.data(),cached.loc.data(),
+   cached.keys.data(),cached.ranks.data(),cached.slots.data(),cached.work.data(),cached.ctl.data(),cached.src.data(),cached.dst.data());});
+  assert(cached.selected==post.selected&&cached.loc==post.loc);
+  assert(cached.src==post.src&&cached.dst==post.dst);
+  assert(cached.changes==post.changes&&cached.changeSlots==post.changeSlots);
+  assert(cached.changeCount==post.changeCount);
+  for(uint32_t i=0;i<10;++i)assert(cached.ctl[i]==post.ctl[i]);
   assert(!post.ctl[1]&&!post.ctl[9]);assert(post.ctl[0]==expectedSource.size());
   assert(post.loc==expectedLoc);
   assert(std::equal(expectedSource.begin(),expectedSource.end(),post.src.begin()+2048));
@@ -194,6 +212,35 @@ int main(){
   assert(std::unordered_set<uint32_t>(expectedDest.begin(),expectedDest.end()).size()==expectedDest.size());
   for(uint32_t i=0;i<expectedSource.size();++i)
    assert(expectedSource[i]==expectedDest[i]||(expectedSource[i]>=resident&&expectedDest[i]<resident));
+ }
+ // Marker-shaped corrupt input locations must fail before they can be
+ // interpreted as handles and cause an out-of-range event publication.
+ for(uint32_t bad:{0x40000000U,0x80000000U,0xc0001fffU}){
+  State invalid(16384,131328);invalid.selected[0]=7;invalid.loc[0]=bad;invalid.ctl[7]=2048;
+  run([&]{rotating::ResolveLowQ4(&invalid.ctx,invalid.history,invalid.resident,0,
+   invalid.selected.data(),invalid.loc.data(),invalid.keys.data(),invalid.ranks.data(),
+   invalid.slots.data(),invalid.work.data(),invalid.ctl.data(),invalid.src.data(),invalid.dst.data());});
+  assert(invalid.ctl[1]==1);
+  assert(std::all_of(invalid.src.begin(),invalid.src.end(),[](auto v){return v==UINT32_MAX;}));
+  assert(std::all_of(invalid.dst.begin(),invalid.dst.end(),[](auto v){return v==UINT32_MAX;}));
+ }
+ // The optimized lookup must retain the old failure decision for invalid
+ // tokens and an exhausted hash. No failed plan publishes destinations.
+ for(uint32_t fault=0;fault<2;++fault){
+  State initial(16384,131328);initial.ctl[7]=fault?2:2048;
+  for(uint32_t i=0;i<kLruSlots;++i)initial.work[4096+i]=i;
+  initial.selected[0]=fault?16384:initial.history;
+  if(fault){initial.selected[1]=16385;initial.selected[2]=16386;}
+  State original(initial),optimized(initial);
+  run([&]{rotating::ResolveCompactQ4<true>(&original.ctx,original.history,original.resident,0,
+   original.selected.data(),original.loc.data(),original.keys.data(),original.ranks.data(),
+   original.slots.data(),original.work.data(),original.ctl.data(),original.src.data(),original.dst.data());});
+  run([&]{rotating::ResolveLowQ4(&optimized.ctx,optimized.history,optimized.resident,0,
+   optimized.selected.data(),optimized.loc.data(),optimized.keys.data(),optimized.ranks.data(),
+   optimized.slots.data(),optimized.work.data(),optimized.ctl.data(),optimized.src.data(),optimized.dst.data());});
+  assert(original.ctl[1]==optimized.ctl[1]&&optimized.ctl[1]==(fault?8U:1U));
+  assert(original.dst==optimized.dst);
+  assert(std::all_of(optimized.dst.begin(),optimized.dst.end(),[](auto v){return v==UINT32_MAX;}));
  }
 }
 ''')
@@ -211,7 +258,9 @@ def test_compact_wiring_keeps_high_path_and_completion_contract():
     assert '#include "low_miss_mode.h"' in source
     assert "compactPlan=PostIndex || (KVIP_LOW_MISS_COMPACT_PLAN && NoPrefetchRound(ctx) && !row->slots)" in producer
     assert producer.index("ctx->admissionControls),shape.batch*16)") < producer.index("compactPlan=PostIndex")
-    assert producer.index("VF_CALL<ResolveCompactQ4<PostIndex>>") < producer.index("DataCopy(output,loc,kSlots)")
+    assert producer.index("VF_CALL<ResolveLowQ4>") < producer.index("DataCopy(output,loc,kSlots)")
+    assert "VF_CALL<ResolveCompactQ4<false>>" in producer
+    assert "if constexpr (PostIndex)" in producer
     assert producer.index("DataCopy(output,loc,kSlots)") < producer.index("flags[published].ready=1")
     assert "if(!compactPlan){" in producer
     assert "VF_CALL<ResolveQueryWork>" in producer
