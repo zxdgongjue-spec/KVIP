@@ -163,8 +163,6 @@ inline void ClassifyPreparedLocations(uint32_t history,uint32_t resident,uint32_
 
 def instrument_miss(kernel, output):
     methods=kernel/'indexer/incremental_methods.h';s=methods.read_text()
-    s=replace_once(s,'bool exportWindowCold_=false;', 'bool exportWindowCold_=false;bool rankTrace_=false;')
-    s=replace_once(s,'exportWindowCold_=true;rankedEpoch_=epoch;', 'exportWindowCold_=true;rankedEpoch_=epoch;rankTrace_=trace;')
     begin=s.index('    uint32_t count=kvip_prefetch_rank::Select')
     end=s.index('    mappedExport_=true;',begin)
     selection=s[begin:end].replace('nullptr,','rankTrace_?rankClocks:nullptr,')
@@ -183,7 +181,8 @@ def instrument_miss(kernel, output):
 '''+s[end:];methods.write_text(s)
     path=output/'tests/operators/lifetch/support/diagnostics.py';s=path.read_text()
     anchor=next(line for line in s.splitlines() if 'samples[-1]["final_topk"] =' in line)
-    s=replace_once(s,anchor,'''            samples[-1]["rank_selection"] = [dict(query=i, check_pack_cycles=int(w[5]), rank_emit_cycles=int(w[6]), calls=int(w[7])) for i,w in enumerate(rotating.incremental.cpu().numpy().reshape(-1,16))]
+    s=replace_once(s,anchor,'''            samples[-1]["rank_progress"] = [dict(query=i, epoch=e, score_count=int(w[8+e])&262143, covered_count=(int(w[8+e])>>18)&262143, rank=(int(w[8+e])>>36)&4095) for i,w in enumerate(rotating.incremental.cpu().numpy().reshape(-1,16)) for e in range(min(rotating.rounds,8)) if int(w[8+e])]
+            samples[-1]["rank_selection"] = [dict(query=i, check_pack_cycles=int(w[5]), rank_emit_cycles=int(w[6]), calls=int(w[7])) for i,w in enumerate(rotating.incremental.cpu().numpy().reshape(-1,16))]
 '''+anchor);path.write_text(s)
 
 
@@ -218,18 +217,33 @@ def main():
     vector.write_text(v+'\n#include "ranked_candidates.h"\n')
     methods = kernel/'indexer/incremental_methods.h'
     s = methods.read_text()
+    shutil.copyfile(here/'coverage_rank.h',kernel/'indexer/coverage_rank.h')
+    v=vector.read_text();vector.write_text(v+'\n#include "recent_config.h"\n#include "coverage_rank.h"\n')
+    s=replace_once(s,'uint32_t incrementalCalls_=0,', 'uint32_t rankEnd0_=0,rankEnd1_=0,rankHalf_=0;uint64_t rankReady_=0;\nuint32_t incrementalCalls_=0,')
+    s=replace_once(s,'        if(end0<runtimeShape_.resident)continue;', '        rankReady_=ready;rankHalf_=half;\n        if(end0<runtimeShape_.resident)continue;')
+    s=replace_once(s,'    uint32_t ends[2]={end0,end1};', '    uint32_t ends[2]={end0,end1};\n    rankEnd0_=prior[0];rankEnd1_=prior[1];')
+    s=replace_once(s,'    if(exportWindowCold_)ExportWindowCold(query);', '    rankEnd0_=prior[0];rankEnd1_=prior[1];\n    if(exportWindowCold_)ExportWindowCold(query);')
+
     start = s.index('    auto compact=mappedExport_?')
     end = s.index('    if(incrementalMetadataActive_)', start)
     s = s[:start]+'''    // The complete Top2048 remains untouched for the next incremental window.
     auto compact=incrementalNew_.template ReinterpretCast<uint32_t>();
-    uint32_t rank=runtimeShape_.rounds>1?
-        1024+(1024*rankedEpoch_+(runtimeShape_.rounds-1)/2)/(runtimeShape_.rounds-1):2048;
+    uint32_t tailBegin=runtimeShape_.history>KVIP_RECENT_TOKENS?runtimeShape_.history-KVIP_RECENT_TOKENS:0;
+    uint32_t initial=kvip_coverage::Covered(0,0,runtimeShape_.resident,valid,0,tailBegin,valid);
+    uint32_t coveredCount=kvip_coverage::Covered(rankEnd0_,rankEnd1_,runtimeShape_.resident,valid,rankHalf_,tailBegin,valid);
+    uint32_t rank=kvip_coverage::Rank(coveredCount,initial,valid);
+    if(rankTrace_ && rankedEpoch_<8) {
+        uint32_t ready=kvip_coverage::Covered(uint32_t(rankReady_),uint32_t(rankReady_>>32),runtimeShape_.resident,valid,rankHalf_,tailBegin,valid);
+        uint64_t record=uint64_t(ready)|(uint64_t(coveredCount)<<18)|(uint64_t(rank)<<36);
+        if(incrementalMetadataActive_)incrementalMetadata_.SetValue(incrementalMetadataIndex_*16+8+rankedEpoch_,record);
+        else IncrementalMeta(query)[8+rankedEpoch_]=record;
+    }
     uint32_t count=kvip_prefetch_rank::Select(indicesOutLocal_,scoreOutLocal_,compact,
         topkSharedTmpLocal_[128],runtimeShape_.resident,valid,rank,ctx->windowLimit/4);
     mappedExport_=true;
 '''+s[end:]
-    s=replace_once(s,'bool exportWindowCold_=false;', 'bool exportWindowCold_=false;\nuint32_t rankedEpoch_=0;')
-    s=replace_once(s,'exportWindowCold_=epoch!=0;', 'exportWindowCold_=true;rankedEpoch_=epoch;')
+    s=replace_once(s,'bool exportWindowCold_=false;', 'bool exportWindowCold_=false;bool rankTrace_=false;\nuint32_t rankedEpoch_=0;')
+    s=replace_once(s,'exportWindowCold_=epoch!=0;', 'exportWindowCold_=true;rankedEpoch_=epoch;rankTrace_=trace;')
     s=replace_once(s,'PipeBarrier<PIPE_ALL>();DataCopy(indicesOutLocal_,saved,2048);',
         '''GlobalTensor<uint16_t> savedScores;
             savedScores.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(WindowTopkPrefix()+uint64_t(query/4)*prefixBytes)+(query%4)*2048);
@@ -320,7 +334,7 @@ def main():
     end=e.index('    if getattr(args, "check_suite", None) == "boundary":',begin)
     e=e[:begin]+e[end:]
     execution.write_text(e)
-    print('Ranked prefetch: all windows; rank 1024..2048; per-Q quota=windowLimit/4; '
+    print('Ranked prefetch: all windows; coverage-based rank 1024..2048; per-Q quota=windowLimit/4; '
           f'minimum={"quota/2" if args.minimum_half else "0"}; '
           f'candidates={"unresolved miss before rank/quota" if args.true_miss else "cold before mapping"}; no quota redistribution')
 

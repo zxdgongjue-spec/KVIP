@@ -458,3 +458,20 @@ python tests/experiments/incremental_lifetch/model_window.py \
 
 旧 `--bitmap-miss` 每轮从 hot/reserved 构建完整 covered bitmap，虽然打包约0.79 µs/Q，
 但 init 明显增加，不作为当前方案。保留入口仅供复现历史对照。
+
+### 按每 Q 实际覆盖进度选择预取排名
+
+ranked 系列实验采用 `1024 + round((covered-initial)/(valid-initial)*1024)`。
+`initial` 是 hot 与已播种 ABC 的位置并集；`covered` 是本次增量 TopK
+完成后的累计覆盖位置并集，按两个生产者交替的 half-window 归属计算，
+ABC 与已扫描区间重叠只计一次。输入为空或无新增可覆盖区间时使用排名 1024。
+预算、半额下限及跨 Q 去重规则不变。A/B 两侧均采用新排名。
+
+沿用 `compare_ranked.sh --tagged-miss ... --prefetch-tokens 1024`，
+然后运行 `summarize.py <结果目录>`。Level 3 的 `full_attribution.json`
+逐 replay 保存 `rank_progress`：epoch、query、score_count、covered_count、rank。
+汇总按窗口、请求、Q展示已发布 score 比例、TopK 覆盖比例和排名 mean/min/max。
+比例分母为此实验的固定 history；ABC 计入并去重。
+score 是当前服务读取的生产者快照，不是所有核同一时刻的快照。
+记录复用每 Q 元数据的 8 个空闲字，仅诊断时写入，保存 epoch 0～7；
+当前默认 4 窗口全部覆盖。普通运行不记录这些字段。

@@ -103,6 +103,18 @@ def detailed_trace(report, path, label, required=False, require_selection=False)
             return '--' if not active else f'{mean(active,name)/mhz:.2f}/{max(r[name] for r in active)/mhz:.2f}'
         rows.append([epoch, number(len(rr)/len(samples)), number(sum(r['skipped'] for r in rr)/len(samples)), number(len(active)/len(samples)), number(sum(r['topk_calls'] for r in rr)/len(samples)), number(sum(r.get('scanned',0) for r in rr)/len(samples)), number(sum(r.get('candidates',0) for r in rr)/len(samples)), duration('cycles'), duration('service_wait_cycles'), duration('service_cycles'), duration('scan_cycles'), duration('candidate_cycles'), duration('post_cycles')])
     lines += table(['Epoch','Attempts','Skipped','Service calls','Incremental TopK calls','Scanned scores','Candidates','Incremental mean/max us','Service wait mean/max us','Service mean/max us','Scan mean/max us','Candidate mean/max us','Post mean/max us'],rows)
+    progress={}
+    for sample in samples:
+        for r in sample.get('rank_progress', []):
+            progress.setdefault((r['epoch'],r['query']),[]).append(r)
+    if progress:
+        history=report.get('history',131072)
+        lines += ['Per-Q progress: published score snapshot before processing; TopK coverage after processing. Percent of history; ABC counted once. Ranks shown as mean/min/max across replays.']
+        lines += table(['Epoch','Request','Q','Score ready %','TopK covered %','Rank mean/min/max'],[
+            [epoch,q//4,q%4+1,number(statistics.mean(r['score_count'] for r in rr)*100/history),
+             number(statistics.mean(r['covered_count'] for r in rr)*100/history),
+             f"{statistics.mean(r['rank'] for r in rr):.2f}/{min(r['rank'] for r in rr)}/{max(r['rank'] for r in rr)}"]
+            for (epoch,q),rr in sorted(progress.items())])
     selection=[r for sample in samples for r in sample.get('rank_selection', []) if r['calls']]
     if require_selection and any(len(s.get('rank_selection', [])) != report['batch'] * 4
                                  or any(r['calls'] <= 0 or r['check_pack_cycles'] < 0 or r['rank_emit_cycles'] < 0
