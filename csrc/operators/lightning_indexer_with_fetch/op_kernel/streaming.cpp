@@ -813,7 +813,8 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b,uint32_t usef
 #if KVIP_LOW_MISS_POST_INDEX && !V9_UBMEM
 // All AIVs participate in phase barriers. Batch scheduling prevents another
 // stream from occupying a subset while this invocation waits for its peers.
-extern "C" __global__ __aicore__ __schedmode__(1) void v9_streaming_resolve_update(GM_ADDR arg) {
+// Legacy host-stub extraction expects the return type after __aicore__.
+extern "C" __schedmode__(1) __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
 #else
 extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
 #endif

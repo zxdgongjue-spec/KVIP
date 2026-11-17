@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import re
 import shutil
 import subprocess
 import tempfile
@@ -28,12 +29,46 @@ def kvaf_build_paths(build_dir):
 
 
 def build_failure(log, stage, returncode):
-    """Expose the first diagnostic, not just recursive make's final exit."""
+    """Retain an early cause and the terminal exception in one bounded excerpt."""
     lines = log.read_text(errors="replace").splitlines()
-    markers = ("error:", "fatal error:", "cmake error", "error generated", "errors generated")
-    first = next((i for i, line in enumerate(lines) if any(m in line.lower() for m in markers)), None)
-    start = max(0, first - 5) if first is not None else max(0, len(lines) - 35)
-    excerpt = "\n".join(lines[start : start + 35])
+    primary = re.compile(
+        r"(?:^|\s)(?:fatal\s+|llvm\s+|internal compiler\s+)?error:|cmake\s+error|"
+        r"\b(?:killed|sigkill|terminated|segmentation fault|out of memory|"
+        r"cannot allocate memory|no space left on device|permission denied)\b", re.IGNORECASE,
+    )
+    terminal = re.compile(
+        r"^\s*(?:[A-Za-z_]\w*\.)*[A-Z][A-Za-z0-9_]*(?::|\s*$)"
+    )
+    roots = [i for i, line in enumerate(lines) if primary.search(line)]
+    exceptions = [i for i, line in enumerate(lines) if terminal.search(line)]
+    secondary = [i for i, line in enumerate(lines)
+                 if "[error]" in line.lower() or "error generated" in line.lower()
+                 or "errors generated" in line.lower()]
+    first = next(iter(roots or exceptions or secondary), max(0, len(lines) - 24))
+    windows = [(max(0, first - 4), first + 24)]
+    if exceptions:
+        last = exceptions[-1]
+        windows.append((max(0, last - 5), last + 4))
+    # CANN wraps both file reads and parsing in the same "read file failed"
+    # error. Preserve the corresponding compile/preprocess context without
+    # inferring that the named object was absent or that its process was killed.
+    failed_file = next((i for i, line in enumerate(lines) if "read file failed" in line.lower()), None)
+    if failed_file is not None:
+        names = re.findall(r"[\w.-]+\.(?:cpp|cc|asc)(?:\.o)?", lines[failed_file])
+        related = [i for i in range(failed_file) if names and names[-1] in lines[i]]
+        at = related[-1] if related else failed_file
+        windows.append((max(0, at - 3), at + 5))
+    windows.append((max(0, len(lines) - 8), len(lines)))
+    indexes = sorted({i for start, end in windows for i in range(start, min(end, len(lines)))})
+    excerpt_lines, previous = [], -1
+    for i in indexes:
+        if previous >= 0 and i > previous + 1:
+            excerpt_lines.append("... omitted build-log lines ...")
+        excerpt_lines.append(lines[i])
+        previous = i
+    # At most 53 source lines and three gap markers; never truncate a selected
+    # terminal exception just because its Python stack exceeds the early window.
+    excerpt = "\n".join(excerpt_lines)
     return RuntimeError(
         f"LIFetch {stage} failed (exit={returncode}); full log: {log}\n--- build diagnostic ---\n{excerpt}"
     )

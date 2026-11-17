@@ -19,7 +19,7 @@ def test_collective_tail_uses_batch_scheduled_mixed_vector_kernel():
     kernel = repo / "csrc/operators/lightning_indexer_with_fetch/op_kernel"
     source = (kernel / "streaming.cpp").read_text()
     entry = source.split("void v9_streaming_resolve_update(GM_ADDR arg)", 1)[1]
-    assert "__schedmode__(1) void v9_streaming_resolve_update" in source
+    assert '__schedmode__(1) __global__ __aicore__ void v9_streaming_resolve_update' in source
     assert "KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0)" in entry
     assert "KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY)" in entry
     assert entry.index("state->active==1") < entry.index("post_index_tail::Run")

@@ -13,6 +13,44 @@ import pytest
 from kvip.runtime import build
 
 
+@pytest.mark.parametrize("cause", ["streaming.cpp:42:7: error: invalid call", "bisheng: Killed", "LLVM ERROR: invalid input"])
+def test_build_failure_keeps_early_cause_and_terminal_python_exception(tmp_path, cause):
+    log = tmp_path / "build.log"
+    lines = ["progress"] * 300
+    lines[20] = cause
+    lines[120] = "Building CXX object preprocess_obj.dir/streaming.cpp.o"
+    lines[160] = "[ERROR]: read file failed, filename is: /build/preprocess_obj.dir/streaming.cpp.o"
+    lines[161] = "Traceback (most recent call last):"
+    lines[250] = "ValueError: unsupported function attribute"
+    lines[-1] = "gmake: *** [Makefile:42: v9_bridge] Error 2"
+    log.write_text("\n".join(lines))
+    message = str(build.build_failure(log, "compile/link", 2))
+    excerpt = message.split("--- build diagnostic ---\n", 1)[1]
+    assert cause in excerpt
+    assert "ValueError: unsupported function attribute" in excerpt
+    assert "Building CXX object preprocess_obj.dir/streaming.cpp.o" in excerpt
+    assert "full log: " + str(log) in message
+    assert len(excerpt.splitlines()) <= 56
+    assert log.read_text() == "\n".join(lines)
+
+
+@pytest.mark.parametrize("exception", ["FuncNameNotFound", "extract_host_stub.FuncNameNotFound"])
+def test_build_failure_does_not_hide_parser_exception_after_long_traceback(tmp_path, exception):
+    log = tmp_path / "build.log"
+    lines = ["[100%] Built target merge_obj",
+             "[ERROR]: read file failed, filename is: /build/preprocess_obj.dir/streaming.cpp.o",
+             "Traceback (most recent call last):"]
+    lines += [f'  File "extract_host_stub.py", line {i}, in parse_func_signature' for i in range(90)]
+    terminal = f"{exception}: '__aicore__ __simt_vf__'"
+    lines += [terminal, *(["gmake: Error 2"] * 20)]
+    log.write_text("\n".join(lines))
+    excerpt = str(build.build_failure(log, "compile/link", 2)).split("--- build diagnostic ---\n", 1)[1]
+    assert terminal in excerpt
+    assert "[100%] Built target merge_obj" in excerpt
+    assert "read file failed" in excerpt
+    assert len(excerpt.splitlines()) <= 56
+
+
 def test_pipeline_options_isolate_and_reuse_the_correct_binary(monkeypatch, tmp_path):
     calls = []
 
