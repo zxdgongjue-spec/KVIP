@@ -118,3 +118,35 @@ python tests/operators/lifetch/test_lifetch.py bench --input real \
 ```
 
 每次运行结果由唯一目录保存，失败也保留已完成 case。
+
+
+### Experimental incremental producer (URMA only)
+
+`build_libraries(incremental_topk=True, reverse_cold=True)` enables an opt-in
+alternative to rolling/refilter histograms. It requires BS<=16, split Q4/H32,
+resident=16384, eight cold windows and at most 2048 recent seed scores per query.
+The frozen-input reader checks those seed bounds before launching.
+
+The scoring VF compresses live sortable-BF16 scores and scan offsets above the
+current Kth. A disjoint 20 KiB UB bank retains Top2048 scores/physical IDs and a
+2048-candidate chunk. Chunks merge when full and at window boundaries using the
+existing exact selector; there is no overflow discard. The selected Kth is
+reused directly. Resident/ABC/victim eligibility is cached in one ID tag bit,
+then removed before publication/output. Submitted IDs are deduplicated using
+the existing Q4 mapping. Budget-blocked entries survive in the retained TopK
+until submitted or selected out. Final output reuses this full-history TopK.
+
+Per-query/window immutable lists avoid producer/consumer overwrite races. The
+optional ABI is 336 bytes; baseline ABI remains 328 bytes. Initial selection,
+compaction, merge, list publication and final consumption all run inside the
+measured graph. Original score publication is retained for score verification.
+No service routing, graph switching, transport budget or KV layout changes.
+
+Arrival-order BF16 Kth ties can change selected IDs/order relative to the
+baseline. The reader verifies all LI scores, full TopK score ranks, every
+window's exact Kth and pending-list validity/completeness, KV bytes and Index
+updates. Traffic uses each variant's actual selected demand. This is not a
+claim of bit-identical baseline tie IDs or model output. Defaults stay off;
+CPU validation is not evidence of CANN compilation or NPU speedup. Compare full
+graph mean and median against both unchanged forward and pure reverse, with
+first/end controls, before considering promotion.

@@ -629,6 +629,16 @@ inline void PrepareCandidateWqes(uint32_t rt_resident,__ubuf__ uint32_t* ids,__u
     }
     asc_threadfence();
 }
+#if KVIP_INCREMENTAL_TOPK
+// Reserve only admitted IDs, before the next Q list is examined. This gives
+// Q4 deduplication with the existing map and no per-window hash table.
+__simt_vf__ __aicore__ LAUNCH_BOUND(256)
+inline void ReserveIncremental(__ubuf__ uint32_t* ids,__gm__ uint32_t* map,
+    uint32_t count,uint32_t firstSlot) {
+    for(uint32_t i=threadIdx.x;i<count;i+=256)asc_stcg(map+ids[i],firstSlot+i);
+    asc_threadfence();
+}
+#endif
 // Same indexed-load pattern as v9 GatherCandidateMap; cold IDs pass through.
 
 template<bool captureIo>
@@ -671,6 +681,9 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
         for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes)for(uint32_t q=0;q<4;++q) {
             uint32_t progress=(b/rt_serviceLanes)*128+q*32;
             uint32_t end=work.GetValue(progress),cap=windowEnd;
+#if KVIP_INCREMENTAL_TOPK
+            cfg.SetValue(1024+b*4+q,work.GetValue(progress+kvip_incremental::kReadyWord));
+#endif
 #if KVIP_WINDOW_REFILTER
             cfg.SetValue(1024+b*4+q,work.GetValue(progress+kvip_rolling::kProgressThreshold)&0xffffU);
 #endif
@@ -753,7 +766,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
 #endif
         auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;
         uint32_t count=0,missing=0;
-#if KVIP_REFILTER_REFILL || KVIP_COMPACT_OUT_OF_PLACE
+#if KVIP_REFILTER_REFILL || KVIP_COMPACT_OUT_OF_PLACE || KVIP_INCREMENTAL_TOPK
         // Existing Q2/16K work tensor: cfg[1536:2016] is disjoint from
         // bitmap words, frozen Q4 progress, thresholds and batched post inputs.
         // Window allowance is validated <=480. No new UB/GM allocation.
@@ -761,6 +774,48 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
 #else
         auto selectedIds=ids;
 #endif
+#if KVIP_INCREMENTAL_TOPK
+        const uint32_t allowance=PrefetchAllowance(slots,requests,state.GetValue(208),
+            state.GetValue(209),state.GetValue(210),ctx->windowLimit);
+        for(uint32_t q=0;q<4 && count<allowance;++q) {
+            uint32_t ready=cfg.GetValue(1024+b*4+q);
+            if(!ready)continue;
+            uint32_t published=ready-1;if(published>epoch)published=epoch;
+            GlobalTensor<uint32_t> list;
+            list.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->incrementalLists)+
+                uint64_t((b*4+q)*rt_rounds+published)*kvip_incremental::kListWords);
+            auto header=work[3072];
+            DataCopy(header,list,32);
+            SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            uint32_t candidates=header.GetValue(0);
+            if(candidates>kvip_incremental::kTop) {state.SetValue(11,kvaf_device::kInvalidArgs);break;}
+            if(!candidates)continue;
+            DataCopy(ids,list[kvip_incremental::kHeader],(candidates+7)/8*8);
+            SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+            Simt::VF_CALL<GatherCandidateMap>(Simt::Dim3{256,1,1},
+                reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),map,candidates);
+            PipeBarrier<PIPE_V>();
+            CompactMisses(reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),candidates,allowance-count,
+                reinterpret_cast<__ubuf__ uint32_t*>(selectedIds[count].GetPhyAddr()));
+            SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            uint32_t found=cfg.GetValue(56),admitted=found<allowance-count?found:allowance-count;
+            missing+=found;
+            if(admitted) {
+                Simt::VF_CALL<ReserveIncremental>(Simt::Dim3{256,1,1},
+                    reinterpret_cast<__ubuf__ uint32_t*>(selectedIds[count].GetPhyAddr()),map,
+                    admitted,rt_resident+slots+count);
+                PipeBarrier<PIPE_V>();
+            }
+            count+=admitted;
+        }
+        for(uint32_t q=0;q<4;++q) {
+            state.SetValue(12+q,cfg.GetValue(128+b*4+q));
+            state.SetValue(80+epoch*4+q,cfg.GetValue(128+b*4+q));
+        }
+#else
 #if KVIP_REFILTER_REFILL
         const uint32_t allowance=PrefetchAllowance(slots,requests,state.GetValue(208),
             state.GetValue(209),state.GetValue(210),ctx->windowLimit);
@@ -823,6 +878,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
             // another Q, enlarge the budget, or resnapshot advancing producers.
             if(count>=allowance || stop>=last || stop<=first)break;
         }
+#endif
 #endif
             if(count) {
                 V9_FETCH_PROFILE(postBegin=GetSystemCycle();)

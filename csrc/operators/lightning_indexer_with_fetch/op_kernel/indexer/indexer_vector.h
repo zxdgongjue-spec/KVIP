@@ -98,6 +98,8 @@ public:
     using QK_T = typename QLIT::qkType;
     using SCORE_T = typename QLIT::scoreType;
 
+#include "incremental_topk_methods.h"
+
     __aicore__ inline QLIVector(){};
     __aicore__ inline void ProcessVec1(const QLICommon::RunInfo &info, uint32_t progressShard = 0,
                                      bool publishShardEnd = false, bool scoreOnly = false);
@@ -301,11 +303,15 @@ private:
             }
             SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
             WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+#if KVIP_INCREMENTAL_TOPK
+            SeedIncremental(query,residentCount,range.begin,range.end,end,aligned);
+#else
             topkOp_.Threshold(mrgValueLocal_, prefixThreshold_[(query % 2) * 128], aligned
 #if KVIP_ROLLING_REUSE_SEED
                 , reinterpret_cast<__ubuf__ uint16_t*>(rollingState_[(query % 2) * kvip_rolling::kStateWords].GetPhyAddr())
 #endif
                 );
+#endif
 #if KVIP_ROLLING_THRESHOLD
             if (topkCount_ == kvip_rolling::kTop) {
                 // The recent interval is already in this union: never count
@@ -472,6 +478,11 @@ private:
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ready),128);
 #endif
         }
+#if KVIP_INCREMENTAL_TOPK
+        // Publish after the scalar resident-progress cache-line writeback.
+        // Otherwise that writeback can erase the adjacent DMA ready stripe.
+        PublishIncremental(query,0);
+#endif
 #if KVIP_ROLLING_THRESHOLD
         PublishRolling(query);
         SetFlag<HardEvent::MTE3_V>(EVENT_ID0); WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
@@ -581,6 +592,12 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe, bool topkOnly)
     pipe->InitBuffer(topkSharedTmpBuf_, topkSharedTmpSize);
     topkSharedTmpLocal_ = topkSharedTmpBuf_.Get<uint32_t>();
     topkOp_.InitBuffers(topkSharedTmpLocal_, indicesOutLocal_);
+#if KVIP_INCREMENTAL_TOPK
+    pipe->InitBuffer(incrementalBuf_,kvip_incremental::kUbBytes);
+    incrementalScores_=incrementalBuf_.Get<uint16_t>();
+    incrementalIds_=incrementalBuf_.Get<uint32_t>()[2048];
+    incrementalOffsets_=incrementalBuf_.Get<uint16_t>()[8192];
+#endif
 #if KVIP_ROLLING_THRESHOLD
     // Append, do not shift Fixpipe or any existing scratch-bank offsets.
     pipe->InitBuffer(rollingBuf_, 2 * kvip_rolling::kStateWords * sizeof(uint16_t));
@@ -897,6 +914,10 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         (!KVIP_ROLLING_FIRST_WINDOW || rollingWindowEpoch_ == 1);
     if (collectWindow) outBase = rollingWindow_[rollingWindowCount_];
 #endif
+#if KVIP_INCREMENTAL_TOPK
+    const bool incrementalTile = !scoreOnly && curS2Idx >= runtimeShape_.resident && incrementalReady_;
+    bool incrementalRelease = false;
+#endif
     if (!scoreOnly && curS2Idx >= runtimeShape_.resident) {
     vector1::BatchClassifyScore(outBase, UB_BANK_DEPTH_STRIDE / sizeof(SCORE_T),
                                         qkBase, qkVLstride, (uint32_t)(gSize_ * UB_BANK_DEPTH_STRIDE / sizeof(float)),
@@ -906,7 +927,17 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
                                         gSize_, curAivS1ProcNum,
         (__ubuf__ uint16_t *)prefixThreshold_.GetPhyAddr() + (curAivS1Idx % 2) * 128,
         (__ubuf__ uint16_t *)classifyUB_.GetPhyAddr() + pingpong * 256,
-        rolling, rollingMask0, rollingMask1, rollingAdvance);
+        rolling, rollingMask0, rollingMask1, rollingAdvance
+#if KVIP_INCREMENTAL_TOPK
+        , incrementalTile ? reinterpret_cast<__ubuf__ uint16_t*>(incrementalScores_[2048+incrementalCount_].GetPhyAddr()) : nullptr,
+        incrementalTile ? reinterpret_cast<__ubuf__ uint16_t*>(incrementalOffsets_[incrementalCount_].GetPhyAddr()) : nullptr,
+        uint16_t(info.s2Idx*128-incrementalBegin_),
+        kvip_rolling::TileMask(curS2Idx,incrementalEnd_,incrementalRecentBegin_,incrementalRecentEnd_)
+#endif
+        );
+#if KVIP_INCREMENTAL_TOPK
+    if(incrementalTile)incrementalCount_+=GetSpr<SpecialPurposeReg::AR>()/sizeof(uint16_t);
+#endif
     } else {
     vector1::BatchMulWeightAndReduceSum(outBase, UB_BANK_DEPTH_STRIDE / sizeof(SCORE_T),
                                         qkBase, qkVLstride, (uint32_t)(gSize_ * UB_BANK_DEPTH_STRIDE / sizeof(float)),
@@ -992,7 +1023,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
                        outBase, classifyUB_[pingpong * 256]);
     }
 #endif
-#if SIM_CAPTURE_HITS
+#if SIM_CAPTURE_HITS && !KVIP_INCREMENTAL_TOPK
     if (!scoreOnly && curS2Idx >= runtimeShape_.resident) {
         constexpr uint32_t prefixBytes = SIM_Q * 2048 * 6 + SIM_Q * 256;
         GlobalTensor<uint8_t> outputHits;
@@ -1011,8 +1042,29 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     if (rollingAdvance)
         for (uint32_t q = 0; q < curAivS1ProcNum; ++q) PublishRolling(info.bIdx * SIM_Q + curAivS1Idx + q);
 #endif
+#if KVIP_INCREMENTAL_TOPK
+    const bool incrementalBoundary = incrementalTile && (info.isLastS2InnerLoop ||
+        info.s2Idx+1==rotating::Trigger(runtimeShape_.history,runtimeShape_.resident,
+                                       runtimeShape_.rounds,incrementalEpoch_));
+    if(incrementalTile && (incrementalBoundary || incrementalCount_+128>kvip_incremental::kChunk)) {
+        // Score VF was the last QK reader. Let Cube refill before selection;
+        // retain the existing output/progress DMA ordering independently.
+        CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4,PIPE_V>(
+            QLICommon::ConstInfo::CROSS_VC_EVENT+pingpong);
+        incrementalRelease = true;
+        MergeIncremental(curAivS1Idx%2);
+        if(incrementalBoundary) {
+            PublishIncremental(info.bIdx*SIM_Q+curAivS1Idx,incrementalEpoch_);
+            incrementalBegin_=(info.s2Idx+1)*128;
+            ++incrementalEpoch_;
+        }
+    }
+#endif
     if (!scoreOnly) PublishScoreProgress(info, progressShard, publishShardEnd);
     SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
+#if KVIP_INCREMENTAL_TOPK
+    if (!incrementalRelease)
+#endif
 #if KVIP_ROLLING_COMPACT
     if (!rollingAdvance)
 #endif
@@ -1245,6 +1297,23 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
             SaveResident(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx,
                          vecOffset, queryRow == SIM_Q, recentEnd, true);
             SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
+            continue;
+        }
+#endif
+#if KVIP_INCREMENTAL_TOPK
+        if(!prefixActive_ && incrementalReady_) {
+            MergeIncremental((curS1Idx+rowIdx)%2);
+            kvip_incremental::UntagIds(
+                reinterpret_cast<__ubuf__ uint32_t*>(incrementalIds_.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()));
+            SetFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);
+            SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
+            DataCopyPad(indiceOutGm[info.indiceOutOffset+(curS1Idx+rowIdx)*topkCount_],
+                        indicesOutLocal_.template ReinterpretCast<int32_t>(),copyOutParams);
+            SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
+#if KVIP_STREAMING_LI
+            EmitFinalClassification(info.indiceOutOffset/topkCount_+curS1Idx+rowIdx);
+#endif
             continue;
         }
 #endif

@@ -125,6 +125,11 @@ private:
 template<>
 class LITopk<uint16_t> {
 public:
+#if KVIP_INCREMENTAL_TOPK
+    __aicore__ inline LocalTensor<uint16_t> ThresholdResult() {
+        return nkValueLocal.ReinterpretCast<uint16_t>();
+    }
+#endif
     __aicore__ inline uint32_t GetSharedTmpBufferSize()
     {
         // 2 * QLICommon::Align(topK, (uint32_t)256):两块hisIndexLocal；3 * 256：histogramsLocal idxHighLocal idxLowLocal；64：nkValueLocal

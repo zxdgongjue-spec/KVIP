@@ -7,7 +7,7 @@ import subprocess
 import pytest
 
 
-@pytest.mark.parametrize("backend,size,tail", [("urma", 328, 320)])
+@pytest.mark.parametrize("backend,size,tail", [("urma", 328, 320), ("incremental", 336, 320)])
 @pytest.mark.parametrize("caller", ["streaming.cpp", "output_worker.h"])
 def test_exact_context_dma(tmp_path, backend, size, tail, caller):
     root = Path(__file__).resolve().parents[4]
@@ -28,6 +28,7 @@ def test_exact_context_dma(tmp_path, backend, size, tail, caller):
 #include <cstring>
 #include <functional>
 #include <vector>
+#define KVIP_INCREMENTAL_TOPK OPTION_VALUE
 #define __gm__
 #define __aicore__
 #define V9_UBPIPE_DEPTH 8
@@ -84,6 +85,7 @@ int main(){
 }
 '''
     for name, value in {
+        "OPTION_VALUE": str(int(backend == "incremental")),
         "CONTEXT": str(context),
         "SNAPSHOT": str(kernel / "context_snapshot.h"),
         "SIZE": str(size),

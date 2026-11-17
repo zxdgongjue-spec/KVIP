@@ -18,6 +18,7 @@
 #include "kernel_operator.h"
 #include "score_common.h"
 #include "rolling_threshold_vector.h"
+#include "incremental_topk_vector.h"
 
 #ifndef KVIP_OPT_LI_REGISTER_PREDICATE
 #define KVIP_OPT_LI_REGISTER_PREDICATE 0
@@ -821,7 +822,9 @@ __simd_callee__ inline void ReduceSumFinalizeClassify(AscendC::MicroAPI::RegTens
                                               AscendC::MicroAPI::MaskReg& maskAllB16,
                                               __ubuf__ uint16_t* out_, __ubuf__ uint16_t* threshold, __ubuf__ uint16_t* hits,
     __ubuf__ uint16_t* rolling = nullptr, uint32_t mask0 = 0,
-    uint32_t mask1 = 0, bool advance = false)
+    uint32_t mask1 = 0, bool advance = false,
+    __ubuf__ uint16_t* compactValues = nullptr, __ubuf__ uint16_t* compactIds = nullptr,
+    uint16_t compactOffset = 0, uint32_t compactMask = 0)
 {
     AscendC::MicroAPI::Add(regSum0[0], regSum0[0], regSum1[0], maskAllB32);
     AscendC::MicroAPI::Add(regSum0[1], regSum0[1], regSum1[1], maskAllB32);
@@ -854,6 +857,12 @@ __simd_callee__ inline void ReduceSumFinalizeClassify(AscendC::MicroAPI::RegTens
     kvip_rolling::Observe(regOut, rolling, threshold, mask0, advance);
     if (advance) MicroAPI::LocalMemBar<MicroAPI::MemType::VEC_STORE, MicroAPI::MemType::VEC_LOAD>();
 #endif
+#if KVIP_INCREMENTAL_TOPK
+    if (compactValues) {
+        kvip_incremental::Compact(regOut, threshold, compactValues, compactIds, compactOffset, compactMask);
+        return;
+    }
+#endif
     ClassifyRollingScore(regOut, threshold, hits, maskAllB16, rolling);
 }
 __simd_callee__ inline void ReduceSum2FinalizeClassify(AscendC::MicroAPI::RegTensor<float> (&regSum0)[2],
@@ -865,7 +874,9 @@ __simd_callee__ inline void ReduceSum2FinalizeClassify(AscendC::MicroAPI::RegTen
                                                __ubuf__ uint16_t* out0_,
                                                __ubuf__ uint16_t* out1_, __ubuf__ uint16_t* threshold, __ubuf__ uint16_t* hits,
     __ubuf__ uint16_t* rolling = nullptr, uint32_t mask0 = 0,
-    uint32_t mask1 = 0, bool advance = false)
+    uint32_t mask1 = 0, bool advance = false,
+    __ubuf__ uint16_t* compactValues = nullptr, __ubuf__ uint16_t* compactIds = nullptr,
+    uint16_t compactOffset = 0, uint32_t compactMask = 0)
 {
     AscendC::MicroAPI::Mul(regSum0[0], regSum0[0], regKScale[0], maskAllB32);
     AscendC::MicroAPI::Mul(regSum0[1], regSum0[1], regKScale[1], maskAllB32);
@@ -912,7 +923,9 @@ __simd_vf__ inline void ClassifyMulWeightAndReduceSum(__ubuf__ uint16_t* out_,
                                               __ubuf__ float* qScale_,
                                               const int gSize, __ubuf__ uint16_t* threshold, __ubuf__ uint16_t* hits,
     __ubuf__ uint16_t* rolling = nullptr, uint32_t mask0 = 0,
-    uint32_t mask1 = 0, bool advance = false)
+    uint32_t mask1 = 0, bool advance = false,
+    __ubuf__ uint16_t* compactValues = nullptr, __ubuf__ uint16_t* compactIds = nullptr,
+    uint16_t compactOffset = 0, uint32_t compactMask = 0)
 {
     AscendC::MicroAPI::RegTensor<float> regwBrc;
     AscendC::MicroAPI::RegTensor<float> regQK[2];
@@ -947,7 +960,7 @@ __simd_vf__ inline void ClassifyMulWeightAndReduceSum(__ubuf__ uint16_t* out_,
     ReduceSumLoopBody<QK_T>(regQK, regQKHalf, regQKInt32, regwBrc, regW, regSum0,
                             regSum1, maskAllB32, qk_, qkVLStride, gSize);
 
-    ReduceSumFinalizeClassify(regSum0, regSum1, regKScale, maskAllB32, bf16Ctx, maskAllB16, out_, threshold, hits, rolling, mask0, mask1, advance);
+    ReduceSumFinalizeClassify(regSum0, regSum1, regKScale, maskAllB32, bf16Ctx, maskAllB16, out_, threshold, hits, rolling, mask0, mask1, advance, compactValues, compactIds, compactOffset, compactMask);
 }
 template <typename QK_T>
 __simd_vf__ inline void ClassifyMulWeightAndReduceSum2(__ubuf__ uint16_t* out0_,
@@ -968,7 +981,9 @@ __simd_vf__ inline void ClassifyMulWeightAndReduceSum2(__ubuf__ uint16_t* out0_,
                                                uint32_t qScaleStride,
                                                const int gSize, __ubuf__ uint16_t* threshold, __ubuf__ uint16_t* hits,
     __ubuf__ uint16_t* rolling = nullptr, uint32_t mask0 = 0,
-    uint32_t mask1 = 0, bool advance = false)
+    uint32_t mask1 = 0, bool advance = false,
+    __ubuf__ uint16_t* compactValues = nullptr, __ubuf__ uint16_t* compactIds = nullptr,
+    uint16_t compactOffset = 0, uint32_t compactMask = 0)
 {
     AscendC::MicroAPI::RegTensor<float> regW[2];
     AscendC::MicroAPI::RegTensor<float> regwBrc[2];
@@ -1012,7 +1027,7 @@ __simd_vf__ inline void ClassifyMulWeightAndReduceSum2(__ubuf__ uint16_t* out0_,
     ReduceSum2LoopBody<QK_T>(regQK0, regQK1, regQK0Half, regQK1Half, regQK0Int32, regQK1Int32, regwBrc, regW,
         regSum0, regSum1, maskAllB32, qk0_, qk1_, qkVLStride, weightFloat_, gSize);
 
-    ReduceSum2FinalizeClassify(regSum0, regSum1, regKScale, maskAllB32, bf16Ctx, maskAllB16, out0_, out1_, threshold, hits, rolling, mask0, mask1, advance);
+    ReduceSum2FinalizeClassify(regSum0, regSum1, regKScale, maskAllB32, bf16Ctx, maskAllB16, out0_, out1_, threshold, hits, rolling, mask0, mask1, advance, compactValues, compactIds, compactOffset, compactMask);
 }
 template <typename QK_T, typename W_T, typename SCALE_T, typename SCORE_T>
 __aicore__ inline void BatchClassifyScore(const LocalTensor<SCORE_T> &out_,   // out    [S2Base]     [128   ]
@@ -1030,7 +1045,9 @@ __aicore__ inline void BatchClassifyScore(const LocalTensor<SCORE_T> &out_,   //
                                                   const int gSize,                     // G 64
                                                   const int batch, __ubuf__ uint16_t* threshold, __ubuf__ uint16_t* hits,
     __ubuf__ uint16_t* rolling = nullptr, uint32_t mask0 = 0,
-    uint32_t mask1 = 0, bool advance = false)
+    uint32_t mask1 = 0, bool advance = false,
+    __ubuf__ uint16_t* compactValues = nullptr, __ubuf__ uint16_t* compactIds = nullptr,
+    uint16_t compactOffset = 0, uint32_t compactMask = 0)
 {
     // 暂只支持这两种情况, 后续改成循环
     if (batch != 2 && batch != 1) {
@@ -1054,9 +1071,9 @@ __aicore__ inline void BatchClassifyScore(const LocalTensor<SCORE_T> &out_,   //
                             weight, weight1, weightStride, weightFloat,
                             kScale, kScaleStride,
                             qScale, qScale1, qScaleStride,
-                            gSize, threshold, hits, rolling, mask0, mask1, advance);
+                            gSize, threshold, hits, rolling, mask0, mask1, advance, compactValues, compactIds, compactOffset, compactMask);
     } else {
-        ClassifyMulWeightAndReduceSum(out, qk, qkVLStride, weight, kScale, qScale, gSize, threshold, hits, rolling, mask0, mask1, advance);
+        ClassifyMulWeightAndReduceSum(out, qk, qkVLStride, weight, kScale, qScale, gSize, threshold, hits, rolling, mask0, mask1, advance, compactValues, compactIds, compactOffset, compactMask);
     }
 }
 __simd_vf__ inline void ClassifyResidentScores(__ubuf__ uint16_t* scores,

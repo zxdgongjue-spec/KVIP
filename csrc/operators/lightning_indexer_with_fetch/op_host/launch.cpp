@@ -3,6 +3,7 @@
 #include "context.h"
 #include "cold_scan.h"
 #include "rolling_threshold.h"
+extern "C" uint32_t kvip_incremental_topk() { return KVIP_INCREMENTAL_TOPK; }
 extern "C" uint32_t kvip_rolling_boundary() { return KVIP_ROLLING_BOUNDARY; }
 extern "C" uint32_t kvip_rolling_sparse() { return KVIP_ROLLING_SPARSE; }
 extern "C" uint32_t kvip_rolling_fast_path() { return KVIP_ROLLING_FAST_PATH; }
@@ -49,6 +50,12 @@ extern "C" uint32_t v9_li(void* bindings, void* stream, const rotating::RuntimeS
             kvip_rolling::kWindowScores) return 100000;
 #endif
 #endif
+#if KVIP_INCREMENTAL_TOPK
+    if (!shape || !shape->splitQ || shape->batch > 16 || shape->indexHeads != 32 ||
+        rotating::UseSequenceSplit(*shape) || shape->resident != 16384 || shape->rounds != 9 ||
+        shape->history <= shape->resident ||
+        ((shape->history - shape->resident)/128+7)/8*128 > 65535) return 100001;
+#endif
 #define LI_LAUNCH_0 aclrtlaunch_v9_li_kernel
 #define LI_LAUNCH_1 aclrtlaunch_v9_li_kernel_1
 #define LI_LAUNCH_2 aclrtlaunch_v9_li_kernel_2
@@ -67,7 +74,7 @@ extern "C" uint32_t v9_row_bytes(const rotating::RuntimeShape* shape) { return s
 extern "C" uint32_t v9_context_bytes(const rotating::RuntimeShape* shape) { return sizeof(rotating::Context); }
 extern "C" uint32_t v9_rounds(const rotating::RuntimeShape* shape) { return shape->rounds; }
 extern "C" uint32_t v9_simulation(const rotating::RuntimeShape* shape) { return 0; }
-extern "C" uint32_t v9_abi_version(const rotating::RuntimeShape* shape) { return 12; }
+extern "C" uint32_t v9_abi_version(const rotating::RuntimeShape* shape) { return 12 + KVIP_INCREMENTAL_TOPK; }
 extern "C" uint32_t v9_aic_count(const rotating::RuntimeShape* shape) { return shape->aicCount; }
 extern "C" uint32_t v9_service_lanes(const rotating::RuntimeShape* shape) { return shape->serviceLanes; }
 extern "C" uint32_t v9_final_workers(const rotating::RuntimeShape* shape) { return shape->finalWorkers; }

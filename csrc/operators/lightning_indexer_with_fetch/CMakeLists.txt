@@ -6,6 +6,7 @@ set(RUN_MODE npu CACHE STRING "NPU build")
 set(SOC_VERSION Ascend950PR_9599 CACHE STRING "Target SoC, not runtime device ordinal")
 set(ASCEND_CANN_PACKAGE_PATH /usr/local/Ascend/cann CACHE PATH "CANN installation")
 set(KVAF_INCLUDE "" CACHE PATH "KVAF device interface headers")
+option(KVIP_INCREMENTAL_TOPK "Producer compact pairs, incremental TopK and direct pending lists" OFF)
 option(KVIP_REVERSE_COLD "Reverse complete 2K cold Index blocks in non-sequence-split URMA LI" OFF)
 option(KVIP_ROLLING_THRESHOLD "Capped BF16 CDF in the native LI score VF" OFF)
 option(KVIP_ROLLING_WINDOWED "Accumulate raw LI scores at existing window boundaries" OFF)
@@ -62,6 +63,7 @@ ascendc_include_directories(v9_kernel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/includ
   ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/indexer ${KVAF_INCLUDE}
   ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)
 ascendc_compile_options(v9_kernel PRIVATE -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WORKER=$<BOOL:${KVIP_OUTPUT_WORKER}> -DKVIP_FUSE_QUERY_WORK=$<BOOL:${KVIP_FUSE_QUERY_WORK}> -O2 -g --cce-auto-sync=off
+  -DKVIP_INCREMENTAL_TOPK=$<BOOL:${KVIP_INCREMENTAL_TOPK}>
   -DKVIP_REVERSE_COLD=$<BOOL:${KVIP_REVERSE_COLD}>
   -DKVIP_ROLLING_THRESHOLD=$<BOOL:${KVIP_ROLLING_THRESHOLD}>
   -DKVIP_ROLLING_COMPACT=$<BOOL:${KVIP_ROLLING_COMPACT}>
@@ -93,3 +95,5 @@ target_compile_definitions(v9_bridge PRIVATE KVIP_ROLLING_REUSE_SEED=$<BOOL:${KV
 target_compile_definitions(v9_bridge PRIVATE KVIP_ROLLING_FAST_PATH=$<BOOL:${KVIP_ROLLING_FAST_PATH}>)
 target_compile_definitions(v9_bridge PRIVATE KVIP_ROLLING_SPARSE=$<BOOL:${KVIP_ROLLING_SPARSE}>)
 target_compile_definitions(v9_bridge PRIVATE KVIP_ROLLING_BOUNDARY=$<BOOL:${KVIP_ROLLING_BOUNDARY}>)
+
+target_compile_definitions(v9_bridge PRIVATE KVIP_INCREMENTAL_TOPK=$<BOOL:${KVIP_INCREMENTAL_TOPK}>)

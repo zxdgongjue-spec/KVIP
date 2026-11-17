@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include "batch_get_abi.h"
 #include "runtime_shape.h"
+#include "incremental_topk.h"
 namespace rotating {
 constexpr uint32_t kTop=2048, kSlots=8192, kMaxRounds=32, kRowStatusWords=32;
 constexpr bool kFinalReplicated=true;
@@ -49,8 +50,11 @@ struct Context {
 
     // Optional int32[B,2] Index-only seed range; independent of KV tailBounds.
     uint64_t thresholdBounds;
+#if KVIP_INCREMENTAL_TOPK
+    uint64_t incrementalLists; // [B*4,rounds,32+2048] immutable count/ID lists.
+#endif
 };
-static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 328,
+static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 328 + 8*KVIP_INCREMENTAL_TOPK,
               "LIFetch runtime ABI layout changed");
 // Workload geometry is bound before capture and shared by host/device launches.
 #if defined(__CCE_AICORE__)
