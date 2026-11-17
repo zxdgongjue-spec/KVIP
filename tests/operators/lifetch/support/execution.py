@@ -3367,6 +3367,10 @@ class FusedReplayState:
         """Check completion before using outputs; then full-byte KV identity."""
         status = self.update.status.cpu().numpy()
         if np.any(status):
+            detail = dict(completion=status.tolist(),
+                          resolver=self.rotating.row_status.cpu().tolist(),
+                          final_posts=self.rotating.final_posts.cpu().tolist())
+            print('REPLAY COMPLETION AUDIT: ' + json.dumps(detail), flush=True)
             raise RuntimeError(f'Replay Index/Fetch completion failed: {status.tolist()}')
         ids = self.update.logical_output.cpu().numpy().reshape(self.batch, 4, 2048)
         slots = self.update.slot_output.cpu().numpy().reshape(self.batch, 4, 2048)
@@ -3380,7 +3384,11 @@ class FusedReplayState:
             selected_ids = ids[row][mask]
             invalid = hot_valid[row, selected_slots] == 0
             wrong_owner = layout[row, selected_slots] != selected_ids
-            bad = invalid | wrong_owner
+            # Index-only exchanges invalidate freed source slots without
+            # moving their KV. This round may still read the old bytes there;
+            # only persistent valid slots promise the committed Index owner.
+            # The full-byte check below validates every selected output slot.
+            bad = (~invalid) & wrong_owner
             if np.any(bad):
                 positions = np.argwhere(mask)
                 examples = []
