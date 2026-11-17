@@ -41,9 +41,15 @@ def _bind_selectors(torch, policy, config):
         raise ValueError("lifetch_score_route must be legacy, auto, history or bsq")
     score_post = getattr(config, "lifetch_score_post", "separate")
     score_prepare = getattr(config, "lifetch_score_prepare", "wave")
-    if score_post not in ("separate", "scatter", "direct") or score_prepare not in ("wave", "invocation"):
+    score_service = getattr(config, "lifetch_score_service", "separate")
+    hot_partitions = getattr(config, "lifetch_score_hot_partitions", 0)
+    cold_partitions = getattr(config, "lifetch_score_cold_partitions", 0)
+    if (score_post not in ("separate", "scatter", "direct") or score_prepare not in ("wave", "invocation", "phase")
+            or score_service not in ("separate", "inline") or (score_service=="inline" and score_post=="separate")
+            or any(type(x) is not int or not 0 <= x <= 32 for x in (hot_partitions,cold_partitions))):
         raise ValueError("Invalid lifetch_score_post/lifetch_score_prepare")
-    if score_route == "legacy" and (score_post != "separate" or score_prepare != "wave"):
+    if score_route == "legacy" and (score_post != "separate" or score_prepare != "wave"
+                                    or score_service!="separate" or hot_partitions or cold_partitions):
         raise ValueError("lifetch score post/prepare require a staged score route")
     split_score = score_route != "legacy"
     aiv_budget = query_device_resources("", policy.pool.device.index)["aiv"] if split_score else None
@@ -55,6 +61,7 @@ def _bind_selectors(torch, policy, config):
             aivs=aiv_budget,
             windows=setup.windows,
             route=score_route,
+            hot_partitions=hot_partitions, cold_partitions=cold_partitions,
         )
     launch_type = LIFetchBinding
     libraries = {}
@@ -104,6 +111,7 @@ def _bind_selectors(torch, policy, config):
             scratch=scratch,
             score_route=score_route,
             score_post=score_post, score_prepare=score_prepare,
+            score_service=score_service, score_hot_partitions=hot_partitions, score_cold_partitions=cold_partitions,
             aiv_budget=aiv_budget,
         )
         update = DirectIndexUpdate(
@@ -114,13 +122,14 @@ def _bind_selectors(torch, policy, config):
     policy.indexer_selectors = selectors
     logging.getLogger("vllm").info(
         "KVAF decode backend=li_fetch groups=%s batch_capacity=%s history_capacity=%s hot_tokens=%s "
-        "requested_windows=%s score_route=%s score_post=%s score_prepare=%s; shared Runtime queues and original LRU candidates",
+        "requested_windows=%s score_route=%s score_post=%s score_prepare=%s score_service=%s P_hot=%s P_cold=%s; shared Runtime queues and original LRU candidates",
         len(selectors),
         setup.batch,
         policy.fused_index_storage[0].history,
         policy.history_capacity,
         setup.windows,
         score_route, score_post, score_prepare,
+        score_service, hot_partitions, cold_partitions,
     )
 
 
@@ -174,7 +183,9 @@ def prepare_workspace(torch, policy, config, device_id, soc, index_heads=64):
 def _bind_ubmem_selectors(torch, policy, config):
     if (getattr(config, "lifetch_score_route", "legacy") != "legacy" or
         getattr(config, "lifetch_score_post", "separate") != "separate" or
-        getattr(config, "lifetch_score_prepare", "wave") != "wave"):
+        getattr(config, "lifetch_score_prepare", "wave") != "wave" or
+        getattr(config, "lifetch_score_service", "separate") != "separate" or
+        getattr(config, "lifetch_score_hot_partitions", 0) or getattr(config, "lifetch_score_cold_partitions", 0)):
         raise ValueError("UBmem supports only legacy score with default post/prepare")
     setup, workspace, writer = policy.fused_setup, policy.fused_workspace, policy.writer
     if config.transport != "ubmem" or setup is None or workspace is None or writer is None:

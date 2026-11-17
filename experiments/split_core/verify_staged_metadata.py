@@ -6,7 +6,9 @@ import json
 from pathlib import Path
 import re
 
-AIV_KERNELS = ("prepare", "scatter", "progress", "service", "topk")
+AIV_KERNELS = ("prepare", "prepare_all", "scatter", "scatter_predicate",
+               "progress", "service", "service_ready", "topk")
+SCORE_KERNELS = ("score", "score_direct")
 
 
 def verify(folder):
@@ -22,13 +24,15 @@ def verify(folder):
         symbol = mappings["aiv_config.cmake"].get(kernel, "")
         if not symbol or "_mix_" in symbol:
             raise ValueError(f"{kernel} lacks an AIV-only generated entry")
-    for name, suffix in (("aic_config.cmake", "_mix_aic"), ("aiv_config.cmake", "_mix_aiv")):
-        if not mappings[name].get("v9_staged_score", "").endswith(suffix):
-            raise ValueError("score must retain its MIX AIC 1:2 entries")
+    for kernel in SCORE_KERNELS:
+        for name, suffix in (("aic_config.cmake", "_mix_aic"), ("aiv_config.cmake", "_mix_aiv")):
+            if not mappings[name].get("v9_staged_" + kernel, "").endswith(suffix):
+                raise ValueError(f"{kernel} must retain its MIX AIC 1:2 entries")
     generated = folder / "auto_gen_indexer.cpp"
     text = generated.read_text()
-    if not re.search(r"v9_staged_score_mix_aic_section[^;]+K_TYPE_MIX_AIC_MAIN[^;]+1, 2", text):
-        raise ValueError("score generated metadata is not MIX 1:2")
+    for kernel in SCORE_KERNELS:
+        if not re.search(r"v9_staged_" + kernel + r"_mix_aic_section[^;]+K_TYPE_MIX_AIC_MAIN[^;]+1, 2", text):
+            raise ValueError(f"{kernel} generated metadata is not MIX 1:2")
     paths[generated.name] = generated
     vector = folder / "auto_gen_staged_vector.cpp"
     paths[vector.name] = vector

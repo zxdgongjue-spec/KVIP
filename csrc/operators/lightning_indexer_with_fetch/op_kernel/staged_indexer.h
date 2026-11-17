@@ -141,20 +141,48 @@ extern "C" __global__ __aicore__ void v9_staged_progress(GM_ADDR bindings,GM_ADD
         for(uint32_t q=0;q<4;++q){ready[q].end[0]=end;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ready+q),128);}
     }
 }
-extern "C" __global__ __aicore__ void v9_staged_service(GM_ADDR bindings,uint32_t epoch) {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    if ASCEND_IS_AIV {
-        using namespace AscendC;
-        auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);auto s=rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(a[14]));
-        TPipe pipe;QLIKernel::QLIVector<kvip_staged_device::Type> op;
-        QLICommon::ConstInfo c{};c.gSize=s.indexHeads;c.kSeqSize=s.history;c.s1BaseSize=4;c.s2BaseSize=128;c.sparseCount=2048;
-        QLITilingData tiling{};op.InitParams(c,&tiling,true);
-        op.SetRotationContext(reinterpret_cast<GM_ADDR>(a[14]));
+namespace kvip_staged_device {
+// Previous same-stream kernels completed all four Hot predicates or every
+// Cold task in this epoch. Publish only the owners read by this Service lane;
+// no lane reads its sibling's records and no cross-lane barrier is needed.
+__aicore__ inline void PublishServiceReady(GM_ADDR bindings,uint32_t end) {
+    using namespace AscendC;
+    auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
+    auto ctx=reinterpret_cast<__gm__ rotating::Context*>(a[14]);
+    auto s=rotating::LoadRuntimeShape(ctx);
+    uint32_t block=GetBlockIdx();
+    uint32_t lane=rotating::ServiceLane(s.batch,s.splitQ,s.serviceAics,block/2,block%2);
+    for(uint32_t b=lane;b<s.batch;b+=s.serviceLanes) {
+        auto ready=reinterpret_cast<__gm__ rotating::Progress*>(ctx->progress)+b*4;
+        for(uint32_t q=0;q<4;++q) {
+            ready[q].end[0]=end;
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ready+q),128);
+        }
+    }
+}
+__aicore__ inline void Service(GM_ADDR bindings,uint32_t epoch) {
+    using namespace AscendC;
+    auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);auto s=rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(a[14]));
+    TPipe pipe;QLIKernel::QLIVector<kvip_staged_device::Type> op;
+    QLICommon::ConstInfo c{};c.gSize=s.indexHeads;c.kSeqSize=s.history;c.s1BaseSize=4;c.s2BaseSize=128;c.sparseCount=2048;
+    QLITilingData tiling{};op.InitParams(c,&tiling,true);
+    op.SetRotationContext(reinterpret_cast<GM_ADDR>(a[14]));
 #if KVIP_STREAMING_LI
-        op.SetStreamingWorkspace(reinterpret_cast<GM_ADDR>(a[15]));
+    op.SetStreamingWorkspace(reinterpret_cast<GM_ADDR>(a[15]));
 #endif
     op.InitBuffers(&pipe,true);
-        op.RotateFetch(epoch);pipe.Destroy();
+    op.RotateFetch(epoch);pipe.Destroy();
+}
+}
+extern "C" __global__ __aicore__ void v9_staged_service(GM_ADDR bindings,uint32_t epoch) {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV { kvip_staged_device::Service(bindings,epoch); }
+}
+extern "C" __global__ __aicore__ void v9_staged_service_ready(GM_ADDR bindings,uint32_t epoch,uint32_t end) {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV {
+        kvip_staged_device::PublishServiceReady(bindings,end);
+        kvip_staged_device::Service(bindings,epoch);
     }
 }
 

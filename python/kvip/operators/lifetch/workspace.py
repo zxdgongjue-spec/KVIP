@@ -116,7 +116,8 @@ class LIFetchWorkspace:
             )
         )
 
-    def reserve_split_score(self, torch, *, resident, aics, aivs, windows, route="auto"):
+    def reserve_split_score(self, torch, *, resident, aics, aivs, windows, route="auto",
+                            hot_partitions=0, cold_partitions=0):
         """Reserve numerical score buffers before profiling/capture.
 
         Forward reuses these views across serial layer groups. Small immutable
@@ -131,7 +132,7 @@ class LIFetchWorkspace:
             and (history - resident) // 128 >= windows - 1
         ):
             raise ValueError("Unsupported split score resident/windows")
-        split_score_tasks(batch, 0, resident, aics, aivs, route)
+        split_score_tasks(batch, 0, resident, aics, aivs, route, partitions=hot_partitions)
         device = self.topk.device
         pool = self.streaming_scratch
         events = self.scratch.get("events")
@@ -150,7 +151,8 @@ class LIFetchWorkspace:
             begin = end
         cap = min(aics, aivs // 2)
         for begin, end in ranges:
-            qg, _, tasks = split_score_tasks(batch, begin, end, aics, aivs, route)
+            qg, _, tasks = split_score_tasks(batch, begin, end, aics, aivs, route,
+                                            partitions=hot_partitions if begin==0 else cold_partitions)
             for first in range(0, len(tasks), cap):
                 ts = tasks[first : first + cap]
                 rows = len(ts)

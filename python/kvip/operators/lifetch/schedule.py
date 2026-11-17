@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 
 
-def split_score_tasks(batch, begin, end, aics, aivs, route="auto"):
+def split_score_tasks(batch, begin, end, aics, aivs, route="auto", *, partitions=0):
     """Enumerate exact Q/H coverage under the independent MIX1:2 budget."""
     if not (
         1 <= batch <= 32
@@ -12,12 +12,17 @@ def split_score_tasks(batch, begin, end, aics, aivs, route="auto"):
         and 1 <= aics <= 32
         and 2 <= aivs <= 64
         and route in ("auto", "history", "bsq")
+        and type(partitions) is int and 0 <= partitions <= 32
     ):
         raise ValueError("Unsupported split score geometry or route")
     capacity = min(aics, aivs // 2)
     qg = 4 if route == "history" or (route == "auto" and 2 * batch <= capacity) else 2
     tiles = (end - begin) // 128
+    if partitions and (qg != 4 or partitions > capacity or partitions > tiles):
+        raise ValueError("Explicit history partitions require Q4, available MIX groups and enough tiles")
     producers = max(1, min(capacity // batch, tiles)) if qg == 4 else 1
+    if partitions:
+        producers = partitions
     tasks = [
         (b, q, begin + tiles * p // producers * 128, begin + tiles * (p + 1) // producers * 128)
         for b in range(batch)

@@ -355,7 +355,7 @@ def dispatch(config):
     run.mkdir(parents=True, exist_ok=False)
     common = {key: getattr(config, key) for key in
               ('transport', 'device', 'kvaf_root', 'kvaf_server', 'output', 'timeout_seconds',
-               'aic_budget', 'aiv_budget', 'q_workers', 'score_route', 'score_post', 'score_prepare')}
+               'aic_budget', 'aiv_budget', 'q_workers', 'score_route', 'score_post', 'score_prepare', 'score_service', 'score_hot_partitions', 'score_cold_partitions')}
     if config.mode == 'all':
         check = configuration(['check'])
         vars(check).update(common)
@@ -368,7 +368,7 @@ def dispatch(config):
     else:
         jobs = [(config.mode, config)]
     for _, job in jobs:
-        vars(job).update({key: getattr(config, key) for key in ('aic_budget', 'aiv_budget', 'q_workers', 'score_route', 'score_post', 'score_prepare')})
+        vars(job).update({key: getattr(config, key) for key in ('aic_budget', 'aiv_budget', 'q_workers', 'score_route', 'score_post', 'score_prepare', 'score_service', 'score_hot_partitions', 'score_cold_partitions')})
     atomic_json(run / 'config.json', {key: str(value) if isinstance(value, Path) else value
                                     for key, value in vars(config).items()})
     rows, stopped = [], False
@@ -1744,6 +1744,7 @@ def run_urma(args, run_dir):
                     batch=batch, history=args.history, resident=args.resident, miss_percent=args.miss_percent,
                     index_heads=args.index_heads, seed=args.seed if hasattr(args, 'seed') else 20261104,
                     fixture=fixture_info,
+                    binary_sha256=built_digest,
                     resources=resources,
                     resource_geometry=(report.get("score_geometry") if args.score_route != "legacy" else geometry),
                     final_workers=(4 if args.score_route != "legacy" else final_aivs(batch, "auto", aics, 0)),
@@ -2020,6 +2021,9 @@ def run_urma_case(
         score_route=getattr(args, 'score_route', 'legacy'),
         score_post=getattr(args, 'score_post', 'separate'),
         score_prepare=getattr(args, 'score_prepare', 'wave'),
+        score_service=getattr(args, 'score_service', 'separate'),
+        score_hot_partitions=getattr(args, 'score_hot_partitions', 0),
+        score_cold_partitions=getattr(args, 'score_cold_partitions', 0),
         prefetch_limit=args.prefetch_tokens,
         output_stride=owner.output.shape[1],
     )
@@ -3231,7 +3235,8 @@ class FusedReplayState:
     """
     def __init__(self, torch, runtime, table, library, initial, pages, addresses,
                  *, device, aics, windows, prefetch_tokens, soc, aiv_budget=None, q_workers=2, score_route='legacy',
-                 score_post='separate', score_prepare='wave'):
+                 score_post='separate', score_prepare='wave', score_service='separate',
+                 score_hot_partitions=0, score_cold_partitions=0):
         from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
         from kvip.cache.index_storage import IndexCacheStorage
         from kvip.operators.lifetch.binding import LIFetchBinding
@@ -3286,7 +3291,8 @@ class FusedReplayState:
                     intermediate_fetches=windows, prefetch_limit=prefetch_tokens,
                     aic_count=aics, token_bytes=self.token_bytes, aiv_budget=aiv_budget,
                     q_workers=q_workers, score_route=score_route,
-                    score_post=score_post, score_prepare=score_prepare, **binding)
+                    score_post=score_post, score_prepare=score_prepare, score_service=score_service,
+                    score_hot_partitions=score_hot_partitions, score_cold_partitions=score_cold_partitions, **binding)
             update_type = UbmemIndexUpdate if ubmem else DirectIndexUpdate
             self.update = update_type(
                 torch, keys=self.storage.keys, scales=self.storage.scales,
@@ -3622,7 +3628,10 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
                 aiv_budget=getattr(config, 'aiv_budget', None), q_workers=config.q_workers,
                 score_route=getattr(config, 'score_route', 'legacy'),
                 score_post=getattr(config, 'score_post', 'separate'),
-                score_prepare=getattr(config, 'score_prepare', 'wave'))
+                score_prepare=getattr(config, 'score_prepare', 'wave'),
+                score_service=getattr(config, 'score_service', 'separate'),
+                score_hot_partitions=getattr(config, 'score_hot_partitions', 0),
+                score_cold_partitions=getattr(config, 'score_cold_partitions', 0))
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
         checks = CorrectnessRecorder()
@@ -3677,6 +3686,9 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
                       score_route=getattr(config, 'score_route', 'legacy'),
                       score_post=getattr(config, 'score_post', 'separate'),
                       score_prepare=getattr(config, 'score_prepare', 'wave'),
+                      score_service=getattr(config, 'score_service', 'separate'),
+                      score_hot_partitions=getattr(config, 'score_hot_partitions', 0),
+                      score_cold_partitions=getattr(config, 'score_cold_partitions', 0),
                       transport=config.transport, path='fused' if fused else 'serial',
                       runtime_workers=workers, kv_payload=('deterministic C8; real Q/Index; captured page aliases'
                       if config.input == 'real' else 'deterministic C8; synthetic controlled Q/Index'),

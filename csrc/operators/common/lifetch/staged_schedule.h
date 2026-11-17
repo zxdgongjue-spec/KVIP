@@ -3,7 +3,8 @@
 // Internal opt-in sidecar. Context/RuntimeShape and their serialized ABI stay fixed.
 namespace kvip_staged {
 enum PostMode : uint32_t { Separate=0, ScatterPredicate=1, DirectPredicate=2 };
-enum PrepareMode : uint32_t { PerWave=0, PerInvocation=1 };
+enum PrepareMode : uint32_t { PerWave=0, PerInvocation=1, PerPhase=2 };
+enum ServiceMode : uint32_t { SeparateReady=0, InlineReady=1 };
 struct ScoreTask { uint32_t owner, queryBegin, begin, end; };
 struct ScoreWave {
     uint64_t bindings, scores, tasks;
@@ -15,14 +16,14 @@ struct Plan {
     const ScoreWave* cold;
     uint32_t hotCount, coldCount, aivBudget, fetchWorkers;
     uint64_t prepareWaves;
-    uint32_t prepareCount, postMode, prepareMode, reserved;
+    uint32_t prepareCount, postMode, prepareMode, serviceMode;
 };
 struct PrepareWave {
     uint64_t bindings, tasks;
     uint32_t rows, stride, queryGroup, reserved;
 };
 static_assert(sizeof(ScoreTask)==16 && sizeof(PrepareWave)==32 && sizeof(Plan)==64,
-              "Rebuild bridge and Python together for staged private plan ABI v2");
+              "Rebuild bridge and Python together for staged private plan ABI v3");
 inline uint32_t OwnerCapacity(uint32_t v, uint32_t w) {
     if (v>64 || (w!=1 && w!=2 && w!=4) || v<=4*w) return 0;
     uint32_t n=(v-4*w)/3;

@@ -2,9 +2,11 @@
 
 此目录随 MR14 源分支一起发布，直接使用当前 checkout 的 `test_lifetch.py`。无需另外应用补丁。
 
-默认保持 `score_route=legacy`。显式 staged 候选提供 `score_post=separate|scatter|direct` 与 `score_prepare=wave|invocation`。Cold 的 scatter 分类继承 score task 的两个配套 AIV；direct 在原 reduction 后直接输出 canonical＋bitmap；invocation 合并 prepare launch，同时保留每次调用的动态输入刷新。resident 全覆盖 θ、四 Q Hot gate、owner 唯一 admission/slot/victim、epoch、Final/Fetch/CQ/Index 的原完成依赖保持。
+默认保持 `score_route=legacy`。显式 staged 候选提供 `score_post=separate|scatter|direct`、`score_prepare=wave|invocation|phase`、`score_service=separate|inline`，以及独立 `score_hot_partitions` / `score_cold_partitions`。Cold 分类继承 score task 的两个配套 AIV；direct 在原 reduction 后直接输出 canonical＋bitmap。phase 分别合并 Hot、Cold prepare，Cold prepare 仍排在 Hot Service 后；inline 由 Service AIV 发布自己的 owner ready，消除独立 progress launch。每次调用仍刷新实时输入。
 
-私有 Plan ABI v2 为64B，Python与bridge必须一起重建，旧 staged bridge会被拒绝。公开Context/RuntimeShape ABI 11不变。CPU通过和源码操作仿真不是A5编译/数值/性能验收；A5结果仍待执行。
+分片数0沿用原自动策略；显式1..32必须满足实际 `min(AIC,AIV/2)` 预算和128-key tile数量，只支持Q4/history或选择Q4的auto。`P_hot`、`P_cold`可不同；resident/Final TopK的history切分仍各为1，Fetch宽度单独选择。保留完整resident θ、四 Q Hot gate、owner唯一admission/slot/victim、epoch、Final/Fetch/CQ/Index的原完成依赖。inline不是段级Service并发：每epoch全部score完成后才消费，不能据此宣称消除了epoch等待。
+
+私有 Plan ABI v3 为64B，Python与bridge必须一起重建，旧 staged bridge会被拒绝。公开Context/RuntimeShape ABI 11不变。CPU通过和源码操作仿真不是A5编译/数值/性能验收；A5结果仍待执行。
 
 ## 运行
 
@@ -58,10 +60,51 @@ python3 tests/operators/lifetch/cold_parallel/summarize_controls.py \
 
 每case的源码先与candidate.json匹配；原入口按源hash构建，不要使用旧bridge缓存。运行失败立即停止并保留日志。汇总核对完整manifest计划、全部receipt/exit/log SHA和所有report PASS后再丢弃r0计时，拒绝缺测或失败case。输出 `full_chain.csv`、`summary.json`；child report保留实际资源、wave queryGroup/rows/stride与binary hash、原始samples。
 
+## 独立分片与关键通路调优
+
+先用W2对齐B1库上P2的有效窗口数。下面包含同构建P2、原staged、direct、phase、inline逐项控制，以及Ph4/Pc4、8、16、28的phase/invocation候选；共52个case（含一轮丢弃）。核预算28/56只在实际资源足够时填写，否则删去预算参数，并把分片列表限制在真实容量内。
+
+```bash
+python3 tests/operators/lifetch/cold_parallel/run_controls.py \
+  --matrix tuning --repo "$PWD" --kvaf-root /path/to/KVAF --device 5 \
+  --windows 2 --prefetch 512 \
+  --hot-partitions 4 --cold-partitions 4,8,16,28 \
+  --prepares phase,invocation --fetch-workers 2 \
+  --aic-budget 28 --aiv-budget 56 \
+  --output /home/w00568585/mr14_score_tuning_W2 --execute
+
+python3 tests/operators/lifetch/cold_parallel/summarize_controls.py \
+  /home/w00568585/mr14_score_tuning_W2
+```
+
+去掉`--execute`先预览。然后另选新output，将`--windows 2,8 --prefetch 0,512`补齐策略对照；可扩展`--hot-partitions 4,8`、`--fetch-workers 1,2,4`，但每个组合都保留匹配的P2和staged控制，case数相应增加。不要同时启动多组跑同一个device。
+
+`candidate_over_legacy_mean<1`才证明相对库上P2整链变快；`candidate_over_staged_before_mean<1`只证明改善原MR14 staged。`best_candidates.json`按W/prefetch/Fetch/预算选择本轮网格中均值最快的候选，不能当作所有场景的最优点。将选中的参数固定后再独立复跑，确认收益复现。汇总核对实际AIC/AIV和binary hash；请求W8的legacy仍是有效W2，所以W8结果需单独解释。`native_chain`继续只是SDK串行参考。
+
+首次生成后，可额外核对CANN配置（将路径换成日志中的实际build）：
+
+```bash
+python3 experiments/split_core/verify_staged_metadata.py \
+  --auto-gen /path/to/build/auto_gen/v9_kernel
+```
+
+新`service_ready`/prepare_all/scatter_predicate必须是AIV-only，score和score_direct必须是MIX1:2。普通计时外采集msprof，确认阶段时间、首次Fetch、未覆盖join和ConsumerReady；该脚本不伪造尚未接入的设备时间戳。
+
 ## 如何判定
 
 比较同轮、同W/prefetch/resources的 `prototype_with_update`：candidate/legacy <1 才表示整链变快。`native_chain` 是SDK QLI→LIDU prepare→KVAF串行参考，不是P2。保留原始056fe62的legacy复测，检查新增编译代码是否让基线漂移。B1 legacy请求W8实际Shape为W2；staged保留W8，必须记录这个策略差异，不能称两侧窗口数完全相同。
 
 全Cold bitmap在计时外验证canonical key、唯一resident θ和queryEnds；原TopK/payload/mapping/LRU/Index/CQ检查继续。UBmem仍限legacy；staged diagnose/all没有统一timeline decoder，继续拒绝。要观察kernel时间可从bench外部采集msprof，不将其扰动计时混入普通样本。
 
-源码仿真B1/C28/V56/history/W8表明dispatch45→31、Cold score载荷3.5→0.875MiB，但direct新增1792次predicate VF与PIPE_V barrier、200704B θ DMA，每VF仅64/256线程有工作。这是源码操作/请求载荷，不能称A5 ISA或实际速度。prepare_all只合并launch，复制量不减，且全部prepare提前到Hot之前；首次Fetch是否提前、未覆盖join与ConsumerReady下降仍需设备埋点。段级Service并发/Final私有buffer拆分尚未实现。
+实际before/after host代码仿真：B1/C28/V56/history/W8，原staged separate/wave为45次dispatch；上一版direct/invocation为31次；新direct/phase/inline/Ph4/Pc8为24次（相对原staged减少46.7%，相对上一版减少22.6%）。准备Q/weight/qscale载荷每个方向从3,842,048B降至1,029,120B（减少73.2%）。Cold score载荷仍保持上一版direct的3.5→0.875MiB收益，本轮没有再减；Cold比较次数与数学工作量不变。减少P降低复制/θ重复加载，却增长每task扫描长度，需要实测其算力与带宽权衡。
+
+W2同候选为12次dispatch，Hot每组4096keys，Cold每组14336keys；W8的Cold每组2048keys。invocation同候选分别为11/23次，但所有Cold prepare移到Hot之前，须比较首次Fetch是否被推迟。源码操作/请求载荷不能称A5 ISA或实际速度，尚不能把原755.9µs直接乘比例得到新延迟。段级Service并发/Final私有buffer拆分尚未实现。
+
+重现源码仿真（需要git中保留04ddfaa基准提交）：
+
+```bash
+python3 tests/operators/lifetch/cold_parallel/simulate_schedule.py \
+  --output /tmp/mr14_score_schedule_simulation.json
+```
+
+结果见`docs/research/split_core/results/critical-path-simulation.json`；实现与限制说明见`docs/research/split_core/critical_path_candidate.md`。

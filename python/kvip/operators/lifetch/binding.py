@@ -43,13 +43,21 @@ class LIFetchBinding:
         score_route="legacy",
         score_post="separate",
         score_prepare="wave",
+        score_service="separate",
+        score_hot_partitions=0,
+        score_cold_partitions=0,
     ):
         if score_route not in ("legacy", "auto", "history", "bsq"):
             raise ValueError("score_route must be legacy, auto, history or bsq")
-        if score_post not in ("separate", "scatter", "direct") or score_prepare not in ("wave", "invocation"):
+        if (score_post not in ("separate", "scatter", "direct") or score_prepare not in ("wave", "invocation", "phase")
+                or score_service not in ("separate", "inline")
+                or (score_service == "inline" and score_post == "separate")
+                or any(type(x) is not int or not 0 <= x <= 32 for x in (score_hot_partitions, score_cold_partitions))
+                or (score_route == "bsq" and (score_hot_partitions or score_cold_partitions))):
             raise ValueError("Invalid staged score_post or score_prepare")
         staged = staged or score_route != "legacy"
-        if not staged and (score_post != "separate" or score_prepare != "wave"):
+        if not staged and (score_post != "separate" or score_prepare != "wave" or score_service != "separate"
+                           or score_hot_partitions or score_cold_partitions):
             raise ValueError("score_post/score_prepare require a staged score route")
         if staged and (final_workers not in (0, 4) or intermediate_fetches < 2):
             raise ValueError("Split score requires four Final records and Hot/Cold windows")
@@ -74,6 +82,8 @@ class LIFetchBinding:
         self.staged = staged
         self.score_route = "auto" if staged and score_route == "legacy" else score_route
         self.score_post, self.score_prepare = score_post, score_prepare
+        self.score_service = score_service
+        self.score_hot_partitions, self.score_cold_partitions = score_hot_partitions, score_cold_partitions
         self.aiv_budget = aiv_budget
         self.runtime_shape = RuntimeShape.prepare(
             self.library,

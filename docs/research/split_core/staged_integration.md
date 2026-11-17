@@ -12,7 +12,19 @@ Resolve保留同owner四Q保护bitmap并集和crossQ dedup，统一分配唯一s
 
 独立物理预算 `Ceff=min(C,floor(V/2))`，score每wave≤Ceff；θ/Final每wave≤V。tail owner容量为 `min(16,floor((V-4W)/3))`，每wave驻留 `3n+4W` AIV。Fetch与completion只等待当前owner范围，上一wave完成后才清packed counters并启动下一wave。
 
-CANN legacy CMake按整个编译文件的默认类型生成kernel元数据。五个纯AIV入口在独立 `staged_vector.cpp` 中编译，score留在MIX文件，避免把θ/Final等错误打包成MIX 1:2并超出AIC预算。`verify_staged_metadata.py --auto-gen <build>/auto_gen/<library>`核对实际生成配置；它拒绝错误MIX负例，验证Model与原生库的AIV-only入口及score 1:2。
+CANN legacy CMake按整个编译文件的默认类型生成kernel元数据。纯AIV入口在独立 `staged_vector.cpp` 中编译，score留在MIX文件，避免把θ/Final等错误打包成MIX 1:2并超出AIC预算。`verify_staged_metadata.py --auto-gen <build>/auto_gen/<library>`核对实际生成配置；当前检查还覆盖prepare_all、scatter_predicate、service_ready及score_direct。CPU负例验证不替代本版本实际CANN生成配置验收。
+
+## 关键通路候选：独立分片与ready转交
+
+`score_post="direct"`让Cold producer在最终key reduction后输出真实owner/Q的canonical与predicate。新增`score_hot_partitions`、`score_cold_partitions`，0保留自动策略；显式分片数限定在实际MIX组预算和128-key tile数量内，要求Q4/history（或auto选Q4）。多个owner允许跨wave，但不能提前跨过未完成的epoch。共享workspace预留与实际task布局使用同一分片参数。
+
+`score_prepare="phase"`分别合并Hot与Cold prepare，顺序为Hot prepare/score/scatter→完整resident TopK/Hot predicate→Hot Service→Cold prepare→各Cold epoch。与`invocation`全量prepare在前的控制分开，避免首个Hot服务机会被Cold准备阻塞。所有prepare仍在每次调用读取实时Q、weight、scale和pages，没有冻结模型输入。
+
+`score_service="inline"`要求scatter/direct predicate；Service kernel在自己的lane内为本owner四Q发布ready并clean cache，再调用原Service。跨kernel同stream依赖保证bitmap完整可见；Service lane不读取兄弟lane的ready，不新增跨lane屏障。它消除独立progress启动，仍然等待整个epoch，没有实现段级乱序消费、跨owner Final→tail流水或classification私有scratch。
+
+私有Plan仍64B，末字段承载serviceMode；其版本升为3，Python拒绝旧bridge。公开Context/RuntimeShape ABI11不变。resident/Final TopK的history分片保持1，Fetch宽度单独取1/2/4，默认legacy未切换。vLLM配置可显式传入`lifetch_score_hot_partitions`、`lifetch_score_cold_partitions`、`lifetch_score_prepare`与`lifetch_score_service`，必须在workspace预留前设置。
+
+本轮CPU/source仿真结果与A5执行命令见[critical_path_candidate.md](critical_path_candidate.md)和[Cold对比脚本](../../../tests/operators/lifetch/cold_parallel/README.md)。本版本尚无A5真机延迟或真实URMA新增路径验收，不能宣称相对库上P2已提速。
 
 ## 调用与startup
 

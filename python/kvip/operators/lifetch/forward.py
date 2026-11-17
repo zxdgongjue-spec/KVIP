@@ -7,7 +7,8 @@ from kvip.operators.lifetch.staged import StagedLIFetchForward
 
 class LIFetchForward(StagedLIFetchForward):
     def __init__(self, rotating, update, *, q_workers=2, aiv_budget=None, score_route=None,
-                 score_post=None, score_prepare=None):
+                 score_post=None, score_prepare=None, score_service=None,
+                 score_hot_partitions=None, score_cold_partitions=None):
         self.staged_score = getattr(rotating, "staged", False)
         route = (
             getattr(rotating, "score_route", "auto" if self.staged_score else "legacy")
@@ -16,11 +17,15 @@ class LIFetchForward(StagedLIFetchForward):
         )
         post = getattr(rotating, "score_post", "separate") if score_post is None else score_post
         prepare = getattr(rotating, "score_prepare", "wave") if score_prepare is None else score_prepare
+        service = getattr(rotating, "score_service", "separate") if score_service is None else score_service
+        hot = getattr(rotating, "score_hot_partitions", 0) if score_hot_partitions is None else score_hot_partitions
+        cold = getattr(rotating, "score_cold_partitions", 0) if score_cold_partitions is None else score_cold_partitions
         if self.staged_score:
             super().__init__(rotating, update, q_workers=q_workers, aiv_budget=aiv_budget,
-                             route=route, score_post=post, score_prepare=prepare)
+                             route=route, score_post=post, score_prepare=prepare, score_service=service,
+                             score_hot_partitions=hot, score_cold_partitions=cold)
             return
-        if route != "legacy" or post != "separate" or prepare != "wave":
+        if route != "legacy" or post != "separate" or prepare != "wave" or service != "separate" or hot or cold:
             raise ValueError("Prepare LIFetchBinding(score_route=...) before enabling split score")
         StreamingLIFetchForward.__init__(
             self,

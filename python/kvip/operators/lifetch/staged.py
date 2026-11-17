@@ -26,23 +26,26 @@ class Plan(ctypes.Structure):
         ("cold", ctypes.POINTER(ScoreWave)),
     ] + [(x, ctypes.c_uint32) for x in ("hotCount", "coldCount", "aivBudget", "fetchWorkers")] + [
         ("prepareWaves", ctypes.c_uint64),
-    ] + [(x, ctypes.c_uint32) for x in ("prepareCount", "postMode", "prepareMode", "reserved")]
+    ] + [(x, ctypes.c_uint32) for x in ("prepareCount", "postMode", "prepareMode", "serviceMode")]
 
 
 class StagedLIFetchForward(StreamingLIFetchForward):
     def __init__(self, rotating, update, *, q_workers=2, aiv_budget=None, route="auto",
-                 score_post="separate", score_prepare="wave"):
-        if score_post not in ("separate", "scatter", "direct") or score_prepare not in ("wave", "invocation"):
+                 score_post="separate", score_prepare="wave", score_service="separate",
+                 score_hot_partitions=0, score_cold_partitions=0):
+        if (score_post not in ("separate", "scatter", "direct") or score_prepare not in ("wave", "invocation", "phase")
+                or score_service not in ("separate", "inline")
+                or (score_service == "inline" and score_post == "separate")):
             raise ValueError("Invalid score post/prepare mode")
         # Reject stale bridges before passing the extended private Plan.
-        for name, expected in (("kvip_staged_plan_bytes", ctypes.sizeof(Plan)), ("kvip_staged_plan_version", 2)):
+        for name, expected in (("kvip_staged_plan_bytes", ctypes.sizeof(Plan)), ("kvip_staged_plan_version", 3)):
             fn = getattr(rotating.library, name, None)
             if fn is None:
-                raise ValueError("Rebuild LIFetch: staged private Plan ABI v2 is required")
+                raise ValueError("Rebuild LIFetch: staged private Plan ABI v3 is required")
             fn.argtypes, fn.restype = [], ctypes.c_uint32
             if fn() != expected:
                 raise ValueError("Rebuild LIFetch: staged private Plan ABI mismatch")
-        self.score_post, self.score_prepare = score_post, score_prepare
+        self.score_post, self.score_prepare, self.score_service = score_post, score_prepare, score_service
         if not getattr(rotating, "staged", False):
             raise ValueError("Prepare LIFetchBinding(staged=True) before allocating its Context")
         if hasattr(rotating, "lease"):
@@ -80,8 +83,9 @@ class StagedLIFetchForward(StreamingLIFetchForward):
         self.storage = [self.canonical]
         cap = min(s.aicCount, self.schedule.aiv_budget // 2)
 
-        def waves(begin, end):
-            qg, _, tasks = split_score_tasks(s.batch, begin, end, s.aicCount, self.schedule.aiv_budget, route)
+        def waves(begin, end, partitions):
+            qg, _, tasks = split_score_tasks(s.batch, begin, end, s.aicCount, self.schedule.aiv_budget, route,
+                                            partitions=partitions)
             result = []
             for first in range(0, len(tasks), cap):
                 ts = tasks[first : first + cap]
@@ -126,12 +130,12 @@ class StagedLIFetchForward(StreamingLIFetchForward):
                 )
             return result
 
-        hot = waves(0, s.resident)
+        hot = waves(0, s.resident, score_hot_partitions)
         cold = []
         begin = s.resident
         for epoch in range(1, s.rounds):
             end = s.resident + ((s.history - s.resident) // 128 * epoch // (s.rounds - 1)) * 128
-            cold.extend(waves(begin, end))
+            cold.extend(waves(begin, end, score_cold_partitions))
             begin = end
         self.hot = (ScoreWave * len(hot))(*hot)
         self.cold = (ScoreWave * len(cold))(*cold)
@@ -145,10 +149,14 @@ class StagedLIFetchForward(StreamingLIFetchForward):
             self.canonical.data_ptr(), self.hot, self.cold, len(hot), len(cold), self.schedule.aiv_budget, q_workers,
             self.prepare_descriptors.data_ptr(), len(desc),
             {"separate": 0, "scatter": 1, "direct": 2}[score_post],
-            {"wave": 0, "invocation": 1}[score_prepare], 0
+            {"wave": 0, "invocation": 1, "phase": 2}[score_prepare],
+            {"separate": 0, "inline": 1}[score_service]
         )
         self.score_geometry = dict(
-            route=route, post=score_post, prepare=score_prepare,
+            route=route, post=score_post, prepare=score_prepare, service=score_service,
+            requested_hot_partitions=score_hot_partitions, requested_cold_partitions=score_cold_partitions,
+            hot_tasks=sum(w.rows for w in hot), cold_tasks=sum(w.rows for w in cold),
+            resident_topk_h_partitions=1, final_topk_h_partitions=1, fetch_workers_per_query=q_workers,
             effective_aic=s.aicCount, aiv_budget=self.schedule.aiv_budget,
             hot_waves=len(hot), cold_waves=len(cold), windows=s.rounds,
             waves=[dict(rows=w.rows, query_group=w.queryGroup, stride=w.stride, ready_end=w.readyEnd)

@@ -126,13 +126,14 @@ extern "C" uint32_t aclrtlaunch_v9_staged_scatter(uint32_t,void*,void*,void*,voi
 extern "C" uint32_t aclrtlaunch_v9_staged_topk(uint32_t,void*,void*,void*,uint32_t,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_staged_progress(uint32_t,void*,void*,void*,uint32_t,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_staged_service(uint32_t,void*,void*,uint32_t);
+extern "C" uint32_t aclrtlaunch_v9_staged_service_ready(uint32_t,void*,void*,uint32_t,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_staged_clear_packed(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_streaming_owner_wave(uint32_t,void*,void*,uint32_t,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_staged_prepare_all(uint32_t,void*,void*,void*,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_staged_score_direct(uint32_t,void*,void*,void*,void*,void*,uint32_t,uint32_t,uint32_t,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_staged_scatter_predicate(uint32_t,void*,void*,void*,void*,void*,uint32_t,uint32_t,uint32_t);
 extern "C" uint32_t kvip_staged_plan_bytes(){return sizeof(kvip_staged::Plan);}
-extern "C" uint32_t kvip_staged_plan_version(){return 2;}
+extern "C" uint32_t kvip_staged_plan_version(){return 3;}
 extern "C" uint32_t kvip_prepare_staged_shape(rotating::RuntimeShape* shape,uint32_t v,uint32_t w) {
     return kvip_staged::PrepareShape(shape,v,w);
 }
@@ -142,8 +143,9 @@ extern "C" uint32_t kvip_lifetch_staged_forward(void* bindings,void* workspace,v
     const rotating::RuntimeShape* s,const kvip_staged::Plan* p) {
     if(!bindings || !workspace || !stream || !s || !p || !p->canonical || !p->hot || !p->cold ||
        !p->hotCount || !p->coldCount || s->finalWorkers!=4 || s->splitQ || s->serviceLanes!=2 ||
-       s->serviceAics!=1 || s->batch<1 || s->batch>32 || s->rounds<2 || p->reserved || p->postMode>kvip_staged::DirectPredicate ||
-       p->prepareMode>kvip_staged::PerInvocation) return 100000;
+       s->serviceAics!=1 || s->batch<1 || s->batch>32 || s->rounds<2 || p->serviceMode>kvip_staged::InlineReady ||
+       p->postMode>kvip_staged::DirectPredicate || p->prepareMode>kvip_staged::PerPhase ||
+       (p->serviceMode==kvip_staged::InlineReady && p->postMode==kvip_staged::Separate)) return 100000;
     rotating::RuntimeShape prepared=*s;
     if(kvip_staged::PrepareShape(&prepared,p->aivBudget,p->fetchWorkers) || std::memcmp(&prepared,s,sizeof(*s)))return 100000;
     uint32_t capacity=kvip_staged::OwnerCapacity(p->aivBudget,p->fetchWorkers);
@@ -166,11 +168,17 @@ extern "C" uint32_t kvip_lifetch_staged_forward(void* bindings,void* workspace,v
     uint32_t prepareRows=0;
     for(uint32_t i=0;i<p->hotCount;++i)if(p->hot[i].rows>prepareRows)prepareRows=p->hot[i].rows;
     for(uint32_t i=0;i<p->coldCount;++i)if(p->cold[i].rows>prepareRows)prepareRows=p->cold[i].rows;
-    if(p->prepareMode==kvip_staged::PerInvocation &&
+    if(p->prepareMode!=kvip_staged::PerWave &&
        (!p->prepareWaves || p->prepareCount!=p->hotCount+p->coldCount))return 100000;
     uint32_t result=v9_init(bindings,stream,s);
     if(!result && p->prepareMode==kvip_staged::PerInvocation)
         result=aclrtlaunch_v9_staged_prepare_all(prepareRows,stream,bindings,reinterpret_cast<void*>(p->prepareWaves),p->prepareCount);
+    auto preparePhase=[&](const kvip_staged::ScoreWave* ws,uint32_t n,uint32_t offset){
+        uint32_t rows=0;for(uint32_t i=0;i<n;++i)if(ws[i].rows>rows)rows=ws[i].rows;
+        return aclrtlaunch_v9_staged_prepare_all(rows,stream,bindings,
+            reinterpret_cast<void*>(p->prepareWaves+uint64_t(offset)*sizeof(kvip_staged::PrepareWave)),n);
+    };
+    if(!result && p->prepareMode==kvip_staged::PerPhase)result=preparePhase(p->hot,p->hotCount,0);
     auto scoreWave=[&](const kvip_staged::ScoreWave& w,bool cold){
         uint32_t r=0;
         if(p->prepareMode==kvip_staged::PerWave)r=aclrtlaunch_v9_staged_prepare(w.rows,stream,bindings,reinterpret_cast<void*>(w.bindings),reinterpret_cast<void*>(w.tasks),w.rows,w.stride,w.queryGroup);
@@ -191,15 +199,23 @@ extern "C" uint32_t kvip_lifetch_staged_forward(void* bindings,void* workspace,v
         uint32_t n=s->batch*4-q;if(n>p->aivBudget)n=p->aivBudget;
         result=aclrtlaunch_v9_staged_topk(n,stream,bindings,reinterpret_cast<void*>(p->canonical),q,1);
     }
-    if(!result)result=aclrtlaunch_v9_staged_progress(s->batch,stream,bindings,reinterpret_cast<void*>(p->canonical),s->resident,s->resident);
-    if(!result)result=aclrtlaunch_v9_staged_service(s->serviceLanes,stream,bindings,0);
+    auto service=[&](uint32_t begin,uint32_t end,uint32_t epoch){
+        if(p->serviceMode==kvip_staged::InlineReady)
+            return aclrtlaunch_v9_staged_service_ready(s->serviceLanes,stream,bindings,epoch,end);
+        uint32_t r=aclrtlaunch_v9_staged_progress(s->batch,stream,bindings,reinterpret_cast<void*>(p->canonical),
+            p->postMode==kvip_staged::Separate?begin:end,end);
+        return r?r:aclrtlaunch_v9_staged_service(s->serviceLanes,stream,bindings,epoch);
+    };
+    if(!result)result=service(s->resident,s->resident,0);
+    // Keep Cold preparation behind Hot Service so the first admission/Fetch
+    // opportunity retains the original resident-first ordering.
+    if(!result && p->prepareMode==kvip_staged::PerPhase)result=preparePhase(p->cold,p->coldCount,p->hotCount);
     uint32_t begin=s->resident,epoch=1;
     for(uint32_t i=0;!result && i<p->coldCount;++i){
         result=scoreWave(p->cold[i],true);
         if(!result && p->cold[i].readyEnd){
             uint32_t end=p->cold[i].readyEnd;
-            result=aclrtlaunch_v9_staged_progress(s->batch,stream,bindings,reinterpret_cast<void*>(p->canonical),p->postMode==kvip_staged::Separate?begin:end,end);
-            if(!result)result=aclrtlaunch_v9_staged_service(s->serviceLanes,stream,bindings,epoch++);
+            result=service(begin,end,epoch++);
             begin=end;
         }
     }

@@ -119,7 +119,10 @@ def configuration(argv=None):
         command.add_argument('--q-workers', type=int, choices=(1, 2, 4), default=2)
         command.add_argument('--score-route', choices=('legacy', 'auto', 'history', 'bsq'), default='legacy')
         command.add_argument('--score-post', choices=('separate', 'scatter', 'direct'), default='separate')
-        command.add_argument('--score-prepare', choices=('wave', 'invocation'), default='wave')
+        command.add_argument('--score-prepare', choices=('wave', 'invocation', 'phase'), default='wave')
+        command.add_argument('--score-service', choices=('separate', 'inline'), default='separate')
+        command.add_argument('--score-hot-partitions', type=int, default=0)
+        command.add_argument('--score-cold-partitions', type=int, default=0)
         if mode == 'check':
             command.add_argument('--suite', type=csv_values, default=('all',))
             command.add_argument('--cases', type=csv_values)
@@ -156,7 +159,14 @@ def configuration(argv=None):
         parser.error('device must be nonnegative and timeout positive')
     if not 0 <= args.aic_budget <= 32 or (args.aiv_budget is not None and not 2 <= args.aiv_budget <= 64):
         parser.error('AIC budget must be 0..32 and AIV budget 2..64')
-    if args.score_route == 'legacy' and (args.score_post != 'separate' or args.score_prepare != 'wave'):
+    if any(not 0 <= x <= 32 for x in (args.score_hot_partitions, args.score_cold_partitions)):
+        parser.error('score partitions must be 0 (auto) or 1..32')
+    if args.score_service == 'inline' and args.score_post == 'separate':
+        parser.error('inline Service ready requires scatter/direct predicates')
+    if args.score_route == 'bsq' and (args.score_hot_partitions or args.score_cold_partitions):
+        parser.error('explicit history partitions require history or Q4 auto route')
+    if args.score_route == 'legacy' and (args.score_post != 'separate' or args.score_prepare != 'wave'
+            or args.score_service != 'separate' or args.score_hot_partitions or args.score_cold_partitions):
         parser.error('score-post/score-prepare require a staged score route')
     if args.transport == 'ubmem' and args.score_route != 'legacy':
         parser.error('UBmem currently supports only the legacy score route')

@@ -12,17 +12,30 @@ def commands(a):
     for round_no in range(a.rounds+1):
         for windows in a.windows:
             for pf in a.prefetch:
-                modes=MODES.copy();rng.shuffle(modes)
-                for route,post,prepare in modes:
+                tuning=getattr(a,'matrix','cold')=='tuning'
+                modes=[(r,p,d,'separate',0,0,2) for r,p,d in MODES]
+                if tuning:
+                    modes=[]
+                    for workers in a.fetch_workers:
+                        modes.extend((r,p,d,s,0,0,workers) for r,p,d,s in (
+                            ('legacy','separate','wave','separate'),('history','separate','wave','separate'),
+                            ('history','direct','wave','separate'),('history','direct','phase','separate'),
+                            ('history','direct','phase','inline')))
+                        modes.extend(('history','direct',prepare,'inline',hot,cold,workers)
+                                     for hot in a.hot_partitions for cold in a.cold_partitions for prepare in a.prepares)
+                modes=list(dict.fromkeys(modes));rng.shuffle(modes)
+                for route,post,prepare,service,hot,cold,workers in modes:
                     name=f'r{round_no}_W{windows}_pf{pf}_{route}_{post}_{prepare}'
+                    if tuning:name+=f'_{service}_Ph{hot}_Pc{cold}_F{workers}'
                     cmd=[a.python,str(a.repo/'tests/operators/lifetch/test_lifetch.py'),'bench',
                          '--transport','urma','--device',str(a.device),'--kvaf-root',str(a.kvaf_root),
                          '--batches','1','--history','131072','--resident','16384','--queries','4','--index-heads','32',
                          '--miss-percent','10','--seed','43','--intermediate-fetches',str(windows),
                          '--prefetch-tokens',str(pf),'--warmup',str(a.warmup),'--iterations',str(a.iterations),
-                         '--q-workers','2','--aic-budget',str(a.aic_budget),'--score-route',route,
+                         '--q-workers',str(workers),'--aic-budget',str(a.aic_budget),'--score-route',route,
                          '--score-post',post,'--score-prepare',prepare,'--output',str(a.output/name),
                          '--timeout-seconds',str(a.timeout)]
+                    if tuning:cmd+=['--score-service',service,'--score-hot-partitions',str(hot),'--score-cold-partitions',str(cold)]
                     if a.aiv_budget is not None:cmd+=['--aiv-budget',str(a.aiv_budget)]
                     if a.kvaf_server:cmd+=['--kvaf-server',a.kvaf_server]
                     if a.valid_history is not None:cmd+=['--valid-history',str(a.valid_history)]
@@ -38,9 +51,25 @@ def main(argv=None):
     p.add_argument('--rounds',type=int,default=3);p.add_argument('--warmup',type=int,default=4);p.add_argument('--iterations',type=int,default=20)
     p.add_argument('--aic-budget',type=int,default=0);p.add_argument('--aiv-budget',type=int)
     p.add_argument('--valid-history',type=int);p.add_argument('--timeout',type=int,default=300)
+    p.add_argument('--matrix',choices=('cold','tuning'),default='cold')
+    p.add_argument('--hot-partitions',type=lambda s:[int(v) for v in s.split(',')],default=[4,8])
+    p.add_argument('--cold-partitions',type=lambda s:[int(v) for v in s.split(',')],default=[4,8,16])
+    p.add_argument('--prepares',type=lambda s:s.split(','),default=['phase','invocation'])
+    p.add_argument('--fetch-workers',type=lambda s:[int(v) for v in s.split(',')],default=[2])
     p.add_argument('--execute',action='store_true');a=p.parse_args(argv)
     a.repo=a.repo.resolve();a.kvaf_root=a.kvaf_root.resolve();a.output=a.output.resolve()
+    lists=(a.windows,a.prefetch,a.hot_partitions,a.cold_partitions,a.prepares,a.fetch_workers)
+    if any(not values or len(set(values))!=len(values) for values in lists):p.error('experiment lists must be nonempty and unique')
+    if a.device<0 or a.timeout<=0 or not 0<=a.aic_budget<=32 or (a.aiv_budget is not None and not 2<=a.aiv_budget<=64):
+        p.error('invalid device, timeout or hardware budget')
     if a.rounds<1 or a.warmup<1 or a.iterations<1 or any(x not in (2,8) for x in a.windows) or any(x<0 for x in a.prefetch):p.error('positive sampling; windows must be 2/8 and prefetch nonnegative')
+    if (any(not 1<=x<=32 for x in a.hot_partitions+a.cold_partitions) or
+        any(x not in (1,2,4) for x in a.fetch_workers) or any(x not in ('phase','invocation','wave') for x in a.prepares)):
+        p.error('valid partition, prepare and Fetch lists required')
+    if a.matrix=='tuning' and a.aic_budget and max(a.hot_partitions+a.cold_partitions)>a.aic_budget:
+        p.error('requested partition exceeds AIC budget')
+    if a.matrix=='tuning' and a.aiv_budget and 2*max(a.hot_partitions+a.cold_partitions)>a.aiv_budget:
+        p.error('requested partition exceeds paired AIV budget')
     cmds=list(commands(a))
     if not a.execute:
         for name,_,cmd in cmds:print(name+': '+shlex.join(cmd))
@@ -65,6 +94,6 @@ def main(argv=None):
         receipt=dict(name=name,discard=(round_no==0),argv=cmd,exit_code=result.returncode,start_unix=start,end_unix=time.time(),log_sha256=digest(log))
         (a.output/(name+'.receipt.json')).write_text(json.dumps(receipt,indent=2))
         if result.returncode:raise RuntimeError(f'{name} failed; stop before other device runs; see {log}')
-    print('All runs completed. Discard r0; compare prototype_with_update within matching W/prefetch/resources.')
+    print('All runs completed. Discard r0; compare prototype_with_update within matching requested windows/prefetch/Fetch/resources; legacy B1 W8 is effective W2.')
     return 0
 if __name__=='__main__':sys.exit(main())
