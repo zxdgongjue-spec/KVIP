@@ -5,6 +5,15 @@ namespace post_index {
 constexpr uint32_t kThreads = 256;
 constexpr uint32_t kEventThreads = 8;
 constexpr uint32_t kMaxEvents = 8192;
+constexpr uint32_t kFailureMaskWord = 31;
+
+// Clear before the producer join; errors publish before the existing Post join.
+// On failure only, finish this VF and its V_S edge before the Post/CQ join.
+__simt_vf__ __aicore__ LAUNCH_BOUND(32)
+inline void MarkPostFailure(__gm__ uint32_t* prefix, uint32_t row, uint64_t error) {
+    if (!threadIdx.x && error) asc_atomic_or(prefix + kFailureMaskWord, uint32_t(1) << row);
+    asc_threadfence();
+}
 
 // Run before posting any Get, then join every AIV's error result. The compact
 // Q4 resolver guarantees unique sources and destinations: missing resident
@@ -35,16 +44,17 @@ inline void ValidatePlan(
 // hold; every WQE address and TND output has consumed the original metadata.
 // CQ completion may still be pending: it writes hot KV, not these Index rows.
 // Split the whole batch's event list across all AIVs. Prefix is only batch+1
-// words, built during the existing pre-Post error reduction; no event list is
+// words, built inside block0 Pack; no event list is
 // copied or compacted. Self-refills need Get/CQ but no Index permutation.
-// Profile counters use 64 B of UB; headline invocations use no UB staging.
+// The caller stages the prefix, failure mask and owners in UB after the
+// collective Post join. Source/destination event arrays remain in GM.
 template<bool Profile = false>
 __simt_vf__ __aicore__ LAUNCH_BOUND(kThreads)
 inline void ApplyPlan(
     __gm__ uint32_t* sources, __gm__ uint32_t* destinations,
     uint32_t eventOffset, uint32_t eventStride, uint32_t history,
-    __gm__ uint32_t* prefix, uint32_t batch, uint32_t first, uint32_t end,
-    __gm__ uint32_t* rowOwners, __gm__ uint64_t* records, uint32_t cores,
+    __ubuf__ uint32_t* prefix, uint32_t batch, uint32_t first, uint32_t end,
+    __ubuf__ uint32_t* rowOwners,
     __gm__ uint64_t* keys, __gm__ uint32_t* scales,
     __gm__ uint64_t* addresses, __gm__ uint64_t* logical,
     uint32_t addressStride, __ubuf__ uint32_t* work) {
@@ -62,10 +72,10 @@ inline void ApplyPlan(
     uint64_t initialError = 0;
     uint32_t initialOwner = 0;
     if (initialEvent < end) {
-        const uint32_t boundaryLo = field < batch ? asc_ldcg(prefix + field + 1) : UINT32_MAX;
-        const uint32_t boundaryHi = field + 8 < batch ? asc_ldcg(prefix + field + 9) : UINT32_MAX;
-        const uint32_t ownerLo = field < batch && rowOwners ? asc_ldcg(rowOwners + field) : field;
-        const uint32_t ownerHi = field + 8 < batch && rowOwners ? asc_ldcg(rowOwners + field + 8) : field + 8;
+        const uint32_t boundaryLo = field < batch ? prefix[field + 1] : UINT32_MAX;
+        const uint32_t boundaryHi = field + 8 < batch ? prefix[field + 9] : UINT32_MAX;
+        const uint32_t ownerLo = field < batch && rowOwners ? rowOwners[field] : field;
+        const uint32_t ownerHi = field + 8 < batch && rowOwners ? rowOwners[field + 8] : field + 8;
         const uint32_t shift = (threadIdx.x % 32) & (32 - kEventThreads);
         const uint32_t lo = (asc_ballot(field < batch && initialEvent >= boundaryLo) >> shift) & 0xffU;
         const uint32_t hi = (asc_ballot(field + 8 < batch && initialEvent >= boundaryHi) >> shift) & 0xffU;
@@ -75,10 +85,7 @@ inline void ApplyPlan(
         if (!initialRow) initialBegin = 0;
         initialEnd = asc_shfl(initialRow < 8 ? boundaryLo : boundaryHi, initialRow & 7, kEventThreads);
         initialOwner = asc_shfl(initialRow < 8 ? ownerLo : ownerHi, initialRow & 7, kEventThreads);
-        uint64_t error = 0;
-        for (uint32_t peer = initialRow + field * batch; peer < cores; peer += kEventThreads * batch)
-            error |= asc_ldcg(records + uint64_t(peer) * 16);
-        initialError = (asc_ballot(error != 0) >> shift) & 0xffU;
+        initialError = (prefix[kFailureMaskWord] >> initialRow) & 1U;
     }
     for (uint32_t i = first + threadIdx.x / kEventThreads; i < end; i += kThreads / kEventThreads) {
         uint32_t src = 0, dst = 0;
@@ -94,13 +101,11 @@ inline void ApplyPlan(
                     rowError = initialError;
                     owner = initialOwner;
                 } else {
-                    while (row < batch && i >= asc_ldcg(prefix + row + 1)) ++row;
-                    rowBegin = asc_ldcg(prefix + row);
-                    rowEnd = asc_ldcg(prefix + row + 1);
-                    rowError = 0;
-                    for (uint32_t peer = row; peer < cores; peer += batch)
-                        rowError |= asc_ldcg(records + uint64_t(peer) * 16);
-                    owner = rowOwners ? asc_ldcg(rowOwners + row) : row;
+                    while (row < batch && i >= prefix[row + 1]) ++row;
+                    rowBegin = prefix[row];
+                    rowEnd = prefix[row + 1];
+                    rowError = (prefix[kFailureMaskWord] >> row) & 1U;
+                    owner = rowOwners ? rowOwners[row] : row;
                 }
             }
             if (!rowError) {

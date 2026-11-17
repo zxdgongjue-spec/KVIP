@@ -33,10 +33,14 @@ def test_collective_tail_uses_batch_scheduled_mixed_vector_kernel():
     assert "RunBatchGetValidation(" not in transport
     assert "ValidateBatchGetRequests" not in transport
     assert "args.tokens_per_block = 1" in tail
-    assert tail.index("post_index_transport::Preflight(args") < tail.index("Simt::VF_CALL<Pack>")
+    assert tail.index("post_index_transport::Preflight(args") < tail.index("Simt::VF_CALL<Pack<true>>")
     assert "OwnerRow(ctx" not in tail
     assert "16384 * 4" not in tail
-    assert "prefix[i % batch + 1] += uint32_t(records[i].count)" in tail
+    assert "prefix[i % batch + 1]" not in tail
+    assert "Pack<true>" in tail and "Pack<false>" in tail
+    assert "post_index_prepare::PrepareOnly" in tail
+    assert "post_index_prepare::PublishPreflight" in tail
+    assert tail.index("prefix[post_index_prepare::kErrorWord] = 0") < tail.index("Producer<true>(a")
     assert "ApplyPlan<false>" in tail
     assert "Simt::VF_CALL<post_index::ValidatePlan>" not in tail
     # OutputWorker's old diagnostic slots overlap the per-core scratch. Only
@@ -64,14 +68,14 @@ def test_cq_control_relocates_one_join_inside_the_same_tail():
         assert branch.count("post_index_transport::Wait(transport)") == 1
         assert branch.count("SyncAll();") == 1
         assert branch.index("record->error = error") < branch.index("SyncAll();")
-    # Five common barriers plus exactly one relocated CQ barrier. The
+    # Four common barriers plus exactly one relocated CQ barrier. The
     # offline control stays inside the existing kernel, not a new graph node.
-    assert tail.count("SyncAll();") == 7
+    assert tail.count("SyncAll();") == 6
     index = tail.index("Simt::VF_CALL<post_index::ApplyPlan<false>>")
     assert tail.index("if (waitFirst)") < index < tail.index("if (!waitFirst)")
     assert tail.index("record->completed = transport.completed", index) < tail.index("if (!waitFirst)")
     assert tail.index("if (!waitFirst)") < tail.index("RowError(records,")
-    assert "blocking = (records[0].fallback & 1U) != 0" in tail
+    assert "blocking = (prefix[post_index_prepare::kBlockingWord] & 1U) != 0" in tail
     assert "record->fallback = uint64_t(blocking) | (waitFirst ? 2U : 0U)" in tail
 
 
@@ -91,7 +95,9 @@ def test_whole_tail_header_and_q4_pack(tmp_path):
 #include <cstdlib>
 #include <array>
 #include <random>
+#include <functional>
 #define KVIP_OUTPUT_WORKER 1
+#define __simt_callee__
 #include "pipeline_types.h"
 #include "runtime_shape.h"
 using namespace AscendC;
@@ -102,13 +108,16 @@ void asc_threadfence(){}
 template<class T>T asc_ldcg(T* p){return *p;}
 template<class T>void asc_stcg(T* p,T value){*p=value;}
 void asc_atomic_or(uint32_t* p,uint32_t value){*p|=value;}
+void asc_atomic_or(uint64_t* p,uint64_t value){*p|=value;}
 void asc_atomic_add(uint32_t* p,uint32_t value){*p+=value;}
 // Run below exercises failure paths only, so Index VF is never reached.
 // The separate update model tests the real half-warp broadcast semantics.
 template<class T>T asc_shfl(T value,int,int){return value;}
-uint32_t asc_ballot(int32_t){std::abort();}
+// Run covers only batch1 fault paths; lane0's prefix value is exact even
+// with this scalar shim. Real 32-lane prefix/error execution has its own model.
+uint32_t asc_ballot(int32_t value){return uint32_t(value != 0);}
 int __popc(uint32_t value){return __builtin_popcount(value);}
-enum class HardEvent {V_S};
+enum class HardEvent {V_S,MTE2_V};
 template<HardEvent>void SetFlag(uint32_t){}
 template<HardEvent>void WaitFlag(uint32_t){}
 constexpr uint32_t EVENT_ID0=0,kSlots=8192,kTop=2048,kRowStatusWords=32;
@@ -124,8 +133,18 @@ struct TPipe {
  template<TPosition P>void InitBuffer(TBuf<P>& buf,uint32_t bytes){buf.storage.resize((bytes+7)/8);}
  void Destroy(){}
 };
+struct DataCopyExtParams {uint32_t blockCount,blockLen,srcStride,dstStride,reserved;};
+template<class T>struct DataCopyPadExtParams {bool padding;uint32_t left,right;T value;};
+template<class T>void DataCopyPad(LocalTensor<T> dst,GlobalTensor<T> src,
+                                DataCopyExtParams params,DataCopyPadExtParams<T>){
+ assert(params.blockCount==1&&!params.srcStride&&!params.dstStride);
+ std::copy_n(reinterpret_cast<uint8_t*>(src.data),params.blockLen,
+             reinterpret_cast<uint8_t*>(dst.p));
+}
+
 unsigned crossCoreBarriers=0;
-void SyncAll(){++crossCoreBarriers;}
+std::function<void(unsigned)> barrierHook;
+void SyncAll(){++crossCoreBarriers;if(barrierHook)barrierHook(crossCoreBarriers);}
 struct Context {
  RuntimeShape shape;
  uint64_t sourceBlocks,sourceOffsets,destinations,rowStatus,fallbackAddresses,fallbackValid,rows,rowOwners;
@@ -141,7 +160,8 @@ KvafExecuteBatchGetKernelArgs nativeArgs{};
 KvafExecuteBatchGetKernelArgs GetArgs(Context*,uint32_t){return nativeArgs;}
 template<bool>uint32_t Producer(Args*,uint32_t){return 0;}
 void OutputWorker(Args*,uint32_t){}
-void PublishStreamingUpdateStatus(uint32_t*,uint32_t,uint32_t){}
+uint32_t publishedUpdateStatus=0;
+void PublishStreamingUpdateStatus(uint32_t*,uint32_t,uint32_t error){publishedUpdateStatus=error;}
 void PublishStreamingResidency(uint32_t,uint32_t,Context*,uint32_t){}
 template<bool=false,bool=false>void FinalizeStreaming(Args*,uint32_t,uint32_t){}
 #include "post_index_tail.h"
@@ -185,7 +205,7 @@ int main(){
     uint32_t begin=uint64_t(total)*lane/lanes,end=uint64_t(total)*(lane+1)/lanes;
     assert(end-begin<=(total+lanes-1)/lanes);
     uint32_t error=0;
-    Simt::VF_CALL<Pack>(Simt::Dim3{256,1,1},&ctx,b,begin,end-begin,n[0],n[1],n[2],n[3],
+    Simt::VF_CALL<Pack<false>>(Simt::Dim3{256,1,1},&ctx,b,begin,end-begin,n[0],n[1],n[2],n[3],
       indexSources.data(),indexDestinations.data(),eventOffset,resident,history,out,
       batch*kSlots,outputRows,656,remoteBase,remoteBytes,localBytes,&error);
     assert(!error);
@@ -208,7 +228,7 @@ int main(){
                 uint32_t begin=0,uint32_t count=1,uint32_t q0=1){
   uint32_t error=0;
   std::fill(packed.begin(),packed.end(),-1);
-  Simt::VF_CALL<Pack>(Simt::Dim3{256,1,1},&ctx,0,begin,count,q0,0,0,0,
+  Simt::VF_CALL<Pack<false>>(Simt::Dim3{256,1,1},&ctx,0,begin,count,q0,0,0,0,
     indexSources.data(),indexDestinations.data(),eventOffset,residentRows,historyRows,packed.data(),
     batch*kSlots,outputRows,656,remoteBase,remote,local,&error);
   if(error)assert(packed[0]==-1&&packed[kSlots]==-1&&packed[2*kSlots]==-1);
@@ -272,8 +292,10 @@ int main(){
  args.packedFetch=reinterpret_cast<uint64_t>(packed.data());args.maxEvents=10240;
  args.eventsSrc=reinterpret_cast<uint64_t>(eventSources.data());args.eventsDst=reinterpret_cast<uint64_t>(eventDestinations.data());
  args.updateBindings=reinterpret_cast<uint64_t>(update.data());
- for(bool waitFirst:{false,true})for(uint32_t fault:{1U,2U,3U,4U,5U,6U,7U,8U}){
+ for(bool waitFirst:{false,true})for(uint32_t fault:{1U,2U,3U,4U,5U,6U,7U,8U,9U,10U}){
   args.prefetchCount=waitFirst?0x02000000U:0;
+  nativeArgs.channel_entity=fault==9?0:reinterpret_cast<uint64_t>(&entity);
+  entity.magic=fault==10?0:kvaf_device::kEntityMagic;
   crossCoreBarriers=0;
   row={};row.error=fault==1?0x4000:0;row.slots=fault==2?1:0;
   records={};records[0].active=1;status[0]=0;status[1]=2;
@@ -288,16 +310,56 @@ int main(){
   if(fault==6){status[1]=0;finalPosts[0].count=0;}
   if(fault==7)status[1]=1;
   if(fault==8)finalPosts[0].count=kTop+1;
+  auto failureMask=reinterpret_cast<uint32_t*>(packed.data())+3*kSlots+post_index::kFailureMaskWord;
+  *failureMask=UINT32_MAX;
   auto before=aiv_model::testDoorbells;
   Run(&args,0);
+  assert(*failureMask==1);
   assert(aiv_model::testDoorbells==before);
-  assert(records[0].error==(fault==1?0x4000:kvaf_device::kInvalidArgs));
+  assert(records[0].error==(fault==1?0x4000:fault==10?kvaf_device::kInvalidEntity:kvaf_device::kInvalidArgs));
   assert(records[0].globalError==records[0].error);
   assert(records[0].completed==0&&records[0].active==1);
   assert(records[0].fallback==(waitFirst?2U:0U));
-  assert(crossCoreBarriers==6);
+  assert(crossCoreBarriers==5);
   for(const auto& post:finalPosts)assert(post.error==records[0].error&&post.pending==0);
   assert(queue.sq_producer_index==0&&!queue.poisoned);
+ }
+
+ // Empty block0 must produce a prefix without dereferencing a null entity.
+ // Inject faults at the real collective edges to model a different AIV's
+ // upper-only error. No real CANN barrier/cache behaviour is claimed here.
+ for(bool waitFirst:{false,true})for(unsigned injectAt:{0U,2U,3U}){
+  args.prefetchCount=waitFirst?0x02000000U:0;
+  nativeArgs.channel_entity=0;entity.magic=kvaf_device::kEntityMagic;
+  row={};records={};records[0].active=1;ctx.shape.resident=2048;
+  std::fill_n(status,32,0U);
+  for(uint32_t q=0;q<4;++q){finalPosts[q]={};finalPosts[q].descriptor=q*kTop;}
+  auto prefix=reinterpret_cast<uint32_t*>(packed.data())+3*kSlots;
+  prefix[24]=prefix[25]=prefix[26]=prefix[31]=UINT32_MAX;
+  constexpr uint64_t upperError=uint64_t(1)<<61;
+  crossCoreBarriers=0;publishedUpdateStatus=UINT32_MAX;
+  barrierHook=[&](unsigned reached){
+   if(reached!=injectAt)return;
+   if(injectAt==2){
+    *reinterpret_cast<uint64_t*>(prefix+post_index_prepare::kErrorWord)|=upperError;
+   }else{
+    records[1].error=upperError;
+    auto previousThread=threadIdx.x;threadIdx.x=0;
+    post_index::MarkPostFailure(prefix,0,upperError);
+    threadIdx.x=previousThread;
+   }
+  };
+  auto before=aiv_model::testDoorbells;
+  Run(&args,0);
+  barrierHook={};
+  assert(aiv_model::testDoorbells==before&&crossCoreBarriers==5);
+  assert(prefix[0]==0&&prefix[1]==0);
+  assert(records[0].active==1&&records[0].completed==0);
+  assert((publishedUpdateStatus!=0)==(injectAt!=0));
+  for(const auto& post:finalPosts){assert((post.error!=0)==(injectAt!=0));assert(post.pending==0);}
+  if(injectAt==2)assert(records[0].error==upperError&&records[0].globalError==upperError);
+  if(injectAt==3)assert(records[1].error==upperError);
+  assert(prefix[31]==(injectAt?1U:0U));
  }
  std::puts("POST_INDEX_TAIL_TYPES_PACK_PASS");
 }
@@ -311,13 +373,14 @@ int main(){
 namespace aiv_model {unsigned testDoorbells=0;void Poll(void*){} void Doorbell(uint32_t,uint32_t*){++testDoorbells;}}
 '''))
     binary = tmp_path / "post_index_tail"
-    subprocess.run([
+    compiled = subprocess.run([
         compiler, "-std=c++17", "-O1", "-g", "-fsanitize=address,undefined",
         "-fno-omit-frame-pointer", "-I", str(model),
         "-I", str(native / "include"),
         "-I", str(repo / "csrc/operators/lightning_indexer_with_fetch/op_kernel"),
         "-I", str(repo / "csrc/operators/lightning_indexer_with_fetch/include"),
         str(source), "-o", str(binary),
-    ], check=True, capture_output=True, text=True)
+    ], capture_output=True, text=True)
+    assert compiled.returncode == 0, compiled.stdout + compiled.stderr
     result = subprocess.run([str(binary)], check=True, capture_output=True, text=True)
     assert "POST_INDEX_TAIL_TYPES_PACK_PASS" in result.stdout

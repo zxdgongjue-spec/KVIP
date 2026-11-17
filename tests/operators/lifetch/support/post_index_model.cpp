@@ -13,6 +13,7 @@
 #include <numeric>
 #include <thread>
 #include <vector>
+#define __simt_callee__
 #define __simt_vf__
 #define __aicore__
 #define __gm__
@@ -46,6 +47,9 @@ template <class T> void asc_stcg(T *p, T v) {
 void asc_atomic_or(uint32_t *p, uint32_t x) {
     std::atomic_ref<uint32_t>(*p).fetch_or(x);
 }
+void asc_atomic_or(uint64_t *p, uint64_t x) {
+    std::atomic_ref<uint64_t>(*p).fetch_or(x);
+}
 void asc_atomic_add(uint32_t *p, uint32_t x) {
     std::atomic_ref<uint32_t>(*p).fetch_add(x);
 }
@@ -72,6 +76,116 @@ int __popc(uint32_t x) {
     return __builtin_popcount(x);
 }
 #include "post_index_update.h"
+// Preparation only needs immutable geometry and the producer's final counts.
+// Full Context ABI and scalar/entity validation are checked by the tail model.
+constexpr uint32_t kRowStatusWords = 32;
+struct Context {
+    struct { uint32_t batch; } shape;
+    uint64_t rowStatus;
+};
+#include "post_index_prepare.h"
+
+void PreparePrefix(Context &context, uint32_t *prefix) {
+    CpuWarpGroup group(32);
+    std::vector<std::thread> lanes;
+    for (uint32_t lane = 0; lane < 32; ++lane) {
+        lanes.emplace_back([&, lane] {
+            currentWarp = &group;
+            threadIdx.x = lane;
+            post_index_prepare::PrepareOnly(&context, prefix);
+        });
+    }
+    for (auto &lane : lanes) lane.join();
+}
+
+void CheckPreparationLifecycle() {
+    // This region is reused across healthy, failed, empty and smaller batches.
+    // Host joins model ordering; actual scalar/SIMT cache visibility is a
+    // separate CANN test, not something this CPU model can establish.
+    alignas(128) std::array<uint64_t, 16> shared;
+    shared.fill(UINT64_MAX);
+    auto prefix = reinterpret_cast<uint32_t *>(shared.data());
+    constexpr uint32_t errorWord = post_index_prepare::kErrorWord;
+    constexpr uint32_t blockingWord = post_index_prepare::kBlockingWord;
+    constexpr uint32_t failureWord = post_index::kFailureMaskWord;
+    static_assert(errorWord % 2 == 0 && errorWord >= 17);
+    static_assert(errorWord + 1 < blockingWord && blockingWord < failureWord);
+    static_assert(failureWord < 32);
+    for (uint32_t batch : {16U, 1U, 3U, 16U}) {
+        for (uint32_t scenario = 0; scenario < 6; ++scenario) {
+            std::vector<uint32_t> status(batch * kRowStatusWords);
+            for (uint32_t row = 0; row < batch; ++row)
+                status[row * kRowStatusWords + 1] = scenario == 0 ? 0 : (row + 1) * 17;
+            if (scenario == 1) status[1] = 0; // empty block0, other requests active
+            if (scenario == 4) status[(batch - 1) * kRowStatusWords + 1] = 8193;
+            Context context{}; // No channel entity or address tables are needed.
+            context.shape.batch = batch;
+            context.rowStatus = reinterpret_cast<uint64_t>(status.data());
+            // Same fields cleared by block0 before the existing producer join.
+            shared[errorWord / 2] = 0;
+            prefix[blockingWord] = 0;
+            prefix[failureWord] = 0;
+            const auto before = shared;
+            const uint64_t earlyError = scenario == 3 ? uint64_t(1) << 63 : 0;
+            threadIdx.x = 0;
+            if (earlyError) post_index_prepare::PublishPreflight(prefix, earlyError, 0);
+            CpuWarpGroup group(32);
+            std::vector<std::thread> workers;
+            for (uint32_t lane = 0; lane < 32; ++lane) {
+                workers.emplace_back([&, lane] {
+                    currentWarp = &group;
+                    threadIdx.x = lane;
+                    post_index_prepare::PrepareOnly(&context, prefix);
+                });
+            }
+            uint64_t expectedError = earlyError | (scenario == 4 ? 1 : 0);
+            uint32_t expectedBlocking = 0, expectedFailure = 0;
+            for (uint32_t core = 0; core < 64; ++core) {
+                // All 64 bits and many concurrent errors in the same row.
+                const uint64_t error = scenario == 2 ? uint64_t(1) << core : 0;
+                const uint32_t blocking = scenario == 2 && core == 63;
+                expectedError |= error;
+                expectedBlocking |= blocking;
+                if (error) expectedFailure |= 1U << (core % batch);
+                workers.emplace_back([&, core, error, blocking] {
+                    threadIdx.x = 0;
+                    if (error || blocking)
+                        post_index_prepare::PublishPreflight(prefix, error, blocking);
+                    if (error) post_index::MarkPostFailure(prefix, core % batch, error);
+                });
+            }
+            for (auto &worker : workers) worker.join();
+            uint32_t total = 0;
+            assert(prefix[0] == 0);
+            for (uint32_t row = 0; row < batch; ++row) {
+                const uint32_t count = status[row * kRowStatusWords + 1];
+                total += count <= 8192 ? count : 0;
+                assert(prefix[row + 1] == total);
+            }
+            assert(shared[errorWord / 2] == expectedError);
+            assert(prefix[blockingWord] == expectedBlocking);
+            assert(prefix[failureWord] == expectedFailure);
+            const auto beforeWords = reinterpret_cast<const uint32_t *>(before.data());
+            for (uint32_t word = 0; word < 32; ++word) {
+                if (word <= batch || word == errorWord || word == errorWord + 1 ||
+                    word == blockingWord || word == failureWord) continue;
+                assert(prefix[word] == beforeWords[word]);
+            }
+        }
+        for (uint32_t workers : {1U, 2U, 4U}) {
+            // Binding allocates the legacy workspace; the shared prefix has
+            // a 128B region below every possible OutputWorker direct table.
+            const uint32_t prefixBegin = 3 * batch * 8192;
+            const uint32_t meta = (3 * batch + 31) & ~31U;
+            const uint32_t directBegin = 4 * workers * (3 * batch * 2048 + meta);
+            const uint32_t allocated = 4 * workers * (9 * batch * 2048 + meta + 64);
+            assert(prefixBegin + 32 <= allocated);
+            assert(prefixBegin + 32 <= directBegin);
+            assert(3 * (batch - 1) * 8192 + 3 * 8192 == prefixBegin);
+        }
+    }
+}
+
 
 struct TestData {
     uint32_t batch, cores, history, resident, eventStride, eventOffset = 5, addressStride;
@@ -80,7 +194,7 @@ struct TestData {
     TestData(uint32_t batchSize, uint32_t coreCount, int scenario)
         : batch(batchSize), cores(coreCount), history(scenario == 3 ? 32768 : 1024),
           resident(history / 2), eventStride(scenario == 3 ? 8199 : 519),
-          addressStride(history + 13), prefix(batchSize + 1), owners(batchSize),
+          addressStride(history + 13), prefix(32), owners(batchSize),
           sources(batchSize * eventStride, UINT32_MAX),
           destinations(batchSize * eventStride, UINT32_MAX), scales((batchSize + 1) * history),
           keys((batchSize + 1) * history * 16), addresses((batchSize + 1) * addressStride),
@@ -166,15 +280,60 @@ void AssertEqual(const TestData &actual, const TestData &expected) {
     assert(actual.prefix == expected.prefix && actual.owners == expected.owners &&
            actual.records == expected.records);
 }
+// Publish the real shader's mask after its previous-generation contents are
+// cleared. Host joins here model ordering, not device cache coherence.
+void PublishFailureMask(TestData &data) {
+    data.prefix[post_index::kFailureMaskWord] = 0;
+    threadIdx.x = 0;
+    for (uint32_t core = 0; core < data.cores; ++core) {
+        post_index::MarkPostFailure(data.prefix.data(), core % data.batch,
+                                   data.records[core * 16]);
+    }
+}
+void CheckConcurrentFailureMask() {
+    std::array<uint32_t, 32> prefix{};
+    for (uint32_t i = 0; i < post_index::kFailureMaskWord; ++i) prefix[i] = 1234 + i;
+    const auto protectedWords = prefix;
+    for (uint32_t round = 0; round < 12; ++round) {
+        const uint32_t batch = round % 3 == 0 ? 16 : round % 3 == 1 ? 1 : 3;
+        prefix[post_index::kFailureMaskWord] = 0;
+        uint32_t expected = 0;
+        std::vector<std::thread> writers;
+        for (uint32_t core = 0; core < 64; ++core) {
+            const uint64_t error = round % 4 == 3 ? 0 :
+                (core % 7 == 0 || core == 63 ? uint64_t(1) << (core % 64) : 0);
+            if (error) expected |= uint32_t(1) << (core % batch);
+            writers.emplace_back([&, core, error] {
+                threadIdx.x = 0;
+                post_index::MarkPostFailure(prefix.data(), core % batch, error);
+            });
+        }
+        for (auto &writer : writers) writer.join();
+        assert(prefix[post_index::kFailureMaskWord] == expected);
+        for (uint32_t i = 0; i < post_index::kFailureMaskWord; ++i)
+            assert(prefix[i] == protectedWords[i]);
+    }
+}
 void RunCase(uint32_t batch, uint32_t cores, int scenario, bool ownerNull, bool profile, int badRow,
              uint32_t errorBit = 37) {
     TestData actual(batch, cores, scenario);
+    std::vector<uint32_t> rowStatus(batch * kRowStatusWords);
+    const auto expectedPrefix = actual.prefix;
+    for (uint32_t row = 0; row < batch; ++row)
+        rowStatus[row * kRowStatusWords + 1] = expectedPrefix[row + 1] - expectedPrefix[row];
+    std::fill(actual.prefix.begin(), actual.prefix.begin() + batch + 1, UINT32_MAX);
+    Context prepareContext{};
+    prepareContext.shape.batch = batch;
+    prepareContext.rowStatus = reinterpret_cast<uint64_t>(rowStatus.data());
+    PreparePrefix(prepareContext, actual.prefix.data());
+    assert(actual.prefix == expectedPrefix);
     ValidatePlans(actual);
     if (badRow >= 0) {
         uint32_t peer = badRow + (cores - 1 - badRow) / batch * batch;
         // Preserve nonzero 64-bit error semantics.
         actual.records[peer * 16] = uint64_t(1) << errorBit;
     }
+    PublishFailureMask(actual);
     const TestData original = actual;
     TestData once = actual;
     const uint32_t moved = ApplyOracle(once, ownerNull, badRow);
@@ -198,8 +357,8 @@ void RunCase(uint32_t batch, uint32_t cores, int scenario, bool ownerNull, bool 
                         counter = 0;
                     }
                     group.barrier.arrive_and_wait();
-                    const uint32_t first = actual.prefix.back() * core / cores,
-                                   end = actual.prefix.back() * (core + 1) / cores;
+                    const uint32_t first = actual.prefix[actual.batch] * core / cores,
+                                   end = actual.prefix[actual.batch] * (core + 1) / cores;
                     for (uint32_t g = 0; g < post_index::kThreads / width; ++g) {
                         threadIdx.x = g * width + lane;
                         group.barrier.arrive_and_wait();
@@ -208,8 +367,8 @@ void RunCase(uint32_t batch, uint32_t cores, int scenario, bool ownerNull, bool 
                                 actual.sources.data(), actual.destinations.data(),
                                 actual.eventOffset, actual.eventStride, actual.history,
                                 actual.prefix.data(), batch, first, end,
-                                ownerNull ? nullptr : actual.owners.data(), actual.records.data(),
-                                cores, actual.keys.data(), actual.scales.data(),
+                                ownerNull ? nullptr : actual.owners.data(),
+                                actual.keys.data(), actual.scales.data(),
                                 actual.addresses.data(), actual.logical.data(),
                                 actual.addressStride, &counter);
                         } else {
@@ -217,8 +376,8 @@ void RunCase(uint32_t batch, uint32_t cores, int scenario, bool ownerNull, bool 
                                 actual.sources.data(), actual.destinations.data(),
                                 actual.eventOffset, actual.eventStride, actual.history,
                                 actual.prefix.data(), batch, first, end,
-                                ownerNull ? nullptr : actual.owners.data(), actual.records.data(),
-                                cores, actual.keys.data(), actual.scales.data(),
+                                ownerNull ? nullptr : actual.owners.data(),
+                                actual.keys.data(), actual.scales.data(),
                                 actual.addresses.data(), actual.logical.data(),
                                 actual.addressStride, nullptr);
                         }
@@ -265,6 +424,8 @@ void CheckInvalidPlans() {
     serialValidationMode = false;
 }
 int main() {
+    CheckPreparationLifecycle();
+    CheckConcurrentFailureMask();
     CheckInvalidPlans();
     for (uint32_t batchSize : {1U, 3U, 16U}) {
         for (uint32_t coreCount : {16U, 64U}) {

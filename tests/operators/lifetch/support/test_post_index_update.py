@@ -21,6 +21,9 @@ def test_post_index_warp_contract(tmp_path, threads):
     )
     assert changes == 1
     (tmp_path / "post_index_update.h").write_text(header)
+    (tmp_path / "post_index_prepare.h").write_text(
+        (INDEXER.parent / "post_index_prepare.h").read_text()
+    )
     compiler = shutil.which("clang++") or shutil.which("g++")
     assert compiler, "The Index CPU model requires a C++20 compiler"
     binary = tmp_path / "post_index_model"

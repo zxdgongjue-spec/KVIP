@@ -2,11 +2,15 @@
 #pragma once
 #include "post_index_transport.h"
 #include "post_index_update.h"
+#include "post_index_prepare.h"
 
 namespace pipeline_ab {
 namespace post_index_tail {
 
-// One cache line per AIV. Only that AIV writes its record, except init's
+static_assert(post_index_prepare::kPostFailureWord == post_index::kFailureMaskWord,
+              "Prepare and Index must share the failure mask");
+
+// One 128B record per AIV. Only that AIV writes its record, except init's
 // batch-wide decision in record zero, read after the preceding kernel edge.
 struct alignas(128) Record {
     uint64_t error, count, fallback, globalError;
@@ -29,9 +33,19 @@ __aicore__ inline uint64_t RowError(__gm__ Record* records, uint32_t b,
     return error;
 }
 
+// Rare failure publication replaces repeated per-event sibling-record loads.
+// The caller retains the existing cross-core join after this VF completes.
+__aicore__ inline void PublishPostFailure(__gm__ uint32_t* prefix, uint32_t row,
+                                        uint64_t error) {
+    if (!error) return;
+    Simt::VF_CALL<post_index::MarkPostFailure>(Simt::Dim3{32,1,1}, prefix, row, error);
+    SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
+}
+
 // Validate and pack one balanced slice of the request's Q4 union. The same
 // event slice supplies Index exchanges and Get descriptors, so both checks
 // share one VF and finish before the collective pre-Post error barrier.
+template<bool BuildPrefix = false>
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void Pack(__gm__ Context* ctx, uint32_t b, uint32_t begin, uint32_t count,
                  uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3,
@@ -40,6 +54,14 @@ inline void Pack(__gm__ Context* ctx, uint32_t b, uint32_t begin, uint32_t count
                  __gm__ int32_t* packed, uint32_t tableCapacity,
                  uint32_t outputRows, uint32_t tokenBytes, uint64_t remoteBase,
                  uint64_t remoteBytes, uint64_t localBytes, __ubuf__ uint32_t* error) {
+    if constexpr (BuildPrefix) {
+        // Only block0 calls this specialization, so packed is the base table.
+        // Publish prefix even if the following ordinary Pack validation fails.
+        const uint32_t batch = ctx->shape.batch;
+        auto prefix = reinterpret_cast<__gm__ uint32_t*>(packed) + uint64_t(batch) * 3 * kSlots;
+        post_index_prepare::PrefixScan(
+            reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus), kRowStatusWords, batch, prefix);
+    }
     const uint64_t total = uint64_t(c0) + c1 + c2 + c3;
     if (!threadIdx.x)
         error[0] = c0 > kTop || c1 > kTop || c2 > kTop || c3 > kTop ||
@@ -108,9 +130,21 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
     auto trace = reinterpret_cast<__gm__ uint64_t*>(a->times) +
                  uint64_t(batch) * 256 + uint64_t(block) * 32;
     // Existing packed workspace has at least 9*batch*8192 words. The first
-    // 3*batch*8192 hold Get descriptors; only batch+1 more words are needed.
+    // 3*batch*8192 hold Get descriptors. The next 128 bytes hold the
+    // batch+1 prefix words and shared error/fallback control at words 24..31.
     auto prefix = reinterpret_cast<__gm__ uint32_t*>(a->packedFetch) +
                   uint64_t(batch) * 3 * kSlots;
+    if (!block) {
+        // Producer<true> never writes packedFetch. OutputWorker's first direct
+        // table is at least 512B beyond prefix, so these two 64B lines are free
+        // before the first join. Later prefix writers are SIMT-only: a scalar
+        // dirty-line writeback could overwrite another AIV's error atomic.
+        prefix[post_index_prepare::kErrorWord] = 0;
+        prefix[post_index_prepare::kErrorWord + 1] = 0;
+        prefix[post_index_prepare::kBlockingWord] = 0;
+        prefix[post_index::kFailureMaskWord] = 0;
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(prefix), 128);
+    }
     // Preserve init's decision; timestamps are zero in headline samples.
     auto words = reinterpret_cast<__gm__ uint64_t*>(record);
     // Peers can still be reading the entry decision. Never transiently clear
@@ -185,43 +219,52 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
         TPipe pipe; TBuf<TPosition::VECCALC> scratch;
         pipe.InitBuffer(scratch, 64); auto local = scratch.Get<uint32_t>();
         auto entity = reinterpret_cast<__gm__ const KvafBatchGetDirectUrmaEntity*>(args.channel_entity);
-        Simt::VF_CALL<Pack>(Simt::Dim3{256,1,1}, ctx, b, begin, end - begin,
-            counts[0], counts[1], counts[2], counts[3], sources, destinations,
-            kPrefetch, shape.resident, shape.history, packed,
-            args.table_capacity, args.output_rows, args.token_bytes,
-            entity->remote_host_ddr_address, entity->remote_host_ddr_size,
-            entity->local_hbm_size,
-            reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
+        if (!block) {
+            Simt::VF_CALL<Pack<true>>(Simt::Dim3{256,1,1}, ctx, b, begin, end - begin,
+                counts[0], counts[1], counts[2], counts[3], sources, destinations,
+                kPrefetch, shape.resident, shape.history, packed,
+                args.table_capacity, args.output_rows, args.token_bytes,
+                entity->remote_host_ddr_address, entity->remote_host_ddr_size,
+                entity->local_hbm_size,
+                reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
+        } else {
+            Simt::VF_CALL<Pack<false>>(Simt::Dim3{256,1,1}, ctx, b, begin, end - begin,
+                counts[0], counts[1], counts[2], counts[3], sources, destinations,
+                kPrefetch, shape.resident, shape.history, packed,
+                args.table_capacity, args.output_rows, args.token_bytes,
+                entity->remote_host_ddr_address, entity->remote_host_ddr_size,
+                entity->local_hbm_size,
+                reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr()));
+        }
         SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
         error |= local.GetValue(0);
         pipe.Destroy();
+    } else if (!block) {
+        // Empty or rejected block0 still publishes a safe prefix. This path
+        // must not dereference a channel entity that preflight did not accept.
+        Simt::VF_CALL<post_index_prepare::PrepareOnly>(Simt::Dim3{32,1,1}, ctx, prefix);
+        SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
+    }
+    if (error || blocking) {
+        Simt::VF_CALL<post_index_prepare::PublishPreflight>(
+            Simt::Dim3{32,1,1}, prefix, error, uint32_t(blocking));
+        SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
     }
     record->error = error; record->fallback = blocking;
     if (profile) record->packDone = GetSystemCycle();
     Flush(record);
+    // Prefix and every exceptional error/capacity writer finish at this
+    // existing join. There is no scalar 64-record reduction or second join.
     SyncAll();
-    if (!block) {
-        uint64_t anyError = 0, anyBlocking = 0;
-        for (uint32_t i = 0; i <= batch; ++i) prefix[i] = 0;
-        for (uint32_t i = 0; i < cores; ++i) {
-            Flush(records + i);
-            anyError |= records[i].error; anyBlocking |= records[i].fallback;
-            prefix[i % batch + 1] += uint32_t(records[i].count);
-        }
-        for (uint32_t i = 1; i <= batch; ++i) prefix[i] += prefix[i - 1];
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(prefix), (batch + 1) * sizeof(uint32_t));
-        record->globalError = anyError; record->fallback = anyBlocking;
-        Flush(record);
-    }
-    SyncAll();
-    Flush(records);
-    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(prefix), (batch + 1) * sizeof(uint32_t));
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(prefix), 128);
+    const uint64_t globalError =
+        *reinterpret_cast<__gm__ uint64_t*>(prefix + post_index_prepare::kErrorWord);
     const uint32_t indexFirst = uint64_t(prefix[batch]) * block / cores;
     const uint32_t indexEnd = uint64_t(prefix[batch]) * (block + 1) / cores;
-    error |= records[0].globalError;
-    blocking = (records[0].fallback & 1U) != 0;
+    error |= globalError;
+    blocking = (prefix[post_index_prepare::kBlockingWord] & 1U) != 0;
     record->fallback = uint64_t(blocking) | (waitFirst ? 2U : 0U);
-    record->globalError = records[0].globalError;
+    record->globalError = globalError;
     post_index_transport::State transport;
     if (profile) record->postBegin = GetSystemCycle();
     if (!error) error = blocking ?
@@ -232,6 +275,7 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
         if (blocking) record->cqDone = record->postDone;
     }
     record->error = error; Flush(record);
+    PublishPostFailure(prefix, b, error);
     // No AIV enters Index maintenance before all Post calls have returned.
     SyncAll();
     if (profile) trace[3] = GetSystemCycle();
@@ -239,29 +283,48 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
         error |= post_index_transport::Wait(transport);
         if (profile) trace[7] = record->cqDone = GetSystemCycle();
         record->error = error; Flush(record);
+        PublishPostFailure(prefix, b, error);
         // This is the same join used after CQ in the overlapping order,
         // relocated before Index so communication is fully drained first.
         SyncAll();
     }
     if (profile) trace[4] = GetSystemCycle();
-    if (!records[0].globalError && indexEnd > indexFirst) {
+    if (!globalError && indexEnd > indexFirst) {
         auto update = reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);
-        // Owner loads are SIMT-only. Pass base arrays and let each VF thread
-        // find the request owning its global event, without scalar OwnerRow.
-        // Timing diagnostics use the production VF too: no diagnostic TPipe,
-        // UB atomics or tuple counter inside the measured Index interval.
+        // Keep global event balancing, but preload the small lookup tables.
+        // Copy/wait/destruction stay within the Index timing interval.
+        TPipe indexPipe;
+        TBuf<TPosition::VECCALC> prefixBuffer, ownerBuffer;
+        indexPipe.InitBuffer(prefixBuffer, 128);
+        auto prefixLocal = prefixBuffer.Get<uint32_t>();
+        GlobalTensor<uint32_t> prefixGlobal;
+        prefixGlobal.SetGlobalBuffer(prefix);
+        DataCopyPad(prefixLocal, prefixGlobal, DataCopyExtParams{1,128,0,0,0},
+                    DataCopyPadExtParams<uint32_t>{false,0,0,0});
+        __ubuf__ uint32_t* indexOwners = nullptr;
+        if (ctx->rowOwners) {
+            indexPipe.InitBuffer(ownerBuffer, (batch * 4 + 31) / 32 * 32);
+            auto ownerLocal = ownerBuffer.Get<uint32_t>();
+            GlobalTensor<uint32_t> ownerGlobal;
+            ownerGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners));
+            DataCopyPad(ownerLocal, ownerGlobal, DataCopyExtParams{1,batch*4,0,0,0},
+                        DataCopyPadExtParams<uint32_t>{false,0,0,0});
+            indexOwners = reinterpret_cast<__ubuf__ uint32_t*>(ownerLocal.GetPhyAddr());
+        }
+        SetFlag<HardEvent::MTE2_V>(EVENT_ID0); WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
         Simt::VF_CALL<post_index::ApplyPlan<false>>(Simt::Dim3{post_index::kThreads,1,1},
             reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc),
             reinterpret_cast<__gm__ uint32_t*>(a->eventsDst),
-            kPrefetch, a->maxEvents, shape.history, prefix, batch, indexFirst, indexEnd,
-            reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners),
-            reinterpret_cast<__gm__ uint64_t*>(records), cores,
+            kPrefetch, a->maxEvents, shape.history,
+            reinterpret_cast<__ubuf__ uint32_t*>(prefixLocal.GetPhyAddr()),
+            batch, indexFirst, indexEnd, indexOwners,
             reinterpret_cast<__gm__ uint64_t*>(a->keys),
             reinterpret_cast<__gm__ uint32_t*>(a->scales),
             reinterpret_cast<__gm__ uint64_t*>(a->addresses),
             reinterpret_cast<__gm__ uint64_t*>(a->logical), uint32_t(update[7]),
             static_cast<__ubuf__ uint32_t*>(nullptr));
         SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        indexPipe.Destroy();
     }
     if (profile) {
         trace[9] = indexEnd - indexFirst;
@@ -289,13 +352,16 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
         auto rowInfo = reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus) + row * kRowStatusWords;
         if (!error && completed != rowInfo[1]) error = kvaf_device::kInvalidArgs;
         auto update = reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);
+        // Preserve a nonzero failure when publishing the 32-bit status ABI.
+        const uint32_t errorCode = uint32_t(error) ? uint32_t(error) :
+                                   (error ? kvaf_device::kInvalidArgs : 0U);
         Simt::VF_CALL<PublishStreamingUpdateStatus>(Simt::Dim3{32,1,1},
-            reinterpret_cast<__gm__ uint32_t*>(update[6]), row, uint32_t(error));
+            reinterpret_cast<__gm__ uint32_t*>(update[6]), row, errorCode);
         SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
         for (uint32_t q = 0; q < 4; ++q) {
             auto post = FinalPostAt(shape.finalPostOffset, ctx, row * 4 + q);
             post->pending = error ? 0 : post->count;
-            post->deferred = 0; post->error = uint32_t(error);
+            post->deferred = 0; post->error = errorCode;
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post), sizeof(*post));
         }
         if (!error && (a->prefetchCount & 0x10000000U)) {
