@@ -4,6 +4,7 @@ import argparse
 from collections import Counter, defaultdict
 from decimal import Decimal
 import json
+import re
 from pathlib import Path
 import statistics
 import sys
@@ -32,29 +33,57 @@ def li_kernel_breakdown(capture):
     scope = scopes[0]
     origin = Decimal(str(scope['ts']))
     duration = float(scope['dur'])
-    phases = {'v9_li_kernel': 'kernel 0: hot/ABC',
-              'v9_li_kernel_1': 'kernel 1: resident TopK',
-              'v9_li_kernel_2': 'kernel 2: cold/prefetch',
-              'v9_li_kernel_3': 'kernel 3: final TopK'}
-    data = defaultdict(list)
+    labels = ('kernel 0: hot/ABC', 'kernel 1: resident TopK',
+              'kernel 2: cold/prefetch', 'kernel 3: final TopK')
+    calls = capture.get('graph_calls')
+    if not isinstance(calls, int) or calls < 1:
+        return {}, 'missing measured graph invocation count'
+    by_name = defaultdict(list)
     for event in events:
         name = str(event.get('name', '')).lower()
         category = str(event.get('cat') or '').lower()
-        if event.get('ph') != 'X' or (category and 'kernel' not in category):
-            continue
-        # Only accept the four concrete names; unknown numeric suffixes can
-        # be dispatch identifiers, so never guess which kernel they denote.
-        phase = phases.get(name)
-        if phase is None:
+        if (event.get('ph') != 'X' or (category and 'kernel' not in category)
+                or not re.fullmatch(r'v9_li_kernel(?:_\d+)*', name)):
             continue
         start = float(Decimal(str(event['ts'])) - origin)
         end = start + float(event.get('dur', 0))
         if 0 <= start <= end <= duration:
-            data[phase].append(end-start)
-    calls = capture.get('graph_calls')
-    errors = [f'{name}: {len(data.get(name, []))}/{calls} launches'
-              for name in phases.values() if calls and len(data.get(name, [])) != calls]
-    return {phase: data[phase] for phase in phases.values() if phase in data}, '; '.join(errors)
+            by_name[name].append((start, end))
+    # CANN may add one common numeric dispatch suffix to every function:
+    # e.g. kernel_0, kernel_1_0, kernel_2_0, kernel_3_0. A single
+    # name such as kernel_1 is ambiguous without the complete family, so
+    # accept a convention only when the whole quartet has the expected count
+    # and the four launches occur in order for each graph invocation.
+    base = 'v9_li_kernel'
+    suffixes = {''}
+    for name in by_name:
+        match = re.fullmatch(r'v9_li_kernel_1(_\d+(?:_\d+)*)', name)
+        if match:
+            suffixes.add(match.group(1))
+    # Some profiler exports number all four kernels directly, yielding
+    # kernel_0, kernel_1, kernel_2, kernel_3. This is distinct from CANN's
+    # common suffix convention and must be resolved using the entire family.
+    families = [[base + f'_{i}' for i in range(4)]]
+    families += [[base + suffix] + [base + f'_{i}' + suffix for i in range(1, 4)]
+                 for suffix in sorted(suffixes)]
+    valid = []
+    for names in families:
+        if any(len(by_name[name]) != calls for name in names):
+            continue
+        arrays = [sorted(by_name[name]) for name in names]
+        if any(not all(arrays[j][i][1] <= arrays[j+1][i][0] for j in range(3))
+               for i in range(calls)):
+            continue
+        if any(arrays[3][i][1] > arrays[0][i+1][0] for i in range(calls-1)):
+            continue
+        valid.append((names, arrays))
+    if len(valid) != 1:
+        found = {name: len(rows) for name, rows in sorted(by_name.items())}
+        return {}, (f'cannot uniquely identify four LI kernels for {calls} calls; '
+                    f'matching families={len(valid)}, observed={found}')
+    _, arrays = valid[0]
+    return {label: [end-start for start, end in rows]
+            for label, rows in zip(labels, arrays)}, ''
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
