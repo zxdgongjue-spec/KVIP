@@ -61,7 +61,7 @@ def main():
                 for stage in ('prefix_tag_audit', 'final_tag_audit'):
                     if stage in request:
                         audit = request[stage]
-                        tag_rows.append([sample.get('round'), request['request'], stage,
+                        tag_rows.append([sample.get('repeat', sample.get('round')), request['request'], stage,
                                          sum(q['stable_hot'] for q in audit),
                                          sum(q['missing_hot_tags'] for q in audit)])
                 records = request.get('prefetch_transfers', [])
@@ -70,9 +70,9 @@ def main():
                 if 'prefetch_classes' not in request:
                     continue
                 counts = request['prefetch_classes']
-                exact_rows.append([sample.get('round'), request['request'], request['prefetch'],
+                exact_rows.append([sample.get('repeat', sample.get('round')), request['request'], request['prefetch'],
                                    *[counts[k] for k in ('stable_hot', 'reserved_hot', 'abc', 'cold', 'repeated')]])
-                exact_records.extend(dict(repeat=sample.get('round'), request=request['request'], **record)
+                exact_records.extend(dict(repeat=sample.get('repeat', sample.get('round')), request=request['request'], **record)
                                      for record in records)
         groups = {}
         for s in samples:
