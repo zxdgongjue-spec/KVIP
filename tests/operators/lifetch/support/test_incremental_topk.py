@@ -30,10 +30,18 @@ def test_actual_compact_pairs_padding_and_physical_remap(tmp_path):
 #define KVIP_REVERSE_COLD 1
 constexpr uint32_t kTop=2048,kNeedsFetch=0x80000000U,kIdMask=0x7fffffffU;
 struct {unsigned x;} threadIdx;
-namespace AscendC {enum class SpecialPurposeReg{AR};}
+// Model both SDK enums: importing both namespaces must not resolve a bare name.
+namespace AscendC {
+enum class SpecialPurposeReg{AR};
+enum class GatherMaskMode{VERSION_V1,VERSION_V2};
+namespace Reg {enum class GatherMaskMode{NO_STORE_REG,STORE_REG};}
+namespace MicroAPI = Reg;
+}
+using namespace AscendC;
+using namespace AscendC::MicroAPI;
 enum class CMPMODE{GT,LT,GE,NE};
 enum class MaskPattern{ALL};enum class LoadDist{DIST_BRC_B16};
-enum class HighLowPart{LOWEST};enum class GatherMaskMode{STORE_REG};
+enum class HighLowPart{LOWEST};
 enum class PostLiteral{POST_MODE_UPDATE};
 struct MaskReg{std::array<bool,128> v{};};
 template<class T>struct RegTensor{std::array<T,256/sizeof(T)> v{};};
@@ -55,7 +63,7 @@ void MaskAnd(MaskReg& r,MaskReg a,MaskReg b,MaskReg m){for(unsigned i=0;i<128;++
 template<class T>void Select(RegTensor<T>& r,RegTensor<T>& a,RegTensor<T>& b,MaskReg m){for(unsigned i=0;i<r.v.size();++i)r.v[i]=m.v[i]?a.v[i]:b.v[i];}
 template<class T>void Min(RegTensor<T>& r,RegTensor<T>& a,RegTensor<T>& b,MaskReg m){for(unsigned i=0;i<r.v.size();++i)if(m.v[i])r.v[i]=std::min(a.v[i],b.v[i]);}
 template<class T>void ReduceMin(RegTensor<T>& r,RegTensor<T>& a,MaskReg m){T v=65535;for(unsigned i=0;i<a.v.size();++i)if(m.v[i])v=std::min(v,a.v[i]);r.v.fill(0xdead);r.v[0]=v;}
-template<class T,GatherMaskMode>void Squeeze(RegTensor<T>& r,RegTensor<T>& a,MaskReg m){packed=0;for(unsigned i=0;i<a.v.size();++i)if(m.v[i])r.v[packed++]=a.v[i];}
+template<class T,AscendC::MicroAPI::GatherMaskMode>void Squeeze(RegTensor<T>& r,RegTensor<T>& a,MaskReg m){packed=0;for(unsigned i=0;i<a.v.size();++i)if(m.v[i])r.v[packed++]=a.v[i];}
 template<class T,PostLiteral>void StoreUnAlign(T*& p,RegTensor<T>& r,UnalignRegForStore&){std::copy_n(r.v.begin(),packed,p);p+=packed;ar+=packed*sizeof(T);}
 template<class T>void StoreUnAlignPost(T*&,UnalignRegForStore&){}
 template<class T>void And(RegTensor<T>& r,RegTensor<T>& a,RegTensor<T>& b,MaskReg m){for(unsigned i=0;i<r.v.size();++i)if(m.v[i])r.v[i]=a.v[i]&b.v[i];}

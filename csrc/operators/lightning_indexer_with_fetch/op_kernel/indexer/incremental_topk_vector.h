@@ -28,13 +28,13 @@ __simd_callee__ inline void Compact(RegTensor<uint16_t>& score,
     MaskAnd(admitted, admitted, valid, all);
     UnalignRegForStore store;
     ClearSpr<AscendC::SpecialPurposeReg::AR>();
-    Squeeze<uint16_t, GatherMaskMode::STORE_REG>(packed, score, admitted);
+    Squeeze<uint16_t, AscendC::MicroAPI::GatherMaskMode::STORE_REG>(packed, score, admitted);
     StoreUnAlign<uint16_t, PostLiteral::POST_MODE_UPDATE>(values, packed, store);
     StoreUnAlignPost(values, store);
     Adds(position, index, scanOffset, all);
     ClearSpr<AscendC::SpecialPurposeReg::AR>();
     UnalignRegForStore idStore;
-    Squeeze<uint16_t, GatherMaskMode::STORE_REG>(packed, position, admitted);
+    Squeeze<uint16_t, AscendC::MicroAPI::GatherMaskMode::STORE_REG>(packed, position, admitted);
     StoreUnAlign<uint16_t, PostLiteral::POST_MODE_UPDATE>(offsets, packed, idStore);
     StoreUnAlignPost(offsets, idStore);
 }
@@ -117,7 +117,7 @@ __simd_vf__ inline void CompactIds(__ubuf__ uint32_t* ids, __ubuf__ uint32_t* ou
         LoadAlign(id, ids + i);
         CompareScalar<uint32_t, CMPMODE::GE>(selected, id, kNeedsFetch, all);
         And(id,id,mask,all);
-        Squeeze<uint32_t, GatherMaskMode::STORE_REG>(compact, id, selected);
+        Squeeze<uint32_t, AscendC::MicroAPI::GatherMaskMode::STORE_REG>(compact, id, selected);
         StoreUnAlign<uint32_t, PostLiteral::POST_MODE_UPDATE>(output, compact, store);
     }
     StoreUnAlignPost(output, store);
