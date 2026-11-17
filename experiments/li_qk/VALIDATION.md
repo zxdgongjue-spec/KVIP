@@ -10,5 +10,6 @@
 - 一键启动脚本`run_a5.sh`通过Bash语法检查及3项编排检查：本地Git拉取/新worktree与原修改保留、固定参数及SDK开关转交、构建/运行失败后停止并保留退出码和打包日志。检查使用模拟执行后端，不执行CANN或NPU；命令为`python3 experiments/li_qk/test_a5_launcher.py`。
 - 增补联网处理后，启动脚本6项检查通过：此次Git代理覆盖不写回配置；origin不可达时本地提交/离线bundle仍能进入同一实验流程；本地缺少指定提交时拒绝运行。离线和网络检查仍使用模拟LI后端，不表示A5设备结果。
 - 固定目录宿主机脚本`sync_a5_host.sh`通过Bash语法检查及本地Docker验证：从已有离线包自动创建同步目录、重复同步、目标容器中两个文件的SHA一致、容器不存在时停止。未启动LI kernel，不能作为A5算子执行验收。
+- 无容器CLI时自动准备源码，`--run-here`在当前A5环境使用NPU路径执行。增补检查覆盖没有CLI时的真实Git/bundle准备、缺少`npu-smi`时提前停止、参数转交和后端失败传播；最后的NPU查询与LI执行在流程检查中使用stub，不产生设备性能结果。原Docker复制流程仍通过本地Docker哈希回归检查。
 
 本地完整日志、7点计划、构建哈希及元数据保存在`tests/results/li-qk-controls-20261117/`。交付包包含`validation/`中的检查记录，不附带跨CANN版本复用的二进制。A5性能结果由`run.py run`和`summarize`生成。

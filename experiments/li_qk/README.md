@@ -49,7 +49,9 @@ Q1 使用现有 Q2 的最小 M/Fixpipe 物理对齐布局，actual qlen=1。Cube
 
 ## 构建与 A5 执行
 
-宿主机同步入口为`sync_a5_host.sh`。在A5容器外执行`bash sync_a5_host.sh --no-proxy`，脚本自动创建固定目录`/tmp/li_qk_sync`，同步MR14，生成启动脚本和离线包，用`docker cp`复制到目标容器，并在目标容器内验证文件。无需查找临时目录后缀。宿主机也无法联网时，使用`--offline-bundle /path/to/li_qk_mr14_offline.bundle`导入已下载的代码包。`--container`可指定实际容器；同步完成后按打印的两条命令进入该容器并运行实验。
+代码准备入口为`sync_a5_host.sh`。执行`bash sync_a5_host.sh --no-proxy`，脚本自动创建固定目录`/tmp/li_qk_sync`，同步MR14，生成启动脚本和离线包。可用容器CLI时自动识别Docker/Podman/nerdctl并复制到目标容器；没有CLI时只准备本地文件，不因缺少Docker而失败。可用`--runtime`显式选择工具，nerdctl可加`--namespace`。`--container`指定实际容器。
+
+当前终端已能访问NPU/CANN时，可直接执行`bash sync_a5_host.sh --no-proxy --run-here`同步并运行，不需要容器管理工具。`run-here`指当前登录的A5真机终端，先检查`npu-smi info`与Model preload，再构建`RUN_MODE=npu`并使用ACL设备事件计时；不切换成Model/CPU计算。设备5是否可用还由实际ACL运行检查。只准备源码用`--sync-only`。运行参数放在`--`后，例如`--run-here -- --kvaf-include /path/to/include`。默认使用原KVIP checkout，缺少该目录时使用新建的bare仓库建立实验worktree。网络不可用时将`--no-proxy`换成`--offline-bundle /path/to/li_qk_mr14_offline.bundle`。
 
 一键脚本为`run_a5.sh`，在原A5容器与Python环境中执行。默认拉取MR14源分支并固定实验提交`0c1d483`，建立新worktree，检查依赖，构建，执行7点，汇总并打包；失败停止并打包已生成日志。原checkout和每次结果均保留。CANN路径优先从当前环境识别；KVAF优先使用原checkout的`third_party/KVAF`。
 
