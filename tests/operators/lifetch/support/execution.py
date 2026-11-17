@@ -3664,6 +3664,18 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             state.reset()
             if fused:
                 state.forward.set_diagnostics(False)
+        # KVAF registers each distinct caller output lazily on its first Get.
+        # Registration uploads entity metadata, which cannot run inside capture.
+        # Exercise every state on the normal stream, then restore it so neither
+        # capture nor measurement inherits a warmed cache from this setup.
+        initial = next(iter(sequence))
+        for i, state in enumerate(states):
+            pending = True
+            state.forward()
+            stream.synchronize()
+            checks.check(f'pre_capture/input{i}', lambda state=state: state.validate(initial))
+            pending = False
+            state.reset()
         stream.synchronize()
         with ExitStack() as scopes:
             if fused:
