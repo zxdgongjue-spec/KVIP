@@ -1,0 +1,37 @@
+cmake_minimum_required(VERSION 3.19)
+project(li_qk_controls LANGUAGES C CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_BUILD_TYPE Release)
+set(RUN_MODE npu CACHE STRING "npu or sim")
+set(SOC_VERSION "" CACHE STRING "Actual A5 SoC")
+set(ASCEND_CANN_PACKAGE_PATH "" CACHE PATH "Matching CANN installation")
+set(SCORE_SOURCE "" CACHE PATH "Prepared source snapshot")
+set(KVAF_INCLUDE "" CACHE PATH "Existing compatible device headers; no Fetch is launched")
+if(NOT EXISTS "${SCORE_SOURCE}/score-source.json" OR NOT EXISTS "${KVAF_INCLUDE}/kvaf_batch_get_device.h")
+ message(FATAL_ERROR "Prepare source and provide existing KVAF include directory")
+endif()
+if(NOT SOC_VERSION OR NOT EXISTS "${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake")
+ message(FATAL_ERROR "Specify actual SOC_VERSION and matching CANN path")
+endif()
+include(${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
+set(OP ${SCORE_SOURCE}/csrc/operators/lightning_indexer_with_fetch)
+ascendc_library(li_score STATIC score.cpp)
+ascendc_library(li_post STATIC post.cpp)
+foreach(target li_score li_post)
+ ascendc_include_directories(${target} PRIVATE ${OP}/include ${OP}/op_kernel ${OP}/op_kernel/indexer
+  ${KVAF_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../split_core/model_support
+  ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)
+ ascendc_compile_options(${target} PRIVATE -O2 -g --cce-auto-sync=off -mllvm -user-reserved-ub-size=223232
+  -DV9_USER_UB_BYTES=223232 -DKVIP_STREAMING_LI=0 -DSIM_Q=4 -DSIM_CAPTURE_HITS=0
+  -DKVIP_OUTPUT_WORKER=1 -DKVIP_FUSE_QUERY_WORK=1 -DV9_SIMULATION=0 -DROTATION_PUBLISH_TILES=1
+  -DKVIP_FUSION3=0 -DKVIP_FUSION3_TEST_TRANSPORT=1 -DKVIP_OPT_LI_REGISTER_PREDICATE=0
+  -DV9_PARTIAL_SCAN_SIMD=1 -DV9_PROBE_EPOCH=0 -DV9_INTERMEDIATE_PROFILING=0 -DV9_BATCH_POST=2)
+endforeach()
+add_executable(li_qk host.cpp)
+target_include_directories(li_qk PRIVATE ${OP}/include ${OP}/op_kernel ${KVAF_INCLUDE}
+ ${SCORE_SOURCE}/csrc/operators/common/lifetch ${CMAKE_CURRENT_SOURCE_DIR}/../split_core/model_support)
+target_compile_definitions(li_qk PRIVATE LI_QK_RUN_MODE="${RUN_MODE}")
+target_link_libraries(li_qk PRIVATE li_score li_post host_intf_pub ascendcl)
+if(RUN_MODE STREQUAL sim)
+ target_link_options(li_qk PRIVATE -Wl,--allow-shlib-undefined)
+endif()
