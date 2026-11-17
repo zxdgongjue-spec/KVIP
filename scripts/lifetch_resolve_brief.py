@@ -13,9 +13,69 @@ def fmt(value):
     return '—' if value is None else f'{value:.2f}'
 
 
+def print_critical_requests(cores):
+    """Compare per-request stages from a single detailed replay."""
+    resolvers = {}
+    outputs = {}
+    fetch_groups = {1: [], 4: []}
+    for core in cores:
+        role = core.get('role', '')
+        fetch_match = re.fullmatch(r'fetch Q([14]) lane(\d+)', role)
+        if fetch_match:
+            fetch_groups[int(fetch_match.group(1))].append((int(fetch_match.group(2)), core.get('requests')))
+            continue
+        match = re.fullmatch(r'(resolver\+finalize|output_pack) b(\d+)', role)
+        if not match:
+            continue
+        target = resolvers if match.group(1) == 'resolver+finalize' else outputs
+        target[int(match.group(2))] = core
+
+    print('\nPack end is this request\'s descriptor-packing stage end; '
+          'it is not group ready, a doorbell, or CQ completion.')
+    for q in (1, 4):
+        rows = []
+        for request, output in outputs.items():
+            resolver = resolvers.get(request)
+            if resolver is None:
+                continue
+            output_stages = {s['name']: s for s in output.get('stages', [])}
+            resolver_stages = {s['name']: s for s in resolver.get('stages', [])}
+            pack = output_stages.get(f'Q{q}.locations_and_pack')
+            if not pack or not isinstance(pack.get('end_us'), (int, float)):
+                continue
+            rows.append((pack['end_us'], request, resolver, resolver_stages, output_stages, pack))
+        rows.sort(key=lambda row: (-row[0], row[1]))
+
+        def print_rows(selected):
+            print('Request | Resolve start | Resolve end | Lookup duration | Pack start | Pack end | Resolver end')
+            if not selected:
+                print('No matching per-request stages in this replay.')
+            for _, request, resolver, resolver_stages, output_stages, pack in selected:
+                resolve = resolver_stages.get(f'Q{q}.resolve', {})
+                lookup = output_stages.get(f'Q{q}.logical_lookup', {})
+                print(f'{request} | {fmt(resolve.get("start_us"))} | {fmt(resolve.get("end_us"))} | '
+                      f'{fmt(lookup.get("duration_us"))} | {fmt(pack.get("start_us"))} | '
+                      f'{fmt(pack.get("end_us"))} | {fmt(resolver.get("end_us"))}')
+
+        groups = sorted(fetch_groups[q], key=lambda group: group[0])
+        missing_groups = not groups
+        for lane, requests in groups:
+            if not isinstance(requests, list) or not requests or not all(type(r) is int for r in requests):
+                print(f'\nQ{q} lane{lane}: request group unknown (requests field missing or empty)')
+                missing_groups = True
+                continue
+            print(f'\nQ{q} lane{lane}: up to 2 requests with latest pack end')
+            print_rows([row for row in rows if row[1] in requests][:2])
+        if missing_groups:
+            print(f'\nQ{q}: group unknown; up to 4 requests with latest pack end globally')
+            print_rows(rows[:4])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('run', type=Path, help='result directory or diagnostic.json')
+    parser.add_argument('--critical-requests', action='store_true',
+                        help='print the slowest per-Fetch-lane Q1/Q4 descriptor stages')
     args = parser.parse_args()
     paths = [args.run] if args.run.is_file() else list(args.run.rglob('diagnostic.json'))
     if not paths:
@@ -42,6 +102,9 @@ def main():
           f'span={fmt(timeline["observed_span_us"])} us | clock={fmt(mhz)} MHz')
     print('All timestamps below: us from earliest Resolve-kernel core entry; '
           'separate detailed replay, not the benchmark event.')
+    if args.critical_requests:
+        print_critical_requests(cores)
+        return
     frequencies = Counter((c['block'], c['role']) for s in samples
                           for c in s['timeline']['cores']
                           if c['block'] == s['timeline']['last_block'])
