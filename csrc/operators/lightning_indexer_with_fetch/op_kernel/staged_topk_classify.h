@@ -45,3 +45,24 @@ inline void MergeClassifyBitmap(__ubuf__ uint32_t* bitmap,uint32_t resident) {
     asc_syncthreads();
 }
 }
+#if !V9_UBMEM
+
+namespace rotating {
+__simt_vf__ __aicore__ LAUNCH_BOUND(512)
+inline void ClassifyPreparedLocations(uint32_t history,uint32_t resident,uint32_t batch,__gm__ Context* ctx,
+    __ubuf__ uint32_t* indices,__ubuf__ uint32_t* locations,__ubuf__ uint32_t* bitmap,__ubuf__ uint32_t* error) {
+    const uint32_t words=(resident+31)/32,shards=4096/words<8?4096/words:8;
+    auto mapping=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+uint64_t(batch)*history;
+    auto lru=reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+batch*kLruSlots;
+    for(uint32_t i=threadIdx.x;i<kTop;i+=512){
+        uint32_t token=indices[i],slot=locations[i];
+        if(token==UINT32_MAX){locations[i]=UINT32_MAX;continue;}
+        if(token>=history){locations[i]=UINT32_MAX;asc_atomic_or(error,1U);continue;}
+        if(slot==UINT32_MAX)slot=ResolvePhysicalSlot(resident,lru,asc_ldcg(mapping+token));
+        locations[i]=slot;
+        if(slot<resident)asc_atomic_or(bitmap+(threadIdx.x%shards)*words+slot/32,1U<<(slot%32));
+    }
+    asc_syncthreads();
+}
+}
+#endif

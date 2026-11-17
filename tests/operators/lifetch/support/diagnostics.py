@@ -103,7 +103,7 @@ def summarize(directory, config):
                     result['missing'].append(f'{path} repeat={sample["round"]}: algorithm: {sample["algorithm"]["error"]}')
             else:
                 result['missing'].append(f'{path} repeat={sample["round"]}: algorithm counters')
-            for key in ('source_round', 'scheduler_round', 'identities', 'correctness', 'diagnostic_error'):
+            for key in ('source_round', 'scheduler_round', 'identities', 'correctness', 'diagnostic_error', 'rank_progress'):
                 if key in sample:
                     item[key] = sample[key]
             if sample.get('diagnostic_error'):
@@ -544,6 +544,10 @@ def level_two_tables(result):
             repeat = sample['repeat']
             if result.get('level', 2) >= 3:
                 lines.append(f"\nSource: {capture['source']} | repeat={repeat}")
+            if result.get('level', 2) >= 3 and sample.get('rank_progress'):
+                emit(algorithm_lines, 'Per-Q prefetch rank / progress',
+                     ['Request', 'Q', 'Window', 'Score ready %', 'TopK covered %', 'Rank'],
+                     sample['rank_progress'])
             timeline = sample.get('timeline')
             if timeline:
                 if result.get('level', 2) >= 3:
@@ -815,6 +819,8 @@ def collect_core(torch, rotating, graph, reset, verify, rounds, folder, *, full=
     with profile:
         for step in range(rounds):
             reset()
+            if hasattr(rotating, "rank_progress"):
+                rotating.rank_progress.zero_()
             stream.synchronize()
             algorithm_initial = algorithm_before(rotating)
             begin, end = [torch.npu.Event(enable_timing=True) for _ in range(2)]
@@ -842,6 +848,16 @@ def collect_core(torch, rotating, graph, reset, verify, rounds, folder, *, full=
                 )
             )
             samples[-1]["algorithm"] = algorithm_after(rotating, algorithm_initial)
+            if hasattr(rotating, "rank_progress"):
+                records = rotating.rank_progress.cpu().tolist()
+                bounds = rotating.query_ends.cpu().tolist()
+                samples[-1]["rank_progress"] = [
+                    [b, q + 1, epoch, 100 * (word & ((1 << 18) - 1)) / max(bounds[b][q], 1),
+                     100 * ((word >> 18) & ((1 << 18) - 1)) / max(bounds[b][q], 1),
+                     (word >> 36) & 4095]
+                    for b, queries in enumerate(records) for q, epochs in enumerate(queries)
+                    for epoch, word in enumerate(epochs[:rotating.rounds]) if word
+                ]
             if diagnostics is not None:
                 samples[-1]["streaming_cycles"] = diagnostics()
     # Save events/counters before parsing, so collection never needs repeating

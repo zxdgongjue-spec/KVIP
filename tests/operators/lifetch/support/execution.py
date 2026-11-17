@@ -2256,8 +2256,8 @@ def run_urma_case(
     restored_hot = hot_case["hot_changes"]
     if not bench_only and not compact and args.prefetch_tokens and args.miss_percent < 100:
         def check_collision_coverage():
-            assert hot_case["first_window_fetches"] and restored_hot, (
-                f"First window did not Fetch former hot candidates into LRU slots: {hot_case}")
+            assert restored_hot, (
+                f"Selected former hot candidates were not repaired: {hot_case}")
         correctness.check("hot-victim-collision coverage", check_collision_coverage)
 
     if getattr(args, "check_suite", None) == "boundary":

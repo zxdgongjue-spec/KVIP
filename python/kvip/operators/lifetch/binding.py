@@ -37,6 +37,8 @@ class LIFetchBinding:
         output_stride=None,
         scratch=None,
     ):
+        if history > 131072:
+            raise ValueError("Ranked LIFetch requires history<=131072")
         if resident > 131072:
             raise ValueError("LIFetch hot bitmap supports resident <= 131072")
         if not 1 <= batch <= 16:
@@ -83,7 +85,7 @@ class LIFetchBinding:
             ("history", history),
             ("resident", resident),
             ("simulation", 0),
-            ("context_bytes", 320),
+            ("context_bytes", 352),
             ("row_bytes", 1024),
         ):
             fn = getattr(self.library, "v9_" + name)
@@ -210,6 +212,9 @@ class LIFetchBinding:
                 np.array([self.change_slots.data_ptr(), self.change_count.data_ptr()], dtype="<u8").view("u1"),
             )
         )
+        self.rank_progress = self.window_topk_storage[-batch*4*32*8:].view(torch.int64).view(batch,4,32)
+        self.incremental = self.window_topk_storage[:batch*512].view(torch.int64).view(batch,4,16)
+        blob = np.concatenate((blob, np.array([self.incremental.data_ptr(), 0, 0, 0], dtype="<u8").view("u1")))
         self.context = torch.from_numpy(blob.copy()).to(self.device)
         self.arguments = tuple(arguments) + (self.context,)
         self.bindings = torch.tensor([x.data_ptr() for x in self.arguments], dtype=torch.uint64, device=self.device)

@@ -44,11 +44,13 @@ struct Context {
     uint64_t rowOwners, tokenAddresses, addressStride, outputStride, tailBounds;
     RuntimeShape shape;
     uint64_t changeSlots, changeCount; // Extended direct-hot producer records, ABI 3.
+    uint64_t incremental; // Per-Q TopK prefixes, admission bitmap and diagnostics.
+    uint64_t incrementalPadding[3]; // Preserve 32-byte DMA alignment.
     // Optional serving layout: active row -> stable owner; addresses stay with
     // that owner's Index permutation. tailBounds[B,2] are [committed,write_end).
 
 };
-static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 320,
+static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 352,
               "LIFetch runtime ABI layout changed");
 // Workload geometry is bound before capture and shared by host/device launches.
 #if defined(__CCE_AICORE__)

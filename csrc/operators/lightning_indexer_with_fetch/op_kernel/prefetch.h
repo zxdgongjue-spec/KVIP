@@ -13,6 +13,7 @@ namespace kvaf_device { using ubmem_device::CleanCacheLines; constexpr uint32_t 
 #include "simt_api/device_sync_functions.h"
 #include "simt_api/device_warp_functions.h"
 #include "context.h"
+#include "indexer/ranked_candidates.h"
 #include "../../common/lifetch/prefetch_budget.h"
 
 // Imported from direct_slots.h
@@ -71,21 +72,7 @@ __simd_vf__ inline void PrepareProgress(__ubuf__ uint32_t* table, uint32_t baseT
         Adds(value, value, uint32_t(512), all);
     }
 }
-__simd_callee__ inline void Visible(MicroAPI::RegTensor<uint16_t>& value,
-    MicroAPI::RegTensor<uint16_t>& index, __ubuf__ uint16_t* input,
-    __ubuf__ uint32_t* control, uint32_t q, MicroAPI::MaskReg& all) {
-    using namespace MicroAPI;
-    RegTensor<uint16_t> low, high, zero;
-    MaskReg lower, upper, valid;
-    LoadAlign(value, input);
-    LoadAlign<uint16_t, LoadDist::DIST_BRC_B16>(low, reinterpret_cast<__ubuf__ uint16_t*>(control + 4 + q));
-    LoadAlign<uint16_t, LoadDist::DIST_BRC_B16>(high, reinterpret_cast<__ubuf__ uint16_t*>(control + q));
-    Compare<uint16_t, CMPMODE::GE>(lower, index, low, all);
-    Compare<uint16_t, CMPMODE::LT>(upper, index, high, all);
-    MaskAnd(valid, lower, upper, all);
-    Duplicate(zero, uint16_t(0));
-    Select(value, value, zero, valid);
-}
+
 }
 
 // Imported from window_fetch.h
@@ -336,6 +323,7 @@ inline void BatchBuild(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_residen
                         fields[1024+g*rt_postBank+i]=PhysicalSlot(rt_resident,ctx,b,slot);
                     }
                     asc_stcg(map+token,slot);
+
                     RecordChange(rt_resident,ctx,b,slot,token);
                 }
                 if(t<16) {
@@ -386,192 +374,50 @@ namespace rotating {
 // Reserve the last 8KiB of the 32000-byte Q4 scratch for candidate IDs
 // when indicesOut holds the complete lane's batch rows.
 constexpr uint32_t kCandidateCapacity=2048;
-#ifndef V9_PARTIAL_SCAN_SIMD
-#define V9_PARTIAL_SCAN_SIMD 1
-#endif
-// Clip each query before union so publication skew never admits future bits.
-__simd_callee__ inline void ClipWords(MicroAPI::RegTensor<uint32_t>& value,
-    MicroAPI::RegTensor<uint32_t>& index,__ubuf__ uint32_t* cfg,uint32_t q,
-    MicroAPI::MaskReg& all) {
-    using namespace MicroAPI;
-    RegTensor<uint32_t> low,high,lowMask,highMask,mask,ones,zero;
-    LoadAlign<uint32_t,LoadDist::DIST_BRC_B32>(low,cfg+80+q*4);
-    LoadAlign<uint32_t,LoadDist::DIST_BRC_B32>(high,cfg+81+q*4);
-    LoadAlign<uint32_t,LoadDist::DIST_BRC_B32>(lowMask,cfg+82+q*4);
-    LoadAlign<uint32_t,LoadDist::DIST_BRC_B32>(highMask,cfg+83+q*4);
-    Duplicate(ones,uint32_t(0x55555555U));Duplicate(zero,uint32_t(0));
-    MaskReg lower,upper,valid,edge;
-    Compare<uint32_t,CMPMODE::GE>(lower,index,low,all);
-    Compare<uint32_t,CMPMODE::LE>(upper,index,high,all);
-    MaskAnd(valid,lower,upper,all);Select(value,value,zero,valid);
-    Compare<uint32_t,CMPMODE::EQ>(edge,index,low,all);Select(mask,lowMask,ones,edge);And(value,value,mask,all);
-    Compare<uint32_t,CMPMODE::EQ>(edge,index,high,all);Select(mask,highMask,ones,edge);And(value,value,mask,all);
-}
-template<bool Partial=false>
-__simd_vf__ inline void UnionWords(__ubuf__ uint32_t* masks,__ubuf__ uint32_t* indices,__ubuf__ uint32_t* values,
-    __ubuf__ uint32_t* cfg,uint32_t words,uint32_t wordBase) {
-    using namespace MicroAPI;
-    auto all=CreateMask<uint32_t,MaskPattern::ALL>();auto one=CreateMask<uint32_t,MaskPattern::VL1>();
-    RegTensor<uint32_t> a,b,c,d,packed,counts,accum,total,bitMask;
-    RegTensor<int32_t> indexSigned;Arange(indexSigned,int32_t(wordBase));
-    auto& index=reinterpret_cast<RegTensor<uint32_t>&>(indexSigned);
-    Duplicate(accum,uint32_t(0));Duplicate(bitMask,uint32_t(0x55555555U));uint32_t remaining=words;
-    UnalignRegForStore indexStore;ClearSpr<SpecialPurposeReg::AR>();
-    for(uint16_t i=0;i<words;i+=64) {
-        auto valid=UpdateMask<uint32_t>(remaining);
-        LoadAlign(a,masks+i);LoadAlign(b,masks+words+i);LoadAlign(c,masks+2*words+i);LoadAlign(d,masks+3*words+i);
-        if constexpr(Partial){
-            ClipWords(a,index,cfg,0,all);ClipWords(b,index,cfg,1,all);
-            ClipWords(c,index,cfg,2,all);ClipWords(d,index,cfg,3,all);
-        }
-        Or(a,a,b,all);Or(c,c,d,all);Or(a,a,c,all);
-        And(a,a,bitMask,all);
-        MaskReg nonzero;CompareScalar<uint32_t,CMPMODE::NE>(nonzero,a,uint32_t(0),valid);
-        Duplicate<uint32_t,MaskMergeMode::ZEROING>(counts,uint32_t(1),nonzero);Add(accum,accum,counts,all);
-        StoreAlign(masks+i,a,valid);
-        Squeeze<uint32_t,MicroAPI::GatherMaskMode::STORE_REG>(packed,index,nonzero);
-        StoreUnAlign<uint32_t,PostLiteral::POST_MODE_UPDATE>(indices,packed,indexStore);
-        Adds(index,index,uint32_t(64),all);
-    }
-    StoreUnAlignPost(indices,indexStore);
-    ReduceSum(total,accum,all);StoreAlign(cfg+72,total,one);
-    // The second pass reloads q0 after the OR stores above. A scalar V_S
-    // after this VF cannot order its internal vector store/load pipelines.
-    LocalMemBar<MemType::VEC_STORE,MemType::VEC_LOAD>();
-    ClearSpr<SpecialPurposeReg::AR>();UnalignRegForStore valueStore;remaining=words;
-    for(uint16_t i=0;i<words;i+=64) {
-        auto valid=UpdateMask<uint32_t>(remaining);LoadAlign(a,masks+i);
-        MaskReg nonzero;CompareScalar<uint32_t,CMPMODE::NE>(nonzero,a,uint32_t(0),valid);
-        Squeeze<uint32_t,MicroAPI::GatherMaskMode::STORE_REG>(packed,a,nonzero);
-        StoreUnAlign<uint32_t,PostLiteral::POST_MODE_UPDATE>(values,packed,valueStore);
-    }
-    StoreUnAlignPost(values,valueStore);
-}
-// Each SIMT thread owns consecutive bitmap words. A two-level prefix sum
-// assigns stable, token-ordered output positions without per-candidate atomics.
-__simt_vf__ __aicore__ LAUNCH_BOUND(256)
-inline void ExpandWords(__ubuf__ uint32_t* input,__ubuf__ uint32_t* wordIndices,__ubuf__ uint32_t* ids,
-    __ubuf__ uint32_t* cfg,uint32_t base,uint32_t span,uint32_t oldCount,uint32_t words) {
-    const uint32_t tid=threadIdx.x,lane=tid%warpSize,warp=tid/warpSize;
-    const uint32_t perThread=(words+255)/256;
-    uint32_t count=0;
-    for(uint32_t i=0;i<perThread;++i) {
-        uint32_t word=tid*perThread+i;
-        if(word<words)count+=uint32_t(__popc(input[word]));
-    }
-    uint32_t inclusive=count;
-    for(uint32_t delta=1;delta<warpSize;delta*=2) {
-        uint32_t prior=asc_shfl_up(inclusive,delta);
-        if(lane>=delta)inclusive+=prior;
-    }
-    if(lane==warpSize-1)cfg[64+warp]=inclusive;
-    asc_syncthreads();
-    if(!tid) {
-        uint32_t total=oldCount;
-        for(uint32_t w=0;w<256/warpSize;++w) {
-            uint32_t n=cfg[64+w];cfg[64+w]=total;total+=n;
-        }
-        cfg[40]=total<kCandidateCapacity?total:kCandidateCapacity;cfg[48]=span;
-    }
-    asc_syncthreads();
-    uint32_t rank=cfg[64+warp]+inclusive-count,stopValue=span;
-    for(uint32_t i=0;i<perThread;++i) {
-        uint32_t word=tid*perThread+i;
-        uint32_t bits=word<words?input[word]:0;
-        while(bits) {
-            uint32_t offset=wordIndices[word]*16+uint32_t(__ffs(int32_t(bits))-1)/2;
-            if(rank<kCandidateCapacity)ids[rank]=base+offset;
-            uint32_t select=0U-uint32_t(rank==kCandidateCapacity);
-            stopValue=(stopValue&~select)|(offset&select);
-            ++rank;bits&=bits-1;
-        }
-    }
-    if(stopValue<span)asc_atomic_min(cfg+48,stopValue);
-}
-// Explicit two-bit predicate decoding for unequal query publication bounds.
-__simt_callee__ inline uint32_t ReadyWord(__ubuf__ uint32_t* input,__ubuf__ uint32_t* cfg,uint32_t word,uint32_t words) {
-    uint32_t bits=0,start=word*16;
-    for(uint32_t q=0;q<4;++q) {
-        uint32_t low=cfg[28+q],high=cfg[24+q];
-        if(start>=high || start+16<=low)continue;
-        uint32_t lo=low>start?low-start:0,hi=high-start<16?high-start:16;
-        uint32_t mask=0x55555555U<<(lo*2);
-        if(hi<16)mask&=(1U<<(hi*2))-1;
-        bits|=input[q*words+word]&mask;
-    }
-    return bits;
-}
-__simt_vf__ __aicore__ LAUNCH_BOUND(256)
-inline void ScanPartial(__ubuf__ uint32_t* input,__ubuf__ uint32_t* ids,__ubuf__ uint32_t* cfg,
-    uint32_t base,uint32_t span,uint32_t oldCount) {
-    uint32_t tid=threadIdx.x,lane=tid%warpSize,warp=tid/warpSize;
-    uint32_t words=span/16,perThread=(words+255)/256,count=0;
-    for(uint32_t i=0;i<perThread;++i) {
-        uint32_t w=tid*perThread+i;
-        if(w<words)count+=uint32_t(__popc(ReadyWord(input,cfg,w,words)));
-    }
-    uint32_t inclusive=count;
-    for(uint32_t d=1;d<warpSize;d*=2) {
-        uint32_t previous=asc_shfl_up(inclusive,d);if(lane>=d)inclusive+=previous;
-    }
-    if(lane==warpSize-1)cfg[64+warp]=inclusive;
-    asc_syncthreads();
-    if(!tid) {
-        uint32_t total=oldCount;
-        for(uint32_t w=0;w<256/warpSize;++w) {uint32_t n=cfg[64+w];cfg[64+w]=total;total+=n;}
-        cfg[40]=total<kCandidateCapacity?total:kCandidateCapacity;cfg[48]=span;
-    }
-    asc_syncthreads();
-    uint32_t rank=cfg[64+warp]+inclusive-count,stop=span;
-    for(uint32_t i=0;i<perThread;++i) {
-        uint32_t w=tid*perThread+i,bits=w<words?ReadyWord(input,cfg,w,words):0;
-        while(bits) {
-            uint32_t offset=w*16+uint32_t(__ffs(int32_t(bits))-1)/2;
-            if(rank<kCandidateCapacity)ids[rank]=base+offset;
-            uint32_t select=0U-uint32_t(rank==kCandidateCapacity);
-            stop=(stop&~select)|(offset&select);++rank;bits&=bits-1;
-        }
-    }
-    if(stop<span)asc_atomic_min(cfg+48,stop);
-}
-// LIDU pattern: gather only candidate map entries, then SIMD squeeze misses.
-__simt_vf__ __aicore__ LAUNCH_BOUND(256)
-inline void GatherCandidateMap(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* slots,
-    __gm__ uint32_t* map,uint32_t count) {
-    for(uint32_t i=threadIdx.x;i<count;i+=256)slots[i]=asc_ldcg(map+ids[i]);
-}
-__simd_vf__ inline void CompactMisses(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* slots,
-    __ubuf__ uint32_t* cfg,uint32_t count,uint32_t available) {
-    using namespace MicroAPI;
-    auto all=CreateMask<uint32_t,MaskPattern::ALL>();auto lane=CreateMask<uint32_t,MaskPattern::VL1>();
-    RegTensor<uint32_t> token,old,rank,index,written,flags,total,zeroIndex,broadcast,packed;
-    Duplicate(written,uint32_t(0));Duplicate(zeroIndex,uint32_t(0));
-    uint32_t remaining=count;auto output=ids;ClearSpr<SpecialPurposeReg::AR>();UnalignRegForStore store;
-    for(uint16_t i=0;i<count;i+=64) {
-        auto valid=UpdateMask<uint32_t>(remaining);LoadAlign(token,ids+i);LoadAlign(old,slots+i);
-        MaskReg miss,capacity;CompareScalar<uint32_t,CMPMODE::EQ>(miss,old,UINT32_MAX,valid);
-        Unsqueeze(rank,miss);Add(index,rank,written,all);
-        Duplicate<uint32_t,MaskMergeMode::ZEROING>(flags,uint32_t(1),miss);
-        ReduceSum(total,flags,all);Gather(broadcast,total,zeroIndex);Add(written,written,broadcast,all);
-        CompareScalar<uint32_t,CMPMODE::LT>(capacity,index,available,valid);MaskAnd(miss,miss,capacity,valid);
-        Squeeze<uint32_t,MicroAPI::GatherMaskMode::STORE_REG>(packed,token,miss);
-        StoreUnAlign<uint32_t,PostLiteral::POST_MODE_UPDATE>(output,packed,store);
-    }
-    StoreUnAlignPost(output,store);StoreAlign(cfg+56,written,lane);
-}
 // V7's direct transport pattern: address lookup/slot assignment only for the
 // compact miss list. FinalBuild/SubmitWqes are shared with final completion.
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void PrepareCandidateWqes(uint32_t rt_resident,__ubuf__ uint32_t* ids,__ubuf__ uint32_t* lo,
     __ubuf__ uint32_t* hi,__ubuf__ uint32_t* slots,__gm__ uint32_t* map,
-    __gm__ uint64_t* addresses,uint32_t count,uint32_t slotBase,__gm__ Context* ctx,uint32_t batch) {
+    __gm__ uint64_t* addresses,uint32_t count,uint32_t slotBase,__gm__ Context* ctx,uint32_t batch,__gm__ uint32_t* admitted) {
     for(uint32_t i=threadIdx.x;i<count;i+=256) {
         uint32_t token=ids[i],slot=slotBase+i;uint64_t remote=asc_ldcg(addresses+token);
         lo[i]=uint32_t(remote);hi[i]=uint32_t(remote>>32);slots[i]=PhysicalSlot(rt_resident,ctx,batch,slot);asc_stcg(map+token,slot);
+        asc_atomic_or(admitted+token/32,1U<<(token%32));
         RecordChange(rt_resident,ctx,batch,slot,token);
     }
     asc_threadfence();
 }
+// One UB bit per token gives exact deduplication. Expand only newly inserted
+// compact IDs, never scan the history-sized set. Each warp reserves output once.
+__simt_vf__ __aicore__ LAUNCH_BOUND(256)
+inline void UnionColdTopk(__ubuf__ uint32_t* input,__ubuf__ uint32_t* bits,
+    __ubuf__ uint32_t* ids,__ubuf__ uint32_t* cfg,uint32_t stride,
+    uint32_t n0,uint32_t n1,uint32_t n2,uint32_t n3,uint32_t limit,uint32_t words,bool last) {
+    uint32_t tid=threadIdx.x,lane=tid%32;
+    for(uint32_t i=tid;i<4*stride;i+=256) {
+        uint32_t q=i/stride,j=i%stride,n=q==0?n0:q==1?n1:q==2?n2:n3;
+        bool fresh=false;uint32_t token=0;
+        if(j<n) {
+            token=input[i];uint32_t bit=1U<<(token%32);
+            fresh=(asc_atomic_or(bits+token/32,bit)&bit)==0;
+        }
+        uint32_t mask=asc_ballot(fresh),base=0;
+        if(!lane && mask)base=asc_atomic_add(cfg+40,uint32_t(__popc(mask)));
+        base=asc_shfl(base,0);
+        uint32_t rank=base+__popc(mask&((1U<<lane)-1));
+        if(fresh && rank<kCandidateCapacity)ids[rank]=token;
+    }
+    asc_syncthreads();
+    // Earlier chunks still need all bits for dedup. Prune only after the last.
+    if(last && limit && cfg[40]>limit) {
+        for(uint32_t i=tid;i<words;i+=256)bits[i]=0;
+        asc_syncthreads();
+        for(uint32_t i=tid;i<limit;i+=256){uint32_t token=ids[i];asc_atomic_or(bits+token/32,1U<<(token%32));}
+        asc_syncthreads();
+    }
+}
+
 // Same indexed-load pattern as v9 GatherCandidateMap; cold IDs pass through.
 
 template<bool captureIo>
@@ -588,49 +434,13 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
         do { kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(events+(epoch-1)*rt_serviceLanes+lane),64); }
         while(!previous->complete);
     }
-    GlobalTensor<uint32_t> progressGm;
-    progressGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress));
     auto work=flags.ReinterpretCast<uint32_t>();
-    const uint32_t windowEnd=sequenceHalfWindow?SequenceWindowEnd(rt_history,rt_resident,sequenceHalfWindow,epoch):
-        Trigger(rt_history,rt_resident,rt_rounds,epoch)*128;
-    // Each shard publishes an independent ready boundary. Snapshot whatever
-    // has completed; the final resolver repairs selected tokens that were not
-    // prefetched. Waiting for another shard here can stall its producer.
     V9_FETCH_PROFILE(event->begin=GetSystemCycle();)
     uint64_t postedCount=0; // Business state: controls batched WQE submission.
 
     auto cfg=work[4096];
     auto rowStorage=ids;
     if(rt_batchedRows)ids=scratch[23808/4];
-    // Freeze every ready snapshot before doing any batch work. Cap to the
-    // scheduled boundary so slow service cannot chase newly produced history.
-    if(lane<rt_batch) {
-        DataCopyExtParams gather;gather.blockCount=(rt_batch-lane+rt_serviceLanes-1)/rt_serviceLanes;
-        gather.blockLen=4*sizeof(Progress);gather.srcStride=(rt_serviceLanes-1)*4*sizeof(Progress);gather.dstStride=0;
-        DataCopyPadExtParams<uint32_t> padding{false,0,0,0};
-        SetFlag<HardEvent::S_MTE2>(EVENT_ID0);WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
-        DataCopyPad(work,progressGm[lane*128],gather,padding);
-        SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-        for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes)for(uint32_t q=0;q<4;++q) {
-            uint32_t progress=(b/rt_serviceLanes)*128+q*32;
-            uint32_t end=work.GetValue(progress),cap=windowEnd;
-            if(ctx->queryEnds) {
-                auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds);
-                uint32_t valid=bounds[b*4+q];
-                if(ctx->lruSlots && valid<rt_resident)valid=rt_resident;
-                if(cap>valid)cap=valid;
-            }
-            if(sequenceHalfWindow) {
-                // A separate hot phase has already published the hot bitmap.
-                if(end<rt_resident)end=rt_resident;
-                uint32_t high=work.GetValue(progress+16);
-                // Split-Q geometry limits the batch to 16, leaving this band
-                // disjoint from both the low snapshot and batched post input.
-                cfg.SetValue(192+b*4+q,high<cap?high:cap);
-            }
-            cfg.SetValue(128+b*4+q,end<cap?end:cap);
-        }
-    }
     GlobalTensor<uint32_t> allRows;allRows.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->rows));
     if(rt_batchedRows) {
         if(lane<rt_batch) {
@@ -660,34 +470,51 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         const uint64_t entityAddress=state64.GetValue(0),queueAddress=state64.GetValue(1);
         const uint64_t addresses=state64.GetValue(2),output=state64.GetValue(3);
         const uint32_t lower=ctx->lruSlots?0:rt_resident;
-#define KV_WINDOW_HISTORY rt_history
-#define KV_WINDOW_RESIDENT rt_resident
-#define KV_WINDOW_SCAN_TOKENS rt_scanTokens
-#include "../../common/lifetch/sequence_candidates.h"
-#undef KV_WINDOW_HISTORY
-#undef KV_WINDOW_RESIDENT
-#undef KV_WINDOW_SCAN_TOKENS
+        uint32_t candidateCount=0;
+        uint32_t available=PrefetchAllowance(slots,requests,state.GetValue(208),
+            state.GetValue(209),state.GetValue(210),ctx->windowLimit);
+        V9_FETCH_PROFILE(scanBegin=GetSystemCycle();)
+        // Counts occupy spare incremental metadata, exported alongside TopK.
+        GlobalTensor<uint32_t> metadata,compact;
+        metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->incremental)+b*128);
+        compact.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*8192);
+        DataCopy(cfg[128],metadata,128);
+        SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        uint32_t counts[4],maxCount=0;
+        for(uint32_t q=0;q<4;++q){counts[q]=cfg.GetValue(128+q*32+6);if(counts[q]>maxCount)maxCount=counts[q];}
+        cfg.SetValue(40,0);
+        Duplicate(scratch,uint32_t(0),rt_history/32);
+        auto input=scratch[rt_history/32];
+        // Four 256-ID rows fit before the unchanged service output at 23808.
+        // Dense tails use the same bounded loop; all reads finish before jobs
+        // overwrite ctx->locations in the original downstream submission path.
+        for(uint32_t start=0;start<maxCount;start+=256) {
+            uint32_t width=maxCount-start;if(width>256)width=256;width=(width+7)/8*8;
+            SetFlag<HardEvent::V_MTE2>(EVENT_ID5);WaitFlag<HardEvent::V_MTE2>(EVENT_ID5);
+            DataCopyExtParams copy;copy.blockCount=4;copy.blockLen=width*4;copy.srcStride=(2048-width)*4;copy.dstStride=0;
+            DataCopyPadExtParams<uint32_t> pad{false,0,0,0};
+            DataCopyPad(input,compact[start],copy,pad);
+            SetFlag<HardEvent::MTE2_V>(EVENT_ID5);WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);
+            SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
+            uint32_t n[4];for(uint32_t q=0;q<4;++q)n[q]=counts[q]>start?((counts[q]-start)<width?counts[q]-start:width):0;
+            Simt::VF_CALL<UnionColdTopk>(Simt::Dim3{256,1,1},
+                reinterpret_cast<__ubuf__ uint32_t*>(input.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),width,n[0],n[1],n[2],n[3],available<kCandidateCapacity?available:kCandidateCapacity,rt_history/32,start+256>=maxCount);
+        }
+        SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        candidateCount=cfg.GetValue(40);if(candidateCount>kCandidateCapacity)candidateCount=kCandidateCapacity;
+
+
         V9_FETCH_PROFILE(scanTicks+=GetSystemCycle()-scanBegin;totalCandidates+=candidateCount;)
         V9_FETCH_PROFILE(candidateBegin=GetSystemCycle();postBegin=0;)
         uint32_t count=0,missing=0;
         if(candidateCount) {
             auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;
-            uint32_t available=PrefetchAllowance(slots,requests,state.GetValue(208),
-                state.GetValue(209),state.GetValue(210),ctx->windowLimit);
-            if(!slots && !ctx->tailBounds) {
-                // No slot has ever been assigned: the OR bitmap already
-                // deduplicated tokens, so every candidate is a new miss.
-                missing=candidateCount;count=missing<available?missing:available;
-            } else {
-                Simt::VF_CALL<GatherCandidateMap>(Simt::Dim3{256,1,1},
-                    reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),map,candidateCount);
-                SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-                SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
-                CompactMisses(reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),candidateCount,available);
-                SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-                missing=cfg.GetValue(56);count=missing<available?missing:available;
-            }
+            // ExportWindowCold already removed local hits and prior admissions.
+            // AdvanceWindow joined the predecessor; this request has no other writer.
+            missing=candidateCount;count=missing<available?missing:available;
             V9_FETCH_PROFILE(candidateTicks+=GetSystemCycle()-candidateBegin;)
             if(count) {
                 V9_FETCH_PROFILE(postBegin=GetSystemCycle();)
@@ -696,11 +523,20 @@ if (rt_batchedRows) {
                 postInput.SetValue(64,count);postInput.SetValue(65,rt_resident+slots);
                 postInput.SetValue(66,pending);post64.SetValue(34,addresses);
                 post64.SetValue(35,output);post64.SetValue(36,queueAddress);
+                post64.SetValue(37,kvip_prefetch_rank::CoveredAddress(ctx->incremental,rt_batch,rt_history,b));
                 GlobalTensor<uint32_t> entityGm,queueGm;
                 entityGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(entityAddress));
                 queueGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(queueAddress));
                 DataCopy(postInput,entityGm,48);DataCopy(postInput[48],queueGm,16);
                 SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+                bool bulk=count<postInput.GetValue(19) && pending+1<postInput.GetValue(31);
+                if(bulk){
+                    GlobalTensor<int32_t> admitted;
+                    admitted.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(post64.GetValue(37)));
+                    SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
+                    SetAtomicAdd<int32_t>();DataCopy(admitted,scratch.ReinterpretCast<int32_t>(),rt_history/32);SetAtomicNone();
+                    SetFlag<HardEvent::MTE3_S>(EVENT_ID5);WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
+                }
                 GlobalTensor<uint32_t> jobs;
                 jobs.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*8192);
                 SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
@@ -712,7 +548,7 @@ if (rt_batchedRows) {
                     Simt::VF_CALL<PrepareCandidateWqes>(Simt::Dim3{256,1,1},rt_resident,
                         reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),
                         reinterpret_cast<__ubuf__ uint32_t*>(work[512].GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work[1024].GetPhyAddr()),
-                        map,reinterpret_cast<__gm__ uint64_t*>(addresses),count,rt_resident+slots,ctx,b);
+                        map,reinterpret_cast<__gm__ uint64_t*>(addresses),count,rt_resident+slots,ctx,b,reinterpret_cast<__gm__ uint32_t*>(kvip_prefetch_rank::CoveredAddress(ctx->incremental,rt_batch,rt_history,b)));
                     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
                     if(captureIo && !firstDoorbell)firstDoorbell=GetSystemCycle();
                     if(SubmitWqesAt(rt_tokenBytes,entityAddress,queueAddress,output,work[1024],scratch,work,work[512],cfg,count,256,false,nullptr,pending))++pending;
@@ -728,16 +564,6 @@ if (rt_batchedRows) {
         state.SetValue(16+epoch,count);state.SetValue(48+epoch,missing-count);
         state.SetValue(10,state.GetValue(10)+missing-count);
         state.SetValue(8,slots);state.SetValue(9,requests);state.SetValue(211,pending);
-        for(uint32_t q=0;q<4;++q) {
-            uint32_t processed=end[0][q]<stop?end[0][q]:stop;
-            if(processed<consumed[0][q])processed=consumed[0][q];
-            state.SetValue(12+q,processed);
-            if(sequenceHalfWindow) {
-                processed=end[1][q]<stop?end[1][q]:stop;
-                if(processed<consumed[1][q])processed=consumed[1][q];
-            }
-            state.SetValue(80+epoch*4+q,processed);
-        }
         if(!rt_batchedRows) {
             SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
             DataCopy(rowGm,state,256);

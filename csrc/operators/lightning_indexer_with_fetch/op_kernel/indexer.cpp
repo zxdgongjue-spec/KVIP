@@ -34,6 +34,9 @@ __aicore__ inline void RunLi(GM_ADDR bindings) {
         bfloat16_t,float,float,uint16_t>;
     QLIKernel::QuantLightningIndexerKernel<Type> op;
     op.runtimeShape_ = shape;
+#if !V9_UBMEM
+    op.rotationContext_ = P(14);
+#endif
     op.sequenceSplit_ = splitSequence;
     op.sequenceTopKOnly_ = Phase == SequenceLiPhase::Threshold || Phase == SequenceLiPhase::Final;
     QLITilingData tiling{shape.batch,shape.batch*4,shape.indexHeads,4,shape.history,

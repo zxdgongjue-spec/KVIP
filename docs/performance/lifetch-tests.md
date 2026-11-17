@@ -469,3 +469,34 @@ Level2 每个 case 只打印一组汇总表：相同计数保留单值，波动�
 Level3 的算法与 KV 流量表同样按采样汇总一次；时间线保留逐次 replay。逐Q Resolver/Update 的耗时直接查看核时间线，不再重复打印同一张简表。预取服务使用 core pair、lane、epoch 标识；小控制间隙在终端显示总量及最大值，CSV 保留全部区间。Resolver 的占位 Output/Descriptor 时间戳不作为实际操作耗时展示，输出及打包耗时查看 output_pack 核。LI 分类区间标注管线等待，不能当作纯分类计算成本。
 
 若后续专项校验失败，最终结果显示 FAILED/FAIL；此前完成的性能样本保留，不能用此前的 PASS 替代整个测试的结果。
+
+### URMA 增量 TopK 与排名预取
+
+URMA 正式 LIFetch 使用窗口增量 TopK，最终 TopK 继续合并尚未覆盖的区间。
+每 Q 先排除有效 hot、ABC 本地命中及已经预取的 token，再做排名筛选。
+排名从 1024 到 2048，按该 Q 扣除初始 hot/ABC 覆盖后的实际进度计算。
+每窗口预算由 `--prefetch-tokens / --intermediate-fetches` 给出，再均分给四个 Q；
+每 Q 下限为上限的一半，候选不足时按实际数量，跨 Q 去重后可能低于该下限。
+
+ABC 种子范围读取正式绑定的 `tail_bounds`，按 query 有效长度及输出容量裁剪。
+不传 ABC bounds 时不推断尾部命中，也不固定读取末尾 384 个 token。
+当前增量位图缓冲支持 history 不超过 131072；超出时绑定明确报错。
+UBmem 保留主线执行路径。
+
+```bash
+python tests/operators/lifetch/test_lifetch.py check \
+  --transport urma --device 4 \
+  --kvaf-root /vllm-workspace/vllm-ascend/third_party/KVAF \
+  --kvaf-server 127.0.0.1:28885 --timeout-seconds 600
+
+python tests/operators/lifetch/test_lifetch.py diagnose \
+  --transport urma --device 4 \
+  --kvaf-root /vllm-workspace/vllm-ascend/third_party/KVAF \
+  --kvaf-server 127.0.0.1:28885 \
+  --batches 16 --miss-percent 10 --intermediate-fetches 4 \
+  --prefetch-tokens 1024 --level 3 --iterations 20 --timeout-seconds 600
+```
+
+Level 3 的 `Per-Q prefetch rank / progress` 展示各请求、Q、窗口的 Score 完成比例、
+TopK 覆盖比例和排名。仅诊断回放采集，bench 不启用这些打点。
+上述合成负载命令没有 ABC bounds；包含 ABC 的服务负载通过原有 replay 输入传入。

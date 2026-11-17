@@ -34,6 +34,8 @@ __aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uin
     auto local=storage.Get<uint32_t>();
     Duplicate(local,uint32_t(0),4096);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    FillRoundWords(ctx->incremental+b*512,128,local);
+    FillRoundWords(kvip_prefetch_rank::CoveredAddress(ctx->incremental,rt_batch,rt_history,b),(rt_history+255)/256*8,local);
     FillRoundWords(ctx->rows+b*sizeof(Row),sizeof(Row)/4,local);
     FillRoundWords(ctx->progress+b*4*sizeof(Progress),4*sizeof(Progress)/4,local);
     FillRoundWords(ctx->owners+b*128,32,local);
