@@ -10,16 +10,31 @@ import numpy as np
 
 def decode_profile(raw, *, batch, workers, resolver_cores, transport, threshold_markers=False,
                    early_prefetch_drain=False, init_route_markers=False, row_route_publish=False,
-                   direct_index_markers=False, compact_plan_markers=False):
+                   direct_index_markers=False, compact_plan_markers=False, post_index_low=False, tail_cores=None):
     raw = np.asarray(raw)
-    expected = batch * 256 + (resolver_cores * batch + 4 * workers) * 32
+    role_cores = resolver_cores * batch + 4 * workers
+    if tail_cores is None:
+        tail_cores = role_cores
+    if type(tail_cores) is not int or not role_cores <= tail_cores <= 64:
+        raise ValueError("Invalid production tail core count")
+    expected = batch * 256 + tail_cores * 32
     if raw.dtype != np.int64 or raw.size != expected or batch < 1 or workers < 1:
         raise ValueError("Unexpected production streaming timestamp layout")
     raw = raw.reshape(-1).view(np.uint64)
+    if post_index_low:
+        # The low phase tail has its own workspace ABI. Retain only LI/init
+        # markers; old per-role fields may contain a preceding HIGH replay.
+        raw = raw.copy()
+        old_tail = raw[: batch * 64].reshape(batch, 64)
+        old_tail[:, :57] = 0  # init owns consumer words 25..31 (row words 57..63).
+        raw[batch * 128:] = 0
+        direct_index_markers = compact_plan_markers = early_prefetch_drain = False
     producer_update = raw[: batch * 64].reshape(batch, 64)
     li = raw[batch * 64 : batch * 128].reshape(batch, 4, 16)
     fetch = raw[batch * 128 : batch * 256].reshape(batch, 128)
-    cores = raw[batch * 256 :].reshape(-1, 32)
+    # A full-AIV low tail uses a larger grid for small batches. HIGH retains
+    # the original role numbering; spare records have no old-role semantics.
+    cores = raw[batch * 256 :].reshape(-1, 32)[:role_cores]
     metrics = {}
 
     def interval(name, rows, begin, end, *, required=False):

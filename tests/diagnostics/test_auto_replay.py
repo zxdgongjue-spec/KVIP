@@ -47,7 +47,7 @@ def test_repacking_preserves_tnd_query_mapping_and_owner_state():
 
 def test_auto_options_are_explicit_and_runtime_mode_is_not_guessed_from_static_quota():
     for name in ("auto", "auto-end", "auto-tail", "auto-tail-end", "auto-tail-sparse", "auto-tail-sparse-fast",
-                 "auto-tail-row-publish", "auto-tail-row-direct", "auto-tail-row-simt", "auto-tail-compact"):
+                 "auto-tail-row-publish", "auto-tail-row-direct", "auto-tail-row-simt", "auto-tail-compact", "auto-post-index"):
         values = validate_options(options_for(name))
         assert values["auto_route"] and q_workers_for(name) == 4
         with pytest.raises(ValueError, match="auto_route requires"):
@@ -125,6 +125,36 @@ def test_read_through_is_opt_in_and_excludes_failed_promotion_experiments():
     for key in ("auto_route", "low_miss_tail", "low_miss_sparse_init", "selected_metadata"):
         with pytest.raises(ValueError):
             validate_options(expected | {key: False})
+
+
+def test_post_index_keeps_promotion_and_policy_and_excludes_scratch_modes():
+    from kvip.diagnostics.pipeline_options import admission_for
+
+    expected = options_for("auto-tail-row-direct") | {"low_miss_post_index": True}
+    assert options_for("auto-post-index") == expected
+    assert validate_options(expected) == expected
+    assert q_workers_for("auto-post-index") == 4
+    assert admission_for("auto-post-index") == admission_for("auto-tail-row-direct")
+    for key in ("low_miss_read_through", "low_miss_compact_plan", "auto_route_simt"):
+        with pytest.raises(ValueError):
+            validate_options(expected | {key: True})
+    for key in ("auto_route", "low_miss_tail", "low_miss_sparse_init", "auto_route_row_publish",
+                "low_miss_direct_index", "selected_metadata", "ready_batch_fetch", "early_fetch_ready"):
+        with pytest.raises(ValueError):
+            validate_options(expected | {key: False})
+
+
+@pytest.mark.parametrize("transport,feature", [("urma", None), ("urma", lambda: 0), ("ubmem", lambda: 1)])
+def test_post_index_requires_the_loaded_binary_capability(transport, feature):
+    from kvip.diagnostics.replay_measure import prepare_fused_state
+
+    library = SimpleNamespace()
+    if feature is not None:
+        library.kvip_low_miss_post_index = feature
+    bundle = SimpleNamespace(selector=None, update=None, rotating=SimpleNamespace(library=library),
+                             tuning={"low_miss_post_index": True})
+    with pytest.raises(ValueError, match="Post-before-Index"):
+        prepare_fused_state(bundle, None, None, None, 0, transport)
 
 
 def test_read_through_carry_replays_one_graph_without_persistent_restore(monkeypatch):

@@ -191,6 +191,10 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         feature = getattr(rotating.library, "kvip_low_miss_read_through", None)
         if transport != "urma" or feature is None or not feature():
             raise ValueError("Read-through low requires a capable loaded URMA build")
+    if bundle.tuning.get("low_miss_post_index"):
+        feature = getattr(rotating.library, "kvip_low_miss_post_index", None)
+        if transport != "urma" or feature is None or not feature():
+            raise ValueError("Post-before-Index low requires a capable loaded URMA build")
     seeds = []
     for name, target in (persistent_tensors(selector) | input_tensors(selector)).items():
         seed = (
@@ -252,6 +256,16 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         ):
             raise AssertionError("Fused final ordered selection changed during timed replay")
         reads.update(fused_demand(bundle, demand, logical, reads))
+        if bundle.tuning.get("low_miss_post_index"):
+            from kvip.diagnostics.post_index_profile import decode_post_index
+
+            reads["post_index"] = decode_post_index(
+                cpu_array(torch, bundle.forward.post_index),
+                active=early_threshold_skipped(bundle.tuning),
+                diagnostic=bool(getattr(bundle, "post_index_diagnostics", False)),
+            )
+            if reads["post_index"]["active"] and reads["post_index"]["submitted_requests"] != reads["final"]:
+                raise AssertionError("Post-Index per-core request count differs from verified final Get")
         return reads
 
     def verify():
@@ -462,6 +476,7 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
                 auto.begin(step=args.iterations + step + 1, learning=True)
             bundle.forward.times.zero_()
             bundle.forward.set_options(diagnostics=True)
+            bundle.post_index_diagnostics = True
             stream.synchronize()
             phase(retained, "diagnostic_replay_and_sync", step)
             replay(graph)
@@ -484,6 +499,10 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
                         row_route_publish=row_route_publish,
                         direct_index_markers=direct_index_markers,
                         compact_plan_markers=compact_plan_markers,
+                        post_index_low=bool(getattr(bundle, "tuning", {}).get("low_miss_post_index")
+                                            and early_threshold_skipped(bundle.tuning)),
+                        tail_cores=(int(bundle.forward.post_index.shape[0])
+                                    if getattr(bundle, "tuning", {}).get("low_miss_post_index") else None),
                     ),
                     reads=diagnostic_reads,
                     **({"auto_route": auto.record(diagnostic_reads)} if auto is not None else {}),
@@ -493,6 +512,7 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
             # the enabled profile buffer for the existing fatal-exit path.
             phase(retained, "diagnostic_disable", step)
             bundle.forward.set_options(diagnostics=False)
+            bundle.post_index_diagnostics = False
             stream.synchronize()
         result["native_diagnostics"] = dict(
             included_in_timing=False,
