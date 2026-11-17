@@ -35,3 +35,13 @@
 - 全核issue窗口包络40759→35002→34402；缩短14.12%/15.60%。总Init46→58→60、总指令增加。issue窗口含等待，不等于活跃周期/完成时间，也不是A5微秒。
 - Model与fresh NPU构建的compiled C++/headers及共享device source SHA均与当前代码一致，binary/library SHA核验一致；NPU receipt所有wrapper SHA与最终代码一致。Model receipt的部分Python wrapper随后补充统计/参数检查，各capture保留实际argv、geometry、Model配置与fixture SHA。
 - 原完整H128K score超时状态未改变，未有真实A5 msprof；本轮未实施producer直写canonical、初始化复用或Final并发。
+
+## 2026-11-18 后处理持续分核
+
+当前报告见`TAIL_REPORT.md`，证据根`tests/results/li-tail-20261117/`。
+
+- 七项CPU检查通过：C++/Python几何与唯一覆盖、局部TopK精确合并/tie/无效尾、局部θ不能代替唯一θ、resident候选＋Cold GT θ的Final覆盖性质、B16任务量、汇总拒绝不完整/跨binary/fixture混比、opcode区分GM与UB。
+- H32K/R8K/P4的C0/C1/C2/C3完整数值控制均PASS（结构适配resident）；同binary/fixture下C1 whole ticks为C0的0.3997，C2为1.0960。
+- 最终代码复用原resident primitive；B1/H128K/R16K/P4完整后处理C0/C1全部PASS，whole ticks1135835/243506。Final＋classification＋并集C0/C2全部PASS，whole ticks83149/96339；resident参考单点PASS。动态日志mask0xffffffff，实际ELF/entry/launch验证。
+- compiled C++/headers与CANN950 Model、fresh `RUN_MODE=npu`构建的SHA相符，binary/library SHA也验证。Python统计/脚本随后完善，不沿用旧Python分类标签解释GM访存。
+- 模型输入是已有最终score，mapping/LRU固定，只验证隔离后处理契约；不模拟动态Service/URMA/Index，也未实现producer/consumer常驻融合。没有真实A5时间或msprof，脚本供服务器采集。

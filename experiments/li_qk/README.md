@@ -180,3 +180,19 @@ done
 每次输出必须不存在。确定性fixture生成器保持不变，检查三个manifest的fixture hashes一致。单独`profile.py run`也支持`--work-grain`。
 
 全核七点Model脚本是 [run_granularity_model.sh](run_granularity_model.sh)，汇总为 [grain_summary.py](grain_summary.py)。报告同时解释128计算tile、分配量子、连续片段、canonical与Final，及尚未实施的初始化复用和producer直写方向。
+
+## Score后的持续分核控制
+
+需求见 [TAIL_PROMPT.md](TAIL_PROMPT.md)，源码/阶段规模/论文依据/实测见 [TAIL_REPORT.md](TAIL_REPORT.md)。新入口读取相同的最终sortable score，不运行QK、Fetch、Service或Index：C0原Cold＋原Final，C1只分Cold，C2只分Final，C3两者都分；默认resident仍调用原TopK/θ/Hot primitive。C0是隔离后处理控制，不是SDK或生产P2整链。
+
+```bash
+# 宿主机更新已确认的共享目录
+bash experiments/li_qk/update_shared_a5.sh --no-proxy
+# 原A5容器；默认B1/Q4/H128K/R16K/P4，device5
+bash /home/w00568585/li_qk_shared/run_tail_in_container.sh --controls C0,C1 --profile
+# 四组控制，以及独立B16场景
+bash /home/w00568585/li_qk_shared/run_tail_in_container.sh --profile
+bash /home/w00568585/li_qk_shared/run_tail_in_container.sh --batch 16 --parts 2 --profile
+```
+
+fresh NPU build、r0丢弃、三轮交错同轮配对；msprof单独采集。Model使用 [run_tail_model.sh](run_tail_model.sh)，[tail_instructions.py](tail_instructions.py)按实际ELF/entry/launch证明分类，[tail_summary.py](tail_summary.py)仅合并完整Model结果，同binary/fixture/几何/范围才计算比值。后处理预算是64 AIV，B16 score原入口的30/60限制另计。

@@ -66,6 +66,13 @@ git --git-dir="$LI_REPO" bundle verify "$LI_RELEASE/li_qk_mr14_offline.bundle"
 printf '%s\n' "$LI_HEAD" > "$LI_RELEASE/SOURCE_COMMIT"
 git hash-object --no-filters "$LI_RELEASE/run_li_qk_a5.sh" > "$LI_RELEASE/SCRIPT_BLOB"
 git hash-object --no-filters "$LI_RELEASE/li_qk_mr14_offline.bundle" > "$LI_RELEASE/BUNDLE_BLOB"
+# Older releases retain the original score-only launcher. Publish the new
+# post-score launcher when the frozen revision contains it.
+if git --git-dir="$LI_REPO" cat-file -e "$LI_HEAD:experiments/li_qk/run_tail_a5.sh" 2>/dev/null; then
+    git --git-dir="$LI_REPO" show "$LI_HEAD:experiments/li_qk/run_tail_a5.sh" > "$LI_RELEASE/run_tail_a5.sh"
+    bash -n "$LI_RELEASE/run_tail_a5.sh"
+    git hash-object --no-filters "$LI_RELEASE/run_tail_a5.sh" > "$LI_RELEASE/TAIL_SCRIPT_BLOB"
+fi
 cat > "$LI_SHARE/run_in_container.sh.pending" <<'LI_CONTAINER_ENTRY_END'
 #!/usr/bin/env bash
 # Container: read a frozen shared release, then run the physical NPU benchmark.
@@ -102,8 +109,26 @@ exec bash "$LI_RELEASE/run_li_qk_a5.sh" --repo "$LI_REPO" \
 LI_CONTAINER_ENTRY_END
 bash -n "$LI_SHARE/run_in_container.sh.pending"
 mv "$LI_SHARE/run_in_container.sh.pending" "$LI_SHARE/run_in_container.sh"
+cat > "$LI_SHARE/run_tail_in_container.sh.pending" <<'LI_TAIL_ENTRY_END'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+LI_TAIL_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+LI_TAIL_RELEASE=$(cd "$LI_TAIL_ROOT/current" && pwd -P)
+[[ -s $LI_TAIL_RELEASE/run_tail_a5.sh && -s $LI_TAIL_RELEASE/TAIL_SCRIPT_BLOB ]] || {
+    echo 'ERROR: published revision lacks post-score controls; update MR14 on the host' >&2; exit 1;
+}
+[[ $(git hash-object --no-filters "$LI_TAIL_RELEASE/run_tail_a5.sh") == "$(cat "$LI_TAIL_RELEASE/TAIL_SCRIPT_BLOB")" ]] || {
+    echo 'ERROR: shared post-score launcher hash mismatch' >&2; exit 1;
+}
+exec bash "$LI_TAIL_RELEASE/run_tail_a5.sh" --share-root "$LI_TAIL_ROOT" "$@"
+LI_TAIL_ENTRY_END
+bash -n "$LI_SHARE/run_tail_in_container.sh.pending"
+mv "$LI_SHARE/run_tail_in_container.sh.pending" "$LI_SHARE/run_tail_in_container.sh"
 if [[ -e $LI_SHARE/current && ! -L $LI_SHARE/current ]]; then die 'current must be the updater release symlink; existing directory was preserved'; fi
 ln -sfn "releases/$(basename "$LI_RELEASE")" "$LI_SHARE/current"
 printf '\nHost code update complete: %s\nShared directory: %s\n' "$LI_HEAD" "$LI_SHARE"
 printf 'In the A5 container, verify the existing mapping:\n  bash %q/run_in_container.sh --verify-only\n' "$LI_SHARE"
 printf 'Then run the physical NPU experiment (default B1 eight points; --suite batch16 for B16/30-core):\n  bash %q/run_in_container.sh\n' "$LI_SHARE"
+if [[ -s $LI_RELEASE/run_tail_a5.sh ]]; then
+    printf 'Post-score controls with separate msprof capture:\n  bash %q/run_tail_in_container.sh --batch 1 --parts 4 --profile\n' "$LI_SHARE"
+fi
