@@ -90,6 +90,11 @@ class LIFetchBinding:
             admission_controls = np.tile(np.array(auto_route.full_controls, dtype=np.int32), (batch, 1))
         admission_values = None if admission_controls is None else _admission_values(admission_controls, batch)
         self.library = load_lifetch_library(library)
+        feature = getattr(self.library, "kvip_low_miss_post_index", None)
+        self.post_index = False
+        if feature is not None:
+            feature.argtypes, feature.restype = [], ctypes.c_uint32
+            self.post_index = feature() == 1
         feature = getattr(self.library, "kvip_low_miss_read_through", None)
         read_through_build = False
         if feature is not None:
@@ -159,6 +164,8 @@ class LIFetchBinding:
             raise ValueError("Direct hot-first mode requires a window and concurrently resident LI tasks")
         contexts = owner.build_device_args(library)
         required_queues = max(batch * (final_aivs(batch, li_tiling, aic_count, final_workers) + 1), 2 * batch + 16)
+        if self.post_index:
+            required_queues = max(required_queues, 2 * aic_count)
         if contexts.shape[0] < required_queues:
             raise ValueError("V9 requires exclusive prefetch and per-final-AIV queues")
         self.rounds = li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)[

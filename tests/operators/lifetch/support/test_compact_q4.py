@@ -35,6 +35,7 @@ def test_compact_q4_matches_staged_resolver(tmp_path):
 #include <numeric>
 #include <random>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #define __simt_callee__
@@ -96,7 +97,7 @@ template<class F>void run(F f){std::vector<std::thread> workers;
  for(auto& worker:workers)worker.join();}
 int main(){
  std::mt19937 rng(138);
- for(uint32_t mode=0;mode<24;++mode){
+ for(uint32_t mode=0;mode<28;++mode){
   uint32_t resident=mode==22?131072:16384,history=mode==23?(1U<<24):resident+16384;
   State base(resident,history);
   std::vector<uint32_t> shuffled(resident);std::iota(shuffled.begin(),shuffled.end(),0);
@@ -118,6 +119,10 @@ int main(){
    else if(mode==6){token=(i%2)?base.lru[pos]:resident+pos;slot=token<resident?token:UINT32_MAX;}
    else if(mode==7){token=base.lru[pos];slot=UINT32_MAX;} // Invalid-hot cycles require original Index fallback.
    else if(mode==23){token=collisions[pos%collisions.size()];slot=UINT32_MAX;}
+   else if(mode==24){token=i%2?resident+i/2:pos/2;slot=UINT32_MAX;}
+   else if(mode==25){token=i;slot=UINT32_MAX;} // 8192 unique self-refills.
+   else if(mode==26){token=i+1==kSlots?17:resident+i;slot=UINT32_MAX;}
+   else if(mode==27){token=i<4096?resident+i:i-4096;slot=UINT32_MAX;}
    else{
     bool miss=rng()%100<mode*4;
     token=miss?resident+rng()%8192:rng()%resident;slot=miss?UINT32_MAX:token;
@@ -148,6 +153,47 @@ int main(){
   auto count=newState.ctl[0];std::unordered_set<uint32_t> sources,destinations;
   for(uint32_t i=0;i<count;++i){sources.insert(newState.src[2048+i]);destinations.insert(newState.dst[2048+i]);}
   assert(sources.size()==count&&destinations.size()==count);
+
+  // The post-then-Index plan retains every selected resident position. Even
+  // invalid resident rows refill themselves; only cold IDs consume victims.
+  State post(base);
+  std::unordered_set<uint32_t> protectedRows;
+  for(auto token:post.selected)if(token<resident){
+   post.ctl[1024+token/32]|=1U<<(token%32);protectedRows.insert(token);
+  }
+  for(auto slot:post.loc)if(slot<resident)protectedRows.insert(slot);
+  auto expectedLoc=post.loc;
+  std::vector<uint32_t> expectedSource,expectedDest,expectedCounts(4),available;
+  for(auto slot:post.lru)if(!protectedRows.count(slot))available.push_back(slot);
+  std::unordered_set<uint32_t> listed(available.begin(),available.end());
+  for(uint32_t slot=0;slot<resident;++slot)
+   if(!protectedRows.count(slot)&&!listed.count(slot))available.push_back(slot);
+  uint32_t victim=0;std::unordered_map<uint32_t,uint32_t> assigned;
+  for(uint32_t q=0;q<4;++q){
+   auto before=expectedSource.size();
+   for(uint32_t i=q*kTop;i<(q+1)*kTop;++i){
+    uint32_t token=post.selected[i];
+    if(token==UINT32_MAX||expectedLoc[i]!=UINT32_MAX)continue;
+    if(!assigned.count(token)){
+     uint32_t slot=token<resident?token:available.at(victim++);
+     assigned[token]=slot;expectedSource.push_back(token);expectedDest.push_back(slot);
+    }
+    expectedLoc[i]=assigned.at(token);
+   }
+   expectedCounts[q]=expectedSource.size()-before;
+  }
+  post.ctl[9]=1; // The old proof rejects invalid hot sources; the new one repairs them.
+  run([&]{rotating::ResolveCompactQ4<true>(&post.ctx,history,resident,0,post.selected.data(),post.loc.data(),
+   post.keys.data(),post.ranks.data(),post.slots.data(),post.work.data(),post.ctl.data(),post.src.data(),post.dst.data());});
+  assert(!post.ctl[1]&&!post.ctl[9]);assert(post.ctl[0]==expectedSource.size());
+  assert(post.loc==expectedLoc);
+  assert(std::equal(expectedSource.begin(),expectedSource.end(),post.src.begin()+2048));
+  assert(std::equal(expectedDest.begin(),expectedDest.end(),post.dst.begin()+2048));
+  assert(std::equal(expectedCounts.begin(),expectedCounts.end(),post.ctl.begin()+2));
+  assert(std::unordered_set<uint32_t>(expectedSource.begin(),expectedSource.end()).size()==expectedSource.size());
+  assert(std::unordered_set<uint32_t>(expectedDest.begin(),expectedDest.end()).size()==expectedDest.size());
+  for(uint32_t i=0;i<expectedSource.size();++i)
+   assert(expectedSource[i]==expectedDest[i]||(expectedSource[i]>=resident&&expectedDest[i]<resident));
  }
 }
 ''')
@@ -163,9 +209,9 @@ def test_compact_wiring_keeps_high_path_and_completion_contract():
     source = (INDEXER.parent / "streaming.cpp").read_text()
     producer = function(source, "inline uint32_t Producer(")
     assert '#include "low_miss_mode.h"' in source
-    assert "compactPlan=NoPrefetchRound(ctx) && !row->slots" in producer
-    assert producer.index("ctx->admissionControls),shape.batch*16)") < producer.index("compactPlan=NoPrefetchRound")
-    assert producer.index("VF_CALL<ResolveCompactQ4>") < producer.index("DataCopy(output,loc,kSlots)")
+    assert "compactPlan=PostIndex || (KVIP_LOW_MISS_COMPACT_PLAN && NoPrefetchRound(ctx) && !row->slots)" in producer
+    assert producer.index("ctx->admissionControls),shape.batch*16)") < producer.index("compactPlan=PostIndex")
+    assert producer.index("VF_CALL<ResolveCompactQ4<PostIndex>>") < producer.index("DataCopy(output,loc,kSlots)")
     assert producer.index("DataCopy(output,loc,kSlots)") < producer.index("flags[published].ready=1")
     assert "if(!compactPlan){" in producer
     assert "VF_CALL<ResolveQueryWork>" in producer

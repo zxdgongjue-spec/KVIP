@@ -75,6 +75,8 @@ template<class T>void asc_stcg(T* p,T v){*p=v;}
         + "\n"
         + function(metadata, "__simt_callee__ inline uint32_t OutputStride(")
         + "\n"
+        + function(metadata, "__simt_callee__ inline uint32_t TailCapacity(")
+        + "\n"
         + function(prefetch, "inline void InitializeTailMappings(")
         + "\n"
         + function(streaming, "inline void PublishPrefetchResidency(")

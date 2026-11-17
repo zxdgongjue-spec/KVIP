@@ -65,7 +65,11 @@ class StreamingLIFetchForward:
         self.events_src = allocate("event_sources", (b, 10240), torch.int32)
         self.events_dst = allocate("event_destinations", (b, 10240), torch.int32)
         self.worker_status = allocate("worker_status", (b, 32), torch.int32, True)
-        self.times = allocate("times", (b * 256 + (self.resolver_cores * b + 4 * q_workers) * 32,), torch.int64, True)
+        tail_cores = 2 * shape.aicCount if rotating.post_index else self.resolver_cores * b + 4 * q_workers
+        self.times = allocate("times", (b * 256 + tail_cores * 32,), torch.int64, True)
+        self.post_index = (
+            allocate("post_index", (tail_cores, 16), torch.int64, True) if rotating.post_index else None
+        )
         self.query_bitmaps = allocate("query_bitmaps", (b, 4, (self.resident + 31) // 32), torch.int32)
         self.query_errors = allocate("query_errors", (b, 4, 32), torch.int32, True)
         self.dense_shadow = allocate("dense_shadow", (b, 3 * self.history), torch.int64)
@@ -98,7 +102,8 @@ class StreamingLIFetchForward:
             (
                 blob,
                 np.asarray([self.dense_shadow.data_ptr(), self.packed_fetch.data_ptr()], dtype="<u8").view("u1"),
-                np.zeros(112, dtype="u1"),
+                np.asarray([0 if self.post_index is None else self.post_index.data_ptr()], dtype="<u8").view("u1"),
+                np.zeros(104, dtype="u1"),
             )
         )
         if len(blob) != 256:

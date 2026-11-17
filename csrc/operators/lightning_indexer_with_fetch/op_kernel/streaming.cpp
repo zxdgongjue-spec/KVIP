@@ -4,7 +4,7 @@
 #if defined(__CCE_AICORE__)
 #include "resolver.h"
 #include "resolver_staged_dma2.h"
-#if KVIP_LOW_MISS_COMPACT_PLAN
+#if KVIP_LOW_MISS_COMPACT_PLAN || KVIP_LOW_MISS_POST_INDEX
 #include "resolver_compact_q4.h"
 #include "low_miss_mode.h"
 #endif
@@ -116,6 +116,7 @@ __aicore__ inline void SyncFetchDescriptors(__gm__ Context* ctx, uint32_t begin,
 #include "low_miss_mode.h"
 #include "read_through.h"
 #endif
+template <bool PostIndex = false>
 __aicore__ inline uint32_t Producer(__gm__ Args* a, uint32_t b) {
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
@@ -206,16 +207,19 @@ __aicore__ inline uint32_t Producer(__gm__ Args* a, uint32_t b) {
  if(profile)ticks[3]=GetSystemCycle();
  GlobalTensor<uint32_t> output;output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*kSlots);
  auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*32;
-#if KVIP_LOW_MISS_COMPACT_PLAN
+#if KVIP_LOW_MISS_COMPACT_PLAN || KVIP_LOW_MISS_POST_INDEX
  // The graph reuses these addresses. Refresh the init-published decision on
- // this Producer AIV rather than relying on the LI core's private cache.
- if(ctx->admissionControls && shape.batch && shape.batch<=16)
+ // the optional compact producer. The Post/Index entry already resolved the
+ // uniform decision; its high specialization must not pay for another read.
+#if KVIP_LOW_MISS_COMPACT_PLAN
+ if(!PostIndex && ctx->admissionControls && shape.batch && shape.batch<=16)
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->admissionControls),shape.batch*16);
- const bool compactPlan=NoPrefetchRound(ctx) && !row->slots;
+#endif
+ const bool compactPlan=PostIndex || (KVIP_LOW_MISS_COMPACT_PLAN && NoPrefetchRound(ctx) && !row->slots);
  uint32_t compactPublished=0;
  if(compactPlan){
   if(profile)ticks[9]=1;
-  Simt::VF_CALL<ResolveCompactQ4>(Simt::Dim3{512,1,1},stagedContext,
+  Simt::VF_CALL<ResolveCompactQ4<PostIndex>>(Simt::Dim3{512,1,1},stagedContext,
    shape.history,shape.resident,b,FinalPtr(selected),FinalPtr(loc),FinalPtr(keys),
    FinalPtr(ranks),FinalPtr(slots),FinalPtr(work),FinalPtr(ctl),eventSource,eventDest);
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
@@ -232,7 +236,7 @@ __aicore__ inline uint32_t Producer(__gm__ Args* a, uint32_t b) {
   if(profile)ticks[10+q*5]=GetSystemCycle();
   uint32_t fw=(a->prefetchCount>>16)&0xffU,ds=shape.batch*kTop,meta=(3*shape.batch+31)&~31U;
   auto direct=reinterpret_cast<__gm__ int32_t*>(a->packedFetch)+4*fw*(3*ds+meta)+(q*fw+b%fw)*(6*ds+64);
-#if KVIP_LOW_MISS_COMPACT_PLAN
+#if KVIP_LOW_MISS_COMPACT_PLAN || KVIP_LOW_MISS_POST_INDEX
   if(!compactPlan){
 #endif
   Simt::VF_CALL<ResolveQueryWork>(Simt::Dim3{512,1,1},stagedContext,shape.history,shape.resident,shape.tokenBytes,row->slots,
@@ -241,22 +245,22 @@ __aicore__ inline uint32_t Producer(__gm__ Args* a, uint32_t b) {
     reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(work),FinalPtr(ctl),
     (a->prefetchCount & 0x20000000U)?nullptr:direct,ds);
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-#if KVIP_LOW_MISS_COMPACT_PLAN
+#if KVIP_LOW_MISS_COMPACT_PLAN || KVIP_LOW_MISS_POST_INDEX
   }
 #endif
   if(profile)ticks[11+q*5]=GetSystemCycle();
   uint32_t total=ctl.GetValue(0),added=ctl.GetValue(2+q),error=ctl.GetValue(1);
-#if KVIP_LOW_MISS_COMPACT_PLAN
+#if KVIP_LOW_MISS_COMPACT_PLAN || KVIP_LOW_MISS_POST_INDEX
   if(compactPlan){compactPublished+=added;total=compactPublished;}
 #endif
   if(profile)ticks[12+q*5]=ticks[11+q*5];
   if(profile)ticks[13+q*5]=GetSystemCycle();
-#if KVIP_LOW_MISS_COMPACT_PLAN
+#if KVIP_LOW_MISS_COMPACT_PLAN || KVIP_LOW_MISS_POST_INDEX
   if(!compactPlan){
 #endif
   SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);DataCopy(output[q*kTop],loc[q*kTop],kTop);
   SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
-#if KVIP_LOW_MISS_COMPACT_PLAN
+#if KVIP_LOW_MISS_COMPACT_PLAN || KVIP_LOW_MISS_POST_INDEX
   }
 #endif
   if(profile)ticks[14+q*5]=GetSystemCycle();
@@ -678,7 +682,7 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
  }
 }
 #endif
-template <bool ReadThrough = false>
+template <bool ReadThrough = false, bool PostIndex = false>
 __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b,uint32_t usefulPrefetch){
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
@@ -689,7 +693,7 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b,uint32_t usef
   if(profile)for(uint32_t i=0;i<32;++i)ft[i]=0;
  }
  if(profile)ft[0]=GetSystemCycle();
- if constexpr (!ReadThrough) {
+ if constexpr (!ReadThrough && !PostIndex) {
 #if KVIP_EARLY_PREFETCH_DRAIN && !V9_UBMEM
  // Consumer is the only CQ reader and flag-7 writer in this specialization.
  error|=JoinEarlyPrefetch(a,b,ft,profile);
@@ -709,6 +713,9 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b,uint32_t usef
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+7),sizeof(BatchFlag));
 #endif
  }
+ // Post/Index has already joined all cores and their CQ completion. It has
+ // no prefetch CQ and must not poll the old role flags a second time.
+ if constexpr (!PostIndex) {
  for(uint32_t f=ReadThrough?8:6;f<12;++f){uint64_t start=GetSystemCycle();if(profile)ft[8+2*(f-6)]=start;while(true){
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+f),sizeof(BatchFlag));
   if(flags[f].ready){error|=flags[f].error;break;}
@@ -725,6 +732,7 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b,uint32_t usef
    if(profile)ft[21]=GetSystemCycle();
   }
  }
+ }
  auto info=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),kRowStatusWords*4);
  auto update=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);
@@ -739,12 +747,14 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b,uint32_t usef
   total+=post->count;completed+=post->pending;error|=post->error;
   if(post->deferred){++deferred;error|=kvaf_device::kInvalidArgs;}
 #if !V9_UBMEM
+  if constexpr (!PostIndex) {
   uint32_t workers=(a->prefetchCount>>16)&0xffU;
   uint32_t pair=2*shape.batch+2*(q*workers+b%workers);
   auto queueArgs=GetArgs(ctx,pair);
   auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(queueArgs.queue_state);
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
   lastHead=queue->sq_producer_index;lastCq=queue->cq_consumer_index;
+  }
 #endif
   post->pending=0;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
  }
@@ -796,10 +806,25 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b,uint32_t usef
  if(profile){ft[3]=GetSystemCycle();kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ft),32*8);}
 }
 
+#if KVIP_LOW_MISS_POST_INDEX && !V9_UBMEM
+#include "post_index_tail.h"
 #endif
+#endif
+#if KVIP_LOW_MISS_POST_INDEX && !V9_UBMEM
+// All AIVs participate in phase barriers. Batch scheduling prevents another
+// stream from occupying a subset while this invocation waits for its peers.
+extern "C" __global__ __aicore__ __schedmode__(1) void v9_streaming_resolve_update(GM_ADDR arg) {
+#else
 extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
+#endif
 #if defined(__CCE_AICORE__)
+#if KVIP_LOW_MISS_POST_INDEX && !V9_UBMEM
+ // Vector-only mixed scheduling enables the hardware cross-core barrier.
+ // AIV_ONLY does not enable that scheduler, even with __schedmode__(1).
+ KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
+#else
  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+#endif
  if ASCEND_IS_AIV {
   auto a=reinterpret_cast<__gm__ Args*>(arg);uint32_t block=GetBlockIdx();
   auto shape=LoadRuntimeShape(reinterpret_cast<__gm__ Context*>(a->context));
@@ -808,6 +833,17 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
   bool profile=(a->prefetchCount & 0x80000000U)!=0;
   auto trace=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*256+uint64_t(block)*32;
   if(profile)trace[0]=GetSystemCycle();
+#if KVIP_LOW_MISS_POST_INDEX && !V9_UBMEM
+  if(a->postIndex) {
+   auto state=reinterpret_cast<__gm__ post_index_tail::Record*>(a->postIndex);
+   post_index_tail::Flush(state);
+   if(state->active==1) {
+    post_index_tail::Run(a,block);
+    if(profile){trace[1]=GetSystemCycle();kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(trace),32*8);}
+    return;
+   }
+  }
+#endif
 #if KVIP_LOW_MISS_READ_THROUGH && !V9_UBMEM
   const bool readThrough=read_through::Active(reinterpret_cast<__gm__ Context*>(a->context));
 #endif

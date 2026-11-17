@@ -187,7 +187,8 @@ int main(){using namespace rotating;std::mt19937 rng(451);
     subprocess.run([str(binary)], check=True)
 
 
-def test_no_prefetch_preserves_candidate_hits_and_q4_protection(tmp_path):
+@pytest.mark.parametrize("post_index", [0, 1])
+def test_no_prefetch_preserves_candidate_hits_and_q4_protection(tmp_path, post_index):
     resolve = function(
         (ROOT / "csrc/operators/common/lifetch/cache_metadata.h").read_text(),
         "__simt_callee__ inline uint32_t ResolvePhysicalSlot(",
@@ -274,6 +275,11 @@ int main(){using namespace rotating;
   for(uint32_t slot:locations)if(slot<R)assert(unionBits[slot/32]&(1U<<(slot%32)));
   if(low&&!used){
    assert(locations[2]==UINT32_MAX);
+#if KVIP_LOW_MISS_POST_INDEX
+   assert(unionBits[2/32]&(1U<<(2%32)));
+#else
+   assert(!(unionBits[2/32]&(1U<<(2%32))));
+#endif
    assert(locations[3*kTop+32]==64);
    assert(unionBits[64/32]&(1U<<(64%32)));
   }else assert(locations[3*kTop+32]==UINT32_MAX);
@@ -283,6 +289,7 @@ int main(){using namespace rotating;
     binary = tmp_path / "no_prefetch_metadata"
     subprocess.run([
         "c++", "-std=c++17", "-O1", "-g", "-fsanitize=address,undefined",
+        f"-DKVIP_LOW_MISS_POST_INDEX={post_index}",
         "-I", str(OPERATOR), str(source), "-o", str(binary),
     ], check=True)
     subprocess.run([str(binary)], check=True)

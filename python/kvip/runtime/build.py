@@ -93,6 +93,7 @@ def build_libraries(
     low_miss_direct_index=False,
     low_miss_compact_plan=False,
     low_miss_read_through=False,
+    low_miss_post_index=False,
     auto_route=False,
     prefetch_gate=False,
     prefetch_rank=0,
@@ -126,6 +127,7 @@ def build_libraries(
         LOW_MISS_DIRECT_INDEX=low_miss_direct_index,
         LOW_MISS_COMPACT_PLAN=low_miss_compact_plan,
         LOW_MISS_READ_THROUGH=low_miss_read_through,
+        LOW_MISS_POST_INDEX=low_miss_post_index,
         AUTO_ROUTE=auto_route,
         PREFETCH_GATE=prefetch_gate,
         SKIP_EXHAUSTED_PREFETCH=skip_exhausted_prefetch,
@@ -161,6 +163,14 @@ def build_libraries(
         raise ValueError("low_miss_compact_plan requires auto_route, low_miss_tail, selected_metadata and early_fetch_ready")
     if low_miss_read_through and not (auto_route and low_miss_tail and selected_metadata and early_fetch_ready):
         raise ValueError("low_miss_read_through requires auto_route, low_miss_tail, selected_metadata and early_fetch_ready")
+    if low_miss_post_index:
+        if not (auto_route and low_miss_direct_index and low_miss_tail and selected_metadata and early_fetch_ready):
+            raise ValueError("low_miss_post_index requires auto_route and the normal direct-Index low path")
+        if low_miss_read_through or low_miss_compact_plan or auto_route_simt:
+            raise ValueError("low_miss_post_index is separate from read-through, compact-plan and SIMT routing")
+        native_get = (Path(headers) / "kvaf_batch_get_device.h").read_text()
+        if not all(name in native_get for name in ("PostDirectRequests", "WaitForCompletion", "batch_get_schedule.h")):
+            raise ValueError("low_miss_post_index requires the existing KVAF fused-context Post/CQ helpers")
     if type(prefetch_rank) is not int or not 0 <= prefetch_rank <= 2048:
         raise ValueError("prefetch_rank must be an integer in 0..2048")
     if prefetch_rank and not prefetch_gate:

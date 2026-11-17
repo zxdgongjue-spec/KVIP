@@ -59,7 +59,7 @@ def test_pipeline_options_isolate_and_reuse_the_correct_binary(monkeypatch, tmp_
                                     "low_miss_skip", "low_miss_tail", "auto_route", "low_miss_sparse_init",
                                     "auto_route_fast_probe", "auto_route_row_publish",
                                     "auto_route_simt", "low_miss_direct_index",
-                                    "low_miss_compact_plan"))
+                                    "low_miss_compact_plan", "low_miss_post_index"))
 def test_pipeline_options_reject_ambiguous_values_before_build(tmp_path, value, option):
     with pytest.raises(ValueError, match="must be bool"):
         build.build_libraries(cache_dir=tmp_path, cann=tmp_path, headers=tmp_path, soc="A5", **{option: value})
@@ -124,6 +124,8 @@ def test_low_miss_tail_requires_light_path_and_isolates_binary(monkeypatch, tmp_
 
 def test_auto_route_requires_complete_tail_and_isolates_binary(monkeypatch, tmp_path):
     calls = []
+    # Keep KVAF provenance fixed while checking feature-only cache isolation.
+    (tmp_path / "kvaf_batch_get_device.h").write_text('// batch_get_schedule.h\nvoid PostDirectRequests(); void WaitForCompletion();\n')
 
     def compile_command(command, **kwargs):
         calls.append(command)
@@ -193,6 +195,17 @@ def test_auto_route_requires_complete_tail_and_isolates_binary(monkeypatch, tmp_
     parallel = build.build_libraries(**args, **parallel_flags)
     compact = build.build_libraries(**args, **parallel_flags, low_miss_compact_plan=True)
     read_through = build.build_libraries(**args, **row_flags, low_miss_read_through=True)
+    post_index_flags = row_flags | dict(low_miss_direct_index=True, low_miss_post_index=True)
+    post_index = build.build_libraries(**args, **post_index_flags)
+    assert post_index not in (automatic, sparse, fast, row, direct, parallel, compact, read_through)
+    recorded = json.loads((post_index[0].parent / "complete.json").read_text())
+    assert recorded["KVIP_LOW_MISS_POST_INDEX"] == "ON"
+    assert recorded["KVIP_LOW_MISS_DIRECT_INDEX"] == "ON"
+    for name in ("AUTO_ROUTE_SIMT", "LOW_MISS_COMPACT_PLAN", "LOW_MISS_READ_THROUGH"):
+        assert recorded[f"KVIP_{name}"] == "OFF"
+    previous = len(calls)
+    assert build.build_libraries(**args, **post_index_flags) == post_index
+    assert len(calls) == previous
     assert read_through not in (automatic, sparse, fast, row, direct, parallel, compact)
     recorded = json.loads((read_through[0].parent / "complete.json").read_text())
     assert recorded["KVIP_LOW_MISS_READ_THROUGH"] == "ON"
@@ -232,6 +245,30 @@ def test_direct_index_requires_proved_streaming_path(monkeypatch, tmp_path, miss
     flags[missing] = False
     with pytest.raises(ValueError, match="low_miss_direct_index requires"):
         build.build_libraries(cache_dir=tmp_path, cann=tmp_path, headers=tmp_path,
+                              soc="A5", **flags)
+    compile_.assert_not_called()
+
+
+@pytest.mark.parametrize("fault", (
+    "auto_route", "low_miss_direct_index", "low_miss_tail", "selected_metadata",
+    "early_fetch_ready", "low_miss_read_through", "low_miss_compact_plan", "auto_route_simt", "old_kvaf",
+))
+def test_post_index_rejects_missing_contract_or_incompatible_policy_before_build(monkeypatch, tmp_path, fault):
+    compile_ = Mock()
+    monkeypatch.setattr(build.subprocess, "run", compile_)
+    flags = dict(adaptive_admission=True, low_miss_skip=True, low_miss_tail=True,
+                 selected_metadata=True, early_fetch_ready=True, ready_batch_fetch=True,
+                 auto_route=True, low_miss_sparse_init=True, auto_route_row_publish=True,
+                 low_miss_direct_index=True, low_miss_post_index=True)
+    header = tmp_path / "kvaf_batch_get_device.h"
+    header.write_text(
+        "// batch_get_schedule.h\nvoid PostDirectRequests(); void WaitForCompletion();\n"
+        if fault != "old_kvaf" else "// Missing fused-context KVAF helpers\n"
+    )
+    if fault != "old_kvaf":
+        flags[fault] = fault in ("low_miss_read_through", "low_miss_compact_plan", "auto_route_simt")
+    with pytest.raises(ValueError, match="requires|separate"):
+        build.build_libraries(cache_dir=tmp_path / "cache", cann=tmp_path, headers=tmp_path,
                               soc="A5", **flags)
     compile_.assert_not_called()
 

@@ -19,7 +19,10 @@ struct alignas(128) Args {
  uint64_t flags, eventsSrc, eventsDst, workerStatus, times;
  uint32_t history, resident, prefetchCount, maxEvents;
  uint64_t queryBitmaps, queryErrors, updateBindings, denseShadow, packedFetch;
+ // Optional invocation-local phase records, inside the existing 256-byte ABI.
+ uint64_t postIndex;
 };
+static_assert(sizeof(Args)==256,"streaming Args ABI");
 }
 
 namespace rotating {

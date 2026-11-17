@@ -22,7 +22,7 @@ def test_single_cq_owner_completion_error_and_diagnostic_lines(tmp_path, early):
     consumer = source.split("__aicore__ inline void Consumer", 1)[1]
     consumer = consumer.split(" TPipe pipe;", 1)[0]
     finalize = source.split("__aicore__ inline void FinalizeStreaming", 1)[1]
-    finalize = finalize.split(" for(uint32_t f=6;", 1)[0]
+    finalize = finalize.split(" // Post/Index has already joined", 1)[0]
     context = (KERNEL.parent / "include/context.h").read_text()
     row = "struct alignas(128) Row" + context.split("struct alignas(128) Row", 1)[1]
     row = row.split("struct alignas(128) Event", 1)[0]
@@ -85,6 +85,7 @@ void CompletePrefetch(Context*,uint32_t batch,bool spare,
 }
 #include "early_prefetch_drain.h"
 void ConsumerPrefix/*CONSUMER*/}
+template<bool ReadThrough=false,bool PostIndex=false>
 uint64_t FinalizerPrefix/*FINALIZE*/return error;}
 void reset(uint32_t batch,bool profiling,uint64_t error){
  b=batch;profile=profiling;errorToReturn=error;
@@ -129,6 +130,15 @@ int main(){
  assert(FinalizerPrefix(&a,b,0)==kvaf_device::kCqTimeout);
  assert(drains==0&&releases==0&&!flags[7].ready);
 #endif
+ // A joined Post/Index tail must not touch a prefetch CQ or require old
+ // Consumer flags, even when the binary also contains early-drain support.
+ for(unsigned batch:{0U,15U})for(bool profiling:{false,true}){
+  reset(batch,profiling,0);a.prefetchCount=profile?0x80000000U:0;role=2;
+  rows[b].pending=0;
+  assert((FinalizerPrefix<false,true>(&a,b,0)==0));
+  assert(drains==0&&releases==0&&!flags[b*kFlagCount+7].ready);
+  assert(rows[b].slots==113&&rows[b].finalHead==991&&rows[b].finalRequests==77);
+ }
 }
 """
     for name, value in (("ROW", row), ("CONSUMER", consumer), ("FINALIZE", finalize)):

@@ -19,6 +19,7 @@ extern "C" uint32_t kvip_auto_route_simt() { return KVIP_AUTO_ROUTE_SIMT; }
 extern "C" uint32_t kvip_low_miss_direct_index() { return KVIP_LOW_MISS_DIRECT_INDEX; }
 extern "C" uint32_t kvip_low_miss_compact_plan() { return KVIP_LOW_MISS_COMPACT_PLAN; }
 extern "C" uint32_t kvip_low_miss_read_through() { return KVIP_LOW_MISS_READ_THROUGH; }
+extern "C" uint32_t kvip_low_miss_post_index() { return KVIP_LOW_MISS_POST_INDEX; }
 extern "C" uint32_t kvip_init_route_profile() { return 1; }
 extern "C" uint32_t kvip_auto_route() { return KVIP_AUTO_ROUTE; }
 extern "C" uint32_t kvip_prefetch_rank() { return KVIP_PREFETCH_RANK; }
@@ -104,7 +105,11 @@ extern "C" uint32_t kvip_lifetch_streaming_forward(void* bindings,void* update,v
     if((workers!=1 && workers!=2 && workers!=4) || shape->batch*pipeline_ab::kResolveCores+4*workers>shape->aicCount*2)return 100000;
     uint32_t result=v9_init(bindings,stream,shape);
     if(!result)result=v9_li(bindings,stream,shape);
-    if(!result)result=aclrtlaunch_v9_streaming_resolve_update(shape->batch*pipeline_ab::kResolveCores+4*workers,stream,workspace);
+    uint32_t tailCores=shape->batch*pipeline_ab::kResolveCores+4*workers;
+#if KVIP_LOW_MISS_POST_INDEX
+    tailCores=2*shape->aicCount;
+#endif
+    if(!result)result=aclrtlaunch_v9_streaming_resolve_update(tailCores,stream,workspace);
     return result;
 }
 

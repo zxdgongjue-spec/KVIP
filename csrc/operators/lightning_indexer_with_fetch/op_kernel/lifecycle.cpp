@@ -191,6 +191,15 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
         }
 #endif
         if(profile) { ticks[27]=GetSystemCycle(); ticks[28]=GetSystemCycle(); }
+#if KVIP_LOW_MISS_POST_INDEX
+        // Evaluate computes one batch-wide decision. Publish it once at the
+        // existing kernel boundary; the tail does not rescan request rows.
+        if(!b && streaming && streaming->postIndex) {
+            auto decision=reinterpret_cast<__gm__ uint64_t*>(streaming->postIndex)+14;
+            *decision=noPrefetch?1U:0U;
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(decision),sizeof(uint64_t));
+        }
+#endif
         InitializeRound(rt_batch,rt_history,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b,streaming,noPrefetch
 #if KVIP_AUTO_ROUTE_SIMT
             ,parallelRoute,ticks

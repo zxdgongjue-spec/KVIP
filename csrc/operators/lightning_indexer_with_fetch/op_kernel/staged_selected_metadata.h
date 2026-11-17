@@ -63,8 +63,15 @@ inline void ClassifySelectedMetadata(uint32_t history, uint32_t resident,
 #endif
         }
         locations[i] = slot;
-        if (slot < resident) {
-            asc_atomic_or(bitmap + (threadIdx.x % shards) * words + slot / 32, 1U << (slot % 32));
+        uint32_t protectedSlot = slot;
+#if KVIP_LOW_MISS_POST_INDEX
+        // Zero-prefetch rounds repair invalid resident KV in place. Protect
+        // its Index position without claiming that its KV is already valid.
+        protectedSlot = preserveHot ? token : slot;
+#endif
+        if (protectedSlot < resident) {
+            asc_atomic_or(bitmap + (threadIdx.x % shards) * words + protectedSlot / 32,
+                          1U << (protectedSlot % 32));
         }
     }
     asc_syncthreads();

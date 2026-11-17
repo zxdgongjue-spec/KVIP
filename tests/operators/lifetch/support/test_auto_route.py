@@ -243,7 +243,7 @@ def test_auto_route_device_publication_order():
     prefix = final[:commit]
     assert prefix.rfind("CleanCacheLines(record,128)") > prefix.rfind("CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(pending),128)")
     assert prefix.rfind("CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(pending),128)") > prefix.rfind("CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(config),128)")
-    assert final.index("for(uint32_t f=6;f<12;++f)") < commit
+    assert final.index("for(uint32_t f=ReadThrough?8:6;f<12;++f)") < commit
     assert final.index("uint32_t updateError=*updateStatus") < commit
     assert "if(kvip_auto_route::Commit(config,b,error|updateError))kvaf_device::CleanCacheLines(record,128)" in final
     producer = function(source, "__aicore__ inline uint32_t Producer(")
