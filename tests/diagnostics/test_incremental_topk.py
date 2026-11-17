@@ -4,10 +4,10 @@ import pytest
 from kvip.diagnostics.incremental_topk import IncrementalTopK, simulate, verify_rank
 
 
-@pytest.mark.parametrize("window_staging", [False, True])
+@pytest.mark.parametrize("window_staging,prefilter", [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("distribution", ["uniform", "ties", "zero", "ascending", "descending"])
-def test_prefix_and_final_ranks(reverse, distribution, window_staging):
+def test_prefix_and_final_ranks(reverse, distribution, window_staging, prefilter):
     rng = np.random.default_rng(42)
     n, k = 8193, 128
     values = rng.integers(0, 65536 if distribution == "uniform" else 8, (4, n), dtype=np.uint16)
@@ -19,7 +19,7 @@ def test_prefix_and_final_ranks(reverse, distribution, window_staging):
     seed = [np.r_[np.arange(512), np.arange(n-260, len(s))] for s in scores]
     order = np.arange(512, n)[::-1 if reverse else 1]
     result = simulate(scores, seed, np.array_split(order, 8), np.arange(n) % 3 != 0,
-                      k=k, budget=31, window_budget=7, window_staging=window_staging)
+                      k=k, budget=31, window_budget=7, window_staging=window_staging, prefilter=prefilter)
     assert result["total"] == len(result["selected"]) + result["waste"]
     assert result["useful"] + result["repair"] == len(result["selected"])
     flat = sum(result["publication"], [])
@@ -104,7 +104,8 @@ def test_incremental_report_requires_oracle_and_uses_both_controls(tmp_path, cap
 
 
 @pytest.mark.parametrize("owner_format", ["packed", "separate", "both"])
-def test_frozen_archive_cpu_command(tmp_path, monkeypatch, capsys, owner_format):
+@pytest.mark.parametrize("mode", [[], ["--prefilter"]])
+def test_frozen_archive_cpu_command(tmp_path, monkeypatch, capsys, owner_format, mode):
     import json
     import sys
     from kvip.diagnostics.archive import TensorArchive
@@ -126,7 +127,7 @@ def test_frozen_archive_cpu_command(tmp_path, monkeypatch, capsys, owner_format)
     archive.save("pre.hot_valid", np.ones((2,r),dtype=np.int32))
     archive.save("pre.reserved_hot", np.full((1,r),-1,dtype=np.int32))
     (tmp_path/"manifest.json").write_text(json.dumps(manifest))
-    monkeypatch.setattr(sys, "argv", ["incremental_topk", "--snapshot", str(tmp_path)])
+    monkeypatch.setattr(sys, "argv", ["incremental_topk", "--snapshot", str(tmp_path), *mode])
     main()
     output = capsys.readouterr().out
     assert "CPU_INCREMENTAL forward PASS" in output
@@ -192,9 +193,9 @@ def test_window_report_requires_each_incremental_oracle(tmp_path, capsys):
             geometry=dict(rounds=9, token_bytes=656), timing=dict(mean_us=100,p50_us=99),
             reads_samples=[dict(prefetch=5,unused_prefetch=1,unused_prefetch_bytes=656,
                 final=3,bytes=5248,useful_transfer_bytes=4592,cold_demand=6,selected_unique=60)],
-            selection_comparison=dict(total_replacements=0))
+            selection_comparison=dict(total_replacements=0, ordered_output_sha256="same-final-ids"))
         if options_for(name)["incremental_topk"]:
-            cases[name]["incremental_check"]=dict(status="exact_prefix_ranks_and_pending")
+            cases[name]["incremental_check"]=dict(status="exact_prefix_ranks_and_pending", prefix_lists_sha256="same-windows")
     data = dict(status="pass", execution_order=list(INCREMENTAL_WINDOW_VARIANTS), cases=cases)
     path = tmp_path / "result.json"
     path.write_text(json.dumps(data))
@@ -206,3 +207,78 @@ def test_window_report_requires_each_incremental_oracle(tmp_path, capsys):
     path.write_text(json.dumps(data))
     with pytest.raises(ValueError,match="reverse-inc-register.*oracle"):
         scan_report.report(path, require_incremental_window=True)
+
+
+@pytest.mark.parametrize("count", [0, 1, 127, 128, 2047, 2048, 2049, 16384])
+def test_prefilter_exact_ids_thresholds_and_dense_fallback(count):
+    from kvip.diagnostics.incremental_topk import PrefilterWindowTopK, WindowTopK
+    rng = np.random.default_rng(177)
+    seed = np.full(16384, 30000, dtype=np.uint16)
+    indices = np.arange(16384)
+    sparse = PrefilterWindowTopK(seed, indices)
+    dense = WindowTopK(seed, indices)
+    for epoch in range(8):
+        window = rng.integers(0, sparse.threshold+1, 16384, dtype=np.uint16)
+        window[rng.permutation(16384)[:count]] = sparse.threshold+1
+        ids = np.arange(16384) + (epoch+1)*16384
+        sparse.append(window, ids)
+        dense.append(window, ids)
+        np.testing.assert_array_equal(sparse.ids, dense.ids)
+        np.testing.assert_array_equal(sparse.scores, dense.scores)
+        assert sparse.threshold == dense.threshold
+    assert sparse.dense == (8 if count > 2048 else 0)
+    assert sparse.empty == (8 if count == 0 else 0)
+
+
+def test_prefilter_q4_lists_and_traffic_identical_to_dense():
+    rng = np.random.default_rng(91)
+    n = 131584
+    scores = [rng.integers(30000, 31024, n-q, dtype=np.uint16) for q in range(4)]
+    seed = [np.r_[np.arange(16384), np.arange(130048, len(s))] for s in scores]
+    windows = np.array_split(np.arange(16384, n), 8)
+    eligible = np.arange(n) % 3 != 0
+    a = simulate(scores, seed, windows, eligible, window_staging=True)
+    b = simulate(scores, seed, windows, eligible, prefilter=True)
+    for key in ("thresholds", "publication", "selected", "prefetch", "useful", "waste", "repair", "total"):
+        assert a[key] == b[key]
+
+
+def test_prefilter_report_requires_both_oracles(tmp_path, capsys):
+    import json
+    from kvip.diagnostics import scan_report
+    from kvip.diagnostics.scan_options import INCREMENTAL_PREFILTER_VARIANTS, options_for
+    cases = {}
+    for name in INCREMENTAL_PREFILTER_VARIANTS:
+        cases[name] = dict(
+            geometry=dict(rounds=9, token_bytes=656), timing=dict(mean_us=100,p50_us=99),
+            reads_samples=[dict(prefetch=5,unused_prefetch=1,unused_prefetch_bytes=656,
+                final=3,bytes=5248,useful_transfer_bytes=4592,cold_demand=6,selected_unique=60)],
+            selection_comparison=dict(total_replacements=0, ordered_output_sha256="same-final-ids"))
+        if options_for(name)["incremental_topk"]:
+            cases[name]["incremental_check"]=dict(status="exact_prefix_ranks_and_pending", prefix_lists_sha256="same-windows")
+    data = dict(status="pass", execution_order=list(INCREMENTAL_PREFILTER_VARIANTS), cases=cases)
+    path = tmp_path / "result.json"
+    path.write_text(json.dumps(data))
+    scan_report.report(path, require_incremental_prefilter=True)
+    output = capsys.readouterr().out
+    assert "INCREMENT reverse-inc-register->reverse-inc-prefilter" in output
+    assert "CHECK window_prefix_ranks_and_pending=PASS" in output
+    assert "ordered_TopK=identical" not in output
+    del cases["reverse-inc-register"]["incremental_check"]
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="reverse-inc-register.*oracle"):
+        scan_report.report(path, require_incremental_prefilter=True)
+
+
+@pytest.mark.parametrize("key", ["prefix_lists_sha256", "ordered_output_sha256"])
+def test_prefilter_pair_rejects_different_exact_lists_or_final_order(key):
+    from copy import deepcopy
+    from kvip.diagnostics.replay_measure import verify_prefilter_equivalence
+    sample = dict(incremental_check=dict(prefix_lists_sha256="prefix"),
+                  selection_comparison=dict(ordered_output_sha256="final"))
+    cases = {name:deepcopy(sample) for name in ("reverse-inc-register", "reverse-inc-prefilter")}
+    verify_prefilter_equivalence(cases)
+    section = "incremental_check" if key == "prefix_lists_sha256" else "selection_comparison"
+    cases["reverse-inc-prefilter"][section][key] = "different"
+    with pytest.raises(AssertionError, match=key):
+        verify_prefilter_equivalence(cases)

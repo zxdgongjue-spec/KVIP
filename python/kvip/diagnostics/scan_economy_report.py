@@ -42,7 +42,10 @@ def report(cases, order):
         g = gain(t, original)
         print(f"{name:23} {t['mean_us']:8.3f} {t['p50_us']:8.3f} {g['mean_us']:10.2f} {g['p50_us']:9.2f} "
               f"{useful_prefetch(case):10.1f} {b['repair']/2**20:10.4f} {b['waste']/2**20:9.4f} {b['total']/2**20:9.4f}")
-    if "reverse-inc-register" in cases:
+    if "reverse-inc-prefilter" in cases:
+        pairs = (("reverse-inc-register", "reverse-inc-prefilter"),
+                 ("forward", "reverse-inc-prefilter"), ("reverse", "reverse-inc-prefilter"))
+    elif "reverse-inc-register" in cases:
         pairs = (("reverse-incremental", "reverse-inc-window"),
                  ("reverse-inc-window", "reverse-inc-register"),
                  ("forward", "reverse-inc-register"), ("reverse", "reverse-inc-register"))
@@ -94,7 +97,7 @@ def report(cases, order):
               f"vs_reverse_mean/p50={inc['mean_us']:+.2f}/{inc['p50_us']:+.2f}%")
     samples = cases["forward"]["reads_samples"]
     cold, selected = (mean(s[k] for s in samples) for k in ("cold_demand", "selected_unique"))
-    if "reverse-incremental" in cases:
+    if any("incremental_check" in case for case in cases.values()):
         for name in (n for n in order if not n.endswith("-end")):
             case = cases[name]
             selected = mean(r["selected_unique"] for r in case["reads_samples"])
@@ -129,6 +132,8 @@ def report(cases, order):
                 print(f"PROFILE {name} cycles_p50/max " + " ".join(fields))
         if profiled:
             print("PROFILE_SCOPE separate instrumented replay; producer=index producer (not full LI); overlapping cycles, not additive graph time")
+    if "reverse-inc-prefilter" in cases:
+        print("CHECK prefilter_vs_dense window_lists_and_final_order=IDENTICAL; actual transfer timing/counters may vary")
     print("DECISION " + ("retest_candidates="+",".join(candidates) if candidates else "keep_original_fused"))
     print("NOTE positive delta=more work/bytes; useful_pre includes all prefetch windows; no completion-overlap claim")
     if "reverse-window-fast" in cases:

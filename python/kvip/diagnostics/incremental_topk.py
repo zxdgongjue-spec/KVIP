@@ -1,6 +1,7 @@
 """CPU specification of producer-side incremental selection; no latency model."""
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -67,6 +68,34 @@ class WindowTopK(IncrementalTopK):
 
 
 
+class PrefilterWindowTopK(WindowTopK):
+    """Cheap tile cutoff, boundary compaction, bounded sparse selector input.
+
+    More than CHUNK candidates use the full fixed-position window. This is a
+    scratch-capacity fallback, never a candidate budget or a truncation.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.counts = []
+        self.dense = self.empty = self.input_items = self.control_items = 0
+
+    def append(self, scores, ids):
+        keep = scores > self.threshold
+        count = int(np.count_nonzero(keep))
+        self.counts.append(count)
+        self.compacted += count
+        self.control_items += (self.k + len(scores) + 255) // 256 * 256
+        if not count:
+            self.empty += 1
+            return
+        if count <= self.chunk:
+            scores, ids = scores[keep], ids[keep]
+        else:
+            self.dense += 1
+        self.input_items += (self.k + len(scores) + 255) // 256 * 256
+        super().append(scores, ids)
+
+
 def verify_rank(scores, ids, k=TOP):
     if len(ids) != k or len(np.unique(ids)) != k:
         raise AssertionError("Duplicate or missing TopK IDs")
@@ -75,9 +104,9 @@ def verify_rank(scores, ids, k=TOP):
         raise AssertionError("Incremental selection lost an exact TopK rank")
 
 
-def simulate(scores, seed, windows, eligible, *, k=TOP, budget=512, window_budget=64, window_staging=False):
+def simulate(scores, seed, windows, eligible, *, k=TOP, budget=512, window_budget=64, window_staging=False, prefilter=False):
     """Q4 union, immutable window lists, retained unsubmitted entries, final repair."""
-    keeper_type = WindowTopK if window_staging else IncrementalTopK
+    keeper_type = PrefilterWindowTopK if prefilter else WindowTopK if window_staging else IncrementalTopK
     keepers = [keeper_type(s[seed[q]], seed[q], k=k) for q, s in enumerate(scores)]
     seen = [set(map(int, seed[q])) for q in range(len(scores))]
     posted = set()
@@ -104,6 +133,11 @@ def simulate(scores, seed, windows, eligible, *, k=TOP, budget=512, window_budge
         prefetch=len(posted), useful=len(posted & selected), waste=len(posted - selected),
         repair=len(selected - posted), total=len(posted | selected),
         merges=sum(v.merges for v in keepers), compacted=sum(v.compacted for v in keepers),
+        window_candidates=[n for v in keepers for n in getattr(v, "counts", [])],
+        dense_windows=sum(getattr(v, "dense", 0) for v in keepers),
+        empty_windows=sum(getattr(v, "empty", 0) for v in keepers),
+        selection_items=sum(getattr(v, "input_items", 0) for v in keepers),
+        dense_selection_items=sum(getattr(v, "control_items", 0) for v in keepers),
     )
 
 
@@ -203,17 +237,24 @@ def verify(torch, bundle, archive):
     from kvip.diagnostics.archive import cpu_array
     g, scores, ends, bounds = inputs(archive)
     lists = cpu_array(torch, bundle.rotating.incremental_lists).reshape(g["batch"], 4, 9, 2080)
+    digest = hashlib.sha256()
     for row in range(g["batch"]):
         check_publications(scores[row], ends[row], g["resident"], bounds[row], lists[row],
                            eligibility(archive, row), bundle.tuning.get("reverse_cold", False))
+        for query in lists[row]:
+            for window in query:
+                count = int(window[0])
+                digest.update(window[:3].astype("<i4", copy=False).tobytes())
+                digest.update(window[32:32+count].astype("<i4", copy=False).tobytes())
     return dict(status="exact_prefix_ranks_and_pending", windows=9, queries=g["batch"]*4,
-                included_in_timing=False)
+                prefix_lists_sha256=digest.hexdigest(), included_in_timing=False)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--snapshot", type=Path, required=True)
     parser.add_argument("--window-staging", action="store_true")
+    parser.add_argument("--prefilter", action="store_true", help="Validate sparse/dense boundary selection against the whole-window control")
     args = parser.parse_args()
     from kvip.diagnostics.archive import TensorArchive
     from kvip.diagnostics.recent_threshold import recent_positions
@@ -222,16 +263,34 @@ def main():
     archive = TensorArchive(args.snapshot, manifest)
     g, scores, ends, bounds = inputs(archive)
     for reverse in (False, True):
-        merges = compacted = 0
+        merges = compacted = dense = empty = items = control_items = 0
+        candidates = []
         for row in range(g["batch"]):
             valid = [scores[row, q, :int(ends[row, q])] for q in range(4)]
             seed = [recent_positions(g["resident"], bounds[row], len(s)) for s in valid]
             windows = scan_windows(g["history"], g["resident"], ends[row], reverse)
-            result = simulate(valid, seed, windows, eligibility(archive, row), window_staging=args.window_staging)
+            result = simulate(valid, seed, windows, eligibility(archive, row),
+                              window_staging=args.window_staging, prefilter=args.prefilter)
+            if args.prefilter:
+                reference = simulate(valid, seed, windows, eligibility(archive, row), window_staging=True)
+                for key in ("thresholds", "publication", "selected", "prefetch", "useful", "waste", "repair", "total"):
+                    if result[key] != reference[key]:
+                        raise AssertionError(f"Prefilter changed exact whole-window {key} row={row} reverse={reverse}")
+                candidates.extend(result["window_candidates"])
+                dense += result["dense_windows"]
+                empty += result["empty_windows"]
+                items += result["selection_items"]
+                control_items += result["dense_selection_items"]
             assert result["total"] == len(result["selected"]) + result["waste"]
             assert result["useful"] + result["repair"] == len(result["selected"])
             merges += result["merges"]
             compacted += result["compacted"]
+        if args.prefilter:
+            print(f"CPU_PREFILTER {'reverse' if reverse else 'forward'} PASS "
+                  f"candidates_mean={np.mean(candidates):.1f} p95={np.percentile(candidates,95):.1f} "
+                  f"max={max(candidates)} dense_fallback={dense}/{len(candidates)} empty={empty} "
+                  f"selector_items_reduction={100*(1-items/control_items):.2f}% "
+                  "window_thresholds_lists_traffic=IDENTICAL_TO_DENSE timing=NOT_SIMULATED", flush=True)
         print(f"CPU_INCREMENTAL {'reverse' if reverse else 'forward'} PASS queries={g['batch']*4} window_staging={args.window_staging} cold_windows=8 exact_score_ranks=YES retry_and_traffic_identity=YES timing=NOT_SIMULATED", flush=True)
 
 

@@ -800,7 +800,20 @@ def study_cases(args):
     return {policy: {"recent_threshold": policy == "recent", "recent_skip": True} for policy in ("resident", "recent")}
 
 
+def verify_prefilter_equivalence(cases):
+    names = ("reverse-inc-register", "reverse-inc-prefilter")
+    if not all(name in cases for name in names):
+        return
+    before, after = (cases[name] for name in names)
+    for section, key in (("incremental_check", "prefix_lists_sha256"),
+                         ("selection_comparison", "ordered_output_sha256")):
+        value = before.get(section, {}).get(key)
+        if not value or value != after.get(section, {}).get(key):
+            raise AssertionError(f"Prefilter changed whole-window {key}")
+
+
 def verify_case_equivalence(cases, *, same_threshold):
+    verify_prefilter_equivalence(cases)
     first = next(iter(cases.values()))
     for case in cases.values():
         incremental = case.get("tuning", {}).get("incremental_topk", False)
