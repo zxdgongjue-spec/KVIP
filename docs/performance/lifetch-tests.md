@@ -91,7 +91,7 @@ BS、Q、序列长度、预算、窗口、seed及eager/graph覆盖均由内置ca
 | `--history / --resident / --index-heads` | synthetic默认131072 / 16384 / 32 |
 | `--trace-root / --group / --round-range` | real必填：数据目录、层组、源采集轮号闭区间（如51:51）；层投影使用输入数据已有配置 |
 | `--prefetch-tokens / --intermediate-fetches` | 默认512 / 8，记录实际窗口数 |
-| `--warmup / --iterations` | 默认4 / 20；synthetic按单轮，real按完整序列 |
+| `--warmup / --iterations` | 默认4 / 20；iterations为图内独立调用数，warmup为整图预热遍数 |
 
 synthetic参数与real选择参数二选一：real不接受合成负载参数BS/Q/history/resident/heads/seed；形状和计算输入由数据确定，不能用合成参数覆盖。裁剪BS需先用数据转换器生成对应输入。
 
@@ -151,19 +151,23 @@ synthetic参数与real选择参数二选一：real不接受合成负载参数BS/
 
 | 指标 | 口径 |
 | --- | --- |
-| 完整图 | 无详细打点的mean、p50、p99、样本数 |
+| Event均值 | 整图只测一次，event耗时除以iterations；与profiler同时采集，关闭详细设备打点 |
+| Profiler统计 | 图内每次完整调用首kernel开始至末kernel结束，含内部间隔；展示mean、p50、p99 |
+| 阶段拆解 | 同一份profiler的阶段均值；图间隙与event边界另外对账 |
 | 收益 | 1−fused_mean/serial_mean；加速比serial_mean/fused_mean |
 | 实际miss | 每请求全部Q需求并集的cold/selected；跨请求/轮先加计数再求比例 |
 | 读取量 | 实际预取、补拉及字节；不以cold数代替全部读取 |
-| real汇总 | 每轮跨重复统计、所有轮的平均、每次序列内被测图时间之和 |
+| real汇总 | 每个源轮的图内调用统计、所有源轮的平均、序列内被测图时间之和 |
 
-序列图时间之和不是含CPU间隙的服务耗时。正常完成的计时均展示mean/p50/p99及可计算的对比，即使correctness=FAIL；这类结果明确标为精度失败，不算正确实现的性能验收通过。崩溃、超时或未完成的样本不纳入完整计时统计，保留已完成样本数和失败原因，不用0补齐。URMA与UBmem的bench终端只展示运行进度、失败信息和最终性能表，不展开逐case详细摘要、读取计数或测试框架墙钟统计。已有详细信息保留在结果文件中；算法统计、阶段耗时与归因由diagnose展示，不为bench增加细粒度采集。版本、输入、配置和原始样本自动落盘。
+序列图时间之和不是含CPU间隙的服务耗时。正常完成的计时均展示mean/p50/p99及可计算的对比，即使correctness=FAIL；这类结果明确标为精度失败，不算正确实现的性能验收通过。崩溃、超时或未完成的样本不纳入完整计时统计，保留已完成样本数和失败原因，不用0补齐。URMA与UBmem的bench终端只展示运行进度、失败信息和最终性能表，不展开逐case详细摘要、读取计数或测试框架墙钟统计。已有详细信息保留在结果文件中；bench展示同次profiler的kernel阶段均值；算法统计、逐核及操作打点仍只由diagnose采集。版本、输入、配置和原始样本自动落盘。
 
 ## 6. diagnose：按等级采集
 
 ### 6.1 等级与内置内容
 
-每次diagnose先执行同配置bench作为无打点参考，再独立运行诊断。若仅结果精度失败且符合第1节的安全继续条件，继续诊断并保留correctness=FAIL；执行异常时报告已取得的计时和现场，不伪造缺失数据。all中直接复用已完成bench。诊断采样次数沿用iterations，预热沿用warmup，无额外参数。
+bench和diagnose共用一次event＋profiler性能采样，串行与融合都保存时间线。先构造iterations份独立的输入和可变缓存状态，在一张图内串行调用；每次预热前在图外恢复初态。整图预热warmup遍后，恢复初态并只重放一次进行测量。真实连续序列为每个源轮重放这张图，各独立状态保留轮间演进。
+
+Event平均值为整图时间除以iterations。Profiler平均值和p50/p99基于图内iterations次调用的完整device span，包含调用内部kernel间隔。调用之间的间隔和event两端余量保留在整图对账中，不摊成虚构的逐调用event。详细打点只在性能采样完成后额外运行，不进入上述统计。diagnose原有算法、带宽及逐核展示保留。
 
 | level | 时间信息 | 算法信息 | Fetch信息 |
 | --- | --- | --- | --- |
@@ -501,8 +505,6 @@ Level 3 的 `Per-Q prefetch rank / progress` 展示各请求、Q、窗口的 Sco
 TopK 覆盖比例和排名。仅诊断回放采集，bench 不启用这些打点。
 上述合成负载命令没有 ABC bounds；包含 ABC 的服务负载通过原有 replay 输入传入。
 
-URMA 合成负载的 bench 与 diagnose 共用 DDR/session 资源池、输入生成器及 LRU 快照恢复。
-两者均先完成串行、融合的无打点图性能采样，再执行 diagnose 的校准、profiler 和独立 Get 测试。
-每轮检查完成状态，采样前和末次采样后做完整正确性校验；check 保留逐轮完整校验。
-`sampling_protocol.json` 记录输入参数、预热/采样次数和计时边界，`report.json` 保存每次性能采样的
-`fused_read_counts`。Profiler 阶段数据仍来自独立回放，不替代完整图性能样本。
+URMA与UBmem的合成bench、diagnose复用DDR/session资源池、现有compact生成器及LRU策略。图内每次调用拥有独立的Q/Index、hot缓存和输出，DDR只读KV共用，避免后续调用变成热缓存命中。
+
+每个路径的 `diagnose/round-<源轮>/trace.json` 保存同次原始profiler时间线；`graph_event.json` 保存整图event及调用数；`graph_profile.json` 保存图内每次调用的起止、阶段耗时和统计。`full_attribution.json`（融合）及 `native_attribution.json`（串行）用于原有诊断展示。`report.json`中的event平均与profiler平均、p50/p99来自这些同次数据。

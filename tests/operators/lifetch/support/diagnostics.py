@@ -90,7 +90,9 @@ def summarize(directory, config):
     for path in paths:
         content = json.loads(path.read_text())
         samples = content['samples'] if isinstance(content, dict) else content
-        capture = dict(source=str(path), samples=[], stage_summary={})
+        capture = dict(source=str(path), samples=[], stage_summary={},
+                       graph_accounting=content.get('graph_accounting') if isinstance(content, dict) else None,
+                       graph_calls=content.get('graph_calls') if isinstance(content, dict) else None)
         detail_path = path.parent / 'detail_samples.json'
         detail_samples = json.loads(detail_path.read_text()) if detail_path.exists() and config.level >= 2 else []
         stage_values = {}
@@ -192,7 +194,9 @@ def summarize(directory, config):
     native_paths = sorted(directory.rglob('native_attribution.json'))
     for path in native_paths:
         content = json.loads(path.read_text())
-        capture = dict(source=str(path), path='serial', samples=content['samples'], stage_summary={})
+        capture = dict(source=str(path), path='serial', samples=content['samples'], stage_summary={},
+                       graph_accounting=content.get('graph_accounting') if isinstance(content, dict) else None,
+                       graph_calls=content.get('graph_calls') if isinstance(content, dict) else None)
         values = {}
         if len(content['samples']) != config.iterations:
             result['missing'].append(f'{path}: native repeat count differs from iterations')
@@ -254,7 +258,7 @@ def summarize(directory, config):
         result['trace'] = 'INCOMPLETE'
     atomic_json(directory / 'diagnostic.json', result)
     lines = [f"DIAG level={config.level} transport={config.transport} trace={result['trace']}",
-             'Separate profiled pass; times are not added across overlapping cores.',
+             'Event and profiler share the measured graph; detailed core stamps use an additional pass.',
              'Synthetic repeats restore the same state; they are not consecutive decode rounds.']
     for capture in result['captures']:
         lines.append(f"source={capture['source']}")
@@ -515,6 +519,9 @@ def algorithm_after(rotating, before):
 
 def same_replay_table(capture):
     samples = capture['samples']
+    graph_accounting = capture.get('graph_accounting')
+    if graph_accounting:
+        samples = [dict(round=0, accounting=graph_accounting)]
     names = list(dict.fromkeys(name for sample in samples
                               for name in sample.get('accounting', {}).get('stages_us', {})))
     rows = []
@@ -533,7 +540,8 @@ def same_replay_table(capture):
                      overlap, gap, boundary, total, event, total - event])
     return diagnostic_table(
         'Same-replay graph accounting (us): sum(stages) - overlap + gap + boundary = graph event. '
-        'Boundary is the event remainder, not attributed CPU time.',
+        'Boundary is the event remainder, not attributed CPU time.' +
+        (f" Graph contains {capture['graph_calls']} independent invocations." if graph_accounting else ''),
         ['Repeat', *names, 'Overlap', 'Gap', 'Boundary', 'Reconstructed', 'Graph event', 'Delta'], rows)
 
 
@@ -551,7 +559,7 @@ def level_one_tables(result):
                 *[line(row) for row in values[1:]], '']
 
     lines = [f"DIAG level=1 transport={result['transport']} trace={result['trace']}",
-             'Times: us. Separate profiled replays; synthetic repeats are not decode rounds.', '']
+             'Times: us. Event and profiler share one measured graph; invocation IDs are not decode rounds.', '']
     stages, counts, bandwidth = [], [], []
     scopes = {}
     for index, capture in enumerate(result['captures'], 1):
@@ -575,7 +583,7 @@ def level_one_tables(result):
     lines += ['ALGORITHM / KV TRAFFIC | per request, Q4 unique-demand basis.', '']
     lines += table('Per-request counts', ['Path', 'Repeat', 'Request', 'Hot', 'Demand', 'Cold',
                                           'Prefetch', 'Final', 'KV bytes'], counts)
-    lines += ['TIME BREAKDOWN | us; graph and stages below share each profiled replay. Detailed stamps OFF. The final performance table is unprofiled.', '']
+    lines += ['TIME BREAKDOWN | us; graph and stages below share each profiled replay. Detailed stamps OFF. Event mean and profiler statistics come from this same measured graph.', '']
     lines += table('Stage distribution (overlapping stages must not be added)',
                    ['Path', 'Stage', 'Mean', 'p50', 'Min', 'Max', 'N'], stages)
     for capture in result['captures']:
@@ -656,7 +664,7 @@ def resolver_phase_rows(timeline):
 
 def level_two_tables(result):
     """Same-replay tables, with no summed-overlap or synthetic decode trend."""
-    lines = ['TIME BREAKDOWN | us; graph and stages below share each profiled replay. Detailed stamps OFF. The final performance table is unprofiled.',
+    lines = ['TIME BREAKDOWN | us; graph and stages below share each profiled replay. Detailed stamps OFF. Event mean and profiler statistics come from this same measured graph.',
              'Logical block IDs, not physical core IDs. Waits include control/polling.']
     algorithm_lines = ['ALGORITHM / KV TRAFFIC | per request, Q4 unique-demand basis.',
         'Cold miss % = initial cold / unique demand; read amplification = (prefetch + final) / initial cold.',

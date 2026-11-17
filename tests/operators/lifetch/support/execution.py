@@ -243,7 +243,7 @@ def run_config(path, shared_pool=None):
     config = SimpleNamespace(**json.loads(path.read_text()))
     config.kvaf_root = Path(config.kvaf_root).resolve()
     config.output = path.parent
-    use_pool = config.mode == 'bench' or (config.mode == 'diagnose' and config.transport == 'urma')
+    use_pool = config.mode in ('bench', 'diagnose')
     if use_pool and config.input == 'synthetic' and shared_pool is None:
         pool = BenchPool(config)
         misses = config.miss_percent if isinstance(config.miss_percent, list) else [config.miss_percent]
@@ -315,7 +315,9 @@ def run_config(path, shared_pool=None):
                     detail='two independent create/Put/Get/lease/release cycles')])
         atomic_json(path.parent / 'worker-result.json', dict(exit_code=0))
         return 0
-    if config.transport == 'urma':
+    if config.mode in ('bench', 'diagnose'):
+        code = run_synthetic_batch(config, path.parent, shared_pool=shared_pool)
+    elif config.transport == 'urma':
         options = runner_options(config)
         options.shared_pool = shared_pool
         code = run_worker(options, path.parent)
@@ -3217,7 +3219,7 @@ class FusedReplayState:
     state must not have live graphs or unfinished device work.
     """
     def __init__(self, torch, runtime, table, library, initial, pages, addresses,
-                 *, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024):
+                 *, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None):
         from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
         from kvip.cache.index_storage import IndexCacheStorage
         from kvip.operators.lifetch.binding import LIFetchBinding
@@ -3241,8 +3243,9 @@ class FusedReplayState:
         output_rows = self.output.view(-1, self.token_bytes)
         stream = torch.npu.current_stream(device)
         self.workspace.inputs.prepare([4] * self.batch, query_owners=list(range(1, self.batch + 1)))
-        self.lease = (UbmemLease(torch, runtime, output_rows, stream) if ubmem
-                      else KvafGetLease(torch, runtime, library, output_rows, stream))
+        self.owns_lease = lease is None
+        self.lease = lease or (UbmemLease(torch, runtime, output_rows, stream) if ubmem
+                              else KvafGetLease(torch, runtime, library, output_rows, stream))
         try:
             if not ubmem:
                 self.workspace.allocate_rotation(
@@ -3251,7 +3254,8 @@ class FusedReplayState:
             binding = dict(
                 query_ends=self.workspace.inputs.query_ends.view(self.batch, 4),
                 hot_valid=self.storage.hot_valid, row_owners=self.workspace.inputs.row_owners,
-                token_addresses=self.storage.addresses, tail_bounds=self.workspace.tail_bounds,
+                token_addresses=self.storage.addresses,
+                tail_bounds=self.workspace.tail_bounds if g.get("sparse_mode", 3) else None,
                 output_stride=self.stride, scratch=self.workspace.scratch,
             )
             if ubmem:
@@ -3280,7 +3284,8 @@ class FusedReplayState:
             self.forward = StreamingForward(self.rotating, self.update, torch, prefetch_tokens)
             self.reset()
         except BaseException:
-            self.lease.close()
+            if self.owns_lease:
+                self.lease.close()
             raise
 
     def upload(self, target, array):
@@ -3333,6 +3338,8 @@ class FusedReplayState:
         self.upload(self.workspace.tail_bounds, inputs.tail_bounds)
         for row, (begin, end) in enumerate(inputs.tail_bounds):
             ids = np.arange(int(begin), int(end))
+            if not len(ids):
+                continue
             capacity = self.stride - self.resident
             if capacity <= 0 or len(ids) > capacity:
                 raise ValueError('Captured ABC range exceeds replay output stride')
@@ -3489,7 +3496,8 @@ class FusedReplayState:
         assert not failures, f'Replay round={inputs.source_round}: ' + '; '.join(failures)
 
     def close(self):
-        self.lease.close()
+        if self.owns_lease:
+            self.lease.close()
 
 
 class NativeReplayState:
@@ -3514,7 +3522,7 @@ class NativeReplayState:
         self.query_scale = torch.empty((self.batch, 4, heads), dtype=torch.float32, device=device)
         lengths = torch.full((self.batch,), self.history, dtype=torch.int32, device=device)
         self.fixture = dict(
-            sparse_mode=3, query=self.query, key=self.keys.view(torch.float8_e4m3fn).reshape(-1, 128, 1, 128),
+            sparse_mode=g.get('sparse_mode', 3), query=self.query, key=self.keys.view(torch.float8_e4m3fn).reshape(-1, 128, 1, 128),
             actual_query=torch.arange(1, self.batch + 1, dtype=torch.int32, device=device) * 4,
             actual_key=lengths, li_query_lengths=torch.full((self.batch,), 4, dtype=torch.int32, device=device),
             block_table=torch.arange(self.batch * self.history // 128, dtype=torch.int32, device=device).reshape(self.batch, -1),
@@ -3524,10 +3532,11 @@ class NativeReplayState:
         for row in range(self.batch):
             hot = initial.captured_hot_valid[row] != 0
             mapping[row, initial.captured_layout[row, :self.resident][hot]] = np.flatnonzero(hot)
-        session = SimpleNamespace(
-            runtime=runtime, device_table=table, batch_get_attempted=False,
-            cpu_payload=torch.from_numpy(np.stack([pages.token_payload(row, np.arange(self.history))
-                                                  for row in range(self.batch)])))
+        if not hasattr(pages, 'cpu_payload'):
+            pages.cpu_payload = torch.from_numpy(np.stack([
+                pages.token_payload(row, np.arange(self.history)) for row in range(self.batch)]))
+        session = SimpleNamespace(runtime=runtime, device_table=table, batch_get_attempted=False,
+                                  cpu_payload=pages.cpu_payload)
         owner = SimpleNamespace(batch=self.batch, resident_budget=self.stride,
                                 cache_map=torch.from_numpy(mapping).to(device), lease=None, session=session)
         self.native = NativeMtp(torch, device, owner, self.fixture, source_tokens=self.history,
@@ -3562,7 +3571,7 @@ class NativeReplayState:
         self.upload(self.weights.view(self.torch.int16), inputs.weights.view(np.int16))
         self.upload(self.query_scale, inputs.query_scale)
         # Native sparse mode aligns Q4 to the final key length.
-        if not np.all(np.diff(inputs.query_ends, axis=1) == 1):
+        if self.fixture['sparse_mode'] == 3 and not np.all(np.diff(inputs.query_ends, axis=1) == 1):
             raise ValueError('Native replay requires consecutive causal Q4 positions')
         self.upload(self.fixture['actual_key'], inputs.query_ends[:, -1])
         forward = self.native.forward.cpu().numpy()
@@ -3574,6 +3583,8 @@ class NativeReplayState:
             forward[row, forward[row] >= self.resident] = -1
             reverse[row, self.resident:] = -1
             ids = np.arange(int(begin), int(end))
+            if not len(ids):
+                continue
             if tail_capacity <= 0 or len(ids) > tail_capacity:
                 raise ValueError('Native replay ABC exceeds bound output')
             slots = self.resident + ids % tail_capacity
@@ -3621,7 +3632,182 @@ class NativeReplayState:
         pass  # No lease: caller owns the ordinary KVAF Runtime and table.
 
 
-def run_path(config, directory, sequence, pages, *, fused, round_check=None):
+def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
+    """One graph contains iterations independent cache states, reused per round."""
+    from contextlib import ExitStack
+    from diagnostics import algorithm_before, algorithm_after
+    from performance import profile_graph_batch
+    directory = Path(directory)
+    stream = torch.npu.current_stream(states[0].device)
+    graph = torch.npu.NPUGraph()
+    capture = torch.npu.Stream()
+    checks = CorrectnessRecorder()
+    pending = False
+    def replay():
+        nonlocal pending
+        pending = True
+        graph.replay()
+    class TrackedGraph:
+        def replay(self):
+            replay()
+        def completed(self):
+            nonlocal pending
+            pending = False
+    def validate_all(inputs, label):
+        nonlocal pending
+        pending = True
+        for i, state in enumerate(states):
+            checks.check(f'{label}/input{i}/round{inputs.source_round}', lambda state=state: state.validate(inputs))
+        pending = False
+    try:
+        for state in states:
+            state.reset()
+            if fused:
+                state.forward.set_diagnostics(False)
+        stream.synchronize()
+        with ExitStack() as scopes:
+            if fused:
+                for lease in {id(state.lease): state.lease for state in states}.values():
+                    scopes.enter_context(lease.capture_scope())
+            pending = True
+            with torch.npu.graph(graph, stream=capture):
+                for state in states:
+                    state.forward()
+            capture.synchronize()
+            pending = False
+        if fused:
+            for lease in {id(state.lease): state.lease for state in states}.values():
+                if hasattr(lease, "retain_graph"):
+                    lease.retain_graph(graph)
+        for warmup in range(config.warmup):
+            for state in states:
+                state.reset()
+            for inputs in sequence:
+                for state in states:
+                    state.prepare(inputs)
+                stream.synchronize()
+                replay()
+                stream.synchronize()
+                validate_all(inputs, f'warmup{warmup}')
+        for state in states:
+            state.reset()
+        rounds = {}
+        for inputs in sequence:
+            before = []
+            for state in states:
+                state.prepare(inputs)
+                if fused and config.mode == 'diagnose':
+                    initial = algorithm_before(state.rotating)
+                    initial['logical_ids'] = state.input_layout.copy()
+                    before.append(initial)
+            stream.synchronize()
+            folder = directory / 'diagnose' / f'round-{inputs.source_round}'
+            measured = profile_graph_batch(torch, TrackedGraph(), calls=len(states), folder=folder,
+                                           serial=not fused, transport=config.transport, stream=stream)
+            validate_all(inputs, 'measured')
+            rounds[inputs.source_round] = measured['timing']
+            samples = []
+            for i, item in enumerate(measured['samples']):
+                accounting = dict(item, kernel_span_us=item['us'], event_us=None,
+                                  boundary_residual_us=None, timing_source='profiler invocation')
+                sample = dict(round=i, repeat=i, source_round=inputs.source_round,
+                              us=item['us'], accounting=accounting)
+                if before:
+                    sample['algorithm'] = algorithm_after(states[i].rotating, before[i])
+                    totals = sample['algorithm'].get('totals', {})
+                    sample.update(prefetch=totals.get('prefetch'), final=totals.get('final'))
+                samples.append(sample)
+            atomic_json(folder / ('full_attribution.json' if fused else 'native_attribution.json'),
+                        dict(path='fused' if fused else 'serial', samples=samples,
+                             graph_accounting=measured['accounting'], graph_calls=len(states),
+                             timing=measured['timing'], trace=measured['trace']))
+        # Detailed stamps are additional diagnostics, never performance samples.
+        if fused and config.mode == 'diagnose' and config.level >= 2:
+            clock_mhz = states[0].forward.calibrate_counter_mhz()
+            for state in states:
+                state.reset()
+                state.forward.counter_clock_mhz = clock_mhz
+                state.forward.set_diagnostics(True)
+            for inputs in sequence:
+                for state in states:
+                    state.prepare(inputs)
+                    state.forward.times.zero_()
+                    if hasattr(state.rotating, 'rank_progress'):
+                        state.rotating.rank_progress.zero_()
+                stream.synchronize()
+                replay()
+                stream.synchronize()
+                validate_all(inputs, 'detail')
+                from diagnostics import decode_rank_progress
+                details = []
+                for i, state in enumerate(states):
+                    sample = dict(round=i, source_round=inputs.source_round,
+                                  streaming_cycles=state.forward.diagnostic_cycles())
+                    if hasattr(state.rotating, 'rank_progress'):
+                        records = state.rotating.rank_progress.cpu().tolist()
+                        bounds = state.rotating.query_ends.cpu().tolist()
+                        sample['rank_progress'] = [
+                            [b, q + 1, epoch, *decode_rank_progress(word, bounds[b][q])]
+                            for b, queries in enumerate(records) for q, epochs in enumerate(queries)
+                            for epoch, word in enumerate(epochs[:state.rotating.rounds]) if word]
+                    details.append(sample)
+                atomic_json(directory / 'diagnose' / f'round-{inputs.source_round}' / 'detail_samples.json', details)
+        if fused and config.mode == 'diagnose' and config.level == 3 and config.transport == 'urma' and 'fetch' in config.stages:
+            from performance import compare_fetch_only
+            first = states[0]
+            first.forward.set_diagnostics(False)
+            first.reset()
+            first.prepare(next(iter(sequence)))
+            initial_output = first.output.clone()
+            pending = True
+            first.forward()
+            stream.synchronize()
+            first.validate(next(iter(sequence)))
+            pending = False
+            isolated_graphs = []
+            def mark_launched():
+                nonlocal pending
+                pending = True
+            def mark_completed(**kwargs):
+                nonlocal pending
+                pending = False
+            owner = SimpleNamespace(output=first.output, initial_output=initial_output,
+                                    abi_sizes=first.lease.sizes, graphs=isolated_graphs,
+                                    mark_launched=mark_launched, mark_completed=mark_completed)
+            try:
+                rows = compare_fetch_only(torch, owner, first.rotating, first.forward, config)
+                atomic_json(directory / 'diagnose' / 'fetch_only.json', dict(status='PASS', rows=rows))
+            finally:
+                stream.synchronize()
+                for isolated in isolated_graphs:
+                    isolated.reset()
+        all_spans = [v for timing in rounds.values() for v in timing['samples_us']]
+        event_mean = sum(t['mean_us'] for t in rounds.values()) / len(rounds)
+        overall = timing_summary(all_spans)
+        overall.update(profiler_mean_us=overall['mean_us'], mean_us=event_mean,
+                       event_mean_us=event_mean, measured_graphs=len(rounds),
+                       graph_calls=len(states), timing_protocol='one_profiled_graph',
+                       stage_mean_us={stage: sum(t['stage_mean_us'].get(stage, 0.) for t in rounds.values())/len(rounds)
+                                      for stage in dict.fromkeys(s for t in rounds.values() for s in t['stage_mean_us'])},
+                       inter_kernel_gap_mean_us=sum(t['inter_kernel_gap_mean_us'] for t in rounds.values())/len(rounds),
+                       overlap_mean_us=sum(t['overlap_mean_us'] for t in rounds.values())/len(rounds),
+                       outside_invocations_mean_us=sum(t['outside_invocations_mean_us'] for t in rounds.values())/len(rounds))
+        return dict(rounds=rounds, all_rounds=overall, correctness=checks.status,
+                    failures=checks.failures, sequence_graph_sum=dict(
+                        mean_us=sum(t['mean_us'] for t in rounds.values()), samples=1))
+    except BaseException as error:
+        if pending:
+            NativeFetchSession.quarantine('batched_replay_completion_uncertain', error)
+        raise
+    finally:
+        if not pending:
+            if fused:
+                for state in states:
+                    state.forward.set_diagnostics(False)
+            graph.reset()
+
+
+def run_path(config, directory, sequence, pages, *, fused, round_check=None, shared_pool=None):
     import acl
     import kvaf
     import torch
@@ -3651,8 +3837,11 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
         kwargs['transport'] = 'ubmem'
     else:
         kwargs['jettys_per_core'] = 2
-    runtime = kvaf.NpuRuntime(str(build / 'bin/kvaf_execute_batch_get_kernels.o'), width, 128, **kwargs)
+    borrowed = shared_pool.borrow(torch, device, g['batch'], g['history'], workers) if shared_pool else None
+    runtime = borrowed.runtime if borrowed else kvaf.NpuRuntime(
+        str(build / 'bin/kvaf_execute_batch_get_kernels.o'), width, 128, **kwargs)
     state = graph = table = None
+    batch_states = []
     pending = False
     def replay_stage(label):
         progress(directory.parent, f"REPLAY {'fused' if fused else 'serial'}: {label}")
@@ -3661,20 +3850,24 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
         block_bytes = 128 * width
         slot_bytes = ((block_bytes + 4095) // 4096 * 4096
                       if config.transport == 'ubmem' else block_bytes)
-        runtime.link_to(config.kvaf_server)
-        runtime.initialize((pages.page_count + 2) * slot_bytes, slot_bytes)
-        # Reuse Runtime Put; bounded source buffers avoid a multi-GB staging copy.
-        for begin in range(0, pages.page_count, 128):
-            ids = list(range(begin, min(begin + 128, pages.page_count)))
-            source = torch.from_numpy(pages.page_payload(ids)).to(device)
-            pending = True
-            runtime.batch_put(ids, source, [n * block_bytes for n in range(len(ids))],
-                              [block_bytes] * len(ids))
-            stream.synchronize()
-            pending = False
-        replay_stage('DDR Put completed; access table and binding')
-        table = runtime.prepare_access_table(list(range(pages.page_count)))
-        view = runtime.access_table_view(table, device='npu')
+        if borrowed:
+            table, view = borrowed.table, borrowed.device_table
+            pages.cpu_payload = borrowed.cpu_payload
+        else:
+            runtime.link_to(config.kvaf_server)
+            runtime.initialize((pages.page_count + 2) * slot_bytes, slot_bytes)
+            # Reuse Runtime Put; bounded source buffers avoid a multi-GB staging copy.
+            for begin in range(0, pages.page_count, 128):
+                ids = list(range(begin, min(begin + 128, pages.page_count)))
+                source = torch.from_numpy(pages.page_payload(ids)).to(device)
+                pending = True
+                runtime.batch_put(ids, source, [n * block_bytes for n in range(len(ids))],
+                                  [block_bytes] * len(ids))
+                stream.synchronize()
+                pending = False
+            replay_stage('DDR Put completed; access table and binding')
+            table = runtime.prepare_access_table(list(range(pages.page_count)))
+            view = runtime.access_table_view(table, device='npu')
         indices = torch.from_numpy(pages.page_indices.reshape(-1).astype(np.int64)).to(device)
         # Native LIDU addresses logical request pages; aliases repeat addresses.
         expanded = SimpleNamespace(addresses=view.addresses[indices].contiguous(),
@@ -3695,6 +3888,19 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
                 prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024))
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
+        if config.mode in ('bench', 'diagnose') and g.get('sparse_mode') == 0 and not fused:
+            from kvip.cache.lru import SlotLRU
+            selected = state.native_li(torch_npu, state.fixture).cpu().numpy().reshape(g['batch'], -1)
+            chains = []
+            for ids in selected:
+                policy = SlotLRU(); policy.resize(g['resident'], g['resident'])
+                policy.commit(ids[ids < g['resident']])
+                chain = []; slot = int(policy.head[0])
+                while slot >= 0:
+                    chain.append(slot); slot = int(policy.next[0, slot])
+                chains.append(chain)
+            initial.captured_lru = np.asarray(chains, dtype=np.int32)
+            state.reset()
         if fused:
             state.failure_directory = directory
         replay_stage('binding and initial inputs ready')
@@ -3717,6 +3923,29 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
         stream.synchronize()
         replay_stage('first eager completed; correctness check')
         checks.check('eager', lambda: validate(initial))
+        if config.mode in ('bench', 'diagnose'):
+            batch_states.append(state)
+            for _ in range(1, config.iterations):
+                if fused:
+                    replica = FusedReplayState(
+                        torch, runtime, view, library, initial, pages, logical_addresses,
+                        device=device, aics=aics, windows=config.intermediate_fetches,
+                        prefetch_tokens=config.prefetch_tokens, soc=soc,
+                        prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease)
+                    replica.failure_directory = directory
+                else:
+                    replica = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
+                batch_states.append(replica)
+            replay_stage(f'one graph with {len(batch_states)} independent inputs; event + profiler')
+            result = measure_replay_batch(torch, batch_states, sequence, config, directory, fused=fused)
+            if checks.failures:
+                result['correctness'] = 'FAIL'
+                result['failures'] = checks.failures + result['failures']
+            result.update(transport=config.transport, path='fused' if fused else 'serial',
+                          runtime_workers=shared_pool.workers if borrowed else workers, geometry=g,
+                          input_paths=[str(ref.manifest_path) for refs in sequence.rounds for ref in refs])
+            atomic_json(directory / 'path_result.json', result)
+            return result
         state.reset()
         stream.synchronize()
         graph = torch.npu.NPUGraph()
@@ -3778,12 +4007,90 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
         if not pending:
             if graph is not None:
                 graph.reset()
+            for replica in reversed(batch_states[1:]):
+                replica.close()
             if state is not None:
                 state.close()
-            if table is not None:
-                runtime.release_access_table(table)
-            if runtime.initialized:
-                runtime.shutdown()
+            if borrowed:
+                shared_pool.release()
+            else:
+                if table is not None:
+                    runtime.release_access_table(table)
+                if runtime.initialized:
+                    runtime.shutdown()
+
+
+def run_synthetic_batch(config, directory, *, shared_pool=None):
+    """Keep the compact fixture; benchmark it through independent state slots."""
+    from workloads import prepare_compact_fixture, ReplayRound
+    from kvip.cache.lru import SlotLRU
+    directory = Path(directory)
+    fixture = directory / 'fixture'
+    key = ('graph_batch', config.history, config.resident, config.miss_percent,
+           config.index_heads, config.seed)
+    pool = shared_pool or BenchPool(config)
+    owns_pool = shared_pool is None
+    if key in pool.fixtures:
+        fixture = pool.fixtures[key]
+    else:
+        prepare_compact_fixture(fixture, config.history, config.resident, config.miss_percent,
+                                config.index_heads, config.seed)
+        pool.fixtures[key] = fixture
+    h, r, heads = config.history, config.resident, config.index_heads
+    # The previous synthetic runner treats physical fixture rows as logical
+    # tokens. Preserve that identity and the exact Q/Index/scale bit patterns.
+    order = np.load(fixture / 'physical_to_logical.npy')
+    scores = np.load(fixture / 'logical_scores.npy')[:, order]
+    keys = np.fromfile(fixture / 'arg1.bin', np.uint8).reshape(h, 128)
+    scales = np.fromfile(fixture / 'arg4.bin', np.float32)
+    query = np.fromfile(fixture / 'arg0.bin', np.uint8).reshape(4, heads, 128)
+    weights = (np.fromfile(fixture / 'arg2.bin', np.float32).view(np.uint32) >> 16).astype(np.uint16).reshape(4, heads)
+    qscale = np.fromfile(fixture / 'arg3.bin', np.float32).reshape(4, heads)
+    selected = np.argpartition(scores, -TOPK, axis=1)[:, -TOPK:].reshape(-1)
+    policy = SlotLRU(); policy.resize(r, r); policy.commit(selected[selected < r].astype(np.int32))
+    chain = []; slot = int(policy.head[0])
+    while slot >= 0:
+        chain.append(slot); slot = int(policy.next[0, slot])
+    failed = False
+    try:
+        for batch in config.batches:
+            def rows(value):
+                return np.broadcast_to(value, (batch, *value.shape))
+            g = dict(batch=batch, history=h, resident=r, heads=heads, token_bytes=TOKEN_BYTES,
+                     output_stride=r, sparse_mode=0)
+            inputs = ReplayRound(1, 1, tuple((0, str(i), i+1) for i in range(batch)), g,
+                rows(keys), rows(scales), rows(query), rows(weights), rows(qscale),
+                np.full((batch, 4), h, np.int32), np.zeros((batch, 2), np.int32),
+                np.ones((batch, h), np.uint8), tuple(tuple(None for _ in range(h//128)) for _ in range(batch)),
+                rows(np.arange(h)), np.ones((batch, r), np.int32), rows(np.asarray(chain, np.int32)),
+                (str(fixture),), rows(scores), np.ones((batch, 4, h), bool))
+            class Sequence:
+                rounds = ((SimpleNamespace(source_round=1, manifest_path=fixture/'fixture.json'),),)
+                def __iter__(self):
+                    yield inputs
+            sequence = Sequence()
+            pages = ReplayPagePlan(sequence)
+            # Shared DDR already holds payload(request, token), as before.
+            from workloads import payload
+            pages.token_payload = lambda row, ids: payload(row, np.asarray(ids))
+            folder = directory / f'case-b{batch}'
+            results = {}
+            for name in ('serial', 'fused'):
+                results[name] = run_path(config, folder / name, sequence, pages,
+                                         fused=name == 'fused', shared_pool=pool)
+                report = dict(batch=batch, miss_percent=config.miss_percent, input='synthetic',
+                              correctness='NOT_RUN', execution='INCOMPLETE',
+                              timing={'native_chain': results['serial']['all_rounds']})
+                if 'fused' in results:
+                    report.update(execution='COMPLETED', correctness='PASS' if all(
+                        result['correctness']=='PASS' for result in results.values()) else 'FAIL')
+                    report['timing']['prototype_with_update'] = results['fused']['all_rounds']
+                atomic_json(folder / 'report.json', report)
+            failed |= report['correctness'] != 'PASS'
+        return int(failed)
+    finally:
+        if owns_pool:
+            pool.close()
 
 
 def run_real(config, directory):

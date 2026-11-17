@@ -135,8 +135,8 @@ def configuration(argv=None):
             command.add_argument('--prefetch-rank-start', type=int, default=1024,
                                  help='URMA initial admission rank (1..2048); progresses to 2048 by per-Q coverage')
             command.add_argument('--intermediate-fetches', type=int, default=8)
-            command.add_argument('--warmup', type=int, default=4)
-            command.add_argument('--iterations', type=int, default=20)
+            command.add_argument('--warmup', type=int, default=4, help='whole-graph warmup repetitions')
+            command.add_argument('--iterations', type=int, default=20, help='independent complete invocations captured in one measured graph')
         if mode == 'diagnose':
             command.add_argument('--level', type=int, choices=(1, 2, 3), default=1)
             command.add_argument('--stages', type=csv_values, default=('all',))
