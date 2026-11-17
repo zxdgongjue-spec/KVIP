@@ -190,7 +190,7 @@ def create_fused(
             raise ValueError("This snapshot uses sequence-split LI; reverse scan is not implemented for that schedule")
         if build_options.get("compact_out_of_place") and (b > 16 or 2 * b > aics or g["heads"] != 32):
             raise ValueError("Disjoint compact scratch requires H32 split-Q B1..16")
-        if build_options.get("rolling_threshold"):
+        if build_options.get("rolling_threshold") or build_options.get("incremental_topk"):
             import numpy as np
 
             if b > 16 or 2 * b > aics:
@@ -204,6 +204,8 @@ def create_fused(
             counts = np.maximum(0, np.minimum(bounds[:, 1, None], ends) - np.maximum(bounds[:, 0, None], r))
             if r % 16 or r < 2048 or np.any(ends < r) or np.any((r + counts + 255)//256*256 > 18432):
                 raise ValueError("Rolling experiment requires every query to use the resident+recent exact-Kth seed")
+            if build_options.get("incremental_topk") and (rounds != 9 or r != 16384 or g["heads"] != 32):
+                raise ValueError("Incremental selection requires resident16384, H32 and eight cold windows")
         ends = archive.array("pre.query_ends").reshape(b, 4).min(axis=1)
         if ((ends // 2048) * 2048 <= ((r + 2047) // 2048) * 2048).any():
             raise ValueError("Snapshot has no full causal cold blocks to reverse")

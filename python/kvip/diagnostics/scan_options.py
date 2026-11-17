@@ -1,6 +1,6 @@
 """Independent URMA scan-order/admission experiment; no graph-route changes."""
 
-OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill", "compact_out_of_place", "rolling_reuse_seed", "rolling_fast_path", "rolling_sparse", "rolling_boundary")
+OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill", "compact_out_of_place", "rolling_reuse_seed", "rolling_fast_path", "rolling_sparse", "rolling_boundary", "incremental_topk")
 DEFAULT_VARIANTS = ("forward", "reverse", "forward-wide", "reverse-wide", "forward-end")
 VARIANTS = {name: ("reverse_cold",) if name.startswith("reverse") else () for name in DEFAULT_VARIANTS}
 ROLLING_VARIANTS = ("forward", "reverse", "reverse-roll", "reverse-refilter", "forward-refilter", "forward-end")
@@ -88,6 +88,10 @@ VARIANTS["reverse-boundary"] = tuple(
 )
 
 
+INCREMENTAL_VARIANTS = ("forward", "reverse", "reverse-incremental", "reverse-end", "forward-end")
+VARIANTS["reverse-incremental"] = ("reverse_cold", "incremental_topk")
+
+
 def options_for(name):
     return {key: key in VARIANTS[name] for key in OPTIONS}
 
@@ -109,6 +113,8 @@ def validate_options(options):
         raise ValueError("Scan experiment options do not match the selected native interface")
     if any(type(value) is not bool for value in options.values()):
         raise ValueError("Scan build options must be bool")
+    if options["incremental_topk"] and (options["rolling_threshold"] or options["window_refilter"]):
+        raise ValueError("Incremental TopK replaces rolling/refilter")
     if (options["window_refilter"] or options["rolling_batched"] or options["rolling_windowed"]) and not options["rolling_threshold"]:
         raise ValueError("Window refilter requires rolling threshold")
     if options["rolling_batched"] and options["rolling_windowed"]:

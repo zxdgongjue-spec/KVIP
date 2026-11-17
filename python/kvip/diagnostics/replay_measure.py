@@ -237,6 +237,10 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         from kvip.diagnostics.threshold_check import verify_initial_threshold
 
         bundle.threshold_comparison = verify_initial_threshold(torch, bundle, archive)
+        if bundle.tuning.get("incremental_topk"):
+            from kvip.diagnostics.incremental_topk import verify as verify_incremental
+
+            bundle.incremental_check = verify_incremental(torch, bundle, archive)
         if bundle.tuning.get("rolling_threshold"):
             from kvip.diagnostics.rolling_check import verify as verify_rolling
 
@@ -677,6 +681,8 @@ def measure_case(args, archive, context, retained):
             result["score_comparison"] = score_reference_result
         result["tuning"] = dict(bundle.tuning)
         result["threshold_comparison"] = bundle.threshold_comparison
+        if incremental_check := getattr(bundle, "incremental_check", None):
+            result["incremental_check"] = incremental_check
         if rolling_check := getattr(bundle, "rolling_threshold_check", None):
             result["rolling_threshold_check"] = rolling_check
         result["prefetch_admission_accounting"] = ADMISSION_ACCOUNTING
@@ -797,9 +803,18 @@ def study_cases(args):
 def verify_case_equivalence(cases, *, same_threshold):
     first = next(iter(cases.values()))
     for case in cases.values():
-        if (
+        incremental = case.get("tuning", {}).get("incremental_topk", False)
+        if incremental:
+            # The actual native score table and each selected rank have already
+            # been checked by verify_fused_scores. Arrival-order kth ties can
+            # legitimately differ after final TopK reuse; report that explicitly.
+            selection = case["selection_comparison"]
+            if selection.get("status") not in ("exact", "verified_bf16_boundary_ties"):
+                raise AssertionError("Incremental selection lacks exact full-score rank verification")
+        if (not incremental and
             case["selection_comparison"]["ordered_output_sha256"]
             != first["selection_comparison"]["ordered_output_sha256"]
+            and not first.get("tuning", {}).get("incremental_topk", False)
         ):
             raise AssertionError("Seed A/B changed the final ordered TopK outputs")
         if same_threshold and any(

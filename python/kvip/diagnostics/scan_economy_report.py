@@ -42,7 +42,9 @@ def report(cases, order):
         g = gain(t, original)
         print(f"{name:23} {t['mean_us']:8.3f} {t['p50_us']:8.3f} {g['mean_us']:10.2f} {g['p50_us']:9.2f} "
               f"{useful_prefetch(case):10.1f} {b['repair']/2**20:10.4f} {b['waste']/2**20:9.4f} {b['total']/2**20:9.4f}")
-    if "reverse-boundary" in cases:
+    if "reverse-incremental" in cases:
+        pairs = (("forward", "reverse-incremental"), ("reverse", "reverse-incremental"))
+    elif "reverse-boundary" in cases:
         pairs = (("reverse", "reverse-window-fast"),
                  ("reverse-window-fast", "reverse-boundary-ref"),
                  ("reverse-boundary", "reverse-boundary-ref"))
@@ -88,7 +90,17 @@ def report(cases, order):
               f"vs_reverse_mean/p50={inc['mean_us']:+.2f}/{inc['p50_us']:+.2f}%")
     samples = cases["forward"]["reads_samples"]
     cold, selected = (mean(s[k] for s in samples) for k in ("cold_demand", "selected_unique"))
-    print(f"CHECK ordered_TopK=identical initial/final_thresholds=identical cold_miss={100*cold/selected:.4f}%")
+    if "reverse-incremental" in cases:
+        for name in ("forward", "reverse", "reverse-incremental"):
+            case = cases[name]
+            selected = mean(r["selected_unique"] for r in case["reads_samples"])
+            cold = mean(r["cold_demand"] for r in case["reads_samples"])
+            check = case["selection_comparison"]
+            print(f"CHECK {name} full_score_ranks=PASS cold_miss={100*cold/selected:.4f}% "
+                  f"cold={cold:.0f} selected={selected:.0f} archive_tie_replacements={check['total_replacements']}")
+        print("CHECK window_prefix_ranks_and_pending=PASS initial/final_thresholds=identical; incremental kth ties may change ID/order; actual demand used per case")
+    else:
+        print(f"CHECK ordered_TopK=identical initial/final_thresholds=identical cold_miss={100*cold/selected:.4f}%")
     for name in order:
         check = cases[name].get("rolling_threshold_check")
         if check:
