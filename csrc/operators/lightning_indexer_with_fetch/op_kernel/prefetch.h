@@ -393,14 +393,21 @@ inline void PrepareCandidateWqes(uint32_t rt_resident,__ubuf__ uint32_t* ids,__u
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void UnionColdTopk(__ubuf__ uint32_t* input,__ubuf__ uint32_t* bits,
     __ubuf__ uint32_t* ids,__ubuf__ uint32_t* cfg,uint32_t stride,
-    uint32_t n0,uint32_t n1,uint32_t n2,uint32_t n3,uint32_t limit,uint32_t words,bool last) {
+    uint32_t n0,uint32_t n1,uint32_t n2,uint32_t n3,uint32_t limit,uint32_t words,bool last,
+    __gm__ uint32_t* mapping) {
     uint32_t tid=threadIdx.x,lane=tid%32;
     for(uint32_t i=tid;i<4*stride;i+=256) {
         uint32_t q=i/stride,j=i%stride,n=q==0?n0:q==1?n1:q==2?n2:n3;
         bool fresh=false;uint32_t token=0;
         if(j<n) {
-            token=input[i];uint32_t bit=1U<<(token%32);
-            fresh=(asc_atomic_or(bits+token/32,bit)&bit)==0;
+            token=input[i];
+            // The predecessor service is joined before this window. Its map
+            // is authoritative even when the exported eligibility is stale.
+            // Never create a second Index exchange for an admitted source.
+            if(token/32<words && asc_ldcg(mapping+token)==UINT32_MAX){
+                uint32_t bit=1U<<(token%32);
+                fresh=(asc_atomic_or(bits+token/32,bit)&bit)==0;
+            }
         }
         uint32_t mask=asc_ballot(fresh),base=0;
         if(!lane && mask)base=asc_atomic_add(cfg+40,uint32_t(__popc(mask)));
@@ -501,7 +508,8 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
                 reinterpret_cast<__ubuf__ uint32_t*>(input.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),width,n[0],n[1],n[2],n[3],available<kCandidateCapacity?available:kCandidateCapacity,rt_history/32,start+256>=maxCount);
+                reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),width,n[0],n[1],n[2],n[3],available<kCandidateCapacity?available:kCandidateCapacity,rt_history/32,start+256>=maxCount,
+                reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+uint64_t(b)*rt_history);
         }
         SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
         candidateCount=cfg.GetValue(40);if(candidateCount>kCandidateCapacity)candidateCount=kCandidateCapacity;
