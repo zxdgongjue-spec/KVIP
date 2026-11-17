@@ -55,28 +55,27 @@ __simd_callee__ inline void CountBelowBin(RegTensor<uint16_t>& result,
 // thresholds that would leave it are conservatively capped at its upper end.
 __simd_callee__ inline void ExportRollingSeed(__ubuf__ uint16_t* state,
     RegTensor<uint16_t>& lower, RegTensor<uint16_t>& upper,
-    RegTensor<uint16_t>& previous, RegTensor<uint16_t>& key, uint16_t count) {
+    RegTensor<uint16_t>& rank, RegTensor<uint16_t>& key) {
     auto all = CreateMask<uint16_t, MaskPattern::ALL>();
-    StoreAlign(state, lower, all); StoreAlign(state + 128, upper, all);
-    LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
     RegTensor<int16_t> sequence; Arange(sequence, int16_t(0));
     auto& lane = reinterpret_cast<RegTensor<uint16_t>&>(sequence);
-    RegTensor<uint16_t> offsets, cap, left, right, zero, above, top;
-    Duplicate(cap, uint16_t(254)); Sub(offsets, cap, lane, all);
-    Gather(left, state, offsets, all);
+    RegTensor<uint16_t> offsets, cap, last, left, right, lowerLast, zero, above, top;
     Duplicate(cap, uint16_t(126)); Sub(offsets, cap, lane, all);
-    Duplicate(cap, uint16_t(127)); Duplicate(zero, uint16_t(0));
-    MaskReg valid; Compare<uint16_t, CMPMODE::LT>(valid, lane, cap, all);
-    // Last lane has no predecessor CDF entry. Clamp its address even when
-    // masked, then explicitly select zero rather than relying on merge mode.
-    Select(offsets, offsets, zero, valid);
-    Gather(right, state, offsets, all); Select(right, right, zero, valid);
-    Duplicate(above, count); Sub(above, above, previous, all);
+    Duplicate(last, uint16_t(127)); Duplicate(zero, uint16_t(0));
+    Min(offsets, offsets, last, all);
+    // Stay in registers: do not round-trip the CDF through mutable UB state.
+    // left = CDF[254..127], right = CDF[126..0] followed by zero.
+    Gather(left, upper, offsets); Gather(right, lower, offsets);
+    Gather(lowerLast, lower, last);
+    MaskReg valid; Compare<uint16_t, CMPMODE::LT>(valid, lane, last, all);
+    Select(left, left, lowerLast, valid); Select(right, right, zero, valid);
+    // rank = N - K + 1 - count(high_byte < selected_byte), hence
+    // rank + K - 1 counts all keys at or above the selected byte.
+    // This uses the exact residual rank already consumed by the low selector.
+    Adds(above, rank, uint16_t(kvip_rolling::kTop - 1), all);
     Sub(left, above, left, all); Sub(right, above, right, all);
     Duplicate(top, uint16_t(kvip_rolling::kTop));
     Min(left, left, top, all); Min(right, right, top, all);
-    // Complete both gathers before overwriting their shared 512-byte source.
-    LocalMemBar<MemType::VEC_LOAD, MemType::VEC_STORE>();
     StoreAlign(state, left, all); StoreAlign(state + 128, right, all);
     StoreAlign(state + kvip_rolling::kBins, key, all);
     StoreAlign(state + kvip_rolling::kAdmission, key, all);
@@ -132,7 +131,7 @@ __simd_vf__ inline void RegisterThreshold(__ubuf__ uint16_t* input,
     Add(key, key, low, all16);
     StoreAlign(output, key, all16);
 #if KVIP_ROLLING_REUSE_SEED
-    if (rollingState) ExportRollingSeed(rollingState, lower, upper, previous, key, loops * 256);
+    if (rollingState) ExportRollingSeed(rollingState, lower, upper, rank, key);
 #endif
 }
 } // namespace kvip_recent_threshold

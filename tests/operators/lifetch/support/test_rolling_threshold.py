@@ -58,8 +58,10 @@ template<class T> void ShiftRights(RegTensor<T>& r,RegTensor<T>& a,int16_t n,Mas
  for(unsigned i=0;i<r.v.size();++i)if(mask.v[i])r.v[i]=a.v[i]>>n;}
 template<class T> void Xor(RegTensor<T>& r,RegTensor<T>& a,RegTensor<T>& b,MaskReg mask){
  for(unsigned i=0;i<r.v.size();++i)if(mask.v[i])r.v[i]=a.v[i]^b.v[i];}
-template<class T> void Gather(RegTensor<T>& r,T* p,RegTensor<uint16_t>& index,MaskReg mask){
- for(unsigned i=0;i<r.v.size();++i)if(mask.v[i]){assert(index.v[i]<256);r.v[i]=p[index.v[i]];}}
+// Seed export must consume its live CDF registers, not temporarily overwrite
+// and gather the rolling-state buffer. No UB-source Gather overload is given.
+template<class T> void Gather(RegTensor<T>& r,RegTensor<T> source,RegTensor<uint16_t>& index){
+ for(unsigned i=0;i<r.v.size();++i){assert(index.v[i]<source.v.size());r.v[i]=source.v[index.v[i]];}}
 template<class T> void And(RegTensor<T>& r,RegTensor<T>& a,RegTensor<T>& b,MaskReg mask){
  for(unsigned i=0;i<r.v.size();++i)if(mask.v[i])r.v[i]=a.v[i]&b.v[i];}
 enum class MemType {VEC_STORE,VEC_LOAD};
@@ -155,11 +157,12 @@ int main(){
   std::array<uint16_t,kvip_rolling::kStateWords+32> storage;storage.fill(0xa55a);
   auto seed=truth;seed.resize((seed.size()+255)/256*256,0);
 #if KVIP_ROLLING_REUSE_SEED
-  unsigned seedHistograms=histograms;
+  unsigned seedHistograms=histograms,seedStores=stores;
   kvip_recent_threshold::RegisterThreshold(seed.data(),threshold.data(),seed.size()/256,
       seed.size()-2048+1,storage.data()+16);
   assert(threshold[0]==initial);
   assert(histograms-seedHistograms==4*seed.size()/256); // No third score pass.
+  assert(stores-seedStores==5); // Threshold + final CDF/anchor/admission only.
   for(unsigned j=0;j<256;++j){
    unsigned key=(unsigned(initial)&0xff00)+255-j;
    unsigned count=std::count_if(seed.begin(),seed.end(),[&](auto value){return value>=key;});

@@ -297,11 +297,23 @@ when later threshold updates are omitted. These controls stay opt-in.
 exact seed selector has already computed the cumulative low-byte distribution
 for the high byte containing Kth, plus the number of keys in earlier bytes.
 Before discarding these registers, it exports a descending CDF into the
-existing rolling state. Two 128-lane gathers and constant-size arithmetic
+existing rolling state. Three register gathers and constant-size arithmetic
 replace reloading/re-encoding/re-histogramming roughly 16K--18K seed scores per
 query. The initial Kth and resident classification are unchanged. There is no
-additional allocation, Index read, kernel or final TopK change. Memory barriers
-separate the 512-byte temporary ascending CDF from its descending overwrite.
+additional allocation, Index read, kernel or final TopK change. The conversion
+consumes the live lower/upper CDF registers and the residual rank used by the
+low-byte selector. Only the final descending CDF is written to rolling state.
+
+The previous UB scratch conversion failed the G7 device oracle at eager verify
+(`15103 != 14932`), although the host numerical model passed. The replacement
+removes its temporary UB stores, UB gathers and two local barriers; it also
+derives the population above the selected byte from the already-used residual
+rank (`rank + K - 1`) instead of retaining the first-pass count. This narrows
+the device-sensitive data flow; the exact device failure mechanism was not
+reproduced on the host. Native lane tests now reject UB-source Gather in the
+exporter and require only five output stores including the original threshold.
+The independent NPU oracle remains mandatory; no tolerance, threshold clamp
+or bypass is added to turn the failing comparison into a pass.
 
 This reuses a narrower score interval: `[seed & 0xff00, seed | 0xff]`, whereas
 the old histogram spans `[seed, seed+255]`. Within the reused byte, threshold
