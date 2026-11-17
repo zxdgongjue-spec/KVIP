@@ -48,7 +48,7 @@ __aicore__ inline void JoinColdOutput(){if(coldOutputPending_){WaitFlag<HardEven
 bool mappedExport_=false;uint32_t mappedValid_=0;
 // QLIVector member: called after ID recovery while the complete Q is in UB.
 bool exportWindowCold_=false;bool rankTrace_=false;
-uint32_t rankedEpoch_=0;
+uint32_t rankedEpoch_=0;bool windowCoveredEmpty_=false;
 __aicore__ inline void ExportWindowCold(uint32_t query) {
     // Even a window with zero newly compacted scores exports the saved TopK.
     // Its output bank may still feed the preceding Q's asynchronous DMA.
@@ -78,7 +78,7 @@ __aicore__ inline void ExportWindowCold(uint32_t query) {
         ctx->incremental,runtimeShape_.batch,runtimeShape_.history,b));
     uint64_t rankClocks[5];
     uint32_t count=kvip_prefetch_rank::SelectBitmap(indicesOutLocal_,scoreOutLocal_,compact,
-        topkSharedTmpLocal_[128],covered,runtimeShape_.history,valid,rank,ctx->windowLimit/4,rankTrace_?rankClocks:nullptr,(ctx->windowLimit/4)/2);
+        topkSharedTmpLocal_[128],covered,runtimeShape_.history,valid,rank,ctx->windowLimit/4,rankTrace_?rankClocks:nullptr,(ctx->windowLimit/4)/2,windowCoveredEmpty_);
     if(rankTrace_) {
         uint64_t delta[3]={rankClocks[1]-rankClocks[0],rankClocks[4]-rankClocks[1],1};
         for(uint32_t k=0;k<3;++k) {
@@ -486,6 +486,11 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     GlobalTensor<uint32_t> progressSource;progressSource.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress));
     for(uint32_t b=lane,i=0;b<runtimeShape_.batch;b+=runtimeShape_.serviceLanes,i+=128)
         DataCopy(incrementalOld_[i],progressSource[b*128],128);
+    // Stage the first 64 bytes of each row after progress. At most two rows
+    // use words [256, 288), disjoint from progress words [0, 256).
+    GlobalTensor<uint32_t> rowsSource;rowsSource.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->rows));
+    for(uint32_t b=lane,i=0;b<runtimeShape_.batch;b+=runtimeShape_.serviceLanes,++i)
+        DataCopy(incrementalOld_[256+i*16],rowsSource[b*256],16);
     }
     GlobalTensor<uint64_t> metadata;
     metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(ctx->incremental));
@@ -495,10 +500,19 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
         SetFlag<HardEvent::MTE2_S>(EVENT_ID5);WaitFlag<HardEvent::MTE2_S>(EVENT_ID5);
     }
     uint32_t ownedQueries=lane<runtimeShape_.batch?((runtimeShape_.batch-1-lane)/runtimeShape_.serviceLanes+1)*4:0;
-    if(incrementalMetadataActive_)for(uint32_t i=0;i<ownedQueries;++i)incrementalMetadata_.SetValue(i*16+4,uint64_t(incrementalOld_.GetValue(i*32))|(uint64_t(incrementalOld_.GetValue(i*32+16))<<32));
+    uint32_t requests0=0,requests1=0;
+    if(incrementalMetadataActive_) {
+        if(ownedQueries>0)requests0=incrementalOld_.GetValue(256+9);
+        if(ownedQueries>4)requests1=incrementalOld_.GetValue(256+16+9);
+        for(uint32_t i=0;i<ownedQueries;++i)
+            incrementalMetadata_.SetValue(i*16+4,uint64_t(incrementalOld_.GetValue(i*32))|(uint64_t(incrementalOld_.GetValue(i*32+16))<<32));
+    }
     uint32_t cap=half?rotating::SequenceWindowEnd(runtimeShape_.history,runtimeShape_.resident,half,epoch):
         rotating::Trigger(runtimeShape_.history,runtimeShape_.resident,runtimeShape_.rounds,epoch)*128;
     for(uint32_t b=lane;b<runtimeShape_.batch;b+=runtimeShape_.serviceLanes) for(uint32_t q=0;q<4;++q) {
+        // Init clears covered; the posting path records every admission in
+        // requests. The predecessor fence makes the row and bitmap visible.
+        windowCoveredEmpty_=incrementalMetadataActive_ && (((b-lane)/runtimeShape_.serviceLanes)==0 ? requests0==0 : requests1==0);
         uint32_t progressIndex=(((b-lane)/runtimeShape_.serviceLanes)*4+q)*16+4;
         uint64_t ready;
         if(incrementalMetadataActive_)ready=incrementalMetadata_.GetValue(progressIndex);

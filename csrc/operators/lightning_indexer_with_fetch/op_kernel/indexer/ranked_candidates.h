@@ -13,7 +13,7 @@ __simt_callee__ inline uint64_t CoveredAddressSimt(uint64_t incremental,uint32_t
 }
 // One bit per physical Index position: valid local or already admitted.
 // Packed scores and eligibility use disjoint banks; the full TopK stays intact.
-template<bool Gathered=false>
+template<bool Gathered=false, bool Empty=false>
 __simd_vf__ inline void PackUncovered(__ubuf__ uint32_t* ids,__ubuf__ uint16_t* scores,
     __ubuf__ uint32_t* covered,__ubuf__ uint32_t* eligible,
     __ubuf__ uint32_t* packed,__ubuf__ uint32_t* count,uint32_t valid) {
@@ -26,8 +26,11 @@ __simd_vf__ inline void PackUncovered(__ubuf__ uint32_t* ids,__ubuf__ uint16_t* 
         LoadAlign(id,ids+i);LoadAlign<uint16_t,LoadDist::DIST_UNPACK_B16>(score,scores+i);
         CompareScalar<uint32_t,CMPMODE::LT>(bounded,id,valid,all);Select(safe,id,zero,bounded);
         ShiftRights(index,safe,int16_t(5),all);And(shift,safe,mask31,all);
-        if constexpr(Gathered)LoadAlign(bits,covered+i);else Gather(bits,covered,index,all);
-        ShiftRight(bits,bits,reinterpret_cast<RegTensor<int32_t>&>(shift),all);And(bits,bits,one,all);
+        if constexpr(Empty) { Duplicate(bits,uint32_t(0)); }
+        else {
+            if constexpr(Gathered)LoadAlign(bits,covered+i);else Gather(bits,covered,index,all);
+            ShiftRight(bits,bits,reinterpret_cast<RegTensor<int32_t>&>(shift),all);And(bits,bits,one,all);
+        }
         CompareScalar<uint32_t,CMPMODE::EQ>(miss,bits,uint32_t(0),all);MaskAnd(take,bounded,miss,all);
         Select(kept,id,invalid,take);StoreAlign(eligible+i,kept,all);
         Duplicate<uint32_t,MaskMergeMode::ZEROING>(ones,uint32_t(1),take);Add(sum,sum,ones,all);
@@ -148,14 +151,16 @@ __simd_vf__ inline void GatherCoveredChunk(__ubuf__ uint32_t* ids,__ubuf__ uint3
 __aicore__ inline uint32_t SelectBitmap(LocalTensor<uint32_t> ids,LocalTensor<uint16_t> scores,
     LocalTensor<uint32_t> output,LocalTensor<uint32_t> scratch,
     __gm__ uint32_t* covered,uint32_t history,uint32_t valid,uint32_t rank,uint32_t quota,
-    uint64_t* clocks=nullptr,uint32_t minimum=0) {
+    uint64_t* clocks=nullptr,uint32_t minimum=0,bool coveredEmpty=false) {
     uint64_t begin=clocks?GetSystemCycle():0;
     auto p=reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr());
     auto eligible=output[2048];
     auto id=reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr());
     auto score=reinterpret_cast<__ubuf__ uint16_t*>(scores.GetPhyAddr());
     auto out=reinterpret_cast<__ubuf__ uint32_t*>(eligible.GetPhyAddr());
-    if(history<=131072){
+    if(coveredEmpty){
+        PackUncovered<false,true>(id,score,p,out,p+4096,p+6144,valid);
+    }else if(history<=131072){
         GlobalTensor<uint32_t> bits;bits.SetGlobalBuffer(covered);
         DataCopy(scratch,bits,(history+255)/256*8);
         SetFlag<HardEvent::MTE2_V>(EVENT_ID4);WaitFlag<HardEvent::MTE2_V>(EVENT_ID4);
