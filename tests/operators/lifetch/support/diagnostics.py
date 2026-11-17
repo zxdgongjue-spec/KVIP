@@ -772,8 +772,12 @@ def level_two_tables(result):
                 for event in services:
                     identity = [event['event'], event['core'], event['epoch'], event.get('lane')]
                     service_rows.append([*identity, event['bitmap_bytes'], event['candidate_count'], event['posted_count']])
-                    for label, key in (('scan', 'scan_cycles'), ('candidates', 'candidate_cycles'), ('submit/copy', 'post_cycles')):
-                        service_times.append([*identity, label, event[key], event[key] / mhz if mhz else None])
+                    for label, key in (('predecessor wait', 'predecessor_wait_cycles'),
+                                       ('incremental', 'incremental_cycles'), ('scan', 'scan_cycles'),
+                                       ('candidates', 'candidate_cycles'), ('submit/copy', 'post_cycles')):
+                        value = event.get(key)
+                        if value is not None:
+                            service_times.append([*identity, label, value, value / mhz if mhz else None])
                 if service_rows and result.get('level', 2) >= 3:
                     emit(algorithm_lines, 'Prefetch service work',
                         ['Event', 'Core pair', 'Epoch', 'Lane', 'Bitmap bytes', 'Candidates', 'Posted'], service_rows, 4)

@@ -7,7 +7,7 @@ extern "C" uint32_t aclrtlaunch_v9_##name##_kernel(uint32_t,void*,void*); \
 extern "C" uint32_t v9_##name(void* bindings,void* stream,const rotating::RuntimeShape* shape) { \
     if (!bindings || !stream || !shape) return 100000; \
     return aclrtlaunch_v9_##name##_kernel(blocks,stream,bindings); }
-ENTRY(init,shape->batch)
+ENTRY(init,shape->batch*4)
 
 extern "C" uint32_t aclrtlaunch_v9_li_kernel(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_1(uint32_t,void*,void*);

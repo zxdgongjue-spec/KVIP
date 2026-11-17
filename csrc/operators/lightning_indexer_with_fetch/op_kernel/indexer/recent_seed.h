@@ -29,6 +29,18 @@ inline void Remap(__ubuf__ uint32_t* indices, __ubuf__ uint32_t* previous,
     }
 }
 
+// One-pass resident + recent TopK produces compact indices. Restore the
+// physical recent index; padding is kept invalid if ever selected.
+__simt_vf__ __aicore__ LAUNCH_BOUND(512)
+inline void RemapJoined(__ubuf__ uint32_t* indices, uint32_t resident,
+                        uint32_t begin, uint32_t count) {
+    for (uint32_t i = threadIdx.x; i < 2048; i += 512) {
+        uint32_t index = indices[i];
+        if (index >= resident)
+            indices[i] = index - resident < count ? begin + index - resident : UINT32_MAX;
+    }
+}
+
 // Native LI uses two bitmap bits per score; operate through its predicate format.
 __simd_vf__ inline void ExcludeSeeded(__ubuf__ uint16_t* bitmap,uint32_t base,uint32_t n,uint32_t begin,uint32_t end) {
     using namespace AscendC::MicroAPI;

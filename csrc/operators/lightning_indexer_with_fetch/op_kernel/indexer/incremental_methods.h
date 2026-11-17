@@ -123,6 +123,7 @@ static constexpr uint32_t kIncrementalInputBytes=40960;
 TBuf<TPosition::VECCALC> incrementalInputBuf_;
 LocalTensor<uint16_t> incrementalInput_;
 bool incrementalPipeline_=false,incrementalInputPending_=false,incrementalOutputPending_=false;
+uint32_t incrementalFinalValid_=0;
 uint32_t incrementalInputQuery_=0,incrementalInputBase_=0,incrementalInputCount_=0;
 uint32_t incrementalNextQuery_=0,incrementalNextIndex_=0,incrementalNextEnd0_=0,incrementalNextEnd1_=0;
 bool incrementalHasNext_=false;
@@ -252,7 +253,7 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
         return;
     }
     const uint32_t batch=query/4,q=query%4;
-    mappedValid_=runtimeShape_.history;
+    mappedValid_=incrementalFinalValid_ ? Min(runtimeShape_.history,incrementalFinalValid_) : runtimeShape_.history;
     auto mappedCtx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     if(mappedCtx->queryEnds)mappedValid_=Min(mappedValid_,reinterpret_cast<__gm__ uint32_t*>(mappedCtx->queryEnds)[query]);
     GlobalTensor<uint16_t> stateScores,raw,bitmap;
@@ -332,6 +333,13 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
             kvip_recent_index::ExcludeSeeded(reinterpret_cast<__ubuf__ uint16_t*>(maskLocal.GetPhyAddr()),base,n,seeded.begin,seeded.end);
             PipeBarrier<PIPE_V>();
         }
+        // Final causal Q lengths can end inside a 128-token bitmap tile.
+        // The last aligned read includes later Q tokens; remove those bits
+        // before counting or packing candidates, including on scratch reloads.
+        if (base+n>mappedValid_) {
+            kvip_recent_index::ExcludeSeeded(reinterpret_cast<__ubuf__ uint16_t*>(maskLocal.GetPhyAddr()),base,n,mappedValid_,base+n);
+            PipeBarrier<PIPE_V>();
+        }
         auto tileList=indicesOutLocal_[2048].template ReinterpretCast<uint16_t>();
         lifetch_incremental::MarkNonemptyTiles(
             reinterpret_cast<__ubuf__ uint16_t*>(maskLocal.GetPhyAddr()),
@@ -368,6 +376,10 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
                 kvip_recent_index::ExcludeSeeded(reinterpret_cast<__ubuf__ uint16_t*>(maskLocal.GetPhyAddr()),base,n,seeded.begin,seeded.end);
                 PipeBarrier<PIPE_V>();
             }
+            if (base+n>mappedValid_) {
+                kvip_recent_index::ExcludeSeeded(reinterpret_cast<__ubuf__ uint16_t*>(maskLocal.GetPhyAddr()),base,n,mappedValid_,base+n);
+                PipeBarrier<PIPE_V>();
+            }
             lifetch_incremental::Count(reinterpret_cast<__ubuf__ uint16_t*>(rawLocal.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint16_t*>(maskLocal.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(countLocal.GetPhyAddr()),n,cutoff);
@@ -387,6 +399,10 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
                 SetFlag<HardEvent::MTE2_V>(EVENT_ID5);WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);
                 if(base<seeded.end && base+n>seeded.begin) {
                 kvip_recent_index::ExcludeSeeded(reinterpret_cast<__ubuf__ uint16_t*>(maskLocal.GetPhyAddr()),base,n,seeded.begin,seeded.end);
+                PipeBarrier<PIPE_V>();
+            }
+            if (base+n>mappedValid_) {
+                kvip_recent_index::ExcludeSeeded(reinterpret_cast<__ubuf__ uint16_t*>(maskLocal.GetPhyAddr()),base,n,mappedValid_,base+n);
                 PipeBarrier<PIPE_V>();
             }
             lifetch_incremental::Count(reinterpret_cast<__ubuf__ uint16_t*>(rawLocal.GetPhyAddr()),
@@ -449,13 +465,19 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     uint32_t lane=rotating::ServiceLane(runtimeShape_.batch,runtimeShape_.splitQ,
         runtimeShape_.serviceAics,blockId_/2,blockId_%2);
+    // The predecessor wait is part of the optional window service and can
+    // delay the producer. Capture it separately from incremental computation.
+    bool trace=streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U);
+    if(trace) {
+        auto event=reinterpret_cast<__gm__ rotating::Event*>(ctx->events)+epoch*runtimeShape_.serviceLanes+lane;
+        event->waitBegin=GetSystemCycle();
+    }
     // Same predecessor dependency as original FastService, moved before the
     // added calculation so private per-lane state cannot have two writers.
     if(epoch) {
         auto previous=reinterpret_cast<__gm__ volatile rotating::Event*>(ctx->events)+(epoch-1)*runtimeShape_.serviceLanes+lane;
         do {kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ rotating::Event*>(previous)),64);}while(!previous->complete);
     }
-    bool trace=streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U);
     uint64_t begin=trace?GetSystemCycle():0;
     exportWindowCold_=true;rankedEpoch_=epoch;rankTrace_=trace;
     incrementalCalls_=0;incrementalScanned_=0;incrementalCandidates_=0;
@@ -535,7 +557,10 @@ __aicore__ inline void FinalIncremental(uint32_t query,uint32_t valid) {
         while(!PreviousServiceReady(runtimeShape_.rounds,lane)) {}
     }
     uint32_t half=rotating::UseSequenceSplit(runtimeShape_)?rotating::SequenceHalfWindow(runtimeShape_):0;
-    AdvanceIncremental(query,valid,half?valid:0,half);
+    uint32_t alignedValid=(valid+127U)&~127U;
+    incrementalFinalValid_=valid;
+    AdvanceIncremental(query,alignedValid,half?alignedValid:0,half);
+    incrementalFinalValid_=0;
     constexpr uint32_t prefixBytes=4*2048*6+1024;
     GlobalTensor<uint32_t> ids;
     ids.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(WindowTopkPrefix()+(query/4)*prefixBytes+4*2048*2)+(query%4)*2048);

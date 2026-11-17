@@ -66,7 +66,6 @@ __aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uin
     SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
     Duplicate(local,UINT32_MAX,4096);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-    FillRoundWords(ctx->mapping+uint64_t(b)*rt_history*4,rt_history,local);
     if(ctx->changes)FillRoundWords(ctx->changes+b*kChangeCapacity*4,kChangeCapacity,local);
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     // Copy only the candidate prefix; resolver writes extended destinations.
@@ -96,8 +95,27 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
 
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     if ASCEND_IS_AIV {
-        uint32_t b=GetBlockIdx(); if(b>=rt_batch) return;
+        uint32_t block=GetBlockIdx();
+        uint32_t b=block%rt_batch, part=block/rt_batch;
+        if(part>=4) return;
         auto ctx=GetContext(bindings);
+        // Each worker owns an aligned range, including its ABC mappings.
+        // No cache line is concurrently cleared and filled by another core.
+        uint32_t chunk=((rt_history+127)/128)*32;
+        uint32_t begin=part*chunk;
+        uint32_t end=begin+chunk<rt_history ? begin+chunk : rt_history;
+        if(begin<end) {
+            TPipe mapPipe; TBuf<TPosition::VECCALC> mapStorage;
+            mapPipe.InitBuffer(mapStorage,4096*4);
+            auto local=mapStorage.Get<uint32_t>();
+            Duplicate(local,UINT32_MAX,4096);
+            SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            FillRoundWords(ctx->mapping+(uint64_t(b)*rt_history+begin)*4,end-begin,local);
+            SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            mapPipe.Destroy();
+            Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},rt_history,rt_resident,ctx,b,begin,end);
+        }
+        if(part) return;
         auto initBindings=reinterpret_cast<__gm__ uint64_t*>(bindings);
         auto streaming=reinterpret_cast<__gm__ pipeline_ab::Args*>(initBindings[15]);
         InitializeRound(rt_batch,rt_history,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b,streaming);
@@ -114,7 +132,6 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
         uint64_t outputStride=ctx->outputStride ? ctx->outputStride : rt_resident;
         row->addresses=ctx->tokenAddresses ? ctx->tokenAddresses+uint64_t(owner)*ctx->addressStride*8 : a[13]+rt_batch*prefix+b*tail;
         row->output=args.output+uint64_t(owner)*outputStride*rt_tokenBytes;
-        Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},rt_history,rt_resident,ctx,b);
         row->initialHead=queue->sq_producer_index;
         row->limit=kSlots;
         row->prefetchLimit=ctx->prefetchLimit;

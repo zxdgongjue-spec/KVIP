@@ -212,8 +212,8 @@ private:
         }
     }
 
-    __aicore__ inline void SaveResident(uint32_t query, uint32_t scoreRow, bool publishProgress, uint32_t availableEnd) {
-        MergeRecentScores(query,scoreRow,availableEnd);
+    __aicore__ inline void SaveResident(uint32_t query, uint32_t scoreRow, bool publishProgress, uint32_t availableEnd, bool recentMerged = false) {
+        if (!recentMerged) MergeRecentScores(query,scoreRow,availableEnd);
         TagResident(query);
 #else
     __aicore__ inline void SaveResident(uint32_t query, uint32_t scoreRow, bool publishProgress) {
@@ -973,6 +973,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
 #if !V9_UBMEM
         const int32_t recentCausalEnd=int32_t(info.actS2SizeOrig)-int32_t(info.actS1Size)+int32_t(curAivS1Idx+i)+1;
         const uint32_t recentEnd=constInfo_.attenMaskFlag ? uint32_t(recentCausalEnd>0?recentCausalEnd:0) : uint32_t(info.actS2SizeOrig);
+        bool recentMerged = false;
 #endif
         // Causal ProcessTopK derives its bound from actS2SizeOrig, overriding
         // ProcessResidentTopK's actS2Size. Only resident scores exist here.
@@ -1011,7 +1012,8 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
 
         AscendC::DataCopyPadExtParams<SCORE_T> padParams{true, 0, 0, 0};
 #if !V9_UBMEM
-        if (!prefixActive_ && validS2Len >= runtimeShape_.resident && validS2Len % 128 == 0) {
+        if (!prefixActive_ && validS2Len >= runtimeShape_.resident &&
+            (uint64_t(validS2Len)+127U)/128U*128U <= runtimeShape_.history) {
             FinalIncremental(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, validS2Len);
         } else if (validS2Len >= topkCount_) {
 #else
@@ -1028,10 +1030,52 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
                 AscendC::DataCopyPad(mrgValueLocal_, scoreGm[vecOffset * QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_)], copyInParams, padParams);
                 SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
                 WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+#if !V9_UBMEM && KVIP_STREAMING_LI
+                kvip_recent_index::Range joinedRecent{0, 0};
+                // The TopK input and scratch already reserve resident + K
+                // entries. Combining the recent scores avoids a second TopK.
+                // Keep the old path for shorter resident sequences and tails
+                // larger than that existing capacity.
+                if (prefixActive_ && streamingTopkOnly_ && runtimeShape_.resident == 16384 &&
+                    validS2Len == 16384 && trunkLen_ == 16384) {
+                    uint32_t query = info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx;
+                    uint32_t end = rotationContext->queryEnds ?
+                        reinterpret_cast<__gm__ uint32_t*>(rotationContext->queryEnds)[query] : runtimeShape_.history;
+                    joinedRecent = kvip_recent_index::RecentRange(rotationContext, query / SIM_Q, Min(end, recentEnd));
+                    uint32_t count = joinedRecent.end - joinedRecent.begin;
+                    if (count && count <= topkCount_) {
+                        uint32_t padded = QLICommon::Align(count, uint32_t(256));
+                        if (padded != count) {
+                            Duplicate(mrgValueLocal_[validS2LenAlign + count / 256 * 256], zero,
+                                      padded - count / 256 * 256);
+                            SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+                            WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+                        }
+                        DataCopyExtParams recentCopy{1, count * uint32_t(sizeof(SCORE_T)), 0, 0, 0};
+                        DataCopyPad(mrgValueLocal_[validS2LenAlign],
+                            scoreGm[vecOffset * QLICommon::Align((uint64_t)constInfo_.kSeqSize,
+                                                               (uint64_t)s2BaseSize_) + joinedRecent.begin],
+                            recentCopy, padParams);
+                        SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+                        WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+                        validS2LenAlign += padded;
+                        recentMerged = true;
+                    }
+                }
+#endif
 #if KVIP_STREAMING_LI
                 BeginFinalMetadata(streamingQuery);
 #endif
                 topkOp_(mrgValueLocal_, indicesOutLocal_, scoreOutLocal_, validS2LenAlign, 0, 1, prefixActive_);
+#if !V9_UBMEM && KVIP_STREAMING_LI
+                if (recentMerged) {
+                    SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
+                    Simt::VF_CALL<kvip_recent_index::RemapJoined>(Simt::Dim3{512,1,1},
+                        reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),
+                        runtimeShape_.resident, joinedRecent.begin, joinedRecent.end - joinedRecent.begin);
+                    SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
+                }
+#endif
             } else {
                 for (uint32_t loopIdx = 0; loopIdx < s2LoopNum; loopIdx++) {
                     if (loopIdx == 0) {
@@ -1102,7 +1146,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         if (prefixActive_) {
             if (validS2Len < topkCount_) Duplicate(scoreOutLocal_, uint16_t(0), topkCount_);
 #if !V9_UBMEM
-            SaveResident(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, vecOffset, queryRow == SIM_Q, recentEnd);
+            SaveResident(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, vecOffset, queryRow == SIM_Q, recentEnd, recentMerged);
 #else
             SaveResident(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, vecOffset, queryRow == SIM_Q);
 #endif

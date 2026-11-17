@@ -24,10 +24,10 @@ namespace kvaf_device { using ubmem_device::CleanCacheLines; constexpr uint32_t 
 namespace rotating {
 #include "../../common/lifetch/cache_metadata.h"
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
-inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm__ Context* ctx,uint32_t b) {
+inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,uint32_t beginOffset,uint32_t endOffset) {
     // Use the existing SIMT launch: scalar cache-line writeback would race
     // adjacent request counts initialized by other cores.
-    if(!threadIdx.x && ctx->changeCount) {
+    if(!threadIdx.x && beginOffset == 0 && ctx->changeCount) {
         asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->changeCount)+b,kLruSlots);
         asc_threadfence();
     }
@@ -38,7 +38,7 @@ inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm
     const uint32_t tailTokens=OutputStride(rt_resident,ctx)-rt_resident;
     for(uint32_t i=threadIdx.x;i<tailTokens;i+=256) {
         uint32_t token=begin+i;
-        if(token<end && token<rt_history)
+        if(token<end && token<rt_history && token>=beginOffset && token<endOffset)
             asc_stcg(map+token,rt_resident+kSlots+token%tailTokens);
     }
     asc_threadfence();
@@ -427,7 +427,7 @@ inline void UnionColdTopk(__ubuf__ uint32_t* input,__ubuf__ uint32_t* bits,
 
 // Same indexed-load pattern as v9 GatherCandidateMap; cold IDs pass through.
 
-template<bool captureIo>
+template<bool captureIo, bool predecessorChecked=false>
 __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer,uint32_t epoch,uint32_t core,uint32_t lane,
     LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids,
     uint32_t sequenceHalfWindow) {
@@ -435,8 +435,8 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
     uint64_t scanBegin=0,candidateBegin=0,postBegin=0,begin=0;
     uint64_t firstDoorbell=0,lastDoorbell=0;
     auto ctx=reinterpret_cast<__gm__ Context*>(pointer);auto events=reinterpret_cast<__gm__ Event*>(ctx->events);
-    auto event=events+epoch*rt_serviceLanes+lane;event->core=core;event->epoch=epoch;V9_FETCH_PROFILE(event->waitBegin=GetSystemCycle();)
-    if(epoch) {
+    auto event=events+epoch*rt_serviceLanes+lane;event->core=core;event->epoch=epoch;V9_FETCH_PROFILE(if constexpr (!predecessorChecked) event->waitBegin=GetSystemCycle();)
+    if constexpr (!predecessorChecked) if(epoch) {
         auto previous=reinterpret_cast<__gm__ volatile Event*>(events)+(epoch-1)*rt_serviceLanes+lane;
         do { kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(events+(epoch-1)*rt_serviceLanes+lane),64); }
         while(!previous->complete);
@@ -658,8 +658,11 @@ namespace rotating {
 __aicore__ inline void Service(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_splitQ,uint32_t rt_rounds,uint32_t rt_serviceAics,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer, uint32_t epoch, uint32_t core,
     uint32_t lane, LocalTensor<uint32_t> scratch, LocalTensor<uint16_t> flags,
     LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow = 0,bool captureIo = false) {
-    if(captureIo) FastService<true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow);
-    else FastService<false>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow);
+    // RotateFetch calls AdvanceWindow first, which joins the same lane's
+    // predecessor before touching incremental state. A second CQ-independent
+    // poll here adds no ordering and delays the resumed score producer.
+    if(captureIo) FastService<true,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow);
+    else FastService<false,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow);
 }
 }
 

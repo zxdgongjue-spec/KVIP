@@ -4313,6 +4313,10 @@ class StreamingForward(LIFetchForward):
                 services.append(dict(event=event_index, core=int(words[4]), epoch=int(words[5]),
                     lane=event_index % self.rotating.service_lanes,
                     begin_cycles=int(event[0]), end_cycles=int(event[1]),
+                    predecessor_wait_cycles=(int(event[13])-int(event[4])
+                        if not ubmem and int(event[4]) and int(event[13]) >= int(event[4]) else None),
+                    incremental_cycles=(int(event[14])-int(event[13])
+                        if not ubmem and int(event[13]) and int(event[14]) >= int(event[13]) else None),
                     scan_cycles=int(event[5]), candidate_cycles=int(event[6]), post_cycles=int(event[7]),
                     bitmap_bytes=int(event[8]), candidate_count=int(event[9]), posted_count=int(event[10])))
             result[0]['prefetch_services'] = services

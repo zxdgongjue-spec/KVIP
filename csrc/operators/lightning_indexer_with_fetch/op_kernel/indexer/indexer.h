@@ -149,7 +149,7 @@ protected:
 #if !V9_UBMEM
                                            uint32_t& loop, uint32_t& scaleLoop, bool last, bool newQuery = false);
     __aicore__ inline bool ScoreRecent(uint32_t& loop, uint32_t qScaleLoop,
-                                      uint32_t shard = 0, uint32_t shards = 1);
+                                      uint32_t shard = 0, uint32_t shards = 1, bool reuseRetained = false);
     __aicore__ inline void FinishBaseBlock(const QLICommon::RunInfo& runInfo);
 #else
                                            uint32_t& loop, uint32_t& scaleLoop, bool last);
@@ -701,12 +701,11 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
 #if !V9_UBMEM
 }
 
-// A score-only range inside the existing LI launch. Keep Q/weights/query-scale
-// for the following resident range, but finish the key/scale tail because its
-// next physical address is discontinuous. No hit/progress/service is published.
+// Score the recent range without publishing prefetch progress. The key/scale
+// bank is drained at the range boundary; Q may be retained or reused.
 template <typename QLIT>
 __aicore__ inline bool QuantLightningIndexerKernel<QLIT>::ScoreRecent(
-    uint32_t& loop, uint32_t qScaleLoop, uint32_t shard, uint32_t shards)
+    uint32_t& loop, uint32_t qScaleLoop, uint32_t shard, uint32_t shards, bool reuseRetained)
 {
     auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     if (!ctx->tailBounds) return false;
@@ -730,7 +729,11 @@ __aicore__ inline bool QuantLightningIndexerKernel<QLIT>::ScoreRecent(
         if ((tile - tiles.begin) % QLICommon::KScaleTiles == 0) ++scaleLoop;
         QLICommon::RunInfo info;
         CalcRunInfo(loop, tile, info, qScaleLoop, scaleLoop);
-        info.retainQuery = true;
+        if (reuseRetained) {
+            info.isFirstS2InnerLoop = false;
+            info.reuseQuery = true;
+        }
+        info.retainQuery = !reuseRetained;
         if ASCEND_IS_AIC {
             matmulService.ComputeMm1(info);
         } else {
@@ -777,11 +780,31 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
         uint32_t loop = 0, scaleLoop = 0;
         if constexpr (Phase == SequenceLiPhase::Hot) {
 #if !V9_UBMEM
-            bool hadRecent = ScoreRecent(loop, 0, shard, 2);
+            auto ctxRecent = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+            uint32_t recentEnd = tempLoopInfo.actS2Size;
+            auto boundsRecent = reinterpret_cast<__gm__ uint32_t*>(ctxRecent->tailBounds);
+            bool potentiallyRecent = boundsRecent &&
+                boundsRecent[tempLoopInfo.bIdx * 2] < boundsRecent[tempLoopInfo.bIdx * 2 + 1] &&
+                ctxRecent->outputStride > runtimeShape_.resident;
+            if (potentiallyRecent && ctxRecent->queryEnds) {
+                auto ends = reinterpret_cast<__gm__ uint32_t*>(ctxRecent->queryEnds) + tempLoopInfo.bIdx * SIM_Q;
+                uint32_t maximum = 0;
+                for (uint32_t q = 0; q < SIM_Q; ++q) if (ends[q] > maximum) maximum = ends[q];
+                if (maximum < recentEnd) recentEnd = maximum;
+            }
+            bool hasRecent = false;
+            if (potentiallyRecent) {
+                auto recentRange = kvip_recent_index::RecentRange(ctxRecent, tempLoopInfo.bIdx, recentEnd);
+                auto recentTiles = kvip_recent_index::Tiles(recentRange, shard, 2);
+                hasRecent = recentTiles.begin != recentTiles.end;
+            }
 #endif
             uint32_t half = resident_ / (2 * S2_BASE_SIZE);
 #if !V9_UBMEM
-            ScanSequenceHalf(shard * half, (shard + 1) * half, shard, loop, scaleLoop, true, hadRecent);
+            // Keep Q and its scale until the shard's recent tail finishes. Key
+            // and key-scale banks still drain at each discontinuous range.
+            ScanSequenceHalf(shard * half, (shard + 1) * half, shard, loop, scaleLoop, !hasRecent, false);
+            if (hasRecent) ScoreRecent(loop, 0, shard, 2, true);
 #else
             ScanSequenceHalf(shard * half, (shard + 1) * half, shard, loop, scaleLoop, true);
 #endif
