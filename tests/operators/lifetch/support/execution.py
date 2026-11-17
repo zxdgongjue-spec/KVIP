@@ -2007,7 +2007,7 @@ def run_urma_case(
     )
     pipeline = StreamingForward(rotating, update, torch, args.prefetch_tokens, fused_final=True, q_workers=args.q_workers)
     pipeline.legacy_layout = False
-    pipeline.parallel_finalize = False
+    pipeline.parallel_finalize = True
     pipeline.prepare_metadata = True
     pipeline.set_diagnostics(False)
     counter_clock_mhz = None

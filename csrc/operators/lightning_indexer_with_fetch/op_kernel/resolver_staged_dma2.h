@@ -21,14 +21,15 @@ __simt_callee__ inline uint32_t StagedKnownSlot(uint32_t token, uint32_t residen
     return ResolvePhysicalSlot(resident, lru, slot);
 }
 
-// Deterministic prefix of per-thread counts (512 SIMT threads).
+// Deterministic prefix; resolver uses 512 threads, small publication batches use 64.
+template<uint32_t Threads=512>
 __simt_callee__ inline uint32_t StagedPrefix(uint32_t local, __ubuf__ uint32_t* ctl) {
     uint32_t lane=threadIdx.x%warpSize, warp=threadIdx.x/warpSize;
     uint32_t scan=local;
     for(uint32_t d=1;d<warpSize;d*=2){uint32_t v=asc_shfl_up(scan,d);if(lane>=d)scan+=v;}
     if(lane==warpSize-1)ctl[544+warp]=scan;
     asc_syncthreads();
-    if(!warp){uint32_t v=lane<512/warpSize?ctl[544+lane]:0;
+    if(!warp){uint32_t v=lane<Threads/warpSize?ctl[544+lane]:0;
         for(uint32_t d=1;d<warpSize;d*=2){uint32_t prior=asc_shfl_up(v,d);if(lane>=d)v+=prior;}ctl[544+lane]=v;}
     asc_syncthreads();
     return scan-local+(warp?ctl[544+warp-1]:0);

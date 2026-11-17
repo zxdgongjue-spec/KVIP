@@ -13,6 +13,7 @@ constexpr uint32_t kMaxFinal=8192, kMapSize=4096, kChunk=32;
 constexpr uint32_t kFlagWords=32, kFlagCount=KVIP_OUTPUT_WORKER?16:12;
 // Each flag is isolated to avoid stale reads/false sharing across AIVs.
 struct alignas(128) BatchFlag { uint32_t ready, count, error, reserved[29]; };
+constexpr uint32_t kBatchFlagPayloadBytes = 3 * sizeof(uint32_t);
 static_assert(sizeof(BatchFlag)==128,"one cache line per flag");
 struct alignas(128) Args {
  uint64_t context, keys, scales, addresses, logical, valid;

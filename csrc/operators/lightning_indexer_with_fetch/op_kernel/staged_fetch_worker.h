@@ -79,7 +79,7 @@ __aicore__ inline void CompletePrefetch(__gm__ Context* ctx,uint32_t b,bool init
         // Only the first cache line and the pending field are read/written here.
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),64);
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->pending),sizeof(row->pending));
-        auto args=GetArgs(ctx,b*2);
+        auto args=reinterpret_cast<__gm__ const KvafExecuteBatchGetKernelArgs*>(ctx->args)+b*2;
         auto entity=reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(row->entity);
         auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(row->queue);
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
@@ -99,14 +99,14 @@ __aicore__ inline void CompletePrefetch(__gm__ Context* ctx,uint32_t b,bool init
         row->error=uint32_t(error);
         if(!error) row->pending=0;
         if(error) queue->last_error=error;
-        auto status=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(args.core_status);
+        auto status=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(args->core_status);
         kvaf_device::WriteStatus(status,error,row->requests,completed,queue->sq_producer_index,
             queue->cq_consumer_index,UINT64_MAX,0);
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),sizeof(*status));
         // The odd view is final-owned; its status is not prefetch completion.
         if(initializeSpare){
-            auto spare=GetArgs(ctx,b*2+1);
-            auto unused=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(spare.core_status);
+            auto spare=args+1;
+            auto unused=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(spare->core_status);
             kvaf_device::WriteStatus(unused,0,0,0,0,0,UINT64_MAX,0);
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(unused),sizeof(*unused));
         }
