@@ -288,6 +288,7 @@ def test_replay_activates_upstream_before_context_allocation(tmp_path, monkeypat
         mode="serial",
         study="threshold",
         threshold_policy="resident",
+        isolate_variants=False,
     )
     calls = []
     monkeypatch.setattr(replay, "arguments", lambda argv: args)

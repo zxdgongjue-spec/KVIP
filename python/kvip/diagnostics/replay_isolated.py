@@ -7,8 +7,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
 
-from kvip.diagnostics.console import emit, saved_failure
+from kvip.diagnostics.console import NativeLog, emit, print_replay_failure, saved_failure
 from kvip.diagnostics.replay_measure import verify_case_equivalence
 
 
@@ -30,13 +31,28 @@ def command(args, name, output):
     return result
 
 
+def preflight(args, retained):
+    """Compile every distinct variant before starting any device process."""
+    from kvip.diagnostics.scan_options import prebuild
+    from kvip.diagnostics.upstream import activate
+
+    activate(args.upstream_root, args.upstream_revision)
+    prebuild(args, retained)
+
+
 def run(args):
     args.output.parent.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix=f".{args.output.stem}-variants.", dir=args.output.parent))
     cases, memory, name = {}, [], "unassigned"
     child = {}
     log = directory / "startup.log"
+    retained = {"progress": dict(variant=name, phase="compile_preflight", step=None)}
+    build_log = NativeLog(args.quiet, report_failure=False)
+    compiled = False
     try:
+        with build_log:
+            preflight(args, retained)
+        compiled = True
         for name in args.scan_variants:
             child = {}
             output, log = directory / f"{name}.json", directory / f"{name}.log"
@@ -66,13 +82,17 @@ def run(args):
     except BaseException as error:
         report = dict(child) if child.get("status") == "failed" else {}
         report.update(status="failed", completed_cases=cases, isolated_directory=str(directory))
-        report.setdefault("progress", dict(variant=name, phase="isolated_variant"))
-        report.setdefault("error", dict(type=type(error).__name__, message=str(error)))
-        report.setdefault("native_log", str(log))
+        report.setdefault("progress", dict(variant=name, phase="isolated_variant")
+                          if compiled else dict(retained["progress"]))
+        report.setdefault("error", dict(type=type(error).__name__, message=str(error),
+                                        traceback=traceback.format_exc()))
+        report.setdefault("native_log", str(build_log.failure_path or log))
         report.setdefault("memory_samples", memory)
         if not args.output.exists():
             with args.output.open("x") as stream:
                 json.dump(report, stream, indent=2)
+        if not compiled:
+            print_replay_failure(report, result_path=args.output, log_path=build_log.failure_path)
         emit(f"ISOLATED_REPLAY_FAILED {error}\nFAILURE_JSON {args.output}", file=sys.stderr)
         raise SystemExit(130 if isinstance(error, KeyboardInterrupt) else 70) from error
     shutil.rmtree(directory)

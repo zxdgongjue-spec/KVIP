@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,8 +27,15 @@ def arguments(tmp_path):
 def test_isolated_children_keep_controls_and_retain_failure_evidence(tmp_path, monkeypatch, failure):
     args = arguments(tmp_path)
     calls = []
+    compiled = []
+
+    def preflight(arguments, retained):
+        compiled.extend(arguments.scan_variants)
+
+    monkeypatch.setattr(replay_isolated, "preflight", preflight)
 
     def child(command, stdout, stderr):
+        assert compiled == args.scan_variants
         parsed = replay.arguments(command[6:])
         assert not parsed.isolate_variants
         assert parsed.cold_windows == 8 and parsed.device == 0
@@ -80,3 +88,43 @@ def test_child_command_does_not_forward_isolation(tmp_path):
     assert cmd[:6] == [replay_isolated.sys.executable, "-B", "-X", "faulthandler", "-m", "kvip.diagnostics.replay"]
     child = replay.arguments(cmd[6:])
     assert child.scan_variants == ["reverse"] and not child.isolate_variants
+
+
+def test_compile_failure_starts_no_device_children(tmp_path, monkeypatch):
+    args = arguments(tmp_path)
+
+    def preflight(arguments, retained):
+        retained["progress"].update(variant="reverse-incremental")
+        os.write(2, b"compiler: ambiguous enum\n")
+        raise RuntimeError("compile failed\n--- build diagnostic ---\nerror: ambiguous enum")
+
+    monkeypatch.setattr(replay_isolated, "preflight", preflight)
+    monkeypatch.setattr(replay_isolated.subprocess, "run", lambda *a, **k: pytest.fail("device child started"))
+    with pytest.raises(SystemExit, match="70"):
+        replay_isolated.run(args)
+    report = json.loads(args.output.read_text())
+    assert report["completed_cases"] == {}
+    assert report["progress"] == dict(variant="reverse-incremental", phase="compile_preflight", step=None)
+    assert "error: ambiguous enum" in report["error"]["message"]
+    native_log = Path(report["native_log"])
+    assert "compiler: ambiguous enum" in native_log.read_text()
+
+
+def test_preflight_selects_pinned_production_before_build(tmp_path, monkeypatch):
+    from kvip.diagnostics import scan_options, upstream
+
+    args = arguments(tmp_path)
+    retained, calls = {}, []
+
+    def activate(root, revision):
+        assert root == args.upstream_root and revision == args.upstream_revision
+        calls.append("activate")
+
+    def prebuild(arguments, state):
+        assert calls == ["activate"] and arguments is args and state is retained
+        calls.append("build")
+
+    monkeypatch.setattr(upstream, "activate", activate)
+    monkeypatch.setattr(scan_options, "prebuild", prebuild)
+    replay_isolated.preflight(args, retained)
+    assert calls == ["activate", "build"]
