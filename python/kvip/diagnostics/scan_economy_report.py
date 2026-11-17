@@ -42,7 +42,10 @@ def report(cases, order):
         g = gain(t, original)
         print(f"{name:23} {t['mean_us']:8.3f} {t['p50_us']:8.3f} {g['mean_us']:10.2f} {g['p50_us']:9.2f} "
               f"{useful_prefetch(case):10.1f} {b['repair']/2**20:10.4f} {b['waste']/2**20:9.4f} {b['total']/2**20:9.4f}")
-    if "reverse-inc-inplace" in cases:
+    if "reverse-inc-progress" in cases:
+        pairs = (("reverse-inc-register", "reverse-inc-progress"),
+                 ("forward", "reverse-inc-progress"), ("reverse", "reverse-inc-progress"))
+    elif "reverse-inc-inplace" in cases:
         pairs = (("reverse-inc-light-ties", "reverse-inc-inplace"),
                  ("reverse-inc-register", "reverse-inc-inplace"),
                  ("forward", "reverse-inc-inplace"), ("reverse", "reverse-inc-inplace"))
@@ -163,7 +166,7 @@ def report(cases, order):
                                   for column in table.get("counter_columns_with_values", [])})
                 print(f"PMU {name} metric={entry['metric']} exported_columns={len(columns)} "
                       "values_in_saved_CSV_not_validated_utilization")
-    if "reverse-inc-prefilter" in cases or "reverse-inc-ties" in cases or "reverse-inc-light" in cases or "reverse-inc-inplace" in cases:
+    if "reverse-inc-prefilter" in cases or "reverse-inc-ties" in cases or "reverse-inc-light" in cases or "reverse-inc-inplace" in cases or "reverse-inc-progress" in cases:
         print("CHECK incremental_variants_vs_dense window_lists_and_final_order=IDENTICAL; actual transfer timing/counters may vary")
     print("DECISION " + ("retest_candidates="+",".join(candidates) if candidates else "keep_original_fused"))
     print("NOTE positive delta=more work/bytes; useful_pre includes all prefetch windows; no completion-overlap claim")

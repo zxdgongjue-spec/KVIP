@@ -7,10 +7,10 @@ import numpy as np
 import pytest
 
 from kvip.diagnostics import replay, replay_measure, scan_report, scan_options
-from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS, INCREMENTAL_VARIANTS, INCREMENTAL_WINDOW_VARIANTS, INCREMENTAL_PREFILTER_VARIANTS, INCREMENTAL_STATE_VARIANTS, INCREMENTAL_LIGHT_VARIANTS, INCREMENTAL_INPLACE_VARIANTS, budgets_for, options_for, validate_options
+from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS, INCREMENTAL_VARIANTS, INCREMENTAL_WINDOW_VARIANTS, INCREMENTAL_PREFILTER_VARIANTS, INCREMENTAL_STATE_VARIANTS, INCREMENTAL_LIGHT_VARIANTS, INCREMENTAL_INPLACE_VARIANTS, INCREMENTAL_PROGRESS_VARIANTS, budgets_for, options_for, validate_options
 
 
-@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS, INCREMENTAL_VARIANTS, INCREMENTAL_WINDOW_VARIANTS, INCREMENTAL_PREFILTER_VARIANTS, INCREMENTAL_STATE_VARIANTS, INCREMENTAL_LIGHT_VARIANTS, INCREMENTAL_INPLACE_VARIANTS])
+@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS, INCREMENTAL_VARIANTS, INCREMENTAL_WINDOW_VARIANTS, INCREMENTAL_PREFILTER_VARIANTS, INCREMENTAL_STATE_VARIANTS, INCREMENTAL_LIGHT_VARIANTS, INCREMENTAL_INPLACE_VARIANTS, INCREMENTAL_PROGRESS_VARIANTS])
 def test_scan_study_reuses_one_arena_and_delivers_independent_options(monkeypatch, variants):
     args = SimpleNamespace(study="scan-order", mode="fused", transport="urma",
                            threshold_policy="recent", scan_variants=list(variants))
@@ -35,7 +35,7 @@ def test_scan_study_reuses_one_arena_and_delivers_independent_options(monkeypatc
     assert calls == [(name, options_for(name), budgets_for(name)) for name in variants]
 
 
-@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS, INCREMENTAL_VARIANTS, INCREMENTAL_WINDOW_VARIANTS, INCREMENTAL_PREFILTER_VARIANTS, INCREMENTAL_STATE_VARIANTS, INCREMENTAL_LIGHT_VARIANTS, INCREMENTAL_INPLACE_VARIANTS])
+@pytest.mark.parametrize("variants", [DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS, INCREMENTAL_VARIANTS, INCREMENTAL_WINDOW_VARIANTS, INCREMENTAL_PREFILTER_VARIANTS, INCREMENTAL_STATE_VARIANTS, INCREMENTAL_LIGHT_VARIANTS, INCREMENTAL_INPLACE_VARIANTS, INCREMENTAL_PROGRESS_VARIANTS])
 def test_actual_command_line_accepts_scan_variants(tmp_path, variants):
     args = replay.arguments([
         "--snapshot", str(tmp_path / "input"), "--build-dir", str(tmp_path / "build"),
@@ -70,9 +70,9 @@ def test_report_uses_full_chain_and_keeps_mean_and_median_separate(tmp_path, cap
 
 def test_rolling_experiment_does_not_change_budgets_or_enable_pipeline_options():
     assert {budgets_for(name) for name in ROLLING_VARIANTS} == {(512, 64)}
-    assert options_for("reverse-refilter") == dict(reverse_cold=True, rolling_threshold=True, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False, compact_out_of_place=False, rolling_reuse_seed=False, rolling_fast_path=False, rolling_sparse=False, rolling_boundary=False, incremental_topk=False, incremental_window=False, incremental_register=False, incremental_prefilter=False, incremental_direct=False, incremental_ties=False, incremental_light=False, incremental_inplace=False)
+    assert options_for("reverse-refilter") == dict(reverse_cold=True, rolling_threshold=True, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False, compact_out_of_place=False, rolling_reuse_seed=False, rolling_fast_path=False, rolling_sparse=False, rolling_boundary=False, incremental_topk=False, incremental_window=False, incremental_register=False, incremental_prefilter=False, incremental_direct=False, incremental_ties=False, incremental_light=False, incremental_inplace=False, incremental_progress=False)
     with pytest.raises(ValueError, match="requires rolling"):
-        validate_options(dict(reverse_cold=True, rolling_threshold=False, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False, compact_out_of_place=False, rolling_reuse_seed=False, rolling_fast_path=False, rolling_sparse=False, rolling_boundary=False, incremental_topk=False, incremental_window=False, incremental_register=False, incremental_prefilter=False, incremental_direct=False, incremental_ties=False, incremental_light=False, incremental_inplace=False))
+        validate_options(dict(reverse_cold=True, rolling_threshold=False, window_refilter=True, rolling_batched=False, rolling_windowed=False, rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False, compact_out_of_place=False, rolling_reuse_seed=False, rolling_fast_path=False, rolling_sparse=False, rolling_boundary=False, incremental_topk=False, incremental_window=False, incremental_register=False, incremental_prefilter=False, incremental_direct=False, incremental_ties=False, incremental_light=False, incremental_inplace=False, incremental_progress=False))
 
 
 def test_rolling_reference_uses_unique_seed_and_only_scanned_causal_positions():
@@ -549,3 +549,38 @@ def test_inplace_report_rejects_changed_window_list_or_order(tmp_path, capsys):
     path.write_text(json.dumps(data))
     with pytest.raises(AssertionError, match="prefix_lists_sha256"):
         scan_report.load_report(path, require_incremental_inplace=True)
+
+
+def test_progress_bank_is_an_independent_change():
+    options = options_for("reverse-inc-progress")
+    validate_options(options)
+    original = options_for("reverse-inc-register")
+    assert {key for key in options if options[key] != original[key]} == {"incremental_progress"}
+    assert budgets_for("reverse-inc-progress") == (512, 64)
+    with pytest.raises(ValueError, match="Independent progress"):
+        validate_options(dict(options, incremental_window=False))
+
+
+@pytest.mark.parametrize("section,key", [
+    ("incremental_check", "prefix_lists_sha256"),
+    ("selection_comparison", "ordered_output_sha256"),
+])
+def test_progress_report_requires_unchanged_lists_and_final_order(tmp_path, capsys, section, key):
+    template = rolling_report(tmp_path)["cases"]["forward"]
+    cases = {name: json.loads(json.dumps(template)) for name in INCREMENTAL_PROGRESS_VARIANTS}
+    for case in cases.values():
+        case["geometry"]["rounds"] = 9
+        case["reads_samples"][0].update(prefetch=20, unused_prefetch=10)
+        case["selection_comparison"] = {"ordered_output_sha256": "same", "total_replacements": 0, "full_score_rank_check": True}
+        case["incremental_check"] = {"status": "exact_prefix_ranks_and_pending", "prefix_lists_sha256": "same"}
+    path = tmp_path / "progress.json"
+    data = dict(status="pass", execution_order=list(INCREMENTAL_PROGRESS_VARIANTS), cases=cases)
+    path.write_text(json.dumps(data))
+    scan_report.report(path, require_incremental_progress=True)
+    output = capsys.readouterr().out
+    assert "reverse-inc-register->reverse-inc-progress" in output
+    assert "BASELINE unchanged_forward" in output
+    cases["reverse-inc-progress"][section][key] = "changed"
+    path.write_text(json.dumps(data))
+    with pytest.raises(AssertionError, match=key):
+        scan_report.load_report(path, require_incremental_progress=True)
