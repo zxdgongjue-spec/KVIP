@@ -49,10 +49,31 @@ def main():
     data = json.loads(path.read_text())
     lines = [f'RUN {path}', 'A: CURRENT RUN. One count per request/replay; no duplicate collection from totals.']
     fields = ['selected_unique','initial_cold','candidate_hot','prefetch','final','unused_prefetch']
+    tag_rows = []
+    exact_rows = []
+    exact_records = []
     for capture in data.get('captures', []):
         if capture.get('path') == 'serial':
             continue
         samples = [s for s in capture['samples'] if s.get('algorithm',{}).get('requests')]
+        for sample in samples:
+            for request in sample['algorithm']['requests']:
+                for stage in ('prefix_tag_audit', 'final_tag_audit'):
+                    if stage in request:
+                        audit = request[stage]
+                        tag_rows.append([sample.get('round'), request['request'], stage,
+                                         sum(q['stable_hot'] for q in audit),
+                                         sum(q['missing_hot_tags'] for q in audit)])
+                records = request.get('prefetch_transfers', [])
+                if not records and request['prefetch']:
+                    continue
+                if 'prefetch_classes' not in request:
+                    continue
+                counts = request['prefetch_classes']
+                exact_rows.append([sample.get('round'), request['request'], request['prefetch'],
+                                   *[counts[k] for k in ('stable_hot', 'reserved_hot', 'abc', 'cold', 'repeated')]])
+                exact_records.extend(dict(repeat=sample.get('round'), request=request['request'], **record)
+                                     for record in records)
         groups = {}
         for s in samples:
             for r in s['algorithm']['requests']:
@@ -78,7 +99,28 @@ def main():
         bounds=[max(0,r['prefetch']-r['unused_prefetch']-r['initial_cold']) for r in totals if all(r[k] is not None for k in ('prefetch','unused_prefetch','initial_cold'))]
         if bounds:
             lines.append(f'Conditional lower bound on initially-local selected prefetch: mean={statistics.mean(bounds):.2f}, min={min(bounds):.2f}, max={max(bounds):.2f}; assumes no repeated token transfers.')
-    lines.append('Current saved counters do not contain per-transfer token lists. They cannot prove absence of repeated hardware reads or exact hot-refetch attribution.')
+    if tag_rows:
+        grouped = {}
+        for repeat, request, stage, stable, missing in tag_rows:
+            values = grouped.setdefault((repeat, stage), [0, 0])
+            values[0] += stable
+            values[1] += missing
+        lines.append(diagnostic_table('Hot tags: initial prefix vs final incremental TopK',
+                     ['Repeat', 'Stage', 'Stable hot positions', 'Missing hot tags'],
+                     [[repeat, stage, *values] for (repeat, stage), values in sorted(grouped.items())]))
+    if exact_rows:
+        by_repeat = {}
+        for row in exact_rows:
+            by_repeat.setdefault(row[0], []).append(row)
+        lines.append(diagnostic_table('Current admissions: exact per-token initial-state audit',
+                     ['Repeat', 'Posts', 'Stable hot', 'Reserved hot', 'ABC', 'Cold', 'Repeated tokens'],
+                     [[repeat, *[sum(row[i] for row in rows) for i in range(2, 8)]]
+                      for repeat, rows in sorted(by_repeat.items())]))
+        records_path = path.parent / 'prefetch_token_audit.json'
+        records_path.write_text(json.dumps(exact_records, indent=2) + '\n')
+        lines.append(f'Every admission: {records_path}; hot_valid/reserved are pre-call snapshots. Counts reconcile with posted ordinals; this is not a hardware WQE capture.')
+    else:
+        lines.append('This older run has no per-transfer records; exact attribution requires a new diagnose run.')
     output=path.parent/'prefetch_hot_audit.log'
     output.write_text('\n\n'.join(lines)+'\n')
     print('\n\n'.join(lines), flush=True)

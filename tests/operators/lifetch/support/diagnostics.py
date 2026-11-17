@@ -328,7 +328,7 @@ def summarize(directory, config):
 
 
 def algorithm_counts(mapping, selected, rows, posts, resident, windows, *,
-                     hot_valid=None, lru_slots=None, logical_ids=None, tail_bounds=None, token_bytes=656):
+                     hot_valid=None, lru_slots=None, reserved_hot=None, logical_ids=None, tail_bounds=None, token_bytes=656):
     """Reconcile existing admission records, not hypothetical transfer savings.
 
     The prefetch map stores resident+admission_ordinal; ABC uses a separate
@@ -404,6 +404,32 @@ def algorithm_counts(mapping, selected, rows, posts, resident, windows, *,
             slots = np.asarray(lru_slots)[row]
             slots = slots[(slots >= 0) & (slots < resident)]
             candidate_hot = int(np.isin(demand, np.intersect1d(local, logical_ids[row, slots])).sum())
+        # Preserve every admission identity outside graph timing. Physical IDs
+        # refer to the pre-call Index; hot validity and reservations must come
+        # from that same snapshot, before Index update changes ownership.
+        transfers = []
+        transfer_counts = dict(stable_hot=0, reserved_hot=0, cold=0, abc=0, repeated=0)
+        if hot_valid is not None and reserved_hot is not None:
+            reservations = np.asarray(reserved_hot)[row]
+            if reservations.shape != (resident,):
+                raise ValueError('Invalid initial reserved-hot shape')
+            window_ids = np.repeat(np.arange(1, windows + 1), epochs)
+            seen_tokens = set()
+            for ordinal, (position, token) in enumerate(zip(admitted, fetched_ids)):
+                position, token = int(position), int(token)
+                live = bool(position < resident and valid[position])
+                reserved = int(reservations[position]) if position < resident else -1
+                abc = tail_bounds is not None and begin_tail <= token < end_tail
+                category = ('abc' if abc else 'reserved_hot' if live and reserved >= 0
+                            else 'stable_hot' if live else 'cold')
+                repeated = token in seen_tokens
+                seen_tokens.add(token)
+                transfer_counts[category] += 1
+                transfer_counts['repeated'] += int(repeated)
+                transfers.append(dict(ordinal=ordinal, window=int(window_ids[ordinal]),
+                                      position=position, token=token, hot_valid=int(live),
+                                      reserved=reserved, category=category,
+                                      repeated=repeated, unused=bool(unused[ordinal])))
         requests.append(dict(request=row, selected_unique=len(demand), initial_cold=cold,
                              initial_hot_valid=None if local is None else initial_hot_count,
                              candidate_hot=candidate_hot, prefetch=posted, final=final,
@@ -411,7 +437,8 @@ def algorithm_counts(mapping, selected, rows, posts, resident, windows, *,
                              unused_prefetch=int(unused.sum()),
                              selected_prefetch=posted - int(unused.sum()),
                              useful=None, redundant=None, refetched=None,
-                             windows=window_rows, queries=query_rows))
+                             windows=window_rows, queries=query_rows,
+                             prefetch_transfers=transfers, prefetch_classes=transfer_counts))
     totals = {key: sum(item[key] for item in requests) for key in
               ('selected_unique', 'prefetch', 'final', 'KV_read_bytes', 'unused_prefetch', 'selected_prefetch')}
     totals['initial_cold'] = None if hot_valid is None else sum(item['initial_cold'] for item in requests)
@@ -430,17 +457,58 @@ def algorithm_before(rotating):
     if np.any(owners < 0) or np.any(owners >= len(validity)):
         raise ValueError('Diagnostic owner is outside hot validity storage')
     return dict(hot_valid=validity[owners].copy(), lru_slots=rotating.lru_slots.cpu().numpy().copy(),
+                reserved_hot=rotating.reserved_hot.cpu().numpy().copy(),
                 tail_bounds=None if rotating.tail_bounds is None else rotating.tail_bounds.cpu().numpy().copy())
+
+
+def prefetch_tag_audit(ids, before, resident):
+    """Check tags against the original residency, before Index exchanges."""
+    result = []
+    for row in range(ids.shape[0]):
+        queries = []
+        for query in range(4):
+            encoded = ids[row, query].astype(np.uint32)
+            raw = encoded & np.uint32(0x3fffffff)
+            bounded = raw < resident
+            safe = np.minimum(raw, resident - 1)
+            live = np.asarray(before['hot_valid'])[row, safe] != 0
+            reserved = np.asarray(before['reserved_hot'])[row, safe]
+            stable = bounded & live & (reserved < 0)
+            if before.get('tail_bounds') is not None:
+                begin, end = before['tail_bounds'][row]
+                stable &= ~((raw >= begin) & (raw < end))
+            missing = stable & ((encoded & np.uint32(0x80000000)) == 0)
+            queries.append(dict(query=query + 1, stable_hot=int(stable.sum()),
+                                missing_hot_tags=int(missing.sum()),
+                                missing_positions=raw[missing].astype(int).tolist()))
+        result.append(queries)
+    return result
 
 
 def algorithm_after(rotating, before):
     shape = rotating.runtime_shape
     try:
-        return algorithm_counts(
+        result = algorithm_counts(
             rotating.mapping.cpu().numpy(),
             rotating.arguments[9].cpu().numpy().view(np.int32).reshape(shape.batch, 4, 2048),
             rotating.rows.cpu().numpy().view(np.uint32), rotating.final_posts.cpu().numpy(),
             shape.resident, rotating.rounds, token_bytes=shape.tokenBytes, **before)
+        if hasattr(rotating, 'window_topk_storage'):
+            prefix_bytes = 4 * 2048 * 6 + 1024
+            # The public prefix is immutable after SaveResident; the private
+            # prefix retains tagged IDs after the final incremental merge.
+            public = rotating.arguments[13][:shape.batch * prefix_bytes].cpu().numpy().view(np.uint8)
+            private = rotating.window_topk_storage[shape.batch * 512:
+                       shape.batch * (512 + prefix_bytes)].cpu().numpy().view(np.uint8)
+            def decode_ids(buffer):
+                return np.stack([buffer[row * prefix_bytes + 4 * 2048 * 2:
+                                        row * prefix_bytes + 4 * 2048 * 6].copy().view(np.uint32).reshape(4, 2048)
+                                 for row in range(shape.batch)])
+            for name, buffer in (('prefix_tag_audit', public), ('final_tag_audit', private)):
+                audits = prefetch_tag_audit(decode_ids(buffer), before, shape.resident)
+                for request, audit in zip(result['requests'], audits):
+                    request[name] = audit
+        return result
     except ValueError as error:
         return {'error': str(error)}
 
