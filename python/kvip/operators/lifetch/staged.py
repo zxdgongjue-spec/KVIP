@@ -13,16 +13,36 @@ class ScoreWave(ctypes.Structure):
     ]
 
 
+class PrepareWave(ctypes.Structure):
+    _fields_ = [(x, ctypes.c_uint64) for x in ("bindings", "tasks")] + [
+        (x, ctypes.c_uint32) for x in ("rows", "stride", "queryGroup", "reserved")
+    ]
+
+
 class Plan(ctypes.Structure):
     _fields_ = [
         ("canonical", ctypes.c_uint64),
         ("hot", ctypes.POINTER(ScoreWave)),
         ("cold", ctypes.POINTER(ScoreWave)),
-    ] + [(x, ctypes.c_uint32) for x in ("hotCount", "coldCount", "aivBudget", "fetchWorkers")]
+    ] + [(x, ctypes.c_uint32) for x in ("hotCount", "coldCount", "aivBudget", "fetchWorkers")] + [
+        ("prepareWaves", ctypes.c_uint64),
+    ] + [(x, ctypes.c_uint32) for x in ("prepareCount", "postMode", "prepareMode", "reserved")]
 
 
 class StagedLIFetchForward(StreamingLIFetchForward):
-    def __init__(self, rotating, update, *, q_workers=2, aiv_budget=None, route="auto"):
+    def __init__(self, rotating, update, *, q_workers=2, aiv_budget=None, route="auto",
+                 score_post="separate", score_prepare="wave"):
+        if score_post not in ("separate", "scatter", "direct") or score_prepare not in ("wave", "invocation"):
+            raise ValueError("Invalid score post/prepare mode")
+        # Reject stale bridges before passing the extended private Plan.
+        for name, expected in (("kvip_staged_plan_bytes", ctypes.sizeof(Plan)), ("kvip_staged_plan_version", 2)):
+            fn = getattr(rotating.library, name, None)
+            if fn is None:
+                raise ValueError("Rebuild LIFetch: staged private Plan ABI v2 is required")
+            fn.argtypes, fn.restype = [], ctypes.c_uint32
+            if fn() != expected:
+                raise ValueError("Rebuild LIFetch: staged private Plan ABI mismatch")
+        self.score_post, self.score_prepare = score_post, score_prepare
         if not getattr(rotating, "staged", False):
             raise ValueError("Prepare LIFetchBinding(staged=True) before allocating its Context")
         if hasattr(rotating, "lease"):
@@ -115,8 +135,24 @@ class StagedLIFetchForward(StreamingLIFetchForward):
             begin = end
         self.hot = (ScoreWave * len(hot))(*hot)
         self.cold = (ScoreWave * len(cold))(*cold)
+        # Pointer-rich descriptors are private to this forward, never in the shared scratch pool.
+        desc = (PrepareWave * (len(hot) + len(cold)))(*[
+            PrepareWave(w.bindings, w.tasks, w.rows, w.stride, w.queryGroup, 0) for w in hot + cold
+        ])
+        self.prepare_descriptors = torch.tensor(list(bytes(desc)), dtype=torch.uint8, device=device)
+        self.storage.append(self.prepare_descriptors)
         self.plan = Plan(
-            self.canonical.data_ptr(), self.hot, self.cold, len(hot), len(cold), self.schedule.aiv_budget, q_workers
+            self.canonical.data_ptr(), self.hot, self.cold, len(hot), len(cold), self.schedule.aiv_budget, q_workers,
+            self.prepare_descriptors.data_ptr(), len(desc),
+            {"separate": 0, "scatter": 1, "direct": 2}[score_post],
+            {"wave": 0, "invocation": 1}[score_prepare], 0
+        )
+        self.score_geometry = dict(
+            route=route, post=score_post, prepare=score_prepare,
+            effective_aic=s.aicCount, aiv_budget=self.schedule.aiv_budget,
+            hot_waves=len(hot), cold_waves=len(cold), windows=s.rounds,
+            waves=[dict(rows=w.rows, query_group=w.queryGroup, stride=w.stride, ready_end=w.readyEnd)
+                   for w in hot + cold],
         )
         self.function = rotating.library.kvip_lifetch_staged_forward
         self.function.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_void_p, ctypes.POINTER(Plan)]

@@ -39,6 +39,12 @@ def _bind_selectors(torch, policy, config):
     score_route = getattr(config, "lifetch_score_route", "legacy")
     if score_route not in ("legacy", "auto", "history", "bsq"):
         raise ValueError("lifetch_score_route must be legacy, auto, history or bsq")
+    score_post = getattr(config, "lifetch_score_post", "separate")
+    score_prepare = getattr(config, "lifetch_score_prepare", "wave")
+    if score_post not in ("separate", "scatter", "direct") or score_prepare not in ("wave", "invocation"):
+        raise ValueError("Invalid lifetch_score_post/lifetch_score_prepare")
+    if score_route == "legacy" and (score_post != "separate" or score_prepare != "wave"):
+        raise ValueError("lifetch score post/prepare require a staged score route")
     split_score = score_route != "legacy"
     aiv_budget = query_device_resources("", policy.pool.device.index)["aiv"] if split_score else None
     if split_score:
@@ -97,6 +103,7 @@ def _bind_selectors(torch, policy, config):
             output_stride=policy.slot_capacity,
             scratch=scratch,
             score_route=score_route,
+            score_post=score_post, score_prepare=score_prepare,
             aiv_budget=aiv_budget,
         )
         update = DirectIndexUpdate(
@@ -107,13 +114,13 @@ def _bind_selectors(torch, policy, config):
     policy.indexer_selectors = selectors
     logging.getLogger("vllm").info(
         "KVAF decode backend=li_fetch groups=%s batch_capacity=%s history_capacity=%s hot_tokens=%s "
-        "requested_windows=%s score_route=%s; shared Runtime queues and original LRU candidates",
+        "requested_windows=%s score_route=%s score_post=%s score_prepare=%s; shared Runtime queues and original LRU candidates",
         len(selectors),
         setup.batch,
         policy.fused_index_storage[0].history,
         policy.history_capacity,
         setup.windows,
-        score_route,
+        score_route, score_post, score_prepare,
     )
 
 
@@ -165,6 +172,10 @@ def prepare_workspace(torch, policy, config, device_id, soc, index_heads=64):
 
 
 def _bind_ubmem_selectors(torch, policy, config):
+    if (getattr(config, "lifetch_score_route", "legacy") != "legacy" or
+        getattr(config, "lifetch_score_post", "separate") != "separate" or
+        getattr(config, "lifetch_score_prepare", "wave") != "wave"):
+        raise ValueError("UBmem supports only legacy score with default post/prepare")
     setup, workspace, writer = policy.fused_setup, policy.fused_workspace, policy.writer
     if config.transport != "ubmem" or setup is None or workspace is None or writer is None:
         raise RuntimeError("UBmem binding requires a profiled workspace and service caches")

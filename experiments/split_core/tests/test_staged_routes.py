@@ -197,7 +197,7 @@ class StagedRoutes(unittest.TestCase):
 int main(){
  static_assert(sizeof(kvip_staged::ScoreWave)==40);
  static_assert(sizeof(kvip_staged::ScoreTask)==16);
- static_assert(sizeof(kvip_staged::Plan)==40);
+ static_assert(sizeof(kvip_staged::Plan)==64);
  rotating::RuntimeShape s{};s.batch=32;s.history=131072;s.resident=16384;
  s.indexHeads=32;s.aicCount=28;s.tokenBytes=656;s.rounds=2;
  assert(rotating::PrepareShape(&s)!=0);

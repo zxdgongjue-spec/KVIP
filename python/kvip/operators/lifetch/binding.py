@@ -41,10 +41,16 @@ class LIFetchBinding:
         aiv_budget=None,
         q_workers=2,
         score_route="legacy",
+        score_post="separate",
+        score_prepare="wave",
     ):
         if score_route not in ("legacy", "auto", "history", "bsq"):
             raise ValueError("score_route must be legacy, auto, history or bsq")
+        if score_post not in ("separate", "scatter", "direct") or score_prepare not in ("wave", "invocation"):
+            raise ValueError("Invalid staged score_post or score_prepare")
         staged = staged or score_route != "legacy"
+        if not staged and (score_post != "separate" or score_prepare != "wave"):
+            raise ValueError("score_post/score_prepare require a staged score route")
         if staged and (final_workers not in (0, 4) or intermediate_fetches < 2):
             raise ValueError("Split score requires four Final records and Hot/Cold windows")
         if resident > 131072:
@@ -67,6 +73,7 @@ class LIFetchBinding:
             aiv_budget = int(query_device_resources("", ordinal)["aiv"])
         self.staged = staged
         self.score_route = "auto" if staged and score_route == "legacy" else score_route
+        self.score_post, self.score_prepare = score_post, score_prepare
         self.aiv_budget = aiv_budget
         self.runtime_shape = RuntimeShape.prepare(
             self.library,

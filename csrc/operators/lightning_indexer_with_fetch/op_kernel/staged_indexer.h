@@ -5,6 +5,7 @@
 #error "Include staged_indexer.h only from staged_vector.cpp"
 #endif
 #include "../../common/lifetch/staged_schedule.h"
+#include "staged_post_device.h"
 namespace kvip_staged_device {
 using namespace AscendC;
 using namespace QLICommon;
@@ -58,6 +59,49 @@ extern "C" __global__ __aicore__ void v9_staged_scatter(GM_ADDR input,GM_ADDR ca
             SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
             DataCopy(dst[(uint64_t(t->owner)*4+t->queryBegin+q)*history+t->begin+x],local,n);
             SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+        }
+        pipe.Destroy();
+    }
+}
+// Match the score kernel's paired AIV query ownership: Q4 -> two Q per AIV,
+// Q2 -> one Q per AIV. No task writes Progress or another task's bitmap bytes.
+extern "C" __global__ __aicore__ void v9_staged_scatter_predicate(
+    GM_ADDR original,GM_ADDR input,GM_ADDR canonical,GM_ADDR tasks,
+    uint32_t rows,uint32_t stride,uint32_t queryGroup) {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV {
+        using namespace AscendC;
+        uint32_t row=GetBlockIdx()/2,lane=GetBlockIdx()%2;if(row>=rows)return;
+        auto a=reinterpret_cast<__gm__ uint64_t*>(original);
+        auto ctx=reinterpret_cast<__gm__ rotating::Context*>(a[14]);
+        auto shape=rotating::LoadRuntimeShape(ctx);
+        auto t=reinterpret_cast<__gm__ const kvip_staged::ScoreTask*>(tasks)+row;
+        TPipe pipe;TBuf<TPosition::VECCALC> data,packed;
+        pipe.InitBuffer(data,8192);pipe.InitBuffer(packed,1024);
+        auto local=data.Get<uint16_t>();auto bits=packed.Get<uint8_t>();
+        GlobalTensor<uint16_t> src,dst;GlobalTensor<uint8_t> bitmap;
+        src.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(input));
+        dst.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(canonical));
+        bitmap.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(ctx->hits));
+        uint32_t first=kvip_staged_post::FirstQuery(queryGroup,lane);
+        for(uint32_t q=first;q<first+kvip_staged_post::QueryCount(queryGroup);++q) {
+            uint32_t realQ=t->queryBegin+q;
+            uint16_t theta=reinterpret_cast<__gm__ uint16_t*>(a[13])[
+                kvip_staged_post::ThresholdOffset(t->owner,realQ)];
+            uint32_t valid=ctx->queryEnds?reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)[t->owner*4+realQ]:shape.history;
+            for(uint32_t x=0;x<t->end-t->begin;x+=4096) {
+                uint32_t n=t->end-t->begin-x;if(n>4096)n=4096;
+                DataCopy(local,src[(uint64_t(row)*queryGroup+q)*stride+x],n);
+                SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+                Simt::VF_CALL<kvip_staged_device::PackColdUB>(Simt::Dim3{256,1,1},
+                    reinterpret_cast<__ubuf__ uint16_t*>(local.GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ uint8_t*>(bits.GetPhyAddr()),n,n,n/4,1,t->begin+x,
+                    theta,theta,valid,valid);
+                SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+                DataCopy(dst[kvip_staged_post::CanonicalOffset(t->owner,realQ,shape.history,t->begin+x)],local,n);
+                DataCopy(bitmap[kvip_staged_post::BitmapOffset(t->owner,realQ,shape.history,t->begin+x)],bits,n/4);
+                SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+            }
         }
         pipe.Destroy();
     }
@@ -122,16 +166,14 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(256) inline void StagedPreparePages(__gm__ u
 }
 // Refresh graph-captured wave inputs from the live bindings every invocation.
 // Index can permute pages between rounds; cached host copies are not valid inputs.
-extern "C" __global__ __aicore__ void v9_staged_prepare(GM_ADDR original,GM_ADDR waveBindings,
-    GM_ADDR tasks,uint32_t rows,uint32_t stride,uint32_t queryGroup) {
- KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
- if ASCEND_IS_AIV {
-  using namespace AscendC;uint32_t row=GetBlockIdx();if(row>=rows)return;
+__aicore__ inline void PrepareRow(GM_ADDR original,GM_ADDR waveBindings,
+    GM_ADDR tasks,uint32_t rows,uint32_t stride,uint32_t queryGroup,uint32_t row,AscendC::LocalTensor<uint8_t> local) {
+
+  using namespace AscendC;if(row>=rows)return;
   auto src=reinterpret_cast<__gm__ uint64_t*>(original),dst=reinterpret_cast<__gm__ uint64_t*>(waveBindings);
   auto t=reinterpret_cast<__gm__ kvip_staged::ScoreTask*>(tasks)+row;
   auto s=rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(src[14]));
   if(!row){dst[1]=src[1];dst[4]=src[4];kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(dst),64);}
-  TPipe pipe;TBuf<TPosition::VECCALC> buf;pipe.InitBuffer(buf,8192);auto local=buf.Get<uint8_t>();
   const uint32_t fields[3]={0,2,3},widths[3]={128,2,4};
   for(uint32_t f=0;f<3;++f){uint32_t field=fields[f],bytes=queryGroup*s.indexHeads*widths[f];
    GlobalTensor<uint8_t> input,output;input.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(src[field]));
@@ -145,6 +187,27 @@ extern "C" __global__ __aicore__ void v9_staged_prepare(GM_ADDR original,GM_ADDR
   auto inputPages=reinterpret_cast<__gm__ uint32_t*>(src[7]),pages=reinterpret_cast<__gm__ uint32_t*>(dst[7]);
   Simt::VF_CALL<StagedPreparePages>(Simt::Dim3{256,1,1},inputPages,pages,t->owner,t->begin,t->end-t->begin,row,stride,s.history);
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+}
+
+extern "C" __global__ __aicore__ void v9_staged_prepare(GM_ADDR original,GM_ADDR waveBindings,
+    GM_ADDR tasks,uint32_t rows,uint32_t stride,uint32_t queryGroup) {
+ KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+ if ASCEND_IS_AIV {
+  AscendC::TPipe pipe;AscendC::TBuf<AscendC::TPosition::VECCALC> buf;pipe.InitBuffer(buf,8192);
+  PrepareRow(original,waveBindings,tasks,rows,stride,queryGroup,AscendC::GetBlockIdx(),buf.Get<uint8_t>());
+  pipe.Destroy();
+ }
+}
+extern "C" __global__ __aicore__ void v9_staged_prepare_all(GM_ADDR original,GM_ADDR descriptors,uint32_t count) {
+ KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+ if ASCEND_IS_AIV {
+  AscendC::TPipe pipe;AscendC::TBuf<AscendC::TPosition::VECCALC> buf;pipe.InitBuffer(buf,8192);
+  auto waves=reinterpret_cast<__gm__ const kvip_staged::PrepareWave*>(descriptors);
+  for(uint32_t i=0;i<count;++i) {
+   auto w=waves+i;
+   PrepareRow(original,reinterpret_cast<GM_ADDR>(w->bindings),reinterpret_cast<GM_ADDR>(w->tasks),
+       w->rows,w->stride,w->queryGroup,AscendC::GetBlockIdx(),buf.Get<uint8_t>());
+  }
   pipe.Destroy();
  }
 }

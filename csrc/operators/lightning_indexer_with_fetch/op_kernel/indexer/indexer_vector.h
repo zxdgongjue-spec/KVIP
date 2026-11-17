@@ -1,4 +1,6 @@
 #include "prefetch.h"
+#include "../staged_post_device.h"
+#include "../../../common/lifetch/staged_schedule.h"
 #if KVIP_STREAMING_LI
 #include "pipeline_types.h"
 #include "staged_topk_classify.h"
@@ -37,6 +39,26 @@ template <typename QLIT>
 class QLIVector {
 public:
     bool scoreOnly_ = false;
+    // Private output sidecar: all virtual input geometry remains untouched.
+    bool stagedDirect_ = false;
+    kvip_staged::ScoreTask stagedTask_{};
+    uint32_t stagedHistory_=0,stagedValid_[2]{};
+    GM_ADDR stagedCanonical_=nullptr,stagedHits_=nullptr,stagedPrefix_=nullptr;
+    __aicore__ inline void SetStagedOutput(GM_ADDR original,GM_ADDR canonical,GM_ADDR tasks) {
+        if ASCEND_IS_AIV {
+        auto a=reinterpret_cast<__gm__ uint64_t*>(original);
+        auto ctx=reinterpret_cast<__gm__ rotating::Context*>(a[14]);
+        auto s=rotating::LoadRuntimeShape(ctx);
+        auto t=reinterpret_cast<__gm__ const kvip_staged::ScoreTask*>(tasks)+blockId_/2;
+        stagedTask_={t->owner,t->queryBegin,t->begin,t->end};
+        stagedHistory_=s.history;stagedCanonical_=canonical;
+        stagedHits_=reinterpret_cast<GM_ADDR>(ctx->hits);stagedPrefix_=reinterpret_cast<GM_ADDR>(a[13]);
+        uint32_t first=stagedTask_.queryBegin+(blockId_%2)*(s1BaseSize_/2);
+        for(uint32_t q=0;q<s1BaseSize_/2;++q)
+            stagedValid_[q]=ctx->queryEnds?reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)[stagedTask_.owner*4+first+q]:s.history;
+        stagedDirect_=true;
+        }
+    }
     rotating::RuntimeShape runtimeShape_;
     __aicore__ inline void SetRotationContext(GM_ADDR p) {
         rotationContext_ = p;
@@ -529,6 +551,14 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         return;
     }
 
+    if (stagedDirect_ && info.isFirstS2InnerLoop) {
+        GlobalTensor<uint16_t> theta;
+        theta.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(stagedPrefix_));
+        for(uint32_t q=0;q<curAivS1ProcNum;++q)
+            DataCopy(prefixThreshold_[q*128],theta[kvip_staged_post::ThresholdOffset(
+                stagedTask_.owner,stagedTask_.queryBegin+curAivS1Idx+q)],128);
+        SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+    }
     if (info.isFirstS2InnerLoop) {
         WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_QSCALE + qScalepingpong);
         //weightsGm --> weightUB_
@@ -599,6 +629,14 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
                                         qScaleBase, UB_BANK_DEPTH_STRIDE / sizeof(SCALE_T),
                                         gSize_, curAivS1ProcNum);
     }
+    if (stagedDirect_) {
+        PipeBarrier<PIPE_V>();
+        Simt::VF_CALL<kvip_staged_device::PackColdThresholdUB>(Simt::Dim3{256,1,1},
+            reinterpret_cast<__ubuf__ uint16_t*>(outBase.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint8_t*>(classifyUB_.GetPhyAddr())+pingpong*512,
+            reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_.GetPhyAddr()),
+            curAivS1ProcNum,stagedTask_.begin+curS2Idx,stagedValid_[0],stagedValid_[1]);
+    }
     if (info.isFirstS2InnerLoop) {
         SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_QSCALE + qScalepingpong);
     }
@@ -623,7 +661,20 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     copyOutParams.blockLen = s2BaseSize_ * sizeof(SCORE_T);
     copyOutParams.srcStride = (UB_BANK_DEPTH_STRIDE - copyOutParams.blockLen) / 32;
     copyOutParams.dstStride = (QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_) - s2BaseSize_) * sizeof(SCORE_T);
-    DataCopyPad(scoreGm[vec1OutGmOffset], outBase, copyOutParams);
+    if (stagedDirect_) {
+        uint32_t q=stagedTask_.queryBegin+curAivS1Idx,token=stagedTask_.begin+curS2Idx;
+        GlobalTensor<SCORE_T> canonical;
+        canonical.SetGlobalBuffer(reinterpret_cast<__gm__ SCORE_T*>(stagedCanonical_));
+        copyOutParams.dstStride=(stagedHistory_-s2BaseSize_)*sizeof(SCORE_T);
+        DataCopyPad(canonical[kvip_staged_post::CanonicalOffset(stagedTask_.owner,q,stagedHistory_,token)],outBase,copyOutParams);
+        GlobalTensor<uint8_t> bitmap;bitmap.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(stagedHits_));
+        DataCopyExtParams hitCopy;hitCopy.blockCount=curAivS1ProcNum;
+        hitCopy.blockLen=32;hitCopy.srcStride=7;hitCopy.dstStride=stagedHistory_/4-32;hitCopy.rsv=0;
+        DataCopyPad(bitmap[kvip_staged_post::BitmapOffset(stagedTask_.owner,q,stagedHistory_,token)],
+            classifyUB_[pingpong*256].template ReinterpretCast<uint8_t>(),hitCopy);
+    } else {
+        DataCopyPad(scoreGm[vec1OutGmOffset], outBase, copyOutParams);
+    }
 #if SIM_CAPTURE_HITS
     if (!scoreOnly_ && curS2Idx >= runtimeShape_.resident) {
         constexpr uint32_t prefixBytes = SIM_Q * 2048 * 6 + SIM_Q * 256;

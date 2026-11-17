@@ -122,6 +122,8 @@ for b in (24, 32):
         rotating.arguments[5] = T(np.full(b, 4, np.int32))
         rotating.arguments[6] = T(np.full(b, s.history, np.int32))
         rotating.library.kvip_lifetch_staged_forward = Mock(return_value=0)
+        rotating.library.kvip_staged_plan_bytes = Mock(return_value=64)
+        rotating.library.kvip_staged_plan_version = Mock(return_value=2)
         torch = rotating.torch
         torch.uint8 = np.uint8
         torch.uint16 = np.uint16
@@ -162,6 +164,8 @@ for group in range(2):
     rotating.arguments[5] = T(np.full(3, 4, np.int32))
     rotating.arguments[6] = T(np.full(3, 8192, np.int32))
     rotating.library.kvip_lifetch_staged_forward = Mock(return_value=0)
+    rotating.library.kvip_staged_plan_bytes = Mock(return_value=64)
+    rotating.library.kvip_staged_plan_version = Mock(return_value=2)
     torch = rotating.torch
     torch.uint8 = np.uint8
     torch.uint16 = np.uint16

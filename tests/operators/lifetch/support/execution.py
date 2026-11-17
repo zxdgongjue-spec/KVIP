@@ -355,7 +355,7 @@ def dispatch(config):
     run.mkdir(parents=True, exist_ok=False)
     common = {key: getattr(config, key) for key in
               ('transport', 'device', 'kvaf_root', 'kvaf_server', 'output', 'timeout_seconds',
-               'aic_budget', 'aiv_budget', 'q_workers', 'score_route')}
+               'aic_budget', 'aiv_budget', 'q_workers', 'score_route', 'score_post', 'score_prepare')}
     if config.mode == 'all':
         check = configuration(['check'])
         vars(check).update(common)
@@ -368,7 +368,7 @@ def dispatch(config):
     else:
         jobs = [(config.mode, config)]
     for _, job in jobs:
-        vars(job).update({key: getattr(config, key) for key in ('aic_budget', 'aiv_budget', 'q_workers', 'score_route')})
+        vars(job).update({key: getattr(config, key) for key in ('aic_budget', 'aiv_budget', 'q_workers', 'score_route', 'score_post', 'score_prepare')})
     atomic_json(run / 'config.json', {key: str(value) if isinstance(value, Path) else value
                                     for key, value in vars(config).items()})
     rows, stopped = [], False
@@ -1745,8 +1745,8 @@ def run_urma(args, run_dir):
                     index_heads=args.index_heads, seed=args.seed if hasattr(args, 'seed') else 20261104,
                     fixture=fixture_info,
                     resources=resources,
-                    resource_geometry=geometry,
-                    final_workers=final_aivs(batch, "auto", aics, 0),
+                    resource_geometry=(report.get("score_geometry") if args.score_route != "legacy" else geometry),
+                    final_workers=(4 if args.score_route != "legacy" else final_aivs(batch, "auto", aics, 0)),
                     build_options={k: str(v) for k, v in options.items()},
                 )
                 (folder / "report.json").write_text(json.dumps(report, indent=2))
@@ -2018,6 +2018,8 @@ def run_urma_case(
         aiv_budget=getattr(args, 'aiv_budget', None),
         q_workers=args.q_workers,
         score_route=getattr(args, 'score_route', 'legacy'),
+        score_post=getattr(args, 'score_post', 'separate'),
+        score_prepare=getattr(args, 'score_prepare', 'wave'),
         prefetch_limit=args.prefetch_tokens,
         output_stride=owner.output.shape[1],
     )
@@ -2125,6 +2127,21 @@ def run_urma_case(
             update.check_capacity()
         if completion_only:
             return
+        if getattr(pipeline, "staged_score", False):
+            # Outside graph timing: compare every Cold packed byte with the
+            # canonical sortable keys, global resident theta and real Q bounds.
+            canonical = pipeline.canonical.cpu().numpy().reshape(b, 4, h)
+            prefix_blob = arguments[13].cpu().numpy().view(np.uint8).reshape(-1)
+            threshold_rows = prefix_blob[:b * (4 * 2048 * 6 + 1024)].view(np.uint16).reshape(b, -1)
+            theta = threshold_rows[:, 4 * 2048 * 3:].reshape(b, 4, 128)[:, :, 0]
+            ends = rotating.query_ends.cpu().numpy().reshape(b, 4)
+            pred = (canonical[:, :, r:] > theta[:, :, None]) & (np.arange(r, h)[None, None, :] < ends[:, :, None])
+            groups = pred.reshape(b, 4, (h-r)//4, 4).astype(np.uint8)
+            expected_bits = (groups * np.array([1, 4, 16, 64], dtype=np.uint8)).sum(axis=-1).astype(np.uint8)
+            hit_offset = b * (4 * 2048 * 6 + 1024)
+            actual_bits = prefix_blob[hit_offset:hit_offset+b*h].reshape(b, 4, h//4)[:, :, r//4:]
+            if not np.array_equal(actual_bits, expected_bits):
+                raise AssertionError("Staged Cold predicate differs from canonical score/global resident theta/queryEnds")
         selected = topk.cpu().numpy()
         if np.any(selected < 0) or np.any(selected >= h):
             raise RuntimeError("TopK contains out-of-range positions")
@@ -2416,6 +2433,8 @@ def run_urma_case(
         fetch_only = compare_fetch_only(torch, owner, rotating, pipeline, args)
         atomic_json(folder / "fetch_only.json", dict(status="PASS", rows=fetch_only))
     return dict(
+        score_geometry=getattr(pipeline, "score_geometry", dict(route="legacy", post="separate", prepare="wave",
+            effective_aic=rotating.runtime_shape.aicCount, aiv_budget=rotating.aiv_budget, windows=rotating.runtime_shape.rounds)),
         status=correctness.status.lower(),
         correctness=correctness.status,
         correctness_failures=correctness.failures,
@@ -3211,7 +3230,8 @@ class FusedReplayState:
     state must not have live graphs or unfinished device work.
     """
     def __init__(self, torch, runtime, table, library, initial, pages, addresses,
-                 *, device, aics, windows, prefetch_tokens, soc, aiv_budget=None, q_workers=2, score_route='legacy'):
+                 *, device, aics, windows, prefetch_tokens, soc, aiv_budget=None, q_workers=2, score_route='legacy',
+                 score_post='separate', score_prepare='wave'):
         from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
         from kvip.cache.index_storage import IndexCacheStorage
         from kvip.operators.lifetch.binding import LIFetchBinding
@@ -3265,7 +3285,8 @@ class FusedReplayState:
                     batch=self.batch, history=self.history, resident=self.resident,
                     intermediate_fetches=windows, prefetch_limit=prefetch_tokens,
                     aic_count=aics, token_bytes=self.token_bytes, aiv_budget=aiv_budget,
-                    q_workers=q_workers, score_route=score_route, **binding)
+                    q_workers=q_workers, score_route=score_route,
+                    score_post=score_post, score_prepare=score_prepare, **binding)
             update_type = UbmemIndexUpdate if ubmem else DirectIndexUpdate
             self.update = update_type(
                 torch, keys=self.storage.keys, scales=self.storage.scales,
@@ -3599,7 +3620,9 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
                 device=device, aics=aics, windows=config.intermediate_fetches,
                 prefetch_tokens=config.prefetch_tokens, soc=soc,
                 aiv_budget=getattr(config, 'aiv_budget', None), q_workers=config.q_workers,
-                score_route=getattr(config, 'score_route', 'legacy'))
+                score_route=getattr(config, 'score_route', 'legacy'),
+                score_post=getattr(config, 'score_post', 'separate'),
+                score_prepare=getattr(config, 'score_prepare', 'wave'))
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
         checks = CorrectnessRecorder()
@@ -3650,7 +3673,11 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
         if checks.failures:
             result['correctness'] = 'FAIL'
             result['failures'] = checks.failures + result['failures']
-        result.update(transport=config.transport, path='fused' if fused else 'serial',
+        result.update(score_geometry=getattr(getattr(state, 'forward', None), 'score_geometry', None),
+                      score_route=getattr(config, 'score_route', 'legacy'),
+                      score_post=getattr(config, 'score_post', 'separate'),
+                      score_prepare=getattr(config, 'score_prepare', 'wave'),
+                      transport=config.transport, path='fused' if fused else 'serial',
                       runtime_workers=workers, kv_payload=('deterministic C8; real Q/Index; captured page aliases'
                       if config.input == 'real' else 'deterministic C8; synthetic controlled Q/Index'),
                       lru_initialization='captured 2048 oldest slots; remaining order initialized by slot ID',

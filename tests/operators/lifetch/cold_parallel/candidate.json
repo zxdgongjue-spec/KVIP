@@ -1,0 +1,21 @@
+{
+  "base_commit": "056fe629aef5f860d7541ee1123e476f145c84e3",
+  "private_plan_abi": 2,
+  "files_sha256": {
+    "csrc/operators/common/lifetch/staged_post.h": "671d0f64a3b3465ee397ecf81527608d1180b5d1299a18b863be0fbdf30c76ec",
+    "csrc/operators/common/lifetch/staged_schedule.h": "e27689006c34a31bc9fd41fcfadfbcc2ec19039e0123a1c0e6638594fee04d4a",
+    "csrc/operators/lightning_indexer_with_fetch/op_host/launch.cpp": "1b98e84d64f18a8405298fe3ad397803b0e76a119c3457380a41ff2692bc4a9a",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer.cpp": "496cf4055febf43897afa7b872ce2b253302ae2c72127f67a21ab93e5e17deb6",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_vector.h": "9818dcbb641195feb31988efcc5c64fcd1ff7d65436d92c77b72a3543469e6f2",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/staged_indexer.h": "e916848f580a1358a7dbf524646c23c95d2642e02a27d0a0a16197cbf5e7843a",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/staged_post_device.h": "eeb21404b37dac543a4bccedc8e8ea020f2929a10a9933c2a76855e1e6d040dd",
+    "experiments/split_core/tests/check_staged_binding.py": "78984712c27c7202a36b07d916beec5165e8ba7d22faf702f5fc4f0df006a4aa",
+    "experiments/split_core/tests/test_staged_routes.py": "5f478da62d614646bb05d6af8240440b60a306d7af0959ddac8b0f5390606ca6",
+    "python/kvip/adapters/vllm/binding.py": "129d10d9abef3b2fdde558355a7dfa10387eded5d9f713439a7018de50a4c141",
+    "python/kvip/operators/lifetch/binding.py": "ac860489a06071864c04e630156c557ccc430c202ba542d697f00b9b192b6520",
+    "python/kvip/operators/lifetch/forward.py": "c37730a191be10c229e4a0edae324d081770ec3c9b87dcbd0cedbf849a89d00f",
+    "python/kvip/operators/lifetch/staged.py": "d8d6aa3af931f8ab07d0686c08b4e70285f79ea562564b98057cb065180887e2",
+    "tests/operators/lifetch/support/execution.py": "dfb24e2ba1fc335c64d19e4c89f31a0de91f4717377694359e3e77f7d7ee6edc",
+    "tests/operators/lifetch/support/workloads.py": "4bcb684c5324de707d835585f84f2a4e6a97af214933cb3993a390d82c238a7a"
+  }
+}
