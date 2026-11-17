@@ -52,6 +52,10 @@ def arguments(argv=None):
         choices=tuple(VARIANTS),
     )
     p.add_argument("--scan-variants", nargs="+", choices=tuple(SCAN_VARIANTS))
+    p.add_argument("--cold-windows", type=int, choices=(8,),
+                   help="Eight cold windows plus the resident publication (9 native rounds)")
+    p.add_argument("--compare-layout", action="store_true",
+                   help="Compare persistent post-state outside timing, including repeat drift")
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--iterations", type=int, default=10)
     p.add_argument(
@@ -113,6 +117,10 @@ def arguments(argv=None):
             p.error("scan-variants must be unique")
     elif args.scan_variants:
         p.error("scan-variants requires study=scan-order")
+    if (args.cold_windows is not None or args.compare_layout) and args.study != "scan-order":
+        p.error("cold-windows/compare-layout requires study=scan-order")
+    if args.compare_layout and args.scan_variants != ["forward", "reverse", "reverse-end", "forward-end"]:
+        p.error("compare-layout requires forward reverse reverse-end forward-end")
     if args.topk_probe and args.study != "post-threshold":
         p.error("topk-probe requires study=post-threshold")
     if args.study in ("threshold-only", "seed-ub", "local-victims", "register-kth", "overlap-victims") and (

@@ -102,8 +102,10 @@ def create_fused(
     b, h, r = (g[n] for n in ("batch", "history", "resident"))
     if aics < g["aic_count"]:
         raise ValueError("Replay device has fewer AICs than the recorded input")
-    if g["requested_windows"] != 8:
-        raise ValueError("This comparison uses current serving defaults: 8 windows, 512 prefetch tokens")
+    if g["requested_windows"] != 8 and not (
+        upstream and scan_options is not None and g["requested_windows"] == 9
+    ):
+        raise ValueError("Replay requires 8 native rounds, or explicit scan study with 8 cold + 1 resident rounds")
     common = dict(
         batch=b, history=h, aics=g["aic_count"], windows=g["requested_windows"], device=device, index_heads=g["heads"]
     )

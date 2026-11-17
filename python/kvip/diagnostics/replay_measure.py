@@ -325,6 +325,16 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
     phase(retained, "final_verify")
     verify()  # Full score/Index/KV oracle after the final measured replay.
     result = dict(timing=statistics(samples), reads_samples=reads)
+    if getattr(args, "compare_layout", False):
+        from kvip.diagnostics.layout_state import capture
+
+        phase(retained, "post_layout_readback")
+        result["layout_audit"] = capture(
+            post_state(torch, bundle.selector), bundle.oracle,
+            address_delta=retained["address_delta"],
+            variant=retained["progress"]["variant"],
+            references=retained["layout_references"],
+        )
     diagnostic_count = getattr(args, "diagnostic_replays", 0)
     if diagnostic_count and args.mode == "fused":
         from kvip.diagnostics.native_profile import decode_profile
@@ -463,6 +473,9 @@ def measure_case(args, archive, context, retained):
     device, stream, cann, aics = context.device, context.stream, context.cann, context.aics
     runtime, restored, table = context.runtime, context.restored, context.table
     case_retained = {"progress": retained.setdefault("progress", {})}
+    if getattr(args, "compare_layout", False):
+        case_retained["layout_references"] = retained.setdefault("layout_references", {})
+        case_retained["address_delta"] = restored["new_base"] - restored["old_base"]
     retained["active_case"] = case_retained
     phase(retained, "bundle_create")
     if args.mode == "fused":
@@ -578,6 +591,7 @@ def measure_case(args, archive, context, retained):
         replay_selection=archive.manifest.get("replay_selection"),
         scope="Query_Index_ready_to_LI_TopK_Fetch_cache_state_and_TND_slot_outputs",
         geometry=archive.manifest["geometry"],
+        schedule_override=archive.manifest.get("layout_audit_schedule"),
         device=args.device,
         soc=args.soc,
         kvaf_module=str(Path(kvaf.__file__).resolve()),
@@ -756,6 +770,10 @@ def verify_case_equivalence(cases, *, same_threshold):
 
 
 def run(args, archive, retained):
+    if getattr(args, "cold_windows", None) is not None:
+        from kvip.diagnostics.layout_state import configure_windows
+
+        configure_windows(archive, args.cold_windows)
     if getattr(args, "study", "threshold") == "scan-order":
         from kvip.diagnostics.scan_options import prebuild
 
