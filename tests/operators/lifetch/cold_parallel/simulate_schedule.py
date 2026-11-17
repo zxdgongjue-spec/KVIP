@@ -27,18 +27,25 @@ def snapshot(ref, root):
         target=root/path;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(content)
     return subprocess.check_output(['git','rev-parse',ref],cwd=SOURCE,text=True).strip()
 
-def execute(source, lib, tags, windows, post, prepare, service, hot_p, cold_p, aics, aivs):
-    split=runpy.run_path(str(source/'python/kvip/operators/lifetch/schedule.py'))['split_score_tasks']
-    h,r,b=131072,16384,1
-    shape=RuntimeShape(batch=b,history=h,resident=r,indexHeads=32,aicCount=aics,rounds=windows,tokenBytes=656)
-    assert lib.kvip_prepare_staged_shape(C.byref(shape),aivs,2)==0
-    waves=[];tasks_all=[];ranges=[]
+def execute(source, lib, tags, windows, post, prepare, service, hot_p, cold_p, aics, aivs,
+            *, batch=1,history=131072,resident=16384,heads=32,workers=2,route='history',splitter=None,compact=False):
+    split=splitter or runpy.run_path(str(source/'python/kvip/operators/lifetch/schedule.py'))['split_score_tasks']
+    h,r,b=history,resident,batch
+    shape=RuntimeShape(batch=b,history=h,resident=r,indexHeads=heads,aicCount=aics,rounds=windows,tokenBytes=656)
+    assert lib.kvip_prepare_staged_shape(C.byref(shape),aivs,workers)==0
+    waves=[];tasks_all=[];prepared_queries=0
     def phase(begin,end,partitions):
         opts=dict(partitions=partitions) if partitions else {}
-        qg,_,tasks=split(b,begin,end,aics,aivs,'history',**opts)
-        tasks_all.extend(tasks);ranges.extend((t[2],t[3]) for t in tasks)
-        assert tasks[0][2]==begin and tasks[-1][3]==end
-        assert all(t[3]==z[2] for t,z in zip(tasks,tasks[1:]))
+        nonlocal prepared_queries
+        qg,_,tasks=split(b,begin,end,aics,aivs,route,**opts)
+        tasks_all.extend(tasks);prepared_queries+=len(tasks)*qg
+        coverage={}
+        for owner,q,lo,hi in tasks:
+            for real_q in range(q,q+qg):coverage.setdefault((owner,real_q),[]).append((lo,hi))
+        assert len(coverage)==b*4
+        for intervals in coverage.values():
+            assert intervals[0][0]==begin and intervals[-1][1]==end
+            assert all(t[1]==z[0] for t,z in zip(intervals,intervals[1:]))
         result=[];cap=min(aics,aivs//2)
         for first in range(0,len(tasks),cap):
             chunk=tasks[first:first+cap];stride=max(t[3]-t[2] for t in chunk)
@@ -49,7 +56,7 @@ def execute(source, lib, tags, windows, post, prepare, service, hot_p, cold_p, a
         end=r+((h-r)//128*epoch//(windows-1))*128
         cold.extend(phase(begin,end,cold_p));begin=end
     hot_array=(ScoreWave*len(hot))(*hot);cold_array=(ScoreWave*len(cold))(*cold)
-    plan=Plan(300,hot_array,cold_array,len(hot),len(cold),aivs,2,400,len(waves),post,prepare,service)
+    plan=Plan(300,hot_array,cold_array,len(hot),len(cold),aivs,workers,400,len(waves),post,prepare,service)
     lib.reset(0)
     status=lib.kvip_lifetch_staged_forward(1,2,3,C.byref(shape),C.byref(plan))
     assert status==0,status
@@ -64,17 +71,34 @@ def execute(source, lib, tags, windows, post, prepare, service, hot_p, cold_p, a
     # Prepared Q / weight / qscale payload, each direction. Pages are unique H
     # ranges; padding, cache sectors and other operator traffic are excluded.
     prepared_rows=sum(w.rows for w in waves)
-    input_bytes=prepared_rows*4*32*(128+2+4)
-    cold_keys=4*(h-r);bitmap_bytes=cold_keys//4
+    input_bytes=prepared_queries*heads*(128+2+4)
+    cold_keys=b*4*(h-r);bitmap_bytes=cold_keys//4
     score_payload=cold_keys*2*({0:4,1:3,2:1}[post])
     cold_tasks=len(tasks_all)-sum(w.rows for w in hot)
-    return dict(windows=windows,post=post,prepare=prepare,service=service,
+    first_service=sequence.index('staged_service_ready' if service else 'staged_service')
+    hot_queries=sum(w.rows*w.queryGroup for w in hot)
+    hot_loops=sum(w.stride//128 for w in hot);cold_loops=sum(w.stride//128 for w in cold)
+    return dict(batch=b,history=h,resident=r,heads=heads,workers=workers,route=route,
+        aics=aics,aivs=aivs,windows=windows,post=post,prepare=prepare,service=service,
         requested_hot_partitions=hot_p,requested_cold_partitions=cold_p,
-        dispatch_count=len(sequence),dispatch_sequence=sequence,prepared_task_rows=prepared_rows,
+        dispatch_count=len(sequence),**({} if compact else dict(dispatch_sequence=sequence)),prepared_task_rows=prepared_rows,
         prepared_q_weight_qscale_bytes_each_direction=input_bytes,
+        prepare_bytes_before_hot_service=input_bytes if prepare==1 else hot_queries*heads*(128+2+4),
+        dispatches_before_hot_service=first_service,
+        hot_score_waves=len(hot),cold_score_waves=len(cold),
+        query_group=hot[0].queryGroup,
+        hot_task_rows=sum(w.rows for w in hot),cold_task_rows=sum(w.rows for w in cold),
+        hot_critical_128key_iterations=hot_loops,cold_critical_128key_iterations=cold_loops,
+        score_critical_128key_iterations=hot_loops+cold_loops,
+        logical_qk_macs=b*4*heads*h*128,
+        final_score_read_payload_bytes=b*4*h*2,
+        hot_score_intermediate_and_resident_topk_payload_bytes=b*4*r*2*4,
+        scratch_score_allocation_bytes=sum(w.rows*w.queryGroup*w.stride*2 for w in waves),
+        virtual_selected_allocation_bytes=prepared_queries*2048*4,
+        hot_service_calls=1,cold_service_calls=windows-1,
         cold_score_gm_payload_bytes=score_payload,cold_bitmap_payload_bytes=bitmap_bytes,
         cold_predicate_comparisons=cold_keys,
-        direct_theta_padded_dma_bytes=cold_tasks*4*256 if post==2 else 0,
+        direct_theta_padded_dma_bytes=sum(w.rows*w.queryGroup*256 for w in cold) if post==2 else 0,
         hot_key_lengths=sorted(set(t[3]-t[2] for t in tasks_all[:sum(w.rows for w in hot)])),
         cold_key_lengths=sorted(set(t[3]-t[2] for t in tasks_all[sum(w.rows for w in hot):])),
         resident_topk_h_partitions=1,final_topk_h_partitions=1)

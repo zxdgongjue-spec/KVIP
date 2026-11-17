@@ -413,6 +413,48 @@ class Checks(unittest.TestCase):
         candidate_report.write_text(json.dumps(changed))
         self.assertNotEqual(subprocess.run(command,capture_output=True).returncode,0)
 
+    def test_10_source_tradeoffs_and_explicit_shortlist(self):
+        sys.path.insert(0,str(TASK))
+        from simulate_schedule import execute
+        from explore_schedule import conditional_cost,REPORT
+        lib,tags,_=LIB
+        def row(w,ph,pc,**kw):return execute(SOURCE,lib,tags,w,2,2,1,ph,pc,28,56,splitter=split_score_tasks,compact=True,**kw)
+        a,b=row(2,28,28),row(8,28,28)
+        self.assertEqual((a['score_critical_128key_iterations'],b['score_critical_128key_iterations']),(37,40))
+        for w in (2,8):
+            low=row(w,4,8);self.assertEqual(low['score_critical_128key_iterations'],144)
+            self.assertEqual(low['logical_qk_macs'],a['logical_qk_macs'])
+        lower=row(8,26,26)
+        self.assertEqual(lower['score_critical_128key_iterations'],b['score_critical_128key_iterations'])
+        self.assertLess(lower['prepared_q_weight_qscale_bytes_each_direction'],b['prepared_q_weight_qscale_bytes_each_direction'])
+        q2=row(2,0,0,route='bsq');self.assertEqual(q2['logical_qk_macs'],a['logical_qk_macs'])
+        base=execute(SOURCE,lib,tags,8,0,0,0,0,0,28,56,splitter=split_score_tasks,compact=True)
+        self.assertAlmostEqual(conditional_cost(base,base,.5,.5,.1,.5),sum(REPORT.values()))
+        import run_controls
+        args=NS(rounds=1,windows=[2],prefetch=[512],python=sys.executable,repo=SOURCE,device=5,
+                kvaf_root=Path('/tmp/KVAF'),warmup=4,iterations=20,aic_budget=28,output=TMP/'pairs',timeout=300,
+                aiv_budget=56,kvaf_server=None,valid_history=None,matrix='tuning',hot_partitions=[4,8],
+                cold_partitions=[4,8,16],partition_pairs=[(4,8),(26,28)],prepares=['phase'],fetch_workers=[2])
+        commands=list(run_controls.commands(args));self.assertEqual(len(commands),14)
+        for _,_,cmd in commands:
+            c=configuration(cmd[2:])
+            if c.score_hot_partitions:self.assertIn((c.score_hot_partitions,c.score_cold_partitions),args.partition_pairs)
+
+    def test_11_model_plan_matches_actual_dispatch(self):
+        sys.path.insert(0,str(TASK))
+        from run_model_controls import configs
+        from simulate_schedule import execute
+        lib,tags,_=LIB
+        for matrix in ('smoke','full'):
+            rows=configs(matrix);self.assertEqual(len(rows),len({r['name'] for r in rows}))
+            for r in rows:
+                if r['route']=='legacy':continue
+                out=execute(SOURCE,lib,tags,r['windows'],{'separate':0,'scatter':1,'direct':2}[r['post']],
+                    {'wave':0,'invocation':1,'phase':2}[r['prepare']],int(r['service']=='inline'),r['hot'],r['cold'],
+                    r['aics'],r['aivs'],batch=r['batch'],history=r['history'],resident=r['resident'],route=r['route'],
+                    workers=r['workers'],splitter=split_score_tasks,compact=True)
+                self.assertEqual(out['cold_predicate_comparisons'],r['batch']*4*(r['history']-r['resident']))
+
 if __name__=='__main__':
     with tempfile.TemporaryDirectory(prefix='kvip-cold-cpu-') as d:
         TMP=Path(d);LIB=compile_harnesses()

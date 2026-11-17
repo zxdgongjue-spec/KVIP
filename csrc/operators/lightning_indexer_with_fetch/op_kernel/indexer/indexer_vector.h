@@ -43,7 +43,9 @@ public:
     bool stagedDirect_ = false;
     kvip_staged::ScoreTask stagedTask_{};
     uint32_t stagedHistory_=0,stagedValid_[2]{};
-    GM_ADDR stagedCanonical_=nullptr,stagedHits_=nullptr,stagedPrefix_=nullptr;
+    GM_ADDR stagedCanonical_=nullptr;
+    GM_ADDR stagedHits_=nullptr;
+    GM_ADDR stagedPrefix_=nullptr;
     __aicore__ inline void SetStagedOutput(GM_ADDR original,GM_ADDR canonical,GM_ADDR tasks) {
         if ASCEND_IS_AIV {
         auto a=reinterpret_cast<__gm__ uint64_t*>(original);

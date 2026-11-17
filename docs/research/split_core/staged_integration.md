@@ -70,4 +70,4 @@ main统一测试入口的paired native benchmark保留B≤16，URMA `bench/check
 
 该小尺寸fixture的每owner cold并集为410；另有563个选中resident token落在预留LRU区。prefetch0且无tail映射时，旧缓存契约将这些reserved hot token也计入补取，因此独立输入oracle要求去重补取总数973。driver同时检查row/worker计数，不能用cold数替代最终补取数；完整Final集合、映射和payload检查仍保留。
 
-Model中prefetch预算为0，使用独立编译的current score wrapper与当前完整tail，最终BatchGet使用受控同步GM-copy；原生staged入口另行编译/链接核验。它不证明真实URMA/CQE/DMA、非零prefetch异步正确性或真机速度。完整42场景Model矩阵以及NPU/KVAF整链验收仍pending；新路径不设为默认。本文没有将独立TopK测量当score或整链提速证据。
+历史Model中prefetch预算为0，使用独立编译的current score wrapper与当时完整tail，最终BatchGet使用受控同步GM-copy；原生staged入口另行编译/链接核验。当前完整driver默认使用生产score（`STAGED_SCORE_WRAPPER=OFF`），新增legacy控制、W/post/prepare/service/Ph/Pc/Fetch参数和公共clock probes；新源码编译与Model结果见[本轮探索报告](optimization_exploration_20261117.md)。两种Model都不证明真实URMA/CQE/DMA、非零prefetch异步正确性或真机速度。完整42场景Model矩阵以及NPU/KVAF整链验收仍pending；新路径不设为默认。本文没有将独立TopK测量当score或整链提速证据。

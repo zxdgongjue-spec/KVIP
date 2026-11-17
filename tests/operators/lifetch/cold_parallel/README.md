@@ -1,5 +1,7 @@
 # A5：MR14 Cold predicate 并行整链对比
 
+32 AIC / 64 AIV 的新一轮实验及可直接执行的窗口短名单见[实验报告](../../../../docs/research/split_core/a5_budget_experiment_20261117.md)。`run_a5_budget.py` 包装本目录的 `run_controls.py`，W2/prefetch512 为40个case；默认W2/W8、prefetch0/512共160个case，均包含同构建P2与原staged控制。预算不足会过滤超预算短名单。源码调度12,288项通过，不代表A5计时或设备ISA验收。
+
 此目录随 MR14 源分支一起发布，直接使用当前 checkout 的 `test_lifetch.py`。无需另外应用补丁。
 
 默认保持 `score_route=legacy`。显式 staged 候选提供 `score_post=separate|scatter|direct`、`score_prepare=wave|invocation|phase`、`score_service=separate|inline`，以及独立 `score_hot_partitions` / `score_cold_partitions`。Cold 分类继承 score task 的两个配套 AIV；direct 在原 reduction 后直接输出 canonical＋bitmap。phase 分别合并 Hot、Cold prepare，Cold prepare 仍排在 Hot Service 后；inline 由 Service AIV 发布自己的 owner ready，消除独立 progress launch。每次调用仍刷新实时输入。
@@ -108,3 +110,41 @@ python3 tests/operators/lifetch/cold_parallel/simulate_schedule.py \
 ```
 
 结果见`docs/research/split_core/results/critical-path-simulation.json`；实现与限制说明见`docs/research/split_core/critical_path_candidate.md`。
+
+## 全量探索后的短名单
+
+源码主/补充网格共13,148项有效调度已检查。Ph4/Pc8复制少，但关键score循环较P28增长约3.6–3.9倍，因此不要只测低分片。建议先固定phase、Fetch2，W2与W8分别执行短名单；每组均包含五个逐项控制，prefetch0/512、一轮丢弃＋三轮测量，共72个case。预算28/56须先核对真实容量。
+
+```bash
+python3 tests/operators/lifetch/cold_parallel/run_controls.py \
+  --matrix tuning --repo "$PWD" --kvaf-root /path/to/KVAF --device 5 \
+  --windows 2 --prefetch 0,512 --partition-pairs 4:8,8:16,16:28,26:28 \
+  --prepares phase --fetch-workers 2 --aic-budget 28 --aiv-budget 56 \
+  --output /home/w00568585/mr14_explore_W2 --execute
+
+python3 tests/operators/lifetch/cold_parallel/summarize_controls.py \
+  /home/w00568585/mr14_explore_W2
+
+python3 tests/operators/lifetch/cold_parallel/run_controls.py \
+  --matrix tuning --repo "$PWD" --kvaf-root /path/to/KVAF --device 5 \
+  --windows 8 --prefetch 0,512 --partition-pairs 4:8,8:16,16:16,26:26 \
+  --prepares phase --fetch-workers 2 --aic-budget 28 --aiv-budget 56 \
+  --output /home/w00568585/mr14_explore_W8 --execute
+
+python3 tests/operators/lifetch/cold_parallel/summarize_controls.py \
+  /home/w00568585/mr14_explore_W8
+```
+
+`--partition-pairs`覆盖hot/cold的笛卡尔网格；去掉`--execute`预览。首轮找候选，之后固定最佳参数独立复跑；再选择一组phase/invocation与Fetch1/2/4比较，避免一次大网格搜索替代独立复验。原056fe62的legacy需另行复测基线漂移；当前控制是同一新构建中的legacy/original-staged行为。
+
+源码探索可重现：
+
+```bash
+python3 tests/operators/lifetch/cold_parallel/explore_schedule.py \
+  --output tests/results/mr14-source-exploration-new
+python3 tests/operators/lifetch/cold_parallel/plot_exploration.py \
+  tests/results/mr14-source-exploration-new/primary_grid.csv \
+  --output tests/results/mr14-source-exploration-new/tradeoffs.png
+```
+
+绘图需要matplotlib；源码调度需要NumPy、C++17。详细结论和实际Model边界见[探索报告](../../../../docs/research/split_core/optimization_exploration_20261117.md)。Model的生产score完整driver说明见[experiment README](../../../../experiments/split_core/README.md)。源码计数/条件分析/Model周期/A5微秒数分别记录，不能互相替代。

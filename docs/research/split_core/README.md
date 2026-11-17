@@ -15,7 +15,10 @@
 - [调用、资源和完整处理顺序](staged_integration.md)
 - [验证命令](../../../experiments/split_core/README.md)
 - [精简历史验证摘要](results/score-integration-validation.json)
+- [本轮参数探索、实际编译与 Model 验证](optimization_exploration_20261117.md)
+- [A5 32 AIC / 64 AIV 预算实验与窗口短名单](a5_budget_experiment_20261117.md)
+- [A5 P2/分核整链控制脚本](../../../tests/operators/lifetch/cold_parallel/README.md)
 
-历史回放、独立 TopK、native 矩阵、trace/adaptive 研究及原始产物已移出当前 MR 文件树，可在提交 `5b006c6651485ab3d9acba83764982c50252ac2e` 恢复。它们包含不同源码、binary 和计量口径，不用于证明当前生产路径提速。当前日志、fixture 和构建结果写入被忽略的 `tests/results/` 或 `build/`，不提交生成产物。
+历史回放、独立 TopK、native 矩阵、trace/adaptive 研究及原始产物已移出当前 MR 文件树，可在提交 `5b006c6651485ab3d9acba83764982c50252ac2e` 恢复。它们包含不同源码、binary 和计量口径，不用于证明当前生产路径提速。当前日志、fixture 和构建结果写入被忽略的 `tests/results/` 或 `build/`；仓库只保留精简结果索引和可重现的源码计数图。
 
 历史 r5 Model 结果仍绑定 `ecf4e8e`，精简摘要保留其版本、哈希和限制。清理及 main 测试重构合入后的检查另行执行；物理 NPU/KVAF、非零 prefetch 和真机性能仍待验收。

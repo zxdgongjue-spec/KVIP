@@ -1,0 +1,55 @@
+{
+  "status": "NOT_ACCEPTED",
+  "observed_at": "2026-11-17T06:41:28.573923+00:00",
+  "scope": "CANN9.1/950 Model baseline, H8192/R6400, prefetch0 and synchronous GM final Fetch",
+  "physical_npu": false,
+  "accepted_cycle_results": 0,
+  "runs": [
+    {
+      "name": "staged_before_W2",
+      "status": "FAILED",
+      "exit_code": 124,
+      "host_wall_seconds": 1200.9862436669998,
+      "log_sha256": "845adc5f1cab61a267086e9374530990feea89d8d3cb38bc3064bd98e504be88",
+      "batch": 1,
+      "history": 8192,
+      "resident": 6400,
+      "aics": 4,
+      "aivs": 16,
+      "result_path": "tests/results/mr14-model-exploration-20261117/smoke-round2/results.json",
+      "result_sha256": "1344faddc7adb086ccfea152c533c25cb942c44172811e18293a52ad90e212fb",
+      "log_path": "tests/results/mr14-model-exploration-20261117/smoke-round2/staged_before_W2.log",
+      "observed_log_sha256": "845adc5f1cab61a267086e9374530990feea89d8d3cb38bc3064bd98e504be88"
+    },
+    {
+      "name": "staged_before_W2",
+      "status": "FAILED",
+      "exit_code": 139,
+      "host_wall_seconds": 19.911473667,
+      "log_sha256": "1c0b091952274bcca8582bf9e81b28f7a6f6953051a9e771b833463e6c5cb481",
+      "batch": 1,
+      "history": 8192,
+      "resident": 6400,
+      "aics": 4,
+      "aivs": 16,
+      "result_path": "tests/results/mr14-model-exploration-20261117/smoke-round3/results.json",
+      "result_sha256": "ad2392c8cedcdc1bb6ebd649f571e88ef4ffe1bc0bf00510f4dee349193e620f",
+      "log_path": "tests/results/mr14-model-exploration-20261117/smoke-round3/staged_before_W2.log",
+      "observed_log_sha256": "1c0b091952274bcca8582bf9e81b28f7a6f6953051a9e771b833463e6c5cb481"
+    },
+    {
+      "name": "staged_before_W2",
+      "status": "RUNNING",
+      "batch": 1,
+      "history": 8192,
+      "resident": 6400,
+      "aics": 4,
+      "aivs": 16,
+      "result_path": "tests/results/mr14-model-exploration-20261117/smoke-round4/results.json",
+      "result_sha256": "ace3719f96f70db78e13489f8adfdfa51c5affbd50b6e8c0c130fc3a3b2fed4a",
+      "log_path": "tests/results/mr14-model-exploration-20261117/smoke-round4/staged_before_W2.log",
+      "observed_log_sha256": "065323e8cb5883cb3d2278d91f8658781d837edf6562eddf3decb7b978b2131b"
+    }
+  ],
+  "note": "RUNNING is an observation only. No complete oracle and normal footer has been accepted; no Model speedup is reported."
+}

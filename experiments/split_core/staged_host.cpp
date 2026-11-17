@@ -27,10 +27,22 @@ struct Memory {
 };
 #include "standard_host_helpers.h"
 extern "C" uint32_t kvip_lifetch_staged_forward(void*,void*,void*,const rotating::RuntimeShape*,const kvip_staged::Plan*);
-static void Run(const std::string& out,uint32_t batch,uint32_t h,uint32_t r,uint32_t c,uint32_t v,uint32_t miss,aclrtStream stream,const std::string& forced){
+extern "C" uint32_t kvip_lifetch_streaming_forward_v2(void*,void*,void*,void*,const rotating::RuntimeShape*,uint32_t,uint32_t);
+extern "C" uint32_t aclrtlaunch_kvip_model_clock(uint32_t,void*,void*,uint32_t);
+struct Options {
+ uint32_t windows=2,post=0,prepare=0,service=0,hot=0,cold=0,workers=2;
+};
+static uint32_t choice(const std::string& value,const std::vector<std::string>& names){
+ auto at=std::find(names.begin(),names.end(),value);require(at!=names.end(),"invalid option "+value);return at-names.begin();
+}
+static void Run(const std::string& out,uint32_t batch,uint32_t h,uint32_t r,uint32_t c,uint32_t v,uint32_t miss,aclrtStream stream,const std::string& forced,const Options& options){
  using namespace rotating;Memory m;
- RuntimeShape s{};s.batch=batch;s.history=h;s.resident=r;s.indexHeads=32;s.aicCount=c;s.tokenBytes=656;s.rounds=2;
- check(kvip_staged::PrepareShape(&s,v,2));
+ RuntimeShape s{};s.batch=batch;s.history=h;s.resident=r;s.indexHeads=32;s.aicCount=c;s.tokenBytes=656;s.rounds=options.windows;
+ require(forced=="legacy" || forced=="history" || forced=="bsq" || forced=="auto","invalid route");
+ if(forced=="legacy"){
+  require(!options.post && !options.prepare && !options.service && !options.hot && !options.cold,"legacy needs default score controls");
+  s.splitQ=1;check(rotating::PrepareShape(&s));require(s.finalWorkers==4,"legacy four records");
+ }else check(kvip_staged::PrepareShape(&s,v,options.workers));
  auto qseed=ReadFixture<uint8_t>("arg0.bin"),kseed=ReadFixture<uint8_t>("arg1.bin");
  auto wseed=ReadFixture<uint16_t>("weights-bf16.bin");auto zseed=ReadFixture<float>("arg3.bin"),ksseed=ReadFixture<float>("arg4.bin");
  auto oracle=ReadFixture<uint16_t>("oracle.bin");auto expected=ReadFixture<uint32_t>("selected.bin");
@@ -54,7 +66,7 @@ static void Run(const std::string& out,uint32_t batch,uint32_t h,uint32_t r,uint
  std::vector<uint64_t> output(uint64_t(batch)*outputStride*82+128,0x5a5a5a5a5a5a5a5aULL);
  for(uint32_t b=0;b<batch;++b)for(uint32_t t=0;t<r;++t)for(uint32_t f=0;f<82;++f)output[(uint64_t(b)*outputStride+t)*82+f]=ExpectedPayload(b,t,f);
  auto outputGm=m.put(output);std::vector<uint64_t>().swap(output);
- uint32_t views=2*batch+16;
+ uint32_t views=2*batch+8*options.workers;
  auto sq=m.put(std::vector<uint8_t>(uint64_t(views)*4096*64)),cq=m.put(std::vector<uint32_t>(views*64*16,4)),db=m.put(std::vector<uint32_t>(views*64));
  std::vector<KvafBatchGetDirectUrmaEntity> entities(views);std::vector<KvafBatchGetQueueState> queues(views);
  std::vector<KvafBatchGetCoreStatus> statuses(views);
@@ -98,22 +110,25 @@ static void Run(const std::string& out,uint32_t batch,uint32_t h,uint32_t r,uint
  update[24]=h;update[25]=r;update[26]=ctx.changeCount;update[27]=m.put(std::vector<uint32_t>(batch*40960));auto updateGm=m.put(update);
  pipeline_ab::Args tail{};tail.context=ctxGm;tail.keys=keysGm;tail.scales=scalesGm;tail.addresses=addrGm;tail.logical=logicalGm;tail.valid=ctx.hotValid;
  tail.flags=m.put(std::vector<pipeline_ab::BatchFlag>(batch*16));tail.eventsSrc=m.put(std::vector<uint32_t>(batch*10240));tail.eventsDst=m.put(std::vector<uint32_t>(batch*10240));
- tail.workerStatus=m.put(std::vector<uint32_t>(batch*32));tail.times=m.put(std::vector<uint64_t>(batch*256+(3*batch+8)*32));
- tail.history=h;tail.resident=r;tail.prefetchCount=(2<<16)|0x10000000U;tail.maxEvents=10240;
+ tail.workerStatus=m.put(std::vector<uint32_t>(batch*32));tail.times=m.put(std::vector<uint64_t>(batch*256+(3*batch+4*options.workers)*32));
+ tail.history=h;tail.resident=r;tail.prefetchCount=(options.workers<<16)|0x10000000U;tail.maxEvents=10240;
  tail.queryBitmaps=m.put(std::vector<uint32_t>(batch*4*((r+31)/32)));tail.queryErrors=m.put(std::vector<uint32_t>(batch*4*32));tail.updateBindings=updateGm;
- tail.denseShadow=m.put(std::vector<uint64_t>(uint64_t(batch)*h*3));tail.packedFetch=m.put(std::vector<int32_t>(8*(9*batch*2048+((3*batch+31)&~31U)+64)));auto workspace=m.put(std::vector<pipeline_ab::Args>{tail});
+ tail.denseShadow=m.put(std::vector<uint64_t>(uint64_t(batch)*h*3));tail.packedFetch=m.put(std::vector<int32_t>(4*options.workers*(9*batch*2048+((3*batch+31)&~31U)+64)));auto workspace=m.put(std::vector<pipeline_ab::Args>{tail});
  std::vector<uint64_t> binding(16);binding[1]=keysGm;binding[4]=scalesGm;binding[9]=ctx.selected;binding[14]=ctxGm;binding[15]=workspace;
  std::vector<uint8_t> liveQ(uint64_t(batch)*qseed.size());std::vector<uint16_t> liveW(uint64_t(batch)*wseed.size());std::vector<float> liveZ(uint64_t(batch)*zseed.size());
  for(uint32_t b=0;b<batch;++b){std::copy(qseed.begin(),qseed.end(),liveQ.begin()+uint64_t(b)*qseed.size());std::copy(wseed.begin(),wseed.end(),liveW.begin()+uint64_t(b)*wseed.size());std::copy(zseed.begin(),zseed.end(),liveZ.begin()+uint64_t(b)*zseed.size());}
  binding[0]=m.put(liveQ);binding[2]=m.put(liveW);binding[3]=m.put(liveZ);
+ binding[5]=m.put(std::vector<uint32_t>(batch,4));binding[6]=m.put(std::vector<uint32_t>(batch,h));
+ binding[12]=m.put(std::vector<uint8_t>(std::max<uint64_t>(16ULL*1024*1024,uint64_t(s.liCores)*4*h*4+1024*1024)));
  std::vector<int32_t> livePages(batch*h/128);std::iota(livePages.begin(),livePages.end(),0);binding[7]=m.put(livePages);
  binding[13]=m.put(std::vector<uint8_t>(uint64_t(batch)*(4*2048*6+1024+uint64_t(h)*2)));ctx.hits=binding[13]+uint64_t(batch)*(4*2048*6+1024);
  m.set(ctxGm,std::vector<Context>{ctx});auto bindings=m.put(binding);
  auto canonical=m.put(std::vector<uint16_t>(uint64_t(batch)*4*h+128,0x5a5a));
  std::vector<kvip_staged::ScoreWave> hot,coldWaves;
- auto makeWaves=[&](uint32_t begin,uint32_t end,std::vector<kvip_staged::ScoreWave>& waves){
+ auto makeWaves=[&](uint32_t begin,uint32_t end,uint32_t requested,std::vector<kvip_staged::ScoreWave>& waves){
   uint32_t cap=std::min(c,v/2),qsize=2*batch<=cap?4:2,p=qsize==4?std::max(1U,std::min(cap/batch,(end-begin)/128)):1;
   if(forced=="bsq"){qsize=2;p=1;}else if(forced=="history"){qsize=4;p=std::max(1U,std::min(cap/batch,(end-begin)/128));}
+  if(requested){require(qsize==4 && requested<=cap && requested<=(end-begin)/128,"invalid explicit history partitions");p=requested;}
   std::vector<kvip_staged::ScoreTask> tasks;
   for(uint32_t b=0;b<batch;++b)for(uint32_t q=0;q<4;q+=qsize)for(uint32_t i=0;i<p;++i)tasks.push_back({b,q,begin+((end-begin)/128*i/p)*128,begin+((end-begin)/128*(i+1)/p)*128});
   for(uint32_t first=0;first<tasks.size();first+=cap){uint32_t rows=std::min(cap,uint32_t(tasks.size())-first),stride=0;
@@ -131,15 +146,41 @@ static void Run(const std::string& out,uint32_t batch,uint32_t h,uint32_t r,uint
    waves.push_back({m.put(wb),score,m.put(wave),rows,stride,qsize,first+rows==tasks.size()?end:0});
   }
  };
- makeWaves(0,r,hot);makeWaves(r,h,coldWaves);kvip_staged::Plan plan{canonical,hot.data(),coldWaves.data(),uint32_t(hot.size()),uint32_t(coldWaves.size()),v,2};
- auto start=std::chrono::steady_clock::now();check(kvip_lifetch_staged_forward((void*)bindings,(void*)workspace,stream,&s,&plan));check(aclrtSynchronizeStream(stream));
+ if(forced!="legacy"){
+  makeWaves(0,r,options.hot,hot);uint32_t begin=r;
+  for(uint32_t epoch=1;epoch<s.rounds;++epoch){uint32_t end=r+((h-r)/128*epoch/(s.rounds-1))*128;makeWaves(begin,end,options.cold,coldWaves);begin=end;}
+ }
+ kvip_staged::Plan plan{canonical,hot.data(),coldWaves.data(),uint32_t(hot.size()),uint32_t(coldWaves.size()),v,options.workers};
+ if(forced!="legacy"){
+  std::vector<kvip_staged::PrepareWave> descriptors;
+  for(auto list:{&hot,&coldWaves})for(auto w:*list)descriptors.push_back({w.bindings,w.tasks,w.rows,w.stride,w.queryGroup,0});
+  plan.prepareWaves=m.put(descriptors);plan.prepareCount=descriptors.size();plan.postMode=options.post;plan.prepareMode=options.prepare;plan.serviceMode=options.service;
+ }
+ auto clock=m.put(std::vector<uint64_t>(2));
+ auto start=std::chrono::steady_clock::now();check(aclrtlaunch_kvip_model_clock(1,stream,(void*)clock,0));
+ if(forced=="legacy")check(kvip_lifetch_streaming_forward_v2((void*)bindings,(void*)updateGm,(void*)workspace,stream,&s,options.workers,v));
+ else check(kvip_lifetch_staged_forward((void*)bindings,(void*)workspace,stream,&s,&plan));
+ check(aclrtlaunch_kvip_model_clock(1,stream,(void*)clock,1));check(aclrtSynchronizeStream(stream));
+ auto modelClock=m.get<uint64_t>(clock,2);require(modelClock[1]>modelClock[0],"invalid Model forward clock");
  double wall=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
- auto scores=m.get<uint16_t>(canonical,uint64_t(batch)*4*h+128);for(size_t i=0;i<uint64_t(batch)*4*h;++i)require(scores[i]==oracle[i%(4*h)],"score mismatch "+std::to_string(i));
+ auto scores=m.get<uint16_t>(canonical,uint64_t(batch)*4*h+128);if(forced!="legacy")for(size_t i=0;i<uint64_t(batch)*4*h;++i)require(scores[i]==oracle[i%(4*h)],"score mismatch "+std::to_string(i));
  for(size_t i=uint64_t(batch)*4*h;i<scores.size();++i)require(scores[i]==0x5a5a,"score guard");
  auto prefix=m.get<uint16_t>(binding[13],uint64_t(batch)*(4*2048*3+512));
  for(uint32_t b=0;b<batch;++b)for(uint32_t q=0;q<4;++q){
   std::vector<uint16_t> row(oracle.begin()+q*h,oracle.begin()+q*h+r);std::nth_element(row.begin(),row.end()-2048,row.end());
   require(prefix[uint64_t(b)*(4*2048*3+512)+4*2048*3+q*128]==row[r-2048],"exact global resident threshold");
+ }
+ // With prefetch0, Final correctness alone cannot validate every unused Cold
+ // predicate. Validate packed bytes independently, outside clock probes.
+ if(forced!="legacy"){
+  auto bitmap=m.get<uint8_t>(ctx.hits,uint64_t(batch)*h);
+  for(uint32_t b=0;b<batch;++b)for(uint32_t q=0;q<4;++q){
+   auto theta=prefix[uint64_t(b)*(4*2048*3+512)+4*2048*3+q*128];
+   for(uint32_t t=r;t<h;t+=4){uint8_t want=0;
+    for(uint32_t i=0;i<4;++i)if(oracle[uint64_t(q)*h+t+i]>theta)want|=1U<<(2*i);
+    require(bitmap[(uint64_t(b)*4+q)*(h/4)+t/4]==want,"Cold bitmap byte "+std::to_string(t/4));
+   }
+  }
  }
  auto selected=m.get<uint32_t>(ctx.selected,batch*8192+128),loc=m.get<uint32_t>(ctx.locations,batch*8192+128),outLogical=m.get<uint32_t>(update[22],batch*8192+128),outSlots=m.get<uint32_t>(update[23],batch*8192+128);
  auto updated=m.get<uint64_t>(logicalGm,uint64_t(batch)*h),updatedAddr=m.get<uint64_t>(addrGm,uint64_t(batch)*h);
@@ -181,15 +222,25 @@ static void Run(const std::string& out,uint32_t batch,uint32_t h,uint32_t r,uint
  for(uint32_t i=0;i<128;++i){require(selected[batch*8192+i]==0x5a5a5a5a && loc[batch*8192+i]==0x5a5a5a5a && outLogical[batch*8192+i]==0x5a5a5a5a && outSlots[batch*8192+i]==0x5a5a5a5a,"output guard");require(keyAfter[uint64_t(batch)*h*128+i]==0x5a,"key guard");}
  std::ofstream report(out+"/correctness.json");report<<"{\"status\":\"PASSED\",\"producer\":\""<<SCORE_VERSION<<"\",\"batch\":"<<batch<<",\"history\":"<<h<<",\"resident\":"<<r<<",\"miss_per_query\":"<<miss
  <<",\"unique_cold\":"<<cold.size()<<",\"unique_reserved_hot_repair\":"<<repair.size()-cold.size()<<",\"unique_repair\":"<<repair.size()
- <<",\"score_keys\":"<<uint64_t(batch)*4*h<<",\"owner_waves\":"<<(batch+kvip_staged::OwnerCapacity(v,2)-1)/kvip_staged::OwnerCapacity(v,2)
- <<",\"hot_score_waves\":"<<hot.size()<<",\"cold_score_waves\":"<<coldWaves.size()<<",\"score_route\":\""<<forced<<"\",\"prefetch_budget\":0,\"all_index_fields\":true,\"all_hot_payload\":true,\"guards\":true,\"completion\":true,\"physical_npu\":false,\"transport\":\"GM adapter\",\"host_wall_ms\":"<<wall<<"}\n";
+ <<",\"score_keys\":"<<(forced=="legacy"?0:uint64_t(batch)*4*h)<<",\"owner_waves\":"<<(batch+kvip_staged::OwnerCapacity(v,options.workers)-1)/kvip_staged::OwnerCapacity(v,options.workers)
+ <<",\"hot_score_waves\":"<<hot.size()<<",\"cold_score_waves\":"<<coldWaves.size()<<",\"score_route\":\""<<forced<<"\",\"prefetch_budget\":0,\"all_index_fields\":true,\"all_hot_payload\":true,\"guards\":true,\"completion\":true,\"physical_npu\":false,\"transport\":\"GM adapter\",\"host_wall_ms\":"<<wall
+ <<",\"requested_windows\":"<<options.windows<<",\"effective_windows\":"<<s.rounds<<",\"post\":"<<options.post<<",\"prepare\":"<<options.prepare<<",\"service\":"<<options.service
+ <<",\"hot_partitions\":"<<options.hot<<",\"cold_partitions\":"<<options.cold<<",\"fetch_workers\":"<<options.workers<<",\"forward_model_cycles\":"<<modelClock[1]-modelClock[0]
+ <<",\"cold_bitmap_bytes_checked\":"<<(forced=="legacy"?0:uint64_t(batch)*(h-r))
+ <<",\"model_clock_start\":"<<modelClock[0]<<",\"model_clock_end\":"<<modelClock[1]<<",\"clock_probe_kernels\":2,\"sequence_split\":"<<(rotating::UseSequenceSplit(s)?"true":"false")<<"}\n";
  require(bool(report),"report write");std::cout<<"STAGED_FULL_ORACLE_PASSED B="<<batch<<" miss="<<miss<<"\n";
 }
 int main(int argc,char** argv){try{
- if(argc==2 && std::string(argv[1])=="--capabilities"){std::cout<<"{\"scope\":\"staged full streaming with GM adapter\",\"max_batch\":32,\"queries\":4,\"producer\":\""<<SCORE_VERSION<<"\"}\n";return 0;}
- require(argc==11,"staged_routes FIXTURE OUTPUT B H R C V MISS ROUTE DEVICE");
+ if(argc==2 && std::string(argv[1])=="--capabilities"){std::cout<<"{\"scope\":\"production score and full tail with GM adapter\",\"max_batch\":32,\"queries\":4,\"producer\":\""<<SCORE_VERSION
+ <<"\",\"score_controls\":true,\"legacy_control\":true,\"model_clock_probes\":2,\"prefetch_budget\":0}\n";return 0;}
+ require(argc==11 || argc==18,"staged_routes FIXTURE OUTPUT B H R C V MISS ROUTE DEVICE [WINDOWS POST PREPARE SERVICE P_HOT P_COLD FETCH_WORKERS]");
+ Options options;
+ if(argc==18){options.windows=std::stoul(argv[11]);options.post=choice(argv[12],{"separate","scatter","direct"});options.prepare=choice(argv[13],{"wave","invocation","phase"});
+  options.service=choice(argv[14],{"separate","inline"});options.hot=std::stoul(argv[15]);options.cold=std::stoul(argv[16]);options.workers=std::stoul(argv[17]);}
+ require(options.windows>=2 && options.windows<=32 && options.hot<=32 && options.cold<=32 && (options.workers==1 || options.workers==2 || options.workers==4),"invalid options");
+ require(!options.service || options.post,"inline ready needs scatter/direct");
  require(!std::filesystem::exists(argv[2]),"output must be new");std::filesystem::create_directories(argv[2]);setenv("KVIP_FIXTURE_DIR",argv[1],1);
  check(aclInit(nullptr));check(aclrtSetDevice(std::stoul(argv[10])));aclrtStream stream;check(aclrtCreateStream(&stream));
- Run(argv[2],std::stoul(argv[3]),std::stoul(argv[4]),std::stoul(argv[5]),std::stoul(argv[6]),std::stoul(argv[7]),std::stoul(argv[8]),stream,argv[9]);
+ Run(argv[2],std::stoul(argv[3]),std::stoul(argv[4]),std::stoul(argv[5]),std::stoul(argv[6]),std::stoul(argv[7]),std::stoul(argv[8]),stream,argv[9],options);
  check(aclrtDestroyStream(stream));check(aclrtResetDevice(std::stoul(argv[10])));check(aclFinalize());return 0;
  }catch(const std::exception& e){std::cerr<<e.what()<<"\n";return 1;}}
