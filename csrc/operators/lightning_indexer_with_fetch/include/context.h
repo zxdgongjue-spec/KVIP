@@ -45,7 +45,8 @@ struct Context {
     RuntimeShape shape;
     uint64_t changeSlots, changeCount; // Extended direct-hot producer records, ABI 3.
     uint64_t incremental; // Per-Q TopK prefixes, admission bitmap and diagnostics.
-    uint64_t incrementalPadding[3]; // Preserve 32-byte DMA alignment.
+    uint64_t prefetchRankStart; // Zero preserves the default rank 1024.
+    uint64_t incrementalPadding[2]; // Preserve 32-byte DMA alignment.
     // Optional serving layout: active row -> stable owner; addresses stay with
     // that owner's Index permutation. tailBounds[B,2] are [committed,write_end).
 

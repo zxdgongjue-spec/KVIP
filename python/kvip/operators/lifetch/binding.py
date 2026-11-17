@@ -21,6 +21,7 @@ class LIFetchBinding:
         history,
         resident,
         prefetch_limit=512,
+        prefetch_rank_start=1024,
         window_limit=None,
         li_tiling="auto",
         intermediate_fetches=32,
@@ -37,6 +38,9 @@ class LIFetchBinding:
         output_stride=None,
         scratch=None,
     ):
+        if not isinstance(prefetch_rank_start, int) or not 1 <= prefetch_rank_start <= 2048:
+            raise ValueError("prefetch_rank_start must be an integer in 1..2048")
+        self.prefetch_rank_start = prefetch_rank_start
         if history > 131072:
             raise ValueError("Ranked LIFetch requires history<=131072")
         if resident > 131072:
@@ -214,7 +218,7 @@ class LIFetchBinding:
         )
         self.rank_progress = self.window_topk_storage[-batch*4*32*8:].view(torch.int64).view(batch,4,32)
         self.incremental = self.window_topk_storage[:batch*512].view(torch.int64).view(batch,4,16)
-        blob = np.concatenate((blob, np.array([self.incremental.data_ptr(), 0, 0, 0], dtype="<u8").view("u1")))
+        blob = np.concatenate((blob, np.array([self.incremental.data_ptr(), prefetch_rank_start, 0, 0], dtype="<u8").view("u1")))
         self.context = torch.from_numpy(blob.copy()).to(self.device)
         self.arguments = tuple(arguments) + (self.context,)
         self.bindings = torch.tensor([x.data_ptr() for x in self.arguments], dtype=torch.uint64, device=self.device)

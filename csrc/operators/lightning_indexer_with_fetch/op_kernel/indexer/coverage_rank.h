@@ -27,11 +27,11 @@ KVIP_COVERAGE_DEVICE inline uint32_t Covered(uint32_t end0,uint32_t end1,
     }
     return total;
 }
-KVIP_COVERAGE_DEVICE inline uint32_t Rank(uint32_t covered,uint32_t initial,uint32_t valid) {
-    if(valid<=initial)return 1024;
+KVIP_COVERAGE_DEVICE inline uint32_t Rank(uint32_t covered,uint32_t initial,uint32_t valid,uint32_t start=1024) {
+    if(valid<=initial)return start;
     uint32_t done=covered>initial?covered-initial:0, remaining=valid-initial;
     if(done>remaining)done=remaining;
-    return 1024+(uint64_t(done)*1024+remaining/2)/remaining;
+    return start+(uint64_t(done)*(2048-start)+remaining/2)/remaining;
 }
 }
 #undef KVIP_COVERAGE_DEVICE

@@ -47,7 +47,7 @@ __aicore__ inline void ExportWindowCold(uint32_t query) {
     uint32_t tailBegin=recent.begin,tailEnd=recent.end;
     uint32_t initial=kvip_coverage::Covered(0,0,runtimeShape_.resident,valid,0,tailBegin,tailEnd);
     uint32_t coveredCount=kvip_coverage::Covered(rankEnd0_,rankEnd1_,runtimeShape_.resident,valid,rankHalf_,tailBegin,tailEnd);
-    uint32_t rank=kvip_coverage::Rank(coveredCount,initial,valid);
+    uint32_t rank=kvip_coverage::Rank(coveredCount,initial,valid,ctx->prefetchRankStart?uint32_t(ctx->prefetchRankStart):1024);
     if(rankTrace_ && rankedEpoch_<32) {
         uint32_t ready=kvip_coverage::Covered(uint32_t(rankReady_),uint32_t(rankReady_>>32),runtimeShape_.resident,valid,rankHalf_,tailBegin,tailEnd);
         uint64_t record=uint64_t(ready)|(uint64_t(coveredCount)<<18)|(uint64_t(rank)<<36);

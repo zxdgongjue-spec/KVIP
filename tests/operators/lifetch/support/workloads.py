@@ -132,6 +132,8 @@ def configuration(argv=None):
             command.add_argument('--group', type=int)
             command.add_argument('--round-range', type=round_range)
             command.add_argument('--prefetch-tokens', type=int, default=512)
+            command.add_argument('--prefetch-rank-start', type=int, default=1024,
+                                 help='URMA initial admission rank (1..2048); progresses to 2048 by per-Q coverage')
             command.add_argument('--intermediate-fetches', type=int, default=8)
             command.add_argument('--warmup', type=int, default=4)
             command.add_argument('--iterations', type=int, default=20)
@@ -179,6 +181,10 @@ def configuration(argv=None):
                     or args.history <= args.resident + 4 or args.index_heads not in (32, 64)
                     or args.seed < 0):
                 parser.error('invalid synthetic geometry or seed')
+        if not 1 <= args.prefetch_rank_start <= 2048:
+            parser.error('prefetch-rank-start must be in 1..2048')
+        if args.transport != 'urma' and args.prefetch_rank_start != 1024:
+            parser.error('prefetch-rank-start requires the URMA ranked prefetch path')
         if (args.warmup < 0 or args.iterations <= 0 or not 1 <= args.intermediate_fetches <= 32
                 or not 0 <= args.prefetch_tokens <= 2048
                 or args.prefetch_tokens % args.intermediate_fetches):

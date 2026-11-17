@@ -1985,6 +1985,7 @@ def run_urma_case(
         intermediate_fetches=args.intermediate_fetches,
         final_workers=0,
         prefetch_limit=args.prefetch_tokens,
+        prefetch_rank_start=getattr(args, "prefetch_rank_start", 1024),
         output_stride=owner.output.shape[1],
     )
     topk = arguments[9].view(torch.int32).reshape(b, 4, 2048)
@@ -3210,7 +3211,7 @@ class FusedReplayState:
     state must not have live graphs or unfinished device work.
     """
     def __init__(self, torch, runtime, table, library, initial, pages, addresses,
-                 *, device, aics, windows, prefetch_tokens, soc):
+                 *, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024):
         from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
         from kvip.cache.index_storage import IndexCacheStorage
         from kvip.operators.lifetch.binding import LIFetchBinding
@@ -3260,6 +3261,7 @@ class FusedReplayState:
                     torch, library, self.workspace.arguments(self.storage), owner,
                     batch=self.batch, history=self.history, resident=self.resident,
                     intermediate_fetches=windows, prefetch_limit=prefetch_tokens,
+                    prefetch_rank_start=prefetch_rank_start,
                     aic_count=aics, token_bytes=self.token_bytes, **binding)
             update_type = UbmemIndexUpdate if ubmem else DirectIndexUpdate
             self.update = update_type(
@@ -3591,7 +3593,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
             state = FusedReplayState(
                 torch, runtime, view, library, initial, pages, logical_addresses,
                 device=device, aics=aics, windows=config.intermediate_fetches,
-                prefetch_tokens=config.prefetch_tokens, soc=soc)
+                prefetch_tokens=config.prefetch_tokens, soc=soc,
+                prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024))
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
         checks = CorrectnessRecorder()
