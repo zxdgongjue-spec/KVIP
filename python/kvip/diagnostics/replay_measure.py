@@ -801,10 +801,15 @@ def study_cases(args):
 
 
 def verify_prefilter_equivalence(cases):
-    names = ("reverse-inc-register", "reverse-inc-prefilter")
-    if not all(name in cases for name in names):
+    reference = cases.get("reverse-inc-register")
+    if reference is None:
         return
-    before, after = (cases[name] for name in names)
+    for name in ("reverse-inc-prefilter", "reverse-inc-direct", "reverse-inc-ties"):
+        if name in cases:
+            verify_incremental_state_pair(reference, cases[name])
+
+
+def verify_incremental_state_pair(before, after):
     for section, key in (("incremental_check", "prefix_lists_sha256"),
                          ("selection_comparison", "ordered_output_sha256")):
         value = before.get(section, {}).get(key)

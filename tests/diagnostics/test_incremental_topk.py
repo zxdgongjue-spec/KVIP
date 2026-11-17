@@ -104,7 +104,7 @@ def test_incremental_report_requires_oracle_and_uses_both_controls(tmp_path, cap
 
 
 @pytest.mark.parametrize("owner_format", ["packed", "separate", "both"])
-@pytest.mark.parametrize("mode", [[], ["--prefilter"]])
+@pytest.mark.parametrize("mode", [[], ["--prefilter"], ["--tie-fast"]])
 def test_frozen_archive_cpu_command(tmp_path, monkeypatch, capsys, owner_format, mode):
     import json
     import sys
@@ -282,3 +282,50 @@ def test_prefilter_pair_rejects_different_exact_lists_or_final_order(key):
     cases["reverse-inc-prefilter"][section][key] = "different"
     with pytest.raises(AssertionError, match=key):
         verify_prefilter_equivalence(cases)
+
+
+@pytest.mark.parametrize("count", [0, 1, 31, 127, 128, 129, 2047, 2048, 2049, 16384])
+def test_exact_tie_replacement_preserves_dense_selection_order(count):
+    from kvip.diagnostics.incremental_topk import TieWindowTopK, WindowTopK
+    rng = np.random.default_rng(178)
+    seed = np.full(16384,30000,dtype=np.uint16)
+    seed[:1920] += np.uint16(10)
+    tie = TieWindowTopK(seed,np.arange(16384))
+    full = WindowTopK(seed,np.arange(16384))
+    fast = 0
+    for epoch in range(12):
+        scores = rng.integers(0,tie.threshold+1,16384,dtype=np.uint16)
+        scores[rng.permutation(16384)[:count]] = tie.threshold+1
+        ids = np.arange(16384) + 16384*(epoch+1)
+        old_ties = np.count_nonzero(tie.scores == tie.threshold)
+        fast += 0 < count < old_ties
+        tie.append(scores,ids); full.append(scores,ids)
+        np.testing.assert_array_equal(tie.ids,full.ids)
+        np.testing.assert_array_equal(tie.scores,full.scores)
+        assert tie.threshold == full.threshold
+    assert tie.fast_ties == fast
+
+
+def test_state_report_checks_both_new_variants(tmp_path,capsys):
+    import json
+    from kvip.diagnostics import scan_report
+    from kvip.diagnostics.scan_options import INCREMENTAL_STATE_VARIANTS,options_for
+    cases = {}
+    for name in INCREMENTAL_STATE_VARIANTS:
+        cases[name] = dict(
+            geometry=dict(rounds=9,token_bytes=656),timing=dict(mean_us=100,p50_us=99),
+            reads_samples=[dict(prefetch=5,unused_prefetch=1,unused_prefetch_bytes=656,
+                final=3,bytes=5248,useful_transfer_bytes=4592,cold_demand=6,selected_unique=60)],
+            selection_comparison=dict(total_replacements=0,ordered_output_sha256="same-final"))
+        if options_for(name)["incremental_topk"]:
+            cases[name]["incremental_check"]=dict(status="exact_prefix_ranks_and_pending",prefix_lists_sha256="same-prefix")
+    path=tmp_path/"result.json"
+    path.write_text(json.dumps(dict(status="pass",execution_order=list(INCREMENTAL_STATE_VARIANTS),cases=cases)))
+    scan_report.report(path,require_incremental_state=True)
+    output=capsys.readouterr().out
+    assert "INCREMENT reverse-inc-direct->reverse-inc-ties" in output
+    assert "window_lists_and_final_order=IDENTICAL" in output
+    cases["reverse-inc-ties"]["incremental_check"]["prefix_lists_sha256"]="different"
+    path.write_text(json.dumps(dict(status="pass",execution_order=list(INCREMENTAL_STATE_VARIANTS),cases=cases)))
+    with pytest.raises(AssertionError,match="prefix_lists_sha256"):
+        scan_report.report(path,require_incremental_state=True)

@@ -1,6 +1,6 @@
 """Independent URMA scan-order/admission experiment; no graph-route changes."""
 
-OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill", "compact_out_of_place", "rolling_reuse_seed", "rolling_fast_path", "rolling_sparse", "rolling_boundary", "incremental_topk", "incremental_window", "incremental_register", "incremental_prefilter")
+OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill", "compact_out_of_place", "rolling_reuse_seed", "rolling_fast_path", "rolling_sparse", "rolling_boundary", "incremental_topk", "incremental_window", "incremental_register", "incremental_prefilter", "incremental_direct", "incremental_ties")
 DEFAULT_VARIANTS = ("forward", "reverse", "forward-wide", "reverse-wide", "forward-end")
 VARIANTS = {name: ("reverse_cold",) if name.startswith("reverse") else () for name in DEFAULT_VARIANTS}
 ROLLING_VARIANTS = ("forward", "reverse", "reverse-roll", "reverse-refilter", "forward-refilter", "forward-end")
@@ -107,6 +107,14 @@ INCREMENTAL_PREFILTER_VARIANTS = (
 VARIANTS["reverse-inc-prefilter"] = VARIANTS["reverse-inc-register"] + ("incremental_prefilter",)
 
 
+INCREMENTAL_STATE_VARIANTS = (
+    "forward", "reverse", "reverse-inc-register", "reverse-inc-direct",
+    "reverse-inc-ties", "reverse-end", "forward-end",
+)
+VARIANTS["reverse-inc-direct"] = VARIANTS["reverse-inc-prefilter"] + ("incremental_direct",)
+VARIANTS["reverse-inc-ties"] = VARIANTS["reverse-inc-direct"] + ("incremental_ties",)
+
+
 def options_for(name):
     return {key: key in VARIANTS[name] for key in OPTIONS}
 
@@ -128,6 +136,10 @@ def validate_options(options):
         raise ValueError("Scan experiment options do not match the selected native interface")
     if any(type(value) is not bool for value in options.values()):
         raise ValueError("Scan build options must be bool")
+    if options["incremental_ties"] and not options["incremental_direct"]:
+        raise ValueError("Boundary tie updates require direct incremental state")
+    if options["incremental_direct"] and not options["incremental_prefilter"]:
+        raise ValueError("Direct incremental state requires window prefilter")
     if options["incremental_prefilter"] and not options["incremental_register"]:
         raise ValueError("Window prefilter requires register window selection")
     if options["incremental_window"] and not options["incremental_topk"]:

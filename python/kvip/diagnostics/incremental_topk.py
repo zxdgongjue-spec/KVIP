@@ -93,7 +93,28 @@ class PrefilterWindowTopK(WindowTopK):
         else:
             self.dense += 1
         self.input_items += (self.k + len(scores) + 255) // 256 * 256
+        self.select_window(scores, ids)
+
+    def select_window(self, scores, ids):
         super().append(scores, ids)
+
+
+class TieWindowTopK(PrefilterWindowTopK):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fast_ties = 0
+
+    def select_window(self, scores, ids):
+        strict = int(np.count_nonzero(self.scores > self.threshold))
+        # At least one old Kth tie must survive; equality takes the full path.
+        if len(scores) < self.k - strict:
+            assert np.all(scores > self.threshold)
+            keep = self.k - len(scores)
+            self.scores = np.r_[self.scores[:strict], scores, self.scores[strict:keep]]
+            self.ids = np.r_[self.ids[:strict], ids, self.ids[strict:keep]]
+            self.fast_ties += 1
+            return
+        super().select_window(scores, ids)
 
 
 def verify_rank(scores, ids, k=TOP):
@@ -104,9 +125,9 @@ def verify_rank(scores, ids, k=TOP):
         raise AssertionError("Incremental selection lost an exact TopK rank")
 
 
-def simulate(scores, seed, windows, eligible, *, k=TOP, budget=512, window_budget=64, window_staging=False, prefilter=False):
+def simulate(scores, seed, windows, eligible, *, k=TOP, budget=512, window_budget=64, window_staging=False, prefilter=False, tie_fast=False):
     """Q4 union, immutable window lists, retained unsubmitted entries, final repair."""
-    keeper_type = PrefilterWindowTopK if prefilter else WindowTopK if window_staging else IncrementalTopK
+    keeper_type = TieWindowTopK if tie_fast else PrefilterWindowTopK if prefilter else WindowTopK if window_staging else IncrementalTopK
     keepers = [keeper_type(s[seed[q]], seed[q], k=k) for q, s in enumerate(scores)]
     seen = [set(map(int, seed[q])) for q in range(len(scores))]
     posted = set()
@@ -134,6 +155,7 @@ def simulate(scores, seed, windows, eligible, *, k=TOP, budget=512, window_budge
         repair=len(selected - posted), total=len(posted | selected),
         merges=sum(v.merges for v in keepers), compacted=sum(v.compacted for v in keepers),
         window_candidates=[n for v in keepers for n in getattr(v, "counts", [])],
+        tie_fast_windows=sum(getattr(v, "fast_ties", 0) for v in keepers),
         dense_windows=sum(getattr(v, "dense", 0) for v in keepers),
         empty_windows=sum(getattr(v, "empty", 0) for v in keepers),
         selection_items=sum(getattr(v, "input_items", 0) for v in keepers),
@@ -255,7 +277,9 @@ def main():
     parser.add_argument("--snapshot", type=Path, required=True)
     parser.add_argument("--window-staging", action="store_true")
     parser.add_argument("--prefilter", action="store_true", help="Validate sparse/dense boundary selection against the whole-window control")
+    parser.add_argument("--tie-fast", action="store_true", help="Validate exact boundary-tie replacement against dense selection")
     args = parser.parse_args()
+    args.prefilter |= args.tie_fast
     from kvip.diagnostics.archive import TensorArchive
     from kvip.diagnostics.recent_threshold import recent_positions
 
@@ -263,20 +287,21 @@ def main():
     archive = TensorArchive(args.snapshot, manifest)
     g, scores, ends, bounds = inputs(archive)
     for reverse in (False, True):
-        merges = compacted = dense = empty = items = control_items = 0
+        merges = compacted = dense = empty = items = control_items = fast = 0
         candidates = []
         for row in range(g["batch"]):
             valid = [scores[row, q, :int(ends[row, q])] for q in range(4)]
             seed = [recent_positions(g["resident"], bounds[row], len(s)) for s in valid]
             windows = scan_windows(g["history"], g["resident"], ends[row], reverse)
             result = simulate(valid, seed, windows, eligibility(archive, row),
-                              window_staging=args.window_staging, prefilter=args.prefilter)
+                              window_staging=args.window_staging, prefilter=args.prefilter, tie_fast=args.tie_fast)
             if args.prefilter:
                 reference = simulate(valid, seed, windows, eligibility(archive, row), window_staging=True)
                 for key in ("thresholds", "publication", "selected", "prefetch", "useful", "waste", "repair", "total"):
                     if result[key] != reference[key]:
                         raise AssertionError(f"Prefilter changed exact whole-window {key} row={row} reverse={reverse}")
                 candidates.extend(result["window_candidates"])
+                fast += result["tie_fast_windows"]
                 dense += result["dense_windows"]
                 empty += result["empty_windows"]
                 items += result["selection_items"]
@@ -291,6 +316,10 @@ def main():
                   f"max={max(candidates)} dense_fallback={dense}/{len(candidates)} empty={empty} "
                   f"selector_items_reduction={100*(1-items/control_items):.2f}% "
                   "window_thresholds_lists_traffic=IDENTICAL_TO_DENSE timing=NOT_SIMULATED", flush=True)
+        if args.tie_fast:
+            print(f"CPU_TIES {'reverse' if reverse else 'forward'} PASS "
+                  f"skip_Kth_nonempty={fast}/{len(candidates)-empty} empty={empty} "
+                  "thresholds_ordered_lists_traffic=IDENTICAL timing=NOT_SIMULATED", flush=True)
         print(f"CPU_INCREMENTAL {'reverse' if reverse else 'forward'} PASS queries={g['batch']*4} window_staging={args.window_staging} cold_windows=8 exact_score_ranks=YES retry_and_traffic_identity=YES timing=NOT_SIMULATED", flush=True)
 
 
