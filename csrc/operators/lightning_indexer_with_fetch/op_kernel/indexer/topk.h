@@ -126,6 +126,12 @@ template<>
 class LITopk<uint16_t> {
 public:
 #if KVIP_INCREMENTAL_TOPK
+#if KVIP_INCREMENTAL_DIRECT
+    __aicore__ inline LocalTensor<uint16_t> IncrementalOrdinals() { return tmpIndexLocal; }
+#if KVIP_INCREMENTAL_TIES
+    __aicore__ inline uint32_t IncrementalStrictCount() { return incrementalStrictCount_; }
+#endif
+#endif
     __aicore__ inline LocalTensor<uint16_t> ThresholdResult() {
         return nkValueLocal.ReinterpretCast<uint16_t>();
     }
@@ -216,6 +222,9 @@ public:
             auto values = reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal.GetPhyAddr());
             auto kth = reinterpret_cast<__ubuf__ uint32_t*>(nkValueLocal.GetPhyAddr());
             topkb16gather::FindIdxGTOutputVFImpl(idx, values, uint16_t(0), kth, uint16_t(s2SeqLen / 128));
+#if KVIP_INCREMENTAL_TIES
+            incrementalStrictCount_ = GetSpr<SpecialPurposeReg::AR>() / sizeof(uint16_t);
+#endif
             topkb16gather::FindIdxEQOutputVFImpl(idx, values, uint16_t(0), kth, uint16_t(s2SeqLen / 128));
             topkb16gather::FindValueOutputVFImpl(
                 reinterpret_cast<__ubuf__ uint16_t*>(hisValueLocal.GetPhyAddr()),
@@ -251,6 +260,9 @@ public:
         }
     }
 private:
+#if KVIP_INCREMENTAL_TIES
+    uint32_t incrementalStrictCount_ = 0;
+#endif
     LocalTensor<uint32_t> hisIndexLocal[2];      // 每trunkLen长度的s2选出的topK个索引
     LocalTensor<uint32_t> histogramsLocal;       // 直方图的临时Buf 256 * 4B
     LocalTensor<uint32_t> idxHighLocal;          // 输入数据高8位Buf 256 * 4B

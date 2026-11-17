@@ -10,6 +10,13 @@
     uint32_t incrementalTailBegin_ = 0, incrementalTailEnd_ = 0;
     uint32_t incrementalReverseBegin_ = 0, incrementalReverseEnd_ = 0;
     bool incrementalReady_ = false;
+#if KVIP_INCREMENTAL_DIRECT
+    uint32_t incrementalPending_ = 0;
+    bool incrementalPacked_ = false;
+#endif
+#if KVIP_INCREMENTAL_TIES
+    uint32_t incrementalStrict_ = 0;
+#endif
 
     __aicore__ inline void SaveIncremental(uint32_t bank) {
         PipeBarrier<PIPE_V>();
@@ -37,6 +44,13 @@
         Simt::VF_CALL<kvip_incremental::TagSeed>(Simt::Dim3{256,1,1},ctx,query/4,runtimeShape_.resident,
             reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()));
         SaveIncremental(query % 2);
+#if KVIP_INCREMENTAL_TIES
+        // Reuse the seed selector's GT count; do not rescan the selected K.
+        incrementalStrict_ = topkOp_.IncrementalStrictCount();
+#endif
+#if KVIP_INCREMENTAL_DIRECT
+        incrementalPacked_ = false;
+#endif
         incrementalCount_ = 0; incrementalEpoch_ = 1;
         incrementalBegin_ = runtimeShape_.resident;
         incrementalEnd_ = causalEnd;
@@ -54,6 +68,9 @@
     }
 
     __aicore__ inline void MergeIncremental(uint32_t bank) {
+#if KVIP_INCREMENTAL_DIRECT
+        incrementalPacked_ = false;
+#endif
         if (!incrementalCount_) return;
         // A prior tile may still be copying the progress table from scoreOut.
         SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
@@ -105,6 +122,54 @@
                                       2048+incrementalCount_,size);
         }
 #endif
+#if KVIP_INCREMENTAL_DIRECT
+#if KVIP_INCREMENTAL_TIES
+        if (offsets && incrementalCount_ < kvip_incremental::kTop - incrementalStrict_) {
+            // All new strict improvements fit in the old Kth tie group and
+            // at least one old tie survives. Kth is therefore exactly unchanged.
+            kvip_incremental::Materialize<true>(nullptr,
+                reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(incrementalIds_.GetPhyAddr()), offsets,
+                reinterpret_cast<__ubuf__ uint16_t*>(scoreOutLocal_.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(topkSharedTmpLocal_[32].GetPhyAddr()),
+                incrementalStrict_, incrementalCount_, incrementalBegin_,
+                incrementalReverseBegin_, incrementalReverseEnd_, incrementalTailBegin_, incrementalTailEnd_);
+            incrementalPending_ = GetSpr<SpecialPurposeReg::AR>() / sizeof(uint32_t);
+            incrementalPacked_ = true;
+            PipeBarrier<PIPE_V>();
+            DataCopy(incrementalScores_, scoreOutLocal_, 2048);
+            DataCopy(incrementalIds_, indicesOutLocal_, 2048);
+            PipeBarrier<PIPE_V>();
+            rotationProgressBase_ = UINT32_MAX;
+            incrementalStrict_ += incrementalCount_;
+            incrementalCount_ = 0;
+            return;
+        }
+#endif
+        auto cutoff = topkOp_.ThresholdResult();
+        auto ordinals = topkOp_.IncrementalOrdinals();
+        topkOp_.Threshold(mrgValueLocal_, cutoff, size);
+        PipeBarrier<PIPE_V>();
+        auto idx = reinterpret_cast<__ubuf__ uint16_t*>(ordinals.GetPhyAddr());
+        auto values = reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_.GetPhyAddr());
+        auto kth = reinterpret_cast<__ubuf__ uint32_t*>(cutoff.GetPhyAddr());
+        topkb16gather::FindIdxGTOutputVFImpl(idx, values, uint16_t(0), kth, uint16_t(size / 128));
+#if KVIP_INCREMENTAL_TIES
+        incrementalStrict_ = GetSpr<SpecialPurposeReg::AR>() / sizeof(uint16_t);
+#endif
+        topkb16gather::FindIdxEQOutputVFImpl(idx, values, uint16_t(0), kth, uint16_t(size / 128));
+        PipeBarrier<PIPE_V>();
+        kvip_incremental::Materialize<false>(idx, values,
+            reinterpret_cast<__ubuf__ uint32_t*>(incrementalIds_.GetPhyAddr()), offsets,
+            reinterpret_cast<__ubuf__ uint16_t*>(scoreOutLocal_.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(topkSharedTmpLocal_[32].GetPhyAddr()),
+            0, 0, incrementalBegin_, incrementalReverseBegin_, incrementalReverseEnd_,
+            incrementalTailBegin_, incrementalTailEnd_);
+        incrementalPending_ = GetSpr<SpecialPurposeReg::AR>() / sizeof(uint32_t);
+        incrementalPacked_ = true;
+#else
         topkOp_(mrgValueLocal_, indicesOutLocal_, scoreOutLocal_, size, 0, 1, true);
         PipeBarrier<PIPE_V>();
         Simt::VF_CALL<kvip_incremental::Remap>(Simt::Dim3{256,1,1},
@@ -112,18 +177,32 @@
             reinterpret_cast<__ubuf__ uint32_t*>(incrementalIds_.GetPhyAddr()),
             offsets,
             incrementalBegin_,incrementalReverseBegin_,incrementalReverseEnd_,0,0,incrementalTailBegin_,incrementalTailEnd_);
+#endif
         SaveIncremental(bank);
         incrementalCount_ = 0;
     }
 
     __aicore__ inline void PublishIncremental(uint32_t query, uint32_t epoch) {
         auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+#if KVIP_INCREMENTAL_DIRECT
+        // Header+IDs share one contiguous staging area. The selected-ordinal
+        // scratch starts later in this allocation and is never overwritten.
+        if (!incrementalPacked_) {
+            kvip_incremental::CompactIds(
+                reinterpret_cast<__ubuf__ uint32_t*>(incrementalIds_.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(topkSharedTmpLocal_[32].GetPhyAddr()));
+            incrementalPending_ = GetSpr<SpecialPurposeReg::AR>() / sizeof(uint32_t);
+        }
+        const uint32_t count = incrementalPending_;
+        auto header = topkSharedTmpLocal_;
+#else
         auto flags = mrgValueLocal_.template ReinterpretCast<uint32_t>();
         kvip_incremental::CompactIds(
             reinterpret_cast<__ubuf__ uint32_t*>(incrementalIds_.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()));
         const uint32_t count = GetSpr<SpecialPurposeReg::AR>() / sizeof(uint32_t);
         auto header = flags[2048];
+#endif
         Duplicate(header,uint32_t(0),32);
         SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
         header.SetValue(0,count);
@@ -135,8 +214,13 @@
             uint64_t(query*runtimeShape_.rounds+epoch)*kvip_incremental::kListWords);
         SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+#if KVIP_INCREMENTAL_DIRECT
+        DataCopy(output,header,32+(count+7)/8*8);
+        incrementalPacked_ = false;
+#else
         if(count)DataCopy(output[kvip_incremental::kHeader],indicesOutLocal_,(count+7)/8*8);
         DataCopy(output,header,32);
+#endif
         SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
         header.SetValue(0,epoch+1);
         SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);

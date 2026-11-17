@@ -173,7 +173,10 @@ def test_recent_does_not_change_final_topk_input():
     assert "prefixOutput_" not in final
     assert "scoreGm[vecOffset *" in final
     assert "if (prefixActive_)" in final
-    score = function(source, "__aicore__ inline void QLIVector<QLIT>::ProcessVec1(")
+    # Conditional branches can open alternative braces with one common close.
+    # This source check needs both branches, without raw brace counting.
+    score = source.split("__aicore__ inline void QLIVector<QLIT>::ProcessVec1(", 1)[1]
+    score = score.split("\ntemplate <typename QLIT>", 1)[0]
     assert score.count("!scoreOnly && curS2Idx >= runtimeShape_.resident") >= 2
     assert "if (!scoreOnly) PublishScoreProgress(info, progressShard, publishShardEnd);" in score
 

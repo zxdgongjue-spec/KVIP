@@ -2,6 +2,7 @@
 #pragma once
 #include "incremental_topk.h"
 #include "cold_scan.h"
+#include "incremental_state_vector.h"
 
 #if KVIP_INCREMENTAL_TOPK
 namespace kvip_incremental {

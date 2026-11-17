@@ -6,7 +6,7 @@ from pathlib import Path
 from test_recent_index import INDEXER, function
 
 
-def test_actual_boundary_sparse_dense_empty_and_scratch_reuse(tmp_path):
+def prefilter_model_source():
     vector = (INDEXER / "incremental_topk_vector.h").read_text()
     methods = "\n".join(function(vector, name) for name in (
         "__simd_callee__ inline void StoreWindow(",
@@ -124,6 +124,11 @@ int main(){
 }
 '''.replace("MERGE", function((INDEXER / "incremental_topk_methods.h").read_text(),
                                   "    __aicore__ inline void MergeIncremental("))
+    return source
+
+
+def test_actual_boundary_sparse_dense_empty_and_scratch_reuse(tmp_path):
+    source = prefilter_model_source()
     cpp = tmp_path / "prefilter.cpp"
     cpp.write_text(source)
     exe = cpp.with_suffix("")

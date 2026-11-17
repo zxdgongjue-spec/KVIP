@@ -13,6 +13,18 @@
 #ifndef KVIP_INCREMENTAL_PREFILTER
 #define KVIP_INCREMENTAL_PREFILTER 0
 #endif
+#ifndef KVIP_INCREMENTAL_DIRECT
+#define KVIP_INCREMENTAL_DIRECT 0
+#endif
+#ifndef KVIP_INCREMENTAL_TIES
+#define KVIP_INCREMENTAL_TIES 0
+#endif
+#if KVIP_INCREMENTAL_DIRECT && !KVIP_INCREMENTAL_PREFILTER
+#error "Direct incremental state requires window prefilter"
+#endif
+#if KVIP_INCREMENTAL_TIES && !KVIP_INCREMENTAL_DIRECT
+#error "Boundary tie updates require direct incremental state"
+#endif
 #if KVIP_INCREMENTAL_PREFILTER && !KVIP_INCREMENTAL_REGISTER
 #error "Window prefilter requires register window selection"
 #endif

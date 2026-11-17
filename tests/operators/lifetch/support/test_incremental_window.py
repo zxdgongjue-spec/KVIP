@@ -22,6 +22,10 @@ def test_register_dispatch_preserves_exact_kth_and_stable_ties(tmp_path):
     branch = text[start:end]
     source += r'''
 #define KVIP_INCREMENTAL_REGISTER 1
+#define KVIP_INCREMENTAL_TIES 1
+enum class SpecialPurposeReg{AR};
+unsigned scalarAr=0;
+template<SpecialPurposeReg>unsigned GetSpr(){return scalarAr;}
 constexpr unsigned PIPE_V=0;
 template<unsigned>void PipeBarrier(){}
 enum class RoundMode{CAST_NONE};
@@ -33,6 +37,7 @@ unsigned written=0;
 void FindIdxGTOutputVFImpl(uint16_t* out,uint16_t* in,uint16_t begin,uint32_t* key,uint16_t loops){
  written=0;auto kth=*reinterpret_cast<uint16_t*>(key);
  for(unsigned i=0;i<loops*128;++i)if(in[i]>kth)out[written++]=begin+i;
+ scalarAr=2*written;
 }
 void FindIdxEQOutputVFImpl(uint16_t* out,uint16_t* in,uint16_t begin,uint32_t* key,uint16_t loops){
  auto kth=*reinterpret_cast<uint16_t*>(key);
@@ -44,7 +49,8 @@ void FindValueOutputVFImpl(uint16_t* out,uint16_t* in,uint16_t* idx,uint16_t loo
 template<bool B,class... Args>void LiTopKVF(Args...){assert(false);}
 }
 struct TopK {
- unsigned topK=2048;
+ unsigned topK=2048,incrementalStrictCount_=0;
+STRICT_GETTER
  std::array<uint32_t,832> scratch{};
  std::array<uint16_t,18432> index{};
  Tensor<uint32_t> histogramsLocal{scratch.data(),256},idxHighLocal{scratch.data()+256,256},
@@ -75,12 +81,14 @@ int main(){
    Tensor<uint16_t> in{input.data(),n},out{scores.data(),2048};Tensor<uint32_t> idx{ids.data(),2048};
    TopK op;topkb16gather::passes=0;op.Run(in,idx,out,n);
    assert(input==before&&topkb16gather::passes==0);
+   assert(op.IncrementalStrictCount()==std::count_if(input.begin(),input.end(),[&](auto v){return v>kth;}));
    assert(*reinterpret_cast<uint16_t*>(op.nkValueLocal.p)==kth);
    for(unsigned i=0;i<2048;++i){assert(ids[i]==expected[i]);assert(scores[i]==input[ids[i]]);}
   }
 }
 '''.replace("THRESHOLD", function(text, "    __aicore__ inline void Threshold("))
     source = source.replace("BRANCH", branch)
+    source = source.replace("STRICT_GETTER", function(text, "    __aicore__ inline uint32_t IncrementalStrictCount("))
     cpp = tmp_path / "window_selector.cpp"
     cpp.write_text(source)
     exe = cpp.with_suffix("")

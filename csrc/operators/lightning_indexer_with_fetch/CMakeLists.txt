@@ -10,6 +10,14 @@ option(KVIP_INCREMENTAL_TOPK "Producer compact pairs, incremental TopK and direc
 option(KVIP_INCREMENTAL_WINDOW "Fixed-address per-window incremental score staging" OFF)
 option(KVIP_INCREMENTAL_REGISTER "Register Kth for incremental window selection" OFF)
 option(KVIP_INCREMENTAL_PREFILTER "Fixed tile filtering and boundary-only sparse compaction" OFF)
+option(KVIP_INCREMENTAL_DIRECT "Materialize selected scores and physical IDs in one SIMD VF" OFF)
+option(KVIP_INCREMENTAL_TIES "Exact boundary-tie replacement without Kth selection" OFF)
+if(KVIP_INCREMENTAL_DIRECT AND NOT KVIP_INCREMENTAL_PREFILTER)
+  message(FATAL_ERROR "Direct incremental state requires window prefilter")
+endif()
+if(KVIP_INCREMENTAL_TIES AND NOT KVIP_INCREMENTAL_DIRECT)
+  message(FATAL_ERROR "Boundary tie updates require direct incremental state")
+endif()
 if(KVIP_INCREMENTAL_PREFILTER AND NOT KVIP_INCREMENTAL_REGISTER)
   message(FATAL_ERROR "Window prefilter requires register window selection")
 endif()
@@ -78,6 +86,8 @@ ascendc_compile_options(v9_kernel PRIVATE -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WO
   -DKVIP_INCREMENTAL_WINDOW=$<BOOL:${KVIP_INCREMENTAL_WINDOW}>
   -DKVIP_INCREMENTAL_REGISTER=$<BOOL:${KVIP_INCREMENTAL_REGISTER}>
   -DKVIP_INCREMENTAL_PREFILTER=$<BOOL:${KVIP_INCREMENTAL_PREFILTER}>
+  -DKVIP_INCREMENTAL_DIRECT=$<BOOL:${KVIP_INCREMENTAL_DIRECT}>
+  -DKVIP_INCREMENTAL_TIES=$<BOOL:${KVIP_INCREMENTAL_TIES}>
   -DKVIP_INCREMENTAL_TOPK=$<BOOL:${KVIP_INCREMENTAL_TOPK}>
   -DKVIP_REVERSE_COLD=$<BOOL:${KVIP_REVERSE_COLD}>
   -DKVIP_ROLLING_THRESHOLD=$<BOOL:${KVIP_ROLLING_THRESHOLD}>
@@ -116,3 +126,5 @@ target_compile_definitions(v9_bridge PRIVATE KVIP_INCREMENTAL_TOPK=$<BOOL:${KVIP
 target_compile_definitions(v9_bridge PRIVATE KVIP_INCREMENTAL_WINDOW=$<BOOL:${KVIP_INCREMENTAL_WINDOW}> KVIP_INCREMENTAL_REGISTER=$<BOOL:${KVIP_INCREMENTAL_REGISTER}>)
 
 target_compile_definitions(v9_bridge PRIVATE KVIP_INCREMENTAL_PREFILTER=$<BOOL:${KVIP_INCREMENTAL_PREFILTER}>)
+
+target_compile_definitions(v9_bridge PRIVATE KVIP_INCREMENTAL_DIRECT=$<BOOL:${KVIP_INCREMENTAL_DIRECT}> KVIP_INCREMENTAL_TIES=$<BOOL:${KVIP_INCREMENTAL_TIES}>)

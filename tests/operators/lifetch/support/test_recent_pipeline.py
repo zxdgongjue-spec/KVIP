@@ -233,9 +233,10 @@ def test_native_two_range_query_lifetime(tmp_path, scale_tiles):
 
 def test_query_lifetime_keeps_physical_key_boundaries():
     cube = function((INDEXER / "indexer_cube.h").read_text(), "__aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(")
-    vector = function(
-        (INDEXER / "indexer_vector.h").read_text(), "__aicore__ inline void QLIVector<QLIT>::ProcessVec1("
-    )
+    # Preserve both preprocessor alternatives; their braces share a close.
+    vector = (INDEXER / "indexer_vector.h").read_text().split(
+        "__aicore__ inline void QLIVector<QLIT>::ProcessVec1(", 1
+    )[1].split("\ntemplate <typename QLIT>", 1)[0]
     assert cube.count("runInfo.LoadQuery()") == 2
     assert cube.count("runInfo.ReleaseQuery()") == 2
     assert "l1FullyUsed || runInfo.isLastS2InnerLoop" in cube
