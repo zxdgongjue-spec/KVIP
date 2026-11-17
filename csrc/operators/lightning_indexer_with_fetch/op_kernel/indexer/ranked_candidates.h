@@ -129,6 +129,20 @@ inline void GatherCoveredWords(__ubuf__ uint32_t* ids,__gm__ uint32_t* covered,
         uint32_t id=ids[i];words[i]=id<valid?asc_ldcg(covered+id/32):0U;
     }
 }
+__simd_vf__ inline void GatherCoveredChunk(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* bitmap,
+    __ubuf__ uint32_t* words,uint32_t base,uint32_t end) {
+    using namespace MicroAPI;auto all=CreateMask<uint32_t,MaskPattern::ALL>();
+    RegTensor<uint32_t> id,offset,index,safe,zero,bits,previous;MaskReg ge,lt,inside;
+    Duplicate(zero,uint32_t(0));
+    for(uint16_t i=0;i<2048;i+=64){
+        LoadAlign(id,ids+i);CompareScalar<uint32_t,CMPMODE::GE>(ge,id,base,all);
+        CompareScalar<uint32_t,CMPMODE::LT>(lt,id,end,all);MaskAnd(inside,ge,lt,all);
+        Adds(offset,id,uint32_t(0-base),all);Select(safe,offset,zero,inside);
+        ShiftRights(index,safe,int16_t(5),all);Gather(bits,bitmap,index,all);
+        if(base==0)Duplicate(previous,uint32_t(0));else LoadAlign(previous,words+i);
+        Select(bits,bits,previous,inside);StoreAlign(words+i,bits,all);
+    }
+}
 // scratch >= 25 KiB, output >= 16 KiB. Bitmap bank dies before rank selection.
 // Bitmap loading or sparse gathering is included in clocks[0..1].
 __aicore__ inline uint32_t SelectBitmap(LocalTensor<uint32_t> ids,LocalTensor<uint16_t> scores,
@@ -146,6 +160,19 @@ __aicore__ inline uint32_t SelectBitmap(LocalTensor<uint32_t> ids,LocalTensor<ui
         DataCopy(scratch,bits,(history+255)/256*8);
         SetFlag<HardEvent::MTE2_V>(EVENT_ID4);WaitFlag<HardEvent::MTE2_V>(EVENT_ID4);
         PackUncovered<false>(id,score,p,out,p+4096,p+6144,valid);
+    }else if(history<=262144){
+        // At most two DMA chunks; reuse the eligible bank for gathered words.
+        // Longer histories use sparse loads rather than scanning every chunk.
+        GlobalTensor<uint32_t> bits;bits.SetGlobalBuffer(covered);
+        for(uint32_t base=0;base<history;base+=131072){
+            uint32_t size=history-base<131072?history-base:131072;
+            DataCopy(scratch,bits[base/32],(size+255)/256*8);
+            SetFlag<HardEvent::MTE2_V>(EVENT_ID4);WaitFlag<HardEvent::MTE2_V>(EVENT_ID4);
+            GatherCoveredChunk(id,p,out,base,base+size);
+            SetFlag<HardEvent::V_MTE2>(EVENT_ID4);WaitFlag<HardEvent::V_MTE2>(EVENT_ID4);
+        }
+        SetFlag<HardEvent::V_S>(EVENT_ID4);WaitFlag<HardEvent::V_S>(EVENT_ID4);
+        PackUncovered<true>(id,score,out,out,p+4096,p+6144,valid);
     }else{
         SetFlag<HardEvent::V_S>(EVENT_ID4);WaitFlag<HardEvent::V_S>(EVENT_ID4);
         Simt::VF_CALL<GatherCoveredWords>(Simt::Dim3{256,1,1},id,covered,p,valid);
