@@ -42,7 +42,7 @@ def isolate(kernel):
     else:
         prefix += "    auto moves=reinterpret_cast<__gm__ Move*>(a->highIndex)+uint64_t(b)*kCapacity;\n"
     header.write_text(prefix + start + before_wait + after_publish +
-                      "    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ticks),256);\n}\n} }\n")
+                      "    if (profile) kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ticks),256);\n}\n} }\n")
     streaming = kernel / "streaming.cpp"
     prefix, entry = split_once(streaming.read_text(),
                                'extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {')
