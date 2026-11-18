@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
+#include "high_index_lending.h"
 
 // Four AIVs own one request, one Q and one private final queue each. Init
 // already clears these four cache-line-separated records at each HIGH step.
@@ -119,6 +120,18 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
         SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
         error|=local.GetValue(0); pipe.Destroy();
     }
+    // Only already validated, active queues participate. Sparse rows keep
+    // their idle Jettys untouched, including their CQ and transport state.
+    uint32_t capacity=0;
+    if(count && !error && !blocking) {
+        auto e=reinterpret_cast<__gm__ const KvafBatchGetDirectUrmaEntity*>(args.channel_entity);
+        capacity=e->sq_depth-1;
+        if(args.batch_get_max_inflight_total && capacity>args.batch_get_max_inflight_total)
+            capacity=args.batch_get_max_inflight_total;
+        if(count && e->cq_depth<=2) capacity=count;
+    }
+    me->reserved[11]=safe;
+    me->reserved[12]=capacity;
     if(!q) {
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),128);
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),64);
@@ -135,16 +148,42 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
     for(uint32_t p=0;p<4;++p) total+=join.lines[p].count;
     // All input, output and plan owners returned before granting Validated.
     if(total!=join.lines[0].reserved[6]) error|=kvaf_device::kInvalidArgs;
+    FinalLoan loan;
+    if(!error && total>kvaf_device::kWqesPerPost) {
+        loan=ChooseLoan(join.lines,join.lines[0].reserved[7]);
+        if(loan.count && (q==loan.donor || q==loan.helper)) {
+            uint32_t peer=q==loan.donor ? loan.helper : loan.donor;
+            if(!SameTransferMemory(args,GetArgs(ctx,FinalQueue(batch,4,b,peer)))) loan.count=0;
+        }
+    }
+    const uint32_t lent=q==loan.donor ? loan.count : 0;
+    const uint32_t borrowed=q==loan.helper ? loan.count : 0;
+    const uint32_t own=count-lent;
     post_index_transport::State first{},second{};
     // The final ranges contain frozen addresses. A prefetch can conflict
     // with a final KV destination, but it cannot overwrite Index storage.
     // Post a safe prefix now; defer only the unsendable range. A bounded
     // blocking fallback is likewise deferred so its CQ cannot gate Index.
     bool conflict=safe<count && join.lines[0].reserved[7];
-    uint32_t early=blocking ? 0 : (!conflict ? count : (split ? safe : 0));
+    uint32_t early=blocking ? 0 : (!conflict ? own : (split ? safe : 0));
     if(!error && early){
         if(profile){r->postBegin=GetSystemCycle();ticks[4]=r->postBegin;ticks[8]=1;}
         error|=post_index_transport::Post(args,0,early,first);
+        if(profile) r->postDone=GetSystemCycle();
+    }
+    if(!error && borrowed) {
+        // StagedQuery reserves a distinct destination per deduplicated miss
+        // across Q. Read the producer's original suffix in place on this FIFO.
+        const uint32_t start=b*kSlots+loan.donor*kTop+join.lines[loan.donor].count-borrowed;
+        args.indices=ctx->sourceBlocks+uint64_t(start)*4;
+        args.offsets=ctx->sourceOffsets+uint64_t(start)*4;
+        args.output_indices=ctx->destinations+uint64_t(start)*4;
+        args.request_capacity=borrowed;
+        if(profile) {
+            uint64_t begin=GetSystemCycle(); ticks[4]=begin; ticks[8]=early ? 2 : 1;
+            if(!early) r->postBegin=begin;
+        }
+        error|=post_index_transport::Post(args,0,borrowed,second);
         if(profile) r->postDone=GetSystemCycle();
     }
     auto plan=join.lines+2;
@@ -155,7 +194,8 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
     // A failed lane can reach Done without gathering originals. Mark the
     // skipped phase failed as well so its peers never scatter stale payload.
     if(error) join.Publish(RowRendezvous::ReadOriginals,error);
-    if(profile){ r->indexDone=GetSystemCycle(); ticks[2]=0x52514932U; }
+    if(profile){ r->indexDone=GetSystemCycle(); ticks[2]=0x52514933U;
+        ticks[20]=count; ticks[21]=borrowed; ticks[22]=lent; ticks[23]=borrowed?loan.donor+1:0; }
     // Only q0 consumes the prefetch queue. Only ranges that might
     // overwrite an in-flight prefetch destination depend on that completion.
     if(!q){
@@ -164,15 +204,15 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
         flags[7].error=error; flags[7].ready=1;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+7),sizeof(*flags));
     }
-    if(early<count) {
+    if(early<own) {
         if(conflict) error|=AwaitPublication(flags+7);
         if(!error){
             if(profile){
                 uint64_t begin=GetSystemCycle(); ticks[4]=begin; ticks[8]=early ? 2 : 1;
                 if(!early) r->postBegin=begin;
             }
-            error|=blocking ? post_index_transport::GetBlocking(args,early,count-early,second)
-                            : post_index_transport::Post(args,early,count-early,second);
+            error|=blocking ? post_index_transport::GetBlocking(args,early,own-early,second)
+                            : post_index_transport::Post(args,early,own-early,second);
             if(profile) r->postDone=GetSystemCycle();
         }
     }
@@ -180,7 +220,7 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
     // prefix must be retired even on failure of the row or of the suffix.
     error|=post_index_transport::RetirePair(first,second);
     if(profile) r->cqDone=GetSystemCycle();
-    r->error=error; r->globalError=error; r->count=count; r->fallback=blocking?1:0;
+    r->error=error; r->globalError=error; r->count=own+borrowed; r->fallback=blocking?1:0;
     r->completed=first.completed+second.completed; r->active=2;
     post_index_tail::Flush(r);
     // Completed counts travel on the same cache line as this lane's Done flag.
