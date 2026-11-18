@@ -17,14 +17,14 @@ struct PrivatePlan {
     uint32_t strategy = 2, probedEvents = 0;
 };
 
-#include "high_index_cold_plan.h"
+#include "high_index_touched_plan.h"
 
 // One owner composes each row's sparse/dense map preserving the original
 // prefetch/Q0/Q1/Q2/Q3 phase and 512-event chunk boundaries. Dirty destinations
 // include displaced rows. No key/scale/address/logical writes here.
 __aicore__ inline void Plan(__gm__ Args* a, uint32_t b, __gm__ Edge* edges,
                            __gm__ uint32_t* invalidations, bool profile, PrivatePlan& plan) {
-    if (TryColdPlan(a,b,edges,profile,plan)) { plan.strategy=1; return; }
+    if (TryTouchedPlan(a,b,edges,invalidations,profile,plan)) return;
     auto ctx = reinterpret_cast<__gm__ Context*>(a->context);
     auto shape = LoadRuntimeShape(ctx);
     auto src = reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+uint64_t(b)*a->maxEvents;
@@ -156,7 +156,7 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a,uint32_t blo
         if (profile) {
             ticks[15]=GetSystemCycle(); ticks[20]=2*plan.pairs+plan.singles;
             ticks[21]=plan.activeCycles; ticks[22]=plan.pairs;
-            ticks[23]=0x43503231U; ticks[24]=plan.strategy;
+            ticks[23]=kTouchedMagic; ticks[24]=plan.strategy;
             ticks[25]=plan.probedEvents; ticks[26]=plan.probeCycles;
         }
     }
