@@ -1,7 +1,7 @@
 """Independent URMA scan-order/admission experiment; no graph-route changes."""
 
 OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill", "compact_out_of_place", "rolling_reuse_seed", "rolling_fast_path", "rolling_sparse", "rolling_boundary", "incremental_topk", "incremental_window", "incremental_register", "incremental_prefilter", "incremental_direct", "incremental_ties", "incremental_light", "incremental_inplace", "incremental_progress", "incremental_segments")
-EXPERIMENT_OPTIONS = ("consumed_prefix", "window_probe")
+EXPERIMENT_OPTIONS = ("consumed_prefix", "window_probe", "seed_mask")
 DEFAULT_VARIANTS = ("forward", "reverse", "forward-wide", "reverse-wide", "forward-end")
 VARIANTS = {name: ("reverse_cold",) if name.startswith("reverse") else () for name in DEFAULT_VARIANTS}
 ROLLING_VARIANTS = ("forward", "reverse", "reverse-roll", "reverse-refilter", "forward-refilter", "forward-end")
@@ -151,6 +151,12 @@ for _base in ("reverse", "reverse-inc-register", "reverse-inc-segments", "revers
     VARIANTS[_base + "-probe"] = VARIANTS[_base] + ("window_probe",)
 
 
+VARIANTS["reverse-seed-mask"] = VARIANTS["reverse-consumed"] + ("seed_mask",)
+VARIANTS["reverse-seed-mask-probe"] = VARIANTS["reverse-seed-mask"] + ("window_probe",)
+for _base in ("reverse-consumed", "reverse-seed-mask", "reverse-cap128"):
+    VARIANTS[_base + "-end"] = VARIANTS[_base]
+
+
 def options_for(name):
     options = {key: key in VARIANTS[name] for key in OPTIONS}
     options.update({key: True for key in EXPERIMENT_OPTIONS if key in VARIANTS[name]})
@@ -161,7 +167,7 @@ def budgets_for(name):
     if name not in VARIANTS:
         raise ValueError(f"Unknown scan variant: {name}")
     if "-cap" in name:
-        return 512, int(name.rsplit("-cap", 1)[1])
+        return 512, int(name.removesuffix("-end").rsplit("-cap", 1)[1])
     return (1024, 128) if name.endswith("-wide") else (512, 64)
 
 
@@ -176,6 +182,8 @@ def validate_options(options):
         raise ValueError("Scan experiment options do not match the selected native interface")
     if any(type(value) is not bool for value in options.values()):
         raise ValueError("Scan build options must be bool")
+    if options.get("seed_mask") and not options["incremental_segments"]:
+        raise ValueError("Seed mask requires segment lists")
     if options.get("consumed_prefix") and not options["incremental_segments"]:
         raise ValueError("Consumed prefix requires segment lists")
     if options["incremental_segments"] and (

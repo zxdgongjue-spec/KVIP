@@ -20,6 +20,10 @@ case "$study" in
         branch=perf/urma-consumed-prefix
         native_sha=f7e092a54f7d1ef9fb0b43982a9d4ab5d938a37d
         ;;
+    seed)
+        branch=perf/urma-seed-mask
+        native_sha=a0956cad1327112ace20f3897431aaa797534f6c
+        ;;
     segments) ;;
     *) echo "Unknown study $study" >&2; exit 2 ;;
 esac
@@ -88,12 +92,24 @@ fi
 run_case() {
     local group=$1 phase=$2 warm=5 iterations=10 diagnostic=0 args=() selected=("${variants[@]}")
     local base="$result/g${group}-$phase"
+    if [[ "$study" == seed ]]; then
+        selected=(forward reverse reverse-consumed reverse-seed-mask reverse-seed-mask-end
+            reverse-consumed-end reverse-end forward-end)
+        if [[ "$group" == 4 ]]; then
+            selected=(forward reverse reverse-cap128 reverse-consumed reverse-seed-mask
+                reverse-seed-mask-end reverse-consumed-end reverse-cap128-end reverse-end forward-end)
+        fi
+        profile_variants=(reverse reverse-consumed reverse-seed-mask)
+    fi
     if [[ "$phase" == kernels ]]; then
         selected=("${profile_variants[@]}")
         args=(--profile-dir "$result/profiles/g$group" --profile-metrics none)
         warm=2; iterations=1
     elif [[ "$phase" == markers ]]; then
         selected=(reverse-probe reverse-inc-register-probe reverse-inc-segments-probe reverse-consumed-probe)
+        if [[ "$study" == seed ]]; then
+            selected=(reverse-probe reverse-consumed-probe reverse-seed-mask-probe)
+        fi
         warm=1; iterations=1; diagnostic=1
     fi
     echo "BEGIN G$group $phase"
@@ -110,7 +126,7 @@ run_case() {
                 awk '/^BUILD_DIAGNOSTIC_BEGIN/{block=1} block || /^REPLAY_FAILED|^FAILURE_JSON|^FAILURE_LOG|^RUN_LOG/{print} /^BUILD_DIAGNOSTIC_END/{block=0}' >&2
             return "$rc"
         }
-    if [[ "$study" == budget ]]; then
+    if [[ "$study" == budget || "$study" == seed ]]; then
         python3 -B "$reader/tests/diagnostics/window_budget_report.py" "$base.json" "$phase" \
             "$native_sha" "$inputs/g${group}-input/manifest.json" | tee "$base.txt"
     elif [[ "$phase" == graph ]]; then
@@ -125,6 +141,13 @@ for group in 7 2 10 17 4; do run_case "$group" graph; done
 for group in 7 2; do run_case "$group" kernels; done
 if [[ "$study" == budget ]]; then
     python3 -B "$reader/tests/diagnostics/window_budget_report.py" --combined "$result"
+    for group in 7 2; do run_case "$group" markers; done
+elif [[ "$study" == seed ]]; then
+    overall=PASS
+    for group in 7 2 10 17 4; do
+        grep -q '^SEED_GATE PASS ' "$result/g$group-graph.txt" || overall=KEEP_BASELINES
+    done
+    echo "FIVE_GROUP_GATE reverse-seed-mask $overall"
     for group in 7 2; do run_case "$group" markers; done
 fi
 (cd "$result"; tar -czf results.tar.gz g*.json g*.txt)

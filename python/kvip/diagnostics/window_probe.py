@@ -20,7 +20,13 @@ def decode(times, events, *, incremental):
     def per_window(a):
         return np.asarray(a.max(axis=1), dtype=np.int64).tolist()
 
+    parts = times[:, 0, 3:7]
+    if incremental and parts.any() and not np.array_equal(parts.sum(axis=1), times[:, 0, 0]):
+        raise ValueError("Seed subintervals do not cover the same query")
+
     return dict(
+        # Split one query's observed seed time, preserving additivity.
+        seed_slowest_parts=times[int(times[:, 0, 0].argmax()), 0, 3:7].tolist(),
         seed_max_ticks=int(times[:, 0, 0].max()),
         merge_max_by_cold_window=per_window(times[:, 1:, 1].T),
         publish_max_by_cold_window=per_window(times[:, 1:, 2].T),
