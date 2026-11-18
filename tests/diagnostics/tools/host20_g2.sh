@@ -8,6 +8,7 @@ profile=0
 candidate=
 high_index=0
 index_speed=0
+index_10k=0
 index_groups=(4 7 10 17)
 joint=0
 account=0
@@ -34,6 +35,10 @@ elif [[ $# == 1 && $1 == --parity ]]; then
 elif [[ $# == 1 && $1 == --kernels ]]; then
     labels=(serial after)
     profile=1
+elif [[ $# == 2 && $1 == --index-10k && $2 =~ ^[0-9a-f]{40}$ ]]; then
+    index_10k=1
+    labels=(before after)
+    candidate=$2
 elif [[ $# -ge 2 && $1 == --index-speed && $2 =~ ^[0-9a-f]{40}$ ]]; then
     if [[ $# -gt 2 ]]; then
         index_groups=()
@@ -51,7 +56,7 @@ elif [[ $# == 2 && $1 == --high-index && $2 =~ ^[0-9a-f]{40}$ ]]; then
     high_index=1
     candidate=$2
 elif [[ $# != 0 ]]; then
-    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA|--index-speed CANDIDATE_SHA [GROUP ...]]"
+    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA|--index-speed CANDIDATE_SHA [GROUP ...]|--index-10k CANDIDATE_SHA]"
 fi
 
 diag=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
@@ -67,7 +72,7 @@ after=0f103cc1b6db1beacfb90023d02befc5eff8ae9e
 if [[ -n $candidate ]]; then
     before=${3:-$after}
     if ((account)); then before=66a2f469ebaec3b35fff789a75177ee19b00213e; fi
-    if ((index_speed)); then before=dc7904e8e874956de6df8352265bb6ac64d1d644; fi
+    if ((index_speed || index_10k)); then before=dc7904e8e874956de6df8352265bb6ac64d1d644; fi
     after=$candidate
     [[ $after != "$before" ]] && git -C "$repo" merge-base --is-ancestor "$before" "$after" ||
         die "Candidate must be a distinct descendant of $before"
@@ -75,14 +80,6 @@ if [[ -n $candidate ]]; then
         [[ $(git -C "$repo" rev-parse "$after^") == "$init_only" && $(git -C "$repo" rev-parse "$init_only^") == "$before" ]] ||
             die "Expected baseline -> init-only -> init+LI revisions"
     fi
-fi
-[[ -s "$build/CMakeCache.txt" && -x "$cpu" ]] || die "Missing existing KVAF build or CPU helper: $cache"
-if ((high_index)); then
-    for group in "${index_groups[@]}"; do
-        [[ -s "$cache/skip-results.po80Nw/g$group-input/manifest.json" ]] || die "Missing snapshot for G$group"
-    done
-else
-    [[ -s "$snapshot/manifest.json" ]] || die "Missing G2 snapshot: $snapshot"
 fi
 clean() { git -C "$1" diff --quiet && git -C "$1" diff --cached --quiet; }
 clean "$diag" || die "Modified diagnostics checkout: $diag"
@@ -98,6 +95,31 @@ for label in "${labels[@]}"; do
 done
 
 export PATH=/usr/local/python3.12.13/bin:$PATH
+[[ -s "$build/CMakeCache.txt" ]] || die "Missing KVAF CMake cache: $build"
+if ((index_10k)); then
+    cann=$(sed -n 's/^ASCEND_CANN_PACKAGE_PATH:[^=]*=//p' "$build/CMakeCache.txt")
+    export ASCEND_CANN_PACKAGE_PATH=${cann:-/usr/local/Ascend/cann-9.2.0}
+    export ASCEND_RT_VISIBLE_DEVICES=4 SOC_VERSION=Ascend950DT_9582 INDEX_LAYOUTS='even skew'
+    export ASCEND_LAUNCH_BLOCKING=0 MAX_JOBS=2
+    inc="$cache/KVAF/access_operator/demo/aiv_batch_get/include"
+    probe=$(mktemp -d /tmp/kvip-10k.XXXXXX)
+    printf 'INDEX_10K physical_NPU=4 logical=0 events=5000 moves=10000 RESULT_ROOT=%s\n' "$probe"
+    for role in before after; do
+        rev=$before
+        if [[ $role == after ]]; then rev=$after; fi
+        printf 'INDEX_10K_ARM=%s REVISION=%s\n' "$role" "$rev"
+        bash "$diag/tests/diagnostics/tools/high_index_model/run_case.sh" npu "$src/auto-${rev:0:8}" "$inc" "$probe/$role"
+    done
+    exit
+fi
+[[ -x "$cpu" ]] || die "Missing KVAF CPU helper: $cpu"
+if ((high_index)); then
+    for group in "${index_groups[@]}"; do
+        [[ -s "$cache/skip-results.po80Nw/g$group-input/manifest.json" ]] || die "Missing snapshot for G$group"
+    done
+else
+    [[ -s "$snapshot/manifest.json" ]] || die "Missing G2 snapshot: $snapshot"
+fi
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 envroot="$src/candidate-c72c82cf"
