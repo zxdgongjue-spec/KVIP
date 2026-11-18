@@ -22,6 +22,9 @@ def test_compact_q4_matches_staged_resolver(tmp_path):
     compact = (kernel / "resolver_compact_q4.h").read_text().replace(
         "constexpr uint32_t kCompactThreads=512;", "constexpr uint32_t kCompactThreads=kTestThreads;")
     low = (kernel / "resolver_low_q4.h").read_text()
+    # Each lane owns distinct control/bitmap words; the sole barrier is at exit.
+    merge = function((kernel / "streaming.cpp").read_text(), "inline void MergeLowQ4Protection(")
+    merge = merge.replace("asc_syncthreads();", "")
     hot = kernel.parent.parent / "lidu/op_kernel/hot_slot_selection.h"
     program = tmp_path / "compact.cpp"
     program.write_text(r'''
@@ -79,7 +82,7 @@ uint32_t StagedPrefix(uint32_t local,uint32_t* ctl){
  if(!threadIdx.x)for(uint32_t i=1;i<kTestThreads;++i)ctl[544+i]+=ctl[543+i];
  asc_syncthreads();return threadIdx.x?ctl[543+threadIdx.x]:0;
 }
-''' + old + '\n' + compact + '\n' + low + r'''
+''' + old + '\n' + compact + '\n' + low + '\n' + merge + r'''
 struct State {
  uint32_t resident,history,changeCount=0;
  std::vector<uint32_t> selected,loc,keys,ranks,slots,work,ctl,changes,changeSlots,src,dst,lru;
@@ -194,6 +197,21 @@ int main(){
   }
   post.ctl[9]=1; // The old proof rejects invalid hot sources; the new one repairs them.
   State cached(post);
+  const uint32_t words=(resident+31)/32;
+  auto immutableBitmap=cached.ctl;
+  std::vector<uint32_t> other(3*words);
+  for(uint32_t i=0;i<words;++i){
+   uint32_t bits=immutableBitmap[1024+i];
+   cached.ctl[1024+i]=bits&0x11111111U;
+   for(uint32_t q=0;q<3;++q)other[q*words+i]=bits&(0x22222222U<<q);
+  }
+  std::fill_n(cached.ctl.begin(),10,0xdeadbeefU);
+  for(uint32_t lane=0;lane<512;++lane){
+   threadIdx.x=lane;
+   MergeLowQ4Protection(cached.ctl.data(),other.data(),words);
+  }
+  assert(cached.ctl[7]==kSlots);
+  assert(std::equal(immutableBitmap.begin()+1024,immutableBitmap.begin()+1024+words,cached.ctl.begin()+1024));
   run([&]{rotating::ResolveCompactQ4<true>(&post.ctx,history,resident,0,post.selected.data(),post.loc.data(),
    post.keys.data(),post.ranks.data(),post.slots.data(),post.work.data(),post.ctl.data(),post.src.data(),post.dst.data());});
   run([&]{rotating::ResolveLowQ4(&cached.ctx,history,resident,0,cached.selected.data(),cached.loc.data(),
@@ -202,7 +220,7 @@ int main(){
   assert(cached.src==post.src&&cached.dst==post.dst);
   assert(cached.changes==post.changes&&cached.changeSlots==post.changeSlots);
   assert(cached.changeCount==post.changeCount);
-  for(uint32_t i=0;i<10;++i)assert(cached.ctl[i]==post.ctl[i]);
+  for(uint32_t i=0;i<10;++i)if(i!=7)assert(cached.ctl[i]==post.ctl[i]);
   assert(!post.ctl[1]&&!post.ctl[9]);assert(post.ctl[0]==expectedSource.size());
   assert(post.loc==expectedLoc);
   assert(std::equal(expectedSource.begin(),expectedSource.end(),post.src.begin()+2048));
