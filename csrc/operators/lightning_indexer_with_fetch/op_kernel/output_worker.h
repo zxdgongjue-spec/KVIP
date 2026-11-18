@@ -26,10 +26,13 @@ __aicore__ inline uint32_t AwaitPublication(__gm__ BatchFlag* flag){
   if(GetSystemCycle()-start>5000000000ULL)return 8;
  }
 }
+// A dedicated HIGH measurement owns its per-core trace lines after the role
+// join; suppress this role's legacy per-batch writes to those same lines.
+template<bool TraceRole = true>
 __aicore__ inline void OutputWorker(__gm__ Args* a,uint32_t b){
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
- bool profile=(a->prefetchCount&0x80000000U)!=0;
+ bool profile=TraceRole && (a->prefetchCount&0x80000000U)!=0;
  auto ticks=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*256+uint64_t(b*kResolveCores+2)*32;
  uint32_t error=AwaitPublication(flags);
  if(profile)ticks[2]=GetSystemCycle();

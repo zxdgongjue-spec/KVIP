@@ -185,10 +185,11 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a,uint32_t blo
     auto moves=reinterpret_cast<__gm__ Move*>(a->highIndex)+uint64_t(b)*kCapacity;
     r->error=0; r->globalError=0; r->completed=0; r->count=0;
     r->packedRow=b; r->lane=lane; r->lanes=lanes;
-    if (profile) r->start=GetSystemCycle();
+    r->planDone=0; r->packDone=0; r->postBegin=0; r->postDone=0;
+    r->indexDone=0; r->cqDone=0; r->start=profile ? GetSystemCycle() : 0;
     uint32_t useful=0;
     if (!lane) useful=Producer(a,b);
-    else if (lane==1) OutputWorker(a,b);
+    else if (lane==1) OutputWorker<false>(a,b);
     if (!lane) CompletePrefetch(ctx,b,true);
     SyncAll(); // original-address readers and all speculative CQs are finished
     if (profile) r->planDone=GetSystemCycle();
