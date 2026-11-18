@@ -276,12 +276,13 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
                       if detail is not None and np.any(detail[:, 2] == INDEX_DETAIL_SAME_VF_MAGIC) else None)
             records = cpu_array(torch, bundle.forward.post_index)
             if high_active:
-                from kvip.diagnostics.high_index_profile import decode_high_index, descriptor_fingerprint, event_work
+                from kvip.diagnostics.high_index_profile import (
+                    decode_high_index, describe_row_load, descriptor_fingerprint, event_work,
+                )
 
-                work = event_work(cpu_array(torch, bundle.forward.flags),
-                                  cpu_array(torch, bundle.forward.events_src),
-                                  cpu_array(torch, bundle.forward.events_dst),
-                                  history=bundle.forward.history)
+                flags, src, dst = (cpu_array(torch, value) for value in
+                                   (bundle.forward.flags, bundle.forward.events_src, bundle.forward.events_dst))
+                work = event_work(flags, src, dst, history=bundle.forward.history)
                 work["descriptor_sha256"] = descriptor_fingerprint(
                     cpu_array(torch, rotating.final_posts),
                     (cpu_array(torch, v) for v in (rotating.blocks, rotating.offsets, rotating.destinations)),
@@ -292,6 +293,9 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
                     records, detail, wait_first=bool(getattr(bundle.forward, "post_index_wait_first", False)),
                     final_get=reads["final"], work=work,
                 )
+                if detail is not None:
+                    phase = reads["high_post_index"]
+                    phase["row_load"] = describe_row_load(flags, src, dst, phase["moved"], bundle.forward.resident)
             reads["post_index"] = decode_post_index(
                 records,
                 active=low_active,
@@ -335,9 +339,10 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         if "moved" in high:
             from kvip.diagnostics.high_index_profile import validate_move_counts, verify_permutation
 
-            verify_permutation(cpu_array(torch, bundle.forward.flags), cpu_array(torch, bundle.forward.events_src),
-                               cpu_array(torch, bundle.forward.events_dst), oracle.pre["logical_ids"],
-                               state["logical_ids"], oracle.owners)
+            high["row_load"]["two_cycle_moves"] = sum(verify_permutation(
+                cpu_array(torch, bundle.forward.flags), cpu_array(torch, bundle.forward.events_src),
+                cpu_array(torch, bundle.forward.events_dst), oracle.pre["logical_ids"], state["logical_ids"], oracle.owners,
+            ))
             validate_move_counts(high, oracle.pre["logical_ids"], state["logical_ids"], oracle.owners)
         if bundle.tuning.get("low_miss_read_through") and early_threshold_skipped(bundle.tuning):
             bundle.read_through_check = oracle.verify_frozen(state, address_delta=delta, output_stride=stride)

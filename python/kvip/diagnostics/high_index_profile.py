@@ -36,6 +36,7 @@ def event_work(flags, sources, destinations, *, history):
 def verify_permutation(flags, sources, destinations, before, after, owners):
     """Replay each simultaneous 512-element assignment plus its displaced-row closure."""
     history = before.shape[1]
+    two_cycle_moves = []
     for row, owner in enumerate(owners):
         at = np.arange(history, dtype=np.int32)
         location = at.copy()
@@ -59,6 +60,34 @@ def verify_permutation(flags, sources, destinations, before, after, owners):
             offset += int(count)
         if not np.array_equal(before[owner, at], after[owner]):
             raise ValueError(f"HIGH Index permutation differs from ordered prefetch/Q updates: row={row}")
+        # Count endpoints, not pairs. Use the composed permutation; the two
+        # endpoints of an input event need not be partners after later phases.
+        dirty = np.flatnonzero(at != np.arange(history))
+        two_cycle_moves.append(int(np.count_nonzero(at[at[dirty]] == dirty)))
+    return two_cycle_moves
+
+
+def describe_row_load(flags, sources, destinations, moved, resident):
+    """Describe real work distribution using the already copied diagnostic inputs."""
+    counts = flags[:, [0, 12, 13, 14, 15], 1]
+    batch = len(counts)
+    row_events = counts.sum(axis=1)
+    row_moves = np.asarray(moved).reshape(-1, batch).sum(axis=0)
+    simple = 0
+    for row, portions in enumerate(counts):
+        prefetched, final = int(portions[0]), int(portions[1:].sum())
+        if not prefetched + final:
+            continue
+        def used(table):
+            return np.concatenate((table[row, :prefetched], table[row, 2048:2048 + final]))
+        src, dst = used(sources), used(destinations)
+        if (np.all(src >= resident) and np.all(dst < resident)
+                and np.unique(src).size == src.size and np.unique(dst).size == dst.size):
+            simple += 1
+    return dict(row_events=row_events.tolist(), row_moves=row_moves.tolist(),
+                max_row_events=int(row_events.max()), max_row_moves=int(row_moves.max()),
+                dense_eligible_rows=int(np.count_nonzero(2 * row_events >= 4096)),
+                simple_swap_rows=simple)
 
 
 def validate_move_counts(profile, before, after, owners):
@@ -164,4 +193,8 @@ def decode_high_index(records, detail, *, wait_first, final_get, work):
         result.update(plan_join=int(marks[:, 11].max()) - int(marks[:, 4].min()),
                       gather_join=int(marks[:, 12].max()) - int(marks[:, 11].max()),
                       scatter_end=int(marks[:, 5].max()) - int(marks[:, 12].max()))
+        # The first two endpoints follow a collective. Last arrival *after*
+        # that collective identifies the observed endpoint, not its cause.
+        result["last_end_aiv"] = {name: int(np.argmax(marks[:, col])) for name, col in
+                                  (("plan_join", 11), ("gather_join", 12), ("scatter", 5))}
     return result
