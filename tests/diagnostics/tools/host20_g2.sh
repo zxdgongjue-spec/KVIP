@@ -1,21 +1,26 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# G2 regression on host20's existing fixture and KVAF runtime. No vLLM service.
+# Fixed-graph replay on host20's existing fixtures and KVAF runtime.
 set -eo pipefail
 die() { printf '%s\n' "$*" >&2; exit 1; }
 labels=(after)
 profile=0
 candidate=
-if [[ $# == 2 && $1 == --parity && $2 =~ ^[0-9a-f]{40}$ ]]; then
+high_index=0
+if [[ ($# == 2 || $# == 3) && $1 == --parity && $2 =~ ^[0-9a-f]{40}$ ]]; then
     labels=(serial before after after-end before-end serial-end before-profile after-profile)
     candidate=$2
+    [[ $# == 2 || $3 =~ ^[0-9a-f]{40}$ ]] || die "Expected a full control SHA"
 elif [[ $# == 1 && $1 == --parity ]]; then
     labels=(serial before after after-end before-end serial-end)
 elif [[ $# == 1 && $1 == --kernels ]]; then
     labels=(serial after)
     profile=1
+elif [[ $# == 2 && $1 == --high-index && $2 =~ ^[0-9a-f]{40}$ ]]; then
+    high_index=1
+    candidate=$2
 elif [[ $# != 0 ]]; then
-    die "usage: bash host20_g2.sh [--parity [FULL_CANDIDATE_SHA]|--kernels]"
+    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA]]|--kernels|--high-index CANDIDATE_SHA]"
 fi
 
 diag=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
@@ -29,13 +34,19 @@ main=532df2c8dfcb27cf8ab203f70d5bdf3510d77b6c
 before=96198a2bfc9ba2e983c090225b9acdfdf40c6099
 after=0f103cc1b6db1beacfb90023d02befc5eff8ae9e
 if [[ -n $candidate ]]; then
-    before=$after
+    before=${3:-$after}
     after=$candidate
     [[ $after != "$before" ]] && git -C "$repo" merge-base --is-ancestor "$before" "$after" ||
         die "Candidate must be a distinct descendant of $before"
 fi
-[[ -s "$snapshot/manifest.json" && -s "$build/CMakeCache.txt" && -x "$cpu" ]] ||
-    die "Missing G2 snapshot, existing KVAF build or CPU helper: $cache"
+[[ -s "$build/CMakeCache.txt" && -x "$cpu" ]] || die "Missing existing KVAF build or CPU helper: $cache"
+if ((high_index)); then
+    for group in 7 10 17 4; do
+        [[ -s "$cache/skip-results.po80Nw/g$group-input/manifest.json" ]] || die "Missing snapshot for G$group"
+    done
+else
+    [[ -s "$snapshot/manifest.json" ]] || die "Missing G2 snapshot: $snapshot"
+fi
 clean() { git -C "$1" diff --quiet && git -C "$1" diff --cached --quiet; }
 clean "$diag" || die "Modified diagnostics checkout: $diag"
 for label in "${labels[@]}"; do
@@ -67,8 +78,14 @@ export KVAF_BATCH_GET_KERNEL="$build/bin/kvaf_execute_batch_get_kernels.o"
 export KVAF_BATCH_PUT_KERNEL="$build/bin/kvaf_execute_batch_put_kernels.o"
 [[ -s "$KVAF_BATCH_GET_KERNEL" && -s "$KVAF_BATCH_PUT_KERNEL" ]] || die "Missing Get/Put objects in $build/bin"
 
-out=$(mktemp -d "$cache/host20-g2-map-check.XXXXXX")
-printf 'G2 NPU4 logical=0 candidate=%.8s harness=%.8s\nRESULT_ROOT=%s\n' "$after" "$(git -C "$diag" rev-parse HEAD)" "$out"
+if ((high_index)); then
+    out=$(mktemp -d "$cache/host20-high-index.XXXXXX")
+    printf 'HIGH_INDEX NPU4 logical=0 candidate=%.8s\n' "$after"
+else
+    out=$(mktemp -d "$cache/host20-g2-map-check.XXXXXX")
+    printf 'G2 NPU4 logical=0 control=%.8s candidate=%.8s harness=%.8s\n' "$before" "$after" "$(git -C "$diag" rev-parse HEAD)"
+fi
+printf 'RESULT_ROOT=%s\n' "$out"
 port=29084
 "$cpu" --listen 127.0.0.1 --port "$port" --memory-page-mode thp >"$out/.cpu.log" 2>&1 &
 pid=$!
@@ -92,6 +109,11 @@ done
 if [[ $ready != 1 ]] || ! kill -0 "$pid" 2>/dev/null; then tail -n 8 "$out/.cpu.log" >&2; exit 1; fi
 
 cd "$diag"
+if ((high_index)); then
+    python3 -B -m kvip.diagnostics.high_index_study --cache "$cache" \
+        --source "$src/auto-${after:0:8}" --revision "$after" --server "127.0.0.1:$port" --result-dir "$out"
+    exit
+fi
 common=(--snapshot "$snapshot" --build-dir "$build" --transport urma --kvaf-server "127.0.0.1:$port"
         --device 0 --soc Ascend950DT_9582 --warmup 2 --quiet)
 for label in "${labels[@]}"; do
