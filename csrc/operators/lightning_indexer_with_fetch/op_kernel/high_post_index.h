@@ -285,15 +285,21 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a,uint32_t blo
         ticks[2]=0x50494831U; ticks[5]=r->indexDone=GetSystemCycle();
         ticks[9]=last-first; ticks[10]=last-first;
     }
+    // Wait-first already drained its queue before Index. Publish its results
+    // at the Index join; both orders have exactly one Index join and one CQ join.
+    if (waitFirst) {
+        r->error=error|ws[0]; r->completed=transport.completed; r->active=2;
+        post_index_tail::Flush(r);
+    }
     SyncAll();
     if (profile) ticks[6]=GetSystemCycle();
     if (!waitFirst) {
         error|=post_index_transport::Wait(transport);
         if (profile) ticks[7]=r->cqDone=GetSystemCycle();
+        r->error=error|ws[0]; r->completed=transport.completed; r->active=2;
+        post_index_tail::Flush(r);
+        SyncAll();
     }
-    r->error=error|ws[0]; r->completed=transport.completed; r->active=2;
-    post_index_tail::Flush(r);
-    SyncAll();
     if (!lane) {
         uint32_t completed=0;
         uint64_t failed=RowErrors(records,b,batch,cores);
