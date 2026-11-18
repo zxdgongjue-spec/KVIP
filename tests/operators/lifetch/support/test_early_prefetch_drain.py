@@ -85,7 +85,7 @@ void CompletePrefetch(Context*,uint32_t batch,bool spare,
 }
 #include "early_prefetch_drain.h"
 void ConsumerPrefix/*CONSUMER*/}
-template<bool ReadThrough=false,bool PostIndex=false>
+template<bool ReadThrough=false,bool PostIndex=false,bool JoinedRow=false>
 uint64_t FinalizerPrefix/*FINALIZE*/return error;}
 void reset(uint32_t batch,bool profiling,uint64_t error){
  b=batch;profile=profiling;errorToReturn=error;
