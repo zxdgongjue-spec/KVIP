@@ -3,6 +3,7 @@
 #include "context.h"
 #include "cold_scan.h"
 #include "rolling_threshold.h"
+extern "C" uint32_t kvip_fetch_window_rank() { return (KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE) ? 2 : 0; }
 extern "C" uint32_t kvip_fetch_bitmap() { return KVIP_FETCH_BITMAP; }
 extern "C" uint32_t kvip_fetch_dense() { return KVIP_FETCH_DENSE; }
 extern "C" uint32_t kvip_incremental_window() { return KVIP_INCREMENTAL_WINDOW; }

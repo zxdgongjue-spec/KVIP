@@ -803,7 +803,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         }
         uint32_t allowance=PrefetchAllowance(slots,requests,state.GetValue(208),state.GetValue(209),
                                              state.GetValue(210),ctx->windowLimit);
-        count=ServiceFetchRank(ctx,scratch,cfg,selectedIds,rollingScores,map,b,rt_history,rt_resident,
+        count=ServiceFetchRank<captureIo>(ctx,scratch,cfg,selectedIds,rollingScores,map,b,rt_history,rt_resident,
                                rt_rounds,versions,target,ends,range,allowance,slots,missing,false);
         state.SetValue(12,target);
         // The ordinary row flush already transfers this history. Actual posted
