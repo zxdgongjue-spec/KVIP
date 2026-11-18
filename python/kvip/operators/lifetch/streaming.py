@@ -143,9 +143,12 @@ class StreamingLIFetchForward:
                 raise RuntimeError("Rebuild the URMA Post/Index bridge for eight-window Index profiling")
             # At most two dirty physical positions per prefetched or final event.
             # Two u32 positions plus the 148-byte tuple occupy 40 aligned u32 words.
+            # Final Get may reuse drained prefetch queues, but their externally
+            # visible status records remain owned by the prefetch phase.
+            move_bytes = self.batch * 2 * (2048 + 8192) * 160
+            status_bytes = 2 * self.rotating.runtime_shape.aicCount * self.rotating.owner.abi_sizes["status"]
             self._high_index_storage = self.torch.empty(
-                (self.batch, 2 * (2048 + 8192), 40),
-                dtype=self.torch.int32, device=self.rotating.device,
+                (move_bytes + status_bytes,), dtype=self.torch.uint8, device=self.rotating.device,
             )
             ptr = np.asarray([self._high_index_storage.data_ptr()], dtype="<u8").view("u1")
             self.workspace[152:160].copy_(self.torch.from_numpy(ptr.copy()))

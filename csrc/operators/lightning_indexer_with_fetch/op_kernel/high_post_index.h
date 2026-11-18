@@ -209,6 +209,10 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a,uint32_t blo
     uint32_t begin=total*lane/lanes,end=total*(lane+1)/lanes,own=end-begin;
     auto packed=reinterpret_cast<__gm__ int32_t*>(a->packedFetch)+uint64_t(b)*3*kSlots;
     auto args=GetArgs(ctx,block);
+    // Reuse the drained physical queue, never its first-phase completion
+    // record: the service exposes those prefetch records through the lease.
+    auto update=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);
+    args.core_status=a->highIndex+uint64_t(batch)*kCapacity*sizeof(Move)+uint64_t(block)*update[15];
     args.block_count=1; args.jettys_per_core=1;
     args.indices=uint64_t(packed+begin); args.offsets=uint64_t(packed+kSlots+begin);
     args.output_indices=uint64_t(packed+2*kSlots+begin); args.request_capacity=own;
@@ -266,7 +270,6 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a,uint32_t blo
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ws),128);
     uint32_t n=ws[0]?0:ws[3],first=n*lane/lanes,last=n*(lane+1)/lanes;
     uint32_t owner=ctx->rowOwners ? reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b] : b;
-    auto update=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);
     auto keys=reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*shape.history*16;
     auto scales=reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*shape.history;
     auto addresses=reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(owner)*update[7];

@@ -74,7 +74,8 @@ def test_post_index_workspace_keeps_default_abi_and_graph_pointers(monkeypatch, 
         f.library.kvip_high_post_index = Mock(return_value=1)
         forward.set_options()
         high_pointer = forward._high_index_storage.data_ptr()
-        assert forward._high_index_storage.shape == (batch, 20480, 40)
+        expected_bytes = batch * 20480 * 160 + expected_cores * rotating.owner.abi_sizes["status"]
+        assert forward._high_index_storage.shape == (expected_bytes,)
         assert int.from_bytes(blob[152:160], "little") == high_pointer
         allocation_count = f.torch.empty.call_count
         for enabled in (True, False, True):
