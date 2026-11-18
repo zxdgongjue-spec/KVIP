@@ -114,25 +114,48 @@ __aicore__ inline uint64_t Post(
     return kvaf_device::kSuccess;
 }
 
-// A failure on another core must not strand this core's already-posted reads.
-// Drain through the existing native CQ helper, then publish residency elsewhere.
-__aicore__ inline uint64_t Wait(State& state) {
+// Only a timeout leaves the native CQ consumer index unchanged. An error CQE
+// has still consumed its slot, so the next FIFO checkpoint may then be polled.
+template<bool RetryTimeout>
+__aicore__ inline uint64_t Retire(State& state, uint64_t previousError) {
     if (!state.pending) return state.error;
     auto entity = reinterpret_cast<__gm__ const KvafBatchGetDirectUrmaEntity*>(state.entity);
     auto queue = reinterpret_cast<__gm__ KvafBatchGetQueueState*>(state.queue);
     auto status = reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(state.status);
     uint32_t polls = 0;
     const uint64_t error = kvaf_device::WaitForCompletion(entity, queue, &polls);
-    if (!error) { ++queue->completed_batch_count; state.completed = state.requests; }
-    else queue->poisoned = 1;
-    queue->last_error = error;
+    uint64_t completion = error;
+    if constexpr (RetryTimeout) {
+        if (error == kvaf_device::kCqTimeout)
+            completion = kvaf_device::WaitForCompletion(entity, queue, &polls);
+    }
+    if (!completion) { ++queue->completed_batch_count; state.completed = state.requests; }
+    if (error) {
+        queue->poisoned = 1;
+        if (!queue->last_error) queue->last_error = error;
+    }
     if (!state.error) state.error = error;
-    kvaf_device::WriteStatus(status, state.error, state.requests, queue->completed_batch_count,
-        queue->sq_producer_index, queue->cq_consumer_index, UINT64_MAX, state.lastWqe);
+    kvaf_device::WriteStatus(status, previousError ? previousError : state.error,
+        state.requests, queue->completed_batch_count, queue->sq_producer_index,
+        queue->cq_consumer_index, UINT64_MAX, state.lastWqe);
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue), sizeof(*queue));
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status), sizeof(*status));
-    state.pending = false;
+    state.pending = RetryTimeout && completion == kvaf_device::kCqTimeout;
     return state.error;
+}
+
+__aicore__ inline uint64_t Wait(State& state) {
+    return Retire<false>(state, 0);
+}
+
+// Both states belong to one private FIFO. Retire an accepted suffix after a
+// consumed prefix error, but never charge a late prefix CQE to that suffix.
+// After two timeouts the queue must be torn down: its pending DMA is unknown.
+__aicore__ inline uint64_t RetirePair(State& first, State& second) {
+    const uint64_t prefixError = Retire<true>(first, 0);
+    if (first.pending) return prefixError;
+    const uint64_t suffixError = Retire<true>(second, prefixError);
+    return prefixError ? prefixError : suffixError;
 }
 
 }  // namespace post_index_transport

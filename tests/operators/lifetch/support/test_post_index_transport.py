@@ -26,6 +26,14 @@ def test_original_blocking_baseline_and_deferred_native_helpers(tmp_path):
     prefix, poll = source.split("void Poll(void* address)", 1)
     poll, suffix = poll.split("}  // namespace aiv_model", 1)
     assert poll.count("  CHECK(false);") == 1
+    # Schedule a late or erroneous CQE for one chosen FIFO checkpoint while
+    # preserving the original native wait/doorbell and CQ owner-bit handling.
+    prefix += "uint64_t inject_checkpoint=UINT64_MAX, inject_polls=0; bool inject_error=false;\n"
+    probe = "    if (queue.timeout || queue.checkpoints.empty() ||"
+    assert poll.count(probe) == 1 and poll.count("queue.error ?") == 1
+    poll = poll.replace(probe, "    if (queue.cq_producer == inject_checkpoint && inject_polls) "
+                               "{ --inject_polls; return; }\n" + probe)
+    poll = poll.replace("queue.error ?", "(queue.error || (queue.cq_producer==inject_checkpoint && inject_error)) ?")
     source = prefix + "void Poll(void* address)" + poll.replace("  CHECK(false);", "  return;") + "}  // namespace aiv_model" + suffix
     source = source.replace("int main() {", "int original_blocking_checks() {")
     source = source.rstrip()[:-1] + "return 0;\n}\n"
@@ -93,6 +101,27 @@ int main(){
     CHECK(f.queues[0].poisoned&&f.queues[0].last_error);
     CHECK(Preflight(f.args,0,1,blocking)==kInvalidQueue);
   }
+  for(unsigned target:{0U,1U})for(unsigned fault:{0U,1U,2U,3U}){
+    Fixture f(64,1,1,0);State first,second;
+    // Unequal prefix/suffix counts expose an incorrect attribution of a late CQE.
+    CHECK(Post(f.args,0,5,first)==0 && Post(f.args,5,13,second)==0);
+    aiv_model::inject_checkpoint=target;
+    aiv_model::inject_polls=fault==1 ? kMaxCqPolls : fault==2 ? 2*kMaxCqPolls : 0;
+    aiv_model::inject_error=fault==3;
+    const uint64_t expected=fault==0 ? kSuccess : fault==3 ? kCqError : kCqTimeout;
+    CHECK(RetirePair(first,second)==expected);
+    CHECK(f.statuses[0].result==expected && f.queues[0].last_error==expected);
+    CHECK(bool(f.queues[0].poisoned)==bool(fault));
+    const uint64_t retired=fault==2 ? target : 2;
+    CHECK(f.queues[0].cq_consumer_index==retired);
+    CHECK(aiv_model::hardware[0].cq_consumer==retired);
+    CHECK(aiv_model::hardware[0].checkpoints.size()==2-retired);
+    CHECK(first.pending==(retired==0) && second.pending==(retired<2));
+    CHECK(first.completed==(retired>=1 && !(fault==3 && target==0) ? 5u : 0u));
+    CHECK(second.completed==(retired==2 && !(fault==3 && target==1) ? 13u : 0u));
+    bool blocking=false;CHECK(Preflight(f.args,0,1,blocking)==(fault ? kInvalidQueue : kSuccess));
+  }
+  aiv_model::inject_checkpoint=UINT64_MAX;
   {KvafExecuteBatchGetKernelArgs args{};State state;bool blocking=false;
     CHECK(Preflight(args,0,0,blocking)==0&&!blocking);
     CHECK(Post(args,0,0,state)==0&&Wait(state)==0&&GetBlocking(args,0,0,state)==0);
