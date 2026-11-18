@@ -66,6 +66,26 @@ def test_post_index_workspace_keeps_default_abi_and_graph_pointers(monkeypatch, 
             assert forward.workspace.data_ptr() == workspace_pointer
             assert int.from_bytes(forward.workspace.values[144:152], "little") == pointer
 
+    # The optional HIGH workspace is introduced only when explicitly requested.
+    forward.high_post_index = True
+    with pytest.raises(RuntimeError, match="eight-window Index"):
+        forward.set_options()
+    if feature == 1:
+        f.library.kvip_high_post_index = Mock(return_value=1)
+        forward.set_options()
+        high_pointer = forward._high_index_storage.data_ptr()
+        assert forward._high_index_storage.shape == (batch, 20480, 40)
+        assert int.from_bytes(blob[152:160], "little") == high_pointer
+        allocation_count = f.torch.empty.call_count
+        for enabled in (True, False, True):
+            forward.high_post_index = enabled
+            forward.set_options(diagnostics=True)
+            flags = int.from_bytes(blob[96:100], "little")
+            assert bool(flags & 0x01000000) == enabled
+            assert int.from_bytes(blob[152:160], "little") == high_pointer
+            assert forward.workspace.data_ptr() == workspace_pointer
+        assert f.torch.empty.call_count == allocation_count
+
 
 def test_post_index_requires_every_physical_aiv_to_have_an_exclusive_queue(monkeypatch):
     f = fixture(monkeypatch, batch=2)
