@@ -856,7 +856,13 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     bool overlapSecond=false;
     if(taggedLocations_) {
         if(profile)liTicks[3]=GetSystemCycle();
+        // All selected tokens for this Q share one ABC ring and its bounds.
+        const uint32_t stride=uint32_t(ctx->outputStride);
+        const uint32_t capacity=stride>runtimeShape_.resident?stride-runtimeShape_.resident:0;
+        const uint32_t tailSize=tailEnd>tailBegin?Min(tailEnd-tailBegin,capacity):0;
+        const uint32_t ringStart=tailSize?tailBegin%capacity:0;
         Simt::VF_CALL<rotating::ClassifyPreparedLocations>(Simt::Dim3{512,1,1},runtimeShape_.history,runtimeShape_.resident,b,ctx,
+            tailBegin,tailSize,ringStart,capacity,
             reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(result.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(bitmap[bitmapWords].GetPhyAddr()));
         if(profile){SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);liTicks[4]=liTicks[5]=liTicks[6]=GetSystemCycle();}
