@@ -63,14 +63,6 @@ inline void EmitEdges(__gm__ Edge* edges, __gm__ uint32_t* dense, uint32_t histo
     asc_threadfence();
 }
 
-template<class T>
-__simt_callee__ inline void Exchange(__gm__ T* left, __gm__ T* right) {
-    T oldLeft = asc_ldcg(left);
-    T oldRight = asc_ldcg(right);
-    asc_stcg(left, oldRight);
-    asc_stcg(right, oldLeft);
-}
-
 template<bool Scatter, bool Spill>
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void Transfer(__gm__ Edge* edges, uint32_t p0, uint32_t p1, uint32_t s0, uint32_t s1,
@@ -81,12 +73,23 @@ inline void Transfer(__gm__ Edge* edges, uint32_t p0, uint32_t p1, uint32_t s0, 
     if constexpr (!Scatter) {
         for (uint32_t i = p0 + tuple; i < p1; i += 16) {
             uint32_t a = asc_ldcg(&edges[i].src), b = asc_ldcg(&edges[i].dst);
-            Exchange(keys + uint64_t(a) * 16 + field, keys + uint64_t(b) * 16 + field);
-            if (!field) {
-                Exchange(scales + a, scales + b);
-                Exchange(addr + a, addr + b);
-                Exchange(logical + a, logical + b);
+            auto ka = keys + uint64_t(a) * 16 + field;
+            auto kb = keys + uint64_t(b) * 16 + field;
+            uint64_t left = asc_ldcg(ka), right = asc_ldcg(kb);
+            // Keep one 16-lane group per key. Two lanes load the independent
+            // 64-bit columns together; the third exchanges the 32-bit scale.
+            auto column = field == 0 ? addr : logical;
+            if (field < 2) {
+                uint64_t x = asc_ldcg(column + a), y = asc_ldcg(column + b);
+                asc_stcg(column + a, y);
+                asc_stcg(column + b, x);
+            } else if (field == 2) {
+                uint32_t x = asc_ldcg(scales + a), y = asc_ldcg(scales + b);
+                asc_stcg(scales + a, y);
+                asc_stcg(scales + b, x);
             }
+            asc_stcg(ka, right);
+            asc_stcg(kb, left);
         }
     }
     for (uint32_t i = s0 + tuple; i < s1; i += 16) {
