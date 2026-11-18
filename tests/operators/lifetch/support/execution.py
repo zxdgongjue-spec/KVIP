@@ -2208,6 +2208,12 @@ def run_urma_case(
         stream.synchronize()
         def validate_pipeline():
             verify(True)
+            if getattr(args, "mode", None) == "check":
+                for name in ("_live_count", "_live_flags", "_live_rows", "_live_events"):
+                    if getattr(pipeline, name).count_nonzero().item():
+                        raise AssertionError(f"Resolver left nonzero round state in {name}")
+                if int(rotating.count.cpu().item()) != state["completion"]["final_reads"]:
+                    raise AssertionError("Published repair count differs from completed round")
             verify_all_valid_hot()
             # Validate every Index field against its logical owner, including rows
             # outside current TopK. This checks the actual staged update, not an

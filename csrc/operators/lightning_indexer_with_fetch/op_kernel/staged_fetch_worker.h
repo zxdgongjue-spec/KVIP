@@ -80,11 +80,10 @@ __aicore__ inline void CompletePrefetch(__gm__ Context* ctx,uint32_t b,bool init
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),64);
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->pending),sizeof(row->pending));
         auto args=reinterpret_cast<__gm__ const KvafExecuteBatchGetKernelArgs*>(ctx->args)+b*2;
-        auto entity=reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(row->entity);
-        auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(row->queue);
+        auto entity=reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(args->channel_entity);
+        auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args->queue_state);
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
         uint64_t error=row->error;
-        if(row->pending>=entity->cq_depth) error=kvaf_device::kInvalidArgs;
         uint32_t completed=0;
 #if !V9_SIMULATION
         if(!error) {

@@ -240,7 +240,7 @@ __simd_vf__ inline void FinalBuild(uint32_t rt_tokenBytes,__ubuf__ uint32_t* rem
 }
 
 __aicore__ inline bool SubmitWqesAt(uint32_t rt_tokenBytes,uint64_t entityAddress,uint64_t queueAddress,uint64_t output,LocalTensor<uint32_t> slots,LocalTensor<uint32_t> words,
-    LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,LocalTensor<uint32_t> cfg,uint32_t count,uint32_t bankSize,bool final,__gm__ Row* row,uint32_t pending=0) {
+    LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,LocalTensor<uint32_t> cfg,uint32_t count,uint32_t bankSize,bool final,__gm__ Row* row) {
     auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(queueAddress);
     // Intermediate service exclusively owns this queue; CQ draining starts
     // after LI completes. Keep its state on the DMA path, like the batch row.
@@ -265,7 +265,7 @@ __aicore__ inline bool SubmitWqesAt(uint32_t rt_tokenBytes,uint64_t entityAddres
     DataCopy(meta,entityGm,48);
     SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
     uint32_t sqDepth=meta.GetValue(19);uint64_t sqAddress=meta64.GetValue(7),doorbell=meta64.GetValue(8);
-    if(head>UINT64_MAX-count || count>=sqDepth || (!final && pending+1>=meta.GetValue(31)))return false;
+    if(final && (head>UINT64_MAX-count || count>=sqDepth))return false;
     cfg.SetValue(1,6U<<8);cfg.SetValue(2,(meta.GetValue(20)&0xffffffU)|0x1000000U);
     cfg.SetValue(3,meta.GetValue(6)&0xfffffU);
     for(uint32_t j=0;j<4;++j)cfg.SetValue(4+j,meta.GetValue(22+j));
@@ -292,6 +292,9 @@ __aicore__ inline bool SubmitWqesAt(uint32_t rt_tokenBytes,uint64_t entityAddres
     }
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     if(!final) {
+#if !V9_SIMULATION
+        queue64.SetValue(0,(uint64_t(1)<<32)|kvaf_device::kQueueMagic);
+#endif
         queue64.SetValue(1,head+count);
         SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
         DataCopy(queueGm,queueLocal,16);
@@ -349,47 +352,42 @@ inline void BatchBuild(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_residen
             auto entity=input;
             output=input64[35];
             head=input64[25];depth=entity[19];
-            uint32_t pending=input[66],cqDepth=entity[31];
-            if(head>UINT64_MAX-count || count>=depth || pending+1>=cqDepth) {
-                if(!t){asc_stcg(rowWords+11,uint32_t(kvaf_device::kInvalidArgs));input[64]=0;}count=0;
-            } else {
-                auto addresses=reinterpret_cast<__gm__ uint64_t*>(input64[34]);
-                auto jobs=reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*8192;
-                auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;
-                slotBase=input[65];
-                n=count>begin?count-begin:0;if(n>rt_postBank)n=rt_postBank;
-                for(uint32_t i=t;i<n;i+=rt_postThreads) {
-                    uint32_t token=asc_ldcg(jobs+begin+i);
-                    uint32_t slot=slotBase+begin+i;
-                    uint32_t physical=PhysicalSlot(rt_resident,ctx,b,slot);
-                    uint64_t address=asc_ldcg(addresses+token);
-                    if constexpr(BuildSimt)remote[g*rt_postBank+i]=address;
-                    else {
-                        auto fields=reinterpret_cast<__ubuf__ uint32_t*>(remote);
-                        fields[g*rt_postBank+i]=uint32_t(address);
-                        fields[512+g*rt_postBank+i]=uint32_t(address>>32);
-                        fields[1024+g*rt_postBank+i]=physical;
-                    }
-                    TrackMapping(ctx,b,slot-rt_resident,token,i+1==n);
-                    asc_stcg(map+token,slot);
+            auto addresses=reinterpret_cast<__gm__ uint64_t*>(input64[34]);
+            auto jobs=reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*8192;
+            auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;
+            slotBase=input[65];
+            n=count>begin?count-begin:0;if(n>rt_postBank)n=rt_postBank;
+            for(uint32_t i=t;i<n;i+=rt_postThreads) {
+                uint32_t token=asc_ldcg(jobs+begin+i);
+                uint32_t slot=slotBase+begin+i;
+                uint32_t physical=PhysicalSlot(rt_resident,ctx,b,slot);
+                uint64_t address=asc_ldcg(addresses+token);
+                if constexpr(BuildSimt)remote[g*rt_postBank+i]=address;
+                else {
+                    auto fields=reinterpret_cast<__ubuf__ uint32_t*>(remote);
+                    fields[g*rt_postBank+i]=uint32_t(address);
+                    fields[512+g*rt_postBank+i]=uint32_t(address>>32);
+                    fields[1024+g*rt_postBank+i]=physical;
+                }
+                TrackMapping(ctx,b,slot-rt_resident,token,i+1==n);
+                asc_stcg(map+token,slot);
 
-                    RecordPrefetchSlot(rt_resident,ctx,b,slot,token,physical);
-                }
-                if(t<16) {
-                    uint32_t value=0;
-                    if(t==1)value=6U<<8;
-                    if(t==2)value=(entity[20]&0xffffffU)|0x1000000U;
-                    if(t==3)value=entity[6]&0xfffffU;
-                    if(t>=4 && t<8)value=entity[22+t-4];
-                    if(t==8)value=entity[7];
-                    if(t==12)value=rt_tokenBytes;
-                    if(t==13)value=entity[12];
-                    if(t==14)value=uint32_t(output);
-                    if(t==15)value=uint32_t(output>>32);
-                    meta[g*32+t]=value;
-                }
-                if(!t) {meta[g*32+16]=uint32_t(head+begin);meta[g*32+17]=depth;}
+                RecordPrefetchSlot(rt_resident,ctx,b,slot,token,physical);
             }
+            if(t<16) {
+                uint32_t value=0;
+                if(t==1)value=6U<<8;
+                if(t==2)value=(entity[20]&0xffffffU)|0x1000000U;
+                if(t==3)value=entity[6]&0xfffffU;
+                if(t>=4 && t<8)value=entity[22+t-4];
+                if(t==8)value=entity[7];
+                if(t==12)value=rt_tokenBytes;
+                if(t==13)value=entity[12];
+                if(t==14)value=uint32_t(output);
+                if(t==15)value=uint32_t(output>>32);
+                meta[g*32+t]=value;
+            }
+            if(!t) {meta[g*32+16]=uint32_t(head+begin);meta[g*32+17]=depth;}
         }
     }
     asc_syncthreads();
@@ -476,8 +474,6 @@ inline void UnionColdTopk(__ubuf__ uint32_t* input,__ubuf__ uint32_t* bits,
     }
 }
 
-// Same indexed-load pattern as v9 GatherCandidateMap; cold IDs pass through.
-
 template<bool captureIo, bool predecessorChecked=false>
 __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer,uint32_t epoch,uint32_t core,uint32_t lane,
     LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids,
@@ -521,16 +517,14 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
         }
 auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         if (rt_batchedRows) postInput.SetValue(64,0);
-        if(state.GetValue(11))continue;
         uint32_t slots=state.GetValue(8),requests=state.GetValue(9),pending=state.GetValue(211);
         uint32_t sequence=state.GetValue(246)+1;
         state.SetValue(246,sequence);state.SetValue(214+epoch,sequence);
-        const uint64_t entityAddress=state64.GetValue(0),queueAddress=state64.GetValue(1);
-        const uint64_t addresses=state64.GetValue(2);
+
         const uint32_t lower=ctx->lruSlots?0:rt_resident;
         uint32_t candidateCount=0;
-        uint32_t available=PrefetchAllowance(slots,requests,state.GetValue(208),
-            state.GetValue(209),state.GetValue(210),ctx->windowLimit);
+        uint32_t available=requests<ctx->prefetchLimit?ctx->prefetchLimit-requests:0;
+        if(available>ctx->windowLimit)available=ctx->windowLimit;
         V9_FETCH_PROFILE(scanBegin=GetSystemCycle();)
         // Counts occupy spare incremental metadata, exported alongside TopK.
         GlobalTensor<uint32_t> metadata,compact;
@@ -577,8 +571,10 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
             V9_FETCH_PROFILE(candidateTicks+=GetSystemCycle()-candidateBegin;)
             if(count) {
                 const auto& args=reinterpret_cast<__gm__ KvafExecuteBatchGetKernelArgs*>(ctx->args)[b*2];
+                const uint64_t entityAddress=args.channel_entity,queueAddress=args.queue_state;
                 uint32_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
                 uint64_t stride=ctx->outputStride?ctx->outputStride:rt_resident;
+                uint64_t addresses=ctx->rowAddressBase?RequestAddressTable(ctx,b,owner,rt_history):state64.GetValue(2);
                 uint64_t output=args.output+uint64_t(owner)*stride*rt_tokenBytes;
                 V9_FETCH_PROFILE(postBegin=GetSystemCycle();)
 if (rt_batchedRows) {
@@ -592,14 +588,11 @@ if (rt_batchedRows) {
                 queueGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(queueAddress));
                 DataCopy(postInput,entityGm,48);DataCopy(postInput[48],queueGm,16);
                 SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-                bool bulk=post64.GetValue(25)<=UINT64_MAX-count && count<postInput.GetValue(19) && pending+1<postInput.GetValue(31);
-                if(bulk){
-                    GlobalTensor<int32_t> admitted;
-                    admitted.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(post64.GetValue(37)));
-                    SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
-                    SetAtomicAdd<int32_t>();DataCopy(admitted,scratch.ReinterpretCast<int32_t>(),rt_history/32);SetAtomicNone();
-                    SetFlag<HardEvent::MTE3_S>(EVENT_ID5);WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
-                }
+                GlobalTensor<int32_t> admitted;
+                admitted.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(post64.GetValue(37)));
+                SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
+                SetAtomicAdd<int32_t>();DataCopy(admitted,scratch.ReinterpretCast<int32_t>(),rt_history/32);SetAtomicNone();
+                SetFlag<HardEvent::MTE3_S>(EVENT_ID5);WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
                 GlobalTensor<uint32_t> jobs;
                 jobs.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*8192);
                 SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
@@ -614,8 +607,8 @@ if (rt_batchedRows) {
                         map,reinterpret_cast<__gm__ uint64_t*>(addresses),count,rt_resident+slots,ctx,b,reinterpret_cast<__gm__ uint32_t*>(kvip_prefetch_rank::CoveredAddress(ctx->incremental,rt_batch,rt_history,b)));
                     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
                     if(captureIo && !firstDoorbell)firstDoorbell=GetSystemCycle();
-                    if(SubmitWqesAt(rt_tokenBytes,entityAddress,queueAddress,output,work[1024],scratch,work,work[512],cfg,count,256,false,nullptr,pending))++pending;
-                    else state.SetValue(11,kvaf_device::kInvalidArgs);
+                    SubmitWqesAt(rt_tokenBytes,entityAddress,queueAddress,output,work[1024],scratch,work,work[512],cfg,count,256,false,nullptr);
+                    ++pending;
                     if(captureIo)lastDoorbell=GetSystemCycle();
                     slots+=count;requests+=count;
                 }
@@ -680,6 +673,9 @@ if (rt_batchedRows) {
         for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
             auto input=cfg[256+(b/rt_serviceLanes)*80];auto in64=input.ReinterpretCast<uint64_t>();
             uint32_t count=input.GetValue(64);if(!count)continue;
+#if !V9_SIMULATION
+            in64.SetValue(24,(uint64_t(1)<<32)|kvaf_device::kQueueMagic);
+#endif
             in64.SetValue(25,in64.GetValue(25)+count);
             GlobalTensor<uint32_t> queue;queue.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(in64.GetValue(36)));
             SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);

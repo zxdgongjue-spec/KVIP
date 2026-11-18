@@ -72,14 +72,36 @@ class StreamingLIFetchForward:
         self.packed_fetch = allocate(
             "packed_fetch", (4 * q_workers, 9 * b * 2048 + ((3 * b + 31) // 32) * 32 + 64), torch.int32
         )
+        self._live_flags = self.flags
+        self._context = rotating.context
+        completed_flags = live_count = completed_rows = completed_events = 0
+        if not hasattr(rotating, "lease"):  # URMA retires live publication state at kernel exit.
+            self._live_flags = allocate("live_flags", (b, flag_count, 32), torch.int32, True)
+            completed_flags = self.flags.data_ptr()
+            self._live_count = allocate("live_count", (32,), torch.int32, True)
+            live_count = self._live_count.data_ptr()
+            self._live_rows = allocate("live_rows", rotating.rows.shape, rotating.rows.dtype, True)
+            completed_rows = rotating.rows.data_ptr()
+            self._context = rotating.context.clone()
+            context_words = self._context.view(torch.int64)
+            self._live_events = allocate("live_events", rotating.events.shape, rotating.events.dtype, True)
+            completed_events = rotating.events.data_ptr()
+            context_words[1] = self._live_rows.data_ptr()
+            context_words[4] = self._live_events.data_ptr()
+            context_words[-1] = rotating.arguments[13].data_ptr() + b * (4 * 2048 * 6 + 1024 + 8 * self.history)
+            groups = 4 * q_workers
+            stride = b * 2048
+            metadata = ((3 * b + 31) // 32) * 32
+            direct = self.packed_fetch.view(-1)[groups * (3 * stride + metadata):].view(groups, -1)
+            direct[:, -64:].zero_()
         pointers = [
-            rotating.context.data_ptr(),
+            self._context.data_ptr(),
             keys.data_ptr(),
             scales.data_ptr(),
             addresses.data_ptr(),
             logical.data_ptr(),
             rotating.hot_valid.data_ptr(),
-            self.flags.data_ptr(),
+            self._live_flags.data_ptr(),
             self.events_src.data_ptr(),
             self.events_dst.data_ptr(),
             self.worker_status.data_ptr(),
@@ -97,21 +119,27 @@ class StreamingLIFetchForward:
         blob = np.concatenate(
             (
                 blob,
-                np.asarray([self.dense_shadow.data_ptr(), self.packed_fetch.data_ptr()], dtype="<u8").view("u1"),
-                np.zeros(112, dtype="u1"),
+                np.asarray([self.dense_shadow.data_ptr(), self.packed_fetch.data_ptr(), completed_flags, live_count, completed_rows, completed_events], dtype="<u8").view("u1"),
+                np.zeros(80, dtype="u1"),
             )
         )
         if len(blob) != 256:
             raise AssertionError(f"LIFetch workspace ABI size={len(blob)}, expected 256")
         self.workspace = torch.from_numpy(blob.copy()).to(device)
         self.bindings = torch.tensor(
-            [x.data_ptr() for x in rotating.arguments] + [self.workspace.data_ptr()],
+            [x.data_ptr() for x in rotating.arguments[:-1]] + [self._context.data_ptr(), self.workspace.data_ptr()],
             dtype=torch.uint64,
             device=device,
         )
         # Standalone LI calls use the most recently attached workspace. Each
         # fused call keeps its own LI and resolver workspace paired.
-        rotating.bindings = self.bindings
+        if completed_rows:
+            rotating.bindings = torch.tensor(
+                [x.data_ptr() for x in rotating.arguments] + [self.workspace.data_ptr()],
+                dtype=torch.uint64, device=device,
+            )
+        else:
+            rotating.bindings = self.bindings
         self.function.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_uint32]
         self.function.restype = ctypes.c_uint32
 

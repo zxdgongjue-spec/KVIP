@@ -26,6 +26,11 @@ inline void PublishQ(
 __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PublishPrefetch(
  __gm__ uint32_t* source,__gm__ uint32_t* dest,__gm__ uint32_t* outSource,__gm__ uint32_t* outDest,uint32_t count) {
  for(uint32_t i=threadIdx.x;i<count;i+=512){asc_stcg(outSource+i,asc_ldcg(source+i));asc_stcg(outDest+i,asc_ldcg(dest+i));}
+#if !V9_UBMEM
+ // The admitted prefix has been overwritten by LI. Clear only the remaining
+ // ordinals before resolver appends changes, keeping completed rows observable.
+ for(uint32_t i=count+threadIdx.x;i<kPrefetch;i+=512)asc_stcg(source+i,UINT32_MAX);
+#endif
  asc_threadfence();asc_syncthreads();
 }
 // ctl[32:64] is outside resolver counts, prefix scratch and protection bitmap.
@@ -105,7 +110,15 @@ __aicore__ inline void SyncFetchDescriptors(__gm__ Context* ctx, uint32_t begin,
 #include "output_worker.h"
 __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
- auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
+ auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
+#if !V9_UBMEM
+ if(ctx->rowAddressBase){
+  uint32_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
+  row->addresses=RequestAddressTable(ctx,b,owner,shape.history);
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),64);
+ }
+#endif
+ auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
  auto ticks=reinterpret_cast<__gm__ uint64_t*>(a->times)+b*64;
  bool profile=(a->prefetchCount & 0x80000000U)!=0;
  if(profile)ticks[1]=GetSystemCycle();
@@ -368,11 +381,11 @@ constexpr uint32_t kBatchGetInflight = 2048;
 // Each worker owns one KVAF queue. It gathers its shard of requests for one Q,
 // calls the native BatchGet once per safe/conflicting phase, then acknowledges
 // all rows covered by that call. The native scheduler owns WQE and CQ handling.
-__aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,uint32_t workers,bool skipEmptyConflict=true){
+__aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,uint32_t workers,bool skipEmptyConflict=true,bool standalone=false){
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  if(lane>=shape.batch)return;
  bool directLayout=skipEmptyConflict && !(a->prefetchCount & 0x20000000U);
- auto allFlags=reinterpret_cast<__gm__ BatchFlag*>(a->flags);
+ auto allFlags=reinterpret_cast<__gm__ BatchFlag*>(standalone && a->completedFlags?a->completedFlags:a->flags);
  bool profile=(a->prefetchCount & 0x80000000U)!=0;
  bool groupLayout=directLayout && ctx->fallbackAddresses;
  uint32_t stride=shape.batch*kTop;
@@ -385,7 +398,7 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
  uint32_t pair=2*shape.batch+2*(q*workers+lane);
  auto args=GetArgs(ctx,pair);args.jettys_per_core=2;
  args.indices=uint64_t(packed);args.offsets=uint64_t(packed+stride);args.output_indices=uint64_t(packed+2*stride);
- args.miss_count=ctx->count;args.request_capacity=stride;
+ args.miss_count=(!standalone && a->liveCount)?a->liveCount:ctx->count;args.request_capacity=stride;
  if(ctx->fallbackAddresses){args.address_table=ctx->fallbackAddresses;args.valid_table=ctx->fallbackValid;args.table_capacity=shape.batch*kSlots;}
  if(!args.batch_get_max_inflight_total)args.batch_get_max_inflight_total=kBatchGetInflight;
  auto compactAddresses=reinterpret_cast<__gm__ uint64_t*>(packed);
@@ -396,7 +409,7 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
   uint64_t prepareStart=profile?GetSystemCycle():0;
   uint32_t size=0,rangeCount=0;
   if(groupLayout && !phase){
-   auto counters=reinterpret_cast<__gm__ uint32_t*>(direct+6*stride);
+   auto counters=reinterpret_cast<__gm__ uint32_t*>(direct+6*stride)+(standalone && a->completedFlags?32:0);
    uint32_t expected=(shape.batch-1-lane)/workers+1;uint64_t started=GetSystemCycle();
    while(true){
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(counters+kGroupReadyWord),64);
@@ -454,7 +467,7 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
   }
   if(directLayout){
-   auto counters=reinterpret_cast<__gm__ uint32_t*>(direct+6*stride);
+   auto counters=reinterpret_cast<__gm__ uint32_t*>(direct+6*stride)+(standalone && a->completedFlags?32:0);
    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(counters),64);
    if(counters[phase*8]!=size)error|=kvaf_device::kInvalidArgs;
    packed=direct+phase*3*stride;
@@ -622,6 +635,48 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
 }
 
 #endif
+#if defined(__CCE_AICORE__) && !V9_UBMEM
+__simt_vf__ __aicore__ LAUNCH_BOUND(128)
+inline void RetireRoundControl(__gm__ Args* a,uint32_t batch,uint32_t workers,uint32_t block){
+ uint32_t t=threadIdx.x;
+ if(block<batch && a->completedRows){
+  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);
+  auto live=reinterpret_cast<__gm__ uint32_t*>(ctx->rows)+block*(sizeof(Row)/4);
+  auto snapshot=reinterpret_cast<__gm__ uint32_t*>(a->completedRows)+block*(sizeof(Row)/4);
+  for(uint32_t i=t;i<sizeof(Row)/4;i+=128){
+   asc_stcg(snapshot+i,asc_ldcg(live+i));asc_stcg(live+i,0U);
+  }
+ }
+ if(block<batch && a->completedEvents){
+  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);
+  uint32_t words=ctx->shape.rounds*ctx->shape.serviceLanes*(sizeof(Event)/4);
+  auto events=reinterpret_cast<__gm__ uint32_t*>(ctx->events);
+  auto saved=reinterpret_cast<__gm__ uint32_t*>(a->completedEvents);
+  for(uint32_t i=block*128+t;i<words;i+=batch*128){
+   asc_stcg(saved+i,asc_ldcg(events+i));asc_stcg(events+i,0U);
+  }
+ }
+ if(!block && !t && a->liveCount){
+  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);
+  auto live=reinterpret_cast<__gm__ uint32_t*>(a->liveCount);
+  asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->count),asc_ldcg(live));
+  asc_stcg(live,0U);
+ }
+ if(block<batch && t<kFlagCount*3){
+  uint32_t word=(block*kFlagCount+t/3)*kFlagWords+t%3;
+  auto live=reinterpret_cast<__gm__ uint32_t*>(a->flags)+word;
+  asc_stcg(reinterpret_cast<__gm__ uint32_t*>(a->completedFlags)+word,asc_ldcg(live));
+  asc_stcg(live,0U);
+ }
+ if(block<4*workers && t<32){
+  uint32_t stride=batch*kTop,meta=(3*batch+31)&~31U;
+  auto control=reinterpret_cast<__gm__ uint32_t*>(a->packedFetch)+4*workers*(3*stride+meta)+block*(6*stride+64)+6*stride+t;
+  asc_stcg(control+32,asc_ldcg(control));
+  asc_stcg(control,0U);
+ }
+ asc_threadfence();
+}
+#endif
 extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
 #if defined(__CCE_AICORE__)
  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
@@ -667,6 +722,13 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
    if(q<4 && part<workers){
     FetchQueryGroup(a,q,part,workers);
    }}
+#if !V9_UBMEM
+  if(a->completedFlags){
+   AscendC::SyncAll<true>();
+   if(block<shape.batch || block<4*workers)
+    Simt::VF_CALL<RetireRoundControl>(Simt::Dim3{128,1,1},a,shape.batch,workers,block);
+  }
+#endif
   if(profile){trace[1]=GetSystemCycle();kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(trace),32*8);}
  }
 #endif
@@ -698,7 +760,11 @@ extern "C" __global__ __aicore__ void v9_query_fetch_only(GM_ADDR arg,uint32_t q
    uint32_t workers=2;
    uint32_t q=query==4?block/2:query;
    uint32_t lane=query==4?block%2:block;
+   #if V9_UBMEM
    FetchQueryGroup(reinterpret_cast<__gm__ Args*>(arg),q,lane,workers,skipEmptyConflict);
+#else
+   FetchQueryGroup(reinterpret_cast<__gm__ Args*>(arg),q,lane,workers,skipEmptyConflict,true);
+#endif
   }
  }
 #endif

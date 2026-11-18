@@ -52,11 +52,17 @@ struct Context {
     uint64_t changeSlots, changeCount; // Extended direct-hot producer records, ABI 3.
     uint64_t incremental; // Per-Q TopK prefixes, admission bitmap and diagnostics.
     uint64_t prefetchRankStart; // Zero preserves the default rank 1024.
-    uint64_t mappingJournal, incrementalPadding; // Preserve 32-byte DMA alignment.
+    uint64_t mappingJournal, rowAddressBase; // Preserve 32-byte DMA alignment.
     // Optional serving layout: active row -> stable owner; addresses stay with
     // that owner's Index permutation. tailBounds[B,2] are [committed,write_end).
 
 };
+#if defined(__CCE_AICORE__)
+__aicore__ inline uint64_t RequestAddressTable(__gm__ Context* ctx,uint32_t b,uint32_t owner,uint32_t history){
+    return ctx->tokenAddresses ? ctx->tokenAddresses+uint64_t(owner)*ctx->addressStride*8 :
+        ctx->rowAddressBase+uint64_t(b)*(uint64_t(history)*8+8192*64+512);
+}
+#endif
 static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 352,
               "LIFetch runtime ABI layout changed");
 // Workload geometry is bound before capture and shared by host/device launches.

@@ -103,6 +103,9 @@ __aicore__ inline void OutputWorker(__gm__ Args* a,uint32_t b){
  Simt::VF_CALL<MergeQueryBitmaps>(Simt::Dim3{512,1,1},FinalPtr(ctl[1024]),FinalPtr(tokens),0,
   reinterpret_cast<__gm__ int64_t*>(u[20]),reinterpret_cast<__gm__ int64_t*>(u[21]),shape.batch,b,FinalPtr(ctl[kOutputMasksOffset]),enabled);
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+#if !V9_UBMEM
+ if(a->liveCount)staged->count=a->liveCount;
+#endif
  auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
  auto source=reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+b*a->maxEvents;
  auto dest=reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+b*a->maxEvents;
