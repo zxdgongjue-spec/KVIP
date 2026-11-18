@@ -315,6 +315,23 @@ def early_post_timing(rows, marks):
                 nonempty_lanes=int(live.sum()))
 
 
+def retire_timing(rows, marks):
+    """Bound software completion calls by their own lane clock."""
+    begin, end = marks[:16, 28], marks[:16, 29]
+    retire = marks[:, 30]
+    live = np.flatnonzero(rows[:, 1])
+    if (not len(live) or np.any(marks[16:, 28:30]) or np.any(begin < rows[:16, 8])
+            or np.any(end < begin) or np.any(retire[:16] < end)
+            or np.any(retire < rows[:, 8]) or np.any(rows[:, 9] < retire)):
+        raise ValueError("Invalid RQI5 prefetch CQ and final RetirePair timestamps")
+    last = live[np.argmax(rows[live, 9])]
+    # The latest-returning lane can differ from the one with the longest call.
+    final = rows[live, 9] - retire[live]
+    return dict(prefetch_p50=float(np.median(end-begin)), prefetch_max=int((end-begin).max()),
+                final_p50=float(np.median(final)), final_max=int(final.max()),
+                last_lane=int(last), last_lane_final=int(rows[last, 9]-retire[last]))
+
+
 def check_get_reassignment(counts, marks, canonical):
     """Reconcile every transport lane against the independent per-request Q descriptor counts."""
     if canonical is None or np.shape(canonical) != (16, 4):
@@ -357,7 +374,7 @@ def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan
     if detail.dtype != np.int64 or detail.shape != (len(rows), 32):
         raise ValueError("Unexpected HIGH timestamp layout")
     marks = detail.view(np.uint64)
-    row_markers = {0x52514931: "RQI1", 0x52514932: "RQI2", 0x52514933: "RQI3", 0x52514934: "RQI4"}
+    row_markers = {0x52514931: "RQI1", 0x52514932: "RQI2", 0x52514933: "RQI3", 0x52514934: "RQI4", 0x52514935: "RQI5"}
     marker = row_markers.get(int(marks[0, 2]))
     if marker is not None and np.all(marks[:, 2] == marks[0, 2]):
         if wait_first or not schedule_timing:
@@ -368,7 +385,9 @@ def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan
         result["row_partitions"] = dict(pairs=marks[:, 16].tolist(), singles=marks[:, 17].tolist(),
                                         invalidations=marks[:, 19].tolist(), single_owner=marker != "RQI1")
         schedule = overlap_schedule_timing(rows, marks, marker=marker)
-        if marker == "RQI4":
+        if marker == "RQI5":
+            schedule["retire"] = retire_timing(rows, marks)
+        if marker in ("RQI4", "RQI5"):
             schedule["early_post"] = early_post_timing(rows, marks)
         if marker == "RQI3":
             schedule["get_reassignment"] = check_get_reassignment(rows[:, 1], marks, canonical_counts)

@@ -26,6 +26,11 @@ if [[ ${1:-} == --high-overlap-ab && ${3:-} == --intermediate ]]; then
     intermediate=$4
     set -- "$1" "$2" "${@:5}"
 fi
+kernel_account=0
+if [[ ${1:-} == --high-overlap-ab && ${3:-} == --kernel-account ]]; then
+    kernel_account=1
+    set -- "$1" "$2" "${@:4}"
+fi
 joint=0
 account=0
 init_only=
@@ -76,18 +81,20 @@ elif [[ $# -ge 2 && ($1 == --index-speed || $1 == --index-paired || $1 == --cons
     fi
     index_speed=1
     labels=(before after)
+    if ((high_overlap_ab)); then labels+=(original); fi
     candidate=$2
 elif [[ $# == 2 && $1 == --high-index && $2 =~ ^[0-9a-f]{40}$ ]]; then
     high_index=1
     candidate=$2
 elif [[ $# != 0 ]]; then
-    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA|--index-speed CANDIDATE_SHA [GROUP ...]|--index-10k CANDIDATE_SHA [moves|events]|--index-paired CANDIDATE_SHA [--baseline CONTROL_SHA] [GROUP ...]|--index-10k-paired CANDIDATE_SHA [--baseline CONTROL_SHA] [moves|events]|--consumer-ab CANDIDATE_SHA --baseline CONTROL_SHA [GROUP ...]|--high-overlap-ab CANDIDATE_SHA --baseline CONTROL_SHA [--intermediate INTERMEDIATE_SHA] [GROUP ...]]"
+    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA|--index-speed CANDIDATE_SHA [GROUP ...]|--index-10k CANDIDATE_SHA [moves|events]|--index-paired CANDIDATE_SHA [--baseline CONTROL_SHA] [GROUP ...]|--index-10k-paired CANDIDATE_SHA [--baseline CONTROL_SHA] [moves|events]|--consumer-ab CANDIDATE_SHA --baseline CONTROL_SHA [GROUP ...]|--high-overlap-ab CANDIDATE_SHA --baseline CONTROL_SHA [--intermediate INTERMEDIATE_SHA] [--kernel-account] [GROUP ...]]"
 fi
 
 diag=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
 cache=/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold
 repo=/home/c00982601/CacheOS/vLLM-DSA/third_party/KVIP
 src="$cache/adaptive-sources"
+fixed_original=4cb3917d1861776a396e0f1a402e6b940fcabed4
 build="$cache/KVAF/build-npu"
 cpu="$cache/KVAF/build-cpu/runtime/kvaf_cpu_service"
 snapshot="$cache/skip-results.po80Nw/g2-input"
@@ -119,6 +126,7 @@ clean() { git -C "$1" diff --quiet && git -C "$1" diff --cached --quiet; }
 clean "$diag" || die "Modified diagnostics checkout: $diag"
 for label in "${labels[@]}"; do
     case "$label" in
+        original*) rev=$fixed_original; root="$src/auto-${rev:0:8}" ;;
         serial*) rev=$main; root="$src/main-${rev:0:8}" ;;
         before*) rev=$before; root="$src/auto-${rev:0:8}" ;;
         middle*) rev=$intermediate; root="$src/auto-${rev:0:8}" ;;
@@ -196,7 +204,7 @@ export KVAF_BATCH_PUT_KERNEL="$build/bin/kvaf_execute_batch_put_kernels.o"
 if ((high_overlap_ab)); then
     out=$(mktemp -d "$cache/host20-high-overlap.XXXXXX")
     if [[ -n $intermediate ]]; then printf 'INTERMEDIATE=%.8s\n' "$intermediate"; fi
-    printf 'HIGH_OVERLAP_AB NPU4 logical=0 HIGH=8_windows original=per_row_consumer baseline=%.8s candidate=%.8s\n' "$before" "$after"
+    printf 'HIGH_OVERLAP_AB NPU4 logical=0 HIGH=8_windows original=per_row_consumer reference=%.8s baseline=%.8s candidate=%.8s\n' "$fixed_original" "$before" "$after"
 elif ((consumer_ab)); then
     out=$(mktemp -d "$cache/host20-consumer-ab.XXXXXX")
     printf 'CONSUMER_AB NPU4 logical=0 HIGH=8_windows baseline=%.8s candidate=%.8s\n' "$before" "$after"
@@ -249,6 +257,7 @@ if ((high_index)); then
         study=kvip.diagnostics.consumer_ab
         study_args=(--baseline "$before" --groups "${index_groups[@]}")
         if ((high_overlap_ab)); then study_args+=(--high-overlap); fi
+        if ((kernel_account)); then study_args+=(--kernel-account); fi
         if [[ -n $intermediate ]]; then study_args+=(--intermediate "$intermediate"); fi
     elif ((index_speed)); then
         study=kvip.diagnostics.high_index_speed

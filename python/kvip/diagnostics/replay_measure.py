@@ -625,6 +625,7 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
                 diagnostic_samples[-1]["reads"]["high_post_index"],
                 result["native_diagnostics"]["counter_calibration"]["cycles_per_us"])
     last_step = args.iterations + diagnostic_count
+    high_profile = bool(getattr(args, "profile_dir", None) and getattr(args, "verify_consumer_work", False))
     if getattr(args, "profile_dir", None) is not None:
         from kvip.diagnostics.system_profile import collect_system_profiles
 
@@ -632,6 +633,7 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
         metadata = dict(retained["profile_metadata"])
         profile_reset, profile_verify = reset, verify
         if auto is not None:
+            bundle.record_consumer_work = high_profile
             # One separate Level0 capture from the naturally learned state.
             # No feedback injection or lifecycle fault may precede the capture.
             last_step += 1
@@ -642,7 +644,10 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
 
             def profile_verify():
                 reads = verify()
-                metadata["auto_route"] = verified_low_trace(auto, reads, last_step)
+                if high_profile:
+                    metadata["auto_route"] = verified_high_trace(auto, reads, last_step, args.high_post_index)
+                else:
+                    metadata["auto_route"] = verified_low_trace(auto, reads, last_step)
 
         result["system_profiles"] = collect_system_profiles(
             torch=torch,
@@ -658,7 +663,8 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
             retained=retained,
             checkpoint=lambda name, step: phase(retained, name, step),
         )
-    if getattr(args, "profile_graph_event", False):
+        bundle.record_consumer_work = False
+    if getattr(args, "profile_graph_event", False) and not high_profile:
         from kvip.diagnostics.graph_queue_probe import probe
 
         def prepare_step(step):
@@ -690,6 +696,21 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
     for graph in reversed(graphs):
         graph.reset()
     return result
+
+
+def verified_high_trace(auto, reads, step, full_aiv):
+    observation = auto.record(reads)
+    owners = sorted(int(r[0]) for r in auto.requests if r[3])
+    work = reads.get("consumer_work", {})
+    high = reads.get("high_post_index")
+    if (not owners or observation["mode"] != "high" or not observation["steps"]
+            or any(s != step for s in observation["steps"]) or sorted(observation["learned_owners"]) != owners
+            or reads["post_index"]["active"] or work.get("ordered_index_verified") is not True
+            or (high is not None) != full_aiv or (high and (high["wait_first"] or high["fallback_cores"]
+                or high["core_count"] != 64 or sum(high["final_get_by_core"]) != reads["final"]))):
+        raise ValueError("Level0 replay did not verify the natural HIGH schedule and persistent Index")
+    return dict(mode="high", step=step, full_aiv=full_aiv, prefetch=int(reads["prefetch"]), final_get=int(reads["final"]),
+                ordered_index_verified=True, event_sha256=work["event_sha256"], descriptor_sha256=work["descriptor_sha256"])
 
 
 def verified_low_trace(auto, reads, step):

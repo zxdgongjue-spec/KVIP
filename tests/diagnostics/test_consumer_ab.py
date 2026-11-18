@@ -5,7 +5,7 @@ import numpy as np
 
 import pytest
 
-from kvip.diagnostics.consumer_ab import ARMS, command, diagnostic_wait, summarize
+from kvip.diagnostics.consumer_ab import ARMS, FIXED_FUSED_REVISION, command, diagnostic_wait, summarize
 from kvip.diagnostics.replay import arguments
 
 
@@ -93,10 +93,10 @@ def test_high_overlap_arms_reuse_public_completion_records(tmp_path, capsys, for
         assert opts.verify_consumer_work and opts.check_auto_route and opts.high_post_index == (not original)
         middle = arm.startswith("middle")
         diagnostic = arm in ("before", "middle", "after")
-        profiled = diagnostic or (intermediate and arm == "original")
+        profiled = diagnostic or arm == "original"
         assert opts.calibrate_counter == profiled and opts.diagnostic_replays == int(profiled)
         assert not opts.post_index_wait_first
-        revision = args.intermediate if middle else (args.baseline if old_binary else args.revision)
+        revision = FIXED_FUSED_REVISION if original else args.intermediate if middle else (args.baseline if old_binary else args.revision)
         assert opts.upstream_revision == revision
         expected_source = args.cache / "adaptive-sources" / f"auto-{revision[:8]}" if old_binary or middle else args.source
         assert opts.upstream_root == expected_source
@@ -134,18 +134,21 @@ def test_high_overlap_arms_reuse_public_completion_records(tmp_path, capsys, for
         with pytest.raises(ValueError, match="wrong source"):
             summarize(7, cases, args.baseline, args.revision, True, formats, args.intermediate)
         cases["middle-end"]["kvip_commit"] = args.intermediate
-    if not intermediate:
-        from kvip.diagnostics.consumer_ab import FIXED_FUSED_REVISION
-        for name in ("original", "original-end", "before", "before-end"):
-            cases[name]["kvip_commit"] = FIXED_FUSED_REVISION
-        summarize(7, cases, FIXED_FUSED_REVISION, args.revision, True, formats)
-        fixed = next(row for row in capsys.readouterr().out.splitlines() if " FIXED_FUSED " in row)
-        assert "source=4cb3917d" in fixed
-        assert "reduction_pct_first/end_mean/p50=-0.200/-0.200,-0.201/-0.201" in fixed
-        assert "all_brackets_reduction_pct_min/max_mean/p50=-0.602/-0.602,0.200/0.200" in fixed
-        assert "slower_pct_first/end_mean/p50=0.200/0.200,0.201/0.201" in fixed
-        for name in ("original", "original-end", "before", "before-end"):
-            cases[name]["kvip_commit"] = args.baseline
+    fixed = next(row for row in result.splitlines() if " FIXED_FUSED " in row)
+    assert "source=4cb3917d" in fixed
+    assert "reduction_pct_first/end_mean/p50=-0.200/-0.200,-0.201/-0.201" in fixed
+    assert "all_brackets_reduction_pct_min/max_mean/p50=-0.602/-0.602,0.200/0.200" in fixed
+    assert "slower_pct_first/end_mean/p50=0.200/0.200,0.201/0.201" in fixed
+    cases["original-end"]["kvip_commit"] = args.baseline
+    with pytest.raises(ValueError, match="wrong source"):
+        summarize(7, cases, args.baseline, args.revision, True, formats, args.intermediate)
+    cases["original-end"]["kvip_commit"] = FIXED_FUSED_REVISION
+    for label in ("original", "original-end"):
+        cases[label]["library_sha256"] = args.baseline
+    with pytest.raises(ValueError, match="distinct binaries"):
+        summarize(7, cases, args.baseline, args.revision, True, formats, args.intermediate)
+    for label in ("original", "original-end"):
+        cases[label]["library_sha256"] = FIXED_FUSED_REVISION
     cases["after"]["reads_samples"][1]["high_post_index"]["final_get_by_core"] = [0]*64
     with pytest.raises(ValueError, match="transport count"):
         summarize(7, cases, args.baseline, args.revision, True, formats, args.intermediate)
@@ -322,3 +325,18 @@ def test_two_source_fixed_fused_baseline_gets_its_own_clock(tmp_path):
     assert not original.high_post_index and not end.high_post_index
     assert (original.calibrate_counter, original.diagnostic_replays) == (True, 1)
     assert (end.calibrate_counter, end.diagnostic_replays) == (False, 0)
+
+
+def test_rqi5_times_separate_prefetch_owners_from_nonempty_final_queues():
+    from kvip.diagnostics.high_index_profile import retire_timing
+    r = np.zeros((64,16), np.uint64)
+    m = np.zeros((64,32), np.uint64)
+    r[:,8], r[:,9], m[:,30] = 620, 1400, 1020
+    m[:16,28], m[:16,29] = 640,960
+    r[[0,63],1] = [10,100]
+    m[63,30], r[63,9] = 750,1250
+    assert retire_timing(r,m) == dict(prefetch_p50=320.0,prefetch_max=320,final_p50=440.0,
+                                      final_max=500,last_lane=0,last_lane_final=380)
+    m[16,29] = 1234
+    with pytest.raises(ValueError, match="RQI5"):
+        retire_timing(r,m)
