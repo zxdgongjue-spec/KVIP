@@ -48,3 +48,4 @@
 - compiled C++/headers与CANN950 Model、fresh `RUN_MODE=npu`构建的SHA相符，binary/library SHA也验证。Python统计/脚本随后完善，不沿用旧Python分类标签解释GM访存。
 - 模型输入是已有最终score，mapping/LRU固定，只验证隔离后处理契约；不模拟动态Service/URMA/Index，也未实现producer/consumer常驻融合。没有真实A5时间或msprof，脚本供服务器采集。
 - 容器入口`run_tail_in_container.sh`补为正式仓库文件；六项本地shell检查通过，覆盖仓库入口/共享入口、显式共享路径、参数转交、缺少release的更新提示及无参数启动。宿主机发布使用同一仓库文件；旧提交保留原生成方式。没有执行NPU。
+- 现有`run_tail_a5.sh`新增`--from-repo`，直接构建当前仓库，无需共享release/bundle。五项本地编排检查通过：无共享包时校验、B16参数与bench/profile转交且禁止fetch/bundle/clone/worktree、构建失败退出码23并停止后续执行、模式冲突拒绝、原共享模式兼容。使用真实本地Git与模拟NPU/backend，仅验证编排，不产生设备性能；工作区修改保留，记录源码状态。

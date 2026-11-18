@@ -260,6 +260,9 @@ Final数值选择在私有buffer上进行；classification等Service停止新增
 原七点/八点/B16 score实验仍沿用原入口，新后处理入口独立：
 
 ```bash
+# 在已检出MR14源分支的仓库根目录直接执行，无需共享release
+bash experiments/li_qk/run_tail_a5.sh --from-repo --batch 1 --parts 4 --controls C0,C1 --profile
+# 或继续使用已有的共享发布方式
 # A5宿主机：更新已确认的共享目录，不依赖Docker CLI
 bash experiments/li_qk/update_shared_a5.sh --no-proxy
 # 原A5容器：先只对比Cold，再执行包含Final分核的四组控制

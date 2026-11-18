@@ -186,6 +186,16 @@ done
 需求见 [TAIL_PROMPT.md](TAIL_PROMPT.md)，源码/阶段规模/论文依据/实测见 [TAIL_REPORT.md](TAIL_REPORT.md)。新入口读取相同的最终sortable score，不运行QK、Fetch、Service或Index：C0单owner GM Cold＋库上Final primitive，C1只分Cold，C2只分Final，C3两者都分；默认resident仍调用原TopK/θ/Hot primitive。C0是隔离后处理控制，不是SDK或生产P2整链。
 
 ```bash
+# 直接从已更新的仓库根目录运行；无需共享release或离线bundle
+bash experiments/li_qk/run_tail_a5.sh --from-repo --controls C0,C1 --profile
+bash experiments/li_qk/run_tail_a5.sh --from-repo --batch 16 --parts 2 --profile
+```
+
+`--from-repo`使用脚本所在的Git工作目录，记录commit、工作区状态和构建源码SHA，保留本地修改。构建/结果写入新的`/home/w00568585/li_tail_*`目录，不在容器联网拉代码。MR14脚本尚未合入main时，需要先在宿主机实际检出`codex/split-core-unified-comparison`分支；`git fetch`不会更新当前工作目录中的文件。
+
+已有共享发布方式也保留：
+
+```bash
 # 宿主机更新已确认的共享目录
 bash experiments/li_qk/update_shared_a5.sh --no-proxy
 # 原A5容器；默认B1/Q4/H128K/R16K/P4，device5

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Physical A5 only; read the frozen bundle from the existing shared mount.
+# Physical A5 only; run from a checkout or a verified shared release.
 set -Eeuo pipefail
+LI_TAIL_REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
+LI_TAIL_FROM_REPO=0
 LI_TAIL_SHARE=/home/w00568585/li_qk_shared
 LI_TAIL_RELEASE_DIR=
 LI_TAIL_OUTPUT_ROOT=/home/w00568585
@@ -20,7 +22,8 @@ LI_TAIL_CONTROLS=(C0 C1 C2 C3)
 die(){ printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 usage(){ cat <<'USAGE'
 Usage: bash run_tail_a5.sh [options]
-Run in the original A5 container after the host updates li_qk_shared.
+Run in the original A5 container. From a checkout, use --from-repo.
+  --from-repo           Build this repository's working tree; no shared bundle required
   --batch 1|16          Requests (default 1)
   --history N           History tokens (default 131072)
   --resident N          Resident tokens (default 16384)
@@ -28,7 +31,7 @@ Run in the original A5 container after the host updates li_qk_shared.
   --resident-parts N    Independent resident TopK parts (default 1)
   --profile             Collect separate msprof traces for all four controls
   --controls C0,C1      Controls to compare (default C0,C1,C2,C3; C0 required)
-  --verify-only         Verify the shared release without building/running kernels
+  --verify-only         Verify source without building/running kernels
   --device N            Physical device (default 5)
   --share-root PATH     Published shared package root
   --release-root PATH   Pin an immutable release (set by the shared launcher)
@@ -42,6 +45,7 @@ USAGE
 while (($#)); do
  case "$1" in
   -h|--help) usage; exit 0 ;;
+  --from-repo) LI_TAIL_FROM_REPO=1; shift ;;
   --profile) LI_TAIL_PROFILE=1; shift ;;
   --verify-only) LI_TAIL_VERIFY_ONLY=1; shift ;;
   --controls)
@@ -69,6 +73,18 @@ for LI_TAIL_NUM in "$LI_TAIL_BATCH" "$LI_TAIL_HISTORY" "$LI_TAIL_RESIDENT" "$LI_
 done
 [[ ${LD_PRELOAD:-} != *camodel* && ${LD_PRELOAD:-} != *cmodel* ]] || die 'Physical A5 required; Model preload rejected'
 command -v git >/dev/null || die 'Command unavailable: git'
+if ((LI_TAIL_FROM_REPO)); then
+ [[ -z $LI_TAIL_RELEASE_DIR ]] || die '--from-repo cannot be combined with --release-root'
+ for LI_TAIL_FILE in experiments/li_qk/tail.py experiments/li_qk/test_tail.py experiments/split_core/prepare_score_source.py csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer.h; do
+  [[ -f $LI_TAIL_REPO_ROOT/$LI_TAIL_FILE ]] || die "Repository file missing: $LI_TAIL_REPO_ROOT/$LI_TAIL_FILE"
+ done
+ LI_TAIL_COMMIT=$(git -C "$LI_TAIL_REPO_ROOT" rev-parse --verify HEAD) || die 'Use run_tail_a5.sh from a Git checkout'
+ LI_TAIL_SOURCE_MODE=repository
+ if ((LI_TAIL_VERIFY_ONLY)); then
+  printf 'Repository post-score source verified: %s\ncommit=%s\nNo kernels executed.\n' "$LI_TAIL_REPO_ROOT" "$LI_TAIL_COMMIT"
+  exit 0
+ fi
+else
 LI_TAIL_RELEASE=$(cd "${LI_TAIL_RELEASE_DIR:-$LI_TAIL_SHARE/current}" && pwd -P) || die 'Update the shared package on the host first'
 [[ $(git hash-object --no-filters "$LI_TAIL_RELEASE/li_qk_mr14_offline.bundle") == "$(cat "$LI_TAIL_RELEASE/BUNDLE_BLOB")" ]] || die 'Published bundle hash mismatch'
 LI_TAIL_PUBLISHED=$(git bundle list-heads "$LI_TAIL_RELEASE/li_qk_mr14_offline.bundle" refs/remotes/origin/codex/split-core-unified-comparison)
@@ -77,19 +93,28 @@ if ((LI_TAIL_VERIFY_ONLY)); then
  printf 'Shared post-score source verified: %s\nNo kernels executed.\n' "${LI_TAIL_PUBLISHED%% *}"
  exit 0
 fi
+ LI_TAIL_SOURCE_MODE=shared_release
+fi
 for LI_TAIL_CMD in npu-smi cmake "$LI_TAIL_PYTHON"; do command -v "$LI_TAIL_CMD" >/dev/null || die "Command unavailable: $LI_TAIL_CMD"; done
 mkdir -p "$LI_TAIL_OUTPUT_ROOT"
 LI_TAIL_OUT=$(mktemp -d "$LI_TAIL_OUTPUT_ROOT/li_tail_$(date +%Y%m%d_%H%M%S)_XXXXXX")
 finish(){ local li_tail_status=$?; trap - EXIT; tar -czf "$LI_TAIL_OUT.tar.gz" -C "$(dirname "$LI_TAIL_OUT")" "$(basename "$LI_TAIL_OUT")" || true; printf 'Results: %s\nArchive: %s.tar.gz\n' "$LI_TAIL_OUT" "$LI_TAIL_OUT"; exit "$li_tail_status"; }
 trap finish EXIT
+if ((LI_TAIL_FROM_REPO)); then
+ LI_TAIL_SOURCE_ROOT=$LI_TAIL_REPO_ROOT
+else
 git init --bare "$LI_TAIL_OUT/repo.git" > "$LI_TAIL_OUT/git.log" 2>&1
 git --git-dir="$LI_TAIL_OUT/repo.git" fetch "$LI_TAIL_RELEASE/li_qk_mr14_offline.bundle" refs/remotes/origin/codex/split-core-unified-comparison >> "$LI_TAIL_OUT/git.log" 2>&1
 LI_TAIL_COMMIT=$(git --git-dir="$LI_TAIL_OUT/repo.git" rev-parse FETCH_HEAD)
 [[ $LI_TAIL_COMMIT == "$(cat "$LI_TAIL_RELEASE/SOURCE_COMMIT")" ]] || die 'Published commit mismatch'
 git --git-dir="$LI_TAIL_OUT/repo.git" worktree add --detach "$LI_TAIL_OUT/source" "$LI_TAIL_COMMIT" >> "$LI_TAIL_OUT/git.log" 2>&1
-cd "$LI_TAIL_OUT/source"
+ LI_TAIL_SOURCE_ROOT=$LI_TAIL_OUT/source
+fi
+cd "$LI_TAIL_SOURCE_ROOT"
 [[ -f experiments/li_qk/tail.py ]] || die 'Published revision lacks post-score controls; update the host to the latest MR14'
-printf 'commit=%s\nbatch=%s\nhistory=%s\nresident=%s\nparts=%s\nresident_parts=%s\n' "$LI_TAIL_COMMIT" "$LI_TAIL_BATCH" "$LI_TAIL_HISTORY" "$LI_TAIL_RESIDENT" "$LI_TAIL_PARTS" "$LI_TAIL_RPARTS" > "$LI_TAIL_OUT/config.txt"
+printf 'source_mode=%s\nsource_root=%s\ncommit=%s\nbatch=%s\nhistory=%s\nresident=%s\nparts=%s\nresident_parts=%s\n' "$LI_TAIL_SOURCE_MODE" "$LI_TAIL_SOURCE_ROOT" "$LI_TAIL_COMMIT" "$LI_TAIL_BATCH" "$LI_TAIL_HISTORY" "$LI_TAIL_RESIDENT" "$LI_TAIL_PARTS" "$LI_TAIL_RPARTS" > "$LI_TAIL_OUT/config.txt"
+git status --porcelain > "$LI_TAIL_OUT/source-status.txt"
+printf 'Source mode: %s\nSource checkout: %s\nResults directory: %s\n' "$LI_TAIL_SOURCE_MODE" "$LI_TAIL_SOURCE_ROOT" "$LI_TAIL_OUT"
 npu-smi info > "$LI_TAIL_OUT/npu-smi.log"
 LI_TAIL_ARGS=(--batch "$LI_TAIL_BATCH" --history "$LI_TAIL_HISTORY" --resident "$LI_TAIL_RESIDENT" --parts "$LI_TAIL_PARTS" --resident-parts "$LI_TAIL_RPARTS" --device "$LI_TAIL_DEVICE" --controls "${LI_TAIL_CONTROLS[@]}")
 "$LI_TAIL_PYTHON" experiments/li_qk/tail.py plan "${LI_TAIL_ARGS[@]}" > "$LI_TAIL_OUT/plan.json"
