@@ -347,3 +347,24 @@ def test_light_variants_require_direct_and_preserve_controls():
     options["incremental_direct"] = False
     with pytest.raises(ValueError, match="Light"):
         validate_options(options)
+
+
+def test_immutable_segment_references_keep_pending_order():
+    from kvip.diagnostics.incremental_topk import expand_segments
+
+    words = np.zeros((1, 4, 2080), dtype=np.uint32)
+    words[0, 0, :6] = (11, 90, 1, 0, 0, 0)
+    words[0, 0, 32:43] = np.arange(11)
+    words[0, 1, :6] = (11, 90, 2, 0, 8, 1)
+    words[0, 1, 32:35] = (8, 13, 9)
+    words[0, 2, :6] = (11, 90, 3, 0, 8, 1)
+    words[0, 3, :6] = (2, 91, 4, 3, 0, 3)
+    words[0, 3, 32:34] = (13, 3)
+    decoded = expand_segments(words)
+    for epoch in (1, 2):
+        np.testing.assert_array_equal(decoded[0, epoch, 32:43], [*range(9), 13, 9])
+    np.testing.assert_array_equal(decoded[0, 3, 32:34], [13, 3])
+    assert words[0, 2, 32] == 0
+    words[0, 1, 5] = 2
+    with pytest.raises(ValueError, match="Invalid segment descriptor"):
+        expand_segments(words)

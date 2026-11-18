@@ -257,15 +257,31 @@ def check_publications(scores, ends, resident, bounds, lists, eligible, reverse)
                 raise AssertionError("Incremental pending tie count cannot represent an exact TopK")
 
 
+def expand_segments(stored):
+    """Resolve immutable references exactly as Fetch does, before checking window ranks."""
+    expanded = stored.copy()
+    for query, output in zip(stored, expanded):
+        for epoch, header in enumerate(query):
+            count, _, version, base, prefix, suffix = map(int, header[:6])
+            if not (version == epoch + 1 and 0 <= prefix <= count <= TOP and prefix % 8 == 0
+                    and 0 <= base <= epoch and 0 <= suffix <= epoch):
+                raise ValueError(f"Invalid segment descriptor in window {epoch}")
+            if prefix:
+                output[epoch, 32:32+prefix] = query[base, 32:32+prefix]
+            output[epoch, 32+prefix:32+count] = query[suffix, 32:32+count-prefix]
+    return expanded
+
+
 def verify(torch, bundle, archive):
     from kvip.diagnostics.archive import cpu_array
     g, scores, ends, bounds = inputs(archive)
     lists = cpu_array(torch, bundle.rotating.incremental_lists).reshape(g["batch"], 4, 9, 2080)
     digest = hashlib.sha256()
     for row in range(g["batch"]):
-        check_publications(scores[row], ends[row], g["resident"], bounds[row], lists[row],
+        published = expand_segments(lists[row]) if bundle.tuning.get("incremental_segments") else lists[row]
+        check_publications(scores[row], ends[row], g["resident"], bounds[row], published,
                            eligibility(archive, row), bundle.tuning.get("reverse_cold", False))
-        for query in lists[row]:
+        for query in published:
             for window in query:
                 count = int(window[0])
                 digest.update(window[:3].astype("<i4", copy=False).tobytes())

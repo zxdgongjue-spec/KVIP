@@ -1,6 +1,6 @@
 """Independent URMA scan-order/admission experiment; no graph-route changes."""
 
-OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill", "compact_out_of_place", "rolling_reuse_seed", "rolling_fast_path", "rolling_sparse", "rolling_boundary", "incremental_topk", "incremental_window", "incremental_register", "incremental_prefilter", "incremental_direct", "incremental_ties", "incremental_light", "incremental_inplace", "incremental_progress")
+OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill", "compact_out_of_place", "rolling_reuse_seed", "rolling_fast_path", "rolling_sparse", "rolling_boundary", "incremental_topk", "incremental_window", "incremental_register", "incremental_prefilter", "incremental_direct", "incremental_ties", "incremental_light", "incremental_inplace", "incremental_progress", "incremental_segments")
 DEFAULT_VARIANTS = ("forward", "reverse", "forward-wide", "reverse-wide", "forward-end")
 VARIANTS = {name: ("reverse_cold",) if name.startswith("reverse") else () for name in DEFAULT_VARIANTS}
 ROLLING_VARIANTS = ("forward", "reverse", "reverse-roll", "reverse-refilter", "forward-refilter", "forward-end")
@@ -135,6 +135,13 @@ INCREMENTAL_PROGRESS_VARIANTS = (
 VARIANTS["reverse-inc-progress"] = VARIANTS["reverse-inc-register"] + ("incremental_progress",)
 
 
+SEGMENT_VARIANTS = (
+    "forward", "reverse", "reverse-inc-register", "reverse-inc-segments",
+    "reverse-end", "forward-end",
+)
+VARIANTS["reverse-inc-segments"] = VARIANTS["reverse-inc-light-ties"] + ("incremental_segments",)
+
+
 def options_for(name):
     return {key: key in VARIANTS[name] for key in OPTIONS}
 
@@ -156,6 +163,11 @@ def validate_options(options):
         raise ValueError("Scan experiment options do not match the selected native interface")
     if any(type(value) is not bool for value in options.values()):
         raise ValueError("Scan build options must be bool")
+    if options["incremental_segments"] and (
+        not options["incremental_light"] or not options["incremental_ties"]
+        or options["incremental_progress"] or options["incremental_inplace"]
+    ):
+        raise ValueError("Segment lists require light tie selection and its private staging bank")
     if options["incremental_progress"] and not options["incremental_window"]:
         raise ValueError("Independent progress requires fixed-window incremental staging")
     if options["incremental_inplace"] and not (options["incremental_light"] and options["incremental_ties"]):

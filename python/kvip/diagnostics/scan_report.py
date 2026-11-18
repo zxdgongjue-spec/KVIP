@@ -6,15 +6,15 @@ import json
 from pathlib import Path
 from statistics import mean
 
-from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS, INCREMENTAL_VARIANTS, INCREMENTAL_WINDOW_VARIANTS, INCREMENTAL_PREFILTER_VARIANTS, INCREMENTAL_STATE_VARIANTS, INCREMENTAL_LIGHT_VARIANTS, INCREMENTAL_INPLACE_VARIANTS, INCREMENTAL_PROGRESS_VARIANTS, options_for
+from kvip.diagnostics.scan_options import DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS, INCREMENTAL_VARIANTS, INCREMENTAL_WINDOW_VARIANTS, INCREMENTAL_PREFILTER_VARIANTS, INCREMENTAL_STATE_VARIANTS, INCREMENTAL_LIGHT_VARIANTS, INCREMENTAL_INPLACE_VARIANTS, INCREMENTAL_PROGRESS_VARIANTS, SEGMENT_VARIANTS, options_for
 
 
 def load_report(path, *, require_rolling=False, require_batched=False, require_windowed=False, require_lean=False, require_safe=False, require_economy=False, require_seed=False, require_fast=False, require_sparse=False, require_boundary=False, require_incremental=False, require_incremental_window=False, require_incremental_prefilter=False, require_incremental_state=False, require_incremental_light=False, require_incremental_inplace=False, require_incremental_progress=False, expected_native=None, snapshot=None):
     data = json.loads(path.read_text())
     order = tuple(data.get("execution_order", ()))
-    if data.get("status") != "pass" or order not in (DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS, INCREMENTAL_VARIANTS, INCREMENTAL_WINDOW_VARIANTS, INCREMENTAL_PREFILTER_VARIANTS, INCREMENTAL_STATE_VARIANTS, INCREMENTAL_LIGHT_VARIANTS, INCREMENTAL_INPLACE_VARIANTS, INCREMENTAL_PROGRESS_VARIANTS):
+    if data.get("status") != "pass" or order not in (DEFAULT_VARIANTS, ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS, INCREMENTAL_VARIANTS, INCREMENTAL_WINDOW_VARIANTS, INCREMENTAL_PREFILTER_VARIANTS, INCREMENTAL_STATE_VARIANTS, INCREMENTAL_LIGHT_VARIANTS, INCREMENTAL_INPLACE_VARIANTS, INCREMENTAL_PROGRESS_VARIANTS, SEGMENT_VARIANTS):
         raise ValueError("Missing or incomplete controlled scan experiment")
-    if require_rolling and order not in (ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS, INCREMENTAL_VARIANTS, INCREMENTAL_WINDOW_VARIANTS, INCREMENTAL_PREFILTER_VARIANTS, INCREMENTAL_STATE_VARIANTS, INCREMENTAL_LIGHT_VARIANTS, INCREMENTAL_INPLACE_VARIANTS, INCREMENTAL_PROGRESS_VARIANTS):
+    if require_rolling and order not in (ROLLING_VARIANTS, BATCHED_VARIANTS, WINDOWED_VARIANTS, LEAN_VARIANTS, SAFE_VARIANTS, ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS, INCREMENTAL_VARIANTS, INCREMENTAL_WINDOW_VARIANTS, INCREMENTAL_PREFILTER_VARIANTS, INCREMENTAL_STATE_VARIANTS, INCREMENTAL_LIGHT_VARIANTS, INCREMENTAL_INPLACE_VARIANTS, INCREMENTAL_PROGRESS_VARIANTS, SEGMENT_VARIANTS):
         raise ValueError("Old scan/budget experiment: rolling/refilter cases were not measured")
     if require_batched and order != BATCHED_VARIANTS:
         raise ValueError("Batched histogram variants were not measured")
@@ -48,20 +48,20 @@ def load_report(path, *, require_rolling=False, require_batched=False, require_w
         raise ValueError("Packed histogram controls were not measured")
     if require_seed and order != SEED_VARIANTS:
         raise ValueError("Seed reuse controls were not measured")
-    if require_incremental or require_incremental_window or require_incremental_prefilter or require_incremental_state or require_incremental_light or require_incremental_inplace or require_incremental_progress:
+    if require_incremental or require_incremental_window or require_incremental_prefilter or require_incremental_state or require_incremental_light or require_incremental_inplace or require_incremental_progress or order == SEGMENT_VARIANTS:
         for name in order:
             if not options_for(name)["incremental_topk"]:
                 continue
             candidate = data["cases"][name]
             if candidate.get("incremental_check", {}).get("status") != "exact_prefix_ranks_and_pending":
                 raise ValueError(f"{name}: Incremental device prefix/pending oracle has not passed")
-    if require_incremental_prefilter or require_incremental_state or require_incremental_light or require_incremental_inplace or require_incremental_progress:
+    if require_incremental_prefilter or require_incremental_state or require_incremental_light or require_incremental_inplace or require_incremental_progress or order == SEGMENT_VARIANTS:
         from kvip.diagnostics.replay_measure import verify_prefilter_equivalence
         verify_prefilter_equivalence(data["cases"])
     digest = None if snapshot is None else hashlib.sha256((snapshot / "manifest.json").read_bytes()).hexdigest()
     for name in order:
         case = data["cases"][name]
-        if (require_fast or require_sparse or require_boundary or require_incremental or require_incremental_window or require_incremental_prefilter or require_incremental_state or require_incremental_light or require_incremental_inplace or require_incremental_progress) and case.get("geometry", {}).get("rounds") != 9:
+        if (require_fast or require_sparse or require_boundary or require_incremental or require_incremental_window or require_incremental_prefilter or require_incremental_state or require_incremental_light or require_incremental_inplace or require_incremental_progress or order == SEGMENT_VARIANTS) and case.get("geometry", {}).get("rounds") != 9:
             raise ValueError(f"{name}: expected resident plus eight cold windows")
         if expected_native and case.get("production_source", {}).get("commit") != expected_native:
             raise ValueError(f"{name}: native revision does not match {expected_native}")
@@ -99,7 +99,7 @@ def report(path, *, require_rolling=False, require_batched=False, require_window
     readers = sorted({case.get("diagnostics_commit", "unknown") for case in cases.values()})
     print(f"SOURCE native={','.join(natives)} reader={','.join(readers)}")
     print(f"RESULT_FILE={path}")
-    if tuple(order) in (ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS, INCREMENTAL_VARIANTS, INCREMENTAL_WINDOW_VARIANTS, INCREMENTAL_PREFILTER_VARIANTS, INCREMENTAL_STATE_VARIANTS, INCREMENTAL_LIGHT_VARIANTS, INCREMENTAL_INPLACE_VARIANTS, INCREMENTAL_PROGRESS_VARIANTS):
+    if tuple(order) in (ECONOMY_VARIANTS, SEED_VARIANTS, FAST_VARIANTS, SPARSE_VARIANTS, BOUNDARY_VARIANTS, INCREMENTAL_VARIANTS, INCREMENTAL_WINDOW_VARIANTS, INCREMENTAL_PREFILTER_VARIANTS, INCREMENTAL_STATE_VARIANTS, INCREMENTAL_LIGHT_VARIANTS, INCREMENTAL_INPLACE_VARIANTS, INCREMENTAL_PROGRESS_VARIANTS, SEGMENT_VARIANTS):
         from kvip.diagnostics.scan_economy_report import report as economy_report
         economy_report(cases, order)
         return
