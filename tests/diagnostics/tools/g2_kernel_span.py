@@ -12,7 +12,7 @@ def summarize(root, label):
     info = json.loads(manifest.read_text())
     if info["correctness"] != "passed" or info["graph_replays"] != 1 or info["included_in_headline_timing"]:
         raise ValueError(f"Not a verified independent graph capture: {manifest}")
-    if label == "after" and info["experiment"]["auto_route"]["mode"] != "low":
+    if label in ("before", "after") and info["experiment"]["auto_route"]["mode"] != "low":
         raise ValueError("Fused trace was not LOW")
     table, = manifest.parent.rglob("kernel_details.csv")
     with table.open(encoding="utf-8-sig", newline="") as f:

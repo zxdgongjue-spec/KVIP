@@ -96,6 +96,7 @@ common=(--snapshot "$snapshot" --build-dir "$build" --transport urma --kvaf-serv
         --device 0 --soc Ascend950DT_9582 --warmup 2 --iterations 10 --quiet)
 for label in "${labels[@]}"; do
     extra=(--diagnostic-replays 0)
+    capture=$profile
     if [[ $label == serial* ]]; then
         rev=$main; root="$src/main-${rev:0:8}"; args=(--mode serial --serial-workers 32)
     else
@@ -103,10 +104,16 @@ for label in "${labels[@]}"; do
         if [[ $label == before* ]]; then rev=$before; fi
         root="$src/auto-${rev:0:8}"
         args=(--mode fused --study post-threshold --threshold-policy recent --pipeline-variants auto-post-index --check-auto-route)
-        if [[ $label == before || $label == after ]]; then extra=(--diagnostic-replays 2 --calibrate-counter); fi
+        if [[ $label == before || $label == after ]]; then
+            extra=(--diagnostic-replays 2 --calibrate-counter)
+            if [[ -n $candidate ]]; then capture=1; fi
+        fi
     fi
     if ((profile)); then
-        extra=(--diagnostic-replays 0 --profile-dir "$out/$label-profile" --profile-metrics none)
+        extra=(--diagnostic-replays 0)
+    fi
+    if ((capture)); then
+        extra+=(--profile-dir "$out/$label-profile" --profile-metrics none)
     fi
     log="$out/.$label.log"
     if python3 -B -m kvip.diagnostics.replay "${common[@]}" "${args[@]}" "${extra[@]}" \
@@ -131,7 +138,7 @@ PY
         if ((${#labels[@]} == 1)); then
             grep -E '^REPLAY_PASS|^AUTO_ROUTE_PASS|^AUTO_LIFECYCLE_PASS' "$log"
         fi
-        if ((profile)); then
+        if ((capture)); then
             python3 -B "$diag/tests/diagnostics/tools/g2_kernel_span.py" "$out/$label-profile" "$label"
         fi
         rm -f "$log"
