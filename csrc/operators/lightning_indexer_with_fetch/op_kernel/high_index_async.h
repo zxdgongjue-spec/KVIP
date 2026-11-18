@@ -180,7 +180,7 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
         Simt::VF_CALL<PublishStreamingUpdateStatus>(Simt::Dim3{32,1,1},reinterpret_cast<__gm__ uint32_t*>(update[6]),b,error?1U:0U);
         SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
         if(!error && (a->prefetchCount & 0x10000000U)){
-            Simt::VF_CALL<PublishStreamingResidency>(Simt::Dim3{256,1,1},ctx,b,shape.resident);
+            Simt::VF_CALL<PublishStreamingResidency>(Simt::Dim3{256,1,1},shape.resident,shape.finalPostOffset,ctx,b);
             SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
         }
         FinalizeStreaming<false,true>(a,b,useful);
