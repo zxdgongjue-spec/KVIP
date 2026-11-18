@@ -100,7 +100,7 @@ int main(int argc, char **argv) {
         const bool countEvents = layout == "even-events" || layout == "skew-events";
         const bool exact = layout == "even" || layout == "skew" || countEvents;
         const bool skew = layout == "skew" || layout == "skew-mixed" || layout == "skew-events";
-        if (!exact && layout != "even-mixed" && layout != "skew-mixed" && layout != "mixed-fallback")
+        if (!exact && layout != "even-mixed" && layout != "skew-mixed" && layout != "mixed-fallback" && layout != "all-fallback")
             throw std::runtime_error("unknown Index fixture layout");
         RuntimeShape shape{};
         shape.batch = B;
@@ -151,6 +151,11 @@ int main(int argc, char **argv) {
                     // A later phase can legally select it again; generic planning relocates it.
                     if (layout == "mixed-fallback" && b % 4 == 0 && ph == 3 && j == 0)
                         s = src[b * E];
+                    // Re-select previously promoted sources on every request. Alternating
+                    // requests first collide in q0 or q2. The raw IDs are distinct within
+                    // each chunk; their current Index positions may already be in hot.
+                    if (layout == "all-fallback" && ph >= 1 + 2 * (b % 2) && j % 5 == 0)
+                        s = src[b * E + (ph - 1) * 10 + j / 5];
                     src[b * E + i] = s;
                     dst[b * E + i] = d;
                 }
