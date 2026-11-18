@@ -40,11 +40,11 @@ int main(int argc, char **argv) {
         constexpr uint32_t H = 32768, R = 16384, E = 10240;
         const uint32_t B = 16, C = 64, A = H + 128;
         const std::string layout = argc == 2 ? argv[1] : "";
-        if (layout != "even" && layout != "skew" && layout != "even-mixed" &&
-            layout != "skew-mixed")
-            throw std::runtime_error("expected even, skew, even-mixed or skew-mixed");
-        const bool exact = layout == "even" || layout == "skew";
-        const bool skew = layout == "skew" || layout == "skew-mixed";
+        const bool countEvents = layout == "even-events" || layout == "skew-events";
+        const bool exact = layout == "even" || layout == "skew" || countEvents;
+        const bool skew = layout == "skew" || layout == "skew-mixed" || layout == "skew-events";
+        if (!exact && layout != "even-mixed" && layout != "skew-mixed")
+            throw std::runtime_error("unknown Index fixture layout");
         RuntimeShape shape{};
         shape.batch = B;
         shape.history = H;
@@ -69,8 +69,10 @@ int main(int argc, char **argv) {
             std::iota(inv.begin(), inv.end(), 0U);
             // even/skew contain exactly 5,000 disjoint swaps. Mixed fixtures have 5,440 events
             // and exercise repeat victims across phase boundaries in half the requests.
-            const uint32_t n = exact ? (skew ? (b < 4 ? 966 : 94 + (b < 12)) : 312 + (b < 8))
-                                     : (skew ? (b < 4 ? 880 : 160) : 340);
+            uint32_t n = exact ? (skew ? (b < 4 ? 966 : 94 + (b < 12)) : 312 + (b < 8))
+                               : (skew ? (b < 4 ? 880 : 160) : 340);
+            if (countEvents)
+                n *= 2;
             uint32_t start = 0, off = 0;
             for (uint32_t ph = 0; ph < 5; ++ph) {
                 uint32_t num = ph == 0 ? (n + 1) / 2 : (n - n / 2) / 4;
@@ -129,8 +131,11 @@ int main(int argc, char **argv) {
             }
             moves += counts[b];
         }
-        if (exact && (events != 5000 || moves != 10000))
-            throw std::runtime_error("exact 10000 fixture");
+        if (exact) {
+            const uint32_t expectedEvents = countEvents ? 10000 : 5000;
+            if (events != expectedEvents || moves != 2 * expectedEvents)
+                throw std::runtime_error("incorrect exact event or changed-tuple count");
+        }
         printf("INDEX_MODEL_START B=%u cores=%u history=%u resident=%u layout=%s events=%llu "
                "moves=%llu\n",
                B, C, H, R, layout.c_str(), (unsigned long long)events, (unsigned long long)moves);

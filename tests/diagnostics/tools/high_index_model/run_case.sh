@@ -40,7 +40,7 @@ cd "$output"
 # The native executable sees one logical device after ASCEND_RT_VISIBLE_DEVICES is set.
 read -r -a layouts <<< "${INDEX_LAYOUTS:-even skew}"
 for layout in "${layouts[@]}"; do
-    case "$layout" in even|skew|even-mixed|skew-mixed) ;; *) echo "Unknown layout $layout" >&2; exit 2;; esac
+    case "$layout" in even|skew|even-mixed|skew-mixed|even-events|skew-events) ;; *) echo "Unknown layout $layout" >&2; exit 2;; esac
     run_dir=$(mktemp -d "$output/$layout.XXXXXX")
     if [[ $mode == sim ]]; then export CAMODEL_LOG_PATH="$run_dir"; fi
     if ! (cd "$run_dir" && "$output/high_index_case" "$layout") >"$run_dir/run.log" 2>&1; then
