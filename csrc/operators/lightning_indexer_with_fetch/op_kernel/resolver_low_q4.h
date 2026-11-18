@@ -7,7 +7,6 @@ namespace rotating {
 // Valid resident/ABC slots fit below these marker bits. Before publication all
 // handles are replaced with the same final slots as ResolveCompactQ4<true>.
 constexpr uint32_t kLowQ4Bucket = 0x80000000U;
-constexpr uint32_t kLowQ4First = 0x40000000U;
 constexpr uint32_t kLowQ4BucketMask = 8191U;
 
 __simt_vf__ __aicore__ LAUNCH_BOUND(kCompactThreads)
@@ -18,25 +17,49 @@ inline void ResolveLowQ4(
     __ubuf__ uint32_t* scratch, __ubuf__ uint32_t* ctl,
     __gm__ uint32_t* eventSource, __gm__ uint32_t* eventDest) {
     static_assert(kSlots <= 8192, "low-Q4 ranks and bucket handles use 13 bits");
-    // The preceding initialization VF may reject geometry before touching
-    // locations or hash storage. Never consume that stale scratch on failure.
-    const uint32_t initializationError = ctl[1];
-    // Join these reads before any thread can publish a new hash error below;
-    // otherwise late threads could exit while their peers await a barrier.
-    asc_syncthreads();
-    if (initializationError) return;
-    const uint32_t tid = threadIdx.x, buckets = ctl[7], per = kSlots / kCompactThreads;
+    const uint32_t tid = threadIdx.x;
+    constexpr uint32_t per = kSlots / kCompactThreads;
+    static_assert(per <= 32, "one lane mask covers its contiguous positions");
+    const uint32_t begin = tid * per;
     auto bitmap = ctl + 1024, lru = scratch + 4096;
-    // Cache the successful lookup once. Each selected position owns its loc
-    // word, while atomic_min preserves the first occurrence across all Qs.
-    for (uint32_t i = tid; i < kSlots; i += kCompactThreads) {
-        const uint32_t token = selected[i];
+    const uint32_t words = (resident + 31) / 32;
+    // The other Qs' three hit bitmaps temporarily occupy keys. Fold them here
+    // before reusing that storage; LOW never needs per-query output masks.
+    for (uint32_t w = tid; w < words; w += kCompactThreads)
+        bitmap[w] |= keys[w] | keys[words + w] | keys[2 * words + w];
+    if (tid < 10) ctl[tid] = 0;
+    uint32_t pending = 0, inputError = 0;
+    for (uint32_t bit = 0; bit < per; ++bit) {
+        const uint32_t i = begin + bit, token = selected[i], slot = loc[i];
         if (token == UINT32_MAX) continue;
-        if (loc[i] != UINT32_MAX) {
-            if (loc[i] & (kLowQ4Bucket | kLowQ4First)) asc_atomic_or(ctl + 1, 1U);
-            continue;
+        if (slot == UINT32_MAX) {
+            pending |= 1U << bit;
+            inputError |= token >= history;
+        } else {
+            inputError |= (slot >> 30) != 0;
         }
-        if (token >= history) { asc_atomic_or(ctl + 1, 1U); continue; }
+    }
+    StagedPrefix(__builtin_popcount(pending), ctl);
+    const uint32_t pendingCount = ctl[544 + kCompactThreads / warpSize - 1];
+    const uint32_t buckets = pendingCount <= 128 ? 256 : pendingCount <= 512 ? 1024 :
+                             pendingCount <= 1024 ? 2048 : pendingCount <= 2048 ? 4096 : 8192;
+    if (inputError) asc_atomic_or(ctl + 1, 1U);
+    for (uint32_t i = tid; i < buckets; i += kCompactThreads) {
+        keys[i] = UINT32_MAX;
+        ranks[i] = UINT32_MAX;
+    }
+    asc_syncthreads();
+    if (ctl[1]) return;
+    if (!pendingCount) {
+        if (!tid) asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->changeCount) + batch, kLruSlots);
+        asc_threadfence();
+        asc_syncthreads();
+        return;
+    }
+    // A register bit names the original Q4 position. The remaining passes
+    // visit only misses, retaining first-occurrence and victim order.
+    for (uint32_t bits = pending; bits; bits &= bits - 1) {
+        const uint32_t i = begin + __builtin_ctz(bits), token = selected[i];
         uint32_t bucket = SparseHash(token) & (buckets - 1), probe = 0;
         for (; probe < buckets; ++probe) {
             const uint32_t previous = asc_atomic_cas(keys + bucket, UINT32_MAX, token);
@@ -51,16 +74,15 @@ inline void ResolveLowQ4(
     }
     asc_syncthreads();
     if (ctl[1]) return;
-    uint32_t local = 0, coldLocal = 0;
-    for (uint32_t i = tid * per; i < (tid + 1) * per; ++i) {
-        if (selected[i] == UINT32_MAX || !(loc[i] & kLowQ4Bucket)) continue;
+    uint32_t first = 0, coldLocal = 0;
+    for (uint32_t bits = pending; bits; bits &= bits - 1) {
+        const uint32_t i = begin + __builtin_ctz(bits);
         if (ranks[loc[i] & kLowQ4BucketMask] == i) {
-            loc[i] |= kLowQ4First;
-            ++local;
+            first |= bits & -bits;
             coldLocal += selected[i] >= resident;
         }
     }
-    const uint32_t offset = StagedPrefix(local | (coldLocal << 16), ctl);
+    const uint32_t offset = StagedPrefix(__builtin_popcount(first) | (coldLocal << 16), ctl);
     const uint32_t total = ctl[544 + kCompactThreads / warpSize - 1];
     const uint32_t needed = total & 0xffffU, neededSlots = total >> 16;
     uint32_t rankOffset = offset & 0xffffU, coldOffset = offset >> 16;
@@ -71,8 +93,8 @@ inline void ResolveLowQ4(
         ctl[2 + tid] = (end - begin) & 0xffffU;
     }
     if (!tid) ctl[0] = needed;
-    for (uint32_t i = tid * per; i < (tid + 1) * per; ++i) {
-        if (selected[i] == UINT32_MAX || !(loc[i] & kLowQ4First)) continue;
+    for (uint32_t bits = first; bits; bits &= bits - 1) {
+        const uint32_t i = begin + __builtin_ctz(bits);
         const uint32_t bucket = loc[i] & kLowQ4BucketMask;
         ranks[bucket] = kStagedRankTag | (rankOffset++ << 13) | coldOffset;
         coldOffset += selected[i] >= resident;
@@ -98,10 +120,10 @@ inline void ResolveLowQ4(
             }
         }
         asc_syncthreads();
-        for (uint32_t i = tid; i < allocated; i += kCompactThreads)
-            asc_atomic_or(bitmap + slots[i] / 32, 1U << (slots[i] % 32));
-        asc_syncthreads();
         if (allocated < neededSlots) {
+            // The bitmap is read again only in the fallback allocation.
+            for (uint32_t i = tid; i < allocated; i += kCompactThreads)
+                asc_atomic_or(bitmap + slots[i] / 32, 1U << (slots[i] % 32));
             // Keep the original fallback order, including protection for late
             // query hits. LRU scratch is dead after this point.
             for (uint32_t i = tid; i < kSlots; i += kCompactThreads)
@@ -134,13 +156,13 @@ inline void ResolveLowQ4(
     auto changeSlots = reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots) + batch * kChangeCapacity;
     // Resolve duplicates and publish each unique event in this same pass.
     // This replaces repeated hash probes and the final full-bucket scan.
-    for (uint32_t i = tid; i < kSlots; i += kCompactThreads) {
+    for (uint32_t bits = pending; bits; bits &= bits - 1) {
+        const uint32_t i = begin + __builtin_ctz(bits);
         const uint32_t token = selected[i], handle = loc[i];
-        if (token == UINT32_MAX || !(handle & kLowQ4Bucket)) continue;
         const uint32_t rankPair = ranks[handle & kLowQ4BucketMask] & ~kStagedRankTag;
         const uint32_t slot = token < resident ? token : slots[rankPair & 8191U];
         loc[i] = slot;
-        if (!(handle & kLowQ4First)) continue;
+        if (!(first & (bits & -bits))) continue;
         const uint32_t rank = rankPair >> 13;
         const int32_t ordinal = asc_ldcg(reserved + slot);
         const uint32_t record = ordinal >= 0 ? uint32_t(ordinal) : kLruSlots + rank;

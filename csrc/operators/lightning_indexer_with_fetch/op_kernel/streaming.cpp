@@ -192,6 +192,7 @@ __aicore__ inline uint32_t Producer(__gm__ Args* a, uint32_t b) {
  for(uint32_t q=1;q<4;++q)DataCopy(keys[(q-1)*words],input[q*words],words);
  input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots);DataCopy(work[4096],input,kLruSlots);
  SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+ if constexpr (!PostIndex) {
  Simt::VF_CALL<MergeQueryBitmaps>(Simt::Dim3{512,1,1},FinalPtr(ctl[1024]),FinalPtr(keys),words
   ,unpack,outputValid,shape.batch,b,FinalPtr(ctl[kOutputMasksOffset]),outputEnabled && !KVIP_OUTPUT_WORKER
  );
@@ -220,6 +221,10 @@ __aicore__ inline uint32_t Producer(__gm__ Args* a, uint32_t b) {
  );
 #endif
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+ } else if(profile) {
+  // LOW merges hit masks and initializes its distinct-miss hash in ResolveLowQ4.
+  ticks[2]=GetSystemCycle();
+ }
  if(profile)ticks[3]=GetSystemCycle();
  GlobalTensor<uint32_t> output;output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*kSlots);
  auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*32;
