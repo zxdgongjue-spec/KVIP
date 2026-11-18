@@ -69,6 +69,8 @@ class LIFetchBinding:
         self.fetch_rank = any(bool(fn and fn()) for fn in
                               (getattr(self.library, "kvip_fetch_bitmap", None),
                                getattr(self.library, "kvip_fetch_dense", None)))
+        packets_option = getattr(self.library, "kvip_fetch_packets", None)
+        self.fetch_packets_enabled = bool(packets_option and packets_option())
         if self.fetch_rank and (batch != 16 or resident != 16384 or history % 128 or
                 self.runtime_shape.rounds != 9 or not self.runtime_shape.splitQ or
                 self.runtime_shape.indexHeads != 32 or not self.runtime_shape.batchedRows or
@@ -92,7 +94,7 @@ class LIFetchBinding:
             ("final_replicated", int(final_strategy == "replicated")),
             ("final_workers", final_aivs(batch, li_tiling, aic_count, final_workers)),
             ("aic_count", aic_count),
-            ("abi_version", 12 + 8*self.fetch_rank + self.incremental_topk + 2 * window_probe + 4 * seed_mask),
+            ("abi_version", 12 + 16*self.fetch_packets_enabled + 8*self.fetch_rank + self.incremental_topk + 2 * window_probe + 4 * seed_mask),
             (
                 "service_lanes",
                 li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)["service_aivs_per_window"],
@@ -106,7 +108,7 @@ class LIFetchBinding:
             ("history", history),
             ("resident", resident),
             ("simulation", 0),
-            ("context_bytes", 328 + 16*self.fetch_rank + 8 * (self.incremental_topk + window_probe + seed_mask)),
+            ("context_bytes", 328 + 16*self.fetch_rank + 8 * (self.incremental_topk + window_probe + seed_mask + self.fetch_packets_enabled)),
             ("row_bytes", 1024),
         ):
             fn = getattr(self.library, "v9_" + name)
@@ -253,6 +255,9 @@ class LIFetchBinding:
             self.fetch_ranks = torch.empty((batch, 4, self.rounds, 3104), dtype=torch.int32, device=self.device)
             self.fetch_audit = torch.empty((batch, self.rounds, 96), dtype=torch.int32, device=self.device)
             blob = np.r_[blob, np.array([self.fetch_ranks.data_ptr(), self.fetch_audit.data_ptr()], dtype="<u8").view("u1")]
+        if self.fetch_packets_enabled:
+            self.fetch_packets = torch.empty((batch, 4, history // 128, 48), dtype=torch.int16, device=self.device)
+            blob = np.r_[blob, np.array([self.fetch_packets.data_ptr()], dtype="<u8").view("u1")]
         if self.incremental_topk:
             # Optional experimental ABI: baseline allocations/layout are unchanged.
             self.incremental_lists = torch.empty((batch * 4, self.rounds, 2080),
@@ -264,7 +269,7 @@ class LIFetchBinding:
         if seed_mask:
             self.seed_mask = torch.empty((batch, 16384 // 8), dtype=torch.int32, device=self.device)
             blob = np.r_[blob, np.array([self.seed_mask.data_ptr()], dtype="<u8").view("u1")]
-        if blob.size != 328 + 16*self.fetch_rank + 8 * (self.incremental_topk + window_probe + seed_mask):
+        if blob.size != 328 + 16*self.fetch_rank + 8 * (self.incremental_topk + window_probe + seed_mask + self.fetch_packets_enabled):
             raise AssertionError("LIFetch Context ABI changed")
         self.context = torch.from_numpy(blob.copy()).to(self.device)
         self.arguments = tuple(arguments) + (self.context,)

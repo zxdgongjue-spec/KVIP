@@ -16,6 +16,7 @@
 #define QUANT_LIGHTNING_INDEXER_VECTOR1_H
 
 #include "kernel_operator.h"
+#include "fetch_packets.h"
 #include "score_common.h"
 #include "rolling_threshold_vector.h"
 #include "incremental_topk_vector.h"
@@ -870,7 +871,9 @@ __simd_callee__ inline void ReduceSumFinalizeClassify(AscendC::MicroAPI::RegTens
         return;
     }
 #endif
-#if !KVIP_FETCH_DENSE
+#if KVIP_FETCH_PACKETS
+    kvip_fetch_packets::PackScore(regOut, threshold, hits, maskAllB16);
+#elif !KVIP_FETCH_DENSE
     ClassifyRollingScore(regOut, threshold, hits, maskAllB16, rolling);
 #endif
 }
@@ -919,7 +922,10 @@ __simd_callee__ inline void ReduceSum2FinalizeClassify(AscendC::MicroAPI::RegTen
                          threshold + 128, mask1, advance);
     if (advance) MicroAPI::LocalMemBar<MicroAPI::MemType::VEC_STORE, MicroAPI::MemType::VEC_LOAD>();
 #endif
-#if !KVIP_FETCH_DENSE
+#if KVIP_FETCH_PACKETS
+    kvip_fetch_packets::PackScore(regOut[0], threshold, hits, maskAllB16);
+    kvip_fetch_packets::PackScore(regOut[1], threshold + 128, hits + 128, maskAllB16);
+#elif !KVIP_FETCH_DENSE
     ClassifyRollingScore(regOut[0], threshold, hits, maskAllB16, rolling);
     ClassifyRollingScore(regOut[1], threshold + 128, hits + 128, maskAllB16,
                          rolling ? rolling + kvip_rolling::kStateWords : nullptr);

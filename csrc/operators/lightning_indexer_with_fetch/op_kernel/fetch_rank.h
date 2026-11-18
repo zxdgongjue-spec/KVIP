@@ -116,6 +116,80 @@ __simd_callee__ inline void RankGather16(MicroAPI::RegTensor<uint32_t>& result,
     Select(result, high, word, upper); And(result, result, mask, all);
 }
 
+#if KVIP_FETCH_PACKETS
+// A packet has a count and sixteen compact score/offset pairs. Full tiles
+// are reread only on overflow. No candidate is lost to the fixed packet size.
+__simd_vf__ inline void PackFetchPackets(__ubuf__ uint16_t* packets,
+    __ubuf__ uint32_t* packed, __ubuf__ uint32_t* overflow,
+    uint16_t cutoff, uint16_t valid, uint16_t skipLo, uint16_t skipHi, uint16_t tiles) {
+    using namespace MicroAPI;
+    auto all = CreateMask<uint32_t, MaskPattern::ALL>();
+    RegTensor<uint32_t> flags,one,zero,lowMask,slotMask;
+    Duplicate(flags,uint32_t(0));Duplicate(one,uint32_t(1));Duplicate(zero,uint32_t(0));
+    Duplicate(lowMask,uint32_t(65535));Duplicate(slotMask,uint32_t(15));
+    UnalignRegForStore writer;ClearSpr<SpecialPurposeReg::AR>();
+    // Four packets per vector, including zero-count tiles. Every lane has
+    // useful work; no per-tile scalar branch, count read or vector launch.
+    for(uint16_t base=0;base<tiles*16;base+=64) {
+        RegTensor<int32_t> seq;Arange(seq,int32_t(base));
+        auto& lane=reinterpret_cast<RegTensor<uint32_t>&>(seq);
+        RegTensor<uint32_t> tile,slot,header,word,count,index,key,offset,value,bit;
+        ShiftRights(tile,lane,int16_t(4),all);And(slot,lane,slotMask,all);
+        Muls(header,tile,uint32_t(24),all);
+        Gather(word,reinterpret_cast<__ubuf__ uint32_t*>(packets),header,all);
+        And(count,word,lowMask,all);
+        Muls(index,tile,uint32_t(48),all);Add(index,index,slot,all);Adds(index,index,uint32_t(16),all);
+        RankGather16(key,packets,index);Adds(index,index,uint32_t(16),all);RankGather16(offset,packets,index);
+        RegTensor<uint32_t> tileBase;Muls(tileBase,tile,uint32_t(128),all);Add(offset,offset,tileBase,all);
+        MaskReg keep,capacity,causal,left,right,inside,first,tooMany;
+        CompareScalar<uint32_t,CMPMODE::LT>(inside,tile,uint32_t(tiles),all);
+        Compare<uint32_t,CMPMODE::LT>(keep,slot,count,all);MaskAnd(keep,keep,inside,all);
+        CompareScalar<uint32_t,CMPMODE::LE>(capacity,count,uint32_t(16),all);MaskAnd(keep,keep,capacity,all);
+        CompareScalar<uint32_t,CMPMODE::GT>(capacity,key,uint32_t(cutoff),all);MaskAnd(keep,keep,capacity,all);
+        CompareScalar<uint32_t,CMPMODE::LT>(causal,offset,uint32_t(valid),all);
+        CompareScalar<uint32_t,CMPMODE::LT>(left,offset,uint32_t(skipLo),all);
+        CompareScalar<uint32_t,CMPMODE::GE>(right,offset,uint32_t(skipHi),all);MaskOr(left,left,right,all);
+        MaskAnd(keep,keep,causal,all);MaskAnd(keep,keep,left,all);
+        ShiftLefts(value,offset,int16_t(16),all);Or(value,value,key,all);
+        Squeeze<uint32_t,MicroAPI::GatherMaskMode::STORE_REG>(value,value,keep);
+        StoreUnAlign<uint32_t,PostLiteral::POST_MODE_UPDATE>(packed,value,writer);
+        // Mark overflowing, unmasked tiles once, not once per candidate lane.
+        CompareScalar<uint32_t,CMPMODE::EQ>(first,slot,uint32_t(0),all);
+        CompareScalar<uint32_t,CMPMODE::GT>(tooMany,count,uint32_t(16),all);
+        MaskAnd(tooMany,tooMany,first,all);MaskAnd(tooMany,tooMany,inside,all);
+        CompareScalar<uint32_t,CMPMODE::LT>(causal,tileBase,uint32_t(valid),all);
+        CompareScalar<uint32_t,CMPMODE::LT>(left,tileBase,uint32_t(skipLo),all);
+        Adds(index,tileBase,uint32_t(128),all);
+        CompareScalar<uint32_t,CMPMODE::GT>(right,index,uint32_t(skipHi),all);MaskOr(left,left,right,all);
+        MaskAnd(tooMany,tooMany,causal,all);MaskAnd(tooMany,tooMany,left,all);
+        ShiftLeft(bit,one,reinterpret_cast<RegTensor<int32_t>&>(tile),all);
+        Select(bit,bit,zero,tooMany);Add(flags,flags,bit,all);
+    }
+    StoreUnAlignPost(packed,writer);
+    ReduceSum(flags,flags,all);
+    auto first=CreateMask<uint32_t,MaskPattern::VL1>();StoreAlign(overflow,flags,first);
+}
+__simd_vf__ inline void CollectFetchPackets(__ubuf__ uint32_t* packed,
+    __ubuf__ uint16_t* values, __ubuf__ uint16_t* offsets,
+    uint32_t pending, uint32_t count, uint32_t scanOffset) {
+    using namespace MicroAPI;
+    auto all=CreateMask<uint32_t,MaskPattern::ALL>();
+    RegTensor<uint32_t> zero,low;Duplicate(zero,uint32_t(0));Duplicate(low,uint32_t(65535));
+    for(uint16_t base=pending/64*64;base<pending+count;base+=64) {
+        RegTensor<int32_t> seq;Arange(seq,int32_t(base));
+        auto& lane=reinterpret_cast<RegTensor<uint32_t>&>(seq);
+        RegTensor<uint32_t> index,pair,key,offset;MaskReg lo,hi,write;
+        CompareScalar<uint32_t,CMPMODE::GE>(lo,lane,pending,all);
+        CompareScalar<uint32_t,CMPMODE::LT>(hi,lane,pending+count,all);MaskAnd(write,lo,hi,all);
+        Adds(index,lane,uint32_t(0)-pending,all);Select(index,index,zero,write);
+        Gather(pair,packed,index,all);And(key,pair,low,all);ShiftRights(offset,pair,int16_t(16),all);
+        Adds(offset,offset,scanOffset,all);
+        StoreAlign<uint16_t,StoreDist::DIST_PACK_B32>(values+base,reinterpret_cast<RegTensor<uint16_t>&>(key),write);
+        StoreAlign<uint16_t,StoreDist::DIST_PACK_B32>(offsets+base,reinterpret_cast<RegTensor<uint16_t>&>(offset),write);
+    }
+}
+#endif
+
 __simd_callee__ inline void RankPhysical(MicroAPI::RegTensor<uint32_t>& id,
     uint32_t reverseBegin, uint32_t reverseEnd) {
     using namespace MicroAPI;
@@ -369,7 +443,32 @@ __aicore__ inline uint32_t AdvanceFetchRank(__gm__ Context* ctx, LocalTensor<uin
             uint32_t valid=ClipRankOffset(queryEnd,p,n);
             if(valid && !(p>=lo && p+valid<=hi)) {
                 uint32_t tileMask = (1u << (n / 128)) - 1;
-#if KVIP_FETCH_BITMAP
+#if KVIP_FETCH_PACKETS
+                GlobalTensor<uint16_t> packets;
+                packets.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(ctx->fetchPackets)
+                    + uint64_t(q)*history/128*48);
+                DataCopy(raw,packets[scan/128*48],n/128*48);
+                SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+                PackFetchPackets(RankPtr(raw),RankPtr(a[2048]),RankPtr(a[9632]),kth,valid,
+                    ClipRankOffset(lo,p,n),ClipRankOffset(hi,p,n),n/128);
+                SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+                uint32_t packetCount=GetSpr<SpecialPurposeReg::AR>()/sizeof(uint32_t);
+                uint32_t overflow=a.GetValue(9632);
+                // An overflow tile can interleave with normal packets. Preserve
+                // exact encounter/tie order by falling back for this 2K block.
+                if(!overflow && pending+packetCount<=kTop) {
+                    if(packetCount)CollectFetchPackets(RankPtr(a[2048]),RankPtr(values),RankPtr(offsets),
+                        pending,packetCount,scan-start);
+                    pending+=packetCount;
+                    if constexpr(profile) {++blockCount;candidateCount+=packetCount;}
+                    SetFlag<HardEvent::V_MTE2>(kRankScratchReleased);
+                    WaitFlag<HardEvent::V_MTE2>(kRankScratchReleased);
+                    scan+=n;continue;
+                }
+                SetFlag<HardEvent::V_MTE2>(kRankScratchReleased);
+                WaitFlag<HardEvent::V_MTE2>(kRankScratchReleased);
+                DataCopy(raw,scores[p],n);
+#elif KVIP_FETCH_BITMAP
                 if (scan >= batchEnd) {
                     batchStart = scan - scan % 2048;
                     batchEnd = stop - batchStart > 16384 ? batchStart + 16384 : stop;
@@ -439,6 +538,9 @@ __aicore__ inline uint32_t AdvanceFetchRank(__gm__ Context* ctx, LocalTensor<uin
     }
     uint64_t storeBegin = 0;
     auto hdr=a[9792]; hdr.SetValue(0,kth);hdr.SetValue(1,strict);
+#if KVIP_FETCH_PACKETS
+    hdr.SetValue(2,epoch+1); // Diagnostic validity; not read by the production path.
+#endif
     if constexpr (profile) {
         auto times = hdr.ReinterpretCast<uint64_t>();
         uint64_t done = GetSystemCycle();
@@ -554,4 +656,37 @@ __aicore__ inline uint32_t ServiceFetchRank(__gm__ Context* ctx, LocalTensor<uin
     }
     return count;
 }
+#if KVIP_FETCH_PACKETS
+template<bool profile=false>
+__aicore__ inline uint32_t ServiceFetchDemand(__gm__ Context* ctx,LocalTensor<uint32_t> scratch,
+    LocalTensor<uint32_t> cfg,LocalTensor<uint32_t> selectedIds,GM_ADDR scores,__gm__ uint32_t* map,
+    uint32_t b,uint32_t history,uint32_t resident,uint32_t rounds,LocalTensor<uint32_t> state,
+    uint32_t target,const uint32_t* ends,kvip_cold_scan::Range order,uint32_t allowance,
+    uint32_t slots,uint32_t& missing,bool frozenMap=false) {
+    uint32_t count=0;
+    // Q4 reservation order is unchanged. Queries which cannot post do not
+    // update ranks; their producer packets remain available for a later turn.
+    for(uint32_t q=0;q<4 && count<allowance && target;++q) {
+        uint32_t previous=state.GetValue(12+q),strict=0;
+        if(previous<target) {
+            for(uint32_t v=previous;v<target;++v)
+                strict=AdvanceFetchRank<profile>(ctx,scratch,scores,b*4+q,history,resident,
+                                                 rounds,v,ends[q],order,frozenMap);
+            state.SetValue(12+q,target);
+        } else {
+            GlobalTensor<uint32_t> bank;
+            bank.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->fetchRanks)
+                + uint64_t((b*4+q)*rounds+target-1)*(kRankWords+kRankHeader));
+            DataCopy(scratch,bank[kRankHeader],kTop);DataCopy(scratch[4096],bank,kRankHeader);
+            SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            strict=scratch.GetValue(4097);
+        }
+        uint64_t begin=0;if constexpr(profile)begin=GetSystemCycle();
+        count+=AdmitLocalRank(ctx,scratch,cfg,selectedIds[count],map,b,resident,strict,
+                             allowance-count,slots+count,missing,frozenMap);
+        if constexpr(profile)RankTimer(ctx,b*4+q,rounds,target-1,6,GetSystemCycle()-begin);
+    }
+    return count;
+}
+#endif
 #endif

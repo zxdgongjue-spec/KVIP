@@ -655,6 +655,72 @@ inline void ReserveIncremental(__ubuf__ uint32_t* ids,__gm__ uint32_t* map,
 #include "fetch_rank.h"
 // Same indexed-load pattern as v9 GatherCandidateMap; cold IDs pass through.
 
+#if KVIP_FETCH_PACKETS
+template<bool captureIo>
+__aicore__ inline void FlushFetchBatch(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,
+    uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,
+    __gm__ Context* ctx,uint32_t epoch,uint32_t lane,LocalTensor<uint32_t> cfg,
+    LocalTensor<uint32_t> work,LocalTensor<uint32_t> scratch,
+    uint64_t& firstDoorbell,uint64_t& secondDoorbell,uint64_t& lastDoorbell) {
+        uint32_t maxCount=0;
+        for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
+            uint32_t n=cfg.GetValue(256+(b/rt_serviceLanes)*80+64);if(n>maxCount)maxCount=n;
+        }
+        for(uint32_t start=0;start<maxCount;start+=rt_postBank) {
+            Simt::VF_CALL<BatchBuild<V9_BATCH_POST==1,captureIo>>(Simt::Dim3{512,1,1},rt_batch,rt_history,rt_resident,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,ctx,epoch,lane,start,
+                reinterpret_cast<__ubuf__ uint64_t*>(work[512].GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(cfg[256].GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()));
+            SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
+                uint32_t g=b/rt_serviceLanes;auto input=cfg[256+g*80];auto in64=input.ReinterpretCast<uint64_t>();
+                uint32_t count=input.GetValue(64);if(count<=start)continue;
+                uint32_t n=count-start;if(n>rt_postBank)n=rt_postBank;
+                uint32_t depth=input.GetValue(19),offset=uint32_t(in64.GetValue(25)+start)&(depth-1);
+                uint32_t first=n<depth-offset?n:depth-offset;
+#if V9_BATCH_POST == 2
+                FinalBuild(rt_tokenBytes,reinterpret_cast<__ubuf__ uint32_t*>(work[512+g*rt_postBank].GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ uint32_t*>(work[1024+g*rt_postBank].GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ uint32_t*>(work[1536+g*rt_postBank].GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ uint32_t*>(scratch[g*rt_postBank*16].GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ uint32_t*>(work[g*32].GetPhyAddr()),0,n,count-start);
+                SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+#endif
+                GlobalTensor<uint32_t> sq;sq.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(in64.GetValue(7)));
+                DataCopy(sq[offset*16],scratch[g*rt_postBank*16],first*16);
+                if(first<n)DataCopy(sq,scratch[(g*rt_postBank+first)*16],(n-first)*16);
+            }
+            SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+        }
+        for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
+            auto input=cfg[256+(b/rt_serviceLanes)*80];auto in64=input.ReinterpretCast<uint64_t>();
+            uint32_t count=input.GetValue(64);if(!count)continue;
+            in64.SetValue(25,in64.GetValue(25)+count);
+            GlobalTensor<uint32_t> queue;queue.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(in64.GetValue(36)));
+            SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+            DataCopy(queue,input[48],16);
+        }
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
+            auto input=cfg[256+(b/rt_serviceLanes)*80];if(!input.GetValue(64))continue;
+            auto in64=input.ReinterpretCast<uint64_t>();uint64_t db=in64.GetValue(8),head=in64.GetValue(25);
+#if V9_SIMULATION
+            *reinterpret_cast<__gm__ uint64_t*>(db)=head;
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(db),64);
+#else
+            st_dev(uint32_t(head),reinterpret_cast<__gm__ uint32_t*>(db),0);
+#endif
+            if constexpr(captureIo) {
+                lastDoorbell=GetSystemCycle();
+                if(!firstDoorbell)firstDoorbell=lastDoorbell;
+                else if(!secondDoorbell)secondDoorbell=lastDoorbell;
+            }
+        }
+}
+
+#endif
 template<bool captureIo>
 __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer,uint32_t epoch,uint32_t core,uint32_t lane,
     LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids,
@@ -728,6 +794,12 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
             SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
         }
     }
+#if KVIP_FETCH_PACKETS
+    // Immediate posts may run before later rows have been visited. Explicitly
+    // clear their BatchBuild counts so they cannot consume stale UB contents.
+    for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes)
+        cfg.SetValue(256+(b/rt_serviceLanes)*80+64,0);
+#endif
     for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
         // Transfer state as a block. Avoid scalar GM read/modify/write and
         // repeated cache maintenance for every counter/cache line.
@@ -791,7 +863,11 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
 #if KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
         // consumed[0] is the count of committed rank versions for this row.
         uint32_t versions=state.GetValue(12);
+#if KVIP_FETCH_PACKETS
+        uint32_t target=0; // Per-query consumed cursors are independent.
+#else
         uint32_t target=versions;
+#endif
         for(;target<=epoch;++target) {
             uint32_t bound=Trigger(rt_history,rt_resident,rt_rounds,target)*128;
             bool complete=true;
@@ -803,9 +879,14 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         }
         uint32_t allowance=PrefetchAllowance(slots,requests,state.GetValue(208),state.GetValue(209),
                                              state.GetValue(210),ctx->windowLimit);
+#if KVIP_FETCH_PACKETS
+        count=ServiceFetchDemand<captureIo>(ctx,scratch,cfg,selectedIds,rollingScores,map,b,rt_history,rt_resident,
+                               rt_rounds,state,target,ends,range,allowance,slots,missing);
+#else
         count=ServiceFetchRank<captureIo>(ctx,scratch,cfg,selectedIds,rollingScores,map,b,rt_history,rt_resident,
                                rt_rounds,versions,target,ends,range,allowance,slots,missing,false);
         state.SetValue(12,target);
+#endif
         // The ordinary row flush already transfers this history. Actual posted
         // IDs are recorded in BatchBuild, just as for the forward/reverse controls.
         if constexpr (captureIo) state.SetValue(80+epoch*4, target);
@@ -984,6 +1065,19 @@ if (rt_batchedRows) {
                 SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
                 DataCopy(jobs,selectedIds,((count+7)/8)*8);
                 SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+#if KVIP_FETCH_PACKETS
+                // Publish this request now. A different request's rank work is
+                // not a dependency of these WQEs. Preserve in-request batching.
+                FlushFetchBatch<captureIo>(rt_batch,rt_history,rt_resident,rt_serviceLanes,rt_tokenBytes,
+                    rt_postThreads,rt_postBank,ctx,epoch,lane,cfg,work,scratch,
+                    firstDoorbell,secondDoorbell,lastDoorbell);
+                // BatchBuild normally updates pending AFTER the row flush.
+                // Immediate posting moves it before that flush, so retain the
+                // increment in the UB row as well instead of overwriting it.
+                if(postInput.GetValue(64))++pending;
+                else state.SetValue(11,kvaf_device::kInvalidArgs);
+                postInput.SetValue(64,0);
+#endif
                 slots+=count;requests+=count;
 } else {
                 {
@@ -1020,6 +1114,7 @@ if (rt_batchedRows) {
             SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
         }
     }
+#if !KVIP_FETCH_PACKETS
 if (rt_batchedRows) {
     if(postedCount) {
         V9_FETCH_PROFILE(begin=GetSystemCycle();)
@@ -1082,6 +1177,7 @@ if (rt_batchedRows) {
         V9_FETCH_PROFILE(postTicks+=GetSystemCycle()-begin;)
     }
 }
+#endif
     V9_FETCH_PROFILE(event->scanTicks=scanTicks;event->candidateTicks=candidateTicks;event->postTicks=postTicks;)
     V9_FETCH_PROFILE(event->bitmapBytes=bitmapBytes;event->candidateCount=totalCandidates;event->postedCount=postedCount;)
     if(captureIo){auto stamp=reinterpret_cast<__gm__ uint64_t*>(event->pad);stamp[0]=firstDoorbell;stamp[1]=lastDoorbell;stamp[4]=secondDoorbell;}

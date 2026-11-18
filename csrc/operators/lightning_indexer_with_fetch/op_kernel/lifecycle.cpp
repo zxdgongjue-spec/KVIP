@@ -6,6 +6,7 @@
 
 #include <stdint.h>
 #include "prefetch.h"
+#include "fetch_packets.h"
 using namespace AscendC;
 using namespace rotating;
 __aicore__ inline __gm__ Context* GetContext(GM_ADDR bindings) {
@@ -201,7 +202,51 @@ extern "C" __global__ __aicore__ void kvip_transport_snapshot_kernel(
 
 // Untimed deterministic validation uses completed device scores and the same rank/admission
 // code as FastService. It never opens a transport queue or changes the serving cache.
-extern "C" __global__ __aicore__ void v9_fetch_fixture_kernel(GM_ADDR bindings, GM_ADDR frozenMap) {
+#if KVIP_FETCH_PACKETS
+__simd_vf__ inline void FixturePackScore(__ubuf__ uint16_t* input,__ubuf__ uint16_t* limit,
+                                        __ubuf__ uint16_t* packet) {
+    MicroAPI::RegTensor<uint16_t> score;MicroAPI::LoadAlign(score,input);
+    auto all=MicroAPI::CreateMask<uint16_t,MicroAPI::MaskPattern::ALL>();
+    kvip_fetch_packets::PackScore(score,limit,packet,all);
+}
+#endif
+// Functional producer fixture; actual LI invokes the same register routine.
+extern "C" __global__ __aicore__ void v9_fetch_packet_fixture_kernel(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__) && KVIP_FETCH_PACKETS
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV {
+        auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
+        auto ctx=reinterpret_cast<__gm__ Context*>(a[14]);uint32_t b=GetBlockIdx();
+        if(b>=ctx->shape.batch)return;
+        const uint32_t h=ctx->shape.history,r=ctx->shape.resident;
+        uint32_t ends[4];for(uint32_t q=0;q<4;++q)ends[q]=reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)[b*4+q];
+        auto order=kvip_cold_scan::Bounds(r,h,ends);
+        TPipe pipe;TBuf<TPosition::VECCALC> buf;pipe.InitBuffer(buf,1024);
+        auto raw=buf.Get<uint16_t>(),packet=raw[128],limit=raw[192];
+        auto prefix=reinterpret_cast<__gm__ uint8_t*>(ctx->hits)-ctx->shape.batch*(4*kTop*6+1024);
+        for(uint32_t q=0;q<4;++q) {
+            GlobalTensor<uint16_t> seed,scores,output;
+            seed.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(prefix+b*(4*kTop*6+1024))+q*kTop);
+            scores.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(a[12])+uint64_t(b*4+q)*h);
+            output.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(ctx->fetchPackets)+uint64_t(b*4+q)*h/128*48);
+            DataCopy(limit,seed[kTop-16],16);
+            SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            limit.SetValue(0,limit.GetValue(15));
+            SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
+            for(uint32_t scan=r;scan<h;scan+=128) {
+                DataCopy(raw,scores[kvip_cold_scan::Remap(scan,order)],128);
+                SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+                FixturePackScore(RankPtr(raw),RankPtr(limit),RankPtr(packet));
+                SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+                DataCopy(output[scan/128*48],packet,48);
+                PipeBarrier<PIPE_ALL>();
+            }
+        }
+    }
+#endif
+}
+
+extern "C" __global__ __aicore__ void v9_fetch_fixture_kernel(GM_ADDR bindings, GM_ADDR frozenMap, uint32_t lazy) {
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
 #if KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
@@ -220,9 +265,18 @@ extern "C" __global__ __aicore__ void v9_fetch_fixture_kernel(GM_ADDR bindings, 
         auto scratch=storage.Get<uint32_t>(),cfg=scratch[10240],sent=scratch[10496];
         auto map=reinterpret_cast<__gm__ uint32_t*>(frozenMap)+uint64_t(b)*h;
         uint32_t total=0;
+#if KVIP_FETCH_PACKETS
+        auto state=cfg[128];for(uint32_t q=0;q<4;++q)state.SetValue(12+q,0);
+#endif
         for(uint32_t e=0;e<9;++e) {
             uint32_t missing=0, budget=512-total<64?512-total:64;
-            uint32_t count=ServiceFetchRank(ctx,scratch,cfg,sent,reinterpret_cast<GM_ADDR>(a[12]),map,
+            uint32_t count;
+#if KVIP_FETCH_PACKETS
+            if(lazy)count=ServiceFetchDemand(ctx,scratch,cfg,sent,reinterpret_cast<GM_ADDR>(a[12]),map,
+                b,h,r,9,state,e+1,ends,order,budget,total,missing,true);
+            else
+#endif
+            count=ServiceFetchRank(ctx,scratch,cfg,sent,reinterpret_cast<GM_ADDR>(a[12]),map,
                 b,h,r,9,e,e+1,ends,order,budget,total,missing,true);
             GlobalTensor<uint32_t> audit;
             audit.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->fetchAudit)+(b*9+e)*96);

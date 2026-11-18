@@ -1116,7 +1116,21 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
                        outBase, classifyUB_[pingpong * 256]);
     }
 #endif
-#if SIM_CAPTURE_HITS && !KVIP_INCREMENTAL_TOPK && !KVIP_FETCH_DENSE
+#if KVIP_FETCH_PACKETS
+    if (!scoreOnly && curS2Idx >= runtimeShape_.resident) {
+        auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+        GlobalTensor<uint8_t> packets;
+        packets.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(ctx->fetchPackets));
+        DataCopyExtParams copy;
+        copy.blockCount = curAivS1ProcNum;
+        copy.blockLen = 96;
+        copy.srcStride = 5; // 256-byte classifyUB query stride.
+        copy.dstStride = runtimeShape_.history / 128 * 96 - 96;
+        DataCopyPad(packets[((info.bIdx * SIM_Q + curAivS1Idx) *
+                    (runtimeShape_.history / 128) + info.s2Idx) * 96],
+                    classifyUB_[pingpong * 256].template ReinterpretCast<uint8_t>(), copy);
+    }
+#elif SIM_CAPTURE_HITS && !KVIP_INCREMENTAL_TOPK && !KVIP_FETCH_DENSE
     if (!scoreOnly && curS2Idx >= runtimeShape_.resident) {
         constexpr uint32_t prefixBytes = SIM_Q * 2048 * 6 + SIM_Q * 256;
         GlobalTensor<uint8_t> outputHits;
