@@ -90,14 +90,19 @@ def li_kernel_breakdown(capture):
 def bench_li(root):
     profiles = [p for p in root.rglob('graph_profile.json')
                 if 'bench' in p.parts and 'fused' in p.parts]
+    explicit_run = (root / 'cases' / 'bench').is_dir() or root.name == 'bench'
+    if not profiles:
+        raise SystemExit(f'No fused bench graph_profile.json found under {root.resolve()}')
     for fused in sorted(profiles, key=lambda p: p.stat().st_mtime_ns, reverse=True):
         case = next(d for d in fused.parents if d.name == 'bench')
-        config_file = case / 'config.json'
-        if not config_file.is_file():
-            continue
-        config = json.loads(config_file.read_text())
-        if (config.get('input'), config.get('group'), config.get('transport')) != ('real', 2, 'urma'):
-            continue
+        if not explicit_run:
+            config_file = next((d / 'config.json' for d in (case, case.parent.parent)
+                                if (d / 'config.json').is_file()), None)
+            if config_file is None:
+                continue
+            config = json.loads(config_file.read_text())
+            if (config.get('input'), str(config.get('group')), config.get('transport')) != ('real', '2', 'urma'):
+                continue
         relative = fused.relative_to(case)
         parts = list(relative.parts)
         parts[parts.index('fused')] = 'serial'
