@@ -24,6 +24,10 @@ case "$study" in
         branch=perf/urma-seed-mask
         native_sha=a0956cad1327112ace20f3897431aaa797534f6c
         ;;
+    parallel)
+        branch=perf/urma-seed-parallel
+        native_sha=501ad79ea5e5578990f13fd095d2ce5bd97ef167
+        ;;
     segments) ;;
     *) echo "Unknown study $study" >&2; exit 2 ;;
 esac
@@ -92,7 +96,7 @@ fi
 run_case() {
     local group=$1 phase=$2 warm=5 iterations=10 diagnostic=0 args=() selected=("${variants[@]}")
     local base="$result/g${group}-$phase"
-    if [[ "$study" == seed ]]; then
+    if [[ "$study" == seed || "$study" == parallel ]]; then
         selected=(forward reverse reverse-consumed reverse-seed-mask reverse-seed-mask-end
             reverse-consumed-end reverse-end forward-end)
         if [[ "$group" == 4 ]]; then
@@ -100,6 +104,16 @@ run_case() {
                 reverse-seed-mask-end reverse-consumed-end reverse-cap128-end reverse-end forward-end)
         fi
         profile_variants=(reverse reverse-consumed reverse-seed-mask)
+        if [[ "$study" == parallel ]]; then
+            local ordered=() name
+            for name in "${selected[@]}"; do
+                if [[ "$name" == reverse-seed-mask ]]; then ordered+=(reverse-seed-parallel); fi
+                ordered+=("$name")
+                if [[ "$name" == reverse-seed-mask-end ]]; then ordered+=(reverse-seed-parallel-end); fi
+            done
+            selected=("${ordered[@]}")
+            profile_variants+=(reverse-seed-parallel)
+        fi
     fi
     if [[ "$phase" == kernels ]]; then
         selected=("${profile_variants[@]}")
@@ -107,8 +121,9 @@ run_case() {
         warm=2; iterations=1
     elif [[ "$phase" == markers ]]; then
         selected=(reverse-probe reverse-inc-register-probe reverse-inc-segments-probe reverse-consumed-probe)
-        if [[ "$study" == seed ]]; then
+        if [[ "$study" == seed || "$study" == parallel ]]; then
             selected=(reverse-probe reverse-consumed-probe reverse-seed-mask-probe)
+            if [[ "$study" == parallel ]]; then selected+=(reverse-seed-parallel-probe); fi
         fi
         warm=1; iterations=1; diagnostic=1
     fi
@@ -126,7 +141,7 @@ run_case() {
                 awk '/^BUILD_DIAGNOSTIC_BEGIN/{block=1} block || /^REPLAY_FAILED|^FAILURE_JSON|^FAILURE_LOG|^RUN_LOG/{print} /^BUILD_DIAGNOSTIC_END/{block=0}' >&2
             return "$rc"
         }
-    if [[ "$study" == budget || "$study" == seed ]]; then
+    if [[ "$study" == budget || "$study" == seed || "$study" == parallel ]]; then
         python3 -B "$reader/tests/diagnostics/window_budget_report.py" "$base.json" "$phase" \
             "$native_sha" "$inputs/g${group}-input/manifest.json" | tee "$base.txt"
     elif [[ "$phase" == graph ]]; then
@@ -142,12 +157,15 @@ for group in 7 2; do run_case "$group" kernels; done
 if [[ "$study" == budget ]]; then
     python3 -B "$reader/tests/diagnostics/window_budget_report.py" --combined "$result"
     for group in 7 2; do run_case "$group" markers; done
-elif [[ "$study" == seed ]]; then
+elif [[ "$study" == seed || "$study" == parallel ]]; then
     overall=PASS
+    label=SEED_GATE
+    candidate=reverse-seed-mask
+    if [[ "$study" == parallel ]]; then label=PARALLEL_GATE; candidate=reverse-seed-parallel; fi
     for group in 7 2 10 17 4; do
-        grep -q '^SEED_GATE PASS ' "$result/g$group-graph.txt" || overall=KEEP_BASELINES
+        grep -q "^$label PASS " "$result/g$group-graph.txt" || overall=KEEP_BASELINES
     done
-    echo "FIVE_GROUP_GATE reverse-seed-mask $overall"
+    echo "FIVE_GROUP_GATE $candidate $overall"
     for group in 7 2; do run_case "$group" markers; done
 fi
 (cd "$result"; tar -czf results.tar.gz g*.json g*.txt)

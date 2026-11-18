@@ -58,12 +58,13 @@ def report(path, phase, revision, manifest):
         baseline = None
         for name in data["execution_order"]:
             entry, = [p for p in cases[name]["system_profiles"]["passes"] if p["metric"] == "none"]
-            t = {k: entry["timeline"][k]["span_us"] for k in ("device", "li", "streaming")}
+            t = {k: entry["timeline"][k]["span_us"] for k in ("device", "init", "li", "streaming")}
             if baseline is None:
                 baseline = t
             print(f"KERNEL {name} LI={t['li']:.3f} extra={t['li']-baseline['li']:+.3f} "
                   f"stream={t['streaming']:.3f} saved={baseline['streaming']-t['streaming']:+.3f} "
-                  f"init={entry['timeline']['init']['span_us']:.3f} span={t['device']:.3f} us")
+                  f"init={t['init']:.3f} init_plus_LI_extra={t['li']+t['init']-baseline['li']-baseline['init']:+.3f} "
+                  f"span={t['device']:.3f} us")
         return
     if phase == "markers":
         for name in data["execution_order"]:
@@ -76,14 +77,17 @@ def report(path, phase, revision, manifest):
                   f"post9={w['post_max_by_epoch']} service9={w['service_max_by_epoch']} "
                   f"inspected={sum(w['inspected_by_epoch'])}")
         return
-    if "reverse-seed-mask" in cases:
-        repeat = "reverse-seed-mask"
+    for repeat, label in (("reverse-seed-mask", "SEED_GATE"), ("reverse-seed-parallel", "PARALLEL_GATE")):
+        if repeat not in cases:
+            continue
         marg = []
         # Slower of the two candidate runs against faster controls per metric;
         # require residual gain above the larger observed repeat drift.
         _, candidate_drift = control(cases, repeat)
         comparisons = []
         references = CONTROLS + ("reverse-consumed",)
+        if repeat == "reverse-seed-parallel":
+            references += ("reverse-seed-mask",)
         if "reverse-cap128-end" in cases:
             references += ("reverse-cap128",)
         for base in references:
@@ -93,7 +97,7 @@ def report(path, phase, revision, manifest):
                 marg.append(100 * (1 - slow / best[k]) - max(abs(drift[k]), abs(candidate_drift[k])))
             comparisons.append(f"{base}={marg[-2]:+.2f}/{marg[-1]:+.2f}")
         gate = "PASS" if min(marg) > 0 else "KEEP_BASELINES"
-        print(f"SEED_GATE {gate} net_mean/P50_pp={' '.join(comparisons)}")
+        print(f"{label} {gate} net_mean/P50_pp={' '.join(comparisons)}")
     for base in CONTROLS:
         best, drift = control(cases, base)
         print(f"CONTROL {base} mean/p50={best['mean_us']:.3f}/{best['p50_us']:.3f} us "

@@ -1,7 +1,7 @@
 """Independent URMA scan-order/admission experiment; no graph-route changes."""
 
 OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill", "compact_out_of_place", "rolling_reuse_seed", "rolling_fast_path", "rolling_sparse", "rolling_boundary", "incremental_topk", "incremental_window", "incremental_register", "incremental_prefilter", "incremental_direct", "incremental_ties", "incremental_light", "incremental_inplace", "incremental_progress", "incremental_segments")
-EXPERIMENT_OPTIONS = ("consumed_prefix", "window_probe", "seed_mask")
+EXPERIMENT_OPTIONS = ("consumed_prefix", "window_probe", "seed_mask", "seed_parallel")
 DEFAULT_VARIANTS = ("forward", "reverse", "forward-wide", "reverse-wide", "forward-end")
 VARIANTS = {name: ("reverse_cold",) if name.startswith("reverse") else () for name in DEFAULT_VARIANTS}
 ROLLING_VARIANTS = ("forward", "reverse", "reverse-roll", "reverse-refilter", "forward-refilter", "forward-end")
@@ -153,7 +153,9 @@ for _base in ("reverse", "reverse-inc-register", "reverse-inc-segments", "revers
 
 VARIANTS["reverse-seed-mask"] = VARIANTS["reverse-consumed"] + ("seed_mask",)
 VARIANTS["reverse-seed-mask-probe"] = VARIANTS["reverse-seed-mask"] + ("window_probe",)
-for _base in ("reverse-consumed", "reverse-seed-mask", "reverse-cap128"):
+VARIANTS["reverse-seed-parallel"] = VARIANTS["reverse-seed-mask"] + ("seed_parallel",)
+VARIANTS["reverse-seed-parallel-probe"] = VARIANTS["reverse-seed-parallel"] + ("window_probe",)
+for _base in ("reverse-consumed", "reverse-seed-mask", "reverse-seed-parallel", "reverse-cap128"):
     VARIANTS[_base + "-end"] = VARIANTS[_base]
 
 
@@ -182,6 +184,8 @@ def validate_options(options):
         raise ValueError("Scan experiment options do not match the selected native interface")
     if any(type(value) is not bool for value in options.values()):
         raise ValueError("Scan build options must be bool")
+    if options.get("seed_parallel") and not options.get("seed_mask"):
+        raise ValueError("Parallel seed preparation requires the seed mask")
     if options.get("seed_mask") and not options["incremental_segments"]:
         raise ValueError("Seed mask requires segment lists")
     if options.get("consumed_prefix") and not options["incremental_segments"]:
