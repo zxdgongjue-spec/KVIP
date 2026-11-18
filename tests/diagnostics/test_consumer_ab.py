@@ -99,6 +99,7 @@ def test_high_overlap_arms_reuse_public_completion_records(tmp_path, capsys, for
                     index_completion_spread=500, last_index_minus_last_final_wait=-1000,
                     nonempty_lanes=1, final_api_calls=1, blocking_final_lanes=0,
                     validation_by_role_p50=[300, 500, 350, 10], validation_spread_max=490,
+                    row_retire_to_exit_p50=30, row_retire_to_exit_max=60,
                     lane_index_p50=220, max_moves_per_lane=100, moved_total=1000, max_row_moves=256,
                     format=formats[int(arm=="after")])))
         else:
@@ -131,6 +132,7 @@ def test_row_timeline_handles_split_submissions_and_excludes_idle_final_lanes():
     rows[0:2, 7] = [326, 280]
     rows[:, 9] = 9999
     rows[0:2, 9] = [341, 300]
+    marks[:16, 1] = 9999 + np.arange(16) + 100
     marks[:, 2] = 0x52514931
     marks[:, 3] = 160
     marks[0:2, 4] = [320, 270]
@@ -142,7 +144,12 @@ def test_row_timeline_handles_split_submissions_and_excludes_idle_final_lanes():
                           last_final_wait_return=241, longest_lane_index=130, index_completion_spread=40,
                           last_index_minus_last_final_wait=-51, blocking_final_lanes=0,
                           validation_by_role_p50=[55,50,45,30], validation_spread_max=25, lane_index_p50=90,
+                          row_retire_to_exit_p50=107.5, row_retire_to_exit_max=115,
                           max_moves_per_lane=0, max_row_moves=0, moved_total=0)
+    marks[7, 1] = 9998
+    with pytest.raises(ValueError, match="owner exit"):
+        decode_high_index(rows, marks, wait_first=False, final_get=10, work={}, schedule_timing=True)
+    marks[7, 1] = 10106
     marks[1, 8] = 0
     with pytest.raises(ValueError, match="nonempty"):
         decode_high_index(rows, marks, wait_first=False, final_get=10, work={}, schedule_timing=True)

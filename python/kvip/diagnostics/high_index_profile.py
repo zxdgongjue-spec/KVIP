@@ -314,6 +314,16 @@ def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan
         schedule["validation_by_role_p50"] = np.median(ready-entry, axis=1).tolist()
         schedule["validation_spread_max"] = int(spans.max())
         schedule["lane_index_p50"] = float(np.median(rows[:, 8]-marks[:, 3]))
+        # Every lane timestamps RetirePair return, including a lane with no Get.
+        # q0 exits only after joining the four Done flags and publishing the row.
+        retired = rows[:, 9].reshape(4, 16)
+        last_retired = retired.max(axis=0)
+        owner_exit = marks[:16, 1]
+        if np.any(retired.ravel() < rows[:, 8]) or np.any(owner_exit < last_retired):
+            raise ValueError("Invalid row retirement or owner exit timestamp")
+        tail = owner_exit - last_retired
+        schedule["row_retire_to_exit_p50"] = float(np.median(tail))
+        schedule["row_retire_to_exit_max"] = int(tail.max())
         moved = marks[:, 10].reshape(4, 16)
         schedule["max_moves_per_lane"] = int(moved.max())
         schedule["max_row_moves"] = int(moved.sum(axis=0).max())

@@ -187,6 +187,7 @@ def summarize(group, cases, baseline, candidate, high_overlap=False, schedule_fo
                 print(f"G{group} LOAD {arm} role0/1/2/3_to_valid_p50_us={roles}"
                       f" max_row_valid_spread_us={metrics['validation_spread_max']/rate:.2f}"
                       f" lane_Index_us_p50/max={metrics['lane_index_p50']/rate:.2f}/{metrics['longest_lane_index']/rate:.2f}"
+                      f" last_retire_to_row_exit_us_p50/max={metrics['row_retire_to_exit_p50']/rate:.2f}/{metrics['row_retire_to_exit_max']/rate:.2f}"
                       f" moves_total/max_row/max_lane={metrics['moved_total']}/{metrics['max_row_moves']}/{metrics['max_moves_per_lane']}"
                       f" rows_single_owner/gather={high['single_owner_rows']}/{high['row_gathers']}")
         print(f"G{group} CHECK real_Index_order/TopK/KV/lifecycle/submitted_completed=PASS", flush=True)
