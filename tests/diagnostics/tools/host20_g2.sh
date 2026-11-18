@@ -8,6 +8,7 @@ profile=0
 candidate=
 high_index=0
 joint=0
+account=0
 if [[ $# == 4 && $1 == --parity && $4 == --high-post-index ]]; then
     joint=1
     set -- "$1" "$2" "$3"
@@ -16,6 +17,10 @@ if [[ ($# == 2 || $# == 3) && $1 == --parity && $2 =~ ^[0-9a-f]{40}$ ]]; then
     labels=(serial before after after-end before-end serial-end before-profile after-profile)
     candidate=$2
     [[ $# == 2 || $3 =~ ^[0-9a-f]{40}$ ]] || die "Expected a full control SHA"
+elif [[ $# == 2 && $1 == --account && $2 =~ ^[0-9a-f]{40}$ ]]; then
+    account=1
+    labels=(serial before after after-end before-end serial-end)
+    candidate=$2
 elif [[ $# == 1 && $1 == --parity ]]; then
     labels=(serial before after after-end before-end serial-end)
 elif [[ $# == 1 && $1 == --kernels ]]; then
@@ -25,7 +30,7 @@ elif [[ $# == 2 && $1 == --high-index && $2 =~ ^[0-9a-f]{40}$ ]]; then
     high_index=1
     candidate=$2
 elif [[ $# != 0 ]]; then
-    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--kernels|--high-index CANDIDATE_SHA]"
+    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA|--kernels|--high-index CANDIDATE_SHA]"
 fi
 
 diag=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
@@ -40,6 +45,7 @@ before=96198a2bfc9ba2e983c090225b9acdfdf40c6099
 after=0f103cc1b6db1beacfb90023d02befc5eff8ae9e
 if [[ -n $candidate ]]; then
     before=${3:-$after}
+    if ((account)); then before=66a2f469ebaec3b35fff789a75177ee19b00213e; fi
     after=$candidate
     [[ $after != "$before" ]] && git -C "$repo" merge-base --is-ancestor "$before" "$after" ||
         die "Candidate must be a distinct descendant of $before"
@@ -142,14 +148,22 @@ for label in "${labels[@]}"; do
         fi
     fi
     role=${label%-profile}
-    if ((capture)); then
+    output="$out/g2-$label.json"
+    if ((account)); then
+        round=1
+        if [[ $label == *-end ]]; then round=2; fi
+        role=${label%-end}
+        stem="r$round-$role"
+        output="$out/$stem.json"
+        extra=(--diagnostic-replays 0 --profile-graph-event --profile-dir "$out/profile-$stem" --profile-metrics none)
+    elif ((capture)); then
         extra+=(--profile-dir "$out/$role-profile" --profile-metrics none)
     fi
     log="$out/.$label.log"
     if python3 -B -m kvip.diagnostics.replay "${common[@]}" --iterations "$iterations" "${args[@]}" "${extra[@]}" \
-        --upstream-root "$root" --upstream-revision "$rev" --output "$out/g2-$label.json" >"$log" 2>&1; then
+        --upstream-root "$root" --upstream-revision "$rev" --output "$output" >"$log" 2>&1; then
         if [[ $label == before || $label == after ]]; then
-            python3 -B - "$out/g2-$label.json" "$label" "$rev" "$joint" <<'PY'
+            python3 -B - "$output" "$label" "$rev" "$joint" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -188,9 +202,13 @@ PY
         tail -n 12 "$log" >&2
         exit "$rc"
     fi
-    if [[ $label == serial-end ]]; then
+    if [[ $label == serial-end ]] && (( !account )); then
         python3 -B -m kvip.diagnostics.post_index_plan_report --directory "$out" --group 2 |
             awk '/^RESULT_BEGIN|ALL_mean\/p50=|^GAIN |^DRIFT |^CLOCK |^CHECK |^OBSERVED |^RESULT_END/ ||
                  (/^(INIT_LI|PHASE_END|INDEX_CQ|FINALIZE) / && /sample=1 /)'
     fi
 done
+
+if ((account)); then
+    python3 -B -m kvip.diagnostics.graph_accounting --directory "$out"
+fi
