@@ -30,6 +30,9 @@
 #include "indexer_types.h"
 #include "indexer_score.h"
 #include "topk.h"
+#ifdef LI_PRODUCER_CONTROLS
+#include "producer_device.h"
+#endif
 
 namespace QLIKernel {
 using namespace QLICommon;
@@ -39,6 +42,11 @@ template <typename QLIT>
 class QLIVector {
 public:
     bool scoreOnly_ = false;
+#ifdef LI_PRODUCER_CONTROLS
+    li_producer::DeviceState producer_;
+    __aicore__ inline void SetProducerOutput(GM_ADDR binding,TPipe* pipe) { producer_.Init(binding,pipe,blockId_); }
+    __aicore__ inline void FinishProducer() { producer_.Finish(); }
+#endif
     // Private output sidecar: all virtual input geometry remains untouched.
     bool stagedDirect_ = false;
     kvip_staged::ScoreTask stagedTask_{};
@@ -663,6 +671,11 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     copyOutParams.blockLen = s2BaseSize_ * sizeof(SCORE_T);
     copyOutParams.srcStride = (UB_BANK_DEPTH_STRIDE - copyOutParams.blockLen) / 32;
     copyOutParams.dstStride = (QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_) - s2BaseSize_) * sizeof(SCORE_T);
+    #ifdef LI_PRODUCER_CONTROLS
+    if (producer_.Enabled()) {
+        producer_.Tile(outBase,UB_BANK_DEPTH_STRIDE/sizeof(SCORE_T),curAivS1Idx,curAivS1ProcNum,curS2Idx);
+    } else
+    #endif
     if (stagedDirect_) {
         uint32_t q=stagedTask_.queryBegin+curAivS1Idx,token=stagedTask_.begin+curS2Idx;
         GlobalTensor<SCORE_T> canonical;

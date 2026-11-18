@@ -11,7 +11,11 @@ struct QLITilingData {
 #endif
 #if defined(__CCE_AICORE__)
 __aicore__ inline void RunScoreRow(
-    GM_ADDR bindings,uint32_t rows,uint32_t stride,uint32_t heads,uint32_t logicalGroup,bool segmentFence=false) {
+    GM_ADDR bindings,uint32_t rows,uint32_t stride,uint32_t heads,uint32_t logicalGroup,bool segmentFence=false
+#ifdef LI_PRODUCER_CONTROLS
+    ,GM_ADDR producer=nullptr
+#endif
+    ) {
 
     using namespace AscendC;using namespace QLICommon;
     // Native M/Fixpipe layout rounds a Q1 tail to two Q. qlen remains one;
@@ -29,7 +33,13 @@ __aicore__ inline void RunScoreRow(
     QLITilingData tiling{rows,rows*physicalGroup,heads,physicalGroup,stride,2048,rows,128,
                        stride/128,0,16384,128,stride,0,rows};
     op.Init(P(0),P(1),P(2),P(3),P(4),P(5),P(6),P(7),P(9),P(12),&tiling,&pipe);
+    #ifdef LI_PRODUCER_CONTROLS
+    if ASCEND_IS_AIV { if(producer)op.vectorService.SetProducerOutput(producer,&pipe); }
+    #endif
     op.Process();
+    #ifdef LI_PRODUCER_CONTROLS
+    if ASCEND_IS_AIV { if(producer)op.vectorService.FinishProducer(); }
+    #endif
     if(segmentFence) {
         // ProcessMain drains VC0/VC1 for AIV0. AIV1's two credits must also
         // be consumed before another piece reuses the same CV/VC channels.
