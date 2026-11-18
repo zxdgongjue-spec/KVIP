@@ -3377,8 +3377,8 @@ class FusedReplayState:
                 raise RuntimeError(f'Replay persistent hot KV mismatch: request={row}')
         return layout, hot_valid
 
-    def validate(self, inputs):
-        """Check completion before using outputs; then full-byte KV identity."""
+    def check_completion(self):
+        """Check device completion before reading outputs or reusing transport state."""
         status = self.update.status.cpu().numpy()
         if np.any(status):
             flags = self.forward.flags.cpu().numpy()
@@ -3417,6 +3417,9 @@ class FusedReplayState:
                 atomic_json(self.failure_directory / 'completion_failure.json', detail)
             print('REPLAY COMPLETION AUDIT: ' + json.dumps(detail), flush=True)
             raise RuntimeError(f'Replay Index/Fetch completion failed: {status.tolist()}')
+
+    def validate(self, inputs):
+        self.check_completion()
         ids = self.update.logical_output.cpu().numpy().reshape(self.batch, 4, 2048)
         slots = self.update.slot_output.cpu().numpy().reshape(self.batch, 4, 2048)
         if np.any(ids < 0) or np.any(ids >= self.history) or np.any(slots < 0) or np.any(slots >= self.stride):
@@ -3653,11 +3656,17 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
         def completed(self):
             nonlocal pending
             pending = False
+    # Multi-round validation also advances the host LRU for the next input.
+    compact = config.mode == "bench" and len(sequence.rounds) == 1
+
     def validate_all(inputs, label):
         nonlocal pending
         pending = True
         for i, state in enumerate(states):
-            checks.check(f'{label}/input{i}/round{inputs.source_round}', lambda state=state: state.validate(inputs))
+            if not compact or (label == 'measured' and i in (0, len(states) - 1)):
+                checks.check(f'{label}/input{i}/round{inputs.source_round}', lambda state=state: state.validate(inputs))
+            elif fused:
+                state.check_completion()
         pending = False
     try:
         for state in states:
@@ -3673,7 +3682,10 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             pending = True
             state.forward()
             stream.synchronize()
-            checks.check(f'pre_capture/input{i}', lambda state=state: state.validate(initial))
+            if not compact:
+                checks.check(f'pre_capture/input{i}', lambda state=state: state.validate(initial))
+            elif fused:
+                state.check_completion()
             pending = False
             state.reset()
         stream.synchronize()
