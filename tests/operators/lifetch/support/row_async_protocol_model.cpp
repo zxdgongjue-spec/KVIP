@@ -100,6 +100,8 @@ void PublishStreamingResidency(uint32_t,unsigned,Context*,unsigned){if(!threadId
 template<bool,bool,bool JoinedRow> void FinalizeStreaming(Args* a,unsigned,unsigned useful,
         unsigned total,unsigned completed,unsigned error){
     static_assert(JoinedRow);assert(useful==5 && lane==0);
+    sim->status=error?1U:0U;
+    if(!error)sim->published.fetch_add(1);
     unsigned expected=0;
     auto* c=reinterpret_cast<Context*>(a->context);
     for(auto& post:c->post){expected+=post.count;post.pending=0;post.deferred=0;post.error=error;}

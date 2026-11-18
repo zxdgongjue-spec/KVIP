@@ -239,26 +239,27 @@ def test_auto_route_device_publication_order():
     kernel = INCLUDE.parent / "op_kernel"
     source = (kernel / "streaming.cpp").read_text()
     final = function(source, "__aicore__ inline void FinalizeStreaming(")
-    commit = final.index("kvip_auto_route::Commit(config,b,error|updateError)")
-    prefix = final[:commit]
+    feedback = function(source, "inline void CommitRouteFeedback(")
+    commit = feedback.index("kvip_auto_route::Commit(config,b,error)")
+    prefix = feedback[:commit]
     assert prefix.rfind("CleanCacheLines(record,128)") > prefix.rfind("CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(pending),128)")
     assert prefix.rfind("CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(pending),128)") > prefix.rfind("CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(config),128)")
-    assert final.index("for(uint32_t f=ReadThrough?8:6;f<12;++f)") < commit
-    assert final.index("uint32_t updateError=rowJoinError?1U:0U") < commit
-    assert final.index("updateError=*updateStatus") < commit
-    assert "if(kvip_auto_route::Commit(config,b,error|updateError))kvaf_device::CleanCacheLines(record,128)" in final
+    legacy_commit = final.index("CommitRouteFeedback(ctx,b,info[1],usefulPrefetch,error|updateError)")
+    assert final.index("for(uint32_t f=ReadThrough?8:6;f<12;++f)") < legacy_commit
+    assert final.index("updateError=*updateStatus") < legacy_commit
+    assert final.index("VF_CALL<CommitJoinedRow>") < final.index("CommitRouteFeedback(ctx,b,necessary,usefulPrefetch,error)")
     producer = function(source, "__aicore__ inline uint32_t Producer(")
     assert "auto_route::Config" not in producer
     assert "auto_route::Pending" not in producer
     assert "usefulPrefetch=ctl.GetValue(8)" in producer
     assert "return usefulPrefetch;" in producer
     assert "uint32_t useful=Producer(a,b);FinalizeStreaming(a,b,useful)" in source
-    write = final.index("pending->usefulPrefetch=")
-    assert final[:write].rfind("CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(pending),128)") >= 0
-    assert final[:write].rfind("CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),kRowStatusWords*4)") >= 0
-    assert "pending->necessary=uint64_t(info[1])+pending->usefulPrefetch" in final
-    assert "pending->usefulPrefetch=usefulPrefetch" in final
-    assert final.index("CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(pending),128)", commit) > commit
+    write = feedback.index("pending->usefulPrefetch=")
+    assert feedback[:write].rfind("CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(pending),128)") >= 0
+    assert final[:legacy_commit].rfind("CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),kRowStatusWords*4)") >= 0
+    assert "pending->necessary=uint64_t(necessary)+pending->usefulPrefetch" in feedback
+    assert "pending->usefulPrefetch=usefulPrefetch" in feedback
+    assert feedback.index("CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(pending),128)", commit) > commit
     indexer = (kernel / "indexer.cpp").read_text()
     assert indexer.index("CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->admissionControls)") < indexer.index("rotating::NoPrefetchRound(ctx)")
 

@@ -28,6 +28,7 @@ def test_post_index_completion_matches_old_state(tmp_path, threads, batch):
     structures=context[context.index('struct alignas(128) FinalPost'):context.index('struct alignas(128) Event')]
     old_residency=function(source,'inline void PublishStreamingResidency(')
     old_finalize=function(source,'inline void FinalizeStreaming(')
+    route=function(source,'inline void CommitRouteFeedback(')
     kvaf = Path(os.environ.get("KVAF_LEGACY_SOURCE_ROOT", REPO.parent / "KVAF"))
     native = kvaf / "access_operator/demo/aiv_batch_get/include"
     if not (native / "kvaf_batch_get_device.h").is_file():
@@ -55,6 +56,7 @@ def test_post_index_completion_matches_old_state(tmp_path, threads, batch):
 #define __simt_vf__
 #define LAUNCH_BOUND(n)
 #define KVIP_AUTO_ROUTE 1
+#define KVIP_LOW_MISS_POST_INDEX 1
 #define KVIP_LOW_MISS_TAIL 1
 #define KVIP_EARLY_PREFETCH_DRAIN 0
 #define V9_UBMEM 0
@@ -132,7 +134,7 @@ void CleanCacheLines(uint8_t*,uint64_t){}
 void CompletePrefetch(Context*,uint32_t,bool,uint64_t*,uint64_t*,uint64_t*){assert(false);}
 void PublishPrefetchResidency(Context*,uint32_t,uint32_t){assert(false);}
 KvafExecuteBatchGetKernelArgs GetArgs(Context*,uint32_t){return {};}
-'''+old_residency+'\n'+(kernel/'index_cache_update.h').read_text()+
+'''+old_residency+'\n'+(kernel/'index_cache_update.h').read_text()+'\n'+route+'\n'+(kernel/'joined_row_commit.h').read_text()+
     '\ntemplate<bool ReadThrough=false,bool PostIndex=false,bool JoinedRow=false>\n'+old_finalize+'\n'+
     FINALIZE_HEADER.read_text().replace('LAUNCH_BOUND(256)', f'LAUNCH_BOUND({threads})').replace('i += 256', f'i += {threads}').replace('Simt::Dim3{256, 1, 1}', f'Simt::Dim3{{{threads}, 1, 1}}')+r'''
 struct Fixture {
@@ -223,10 +225,18 @@ struct Fixture {
 int main(){
  // Compare the old full-AIV handoff through FinalPost with direct row counts.
  // Cover partial completions on error as well as a completed zero-Get row.
- for(uint32_t n:{0U,955U})for(uint32_t err:{0U,8U}) {
-  Fixture through,joined;const uint32_t b=0,done=err?n/2:n;
+ for(uint32_t n:{0U,955U})for(uint32_t err:{0U,8U})for(bool parallel:{false,true})for(unsigned pf:{0U,3U}) {
+  Fixture through,joined;const uint32_t b=std::min(2U,Fixture::B-1),done=err?n/2:n;
   through.plan(b,n);joined.plan(b,n);
+  for(auto* f:{&through,&joined}) {
+   f->rows[b].slots=pf;f->args.prefetchCount=parallel?0x10000000U:0;
+   for(unsigned i=0;i<pf;++i){
+    unsigned d=f->lru[b*2048+i];
+    f->events[b*Fixture::E+i]=d;f->changes[b*Fixture::E+i]=923+i;f->hot[f->owners[b]*Fixture::R+d]=0;
+   }
+  }
   through.updateStatus[b]=joined.updateStatus[b]=err?1U:0U;
+  if(parallel && !err) Simt::VF_CALL<PublishStreamingResidency>(Simt::Dim3{256,1,1},Fixture::R,0,&through.ctx,b);
   for(uint32_t q=0;q<4;++q){
    auto& p=through.posts[4*b+q];p.pending=q==0?done:0;p.deferred=0;p.error=err;
   }

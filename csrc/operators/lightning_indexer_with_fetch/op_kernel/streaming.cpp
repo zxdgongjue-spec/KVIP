@@ -776,7 +776,7 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b,uint32_t usef
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->finalPending),sizeof(row->finalPending));
   const uint32_t necessary=info[1], prefetched=row->slots;
   error|=row->error;
-  if(info[0] || row->pending || total!=necessary || completed!=total || prefetched>kPrefetch ||
+  if(info[0] || row->pending || total!=necessary || prefetched>kPrefetch ||
      kPrefetch+uint64_t(total)>a->maxEvents) error|=kvaf_device::kInvalidArgs;
   if(profile)ft[1]=GetSystemCycle();
   Simt::VF_CALL<CommitJoinedRow>(Simt::Dim3{256,1,1},a,ctx,b,shape.resident,shape.finalPostOffset,
