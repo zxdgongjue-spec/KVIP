@@ -32,7 +32,7 @@ constexpr uint32_t kFlagCount=16,kTop=8,kSlots=4*kTop,kRowStatusWords=32,kCapaci
 struct BatchFlag { std::atomic<uint32_t> ready{},count{},error{},reserved[29]{}; };
 struct Edge {uint32_t s,d;}; struct Tuple {uint32_t padding;};
 struct FinalPost {uint32_t count{},nonconflicting{},descriptor{},pending{},deferred{},error{};};
-struct Row {uint32_t error=0;};
+struct Row {uint32_t error=0, pending=1;};
 struct Context {uint64_t fallbackAddresses{},destinations{},sourceBlocks{},sourceOffsets{},fallbackValid{},rowStatus{},rows{},rowOwners{};FinalPost post[4]{};};
 struct Args {uint64_t context{}, flags{},postIndex{},updateBindings{},times{},highIndex{}; uint32_t prefetchCount{};};
 struct Shape {unsigned batch=16,finalPostOffset=0,resident=16;}; Shape LoadRuntimeShape(Context*){return {};}
@@ -41,7 +41,7 @@ using KvafBatchGetDirectUrmaEntity=Entity;
 struct QueueArgs {uint64_t channel_entity{},core_status{},indices{},offsets{},output_indices{},address_table{},valid_table{};
     uint32_t block_count{},jettys_per_core{},table_capacity{},request_capacity{},tokens_per_block{},output_rows=1024,token_bytes=16;};
 struct PrivatePlan {unsigned pairs=3,singles=7,invalidations=1,error=0;};
-struct Input {std::array<unsigned,4> n,safe; unsigned cqDepth=4; int blocking=-1,badPreflight=-1, badBlock=-1,badWait=-1,badDescriptor=-1;bool badPlan=false,badDrain=false,badTotal=false;};
+struct Input {std::array<unsigned,4> n,safe; unsigned cqDepth=4; int blocking=-1,badPreflight=-1, badBlock=-1,badWait=-1,badDescriptor=-1;bool badPlan=false,badDrain=false,badTotal=false,pending=true;};
 struct FIFO {unsigned issued=0,drained=0,reads=0,capacity=3;std::vector<unsigned> positions;};
 struct World {Input input;Entity e;FIFO q[4];std::atomic<unsigned> prefetch{0}, applied{0}, finalized{0},published{0};unsigned status=0;};
 World* sim;
@@ -53,12 +53,12 @@ unsigned Producer(Args*,unsigned){assert(lane==0);return 5;}
 template<bool> void OutputWorker(Args*,unsigned){assert(lane==1);}
 void Plan(Args*,unsigned,Edge*,uint32_t*,bool,PrivatePlan& p){assert(lane==2);p.error=sim->input.badPlan;}
 void CompletePrefetch(Context* c,unsigned,bool){assert(lane==0);assert(sim->prefetch.fetch_add(1)==0);reinterpret_cast<Row*>(c->rows)->error|=sim->input.badDrain;}
-namespace post_index_tail {struct Record {uint64_t error{},globalError{},count{},fallback{},completed{},active{};};void Flush(Record*){} }
+namespace post_index_tail {struct Record {uint64_t error{},globalError{},count{},fallback{},completed{},active{},start{},planDone{},packDone{},postBegin{},postDone{},indexDone{},cqDone{};};void Flush(Record*){} }
 namespace post_index_transport {
 struct State{unsigned seq=0,count=0,completed=0;};
 uint32_t Preflight(QueueArgs&,unsigned,unsigned n,bool& blocking){if(!n)return 0;blocking=int(lane)==sim->input.blocking;return int(lane)==sim->input.badPreflight;}
 uint32_t Post(QueueArgs&,unsigned first,unsigned n,State& s){auto& q=sim->q[lane];assert(!s.seq && n);
-    assert(n+first<=sim->input.n[lane]);assert(first+n<=sim->input.safe[lane] || sim->prefetch.load());
+    assert(n+first<=sim->input.n[lane]);assert(first+n<=sim->input.safe[lane] || !sim->input.pending || sim->prefetch.load());
     for(unsigned i=first;i<first+n;++i)q.positions.push_back(i);
     s.seq=++q.issued;s.count=n;assert(q.issued-q.drained<sim->e.cq_depth);return 0;}
 uint32_t Wait(State& s){if(!s.seq)return 0;auto& q=sim->q[lane];assert(++q.drained==s.seq);
@@ -79,9 +79,9 @@ template<bool,bool> void FinalizeStreaming(Args*,unsigned,unsigned useful){asser
 void run(Input in){World world{in};sim=&world;world.e.cq_depth=in.cqDepth;
     std::array<BatchFlag,16> flags;std::array<post_index_tail::Record,64> records{};std::array<Edge,128> edges{};
     std::array<uint64_t,64*32+16*256> ticks{};uint64_t update[16]{};update[6]=uint64_t(&world.status);
-    uint32_t info[32]{};Row row;uint64_t addresses[kSlots]{};int dst[kSlots]{},blk[kSlots]{},off[kSlots]{};uint8_t valid[kSlots]{};
+    uint32_t info[32]{};Row row;row.pending=in.pending; uint64_t addresses[kSlots]{};int dst[kSlots]{},blk[kSlots]{},off[kSlots]{};uint8_t valid[kSlots]{};
     Context c{uint64_t(addresses),uint64_t(dst),uint64_t(blk),uint64_t(off),uint64_t(valid),uint64_t(info),uint64_t(&row)};
-    Args a{uint64_t(&c),uint64_t(flags.data()),uint64_t(records.data()),uint64_t(update),uint64_t(ticks.data()),uint64_t(edges.data()),0x10000000};
+    Args a{uint64_t(&c),uint64_t(flags.data()),uint64_t(records.data()),uint64_t(update),uint64_t(ticks.data()),uint64_t(edges.data()),0x90000000};
     for(unsigned i=0;i<kSlots;++i){addresses[i]=128+16*i;blk[i]=i;dst[i]=i;valid[i]=1;}
     for(unsigned q=0;q<4;++q){c.post[q]={in.n[q],in.safe[q],q*kTop};info[1]+=in.n[q];flags[1+q].ready=1;}
     if(in.badTotal)++info[1];
@@ -97,7 +97,7 @@ void run(Input in){World world{in};sim=&world;world.e.cq_depth=in.cqDepth;
         if(in.badPlan || in.badDescriptor>=0 || in.badPreflight>=0 || in.badTotal)assert(!queue.issued);
         if(in.badDrain && in.safe[q]<in.n[q])assert(queue.positions.size()<=in.safe[q]);
         if(!failed){assert(queue.positions.size()==in.n[q]);for(unsigned i=0;i<in.n[q];++i)assert(queue.positions[i]==i);
-            assert(queue.issued==(in.n[q]==0 ? 0u : (in.safe[q] && in.safe[q]<in.n[q] && in.cqDepth>2 && int(q)!=in.blocking ? 2u:1u)));}
+            assert(queue.issued==(in.n[q]==0 ? 0u : (in.pending && in.safe[q] && in.safe[q]<in.n[q] && in.cqDepth>2 && int(q)!=in.blocking ? 2u:1u)));}
         totalCompleted+=records[q*16].completed;assert(bool(c.post[q].error)==failed);}
     assert(c.post[0].pending==totalCompleted);
     if(!failed)assert(world.applied==4);
@@ -106,7 +106,7 @@ void run(Input in){World world{in};sim=&world;world.e.cq_depth=in.cqDepth;
     if(in.badDrain){assert(world.q[0].issued==1 && world.q[0].positions.size()==in.safe[0]);}
 }
 int main(){Input mixed{{4,3,0,5},{2,3,0,0}};
-    run(mixed);auto c=mixed;c.cqDepth=2;run(c);c=mixed;c.blocking=0;run(c);c.badBlock=0;run(c);
+    run(mixed);auto drained=mixed;drained.pending=false;run(drained);auto c=mixed;c.cqDepth=2;run(c);c=mixed;c.blocking=0;run(c);c.badBlock=0;run(c);
     c=mixed;c.badPlan=true;run(c);c=mixed;c.badTotal=true;run(c);c=mixed;c.badDescriptor=1;run(c);
     c=mixed;c.badPreflight=3;run(c);c=mixed;c.badWait=0;run(c);c=mixed;c.badDrain=true;run(c);
     run(Input{{4,3,0,5},{4,3,0,5}});run(Input{{0,0,0,0},{0,0,0,0}});
