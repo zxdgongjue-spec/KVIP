@@ -12,6 +12,7 @@ def rotation_spec(batch, history, resident, final, rounds, lanes, status_bytes):
         progress=(batch, 4, 32),
         rows=(batch, 256),
         mapping=(batch, history),
+        mapping_journal=(batch, 2080),
         locations=(batch, 4, 2048),
         owners=(batch * 32 + batch * final * 320,),
         blocks=(batch * 8192,),
@@ -150,6 +151,7 @@ def ubmem_rotation_spec(batch, history, resident, aics, windows):
         shape["service_aivs_per_window"], status_bytes=0,
     )
     spec.pop("window_topk_storage")
+    spec.pop("mapping_journal")
     del spec["final_status"]  # URMA completion queues only.
     # aclnnInplaceZero lacks uint64 support. Preserve the ABI bits in int64.
     spec["ubmem_status"] = ((batch, 16), "int64")

@@ -118,6 +118,10 @@ class LIFetchBinding:
         )
         for name, (shape, dtype_name) in spec.items():
             dtype = getattr(torch, dtype_name)
+            if name == "mapping_journal" and scratch is not None and name not in scratch:
+                # Existing caller-owned scratch uses the full mapping reset.
+                self.mapping_journal = None
+                continue
             value = torch.zeros(shape, dtype=dtype, device=self.device) if scratch is None else scratch[name]
             if (
                 value.device != self.device
@@ -218,10 +222,11 @@ class LIFetchBinding:
         )
         self.rank_progress = self.window_topk_storage[-batch*4*32*8:].view(torch.int64).view(batch,4,32)
         self.incremental = self.window_topk_storage[:batch*512].view(torch.int64).view(batch,4,16)
-        blob = np.concatenate((blob, np.array([self.incremental.data_ptr(), prefetch_rank_start, 0, 0], dtype="<u8").view("u1")))
+        blob = np.concatenate((blob, np.array([self.incremental.data_ptr(), prefetch_rank_start,
+                               self.mapping_journal.data_ptr() if self.mapping_journal is not None else 0, 0], dtype="<u8").view("u1")))
         self.context = torch.from_numpy(blob.copy()).to(self.device)
         self.arguments = tuple(arguments) + (self.context,)
-        self.bindings = torch.tensor([x.data_ptr() for x in self.arguments], dtype=torch.uint64, device=self.device)
+        self.bindings = torch.tensor([x.data_ptr() for x in self.arguments] + [0], dtype=torch.uint64, device=self.device)
         self.functions = {}
         for name in ("init", "li"):
             fn = getattr(self.library, "v9_" + name)
@@ -243,6 +248,8 @@ class LIFetchBinding:
             tensor.zero_()
         self.changes.fill_(-1)
         self.mapping.fill_(-1)
+        if self.mapping_journal is not None:
+            self.mapping_journal.zero_()
         self.locations.fill_(-1)
 
     def _call(self, name):

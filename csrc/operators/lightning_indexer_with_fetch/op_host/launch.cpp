@@ -2,12 +2,17 @@
 #include "api.h"
 #include "context.h"
 extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) { return rotating::PrepareShape(shape); }
-#define ENTRY(name, blocks) \
-extern "C" uint32_t aclrtlaunch_v9_##name##_kernel(uint32_t,void*,void*); \
-extern "C" uint32_t v9_##name(void* bindings,void* stream,const rotating::RuntimeShape* shape) { \
-    if (!bindings || !stream || !shape) return 100000; \
-    return aclrtlaunch_v9_##name##_kernel(blocks,stream,bindings); }
-ENTRY(init,shape->batch*4)
+extern "C" uint32_t aclrtlaunch_v9_init_kernel(uint32_t,void*,void*,uint32_t,void*,
+    uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
+static uint32_t LaunchInit(void* bindings,void* stream,const rotating::RuntimeShape* shape,void* workspace,uint32_t fullReset) {
+    return aclrtlaunch_v9_init_kernel(shape->batch*4,stream,bindings,fullReset,workspace,
+        shape->batch, shape->history, shape->resident, shape->rounds,
+        shape->serviceLanes, shape->finalWorkers, shape->finalPostOffset, shape->tokenBytes);
+}
+extern "C" uint32_t v9_init(void* bindings,void* stream,const rotating::RuntimeShape* shape) {
+    if (!bindings || !stream || !shape) return 100000;
+    return LaunchInit(bindings,stream,shape,nullptr,1);
+}
 
 extern "C" uint32_t aclrtlaunch_v9_li_kernel(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_1(uint32_t,void*,void*);
@@ -76,7 +81,7 @@ extern "C" uint32_t aclrtlaunch_v9_streaming_resolve_update(uint32_t,void*,void*
 extern "C" uint32_t kvip_lifetch_streaming_forward(void* bindings,void* update,void* workspace,void* stream,const rotating::RuntimeShape* shape,uint32_t workers) {
     if(!bindings||!update||!workspace||!stream||!shape||shape->resident>131072||shape->batch<1||shape->batch>16||shape->finalWorkers!=4)return 100000;
     if((workers!=1 && workers!=2 && workers!=4) || shape->batch*pipeline_ab::kResolveCores+4*workers>shape->aicCount*2)return 100000;
-    uint32_t result=v9_init(bindings,stream,shape);
+    uint32_t result=LaunchInit(bindings,stream,shape,workspace,0);
     if(!result)result=v9_li(bindings,stream,shape);
     if(!result)result=aclrtlaunch_v9_streaming_resolve_update(shape->batch*pipeline_ab::kResolveCores+4*workers,stream,workspace);
     return result;

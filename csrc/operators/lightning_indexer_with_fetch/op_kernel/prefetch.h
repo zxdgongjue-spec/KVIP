@@ -31,6 +31,19 @@ inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm
         asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->changeCount)+b,kLruSlots);
         asc_threadfence();
     }
+    if(!threadIdx.x && beginOffset==0 && ctx->mappingJournal){
+        auto journal=reinterpret_cast<__gm__ MappingJournal*>(ctx->mappingJournal)+b;
+        auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds);
+        uint32_t first=bounds?asc_ldcg(bounds+2*b):0,last=bounds?asc_ldcg(bounds+2*b+1):0;
+        uint32_t capacity=OutputStride(rt_resident,ctx)-rt_resident;
+        if(last>rt_history)last=rt_history;
+        if(last<first)last=first;
+        if(last-first>capacity)last=first+capacity;
+        asc_stcg(&journal->count,0U);
+        asc_stcg(&journal->tailBegin,first);
+        asc_stcg(&journal->tailEnd,last);
+        asc_threadfence();
+    }
     if(!ctx->tailBounds)return;
     auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds)+b*2;
     auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;
@@ -42,6 +55,15 @@ inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm
             asc_stcg(map+token,rt_resident+kSlots+token%tailTokens);
     }
     asc_threadfence();
+}
+
+// Each request's prefetch queue appends contiguous ordinals in service order.
+__simt_callee__ inline void TrackMapping(__gm__ Context* ctx,uint32_t b,uint32_t ordinal,
+    uint32_t token,bool last) {
+    if (!ctx->mappingJournal || ordinal>=kLruSlots) return;
+    auto journal=reinterpret_cast<__gm__ MappingJournal*>(ctx->mappingJournal)+b;
+    asc_stcg(journal->tokens+ordinal,token);
+    if(last) asc_stcg(&journal->count,ordinal+1);
 }
 
 // Resolver workers consume the pre-round validity. Publish only after all
@@ -322,6 +344,7 @@ inline void BatchBuild(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_residen
                         fields[512+g*rt_postBank+i]=uint32_t(address>>32);
                         fields[1024+g*rt_postBank+i]=PhysicalSlot(rt_resident,ctx,b,slot);
                     }
+                    TrackMapping(ctx,b,slot-rt_resident,token,i+1==n);
                     asc_stcg(map+token,slot);
 
                     RecordChange(rt_resident,ctx,b,slot,token);
@@ -383,6 +406,7 @@ inline void PrepareCandidateWqes(uint32_t rt_resident,__ubuf__ uint32_t* ids,__u
     for(uint32_t i=threadIdx.x;i<count;i+=256) {
         uint32_t token=ids[i],slot=slotBase+i;uint64_t remote=asc_ldcg(addresses+token);
         lo[i]=uint32_t(remote);hi[i]=uint32_t(remote>>32);slots[i]=PhysicalSlot(rt_resident,ctx,batch,slot);asc_stcg(map+token,slot);
+        TrackMapping(ctx,batch,slot-rt_resident,token,i+1==count);
         asc_atomic_or(admitted+token/32,1U<<(token%32));
         RecordChange(rt_resident,ctx,batch,slot,token);
     }

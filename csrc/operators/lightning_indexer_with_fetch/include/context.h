@@ -6,6 +6,12 @@ namespace rotating {
 constexpr uint32_t kTop=2048, kSlots=8192, kMaxRounds=32, kRowStatusWords=32;
 constexpr bool kFinalReplicated=true;
 constexpr uint32_t kFinalStateWords=288;
+// Previous-round mapping writes, indexed by the contiguous prefetch ordinal.
+struct alignas(128) MappingJournal {
+    uint32_t tokens[2048];
+    uint32_t tailBegin, tailEnd, count;
+};
+static_assert(sizeof(MappingJournal)==2080*sizeof(uint32_t),"mapping journal row ABI");
 struct alignas(128) FinalPost {
     uint32_t count, pending, error, deferred, descriptor;
     uint32_t nonconflicting; // Compact descriptor prefix safe before prefetch CQ.
@@ -46,7 +52,7 @@ struct Context {
     uint64_t changeSlots, changeCount; // Extended direct-hot producer records, ABI 3.
     uint64_t incremental; // Per-Q TopK prefixes, admission bitmap and diagnostics.
     uint64_t prefetchRankStart; // Zero preserves the default rank 1024.
-    uint64_t incrementalPadding[2]; // Preserve 32-byte DMA alignment.
+    uint64_t mappingJournal, incrementalPadding; // Preserve 32-byte DMA alignment.
     // Optional serving layout: active row -> stable owner; addresses stay with
     // that owner's Index permutation. tailBounds[B,2] are [committed,write_end).
 

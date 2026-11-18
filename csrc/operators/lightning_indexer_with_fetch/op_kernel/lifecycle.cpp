@@ -55,64 +55,117 @@ __aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uin
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     pipe.Destroy();
 }
+__simt_vf__ __aicore__ LAUNCH_BOUND(256)
+inline void ResetTrackedMapping(__gm__ uint32_t* map,__gm__ MappingJournal* journal,__gm__ uint32_t* count,
+                               uint32_t history,uint32_t resident,uint32_t begin,uint32_t end,
+                               uint32_t oldBegin,uint32_t oldEnd,uint32_t tailTokens,uint32_t dirtyCount) {
+    unsigned tid=threadIdx.x;
+    for(unsigned i=tid;i<dirtyCount;i+=256) {
+        unsigned token=asc_ldcg(journal->tokens+i);
+        if(token<history && !(token>=begin && token<end && token-begin<tailTokens))asc_stcg(map+token,UINT32_MAX);
+
+    }
+    for(unsigned i=tid;oldBegin<history && i<history-oldBegin && oldBegin+i<oldEnd;i+=256){
+        unsigned token=oldBegin+i;
+        if(!(token>=begin && token<end && token-begin<tailTokens))asc_stcg(map+token,UINT32_MAX);
+    }
+    for(unsigned i=tid;i<tailTokens && begin<history && i<history-begin && begin+i<end;i+=256)asc_stcg(map+begin+i,resident+kSlots+(begin+i)%tailTokens);
+    if(!tid){
+        asc_stcg(&journal->count,0U);asc_stcg(&journal->tailBegin,begin);asc_stcg(&journal->tailEnd,end);
+        if(count)asc_stcg(count,kLruSlots);
+    }
+    asc_threadfence();
+}
 #endif
-extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
+extern "C" __global__ __aicore__ void v9_init_kernel(
+    GM_ADDR bindings,uint32_t fullReset,GM_ADDR workspace,
+    uint32_t rt_batch, uint32_t rt_history, uint32_t rt_resident, uint32_t rt_rounds,
+    uint32_t rt_serviceLanes, uint32_t rt_finalWorkers, uint32_t rt_finalPostOffset, uint32_t rt_tokenBytes) {
 #if defined(__CCE_AICORE__)
     auto ctx=GetContext(bindings);
-    const auto& runtimeShape=ctx->shape;
-    const uint32_t rt_batch = runtimeShape.batch;
-    const uint32_t rt_history = runtimeShape.history;
-    const uint32_t rt_resident = runtimeShape.resident;
-    const uint32_t rt_rounds = runtimeShape.rounds;
-    const uint32_t rt_serviceLanes = runtimeShape.serviceLanes;
-    const uint32_t rt_finalWorkers = runtimeShape.finalWorkers;
-    const uint32_t rt_finalPostOffset = runtimeShape.finalPostOffset;
-    const uint32_t rt_tokenBytes = runtimeShape.tokenBytes;
-
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     if ASCEND_IS_AIV {
         uint32_t block=GetBlockIdx();
-        uint32_t b=block%rt_batch, part=block/rt_batch;
+        uint32_t b=block/4, part=(block+3)%4;
         if(part>=4) return;
-        // Each worker owns an aligned range, including its ABC mappings.
-        // No cache line is concurrently cleared and filled by another core.
-        uint32_t chunk=((rt_history+127)/128)*32;
-        uint32_t begin=part*chunk;
-        uint32_t end=begin+chunk<rt_history ? begin+chunk : rt_history;
-        if(begin<end || ctx->changes || (part==3 && ctx->changeSlots)) {
-            TPipe mapPipe; TBuf<TPosition::VECCALC> mapStorage;
-            mapPipe.InitBuffer(mapStorage,4096*4);
-            auto local=mapStorage.Get<uint32_t>();
-            Duplicate(local,UINT32_MAX,4096);
-            SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-            if(begin<end) FillRoundWords(ctx->mapping+(uint64_t(b)*rt_history+begin)*4,end-begin,local);
-            // All four workers clear disjoint aligned changes ranges. This
-            // also runs when the corresponding mapping range is empty.
-            if(ctx->changes) {
-                constexpr uint32_t changeChunk=kChangeCapacity/4;
-                static_assert(kChangeCapacity%4==0 && changeChunk%8==0,"unaligned change shards");
-                FillRoundWords(ctx->changes+(uint64_t(b)*kChangeCapacity+part*changeChunk)*4,changeChunk,local);
-            }
-            SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
-            // The next kernel observes the completed LRU copy at the launch
-            // boundary; it does not depend on the owner's row initialization.
-            if(part==3 && ctx->changeSlots) {
-                GlobalTensor<uint32_t> source,target;
-                source.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots);
-                target.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+b*kChangeCapacity);
-                DataCopy(local,source,kLruSlots);
-                SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-                DataCopy(target,local,kLruSlots);
+        if(ctx->mappingJournal && !fullReset && ctx->prefetchLimit<=kLruSlots) {
+            if(part==3) {
+                TPipe pipe; TBuf<TPosition::VECCALC> store; pipe.InitBuffer(store,(kChangeCapacity+kLruSlots)*4);
+                auto local=store.Get<uint32_t>();auto lru=local[kChangeCapacity];GlobalTensor<uint32_t> dst;
+                if(ctx->changeSlots){
+                    GlobalTensor<uint32_t> src;
+                    src.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots);
+                    dst.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+b*kChangeCapacity);
+                    DataCopy(lru,src,kLruSlots);
+                }
+                if(ctx->changes){
+                    Duplicate(local,UINT32_MAX,kChangeCapacity);
+                    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+                    GlobalTensor<uint32_t> changes;
+                    changes.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+b*kChangeCapacity);
+                    DataCopy(changes,local,kChangeCapacity);
+                }
+                if(ctx->changeSlots){
+                    SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+                    DataCopy(dst,lru,kLruSlots);
+                }
                 SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+                pipe.Destroy();
             }
-            mapPipe.Destroy();
-            if(begin<end) Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},rt_history,rt_resident,ctx,b,begin,end);
+            if(part==2) {
+                auto journal=reinterpret_cast<__gm__ MappingJournal*>(ctx->mappingJournal)+b;
+                auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds);
+                uint32_t tail=ctx->outputStride?ctx->outputStride-rt_resident:0;
+                auto count=reinterpret_cast<__gm__ uint32_t*>(ctx->changeCount);
+                uint32_t begin=bounds?bounds[b*2]:0,end=bounds?bounds[b*2+1]:0;
+                if(begin>=rt_history || end<begin) end=begin;
+                else { if(end>rt_history)end=rt_history; if(end-begin>tail)end=begin+tail; }
+                kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&journal->tailBegin),128);
+                Simt::VF_CALL<ResetTrackedMapping>(Simt::Dim3{256,1,1},
+                    reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+uint64_t(b)*rt_history,journal,count?count+b:nullptr,
+                    rt_history,rt_resident,begin,end,journal->tailBegin,journal->tailEnd,tail,journal->count);
+            }
+        } else {
+            // Each worker owns an aligned range, including its ABC mappings.
+            // No cache line is concurrently cleared and filled by another core.
+            uint32_t chunk=((rt_history+127)/128)*32;
+            uint32_t begin=part*chunk;
+            uint32_t end=begin+chunk<rt_history ? begin+chunk : rt_history;
+            if(begin<end || ctx->changes || (part==3 && ctx->changeSlots)) {
+                TPipe mapPipe; TBuf<TPosition::VECCALC> mapStorage;
+                mapPipe.InitBuffer(mapStorage,4096*4);
+                auto local=mapStorage.Get<uint32_t>();
+                Duplicate(local,UINT32_MAX,4096);
+                SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+                if(begin<end) FillRoundWords(ctx->mapping+(uint64_t(b)*rt_history+begin)*4,end-begin,local);
+                // All four workers clear disjoint aligned changes ranges. This
+                // also runs when the corresponding mapping range is empty.
+                if(ctx->changes) {
+                    constexpr uint32_t changeChunk=kChangeCapacity/4;
+                    static_assert(kChangeCapacity%4==0 && changeChunk%8==0,"unaligned change shards");
+                    FillRoundWords(ctx->changes+(uint64_t(b)*kChangeCapacity+part*changeChunk)*4,changeChunk,local);
+                }
+                SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+                // The next kernel observes the completed LRU copy at the launch
+                // boundary; it does not depend on the owner's row initialization.
+                if(part==3 && ctx->changeSlots) {
+                    GlobalTensor<uint32_t> source,target;
+                    source.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots);
+                    target.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+b*kChangeCapacity);
+                    DataCopy(local,source,kLruSlots);
+                    SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+                    DataCopy(target,local,kLruSlots);
+                    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+                }
+                mapPipe.Destroy();
+                if(begin<end) Simt::VF_CALL<InitializeTailMappings>(Simt::Dim3{256,1,1},rt_history,rt_resident,ctx,b,begin,end);
+            }
         }
         // A separate shard clears the per-round state while the owner
         // initializes the row. The next kernel waits for all init blocks.
         if(part==1) {
             auto initBindings=reinterpret_cast<__gm__ uint64_t*>(bindings);
-            auto streaming=reinterpret_cast<__gm__ pipeline_ab::Args*>(initBindings[15]);
+            auto streaming=reinterpret_cast<__gm__ pipeline_ab::Args*>(workspace ? reinterpret_cast<uint64_t>(workspace) : initBindings[15]);
             InitializeRound(rt_batch,rt_history,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b,streaming);
         }
         if(part) return;
@@ -150,6 +203,7 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
             row->error=kvaf_device::kInvalidArgs;
         if(!queue->initialized) {
             queue->magic=kvaf_device::kQueueMagic; queue->initialized=1;
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
         }
         if(entity->sq_depth>(1U<<30) || row->initialHead>UINT64_MAX-ctx->prefetchLimit ||
            args.token_bytes!=rt_tokenBytes || args.tokens_per_block!=128 ||
@@ -162,7 +216,7 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
            entity->local_hbm_size<(uint64_t(owner)+1)*outputStride*rt_tokenBytes ||
            !entity->remote_host_ddr_address || entity->remote_host_ddr_size<rt_tokenBytes)
             row->error=kvaf_device::kInvalidEntity;
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
+
 #endif
         SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
         FillRoundWords(ctx->rows+b*sizeof(Row),sizeof(Row)/4,rowLocal);
