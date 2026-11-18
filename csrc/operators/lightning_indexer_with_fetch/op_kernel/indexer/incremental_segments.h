@@ -23,6 +23,47 @@ __simd_callee__ inline void RankIds(RegTensor<uint32_t>& result, __ubuf__ uint32
     Gather(result, ids, index, all);
 }
 
+#if KVIP_SEED_MASK
+// Consume the selector's 16-bit ordinals directly. Produce the final internal
+// tie order and eligibility tag in the same vector store.
+__simd_vf__ inline void MaterializeSeed(__ubuf__ uint16_t* ordinals, __ubuf__ uint32_t* bits,
+    __ubuf__ uint32_t* output, uint32_t strict, uint32_t residentCount, uint32_t recentBegin,
+    uint32_t resident, uint32_t tailBegin, uint32_t tailEnd) {
+    auto all = CreateMask<uint32_t, MaskPattern::ALL>();
+    RegTensor<uint32_t> last, zero, one, lowBits, fetch;
+    Duplicate(last, kTop - 1 + strict); Duplicate(zero, uint32_t(0)); Duplicate(one, uint32_t(1));
+    Duplicate(lowBits, uint32_t(7)); Duplicate(fetch, kNeedsFetch);
+    for (uint16_t i = 0; i < kTop; i += 64) {
+        RegTensor<int32_t> lanes; Arange(lanes, int32_t(i));
+        auto& lane = reinterpret_cast<RegTensor<uint32_t>&>(lanes);
+        RegTensor<uint32_t> rank, ordinal, token, index, shift, word, tagged;
+        MaskReg keep, prefix, hot, flagged, cold, left, right, outside, needs;
+        Sub(rank, last, lane, all);
+        CompareScalar<uint32_t, CMPMODE::LT>(keep, lane, strict, all);
+        Select(rank, lane, rank, keep);
+        GatherU16(ordinal, ordinals, rank);
+        Adds(token, ordinal, recentBegin - residentCount, all);
+        CompareScalar<uint32_t, CMPMODE::LT>(prefix, ordinal, residentCount, all);
+        Select(token, ordinal, token, prefix);
+        CompareScalar<uint32_t, CMPMODE::LT>(hot, token, resident, all);
+        Select(index, token, zero, hot); // No out-of-range gather on recent tokens.
+        And(shift, index, lowBits, all); ShiftLefts(shift, shift, int16_t(2), all);
+        ShiftRights(index, index, int16_t(3), all);
+        Gather(word, bits, index, all);
+        ShiftRight(word, word, reinterpret_cast<RegTensor<int32_t>&>(shift), all);
+        And(word, word, one, all);
+        CompareScalar<uint32_t, CMPMODE::NE>(flagged, word, uint32_t(0), all);
+        CompareScalar<uint32_t, CMPMODE::GE>(cold, token, resident, all);
+        MaskOr(needs, flagged, cold, all);
+        CompareScalar<uint32_t, CMPMODE::LT>(left, token, tailBegin, all);
+        CompareScalar<uint32_t, CMPMODE::GE>(right, token, tailEnd, all);
+        MaskOr(outside, left, right, all); MaskAnd(needs, needs, outside, all);
+        Or(tagged, token, fetch, all); Select(token, tagged, token, needs);
+        StoreAlign(output + i, token, all);
+    }
+}
+#endif
+
 // The permutation is its own inverse. Source and destination never alias.
 template<bool stripTag>
 __simd_vf__ inline void FlipTies(__ubuf__ uint32_t* src, __ubuf__ uint32_t* dst,

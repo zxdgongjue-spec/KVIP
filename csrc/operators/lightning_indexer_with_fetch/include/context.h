@@ -34,6 +34,8 @@ struct alignas(128) Event {
     uint64_t scanTicks, candidateTicks, postTicks, bitmapBytes, candidateCount, postedCount;
     uint32_t pad[10];
 };
+constexpr uint32_t kSeedMaskSlots = 16384;
+constexpr uint32_t kSeedMaskWords = kSeedMaskSlots / 8; // Native B32 predicate: one bit per nibble.
 struct Context {
     uint64_t progress, rows, mapping, locations, events, hits, selected, owners;
     uint64_t args, sourceBlocks, sourceOffsets, destinations, count, rowStatus, finalStatus;
@@ -56,8 +58,11 @@ struct Context {
 #if KVIP_WINDOW_PROBE
     uint64_t windowTimes; // [B*4,rounds,8] uint64; one cache line per producer/epoch.
 #endif
+#if KVIP_SEED_MASK
+    uint64_t seedMask; // [active batch,kSeedMaskWords] immutable resident Get eligibility
+#endif
 };
-static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 328 + 8*(KVIP_INCREMENTAL_TOPK + KVIP_WINDOW_PROBE),
+static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 328 + 8*(KVIP_INCREMENTAL_TOPK + KVIP_WINDOW_PROBE + KVIP_SEED_MASK),
               "LIFetch runtime ABI layout changed");
 // Workload geometry is bound before capture and shared by host/device launches.
 #if defined(__CCE_AICORE__)

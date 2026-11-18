@@ -206,7 +206,7 @@ public:
     }
 
     __aicore__ inline void operator()(LocalTensor<uint16_t>& mrgValueLocal, LocalTensor<uint32_t>& indicesOutLocal,
-                                      LocalTensor<uint16_t>& hisValueLocal, uint32_t s2SeqLen, uint32_t loopIdx, uint32_t s2LoopNum, bool returnScores = false)
+                                      LocalTensor<uint16_t>& hisValueLocal, uint32_t s2SeqLen, uint32_t loopIdx, uint32_t s2LoopNum, bool returnScores = false, bool keepOrdinals = false)
     {
         if (s2LoopNum == 1) {
             if (returnScores) {
@@ -236,6 +236,9 @@ public:
             topkb16gather::LiTopKVF<false>(tmpIndexLocal, hisValueLocal, mrgValueLocal, histogramsLocal, idxHighLocal, idxLowLocal, nkValueLocal, topK, s2SeqLen);
             }
             PipeBarrier<PIPE_V>();
+#if KVIP_SEED_MASK
+            if (keepOrdinals) return;
+#endif
             Cast(indicesOutLocal, tmpIndexLocal, RoundMode::CAST_NONE, topK);
             return;
         }

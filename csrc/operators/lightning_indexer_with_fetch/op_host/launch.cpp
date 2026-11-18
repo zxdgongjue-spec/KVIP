@@ -6,6 +6,7 @@
 extern "C" uint32_t kvip_incremental_window() { return KVIP_INCREMENTAL_WINDOW; }
 extern "C" uint32_t kvip_incremental_inplace() { return KVIP_INCREMENTAL_INPLACE; }
 extern "C" uint32_t kvip_window_probe() { return KVIP_WINDOW_PROBE; }
+extern "C" uint32_t kvip_seed_mask() { return KVIP_SEED_MASK; }
 extern "C" uint32_t kvip_consumed_prefix() { return KVIP_CONSUMED_PREFIX; }
 extern "C" uint32_t kvip_incremental_segments() { return KVIP_INCREMENTAL_SEGMENTS; }
 extern "C" uint32_t kvip_incremental_progress() { return KVIP_INCREMENTAL_PROGRESS; }
@@ -90,7 +91,7 @@ extern "C" uint32_t v9_row_bytes(const rotating::RuntimeShape* shape) { return s
 extern "C" uint32_t v9_context_bytes(const rotating::RuntimeShape* shape) { return sizeof(rotating::Context); }
 extern "C" uint32_t v9_rounds(const rotating::RuntimeShape* shape) { return shape->rounds; }
 extern "C" uint32_t v9_simulation(const rotating::RuntimeShape* shape) { return 0; }
-extern "C" uint32_t v9_abi_version(const rotating::RuntimeShape* shape) { return 12 + KVIP_INCREMENTAL_TOPK + 2*KVIP_WINDOW_PROBE; }
+extern "C" uint32_t v9_abi_version(const rotating::RuntimeShape* shape) { return 12 + KVIP_INCREMENTAL_TOPK + 2*KVIP_WINDOW_PROBE + 4*KVIP_SEED_MASK; }
 extern "C" uint32_t v9_aic_count(const rotating::RuntimeShape* shape) { return shape->aicCount; }
 extern "C" uint32_t v9_service_lanes(const rotating::RuntimeShape* shape) { return shape->serviceLanes; }
 extern "C" uint32_t v9_final_workers(const rotating::RuntimeShape* shape) { return shape->finalWorkers; }

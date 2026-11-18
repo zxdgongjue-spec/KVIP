@@ -2,6 +2,7 @@
 #if defined(__CCE_AICORE__)
 #include "context.h"
 #include "pipeline_types.h"
+#include "seed_mask.h"
 
 #include <stdint.h>
 #include "prefetch.h"
@@ -31,6 +32,13 @@ __aicore__ inline void FillRoundWords(uint64_t address,uint32_t words,
 }
 __aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t b,__gm__ pipeline_ab::Args* streaming) {
     TPipe pipe;TBuf<TPosition::VECCALC> storage;pipe.InitBuffer(storage,4096*4);
+#if KVIP_SEED_MASK
+    TBuf<TPosition::VECCALC> seedInputs;
+    if (ctx->shape.resident <= kSeedMaskSlots) {
+        pipe.InitBuffer(seedInputs, kSeedChunk * 2 * sizeof(uint32_t));
+        LoadSeedInputs(ctx, b, ctx->shape.resident, seedInputs.Get<uint32_t>());
+    }
+#endif
     auto local=storage.Get<uint32_t>();
     Duplicate(local,uint32_t(0),4096);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
@@ -77,6 +85,12 @@ __aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uin
         DataCopy(target,local,kLruSlots);
         SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     }
+#if KVIP_SEED_MASK
+    if (ctx->shape.resident <= kSeedMaskSlots) {
+        // The previous DMA has joined. Reuse local for the predicate output.
+        PrepareSeedMask(ctx, b, ctx->shape.resident, seedInputs.Get<uint32_t>(), local);
+    }
+#endif
     pipe.Destroy();
 }
 #endif

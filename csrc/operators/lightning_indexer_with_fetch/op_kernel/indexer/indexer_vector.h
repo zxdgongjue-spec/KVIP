@@ -335,7 +335,14 @@ private:
                 );
 #endif
 #if KVIP_WINDOW_PROBE
-            RecordProbe(query, 0, 0, ProbeClock() - seedStart);
+            auto seedEnd = ProbeClock();
+            RecordProbe(query, 0, 0, seedEnd - seedStart);
+#if KVIP_INCREMENTAL_TOPK
+            RecordProbe(query, 0, 3, seedSelectedAt_ - seedStart);
+            RecordProbe(query, 0, 4, seedRemappedAt_ - seedSelectedAt_);
+            RecordProbe(query, 0, 5, seedTaggedAt_ - seedRemappedAt_);
+            RecordProbe(query, 0, 6, seedEnd - seedTaggedAt_);
+#endif
 #endif
 #if KVIP_ROLLING_THRESHOLD
             if (topkCount_ == kvip_rolling::kTop) {

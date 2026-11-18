@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Included inside QLIVector. All additions are absent from baseline builds.
 #if KVIP_INCREMENTAL_TOPK
+#if KVIP_WINDOW_PROBE
+    uint64_t seedSelectedAt_, seedRemappedAt_, seedTaggedAt_;
+#endif
     TBuf<TPosition::VECCALC> incrementalBuf_;
     LocalTensor<uint16_t> incrementalScores_, incrementalOffsets_;
     LocalTensor<uint32_t> incrementalIds_;
@@ -82,19 +85,27 @@
 #endif
     }
 
-    __aicore__ inline void SeedIncremental(uint32_t query, uint32_t residentCount,
-        uint32_t begin, uint32_t end, uint32_t causalEnd, uint32_t aligned) {
+    __aicore__ inline void SaveLegacySeed(uint32_t query, uint32_t residentCount,
+        uint32_t begin, uint32_t aligned, __gm__ rotating::Context* ctx) {
         topkOp_(mrgValueLocal_, indicesOutLocal_, scoreOutLocal_, aligned, 0, 1, true);
+#if KVIP_WINDOW_PROBE
+            seedSelectedAt_ = ProbeClock();
+#endif
         PipeBarrier<PIPE_V>();
         Simt::VF_CALL<kvip_incremental::Remap>(Simt::Dim3{256,1,1},
             reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(incrementalIds_.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint16_t*>(incrementalOffsets_.GetPhyAddr()),
             0, 0, 0, residentCount, begin, 0, 0);
+#if KVIP_WINDOW_PROBE
+            seedRemappedAt_ = ProbeClock();
+#endif
         PipeBarrier<PIPE_V>();
-        auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
         Simt::VF_CALL<kvip_incremental::TagSeed>(Simt::Dim3{256,1,1},ctx,query/4,runtimeShape_.resident,
             reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()));
+#if KVIP_WINDOW_PROBE
+            seedTaggedAt_ = ProbeClock();
+#endif
 #if !KVIP_INCREMENTAL_SEGMENTS
         SaveIncremental(query % 2);
 #endif
@@ -106,6 +117,54 @@
         listChange_ = ListChange::Rebased;
         SaveIncremental(query % 2);
 #endif
+    }
+
+    __aicore__ inline void SeedIncremental(uint32_t query, uint32_t residentCount,
+        uint32_t begin, uint32_t end, uint32_t causalEnd, uint32_t aligned) {
+        auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+        incrementalTailBegin_ = 0;
+        incrementalTailEnd_ = 0;
+        if (ctx->tailBounds) {
+            auto tail = reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds) + (query / 4) * 2;
+            incrementalTailBegin_ = tail[0]; incrementalTailEnd_ = tail[1];
+        }
+#if KVIP_SEED_MASK
+        if (runtimeShape_.resident <= rotating::kSeedMaskSlots) {
+            const uint32_t resident = runtimeShape_.resident;
+            // This selector returns 16-bit ordinals and never writes the 32-bit index bank.
+            auto bits = indicesOutLocal_;
+            GlobalTensor<uint32_t> source;
+            source.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->seedMask) +
+                                   (query / 4) * rotating::kSeedMaskWords);
+            SetFlag<HardEvent::V_MTE2>(EVENT_ID5); WaitFlag<HardEvent::V_MTE2>(EVENT_ID5);
+            DataCopy(bits, source, ((resident + 63) / 64) * 8);
+            SetFlag<HardEvent::MTE2_V>(EVENT_ID5);
+            topkOp_(mrgValueLocal_, indicesOutLocal_, incrementalScores_, aligned, 0, 1, true, true);
+#if KVIP_WINDOW_PROBE
+            seedSelectedAt_ = seedRemappedAt_ = ProbeClock();
+#endif
+            incrementalStrict_ = topkOp_.IncrementalStrictCount();
+            WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);
+            kvip_incremental::MaterializeSeed(
+                reinterpret_cast<__ubuf__ uint16_t*>(topkOp_.IncrementalOrdinals().GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(bits.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(incrementalIds_.GetPhyAddr()),
+                incrementalStrict_, residentCount, begin, resident, incrementalTailBegin_, incrementalTailEnd_);
+#if KVIP_WINDOW_PROBE
+            seedTaggedAt_ = ProbeClock();
+#endif
+            kvip_incremental::BroadcastThreshold(
+                reinterpret_cast<__ubuf__ uint16_t*>(topkOp_.ThresholdResult().GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_[(query % 2) * 128].GetPhyAddr()));
+            PipeBarrier<PIPE_V>();
+            rotationProgressBase_ = UINT32_MAX;
+            listChange_ = ListChange::Rebased;
+        } else
+#endif
+        {
+            SaveLegacySeed(query, residentCount, begin, aligned, ctx);
+        }
+
 #if KVIP_INCREMENTAL_DIRECT
         incrementalPacked_ = false;
 #endif
@@ -113,10 +172,6 @@
         incrementalBegin_ = runtimeShape_.resident;
         incrementalEnd_ = causalEnd;
         incrementalRecentBegin_ = begin; incrementalRecentEnd_ = end;
-        if(ctx->tailBounds) {
-            auto tail=reinterpret_cast<__gm__ int32_t*>(ctx->tailBounds)+(query/4)*2;
-            incrementalTailBegin_=tail[0]; incrementalTailEnd_=tail[1];
-        }
         uint32_t ends[4] = {runtimeShape_.history,runtimeShape_.history,runtimeShape_.history,runtimeShape_.history};
         if(ctx->queryEnds) for(uint32_t q=0;q<4;++q)
             ends[q]=reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)[query/4*4+q];

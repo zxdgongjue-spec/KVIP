@@ -34,6 +34,12 @@
 #ifndef KVIP_WINDOW_PROBE
 #define KVIP_WINDOW_PROBE 0
 #endif
+#ifndef KVIP_SEED_MASK
+#define KVIP_SEED_MASK 0
+#endif
+#if KVIP_SEED_MASK && !KVIP_INCREMENTAL_SEGMENTS
+#error "Seed mask requires segment lists"
+#endif
 #ifndef KVIP_CONSUMED_PREFIX
 #define KVIP_CONSUMED_PREFIX 0
 #endif

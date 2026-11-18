@@ -68,6 +68,8 @@ class LIFetchBinding:
         self.incremental_topk = bool(option()) if option is not None else False
         probe = getattr(self.library, "kvip_window_probe", None)
         window_probe = bool(probe and probe())
+        mask_option = getattr(self.library, "kvip_seed_mask", None)
+        seed_mask = bool(mask_option and mask_option())
         if self.incremental_topk and (resident != 16384 or self.runtime_shape.indexHeads != 32 or
                 self.runtime_shape.rounds != 9 or not self.runtime_shape.splitQ):
             raise ValueError("Incremental TopK requires split Q4, H32, resident16384 and eight cold windows")
@@ -79,7 +81,7 @@ class LIFetchBinding:
             ("final_replicated", int(final_strategy == "replicated")),
             ("final_workers", final_aivs(batch, li_tiling, aic_count, final_workers)),
             ("aic_count", aic_count),
-            ("abi_version", 12 + self.incremental_topk + 2 * window_probe),
+            ("abi_version", 12 + self.incremental_topk + 2 * window_probe + 4 * seed_mask),
             (
                 "service_lanes",
                 li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)["service_aivs_per_window"],
@@ -93,7 +95,7 @@ class LIFetchBinding:
             ("history", history),
             ("resident", resident),
             ("simulation", 0),
-            ("context_bytes", 328 + 8 * (self.incremental_topk + window_probe)),
+            ("context_bytes", 328 + 8 * (self.incremental_topk + window_probe + seed_mask)),
             ("row_bytes", 1024),
         ):
             fn = getattr(self.library, "v9_" + name)
@@ -236,7 +238,10 @@ class LIFetchBinding:
         if window_probe:
             self.window_times = torch.zeros((batch * 4, self.rounds, 8), dtype=torch.int64, device=self.device)
             blob = np.r_[blob, np.array([self.window_times.data_ptr()], dtype="<u8").view("u1")]
-        if blob.size != 328 + 8 * (self.incremental_topk + window_probe):
+        if seed_mask:
+            self.seed_mask = torch.empty((batch, 16384 // 8), dtype=torch.int32, device=self.device)
+            blob = np.r_[blob, np.array([self.seed_mask.data_ptr()], dtype="<u8").view("u1")]
+        if blob.size != 328 + 8 * (self.incremental_topk + window_probe + seed_mask):
             raise AssertionError("LIFetch Context ABI changed")
         self.context = torch.from_numpy(blob.copy()).to(self.device)
         self.arguments = tuple(arguments) + (self.context,)
