@@ -7,7 +7,7 @@ labels=(after)
 profile=0
 candidate=
 if [[ $# == 2 && $1 == --parity && $2 =~ ^[0-9a-f]{40}$ ]]; then
-    labels=(serial before after after-end before-end serial-end)
+    labels=(serial before after after-end before-end serial-end before-profile after-profile)
     candidate=$2
 elif [[ $# == 1 && $1 == --parity ]]; then
     labels=(serial before after after-end before-end serial-end)
@@ -89,14 +89,19 @@ for ((i=0; i<30; i++)); do
     if grep -Fq "[KVAF_CPU] LISTEN address=127.0.0.1 port=$port" "$out/.cpu.log"; then ready=1; break; fi
     sleep 1
 done
-if [[ $ready != 1 ]] || ! kill -0 "$pid" 2>/dev/null; then tail -n 8 "$out/.cpu.log"; exit 1; fi
+if [[ $ready != 1 ]] || ! kill -0 "$pid" 2>/dev/null; then tail -n 8 "$out/.cpu.log" >&2; exit 1; fi
 
 cd "$diag"
 common=(--snapshot "$snapshot" --build-dir "$build" --transport urma --kvaf-server "127.0.0.1:$port"
-        --device 0 --soc Ascend950DT_9582 --warmup 2 --iterations 10 --quiet)
+        --device 0 --soc Ascend950DT_9582 --warmup 2 --quiet)
 for label in "${labels[@]}"; do
     extra=(--diagnostic-replays 0)
     capture=$profile
+    iterations=10
+    if [[ $label == *-profile ]]; then
+        capture=1
+        iterations=2  # First timed replay learns, second confirms the LOW route.
+    fi
     if [[ $label == serial* ]]; then
         rev=$main; root="$src/main-${rev:0:8}"; args=(--mode serial --serial-workers 32)
     else
@@ -104,19 +109,16 @@ for label in "${labels[@]}"; do
         if [[ $label == before* ]]; then rev=$before; fi
         root="$src/auto-${rev:0:8}"
         args=(--mode fused --study post-threshold --threshold-policy recent --pipeline-variants auto-post-index --check-auto-route)
-        if [[ $label == before || $label == after ]]; then
+        if ((!capture)) && [[ $label == before || $label == after ]]; then
             extra=(--diagnostic-replays 2 --calibrate-counter)
-            if [[ -n $candidate ]]; then capture=1; fi
         fi
     fi
-    if ((profile)); then
-        extra=(--diagnostic-replays 0)
-    fi
+    role=${label%-profile}
     if ((capture)); then
-        extra+=(--profile-dir "$out/$label-profile" --profile-metrics none)
+        extra+=(--profile-dir "$out/$role-profile" --profile-metrics none)
     fi
     log="$out/.$label.log"
-    if python3 -B -m kvip.diagnostics.replay "${common[@]}" "${args[@]}" "${extra[@]}" \
+    if python3 -B -m kvip.diagnostics.replay "${common[@]}" --iterations "$iterations" "${args[@]}" "${extra[@]}" \
         --upstream-root "$root" --upstream-revision "$rev" --output "$out/g2-$label.json" >"$log" 2>&1; then
         if [[ $label == before || $label == after ]]; then
             python3 -B - "$out/g2-$label.json" "$label" "$rev" <<'PY'
@@ -139,7 +141,7 @@ PY
             grep -E '^REPLAY_PASS|^AUTO_ROUTE_PASS|^AUTO_LIFECYCLE_PASS' "$log"
         fi
         if ((capture)); then
-            python3 -B "$diag/tests/diagnostics/tools/g2_kernel_span.py" "$out/$label-profile" "$label"
+            python3 -B "$diag/tests/diagnostics/tools/g2_kernel_span.py" "$out/$role-profile" "$role"
         fi
         rm -f "$log"
     else
@@ -148,9 +150,9 @@ PY
         tail -n 12 "$log" >&2
         exit "$rc"
     fi
+    if [[ $label == serial-end ]]; then
+        python3 -B -m kvip.diagnostics.post_index_plan_report --directory "$out" --group 2 |
+            awk '/^RESULT_BEGIN|ALL_mean\/p50=|^GAIN |^DRIFT |^CLOCK |^CHECK |^OBSERVED |^RESULT_END/ ||
+                 (/^(INIT_LI|PHASE_END|INDEX_CQ|FINALIZE) / && /sample=1 /)'
+    fi
 done
-if ((${#labels[@]} > 1 && !profile)); then
-    python3 -B -m kvip.diagnostics.post_index_plan_report --directory "$out" --group 2 |
-        awk '/^RESULT_BEGIN|ALL_mean\/p50=|^GAIN |^DRIFT |^CLOCK |^CHECK |^OBSERVED |^RESULT_END/ ||
-             (/^(INIT_LI|PHASE_END|INDEX_CQ|FINALIZE) / && /sample=1 /)'
-fi
