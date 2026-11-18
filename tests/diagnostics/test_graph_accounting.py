@@ -98,6 +98,13 @@ def test_paired_rounds_check_profile_identity_and_retained_work(tmp_path, capsys
     assert ("ABLATION init-only-before" in output) == init_only
     assert ("ABLATION after-init-only" in output) == init_only
     assert ("FRONTEND torch-front-before" in output) == (extra == "torch-front")
+    if extra == "torch-front":
+        for number in (1, 2):
+            (tmp_path / f"r{number}-after.json").unlink()
+        with pytest.raises(ValueError, match="incomplete"):
+            summarize(tmp_path)
+        summarize(tmp_path, frontend_only=True)
+        assert "FRONTEND torch-front-before" in capsys.readouterr().out
     if init_only:
         one_side = tmp_path / "r2-init-only.json"
         saved = one_side.read_bytes()
@@ -110,4 +117,4 @@ def test_paired_rounds_check_profile_identity_and_retained_work(tmp_path, capsys
     data["system_profiles"]["passes"][0]["experiment"]["auto_route"]["final_get"] = 0
     path.write_text(json.dumps(data))
     with pytest.raises(ValueError, match="wrong trace route/traffic"):
-        summarize(tmp_path)
+        summarize(tmp_path, frontend_only=extra == "torch-front")

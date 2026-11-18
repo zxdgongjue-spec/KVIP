@@ -15,7 +15,6 @@ from kvip.diagnostics.post_index_order_report import _low_traffic, _validate
 from kvip.diagnostics.read_through_report import load_case, require
 
 
-ROLES = ("serial", "before", "after")
 EDGE_KEYS = ("event_to_execute", "execute_to_kernel", "kernel_to_join", "join_to_event", "event_alignment")
 
 
@@ -187,7 +186,7 @@ def sample(path, role):
     return case, values, kernels
 
 
-def summarize(directory):
+def summarize(directory, frontend_only=False):
     files = defaultdict(dict)
     for path in directory.glob("r*-*.json"):
         match = re.fullmatch(r"r(\d+)-(serial|before|init-only|torch-front|after)\.json", path.name)
@@ -199,8 +198,15 @@ def summarize(directory):
     require(len(rounds) >= 2 and rounds == list(range(1, len(rounds) + 1)), "Need consecutive paired rounds from 1")
     has_init_only = any("init-only" in files[i] for i in rounds)
     has_torch_front = any("torch-front" in files[i] for i in rounds)
-    roles = tuple(r for r in ("serial", "before", "init-only", "torch-front", "after")
-                  if (r != "init-only" or has_init_only) and (r != "torch-front" or has_torch_front))
+    roles = ["serial", "before"]
+    if has_init_only:
+        roles.append("init-only")
+    if has_torch_front:
+        roles.append("torch-front")
+    if frontend_only:
+        require(has_torch_front and not has_init_only, "Missing same-binary frontend comparison")
+    else:
+        roles.append("after")
     require(all(set(files[i]) == set(roles) for i in rounds), "An interleaved round is incomplete")
     rows = {r: [sample(files[i][r], r) for i in rounds] for r in roles}
     base = rows["serial"][0][0]
@@ -260,7 +266,10 @@ def summarize(directory):
             print(output + " " + observed)
         else:
             print(f"QUEUE {role} status=unresolved {observed}")
-    for candidate, control in (("before", "serial"), ("after", "serial"), ("after", "before")):
+    comparisons = [("before", "serial")]
+    if not frontend_only:
+        comparisons.extend([("after", "serial"), ("after", "before")])
+    for candidate, control in comparisons:
         pairs = [(a[1], b[1]) for a, b in zip(rows[candidate], rows[control])]
 
         def delta(key):
@@ -326,13 +335,18 @@ def summarize(directory):
                                    (alternate, "torch.npu.NPUGraph")):
                 prof = case["system_profiles"]["passes"][0]["experiment"]
                 require(case["graph_backend"] == prof["graph_backend"] == expected, "Graph frontend mismatch")
-        for newer, older in (("torch-front", "before"), ("torch-front", "serial")):
-            pairs = [(a[1], b[1]) for a, b in zip(rows[newer], rows[older])]
-            def paired_field(key):
-                return mean(a[key] - b[key] for a, b in pairs)
-            brackets = ",".join(f"{a['headline']-b['headline']:+.3f}/{a['p50']-b['p50']:+.3f}" for a,b in pairs)
-            print(f"FRONTEND {newer}-{older} steady_mean_us={paired_field('headline'):+.3f} "
-                  f"kernel_span_delta={paired_field('kernel_span'):+.3f} round_mean/p50_us={brackets}")
+        for older in ("before", "serial"):
+            pairs = [(a[1], b[1]) for a, b in zip(rows["torch-front"], rows[older])]
+            brackets = ",".join(f"{a['headline'] - b['headline']:+.3f}/{a['p50'] - b['p50']:+.3f}" for a, b in pairs)
+            latency = mean(a["headline"] - b["headline"] for a, b in pairs)
+            span = mean(a["kernel_span"] - b["kernel_span"] for a, b in pairs)
+            print(f"FRONTEND torch-front-{older} steady_mean_us={latency:+.3f} "
+                  f"kernel_span_delta={span:+.3f} round_mean/p50_us={brackets}")
+            if all("sensitivity_after_empty" in a and "sensitivity_after_empty" in b for a, b in pairs):
+                call = mean(a["queued_host_call"] - b["queued_host_call"] for a, b in pairs)
+                wait = mean(a["sensitivity_after_empty"] - b["sensitivity_after_empty"] for a, b in pairs)
+                print(f"QUEUE_DELTA torch-front-{older} net_sensitivity={wait:+.3f} "
+                      f"queued_host_call_delta={call:+.3f} diagnostic_only=true")
     if has_init_only:
         for newer, older in (("init-only", "before"), ("after", "init-only")):
             matched = [(a[1], b[1]) for a, b in zip(rows[newer], rows[older])]
@@ -348,9 +362,10 @@ def summarize(directory):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--directory", type=Path, required=True)
+    p.add_argument("--frontend-only", action="store_true")
     args = p.parse_args()
     try:
-        summarize(args.directory)
+        summarize(args.directory, args.frontend_only)
     except (ValueError, KeyError, TypeError, OSError) as error:
         raise SystemExit(f"ACCOUNTING_FAILED: {error}") from None
 

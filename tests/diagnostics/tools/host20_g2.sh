@@ -10,6 +10,7 @@ high_index=0
 joint=0
 account=0
 frontier=0
+frontend_only=0
 init_only=
 if [[ $# == 4 && $1 == --parity && $4 == --high-post-index ]]; then
     joint=1
@@ -24,6 +25,11 @@ elif [[ $# == 2 && $1 == --low-followup && $2 =~ ^[0-9a-f]{40}$ ]]; then
     frontier=1
     candidate=$2
     labels=(serial before torch-front after after-end torch-front-end before-end serial-end)
+elif [[ $# == 1 && $1 == --low-frontend ]]; then
+    account=1
+    frontier=1
+    frontend_only=1
+    labels=(serial before torch-front torch-front-end before-end serial-end)
 elif [[ ($# == 2 || $# == 3) && $1 == --account && $2 =~ ^[0-9a-f]{40}$ ]]; then
     account=1
     labels=(serial before after after-end before-end serial-end)
@@ -42,7 +48,7 @@ elif [[ $# == 2 && $1 == --high-index && $2 =~ ^[0-9a-f]{40}$ ]]; then
     high_index=1
     candidate=$2
 elif [[ $# != 0 ]]; then
-    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--low-followup CANDIDATE_SHA|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA]"
+    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--low-followup CANDIDATE_SHA|--low-frontend|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA]"
 fi
 
 diag=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
@@ -55,6 +61,10 @@ snapshot="$cache/skip-results.po80Nw/g2-input"
 main=532df2c8dfcb27cf8ab203f70d5bdf3510d77b6c
 before=96198a2bfc9ba2e983c090225b9acdfdf40c6099
 after=0f103cc1b6db1beacfb90023d02befc5eff8ae9e
+if ((frontend_only)); then
+    before=cdfc4da4b53b80255740183c7a0a8db8bf350dcb
+    after=none
+fi
 if [[ -n $candidate ]]; then
     before=${3:-$after}
     if ((account)); then before=66a2f469ebaec3b35fff789a75177ee19b00213e; fi
@@ -230,5 +240,7 @@ PY
 done
 
 if ((account)); then
-    python3 -B -m kvip.diagnostics.graph_accounting --directory "$out"
+    report_args=(--directory "$out")
+    if ((frontend_only)); then report_args+=(--frontend-only); fi
+    python3 -B -m kvip.diagnostics.graph_accounting "${report_args[@]}"
 fi
