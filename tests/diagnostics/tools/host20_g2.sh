@@ -7,6 +7,11 @@ labels=(after)
 profile=0
 candidate=
 high_index=0
+joint=0
+if [[ $# == 4 && $1 == --parity && $4 == --high-post-index ]]; then
+    joint=1
+    set -- "$1" "$2" "$3"
+fi
 if [[ ($# == 2 || $# == 3) && $1 == --parity && $2 =~ ^[0-9a-f]{40}$ ]]; then
     labels=(serial before after after-end before-end serial-end before-profile after-profile)
     candidate=$2
@@ -20,7 +25,7 @@ elif [[ $# == 2 && $1 == --high-index && $2 =~ ^[0-9a-f]{40}$ ]]; then
     high_index=1
     candidate=$2
 elif [[ $# != 0 ]]; then
-    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA]]|--kernels|--high-index CANDIDATE_SHA]"
+    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--kernels|--high-index CANDIDATE_SHA]"
 fi
 
 diag=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
@@ -131,6 +136,7 @@ for label in "${labels[@]}"; do
         if [[ $label == before* ]]; then rev=$before; fi
         root="$src/auto-${rev:0:8}"
         args=(--mode fused --study post-threshold --threshold-policy recent --pipeline-variants auto-post-index --check-auto-route)
+        if ((joint)); then args+=(--high-post-index); fi
         if ((!capture)) && [[ $label == before || $label == after ]]; then
             extra=(--diagnostic-replays 2 --calibrate-counter)
         fi
@@ -143,12 +149,12 @@ for label in "${labels[@]}"; do
     if python3 -B -m kvip.diagnostics.replay "${common[@]}" --iterations "$iterations" "${args[@]}" "${extra[@]}" \
         --upstream-root "$root" --upstream-revision "$rev" --output "$out/g2-$label.json" >"$log" 2>&1; then
         if [[ $label == before || $label == after ]]; then
-            python3 -B - "$out/g2-$label.json" "$label" "$rev" <<'PY'
+            python3 -B - "$out/g2-$label.json" "$label" "$rev" "$joint" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-path, label, revision = sys.argv[1:]
+path, label, revision, joint = sys.argv[1:]
 case = json.loads(Path(path).read_text())["cases"]["auto-post-index"]
 lifecycle = case["auto_route"]["lifecycle"]
 policy = lifecycle["low_history_map_contract"]
@@ -157,6 +163,16 @@ rows = sum(row["mode"] == "low" and row["poisoned_history_map"] for row in lifec
 if case["kvip_commit"] != revision or lifecycle["status"] != "pass" or policy != want or not rows:
     raise SystemExit(f"MAP_CHECK_FAILED label={label} policy={policy} tested_low_steps={rows} JSON={path}")
 print(f"MAP_CHECK_PASS label={label} policy={policy} tested_low_steps={rows}")
+if joint == "1":
+    observed = [step["mode"] for step in case["auto_route"]["samples"]]
+    reads = case["reads_samples"]
+    if (not case.get("high_post_index") or set(observed) != {"low", "high"}
+            or len(reads) != len(observed)
+            or any(bool(row.get("high_post_index")) != (mode == "high")
+                   or row["post_index"]["active"] != (mode == "low")
+                   for mode, row in zip(observed, reads))):
+        raise SystemExit(f"JOINT_ROUTE_FAILED label={label} JSON={path}")
+    print(f"JOINT_ROUTE_PASS label={label} low={observed.count('low')} high={observed.count('high')}")
 PY
         fi
         if ((${#labels[@]} == 1)); then
