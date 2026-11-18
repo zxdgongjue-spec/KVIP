@@ -68,7 +68,7 @@
     __aicore__ inline void SaveIncremental(uint32_t bank) {
         PipeBarrier<PIPE_V>();
         DataCopy(incrementalScores_, scoreOutLocal_, 2048);
-#if KVIP_INCREMENTAL_SEGMENTS
+#if KVIP_INCREMENTAL_SEGMENTS && (!KVIP_NATIVE_TRUNK || KVIP_TRUNK_PRUNED)
         kvip_incremental::FlipTies<false>(
             reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(incrementalIds_.GetPhyAddr()), incrementalStrict_);
@@ -188,6 +188,38 @@
         listChange_ = ListChange::Unchanged;
 #endif
         if (!incrementalCount_) return;
+#if KVIP_NATIVE_TRUNK && !KVIP_TRUNK_PRUNED
+        // The prior epoch issued its readiness DMA from an immutable stripe.
+        // The current score DMA may still be reading this merge buffer.
+        SetFlag<HardEvent::MTE3_V>(EVENT_ID0); WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+        PipeBarrier<PIPE_V>();
+        const uint32_t count = kvip_incremental::kTop + incrementalCount_;
+        const uint32_t aligned = QLICommon::Align(count, uint32_t(256));
+        DataCopy(mrgValueLocal_, incrementalScores_, kvip_incremental::kTop);
+        if (count != aligned)
+            kvip_incremental::ZeroTail(reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_.GetPhyAddr()),
+                                      count, aligned);
+        PipeBarrier<PIPE_V>();
+        topkOp_.SelectTrunk(mrgValueLocal_, incrementalScores_, aligned);
+        PipeBarrier<PIPE_V>();
+        auto idx = reinterpret_cast<__ubuf__ uint16_t*>(topkOp_.IncrementalOrdinals().GetPhyAddr());
+        kvip_incremental::Materialize<false>(idx,
+            reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(incrementalIds_.GetPhyAddr()), nullptr,
+            reinterpret_cast<__ubuf__ uint16_t*>(incrementalScores_.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(topkSharedTmpLocal_[32].GetPhyAddr()), 0,
+            incrementalCount_, incrementalBegin_, incrementalReverseBegin_, incrementalReverseEnd_,
+            incrementalTailBegin_, incrementalTailEnd_);
+        incrementalPending_ = GetSpr<SpecialPurposeReg::AR>() / sizeof(uint32_t);
+        PipeBarrier<PIPE_V>();
+        DataCopy(incrementalIds_, indicesOutLocal_, kvip_incremental::kTop);
+        kvip_incremental::BroadcastThreshold(
+            reinterpret_cast<__ubuf__ uint16_t*>(topkOp_.ThresholdResult().GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_[bank*128].GetPhyAddr()));
+        PipeBarrier<PIPE_V>();
+        incrementalCount_ = 0;
+#else
         // The original progress table aliases scoreOut. With an independent
         // bank, score/progress DMA sources are disjoint from selector outputs.
         // PublishIncremental still joins its own payload/header transfers.
@@ -204,7 +236,11 @@
 #else
         kvip_incremental::PackWindow<false>(window,
 #endif
-            reinterpret_cast<__ubuf__ uint16_t*>(packed.GetPhyAddr()), incrementalCount_);
+            reinterpret_cast<__ubuf__ uint16_t*>(packed.GetPhyAddr()), incrementalCount_
+#if KVIP_TRUNK_PRUNED
+            , reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_[bank * 128].GetPhyAddr())
+#endif
+            );
         const uint32_t admitted = GetSpr<SpecialPurposeReg::AR>() / sizeof(uint16_t);
         if (!admitted) {
             incrementalCount_ = 0;
@@ -343,6 +379,7 @@
 #endif
         SaveIncremental(bank);
         incrementalCount_ = 0;
+#endif
     }
 
 #if KVIP_INCREMENTAL_SEGMENTS
@@ -406,7 +443,27 @@
 #endif
 
     __aicore__ inline void PublishIncremental(uint32_t query, uint32_t epoch) {
-#if KVIP_INCREMENTAL_SEGMENTS
+#if KVIP_NATIVE_TRUNK && !KVIP_TRUNK_PRUNED
+        using namespace kvip_incremental;
+        auto header = topkSharedTmpLocal_;
+        if (epoch == 0) {
+            CompactIds(reinterpret_cast<__ubuf__ uint32_t*>(incrementalIds_.GetPhyAddr()),
+                       reinterpret_cast<__ubuf__ uint32_t*>(header[kHeader].GetPhyAddr()));
+            incrementalPending_ = AscendC::GetSpr<AscendC::SpecialPurposeReg::AR>() / sizeof(uint32_t);
+        }
+        ListHeader(reinterpret_cast<__ubuf__ uint32_t*>(header.GetPhyAddr()),
+                   reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_[(query%2)*128].GetPhyAddr()),
+                   incrementalPending_, epoch+1, epoch, 0, epoch);
+        auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+        GlobalTensor<uint32_t> list;
+        list.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->incrementalLists) +
+                             uint64_t(query*runtimeShape_.rounds + epoch)*kListWords);
+        SetFlag<HardEvent::V_MTE3>(EVENT_ID0); WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        DataCopy(list,header,kHeader+(incrementalPending_+7)/8*8);
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0); WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        auto ready = incrementalScores_[kTop+32].template ReinterpretCast<uint32_t>();
+        DataCopy(rotationProgressGm_[query*32+kReadyWord],ready[epoch*8],8);
+#elif KVIP_INCREMENTAL_SEGMENTS
         PublishSegments(query, epoch);
 #else
         auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);

@@ -127,6 +127,15 @@ class LITopk<uint16_t> {
 public:
 #if KVIP_INCREMENTAL_TOPK
 #if KVIP_INCREMENTAL_DIRECT
+#if KVIP_NATIVE_TRUNK && !KVIP_TRUNK_PRUNED
+    __aicore__ inline void SelectTrunk(LocalTensor<uint16_t> values, LocalTensor<uint16_t> unusedScores,
+                                        uint32_t alignedLen) {
+        // Return native strict-then-tie ordinals. The caller gathers scores,
+        // physical IDs and the Fetch payload together.
+        topkb16gather::LiTopKVF<false>(tmpIndexLocal, unusedScores, values, histogramsLocal,
+            idxHighLocal, idxLowLocal, nkValueLocal, topK, alignedLen);
+    }
+#endif
     __aicore__ inline LocalTensor<uint16_t> IncrementalOrdinals() { return tmpIndexLocal; }
 #if KVIP_INCREMENTAL_TIES
     __aicore__ inline uint32_t IncrementalStrictCount() { return incrementalStrictCount_; }

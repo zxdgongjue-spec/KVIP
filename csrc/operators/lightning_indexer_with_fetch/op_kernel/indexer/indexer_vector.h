@@ -957,6 +957,16 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
 #if KVIP_INCREMENTAL_TOPK
     const bool incrementalTile = !scoreOnly && curS2Idx >= runtimeShape_.resident && incrementalReady_;
     bool incrementalRelease = false;
+#if KVIP_NATIVE_TRUNK
+    const uint32_t tileMask = incrementalTile ? kvip_rolling::TileMask(
+        curS2Idx, incrementalEnd_, incrementalRecentBegin_, incrementalRecentEnd_) : 0;
+    if (curAivS1ProcNum == 1 && (tileMask & 255) == 128 &&
+        ((tileMask >> 8) & 255) == ((tileMask >> 16) & 255)) {
+        // The complete tile can serve both the score export and the native
+        // window selector. The boundary joins the export before scratch reuse.
+        outBase = mrgValueLocal_[2048 + info.s2Idx*128 - incrementalBegin_];
+    }
+#endif
 #endif
     if (!scoreOnly && curS2Idx >= runtimeShape_.resident) {
     vector1::BatchClassifyScore(outBase, UB_BANK_DEPTH_STRIDE / sizeof(SCORE_T),
@@ -976,7 +986,11 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
 #endif
         incrementalTile ? reinterpret_cast<__ubuf__ uint16_t*>(incrementalOffsets_[incrementalCount_].GetPhyAddr()) : nullptr,
         uint16_t(info.s2Idx*128-incrementalBegin_),
+#if KVIP_NATIVE_TRUNK
+        tileMask
+#else
         kvip_rolling::TileMask(curS2Idx,incrementalEnd_,incrementalRecentBegin_,incrementalRecentEnd_)
+#endif
 #endif
         );
 #if KVIP_INCREMENTAL_TOPK && !KVIP_INCREMENTAL_WINDOW
@@ -1363,7 +1377,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
 #if KVIP_INCREMENTAL_TOPK
         if(!prefixActive_ && incrementalReady_) {
             MergeIncremental((curS1Idx+rowIdx)%2);
-#if KVIP_INCREMENTAL_SEGMENTS
+#if KVIP_INCREMENTAL_SEGMENTS && (!KVIP_NATIVE_TRUNK || KVIP_TRUNK_PRUNED)
             kvip_incremental::FlipTies<true>(
                 reinterpret_cast<__ubuf__ uint32_t*>(incrementalIds_.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()), incrementalStrict_);

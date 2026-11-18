@@ -6,6 +6,8 @@
 extern "C" uint32_t kvip_incremental_window() { return KVIP_INCREMENTAL_WINDOW; }
 extern "C" uint32_t kvip_incremental_inplace() { return KVIP_INCREMENTAL_INPLACE; }
 extern "C" uint32_t kvip_window_probe() { return KVIP_WINDOW_PROBE; }
+extern "C" uint32_t kvip_trunk_pruned() { return KVIP_TRUNK_PRUNED; }
+extern "C" uint32_t kvip_native_trunk() { return KVIP_NATIVE_TRUNK; }
 extern "C" uint32_t kvip_seed_parallel() { return KVIP_SEED_PARALLEL; }
 extern "C" uint32_t kvip_seed_mask() { return KVIP_SEED_MASK; }
 extern "C" uint32_t kvip_consumed_prefix() { return KVIP_CONSUMED_PREFIX; }

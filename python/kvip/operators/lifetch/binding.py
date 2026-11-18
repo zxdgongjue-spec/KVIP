@@ -73,6 +73,9 @@ class LIFetchBinding:
         if self.incremental_topk and (resident != 16384 or self.runtime_shape.indexHeads != 32 or
                 self.runtime_shape.rounds != 9 or not self.runtime_shape.splitQ):
             raise ValueError("Incremental TopK requires split Q4, H32, resident16384 and eight cold windows")
+        trunk_option = getattr(self.library, "kvip_native_trunk", None)
+        if trunk_option and trunk_option() and history - resident > 8 * 16384:
+            raise ValueError("Eight Fetch windows exceed the native 16K score buffer")
         if self.incremental_topk and (threshold_bounds is None or query_ends is None):
             raise ValueError("Incremental TopK requires a validated resident+recent seed")
         self.shape_pointer = ctypes.byref(self.runtime_shape)

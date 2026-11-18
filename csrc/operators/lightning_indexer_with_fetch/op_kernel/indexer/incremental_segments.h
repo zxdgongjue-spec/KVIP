@@ -38,10 +38,14 @@ __simd_vf__ inline void MaterializeSeed(__ubuf__ uint16_t* ordinals, __ubuf__ ui
         auto& lane = reinterpret_cast<RegTensor<uint32_t>&>(lanes);
         RegTensor<uint32_t> rank, ordinal, token, index, shift, word, tagged;
         MaskReg keep, prefix, hot, flagged, cold, left, right, outside, needs;
+#if KVIP_NATIVE_TRUNK && !KVIP_TRUNK_PRUNED
+        GatherU16(ordinal, ordinals, lane);
+#else
         Sub(rank, last, lane, all);
         CompareScalar<uint32_t, CMPMODE::LT>(keep, lane, strict, all);
         Select(rank, lane, rank, keep);
         GatherU16(ordinal, ordinals, rank);
+#endif
         Adds(token, ordinal, recentBegin - residentCount, all);
         CompareScalar<uint32_t, CMPMODE::LT>(prefix, ordinal, residentCount, all);
         Select(token, ordinal, token, prefix);

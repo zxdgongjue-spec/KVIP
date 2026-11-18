@@ -30,7 +30,7 @@ __simd_callee__ inline void StoreWindow(RegTensor<uint16_t>& score,
     CompareScalar<uint16_t, CMPMODE::GE>(right, index, uint16_t((laneMask >> 16) & 255), all);
     MaskOr(outside, left, right, all);
     MaskAnd(valid, valid, outside, all);
-#if KVIP_INCREMENTAL_PREFILTER
+#if KVIP_INCREMENTAL_PREFILTER && !KVIP_NATIVE_TRUNK
     // Current window's Kth is fixed until its boundary. Keep only strict
     // improvements: existing K precede new equal-score entries in tie order.
     RegTensor<uint16_t> threshold;
@@ -51,16 +51,28 @@ __simd_callee__ inline void StoreWindow(RegTensor<uint16_t>& score,
 // keeps the original fixed-position scores, without truncation.
 template<bool positions>
 __simd_vf__ inline void PackWindow(__ubuf__ uint16_t* input,
-    __ubuf__ uint16_t* output, uint32_t count) {
+    __ubuf__ uint16_t* output, uint32_t count
+#if KVIP_TRUNK_PRUNED
+    , __ubuf__ uint16_t* cutoff
+#endif
+    ) {
     auto all = CreateMask<uint16_t, MaskPattern::ALL>();
     RegTensor<uint16_t> value, packed;
     RegTensor<int16_t> offset;
     MaskReg admitted;
+#if KVIP_TRUNK_PRUNED
+    RegTensor<uint16_t> threshold;
+    LoadAlign<uint16_t, LoadDist::DIST_BRC_B16>(threshold, cutoff);
+#endif
     UnalignRegForStore store;
     ClearSpr<AscendC::SpecialPurposeReg::AR>();
     for (uint16_t base = 0; base < count; base += 128) {
         LoadAlign(value, input + base);
+#if KVIP_TRUNK_PRUNED
+        Compare<uint16_t, CMPMODE::GT>(admitted, value, threshold, all);
+#else
         CompareScalar<uint16_t, CMPMODE::GT>(admitted, value, uint16_t(0), all);
+#endif
         if constexpr (positions) {
             Arange(offset, int16_t(base));
             Squeeze<uint16_t, AscendC::MicroAPI::GatherMaskMode::STORE_REG>(

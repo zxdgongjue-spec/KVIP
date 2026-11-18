@@ -46,6 +46,18 @@
 #if KVIP_SEED_MASK && !KVIP_INCREMENTAL_SEGMENTS
 #error "Seed mask requires segment lists"
 #endif
+#ifndef KVIP_TRUNK_PRUNED
+#define KVIP_TRUNK_PRUNED 0
+#endif
+#ifndef KVIP_NATIVE_TRUNK
+#define KVIP_NATIVE_TRUNK 0
+#endif
+#if KVIP_NATIVE_TRUNK && !KVIP_SEED_MASK
+#error "Native trunk requires the tagged seed and canonical snapshot lists"
+#endif
+#if KVIP_TRUNK_PRUNED && !KVIP_NATIVE_TRUNK
+#error "Trunk pruning requires shared window scores"
+#endif
 #ifndef KVIP_CONSUMED_PREFIX
 #define KVIP_CONSUMED_PREFIX 0
 #endif
