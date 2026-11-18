@@ -244,7 +244,7 @@ def test_size_matching_uses_only_same_step_and_all_four_counts():
     assert size_near_pairs(cases, "before") == [8]*5 + [16]*9
 
 
-@pytest.mark.parametrize("mutation", ["none", "stale_counts", "wrong_donor", "same_work_wrong_lane", "two_donors", "empty"])
+@pytest.mark.parametrize("mutation", ["none", "stale_counts", "wrong_donor", "same_work_wrong_lane", "two_donors", "idle_helper", "missing_post", "empty"])
 def test_reassigned_get_uses_real_descriptor_totals_and_physical_core_submissions(mutation):
     from kvip.diagnostics.high_index_profile import check_get_reassignment
     canonical = np.zeros((16, 4), dtype=np.int32)
@@ -255,8 +255,14 @@ def test_reassigned_get_uses_real_descriptor_totals_and_physical_core_submission
     if mutation != "empty":
         marks[3, 22] = marks[19, 21] = 500
         marks[19, 23] = 1
+        marks[19, 8] = 2
         actual[3], actual[19] = 524, 507
-    if mutation == "stale_counts":
+    if mutation == "idle_helper":
+        canonical[3, 1] = marks[19, 20] = 0
+        actual[19] = 500
+    elif mutation == "missing_post":
+        marks[19, 8] = 1
+    elif mutation == "stale_counts":
         canonical[3, 1] = 10
     elif mutation == "wrong_donor":
         marks[19, 23] = 3

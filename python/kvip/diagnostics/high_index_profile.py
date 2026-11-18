@@ -297,6 +297,7 @@ def check_get_reassignment(counts, marks, canonical):
     # suffix onto one helper; neither the Index events nor descriptor lists move.
     if (not np.array_equal(canonical, source) or np.any(canonical > 2048)
             or np.any(give > source) or np.any(take > 2048)
+            or np.any((take > 0) & ((source == 0) | (marks[:, 8].reshape(4, 16) != 2)))
             or np.any((take > 0) & (give > 0)) or np.any((take == 0) != (donor == 0))
             or np.any((give > 0).sum(axis=0) > 1) or np.any((take > 0).sum(axis=0) > 1)
             or not np.array_equal(take.sum(axis=0), give.sum(axis=0))
