@@ -211,7 +211,7 @@ def _preplan_detail(marks, moved, work):
                 first_preplan_to_last_index=post[1]-int(start.min()))
 
 
-def decode_high_index(records, detail, *, wait_first, final_get, work):
+def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan_expected=False):
     records = np.asarray(records)
     if records.dtype != np.int64 or records.shape != (64, 16):
         raise ValueError("HIGH requires one 128-byte record per AIV")
@@ -259,7 +259,12 @@ def decode_high_index(records, detail, *, wait_first, final_get, work):
         if np.any(joined == 0) or np.any(joined < np.maximum(marks[:, 6], marks[:, 7])):
             raise ValueError("Incomplete or unordered final HIGH collective markers")
         result["joined_span"] = span(marks[:, 3], joined)
-    if np.any(marks[:, 14:23]):
+    from kvip.diagnostics.high_index_cold_plan import decode_choices
+
+    cold = decode_choices(marks, cold_plan_expected)
+    if cold:
+        result["cold_plan"] = cold
+    if cold or np.any(marks[:, 14:23]):
         result["preplan"] = _preplan_detail(marks, moved, work)
     subphases = marks[:, [4, 11, 12, 5]]
     if np.any(subphases[:, 1:3]):

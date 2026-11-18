@@ -292,12 +292,17 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
                 reads["high_post_index"] = decode_high_index(
                     records, detail, wait_first=bool(getattr(bundle.forward, "post_index_wait_first", False)),
                     final_get=reads["final"], work=work,
+                    cold_plan_expected=getattr(bundle, "cold_plan_expected", False),
                 )
                 if detail is not None:
                     phase = reads["high_post_index"]
                     phase["row_load"] = describe_row_load(
                         flags, src, dst, phase["moved"], bundle.forward.resident,
                         planned_row_moves=phase.get("preplan", {}).get("row_moves"))
+                    if phase.get("cold_plan"):
+                        from kvip.diagnostics.high_index_cold_plan import verify_choices
+
+                        verify_choices(phase, flags, src, dst, bundle.forward.resident, bundle.forward.history)
             reads["post_index"] = decode_post_index(
                 records,
                 active=low_active,
@@ -770,6 +775,8 @@ def measure_case(args, archive, context, retained):
         retained["buffers"] = case_retained["buffers"]
         retained["buffers_variant"] = retained["progress"].get("variant")
         if getattr(args, "high_post_index", False):
+            production = Path(args.upstream_root) / "csrc/operators/lightning_indexer_with_fetch/op_kernel"
+            bundle.cold_plan_expected = (production / "high_index_cold_plan.h").is_file()
             feature = getattr(bundle.rotating.library, "kvip_high_post_index", None)
             if not bundle.tuning.get("low_miss_post_index") or feature is None or feature() != 1:
                 raise ValueError("The loaded binary lacks full-AIV HIGH Index support")

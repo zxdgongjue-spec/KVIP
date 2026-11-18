@@ -70,7 +70,8 @@ def index_rows(case):
         rows.append(dict(key=key, events=phase["event_count"], moves=sum(phase["moved"]),
                          lane_moves=phase["moved"], active=phase["active_aiv"],
                          row_load=phase.get("row_load"), last_end_aiv=phase.get("last_end_aiv"),
-                         preplan=early, **times))
+                         preplan=early, cold_plan=phase.get("cold_plan"),
+                         rate=rate, **times))
     require(rows, "No naturally selected HIGH in diagnostic samples")
     return rows
 
@@ -156,6 +157,17 @@ def summarize(group, cases, revision):
                   + " ".join(f"{k}_us={pair([r['preplan'][k] for r in rows])}" for k in EARLY_TIMES)
                   + " " + " ".join(f"{k}={pair([r['preplan'][k] for r in rows])}"
                                   for k in ("pairs", "long_moves", "spilled", "hot_invalidations")))
+        if rows[0]["cold_plan"]:
+            require(all(r["cold_plan"]["cpu_eligibility_checked"] for r in rows), "Unverified cold-plan choice")
+            fast = sum(len(r["cold_plan"]["fast_rows"]) for r in rows)
+            fallback = sum(len(r["cold_plan"]["fallback_rows"]) for r in rows)
+            fast_events = sum(r["cold_plan"]["fast_events"] for r in rows)
+            fallback_events = sum(r["cold_plan"]["fallback_events"] for r in rows)
+            coverage = 100*fast_events/(fast_events+fallback_events) if fast_events+fallback_events else 0
+            print(f"G{group} COLD_PLAN {arm} row_steps_fast/fallback={fast}/{fallback}"
+                  f" events_fast/fallback={fast_events}/{fallback_events} fast_event_coverage={coverage:.2f}%"
+                  f" max_lane_probe_us_mean/p50={pair([max(r['cold_plan']['probe_active_cycles'])/r['rate'] for r in rows])}"
+                  " cpu_choices/persistent_permutation=PASS")
         if arm in ("old", "candidate") and rows[0]["row_load"]:
             # Report the critical shape on the actual slowest instrumented sample.
             worst = max(rows, key=lambda r: r["index_span"])

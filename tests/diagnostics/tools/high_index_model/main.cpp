@@ -33,17 +33,74 @@ struct D {
         return x;
     }
 };
+#if INDEX_COLD_PLAN
+// Read the complete raw phases independently of the candidate's sparse planner.
+// The existing CPU permutation check below still compares every device output byte.
+static void CheckColdChoices(const std::vector<pipeline_ab::BatchFlag> &flags,
+                            const std::vector<uint32_t> &src, const std::vector<uint32_t> &dst,
+                            const std::vector<uint64_t> &ticks, uint32_t batch, uint32_t resident,
+                            uint32_t history, uint32_t stride) {
+    using namespace pipeline_ab;
+    uint32_t fastRows=0, fastEvents=0, fallbackEvents=0, totalProbe=0;
+    for (uint32_t b=0; b<batch; ++b) {
+        std::unordered_set<uint32_t> sources;
+        bool eligible=resident<=16384 && history<=210944;
+        uint32_t end=2048, events=0, probe=0;
+        for (unsigned ph=0; ph<5; ++ph) {
+            auto count=flags[b*kFlagCount+(ph ? 12+ph-1 : 0)].count;
+            uint32_t offset=ph ? end : 0;
+            if (ph) end+=count;
+            events+=count;
+            if (!eligible) continue;
+            probe+=count;
+            for (uint32_t k=0; k<count && eligible; k+=512) {
+                std::unordered_set<uint32_t> victims;
+                for (uint32_t j=k; j<std::min(k+512, count); ++j) {
+                    const uint32_t i=b*stride+offset+j, s=src[i], d=dst[i];
+                    if (s<resident || s>=history || d>=resident ||
+                        !sources.insert(s).second || !victims.insert(d).second) {
+                        eligible=false;
+                        break;
+                    }
+                }
+            }
+        }
+        for (unsigned lane=0; lane<4; ++lane) {
+            auto t=ticks.data()+batch*256+(lane*batch+b)*32;
+            if (lane==2) {
+                if (t[23]!=0x43503231 || t[24]!=(eligible ? 1U : 2U) || t[25]!=probe || t[26]>t[21])
+                    throw std::runtime_error("cold-plan strategy/count differs from CPU eligibility on row "+std::to_string(b));
+            } else if (t[23] || t[24] || t[25] || t[26]) {
+                throw std::runtime_error("cold-plan markers published by an unexpected lane");
+            }
+        }
+        fastRows+=eligible;
+        if (eligible) fastEvents+=events; else fallbackEvents+=events;
+        totalProbe+=probe;
+    }
+    std::printf("COLD_PLAN_MODEL fast_rows=%u fallback_rows=%u fast_events=%u fallback_events=%u "
+                "submitted_probe_phase_events=%u cpu_choices=PASS\n", fastRows, batch-fastRows,
+                fastEvents, fallbackEvents, totalProbe);
+}
+#endif
+
 int main(int argc, char **argv) {
     try {
         using namespace rotating;
         using namespace pipeline_ab;
-        constexpr uint32_t H = 32768, R = 16384, E = 10240;
+        constexpr uint32_t R = 16384, E = 10240;
+#if INDEX_TARGET_NPU
+        constexpr uint32_t H = 131328, coldStride = 7919;
+#else
+        constexpr uint32_t H = 32768, coldStride = 7;
+#endif
+        static_assert(std::gcd(coldStride, H - R) == 1, "Cold sources must remain unique");
         const uint32_t B = 16, C = 64, A = H + 128;
         const std::string layout = argc == 2 ? argv[1] : "";
         const bool countEvents = layout == "even-events" || layout == "skew-events";
         const bool exact = layout == "even" || layout == "skew" || countEvents;
         const bool skew = layout == "skew" || layout == "skew-mixed" || layout == "skew-events";
-        if (!exact && layout != "even-mixed" && layout != "skew-mixed")
+        if (!exact && layout != "even-mixed" && layout != "skew-mixed" && layout != "mixed-fallback")
             throw std::runtime_error("unknown Index fixture layout");
         RuntimeShape shape{};
         shape.batch = B;
@@ -85,10 +142,14 @@ int main(int argc, char **argv) {
                     uint32_t i = ph ? 2048 + off + j : j;
                     // Deterministic sparse permutation; re-use a prior destination on odd rows to
                     // force real closures across phases.
-                    uint32_t s = R + ((start + j) * 7) % R, cell = start + j;
+                    uint32_t s = R + ((start + j) * coldStride) % (H - R), cell = start + j;
                     if (!exact && (b & 1) && ph > 0 && j == 0)
                         cell = ph - 1;
                     uint32_t d = (cell * 13) % R;
+                    // A legal nonresident destination forces the general planner on four rows.
+                    // The remaining rows still take the cold fast path in the same launch.
+                    if (layout == "mixed-fallback" && b % 4 == 0 && ph == 3 && j == 0)
+                        d = H-1;
                     src[b * E + i] = s;
                     dst[b * E + i] = d;
                 }
@@ -284,6 +345,9 @@ int main(int argc, char **argv) {
                 gather = std::max(gather, t[12]);
                 finish = std::max(finish, t[6]);
             }
+#if INDEX_COLD_PLAN
+            CheckColdChoices(flags, src, dst, ticks, B, R, H, E);
+#endif
             if (movedCount != moves)
                 throw std::runtime_error("per-core moved counters differ from CPU oracle");
             const uint64_t first = earlyEnd ? std::min(earlyStart, start) : start;
