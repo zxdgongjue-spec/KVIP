@@ -337,3 +337,11 @@ TopK预算独立固定为64 AIV。B16已有64个真实Q，因此原TopK可用64 
 采样沿用warmup4/iterations20、丢弃r0、三轮交错同轮配对，msprof单独采集。结果在打印的`li_radix_full_*/results/summary.csv`；重点比较`uniform_p2_radix`的 **`li_over_uniform_p2`**，小于1才说明在相同score调度下，分片radix改善了完整LI。`topk_over_uniform_p2`用于定位尾部影响，`li_over_batch_li`用于衡量score＋TopK总体改动。完整LI直接计时，不用score与TopK的独立p50相加；30/32核目录之间可对照绝对时间，但不属于同轮配对比值。原八组score调度实验仍使用 [run_b16_a5.sh](run_b16_a5.sh)。
 
 开发验证：B1及B16两种核预算的实际host入口、任务覆盖、canonical/TopK oracle、launch计划与汇总配对均通过CPU检查；NPU编译链接通过。CPU事件样本仅用于校验汇总逻辑，不提供性能结论；B16/H128K的完整LI及msprof耗时需在A5运行后获取。
+
+## B1/P16：三个producer融合方案
+
+仓库入口 [run_producer_a5.sh](run_producer_a5.sh) 比较原score＋scatter＋TopK、直接输出＋原TopK、score融合高位histogram＋单kernel尾部、score融合局部Top2048＋全局候选选择。固定H128K/Q4/G32/P16，直接测完整LI；三个候选均2次launch。命令、计时范围、候选数据规模、Model限制及提交划分见 [PRODUCER_REPORT.md](PRODUCER_REPORT.md)。
+
+```bash
+bash experiments/li_qk/run_producer_a5.sh --device 5 --profile
+```

@@ -1,0 +1,49 @@
+{
+  "scope": "fixed B1/Q4/H128K/G32/D128/K2048/P16, complete numerical LI, one Model run per accepted case, no Fetch",
+  "fixture_sha256": {
+    "query": "3fd392bd00b2c981001d540d6c88262cf25919ce22283e29f6c2dbb9220766d2",
+    "key": "38256f383caf290a8b90a5ad47c658a07ded7efc583709110eef790f95fb506f",
+    "weight": "bcdefa3e55f2adf59e60b521bfcd84c3402ad2f52a126c14fc6bfbd1084e5f5c",
+    "qscale": "9e53a2505106b47809441a06250375bce7f2009d3393dc68dcde626790cf8af4",
+    "kscale": "50b2c297046606cdddc315a97e5e7ad7425fb05bf67206646a72d385a6d24f36",
+    "oracle": "fb5de73938b93969a807badd72591185cfacf6bae8c034c76aa4dc24e885a44a"
+  },
+  "rows": [
+    {
+      "case": "split_scatter",
+      "correctness": "PASS",
+      "full_li_launches": 3,
+      "whole_model_ticks": 108827,
+      "over_split_scatter": 1.0,
+      "reduction_percent": 0.0,
+      "over_direct": 1.1281384114610329
+    },
+    {
+      "case": "direct",
+      "correctness": "PASS",
+      "full_li_launches": 2,
+      "whole_model_ticks": 96466,
+      "over_split_scatter": 0.8864160548393322,
+      "reduction_percent": 11.358394516066783,
+      "over_direct": 1.0
+    },
+    {
+      "case": "high_fused",
+      "correctness": "PASS",
+      "full_li_launches": 2,
+      "whole_model_ticks": 146422,
+      "over_split_scatter": 1.3454565503046119,
+      "reduction_percent": -34.545655030461184,
+      "over_direct": 1.5178612153504862
+    },
+    {
+      "case": "local_topk",
+      "correctness": "PASS",
+      "full_li_launches": 2,
+      "whole_model_ticks": 107596,
+      "over_split_scatter": 0.9886884688542366,
+      "reduction_percent": 1.1311531145763443,
+      "over_direct": 1.1153774386830593
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+{
+  "scope": "Only the listed computation sources are checked. Receipts remain unmodified; their old local commit and dirty state are preserved.",
+  "sha256": {
+    "experiments/li_qk/producer.cpp": {
+      "build": "bcbf07ca4afebf3be35eb7680814479b3fc0674a16c29a3854adbaaef9cb5fe8",
+      "current": "bcbf07ca4afebf3be35eb7680814479b3fc0674a16c29a3854adbaaef9cb5fe8",
+      "match": true
+    },
+    "experiments/li_qk/producer_device.h": {
+      "build": "6328c8235510795c60180210e058058b56975ba6a48cfa8318a29e6b365123bc",
+      "current": "6328c8235510795c60180210e058058b56975ba6a48cfa8318a29e6b365123bc",
+      "match": true
+    },
+    "experiments/li_qk/producer_plan.h": {
+      "build": "3b1794db526d11885e06a7ef4b3cf6a086909b4e80362bb5c7beedfdf9a52e29",
+      "current": "3b1794db526d11885e06a7ef4b3cf6a086909b4e80362bb5c7beedfdf9a52e29",
+      "match": true
+    },
+    "experiments/li_qk/score.cpp": {
+      "build": "e3d80f9e6263196ac2ef2251d39798f29ea2369b04a6ffcc8fa71ad5f72b064a",
+      "current": "e3d80f9e6263196ac2ef2251d39798f29ea2369b04a6ffcc8fa71ad5f72b064a",
+      "match": true
+    },
+    "experiments/li_qk/post.cpp": {
+      "build": "ea94bacb8efbb59d6c500a9d3c889623dc92b1eaffa5396d042bc8b6ad0a0740",
+      "current": "ea94bacb8efbb59d6c500a9d3c889623dc92b1eaffa5396d042bc8b6ad0a0740",
+      "match": true
+    },
+    "experiments/li_qk/radix.cpp": {
+      "build": "8dc92c6a2bd32c3101049ddb5da4535c80c3dd5e69e51fb25e7f8b9e95037d27",
+      "current": "8dc92c6a2bd32c3101049ddb5da4535c80c3dd5e69e51fb25e7f8b9e95037d27",
+      "match": true
+    },
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_vector.h": {
+      "build": "6be6cf9349baed4d4497e36fd1c9bf94722e4446547f414b891e417395f7cc5e",
+      "current": "6be6cf9349baed4d4497e36fd1c9bf94722e4446547f414b891e417395f7cc5e",
+      "match": true
+    }
+  },
+  "unchanged_candidate_tail_function_sha256": "2b4b48c3cc91cdbf259b066563ce9db6cfe29d0342b9117e56e5e784409d2209",
+  "final_build_source_commit": "f46991e269ed0550b545049e22c1f8a97fe3f024",
+  "final_kernel_wrapper_matches": {
+    "experiments/li_qk/producer.cpp": "bcbf07ca4afebf3be35eb7680814479b3fc0674a16c29a3854adbaaef9cb5fe8",
+    "experiments/li_qk/producer_tail.cpp": "94e97156c9e8a2a25815220889d261a03926c7630225134fd916f3f8b2be71d8",
+    "experiments/li_qk/producer_device.h": "6328c8235510795c60180210e058058b56975ba6a48cfa8318a29e6b365123bc",
+    "experiments/li_qk/producer_plan.h": "3b1794db526d11885e06a7ef4b3cf6a086909b4e80362bb5c7beedfdf9a52e29",
+    "experiments/li_qk/score.cpp": "e3d80f9e6263196ac2ef2251d39798f29ea2369b04a6ffcc8fa71ad5f72b064a",
+    "experiments/li_qk/post.cpp": "ea94bacb8efbb59d6c500a9d3c889623dc92b1eaffa5396d042bc8b6ad0a0740",
+    "experiments/li_qk/radix.cpp": "8dc92c6a2bd32c3101049ddb5da4535c80c3dd5e69e51fb25e7f8b9e95037d27"
+  },
+  "candidate_tail_body_unchanged_since_94fae0a": true
+}

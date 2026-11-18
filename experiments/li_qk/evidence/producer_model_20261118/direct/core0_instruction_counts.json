@@ -1,0 +1,43 @@
+{
+  "scope": "core0 only, issued log entries, no extrapolation to full device",
+  "case": "direct",
+  "units": {
+    "core0.veccore1.instr_log.dump.gz": {
+      "SCALAR": 12600,
+      "MTE2": 74,
+      "MTE3": 204,
+      "PUSHQ": 420,
+      "FLOWCTRL": 1523,
+      "RVECLP": 129,
+      "RVECSU": 4619,
+      "RVECEX": 34073,
+      "RVECST": 3434,
+      "VEC": 181,
+      "RVECLD": 14896,
+      "ALL": 6
+    },
+    "core0.cubecore0.instr_log.dump.gz": {
+      "SCALAR": 21365,
+      "MTE1": 333,
+      "MTE2": 202,
+      "CUBE": 327,
+      "FLOWCTRL": 1893,
+      "FIXP": 322,
+      "ALL": 2
+    },
+    "core0.veccore0.instr_log.dump.gz": {
+      "SCALAR": 12600,
+      "MTE2": 74,
+      "MTE3": 204,
+      "PUSHQ": 420,
+      "FLOWCTRL": 1523,
+      "RVECLP": 129,
+      "RVECSU": 4619,
+      "RVECEX": 34073,
+      "RVECST": 3434,
+      "VEC": 181,
+      "RVECLD": 14896,
+      "ALL": 6
+    }
+  }
+}

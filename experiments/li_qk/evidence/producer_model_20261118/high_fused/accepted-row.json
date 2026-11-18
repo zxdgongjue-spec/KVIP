@@ -1,0 +1,37 @@
+{
+  "row": {
+    "name": "r0_high_fused",
+    "case": "high_fused",
+    "round": 0,
+    "argv": [
+      "/tmp/li-producer-final-sim/build/li_producer",
+      "/tmp/li-producer-high-final-model/fixture",
+      "/tmp/li-producer-high-final-model/r0_high_fused",
+      "2",
+      "0",
+      "1",
+      "0"
+    ],
+    "exit_code": 0,
+    "log_sha256": "c41cf6823fec0942274c35ee1120530824233335079daeae7d5693216c2aa10e",
+    "report_sha256": "d8a4b5de49d06cbecf7c81db721b3bb0c81962e87dbfac6c6bfe50900b8f7da4",
+    "whole_model_ticks": 146422
+  },
+  "fixture": {
+    "batch": 1,
+    "history": 131072,
+    "heads": 32,
+    "seed": 20261115,
+    "numerical_domain": "finite sparse dyadic FP8, BF16 weights, signed per-owner data",
+    "hashes": {
+      "query": "3fd392bd00b2c981001d540d6c88262cf25919ce22283e29f6c2dbb9220766d2",
+      "key": "38256f383caf290a8b90a5ad47c658a07ded7efc583709110eef790f95fb506f",
+      "weight": "bcdefa3e55f2adf59e60b521bfcd84c3402ad2f52a126c14fc6bfbd1084e5f5c",
+      "qscale": "9e53a2505106b47809441a06250375bce7f2009d3393dc68dcde626790cf8af4",
+      "kscale": "50b2c297046606cdddc315a97e5e7ad7425fb05bf67206646a72d385a6d24f36",
+      "oracle": "fb5de73938b93969a807badd72591185cfacf6bae8c034c76aa4dc24e885a44a"
+    }
+  },
+  "scope": "full numerical LI; includes canonical score output for all routes; no resident/Service/Fetch/Index",
+  "original_run_status": "PASS"
+}

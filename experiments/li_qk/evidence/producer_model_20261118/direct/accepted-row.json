@@ -1,0 +1,38 @@
+{
+  "row": {
+    "name": "r0_direct",
+    "case": "direct",
+    "round": 0,
+    "argv": [
+      "/tmp/li-producer-all-sim-v3/build/li_producer",
+      "/tmp/li-producer-all-model/fixture",
+      "/tmp/li-producer-all-model/r0_direct",
+      "1",
+      "0",
+      "1",
+      "0"
+    ],
+    "exit_code": 0,
+    "log_sha256": "be52ca6849e521827a5c904020770ffc8d164529b9bb82b041f7edc1b7c6822c",
+    "report_sha256": "e0f3ce733758f6dde36489a61ccea8a8eece52e6ec4fff3ba6ce1d8099fbc56c",
+    "whole_model_ticks": 96466
+  },
+  "fixture": {
+    "batch": 1,
+    "history": 131072,
+    "heads": 32,
+    "seed": 20261115,
+    "numerical_domain": "finite sparse dyadic FP8, BF16 weights, signed per-owner data",
+    "hashes": {
+      "query": "3fd392bd00b2c981001d540d6c88262cf25919ce22283e29f6c2dbb9220766d2",
+      "key": "38256f383caf290a8b90a5ad47c658a07ded7efc583709110eef790f95fb506f",
+      "weight": "bcdefa3e55f2adf59e60b521bfcd84c3402ad2f52a126c14fc6bfbd1084e5f5c",
+      "qscale": "9e53a2505106b47809441a06250375bce7f2009d3393dc68dcde626790cf8af4",
+      "kscale": "50b2c297046606cdddc315a97e5e7ad7425fb05bf67206646a72d385a6d24f36",
+      "oracle": "fb5de73938b93969a807badd72591185cfacf6bae8c034c76aa4dc24e885a44a"
+    }
+  },
+  "scope": "full numerical LI; includes canonical score output for all routes; no resident/Service/Fetch/Index",
+  "original_run_status": "INCOMPLETE",
+  "note": "Only this PASS row is accepted; other failed rows remain in the unmodified original manifest."
+}
