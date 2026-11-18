@@ -114,17 +114,18 @@ static void Run(const std::string& fixture,const std::string& output,const li_qk
     rotating::Context ctx{};ctx.shape.batch=p.batch;ctx.shape.history=ctx.shape.resident=h;ctx.shape.indexHeads=g;
     uint64_t context=m.Put(std::vector<rotating::Context>{ctx},true);
 #ifdef LI_QK_RADIX_COMPARE
-    Require(p.batch==1 && p.queryParts==1 && (p.historyParts==1 || p.historyParts==16),"B1 Q4 P1/P16 required");
+    Require(p.queryParts==1 && ((p.batch==1 && (p.historyParts==1 || p.historyParts==16)) || (p.batch==16 && p.historyParts<=2)),"B1 P1/P16 or B16 P1/P2 Q4 required");
     Require(h>=8192 && h<=131072 && h%4096==0 && p.capacity>=16,"aligned H8192..128K and at least16 groups required");
-    li_radix::Bindings radix{};radix.scores=canonical;radix.selected=indices;radix.batch=1;radix.history=h;radix.parts=16;
+    uint32_t radixParts=p.batch==1?16:2,radixWorkers=std::min(64U,queries*radixParts);
+    li_radix::Bindings radix{};radix.scores=canonical;radix.selected=indices;radix.batch=p.batch;radix.history=h;radix.parts=radixParts;
     // Match the original standalone LI's full valid H for every true Q.
-    radix.ends=m.Put(std::vector<uint32_t>(4,h),true);
-    radix.high=m.Put(std::vector<uint32_t>(4*16*256+128,0x5a5a5a5a));radix.low=m.Put(std::vector<uint32_t>(4*16*256+128,0x5a5a5a5a));
-    radix.params=m.Put(std::vector<uint32_t>(4*32+128,0x5a5a5a5a));radix.offsets=m.Put(std::vector<uint32_t>(4*16*8+128,0x5a5a5a5a));
+    radix.ends=m.Put(std::vector<uint32_t>(queries,h),true);
+    radix.high=m.Put(std::vector<uint32_t>(queries*radixParts*256+128,0x5a5a5a5a));radix.low=m.Put(std::vector<uint32_t>(queries*radixParts*256+128,0x5a5a5a5a));
+    radix.params=m.Put(std::vector<uint32_t>(queries*32+128,0x5a5a5a5a));radix.offsets=m.Put(std::vector<uint32_t>(queries*radixParts*8+128,0x5a5a5a5a));
     auto radixBinding=m.Put(std::vector<li_radix::Bindings>{radix},true);
-    auto tail=[&](){if(topkRoute=="original")Check(aclrtlaunch_li_qk_topk(4,stream,(void*)canonical,(void*)indices,(void*)context,h,g,4));
-        else {Check(aclrtlaunch_li_radix_high(64,stream,(void*)radixBinding));Check(aclrtlaunch_li_radix_high_reduce(4,stream,(void*)radixBinding));
-            Check(aclrtlaunch_li_radix_low(64,stream,(void*)radixBinding));Check(aclrtlaunch_li_radix_low_reduce(4,stream,(void*)radixBinding));Check(aclrtlaunch_li_radix_emit(64,stream,(void*)radixBinding));}};
+    auto tail=[&](){if(topkRoute=="original")Check(aclrtlaunch_li_qk_topk(queries,stream,(void*)canonical,(void*)indices,(void*)context,h,g,queries));
+        else {Check(aclrtlaunch_li_radix_high(radixWorkers,stream,(void*)radixBinding));Check(aclrtlaunch_li_radix_high_reduce(queries,stream,(void*)radixBinding));
+            Check(aclrtlaunch_li_radix_low(radixWorkers,stream,(void*)radixBinding));Check(aclrtlaunch_li_radix_low_reduce(queries,stream,(void*)radixBinding));Check(aclrtlaunch_li_radix_emit(radixWorkers,stream,(void*)radixBinding));}};
 #endif
     const bool native=std::string(LI_QK_RUN_MODE)=="npu";
     std::string modelStage=std::getenv("LI_QK_MODEL_STAGE")?std::getenv("LI_QK_MODEL_STAGE"):"all";
@@ -214,7 +215,7 @@ static void Run(const std::string& fixture,const std::string& output,const li_qk
     for(uint32_t i=queries*2048;i<selected.size();++i)Require(selected[i]==-7,"TopK guard changed");
     m.CheckInputs();
 #ifdef LI_QK_RADIX_COMPARE
-    for(auto pair:{std::pair<uint64_t,uint32_t>{radix.high,4*16*256},{radix.low,4*16*256},{radix.params,4*32},{radix.offsets,4*16*8}}){auto v=m.Get<uint32_t>(pair.first,pair.second+128);for(uint32_t i=pair.second;i<v.size();++i)Require(v[i]==0x5a5a5a5a,"radix metadata guard");}
+    for(auto pair:{std::pair<uint64_t,uint32_t>{radix.high,queries*radixParts*256},{radix.low,queries*radixParts*256},{radix.params,queries*32},{radix.offsets,queries*radixParts*8}}){auto v=m.Get<uint32_t>(pair.first,pair.second+128);for(uint32_t i=pair.second;i<v.size();++i)Require(v[i]==0x5a5a5a5a,"radix metadata guard");}
 #endif
     std::ofstream f(output+"/score-keys.bin",std::ios::binary);f.write(reinterpret_cast<char*>(flat.data()),uint64_t(queries)*h*2);Require(bool(f),"score file write");
     std::ofstream k(output+"/topk.bin",std::ios::binary);k.write(reinterpret_cast<char*>(selected.data()),queries*2048*4);Require(bool(k),"TopK file write");
@@ -230,8 +231,8 @@ static void Run(const std::string& fixture,const std::string& output,const li_qk
     auto array=[&](const char* name,const std::vector<double>& v){report<<",\""<<name<<"\":[";for(size_t i=0;i<v.size();++i){if(i)report<<",";report<<v[i];}report<<"]";};
     array("score_samples_us",scoreUs);array("li_samples_us",liUs);array("host_score_samples_us",hostScoreUs);array("host_li_samples_us",hostLiUs);
 #ifdef LI_QK_RADIX_COMPARE
-    report<<",\"topk_route\":\""<<topkRoute<<"\",\"radix_parts\":"<<(topkRoute=="sharded"?16:1)<<",\"tail_kernel_launches\":"<<(topkRoute=="sharded"?5:1)<<",\"tail_peak_aivs\":"<<(topkRoute=="sharded"?64:4)<<",\"topk_p50_us\":";if(native && !topkUs.empty())report<<Median(topkUs);else report<<"null";
-    array("topk_samples_us",topkUs);report<<",\"full_valid_history\":true,\"full_li_kernel_launches\":"<<(1+(alias?0:1)+(topkRoute=="sharded"?5:1));
+    report<<",\"topk_route\":\""<<topkRoute<<"\",\"radix_parts\":"<<(topkRoute=="sharded"?radixParts:1)<<",\"tail_kernel_launches\":"<<(topkRoute=="sharded"?5:1)<<",\"tail_peak_aivs\":"<<(topkRoute=="sharded"?radixWorkers:queries)<<",\"topk_p50_us\":";if(native && !topkUs.empty())report<<Median(topkUs);else report<<"null";
+    array("topk_samples_us",topkUs);report<<",\"full_valid_history\":true,\"full_li_kernel_launches\":"<<((p.balanced?1:waves.size())+(alias?0:waves.size())+(topkRoute=="sharded"?5:1));
 #endif
     report<<",\"model_stage\":\""<<modelStage<<"\",\"guards\":true,\"inputs_unchanged\":true,\"topk_threshold_oracle\":"<<(topkChecked?"true":"false")<<",\"scope\":\"standalone numeric LI; score and score+canonical+global TopK; no Fetch/Service/Index\"}\n";
     Require(bool(report),"report write");std::cout<<"LI_QK_ORACLE_PASS T="<<p.historyParts<<" Qparts="<<p.queryParts<<"\n";
@@ -243,7 +244,7 @@ int main(int argc,char** argv){try {
 #ifdef LI_QK_RADIX_COMPARE
     Require(argc==17,"li_qk_radix FIXTURE OUTPUT H G C V P QPARTS WARMUP ITERATIONS DEVICE B waves both|li GRAIN original|sharded");
     topkRoute=argv[16];Require(topkRoute=="original" || topkRoute=="sharded","TopK route required");--argc;
-    Require(topkRoute!="sharded" || std::string(argv[7])=="16","sharded requires score P16");
+    Require(topkRoute!="sharded" || std::string(argv[7])==(std::string(argv[12])=="16"?"2":"16"),"sharded requires B1 score P16 or B16 score P2");
 #endif
     Require(argc==12 || argc==14 || argc==15 || argc==16,"li_qk FIXTURE OUTPUT H HEADS C V T QPARTS WARMUP ITERATIONS DEVICE [BATCH waves|balanced [both|li [WORK_GRAIN]]]");
     auto number=[](const char* s){size_t used=0;uint64_t n=std::stoull(s,&used);Require(s[used]==0&&n<=UINT32_MAX,"integer required");return uint32_t(n);};

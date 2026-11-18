@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Equal-history P16 score with/without distributed radix, plus serial LI.
+# Standalone B1/B16 LI: baseline and split score with/without sharded radix.
 set -Eeuo pipefail
 LI_COMPARE_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 LI_COMPARE_CANN=${ASCEND_CANN_PACKAGE_PATH:-${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}}
 LI_COMPARE_KVAF=$LI_COMPARE_ROOT/third_party/KVAF/access_operator/demo/aiv_batch_get/include
 LI_COMPARE_SOC=Ascend950PR_9599
 LI_COMPARE_DEVICE=5
+LI_COMPARE_BATCH=1
+LI_COMPARE_CORES=32
 LI_COMPARE_PYTHON=python3
 LI_COMPARE_OUTPUT_ROOT=/home/w00568585
 LI_COMPARE_PROFILE=0
@@ -18,10 +20,11 @@ while (($#)); do
  case "$1" in
   --profile) LI_COMPARE_PROFILE=1; shift ;;
   --plan-only) LI_COMPARE_PLAN=1; shift ;;
-  --device|--output-root|--cann-root|--kvaf-include|--soc|--python)
+  --batch|--score-cores|--device|--output-root|--cann-root|--kvaf-include|--soc|--python)
    (($#>=2)) || die "Missing value: $1"
    case "$1" in
     --device) LI_COMPARE_DEVICE=$2 ;; --output-root) LI_COMPARE_OUTPUT_ROOT=$2 ;;
+    --batch) LI_COMPARE_BATCH=$2 ;; --score-cores) LI_COMPARE_CORES=$2 ;;
     --cann-root) LI_COMPARE_CANN=$2 ;; --kvaf-include) LI_COMPARE_KVAF=$2 ;;
     --soc) LI_COMPARE_SOC=$2 ;; --python) LI_COMPARE_PYTHON=$2 ;;
    esac
@@ -29,10 +32,12 @@ while (($#)); do
   -h|--help)
    cat <<'USAGE'
 Usage: bash experiments/li_qk/run_li_radix_a5.sh [--profile] [options]
-B1/Q4/H128K/G32/D128/K2048, identical input and full valid H.
-Three cases: serial LI; equal score P16 + original TopK;
-equal score P16 + distributed radix P16.
+B1 or B16/Q4/H128K/G32/D128/K2048, identical input and full valid H.
+B1: serial LI; equal score P16 + original TopK; same score + radix P16.
+B16: batch LI (16 score groups); score P2 + original TopK; same score + radix P2.
 Reports score-only, separate TopK-only, and directly measured full LI.
+  --batch 1|16          Default 1; B16 uses score P1/P2 and radix P2
+  --score-cores 30|32   Score budget (default32); B16/C30 uses balanced_owner/grain128
   --profile             Separate msprof trace for each case
   --plan-only           Print the three cases, no device/build
   --device N            Default 5
@@ -48,7 +53,8 @@ USAGE
  esac
 done
 cd "$LI_COMPARE_ROOT"
-if ((LI_COMPARE_PLAN)); then exec "$LI_COMPARE_PYTHON" experiments/li_qk/li_radix_compare.py plan; fi
+LI_COMPARE_ARGS=(--batch "$LI_COMPARE_BATCH" --score-cores "$LI_COMPARE_CORES")
+if ((LI_COMPARE_PLAN)); then exec "$LI_COMPARE_PYTHON" experiments/li_qk/li_radix_compare.py plan "${LI_COMPARE_ARGS[@]}"; fi
 [[ ${LD_PRELOAD:-} != *camodel* && ${LD_PRELOAD:-} != *cmodel* ]] || die 'Physical A5 required'
 [[ $LI_COMPARE_DEVICE =~ ^[0-9]+$ ]] || die 'Invalid device'
 for LI_COMPARE_CMD in npu-smi cmake git "$LI_COMPARE_PYTHON"; do command -v "$LI_COMPARE_CMD" >/dev/null || die "Command unavailable: $LI_COMPARE_CMD"; done
@@ -74,11 +80,11 @@ printf 'Results directory: %s\nSource checkout: %s\n' "$LI_COMPARE_OUT" "$LI_COM
 git rev-parse HEAD > "$LI_COMPARE_OUT/source-commit.txt"
 git status --porcelain > "$LI_COMPARE_OUT/source-status.txt"
 npu-smi info > "$LI_COMPARE_OUT/npu-smi.log"
-"$LI_COMPARE_PYTHON" experiments/li_qk/li_radix_compare.py plan > "$LI_COMPARE_OUT/plan.json"
+"$LI_COMPARE_PYTHON" experiments/li_qk/li_radix_compare.py plan "${LI_COMPARE_ARGS[@]}" > "$LI_COMPARE_OUT/plan.json"
 run_logged checks "$LI_COMPARE_OUT/checks.log" "$LI_COMPARE_PYTHON" experiments/li_qk/test_li_radix_compare.py
 run_logged build "$LI_COMPARE_OUT/build-console.log" "$LI_COMPARE_PYTHON" experiments/li_qk/li_radix_compare.py build --run-mode npu --cann-root "$LI_COMPARE_CANN" --kvaf-include "$LI_COMPARE_KVAF" --soc "$LI_COMPARE_SOC" --output "$LI_COMPARE_OUT/build"
-run_logged bench "$LI_COMPARE_OUT/bench.log" "$LI_COMPARE_PYTHON" experiments/li_qk/li_radix_compare.py bench --build "$LI_COMPARE_OUT/build" --output "$LI_COMPARE_OUT/results" --device "$LI_COMPARE_DEVICE"
+run_logged bench "$LI_COMPARE_OUT/bench.log" "$LI_COMPARE_PYTHON" experiments/li_qk/li_radix_compare.py bench --build "$LI_COMPARE_OUT/build" --output "$LI_COMPARE_OUT/results" --device "$LI_COMPARE_DEVICE" "${LI_COMPARE_ARGS[@]}"
 if ((LI_COMPARE_PROFILE)); then
- run_logged profile "$LI_COMPARE_OUT/profile.log" "$LI_COMPARE_PYTHON" experiments/li_qk/li_radix_compare.py profile --build "$LI_COMPARE_OUT/build" --output "$LI_COMPARE_OUT/msprof" --device "$LI_COMPARE_DEVICE"
+ run_logged profile "$LI_COMPARE_OUT/profile.log" "$LI_COMPARE_PYTHON" experiments/li_qk/li_radix_compare.py profile --build "$LI_COMPARE_OUT/build" --output "$LI_COMPARE_OUT/msprof" --device "$LI_COMPARE_DEVICE" "${LI_COMPARE_ARGS[@]}"
 fi
 cat "$LI_COMPARE_OUT/results/summary.csv"

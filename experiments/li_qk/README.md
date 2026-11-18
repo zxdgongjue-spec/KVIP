@@ -299,3 +299,41 @@ bash experiments/li_qk/run_li_radix_a5.sh --device 5 --profile
 该完整对照使用所有Q的有效H131072，前一轮radix-only实验包含各Q的H-3..H裁剪边界，两者的数值范围不同；不能将旧radix-only ticks直接加到新LI上。本入口不执行Fetch、resident/Cold、Service或Index。
 
 开发验证：三组完整链路在H8192的设备Model上均正确性PASS，检查实际score/canonical逐元素与oracle一致、2048个唯一有效token、全部GT必选、输入及输出guard。H8192仅用于入口连通验证，不替代H128K性能实验。sim/npu编译链接通过；新脚本的H128K完整LI微秒结果需在A5运行后获取。
+
+## B16：相同score调度下的原TopK与分片radix完整LI对照
+
+仓库入口 [run_li_radix_b16_a5.sh](run_li_radix_b16_a5.sh) 固定 B16/Q4/H128K/G32/D128/K2048，默认30个score核，也支持32核。两种预算各跑三组；原B1入口仍默认B1。
+
+宿主机更新现有共享checkout，更新后容器可直接看到：
+
+```bash
+cd /home/w00568585/wt-mr14
+git fetch origin codex/split-core-unified-comparison
+git merge --ff-only FETCH_HEAD
+```
+
+容器中执行仓库脚本；每条命令生成独立结果目录：
+
+```bash
+cd /home/w00568585/wt-mr14
+# 30 score AIC / 60 score AIV，均衡调度
+bash experiments/li_qk/run_li_radix_b16_a5.sh --device 5 --profile
+# 32 score AIC / 64 score AIV，每batch固定两核
+bash experiments/li_qk/run_li_radix_b16_a5.sh --score-cores 32 --device 5 --profile
+```
+
+| 用例 | score策略 | 实际score核 | Top2048 |
+|---|---|---|---|
+| batch_li | 每batch一个核组，扫描完整H | 16 AIC / 32 AIV | 原per-Q radix，64 AIV |
+| uniform_p2 | P2参考工作，按所选30/32核预算下发 | 30 AIC / 60 AIV 或32 AIC / 64 AIV | 原per-Q radix，64 AIV |
+| uniform_p2_radix | 与uniform_p2共用相同score和scatter计划 | 与uniform_p2相同 | 每Q的H分两段，分片radix，64 AIV，5次launch |
+
+`batch_li`是B16独立LI参考，已有16个batch间并行核组，并非整机单核串行。三组共用同一fixture、二进制和全部真实Q的完整有效H；只执行数值LI，不含SDK、Fetch、resident/Cold、Service或Index。
+
+32核使用固定的32个任务，每batch两段65536 keys，1次score＋1次scatter。30核使用`balanced_owner`：将16个owner的H按128-key粒度均分给30个常驻核，每核总工作69888或70016 keys；保留真实owner边界，不强制保留名义P2的半段边界。实际44个非空段放入两个scratch slot，**1次常驻score launch＋2次scatter**。两个slot是分数整理批次，不是两轮score下发；该调度作为均衡控制方案，性能优劣由真机结果判断。`plan.json`及summary记录核预算、实际核数、任务粒度、每核工作量和launch数。
+
+TopK预算独立固定为64 AIV。B16已有64个真实Q，因此原TopK可用64 AIV；P2分片radix的128个扫描任务也只能使用64 AIV，每个AIV循环处理两段，后续规约生成每个真实Q唯一的全局阈值。不能把该对照解释成TopK从60核增加到64核：两种TopK路线均使用64 AIV。
+
+采样沿用warmup4/iterations20、丢弃r0、三轮交错同轮配对，msprof单独采集。结果在打印的`li_radix_full_*/results/summary.csv`；重点比较`uniform_p2_radix`的 **`li_over_uniform_p2`**，小于1才说明在相同score调度下，分片radix改善了完整LI。`topk_over_uniform_p2`用于定位尾部影响，`li_over_batch_li`用于衡量score＋TopK总体改动。完整LI直接计时，不用score与TopK的独立p50相加；30/32核目录之间可对照绝对时间，但不属于同轮配对比值。原八组score调度实验仍使用 [run_b16_a5.sh](run_b16_a5.sh)。
+
+开发验证：B1及B16两种核预算的实际host入口、任务覆盖、canonical/TopK oracle、launch计划与汇总配对均通过CPU检查；NPU编译链接通过。CPU事件样本仅用于校验汇总逻辑，不提供性能结论；B16/H128K的完整LI及msprof耗时需在A5运行后获取。
