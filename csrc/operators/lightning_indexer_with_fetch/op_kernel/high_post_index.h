@@ -5,70 +5,42 @@
 // speculative reads before posting any final overwrite, and compose the same
 // ordered per-row permutation as Consumer. Only then can all AIVs safely move
 // immutable tuples in parallel, including cycles and repeated victims.
+#include "high_index_workspace.h"
+#include "high_index_partition.h"
+
 namespace pipeline_ab {
 namespace high_post_index {
-constexpr uint32_t kCapacity = 2 * (kPrefetch + kSlots);
-struct Move {
-    uint32_t src, dst;
-    uint64_t key[16], address, logical;
-    uint32_t scale, padding;
-};
-static_assert(sizeof(Move) == 160, "must match optional host scratch allocation");
 static_assert(offsetof(Args, highIndex) == 152, "high Index workspace address ABI");
-
-__simt_vf__ __aicore__ LAUNCH_BOUND(THREADS)
-inline void EmitMoves(__gm__ Move* moves, __gm__ uint32_t* dense, uint32_t history,
-                      bool denseMode, __ubuf__ uint32_t* work) {
-    uint32_t tid = threadIdx.x, count = 0;
-    const uint32_t size = denseMode ? history : MAP;
-    for (uint32_t base = 0; base < size; base += THREADS) {
-        uint32_t i = base + tid;
-        uint32_t dst = i, src = i;
-        if (i < size) {
-            if (denseMode) src = asc_ldcg(dense + i);
-            else { dst = work[KEYS_POS+i]; src = dst == EMPTY ? dst : work[VALUES_POS+i]; }
-        }
-        const uint32_t changed = dst != src;
-        uint32_t rank = prefix(changed, work+CONTROL+32);
-        uint32_t found = work[CONTROL+32+15];
-        if (count + found > kCapacity || (changed && (dst >= history || src >= history)))
-            asc_atomic_or(work+CONTROL, 1U);
-        asc_syncthreads();
-        if (work[CONTROL]) return;
-        if (changed) {
-            asc_stcg(&moves[count+rank].src, src);
-            asc_stcg(&moves[count+rank].dst, dst);
-        }
-        count += found;
-        asc_syncthreads();
-    }
-    if (!tid) work[CONTROL+1] = count;
-    asc_threadfence();
-}
+struct PrivatePlan {
+    uint32_t pairs = 0, singles = 0, invalidations = 0, chunks = 0, error = 0;
+    uint64_t activeCycles = 0;
+};
 
 // One owner composes each row's sparse/dense map preserving the original
 // prefetch/Q0/Q1/Q2/Q3 phase and 512-event chunk boundaries. Dirty destinations
 // include displaced rows. No key/scale/address/logical writes here.
-__aicore__ inline uint32_t Plan(__gm__ Args* a, uint32_t b, __gm__ Move* moves,
-                               uint32_t& moveCount, uint32_t& chunks) {
+__aicore__ inline void Plan(__gm__ Args* a, uint32_t b, __gm__ Edge* edges,
+                           __gm__ uint32_t* invalidations, bool profile, PrivatePlan& plan) {
     auto ctx = reinterpret_cast<__gm__ Context*>(a->context);
     auto shape = LoadRuntimeShape(ctx);
-    uint32_t owner = ctx->rowOwners ? reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b] : b;
     auto src = reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+uint64_t(b)*a->maxEvents;
     auto dst = reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+uint64_t(b)*a->maxEvents;
-    auto valid = reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*shape.resident;
     auto dense = reinterpret_cast<__gm__ uint32_t*>(a->denseShadow)+uint64_t(b)*shape.history*6;
     auto flags = reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
     TPipe pipe; TBuf<TPosition::VECCALC> buf; pipe.InitBuffer(buf,SCRATCH_WORDS*4);
     auto local = buf.Get<uint32_t>();
     auto mem = reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr());
+    uint64_t begin = profile ? GetSystemCycle() : 0;
     Simt::VF_CALL<InitShadow>(Simt::Dim3{THREADS,1,1},mem);
     SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
     bool denseMode = false;
     uint32_t seen = 0, finalCount = 0, error = 0;
     for (uint32_t phase = 0; phase < 5 && !error; ++phase) {
         auto flag = flags+(phase ? kRawQueryFlag+phase-1 : 0);
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flag),sizeof(*flag));
+        if (profile) plan.activeCycles += GetSystemCycle() - begin;
+        error = AwaitPublication(flag);
+        if (profile) begin = GetSystemCycle();
+        if (error) break;
         uint32_t n = flag->count, offset = phase ? kPrefetch+finalCount : 0;
         if (!flag->ready || flag->error || n > kTop || offset+n > a->maxEvents) { error=1; break; }
         if (!n) continue;
@@ -80,52 +52,29 @@ __aicore__ inline uint32_t Plan(__gm__ Args* a, uint32_t b, __gm__ Move* moves,
         __gm__ uint64_t* absent = nullptr;
         __gm__ uint32_t* noScales = nullptr;
         if (denseMode)
-            Simt::VF_CALL<ApplyDenseBatch<false,true>>(Simt::Dim3{THREADS,1,1},src,dst,offset,n,
-                absent,noScales,valid,shape.resident,dense,shape.history,mem,absent,absent,absent);
+            Simt::VF_CALL<ApplyDenseBatch<false,true,sizeof(Tuple)/sizeof(uint32_t)>>(Simt::Dim3{THREADS,1,1},src,dst,offset,n,
+                absent,noScales,invalidations,shape.resident,dense,shape.history,mem,absent,absent,absent);
         else
-            Simt::VF_CALL<ApplyBatch<false,true>>(Simt::Dim3{THREADS,1,1},src,dst,offset,n,
-                absent,noScales,valid,shape.resident,mem,absent,absent,absent,shape.history);
+            Simt::VF_CALL<ApplyBatch<false,true,sizeof(Tuple)/sizeof(uint32_t)>>(Simt::Dim3{THREADS,1,1},src,dst,offset,n,
+                absent,noScales,invalidations,shape.resident,mem,absent,absent,absent,shape.history);
         SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
         error=local.GetValue(CONTROL); seen+=n;
         if (phase) finalCount+=n;
     }
     if (!error && seen) {
-        Simt::VF_CALL<EmitMoves>(Simt::Dim3{THREADS,1,1},moves,dense,shape.history,denseMode,mem);
+        Simt::VF_CALL<EmitEdges>(Simt::Dim3{THREADS,1,1},edges,dense,shape.history,denseMode,mem);
         SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
         error=local.GetValue(CONTROL);
-        if (!error) moveCount=local.GetValue(CONTROL+1);
-    }
-    chunks=local.GetValue(CONTROL+4);
-    pipe.Destroy();
-    return error;
-}
-
-template<bool Scatter>
-__simt_vf__ __aicore__ LAUNCH_BOUND(256)
-inline void MoveTuples(__gm__ Move* moves, uint32_t first, uint32_t end,
-                       __gm__ uint64_t* keys, __gm__ uint32_t* scales,
-                       __gm__ uint64_t* addresses, __gm__ uint64_t* logical) {
-    const uint32_t field=threadIdx.x%16;
-    for (uint32_t i=first+threadIdx.x/16; i<end; i+=16) {
-        auto m=moves+i;
-        const uint32_t pos=Scatter ? asc_ldcg(&m->dst) : asc_ldcg(&m->src);
-        if constexpr (Scatter) {
-            asc_stcg(keys+uint64_t(pos)*16+field,asc_ldcg(m->key+field));
-            if (!field) {
-                asc_stcg(scales+pos,asc_ldcg(&m->scale));
-                asc_stcg(addresses+pos,asc_ldcg(&m->address));
-                asc_stcg(logical+pos,asc_ldcg(&m->logical));
-            }
-        } else {
-            asc_stcg(m->key+field,asc_ldcg(keys+uint64_t(pos)*16+field));
-            if (!field) {
-                asc_stcg(&m->scale,asc_ldcg(scales+pos));
-                asc_stcg(&m->address,asc_ldcg(addresses+pos));
-                asc_stcg(&m->logical,asc_ldcg(logical+pos));
-            }
+        if (!error) {
+            plan.pairs=local.GetValue(CONTROL+1);
+            plan.singles=local.GetValue(CONTROL+2);
+            plan.invalidations=local.GetValue(CONTROL+6);
         }
     }
-    asc_threadfence();
+    plan.error=error;
+    plan.chunks=local.GetValue(CONTROL+4);
+    if (profile) plan.activeCycles += GetSystemCycle() - begin;
+    pipe.Destroy();
 }
 
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
@@ -167,6 +116,8 @@ __aicore__ inline uint64_t RowErrors(__gm__ post_index_tail::Record* records,
     return error;
 }
 
+#include "high_index_balance.h"
+
 // Every block takes all joins, including empty plans and failed rows. The
 // orders perform the same work; only the CQ wait/join moves around Index.
 __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a,uint32_t block) {
@@ -182,14 +133,27 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a,uint32_t blo
     auto ws=reinterpret_cast<__gm__ uint32_t*>(a->workerStatus)+b*32;
     auto info=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
     auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
-    auto moves=reinterpret_cast<__gm__ Move*>(a->highIndex)+uint64_t(b)*kCapacity;
+    auto edges=reinterpret_cast<__gm__ Edge*>(a->highIndex+uint64_t(b)*kRowBytes);
+    auto spill=reinterpret_cast<__gm__ Tuple*>(edges+kCapacity);
+    // Tuple padding belongs to the private invalidation list, even in a spill.
+    auto invalidations=&spill[0].padding;
+    PrivatePlan plan;
     r->error=0; r->globalError=0; r->completed=0; r->count=0;
     r->packedRow=b; r->lane=lane; r->lanes=lanes;
     r->planDone=0; r->packDone=0; r->postBegin=0; r->postDone=0;
     r->indexDone=0; r->cqDone=0; r->start=profile ? GetSystemCycle() : 0;
+    if (profile) { ticks[14]=0; ticks[15]=0; ticks[20]=0; ticks[21]=0; ticks[22]=0; }
     uint32_t useful=0;
     if (!lane) useful=Producer(a,b);
     else if (lane==1) OutputWorker<false>(a,b);
+    else if (lane==2) {
+        if (profile) ticks[14]=GetSystemCycle();
+        Plan(a,b,edges,invalidations,profile,plan);
+        if (profile) {
+            ticks[15]=GetSystemCycle(); ticks[20]=2*plan.pairs+plan.singles;
+            ticks[21]=plan.activeCycles; ticks[22]=plan.pairs;
+        }
+    }
     if (!lane) CompletePrefetch(ctx,b,true);
     SyncAll(); // original-address readers and all speculative CQs are finished
     if (profile) r->planDone=GetSystemCycle();
@@ -198,7 +162,7 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a,uint32_t blo
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(posts),4*sizeof(FinalPost));
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),128);
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),64);
-    uint64_t error=row->error | info[0];
+    uint64_t error=row->error | info[0] | plan.error;
     uint32_t count[4]={},total=0;
     for (uint32_t q=0;q<4;++q) {
         if (posts[q].count>kTop || posts[q].descriptor!=b*kSlots+q*kTop) error|=1;
@@ -212,7 +176,7 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a,uint32_t blo
     // Reuse the drained physical queue, never its first-phase completion
     // record: the service exposes those prefetch records through the lease.
     auto update=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);
-    args.core_status=a->highIndex+uint64_t(batch)*kCapacity*sizeof(Move)+uint64_t(block)*update[15];
+    args.core_status=a->highIndex+uint64_t(batch)*kRowBytes+uint64_t(block)*update[15];
     args.block_count=1; args.jettys_per_core=1;
     args.indices=uint64_t(packed+begin); args.offsets=uint64_t(packed+kSlots+begin);
     args.output_indices=uint64_t(packed+2*kSlots+begin); args.request_capacity=own;
@@ -258,36 +222,21 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a,uint32_t blo
         SyncAll();
     }
     if (profile) ticks[4]=GetSystemCycle();
-    if (!lane) {
-        uint32_t count=0,chunks=0;
+    // The public launch requires 3*batch + 4*workers <= cores. The third
+    // lane holds this row's private plan across both transport orderings.
+    if (lane==2) {
         uint64_t rejected=RowErrors(records,b,batch,cores);
-        ws[0]=rejected ? 1U : Plan(a,b,moves,count,chunks);
-        ws[1]=total; ws[2]=chunks; ws[3]=count;
+        ws[0]=rejected ? 1U : plan.error;
+        ws[1]=total; ws[2]=plan.chunks;
+        ws[3]=plan.pairs; ws[4]=plan.singles; ws[5]=plan.invalidations;
+        ws[6]=ctx->rowOwners ? reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b] : b;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ws),128);
     }
-    SyncAll(); // all rows' final maps have been composed
+    SyncAll(); // all Post/Wait permissions and private row descriptors are visible
     if (profile) ticks[11]=GetSystemCycle();
+    ApplyGlobalIndex(a,ctx,b,block,batch,cores,lane,lanes,update,ticks,profile);
+    if (profile) r->indexDone=ticks[5];
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ws),128);
-    uint32_t n=ws[0]?0:ws[3],first=n*lane/lanes,last=n*(lane+1)/lanes;
-    uint32_t owner=ctx->rowOwners ? reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b] : b;
-    auto keys=reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*shape.history*16;
-    auto scales=reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*shape.history;
-    auto addresses=reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(owner)*update[7];
-    auto logical=reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*shape.history;
-    if (last>first) {
-        Simt::VF_CALL<MoveTuples<false>>(Simt::Dim3{256,1,1},moves,first,last,keys,scales,addresses,logical);
-        SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
-    }
-    SyncAll(); // no writer can clobber an unread source, even in long cycles
-    if (profile) ticks[12]=GetSystemCycle();
-    if (last>first) {
-        Simt::VF_CALL<MoveTuples<true>>(Simt::Dim3{256,1,1},moves,first,last,keys,scales,addresses,logical);
-        SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
-    }
-    if (profile) {
-        ticks[2]=0x50494831U; ticks[5]=r->indexDone=GetSystemCycle();
-        ticks[9]=last-first; ticks[10]=last-first;
-    }
     // Wait-first already drained its queue before Index. Publish its results
     // at the Index join; both orders have exactly one Index join and one CQ join.
     if (waitFirst) {

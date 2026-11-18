@@ -33,7 +33,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void InitShadow(__ubuf__ uin
 #endif
  if(threadIdx.x<128)m[CONTROL+threadIdx.x]=0;asc_syncthreads();
 }
-template<bool PrepareMetadata=false, bool PermutationOnly=false>
+template<bool PrepareMetadata=false, bool PermutationOnly=false, uint32_t DeferredStride=0>
 __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void ApplyBatch(__gm__ uint32_t* sources,__gm__ uint32_t* destinations,uint32_t begin,uint32_t count,__gm__ uint64_t* keys,__gm__ uint32_t* scales,__gm__ uint32_t* valid,uint32_t resident,__ubuf__ uint32_t* m,
  __gm__ uint64_t* addresses=nullptr,__gm__ uint64_t* logical=nullptr,
  __gm__ uint64_t* prepared=nullptr,uint32_t history=0){
@@ -83,7 +83,14 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void ApplyBatch(__gm__ uint3
    asc_stcg(prepared+history+index,asc_ldcg(logical+row));}}
   // Closure destinations are freed source rows, not destinations of this
   // batch. If hot, their KV did not move with Index; conservatively invalidate.
-  for(uint32_t i=n+tid;i<moves;i+=THREADS)InvalidateFreedHot(valid,pd[CHUNK+i-n],resident);
+  for(uint32_t i=n+tid;i<moves;i+=THREADS){
+   uint32_t freedSlot=pd[CHUNK+i-n];
+   if constexpr (DeferredStride != 0) {
+    // Private log. A planner running beside the resolver must never change
+    // residency before the resolver and transport have authorized the row.
+    if(freedSlot<resident)asc_stcg(valid+DeferredStride*asc_atomic_add(ctl+6,1U),freedSlot);
+   } else InvalidateFreedHot(valid,freedSlot,resident);
+  }
   asc_threadfence();asc_syncthreads();if(!tid)ctl[4]++;asc_syncthreads();
  }
 }
@@ -119,7 +126,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void InitDenseShadow(
  }
  asc_threadfence();asc_syncthreads();
 }
-template<bool PrepareMetadata=false, bool PermutationOnly=false>
+template<bool PrepareMetadata=false, bool PermutationOnly=false, uint32_t DeferredStride=0>
 __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void ApplyDenseBatch(
  __gm__ uint32_t* sources,__gm__ uint32_t* destinations,uint32_t begin,uint32_t count,
  __gm__ uint64_t* keys,__gm__ uint32_t* scales,__gm__ uint32_t* valid,uint32_t resident,
@@ -170,7 +177,14 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void ApplyDenseBatch(
    asc_stcg(dense+dst,row);asc_stcg(dense+history+row,dst);
    if constexpr(PrepareMetadata){asc_stcg(prepared+dst,asc_ldcg(addresses+row));
     asc_stcg(prepared+history+dst,asc_ldcg(logical+row));}}
-  for(uint32_t i=n+tid;i<moves;i+=THREADS)InvalidateFreedHot(valid,pd[CHUNK+i-n],resident);
+  for(uint32_t i=n+tid;i<moves;i+=THREADS){
+   uint32_t freedSlot=pd[CHUNK+i-n];
+   if constexpr (DeferredStride != 0) {
+    // Private log. A planner running beside the resolver must never change
+    // residency before the resolver and transport have authorized the row.
+    if(freedSlot<resident)asc_stcg(valid+DeferredStride*asc_atomic_add(ctl+6,1U),freedSlot);
+   } else InvalidateFreedHot(valid,freedSlot,resident);
+  }
   asc_threadfence();asc_syncthreads();if(!tid)ctl[4]++;asc_syncthreads();
  }
 }
