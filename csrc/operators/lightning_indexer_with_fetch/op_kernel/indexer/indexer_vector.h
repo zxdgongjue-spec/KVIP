@@ -603,6 +603,14 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe, bool topkOnly)
     incrementalScores_=incrementalBuf_.Get<uint16_t>();
     incrementalIds_=incrementalBuf_.Get<uint32_t>()[2048];
     incrementalOffsets_=incrementalBuf_.Get<uint16_t>()[8192];
+#if KVIP_INCREMENTAL_SEGMENTS
+    auto stripes = incrementalScores_[kvip_incremental::kTop + 32].template ReinterpretCast<uint32_t>();
+    for (uint32_t epoch = 0; epoch < 9; ++epoch) {
+        for (uint32_t i = 0; i < 8; ++i) stripes.SetValue(epoch * 8 + i, i ? 0 : epoch + 1);
+    }
+    SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+    WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+#endif
 #endif
 #if KVIP_ROLLING_THRESHOLD
     // Append, do not shift Fixpipe or any existing scratch-bank offsets.
@@ -1318,9 +1326,15 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
 #if KVIP_INCREMENTAL_TOPK
         if(!prefixActive_ && incrementalReady_) {
             MergeIncremental((curS1Idx+rowIdx)%2);
+#if KVIP_INCREMENTAL_SEGMENTS
+            kvip_incremental::FlipTies<true>(
+                reinterpret_cast<__ubuf__ uint32_t*>(incrementalIds_.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()), incrementalStrict_);
+#else
             kvip_incremental::UntagIds(
                 reinterpret_cast<__ubuf__ uint32_t*>(incrementalIds_.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()));
+#endif
             SetFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);
             SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
             DataCopyPad(indiceOutGm[info.indiceOutOffset+(curS1Idx+rowIdx)*topkCount_],

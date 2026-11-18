@@ -4,6 +4,7 @@
 #include "cold_scan.h"
 #include "incremental_state_vector.h"
 #include "incremental_light.h"
+#include "incremental_segments.h"
 
 #if KVIP_INCREMENTAL_TOPK
 namespace kvip_incremental {

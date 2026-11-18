@@ -42,8 +42,10 @@ def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False,
                     rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False,
                     compact_out_of_place=False, rolling_reuse_seed=False, rolling_fast_path=False, rolling_sparse=False, rolling_boundary=False, incremental_topk=False,
                     incremental_window=False, incremental_register=False, incremental_prefilter=False, incremental_direct=False, incremental_ties=False, incremental_light=False, incremental_inplace=False,
-                    incremental_progress=False):
+                    incremental_progress=False, incremental_segments=False):
     """Build one shape-independent binary per source/toolchain/SoC."""
+    if incremental_segments and not (incremental_light and incremental_ties and not incremental_progress and not incremental_inplace):
+        raise ValueError("Segment lists require light tie selection and its private staging bank")
     if incremental_progress and not incremental_window:
         raise ValueError("Independent progress requires fixed-window incremental staging")
     if incremental_inplace and not (incremental_light and incremental_ties):
@@ -92,6 +94,7 @@ def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False,
         KVIP_INCREMENTAL_REGISTER="ON" if incremental_register else "OFF",
         KVIP_INCREMENTAL_PREFILTER="ON" if incremental_prefilter else "OFF",
         KVIP_INCREMENTAL_INPLACE="ON" if incremental_inplace else "OFF",
+        KVIP_INCREMENTAL_SEGMENTS="ON" if incremental_segments else "OFF",
         KVIP_INCREMENTAL_PROGRESS="ON" if incremental_progress else "OFF",
         KVIP_INCREMENTAL_LIGHT="ON" if incremental_light else "OFF",
         KVIP_INCREMENTAL_DIRECT="ON" if incremental_direct else "OFF",

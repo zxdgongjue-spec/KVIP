@@ -10,6 +10,12 @@
     uint32_t incrementalTailBegin_ = 0, incrementalTailEnd_ = 0;
     uint32_t incrementalReverseBegin_ = 0, incrementalReverseEnd_ = 0;
     bool incrementalReady_ = false;
+#if KVIP_INCREMENTAL_SEGMENTS
+    enum class ListChange { Unchanged, Extended, Rebased };
+    ListChange listChange_ = ListChange::Rebased;
+    uint32_t baseEpoch_ = 0, suffixEpoch_ = 0, baseStrict_ = 0;
+    uint32_t baseAligned_ = 0, baseCarry_ = 0, publishedPrefix_ = 0;
+#endif
 #if KVIP_INCREMENTAL_DIRECT
     uint32_t incrementalPending_ = 0;
     bool incrementalPacked_ = false;
@@ -59,7 +65,13 @@
     __aicore__ inline void SaveIncremental(uint32_t bank) {
         PipeBarrier<PIPE_V>();
         DataCopy(incrementalScores_, scoreOutLocal_, 2048);
+#if KVIP_INCREMENTAL_SEGMENTS
+        kvip_incremental::FlipTies<false>(
+            reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(incrementalIds_.GetPhyAddr()), incrementalStrict_);
+#else
         DataCopy(incrementalIds_, indicesOutLocal_, 2048);
+#endif
         kvip_incremental::BroadcastThreshold(reinterpret_cast<__ubuf__ uint16_t*>(topkOp_.ThresholdResult().GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_[bank * 128].GetPhyAddr()));
         PipeBarrier<PIPE_V>();
@@ -83,10 +95,16 @@
         auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
         Simt::VF_CALL<kvip_incremental::TagSeed>(Simt::Dim3{256,1,1},ctx,query/4,runtimeShape_.resident,
             reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()));
+#if !KVIP_INCREMENTAL_SEGMENTS
         SaveIncremental(query % 2);
+#endif
 #if KVIP_INCREMENTAL_TIES
         // Reuse the seed selector's GT count; do not rescan the selected K.
         incrementalStrict_ = topkOp_.IncrementalStrictCount();
+#endif
+#if KVIP_INCREMENTAL_SEGMENTS
+        listChange_ = ListChange::Rebased;
+        SaveIncremental(query % 2);
 #endif
 #if KVIP_INCREMENTAL_DIRECT
         incrementalPacked_ = false;
@@ -111,6 +129,9 @@
 #if KVIP_INCREMENTAL_DIRECT
         incrementalPacked_ = false;
 #endif
+#if KVIP_INCREMENTAL_SEGMENTS
+        listChange_ = ListChange::Unchanged;
+#endif
         if (!incrementalCount_) return;
         // The original progress table aliases scoreOut. With an independent
         // bank, score/progress DMA sources are disjoint from selector outputs.
@@ -123,7 +144,11 @@
 #if KVIP_INCREMENTAL_PREFILTER
         auto packed = topkSharedTmpLocal_.template ReinterpretCast<uint16_t>();
         auto window = reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_[2048].GetPhyAddr());
+#if KVIP_INCREMENTAL_SEGMENTS
+        kvip_incremental::PackWindow<true>(window,
+#else
         kvip_incremental::PackWindow<false>(window,
+#endif
             reinterpret_cast<__ubuf__ uint16_t*>(packed.GetPhyAddr()), incrementalCount_);
         const uint32_t admitted = GetSpr<SpecialPurposeReg::AR>() / sizeof(uint16_t);
         if (!admitted) {
@@ -132,9 +157,35 @@
         }
         if (admitted <= kvip_incremental::kChunk) {
             PipeBarrier<PIPE_V>();
+#if KVIP_INCREMENTAL_SEGMENTS
+            auto sparseScores = reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_.GetPhyAddr());
+            kvip_incremental::GatherAdmitted(window,
+                reinterpret_cast<__ubuf__ uint16_t*>(packed.GetPhyAddr()), sparseScores, offsets, admitted);
+            PipeBarrier<PIPE_V>();
+            if (admitted < kvip_incremental::kTop - incrementalStrict_) {
+                // No old tie needs to move. The discarded ties occupy exactly
+                // the slots immediately following the previous strict prefix.
+                auto fresh = reinterpret_cast<__ubuf__ uint32_t*>(
+                    topkSharedTmpLocal_[kvip_incremental::kMappedWord].GetPhyAddr());
+                kvip_incremental::MapNewIds(offsets, fresh, admitted, incrementalBegin_,
+                    incrementalReverseBegin_, incrementalReverseEnd_, incrementalTailBegin_, incrementalTailEnd_);
+                PipeBarrier<PIPE_V>();
+                kvip_incremental::AppendStrict(
+                    reinterpret_cast<__ubuf__ uint16_t*>(incrementalScores_.GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ uint32_t*>(incrementalIds_.GetPhyAddr()),
+                    sparseScores, fresh, incrementalStrict_, admitted);
+                PipeBarrier<PIPE_V>();
+                incrementalStrict_ += admitted;
+                incrementalCount_ = 0;
+                listChange_ = ListChange::Extended;
+                return;
+            }
+            DataCopy(mrgValueLocal_[2048], mrgValueLocal_, QLICommon::Align(admitted, uint32_t(16)));
+#else
             kvip_incremental::PackWindow<true>(window, offsets, incrementalCount_);
             PipeBarrier<PIPE_V>();
             DataCopy(mrgValueLocal_[2048], packed, QLICommon::Align(admitted, uint32_t(16)));
+#endif
             incrementalCount_ = admitted;
         } else {
             offsets = nullptr; // Preserve all fixed positions; never truncate a dense window.
@@ -158,6 +209,11 @@
             incrementalCount_ = 0;
             return; // Kth and strict prefix unchanged; publication compacts the updated IDs.
         }
+#endif
+#if KVIP_INCREMENTAL_SEGMENTS
+        // The new strict winners fill the old tie group, so no reversed old
+        // tie can be selected by the exact general merge.
+        listChange_ = ListChange::Rebased;
 #endif
         const uint32_t size = QLICommon::Align(2048 + incrementalCount_, uint32_t(256));
 #if KVIP_INCREMENTAL_WINDOW
@@ -234,7 +290,70 @@
         incrementalCount_ = 0;
     }
 
+#if KVIP_INCREMENTAL_SEGMENTS
+    __aicore__ inline void PublishSegments(uint32_t query, uint32_t epoch) {
+        using namespace kvip_incremental;
+        auto ids = reinterpret_cast<__ubuf__ uint32_t*>(incrementalIds_.GetPhyAddr());
+        auto header = topkSharedTmpLocal_;
+        auto payload = reinterpret_cast<__ubuf__ uint32_t*>(header[kHeader].GetPhyAddr());
+        // Spare chunk score bank in fixed-window mode. Keep the unaligned
+        // remainder of the base prefix private across RotateFetch calls.
+        auto carry = incrementalScores_[kTop].template ReinterpretCast<uint32_t>();
+        uint32_t writeCount = 0;
+        if (listChange_ == ListChange::Rebased) {
+            uint32_t prefix = 0;
+            if (incrementalStrict_) {
+                PackRankRange(ids, payload, 0, incrementalStrict_, incrementalStrict_);
+                prefix = AscendC::GetSpr<SpecialPurposeReg::AR>() / sizeof(uint32_t);
+            }
+            baseEpoch_ = suffixEpoch_ = epoch;
+            baseStrict_ = incrementalStrict_;
+            baseAligned_ = prefix / 8 * 8;
+            baseCarry_ = prefix - baseAligned_;
+            PipeBarrier<PIPE_V>();
+            if (baseCarry_) DataCopy(carry, header[kHeader + baseAligned_], 8);
+            PipeBarrier<PIPE_V>();
+            uint32_t ties = 0;
+            if (incrementalStrict_ < kTop) {
+                PackRankRange(ids, payload + prefix, incrementalStrict_, kTop, incrementalStrict_);
+                ties = AscendC::GetSpr<SpecialPurposeReg::AR>() / sizeof(uint32_t);
+            }
+            writeCount = incrementalPending_ = prefix + ties;
+            publishedPrefix_ = 0;
+        } else if (listChange_ == ListChange::Extended) {
+            suffixEpoch_ = epoch;
+            publishedPrefix_ = baseAligned_;
+            if (baseCarry_) DataCopy(header[kHeader], carry, 8);
+            PipeBarrier<PIPE_V>();
+            PackRankRange(ids, payload + baseCarry_, baseStrict_, kTop, incrementalStrict_);
+            writeCount = baseCarry_ + AscendC::GetSpr<SpecialPurposeReg::AR>() / sizeof(uint32_t);
+            incrementalPending_ = publishedPrefix_ + writeCount;
+        }
+        // An unchanged window still releases a new epoch and its new budget.
+        // Both source payloads are immutable until the graph finishes.
+        ListHeader(reinterpret_cast<__ubuf__ uint32_t*>(header.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_[(query % 2) * 128].GetPhyAddr()),
+            incrementalPending_, epoch + 1, baseEpoch_, publishedPrefix_, suffixEpoch_);
+        auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+        GlobalTensor<uint32_t> list;
+        list.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->incrementalLists)
+            + uint64_t(query * runtimeShape_.rounds + epoch) * kListWords);
+        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        DataCopy(list, header, kHeader + (writeCount + 7) / 8 * 8);
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        // This immutable source is disjoint from every later sort and list
+        // buffer. Payload visibility is established before issuing ready.
+        auto ready = incrementalScores_[kTop + 32].template ReinterpretCast<uint32_t>();
+        DataCopy(rotationProgressGm_[query * 32 + kReadyWord], ready[epoch * 8], 8);
+    }
+#endif
+
     __aicore__ inline void PublishIncremental(uint32_t query, uint32_t epoch) {
+#if KVIP_INCREMENTAL_SEGMENTS
+        PublishSegments(query, epoch);
+#else
         auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
 #if KVIP_INCREMENTAL_DIRECT
         // Header+IDs share one contiguous staging area. The selected-ordinal
@@ -291,5 +410,6 @@
         DataCopy(rotationProgressGm_[query*32+kvip_incremental::kReadyWord],header,8);
 #endif
         SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+#endif
     }
 #endif

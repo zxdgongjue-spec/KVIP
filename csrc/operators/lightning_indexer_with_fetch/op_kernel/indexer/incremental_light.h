@@ -135,7 +135,11 @@ __simd_vf__ inline void GatherIds(__ubuf__ uint16_t* ordinals,
 // Keep the ready stripe in the already prepared header. The caller still
 // waits for the payload DMA to finish before publishing this stripe.
 __simd_vf__ inline void ListHeader(__ubuf__ uint32_t* output,
-    __ubuf__ uint16_t* threshold, uint32_t count, uint32_t epoch) {
+    __ubuf__ uint16_t* threshold, uint32_t count, uint32_t epoch
+#if KVIP_INCREMENTAL_SEGMENTS
+    , uint32_t baseEpoch, uint32_t prefixCount, uint32_t suffixEpoch
+#endif
+    ) {
     auto all = CreateMask<uint32_t, MaskPattern::ALL>();
     RegTensor<int32_t> sequence;
     Arange(sequence, int32_t(0));
@@ -153,6 +157,17 @@ __simd_vf__ inline void ListHeader(__ubuf__ uint32_t* output,
     And(field, reinterpret_cast<RegTensor<uint32_t>&>(key), mask, all);
     CompareScalar<uint32_t, CMPMODE::EQ>(use, lane, uint32_t(1), all);
     Select(value, field, value, use);
+#if KVIP_INCREMENTAL_SEGMENTS
+    CompareScalar<uint32_t, CMPMODE::EQ>(use, lane, uint32_t(3), all);
+    Duplicate(field, baseEpoch);
+    Select(value, field, value, use);
+    CompareScalar<uint32_t, CMPMODE::EQ>(use, lane, uint32_t(4), all);
+    Duplicate(field, prefixCount);
+    Select(value, field, value, use);
+    CompareScalar<uint32_t, CMPMODE::EQ>(use, lane, uint32_t(5), all);
+    Duplicate(field, suffixEpoch);
+    Select(value, field, value, use);
+#endif
     Duplicate(field, epoch);
     CompareScalar<uint32_t, CMPMODE::EQ>(use, lane, uint32_t(2), all);
     Select(value, field, value, use);

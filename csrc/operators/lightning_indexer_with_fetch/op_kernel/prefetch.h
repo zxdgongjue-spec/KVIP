@@ -791,7 +791,25 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
             uint32_t candidates=header.GetValue(0);
             if(candidates>kvip_incremental::kTop) {state.SetValue(11,kvaf_device::kInvalidArgs);break;}
             if(!candidates)continue;
+#if KVIP_INCREMENTAL_SEGMENTS
+            const uint32_t baseEpoch = header.GetValue(3);
+            const uint32_t prefix = header.GetValue(4);
+            const uint32_t suffixEpoch = header.GetValue(5);
+            if (baseEpoch > published || suffixEpoch > published || prefix > candidates || prefix % 8) {
+                state.SetValue(11, kvaf_device::kInvalidArgs);
+                break;
+            }
+            GlobalTensor<uint32_t> payload;
+            payload.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->incrementalLists)
+                + uint64_t(b * 4 + q) * rt_rounds * kvip_incremental::kListWords + kvip_incremental::kHeader);
+            if (prefix) DataCopy(ids, payload[baseEpoch * kvip_incremental::kListWords], prefix);
+            if (prefix < candidates) {
+                DataCopy(ids[prefix], payload[suffixEpoch * kvip_incremental::kListWords],
+                         (candidates - prefix + 7) / 8 * 8);
+            }
+#else
             DataCopy(ids,list[kvip_incremental::kHeader],(candidates+7)/8*8);
+#endif
             SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
             Simt::VF_CALL<GatherCandidateMap>(Simt::Dim3{256,1,1},
                 reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),

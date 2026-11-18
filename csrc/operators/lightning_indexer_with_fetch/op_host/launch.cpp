@@ -5,6 +5,7 @@
 #include "rolling_threshold.h"
 extern "C" uint32_t kvip_incremental_window() { return KVIP_INCREMENTAL_WINDOW; }
 extern "C" uint32_t kvip_incremental_inplace() { return KVIP_INCREMENTAL_INPLACE; }
+extern "C" uint32_t kvip_incremental_segments() { return KVIP_INCREMENTAL_SEGMENTS; }
 extern "C" uint32_t kvip_incremental_progress() { return KVIP_INCREMENTAL_PROGRESS; }
 extern "C" uint32_t kvip_incremental_light() { return KVIP_INCREMENTAL_LIGHT; }
 extern "C" uint32_t kvip_incremental_direct() { return KVIP_INCREMENTAL_DIRECT; }
