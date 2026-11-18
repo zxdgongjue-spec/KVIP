@@ -20,18 +20,35 @@ __aicore__ inline bool HasUniformLengths(const rotating::RuntimeShape& shape, GM
     return true;
 }
 
+__aicore__ inline bool LiNoPrefetch(__gm__ rotating::Context* ctx,
+                                    const __gm__ uint64_t* bindings, bool afterInit) {
+#if KVIP_LOW_MISS_POST_INDEX
+    // Only the combined graph launch has an init -> LI edge for this invocation.
+    if (afterInit) {
+        auto args = reinterpret_cast<const __gm__ pipeline_ab::Args*>(bindings[15]);
+        if (args && args->postIndex) {
+            auto word = reinterpret_cast<__gm__ uint64_t*>(args->postIndex) + pipeline_ab::kPostIndexRouteWord;
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(word), sizeof(*word));
+            const uint64_t route = *word;
+            if (route <= 1) return route == 1;
+        }
+    }
+#endif
+#if KVIP_AUTO_ROUTE
+    if (ctx->autoRoute && ctx->admissionControls)
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->admissionControls),ctx->shape.batch*16);
+#endif
+    return rotating::NoPrefetchRound(ctx);
+}
+
 template <SequenceLiPhase Phase>
-__aicore__ inline void RunLi(GM_ADDR bindings) {
+__aicore__ inline void RunLi(GM_ADDR bindings, bool afterInit=false) {
     using namespace AscendC; using namespace QLICommon;
     auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
 #define P(i) reinterpret_cast<GM_ADDR>(a[i])
     auto ctx = reinterpret_cast<__gm__ rotating::Context*>(a[14]);
     auto shape = rotating::LoadRuntimeShape(ctx);
-#if KVIP_AUTO_ROUTE
-    if (ctx->autoRoute && ctx->admissionControls)
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->admissionControls),shape.batch*16);
-#endif
-    const bool noPrefetch = rotating::NoPrefetchRound(ctx);
+    const bool noPrefetch = LiNoPrefetch(ctx, a, afterInit);
     bool splitSequence = rotating::UseSequenceSplit(shape) && HasUniformLengths(shape, P(5), P(6));
     if constexpr (Phase != SequenceLiPhase::Hot) {
         if (!splitSequence) return;
@@ -78,10 +95,18 @@ __aicore__ inline void RunLi(GM_ADDR bindings) {
 }
 #endif
 
+#if KVIP_LOW_MISS_POST_INDEX
+extern "C" __global__ __aicore__ void v9_li_kernel(GM_ADDR bindings, uint32_t afterInit) {
+#else
 extern "C" __global__ __aicore__ void v9_li_kernel(GM_ADDR bindings) {
+#endif
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+#if KVIP_LOW_MISS_POST_INDEX
+    RunLi<SequenceLiPhase::Hot>(bindings, afterInit != 0);
+#else
     RunLi<SequenceLiPhase::Hot>(bindings);
+#endif
 #endif
 }
 

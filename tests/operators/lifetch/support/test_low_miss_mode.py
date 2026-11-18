@@ -113,3 +113,89 @@ int main() {
     subprocess.run(["c++", "-std=c++17", "-fsanitize=address,undefined", "-O1",
                     str(source), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
+
+
+def test_li_reads_current_auto_decision_only_after_init(tmp_path):
+    kernel = INDEXER.parent
+    indexer = (kernel / "indexer.cpp").read_text()
+    li = function(indexer, "__aicore__ inline bool LiNoPrefetch(")
+    launch = (kernel.parent / "op_host/launch.cpp").read_text()
+    direct = function(launch, 'extern "C" uint32_t v9_li(')
+    combined = function(launch, 'extern "C" uint32_t kvip_lifetch_streaming_forward(')
+    source = tmp_path / "li_mode.cpp"
+    source.write_text(r'''
+#include <cassert>
+#include <cstdint>
+#define __aicore__
+#define __gm__
+#define KVIP_OUTPUT_WORKER 1
+#define KVIP_ADAPTIVE_ADMISSION 1
+#define KVIP_LOW_MISS_SKIP 1
+#define KVIP_AUTO_ROUTE 1
+#define KVIP_LOW_MISS_TAIL 1
+#define KVIP_LOW_MISS_DIRECT_INDEX 1
+#define KVIP_SELECTED_METADATA 1
+#define KVIP_EARLY_FETCH_READY 1
+#define KVIP_READY_BATCH_FETCH 1
+#define KVIP_LOW_MISS_POST_INDEX 1
+#include "pipeline_types.h"
+#include "low_miss_mode.h"
+namespace rotating {
+struct RuntimeShape { uint32_t batch=16, resident=16384, aicCount=32, finalWorkers=4; };
+struct Context { uint64_t autoRoute=1, admissionControls=0; RuntimeShape shape; };
+}
+namespace kvaf_device {
+static uint8_t* last;
+void CleanCacheLines(uint8_t* p, uint32_t) { last=p; }
+}
+''' + li + r'''
+int stage=0, initResult=0;
+uint32_t v9_init(void*, void*, const rotating::RuntimeShape*) { assert(stage++==0); return initResult; }
+uint32_t LaunchLi(void*,void*,const rotating::RuntimeShape*,uint32_t afterInit) {
+    assert(afterInit == uint32_t(stage==1)); ++stage; return 0;
+}
+uint32_t aclrtlaunch_v9_streaming_resolve_update(uint32_t,void*,void*) {
+    assert(stage++==2); return 0;
+}
+''' + direct + combined + r'''
+int main(){
+    uint64_t bindings[16]{}, records[16]{};
+    int32_t controls[64]{};
+    pipeline_ab::Args args{};
+    rotating::Context ctx;
+    ctx.admissionControls = uint64_t(controls);
+    args.postIndex = uint64_t(records);
+    bindings[15] = uint64_t(&args);
+    for(unsigned i=0;i<16;++i) controls[i*4+1]=64;
+    auto& mode=records[pipeline_ab::kPostIndexRouteWord];
+    for(uint64_t value : {uint64_t(1),uint64_t(0),uint64_t(1)}) {
+        mode=value;
+        assert(LiNoPrefetch(&ctx,bindings,true)==(value==1));
+        assert(kvaf_device::last==reinterpret_cast<uint8_t*>(&mode));
+    }
+    // Standalone hot LI can receive manual rows changed since a previous init.
+    controls[60]=512;
+    assert(!LiNoPrefetch(&ctx,nullptr,false));
+    assert(kvaf_device::last==reinterpret_cast<uint8_t*>(controls));
+    mode=pipeline_ab::kReadAdmissionRows;
+    assert(!LiNoPrefetch(&ctx,bindings,true));
+    controls[60]=0; assert(LiNoPrefetch(&ctx,bindings,true));
+    controls[61]=0; assert(!LiNoPrefetch(&ctx,bindings,true));
+    controls[61]=64;
+    args.postIndex=0; assert(LiNoPrefetch(&ctx,bindings,true));
+    bindings[15]=0; assert(LiNoPrefetch(&ctx,bindings,true));
+    ctx.admissionControls=0; assert(!LiNoPrefetch(&ctx,bindings,true));
+    assert(v9_li(&ctx,&ctx,&ctx.shape)==0 && stage==1);
+    stage=0;
+    assert(kvip_lifetch_streaming_forward(&ctx,&ctx,&ctx,&ctx,&ctx.shape,4)==0 && stage==3);
+    stage=0; initResult=7;
+    assert(kvip_lifetch_streaming_forward(&ctx,&ctx,&ctx,&ctx,&ctx.shape,4)==7 && stage==1);
+}
+''')
+    binary = tmp_path / "li_mode"
+    subprocess.run([
+        "c++", "-std=c++17", "-O1", "-fsanitize=address,undefined",
+        "-include", "initializer_list", "-I", str(kernel), "-I", str(kernel.parent / "include"),
+        str(source), "-o", str(binary),
+    ], check=True)
+    subprocess.run([str(binary)], check=True)

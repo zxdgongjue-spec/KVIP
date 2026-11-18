@@ -3,6 +3,9 @@
 namespace pipeline_ab {
 constexpr uint32_t kResolveCores=KVIP_OUTPUT_WORKER?3:2;
 constexpr uint32_t kRawQueryFlag=12;
+// One word in the first post-Index record. Only a value of 1 enters its tail.
+constexpr uint32_t kPostIndexRouteWord = 14;
+constexpr uint64_t kReadAdmissionRows = 2;
 constexpr uint32_t kPrefetch=2048, kQueries=4;
 // Only the current Q needs first-occurrence IDs; slots/hash ranks span all Qs.
 constexpr uint32_t kStagedSlotsOffset=4*8192+1024;

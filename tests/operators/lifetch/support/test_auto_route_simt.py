@@ -167,7 +167,7 @@ void instantiate(__gm__ Context* ctx, __ubuf__ uint32_t* words) {
 def test_parallel_route_keeps_scalar_cache_visibility():
     source = (INCLUDE.parent / "op_kernel/lifecycle.cpp").read_text()
     init = function(source, 'void v9_init_kernel(')
-    check = init.index("parallelRoute=kvip_auto_route::CanPublishRows(ctx)")
+    check = init.index("!stageRoute && kvip_auto_route::CanPublishRows(ctx)")
     assert init.index("reinterpret_cast<__gm__ uint8_t*>(ctx->autoRoute),128") < check
     row_load = init.index("uint32_t owner=ctx->rowOwners ?")
     refresh = init.index("reinterpret_cast<__gm__ uint8_t*>(ctx->rowOwners)+b*sizeof(uint32_t),sizeof(uint32_t)")

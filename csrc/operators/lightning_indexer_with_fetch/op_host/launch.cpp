@@ -37,12 +37,20 @@ extern "C" uint32_t v9_##name(void* bindings,void* stream,const rotating::Runtim
     return aclrtlaunch_v9_##name##_kernel(blocks,stream,bindings); }
 ENTRY(init,shape->batch)
 
+#if KVIP_LOW_MISS_POST_INDEX
+extern "C" uint32_t aclrtlaunch_v9_li_kernel(uint32_t,void*,void*,uint32_t);
+#else
 extern "C" uint32_t aclrtlaunch_v9_li_kernel(uint32_t,void*,void*);
+#endif
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_1(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_2(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_3(uint32_t,void*,void*);
-extern "C" uint32_t v9_li(void* bindings, void* stream, const rotating::RuntimeShape* shape) {
+static uint32_t LaunchLi(void* bindings, void* stream, const rotating::RuntimeShape* shape, uint32_t afterInit) {
+#if KVIP_LOW_MISS_POST_INDEX
+#define LI_LAUNCH_0(n,s,b) aclrtlaunch_v9_li_kernel(n,s,b,afterInit)
+#else
 #define LI_LAUNCH_0 aclrtlaunch_v9_li_kernel
+#endif
 #define LI_LAUNCH_1 aclrtlaunch_v9_li_kernel_1
 #define LI_LAUNCH_2 aclrtlaunch_v9_li_kernel_2
 #define LI_LAUNCH_3 aclrtlaunch_v9_li_kernel_3
@@ -51,6 +59,9 @@ extern "C" uint32_t v9_li(void* bindings, void* stream, const rotating::RuntimeS
 #undef LI_LAUNCH_1
 #undef LI_LAUNCH_2
 #undef LI_LAUNCH_3
+}
+extern "C" uint32_t v9_li(void* bindings, void* stream, const rotating::RuntimeShape* shape) {
+    return LaunchLi(bindings,stream,shape,0);
 }
 extern "C" uint32_t v9_li_cores(const rotating::RuntimeShape* shape) { return shape->liCores; }
 extern "C" uint32_t v9_batch(const rotating::RuntimeShape* shape) { return shape->batch; }
@@ -105,7 +116,7 @@ extern "C" uint32_t kvip_lifetch_streaming_forward(void* bindings,void* update,v
     if(!bindings||!update||!workspace||!stream||!shape||shape->resident>131072||shape->batch<1||shape->batch>16||shape->finalWorkers!=4)return 100000;
     if((workers!=1 && workers!=2 && workers!=4) || shape->batch*pipeline_ab::kResolveCores+4*workers>shape->aicCount*2)return 100000;
     uint32_t result=v9_init(bindings,stream,shape);
-    if(!result)result=v9_li(bindings,stream,shape);
+    if(!result)result=LaunchLi(bindings,stream,shape,1);
     uint32_t tailCores=shape->batch*pipeline_ab::kResolveCores+4*workers;
 #if KVIP_LOW_MISS_POST_INDEX
     tailCores=2*shape->aicCount;

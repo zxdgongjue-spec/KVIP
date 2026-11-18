@@ -44,7 +44,7 @@ __aicore__ inline void FillRoundWords(uint64_t address,uint32_t words,
     }
     // Caller joins the whole fill group before reusing the shared UB value.
 }
-__aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t b,__gm__ pipeline_ab::Args* streaming,bool& noPrefetch,bool stageRoute=false,__gm__ uint64_t* stageTicks=nullptr
+__aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t b,__gm__ pipeline_ab::Args* streaming,bool& noPrefetch,bool* stagedPublication=nullptr,__gm__ uint64_t* stageTicks=nullptr
 #if KVIP_AUTO_ROUTE_SIMT
     ,bool parallelRoute=false,__gm__ uint64_t* routeTicks=nullptr
 #endif
@@ -52,8 +52,8 @@ __aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uin
     TPipe pipe;TBuf<TPosition::VECCALC> storage;pipe.InitBuffer(storage,kvip_round_init::kFillWords*4);
     auto local=storage.Get<uint32_t>();
 #if defined(__CCE_AICORE__) && KVIP_LOW_MISS_POST_INDEX && KVIP_AUTO_ROUTE_ROW_PUBLISH
-    if(stageRoute){
-        kvip_auto_route::StageAndEvaluate(ctx,b,local,noPrefetch);
+    if(stagedPublication){
+        *stagedPublication=kvip_auto_route::StageAndEvaluate(ctx,b,local,noPrefetch);
         if(stageTicks){stageTicks[27]=GetSystemCycle();stageTicks[28]=GetSystemCycle();}
     }
 #endif
@@ -227,17 +227,18 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
         }
 #endif
         if(profile && !stageRoute) { ticks[27]=GetSystemCycle(); ticks[28]=GetSystemCycle(); }
-        InitializeRound(rt_batch,rt_history,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b,streaming,noPrefetch,stageRoute,ticks
+        bool published=false;
+        InitializeRound(rt_batch,rt_history,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b,streaming,noPrefetch,stageRoute ? &published : nullptr,ticks
 #if KVIP_AUTO_ROUTE_SIMT
             ,parallelRoute,ticks
 #endif
             );
 #if KVIP_LOW_MISS_POST_INDEX
-        // Evaluate computes one batch-wide decision. Publish it once at the
-        // existing kernel boundary; the tail does not rescan request rows.
+        // An automatic low decision is conclusive on every route evaluator.
+        // A high result without a verified publication can still have manual controls.
         if(!b && streaming && streaming->postIndex) {
-            auto decision=reinterpret_cast<__gm__ uint64_t*>(streaming->postIndex)+14;
-            *decision=noPrefetch?1U:0U;
+            auto decision=reinterpret_cast<__gm__ uint64_t*>(streaming->postIndex)+pipeline_ab::kPostIndexRouteWord;
+            *decision=noPrefetch ? 1U : (published ? 0U : pipeline_ab::kReadAdmissionRows);
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(decision),sizeof(uint64_t));
         }
 #endif

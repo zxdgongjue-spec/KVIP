@@ -176,6 +176,46 @@ __aicore__ inline void CopyRouteTable(uint64_t source, uint32_t bytes,
     AscendC::DataCopyPadExtParams<uint32_t> pad{false,0,0,0};
     AscendC::DataCopyPad(target,input,copy,pad);
 }
+// A warp proves the common all-Q4 case using only the staged table. At
+// most sixteen lanes participate. An inconclusive proof selects the general
+// evaluator, before any pending or control record has been changed.
+__simt_vf__ __aicore__ LAUNCH_BOUND(32) inline void ScoreQ4Route(
+    __ubuf__ RouteTables* table, uint32_t batch, uint32_t history,
+    uint32_t tokenBytes, uint32_t ownRow, __ubuf__ uint32_t* proof) {
+    const uint32_t lane = threadIdx.x;
+    const bool active = lane < batch;
+    auto request = &table->requests[active ? lane : 0];
+    bool valid = request->owner < table->config.owners && request->owner == table->owners[active ? lane : 0] &&
+                 request->queries == 4 && request->generation;
+    const uint32_t owner = valid ? uint32_t(request->owner) : 0;
+    auto previous = &table->feedback[owner];
+    auto ends = table->ends + 4 * (active ? lane : 0);
+    valid = valid && previous->valid == kValid && previous->generation == request->generation && previous->step &&
+            request->step > previous->step && request->step - previous->step <= table->config.maxStepGap &&
+            previous->queries == 4 && previous->necessary <= 8192 && previous->mode <= 1 && previous->tokenBytes == tokenBytes &&
+            ends[0] - 1u < history && ends[1] - 1u < history && ends[2] - 1u < history && ends[3] - 1u < history;
+    uint32_t lowerOwners = active && owner < 32 ? (1U << (owner & 31)) : 0;
+    uint32_t upperOwners = active && owner >= 32 ? (1U << (owner & 31)) : 0;
+    uint32_t work = active ? ends[0] + ends[1] + ends[2] + ends[3] : 0;
+    uint32_t demand = active ? uint32_t(previous->necessary) : 0;
+    const uint32_t invalidRows = asc_ballot(active && !valid);
+    const uint32_t previousHighRows = asc_ballot(active && previous->mode != 0);
+    if (lane == ownRow) proof[1] = work;
+    for (uint32_t distance = 1; distance < 16; distance *= 2) {
+        const uint32_t src = lane ^ distance;
+        lowerOwners |= asc_shfl(lowerOwners, src, 32);
+        upperOwners |= asc_shfl(upperOwners, src, 32);
+        work += asc_shfl(work, src, 32);
+        demand += asc_shfl(demand, src, 32);
+    }
+    if (!lane) {
+        bool unique = uint32_t(__builtin_popcount(lowerOwners) + __builtin_popcount(upperOwners)) == batch;
+        const uint64_t budget = previousHighRows ? table->config.lowBudget : table->config.highBudget;
+        const bool low = uint64_t(demand) * tokenBytes * 1024 <= budget * work;
+        proof[0] = !invalidRows && unique ? uint32_t(!low) : 2;
+    }
+}
+
 template<class Context>
 __aicore__ inline bool StageAndEvaluate(__gm__ Context* ctx, uint32_t row,
     AscendC::LocalTensor<uint32_t> storage,bool& noPrefetch) {
@@ -196,7 +236,51 @@ __aicore__ inline bool StageAndEvaluate(__gm__ Context* ctx, uint32_t row,
     AscendC::DataCopyPad(storage[offsetof(RouteTables,feedback)/4],input,copy,pad);
     AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
     AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
-    bool result=EvaluateStaged(ctx,table,noPrefetch,row);
+    bool result = false;
+    constexpr uint32_t resultWord = (sizeof(RouteTables) + 31) / 32 * 8;
+    static_assert((resultWord + 8) * 4 <= 16384, "route result must fit init scratch");
+    // Sixty-four query ends fit in a 32-bit warp sum under this bound.
+    if (ctx->rowOwners && ctx->queryEnds && ctx->shape.history <= UINT32_MAX / 64 &&
+        ValidStaged(&table->config) && table->config.learning && table->config.owners == c->owners) {
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+        Simt::VF_CALL<ScoreQ4Route>(Simt::Dim3{32,1,1}, table, ctx->shape.batch,
+            ctx->shape.history, ctx->shape.tokenBytes, row,
+            reinterpret_cast<__ubuf__ uint32_t*>(storage.GetPhyAddr()) + resultWord);
+        AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
+        uint32_t mode = storage.GetValue(resultWord);
+        if (mode <= 1) {
+            auto request = table->requests + row;
+            auto record = reinterpret_cast<__gm__ Pending*>(c->pending) + row;
+            record->owner = request->owner;
+            record->generation = request->generation;
+            record->step = request->step;
+            record->queries = 4;
+            record->learnable = 1;
+            record->mode = mode;
+            record->reason = Predicted;
+            record->scoreWork = storage.GetValue(resultWord + 1);
+            record->tokenBytes = ctx->shape.tokenBytes;
+            record->necessary = 0;
+            record->usefulPrefetch = 0;
+            record->previousStep = table->feedback[request->owner].step;
+            for (uint32_t i = 0; i < 4; ++i) record->reserved[i] = 0;
+            if (row % 8 == 0) {
+                auto controls = reinterpret_cast<__gm__ int32_t*>(ctx->admissionControls);
+                uint32_t stop = row + 8 < ctx->shape.batch ? row + 8 : ctx->shape.batch;
+                for (uint32_t i = row; i < stop; ++i) {
+                    controls[4 * i] = mode ? int32_t(c->fullTotal) : 0;
+                    controls[4 * i + 1] = int32_t(c->fullWindow);
+                    controls[4 * i + 2] = int32_t(c->fullSteps);
+                    controls[4 * i + 3] = int32_t(c->fullCarry);
+                }
+            }
+            noPrefetch = !mode;
+            result = true;
+        }
+    }
+    if (!result) result = EvaluateStaged(ctx, table, noPrefetch, row);
     if(result){
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(c->pending)+row*128,128);
         if(row%8==0){uint32_t count=ctx->shape.batch-row;if(count>8)count=8;

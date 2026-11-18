@@ -191,6 +191,17 @@ int main() {
     f=Fixture();f.config.lowBudget=0;assert(!f.compare());
     f=Fixture();f.config.fullSteps=65536;assert(!f.compare());
     f=Fixture();f.config.owners=0;assert(!f.compare());
+    // Exercise the Q4 steady route at and on either side of the byte budget.
+    // Also invalidate a late row, after most of the fast-path scan completed.
+    for (unsigned demand : {0U, 127U, 128U, 129U, 8192U}) {
+        f = Fixture();
+        f.config.lowBudget = 255; f.config.highBudget = 256;
+        for (auto& previous : f.feedback) previous.necessary = demand;
+        f.ends.fill(128 * 656);
+        f.compare();
+        f.requests[15].generation++;
+        assert(!f.compare());
+    }
     std::mt19937 rng(117);
     for (uint32_t iteration = 0; iteration < 5000; ++iteration) {
         f = Fixture();
