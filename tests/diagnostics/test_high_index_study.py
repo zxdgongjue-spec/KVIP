@@ -45,7 +45,14 @@ def test_high_diagnostic_checks_work_order_and_per_core_fallback(wait_first):
         marks[:,field] = tick
     phase = decode_high_index(records, marks, wait_first=wait_first, final_get=0, work={})
     assert phase["fallback"] and phase["fallback_cores"] == 1 and phase["active_aiv"] == 0
-    assert phase["index_span"] == 1 and phase["joined_span"] == 4
+    assert phase["index_span"] == 1 and "joined_span" not in phase
+    marks[:,13] = 9
+    phase = decode_high_index(records, marks, wait_first=wait_first, final_get=0, work={})
+    assert phase["joined_span"] == 7
+    marks[2,13] = 0
+    with pytest.raises(ValueError, match="collective"):
+        decode_high_index(records, marks, wait_first=wait_first, final_get=0, work={})
+    marks[:,13] = 9
     marks[63, order[-1]] = 1
     with pytest.raises(ValueError, match="Unordered"):
         decode_high_index(records, marks, wait_first=wait_first, final_get=0, work={})

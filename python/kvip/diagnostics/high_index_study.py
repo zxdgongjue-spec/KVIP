@@ -128,6 +128,7 @@ def summarize(group, cases):
     for role in ("wait-first", "overlap"):
         profiles[role] = order_samples(cases[role])
         for i, (_, phase, rate, read) in enumerate(profiles[role], 1):
+            joined = f"{phase['joined_span']/rate:.3f}" if "joined_span" in phase else "unavailable"
             split = (" plan+join/gather+join/scatter_us="
                      + pair_string(phase[name]/rate for name in ("plan_join", "gather_join", "scatter_end"))
                      if "plan_join" in phase else "")
@@ -136,14 +137,15 @@ def summarize(group, cases):
                   f" prefetch/final={read['prefetch']}/{read['final']} fallback={int(phase['fallback'])}"
                   f" index_span_us={phase['index_span']/rate:.3f} cq_span_us={phase['cq_span']/rate:.3f}"
                   f" index/CQ_core_p50_us={phase['index_core_p50']/rate:.3f}/{phase['cq_core_p50']/rate:.3f}"
-                  f" post_join_to_finish_us={phase['joined_span']/rate:.3f}{split}")
+                  f" post_join_to_finish_us={joined}{split}")
     count, saving = equivalent_savings(cases)
     matched = []
     for key, wait, rate, _ in profiles["wait-first"]:
         if key is None:
             continue
         for other_key, overlap, other_rate, _ in profiles["overlap"]:
-            if key == other_key and wait["moved"] == overlap["moved"]:
+            if (key == other_key and wait["moved"] == overlap["moved"]
+                    and "joined_span" in wait and "joined_span" in overlap):
                 isolated = wait["index_span"]/rate
                 saved = wait["joined_span"]/rate - overlap["joined_span"]/other_rate
                 matched.append(isolated - saved)

@@ -147,9 +147,15 @@ def decode_high_index(records, detail, *, wait_first, final_get, work):
     # The drain span includes software polling and warp skew; it is not a wire RTT.
     result.update(assigned=assigned.tolist(), moved=moved.tolist(), active_aiv=int(np.count_nonzero(moved)),
                   index_span=span(marks[:, 4], marks[:, 5]), cq_span=cq_span,
-                  joined_span=span(marks[:, 3], np.maximum(marks[:, 6], marks[:, 7])),
                   index_core_p50=float(np.median(marks[:, 5] - marks[:, 4])),
                   cq_core_p50=float(np.median(marks[:, 7] - drain_start)))
+    # [7] ends local polling; [6] ends an Index collective. Only [13] follows
+    # the last collective in both orders. Their maximum is an asymmetric proxy.
+    joined = marks[:, 13]
+    if np.any(joined):
+        if np.any(joined == 0) or np.any(joined < np.maximum(marks[:, 6], marks[:, 7])):
+            raise ValueError("Incomplete or unordered final HIGH collective markers")
+        result["joined_span"] = span(marks[:, 3], joined)
     subphases = marks[:, [4, 11, 12, 5]]
     if np.any(subphases[:, 1:3]):
         if np.any(subphases == 0) or np.any(subphases[:, 1:] < subphases[:, :-1]):
