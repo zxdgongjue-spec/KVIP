@@ -20,3 +20,15 @@ def test_middle_doorbell_is_first_useful_and_empty_turns_count():
     events[1, 0, 15] = 119
     with pytest.raises(ValueError, match='not monotonic'):
         marker_summary(events.view(np.uint8), posts, final, 1)
+
+
+def test_live_submission_is_checked_even_if_no_new_rank_was_ready():
+    from kvip.diagnostics.fetch_rank_check import check_state
+
+    versions = np.zeros((1, 9), dtype=np.int32)
+    posts = [[[] for _ in range(9)]]
+    tables = [[[] for _ in range(4)]]
+    assert check_state(None, versions, posts, tables, None, fixed=False)['lists'] == 9
+    posts[0][2] = [57]
+    with pytest.raises(ValueError, match='Q4 submission mismatch'):
+        check_state(None, versions, posts, tables, None, fixed=False)

@@ -19,7 +19,7 @@ groups=(2 7 10 17 4)
 case "$study" in
     fetch)
         branch=perf/urma-fetch-rank-ab
-        native_sha=d5ad16037db5aa108ad634b0b0465ef3dd62f7bd
+        native_sha=e435e34a448039b94f65c0404665b94f5af4ee63
         groups=(7 2)
         ;;
     budget)
@@ -56,6 +56,19 @@ if [[ ! -d "$native" ]]; then
     git -C "$kvip" worktree add -q --detach "$native" "$native_sha"
 fi
 [[ $(git -C "$native" rev-parse HEAD) == "$native_sha" ]] || { echo "SOURCE_MISMATCH expected=$native_sha path=$native" >&2; exit 1; }
+if [[ "$study" == fetch ]]; then
+    prior_sha=d5ad16037db5aa108ad634b0b0465ef3dd62f7bd
+    prior="$work/fused-scan-sources/native-$prior_sha"
+    if [[ ! -d "$prior" ]]; then
+        git -C "$native" worktree add -q --detach "$prior" "$prior_sha"
+    fi
+    [[ $(git -C "$prior" rev-parse HEAD) == "$prior_sha" ]] || { echo "SOURCE_MISMATCH $prior" >&2; exit 1; }
+    for checkout in "$native" "$prior"; do
+        if ! git -C "$checkout" diff --quiet HEAD -- csrc python; then
+            echo "MODIFIED_NATIVE_SOURCE $checkout" >&2; exit 1
+        fi
+    done
+fi
 set +u
 source "$kvip/scripts/env.sh"
 set -u
@@ -105,7 +118,7 @@ if [[ "$study" == budget ]]; then
 fi
 run_case() {
     local group=$1 phase=$2 warm=5 iterations=10 diagnostic=0 args=() selected=("${variants[@]}")
-    local base="$result/g${group}-$phase"
+    local base="$result/g${group}-$phase" source="$native" source_sha="$native_sha"
     if [[ "$study" == seed || "$study" == parallel ]]; then
         selected=(forward reverse reverse-consumed reverse-seed-mask reverse-seed-mask-end
             reverse-consumed-end reverse-end forward-end)
@@ -148,6 +161,13 @@ run_case() {
         selected=(forward reverse reverse-fetch-bitmap reverse-fetch-dense)
         if [[ "$phase" == check ]]; then
             warm=1; iterations=1; diagnostic=1
+        elif [[ "$phase" == prior-open || "$phase" == prior-close ]]; then
+            source="$prior"; source_sha="$prior_sha"
+            if [[ "$phase" == prior-open ]]; then
+                selected=(reverse-fetch-bitmap reverse-fetch-dense)
+            else
+                selected=(reverse-fetch-dense-end reverse-fetch-bitmap-end)
+            fi
         else
             selected+=(reverse-fetch-dense-end reverse-fetch-bitmap-end reverse-end forward-end)
         fi
@@ -156,7 +176,7 @@ run_case() {
     python3 -B -X faulthandler -m kvip.diagnostics.replay \
         --snapshot "$inputs/g${group}-input" --build-dir "$build" --transport urma --mode fused \
         --threshold-policy recent --study scan-order --scan-variants "${selected[@]}" \
-        --cold-windows 8 --isolate-variants --upstream-root "$native" --upstream-revision "$native_sha" \
+        --cold-windows 8 --isolate-variants --upstream-root "$source" --upstream-revision "$source_sha" \
         --kvaf-server "127.0.0.1:$cpu_port" --device 0 --soc Ascend950DT_9582 \
         --warmup "$warm" --iterations "$iterations" --diagnostic-replays "$diagnostic" "${args[@]}" --quiet \
         --output "$base.json" >"$base.log" 2>&1 || {
@@ -167,6 +187,7 @@ run_case() {
             return "$rc"
         }
     if [[ "$study" == fetch ]]; then
+        if [[ "$phase" == prior-* ]]; then return 0; fi
         python3 -B "$reader/tests/diagnostics/fetch_ab_report.py" "$base.json" "$phase" \
             "$native_sha" "$inputs/g${group}-input/manifest.json" | tee "$base.txt"
     elif [[ "$study" == budget || "$study" == seed || "$study" == parallel || "$study" == trunk ]]; then
@@ -185,7 +206,14 @@ if [[ "$study" == fetch ]]; then
     export KVIP_FETCH_AB_CHECK=1
     for group in "${groups[@]}"; do run_case "$group" check; done
     unset KVIP_FETCH_AB_CHECK
-    for group in "${groups[@]}"; do run_case "$group" graph; done
+    for group in "${groups[@]}"; do
+        run_case "$group" prior-open
+        run_case "$group" graph
+        run_case "$group" prior-close
+        python3 -B "$reader/tests/diagnostics/fetch_ab_report.py" \
+            "$result/g${group}-graph.json" revised "$native_sha" "$inputs/g${group}-input/manifest.json" \
+            "$prior_sha" "$result/g${group}-prior-open.json" "$result/g${group}-prior-close.json" | tee "$result/g${group}-revised.txt"
+    done
     (cd "$result" && tar -czf results.tar.gz g*.json g*.txt)
     echo "G7_G2_COMPLETE RETURN_FILE=$result/results.tar.gz"
     exit 0

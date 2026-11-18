@@ -29,13 +29,13 @@ def oracle_row(scores, ends, bounds, resident):
     return table
 
 
-def check_state(ranks, audit, tables, eligible, *, fixed, actual_posts=None):
+def check_state(ranks, all_versions, posts, tables, eligible, *, fixed):
     digest = hashlib.sha256()
     sent_digest = hashlib.sha256()
     ranks_checked = 0
     submits = []
     for row, table in enumerate(tables):
-        versions = audit[row, :, 0].astype(int)
+        versions = all_versions[row].astype(int)
         if (np.any(np.diff(versions) < 0) or np.any(versions < 0)
                 or np.any(versions > np.arange(1, 10))
                 or (fixed and not np.array_equal(versions, np.arange(1, 10)))):
@@ -64,18 +64,16 @@ def check_state(ranks, audit, tables, eligible, *, fixed, actual_posts=None):
                     ids = table[q][version-1][1]
                     lists.append(ids[eligible[row, ids]].tolist())
             wanted = publication(lists, posted, 64, 512)
-            n = int(audit[row, epoch, 1])
-            observed = audit[row, epoch, 32:32+n].tolist()
+            observed = posts[row][epoch]
+            n = len(observed)
             if n != len(wanted) or observed != wanted:
                 raise ValueError(f"Q4 submission mismatch row={row} epoch={epoch} version={version} "
                                  f"counts={n}/{len(wanted)} first={observed[:4]}/{wanted[:4]}")
-            if actual_posts is not None and actual_posts[row][epoch] != observed:
-                raise ValueError(f"Submitted WQE IDs differ from admission row={row} epoch={epoch}")
             sent_digest.update(np.asarray([n, *observed], dtype='<u4').tobytes())
             row_lists.append(observed)
         submits.append(row_lists)
     return dict(ranks=ranks_checked, lists=len(tables)*9, prefix_sha=digest.hexdigest(),
-                post_sha=sent_digest.hexdigest(), versions=audit[:, :, 0].tolist(), posts=submits)
+                post_sha=sent_digest.hexdigest(), versions=all_versions.tolist(), posts=submits)
 
 
 def native_call(library, name, signature, *args):
@@ -179,17 +177,20 @@ def inspect_replay(torch, stream, rot, archive):
     finally:
         cpu.close()
 
-    def read(fixed):
-        return check_state(cpu_array(torch, rot.fetch_ranks), cpu_array(torch, rot.fetch_audit),
-                           tables, eligible, fixed=fixed, actual_posts=None if fixed else posts)
-
-    result['live'] = read(False)
+    # Compare the actual WQEs with the independent oracle. The version rides
+    # in the normal row flush so timing never waits for an extra admission dump.
+    versions = cpu_array(torch, rot.rows)[:, 80:116:4]
+    result['live'] = check_state(cpu_array(torch, rot.fetch_ranks), versions, posts, tables, eligible, fixed=False)
     frozen = torch.from_numpy(np.where(eligible, -1, 0).astype('<i4')).to(rot.device)
     stream.synchronize()
     ptr = ctypes.c_void_p
     native_call(rot.library, 'kvip_fetch_fixture', [ptr, ptr, ptr, ctypes.c_uint32],
                 rot.bindings.data_ptr(), frozen.data_ptr(), stream.npu_stream, len(tables))
     stream.synchronize()
-    fixed = read(True)
+    audit = cpu_array(torch, rot.fetch_audit)
+    if np.any(audit[:, :, 1] > 64) or np.any(audit[:, :, 1] < 0):
+        raise ValueError("Fixture exceeded the window budget")
+    lists = [[a[32:32+int(a[1])].tolist() for a in row] for row in audit]
+    fixed = check_state(cpu_array(torch, rot.fetch_ranks), audit[:, :, 0], lists, tables, eligible, fixed=True)
     result['fixed'] = {k: fixed[k] for k in ('ranks', 'lists', 'prefix_sha', 'post_sha')}
     return result
