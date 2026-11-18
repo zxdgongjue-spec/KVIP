@@ -73,23 +73,34 @@ def test_checks_fail_for_stale_or_unverified_index_or_changed_transport():
         diagnostic_wait(case)
 
 
-@pytest.mark.parametrize("formats", [("PIH1", "RQI1"), ("RQI1", "RQI2")])
+@pytest.mark.parametrize("formats", [("PIH1", "RQI1"), ("RQI1", "RQI2"), ("RQI1", "RQI2", "RQI3")])
 def test_high_overlap_arms_reuse_public_completion_records(tmp_path, capsys, formats):
-    from kvip.diagnostics.consumer_ab import OVERLAP_ARMS
+    from kvip.diagnostics.consumer_ab import OVERLAP_ARMS, THREE_SOURCE_ARMS
 
     args = SimpleNamespace(baseline="a"*40, revision="b"*40, cache=tmp_path, source=tmp_path/"new",
                            result_dir=tmp_path, server="127.0.0.1:29085", high_overlap=True)
+    intermediate = len(formats) == 3
+    args.intermediate = "e"*40 if intermediate else None
+    roles = THREE_SOURCE_ARMS if intermediate else OVERLAP_ARMS
+    latencies = dict(original=500, before=540, middle=507, after=501,
+                     **{"after-end":499, "middle-end":509, "before-end":542, "original-end":498})
     cases = {}
-    for arm, usecs in zip(OVERLAP_ARMS, (500, 540, 501, 499, 542, 498)):
+    for arm in roles:
+        usecs = latencies[arm]
         opts = arguments(command(args, 7, arm)[4:])
         original = arm.startswith("original")
         old_binary = original or arm.startswith("before")
         assert opts.verify_consumer_work and opts.check_auto_route and opts.high_post_index == (not original)
-        diagnostic = arm in ("before", "after")
+        middle = arm.startswith("middle")
+        diagnostic = arm in ("before", "middle", "after")
         assert opts.calibrate_counter == diagnostic and opts.diagnostic_replays == int(diagnostic)
         assert not opts.post_index_wait_first
-        assert opts.upstream_revision == (args.baseline if old_binary else args.revision)
+        revision = args.intermediate if middle else (args.baseline if old_binary else args.revision)
+        assert opts.upstream_revision == revision
+        expected_source = args.cache / "adaptive-sources" / f"auto-{revision[:8]}" if old_binary or middle else args.source
+        assert opts.upstream_root == expected_source
         c = synthetic_report("before" if old_binary else "after", usecs)
+        c["kvip_commit"] = c["library_sha256"] = revision
         if diagnostic:
             diag = c["native_diagnostics"]
             diag["samples"] = diag["samples"][:1]
@@ -98,10 +109,11 @@ def test_high_overlap_arms_reuse_public_completion_records(tmp_path, capsys, for
                     last_post_return=1500, last_final_wait_return=4000, longest_lane_index=3000,
                     index_completion_spread=500, last_index_minus_last_final_wait=-1000,
                     nonempty_lanes=1, final_api_calls=1, blocking_final_lanes=0,
+                    last_wait_lane=0, last_wait_lane_get=1, last_wait_lane_post_return=1500, max_lane_get=1, max_row_get=1,
                     validation_by_role_p50=[300, 500, 350, 10], validation_spread_max=490,
                     row_retire_to_exit_p50=30, row_retire_to_exit_max=60,
                     lane_index_p50=220, max_moves_per_lane=100, moved_total=1000, max_row_moves=256,
-                    format=formats[int(arm=="after")])))
+                    format=formats[roles.index(arm)-1])))
         else:
             del c["native_diagnostics"]
         c["high_post_index"] = not original
@@ -110,13 +122,20 @@ def test_high_overlap_arms_reuse_public_completion_records(tmp_path, capsys, for
             for s in c["reads_samples"]:
                 s["high_post_index"] = dict(core_count=64, fallback_cores=0, final_get_by_core=[1]+[0]*63)
         cases[arm] = c
-    summarize(7, cases, args.baseline, args.revision, True, formats)
+    summarize(7, cases, args.baseline, args.revision, True, formats, args.intermediate)
     result = capsys.readouterr().out
     assert "ORIGINAL_per_row_vs_candidate_us saved_min=-3.000/-3.000 saved_max=1.000/1.000" in result
     assert "identical_work_pairs=18/18" in result and "real_Index_order/TopK/KV/lifecycle/submitted_completed=PASS" in result
+    if intermediate:
+        assert "VS_middle_us saved_min=6.000/6.000 saved_max=10.000/10.000" in result
+        assert "middle=18/18,8.000/8.000" in result
+        cases["middle-end"]["kvip_commit"] = args.baseline
+        with pytest.raises(ValueError, match="wrong source"):
+            summarize(7, cases, args.baseline, args.revision, True, formats, args.intermediate)
+        cases["middle-end"]["kvip_commit"] = args.intermediate
     cases["after"]["reads_samples"][1]["high_post_index"]["final_get_by_core"] = [0]*64
     with pytest.raises(ValueError, match="transport count"):
-        summarize(7, cases, args.baseline, args.revision, True, formats)
+        summarize(7, cases, args.baseline, args.revision, True, formats, args.intermediate)
 
 def test_row_timeline_handles_split_submissions_and_excludes_idle_final_lanes():
     from kvip.diagnostics.high_index_profile import decode_high_index
@@ -143,6 +162,7 @@ def test_row_timeline_handles_split_submissions_and_excludes_idle_final_lanes():
                           first_post_begin=40, last_post_begin=220, last_post_return=226,
                           last_final_wait_return=241, longest_lane_index=130, index_completion_spread=40,
                           last_index_minus_last_final_wait=-51, blocking_final_lanes=0,
+                          last_wait_lane=0, last_wait_lane_get=3, last_wait_lane_post_return=226, max_lane_get=7, max_row_get=7,
                           validation_by_role_p50=[55,50,45,30], validation_spread_max=25, lane_index_p50=90,
                           row_retire_to_exit_p50=107.5, row_retire_to_exit_max=115,
                           max_moves_per_lane=0, max_row_moves=0, moved_total=0)
@@ -194,6 +214,56 @@ def test_expected_format_follows_checked_out_dispatch_and_marker(tmp_path):
     (folder / "streaming.cpp").write_text("high_post_index::Run(a,block);")
     assert schedule_format(tmp_path) == "PIH1"
     (folder / "streaming.cpp").write_text("high_post_index::RunRow(a,block);")
-    for token, expected in (("0x52514931", "RQI1"), ("0x52514932", "RQI2")):
+    for token, expected in (("0x52514931", "RQI1"), ("0x52514932", "RQI2"), ("0x52514933", "RQI3")):
         (folder / "high_index_async.h").write_text(f"ticks[2]={token}U;")
         assert schedule_format(tmp_path) == expected
+
+
+def test_size_matching_uses_only_same_step_and_all_four_counts():
+    from kvip.diagnostics.consumer_ab import size_near_pairs
+    from copy import deepcopy
+
+    cases = {arm: synthetic_report(arm, val, exact=False)
+             for arm, val in (("before", 510), ("before-end", 520), ("after", 502), ("after-end", 504))}
+    for case in cases.values():
+        case["reads_samples"] = [deepcopy(sample) for sample in case["reads_samples"]]
+        for sample in case["reads_samples"]:
+            sample["prefetch"] = sample["final"] = sample["unused_prefetch"] = 100
+    # The sources have different IDs even at identical sizes. Reject each
+    # out-of-band count independently; include exactly 2% and one-count noise.
+    for i, key in enumerate(("prefetch", "final", "unused_prefetch", "event_count"), start=1):
+        sample = cases["after"]["reads_samples"][i]
+        (sample["consumer_work"] if key == "event_count" else sample)[key] = 103
+    cases["after"]["reads_samples"][5]["unused_prefetch"] = 102
+    cases["before"]["reads_samples"][6]["final"] = 0
+    cases["after"]["reads_samples"][6]["final"] = 1
+    assert size_near_pairs(cases, "before") == [8]*5 + [16]*9
+
+
+@pytest.mark.parametrize("mutation", ["none", "stale_counts", "wrong_donor", "same_work_wrong_lane", "two_donors", "empty"])
+def test_reassigned_get_uses_real_descriptor_totals_and_physical_core_submissions(mutation):
+    from kvip.diagnostics.high_index_profile import check_get_reassignment
+    canonical = np.zeros((16, 4), dtype=np.int32)
+    canonical[3, :3] = [1024, 7, 9]
+    marks = np.zeros((64, 32), dtype=np.uint64)
+    marks[:, 20] = canonical.T.ravel()
+    actual = marks[:, 20].copy()
+    if mutation != "empty":
+        marks[3, 22] = marks[19, 21] = 500
+        marks[19, 23] = 1
+        actual[3], actual[19] = 524, 507
+    if mutation == "stale_counts":
+        canonical[3, 1] = 10
+    elif mutation == "wrong_donor":
+        marks[19, 23] = 3
+    elif mutation == "same_work_wrong_lane":
+        actual[[3,19]] = [525,506]
+    elif mutation == "two_donors":
+        marks[3,22], marks[35,22] = 499,1
+        actual[3], actual[35] = 525,8
+    if mutation in ("none", "empty"):
+        assert check_get_reassignment(actual, marks, canonical) == dict(
+            helpers=int(mutation == "none"), transferred=500 if mutation == "none" else 0, max_canonical_lane=1024)
+    else:
+        with pytest.raises(ValueError):
+            check_get_reassignment(actual, marks, canonical)

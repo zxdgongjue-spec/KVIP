@@ -284,8 +284,9 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
                 flags, src, dst = (cpu_array(torch, value) for value in
                                    (bundle.forward.flags, bundle.forward.events_src, bundle.forward.events_dst))
                 work = event_work(flags, src, dst, history=bundle.forward.history)
+                posts = cpu_array(torch, rotating.final_posts)
                 work["descriptor_sha256"] = descriptor_fingerprint(
-                    cpu_array(torch, rotating.final_posts),
+                    posts,
                     (cpu_array(torch, v) for v in (rotating.blocks, rotating.offsets, rotating.destinations)),
                     cpu_array(torch, rotating.fallback_addresses),
                     final_get=reads["final"], arena_base=restored["new_base"],
@@ -297,7 +298,7 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
                     records, detail, wait_first=bool(getattr(bundle.forward, "post_index_wait_first", False)),
                     final_get=reads["final"], work=work,
                     cold_plan_expected=getattr(bundle, "cold_plan_expected", False),
-                    schedule_timing=getattr(bundle, "record_high_schedule", False),
+                    schedule_timing=getattr(bundle, "record_high_schedule", False), canonical_counts=posts[:, :, 0],
                 )
                 phase = reads["high_post_index"]
                 if "moved" in phase:

@@ -246,7 +246,7 @@ def _preplan_detail(marks, moved, work):
 
 def overlap_schedule_timing(rows, marks, *, marker):
     """One diagnostic replay. Only nonempty final Get calls contribute transport endpoints."""
-    row_local = marker in ("RQI1", "RQI2")
+    row_local = marker != "PIH1"
     live = rows[:, 1] > 0
     origin, index_end = rows[:, 10], rows[:, 8]
     index_start = marks[:, 3 if row_local else 11]
@@ -260,6 +260,7 @@ def overlap_schedule_timing(rows, marks, *, marker):
             or max(n_calls[live]) > (2 if row_local else 1)):
         raise ValueError("Invalid per-lane Index interval or nonempty final Post/Wait timestamps")
     begin = int(origin.min())
+    last_lane = int(np.flatnonzero(live)[np.argmax(waited)])
     return dict(
         format=marker,
         final_api_calls=int(n_calls.sum()), nonempty_lanes=int(live.sum()),
@@ -269,10 +270,34 @@ def overlap_schedule_timing(rows, marks, *, marker):
         index_completion_spread=int(index_end.max())-int(index_end.min()),
         last_index_minus_last_final_wait=int(index_end.max())-int(waited.max()),
         blocking_final_lanes=int(np.count_nonzero(rows[live, 2] & 1)),
+        last_wait_lane=last_lane, last_wait_lane_get=int(rows[last_lane, 1]),
+        last_wait_lane_post_return=int(rows[last_lane, 7])-begin,
+        max_lane_get=int(rows[:, 1].max()), max_row_get=int(rows[:, 1].reshape(4, 16).sum(axis=0).max()),
     )
 
 
-def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan_expected=False, schedule_timing=False):
+def check_get_reassignment(counts, marks, canonical):
+    """Reconcile every transport lane against the independent per-request Q descriptor counts."""
+    if canonical is None or np.shape(canonical) != (16, 4):
+        raise ValueError("Missing canonical final descriptor counts for RQI3")
+    source, take, give, donor = (marks[:, k].reshape(4, 16) for k in (20, 21, 22, 23))
+    canonical = np.asarray(canonical).T
+    # Check ranges before unsigned arithmetic. Each row may split one donor's
+    # suffix onto one helper; neither the Index events nor descriptor lists move.
+    if (not np.array_equal(canonical, source) or np.any(canonical > 2048)
+            or np.any(give > source) or np.any(take > 2048)
+            or np.any((take > 0) & (give > 0)) or np.any((take == 0) != (donor == 0))
+            or np.any((give > 0).sum(axis=0) > 1) or np.any((take > 0).sum(axis=0) > 1)
+            or not np.array_equal(take.sum(axis=0), give.sum(axis=0))
+            or not np.array_equal(counts.reshape(4, 16), source - give + take)):
+        raise ValueError("Invalid row-local final Get reassignment or per-lane completion counts")
+    lanes, requests = np.nonzero(take)
+    if not np.array_equal(donor[lanes, requests], np.argmax(give[:, requests], axis=0) + 1):
+        raise ValueError("Final Get helper read an unexpected donor Q")
+    return dict(helpers=len(lanes), transferred=int(take.sum()), max_canonical_lane=int(canonical.max()))
+
+
+def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan_expected=False, schedule_timing=False, canonical_counts=None):
     records = np.asarray(records)
     if records.dtype != np.int64 or records.shape != (64, 16):
         raise ValueError("HIGH requires one 128-byte record per AIV")
@@ -292,7 +317,7 @@ def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan
     if detail.dtype != np.int64 or detail.shape != (len(rows), 32):
         raise ValueError("Unexpected HIGH timestamp layout")
     marks = detail.view(np.uint64)
-    row_markers = {0x52514931: "RQI1", 0x52514932: "RQI2"}
+    row_markers = {0x52514931: "RQI1", 0x52514932: "RQI2", 0x52514933: "RQI3"}
     marker = row_markers.get(int(marks[0, 2]))
     if marker is not None and np.all(marks[:, 2] == marks[0, 2]):
         if wait_first or not schedule_timing:
@@ -301,8 +326,10 @@ def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan
             raise ValueError("Incomplete row-local Index transfer counts")
         result["moved"] = marks[:, 10].tolist()
         result["row_partitions"] = dict(pairs=marks[:, 16].tolist(), singles=marks[:, 17].tolist(),
-                                        invalidations=marks[:, 19].tolist(), single_owner=marker == "RQI2")
+                                        invalidations=marks[:, 19].tolist(), single_owner=marker in ("RQI2", "RQI3"))
         schedule = overlap_schedule_timing(rows, marks, marker=marker)
+        if marker == "RQI3":
+            schedule["get_reassignment"] = check_get_reassignment(rows[:, 1], marks, canonical_counts)
         # block=q*16+request. Each lane records packDone when its own role and
         # validation finish. Their within-request spread is a readiness difference,
         # not cycles to add to graph latency or a measurement of idle utilization.

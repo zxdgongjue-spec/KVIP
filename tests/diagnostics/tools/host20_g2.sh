@@ -13,11 +13,17 @@ fixed_work=0
 index_units=moves
 index_groups=(4 7 10 17)
 baseline_override=
+intermediate=
 consumer_ab=0
 high_overlap_ab=0
 if [[ (${1:-} == --index-paired || ${1:-} == --index-10k-paired || ${1:-} == --consumer-ab || ${1:-} == --high-overlap-ab) && ${3:-} == --baseline ]]; then
     [[ ${4:-} =~ ^[0-9a-f]{40}$ ]] || die "--baseline requires a full 40-digit SHA"
     baseline_override=$4
+    set -- "$1" "$2" "${@:5}"
+fi
+if [[ ${1:-} == --high-overlap-ab && ${3:-} == --intermediate ]]; then
+    [[ ${4:-} =~ ^[0-9a-f]{40}$ ]] || die "--intermediate requires a full 40-digit SHA"
+    intermediate=$4
     set -- "$1" "$2" "${@:5}"
 fi
 joint=0
@@ -75,7 +81,7 @@ elif [[ $# == 2 && $1 == --high-index && $2 =~ ^[0-9a-f]{40}$ ]]; then
     high_index=1
     candidate=$2
 elif [[ $# != 0 ]]; then
-    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA|--index-speed CANDIDATE_SHA [GROUP ...]|--index-10k CANDIDATE_SHA [moves|events]|--index-paired CANDIDATE_SHA [--baseline CONTROL_SHA] [GROUP ...]|--index-10k-paired CANDIDATE_SHA [--baseline CONTROL_SHA] [moves|events]|--consumer-ab CANDIDATE_SHA --baseline CONTROL_SHA [GROUP ...]|--high-overlap-ab CANDIDATE_SHA --baseline CONTROL_SHA [GROUP ...]]"
+    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA|--index-speed CANDIDATE_SHA [GROUP ...]|--index-10k CANDIDATE_SHA [moves|events]|--index-paired CANDIDATE_SHA [--baseline CONTROL_SHA] [GROUP ...]|--index-10k-paired CANDIDATE_SHA [--baseline CONTROL_SHA] [moves|events]|--consumer-ab CANDIDATE_SHA --baseline CONTROL_SHA [GROUP ...]|--high-overlap-ab CANDIDATE_SHA --baseline CONTROL_SHA [--intermediate INTERMEDIATE_SHA] [GROUP ...]]"
 fi
 
 diag=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
@@ -95,6 +101,13 @@ if [[ -n $candidate ]]; then
     if ((consumer_ab)); then before=$baseline_override; fi
     if ((fixed_work)); then before=${baseline_override:-785703fe7118ac777069c27f43509ee090f8730a}; fi
     after=$candidate
+    if [[ -n $intermediate ]]; then
+        [[ $intermediate != "$before" && $intermediate != "$after" ]] &&
+            git -C "$repo" merge-base --is-ancestor "$before" "$intermediate" &&
+            git -C "$repo" merge-base --is-ancestor "$intermediate" "$after" ||
+            die "Expected baseline -> intermediate -> candidate revisions"
+        labels+=(middle)
+    fi
     [[ $after != "$before" ]] && git -C "$repo" merge-base --is-ancestor "$before" "$after" ||
         die "Candidate must be a distinct descendant of $before"
     if [[ -n $init_only ]]; then
@@ -108,6 +121,7 @@ for label in "${labels[@]}"; do
     case "$label" in
         serial*) rev=$main; root="$src/main-${rev:0:8}" ;;
         before*) rev=$before; root="$src/auto-${rev:0:8}" ;;
+        middle*) rev=$intermediate; root="$src/auto-${rev:0:8}" ;;
         init-only*) rev=$init_only; root="$src/auto-${rev:0:8}" ;;
         after*) rev=$after; root="$src/auto-${rev:0:8}" ;;
     esac
@@ -181,6 +195,7 @@ export KVAF_BATCH_PUT_KERNEL="$build/bin/kvaf_execute_batch_put_kernels.o"
 
 if ((high_overlap_ab)); then
     out=$(mktemp -d "$cache/host20-high-overlap.XXXXXX")
+    if [[ -n $intermediate ]]; then printf 'INTERMEDIATE=%.8s\n' "$intermediate"; fi
     printf 'HIGH_OVERLAP_AB NPU4 logical=0 HIGH=8_windows original=per_row_consumer baseline=%.8s candidate=%.8s\n' "$before" "$after"
 elif ((consumer_ab)); then
     out=$(mktemp -d "$cache/host20-consumer-ab.XXXXXX")
@@ -234,6 +249,7 @@ if ((high_index)); then
         study=kvip.diagnostics.consumer_ab
         study_args=(--baseline "$before" --groups "${index_groups[@]}")
         if ((high_overlap_ab)); then study_args+=(--high-overlap); fi
+        if [[ -n $intermediate ]]; then study_args+=(--intermediate "$intermediate"); fi
     elif ((index_speed)); then
         study=kvip.diagnostics.high_index_speed
         study_args=(--groups "${index_groups[@]}")
