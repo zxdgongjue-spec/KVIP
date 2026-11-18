@@ -23,14 +23,17 @@ struct RowRendezvous {
             if(GetSystemCycle()-start>5000000000ULL) return 8;
         }
     }
-    __aicore__ inline uint32_t All(Phase phase) {
+    __aicore__ inline uint32_t AwaitPeers(Phase phase) {
         uint32_t error=0;
-        for(uint32_t p=0;p<4;++p) error|=Await(p,phase);
+        // The caller already holds its own result. Poll the three other
+        // writers, starting at different peers on each lane.
+        for(uint32_t distance=1;distance<4;++distance)
+            error|=Await((lane+distance)&3U,phase);
         return error;
     }
     __aicore__ inline uint64_t Gathered() {
         Publish(ReadOriginals,0);
-        return All(ReadOriginals);
+        return AwaitPeers(ReadOriginals);
     }
 };
 
@@ -127,7 +130,7 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
     me->count=count;
     if(profile) r->packDone=GetSystemCycle();
     join.Publish(RowRendezvous::Validated,error);
-    error|=join.All(RowRendezvous::Validated);
+    error|=join.AwaitPeers(RowRendezvous::Validated);
     uint32_t total=0;
     for(uint32_t p=0;p<4;++p) total+=join.lines[p].count;
     // All input, output and plan owners returned before granting Validated.
@@ -184,7 +187,7 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
     me->reserved[4]=first.completed+second.completed;
     join.Publish(RowRendezvous::Done,error);
     if(!q) {
-        error|=join.All(RowRendezvous::Done);
+        error|=join.AwaitPeers(RowRendezvous::Done);
         uint32_t completed=0;
         for(uint32_t p=0;p<4;++p) completed+=join.lines[p].reserved[4];
         if(completed!=total) error|=kvaf_device::kInvalidArgs;
