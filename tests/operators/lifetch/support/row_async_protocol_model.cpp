@@ -42,12 +42,12 @@ using KvafBatchGetDirectUrmaEntity=Entity;
 struct QueueArgs {uint64_t channel_entity{},core_status{},indices{},offsets{},output_indices{},address_table{},valid_table{};
     uint64_t output=64;uint32_t batch_get_max_inflight_total=0,block_count{},jettys_per_core{},table_capacity{},request_capacity{},tokens_per_block{},output_rows=4096,token_bytes=16;};
 struct PrivatePlan {unsigned pairs=3,singles=7,invalidations=1,error=0;};
-struct Input {std::array<unsigned,4> n,safe; unsigned cqDepth=4; int blocking=-1,badPreflight=-1, badBlock=-1,badWait=-1,badDescriptor=-1,badPost=-1;bool badPlan=false,badDrain=false,badTotal=false,pending=true,badTnd=false; int badMr=-1, badEid=-1, badLocalToken=-1, badRegion=-1; bool expectLoan=false; unsigned maxInflight=0;};
+struct Input {std::array<unsigned,4> n,safe; unsigned cqDepth=4; int blocking=-1,badPreflight=-1, badBlock=-1,badWait=-1,badDescriptor=-1,badPost=-1;bool badPlan=false,badDrain=false,badTotal=false,pending=true,badTnd=false; int badMr=-1, badEid=-1, localPath=-1, badRegion=-1, badLocalSize=-1, differentOutput=-1; bool expectLoan=false; unsigned maxInflight=0;};
 struct FIFO {unsigned issued=0,drained=0,reads=0,capacity=3;std::vector<unsigned> positions;};
 struct World {Input input;Entity e[4];uint64_t blocks=0;FIFO q[4];std::atomic<unsigned> prefetch{0}, applied{0}, finalized{0},published{0};unsigned status=0;};
 World* sim;
 unsigned FinalQueue(unsigned batch,unsigned workers,unsigned b,unsigned q){return !q ? 2*b+1 : 2*batch+b*(workers-1)+q-1;}
-QueueArgs GetArgs(Context*,unsigned queue){for(unsigned q=0;q<4;++q)if(queue==FinalQueue(16,4,0,q)){ QueueArgs args{uint64_t(&sim->e[q])};args.batch_get_max_inflight_total=sim->input.maxInflight;return args;} assert(false);return {};}
+QueueArgs GetArgs(Context*,unsigned queue){for(unsigned q=0;q<4;++q)if(queue==FinalQueue(16,4,0,q)){ QueueArgs args{uint64_t(&sim->e[q])};args.output=sim->e[q].local_hbm_address;args.batch_get_max_inflight_total=sim->input.maxInflight;return args;} assert(false);return {};}
 FinalPost* FinalPostAt(unsigned,Context* c,unsigned base){assert(!base); return c->post;}
 unsigned AwaitPublication(BatchFlag* f){while(!f->ready.load())std::this_thread::yield();return f->error;}
 template<bool PostIndex,bool RowOutput> unsigned Producer(Args*,unsigned){static_assert(!PostIndex && RowOutput);assert(lane==0);return 5;}
@@ -98,8 +98,10 @@ template<bool,bool,bool JoinedRow> void FinalizeStreaming(Args* a,unsigned,unsig
 
 void run(Input in){World world{in};sim=&world;for(auto& e:world.e)e.cq_depth=in.cqDepth;
     if(in.badMr>=0)world.e[in.badMr].remote_token_id++;
-    if(in.badEid>=0)world.e[in.badEid].remote_eid[0]++;
-    if(in.badLocalToken>=0)world.e[in.badLocalToken].local_token_value++;
+    if(in.badEid>=0)world.e[in.badEid].remote_eid[15]++;
+    if(in.localPath>=0){world.e[in.localPath].local_token_id++;world.e[in.localPath].local_token_value++;}
+    if(in.badLocalSize>=0)world.e[in.badLocalSize].local_hbm_size++;
+    if(in.differentOutput>=0)world.e[in.differentOutput].local_hbm_address+=65536;
     if(in.badRegion>=0)world.e[in.badRegion].remote_host_ddr_size++;
     const bool badRequiredQueue=in.badPreflight>=0 && in.n[in.badPreflight]!=0;
     std::array<BatchFlag,16> flags;std::array<post_index_tail::Record,64> records{};std::array<Edge,128> edges{};
@@ -175,7 +177,10 @@ int main(){
     Input high{{384,40,40,48},{384,40,40,48}};high.expectLoan=true;
     run(high); c=high;c.n[1]=c.safe[1]=0;run(c);
     c=high;c.badMr=0;c.expectLoan=false;run(c);c=high;c.badEid=1;c.expectLoan=false;run(c);
-    c=high;c.badLocalToken=1;c.expectLoan=false;run(c);c=high;c.badRegion=1;c.expectLoan=false;run(c);
+    c=high;c.localPath=1;run(c);
+    c=high;c.badLocalSize=1;c.expectLoan=false;run(c);
+    c=high;c.differentOutput=1;c.expectLoan=false;run(c);
+    c=high;c.badRegion=1;c.expectLoan=false;run(c);
     c=high;c.n[1]=c.safe[1]=0;c.badPreflight=1;run(c);
     c=high;c.cqDepth=2;c.expectLoan=false;run(c);
     c=high;c.n[1]=c.safe[1]=0;c.cqDepth=2;c.expectLoan=false;run(c);

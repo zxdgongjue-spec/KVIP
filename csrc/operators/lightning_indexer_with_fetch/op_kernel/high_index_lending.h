@@ -42,13 +42,17 @@ __aicore__ inline bool SameTransferMemory(const QueueArgs& a,const QueueArgs& b)
         return false;
     auto x=reinterpret_cast<__gm__ const KvafBatchGetDirectUrmaEntity*>(a.channel_entity);
     auto y=reinterpret_cast<__gm__ const KvafBatchGetDirectUrmaEntity*>(b.channel_entity);
+    // LocalBufferAcquire registers the same HBM interval separately on each
+    // EID path. The receiver builds WQEs with its own validated local token.
     if(x->remote_host_ddr_address!=y->remote_host_ddr_address ||
        x->remote_host_ddr_size!=y->remote_host_ddr_size ||
        x->remote_token_id!=y->remote_token_id || x->remote_token_value!=y->remote_token_value ||
-       x->local_hbm_address!=y->local_hbm_address || x->local_hbm_size!=y->local_hbm_size ||
-       x->local_token_id!=y->local_token_id || x->local_token_value!=y->local_token_value)
+       x->local_hbm_address!=y->local_hbm_address || x->local_hbm_size!=y->local_hbm_size)
         return false;
-    for(uint32_t i=0;i<sizeof(x->remote_eid);++i)
-        if(x->remote_eid[i]!=y->remote_eid[i]) return false;
-    return true;
+    static_assert(alignof(KvafBatchGetDirectUrmaEntity)>=alignof(uint64_t) &&
+                  __builtin_offsetof(KvafBatchGetDirectUrmaEntity,remote_eid)%alignof(uint64_t)==0 &&
+                  sizeof(x->remote_eid)==2*sizeof(uint64_t),"unexpected KVAF EID layout");
+    auto xid=reinterpret_cast<__gm__ const uint64_t*>(x->remote_eid);
+    auto yid=reinterpret_cast<__gm__ const uint64_t*>(y->remote_eid);
+    return xid[0]==yid[0] && xid[1]==yid[1];
 }
