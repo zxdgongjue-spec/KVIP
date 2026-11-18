@@ -53,7 +53,7 @@ __aicore__ inline uint32_t Plan(__gm__ Args* a, uint32_t b, __gm__ Move* moves,
                                uint32_t& moveCount, uint32_t& chunks) {
     auto ctx = reinterpret_cast<__gm__ Context*>(a->context);
     auto shape = LoadRuntimeShape(ctx);
-    uint32_t owner = OwnerRow(ctx,b);
+    uint32_t owner = ctx->rowOwners ? reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b] : b;
     auto src = reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+uint64_t(b)*a->maxEvents;
     auto dst = reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+uint64_t(b)*a->maxEvents;
     auto valid = reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*shape.resident;
@@ -262,9 +262,10 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a,uint32_t blo
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ws),128);
     }
     SyncAll(); // all rows' final maps have been composed
+    if (profile) ticks[11]=GetSystemCycle();
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ws),128);
     uint32_t n=ws[0]?0:ws[3],first=n*lane/lanes,last=n*(lane+1)/lanes;
-    uint32_t owner=OwnerRow(ctx,b);
+    uint32_t owner=ctx->rowOwners ? reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b] : b;
     auto update=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);
     auto keys=reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*shape.history*16;
     auto scales=reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*shape.history;
@@ -275,6 +276,7 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a,uint32_t blo
         SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
     }
     SyncAll(); // no writer can clobber an unread source, even in long cycles
+    if (profile) ticks[12]=GetSystemCycle();
     if (last>first) {
         Simt::VF_CALL<MoveTuples<true>>(Simt::Dim3{256,1,1},moves,first,last,keys,scales,addresses,logical);
         SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
