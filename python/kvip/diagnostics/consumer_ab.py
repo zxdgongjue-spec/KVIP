@@ -28,10 +28,12 @@ def command(args, group, arm):
     cmd[cmd.index("--output") + 1] = str(args.result_dir / f"g{group}-{arm}.json")
     cmd.append("--verify-consumer-work")
     if getattr(args, "high_overlap", False):
-        # Uninstrumented HIGH has a shared completion ABI across methods. Its reader checks
-        # per-worker Post==complete and owner errors, without interpreting schedule-specific stage counters.
+        # Every headline uses the common Post/Wait completion ABI. Stage counters
+        # belong to the separate replay and are decoded by their on-device marker.
         if not arm.startswith("original"):
             cmd.append("--high-post-index")
+        if arm in ("before", "after"):
+            cmd.extend(("--diagnostic-replays", "1", "--calibrate-counter"))
     elif arm in ("before", "after"):
         cmd.extend(("--diagnostic-replays", "2", "--calibrate-counter"))
     return cmd
@@ -150,6 +152,24 @@ def summarize(group, cases, baseline, candidate, high_overlap=False):
             for a in ("original", "before", "after")) + " transport64_max_fallback_cores="
             + "/".join(str(max(s["high_post_index"]["fallback_cores"] for s in cases[a]["reads_samples"]))
                        for a in ("before", "after")))
+        for arm, marker in (("before", "PIH1"), ("after", "RQI1")):
+            diag = cases[arm]["native_diagnostics"]
+            clock = diag["counter_calibration"]
+            require(not diag["included_in_timing"] and not clock["included_in_timing"]
+                    and len(diag["samples"]) == 1 and clock["status"] == "measured",
+                    f"{arm}: missing separate HIGH replay and independent clock")
+            sample = diag["samples"][0]
+            metrics = sample["reads"]["high_post_index"]["schedule_timing"]
+            require(sample["auto_route"]["mode"] == "high" and metrics["format"] == marker
+                    and sample["reads"]["consumer_work"]["ordered_index_verified"] is True
+                    and sample["reads"]["high_post_index"]["persistent_moves_checked"],
+                    f"{arm}: wrong stage instrumentation, route or persistent Index")
+            rate = calibration_summary(clock["samples"])["cycles_per_us"]
+            keys = ("first_post_begin", "last_post_begin", "last_post_return", "last_final_wait_return",
+                    "longest_lane_index", "index_completion_spread", "last_index_minus_last_final_wait")
+            print(f"G{group} TRACE_us {arm} marker={marker} " + " ".join(f"{k}={metrics[k]/rate:.2f}" for k in keys)
+                  + f" final_Get={sample['reads']['final']} nonempty_lanes={metrics['nonempty_lanes']}"
+                  + f" calls={metrics['final_api_calls']} blocking_lanes={metrics['blocking_final_lanes']}")
         print(f"G{group} CHECK real_Index_order/TopK/KV/lifecycle/submitted_completed=PASS", flush=True)
         return
     stages = []

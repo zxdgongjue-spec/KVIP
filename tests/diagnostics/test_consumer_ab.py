@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from types import SimpleNamespace
 
+import numpy as np
+
 import pytest
 
 from kvip.diagnostics.consumer_ab import ARMS, command, diagnostic_wait, summarize
@@ -82,10 +84,22 @@ def test_high_overlap_arms_reuse_public_completion_records(tmp_path, capsys):
         original = arm.startswith("original")
         old_binary = original or arm.startswith("before")
         assert opts.verify_consumer_work and opts.check_auto_route and opts.high_post_index == (not original)
-        assert not opts.calibrate_counter and not opts.diagnostic_replays and not opts.post_index_wait_first
+        diagnostic = arm in ("before", "after")
+        assert opts.calibrate_counter == diagnostic and opts.diagnostic_replays == int(diagnostic)
+        assert not opts.post_index_wait_first
         assert opts.upstream_revision == (args.baseline if old_binary else args.revision)
         c = synthetic_report("before" if old_binary else "after", usecs)
-        del c["native_diagnostics"]
+        if diagnostic:
+            diag = c["native_diagnostics"]
+            diag["samples"] = diag["samples"][:1]
+            diag["samples"][0]["reads"] = dict(final=1, consumer_work=dict(ordered_index_verified=True),
+                high_post_index=dict(persistent_moves_checked=True, schedule_timing=dict(first_post_begin=1000, last_post_begin=1400,
+                    last_post_return=1500, last_final_wait_return=4000, longest_lane_index=3000,
+                    index_completion_spread=500, last_index_minus_last_final_wait=-1000,
+                    nonempty_lanes=1, final_api_calls=1, blocking_final_lanes=0,
+                    format="PIH1" if arm=="before" else "RQI1")))
+        else:
+            del c["native_diagnostics"]
         c["high_post_index"] = not original
         c["verified_consumer_work"]["index_positions_changed"] = 1868
         if not original:
@@ -99,3 +113,46 @@ def test_high_overlap_arms_reuse_public_completion_records(tmp_path, capsys):
     cases["after"]["reads_samples"][1]["high_post_index"]["final_get_by_core"] = [0]*64
     with pytest.raises(ValueError, match="transport count"):
         summarize(7, cases, args.baseline, args.revision, True)
+
+def test_row_timeline_handles_split_submissions_and_excludes_idle_final_lanes():
+    from kvip.diagnostics.high_index_profile import decode_high_index
+    rows = np.zeros((64, 16), dtype=np.int64)
+    marks = np.zeros((64, 32), dtype=np.int64)
+    rows[:, 14] = 2
+    rows[:, 10] = 100
+    rows[:, 8] = 250
+    rows[0, 8] = 290
+    rows[0:2, 1] = rows[0:2, 15] = [3, 7]
+    rows[0:2, 6] = [140, 270]
+    rows[0:2, 7] = [326, 280]
+    rows[:, 9] = 9999
+    rows[0:2, 9] = [341, 300]
+    marks[:, 2] = 0x52514931
+    marks[:, 3] = 160
+    marks[0:2, 4] = [320, 270]
+    marks[0:2, 8] = [2, 1]
+    report = decode_high_index(rows, marks, wait_first=False, final_get=10,
+                               work={}, schedule_timing=True)["schedule_timing"]
+    assert report == dict(format="RQI1", final_api_calls=3, nonempty_lanes=2,
+                          first_post_begin=40, last_post_begin=220, last_post_return=226,
+                          last_final_wait_return=241, longest_lane_index=130, index_completion_spread=40,
+                          last_index_minus_last_final_wait=-51, blocking_final_lanes=0)
+    marks[1, 8] = 0
+    with pytest.raises(ValueError, match="nonempty"):
+        decode_high_index(rows, marks, wait_first=False, final_get=10, work={}, schedule_timing=True)
+
+def test_row_owned_partition_checks_exchanges_independently_from_single_moves():
+    from kvip.diagnostics.high_index_profile import validate_move_counts
+    before = np.tile(np.arange(8), (16, 1))
+    after = before.copy()
+    after[0] = [1, 0, 3, 4, 2, 5, 6, 7]
+    pairs = np.zeros(64, dtype=int)
+    pairs[48] = 1
+    singles = np.zeros(64, dtype=int)
+    singles[[16, 32, 48]] = 1
+    profile = dict(moved=2*pairs+singles, row_partitions=dict(pairs=pairs, singles=singles, invalidations=[0]*64))
+    validate_move_counts(profile, before, after, range(16), two_cycle_moves=[2]+[0]*15, invalidations=[0]*16)
+    assert profile["persistent_moves_checked"]
+    profile["row_partitions"]["pairs"] = np.roll(pairs, 16)
+    with pytest.raises(ValueError, match="Row-local"):
+        validate_move_counts(profile, before, after, range(16), two_cycle_moves=[2]+[0]*15, invalidations=[0]*16)

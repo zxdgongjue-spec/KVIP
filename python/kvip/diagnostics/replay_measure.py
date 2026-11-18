@@ -297,9 +297,10 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
                     records, detail, wait_first=bool(getattr(bundle.forward, "post_index_wait_first", False)),
                     final_get=reads["final"], work=work,
                     cold_plan_expected=getattr(bundle, "cold_plan_expected", False),
+                    schedule_timing=getattr(bundle, "record_high_schedule", False),
                 )
-                if detail is not None:
-                    phase = reads["high_post_index"]
+                phase = reads["high_post_index"]
+                if "moved" in phase:
                     phase["row_load"] = describe_row_load(
                         flags, src, dst, phase["moved"], bundle.forward.resident,
                         planned_row_moves=phase.get("preplan", {}).get("row_moves"))
@@ -364,7 +365,7 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
             two_cycles = verify_permutation(
                 cpu_array(torch, bundle.forward.flags), cpu_array(torch, bundle.forward.events_src),
                 cpu_array(torch, bundle.forward.events_dst), oracle.pre["logical_ids"], state["logical_ids"], oracle.owners,
-                resident=bundle.forward.resident, invalidations=invalidations if "preplan" in high else None,
+                resident=bundle.forward.resident, invalidations=invalidations if ("preplan" in high or "row_partitions" in high) else None,
             )
             high["row_load"]["two_cycle_moves"] = sum(two_cycles)
             validate_move_counts(high, oracle.pre["logical_ids"], state["logical_ids"], oracle.owners,
@@ -421,6 +422,7 @@ def verify_score_keys(actual, expected, query_ends):
 def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
     """Time the complete current graph without per-stage instrumentation."""
     graphs = retained.setdefault("graphs", [])
+    bundle.record_high_schedule = bool(getattr(args, "verify_consumer_work", False) and getattr(args, "high_post_index", False))
     reset, verify = bundle.reset, bundle.verify
     lease = bundle.lease
 
@@ -560,6 +562,7 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
             bundle.forward.times.zero_()
             bundle.forward.set_options(diagnostics=True)
             bundle.post_index_diagnostics = True
+            bundle.record_consumer_work = bundle.record_high_schedule
             stream.synchronize()
             phase(retained, "diagnostic_replay_and_sync", step)
             replay(graph)
@@ -597,6 +600,7 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
             phase(retained, "diagnostic_disable", step)
             bundle.forward.set_options(diagnostics=False)
             bundle.post_index_diagnostics = False
+            bundle.record_consumer_work = False
             stream.synchronize()
         result["native_diagnostics"] = dict(
             included_in_timing=False,

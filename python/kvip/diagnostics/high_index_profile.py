@@ -110,6 +110,20 @@ def validate_move_counts(profile, before, after, owners, *, two_cycle_moves=None
     if before.shape != after.shape or before.ndim != 2 or cores != 64 or batch != 16:
         raise ValueError("Unexpected full-AIV Index metadata shape")
     counts = [int(np.count_nonzero(before[o] != after[o])) for o in owners]
+    if local := profile.get("row_partitions"):
+        # Unlike the global 64-lane planner, the new schedule independently divides
+        # each row's exchanges, long-cycle tuples and invalidations among its four Q lanes.
+        pairs = np.asarray(two_cycle_moves, dtype=np.int64) // 2
+        singles = np.asarray(counts) - 2*pairs
+        def partition(items):
+            return np.diff(np.arange(cores // batch + 1)[:, None]*items // (cores // batch), axis=0).ravel()
+        if (not np.array_equal(local["pairs"], partition(pairs))
+                or not np.array_equal(local["singles"], partition(singles))
+                or not np.array_equal(local["invalidations"], partition(np.asarray(invalidations, dtype=np.int64)))
+                or not np.array_equal(moved, 2*partition(pairs) + partition(singles))):
+            raise ValueError("Row-local HIGH transfer or invalidation counters disagree with persistent Index oracle")
+        profile["persistent_moves_checked"] = True
+        return
     if prepared := profile.get("preplan"):
         if counts != prepared["row_moves"] or list(two_cycle_moves) != [2*p for p in prepared["row_pairs"]]:
             raise ValueError("Preplanned moves/pairs disagree with persistent Index permutation")
@@ -216,7 +230,34 @@ def _preplan_detail(marks, moved, work):
                 first_preplan_to_last_index=post[1]-int(start.min()))
 
 
-def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan_expected=False):
+def overlap_schedule_timing(rows, marks, *, row_local):
+    """One diagnostic replay. Only nonempty final Get calls contribute transport endpoints."""
+    live = rows[:, 1] > 0
+    origin, index_end = rows[:, 10], rows[:, 8]
+    index_start = marks[:, 3 if row_local else 11]
+    start, returned, waited = (rows[live, k] for k in (6, 7, 9))
+    last_start = marks[live, 4] if row_local else start
+    n_calls = marks[:, 8] if row_local else live.astype(np.uint64)
+    if (not np.any(live) or min(origin) == 0 or np.any(index_start < origin)
+            or np.any(index_end < index_start) or np.any(start < origin[live])
+            or np.any(last_start < start) or np.any(returned < last_start) or np.any(waited < returned)
+            or np.any(n_calls[~live] != 0) or min(n_calls[live]) < 1
+            or max(n_calls[live]) > (2 if row_local else 1)):
+        raise ValueError("Invalid per-lane Index interval or nonempty final Post/Wait timestamps")
+    begin = int(origin.min())
+    return dict(
+        format="RQI1" if row_local else "PIH1",
+        final_api_calls=int(n_calls.sum()), nonempty_lanes=int(live.sum()),
+        first_post_begin=int(start.min())-begin, last_post_begin=int(last_start.max())-begin,
+        last_post_return=int(returned.max())-begin, last_final_wait_return=int(waited.max())-begin,
+        longest_lane_index=int((index_end-index_start).max()),
+        index_completion_spread=int(index_end.max())-int(index_end.min()),
+        last_index_minus_last_final_wait=int(index_end.max())-int(waited.max()),
+        blocking_final_lanes=int(np.count_nonzero(rows[live, 2] & 1)),
+    )
+
+
+def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan_expected=False, schedule_timing=False):
     records = np.asarray(records)
     if records.dtype != np.int64 or records.shape != (64, 16):
         raise ValueError("HIGH requires one 128-byte record per AIV")
@@ -236,6 +277,16 @@ def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan
     if detail.dtype != np.int64 or detail.shape != (len(rows), 32):
         raise ValueError("Unexpected HIGH timestamp layout")
     marks = detail.view(np.uint64)
+    if np.all(marks[:, 2] == 0x52514931):
+        if wait_first or not schedule_timing:
+            raise ValueError("RQI1 row-local timing requires the full-graph HIGH overlap comparison")
+        if np.any(marks[:, 9] != marks[:, 10]) or np.any(marks[:, 10] != 2*marks[:, 16] + marks[:, 17]):
+            raise ValueError("Incomplete row-local Index transfer counts")
+        result["moved"] = marks[:, 10].tolist()
+        result["row_partitions"] = dict(pairs=marks[:, 16].tolist(), singles=marks[:, 17].tolist(),
+                                        invalidations=marks[:, 19].tolist())
+        result["schedule_timing"] = overlap_schedule_timing(rows, marks, row_local=True)
+        return result
     if np.any(marks[:, 2] != 0x50494831):
         raise ValueError("Missing PIH1 markers on one or more AIVs")
     order = [3, 7, 4, 5, 6] if wait_first else [3, 4, 5, 6, 7]
@@ -283,4 +334,8 @@ def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan
         # that collective identifies the observed endpoint, not its cause.
         result["last_end_aiv"] = {name: int(np.argmax(marks[:, col])) for name, col in
                                   (("plan_join", 11), ("gather_join", 12), ("scatter", 5))}
+    if schedule_timing:
+        if wait_first:
+            raise ValueError("Expected simultaneous Index and transport")
+        result["schedule_timing"] = overlap_schedule_timing(rows, marks, row_local=False)
     return result
