@@ -44,6 +44,7 @@ def report(cases, order):
               f"{useful_prefetch(case):10.1f} {b['repair']/2**20:10.4f} {b['waste']/2**20:9.4f} {b['total']/2**20:9.4f}")
     if "reverse-inc-segments" in cases:
         pairs = (("reverse-inc-register", "reverse-inc-segments"),
+                 ("reverse-inc-light-ties", "reverse-inc-segments"),
                  ("forward", "reverse-inc-segments"), ("reverse", "reverse-inc-segments"))
     elif "reverse-inc-progress" in cases:
         pairs = (("reverse-inc-register", "reverse-inc-progress"),

@@ -136,7 +136,7 @@ VARIANTS["reverse-inc-progress"] = VARIANTS["reverse-inc-register"] + ("incremen
 
 
 SEGMENT_VARIANTS = (
-    "forward", "reverse", "reverse-inc-register", "reverse-inc-segments",
+    "forward", "reverse", "reverse-inc-register", "reverse-inc-light-ties", "reverse-inc-segments",
     "reverse-end", "forward-end",
 )
 VARIANTS["reverse-inc-segments"] = VARIANTS["reverse-inc-light-ties"] + ("incremental_segments",)

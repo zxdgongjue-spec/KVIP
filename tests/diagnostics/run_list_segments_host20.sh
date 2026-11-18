@@ -64,8 +64,8 @@ for ((i=0;i<30;i++)); do
     sleep 1
 done
 if ((!ready)); then tail -n 10 "$result/.cpu.log" >&2; exit 1; fi
-variants=(forward reverse reverse-inc-register reverse-inc-segments reverse-end forward-end)
-profile_variants=(reverse reverse-inc-register reverse-inc-segments)
+variants=(forward reverse reverse-inc-register reverse-inc-light-ties reverse-inc-segments reverse-end forward-end)
+profile_variants=(reverse reverse-inc-register reverse-inc-light-ties reverse-inc-segments)
 run_case() {
     local group=$1 phase=$2 warm=5 iterations=10 args=() selected=("${variants[@]}")
     local base="$result/g${group}-$phase"
@@ -91,7 +91,7 @@ run_case() {
     if [[ "$phase" == graph ]]; then
         python3 -B -m kvip.diagnostics.scan_report "$base.json" --expected-native "$native_sha" \
             --snapshot "$inputs/g${group}-input" > "$base.txt"
-        awk '/^CONTROL |^variant |^(forward|reverse|reverse-inc-register|reverse-inc-segments) +[0-9]|^GATE reverse-inc-segments |^CHECK incremental_variants/{print}' "$base.txt"
+        awk '/^CONTROL |^variant |^(forward|reverse|reverse-inc-register|reverse-inc-light-ties|reverse-inc-segments) +[0-9]|^GATE reverse-inc-segments |^CHECK incremental_variants/{print}' "$base.txt"
     else
         python3 -B "$reader/tests/diagnostics/list_segment_times.py" "$base.json" | tee "$base.txt"
     fi
