@@ -1,0 +1,182 @@
+[
+  {
+    "name": "B1_original_P1",
+    "batch": 1,
+    "history": 131072,
+    "route": "original",
+    "parts": 1,
+    "scan_workers": 4,
+    "max_segments_per_aiv": 1,
+    "launches": 1,
+    "whole_model_ticks_mean": 50060,
+    "over_original_mean": 1.0,
+    "over_original_per_round": [
+      1.0
+    ],
+    "over_sharded_P1_mean": 0.5050596769474459,
+    "over_sharded_P1_per_round": [
+      0.5050596769474459
+    ],
+    "issued_instructions": 92800
+  },
+  {
+    "name": "B1_sharded_P1",
+    "batch": 1,
+    "history": 131072,
+    "route": "sharded",
+    "parts": 1,
+    "scan_workers": 4,
+    "max_segments_per_aiv": 1,
+    "launches": 5,
+    "whole_model_ticks_mean": 99117,
+    "over_original_mean": 1.9799640431482222,
+    "over_original_per_round": [
+      1.9799640431482222
+    ],
+    "over_sharded_P1_mean": 1.0,
+    "over_sharded_P1_per_round": [
+      1.0
+    ],
+    "issued_instructions": 95307
+  },
+  {
+    "name": "B1_sharded_P4",
+    "batch": 1,
+    "history": 131072,
+    "route": "sharded",
+    "parts": 4,
+    "scan_workers": 16,
+    "max_segments_per_aiv": 1,
+    "launches": 5,
+    "whole_model_ticks_mean": 51914,
+    "over_original_mean": 1.0370355573312025,
+    "over_original_per_round": [
+      1.0370355573312025
+    ],
+    "over_sharded_P1_mean": 0.5237648435687118,
+    "over_sharded_P1_per_round": [
+      0.5237648435687118
+    ],
+    "issued_instructions": 107463
+  },
+  {
+    "name": "B1_sharded_P16",
+    "batch": 1,
+    "history": 131072,
+    "route": "sharded",
+    "parts": 16,
+    "scan_workers": 64,
+    "max_segments_per_aiv": 1,
+    "launches": 5,
+    "whole_model_ticks_mean": 41829,
+    "over_original_mean": 0.8355773072313224,
+    "over_original_per_round": [
+      0.8355773072313224
+    ],
+    "over_sharded_P1_mean": 0.42201640485486847,
+    "over_sharded_P1_per_round": [
+      0.42201640485486847
+    ],
+    "issued_instructions": 170103
+  },
+  {
+    "name": "B1_sharded_P32",
+    "batch": 1,
+    "history": 131072,
+    "route": "sharded",
+    "parts": 32,
+    "scan_workers": 64,
+    "max_segments_per_aiv": 2,
+    "launches": 5,
+    "whole_model_ticks_mean": 52814,
+    "over_original_mean": 1.0550139832201357,
+    "over_original_per_round": [
+      1.0550139832201357
+    ],
+    "over_sharded_P1_mean": 0.5328450215402,
+    "over_sharded_P1_per_round": [
+      0.5328450215402
+    ],
+    "issued_instructions": 218663
+  },
+  {
+    "name": "B16_original_P1",
+    "batch": 16,
+    "history": 131072,
+    "route": "original",
+    "parts": 1,
+    "scan_workers": 64,
+    "max_segments_per_aiv": 1,
+    "launches": 1,
+    "whole_model_ticks_mean": 49534,
+    "over_original_mean": 1.0,
+    "over_original_per_round": [
+      1.0
+    ],
+    "over_sharded_P1_mean": 0.4834330441232445,
+    "over_sharded_P1_per_round": [
+      0.4834330441232445
+    ],
+    "issued_instructions": 1484800
+  },
+  {
+    "name": "B16_sharded_P1",
+    "batch": 16,
+    "history": 131072,
+    "route": "sharded",
+    "parts": 1,
+    "scan_workers": 64,
+    "max_segments_per_aiv": 1,
+    "launches": 5,
+    "whole_model_ticks_mean": 102463,
+    "over_original_mean": 2.068538781443049,
+    "over_original_per_round": [
+      2.068538781443049
+    ],
+    "over_sharded_P1_mean": 1.0,
+    "over_sharded_P1_per_round": [
+      1.0
+    ],
+    "issued_instructions": 1515948
+  },
+  {
+    "name": "B16_sharded_P2",
+    "batch": 16,
+    "history": 131072,
+    "route": "sharded",
+    "parts": 2,
+    "scan_workers": 64,
+    "max_segments_per_aiv": 2,
+    "launches": 5,
+    "whole_model_ticks_mean": 104518,
+    "over_original_mean": 2.110025437073525,
+    "over_original_per_round": [
+      2.110025437073525
+    ],
+    "over_sharded_P1_mean": 1.0200560202219338,
+    "over_sharded_P1_per_round": [
+      1.0200560202219338
+    ],
+    "issued_instructions": 1536940
+  },
+  {
+    "name": "B16_sharded_P4",
+    "batch": 16,
+    "history": 131072,
+    "route": "sharded",
+    "parts": 4,
+    "scan_workers": 64,
+    "max_segments_per_aiv": 4,
+    "launches": 5,
+    "whole_model_ticks_mean": 107264,
+    "over_original_mean": 2.165462106835709,
+    "over_original_per_round": [
+      2.165462106835709
+    ],
+    "over_sharded_P1_mean": 1.046855938241121,
+    "over_sharded_P1_per_round": [
+      1.046855938241121
+    ],
+    "issued_instructions": 1578924
+  }
+]

@@ -263,3 +263,17 @@ bash experiments/li_qk/run_tail_in_container.sh \
 该入口仍需要宿主机先运行`update_shared_a5.sh`准备可见的release；只拉取仓库不会生成共享release。缺少release时会打印宿主机更新命令，不在容器联网拉取代码。
 
 fresh NPU build、r0丢弃、三轮交错同轮配对；msprof单独采集。Model使用 [run_tail_model.sh](run_tail_model.sh)，[tail_instructions.py](tail_instructions.py)按实际ELF/entry/launch证明分类，[tail_summary.py](tail_summary.py)仅合并完整Model结果，同binary/fixture/几何/范围才计算比值。后处理预算是64 AIV，B16 score原入口的30/60限制另计。
+
+## 精确分片 radix Top2048
+
+[RADIX_REPORT.md](RADIX_REPORT.md)记录实现、B1/B16策略、九组H128K完整Model对照及指令分解。该入口只读相同的GM uint16 score，调用原per-Q radix作为对照；新路径合并高/低8位累计直方图，生成全局阈值，再并行输出GT/EQ，固定五次AIV launch。
+
+```bash
+# 在已更新MR14的原A5容器内，从仓库直接运行九组；不联网
+bash experiments/li_qk/run_radix_a5.sh --device 5 --profile
+# 可分别运行，或仅核对任务计划
+bash experiments/li_qk/run_radix_a5.sh --suite b1
+bash experiments/li_qk/run_radix_a5.sh --suite b16 --plan-only
+```
+
+B1：原P1与新P1/P4/P16/P32；B16：原P1与新P1/P2/P4。默认Q4/H128K/K2048，64AIV预算。B1/P16的Model ticks下降16.4%，B16新路径约慢2.1倍；这些不是A5微秒或完整LIFetch收益。生产默认路由未修改。

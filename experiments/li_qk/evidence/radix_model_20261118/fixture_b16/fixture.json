@@ -1,0 +1,15 @@
+{
+  "batch": 16,
+  "history": 131072,
+  "heads": 32,
+  "seed": 20261115,
+  "numerical_domain": "finite sparse dyadic FP8, BF16 weights, signed per-owner data",
+  "hashes": {
+    "query": "d443bcc72abd29ca22306cdba4c95d752ff0e20b0e64102f60ca87e836e98cfb",
+    "key": "ebf53add6bf3c797fbc802ace0d7df62146477c097bbab6cc4ce650679a8c8e4",
+    "weight": "1ccdc0b1774c47f350d82e7650f387c9da4c9e70bc98cba15ba247e759d80edd",
+    "qscale": "884756ca1ca9e6e195e495111ceb1127be2b211a4ccb22f93e54b34d7ca7f161",
+    "kscale": "74d9ad7da7b42460f20722bd2c6b95ac1cbaa19fa1b666cca0e1251c425f592e",
+    "oracle": "481b33b44387a9b63ec7e3df16bffa06abe252a8672276b21ed042a0b4219360"
+  }
+}
