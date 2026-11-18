@@ -42,7 +42,7 @@ using KvafBatchGetDirectUrmaEntity=Entity;
 struct QueueArgs {uint64_t channel_entity{},core_status{},indices{},offsets{},output_indices{},address_table{},valid_table{};
     uint32_t block_count{},jettys_per_core{},table_capacity{},request_capacity{},tokens_per_block{},output_rows=1024,token_bytes=16;};
 struct PrivatePlan {unsigned pairs=3,singles=7,invalidations=1,error=0;};
-struct Input {std::array<unsigned,4> n,safe; unsigned cqDepth=4; int blocking=-1,badPreflight=-1, badBlock=-1,badWait=-1,badDescriptor=-1;bool badPlan=false,badDrain=false,badTotal=false,pending=true;};
+struct Input {std::array<unsigned,4> n,safe; unsigned cqDepth=4; int blocking=-1,badPreflight=-1, badBlock=-1,badWait=-1,badDescriptor=-1,badPost=-1;bool badPlan=false,badDrain=false,badTotal=false,pending=true;};
 struct FIFO {unsigned issued=0,drained=0,reads=0,capacity=3;std::vector<unsigned> positions;};
 struct World {Input input;Entity e;FIFO q[4];std::atomic<unsigned> prefetch{0}, applied{0}, finalized{0},published{0};unsigned status=0;};
 World* sim;
@@ -59,6 +59,7 @@ namespace post_index_transport {
 struct State{unsigned seq=0,count=0,completed=0;};
 uint32_t Preflight(QueueArgs&,unsigned,unsigned n,bool& blocking){if(!n)return 0;blocking=int(lane)==sim->input.blocking;return int(lane)==sim->input.badPreflight;}
 uint32_t Post(QueueArgs&,unsigned first,unsigned n,State& s){auto& q=sim->q[lane];assert(!s.seq && n);
+    if(int(lane)==sim->input.badPost && first==0)return 1;
     assert(n+first<=sim->input.n[lane]);assert(first+n<=sim->input.safe[lane] || !sim->input.pending || sim->prefetch.load());
     for(unsigned i=first;i<first+n;++i)q.positions.push_back(i);
     s.seq=++q.issued;s.count=n;assert(q.issued-q.drained<sim->e.cq_depth);return 0;}
@@ -100,7 +101,7 @@ void run(Input in){World world{in};sim=&world;world.e.cq_depth=in.cqDepth;
     std::array<std::thread,4> cores;
     for(unsigned q=0;q<4;++q)cores[q]=std::thread([&,q]{lane=q;RunRow(&a,q*16);});
     for(auto& core:cores)core.join();
-    bool failed=in.badPlan||in.badDrain||in.badTotal||in.badBlock>=0||in.badWait>=0||in.badDescriptor>=0||in.badPreflight>=0;
+    bool failed=in.badPost>=0||in.badPlan||in.badDrain||in.badTotal||in.badBlock>=0||in.badWait>=0||in.badDescriptor>=0||in.badPreflight>=0;
     assert(bool(world.status)==failed && world.finalized==1 && world.published==!failed && world.prefetch==1);
     unsigned totalCompleted=0;
     for(unsigned q=0;q<4;++q){auto& queue=world.q[q];
@@ -124,11 +125,15 @@ void run(Input in){World world{in};sim=&world;world.e.cq_depth=in.cqDepth;
     }
     if(in.badPlan||in.badDescriptor>=0||in.badPreflight>=0||in.badTotal)assert(world.applied==0);
     if(in.badBlock>=0 || in.badDrain || in.badWait>=0)assert(world.applied==4);
+    if(in.badPost>=0){
+        for(unsigned q=0;q<4;++q)assert(flags[8+q].reserved[2]!=0 || records[q*16].error!=0);
+        assert(flags[8+in.badPost].reserved[2]!=0);
+    }
     if(in.badDrain){assert(world.q[0].issued==1 && world.q[0].positions.size()==in.safe[0]);}
 }
 int main(){Input mixed{{4,3,0,5},{2,3,0,0}};
     run(mixed);auto drained=mixed;drained.pending=false;run(drained);auto c=mixed;c.cqDepth=2;run(c);c=mixed;c.blocking=0;run(c);c.badBlock=0;run(c);
     c=mixed;c.badPlan=true;run(c);c=mixed;c.badTotal=true;run(c);c=mixed;c.badDescriptor=1;run(c);
-    c=mixed;c.badPreflight=3;run(c);c=mixed;c.badWait=0;run(c);c=mixed;c.badDrain=true;run(c);
+    c=mixed;c.badPost=1;run(c);c=mixed;c.badPreflight=3;run(c);c=mixed;c.badWait=0;run(c);c=mixed;c.badDrain=true;run(c);
     run(Input{{4,3,0,5},{4,3,0,5}});run(Input{{0,0,0,0},{0,0,0,0}});
 }

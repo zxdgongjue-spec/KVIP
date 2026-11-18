@@ -148,6 +148,9 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
     if(profile) ticks[3]=GetSystemCycle();
     if(!error) error|=ApplyRowIndex(a,ctx,b,owner,q,4,plan->reserved[8],plan->reserved[9],
                                    plan->reserved[10],update[7],ticks,profile,join);
+    // A failed lane can reach Done without gathering originals. Mark the
+    // skipped phase failed as well so its peers never scatter stale payload.
+    if(error) join.Publish(RowRendezvous::ReadOriginals,error);
     if(profile){ r->indexDone=GetSystemCycle(); ticks[2]=0x52514932U; }
     // Only q0 consumes the prefetch queue. Only ranges that might
     // overwrite an in-flight prefetch destination depend on that completion.
