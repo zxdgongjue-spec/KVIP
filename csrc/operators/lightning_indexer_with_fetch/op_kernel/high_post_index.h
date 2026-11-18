@@ -121,6 +121,8 @@ __aicore__ inline uint64_t RowErrors(__gm__ post_index_tail::Record* records,
 }
 
 #include "high_index_balance.h"
+#include "high_index_row.h"
+#include "high_index_async.h"
 
 // Every block takes all joins, including empty plans and failed rows. The
 // orders perform the same work; only the CQ wait/join moves around Index.

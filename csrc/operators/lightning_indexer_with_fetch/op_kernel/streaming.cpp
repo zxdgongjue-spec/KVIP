@@ -890,7 +890,9 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
    }
 #if KVIP_OUTPUT_WORKER && KVIP_FUSE_QUERY_WORK
    if (a->highIndex && (a->prefetchCount & 0x01000000U)) {
-    high_post_index::Run(a,block);
+    if (kEarlyFetchReady && shape.batch==16 && shape.aicCount==32 && shape.finalWorkers==4 && !(a->prefetchCount & 0x02000000U))
+     high_post_index::RunRow(a,block);
+    else high_post_index::Run(a,block);
     if(profile){trace[1]=GetSystemCycle();kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(trace),32*8);}
     return;
    }
