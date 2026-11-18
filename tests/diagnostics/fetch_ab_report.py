@@ -29,7 +29,7 @@ def validated_cases(path, native, manifest):
                 or (g['batch'], g['token_bytes'], g['rounds']) != (16, 656, 9)
                 or (t['window_limit'], t['prefetch_limit']) != (64, 512)
                 or any(t.get(key, False) != opts.get(key, False)
-                       for key in ('reverse_cold', 'fetch_bitmap', 'fetch_dense'))):
+                       for key in ('reverse_cold', 'fetch_bitmap', 'fetch_dense', 'fetch_packets'))):
             raise ValueError(f'Wrong source, input, geometry or compile settings: {name}')
     return cases
 

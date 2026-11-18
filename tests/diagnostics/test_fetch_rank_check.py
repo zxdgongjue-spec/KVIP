@@ -62,3 +62,28 @@ def test_rank_metadata_bit_preserves_ids_order_and_pending_submissions():
     ranks[0, 0, 0, 32] ^= 1
     with pytest.raises(ValueError):
         check_state(ranks, *args, fixed=True)
+
+
+def test_lazy_rank_skips_unneeded_queries_but_still_checks_every_post():
+    from kvip.diagnostics.fetch_rank_check import check_state
+    from kvip.diagnostics.fetch_window_topk import publication
+
+    ids = np.arange(2048, dtype='<u4')
+    scores = np.arange(4096, 2048, -1, dtype='<u2')
+    table = [(scores, ids, int(scores[-1])) for _ in range(9)]
+    ranks = np.zeros((1, 4, 9, 3104), dtype='<u4')
+    # Q0 fills each 64-entry window. Q1-3 and the exhausted ninth turn
+    # cannot submit; their rank banks have never been initialized.
+    for epoch in range(8):
+        row = ranks[0, 0, epoch]
+        row[:3] = [scores[-1], 2047, epoch+1]
+        row[32:2080] = ids | np.uint32(0x80000000)
+        row[2080:] = scores.view('<u4')
+    sent = set()
+    posts = [[publication([ids.tolist()]*4, sent, 64, 512) for _ in range(9)]]
+    args = (np.arange(1, 10)[None], posts, [[table]*4], np.ones((1, 2048), dtype=bool))
+    result = check_state(ranks, *args, fixed=False, lazy=True)
+    assert (result['ranks'], result['lists']) == (8, 9)
+    posts[0][4][0] += 1
+    with pytest.raises(ValueError, match='Q4 submission mismatch'):
+        check_state(ranks, *args, fixed=False, lazy=True)

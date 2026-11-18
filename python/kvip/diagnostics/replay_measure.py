@@ -381,6 +381,10 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None, archive=N
             phase(retained, "diagnostic_reset", step)
             reset()
             bundle.forward.times.zero_()
+            if getattr(getattr(bundle, "rotating", None), "fetch_packets_enabled", False):
+                # Diagnostic validity only. Production uses reset row cursors;
+                # headline timing does not clear or read the unused rank banks.
+                bundle.rotating.fetch_ranks.zero_()
             bundle.forward.set_options(diagnostics=True)
             stream.synchronize()
             phase(retained, "diagnostic_replay_and_sync", step)

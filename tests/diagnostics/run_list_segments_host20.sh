@@ -16,12 +16,13 @@ native_sha=6de229cab2b877fea055cb3411d5161cc764ec81
 branch=perf/urma-list-segments
 study=${1:-segments}
 compare_prior=1
+if [[ "$study" == packets ]]; then compare_prior=0; fi
 if [[ "$study" == fetch && "${2:-}" == recheck ]]; then compare_prior=0; fi
 groups=(2 7 10 17 4)
 case "$study" in
-    fetch)
+    fetch|packets)
         branch=perf/urma-fetch-rank-ab
-        native_sha=9418f17c33ac32817587a6b90ebe4af73bd0c0ea
+        native_sha=bfc6510c7d0b8b5ccf86c9aa7d61b765a2b57aae
         groups=(7 2)
         ;;
     budget)
@@ -58,7 +59,7 @@ if [[ ! -d "$native" ]]; then
     git -C "$kvip" worktree add -q --detach "$native" "$native_sha"
 fi
 [[ $(git -C "$native" rev-parse HEAD) == "$native_sha" ]] || { echo "SOURCE_MISMATCH expected=$native_sha path=$native" >&2; exit 1; }
-if [[ "$study" == fetch ]]; then
+if [[ "$study" == fetch || "$study" == packets ]]; then
     prior_sha=d5ad16037db5aa108ad634b0b0465ef3dd62f7bd
     prior="$work/fused-scan-sources/native-$prior_sha"
     checkouts=("$native")
@@ -163,7 +164,7 @@ run_case() {
         fi
         warm=1; iterations=1; diagnostic=1
     fi
-    if [[ "$study" == fetch ]]; then
+    if [[ "$study" == fetch || "$study" == packets ]]; then
         selected=(forward reverse reverse-fetch-bitmap reverse-fetch-dense)
         if [[ "$phase" == check ]]; then
             selected=(reverse-fetch-bitmap reverse-fetch-dense forward reverse)
@@ -180,6 +181,14 @@ run_case() {
             fi
         else
             selected+=(reverse-fetch-dense-end reverse-fetch-bitmap-end reverse-end forward-end)
+        fi
+    fi
+    if [[ "$study" == packets ]]; then
+        selected=(forward reverse reverse-fetch-packets reverse-fetch-packets-end reverse-end forward-end)
+        diagnostic=1 # Separate diagnostic replay after uninstrumented timing.
+        if [[ "$phase" == check ]]; then
+            selected=(reverse-fetch-packets forward reverse)
+            warm=1; iterations=1; diagnostic=1
         fi
     fi
     echo "BEGIN G$group $phase"
@@ -202,10 +211,16 @@ run_case() {
             fi
             return "$rc"
         }
-    if [[ "$study" == fetch ]]; then
+    if [[ "$study" == fetch || "$study" == packets ]]; then
         if [[ "$phase" == dense-check ]]; then echo "DENSE_CHECK G$group PASS"; return 0; fi
         if [[ "$phase" == prior-* ]]; then return 0; fi
-        python3 -B "$reader/tests/diagnostics/fetch_ab_report.py" "$base.json" "$phase" \
+        local reporter=fetch_ab_report.py
+        if [[ "$study" == packets ]]; then
+            reporter=fetch_packet_report.py
+            python3 -B "$reader/tests/diagnostics/$reporter" "$base.json" check \
+                "$native_sha" "$inputs/g${group}-input/manifest.json" | tee "$result/g${group}-check.txt"
+        fi
+        python3 -B "$reader/tests/diagnostics/$reporter" "$base.json" "$phase" \
             "$native_sha" "$inputs/g${group}-input/manifest.json" | tee "$base.txt"
     elif [[ "$study" == budget || "$study" == seed || "$study" == parallel || "$study" == trunk ]]; then
         python3 -B "$reader/tests/diagnostics/window_budget_report.py" "$base.json" "$phase" \
@@ -218,6 +233,20 @@ run_case() {
         python3 -B "$reader/tests/diagnostics/list_segment_times.py" "$base.json" | tee "$base.txt"
     fi
 }
+if [[ "$study" == packets ]]; then
+    python3 -B -m kvip.diagnostics.fetch_packets --inputs "$inputs" --groups 7 2
+    export KVIP_FETCH_AB_CHECK=1
+    for group in "${groups[@]}"; do run_case "$group" graph; done
+    unset KVIP_FETCH_AB_CHECK
+    gate=BOTH_AHEAD
+    for group in "${groups[@]}"; do
+        grep -q '^GATE packets AHEAD ' "$result/g${group}-graph.txt" || gate=KEEP_BASELINES
+    done
+    echo "PERFORMANCE_GATE $gate"
+    (cd "$result" && tar -czf results.tar.gz g*.json g*.txt)
+    echo "G7_G2_COMPLETE RETURN_FILE=$result/results.tar.gz"
+    exit 0
+fi
 if [[ "$study" == fetch ]]; then
     python3 -B -m kvip.diagnostics.fetch_window_topk --inputs "$inputs" --groups 7 2
     export KVIP_FETCH_AB_CHECK=1

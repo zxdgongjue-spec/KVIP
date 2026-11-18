@@ -61,7 +61,7 @@ def bitmap_evidence(words, row_scores, ends, bounds, resident, query, epoch, cut
             f"first_physical_tiles={(physical[::128][lost][:6]//128).tolist()}")
 
 
-def check_state(ranks, all_versions, posts, tables, eligible, *, fixed):
+def check_state(ranks, all_versions, posts, tables, eligible, *, fixed, lazy=False):
     digest = hashlib.sha256()
     sent_digest = hashlib.sha256()
     ranks_checked = 0
@@ -75,6 +75,10 @@ def check_state(ranks, all_versions, posts, tables, eligible, *, fixed):
         for q in range(4):
             for epoch in range(versions[-1]):
                 r = ranks[row, q, epoch]
+                if lazy and r[2] == 0:
+                    continue
+                if lazy and r[2] != epoch+1:
+                    raise ValueError("Invalid lazy rank validity marker")
                 kth, strict = map(int, r[:2])
                 scores, ids, cutoff = table[q][epoch]
                 expected = int(np.count_nonzero(scores > cutoff))
@@ -216,7 +220,7 @@ def inspect_replay(torch, stream, rot, archive):
     # The fixture overwrites the rank bank. Check the live result first and
     # retain its failure while checking the SAME device-produced inputs at rest.
     def evidence(exc):
-        if not isinstance(exc, RankMismatch) or not rot.library.kvip_fetch_bitmap():
+        if not isinstance(exc, RankMismatch) or not rot.library.kvip_fetch_bitmap() or getattr(rot, "fetch_packets_enabled", False):
             return str(exc)
         b, q, epoch = exc.where
         history = g['history']
@@ -229,7 +233,8 @@ def inspect_replay(torch, stream, rot, archive):
     profile = getattr(rot.library, 'kvip_fetch_window_rank', None)
     if profile and profile():
         samples = [live_ranks[b, q, e, :32] for b in range(len(tables))
-                   for q in range(4) for e in range(1, int(versions[b, -1]))]
+                   for q in range(4) for e in range(1, int(versions[b, -1]))
+                   if not getattr(rot, 'fetch_packets_enabled', False) or live_ranks[b,q,e,2] == e+1]
         if samples:
             headers = np.ascontiguousarray(samples)
             times = headers.view('<u8')[:, 2:7] / result['markers']['ticks_per_us']
@@ -241,7 +246,8 @@ def inspect_replay(torch, stream, rot, archive):
                 merges=int(headers[:, 20].sum()))
     live_error = None
     try:
-        result['live'] = check_state(live_ranks, versions, posts, tables, eligible, fixed=False)
+        result['live'] = check_state(live_ranks, versions, posts, tables, eligible, fixed=False,
+                                     lazy=getattr(rot, 'fetch_packets_enabled', False))
     except ValueError as exc:
         live_error = evidence(exc)
     frozen = torch.from_numpy(np.where(eligible, -1, 0).astype('<i4')).to(rot.device)

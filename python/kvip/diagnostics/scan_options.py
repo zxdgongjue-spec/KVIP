@@ -2,7 +2,7 @@
 
 OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill", "compact_out_of_place", "rolling_reuse_seed", "rolling_fast_path", "rolling_sparse", "rolling_boundary", "incremental_topk", "incremental_window", "incremental_register", "incremental_prefilter", "incremental_direct", "incremental_ties", "incremental_light", "incremental_inplace", "incremental_progress", "incremental_segments")
 EXPERIMENT_OPTIONS = ("consumed_prefix", "window_probe", "seed_mask", "seed_parallel", "native_trunk", "trunk_pruned",
-                      "fetch_bitmap", "fetch_dense")
+                      "fetch_bitmap", "fetch_dense", "fetch_packets")
 DEFAULT_VARIANTS = ("forward", "reverse", "forward-wide", "reverse-wide", "forward-end")
 VARIANTS = {name: ("reverse_cold",) if name.startswith("reverse") else () for name in DEFAULT_VARIANTS}
 ROLLING_VARIANTS = ("forward", "reverse", "reverse-roll", "reverse-refilter", "forward-refilter", "forward-end")
@@ -170,6 +170,9 @@ for _mode in ("bitmap", "dense"):
     for _suffix in ("", "-end"):
         VARIANTS["reverse-fetch-" + _mode + _suffix] = ("reverse_cold", "fetch_" + _mode)
 
+
+for _suffix in ("", "-end"):
+    VARIANTS["reverse-fetch-packets"+_suffix] = ("reverse_cold", "fetch_bitmap", "fetch_packets")
 
 def options_for(name):
     options = {key: key in VARIANTS[name] for key in OPTIONS}
