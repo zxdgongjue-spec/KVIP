@@ -2,6 +2,15 @@
 #include <acl/acl.h>
 #include "context.h"
 #include "plan.h"
+#ifdef LI_QK_RADIX_COMPARE
+#include "radix_plan.h"
+extern "C" uint32_t aclrtlaunch_li_radix_high(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_li_radix_high_reduce(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_li_radix_low(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_li_radix_low_reduce(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_li_radix_emit(uint32_t,void*,void*);
+static std::string topkRoute="original";
+#endif
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -104,6 +113,19 @@ static void Run(const std::string& fixture,const std::string& output,const li_qk
     uint64_t indices=m.Put(std::vector<int32_t>(queries*2048+128,-7));
     rotating::Context ctx{};ctx.shape.batch=p.batch;ctx.shape.history=ctx.shape.resident=h;ctx.shape.indexHeads=g;
     uint64_t context=m.Put(std::vector<rotating::Context>{ctx},true);
+#ifdef LI_QK_RADIX_COMPARE
+    Require(p.batch==1 && p.queryParts==1 && (p.historyParts==1 || p.historyParts==16),"B1 Q4 P1/P16 required");
+    Require(h>=8192 && h<=131072 && h%4096==0 && p.capacity>=16,"aligned H8192..128K and at least16 groups required");
+    li_radix::Bindings radix{};radix.scores=canonical;radix.selected=indices;radix.batch=1;radix.history=h;radix.parts=16;
+    // Match the original standalone LI's full valid H for every true Q.
+    radix.ends=m.Put(std::vector<uint32_t>(4,h),true);
+    radix.high=m.Put(std::vector<uint32_t>(4*16*256+128,0x5a5a5a5a));radix.low=m.Put(std::vector<uint32_t>(4*16*256+128,0x5a5a5a5a));
+    radix.params=m.Put(std::vector<uint32_t>(4*32+128,0x5a5a5a5a));radix.offsets=m.Put(std::vector<uint32_t>(4*16*8+128,0x5a5a5a5a));
+    auto radixBinding=m.Put(std::vector<li_radix::Bindings>{radix},true);
+    auto tail=[&](){if(topkRoute=="original")Check(aclrtlaunch_li_qk_topk(4,stream,(void*)canonical,(void*)indices,(void*)context,h,g,4));
+        else {Check(aclrtlaunch_li_radix_high(64,stream,(void*)radixBinding));Check(aclrtlaunch_li_radix_high_reduce(4,stream,(void*)radixBinding));
+            Check(aclrtlaunch_li_radix_low(64,stream,(void*)radixBinding));Check(aclrtlaunch_li_radix_low_reduce(4,stream,(void*)radixBinding));Check(aclrtlaunch_li_radix_emit(64,stream,(void*)radixBinding));}};
+#endif
     const bool native=std::string(LI_QK_RUN_MODE)=="npu";
     std::string modelStage=std::getenv("LI_QK_MODEL_STAGE")?std::getenv("LI_QK_MODEL_STAGE"):"all";
     Require(modelStage=="all" || (!native && std::string(LI_QK_RUN_MODE)=="sim" &&
@@ -121,9 +143,18 @@ static void Run(const std::string& fixture,const std::string& output,const li_qk
     if(modelStage=="topk")Check(aclrtMemcpy((void*)canonical,oracle.size()*2,oracle.data(),oracle.size()*2,ACL_MEMCPY_HOST_TO_DEVICE));
     aclrtEvent start=nullptr,end=nullptr;if(native){Check(aclrtCreateEvent(&start));Check(aclrtCreateEvent(&end));}
     std::vector<double> scoreUs,liUs,hostScoreUs,hostLiUs;
+#ifdef LI_QK_RADIX_COMPARE
+    std::vector<double> topkUs;bool tailOnly=false;
+#endif
     auto call=[&](bool complete,bool measured) {
         if(native && measured)Check(aclrtRecordEvent(start,stream));
         auto began=std::chrono::steady_clock::now();
+#ifdef LI_QK_RADIX_COMPARE
+        if(tailOnly)tail();
+        else if(complete && modelStage=="all") {Score(waves,p,list,stream);
+            if(!alias)for(auto w:waves)Check(aclrtlaunch_li_qk_scatter(w.rows,stream,(void*)w.score,(void*)canonical,(void*)w.tasks,w.rows,p.stride,h,p.physicalGroup));tail();}
+        else
+#endif
         if(modelStage=="score")Score(waves,p,list,stream);
         else if(modelStage=="scatter") {if(!alias)for(auto w:waves)Check(aclrtlaunch_li_qk_scatter(w.rows,stream,(void*)w.score,(void*)canonical,(void*)w.tasks,w.rows,p.stride,h,p.physicalGroup));}
         else if(modelStage=="topk")Check(aclrtlaunch_li_qk_topk(queries,stream,(void*)canonical,(void*)indices,(void*)context,h,g,queries));
@@ -134,11 +165,18 @@ static void Run(const std::string& fixture,const std::string& output,const li_qk
         Check(aclrtSynchronizeStream(stream));
         if(measured) {
             (complete?hostLiUs:hostScoreUs).push_back(std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-began).count());
-            if(native){float ms=0;Check(aclrtEventElapsedTime(&ms,start,end));Require(ms>0,"invalid device event time");(complete?liUs:scoreUs).push_back(ms*1000.0);}
+            if(native){float ms=0;Check(aclrtEventElapsedTime(&ms,start,end));Require(ms>0,"invalid device event time");
+#ifdef LI_QK_RADIX_COMPARE
+                if(tailOnly)topkUs.push_back(ms*1000.0);else
+#endif
+                (complete?liUs:scoreUs).push_back(ms*1000.0);}
         }
     };
     for(uint32_t i=0;i<warmup;++i){if(phase=="both")call(false,false);call(true,false);}
     for(uint32_t i=0;i<iterations;++i){if(phase=="li"){call(true,true);continue;}if(i%2){call(true,true);call(false,true);}else{call(false,true);call(true,true);}}
+#ifdef LI_QK_RADIX_COMPARE
+    if(phase=="both"){tailOnly=true;for(uint32_t i=0;i<warmup;++i)call(true,false);for(uint32_t i=0;i<iterations;++i)call(true,true);tailOnly=false;}
+#endif
     if(native){Check(aclrtDestroyEvent(start));Check(aclrtDestroyEvent(end));}
     auto flat=m.Get<uint16_t>(canonical,uint64_t(queries)*h+128);
     if(modelStage=="score" && !alias)for(auto w:waves){auto raw=m.Get<uint16_t>(w.score,uint64_t(w.rows)*p.physicalGroup*p.stride);
@@ -175,6 +213,9 @@ static void Run(const std::string& fixture,const std::string& output,const li_qk
     }
     for(uint32_t i=queries*2048;i<selected.size();++i)Require(selected[i]==-7,"TopK guard changed");
     m.CheckInputs();
+#ifdef LI_QK_RADIX_COMPARE
+    for(auto pair:{std::pair<uint64_t,uint32_t>{radix.high,4*16*256},{radix.low,4*16*256},{radix.params,4*32},{radix.offsets,4*16*8}}){auto v=m.Get<uint32_t>(pair.first,pair.second+128);for(uint32_t i=pair.second;i<v.size();++i)Require(v[i]==0x5a5a5a5a,"radix metadata guard");}
+#endif
     std::ofstream f(output+"/score-keys.bin",std::ios::binary);f.write(reinterpret_cast<char*>(flat.data()),uint64_t(queries)*h*2);Require(bool(f),"score file write");
     std::ofstream k(output+"/topk.bin",std::ios::binary);k.write(reinterpret_cast<char*>(selected.data()),queries*2048*4);Require(bool(k),"TopK file write");
     std::ofstream report(output+"/report.json");report<<std::setprecision(10);
@@ -188,6 +229,10 @@ static void Run(const std::string& fixture,const std::string& output,const li_qk
     report<<",\"li_p50_us\":";if(native)report<<Median(liUs);else report<<"null";
     auto array=[&](const char* name,const std::vector<double>& v){report<<",\""<<name<<"\":[";for(size_t i=0;i<v.size();++i){if(i)report<<",";report<<v[i];}report<<"]";};
     array("score_samples_us",scoreUs);array("li_samples_us",liUs);array("host_score_samples_us",hostScoreUs);array("host_li_samples_us",hostLiUs);
+#ifdef LI_QK_RADIX_COMPARE
+    report<<",\"topk_route\":\""<<topkRoute<<"\",\"radix_parts\":"<<(topkRoute=="sharded"?16:1)<<",\"tail_kernel_launches\":"<<(topkRoute=="sharded"?5:1)<<",\"tail_peak_aivs\":"<<(topkRoute=="sharded"?64:4)<<",\"topk_p50_us\":";if(native && !topkUs.empty())report<<Median(topkUs);else report<<"null";
+    array("topk_samples_us",topkUs);report<<",\"full_valid_history\":true,\"full_li_kernel_launches\":"<<(1+(alias?0:1)+(topkRoute=="sharded"?5:1));
+#endif
     report<<",\"model_stage\":\""<<modelStage<<"\",\"guards\":true,\"inputs_unchanged\":true,\"topk_threshold_oracle\":"<<(topkChecked?"true":"false")<<",\"scope\":\"standalone numeric LI; score and score+canonical+global TopK; no Fetch/Service/Index\"}\n";
     Require(bool(report),"report write");std::cout<<"LI_QK_ORACLE_PASS T="<<p.historyParts<<" Qparts="<<p.queryParts<<"\n";
 }
@@ -195,6 +240,11 @@ int main(int argc,char** argv){try {
     if(argc==2 && std::string(argv[1])=="--capabilities"){
         std::cout<<"{\"run_mode\":\""<<LI_QK_RUN_MODE<<"\",\"scope\":\"standalone LI QK controls\",\"fetch_launches\":0,\"queries\":4,\"batch\":1,\"k\":2048}\n";return 0;
     }
+#ifdef LI_QK_RADIX_COMPARE
+    Require(argc==17,"li_qk_radix FIXTURE OUTPUT H G C V P QPARTS WARMUP ITERATIONS DEVICE B waves both|li GRAIN original|sharded");
+    topkRoute=argv[16];Require(topkRoute=="original" || topkRoute=="sharded","TopK route required");--argc;
+    Require(topkRoute!="sharded" || std::string(argv[7])=="16","sharded requires score P16");
+#endif
     Require(argc==12 || argc==14 || argc==15 || argc==16,"li_qk FIXTURE OUTPUT H HEADS C V T QPARTS WARMUP ITERATIONS DEVICE [BATCH waves|balanced [both|li [WORK_GRAIN]]]");
     auto number=[](const char* s){size_t used=0;uint64_t n=std::stoull(s,&used);Require(s[used]==0&&n<=UINT32_MAX,"integer required");return uint32_t(n);};
     std::string schedule=argc>=14?argv[13]:"waves",phase=argc>=15?argv[14]:"both";

@@ -149,7 +149,9 @@ class Controls(unittest.TestCase):
     def test_04_scope_and_invalid_geometry(self):
         import re
         launches=set(re.findall(r'aclrtlaunch_\w+', (HERE/'host.cpp').read_text()))
-        self.assertEqual(launches,{'aclrtlaunch_li_qk_score','aclrtlaunch_li_qk_scatter','aclrtlaunch_li_qk_topk','aclrtlaunch_li_qk_score_balanced'})
+        self.assertEqual(launches,{'aclrtlaunch_li_qk_score','aclrtlaunch_li_qk_scatter','aclrtlaunch_li_qk_topk','aclrtlaunch_li_qk_score_balanced',
+            'aclrtlaunch_li_radix_high','aclrtlaunch_li_radix_high_reduce','aclrtlaunch_li_radix_low','aclrtlaunch_li_radix_low_reduce','aclrtlaunch_li_radix_emit'})
+        self.assertIn('#ifdef LI_QK_RADIX_COMPARE',(HERE/'host.cpp').read_text())
         self.assertIn('-DKVIP_STREAMING_LI=0',(HERE/'CMakeLists.txt').read_text())
         for kw in (dict(t=0,qp=1),dict(t=64,qp=1),dict(t=1,qp=3),dict(t=1,qp=1,aivs=1)):
             with self.assertRaises(ValueError):controls.geometry(**kw)

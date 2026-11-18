@@ -277,3 +277,25 @@ bash experiments/li_qk/run_radix_a5.sh --suite b16 --plan-only
 ```
 
 B1：原P1与新P1/P4/P16/P32；B16：原P1与新P1/P2/P4。默认Q4/H128K/K2048，64AIV预算。B1/P16的Model ticks下降16.4%，B16新路径约慢2.1倍；这些不是A5微秒或完整LIFetch收益。生产默认路由未修改。
+
+## B1/P16 均匀score分核＋radix完整LI对照
+
+```bash
+bash experiments/li_qk/run_li_radix_a5.sh --device 5 --profile
+```
+
+固定B1/Q4/H128K/G32/D128/K2048，全部真实Q使用完整有效H，三组共用相同输入和同一二进制：
+
+| 用例 | score | score整理 | TopK |
+|---|---|---|---|
+| serial_li | 1 AIC＋2 AIV扫描完整H | canonical直接别名 | 原per-Q radix，4 AIV |
+| uniform_p16 | 16 AIC＋32 AIV，H均分16段，每段8192 key | 1次相同scatter | 原per-Q radix，4 AIV |
+| uniform_p16_radix | 与uniform_p16相同 | 与uniform_p16相同 | 分片radix/P16，64 AIV，5次launch |
+
+“原始LI”是此前使用的非融合独立串行参考，不是SDK `native_chain`或生产P2整链。“不分片radix”仍使用原radix TopK，仅不继续切分TopK；不替换成其他排序算法。
+
+默认warmup4/iterations20、丢弃r0、三轮交错。`results/summary.csv`记录score-only、单独TopK-only和**直接测得的完整LI**，同时给出各自相对serial与uniform_p16的比值。完整LI不通过独立阶段p50相加估算。TopK-only在score/canonical生成后另测；msprof独立运行会包含score-only、完整LI和tail-only调用，分析trace时应区分。score P16与radix P16是两个独立预算，前者用16AIC/32AIV，后者最多64AIV。
+
+该完整对照使用所有Q的有效H131072，前一轮radix-only实验包含各Q的H-3..H裁剪边界，两者的数值范围不同；不能将旧radix-only ticks直接加到新LI上。本入口不执行Fetch、resident/Cold、Service或Index。
+
+开发验证：三组完整链路在H8192的设备Model上均正确性PASS，检查实际score/canonical逐元素与oracle一致、2048个唯一有效token、全部GT必选、输入及输出guard。H8192仅用于入口连通验证，不替代H128K性能实验。sim/npu编译链接通过；新脚本的H128K完整LI微秒结果需在A5运行后获取。

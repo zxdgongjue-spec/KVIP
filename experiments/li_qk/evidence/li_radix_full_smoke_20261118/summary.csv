@@ -1,0 +1,4 @@
+name,score_parts,topk_route,score_aics,score_aivs,radix_parts,tail_peak_aivs,scatter_launches,tail_kernel_launches,full_li_kernel_launches,whole_model_ticks_mean,whole_model_ticks_over_serial,whole_model_ticks_over_uniform_p16
+serial_li,1,original,1,2,1,4,0,1,2,53033,1.0,2.2059398527515492
+uniform_p16,16,original,16,32,1,4,1,1,3,24041,0.45332151679143173,1.0
+uniform_p16_radix,16,sharded,16,32,16,64,1,5,7,55461,1.0457828144740067,2.306933987770891

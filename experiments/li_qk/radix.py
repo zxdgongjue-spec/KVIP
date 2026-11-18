@@ -23,12 +23,14 @@ def definitions(history=131072):
     return rows
 
 def build(a):
+    target=getattr(a,'target','li_radix')
+    if target not in ('li_radix','li_qk_radix'):raise ValueError('invalid build target')
     a.output.mkdir(parents=True,exist_ok=False)
     before={str(p.relative_to(ROOT)):sha(p) for p in HERE.iterdir() if p.suffix in ('.cpp','.h','.txt','.py')}
     source=prepare(a.output/'source');commands=[['cmake','-S',str(HERE),'-B',str(a.output/'build'),'-DRUN_MODE='+a.run_mode,
         '-DLI_RADIX_CONTROLS=ON','-DSOC_VERSION='+a.soc,'-DASCEND_CANN_PACKAGE_PATH='+str(a.cann_root),
         '-DSCORE_SOURCE='+str(a.output/'source'),'-DKVAF_INCLUDE='+str(a.kvaf_include)],
-        ['cmake','--build',str(a.output/'build'),'--target','li_radix','-j',str(a.jobs)]]
+        ['cmake','--build',str(a.output/'build'),'--target',target,'-j',str(a.jobs)]]
     record=a.output/'build-manifest.json';receipt=dict(status='BUILDING',commands=commands,wrapper_sha256=before,prepared_source=source)
     record.write_text(json.dumps(receipt,indent=2)+'\n')
     with (a.output/'build.log').open('w') as log:
@@ -38,8 +40,8 @@ def build(a):
                 receipt.update(status='FAILED',exit_code=r.returncode);record.write_text(json.dumps(receipt,indent=2)+'\n');raise RuntimeError('build failed: '+str(a.output/'build.log'))
     for p,h in before.items():
         if sha(ROOT/p)!=h:raise ValueError('source changed during build: '+p)
-    receipt.update(status='BUILT',binary_sha256=sha(a.output/'build/li_radix'),parts_sha256={str(p.relative_to(a.output)):sha(p) for p in (a.output/'build').rglob('*.a')})
-    record.write_text(json.dumps(receipt,indent=2)+'\n');print(a.output/'build/li_radix')
+    receipt.update(status='BUILT',target=target,binary_sha256=sha(a.output/'build'/target),parts_sha256={str(p.relative_to(a.output)):sha(p) for p in (a.output/'build').rglob('*.a')})
+    record.write_text(json.dumps(receipt,indent=2)+'\n');print(a.output/'build'/target)
 
 def fixture(path,b,h,distribution):
     if distribution=='score':return make_fixture(path,b,h,32)
