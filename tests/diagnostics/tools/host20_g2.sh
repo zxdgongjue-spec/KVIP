@@ -9,6 +9,7 @@ candidate=
 high_index=0
 joint=0
 account=0
+init_only=
 if [[ $# == 4 && $1 == --parity && $4 == --high-post-index ]]; then
     joint=1
     set -- "$1" "$2" "$3"
@@ -17,10 +18,15 @@ if [[ ($# == 2 || $# == 3) && $1 == --parity && $2 =~ ^[0-9a-f]{40}$ ]]; then
     labels=(serial before after after-end before-end serial-end before-profile after-profile)
     candidate=$2
     [[ $# == 2 || $3 =~ ^[0-9a-f]{40}$ ]] || die "Expected a full control SHA"
-elif [[ $# == 2 && $1 == --account && $2 =~ ^[0-9a-f]{40}$ ]]; then
+elif [[ ($# == 2 || $# == 3) && $1 == --account && $2 =~ ^[0-9a-f]{40}$ ]]; then
     account=1
     labels=(serial before after after-end before-end serial-end)
     candidate=$2
+    if [[ $# == 3 ]]; then
+        [[ $3 =~ ^[0-9a-f]{40}$ ]] || die "Expected a full init-only SHA"
+        init_only=$3
+        labels=(serial before init-only after after-end init-only-end before-end serial-end)
+    fi
 elif [[ $# == 1 && $1 == --parity ]]; then
     labels=(serial before after after-end before-end serial-end)
 elif [[ $# == 1 && $1 == --kernels ]]; then
@@ -30,7 +36,7 @@ elif [[ $# == 2 && $1 == --high-index && $2 =~ ^[0-9a-f]{40}$ ]]; then
     high_index=1
     candidate=$2
 elif [[ $# != 0 ]]; then
-    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA|--kernels|--high-index CANDIDATE_SHA]"
+    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA]"
 fi
 
 diag=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
@@ -49,6 +55,10 @@ if [[ -n $candidate ]]; then
     after=$candidate
     [[ $after != "$before" ]] && git -C "$repo" merge-base --is-ancestor "$before" "$after" ||
         die "Candidate must be a distinct descendant of $before"
+    if [[ -n $init_only ]]; then
+        [[ $(git -C "$repo" rev-parse "$after^") == "$init_only" && $(git -C "$repo" rev-parse "$init_only^") == "$before" ]] ||
+            die "Expected baseline -> init-only -> init+LI revisions"
+    fi
 fi
 [[ -s "$build/CMakeCache.txt" && -x "$cpu" ]] || die "Missing existing KVAF build or CPU helper: $cache"
 if ((high_index)); then
@@ -64,6 +74,7 @@ for label in "${labels[@]}"; do
     case "$label" in
         serial*) rev=$main; root="$src/main-${rev:0:8}" ;;
         before*) rev=$before; root="$src/auto-${rev:0:8}" ;;
+        init-only*) rev=$init_only; root="$src/auto-${rev:0:8}" ;;
         after*) rev=$after; root="$src/auto-${rev:0:8}" ;;
     esac
     [[ -d "$root" && $(git -C "$root" rev-parse HEAD) == "$rev" ]] && clean "$root" ||
@@ -140,6 +151,7 @@ for label in "${labels[@]}"; do
     else
         rev=$after
         if [[ $label == before* ]]; then rev=$before; fi
+        if [[ $label == init-only* ]]; then rev=$init_only; fi
         root="$src/auto-${rev:0:8}"
         args=(--mode fused --study post-threshold --threshold-policy recent --pipeline-variants auto-post-index --check-auto-route)
         if ((joint)); then args+=(--high-post-index); fi
@@ -162,7 +174,7 @@ for label in "${labels[@]}"; do
     log="$out/.$label.log"
     if python3 -B -m kvip.diagnostics.replay "${common[@]}" --iterations "$iterations" "${args[@]}" "${extra[@]}" \
         --upstream-root "$root" --upstream-revision "$rev" --output "$output" >"$log" 2>&1; then
-        if [[ $label == before || $label == after ]]; then
+        if [[ $label == before || $label == after || $label == init-only ]]; then
             python3 -B - "$output" "$label" "$rev" "$joint" <<'PY'
 import json
 import sys
