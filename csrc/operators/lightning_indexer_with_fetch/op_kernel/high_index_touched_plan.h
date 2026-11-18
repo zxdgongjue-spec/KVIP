@@ -18,12 +18,14 @@ constexpr uint32_t tFree=tOut+THREADS, tWords=tFree+THREADS;
 static_assert(tWords*4<=223232, "Index plan exceeds private AIV UB");
 
 __simt_callee__ inline bool FirstVisit(__ubuf__ uint32_t* bits, uint32_t id) {
-    uint32_t mask=1U<<(id%32);
-    return !(asc_atomic_or(bits+id/32,mask)&mask);
+    // Nearby token IDs use distinct UB words and banks. Higher bits select
+    // the bit within a 1024-position tile; the permutation is one-to-one.
+    uint32_t mask=1U<<((id/32)%32);
+    return !(asc_atomic_or(bits+(id/1024)*32+id%32,mask)&mask);
 }
 
 __simt_callee__ inline bool WasVisited(__ubuf__ uint32_t* bits, uint32_t id) {
-    return (bits[id/32]>>(id%32))&1U;
+    return (bits[(id/1024)*32+id%32]>>((id/32)%32))&1U;
 }
 
 __simt_callee__ inline uint32_t InternPosition(__ubuf__ uint32_t* keys, uint32_t position, bool& fresh) {
@@ -135,7 +137,7 @@ inline void ApplyPublishedPhases(__gm__ uint32_t* sources,__gm__ uint32_t* desti
         __gm__ uint32_t* invalidations,__ubuf__ uint32_t* m) {
     uint32_t tid=threadIdx.x;
     if(first==0){
-        for(uint32_t i=tid;i<(history+31)/32;i+=THREADS)m[tSeen+i]=0;
+        for(uint32_t i=tid;i<((history+1023)/1024)*32;i+=THREADS)m[tSeen+i]=0;
         if(tid<=Conflict)m[tid]=tid==Mode ? 1U : 0U;
         asc_syncthreads();
     }
@@ -152,8 +154,14 @@ inline void ApplyPublishedPhases(__gm__ uint32_t* sources,__gm__ uint32_t* desti
             uint32_t raw=0, dst=0;
             if(tid<n){raw=asc_ldcg(sources+offset+base+tid); dst=asc_ldcg(destinations+offset+base+tid);}
             if(m[Mode]==1){
-                if(tid<n && (raw<resident || raw>=history || dst>=resident ||
-                   !FirstVisit(m+tSeen,raw) || !FirstVisit(m+tSeen,dst)))asc_atomic_or(m+Conflict,1U);
+                if(tid<n){
+                    if(raw<resident || raw>=history || dst>=resident)asc_atomic_or(m+Conflict,1U);
+                    else {
+                        bool newSource=FirstVisit(m+tSeen,raw);
+                        bool newVictim=FirstVisit(m+tSeen,dst);
+                        if(!newSource || !newVictim)asc_atomic_or(m+Conflict,1U);
+                    }
+                }
                 asc_syncthreads();
                 if(!tid)m[DirectTested]+=n;
                 if(!m[Conflict]){

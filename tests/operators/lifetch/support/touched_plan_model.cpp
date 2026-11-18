@@ -136,6 +136,16 @@ int main(){
     run(e,{5,5,5,5,5});run(e,{1,2,3,4,5});
     e[4].push_back({e[0][0].src,127}); // late reselect must log the freed hot source
     run(e,{1,3,3,5,5});
+    // An already published prefix followed by a two-wave disjoint tail.
+    // Force both a hot-source miss and a repeated endpoint at the last slot.
+    for(unsigned tail=1;tail<=2*THREADS+1;++tail){
+        e={};
+        for(unsigned i=0;i<9;++i)e[0].push_back({resident+2*i+1,i});
+        for(unsigned j=0;j<tail;++j)e[1+j%4].push_back({history-1-3*j,9+j});
+        run(e,{1,5,5,5,5}); run(e,{5,5,5,5,5});
+        e[4].push_back({e[0][2].src,90});
+        run(e,{1,5,5,5,5}); run(e,{5,5,5,5,5});
+    }
     std::mt19937 rng(84177);
     for(uint32_t trial=0;trial<90;++trial){
         e={};
