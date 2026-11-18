@@ -105,6 +105,9 @@ if __name__ == "__main__":
             cases = json.loads(f.read_text())["cases"]
             for name in ("reverse", "reverse-inc-register", "reverse-inc-segments"):
                 a = mean_admission(cases[name]["reads_samples"])
+                if a is None:
+                    print(f"PRIOR G{group} {name} no_saved_admission_counters")
+                    continue
                 print(f"PRIOR G{group} {name} window_only={a['window_limited_epochs']:.1f}/"
                       f"{a['visited_epochs']:.0f} total_exhausted={a['budget_exhausted_epochs']:.1f} "
                       f"unused_room={a['remaining_admissible_budget']:.1f}")
