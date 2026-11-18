@@ -116,6 +116,7 @@ int main(int argc, char **argv) {
             throw std::runtime_error("shape");
         std::vector<uint32_t> src(B * E), dst(B * E), own(B), hot(uint64_t(B) * R, 1),
             pos(uint64_t(B) * H);
+        auto expectedHot = hot;
         std::vector<BatchFlag> flags(B * kFlagCount);
         uint64_t events = 0, moves = 0;
         std::vector<uint32_t> counts(B);
@@ -146,10 +147,10 @@ int main(int argc, char **argv) {
                     if (!exact && (b & 1) && ph > 0 && j == 0)
                         cell = ph - 1;
                     uint32_t d = (cell * 13) % R;
-                    // A legal nonresident destination forces the general planner on four rows.
-                    // The remaining rows still take the cold fast path in the same launch.
+                    // The original cold token now resides in its previous hot destination.
+                    // A later phase can legally select it again; generic planning relocates it.
                     if (layout == "mixed-fallback" && b % 4 == 0 && ph == 3 && j == 0)
-                        d = H-1;
+                        s = src[b * E];
                     src[b * E + i] = s;
                     dst[b * E + i] = d;
                 }
@@ -169,8 +170,11 @@ int main(int argc, char **argv) {
                         if (!sset.count(d))
                             os.push_back(d);
                     for (auto s : ss)
-                        if (!dset.count(s))
+                        if (!dset.count(s)) {
                             od.push_back(s);
+                            if (s < R)
+                                expectedHot[own[b] * R + s] = 0;
+                        }
                     ss.insert(ss.end(), os.begin(), os.end());
                     dd.insert(dd.end(), od.begin(), od.end());
                     std::vector<uint32_t> tmp;
@@ -329,8 +333,8 @@ int main(int argc, char **argv) {
                                                  std::to_string(i));
                 }
             }
-            if (actualh != hot)
-                throw std::runtime_error("hot valid altered");
+            if (actualh != expectedHot)
+                throw std::runtime_error("hot-valid bits differ from the ordered per-chunk CPU closure");
             uint64_t start = UINT64_MAX, plan = 0, gather = 0, finish = 0;
             uint64_t earlyStart = UINT64_MAX, earlyEnd = 0, movedCount = 0;
             for (uint32_t c = 0; c < C; ++c) {
