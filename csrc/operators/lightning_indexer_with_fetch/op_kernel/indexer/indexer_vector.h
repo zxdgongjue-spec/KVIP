@@ -1008,6 +1008,16 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
 #if KVIP_LOW_MISS_TAIL
     preserveHot=noPrefetchRound_ && !used;
 #endif
+#if KVIP_LOW_MISS_POST_INDEX && !V9_UBMEM
+    if (preserveHot) {
+        Simt::VF_CALL<rotating::ClassifyLowRaw>(Simt::Dim3{512,1,1},
+            runtimeShape_.history,runtimeShape_.resident,owner,tailBegin,tailEnd,ctx,
+            reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(result.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(bitmap[bitmapWords].GetPhyAddr()));
+    } else
+#endif
     Simt::VF_CALL<rotating::ClassifySelectedMetadata>(Simt::Dim3{512,1,1},
         runtimeShape_.history,runtimeShape_.resident,b,owner,used,tailBegin,tailEnd,
         ctx->tailBounds!=0,ctx,

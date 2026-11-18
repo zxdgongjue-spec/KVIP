@@ -254,6 +254,16 @@ int main(){using namespace rotating;
     ClassifySelectedMetadata(H,R,B,O,used,begin,end,true,&ctx,selected.data()+q*kTop,
       locations.data()+q*kTop,bits.data(),bits.data()+4096,low);
    }
+#if KVIP_LOW_MISS_POST_INDEX
+   if(low && !used) {
+    std::vector<uint32_t> actual(kTop,42),rawBits(4104,0);
+    for(threadIdx.x=0;threadIdx.x<512;++threadIdx.x)
+      ClassifyLowRaw(H,R,O,begin,end,&ctx,selected.data()+q*kTop,actual.data(),
+                     rawBits.data(),rawBits.data()+4096);
+    assert(std::equal(actual.begin(),actual.end(),locations.begin()+q*kTop));
+    assert(rawBits==bits);
+   }
+#endif
    for(threadIdx.x=0;threadIdx.x<512;++threadIdx.x)MergeClassifyBitmap(bits.data(),R);
    assert(bits[4096]==uint32_t(q==0));
    for(uint32_t i=0;i<kTop;++i){

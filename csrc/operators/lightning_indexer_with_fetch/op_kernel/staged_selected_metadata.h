@@ -76,4 +76,35 @@ inline void ClassifySelectedMetadata(uint32_t history, uint32_t resident,
     }
     asc_syncthreads();
 }
+#if KVIP_LOW_MISS_POST_INDEX && !V9_UBMEM
+// Zero-window Qs classify against immutable resident validity and the ABC
+// ring. Preserve invalid resident Index positions for in-place repair.
+// Return the regular full slot rows for every consumer and error path.
+__simt_vf__ __aicore__ LAUNCH_BOUND(kClassifyThreads)
+inline void ClassifyLowRaw(uint32_t history, uint32_t resident, uint32_t owner,
+    uint32_t tailBegin, uint32_t tailEnd, __gm__ Context* ctx,
+    __ubuf__ uint32_t* indices, __ubuf__ uint32_t* locations,
+    __ubuf__ uint32_t* bitmap, __ubuf__ uint32_t* error) {
+    const uint32_t words = (resident + 31) / 32;
+    const uint32_t shards = 4096 / words < 8 ? 4096 / words : 8;
+    auto valid = reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid);
+    const uint32_t capacity = TailCapacity(resident, ctx);
+    for (uint32_t i = threadIdx.x; i < kTop; i += kClassifyThreads) {
+        const uint32_t token = indices[i];
+        const bool inTail = token < history && token >= tailBegin && token < tailEnd;
+        const bool abc = inTail && token - tailBegin < capacity;
+        uint32_t slot = UINT32_MAX;
+        if (abc) slot = resident + token % capacity;
+        if (token < resident && token < history) {
+            asc_atomic_or(bitmap + (threadIdx.x % shards) * words + token / 32, 1U << (token % 32));
+            if (!inTail && (!valid || asc_ldcg(valid + uint64_t(owner) * resident + token)))
+                slot = token;
+        } else if (token != UINT32_MAX && token >= history) {
+            asc_atomic_or(error, 1U);
+        }
+        locations[i] = slot;
+    }
+    asc_syncthreads();
+}
+#endif
 }  // namespace rotating
