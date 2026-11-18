@@ -313,7 +313,7 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a,uint32_t blo
         // FinalizeStreaming checks and publishes the existing transport ABI.
         for (uint32_t q=0;q<4;++q) {
             posts[q].pending=q==0?completed:0; posts[q].deferred=0;
-            posts[q].error=failed ? uint32_t(kvaf_device::kInvalidArgs) : 0;
+            posts[q].error=uint32_t(failed);
         }
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(posts),4*sizeof(FinalPost));
         Simt::VF_CALL<PublishStreamingUpdateStatus>(Simt::Dim3{32,1,1},

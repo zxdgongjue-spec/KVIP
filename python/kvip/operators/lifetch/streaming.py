@@ -150,6 +150,8 @@ class StreamingLIFetchForward:
             self._high_index_storage = self.torch.empty(
                 (move_bytes + status_bytes,), dtype=self.torch.uint8, device=self.rotating.device,
             )
+            # KVAF's bounded fallback inspects the optional profile magic before writing status.
+            self._high_index_storage[move_bytes:].fill_(0)
             ptr = np.asarray([self._high_index_storage.data_ptr()], dtype="<u8").view("u1")
             self.workspace[152:160].copy_(self.torch.from_numpy(ptr.copy()))
         value = (
