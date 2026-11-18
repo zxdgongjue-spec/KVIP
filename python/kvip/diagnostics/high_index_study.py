@@ -48,11 +48,11 @@ def pair_string(values):
     return "/".join(f"{value:.3f}" for value in values)
 
 
-def order_samples(case):
+def order_samples(case, expected_count=2):
     diagnostics = case["native_diagnostics"]
     clock = diagnostics["counter_calibration"]
     require(clock["status"] == "measured" and clock["included_in_timing"] is False
-            and diagnostics["included_in_timing"] is False and len(diagnostics["samples"]) == 2,
+            and diagnostics["included_in_timing"] is False and len(diagnostics["samples"]) == expected_count,
             "Missing independent HIGH diagnostics or counter calibration")
     rate = calibration_summary(clock["samples"])["cycles_per_us"]
     samples = []

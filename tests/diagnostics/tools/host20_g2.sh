@@ -7,6 +7,7 @@ labels=(after)
 profile=0
 candidate=
 high_index=0
+index_speed=0
 joint=0
 account=0
 init_only=
@@ -32,11 +33,16 @@ elif [[ $# == 1 && $1 == --parity ]]; then
 elif [[ $# == 1 && $1 == --kernels ]]; then
     labels=(serial after)
     profile=1
+elif [[ $# == 2 && $1 == --index-speed && $2 =~ ^[0-9a-f]{40}$ ]]; then
+    high_index=1
+    index_speed=1
+    labels=(before after)
+    candidate=$2
 elif [[ $# == 2 && $1 == --high-index && $2 =~ ^[0-9a-f]{40}$ ]]; then
     high_index=1
     candidate=$2
 elif [[ $# != 0 ]]; then
-    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA]"
+    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA|--index-speed CANDIDATE_SHA]"
 fi
 
 diag=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
@@ -52,6 +58,7 @@ after=0f103cc1b6db1beacfb90023d02befc5eff8ae9e
 if [[ -n $candidate ]]; then
     before=${3:-$after}
     if ((account)); then before=66a2f469ebaec3b35fff789a75177ee19b00213e; fi
+    if ((index_speed)); then before=dc7904e8e874956de6df8352265bb6ac64d1d644; fi
     after=$candidate
     [[ $after != "$before" ]] && git -C "$repo" merge-base --is-ancestor "$before" "$after" ||
         die "Candidate must be a distinct descendant of $before"
@@ -100,7 +107,10 @@ export KVAF_BATCH_GET_KERNEL="$build/bin/kvaf_execute_batch_get_kernels.o"
 export KVAF_BATCH_PUT_KERNEL="$build/bin/kvaf_execute_batch_put_kernels.o"
 [[ -s "$KVAF_BATCH_GET_KERNEL" && -s "$KVAF_BATCH_PUT_KERNEL" ]] || die "Missing Get/Put objects in $build/bin"
 
-if ((high_index)); then
+if ((index_speed)); then
+    out=$(mktemp -d "$cache/host20-high-index-speed.XXXXXX")
+    printf 'HIGH_INDEX_SPEED NPU4 logical=0 baseline=%.8s candidate=%.8s\n' "$before" "$after"
+elif ((high_index)); then
     out=$(mktemp -d "$cache/host20-high-index.XXXXXX")
     printf 'HIGH_INDEX NPU4 logical=0 candidate=%.8s\n' "$after"
 else
@@ -132,7 +142,9 @@ if [[ $ready != 1 ]] || ! kill -0 "$pid" 2>/dev/null; then tail -n 8 "$out/.cpu.
 
 cd "$diag"
 if ((high_index)); then
-    python3 -B -m kvip.diagnostics.high_index_study --cache "$cache" \
+    study=kvip.diagnostics.high_index_study
+    if ((index_speed)); then study=kvip.diagnostics.high_index_speed; fi
+    python3 -B -m "$study" --cache "$cache" \
         --source "$src/auto-${after:0:8}" --revision "$after" --server "127.0.0.1:$port" --result-dir "$out"
     exit
 fi

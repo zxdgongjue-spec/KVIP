@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+from types import SimpleNamespace
+
+from kvip.diagnostics.high_index_speed import ARMS, BASE, DIAGNOSTICS, command, one_to_one, qualified_targets
+from kvip.diagnostics.replay import arguments
+
+
+def test_pinned_binaries_and_work_orders_use_real_parser(tmp_path):
+    args = SimpleNamespace(cache=tmp_path, source=tmp_path, revision="a" * 40,
+                           server="127.0.0.1:29084", result_dir=tmp_path)
+    outputs = set()
+    for arm in ARMS:
+        parsed = arguments(command(args, 7, arm)[4:])
+        assert parsed.upstream_revision == (args.revision if arm in ("candidate", "wait") else BASE)
+        assert parsed.high_post_index == (arm != "original")
+        assert parsed.post_index_wait_first == (arm == "wait")
+        assert parsed.diagnostic_replays == (DIAGNOSTICS if arm in ("old", "wait", "candidate") else 0)
+        assert parsed.calibrate_counter == bool(parsed.diagnostic_replays)
+        assert parsed.check_auto_route and parsed.device == 0 and parsed.transport == "urma"
+        assert parsed.output not in outputs
+        outputs.add(parsed.output)
+
+
+def test_exposure_excludes_fallback_and_reused_or_different_tasks():
+    left = [("a", 1), ("a", 2), (None, 3), ("b", 4)]
+    right = [("a", 5), (None, 6), ("c", 7), ("a", 8), ("a", 9)]
+    assert one_to_one(left, right) == [(1, 5), (2, 8)]
+
+
+def test_target_requires_measured_units_and_never_scales_nearby_timings(capsys):
+    qualified_targets(7, [dict(events=10000, moves=14000, index_span=50.5),
+                          dict(events=6999, moves=9999, index_span=42.0)])
+    lines = capsys.readouterr().out.splitlines()
+    assert "EVENTS exact_n=1" in lines[0] and "exact_index_us=50.500/50.500" in lines[0]
+    assert "MOVES exact_n=0" in lines[1] and "exact_index_us=unmeasured" in lines[1]
+    assert "nearest_moves=9999" in lines[1] and "ge10k_under50_n=0" in lines[1]
