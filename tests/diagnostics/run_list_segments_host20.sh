@@ -15,7 +15,13 @@ cpu="$work/KVAF/build-cpu/runtime/kvaf_cpu_service"
 native_sha=6de229cab2b877fea055cb3411d5161cc764ec81
 branch=perf/urma-list-segments
 study=${1:-segments}
+groups=(2 7 10 17 4)
 case "$study" in
+    fetch)
+        branch=perf/urma-fetch-rank-ab
+        native_sha=d5ad16037db5aa108ad634b0b0465ef3dd62f7bd
+        groups=(7 2)
+        ;;
     budget)
         branch=perf/urma-consumed-prefix
         native_sha=f7e092a54f7d1ef9fb0b43982a9d4ab5d938a37d
@@ -36,7 +42,7 @@ case "$study" in
     *) echo "Unknown study $study" >&2; exit 2 ;;
 esac
 native="$work/fused-scan-sources/native-$native_sha"
-for group in 2 7 10 17 4; do
+for group in "${groups[@]}"; do
     [[ -s "$inputs/g${group}-input/manifest.json" ]] || { echo "INPUT_MISSING G$group $inputs" >&2; exit 1; }
 done
 [[ -x "$cpu" ]] || { echo "CPU_BINARY_MISSING $cpu" >&2; exit 1; }
@@ -138,6 +144,14 @@ run_case() {
         fi
         warm=1; iterations=1; diagnostic=1
     fi
+    if [[ "$study" == fetch ]]; then
+        selected=(forward reverse reverse-fetch-bitmap reverse-fetch-dense)
+        if [[ "$phase" == check ]]; then
+            warm=1; iterations=1; diagnostic=1
+        else
+            selected+=(reverse-fetch-dense-end reverse-fetch-bitmap-end reverse-end forward-end)
+        fi
+    fi
     echo "BEGIN G$group $phase"
     python3 -B -X faulthandler -m kvip.diagnostics.replay \
         --snapshot "$inputs/g${group}-input" --build-dir "$build" --transport urma --mode fused \
@@ -152,7 +166,10 @@ run_case() {
                 awk '/^BUILD_DIAGNOSTIC_BEGIN/{block=1} block || /^REPLAY_FAILED|^FAILURE_JSON|^FAILURE_LOG|^RUN_LOG/{print} /^BUILD_DIAGNOSTIC_END/{block=0}' >&2
             return "$rc"
         }
-    if [[ "$study" == budget || "$study" == seed || "$study" == parallel || "$study" == trunk ]]; then
+    if [[ "$study" == fetch ]]; then
+        python3 -B "$reader/tests/diagnostics/fetch_ab_report.py" "$base.json" "$phase" \
+            "$native_sha" "$inputs/g${group}-input/manifest.json" | tee "$base.txt"
+    elif [[ "$study" == budget || "$study" == seed || "$study" == parallel || "$study" == trunk ]]; then
         python3 -B "$reader/tests/diagnostics/window_budget_report.py" "$base.json" "$phase" \
             "$native_sha" "$inputs/g${group}-input/manifest.json" | tee "$base.txt"
     elif [[ "$phase" == graph ]]; then
@@ -163,6 +180,16 @@ run_case() {
         python3 -B "$reader/tests/diagnostics/list_segment_times.py" "$base.json" | tee "$base.txt"
     fi
 }
+if [[ "$study" == fetch ]]; then
+    python3 -B -m kvip.diagnostics.fetch_window_topk --inputs "$inputs" --groups 7 2
+    export KVIP_FETCH_AB_CHECK=1
+    for group in "${groups[@]}"; do run_case "$group" check; done
+    unset KVIP_FETCH_AB_CHECK
+    for group in "${groups[@]}"; do run_case "$group" graph; done
+    (cd "$result" && tar -czf results.tar.gz g*.json g*.txt)
+    echo "G7_G2_COMPLETE RETURN_FILE=$result/results.tar.gz"
+    exit 0
+fi
 for group in 7 2 10 17 4; do run_case "$group" graph; done
 for group in 7 2; do run_case "$group" kernels; done
 if [[ "$study" == budget ]]; then

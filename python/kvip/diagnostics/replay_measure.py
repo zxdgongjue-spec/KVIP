@@ -272,7 +272,7 @@ def verify_score_keys(actual, expected, query_ends):
     return dict(status="bit_exact", compared_scores=compared, included_in_timing=False)
 
 
-def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
+def measure(torch, kvaf, stream, bundle, args, retained, runtime=None, archive=None):
     """Time the complete current graph without per-stage instrumentation."""
     graphs = retained.setdefault("graphs", [])
     reset, verify = bundle.reset, bundle.verify
@@ -411,6 +411,10 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
                     cpu_array(torch, bundle.rotating.events),
                     incremental=bundle.tuning["incremental_topk"],
                 )
+            if os.environ.get("KVIP_FETCH_AB_CHECK") == "1":
+                from kvip.diagnostics.fetch_rank_check import inspect_replay
+
+                diagnostic_samples[-1]["fetch_ab"] = inspect_replay(torch, stream, bundle.rotating, archive)
             # Only after successful completion; failures retain all owners and
             # the enabled profile buffer for the existing fatal-exit path.
             phase(retained, "diagnostic_disable", step)
@@ -617,7 +621,7 @@ def measure_case(args, archive, context, retained):
             runtime_configuration=runtime_worker_config(args, archive, aics),
             libraries=[dict(path=str(path), sha256=file_digest(path)) for path in libraries],
         )
-    results = measure(torch, kvaf, stream, bundle, args, case_retained, runtime=runtime)
+    results = measure(torch, kvaf, stream, bundle, args, case_retained, runtime=runtime, archive=archive)
     phase(retained, "result_metadata")
     upstream_root = getattr(args, "upstream_root", None)
     if upstream_root:
