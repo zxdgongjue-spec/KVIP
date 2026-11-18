@@ -3,6 +3,8 @@
 #include "context.h"
 #include "cold_scan.h"
 #include "rolling_threshold.h"
+extern "C" uint32_t kvip_fetch_bitmap() { return KVIP_FETCH_BITMAP; }
+extern "C" uint32_t kvip_fetch_dense() { return KVIP_FETCH_DENSE; }
 extern "C" uint32_t kvip_incremental_window() { return KVIP_INCREMENTAL_WINDOW; }
 extern "C" uint32_t kvip_incremental_inplace() { return KVIP_INCREMENTAL_INPLACE; }
 extern "C" uint32_t kvip_window_probe() { return KVIP_WINDOW_PROBE; }
@@ -94,7 +96,7 @@ extern "C" uint32_t v9_row_bytes(const rotating::RuntimeShape* shape) { return s
 extern "C" uint32_t v9_context_bytes(const rotating::RuntimeShape* shape) { return sizeof(rotating::Context); }
 extern "C" uint32_t v9_rounds(const rotating::RuntimeShape* shape) { return shape->rounds; }
 extern "C" uint32_t v9_simulation(const rotating::RuntimeShape* shape) { return 0; }
-extern "C" uint32_t v9_abi_version(const rotating::RuntimeShape* shape) { return 12 + KVIP_INCREMENTAL_TOPK + 2*KVIP_WINDOW_PROBE + 4*KVIP_SEED_MASK; }
+extern "C" uint32_t v9_abi_version(const rotating::RuntimeShape* shape) { return 12 + 8*(KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE) + KVIP_INCREMENTAL_TOPK + 2*KVIP_WINDOW_PROBE + 4*KVIP_SEED_MASK; }
 extern "C" uint32_t v9_aic_count(const rotating::RuntimeShape* shape) { return shape->aicCount; }
 extern "C" uint32_t v9_service_lanes(const rotating::RuntimeShape* shape) { return shape->serviceLanes; }
 extern "C" uint32_t v9_final_workers(const rotating::RuntimeShape* shape) { return shape->finalWorkers; }
@@ -173,3 +175,13 @@ extern "C" uint32_t kvip_native_fetch_only(void* workspace,void* counts,void* st
 extern "C" uint32_t kvip_streaming_resolver_cores(){return pipeline_ab::kResolveCores;}
 
 extern "C" uint32_t kvip_streaming_flag_count(){return pipeline_ab::kFlagCount;}
+
+extern "C" uint32_t aclrtlaunch_v9_fetch_fixture_kernel(uint32_t,void*,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_fetch_clock_kernel(uint32_t,void*,void*);
+extern "C" uint32_t kvip_fetch_fixture(void* bindings,void* map,void* stream,uint32_t batch) {
+    if(!(KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE) || !batch || batch>16)return 100001;
+    return aclrtlaunch_v9_fetch_fixture_kernel(batch,stream,bindings,map);
+}
+extern "C" uint32_t kvip_fetch_clock(void* data,void* stream) {
+    return aclrtlaunch_v9_fetch_clock_kernel(1,stream,data);
+}

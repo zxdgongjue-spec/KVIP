@@ -198,3 +198,57 @@ extern "C" __global__ __aicore__ void kvip_transport_snapshot_kernel(
     }
 #endif
 }
+
+// Untimed deterministic validation uses completed device scores and the same rank/admission
+// code as FastService. It never opens a transport queue or changes the serving cache.
+extern "C" __global__ __aicore__ void v9_fetch_fixture_kernel(GM_ADDR bindings, GM_ADDR frozenMap) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+#if KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
+    if ASCEND_IS_AIV {
+        using namespace AscendC;
+        using namespace rotating;
+        auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
+        auto ctx=reinterpret_cast<__gm__ Context*>(a[14]);
+        uint32_t b=GetBlockIdx(),h=ctx->shape.history,r=ctx->shape.resident;
+        if (b >= ctx->shape.batch) return;
+        uint32_t ends[4];
+        for(uint32_t q=0;q<4;++q)ends[q]=reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)[b*4+q];
+        auto order=kvip_cold_scan::Bounds(r,h,ends);
+        TPipe pipe; TBuf<TPosition::VECCALC> storage;
+        pipe.InitBuffer(storage,11264*sizeof(uint32_t));
+        auto scratch=storage.Get<uint32_t>(),cfg=scratch[10240],sent=scratch[10496];
+        auto map=reinterpret_cast<__gm__ uint32_t*>(frozenMap)+uint64_t(b)*h;
+        uint32_t total=0;
+        for(uint32_t e=0;e<9;++e) {
+            for(uint32_t q=0;q<4;++q)
+                AdvanceFetchRank(ctx,scratch,reinterpret_cast<GM_ADDR>(a[12]),b*4+q,h,r,9,e,ends[q],order);
+            uint32_t missing=0, budget=512-total<64?512-total:64;
+            uint32_t count=AdmitFetchRank(ctx,scratch,cfg,sent,map,b,r,9,e+1,budget,total,missing,true);
+            GlobalTensor<uint32_t> audit;
+            audit.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->fetchAudit)+(b*9+e)*96);
+            cfg.SetValue(0,e+1);cfg.SetValue(1,count);
+            SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+            DataCopy(audit,cfg,32);
+            if(count)DataCopy(audit[32],sent,(count+7)/8*8);
+            PipeBarrier<PIPE_ALL>();
+            total+=count;
+        }
+    }
+#endif
+#endif
+}
+
+extern "C" __global__ __aicore__ void v9_fetch_clock_kernel(GM_ADDR data) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV {
+        if (AscendC::GetBlockIdx() != 0) return;
+        auto dst=reinterpret_cast<__gm__ uint64_t*>(data);
+        uint64_t duration=dst[0],start=AscendC::GetSystemCycle(),end=start;
+        while(end-start<duration)end=AscendC::GetSystemCycle();
+        dst[1]=end-start;
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(data),64);
+    }
+#endif
+}

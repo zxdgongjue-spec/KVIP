@@ -60,6 +60,11 @@ public:
         WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     }
     __aicore__ inline void RotateFetch(uint32_t epoch, uint32_t sequenceHalfWindow = 0) {
+#if KVIP_STREAMING_LI && !V9_UBMEM
+        bool stamp = streamingWorkspace_ &&
+            (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U);
+        uint64_t entry = stamp ? GetSystemCycle() : 0;
+#endif
         // Join this producer's hit publication. Other producers remain free.
         PipeBarrier<PIPE_ALL>();
 #if defined(V9_UBMEM) && V9_UBMEM
@@ -69,17 +74,28 @@ public:
 #endif
 #if !KVIP_STREAMING_LI
             topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow
-#if KVIP_WINDOW_REFILTER
+#if KVIP_WINDOW_REFILTER || KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
             , false, scoreStorage_
 #endif
             );
 #else
             topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow,
             streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U)
-#if KVIP_WINDOW_REFILTER
+#if KVIP_WINDOW_REFILTER || KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
             , scoreStorage_
 #endif
             );
+#endif
+#if KVIP_STREAMING_LI && !V9_UBMEM
+        if(stamp) {
+            uint64_t returned=GetSystemCycle();
+            auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+            uint32_t lane=rotating::ServiceLane(runtimeShape_.batch,runtimeShape_.splitQ,runtimeShape_.serviceAics,blockId_/2,blockId_%2);
+            auto event=reinterpret_cast<__gm__ rotating::Event*>(ctx->events)+epoch*runtimeShape_.serviceLanes+lane;
+            auto marks=reinterpret_cast<__gm__ uint64_t*>(event->pad);
+            marks[2]=entry; marks[3]=returned;
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event),sizeof(rotating::Event));
+        }
 #endif
     }
     __aicore__ inline void LoadSequenceSplitThresholds(uint32_t batch) {
@@ -325,7 +341,17 @@ private:
 #if KVIP_WINDOW_PROBE
             auto seedStart = ProbeClock();
 #endif
-#if KVIP_INCREMENTAL_TOPK
+#if KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
+            topkOp_(mrgValueLocal_, indicesOutLocal_, scoreOutLocal_, aligned, 0, 1, true);
+            PipeBarrier<PIPE_V>();
+            rotating::RemapFetchSeed(reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),
+                                     residentCount, range.begin);
+            SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            prefixThreshold_.SetValue((query%2)*128,scoreOutLocal_.GetValue(2047));
+            SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
+            SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+            rotationProgressBase_ = UINT32_MAX;
+#elif KVIP_INCREMENTAL_TOPK
             SeedIncremental(query,residentCount,range.begin,range.end,end,aligned);
 #else
             topkOp_.Threshold(mrgValueLocal_, prefixThreshold_[(query % 2) * 128], aligned
@@ -445,7 +471,7 @@ private:
         scores.SetGlobalBuffer((__gm__ uint16_t *)(prefixOutput_ + batch * rowBytes));
         indices.SetGlobalBuffer((__gm__ int32_t *)(prefixOutput_ + batch * rowBytes + count * 2));
         thresholds.SetGlobalBuffer((__gm__ uint16_t *)(prefixOutput_ + batch * rowBytes + count * 6));
-        if (!thresholdReady) {
+        if (!thresholdReady || KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE) {
             DataCopy(scores[q * 2048], scoreOutLocal_, 2048);
             DataCopy(indices[q * 2048], indicesOutLocal_.template ReinterpretCast<int32_t>(), 2048);
         }
@@ -1081,7 +1107,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
                        outBase, classifyUB_[pingpong * 256]);
     }
 #endif
-#if SIM_CAPTURE_HITS && !KVIP_INCREMENTAL_TOPK
+#if SIM_CAPTURE_HITS && !KVIP_INCREMENTAL_TOPK && !KVIP_FETCH_DENSE
     if (!scoreOnly && curS2Idx >= runtimeShape_.resident) {
         constexpr uint32_t prefixBytes = SIM_Q * 2048 * 6 + SIM_Q * 256;
         GlobalTensor<uint8_t> outputHits;

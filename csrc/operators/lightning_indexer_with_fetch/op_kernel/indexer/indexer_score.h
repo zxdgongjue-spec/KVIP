@@ -870,7 +870,9 @@ __simd_callee__ inline void ReduceSumFinalizeClassify(AscendC::MicroAPI::RegTens
         return;
     }
 #endif
+#if !KVIP_FETCH_DENSE
     ClassifyRollingScore(regOut, threshold, hits, maskAllB16, rolling);
+#endif
 }
 __simd_callee__ inline void ReduceSum2FinalizeClassify(AscendC::MicroAPI::RegTensor<float> (&regSum0)[2],
                                                AscendC::MicroAPI::RegTensor<float> (&regSum1)[2],
@@ -917,9 +919,11 @@ __simd_callee__ inline void ReduceSum2FinalizeClassify(AscendC::MicroAPI::RegTen
                          threshold + 128, mask1, advance);
     if (advance) MicroAPI::LocalMemBar<MicroAPI::MemType::VEC_STORE, MicroAPI::MemType::VEC_LOAD>();
 #endif
+#if !KVIP_FETCH_DENSE
     ClassifyRollingScore(regOut[0], threshold, hits, maskAllB16, rolling);
     ClassifyRollingScore(regOut[1], threshold + 128, hits + 128, maskAllB16,
                          rolling ? rolling + kvip_rolling::kStateWords : nullptr);
+#endif
 }
 template <typename QK_T>
 __simd_vf__ inline void ClassifyMulWeightAndReduceSum(__ubuf__ uint16_t* out_,

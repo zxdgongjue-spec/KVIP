@@ -15,6 +15,11 @@ namespace kvaf_device { using ubmem_device::CleanCacheLines; constexpr uint32_t 
 #include "context.h"
 #include "cold_scan.h"
 #include "rolling_threshold.h"
+#if KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
+#include "indexer/li_types.h"
+#include "indexer/recent_threshold.h"
+#include "indexer/topk_common.h"
+#endif
 #include "../../common/lifetch/prefetch_budget.h"
 
 // Imported from direct_slots.h
@@ -301,7 +306,7 @@ namespace rotating {
 // One SIMT task covers every batch assigned to this AIV. Per-batch queues
 // remain independent. locations is dead until final resolve and stages IDs.
 
-template<bool BuildSimt>
+template<bool BuildSimt, bool traceWqe>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
 inline void BatchBuild(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,__gm__ Context* ctx,uint32_t epoch,uint32_t lane,uint32_t begin,
     __ubuf__ uint64_t* remote,__ubuf__ uint32_t* meta,__ubuf__ uint32_t* inputs,__ubuf__ uint32_t* wqes) {
@@ -328,6 +333,13 @@ inline void BatchBuild(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_residen
                 n=count>begin?count-begin:0;if(n>rt_postBank)n=rt_postBank;
                 for(uint32_t i=t;i<n;i+=rt_postThreads) {
                     uint32_t token=asc_ldcg(jobs+begin+i);
+                    if constexpr(traceWqe) {
+                        if(rt_batch==16 && ctx->shape.rounds==9 && ctx->windowLimit==64) {
+                            auto audit=reinterpret_cast<__gm__ uint32_t*>(ctx->events+
+                                uint64_t(9)*rt_serviceLanes*sizeof(Event));
+                            asc_stcg(audit+(b*9+epoch)*64+begin+i,token);
+                        }
+                    }
                     uint32_t slot=slotBase+begin+i;
                     uint64_t address=asc_ldcg(addresses+token);
                     if constexpr(BuildSimt)remote[g*rt_postBank+i]=address;
@@ -630,7 +642,7 @@ inline void PrepareCandidateWqes(uint32_t rt_resident,__ubuf__ uint32_t* ids,__u
     }
     asc_threadfence();
 }
-#if KVIP_INCREMENTAL_TOPK
+#if KVIP_INCREMENTAL_TOPK || KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
 // Reserve only admitted IDs, before the next Q list is examined. This gives
 // Q4 deduplication with the existing map and no per-window hash table.
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
@@ -640,6 +652,7 @@ inline void ReserveIncremental(__ubuf__ uint32_t* ids,__gm__ uint32_t* map,
     asc_threadfence();
 }
 #endif
+#include "fetch_rank.h"
 // Same indexed-load pattern as v9 GatherCandidateMap; cold IDs pass through.
 
 template<bool captureIo>
@@ -648,7 +661,7 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
     uint32_t sequenceHalfWindow, GM_ADDR rollingScores = nullptr) {
     uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0;
     uint64_t scanBegin=0,candidateBegin=0,postBegin=0,begin=0;
-    uint64_t firstDoorbell=0,lastDoorbell=0;
+    uint64_t firstDoorbell=0,secondDoorbell=0,lastDoorbell=0;
     auto ctx=reinterpret_cast<__gm__ Context*>(pointer);auto events=reinterpret_cast<__gm__ Event*>(ctx->events);
     auto event=events+epoch*rt_serviceLanes+lane;event->core=core;event->epoch=epoch;V9_FETCH_PROFILE(event->waitBegin=GetSystemCycle();)
     if(epoch) {
@@ -767,7 +780,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
 #endif
         auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;
         uint32_t count=0,missing=0;
-#if KVIP_REFILTER_REFILL || KVIP_COMPACT_OUT_OF_PLACE || KVIP_INCREMENTAL_TOPK
+#if KVIP_REFILTER_REFILL || KVIP_COMPACT_OUT_OF_PLACE || KVIP_INCREMENTAL_TOPK || KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
         // Existing Q2/16K work tensor: cfg[1536:2016] is disjoint from
         // bitmap words, frozen Q4 progress, thresholds and batched post inputs.
         // Window allowance is validated <=480. No new UB/GM allocation.
@@ -775,7 +788,38 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
 #else
         auto selectedIds=ids;
 #endif
-#if KVIP_INCREMENTAL_TOPK
+#if KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
+        // consumed[0] is the count of committed rank versions for this row.
+        uint32_t versions=state.GetValue(12);
+        uint32_t target=versions;
+        for(;target<=epoch;++target) {
+            uint32_t bound=Trigger(rt_history,rt_resident,rt_rounds,target)*128;
+            bool complete=true;
+            for(uint32_t q=0;q<4;++q) {
+                uint32_t want=bound<ends[q]?bound:ends[q];
+                if(cfg.GetValue(128+b*4+q)<want)complete=false;
+            }
+            if(!complete)break;
+        }
+        for(uint32_t v=versions;v<target;++v)
+            for(uint32_t q=0;q<4;++q)
+                AdvanceFetchRank(ctx,scratch,rollingScores,b*4+q,rt_history,rt_resident,
+                                 rt_rounds,v,ends[q],range);
+        state.SetValue(12,target);
+        uint32_t allowance=PrefetchAllowance(slots,requests,state.GetValue(208),state.GetValue(209),
+                                             state.GetValue(210),ctx->windowLimit);
+        count=AdmitFetchRank(ctx,scratch,cfg,selectedIds,map,b,rt_resident,rt_rounds,
+                             target,allowance,slots,missing,false);
+        if constexpr(captureIo) {
+            GlobalTensor<uint32_t> audit;
+            audit.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->fetchAudit)+(b*rt_rounds+epoch)*96);
+            auto header=scratch[4096];header.SetValue(0,target);header.SetValue(1,count);
+            SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+            DataCopy(audit,header,32);
+            if(count) DataCopy(audit[32],selectedIds,(count+7)/8*8);
+            SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        }
+#elif KVIP_INCREMENTAL_TOPK
         const uint32_t allowance=PrefetchAllowance(slots,requests,state.GetValue(208),
             state.GetValue(209),state.GetValue(210),ctx->windowLimit);
         V9_FETCH_PROFILE(candidateBegin=GetSystemCycle();)
@@ -994,7 +1038,7 @@ if (rt_batchedRows) {
             uint32_t n=cfg.GetValue(256+(b/rt_serviceLanes)*80+64);if(n>maxCount)maxCount=n;
         }
         for(uint32_t start=0;start<maxCount;start+=rt_postBank) {
-            Simt::VF_CALL<BatchBuild<V9_BATCH_POST==1>>(Simt::Dim3{512,1,1},rt_batch,rt_history,rt_resident,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,ctx,epoch,lane,start,
+            Simt::VF_CALL<BatchBuild<V9_BATCH_POST==1,captureIo>>(Simt::Dim3{512,1,1},rt_batch,rt_history,rt_resident,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,ctx,epoch,lane,start,
                 reinterpret_cast<__ubuf__ uint64_t*>(work[512].GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(cfg[256].GetPhyAddr()),
@@ -1033,21 +1077,24 @@ if (rt_batchedRows) {
         for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
             auto input=cfg[256+(b/rt_serviceLanes)*80];if(!input.GetValue(64))continue;
             auto in64=input.ReinterpretCast<uint64_t>();uint64_t db=in64.GetValue(8),head=in64.GetValue(25);
-            if(captureIo && !firstDoorbell)firstDoorbell=GetSystemCycle();
 #if V9_SIMULATION
             *reinterpret_cast<__gm__ uint64_t*>(db)=head;
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(db),64);
 #else
             st_dev(uint32_t(head),reinterpret_cast<__gm__ uint32_t*>(db),0);
 #endif
-            if(captureIo)lastDoorbell=GetSystemCycle();
+            if constexpr(captureIo) {
+                lastDoorbell=GetSystemCycle();
+                if(!firstDoorbell)firstDoorbell=lastDoorbell;
+                else if(!secondDoorbell)secondDoorbell=lastDoorbell;
+            }
         }
         V9_FETCH_PROFILE(postTicks+=GetSystemCycle()-begin;)
     }
 }
     V9_FETCH_PROFILE(event->scanTicks=scanTicks;event->candidateTicks=candidateTicks;event->postTicks=postTicks;)
     V9_FETCH_PROFILE(event->bitmapBytes=bitmapBytes;event->candidateCount=totalCandidates;event->postedCount=postedCount;)
-    if(captureIo){auto stamp=reinterpret_cast<__gm__ uint64_t*>(event->pad);stamp[0]=firstDoorbell;stamp[1]=lastDoorbell;}
+    if(captureIo){auto stamp=reinterpret_cast<__gm__ uint64_t*>(event->pad);stamp[0]=firstDoorbell;stamp[1]=lastDoorbell;stamp[4]=secondDoorbell;}
     V9_FETCH_PROFILE(event->end=GetSystemCycle();)event->complete=1;
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event),captureIo?sizeof(Event):64);
 }

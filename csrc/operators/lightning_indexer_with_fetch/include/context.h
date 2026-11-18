@@ -36,6 +36,12 @@ struct alignas(128) Event {
 };
 constexpr uint32_t kSeedMaskSlots = 16384;
 constexpr uint32_t kSeedMaskWords = kSeedMaskSlots / 8; // Native B32 predicate: one bit per nibble.
+#ifndef KVIP_FETCH_BITMAP
+#define KVIP_FETCH_BITMAP 0
+#endif
+#ifndef KVIP_FETCH_DENSE
+#define KVIP_FETCH_DENSE 0
+#endif
 struct Context {
     uint64_t progress, rows, mapping, locations, events, hits, selected, owners;
     uint64_t args, sourceBlocks, sourceOffsets, destinations, count, rowStatus, finalStatus;
@@ -52,6 +58,9 @@ struct Context {
 
     // Optional int32[B,2] Index-only seed range; independent of KV tailBounds.
     uint64_t thresholdBounds;
+#if KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
+    uint64_t fetchRanks, fetchAudit; // immutable per logical prefix; actual service version and IDs
+#endif
 #if KVIP_INCREMENTAL_TOPK
     uint64_t incrementalLists; // [B*4,rounds,32+2048] immutable count/ID lists.
 #endif
@@ -62,7 +71,7 @@ struct Context {
     uint64_t seedMask; // [active batch,kSeedMaskWords] immutable resident Get eligibility
 #endif
 };
-static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 328 + 8*(KVIP_INCREMENTAL_TOPK + KVIP_WINDOW_PROBE + KVIP_SEED_MASK),
+static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 328 + 16*(KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE) + 8*(KVIP_INCREMENTAL_TOPK + KVIP_WINDOW_PROBE + KVIP_SEED_MASK),
               "LIFetch runtime ABI layout changed");
 // Workload geometry is bound before capture and shared by host/device launches.
 #if defined(__CCE_AICORE__)

@@ -42,8 +42,12 @@ def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False,
                     rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False,
                     compact_out_of_place=False, rolling_reuse_seed=False, rolling_fast_path=False, rolling_sparse=False, rolling_boundary=False, incremental_topk=False,
                     incremental_window=False, incremental_register=False, incremental_prefilter=False, incremental_direct=False, incremental_ties=False, incremental_light=False, incremental_inplace=False,
-                    incremental_progress=False, incremental_segments=False, consumed_prefix=False, window_probe=False, seed_mask=False, seed_parallel=False, native_trunk=False, trunk_pruned=False):
+                    incremental_progress=False, incremental_segments=False, consumed_prefix=False, window_probe=False, seed_mask=False, seed_parallel=False, native_trunk=False, trunk_pruned=False,
+                    fetch_bitmap=False, fetch_dense=False):
     """Build one shape-independent binary per source/toolchain/SoC."""
+    if fetch_bitmap or fetch_dense:
+        if fetch_bitmap == fetch_dense or not reverse_cold or incremental_topk or rolling_threshold:
+            raise ValueError("Fetch ranking needs one reverse score path and its own TopK")
     if trunk_pruned and not native_trunk:
         raise ValueError("Pruning requires shared native trunk scores")
     if native_trunk and not seed_mask:
@@ -105,6 +109,8 @@ def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False,
         KVIP_INCREMENTAL_PREFILTER="ON" if incremental_prefilter else "OFF",
         KVIP_INCREMENTAL_INPLACE="ON" if incremental_inplace else "OFF",
         KVIP_WINDOW_PROBE="ON" if window_probe else "OFF",
+        KVIP_FETCH_BITMAP="ON" if fetch_bitmap else "OFF",
+        KVIP_FETCH_DENSE="ON" if fetch_dense else "OFF",
         KVIP_TRUNK_PRUNED="ON" if trunk_pruned else "OFF",
         KVIP_NATIVE_TRUNK="ON" if native_trunk else "OFF",
         KVIP_SEED_PARALLEL="ON" if seed_parallel else "OFF",
