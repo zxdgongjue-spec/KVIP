@@ -53,8 +53,11 @@ struct Context {
 #if KVIP_INCREMENTAL_TOPK
     uint64_t incrementalLists; // [B*4,rounds,32+2048] immutable count/ID lists.
 #endif
+#if KVIP_WINDOW_PROBE
+    uint64_t windowTimes; // [B*4,rounds,8] uint64; one cache line per producer/epoch.
+#endif
 };
-static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 328 + 8*KVIP_INCREMENTAL_TOPK,
+static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 328 + 8*(KVIP_INCREMENTAL_TOPK + KVIP_WINDOW_PROBE),
               "LIFetch runtime ABI layout changed");
 // Workload geometry is bound before capture and shared by host/device launches.
 #if defined(__CCE_AICORE__)

@@ -12,6 +12,8 @@ option(KVIP_INCREMENTAL_REGISTER "Register Kth for incremental window selection"
 option(KVIP_INCREMENTAL_PREFILTER "Fixed tile filtering and boundary-only sparse compaction" OFF)
 option(KVIP_INCREMENTAL_DIRECT "Materialize selected scores and physical IDs in one SIMD VF" OFF)
 option(KVIP_INCREMENTAL_INPLACE "Update only the boundary-tie suffix in place" OFF)
+option(KVIP_WINDOW_PROBE "Measure producer stages in a separate diagnostic binary" OFF)
+option(KVIP_CONSUMED_PREFIX "Skip proven consumed list prefixes at Fetch" OFF)
 option(KVIP_INCREMENTAL_SEGMENTS "Retain ranked prefixes across Fetch windows" OFF)
 option(KVIP_INCREMENTAL_PROGRESS "Keep progress in an independent existing UB bank" OFF)
 if(KVIP_INCREMENTAL_PROGRESS AND NOT KVIP_INCREMENTAL_WINDOW)
@@ -100,6 +102,8 @@ ascendc_compile_options(v9_kernel PRIVATE -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WO
   -DKVIP_INCREMENTAL_REGISTER=$<BOOL:${KVIP_INCREMENTAL_REGISTER}>
   -DKVIP_INCREMENTAL_PREFILTER=$<BOOL:${KVIP_INCREMENTAL_PREFILTER}>
   -DKVIP_INCREMENTAL_INPLACE=$<BOOL:${KVIP_INCREMENTAL_INPLACE}>
+  -DKVIP_WINDOW_PROBE=$<BOOL:${KVIP_WINDOW_PROBE}>
+  -DKVIP_CONSUMED_PREFIX=$<BOOL:${KVIP_CONSUMED_PREFIX}>
   -DKVIP_INCREMENTAL_SEGMENTS=$<BOOL:${KVIP_INCREMENTAL_SEGMENTS}>
   -DKVIP_INCREMENTAL_PROGRESS=$<BOOL:${KVIP_INCREMENTAL_PROGRESS}>
   -DKVIP_INCREMENTAL_LIGHT=$<BOOL:${KVIP_INCREMENTAL_LIGHT}>
@@ -151,4 +155,6 @@ target_compile_definitions(v9_bridge PRIVATE KVIP_INCREMENTAL_LIGHT=$<BOOL:${KVI
 target_compile_definitions(v9_bridge PRIVATE KVIP_INCREMENTAL_INPLACE=$<BOOL:${KVIP_INCREMENTAL_INPLACE}>)
 target_compile_definitions(v9_bridge PRIVATE KVIP_INCREMENTAL_PROGRESS=$<BOOL:${KVIP_INCREMENTAL_PROGRESS}>)
 
+target_compile_definitions(v9_bridge PRIVATE KVIP_WINDOW_PROBE=$<BOOL:${KVIP_WINDOW_PROBE}>)
+target_compile_definitions(v9_bridge PRIVATE KVIP_CONSUMED_PREFIX=$<BOOL:${KVIP_CONSUMED_PREFIX}>)
 target_compile_definitions(v9_bridge PRIVATE KVIP_INCREMENTAL_SEGMENTS=$<BOOL:${KVIP_INCREMENTAL_SEGMENTS}>)

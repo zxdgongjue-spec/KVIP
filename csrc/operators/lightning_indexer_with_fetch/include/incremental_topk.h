@@ -31,6 +31,15 @@
 #ifndef KVIP_INCREMENTAL_SEGMENTS
 #define KVIP_INCREMENTAL_SEGMENTS 0
 #endif
+#ifndef KVIP_WINDOW_PROBE
+#define KVIP_WINDOW_PROBE 0
+#endif
+#ifndef KVIP_CONSUMED_PREFIX
+#define KVIP_CONSUMED_PREFIX 0
+#endif
+#if KVIP_CONSUMED_PREFIX && !KVIP_INCREMENTAL_SEGMENTS
+#error "Consumed prefix requires immutable segment lists"
+#endif
 #if KVIP_INCREMENTAL_SEGMENTS && (!KVIP_INCREMENTAL_LIGHT || !KVIP_INCREMENTAL_TIES || KVIP_INCREMENTAL_PROGRESS || KVIP_INCREMENTAL_INPLACE)
 #error "Segment lists require light tie selection and its private staging bank"
 #endif

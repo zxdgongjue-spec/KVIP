@@ -778,6 +778,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
 #if KVIP_INCREMENTAL_TOPK
         const uint32_t allowance=PrefetchAllowance(slots,requests,state.GetValue(208),
             state.GetValue(209),state.GetValue(210),ctx->windowLimit);
+        V9_FETCH_PROFILE(candidateBegin=GetSystemCycle();)
         for(uint32_t q=0;q<4 && count<allowance;++q) {
             uint32_t ready=cfg.GetValue(1024+b*4+q);
             if(!ready)continue;
@@ -802,11 +803,30 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
             GlobalTensor<uint32_t> payload;
             payload.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->incrementalLists)
                 + uint64_t(b * 4 + q) * rt_rounds * kvip_incremental::kListWords + kvip_incremental::kHeader);
-            if (prefix) DataCopy(ids, payload[baseEpoch * kvip_incremental::kListWords], prefix);
-            if (prefix < candidates) {
-                DataCopy(ids[prefix], payload[suffixEpoch * kvip_incremental::kListWords],
-                         (candidates - prefix + 7) / 8 * 8);
+            uint32_t skip = 0;
+#if KVIP_CONSUMED_PREFIX
+            // The last snapshot row is unused when rounds < kMaxRounds. Its
+            // four words are cleared by InitializeRound and carried in the
+            // existing Row DMA. The preceding service event orders its reuse.
+            constexpr uint32_t cursorWord = __builtin_offsetof(Row, snapshot) / sizeof(uint32_t)
+                                          + 4 * (kMaxRounds - 1);
+            const bool useCursor = rt_rounds < kMaxRounds;
+            const uint32_t cursor = useCursor ? state.GetValue(cursorWord + q) : 0;
+            if ((cursor >> 18) == baseEpoch + 1) {
+                const uint32_t consumed = cursor & 0xfffU;
+                const bool sameSuffix = ((cursor >> 12) & 63U) == suffixEpoch + 1;
+                if (sameSuffix && consumed == candidates) continue;
+                skip = (sameSuffix ? consumed : (consumed < prefix ? consumed : prefix)) & ~7U;
             }
+#endif
+            const uint32_t head = prefix > skip ? prefix - skip : 0;
+            const uint32_t tail = skip > prefix ? skip - prefix : 0;
+            if (head) DataCopy(ids, payload[baseEpoch * kvip_incremental::kListWords + skip], head);
+            if (prefix + tail < candidates) {
+                DataCopy(ids[head], payload[suffixEpoch * kvip_incremental::kListWords + tail],
+                         (candidates - prefix - tail + 7) / 8 * 8);
+            }
+            candidates -= skip;
 #else
             DataCopy(ids,list[kvip_incremental::kHeader],(candidates+7)/8*8);
 #endif
@@ -823,6 +843,17 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
                 reinterpret_cast<__ubuf__ uint32_t*>(selectedIds[count].GetPhyAddr()));
             SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
             uint32_t found=cfg.GetValue(56),admitted=found<allowance-count?found:allowance-count;
+            V9_FETCH_PROFILE(totalCandidates+=candidates;)
+#if KVIP_CONSUMED_PREFIX
+            if (useCursor) {
+                // An unsubmitted miss may never be skipped. If the cap bound,
+                // the first admitted positions are safe even with arbitrary
+                // hits interleaved; later positions will be inspected again.
+                uint32_t proven = skip + (found == admitted ? candidates : admitted);
+                state.SetValue(cursorWord + q, ((baseEpoch + 1) << 18) |
+                               ((suffixEpoch + 1) << 12) | proven);
+            }
+#endif
             missing+=found;
             if(admitted) {
                 Simt::VF_CALL<ReserveIncremental>(Simt::Dim3{256,1,1},
@@ -832,6 +863,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
             }
             count+=admitted;
         }
+        V9_FETCH_PROFILE(candidateTicks+=GetSystemCycle()-candidateBegin;)
         for(uint32_t q=0;q<4;++q) {
             state.SetValue(12+q,cfg.GetValue(128+b*4+q));
             state.SetValue(80+epoch*4+q,cfg.GetValue(128+b*4+q));

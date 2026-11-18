@@ -42,8 +42,10 @@ def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False,
                     rolling_compact=False, rolling_first_window=False, refilter_safe=False, refilter_refill=False,
                     compact_out_of_place=False, rolling_reuse_seed=False, rolling_fast_path=False, rolling_sparse=False, rolling_boundary=False, incremental_topk=False,
                     incremental_window=False, incremental_register=False, incremental_prefilter=False, incremental_direct=False, incremental_ties=False, incremental_light=False, incremental_inplace=False,
-                    incremental_progress=False, incremental_segments=False):
+                    incremental_progress=False, incremental_segments=False, consumed_prefix=False, window_probe=False):
     """Build one shape-independent binary per source/toolchain/SoC."""
+    if consumed_prefix and not incremental_segments:
+        raise ValueError("Consumed prefix requires immutable segment lists")
     if incremental_segments and not (incremental_light and incremental_ties and not incremental_progress and not incremental_inplace):
         raise ValueError("Segment lists require light tie selection and its private staging bank")
     if incremental_progress and not incremental_window:
@@ -94,6 +96,8 @@ def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False,
         KVIP_INCREMENTAL_REGISTER="ON" if incremental_register else "OFF",
         KVIP_INCREMENTAL_PREFILTER="ON" if incremental_prefilter else "OFF",
         KVIP_INCREMENTAL_INPLACE="ON" if incremental_inplace else "OFF",
+        KVIP_WINDOW_PROBE="ON" if window_probe else "OFF",
+        KVIP_CONSUMED_PREFIX="ON" if consumed_prefix else "OFF",
         KVIP_INCREMENTAL_SEGMENTS="ON" if incremental_segments else "OFF",
         KVIP_INCREMENTAL_PROGRESS="ON" if incremental_progress else "OFF",
         KVIP_INCREMENTAL_LIGHT="ON" if incremental_light else "OFF",

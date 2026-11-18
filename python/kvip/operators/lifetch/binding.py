@@ -66,6 +66,8 @@ class LIFetchBinding:
         )
         option = getattr(self.library, "kvip_incremental_topk", None)
         self.incremental_topk = bool(option()) if option is not None else False
+        probe = getattr(self.library, "kvip_window_probe", None)
+        window_probe = bool(probe and probe())
         if self.incremental_topk and (resident != 16384 or self.runtime_shape.indexHeads != 32 or
                 self.runtime_shape.rounds != 9 or not self.runtime_shape.splitQ):
             raise ValueError("Incremental TopK requires split Q4, H32, resident16384 and eight cold windows")
@@ -77,7 +79,7 @@ class LIFetchBinding:
             ("final_replicated", int(final_strategy == "replicated")),
             ("final_workers", final_aivs(batch, li_tiling, aic_count, final_workers)),
             ("aic_count", aic_count),
-            ("abi_version", 12 + self.incremental_topk),
+            ("abi_version", 12 + self.incremental_topk + 2 * window_probe),
             (
                 "service_lanes",
                 li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)["service_aivs_per_window"],
@@ -91,7 +93,7 @@ class LIFetchBinding:
             ("history", history),
             ("resident", resident),
             ("simulation", 0),
-            ("context_bytes", 328 + 8 * self.incremental_topk),
+            ("context_bytes", 328 + 8 * (self.incremental_topk + window_probe)),
             ("row_bytes", 1024),
         ):
             fn = getattr(self.library, "v9_" + name)
@@ -231,7 +233,10 @@ class LIFetchBinding:
             self.incremental_lists = torch.empty((batch * 4, self.rounds, 2080),
                                                   dtype=torch.int32, device=self.device)
             blob = np.r_[blob, np.array([self.incremental_lists.data_ptr()], dtype="<u8").view("u1")]
-        if blob.size != 328 + 8 * self.incremental_topk:
+        if window_probe:
+            self.window_times = torch.zeros((batch * 4, self.rounds, 8), dtype=torch.int64, device=self.device)
+            blob = np.r_[blob, np.array([self.window_times.data_ptr()], dtype="<u8").view("u1")]
+        if blob.size != 328 + 8 * (self.incremental_topk + window_probe):
             raise AssertionError("LIFetch Context ABI changed")
         self.context = torch.from_numpy(blob.copy()).to(self.device)
         self.arguments = tuple(arguments) + (self.context,)

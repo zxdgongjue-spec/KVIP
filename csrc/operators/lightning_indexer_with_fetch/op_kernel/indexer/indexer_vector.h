@@ -258,6 +258,19 @@ private:
 #endif
     }
 #endif
+#if KVIP_WINDOW_PROBE
+    __aicore__ inline uint64_t ProbeClock() {
+        PipeBarrier<PIPE_ALL>();
+        return GetSystemCycle();
+    }
+    __aicore__ inline void RecordProbe(uint32_t query, uint32_t epoch, uint32_t stage, uint64_t ticks) {
+        auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+        auto row = reinterpret_cast<__gm__ uint64_t*>(ctx->windowTimes) +
+                   (query * runtimeShape_.rounds + epoch) * 8;
+        row[stage] = ticks;
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row), 64);
+    }
+#endif
     GM_ADDR scoreStorage_ = nullptr;
     __aicore__ inline bool TryResidentThreshold(uint32_t query, uint32_t scoreRow,
                                                 uint32_t residentCount, uint32_t availableEnd) {
@@ -309,6 +322,9 @@ private:
             }
             SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
             WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+#if KVIP_WINDOW_PROBE
+            auto seedStart = ProbeClock();
+#endif
 #if KVIP_INCREMENTAL_TOPK
             SeedIncremental(query,residentCount,range.begin,range.end,end,aligned);
 #else
@@ -317,6 +333,9 @@ private:
                 , reinterpret_cast<__ubuf__ uint16_t*>(rollingState_[(query % 2) * kvip_rolling::kStateWords].GetPhyAddr())
 #endif
                 );
+#endif
+#if KVIP_WINDOW_PROBE
+            RecordProbe(query, 0, 0, ProbeClock() - seedStart);
 #endif
 #if KVIP_ROLLING_THRESHOLD
             if (topkCount_ == kvip_rolling::kTop) {
@@ -1075,9 +1094,20 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4,PIPE_V>(
             QLICommon::ConstInfo::CROSS_VC_EVENT+pingpong);
         incrementalRelease = true;
+#if KVIP_WINDOW_PROBE
+        auto mergeStart = ProbeClock();
+#endif
         MergeIncremental(curAivS1Idx%2);
         if(incrementalBoundary) {
+#if KVIP_WINDOW_PROBE
+            auto publishStart = ProbeClock();
+#endif
             PublishIncremental(info.bIdx*SIM_Q+curAivS1Idx,incrementalEpoch_);
+#if KVIP_WINDOW_PROBE
+            auto publishEnd = ProbeClock();
+            RecordProbe(info.bIdx*SIM_Q+curAivS1Idx, incrementalEpoch_, 1, publishStart - mergeStart);
+            RecordProbe(info.bIdx*SIM_Q+curAivS1Idx, incrementalEpoch_, 2, publishEnd - publishStart);
+#endif
             incrementalBegin_=(info.s2Idx+1)*128;
             ++incrementalEpoch_;
         }
