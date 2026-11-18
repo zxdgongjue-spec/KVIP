@@ -100,35 +100,33 @@ inline void Transfer(__gm__ Edge* edges, uint32_t p0, uint32_t p1, uint32_t s0, 
             auto t = spill + i;
             if constexpr (Scatter) {
                 asc_stcg(key, asc_ldcg(t->key + field));
-                if (!field) {
-                    asc_stcg(scales + pos, asc_ldcg(&t->scale));
-                    asc_stcg(addr + pos, asc_ldcg(&t->address));
-                    asc_stcg(logical + pos, asc_ldcg(&t->logical));
-                }
             } else {
                 asc_stcg(t->key + field, asc_ldcg(key));
-                if (!field) {
-                    asc_stcg(&t->scale, asc_ldcg(scales + pos));
-                    asc_stcg(&t->address, asc_ldcg(addr + pos));
-                    asc_stcg(&t->logical, asc_ldcg(logical + pos));
-                }
+            }
+            if (field < 2) {
+                auto column = field == 0 ? addr + pos : logical + pos;
+                auto cached = field == 0 ? &t->address : &t->logical;
+                if constexpr (Scatter) asc_stcg(column, asc_ldcg(cached));
+                else asc_stcg(cached, asc_ldcg(column));
+            } else if (field == 2) {
+                if constexpr (Scatter) asc_stcg(scales + pos, asc_ldcg(&t->scale));
+                else asc_stcg(&t->scale, asc_ldcg(scales + pos));
             }
         } else {
             auto t = local + i - s0;
             if constexpr (Scatter) {
                 asc_stcg(key, t->key[field]);
-                if (!field) {
-                    asc_stcg(scales + pos, t->scale);
-                    asc_stcg(addr + pos, t->address);
-                    asc_stcg(logical + pos, t->logical);
-                }
             } else {
                 t->key[field] = asc_ldcg(key);
-                if (!field) {
-                    t->scale = asc_ldcg(scales + pos);
-                    t->address = asc_ldcg(addr + pos);
-                    t->logical = asc_ldcg(logical + pos);
-                }
+            }
+            if (field < 2) {
+                auto column = field == 0 ? addr + pos : logical + pos;
+                auto cached = field == 0 ? &t->address : &t->logical;
+                if constexpr (Scatter) asc_stcg(column, *cached);
+                else *cached = asc_ldcg(column);
+            } else if (field == 2) {
+                if constexpr (Scatter) asc_stcg(scales + pos, t->scale);
+                else t->scale = asc_ldcg(scales + pos);
             }
         }
     }
