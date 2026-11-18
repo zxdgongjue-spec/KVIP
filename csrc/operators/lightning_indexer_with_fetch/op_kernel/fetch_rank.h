@@ -4,6 +4,9 @@
 constexpr uint32_t kRankWords = 3072; // 2048 u32 IDs, 2048 u16 keys.
 constexpr uint32_t kRankHeader = 32;
 constexpr uint32_t kFetchEpochs = 9;
+// V_MTE2 event 0/1 belongs to the two live LI key-scale banks during
+// RotateFetch. Event 3 is balanced locally by LI before entering Service.
+constexpr auto kRankScratchReleased = EVENT_ID3;
 
 __simd_vf__ inline void RemapFetchSeed(__ubuf__ uint32_t* ids,uint32_t resident,uint32_t begin) {
     using namespace MicroAPI;
@@ -267,11 +270,12 @@ __aicore__ inline uint32_t AdvanceFetchRank(__gm__ Context* ctx, LocalTensor<uin
                     PackRankOffsets<true>(RankPtr(raw), RankPtr(off), kth, valid,
                         ClipRankOffset(lo,p,n),ClipRankOffset(hi,p,n),n/128,tileMask);
                 }
-                uint32_t added = GetSpr<SpecialPurposeReg::AR>() / sizeof(uint16_t);
                 SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+                uint32_t added = GetSpr<SpecialPurposeReg::AR>() / sizeof(uint16_t);
                 if (added) MergeRankBlock(a,p,added,kth,strict);
                 // The next DMA reuses raw after both the sieve and merge readers.
-                SetFlag<HardEvent::V_MTE2>(EVENT_ID0);WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
+                SetFlag<HardEvent::V_MTE2>(kRankScratchReleased);
+                WaitFlag<HardEvent::V_MTE2>(kRankScratchReleased);
             }
             scan+=n;
         }

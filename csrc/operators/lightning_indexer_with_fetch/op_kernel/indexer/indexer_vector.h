@@ -870,6 +870,15 @@ __aicore__ inline void QLIVector<QLIT>::PublishScoreProgress(
             WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
             rotationProgressBase_ = tableBase;
         }
+#if KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
+        // Fetch ranks consume the whole prefix on another core. Complete the
+        // score and optional predicate stores before exposing a window boundary.
+        if (info.isLastS2InnerLoop || rotating::IsTrigger(runtimeShape_.history,
+                runtimeShape_.resident, runtimeShape_.rounds, info.s2Idx + 1)) {
+            SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        }
+#endif
         DataCopyExtParams publish;
         publish.blockCount = curAivS1ProcNum; // Q2: one query/AIV; Q4: two
         publish.blockLen = 32;
