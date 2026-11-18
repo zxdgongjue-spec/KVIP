@@ -181,7 +181,7 @@ __aicore__ inline void CopyRouteTable(uint64_t source, uint32_t bytes,
 // evaluator, before any pending or control record has been changed.
 __simt_vf__ __aicore__ LAUNCH_BOUND(32) inline void ScoreQ4Route(
     __ubuf__ RouteTables* table, uint32_t batch, uint32_t history,
-    uint32_t tokenBytes, uint32_t ownRow, __ubuf__ uint32_t* proof) {
+    uint32_t tokenBytes, uint32_t ownRow, __gm__ int32_t* controls, __ubuf__ uint32_t* proof) {
     const uint32_t lane = threadIdx.x;
     const bool active = lane < batch;
     auto request = &table->requests[active ? lane : 0];
@@ -200,7 +200,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(32) inline void ScoreQ4Route(
     uint32_t demand = active ? uint32_t(previous->necessary) : 0;
     const uint32_t invalidRows = asc_ballot(active && !valid);
     const uint32_t previousHighRows = asc_ballot(active && previous->mode != 0);
-    if (lane == ownRow) proof[1] = work;
+    const uint32_t ownWork = asc_shfl(work, ownRow, 32);
     for (uint32_t distance = 1; distance < 16; distance *= 2) {
         const uint32_t src = lane ^ distance;
         lowerOwners |= asc_shfl(lowerOwners, src, 32);
@@ -208,22 +208,54 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(32) inline void ScoreQ4Route(
         work += asc_shfl(work, src, 32);
         demand += asc_shfl(demand, src, 32);
     }
-    if (!lane) {
-        bool unique = uint32_t(__builtin_popcount(lowerOwners) + __builtin_popcount(upperOwners)) == batch;
-        const uint64_t budget = previousHighRows ? table->config.lowBudget : table->config.highBudget;
-        const bool low = uint64_t(demand) * tokenBytes * 1024 <= budget * work;
-        proof[0] = !invalidRows && unique ? uint32_t(!low) : 2;
+    const bool unique = uint32_t(__builtin_popcount(lowerOwners) + __builtin_popcount(upperOwners)) == batch;
+    const uint64_t budget = previousHighRows ? table->config.lowBudget : table->config.highBudget;
+    // Lanes 0..15 participated in the reduction. Broadcast its verified
+    // result before touching any global state, including on fallback.
+    const uint32_t mode = asc_shfl((invalidRows || !unique) ? 2U :
+        uint32_t(uint64_t(demand) * tokenBytes * 1024 > budget * work), 0, 32);
+    if (!lane) proof[0] = mode;
+    if (mode > 1) return;
+
+    // Lanes own disjoint words of one aligned Pending record. Publish all
+    // 16 words even when a previous replay took the general fallback. Both
+    // completion paths acquire this record before committing feedback.
+    if (lane < 16) {
+        auto own = &table->requests[ownRow];
+        uint64_t value = 0;
+        switch (lane) {
+        case offsetof(Pending, owner) / sizeof(value): value = own->owner; break;
+        case offsetof(Pending, generation) / sizeof(value): value = own->generation; break;
+        case offsetof(Pending, step) / sizeof(value): value = own->step; break;
+        case offsetof(Pending, learnable) / sizeof(value): value = 1; break;
+        case offsetof(Pending, mode) / sizeof(value): value = mode; break;
+        case offsetof(Pending, queries) / sizeof(value): value = 4; break;
+        case offsetof(Pending, scoreWork) / sizeof(value): value = ownWork; break;
+        case offsetof(Pending, tokenBytes) / sizeof(value): value = tokenBytes; break;
+        case offsetof(Pending, previousStep) / sizeof(value): value = table->feedback[own->owner].step; break;
+        }
+        static_assert(sizeof(Pending) == 16 * sizeof(uint64_t) && Predicted == 0,
+                      "Q4 pending publication requires the routing ABI");
+        auto pending = reinterpret_cast<__gm__ uint64_t*>(table->config.pending);
+        asc_stcg(pending + ownRow * 16 + lane, value);
     }
+    if (ownRow % 8 == 0 && ownRow + lane / 4 < batch) {
+        const uint32_t field = lane % 4;
+        const uint32_t value = field == 0 ? uint32_t(mode ? table->config.fullTotal : 0) :
+                               field == 1 ? uint32_t(table->config.fullWindow) :
+                               field == 2 ? uint32_t(table->config.fullSteps) : uint32_t(table->config.fullCarry);
+        asc_stcg(controls + ownRow * 4 + lane, int32_t(value));
+    }
+    asc_threadfence();
 }
 
 template<class Context>
 __aicore__ inline bool StageAndEvaluate(__gm__ Context* ctx, uint32_t row,
     AscendC::LocalTensor<uint32_t> storage,bool& noPrefetch) {
     auto c=reinterpret_cast<const __gm__ Config*>(ctx->autoRoute);
-    // Original scalar path remains available for unsupported metadata layouts.
-    if(!ctx->admissionControls || !Valid(c) || c->owners>64 || !ctx->shape.batch ||
-       ctx->shape.batch>16 || row>=ctx->shape.batch || c->pending%128 ||
-       ctx->admissionControls%128)return false;
+    // The caller admitted this immutable configuration with CanStage before
+    // selecting this implementation. Request and feedback data still need
+    // to be checked for each replay.
     auto table=reinterpret_cast<__ubuf__ RouteTables*>(storage.GetPhyAddr());
     CopyRouteTable(ctx->autoRoute,sizeof(Config),storage);
     CopyRouteTable(c->requests,ctx->shape.batch*sizeof(Request),storage[offsetof(RouteTables,requests)/4]);
@@ -236,51 +268,25 @@ __aicore__ inline bool StageAndEvaluate(__gm__ Context* ctx, uint32_t row,
     AscendC::DataCopyPad(storage[offsetof(RouteTables,feedback)/4],input,copy,pad);
     AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
     AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
-    bool result = false;
     constexpr uint32_t resultWord = (sizeof(RouteTables) + 31) / 32 * 8;
     static_assert((resultWord + 8) * 4 <= 16384, "route result must fit init scratch");
     // Sixty-four query ends fit in a 32-bit warp sum under this bound.
     if (ctx->rowOwners && ctx->queryEnds && ctx->shape.history <= UINT32_MAX / 64 &&
-        ValidStaged(&table->config) && table->config.learning && table->config.owners == c->owners) {
+        table->config.learning) {
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
         Simt::VF_CALL<ScoreQ4Route>(Simt::Dim3{32,1,1}, table, ctx->shape.batch,
-            ctx->shape.history, ctx->shape.tokenBytes, row,
+            ctx->shape.history, ctx->shape.tokenBytes, row, reinterpret_cast<__gm__ int32_t*>(ctx->admissionControls),
             reinterpret_cast<__ubuf__ uint32_t*>(storage.GetPhyAddr()) + resultWord);
         AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
         uint32_t mode = storage.GetValue(resultWord);
         if (mode <= 1) {
-            auto request = table->requests + row;
-            auto record = reinterpret_cast<__gm__ Pending*>(c->pending) + row;
-            record->owner = request->owner;
-            record->generation = request->generation;
-            record->step = request->step;
-            record->queries = 4;
-            record->learnable = 1;
-            record->mode = mode;
-            record->reason = Predicted;
-            record->scoreWork = storage.GetValue(resultWord + 1);
-            record->tokenBytes = ctx->shape.tokenBytes;
-            record->necessary = 0;
-            record->usefulPrefetch = 0;
-            record->previousStep = table->feedback[request->owner].step;
-            for (uint32_t i = 0; i < 4; ++i) record->reserved[i] = 0;
-            if (row % 8 == 0) {
-                auto controls = reinterpret_cast<__gm__ int32_t*>(ctx->admissionControls);
-                uint32_t stop = row + 8 < ctx->shape.batch ? row + 8 : ctx->shape.batch;
-                for (uint32_t i = row; i < stop; ++i) {
-                    controls[4 * i] = mode ? int32_t(c->fullTotal) : 0;
-                    controls[4 * i + 1] = int32_t(c->fullWindow);
-                    controls[4 * i + 2] = int32_t(c->fullSteps);
-                    controls[4 * i + 3] = int32_t(c->fullCarry);
-                }
-            }
             noPrefetch = !mode;
-            result = true;
+            return true;
         }
     }
-    if (!result) result = EvaluateStaged(ctx, table, noPrefetch, row);
+    const bool result = EvaluateStaged(ctx, table, noPrefetch, row);
     if(result){
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(c->pending)+row*128,128);
         if(row%8==0){uint32_t count=ctx->shape.batch-row;if(count>8)count=8;

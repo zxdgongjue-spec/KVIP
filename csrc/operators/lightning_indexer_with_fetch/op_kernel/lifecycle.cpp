@@ -170,10 +170,8 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
         bool stageRoute=false;
 #if KVIP_LOW_MISS_POST_INDEX && KVIP_AUTO_ROUTE_ROW_PUBLISH
         if(ctx->autoRoute){
-            auto c=reinterpret_cast<const __gm__ kvip_auto_route::Config*>(ctx->autoRoute);
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->autoRoute),128);
-            stageRoute=ctx->admissionControls && kvip_auto_route::Valid(c) && c->owners<=64 &&
-                rt_batch && rt_batch<=16 && b<rt_batch && !(c->pending%128) && !(ctx->admissionControls%128);
+            stageRoute=kvip_auto_route::CanStage(ctx,b);
         }
 #endif
 #if KVIP_AUTO_ROUTE_SIMT
@@ -293,8 +291,9 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
             // Init blocks do not read controls written by another block.
             // A low round performs no prefetch, so this full limit is unused.
             auto config = reinterpret_cast<__gm__ kvip_auto_route::Config*>(ctx->autoRoute);
-            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(config),128);
-            if (kvip_auto_route::Valid(config)) row->prefetchLimit=uint32_t(config->fullTotal);
+            if (!stageRoute)
+                kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(config),128);
+            if (stageRoute || kvip_auto_route::Valid(config)) row->prefetchLimit=uint32_t(config->fullTotal);
             else row->error=kvaf_device::kInvalidArgs;
         } else
 #endif
