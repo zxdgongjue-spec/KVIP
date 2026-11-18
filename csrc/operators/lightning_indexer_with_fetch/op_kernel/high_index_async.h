@@ -73,7 +73,7 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
     const bool profile=(a->prefetchCount & 0x80000000U)!=0;
     if(profile){
         r->start=GetSystemCycle();
-        r->planDone=0; r->postBegin=0; r->postDone=0;
+        r->planDone=0; r->postBegin=0; r->postDone=0; ticks[4]=0; ticks[8]=0;
     }
     uint32_t useful=0,error=0;
     if(q==0) useful=Producer(a,b);
@@ -120,6 +120,8 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),64);
         error|=row->error | info[0];
         me->reserved[6]=info[1];
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->pending),sizeof(row->pending));
+        me->reserved[7]=row->pending!=0;
     }
     me->count=count;
     if(profile) r->packDone=GetSystemCycle();
@@ -134,9 +136,10 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
     // with a final KV destination, but it cannot overwrite Index storage.
     // Post a safe prefix now; defer only the unsendable range. A bounded
     // blocking fallback is likewise deferred so its CQ cannot gate Index.
-    uint32_t early=(!blocking && (safe==count || split)) ? safe : 0;
+    bool conflict=safe<count && join.lines[0].reserved[7];
+    uint32_t early=blocking ? 0 : (!conflict ? count : (split ? safe : 0));
     if(!error && early){
-        if(profile) r->postBegin=GetSystemCycle();
+        if(profile){r->postBegin=GetSystemCycle();ticks[4]=r->postBegin;ticks[8]=1;}
         error|=post_index_transport::Post(args,0,early,first);
         if(profile) r->postDone=GetSystemCycle();
     }
@@ -155,9 +158,12 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+7),sizeof(*flags));
     }
     if(early<count) {
-        if(safe<count) error|=AwaitPublication(flags+7);
+        if(conflict) error|=AwaitPublication(flags+7);
         if(!error){
-            if(profile && !early) r->postBegin=GetSystemCycle();
+            if(profile){
+                uint64_t begin=GetSystemCycle(); ticks[4]=begin; ticks[8]=early ? 2 : 1;
+                if(!early) r->postBegin=begin;
+            }
             error|=blocking ? post_index_transport::GetBlocking(args,early,count-early,second)
                             : post_index_transport::Post(args,early,count-early,second);
             if(profile) r->postDone=GetSystemCycle();
