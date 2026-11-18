@@ -262,8 +262,9 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
 
             diagnostic = bool(getattr(bundle, "post_index_diagnostics", False))
             low_active = early_threshold_skipped(bundle.tuning)
+            high_active = not low_active and bool(getattr(bundle.forward, "high_post_index", False))
             raw_times = (cpu_array(torch, bundle.forward.times)
-                         if diagnostic and low_active else None)
+                         if diagnostic and (low_active or high_active) else None)
             batch = bundle.forward.batch
             detail = raw_times[batch * 256:].reshape(-1, 32) if raw_times is not None else None
             finalization = (raw_times[batch * 128:batch * 256].reshape(batch, 128)[:, 96:100]
@@ -273,8 +274,26 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
             events = (tuple(cpu_array(torch, value) for value in
                             (bundle.forward.events_src, bundle.forward.events_dst))
                       if detail is not None and np.any(detail[:, 2] == INDEX_DETAIL_SAME_VF_MAGIC) else None)
+            records = cpu_array(torch, bundle.forward.post_index)
+            if high_active:
+                from kvip.diagnostics.high_index_profile import decode_high_index, descriptor_fingerprint, event_work
+
+                work = event_work(cpu_array(torch, bundle.forward.flags),
+                                  cpu_array(torch, bundle.forward.events_src),
+                                  cpu_array(torch, bundle.forward.events_dst),
+                                  history=bundle.forward.history)
+                work["descriptor_sha256"] = descriptor_fingerprint(
+                    cpu_array(torch, rotating.final_posts),
+                    (cpu_array(torch, v) for v in (rotating.blocks, rotating.offsets, rotating.destinations)),
+                    cpu_array(torch, rotating.fallback_addresses),
+                    final_get=reads["final"], arena_base=restored["new_base"],
+                )
+                reads["high_post_index"] = decode_high_index(
+                    records, detail, wait_first=bool(getattr(bundle.forward, "post_index_wait_first", False)),
+                    final_get=reads["final"], work=work,
+                )
             reads["post_index"] = decode_post_index(
-                cpu_array(torch, bundle.forward.post_index),
+                records,
                 active=low_active,
                 diagnostic=diagnostic,
                 index_detail=detail,
@@ -312,6 +331,14 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         state = post_state(torch, selector)
         stride = rotating.output_stride if bundle.tuning.get("low_miss_read_through") else None
         oracle.verify(state, address_delta=delta, expected_topk=selected_expected, output_stride=stride)
+        high = reads.get("high_post_index", {})
+        if "moved" in high:
+            from kvip.diagnostics.high_index_profile import validate_move_counts, verify_permutation
+
+            verify_permutation(cpu_array(torch, bundle.forward.flags), cpu_array(torch, bundle.forward.events_src),
+                               cpu_array(torch, bundle.forward.events_dst), oracle.pre["logical_ids"],
+                               state["logical_ids"], oracle.owners)
+            validate_move_counts(high, oracle.pre["logical_ids"], state["logical_ids"], oracle.owners)
         if bundle.tuning.get("low_miss_read_through") and early_threshold_skipped(bundle.tuning):
             bundle.read_through_check = oracle.verify_frozen(state, address_delta=delta, output_stride=stride)
         reads.update(fused_demand(bundle, demand, state["logical_output"], reads))
@@ -520,7 +547,8 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
                         direct_index_markers=direct_index_markers,
                         compact_plan_markers=compact_plan_markers,
                         post_index_low=bool(getattr(bundle, "tuning", {}).get("low_miss_post_index")
-                                            and early_threshold_skipped(bundle.tuning)),
+                                            and (early_threshold_skipped(bundle.tuning)
+                                                 or getattr(bundle.forward, "high_post_index", False))),
                         tail_cores=(int(bundle.forward.post_index.shape[0])
                                     if getattr(bundle, "tuning", {}).get("low_miss_post_index") else None),
                     ),
@@ -710,6 +738,12 @@ def measure_case(args, archive, context, retained):
         case_retained["buffers"] = buffer_addresses(bundle)
         retained["buffers"] = case_retained["buffers"]
         retained["buffers_variant"] = retained["progress"].get("variant")
+        if getattr(args, "high_post_index", False):
+            feature = getattr(bundle.rotating.library, "kvip_high_post_index", None)
+            if not bundle.tuning.get("low_miss_post_index") or feature is None or feature() != 1:
+                raise ValueError("The loaded binary lacks full-AIV HIGH Index support")
+            bundle.forward.high_post_index = True
+            bundle.forward.set_options()
         if getattr(args, "post_index_wait_first", False):
             feature = getattr(bundle.rotating.library, "kvip_post_index_order_control", None)
             if not bundle.tuning.get("low_miss_post_index") or feature is None or feature() != 1:
@@ -826,6 +860,7 @@ def measure_case(args, archive, context, retained):
         ),
         graph_backend="torch.npu.NPUGraph" if args.mode == "serial" else "kvaf.AclGraph",
         post_index_wait_first=bool(getattr(args, "post_index_wait_first", False)),
+        high_post_index=bool(getattr(args, "high_post_index", False)),
         selection_comparison=bundle.selection_comparison,
         demand_accounting=DEMAND_ACCOUNTING,
         representation=(

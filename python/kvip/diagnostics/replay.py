@@ -63,6 +63,8 @@ def arguments(argv=None):
                    help="Untimed light-low replay: one captured graph, quotas 0/512/0, restore before each")
     p.add_argument("--check-auto-route", action="store_true",
                    help="Untimed device-feedback lifecycle checks on the auto variant")
+    p.add_argument("--high-post-index", action="store_true",
+                   help="Enable the full-AIV terminal Index on naturally selected eight-window HIGH steps")
     p.add_argument("--post-index-wait-first", action="store_true",
                    help="Offline same-binary control: drain CQ before the complete Index update")
     p.add_argument("--calibrate-counter", action="store_true",
@@ -126,10 +128,10 @@ def arguments(argv=None):
     ):
         p.error("Auto timeline requires only auto-post-index, --profile-metrics none, --check-auto-route, "
                 "at least two timed iterations and normal Post-Index-CQ order")
-    if args.post_index_wait_first and (
+    if (args.post_index_wait_first or args.high_post_index) and (
         args.study != "post-threshold" or args.pipeline_variants != ["auto-post-index"]
     ):
-        p.error("post-index-wait-first requires only the auto-post-index variant")
+        p.error("post-index-wait-first/high-post-index requires only the auto-post-index variant")
     if args.calibrate_counter and (args.mode != "fused" or not args.diagnostic_replays):
         p.error("calibrate-counter requires fused mode and separate diagnostic-replays")
     if args.study in ("threshold-only", "seed-ub", "local-victims", "register-kth", "overlap-victims") and (
