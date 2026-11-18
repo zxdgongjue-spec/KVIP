@@ -211,7 +211,9 @@ __aicore__ inline uint32_t Producer(__gm__ Args* a, uint32_t b) {
   // contiguous banks on the vector pipe. Their 8192 buckets can hold every
   // Q4 position, even when a predicted LOW round has no hits.
   PipeBarrier<PIPE_V>();
-  Duplicate(keys,UINT32_MAX,2*kSlots);
+  if(profile)ticks[2]=GetSystemCycle();
+  Duplicate(keys,UINT32_MAX,kSlots);
+  Duplicate(ranks,UINT32_MAX,kSlots);
  } else
 #endif
  {
