@@ -13,7 +13,7 @@ constexpr int64_t MIN_QUERIES_PER_REQUEST = 1;
 constexpr int64_t MAX_QUERIES_PER_REQUEST = 4;
 constexpr int64_t MTP_MISS_CAPACITY =
     SPARSE_COUNT * MAX_QUERIES_PER_REQUEST;
-constexpr int64_t MAX_SOURCE_CAPACITY = (1 << 18) + 32;
+constexpr int64_t MAX_SOURCE_CAPACITY = (1 << 20) + 20 * 128;
 constexpr int64_t MAX_CACHE_TOKENS = (1U << 17) + 20U * 128U;
 constexpr int64_t BITMAP_BLOCK_WORDS = 8;
 constexpr int64_t MISS_SLOT_BITMAP_WORDS =
