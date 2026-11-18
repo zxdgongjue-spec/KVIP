@@ -75,7 +75,7 @@ class LIFetchBinding:
             ("final_replicated", int(final_strategy == "replicated")),
             ("final_workers", final_aivs(batch, li_tiling, aic_count, final_workers)),
             ("aic_count", aic_count),
-            ("abi_version", 11),
+            ("abi_version", 12),
             (
                 "service_lanes",
                 li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)["service_aivs_per_window"],
@@ -119,9 +119,8 @@ class LIFetchBinding:
         for name, (shape, dtype_name) in spec.items():
             dtype = getattr(torch, dtype_name)
             if name == "mapping_journal" and scratch is not None and name not in scratch:
-                # Existing caller-owned scratch uses the full mapping reset.
-                self.mapping_journal = None
-                continue
+                # Keep the sparse snapshot journal paired with its shared mapping.
+                scratch[name] = torch.zeros(shape, dtype=dtype, device=self.device)
             value = torch.zeros(shape, dtype=dtype, device=self.device) if scratch is None else scratch[name]
             if (
                 value.device != self.device

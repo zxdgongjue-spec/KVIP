@@ -20,7 +20,8 @@ struct alignas(128) Args {
  uint64_t flags, eventsSrc, eventsDst, workerStatus, times;
  uint32_t history, resident, prefetchCount, maxEvents;
  uint64_t queryBitmaps, queryErrors, updateBindings, denseShadow, packedFetch;
- uint64_t completedFlags, liveCount, completedRows, completedEvents; // Optional URMA diagnostic snapshot; zero for standalone/legacy callers.
+ uint64_t completedFlags, liveCount, completedRows, completedEvents; // Completed snapshots, separate from live URMA state.
+ uint64_t completedMapping, completedJournal;
 };
 }
 

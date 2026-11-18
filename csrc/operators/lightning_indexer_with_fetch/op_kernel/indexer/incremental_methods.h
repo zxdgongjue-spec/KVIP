@@ -129,7 +129,7 @@ uint32_t incrementalNextQuery_=0,incrementalNextIndex_=0,incrementalNextEnd0_=0,
 bool incrementalHasNext_=false;
 __aicore__ inline __gm__ uint64_t* IncrementalMeta(uint32_t query) {
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
-    return reinterpret_cast<__gm__ uint64_t*>(ctx->incremental)+query*16;
+    return reinterpret_cast<__gm__ uint64_t*>(rotating::TopKHeader(ctx))+query*16;
 }
 __aicore__ inline void SeedIncremental(uint32_t query,uint32_t row) {
     auto meta=IncrementalMeta(query);
@@ -499,7 +499,7 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
         DataCopy(incrementalOld_[256+i*16],rowsSource[b*256],16);
     }
     GlobalTensor<uint64_t> metadata;
-    metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(ctx->incremental));
+    metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(rotating::TopKHeader(ctx)));
     if(incrementalMetadataActive_) {
         for(uint32_t b=lane,i=0;b<runtimeShape_.batch;b+=runtimeShape_.serviceLanes,i+=64)
             DataCopy(incrementalMetadata_[i],metadata[b*64],64);

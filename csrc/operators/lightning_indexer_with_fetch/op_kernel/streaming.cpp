@@ -128,6 +128,10 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  if(!inputError){auto errors=reinterpret_cast<__gm__ uint32_t*>(a->queryErrors)+(b*4)*32;
   for(uint32_t q=0;q<4;++q){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+q*32),128);inputError|=errors[q*32];}}
  if(inputError){auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*32;status[0]=inputError;status[1]=0;
+  if(ctx->changeCount){
+   auto count=reinterpret_cast<__gm__ uint32_t*>(ctx->changeCount)+b;
+   count[0]=kLruSlots;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(count),4);
+  }
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),128);
   for(uint32_t q=0;q<kFlagCount;++q){if(q==6 || (q>=7 && q<12))continue;flags[q].count=0;flags[q].error=inputError;flags[q].ready=1;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+q),kBatchFlagPayloadBytes);}
   return;}
@@ -636,6 +640,41 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
 
 #endif
 #if defined(__CCE_AICORE__) && !V9_UBMEM
+// Producer has consumed Q4. Fetch and Index update use the published descriptors.
+__simt_vf__ __aicore__ LAUNCH_BOUND(128)
+inline void RetireSelection(__gm__ Args* a,uint32_t batch,uint32_t b){
+  uint32_t t=threadIdx.x;
+  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);
+  auto header=reinterpret_cast<__gm__ uint32_t*>(ctx->rows+uint64_t(batch)*sizeof(Row))+b*128+t;
+  asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->incremental)+b*128+t,asc_ldcg(header));
+  asc_stcg(header,0U);
+  auto journal=reinterpret_cast<__gm__ MappingJournal*>(ctx->mappingJournal)+b;
+  auto previous=reinterpret_cast<__gm__ MappingJournal*>(a->completedJournal)+b;
+  uint32_t history=a->history;
+  auto live=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+uint64_t(b)*history;
+  auto published=reinterpret_cast<__gm__ uint32_t*>(a->completedMapping)+uint64_t(b)*history;
+  uint32_t oldCount=asc_ldcg(&previous->count),count=asc_ldcg(&journal->count);
+  uint32_t first=asc_ldcg(&previous->tailBegin),end=asc_ldcg(&previous->tailEnd);
+  for(uint32_t i=t;i<oldCount;i+=128){
+   uint32_t token=asc_ldcg(previous->tokens+i);
+   if(token<history)asc_stcg(published+token,UINT32_MAX);
+  }
+  for(uint32_t i=first+t;i<end;i+=128)asc_stcg(published+i,UINT32_MAX);
+  // Old and new snapshots may contain the same token. Only this request's AIV participates.
+  asc_threadfence();asc_syncthreads();
+  for(uint32_t i=t;i<count;i+=128){
+   uint32_t token=asc_ldcg(journal->tokens+i);
+   if(token>=history)continue;
+   asc_stcg(published+token,asc_ldcg(live+token));
+   asc_stcg(previous->tokens+i,token);
+   asc_stcg(live+token,UINT32_MAX);
+  }
+  if(!t){
+   asc_stcg(&journal->count,0U);asc_stcg(&previous->count,count);
+   asc_stcg(&previous->tailBegin,0U);asc_stcg(&previous->tailEnd,0U);
+  }
+  asc_threadfence();
+}
 __simt_vf__ __aicore__ LAUNCH_BOUND(128)
 inline void RetireRoundControl(__gm__ Args* a,uint32_t batch,uint32_t workers,uint32_t block){
  uint32_t t=threadIdx.x;
@@ -689,7 +728,14 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
   auto trace=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*256+uint64_t(block)*32;
   if(profile)trace[0]=GetSystemCycle();
   if(block<shape.batch*kResolveCores){uint32_t b=block/kResolveCores,role=block%kResolveCores;
-   if(role==0){Producer(a,b);FinalizeStreaming(a,b);}else if(role==1)Consumer(a,b);
+   if(role==0){
+    Producer(a,b);
+#if !V9_UBMEM
+    if(a->completedMapping)
+     Simt::VF_CALL<RetireSelection>(Simt::Dim3{128,1,1},a,shape.batch,b);
+#endif
+    FinalizeStreaming(a,b);
+   }else if(role==1)Consumer(a,b);
    else OutputWorker(a,b);
 #if !V9_UBMEM
    if(role==kResolveCores-1){

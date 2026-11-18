@@ -528,7 +528,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         V9_FETCH_PROFILE(scanBegin=GetSystemCycle();)
         // Counts occupy spare incremental metadata, exported alongside TopK.
         GlobalTensor<uint32_t> metadata,compact;
-        metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->incremental)+b*128);
+        metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(rotating::TopKHeader(ctx))+b*128);
         compact.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*8192);
         DataCopy(cfg[128],metadata,128);
         SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);

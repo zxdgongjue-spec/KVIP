@@ -58,6 +58,10 @@ struct Context {
 
 };
 #if defined(__CCE_AICORE__)
+// Fused requests keep live TopK headers immediately after their private rows.
+__aicore__ inline uint64_t TopKHeader(__gm__ Context* ctx){
+    return ctx->rowAddressBase ? ctx->rows+uint64_t(ctx->shape.batch)*sizeof(Row) : ctx->incremental;
+}
 __aicore__ inline uint64_t RequestAddressTable(__gm__ Context* ctx,uint32_t b,uint32_t owner,uint32_t history){
     return ctx->tokenAddresses ? ctx->tokenAddresses+uint64_t(owner)*ctx->addressStride*8 :
         ctx->rowAddressBase+uint64_t(b)*(uint64_t(history)*8+8192*64+512);

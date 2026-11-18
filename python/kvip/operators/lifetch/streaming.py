@@ -54,11 +54,13 @@ class StreamingLIFetchForward:
         # tensors across groups, retaining a distinct immutable Args per group.
         pool = getattr(rotating, "streaming_scratch", {})
 
-        def allocate(name, shape, dtype, zero=False):
+        def allocate(name, shape, dtype, zero=False, *, fill=None):
             key = (name, tuple(shape), dtype, str(device))
             if key not in pool:
                 factory = torch.zeros if zero else torch.empty
                 pool[key] = factory(shape, dtype=dtype, device=device)
+                if fill is not None:
+                    pool[key].fill_(fill)
             return pool[key]
 
         self.flags = allocate("flags", (b, flag_count, 32), torch.int32, True)
@@ -75,18 +77,25 @@ class StreamingLIFetchForward:
         self._live_flags = self.flags
         self._context = rotating.context
         completed_flags = live_count = completed_rows = completed_events = 0
+        completed_mapping = completed_journal = 0
         if not hasattr(rotating, "lease"):  # URMA retires live publication state at kernel exit.
             self._live_flags = allocate("live_flags", (b, flag_count, 32), torch.int32, True)
             completed_flags = self.flags.data_ptr()
             self._live_count = allocate("live_count", (32,), torch.int32, True)
             live_count = self._live_count.data_ptr()
-            self._live_rows = allocate("live_rows", rotating.rows.shape, rotating.rows.dtype, True)
+            self._live_rows = allocate("live_rows", (rotating.rows.numel() * rotating.rows.element_size() + b * 512,), torch.uint8, True)
             completed_rows = rotating.rows.data_ptr()
             self._context = rotating.context.clone()
             context_words = self._context.view(torch.int64)
             self._live_events = allocate("live_events", rotating.events.shape, rotating.events.dtype, True)
             completed_events = rotating.events.data_ptr()
             context_words[1] = self._live_rows.data_ptr()
+            self._live_mapping = allocate("live_mapping", rotating.mapping.shape, rotating.mapping.dtype, fill=-1)
+            self._live_journal = allocate("live_journal", rotating.mapping_journal.shape, rotating.mapping_journal.dtype, True)
+            completed_mapping = rotating.mapping.data_ptr()
+            completed_journal = rotating.mapping_journal.data_ptr()
+            context_words[2] = self._live_mapping.data_ptr()
+            context_words[-2] = self._live_journal.data_ptr()
             context_words[4] = self._live_events.data_ptr()
             context_words[-1] = rotating.arguments[13].data_ptr() + b * (4 * 2048 * 6 + 1024 + 8 * self.history)
             groups = 4 * q_workers
@@ -119,8 +128,8 @@ class StreamingLIFetchForward:
         blob = np.concatenate(
             (
                 blob,
-                np.asarray([self.dense_shadow.data_ptr(), self.packed_fetch.data_ptr(), completed_flags, live_count, completed_rows, completed_events], dtype="<u8").view("u1"),
-                np.zeros(80, dtype="u1"),
+                np.asarray([self.dense_shadow.data_ptr(), self.packed_fetch.data_ptr(), completed_flags, live_count, completed_rows, completed_events, completed_mapping, completed_journal], dtype="<u8").view("u1"),
+                np.zeros(64, dtype="u1"),
             )
         )
         if len(blob) != 256:

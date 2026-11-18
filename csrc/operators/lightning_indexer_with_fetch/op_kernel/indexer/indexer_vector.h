@@ -292,7 +292,7 @@ private:
         }
 #if !V9_UBMEM
         // Private incremental TopK state, shared by all prefetch windows.
-        auto windowMeta=reinterpret_cast<__gm__ uint64_t*>(context->incremental)+query*16;
+        auto windowMeta=reinterpret_cast<__gm__ uint64_t*>(rotating::TopKHeader(context))+query*16;
         windowMeta[0]=reinterpret_cast<uint64_t>(scoreGm.GetPhyAddr())+uint64_t(scoreRow)*runtimeShape_.history*2;
         windowMeta[1]=uint64_t(runtimeShape_.resident)|(uint64_t(runtimeShape_.resident)<<32);windowMeta[2]=0;windowMeta[3]=0;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(windowMeta),128);
