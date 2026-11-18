@@ -33,7 +33,7 @@ def event_work(flags, sources, destinations, *, history):
     return dict(event_sha256=digest.hexdigest(), event_count=int(counts.sum()))
 
 
-def verify_permutation(flags, sources, destinations, before, after, owners, *, resident=None, invalidations=None):
+def verify_permutation(flags, sources, destinations, before, after, owners, *, resident=None, invalidations=None, invalidated_slots=None):
     """Replay each simultaneous 512-element assignment plus its displaced-row closure."""
     history = before.shape[1]
     two_cycle_moves = []
@@ -42,6 +42,7 @@ def verify_permutation(flags, sources, destinations, before, after, owners, *, r
         location = at.copy()
         offset = 0
         cleared = 0
+        invalid_slots = set()
         for phase, count in enumerate(flags[row, [0,12,13,14,15], 1]):
             if phase == 1:
                 offset = 2048
@@ -55,6 +56,8 @@ def verify_permutation(flags, sources, destinations, before, after, owners, *, r
                 freed = src[~np.isin(src, dst)]
                 if invalidations is not None:
                     cleared += int(np.count_nonzero(freed < resident))
+                if invalidated_slots is not None:
+                    invalid_slots.update(map(int, freed[freed < resident]))
                 source = np.concatenate((src, evicted))
                 target = np.concatenate((dst, freed))
                 original = at[source]
@@ -69,6 +72,8 @@ def verify_permutation(flags, sources, destinations, before, after, owners, *, r
         two_cycle_moves.append(int(np.count_nonzero(at[at[dirty]] == dirty)))
         if invalidations is not None:
             invalidations.append(cleared)
+        if invalidated_slots is not None:
+            invalidated_slots.append(sorted(invalid_slots))
     return two_cycle_moves
 
 

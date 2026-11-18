@@ -62,3 +62,27 @@ def test_choices_require_positive_build_evidence_and_planner_ownership():
     marks[:,23] = MAGIC
     with pytest.raises(ValueError, match="Invalid"):
         decode_choices(marks, expected=True)
+
+
+def test_touched_plan_cpu_records_cap_and_first_interference():
+    from kvip.diagnostics.high_index_cold_plan import TOUCHED_MAGIC, touched_choice
+
+    src = np.arange(10000, 20240)
+    dst = np.arange(10240)
+    assert touched_choice(src, dst, [4, 4, 0, 0, 0], 8192, 32768) == (1, 8)
+    dst[2049] = 2  # A second destination in another phase switches to the touched dictionary.
+    assert touched_choice(src, dst, [4, 4, 4, 8, 2], 8192, 32768) == (3, 8)
+    assert touched_choice(src, dst, [0, 2048, 2048, 0, 0], 8192, 32768) == (2, 3072)
+    dst[2049] = dst[2048]
+    # Once a conflict is found, later phases still count against the cap.
+    assert touched_choice(src, dst, [0, 2048, 2048, 0, 0], 8192, 32768) == (2, 512)
+    assert touched_choice(src, dst, [0]*5, 8192, 210945) == (2, 0)
+    marks = np.zeros((64,32), np.uint64)
+    marks[32:48,23:25] = [TOUCHED_MAGIC,3]
+    marks[32:48,26] = marks[32:48,21] = 11
+    assert decode_choices(marks, "HT31")["marker"] == "HT31"
+    with pytest.raises(ValueError,match="Invalid"):
+        decode_choices(marks, "CP21")
+    marks[33,26] -= np.uint64(1)
+    with pytest.raises(ValueError,match="active"):
+        decode_choices(marks, "HT31")

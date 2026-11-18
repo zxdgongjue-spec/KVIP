@@ -591,6 +591,14 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
             phase(retained, "counter_calibration")
             result["native_diagnostics"]["counter_calibration"] = calibrate_counter(
                 torch, library, bundle.rotating.device, stream)
+        if library_path := getattr(args, "frozen_high_tail_library", None):
+            from kvip.diagnostics.frozen_high_tail import measure_frozen
+
+            phase(retained, "frozen_high_tail")
+            result["frozen_high_tail"] = measure_frozen(
+                torch, stream, bundle, library_path, args.upstream_revision,
+                diagnostic_samples[-1]["reads"]["high_post_index"],
+                result["native_diagnostics"]["counter_calibration"]["cycles_per_us"])
     last_step = args.iterations + diagnostic_count
     if getattr(args, "profile_dir", None) is not None:
         from kvip.diagnostics.system_profile import collect_system_profiles
@@ -776,7 +784,8 @@ def measure_case(args, archive, context, retained):
         retained["buffers_variant"] = retained["progress"].get("variant")
         if getattr(args, "high_post_index", False):
             production = Path(args.upstream_root) / "csrc/operators/lightning_indexer_with_fetch/op_kernel"
-            bundle.cold_plan_expected = (production / "high_index_cold_plan.h").is_file()
+            bundle.cold_plan_expected = ("HT31" if (production / "high_index_touched_plan.h").is_file() else
+                                         "CP21" if (production / "high_index_cold_plan.h").is_file() else False)
             feature = getattr(bundle.rotating.library, "kvip_high_post_index", None)
             if not bundle.tuning.get("low_miss_post_index") or feature is None or feature() != 1:
                 raise ValueError("The loaded binary lacks full-AIV HIGH Index support")

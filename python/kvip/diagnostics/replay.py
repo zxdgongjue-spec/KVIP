@@ -65,6 +65,8 @@ def arguments(argv=None):
                    help="Untimed device-feedback lifecycle checks on the auto variant")
     p.add_argument("--high-post-index", action="store_true",
                    help="Enable the full-AIV terminal Index on naturally selected eight-window HIGH steps")
+    p.add_argument("--frozen-high-tail-library", type=Path,
+                   help="Run three orders on one frozen descriptor stream with the same live URMA queues")
     p.add_argument("--post-index-wait-first", action="store_true",
                    help="Offline same-binary control: drain CQ before the complete Index update")
     p.add_argument("--calibrate-counter", action="store_true",
@@ -136,6 +138,9 @@ def arguments(argv=None):
         args.study != "post-threshold" or args.pipeline_variants != ["auto-post-index"]
     ):
         p.error("post-index-wait-first/high-post-index requires only the auto-post-index variant")
+    if args.frozen_high_tail_library and (not args.high_post_index or args.post_index_wait_first
+                                          or not args.diagnostic_replays or not args.calibrate_counter):
+        p.error("frozen-high-tail-library requires high-post-index, calibration and diagnostic replays in normal order")
     if args.calibrate_counter and (args.mode != "fused" or not args.diagnostic_replays):
         p.error("calibrate-counter requires fused mode and separate diagnostic-replays")
     if args.study in ("threshold-only", "seed-ub", "local-victims", "register-kth", "overlap-victims") and (
