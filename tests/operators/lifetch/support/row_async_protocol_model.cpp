@@ -16,6 +16,7 @@
 #define LAUNCH_BOUND(n)
 thread_local struct { unsigned x; } threadIdx;
 thread_local unsigned lane;
+thread_local bool appliedThisLane=false;
 uint64_t GetSystemCycle() { return std::chrono::steady_clock::now().time_since_epoch().count(); }
 template<class T> T asc_ldcg(T* p) { return *p; }
 void asc_syncthreads() {}
@@ -61,7 +62,7 @@ uint32_t Post(QueueArgs&,unsigned first,unsigned n,State& s){auto& q=sim->q[lane
     assert(n+first<=sim->input.n[lane]);assert(first+n<=sim->input.safe[lane] || !sim->input.pending || sim->prefetch.load());
     for(unsigned i=first;i<first+n;++i)q.positions.push_back(i);
     s.seq=++q.issued;s.count=n;assert(q.issued-q.drained<sim->e.cq_depth);return 0;}
-uint32_t Wait(State& s){if(!s.seq)return 0;auto& q=sim->q[lane];assert(++q.drained==s.seq);
+uint32_t Wait(State& s){if(!s.seq)return 0;auto& q=sim->q[lane];assert(appliedThisLane);assert(++q.drained==s.seq);
     if(int(lane)==sim->input.badWait && s.seq==1)return 1;
     s.completed=s.count;return 0;}
 uint32_t GetBlocking(QueueArgs& args,unsigned begin,unsigned count,State& s){if(int(lane)==sim->input.badBlock)return 1;
@@ -70,7 +71,7 @@ uint32_t GetBlocking(QueueArgs& args,unsigned begin,unsigned count,State& s){if(
 template<class T> uint64_t ApplyRowIndex(Args*,Context*,unsigned,unsigned,unsigned q,unsigned lanes,unsigned pairs,
         unsigned singles,unsigned invalidations,uint64_t,uint64_t*,bool,T& team){
     assert(q==lane && lanes==4 && pairs==3 && singles==7 && invalidations==1);
-    sim->applied.fetch_add(1);return team.Gathered();}
+    appliedThisLane=true;sim->applied.fetch_add(1);return team.Gathered();}
 void PublishStreamingUpdateStatus(uint32_t* p,unsigned,unsigned err){if(!threadIdx.x)*p=err;}
 void PublishStreamingResidency(uint32_t,unsigned,Context*,unsigned){if(!threadIdx.x)sim->published.fetch_add(1);}
 template<bool,bool> void FinalizeStreaming(Args*,unsigned,unsigned useful){assert(useful==5 && lane==0);sim->finalized.fetch_add(1);}
@@ -100,7 +101,17 @@ void run(Input in){World world{in};sim=&world;world.e.cq_depth=in.cqDepth;
             assert(queue.issued==(in.n[q]==0 ? 0u : (in.pending && in.safe[q] && in.safe[q]<in.n[q] && in.cqDepth>2 && int(q)!=in.blocking ? 2u:1u)));}
         totalCompleted+=records[q*16].completed;assert(bool(c.post[q].error)==failed);}
     assert(c.post[0].pending==totalCompleted);
-    if(!failed)assert(world.applied==4);
+    if(!failed){
+        assert(world.applied==4);
+        for(unsigned q=0;q<4;++q){
+            auto& rec=records[q*16];
+            auto* mark=ticks.data()+16*256+q*16*32;
+            assert(rec.indexDone>=mark[3] && rec.cqDone>=rec.indexDone);
+            assert(mark[8]==world.q[q].issued && bool(rec.postBegin)==bool(in.n[q]));
+            if(mark[8])assert(rec.postBegin<=mark[4] && mark[4]<=rec.postDone);
+            if(mark[8]==2)assert(rec.postBegin<mark[3] && mark[4]>=rec.indexDone);
+        }
+    }
     if(in.badPlan||in.badDescriptor>=0||in.badPreflight>=0||in.badTotal)assert(world.applied==0);
     if(in.badBlock>=0 || in.badDrain || in.badWait>=0)assert(world.applied==4);
     if(in.badDrain){assert(world.q[0].issued==1 && world.q[0].positions.size()==in.safe[0]);}
