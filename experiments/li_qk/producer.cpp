@@ -1,6 +1,11 @@
 // New entrypoint only: existing li_score target/default path is unchanged.
 #define LI_PRODUCER_CONTROLS 1
+// Keep the baseline linked to the unmodified li_score library entrypoints.
+#define li_qk_score li_producer_unused_score
+#define li_qk_score_balanced li_producer_unused_balanced
 #include "score.cpp"
+#undef li_qk_score
+#undef li_qk_score_balanced
 extern "C" __global__ __aicore__ void li_qk_score_producer(
     GM_ADDR bindings,GM_ADDR output,uint32_t rows,uint32_t stride,uint32_t heads,uint32_t group) {
 #if defined(__CCE_AICORE__)

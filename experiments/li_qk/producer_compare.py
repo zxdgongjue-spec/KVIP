@@ -4,7 +4,7 @@ import argparse,csv,json,os,random,shlex,statistics,subprocess,gzip,shutil,re
 from pathlib import Path
 from run import HERE,ROOT,prepare,make_fixture,sha
 from cases import lease
-CASES=('split_scatter','direct')
+CASES=('split_scatter','direct','high_fused')
 def build(a):
  a.output.mkdir(parents=True,exist_ok=False);source=prepare(a.output/'source')
  before={str(p.relative_to(ROOT)):sha(p) for p in HERE.iterdir() if p.suffix in ('.cpp','.h','.txt','.py')}
