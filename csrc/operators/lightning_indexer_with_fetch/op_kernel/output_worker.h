@@ -19,6 +19,55 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PackPublicationEvents(
  asc_syncthreads();
  PackStagedUrmaQuery(history,resident,bytes,b,q,used,0,count,ctx,tokens,ids,slots,ctl,direct,stride);
 }
+#if KVIP_LOW_MISS_POST_INDEX && KVIP_READY_BATCH_FETCH && !V9_UBMEM
+// One exclusive publisher owns these four ranges. Keep the parallel consumer
+// checks, but read each raw token, slot and hazard ordinal only once when packing.
+__simt_vf__ __aicore__ LAUNCH_BOUND(512)
+inline void PackRowEvents(StagedContextPointer ctx,uint32_t history,uint32_t resident,
+        uint32_t bytes,uint32_t b,uint32_t q,uint32_t used,uint32_t begin,uint32_t count,
+        __gm__ uint32_t* src,__gm__ uint32_t* dst,__ubuf__ uint32_t* tokens,
+        __ubuf__ uint32_t* slots,__ubuf__ uint32_t* ctl) {
+    const uint32_t tid=threadIdx.x, per=(count+511)/512, first=tid*per;
+    const uint32_t end=first+per<count ? first+per : count;
+    static_assert(kTop<=512*32,"one conflict bit per lane item");
+    auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
+    auto addresses=reinterpret_cast<__gm__ uint64_t*>(row->addresses);
+    auto reserved=reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+uint64_t(b)*resident;
+    auto blocks=reinterpret_cast<__gm__ int32_t*>(ctx->sourceBlocks);
+    auto offsets=reinterpret_cast<__gm__ int32_t*>(ctx->sourceOffsets);
+    auto outSlots=reinterpret_cast<__gm__ int32_t*>(ctx->destinations);
+    const uint32_t ownerBase=OwnerRow(ctx,b)*OutputStride(resident,ctx);
+    uint32_t conflicts=0,localSafe=0;
+    for(uint32_t i=first;i<end;++i) {
+        tokens[i]=asc_ldcg(src+begin+i);
+        uint32_t slot=asc_ldcg(dst+begin+i);
+        slots[i]=slot;
+        if(slot>=resident){asc_atomic_or(ctl+1,4U);continue;}
+        int32_t ordinal=asc_ldcg(reserved+slot);
+        bool conflict=ordinal>=0 && uint32_t(ordinal)<used;
+        conflicts|=uint32_t(conflict)<<(i-first);
+        localSafe+=!conflict;
+    }
+    uint32_t nextSafe=StagedPrefix(localSafe,ctl);
+    const uint32_t safe=ctl[544+512/warpSize-1];
+    uint32_t nextConflict=safe+first-nextSafe;
+    for(uint32_t i=first;i<end;++i) {
+        uint32_t slot=slots[i],token=tokens[i];
+        if(slot>=resident) continue;
+        if(token>=history){asc_atomic_or(ctl+1,1U);continue;}
+        const uint32_t pos=b*kSlots+q*kTop+
+            ((conflicts>>(i-first))&1U ? nextConflict++ : nextSafe++);
+        StoreFallbackSource(history,bytes,ctx,b,pos,token,asc_ldcg(addresses+token),blocks,offsets);
+        asc_stcg(outSlots+pos,int32_t(ownerBase+slot));
+    }
+    asc_syncthreads();
+    if(!tid) {
+        ctl[16]=count;ctl[17]=safe;
+        if(!ctl[1])asc_atomic_add(reinterpret_cast<__gm__ uint32_t*>(ctx->count),count);
+    }
+    asc_threadfence();asc_syncthreads();
+}
+#endif
 __aicore__ inline uint32_t AwaitPublication(__gm__ BatchFlag* flag){
  uint64_t start=GetSystemCycle();
  while(true){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flag),sizeof(BatchFlag));
@@ -106,8 +155,20 @@ __aicore__ inline uint32_t OutputWorker(__gm__ Args* a,uint32_t b){
     // reservation in this whole-shard layout is not a publication boundary.
     direct=nullptr;
 #endif
+#if KVIP_LOW_MISS_POST_INDEX && KVIP_READY_BATCH_FETCH && !V9_UBMEM
+    if constexpr(Role==OutputRole::Descriptors) {
+     if(!count){ctl.SetValue(16,0);ctl.SetValue(17,0);}
+     else {
+      Simt::VF_CALL<PackRowEvents>(Simt::Dim3{512,1,1},staged,shape.history,shape.resident,shape.tokenBytes,
+          b,q,row->slots,kPrefetch+total,count,source,dest,FinalPtr(tokens),FinalPtr(slots),FinalPtr(ctl));
+      SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);error=ctl.GetValue(1);
+     }
+    } else
+#endif
+    {
     Simt::VF_CALL<PackPublicationEvents>(Simt::Dim3{512,1,1},staged,shape.history,shape.resident,shape.tokenBytes,b,q,row->slots,kPrefetch+total,count,source,dest,FinalPtr(tokens),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(ctl),(a->prefetchCount&0x20000000U)?nullptr:direct,stride);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);error=ctl.GetValue(1);
+    }
     if(profile)ticks[7+q*6]=GetSystemCycle();
     if(!error){
      if(!kEarlyFetchReady)PublishQueryOutputs(u,shape.batch,b,q,selected,loc,work);
