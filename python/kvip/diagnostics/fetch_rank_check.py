@@ -29,6 +29,38 @@ def oracle_row(scores, ends, bounds, resident):
     return table
 
 
+class RankMismatch(ValueError):
+    def __init__(self, row, query, epoch, actual, expected, cutoff, expected_ids):
+        self.where = (row, query, epoch)
+        kth, strict = map(int, actual[:2])
+        ids = actual[32:32+TOP]
+        missing = np.setdiff1d(expected_ids, ids)
+        extra = np.setdiff1d(ids, expected_ids)
+        super().__init__(f"rank row={row} q={query} epoch={epoch} "
+                         f"kth={kth}/{cutoff} strict={strict}/{expected} "
+                         f"missing={len(missing)}:{missing[:6].tolist()} "
+                         f"extra={len(extra)}:{extra[:6].tolist()}")
+
+
+def bitmap_evidence(words, row_scores, ends, bounds, resident, query, epoch, cutoff):
+    """Compare completed producer bits with the scores in physical Index order."""
+    if epoch == 0:
+        return "seed"
+    history = row_scores.shape[-1]
+    physical = scan_windows(history, resident, ends, True)[epoch-1]
+    logical = scan_windows(history, resident, ends, False)[epoch-1]
+    valid = ((physical < ends[query]) &
+             ((physical < bounds[0]) | (physical >= bounds[1])))
+    wanted = (row_scores[query, physical] > cutoff) & valid
+    stored = ((words[logical//16] >> ((logical % 16)*2)) & 1).astype(bool)
+    wanted_tiles = wanted.reshape(-1, 128).any(axis=1)
+    stored_tiles = (words.reshape(-1, 8)[logical[::128]//128] != 0).any(axis=1)
+    lost = wanted_tiles & ~stored_tiles
+    return (f"completed_bitmap missing_bits={np.count_nonzero(wanted & ~stored)} "
+            f"missing_nonempty_tiles={np.count_nonzero(lost)} "
+            f"first_physical_tiles={(physical[::128][lost][:6]//128).tolist()}")
+
+
 def check_state(ranks, all_versions, posts, tables, eligible, *, fixed):
     digest = hashlib.sha256()
     sent_digest = hashlib.sha256()
@@ -45,13 +77,14 @@ def check_state(ranks, all_versions, posts, tables, eligible, *, fixed):
                 r = ranks[row, q, epoch]
                 kth, strict = map(int, r[:2])
                 scores, ids, cutoff = table[q][epoch]
-                if kth != cutoff or strict != int(np.sum(scores > cutoff)):
-                    raise ValueError(f"Kth/count mismatch row={row} q={q} epoch={epoch}: {kth}/{strict}")
+                expected = int(np.count_nonzero(scores > cutoff))
+                if (kth, strict) != (cutoff, expected):
+                    raise RankMismatch(row, q, epoch, r, expected, cutoff, ids)
                 positions = np.r_[np.arange(strict), np.arange(TOP-1, strict-1, -1)]
                 observed_ids = r[32:32+TOP][positions]
                 observed_scores = r[32+TOP:].view('<u2')[positions]
                 if not np.array_equal(observed_ids, ids) or not np.array_equal(observed_scores, scores):
-                    raise ValueError(f"Ordered score/ID mismatch row={row} q={q} epoch={epoch}")
+                    raise RankMismatch(row, q, epoch, r, expected, cutoff, ids)
                 digest.update(observed_ids.astype('<u4').tobytes())
                 digest.update(observed_scores.astype('<u2').tobytes())
                 ranks_checked += 1
@@ -180,7 +213,23 @@ def inspect_replay(torch, stream, rot, archive):
     # Compare the actual WQEs with the independent oracle. The version rides
     # in the normal row flush so timing never waits for an extra admission dump.
     versions = cpu_array(torch, rot.rows)[:, 80:116:4]
-    result['live'] = check_state(cpu_array(torch, rot.fetch_ranks), versions, posts, tables, eligible, fixed=False)
+    # The fixture overwrites the rank bank. Check the live result first and
+    # retain its failure while checking the SAME device-produced inputs at rest.
+    def evidence(exc):
+        if not isinstance(exc, RankMismatch) or not rot.library.kvip_fetch_bitmap():
+            return str(exc)
+        b, q, epoch = exc.where
+        history = g['history']
+        offset = len(tables)*(4*TOP*6+1024) + (b*4+q)*(history//4)
+        words = cpu_array(torch, rot.arguments[13].view(torch.uint8).reshape(-1)[
+            offset:offset+history//4]).view('<u4')
+        return f"{exc} {bitmap_evidence(words, scores[b], ends[b], bounds[b], g['resident'], q, epoch, tables[b][q][0][2])}"
+
+    live_error = None
+    try:
+        result['live'] = check_state(cpu_array(torch, rot.fetch_ranks), versions, posts, tables, eligible, fixed=False)
+    except ValueError as exc:
+        live_error = evidence(exc)
     frozen = torch.from_numpy(np.where(eligible, -1, 0).astype('<i4')).to(rot.device)
     stream.synchronize()
     ptr = ctypes.c_void_p
@@ -191,6 +240,11 @@ def inspect_replay(torch, stream, rot, archive):
     if np.any(audit[:, :, 1] > 64) or np.any(audit[:, :, 1] < 0):
         raise ValueError("Fixture exceeded the window budget")
     lists = [[a[32:32+int(a[1])].tolist() for a in row] for row in audit]
-    fixed = check_state(cpu_array(torch, rot.fetch_ranks), audit[:, :, 0], lists, tables, eligible, fixed=True)
+    try:
+        fixed = check_state(cpu_array(torch, rot.fetch_ranks), audit[:, :, 0], lists, tables, eligible, fixed=True)
+    except ValueError as exc:
+        raise ValueError(f"live={live_error or 'PASS'}; frozen={evidence(exc)}") from exc
+    if live_error:
+        raise ValueError(f"live={live_error}; frozen=PASS ({fixed['ranks']} ranks, {fixed['lists']} lists)")
     result['fixed'] = {k: fixed[k] for k in ('ranks', 'lists', 'prefix_sha', 'post_sha')}
     return result

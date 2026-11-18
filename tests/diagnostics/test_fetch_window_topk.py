@@ -38,3 +38,21 @@ def test_common_version_and_post_budget():
     assert request.advance() is None
     snapshots = [[[i, q + 8] for q in range(4)] for i in range(9)]
     check_staggered(snapshots, snapshots, 2, 6)
+
+
+def test_bitmap_evidence_maps_reverse_logical_tiles_to_physical_scores():
+    from kvip.diagnostics.fetch_rank_check import bitmap_evidence
+    from kvip.diagnostics.incremental_topk import scan_windows
+
+    resident, history = 2048, 20480
+    ends = np.full(4, history)
+    scores = np.zeros((4, history), dtype=np.uint16)
+    logical = scan_windows(history, resident, ends, False)[0]
+    physical = scan_windows(history, resident, ends, True)[0]
+    words = np.zeros(history // 16, dtype=np.uint32)
+    scores[0, physical[[1, 18, 128]]] = 99
+    # One wrong bit in a retained tile and one entire missing tile.
+    words[logical[1] // 16] = 1 << (2 * (logical[1] % 16))
+    msg = bitmap_evidence(words, scores, ends, (0, 0), resident, 0, 1, 98)
+    assert "missing_bits=2 missing_nonempty_tiles=1" in msg
+    assert f"first_physical_tiles={[int(physical[128]) // 128]}" in msg

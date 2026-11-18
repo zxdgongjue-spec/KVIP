@@ -15,11 +15,13 @@ cpu="$work/KVAF/build-cpu/runtime/kvaf_cpu_service"
 native_sha=6de229cab2b877fea055cb3411d5161cc764ec81
 branch=perf/urma-list-segments
 study=${1:-segments}
+compare_prior=1
+if [[ "$study" == fetch && "${2:-}" == recheck ]]; then compare_prior=0; fi
 groups=(2 7 10 17 4)
 case "$study" in
     fetch)
         branch=perf/urma-fetch-rank-ab
-        native_sha=e435e34a448039b94f65c0404665b94f5af4ee63
+        native_sha=051e5d0bb483ebff0aeb7010c60aeae0555334a5
         groups=(7 2)
         ;;
     budget)
@@ -59,11 +61,15 @@ fi
 if [[ "$study" == fetch ]]; then
     prior_sha=d5ad16037db5aa108ad634b0b0465ef3dd62f7bd
     prior="$work/fused-scan-sources/native-$prior_sha"
-    if [[ ! -d "$prior" ]]; then
-        git -C "$native" worktree add -q --detach "$prior" "$prior_sha"
+    checkouts=("$native")
+    if ((compare_prior)); then
+        if [[ ! -d "$prior" ]]; then
+            git -C "$native" worktree add -q --detach "$prior" "$prior_sha"
+        fi
+        [[ $(git -C "$prior" rev-parse HEAD) == "$prior_sha" ]] || { echo "SOURCE_MISMATCH $prior" >&2; exit 1; }
+        checkouts+=("$prior")
     fi
-    [[ $(git -C "$prior" rev-parse HEAD) == "$prior_sha" ]] || { echo "SOURCE_MISMATCH $prior" >&2; exit 1; }
-    for checkout in "$native" "$prior"; do
+    for checkout in "${checkouts[@]}"; do
         if ! git -C "$checkout" diff --quiet HEAD -- csrc python; then
             echo "MODIFIED_NATIVE_SOURCE $checkout" >&2; exit 1
         fi
@@ -160,6 +166,10 @@ run_case() {
     if [[ "$study" == fetch ]]; then
         selected=(forward reverse reverse-fetch-bitmap reverse-fetch-dense)
         if [[ "$phase" == check ]]; then
+            selected=(reverse-fetch-bitmap reverse-fetch-dense forward reverse)
+            warm=1; iterations=1; diagnostic=1
+        elif [[ "$phase" == dense-check ]]; then
+            selected=(reverse-fetch-dense)
             warm=1; iterations=1; diagnostic=1
         elif [[ "$phase" == prior-open || "$phase" == prior-close ]]; then
             source="$prior"; source_sha="$prior_sha"
@@ -184,9 +194,16 @@ run_case() {
             echo "REPLAY_FAILED G$group LOG=$base.log" >&2
             python3 -B -m kvip.diagnostics.console --result "$base.json" --log "$base.log" --returncode "$rc" 2>&1 |
                 awk '/^BUILD_DIAGNOSTIC_BEGIN/{block=1} block || /^REPLAY_FAILED|^FAILURE_JSON|^FAILURE_LOG|^RUN_LOG/{print} /^BUILD_DIAGNOSTIC_END/{block=0}' >&2
+            if [[ "$phase" == check && "$compare_prior" == 0 ]] &&
+                grep -q '^REPLAY_FAILED variant=reverse-fetch-bitmap phase=diagnostic_verify ' "$base.log"; then
+                # Distinguish a producer-bitmap fault from a shared rank fault on
+                # the same input. Preserve the bitmap failure and skip all timing.
+                run_case "$group" dense-check || true
+            fi
             return "$rc"
         }
     if [[ "$study" == fetch ]]; then
+        if [[ "$phase" == dense-check ]]; then echo "DENSE_CHECK G$group PASS"; return 0; fi
         if [[ "$phase" == prior-* ]]; then return 0; fi
         python3 -B "$reader/tests/diagnostics/fetch_ab_report.py" "$base.json" "$phase" \
             "$native_sha" "$inputs/g${group}-input/manifest.json" | tee "$base.txt"
@@ -207,8 +224,9 @@ if [[ "$study" == fetch ]]; then
     for group in "${groups[@]}"; do run_case "$group" check; done
     unset KVIP_FETCH_AB_CHECK
     for group in "${groups[@]}"; do
-        run_case "$group" prior-open
+        if ((compare_prior)); then run_case "$group" prior-open; fi
         run_case "$group" graph
+        if ((!compare_prior)); then continue; fi
         run_case "$group" prior-close
         python3 -B "$reader/tests/diagnostics/fetch_ab_report.py" \
             "$result/g${group}-graph.json" revised "$native_sha" "$inputs/g${group}-input/manifest.json" \
