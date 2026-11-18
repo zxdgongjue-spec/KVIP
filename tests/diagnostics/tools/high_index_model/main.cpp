@@ -301,6 +301,8 @@ int main(int argc, char **argv) {
             fflush(stdout);
         }
         Check(aclrtDestroyStream(stream));
+        Check(aclrtResetDevice(0));
+        Check(aclFinalize());
         return 0;
     } catch (const std::exception &e) {
         fprintf(stderr, "FAIL %s\n", e.what());
