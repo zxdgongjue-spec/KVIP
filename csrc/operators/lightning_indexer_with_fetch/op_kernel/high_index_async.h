@@ -167,11 +167,13 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
     // A failed lane can reach Done without gathering originals. Mark the
     // skipped phase failed as well so its peers never scatter stale payload.
     if(error) join.Publish(RowRendezvous::ReadOriginals,error);
-    if(profile){ r->indexDone=GetSystemCycle(); ticks[2]=0x52514934U; }
+    if(profile){ r->indexDone=GetSystemCycle(); ticks[2]=0x52514935U; ticks[28]=0; ticks[29]=0; }
     // Only q0 consumes the prefetch queue. Only ranges that might
     // overwrite an in-flight prefetch destination depend on that completion.
     if(!q){
-        CompletePrefetch(ctx,b,true);
+        if(profile) ticks[28]=GetSystemCycle();
+        CompletePrefetch<true>(ctx,b,true);
+        if(profile) ticks[29]=GetSystemCycle();
         error|=row->error;
         flags[7].error=error; flags[7].ready=1;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+7),sizeof(*flags));
@@ -190,6 +192,7 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
     }
     // Both checkpoints, if issued, belong to this lane's FIFO. An accepted
     // prefix must be retired even on failure of the row or of the suffix.
+    if(profile) ticks[30]=GetSystemCycle();
     error|=post_index_transport::RetirePair(first,second);
     if(profile) r->cqDone=GetSystemCycle();
     r->error=error; r->globalError=error; r->count=count; r->fallback=blocking?1:0;

@@ -141,7 +141,12 @@ __aicore__ inline uint64_t Retire(State& state, uint64_t previousError) {
         state.requests, queue->completed_batch_count, queue->sq_producer_index,
         queue->cq_consumer_index, UINT64_MAX, state.lastWqe);
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue), sizeof(*queue));
-    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status), sizeof(*status));
+    // The two-checkpoint HIGH path writes only the public status header.
+    // The blocking native path can write a full profile and keeps its flush.
+    constexpr auto written=offsetof(KvafBatchGetCoreStatus,profile);
+    static_assert(written==8*sizeof(uint64_t),"unexpected KVAF status ABI");
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),
+                                 RetryTimeout ? written : sizeof(*status));
     state.pending = RetryTimeout && completion == kvaf_device::kCqTimeout;
     return state.error;
 }

@@ -29,6 +29,14 @@ def test_original_blocking_baseline_and_deferred_native_helpers(tmp_path):
     # Schedule a late or erroneous CQE for one chosen FIFO checkpoint while
     # preserving the original native wait/doorbell and CQ owner-bit handling.
     prefix += "uint64_t inject_checkpoint=UINT64_MAX, inject_polls=0; bool inject_error=false;\n"
+    prefix += "uintptr_t status_base=0; unsigned header_cleans=0, profile_cleans=0;\n"
+    poll = poll.replace("{", """{
+  auto addr=reinterpret_cast<uintptr_t>(address);
+  if(status_base && addr>=status_base && addr-status_base<sizeof(KvafBatchGetCoreStatus)) {
+    if(addr-status_base<offsetof(KvafBatchGetCoreStatus,profile)) ++header_cleans;
+    else ++profile_cleans;
+    return;
+  }""",1)
     probe = "    if (queue.timeout || queue.checkpoints.empty() ||"
     assert poll.count(probe) == 1 and poll.count("queue.error ?") == 1
     poll = poll.replace(probe, "    if (queue.cq_producer == inject_checkpoint && inject_polls) "
@@ -100,6 +108,22 @@ int main(){
     CHECK(Wait(state)==(timeout?kCqTimeout:kCqError));
     CHECK(f.queues[0].poisoned&&f.queues[0].last_error);
     CHECK(Preflight(f.args,0,1,blocking)==kInvalidQueue);
+  }
+  { // HIGH RetirePair keeps complete public header and never flushes its untouched profile.
+    Fixture f(64,1,1,0);State first,second;
+    alignas(64) KvafBatchGetCoreStatus status{};
+    std::memset(&status.profile,0xa5,sizeof(status.profile));
+    auto oldProfile=status.profile;
+    f.args.core_status=reinterpret_cast<uint64_t>(&status);
+    CHECK(Post(f.args,0,5,first)==0 && Post(f.args,5,13,second)==0);
+    aiv_model::status_base=f.args.core_status;
+    CHECK(RetirePair(first,second)==0);
+    aiv_model::status_base=0;
+    CHECK(aiv_model::header_cleans==2 && aiv_model::profile_cleans==0);
+    CHECK(std::memcmp(&oldProfile,&status.profile,sizeof(status.profile))==0);
+    CHECK(status.magic==KVAF_AIV_BATCH_GET_STATUS_MAGIC && status.processed_request_count==13);
+    CHECK(status.result==0 && status.completed_batch_count==2 && status.sq_producer_index==18 &&
+          status.cq_consumer_index==2 && status.failed_request_index==UINT64_MAX);
   }
   for(unsigned target:{0U,1U})for(unsigned fault:{0U,1U,2U,3U}){
     Fixture f(64,1,1,0);State first,second;

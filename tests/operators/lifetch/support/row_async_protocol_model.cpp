@@ -72,7 +72,7 @@ template<bool,OutputRole Role> unsigned OutputWorker(Args* a,unsigned,uint64_t* 
     return Role==OutputRole::Tnd && sim->input.badTnd;
 }
 void Plan(Args*,unsigned,Edge*,uint32_t*,bool,PrivatePlan& p){assert(lane==2);awaitEarlyPost();p.error=sim->input.badPlan;}
-void CompletePrefetch(Context* c,unsigned,bool){assert(lane==0);assert(sim->prefetch.fetch_add(1)==0);reinterpret_cast<Row*>(c->rows)->error|=sim->input.badDrain;}
+template<bool HeaderOnly> void CompletePrefetch(Context* c,unsigned,bool){static_assert(HeaderOnly);assert(lane==0);assert(sim->prefetch.fetch_add(1)==0);reinterpret_cast<Row*>(c->rows)->error|=sim->input.badDrain;}
 namespace post_index_tail {struct Record {uint64_t error{},globalError{},count{},fallback{},completed{},active{},start{},planDone{},packDone{},postBegin{},postDone{},indexDone{},cqDone{};};void Flush(Record*){} }
 namespace post_index_transport {
 struct State{unsigned seq=0,count=0,completed=0;};
@@ -148,7 +148,10 @@ void run(Input in){World world{in};sim=&world;world.e.cq_depth=in.cqDepth;
         for(unsigned q=0;q<4;++q){
             auto& rec=records[q*16];
             auto* mark=ticks.data()+16*256+q*16*32;
-            assert(mark[2]==0x52514934 && mark[20]<=mark[21] && mark[21]==rec.packDone);
+            assert(mark[30]>=rec.indexDone && mark[30]<=rec.cqDone);
+            if(q)assert(mark[28]==0 && mark[29]==0);
+            else assert(rec.indexDone<=mark[28] && mark[28]<=mark[29] && mark[29]<=mark[30]);
+            assert(mark[2]==0x52514935 && mark[20]<=mark[21] && mark[21]==rec.packDone);
             assert(mark[21]<=mark[23] && mark[23]<=mark[3]);
             if(!q)assert(mark[21]<=mark[22] && mark[22]<=mark[23]);
             if(q==1)for(int n=24;n<28;++n)assert(mark[n]);

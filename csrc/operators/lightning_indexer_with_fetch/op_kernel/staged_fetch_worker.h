@@ -73,13 +73,14 @@ __aicore__ inline CqDrainResult DrainQueue(
     queue->completed_batch_count+=result.completed;
     return result;
 }
+template<bool HeaderOnly=false>
 __aicore__ inline void CompletePrefetch(__gm__ Context* ctx,uint32_t b,bool initializeSpare,
     uint64_t* diagnosticPolls=nullptr,uint64_t* diagnosticDrain=nullptr,uint64_t* diagnosticArrival=nullptr) {
         auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
         // Only the first cache line and the pending field are read/written here.
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),64);
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->pending),sizeof(row->pending));
-        auto args=GetArgs(ctx,b*2);
+        auto views=reinterpret_cast<__gm__ const KvafExecuteBatchGetKernelArgs*>(ctx->args);
         auto entity=reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(row->entity);
         auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(row->queue);
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
@@ -99,16 +100,22 @@ __aicore__ inline void CompletePrefetch(__gm__ Context* ctx,uint32_t b,bool init
         row->error=uint32_t(error);
         if(!error) row->pending=0;
         if(error) queue->last_error=error;
-        auto status=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(args.core_status);
+        // Native WriteStatus updates only these eight words. The HIGH path
+        // never calls WriteProfile here; prior profile bytes remain untouched.
+        constexpr auto written=offsetof(KvafBatchGetCoreStatus,profile);
+        static_assert(written==8*sizeof(uint64_t),"unexpected KVAF status ABI");
+        constexpr auto flushBytes=HeaderOnly ? written : sizeof(KvafBatchGetCoreStatus);
+        uint64_t statusAddress=HeaderOnly ? views[b*2].core_status : GetArgs(ctx,b*2).core_status;
+        auto status=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(statusAddress);
         kvaf_device::WriteStatus(status,error,row->requests,completed,queue->sq_producer_index,
             queue->cq_consumer_index,UINT64_MAX,0);
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),sizeof(*status));
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),flushBytes);
         // The odd view is final-owned; its status is not prefetch completion.
         if(initializeSpare){
-            auto spare=GetArgs(ctx,b*2+1);
-            auto unused=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(spare.core_status);
+            uint64_t spareAddress=HeaderOnly ? views[b*2+1].core_status : GetArgs(ctx,b*2+1).core_status;
+            auto unused=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(spareAddress);
             kvaf_device::WriteStatus(unused,0,0,0,0,0,UINT64_MAX,0);
-            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(unused),sizeof(*unused));
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(unused),flushBytes);
         }
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
         // Only the first cache line and the pending field are read/written here.
