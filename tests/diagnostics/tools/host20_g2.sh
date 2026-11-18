@@ -14,7 +14,8 @@ index_units=moves
 index_groups=(4 7 10 17)
 baseline_override=
 consumer_ab=0
-if [[ (${1:-} == --index-paired || ${1:-} == --index-10k-paired || ${1:-} == --consumer-ab) && ${3:-} == --baseline ]]; then
+high_overlap_ab=0
+if [[ (${1:-} == --index-paired || ${1:-} == --index-10k-paired || ${1:-} == --consumer-ab || ${1:-} == --high-overlap-ab) && ${3:-} == --baseline ]]; then
     [[ ${4:-} =~ ^[0-9a-f]{40}$ ]] || die "--baseline requires a full 40-digit SHA"
     baseline_override=$4
     set -- "$1" "$2" "${@:5}"
@@ -51,7 +52,7 @@ elif [[ ($# == 2 || $# == 3) && ($1 == --index-10k || $1 == --index-10k-paired) 
     [[ $index_units == moves || $index_units == events ]] || die "Expected 10k moves or events"
     labels=(before after)
     candidate=$2
-elif [[ $# -ge 2 && ($1 == --index-speed || $1 == --index-paired || $1 == --consumer-ab) && $2 =~ ^[0-9a-f]{40}$ ]]; then
+elif [[ $# -ge 2 && ($1 == --index-speed || $1 == --index-paired || $1 == --consumer-ab || $1 == --high-overlap-ab) && $2 =~ ^[0-9a-f]{40}$ ]]; then
     if [[ $# -gt 2 ]]; then
         index_groups=()
         for group in "${@:3}"; do
@@ -62,9 +63,10 @@ elif [[ $# -ge 2 && ($1 == --index-speed || $1 == --index-paired || $1 == --cons
     fi
     high_index=1
     if [[ $1 == --index-paired ]]; then fixed_work=1; fi
-    if [[ $1 == --consumer-ab ]]; then
-        [[ -n $baseline_override ]] || die "--consumer-ab requires --baseline CONTROL_SHA"
+    if [[ $1 == --consumer-ab || $1 == --high-overlap-ab ]]; then
+        [[ -n $baseline_override ]] || die "$1 requires --baseline CONTROL_SHA"
         consumer_ab=1
+        if [[ $1 == --high-overlap-ab ]]; then high_overlap_ab=1; fi
     fi
     index_speed=1
     labels=(before after)
@@ -73,7 +75,7 @@ elif [[ $# == 2 && $1 == --high-index && $2 =~ ^[0-9a-f]{40}$ ]]; then
     high_index=1
     candidate=$2
 elif [[ $# != 0 ]]; then
-    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA|--index-speed CANDIDATE_SHA [GROUP ...]|--index-10k CANDIDATE_SHA [moves|events]|--index-paired CANDIDATE_SHA [--baseline CONTROL_SHA] [GROUP ...]|--index-10k-paired CANDIDATE_SHA [--baseline CONTROL_SHA] [moves|events]|--consumer-ab CANDIDATE_SHA --baseline CONTROL_SHA [GROUP ...]]"
+    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA|--index-speed CANDIDATE_SHA [GROUP ...]|--index-10k CANDIDATE_SHA [moves|events]|--index-paired CANDIDATE_SHA [--baseline CONTROL_SHA] [GROUP ...]|--index-10k-paired CANDIDATE_SHA [--baseline CONTROL_SHA] [moves|events]|--consumer-ab CANDIDATE_SHA --baseline CONTROL_SHA [GROUP ...]|--high-overlap-ab CANDIDATE_SHA --baseline CONTROL_SHA [GROUP ...]]"
 fi
 
 diag=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
@@ -177,7 +179,10 @@ export KVAF_BATCH_GET_KERNEL="$build/bin/kvaf_execute_batch_get_kernels.o"
 export KVAF_BATCH_PUT_KERNEL="$build/bin/kvaf_execute_batch_put_kernels.o"
 [[ -s "$KVAF_BATCH_GET_KERNEL" && -s "$KVAF_BATCH_PUT_KERNEL" ]] || die "Missing Get/Put objects in $build/bin"
 
-if ((consumer_ab)); then
+if ((high_overlap_ab)); then
+    out=$(mktemp -d "$cache/host20-high-overlap.XXXXXX")
+    printf 'HIGH_OVERLAP_AB NPU4 logical=0 HIGH=8_windows original=per_row_consumer baseline=%.8s candidate=%.8s\n' "$before" "$after"
+elif ((consumer_ab)); then
     out=$(mktemp -d "$cache/host20-consumer-ab.XXXXXX")
     printf 'CONSUMER_AB NPU4 logical=0 HIGH=8_windows baseline=%.8s candidate=%.8s\n' "$before" "$after"
 elif ((index_speed)); then
@@ -228,6 +233,7 @@ if ((high_index)); then
     if ((consumer_ab)); then
         study=kvip.diagnostics.consumer_ab
         study_args=(--baseline "$before" --groups "${index_groups[@]}")
+        if ((high_overlap_ab)); then study_args+=(--high-overlap); fi
     elif ((index_speed)); then
         study=kvip.diagnostics.high_index_speed
         study_args=(--groups "${index_groups[@]}")

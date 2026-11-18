@@ -16,18 +16,23 @@ from kvip.diagnostics.read_through_report import load_case, require, timing
 
 
 ARMS = ("before", "after", "after-end", "before-end")
+OVERLAP_ARMS = ("original", *ARMS, "original-end")
 
 
 def command(args, group, arm):
     run = copy(args)
-    if arm.startswith("before"):
+    if arm.startswith(("before", "original")):
         run.revision = args.baseline
         run.source = args.cache / "adaptive-sources" / f"auto-{run.revision[:8]}"
-    # "original" retains the query workers, Consumer and the real cache update in both binaries.
     cmd = replay_command(run, group, "original")
     cmd[cmd.index("--output") + 1] = str(args.result_dir / f"g{group}-{arm}.json")
     cmd.append("--verify-consumer-work")
-    if arm in ("before", "after"):
+    if getattr(args, "high_overlap", False):
+        # Uninstrumented HIGH has a shared completion ABI across methods. Its reader checks
+        # per-worker Post==complete and owner errors, without interpreting schedule-specific stage counters.
+        if not arm.startswith("original"):
+            cmd.append("--high-post-index")
+    elif arm in ("before", "after"):
         cmd.extend(("--diagnostic-replays", "2", "--calibrate-counter"))
     return cmd
 
@@ -72,7 +77,8 @@ def diagnostic_wait(case):
     return max_wait, apply, ends
 
 
-def summarize(group, cases, baseline, candidate):
+def summarize(group, cases, baseline, candidate, high_overlap=False):
+    arms = OVERLAP_ARMS if high_overlap else ARMS
     base = cases["before"]
     geometry = base["geometry"]
     require((geometry["requested_windows"], geometry["batch"], geometry["token_count"], geometry["token_bytes"])
@@ -83,10 +89,10 @@ def summarize(group, cases, baseline, candidate):
             require(base.get(key) is not None and c[key] == base[key], f"{arm}: unmatched {key}")
         require(c["device"] == 0 and c["graph_backend"] == "kvaf.AclGraph" and len(c["_samples"]) == 10,
                 f"{arm}: invalid graph or samples")
-        ref = "before" if arm.startswith("before") else "after"
+        ref = "before" if arm.startswith(("before", "original")) else "after"
         require(c["kvip_commit"] == (baseline if ref == "before" else candidate)
                 and c["library_sha256"] == cases[ref]["library_sha256"] and bool(c["library_sha256"])
-                and c["high_post_index"] is False and c["post_index_wait_first"] is False,
+                and c["high_post_index"] == (high_overlap and not arm.startswith("original")) and c["post_index_wait_first"] is False,
                 f"{arm}: wrong source, binary or production scheduling")
         require([s["mode"] for s in c["auto_route"]["samples"]] == ["high"] * 10
                 and c["tuning"]["low_miss_post_index"] and c["tuning"]["auto_route"],
@@ -101,16 +107,16 @@ def summarize(group, cases, baseline, candidate):
                 f"{arm}: final graph did not verify the ordered persistent Index update")
     require(cases["before"]["library_sha256"] != cases["after"]["library_sha256"], "Same binary in both arms")
 
-    times = {arm: timing(cases[arm], True) for arm in ARMS}
+    times = {arm: timing(cases[arm], True) for arm in arms}
     def diff(a, b):
         return [x - y for x, y in zip(times[a], times[b])]
 
     saved = [diff(b, a) for b in ("before", "before-end") for a in ("after", "after-end")]
-    print(f"G{group} GRAPH_us_mean/p50 " + " ".join(f"{arm}={two(times[arm])}" for arm in ARMS)
+    print(f"G{group} GRAPH_us_mean/p50 " + " ".join(f"{arm}={two(times[arm])}" for arm in arms)
           + f" saved_min={two(map(min, zip(*saved)))} saved_max={two(map(max, zip(*saved)))}"
           + f" drift_old={two(diff('before-end','before'))} drift_new={two(diff('after-end','after'))}")
     records = {}
-    for arm in ARMS:
+    for arm in arms:
         c = cases[arm]
         records[arm] = [(work_key(r), t) for r, t in zip(c["reads_samples"][1:], c["_samples"][1:])]
     pairs = []
@@ -118,10 +124,34 @@ def summarize(group, cases, baseline, candidate):
         pairs.extend(one_to_one(records[old], records[new]))
     delta = [a - b for a, b in pairs]
     reads = ["{:.1f}/{:.1f}".format(*(mean(r[k] for r in cases[a]["reads_samples"][1:]) for k in ("prefetch", "final")))
-             for a in ARMS]
-    print(f"G{group} GET_prefetch/final " + " ".join(f"{a}={r}" for a, r in zip(ARMS, reads))
+             for a in arms]
+    print(f"G{group} GET_prefetch/final " + " ".join(f"{a}={r}" for a, r in zip(arms, reads))
           + f" identical_work_pairs={len(pairs)}/18 paired_saved_us_mean/p50="
           + (two((mean(delta), median(delta))) if pairs else "unavailable"))
+    if high_overlap:
+        gains = [diff(o, a) for o in ("original", "original-end") for a in ("after", "after-end")]
+        clean_pairs = []
+        for o, a in (("original", "after"), ("original-end", "after-end")):
+            clean_pairs.extend(one_to_one(records[o], records[a]))
+        clean = [a - b for a, b in clean_pairs]
+        print(f"G{group} ORIGINAL_per_row_vs_candidate_us saved_min={two(map(min, zip(*gains)))}"
+              f" saved_max={two(map(max, zip(*gains)))} drift_original={two(diff('original-end','original'))}"
+              f" identical_work_pairs={len(clean)}/18 paired_saved_us_mean/p50="
+              + (two((mean(clean), median(clean))) if clean else "unavailable"))
+        for arm in arms:
+            if arm.startswith("original"):
+                continue
+            for row in cases[arm]["reads_samples"]:
+                phase = row["high_post_index"]
+                require(phase["core_count"] == 64 and 0 <= phase["fallback_cores"] <= 64 and
+                        sum(phase["final_get_by_core"]) == row["final"], "HIGH transport count mismatch")
+        print(f"G{group} VERIFIED_last_changed_Index_positions " + " ".join(
+            f"{a}={cases[a]['verified_consumer_work']['index_positions_changed']}"
+            for a in ("original", "before", "after")) + " transport64_max_fallback_cores="
+            + "/".join(str(max(s["high_post_index"]["fallback_cores"] for s in cases[a]["reads_samples"]))
+                       for a in ("before", "after")))
+        print(f"G{group} CHECK real_Index_order/TopK/KV/lifecycle/submitted_completed=PASS", flush=True)
+        return
     stages = []
     for arm in ("before", "after"):
         waits, apply, ends = diagnostic_wait(cases[arm])
@@ -141,10 +171,12 @@ def main():
     p.add_argument("--server", required=True)
     p.add_argument("--result-dir", required=True, type=Path)
     p.add_argument("--groups", type=int, nargs="+", choices=GROUPS, required=True)
+    p.add_argument("--high-overlap", action="store_true", help="Bracket both full-AIV HIGH arms with the original per-row schedule")
     args = p.parse_args()
+    arms = OVERLAP_ARMS if args.high_overlap else ARMS
     for group in args.groups:
         cases = {}
-        for arm in ARMS:
+        for arm in arms:
             cmd = command(args, group, arm)
             log = args.result_dir / f".g{group}-{arm}.log"
             with log.open("x") as out:
@@ -154,7 +186,7 @@ def main():
                     print("".join(deque(out, maxlen=8)), file=sys.stderr, end="")
                 raise SystemExit(f"G{group}/{arm} failed rc={status} log={log}")
             cases[arm] = load_case(cmd[cmd.index("--output") + 1], arm)
-        summarize(group, cases, args.baseline, args.revision)
+        summarize(group, cases, args.baseline, args.revision, args.high_overlap)
 
 
 if __name__ == "__main__":

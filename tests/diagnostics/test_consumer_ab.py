@@ -69,3 +69,33 @@ def test_checks_fail_for_stale_or_unverified_index_or_changed_transport():
     case["native_diagnostics"]["samples"][0]["raw"]["fetch"][0][104] = 0
     with pytest.raises(ValueError, match="timestamps"):
         diagnostic_wait(case)
+
+
+def test_high_overlap_arms_reuse_public_completion_records(tmp_path, capsys):
+    from kvip.diagnostics.consumer_ab import OVERLAP_ARMS
+
+    args = SimpleNamespace(baseline="a"*40, revision="b"*40, cache=tmp_path, source=tmp_path/"new",
+                           result_dir=tmp_path, server="127.0.0.1:29085", high_overlap=True)
+    cases = {}
+    for arm, usecs in zip(OVERLAP_ARMS, (500, 540, 501, 499, 542, 498)):
+        opts = arguments(command(args, 7, arm)[4:])
+        original = arm.startswith("original")
+        old_binary = original or arm.startswith("before")
+        assert opts.verify_consumer_work and opts.check_auto_route and opts.high_post_index == (not original)
+        assert not opts.calibrate_counter and not opts.diagnostic_replays and not opts.post_index_wait_first
+        assert opts.upstream_revision == (args.baseline if old_binary else args.revision)
+        c = synthetic_report("before" if old_binary else "after", usecs)
+        del c["native_diagnostics"]
+        c["high_post_index"] = not original
+        c["verified_consumer_work"]["index_positions_changed"] = 1868
+        if not original:
+            for s in c["reads_samples"]:
+                s["high_post_index"] = dict(core_count=64, fallback_cores=0, final_get_by_core=[1]+[0]*63)
+        cases[arm] = c
+    summarize(7, cases, args.baseline, args.revision, True)
+    result = capsys.readouterr().out
+    assert "ORIGINAL_per_row_vs_candidate_us saved_min=-3.000/-3.000 saved_max=1.000/1.000" in result
+    assert "identical_work_pairs=18/18" in result and "real_Index_order/TopK/KV/lifecycle/submitted_completed=PASS" in result
+    cases["after"]["reads_samples"][1]["high_post_index"]["final_get_by_core"] = [0]*64
+    with pytest.raises(ValueError, match="transport count"):
+        summarize(7, cases, args.baseline, args.revision, True)

@@ -352,6 +352,9 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
             flags, src, dst = (cpu_array(torch, v) for v in
                                (bundle.forward.flags, bundle.forward.events_src, bundle.forward.events_dst))
             verify_permutation(flags, src, dst, oracle.pre["logical_ids"], state["logical_ids"], oracle.owners)
+            owned = list(oracle.owners)
+            reads["consumer_work"]["index_positions_changed"] = int(np.count_nonzero(
+                oracle.pre["logical_ids"][owned] != state["logical_ids"][owned]))
             reads["consumer_work"]["ordered_index_verified"] = True
         high = reads.get("high_post_index", {})
         if "moved" in high:
