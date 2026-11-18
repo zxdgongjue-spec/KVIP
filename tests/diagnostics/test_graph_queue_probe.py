@@ -7,13 +7,13 @@ import pytest
 from kvip.diagnostics.graph_queue_probe import COPIES, probe
 
 
-@pytest.mark.parametrize("pending", [True, False])
-def test_equal_traffic_around_both_stream_states(pending):
+@pytest.mark.parametrize("separated", [True, False])
+def test_equal_traffic_around_both_stream_states(separated):
     ops = []
     stream = SimpleNamespace(device="npu:0", synchronize=lambda: ops.append("sync"))
     begin = SimpleNamespace(
         record=lambda s: ops.append("begin"),
-        query=lambda: ops.append("query") or not pending,
+        query=lambda: ops.append("query") or (ops[-5] == "sync" and separated),
         elapsed_time=lambda other: 0.01,
     )
     end = SimpleNamespace(record=lambda s: ops.append("end"), synchronize=lambda: ops.append("wait"))
@@ -50,7 +50,7 @@ def test_equal_traffic_around_both_stream_states(pending):
             "verify",
         ]
         assert ops[start : start + len(expected)] == expected
-    assert results["status"] == ("measured" if pending else "insufficient_queue_lead")
+    assert results["status"] == ("measured" if separated else "queue_states_unresolved")
 
 
 def test_missing_query_keeps_headline_and_profile():

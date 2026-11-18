@@ -147,7 +147,8 @@ def sample(path, role):
         )
         values["queue_fenced"] = mean(r["elapsed_us"] for r in samples if r["fenced"])
         values["queue_pending"] = sum(r["begin_pending_after_submit"] for r in samples if not r["fenced"])
-        if values["queue_pending"] == 2:
+        values["idle_started"] = sum(not r["begin_pending_after_submit"] for r in samples if r["fenced"])
+        if values["queue_pending"] == values["idle_started"] == 2:
             values["queue_ahead"] = mean(r["elapsed_us"] for r in samples if not r["fenced"])
             values["queue_sensitivity"] = values["queue_fenced"] - values["queue_ahead"]
     return case, values, kernels
@@ -201,15 +202,17 @@ def summarize(directory):
         require(all(set(k) == set(names) for _, _, k in measurements), f"{role}: different kernel lists")
         print(f"KERNEL_MEAN {role} " + " ".join(f"{n}={mean(k[n] for _, _, k in measurements):.3f}" for n in names))
         pending = sum(v.get("queue_pending", 0) for _, v, _ in measurements)
+        started = sum(v.get("idle_started", 0) for _, v, _ in measurements)
+        observed = f"idle_begin_reached={started}/{len(rounds)*2} queued_begin_pending={pending}/{len(rounds)*2}"
         if all("queue_ahead" in v for _, v, _ in measurements):
             print(
                 f"QUEUE {role} idle/queued_mean_us={mean(v['queue_fenced'] for _, v, _ in measurements):.3f}/"
                 f"{mean(v['queue_ahead'] for _, v, _ in measurements):.3f} "
                 f"idle_minus_queued_us={mean(v['queue_sensitivity'] for _, v, _ in measurements):+.3f} "
-                f"pending={pending}/{len(rounds) * 2}"
+                f"{observed}"
             )
         else:
-            print(f"QUEUE {role} status=unresolved pending={pending}/{len(rounds) * 2}")
+            print(f"QUEUE {role} status=unresolved {observed}")
     for candidate, control in (("before", "serial"), ("after", "serial"), ("after", "before")):
         pairs = [(a[1], b[1]) for a, b in zip(rows[candidate], rows[control])]
 

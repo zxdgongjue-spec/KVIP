@@ -40,9 +40,9 @@ def probe(torch, stream, begin, end, replay, prepare, verify, first_step, expect
             if gets != expected_get:
                 raise AssertionError(f"Queue probe changed final Get: {gets} != {expected_get}")
             rows.append(dict(fenced=fence, begin_pending_after_submit=pending, elapsed_us=elapsed, final_get=gets))
-    evidence = all(row["begin_pending_after_submit"] for row in rows if not row["fenced"])
+    evidence = all(row["begin_pending_after_submit"] != row["fenced"] for row in rows)
     return dict(
-        status="measured" if evidence else "insufficient_queue_lead",
+        status="measured" if evidence else "queue_states_unresolved",
         scratch_bytes_per_tensor=SCRATCH_BYTES,
         leading_copy_bytes=SCRATCH_BYTES * COPIES,
         samples=rows,
