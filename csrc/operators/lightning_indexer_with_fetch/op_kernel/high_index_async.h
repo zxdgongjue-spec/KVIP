@@ -5,7 +5,7 @@
 // already clears these four cache-line-separated records at each HIGH step.
 // One writer per record. Later phases never overwrite an earlier result.
 struct RowRendezvous {
-    enum Phase : uint32_t { Validated=1, Posted=2, ReadOriginals=3, Done=4 };
+    enum Phase : uint32_t { Validated=1, ReadOriginals=2, Done=3 };
     __gm__ BatchFlag* lines;
     uint32_t lane;
     __aicore__ inline void Publish(Phase phase,uint32_t error) {
@@ -117,49 +117,40 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
         me->reserved[6]=info[1];
     }
     me->count=count;
-    me->reserved[5]=(safe<count ? 1U:0U) | (blocking ? 2U:0U);
     join.Publish(RowRendezvous::Validated,error);
     error|=join.All(RowRendezvous::Validated);
-    uint32_t hazards=0,total=0;
-    for(uint32_t p=0;p<4;++p){ hazards|=join.lines[p].reserved[5]; total+=join.lines[p].count; }
+    uint32_t total=0;
+    for(uint32_t p=0;p<4;++p) total+=join.lines[p].count;
     // Producer and OutputWorker have both returned before their Validated signal.
     if(total!=join.lines[0].reserved[6]) error|=kvaf_device::kInvalidArgs;
     post_index_transport::State first{},second{};
-    if(!error && count && (safe==count || split)) {
-        error|=blocking ? post_index_transport::GetBlocking(args,0,count,first)
-                        : post_index_transport::Post(args,0,safe,first);
-    }
-    if(hazards & 1U) {
-        if(!q) {
-            CompletePrefetch(ctx,b,true);
-            flags[7].error=row->error; flags[7].ready=1;
-            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+7),sizeof(*flags));
-        }
-        if(safe<count) {
-            error|=AwaitPublication(flags+7);
-            if(!error) {
-                uint32_t begin=split?safe:0;
-                error|=blocking ? post_index_transport::GetBlocking(args,begin,count-begin,second)
-                                : post_index_transport::Post(args,begin,count-begin,second);
-            }
-        }
-        if(!q) error|=row->error;
-    }
-    // A nonblocking Post on a private preflighted queue has no synchronous
-    // rejection. Only conflicts and blocking fallback can still reject a peer.
-    if(hazards) {
-        join.Publish(RowRendezvous::Posted,error);
-        error|=join.All(RowRendezvous::Posted);
-    }
+    // The final ranges contain frozen addresses. A prefetch can conflict
+    // with a final KV destination, but it cannot overwrite Index storage.
+    // Post a safe prefix now; defer only the unsendable range. A bounded
+    // blocking fallback is likewise deferred so its CQ cannot gate Index.
+    uint32_t early=(!blocking && (safe==count || split)) ? safe : 0;
+    if(!error && early) error|=post_index_transport::Post(args,0,early,first);
     auto plan=join.lines+2;
     uint32_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
     if(!error) error|=ApplyRowIndex(a,ctx,b,owner,q,4,plan->reserved[8],plan->reserved[9],
                                    plan->reserved[10],update[7],ticks,profile,join);
-    // Both checkpoints, if issued, are on this lane's exclusive FIFO.
-    // Every accepted Post is drained even if another lane rejected the row.
+    // Only q0 consumes the prefetch queue. Only ranges that might
+    // overwrite an in-flight prefetch destination depend on that completion.
+    if(!q){
+        CompletePrefetch(ctx,b,true);
+        error|=row->error;
+        flags[7].error=error; flags[7].ready=1;
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+7),sizeof(*flags));
+    }
+    if(early<count) {
+        if(safe<count) error|=AwaitPublication(flags+7);
+        if(!error) error|=blocking ? post_index_transport::GetBlocking(args,early,count-early,second)
+                                   : post_index_transport::Post(args,early,count-early,second);
+    }
+    // Both checkpoints, if issued, belong to this lane's FIFO. An accepted
+    // prefix must be retired even on failure of the row or of the suffix.
     error|=post_index_transport::Wait(first);
     error|=post_index_transport::Wait(second);
-    if(!q && !(hazards&1U)){ CompletePrefetch(ctx,b,true); error|=row->error; }
     r->error=error; r->globalError=error; r->count=count; r->fallback=blocking?1:0;
     r->completed=first.completed+second.completed; r->active=2;
     post_index_tail::Flush(r);
