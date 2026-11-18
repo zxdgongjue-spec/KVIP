@@ -76,9 +76,9 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
         r->planDone=0; r->postBegin=0; r->postDone=0; ticks[4]=0; ticks[8]=0;
     }
     uint32_t useful=0,error=0;
-    if(q==0) useful=Producer(a,b);
-    if(q==1) OutputWorker<false,OutputRole::Descriptors>(a,b);
-    if(q==3) OutputWorker<false,OutputRole::Tnd>(a,b);
+    if(q==0) useful=Producer<false,true>(a,b);
+    if(q==1) error|=OutputWorker<false,OutputRole::Descriptors>(a,b);
+    if(q==3) error|=OutputWorker<false,OutputRole::Tnd>(a,b);
     if(q==2) {
         auto edges=reinterpret_cast<__gm__ Edge*>(a->highIndex+uint64_t(b)*kRowBytes);
         auto spill=reinterpret_cast<__gm__ Tuple*>(edges+kCapacity);
@@ -130,7 +130,7 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
     error|=join.All(RowRendezvous::Validated);
     uint32_t total=0;
     for(uint32_t p=0;p<4;++p) total+=join.lines[p].count;
-    // Producer and OutputWorker have both returned before their Validated signal.
+    // All input, output and plan owners returned before granting Validated.
     if(total!=join.lines[0].reserved[6]) error|=kvaf_device::kInvalidArgs;
     post_index_transport::State first{},second{};
     // The final ranges contain frozen addresses. A prefetch can conflict

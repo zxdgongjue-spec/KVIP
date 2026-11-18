@@ -23,7 +23,9 @@ def test_fetch_ready_precedes_output_dma_but_not_metadata_join(tmp_path, ubmem, 
     streaming = (kernel_dir / 'streaming.cpp').read_text()
     publish = streaming[streaming.index('__aicore__ inline void PublishQueryOutputs'):]
     publish = publish[:publish.index('// The producer and Fetch AIV')]
-    producer_join = streaming.split(' uint64_t publishWait=GetSystemCycle();', 1)[1].split(' status[0]=', 1)[0]
+    end_of_resolve = streaming.split(' // The row tail joins the descriptor', 1)[1]
+    producer_join = ' if constexpr(!RowOutput){' + end_of_resolve.split(' if constexpr(!RowOutput){', 1)[1].split(' status[0]=', 1)[0]
+    producer_recovery = end_of_resolve.split(' // Publish failure to every remaining reader, never leave the consumer waiting.\n', 1)[1].split(' if(profile)', 1)[0]
     consumer_join = streaming.split(' if(!error){uint64_t start=GetSystemCycle();while(true)', 1)[1].split('\n if(!error\n', 1)[0]
     input_error = streaming.split(' if(inputError){', 1)[1].split('\n TPipe pipe;', 1)[0]
     producer_done = streaming.split(' if(!kEarlyFetchReady){flags[5].error=status[0];', 1)[1].split('\n}', 1)[0]
@@ -70,6 +72,7 @@ constexpr int EVENT_ID0=0;
 BatchFlag flags[2*kFlagCount];FinalPost posts[8];
 uint32_t activeBatch=0,currentQuery=0,initialError=0,packErrorQuery=99,missingRaw=99;
 bool splitOutput=false,observed[4]{};
+uint32_t tndStatus=0,packStatus=0;
 bool outputEnabled=true,descriptorSynced[4]{},postSynced[4]{},outputDone[4]{};
 bool noPrefetchMode=false;
 uint32_t usedSlots=0;
@@ -146,16 +149,19 @@ void CleanCacheLines(uint8_t* ptr,uint64_t){
 #include "FINAL_POST_HEADER"
 /*PUBLISH_OUTPUTS*/
 /*OUTPUT_WORKER*/
-template<bool PostIndex=false>
+template<bool PostIndex=false,bool RowOutput=false>
 uint32_t ProducerInputError(Args* a,Context* ctx,uint32_t b,uint32_t inputError){
  auto flags=reinterpret_cast<BatchFlag*>(a->flags)+b*kFlagCount;
  if(inputError){/*PRODUCER_ERROR*/
  return 0;
 }
-uint32_t JoinProducer(BatchFlag* flags){
- uint32_t control[2]{};LocalTensor<uint32_t> ctl{control};
- uint64_t publishWait=GetSystemCycle();/*PRODUCER_JOIN*/
+template<bool RowOutput=false> uint32_t JoinProducer(BatchFlag* flags,uint32_t initial=0){
+ uint32_t control[2]{0,initial};LocalTensor<uint32_t> ctl{control};
+ /*PRODUCER_JOIN*/
  return ctl.GetValue(1);
+}
+template<bool RowOutput> void RecoverUnready(BatchFlag* flags,uint32_t* status){
+ /*PRODUCER_RECOVERY*/
 }
 uint32_t JoinConsumer(BatchFlag* flags){
  uint32_t error=0;
@@ -204,9 +210,10 @@ void runWorker(unsigned b){
  auto f=flags+b*kFlagCount;f[0].ready=1;f[0].error=initialError;
  for(unsigned q=0;q<4;++q){f[kRawQueryFlag+q].ready=q!=missingRaw;f[kRawQueryFlag+q].count=queryCount[q];}
  if(splitOutput){
-  OutputWorker<false,OutputRole::Descriptors>(&args,b);
+  packStatus=OutputWorker<false,OutputRole::Descriptors>(&args,b);
   assert(!flags[b*kFlagCount+kOutputsDoneFlag].ready && outputStarts==0);
-  OutputWorker<false,OutputRole::Tnd>(&args,b);
+  tndStatus=OutputWorker<false,OutputRole::Tnd>(&args,b);
+  assert(!flags[b*kFlagCount+kOutputsDoneFlag].ready && packStatus==tndStatus);
  }else OutputWorker(&args,b);
 }
 int main(){
@@ -225,13 +232,13 @@ int main(){
   splitOutput=true;
   for(unsigned b:{0U,1U}){
    reset();runWorker(b);assert(fetchReads==4 && outputCopies==8 && dma.empty());
-   assert(!JoinProducer(flags+b*kFlagCount));assert(!JoinConsumer(flags+b*kFlagCount));
+   assert(!JoinProducer<true>(flags+b*kFlagCount) && tndStatus==0);
    for(unsigned q=0;q<4;++q)assert(slotOut[(b*4+q)*kTop]==b*10000+q*kTop);
   }
-  reset();outputEnabled=false;runWorker(0);assert(fetchReads==4 && outputCopies==0 && !JoinConsumer(flags));
-  reset();packErrorQuery=1;runWorker(0);assert(fetchReads==1 && outputCopies==2 && JoinConsumer(flags)==16);
-  reset();missingRaw=1;timeoutClock=true;runWorker(0);assert(fetchReads==1 && outputCopies==2 && JoinConsumer(flags)==8);
-  reset();initialError=2;runWorker(0);assert(fetchReads==0 && outputCopies==0 && JoinConsumer(flags)==2);
+  reset();outputEnabled=false;runWorker(0);assert(fetchReads==4 && outputCopies==0 && !tndStatus);
+  reset();packErrorQuery=1;runWorker(0);assert(fetchReads==1 && outputCopies==2 && tndStatus==16);
+  reset();missingRaw=1;timeoutClock=true;runWorker(0);assert(fetchReads==1 && outputCopies==2 && tndStatus==8);
+  reset();initialError=2;runWorker(0);assert(fetchReads==0 && outputCopies==0 && tndStatus==2);
   splitOutput=false;
  }
  // Q-ready alone cannot authorize metadata commit or producer finalization.
@@ -257,6 +264,19 @@ int main(){
  Args args{};args.flags=uint64_t(flags);ProducerInputError(&args,&ctx,0,64);
  assert(flags[0].ready && flags[4].ready && flags[15].ready);
  assert(kEarlyFetchReady ? !flags[5].ready : flags[5].ready);
+ // RowOutput resolves/statuses without waiting on service outputs or writing
+ // descriptor-ready flags owned by the other role. The old paths still join.
+ reset();activeBatch=0;timeoutClock=true;
+ assert(JoinProducer<true>(flags,17)==17);
+ ProducerInputError<false,true>(&args,&ctx,0,32);
+ assert(status[0]==32 && status[1]==0);
+ for(unsigned q=0;q<kFlagCount;++q)
+  assert(flags[q].ready==(q==0 || q>=kRawQueryFlag));
+ RecoverUnready<true>(flags,status);
+ for(unsigned q=1;q<=4;++q)assert(!flags[q].ready);
+ RecoverUnready<false>(flags,status);
+ for(unsigned q=1;q<=4;++q)assert(flags[q].ready && flags[q].error==32);
+ assert(!flags[kOutputsDoneFlag].ready);
  // Exact low planning has no per-query waiters. Its error path must clear
  // the reused Q counts while leaving these legacy publication flags alone.
  reset();std::fill_n(status,32,99);
@@ -276,6 +296,7 @@ int main(){
         'OUTPUT_WORKER': worker,
         'PRODUCER_ERROR': input_error,
         'PRODUCER_JOIN': producer_join,
+        'PRODUCER_RECOVERY': producer_recovery,
         'CONSUMER_JOIN': consumer_join,
         'PRODUCER_DONE': producer_done,
         'INITIALIZE_FLAGS': initialize_flags,

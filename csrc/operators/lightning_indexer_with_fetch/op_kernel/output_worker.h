@@ -32,7 +32,7 @@ __aicore__ inline uint32_t AwaitPublication(__gm__ BatchFlag* flag){
 // use the same descriptor and completion publications as the original worker.
 enum class OutputRole { Combined, Descriptors, Tnd };
 template<bool TraceRole = true, OutputRole Role = OutputRole::Combined>
-__aicore__ inline void OutputWorker(__gm__ Args* a,uint32_t b){
+__aicore__ inline uint32_t OutputWorker(__gm__ Args* a,uint32_t b){
  constexpr bool pack=Role!=OutputRole::Tnd, tnd=Role!=OutputRole::Descriptors;
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
@@ -41,8 +41,8 @@ __aicore__ inline void OutputWorker(__gm__ Args* a,uint32_t b){
  uint32_t error=AwaitPublication(flags);
  if(profile)ticks[2]=GetSystemCycle();
  if(error){if constexpr(pack)for(uint32_t q=0;q<4;++q){auto f=flags+q+1;f->count=0;f->error=error;f->ready=1;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(f),sizeof(BatchFlag));}
-  if(kEarlyFetchReady && tnd){auto done=flags+kOutputsDoneFlag;done->count=0;done->error=error;done->ready=1;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(done),sizeof(BatchFlag));}
-  return;}
+  if(kEarlyFetchReady && Role==OutputRole::Combined){auto done=flags+kOutputsDoneFlag;done->count=0;done->error=error;done->ready=1;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(done),sizeof(BatchFlag));}
+  return error;}
  TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,kFinalScratchBytes);
  auto local=scratch.Get<uint32_t>();auto selected=local,loc=local[kSlots],tokens=local[2*kSlots];
  auto ids=local[4*kSlots].ReinterpretCast<uint16_t>();
@@ -87,9 +87,7 @@ __aicore__ inline void OutputWorker(__gm__ Args* a,uint32_t b){
   }
   if(profile)ticks[5+q*6]=GetSystemCycle();
   auto ready=flags+(pack?kRawQueryFlag+q:q+1);
-  // The split TND owner waits through the last descriptor publication even
-  // after error. Its completion releases Producer's row-status commit.
-  if(!error || !pack)error|=AwaitPublication(ready);
+  if(!error)error=AwaitPublication(ready);
   if(profile)ticks[6+q*6]=GetSystemCycle();
   uint32_t count=error?0:ready->count;
   if(count>kTop)error=4;
@@ -128,7 +126,8 @@ __aicore__ inline void OutputWorker(__gm__ Args* a,uint32_t b){
   // separate all-output join before either reader may commit logical metadata.
   if(kEarlyFetchReady && tnd && !error && enabled)PublishQueryOutputs(u,shape.batch,b,q,selected,loc,work);
  }
- if(kEarlyFetchReady && tnd){auto done=flags+kOutputsDoneFlag;done->count=total;done->error=error;done->ready=1;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(done),sizeof(BatchFlag));}
+ if(kEarlyFetchReady && Role==OutputRole::Combined){auto done=flags+kOutputsDoneFlag;done->count=total;done->error=error;done->ready=1;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(done),sizeof(BatchFlag));}
  if(profile)kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ticks),32*8);
  pipe.Destroy();
+ return error;
 }
