@@ -388,18 +388,26 @@ def verify_score_keys(actual, expected, query_ends):
     return dict(status="bit_exact", compared_scores=compared, included_in_timing=False)
 
 
+def graph_backend(args):
+    if args.mode == "serial" or getattr(args, "fused_torch_graph", False):
+        return "torch.npu.NPUGraph"
+    return "kvaf.AclGraph"
+
+
 def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
     """Time the complete current graph without per-stage instrumentation."""
     graphs = retained.setdefault("graphs", [])
     reset, verify = bundle.reset, bundle.verify
     lease = bundle.lease
 
+    use_torch_graph = graph_backend(args) == "torch.npu.NPUGraph"
+
     def capture(call):
-        graph = torch.npu.NPUGraph() if args.mode == "serial" else kvaf.AclGraph()
+        graph = torch.npu.NPUGraph() if use_torch_graph else kvaf.AclGraph()
         graphs.append(graph)
         if lease is not None and hasattr(lease, "retain_graph"):
             lease.retain_graph(graph)
-        if args.mode == "serial":
+        if use_torch_graph:
             # Native LI/gather allocate Torch outputs during capture. Use the
             # Torch graph pool, explicitly on the same stream as native Get.
             with torch.npu.graph(graph, stream=stream):
@@ -411,7 +419,7 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
         return graph
 
     def replay(graph):
-        if args.mode == "serial":
+        if use_torch_graph:
             graph.replay()
         else:
             graph.replay(stream)
@@ -816,7 +824,7 @@ def measure_case(args, archive, context, retained):
             cann=str(cann),
             kvaf_module=str(Path(kvaf.__file__).resolve()),
             kvaf_build=str(build),
-            graph_backend="torch.npu.NPUGraph" if args.mode == "serial" else "kvaf.AclGraph",
+            graph_backend=graph_backend(args),
             tuning=dict(getattr(bundle, "tuning", {})),
             pipeline_options=getattr(args, "pipeline_options", None),
             pipeline_q_workers=getattr(args, "pipeline_q_workers", None),
@@ -878,7 +886,7 @@ def measure_case(args, archive, context, retained):
             if args.transport == "ubmem"
             else "Current URMA CPU allocation; page policy is supplied to the local CPU service, physical coverage is not measured"
         ),
-        graph_backend="torch.npu.NPUGraph" if args.mode == "serial" else "kvaf.AclGraph",
+        graph_backend=graph_backend(args),
         post_index_wait_first=bool(getattr(args, "post_index_wait_first", False)),
         high_post_index=bool(getattr(args, "high_post_index", False)),
         selection_comparison=bundle.selection_comparison,

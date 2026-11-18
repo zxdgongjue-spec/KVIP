@@ -55,18 +55,20 @@ def test_overlap_marks_exported_kernel_time_once_and_missing_markers_are_unresol
     }
 
 
-@pytest.mark.parametrize("init_only", [False, True])
-def test_paired_rounds_check_profile_identity_and_retained_work(tmp_path, capsys, init_only):
+@pytest.mark.parametrize("extra", [None, "init-only", "torch-front"])
+def test_paired_rounds_check_profile_identity_and_retained_work(tmp_path, capsys, extra):
+    init_only = extra == "init-only"
     cases = inputs()
     for number in (1, 2):
-        for role in ("serial", "before", "init-only", "after") if init_only else ("serial", "before", "after"):
-            case = cases["before" if role == "init-only" else role]
+        for role in (("serial", "before", extra, "after") if extra else ("serial", "before", "after")):
+            case = cases["before" if role == extra else role]
             case.update(diagnostics_commit="h", libraries=[], queue_probe={"status": "unavailable"})
+            case["graph_backend"] = "torch.npu.NPUGraph" if role in ("serial", "torch-front") else "kvaf.AclGraph"
             directory = tmp_path / f"p{number}-{role}"
             directory.mkdir()
             name = "QuantLightningIndexer" if role == "serial" else "v9_li_kernel_0"
             (directory / "trace_view.json").write_text(json.dumps(trace(name)))
-            experiment = dict(snapshot_sha256=case["snapshot_sha256"], production_source=case["production_source"])
+            experiment = dict(graph_backend=case["graph_backend"], snapshot_sha256=case["snapshot_sha256"], production_source=case["production_source"])
             if role != "serial":
                 experiment.update(
                     auto_route=dict(
@@ -95,6 +97,7 @@ def test_paired_rounds_check_profile_identity_and_retained_work(tmp_path, capsys
     assert "PAIRED after-before" in output
     assert ("ABLATION init-only-before" in output) == init_only
     assert ("ABLATION after-init-only" in output) == init_only
+    assert ("FRONTEND torch-front-before" in output) == (extra == "torch-front")
     if init_only:
         one_side = tmp_path / "r2-init-only.json"
         saved = one_side.read_bytes()

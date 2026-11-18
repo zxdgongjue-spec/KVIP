@@ -245,7 +245,8 @@ def test_low_trace_requires_device_route_and_step_completion(mismatch):
 
 @pytest.mark.parametrize("automatic", [False, True])
 @pytest.mark.parametrize("paired", [False, True])
-def test_measure_profiles_only_after_headline_and_before_graph_reset(tmp_path, monkeypatch, automatic, paired):
+@pytest.mark.parametrize("torch_frontend", [False, True])
+def test_measure_profiles_only_after_headline_and_before_graph_reset(tmp_path, monkeypatch, automatic, paired, torch_frontend):
     events = []
 
     class Graph:
@@ -260,6 +261,20 @@ def test_measure_profiles_only_after_headline_and_before_graph_reset(tmp_path, m
 
         def reset(self):
             events.append("graph_reset")
+
+    class TorchGraph:
+        def replay(self):
+            events.append("replay")
+
+        def reset(self):
+            events.append("graph_reset")
+
+    stream = SimpleNamespace(synchronize=lambda: events.append("sync"))
+
+    def torch_capture(graph, **kwargs):
+        assert torch_frontend and isinstance(graph, TorchGraph) and kwargs == {"stream": stream}
+        events.append("capture")
+        return nullcontext()
 
     class Event:
         def __init__(self, **kwargs):
@@ -318,14 +333,15 @@ def test_measure_profiles_only_after_headline_and_before_graph_reset(tmp_path, m
     result = replay_measure.measure(
         SimpleNamespace(
             __version__="test",
-            npu=SimpleNamespace(Event=Event),
+            npu=SimpleNamespace(Event=Event, NPUGraph=TorchGraph, graph=torch_capture),
             profiler=SimpleNamespace(record_function=lambda name: nullcontext()),
         ),
         SimpleNamespace(AclGraph=Graph),
-        SimpleNamespace(synchronize=lambda: events.append("sync")),
+        stream,
         bundle,
         SimpleNamespace(
             mode="fused",
+            fused_torch_graph=torch_frontend,
             transport="urma",
             threshold_policy="recent",
             warmup=0,

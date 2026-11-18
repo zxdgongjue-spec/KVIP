@@ -59,6 +59,8 @@ def arguments(argv=None):
         help="Separate instrumented fused graph replays after headline timing",
     )
     p.add_argument("--quiet", action="store_true")
+    p.add_argument("--fused-torch-graph", action="store_true",
+                   help="Capture the same fused kernels with the strong serial Torch graph frontend")
     p.add_argument("--check-mode-switch", action="store_true",
                    help="Untimed light-low replay: one captured graph, quotas 0/512/0, restore before each")
     p.add_argument("--check-auto-route", action="store_true",
@@ -98,6 +100,8 @@ def arguments(argv=None):
             p.error("profile-metrics must be unique")
     if not args.kvaf_server:
         p.error("A local KVAF CPU service address is required for this runtime")
+    if args.fused_torch_graph and (args.mode != "fused" or args.study != "post-threshold"):
+        p.error("fused-torch-graph requires a fused post-threshold study")
     if args.mode == "serial" and args.threshold_policy != "resident":
         p.error("Threshold policy changes only the fused path")
     if bool(args.upstream_root) != bool(args.upstream_revision):

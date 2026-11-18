@@ -9,6 +9,7 @@ candidate=
 high_index=0
 joint=0
 account=0
+frontier=0
 init_only=
 if [[ $# == 4 && $1 == --parity && $4 == --high-post-index ]]; then
     joint=1
@@ -18,6 +19,11 @@ if [[ ($# == 2 || $# == 3) && $1 == --parity && $2 =~ ^[0-9a-f]{40}$ ]]; then
     labels=(serial before after after-end before-end serial-end before-profile after-profile)
     candidate=$2
     [[ $# == 2 || $3 =~ ^[0-9a-f]{40}$ ]] || die "Expected a full control SHA"
+elif [[ $# == 2 && $1 == --low-followup && $2 =~ ^[0-9a-f]{40}$ ]]; then
+    account=1
+    frontier=1
+    candidate=$2
+    labels=(serial before torch-front after after-end torch-front-end before-end serial-end)
 elif [[ ($# == 2 || $# == 3) && $1 == --account && $2 =~ ^[0-9a-f]{40}$ ]]; then
     account=1
     labels=(serial before after after-end before-end serial-end)
@@ -36,7 +42,7 @@ elif [[ $# == 2 && $1 == --high-index && $2 =~ ^[0-9a-f]{40}$ ]]; then
     high_index=1
     candidate=$2
 elif [[ $# != 0 ]]; then
-    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA]"
+    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--low-followup CANDIDATE_SHA|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA]"
 fi
 
 diag=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
@@ -52,6 +58,7 @@ after=0f103cc1b6db1beacfb90023d02befc5eff8ae9e
 if [[ -n $candidate ]]; then
     before=${3:-$after}
     if ((account)); then before=66a2f469ebaec3b35fff789a75177ee19b00213e; fi
+    if ((frontier)); then before=cdfc4da4b53b80255740183c7a0a8db8bf350dcb; fi
     after=$candidate
     [[ $after != "$before" ]] && git -C "$repo" merge-base --is-ancestor "$before" "$after" ||
         die "Candidate must be a distinct descendant of $before"
@@ -73,7 +80,7 @@ clean "$diag" || die "Modified diagnostics checkout: $diag"
 for label in "${labels[@]}"; do
     case "$label" in
         serial*) rev=$main; root="$src/main-${rev:0:8}" ;;
-        before*) rev=$before; root="$src/auto-${rev:0:8}" ;;
+        before*|torch-front*) rev=$before; root="$src/auto-${rev:0:8}" ;;
         init-only*) rev=$init_only; root="$src/auto-${rev:0:8}" ;;
         after*) rev=$after; root="$src/auto-${rev:0:8}" ;;
     esac
@@ -150,10 +157,11 @@ for label in "${labels[@]}"; do
         rev=$main; root="$src/main-${rev:0:8}"; args=(--mode serial --serial-workers 32)
     else
         rev=$after
-        if [[ $label == before* ]]; then rev=$before; fi
+        if [[ $label == before* || $label == torch-front* ]]; then rev=$before; fi
         if [[ $label == init-only* ]]; then rev=$init_only; fi
         root="$src/auto-${rev:0:8}"
         args=(--mode fused --study post-threshold --threshold-policy recent --pipeline-variants auto-post-index --check-auto-route)
+        if [[ $label == torch-front* ]]; then args+=(--fused-torch-graph); fi
         if ((joint)); then args+=(--high-post-index); fi
         if ((!capture)) && [[ $label == before || $label == after ]]; then
             extra=(--diagnostic-replays 2 --calibrate-counter)

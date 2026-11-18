@@ -190,7 +190,7 @@ def sample(path, role):
 def summarize(directory):
     files = defaultdict(dict)
     for path in directory.glob("r*-*.json"):
-        match = re.fullmatch(r"r(\d+)-(serial|before|init-only|after)\.json", path.name)
+        match = re.fullmatch(r"r(\d+)-(serial|before|init-only|torch-front|after)\.json", path.name)
         if match:
             number, role = int(match[1]), match[2]
             require(role not in files[number], f"Duplicate role {role} in round {number}")
@@ -198,7 +198,9 @@ def summarize(directory):
     rounds = sorted(files)
     require(len(rounds) >= 2 and rounds == list(range(1, len(rounds) + 1)), "Need consecutive paired rounds from 1")
     has_init_only = any("init-only" in files[i] for i in rounds)
-    roles = ("serial", "before", "init-only", "after") if has_init_only else ROLES
+    has_torch_front = any("torch-front" in files[i] for i in rounds)
+    roles = tuple(r for r in ("serial", "before", "init-only", "torch-front", "after")
+                  if (r != "init-only" or has_init_only) and (r != "torch-front" or has_torch_front))
     require(all(set(files[i]) == set(roles) for i in rounds), "An interleaved round is incomplete")
     rows = {r: [sample(files[i][r], r) for i in rounds] for r in roles}
     base = rows["serial"][0][0]
@@ -314,6 +316,23 @@ def summarize(directory):
             f"PAIRED {candidate}-{control} round_steady_mean/p50_us="
             + ",".join(f"{a['headline'] - b['headline']:+.3f}/{a['p50'] - b['p50']:+.3f}" for a, b in pairs)
         )
+    if has_torch_front:
+        for serial_row, ref_row, torch_row in zip(rows["serial"], rows["before"], rows["torch-front"]):
+            ref, alternate = ref_row[0], torch_row[0]
+            for field in ("kvip_commit", "libraries", "tuning"):
+                require(ref[field] == alternate[field], f"Frontend control differs in {field}")
+            require(set(ref_row[2]) == set(torch_row[2]), "Changing the frontend changed the fused kernel list")
+            for case, expected in ((serial_row[0], "torch.npu.NPUGraph"), (ref, "kvaf.AclGraph"),
+                                   (alternate, "torch.npu.NPUGraph")):
+                prof = case["system_profiles"]["passes"][0]["experiment"]
+                require(case["graph_backend"] == prof["graph_backend"] == expected, "Graph frontend mismatch")
+        for newer, older in (("torch-front", "before"), ("torch-front", "serial")):
+            pairs = [(a[1], b[1]) for a, b in zip(rows[newer], rows[older])]
+            def paired_field(key):
+                return mean(a[key] - b[key] for a, b in pairs)
+            brackets = ",".join(f"{a['headline']-b['headline']:+.3f}/{a['p50']-b['p50']:+.3f}" for a,b in pairs)
+            print(f"FRONTEND {newer}-{older} steady_mean_us={paired_field('headline'):+.3f} "
+                  f"kernel_span_delta={paired_field('kernel_span'):+.3f} round_mean/p50_us={brackets}")
     if has_init_only:
         for newer, older in (("init-only", "before"), ("after", "init-only")):
             matched = [(a[1], b[1]) for a, b in zip(rows[newer], rows[older])]
