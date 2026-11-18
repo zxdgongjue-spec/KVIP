@@ -4,6 +4,7 @@
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+import subprocess
 import sys
 
 import numpy as np
@@ -548,8 +549,13 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
                 torch, library, bundle.rotating.device, stream)
     if auto is not None and getattr(args, "check_auto_route", False):
         phase(retained, "auto_route_lifecycle")
+        post_index = (getattr(bundle, "tuning", {}).get("low_miss_post_index")
+                      and getattr(bundle.forward, "post_index", None) is not None)
+        preserve_map = bool(post_index and low_post_index_preserves_map(
+            getattr(args, "upstream_root", None), getattr(args, "upstream_revision", None)))
         result["auto_route"]["lifecycle"] = check_auto_route(
-            torch, stream, bundle, lambda: replay(graph), args.iterations + diagnostic_count
+            torch, stream, bundle, lambda: replay(graph), args.iterations + diagnostic_count,
+            preserve_low_map=preserve_map,
         )
     if getattr(args, "profile_dir", None) is not None:
         from kvip.diagnostics.system_profile import collect_system_profiles
@@ -950,7 +956,45 @@ def study_cases(args):
     return {policy: {"recent_threshold": policy == "recent", "recent_skip": True} for policy in ("resident", "recent")}
 
 
-def check_auto_route(torch, stream, bundle, replay, last_step):
+def low_post_index_preserves_map(root, revision):
+    """0f103cc1 removed the LOW tail-map writes. Check the pinned producer, not the harness."""
+    if root is None and revision is None:
+        return False  # Bundled (un-pinned) diagnostic producer uses InitializeTailMappings.
+    if not root or not revision:
+        raise ValueError("Incomplete production checkout for sparse-map contract")
+    introduced = "0f103cc1b6db1beacfb90023d02befc5eff8ae9e"
+    if revision == introduced:
+        return True
+    check = subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor", introduced, revision],
+                           capture_output=True, text=True)
+    if check.returncode not in (0, 1):
+        raise RuntimeError(f"Cannot establish sparse-map contract for {revision}: {check.stderr.strip()}")
+    return check.returncode == 0
+
+
+def validate_sparse_history_map(mapping, bounds, resident, capacity, *, write_tail, step_name):
+    """Check every poisoned word, including the ABC range, against one producer contract."""
+    if mapping.ndim != 2 or bounds.shape != (len(mapping), 2) or capacity < 0:
+        raise ValueError("Invalid sparse history-map geometry")
+    for i, (row, (start, stop)) in enumerate(zip(mapping, bounds)):
+        start, stop = int(start), int(stop)
+        # Negative NumPy indices would wrap around to the end of this row.
+        # Invalid capture bounds must never be interpreted as valid tail IDs.
+        if not 0 <= start <= stop <= 0xffffffff or start + capacity > 1 << 32:
+            raise ValueError(f"Invalid ABC bounds step={step_name} row={i} start={start} stop={stop}")
+        expected = np.full(row.shape, resident, dtype=row.dtype)
+        if write_tail and capacity:
+            ids = np.arange(start, min(stop, start + capacity, len(row)))
+            expected[ids] = resident + 8192 + ids % capacity
+        wrong = np.flatnonzero(row != expected)
+        if wrong.size:
+            col = int(wrong[0])
+            raise AssertionError(f"Sparse history-map mismatch step={step_name} row={i} token={col} "
+                                 f"policy={'write_abc' if write_tail else 'preserve_all'} "
+                                 f"expected={int(expected[col])} actual={int(row[col])}")
+
+
+def check_auto_route(torch, stream, bundle, replay, last_step, *, preserve_low_map=False):
     """Same captured graph, real packed-row reorder, device-owned feedback."""
     from kvip.diagnostics.auto_replay import RowPermutation, requests_for
 
@@ -991,13 +1035,8 @@ def check_auto_route(torch, stream, bundle, replay, last_step):
             resident = bundle.rotating.hot_valid.shape[1]
             bounds = selected.array("pre.tail_bounds")
             capacity = selected.manifest["geometry"]["output_stride"] - resident
-            for row, (start, stop) in zip(mapping, bounds):
-                expected = np.full(row.shape, resident, dtype=row.dtype)
-                ids = np.arange(int(start), min(int(stop), int(start) + capacity, len(row)))
-                if len(ids):
-                    expected[ids] = resident + 8192 + ids % capacity
-                if not np.array_equal(row, expected):
-                    raise AssertionError("Sparse low init changed unused history-map words")
+            validate_sparse_history_map(mapping, bounds, resident, capacity,
+                                        write_tail=not preserve_low_map, step_name=name)
         rows.append(dict(name=name, **observation, poisoned_history_map=sparse))
 
     run("learning-disabled", last_step + 1, learning=False)
@@ -1024,6 +1063,8 @@ def check_auto_route(torch, stream, bundle, replay, last_step):
                 feedback_reset=False, real_packed_row_reorder=True,
                 prediction_fault_injection=True,
                 scope="Untimed prediction fault injection and identity rejection, not a real transport fault; frozen payload restored, not consecutive service cache evolution")
+    if bundle.tuning.get("low_miss_sparse_init"):
+        result["low_history_map_contract"] = "preserve_all" if preserve_low_map else "write_abc"
     if bundle.tuning.get("low_miss_read_through"):
         result["persistent_carry"] = check_read_through_carry(torch, stream, bundle, replay)
     return result

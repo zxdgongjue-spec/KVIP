@@ -360,7 +360,8 @@ def test_diagnostics_advance_measured_feedback_before_lifecycle_without_timing_t
         def elapsed_time(self, other):
             return [0.0, 0.010, 0.020, 0.030][automatic.step]
 
-    def lifecycle(torch, stream, bundle, replay, last_step):
+    def lifecycle(torch, stream, bundle, replay, last_step, *, preserve_low_map):
+        assert preserve_low_map is False
         assert last_step == 5
         assert log[-1] == ("replay", 5, True, True)
         log.append("lifecycle")
