@@ -300,6 +300,8 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a,uint32_t blo
         post_index_tail::Flush(r);
         SyncAll();
     }
+    // Common endpoint after the last collective in either order.
+    if (profile) ticks[13]=GetSystemCycle();
     if (!lane) {
         uint32_t completed=0;
         uint64_t failed=RowErrors(records,b,batch,cores);
