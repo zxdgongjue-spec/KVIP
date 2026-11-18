@@ -603,11 +603,31 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
             verify=profile_verify,
             directory=args.profile_dir,
             case=f"{args.transport}-{args.mode}-{variant}",
+            graph_events=(begin, end, stream) if getattr(args, "profile_graph_event", False) else None,
             metrics=args.profile_metrics,
             metadata=metadata,
             retained=retained,
             checkpoint=lambda name, step: phase(retained, name, step),
         )
+    if getattr(args, "profile_graph_event", False):
+        from kvip.diagnostics.graph_queue_probe import probe
+
+        def prepare_step(step):
+            phase(retained, "queue_probe_restore", step)
+            reset()
+            if auto is not None:
+                auto.begin(step=step, learning=True)
+
+        def verify_step(step):
+            counts = verify()
+            if auto is not None:
+                verified_low_trace(auto, counts, step)
+            return counts["final"]
+
+        phase(retained, "unprofiled_queue_probe")
+        result["queue_probe"] = probe(torch, stream, begin, end, lambda: replay(graph), prepare_step,
+                                      verify_step, last_step + 1, reads[-1]["final"])
+        last_step += len(result["queue_probe"]["samples"])
     if auto is not None and getattr(args, "check_auto_route", False):
         phase(retained, "auto_route_lifecycle")
         post_index = (getattr(bundle, "tuning", {}).get("low_miss_post_index")

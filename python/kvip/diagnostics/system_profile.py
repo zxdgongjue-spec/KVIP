@@ -142,7 +142,8 @@ def inspect_artifacts(directory, metric):
 
 
 def collect_system_profiles(
-    *, torch, reset, replay, synchronize, verify, directory, case, metrics, metadata, retained, checkpoint, npu=None
+    *, torch, reset, replay, synchronize, verify, directory, case, metrics, metadata, retained, checkpoint,
+    npu=None, graph_events=None
 ):
     """Restore/fence outside collection; profile one existing graph per metric."""
     if npu is None:
@@ -218,13 +219,20 @@ def collect_system_profiles(
             started = True
             checkpoint("profile_replay_and_sync", step)
             with torch.profiler.record_function(report["cpu_range"]):
+                if graph_events is not None:
+                    begin, end, stream = graph_events  # Preallocated and primed in headline measurement.
+                    begin.record(stream)
                 replay()
+                if graph_events is not None:
+                    end.record(stream)
                 synchronize()
             checkpoint("profile_stop_and_export", step)
             stop_attempted = True
             profiler.stop()  # Synchronous Text analysis/export callback.
             checkpoint("profile_verify", step)
             verify()
+            if graph_events is not None:
+                report["graph_event_us"] = float(begin.elapsed_time(end)) * 1000
             report.update(status="captured", correctness="passed", artifacts=inspect_artifacts(target, name))
             save()
         except BaseException as error:

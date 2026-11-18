@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from kvip.diagnostics import replay, replay_measure, system_profile
+from kvip.diagnostics import graph_queue_probe, replay, replay_measure, system_profile
 
 
 def fake_npu(events, *, stop_error=False, mutate_config=False):
@@ -191,6 +191,8 @@ def cli(tmp_path, *extra):
 @pytest.mark.parametrize(
     "extra",
     [
+        ["--profile-graph-event"],
+        ["--profile-dir", "p", "--profile-graph-event", "--profile-metrics", "Memory"],
         ["--profile-metrics", "Memory"],
         ["--profile-dir", "profiles", "--profile-metrics", "Memory", "Memory"],
         ["--profile-dir", "profiles", "--diagnostic-replays", "1"],
@@ -242,7 +244,8 @@ def test_low_trace_requires_device_route_and_step_completion(mismatch):
 
 
 @pytest.mark.parametrize("automatic", [False, True])
-def test_measure_profiles_only_after_headline_and_before_graph_reset(tmp_path, monkeypatch, automatic):
+@pytest.mark.parametrize("paired", [False, True])
+def test_measure_profiles_only_after_headline_and_before_graph_reset(tmp_path, monkeypatch, automatic, paired):
     events = []
 
     class Graph:
@@ -275,11 +278,20 @@ def test_measure_profiles_only_after_headline_and_before_graph_reset(tmp_path, m
     monkeypatch.setattr(
         system_profile, "collect_system_profiles", lambda **kwargs: original(**kwargs, npu=fake_npu(events))
     )
+    def queue_probe(torch, stream, begin, end, replay, prepare, verify, first_step, expected_get):
+        assert paired and expected_get == 955
+        for step in range(first_step, first_step + 4):
+            prepare(step)
+            replay()
+            assert verify(step) == 955
+        return dict(samples=[{} for _ in range(4)])
+
+    monkeypatch.setattr(graph_queue_probe, "probe", queue_probe)
     bundle = SimpleNamespace(
         reset=lambda: events.append("reset"),
-        verify=lambda: events.append("verify"),
+        verify=lambda: events.append("verify") or {"final": 955},
         forward=lambda: events.append("forward"),
-        read_counts=lambda: {},
+        read_counts=lambda: {"final": 955},
         lease=None,
     )
     if automatic:
@@ -290,7 +302,7 @@ def test_measure_profiles_only_after_headline_and_before_graph_reset(tmp_path, m
             bundle.auto_replay.requests = [[7, 1, step, 4]]
 
         def lifecycle(*args, **kwargs):
-            assert args[-1] == 3 and events[-1] == "verify"
+            assert args[-1] == (7 if paired else 3) and events[-1] == "verify"
             events.append("lifecycle")
             return {"status": "pass"}
 
@@ -321,16 +333,41 @@ def test_measure_profiles_only_after_headline_and_before_graph_reset(tmp_path, m
             check_auto_route=automatic,
             profile_dir=tmp_path,
             profile_metrics=["none"],
+            profile_graph_event=paired,
         ),
         {"progress": {"variant": variant}, "profile_metadata": {}},
     )
     assert result["timing"]["samples_us"] == [10.0] * iterations
     timed_then_profile = ["verify", "reset", *(["begin-3"] if automatic else []),
-                          "sync", "start", "replay", "sync", "stop", "export", "verify",
-                          *(["lifecycle"] if automatic else []), "graph_reset"]
+                          "sync", "start", *(["event"] if paired else []), "replay", *(["event"] if paired else []),
+                          "sync", "stop", "export", "verify"]
+    if paired:
+        for i in range(4):
+            timed_then_profile.extend(["reset", *([f"begin-{4+i}"] if automatic else []), "replay", "verify"])
+    timed_then_profile.extend([*(["lifecycle"] if automatic else []), "graph_reset"])
     assert events[-len(timed_then_profile):] == timed_then_profile
-    assert events.count("event") == 2 * iterations
+    assert events.count("event") == 2 * (iterations + int(paired))
     if automatic:
         manifest = json.loads((tmp_path / f"urma-fused-{variant}/none/profile_manifest.json").read_text())
         assert manifest["experiment"]["auto_route"]["mode"] == "low" and manifest["experiment"]["auto_route"]["step"] == 3
         assert result["auto_route"]["low_steps"] == 2
+
+
+def test_graph_events_bracket_exactly_the_exported_replay(tmp_path):
+    events = []
+    stream = object()
+
+    def record(s):
+        assert s is stream
+        events.append("event")
+
+    end = SimpleNamespace(record=record)
+
+    def elapsed(e):
+        assert e is end and events[-1] == "verify"
+        return .401
+
+    begin = SimpleNamespace(record=record, elapsed_time=elapsed)
+    result = collect(tmp_path, events, metrics=["none"], graph_events=(begin, end, stream))
+    assert events == ["reset", "sync", "start", "event", "replay", "event", "sync", "stop", "export", "verify"]
+    assert result["passes"][0]["graph_event_us"] == 401

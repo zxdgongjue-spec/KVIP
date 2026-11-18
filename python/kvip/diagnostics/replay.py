@@ -70,6 +70,8 @@ def arguments(argv=None):
     p.add_argument("--calibrate-counter", action="store_true",
                    help="After headline timing, calibrate device cycles with three independent long graph events")
     p.add_argument("--profile-dir", type=Path, help="Independent system traces, outside headline timing")
+    p.add_argument("--profile-graph-event", action="store_true",
+                   help="Record the complete graph Event inside the same Level0 trace")
     p.add_argument("--profile-metrics", nargs="+", choices=PROFILE_METRICS, default=None)
     p.add_argument(
         "--topk-probe",
@@ -84,6 +86,8 @@ def arguments(argv=None):
         p.error("Output already exists")
     if args.profile_metrics is not None and args.profile_dir is None:
         p.error("profile-metrics requires profile-dir")
+    if args.profile_graph_event and (args.profile_dir is None or args.profile_metrics not in (None, ["none"])):
+        p.error("profile-graph-event requires a Level0 timeline (--profile-dir, metric none)")
     if args.profile_dir is not None:
         if args.topk_probe or args.diagnostic_replays:
             p.error("profile-dir cannot be combined with topk-probe or diagnostic-replays")
