@@ -49,3 +49,12 @@
 - 模型输入是已有最终score，mapping/LRU固定，只验证隔离后处理契约；不模拟动态Service/URMA/Index，也未实现producer/consumer常驻融合。没有真实A5时间或msprof，脚本供服务器采集。
 - 容器入口`run_tail_in_container.sh`补为正式仓库文件；六项本地shell检查通过，覆盖仓库入口/共享入口、显式共享路径、参数转交、缺少release的更新提示及无参数启动。宿主机发布使用同一仓库文件；旧提交保留原生成方式。没有执行NPU。
 - 现有`run_tail_a5.sh`新增`--from-repo`，直接构建当前仓库，无需共享release/bundle。五项本地编排检查通过：无共享包时校验、B16参数与bench/profile转交且禁止fetch/bundle/clone/worktree、构建失败退出码23并停止后续执行、模式冲突拒绝、原共享模式兼容。使用真实本地Git与模拟NPU/backend，仅验证编排，不产生设备性能；工作区修改保留，记录源码状态。
+
+## B1 history 1/2/4/8/16/32/30 单轴对比
+
+- 新正式入口`run_history_a5.sh`直接从仓库执行，固定B1/Q4/H131072/G32/D128/TopK2048。七点均一次score启动，实际下发T个AIC、2T个AIV；Final仍四AIV。
+- T30按原生H128 tile均衡，26片4352 key、4片4480 key；C++/Python每个Q/history坐标覆盖一次，最大片长差128。原power-of-two分片边界保持不变。
+- 新四项CPU检查通过：两个history几何的C++/Python一致与覆盖、真实host在ACL stub下的七点score/scatter/TopK/guard/oracle、汇总同轮配对并拒绝错误核数、正式脚本plan-only和32/64预算校验。原七项score回归检查全部通过。
+- 真实shell/local Git配合模拟NPU/backend的编排检查通过：不fetch或导入bundle，转交history7与warmup4/iterations20/rounds3，七点msprof另采，构建失败23停止后续执行并保存日志。没有设备性能数据。
+- CANN9.1.0/Ascend950PR_9599 fresh NPU构建与host链接通过。仅在本地无驱动容器链接时，将匹配CANN的devlib追加到已有LD_LIBRARY_PATH；没有使用该构建执行NPU。此前两个因本地驱动/依赖搜索路径失败的构建保留为失败记录，不作为通过结果。
+- 证据为`tests/results/li-tail-20261117/history7-plan.json`、`history7-cpu-checks.log`、`history7-launcher-*/receipt.json`及`history7-npu-final/build-manifest.json`。A5时间和msprof需真机执行新脚本采集。

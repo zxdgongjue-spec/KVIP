@@ -180,6 +180,8 @@ static void Run(const std::string& fixture,const std::string& output,const li_qk
     std::ofstream report(output+"/report.json");report<<std::setprecision(10);
     report<<"{\"status\":\"PASS\",\"run_mode\":\""<<LI_QK_RUN_MODE<<"\",\"batch\":"<<p.batch<<",\"queries\":4,\"history\":"<<h<<",\"heads\":"<<g
       <<",\"history_parts\":"<<p.historyParts<<",\"query_parts\":"<<p.queryParts<<",\"logical_query_group\":"<<p.queryGroup<<",\"physical_query_tile\":"<<p.physicalGroup
+      <<",\"score_peak_aics\":"<<(p.balanced?p.capacity:waves[0].rows)<<",\"score_peak_aivs\":"<<2*(p.balanced?p.capacity:waves[0].rows)
+      <<",\"history_partition_quantum\":"<<(p.balanced?p.workGrain:(p.historyParts==30?128:256))
       <<",\"schedule\":\""<<(p.balanced?"balanced":"waves")<<"\",\"work_grain\":"<<p.workGrain<<",\"phase\":\""<<phase<<"\",\"capacity\":"<<p.capacity<<",\"tasks\":"<<p.tasks.size()<<",\"score_waves\":"<<(p.balanced?1:waves.size())<<",\"score_slots\":"<<waves.size()<<",\"score_launches\":"<<((modelStage=="all" || modelStage=="score")?(p.balanced?1:waves.size()):0)
       <<",\"scatter_launches\":"<<((modelStage=="all" || modelStage=="scatter") && !alias?waves.size():0)<<",\"canonical_alias\":"<<(alias?"true":"false")<<",\"topk_launches\":"<<(topkChecked?1:0)<<",\"fetch_launches\":0,\"final_topk_aivs\":"<<queries<<",\"k\":2048,\"warmup\":"<<warmup<<",\"iterations\":"<<iterations
       <<",\"score_p50_us\":";if(native && !scoreUs.empty())report<<Median(scoreUs);else report<<"null";

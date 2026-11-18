@@ -18,7 +18,7 @@ inline Plan MakePlan(uint32_t history,uint32_t heads,uint32_t aics,uint32_t aivs
                      uint32_t workGrain=2048,bool shortScore=false) {
     if (!history || history%256 || history>210944 || (history<2048 && !(shortScore && balanced)) ||
         heads!=32 || !aics || aics>32 || aivs<2 || aivs>64 ||
-        !(historyParts==1 || historyParts==2 || historyParts==4 || historyParts==8 || historyParts==16 || historyParts==32) ||
+        !(historyParts==1 || historyParts==2 || historyParts==4 || historyParts==8 || historyParts==16 || historyParts==32 || historyParts==30) ||
         !(queryParts==1 || queryParts==2 || queryParts==4) || (!balanced && history/256<historyParts) ||
         !(batch==1 || batch==16) || (batch==16 && (queryParts!=1 || historyParts>2)))
         throw std::invalid_argument("LI QK: B1 T<=32 or B16 T1/T2 Q4; G32 and aligned H required");
@@ -26,8 +26,11 @@ inline Plan MakePlan(uint32_t history,uint32_t heads,uint32_t aics,uint32_t aivs
     Plan p{history,heads,historyParts,queryParts,group,std::max(2U,group),std::min(aics,aivs/2),0,{}};
     p.batch=batch;p.balanced=balanced;p.workGrain=workGrain;
     if(!balanced && workGrain!=2048)throw std::invalid_argument("work grain applies to balanced score only");
+    // Non-power-of-two T30 balances complete native H128 tiles. Preserve
+    // the existing 256-token boundaries for the original controls.
+    const uint32_t quantum=historyParts==30?128:256;
     for(uint32_t b=0;b<batch;++b)for(uint32_t q=0;q<4;q+=group)for(uint32_t t=0;t<historyParts;++t) {
-        uint32_t lo=history/256*t/historyParts*256,hi=history/256*(t+1)/historyParts*256;
+        uint32_t lo=history/quantum*t/historyParts*quantum,hi=history/quantum*(t+1)/historyParts*quantum;
         p.tasks.push_back({q,group,lo,hi,b});p.stride=std::max(p.stride,hi-lo);
     }
     if(balanced) {

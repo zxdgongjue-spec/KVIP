@@ -17,13 +17,13 @@ def main():
     p.add_argument('action',choices=('plan','run'))
     p.add_argument('--build',type=Path,required=True);p.add_argument('--output',type=Path,required=True)
     p.add_argument('--device',type=int,default=5)
-    p.add_argument('--suite',choices=('orthogonal7','orthogonal8','batch16'),default='batch16')
+    p.add_argument('--suite',choices=('orthogonal7','orthogonal8','history7','batch16'),default='batch16')
     p.add_argument('--history',type=int,default=131072)
     p.add_argument('--metrics',choices=('PipeUtilization','Memory','ResourceConflictRatio'),default='PipeUtilization')
     p.add_argument('--timeout',type=int,default=900)
     p.add_argument('--work-grain',type=int,default=2048)
     a=p.parse_args();a.build=a.build.resolve();a.output=a.output.resolve()
-    configs=suite_cases('batch16') if a.suite=='batch16' else [dict(batch=1,history_parts=16 if a.suite=='orthogonal7' else 32,query_parts=1,schedule='waves')]
+    configs=suite_cases(a.suite) if a.suite in ('batch16','history7') else [dict(batch=1,history_parts=16 if a.suite=='orthogonal7' else 32,query_parts=1,schedule='waves')]
     cases=[]
     for c in configs:
         c=dict(c);b=c['batch'];c.update(aics=30 if b==16 else 32,aivs=60 if b==16 else 64)

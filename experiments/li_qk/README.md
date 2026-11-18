@@ -181,6 +181,35 @@ done
 
 全核七点Model脚本是 [run_granularity_model.sh](run_granularity_model.sh)，汇总为 [grain_summary.py](grain_summary.py)。报告同时解释128计算tile、分配量子、连续片段、canonical与Final，及尚未实施的初始化复用和producer直写方向。
 
+## B1/Q4 history 1/2/4/8/16/32/30 核组对比
+
+在实际检出MR14源分支的仓库根目录中，直接运行正式仓库脚本：
+
+```bash
+# 只查看完整任务分配，不需要NPU
+bash experiments/li_qk/run_history_a5.sh --plan-only
+# 七个history点，分别计score和完整数字LI
+bash experiments/li_qk/run_history_a5.sh
+# 同样七点，结束后另采msprof
+bash experiments/li_qk/run_history_a5.sh --profile
+```
+
+固定B1/Q4/H131072/G32/D128/TopK2048，只切history，Qparts始终1。各点一次score启动，实际下发T个AIC核组、2T个AIV；各片保留完整Q4。Final仍使用相同的四AIV TopK，不随history分片数改变；不执行resident/Cold分类、Service、Fetch或Index。
+
+| history分片/score AIC核组 | score AIV | 每核history key数 |
+|---:|---:|---:|
+| 1 | 2 | 131072 |
+| 2 | 4 | 65536 |
+| 4 | 8 | 32768 |
+| 8 | 16 | 16384 |
+| 16 | 32 | 8192 |
+| 32 | 64 | 4096 |
+| 30 | 60 | 26核×4352，4核×4480 |
+
+H131072无法整数均分30核，T30按原生H128 tile均衡，片长只差一个tile；其他点保留原边界。T30是30个独立连续分片、一次score启动，不是T32在30核预算下的30+2两波。所有点使用同一fixture/build，warmup4/iterations20、丢弃r0、三轮交错、按同轮T1配对。
+
+默认device5，结果写到新的`/home/w00568585/li_history7_*`目录，`results/summary.csv`包含每个T的score/LI p50均值与同轮T1比值、实际下发核数、片长和启动数。`score_p50`只含score；`li_p50`包含必要scatter和同一个Final TopK。`msprof/`另存七点trace，不计入基准。需要时追加`--cann-root PATH --kvaf-include PATH --soc NAME`。不在容器fetch，不要求共享发布包。
+
 ## Score后的持续分核控制
 
 需求见 [TAIL_PROMPT.md](TAIL_PROMPT.md)，源码/阶段规模/论文依据/实测见 [TAIL_REPORT.md](TAIL_REPORT.md)。新入口读取相同的最终sortable score，不运行QK、Fetch、Service或Index：C0单owner GM Cold＋库上Final primitive，C1只分Cold，C2只分Final，C3两者都分；默认resident仍调用原TopK/θ/Hot primitive。C0是隔离后处理控制，不是SDK或生产P2整链。

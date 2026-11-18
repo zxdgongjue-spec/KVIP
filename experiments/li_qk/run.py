@@ -26,6 +26,9 @@ def suite_cases(suite):
     if suite in ('orthogonal7','orthogonal8'):
         return [dict(batch=1,history_parts=t,query_parts=q,schedule='waves')
                 for t,q in POINTS+(((32,1),) if suite=='orthogonal8' else ())]
+    if suite=='history7':
+        return [dict(batch=1,history_parts=t,query_parts=1,schedule='waves')
+                for t in (1,2,4,8,16,32,30)]
     if suite=='batch16':
         return [dict(batch=16,history_parts=t,query_parts=1,schedule=s)
                 for t,s in ((1,'waves'),(2,'waves'),(2,'balanced'))]
@@ -70,15 +73,16 @@ def make_fixture(output,batch,history,heads):
 
 def geometry(t,qp,history=131072,aics=32,aivs=64,batch=1,schedule="waves",work_grain=2048,score_only=False):
     minimum=256 if score_only and schedule=='balanced' else 2048
-    if t not in (1,2,4,8,16,32) or qp not in (1,2,4) or history<minimum or history>210944 or history%256:
-        raise ValueError('T=1/2/4/8/16/32, Qparts=1/2/4, aligned history 2048..210944 required')
+    if t not in (1,2,4,8,16,32,30) or qp not in (1,2,4) or history<minimum or history>210944 or history%256:
+        raise ValueError('T=1/2/4/8/16/32/30, Qparts=1/2/4, aligned history 2048..210944 required')
     if not 1<=aics<=32 or not 2<=aivs<=64 or (schedule!='balanced' and history//256<t):
         raise ValueError('valid AIC/AIV budget and nonempty shards required')
     if batch not in (1,16) or schedule not in ('waves','balanced') or (batch==16 and (t>2 or qp!=1)):
         raise ValueError('B1 axes or B16 T1/T2 Q4 required')
     group=4//qp;physical=max(2,group);capacity=min(aics,aivs//2)
     if schedule!='balanced' and work_grain!=2048:raise ValueError('work grain applies to balanced score only')
-    tasks=[dict(query_begin=q,query_count=group,begin=history//256*s//t*256,end=history//256*(s+1)//t*256)
+    quantum=128 if t==30 else 256
+    tasks=[dict(query_begin=q,query_count=group,begin=history//quantum*s//t*quantum,end=history//quantum*(s+1)//t*quantum)
            for b in range(batch) for q in range(0,4,group) for s in range(t)]
     if batch>1:
         for i,task in enumerate(tasks):task["owner"]=i//(qp*t)
@@ -110,6 +114,9 @@ def geometry(t,qp,history=131072,aics=32,aivs=64,batch=1,schedule="waves",work_g
                 score_output_bytes=batch*4*history*2,
                 scratch_score_bytes=len(tasks)*physical*max(lengths)*2,
                 canonical_alias=t==1 and physical==group and len(waves)==1,
+                history_partition_quantum=work_grain if schedule=='balanced' else quantum,
+                score_peak_aics=capacity if schedule=='balanced' else min(capacity,len(tasks)),
+                score_peak_aivs=2*(capacity if schedule=='balanced' else min(capacity,len(tasks))),
                 final_topk_aivs=batch*4,k=2048,fetch_launches=0)
 
 
@@ -172,6 +179,12 @@ def write_summary(output):
             raise ValueError('unaccepted schedule/isolated profiling report')
         if r.get('work_grain',2048)!=(manifest.get('work_grain',2048) if item.get('schedule')=='balanced' else 2048):
             raise ValueError('unaccepted work grain')
+        if manifest.get('suite')=='history7':
+            expected_plan=geometry(item['history_parts'],1,manifest['history'],32,64)
+            for field in ('score_peak_aics','score_peak_aivs','history_partition_quantum','final_topk_aivs'):
+                if r.get(field)!=expected_plan[field]:raise ValueError('history7 core allocation mismatch: '+field)
+            if r['score_waves']!=1 or r.get('score_launches')!=1 or r.get('tasks')!=item['history_parts']:
+                raise ValueError('history7 requires one score launch covering every shard')
         for name in ('score','li'):
             v=r[name+'_p50_us'];samples=r[name+'_samples_us']
             if not isinstance(v,(int,float)) or not math.isfinite(v) or v<=0 or len(samples)!=manifest['iterations']:
@@ -213,6 +226,12 @@ def write_summary(output):
                  li_over_serial_mean=statistics.mean(r['li_over_serial'] for r in rr),
                  score_over_serial_per_round=[r['score_over_serial'] for r in rr],
                  li_over_serial_per_round=[r['li_over_serial'] for r in rr])
+        if manifest.get('suite')=='history7':
+            planned=geometry(t,1,manifest['history'],32,64)
+            row.update(score_peak_aics=planned['score_peak_aics'],score_peak_aivs=planned['score_peak_aivs'],
+                       history_partition_quantum=planned['history_partition_quantum'],
+                       min_history_per_core=min(planned['key_tokens_per_task']),max_history_per_core=max(planned['key_tokens_per_task']),
+                       score_launches=1,final_topk_aivs=4)
         if sdk_cases:
             if any(r['round'] not in sdk for r in rr):raise ValueError('missing paired SDK reference')
             row.update(sdk_li_p50_mean_us=statistics.mean(sdk[r['round']] for r in rr),
@@ -293,7 +312,7 @@ def main():
     b.add_argument('--soc',required=True);b.add_argument('--kvaf-include',type=Path,required=True);b.add_argument('--jobs',type=int,default=4);b.add_argument('--run-mode',choices=('npu','sim'),default='npu')
     for name in ('plan','run'):
         s=subs.add_parser(name);s.add_argument('--history',type=int,default=131072);s.add_argument('--aics',type=int,default=32);s.add_argument('--aivs',type=int,default=64)
-        s.add_argument('--suite',choices=('orthogonal7','orthogonal8','batch16'),default='orthogonal7')
+        s.add_argument('--suite',choices=('orthogonal7','orthogonal8','history7','batch16'),default='orthogonal7')
         s.add_argument('--work-grain',type=int,default=2048,help='balanced work allocation quantum; hardware score tile remains128')
         if name=='plan':s.add_argument('--details',action='store_true',help='include every query/history task interval')
         if name=='run':
@@ -309,7 +328,7 @@ def main():
         configs=suite_cases(a.suite)
         if a.suite!='batch16' and a.work_grain!=2048:p.error('work grain applies to batch16 balanced only')
         rows=[geometry(c['history_parts'],c['query_parts'],a.history,a.aics,a.aivs,c['batch'],c['schedule'],a.work_grain if c['schedule']=='balanced' else 2048) for c in configs]
-        if a.suite=='orthogonal8' and min(a.aics,a.aivs//2)<32:p.error('K32 suite requires32 AIC/64 AIV; use orthogonal7 for smaller budgets')
+        if a.suite in ('orthogonal8','history7') and min(a.aics,a.aivs//2)<32:p.error('K32 suite requires32 AIC/64 AIV; use orthogonal7 for smaller budgets')
         if a.suite=='batch16' and min(a.aics,a.aivs//2)!=30:p.error('batch16 suite requires --aics30 --aivs60 (or64)')
     if a.action=='plan':
         if not a.details:rows=[{k:v for k,v in r.items() if k!='task_map'} for r in rows]
