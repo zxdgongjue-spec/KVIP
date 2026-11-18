@@ -185,12 +185,15 @@ def summarize(group, cases, baseline, candidate, high_overlap=False, schedule_fo
         if baseline == FIXED_FUSED_REVISION:
             # Use same-side graphs for paired *brackets*. Individual samples
             # may have different speculative work; exact matches are above.
-            def slowdown(a, b):
-                return two(100 * (x / y - 1) for x, y in zip(times[a], times[b]))
+            reductions = [tuple(100 * (b-c) / b for b, c in zip(times[ref], times[candidate_arm]))
+                          for ref in ("original", "original-end") for candidate_arm in ("after", "after-end")]
+            first, last = reductions[0], reductions[-1]
             print(f"G{group} FIXED_FUSED source={baseline[:8]} policy=original_per_row flag_high_post_index=0"
                   f" ref_first/end_mean/p50_us={two(times['original'])},{two(times['original-end'])}"
                   f" candidate_first/end_mean/p50_us={two(times['after'])},{two(times['after-end'])}"
-                  f" slower_pct_first/end_mean/p50={slowdown('after','original')},{slowdown('after-end','original-end')}")
+                  f" reduction_pct_first/end_mean/p50={two(first)},{two(last)}"
+                  f" all_brackets_reduction_pct_min/max_mean/p50={two(map(min, zip(*reductions)))},{two(map(max, zip(*reductions)))}"
+                  f" slower_pct_first/end_mean/p50={two(0-v for v in first)},{two(0-v for v in last)}")
         if intermediate:
             middle_gain = [diff(b, m) for b in ("before", "before-end") for m in ("middle", "middle-end")]
             middle = [diff(b, a) for b in ("middle", "middle-end") for a in ("after", "after-end")]

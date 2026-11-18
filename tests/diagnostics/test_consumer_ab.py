@@ -139,7 +139,11 @@ def test_high_overlap_arms_reuse_public_completion_records(tmp_path, capsys, for
         for name in ("original", "original-end", "before", "before-end"):
             cases[name]["kvip_commit"] = FIXED_FUSED_REVISION
         summarize(7, cases, FIXED_FUSED_REVISION, args.revision, True, formats)
-        assert ("FIXED_FUSED source=4cb3917d" in capsys.readouterr().out)
+        fixed = next(row for row in capsys.readouterr().out.splitlines() if " FIXED_FUSED " in row)
+        assert "source=4cb3917d" in fixed
+        assert "reduction_pct_first/end_mean/p50=-0.200/-0.200,-0.201/-0.201" in fixed
+        assert "all_brackets_reduction_pct_min/max_mean/p50=-0.602/-0.602,0.200/0.200" in fixed
+        assert "slower_pct_first/end_mean/p50=0.200/0.200,0.201/0.201" in fixed
         for name in ("original", "original-end", "before", "before-end"):
             cases[name]["kvip_commit"] = args.baseline
     cases["after"]["reads_samples"][1]["high_post_index"]["final_get_by_core"] = [0]*64
