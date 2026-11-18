@@ -51,7 +51,8 @@ QueueArgs GetArgs(Context*,unsigned queue){assert(queue==FinalQueue(16,4,0,lane)
 FinalPost* FinalPostAt(unsigned,Context* c,unsigned base){assert(!base); return c->post;}
 unsigned AwaitPublication(BatchFlag* f){while(!f->ready.load())std::this_thread::yield();return f->error;}
 unsigned Producer(Args*,unsigned){assert(lane==0);return 5;}
-template<bool> void OutputWorker(Args*,unsigned){assert(lane==1);}
+enum class OutputRole { Descriptors, Tnd };
+template<bool,OutputRole Role> void OutputWorker(Args*,unsigned){assert(lane==(Role==OutputRole::Descriptors?1:3));}
 void Plan(Args*,unsigned,Edge*,uint32_t*,bool,PrivatePlan& p){assert(lane==2);p.error=sim->input.badPlan;}
 void CompletePrefetch(Context* c,unsigned,bool){assert(lane==0);assert(sim->prefetch.fetch_add(1)==0);reinterpret_cast<Row*>(c->rows)->error|=sim->input.badDrain;}
 namespace post_index_tail {struct Record {uint64_t error{},globalError{},count{},fallback{},completed{},active{},start{},planDone{},packDone{},postBegin{},postDone{},indexDone{},cqDone{};};void Flush(Record*){} }

@@ -77,7 +77,8 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
     }
     uint32_t useful=0,error=0;
     if(q==0) useful=Producer(a,b);
-    if(q==1) OutputWorker<false>(a,b);
+    if(q==1) OutputWorker<false,OutputRole::Descriptors>(a,b);
+    if(q==3) OutputWorker<false,OutputRole::Tnd>(a,b);
     if(q==2) {
         auto edges=reinterpret_cast<__gm__ Edge*>(a->highIndex+uint64_t(b)*kRowBytes);
         auto spill=reinterpret_cast<__gm__ Tuple*>(edges+kCapacity);

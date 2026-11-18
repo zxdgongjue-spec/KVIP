@@ -69,6 +69,7 @@ enum class HardEvent {V_MTE2,MTE2_V,V_S,MTE3_V,V_MTE3,MTE3_S};
 constexpr int EVENT_ID0=0;
 BatchFlag flags[2*kFlagCount];FinalPost posts[8];
 uint32_t activeBatch=0,currentQuery=0,initialError=0,packErrorQuery=99,missingRaw=99;
+bool splitOutput=false,observed[4]{};
 bool outputEnabled=true,descriptorSynced[4]{},postSynced[4]{},outputDone[4]{};
 bool noPrefetchMode=false;
 uint32_t usedSlots=0;
@@ -108,7 +109,7 @@ void PreparePublicationOutputs(int64_t*,uint32_t*,uint32_t,uint32_t b,uint32_t q
 void PackPublicationEvents(Context*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t q,uint32_t used,uint32_t,
  uint32_t count,uint32_t*,uint32_t*,uint32_t*,uint16_t*,uint32_t*,uint32_t* ctl,int32_t* direct,uint32_t){
  assert((direct==nullptr)==bool(KVIP_READY_BATCH_FETCH && !V9_UBMEM));
- assert(q==currentQuery);ctl[16]=count;ctl[17]=count;
+ if(!splitOutput)assert(q==currentQuery);ctl[16]=count;ctl[17]=count;
  if(q==packErrorQuery)ctl[1]=16;
 }
 void SyncFetchDescriptors(Context*,uint32_t begin,uint32_t){descriptorSynced[(begin%kSlots)/kTop]=true;}
@@ -121,7 +122,8 @@ void CleanCacheLines(uint8_t* ptr,uint64_t){
  for(unsigned q=0;q<4;++q){
   if(ptr==reinterpret_cast<uint8_t*>(posts+activeBatch*4+q))postSynced[q]=true;
   auto f=flags+activeBatch*kFlagCount+q+1;
-  if(ptr==reinterpret_cast<uint8_t*>(f) && f->ready && !f->error){
+  if(ptr==reinterpret_cast<uint8_t*>(f) && f->ready && !f->error && !observed[q]){
+   observed[q]=true;
    auto p=posts+activeBatch*4+q;
    assert(postSynced[q] && descriptorSynced[q]);
    assert(p->count==queryCount[q] && p->descriptor==activeBatch*kSlots+q*kTop);
@@ -171,6 +173,7 @@ void InitializeFlags(Args* streaming,uint32_t b){LocalTensor<uint32_t> local{nul
 void reset(){
  for(auto& f:flags)f={};for(auto& p:posts)p={};
  std::fill_n(logicalOut,8*kTop,0xdeadbeefU);std::fill_n(slotOut,8*kTop,0xdeadbeefU);
+ std::fill_n(observed,4,false);
  std::fill_n(descriptorSynced,4,false);std::fill_n(postSynced,4,false);
  fetchReads=outputStarts=outputCopies=metadataCommits=0;clockValue=0;
  initialError=0;packErrorQuery=missingRaw=99;outputEnabled=true;timeoutClock=false;dma.clear();
@@ -200,7 +203,11 @@ void runWorker(unsigned b){
  args.eventsSrc=args.eventsDst=uint64_t(events.data());args.maxEvents=10240;args.prefetchCount=1U<<16;args.packedFetch=uint64_t(packed.data());
  auto f=flags+b*kFlagCount;f[0].ready=1;f[0].error=initialError;
  for(unsigned q=0;q<4;++q){f[kRawQueryFlag+q].ready=q!=missingRaw;f[kRawQueryFlag+q].count=queryCount[q];}
- OutputWorker(&args,b);
+ if(splitOutput){
+  OutputWorker<false,OutputRole::Descriptors>(&args,b);
+  assert(!flags[b*kFlagCount+kOutputsDoneFlag].ready && outputStarts==0);
+  OutputWorker<false,OutputRole::Tnd>(&args,b);
+ }else OutputWorker(&args,b);
 }
 int main(){
  static_assert(kFlagCount==16);
@@ -213,6 +220,19 @@ int main(){
   assert(!JoinProducer(flags+b*kFlagCount));assert(!JoinConsumer(flags+b*kFlagCount));assert(metadataCommits==1);
   auto error=flags[b*kFlagCount+kOutputCompletionFlag].error;ProducerDone(flags+b*kFlagCount,77);
   assert(!kEarlyFetchReady || flags[b*kFlagCount+kOutputCompletionFlag].error==error);
+ }
+ if(kEarlyFetchReady){
+  splitOutput=true;
+  for(unsigned b:{0U,1U}){
+   reset();runWorker(b);assert(fetchReads==4 && outputCopies==8 && dma.empty());
+   assert(!JoinProducer(flags+b*kFlagCount));assert(!JoinConsumer(flags+b*kFlagCount));
+   for(unsigned q=0;q<4;++q)assert(slotOut[(b*4+q)*kTop]==b*10000+q*kTop);
+  }
+  reset();outputEnabled=false;runWorker(0);assert(fetchReads==4 && outputCopies==0 && !JoinConsumer(flags));
+  reset();packErrorQuery=1;runWorker(0);assert(fetchReads==1 && outputCopies==2 && JoinConsumer(flags)==16);
+  reset();missingRaw=1;timeoutClock=true;runWorker(0);assert(fetchReads==1 && outputCopies==2 && JoinConsumer(flags)==8);
+  reset();initialError=2;runWorker(0);assert(fetchReads==0 && outputCopies==0 && JoinConsumer(flags)==2);
+  splitOutput=false;
  }
  // Q-ready alone cannot authorize metadata commit or producer finalization.
  if(kEarlyFetchReady){
