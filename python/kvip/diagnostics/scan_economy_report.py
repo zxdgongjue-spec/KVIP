@@ -109,11 +109,16 @@ def report(cases, order):
             passes = min(conservative.values()) >= 0
         elif name != "reverse":
             passes &= all(inc[k] > max(1.0, abs(reverse_drift[k])) for k in inc)
+        matched = ""
+        if name == "reverse-inc-segments":
+            delta = gain(cases[name]["timing"], cases["reverse-inc-light-ties"]["timing"])
+            passes &= all(delta[k] > max(1.0, abs(reverse_drift[k])) for k in delta)
+            matched = f" vs_light_mean/p50={delta['mean_us']:+.2f}/{delta['p50_us']:+.2f}%"
         if passes:
             candidates.append(name)
         print(f"GATE {name} {'CANDIDATE' if passes else 'KEEP_BASELINE'} "
               f"vs_original_mean/p50={g['mean_us']:+.2f}/{g['p50_us']:+.2f}% "
-              f"vs_reverse_mean/p50={inc['mean_us']:+.2f}/{inc['p50_us']:+.2f}%")
+              f"vs_reverse_mean/p50={inc['mean_us']:+.2f}/{inc['p50_us']:+.2f}%{matched}")
     samples = cases["forward"]["reads_samples"]
     cold, selected = (mean(s[k] for s in samples) for k in ("cold_demand", "selected_unique"))
     if any("incremental_check" in case for case in cases.values()):
