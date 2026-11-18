@@ -10,7 +10,7 @@ import statistics
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tests/operators/lifetch/support'))
-from diagnostics import diagnostic_table
+from diagnostics import diagnostic_table, resolver_phase_rows
 
 
 def stats(values):
@@ -130,11 +130,77 @@ def bench_li(root):
     raise SystemExit(f'No real G2 URMA bench graph profile under {root}')
 
 
+def resolve_brief(root):
+    paths = [root] if root.is_file() else list(root.rglob('diagnostic.json'))
+    if len(paths) != 1:
+        raise SystemExit(f'Expected one diagnostic.json under {root}, found {len(paths)}; pass the run directory.')
+    doc = json.loads(paths[0].read_text())
+    print(f'Source: {paths[0]}')
+    for capture in doc.get('captures', []):
+        if capture.get('path') == 'serial':
+            continue
+        samples = capture['samples']
+        clean = [value for s in samples for key, value in s.get('accounting', {}).get('stages_us', {}).items()
+                 if key in ('resolve_update', 'resolve_update_fetch')]
+        if clean:
+            print(f'Profiler fused tail: mean {statistics.mean(clean):.2f} us | N={len(clean)}')
+        timelines = [s['timeline'] for s in samples if s.get('timeline')]
+        if not timelines:
+            raise SystemExit('No detailed core timeline in this capture; check diagnose level and trace status.')
+        ends, leaders, phases, peer_phases = defaultdict(list), Counter(), defaultdict(list), defaultdict(list)
+        resolver_columns = ('input/init', 'Q1-4 resolve', 'output/publish', 'prefetch CQ',
+                            'wait update', 'wait prefetch flag', 'wait Q Fetch', 'residency',
+                            'status', 'other/control')
+        for t in timelines:
+            cores = t['cores']
+            groups = defaultdict(list)
+            for c in cores:
+                role = c['role'].split()
+                group = ' '.join(role[:2]) if role[0] == 'fetch' else role[0]
+                groups[group].append(c)
+                if c['block'] == t['last_block']:
+                    leaders[group] += 1
+            for group, members in groups.items():
+                latest = max(members, key=lambda c: c['end_us'])
+                ends[group].append(latest['end_us'])
+                if group.startswith('resolver'):
+                    row, = resolver_phase_rows({'cores': [latest]})
+                    for key, value in zip(resolver_columns, row[1:11]):
+                        phases[key].append(value)
+                    if abs(row[-1]) > 0.1:
+                        raise SystemExit(f'Resolver phase accounting differs by {row[-1]:.2f} us')
+                else:
+                    buckets = Counter()
+                    for stage in latest['stages']:
+                        key = stage['name']
+                        if key.startswith('request'):
+                            continue  # Per-request intervals nest inside Fetch prepare.
+                        key = re.sub(r'control_gap[0-9]+', 'control gaps', key)
+                        buckets[key] += stage['duration_us']
+                    peer_phases[group].append(buckets)
+        rows = []
+        for group, values in sorted(ends.items(), key=lambda item: -statistics.mean(item[1])):
+            buckets = peer_phases[group]
+            names = {k for b in buckets for k in b}
+            costs = sorted(((statistics.mean(b[k] for b in buckets), k) for k in names), reverse=True)
+            rows.append([group, statistics.mean(values), max(values), f'{leaders[group]}/{len(timelines)}',
+                         ', '.join(f'{k} {v:.2f}' for v, k in costs[:3])])
+        print(diagnostic_table('Detail pass | latest core per role per replay (us)',
+                               ['Role', 'Mean end', 'Max end', 'Last', 'Top 3 intervals (mean us)'], rows))
+        print(diagnostic_table('Latest resolver per replay | exclusive phase durations (us)',
+                               ['Phase', 'Mean', 'p50', 'Max'],
+                               [[k, statistics.mean(v), statistics.median(v), max(v)]
+                                for k, v in sorted(phases.items(), key=lambda item: -sum(item[1]))]))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('root', nargs='?', type=Path, default=Path('tests/results/lifetch'))
     parser.add_argument("--bench-li", action="store_true", help="summarize the latest real G2 URMA bench LI kernels")
+    parser.add_argument('--resolve', action='store_true', help='summarize fused tail bottlenecks for one diagnose run')
     args = parser.parse_args()
+    if args.resolve:
+        return resolve_brief(args.root)
     if args.bench_li:
         return bench_li(args.root)
     matches = []
