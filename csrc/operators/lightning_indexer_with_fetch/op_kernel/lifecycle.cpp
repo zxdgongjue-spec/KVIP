@@ -32,11 +32,11 @@ __aicore__ inline void FillRoundWords(uint64_t address,uint32_t words,
 }
 __aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_finalWorkers,uint32_t rt_finalPostOffset,__gm__ Context* ctx,uint32_t b,__gm__ pipeline_ab::Args* streaming) {
     TPipe pipe;TBuf<TPosition::VECCALC> storage;pipe.InitBuffer(storage,4096*4);
-#if KVIP_SEED_MASK
+#if KVIP_SEED_MASK && !KVIP_SEED_PARALLEL
     TBuf<TPosition::VECCALC> seedInputs;
     if (ctx->shape.resident <= kSeedMaskSlots) {
         pipe.InitBuffer(seedInputs, kSeedChunk * 2 * sizeof(uint32_t));
-        LoadSeedInputs(ctx, b, ctx->shape.resident, seedInputs.Get<uint32_t>());
+        LoadSeedInputs(ctx, b, ctx->shape.resident, seedInputs.Get<uint32_t>(), 0, ctx->shape.resident);
     }
 #endif
     auto local=storage.Get<uint32_t>();
@@ -85,10 +85,10 @@ __aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uin
         DataCopy(target,local,kLruSlots);
         SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     }
-#if KVIP_SEED_MASK
+#if KVIP_SEED_MASK && !KVIP_SEED_PARALLEL
     if (ctx->shape.resident <= kSeedMaskSlots) {
         // The previous DMA has joined. Reuse local for the predicate output.
-        PrepareSeedMask(ctx, b, ctx->shape.resident, seedInputs.Get<uint32_t>(), local);
+        PrepareSeedMask(ctx, b, 0, ctx->shape.resident, seedInputs.Get<uint32_t>(), local);
     }
 #endif
     pipe.Destroy();
@@ -108,8 +108,16 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
 
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     if ASCEND_IS_AIV {
-        uint32_t b=GetBlockIdx(); if(b>=rt_batch) return;
+        uint32_t b=GetBlockIdx();
         auto ctx=GetContext(bindings);
+        if (b >= rt_batch) {
+#if KVIP_SEED_PARALLEL
+            const uint32_t worker = b - rt_batch;
+            BuildSeedStripe(ctx, worker % rt_batch, rt_resident, worker / rt_batch,
+                            SeedInitHelpers(runtimeShape));
+#endif
+            return;
+        }
         auto initBindings=reinterpret_cast<__gm__ uint64_t*>(bindings);
         auto streaming=reinterpret_cast<__gm__ pipeline_ab::Args*>(initBindings[15]);
         InitializeRound(rt_batch,rt_history,rt_rounds,rt_serviceLanes,rt_finalWorkers,rt_finalPostOffset,ctx,b,streaming);

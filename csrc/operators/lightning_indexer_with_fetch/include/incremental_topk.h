@@ -37,6 +37,12 @@
 #ifndef KVIP_SEED_MASK
 #define KVIP_SEED_MASK 0
 #endif
+#ifndef KVIP_SEED_PARALLEL
+#define KVIP_SEED_PARALLEL 0
+#endif
+#if KVIP_SEED_PARALLEL && !KVIP_SEED_MASK
+#error "Independent seed preparation requires the seed mask"
+#endif
 #if KVIP_SEED_MASK && !KVIP_INCREMENTAL_SEGMENTS
 #error "Seed mask requires segment lists"
 #endif

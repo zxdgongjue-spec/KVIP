@@ -13,6 +13,7 @@ option(KVIP_INCREMENTAL_PREFILTER "Fixed tile filtering and boundary-only sparse
 option(KVIP_INCREMENTAL_DIRECT "Materialize selected scores and physical IDs in one SIMD VF" OFF)
 option(KVIP_INCREMENTAL_INPLACE "Update only the boundary-tie suffix in place" OFF)
 option(KVIP_WINDOW_PROBE "Measure producer stages in a separate diagnostic binary" OFF)
+option(KVIP_SEED_PARALLEL "Prepare resident predicates on independent init blocks" OFF)
 option(KVIP_SEED_MASK "Classify the initial winners from a shared resident bitmap" OFF)
 option(KVIP_CONSUMED_PREFIX "Skip proven consumed list prefixes at Fetch" OFF)
 option(KVIP_INCREMENTAL_SEGMENTS "Retain ranked prefixes across Fetch windows" OFF)
@@ -104,6 +105,7 @@ ascendc_compile_options(v9_kernel PRIVATE -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WO
   -DKVIP_INCREMENTAL_PREFILTER=$<BOOL:${KVIP_INCREMENTAL_PREFILTER}>
   -DKVIP_INCREMENTAL_INPLACE=$<BOOL:${KVIP_INCREMENTAL_INPLACE}>
   -DKVIP_WINDOW_PROBE=$<BOOL:${KVIP_WINDOW_PROBE}>
+  -DKVIP_SEED_PARALLEL=$<BOOL:${KVIP_SEED_PARALLEL}>
   -DKVIP_SEED_MASK=$<BOOL:${KVIP_SEED_MASK}>
   -DKVIP_CONSUMED_PREFIX=$<BOOL:${KVIP_CONSUMED_PREFIX}>
   -DKVIP_INCREMENTAL_SEGMENTS=$<BOOL:${KVIP_INCREMENTAL_SEGMENTS}>
@@ -158,6 +160,7 @@ target_compile_definitions(v9_bridge PRIVATE KVIP_INCREMENTAL_INPLACE=$<BOOL:${K
 target_compile_definitions(v9_bridge PRIVATE KVIP_INCREMENTAL_PROGRESS=$<BOOL:${KVIP_INCREMENTAL_PROGRESS}>)
 
 target_compile_definitions(v9_bridge PRIVATE KVIP_WINDOW_PROBE=$<BOOL:${KVIP_WINDOW_PROBE}>)
+target_compile_definitions(v9_bridge PRIVATE KVIP_SEED_PARALLEL=$<BOOL:${KVIP_SEED_PARALLEL}>)
 target_compile_definitions(v9_bridge PRIVATE KVIP_SEED_MASK=$<BOOL:${KVIP_SEED_MASK}>)
 target_compile_definitions(v9_bridge PRIVATE KVIP_CONSUMED_PREFIX=$<BOOL:${KVIP_CONSUMED_PREFIX}>)
 target_compile_definitions(v9_bridge PRIVATE KVIP_INCREMENTAL_SEGMENTS=$<BOOL:${KVIP_INCREMENTAL_SEGMENTS}>)

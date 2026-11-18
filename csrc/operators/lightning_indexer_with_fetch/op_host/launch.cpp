@@ -6,6 +6,7 @@
 extern "C" uint32_t kvip_incremental_window() { return KVIP_INCREMENTAL_WINDOW; }
 extern "C" uint32_t kvip_incremental_inplace() { return KVIP_INCREMENTAL_INPLACE; }
 extern "C" uint32_t kvip_window_probe() { return KVIP_WINDOW_PROBE; }
+extern "C" uint32_t kvip_seed_parallel() { return KVIP_SEED_PARALLEL; }
 extern "C" uint32_t kvip_seed_mask() { return KVIP_SEED_MASK; }
 extern "C" uint32_t kvip_consumed_prefix() { return KVIP_CONSUMED_PREFIX; }
 extern "C" uint32_t kvip_incremental_segments() { return KVIP_INCREMENTAL_SEGMENTS; }
@@ -36,7 +37,7 @@ extern "C" uint32_t aclrtlaunch_v9_##name##_kernel(uint32_t,void*,void*); \
 extern "C" uint32_t v9_##name(void* bindings,void* stream,const rotating::RuntimeShape* shape) { \
     if (!bindings || !stream || !shape) return 100000; \
     return aclrtlaunch_v9_##name##_kernel(blocks,stream,bindings); }
-ENTRY(init,shape->batch)
+ENTRY(init,shape->batch * (1 + rotating::SeedInitHelpers(*shape)))
 
 extern "C" uint32_t aclrtlaunch_v9_li_kernel(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_1(uint32_t,void*,void*);

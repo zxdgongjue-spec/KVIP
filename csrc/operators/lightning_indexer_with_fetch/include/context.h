@@ -79,6 +79,13 @@ __aicore__ inline RuntimeShape LoadRuntimeShape(const __gm__ Context* ctx) {
     return result;
 }
 #endif
+V9_DEVICE inline uint32_t SeedInitHelpers(const RuntimeShape& shape) {
+#if KVIP_SEED_PARALLEL
+    if (shape.resident <= kSeedMaskSlots)
+        return 3 * shape.batch <= 2 * shape.aicCount ? 2 : 1;
+#endif
+    return 0;
+}
 // Even views remain prefetch-owned. Reuse spare odd views, then extra views.
 V9_DEVICE inline uint32_t FinalQueue(uint32_t rt_batch,uint32_t rt_finalWorkers,uint32_t batch,uint32_t worker) {
     return worker==0 ? batch*2+1 : rt_batch*2+batch*(rt_finalWorkers-1)+worker-1;
