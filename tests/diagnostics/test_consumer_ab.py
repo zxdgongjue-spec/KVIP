@@ -134,6 +134,14 @@ def test_high_overlap_arms_reuse_public_completion_records(tmp_path, capsys, for
         with pytest.raises(ValueError, match="wrong source"):
             summarize(7, cases, args.baseline, args.revision, True, formats, args.intermediate)
         cases["middle-end"]["kvip_commit"] = args.intermediate
+    if not intermediate:
+        from kvip.diagnostics.consumer_ab import FIXED_FUSED_REVISION
+        for name in ("original", "original-end", "before", "before-end"):
+            cases[name]["kvip_commit"] = FIXED_FUSED_REVISION
+        summarize(7, cases, FIXED_FUSED_REVISION, args.revision, True, formats)
+        assert ("FIXED_FUSED source=4cb3917d" in capsys.readouterr().out)
+        for name in ("original", "original-end", "before", "before-end"):
+            cases[name]["kvip_commit"] = args.baseline
     cases["after"]["reads_samples"][1]["high_post_index"]["final_get_by_core"] = [0]*64
     with pytest.raises(ValueError, match="transport count"):
         summarize(7, cases, args.baseline, args.revision, True, formats, args.intermediate)
@@ -218,7 +226,7 @@ def test_expected_format_follows_checked_out_dispatch_and_marker(tmp_path):
     (folder / "streaming.cpp").write_text("high_post_index::Run(a,block);")
     assert schedule_format(tmp_path) == "PIH1"
     (folder / "streaming.cpp").write_text("high_post_index::RunRow(a,block);")
-    for token, expected in (("0x52514931", "RQI1"), ("0x52514932", "RQI2"), ("0x52514933", "RQI3")):
+    for token, expected in (("0x52514931", "RQI1"), ("0x52514932", "RQI2"), ("0x52514933", "RQI3"), ("0x52514934", "RQI4")):
         (folder / "high_index_async.h").write_text(f"ticks[2]={token}U;")
         assert schedule_format(tmp_path) == expected
 
@@ -277,3 +285,36 @@ def test_reassigned_get_uses_real_descriptor_totals_and_physical_core_submission
     else:
         with pytest.raises(ValueError):
             check_get_reassignment(actual, marks, canonical)
+
+def test_rqi4_early_post_report_uses_the_full_row_but_only_nonempty_network_lanes():
+    from kvip.diagnostics.high_index_profile import early_post_timing
+    rows = np.zeros((64, 16), dtype=np.int64)
+    marks = np.zeros((64, 32), dtype=np.int64)
+    marks[:, 0], marks[:, 1] = 1000, 1700
+    marks[:, 20], marks[:, 21], marks[:, 23], marks[:, 3] = 1200, 1210, 1490, 1510
+    # Initial query may be observed before the publisher records its post-flush clock.
+    marks[16:32, 24:28] = [1202, 1260, 1300, 1340]
+    marks[:16, 22] = 1460
+    rows[32:48, 4] = 1410
+    rows[:, 5] = marks[:, 21]
+    rows[[2, 20, 61], 1] = 100
+    rows[[2, 20, 61], 6] = [1220, 1470, 1500]
+    assert early_post_timing(rows, marks) == dict(
+        first_query_ready=202, last_query_ready=340, first_query_observed=200, last_query_observed=200,
+        last_plan=410, last_tnd=460, lanes_post_before_row_join=2, lanes_post_before_row_plan_or_tnd=1,
+        nonempty_lanes=3)
+    marks[20,25] = 0
+    with pytest.raises(ValueError, match="RQI4"):
+        early_post_timing(rows, marks)
+
+
+def test_two_source_fixed_fused_baseline_gets_its_own_clock(tmp_path):
+    from kvip.diagnostics.consumer_ab import FIXED_FUSED_REVISION
+    args = SimpleNamespace(baseline=FIXED_FUSED_REVISION, revision="b"*40, cache=tmp_path, source=tmp_path/"after",
+                           result_dir=tmp_path, server="127.0.0.1:29084", intermediate=None, high_overlap=True)
+    original = arguments(command(args, 7, "original")[4:])
+    end = arguments(command(args, 7, "original-end")[4:])
+    assert original.upstream_revision == end.upstream_revision == FIXED_FUSED_REVISION
+    assert not original.high_post_index and not end.high_post_index
+    assert (original.calibrate_counter, original.diagnostic_replays) == (True, 1)
+    assert (end.calibrate_counter, end.diagnostic_replays) == (False, 0)

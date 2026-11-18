@@ -26,9 +26,18 @@ def original_native_window(sample):
             active.append(lane)
         else:
             require((calls, call, returned) == (0, 0, 0), "Stale empty Get markers")
+    # The combined output worker records this instant immediately after
+    # flushing each descriptor-ready flag, before issuing that query's TND.
+    published = []
+    for core in cores[2:first_worker:resolvers]:
+        row = [core[9+6*q] for q in range(4)]
+        require(core[0] <= row[0] and row[-1] <= core[1] and row == sorted(row),
+                "Missing or unordered original Q descriptor publications")
+        published.extend(row)
     final = sum(c[10] for c in active)
     require(final == sample["reads"]["final"], "Mismatch between native Get and final request count")
     return dict(
+        first_query_ready=min(published) - origin, last_query_ready=max(published) - origin,
         first_native_call=min((c[3] - origin for c in active), default=None),
         last_native_return=max((c[4] - origin for c in active), default=None),
         last_consumer_exit=max(c[1] for c in cores[1:first_worker:resolvers]) - origin,
@@ -48,7 +57,8 @@ def print_original_clock(group, case):
     rate = calibration_summary(clock["samples"])["cycles_per_us"]
     def us(key):
         return "NA" if result[key] is None else f"{result[key] / rate:.2f}"
-    print(f"G{group} ORIGINAL_NATIVE_us first_blocking_call={us('first_native_call')}"
+    print(f"G{group} ORIGINAL_NATIVE_us first/last_Q_ready={us('first_query_ready')}/{us('last_query_ready')}"
+          f" first_blocking_call={us('first_native_call')}"
           f" last_blocking_return={us('last_native_return')} last_consumer_exit={us('last_consumer_exit')}"
           f" last_role_exit={us('last_role_exit')} final_Get={result['final_Get']}"
           f" active_workers={result['active_workers']} calls={result['native_calls']}"

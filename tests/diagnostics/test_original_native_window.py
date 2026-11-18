@@ -8,6 +8,9 @@ def original_trace():
     base = 2**54
     cores = [[base+1, base+80, 0, 0, 0, 0] + [0]*26 for _ in range(64)]
     cores[1][1] += 5
+    for b in range(16):
+        for q in range(4):
+            cores[b*3+2][9+6*q] = base + 4 + b + 8*q
     for r in cores[48:]:
         r[2], r[5] = base+3, base+70
     for i, (n, start, end) in enumerate([(3, 20, 60), (5, 9, 69)]):
@@ -18,7 +21,7 @@ def original_trace():
 
 
 def test_endpoints_count_only_nonempty_workers():
-    assert original_native_window(original_trace()) == dict(first_native_call=8, last_native_return=68,
+    assert original_native_window(original_trace()) == dict(first_query_ready=3, last_query_ready=42, first_native_call=8, last_native_return=68,
         last_consumer_exit=84, last_role_exit=84, final_Get=8, active_workers=2, native_calls=4)
 
 

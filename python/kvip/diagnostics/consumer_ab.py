@@ -16,6 +16,7 @@ from kvip.diagnostics.original_native_window import print_original_clock
 from kvip.diagnostics.read_through_report import load_case, require, timing
 
 
+FIXED_FUSED_REVISION = "4cb3917d1861776a396e0f1a402e6b940fcabed4"
 ARMS = ("before", "after", "after-end", "before-end")
 OVERLAP_ARMS = ("original", *ARMS, "original-end")
 THREE_SOURCE_ARMS = ("original", "before", "middle", "after", "after-end", "middle-end", "before-end", "original-end")
@@ -43,7 +44,8 @@ def command(args, group, arm):
             cmd.extend(("--diagnostic-replays", "1", "--calibrate-counter"))
     elif arm in ("before", "after"):
         cmd.extend(("--diagnostic-replays", "2", "--calibrate-counter"))
-    if arm == "original" and getattr(args, "intermediate", None) and args.high_overlap:
+    if (arm == "original" and args.high_overlap
+            and (getattr(args, "intermediate", None) or args.baseline == FIXED_FUSED_REVISION)):
         cmd.extend(("--diagnostic-replays", "1", "--calibrate-counter"))
     return cmd
 
@@ -109,7 +111,7 @@ def schedule_format(source):
     if "high_post_index::RunRow(" not in (kernel/"streaming.cpp").read_text():
         return "PIH1"
     impl = (kernel/"high_index_async.h").read_text()
-    for tag, marker in (("0x52514933", "RQI3"), ("0x52514932", "RQI2"), ("0x52514931", "RQI1")):
+    for tag, marker in (("0x52514934", "RQI4"), ("0x52514933", "RQI3"), ("0x52514932", "RQI2"), ("0x52514931", "RQI1")):
         if tag in impl:
             return marker
     raise ValueError(f"Unrecognized row schedule diagnostic ABI at {source}")
@@ -180,6 +182,15 @@ def summarize(group, cases, baseline, candidate, high_overlap=False, schedule_fo
               f" saved_max={two(map(max, zip(*gains)))} drift_original={two(diff('original-end','original'))}"
               f" identical_work_pairs={len(clean)}/18 paired_saved_us_mean/p50="
               + (two((mean(clean), median(clean))) if clean else "unavailable"))
+        if baseline == FIXED_FUSED_REVISION:
+            # Use same-side graphs for paired *brackets*. Individual samples
+            # may have different speculative work; exact matches are above.
+            def slowdown(a, b):
+                return two(100 * (x / y - 1) for x, y in zip(times[a], times[b]))
+            print(f"G{group} FIXED_FUSED source={baseline[:8]} policy=original_per_row flag_high_post_index=0"
+                  f" ref_first/end_mean/p50_us={two(times['original'])},{two(times['original-end'])}"
+                  f" candidate_first/end_mean/p50_us={two(times['after'])},{two(times['after-end'])}"
+                  f" slower_pct_first/end_mean/p50={slowdown('after','original')},{slowdown('after-end','original-end')}")
         if intermediate:
             middle_gain = [diff(b, m) for b in ("before", "before-end") for m in ("middle", "middle-end")]
             middle = [diff(b, a) for b in ("middle", "middle-end") for a in ("after", "after-end")]
@@ -247,6 +258,17 @@ def summarize(group, cases, baseline, candidate, high_overlap=False, schedule_fo
                       f" last_retire_to_row_exit_us_p50/max={metrics['row_retire_to_exit_p50']/rate:.2f}/{metrics['row_retire_to_exit_max']/rate:.2f}"
                       f" moves_total/max_row/max_lane={metrics['moved_total']}/{metrics['max_row_moves']}/{metrics['max_moves_per_lane']}"
                       f" rows_single_owner/gather={high['single_owner_rows']}/{high['row_gathers']}" + split_load)
+                if marker == "RQI4":
+                    early = metrics["early_post"]
+                    def times_us(*keys):
+                        return "/".join(f"{early[k]/rate:.2f}" for k in keys)
+                    print(f"G{group} PIPE {arm} from_outer_entry_us"
+                          f" first/last_Q_ready={times_us('first_query_ready','last_query_ready')}"
+                          f" first/last_Q_seen={times_us('first_query_observed','last_query_observed')}"
+                          f" last_plan/TND={times_us('last_plan','last_tnd')}"
+                          f" lanes_firstPost_before_rowJoin={early['lanes_post_before_row_join']}/{early['nonempty_lanes']}"
+                          f" lanes_firstPost_before_row_plan_or_TND_done="
+                          f"{early['lanes_post_before_row_plan_or_tnd']}/{early['nonempty_lanes']}")
         print(f"G{group} CHECK real_Index_order/TopK/KV/lifecycle/submitted_completed=PASS", flush=True)
         return
     stages = []
@@ -292,7 +314,7 @@ def main():
                 raise SystemExit(f"G{group}/{arm} failed rc={status} log={log}")
             cases[arm] = load_case(cmd[cmd.index("--output") + 1], arm)
         summarize(group, cases, args.baseline, args.revision, args.high_overlap, formats, args.intermediate)
-        if getattr(args, "intermediate", None) and args.high_overlap:
+        if args.high_overlap and (args.intermediate or args.baseline == FIXED_FUSED_REVISION):
             print_original_clock(group, cases["original"])
 
 

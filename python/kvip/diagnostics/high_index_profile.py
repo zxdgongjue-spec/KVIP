@@ -287,6 +287,34 @@ def overlap_schedule_timing(rows, marks, *, marker):
     return result
 
 
+def early_post_timing(rows, marks):
+    """RQI4 times observed on a successful graph, relative to outer streaming entry."""
+    outer = int(marks[:, 0].min())
+    # Q1 is the sole writer for the four descriptor-ready publications in a row.
+    published = marks[16:32, 24:28]
+    plan, tnd = rows[32:48, 4], marks[:16, 22]
+    observed, validated, joined = marks[:, 20], marks[:, 21], marks[:, 23]
+    live = rows[:, 1] > 0
+    if (not np.any(live) or np.any(published < marks[16:32, :1]) or np.any(published[:, 1:] < published[:, :-1])
+            or np.any(published[:, -1] > marks[16:32, 1]) or np.any(plan < marks[32:48, 0])
+            or np.any(plan > joined[32:48]) or np.any(tnd < marks[:16, 0]) or np.any(tnd > joined[:16])
+            or np.any(observed < marks[:, 0]) or np.any(observed > validated)
+            or not np.array_equal(rows[:, 5], validated) or np.any(joined < validated)
+            or np.any(joined > marks[:, 3]) or np.any(rows[live, 6] < validated[live])):
+        raise ValueError("Missing or unordered RQI4 descriptor, local Post or row-work markers")
+    # A reader may observe the flushed descriptor before its publisher timestamps
+    # the return from that flush. Only compare absolute endpoints, don't force
+    # happens-before on those two readings from different AIVs.
+    row_id = np.flatnonzero(live) % 16
+    post = rows[live, 6]
+    return dict(first_query_ready=int(published.min()) - outer, last_query_ready=int(published.max()) - outer,
+                first_query_observed=int(observed.min()) - outer, last_query_observed=int(observed.max()) - outer,
+                last_plan=int(plan.max()) - outer, last_tnd=int(tnd.max()) - outer,
+                lanes_post_before_row_join=int(np.count_nonzero(post < joined[live])),
+                lanes_post_before_row_plan_or_tnd=int(np.count_nonzero(post < np.maximum(plan, tnd)[row_id])),
+                nonempty_lanes=int(live.sum()))
+
+
 def check_get_reassignment(counts, marks, canonical):
     """Reconcile every transport lane against the independent per-request Q descriptor counts."""
     if canonical is None or np.shape(canonical) != (16, 4):
@@ -329,7 +357,7 @@ def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan
     if detail.dtype != np.int64 or detail.shape != (len(rows), 32):
         raise ValueError("Unexpected HIGH timestamp layout")
     marks = detail.view(np.uint64)
-    row_markers = {0x52514931: "RQI1", 0x52514932: "RQI2", 0x52514933: "RQI3"}
+    row_markers = {0x52514931: "RQI1", 0x52514932: "RQI2", 0x52514933: "RQI3", 0x52514934: "RQI4"}
     marker = row_markers.get(int(marks[0, 2]))
     if marker is not None and np.all(marks[:, 2] == marks[0, 2]):
         if wait_first or not schedule_timing:
@@ -338,8 +366,10 @@ def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan
             raise ValueError("Incomplete row-local Index transfer counts")
         result["moved"] = marks[:, 10].tolist()
         result["row_partitions"] = dict(pairs=marks[:, 16].tolist(), singles=marks[:, 17].tolist(),
-                                        invalidations=marks[:, 19].tolist(), single_owner=marker in ("RQI2", "RQI3"))
+                                        invalidations=marks[:, 19].tolist(), single_owner=marker != "RQI1")
         schedule = overlap_schedule_timing(rows, marks, marker=marker)
+        if marker == "RQI4":
+            schedule["early_post"] = early_post_timing(rows, marks)
         if marker == "RQI3":
             schedule["get_reassignment"] = check_get_reassignment(rows[:, 1], marks, canonical_counts)
         # block=q*16+request. Each lane records packDone when its own role and
