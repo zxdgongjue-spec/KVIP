@@ -9,6 +9,7 @@ candidate=
 high_index=0
 index_speed=0
 index_10k=0
+index_units=moves
 index_groups=(4 7 10 17)
 joint=0
 account=0
@@ -35,8 +36,10 @@ elif [[ $# == 1 && $1 == --parity ]]; then
 elif [[ $# == 1 && $1 == --kernels ]]; then
     labels=(serial after)
     profile=1
-elif [[ $# == 2 && $1 == --index-10k && $2 =~ ^[0-9a-f]{40}$ ]]; then
+elif [[ ($# == 2 || $# == 3) && $1 == --index-10k && $2 =~ ^[0-9a-f]{40}$ ]]; then
     index_10k=1
+    index_units=${3:-moves}
+    [[ $index_units == moves || $index_units == events ]] || die "Expected 10k moves or events"
     labels=(before after)
     candidate=$2
 elif [[ $# -ge 2 && $1 == --index-speed && $2 =~ ^[0-9a-f]{40}$ ]]; then
@@ -56,7 +59,7 @@ elif [[ $# == 2 && $1 == --high-index && $2 =~ ^[0-9a-f]{40}$ ]]; then
     high_index=1
     candidate=$2
 elif [[ $# != 0 ]]; then
-    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA|--index-speed CANDIDATE_SHA [GROUP ...]|--index-10k CANDIDATE_SHA]"
+    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA|--index-speed CANDIDATE_SHA [GROUP ...]|--index-10k CANDIDATE_SHA [moves|events]]"
 fi
 
 diag=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
@@ -103,7 +106,8 @@ if ((index_10k)); then
     export ASCEND_LAUNCH_BLOCKING=0 MAX_JOBS=2
     inc="$cache/KVAF/access_operator/demo/aiv_batch_get/include"
     probe=$(mktemp -d /tmp/kvip-10k.XXXXXX)
-    printf 'INDEX_10K physical_NPU=4 logical=0 events=5000 moves=10000 RESULT_ROOT=%s\n' "$probe"
+    if [[ $index_units == events ]]; then export INDEX_LAYOUTS='even-events skew-events'; fi
+    printf 'INDEX_10K physical_NPU=4 logical=0 target=10000_%s RESULT_ROOT=%s\n' "$index_units" "$probe"
     for role in before after; do
         rev=$before
         if [[ $role == after ]]; then rev=$after; fi
