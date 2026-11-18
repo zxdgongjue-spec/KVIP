@@ -66,9 +66,11 @@ def li_kernel_breakdown(capture):
     families = [[base + f'_{i}' for i in range(4)]]
     families += [[base + suffix] + [base + f'_{i}' + suffix for i in range(1, 4)]
                  for suffix in sorted(suffixes)]
+    # Some CANN traces append the launch ordinal separately to each symbol.
+    families.append([base + '_0'] + [base + f'_{i}_{i}' for i in range(1, 4)])
     valid = []
     for names in families:
-        if any(len(by_name[name]) != calls for name in names):
+        if set(names) != set(by_name) or any(len(by_name[name]) != calls for name in names):
             continue
         arrays = [sorted(by_name[name]) for name in names]
         if any(not all(arrays[j][i][1] <= arrays[j+1][i][0] for j in range(3))
