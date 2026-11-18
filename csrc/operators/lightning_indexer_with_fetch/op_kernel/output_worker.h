@@ -32,7 +32,7 @@ __aicore__ inline uint32_t AwaitPublication(__gm__ BatchFlag* flag){
 // use the same descriptor and completion publications as the original worker.
 enum class OutputRole { Combined, Descriptors, Tnd };
 template<bool TraceRole = true, OutputRole Role = OutputRole::Combined>
-__aicore__ inline uint32_t OutputWorker(__gm__ Args* a,uint32_t b){
+__aicore__ inline uint32_t OutputWorker(__gm__ Args* a,uint32_t b,__gm__ uint64_t* publicationTimes=nullptr){
  constexpr bool pack=Role!=OutputRole::Tnd, tnd=Role!=OutputRole::Descriptors;
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
@@ -118,6 +118,7 @@ __aicore__ inline uint32_t OutputWorker(__gm__ Args* a,uint32_t b){
    PrepareFinalFetch(shape.finalWorkers,shape.finalPostOffset,ctx,b,q,error?0:ctl.GetValue(16),b*kSlots+q*kTop,error,error?0:ctl.GetValue(17));
    auto f=flags+q+1;f->count=count;f->error=error;f->ready=1;
    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(f),sizeof(BatchFlag));
+   if constexpr(Role==OutputRole::Descriptors)if(publicationTimes)publicationTimes[q]=GetSystemCycle();
   }
   total+=count;
   if(profile)ticks[9+q*6]=GetSystemCycle();

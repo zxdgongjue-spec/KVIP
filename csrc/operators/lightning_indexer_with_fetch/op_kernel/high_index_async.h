@@ -79,9 +79,10 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
         r->planDone=0; r->postBegin=0; r->postDone=0; ticks[4]=0; ticks[8]=0;
     }
     uint32_t useful=0,error=0;
-    if(q==0) useful=Producer<false,true>(a,b);
-    if(q==1) error|=OutputWorker<false,OutputRole::Descriptors>(a,b);
-    if(q==3) error|=OutputWorker<false,OutputRole::Tnd>(a,b);
+    // Keep Q0's private final FIFO free to issue as soon as its descriptors
+    // arrive. The resolver owns Q3; its own descriptors are produced last.
+    if(q==3) useful=Producer<false,true>(a,b);
+    if(q==1) error|=OutputWorker<false,OutputRole::Descriptors>(a,b,profile?ticks+24:nullptr);
     if(q==2) {
         auto edges=reinterpret_cast<__gm__ Edge*>(a->highIndex+uint64_t(b)*kRowBytes);
         auto spill=reinterpret_cast<__gm__ Tuple*>(edges+kCapacity);
@@ -93,6 +94,7 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
         me->reserved[10]=plan.invalidations;
     }
     error|=AwaitPublication(flags+1+q);
+    if(profile){ticks[20]=GetSystemCycle();ticks[22]=0;}
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(posts+q),sizeof(*posts));
     const uint32_t count=posts[q].count,safe=posts[q].nonconflicting,base=b*kSlots+q*kTop;
     error|=posts[q].error;
@@ -119,34 +121,44 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
         SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
         error|=local.GetValue(0); pipe.Destroy();
     }
-    if(!q) {
+    if(q==3) {
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),128);
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),64);
         error|=row->error | info[0];
+        me->reserved[5]=useful;
         me->reserved[6]=info[1];
+    }
+    // pending is immutable from kernel entry through the row's Index join.
+    // Only a range that might overwrite a speculative KV depends on its CQ.
+    bool conflict=false;
+    if(safe<count){
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->pending),sizeof(row->pending));
-        me->reserved[7]=row->pending!=0;
+        conflict=row->pending!=0;
     }
     me->count=count;
-    if(profile) r->packDone=GetSystemCycle();
-    join.Publish(RowRendezvous::Validated,error);
-    error|=join.AwaitPeers(RowRendezvous::Validated);
-    uint32_t total=0;
-    for(uint32_t p=0;p<4;++p) total+=join.lines[p].count;
-    // All input, output and plan owners returned before granting Validated.
-    if(total!=join.lines[0].reserved[6]) error|=kvaf_device::kInvalidArgs;
+    if(profile){r->packDone=GetSystemCycle();ticks[21]=r->packDone;}
     post_index_transport::State first{},second{};
-    // The final ranges contain frozen addresses. A prefetch can conflict
-    // with a final KV destination, but it cannot overwrite Index storage.
-    // Post a safe prefix now; defer only the unsendable range. A bounded
-    // blocking fallback is likewise deferred so its CQ cannot gate Index.
-    bool conflict=safe<count && join.lines[0].reserved[7];
     uint32_t early=blocking ? 0 : (!conflict ? count : (split ? safe : 0));
     if(!error && early){
         if(profile){r->postBegin=GetSystemCycle();ticks[4]=r->postBegin;ticks[8]=1;}
         error|=post_index_transport::Post(args,0,early,first);
         if(profile) r->postDone=GetSystemCycle();
     }
+    // WQE scratch is released on return from Post. TND reads selected
+    // logical IDs and resolved locations, independently of final KV writes.
+    if(!q) {
+        error|=OutputWorker<false,OutputRole::Tnd>(a,b);
+        if(profile) ticks[22]=GetSystemCycle();
+    }
+    // A rank can now submit before a peer reports its plan/TND/validation
+    // error. Such an issued prefix must drain. Real Index writes require the
+    // row-wide success below; finalization invalidates residency on failure.
+    join.Publish(RowRendezvous::Validated,error);
+    error|=join.AwaitPeers(RowRendezvous::Validated);
+    uint32_t total=0;
+    for(uint32_t p=0;p<4;++p) total+=join.lines[p].count;
+    if(total!=join.lines[3].reserved[6]) error|=kvaf_device::kInvalidArgs;
+    if(profile) ticks[23]=GetSystemCycle();
     auto plan=join.lines+2;
     uint32_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
     if(profile) ticks[3]=GetSystemCycle();
@@ -155,7 +167,7 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
     // A failed lane can reach Done without gathering originals. Mark the
     // skipped phase failed as well so its peers never scatter stale payload.
     if(error) join.Publish(RowRendezvous::ReadOriginals,error);
-    if(profile){ r->indexDone=GetSystemCycle(); ticks[2]=0x52514932U; }
+    if(profile){ r->indexDone=GetSystemCycle(); ticks[2]=0x52514934U; }
     // Only q0 consumes the prefetch queue. Only ranges that might
     // overwrite an in-flight prefetch destination depend on that completion.
     if(!q){
@@ -197,6 +209,6 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
             Simt::VF_CALL<PublishStreamingResidency>(Simt::Dim3{256,1,1},shape.resident,shape.finalPostOffset,ctx,b);
             SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
         }
-        FinalizeStreaming<false,true,true>(a,b,useful,total,completed,error);
+        FinalizeStreaming<false,true,true>(a,b,join.lines[3].reserved[5],total,completed,error);
     }
 }
