@@ -83,12 +83,14 @@ def format_frozen(report):
     def fields(key):
         data = report[key]
         diff = data["exposed"]
+        raw, units = (("probed", "joined_us") if key == "joined" else ("uninstrumented", "event_us"))
+        positive = sum(s["arms"]["overlap"][units] > s["arms"]["get_only"][units] for s in report[raw])
         return (
             f"{key}_get/overlap/wait_p50="
             + "/".join(f"{data[k]['p50']:.2f}" for k in ARMS)
             + f" exposed_mean/p50/min/max/drift={diff['mean']:.2f}/{diff['p50']:.2f}/"
             f"{diff['minimum']:.2f}/{diff['maximum']:.2f}/{diff['second_half_minus_first']:.2f}"
-            f" saved_p50={data['saved']['p50']:.2f}"
+            f" exposed_positive={positive}/{len(report[raw])} saved_p50={data['saved']['p50']:.2f}"
         )
 
     return (

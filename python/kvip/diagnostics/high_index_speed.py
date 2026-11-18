@@ -30,7 +30,7 @@ def command(args, group, arm):
     opts = copy(args)
     frozen = getattr(args, "frozen_library", None)
     if arm in ("old", "original", "old-end"):
-        opts.revision = PREVIOUS if frozen else BASE
+        opts.revision = getattr(args, "baseline", None) or (PREVIOUS if frozen else BASE)
         opts.source = args.cache / "adaptive-sources" / f"auto-{opts.revision[:8]}"
     role = {"old": "overlap", "original": "original", "candidate": "overlap",
             "wait": "wait-first", "old-end": "overlap-end"}[arm]
@@ -109,7 +109,8 @@ def qualified_targets(group, rows):
               f" ge10k_n={len(large)} " + " ".join(values))
 
 
-def summarize(group, cases, revision, *, frozen=False):
+def summarize(group, cases, revision, *, frozen=False, baseline=None):
+    control = baseline or (PREVIOUS if frozen else BASE)
     base = cases["old"]
     require(base["device"] == 0, "Expected the host20 physical-NPU4 logical-device-zero mapping")
     geometry = base["geometry"]
@@ -119,7 +120,7 @@ def summarize(group, cases, revision, *, frozen=False):
         for key in ("geometry", "snapshot_sha256", "kvaf_build", "warmup", "soc", "device", "diagnostics_commit"):
             require(base.get(key) is not None and case.get(key) == base[key],
                     f"{arm}: incomparable {key}")
-        require(case["kvip_commit"] == (revision if arm in ("candidate", "wait") else PREVIOUS if frozen else BASE)
+        require(case["kvip_commit"] == (revision if arm in ("candidate", "wait") else control)
                 and case["high_post_index"] == (arm != "original")
                 and case["post_index_wait_first"] == (arm == "wait"),
                 f"{arm}: wrong source, Index policy or CQ order")
@@ -152,10 +153,10 @@ def summarize(group, cases, revision, *, frozen=False):
             rows = index_rows(cases[arm])
             require(all(r["preplan"] and r["cold_plan"] and r["cold_plan"]["cpu_eligibility_checked"]
                         for r in rows), f"{arm}: missing verified row planner counters")
-            if arm == "candidate":
-                modes = ("direct_rows", "touched_rows", "general_rows")
-            else:
-                modes = ("fast_rows", "fallback_rows")
+            markers = {r["cold_plan"].get("marker") for r in rows}
+            require(len(markers) == 1 and markers <= {"HT31", "CP21"}, f"{arm}: unrecognized planner")
+            modes = (("direct_rows", "touched_rows", "general_rows") if markers == {"HT31"} else
+                     ("fast_rows", "fallback_rows"))
             counts = "/".join(str(sum(len(r["cold_plan"][k]) for r in rows)) for k in modes)
             require(sum(map(int, counts.split("/"))) == len(rows)*geometry["batch"],
                     f"{arm}: planner choice missing for a request")
@@ -229,7 +230,12 @@ def main(argv=None):
     p.add_argument("--result-dir", type=Path, required=True)
     p.add_argument("--groups", type=int, nargs="+", choices=GROUPS, default=(4, 7, 10, 17))
     p.add_argument("--frozen-library", type=Path)
+    p.add_argument("--baseline", help="Pinned old/original/old-end SHA for a fixed-work study")
     args = p.parse_args(argv)
+    if args.baseline and (not args.frozen_library or len(args.baseline) != 40
+                          or any(ch not in "0123456789abcdef" for ch in args.baseline)
+                          or args.baseline == args.revision):
+        p.error("--baseline requires --frozen-library and a distinct full control SHA")
     if args.frozen_library and not args.frozen_library.is_file():
         p.error(f"missing frozen-tail library: {args.frozen_library}")
     if len(set(args.groups)) != len(args.groups):
@@ -247,7 +253,7 @@ def main(argv=None):
                     print("".join(deque(f, maxlen=8)), file=sys.stderr, end="")
                 raise SystemExit(f"G{group}/{arm} failed rc={proc.returncode} log={log}")
             cases[arm] = load_case(output, arm)
-        summarize(group, cases, args.revision, frozen=bool(args.frozen_library))
+        summarize(group, cases, args.revision, frozen=bool(args.frozen_library), baseline=args.baseline)
 
 
 if __name__ == "__main__":

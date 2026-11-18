@@ -32,6 +32,7 @@ if [[ ! -x "$output/high_index_case" ]]; then
     fi
     ln -s "$build/high_index_case" "$output/high_index_case"
 fi
+if [[ ${INDEX_PROBE_BUILD_ONLY:-0} == 1 ]]; then exit 0; fi
 if [[ $mode == sim ]]; then
     export CAMODEL_CONFIG_PATH="$self/model"
     export LD_LIBRARY_PATH="$cann/tools/simulator/Ascend950PR_9582/lib:${LD_LIBRARY_PATH:-}"
@@ -39,6 +40,8 @@ fi
 cd "$output"
 # The native executable sees one logical device after ASCEND_RT_VISIBLE_DEVICES is set.
 read -r -a layouts <<< "${INDEX_LAYOUTS:-even skew}"
+lines='INDEX_MODEL_START|DEVICE_INDEX_US|COLD_PLAN_MODEL|TOUCHED_PLAN_MODEL|INDEX_WORK|MODEL_EXACT_PASS'
+if [[ ${INDEX_REPORT_SAMPLES:-0} == 1 ]]; then lines+='|DEVICE_INDEX_SAMPLES_US'; fi
 for layout in "${layouts[@]}"; do
     case "$layout" in even|skew|even-mixed|skew-mixed|even-events|skew-events|mixed-fallback|all-fallback) ;; *) echo "Unknown layout $layout" >&2; exit 2;; esac
     run_dir=$(mktemp -d "$output/$layout.XXXXXX")
@@ -47,5 +50,5 @@ for layout in "${layouts[@]}"; do
         tail -20 "$run_dir/run.log" >&2
         exit 1
     fi
-    grep -E '^(INDEX_MODEL_START|DEVICE_INDEX_US|COLD_PLAN_MODEL|TOUCHED_PLAN_MODEL|INDEX_WORK|MODEL_EXACT_PASS)' "$run_dir/run.log"
+    grep -E "^($lines) " "$run_dir/run.log"
 done

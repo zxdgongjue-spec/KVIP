@@ -96,3 +96,17 @@ def test_frozen_work_compares_previous_candidate_and_runs_on_one_arm(tmp_path):
             assert revision == PREVIOUS
             assert "--frozen-high-tail-library" not in cmd
         assert "--post-index-wait-first" not in cmd
+
+
+def test_explicit_ht31_control_pins_all_three_reference_runs(tmp_path):
+    from kvip.diagnostics.high_index_speed import FROZEN_ARMS
+    args = SimpleNamespace(cache=tmp_path, source=tmp_path, revision="b"*40, baseline="a"*40,
+                           server="127.0.0.1:29084", result_dir=tmp_path, frozen_library=tmp_path/"lib.so")
+    for arm in FROZEN_ARMS:
+        parsed = arguments(command(args, 4, arm)[4:])
+        expected = args.revision if arm == "candidate" else args.baseline
+        assert parsed.upstream_revision == expected
+        if arm != "candidate":
+            assert parsed.upstream_root == tmp_path/"adaptive-sources"/"auto-aaaaaaaa"
+        assert bool(parsed.frozen_high_tail_library) == (arm == "candidate")
+        assert parsed.high_post_index == (arm != "original")

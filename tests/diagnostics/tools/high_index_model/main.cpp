@@ -346,6 +346,9 @@ int main(int argc, char **argv) {
             }
             Check(aclrtDestroyEvent(begin));
             Check(aclrtDestroyEvent(end));
+            printf("DEVICE_INDEX_SAMPLES_US");
+            for (double us : elapsedUs) printf(" %.9f", us);
+            printf("\n");
             std::sort(elapsedUs.begin(), elapsedUs.end());
             const double mean =
                 std::accumulate(elapsedUs.begin(), elapsedUs.end(), 0.0) / elapsedUs.size();

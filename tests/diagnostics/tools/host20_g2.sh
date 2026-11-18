@@ -12,6 +12,12 @@ index_10k=0
 fixed_work=0
 index_units=moves
 index_groups=(4 7 10 17)
+baseline_override=
+if [[ (${1:-} == --index-paired || ${1:-} == --index-10k-paired) && ${3:-} == --baseline ]]; then
+    [[ ${4:-} =~ ^[0-9a-f]{40}$ ]] || die "--baseline requires a full 40-digit SHA"
+    baseline_override=$4
+    set -- "$1" "$2" "${@:5}"
+fi
 joint=0
 account=0
 init_only=
@@ -62,7 +68,7 @@ elif [[ $# == 2 && $1 == --high-index && $2 =~ ^[0-9a-f]{40}$ ]]; then
     high_index=1
     candidate=$2
 elif [[ $# != 0 ]]; then
-    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA|--index-speed CANDIDATE_SHA [GROUP ...]|--index-10k CANDIDATE_SHA [moves|events]|--index-paired CANDIDATE_SHA [GROUP ...]|--index-10k-paired CANDIDATE_SHA [moves|events]]"
+    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA|--index-speed CANDIDATE_SHA [GROUP ...]|--index-10k CANDIDATE_SHA [moves|events]|--index-paired CANDIDATE_SHA [--baseline CONTROL_SHA] [GROUP ...]|--index-10k-paired CANDIDATE_SHA [--baseline CONTROL_SHA] [moves|events]]"
 fi
 
 diag=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
@@ -79,7 +85,7 @@ if [[ -n $candidate ]]; then
     before=${3:-$after}
     if ((account)); then before=66a2f469ebaec3b35fff789a75177ee19b00213e; fi
     if ((index_speed || index_10k)); then before=dc7904e8e874956de6df8352265bb6ac64d1d644; fi
-    if ((fixed_work)); then before=785703fe7118ac777069c27f43509ee090f8730a; fi
+    if ((fixed_work)); then before=${baseline_override:-785703fe7118ac777069c27f43509ee090f8730a}; fi
     after=$candidate
     [[ $after != "$before" ]] && git -C "$repo" merge-base --is-ancestor "$before" "$after" ||
         die "Candidate must be a distinct descendant of $before"
@@ -112,6 +118,25 @@ if ((index_10k)); then
     probe=$(mktemp -d /tmp/kvip-10k.XXXXXX)
     if [[ $index_units == events ]]; then export INDEX_LAYOUTS='even-events skew-events'; fi
     printf 'INDEX_10K physical_NPU=4 logical=0 target=10000_%s RESULT_ROOT=%s\n' "$index_units" "$probe"
+    if [[ -n $baseline_override ]]; then
+        runner="$diag/tests/diagnostics/tools/high_index_model/run_case.sh"
+        for role in before after; do
+            rev=$before
+            if [[ $role == after ]]; then rev=$after; fi
+            INDEX_PROBE_BUILD_ONLY=1 bash "$runner" npu "$src/auto-${rev:0:8}" "$inc" "$probe/$role"
+        done
+        for role in before after before-end; do
+            rev=$before
+            if [[ $role == after ]]; then rev=$after; fi
+            if ! INDEX_REPORT_SAMPLES=1 bash "$runner" npu "$src/auto-${rev:0:8}" "$inc" \
+                    "$probe/${role%-end}" >"$probe/$role.log" 2>&1; then
+                tail -15 "$probe/$role.log" >&2
+                die "Index probe failed: $role"
+            fi
+        done
+        python3 -B "$diag/tests/diagnostics/tools/high_index_model/bracket.py" "$probe" "$index_units" "$before" "$after"
+        exit
+    fi
     for role in before after; do
         rev=$before
         if [[ $role == after ]]; then rev=$after; fi
@@ -196,6 +221,7 @@ if ((high_index)); then
         study_args=(--groups "${index_groups[@]}")
         if ((fixed_work)); then
             study_args+=(--frozen-library "$out/frozen/libkvip_frozen_tail.so")
+            if [[ -n $baseline_override ]]; then study_args+=(--baseline "$before"); fi
         fi
     fi
     python3 -B -m "$study" "${study_args[@]}" --cache "$cache" \
