@@ -85,10 +85,51 @@ def li_kernel_breakdown(capture):
     return {label: [end-start for start, end in rows]
             for label, rows in zip(labels, arrays)}, ''
 
+def bench_li(root):
+    profiles = [p for p in root.rglob('graph_profile.json')
+                if 'bench' in p.parts and 'fused' in p.parts]
+    for fused in sorted(profiles, key=lambda p: p.stat().st_mtime_ns, reverse=True):
+        case = next(d for d in fused.parents if d.name == 'bench')
+        config_file = case / 'config.json'
+        if not config_file.is_file():
+            continue
+        config = json.loads(config_file.read_text())
+        if (config.get('input'), config.get('group'), config.get('transport')) != ('real', 2, 'urma'):
+            continue
+        relative = fused.relative_to(case)
+        parts = list(relative.parts)
+        parts[parts.index('fused')] = 'serial'
+        serial = case.joinpath(*parts)
+        measured = json.loads(fused.read_text())['timing']
+        calls = measured['graph_calls']
+        phases, issue = li_kernel_breakdown(dict(source=str(fused), graph_calls=calls))
+        if issue:
+            raise SystemExit(f'{fused}: {issue}')
+        reference = json.loads(serial.read_text())['timing']
+        if reference['graph_calls'] != calls:
+            raise SystemExit('Serial and fused invocation counts differ')
+        total = sum(statistics.mean(values) for values in phases.values())
+        reported = measured['stage_mean_us']['li']
+        if abs(total - reported) > 0.01:
+            raise SystemExit(f'Four-kernel sum {total:.2f} differs from bench LI {reported:.2f}')
+        print(f'Fused: {fused}\nSerial: {serial}')
+        print(diagnostic_table('Fused LI kernels (us/call)',
+                               ['Kernel', 'Mean', 'p50', 'Min', 'Max', 'N'],
+                               [[label, *stats(values)] for label, values in phases.items()]))
+        baseline = reference['stage_mean_us']['li']
+        print(f'Fused sum {total:.2f} us | bench LI {reported:.2f} us | '
+              f'serial LI {baseline:.2f} us | fused - serial {total-baseline:+.2f} us')
+        return
+    raise SystemExit(f'No real G2 URMA bench graph profile under {root}')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('root', nargs='?', type=Path, default=Path('tests/results/lifetch'))
+    parser.add_argument("--bench-li", action="store_true", help="summarize the latest real G2 URMA bench LI kernels")
     args = parser.parse_args()
+    if args.bench_li:
+        return bench_li(args.root)
     matches = []
     for path in args.root.rglob('diagnostic.json'):
         config_path = path.parent / 'config.json'
