@@ -75,3 +75,24 @@ def test_preplan_reports_measurements_without_summing_concurrent_requests():
     marks[0, 14] = 1
     with pytest.raises(ValueError, match="misplaced"):
         _preplan_detail(marks, moved, {"event_count": 3})
+
+
+def test_frozen_work_compares_previous_candidate_and_runs_on_one_arm(tmp_path):
+    from kvip.diagnostics.high_index_speed import FROZEN_ARMS, PREVIOUS
+
+    library = tmp_path / "libkvip_frozen_tail.so"
+    args = SimpleNamespace(cache=tmp_path, source=tmp_path, revision="b" * 40,
+                           server="127.0.0.1:29084", result_dir=tmp_path,
+                           frozen_library=library)
+    assert FROZEN_ARMS == ("old", "original", "candidate", "old-end")
+    for arm in FROZEN_ARMS:
+        cmd = command(args, 4, arm)
+        revision = cmd[cmd.index("--upstream-revision") + 1]
+        if arm == "candidate":
+            assert revision == args.revision
+            assert cmd[cmd.index("--frozen-high-tail-library") + 1] == str(library)
+            assert "--calibrate-counter" in cmd and "--check-auto-route" in cmd
+        else:
+            assert revision == PREVIOUS
+            assert "--frozen-high-tail-library" not in cmd
+        assert "--post-index-wait-first" not in cmd
