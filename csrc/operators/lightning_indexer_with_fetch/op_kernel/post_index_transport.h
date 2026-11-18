@@ -130,9 +130,11 @@ __aicore__ inline uint64_t Retire(State& state, uint64_t previousError) {
             completion = kvaf_device::WaitForCompletion(entity, queue, &polls);
     }
     if (!completion) { ++queue->completed_batch_count; state.completed = state.requests; }
-    if (error) {
-        queue->poisoned = 1;
-        if (!queue->last_error) queue->last_error = error;
+    if (error) queue->poisoned = 1;
+    if constexpr (RetryTimeout) {
+        if (error && !queue->last_error) queue->last_error = error;
+    } else {
+        queue->last_error = error;  // Original single-checkpoint path.
     }
     if (!state.error) state.error = error;
     kvaf_device::WriteStatus(status, previousError ? previousError : state.error,
