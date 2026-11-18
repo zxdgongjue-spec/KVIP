@@ -79,7 +79,18 @@ def diagnostic_wait(case):
     return max_wait, apply, ends
 
 
-def summarize(group, cases, baseline, candidate, high_overlap=False):
+def schedule_format(source):
+    kernel = source / "csrc/operators/lightning_indexer_with_fetch/op_kernel"
+    if "high_post_index::RunRow(" not in (kernel/"streaming.cpp").read_text():
+        return "PIH1"
+    impl = (kernel/"high_index_async.h").read_text()
+    for tag, marker in (("0x52514932", "RQI2"), ("0x52514931", "RQI1")):
+        if tag in impl:
+            return marker
+    raise ValueError(f"Unrecognized row schedule diagnostic ABI at {source}")
+
+
+def summarize(group, cases, baseline, candidate, high_overlap=False, schedule_formats=("PIH1", "RQI1")):
     arms = OVERLAP_ARMS if high_overlap else ARMS
     base = cases["before"]
     geometry = base["geometry"]
@@ -152,7 +163,7 @@ def summarize(group, cases, baseline, candidate, high_overlap=False):
             for a in ("original", "before", "after")) + " transport64_max_fallback_cores="
             + "/".join(str(max(s["high_post_index"]["fallback_cores"] for s in cases[a]["reads_samples"]))
                        for a in ("before", "after")))
-        for arm, marker in (("before", "PIH1"), ("after", "RQI1")):
+        for arm, marker in zip(("before", "after"), schedule_formats):
             diag = cases[arm]["native_diagnostics"]
             clock = diag["counter_calibration"]
             require(not diag["included_in_timing"] and not clock["included_in_timing"]
@@ -170,6 +181,14 @@ def summarize(group, cases, baseline, candidate, high_overlap=False):
             print(f"G{group} TRACE_us {arm} marker={marker} " + " ".join(f"{k}={metrics[k]/rate:.2f}" for k in keys)
                   + f" final_Get={sample['reads']['final']} nonempty_lanes={metrics['nonempty_lanes']}"
                   + f" calls={metrics['final_api_calls']} blocking_lanes={metrics['blocking_final_lanes']}")
+            if marker.startswith("RQI"):
+                high = sample["reads"]["high_post_index"]
+                roles = "/".join(f"{v/rate:.2f}" for v in metrics["validation_by_role_p50"])
+                print(f"G{group} LOAD {arm} role0/1/2/3_to_valid_p50_us={roles}"
+                      f" max_row_valid_spread_us={metrics['validation_spread_max']/rate:.2f}"
+                      f" lane_Index_us_p50/max={metrics['lane_index_p50']/rate:.2f}/{metrics['longest_lane_index']/rate:.2f}"
+                      f" moves_total/max_row/max_lane={metrics['moved_total']}/{metrics['max_row_moves']}/{metrics['max_moves_per_lane']}"
+                      f" rows_single_owner/gather={high['single_owner_rows']}/{high['row_gathers']}")
         print(f"G{group} CHECK real_Index_order/TopK/KV/lifecycle/submitted_completed=PASS", flush=True)
         return
     stages = []
@@ -194,6 +213,10 @@ def main():
     p.add_argument("--high-overlap", action="store_true", help="Bracket both full-AIV HIGH arms with the original per-row schedule")
     args = p.parse_args()
     arms = OVERLAP_ARMS if args.high_overlap else ARMS
+    formats = ()
+    if args.high_overlap:
+        baseline_source = args.cache/"adaptive-sources"/f"auto-{args.baseline[:8]}"
+        formats = (schedule_format(baseline_source), schedule_format(args.source))
     for group in args.groups:
         cases = {}
         for arm in arms:
@@ -206,7 +229,7 @@ def main():
                     print("".join(deque(out, maxlen=8)), file=sys.stderr, end="")
                 raise SystemExit(f"G{group}/{arm} failed rc={status} log={log}")
             cases[arm] = load_case(cmd[cmd.index("--output") + 1], arm)
-        summarize(group, cases, args.baseline, args.revision, args.high_overlap)
+        summarize(group, cases, args.baseline, args.revision, args.high_overlap, formats)
 
 
 if __name__ == "__main__":

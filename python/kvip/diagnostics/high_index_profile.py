@@ -117,11 +117,25 @@ def validate_move_counts(profile, before, after, owners, *, two_cycle_moves=None
         singles = np.asarray(counts) - 2*pairs
         def partition(items):
             return np.diff(np.arange(cores // batch + 1)[:, None]*items // (cores // batch), axis=0).ravel()
-        if (not np.array_equal(local["pairs"], partition(pairs))
-                or not np.array_equal(local["singles"], partition(singles))
+        expected_pairs = partition(pairs).reshape(4, batch)
+        expected_singles = partition(singles).reshape(4, batch)
+        eligible = np.zeros(batch, dtype=bool)
+        if local.get("single_owner", False):
+            # RQI2: move all long-cycle originals on the last lane when that
+            # lane can afford them. The other work consists of atomic swap pairs.
+            total = 2*pairs + singles
+            eligible = (singles > 0) & (singles <= 1024) & (4*singles <= total)
+            pair_cuts = np.minimum(pairs, np.arange(5)[:, None]*total//4//2)
+            expected_pairs[:, eligible] = np.diff(pair_cuts, axis=0)[:, eligible]
+            expected_singles[:, eligible] = 0
+            expected_singles[-1, eligible] = singles[eligible]
+        if (not np.array_equal(local["pairs"], expected_pairs.ravel())
+                or not np.array_equal(local["singles"], expected_singles.ravel())
                 or not np.array_equal(local["invalidations"], partition(np.asarray(invalidations, dtype=np.int64)))
-                or not np.array_equal(moved, 2*partition(pairs) + partition(singles))):
+                or not np.array_equal(moved, (2*expected_pairs + expected_singles).ravel())):
             raise ValueError("Row-local HIGH transfer or invalidation counters disagree with persistent Index oracle")
+        profile["row_gathers"] = int(np.count_nonzero((singles > 0) & ~eligible))
+        profile["single_owner_rows"] = int(np.count_nonzero(eligible))
         profile["persistent_moves_checked"] = True
         return
     if prepared := profile.get("preplan"):
@@ -230,8 +244,9 @@ def _preplan_detail(marks, moved, work):
                 first_preplan_to_last_index=post[1]-int(start.min()))
 
 
-def overlap_schedule_timing(rows, marks, *, row_local):
+def overlap_schedule_timing(rows, marks, *, marker):
     """One diagnostic replay. Only nonempty final Get calls contribute transport endpoints."""
+    row_local = marker in ("RQI1", "RQI2")
     live = rows[:, 1] > 0
     origin, index_end = rows[:, 10], rows[:, 8]
     index_start = marks[:, 3 if row_local else 11]
@@ -246,7 +261,7 @@ def overlap_schedule_timing(rows, marks, *, row_local):
         raise ValueError("Invalid per-lane Index interval or nonempty final Post/Wait timestamps")
     begin = int(origin.min())
     return dict(
-        format="RQI1" if row_local else "PIH1",
+        format=marker,
         final_api_calls=int(n_calls.sum()), nonempty_lanes=int(live.sum()),
         first_post_begin=int(start.min())-begin, last_post_begin=int(last_start.max())-begin,
         last_post_return=int(returned.max())-begin, last_final_wait_return=int(waited.max())-begin,
@@ -277,15 +292,33 @@ def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan
     if detail.dtype != np.int64 or detail.shape != (len(rows), 32):
         raise ValueError("Unexpected HIGH timestamp layout")
     marks = detail.view(np.uint64)
-    if np.all(marks[:, 2] == 0x52514931):
+    row_markers = {0x52514931: "RQI1", 0x52514932: "RQI2"}
+    marker = row_markers.get(int(marks[0, 2]))
+    if marker is not None and np.all(marks[:, 2] == marks[0, 2]):
         if wait_first or not schedule_timing:
-            raise ValueError("RQI1 row-local timing requires the full-graph HIGH overlap comparison")
+            raise ValueError("Row-local timing requires the full-graph HIGH overlap comparison")
         if np.any(marks[:, 9] != marks[:, 10]) or np.any(marks[:, 10] != 2*marks[:, 16] + marks[:, 17]):
             raise ValueError("Incomplete row-local Index transfer counts")
         result["moved"] = marks[:, 10].tolist()
         result["row_partitions"] = dict(pairs=marks[:, 16].tolist(), singles=marks[:, 17].tolist(),
-                                        invalidations=marks[:, 19].tolist())
-        result["schedule_timing"] = overlap_schedule_timing(rows, marks, row_local=True)
+                                        invalidations=marks[:, 19].tolist(), single_owner=marker == "RQI2")
+        schedule = overlap_schedule_timing(rows, marks, marker=marker)
+        # block=q*16+request. Each lane records packDone when its own role and
+        # validation finish. Their within-request spread is a readiness difference,
+        # not cycles to add to graph latency or a measurement of idle utilization.
+        ready = rows[:, 5].reshape(4, 16)
+        entry = rows[:, 10].reshape(4, 16)
+        if np.any(ready < entry) or np.any(ready.ravel() > marks[:, 3]):
+            raise ValueError("Invalid row-local validation timestamp")
+        spans = ready.max(axis=0) - ready.min(axis=0)
+        schedule["validation_by_role_p50"] = np.median(ready-entry, axis=1).tolist()
+        schedule["validation_spread_max"] = int(spans.max())
+        schedule["lane_index_p50"] = float(np.median(rows[:, 8]-marks[:, 3]))
+        moved = marks[:, 10].reshape(4, 16)
+        schedule["max_moves_per_lane"] = int(moved.max())
+        schedule["max_row_moves"] = int(moved.sum(axis=0).max())
+        schedule["moved_total"] = int(moved.sum())
+        result["schedule_timing"] = schedule
         return result
     if np.any(marks[:, 2] != 0x50494831):
         raise ValueError("Missing PIH1 markers on one or more AIVs")
@@ -337,5 +370,5 @@ def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan
     if schedule_timing:
         if wait_first:
             raise ValueError("Expected simultaneous Index and transport")
-        result["schedule_timing"] = overlap_schedule_timing(rows, marks, row_local=False)
+        result["schedule_timing"] = overlap_schedule_timing(rows, marks, marker="PIH1")
     return result

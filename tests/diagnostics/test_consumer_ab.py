@@ -73,7 +73,8 @@ def test_checks_fail_for_stale_or_unverified_index_or_changed_transport():
         diagnostic_wait(case)
 
 
-def test_high_overlap_arms_reuse_public_completion_records(tmp_path, capsys):
+@pytest.mark.parametrize("formats", [("PIH1", "RQI1"), ("RQI1", "RQI2")])
+def test_high_overlap_arms_reuse_public_completion_records(tmp_path, capsys, formats):
     from kvip.diagnostics.consumer_ab import OVERLAP_ARMS
 
     args = SimpleNamespace(baseline="a"*40, revision="b"*40, cache=tmp_path, source=tmp_path/"new",
@@ -93,11 +94,13 @@ def test_high_overlap_arms_reuse_public_completion_records(tmp_path, capsys):
             diag = c["native_diagnostics"]
             diag["samples"] = diag["samples"][:1]
             diag["samples"][0]["reads"] = dict(final=1, consumer_work=dict(ordered_index_verified=True),
-                high_post_index=dict(persistent_moves_checked=True, schedule_timing=dict(first_post_begin=1000, last_post_begin=1400,
+                high_post_index=dict(persistent_moves_checked=True, row_gathers=10, single_owner_rows=1, schedule_timing=dict(first_post_begin=1000, last_post_begin=1400,
                     last_post_return=1500, last_final_wait_return=4000, longest_lane_index=3000,
                     index_completion_spread=500, last_index_minus_last_final_wait=-1000,
                     nonempty_lanes=1, final_api_calls=1, blocking_final_lanes=0,
-                    format="PIH1" if arm=="before" else "RQI1")))
+                    validation_by_role_p50=[300, 500, 350, 10], validation_spread_max=490,
+                    lane_index_p50=220, max_moves_per_lane=100, moved_total=1000, max_row_moves=256,
+                    format=formats[int(arm=="after")])))
         else:
             del c["native_diagnostics"]
         c["high_post_index"] = not original
@@ -106,13 +109,13 @@ def test_high_overlap_arms_reuse_public_completion_records(tmp_path, capsys):
             for s in c["reads_samples"]:
                 s["high_post_index"] = dict(core_count=64, fallback_cores=0, final_get_by_core=[1]+[0]*63)
         cases[arm] = c
-    summarize(7, cases, args.baseline, args.revision, True)
+    summarize(7, cases, args.baseline, args.revision, True, formats)
     result = capsys.readouterr().out
     assert "ORIGINAL_per_row_vs_candidate_us saved_min=-3.000/-3.000 saved_max=1.000/1.000" in result
     assert "identical_work_pairs=18/18" in result and "real_Index_order/TopK/KV/lifecycle/submitted_completed=PASS" in result
     cases["after"]["reads_samples"][1]["high_post_index"]["final_get_by_core"] = [0]*64
     with pytest.raises(ValueError, match="transport count"):
-        summarize(7, cases, args.baseline, args.revision, True)
+        summarize(7, cases, args.baseline, args.revision, True, formats)
 
 def test_row_timeline_handles_split_submissions_and_excludes_idle_final_lanes():
     from kvip.diagnostics.high_index_profile import decode_high_index
@@ -120,6 +123,7 @@ def test_row_timeline_handles_split_submissions_and_excludes_idle_final_lanes():
     marks = np.zeros((64, 32), dtype=np.int64)
     rows[:, 14] = 2
     rows[:, 10] = 100
+    rows[:, 5] = np.repeat([155, 150, 145, 130], 16)
     rows[:, 8] = 250
     rows[0, 8] = 290
     rows[0:2, 1] = rows[0:2, 15] = [3, 7]
@@ -136,7 +140,9 @@ def test_row_timeline_handles_split_submissions_and_excludes_idle_final_lanes():
     assert report == dict(format="RQI1", final_api_calls=3, nonempty_lanes=2,
                           first_post_begin=40, last_post_begin=220, last_post_return=226,
                           last_final_wait_return=241, longest_lane_index=130, index_completion_spread=40,
-                          last_index_minus_last_final_wait=-51, blocking_final_lanes=0)
+                          last_index_minus_last_final_wait=-51, blocking_final_lanes=0,
+                          validation_by_role_p50=[55,50,45,30], validation_spread_max=25, lane_index_p50=90,
+                          max_moves_per_lane=0, max_row_moves=0, moved_total=0)
     marks[1, 8] = 0
     with pytest.raises(ValueError, match="nonempty"):
         decode_high_index(rows, marks, wait_first=False, final_get=10, work={}, schedule_timing=True)
@@ -156,3 +162,31 @@ def test_row_owned_partition_checks_exchanges_independently_from_single_moves():
     profile["row_partitions"]["pairs"] = np.roll(pairs, 16)
     with pytest.raises(ValueError, match="Row-local"):
         validate_move_counts(profile, before, after, range(16), two_cycle_moves=[2]+[0]*15, invalidations=[0]*16)
+
+
+def test_sparse_cycle_stays_on_one_lane_while_swaps_share_real_move_budget():
+    from kvip.diagnostics.high_index_profile import validate_move_counts
+    before = np.tile(np.arange(20), (16, 1))
+    after = before.copy()
+    after[0, :15] = [1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 14, 12]
+    pairs, singles = np.zeros(64, dtype=int), np.zeros(64, dtype=int)
+    pairs[::16], singles[48] = [1, 2, 2, 1], 3
+    profile = dict(moved=2*pairs+singles,
+                   row_partitions=dict(pairs=pairs, singles=singles, invalidations=[0]*64, single_owner=True))
+    validate_move_counts(profile, before, after, range(16), two_cycle_moves=[12]+[0]*15, invalidations=[0]*16)
+    assert profile["persistent_moves_checked"] and profile["row_gathers"] == 0 and profile["single_owner_rows"] == 1
+    profile["row_partitions"]["single_owner"] = False
+    with pytest.raises(ValueError, match="Row-local"):
+        validate_move_counts(profile, before, after, range(16), two_cycle_moves=[12]+[0]*15, invalidations=[0]*16)
+
+
+def test_expected_format_follows_checked_out_dispatch_and_marker(tmp_path):
+    from kvip.diagnostics.consumer_ab import schedule_format
+    folder = tmp_path / "csrc/operators/lightning_indexer_with_fetch/op_kernel"
+    folder.mkdir(parents=True)
+    (folder / "streaming.cpp").write_text("high_post_index::Run(a,block);")
+    assert schedule_format(tmp_path) == "PIH1"
+    (folder / "streaming.cpp").write_text("high_post_index::RunRow(a,block);")
+    for token, expected in (("0x52514931", "RQI1"), ("0x52514932", "RQI2")):
+        (folder / "high_index_async.h").write_text(f"ticks[2]={token}U;")
+        assert schedule_format(tmp_path) == expected
