@@ -195,4 +195,13 @@ bash /home/w00568585/li_qk_shared/run_tail_in_container.sh --profile
 bash /home/w00568585/li_qk_shared/run_tail_in_container.sh --batch 16 --parts 2 --profile
 ```
 
+`run_tail_in_container.sh`现为正式仓库文件，宿主机更新时也将同一文件发布到共享目录。在已更新的仓库根目录中，可以直接执行：
+
+```bash
+bash experiments/li_qk/run_tail_in_container.sh \
+  --share-root /home/w00568585/li_qk_shared --controls C0,C1 --profile
+```
+
+该入口仍需要宿主机先运行`update_shared_a5.sh`准备可见的release；只拉取仓库不会生成共享release。缺少release时会打印宿主机更新命令，不在容器联网拉取代码。
+
 fresh NPU build、r0丢弃、三轮交错同轮配对；msprof单独采集。Model使用 [run_tail_model.sh](run_tail_model.sh)，[tail_instructions.py](tail_instructions.py)按实际ELF/entry/launch证明分类，[tail_summary.py](tail_summary.py)仅合并完整Model结果，同binary/fixture/几何/范围才计算比值。后处理预算是64 AIV，B16 score原入口的30/60限制另计。

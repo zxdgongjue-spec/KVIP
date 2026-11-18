@@ -109,6 +109,9 @@ exec bash "$LI_RELEASE/run_li_qk_a5.sh" --repo "$LI_REPO" \
 LI_CONTAINER_ENTRY_END
 bash -n "$LI_SHARE/run_in_container.sh.pending"
 mv "$LI_SHARE/run_in_container.sh.pending" "$LI_SHARE/run_in_container.sh"
+if git --git-dir="$LI_REPO" cat-file -e "$LI_HEAD:experiments/li_qk/run_tail_in_container.sh" 2>/dev/null; then
+    git --git-dir="$LI_REPO" show "$LI_HEAD:experiments/li_qk/run_tail_in_container.sh" > "$LI_SHARE/run_tail_in_container.sh.pending"
+else
 cat > "$LI_SHARE/run_tail_in_container.sh.pending" <<'LI_TAIL_ENTRY_END'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -122,6 +125,7 @@ LI_TAIL_RELEASE=$(cd "$LI_TAIL_ROOT/current" && pwd -P)
 }
 exec bash "$LI_TAIL_RELEASE/run_tail_a5.sh" --share-root "$LI_TAIL_ROOT" --release-root "$LI_TAIL_RELEASE" "$@"
 LI_TAIL_ENTRY_END
+fi
 bash -n "$LI_SHARE/run_tail_in_container.sh.pending"
 mv "$LI_SHARE/run_tail_in_container.sh.pending" "$LI_SHARE/run_tail_in_container.sh"
 if [[ -e $LI_SHARE/current && ! -L $LI_SHARE/current ]]; then die 'current must be the updater release symlink; existing directory was preserved'; fi

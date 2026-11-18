@@ -47,3 +47,4 @@
 - 共享目录脚本通过真实本地bundle发布/verify/help、脚本/包/commit篡改拒绝、重复发布保留旧release检查；未执行CANN或NPU。生成的七个tail入口元数据均为K_TYPE_AIV。
 - compiled C++/headers与CANN950 Model、fresh `RUN_MODE=npu`构建的SHA相符，binary/library SHA也验证。Python统计/脚本随后完善，不沿用旧Python分类标签解释GM访存。
 - 模型输入是已有最终score，mapping/LRU固定，只验证隔离后处理契约；不模拟动态Service/URMA/Index，也未实现producer/consumer常驻融合。没有真实A5时间或msprof，脚本供服务器采集。
+- 容器入口`run_tail_in_container.sh`补为正式仓库文件；六项本地shell检查通过，覆盖仓库入口/共享入口、显式共享路径、参数转交、缺少release的更新提示及无参数启动。宿主机发布使用同一仓库文件；旧提交保留原生成方式。没有执行NPU。
