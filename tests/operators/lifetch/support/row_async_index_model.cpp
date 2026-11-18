@@ -85,8 +85,8 @@ int main() {
     Args a{uint64_t(storage.data()),uint64_t(keys.data()),uint64_t(scales.data()),uint64_t(addresses.data()),
            uint64_t(logical.data()),resident,history};
     Context ctx{uint64_t(valid.data())};
-    std::array<unsigned,batch> pairs{0,1,4,14,0,35,1,117,0,19,13,17,23,51,101,0};
-    std::array<unsigned,batch> singles{0,0,3,19,4098,0,229,108,4801,0,7,4,3,17,0,21};
+    std::array<unsigned,batch> pairs{0,1,4,14,0,35,1,117,0,19,1700,1800,23,51,101,0};
+    std::array<unsigned,batch> singles{0,0,3,19,4098,0,229,108,4801,0,1024,1025,3,17,0,21};
     std::array<unsigned,batch> invalid{};
     std::array<Team,batch> teams;
     std::vector<unsigned> wanted(batch * history);
@@ -124,7 +124,7 @@ int main() {
             wantedValid[owner*resident+slot]=0;
         }
     }
-    std::latch independent(lanes);
+    std::latch independent(lanes), privatePeers(lanes-1);
     std::vector<std::thread> all;
     for (unsigned block=0;block<batch*lanes;++block) {
         all.emplace_back([&,block]{
@@ -132,20 +132,35 @@ int main() {
             // A slow row is allowed to arrive only after another independent
             // four-lane row has completed. A collective spanning rows cannot work.
             if (row==4) independent.wait();
+            // Hold the only long-cycle owner until the three pure-swap
+            // lanes have returned. A shared gather here would deadlock.
+            if (row==12 && lane==lanes-1) privatePeers.wait();
             uint64_t ticks[32]{};
             auto error=ApplyRowIndex(&a,&ctx,row,owner,lane,lanes,pairs[row],singles[row],
                 invalid[row],stride,ticks,true,teams[row]);
             assert(error==(teams[row].reject ? 13u : 0u));
             unsigned p=pairs[row]*(lane+1)/lanes-pairs[row]*lane/lanes;
             unsigned s=singles[row]*(lane+1)/lanes-singles[row]*lane/lanes;
+            const unsigned moves=2*pairs[row]+singles[row];
+            if(singles[row] && singles[row]<=kLocalTuples && singles[row]*lanes<=moves) {
+                unsigned start=std::min(pairs[row],moves*lane/(2*lanes));
+                unsigned end=std::min(pairs[row],moves*(lane+1)/(2*lanes));
+                p=end-start;
+                s=lane==lanes-1 ? singles[row] : 0;
+                assert(2*p+s <= (moves+lanes-1)/lanes+1);
+            }
             assert(ticks[9]==2*p+s && ticks[16]==p && ticks[17]==s);
             assert(ticks[18]==(s>kLocalTuples ? s : 0));
             if (row==2) independent.count_down();
+            if (row==12 && lane<lanes-1) privatePeers.count_down();
         });
     }
     for (auto &t:all)t.join();
-    for (unsigned row=0;row<batch;++row)
-        assert(teams[row].arrivals.load()==(singles[row] ? lanes : 0u));
+    for (unsigned row=0;row<batch;++row) {
+        const unsigned moves=2*pairs[row]+singles[row];
+        bool shared=singles[row] && (singles[row]>kLocalTuples || singles[row]*lanes>moves);
+        assert(teams[row].arrivals.load()==(shared ? lanes : 0u));
+    }
     for (unsigned owner=0;owner<batch;++owner) {
         for (unsigned pos=0;pos<history;++pos) {
             unsigned dest=owner*history+pos,src=wanted[dest],raw=src-owner*history;
