@@ -5,13 +5,17 @@ set -eo pipefail
 die() { printf '%s\n' "$*" >&2; exit 1; }
 labels=(after)
 profile=0
-if [[ $# == 1 && $1 == --parity ]]; then
+candidate=
+if [[ $# == 2 && $1 == --parity && $2 =~ ^[0-9a-f]{40}$ ]]; then
+    labels=(serial before after after-end before-end serial-end)
+    candidate=$2
+elif [[ $# == 1 && $1 == --parity ]]; then
     labels=(serial before after after-end before-end serial-end)
 elif [[ $# == 1 && $1 == --kernels ]]; then
     labels=(serial after)
     profile=1
 elif [[ $# != 0 ]]; then
-    die "usage: bash host20_g2.sh [--parity|--kernels]"
+    die "usage: bash host20_g2.sh [--parity [FULL_CANDIDATE_SHA]|--kernels]"
 fi
 
 diag=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
@@ -24,6 +28,12 @@ snapshot="$cache/skip-results.po80Nw/g2-input"
 main=532df2c8dfcb27cf8ab203f70d5bdf3510d77b6c
 before=96198a2bfc9ba2e983c090225b9acdfdf40c6099
 after=0f103cc1b6db1beacfb90023d02befc5eff8ae9e
+if [[ -n $candidate ]]; then
+    before=$after
+    after=$candidate
+    [[ $after != "$before" ]] && git -C "$repo" merge-base --is-ancestor "$before" "$after" ||
+        die "Candidate must be a distinct descendant of $before"
+fi
 [[ -s "$snapshot/manifest.json" && -s "$build/CMakeCache.txt" && -x "$cpu" ]] ||
     die "Missing G2 snapshot, existing KVAF build or CPU helper: $cache"
 clean() { git -C "$1" diff --quiet && git -C "$1" diff --cached --quiet; }
@@ -111,7 +121,7 @@ path, label, revision = sys.argv[1:]
 case = json.loads(Path(path).read_text())["cases"]["auto-post-index"]
 lifecycle = case["auto_route"]["lifecycle"]
 policy = lifecycle["low_history_map_contract"]
-want = "preserve_all" if label == "after" else "write_abc"
+want = "write_abc" if revision == "96198a2bfc9ba2e983c090225b9acdfdf40c6099" else "preserve_all"
 rows = sum(row["mode"] == "low" and row["poisoned_history_map"] for row in lifecycle["sequence"])
 if case["kvip_commit"] != revision or lifecycle["status"] != "pass" or policy != want or not rows:
     raise SystemExit(f"MAP_CHECK_FAILED label={label} policy={policy} tested_low_steps={rows} JSON={path}")
