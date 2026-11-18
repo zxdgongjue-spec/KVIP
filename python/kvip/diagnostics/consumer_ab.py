@@ -266,8 +266,10 @@ def summarize(group, cases, baseline, candidate, high_overlap=False, schedule_fo
                 reassign = metrics.get("get_reassignment")
                 split_load = (f" helpers/Get_moved/max_Q_before={reassign['helpers']}/{reassign['transferred']}/"
                               f"{reassign['max_canonical_lane']}" if reassign else "")
-                print(f"G{group} LOAD {arm} role0/1/2/3_to_valid_p50_us={roles}"
-                      f" max_row_valid_spread_us={metrics['validation_spread_max']/rate:.2f}"
+                role_stage = "descriptor_checked" if marker in ("RQI4", "RQI5") else "to_valid"
+                spread = "descriptor_check" if marker in ("RQI4", "RQI5") else "valid"
+                print(f"G{group} LOAD {arm} role0/1/2/3_{role_stage}_p50_us={roles}"
+                      f" max_row_{spread}_spread_us={metrics['validation_spread_max']/rate:.2f}"
                       f" lane_Index_us_p50/max={metrics['lane_index_p50']/rate:.2f}/{metrics['longest_lane_index']/rate:.2f}"
                       f" last_retire_to_row_exit_us_p50/max={metrics['row_retire_to_exit_p50']/rate:.2f}/{metrics['row_retire_to_exit_max']/rate:.2f}"
                       f" moves_total/max_row/max_lane={metrics['moved_total']}/{metrics['max_row_moves']}/{metrics['max_moves_per_lane']}"

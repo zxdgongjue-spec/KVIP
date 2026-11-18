@@ -391,9 +391,9 @@ def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan
             schedule["early_post"] = early_post_timing(rows, marks)
         if marker == "RQI3":
             schedule["get_reassignment"] = check_get_reassignment(rows[:, 1], marks, canonical_counts)
-        # block=q*16+request. Each lane records packDone when its own role and
-        # validation finish. Their within-request spread is a readiness difference,
-        # not cycles to add to graph latency or a measurement of idle utilization.
+        # block=q*16+request. RQI4+ timestamps local descriptor validation
+        # before Post and Q0 TND. Earlier versions timestamp row-role work
+        # and validation before their rendezvous. Keep the raw JSON keys stable.
         ready = rows[:, 5].reshape(4, 16)
         entry = rows[:, 10].reshape(4, 16)
         if np.any(ready < entry) or np.any(ready.ravel() > marks[:, 3]):
