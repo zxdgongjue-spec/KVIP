@@ -75,7 +75,16 @@ template<class T> uint64_t ApplyRowIndex(Args*,Context*,unsigned,unsigned,unsign
     appliedThisLane=true;sim->applied.fetch_add(1);return team.Gathered();}
 void PublishStreamingUpdateStatus(uint32_t* p,unsigned,unsigned err){if(!threadIdx.x)*p=err;}
 void PublishStreamingResidency(uint32_t,unsigned,Context*,unsigned){if(!threadIdx.x)sim->published.fetch_add(1);}
-template<bool,bool> void FinalizeStreaming(Args*,unsigned,unsigned useful){assert(useful==5 && lane==0);sim->finalized.fetch_add(1);}
+template<bool,bool,bool JoinedRow> void FinalizeStreaming(Args* a,unsigned,unsigned useful,
+        unsigned total,unsigned completed,unsigned error){
+    static_assert(JoinedRow);assert(useful==5 && lane==0);
+    unsigned expected=0;
+    auto* c=reinterpret_cast<Context*>(a->context);
+    for(auto& post:c->post){expected+=post.count;post.pending=0;post.deferred=0;post.error=error;}
+    assert(expected==total && (completed==total || error));
+    reinterpret_cast<unsigned*>(c->rowStatus)[4]=completed;
+    sim->finalized.fetch_add(1);
+}
 #include "high_index_async.h"
 
 void run(Input in){World world{in};sim=&world;world.e.cq_depth=in.cqDepth;
@@ -101,7 +110,7 @@ void run(Input in){World world{in};sim=&world;world.e.cq_depth=in.cqDepth;
         if(!failed){assert(queue.positions.size()==in.n[q]);for(unsigned i=0;i<in.n[q];++i)assert(queue.positions[i]==i);
             assert(queue.issued==(in.n[q]==0 ? 0u : (in.pending && in.safe[q] && in.safe[q]<in.n[q] && in.cqDepth>2 && int(q)!=in.blocking ? 2u:1u)));}
         totalCompleted+=records[q*16].completed;assert(bool(c.post[q].error)==failed);}
-    assert(c.post[0].pending==totalCompleted);
+    assert(info[4]==totalCompleted && c.post[0].pending==0);
     if(!failed){
         assert(world.applied==4);
         for(unsigned q=0;q<4;++q){

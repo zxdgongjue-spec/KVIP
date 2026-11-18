@@ -148,7 +148,7 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
     if(profile) ticks[3]=GetSystemCycle();
     if(!error) error|=ApplyRowIndex(a,ctx,b,owner,q,4,plan->reserved[8],plan->reserved[9],
                                    plan->reserved[10],update[7],ticks,profile,join);
-    if(profile){ r->indexDone=GetSystemCycle(); ticks[2]=0x52514931U; }
+    if(profile){ r->indexDone=GetSystemCycle(); ticks[2]=0x52514932U; }
     // Only q0 consumes the prefetch queue. Only ranges that might
     // overwrite an in-flight prefetch destination depend on that completion.
     if(!q){
@@ -176,26 +176,20 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
     r->error=error; r->globalError=error; r->count=count; r->fallback=blocking?1:0;
     r->completed=first.completed+second.completed; r->active=2;
     post_index_tail::Flush(r);
+    // Completed counts travel on the same cache line as this lane's Done flag.
+    me->reserved[4]=first.completed+second.completed;
     join.Publish(RowRendezvous::Done,error);
     if(!q) {
         error|=join.All(RowRendezvous::Done);
         uint32_t completed=0;
-        for(uint32_t p=0;p<4;++p) {
-            auto record=records+b+p*batch;
-            post_index_tail::Flush(record);
-            completed+=record->completed;
-        }
+        for(uint32_t p=0;p<4;++p) completed+=join.lines[p].reserved[4];
         if(completed!=total) error|=kvaf_device::kInvalidArgs;
-        for(uint32_t p=0;p<4;++p){
-            posts[p].pending=p==0?completed:0; posts[p].deferred=0; posts[p].error=error;
-        }
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(posts),4*sizeof(*posts));
         Simt::VF_CALL<PublishStreamingUpdateStatus>(Simt::Dim3{32,1,1},reinterpret_cast<__gm__ uint32_t*>(update[6]),b,error?1U:0U);
         SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
         if(!error && (a->prefetchCount & 0x10000000U)){
             Simt::VF_CALL<PublishStreamingResidency>(Simt::Dim3{256,1,1},shape.resident,shape.finalPostOffset,ctx,b);
             SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
         }
-        FinalizeStreaming<false,true>(a,b,useful);
+        FinalizeStreaming<false,true,true>(a,b,useful,total,completed,error);
     }
 }

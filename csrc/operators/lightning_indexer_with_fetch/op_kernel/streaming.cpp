@@ -728,11 +728,13 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
  }
 }
 #endif
-template <bool ReadThrough = false, bool PostIndex = false>
-__aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b,uint32_t usefulPrefetch){
+template <bool ReadThrough = false, bool PostIndex = false, bool JoinedRow = false>
+__aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b,uint32_t usefulPrefetch,
+ uint32_t total=0,uint32_t completed=0,uint32_t rowJoinError=0){
+ static_assert(!JoinedRow || PostIndex, "Only the joined Post/Index row supplies final counts");
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
- auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;uint64_t error=0;
+ auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;uint64_t error=rowJoinError;
  bool profile=(a->prefetchCount & 0x80000000U)!=0;
  auto ft=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*128+uint64_t(b)*128+96;
  if constexpr (ReadThrough) {
@@ -783,11 +785,22 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b,uint32_t usef
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),kRowStatusWords*4);
  auto update=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);
  auto updateStatus=reinterpret_cast<__gm__ uint32_t*>(update[6])+b;
- kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(updateStatus),sizeof(uint32_t));
- uint32_t updateError=*updateStatus,total=0,completed=0,deferred=0;
+ uint32_t updateError=rowJoinError?1U:0U,deferred=0;
+ if constexpr (!JoinedRow) {
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(updateStatus),sizeof(uint32_t));
+  updateError=*updateStatus;
+ }
  uint64_t lastHead=0,lastCq=0;
  error|=row->error;error|=info[0]?kvaf_device::kInvalidArgs:0;
- for(uint32_t q=0;q<shape.finalWorkers;++q){
+ if constexpr (JoinedRow) {
+  // All four producers have relinquished their FinalPost. The row owner already
+  // holds the checked totals. Publish their terminal ABI state exactly once.
+  auto posts=FinalPostAt(shape.finalPostOffset,ctx,4*b);
+  for(uint32_t q=0;q<4;++q){
+   posts[q].pending=0;posts[q].deferred=0;posts[q].error=rowJoinError;
+  }
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(posts),4*sizeof(*posts));
+ } else for(uint32_t q=0;q<shape.finalWorkers;++q){
   auto post=FinalPostAt(shape.finalPostOffset,ctx,b*shape.finalWorkers+q);
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
   total+=post->count;completed+=post->pending;error|=post->error;

@@ -133,7 +133,7 @@ void CompletePrefetch(Context*,uint32_t,bool,uint64_t*,uint64_t*,uint64_t*){asse
 void PublishPrefetchResidency(Context*,uint32_t,uint32_t){assert(false);}
 KvafExecuteBatchGetKernelArgs GetArgs(Context*,uint32_t){return {};}
 '''+old_residency+'\n'+(kernel/'index_cache_update.h').read_text()+
-    '\ntemplate<bool ReadThrough=false,bool PostIndex=false>\n'+old_finalize+'\n'+
+    '\ntemplate<bool ReadThrough=false,bool PostIndex=false,bool JoinedRow=false>\n'+old_finalize+'\n'+
     FINALIZE_HEADER.read_text().replace('LAUNCH_BOUND(256)', f'LAUNCH_BOUND({threads})').replace('i += 256', f'i += {threads}').replace('Simt::Dim3{256, 1, 1}', f'Simt::Dim3{{{threads}, 1, 1}}')+r'''
 struct Fixture {
  static constexpr uint32_t B=16,O=19,R=16384,E=10240;
@@ -221,6 +221,19 @@ struct Fixture {
  }
 };
 int main(){
+ // Compare the old full-AIV handoff through FinalPost with direct row counts.
+ // Cover partial completions on error as well as a completed zero-Get row.
+ for(uint32_t n:{0U,955U})for(uint32_t err:{0U,8U}) {
+  Fixture through,joined;const uint32_t b=0,done=err?n/2:n;
+  through.plan(b,n);joined.plan(b,n);
+  through.updateStatus[b]=joined.updateStatus[b]=err?1U:0U;
+  for(uint32_t q=0;q<4;++q){
+   auto& p=through.posts[4*b+q];p.pending=q==0?done:0;p.deferred=0;p.error=err;
+  }
+  FinalizeStreaming<false,true>(&through.args,b,7);
+  FinalizeStreaming<false,true,true>(&joined.args,b,7,n,done,err);
+  through.compare(joined);
+ }
  uint32_t cases=0;
  for(uint32_t parallel:{0U,1U})for(uint32_t n:{0U,7U,60U,955U,8192U})for(uint32_t failure=0;failure<30;++failure){
   Fixture base;constexpr uint32_t b=std::min(3U,Fixture::B-1);base.plan(b,n);base.args.prefetchCount=parallel?0x10000000U:0;
