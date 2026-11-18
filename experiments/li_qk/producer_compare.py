@@ -4,7 +4,7 @@ import argparse,csv,json,os,random,shlex,statistics,subprocess,gzip,shutil,re
 from pathlib import Path
 from run import HERE,ROOT,prepare,make_fixture,sha
 from cases import lease
-CASES=('split_scatter','direct','high_fused')
+CASES=('split_scatter','direct','high_fused','local_topk')
 def build(a):
  a.output.mkdir(parents=True,exist_ok=False);source=prepare(a.output/'source')
  before={str(p.relative_to(ROOT)):sha(p) for p in HERE.iterdir() if p.suffix in ('.cpp','.h','.txt','.py')}
@@ -17,7 +17,7 @@ def build(a):
    if r.returncode:raise RuntimeError('build failed: '+str(a.output/'build.log'))
  for path,digest in before.items():
   if sha(ROOT/path)!=digest:raise ValueError('source changed during build: '+path)
- m.update(status='BUILT',binary_sha256=sha(a.output/'build/li_producer'));record.write_text(json.dumps(m,indent=2)+'\n');print(a.output/'build/li_producer')
+ m.update(status='BUILT',binary_sha256=sha(a.output/'build/li_producer'),parts_sha256={str(p.relative_to(a.output)):sha(p) for p in (a.output/'build/lib').glob('*.a')});record.write_text(json.dumps(m,indent=2)+'\n');print(a.output/'build/li_producer')
 def summarize(output):
  m=json.loads((output/'manifest.json').read_text());assert m['status']=='PASS'
  for k,v in m['fixture']['hashes'].items():assert sha(output/'fixture'/(k+'.bin'))==v
@@ -28,6 +28,12 @@ def summarize(output):
   d=output/r['name'];p=json.loads((d/'report.json').read_text());assert r['exit_code']==0 and p['status']=='PASS' and all(p[k] for k in ('oracle','guards','inputs_unchanged'))
   assert sha(d/'report.json')==r['report_sha256'] and sha(d/'score-keys.bin')==m['fixture']['hashes']['oracle']
   assert p['route']==CASES.index(r['case']) and p['history']==131072 and p['parts']==16 and p['warmup']==m['warmup'] and p['iterations']==m['iterations']
+  assert sha(output/(r['name']+'.log'))==r['log_sha256']
+  assert p['run_mode']==('sim' if m['mode']=='model' else 'npu') and p['fetch_launches']==0 and p['full_li_launches']==(3 if p['route']==0 else 2)
+  if m['mode']!='model':
+   import math
+   for metric in ('li','score','tail'):
+    v=p[metric+'_samples_us'];assert len(v)==m['iterations'] and all(math.isfinite(x) and x>0 for x in v) and math.isclose(statistics.median(v),p[metric+'_p50_us'],rel_tol=1e-8)
   lookup[r['round'],r['case']]=(r,p)
  for case in selected:
   vals=[lookup[r,case] for r in range(m['rounds']+1) if m['mode']!='bench' or r>0];out=dict(case=case)
@@ -41,11 +47,14 @@ def summarize(output):
  (output/'summary.json').write_text(json.dumps(rows,indent=2)+'\n');print(output/'summary.csv')
 def execute(a):
  env=dict(os.environ);env.pop('LI_QK_MODEL_STAGE',None);driver=a.build/'build/li_producer';bm=json.loads((a.build/'build-manifest.json').read_text());assert bm['status']=='BUILT' and sha(driver)==bm['binary_sha256']
+ if a.action!='model' and ('camodel' in env.get('LD_PRELOAD','') or 'cmodel' in env.get('LD_PRELOAD','')):raise ValueError('physical A5 required')
+ for p,h in bm.get('parts_sha256',{}).items():
+  if sha(a.build/p)!=h:raise ValueError('changed device library: '+p)
  if a.action=='model':env.update(LD_PRELOAD=str(a.model_lib/'libruntime_camodel.so'),LD_LIBRARY_PATH=str(a.model_lib)+':'+env.get('LD_LIBRARY_PATH',''))
  caps=json.loads(subprocess.check_output([str(driver),'--capabilities'],env=env,text=True).splitlines()[-1]);assert caps['run_mode']==('sim' if a.action=='model' else 'npu')
  a.output.mkdir(parents=True,exist_ok=False);fixture=make_fixture(a.output/'fixture',1,131072,32)
  warm,it=(0,1) if a.action=='model' else (4,20 if a.action=='bench' else 5)
- m=dict(status='RUNNING',mode=a.action,cases=a.cases,rounds=3 if a.action=='bench' else 0,warmup=warm,iterations=it,fixture=fixture,build=bm,rows=[]);record=a.output/'manifest.json';original={}
+ m=dict(status='RUNNING',source_commit=subprocess.check_output(['git','-C',str(ROOT),'rev-parse','HEAD'],text=True).strip(),source_dirty=bool(subprocess.check_output(['git','-C',str(ROOT),'status','--porcelain'],text=True).strip()),scope='full numerical LI; includes canonical score output for all routes; no resident/Service/Fetch/Index',mode=a.action,cases=a.cases,rounds=3 if a.action=='bench' else 0,warmup=warm,iterations=it,fixture=fixture,build=bm,rows=[]);record=a.output/'manifest.json';original={}
  with lease('model' if a.action=='model' else 'npu',a.device,None if a.action=='model' else Path(f'/tmp/kvip-li-qk-device-{a.device}.lease')):
   try:
    if a.action=='model':
@@ -77,6 +86,7 @@ def execute(a):
      if a.action=='profile':subprocess.run(['msprof','--export=on','--output='+str(work/'msprof')],check=True)
    m['status']='PASS'
   finally:
+   if m['status']=='RUNNING':m['status']='INCOMPLETE'
    for p,v in original.items():p.write_text(v)
    record.write_text(json.dumps(m,indent=2)+'\n')
  summarize(a.output)
@@ -85,7 +95,7 @@ def main():
  s=sub.add_parser('build');s.add_argument('--output',type=Path,required=True);s.add_argument('--cann-root',type=Path,required=True);s.add_argument('--kvaf-include',type=Path,required=True);s.add_argument('--soc',default='Ascend950PR_9599');s.add_argument('--run-mode',choices=('sim','npu'),default='npu')
  s=sub.add_parser('summarize');s.add_argument('output',type=Path)
  for action in ('model','bench','profile'):
-  s=sub.add_parser(action);s.add_argument('--build',type=Path,required=True);s.add_argument('--output',type=Path,required=True);s.add_argument('--cases',nargs='+',choices=CASES,default=list(CASES[:2]));s.add_argument('--device',type=int,default=0 if action=='model' else 5);s.add_argument('--timeout',type=int,default=1500)
+  s=sub.add_parser(action);s.add_argument('--build',type=Path,required=True);s.add_argument('--output',type=Path,required=True);s.add_argument('--cases',nargs='+',choices=CASES,default=list(CASES));s.add_argument('--device',type=int,default=0 if action=='model' else 5);s.add_argument('--timeout',type=int,default=1500)
   if action=='model':s.add_argument('--model-lib',type=Path,required=True)
  a=p.parse_args();a.output=a.output.resolve()
  if a.action=='build':build(a)

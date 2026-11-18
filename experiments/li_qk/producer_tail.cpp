@@ -1,6 +1,15 @@
 // Reuse exact native histogram and SIMD compact primitives, in one per-Q launch.
 #include "radix.cpp"
 #include "producer_plan.h"
+#if defined(__CCE_AICORE__)
+namespace radix_device {
+__simt_vf__ __aicore__ LAUNCH_BOUND(256) inline void RemapCandidates(
+    __ubuf__ const uint16_t* selected,__gm__ const uint32_t* candidates,__gm__ uint32_t* output){
+    for(uint32_t i=threadIdx.x;i<2048;i+=blockDim.x)output[i]=candidates[selected[i]];
+    asc_threadfence();
+}
+}
+#endif
 extern "C" __global__ __aicore__ void li_producer_high_tail(GM_ADDR binding){
 #if defined(__CCE_AICORE__)
  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);if ASCEND_IS_AIV {
@@ -28,6 +37,23 @@ extern "C" __global__ __aicore__ void li_producer_high_tail(GM_ADDR binding){
         uint32_t ec=GetSpr<SpecialPurposeReg::AR>()/2,take=ep<quota?quota-ep:0;if(take>ec)take=ec;PipeBarrier<PIPE_ALL>();
         if(take){__VEC_SCOPE__ {radix_device::Widen(reinterpret_cast<__ubuf__ uint32_t*>(out.GetPhyAddr()),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),take,x);}PipeBarrier<PIPE_ALL>();DataCopyExtParams cp{1,take*4,0,0,0};DataCopyPad(dst[totalGT+ep],out.template ReinterpretCast<int32_t>(),cp);SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);}ep+=take;
     }pipe.Destroy();
+ }
+#endif
+}
+extern "C" __global__ __aicore__ void li_producer_candidate_tail(GM_ADDR binding){
+#if defined(__CCE_AICORE__)
+ KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);if ASCEND_IS_AIV {
+    using namespace AscendC;auto a=reinterpret_cast<__gm__ const li_producer::Bindings*>(binding);uint32_t q=GetBlockIdx();if(q>=4)return;
+    constexpr uint32_t n=li_producer::Parts*li_producer::K;
+    TPipe pipe;TBuf<TPosition::VECCALC> input,indices,values,hist,hi,lo,rank;
+    pipe.InitBuffer(input,n*2);pipe.InitBuffer(indices,4096+256);pipe.InitBuffer(values,4096);pipe.InitBuffer(hist,1024);pipe.InitBuffer(hi,1024);pipe.InitBuffer(lo,1024);pipe.InitBuffer(rank,256);
+    auto in=input.Get<uint16_t>(),out=indices.Get<uint16_t>(),val=values.Get<uint16_t>();auto h=hist.Get<uint32_t>(),bhi=hi.Get<uint32_t>(),blo=lo.Get<uint32_t>(),nk=rank.Get<uint32_t>();
+    GlobalTensor<uint16_t> scores;scores.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(a->candidateScores)+q*n);
+    DataCopy(in,scores,n);SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);PipeBarrier<PIPE_ALL>();
+    topkb16gather::LiTopKVF<false>(out,val,in,h,bhi,blo,nk,2048,n);PipeBarrier<PIPE_ALL>();
+    // The selected candidate index fits uint16; fetch only 2048 real token IDs.
+    Simt::VF_CALL<radix_device::RemapCandidates>(Simt::Dim3{256,1,1},reinterpret_cast<__ubuf__ const uint16_t*>(out.GetPhyAddr()),reinterpret_cast<__gm__ const uint32_t*>(a->candidateIds)+q*n,reinterpret_cast<__gm__ uint32_t*>(a->selected)+q*2048);
+    pipe.Destroy();
  }
 #endif
 }

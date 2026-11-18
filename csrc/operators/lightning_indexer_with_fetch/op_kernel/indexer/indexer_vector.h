@@ -45,7 +45,7 @@ public:
 #ifdef LI_PRODUCER_CONTROLS
     li_producer::DeviceState producer_;
     __aicore__ inline void SetProducerOutput(GM_ADDR binding,TPipe* pipe) { producer_.Init(binding,pipe,blockId_); }
-    __aicore__ inline void FinishProducer() { producer_.Finish(); }
+    __aicore__ inline void FinishProducer() { producer_.Finish(topkSharedTmpLocal_,indicesOutLocal_,scoreOutLocal_); }
 #endif
     // Private output sidecar: all virtual input geometry remains untouched.
     bool stagedDirect_ = false;
