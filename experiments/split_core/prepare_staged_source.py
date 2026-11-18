@@ -16,7 +16,7 @@ def main():
     a = p.parse_args()
     a.output.mkdir(parents=True, exist_ok=False)
     prepare(a.output / "producer", a.version)
-    shutil.copytree(ROOT / "csrc/operators", a.output / "tail/csrc/operators")
+    shutil.copytree(a.output / "producer/csrc/operators", a.output / "tail/csrc/operators")
     if a.model:
         path = a.output / "tail" / OP / "op_kernel/streaming.cpp"
         s = path.read_text()

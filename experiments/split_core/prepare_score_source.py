@@ -16,7 +16,17 @@ def prepare(output, version="current"):
         raise ValueError("Only current operator sources are included; historical sources remain in Git history")
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
-    shutil.copytree(ROOT / "csrc/operators", output / "csrc/operators")
+    excluded = []
+    generated_names = {"build", "build_out", "_custom_opp", "CMakeFiles", "__pycache__"}
+
+    def source_only(directory, names):
+        ignored = [name for name in names if name in generated_names]
+        excluded.extend(str((Path(directory) / name).relative_to(ROOT)) for name in ignored)
+        return ignored
+
+    # Operator checkouts can contain unrelated build trees with dangling
+    # liboptiling.so links. Snapshot sources, not those generated artifacts.
+    shutil.copytree(ROOT / "csrc/operators", output / "csrc/operators", ignore=source_only)
     evidence = dict(
         version=version,
         base_commit=subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip(),
@@ -29,6 +39,7 @@ def prepare(output, version="current"):
             if p.is_file()
         },
         scope="current score wrapper; not native transport validation",
+        excluded_generated_paths=sorted(excluded),
     )
     (output / "score-source.json").write_text(json.dumps(evidence, indent=2) + "\n")
     return evidence

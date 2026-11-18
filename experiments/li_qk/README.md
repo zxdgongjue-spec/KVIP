@@ -210,6 +210,10 @@ H131072无法整数均分30核，T30按原生H128 tile均衡，片长只差一�
 
 默认device5，结果写到新的`/home/w00568585/li_history7_*`目录，`results/summary.csv`包含每个T的score/LI p50均值与同轮T1比值、实际下发核数、片长和启动数。`score_p50`只含score；`li_p50`包含必要scatter和同一个Final TopK。`msprof/`另存七点trace，不计入基准。需要时追加`--cann-root PATH --kvaf-include PATH --soc NAME`。不在容器fetch，不要求共享发布包。
 
+脚本实时显示各阶段和`Running r*_T*`进度。成功时打印`SUCCESS: seven history points completed`；失败时打印阶段/退出码及日志末40行，并保存`exit-status.txt`、`launcher-status.txt`。仅出现`Results directory`不表示性能测试完成；`checks.log`中的临时summary是CPU回归用例的数据。
+
+源码快照排除`build`、`build_out`、`_custom_opp`、`CMakeFiles`和`__pycache__`目录，并记录实际排除路径。这样不会复制其它算子旧构建目录里的断链`liboptiling.so`；现有构建目录不被删除，实际源码和本地修改保持。
+
 ## Score后的持续分核控制
 
 需求见 [TAIL_PROMPT.md](TAIL_PROMPT.md)，源码/阶段规模/论文依据/实测见 [TAIL_REPORT.md](TAIL_REPORT.md)。新入口读取相同的最终sortable score，不运行QK、Fetch、Service或Index：C0单owner GM Cold＋库上Final primitive，C1只分Cold，C2只分Final，C3两者都分；默认resident仍调用原TopK/θ/Hot primitive。C0是隔离后处理控制，不是SDK或生产P2整链。

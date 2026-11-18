@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 import numpy as np
 import run as controls
 from test_controls import ACL_STUB,LAUNCH_STUB
@@ -18,6 +19,33 @@ ROOT=HERE.parents[1]
 PARTS=(1,2,4,8,16,32,30)
 
 class HistoryControls(unittest.TestCase):
+    def test_source_snapshot_excludes_dangling_generated_lidu_library(self):
+        import prepare_score_source
+        with tempfile.TemporaryDirectory() as folder:
+            d=Path(folder);repo=d/'repo';operator=repo/'csrc/operators/lightning_indexer_with_fetch/op_kernel'
+            operator.mkdir(parents=True);source=operator/'build_config.h';source.write_text('original source\n')
+            common=repo/'csrc/operators/common/lifetch/cache_metadata.h';common.parent.mkdir(parents=True);common.write_text('shared header\n')
+            (repo/'.gitignore').write_text('build/\n_custom_opp/\n')
+            def git(*args):return subprocess.check_output(['git','-C',str(repo),*args],text=True,stderr=subprocess.STDOUT).strip()
+            git('init');git('config','user.name','Source Check');git('config','user.email','check@example.invalid')
+            git('add','.');git('-c','commit.gpgsign=false','commit','-m','Local source fixture')
+            generated=repo/'csrc/operators/lidu/build/custom_op/build_out/op_host/liboptiling.so'
+            generated.parent.mkdir(parents=True);generated.symlink_to('missing-liboptiling.so')
+            custom=repo/'csrc/operators/lidu/_custom_opp';custom.mkdir();(custom/'generated.so').write_bytes(b'generated')
+            source.write_text('local source change\n')
+            with patch.object(prepare_score_source,'ROOT',repo):
+                evidence=prepare_score_source.prepare(d/'snapshot')
+                self.assertFalse((d/'snapshot/csrc/operators/lidu/build').exists())
+                self.assertFalse((d/'snapshot/csrc/operators/lidu/_custom_opp').exists())
+                self.assertEqual((d/'snapshot/csrc/operators/lightning_indexer_with_fetch/op_kernel/build_config.h').read_bytes(),source.read_bytes())
+                self.assertTrue(evidence['working_tree_dirty'])
+                self.assertIn('csrc/operators/lidu/build',evidence['excluded_generated_paths'])
+                self.assertIn('csrc/operators/common/lifetch/cache_metadata.h',evidence['source_files'])
+                # A broken required source still fails; only generated trees are excluded.
+                (operator/'required.h').symlink_to('missing-required.h')
+                import shutil
+                with self.assertRaises(shutil.Error):prepare_score_source.prepare(d/'invalid-source')
+
     def test_cpp_python_balanced_coverage_and_single_wave(self):
         code='#include "plan.h"\n#include <iostream>\nint main(int argc,char** argv){unsigned h=std::stoul(argv[1]);for(unsigned t:{1,2,4,8,16,32,30}){auto p=li_qk::MakePlan(h,32,32,64,t,1);for(auto r:p.tasks)std::cout<<r.queryBegin<<","<<r.queryCount<<","<<r.begin<<","<<r.end<<","<<r.owner<<"\\n";}}'
         with tempfile.TemporaryDirectory() as folder:

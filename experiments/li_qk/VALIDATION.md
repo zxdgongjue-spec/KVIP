@@ -58,3 +58,10 @@
 - 真实shell/local Git配合模拟NPU/backend的编排检查通过：不fetch或导入bundle，转交history7与warmup4/iterations20/rounds3，七点msprof另采，构建失败23停止后续执行并保存日志。没有设备性能数据。
 - CANN9.1.0/Ascend950PR_9599 fresh NPU构建与host链接通过。仅在本地无驱动容器链接时，将匹配CANN的devlib追加到已有LD_LIBRARY_PATH；没有使用该构建执行NPU。此前两个因本地驱动/依赖搜索路径失败的构建保留为失败记录，不作为通过结果。
 - 证据为`tests/results/li-tail-20261117/history7-plan.json`、`history7-cpu-checks.log`、`history7-launcher-*/receipt.json`及`history7-npu-final/build-manifest.json`。A5时间和msprof需真机执行新脚本采集。
+
+## A5源码快照断链与提前退出修复
+
+- 用户日志确认CPU检查通过，构建前`prepare_score_source.py`复制`lidu/build/.../op_host/liboptiling.so`断链失败，尚未进入NPU编译或性能测量；此前的快速结束是失败退出。
+- score/尾部源码快照排除生成目录，并记录`excluded_generated_paths`。新增真实Git/source-copy回归复现同样断链，确认生成目录跳过、所需源码与本地修改保留，必要源码断链仍会报错。history CPU检查现为五项，全部通过。
+- 启动脚本实时tee各阶段日志，保留失败退出码和阶段；只在汇总完成后打印成功。四项本地编排检查通过：正常结束、build退出23、后端返回0但缺少summary、vendor环境脚本提前exit0。没有实际NPU计时。
+- 新证据在`tests/results/li-tail-20261117/history7-failure-logging-*/receipt.json`；计算kernel和七点几何未修改。
