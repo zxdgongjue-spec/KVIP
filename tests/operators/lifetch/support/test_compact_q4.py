@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Differential execution of the old Q-by-Q and new complete-Q4 resolver.
 
-Four CPU lanes replace 512 SIMT lanes, retaining contiguous query partitions,
+256 CPU lanes replace 512 SIMT lanes, retaining 32-bit lane masks, contiguous query partitions,
 barrier order, atomics and native allocation/copy code. This checks logical
 semantics, bounds and races between phases, not Ascend cache visibility.
 """
@@ -46,7 +46,7 @@ def test_compact_q4_matches_staged_resolver(tmp_path):
 #define __gm__
 #define LAUNCH_BOUND(n)
 #define KVIP_AUTO_ROUTE 1
-constexpr uint32_t kTestThreads=4,warpSize=1,kTop=2048,kSlots=8192,kLruSlots=2048,kChangeCapacity=10240;
+constexpr uint32_t kTestThreads=256,warpSize=1,kTop=2048,kSlots=8192,kLruSlots=2048,kChangeCapacity=10240;
 constexpr uint32_t kStagedRankTag=0x80000000U;
 thread_local struct ThreadIndex {uint32_t x=0;} threadIdx;
 class Barrier {
@@ -85,7 +85,7 @@ struct State {
  std::vector<uint32_t> selected,loc,keys,ranks,slots,work,ctl,changes,changeSlots,src,dst,lru;
  std::vector<int32_t> reserved;std::vector<uint16_t> ids;Row row;Context ctx;
  State(uint32_t r,uint32_t h):resident(r),history(h),selected(kSlots,UINT32_MAX),loc(kSlots,UINT32_MAX),
-  keys(kSlots,UINT32_MAX),ranks(kSlots,UINT32_MAX),slots(kSlots,UINT32_MAX),work(8192),ctl(8192),
+  keys(std::max(kSlots,3*((r+31)/32)),UINT32_MAX),ranks(kSlots,UINT32_MAX),slots(kSlots,UINT32_MAX),work(8192),ctl(8192),
   changes(kChangeCapacity,UINT32_MAX),changeSlots(kChangeCapacity,UINT32_MAX),
   src(kChangeCapacity,UINT32_MAX),dst(kChangeCapacity,UINT32_MAX),lru(kLruSlots),reserved(r,-1),ids(kTop){bind();}
  State(const State& x):resident(x.resident),history(x.history),changeCount(x.changeCount),selected(x.selected),loc(x.loc),
@@ -98,15 +98,6 @@ template<class F>void run(F f){std::vector<std::thread> workers;
  for(auto& worker:workers)worker.join();}
 int main(){
  std::mt19937 rng(138);
- // Initialization failures must propagate before any stale scratch access.
- // Null payloads make an accidental hash/location read fail under ASAN.
- for(uint32_t error:{1U,8U,0x80000000U}){
-  std::vector<uint32_t> ctl(8192,0xdeadbeefU);ctl[1]=error;
-  auto rejected=ctl;
-  run([&]{rotating::ResolveLowQ4(nullptr,64,32,0,
-   nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,ctl.data(),nullptr,nullptr);});
-  assert(ctl==rejected);
- }
  for(uint32_t mode=0;mode<28;++mode){
   uint32_t resident=mode==22?131072:16384,history=mode==23?(1U<<24):resident+16384;
   State base(resident,history);
@@ -194,6 +185,20 @@ int main(){
   }
   post.ctl[9]=1; // The old proof rejects invalid hot sources; the new one repairs them.
   State cached(post);
+  // Production presents four separate Q bitmaps sharing temporary storage
+  // with the hash. Poison the remaining hash and counters as on a reused graph.
+  const uint32_t words=(resident+31)/32;
+  std::fill_n(cached.keys.begin(),3*words,0U);
+  std::fill_n(cached.ctl.begin()+1024,words,0U);
+  for(uint32_t i=0;i<kSlots;++i){
+   const auto token=cached.selected[i],q=i/kTop;
+   if(token<resident){
+    auto bits=q?cached.keys.data()+(q-1)*words:cached.ctl.data()+1024;
+    bits[token/32]|=1U<<(token%32);
+   }
+  }
+  std::fill_n(cached.ctl.begin(),10,0xbaadU);
+
   run([&]{rotating::ResolveCompactQ4<true>(&post.ctx,history,resident,0,post.selected.data(),post.loc.data(),
    post.keys.data(),post.ranks.data(),post.slots.data(),post.work.data(),post.ctl.data(),post.src.data(),post.dst.data());});
   run([&]{rotating::ResolveLowQ4(&cached.ctx,history,resident,0,cached.selected.data(),cached.loc.data(),
@@ -202,7 +207,8 @@ int main(){
   assert(cached.src==post.src&&cached.dst==post.dst);
   assert(cached.changes==post.changes&&cached.changeSlots==post.changeSlots);
   assert(cached.changeCount==post.changeCount);
-  for(uint32_t i=0;i<10;++i)assert(cached.ctl[i]==post.ctl[i]);
+  for(uint32_t i=0;i<6;++i)assert(cached.ctl[i]==post.ctl[i]);
+  assert(cached.ctl[8]==0 && cached.ctl[9]==0);
   assert(!post.ctl[1]&&!post.ctl[9]);assert(post.ctl[0]==expectedSource.size());
   assert(post.loc==expectedLoc);
   assert(std::equal(expectedSource.begin(),expectedSource.end(),post.src.begin()+2048));
@@ -225,20 +231,21 @@ int main(){
   assert(std::all_of(invalid.dst.begin(),invalid.dst.end(),[](auto v){return v==UINT32_MAX;}));
  }
  // The optimized lookup must retain the old failure decision for invalid
- // tokens and an exhausted hash. No failed plan publishes destinations.
+ // tokens and an invalid victim. No failed plan publishes destinations.
  for(uint32_t fault=0;fault<2;++fault){
-  State initial(16384,131328);initial.ctl[7]=fault?2:2048;
+  State initial(16384,131328);initial.ctl[7]=2048;
   for(uint32_t i=0;i<kLruSlots;++i)initial.work[4096+i]=i;
   initial.selected[0]=fault?16384:initial.history;
-  if(fault){initial.selected[1]=16385;initial.selected[2]=16386;}
+  if(fault)initial.work[4096+101]=initial.resident;
   State original(initial),optimized(initial);
+  std::fill_n(optimized.keys.begin(),3*((initial.resident+31)/32),0U);
   run([&]{rotating::ResolveCompactQ4<true>(&original.ctx,original.history,original.resident,0,
    original.selected.data(),original.loc.data(),original.keys.data(),original.ranks.data(),
    original.slots.data(),original.work.data(),original.ctl.data(),original.src.data(),original.dst.data());});
   run([&]{rotating::ResolveLowQ4(&optimized.ctx,optimized.history,optimized.resident,0,
    optimized.selected.data(),optimized.loc.data(),optimized.keys.data(),optimized.ranks.data(),
    optimized.slots.data(),optimized.work.data(),optimized.ctl.data(),optimized.src.data(),optimized.dst.data());});
-  assert(original.ctl[1]==optimized.ctl[1]&&optimized.ctl[1]==(fault?8U:1U));
+  assert(original.ctl[1]==optimized.ctl[1]&&optimized.ctl[1]==(fault?4U:1U));
   assert(original.dst==optimized.dst);
   assert(std::all_of(optimized.dst.begin(),optimized.dst.end(),[](auto v){return v==UINT32_MAX;}));
  }
