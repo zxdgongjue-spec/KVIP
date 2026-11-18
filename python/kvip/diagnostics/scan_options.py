@@ -1,7 +1,7 @@
 """Independent URMA scan-order/admission experiment; no graph-route changes."""
 
 OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill", "compact_out_of_place", "rolling_reuse_seed", "rolling_fast_path", "rolling_sparse", "rolling_boundary", "incremental_topk", "incremental_window", "incremental_register", "incremental_prefilter", "incremental_direct", "incremental_ties", "incremental_light", "incremental_inplace", "incremental_progress", "incremental_segments")
-EXPERIMENT_OPTIONS = ("consumed_prefix", "window_probe", "seed_mask", "seed_parallel")
+EXPERIMENT_OPTIONS = ("consumed_prefix", "window_probe", "seed_mask", "seed_parallel", "native_trunk", "trunk_pruned")
 DEFAULT_VARIANTS = ("forward", "reverse", "forward-wide", "reverse-wide", "forward-end")
 VARIANTS = {name: ("reverse_cold",) if name.startswith("reverse") else () for name in DEFAULT_VARIANTS}
 ROLLING_VARIANTS = ("forward", "reverse", "reverse-roll", "reverse-refilter", "forward-refilter", "forward-end")
@@ -159,6 +159,12 @@ for _base in ("reverse-consumed", "reverse-seed-mask", "reverse-seed-parallel", 
     VARIANTS[_base + "-end"] = VARIANTS[_base]
 
 
+VARIANTS["reverse-native-trunk"] = VARIANTS["reverse-seed-parallel"] + ("native_trunk",)
+VARIANTS["reverse-trunk-pruned"] = VARIANTS["reverse-native-trunk"] + ("trunk_pruned",)
+for _base in ("reverse-native-trunk", "reverse-trunk-pruned"):
+    VARIANTS[_base + "-end"] = VARIANTS[_base]
+
+
 def options_for(name):
     options = {key: key in VARIANTS[name] for key in OPTIONS}
     options.update({key: True for key in EXPERIMENT_OPTIONS if key in VARIANTS[name]})
@@ -184,6 +190,10 @@ def validate_options(options):
         raise ValueError("Scan experiment options do not match the selected native interface")
     if any(type(value) is not bool for value in options.values()):
         raise ValueError("Scan build options must be bool")
+    if options.get("trunk_pruned") and not options.get("native_trunk"):
+        raise ValueError("Pruning requires shared native trunk scores")
+    if options.get("native_trunk") and not options.get("seed_mask"):
+        raise ValueError("The native trunk requires the exact tagged seed")
     if options.get("seed_parallel") and not options.get("seed_mask"):
         raise ValueError("Parallel seed preparation requires the seed mask")
     if options.get("seed_mask") and not options["incremental_segments"]:

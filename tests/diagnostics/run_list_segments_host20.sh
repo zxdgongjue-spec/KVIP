@@ -28,6 +28,10 @@ case "$study" in
         branch=perf/urma-seed-parallel
         native_sha=501ad79ea5e5578990f13fd095d2ce5bd97ef167
         ;;
+    trunk)
+        branch=perf/urma-native-trunk
+        native_sha=b127bb64b89e175b003313253245d531ff40e964
+        ;;
     segments) ;;
     *) echo "Unknown study $study" >&2; exit 2 ;;
 esac
@@ -115,6 +119,13 @@ run_case() {
             profile_variants+=(reverse-seed-parallel)
         fi
     fi
+    if [[ "$study" == trunk ]]; then
+        local extra=() extra_end=()
+        if [[ "$group" == 4 ]]; then extra=(reverse-cap128); extra_end=(reverse-cap128-end); fi
+        selected=(forward reverse "${extra[@]}" reverse-seed-parallel reverse-native-trunk reverse-trunk-pruned
+            reverse-seed-parallel-end reverse-trunk-pruned-end reverse-native-trunk-end "${extra_end[@]}" reverse-end forward-end)
+        profile_variants=(reverse reverse-seed-parallel reverse-native-trunk reverse-trunk-pruned)
+    fi
     if [[ "$phase" == kernels ]]; then
         selected=("${profile_variants[@]}")
         args=(--profile-dir "$result/profiles/g$group" --profile-metrics none)
@@ -141,7 +152,7 @@ run_case() {
                 awk '/^BUILD_DIAGNOSTIC_BEGIN/{block=1} block || /^REPLAY_FAILED|^FAILURE_JSON|^FAILURE_LOG|^RUN_LOG/{print} /^BUILD_DIAGNOSTIC_END/{block=0}' >&2
             return "$rc"
         }
-    if [[ "$study" == budget || "$study" == seed || "$study" == parallel ]]; then
+    if [[ "$study" == budget || "$study" == seed || "$study" == parallel || "$study" == trunk ]]; then
         python3 -B "$reader/tests/diagnostics/window_budget_report.py" "$base.json" "$phase" \
             "$native_sha" "$inputs/g${group}-input/manifest.json" | tee "$base.txt"
     elif [[ "$phase" == graph ]]; then
@@ -167,6 +178,14 @@ elif [[ "$study" == seed || "$study" == parallel ]]; then
     done
     echo "FIVE_GROUP_GATE $candidate $overall"
     for group in 7 2; do run_case "$group" markers; done
+elif [[ "$study" == trunk ]]; then
+    for label in DENSE_GATE PRUNED_GATE; do
+        overall=PASS
+        for group in 7 2 10 17 4; do
+            grep -q "^$label PASS " "$result/g$group-graph.txt" || overall=KEEP_BASELINES
+        done
+        echo "FIVE_GROUP_GATE $label $overall"
+    done
 fi
 (cd "$result"; tar -czf results.tar.gz g*.json g*.txt)
 echo "ALL_FIVE_PASS RETURN_FILE=$result/results.tar.gz"

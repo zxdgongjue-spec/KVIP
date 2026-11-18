@@ -6,7 +6,7 @@ from pathlib import Path
 
 from kvip.diagnostics.prefetch_admission import mean_admission
 from kvip.diagnostics.scan_economy_report import control, gain, useful_prefetch
-from kvip.diagnostics.scan_options import budgets_for
+from kvip.diagnostics.scan_options import budgets_for, options_for
 from kvip.diagnostics.scan_report import traffic
 
 CANDIDATES = ("reverse-consumed", "reverse-consumed-cap128", "reverse-consumed-cap480")
@@ -44,6 +44,11 @@ def report(path, phase, revision, manifest):
                 or case["geometry"]["rounds"] != 9 or case["geometry"]["token_bytes"] != 656
                 or (tuning["prefetch_limit"], tuning["window_limit"]) != budgets_for(name)):
             raise ValueError(f"Source, snapshot, geometry or budget mismatch in {name}")
+        if "reverse-native-trunk" in cases:
+            expected = options_for(name)
+            for flag in ("native_trunk", "trunk_pruned", "seed_parallel"):
+                if tuning.get(flag, False) != expected.get(flag, False):
+                    raise ValueError(f"{name} did not use the requested {flag} setting")
         if tuning.get("incremental_topk"):
             check = case["incremental_check"]
             if check["status"] != "exact_prefix_ranks_and_pending":
@@ -77,7 +82,17 @@ def report(path, phase, revision, manifest):
                   f"post9={w['post_max_by_epoch']} service9={w['service_max_by_epoch']} "
                   f"inspected={sum(w['inspected_by_epoch'])}")
         return
-    for repeat, label in (("reverse-seed-mask", "SEED_GATE"), ("reverse-seed-parallel", "PARALLEL_GATE")):
+    if "reverse-native-trunk" in cases:
+        gates = (
+            ("reverse-native-trunk", "DENSE_GATE", ("reverse-seed-parallel",)),
+            ("reverse-trunk-pruned", "PRUNED_GATE", ("reverse-seed-parallel",)),
+        )
+    else:
+        gates = (
+            ("reverse-seed-mask", "SEED_GATE", ("reverse-consumed",)),
+            ("reverse-seed-parallel", "PARALLEL_GATE", ("reverse-consumed", "reverse-seed-mask")),
+        )
+    for repeat, label, other_controls in gates:
         if repeat not in cases:
             continue
         marg = []
@@ -85,9 +100,7 @@ def report(path, phase, revision, manifest):
         # require residual gain above the larger observed repeat drift.
         _, candidate_drift = control(cases, repeat)
         comparisons = []
-        references = CONTROLS + ("reverse-consumed",)
-        if repeat == "reverse-seed-parallel":
-            references += ("reverse-seed-mask",)
+        references = CONTROLS + other_controls
         if "reverse-cap128-end" in cases:
             references += ("reverse-cap128",)
         for base in references:
