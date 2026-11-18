@@ -25,6 +25,7 @@ def test_fetch_ready_precedes_output_dma_but_not_metadata_join(tmp_path, ubmem, 
     publish = publish[:publish.index('// The producer and Fetch AIV')]
     end_of_resolve = streaming.split(' // The row tail joins the descriptor', 1)[1]
     producer_join = ' if constexpr(!RowOutput){' + end_of_resolve.split(' if constexpr(!RowOutput){', 1)[1].split(' status[0]=', 1)[0]
+    resolver_tail = streaming.split(' // Wake every publication reader on error, then join before final transport state.\n', 1)[1].split('\n}\n__aicore__ inline void Consumer', 1)[0]
     producer_recovery = end_of_resolve.split(' // Publish failure to every remaining reader, never leave the consumer waiting.\n', 1)[1].split(' if(profile)', 1)[0]
     consumer_join = streaming.split(' if(!error){uint64_t start=GetSystemCycle();while(true)', 1)[1].split('\n if(!error\n', 1)[0]
     input_error = streaming.split(' if(inputError){', 1)[1].split('\n TPipe pipe;', 1)[0]
@@ -55,7 +56,7 @@ struct Context {
  Shape shape{};
 };
 using StagedContextPointer=Context*;
-struct Row {uint32_t slots=0;};
+struct alignas(128) Row {uint32_t slots=0;char pad[960]{};uint32_t finalRequests{},finalPending{};uint64_t finalBegin{},finalHead{},finalEnd{};};
 struct alignas(128) FinalPost {uint32_t count=0,pending=0,error=0,deferred=0,descriptor=0,nonconflicting=0;uint64_t head=0;};
 template<class T> struct LocalTensor {
  T* p; T GetValue(unsigned i)const{return p[i];} void SetValue(unsigned i,T v){p[i]=v;}
@@ -163,6 +164,13 @@ template<bool RowOutput=false> uint32_t JoinProducer(BatchFlag* flags,uint32_t i
 template<bool RowOutput> void RecoverUnready(BatchFlag* flags,uint32_t* status){
  /*PRODUCER_RECOVERY*/
 }
+template<bool RowOutput> uint32_t FinishRawResolve(unsigned b,Context* ctx,Row* row,BatchFlag* flags,uint32_t* status,
+        LocalTensor<uint32_t> ctl){
+ // Execute the production tail, starting immediately after the resolver's
+ // last raw event publication. Leave all service descriptor flags unready.
+ TPipe pipe;bool profile=false;uint64_t tickData[32]{};uint64_t* ticks=tickData;
+ /*RESOLVER_TAIL*/
+}
 uint32_t JoinConsumer(BatchFlag* flags){
  uint32_t error=0;
  if(!error){uint64_t start=GetSystemCycle();while(true)/*CONSUMER_JOIN*/
@@ -210,6 +218,16 @@ void runWorker(unsigned b){
  auto f=flags+b*kFlagCount;f[0].ready=1;f[0].error=initialError;
  for(unsigned q=0;q<4;++q){f[kRawQueryFlag+q].ready=q!=missingRaw;f[kRawQueryFlag+q].count=queryCount[q];}
  if(splitOutput){
+  if(!initialError && missingRaw==99){
+   uint32_t ctlData[9]{};for(auto n:queryCount)ctlData[0]+=n;
+   ctlData[8]=7;LocalTensor<uint32_t> ctl{ctlData};
+   timeoutClock=true;
+   uint32_t useful=FinishRawResolve<true>(b,&ctx,rows+b,f,status.data()+b*32,ctl);
+   assert(useful==(KVIP_AUTO_ROUTE?7U:0U) && status[b*32]==0 && status[b*32+1]==ctlData[0]);
+   assert(rows[b].finalRequests==ctlData[0] && rows[b].finalPending);
+   for(unsigned q=1;q<=5;++q)assert(!f[q].ready);
+   timeoutClock=false;
+  }
   packStatus=OutputWorker<false,OutputRole::Descriptors>(&args,b);
   assert(!flags[b*kFlagCount+kOutputsDoneFlag].ready && outputStarts==0);
   tndStatus=OutputWorker<false,OutputRole::Tnd>(&args,b);
@@ -297,6 +315,7 @@ int main(){
         'PRODUCER_ERROR': input_error,
         'PRODUCER_JOIN': producer_join,
         'PRODUCER_RECOVERY': producer_recovery,
+        'RESOLVER_TAIL': resolver_tail,
         'CONSUMER_JOIN': consumer_join,
         'PRODUCER_DONE': producer_done,
         'INITIALIZE_FLAGS': initialize_flags,
