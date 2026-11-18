@@ -221,10 +221,9 @@ extern "C" __global__ __aicore__ void v9_fetch_fixture_kernel(GM_ADDR bindings, 
         auto map=reinterpret_cast<__gm__ uint32_t*>(frozenMap)+uint64_t(b)*h;
         uint32_t total=0;
         for(uint32_t e=0;e<9;++e) {
-            for(uint32_t q=0;q<4;++q)
-                AdvanceFetchRank(ctx,scratch,reinterpret_cast<GM_ADDR>(a[12]),b*4+q,h,r,9,e,ends[q],order);
             uint32_t missing=0, budget=512-total<64?512-total:64;
-            uint32_t count=AdmitFetchRank(ctx,scratch,cfg,sent,map,b,r,9,e+1,budget,total,missing,true);
+            uint32_t count=ServiceFetchRank(ctx,scratch,cfg,sent,reinterpret_cast<GM_ADDR>(a[12]),map,
+                b,h,r,9,e,e+1,ends,order,budget,total,missing,true);
             GlobalTensor<uint32_t> audit;
             audit.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->fetchAudit)+(b*9+e)*96);
             cfg.SetValue(0,e+1);cfg.SetValue(1,count);

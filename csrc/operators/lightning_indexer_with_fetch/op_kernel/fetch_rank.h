@@ -16,39 +16,92 @@ __simd_vf__ inline void RemapFetchSeed(__ubuf__ uint32_t* ids,uint32_t resident,
     }
 }
 
-template<bool offsetsOnly>
-__simd_vf__ inline void PackRankKeys(__ubuf__ uint16_t* raw, __ubuf__ uint16_t* values,
-    __ubuf__ uint16_t* offsets, uint16_t cutoff, uint16_t valid, uint16_t skipLo,
-    uint16_t skipHi, uint16_t tiles) {
+// Each bit represents a 128-score tile. Summarize up to 16K scores from
+// the producer bitmap in one DMA, before reusing its input space for scores.
+#if KVIP_FETCH_BITMAP
+__simd_vf__ inline void FetchTileMask(__ubuf__ uint32_t* words, __ubuf__ uint32_t* result,
+                                      uint32_t tiles) {
+    using namespace MicroAPI;
+    RegTensor<int32_t> lane;
+    Arange(lane, int32_t(0));
+    RegTensor<uint32_t> weight, one, zero, low, high, sum;
+    auto all = CreateMask<uint32_t, MaskPattern::ALL>();
+    auto eight = CreateMask<uint32_t, MaskPattern::VL8>();
+    auto first = CreateMask<uint32_t, MaskPattern::VL1>();
+    Duplicate(one, uint32_t(1));
+    Duplicate(zero, uint32_t(0));
+    ShiftLeft(weight, one, lane, eight);
+    // Eight packed bitmap words describe exactly one 128-score tile. The
+    // hardware block maximum reduces eight such tiles per contiguous load.
+    for (uint16_t t = 0; t < tiles; t += 16) {
+        LoadAlign(low, words + t * 8);
+        LoadAlign(high, words + t * 8 + 64);
+        ReduceMaxWithDataBlock(low, low, all);
+        ReduceMaxWithDataBlock(high, high, all);
+        MaskReg lowHit, highHit;
+        CompareScalar<uint32_t, CMPMODE::NE>(lowHit, low, uint32_t(0), eight);
+        CompareScalar<uint32_t, CMPMODE::NE>(highHit, high, uint32_t(0), eight);
+        Select(low, weight, zero, lowHit);
+        Select(high, weight, zero, highHit);
+        ShiftLefts(high, high, int16_t(8), eight);
+        Or(low, low, high, eight);
+        ReduceSum(sum, low, eight);
+        StoreAlign(result + (t / 16) * 8, sum, first);
+    }
+}
+#endif
+
+template<bool clipped>
+__simd_vf__ inline void PackRankOffsets(__ubuf__ uint16_t* raw, __ubuf__ uint16_t* offsets,
+    uint16_t cutoff, uint16_t valid, uint16_t skipLo, uint16_t skipHi,
+    uint16_t tiles, uint32_t tileMask) {
     using namespace MicroAPI;
     auto all = CreateMask<uint16_t, MaskPattern::ALL>();
     RegTensor<uint16_t> value, packed;
     RegTensor<int16_t> lanes;
-    MaskReg above, causal, left, right, keep;
-    UnalignRegForStore writeValues, writeOffsets;
+    MaskReg keep;
+    UnalignRegForStore writer;
     ClearSpr<SpecialPurposeReg::AR>();
     for (uint16_t tile = 0; tile < tiles; ++tile) {
-        uint16_t i = tile * 128;
+#if KVIP_FETCH_BITMAP
+        if (!(tileMask & (1u << tile))) continue;
+#endif
+        const uint16_t i = tile * 128;
         LoadAlign(value, raw + i);
         Arange(lanes, int16_t(i));
         auto& index = reinterpret_cast<RegTensor<uint16_t>&>(lanes);
-        CompareScalar<uint16_t, CMPMODE::GT>(above, value, cutoff, all);
-        CompareScalar<uint16_t, CMPMODE::LT>(causal, index, valid, all);
-        CompareScalar<uint16_t, CMPMODE::LT>(left, index, skipLo, all);
-        CompareScalar<uint16_t, CMPMODE::GE>(right, index, skipHi, all);
-        MaskOr(keep, left, right, all);
-        MaskAnd(keep, keep, causal, all);
-        MaskAnd(keep, keep, above, all);
-        if constexpr(offsetsOnly) {
-            Squeeze<uint16_t, AscendC::MicroAPI::GatherMaskMode::STORE_REG>(packed,index,keep);
-            StoreUnAlign<uint16_t,PostLiteral::POST_MODE_UPDATE>(offsets,packed,writeOffsets);
-        } else {
-            Squeeze<uint16_t, AscendC::MicroAPI::GatherMaskMode::STORE_REG>(packed,value,keep);
-            StoreUnAlign<uint16_t,PostLiteral::POST_MODE_UPDATE>(values,packed,writeValues);
+        CompareScalar<uint16_t, CMPMODE::GT>(keep, value, cutoff, all);
+        if constexpr (clipped) {
+            MaskReg causal, left, right;
+            CompareScalar<uint16_t, CMPMODE::LT>(causal, index, valid, all);
+            CompareScalar<uint16_t, CMPMODE::LT>(left, index, skipLo, all);
+            CompareScalar<uint16_t, CMPMODE::GE>(right, index, skipHi, all);
+            MaskOr(left, left, right, all);
+            MaskAnd(keep, keep, causal, all);
+            MaskAnd(keep, keep, left, all);
         }
+        Squeeze<uint16_t, AscendC::MicroAPI::GatherMaskMode::STORE_REG>(packed, index, keep);
+        StoreUnAlign<uint16_t,PostLiteral::POST_MODE_UPDATE>(offsets, packed, writer);
     }
-    if constexpr(offsetsOnly) StoreUnAlignPost(offsets,writeOffsets);
-    else StoreUnAlignPost(values,writeValues);
+    StoreUnAlignPost(offsets, writer);
+}
+
+// Only the overflow path needs a contiguous score array for the histogram.
+// Read the winners by their compact offsets and initialize histogram padding.
+__simd_vf__ inline void GatherRankKeys(__ubuf__ uint16_t* raw, __ubuf__ uint16_t* offsets,
+                                      __ubuf__ uint16_t* out, uint32_t count) {
+    using namespace MicroAPI;
+    auto all = CreateMask<uint16_t, MaskPattern::ALL>();
+    RegTensor<uint16_t> pos, value, zero;
+    Duplicate(zero, uint16_t(0));
+    uint16_t tiles = ((count + 255) / 256) * 2;
+    for (uint16_t i = 0; i < tiles; ++i) {
+        auto valid = UpdateMask<uint16_t>(count);
+        LoadAlign(pos, offsets + i * 128);
+        Gather(value, raw, pos, valid);
+        Select(value, value, zero, valid);
+        StoreAlign(out + i * 128, value, all);
+    }
 }
 
 template<bool gather>
@@ -63,7 +116,7 @@ inline void WriteRank(__ubuf__ uint32_t* out, __ubuf__ uint16_t* outKeys,
             outKeys[dst] = values[j];
         } else {
             out[strict+i] = physical + offsets[i];
-            outKeys[strict+i] = values[i];
+            outKeys[strict+i] = values[offsets[i]];
         }
     }
 }
@@ -83,11 +136,12 @@ __aicore__ inline void MergeRankBlock(LocalTensor<uint32_t> arena, uint32_t phys
     auto nextKeys = arena[5120].ReinterpretCast<uint16_t>();
     auto values = arena[7168].ReinterpretCast<uint16_t>();
     auto offsets = arena[8224].ReinterpretCast<uint16_t>();
+    auto raw = arena[6144].ReinterpretCast<uint16_t>();
     // Store cutoff ties backwards, so appending strict winners touches only the
     // discarded end of the tie cohort. Ties are converted back at publication.
     if (strict + added < kTop) {
         Simt::VF_CALL<WriteRank<false>>(Simt::Dim3{256,1,1}, RankPtr(ids), RankPtr(keys),
-            RankPtr(ids), RankPtr(values), RankPtr(offsets), RankPtr(offsets), physical, added, strict);
+            RankPtr(ids), RankPtr(raw), RankPtr(offsets), RankPtr(offsets), physical, added, strict);
         PipeBarrier<PIPE_V>();
         strict += added;
         return;
@@ -98,11 +152,9 @@ __aicore__ inline void MergeRankBlock(LocalTensor<uint32_t> arena, uint32_t phys
     auto cutoff = arena[9472].ReinterpretCast<uint16_t>();
     auto ord = keys; // previous scores are copied before reusing this space
     uint32_t size = (kTop + added + 255) / 256 * 256;
+    GatherRankKeys(RankPtr(raw), RankPtr(offsets), RankPtr(values), added);
+    PipeBarrier<PIPE_V>(); // Complete the gather before replacing raw with old scores.
     DataCopy(input,keys,kTop);
-    // The histogram includes padding in the ascending rank. A strictly higher
-    // cutoff is positive, so padded zeroes cannot enter the selected set.
-    for(uint32_t i=kTop+added;i<size;++i) input.SetValue(i,0);
-    SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
     PipeBarrier<PIPE_V>();
     kvip_recent_threshold::RegisterThreshold(RankPtr(input),RankPtr(cutoff),size/256,size-kTop+1);
     PipeBarrier<PIPE_V>();
@@ -130,7 +182,7 @@ __aicore__ inline uint16_t ClipRankOffset(uint32_t value,uint32_t base,uint32_t 
     return value<=base?0:uint16_t(value-base<n?value-base:n);
 }
 
-__aicore__ inline void AdvanceFetchRank(__gm__ Context* ctx, LocalTensor<uint32_t> a,
+__aicore__ inline uint32_t AdvanceFetchRank(__gm__ Context* ctx, LocalTensor<uint32_t> a,
     GM_ADDR scoreBuffer, uint32_t q, uint32_t history, uint32_t resident, uint32_t rounds,
     uint32_t epoch, uint32_t queryEnd, kvip_cold_scan::Range order) {
     GlobalTensor<uint32_t> store;
@@ -174,45 +226,52 @@ __aicore__ inline void AdvanceFetchRank(__gm__ Context* ctx, LocalTensor<uint32_
         uint32_t lo=ranges[0],hi=ranges[1];
         uint32_t stop=Trigger(history,resident,rounds,epoch)*128;
         auto raw=a[6144].ReinterpretCast<uint16_t>();
-        auto vals=a[7168].ReinterpretCast<uint16_t>(), off=a[8224].ReinterpretCast<uint16_t>();
-        auto mask=a[9280];
+        auto off = a[8224].ReinterpretCast<uint16_t>();
+#if KVIP_FETCH_BITMAP
+        auto masks = a[9632]; // eight aligned tile-mask words, disjoint from the rank.
+        uint32_t batchStart = 0, batchEnd = 0;
+#endif
         for(uint32_t scan=Trigger(history,resident,rounds,epoch-1)*128;scan<stop;) {
             uint32_t n=2048-(scan%2048);if(n>stop-scan)n=stop-scan;
             uint32_t p=kvip_cold_scan::Remap(scan,order);
             uint32_t valid=ClipRankOffset(queryEnd,p,n);
             if(valid && !(p>=lo && p+valid<=hi)) {
+                uint32_t tileMask = (1u << (n / 128)) - 1;
 #if KVIP_FETCH_BITMAP
-                DataCopy(mask,bits[scan/16],n/16);
-                SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-                bool any=false;
-                for(uint32_t i=0;i<n;i+=128) {
-                    bool hit=false;
-                    for(uint32_t j=0;j<8;++j)hit|=mask.GetValue(i/16+j)!=0;
-                    if(hit) {DataCopy(raw[i],scores[p+i],128);any=true;}
-                    else Duplicate(raw[i],uint16_t(0),128);
+                if (scan >= batchEnd) {
+                    batchStart = scan - scan % 2048;
+                    batchEnd = stop - batchStart > 16384 ? batchStart + 16384 : stop;
+                    uint32_t tiles = (batchEnd - batchStart) / 128;
+                    auto words = a[6144];
+                    DataCopy(words, bits[batchStart / 16], tiles * 8);
+                    SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+                    FetchTileMask(RankPtr(words), RankPtr(masks), tiles);
+                    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
                 }
-                if(!any) {PipeBarrier<PIPE_V>();scan+=n;continue;}
-                PipeBarrier<PIPE_V>();
+                uint32_t tile = (scan - batchStart) / 128;
+                tileMask &= masks.GetValue((tile / 16) * 8) >> (tile % 16);
+                if (!tileMask) { scan += n; continue; }
+                for (uint32_t runs = tileMask; runs;) {
+                    uint32_t first = __builtin_ctz(runs);
+                    uint32_t length = __builtin_ctz(~(runs >> first));
+                    DataCopy(raw[first * 128], scores[p + first * 128], length * 128);
+                    runs &= ~(((1u << length) - 1) << first);
+                }
 #else
                 DataCopy(raw,scores[p],n);
 #endif
                 SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-                PackRankKeys<false>(reinterpret_cast<__ubuf__ uint16_t*>(raw.GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint16_t*>(vals.GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint16_t*>(off.GetPhyAddr()),
-                    kth,valid,ClipRankOffset(lo,p,n),ClipRankOffset(hi,p,n),n/128);
-                // AR is the byte count of the final StoreUnAlign stream.
-                uint32_t added=GetSpr<SpecialPurposeReg::AR>()/sizeof(uint16_t);
-                SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-                if(added) {
-                PackRankKeys<true>(reinterpret_cast<__ubuf__ uint16_t*>(raw.GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint16_t*>(vals.GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint16_t*>(off.GetPhyAddr()),
-                    kth,valid,ClipRankOffset(lo,p,n),ClipRankOffset(hi,p,n),n/128);
-                    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+                if (valid == n && (p >= hi || p + n <= lo)) {
+                    PackRankOffsets<false>(RankPtr(raw), RankPtr(off), kth, n, 0, 0, n/128, tileMask);
+                } else {
+                    PackRankOffsets<true>(RankPtr(raw), RankPtr(off), kth, valid,
+                        ClipRankOffset(lo,p,n),ClipRankOffset(hi,p,n),n/128,tileMask);
                 }
-                MergeRankBlock(a,p,added,kth,strict);
-                PipeBarrier<PIPE_ALL>();
+                uint32_t added = GetSpr<SpecialPurposeReg::AR>() / sizeof(uint16_t);
+                SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+                if (added) MergeRankBlock(a,p,added,kth,strict);
+                // The next DMA reuses raw after both the sieve and merge readers.
+                SetFlag<HardEvent::V_MTE2>(EVENT_ID0);WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
             }
             scan+=n;
         }
@@ -222,7 +281,9 @@ __aicore__ inline void AdvanceFetchRank(__gm__ Context* ctx, LocalTensor<uint32_
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     DataCopy(store,hdr,kRankHeader);DataCopy(store[kRankHeader],a,kTop);
     DataCopy(store[kRankHeader+kTop].ReinterpretCast<uint16_t>(),keys,kTop);
-    SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+    // Rank storage is visible on return, and the next VF can reuse scratch in place.
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    return strict;
 }
 
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
@@ -238,38 +299,63 @@ inline void RankMisses(__gm__ Context* ctx,uint32_t b,uint32_t resident,
         states[i]=eligible && !IsTailToken(ctx,b,id)?asc_ldcg(map+id):0;
     }
 }
-__aicore__ inline uint32_t AdmitFetchRank(__gm__ Context* ctx,LocalTensor<uint32_t> scratch,
-    LocalTensor<uint32_t> cfg, LocalTensor<uint32_t> selectedIds,__gm__ uint32_t* map,
-    uint32_t b,uint32_t rt_resident,uint32_t rt_rounds,uint32_t target,
-    uint32_t allowance,uint32_t slots,uint32_t& missing,bool frozenMap) {
-    uint32_t count=0;
-        for(uint32_t q=0;target && q<4 && count<allowance;++q) {
+__aicore__ inline uint32_t AdmitLocalRank(__gm__ Context* ctx, LocalTensor<uint32_t> scratch,
+    LocalTensor<uint32_t> cfg, LocalTensor<uint32_t> selectedIds, __gm__ uint32_t* map,
+    uint32_t b, uint32_t rt_resident, uint32_t strict, uint32_t allowance,
+    uint32_t slots, uint32_t& missing, bool frozenMap) {
+    Simt::VF_CALL<RankMisses>(Simt::Dim3{256,1,1},ctx,b,rt_resident,
+        reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),strict,
+        reinterpret_cast<__ubuf__ uint32_t*>(scratch[2048].GetPhyAddr()),
+        reinterpret_cast<__ubuf__ uint32_t*>(scratch[4096].GetPhyAddr()),map,frozenMap);
+    PipeBarrier<PIPE_V>();
+    CompactMisses(reinterpret_cast<__ubuf__ uint32_t*>(scratch[2048].GetPhyAddr()),
+        reinterpret_cast<__ubuf__ uint32_t*>(scratch[4096].GetPhyAddr()),
+        reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),kTop,allowance,
+        reinterpret_cast<__ubuf__ uint32_t*>(selectedIds.GetPhyAddr()));
+    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+    uint32_t found=cfg.GetValue(56),n=found<allowance?found:allowance;
+    if(n) {
+        Simt::VF_CALL<ReserveIncremental>(Simt::Dim3{256,1,1},
+            reinterpret_cast<__ubuf__ uint32_t*>(selectedIds.GetPhyAddr()),
+            map,n,rt_resident+slots);
+        PipeBarrier<PIPE_V>();
+    }
+    missing += found;
+    return n;
+}
+
+// A rotating service core owns all four ranks for its request. Advance the
+// last visible epoch and admit directly from each query's live UB state.
+// An unchanged frontier may still have unsent winners from an earlier budget.
+__aicore__ inline uint32_t ServiceFetchRank(__gm__ Context* ctx, LocalTensor<uint32_t> scratch,
+    LocalTensor<uint32_t> cfg, LocalTensor<uint32_t> selectedIds, GM_ADDR scores, __gm__ uint32_t* map,
+    uint32_t b, uint32_t history, uint32_t resident, uint32_t rounds, uint32_t versions,
+    uint32_t target, const uint32_t* ends, kvip_cold_scan::Range order, uint32_t allowance,
+    uint32_t slots, uint32_t& missing, bool frozenMap) {
+    uint32_t count = 0;
+    for (uint32_t v = versions; v < target; ++v) {
+        for (uint32_t q = 0; q < 4; ++q) {
+            uint32_t strict = AdvanceFetchRank(ctx, scratch, scores, b*4+q, history, resident,
+                                               rounds, v, ends[q], order);
+            if (v+1 == target && count < allowance) {
+                count += AdmitLocalRank(ctx, scratch, cfg, selectedIds[count], map, b, resident,
+                                        strict, allowance-count, slots+count, missing, frozenMap);
+            }
+        }
+    }
+    if (versions == target && target) {
+        for (uint32_t q = 0; q < 4 && count < allowance; ++q) {
             GlobalTensor<uint32_t> bank;
             bank.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->fetchRanks)
-                +uint64_t((b*4+q)*rt_rounds+target-1)*(kRankWords+kRankHeader));
-            DataCopy(scratch,bank[kRankHeader],kTop);
-            DataCopy(scratch[4096],bank,kRankHeader);
+                + uint64_t((b*4+q)*rounds+target-1)*(kRankWords+kRankHeader));
+            DataCopy(scratch, bank[kRankHeader], kTop);
+            DataCopy(scratch[4096], bank, kRankHeader);
             SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-            uint32_t strict=scratch.GetValue(4097);
-            Simt::VF_CALL<RankMisses>(Simt::Dim3{256,1,1},ctx,b,rt_resident,
-                reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),strict,
-                reinterpret_cast<__ubuf__ uint32_t*>(scratch[2048].GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint32_t*>(scratch[4096].GetPhyAddr()),map,frozenMap);
-            PipeBarrier<PIPE_V>();
-            CompactMisses(reinterpret_cast<__ubuf__ uint32_t*>(scratch[2048].GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint32_t*>(scratch[4096].GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),kTop,allowance-count,
-                reinterpret_cast<__ubuf__ uint32_t*>(selectedIds[count].GetPhyAddr()));
-            SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-            uint32_t found=cfg.GetValue(56),n=found<allowance-count?found:allowance-count;
-            if(n) {
-                Simt::VF_CALL<ReserveIncremental>(Simt::Dim3{256,1,1},
-                    reinterpret_cast<__ubuf__ uint32_t*>(selectedIds[count].GetPhyAddr()),
-                    map,n,rt_resident+slots+count);
-                PipeBarrier<PIPE_V>();
-            }
-            count+=n;missing+=found;
+            uint32_t strict = scratch.GetValue(4097);
+            count += AdmitLocalRank(ctx, scratch, cfg, selectedIds[count], map, b, resident, strict,
+                                    allowance-count, slots+count, missing, frozenMap);
         }
+    }
     return count;
 }
 #endif

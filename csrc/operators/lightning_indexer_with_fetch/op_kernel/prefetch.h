@@ -801,24 +801,14 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
             }
             if(!complete)break;
         }
-        for(uint32_t v=versions;v<target;++v)
-            for(uint32_t q=0;q<4;++q)
-                AdvanceFetchRank(ctx,scratch,rollingScores,b*4+q,rt_history,rt_resident,
-                                 rt_rounds,v,ends[q],range);
-        state.SetValue(12,target);
         uint32_t allowance=PrefetchAllowance(slots,requests,state.GetValue(208),state.GetValue(209),
                                              state.GetValue(210),ctx->windowLimit);
-        count=AdmitFetchRank(ctx,scratch,cfg,selectedIds,map,b,rt_resident,rt_rounds,
-                             target,allowance,slots,missing,false);
-        if constexpr(captureIo) {
-            GlobalTensor<uint32_t> audit;
-            audit.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->fetchAudit)+(b*rt_rounds+epoch)*96);
-            auto header=scratch[4096];header.SetValue(0,target);header.SetValue(1,count);
-            SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
-            DataCopy(audit,header,32);
-            if(count) DataCopy(audit[32],selectedIds,(count+7)/8*8);
-            SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
-        }
+        count=ServiceFetchRank(ctx,scratch,cfg,selectedIds,rollingScores,map,b,rt_history,rt_resident,
+                               rt_rounds,versions,target,ends,range,allowance,slots,missing,false);
+        state.SetValue(12,target);
+        // The ordinary row flush already transfers this history. Actual posted
+        // IDs are recorded in BatchBuild, just as for the forward/reverse controls.
+        if constexpr (captureIo) state.SetValue(80+epoch*4, target);
 #elif KVIP_INCREMENTAL_TOPK
         const uint32_t allowance=PrefetchAllowance(slots,requests,state.GetValue(208),
             state.GetValue(209),state.GetValue(210),ctx->windowLimit);
