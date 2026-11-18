@@ -13,14 +13,18 @@ namespace high_post_index {
 static_assert(offsetof(Args, highIndex) == 152, "high Index workspace address ABI");
 struct PrivatePlan {
     uint32_t pairs = 0, singles = 0, invalidations = 0, chunks = 0, error = 0;
-    uint64_t activeCycles = 0;
+    uint64_t activeCycles = 0, probeCycles = 0;
+    uint32_t strategy = 2, probedEvents = 0;
 };
+
+#include "high_index_cold_plan.h"
 
 // One owner composes each row's sparse/dense map preserving the original
 // prefetch/Q0/Q1/Q2/Q3 phase and 512-event chunk boundaries. Dirty destinations
 // include displaced rows. No key/scale/address/logical writes here.
 __aicore__ inline void Plan(__gm__ Args* a, uint32_t b, __gm__ Edge* edges,
                            __gm__ uint32_t* invalidations, bool profile, PrivatePlan& plan) {
+    if (TryColdPlan(a,b,edges,profile,plan)) { plan.strategy=1; return; }
     auto ctx = reinterpret_cast<__gm__ Context*>(a->context);
     auto shape = LoadRuntimeShape(ctx);
     auto src = reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+uint64_t(b)*a->maxEvents;
@@ -142,7 +146,7 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a,uint32_t blo
     r->packedRow=b; r->lane=lane; r->lanes=lanes;
     r->planDone=0; r->packDone=0; r->postBegin=0; r->postDone=0;
     r->indexDone=0; r->cqDone=0; r->start=profile ? GetSystemCycle() : 0;
-    if (profile) { ticks[14]=0; ticks[15]=0; ticks[20]=0; ticks[21]=0; ticks[22]=0; }
+    if (profile) { ticks[14]=0; ticks[15]=0; ticks[20]=0; ticks[21]=0; ticks[22]=0; ticks[23]=0; ticks[24]=0; ticks[25]=0; ticks[26]=0; }
     uint32_t useful=0;
     if (!lane) useful=Producer(a,b);
     else if (lane==1) OutputWorker<false>(a,b);
@@ -152,6 +156,8 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a,uint32_t blo
         if (profile) {
             ticks[15]=GetSystemCycle(); ticks[20]=2*plan.pairs+plan.singles;
             ticks[21]=plan.activeCycles; ticks[22]=plan.pairs;
+            ticks[23]=0x43503231U; ticks[24]=plan.strategy;
+            ticks[25]=plan.probedEvents; ticks[26]=plan.probeCycles;
         }
     }
     if (!lane) CompletePrefetch(ctx,b,true);
