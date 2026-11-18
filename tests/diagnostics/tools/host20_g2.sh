@@ -13,7 +13,8 @@ fixed_work=0
 index_units=moves
 index_groups=(4 7 10 17)
 baseline_override=
-if [[ (${1:-} == --index-paired || ${1:-} == --index-10k-paired) && ${3:-} == --baseline ]]; then
+consumer_ab=0
+if [[ (${1:-} == --index-paired || ${1:-} == --index-10k-paired || ${1:-} == --consumer-ab) && ${3:-} == --baseline ]]; then
     [[ ${4:-} =~ ^[0-9a-f]{40}$ ]] || die "--baseline requires a full 40-digit SHA"
     baseline_override=$4
     set -- "$1" "$2" "${@:5}"
@@ -50,7 +51,7 @@ elif [[ ($# == 2 || $# == 3) && ($1 == --index-10k || $1 == --index-10k-paired) 
     [[ $index_units == moves || $index_units == events ]] || die "Expected 10k moves or events"
     labels=(before after)
     candidate=$2
-elif [[ $# -ge 2 && ($1 == --index-speed || $1 == --index-paired) && $2 =~ ^[0-9a-f]{40}$ ]]; then
+elif [[ $# -ge 2 && ($1 == --index-speed || $1 == --index-paired || $1 == --consumer-ab) && $2 =~ ^[0-9a-f]{40}$ ]]; then
     if [[ $# -gt 2 ]]; then
         index_groups=()
         for group in "${@:3}"; do
@@ -61,6 +62,10 @@ elif [[ $# -ge 2 && ($1 == --index-speed || $1 == --index-paired) && $2 =~ ^[0-9
     fi
     high_index=1
     if [[ $1 == --index-paired ]]; then fixed_work=1; fi
+    if [[ $1 == --consumer-ab ]]; then
+        [[ -n $baseline_override ]] || die "--consumer-ab requires --baseline CONTROL_SHA"
+        consumer_ab=1
+    fi
     index_speed=1
     labels=(before after)
     candidate=$2
@@ -68,7 +73,7 @@ elif [[ $# == 2 && $1 == --high-index && $2 =~ ^[0-9a-f]{40}$ ]]; then
     high_index=1
     candidate=$2
 elif [[ $# != 0 ]]; then
-    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA|--index-speed CANDIDATE_SHA [GROUP ...]|--index-10k CANDIDATE_SHA [moves|events]|--index-paired CANDIDATE_SHA [--baseline CONTROL_SHA] [GROUP ...]|--index-10k-paired CANDIDATE_SHA [--baseline CONTROL_SHA] [moves|events]]"
+    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA|--index-speed CANDIDATE_SHA [GROUP ...]|--index-10k CANDIDATE_SHA [moves|events]|--index-paired CANDIDATE_SHA [--baseline CONTROL_SHA] [GROUP ...]|--index-10k-paired CANDIDATE_SHA [--baseline CONTROL_SHA] [moves|events]|--consumer-ab CANDIDATE_SHA --baseline CONTROL_SHA [GROUP ...]]"
 fi
 
 diag=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
@@ -85,6 +90,7 @@ if [[ -n $candidate ]]; then
     before=${3:-$after}
     if ((account)); then before=66a2f469ebaec3b35fff789a75177ee19b00213e; fi
     if ((index_speed || index_10k)); then before=dc7904e8e874956de6df8352265bb6ac64d1d644; fi
+    if ((consumer_ab)); then before=$baseline_override; fi
     if ((fixed_work)); then before=${baseline_override:-785703fe7118ac777069c27f43509ee090f8730a}; fi
     after=$candidate
     [[ $after != "$before" ]] && git -C "$repo" merge-base --is-ancestor "$before" "$after" ||
@@ -171,7 +177,10 @@ export KVAF_BATCH_GET_KERNEL="$build/bin/kvaf_execute_batch_get_kernels.o"
 export KVAF_BATCH_PUT_KERNEL="$build/bin/kvaf_execute_batch_put_kernels.o"
 [[ -s "$KVAF_BATCH_GET_KERNEL" && -s "$KVAF_BATCH_PUT_KERNEL" ]] || die "Missing Get/Put objects in $build/bin"
 
-if ((index_speed)); then
+if ((consumer_ab)); then
+    out=$(mktemp -d "$cache/host20-consumer-ab.XXXXXX")
+    printf 'CONSUMER_AB NPU4 logical=0 HIGH=8_windows baseline=%.8s candidate=%.8s\n' "$before" "$after"
+elif ((index_speed)); then
     out=$(mktemp -d "$cache/host20-high-index-speed.XXXXXX")
     printf 'HIGH_INDEX_SPEED NPU4 logical=0 baseline=%.8s candidate=%.8s\n' "$before" "$after"
 elif ((high_index)); then
@@ -216,7 +225,10 @@ cd "$diag"
 if ((high_index)); then
     study=kvip.diagnostics.high_index_study
     study_args=()
-    if ((index_speed)); then
+    if ((consumer_ab)); then
+        study=kvip.diagnostics.consumer_ab
+        study_args=(--baseline "$before" --groups "${index_groups[@]}")
+    elif ((index_speed)); then
         study=kvip.diagnostics.high_index_speed
         study_args=(--groups "${index_groups[@]}")
         if ((fixed_work)); then

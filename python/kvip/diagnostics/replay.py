@@ -63,6 +63,8 @@ def arguments(argv=None):
                    help="Untimed light-low replay: one captured graph, quotas 0/512/0, restore before each")
     p.add_argument("--check-auto-route", action="store_true",
                    help="Untimed device-feedback lifecycle checks on the auto variant")
+    p.add_argument("--verify-consumer-work", action="store_true",
+                   help="Check original HIGH consumer events, final Get descriptors and persistent Index outside timing")
     p.add_argument("--high-post-index", action="store_true",
                    help="Enable the full-AIV terminal Index on naturally selected eight-window HIGH steps")
     p.add_argument("--frozen-high-tail-library", type=Path,
@@ -138,6 +140,9 @@ def arguments(argv=None):
         args.study != "post-threshold" or args.pipeline_variants != ["auto-post-index"]
     ):
         p.error("post-index-wait-first/high-post-index requires only the auto-post-index variant")
+    if args.verify_consumer_work and (not args.check_auto_route or args.transport != "urma" or args.high_post_index
+                                      or args.pipeline_variants != ["auto-post-index"]):
+        p.error("verify-consumer-work requires the URMA auto-post-index original HIGH schedule and check-auto-route")
     if args.frozen_high_tail_library and (not args.high_post_index or args.post_index_wait_first
                                           or not args.diagnostic_replays or not args.calibrate_counter):
         p.error("frozen-high-tail-library requires high-post-index, calibration and diagnostic replays in normal order")

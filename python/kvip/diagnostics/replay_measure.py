@@ -275,7 +275,8 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
                             (bundle.forward.events_src, bundle.forward.events_dst))
                       if detail is not None and np.any(detail[:, 2] == INDEX_DETAIL_SAME_VF_MAGIC) else None)
             records = cpu_array(torch, bundle.forward.post_index)
-            if high_active:
+            check_consumer = getattr(bundle, "record_consumer_work", False) and not low_active
+            if high_active or check_consumer:
                 from kvip.diagnostics.high_index_profile import (
                     decode_high_index, describe_row_load, descriptor_fingerprint, event_work,
                 )
@@ -289,6 +290,9 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
                     cpu_array(torch, rotating.fallback_addresses),
                     final_get=reads["final"], arena_base=restored["new_base"],
                 )
+            if check_consumer:
+                reads["consumer_work"] = work
+            if high_active:
                 reads["high_post_index"] = decode_high_index(
                     records, detail, wait_first=bool(getattr(bundle.forward, "post_index_wait_first", False)),
                     final_get=reads["final"], work=work,
@@ -342,6 +346,13 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         state = post_state(torch, selector)
         stride = rotating.output_stride if bundle.tuning.get("low_miss_read_through") else None
         oracle.verify(state, address_delta=delta, expected_topk=selected_expected, output_stride=stride)
+        if "consumer_work" in reads:
+            from kvip.diagnostics.high_index_profile import verify_permutation
+
+            flags, src, dst = (cpu_array(torch, v) for v in
+                               (bundle.forward.flags, bundle.forward.events_src, bundle.forward.events_dst))
+            verify_permutation(flags, src, dst, oracle.pre["logical_ids"], state["logical_ids"], oracle.owners)
+            reads["consumer_work"]["ordered_index_verified"] = True
         high = reads.get("high_post_index", {})
         if "moved" in high:
             from kvip.diagnostics.high_index_profile import validate_move_counts, verify_permutation
@@ -475,6 +486,7 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
     retained["events"] = [begin, end]
     samples, reads, auto_samples = [], [], []
     auto = getattr(bundle, "auto_replay", None)
+    bundle.record_consumer_work = bool(getattr(args, "verify_consumer_work", False))
     phase(retained, "timed_measurement")
     for step in range(args.warmup + args.iterations):
         phase(retained, "iteration_reset", step)
@@ -496,8 +508,13 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
             if auto is not None:
                 auto_samples.append(auto.record(counts))
     phase(retained, "final_verify")
-    verify()  # Full score/Index/KV oracle after the final measured replay.
+    final_reads = verify()  # Full score/Index/KV oracle after the final measured replay.
     result = dict(timing=statistics(samples), reads_samples=reads)
+    if bundle.record_consumer_work:
+        if "consumer_work" not in final_reads:
+            raise ValueError("Consumer work verification requires a naturally selected HIGH replay")
+        result["verified_consumer_work"] = final_reads["consumer_work"]
+        bundle.record_consumer_work = False
     if auto is not None:
         config = cpu_array(torch, auto.state.config)
         result["auto_route"] = dict(
