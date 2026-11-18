@@ -258,10 +258,15 @@ int main(){using namespace rotating;
    if(low && !used) {
     std::vector<uint32_t> actual(kTop,42),rawBits(4104,0);
     for(threadIdx.x=0;threadIdx.x<512;++threadIdx.x)
-      ClassifyLowRaw(H,R,O,begin,end,&ctx,selected.data()+q*kTop,actual.data(),
+      ClassifyLowTokens(H,R,O,begin,end,&ctx,selected.data()+q*kTop,actual.data(),
                      rawBits.data(),rawBits.data()+4096);
     assert(std::equal(actual.begin(),actual.end(),locations.begin()+q*kTop));
     assert(rawBits==bits);
+    auto expectedBits=bits;
+    // Emulate the VF barrier between all classification lanes and folding.
+    for(threadIdx.x=0;threadIdx.x<512;++threadIdx.x)FoldClassifyShards(rawBits.data(),R);
+    for(threadIdx.x=0;threadIdx.x<512;++threadIdx.x)MergeClassifyBitmap(expectedBits.data(),R);
+    assert(rawBits==expectedBits);
    }
 #endif
    for(threadIdx.x=0;threadIdx.x<512;++threadIdx.x)MergeClassifyBitmap(bits.data(),R);

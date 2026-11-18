@@ -42,14 +42,18 @@ inline void ClassifyTopkHalf(uint32_t history,uint32_t resident,uint32_t batch,
 }
 // The first shard becomes the exact per-query protection bitmap. Sharding
 // limits contention between lanes without changing which slots are protected.
-__simt_vf__ __aicore__ LAUNCH_BOUND(kClassifyThreads)
-inline void MergeClassifyBitmap(__ubuf__ uint32_t* bitmap,uint32_t resident) {
+__simt_callee__ inline void FoldClassifyShards(__ubuf__ uint32_t* bitmap,uint32_t resident) {
     const uint32_t words=(resident+31)/32,shards=4096/words<8?4096/words:8;
     for(uint32_t word=threadIdx.x;word<words;word+=kClassifyThreads){
         uint32_t value=bitmap[word];
         for(uint32_t shard=1;shard<shards;++shard)value|=bitmap[shard*words+word];
         bitmap[word]=value;
     }
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(kClassifyThreads)
+inline void MergeClassifyBitmap(__ubuf__ uint32_t* bitmap,uint32_t resident) {
+    FoldClassifyShards(bitmap, resident);
     asc_syncthreads();
 }
 }

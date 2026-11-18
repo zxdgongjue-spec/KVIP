@@ -80,8 +80,7 @@ inline void ClassifySelectedMetadata(uint32_t history, uint32_t resident,
 // Zero-window Qs classify against immutable resident validity and the ABC
 // ring. Preserve invalid resident Index positions for in-place repair.
 // Return the regular full slot rows for every consumer and error path.
-__simt_vf__ __aicore__ LAUNCH_BOUND(kClassifyThreads)
-inline void ClassifyLowRaw(uint32_t history, uint32_t resident, uint32_t owner,
+__simt_callee__ inline void ClassifyLowTokens(uint32_t history, uint32_t resident, uint32_t owner,
     uint32_t tailBegin, uint32_t tailEnd, __gm__ Context* ctx,
     __ubuf__ uint32_t* indices, __ubuf__ uint32_t* locations,
     __ubuf__ uint32_t* bitmap, __ubuf__ uint32_t* error) {
@@ -104,6 +103,19 @@ inline void ClassifyLowRaw(uint32_t history, uint32_t resident, uint32_t owner,
         }
         locations[i] = slot;
     }
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(kClassifyThreads)
+inline void ClassifyLowRaw(uint32_t history, uint32_t resident, uint32_t owner,
+    uint32_t tailBegin, uint32_t tailEnd, __gm__ Context* ctx,
+    __ubuf__ uint32_t* indices, __ubuf__ uint32_t* locations,
+    __ubuf__ uint32_t* bitmap, __ubuf__ uint32_t* error) {
+    ClassifyLowTokens(history, resident, owner, tailBegin, tailEnd, ctx,
+                      indices, locations, bitmap, error);
+    // Every lane may protect a slot in a different lane's word. Join once
+    // before folding the shards, then let the caller publish the result.
+    asc_syncthreads();
+    FoldClassifyShards(bitmap, resident);
     asc_syncthreads();
 }
 #endif

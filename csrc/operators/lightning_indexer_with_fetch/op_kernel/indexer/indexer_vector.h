@@ -1078,6 +1078,9 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     }
 #endif
     if(profile)liTicks[10]=GetSystemCycle();
+#if KVIP_LOW_MISS_POST_INDEX && KVIP_SELECTED_METADATA && !V9_UBMEM
+    if (!preserveHot)
+#endif
     Simt::VF_CALL<rotating::MergeClassifyBitmap>(Simt::Dim3{512,1,1},reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()),runtimeShape_.resident);
     if(profile){SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);liTicks[11]=GetSystemCycle();}
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
@@ -1085,9 +1088,22 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+uint64_t(query)*2048);
     bits.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(a->queryBitmaps)+uint64_t(query)*((runtimeShape_.resident+31)/32));
     DataCopy(output,result,2048);DataCopy(bits,bitmap,(runtimeShape_.resident+31)/32);
-    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
-    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-    errors[query*32]=bitmap.GetValue(bitmapWords);kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);
+#if KVIP_LOW_MISS_POST_INDEX && KVIP_SELECTED_METADATA && !V9_UBMEM
+    if (preserveHot) {
+        // The first word of this private 128-byte query record is consumed
+        // by the resolver. Publish the already zero-padded 32-byte DMA block
+        // on the same queue as slots and bitmap, before reusing TopK scratch.
+        GlobalTensor<uint32_t> errorRow;
+        errorRow.SetGlobalBuffer(errors + query * 32);
+        DataCopy(errorRow, bitmap[bitmapWords], 8);
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    } else
+#endif
+    {
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        errors[query*32]=bitmap.GetValue(bitmapWords);kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);
+    }
     if(profile){liTicks[7]=GetSystemCycle();liTicks[8]=overlapSecond?1:0;liTicks[9]=streamingTopkOnly_?1:0;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(liTicks),128);}
 }
