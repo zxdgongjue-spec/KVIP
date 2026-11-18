@@ -36,11 +36,13 @@ __aicore__ inline void ApplyGlobalIndex(__gm__ Args* a, __gm__ Context* ctx, uin
     table.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(a->workerStatus));
     DataCopy(h,table,batch*32);
     SetFlag<HardEvent::MTE2_S>(EVENT_ID0); WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-    uint32_t total=0, counts[16], pairs[16];
+    uint32_t total=0, totalLong=0, counts[16], pairs[16];
     for (uint32_t row=0; row<batch; ++row) {
         bool ok=h.GetValue(row*32)==0;
         pairs[row]=ok ? h.GetValue(row*32+3) : 0;
-        counts[row]=ok ? 2*pairs[row]+h.GetValue(row*32+4) : 0;
+        uint32_t longCount=ok ? h.GetValue(row*32+4) : 0;
+        counts[row]=2*pairs[row]+longCount;
+        totalLong+=longCount;
         total+=counts[row];
     }
     uint32_t start=total*block/cores,end=total*(block+1)/cores;
@@ -70,13 +72,16 @@ __aicore__ inline void ApplyGlobalIndex(__gm__ Args* a, __gm__ Context* ctx, uin
     uint64_t stride=update[7];
     bool useSpill=localCount>kLocalTuples;
     TBuf<TPosition::VECCALC> payloadBuf;
-    uint32_t bytes=useSpill || !localCount ? 32 : ((localCount*sizeof(Tuple)+31)/32)*32;
-    pipe.InitBuffer(payloadBuf,bytes);
-    auto local=reinterpret_cast<__ubuf__ Tuple*>(payloadBuf.Get<uint32_t>().GetPhyAddr());
+    auto local=reinterpret_cast<__ubuf__ Tuple*>(h.GetPhyAddr());
+    if (localCount && !useSpill) {
+        pipe.InitBuffer(payloadBuf, ((localCount*sizeof(Tuple)+31)/32)*32);
+        local=reinterpret_cast<__ubuf__ Tuple*>(payloadBuf.Get<uint32_t>().GetPhyAddr());
+    }
     TransferSegments<false>(a,segments,n,a->history,stride,useSpill,local);
-    SyncAll(); // all long-cycle originals are now in private UB or private spill
+    // Uniform across all AIVs. Pure disjoint swaps have no staged sources to protect.
+    if (totalLong) SyncAll();
     if (profile) ticks[12]=GetSystemCycle();
-    TransferSegments<true>(a,segments,n,a->history,stride,useSpill,local);
+    if (localCount) TransferSegments<true>(a,segments,n,a->history,stride,useSpill,local);
     if (profile) {
         ticks[2]=0x50494831U; ticks[5]=GetSystemCycle();
         ticks[9]=2*pairCount+localCount; ticks[10]=ticks[9];
