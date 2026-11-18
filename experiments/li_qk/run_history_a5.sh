@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Repository entry: B1/Q4 history axis only, no network or shared package.
+# Repository entry: B1 history axis or B16 core schedules, no network/shared package.
 set -Eeuo pipefail
 LI_HISTORY_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 LI_HISTORY_OUTPUT_ROOT=/home/w00568585
@@ -10,6 +10,8 @@ LI_HISTORY_DEVICE=5
 LI_HISTORY_PYTHON=python3
 LI_HISTORY_PROFILE=0
 LI_HISTORY_PLAN_ONLY=0
+LI_HISTORY_SUITE=history7
+LI_HISTORY_FINE_GRAIN=128
 LI_HISTORY_OUT=
 LI_HISTORY_STAGE=environment
 LI_HISTORY_LOG=
@@ -50,11 +52,13 @@ run_logged(){
 }
 usage(){ cat <<'USAGE'
 Usage: bash experiments/li_qk/run_history_a5.sh [options]
-Direct repository execution on physical A5: B1/Q4/H131072/G32/D128/K2048.
-History parts: 1,2,4,8,16,32,30; one score launch at each point.
-T30 balances native H128 tiles (4352 or4480 keys/core); Q is never split.
-  --profile             Separately collect msprof traces for all seven points
-  --plan-only           Print the seven complete task plans; do not build/run
+Direct repository execution on physical A5; Q4/H131072/G32/D128/K2048.
+Default history7: B1 history parts1,2,4,8,16,32,30.
+batch16_cores: eight B16 strategies at30/32 AIC groups, Final64 AIV.
+  --suite NAME          history7 (default) or batch16_cores
+  --fine-grain N        B16 fine allocation quantum128 (default) or512
+  --profile             Separately collect msprof traces for every case
+  --plan-only           Print complete task plans; do not build/run
   --device N            Logical device (default 5)
   --output-root PATH    Parent of fresh build/results (default /home/w00568585)
   --cann-root PATH      Matching CANN root containing compiler/tikcpp
@@ -62,7 +66,7 @@ T30 balances native H128 tiles (4352 or4480 keys/core); Q is never split.
   --soc NAME            Actual SoC (default Ascend950PR_9599)
   --python PATH         Python from the existing A5 environment
 Warmup4/iterations20; r0 discarded; three interleaved measured rounds.
-Reports score-only and score+scatter+same Final TopK, paired to same-round T1.
+Reports score-only and score+scatter+same Final TopK; paired within each round.
 USAGE
 }
 while (($#)); do
@@ -70,9 +74,10 @@ while (($#)); do
   -h|--help) usage; exit 0 ;;
   --profile) LI_HISTORY_PROFILE=1; shift ;;
   --plan-only) LI_HISTORY_PLAN_ONLY=1; shift ;;
-  --device|--output-root|--cann-root|--kvaf-include|--soc|--python)
+  --suite|--fine-grain|--device|--output-root|--cann-root|--kvaf-include|--soc|--python)
    (($#>=2)) && [[ -n $2 ]] || die "Missing value: $1"
    case "$1" in
+    --suite) LI_HISTORY_SUITE=$2 ;; --fine-grain) LI_HISTORY_FINE_GRAIN=$2 ;;
     --device) LI_HISTORY_DEVICE=$2 ;; --output-root) LI_HISTORY_OUTPUT_ROOT=$2 ;;
     --cann-root) LI_HISTORY_CANN=$2 ;; --kvaf-include) LI_HISTORY_KVAF=$2 ;;
     --soc) LI_HISTORY_SOC=$2 ;; --python) LI_HISTORY_PYTHON=$2 ;;
@@ -81,13 +86,27 @@ while (($#)); do
   *) die "Unknown option: $1" ;;
  esac
 done
+[[ $LI_HISTORY_SUITE == history7 || $LI_HISTORY_SUITE == batch16_cores ]] || die 'Unknown suite'
+[[ $LI_HISTORY_FINE_GRAIN == 128 || $LI_HISTORY_FINE_GRAIN == 512 ]] || die 'Fine grain must be128 or512'
+LI_HISTORY_PROFILE_ARGS=(--suite "$LI_HISTORY_SUITE")
+if [[ $LI_HISTORY_SUITE == batch16_cores ]]; then
+ LI_HISTORY_BACKEND=experiments/li_qk/b16_cores.py
+ LI_HISTORY_CHECKS=experiments/li_qk/test_b16_cores.py
+ LI_HISTORY_CASE_ARGS=(--history 131072 --aics 32 --aivs 64 --fine-grain "$LI_HISTORY_FINE_GRAIN")
+ LI_HISTORY_PROFILE_ARGS+=(--fine-grain "$LI_HISTORY_FINE_GRAIN")
+else
+ [[ $LI_HISTORY_FINE_GRAIN == 128 ]] || die '--fine-grain applies to batch16_cores only'
+ LI_HISTORY_BACKEND=experiments/li_qk/run.py
+ LI_HISTORY_CHECKS=experiments/li_qk/test_history.py
+ LI_HISTORY_CASE_ARGS=(--suite history7 --history 131072 --aics 32 --aivs 64)
+fi
 trap 'report_error "$?" "$LINENO"' ERR
 trap finish EXIT
 command -v "$LI_HISTORY_PYTHON" >/dev/null || die "Command unavailable: $LI_HISTORY_PYTHON"
 cd "$LI_HISTORY_ROOT"
 if ((LI_HISTORY_PLAN_ONLY)); then
  LI_HISTORY_COMPLETED=1
- exec "$LI_HISTORY_PYTHON" experiments/li_qk/run.py plan --suite history7 --history 131072 --aics 32 --aivs 64 --details
+ exec "$LI_HISTORY_PYTHON" "$LI_HISTORY_BACKEND" plan "${LI_HISTORY_CASE_ARGS[@]}" --details
 fi
 printf '[%s] Checking physical A5 environment\n' "$(date +%H:%M:%S)"
 [[ $LI_HISTORY_DEVICE =~ ^[0-9]+$ && ${#LI_HISTORY_DEVICE} -le 3 ]] || die 'Invalid device'
@@ -112,25 +131,30 @@ if [[ -z $LI_HISTORY_KVAF ]]; then
 fi
 [[ -f $LI_HISTORY_KVAF/kvaf_batch_get_device.h && -f $LI_HISTORY_KVAF/batch_get_abi.h ]] || die 'Set --kvaf-include to compatible KVAF device headers'
 mkdir -p "$LI_HISTORY_OUTPUT_ROOT"
-LI_HISTORY_OUT=$(mktemp -d "$LI_HISTORY_OUTPUT_ROOT/li_history7_$(date +%Y%m%d_%H%M%S)_XXXXXX")
+LI_HISTORY_OUT=$(mktemp -d "$LI_HISTORY_OUTPUT_ROOT/li_${LI_HISTORY_SUITE}_$(date +%Y%m%d_%H%M%S)_XXXXXX")
 printf 'Results directory: %s\n' "$LI_HISTORY_OUT"
 LI_HISTORY_STAGE=source_and_device
 git rev-parse HEAD > "$LI_HISTORY_OUT/source-commit.txt"
 git status --porcelain > "$LI_HISTORY_OUT/source-status.txt"
+printf 'suite=%s\nfine_grain=%s\ndevice=%s\n' "$LI_HISTORY_SUITE" "$LI_HISTORY_FINE_GRAIN" "$LI_HISTORY_DEVICE" > "$LI_HISTORY_OUT/launcher-config.txt"
 LI_HISTORY_LOG=$LI_HISTORY_OUT/npu-smi.log
 npu-smi info > "$LI_HISTORY_OUT/npu-smi.log"
 LI_HISTORY_STAGE=plan
 LI_HISTORY_LOG=$LI_HISTORY_OUT/plan.json
-"$LI_HISTORY_PYTHON" experiments/li_qk/run.py plan --suite history7 --details > "$LI_HISTORY_OUT/plan.json"
-run_logged cpu_checks "$LI_HISTORY_OUT/checks.log" "$LI_HISTORY_PYTHON" experiments/li_qk/test_history.py
+"$LI_HISTORY_PYTHON" "$LI_HISTORY_BACKEND" plan "${LI_HISTORY_CASE_ARGS[@]}" --details > "$LI_HISTORY_OUT/plan.json"
+run_logged cpu_checks "$LI_HISTORY_OUT/checks.log" "$LI_HISTORY_PYTHON" "$LI_HISTORY_CHECKS"
 run_logged build "$LI_HISTORY_OUT/build-console.log" "$LI_HISTORY_PYTHON" experiments/li_qk/run.py build --run-mode npu --cann-root "$LI_HISTORY_CANN" --kvaf-include "$LI_HISTORY_KVAF" --soc "$LI_HISTORY_SOC" --output "$LI_HISTORY_OUT/build"
-run_logged benchmark "$LI_HISTORY_OUT/bench.log" "$LI_HISTORY_PYTHON" -u experiments/li_qk/run.py run --suite history7 --history 131072 --aics 32 --aivs 64 --device "$LI_HISTORY_DEVICE" --warmup 4 --iterations 20 --rounds 3 --build "$LI_HISTORY_OUT/build" --output "$LI_HISTORY_OUT/results"
+run_logged benchmark "$LI_HISTORY_OUT/bench.log" "$LI_HISTORY_PYTHON" -u "$LI_HISTORY_BACKEND" run "${LI_HISTORY_CASE_ARGS[@]}" --device "$LI_HISTORY_DEVICE" --warmup 4 --iterations 20 --rounds 3 --build "$LI_HISTORY_OUT/build" --output "$LI_HISTORY_OUT/results"
 if ((LI_HISTORY_PROFILE)); then
- run_logged profile "$LI_HISTORY_OUT/profile.log" "$LI_HISTORY_PYTHON" -u experiments/li_qk/profile.py run --suite history7 --history 131072 --device "$LI_HISTORY_DEVICE" --build "$LI_HISTORY_OUT/build" --output "$LI_HISTORY_OUT/msprof"
+ run_logged profile "$LI_HISTORY_OUT/profile.log" "$LI_HISTORY_PYTHON" -u experiments/li_qk/profile.py run "${LI_HISTORY_PROFILE_ARGS[@]}" --history 131072 --device "$LI_HISTORY_DEVICE" --build "$LI_HISTORY_OUT/build" --output "$LI_HISTORY_OUT/msprof"
 fi
 LI_HISTORY_STAGE=summary
 LI_HISTORY_LOG=
 cat "$LI_HISTORY_OUT/results/summary.csv"
 LI_HISTORY_COMPLETED=1
 LI_HISTORY_STAGE=complete
-printf 'SUCCESS: seven history points completed; measured rounds=3, r0 discarded\n'
+if [[ $LI_HISTORY_SUITE == history7 ]]; then
+ printf 'SUCCESS: seven history points completed; measured rounds=3, r0 discarded\n'
+else
+ printf 'SUCCESS: eight B16/core strategies completed; measured rounds=3, r0 discarded\n'
+fi

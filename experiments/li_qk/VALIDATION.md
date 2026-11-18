@@ -65,3 +65,12 @@
 - score/尾部源码快照排除生成目录，并记录`excluded_generated_paths`。新增真实Git/source-copy回归复现同样断链，确认生成目录跳过、所需源码与本地修改保留，必要源码断链仍会报错。history CPU检查现为五项，全部通过。
 - 启动脚本实时tee各阶段日志，保留失败退出码和阶段；只在汇总完成后打印成功。四项本地编排检查通过：正常结束、build退出23、后端返回0但缺少summary、vendor环境脚本提前exit0。没有实际NPU计时。
 - 新证据在`tests/results/li-tail-20261117/history7-failure-logging-*/receipt.json`；计算kernel和七点几何未修改。
+
+## B16 30/32核的八组调度对比（2026-11-18）
+
+- 正式仓库入口`run_b16_a5.sh`：30/32 AIC（60/64 AIV）各测两半waves、balanced G2048、balanced G128、balanced_owner G128。允许将细粒度量子替换为512；Final始终64 AIV。
+- 新五项CPU检查通过：C++/Python两个history与两个细粒度计划一致且唯一覆盖；八组真实host在ACL stub下的打包/score/scatter/Final/guard/oracle；同轮三类基准配对及错误Final预算/不完整r0拒绝；仓库/profile完整计划；真实本地Git与模拟NPU/backend编排，覆盖无联网、参数转交、独立profile、构建退出23传播与停止。CPU stub时间为null，合成汇总值只用于测试。
+- 原七项score控制与五项history控制回归全部通过，Bash语法与`git diff --check`通过。新证据`tests/results/li-tail-20261117/b16-cores-cpu-checks.log`和`b16-cores-plan.json`。
+- H128K静态计划：C30 G128累计工作量69888–70016 key/核；balanced_owner有效片段60→44，但scatter仍两次。C32四组任务映射相同、每核65536 key；均衡wrapper额外控制可能抵消收益。
+- CANN9.1.0/Ascend950PR_9599 fresh NPU构建通过，receipt位于`tests/results/li-tail-20261117/b16-cores-npu-build/build-manifest.json`。当前host.cpp、plan.h、score.cpp、post.cpp SHA与构建记录一致；随后增加的Python编排测试和文档不改变编译计算源码。
+- 新owner边界方案没有新增Model运行或A5性能结果；60→44仅为静态片段数量，不是实测动态指令降幅。脚本测量数字LI（score＋必要scatter＋相同Final），不含resident/Cold、Service、Fetch/Index或并发流水。完整策略与服务器执行方法见`B16_CORES_REPORT.md`。

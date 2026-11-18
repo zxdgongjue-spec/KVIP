@@ -72,15 +72,15 @@ def make_fixture(output,batch,history,heads):
 
 
 def geometry(t,qp,history=131072,aics=32,aivs=64,batch=1,schedule="waves",work_grain=2048,score_only=False):
-    minimum=256 if score_only and schedule=='balanced' else 2048
+    minimum=256 if score_only and schedule in ('balanced','balanced_owner') else 2048
     if t not in (1,2,4,8,16,32,30) or qp not in (1,2,4) or history<minimum or history>210944 or history%256:
         raise ValueError('T=1/2/4/8/16/32/30, Qparts=1/2/4, aligned history 2048..210944 required')
-    if not 1<=aics<=32 or not 2<=aivs<=64 or (schedule!='balanced' and history//256<t):
+    if not 1<=aics<=32 or not 2<=aivs<=64 or (schedule=='waves' and history//256<t):
         raise ValueError('valid AIC/AIV budget and nonempty shards required')
-    if batch not in (1,16) or schedule not in ('waves','balanced') or (batch==16 and (t>2 or qp!=1)):
+    if batch not in (1,16) or schedule not in ('waves','balanced','balanced_owner') or (batch==16 and (t>2 or qp!=1)):
         raise ValueError('B1 axes or B16 T1/T2 Q4 required')
     group=4//qp;physical=max(2,group);capacity=min(aics,aivs//2)
-    if schedule!='balanced' and work_grain!=2048:raise ValueError('work grain applies to balanced score only')
+    if schedule=='waves' and work_grain!=2048:raise ValueError('work grain applies to balanced score only')
     quantum=128 if t==30 else 256
     tasks=[dict(query_begin=q,query_count=group,begin=history//quantum*s//t*quantum,end=history//quantum*(s+1)//t*quantum)
            for b in range(batch) for q in range(0,4,group) for s in range(t)]
@@ -88,16 +88,17 @@ def geometry(t,qp,history=131072,aics=32,aivs=64,batch=1,schedule="waves",work_g
         for i,task in enumerate(tasks):task["owner"]=i//(qp*t)
     logical_tasks=len(tasks)
     core_blocks=[]
-    if schedule=="balanced":
-        if ((batch,t,qp,capacity)!=(16,2,1,30) or not 128<=work_grain<=65536 or
+    if schedule in ('balanced','balanced_owner'):
+        if ((batch,t,qp)!=(16,2,1) or capacity not in (30,32) or not 128<=work_grain<=65536 or
                 work_grain&(work_grain-1) or history%(2*work_grain)):
-            raise ValueError("balanced requires B16/T2/Q4,30 groups,power-of-two grain128..65536,H multiple of2*grain")
-        total=batch*history//work_grain;half=history//(2*work_grain);cores=[]
+            raise ValueError("balanced requires B16/T2/Q4,30 or32 groups,power-of-two grain128..65536,H multiple of2*grain")
+        domains=1 if schedule=='balanced_owner' else 2
+        total=batch*history//work_grain;domain=history//(domains*work_grain);cores=[]
         for c in range(capacity):
             lo=total*c//capacity;hi=total*(c+1)//capacity;core_blocks.append(hi-lo);pieces=[]
             while lo<hi:
-                logical=lo//half;end=min(hi,(logical+1)*half);begin=(logical%2*half+lo%half)*work_grain
-                pieces.append(dict(query_begin=0,query_count=4,begin=begin,end=begin+(end-lo)*work_grain,owner=logical//2));lo=end
+                logical=lo//domain;end=min(hi,(logical+1)*domain);begin=(logical%domains*domain+lo%domain)*work_grain
+                pieces.append(dict(query_begin=0,query_count=4,begin=begin,end=begin+(end-lo)*work_grain,owner=logical//domains));lo=end
             cores.append(pieces)
         tasks=[cores[c][slot] if slot<len(cores[c]) else dict(query_begin=0,query_count=0,begin=0,end=0,owner=0)
                for slot in range(max(map(len,cores))) for c in range(capacity)]
@@ -105,7 +106,7 @@ def geometry(t,qp,history=131072,aics=32,aivs=64,batch=1,schedule="waves",work_g
     waves=[tasks[i:i+capacity] for i in range(0,len(tasks),capacity)]
     logical=batch*4*32*history*128
     return dict(batch=batch,schedule=schedule,work_grain=work_grain,logical_tasks=logical_tasks,active_segments=sum(x>0 for x in lengths),core_blocks=core_blocks,history_parts=t,query_parts=qp,logical_query_group=group,physical_query_tile=physical,
-                tasks=len(tasks),capacity=capacity,score_waves=1 if schedule=="balanced" else len(waves),score_slots=len(waves),score_launches=1 if schedule=="balanced" else len(waves),row_stride=max(lengths),
+                tasks=len(tasks),capacity=capacity,score_waves=1 if schedule!='waves' else len(waves),score_slots=len(waves),score_launches=1 if schedule!='waves' else len(waves),row_stride=max(lengths),
                 key_tokens_per_task=sorted(set(lengths)),task_map=tasks,
                 useful_aivs_peak=max(len(w) for w in waves)*(1 if group==1 else 2),
                 allocated_aiv_groups_peak=2*max(len(w) for w in waves),
@@ -114,9 +115,9 @@ def geometry(t,qp,history=131072,aics=32,aivs=64,batch=1,schedule="waves",work_g
                 score_output_bytes=batch*4*history*2,
                 scratch_score_bytes=len(tasks)*physical*max(lengths)*2,
                 canonical_alias=t==1 and physical==group and len(waves)==1,
-                history_partition_quantum=work_grain if schedule=='balanced' else quantum,
-                score_peak_aics=capacity if schedule=='balanced' else min(capacity,len(tasks)),
-                score_peak_aivs=2*(capacity if schedule=='balanced' else min(capacity,len(tasks))),
+                history_partition_quantum=work_grain if schedule!='waves' else quantum,
+                score_peak_aics=capacity if schedule!='waves' else min(capacity,len(tasks)),
+                score_peak_aivs=2*(capacity if schedule!='waves' else min(capacity,len(tasks))),
                 final_topk_aivs=batch*4,k=2048,fetch_launches=0)
 
 

@@ -17,18 +17,23 @@ def main():
     p.add_argument('action',choices=('plan','run'))
     p.add_argument('--build',type=Path,required=True);p.add_argument('--output',type=Path,required=True)
     p.add_argument('--device',type=int,default=5)
-    p.add_argument('--suite',choices=('orthogonal7','orthogonal8','history7','batch16'),default='batch16')
+    p.add_argument('--suite',choices=('orthogonal7','orthogonal8','history7','batch16','batch16_cores'),default='batch16')
     p.add_argument('--history',type=int,default=131072)
     p.add_argument('--metrics',choices=('PipeUtilization','Memory','ResourceConflictRatio'),default='PipeUtilization')
     p.add_argument('--timeout',type=int,default=900)
     p.add_argument('--work-grain',type=int,default=2048)
+    p.add_argument('--fine-grain',type=int,choices=(128,512),default=128)
     a=p.parse_args();a.build=a.build.resolve();a.output=a.output.resolve()
-    configs=suite_cases(a.suite) if a.suite in ('batch16','history7') else [dict(batch=1,history_parts=16 if a.suite=='orthogonal7' else 32,query_parts=1,schedule='waves')]
+    if a.suite=='batch16_cores':
+        from b16_cores import configs as core_configs
+        configs=core_configs(a.fine_grain,a.history)
+    else:configs=suite_cases(a.suite) if a.suite in ('batch16','history7') else [dict(batch=1,history_parts=16 if a.suite=='orthogonal7' else 32,query_parts=1,schedule='waves')]
     cases=[]
     for c in configs:
-        c=dict(c);b=c['batch'];c.update(aics=30 if b==16 else 32,aivs=60 if b==16 else 64)
-        c['name']=f"B{b}_T{c['history_parts']}_{c['schedule']}"
-        c['geometry']=geometry(c['history_parts'],1,a.history,c['aics'],c['aivs'],b,c['schedule'],a.work_grain if c['schedule']=='balanced' else 2048);cases.append(c)
+        c=dict(c);b=c['batch'];c.setdefault('aics',30 if b==16 else 32);c.setdefault('aivs',60 if b==16 else 64)
+        c.setdefault('name',f"B{b}_T{c['history_parts']}_{c['schedule']}")
+        grain=c.get('work_grain',a.work_grain if c['schedule']!='waves' else 2048)
+        c['geometry']=geometry(c['history_parts'],1,a.history,c['aics'],c['aivs'],b,c['schedule'],grain);cases.append(c)
     if a.action=='plan':print(json.dumps(cases,indent=2));return
     if any(x in os.environ.get('LD_PRELOAD','') for x in ('camodel','cmodel')):p.error('physical A5 profile rejects Model preload')
     profiler=shutil.which('msprof')
@@ -73,7 +78,7 @@ def main():
                 raise RuntimeError('profile oracle rejected')
             traces=list((folder/'trace').rglob('*.json'))+list((folder/'trace').rglob('*.csv'))
             if not traces:raise RuntimeError('msprof returned without exported trace; inspect '+str(folder/'trace'))
-            expected_names=['li_qk_topk','li_qk_score_balanced' if c['schedule']=='balanced' else 'li_qk_score']
+            expected_names=['li_qk_topk','li_qk_score_balanced' if c['schedule']!='waves' else 'li_qk_score']
             if not c['geometry']['canonical_alias']:expected_names.append('li_qk_scatter')
             found=set()
             for trace in traces:

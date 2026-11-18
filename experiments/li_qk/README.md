@@ -214,6 +214,21 @@ H131072无法整数均分30核，T30按原生H128 tile均衡，片长只差一�
 
 源码快照排除`build`、`build_out`、`_custom_opp`、`CMakeFiles`和`__pycache__`目录，并记录实际排除路径。这样不会复制其它算子旧构建目录里的断链`liboptiling.so`；现有构建目录不被删除，实际源码和本地修改保持。
 
+## B16/Q4：30/32 核的八组调度对比
+
+正式仓库入口 [run_b16_a5.sh](run_b16_a5.sh) 固定 B16/Q4/H131072/G32/D128/K2048：
+
+```bash
+bash experiments/li_qk/run_b16_a5.sh --plan-only
+bash experiments/li_qk/run_b16_a5.sh --profile
+# 另测512-key分配量子
+bash experiments/li_qk/run_b16_a5.sh --fine-grain 512 --profile
+```
+
+30/32 AIC核组各比较 `waves` 两半切分、`balanced` 量子2048、`balanced` 量子128、`balanced_owner` 量子128。Final固定64 AIV，隔离数字LI；不含resident/Cold、Service、Fetch和Index。默认30核均衡预算69888–70016 key/核；只在owner边界切段由60段降至44段，仍有两次scatter。32核普通两半切分已经一波完成，新调度收益以真机实测为准。
+
+输出 `/home/w00568585/li_batch16_cores_*/results/summary.csv`，分别提供对32核waves、相同核预算waves和匹配策略32核的同轮比值。实际策略、限制、宿主机checkout/容器执行和trace说明见 [B16_CORES_REPORT.md](B16_CORES_REPORT.md)。不使用下载包或生成的共享入口，容器无需联网。
+
 ## Score后的持续分核控制
 
 需求见 [TAIL_PROMPT.md](TAIL_PROMPT.md)，源码/阶段规模/论文依据/实测见 [TAIL_REPORT.md](TAIL_REPORT.md)。新入口读取相同的最终sortable score，不运行QK、Fetch、Service或Index：C0单owner GM Cold＋库上Final primitive，C1只分Cold，C2只分Final，C3两者都分；默认resident仍调用原TopK/θ/Hot primitive。C0是隔离后处理控制，不是SDK或生产P2整链。
