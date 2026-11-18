@@ -734,6 +734,31 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
  }
 }
 #endif
+#if KVIP_AUTO_ROUTE
+__aicore__ inline void CommitRouteFeedback(__gm__ Context* ctx,uint32_t b,uint32_t necessary,
+                                            uint32_t usefulPrefetch,uint64_t error) {
+ if(ctx->autoRoute){
+  auto config=reinterpret_cast<__gm__ kvip_auto_route::Config*>(ctx->autoRoute);
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(config),128);
+  if(kvip_auto_route::Valid(config)){
+   auto pending=reinterpret_cast<__gm__ kvip_auto_route::Pending*>(config->pending)+b;
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(pending),128);
+   pending->usefulPrefetch=usefulPrefetch;
+   pending->necessary=uint64_t(necessary)+pending->usefulPrefetch;
+   if(pending->owner<config->owners){
+    auto record=reinterpret_cast<__gm__ uint8_t*>(config->feedback)+pending->owner*128;
+    kvaf_device::CleanCacheLines(record,128);
+    if(kvip_auto_route::Commit(config,b,error))kvaf_device::CleanCacheLines(record,128);
+   }
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(pending),128);
+  }
+ }
+}
+#endif
+
+#if KVIP_LOW_MISS_POST_INDEX && !V9_UBMEM
+#include "joined_row_commit.h"
+#endif
 template <bool ReadThrough = false, bool PostIndex = false, bool JoinedRow = false>
 __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b,uint32_t usefulPrefetch,
  uint32_t total=0,uint32_t completed=0,uint32_t rowJoinError=0){
@@ -743,6 +768,28 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b,uint32_t usef
  auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;uint64_t error=rowJoinError;
  bool profile=(a->prefetchCount & 0x80000000U)!=0;
  auto ft=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*128+uint64_t(b)*128+96;
+#if KVIP_LOW_MISS_POST_INDEX && !V9_UBMEM
+ if constexpr(JoinedRow) {
+  if(profile)ft[0]=GetSystemCycle();
+  auto info=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(info),kRowStatusWords*4);
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->finalPending),sizeof(row->finalPending));
+  const uint32_t necessary=info[1], prefetched=row->slots;
+  error|=row->error;
+  if(info[0] || row->pending || total!=necessary || completed!=total || prefetched>kPrefetch ||
+     kPrefetch+uint64_t(total)>a->maxEvents) error|=kvaf_device::kInvalidArgs;
+  if(profile)ft[1]=GetSystemCycle();
+  Simt::VF_CALL<CommitJoinedRow>(Simt::Dim3{256,1,1},a,ctx,b,shape.resident,shape.finalPostOffset,
+      prefetched,total,completed,uint32_t(rowJoinError),uint32_t(error));
+  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+  if(profile)ft[2]=GetSystemCycle();
+#if KVIP_AUTO_ROUTE
+  CommitRouteFeedback(ctx,b,necessary,usefulPrefetch,error);
+#endif
+  if(profile){ft[3]=GetSystemCycle();kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ft),32*8);}
+  return;
+ }
+#endif
  if constexpr (ReadThrough) {
   if(profile)for(uint32_t i=0;i<32;++i)ft[i]=0;
  }
@@ -851,22 +898,7 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b,uint32_t usef
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  }
 #if KVIP_AUTO_ROUTE
- if(ctx->autoRoute){
-  auto config=reinterpret_cast<__gm__ kvip_auto_route::Config*>(ctx->autoRoute);
-  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(config),128);
-  if(kvip_auto_route::Valid(config)){
-   auto pending=reinterpret_cast<__gm__ kvip_auto_route::Pending*>(config->pending)+b;
-   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(pending),128);
-   pending->usefulPrefetch=usefulPrefetch;
-   pending->necessary=uint64_t(info[1])+pending->usefulPrefetch;
-   if(pending->owner<config->owners){
-    auto record=reinterpret_cast<__gm__ uint8_t*>(config->feedback)+pending->owner*128;
-    kvaf_device::CleanCacheLines(record,128);
-    if(kvip_auto_route::Commit(config,b,error|updateError))kvaf_device::CleanCacheLines(record,128);
-   }
-   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(pending),128);
-  }
- }
+ CommitRouteFeedback(ctx,b,info[1],usefulPrefetch,error|updateError);
 #endif
  if(profile){ft[3]=GetSystemCycle();kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ft),32*8);}
 }
