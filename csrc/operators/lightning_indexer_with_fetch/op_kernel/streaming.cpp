@@ -59,6 +59,18 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void MergeQueryBitmaps(__ubuf__ 
  }
  asc_syncthreads();
 }
+#if KVIP_LOW_MISS_POST_INDEX && !V9_UBMEM
+// LOW has four finished bitmaps and no speculative transfers. Seed the
+// existing control record during their merge; no output-worker mask is needed.
+__simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void MergeLowQ4Protection(
+    __ubuf__ uint32_t* ctl, __ubuf__ uint32_t* other, uint32_t words) {
+    const uint32_t lane = threadIdx.x;
+    if (lane < 10) ctl[lane] = lane == 7 ? kSlots : 0;
+    for (uint32_t i = lane; i < words; i += 512)
+        ctl[1024 + i] |= other[i] | other[words + i] | other[2 * words + i];
+    asc_syncthreads();
+}
+#endif
 __simt_vf__ __aicore__ LAUNCH_BOUND(32) inline void PublishStreamingUpdateStatus(__gm__ uint32_t* status,uint32_t b,uint32_t error) {
  if(!threadIdx.x)asc_stcg(status+b,error);
  asc_threadfence();
@@ -192,6 +204,17 @@ __aicore__ inline uint32_t Producer(__gm__ Args* a, uint32_t b) {
  for(uint32_t q=1;q<4;++q)DataCopy(keys[(q-1)*words],input[q*words],words);
  input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots);DataCopy(work[4096],input,kLruSlots);
  SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+#if KVIP_LOW_MISS_POST_INDEX && !V9_UBMEM
+ if constexpr (PostIndex) {
+  Simt::VF_CALL<MergeLowQ4Protection>(Simt::Dim3{512,1,1},FinalPtr(ctl),FinalPtr(keys),words);
+  // The other bitmaps alias the hash banks and are now dead. Clear both
+  // contiguous banks on the vector pipe. Their 8192 buckets can hold every
+  // Q4 position, even when a predicted LOW round has no hits.
+  PipeBarrier<PIPE_V>();
+  Duplicate(keys,UINT32_MAX,2*kSlots);
+ } else
+#endif
+ {
  Simt::VF_CALL<MergeQueryBitmaps>(Simt::Dim3{512,1,1},FinalPtr(ctl[1024]),FinalPtr(keys),words
   ,unpack,outputValid,shape.batch,b,FinalPtr(ctl[kOutputMasksOffset]),outputEnabled && !KVIP_OUTPUT_WORKER
  );
@@ -219,6 +242,7 @@ __aicore__ inline uint32_t Producer(__gm__ Args* a, uint32_t b) {
 #endif
  );
 #endif
+ }
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  if(profile)ticks[3]=GetSystemCycle();
  GlobalTensor<uint32_t> output;output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*kSlots);

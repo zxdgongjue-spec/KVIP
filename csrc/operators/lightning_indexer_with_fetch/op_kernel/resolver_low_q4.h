@@ -98,10 +98,11 @@ inline void ResolveLowQ4(
             }
         }
         asc_syncthreads();
-        for (uint32_t i = tid; i < allocated; i += kCompactThreads)
-            asc_atomic_or(bitmap + slots[i] / 32, 1U << (slots[i] % 32));
-        asc_syncthreads();
         if (allocated < neededSlots) {
+            // Only the fallback allocator consumes this augmented bitmap.
+            for (uint32_t i = tid; i < allocated; i += kCompactThreads)
+                asc_atomic_or(bitmap + slots[i] / 32, 1U << (slots[i] % 32));
+            asc_syncthreads();
             // Keep the original fallback order, including protection for late
             // query hits. LRU scratch is dead after this point.
             for (uint32_t i = tid; i < kSlots; i += kCompactThreads)
