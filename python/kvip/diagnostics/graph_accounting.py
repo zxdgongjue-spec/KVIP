@@ -10,6 +10,7 @@ from decimal import Decimal
 from pathlib import Path
 from statistics import mean, median
 
+from kvip.diagnostics.graph_queue_probe import FENCED, PROTOCOL
 from kvip.diagnostics.post_index_order_report import _low_traffic, _validate
 from kvip.diagnostics.read_through_report import load_case, require
 
@@ -84,6 +85,56 @@ def timeline(events, elapsed):
     return values, {name: float(duration) for name, duration in kernel_us.items()}
 
 
+def queue_stats(probe, expected_get):
+    if probe["status"] == "unavailable":
+        return {}
+    rows = probe["samples"]
+    require(
+        [r["fenced"] for r in rows] == list(FENCED)
+        and all(
+            r["final_get"] == expected_get and math.isfinite(r["elapsed_us"]) and r["elapsed_us"] > 0 for r in rows
+        ),
+        "Incomplete queue control",
+    )
+    protocol = probe.get("protocol", "natural")
+    require(protocol in ("natural", PROTOCOL), f"Unknown queue probe protocol {protocol}")
+
+    def difference(field):
+        return mean(r[field] for r in rows if r["fenced"]) - mean(r[field] for r in rows if not r["fenced"])
+
+    result = dict(
+        queue_protocol=protocol,
+        queue_pending=sum(r["begin_pending_after_submit"] for r in rows if not r["fenced"]),
+        idle_started=sum(not r["begin_pending_after_submit"] for r in rows if r["fenced"]),
+    )
+    if protocol == PROTOCOL:
+        for row in rows:
+            blank = row["empty"]
+            require(
+                all(
+                    math.isfinite(v) and v >= 0
+                    for v in (blank["elapsed_us"], row["host_call_us"], blank["host_call_us"])
+                ),
+                "Invalid empty/host timing",
+            )
+        result["empty_pending"] = sum(r["empty"]["begin_pending_after_submit"] for r in rows if not r["fenced"])
+        result["empty_started"] = sum(not r["empty"]["begin_pending_after_submit"] for r in rows if r["fenced"])
+        if min(result["empty_pending"], result["empty_started"]) != 2:
+            return result
+    if min(result["queue_pending"], result["idle_started"]) != 2:
+        return result
+    result["queue_fenced"] = mean(r["elapsed_us"] for r in rows if r["fenced"])
+    result["queue_ahead"] = mean(r["elapsed_us"] for r in rows if not r["fenced"])
+    result["queue_sensitivity"] = difference("elapsed_us")
+    if protocol == PROTOCOL:
+        result["empty_sensitivity"] = mean(r["empty"]["elapsed_us"] for r in rows if r["fenced"]) - mean(
+            r["empty"]["elapsed_us"] for r in rows if not r["fenced"]
+        )
+        result["sensitivity_after_empty"] = result["queue_sensitivity"] - result["empty_sensitivity"]
+        result["queued_host_call"] = mean(r["host_call_us"] for r in rows if not r["fenced"])
+    return result
+
+
 def sample(path, role):
     case = load_case(str(path), role)
     if role != "serial":
@@ -132,25 +183,7 @@ def sample(path, role):
     values["li"] = li[0]
     values["init"] = sum(us for k, us in kernels.items() if "v9_init_kernel" in k)
     values["other_kernels"] = sum(kernels.values()) - values["li"] - values["init"]
-    probe = case["queue_probe"]
-    if probe["status"] != "unavailable":
-        samples = probe["samples"]
-        require(
-            [r["fenced"] for r in samples] == [True, False, False, True]
-            and all(
-                r["final_get"] == case["reads_samples"][-1]["final"]
-                and math.isfinite(r["elapsed_us"])
-                and r["elapsed_us"] > 0
-                for r in samples
-            ),
-            f"{role}: incomplete queue control",
-        )
-        values["queue_fenced"] = mean(r["elapsed_us"] for r in samples if r["fenced"])
-        values["queue_pending"] = sum(r["begin_pending_after_submit"] for r in samples if not r["fenced"])
-        values["idle_started"] = sum(not r["begin_pending_after_submit"] for r in samples if r["fenced"])
-        if values["queue_pending"] == values["idle_started"] == 2:
-            values["queue_ahead"] = mean(r["elapsed_us"] for r in samples if not r["fenced"])
-            values["queue_sensitivity"] = values["queue_fenced"] - values["queue_ahead"]
+    values.update(queue_stats(case["queue_probe"], case["reads_samples"][-1]["final"]))
     return case, values, kernels
 
 
@@ -205,14 +238,24 @@ def summarize(directory):
         print(f"KERNEL_MEAN {role} " + " ".join(f"{n}={mean(k[n] for _, _, k in measurements):.3f}" for n in names))
         pending = sum(v.get("queue_pending", 0) for _, v, _ in measurements)
         started = sum(v.get("idle_started", 0) for _, v, _ in measurements)
-        observed = f"idle_begin_reached={started}/{len(rounds) * 2} queued_begin_pending={pending}/{len(rounds) * 2}"
+        forced = all(v.get("queue_protocol") == PROTOCOL for _, v, _ in measurements)
+        arm = "forced_start" if forced else "idle"
+        observed = f"{arm}_reached={started}/{len(rounds) * 2} queued_begin_pending={pending}/{len(rounds) * 2}"
+        if forced:
+            ep = sum(v["empty_pending"] for _, v, _ in measurements)
+            es = sum(v["empty_started"] for _, v, _ in measurements)
+            observed += f" empty_start/queued={es}/{ep} of {len(rounds) * 2}"
         if all("queue_ahead" in v for _, v, _ in measurements):
-            print(
-                f"QUEUE {role} idle/queued_mean_us={mean(v['queue_fenced'] for _, v, _ in measurements):.3f}/"
-                f"{mean(v['queue_ahead'] for _, v, _ in measurements):.3f} "
-                f"idle_minus_queued_us={mean(v['queue_sensitivity'] for _, v, _ in measurements):+.3f} "
-                f"{observed}"
+            output = (
+                f"QUEUE {role} {arm}/queued_mean_us={mean(v['queue_fenced'] for _, v, _ in measurements):.3f}/"
+                f"{mean(v['queue_ahead'] for _, v, _ in measurements):.3f}"
             )
+            if forced:
+                output += (
+                    f" empty_{arm}_minus_queued={mean(v['empty_sensitivity'] for _, v, _ in measurements):+.3f}"
+                    f" queued_host_call_us={mean(v['queued_host_call'] for _, v, _ in measurements):.3f}"
+                )
+            print(output + " " + observed)
         else:
             print(f"QUEUE {role} status=unresolved {observed}")
     for candidate, control in (("before", "serial"), ("after", "serial"), ("after", "before")):
@@ -247,10 +290,19 @@ def summarize(directory):
         )
         print(f"DELTA {candidate}-{control} mean_us " + " ".join(f"{k}={v:+.3f}" for k, v in signed.items()))
         if all("queue_sensitivity" in a and "queue_sensitivity" in b for a, b in pairs):
-            print(
-                f"QUEUE_DELTA {candidate}-{control} idle_gap={delta('queue_fenced'):+.3f} "
-                f"queued_gap={delta('queue_ahead'):+.3f} gap_change_idle_minus_queued={delta('queue_sensitivity'):+.3f}"
+            calibrated = all("sensitivity_after_empty" in a and "sensitivity_after_empty" in b for a, b in pairs)
+            arm = "forced_start" if calibrated else "idle"
+            raw = (
+                f"QUEUE_DELTA {candidate}-{control} {arm}_gap={delta('queue_fenced'):+.3f} "
+                f"queued_gap={delta('queue_ahead'):+.3f} gap_change={delta('queue_sensitivity'):+.3f}"
             )
+            if calibrated:
+                raw += (
+                    f" empty_gap_change={delta('empty_sensitivity'):+.3f}"
+                    f" net_sensitivity={delta('sensitivity_after_empty'):+.3f}"
+                    f" queued_host_call_delta={delta('queued_host_call'):+.3f} diagnostic_only=true"
+                )
+            print(raw)
         print(
             f"EDGE_DELTA {candidate}-{control} mean_us "
             + " ".join(
