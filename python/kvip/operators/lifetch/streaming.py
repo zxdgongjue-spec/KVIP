@@ -137,6 +137,18 @@ class StreamingLIFetchForward:
 
     def set_options(self, *, diagnostics=False, deferred_fetch=False):
         """Startup/profile-only update; forward never allocates or copies."""
+        if getattr(self, "high_post_index", False) and not hasattr(self, "_high_index_storage"):
+            capability = getattr(self.rotating.library, "kvip_high_post_index", None)
+            if self.post_index is None or capability is None or capability() != 1:
+                raise RuntimeError("Rebuild the URMA Post/Index bridge for eight-window Index profiling")
+            # At most two dirty physical positions per prefetched or final event.
+            # Two u32 positions plus the 148-byte tuple occupy 40 aligned u32 words.
+            self._high_index_storage = self.torch.empty(
+                (self.batch, 2 * (2048 + 8192), 40),
+                dtype=self.torch.int32, device=self.rotating.device,
+            )
+            ptr = np.asarray([self._high_index_storage.data_ptr()], dtype="<u8").view("u1")
+            self.workspace[152:160].copy_(self.torch.from_numpy(ptr.copy()))
         value = (
             self.prefetch_limit
             | ((self.q_workers or 0) << 16)
@@ -145,6 +157,7 @@ class StreamingLIFetchForward:
             | (0x08000000 if self.prepare_metadata else 0)
             | (0x04000000 if getattr(self, "ubmem_overlap_fetch", False) else 0)
             | (0x02000000 if getattr(self, "post_index_wait_first", False) else 0)
+            | (0x01000000 if getattr(self, "high_post_index", False) else 0)
             | (0x80000000 if diagnostics else 0)
             | (0x40000000 if deferred_fetch else 0)
         )

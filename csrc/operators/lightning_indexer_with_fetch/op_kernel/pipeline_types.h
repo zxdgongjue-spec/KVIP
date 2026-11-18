@@ -23,7 +23,7 @@ struct alignas(128) Args {
  uint32_t history, resident, prefetchCount, maxEvents;
  uint64_t queryBitmaps, queryErrors, updateBindings, denseShadow, packedFetch;
  // Optional invocation-local phase records, inside the existing 256-byte ABI.
- uint64_t postIndex;
+ uint64_t postIndex, highIndex;
 };
 static_assert(sizeof(Args)==256,"streaming Args ABI");
 }

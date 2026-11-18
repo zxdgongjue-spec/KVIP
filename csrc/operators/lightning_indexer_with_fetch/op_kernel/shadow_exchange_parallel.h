@@ -33,7 +33,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void InitShadow(__ubuf__ uin
 #endif
  if(threadIdx.x<128)m[CONTROL+threadIdx.x]=0;asc_syncthreads();
 }
-template<bool PrepareMetadata=false>
+template<bool PrepareMetadata=false, bool PermutationOnly=false>
 __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void ApplyBatch(__gm__ uint32_t* sources,__gm__ uint32_t* destinations,uint32_t begin,uint32_t count,__gm__ uint64_t* keys,__gm__ uint32_t* scales,__gm__ uint32_t* valid,uint32_t resident,__ubuf__ uint32_t* m,
  __gm__ uint64_t* addresses=nullptr,__gm__ uint64_t* logical=nullptr,
  __gm__ uint64_t* prepared=nullptr,uint32_t history=0){
@@ -50,6 +50,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void ApplyBatch(__gm__ uint3
 #endif
   if(out)ps[CHUNK+oi]=pd[tid];if(freed)pd[CHUNK+fi]=ps[tid];asc_syncthreads();uint32_t extras=ctl[32+15]&0xffffU;uint32_t moves=n+extras;
   // Each lane handles individual fields; snapshot all rows before any write.
+  if constexpr (!PermutationOnly) {
   for(uint32_t x=tid;x<moves*16;x+=THREADS){uint32_t i=x/16,j=i<n?i:CHUNK+i-n;data[x]=asc_ldcg(keys+uint64_t(ps[j])*16+x%16);}
 #if KVIP_FUSE_QUERY_WORK
   // Membership sets are dead after closure planning. Snapshot both fields
@@ -69,6 +70,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void ApplyBatch(__gm__ uint3
   for(uint32_t i=tid;i<moves;i+=THREADS){uint32_t j=i<n?i:CHUNK+i-n;asc_stcg(scales+pd[j],uint32_t(data[i]));}
 #endif
   asc_threadfence();asc_syncthreads();
+  }
   for(uint32_t i=tid;i<moves;i+=THREADS){uint32_t j=i<n?i:CHUNK+i-n,src=ps[j],dst=pd[j],row=get(m+KEYS_POS,m+VALUES_POS,src);data[i]=row;}asc_syncthreads();
   for(uint32_t i=tid;i<moves;i+=THREADS){uint32_t j=i<n?i:CHUNK+i-n,dst=pd[j],row=uint32_t(data[i]);if(!put(m+KEYS_POS,m+VALUES_POS,dst,row)||!put(m+KEYS_ROW,m+VALUES_ROW,row,dst))asc_atomic_or(ctl,4U);if constexpr(PrepareMetadata){
 #if KVIP_FUSE_QUERY_WORK
@@ -117,7 +119,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void InitDenseShadow(
  }
  asc_threadfence();asc_syncthreads();
 }
-template<bool PrepareMetadata=false>
+template<bool PrepareMetadata=false, bool PermutationOnly=false>
 __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void ApplyDenseBatch(
  __gm__ uint32_t* sources,__gm__ uint32_t* destinations,uint32_t begin,uint32_t count,
  __gm__ uint64_t* keys,__gm__ uint32_t* scales,__gm__ uint32_t* valid,uint32_t resident,
@@ -141,6 +143,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void ApplyDenseBatch(
 #endif
   if(out)ps[CHUNK+oi]=pd[tid];if(freed)pd[CHUNK+fi]=ps[tid];
   asc_syncthreads();uint32_t extras=ctl[32+15]&0xffffU,moves=n+extras;
+  if constexpr (!PermutationOnly) {
   for(uint32_t x=tid;x<moves*16;x+=THREADS){uint32_t i=x/16,j=i<n?i:CHUNK+i-n;data[x]=asc_ldcg(keys+uint64_t(ps[j])*16+x%16);}
 #if KVIP_FUSE_QUERY_WORK
   // Membership sets are dead after closure planning. Snapshot both fields
@@ -160,6 +163,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void ApplyDenseBatch(
   for(uint32_t i=tid;i<moves;i+=THREADS){uint32_t j=i<n?i:CHUNK+i-n;asc_stcg(scales+pd[j],uint32_t(data[i]));}
 #endif
   asc_threadfence();asc_syncthreads();
+  }
   for(uint32_t i=tid;i<moves;i+=THREADS){uint32_t j=i<n?i:CHUNK+i-n;data[i]=asc_ldcg(dense+ps[j]);}
   asc_syncthreads();
   for(uint32_t i=tid;i<moves;i+=THREADS){uint32_t j=i<n?i:CHUNK+i-n,dst=pd[j],row=uint32_t(data[i]);

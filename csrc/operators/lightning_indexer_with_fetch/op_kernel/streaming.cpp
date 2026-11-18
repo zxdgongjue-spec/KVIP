@@ -854,6 +854,9 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b,uint32_t usef
 
 #if KVIP_LOW_MISS_POST_INDEX && !V9_UBMEM
 #include "post_index_tail.h"
+#if KVIP_OUTPUT_WORKER && KVIP_FUSE_QUERY_WORK
+#include "high_post_index.h"
+#endif
 #endif
 #endif
 // CMake applies batch scheduling to the generated entry for Post/Index/CQ.
@@ -885,6 +888,13 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
     if(profile){trace[1]=GetSystemCycle();kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(trace),32*8);}
     return;
    }
+#if KVIP_OUTPUT_WORKER && KVIP_FUSE_QUERY_WORK
+   if (a->highIndex && (a->prefetchCount & 0x01000000U)) {
+    high_post_index::Run(a,block);
+    if(profile){trace[1]=GetSystemCycle();kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(trace),32*8);}
+    return;
+   }
+#endif
   }
 #endif
 #if KVIP_LOW_MISS_READ_THROUGH && !V9_UBMEM
