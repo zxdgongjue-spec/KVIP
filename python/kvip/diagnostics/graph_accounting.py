@@ -157,15 +157,17 @@ def sample(path, role):
 def summarize(directory):
     files = defaultdict(dict)
     for path in directory.glob("r*-*.json"):
-        match = re.fullmatch(r"r(\d+)-(serial|before|after)\.json", path.name)
+        match = re.fullmatch(r"r(\d+)-(serial|before|init-only|after)\.json", path.name)
         if match:
             number, role = int(match[1]), match[2]
             require(role not in files[number], f"Duplicate role {role} in round {number}")
             files[number][role] = path
     rounds = sorted(files)
     require(len(rounds) >= 2 and rounds == list(range(1, len(rounds) + 1)), "Need consecutive paired rounds from 1")
-    require(all(set(files[i]) == set(ROLES) for i in rounds), "An interleaved round is incomplete")
-    rows = {r: [sample(files[i][r], r) for i in rounds] for r in ROLES}
+    has_init_only = any("init-only" in files[i] for i in rounds)
+    roles = ("serial", "before", "init-only", "after") if has_init_only else ROLES
+    require(all(set(files[i]) == set(roles) for i in rounds), "An interleaved round is incomplete")
+    rows = {r: [sample(files[i][r], r) for i in rounds] for r in roles}
     base = rows["serial"][0][0]
     fused_ref = rows["before"][0][0]
     for role, measurements in rows.items():
@@ -203,7 +205,7 @@ def summarize(directory):
         print(f"KERNEL_MEAN {role} " + " ".join(f"{n}={mean(k[n] for _, _, k in measurements):.3f}" for n in names))
         pending = sum(v.get("queue_pending", 0) for _, v, _ in measurements)
         started = sum(v.get("idle_started", 0) for _, v, _ in measurements)
-        observed = f"idle_begin_reached={started}/{len(rounds)*2} queued_begin_pending={pending}/{len(rounds)*2}"
+        observed = f"idle_begin_reached={started}/{len(rounds) * 2} queued_begin_pending={pending}/{len(rounds) * 2}"
         if all("queue_ahead" in v for _, v, _ in measurements):
             print(
                 f"QUEUE {role} idle/queued_mean_us={mean(v['queue_fenced'] for _, v, _ in measurements):.3f}/"
@@ -260,6 +262,13 @@ def summarize(directory):
             f"PAIRED {candidate}-{control} round_steady_mean/p50_us="
             + ",".join(f"{a['headline'] - b['headline']:+.3f}/{a['p50'] - b['p50']:+.3f}" for a, b in pairs)
         )
+    if has_init_only:
+        for newer, older in (("init-only", "before"), ("after", "init-only")):
+            matched = [(a[1], b[1]) for a, b in zip(rows[newer], rows[older])]
+            fields = ("init", "li", "other_kernels", "kernel_span", "outside_kernel", "between_samples_unassigned")
+            effects = " ".join(f"{k}={mean(a[k] - b[k] for a, b in matched):+.3f}" for k in fields)
+            gaps = ",".join(f"{a['headline'] - b['headline']:+.3f}/{a['p50'] - b['p50']:+.3f}" for a, b in matched)
+            print(f"ABLATION {newer}-{older} mean_us {effects} round_steady_mean/p50_us={gaps}")
     print(
         "CHECK snapshot=identical correctness=pass learned_LOW=pass lifecycle=pass same_profile_event_and_kernels=true"
     )

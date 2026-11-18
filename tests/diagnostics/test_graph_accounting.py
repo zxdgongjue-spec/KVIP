@@ -55,11 +55,12 @@ def test_overlap_marks_exported_kernel_time_once_and_missing_markers_are_unresol
     }
 
 
-def test_paired_rounds_check_profile_identity_and_retained_work(tmp_path, capsys):
+@pytest.mark.parametrize("init_only", [False, True])
+def test_paired_rounds_check_profile_identity_and_retained_work(tmp_path, capsys, init_only):
     cases = inputs()
     for number in (1, 2):
-        for role in ("serial", "before", "after"):
-            case = cases[role]
+        for role in ("serial", "before", "init-only", "after") if init_only else ("serial", "before", "after"):
+            case = cases["before" if role == "init-only" else role]
             case.update(diagnostics_commit="h", libraries=[], queue_probe={"status": "unavailable"})
             directory = tmp_path / f"p{number}-{role}"
             directory.mkdir()
@@ -92,6 +93,15 @@ def test_paired_rounds_check_profile_identity_and_retained_work(tmp_path, capsys
     output = capsys.readouterr().out
     assert "EDGE_DELTA after-serial mean_us event_to_execute=+0.000" in output
     assert "PAIRED after-before" in output
+    assert ("ABLATION init-only-before" in output) == init_only
+    assert ("ABLATION after-init-only" in output) == init_only
+    if init_only:
+        one_side = tmp_path / "r2-init-only.json"
+        saved = one_side.read_bytes()
+        one_side.unlink()
+        with pytest.raises(ValueError, match="incomplete"):
+            summarize(tmp_path)
+        one_side.write_bytes(saved)
     path = tmp_path / "r2-before.json"
     data = json.loads(path.read_text())
     data["system_profiles"]["passes"][0]["experiment"]["auto_route"]["final_get"] = 0
