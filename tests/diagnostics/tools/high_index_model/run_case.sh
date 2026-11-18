@@ -47,5 +47,5 @@ for layout in "${layouts[@]}"; do
         tail -20 "$run_dir/run.log" >&2
         exit 1
     fi
-    grep -E '^(INDEX_MODEL_START|DEVICE_INDEX_US|COLD_PLAN_MODEL|INDEX_WORK|MODEL_EXACT_PASS)' "$run_dir/run.log"
+    grep -E '^(INDEX_MODEL_START|DEVICE_INDEX_US|COLD_PLAN_MODEL|TOUCHED_PLAN_MODEL|INDEX_WORK|MODEL_EXACT_PASS)' "$run_dir/run.log"
 done

@@ -33,7 +33,62 @@ struct D {
         return x;
     }
 };
-#if INDEX_COLD_PLAN
+#if INDEX_TOUCHED_PLAN
+// Reconstruct the dispatch predicate from the five raw phases. The separate
+// byte-for-byte oracle checks the permutation even for rows that change mode.
+static void CheckTouchedChoices(const std::vector<pipeline_ab::BatchFlag>& flags,
+                                const std::vector<uint32_t>& sources,
+                                const std::vector<uint32_t>& victims,
+                                const std::vector<uint64_t>& ticks, uint32_t batch,
+                                uint32_t resident, uint32_t history, uint32_t stride) {
+    uint32_t rows[4] = {}, events[4] = {};
+    for (uint32_t b = 0; b < batch; ++b) {
+        std::unordered_set<uint32_t> seenSrc, seenDst;
+        uint32_t mode = resident <= 16384 && history <= 210944 ? 1 : 2;
+        uint32_t total = 0, probe = 0, next = 2048;
+        for (uint32_t phase = 0; phase < 5; ++phase) {
+            const auto count = flags[b * pipeline_ab::kFlagCount + (phase ? 11 + phase : 0)].count;
+            const uint32_t offset = phase ? next : 0;
+            if (phase)
+                next += count;
+            for (uint32_t k = 0; k < count; k += 512) {
+                const uint32_t n = std::min(512u, count - k);
+                if (total + n > 3072)
+                    mode = 2;
+                total += n;
+                if (mode == 1) {
+                    probe += n;
+                    for (uint32_t i = 0; i < n; ++i) {
+                        auto at = b * stride + offset + k + i;
+                        auto src = sources[at], dst = victims[at];
+                        if (src < resident || src >= history || dst >= resident ||
+                            !seenSrc.insert(src).second || !seenDst.insert(dst).second) {
+                            mode = 3;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        for (uint32_t lane = 0; lane < 4; ++lane) {
+            auto t = ticks.data() + batch * 256 + (lane * batch + b) * 32;
+            if (lane == 2) {
+                if (t[23] != 0x48543331 || t[24] != mode || t[25] != probe || t[26] > t[21])
+                    throw std::runtime_error("Touched-plan row " + std::to_string(b) +
+                        " expected mode/probe=" + std::to_string(mode) + "/" + std::to_string(probe) +
+                        " got " + std::to_string(t[24]) + "/" + std::to_string(t[25]));
+            } else if (t[23] || t[24] || t[25] || t[26]) {
+                throw std::runtime_error("touched-plan diagnostic from unexpected lane");
+            }
+        }
+        ++rows[mode];
+        events[mode] += total;
+    }
+    std::printf("TOUCHED_PLAN_MODEL disjoint/mixed/general_rows=%u/%u/%u "
+                "disjoint/mixed/general_events=%u/%u/%u cpu_choices=PASS\n",
+                rows[1], rows[3], rows[2], events[1], events[3], events[2]);
+}
+#elif INDEX_COLD_PLAN
 // Read the complete raw phases independently of the candidate's sparse planner.
 // The existing CPU permutation check below still compares every device output byte.
 static void CheckColdChoices(const std::vector<pipeline_ab::BatchFlag> &flags,
@@ -354,7 +409,9 @@ int main(int argc, char **argv) {
                 gather = std::max(gather, t[12]);
                 finish = std::max(finish, t[6]);
             }
-#if INDEX_COLD_PLAN
+#if INDEX_TOUCHED_PLAN
+            CheckTouchedChoices(flags, src, dst, ticks, B, R, H, E);
+#elif INDEX_COLD_PLAN
             CheckColdChoices(flags, src, dst, ticks, B, R, H, E);
 #endif
             if (movedCount != moves)
