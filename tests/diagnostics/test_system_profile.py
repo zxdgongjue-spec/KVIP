@@ -213,7 +213,36 @@ def test_cli_defaults_to_timeline_and_accepts_metric_sets(tmp_path):
     assert args.profile_metrics == ["none", "PipeUtilization", "Memory"]
 
 
-def test_measure_profiles_only_after_headline_and_before_graph_reset(tmp_path, monkeypatch):
+def test_auto_timeline_is_one_learned_low_pass(tmp_path):
+    base = ["--study", "post-threshold", "--threshold-policy", "recent", "--pipeline-variants", "auto-post-index",
+            "--upstream-root", str(tmp_path), "--upstream-revision", "0" * 40, "--profile-dir", str(tmp_path / "p")]
+    with pytest.raises(SystemExit):
+        cli(tmp_path, *base)
+    base += ["--check-auto-route", "--iterations", "2"]
+    assert cli(tmp_path, *base).profile_metrics == ["none"]
+    for conflict in (["--iterations", "1"], ["--profile-metrics", "Memory"],
+                     ["--pipeline-variants", "auto-tail", "auto-post-index"], ["--post-index-wait-first"]):
+        with pytest.raises(SystemExit):
+            cli(tmp_path, *base, *conflict)
+
+
+@pytest.mark.parametrize("mismatch", ["high", "fallback", "wait_first", "prefetch", "stale", "no_learning", None])
+def test_low_trace_requires_device_route_and_step_completion(mismatch):
+    observed = dict(mode="high" if mismatch == "high" else "low", steps=[3 if mismatch == "stale" else 4],
+                    learned_owners=[] if mismatch == "no_learning" else [7])
+    auto = SimpleNamespace(requests=[[7, 1, 4, 4]], record=lambda reads: observed)
+    reads = dict(prefetch=int(mismatch == "prefetch"), final=955,
+                 post_index=dict(active=mismatch != "high", fallback=mismatch == "fallback",
+                                 wait_first=mismatch == "wait_first"))
+    if mismatch:
+        with pytest.raises(AssertionError, match="LOW"):
+            replay_measure.verified_low_trace(auto, reads, 4)
+    else:
+        assert replay_measure.verified_low_trace(auto, reads, 4)["final_get"] == 955
+
+
+@pytest.mark.parametrize("automatic", [False, True])
+def test_measure_profiles_only_after_headline_and_before_graph_reset(tmp_path, monkeypatch, automatic):
     events = []
 
     class Graph:
@@ -253,6 +282,27 @@ def test_measure_profiles_only_after_headline_and_before_graph_reset(tmp_path, m
         read_counts=lambda: {},
         lease=None,
     )
+    if automatic:
+        counts = dict(prefetch=0, final=955, post_index=dict(active=True, fallback=False, wait_first=False))
+        def begin(*, step, learning):
+            assert learning
+            events.append(f"begin-{step}")
+            bundle.auto_replay.requests = [[7, 1, step, 4]]
+
+        def lifecycle(*args, **kwargs):
+            assert args[-1] == 3 and events[-1] == "verify"
+            events.append("lifecycle")
+            return {"status": "pass"}
+
+        bundle.auto_replay = SimpleNamespace(
+            state=SimpleNamespace(config=[0] * 16), begin=begin,
+            record=lambda reads: dict(mode="low", learned_owners=[7], steps=[bundle.auto_replay.requests[0][2]]))
+        bundle.read_counts = lambda: counts
+        bundle.verify = lambda: events.append("verify") or counts
+        monkeypatch.setattr(replay_measure, "cpu_array", lambda torch, data: data)
+        monkeypatch.setattr(replay_measure, "check_auto_route", lifecycle)
+    iterations = 2 if automatic else 1
+    variant = "auto-post-index" if automatic else "ready-batch4"
     result = replay_measure.measure(
         SimpleNamespace(
             __version__="test",
@@ -267,23 +317,20 @@ def test_measure_profiles_only_after_headline_and_before_graph_reset(tmp_path, m
             transport="urma",
             threshold_policy="recent",
             warmup=0,
-            iterations=1,
+            iterations=iterations,
+            check_auto_route=automatic,
             profile_dir=tmp_path,
             profile_metrics=["none"],
         ),
-        {"progress": {"variant": "ready-batch4"}, "profile_metadata": {}},
+        {"progress": {"variant": variant}, "profile_metadata": {}},
     )
-    assert result["timing"]["samples_us"] == [10.0]
-    assert events[-10:] == [
-        "verify",
-        "reset",
-        "sync",
-        "start",
-        "replay",
-        "sync",
-        "stop",
-        "export",
-        "verify",
-        "graph_reset",
-    ]
-    assert events.count("event") == 2
+    assert result["timing"]["samples_us"] == [10.0] * iterations
+    timed_then_profile = ["verify", "reset", *(["begin-3"] if automatic else []),
+                          "sync", "start", "replay", "sync", "stop", "export", "verify",
+                          *(["lifecycle"] if automatic else []), "graph_reset"]
+    assert events[-len(timed_then_profile):] == timed_then_profile
+    assert events.count("event") == 2 * iterations
+    if automatic:
+        manifest = json.loads((tmp_path / f"urma-fused-{variant}/none/profile_manifest.json").read_text())
+        assert manifest["experiment"]["auto_route"]["mode"] == "low" and manifest["experiment"]["auto_route"]["step"] == 3
+        assert result["auto_route"]["low_steps"] == 2

@@ -118,8 +118,14 @@ def arguments(argv=None):
     auto = args.study == "post-threshold" and any(is_auto_variant(name) for name in args.pipeline_variants)
     if args.check_auto_route and not auto:
         p.error("check-auto-route requires post-threshold with an automatic route variant")
-    if auto and (args.profile_dir or args.topk_probe):
-        p.error("Auto routing currently excludes profile/topk-probe")
+    if auto and args.topk_probe:
+        p.error("Auto routing excludes topk-probe")
+    if auto and args.profile_dir and not (
+        args.pipeline_variants == ["auto-post-index"] and args.profile_metrics == ["none"]
+        and args.check_auto_route and args.iterations >= 2 and not args.post_index_wait_first
+    ):
+        p.error("Auto timeline requires only auto-post-index, --profile-metrics none, --check-auto-route, "
+                "at least two timed iterations and normal Post-Index-CQ order")
     if args.post_index_wait_first and (
         args.study != "post-threshold" or args.pipeline_variants != ["auto-post-index"]
     ):

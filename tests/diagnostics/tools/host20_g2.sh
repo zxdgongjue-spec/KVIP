@@ -4,10 +4,14 @@
 set -eo pipefail
 die() { printf '%s\n' "$*" >&2; exit 1; }
 labels=(after)
+profile=0
 if [[ $# == 1 && $1 == --parity ]]; then
     labels=(serial before after after-end before-end serial-end)
+elif [[ $# == 1 && $1 == --kernels ]]; then
+    labels=(serial after)
+    profile=1
 elif [[ $# != 0 ]]; then
-    die "usage: bash host20_g2.sh [--parity]"
+    die "usage: bash host20_g2.sh [--parity|--kernels]"
 fi
 
 diag=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
@@ -91,6 +95,9 @@ for label in "${labels[@]}"; do
         args=(--mode fused --study post-threshold --threshold-policy recent --pipeline-variants auto-post-index --check-auto-route)
         if [[ $label == before || $label == after ]]; then extra=(--diagnostic-replays 2 --calibrate-counter); fi
     fi
+    if ((profile)); then
+        extra=(--diagnostic-replays 0 --profile-dir "$out/$label-profile" --profile-metrics none)
+    fi
     log="$out/.$label.log"
     if python3 -B -m kvip.diagnostics.replay "${common[@]}" "${args[@]}" "${extra[@]}" \
         --upstream-root "$root" --upstream-revision "$rev" --output "$out/g2-$label.json" >"$log" 2>&1; then
@@ -114,6 +121,9 @@ PY
         if ((${#labels[@]} == 1)); then
             grep -E '^REPLAY_PASS|^AUTO_ROUTE_PASS|^AUTO_LIFECYCLE_PASS' "$log"
         fi
+        if ((profile)); then
+            python3 -B "$diag/tests/diagnostics/tools/g2_kernel_span.py" "$out/$label-profile" "$label"
+        fi
         rm -f "$log"
     else
         rc=$?
@@ -122,8 +132,8 @@ PY
         exit "$rc"
     fi
 done
-if ((${#labels[@]} > 1)); then
+if ((${#labels[@]} > 1 && !profile)); then
     python3 -B -m kvip.diagnostics.post_index_plan_report --directory "$out" --group 2 |
-        awk '/^RESULT_BEGIN|ALL_mean\/p50=|^GAIN |^DRIFT |^CHECK |^OBSERVED |^RESULT_END/ ||
+        awk '/^RESULT_BEGIN|ALL_mean\/p50=|^GAIN |^DRIFT |^CLOCK |^CHECK |^OBSERVED |^RESULT_END/ ||
              (/^(INIT_LI|PHASE_END|INDEX_CQ|FINALIZE) / && /sample=1 /)'
 fi

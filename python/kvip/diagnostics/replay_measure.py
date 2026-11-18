@@ -547,6 +547,39 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
             phase(retained, "counter_calibration")
             result["native_diagnostics"]["counter_calibration"] = calibrate_counter(
                 torch, library, bundle.rotating.device, stream)
+    last_step = args.iterations + diagnostic_count
+    if getattr(args, "profile_dir", None) is not None:
+        from kvip.diagnostics.system_profile import collect_system_profiles
+
+        variant = retained.get("progress", {}).get("variant", args.threshold_policy)
+        metadata = dict(retained["profile_metadata"])
+        profile_reset, profile_verify = reset, verify
+        if auto is not None:
+            # One separate Level0 capture from the naturally learned state.
+            # No feedback injection or lifecycle fault may precede the capture.
+            last_step += 1
+
+            def profile_reset():
+                reset()
+                auto.begin(step=last_step, learning=True)
+
+            def profile_verify():
+                reads = verify()
+                metadata["auto_route"] = verified_low_trace(auto, reads, last_step)
+
+        result["system_profiles"] = collect_system_profiles(
+            torch=torch,
+            reset=profile_reset,
+            replay=lambda: replay(graph),
+            synchronize=stream.synchronize,
+            verify=profile_verify,
+            directory=args.profile_dir,
+            case=f"{args.transport}-{args.mode}-{variant}",
+            metrics=args.profile_metrics,
+            metadata=metadata,
+            retained=retained,
+            checkpoint=lambda name, step: phase(retained, name, step),
+        )
     if auto is not None and getattr(args, "check_auto_route", False):
         phase(retained, "auto_route_lifecycle")
         post_index = (getattr(bundle, "tuning", {}).get("low_miss_post_index")
@@ -554,30 +587,26 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
         preserve_map = bool(post_index and low_post_index_preserves_map(
             getattr(args, "upstream_root", None), getattr(args, "upstream_revision", None)))
         result["auto_route"]["lifecycle"] = check_auto_route(
-            torch, stream, bundle, lambda: replay(graph), args.iterations + diagnostic_count,
-            preserve_low_map=preserve_map,
-        )
-    if getattr(args, "profile_dir", None) is not None:
-        from kvip.diagnostics.system_profile import collect_system_profiles
-
-        variant = retained.get("progress", {}).get("variant", args.threshold_policy)
-        result["system_profiles"] = collect_system_profiles(
-            torch=torch,
-            reset=reset,
-            replay=lambda: replay(graph),
-            synchronize=stream.synchronize,
-            verify=verify,
-            directory=args.profile_dir,
-            case=f"{args.transport}-{args.mode}-{variant}",
-            metrics=args.profile_metrics,
-            metadata=retained["profile_metadata"],
-            retained=retained,
-            checkpoint=lambda name, step: phase(retained, name, step),
+            torch, stream, bundle, lambda: replay(graph), last_step, preserve_low_map=preserve_map,
         )
     phase(retained, "graph_reset")
     for graph in reversed(graphs):
         graph.reset()
     return result
+
+
+def verified_low_trace(auto, reads, step):
+    observation = auto.record(reads)
+    active = sorted(int(r[0]) for r in auto.requests if r[3])
+    post = reads["post_index"]
+    if not (active and observation["mode"] == "low" and reads["prefetch"] == 0
+            and post["active"] and not post["fallback"] and not post["wait_first"]
+            and all(s == step for s in observation["steps"])
+            and sorted(observation["learned_owners"]) == active):
+        raise AssertionError(f"Profiler replay did not exercise the learned LOW Post-Index path: "
+                             f"step={step} mode={observation['mode']} learned={observation['learned_owners']}")
+    return dict(step=step, mode="low", learned_owners=active, prefetch=0,
+                final_get=int(reads["final"]), fallback=False, wait_first=False)
 
 
 def allocate_context(args, archive, retained):
