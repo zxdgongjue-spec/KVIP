@@ -67,16 +67,16 @@ __simt_callee__ inline void ComposeTouchedChunk(__ubuf__ uint32_t* m,uint32_t co
         }
     }
     uint32_t rank=prefix(uint32_t(freshOrig)+uint32_t(freshDst),m+tScan);
-    if(m[Err])return;
     uint32_t added=m[tScan+15], start=m[Unique]+rank;
     if(freshOrig)m[tList+start]=orig;
     if(freshDst)m[tList+start+uint32_t(freshOrig)]=dst;
     uint32_t src=0;
-    if(tid<count){
+    if(tid<count && raw<history && dest<resident){
         src=m[tInv+orig];
         if(!FirstVisit(m+tSrcBits,src) || !FirstVisit(m+tDstBits,dst))asc_atomic_or(m+Err,1U);
     }
     asc_syncthreads();
+    // All lanes observe validation only after source/destination checks join.
     if(m[Err])return;
     bool displaced=tid<count && !WasVisited(m+tSrcBits,dst);
     bool freed=tid<count && !WasVisited(m+tDstBits,src);
