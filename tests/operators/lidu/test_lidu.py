@@ -47,6 +47,29 @@ def run(device):
         expected = topk.cpu().reshape(4, 2048).sort().values
         actual = native.destinations[:4].cpu().reshape(4, 2048).sort().values
         torch.testing.assert_close(actual, expected)
+    # Four disjoint source tiles have identical low token bits. Each of
+    # four queries repeats the same misses, so only 2048 installs are valid.
+    history = 1 << 20
+    padded = history + 20 * 128
+    native.forward = torch.full((batch, padded), -1, dtype=torch.int32, device=device)
+    native.forward[:, :hot].copy_(native.initial)
+    native.padded_tokens = padded
+    fixture["actual_key"][0] = history
+    tile_size = history // 4
+    tokens = torch.cat([
+        torch.arange(end - 512, end, dtype=torch.int32, device=device)
+        for end in range(tile_size, history + 1, tile_size)
+    ])
+    topk.copy_(tokens.repeat(4, 1).reshape_as(topk))
+    native.prepare(topk)
+    torch.npu.synchronize()
+    assert native.counts.cpu().tolist() == [2048, 0, 2048]
+    slots = native.forward[0, tokens.long()].long()
+    assert slots.min().item() >= 0 and slots.max().item() < hot
+    torch.testing.assert_close(native.reverse[0, slots], tokens)
+    native.prepare(topk)
+    torch.npu.synchronize()
+    assert native.counts.cpu().tolist() == [0, 0, 0]
     print("PASS: kvip.lidu eager/graph, Q4 all-hit, empty padding row, repeated replay")
 
 
