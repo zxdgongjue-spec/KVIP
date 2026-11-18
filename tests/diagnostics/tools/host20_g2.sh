@@ -9,6 +9,7 @@ candidate=
 high_index=0
 index_speed=0
 index_10k=0
+fixed_work=0
 index_units=moves
 index_groups=(4 7 10 17)
 joint=0
@@ -36,13 +37,14 @@ elif [[ $# == 1 && $1 == --parity ]]; then
 elif [[ $# == 1 && $1 == --kernels ]]; then
     labels=(serial after)
     profile=1
-elif [[ ($# == 2 || $# == 3) && $1 == --index-10k && $2 =~ ^[0-9a-f]{40}$ ]]; then
+elif [[ ($# == 2 || $# == 3) && ($1 == --index-10k || $1 == --index-10k-paired) && $2 =~ ^[0-9a-f]{40}$ ]]; then
+    if [[ $1 == --index-10k-paired ]]; then fixed_work=1; fi
     index_10k=1
     index_units=${3:-moves}
     [[ $index_units == moves || $index_units == events ]] || die "Expected 10k moves or events"
     labels=(before after)
     candidate=$2
-elif [[ $# -ge 2 && $1 == --index-speed && $2 =~ ^[0-9a-f]{40}$ ]]; then
+elif [[ $# -ge 2 && ($1 == --index-speed || $1 == --index-paired) && $2 =~ ^[0-9a-f]{40}$ ]]; then
     if [[ $# -gt 2 ]]; then
         index_groups=()
         for group in "${@:3}"; do
@@ -52,6 +54,7 @@ elif [[ $# -ge 2 && $1 == --index-speed && $2 =~ ^[0-9a-f]{40}$ ]]; then
         done
     fi
     high_index=1
+    if [[ $1 == --index-paired ]]; then fixed_work=1; fi
     index_speed=1
     labels=(before after)
     candidate=$2
@@ -59,7 +62,7 @@ elif [[ $# == 2 && $1 == --high-index && $2 =~ ^[0-9a-f]{40}$ ]]; then
     high_index=1
     candidate=$2
 elif [[ $# != 0 ]]; then
-    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA|--index-speed CANDIDATE_SHA [GROUP ...]|--index-10k CANDIDATE_SHA [moves|events]]"
+    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA|--index-speed CANDIDATE_SHA [GROUP ...]|--index-10k CANDIDATE_SHA [moves|events]|--index-paired CANDIDATE_SHA [GROUP ...]|--index-10k-paired CANDIDATE_SHA [moves|events]]"
 fi
 
 diag=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
@@ -76,6 +79,7 @@ if [[ -n $candidate ]]; then
     before=${3:-$after}
     if ((account)); then before=66a2f469ebaec3b35fff789a75177ee19b00213e; fi
     if ((index_speed || index_10k)); then before=dc7904e8e874956de6df8352265bb6ac64d1d644; fi
+    if ((fixed_work)); then before=785703fe7118ac777069c27f43509ee090f8730a; fi
     after=$candidate
     [[ $after != "$before" ]] && git -C "$repo" merge-base --is-ancestor "$before" "$after" ||
         die "Candidate must be a distinct descendant of $before"
@@ -153,6 +157,14 @@ else
     printf 'G2 NPU4 logical=0 control=%.8s candidate=%.8s harness=%.8s\n' "$before" "$after" "$(git -C "$diag" rev-parse HEAD)"
 fi
 printf 'RESULT_ROOT=%s\n' "$out"
+if ((fixed_work)); then
+    inc="$cache/KVAF/access_operator/demo/aiv_batch_get/include"
+    bash "$diag/tests/diagnostics/tools/high_index_model/build_frozen.sh" \
+        "$src/auto-${after:0:8}" "$inc" "$out/frozen" >"$out/.frozen-build.log" 2>&1 || {
+        tail -20 "$out/.frozen-build.log" >&2
+        die "Frozen-tail build failed: $out/.frozen-build.log"
+    }
+fi
 port=29084
 "$cpu" --listen 127.0.0.1 --port "$port" --memory-page-mode thp >"$out/.cpu.log" 2>&1 &
 pid=$!
@@ -182,6 +194,9 @@ if ((high_index)); then
     if ((index_speed)); then
         study=kvip.diagnostics.high_index_speed
         study_args=(--groups "${index_groups[@]}")
+        if ((fixed_work)); then
+            study_args+=(--frozen-library "$out/frozen/libkvip_frozen_tail.so")
+        fi
     fi
     python3 -B -m "$study" "${study_args[@]}" --cache "$cache" \
         --source "$src/auto-${after:0:8}" --revision "$after" --server "127.0.0.1:$port" --result-dir "$out"

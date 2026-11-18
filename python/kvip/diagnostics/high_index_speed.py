@@ -17,6 +17,8 @@ from kvip.diagnostics.read_through_report import load_case, require, timing
 BASE = "dc7904e8e874956de6df8352265bb6ac64d1d644"
 # The serial-CQ counterfactual and the candidate have exactly the same compiled binary.
 # Bracket all three treatments by the same previous full-AIV binary.
+PREVIOUS = "785703fe7118ac777069c27f43509ee090f8730a"
+FROZEN_ARMS = ("old", "original", "candidate", "old-end")
 ARMS = ("old", "original", "candidate", "wait", "old-end")
 DIAGNOSTICS = 4
 EARLY_TIMES = ("early_union", "early_active_max", "early_wait_overhead_max", "early_to_post_gap",
@@ -26,15 +28,18 @@ PHASES = ("plan_join", "gather_join", "scatter_end", "index_span", "cq_span", "j
 
 def command(args, group, arm):
     opts = copy(args)
+    frozen = getattr(args, "frozen_library", None)
     if arm in ("old", "original", "old-end"):
-        opts.revision = BASE
-        opts.source = args.cache / "adaptive-sources" / f"auto-{BASE[:8]}"
+        opts.revision = PREVIOUS if frozen else BASE
+        opts.source = args.cache / "adaptive-sources" / f"auto-{opts.revision[:8]}"
     role = {"old": "overlap", "original": "original", "candidate": "overlap",
             "wait": "wait-first", "old-end": "overlap-end"}[arm]
     cmd = replay_command(opts, group, role)
     cmd[cmd.index("--output")+1] = str(args.result_dir / f"g{group}-{arm}.json")
     if "--diagnostic-replays" in cmd:
         cmd[cmd.index("--diagnostic-replays")+1] = str(DIAGNOSTICS)
+    if frozen and arm == "candidate":
+        cmd.extend(("--frozen-high-tail-library", str(frozen)))
     return cmd
 
 
@@ -104,7 +109,7 @@ def qualified_targets(group, rows):
               f" ge10k_n={len(large)} " + " ".join(values))
 
 
-def summarize(group, cases, revision):
+def summarize(group, cases, revision, *, frozen=False):
     base = cases["old"]
     require(base["device"] == 0, "Expected the host20 physical-NPU4 logical-device-zero mapping")
     geometry = base["geometry"]
@@ -114,7 +119,7 @@ def summarize(group, cases, revision):
         for key in ("geometry", "snapshot_sha256", "kvaf_build", "warmup", "soc", "device", "diagnostics_commit"):
             require(base.get(key) is not None and case.get(key) == base[key],
                     f"{arm}: incomparable {key}")
-        require(case["kvip_commit"] == (revision if arm in ("candidate", "wait") else BASE)
+        require(case["kvip_commit"] == (revision if arm in ("candidate", "wait") else PREVIOUS if frozen else BASE)
                 and case["high_post_index"] == (arm != "original")
                 and case["post_index_wait_first"] == (arm == "wait"),
                 f"{arm}: wrong source, Index policy or CQ order")
@@ -131,7 +136,7 @@ def summarize(group, cases, revision):
                         and high["wait_first"] == (arm == "wait"),
                         f"{arm}: incorrect worker count/order/Get counts")
     libs = {k: v["library_sha256"] for k, v in cases.items()}
-    require(libs["old"] == libs["original"] == libs["old-end"] and libs["candidate"] == libs["wait"]
+    require(libs["old"] == libs["original"] == libs["old-end"] and (frozen or libs["candidate"] == libs["wait"])
             and libs["old"] and libs["candidate"] and libs["candidate"] != libs["old"],
             "Expected distinct baseline/candidate binaries and same-binary schedule controls")
     ts = {arm: timing(case, True) for arm, case in cases.items()}
@@ -141,6 +146,26 @@ def summarize(group, cases, revision):
     print(f"G{group} OLD_END_MINUS_START_us={two(drift)} candidate_saved_vs_old_start/end_us="
           f"{two(first_last[0])},{two(first_last[1])} saved_vs_original_us="
           + two([a-b for a, b in zip(ts["original"], ts["candidate"])]))
+    if frozen:
+        from kvip.diagnostics.frozen_high_tail import format_frozen
+        for arm in ("old", "candidate"):
+            rows = index_rows(cases[arm])
+            require(all(r["preplan"] and r["cold_plan"] and r["cold_plan"]["cpu_eligibility_checked"]
+                        for r in rows), f"{arm}: missing verified row planner counters")
+            if arm == "candidate":
+                modes = ("direct_rows", "touched_rows", "general_rows")
+            else:
+                modes = ("fast_rows", "fallback_rows")
+            counts = "/".join(str(sum(len(r["cold_plan"][k]) for r in rows)) for k in modes)
+            require(sum(map(int, counts.split("/"))) == len(rows)*geometry["batch"],
+                    f"{arm}: planner choice missing for a request")
+            print(f"G{group} INDEX {arm} {'/'.join(modes)}={counts}"
+                  f" preplan_active_max_us={pair([r['preplan']['early_active_max'] for r in rows])}"
+                  f" post_index_us={pair([r['index_span'] for r in rows])}"
+                  f" remaining_cq_us={pair([r['cq_span'] for r in rows])}", flush=True)
+        print(f"G{group} {format_frozen(cases['candidate']['frozen_high_tail'])}", flush=True)
+        print(f"G{group} CHECK output/Index/Get_KV/lifecycle=PASS", flush=True)
+        return
     profiles = {arm: index_rows(cases[arm]) for arm in ("old", "candidate", "wait")}
     for arm, rows in profiles.items():
         require(all(bool(r["preplan"]) == (arm != "old") for r in rows),
@@ -203,12 +228,15 @@ def main(argv=None):
     p.add_argument("--server", required=True)
     p.add_argument("--result-dir", type=Path, required=True)
     p.add_argument("--groups", type=int, nargs="+", choices=GROUPS, default=(4, 7, 10, 17))
+    p.add_argument("--frozen-library", type=Path)
     args = p.parse_args(argv)
+    if args.frozen_library and not args.frozen_library.is_file():
+        p.error(f"missing frozen-tail library: {args.frozen_library}")
     if len(set(args.groups)) != len(args.groups):
         p.error("groups must be unique")
     for group in args.groups:
         cases = {}
-        for arm in ARMS:
+        for arm in FROZEN_ARMS if args.frozen_library else ARMS:
             cmd = command(args, group, arm)
             output = cmd[cmd.index("--output")+1]
             log = args.result_dir / f".g{group}-{arm}.log"
@@ -219,7 +247,7 @@ def main(argv=None):
                     print("".join(deque(f, maxlen=8)), file=sys.stderr, end="")
                 raise SystemExit(f"G{group}/{arm} failed rc={proc.returncode} log={log}")
             cases[arm] = load_case(output, arm)
-        summarize(group, cases, args.revision)
+        summarize(group, cases, args.revision, frozen=bool(args.frozen_library))
 
 
 if __name__ == "__main__":
