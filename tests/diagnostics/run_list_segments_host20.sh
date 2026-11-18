@@ -21,7 +21,7 @@ groups=(2 7 10 17 4)
 case "$study" in
     fetch)
         branch=perf/urma-fetch-rank-ab
-        native_sha=051e5d0bb483ebff0aeb7010c60aeae0555334a5
+        native_sha=9418f17c33ac32817587a6b90ebe4af73bd0c0ea
         groups=(7 2)
         ;;
     budget)

@@ -125,11 +125,40 @@ def check_staggered(snapshots, oracle, epoch_budget, request_budget):
         raise AssertionError("Final producer version not consumed")
 
 
+def collect_window(state, scores, ids, *, k=2048, capacity=2048):
+    """Bounded sparse collector with re-filtering after an overflow flush."""
+    values, selected, cutoff = state
+    pending = []
+    merges = nonempty = overflows = 0
+    # A native DMA block ends at a physical 2048-position boundary.
+    cuts = np.r_[0, np.flatnonzero(np.diff(ids // 2048)) + 1, len(ids)]
+    for start, end in zip(cuts, cuts[1:]):
+        offsets = np.arange(start, end)
+        offered = offsets[scores[offsets] > cutoff]
+        nonempty += bool(len(offered))
+        if len(pending) + len(offered) > capacity:
+            if not pending:
+                raise ValueError("Collector capacity must fit one input block")
+            values, selected, cutoff = select(
+                np.r_[values, scores[pending]], np.r_[selected, ids[pending]], k)
+            merges += 1
+            overflows += 1
+            pending = []
+            offered = offsets[scores[offsets] > cutoff]
+        pending.extend(offered.tolist())
+    if pending:
+        values, selected, cutoff = select(
+            np.r_[values, scores[pending]], np.r_[selected, ids[pending]], k)
+        merges += 1
+    return (values, selected, cutoff), (nonempty, merges, overflows)
+
+
 def check_group(scores, ends, bounds, masks, geometry, expected=None):
     batch, queries, history = scores.shape
     offers, seed_bins, touched = [], [], 0
     nonempty_tiles = total_tiles = tie_shortcuts = 0
     q_occurrences = unique_per_request = checks = 0
+    collector_blocks = collector_merges = collector_overflows = 0
     window_budget, request_budget = geometry["window_limit"], geometry["prefetch_limit"]
     if (batch, queries, geometry["token_bytes"]) != (16, 4, 656):
         raise ValueError("Expected BS16 Q4 single-layer 656-byte workload")
@@ -161,7 +190,14 @@ def check_group(scores, ends, bounds, masks, geometry, expected=None):
                     total_tiles += len(np.unique(ids // 128))
                     nonempty_tiles += len(np.unique(ids[passed] // 128))
                     touched += len(ids)
+                    collected, work = collect_window(dense[q], new_scores, ids)
+                    collector_blocks += work[0]
+                    collector_merges += work[1]
+                    collector_overflows += work[2]
                     old_scores, old_ids, kth = select(np.r_[old_scores, new_scores], np.r_[old_ids, ids])
+                    if (collected[2] != kth or not np.array_equal(collected[0], old_scores)
+                            or not np.array_equal(collected[1], old_ids)):
+                        raise AssertionError(f"Window collector differs row={row} q={q} epoch={epoch}")
                     dense[q] = old_scores, old_ids, kth
                 wanted = old_ids[eligible[old_ids]].tolist()
                 got = ranker.eligible_ids()
@@ -183,7 +219,8 @@ def check_group(scores, ends, bounds, masks, geometry, expected=None):
                 unique_per_request += len(set().union(*eligible_lists))
         check_staggered(snapshots, oracle, window_budget, request_budget)
         tie_shortcuts += sum(ranker.fast for ranker in rankers)
-    return (f"checks={checks} skew=PASS T0_offers/query/window={np.mean(offers):.2f} "
+    return (f"checks={checks} skew=PASS collector_blocks/merges/overflow="
+            f"{collector_blocks}/{collector_merges}/{collector_overflows} T0_offers/query/window={np.mean(offers):.2f} "
             f"p95={np.percentile(offers,95):.1f} max={max(offers)} "
             f"T0_pass={100*sum(offers)/touched:.3f}% "
             f"touched_tiles={100*nonempty_tiles/total_tiles:.2f}% "

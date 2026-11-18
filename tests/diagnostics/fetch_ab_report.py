@@ -87,6 +87,14 @@ def report(path, phase, native, manifest, *prior_args):
             print(f"WINDOW {name} mean/P50_us useful_post={fmt('useful')} "
                   f"return_LI={fmt('returned')} nonempty_post={fmt('first')} "
                   f"useful/nonempty/all={m['useful']['n']}/{m['first']['n']}/{m['returned']['n']}")
+        for name in NAMES[-2:]:
+            stages = details[name].get('rank_stages')
+            if stages:
+                values = ' '.join(f"{k}={stages[k]['mean']:.2f}/{stages[k]['p50']:.2f}"
+                                  for k in ('load', 'scan_collect', 'merge', 'store', 'admit'))
+                print(f"RANK_STAGE {name} per_query_window_mean/P50_us {values} "
+                      f"blocks/candidates/merges={stages['blocks']}/{stages['candidates']}/{stages['merges']} "
+                      "instrumented_excludes_post")
         return
     for name in NAMES:
         a, b = (cases[n]['timing'] for n in (name, name+'-end'))

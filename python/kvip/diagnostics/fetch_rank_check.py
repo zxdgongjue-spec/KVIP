@@ -33,7 +33,7 @@ class RankMismatch(ValueError):
     def __init__(self, row, query, epoch, actual, expected, cutoff, expected_ids):
         self.where = (row, query, epoch)
         kth, strict = map(int, actual[:2])
-        ids = actual[32:32+TOP]
+        ids = actual[32:32+TOP] & np.uint32(0x7fffffff)
         missing = np.setdiff1d(expected_ids, ids)
         extra = np.setdiff1d(ids, expected_ids)
         super().__init__(f"rank row={row} q={query} epoch={epoch} "
@@ -81,7 +81,7 @@ def check_state(ranks, all_versions, posts, tables, eligible, *, fixed):
                 if (kth, strict) != (cutoff, expected):
                     raise RankMismatch(row, q, epoch, r, expected, cutoff, ids)
                 positions = np.r_[np.arange(strict), np.arange(TOP-1, strict-1, -1)]
-                observed_ids = r[32:32+TOP][positions]
+                observed_ids = r[32:32+TOP][positions] & np.uint32(0x7fffffff)
                 observed_scores = r[32+TOP:].view('<u2')[positions]
                 if not np.array_equal(observed_ids, ids) or not np.array_equal(observed_scores, scores):
                     raise RankMismatch(row, q, epoch, r, expected, cutoff, ids)
@@ -145,7 +145,7 @@ def clock_rate(torch, rot, stream):
 
 
 def stats(values):
-    return dict(n=len(values), mean=float(np.mean(values)), p50=float(np.median(values))) if values else dict(n=0)
+    return dict(n=len(values), mean=float(np.mean(values)), p50=float(np.median(values))) if len(values) else dict(n=0)
 
 
 def posted_ids(torch, rot):
@@ -225,9 +225,23 @@ def inspect_replay(torch, stream, rot, archive):
             offset:offset+history//4]).view('<u4')
         return f"{exc} {bitmap_evidence(words, scores[b], ends[b], bounds[b], g['resident'], q, epoch, tables[b][q][0][2])}"
 
+    live_ranks = cpu_array(torch, rot.fetch_ranks)
+    profile = getattr(rot.library, 'kvip_fetch_window_rank', None)
+    if profile and profile():
+        samples = [live_ranks[b, q, e, :32] for b in range(len(tables))
+                   for q in range(4) for e in range(1, int(versions[b, -1]))]
+        if samples:
+            headers = np.ascontiguousarray(samples)
+            times = headers.view('<u8')[:, 2:7] / result['markers']['ticks_per_us']
+            result['rank_stages'] = dict(
+                scope='instrumented_per_query_cold_window_excludes_post',
+                load=stats(times[:, 0]), scan_collect=stats(times[:, 1]), merge=stats(times[:, 2]),
+                store=stats(times[:, 3]), admit=stats(times[:, 4]),
+                blocks=int(headers[:, 18].sum()), candidates=int(headers[:, 19].sum()),
+                merges=int(headers[:, 20].sum()))
     live_error = None
     try:
-        result['live'] = check_state(cpu_array(torch, rot.fetch_ranks), versions, posts, tables, eligible, fixed=False)
+        result['live'] = check_state(live_ranks, versions, posts, tables, eligible, fixed=False)
     except ValueError as exc:
         live_error = evidence(exc)
     frozen = torch.from_numpy(np.where(eligible, -1, 0).astype('<i4')).to(rot.device)

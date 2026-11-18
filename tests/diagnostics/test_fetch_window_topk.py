@@ -56,3 +56,20 @@ def test_bitmap_evidence_maps_reverse_logical_tiles_to_physical_scores():
     msg = bitmap_evidence(words, scores, ends, (0, 0), resident, 0, 1, 98)
     assert "missing_bits=2 missing_nonempty_tiles=1" in msg
     assert f"first_physical_tiles={[int(physical[128]) // 128]}" in msg
+
+
+def test_window_collector_flushes_without_losing_candidates_or_tie_order():
+    from kvip.diagnostics.fetch_window_topk import collect_window
+
+    rng = np.random.default_rng(411)
+    seed_ids = np.arange(2048)
+    seed = rng.integers(1, 5, 2048, dtype=np.uint16)
+    ids = np.arange(2048, 20480).reshape(-1, 2048)[::-1].reshape(-1)
+    scores = rng.integers(1, 256, len(ids), dtype=np.uint16)
+    state = select(seed, seed_ids)
+    actual, counts = collect_window(state, scores, ids)
+    expected = select(np.r_[seed, scores], np.r_[seed_ids, ids])
+    assert counts[2] > 0
+    assert actual[2] == expected[2]
+    np.testing.assert_array_equal(actual[0], expected[0])
+    np.testing.assert_array_equal(actual[1], expected[1])
