@@ -70,7 +70,9 @@ def test_cq_control_relocates_one_join_inside_the_same_tail():
     for branch in (before, after):
         assert branch.count("post_index_transport::Wait(transport)") == 1
         assert branch.count("SyncAll();") == 1
-        assert branch.index("record->error = error") < branch.index("SyncAll();")
+    assert before.index("PublishPostFailure(") < before.index("SyncAll();")
+    assert after.index("Flush(record)") < after.index("SyncAll();")
+    assert tail.count("Flush(record)") == 2  # one terminal publication per order
     # Four common barriers plus exactly one relocated CQ barrier. The
     # offline control stays inside the existing kernel, not a new graph node.
     assert tail.count("SyncAll();") == 6

@@ -261,9 +261,7 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
             Simt::Dim3{32,1,1}, prefix, error, uint32_t(blocking));
         SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
     }
-    record->error = error; record->fallback = blocking;
     if (profile) record->packDone = GetSystemCycle();
-    Flush(record);
     // Prefix and every exceptional error/capacity writer finish at this
     // existing join. There is no scalar 64-record reduction or second join.
     SyncAll();
@@ -285,7 +283,6 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
         record->postDone = GetSystemCycle();
         if (blocking) record->cqDone = record->postDone;
     }
-    record->error = error; Flush(record);
     PublishPostFailure(prefix, b, error);
     // No AIV enters Index maintenance before all Post calls have returned.
     SyncAll();
@@ -293,7 +290,6 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
     if (waitFirst) {
         error |= post_index_transport::Wait(transport);
         if (profile) trace[7] = record->cqDone = GetSystemCycle();
-        record->error = error; Flush(record);
         PublishPostFailure(prefix, b, error);
         // This is the same join used after CQ in the overlapping order,
         // relocated before Index so communication is fully drained first.
@@ -341,7 +337,12 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
         trace[9] = indexEnd - indexFirst;
         trace[5] = record->indexDone = GetSystemCycle();
     }
-    record->completed = transport.completed; record->error = error; Flush(record);
+    // Peers use the failure mask up to the final join. Publish this worker's
+    // record once, at the join immediately preceding the per-row reduction.
+    if (waitFirst) {
+        record->completed = transport.completed; record->error = error;
+        Flush(record);
+    }
     SyncAll();
     if (profile) trace[6] = GetSystemCycle();
     // A peer/Index failure must never strand a successfully posted queue.
