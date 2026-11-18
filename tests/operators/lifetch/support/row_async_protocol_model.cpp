@@ -65,6 +65,7 @@ uint32_t Post(QueueArgs&,unsigned first,unsigned n,State& s){auto& q=sim->q[lane
 uint32_t Wait(State& s){if(!s.seq)return 0;auto& q=sim->q[lane];assert(appliedThisLane);assert(++q.drained==s.seq);
     if(int(lane)==sim->input.badWait && s.seq==1)return 1;
     s.completed=s.count;return 0;}
+uint32_t RetirePair(State& a,State& b){uint32_t e=Wait(a);return e|Wait(b);}
 uint32_t GetBlocking(QueueArgs& args,unsigned begin,unsigned count,State& s){if(int(lane)==sim->input.badBlock)return 1;
     Post(args,begin,count,s);auto err=Wait(s);s.seq=0;return err;}
 }

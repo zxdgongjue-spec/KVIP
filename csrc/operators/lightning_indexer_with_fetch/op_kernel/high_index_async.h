@@ -171,8 +171,7 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
     }
     // Both checkpoints, if issued, belong to this lane's FIFO. An accepted
     // prefix must be retired even on failure of the row or of the suffix.
-    error|=post_index_transport::Wait(first);
-    error|=post_index_transport::Wait(second);
+    error|=post_index_transport::RetirePair(first,second);
     if(profile) r->cqDone=GetSystemCycle();
     r->error=error; r->globalError=error; r->count=count; r->fallback=blocking?1:0;
     r->completed=first.completed+second.completed; r->active=2;
