@@ -172,7 +172,7 @@ def create_fused(
     if admission is not None:
         if not upstream or scan_options is None or transport != "urma":
             raise ValueError("Admission experiment requires exact URMA production source")
-        if tuple(admission) not in ((512, 64), (1024, 128)):
+        if tuple(admission) not in ((512, 64), (512, 128), (512, 480), (1024, 128)):
             raise ValueError("Unsupported scan experiment budget")
         effective["prefetch_limit"], effective["window_limit"] = admission
     if scan_options is not None:

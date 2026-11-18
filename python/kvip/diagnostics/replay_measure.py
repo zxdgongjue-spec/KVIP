@@ -403,6 +403,14 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None):
                     reads=diagnostic_reads,
                 )
             )
+            if getattr(bundle, "tuning", {}).get("window_probe"):
+                from kvip.diagnostics.window_probe import decode
+
+                diagnostic_samples[-1]["window_probe"] = decode(
+                    cpu_array(torch, bundle.rotating.window_times),
+                    cpu_array(torch, bundle.rotating.events),
+                    incremental=bundle.tuning["incremental_topk"],
+                )
             # Only after successful completion; failures retain all owners and
             # the enabled profile buffer for the existing fatal-exit path.
             phase(retained, "diagnostic_disable", step)

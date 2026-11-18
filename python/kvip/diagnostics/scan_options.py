@@ -1,6 +1,7 @@
 """Independent URMA scan-order/admission experiment; no graph-route changes."""
 
 OPTIONS = ("reverse_cold", "rolling_threshold", "window_refilter", "rolling_batched", "rolling_windowed", "rolling_compact", "rolling_first_window", "refilter_safe", "refilter_refill", "compact_out_of_place", "rolling_reuse_seed", "rolling_fast_path", "rolling_sparse", "rolling_boundary", "incremental_topk", "incremental_window", "incremental_register", "incremental_prefilter", "incremental_direct", "incremental_ties", "incremental_light", "incremental_inplace", "incremental_progress", "incremental_segments")
+EXPERIMENT_OPTIONS = ("consumed_prefix", "window_probe")
 DEFAULT_VARIANTS = ("forward", "reverse", "forward-wide", "reverse-wide", "forward-end")
 VARIANTS = {name: ("reverse_cold",) if name.startswith("reverse") else () for name in DEFAULT_VARIANTS}
 ROLLING_VARIANTS = ("forward", "reverse", "reverse-roll", "reverse-refilter", "forward-refilter", "forward-end")
@@ -142,13 +143,25 @@ SEGMENT_VARIANTS = (
 VARIANTS["reverse-inc-segments"] = VARIANTS["reverse-inc-light-ties"] + ("incremental_segments",)
 
 
+VARIANTS["reverse-consumed"] = VARIANTS["reverse-inc-segments"] + ("consumed_prefix",)
+for _base in ("reverse", "reverse-inc-segments", "reverse-consumed"):
+    for _cap in (128, 480):
+        VARIANTS[f"{_base}-cap{_cap}"] = VARIANTS[_base]
+for _base in ("reverse", "reverse-inc-register", "reverse-inc-segments", "reverse-consumed"):
+    VARIANTS[_base + "-probe"] = VARIANTS[_base] + ("window_probe",)
+
+
 def options_for(name):
-    return {key: key in VARIANTS[name] for key in OPTIONS}
+    options = {key: key in VARIANTS[name] for key in OPTIONS}
+    options.update({key: True for key in EXPERIMENT_OPTIONS if key in VARIANTS[name]})
+    return options
 
 
 def budgets_for(name):
     if name not in VARIANTS:
         raise ValueError(f"Unknown scan variant: {name}")
+    if "-cap" in name:
+        return 512, int(name.rsplit("-cap", 1)[1])
     return (1024, 128) if name.endswith("-wide") else (512, 64)
 
 
@@ -159,10 +172,12 @@ def q_workers_for(name):
 
 
 def validate_options(options):
-    if not isinstance(options, dict) or set(options) != set(OPTIONS):
+    if not isinstance(options, dict) or set(options).difference(EXPERIMENT_OPTIONS) != set(OPTIONS):
         raise ValueError("Scan experiment options do not match the selected native interface")
     if any(type(value) is not bool for value in options.values()):
         raise ValueError("Scan build options must be bool")
+    if options.get("consumed_prefix") and not options["incremental_segments"]:
+        raise ValueError("Consumed prefix requires segment lists")
     if options["incremental_segments"] and (
         not options["incremental_light"] or not options["incremental_ties"]
         or options["incremental_progress"] or options["incremental_inplace"]
@@ -243,7 +258,7 @@ def prebuild(args, retained):
     seen = set()
     for name in args.scan_variants:
         options = options_for(name)
-        key = tuple(options.values())
+        key = tuple(sorted(options.items()))
         if key in seen:
             continue
         retained.setdefault("progress", {}).update(variant=name, phase="compile_preflight", step=None)
