@@ -10,16 +10,6 @@ using namespace rotating;
 __aicore__ inline __gm__ Context* GetContext(GM_ADDR bindings) {
  return reinterpret_cast<__gm__ Context*>(reinterpret_cast<__gm__ uint64_t*>(bindings)[14]);
 }
-__aicore__ inline KvafExecuteBatchGetKernelArgs GetArgs(__gm__ Context* ctx,uint32_t owner) {
- KvafExecuteBatchGetKernelArgs args{};
- static_assert(sizeof(args)==14*sizeof(uint64_t),"KVAF argument ABI changed");
- auto src=reinterpret_cast<__gm__ uint64_t*>(ctx->args)+owner*14;
- auto dst=reinterpret_cast<uint64_t*>(&args);
- for(uint32_t i=0;i<14;++i)dst[i]=src[i];
- return args;
-}
-#endif
-#if defined(__CCE_AICORE__)
 __aicore__ inline void FillRoundWords(uint64_t address,uint32_t words,
     LocalTensor<uint32_t> local) {
     GlobalTensor<uint32_t> target;target.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(address));
@@ -68,7 +58,8 @@ __aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uin
 #endif
 extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
-    auto runtimeShape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(reinterpret_cast<__gm__ uint64_t*>(bindings)[14]));
+    auto ctx=GetContext(bindings);
+    const auto& runtimeShape=ctx->shape;
     const uint32_t rt_batch = runtimeShape.batch;
     const uint32_t rt_history = runtimeShape.history;
     const uint32_t rt_resident = runtimeShape.resident;
@@ -83,7 +74,6 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
         uint32_t block=GetBlockIdx();
         uint32_t b=block%rt_batch, part=block/rt_batch;
         if(part>=4) return;
-        auto ctx=GetContext(bindings);
         // Each worker owns an aligned range, including its ABC mappings.
         // No cache line is concurrently cleared and filled by another core.
         uint32_t chunk=((rt_history+127)/128)*32;
@@ -130,12 +120,11 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
         rowPipe.InitBuffer(rowStorage,sizeof(Row));
         auto rowLocal=rowStorage.Get<uint32_t>();
         Duplicate(rowLocal,uint32_t(0),sizeof(Row)/4);
-        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        FillRoundWords(ctx->rows+b*sizeof(Row),sizeof(Row)/4,rowLocal);
-        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
-        rowPipe.Destroy();
-        auto args=GetArgs(ctx,b*2);
-        auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
+        SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        // Assemble the row in UB, including the zeroed counters and padding.
+        // Publish the completed row with a single DMA at the kernel boundary.
+        auto row=reinterpret_cast<__ubuf__ Row*>(rowLocal.GetPhyAddr());
+        const auto& args=reinterpret_cast<__gm__ KvafExecuteBatchGetKernelArgs*>(ctx->args)[b*2];
         auto entity=reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(args.channel_entity);
         auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args.queue_state);
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
@@ -175,7 +164,10 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
             row->error=kvaf_device::kInvalidEntity;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
 #endif
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),sizeof(*row));
+        SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        FillRoundWords(ctx->rows+b*sizeof(Row),sizeof(Row)/4,rowLocal);
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        rowPipe.Destroy();
     }
 #endif
 }
