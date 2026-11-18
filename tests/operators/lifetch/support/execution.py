@@ -3219,7 +3219,7 @@ class FusedReplayState:
     state must not have live graphs or unfinished device work.
     """
     def __init__(self, torch, runtime, table, library, initial, pages, addresses,
-                 *, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None):
+                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None):
         from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
         from kvip.cache.index_storage import IndexCacheStorage
         from kvip.operators.lifetch.binding import LIFetchBinding
@@ -3236,7 +3236,7 @@ class FusedReplayState:
         self.storage = IndexCacheStorage(torch, self.batch + 1, self.history, self.resident, device)
         common = dict(batch=self.batch, history=self.history, aics=aics, windows=windows,
                       device=device, index_heads=g['heads'])
-        ubmem = runtime.transport == 'ubmem'
+        ubmem = transport == 'ubmem'
         self.workspace = (UbmemWorkspace(torch, resident=self.resident, **common) if ubmem
                           else LIFetchWorkspace(torch, **common))
         self.output = torch.zeros((self.batch + 1, self.stride, self.token_bytes), dtype=torch.uint8, device=device)
@@ -3907,7 +3907,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 library = build_ubmem_library(cache_dir=build / 'lifetch_ubmem', cann=cann, shape=shape)
             state = FusedReplayState(
                 torch, runtime, view, library, initial, pages, logical_addresses,
-                device=device, aics=aics, windows=config.intermediate_fetches,
+                transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                 prefetch_tokens=config.prefetch_tokens, soc=soc,
                 prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024))
         else:
@@ -3953,7 +3953,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 if fused:
                     replica = FusedReplayState(
                         torch, runtime, view, library, initial, pages, logical_addresses,
-                        device=device, aics=aics, windows=config.intermediate_fetches,
+                        transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                         prefetch_tokens=config.prefetch_tokens, soc=soc,
                         prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease)
                     replica.failure_directory = directory
