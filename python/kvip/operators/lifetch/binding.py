@@ -220,6 +220,9 @@ class LIFetchBinding:
                 np.array([self.change_slots.data_ptr(), self.change_count.data_ptr()], dtype="<u8").view("u1"),
             )
         )
+        covered_start = batch * (512 + 4 * 2048 * 6 + 1024)
+        covered_bytes = batch * ((history + 255) // 256) * 32
+        self.covered = self.window_topk_storage[covered_start:covered_start + covered_bytes]
         self.rank_progress = self.window_topk_storage[-batch*4*32*8:].view(torch.int64).view(batch,4,32)
         self.incremental = self.window_topk_storage[:batch*512].view(torch.int64).view(batch,4,16)
         blob = np.concatenate((blob, np.array([self.incremental.data_ptr(), prefetch_rank_start,
@@ -236,6 +239,7 @@ class LIFetchBinding:
 
     def reset(self):
         for tensor in (
+            self.covered,
             self.progress,
             self.rows,
             self.events,

@@ -933,6 +933,9 @@ def account(events, name, elapsed, *, full=False, fused_final=False):
         if not start <= timestamp or finish > end:
             continue
         groups[stage].append((timestamp, finish))
+    # Current URMA streaming starts with hot LI; older captures have Init.
+    if fused_final and 'resolve_update' in groups and not groups.get('init'):
+        groups.pop('init', None)
     if any(not value for value in groups.values()):
         return dict(
             error="Missing named device kernels; inspect raw trace, no ordinal guessing",

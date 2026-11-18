@@ -120,7 +120,7 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
   return;}
  TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,kFinalScratchBytes);auto local=scratch.Get<uint32_t>();
  Simt::VF_CALL<PublishPrefetch>(Simt::Dim3{512,1,1},reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+b*10240,
-  reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+b*10240,reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+b*a->maxEvents,
+  reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots,reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+b*a->maxEvents,
   reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+b*a->maxEvents,row->slots);
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  flags[0].count=row->slots;flags[0].ready=1;if(profile)ticks[0]=GetSystemCycle();
@@ -636,6 +636,32 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
   if(block<shape.batch*kResolveCores){uint32_t b=block/kResolveCores,role=block%kResolveCores;
    if(role==0){Producer(a,b);FinalizeStreaming(a,b);}else if(role==1)Consumer(a,b);
    else OutputWorker(a,b);
+#if !V9_UBMEM
+   if(role==kResolveCores-1){
+    // All score producers have joined and the final Fetch uses separate flags.
+    auto ctx=reinterpret_cast<__gm__ Context*>(a->context);
+    const uint32_t words=(shape.history+255)/256*8;
+    constexpr uint32_t chunk=4096;
+    const uint32_t size=words<chunk?words:chunk;
+    constexpr uint32_t progressWords=4*sizeof(Progress)/sizeof(uint32_t);
+    const uint32_t clearWords=size>progressWords?size:progressWords;
+    TPipe pipe;TBuf<TPosition::VECCALC> storage;
+    pipe.InitBuffer(storage,clearWords*sizeof(uint32_t));
+    auto zero=storage.Get<uint32_t>();Duplicate(zero,0U,clearWords);
+    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    GlobalTensor<uint32_t> covered;
+    covered.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(kvip_prefetch_rank::CoveredAddress(ctx->incremental,shape.batch,shape.history,b)));
+    for(uint32_t offset=0;offset<words;offset+=size)
+        DataCopy(covered[offset],zero,words-offset<size?words-offset:size);
+    if(ctx->progress){
+        GlobalTensor<uint32_t> progress;
+        progress.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress)+b*progressWords);
+        DataCopy(progress,zero,progressWords);
+    }
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    pipe.Destroy();
+   }
+#endif
   }
   else {uint32_t lane=block-shape.batch*kResolveCores,q=lane/workers,part=lane%workers;
    if(q<4 && part<workers){

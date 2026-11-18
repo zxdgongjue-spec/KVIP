@@ -23,8 +23,21 @@ namespace kvaf_device { using ubmem_device::CleanCacheLines; constexpr uint32_t 
 // virtual ABC tags remain disjoint from prefetch ordinals.
 namespace rotating {
 #include "../../common/lifetch/cache_metadata.h"
+// ABC destinations form a ring immediately after the resident output.
+__simt_callee__ inline uint32_t DirectTailSlot(uint32_t token,uint32_t resident,
+    uint32_t begin,uint32_t end,uint32_t capacity) {
+    if(token>=begin && token<end && token-begin<capacity)return resident+token%capacity;
+    return UINT32_MAX;
+}
+__simt_callee__ inline uint32_t DirectTailSlot(__gm__ Context* ctx,uint32_t batch,
+    uint32_t resident,uint32_t token) {
+    if(!ctx->tailBounds)return UINT32_MAX;
+    auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds)+batch*2;
+    return DirectTailSlot(token,resident,asc_ldcg(bounds),asc_ldcg(bounds+1),
+                          OutputStride(resident,ctx)-resident);
+}
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
-inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,uint32_t beginOffset,uint32_t endOffset) {
+inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm__ Context* ctx,uint32_t b,uint32_t beginOffset,uint32_t endOffset,bool materialize) {
     // Use the existing SIMT launch: scalar cache-line writeback would race
     // adjacent request counts initialized by other cores.
     if(!threadIdx.x && beginOffset == 0 && ctx->changeCount) {
@@ -34,7 +47,8 @@ inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm
     if(!threadIdx.x && beginOffset==0 && ctx->mappingJournal){
         auto journal=reinterpret_cast<__gm__ MappingJournal*>(ctx->mappingJournal)+b;
         auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds);
-        uint32_t first=bounds?asc_ldcg(bounds+2*b):0,last=bounds?asc_ldcg(bounds+2*b+1):0;
+        uint32_t first=materialize && bounds?asc_ldcg(bounds+2*b):0;
+        uint32_t last=materialize && bounds?asc_ldcg(bounds+2*b+1):0;
         uint32_t capacity=OutputStride(rt_resident,ctx)-rt_resident;
         if(last>rt_history)last=rt_history;
         if(last<first)last=first;
@@ -44,7 +58,7 @@ inline void InitializeTailMappings(uint32_t rt_history,uint32_t rt_resident,__gm
         asc_stcg(&journal->tailEnd,last);
         asc_threadfence();
     }
-    if(!ctx->tailBounds)return;
+    if(!materialize || !ctx->tailBounds)return;
     auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds)+b*2;
     auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;
     uint32_t begin=asc_ldcg(bounds),end=asc_ldcg(bounds+1);
@@ -64,6 +78,17 @@ __simt_callee__ inline void TrackMapping(__gm__ Context* ctx,uint32_t b,uint32_t
     auto journal=reinterpret_cast<__gm__ MappingJournal*>(ctx->mappingJournal)+b;
     asc_stcg(journal->tokens+ordinal,token);
     if(last) asc_stcg(&journal->count,ordinal+1);
+}
+
+// Keep exported change records paired for callers of Index update. Only
+// ordinals actually admitted by this round have a corresponding token.
+__simt_callee__ inline void RecordPrefetchSlot(uint32_t resident,__gm__ Context* ctx,
+    uint32_t batch,uint32_t slot,uint32_t token,uint32_t physical) {
+    RecordChange(resident,ctx,batch,slot,token);
+    const uint32_t ordinal=slot-resident;
+    if(ctx->changeSlots && ordinal<kLruSlots)
+        asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+batch*kChangeCapacity+ordinal,
+                 physical);
 }
 
 // Resolver workers consume the pre-round validity. Publish only after all
@@ -240,7 +265,7 @@ __aicore__ inline bool SubmitWqesAt(uint32_t rt_tokenBytes,uint64_t entityAddres
     DataCopy(meta,entityGm,48);
     SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
     uint32_t sqDepth=meta.GetValue(19);uint64_t sqAddress=meta64.GetValue(7),doorbell=meta64.GetValue(8);
-    if(count>=sqDepth || (!final && pending+1>=meta.GetValue(31)))return false;
+    if(head>UINT64_MAX-count || count>=sqDepth || (!final && pending+1>=meta.GetValue(31)))return false;
     cfg.SetValue(1,6U<<8);cfg.SetValue(2,(meta.GetValue(20)&0xffffffU)|0x1000000U);
     cfg.SetValue(3,meta.GetValue(6)&0xfffffU);
     for(uint32_t j=0;j<4;++j)cfg.SetValue(4+j,meta.GetValue(22+j));
@@ -325,7 +350,7 @@ inline void BatchBuild(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_residen
             output=input64[35];
             head=input64[25];depth=entity[19];
             uint32_t pending=input[66],cqDepth=entity[31];
-            if(count>=depth || pending+1>=cqDepth) {
+            if(head>UINT64_MAX-count || count>=depth || pending+1>=cqDepth) {
                 if(!t){asc_stcg(rowWords+11,uint32_t(kvaf_device::kInvalidArgs));input[64]=0;}count=0;
             } else {
                 auto addresses=reinterpret_cast<__gm__ uint64_t*>(input64[34]);
@@ -336,18 +361,19 @@ inline void BatchBuild(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_residen
                 for(uint32_t i=t;i<n;i+=rt_postThreads) {
                     uint32_t token=asc_ldcg(jobs+begin+i);
                     uint32_t slot=slotBase+begin+i;
+                    uint32_t physical=PhysicalSlot(rt_resident,ctx,b,slot);
                     uint64_t address=asc_ldcg(addresses+token);
                     if constexpr(BuildSimt)remote[g*rt_postBank+i]=address;
                     else {
                         auto fields=reinterpret_cast<__ubuf__ uint32_t*>(remote);
                         fields[g*rt_postBank+i]=uint32_t(address);
                         fields[512+g*rt_postBank+i]=uint32_t(address>>32);
-                        fields[1024+g*rt_postBank+i]=PhysicalSlot(rt_resident,ctx,b,slot);
+                        fields[1024+g*rt_postBank+i]=physical;
                     }
                     TrackMapping(ctx,b,slot-rt_resident,token,i+1==n);
                     asc_stcg(map+token,slot);
 
-                    RecordChange(rt_resident,ctx,b,slot,token);
+                    RecordPrefetchSlot(rt_resident,ctx,b,slot,token,physical);
                 }
                 if(t<16) {
                     uint32_t value=0;
@@ -405,10 +431,11 @@ inline void PrepareCandidateWqes(uint32_t rt_resident,__ubuf__ uint32_t* ids,__u
     __gm__ uint64_t* addresses,uint32_t count,uint32_t slotBase,__gm__ Context* ctx,uint32_t batch,__gm__ uint32_t* admitted) {
     for(uint32_t i=threadIdx.x;i<count;i+=256) {
         uint32_t token=ids[i],slot=slotBase+i;uint64_t remote=asc_ldcg(addresses+token);
-        lo[i]=uint32_t(remote);hi[i]=uint32_t(remote>>32);slots[i]=PhysicalSlot(rt_resident,ctx,batch,slot);asc_stcg(map+token,slot);
+        uint32_t physical=PhysicalSlot(rt_resident,ctx,batch,slot);
+        lo[i]=uint32_t(remote);hi[i]=uint32_t(remote>>32);slots[i]=physical;asc_stcg(map+token,slot);
         TrackMapping(ctx,batch,slot-rt_resident,token,i+1==count);
         asc_atomic_or(admitted+token/32,1U<<(token%32));
-        RecordChange(rt_resident,ctx,batch,slot,token);
+        RecordPrefetchSlot(rt_resident,ctx,batch,slot,token,physical);
     }
     asc_threadfence();
 }
@@ -418,7 +445,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void UnionColdTopk(__ubuf__ uint32_t* input,__ubuf__ uint32_t* bits,
     __ubuf__ uint32_t* ids,__ubuf__ uint32_t* cfg,uint32_t stride,
     uint32_t n0,uint32_t n1,uint32_t n2,uint32_t n3,uint32_t limit,uint32_t words,bool last,
-    __gm__ uint32_t* mapping) {
+    __gm__ uint32_t* mapping,__gm__ Context* ctx,uint32_t batch,uint32_t resident) {
     uint32_t tid=threadIdx.x,lane=tid%32;
     for(uint32_t i=tid;i<4*stride;i+=256) {
         uint32_t q=i/stride,j=i%stride,n=q==0?n0:q==1?n1:q==2?n2:n3;
@@ -428,7 +455,7 @@ inline void UnionColdTopk(__ubuf__ uint32_t* input,__ubuf__ uint32_t* bits,
             // The predecessor service is joined before this window. Its map
             // is authoritative even when the exported eligibility is stale.
             // Never create a second Index exchange for an admitted source.
-            if(token/32<words && asc_ldcg(mapping+token)==UINT32_MAX){
+            if(token/32<words && DirectTailSlot(ctx,batch,resident,token)==UINT32_MAX && asc_ldcg(mapping+token)==UINT32_MAX){
                 uint32_t bit=1U<<(token%32);
                 fresh=(asc_atomic_or(bits+token/32,bit)&bit)==0;
             }
@@ -499,7 +526,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         uint32_t sequence=state.GetValue(246)+1;
         state.SetValue(246,sequence);state.SetValue(214+epoch,sequence);
         const uint64_t entityAddress=state64.GetValue(0),queueAddress=state64.GetValue(1);
-        const uint64_t addresses=state64.GetValue(2),output=state64.GetValue(3);
+        const uint64_t addresses=state64.GetValue(2);
         const uint32_t lower=ctx->lruSlots?0:rt_resident;
         uint32_t candidateCount=0;
         uint32_t available=PrefetchAllowance(slots,requests,state.GetValue(208),
@@ -533,7 +560,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
                 reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),width,n[0],n[1],n[2],n[3],available<kCandidateCapacity?available:kCandidateCapacity,rt_history/32,start+256>=maxCount,
-                reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+uint64_t(b)*rt_history);
+                reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+uint64_t(b)*rt_history,ctx,b,rt_resident);
         }
         SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
         candidateCount=cfg.GetValue(40);if(candidateCount>kCandidateCapacity)candidateCount=kCandidateCapacity;
@@ -549,6 +576,10 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
             missing=candidateCount;count=missing<available?missing:available;
             V9_FETCH_PROFILE(candidateTicks+=GetSystemCycle()-candidateBegin;)
             if(count) {
+                const auto& args=reinterpret_cast<__gm__ KvafExecuteBatchGetKernelArgs*>(ctx->args)[b*2];
+                uint32_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
+                uint64_t stride=ctx->outputStride?ctx->outputStride:rt_resident;
+                uint64_t output=args.output+uint64_t(owner)*stride*rt_tokenBytes;
                 V9_FETCH_PROFILE(postBegin=GetSystemCycle();)
 if (rt_batchedRows) {
                 auto post64=postInput.ReinterpretCast<uint64_t>();
@@ -561,7 +592,7 @@ if (rt_batchedRows) {
                 queueGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(queueAddress));
                 DataCopy(postInput,entityGm,48);DataCopy(postInput[48],queueGm,16);
                 SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-                bool bulk=count<postInput.GetValue(19) && pending+1<postInput.GetValue(31);
+                bool bulk=post64.GetValue(25)<=UINT64_MAX-count && count<postInput.GetValue(19) && pending+1<postInput.GetValue(31);
                 if(bulk){
                     GlobalTensor<int32_t> admitted;
                     admitted.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(post64.GetValue(37)));

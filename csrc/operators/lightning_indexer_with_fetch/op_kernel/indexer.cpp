@@ -1,6 +1,9 @@
 #include "kernel_operator.h"
 #if defined(__CCE_AICORE__)
 #include "context.h"
+#if !V9_UBMEM
+#include "round_prepare.h"
+#endif
 struct QLITilingData {
     uint32_t bSize,tSize,gSize,s1Size,s2Size,sparseCount,usedCoreNum,blockSize,maxBlockNumPerBatch,sparseMode;
     uint32_t keyStride0=16384,keyDequantScaleStride0=128;
@@ -60,9 +63,26 @@ __aicore__ inline void RunLi(GM_ADDR bindings) {
 }
 #endif
 
-extern "C" __global__ __aicore__ void v9_li_kernel(GM_ADDR bindings) {
+extern "C" __global__ __aicore__ void v9_li_kernel(GM_ADDR bindings
+#if !V9_UBMEM
+    ,uint32_t prepareRound
+#endif
+) {
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+#if !V9_UBMEM
+    if ASCEND_IS_AIV {
+        if(prepareRound) {
+            auto addresses=reinterpret_cast<__gm__ uint64_t*>(bindings);
+            auto shape=rotating::LoadRuntimeShape(GetContext(bindings));
+            for(uint32_t task=GetBlockIdx();task<4*shape.batch;task+=2*shape.liCores)
+                PrepareRequestPart(bindings,0,reinterpret_cast<GM_ADDR>(addresses[15]),shape.batch,
+                    shape.history,shape.resident,shape.rounds,shape.serviceLanes,shape.finalWorkers,
+                    shape.finalPostOffset,shape.tokenBytes,task);
+            AscendC::SyncAll<true>();
+        }
+    }
+#endif
     RunLi<SequenceLiPhase::Hot>(bindings);
 #endif
 }

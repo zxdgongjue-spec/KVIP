@@ -14,12 +14,12 @@ extern "C" uint32_t v9_init(void* bindings,void* stream,const rotating::RuntimeS
     return LaunchInit(bindings,stream,shape,nullptr,1);
 }
 
-extern "C" uint32_t aclrtlaunch_v9_li_kernel(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel(uint32_t,void*,void*,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_1(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_2(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_3(uint32_t,void*,void*);
-extern "C" uint32_t v9_li(void* bindings, void* stream, const rotating::RuntimeShape* shape) {
-#define LI_LAUNCH_0 aclrtlaunch_v9_li_kernel
+static uint32_t LaunchLi(void* bindings, void* stream, const rotating::RuntimeShape* shape,uint32_t prepareRound) {
+#define LI_LAUNCH_0(blocks,stream,bindings) aclrtlaunch_v9_li_kernel(blocks,stream,bindings,prepareRound)
 #define LI_LAUNCH_1 aclrtlaunch_v9_li_kernel_1
 #define LI_LAUNCH_2 aclrtlaunch_v9_li_kernel_2
 #define LI_LAUNCH_3 aclrtlaunch_v9_li_kernel_3
@@ -28,6 +28,9 @@ extern "C" uint32_t v9_li(void* bindings, void* stream, const rotating::RuntimeS
 #undef LI_LAUNCH_1
 #undef LI_LAUNCH_2
 #undef LI_LAUNCH_3
+}
+extern "C" uint32_t v9_li(void* bindings,void* stream,const rotating::RuntimeShape* shape) {
+    return LaunchLi(bindings,stream,shape,0);
 }
 extern "C" uint32_t v9_li_cores(const rotating::RuntimeShape* shape) { return shape->liCores; }
 extern "C" uint32_t v9_batch(const rotating::RuntimeShape* shape) { return shape->batch; }
@@ -81,8 +84,7 @@ extern "C" uint32_t aclrtlaunch_v9_streaming_resolve_update(uint32_t,void*,void*
 extern "C" uint32_t kvip_lifetch_streaming_forward(void* bindings,void* update,void* workspace,void* stream,const rotating::RuntimeShape* shape,uint32_t workers) {
     if(!bindings||!update||!workspace||!stream||!shape||shape->resident>131072||shape->batch<1||shape->batch>16||shape->finalWorkers!=4)return 100000;
     if((workers!=1 && workers!=2 && workers!=4) || shape->batch*pipeline_ab::kResolveCores+4*workers>shape->aicCount*2)return 100000;
-    uint32_t result=LaunchInit(bindings,stream,shape,workspace,0);
-    if(!result)result=v9_li(bindings,stream,shape);
+    uint32_t result=LaunchLi(bindings,stream,shape,1);
     if(!result)result=aclrtlaunch_v9_streaming_resolve_update(shape->batch*pipeline_ab::kResolveCores+4*workers,stream,workspace);
     return result;
 }

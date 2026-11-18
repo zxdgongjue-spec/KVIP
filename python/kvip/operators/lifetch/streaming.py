@@ -104,11 +104,14 @@ class StreamingLIFetchForward:
         if len(blob) != 256:
             raise AssertionError(f"LIFetch workspace ABI size={len(blob)}, expected 256")
         self.workspace = torch.from_numpy(blob.copy()).to(device)
-        rotating.bindings = torch.tensor(
+        self.bindings = torch.tensor(
             [x.data_ptr() for x in rotating.arguments] + [self.workspace.data_ptr()],
             dtype=torch.uint64,
             device=device,
         )
+        # Standalone LI calls use the most recently attached workspace. Each
+        # fused call keeps its own LI and resolver workspace paired.
+        rotating.bindings = self.bindings
         self.function.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_uint32]
         self.function.restype = ctypes.c_uint32
 
@@ -119,7 +122,7 @@ class StreamingLIFetchForward:
             else self.torch.npu.current_stream(self.rotating.device)
         )
         args = [
-            self.rotating.bindings.data_ptr(),
+            self.bindings.data_ptr(),
             self.update.bindings.data_ptr(),
             self.workspace.data_ptr(),
             stream.npu_stream,

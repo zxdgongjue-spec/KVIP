@@ -26,6 +26,9 @@ inline void ClassifyTopkHalf(uint32_t history,uint32_t resident,uint32_t batch,
         uint32_t slot=UINT32_MAX;
         if(inHalf && !inTail && (!hasValid || valid[token-halfBase]) &&
            (!hasReserved || reserved[token-halfBase]<0))slot=token;
+#if !V9_UBMEM
+        else if(inTail)slot=DirectTailSlot(token,resident,tailBegin,tailEnd,OutputStride(resident,ctx)-resident);
+#endif
         else if(used || hasTail)slot=ResolvePhysicalSlot(resident,lru,asc_ldcg(mapping+token));
         locations[i]=slot;
         if(slot<resident)asc_atomic_or(bitmap+(threadIdx.x%shards)*words+slot/32,1U<<(slot%32));
@@ -58,6 +61,7 @@ inline void ClassifyPreparedLocations(uint32_t history,uint32_t resident,uint32_
         uint32_t token=indices[i],slot=locations[i];
         if(token==UINT32_MAX){locations[i]=UINT32_MAX;continue;}
         if(token>=history){locations[i]=UINT32_MAX;asc_atomic_or(error,1U);continue;}
+        if(slot==UINT32_MAX)slot=DirectTailSlot(ctx,batch,resident,token);
         if(slot==UINT32_MAX)slot=ResolvePhysicalSlot(resident,lru,asc_ldcg(mapping+token));
         locations[i]=slot;
         if(slot<resident)asc_atomic_or(bitmap+(threadIdx.x%shards)*words+slot/32,1U<<(slot%32));

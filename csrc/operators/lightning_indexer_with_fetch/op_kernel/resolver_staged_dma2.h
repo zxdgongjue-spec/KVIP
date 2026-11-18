@@ -14,6 +14,10 @@ __simt_callee__ inline uint32_t StagedKnownSlot(uint32_t token, uint32_t residen
     bool isHot = token < resident && !IsTailToken(ctx, batch, token) &&
         (!ctx->hotValid || valid[token]) && (!ctx->reservedHot || reservedLocal[token] < 0);
     if (isHot) return token;
+#if !V9_UBMEM
+    uint32_t tailSlot=DirectTailSlot(ctx,batch,resident,token);
+    if(tailSlot!=UINT32_MAX)return tailSlot;
+#endif
     auto mapping = reinterpret_cast<__gm__ uint32_t*>(ctx->mapping) + batch * history;
     uint32_t slot = (used || ctx->tailBounds) ? asc_ldcg(mapping + token) : UINT32_MAX;
     if (slot == UINT32_MAX) return slot;
@@ -229,6 +233,9 @@ inline void StagedQuery(uint32_t query,uint32_t history,uint32_t resident,uint32
             uint32_t record=ordinal>=0?uint32_t(ordinal):kLruSlots+rank;
             // PackStagedUrmaQuery publishes the per-Q transport descriptors.
             // Do not write the shared compact descriptor arrays here.
+            // Reserved destinations use a prefix record. Invalidate the unused
+            // suffix ordinal before publishing a count that includes it.
+            if(ordinal>=0)asc_stcg(changes+kLruSlots+rank,UINT32_MAX);
             asc_stcg(changeSlots+record,slot);asc_stcg(changes+record,token);
         }
         asc_threadfence();asc_syncthreads();

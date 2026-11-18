@@ -77,7 +77,27 @@ def split_graph_invocations(accounting, calls, *, serial=False):
     if 'error' in accounting:
         raise ValueError(f'Graph attribution failed: {accounting}')
     groups = accounting['intervals_us']
-    starts = sorted(start for start, _ in groups.get('li' if serial else 'init', []))
+    resolver = 'resolve_update_fetch' if 'resolve_update_fetch' in groups else 'resolve_update'
+    if serial or 'init' in groups:
+        starts = sorted(start for start, _ in groups['li' if serial else 'init'])
+    else:
+        # All LI phases precede one resolver kernel for each invocation.
+        starts = []
+        last_end = float('-inf')
+        pending = sorted(groups['li'], reverse=True)
+        for resolve_start, resolve_end in sorted(groups.get(resolver, [])):
+            phases = []
+            while pending and pending[-1][0] < resolve_start:
+                start, end = pending.pop()
+                if start < last_end or end > resolve_start:
+                    raise ValueError('LI phase crosses a resolver boundary')
+                phases.append(start)
+            if not phases:
+                raise ValueError('Missing LI before resolver in measured graph')
+            starts.append(min(phases))
+            last_end = resolve_end
+        if pending:
+            raise ValueError('LI phase missing its resolver')
     if len(starts) != calls:
         raise ValueError(f'Expected {calls} invocation boundaries, found {len(starts)}')
     samples = []
@@ -85,8 +105,9 @@ def split_graph_invocations(accounting, calls, *, serial=False):
         stop = starts[index + 1] if index + 1 < calls else float('inf')
         intervals = {stage: sorted((a, b) for a, b in values if start <= a < stop)
                      for stage, values in groups.items()}
-        required = {'li', 'lidu_prepare', 'fetch'} if serial else {
-            'init', 'li', 'resolve_update_fetch' if 'resolve_update_fetch' in groups else 'resolve_update'}
+        required = {'li', 'lidu_prepare', 'fetch'} if serial else {'li', resolver}
+        if not serial and 'init' in groups:
+            required.add('init')
         if any(not intervals.get(stage) for stage in required):
             raise ValueError(f'Incomplete invocation {index}: {intervals}')
         flat = sorted(pair for values in intervals.values() for pair in values)
