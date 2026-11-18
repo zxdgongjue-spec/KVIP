@@ -71,6 +71,10 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
     auto posts=FinalPostAt(shape.finalPostOffset,ctx,4*b);
     auto ticks=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(batch)*256+block*32;
     const bool profile=(a->prefetchCount & 0x80000000U)!=0;
+    if(profile){
+        r->start=GetSystemCycle();
+        r->planDone=0; r->postBegin=0; r->postDone=0;
+    }
     uint32_t useful=0,error=0;
     if(q==0) useful=Producer(a,b);
     if(q==1) OutputWorker<false>(a,b);
@@ -79,6 +83,7 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
         auto spill=reinterpret_cast<__gm__ Tuple*>(edges+kCapacity);
         PrivatePlan plan;
         Plan(a,b,edges,&spill[0].padding,false,plan);
+        if(profile) r->planDone=GetSystemCycle();
         error|=plan.error;
         me->reserved[8]=plan.pairs; me->reserved[9]=plan.singles;
         me->reserved[10]=plan.invalidations;
@@ -117,6 +122,7 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
         me->reserved[6]=info[1];
     }
     me->count=count;
+    if(profile) r->packDone=GetSystemCycle();
     join.Publish(RowRendezvous::Validated,error);
     error|=join.All(RowRendezvous::Validated);
     uint32_t total=0;
@@ -129,11 +135,17 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
     // Post a safe prefix now; defer only the unsendable range. A bounded
     // blocking fallback is likewise deferred so its CQ cannot gate Index.
     uint32_t early=(!blocking && (safe==count || split)) ? safe : 0;
-    if(!error && early) error|=post_index_transport::Post(args,0,early,first);
+    if(!error && early){
+        if(profile) r->postBegin=GetSystemCycle();
+        error|=post_index_transport::Post(args,0,early,first);
+        if(profile) r->postDone=GetSystemCycle();
+    }
     auto plan=join.lines+2;
     uint32_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
+    if(profile) ticks[3]=GetSystemCycle();
     if(!error) error|=ApplyRowIndex(a,ctx,b,owner,q,4,plan->reserved[8],plan->reserved[9],
                                    plan->reserved[10],update[7],ticks,profile,join);
+    if(profile){ r->indexDone=GetSystemCycle(); ticks[2]=0x52514931U; }
     // Only q0 consumes the prefetch queue. Only ranges that might
     // overwrite an in-flight prefetch destination depend on that completion.
     if(!q){
@@ -144,13 +156,18 @@ __aicore__ __attribute__((noinline)) inline void RunRow(__gm__ Args* a,uint32_t 
     }
     if(early<count) {
         if(safe<count) error|=AwaitPublication(flags+7);
-        if(!error) error|=blocking ? post_index_transport::GetBlocking(args,early,count-early,second)
-                                   : post_index_transport::Post(args,early,count-early,second);
+        if(!error){
+            if(profile && !early) r->postBegin=GetSystemCycle();
+            error|=blocking ? post_index_transport::GetBlocking(args,early,count-early,second)
+                            : post_index_transport::Post(args,early,count-early,second);
+            if(profile) r->postDone=GetSystemCycle();
+        }
     }
     // Both checkpoints, if issued, belong to this lane's FIFO. An accepted
     // prefix must be retired even on failure of the row or of the suffix.
     error|=post_index_transport::Wait(first);
     error|=post_index_transport::Wait(second);
+    if(profile) r->cqDone=GetSystemCycle();
     r->error=error; r->globalError=error; r->count=count; r->fallback=blocking?1:0;
     r->completed=first.completed+second.completed; r->active=2;
     post_index_tail::Flush(r);
