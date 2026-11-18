@@ -261,7 +261,7 @@ def overlap_schedule_timing(rows, marks, *, marker):
         raise ValueError("Invalid per-lane Index interval or nonempty final Post/Wait timestamps")
     begin = int(origin.min())
     last_lane = int(np.flatnonzero(live)[np.argmax(waited)])
-    return dict(
+    result = dict(
         format=marker,
         final_api_calls=int(n_calls.sum()), nonempty_lanes=int(live.sum()),
         first_post_begin=int(start.min())-begin, last_post_begin=int(last_start.max())-begin,
@@ -274,6 +274,17 @@ def overlap_schedule_timing(rows, marks, *, marker):
         last_wait_lane_post_return=int(rows[last_lane, 7])-begin,
         max_lane_get=int(rows[:, 1].max()), max_row_get=int(rows[:, 1].reshape(4, 16).sum(axis=0).max()),
     )
+    # Streaming writes slots 0/1 around its dispatcher in both production
+    # schedules. Compare these with the original's outer role envelope.
+    entry, exit_time = marks[:, 0], marks[:, 1]
+    if row_local or np.any(entry):
+        if (np.any(entry == 0) or np.any(entry > origin) or np.any(exit_time < index_end)
+                or np.any(exit_time[live] < waited)):
+            raise ValueError("Missing or inconsistent streaming outer role timestamps")
+        outer = int(entry.min())
+        result["outer_entry"] = dict(first_post=int(start.min()) - outer, last_wait=int(waited.max()) - outer,
+                                     last_role_exit=int(exit_time.max()) - outer)
+    return result
 
 
 def check_get_reassignment(counts, marks, canonical):

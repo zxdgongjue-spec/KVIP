@@ -225,12 +225,16 @@ def summarize(group, cases, baseline, candidate, high_overlap=False, schedule_fo
             rate = calibration_summary(clock["samples"])["cycles_per_us"]
             keys = ("first_post_begin", "last_post_begin", "last_post_return", "last_final_wait_return",
                     "longest_lane_index", "index_completion_spread", "last_index_minus_last_final_wait")
+            outer = metrics.get("outer_entry")
+            outer_times = (two(outer[key] / rate for key in ("first_post", "last_wait", "last_role_exit"))
+                           if outer else "unavailable")
             print(f"G{group} TRACE_us {arm} marker={marker} " + " ".join(f"{k}={metrics[k]/rate:.2f}" for k in keys)
                   + f" final_Get={sample['reads']['final']} nonempty_lanes={metrics['nonempty_lanes']}"
                   + f" calls={metrics['final_api_calls']} blocking_lanes={metrics['blocking_final_lanes']}"
                   + f" last_wait_lane/get/max_lane/max_row={metrics['last_wait_lane']}/{metrics['last_wait_lane_get']}/"
                     f"{metrics['max_lane_get']}/{metrics['max_row_get']}"
-                  + f" same_lane_last_post_return_us={metrics['last_wait_lane_post_return']/rate:.2f}")
+                  + f" same_lane_last_post_return_us={metrics['last_wait_lane_post_return']/rate:.2f}"
+                  + f" from_outer_entry_us_firstPost/lastWait/lastExit={outer_times}")
             if marker.startswith("RQI"):
                 high = sample["reads"]["high_post_index"]
                 roles = "/".join(f"{v/rate:.2f}" for v in metrics["validation_by_role_p50"])

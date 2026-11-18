@@ -152,6 +152,8 @@ def test_row_timeline_handles_split_submissions_and_excludes_idle_final_lanes():
     rows[0:2, 7] = [326, 280]
     rows[:, 9] = 9999
     rows[0:2, 9] = [341, 300]
+    marks[:, 0] = 90
+    marks[:, 1] = 10000
     marks[:16, 1] = 9999 + np.arange(16) + 100
     marks[:, 2] = 0x52514931
     marks[:, 3] = 160
@@ -163,6 +165,7 @@ def test_row_timeline_handles_split_submissions_and_excludes_idle_final_lanes():
                           first_post_begin=40, last_post_begin=220, last_post_return=226,
                           last_final_wait_return=241, longest_lane_index=130, index_completion_spread=40,
                           last_index_minus_last_final_wait=-51, blocking_final_lanes=0,
+                          outer_entry=dict(first_post=50, last_wait=251, last_role_exit=10024),
                           last_wait_lane=0, last_wait_lane_get=3, last_wait_lane_post_return=226, max_lane_get=7, max_row_get=7,
                           validation_by_role_p50=[55,50,45,30], validation_spread_max=25, lane_index_p50=90,
                           row_retire_to_exit_p50=107.5, row_retire_to_exit_max=115,
