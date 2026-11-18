@@ -12,6 +12,7 @@ import sys
 from kvip.diagnostics.counter_clock import calibration_summary
 from kvip.diagnostics.high_index_speed import one_to_one, two
 from kvip.diagnostics.high_index_study import GROUPS, replay_command
+from kvip.diagnostics.original_native_window import print_original_clock
 from kvip.diagnostics.read_through_report import load_case, require, timing
 
 
@@ -42,6 +43,8 @@ def command(args, group, arm):
             cmd.extend(("--diagnostic-replays", "1", "--calibrate-counter"))
     elif arm in ("before", "after"):
         cmd.extend(("--diagnostic-replays", "2", "--calibrate-counter"))
+    if arm == "original" and getattr(args, "intermediate", None) and args.high_overlap:
+        cmd.extend(("--diagnostic-replays", "1", "--calibrate-counter"))
     return cmd
 
 
@@ -285,6 +288,8 @@ def main():
                 raise SystemExit(f"G{group}/{arm} failed rc={status} log={log}")
             cases[arm] = load_case(cmd[cmd.index("--output") + 1], arm)
         summarize(group, cases, args.baseline, args.revision, args.high_overlap, formats, args.intermediate)
+        if getattr(args, "intermediate", None) and args.high_overlap:
+            print_original_clock(group, cases["original"])
 
 
 if __name__ == "__main__":

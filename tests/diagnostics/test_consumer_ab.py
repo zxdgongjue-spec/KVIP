@@ -93,7 +93,8 @@ def test_high_overlap_arms_reuse_public_completion_records(tmp_path, capsys, for
         assert opts.verify_consumer_work and opts.check_auto_route and opts.high_post_index == (not original)
         middle = arm.startswith("middle")
         diagnostic = arm in ("before", "middle", "after")
-        assert opts.calibrate_counter == diagnostic and opts.diagnostic_replays == int(diagnostic)
+        profiled = diagnostic or (intermediate and arm == "original")
+        assert opts.calibrate_counter == profiled and opts.diagnostic_replays == int(profiled)
         assert not opts.post_index_wait_first
         revision = args.intermediate if middle else (args.baseline if old_binary else args.revision)
         assert opts.upstream_revision == revision
