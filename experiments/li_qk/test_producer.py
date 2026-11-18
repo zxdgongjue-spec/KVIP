@@ -1,7 +1,9 @@
 """Actual host oracle and boundary validation with CPU launches; no timing claims."""
 import json,os,subprocess,tempfile,unittest
 from pathlib import Path
-from run import HERE,ROOT,make_fixture
+from run import HERE,ROOT,make_fixture,sha
+import producer_compare as compare
+import shutil
 from test_controls import ACL_STUB,LAUNCH_STUB
 class ProducerControls(unittest.TestCase):
  def test_actual_host_direct_oracle_and_unwritten_scratch(self):
@@ -18,4 +20,16 @@ class ProducerControls(unittest.TestCase):
    for route in (0,1,2,3):
     r=subprocess.run([str(d/'host'),str(d/'fixture'),str(d/f'r{route}'),str(route),'0','1','0'],env=env,capture_output=True,text=True);self.assertEqual(r.returncode,0,r.stdout+r.stderr)
     p=json.loads((d/f'r{route}/report.json').read_text());self.assertTrue(p['oracle']);self.assertEqual(p['full_li_launches'],3 if not route else 2)
+   # Synthetic native samples check pairing/receipt validation, never performance.
+   manifest=dict(status='PASS',mode='bench',cases=list(compare.CASES),rounds=1,warmup=4,iterations=2,fixture=dict(hashes={n:sha(d/'fixture'/(n+'.bin')) for n in ('query','key','weight','qscale','kscale','oracle')}),rows=[])
+   for rnd in (0,1):
+    for route,case in enumerate(compare.CASES):
+     name=f'r{rnd}_{case}';shutil.copytree(d/f'r{route}',d/name);report=d/name/'report.json';p=json.loads(report.read_text());p.update(run_mode='npu',warmup=4,iterations=2)
+     for metric in ('li','score','tail'):p[metric+'_samples_us']=[99+route,101+route];p[metric+'_p50_us']=100+route
+     report.write_text(json.dumps(p));log=d/(name+'.log');log.write_text('CPU synthetic samples; no device timings')
+     manifest['rows'].append(dict(name=name,case=case,round=rnd,exit_code=0,report_sha256=sha(report),log_sha256=sha(log)))
+   (d/'manifest.json').write_text(json.dumps(manifest));compare.summarize(d)
+   self.assertEqual(len(json.loads((d/'summary.json').read_text())),4)
+   manifest['rows'].pop();(d/'manifest.json').write_text(json.dumps(manifest))
+   with self.assertRaises(AssertionError):compare.summarize(d)
 if __name__=='__main__':unittest.main()
