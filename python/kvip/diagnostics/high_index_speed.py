@@ -19,6 +19,8 @@ BASE = "dc7904e8e874956de6df8352265bb6ac64d1d644"
 # Bracket all three treatments by the same previous full-AIV binary.
 ARMS = ("old", "original", "candidate", "wait", "old-end")
 DIAGNOSTICS = 4
+EARLY_TIMES = ("early_union", "early_active_max", "early_wait_overhead_max", "early_to_post_gap",
+               "index_union_including_early", "first_preplan_to_last_index")
 PHASES = ("plan_join", "gather_join", "scatter_end", "index_span", "cq_span", "joined_span")
 
 
@@ -58,10 +60,17 @@ def index_rows(case):
     for key, phase, rate, _ in order_samples(case, expected_count=DIAGNOSTICS):
         require(all(k in phase for k in PHASES), "Missing calibrated full-AIV phase boundaries")
         times = {k: phase[k] / rate for k in PHASES}
+        raw = phase.get("preplan")
+        if raw is not None:
+            early = {k: raw[k] / rate for k in EARLY_TIMES}
+            early.update(pairs=sum(raw["pairs_by_core"]), long_moves=sum(raw["long_by_core"]),
+                         spilled=sum(raw["spill_by_core"]), hot_invalidations=sum(raw["invalidations_by_core"]))
+        else:
+            early = {}
         rows.append(dict(key=key, events=phase["event_count"], moves=sum(phase["moved"]),
                          lane_moves=phase["moved"], active=phase["active_aiv"],
                          row_load=phase.get("row_load"), last_end_aiv=phase.get("last_end_aiv"),
-                         **times))
+                         preplan=early, **times))
     require(rows, "No naturally selected HIGH in diagnostic samples")
     return rows
 
@@ -81,10 +90,17 @@ def qualified_targets(group, rows):
         exact = [r for r in rows if r[unit] == 10000]
         nearest = min(rows, key=lambda x: abs(x[unit]-10000))
         large = [r for r in rows if r[unit] >= 10000]
-        print(f"G{group} TARGET_10K_{unit.upper()} exact_n={len(exact)}"
-              f" exact_index_us={pair([r['index_span'] for r in exact]) if exact else 'unmeasured'}"
-              f" nearest_{unit}={nearest[unit]} nearest_index_us={nearest['index_span']:.3f}"
-              f" ge10k_n={len(large)} ge10k_under50_n={sum(r['index_span'] < 50 for r in large)}")
+        metrics = (("post", "index_span"), ("with_early", "index_union_including_early"),
+                   ("earliest_to_finish", "first_preplan_to_last_index"))
+        values = []
+        for label, metric in metrics:
+            def measured(row):
+                return row["index_span"] if metric == "index_span" else row["preplan"][metric]
+            values.append(f"{label}_exact_us={pair([measured(r) for r in exact]) if exact else 'unmeasured'}"
+                          f" {label}_nearest_us={measured(nearest):.3f}"
+                          f" {label}_ge10k_under50_n={sum(measured(r) < 50 for r in large)}")
+        print(f"G{group} TARGET_10K_{unit.upper()} exact_n={len(exact)} nearest_{unit}={nearest[unit]}"
+              f" ge10k_n={len(large)} " + " ".join(values))
 
 
 def summarize(group, cases, revision):
@@ -126,11 +142,20 @@ def summarize(group, cases, revision):
           + two([a-b for a, b in zip(ts["original"], ts["candidate"])]))
     profiles = {arm: index_rows(cases[arm]) for arm in ("old", "candidate", "wait")}
     for arm, rows in profiles.items():
+        require(all(bool(r["preplan"]) == (arm != "old") for r in rows),
+                f"{arm}: expected private planner markers only on the candidate")
+        names = ({"plan_join": "permission_join", "gather_join": "swap_gather_join",
+                  "scatter_end": "long_scatter"} if arm != "old" else {})
         print(f"G{group} PHASE {arm} n={len(rows)} mean/p50"
               f" events={pair([r['events'] for r in rows])} moves={pair([r['moves'] for r in rows])}"
               f" AIV_used={min(r['active'] for r in rows)}..{max(r['active'] for r in rows)}/64"
-              + " " + " ".join(f"{k}_us={pair([r[k] for r in rows])}" for k in PHASES)
+              + " " + " ".join(f"{names.get(k,k)}_us={pair([r[k] for r in rows])}" for k in PHASES)
               + f" fallback={sum(r['key'] is None for r in rows)}")
+        if arm != "old":
+            print(f"G{group} PREPLAN {arm} mean/p50 "
+                  + " ".join(f"{k}_us={pair([r['preplan'][k] for r in rows])}" for k in EARLY_TIMES)
+                  + " " + " ".join(f"{k}={pair([r['preplan'][k] for r in rows])}"
+                                  for k in ("pairs", "long_moves", "spilled", "hot_invalidations")))
         if arm in ("old", "candidate") and rows[0]["row_load"]:
             # Report the critical shape on the actual slowest instrumented sample.
             worst = max(rows, key=lambda r: r["index_span"])
@@ -144,9 +169,12 @@ def summarize(group, cases, revision):
     old_vs_new = one_to_one(profile_tasks(profiles["old"]), profile_tasks(profiles["candidate"]))
     wait_vs_new = one_to_one(profile_tasks(profiles["wait"]), profile_tasks(profiles["candidate"]))
     graph = one_to_one(timed_tasks(cases["wait"]), timed_tasks(cases["candidate"]))
-    print(f"G{group} MATCHED old/candidate_n={len(old_vs_new)} index_saved_us="
+    print(f"G{group} MATCHED old/candidate_n={len(old_vs_new)} post_index_saved_us="
           + (pair([a["index_span"]-b["index_span"] for a,b in old_vs_new]) if old_vs_new else "unavailable")
-          + f" wait/candidate_n={len(wait_vs_new)} approx_exposed_index_us="
+          + " saved_including_early_union_us="
+          + (pair([a["index_span"]-b["preplan"]["index_union_including_early"] for a,b in old_vs_new])
+             if old_vs_new else "unavailable")
+          + f" wait/candidate_n={len(wait_vs_new)} approx_exposed_post_index_us="
           + (pair([a["index_span"]-(a["joined_span"]-b["joined_span"]) for a,b in wait_vs_new])
              if wait_vs_new else "unavailable")
           + f" uninstrumented_wait/candidate_n={len(graph)} graph_saved_us="
@@ -162,8 +190,11 @@ def main(argv=None):
     p.add_argument("--revision", required=True)
     p.add_argument("--server", required=True)
     p.add_argument("--result-dir", type=Path, required=True)
+    p.add_argument("--groups", type=int, nargs="+", choices=GROUPS, default=(4, 7, 10, 17))
     args = p.parse_args(argv)
-    for group in GROUPS:
+    if len(set(args.groups)) != len(args.groups):
+        p.error("groups must be unique")
+    for group in args.groups:
         cases = {}
         for arm in ARMS:
             cmd = command(args, group, arm)

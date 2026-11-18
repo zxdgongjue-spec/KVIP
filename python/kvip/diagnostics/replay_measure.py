@@ -295,7 +295,9 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
                 )
                 if detail is not None:
                     phase = reads["high_post_index"]
-                    phase["row_load"] = describe_row_load(flags, src, dst, phase["moved"], bundle.forward.resident)
+                    phase["row_load"] = describe_row_load(
+                        flags, src, dst, phase["moved"], bundle.forward.resident,
+                        planned_row_moves=phase.get("preplan", {}).get("row_moves"))
             reads["post_index"] = decode_post_index(
                 records,
                 active=low_active,
@@ -339,11 +341,15 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         if "moved" in high:
             from kvip.diagnostics.high_index_profile import validate_move_counts, verify_permutation
 
-            high["row_load"]["two_cycle_moves"] = sum(verify_permutation(
+            invalidations = []
+            two_cycles = verify_permutation(
                 cpu_array(torch, bundle.forward.flags), cpu_array(torch, bundle.forward.events_src),
                 cpu_array(torch, bundle.forward.events_dst), oracle.pre["logical_ids"], state["logical_ids"], oracle.owners,
-            ))
-            validate_move_counts(high, oracle.pre["logical_ids"], state["logical_ids"], oracle.owners)
+                resident=bundle.forward.resident, invalidations=invalidations if "preplan" in high else None,
+            )
+            high["row_load"]["two_cycle_moves"] = sum(two_cycles)
+            validate_move_counts(high, oracle.pre["logical_ids"], state["logical_ids"], oracle.owners,
+                                 two_cycle_moves=two_cycles, invalidations=invalidations)
         if bundle.tuning.get("low_miss_read_through") and early_threshold_skipped(bundle.tuning):
             bundle.read_through_check = oracle.verify_frozen(state, address_delta=delta, output_stride=stride)
         reads.update(fused_demand(bundle, demand, state["logical_output"], reads))

@@ -33,7 +33,7 @@ def event_work(flags, sources, destinations, *, history):
     return dict(event_sha256=digest.hexdigest(), event_count=int(counts.sum()))
 
 
-def verify_permutation(flags, sources, destinations, before, after, owners):
+def verify_permutation(flags, sources, destinations, before, after, owners, *, resident=None, invalidations=None):
     """Replay each simultaneous 512-element assignment plus its displaced-row closure."""
     history = before.shape[1]
     two_cycle_moves = []
@@ -41,6 +41,7 @@ def verify_permutation(flags, sources, destinations, before, after, owners):
         at = np.arange(history, dtype=np.int32)
         location = at.copy()
         offset = 0
+        cleared = 0
         for phase, count in enumerate(flags[row, [0,12,13,14,15], 1]):
             if phase == 1:
                 offset = 2048
@@ -52,6 +53,8 @@ def verify_permutation(flags, sources, destinations, before, after, owners):
                     raise ValueError("Conflicting HIGH Index assignments inside a chunk")
                 evicted = dst[~np.isin(dst, src)]
                 freed = src[~np.isin(src, dst)]
+                if invalidations is not None:
+                    cleared += int(np.count_nonzero(freed < resident))
                 source = np.concatenate((src, evicted))
                 target = np.concatenate((dst, freed))
                 original = at[source]
@@ -64,15 +67,19 @@ def verify_permutation(flags, sources, destinations, before, after, owners):
         # endpoints of an input event need not be partners after later phases.
         dirty = np.flatnonzero(at != np.arange(history))
         two_cycle_moves.append(int(np.count_nonzero(at[at[dirty]] == dirty)))
+        if invalidations is not None:
+            invalidations.append(cleared)
     return two_cycle_moves
 
 
-def describe_row_load(flags, sources, destinations, moved, resident):
+def describe_row_load(flags, sources, destinations, moved, resident, *, planned_row_moves=None):
     """Describe real work distribution using the already copied diagnostic inputs."""
     counts = flags[:, [0, 12, 13, 14, 15], 1]
     batch = len(counts)
     row_events = counts.sum(axis=1)
-    row_moves = np.asarray(moved).reshape(-1, batch).sum(axis=0)
+    # Legacy lanes own one request each. New workers consume flat ranges across rows.
+    row_moves = (np.asarray(moved).reshape(-1, batch).sum(axis=0)
+                 if planned_row_moves is None else np.asarray(planned_row_moves))
     simple = 0
     for row, portions in enumerate(counts):
         prefetched, final = int(portions[0]), int(portions[1:].sum())
@@ -90,15 +97,38 @@ def describe_row_load(flags, sources, destinations, moved, resident):
                 simple_swap_rows=simple)
 
 
-def validate_move_counts(profile, before, after, owners):
+def validate_move_counts(profile, before, after, owners, *, two_cycle_moves=None, invalidations=None):
     """Physical Index rows must match the verified, persistent identity permutation."""
     before, after = map(np.asarray, (before, after))
     moved = np.asarray(profile["moved"])
     cores, batch = len(moved), len(owners)
     if before.shape != after.shape or before.ndim != 2 or cores != 64 or batch != 16:
         raise ValueError("Unexpected full-AIV Index metadata shape")
-    for row, owner in enumerate(owners):
-        count = int(np.count_nonzero(before[owner] != after[owner]))
+    counts = [int(np.count_nonzero(before[o] != after[o])) for o in owners]
+    if prepared := profile.get("preplan"):
+        if counts != prepared["row_moves"] or list(two_cycle_moves) != [2*p for p in prepared["row_pairs"]]:
+            raise ValueError("Preplanned moves/pairs disagree with persistent Index permutation")
+        # The lane owning the first endpoint of a pair moves both physical rows.
+        # Derive its work from the oracle, independently of the device's planner counters.
+        cuts = np.arange(cores+1, dtype=np.int64)*sum(counts)//cores
+        expected_pairs = np.zeros(cores, dtype=np.int64)
+        expected_singles = expected_pairs.copy()
+        base = 0
+        for count, endpoints in zip(counts, two_cycle_moves):
+            local = np.clip(cuts-base, 0, count)
+            expected_pairs += np.diff((np.minimum(local, endpoints)+1)//2)
+            expected_singles += np.diff(np.maximum(local-endpoints, 0))
+            base += count
+        invalid = np.asarray(invalidations, dtype=np.int64)
+        lanes = cores // batch
+        expected_invalidations = np.diff(np.arange(lanes+1)[:, None]*invalid//lanes, axis=0).ravel()
+        if (not np.array_equal(expected_pairs, prepared["pairs_by_core"])
+                or not np.array_equal(expected_singles, prepared["long_by_core"])
+                or not np.array_equal(expected_invalidations, prepared["invalidations_by_core"])):
+            raise ValueError("Global HIGH transfer or hot invalidation work differs from its oracle partition")
+        profile["persistent_moves_checked"] = True
+        return
+    for row, count in enumerate(counts):
         lanes = len(moved[row::batch])
         expected = np.diff(np.arange(lanes+1, dtype=np.int64) * count // lanes)
         if not np.array_equal(moved[row::batch], expected):
@@ -135,6 +165,50 @@ def descriptor_fingerprint(posts, arrays, addresses, *, final_get, arena_base):
         for values in arrays:
             digest.update(values[begin:begin+count].astype("<i4", copy=False).tobytes())
     return digest.hexdigest()
+
+
+def _preplan_detail(marks, moved, work):
+    """Independently time early private planning, including publication waits."""
+    cores = len(marks)
+    batch = cores // 4
+    lane2 = np.zeros(cores, dtype=bool)
+    lane2[2*batch:3*batch] = True
+    if (np.any(marks[~lane2][:, [14, 15, 20, 21, 22]])
+            or np.any(marks[lane2, 14] == 0)
+            or np.any(marks[lane2, 15] < marks[lane2, 14])
+            or np.any(marks[lane2, 15] > marks[lane2, 3])):
+        raise ValueError("Missing, late or misplaced HIGH private preplan marker")
+    start, end = marks[lane2, 14], marks[lane2, 15]
+    active = marks[lane2, 21]
+    if np.any(active > end-start):
+        raise ValueError("HIGH planner active duration exceeds its wall duration")
+    pairs, singles, spill, invalid = marks[:, 16:20].T
+    row_moves, row_pairs = marks[lane2, 20], marks[lane2, 22]
+    # Conservative bounded arithmetic before operations on raw unsigned marker values.
+    if (any(np.any(v > 32768) for v in (pairs, singles, spill, invalid, row_moves, row_pairs))
+            or np.any(2*pairs+singles != moved) or np.any((spill != 0) & (spill != singles))
+            or np.any(2*row_pairs > row_moves) or row_pairs.sum() != pairs.sum()
+            or row_moves.sum() != moved.sum() or int(invalid.sum()) > work["event_count"]):
+        raise ValueError("Invalid per-core HIGH pair, long-cycle, spill or invalidation accounting")
+    intervals = [(int(a), int(b)) for a,b in zip(start, end)]
+    post = (int(marks[:, 4].min()), int(marks[:, 5].max()))
+    if max(b for _,b in intervals) > post[0]:
+        raise ValueError("Private planning finished after the post-permission global barrier")
+    # The separate preplan intervals on 16 AIVs overlap. Count their time union only once.
+    wall = 0
+    previous = 0
+    for a,b in sorted(intervals):
+        wall += max(0, b-max(a, previous))
+        previous = max(previous, b)
+    return dict(row_moves=row_moves.tolist(), row_pairs=row_pairs.tolist(),
+                pairs_by_core=pairs.tolist(), long_by_core=singles.tolist(),
+                spill_by_core=spill.tolist(), invalidations_by_core=invalid.tolist(),
+                active_by_row=active.tolist(), wall_by_row=(end-start).tolist(),
+                early_union=wall, early_active_max=int(active.max()),
+                early_wait_overhead_max=int((end-start-active).max()),
+                early_to_post_gap=post[0]-int(end.max()),
+                index_union_including_early=wall + post[1]-post[0],
+                first_preplan_to_last_index=post[1]-int(start.min()))
 
 
 def decode_high_index(records, detail, *, wait_first, final_get, work):
@@ -185,6 +259,8 @@ def decode_high_index(records, detail, *, wait_first, final_get, work):
         if np.any(joined == 0) or np.any(joined < np.maximum(marks[:, 6], marks[:, 7])):
             raise ValueError("Incomplete or unordered final HIGH collective markers")
         result["joined_span"] = span(marks[:, 3], joined)
+    if np.any(marks[:, 14:23]):
+        result["preplan"] = _preplan_detail(marks, moved, work)
     subphases = marks[:, [4, 11, 12, 5]]
     if np.any(subphases[:, 1:3]):
         if np.any(subphases == 0) or np.any(subphases[:, 1:] < subphases[:, :-1]):

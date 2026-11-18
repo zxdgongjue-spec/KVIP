@@ -8,6 +8,7 @@ profile=0
 candidate=
 high_index=0
 index_speed=0
+index_groups=(4 7 10 17)
 joint=0
 account=0
 init_only=
@@ -33,7 +34,15 @@ elif [[ $# == 1 && $1 == --parity ]]; then
 elif [[ $# == 1 && $1 == --kernels ]]; then
     labels=(serial after)
     profile=1
-elif [[ $# == 2 && $1 == --index-speed && $2 =~ ^[0-9a-f]{40}$ ]]; then
+elif [[ $# -ge 2 && $1 == --index-speed && $2 =~ ^[0-9a-f]{40}$ ]]; then
+    if [[ $# -gt 2 ]]; then
+        index_groups=()
+        for group in "${@:3}"; do
+            [[ $group =~ ^(4|7|10|17)$ && " ${index_groups[*]} " != *" $group "* ]] ||
+                die "Expected unique group numbers from 4, 7, 10, 17"
+            index_groups+=("$group")
+        done
+    fi
     high_index=1
     index_speed=1
     labels=(before after)
@@ -42,7 +51,7 @@ elif [[ $# == 2 && $1 == --high-index && $2 =~ ^[0-9a-f]{40}$ ]]; then
     high_index=1
     candidate=$2
 elif [[ $# != 0 ]]; then
-    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA|--index-speed CANDIDATE_SHA]"
+    die "usage: bash host20_g2.sh [--parity [CANDIDATE_SHA [CONTROL_SHA [--high-post-index]]]|--account CANDIDATE_SHA [INIT_ONLY_SHA]|--kernels|--high-index CANDIDATE_SHA|--index-speed CANDIDATE_SHA [GROUP ...]]"
 fi
 
 diag=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
@@ -69,7 +78,7 @@ if [[ -n $candidate ]]; then
 fi
 [[ -s "$build/CMakeCache.txt" && -x "$cpu" ]] || die "Missing existing KVAF build or CPU helper: $cache"
 if ((high_index)); then
-    for group in 7 10 17 4; do
+    for group in "${index_groups[@]}"; do
         [[ -s "$cache/skip-results.po80Nw/g$group-input/manifest.json" ]] || die "Missing snapshot for G$group"
     done
 else
@@ -143,8 +152,12 @@ if [[ $ready != 1 ]] || ! kill -0 "$pid" 2>/dev/null; then tail -n 8 "$out/.cpu.
 cd "$diag"
 if ((high_index)); then
     study=kvip.diagnostics.high_index_study
-    if ((index_speed)); then study=kvip.diagnostics.high_index_speed; fi
-    python3 -B -m "$study" --cache "$cache" \
+    study_args=()
+    if ((index_speed)); then
+        study=kvip.diagnostics.high_index_speed
+        study_args=(--groups "${index_groups[@]}")
+    fi
+    python3 -B -m "$study" "${study_args[@]}" --cache "$cache" \
         --source "$src/auto-${after:0:8}" --revision "$after" --server "127.0.0.1:$port" --result-dir "$out"
     exit
 fi
