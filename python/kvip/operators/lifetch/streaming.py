@@ -46,6 +46,7 @@ class StreamingLIFetchForward:
         if self.resolver_cores != 3 or flag_count != 16:
             raise ValueError("Rebuild KVIP: the public LIFetch pipeline requires the shared three-role ABI")
         self.function = rotating.library.kvip_lifetch_streaming_forward
+        self.score_parts = 0
         if b * self.resolver_cores + 4 * q_workers > shape.aicCount * 2:
             raise ValueError("LIFetch resolver and Fetch workers exceed the concurrently resident AIV budget")
         if shape.finalWorkers != 4:
@@ -152,6 +153,28 @@ class StreamingLIFetchForward:
         self.function.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_uint32]
         self.function.restype = ctypes.c_uint32
 
+    def set_score_t2(self, parts):
+        """Select the experimental URMA entry before graph capture.
+
+        The actual input rows/lengths remain real. History producers write the
+        canonical score buffer; the original T2 tail retains all shared owners.
+        Length tensors must remain fixed for the lifetime of a captured graph.
+        """
+        from kvip.operators.lifetch.score_policy import validate_score_t2
+        validate_score_t2(self.rotating.runtime_shape, parts)
+        function = getattr(self.rotating.library, 'kvip_lifetch_score_t2_forward', None)
+        if function is None:
+            raise ValueError('score_t2 requires a rebuilt URMA library with the experimental entry')
+        for index, expected in ((5, 4), (6, self.history)):
+            values = self.rotating.arguments[index].detach().cpu().reshape(-1).tolist()
+            if len(values) != self.batch or any(value != expected for value in values):
+                raise ValueError('score_t2 requires uniform Q4 and full history lengths')
+        if self.rotating.arguments[12].numel() * self.rotating.arguments[12].element_size() < self.batch*4*self.history*2:
+            raise ValueError('canonical score workspace is too small')
+        function.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_uint32] * 2
+        function.restype = ctypes.c_uint32
+        self.score_parts, self.function = parts, function
+
     def __call__(self):
         stream = (
             self.rotating.lease.check_stream()
@@ -166,6 +189,8 @@ class StreamingLIFetchForward:
             self.shape_pointer,
         ]
         args.append(self.q_workers)
+        if self.score_parts:
+            args.append(self.score_parts)
         result = self.function(*args)
         if result:
             raise RuntimeError(f"streaming LIFetch launch failed: {result}")

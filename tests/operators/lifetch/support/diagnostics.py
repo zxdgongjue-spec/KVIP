@@ -923,6 +923,9 @@ def account(events, name, elapsed, *, full=False, fused_final=False):
                 key
                 for key, prefix in kernels.items()
                 if n == prefix or (n.startswith(prefix + "_") and re.fullmatch(r"(?:_\d+)+", n[len(prefix) :]))
+                or (key == 'li' and any(
+                    n == variant or (n.startswith(variant + '_') and re.fullmatch(r'(?:_\d+)+', n[len(variant):]))
+                    for variant in ('v9_li_kernel_score_t2', 'v9_li_kernel_cold_t2')))
             ),
             None,
         )

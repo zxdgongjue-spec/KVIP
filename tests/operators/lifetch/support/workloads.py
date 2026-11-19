@@ -134,6 +134,8 @@ def configuration(argv=None):
             command.add_argument('--prefetch-tokens', type=int, default=512)
             command.add_argument('--prefetch-rank-start', type=int, default=1024,
                                  help='URMA initial admission rank (1..2048); progresses to 2048 by per-Q coverage')
+            command.add_argument('--li-score-parts', type=int, default=0,
+                                 help='experimental URMA full-score producer + original T2 tail; 0 keeps the default')
             command.add_argument('--intermediate-fetches', type=int, default=8)
             command.add_argument('--warmup', type=int, default=4, help='whole-graph warmup repetitions')
             command.add_argument('--iterations', type=int, default=20, help='independent complete invocations captured in one measured graph')
@@ -183,6 +185,10 @@ def configuration(argv=None):
                 parser.error('invalid synthetic geometry or seed')
         if not 1 <= args.prefetch_rank_start <= 2048:
             parser.error('prefetch-rank-start must be in 1..2048')
+        if not 0 <= args.li_score_parts <= 32 or (args.li_score_parts and args.transport != 'urma'):
+            parser.error('li-score-parts must be 0..32; the experimental entry requires URMA')
+        if args.li_score_parts and args.input == 'synthetic' and args.index_heads != 32:
+            parser.error('the experimental T2 score entry requires 32 Index heads')
         if args.transport != 'urma' and args.prefetch_rank_start != 1024:
             parser.error('prefetch-rank-start requires the URMA ranked prefetch path')
         if (args.warmup < 0 or args.iterations <= 0 or not 1 <= args.intermediate_fetches <= 32

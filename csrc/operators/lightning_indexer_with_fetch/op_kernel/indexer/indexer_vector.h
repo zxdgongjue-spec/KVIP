@@ -105,6 +105,12 @@ public:
 #else
                                      bool publishShardEnd = false);
 #endif
+    __aicore__ inline void PublishColdTile(const QLICommon::RunInfo &info,
+        uint32_t curAivS1Idx, uint32_t curAivS1ProcNum, uint32_t progressShard, bool publishShardEnd);
+#if !V9_UBMEM
+    __aicore__ inline void ProcessPrecomputedVec1(const QLICommon::RunInfo &info,
+        uint32_t progressShard, bool publishShardEnd);
+#endif
     __aicore__ inline void ProcessTopK(const QLICommon::RunInfo &info, uint32_t queryRow = SIM_Q);
     __aicore__ inline void SetPrefixStorage(GM_ADDR output) { prefixOutput_ = output; }
 #if KVIP_STREAMING_LI
@@ -730,12 +736,21 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     copyOutParams.srcStride = (UB_BANK_DEPTH_STRIDE - copyOutParams.blockLen) / 32;
     copyOutParams.dstStride = (QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_) - s2BaseSize_) * sizeof(SCORE_T);
     DataCopyPad(scoreGm[vec1OutGmOffset], outBase, copyOutParams);
-#if SIM_CAPTURE_HITS
 #if !V9_UBMEM
-    if (!scoreOnly && curS2Idx >= runtimeShape_.resident) {
-#else
-    if (curS2Idx >= runtimeShape_.resident) {
+    if (!scoreOnly)
 #endif
+        PublishColdTile(info, curAivS1Idx, curAivS1ProcNum, progressShard, publishShardEnd);
+    SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
+    CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);   //V核处理完，通知C核可以把mm1Res搬运到UB
+}
+
+template <typename QLIT>
+__aicore__ inline void QLIVector<QLIT>::PublishColdTile(const QLICommon::RunInfo &info,
+    uint32_t curAivS1Idx, uint32_t curAivS1ProcNum, uint32_t progressShard, bool publishShardEnd)
+{
+    uint32_t pingpong = info.loop % 2, curS2Idx = info.s2Idx * s2BaseSize_;
+#if SIM_CAPTURE_HITS
+    if (curS2Idx >= runtimeShape_.resident) {
         constexpr uint32_t prefixBytes = SIM_Q * 2048 * 6 + SIM_Q * 256;
         GlobalTensor<uint8_t> outputHits;
         outputHits.SetGlobalBuffer((__gm__ uint8_t *)(prefixOutput_ + runtimeShape_.batch * prefixBytes));
@@ -749,11 +764,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     }
 #endif
 
-#if !V9_UBMEM
-    if (!scoreOnly && curS2Idx >= runtimeShape_.resident && (publishShardEnd || (info.s2Idx + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
-#else
     if (curS2Idx >= runtimeShape_.resident && (publishShardEnd || (info.s2Idx + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
-#endif
         rotating::IsTrigger(runtimeShape_.history,runtimeShape_.resident,runtimeShape_.rounds,info.s2Idx + 1))) {
         const uint32_t tableBase = (info.s2Idx / 64) * 64;
         if (tableBase != rotationProgressBase_) {
@@ -772,9 +783,42 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         DataCopyPad(rotationProgressGm_[(info.bIdx * SIM_Q + curAivS1Idx) * 32 + progressShard * 16],
             rotationProgress_[(info.s2Idx % 64) * 16], publish);
     }
-    SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
-    CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);   //V核处理完，通知C核可以把mm1Res搬运到UB
 }
+
+#if !V9_UBMEM
+// The score kernel has completed before this T2 consumer starts. Read the
+// canonical two-Q tile once, classify with the unique resident threshold,
+// then publish the unchanged bitmap/progress. No score rewrite or Cube credit.
+template <typename QLIT>
+__aicore__ inline void QLIVector<QLIT>::ProcessPrecomputedVec1(const QLICommon::RunInfo &info,
+    uint32_t progressShard, bool publishShardEnd)
+{
+    uint32_t pingpong = info.loop % 2, query = (blockId_ % 2) * 2;
+    auto out = vec1OutUB_[pingpong * (UB_BANK_STRIDE / sizeof(uint16_t))];
+    WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
+    DataCopyExtParams copy{2, s2BaseSize_ * uint32_t(sizeof(SCORE_T)),
+        (runtimeShape_.history - s2BaseSize_) * uint32_t(sizeof(SCORE_T)),
+        (UB_BANK_DEPTH_STRIDE - s2BaseSize_ * uint32_t(sizeof(SCORE_T))) / 32, 0};
+    DataCopyPadExtParams<SCORE_T> pad{false, 0, 0, 0};
+    DataCopyPad(out, scoreGm[query * runtimeShape_.history + info.s2Idx * s2BaseSize_], copy, pad);
+    SetFlag<HardEvent::MTE2_V>(EVENT_ID0); WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+    auto scores = reinterpret_cast<__ubuf__ uint16_t*>(out.GetPhyAddr());
+    auto threshold = reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_.GetPhyAddr());
+    auto hits = reinterpret_cast<__ubuf__ uint16_t*>(classifyUB_.GetPhyAddr()) + pingpong * 256;
+    __VEC_SCOPE__ {
+        MicroAPI::RegTensor<uint16_t> values;
+        auto all = MicroAPI::CreateMask<uint16_t, MicroAPI::MaskPattern::ALL>();
+        for (uint16_t q = 0; q < 2; ++q) {
+            MicroAPI::LoadAlign(values, scores + q * (UB_BANK_DEPTH_STRIDE / sizeof(uint16_t)));
+            vector1::ClassifyScore(values, threshold + q * 128, hits + q * 128, all);
+        }
+    }
+    SetFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
+    WaitFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
+    PublishColdTile(info, query, 2, progressShard, publishShardEnd);
+    SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
+}
+#endif
 
 #if KVIP_STREAMING_LI
 template <typename QLIT>

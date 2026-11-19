@@ -5,6 +5,9 @@
 // Stable host ABI; implementations live in launch.cpp.
 extern "C" {
 uint32_t kvip_lifetch_streaming_forward(void* bindings, void* update, void* workspace, void* stream, const rotating::RuntimeShape* shape, uint32_t workers);
+// Opt-in URMA experiment: full canonical score followed by the original T2 tail.
+uint32_t kvip_lifetch_score_t2_forward(void* bindings, void* update, void* workspace, void* stream,
+                                    const rotating::RuntimeShape* shape, uint32_t workers, uint32_t parts);
 
 uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape);
 uint32_t v9_init(void* bindings, void* stream,const rotating::RuntimeShape* shape);

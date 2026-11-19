@@ -23,6 +23,7 @@
 #include "lib/matmul_intf.h"
 #include "lib/matrix/matmul/tiling.h"
 #include "indexer_types.h"
+#include "../../../common/lifetch/score_partition.h"
 #include <indexer_vector.h>
 #include "indexer_cube.h"
 
@@ -91,6 +92,9 @@ public:
     bool sequenceTopKOnly_ = false;
 #if !V9_UBMEM
     GM_ADDR rotationContext_ = nullptr;
+    bool scoreOnly_ = false;
+    uint32_t scoreParts_ = 1;
+    bool precomputedScore_ = false;
 #endif
 private:
     static constexpr uint32_t HEAD_DIM = 128;
@@ -459,6 +463,15 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Init(__gm__ uint8_t *q
     InitActualSeqLen(actualSeqLengthsQ, actualSeqLengthsK);
 
     // 获取分核信息
+#if !V9_UBMEM
+    if (scoreOnly_) {
+        const auto slice = kvip_score_t2::Partition(aiCoreIdx, scoreParts_, runtimeShape_.history);
+        splitCoreInfo.bN2Start = splitCoreInfo.bN2End = slice.owner;
+        splitCoreInfo.s2Start = slice.beginTile;
+        splitCoreInfo.s2End = slice.endTile - 1;
+        splitCoreInfo.isCoreEnable = true;
+    } else
+#endif
     if (sequenceSplit_) {
         splitCoreInfo.bN2Start = aiCoreIdx / 2;
         splitCoreInfo.bN2End = splitCoreInfo.bN2Start;
@@ -475,6 +488,9 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Init(__gm__ uint8_t *q
     uint64_t singleCoreScoreSize = constInfo.s1BaseSize * QLICommon::Align((uint64_t)constInfo.kSeqSize,
                                     (uint64_t)constInfo.s2BaseSize)  * sizeof(SCORE_T);
     uint32_t scoreRow = sequenceSplit_ ? aiCoreIdx / 2 : aiCoreIdx;
+#if !V9_UBMEM
+    if (scoreOnly_) scoreRow = aiCoreIdx / scoreParts_;
+#endif
     scoreGm.SetGlobalBuffer((__gm__ SCORE_T *)(workspace + scoreRow * singleCoreScoreSize));
     offset += GetBlockNum() * singleCoreScoreSize;
 
@@ -695,6 +711,10 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
         if ASCEND_IS_AIC {
             matmulService.ComputeMm1(info);
         } else {
+#if !V9_UBMEM
+            if (precomputedScore_) vectorService.ProcessPrecomputedVec1(info, shard, tile + 1 == end);
+            else
+#endif
             vectorService.ProcessVec1(info, shard, tile + 1 == end);
         }
     }
@@ -771,8 +791,14 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
     } else {
         if ASCEND_IS_AIV {
             vectorService.AllocEventID();
+#if !V9_UBMEM
+            if (!precomputedScore_) {
+#endif
             CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT);
             CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + 1);
+#if !V9_UBMEM
+            }
+#endif
         } else {
             matmulService.AllocEventID();
         }
@@ -866,7 +892,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()
         for (uint32_t gS1LoopIdx = splitCoreInfo.gS1Start; gS1LoopIdx <= tempLoopInfo.gS1LoopEnd; gS1LoopIdx++) {
             CalcS2LoopParams(bN2LoopIdx, gS1LoopIdx);
 #if !V9_UBMEM
-            bool hadRecent = ScoreRecent(gloop, qScaleLoop);
+            bool hadRecent = !scoreOnly_ && ScoreRecent(gloop, qScaleLoop);
 #endif
             uint32_t kScaleLoop = 0;
             for (int s2LoopIdx = splitCoreInfo.s2Start; s2LoopIdx <= tempLoopInfo.s2LoopEnd; s2LoopIdx++) {
@@ -916,9 +942,9 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessBaseBlock(uint3
         matmulService.ComputeMm1(runInfo);
 #if !V9_UBMEM
     } else {
-        vectorService.ProcessVec1(runInfo);
+        vectorService.ProcessVec1(runInfo, 0, false, scoreOnly_);
     }
-    FinishBaseBlock(runInfo);
+    if (!scoreOnly_) FinishBaseBlock(runInfo);
 }
 
 template <typename QLIT>

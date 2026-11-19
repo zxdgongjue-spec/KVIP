@@ -1,0 +1,39 @@
+{
+  "cpu_tests": {
+    "status": "PASS",
+    "count": 6
+  },
+  "script_dry_run": "PASS",
+  "cann_npu_build": "PASS",
+  "cann_sim_build": "PASS",
+  "npu_binary_sha256": "9ac13c75d661c37e91ff844175f671b814746c508053c339b09182c6bcfe0bf7",
+  "sim_binary_sha256": "d78cd51a581e84ecb65f4890c62ebbd77f0ca30168c5a746cadcca09bc9e1de8",
+  "model_score": {
+    "status": "PASS",
+    "scope": "CANN Model score producer only; not URMA LIFetch tail or A5 latency",
+    "batch": 1,
+    "queries": 4,
+    "history": 131072,
+    "resident": 16384,
+    "index_heads": 32,
+    "score_parts": 16,
+    "score_aic": 16,
+    "score_aiv": 32,
+    "model_aic": 32,
+    "model_aiv": 64,
+    "oracle_keys": 524288,
+    "guards": true,
+    "whole_model_ticks": 48726,
+    "run_mode": "sim",
+    "soc_build": "Ascend950PR_9599",
+    "soc_model": "Ascend950PR_9589",
+    "cann": "9.1.0",
+    "binary_sha256": "d78cd51a581e84ecb65f4890c62ebbd77f0ca30168c5a746cadcca09bc9e1de8",
+    "kernel_log": "score_model_sim_p16.log",
+    "full_chain_verified": false,
+    "instruction_dump_enabled": false,
+    "input_pattern": "Q4 identical positive FP8 queries; key token has token%129 ones; weight/query_scale/key_scale=1"
+  },
+  "full_candidate_chain": "NOT_RUN",
+  "a5_reproduction": "NOT_RUN"
+}
