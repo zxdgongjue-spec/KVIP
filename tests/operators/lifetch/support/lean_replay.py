@@ -129,6 +129,8 @@ def stage_report(states, profile, samples, mhz, policy, directory):
             # time in common, without treating every such cycle as saved.
             windows = []
             for q in range(4):
+                if policy != 'main':
+                    bracket('final_topk', li[r,q], 14, 15)
                 bracket('li_final_classification', li[r,q], 0, 7)
                 f = fetch[r, q*24:(q+1)*24]
                 for groups, start, end in ((16, 3, 4), (17, 7, 8)):
@@ -169,6 +171,7 @@ def stage_report(states, profile, samples, mhz, policy, directory):
                   direct_plan_and_describe='candidate direct resolver including descriptor generation, excludes input staging, per marked row',
                   index_metadata='per-row metadata interval after final selection',
                   finalize_including_waits='per-row finalizer entry through status publication, includes joins',
+                  final_topk='per-query final score read and TopK sort before location classification, candidate diagnostic only',
                   li_final_classification='per-query final classification including its waits',
                   final_get_post='KVAF post-active time per nonempty final Get worker/phase',
                   final_get_cq_wait='KVAF drain-wait time per nonempty final Get worker/phase')
@@ -214,7 +217,7 @@ def stage_report(states, profile, samples, mhz, policy, directory):
                 diagnostic_final_get_submitted_groups=measured_range(group_counts),
                 route_policy=policy, direct_plan_rows=direct, cycles_per_us=mhz,
                 measured_graph_calls=len(samples), diagnostic_graph_replays=1, diagnostic_graph_calls=len(states),
-                routing_init_us=None, topk_only_us=None, index_cq_hidden_us=None,
+                standalone_init_us=None, index_cq_hidden_us=None,
                 scope='Auxiliary counters exclude headline. Individual role durations run in parallel. '
-                      'No standalone init, TopK-only bracket or counterfactual hidden Index duration. '
+                      'Main has no isolated final TopK probe. Counterfactual hidden Index time is unmeasured. '
                       'Stock producer can choose a different sparse helper under detailed instrumentation.')
