@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-from kvip.diagnostics.ranked_port import load_case, summarize
+from kvip.diagnostics.ranked_port import kernel_costs, load_case, summarize
 
 
 def decode(times, events, batch, rate, *, ranked):
@@ -63,12 +63,18 @@ def decode(times, events, batch, rate, *, ranked):
 
 
 def report(root):
+    kernels = {}
     for name in ("reverse", "ranked"):
         case = load_case(root / f"g7-{name}-2.json")
         samples = case.get("native_diagnostics", {}).get("samples", [])
         if not samples:
             raise ValueError(f"Missing diagnostic replay: {name}")
         print(f"AUDIT_BEGIN G7 {name}")
+        cost = kernel_costs(case)
+        if cost:
+            kernels[name] = cost
+            print(f"KERNEL_US {name} init/LI/resolve_update=" + "/".join(f"{v:.2f}" for v in cost)
+                  + " separate_profile=1")
         for sample_id, sample in enumerate(samples):
             audit = sample.get("li_phase_audit", {})
             if audit.get("status") != "available":
@@ -87,6 +93,10 @@ def report(root):
                     print(f"WINDOW_MAX epoch={epoch} lane={slow['lane']} total_us={slow['open_to_return']:.2f} "
                           f"rank_us={slow['rank_update']:.2f} wait_us={slow['combined_wait']:.2f}")
         print("AUDIT_END")
+    if len(kernels) == 2:
+        delta = [v-b for v, b in zip(kernels["ranked"], kernels["reverse"])]
+        print("KERNEL_DELTA_US ranked-minus-reverse init/LI/resolve_update="
+              + "/".join(f"{v:+.2f}" for v in delta) + " separate_profile=1")
     print("AUDIT_PASS timings=separate_instrumented_replay; no_speedup_claim; raw_per_query_and_window_records_in_JSON")
 
 
