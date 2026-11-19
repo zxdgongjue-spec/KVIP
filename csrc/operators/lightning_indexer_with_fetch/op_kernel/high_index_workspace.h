@@ -63,6 +63,31 @@ inline void EmitEdges(__gm__ Edge* edges, __gm__ uint32_t* dense, uint32_t histo
     asc_threadfence();
 }
 
+template<class T>
+__simt_callee__ inline void ExchangeTwoColumns(__gm__ T* column,
+        uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    T x = asc_ldcg(column + a), y = asc_ldcg(column + b);
+    T z = asc_ldcg(column + c), w = asc_ldcg(column + d);
+    asc_stcg(column + a, y); asc_stcg(column + b, x);
+    asc_stcg(column + c, w); asc_stcg(column + d, z);
+}
+
+// The plan only places disjoint two-cycles in edges[p0:p1]. Issue both
+// records before their stores so an independent key can be in flight.
+__simt_callee__ inline void ExchangeTwoPairs(__gm__ Edge* edges, uint32_t i, uint32_t field,
+        __gm__ uint64_t* keys, __gm__ uint32_t* scales, __gm__ uint64_t* addr,
+        __gm__ uint64_t* logical) {
+    uint32_t a = asc_ldcg(&edges[i].src), b = asc_ldcg(&edges[i].dst);
+    uint32_t c = asc_ldcg(&edges[i+16].src), d = asc_ldcg(&edges[i+16].dst);
+    auto ka = keys + uint64_t(a)*16 + field, kb = keys + uint64_t(b)*16 + field;
+    auto kc = keys + uint64_t(c)*16 + field, kd = keys + uint64_t(d)*16 + field;
+    uint64_t x = asc_ldcg(ka), y = asc_ldcg(kb);
+    uint64_t z = asc_ldcg(kc), w = asc_ldcg(kd);
+    if (field < 2) ExchangeTwoColumns(field == 0 ? addr : logical, a, b, c, d);
+    else if (field == 2) ExchangeTwoColumns(scales, a, b, c, d);
+    asc_stcg(ka, y); asc_stcg(kb, x); asc_stcg(kc, w); asc_stcg(kd, z);
+}
+
 template<bool Scatter, bool Spill>
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void Transfer(__gm__ Edge* edges, uint32_t p0, uint32_t p1, uint32_t s0, uint32_t s1,
@@ -71,7 +96,10 @@ inline void Transfer(__gm__ Edge* edges, uint32_t p0, uint32_t p1, uint32_t s0, 
                      __gm__ Tuple* spill, __ubuf__ Tuple* local) {
     const uint32_t tuple = threadIdx.x / 16, field = threadIdx.x % 16;
     if constexpr (!Scatter) {
-        for (uint32_t i = p0 + tuple; i < p1; i += 16) {
+        uint32_t i = p0 + tuple;
+        for (; i + 16 < p1; i += 32)
+            ExchangeTwoPairs(edges, i, field, keys, scales, addr, logical);
+        if (i < p1) {
             uint32_t a = asc_ldcg(&edges[i].src), b = asc_ldcg(&edges[i].dst);
             auto ka = keys + uint64_t(a) * 16 + field;
             auto kb = keys + uint64_t(b) * 16 + field;

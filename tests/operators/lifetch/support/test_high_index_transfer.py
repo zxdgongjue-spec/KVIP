@@ -80,6 +80,7 @@ void check(uint32_t pairs, uint32_t longer, uint32_t cores) {
     }
 }
 int main(){check(0,0,4);check(5000,0,64);check(17,219,7);
+           for(uint32_t n:{15,16,17,31,32,33}) {check(n,n,1);check(2*n+1,2*n+3,2);}
            check(19,2*kLocalTuples+1,2);check(0,2*kLocalTuples+2,2);}
 """)
     binary = tmp_path / "transfer"
