@@ -193,7 +193,8 @@ __aicore__ inline void OutputWorker(__gm__ Args* a,uint32_t b){
    input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*kSlots+q*kTop);
    // loc is disjoint from the descriptor packing buffers; load it while
    // packing publishes the Fetch group, then join before service output mapping.
-   DataCopy(loc[q*kTop],input,kTop);SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+   DataCopy(loc[q*kTop],input,kTop);
+   SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
    auto direct=reinterpret_cast<__gm__ int32_t*>(a->packedFetch)+4*workers*(3*stride+meta)+(q*workers+b%workers)*(6*stride+64);
    auto compactAddresses=QueryGroupCounters(a,shape.batch,b,q)?reinterpret_cast<__gm__ uint64_t*>(reinterpret_cast<__gm__ int32_t*>(a->packedFetch)+(q*workers+b%workers)*(3*stride+meta)):nullptr;
    // Compact Resolve already published FinalPost and the group counter.
@@ -208,7 +209,10 @@ __aicore__ inline void OutputWorker(__gm__ Args* a,uint32_t b){
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);error=ctl.GetValue(1);groupPublished=compactAddresses!=nullptr;
    }
    if(profile)ticks[7+q*6]=GetSystemCycle();
-   WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+   // MTE3 consumes the slot row directly. Descriptor packing may finish
+   // before this DMA read, especially when the resolver already posted Get.
+   WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+   SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
    if(!error){PublishQueryOutputs(u,shape.batch,b,q,bulkLogical?selected[q*kTop]:work[64],loc,bulkLogical?ctl[kOutputMasksOffset+q*kOutputMasksPerQuery]:work);
     if(!compactAddresses)SyncFetchDescriptors(ctx,b*kSlots+q*kTop,count);}
    if(profile)ticks[8+q*6]=GetSystemCycle();

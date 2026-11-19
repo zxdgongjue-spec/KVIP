@@ -3431,10 +3431,18 @@ class FusedReplayState:
         invalid = (ids < 0) | (ids >= self.history) | (slots < 0) | (slots >= self.stride)
         if invalid.any():
             row, query, position = np.unravel_index(invalid.argmax(), invalid.shape)
+            # Resolve output rows through the same unpack map as the output worker.
+            source = int(self.workspace.inputs.unpack_indices.reshape(-1)[row * 4 + query].cpu())
+            source_row, source_q = divmod(source, 4)
+            raw_slot = selected = None
+            if 0 <= source_row < self.batch:
+                raw_slot = int(self.rotating.locations.reshape(self.batch, 4, 2048)[source_row, source_q, position].cpu())
+                selected = int(self.workspace.topk.reshape(self.batch, 4, 2048)[source_row, source_q, position].cpu())
             raise RuntimeError(
                 f'Replay output token/slot outside allocated bounds: request={row} Q={query + 1} '
                 f'position={position} token={ids[row, query, position]} history={self.history} '
-                f'slot={slots[row, query, position]} stride={self.stride} invalid={invalid.sum()}')
+                f'slot={slots[row, query, position]} stride={self.stride} invalid={invalid.sum()} '
+                f'source={source} selected={selected} resolver_slot={raw_slot}')
         output = self.output[1:].cpu().numpy()
         layout, hot_valid = self.validate_index(inputs, output)
         for row in range(self.batch):
