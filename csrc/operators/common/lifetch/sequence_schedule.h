@@ -15,7 +15,7 @@ LIFETCH_SCHEDULE_DEVICE inline uint32_t ColdWindowCount(const RuntimeShape& s) {
 // The ranked G7 replay has 449 pairs of tiles. The reference gives the
 // final odd pair to one shard and clips the other at the end of history.
 LIFETCH_SCHEDULE_DEVICE inline uint32_t SequenceBlockPairs(uint32_t cold) {
-#if KVIP_RANKED_PORT && KVIP_G7_SCAN_CLOCK != 1 && KVIP_G7_SCAN_CLOCK != 2
+#if (KVIP_RANKED_PORT && !KVIP_G7_SCAN_CLOCK) || KVIP_G7_SCAN_CLOCK == 3
     return (cold / 256 + 1) / 2;
 #else
     return cold / 512;
@@ -32,7 +32,7 @@ LIFETCH_SCHEDULE_DEVICE inline bool UseSequenceSplit(const RuntimeShape& s) {
     // Both shards must have a final tile to drain their persistent pipelines.
     return halfBlocks*(2*windows-1)<cold/256 && s.splitQ && s.indexHeads == 32 && s.rounds > 1 && s.resident % 512 == 0 &&
         s.history > s.resident &&
-#if KVIP_RANKED_PORT && KVIP_G7_SCAN_CLOCK != 1 && KVIP_G7_SCAN_CLOCK != 2
+#if (KVIP_RANKED_PORT && !KVIP_G7_SCAN_CLOCK) || KVIP_G7_SCAN_CLOCK == 3
         cold % 256 == 0 &&
 #else
         cold % 512 == 0 &&
