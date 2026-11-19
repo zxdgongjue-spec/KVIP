@@ -9,6 +9,9 @@
 #include "staged_urma_pack.h"
 #include "staged_outputs.h"
 #include "pipeline_types.h"
+#if !V9_UBMEM
+#include "adaptive_route.h"
+#endif
 #include "shadow_exchange_parallel.h"
 #include "index_cache_update.h"
 using namespace AscendC;
@@ -229,6 +232,9 @@ __aicore__ inline void SyncFetchDescriptors(__gm__ Context* ctx, uint32_t begin,
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->fallbackAddresses)+uint64_t(begin)*8,uint64_t(count)*8);
 }
 #include "output_worker.h"
+#if !V9_UBMEM && KVIP_OUTPUT_WORKER
+#include "adaptive_low_resolve.h"
+#endif
 __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
@@ -243,7 +249,12 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  auto ticks=reinterpret_cast<__gm__ uint64_t*>(a->times)+b*64;
  bool profile=(a->prefetchCount & 0x80000000U)!=0;
  if(profile)ticks[1]=GetSystemCycle();
- uint32_t inputError=0,upperMisses=0;bool bounded=true;
+#if !V9_UBMEM && KVIP_OUTPUT_WORKER
+ const bool zero=AdaptiveLow(a);
+#else
+ constexpr bool zero=false;
+#endif
+ uint32_t inputError=zero && (row->slots || row->requests);uint32_t upperMisses=0;bool bounded=true;
  if(!a->queryBitmaps || !a->queryErrors || !a->updateBindings || !a->packedFetch || !ctx->hotValid || !ctx->changeCount || row->slots>kPrefetch ||
     shape.history!=a->history || shape.resident!=a->resident || shape.resident>131072 || shape.finalWorkers!=4 || a->maxEvents<kPrefetch+kSlots)inputError=1;
  if(!inputError){auto errors=reinterpret_cast<__gm__ uint32_t*>(a->queryErrors)+(b*4)*32;
@@ -258,10 +269,12 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
   for(uint32_t q=0;q<kFlagCount;++q){if(q==6 || (q>=7 && q<12))continue;flags[q].count=0;flags[q].error=inputError;flags[q].ready=1;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+q),kBatchFlagPayloadBytes);}
   return;}
  TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,kFinalScratchBytes);auto local=scratch.Get<uint32_t>();
- Simt::VF_CALL<PublishPrefetch>(Simt::Dim3{512,1,1},reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+b*10240,
-  reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots,reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+b*a->maxEvents,
-  reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+b*a->maxEvents,row->slots);
- SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+ if(!zero){
+  Simt::VF_CALL<PublishPrefetch>(Simt::Dim3{512,1,1},reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+b*kChangeCapacity,
+   reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots,reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+b*a->maxEvents,
+   reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+b*a->maxEvents,row->slots);
+  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+ }
  flags[0].count=row->slots;flags[0].ready=1;if(profile)ticks[0]=GetSystemCycle();
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&flags[0]),kBatchFlagPayloadBytes);
  auto selected=local,loc=local[kSlots],keys=local[2*kSlots],ranks=local[3*kSlots];
@@ -303,7 +316,18 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  locationsGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+uint64_t(b)*kSlots);
  bool shortLru=bounded && row->slots+upperMisses<=kLruSlots;
  uint32_t buckets=bounded?512U:kSlots;
- if(streamQueries){
+ if(zero){
+  // Compact LI lists are read only by the resolver. A dense overflow consumes
+  // the already classified locations and preserves the exact same allocator.
+  if(!bounded){DataCopy(selected,selectedGm,kSlots);DataCopy(loc,locationsGm,kSlots);}
+  input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots);
+  DataCopy(work[4096],input,kLruSlots);
+  if(bounded)ranks=keys[buckets];
+  Duplicate(keys,UINT32_MAX,2*buckets);
+  Duplicate(ctl,uint32_t(0),32);
+  SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+  PipeBarrier<PIPE_V>();
+ }else if(streamQueries){
   input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*kLruSlots);
   if(!shortLru)DataCopy(work[4096],input,kLruSlots);
   else if(upperMisses){
@@ -338,12 +362,27 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  }
  GlobalTensor<uint32_t> output;output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*kSlots);
  auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*32;
+ if(profile){ticks[9]=0;ticks[30]=0;ticks[31]=0;}
 
  // A dense Q3/Q4 can reuse the full result row of an earlier sparse Q.
  bool sparsePrior[4]={};
  uint32_t firstQ=0;
 #if !V9_UBMEM && KVIP_OUTPUT_WORKER
- if(streamQueries && ctx->fallbackAddresses && !(a->prefetchCount&0x20000000U) && !profile){
+ if(zero){
+  uint64_t start=profile?GetSystemCycle():0;
+  if(bounded){
+   Simt::VF_CALL<adaptive_low::Resolve<true>>(Simt::Dim3{512,1,1},stagedArgs,stagedContext,b,
+    FinalPtr(selected),FinalPtr(loc),FinalPtr(keys),FinalPtr(ranks),FinalPtr(slots),
+    reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(work),FinalPtr(ctl));
+  }else{
+   Simt::VF_CALL<adaptive_low::Resolve<false>>(Simt::Dim3{512,1,1},stagedArgs,stagedContext,b,
+    FinalPtr(selected),FinalPtr(loc),FinalPtr(keys),FinalPtr(ranks),FinalPtr(slots),
+    reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(work),FinalPtr(ctl));
+  }
+  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+  if(!ctl.GetValue(1))firstQ=4;
+  if(profile){ticks[9]=bounded?1:2;ticks[30]=GetSystemCycle()-start;ticks[31]=ctl.GetValue(0);}
+ }else if(streamQueries && ctx->fallbackAddresses && !(a->prefetchCount&0x20000000U) && !profile){
   uint32_t workers=(a->prefetchCount>>16)&0xffU;
   ctl.SetValue(20,0);SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
   Simt::VF_CALL<ResolveFirstCompactQuery>(Simt::Dim3{64,1,1},stagedArgs,stagedContext,b,shape.resident,row->slots,workers,shape.batch*kTop,
@@ -542,6 +581,7 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
  uint32_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
  if(profile)ticks[10]=GetSystemCycle();
  uint32_t total=0,error=0,seen=0;bool denseMode=false;
+ uint64_t applyTicks=0,applyCalls=0,swapStart=0;
  auto dense=reinterpret_cast<__gm__ uint32_t*>(a->denseShadow)+uint64_t(b)*shape.history*6;
  bool prepareMetadata=(a->prefetchCount & 0x08000000U)!=0;
  auto update=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);
@@ -568,9 +608,11 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
    error=AwaitPublication(flags);
    bool prefixApplied=false;
    if(!error && prefix){
+    if(profile)swapStart=GetSystemCycle();
     Simt::VF_CALL<SwapColdIndexRows<false>>(Simt::Dim3{THREADS,1,1},src,dst,0,prefix,
      shape.resident,shape.history,keys,scales,work);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+    if(profile){applyTicks+=GetSystemCycle()-swapStart;++applyCalls;}
     prefixApplied=!local.GetValue(CONTROL);
    }
    if(!error && (!prefix || prefixApplied)){
@@ -584,9 +626,11 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
     }
     if(!error && final<=upper){
      if(final){
+      if(profile)swapStart=GetSystemCycle();
       Simt::VF_CALL<SwapColdIndexRows<false>>(Simt::Dim3{THREADS,1,1},src+kPrefetch,dst+kPrefetch,
        prefix,final,shape.resident,shape.history,keys,scales,work);
       SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+      if(profile){applyTicks+=GetSystemCycle()-swapStart;++applyCalls;}
       disjoint=!local.GetValue(CONTROL);
      }else disjoint=true;
      if(disjoint){total=final;seen=prefix+final;}
@@ -594,9 +638,11 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
     if(prefixApplied && !disjoint){
      // The suffix can alias a prefetched row. Reversing the disjoint prefix
      // restores the input permutation for the general planner.
+     if(profile)swapStart=GetSystemCycle();
      Simt::VF_CALL<SwapColdIndexRows<true>>(Simt::Dim3{THREADS,1,1},src,dst,0,prefix,
       shape.resident,shape.history,keys,scales,work);
      SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+     if(profile){applyTicks+=GetSystemCycle()-swapStart;++applyCalls;}
     }
    }
   }
@@ -643,7 +689,9 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
   }
   seen+=count;
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-  error=local.GetValue(CONTROL);if(profile)ticks[13+2*phase]=GetSystemCycle();if(phase)total+=count;
+  error=local.GetValue(CONTROL);
+  if(profile){ticks[13+2*phase]=GetSystemCycle();applyTicks+=ticks[13+2*phase]-ticks[12+2*phase];++applyCalls;}
+  if(phase)total+=count;
  }
  if(!error){uint64_t start=GetSystemCycle();while(true){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+4),kBatchFlagPayloadBytes);if(flags[4].ready){error=flags[4].error;break;}if(GetSystemCycle()-start>5000000000ULL){error=8;break;}}}
  if(!error){auto update=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);uint64_t addressStride=update[7];if(profile)ticks[22]=GetSystemCycle();
@@ -662,7 +710,7 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
   }
   if(profile)ticks[23]=GetSystemCycle();}
- status[0]=error;status[1]=total;status[2]=disjoint?uint32_t(seen!=0):(seen?local.GetValue(CONTROL+4):0);if(profile)ticks[24]=GetSystemCycle();
+ status[0]=error;status[1]=total;status[2]=disjoint?uint32_t(seen!=0):(seen?local.GetValue(CONTROL+4):0);if(profile){ticks[24]=GetSystemCycle();ticks[25]=applyTicks;ticks[26]=applyCalls;}
  if(a->updateBindings){auto u=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);Simt::VF_CALL<PublishStreamingUpdateStatus>(Simt::Dim3{32,1,1},reinterpret_cast<__gm__ uint32_t*>(u[6]),b,error);SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);}
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),128);
  if(profile)kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ticks),256);pipe.Destroy();
@@ -1087,7 +1135,13 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
   Simt::VF_CALL<FinalizeJoinedRow>(Simt::Dim3{256,1,1},a,ctx,flags,b,shape.batch,shape.resident,
    shape.finalPostOffset,(a->prefetchCount>>16)&0xffU,deferredPrefix,FinalPtr(result));
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-  uint32_t done=result.GetValue(12);pipe.Destroy();if(done)return;
+  uint32_t done=result.GetValue(12);
+  if(done && a->routeDemand){
+   // HIGH reports actual physical reads, including speculation. ZERO has no
+   // speculation, hence its transfer count is the true unique miss count.
+   adaptive_route::Commit(a,b,0,row->requests+result.GetValue(13));
+  }
+  pipe.Destroy();if(done)return;
  }
 #endif
  auto info=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*kRowStatusWords;
@@ -1161,6 +1215,11 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
   Simt::VF_CALL<CompleteEarlyUpdate<256>>(Simt::Dim3{256,1,1},update,b,error);
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  }
+#if !V9_UBMEM
+ if(a->routeDemand && !error && !updateError){
+  adaptive_route::Commit(a,b,0,row->requests+total);
+ }
+#endif
  if(profile){ft[3]=GetSystemCycle();kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ft),32*8);}
 }
 
