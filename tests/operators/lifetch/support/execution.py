@@ -229,7 +229,7 @@ def launch(config, directory):
     environment = worker_environment(config.kvaf_root, require_runtime=getattr(config, "operation", None) != "contract")
     if getattr(config, 'candidate_root', None):
         from peer_candidate import candidate_package
-        package, _ = candidate_package(config.candidate_root)
+        package, _ = candidate_package(config.candidate_root, mainline=bool(getattr(config, 'route_policy', None)))
         environment['PYTHONPATH'] = str(package) + os.pathsep + environment['PYTHONPATH']
     command = [sys.executable, '-u', '-X', 'faulthandler', str(Path(__file__).resolve()),
                str(directory / 'config.json')]
@@ -249,7 +249,7 @@ def run_config(path, shared_pool=None):
     config.output = path.parent
     if getattr(config, 'candidate_root', None):
         from peer_candidate import candidate_package
-        package, config.candidate_revision = candidate_package(config.candidate_root)
+        package, config.candidate_revision = candidate_package(config.candidate_root, mainline=bool(getattr(config, 'route_policy', None)))
         if Path(kvip.__file__).resolve().parent != package / 'kvip':
             raise RuntimeError(f'Worker imported unexpected KVIP package: {kvip.__file__}')
     use_pool = config.mode in ('bench', 'diagnose')
@@ -3235,7 +3235,7 @@ class FusedReplayState:
     state must not have live graphs or unfinished device work.
     """
     def __init__(self, torch, runtime, table, library, initial, pages, addresses,
-                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None, candidate_bounds=None):
+                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None, candidate_bounds=None, route_policy=None):
         from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
         from kvip.cache.index_storage import IndexCacheStorage
         from kvip.operators.lifetch.binding import LIFetchBinding
@@ -3293,6 +3293,11 @@ class FusedReplayState:
                     batch=self.batch, history=self.history, resident=self.resident,
                     intermediate_fetches=windows, prefetch_limit=prefetch_tokens,
                     aic_count=aics, token_bytes=self.token_bytes, **binding)
+            if route_policy in ('zero', 'early'):
+                from kvip.operators.lifetch.adaptive_route import AdaptiveRoute
+                self.rotating.adaptive_route = AdaptiveRoute(torch, device, self.batch, self.batch + 1,
+                                                           policy=route_policy)
+                self.route_policy = route_policy
             update_type = UbmemIndexUpdate if ubmem else DirectIndexUpdate
             self.update = update_type(
                 torch, keys=self.storage.keys, scales=self.storage.scales,
@@ -3692,8 +3697,13 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             pending = False
     # Multi-round validation also advances the host LRU for the next input.
     compact = config.mode == "bench" and len(sequence.rounds) == 1
-    candidate = fused and getattr(config, 'candidate_root', None)
-    if candidate:
+    policy = getattr(config, 'route_policy', None)
+    lean = policy in ('zero', 'early')
+    candidate = fused and getattr(config, 'candidate_root', None) and not policy
+    if lean:
+        from lean_replay import check_route as checked_routes, set_step
+        route_history = dict(warmup=[], source=config.candidate_revision, policy=policy)
+    elif candidate:
         from peer_candidate import checked_routes, set_step
         route_history = dict(warmup=[], source=config.candidate_revision)
 
@@ -3701,7 +3711,11 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
         nonlocal pending
         pending = True
         for i, state in enumerate(states):
-            if not compact or (label == 'measured' and i in (0, len(states) - 1)):
+            if policy and label != 'measured':
+                # A matched single-round arm is reset between calls. Check
+                # completion now, and verify every measured state after timing.
+                state.check_completion()
+            elif not compact or (label == 'measured' and i in (0, len(states) - 1)):
                 check = f'{label}/input{i}/round{inputs.source_round}'
                 try:
                     checks.check(check, lambda state=state: state.validate(inputs))
@@ -3724,7 +3738,9 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             pending = True
             state.forward()
             stream.synchronize()
-            if not compact:
+            if policy:
+                state.check_completion()
+            elif not compact:
                 checks.check(f'pre_capture/input{i}', lambda state=state: state.validate(initial))
             elif fused:
                 state.check_completion()
@@ -3751,13 +3767,13 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             for inputs in sequence:
                 for state in states:
                     state.prepare(inputs)
-                    if candidate:
-                        set_step(state.rotating.auto_route, warmup + 1)
+                    if lean or candidate:
+                        set_step(state.rotating.adaptive_route if lean else state.rotating.auto_route, warmup + 1)
                 stream.synchronize()
                 replay()
                 stream.synchronize()
                 validate_all(inputs, f'warmup{warmup}')
-                if candidate:
+                if candidate or lean:
                     route_history['warmup'].append(checked_routes(states, warmup + 1, low=warmup > 0))
         for state in states:
             state.reset()
@@ -3766,9 +3782,9 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             before = []
             for state in states:
                 state.prepare(inputs)
-                if candidate:
-                    set_step(state.rotating.auto_route, config.warmup + 1)
-                elif fused and config.mode == 'diagnose':
+                if lean or candidate:
+                    set_step(state.rotating.adaptive_route if lean else state.rotating.auto_route, config.warmup + 1)
+                if not candidate and fused and config.mode == 'diagnose':
                     initial = algorithm_before(state.rotating)
                     initial['logical_ids'] = state.input_layout.copy()
                     before.append(initial)
@@ -3777,7 +3793,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             measured = profile_graph_batch(torch, TrackedGraph(), calls=len(states), folder=folder,
                                            serial=not fused, transport=config.transport, stream=stream)
             validate_all(inputs, 'measured')
-            if candidate:
+            if lean or candidate:
                 route_history['measured'] = checked_routes(states, config.warmup + 1, low=True)
             rounds[inputs.source_round] = measured['timing']
             samples = []
@@ -3787,7 +3803,11 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                 sample = dict(round=i, repeat=i, source_round=inputs.source_round,
                               us=item['us'], accounting=accounting)
                 if before:
-                    sample['algorithm'] = algorithm_after(states[i].rotating, before[i])
+                    if policy == 'zero':
+                        from lean_replay import zero_traffic
+                        sample['algorithm'] = zero_traffic(states[i], before[i])
+                    else:
+                        sample['algorithm'] = algorithm_after(states[i].rotating, before[i])
                     totals = sample['algorithm'].get('totals', {})
                     sample.update(prefetch=totals.get('prefetch'), final=totals.get('final'))
                 samples.append(sample)
@@ -3805,6 +3825,8 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             for inputs in sequence:
                 for state in states:
                     state.prepare(inputs)
+                    if lean:
+                        set_step(state.rotating.adaptive_route, config.warmup + 2)
                     state.forward.times.zero_()
                     if hasattr(state.rotating, 'rank_progress'):
                         state.rotating.rank_progress.zero_()
@@ -3812,6 +3834,14 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                 replay()
                 stream.synchronize()
                 validate_all(inputs, 'detail')
+                if policy:
+                    from lean_replay import stage_report
+                    if lean:
+                        route_history['diagnostic'] = checked_routes(states, config.warmup + 2, low=True)
+                    folder = directory / 'diagnose' / f'round-{inputs.source_round}'
+                    atomic_json(folder / 'lean_stages.json',
+                                stage_report(states, measured, samples, clock_mhz, policy, folder))
+                    continue
                 from diagnostics import decode_rank_progress
                 details = []
                 for i, state in enumerate(states):
@@ -3867,7 +3897,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                        overlap_mean_us=sum(t['overlap_mean_us'] for t in rounds.values())/len(rounds),
                        outside_invocations_mean_us=sum(t['outside_invocations_mean_us'] for t in rounds.values())/len(rounds))
         return dict(rounds=rounds, all_rounds=overall, correctness=checks.status,
-                    **({'auto_route': route_history} if candidate else {}),
+                    **({'auto_route': route_history} if candidate or lean else {}),
                     failures=checks.failures, sequence_graph_sum=dict(
                         mean_us=sum(t['mean_us'] for t in rounds.values()), samples=1))
     except BaseException as error:
@@ -3953,7 +3983,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             candidate_bounds = None
             if config.transport == 'urma':
                 options = {}
-                if getattr(config, 'candidate_root', None):
+                if getattr(config, 'candidate_root', None) and not getattr(config, 'route_policy', None):
                     from peer_candidate import OPTIONS, seed_bounds
                     options = OPTIONS
                     candidate_bounds = seed_bounds(config.candidate_snapshot, initial)
@@ -3968,7 +3998,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 torch, runtime, view, library, initial, pages, logical_addresses,
                 transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                 prefetch_tokens=config.prefetch_tokens, soc=soc,
-                prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024), candidate_bounds=candidate_bounds)
+                prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024), candidate_bounds=candidate_bounds,
+                route_policy=getattr(config, 'route_policy', None))
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
         if config.mode in ('bench', 'diagnose') and g.get('sparse_mode') == 0 and not fused:
@@ -4015,7 +4046,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                         transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                         prefetch_tokens=config.prefetch_tokens, soc=soc,
                         prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease,
-                        candidate_bounds=candidate_bounds)
+                        candidate_bounds=candidate_bounds,
+                        route_policy=getattr(config, 'route_policy', None))
                     replica.failure_directory = directory
                 else:
                     replica = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)

@@ -144,6 +144,8 @@ def configuration(argv=None):
             path.add_argument('--fused-only', action='store_true',
                               help='measure only the complete fused chain on a real replay')
             command.add_argument('--level', type=int, choices=(1, 2, 3), default=1)
+            command.add_argument('--route-policy', choices=('main', 'zero', 'early'),
+                                 help='G2 mainline or learned low route with matched stage accounting')
             command.add_argument('--candidate-root', type=Path, help='G2 auto-route production checkout')
             command.add_argument('--candidate-snapshot', type=Path, help='matching G2 predecessor bounds')
             command.add_argument('--stages', type=csv_values, default=('all',))
@@ -199,9 +201,18 @@ def configuration(argv=None):
     if args.mode == 'diagnose':
         if (args.serial_only or args.fused_only) and args.input != 'real':
             parser.error('standalone path measurements require --input real')
-        if bool(args.candidate_root) != bool(args.candidate_snapshot):
+        if args.route_policy:
+            if (args.transport != 'urma' or not args.fused_only or args.group != 2
+                    or args.round_range != (1, 1) or args.level != 2 or args.warmup < 2
+                    or (args.intermediate_fetches, args.prefetch_tokens) != (4, 1024)):
+                parser.error('route-policy requires G2 URMA fused-only real round 1:1, level 2, warmup >= 2, 4 windows/1024 tokens')
+            if bool(args.candidate_root) != (args.route_policy != 'main') or args.candidate_snapshot:
+                parser.error('zero/early require --candidate-root; main uses the harness mainline source')
+            if args.candidate_root:
+                args.candidate_root = args.candidate_root.resolve()
+        elif bool(args.candidate_root) != bool(args.candidate_snapshot):
             parser.error('--candidate-root and --candidate-snapshot are required together')
-        if args.candidate_root:
+        if args.candidate_root and not args.route_policy:
             if (not getattr(args, 'fused_only', False) or args.input != 'real' or args.transport != 'urma'
                     or args.group != 2 or args.round_range != (1, 1) or args.level != 1
                     or args.warmup < 2 or (args.intermediate_fetches, args.prefetch_tokens) != (8, 512)):

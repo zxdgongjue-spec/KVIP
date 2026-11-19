@@ -17,10 +17,11 @@ OPTIONS = dict(selected_metadata=True, early_fetch_ready=True, ready_batch_fetch
                low_miss_direct_index=True, low_miss_post_index=True, adaptive_admission=True)
 
 
-def candidate_package(root):
+def candidate_package(root, *, mainline=False):
     path = Path(root).resolve()
     revision = subprocess.check_output(['git', '-C', str(path), 'rev-parse', 'HEAD'], text=True).strip()
-    subprocess.run(['git', '-C', str(path), 'merge-base', '--is-ancestor', REVISION, revision], check=True)
+    base = 'a56154c37bebb0928da4a4095e9670898e6b21c7' if mainline else REVISION
+    subprocess.run(['git', '-C', str(path), 'merge-base', '--is-ancestor', base, revision], check=True)
     subprocess.run(['git', '-C', str(path), 'diff', '--quiet', 'HEAD', '--', 'python', 'csrc'], check=True)
     return path / 'python', revision
 
