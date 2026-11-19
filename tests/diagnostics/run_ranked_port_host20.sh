@@ -27,7 +27,7 @@ case "$mode" in
     audit) groups=(7); audit=1; ranked_sha=aaa8d3429951464d0d62d70b10cbaaf7d3c2ed43 ;;
     donor-scan) groups=(7); prior=1; ranked_sha=9952fad5ed36ce4d2885b66399f6543b8c5a8e7d ;;
     donor-slots) groups=(7); prior=1; ranked_sha=3c3fa6486d470e4ddf020d7701691a4314fc5da0 ;;
-    cold-align) groups=(7); prior=1; prior_sha=3c3fa6486d470e4ddf020d7701691a4314fc5da0; ranked_sha=6adedf322b6adc3fb2b825626331c8489438e64b ;;
+    cold-align) groups=(7); prior=1; prior_sha=3c3fa6486d470e4ddf020d7701691a4314fc5da0; ranked_sha=e97d55b9bb8082f3080c113252e53e4695ef739e ;;
     *) echo "Usage: $0 [all|g7|audit|donor-scan|donor-slots|cold-align]" >&2; exit 2 ;;
 esac
 checkout() {
@@ -169,7 +169,7 @@ run_case() {
             diagnostics=1
             case "$name" in
                 reverse-original) extra=(--study scan-order --scan-variants reverse) ;;
-                forward-original) extra=(--study scan-order --scan-variants forward) ;;
+                forward-original|forward-matched|forward-split) extra=(--study scan-order --scan-variants forward) ;;
                 rank-original|rank-matched|rank-split) extra=(--study threshold --ranked-port) ;;
                 *) return 2 ;;
             esac
@@ -224,10 +224,10 @@ for group in "${groups[@]}"; do
     fi
     for name in "${last_order[@]}"; do run_case "$group" "$name" 2; done
     if [[ "$mode" == cold-align ]]; then
-        for arm in reverse-original forward-original rank-original rank-matched rank-split; do
+        for arm in reverse-original forward-original rank-original forward-matched rank-matched forward-split rank-split; do
             case "$arm" in
-                rank-matched) clock=2 ;;
-                rank-split) clock=3 ;;
+                forward-matched|rank-matched) clock=2 ;;
+                forward-split|rank-split) clock=3 ;;
                 *) clock=1 ;;
             esac
             KVIP_G7_SCAN_CLOCK="$clock" run_case "$group" "$arm" 3

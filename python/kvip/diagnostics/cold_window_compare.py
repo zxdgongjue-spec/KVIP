@@ -116,11 +116,11 @@ def report(root):
             raise ValueError("Expected one profiler pass")
         profile = profiles[0]
         timeline = profile.get("timeline") or {}
-        if not timeline.get("kernels"):
+        expected = 4 if name == "ranked" else 1
+        if sum("v9_li_kernel" in r["name"] for r in timeline.get("kernels", [])) != expected:
             timeline = _csv_timeline(Path(profile["directory"]), profile["artifacts"])
         rows = sorted((r for r in timeline.get("kernels", []) if "v9_li_kernel" in r["name"]),
                       key=lambda r: r["start_us"])
-        expected = 4 if name == "ranked" else 1
         if len(rows) != expected:
             raise ValueError(f"{name}: expected {expected} device LI tasks, saw {len(rows)}")
         span = rows[-1]["start_us"] + rows[-1]["duration_us"] - rows[0]["start_us"]
@@ -129,7 +129,7 @@ def report(root):
         print(f"DEVICE_LI {name} {phases}_us={times} span_us={span:.2f}")
     outside, scans, legacy = {}, {}, {}
     expected_audit_commit = case("ranked", 1)["kvip_commit"]
-    for name in ("reverse-original", "forward-original", "rank-original", "rank-matched", "rank-split"):
+    for name in ("reverse-original", "forward-original", "rank-original", "forward-matched", "rank-matched", "forward-split", "rank-split"):
         c = case(name, 3)
         check(c)
         if c["kvip_commit"] != expected_audit_commit:
@@ -155,6 +155,11 @@ def report(root):
                           ("rank-original", "rank-matched"), ("rank-matched", "rank-split")):
         print(f"CHANGE {before}->{after} outside_mean_us={outside[after]-outside[before]:+.2f}"
               + " scan_delta_by_window=" + "/".join(f"{v:+.2f}" for v in scans[after]-scans[before]))
+    flat_cost = outside["rank-matched"] - outside["forward-matched"]
+    split_cost = outside["rank-split"] - outside["forward-split"]
+    print(f"RANK_COST_SAME_WINDOWS_US matched_flat={flat_cost:+.2f} matched_split={split_cost:+.2f} "
+          f"extra_rank_cost_recovered={flat_cost-split_cost:+.2f} "
+          f"plain_scan_saved={outside['forward-matched']-outside['forward-split']:+.2f}")
     win = True
     for base in controls[:2]:
         delta = timing[base].min(axis=0) - timing["ranked"].max(axis=0)
