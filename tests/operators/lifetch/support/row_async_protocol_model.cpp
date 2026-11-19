@@ -151,7 +151,7 @@ void run(Input in){World world{in};sim=&world;world.e.cq_depth=in.cqDepth;
             assert(mark[30]>=rec.indexDone && mark[30]<=rec.cqDone);
             if(q)assert(mark[28]==0 && mark[29]==0);
             else assert(rec.indexDone<=mark[28] && mark[28]<=mark[29] && mark[29]<=mark[30]);
-            assert(mark[2]==0x52514935 && mark[20]<=mark[21] && mark[21]==rec.packDone);
+            assert(mark[2]==0x52514938 && mark[20]<=mark[21] && mark[21]==rec.packDone);
             assert(mark[21]<=mark[23] && mark[23]<=mark[3]);
             if(!q)assert(mark[21]<=mark[22] && mark[22]<=mark[23]);
             if(q==1)for(int n=24;n<28;++n)assert(mark[n]);
