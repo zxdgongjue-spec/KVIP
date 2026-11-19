@@ -127,6 +127,17 @@ def schedule_format(source):
     raise ValueError(f"Unrecognized row schedule diagnostic ABI at {source}")
 
 
+def cycle_move_bins(histograms):
+    """Count changed tuples, not cycles, in each length bucket after JSON round trip."""
+    bins = [0] * 5
+    for row in histograms:
+        for length, count in row.items():
+            size = int(length)
+            bucket = min(size - 2, 3) if size <= 8 else 4
+            bins[bucket] += size * count
+    return "/".join(map(str, bins))
+
+
 def summarize(group, cases, baseline, candidate, high_overlap=False, schedule_formats=("PIH1", "RQI1"), intermediate=None):
     arms = THREE_SOURCE_ARMS if intermediate else (OVERLAP_ARMS if high_overlap else ARMS)
     sources = overlap_sources(baseline, candidate, intermediate)
@@ -290,6 +301,12 @@ def summarize(group, cases, baseline, candidate, high_overlap=False, schedule_fo
                           f" max_idle_window_us={help_stats['longest_free_window_ticks']/rate:.2f}"
                           f" idle_capacity_core_us={help_stats['free_lane_ticks']/rate:.2f}"
                           f" max_exit_gain_if_only_last_row_changes_us={help_stats['last_row_only_exit_gap_ticks']/rate:.2f}")
+                    if "cycle_histograms" in high:
+                        rows = high["cycle_histograms"]
+                        last = help_stats["last_index_row"]
+                        print(f"G{group} INDEX_CYCLES after length=2/3/4/5-8/9+"
+                              f" moved_by_cycle_len={cycle_move_bins(rows)}"
+                              f" last_Index_row={last} moved_by_cycle_len_last_row={cycle_move_bins([rows[last]])}")
                 if marker in ("RQI4", "RQI5", "RQI6"):
                     early = metrics["early_post"]
                     def times_us(*keys):

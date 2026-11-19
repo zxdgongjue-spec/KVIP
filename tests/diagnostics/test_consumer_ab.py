@@ -106,7 +106,8 @@ def test_high_overlap_arms_reuse_public_completion_records(tmp_path, capsys, for
             diag = c["native_diagnostics"]
             diag["samples"] = diag["samples"][:1]
             diag["samples"][0]["reads"] = dict(final=1, consumer_work=dict(ordered_index_verified=True),
-                high_post_index=dict(persistent_moves_checked=True, row_gathers=10, single_owner_rows=1, schedule_timing=dict(first_post_begin=1000, last_post_begin=1400,
+                high_post_index=dict(cycle_histograms=[{}]*3 + [{"2": 512, "4": 5}] + [{}]*12,
+                                     persistent_moves_checked=True, row_gathers=10, single_owner_rows=1, schedule_timing=dict(first_post_begin=1000, last_post_begin=1400,
                     last_post_return=1500, last_final_wait_return=4000, longest_lane_index=3000,
                     index_completion_spread=500, last_index_minus_last_final_wait=-1000,
                     nonempty_lanes=1, final_api_calls=1, blocking_final_lanes=0,
@@ -132,6 +133,7 @@ def test_high_overlap_arms_reuse_public_completion_records(tmp_path, capsys, for
     assert "identical_work_pairs=18/18" in result and "real_Index_order/TopK/KV/lifecycle/submitted_completed=PASS" in result
     assert result.count("INDEX_HELP") == 1
     assert "INDEX_HELP after last_Index_row/pairs/singles=3/512/20" in result
+    assert "moved_by_cycle_len=1024/0/20/0/0 last_Index_row=3 moved_by_cycle_len_last_row=1024/0/20/0/0" in result
     assert "idle_capacity_core_us=94.00 max_exit_gain_if_only_last_row_changes_us=0.00" in result
     if intermediate:
         assert "VS_middle_us saved_min=6.000/6.000 saved_max=10.000/10.000" in result
@@ -221,6 +223,13 @@ def test_row_owned_partition_checks_exchanges_independently_from_single_moves():
     profile = dict(moved=2*pairs+singles, row_partitions=dict(pairs=pairs, singles=singles, invalidations=[0]*64))
     validate_move_counts(profile, before, after, range(16), two_cycle_moves=[2]+[0]*15, invalidations=[0]*16)
     assert profile["persistent_moves_checked"]
+    profile["cycle_histograms"] = [{2: 1, 3: 1}]+[{}]*15
+    validate_move_counts(profile, before, after, range(16), two_cycle_moves=[2]+[0]*15, invalidations=[0]*16)
+    for bad in ({3: 1}, {5: 1}):
+        profile["cycle_histograms"][0] = bad
+        with pytest.raises(ValueError, match="cycle lengths"):
+            validate_move_counts(profile, before, after, range(16), two_cycle_moves=[2]+[0]*15, invalidations=[0]*16)
+    profile["cycle_histograms"][0] = {2: 1, 3: 1}
     profile["row_partitions"]["pairs"] = np.roll(pairs, 16)
     with pytest.raises(ValueError, match="Row-local"):
         validate_move_counts(profile, before, after, range(16), two_cycle_moves=[2]+[0]*15, invalidations=[0]*16)

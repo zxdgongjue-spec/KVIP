@@ -35,7 +35,28 @@ def event_work(flags, sources, destinations, *, history):
     return dict(event_sha256=digest.hexdigest(), event_count=int(counts.sum()))
 
 
-def verify_permutation(flags, sources, destinations, before, after, owners, *, resident=None, invalidations=None, invalidated_slots=None):
+def _cycle_histogram(at, dirty, paired):
+    """Count nontrivial cycles in the composed destination-to-original permutation."""
+    pair_moves = int(np.count_nonzero(paired))
+    counts = {2: pair_moves // 2} if pair_moves else {}
+    visited = set()
+    for first in map(int, dirty[~paired]):
+        if first in visited:
+            continue
+        pos, length = first, 0
+        while pos not in visited:
+            visited.add(pos)
+            pos = int(at[pos])
+            length += 1
+        if pos != first or length < 3:
+            raise ValueError("Malformed long cycle in composed HIGH Index permutation")
+        counts[length] = counts.get(length, 0) + 1
+    if sum(length * count for length, count in counts.items()) != len(dirty):
+        raise ValueError("Index cycle lengths do not account for all changed positions")
+    return counts
+
+
+def verify_permutation(flags, sources, destinations, before, after, owners, *, resident=None, invalidations=None, invalidated_slots=None, cycle_histograms_out=None):
     """Replay each simultaneous 512-element assignment plus its displaced-row closure."""
     history = before.shape[1]
     two_cycle_moves = []
@@ -71,7 +92,10 @@ def verify_permutation(flags, sources, destinations, before, after, owners, *, r
         # Count endpoints, not pairs. Use the composed permutation; the two
         # endpoints of an input event need not be partners after later phases.
         dirty = np.flatnonzero(at != np.arange(history))
-        two_cycle_moves.append(int(np.count_nonzero(at[at[dirty]] == dirty)))
+        paired = at[at[dirty]] == dirty
+        two_cycle_moves.append(int(np.count_nonzero(paired)))
+        if cycle_histograms_out is not None:
+            cycle_histograms_out.append(_cycle_histogram(at, dirty, paired))
         if invalidations is not None:
             invalidations.append(cleared)
         if invalidated_slots is not None:
@@ -112,6 +136,12 @@ def validate_move_counts(profile, before, after, owners, *, two_cycle_moves=None
     if before.shape != after.shape or before.ndim != 2 or cores != 64 or batch != 16:
         raise ValueError("Unexpected full-AIV Index metadata shape")
     counts = [int(np.count_nonzero(before[o] != after[o])) for o in owners]
+    if "cycle_histograms" in profile:
+        hist = profile["cycle_histograms"]
+        hist_moves = [sum(k * n for k, n in row.items()) for row in hist]
+        hist_pairs = [2 * row.get(2, 0) for row in hist]
+        if hist_moves != counts or hist_pairs != list(two_cycle_moves) or sum(counts) != int(moved.sum()):
+            raise ValueError("Index cycle lengths disagree with verified move or pair counts")
     if local := profile.get("row_partitions"):
         # Unlike the global 64-lane planner, the new schedule independently divides
         # each row's exchanges, long-cycle tuples and invalidations among its four Q lanes.

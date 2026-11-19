@@ -348,29 +348,28 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         state = post_state(torch, selector)
         stride = rotating.output_stride if bundle.tuning.get("low_miss_read_through") else None
         oracle.verify(state, address_delta=delta, expected_topk=selected_expected, output_stride=stride)
-        if "consumer_work" in reads:
-            from kvip.diagnostics.high_index_profile import verify_permutation
+        high = reads.get("high_post_index", {})
+        if "consumer_work" in reads or "moved" in high:
+            from kvip.diagnostics.high_index_profile import validate_move_counts, verify_permutation
 
             flags, src, dst = (cpu_array(torch, v) for v in
                                (bundle.forward.flags, bundle.forward.events_src, bundle.forward.events_dst))
-            verify_permutation(flags, src, dst, oracle.pre["logical_ids"], state["logical_ids"], oracle.owners)
-            owned = list(oracle.owners)
-            reads["consumer_work"]["index_positions_changed"] = int(np.count_nonzero(
-                oracle.pre["logical_ids"][owned] != state["logical_ids"][owned]))
-            reads["consumer_work"]["ordered_index_verified"] = True
-        high = reads.get("high_post_index", {})
-        if "moved" in high:
-            from kvip.diagnostics.high_index_profile import validate_move_counts, verify_permutation
-
-            invalidations = []
-            two_cycles = verify_permutation(
-                cpu_array(torch, bundle.forward.flags), cpu_array(torch, bundle.forward.events_src),
-                cpu_array(torch, bundle.forward.events_dst), oracle.pre["logical_ids"], state["logical_ids"], oracle.owners,
-                resident=bundle.forward.resident, invalidations=invalidations if ("preplan" in high or "row_partitions" in high) else None,
-            )
-            high["row_load"]["two_cycle_moves"] = sum(two_cycles)
-            validate_move_counts(high, oracle.pre["logical_ids"], state["logical_ids"], oracle.owners,
-                                 two_cycle_moves=two_cycles, invalidations=invalidations)
+            invalidations = [] if "preplan" in high or "row_partitions" in high else None
+            histograms = [] if "schedule_timing" in high else None
+            before, after = oracle.pre["logical_ids"], state["logical_ids"]
+            two_cycles = verify_permutation(flags, src, dst, before, after, oracle.owners,
+                                           resident=bundle.forward.resident, invalidations=invalidations,
+                                           cycle_histograms_out=histograms)
+            if "consumer_work" in reads:
+                owned = list(oracle.owners)
+                reads["consumer_work"]["index_positions_changed"] = int(np.count_nonzero(before[owned] != after[owned]))
+                reads["consumer_work"]["ordered_index_verified"] = True
+            if "moved" in high:
+                high["row_load"]["two_cycle_moves"] = sum(two_cycles)
+                if histograms is not None:
+                    high["cycle_histograms"] = histograms
+                validate_move_counts(high, before, after, oracle.owners,
+                                     two_cycle_moves=two_cycles, invalidations=invalidations)
         if bundle.tuning.get("low_miss_read_through") and early_threshold_skipped(bundle.tuning):
             bundle.read_through_check = oracle.verify_frozen(state, address_delta=delta, output_stride=stride)
         reads.update(fused_demand(bundle, demand, state["logical_output"], reads))
