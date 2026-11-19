@@ -140,10 +140,19 @@ class DecodeOracle:
             if np.any(slots[row] < 0) or np.any(slots[row] >= self.stride):
                 raise AssertionError("Selected slot is outside the registered owner output")
             hot_slots = slots[row] < self.resident
-            if np.any(state["hot_valid"][owner, slots[row, hot_slots]] == 0) or not np.array_equal(
-                ids[owner, slots[row, hot_slots]], logical[row, hot_slots]
-            ):
-                raise AssertionError("Selected hot slot does not publish the selected logical token")
+            selected_slots = slots[row, hot_slots]
+            bad = (state["hot_valid"][owner, selected_slots] == 0) | (
+                ids[owner, selected_slots] != logical[row, hot_slots]
+            )
+            if np.any(bad):
+                index = int(np.flatnonzero(hot_slots)[np.flatnonzero(bad)[0]])
+                slot = int(slots[row, index])
+                raise AssertionError(
+                    "Selected hot slot does not publish the selected logical token: "
+                    f"row={row} owner={owner} rank={index} slot={slot} "
+                    f"selected={logical[row, index]} actual={ids[owner, slot]} "
+                    f"valid={state['hot_valid'][owner, slot]}"
+                )
             expected = self.expected(owner, logical[row])
             actual = output[owner, slots[row]]
             if not np.array_equal(actual, expected):

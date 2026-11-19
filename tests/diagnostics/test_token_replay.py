@@ -195,6 +195,17 @@ def test_existing_oracle_checks_synthetic_payload_and_index_alignment(token_trac
             DecodeOracle(archive).verify(changed, expected_topk=expected)
 
 
+def test_oracle_reports_wrong_selected_hot_slot(token_trace, tmp_path):
+    archive = materialize_token_trace(token_trace, tmp_path / "synthetic")
+    state = _valid_post(archive)
+    resident = archive.manifest["geometry"]["resident"]
+    rank = int(np.flatnonzero(state["slot_output"][0] < resident)[0])
+    slot = int(state["slot_output"][0, rank])
+    state["slot_output"][0, rank] = (slot + 1) % resident
+    with pytest.raises(AssertionError, match=r"logical token: row=0 owner=\d+ rank=\d+ slot=\d+ selected=\d+ actual=\d+ valid=1"):
+        DecodeOracle(archive).verify(state, expected_topk=archive.array("post.logical_output"))
+
+
 @pytest.mark.parametrize("fault", ["duplicate", "future", "causal_permutation", "availability", "owner", "slot"])
 def test_rejects_nonreplayable_token_contract(token_trace, tmp_path, fault):
     arrays = {name: values.copy() for name, values in token_trace.arrays.items()}

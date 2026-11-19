@@ -12,7 +12,7 @@ work=/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold
 inputs="$work/skip-results.po80Nw"
 build="$work/KVAF/build-npu"
 cpu="$work/KVAF/build-cpu/runtime/kvaf_cpu_service"
-ranked_sha=e749e42e802febe71deed1c513cc86b10c9c150b
+ranked_sha=7e3f73b742dd778615de9725317985b6f9313ffb
 checkout() {
     local branch=$1 sha=$2 destination=$3
     git -C "$kvip" fetch --quiet origin "refs/heads/$branch"
@@ -27,8 +27,11 @@ checkout() {
 }
 ranked="$work/fused-scan-sources/native-$ranked_sha"
 checkout perf/urma-ranked-only "$ranked_sha" "$ranked"
-baseline_sha="$ranked_sha"
-baseline="$ranked"
+# The fix is entirely inside KVIP_RANKED_PORT. Keep the previous, unchanged
+# eight-window controls and their compiled cache instead of rebuilding them.
+baseline_sha=e749e42e802febe71deed1c513cc86b10c9c150b
+baseline="$work/fused-scan-sources/native-$baseline_sha"
+checkout perf/urma-ranked-only "$baseline_sha" "$baseline"
 for group in 7 2; do
     [[ -s "$inputs/g${group}-input/manifest.json" ]] || { echo "INPUT_MISSING G$group" >&2; exit 1; }
 done
@@ -113,8 +116,9 @@ run_case() {
 }
 for group in 7 2; do
     echo "BEGIN G$group graph"
-    for name in forward reverse ranked; do run_case "$group" "$name" 1; done
-    for name in ranked reverse forward; do run_case "$group" "$name" 2; done
+    # Fail on candidate correctness before spending time on control timings.
+    for name in ranked forward reverse; do run_case "$group" "$name" 1; done
+    for name in reverse forward ranked; do run_case "$group" "$name" 2; done
     python3 -B -m kvip.diagnostics.ranked_port report --root "$result" --group "$group" | tee "$result/g${group}-summary.txt"
 done
 (cd "$result" && tar -czf results.tar.gz g*.json g*-summary.txt)
