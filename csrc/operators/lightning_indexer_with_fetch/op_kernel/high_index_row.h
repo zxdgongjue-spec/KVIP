@@ -50,7 +50,8 @@ __aicore__ inline uint64_t ApplyRowIndex(__gm__ Args* a, __gm__ Context* ctx,
     }
     const bool sharedCycles=singles && !privateCycles;
     uint32_t i0=invalidations*lane/lanes, i1=invalidations*(lane+1)/lanes;
-    if (i0!=i1) {
+    const bool ownedFields=lanes==4 && sharedCycles && singles>=64 && singles<=4096;
+    if (!ownedFields && i0!=i1) {
         auto edges=reinterpret_cast<__gm__ Edge*>(a->highIndex+uint64_t(b)*kRowBytes);
         auto payload=reinterpret_cast<__gm__ Tuple*>(edges+kCapacity);
         auto valid=reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*a->resident;
@@ -63,8 +64,9 @@ __aicore__ inline uint64_t ApplyRowIndex(__gm__ Args* a, __gm__ Context* ctx,
     if(profile) ticks[13]=0;
     // One full vector tile dispatches 64 tuples. The largest column footprint
     // admitted here is 4,096 * 40 B, inside one vector core's private UB.
-    if (lanes==4 && sharedCycles && singles>=64 && singles<=4096) {
-        ApplyOwnedFields(a,part,singles,lane,addressStride,ticks,profile);
+    if (ownedFields) {
+        auto valid=reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*a->resident;
+        ApplyOwnedFields(a,part,singles,lane,addressStride,ticks,profile,valid,i0,i1);
     } else if (!localCount || spill) {
         // The spill specialization never forms an address from a null UB
         // pointer. Empty long lists do not allocate a dummy payload.

@@ -70,18 +70,25 @@ __simt_callee__ inline void TransferOwnedPhase(__gm__ Edge* edges, uint32_t p0, 
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void TransferOwnedFields(__gm__ Edge* edges, uint32_t p0, uint32_t p1, uint32_t singles,
         uint32_t lane, __gm__ uint64_t* keys, __gm__ uint32_t* scales, __gm__ uint64_t* addr,
-        __gm__ uint64_t* logical, __ubuf__ uint64_t* saved) {
+        __gm__ uint64_t* logical, __ubuf__ uint64_t* saved, __gm__ uint32_t* valid,
+        uint32_t invalidFirst, uint32_t invalidEnd) {
     TransferOwnedPhase<false>(edges,p0,p1,singles,lane,keys,scales,addr,logical,saved);
     // A destination can be another thread's source. All 256 threads, even
     // those without an edge, complete their own gather before any scatter.
     asc_threadfence();
     asc_syncthreads();
     TransferOwnedPhase<true>(edges,p0,p1,singles,lane,keys,scales,addr,logical,saved);
+    // The log lives in GM padding; this field-owned path uses private UB for
+    // all tuple payloads. Successful hot publications join all Done flags.
+    auto pending=reinterpret_cast<__gm__ Tuple*>(edges+kCapacity);
+    for(uint32_t i=invalidFirst+threadIdx.x;i<invalidEnd;i+=256)
+        asc_stcg(valid+asc_ldcg(&pending[i].padding),uint32_t(0));
     asc_threadfence();
 }
 
 __aicore__ inline void ApplyOwnedFields(__gm__ Args* a,const Segment& part,uint32_t singles,
-        uint32_t lane,uint64_t stride,__gm__ uint64_t* ticks,bool profile) {
+        uint32_t lane,uint64_t stride,__gm__ uint64_t* ticks,bool profile,
+        __gm__ uint32_t* valid,uint32_t invalidFirst,uint32_t invalidEnd) {
     auto edges=reinterpret_cast<__gm__ Edge*>(a->highIndex+uint64_t(part.row)*kRowBytes);
     auto keys=reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(part.owner)*a->history*16;
     auto scales=reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(part.owner)*a->history;
@@ -93,7 +100,7 @@ __aicore__ inline void ApplyOwnedFields(__gm__ Args* a,const Segment& part,uint3
     pipe.InitBuffer(buf,(bytes+31U)&~31U);
     auto saved=reinterpret_cast<__ubuf__ uint64_t*>(buf.Get<uint32_t>().GetPhyAddr());
     Simt::VF_CALL<TransferOwnedFields>(Simt::Dim3{256,1,1},edges,part.p0,part.p1,singles,lane,
-        keys,scales,addr,logical,saved);
+        keys,scales,addr,logical,saved,valid,invalidFirst,invalidEnd);
     SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
     // There is no separately timestamped scalar gather endpoint in this dispatch.
     if (profile) { ticks[12]=0; ticks[13]=bytes; }

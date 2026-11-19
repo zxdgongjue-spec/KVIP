@@ -22,7 +22,7 @@
 #define LAUNCH_BOUND(n)
 thread_local struct { unsigned x; } threadIdx;
 template<class T> T asc_ldcg(T *p) { return *p; }
-template<class T> void asc_stcg(T *p, T value) { *p = value; }
+template<class T> void asc_stcg(T *p, T value) { std::atomic_ref<T>(*p).store(value,std::memory_order_relaxed); }
 void asc_threadfence() { std::atomic_thread_fence(std::memory_order_seq_cst); }
 thread_local std::barrier<> *activeVFBarrier=nullptr;
 void asc_syncthreads() { if (activeVFBarrier) activeVFBarrier->arrive_and_wait(); }
@@ -48,7 +48,7 @@ struct TPipe {
 namespace pipeline_ab::high_post_index {
 struct Edge;
 inline void TransferOwnedFields(Edge*,uint32_t,uint32_t,uint32_t,uint32_t,
-    uint64_t*,uint32_t*,uint64_t*,uint64_t*,uint64_t*);
+    uint64_t*,uint32_t*,uint64_t*,uint64_t*,uint64_t*,uint32_t*,uint32_t,uint32_t);
 }
 namespace Simt {
 struct Dim3 { unsigned x, y, z; };
@@ -142,7 +142,7 @@ int main() {
         }
         invalid[row]=row==15 ? 0 : row+1;
         for (unsigned i=0;i<invalid[row];++i) {
-            unsigned slot=(83*i+row)%resident;
+            unsigned slot=(83*(i==3 ? 2 : i)+row)%resident; // repeated clear is idempotent
             payload[i].padding=slot;
             wantedValid[owner*resident+slot]=0;
         }
