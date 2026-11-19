@@ -148,6 +148,17 @@ public:
     __aicore__ inline void SetStreamingWorkspace(GM_ADDR workspace) { streamingWorkspace_ = workspace; }
     __aicore__ inline void EmitFinalClassification(uint32_t query);
     __aicore__ inline void BeginFinalMetadata(uint32_t query);
+    // Separate diagnostic replay only. Slots 12..15 are unused by the
+    // classification/resolve timers. Do not add a pipe barrier to a marker.
+    __aicore__ inline void AuditRankPhase(uint32_t query, uint32_t slot) {
+        if (!streamingWorkspace_) return;
+        auto args = reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_);
+        if (!(args->prefetchCount & 0x80000000U)) return;
+        auto ticks = reinterpret_cast<__gm__ uint64_t*>(args->times) +
+                     uint64_t(runtimeShape_.batch) * 64 + uint64_t(query) * 16;
+        ticks[slot] = GetSystemCycle();
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ticks), 128);
+    }
 #endif
     __aicore__ inline void ProcessResidentTopK(QLICommon::RunInfo info, uint32_t queryRow = SIM_Q) {
         info.actS2Size = runtimeShape_.resident;
@@ -1434,6 +1445,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
 #if KVIP_STREAMING_LI
         uint32_t streamingQuery = info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx;
         streamingPrefetched_ = false;
+        AuditRankPhase(streamingQuery, prefixActive_ ? 12 : 14);
 #endif
 
         SCORE_T zero = 0;
@@ -1486,6 +1498,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
             SaveResident(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx,
                          vecOffset, queryRow == SIM_Q, recentEnd, true);
             SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
+            AuditRankPhase(streamingQuery, 13);
             continue;
         }
 #endif
