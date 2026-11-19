@@ -425,6 +425,12 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None, archive=N
                 rate = diagnostic.get("ticks_per_us") or counter_rate(torch, bundle.rotating, stream)
                 diagnostic["final_get"] = final_get_times(cpu_array(torch, bundle.forward.times),
                                                           bundle.forward.batch, bundle.forward.q_workers, rate)
+                from kvip.diagnostics.ranked_audit import decode as decode_li_audit
+
+                diagnostic["li_phase_audit"] = decode_li_audit(
+                    cpu_array(torch, bundle.forward.times), cpu_array(torch, bundle.rotating.events),
+                    bundle.forward.batch, rate, ranked=bool(getattr(args, "ranked_port", False)),
+                )
             diagnostic_samples.append(dict(**diagnostic, reads=diagnostic_reads))
             if getattr(bundle, "tuning", {}).get("window_probe"):
                 from kvip.diagnostics.window_probe import decode

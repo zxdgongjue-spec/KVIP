@@ -17,10 +17,12 @@ old_sha=46924fb8a71c5cafbbfa03c7de626f39464b63ff
 tie_sha=a92b7c8cd9e72728817ad8455b01929fcafe924f
 groups=(7 2)
 history=()
+audit=0
 case "${1:-all}" in
     all) ;;
     g7) groups=(7); history=(--history) ;;
-    *) echo "Usage: $0 [all|g7]" >&2; exit 2 ;;
+    audit) groups=(7); audit=1; ranked_sha=aaa8d3429951464d0d62d70b10cbaaf7d3c2ed43 ;;
+    *) echo "Usage: $0 [all|g7|audit]" >&2; exit 2 ;;
 esac
 checkout() {
     local branch=$1 sha=$2 destination=$3
@@ -39,6 +41,7 @@ checkout perf/urma-ranked-only "$ranked_sha" "$ranked"
 # The fix is entirely inside KVIP_RANKED_PORT. Keep the previous, unchanged
 # eight-window controls and their compiled cache instead of rebuilding them.
 baseline_sha=e749e42e802febe71deed1c513cc86b10c9c150b
+if ((audit)); then baseline_sha=$ranked_sha; fi
 baseline="$work/fused-scan-sources/native-$baseline_sha"
 checkout perf/urma-ranked-only "$baseline_sha" "$baseline"
 if ((${#history[@]})); then
@@ -70,6 +73,7 @@ cd "$reader"
 result=$(mktemp -d "$work/host20-ranked-port-npu4.XXXXXX")
 printf 'CONFIG URMA NPU4 logical=0 BS16 Q4 656B cold_windows=8 Fetch_AIV_per_window=8 seed_is_not_window budgets=64/512\nCONTROL=%s\nRANKED=%s\nRESULT_ROOT=%s\n' \
     "$baseline_sha" "$ranked_sha" "$result"
+if ((audit)); then echo MODE=LI_phase_audit_only_not_a_performance_candidate; fi
 for group in "${groups[@]}"; do
     python3 -B -m kvip.diagnostics.ranked_port cpu --snapshot "$inputs/g${group}-input"
 done
@@ -127,8 +131,8 @@ run_case() {
         if [[ "$repeat" == 1 ]]; then diagnostics=1; fi
     fi
     # One independent profiler replay after this process's headline samples.
-    if [[ "$repeat" == 2 && "$name" != forward  ]] && { ((${#history[@]})) || [[ "${RANKED_TIMELINE:-1}" == 1 ]]; }; then
-        if ((${#history[@]})); then
+    if [[ "$repeat" == 2 && "$name" != forward  ]] && { ((${#history[@]} || audit)) || [[ "${RANKED_TIMELINE:-1}" == 1 ]]; }; then
+        if ((${#history[@]} || audit)); then
             extra+=(--final-get-detail)
             diagnostics=1
         fi
@@ -147,6 +151,13 @@ run_case() {
     fi
 }
 for group in "${groups[@]}"; do
+    if ((audit)); then
+        # Two fresh processes. Profiling and phase clocks are independent
+        # replays; no diagnostic duration is treated as a headline speedup.
+        for name in reverse ranked; do run_case "$group" "$name" 2; done
+        python3 -B -m kvip.diagnostics.ranked_audit --root "$result" | tee "$result/g${group}-summary.txt"
+        continue
+    fi
     echo "BEGIN G$group graph"
     # Fail on candidate correctness before spending time on control timings.
     for name in ranked forward reverse; do run_case "$group" "$name" 1; done
@@ -157,5 +168,5 @@ for group in "${groups[@]}"; do
     python3 -B -m kvip.diagnostics.ranked_port report --root "$result" --group "$group" "${history[@]}" | tee "$result/g${group}-summary.txt"
 done
 (cd "$result" && tar -czf results.tar.gz g*.json g*-summary.txt)
-if ((${#history[@]})); then label=G7; else label=G7_G2; fi
+if ((audit)); then label=G7_AUDIT; elif ((${#history[@]})); then label=G7; else label=G7_G2; fi
 printf '%s_COMPLETE RETURN_FILE=%s/results.tar.gz\n' "$label" "$result"
