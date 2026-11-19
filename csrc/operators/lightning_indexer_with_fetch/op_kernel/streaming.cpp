@@ -721,7 +721,7 @@ inline void PublishStreamingResidency(uint32_t resident,uint32_t postOffset,__gm
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void PublishQueryCompletion(__gm__ Context* ctx,__gm__ BatchFlag* flags,
  uint32_t batch,uint32_t resident,uint32_t postOffset,uint32_t q,uint32_t lane,
- uint32_t workers,uint64_t error,uint32_t completed,bool deferredResidency) {
+ uint32_t workers,uint64_t error,uint32_t completed,bool deferredResidency,uint32_t getPhase=0) {
  // Each warp owns a request; eight requests no longer run serially in one VF.
  constexpr uint32_t lanesPerRequest=32,requestsPerWave=256/lanesPerRequest;
  for(uint32_t b=lane+(threadIdx.x/lanesPerRequest)*workers;b<batch;b+=requestsPerWave*workers){
@@ -745,6 +745,7 @@ inline void PublishQueryCompletion(__gm__ Context* ctx,__gm__ BatchFlag* flags,
  asc_threadfence();asc_syncthreads();
  for(uint32_t b=lane+threadIdx.x*workers;b<batch;b+=256*workers){
   auto flag=flags+b*kFlagCount+8+q;
+  if(error)asc_stcg(&flag->reserved[1],getPhase);
   asc_stcg(&flag->reserved[0],uint32_t(deferredResidency));asc_stcg(&flag->error,uint32_t(error));asc_threadfence();asc_stcg(&flag->ready,1U);
  }
  asc_threadfence();
@@ -871,7 +872,7 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
  if(!args.batch_get_max_inflight_total)args.batch_get_max_inflight_total=kBatchGetInflight;
  auto compactAddresses=reinterpret_cast<__gm__ uint64_t*>(packed);
  if(groupLayout){args.address_table=uint64_t(compactAddresses);args.table_capacity=stride;}
- uint64_t error=0;uint32_t completed=0,requested=0;bool hasConflict=false;
+ uint64_t error=0;uint32_t completed=0,requested=0,getPhase=0;bool hasConflict=false;
  for(uint32_t phase=0;phase<2 && !error;++phase){
   if(phase && skipEmptyConflict && !hasConflict)break;
   uint64_t prepareStart=profile?GetSystemCycle():0;
@@ -965,7 +966,8 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
    // KVAF returns an enum. A failed Get can legitimately process fewer
    // descriptors; preserve the transport result instead of OR-ing two enums.
    if(status->magic!=KVAF_AIV_BATCH_GET_STATUS_MAGIC)error=kvaf_device::kInvalidArgs;
-   else if(!error && status->processed_request_count!=size)error=kvaf_device::kInvalidArgs;
+   else if(status->result)getPhase=1+phase;
+   else if(status->processed_request_count!=size)error=kvaf_device::kInvalidArgs;
   }
 #else
   if(size)error|=kvaf_device::kInvalidArgs;
@@ -997,7 +999,7 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
   }
   if(profile)trace[13]=GetSystemCycle();
   Simt::VF_CALL<PublishQueryCompletion>(Simt::Dim3{256,1,1},ctx,allFlags,shape.batch,
-      shape.resident,shape.finalPostOffset,q,lane,workers,error,completed,deferredResidency);
+      shape.resident,shape.finalPostOffset,q,lane,workers,error,completed,deferredResidency,getPhase);
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
   uint64_t published=profile?GetSystemCycle():0;
   if(profile){trace[14]=published;
@@ -1153,7 +1155,10 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
   uint32_t codes=0;
   for(uint32_t q=0;q<4;++q){
    uint32_t code=flags[8+q].error;
-   codes|=(code<255U?code:255U)<<(8*q);
+   if(code){
+    uint32_t phase=flags[8+q].reserved[1];
+    codes|=((phase<<6)|(code<63U?code:63U))<<(8*q);
+   }
   }
   row->finalQueryErrors=codes;
  }
