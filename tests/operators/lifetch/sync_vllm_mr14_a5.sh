@@ -100,6 +100,22 @@ git -C "$LI_VSYNC_STAGE/KVIP" checkout --detach "$LI_VSYNC_HEAD"
 git -C "$LI_VSYNC_STAGE/KVIP" remote add origin https://gitcode.com/CacheOS/KVIP.git
 [[ -f $LI_VSYNC_STAGE/KVIP/tests/operators/lifetch/serial_chain_compare.py ]] || die 'Published revision lacks three-way comparison'
 [[ -f $LI_VSYNC_STAGE/KVIP/tests/operators/lifetch/support/optimized_serial_li.py ]] || die 'Published revision lacks optimized serial LI'
+if ((!LI_VSYNC_ONLY)); then
+    LI_VSYNC_EXPECTED_KVAF=$("$LI_VSYNC_PYTHON" - "$LI_VSYNC_STAGE/KVIP/scripts/build.py" <<'PY'
+import ast, sys
+from pathlib import Path
+tree = ast.parse(Path(sys.argv[1]).read_text())
+for node in tree.body:
+    if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'REVISION' for t in node.targets):
+        print(ast.literal_eval(node.value))
+        break
+else:
+    raise RuntimeError('Published build.py does not declare its KVAF revision')
+PY
+)
+    LI_VSYNC_ACTUAL_KVAF=$(git -C "$LI_VSYNC_KVAF" rev-parse HEAD)
+    [[ $LI_VSYNC_ACTUAL_KVAF == "$LI_VSYNC_EXPECTED_KVAF" ]] || die "KVAF mismatch: $LI_VSYNC_KVAF @ $LI_VSYNC_ACTUAL_KVAF; MR14 requires $LI_VSYNC_EXPECTED_KVAF. Existing KVIP preserved. Pass --kvaf-root to a matching checkout, e.g. /home/w00568585/wt-mr14/third_party/KVAF after checking its HEAD."
+fi
 LI_VSYNC_TARGET=$LI_VSYNC_ROOT/third_party/KVIP
 if [[ -e $LI_VSYNC_TARGET || -L $LI_VSYNC_TARGET ]]; then
     LI_VSYNC_BACKUP=$(mktemp -d "$LI_VSYNC_ROOT/third_party/KVIP-backup.mr14.XXXXXX")/KVIP

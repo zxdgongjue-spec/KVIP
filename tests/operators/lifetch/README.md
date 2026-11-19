@@ -137,6 +137,11 @@ bash /home/w00568585/li_qk_shared/current/sync_vllm_mr14_a5.sh \
 `--sync-only` 只更新源码；`--no-bench` 更新并编译；`--prefetch 0,512` 包含关闭预取的控制组。
 编译日志在新 KVIP 的 `build/vllm-sync-build.log`。KVAF 使用现有同级 `third_party/KVAF`，
 须符合当前 build.py 的固定提交和 URMA patch 条件；冲突会保留源码并报错。
+同步脚本在替换 KVIP 目录前检查发布版本要求的 KVAF 提交。若 vLLM 的 KVAF 仍是
+`c4375e13`，可在确认 HEAD 后显式传 `--kvaf-root /home/w00568585/wt-mr14/third_party/KVAF`，
+复用之前 MR14 实验的 `1c131038` 依赖，不替换 vLLM 的旧 KVAF checkout。
+若 KVIP 已完成替换但编译因依赖版本失败，无需再次同步：用匹配的 `--kvaf-root` 执行
+新 KVIP 的 `scripts/build.py`，source 新 `scripts/env.sh` 后运行三路脚本即可。
 vLLM 的 `scripts/install_kvip.sh` 仍固定自己的 KVIP 提交，重跑会再次替换这个实验安装。
 更新后已有模型 worker 需重新启动才会加载新库；本脚本执行算子链，不启动模型端到端服务。
 
