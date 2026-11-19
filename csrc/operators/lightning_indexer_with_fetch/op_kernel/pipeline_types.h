@@ -22,7 +22,10 @@ struct alignas(128) Args {
  uint64_t queryBitmaps, queryErrors, updateBindings, denseShadow, packedFetch;
  uint64_t completedFlags, liveCount, completedRows, completedEvents; // Completed snapshots, separate from live URMA state.
  uint64_t completedMapping, completedJournal;
+ uint64_t routeRequests, routeFeedback, routeResult, routeDemand;
+ uint32_t routeOwners, routePolicy;
 };
+static_assert(sizeof(Args)==256,"streaming Args ABI");
 }
 
 namespace rotating {

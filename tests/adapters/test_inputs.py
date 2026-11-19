@@ -9,6 +9,22 @@ from kvip.adapters.vllm.index_import import VllmIndexCacheStorage as IndexCacheS
 
 
 class FusedInputsTest(unittest.TestCase):
+    @patch.dict("os.environ", {"KVIP_URMA_ROUTE_POLICY": "zero"})
+    def test_adaptive_identity_reorder_retry_and_recycle_share_metadata_upload(self):
+        inputs = QueryInputs(torch, 2, torch.device("cpu"), pin_memory=False)
+        requests = inputs.route_requests
+        self.assertEqual(requests.data_ptr(), inputs.metadata[5].data_ptr())
+
+        def prepare(ids, owners, positions):
+            plans = [NS(owner=o, request=r, start=s, begin=0, stop=4) for r, o, s in zip(ids, owners, positions)]
+            inputs.prepare([4] * len(plans), query_owners=owners, route_plans=plans)
+            return requests.tolist()
+
+        self.assertEqual(prepare(["a", "b"], [0, 1], [90, 10]), [[0, 1, 1, 4], [1, 2, 1, 4]])
+        self.assertEqual(prepare(["b", "a"], [1, 0], [11, 90]), [[1, 2, 2, 4], [0, 1, 1, 4]])
+        self.assertEqual(prepare(["c"], [1], [6]), [[1, 3, 1, 4], [0, 0, 0, 0]])
+        self.assertEqual(prepare(["c"], [1], [5]), [[1, 4, 1, 4], [0, 0, 0, 0]])
+
     def test_fp8_pack_uses_byte_gather_preserving_all_bit_patterns(self):
         native_select = torch.index_select
 

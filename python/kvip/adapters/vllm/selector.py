@@ -7,6 +7,7 @@ This object neither allocates a Runtime nor selects replacement candidates.
 
 from copy import copy
 
+from kvip.operators.lifetch.adaptive_route import AdaptiveRoute
 from kvip.operators.lifetch.forward import LIFetchForward
 
 
@@ -34,6 +35,11 @@ def bind_group_selector(torch, policy, workspace, setup, group, storage, rotatin
     if not hasattr(workspace, "streaming_scratch"):
         workspace.streaming_scratch = {}
     rotating.streaming_scratch = workspace.streaming_scratch
+    if not ubmem and workspace.inputs.route_policy != "off":
+        rotating.adaptive_route = AdaptiveRoute(
+            torch, rotating.device, setup.batch, storage.logical_ids.shape[0],
+            policy=workspace.inputs.route_policy, requests=workspace.inputs.route_requests,
+        )
     selector = VllmIndexSelector(
         torch, inputs=workspace.inputs, rotating=rotating, update=update,
         logical_ids=storage.logical_ids, row_owners=workspace.inputs.row_owners,
@@ -99,6 +105,7 @@ class VllmIndexSelector:
                 [int(p.stop - p.begin) for p in self.decodes],
                 query_starts=[int(p.begin) for p in self.decodes],
                 query_owners=[int(p.owner) for p in self.decodes],
+                route_plans=self.decodes if self.inputs.route_requests is not None else None,
             )
         if self.row_owners.data_ptr() != self.inputs.row_owners.data_ptr():
             self.row_owners.copy_(self.inputs.row_owners)

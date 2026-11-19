@@ -3,6 +3,7 @@
 #include "context.h"
 #if !V9_UBMEM
 #include "round_prepare.h"
+#include "adaptive_route.h"
 #endif
 struct QLITilingData {
     uint32_t bSize,tSize,gSize,s1Size,s2Size,sparseCount,usedCoreNum,blockSize,maxBlockNumPerBatch,sparseMode;
@@ -29,6 +30,36 @@ __aicore__ inline void RunLi(GM_ADDR bindings) {
 #define P(i) reinterpret_cast<GM_ADDR>(a[i])
     auto shape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(a[14]));
     bool splitSequence = rotating::UseSequenceSplit(shape) && HasUniformLengths(shape, P(5), P(6));
+#if !V9_UBMEM && KVIP_STREAMING_LI
+    auto workspace = reinterpret_cast<__gm__ pipeline_ab::Args*>(a[15]);
+    uint32_t mode = pipeline_ab::adaptive_route::High;
+    if (workspace && workspace->routeResult) {
+        if constexpr (Phase == SequenceLiPhase::Hot) {
+            auto ctx = reinterpret_cast<__gm__ rotating::Context*>(a[14]);
+            const bool profile = (workspace->prefetchCount & 0x80000000U) && shape.aicCount == 32;
+            const uint64_t start = profile ? GetSystemCycle() : 0;
+            mode = pipeline_ab::adaptive_route::Choose(workspace, ctx, shape);
+            if (profile) {
+                uint64_t elapsed = GetSystemCycle() - start;
+                uint32_t core = GetBlockIdx();
+                if ASCEND_IS_AIV { core += shape.aicCount; }
+                auto ticks = reinterpret_cast<__gm__ uint64_t*>(workspace->routeResult) + (1 + core)*16;
+                *ticks = elapsed;
+                kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ticks),128);
+            }
+            if ASCEND_IS_AIV {
+                if (GetBlockIdx() == 0) {
+                    auto value = reinterpret_cast<__gm__ uint32_t*>(workspace->routeResult);
+                    *value = mode;
+                    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(value),128);
+                }
+            }
+        } else {
+            mode = pipeline_ab::adaptive_route::Published(workspace);
+        }
+        if (mode == pipeline_ab::adaptive_route::Zero) splitSequence = false;
+    }
+#endif
     if constexpr (Phase != SequenceLiPhase::Hot) {
         if (!splitSequence) return;
     }
@@ -37,6 +68,11 @@ __aicore__ inline void RunLi(GM_ADDR bindings) {
         bfloat16_t,float,float,uint16_t>;
     QLIKernel::QuantLightningIndexerKernel<Type> op;
     op.runtimeShape_ = shape;
+#if !V9_UBMEM && KVIP_STREAMING_LI
+    op.adaptiveZero_ = mode == pipeline_ab::adaptive_route::Zero;
+    op.vectorService.adaptiveZero_ = op.adaptiveZero_;
+    op.vectorService.earlyOnly_ = mode == pipeline_ab::adaptive_route::Early;
+#endif
 #if !V9_UBMEM
     op.rotationContext_ = P(14);
 #endif
