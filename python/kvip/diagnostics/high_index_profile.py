@@ -157,6 +157,8 @@ def validate_move_counts(profile, before, after, owners, *, two_cycle_moves=None
             # lane can afford them. The other work consists of atomic swap pairs.
             total = 2*pairs + singles
             eligible = (singles > 0) & (singles <= 1024) & (4*singles <= total)
+            if local.get("prefer_owned_fields", False):
+                eligible &= ~((singles >= 64) & (singles <= 4096))
             pair_cuts = np.minimum(pairs, np.arange(5)[:, None]*total//4//2)
             expected_pairs[:, eligible] = np.diff(pair_cuts, axis=0)[:, eligible]
             expected_singles[:, eligible] = 0
@@ -386,6 +388,32 @@ def q2_plan_timing(rows, marks, *, post_first):
     return result
 
 
+def queue_timeline(rows, marks):
+    """Keep one diagnostic launch in the common device clock. A lane is Q * 16 + row."""
+    publications = marks[16:32, 24:28].T.ravel()
+    origin = int(marks[:, 0].min())
+    live = np.flatnonzero(rows[:, 1])
+    critical = int(live[np.argmax(rows[live, 9])])
+    if np.any(marks[live, 30] < rows[live, 7]):
+        raise ValueError("Final FIFO retirement preceded the return of its last Post")
+    timeline = dict(lane_layout="lane = 16 * query + row", units="ticks since earliest streaming entry",
+                    origin_ticks=origin, last_nonempty_return_lane=critical)
+    # A zero device marker denotes an inapplicable operation, e.g. no Post on
+    # an empty lane. Keep it distinguishable from an event at the origin.
+    for name, values in (("entry", marks[:, 0]), ("published", publications),
+                         ("observed", marks[:, 20]), ("checked", marks[:, 21]),
+                         ("plan_end", rows[:, 4]), ("first_post", rows[:, 6]),
+                         ("last_post", marks[:, 4]), ("post_return", rows[:, 7]),
+                         ("row_join", marks[:, 23]), ("index_start", marks[:, 3]),
+                         ("index_end", rows[:, 8]), ("prefetch_retire_start", marks[:, 28]),
+                         ("prefetch_retire_end", marks[:, 29]), ("final_retire_start", marks[:, 30]),
+                         ("final_retire_end", rows[:, 9]), ("role_exit", marks[:, 1])):
+        timeline[name] = [int(v) - origin if v else None for v in values]
+    timeline.update(final_get=rows[:, 1].tolist(), post_calls=marks[:, 8].tolist(),
+                    blocking=(rows[:, 2] & 1).tolist(), index_move_credits=marks[:, 10].tolist())
+    return timeline
+
+
 def retire_timing(rows, marks):
     """Bound software completion calls by their own lane clock."""
     begin, end = marks[:16, 28], marks[:16, 29]
@@ -469,7 +497,7 @@ def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan
     if detail.dtype != np.int64 or detail.shape != (len(rows), 32):
         raise ValueError("Unexpected HIGH timestamp layout")
     marks = detail.view(np.uint64)
-    row_markers = {0x52514931: "RQI1", 0x52514932: "RQI2", 0x52514933: "RQI3", 0x52514934: "RQI4", 0x52514935: "RQI5", 0x52514936: "RQI6", 0x52514937: "RQI7", 0x52514938: "RQI8"}
+    row_markers = {0x52514931: "RQI1", 0x52514932: "RQI2", 0x52514933: "RQI3", 0x52514934: "RQI4", 0x52514935: "RQI5", 0x52514936: "RQI6", 0x52514937: "RQI7", 0x52514938: "RQI8", 0x52514939: "RQI9"}
     marker = row_markers.get(int(marks[0, 2]))
     if marker is not None and np.all(marks[:, 2] == marks[0, 2]):
         if wait_first or not schedule_timing:
@@ -479,8 +507,9 @@ def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan
         result["moved"] = marks[:, 10].tolist()
         result["row_partitions"] = dict(pairs=marks[:, 16].tolist(), singles=marks[:, 17].tolist(),
                                         invalidations=marks[:, 19].tolist(), single_owner=marker != "RQI1")
-        if marker == "RQI8":
+        if marker in ("RQI8", "RQI9"):
             local = result["row_partitions"]
+            local["prefer_owned_fields"] = marker == "RQI9"
             local["field_cycle_write_bytes"] = marks[:, 13].tolist()
             active_fields = marks[:, 13] > 0
             field_ends = marks[active_fields, 12]
@@ -492,9 +521,10 @@ def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan
         schedule = overlap_schedule_timing(rows, marks, marker=marker)
         if marker == "RQI6":
             schedule["poll_work"] = final_poll_work(rows, marks)
-        if marker in ("RQI5", "RQI6", "RQI7", "RQI8"):
+        if marker in ("RQI5", "RQI6", "RQI7", "RQI8", "RQI9"):
             schedule["retire"] = retire_timing(rows, marks)
-        if marker in ("RQI4", "RQI5", "RQI6", "RQI7", "RQI8"):
+            schedule["queue_timeline"] = queue_timeline(rows, marks)
+        if marker in ("RQI4", "RQI5", "RQI6", "RQI7", "RQI8", "RQI9"):
             schedule["early_post"] = early_post_timing(rows, marks)
             schedule["q2_plan"] = q2_plan_timing(rows, marks, post_first=marker == "RQI7")
         if marker == "RQI3":

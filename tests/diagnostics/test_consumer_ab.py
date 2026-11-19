@@ -258,7 +258,7 @@ def test_expected_format_follows_checked_out_dispatch_and_marker(tmp_path):
     (folder / "streaming.cpp").write_text("high_post_index::Run(a,block);")
     assert schedule_format(tmp_path) == "PIH1"
     (folder / "streaming.cpp").write_text("high_post_index::RunRow(a,block);")
-    for token, expected in (("0x52514931", "RQI1"), ("0x52514932", "RQI2"), ("0x52514933", "RQI3"), ("0x52514934", "RQI4"), ("0x52514935", "RQI5"), ("0x52514936", "RQI6"), ("0x52514937", "RQI7"), ("0x52514938", "RQI8")):
+    for token, expected in (("0x52514931", "RQI1"), ("0x52514932", "RQI2"), ("0x52514933", "RQI3"), ("0x52514934", "RQI4"), ("0x52514935", "RQI5"), ("0x52514936", "RQI6"), ("0x52514937", "RQI7"), ("0x52514938", "RQI8"), ("0x52514939", "RQI9")):
         (folder / "high_index_async.h").write_text(f"ticks[2]={token}U;")
         assert schedule_format(tmp_path) == expected
 
@@ -451,7 +451,37 @@ def test_rqi8_single_vf_has_no_timed_gather_endpoint():
     def read():
         return decode_high_index(rows, marks, wait_first=False, final_get=1,
                                  work={}, schedule_timing=True)
-    assert read()["row_partitions"]["field_gather_markers"] == "unavailable"
+    report = read()
+    assert report["row_partitions"]["field_gather_markers"] == "unavailable"
+    timeline = report["schedule_timing"]["queue_timeline"]
+    assert timeline["last_nonempty_return_lane"] == 0
+    assert timeline["first_post"][:2] == [140, None]
+    assert timeline["published"][::16] == [80, 90, 100, 110]
+    assert timeline["post_calls"][0] == 1 and timeline["index_move_credits"][0] == 16
+    assert timeline["final_retire_end"][0] == 600 and timeline["final_retire_start"][0] == 550
     assert "gather_join" not in read()
     marks[::16, 12] = 450
     assert read()["row_partitions"]["field_gather_markers"] == "present"
+
+def test_rqi9_medium_private_cycle_moves_to_fields_but_preserves_logical_counts():
+    from kvip.diagnostics.high_index_profile import validate_move_counts
+    # Real G7 row: under RQI8, Q3 owns all 444 non-pair positions alongside 843 swaps.
+    p, s = 843, 444
+    before = np.tile(np.arange(2*p+s), (16, 1))
+    after = before.copy()
+    after[12, :2*p] = np.arange(2*p).reshape(-1, 2)[:, ::-1].ravel()
+    after[12, 2*p:] = np.roll(after[12, 2*p:], 1)
+    pairs, singles, payload = (np.zeros((4, 16), dtype=np.int64) for _ in range(3))
+    pairs[:,12] = np.diff(np.arange(5)*p//4)
+    singles[:,12] = np.diff(np.arange(5)*s//4)
+    payload[:,12] = s*np.array([40, 40, 36, 32])
+    profile = dict(moved=(2*pairs + singles).ravel(), row_partitions=dict(pairs=pairs.ravel(), singles=singles.ravel(),
+                   invalidations=[0]*64, single_owner=True, prefer_owned_fields=True, field_cycle_write_bytes=payload.ravel()))
+    two = [0]*16
+    two[12] = 2*p
+    validate_move_counts(profile, before, after, range(16), two_cycle_moves=two, invalidations=[0]*16)
+    assert profile["payload_writes"]["field_rows"] == [12]
+    assert profile["row_gathers"] == profile["single_owner_rows"] == 0
+    profile["row_partitions"]["prefer_owned_fields"] = False
+    with pytest.raises(ValueError, match="Row-local"):
+        validate_move_counts(profile, before, after, range(16), two_cycle_moves=two, invalidations=[0]*16)

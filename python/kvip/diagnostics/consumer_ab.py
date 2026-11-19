@@ -121,7 +121,7 @@ def schedule_format(source):
     if "high_post_index::RunRow(" not in (kernel/"streaming.cpp").read_text():
         return "PIH1"
     impl = (kernel/"high_index_async.h").read_text()
-    for tag, marker in (("0x52514938", "RQI8"), ("0x52514937", "RQI7"), ("0x52514936", "RQI6"), ("0x52514935", "RQI5"), ("0x52514934", "RQI4"), ("0x52514933", "RQI3"), ("0x52514932", "RQI2"), ("0x52514931", "RQI1")):
+    for tag, marker in (("0x52514939", "RQI9"), ("0x52514938", "RQI8"), ("0x52514937", "RQI7"), ("0x52514936", "RQI6"), ("0x52514935", "RQI5"), ("0x52514934", "RQI4"), ("0x52514933", "RQI3"), ("0x52514932", "RQI2"), ("0x52514931", "RQI1")):
         if tag in impl:
             return marker
     raise ValueError(f"Unrecognized row schedule diagnostic ABI at {source}")
@@ -283,16 +283,16 @@ def summarize(group, cases, baseline, candidate, high_overlap=False, schedule_fo
                 reassign = metrics.get("get_reassignment")
                 split_load = (f" helpers/Get_moved/max_Q_before={reassign['helpers']}/{reassign['transferred']}/"
                               f"{reassign['max_canonical_lane']}" if reassign else "")
-                role_stage = "descriptor_checked" if marker in ("RQI4", "RQI5", "RQI6", "RQI7", "RQI8") else "to_valid"
-                spread = "descriptor_check" if marker in ("RQI4", "RQI5", "RQI6", "RQI7", "RQI8") else "valid"
-                move_units = "logical_credits" if marker == "RQI8" else "moves"
+                role_stage = "descriptor_checked" if marker in ("RQI4", "RQI5", "RQI6", "RQI7", "RQI8", "RQI9") else "to_valid"
+                spread = "descriptor_check" if marker in ("RQI4", "RQI5", "RQI6", "RQI7", "RQI8", "RQI9") else "valid"
+                move_units = "logical_credits" if marker in ("RQI8", "RQI9") else "moves"
                 print(f"G{group} LOAD {arm} role0/1/2/3_{role_stage}_p50_us={roles}"
                       f" max_row_{spread}_spread_us={metrics['validation_spread_max']/rate:.2f}"
                       f" lane_Index_us_p50/max={metrics['lane_index_p50']/rate:.2f}/{metrics['longest_lane_index']/rate:.2f}"
                       f" last_retire_to_row_exit_us_p50/max={metrics['row_retire_to_exit_p50']/rate:.2f}/{metrics['row_retire_to_exit_max']/rate:.2f}"
                       f" {move_units}_total/max_row/max_lane={metrics['moved_total']}/{metrics['max_row_moves']}/{metrics['max_moves_per_lane']}"
                       f" rows_single_owner/gather={high['single_owner_rows']}/{high['row_gathers']}" + split_load)
-                if marker == "RQI8":
+                if marker in ("RQI8", "RQI9"):
                     payload = high["payload_writes"]
                     print(f"G{group} INDEX_FIELDS {arm} field_rows={len(payload['field_rows'])}"
                           f" cycle_field_write_B={payload['field_cycle_bytes']} total_Index_payload_write_B={payload['total_bytes']}"
@@ -314,7 +314,7 @@ def summarize(group, cases, baseline, candidate, high_overlap=False, schedule_fo
                         print(f"G{group} INDEX_CYCLES after length=2/3/4/5-8/9+"
                               f" moved_by_cycle_len={cycle_move_bins(rows)}"
                               f" last_Index_row={last} moved_by_cycle_len_last_row={cycle_move_bins([rows[last]])}")
-                if marker in ("RQI4", "RQI5", "RQI6", "RQI7", "RQI8"):
+                if marker in ("RQI4", "RQI5", "RQI6", "RQI7", "RQI8", "RQI9"):
                     early = metrics["early_post"]
                     def times_us(*keys):
                         return "/".join(f"{early[k]/rate:.2f}" for k in keys)
@@ -334,7 +334,16 @@ def summarize(group, cases, baseline, candidate, high_overlap=False, schedule_fo
                               + (f"{lag/rate:.2f}" if lag is not None else "unavailable")
                               + f" plan_end_from_lane_entry_p50_us={q2['plan_end_from_entry_p50']/rate:.2f}"
                               + duration)
-                if marker in ("RQI5", "RQI6", "RQI7", "RQI8"):
+                if group == 7 and "queue_timeline" in metrics:
+                    q = metrics["queue_timeline"]
+                    lane = q["last_nonempty_return_lane"]
+                    ready = "/".join(f"{median(q['published'][i:i+16])/rate:.2f}" for i in range(0, 64, 16))
+                    times = "/".join(f"{q[k][lane]/rate:.2f}" for k in
+                                     ("published", "observed", "first_post", "post_return", "final_retire_start", "final_retire_end"))
+                    print(f"G7 POST_LOAD {arm} from_streaming_entry_us Q0/Q1/Q2/Q3_publish_p50={ready}"
+                          f" last_final_Q/row/Get/Posts={lane//16}/{lane%16}/{q['final_get'][lane]}/{q['post_calls'][lane]}"
+                          f" last_lane_publish/seen/firstPost/lastPostReturn/retireStart/retireEnd={times}")
+                if marker in ("RQI5", "RQI6", "RQI7", "RQI8", "RQI9"):
                     cq = metrics["retire"]
                     poll = metrics.get("poll_work")
                     counts = (f" final_probes_total/empty={poll['probes_total']}/{poll['empty_probes']}"
