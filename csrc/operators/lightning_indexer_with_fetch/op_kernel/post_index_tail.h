@@ -263,7 +263,6 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
     }
     record->error = error; record->fallback = blocking;
     if (profile) record->packDone = GetSystemCycle();
-    Flush(record);
     // Prefix and every exceptional error/capacity writer finish at this
     // existing join. There is no scalar 64-record reduction or second join.
     SyncAll();
@@ -285,7 +284,6 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
         record->postDone = GetSystemCycle();
         if (blocking) record->cqDone = record->postDone;
     }
-    record->error = error; Flush(record);
     PublishPostFailure(prefix, b, error);
     // No AIV enters Index maintenance before all Post calls have returned.
     SyncAll();
@@ -293,7 +291,6 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
     if (waitFirst) {
         error |= post_index_transport::Wait(transport);
         if (profile) trace[7] = record->cqDone = GetSystemCycle();
-        record->error = error; Flush(record);
         PublishPostFailure(prefix, b, error);
         // This is the same join used after CQ in the overlapping order,
         // relocated before Index so communication is fully drained first.
@@ -341,8 +338,8 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
         trace[9] = indexEnd - indexFirst;
         trace[5] = record->indexDone = GetSystemCycle();
     }
-    record->completed = transport.completed; record->error = error; Flush(record);
-    SyncAll();
+    // Every AIV has finished its own Index stores and owns its CQ exclusively.
+    // Other cores may still be applying disjoint Index events.
     if (profile) trace[6] = GetSystemCycle();
     // A peer/Index failure must never strand a successfully posted queue.
     if (!waitFirst) {
@@ -351,10 +348,11 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args* a, uint32_t bl
             trace[7] = GetSystemCycle();
             if (!blocking) record->cqDone = trace[7];
         }
-        record->completed = transport.completed; record->error = error;
-        Flush(record);
-        SyncAll();
     }
+    // Row owners read completion records only here, after both Index and CQ.
+    record->completed = transport.completed; record->error = error;
+    Flush(record);
+    SyncAll();
     if (block < batch) {
         const uint32_t row = block;
         error = 0;

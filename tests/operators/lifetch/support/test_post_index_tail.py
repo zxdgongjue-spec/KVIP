@@ -69,15 +69,14 @@ def test_cq_control_relocates_one_join_inside_the_same_tail():
     after = body_after("if (!waitFirst)")
     for branch in (before, after):
         assert branch.count("post_index_transport::Wait(transport)") == 1
-        assert branch.count("SyncAll();") == 1
-        assert branch.index("record->error = error") < branch.index("SyncAll();")
-    # Four common barriers plus exactly one relocated CQ barrier. The
-    # offline control stays inside the existing kernel, not a new graph node.
-    assert tail.count("SyncAll();") == 6
+    assert "PublishPostFailure" in before and before.count("SyncAll();") == 1
+    assert "SyncAll();" not in after
     index = tail.index("Simt::VF_CALL<post_index::ApplyPlan<false>>")
     assert tail.index("if (waitFirst)") < index < tail.index("if (!waitFirst)")
-    assert tail.index("record->completed = transport.completed", index) < tail.index("if (!waitFirst)")
-    assert tail.index("if (!waitFirst)") < tail.index("post_index_finalize::Finish")
+    assert "SyncAll();" not in tail[index:tail.index("if (!waitFirst)")]
+    publish = tail.index("record->completed = transport.completed", index)
+    assert tail.index("if (!waitFirst)") < publish < tail.index("Flush(record);", publish)
+    assert tail.index("SyncAll();", publish) < tail.index("Flush(records + peer)")
     assert "blocking = (prefix[post_index_prepare::kBlockingWord] & 1U) != 0" in tail
     assert "record->fallback = uint64_t(blocking) | (waitFirst ? 2U : 0U)" in tail
 
