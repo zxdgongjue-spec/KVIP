@@ -108,8 +108,8 @@ int main() {
     Args a{uint64_t(storage.data()),uint64_t(keys.data()),uint64_t(scales.data()),uint64_t(addresses.data()),
            uint64_t(logical.data()),resident,history};
     Context ctx{uint64_t(valid.data())};
-    std::array<unsigned,batch> pairs{0,1,4,14,0,35,1,117,0,19,1700,1800,23,51,101,0};
-    std::array<unsigned,batch> singles{0,0,3,64,4097,63,65,108,4096,0,1024,1025,3,17,0,21};
+    std::array<unsigned,batch> pairs{0,1,4,14,0,35,1,117,0,19,843,1800,23,51,101,0};
+    std::array<unsigned,batch> singles{0,0,3,64,4097,63,65,108,4096,0,444,1025,3,17,0,21};
     std::array<unsigned,batch> invalid{};
     std::array<Team,batch> teams;
     std::vector<unsigned> wanted(batch * history);
@@ -165,7 +165,7 @@ int main() {
             unsigned p=pairs[row]*(lane+1)/lanes-pairs[row]*lane/lanes;
             unsigned s=singles[row]*(lane+1)/lanes-singles[row]*lane/lanes;
             const unsigned moves=2*pairs[row]+singles[row];
-            if(singles[row] && singles[row]<=kLocalTuples && singles[row]*lanes<=moves) {
+            if(singles[row] && singles[row]<64 && singles[row]*lanes<=moves) {
                 unsigned start=std::min(pairs[row],moves*lane/(2*lanes));
                 unsigned end=std::min(pairs[row],moves*(lane+1)/(2*lanes));
                 p=end-start;
@@ -174,8 +174,7 @@ int main() {
             }
             assert(ticks[9]==2*p+s && ticks[16]==p && ticks[17]==s);
             assert(ticks[18]==(s>kLocalTuples ? s : 0));
-            const bool shared=singles[row] && (singles[row]>kLocalTuples || singles[row]*lanes>moves);
-            const bool fields=shared && singles[row]>=64 && singles[row]<=4096;
+            const bool fields=singles[row]>=64 && singles[row]<=4096;
             assert(ticks[13]==(fields ? singles[row]*(lane<2 ? 40u : lane==2 ? 36u : 32u) : 0));
 
             if (row==2) independent.count_down();
@@ -186,7 +185,7 @@ int main() {
     for (unsigned row=0;row<batch;++row) {
         const unsigned moves=2*pairs[row]+singles[row];
         bool shared=singles[row] && (singles[row]>kLocalTuples || singles[row]*lanes>moves);
-        bool fields=shared && singles[row]>=64 && singles[row]<=4096;
+        bool fields=singles[row]>=64 && singles[row]<=4096;
         assert(teams[row].arrivals.load()==(shared && !fields ? lanes : 0u));
     }
     for (unsigned owner=0;owner<batch;++owner) {

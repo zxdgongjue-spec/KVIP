@@ -39,7 +39,11 @@ __aicore__ inline uint64_t ApplyRowIndex(__gm__ Args* a, __gm__ Context* ctx,
     // When all long edges fit one lane's usual share and its UB, keep
     // their originals together so the other three lanes need no gather join.
     // Charge the owning lane for those moves when distributing pair swaps.
-    const bool privateCycles=singles && singles<=kLocalTuples && singles*lanes<=moves;
+    // With a full field tile, each core can keep its own 32-byte key slice
+    // on chip. Even when one core could hold every complete tuple, that
+    // arrangement makes its gather/scatter a serial tail for the request.
+    const bool ownedFields=lanes==4 && singles>=64 && singles<=4096;
+    const bool privateCycles=!ownedFields && singles && singles<=kLocalTuples && singles*lanes<=moves;
     if (privateCycles) {
         const uint32_t first=moves*lane/(2*lanes);
         const uint32_t end=moves*(lane+1)/(2*lanes);
@@ -50,7 +54,6 @@ __aicore__ inline uint64_t ApplyRowIndex(__gm__ Args* a, __gm__ Context* ctx,
     }
     const bool sharedCycles=singles && !privateCycles;
     uint32_t i0=invalidations*lane/lanes, i1=invalidations*(lane+1)/lanes;
-    const bool ownedFields=lanes==4 && sharedCycles && singles>=64 && singles<=4096;
     if (!ownedFields && i0!=i1) {
         auto edges=reinterpret_cast<__gm__ Edge*>(a->highIndex+uint64_t(b)*kRowBytes);
         auto payload=reinterpret_cast<__gm__ Tuple*>(edges+kCapacity);
