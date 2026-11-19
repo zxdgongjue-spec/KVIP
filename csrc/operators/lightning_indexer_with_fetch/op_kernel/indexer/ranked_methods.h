@@ -540,6 +540,13 @@ __aicore__ inline void FinalIncremental(uint32_t query,uint32_t valid) {
         PipeBarrier<PIPE_ALL>();DataCopy(indicesOutLocal_,ids,2048);
         SetFlag<HardEvent::MTE2_V>(EVENT_ID5);WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);
     }
+#if KVIP_STREAMING_LI
+    auto slots = streamingTopkOnly_ ? streamingOutput_ : topkSharedTmpLocal_;
+    lifetch_ranked::DecodePublicIds<true>(
+        reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),
+        reinterpret_cast<__ubuf__ uint32_t*>(slots.GetPhyAddr()), runtimeShape_.resident);
+#else
     lifetch_ranked::DecodePublicIds(reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()));
+#endif
     PipeBarrier<PIPE_V>();
 }

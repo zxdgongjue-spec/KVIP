@@ -118,7 +118,11 @@ __simd_vf__ inline void PackOffers(__ubuf__ uint32_t* ids, __ubuf__ uint32_t* ou
     StoreAlign(count, total, one);
 }
 
-__simd_vf__ inline void DecodePublicIds(__ubuf__ uint32_t* ids) {
+// As in the ranked reference's RestorePublicIds, keep the known hot slot
+// when removing the private tag. This port uses one tag for hot and ABC.
+template<bool PrepareSlots = false>
+__simd_vf__ inline void DecodePublicIds(__ubuf__ uint32_t* ids,
+    __ubuf__ uint32_t* slots = nullptr, uint32_t resident = 0) {
     using namespace AscendC::MicroAPI;
     auto all = CreateMask<uint32_t, MaskPattern::ALL>();
     RegTensor<uint32_t> id, mask, raw;
@@ -128,6 +132,16 @@ __simd_vf__ inline void DecodePublicIds(__ubuf__ uint32_t* ids) {
         LoadAlign(id, ids+i);
         CompareScalar<uint32_t, CMPMODE::EQ>(padding, id, UINT32_MAX, all);
         And(raw, id, mask, all);
+        if constexpr (PrepareSlots) {
+            RegTensor<uint32_t> invalid, slot;
+            MaskReg tagged, bounded, known;
+            Duplicate(invalid, UINT32_MAX);
+            Compare<uint32_t, CMPMODE::NE>(tagged, id, raw, all);
+            CompareScalar<uint32_t, CMPMODE::LT>(bounded, raw, resident, all);
+            MaskAnd(known, tagged, bounded, all);
+            Select(slot, raw, invalid, known);
+            StoreAlign(slots + i, slot, all);
+        }
         Select(raw, id, raw, padding);
         StoreAlign(ids+i, raw, all);
     }
