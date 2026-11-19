@@ -3428,8 +3428,13 @@ class FusedReplayState:
         self.check_completion()
         ids = self.update.logical_output.cpu().numpy().reshape(self.batch, 4, 2048)
         slots = self.update.slot_output.cpu().numpy().reshape(self.batch, 4, 2048)
-        if np.any(ids < 0) or np.any(ids >= self.history) or np.any(slots < 0) or np.any(slots >= self.stride):
-            raise RuntimeError('Replay output token/slot outside allocated bounds')
+        invalid = (ids < 0) | (ids >= self.history) | (slots < 0) | (slots >= self.stride)
+        if invalid.any():
+            row, query, position = np.unravel_index(invalid.argmax(), invalid.shape)
+            raise RuntimeError(
+                f'Replay output token/slot outside allocated bounds: request={row} Q={query + 1} '
+                f'position={position} token={ids[row, query, position]} history={self.history} '
+                f'slot={slots[row, query, position]} stride={self.stride} invalid={invalid.sum()}')
         output = self.output[1:].cpu().numpy()
         layout, hot_valid = self.validate_index(inputs, output)
         for row in range(self.batch):
