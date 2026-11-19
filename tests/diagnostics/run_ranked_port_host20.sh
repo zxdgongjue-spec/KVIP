@@ -20,12 +20,14 @@ history=()
 audit=0
 prior=0
 prior_sha=aaa8d3429951464d0d62d70b10cbaaf7d3c2ed43
-case "${1:-all}" in
+mode=${1:-all}
+case "$mode" in
     all) ;;
     g7) groups=(7); history=(--history) ;;
     audit) groups=(7); audit=1; ranked_sha=aaa8d3429951464d0d62d70b10cbaaf7d3c2ed43 ;;
     donor-scan) groups=(7); prior=1; ranked_sha=9952fad5ed36ce4d2885b66399f6543b8c5a8e7d ;;
-    *) echo "Usage: $0 [all|g7|audit|donor-scan]" >&2; exit 2 ;;
+    donor-slots) groups=(7); prior=1; ranked_sha=3c3fa6486d470e4ddf020d7701691a4314fc5da0 ;;
+    *) echo "Usage: $0 [all|g7|audit|donor-scan|donor-slots]" >&2; exit 2 ;;
 esac
 checkout() {
     local branch=$1 sha=$2 destination=$3
@@ -81,7 +83,9 @@ printf 'CONFIG URMA NPU4 logical=0 BS16 Q4 656B cold_windows=8 Fetch_AIV_per_win
     "$baseline_sha" "$ranked_sha" "$result"
 if ((audit)); then echo MODE=LI_phase_audit_only_not_a_performance_candidate; fi
 if ((prior)); then
-    printf 'PRIOR=%s\nDONOR=1d2486a76151ae37662c47aab835d06df50be866\nSCOPE=donor_scan_and_device_call_boundaries_same_rank_and_fetch\n' "$prior_sha"
+    scope=donor_scan_and_device_call_boundaries_same_rank_and_fetch
+    if [[ "$mode" == donor-slots ]]; then scope=final_TopK_tagged_slot_classification; fi
+    printf 'PRIOR=%s\nDONOR=1d2486a76151ae37662c47aab835d06df50be866\nSCOPE=%s\n' "$prior_sha" "$scope"
 fi
 for group in "${groups[@]}"; do
     python3 -B -m kvip.diagnostics.ranked_port cpu --snapshot "$inputs/g${group}-input"
@@ -197,5 +201,5 @@ for group in "${groups[@]}"; do
     python3 -B -m kvip.diagnostics.ranked_port report --root "$result" --group "$group" "${report_flags[@]}" | tee "$result/g${group}-summary.txt"
 done
 (cd "$result" && tar -czf results.tar.gz g*.json g*-summary.txt)
-if ((audit)); then label=G7_AUDIT; elif ((prior)); then label=G7_DONOR_SCAN; elif ((${#history[@]})); then label=G7; else label=G7_G2; fi
+if ((audit)); then label=G7_AUDIT; elif [[ "$mode" == donor-slots ]]; then label=G7_DONOR_SLOTS; elif ((prior)); then label=G7_DONOR_SCAN; elif ((${#history[@]})); then label=G7; else label=G7_G2; fi
 printf '%s_COMPLETE RETURN_FILE=%s/results.tar.gz\n' "$label" "$result"
