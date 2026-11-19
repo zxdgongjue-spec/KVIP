@@ -256,8 +256,8 @@ def load_case(path):
     return data
 
 
-def report(root, group, *, history=False):
-    names = ("forward", "reverse", "ranked")
+def report(root, group, *, history=False, prior=False):
+    names = ("forward", "reverse", "ranked-prior", "ranked") if prior else ("forward", "reverse", "ranked")
     cases = {name: [load_case(root / f"g{group}-{name}-{run}.json") for run in (1, 2)] for name in names}
     first = cases["forward"][0]
     historical = {tag: load_case(root / f"g{group}-{tag}-2.json")
@@ -300,7 +300,9 @@ def report(root, group, *, history=False):
                 value = windows[key]
                 fields.append(f"{key}={value['mean']:.2f}/{value['p50']:.2f}" if value["n"] else f"{key}=NA")
             print("WINDOW mean/P50_us " + " ".join(fields))
-    arms = {"reverse": cases["reverse"][-1], **historical, "ranked": cases["ranked"][-1]}
+    arms = {"reverse": cases["reverse"][-1], **historical,
+            **({"ranked-prior": cases["ranked-prior"][-1]} if prior else {}),
+            "ranked": cases["ranked"][-1]}
     get_times = {}
     for name, case in arms.items():
         if name in historical:
@@ -324,7 +326,7 @@ def report(root, group, *, history=False):
                       f"{get['mapping_wait_p50_us']:.2f}/{get['mapping_wait_max_us']:.2f}")
         elif history:
             print(f"FINAL_GET_US {name} unavailable reason={get.get('reason', 'missing diagnostic')}")
-    for name in (*historical, "ranked"):
+    for name in (*historical, *(("ranked-prior",) if prior else ()), "ranked"):
         if name in kernel_times and "reverse" in kernel_times:
             di, dl, dt = [a-b for a, b in zip(kernel_times[name], kernel_times["reverse"])]
             print(f"KERNEL_DELTA_US {name}-minus-reverse init/LI/resolve_update={di:+.2f}/{dl:+.2f}/{dt:+.2f}"
@@ -333,7 +335,12 @@ def report(root, group, *, history=False):
             base, now = get_times["reverse"], get_times[name]
             print(f"FINAL_GET_SAVED_US {name} vs_reverse Q_worker_P50/max="
                   f"{base['p50_us']-now['p50_us']:+.2f}/{base['max_us']-now['max_us']:+.2f} overlapping_workers=1")
-    for name in names[2:]:
+    if prior:
+        control_audit = load_case(root / f"g{group}-reverse-audit-2.json")
+        if control_audit["snapshot_sha256"] != first["snapshot_sha256"] or control_audit["geometry"] != first["geometry"]:
+            raise ValueError("Phase-only control uses different inputs")
+        report_scan_delta(cases, control_audit=control_audit)
+    for name in ("ranked",):
         gains = []
         for baseline in names[:2]:
             gain = [100*(1-max(c["timing"][k] for c in cases[name])/min(c["timing"][k] for c in cases[baseline]))
@@ -342,9 +349,51 @@ def report(root, group, *, history=False):
             print(f"GAIN {name} vs_{baseline} conservative_mean/P50={gain[0]:+.2f}/{gain[1]:+.2f}%")
         print(f"GATE {name} " + ("CANDIDATE" if min(gains) > 1 else "KEEP_BASELINES"))
     print("NOTE gain uses slowest candidate vs fastest control repeats; window markers are separate instrumented replays, not graph deltas")
-    if history and (len(kernel_times) != len(arms) or len(get_times) != len(arms)):
+    if (history or prior) and (len(kernel_times) != len(arms) or len(get_times) != len(arms)):
         raise ValueError(f"Incomplete G{group} attribution; use stored JSON/profile directories above")
     print(f"RESULT_END G{group}")
+
+
+def report_scan_delta(cases, *, control_audit=None):
+    """Compare the donor scan port with its same-rank predecessor separately."""
+    old, new = cases["ranked-prior"], cases["ranked"]
+    gain = [100 * (1 - max(c["timing"][key] for c in new) /
+                   min(c["timing"][key] for c in old))
+            for key in ("mean_us", "p50_us")]
+    print(f"PORT_GAIN vs_ranked_prior conservative_mean/P50={gain[0]:+.2f}/{gain[1]:+.2f}%")
+    audits = {}
+    phase_cases = {name: cases[name][-1] for name in ("ranked-prior", "ranked")}
+    if control_audit is not None:
+        phase_cases["reverse-audit"] = control_audit
+    for name, case in phase_cases.items():
+        samples = case.get("native_diagnostics", {}).get("samples", [])
+        available = [sample["li_phase_audit"] for sample in samples
+                     if sample.get("li_phase_audit", {}).get("status") == "available"]
+        if not available:
+            raise ValueError(f"Missing LI phase audit for {name}; keep the saved profiles")
+        # This study requests one separate instrumented replay per variant.
+        if len(available) != 1:
+            raise ValueError(f"Expected one LI phase replay for {name}")
+        audits[name] = available[0]
+        phases = available[0]["phases"]
+        print(f"SCAN_AUDIT {name} mean/P50_us " + " ".join(
+            f"{key}={value['mean']:.2f}/{value['p50']:.2f}"
+            for key, value in phases.items()))
+        row = available[0]["latest_query"]
+        print(f"LATEST_QUERY {name} q={row['query']} total_us={row['total_us']:.2f} "
+              + " ".join(f"{key}={value:.2f}" for key, value in row["parts_us"].items()))
+    before, after = audits["ranked-prior"]["phases"], audits["ranked"]["phases"]
+    print("SCAN_DELTA_US new-minus-prior mean/P50 " + " ".join(
+        f"{key}={after[key]['mean']-before[key]['mean']:+.2f}/"
+        f"{after[key]['p50']-before[key]['p50']:+.2f}" for key in before))
+    if "reverse-audit" in audits:
+        control = audits["reverse-audit"]["phases"]
+        key = "scan_excluding_own_fetch"
+        old_gap = before[key]["mean"] - control[key]["mean"]
+        new_gap = after[key]["mean"] - control[key]["mean"]
+        print(f"SCAN_GAP_US vs_phase_only_reverse prior/new/recovered_mean={old_gap:+.2f}/{new_gap:+.2f}/{old_gap-new_gap:+.2f}")
+        print("NOTE reverse-audit has phase markers; headline controls remain unchanged pinned sources")
+    print("NOTE scan phases include stalls; audit deltas and profiler deltas are separate replays")
 
 
 def main():
@@ -362,11 +411,12 @@ def main():
     summary.add_argument("--root", type=Path, required=True)
     summary.add_argument("--group", type=int, required=True)
     summary.add_argument("--history", action="store_true")
+    summary.add_argument("--prior", action="store_true")
     args = parser.parse_args()
     if args.action == "build":
         build(args.root, args.revision, args.build_dir, args.soc, args.baseline)
     elif args.action == "report":
-        report(args.root, args.group, history=args.history)
+        report(args.root, args.group, history=args.history, prior=args.prior)
     else:
         archive = load_snapshot(args.snapshot)
         for skew in (False, True):

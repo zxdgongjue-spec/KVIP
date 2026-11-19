@@ -18,11 +18,14 @@ tie_sha=a92b7c8cd9e72728817ad8455b01929fcafe924f
 groups=(7 2)
 history=()
 audit=0
+prior=0
+prior_sha=aaa8d3429951464d0d62d70b10cbaaf7d3c2ed43
 case "${1:-all}" in
     all) ;;
     g7) groups=(7); history=(--history) ;;
     audit) groups=(7); audit=1; ranked_sha=aaa8d3429951464d0d62d70b10cbaaf7d3c2ed43 ;;
-    *) echo "Usage: $0 [all|g7|audit]" >&2; exit 2 ;;
+    donor-scan) groups=(7); prior=1; ranked_sha=9952fad5ed36ce4d2885b66399f6543b8c5a8e7d ;;
+    *) echo "Usage: $0 [all|g7|audit|donor-scan]" >&2; exit 2 ;;
 esac
 checkout() {
     local branch=$1 sha=$2 destination=$3
@@ -49,6 +52,9 @@ if ((${#history[@]})); then
         checkout perf/urma-ranked-only "$sha" "$work/fused-scan-sources/native-$sha"
     done
 fi
+if ((prior)); then
+    checkout perf/urma-ranked-only "$prior_sha" "$work/fused-scan-sources/native-$prior_sha"
+fi
 for group in "${groups[@]}"; do
     [[ -s "$inputs/g${group}-input/manifest.json" ]] || { echo "INPUT_MISSING G$group" >&2; exit 1; }
 done
@@ -74,6 +80,9 @@ result=$(mktemp -d "$work/host20-ranked-port-npu4.XXXXXX")
 printf 'CONFIG URMA NPU4 logical=0 BS16 Q4 656B cold_windows=8 Fetch_AIV_per_window=8 seed_is_not_window budgets=64/512\nCONTROL=%s\nRANKED=%s\nRESULT_ROOT=%s\n' \
     "$baseline_sha" "$ranked_sha" "$result"
 if ((audit)); then echo MODE=LI_phase_audit_only_not_a_performance_candidate; fi
+if ((prior)); then
+    printf 'PRIOR=%s\nDONOR=1d2486a76151ae37662c47aab835d06df50be866\nSCOPE=donor_scan_and_device_call_boundaries_same_rank_and_fetch\n' "$prior_sha"
+fi
 for group in "${groups[@]}"; do
     python3 -B -m kvip.diagnostics.ranked_port cpu --snapshot "$inputs/g${group}-input"
 done
@@ -81,7 +90,12 @@ echo BUILD_BEGIN
 if ! (
     python3 -B -m kvip.diagnostics.ranked_port build --root "$baseline" --revision "$baseline_sha" \
         --build-dir "$build" --soc Ascend950DT_9582 --baseline || exit $?
+    if ((prior)); then
+        python3 -B -m kvip.diagnostics.ranked_port build --root "$work/fused-scan-sources/native-$prior_sha" \
+            --revision "$prior_sha" --build-dir "$build" --soc Ascend950DT_9582 --baseline || exit $?
+    fi
     local_shas=("$ranked_sha")
+    if ((prior)); then local_shas+=("$prior_sha"); fi
     if ((${#history[@]})); then local_shas+=("$old_sha" "$tie_sha"); fi
     for sha in "${local_shas[@]}"; do
         python3 -B -m kvip.diagnostics.ranked_port build --root "$work/fused-scan-sources/native-$sha" \
@@ -124,15 +138,21 @@ run_case() {
             ranked-46924fb) sha=$old_sha ;;
             ranked-a92b7c8) sha=$tie_sha ;;
             ranked) sha=$ranked_sha ;;
+            ranked-prior) sha=$prior_sha ;;
             *) return 2 ;;
         esac
         source="$work/fused-scan-sources/native-$sha"
         extra=(--study threshold --ranked-port)
         if [[ "$repeat" == 1 ]]; then diagnostics=1; fi
     fi
+    if [[ "$name" == reverse-audit ]]; then
+        sha=$prior_sha
+        source="$work/fused-scan-sources/native-$sha"
+        extra=(--study scan-order --scan-variants reverse)
+    fi
     # One independent profiler replay after this process's headline samples.
-    if [[ "$repeat" == 2 && "$name" != forward  ]] && { ((${#history[@]} || audit)) || [[ "${RANKED_TIMELINE:-1}" == 1 ]]; }; then
-        if ((${#history[@]} || audit)); then
+    if [[ "$repeat" == 2 && "$name" != forward  ]] && { ((${#history[@]} || audit || prior)) || [[ "${RANKED_TIMELINE:-1}" == 1 ]]; }; then
+        if ((${#history[@]} || audit || prior)); then
             extra+=(--final-get-detail)
             diagnostics=1
         fi
@@ -160,13 +180,22 @@ for group in "${groups[@]}"; do
     fi
     echo "BEGIN G$group graph"
     # Fail on candidate correctness before spending time on control timings.
-    for name in ranked forward reverse; do run_case "$group" "$name" 1; done
+    first_order=(ranked forward reverse)
+    last_order=(reverse forward ranked)
+    if ((prior)); then
+        first_order=(ranked ranked-prior forward reverse)
+        last_order=(reverse forward ranked-prior ranked)
+    fi
+    for name in "${first_order[@]}"; do run_case "$group" "$name" 1; done
     if ((${#history[@]})); then
         for name in ranked-46924fb ranked-a92b7c8; do run_case "$group" "$name" 2; done
     fi
-    for name in reverse forward ranked; do run_case "$group" "$name" 2; done
-    python3 -B -m kvip.diagnostics.ranked_port report --root "$result" --group "$group" "${history[@]}" | tee "$result/g${group}-summary.txt"
+    for name in "${last_order[@]}"; do run_case "$group" "$name" 2; done
+    if ((prior)); then run_case "$group" reverse-audit 2; fi
+    report_flags=("${history[@]}")
+    if ((prior)); then report_flags=(--prior); fi
+    python3 -B -m kvip.diagnostics.ranked_port report --root "$result" --group "$group" "${report_flags[@]}" | tee "$result/g${group}-summary.txt"
 done
 (cd "$result" && tar -czf results.tar.gz g*.json g*-summary.txt)
-if ((audit)); then label=G7_AUDIT; elif ((${#history[@]})); then label=G7; else label=G7_G2; fi
+if ((audit)); then label=G7_AUDIT; elif ((prior)); then label=G7_DONOR_SCAN; elif ((${#history[@]})); then label=G7; else label=G7_G2; fi
 printf '%s_COMPLETE RETURN_FILE=%s/results.tar.gz\n' "$label" "$result"

@@ -143,3 +143,29 @@ def test_kernel_costs_falls_back_to_actual_profiler_export(tmp_path):
     report = dict(metric="none", directory=str(tmp_path), timeline={"li": None},
                   artifacts={"csv_files": [{"path": p.name}]})
     assert kernel_costs({"system_profiles": {"passes": [report]}}) == [12, 355, 215]
+
+
+def test_scan_port_report_keeps_phase_and_graph_gains_separate(capsys):
+    from kvip.diagnostics.ranked_port import report_scan_delta
+
+    def case(mean, median, scan):
+        phases = {"seed": dict(mean=20., p50=19.),
+                  "scan_excluding_own_fetch": dict(mean=scan, p50=scan-2)}
+        audit = dict(status="available", phases=phases,
+                     latest_query=dict(query=59, total_us=scan+40,
+                                       parts_us={key: value["mean"] for key, value in phases.items()}))
+        return dict(timing=dict(mean_us=mean, p50_us=median),
+                    native_diagnostics=dict(samples=[dict(li_phase_audit=audit)]))
+
+    cases = {"ranked-prior": [case(870, 868, 360), case(880, 878, 360)],
+             "ranked": [case(850, 848, 320), case(890, 887, 320)]}
+    report_scan_delta(cases, control_audit=case(650, 648, 218))
+    out = capsys.readouterr().out
+    # A faster scan cannot hide a losing full-graph repeat.
+    assert "conservative_mean/P50=-2.30/-2.19%" in out
+    assert "scan_excluding_own_fetch=-40.00/-40.00" in out
+    assert "prior/new/recovered_mean=+142.00/+102.00/+40.00" in out
+    assert "audit deltas and profiler deltas are separate replays" in out
+    cases["ranked"][-1]["native_diagnostics"]["samples"] = []
+    with pytest.raises(ValueError, match="Missing LI phase audit"):
+        report_scan_delta(cases)
