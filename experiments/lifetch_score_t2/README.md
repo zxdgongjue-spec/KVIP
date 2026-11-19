@@ -49,7 +49,26 @@ bash experiments/lifetch_score_t2/run_a5.sh \
 
 准备完成后的实验可以直接指定 `--kvaf-root /home/w00568585/KVAF-score-t2-1c131038`，不再加 `--prepare-kvaf`。可用 `--pinned-kvaf-root` 自定义新目录。新 LIDU vendor 对两路测试共同使用，所选路径写入 manifest。脚本构建 CPU service 产物，但不会启动或重启已有的 KVAF server。
 
-`run_a5.py` 本地 `git archive` 导出精确 MR23 基线，避免把未提交编辑或 build 软链接复制进去。两个 source 通过源文件摘要缓存分别编译 LIFetch。所有测试在同一个固定 KVAF 上执行；native 串行参考会在每路测试中实际执行。不会直接把不同版本的 build-npu 二进制复制到固定版本目录，也不会跳过版本检查。
+`run_a5.py` 本地 `git archive` 导出 MR23 基线，避免把未提交编辑或 build 软链接复制进去。基线的算子、launch 和计时源码保持该提交；两路统一使用当前 `python/kvip/runtime/build.py` 的启动构建修复，替换记录和 SHA256 写入 `baseline_build_override.json`/manifest，原文件另存 `baseline-build-original.py`。两个 source 通过源文件摘要缓存分别编译 LIFetch。所有测试在同一个固定 KVAF 上执行；native 串行参考会在每路测试中实际执行。不会直接把不同版本的 build-npu 二进制复制到固定版本目录，也不会跳过版本检查。
+
+### `indexer.cpp.o: unknown file type` 构建恢复
+
+CANN 的 `merge_obj_text.sh` 会把编译产生的 REL 对象原地链接成 EXEC 对象。失败后复用同一 CMake/ExternalProject 目录，可能跳过编译并再次合并该对象，触发 `unknown file type`。本地 CANN 9.1 已复现该错误机制；服务器上具体对象的类型仍需失败诊断确认，不能仅凭这一行认定对象类型或算法错误。
+
+当前构建器对未完成的缓存每次创建全新的 `attempt-*` 目录，不复用对象和 stamp；成功后原子发布动态库与 `complete.json`，之后直接复用完成产物。失败目录保留，缓存根部 `build.log` 指向最近一次日志。出现 `unknown file type` 时还会输出对象大小及 ELF type/machine。缓存协议更新会避开此前目录，不需要删除整个 KVAF 或重新准备依赖。
+
+更新候选分支后，在容器使用已经准备好的固定依赖重跑：
+
+```bash
+cd /home/w00568585/wt-lifetch-score-t2
+bash experiments/lifetch_score_t2/run_a5.sh \
+  --device 5 --kvaf-root /home/w00568585/KVAF-score-t2-1c131038 \
+  --kvaf-server 127.0.0.1:28885 \
+  --miss-percent 10 --prefetch 1024 --intermediate-fetches 4 \
+  --rounds 1 --warmup 4 --iterations 20
+```
+
+若全新 attempt 仍失败，保留完整新 `build.log` 及对象诊断，再定位编译器、文件内容或其他原因。`INCOMPLETE/NOT_RUN` 的结果不能计入融合性能对比。
 
 默认交错运行：原 MR23（B1/B16）、score P2（B1/B16）、score P16（仅 B1），r0 丢弃，再测 r1/r2/r3。P2 的 B1 控制组用于判断全 score 屏障/Cold 再读的代价；B16/P2 已使用 32 AIC，没有凭空增加 score 并行度。若设备有效核数小于 32，B16/P2 会拒绝执行，禁止超预算隐式分波。
 

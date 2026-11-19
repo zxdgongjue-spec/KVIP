@@ -23,7 +23,7 @@ from kvip.operators.lifetch.score_policy import validate_score_t2
 from diagnostics import account
 from performance import split_graph_invocations
 from workloads import configuration
-from run_a5 import summarize, save
+from run_a5 import BASE, baseline, checksum, summarize, save
 
 
 class Controls(unittest.TestCase):
@@ -126,6 +126,20 @@ extern "C" void slice(unsigned task,unsigned p,unsigned h,unsigned* out) {
         self.assertEqual(configuration(['bench','--li-score-parts','16','--batches','1']).li_score_parts,16)
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             configuration(['bench','--li-score-parts','16','--transport','ubmem'])
+
+    def test_baseline_only_overrides_startup_builder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp)
+            source = baseline(output)
+            relative = 'csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer.cpp'
+            original = subprocess.check_output(['git', 'show', BASE+':'+relative], cwd=ROOT)
+            self.assertEqual((source/relative).read_bytes(), original)
+            relative = 'python/kvip/runtime/build.py'
+            original = subprocess.check_output(['git', 'show', BASE+':'+relative], cwd=ROOT)
+            self.assertEqual((output/'baseline-build-original.py').read_bytes(), original)
+            self.assertEqual((source/relative).read_bytes(), (ROOT/relative).read_bytes())
+            metadata = json.loads((output/'baseline_build_override.json').read_text())
+            self.assertEqual(metadata['effective_sha256'], checksum(ROOT/relative))
 
     def test_summary_uses_graph_event_and_rejects_operand_change(self):
         with tempfile.TemporaryDirectory() as temp:

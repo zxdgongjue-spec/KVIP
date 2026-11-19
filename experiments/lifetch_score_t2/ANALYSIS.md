@@ -60,3 +60,15 @@ Final 是完整有效 history 上的数值 Top2048，不是跨 Q 去重；跨 Q 
 - 为避免磁盘再次耗尽，本次 Model 关闭 instruction dump，仅保留运行日志、配置和 proof，不提供指令占比。
 
 下一步使用 `run_a5.sh --miss-percent 10 --rounds 1` 先验证标准组全流程，再跑全部 miss≤20% 组。所有配置要 PASS，输入 hashes 相同，native 参考没有明显漂移，才能评估候选；完整测量自动保留 profiler trace。若出现退化，再用 `diagnose --level 2` 定位 resident θ/Cold Service/Resolve/CQ 等待，不猜测加速幅度。
+
+## A5 构建失败与恢复（2026-11-19）
+
+用户运行 `lifetch_score_t2_20261119_204047_27p7vr4k` 时，候选 P2 在 CANN 9.2.0 preprocess 的 AIV 合并阶段报 `indexer.cpp.o: unknown file type`。B1 native event 为 254.86µs，LI/LIDU/Fetch 同图阶段为 220.36/19.14/12.03µs；融合未执行，B16 未完成。这些值只证明 native 路线执行，不能形成候选性能或正确性结论。
+
+在本地 CANN 9.1 对已经成功执行过 `merge_obj_text.sh` 的 `.o` 再次运行相同 `ld.lld -m aicorelinux -Ttext=0`，复现同一 `unknown file type`。对象为 ELF EXEC（type=2），不是编译器最初的 REL（type=1）。CANN 合并脚本原地替换 `.o`，而旧构建器对缺少 `complete.json` 的缓存复用同一 CMake/ExternalProject 目录，因此重试可能把已链接对象再次交给链接器。服务器报错对象未直接检查；新的 ELF 诊断用于确认其实际类型，不能排除其他文件/编译器原因。
+
+恢复方案只修改启动构建：每次未完成构建使用全新 `attempt-*`，保留失败对象和日志；成功后原子发布 `.so` 与完成记录，后续缓存命中不调用 CMake。缓存协议摘要更新会避开旧失败目录。MR23 基线只替换同一启动构建器，算子与计时源码保持原提交，替换 SHA256 和原文件作为实验产物保留。
+
+验证：3 项构建恢复测试通过（失败目录/日志保留、新目录重试后成功复用、configure 失败与缺失库不发布完成记录）；9 项实验控制/依赖隔离测试通过，包含基线构建覆盖记录检查。原有源代码/头文件/共享 selector 摘要更新与缓存复用检查、CMake 源目录检查通过。本地 CANN 9.1 NPU 全新目录编译链接通过，缓存第二次调用没有重编，发布后的库在正确预加载 CANN Model runtime 时动态加载及新入口符号检查通过。
+
+本地没有硬件驱动；直接加载 NPU 库时 SoC 检查出现 `basic_string::_S_construct null not valid`，原构建目录和发布目录一致。正确预加载 Model runtime 后两者的环境问题消失，未将该初始化失败当作候选运行结果。完整候选 A5 Cold/Service/Final/URMA 正确性和收益仍待重跑验证。

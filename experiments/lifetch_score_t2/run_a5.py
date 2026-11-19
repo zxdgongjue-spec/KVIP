@@ -65,6 +65,16 @@ def baseline(output):
                         raise RuntimeError('Baseline archive link escapes source root')
             tar.extractall(source)
     archive.unlink()
+    # Apply the same startup-only cache recovery to both routes. MR23 kernel,
+    # launch and benchmark timing sources remain exactly as archived.
+    relative = Path('python/kvip/runtime/build.py')
+    old_builder = source / relative
+    (output / 'baseline-build-original.py').write_bytes(old_builder.read_bytes())
+    original_hash = checksum(old_builder)
+    old_builder.write_bytes((ROOT / relative).read_bytes())
+    save(output / 'baseline_build_override.json', dict(
+        path=str(relative), original_sha256=original_hash, effective_sha256=checksum(old_builder),
+        reason='Shared startup-only fresh-attempt build recovery; no operator or timing changes'))
     return source
 
 
@@ -196,6 +206,7 @@ def main(argv=None):
     sources = {'mr23':baseline(output), 'score_t2_p2':ROOT, 'score_t2_p16':ROOT}
     manifest = dict(status='PLANNED', baseline_commit=BASE, candidate_commit=command(['git','rev-parse','HEAD']),
                     candidate_status=command(['git','status','--short']), configuration=vars(a).copy(),
+                    baseline_build_override=json.loads((output/'baseline_build_override.json').read_text()),
                     effective_kvaf_root=str(kvaf),
                     completion='URMA Fetch + Index update + output slot validation; SFA checked outside timing')
     manifest['configuration'] = {k:str(v) if isinstance(v, Path) else v for k,v in manifest['configuration'].items()}
