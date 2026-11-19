@@ -331,7 +331,8 @@ int main(){
  nativeArgs.token_bytes=656;nativeArgs.miss_count=reinterpret_cast<uint64_t>(&missCount);
  nativeArgs.channel_entity=reinterpret_cast<uint64_t>(&entity);
  nativeArgs.queue_state=reinterpret_cast<uint64_t>(&queue);nativeArgs.core_status=reinterpret_cast<uint64_t>(&nativeStatus);
- Args args{};args.context=reinterpret_cast<uint64_t>(&ctx);args.postIndex=reinterpret_cast<uint64_t>(records.data());
+ std::array<uint64_t,512> times{};
+ Args args{};args.times=reinterpret_cast<uint64_t>(times.data());args.context=reinterpret_cast<uint64_t>(&ctx);args.postIndex=reinterpret_cast<uint64_t>(records.data());
  args.packedFetch=reinterpret_cast<uint64_t>(packed.data());args.maxEvents=10240;
  args.eventsSrc=reinterpret_cast<uint64_t>(eventSources.data());args.eventsDst=reinterpret_cast<uint64_t>(eventDestinations.data());
  args.updateBindings=reinterpret_cast<uint64_t>(update.data());
@@ -365,7 +366,7 @@ int main(){
   assert(records[0].globalError==records[0].error);
   assert(records[0].completed==0&&records[0].active==1);
   assert(records[0].fallback==(waitFirst?2U:0U));
-  assert(crossCoreBarriers==5);
+  assert(crossCoreBarriers==(waitFirst?5:4));
   for(const auto& post:finalPosts)assert(post.error==records[0].error&&post.pending==0);
   assert(queue.sq_producer_index==0&&!queue.poisoned);
  }
@@ -397,7 +398,7 @@ int main(){
   auto before=aiv_model::testDoorbells;
   Run(&args,0);
   barrierHook={};
-  assert(aiv_model::testDoorbells==before&&crossCoreBarriers==5);
+  assert(aiv_model::testDoorbells==before&&crossCoreBarriers==(waitFirst?5:4));
   assert(prefix[0]==0&&prefix[1]==0);
   assert(records[0].active==1&&records[0].completed==0);
   assert((publishedUpdateStatus!=0)==(injectAt!=0));
