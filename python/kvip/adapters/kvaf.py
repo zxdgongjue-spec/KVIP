@@ -217,6 +217,11 @@ class KvafQueueView:
             raise ValueError("Fused queue address/valid tables must be int64 or uint64 / uint8")
         queues = self.context["worker_count"] * 2
         self.core_status = torch.zeros((queues, self.abi_sizes["status"]), dtype=torch.uint8, device=self.device)
+        # Each group owns its queue state. The transport-level
+        # device_queue_state is shared by every group on the same session, so a
+        # poison latched by one group would reject all the others with
+        # kInvalidQueue before they ever post (and it survives lease churn).
+        self.queue_state = torch.zeros((queues, self.abi_sizes["queue"]), dtype=torch.uint8, device=self.device)
         self.descriptors = torch.zeros((4, 8192), dtype=torch.int32, device=self.device)
         self.device_args = None
         lease.plans.append(self)
@@ -237,7 +242,7 @@ class KvafQueueView:
                 self.output.data_ptr(),
                 self.core_status.data_ptr() + queue * sizes["status"],
                 context["device_channel_entity"] + queue * sizes["entity"],
-                context["device_queue_state"] + queue * sizes["queue"],
+                self.queue_state.data_ptr() + queue * sizes["queue"],
                 self.addresses.numel(),
                 8192,
                 context["output_bytes"] // context["token_bytes"],
