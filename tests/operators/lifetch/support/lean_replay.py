@@ -88,6 +88,34 @@ def clipped_union(start, end, intervals):
     return total
 
 
+def window_stages(events, mhz):
+    """Decode full 128-byte retired Event snapshots. An unexecuted window has no time."""
+    invocations, epochs, lanes, _ = events.shape
+    reports = []
+    for epoch in range(epochs):
+        eligible = invocations * lanes
+        raw = events[:, epoch].reshape(-1, 16)
+        words = raw.view('<u4')
+        complete = ((words[:, 6] == 1) & (words[:, 5] == epoch)
+                    & (raw[:, 0] > 0) & (raw[:, 1] >= raw[:, 0]))
+        e = raw[complete]
+        def metric(values):
+            return dict(n=len(values), eligible=eligible,
+                        p50_us=float(np.median(values))/mhz if len(values) else None,
+                        max_us=int(np.max(values))/mhz if len(values) else None)
+
+        def interval(begin, end):
+            valid = (e[:, begin] > 0) & (e[:, end] >= e[:, begin])
+            return metric(e[valid, end] - e[valid, begin])
+
+        reports.append(dict(epoch=epoch, service_us=interval(0, 1),
+                            predecessor_wait_us=interval(4, 13), incremental_us=interval(13, 14),
+                            scan_us=metric(e[:, 5]), candidate_us=metric(e[:, 6]),
+                            post_us=metric(e[:, 7]), active_post_us=metric(e[e[:, 10] > 0, 7]),
+                            posted_tokens=measured_range(e[:, 10].astype(int).tolist()) if len(e) else None))
+    return reports
+
+
 def stage_report(states, profile, samples, mhz, policy, directory):
     # Each summary keeps the relevant unit of observation. No per-request sum
     # of duplicate Get stamps and no zero for a fast path missing a probe.
@@ -96,11 +124,17 @@ def stage_report(states, profile, samples, mhz, policy, directory):
     buckets = defaultdict(list)
     eligible = defaultdict(int)
     direct = dict(compact=0, overflow=0, other=0)
-    raw_times, route_probes, group_counts = [], [], []
+    raw_times, completed_events, route_probes, group_counts = [], [], [], []
     for state in states:
         b = state.batch
         raw = state.forward.times.cpu().numpy().reshape(-1)
         raw_times.append(raw)
+        rotating = state.rotating
+        event_bytes = rotating.events.cpu().numpy().view(np.uint8)
+        event_count = rotating.rounds*rotating.service_lanes
+        event_words = event_bytes.reshape(-1, 128)[:event_count].view('<u8')
+        completed_events.append(event_words.reshape(rotating.rounds, rotating.service_lanes, 16))
+        rows = rotating.rows.cpu().numpy().view(np.uint32).reshape(b, 256)
         producer = raw[:b*64].reshape(b, 64)
         li = raw[b*64:b*128].reshape(b, 4, 16)
         fetch = raw[b*128:b*256].reshape(b, 128)
@@ -132,6 +166,11 @@ def stage_report(states, profile, samples, mhz, policy, directory):
                 if u[26]:
                     buckets['index_active_work'].append(int(u[25])/mhz)
             bracket('finalize_including_waits', fetch[r], 96, 99)
+            if rows[r, 9] > 0:
+                eligible['prefetch_cq_drain'] += 1
+                # Finalizer ft[6] times DrainQueue; ft[7] confirms its call.
+                if fetch[r, 103]:
+                    buckets['prefetch_cq_drain'].append(int(fetch[r, 102])/mhz)
             # Nonempty hardware Get spans include post, transfer and draining.
             # The consumer span includes waits too. Their intersection bounds
             # time in common, without treating every such cycle as saved.
@@ -182,6 +221,7 @@ def stage_report(states, profile, samples, mhz, policy, directory):
                   final_topk='per-query final score read and TopK sort before location classification, candidate diagnostic only',
                   li_final_classification='per-query final classification including its waits',
                   final_get_post='KVAF post-active time per nonempty final Get worker/phase',
+                  prefetch_cq_drain='per request that submitted prefetch, software DrainQueue duration across all its windows',
                   final_get_cq_wait='KVAF drain-wait time per nonempty final Get worker/phase')
     stages = {}
     def metric(name, values, n, scope):
@@ -218,12 +258,14 @@ def stage_report(states, profile, samples, mhz, policy, directory):
                              for w in range(len(requests[0]['windows']))])
     traffic = {k: measured_range([row[k] for row in traffic_rows]) for k in
                ('prefetch', 'final', 'unused_prefetch', 'initial_cold', 'selected_unique', 'KV_read_bytes')}
-    np.savez_compressed(directory / 'lean_ticks.npz', times=np.stack(raw_times), cycles_per_us=mhz,
+    events = np.stack(completed_events)
+    np.savez_compressed(directory / 'lean_ticks.npz', times=np.stack(raw_times), prefetch_events=events, cycles_per_us=mhz,
                         **({'route_probe': np.stack(route_probes)} if route_probes else {}))
     return dict(stages=stages, traffic=traffic, window_posted=[measured_range(col) for col in zip(*windows)],
                 window_nonempty_requests=[measured_range(col) for col in zip(*occupied)],
                 diagnostic_final_get_submitted_groups=measured_range(group_counts),
                 route_policy=policy, direct_plan_rows=direct, cycles_per_us=mhz,
+                window_stages=window_stages(events, mhz),
                 measured_graph_calls=len(samples), diagnostic_graph_replays=1, diagnostic_graph_calls=len(states),
                 standalone_init_us=None, index_cq_hidden_us=None,
                 scope='Auxiliary counters exclude headline. Individual role durations run in parallel. '
