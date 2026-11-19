@@ -125,6 +125,9 @@ private:
 template<>
 class LITopk<uint16_t> {
 public:
+#if KVIP_RANKED_PORT
+    __aicore__ inline uint32_t RankedStrictCount() const { return incrementalStrictCount_; }
+#endif
 #if KVIP_INCREMENTAL_TOPK
 #if KVIP_INCREMENTAL_DIRECT
 #if KVIP_NATIVE_TRUNK && !KVIP_TRUNK_PRUNED
@@ -219,7 +222,7 @@ public:
     {
         if (s2LoopNum == 1) {
             if (returnScores) {
-#if KVIP_INCREMENTAL_REGISTER
+#if KVIP_INCREMENTAL_REGISTER || KVIP_RANKED_PORT
             // Same exact Kth and stable >Kth / ==Kth ID ordering. Keep the
             // two byte CDFs in registers instead of four separate VF stages
             // and intermediate histogram copies. Only incremental calls
@@ -231,7 +234,7 @@ public:
             auto values = reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal.GetPhyAddr());
             auto kth = reinterpret_cast<__ubuf__ uint32_t*>(nkValueLocal.GetPhyAddr());
             topkb16gather::FindIdxGTOutputVFImpl(idx, values, uint16_t(0), kth, uint16_t(s2SeqLen / 128));
-#if KVIP_INCREMENTAL_TIES
+#if KVIP_INCREMENTAL_TIES || KVIP_RANKED_PORT
             incrementalStrictCount_ = GetSpr<SpecialPurposeReg::AR>() / sizeof(uint16_t);
 #endif
             topkb16gather::FindIdxEQOutputVFImpl(idx, values, uint16_t(0), kth, uint16_t(s2SeqLen / 128));
@@ -272,7 +275,7 @@ public:
         }
     }
 private:
-#if KVIP_INCREMENTAL_TIES
+#if KVIP_INCREMENTAL_TIES || KVIP_RANKED_PORT
     uint32_t incrementalStrictCount_ = 0;
 #endif
     LocalTensor<uint32_t> hisIndexLocal[2];      // 每trunkLen长度的s2选出的topK个索引

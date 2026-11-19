@@ -6,6 +6,7 @@
 #define KVIP_COLD_FETCH_ONLY 1
 namespace rotating {
 constexpr uint32_t kTop=2048, kSlots=8192, kMaxRounds=32, kRowStatusWords=32;
+constexpr uint32_t kRankedLocalOffers=64; // Capacity of one private Q handoff, never a selection cap.
 constexpr bool kFinalReplicated=true;
 constexpr uint32_t kFinalStateWords=288;
 struct alignas(128) FinalPost {

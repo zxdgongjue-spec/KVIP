@@ -85,7 +85,7 @@ public:
 #if KVIP_WINDOW_REFILTER || KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
             , false, scoreStorage_
 #elif KVIP_RANKED_PORT
-            , false, nullptr, rankedCounts_
+            , false, nullptr, rankedCounts_, incrementalPipeline_ ? &rankedLocalOffers_ : nullptr
 #endif
             );
 #else
@@ -94,7 +94,7 @@ public:
 #if KVIP_WINDOW_REFILTER || KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
             , scoreStorage_
 #elif KVIP_RANKED_PORT
-            , nullptr, rankedCounts_
+            , nullptr, rankedCounts_, incrementalPipeline_ ? &rankedLocalOffers_ : nullptr
 #endif
             );
 #endif
@@ -561,7 +561,7 @@ private:
             SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
         }
 #if KVIP_RANKED_PORT
-        SeedIncremental(query,scoreRow);
+        SeedIncremental(query,scoreRow,thresholdReady);
 #endif
         if (publishProgress) {
             SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
@@ -736,7 +736,11 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe, bool topkOnly)
     if (!topkOnly) {
         uint32_t used=2*CeilDiv(constInfo_.mBaseSize,2)*s2BaseSize_*sizeof(QK_T)+1536+6*CeilDiv(s1BaseSize_,2)*UB_BANK_DEPTH_STRIDE+2*s2BaseSize_*QLICommon::KScaleTiles*sizeof(SCALE_T)+2*CeilDiv(s1BaseSize_,2)*s2BaseSize_*sizeof(SCORE_T)+(topkCountAlign256_+trunkLen_)*sizeof(SCORE_T)+(topkCountAlign256_+64)*4+topkCountAlign256_*sizeof(SCORE_T)+topkSharedTmpSize+trunkLen_*2+8192+kRankedMetadataBytes;
         incrementalPipeline_=used+kIncrementalInputBytes<=223232;
-        if(incrementalPipeline_){pipe->InitBuffer(incrementalInputBuf_,kIncrementalInputBytes);incrementalInput_=incrementalInputBuf_.Get<uint16_t>();}
+        if(incrementalPipeline_) {
+            pipe->InitBuffer(incrementalInputBuf_,kIncrementalInputBytes);
+            incrementalInput_=incrementalInputBuf_.Get<uint16_t>();
+            rankedLocalOffers_=incrementalInput_[kRankedRawWords].template ReinterpretCast<uint32_t>();
+        }
     }
 #endif
     if (!topkOnly) Duplicate(kScaleUB_, static_cast<SCALE_T>(0), 2 * s2BaseSize_ * QLICommon::KScaleTiles);

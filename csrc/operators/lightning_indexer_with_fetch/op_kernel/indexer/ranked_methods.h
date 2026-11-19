@@ -1,6 +1,5 @@
 // Adapted from KVIP e2315cf incremental_methods.h; only dynamic TopK.
 // Publish cold offers while the recovered TopK IDs are still on chip.
-bool incrementalIdsPending_=false;
 bool mappedExport_=false;uint32_t mappedValid_=0;
 bool exportWindowCold_=false;
 uint32_t rankedEpoch_=0;
@@ -17,21 +16,32 @@ __aicore__ inline void PublishWindowRank(uint32_t query, bool remapPacked=false)
     }
     SetFlag<HardEvent::V_S>(EVENT_ID5);WaitFlag<HardEvent::V_S>(EVENT_ID5);
     uint32_t n=count.GetValue(0);
-    rankedCounts_[incrementalMetadataIndex_]=n;
+    const uint32_t offer = ((rankedEpoch_+1)<<16) | n;
+    rankedCounts_[incrementalMetadataIndex_]=offer;
+    incrementalMetadata_.SetValue(incrementalMetadataIndex_*16+3,offer);
     if(n) {
         GlobalTensor<uint32_t> out;
         uint64_t row=uint64_t(rankedEpoch_)*runtimeShape_.batch*4+query;
         out.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->rankedOffers)+row*2048);
-        SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
-        DataCopy(out,packed,(n+7U)&~7U);
-        SetFlag<HardEvent::MTE3_S>(EVENT_ID5);WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
+        const uint32_t aligned=(n+7U)&~7U;
+        if(incrementalPipeline_ && n<=rotating::kRankedLocalOffers) {
+            auto bank=rankedLocalOffers_[incrementalMetadataIndex_*rotating::kRankedLocalOffers];
+            DataCopy(bank,packed,aligned);
+            SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
+            // Immutable backing for a later unchanged window. This window can
+            // read bank directly. The metadata fence joins all eight writes.
+            DataCopy(out,bank,aligned);
+        } else {
+            SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
+            DataCopy(out,packed,aligned);
+            SetFlag<HardEvent::MTE3_S>(EVENT_ID5);WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
+        }
     }
 }
 __aicore__ inline GM_ADDR WindowTopkPrefix() { return prefixOutput_; }
 // Included in QLIVector. Use the existing merge/output/TopK scratch buffers.
 // Raw scores and predicates die before TopK reuses its scratch. ID maps
 // follow the LI trunk geometry; optional next-Q input uses only spare LI UB.
-uint32_t incrementalCalls_=0;
 TBuf<TPosition::VECCALC> incrementalIdsBuf_;
 LocalTensor<uint32_t> incrementalOld_;
 LocalTensor<uint16_t> incrementalNew_;
@@ -41,16 +51,17 @@ bool incrementalMetadataActive_=false;
 static constexpr uint32_t kRankedMaxRequests=2;
 static constexpr uint32_t kRankedMetadataBytes=kRankedMaxRequests*512;
 uint32_t incrementalMetadataIndex_=0;
-// One additional Q: 4 KiB old scores, 16 KiB raw and 2 KiB bitmap.
-// Old IDs load separately into their final UB buffer while candidates compact.
+// Stage only the next raw scores and bitmap. Read old TopK state on demand.
 // The unchanged TopK scratch is larger than the donor's; a 40 KiB stage
 // silently disables overlap under this source's UB guard. Stage 8K positions
 // at a time, retaining the existing loop for the rest of the ready interval.
 static constexpr uint32_t kIncrementalInputTokens=8192;
-static constexpr uint32_t kIncrementalInputBytes=(2048+kIncrementalInputTokens+kIncrementalInputTokens/8)*2;
+static constexpr uint32_t kRankedRawWords=kIncrementalInputTokens+kIncrementalInputTokens/8;
+static constexpr uint32_t kIncrementalInputBytes=kRankedRawWords*2+8*rotating::kRankedLocalOffers*4;
+LocalTensor<uint32_t> rankedLocalOffers_;
 TBuf<TPosition::VECCALC> incrementalInputBuf_;
 LocalTensor<uint16_t> incrementalInput_;
-bool incrementalPipeline_=false,incrementalInputPending_=false,incrementalOutputPending_=false;
+bool incrementalPipeline_=false,incrementalInputPending_=false;
 uint32_t incrementalFinalValid_=0;
 uint32_t incrementalInputQuery_=0,incrementalInputBase_=0,incrementalInputCount_=0;
 uint32_t incrementalNextQuery_=0,incrementalNextIndex_=0,incrementalNextEnd0_=0,incrementalNextEnd1_=0;
@@ -59,27 +70,28 @@ __aicore__ inline __gm__ uint64_t* IncrementalMeta(uint32_t query) {
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     return reinterpret_cast<__gm__ uint64_t*>(ctx->rankedState)+query*16;
 }
-__aicore__ inline void SeedIncremental(uint32_t query,uint32_t row) {
+__aicore__ inline void SeedIncremental(uint32_t query,uint32_t row,bool hasOrderedSeed) {
     auto meta=IncrementalMeta(query);
     meta[0]=reinterpret_cast<uint64_t>(scoreGm.GetPhyAddr())+
         uint64_t(row)*runtimeShape_.history*2;
     meta[1]=uint64_t(runtimeShape_.resident)|(uint64_t(runtimeShape_.resident)<<32);
     meta[2]=prefixThreshold_.GetValue((query%2)*128);
     for(uint32_t i=3;i<16;++i)meta[i]=0;
+    // Zero is unknown. Encoded zero-strict is one and is a valid state.
+    if(hasOrderedSeed)meta[5]=topkOp_.RankedStrictCount()+1;
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(meta),128);
 }
 __aicore__ inline void FlushIncremental(uint32_t count,uint32_t base,bool clearCandidates=true) {
-    if(incrementalIdsPending_){WaitFlag<HardEvent::MTE2_V>(EVENT_ID7);incrementalIdsPending_=false;}
     mappedExport_=false;
     if(!count)return;
-    ++incrementalCalls_;
-    if(incrementalOutputPending_) {
-        WaitFlag<HardEvent::MTE3_V>(EVENT_ID6);incrementalOutputPending_=false;
-    }
     PipeBarrier<PIPE_V>();
     DataCopy(mrgValueLocal_,scoreOutLocal_,2048);
     DataCopy(incrementalOld_,indicesOutLocal_,2048);
     PipeBarrier<PIPE_V>();
+    if(count%256) {
+        lifetch_ranked::ClearRankPadding(reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_[2048].GetPhyAddr()),count);
+        PipeBarrier<PIPE_V>();
+    }
     topkOp_(mrgValueLocal_,indicesOutLocal_,scoreOutLocal_,2048+((count+255)/256)*256,0,1,true);
     PipeBarrier<PIPE_V>();
     // Use 32000 bytes of TopK scratch: 2048 old IDs plus 5952 added IDs.
@@ -96,7 +108,6 @@ __aicore__ inline void FlushIncremental(uint32_t count,uint32_t base,bool clearC
         reinterpret_cast<__ubuf__ uint16_t*>(incrementalNew_.GetPhyAddr()),base);
     }
     PipeBarrier<PIPE_V>();
-    if(clearCandidates)Duplicate(mrgValueLocal_[2048],uint16_t(0),trunkLen_);
 }
 // All cold windows publish once. Finalization joins the last posting owner.
 __aicore__ inline bool PreviousServiceReady(uint32_t epoch,uint32_t lane) {
@@ -140,19 +151,14 @@ __aicore__ inline void PreloadIncremental(uint32_t half) {
     }
     if(base>=limit)return;
     uint32_t n=Min(kIncrementalInputTokens,limit-base);
-    uint32_t query=incrementalNextQuery_,b=query/4,q=query%4;
-    GlobalTensor<uint16_t> scores,raw,mask;
-    GlobalTensor<uint32_t> ids;
-    scores.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(WindowTopkPrefix()+b*(4*2048*6+1024))+q*2048);
-    ids.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(WindowTopkPrefix()+b*(4*2048*6+1024)+4*2048*2)+q*2048);
+    uint32_t query=incrementalNextQuery_;
+    GlobalTensor<uint16_t> raw,mask;
     raw.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(source));
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     mask.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(ctx->hits)+uint64_t(query)*runtimeShape_.history/8);
     SetFlag<HardEvent::V_MTE2>(EVENT_ID6);WaitFlag<HardEvent::V_MTE2>(EVENT_ID6);
-    DataCopy(incrementalInput_,scores,2048);
-
-    DataCopy(incrementalInput_[2048],raw[base],n);
-    DataCopy(incrementalInput_[2048+kIncrementalInputTokens],mask[base/8],n/8);
+    DataCopy(incrementalInput_,raw[base],n);
+    DataCopy(incrementalInput_[kIncrementalInputTokens],mask[base/8],n/8);
     SetFlag<HardEvent::MTE2_V>(EVENT_ID6);
     incrementalInputQuery_=query;incrementalInputBase_=base;incrementalInputCount_=n;
     incrementalInputPending_=true;
@@ -167,11 +173,13 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
     uint32_t prior[2]={uint32_t(cursor),uint32_t(cursor>>32)};
     uint32_t ends[2]={end0,end1};
     if (!source) return;
-    const uint32_t callsBefore=incrementalCalls_;
+    const uint32_t savedOffer=exportWindowCold_ ? uint32_t(incrementalMetadata_.GetValue(mi+3)) : 0;
+    const uint32_t savedStrict=exportWindowCold_ ? uint32_t(incrementalMetadata_.GetValue(mi+5)) : 0;
     mappedExport_=false;
     if (end0<=prior[0] && (!half || end1<=prior[1])) {
         // The prior TopK is already persisted. Fetch can reuse it unchanged.
-        if(exportWindowCold_) {
+        if(savedOffer)rankedCounts_[incrementalMetadataIndex_]=savedOffer;
+        else if(exportWindowCold_) {
             GlobalTensor<uint32_t> priorIds;
             uint64_t addr=reinterpret_cast<uint64_t>(WindowTopkPrefix())+uint64_t(query/4)*prefixBytes+4*2048*2;
             priorIds.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(addr)+(query%4)*2048);
@@ -200,20 +208,12 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
         incrementalNextQuery_=nq;incrementalNextIndex_=ni;incrementalNextEnd0_=e0;incrementalNextEnd1_=e1;incrementalHasNext_=hn;
     }
     bool staged=incrementalInputPending_ && incrementalInputQuery_==query;
-    incrementalIdsPending_=staged;
     if(staged) {
         WaitFlag<HardEvent::MTE2_V>(EVENT_ID6);
-        DataCopy(scoreOutLocal_,incrementalInput_,2048);
-        DataCopy(indicesOutLocal_,stateIds,2048);
-        SetFlag<HardEvent::MTE2_V>(EVENT_ID7);
-        PipeBarrier<PIPE_V>();
         incrementalInputPending_=false;
-    } else {
-        PipeBarrier<PIPE_ALL>();
-        DataCopy(scoreOutLocal_,stateScores,2048);DataCopy(indicesOutLocal_,stateIds,2048);
-        SetFlag<HardEvent::MTE2_V>(EVENT_ID7);incrementalIdsPending_=true;
     }
-    // Join state and first score tile together below; they use disjoint UB.
+    bool prefixLoaded=false;
+    // A cold score has to beat the cutoff before the old rank is needed.
     auto rawLocal=topkSharedTmpLocal_.template ReinterpretCast<uint16_t>();
     const uint32_t rawCapacity=((topkOp_.GetSharedTmpBufferSize()-128)*4/9/128)*128;
     auto scratchRaw=rawLocal;
@@ -222,7 +222,6 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
     auto countLocal=maskLocal[rawCapacity/8].template ReinterpretCast<uint32_t>();
     uint32_t packed=0,packBase=0;
     const uint16_t cutoff=uint16_t(incrementalMetadataActive_?incrementalMetadata_.GetValue(mi+2):meta[2]);
-    Duplicate(mrgValueLocal_[2048],uint16_t(0),trunkLen_);
     for (uint32_t base=Min(prior[0],half?prior[1]:prior[0]);base<Max(end0,half?end1:end0);) {
         uint32_t shard=0,limit=end0;
         bool contiguous=!half || (prior[0]==prior[1] && end0==end1);
@@ -250,7 +249,7 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
         // use the ordinary path unless aligned, avoiding padded score reads.
         if(staged && base==incrementalInputBase_) {
             n=incrementalInputCount_;
-            rawLocal=incrementalInput_[2048];maskLocal=incrementalInput_[2048+kIncrementalInputTokens];
+            rawLocal=incrementalInput_;maskLocal=incrementalInput_[kIncrementalInputTokens];
             staged=false;
         } else {
             rawLocal=scratchRaw;maskLocal=scratchMask;
@@ -319,6 +318,11 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
                 // Capacity is measured in compact candidates, not raw score tiles.
             // Reuse the demo's uint16 relative IDs across both sequence halves.
             if(packed && (packed+count>trunkLen_ || base+n-packBase>65536)) {
+                if(!prefixLoaded) {
+                    DataCopy(scoreOutLocal_,stateScores,2048);DataCopy(indicesOutLocal_,stateIds,2048);
+                    SetFlag<HardEvent::MTE2_V>(EVENT_ID7);WaitFlag<HardEvent::MTE2_V>(EVENT_ID7);
+                    prefixLoaded=true;
+                }
                 FlushIncremental(packed,packBase);packed=0;
                 // TopK reuses raw/mask scratch; reload only on a capacity flush.
                 SetFlag<HardEvent::V_MTE2>(EVENT_ID5);WaitFlag<HardEvent::V_MTE2>(EVENT_ID5);
@@ -356,34 +360,63 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
     // this Q performs TopK, ID mapping, threshold reduction and writeback.
 
     PreloadIncremental(half);
-    FlushIncremental(packed,packBase,false);
-    PipeBarrier<PIPE_V>();
-    // A nonzero cutoff already describes the unchanged TopK when this
-    // window did not flush any candidates. Final TopK keeps its old path.
+    const uint64_t nextCursor=uint64_t(prior[0])|(uint64_t(prior[1])<<32);
+    if(!packed && !prefixLoaded) {
+        // No winner changed. Reoffer the immutable old list: unposted IDs
+        // remain eligible. The final pass already has its IDs in stateIds.
+        if(exportWindowCold_) {
+            if(savedOffer)rankedCounts_[incrementalMetadataIndex_]=savedOffer;
+            else {
+                DataCopy(indicesOutLocal_,stateIds,2048);
+                SetFlag<HardEvent::MTE2_V>(EVENT_ID7);WaitFlag<HardEvent::MTE2_V>(EVENT_ID7);
+                PublishWindowRank(query);
+            }
+            incrementalMetadata_.SetValue(mi+1,nextCursor);
+        } else {
+            meta[1]=nextCursor;
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(meta),128);
+        }
+        return;
+    }
+
+    const uint32_t strict=savedStrict ? savedStrict-1 : 2048;
+    const bool tieOnly=!prefixLoaded && packed && packed<2048-strict;
+    // Aligned down for the prefix DMA; every element preceding strict is preserved.
+    const uint32_t first=tieOnly ? (strict & ~15U) : 0;
+    if(!prefixLoaded) {
+        DataCopy(scoreOutLocal_[first],stateScores[first],2048-first);
+        DataCopy(indicesOutLocal_,stateIds,2048);
+        SetFlag<HardEvent::MTE2_V>(EVENT_ID7);WaitFlag<HardEvent::MTE2_V>(EVENT_ID7);
+    }
     uint32_t threshold=cutoff;
-    if(!exportWindowCold_ || mappedExport_ || !cutoff || incrementalCalls_!=callsBefore) {
+    if(tieOnly) {
+        auto freshIds=topkSharedTmpLocal_;
+        lifetch_incremental::BuildAddedMap(reinterpret_cast<__ubuf__ uint16_t*>(incrementalNew_.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(freshIds.GetPhyAddr()),packed,packBase);
+        PipeBarrier<PIPE_V>();
+        lifetch_ranked::InsertAboveBoundary(reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint16_t*>(scoreOutLocal_.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(freshIds.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_[2048].GetPhyAddr()),strict,packed);
+        PipeBarrier<PIPE_V>();
+        PublishWindowRank(query);
+        incrementalMetadata_.SetValue(mi+5,strict+packed+1);
+    } else {
+        FlushIncremental(packed,packBase,false);
+        PipeBarrier<PIPE_V>();
         if(!mappedExport_)lifetch_incremental::Minimum(reinterpret_cast<__ubuf__ uint16_t*>(scoreOutLocal_.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(topkSharedTmpLocal_.GetPhyAddr()));
         SetFlag<HardEvent::V_S>(EVENT_ID5);WaitFlag<HardEvent::V_S>(EVENT_ID5);
         threshold=topkSharedTmpLocal_.template ReinterpretCast<uint16_t>().GetValue(0);
-    }
-    if(exportWindowCold_)PublishWindowRank(query,mappedExport_);
-    SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
-    if(incrementalPipeline_ && incrementalMetadataActive_) {
-        if(incrementalOutputPending_) {
-            WaitFlag<HardEvent::MTE3_V>(EVENT_ID6);incrementalOutputPending_=false;
+        if(exportWindowCold_) {
+            PublishWindowRank(query,mappedExport_);
+            incrementalMetadata_.SetValue(mi+5,topkOp_.RankedStrictCount()+1);
         }
-        // TopK prefix/old-ID maps are dead until the NEXT FlushIncremental.
-        // Stage here so next Q can overwrite working outputs immediately.
-        DataCopy(mrgValueLocal_,scoreOutLocal_,2048);
-        DataCopy(incrementalOld_,indicesOutLocal_,2048);
-        SetFlag<HardEvent::V_MTE3>(EVENT_ID6);WaitFlag<HardEvent::V_MTE3>(EVENT_ID6);
-        DataCopy(stateScores,mrgValueLocal_,2048);DataCopy(stateIds,incrementalOld_,2048);
-        SetFlag<HardEvent::MTE3_V>(EVENT_ID6);incrementalOutputPending_=true;
-    } else {
-        DataCopy(stateScores,scoreOutLocal_,2048);DataCopy(stateIds,indicesOutLocal_,2048);
-        SetFlag<HardEvent::MTE3_S>(EVENT_ID5);WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
     }
+    SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
+    DataCopy(stateScores[first],scoreOutLocal_[first],2048-first);
+    DataCopy(stateIds[first],indicesOutLocal_[first],2048-first);
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID5);WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
     if(incrementalMetadataActive_) {
         incrementalMetadata_.SetValue(mi+1,uint64_t(prior[0])|(uint64_t(prior[1])<<32));
         incrementalMetadata_.SetValue(mi+2,threshold);
@@ -413,7 +446,6 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     rankedEpoch_=epoch;
     for(auto& count:rankedCounts_)count=0;
     exportWindowCold_=true;
-    incrementalCalls_=0;
     incrementalMetadataActive_=(runtimeShape_.batch+runtimeShape_.serviceLanes-1)/runtimeShape_.serviceLanes<=kRankedMaxRequests;
     if(incrementalMetadataActive_) {
     GlobalTensor<uint32_t> progressSource;progressSource.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress));
@@ -464,9 +496,6 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
         WaitFlag<HardEvent::MTE2_V>(EVENT_ID6);incrementalInputPending_=false;
     }
     incrementalHasNext_=false;
-    if(incrementalOutputPending_) {
-        WaitFlag<HardEvent::MTE3_V>(EVENT_ID6);incrementalOutputPending_=false;
-    }
     if(incrementalMetadataActive_) {
         SetFlag<HardEvent::S_MTE3>(EVENT_ID5);WaitFlag<HardEvent::S_MTE3>(EVENT_ID5);
         // Use the existing progress snapshot: the common all-ready row is

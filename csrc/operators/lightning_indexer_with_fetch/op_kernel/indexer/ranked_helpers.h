@@ -33,8 +33,68 @@ __simd_vf__ inline void ExcludeSeeded(__ubuf__ uint16_t* bitmap,uint32_t base,ui
 }
 
 namespace lifetch_ranked {
+// The native selector emits strict winners followed by boundary ties. New
+// strict winners displace the last ties. Shift the retained IDs backwards
+// before inserting new IDs, so the reads never observe an overwritten ID.
+__simd_vf__ inline void InsertAboveBoundary(__ubuf__ uint32_t* ids, __ubuf__ uint16_t* scores,
+    __ubuf__ uint32_t* freshIds, __ubuf__ uint16_t* freshScores,
+    uint32_t strict, uint32_t fresh) {
+    using namespace AscendC::MicroAPI;
+    auto all = CreateMask<uint32_t, MaskPattern::ALL>();
+    RegTensor<uint32_t> zero;
+    Duplicate(zero, uint32_t(0));
+    for (int32_t block = 2048 - 64; block >= int32_t(strict & ~63U); block -= 64) {
+        RegTensor<int32_t> seq;
+        Arange(seq, block);
+        auto& lane = reinterpret_cast<RegTensor<uint32_t>&>(seq);
+        RegTensor<uint32_t> index, oldId, newId, id;
+        MaskReg moved, write, add;
+        CompareScalar<uint32_t, CMPMODE::GE>(moved, lane, strict + fresh, all);
+        CompareScalar<uint32_t, CMPMODE::GE>(write, lane, strict, all);
+        MaskXor(add, write, moved, all);
+        Adds(index, lane, uint32_t(0) - fresh, all);
+        Select(index, index, zero, moved);
+        Gather(oldId, ids, index, moved);
+        Adds(index, lane, uint32_t(0) - strict, all);
+        Select(index, index, zero, add);
+        Gather(newId, freshIds, index, add);
+        Select(id, newId, oldId, add);
+        LocalMemBar<MemType::VEC_LOAD, MemType::VEC_STORE>();
+        StoreAlign(ids + block, id, write);
+    }
+    // All surviving ties have the same old score. Copy only the new scores.
+    UnalignRegForStore store;
+    auto dst = scores + strict;
+    uint32_t remaining = fresh;
+    for (uint16_t i = 0; i < fresh; i += 128) {
+        auto valid = UpdateMask<uint16_t>(remaining);
+        RegTensor<uint16_t> values, packed;
+        LoadAlign(values, freshScores+i);
+        if (!i) ClearSpr<SpecialPurposeReg::AR>();
+        Squeeze<uint16_t, AscendC::MicroAPI::GatherMaskMode::STORE_REG>(packed, values, valid);
+        StoreUnAlign<uint16_t, PostLiteral::POST_MODE_UPDATE>(dst, packed, store);
+    }
+    StoreUnAlignPost(dst, store);
+}
+
+// Only padded scores can enter the native histogram. Preserve the actual
+// candidates in the head of the last vector and clear at most 255 scores.
+__simd_vf__ inline void ClearRankPadding(__ubuf__ uint16_t* scores, uint32_t n) {
+    using namespace AscendC::MicroAPI;
+    auto all = CreateMask<uint16_t, MaskPattern::ALL>();
+    RegTensor<uint16_t> zero;
+    Duplicate(zero, uint16_t(0));
+    for (uint32_t i=n & ~127U; i < ((n+255U) & ~255U); i+=128) {
+        RegTensor<int16_t> lane;
+        Arange(lane, int16_t(i));
+        MaskReg padding;
+        CompareScalar<uint16_t, CMPMODE::GE>(padding, reinterpret_cast<RegTensor<uint16_t>&>(lane), uint16_t(n), all);
+        StoreAlign(scores+i, zero, padding);
+    }
+}
+
 // Drop safe-hot tags and padding from the transport list, retaining TopK order.
-// Actual prior admissions and ABC mappings are checked later by the post owner.
+// The posting owner still checks live reservations and prior submissions.
 __simd_vf__ inline void PackOffers(__ubuf__ uint32_t* ids, __ubuf__ uint32_t* out,
     __ubuf__ uint32_t* count, uint32_t validEnd) {
     using namespace AscendC::MicroAPI;

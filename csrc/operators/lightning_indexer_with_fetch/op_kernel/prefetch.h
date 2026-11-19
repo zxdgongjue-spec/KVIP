@@ -623,12 +623,17 @@ inline void TagRankedSeed(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* tagged,
         auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds)+batch*2;
         tailBegin=asc_ldcg(bounds);tailEnd=asc_ldcg(bounds+1);
     }
+    const uint32_t capacity=OutputStride(resident,ctx)-resident;
     for(uint32_t i=threadIdx.x;i<count;i+=256) {
         const uint32_t token=ids[i];
+        // InitializeTailMappings has already assigned exactly these ABC IDs.
+        // Retired pages in thresholdBounds are still normal DDR candidates.
+        const bool mappedTail=token>=tailBegin && token<tailEnd && token-tailBegin<capacity &&
+            token<ctx->shape.history;
         const bool safeHot=token<resident && !(token>=tailBegin && token<tailEnd) &&
             (!valid || asc_ldcg(valid+uint64_t(owner)*resident+token)) &&
             (!reserved || asc_ldcg(reserved+uint64_t(batch)*resident+token)<0);
-        tagged[i]=safeHot ? (token | 0x80000000U) : token;
+        tagged[i]=(safeHot || mappedTail) ? (token | 0x80000000U) : token;
     }
 }
 #endif
@@ -747,7 +752,7 @@ __aicore__ inline void FlushFetchBatch(uint32_t rt_batch,uint32_t rt_history,uin
 template<bool captureIo>
 __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer,uint32_t epoch,uint32_t core,uint32_t lane,
     LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids,
-    uint32_t sequenceHalfWindow, GM_ADDR rollingScores = nullptr, const uint32_t* rankedCounts = nullptr) {
+    uint32_t sequenceHalfWindow, GM_ADDR rollingScores = nullptr, const uint32_t* rankedCounts = nullptr, const LocalTensor<uint32_t>* localOffers = nullptr) {
     uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0;
     uint64_t scanBegin=0,candidateBegin=0,postBegin=0,begin=0;
     uint64_t firstDoorbell=0,secondDoorbell=0,lastDoorbell=0;
@@ -897,20 +902,27 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
 #if KVIP_RANKED_PORT
         const uint32_t allowance=PrefetchAllowance(slots,requests,state.GetValue(208),state.GetValue(209),state.GetValue(210),ctx->windowLimit);
         for(uint32_t q=0;q<4 && count<allowance;++q) {
-            const uint32_t n = rankedCounts[(b / rt_serviceLanes) * 4 + q];
+            const uint32_t offer = rankedCounts[(b / rt_serviceLanes) * 4 + q];
+            const uint32_t n = offer & 0xffffU;
             if (!n) continue;
-            const uint64_t row = (uint64_t(epoch) * rt_batch + b) * 4 + q;
-            GlobalTensor<uint32_t> offers;
-            offers.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->rankedOffers) + row * kTop);
-            SetFlag<HardEvent::V_MTE2>(EVENT_ID0);WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
-            DataCopy(ids,offers,(n+7U)&~7U);
-            SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+            const uint32_t sourceEpoch=(offer >> 16)-1;
+            auto candidates=ids;
+            if(localOffers && sourceEpoch==epoch && n<=kRankedLocalOffers) {
+                candidates=(*localOffers)[((b/rt_serviceLanes)*4+q)*kRankedLocalOffers];
+            } else {
+                const uint64_t row=(uint64_t(sourceEpoch)*rt_batch+b)*4+q;
+                GlobalTensor<uint32_t> offers;
+                offers.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->rankedOffers)+row*kTop);
+                SetFlag<HardEvent::V_MTE2>(EVENT_ID0);WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
+                DataCopy(ids,offers,(n+7U)&~7U);
+                SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+            }
             Simt::VF_CALL<GatherCandidateMap>(Simt::Dim3{256,1,1},
-                reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(candidates.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),map,n,
                 static_cast<__gm__ uint32_t*>(nullptr),reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),rt_history);
             PipeBarrier<PIPE_V>();
-            CompactMisses(reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),
+            CompactMisses(reinterpret_cast<__ubuf__ uint32_t*>(candidates.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),n,allowance-count,
                 reinterpret_cast<__ubuf__ uint32_t*>(selectedIds[count].GetPhyAddr()));
             SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
@@ -1251,9 +1263,9 @@ if (rt_batchedRows) {
 namespace rotating {
 __aicore__ inline void Service(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_splitQ,uint32_t rt_rounds,uint32_t rt_serviceAics,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer, uint32_t epoch, uint32_t core,
     uint32_t lane, LocalTensor<uint32_t> scratch, LocalTensor<uint16_t> flags,
-    LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow = 0,bool captureIo = false, GM_ADDR rollingScores = nullptr, const uint32_t* rankedCounts = nullptr) {
-    if(captureIo) FastService<true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow, rollingScores, rankedCounts);
-    else FastService<false>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow, rollingScores, rankedCounts);
+    LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow = 0,bool captureIo = false, GM_ADDR rollingScores = nullptr, const uint32_t* rankedCounts = nullptr, const LocalTensor<uint32_t>* localOffers = nullptr) {
+    if(captureIo) FastService<true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow, rollingScores, rankedCounts, localOffers);
+    else FastService<false>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow, rollingScores, rankedCounts, localOffers);
 }
 }
 
