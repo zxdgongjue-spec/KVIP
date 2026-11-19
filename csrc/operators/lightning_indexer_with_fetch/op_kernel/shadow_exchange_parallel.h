@@ -30,8 +30,14 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void ApplyBatch(__gm__ uint3
  __gm__ uint64_t* prepared=nullptr,uint32_t history=0){
  uint32_t tid=threadIdx.x;auto ctl=m+CONTROL;auto ps=m+PLAN_SRC;auto pd=m+PLAN_DST;auto data=reinterpret_cast<__ubuf__ uint64_t*>(m+STAGING);
  for(uint32_t base=0;base<count;base+=CHUNK){uint32_t n=(count-base)<CHUNK?count-base:CHUNK;
+  if(!tid)ctl[3]=0;
   for(uint32_t i=tid;i<2*SET;i+=THREADS)m[SRCSET+i]=EMPTY;asc_syncthreads();
-  if(tid<n){uint32_t orig=asc_ldcg(sources+begin+base+tid),dst=asc_ldcg(destinations+begin+base+tid);uint32_t src=get(m+KEYS_ROW,m+VALUES_ROW,orig);ps[tid]=src;pd[tid]=dst;if(orig>=history||dst>=resident||src==EMPTY||!insert(m+SRCSET,src)||!insert(m+DSTSET,dst))asc_atomic_or(ctl,1U);}asc_syncthreads();if(ctl[0])return;
+  if(tid<n){uint32_t orig=asc_ldcg(sources+begin+base+tid),dst=asc_ldcg(destinations+begin+base+tid);uint32_t src=get(m+KEYS_ROW,m+VALUES_ROW,orig);ps[tid]=src;pd[tid]=dst;if(src<resident)asc_atomic_or(ctl+3,1U);if(orig>=history||dst>=resident||src==EMPTY||!insert(m+SRCSET,src)||!insert(m+DSTSET,dst))asc_atomic_or(ctl,1U);}asc_syncthreads();if(ctl[0])return;
+  uint32_t extras=n;
+  if(!ctl[3]){
+   if(tid<n){ps[CHUNK+tid]=pd[tid];pd[CHUNK+tid]=ps[tid];}
+   asc_syncthreads();
+  }else{
   uint32_t out=tid<n&&!contains(m+SRCSET,pd[tid]),freed=tid<n&&!contains(m+DSTSET,ps[tid]);
 #if KVIP_FUSE_QUERY_WORK
   // Both sums are at most CHUNK=512, so two 16-bit lanes share one scan.
@@ -39,7 +45,9 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void ApplyBatch(__gm__ uint3
 #else
   uint32_t oi=prefix(out,ctl+32),fi=prefix(freed,ctl+64);
 #endif
-  if(out)ps[CHUNK+oi]=pd[tid];if(freed)pd[CHUNK+fi]=ps[tid];asc_syncthreads();uint32_t extras=ctl[32+15]&0xffffU;uint32_t moves=n+extras;
+  if(out)ps[CHUNK+oi]=pd[tid];if(freed)pd[CHUNK+fi]=ps[tid];asc_syncthreads();extras=ctl[32+15]&0xffffU;
+  }
+  uint32_t moves=n+extras;
   // Each lane handles individual fields; snapshot all rows before any write.
   for(uint32_t x=tid;x<moves*16;x+=THREADS){uint32_t i=x/16,j=i<n?i:CHUNK+i-n;data[x]=asc_ldcg(keys+uint64_t(ps[j])*16+x%16);}
 #if KVIP_FUSE_QUERY_WORK

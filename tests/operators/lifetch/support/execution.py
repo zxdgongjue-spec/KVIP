@@ -3675,7 +3675,11 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
         pending = True
         for i, state in enumerate(states):
             if not compact or (label == 'measured' and i in (0, len(states) - 1)):
-                checks.check(f'{label}/input{i}/round{inputs.source_round}', lambda state=state: state.validate(inputs))
+                check = f'{label}/input{i}/round{inputs.source_round}'
+                try:
+                    checks.check(check, lambda state=state: state.validate(inputs))
+                except RuntimeError as error:
+                    raise RuntimeError(f'{check}: {error}') from error
             elif fused:
                 state.check_completion()
         pending = False

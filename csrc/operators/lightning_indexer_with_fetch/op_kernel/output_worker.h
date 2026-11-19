@@ -9,6 +9,15 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PreparePublicationOutputs(
  asc_syncthreads();
  if(logical)PrepareStagedQueryOutputs(logical,masks,batchCount,b,q,selected,work,work+64);
 }
+// All selected IDs and logical IDs are immutable until the fourth output
+// publication. Convert in-place while the resolver chooses physical slots.
+__simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PrepareAllLogicalOutputs(
+ __gm__ int64_t* logical,__ubuf__ uint32_t* selected,uint32_t history){
+ for(uint32_t i=threadIdx.x;i<kSlots;i+=512){
+  uint32_t token=selected[i];
+  selected[i]=token<history?uint32_t(asc_ldcg(logical+token)):UINT32_MAX;
+ }
+}
 // Publish all metadata before the group-ready counter; no per-request polling
 // is needed by the direct URMA consumer after it acquires the completed group.
 template<class ContextPointer>
@@ -74,7 +83,12 @@ __aicore__ inline void OutputWorker(__gm__ Args* a,uint32_t b){
  auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
  bool profile=(a->prefetchCount&0x80000000U)!=0;
  auto ticks=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*256+uint64_t(b*kResolveCores+2)*32;
- uint32_t error=AwaitPublication(flags);
+#if V9_UBMEM
+ constexpr bool earlyInputs=false;
+#else
+ bool earlyInputs=!profile && a->updateBindings && ctx->selected && a->queryErrors && shape.history==a->history && shape.resident==a->resident;
+#endif
+ uint32_t error=earlyInputs?0:AwaitPublication(flags);
  if(profile)ticks[2]=GetSystemCycle();
  if(error){for(uint32_t q=0;q<4;++q){
   Simt::VF_CALL<PublishPreparedQuery>(Simt::Dim3{32,1,1},ctx,reinterpret_cast<__gm__ BatchFlag*>(a->flags),b,q,shape.finalPostOffset,0,0,error,QueryGroupCounters(a,shape.batch,b,q));
@@ -110,13 +124,64 @@ __aicore__ inline void OutputWorker(__gm__ Args* a,uint32_t b){
  auto source=reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+b*a->maxEvents;
  auto dest=reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+b*a->maxEvents;
  uint32_t total=0,workers=(a->prefetchCount>>16)&0xffU,stride=shape.batch*kTop,meta=(3*shape.batch+31)&~31U;
+ bool bulkLogical=enabled && !profile;
+ if(bulkLogical){
+  Simt::VF_CALL<PrepareAllLogicalOutputs>(Simt::Dim3{512,1,1},logical,FinalPtr(selected),shape.history);
+  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+ }
+#if !V9_UBMEM
+ if(earlyInputs)error=AwaitPublication(flags);
+ // Every direct sparse descriptor is released by its producer. When the
+ // serving row order is the identity, its four output rows are contiguous.
+ if(!error && bulkLogical && ctx->fallbackAddresses && !(a->prefetchCount&0x20000000U)){
+  bool directRows=true;
+  auto hdr=reinterpret_cast<__gm__ uint32_t*>(a->queryErrors)+128*b;
+  uint32_t upper=row->slots;
+  for(uint32_t q=0;q<4 && directRows;q++){
+   uint32_t n=hdr[32*q+1];if(!n || n>kCompactMissLimit+1){directRows=false;break;}
+   upper+=n-1;
+   for(uint32_t w=0;w<(shape.batch*4+31)/32;w++){
+    uint32_t bit=(4*b+q)/32==w?1U<<((4*b+q)%32):0;
+    directRows&=ctl.GetValue(kOutputMasksOffset+q*kOutputMasksPerQuery+w)==bit &&
+                ctl.GetValue(kOutputMasksOffset+q*kOutputMasksPerQuery+2+w)==0;
+   }
+  }
+  if(directRows && upper<=kLruSlots && AwaitPublication(flags+kRawQueryFlag+3)==0){
+   uint32_t counts[4];
+   for(uint32_t q=0;q<4;q++){
+    auto f=flags+kRawQueryFlag+q;
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(f),kBatchFlagPayloadBytes);
+    directRows&=f->ready && !f->error && f->reserved[0] && f->count<=kTop;
+    counts[q]=f->count;
+   }
+   if(directRows){
+    GlobalTensor<uint32_t> outputs;
+    outputs.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(u[22])+b*kSlots);
+    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    DataCopy(outputs,selected,kSlots);
+    input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*kSlots);
+    DataCopy(loc,input,kSlots);
+    SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+    outputs.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(u[23])+b*kSlots);
+    DataCopy(outputs,loc,kSlots);
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    for(uint32_t q=0;q<4;q++){
+     auto f=flags+q+1;f->count=counts[q];f->error=0;f->ready=1;
+     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(f),kBatchFlagPayloadBytes);
+    }
+    pipe.Destroy();return;
+   }
+  }
+ }
+#endif
  if(profile)ticks[3]=GetSystemCycle();
  for(uint32_t q=0;q<4;++q){
   if(profile)ticks[4+q*6]=GetSystemCycle();
   if(!error){
    // Logical lookup can proceed before this Q has finished choosing slots.
-   Simt::VF_CALL<PreparePublicationOutputs>(Simt::Dim3{512,1,1},logical,FinalPtr(ctl[kOutputMasksOffset+q*kOutputMasksPerQuery]),shape.batch,b,q,FinalPtr(selected),FinalPtr(work));
+   if(!bulkLogical){Simt::VF_CALL<PreparePublicationOutputs>(Simt::Dim3{512,1,1},logical,FinalPtr(ctl[kOutputMasksOffset+q*kOutputMasksPerQuery]),shape.batch,b,q,FinalPtr(selected),FinalPtr(work));
    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+   }
    if(profile)ticks[5+q*6]=GetSystemCycle();
    error=AwaitPublication(flags+kRawQueryFlag+q);
    if(profile)ticks[6+q*6]=GetSystemCycle();
@@ -131,15 +196,20 @@ __aicore__ inline void OutputWorker(__gm__ Args* a,uint32_t b){
    DataCopy(loc[q*kTop],input,kTop);SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
    auto direct=reinterpret_cast<__gm__ int32_t*>(a->packedFetch)+4*workers*(3*stride+meta)+(q*workers+b%workers)*(6*stride+64);
    auto compactAddresses=QueryGroupCounters(a,shape.batch,b,q)?reinterpret_cast<__gm__ uint64_t*>(reinterpret_cast<__gm__ int32_t*>(a->packedFetch)+(q*workers+b%workers)*(3*stride+meta)):nullptr;
-   if(count<=64){
-   Simt::VF_CALL<PackPublicationEvents<64>>(Simt::Dim3{64,1,1},staged,shape.history,shape.resident,shape.tokenBytes,b,q,row->slots,kPrefetch+total,count,source,dest,FinalPtr(tokens),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(ctl),(a->prefetchCount&0x20000000U)?nullptr:direct,stride,compactAddresses);
+   // Compact Resolve already published FinalPost and the group counter.
+   if(compactAddresses && flags[kRawQueryFlag+q].reserved[0]){
+    groupPublished=true;
    }else{
-   Simt::VF_CALL<PackPublicationEvents<512>>(Simt::Dim3{512,1,1},staged,shape.history,shape.resident,shape.tokenBytes,b,q,row->slots,kPrefetch+total,count,source,dest,FinalPtr(tokens),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(ctl),(a->prefetchCount&0x20000000U)?nullptr:direct,stride,compactAddresses);
+    if(count<=64){
+    Simt::VF_CALL<PackPublicationEvents<64>>(Simt::Dim3{64,1,1},staged,shape.history,shape.resident,shape.tokenBytes,b,q,row->slots,kPrefetch+total,count,source,dest,FinalPtr(tokens),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(ctl),(a->prefetchCount&0x20000000U)?nullptr:direct,stride,compactAddresses);
+    }else{
+    Simt::VF_CALL<PackPublicationEvents<512>>(Simt::Dim3{512,1,1},staged,shape.history,shape.resident,shape.tokenBytes,b,q,row->slots,kPrefetch+total,count,source,dest,FinalPtr(tokens),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(ctl),(a->prefetchCount&0x20000000U)?nullptr:direct,stride,compactAddresses);
+    }
+    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);error=ctl.GetValue(1);groupPublished=compactAddresses!=nullptr;
    }
-   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);error=ctl.GetValue(1);groupPublished=compactAddresses!=nullptr;
    if(profile)ticks[7+q*6]=GetSystemCycle();
    WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-   if(!error){PublishQueryOutputs(u,shape.batch,b,q,selected,loc,work);
+   if(!error){PublishQueryOutputs(u,shape.batch,b,q,bulkLogical?selected[q*kTop]:work[64],loc,bulkLogical?ctl[kOutputMasksOffset+q*kOutputMasksPerQuery]:work);
     if(!compactAddresses)SyncFetchDescriptors(ctx,b*kSlots+q*kTop,count);}
    if(profile)ticks[8+q*6]=GetSystemCycle();
   }
