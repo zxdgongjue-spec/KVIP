@@ -74,6 +74,12 @@ python tests/operators/lifetch/test_lifetch.py bench \
 
 ## 依赖、构建与结果
 
+小batch进一步优化的完整任务、论文/硬件依据和新候选见
+[SMALL_BATCH_PROMPT.md](SMALL_BATCH_PROMPT.md) 与 [SMALL_BATCH.md](SMALL_BATCH.md)。
+`run_small_batch_a5.sh` 默认对比B2/B4的 `mr23,window_budget,query_budget`；
+`query_budget` 显式启用 `window_query`，每Q更新TopK后由原request owner提交。
+其新增每窗口TopK/post边界都计入完整LI和Fetch链，不替换默认window路线。
+
 KVAF 固定 `1c1310387ebfb6776a07316874e924265b209ada`。已有其它版本时，添加 `--prepare-kvaf`，从 `--kvaf-root` 的本地 Git 历史准备一个独立 pinned checkout，并在其中编译/应用本仓 device-header 适配；保留源目录和服务器。若本地历史没有目标提交，先在可联网宿主机 fetch，容器不会自动联网或跳过版本保护。UMDK 如需定位，可设置 `KVAF_UMDK_ROOT` 为含 `include/urma_api.h` 的目录。
 
 失败 CANN cache 使用新 `attempt-*`，避免 `merge_obj_text.sh` 原地把 REL `.o` 链为 EXEC 后重试产生 `unknown file type`。两路统一使用该启动构建恢复；基线 kernel、launch 与计时源码仍为固定 MR23，替换及 SHA 保存在 `baseline_build_override.json`。
@@ -84,9 +90,10 @@ KVAF 固定 `1c1310387ebfb6776a07316874e924265b209ada`。已有其它版本时�
 
 - `score_peak_aic/aiv`、`actual_windows`、`service_aivs`、`li_kernel_launches`：记录实际资源/调度，不把设备总核数当作活跃核数。
 - `serial_li_us/serial_lidu_prepare_us/serial_fetch_us`：优化前串行链同图阶段；`fused_event_us/li_us/resolve_fetch_us/gap_us` 为融合整链与阶段。
-- `score_hot_us/score_cold_us/score_total_us/theta_us/service_us/final_us`：窗口候选从同一测量图的具名 kernel 提取，每次调用检查 W 个 score、W 个 Service、1个 θ 和1个 Final，合计与 LI 必须一致。MR23/full 的内部 score/Service 没有独立 kernel 边界，对应列留空，不按比例猜分。
+- `score_hot_us/score_cold_us/score_total_us/theta_us/service_us/final_us`：窗口候选从同一测量图的具名 kernel 提取，每次调用检查 W 个 score、W 个 Service、1个 θ 和1个 Final，合计与 LI 必须一致。`query_budget` 还须有W个 `query_topk_us` kernel，Service列是原post函数边界，不全部解释为URMA传输。MR23/full 的内部 score/Service 没有独立 kernel 边界，对应列留空，不按比例猜分。
 - `other_and_edges_us`：整链 event 减去 LI、Resolve/Get 和调用内 gap 后的余量，包含调用间隙、event 边缘及计时误差，不解释成 CPU idle。
 - `net_gain_vs_mr23_us` 及 `li/resolve_fetch/gap/other_and_edges_gain_vs_mr23_us`：基线减候选，正数表示省时；四项损益加总必须等于完整链净收益。`per_round_over_mr23` 和 `serial_drift_over_mr23` 用于识别波动，不能只挑最快一轮。
+- `over_window_budget/net_gain_vs_window_us/per_round_over_window`：新候选对当前window的完整链及配对轮次结果。旧window与新query共享本轮独立窗口事件初始化修复，详见SMALL_BATCH.md。
 
 score 加速是否转化为完整链收益，见 [ANALYSIS.md](ANALYSIS.md) 的五 batch 分析。旧独立 LI 的 B1/P16 `direct` 约52.14µs采用不同通路/计时方式，不能直接填进此次 SerialAfter 或用作此次加速比。
 
@@ -100,4 +107,4 @@ bash experiments/lifetch_score_t2/run_window_contract.sh \
 
 后者验证 B1/P16、B16/P2 的真实分核 score+predicate（H32768/R16384、各 Q/owner 不同 score/θ、严格 ties、输入/guard、禁止未汇合 ready 发布），不需要 KVAF server。`--mode sim --device 0` 可运行 CANN Model。多 owner 的快速契约检查可增加 `--batches 16 --history 4096 --resident 2048`；这只是地址/数学检查，不能代替 H128K 真机测量。它不验证 Service、Final 或 URMA。之前消费者 DMA 的 V→MTE2 同步修复及 sortable score 审计仍保留；旧 Model 记录见 `CORRECTNESS.md`，不能替代新链正确性。
 
-本轮五 batch 脚本与实际 C++ 分片/cursor/核预算及同图拆解通过20项实验检查，构建恢复通过3项检查；本轮没有改动 kernel。前一提交58aa570的CANN 9.1编译链接、B1/P16（H32768/R16384）与B16/P2（H4096/R2048）的score/predicate Model契约已通过，详见 `window_validation.json`。这些 Model 用例不含Service、Final或URMA，也不是同尺寸性能对比；五 batch A5完整链正确性与收益待实测。
+0f846ec的五batch脚本及同图拆解通过20项实验检查，未改kernel；本轮query候选新增kernel/CLI/全图归属与Model证据门禁，检查结果见 `query_validation.json`。构建恢复另有3项检查。58aa570的CANN 9.1编译链接、B1/P16（H32768/R16384）与B16/P2（H4096/R2048）的score/predicate Model契约已通过，详见 `window_validation.json`。这些旧Model用例不含Service、Final或URMA，也不是同尺寸性能对比，不能替代新query的验证。
