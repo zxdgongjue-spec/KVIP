@@ -14,11 +14,16 @@ clean="$area/KVAF-de4fd37e"
 transport=a2857b460a74704114fd30a849ae38666cc2c372
 kvaf="$area/KVAF-${transport:0:8}"
 snapshot="$work/skip-results.po80Nw/g2-input"
+adaptive=
+if [[ ${1:-} == --main-adaptive ]]; then
+    adaptive=${2:?supply candidate commit}
+    shift 2
+fi
 reuse=
 if [[ $# -eq 2 && $1 == --reuse-serial ]]; then
     reuse=$(cd "$2/serial" && pwd -P)
 elif [[ $# -ne 0 ]]; then
-    echo 'Usage: host20_peer_fused.sh [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
+    echo 'Usage: host20_peer_fused.sh [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
     exit 2
 fi
 mkdir -p "$area"
@@ -36,13 +41,23 @@ pin() {
 }
 pin "$root" "$baseline" "$serial_revision"
 git -C "$root" diff --exit-code --quiet "$serial_revision" HEAD -- csrc/operators/lidu
-git -C "$root" fetch -q origin test/peer-g2-low-cq
-pin "$root" "$src/auto-${old:0:8}" "$old"
-pin "$root" "$src/auto-${new:0:8}" "$new"
+if [[ -n "$adaptive" ]]; then
+    main_sha=a56154c37bebb0928da4a4095e9670898e6b21c7
+    git -C "$root" diff --exit-code --quiet "$main_sha" HEAD -- csrc python
+    git -C "$root" fetch -q origin perf/urma-main-adaptive
+    git -C "$root" merge-base --is-ancestor "$main_sha" "$adaptive"
+    adaptive_src="$src/urma-main-${adaptive:0:8}"
+    pin "$root" "$adaptive_src" "$adaptive"
+    printf '%s\n' "$adaptive" >"$out/candidate.txt"
+else
+    git -C "$root" fetch -q origin test/peer-g2-low-cq
+    pin "$root" "$src/auto-${old:0:8}" "$old"
+    pin "$root" "$src/auto-${new:0:8}" "$new"
+fi
 git -C "$clean" fetch -q origin test/peer-main-urma-fused-context
 pin "$clean" "$kvaf" "$transport"
 pin "$clean" "$clean" de4fd37e02fa86357f71fe4fcbbbecc3e75d1d58
-test -s "$snapshot/manifest.json" || { echo "Missing G2 snapshot $snapshot" >&2; exit 1; }
+[[ -n "$adaptive" || -s "$snapshot/manifest.json" ]] || { echo "Missing G2 snapshot $snapshot" >&2; exit 1; }
 trace=$(bash "$tools/peer_g2_input.sh" "$work")
 cann=$(sed -n 's/^ASCEND_CANN_PACKAGE_PATH:[^=]*=//p' "$clean/build-npu/CMakeCache.txt")
 test -d "$cann/include/acl"
@@ -67,7 +82,12 @@ if [[ -z "$reuse" || ! -s "$KVAF_BATCH_GET_KERNEL" || ! -s "$KVAF_BATCH_PUT_KERN
 fi
 cpu="$clean/build-cpu/runtime/kvaf_cpu_service"
 test -x "$cpu"
-printf 'CONFIG G2 BS16 Q4 656B NPU4 after=%s before=%s main=a56154c3 KVAF=%s\n' "${new:0:8}" "${old:0:8}" "${transport:0:8}"
+if [[ -n "$adaptive" ]]; then
+    printf 'CONFIG G2 NPU4 BS16 Q4 656B main=%.8s candidate=%.8s\n' "$main_sha" "$adaptive"
+    echo 'UNITS us  DETAIL=p50/max[observed/eligible] auxiliary=true  DRIFT=within_graph_last5_minus_first5'
+else
+    printf 'CONFIG G2 BS16 Q4 656B NPU4 after=%s before=%s main=a56154c3 KVAF=%s\n' "${new:0:8}" "${old:0:8}" "${transport:0:8}"
+fi
 run_arm() (
     set -euo pipefail
     label=$1
@@ -93,9 +113,12 @@ run_arm() (
     fi
     "$PYTHON" -B "$tools/support/peer_thp.py" --timeout 1800 --pid "$pid" --log "$arm/cpu.log" --output "$arm/thp.json" >"$arm/thp.log" 2>&1 &
     monitor=$!
+    level=1
     case "$label" in
         serial*) mode=(--serial-only) ;;
-        main) mode=(--fused-only) ;;
+        main) mode=(--fused-only)
+              if [[ -n "$adaptive" ]]; then mode+=(--route-policy main); level=2; fi ;;
+        zero|early) mode=(--fused-only --route-policy "$label" --candidate-root "$adaptive_src"); level=2 ;;
         before*) candidate=$old ;;
         after) candidate=$new ;;
     esac
@@ -108,7 +131,7 @@ run_arm() (
     if ! "$PYTHON" -B "$tools/test_lifetch.py" diagnose "${mode[@]}" "${limits[@]}" \
         --transport urma --input real --trace-root "$trace" --group 2 --round-range 1:1 \
         --device 0 --kvaf-root "$kvaf" --kvaf-server "127.0.0.1:$port" \
-        --prefetch-rank-start 1024 --warmup 4 --iterations 20 --level 1 \
+        --prefetch-rank-start 1024 --warmup 4 --iterations 20 --level "$level" \
         --output "$arm/results" --timeout-seconds 1800 >"$arm/replay.log" 2>&1; then
         tail -5 "$arm/replay.log" >&2
         find "$arm/results" -name worker.log -exec tail -10 {} \; >&2
@@ -116,14 +139,26 @@ run_arm() (
     fi
     if ! wait "$monitor"; then cat "$arm/thp.log" >&2; exit 1; fi
     monitor=
-    "$PYTHON" -B "$tools/support/peer_delta.py" "$out" "$label"
+    if [[ -z "$adaptive" ]]; then
+        "$PYTHON" -B "$tools/support/peer_delta.py" "$out" "$label"
+    else
+        if [[ "$label" == serial ]]; then
+            "$PYTHON" -B "$tools/support/peer_delta.py" "$out" serial >"$out/serial-screen.txt"
+        fi
+        "$PYTHON" -B "$tools/support/main_route_report.py" "$out" --arm "$label"
+    fi
 )
 cd "$root"
 cpu_command=("$cpu")
 if [[ -n "$reuse" ]]; then
     # Keep the original profile, timestamps and logs available in both reports.
     ln -s "$reuse" "$out/serial"
-    "$PYTHON" -B "$tools/support/peer_delta.py" "$out" serial
+    if [[ -z "$adaptive" ]]; then
+        "$PYTHON" -B "$tools/support/peer_delta.py" "$out" serial
+    else
+        "$PYTHON" -B "$tools/support/peer_delta.py" "$out" serial >"$out/serial-screen.txt"
+        "$PYTHON" -B "$tools/support/main_route_report.py" "$out" --arm serial
+    fi
     printf 'REUSED serial=%s\n' "$reuse"
 else
     run_arm serial
@@ -151,5 +186,10 @@ print(",".join(str(n) for n in sorted(ids & allowed)))' "$cpus")
     fi
 fi
 printf 'CPU_PLACEMENT target_node=%s policy=%s actual=measured_per_arm\n' "${node:-unknown}" "$policy"
-for label in main before after before-end serial-end; do run_arm "$label"; done
-"$PYTHON" -B "$tools/support/peer_delta.py" "$out"
+if [[ -n "$adaptive" ]]; then
+    for label in main zero early; do run_arm "$label"; done
+    "$PYTHON" -B "$tools/support/main_route_report.py" "$out" --gains-only
+else
+    for label in main before after before-end serial-end; do run_arm "$label"; done
+    "$PYTHON" -B "$tools/support/peer_delta.py" "$out"
+fi
