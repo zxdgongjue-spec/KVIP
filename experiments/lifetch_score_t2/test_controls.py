@@ -24,6 +24,7 @@ from diagnostics import account
 from performance import split_graph_invocations
 from workloads import configuration
 from run_a5 import BASE, baseline, checksum, summarize, save
+from correctness import audit_score_row, audit_cold_predicate
 
 
 class Controls(unittest.TestCase):
@@ -140,6 +141,29 @@ extern "C" void slice(unsigned task,unsigned p,unsigned h,unsigned* out) {
             self.assertEqual((source/relative).read_bytes(), (ROOT/relative).read_bytes())
             metadata = json.loads((output/'baseline_build_override.json').read_text())
             self.assertEqual(metadata['effective_sha256'], checksum(ROOT/relative))
+
+    def test_score_audit_decodes_signed_numeric_reference(self):
+        keys = np.full(4096, 15088, np.uint16)  # encoded BF16(-2288)
+        keys[0] = 32768  # +0
+        reference = np.full(4096, -2288, np.float32); reference[0] = 0
+        valid = np.ones(4096, bool)
+        self.assertEqual(audit_score_row(keys, reference, valid, np.arange(2048))['score_mismatches'], 0)
+        self.assertEqual(audit_score_row(keys, keys, valid, np.arange(2048))['score_mismatches'], 0)
+        bad_selection = np.arange(1,2049)
+        self.assertEqual(audit_score_row(keys, reference, valid, bad_selection)['missing_above'], 1)
+        reference[2] = -2208
+        result = audit_score_row(keys, reference, valid, np.arange(2048))
+        self.assertEqual(result['score_mismatches'], 1)
+        self.assertEqual(result['examples'][0]['device_score'], -2288)
+
+    def test_cold_predicate_audit_strict_threshold_and_bits(self):
+        keys = np.resize(np.asarray([15087,15088,15089,32768], np.uint16), 512)
+        expected = keys > 15088
+        packed = np.zeros(128, np.uint8)
+        for i in np.flatnonzero(expected): packed[i//4] |= 1 << (2*(i%4))
+        self.assertEqual(audit_cold_predicate(keys, packed, 15088, 128)['cold_predicate_mismatches'], 0)
+        packed[42] = 0
+        self.assertEqual(audit_cold_predicate(keys, packed, 15088, 128)['cold_predicate_mismatches'], 2)
 
     def test_summary_uses_graph_event_and_rejects_operand_change(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -107,3 +107,20 @@ python tests/operators/lifetch/test_lifetch.py bench \
 ## 当前验证状态
 
 CPU 测试与脚本 dry-run 已执行；CANN 9.1 的 npu/sim 编译链接通过。B1/P16 score producer 的 CANN Model oracle/guard 校验通过，整次 Model 为 48726 ticks。完整 Cold/Service/Final/URMA 候选流程及 A5 硬件收益仍待验证；该 score 用例没有验证整个尾部。详见 `ANALYSIS.md` 和 `model_score_result.json`。候选暂不用于生产性能结论。
+
+### Cold 消费路径的同步修复
+
+`ProcessPrecomputedVec1` 原来只等待 MTE3→V，再由 MTE2 搬入下一块 score。MTE2 是独立流水线，该等待没有限制它覆盖 V 仍在读取的 UB。当前在搬入前补齐平衡的 V→MTE2 Set/Wait，之后仍使用 MTE2→V 和 V→MTE3 发布依赖。
+
+另修复失败审计的单位混用：设备 GM 为 sortable BF16 uint16 key，而 synthetic 参考为数值 score。现在在相同口径比较，并增加 saved θ 与 Cold bitmap 对照。TopK 的真实漏选/低分选入检查继续保留，未放宽正确性标准。
+
+先在 A5 检查实际 Cold 消费函数（无需 KVAF server，不执行 Service/Fetch），再运行完整 `run_a5.sh`：
+
+```bash
+cd /home/w00568585/wt-lifetch-score-t2
+bash experiments/lifetch_score_t2/run_cold_contract.sh \
+  --device 5 --batches 1,16 \
+  --kvaf-root /home/w00568585/KVAF-score-t2-1c131038
+```
+
+该标准用例固定 Q4/H32768/R16384，包含每 Q/owner 不同 θ、严格 greater-than ties、连续多 tile 和 ping-pong 复用；核数为 B×2 AIC/B×4 AIV。它只验证实际 Cold bitmap、阈值与输入/guard，不提供性能结果，也不能替代完整 H128K、URMA Fetch、Index/Output 的正确性检查。每次构建使用新目录；若 CANN 不在默认位置，增加 `--cann /实际/CANN/目录`。本地 Model 使用 `--mode sim --batches 1 --device 0`，日志详见 `cold_model_result.json`。

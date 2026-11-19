@@ -1,0 +1,31 @@
+{
+  "date": "2026-11-19",
+  "scope": "CANN Model actual precomputed Cold consumer only; no Service/Fetch/Final TopK",
+  "cann": "9.1.0",
+  "compiled_soc": "Ascend950PR_9599",
+  "reported_model_soc": "Ascend950PR_9589",
+  "geometry": {
+    "batch": 1,
+    "queries": 4,
+    "history": 32768,
+    "resident": 16384,
+    "aics": 2,
+    "aivs": 4,
+    "cold_keys": 65536
+  },
+  "change": "Balanced V_MTE2 Set/Wait before score DMA reuses the UB bank",
+  "before": {
+    "status": "FAIL",
+    "predicate_mismatches": 37236,
+    "log_sha256": "fa449c13c8278114de8cd1e7b141ad39a4ff986f66c2332d63dcb7a06344eed6"
+  },
+  "after": {
+    "status": "PASS",
+    "predicate_mismatches": 0,
+    "strict_gt_ties": true,
+    "input_and_threshold_guards": true,
+    "log_sha256": "db0e10dc3600fe95ccf2d30191c9f8a045c31532191fc1d1e9f8b9087c52ed25"
+  },
+  "full_a5_urma_candidate": "NOT_REVALIDATED",
+  "hardware_latency": "NOT_MEASURED"
+}

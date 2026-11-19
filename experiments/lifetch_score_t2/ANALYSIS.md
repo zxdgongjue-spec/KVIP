@@ -72,3 +72,17 @@ Final 是完整有效 history 上的数值 Top2048，不是跨 Q 去重；跨 Q 
 验证：3 项构建恢复测试通过（失败目录/日志保留、新目录重试后成功复用、configure 失败与缺失库不发布完成记录）；9 项实验控制/依赖隔离测试通过，包含基线构建覆盖记录检查。原有源代码/头文件/共享 selector 摘要更新与缓存复用检查、CMake 源目录检查通过。本地 CANN 9.1 NPU 全新目录编译链接通过，缓存第二次调用没有重编，发布后的库在正确预加载 CANN Model runtime 时动态加载及新入口符号检查通过。
 
 本地没有硬件驱动；直接加载 NPU 库时 SoC 检查出现 `basic_string::_S_construct null not valid`，原构建目录和发布目录一致。正确预加载 Model runtime 后两者的环境问题消失，未将该初始化失败当作候选运行结果。完整候选 A5 Cold/Service/Final/URMA 正确性和收益仍待重跑验证。
+
+## 已执行但 TopK 失败：Cold DMA 同步（2026-11-19）
+
+A5 `r0_pf1024_score_t2_p2` 的 B1/B16 完成执行，均未通过正确性：B1 serial/fused event 255.76/408.90µs，B16 367.41/418.96µs。这里是 P2 控制，不是 B1/P16；runner 在失败处停止，P16 及正式轮没有完成。
+
+同图时间分解：B1 候选 LI 比 native 多 137.32µs，Resolve/Update 比串行 LIDU+Fetch 多 10.38µs；B16 候选 LI 多 127.42µs，而融合末段少 77.11µs。B16 的末段差值被 LI 增量抵消；两路都包含 Fetch 完成。P2/B16 与原 T2 同为 32 AIC；全 history score 完成后才开始 θ/Service，而且 Cold 额外重读 GM。当前失败结果不能用于证明候选的有效性能或推断首次预取时间。
+
+日志的 `score_mismatches=131072` 是审计的单位混用：例如 key15088 解码为 BF16(-2288)，32768 为 +0，贴出的八个样例全部与数值参考一致。这不代表全 history score 已经证明完全正确，也不会消除 TopK 漏选高分/选入低分的失败。审计现在按实际参考格式比较，并记录 resident θ 与物理 Cold bitmap 的差异。
+
+实际消费函数 `ProcessPrecomputedVec1` 存在独立流水线依赖缺口：MTE3→V 等待只能限制 V；MTE2 score DMA 仍可能提前覆盖 V 在读取的 ping-pong UB。新增搬入前 V→MTE2 Set/Wait，事件不借用预先发布的 bank credit。原 canonical、唯一 θ、T2 owner/Service、Final 与 CQ/Index 依赖保持原路径。
+
+使用同一实际消费函数、相同 B1/Q4/H32768/R16384 输入的 CANN Model 对比：保留的修复前二进制有 **37236/65536 个 Cold predicate 错误**；修复后 **0 个错误，PASS**，strict greater-than ties、输入、阈值和 guard 检查通过。NPU/sim 目标共享该消费源文件；本次实际编译运行为 CANN 9.1 sim。详见 `cold_model_result.json`。另一个 H128K 的修复前 probe 也出现大量 predicate 错误；没有将不同几何数据作为同场景比值。
+
+该结果验证了消费路径同步修复，没有执行 Service、Final TopK、URMA 或 Index commit，也未测量 A5 修复后的性能。先运行 `run_cold_contract.sh --device 5 --batches 1,16`，再按原固定参数运行完整 `run_a5.sh`。所有正确性 PASS 后，才评估 P2/P16 的耗时和剩余瓶颈。

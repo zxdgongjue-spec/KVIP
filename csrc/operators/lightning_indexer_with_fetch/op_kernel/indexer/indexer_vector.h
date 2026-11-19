@@ -796,6 +796,11 @@ __aicore__ inline void QLIVector<QLIT>::ProcessPrecomputedVec1(const QLICommon::
     uint32_t pingpong = info.loop % 2, query = (blockId_ % 2) * 2;
     auto out = vec1OutUB_[pingpong * (UB_BANK_STRIDE / sizeof(uint16_t))];
     WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
+    // MTE3_V gates the vector pipe, not the independent MTE2 pipe. Fence
+    // that vector wait and the preceding tile's reads before DMA reuses UB.
+    // EVENT_ID5 is balanced here and is not an AllocEventID bank credit.
+    SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+    WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
     DataCopyExtParams copy{2, s2BaseSize_ * uint32_t(sizeof(SCORE_T)),
         (runtimeShape_.history - s2BaseSize_) * uint32_t(sizeof(SCORE_T)),
         (UB_BANK_DEPTH_STRIDE - s2BaseSize_ * uint32_t(sizeof(SCORE_T))) / 32, 0};

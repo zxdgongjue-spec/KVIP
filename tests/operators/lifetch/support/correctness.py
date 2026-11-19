@@ -5,7 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
-from workloads import configuration
+from workloads import configuration, score_values
 
 # Cases share the existing full-chain oracle; geometry is not public check input.
 FIXED_CASES = {
@@ -17,6 +17,43 @@ FIXED_CASES = {
 
 
 TOPK, BLOCK_TOKENS, TOKEN_BYTES = 2048, 128, 656
+
+
+def audit_score_row(device_keys, reference, valid, selected):
+    """Compare encoded GM keys with the reference's actual numeric format."""
+    keys = np.asarray(device_keys, np.uint16)
+    reference = np.asarray(reference)
+    numeric = score_values(keys)
+    encoded = reference.dtype == np.uint16
+    expected = score_values(reference) if encoded else reference
+    valid = np.asarray(valid, bool)
+    mismatch = np.flatnonzero(valid & ((keys != reference) if encoded else (numeric != expected)))
+    population = keys[valid]
+    cutoff = int(np.partition(population, len(population) - TOPK)[-TOPK])
+    selected = np.asarray(selected)
+    chosen = np.zeros(len(keys), bool)
+    chosen[selected] = True
+    return dict(device_cutoff=cutoff, device_cutoff_score=float(score_values([cutoff])[0]),
+        reference_format='sortable_bf16_u16' if reference.dtype == np.uint16 else 'numeric_score',
+        missing_above=int(np.sum(valid & ~chosen & (keys > cutoff))),
+        below_cutoff=int(np.sum(keys[selected] < cutoff)), score_mismatches=int(len(mismatch)),
+        examples=[dict(token=int(i), device=int(keys[i]), device_score=float(numeric[i]),
+                       reference=float(reference[i]), reference_score=float(expected[i])) for i in mismatch[:8]])
+
+
+def audit_cold_predicate(keys, packed_hits, threshold, resident):
+    """Check the real two-bit-per-token predicate against its saved theta."""
+    keys = np.asarray(keys, np.uint16)
+    positions = np.arange(resident, len(keys))
+    hits = (np.asarray(packed_hits, np.uint8)[positions // 4] >> (2*(positions % 4))) & 1
+    expected = keys[positions] > threshold
+    bad = np.flatnonzero(hits != expected)
+    return dict(resident_threshold_key=int(threshold),
+        resident_threshold_score=float(score_values([threshold])[0]),
+        cold_predicate_set=int(hits.sum()), cold_predicate_expected_set=int(expected.sum()),
+        cold_predicate_mismatches=int(len(bad)),
+        predicate_examples=[dict(physical_token=int(positions[i]), score_key=int(keys[positions[i]]),
+                                 hit=int(hits[i]), expected=bool(expected[i])) for i in bad[:8]])
 
 
 def validate_topk(ids, scores):

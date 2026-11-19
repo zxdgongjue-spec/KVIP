@@ -3482,8 +3482,11 @@ class FusedReplayState:
         except AssertionError as error:
             failures.append(str(error))
             if hasattr(self.rotating, 'incremental'):
+                from correctness import audit_score_row, audit_cold_predicate
                 meta = self.rotating.incremental.cpu().numpy().view(np.uint64)
                 raw = self.workspace.compute.cpu().numpy().view(np.uint16)
+                prefix = self.workspace.prefix_storage.cpu().numpy()
+                prefix_bytes = 4 * 2048 * 6 + 4 * 256
                 base = self.workspace.compute.data_ptr()
                 audit = []
                 for row in range(self.batch):
@@ -3493,21 +3496,19 @@ class FusedReplayState:
                         offset = (int(meta[row, q, 0]) - base) // 2
                         if offset < 0 or offset + self.history > len(raw):
                             continue
-                        scores = raw[offset:offset + self.history][inverse]
+                        physical_scores = raw[offset:offset + self.history]
+                        scores = physical_scores[inverse]
                         valid = inputs.logical_score_valid[row, q]
-                        population = scores[valid]
-                        cutoff = int(np.partition(population, len(population) - 2048)[-2048])
                         selected = ids[row, q]
-                        missing = int(np.sum(population > cutoff) - np.sum(scores[selected] > cutoff))
-                        below = int(np.sum(scores[selected] < cutoff))
                         reference = inputs.logical_score_keys[row, q]
-                        mismatch = np.flatnonzero(valid & (scores != reference))
-                        if missing or below or len(mismatch):
-                            audit.append(dict(request=row, query=q + 1, device_cutoff=cutoff,
-                                missing_above=missing, below_cutoff=below,
-                                score_mismatches=int(len(mismatch)),
-                                examples=[dict(token=int(i), device=int(scores[i]), reference=int(reference[i]))
-                                          for i in mismatch[:8]]))
+                        detail = audit_score_row(scores, reference, valid, selected)
+                        theta_offset = row * prefix_bytes + 4 * 2048 * 6 + q * 256
+                        theta = int(prefix[theta_offset:theta_offset+2].view(np.uint16)[0])
+                        hit_offset = self.batch*prefix_bytes + (row*4+q)*self.history//4
+                        detail.update(audit_cold_predicate(physical_scores,
+                            prefix[hit_offset:hit_offset+self.history//4], theta, self.resident))
+                        if any(detail[k] for k in ('missing_above', 'below_cutoff', 'score_mismatches', 'cold_predicate_mismatches')):
+                            audit.append(dict(request=row, query=q + 1, **detail))
                 print('REPLAY SCORE AUDIT: ' + json.dumps(audit), flush=True)
                 if getattr(self, 'failure_directory', None):
                     atomic_json(self.failure_directory / 'score_failure.json', audit)
