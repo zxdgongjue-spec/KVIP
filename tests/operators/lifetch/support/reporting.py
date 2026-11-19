@@ -161,6 +161,8 @@ def collect_results(directory, config, exit_code):
         row = comparison_row(str(path.parent.relative_to(directory)), timing.get('native_chain'),
                              timing.get('prototype_with_update'), correct,
                              execution=report.get('execution', 'INCOMPLETE' if path.name == 'completed_timings.json' else 'COMPLETED'))
+        if report.get('serial_only') and getattr(config, 'serial_only', False) and timing.get('native_chain'):
+            row.update(timing='COMPLETE', accepted=(row['execution'] == 'COMPLETED' and correct == 'PASS'))
         row.update(batch=batch, transport=config.transport, mode=config.mode, report=str(path),
                    seed=getattr(config, 'seed', None), miss_percent=report.get('miss_percent', getattr(config, 'miss_percent', None)),
                    history=getattr(config, 'history', None), resident=getattr(config, 'resident', None),

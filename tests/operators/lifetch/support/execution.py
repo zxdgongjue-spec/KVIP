@@ -393,7 +393,7 @@ def dispatch(config):
                         print(f'CHECK COVERAGE {name}: padding={phases.get("padding", "not_requested")} '
                               f'transfer={phases.get("transfer", [])}; source={source}', flush=True)
             stopped = not (directory / 'worker-result.json').is_file()
-            if job.mode == 'diagnose':
+            if job.mode == 'diagnose' and not getattr(job, 'serial_only', False):
                 from diagnostics import summarize
                 diagnostic = summarize(directory, job)
                 if diagnostic['trace'] != 'COMPLETE':
@@ -3855,13 +3855,9 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
 
 
 def run_path(config, directory, sequence, pages, *, fused, round_check=None, shared_pool=None):
-    import acl
     import kvaf
     import torch
     import torch_npu
-    from kvip.operators.lifetch_ubmem.build import UbmemGeometry, build_ubmem_library
-    from kvip.runtime.build import build_libraries, kvaf_build_paths
-    from kvip.runtime.device import query_device_resources
 
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -3870,9 +3866,6 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     torch.npu.set_device(config.device)
     device = torch.device(f'npu:{config.device}')
     stream = torch.npu.current_stream(device)
-    cann, headers = kvaf_build_paths(build)
-    soc = acl.get_soc_name()
-    aics = query_device_resources(cann, config.device)['effective_aic']
     _, registration, _ = _load_native_operators('c8_offload')
     registration.require_a5_dsa_registration(('lidu_fused_batch_get_prepare_mtp_out',))
     g = initial.geometry
@@ -3919,12 +3912,20 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
         # Native LIDU addresses logical request pages; aliases repeat addresses.
         expanded = SimpleNamespace(addresses=view.addresses[indices].contiguous(),
                                    valid=view.valid[indices].contiguous())
-        page_addresses = expanded.addresses.cpu().numpy().view(np.uint64).reshape(g['batch'], -1)
-        logical_addresses = (page_addresses[:, :, None] + np.arange(128) * width).reshape(g['batch'], -1)
         if fused:
+            import acl
+            from kvip.runtime.build import build_libraries, kvaf_build_paths
+            from kvip.runtime.device import query_device_resources
+
+            cann, headers = kvaf_build_paths(build)
+            soc = acl.get_soc_name()
+            aics = query_device_resources(cann, config.device)['effective_aic']
+            page_addresses = expanded.addresses.cpu().numpy().view(np.uint64).reshape(g['batch'], -1)
+            logical_addresses = (page_addresses[:, :, None] + np.arange(128) * width).reshape(g['batch'], -1)
             if config.transport == 'urma':
                 (library,) = build_libraries(cache_dir=build / 'lifetch', cann=cann, headers=headers, soc=soc)
             else:
+                from kvip.operators.lifetch_ubmem.build import UbmemGeometry, build_ubmem_library
                 shape = UbmemGeometry(g['batch'], g['history'], g['resident'], g['heads'], width,
                                       aics, config.intermediate_fetches, soc)
                 library = build_ubmem_library(cache_dir=build / 'lifetch_ubmem', cann=cann, shape=shape)
@@ -4151,12 +4152,15 @@ def run_real(config, directory):
         page_count=pages.page_count, kv_payload='synthetic identity C8; actual KV not captured',
         source_paths=[str(ref.manifest_path) for refs in sequence.rounds for ref in refs]))
     results = {}
-    for name in ('serial', 'fused'):
+    serial_only = getattr(config, 'serial_only', False)
+    for name in (('serial',) if serial_only else ('serial', 'fused')):
         results[name] = run_path(config, directory / name, sequence, pages, fused=name == 'fused')
         # Preserve completed serial timing even if the fused worker later fails.
         report = dict(batch=initial.geometry['batch'], input='real', correctness='NOT_RUN',
                       execution='INCOMPLETE', timing={'native_chain': results['serial']['all_rounds']})
-        if 'fused' in results:
+        if serial_only:
+            report.update(serial_only=True, execution='COMPLETED', correctness=results['serial']['correctness'])
+        elif 'fused' in results:
             report.update(execution='COMPLETED',
                           correctness='PASS' if all(r['correctness'] == 'PASS' for r in results.values()) else 'FAIL')
             report['timing']['prototype_with_update'] = results['fused']['all_rounds']

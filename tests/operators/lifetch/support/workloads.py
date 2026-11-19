@@ -138,6 +138,8 @@ def configuration(argv=None):
             command.add_argument('--warmup', type=int, default=4, help='whole-graph warmup repetitions')
             command.add_argument('--iterations', type=int, default=20, help='independent complete invocations captured in one measured graph')
         if mode == 'diagnose':
+            command.add_argument('--serial-only', action='store_true',
+                                 help='measure the native serial chain alone on a real replay')
             command.add_argument('--level', type=int, choices=(1, 2, 3), default=1)
             command.add_argument('--stages', type=csv_values, default=('all',))
     converter = commands.add_parser('convert-trace', help='CPU-only legacy trace conversion')
@@ -190,6 +192,8 @@ def configuration(argv=None):
                 or args.prefetch_tokens % args.intermediate_fetches):
             parser.error('invalid timing or prefetch configuration')
     if args.mode == 'diagnose':
+        if args.serial_only and args.input != 'real':
+            parser.error('--serial-only requires --input real')
         if 'all' in args.stages and len(args.stages) != 1:
             parser.error('stages all cannot be combined with individual stages')
         if set(args.stages) - {*STAGES, 'all'}:
