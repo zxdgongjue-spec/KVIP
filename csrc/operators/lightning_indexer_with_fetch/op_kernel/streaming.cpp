@@ -246,16 +246,30 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  uint32_t inputError=0,upperMisses=0;bool bounded=true;
  if(!a->queryBitmaps || !a->queryErrors || !a->updateBindings || !a->packedFetch || !ctx->hotValid || !ctx->changeCount || row->slots>kPrefetch ||
     shape.history!=a->history || shape.resident!=a->resident || shape.resident>131072 || shape.finalWorkers!=4 || a->maxEvents<kPrefetch+kSlots)inputError=1;
+ uint32_t badQuery=0,classifySite=0;
  if(!inputError){auto errors=reinterpret_cast<__gm__ uint32_t*>(a->queryErrors)+(b*4)*32;
-  for(uint32_t q=0;q<4;++q){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+q*32),128);inputError|=errors[q*32];uint32_t n=errors[q*32+1]-1;
+  for(uint32_t q=0;q<4;++q){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+q*32),128);if(!inputError && errors[q*32]){badQuery=q+1;classifySite=errors[q*32+2];}inputError|=errors[q*32];uint32_t n=errors[q*32+1]-1;
    if(n>kCompactMissLimit)bounded=false;else upperMisses+=n;}}
- if(inputError){auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*32;status[0]=inputError;status[1]=0;
+ if(inputError){
+  // Failure-only feedback: producer owns this row before the final join.
+  row->snapshot[15][0]=0x4c460000U+(badQuery?2U:1U);
+  uint32_t guard=!a->queryBitmaps?1:!a->queryErrors?2:!a->updateBindings?3:!a->packedFetch?4:
+      !ctx->hotValid?5:!ctx->changeCount?6:row->slots>kPrefetch?7:shape.history!=a->history?8:
+      shape.resident!=a->resident?9:shape.resident>131072?10:shape.finalWorkers!=4?11:12;
+  if(badQuery){
+   auto e=reinterpret_cast<__gm__ uint32_t*>(a->queryErrors)+(b*4+badQuery-1)*32;
+   row->snapshot[14][0]=e[3];row->snapshot[14][1]=e[4];row->snapshot[14][2]=shape.history;
+  }
+  row->snapshot[15][1]=badQuery;row->snapshot[15][2]=badQuery?classifySite:guard;
+  row->snapshot[15][3]=inputError;
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->snapshot[15]),16);
+  auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*32;status[0]=inputError;status[1]=0;
   if(ctx->changeCount){
    auto count=reinterpret_cast<__gm__ uint32_t*>(ctx->changeCount)+b;
    count[0]=kLruSlots;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(count),4);
   }
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),128);
-  for(uint32_t q=0;q<kFlagCount;++q){if(q==6 || (q>=7 && q<12))continue;flags[q].count=0;flags[q].error=inputError;flags[q].ready=1;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+q),kBatchFlagPayloadBytes);}
+  for(uint32_t q=0;q<kFlagCount;++q){if((KVIP_OUTPUT_WORKER && q>=1 && q<=4) || q==6 || (q>=7 && q<12))continue;flags[q].count=0;flags[q].error=inputError;flags[q].ready=1;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+q),kBatchFlagPayloadBytes);}
   return;}
  TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,kFinalScratchBytes);auto local=scratch.Get<uint32_t>();
  Simt::VF_CALL<PublishPrefetch>(Simt::Dim3{512,1,1},reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+b*10240,
@@ -407,6 +421,8 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
   SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
   }
   if(profile)ticks[14+q*5]=GetSystemCycle();
+  if(error){row->snapshot[15][0]=0x4c460003U;row->snapshot[15][1]=q+1;row->snapshot[15][2]=compact;row->snapshot[15][3]=error;
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->snapshot[15]),16);}
   uint32_t published=KVIP_OUTPUT_WORKER?kRawQueryFlag+q:q+1;
   flags[published].reserved[0]=compact && earlyFetch;flags[published].count=added;flags[published].error=error;flags[published].ready=1;
   if(profile)ticks[4+q]=GetSystemCycle();status[4+q]=added;status[8+q]=total;
@@ -643,7 +659,15 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
   }
   seen+=count;
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-  error=local.GetValue(CONTROL);if(profile)ticks[13+2*phase]=GetSystemCycle();if(phase)total+=count;
+  error=local.GetValue(CONTROL);
+  if(error){
+   auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
+   row->snapshot[4][0]=0x4c460005U;row->snapshot[4][1]=phase;
+   row->snapshot[4][2]=error==1?local.GetValue(CONTROL+8):6;row->snapshot[4][3]=error;
+   for(uint32_t j=0;j<3 && error==1;++j)row->snapshot[5][j]=local.GetValue(CONTROL+9+j);
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->snapshot[4]),32);
+  }
+  if(profile)ticks[13+2*phase]=GetSystemCycle();if(phase)total+=count;
  }
  if(!error){uint64_t start=GetSystemCycle();while(true){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+4),kBatchFlagPayloadBytes);if(flags[4].ready){error=flags[4].error;break;}if(GetSystemCycle()-start>5000000000ULL){error=8;break;}}}
  if(!error){auto update=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);uint64_t addressStride=update[7];if(profile)ticks[22]=GetSystemCycle();
@@ -957,7 +981,7 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
    uint64_t oldProfile=0;
    if(profile){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),sizeof(*status));oldProfile=status->profile.magic;
     status->profile.magic=KVAF_AIV_BATCH_GET_PROFILE_MAGIC;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&status->profile),sizeof(status->profile));}
-   start=GetSystemCycle();kvaf_device::KvafBatchGetDevice(args,0,0,size);end=GetSystemCycle();
+   start=GetSystemCycle();kvaf_device::KvafBatchGetDevice(args,0,0,size,allFlags[lane*kFlagCount+8+q].reserved+2);end=GetSystemCycle();
    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),2*sizeof(*queue));
    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),sizeof(*status));
    if(profile){postCycles=status->profile.post_active_cycles;waitCycles=status->profile.drain_wait_cycles;groups=status->profile.submitted_group_count;
@@ -1161,6 +1185,16 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
    }
   }
   row->finalQueryErrors=codes;
+  uint32_t workers=(a->prefetchCount>>16)&0xffU;
+  for(uint32_t q=0;q<4 && workers;++q){
+   auto completion=flags+8+q;
+   if(!completion->reserved[1] || (completion->error!=kvaf_device::kCqTimeout && completion->error!=kvaf_device::kCqError))continue;
+   auto groupFlag=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+(b%workers)*kFlagCount+8+q;
+   auto source=groupFlag->reserved+2;
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(source),16*4);
+   for(uint32_t i=0;i<16;++i)row->snapshot[16+4*q+i/4][i%4]=source[i];
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->snapshot[16+4*q]),64);
+  }
  }
 #endif
 #if V9_UBMEM

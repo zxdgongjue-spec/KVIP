@@ -188,7 +188,12 @@ __aicore__ inline void OutputWorker(__gm__ Args* a,uint32_t b){
   }
   bool groupPublished=false;
   uint32_t count=error?0:flags[kRawQueryFlag+q].count;
-  if(count>kTop)error=4;
+  if(count>kTop){
+   row->snapshot[8][0]=0x4c460004U;row->snapshot[8][1]=q+1;
+   row->snapshot[8][2]=1;row->snapshot[8][3]=count;
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->snapshot[8]),16);
+   error=4;
+  }
   if(!error){
    input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*kSlots+q*kTop);
    // loc is disjoint from the descriptor packing buffers; load it while
@@ -207,6 +212,11 @@ __aicore__ inline void OutputWorker(__gm__ Args* a,uint32_t b){
     Simt::VF_CALL<PackPublicationEvents<512>>(Simt::Dim3{512,1,1},staged,shape.history,shape.resident,shape.tokenBytes,b,q,row->slots,kPrefetch+total,count,source,dest,FinalPtr(tokens),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(ctl),(a->prefetchCount&0x20000000U)?nullptr:direct,stride,compactAddresses);
     }
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);error=ctl.GetValue(1);groupPublished=compactAddresses!=nullptr;
+    if(error){
+     row->snapshot[8][0]=0x4c460004U;row->snapshot[8][1]=q+1;
+     row->snapshot[8][2]=2;row->snapshot[8][3]=error;
+     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->snapshot[8]),16);
+    }
    }
    if(profile)ticks[7+q*6]=GetSystemCycle();
    // MTE3 consumes the slot row directly. Descriptor packing may finish

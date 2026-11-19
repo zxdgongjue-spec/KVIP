@@ -804,7 +804,7 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     uint32_t b=query/SIM_Q;
     if (b>=runtimeShape_.batch || runtimeShape_.resident>131072 ||
         !a->queryBitmaps || !a->queryErrors || !ctx->mapping || !ctx->lruSlots) {
-        if (errors && b<runtimeShape_.batch) { errors[query*32]=1; kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128); }
+        if (errors && b<runtimeShape_.batch) { errors[query*32+3]=runtimeShape_.resident>131072?1:!a->queryBitmaps?2:!ctx->mapping?3:4;errors[query*32+2]=1;errors[query*32]=1; kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128); }
         return;
     }
     bool profile=(a->prefetchCount & 0x80000000U)!=0;
@@ -821,7 +821,7 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
                 kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(events+i),64);
                 if(events[i].complete)break;
                 if(GetSystemCycle()-started>5000000000ULL) {
-                    errors[query*32]=2;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);return;
+                    errors[query*32+2]=2;errors[query*32]=2;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);return;
                 }
             }
         }
@@ -841,7 +841,7 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
         uint32_t bytes=2*CeilDiv(constInfo_.mBaseSize,2)*s2BaseSize_*sizeof(QK_T);
         uint32_t mergeBytes=(topkCountAlign256_+trunkLen_)*sizeof(SCORE_T);
         if(bytes<8192*sizeof(uint32_t) || mergeBytes<8192*sizeof(uint32_t)) chunkSize=4096;
-        if(bytes<chunkSize*sizeof(uint32_t) || mergeBytes<chunkSize*sizeof(uint32_t)) {errors[query*32]=4;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);return;}
+        if(bytes<chunkSize*sizeof(uint32_t) || mergeBytes<chunkSize*sizeof(uint32_t)) {errors[query*32+2]=3;errors[query*32]=4;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);return;}
         valid=resMm1UB_.template ReinterpretCast<uint32_t>();
         reserved=mrgValueLocal_.template ReinterpretCast<uint32_t>();
         result=topkSharedTmpLocal_;bitmap=topkSharedTmpLocal_[2048];
@@ -953,6 +953,13 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     DataCopy(output,result,2048);DataCopy(bits,bitmap,(runtimeShape_.resident+31)/32);
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+    if(bitmap.GetValue(bitmapWords)){
+        errors[query*32+2]=4;
+        for(uint32_t pos=0;pos<2048;++pos){
+            uint32_t token=indicesOutLocal_.GetValue(pos);
+            if(token!=UINT32_MAX && token>=runtimeShape_.history){errors[query*32+3]=pos;errors[query*32+4]=token;break;}
+        }
+    }
     errors[query*32+1]=bitmap.GetValue(bitmapWords+1);errors[query*32]=bitmap.GetValue(bitmapWords);kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);
     if(profile){liTicks[7]=GetSystemCycle();liTicks[8]=overlapSecond?1:0;liTicks[9]=streamingTopkOnly_?1:0;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(liTicks),128);}

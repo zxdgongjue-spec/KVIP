@@ -32,7 +32,8 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void ApplyBatch(__gm__ uint3
  for(uint32_t base=0;base<count;base+=CHUNK){uint32_t n=(count-base)<CHUNK?count-base:CHUNK;
   if(!tid)ctl[3]=0;
   for(uint32_t i=tid;i<2*SET;i+=THREADS)m[SRCSET+i]=EMPTY;asc_syncthreads();
-  if(tid<n){uint32_t orig=asc_ldcg(sources+begin+base+tid),dst=asc_ldcg(destinations+begin+base+tid);uint32_t src=get(m+KEYS_ROW,m+VALUES_ROW,orig);ps[tid]=src;pd[tid]=dst;if(src<resident)asc_atomic_or(ctl+3,1U);if(orig>=history||dst>=resident||src==EMPTY||!insert(m+SRCSET,src)||!insert(m+DSTSET,dst))asc_atomic_or(ctl,1U);}asc_syncthreads();if(ctl[0])return;
+  if(tid<n){uint32_t orig=asc_ldcg(sources+begin+base+tid),dst=asc_ldcg(destinations+begin+base+tid);uint32_t src=get(m+KEYS_ROW,m+VALUES_ROW,orig);ps[tid]=src;pd[tid]=dst;if(src<resident)asc_atomic_or(ctl+3,1U);uint32_t issue=orig>=history?1:dst>=resident?2:src==EMPTY?3:!insert(m+SRCSET,src)?4:!insert(m+DSTSET,dst)?5:0;
+   if(issue){if(!asc_atomic_cas(ctl+8,0U,issue)){ctl[9]=orig;ctl[10]=dst;ctl[11]=src;}asc_atomic_or(ctl,1U);}}asc_syncthreads();if(ctl[0])return;
   uint32_t extras=n;
   if(!ctl[3]){
    if(tid<n){ps[CHUNK+tid]=pd[tid];pd[CHUNK+tid]=ps[tid];}
@@ -128,7 +129,8 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void ApplyDenseBatch(
   for(uint32_t i=tid;i<2*SET;i+=THREADS)m[SRCSET+i]=EMPTY;asc_syncthreads();
   if(tid<n){uint32_t orig=asc_ldcg(sources+begin+base+tid),dst=asc_ldcg(destinations+begin+base+tid);
    uint32_t src=orig<history?asc_ldcg(dense+history+orig):EMPTY;ps[tid]=src;pd[tid]=dst;
-   if(orig>=history||dst>=resident||src>=history||!insert(m+SRCSET,src)||!insert(m+DSTSET,dst))asc_atomic_or(ctl,1U);}
+   uint32_t issue=orig>=history?1:dst>=resident?2:src>=history?3:!insert(m+SRCSET,src)?4:!insert(m+DSTSET,dst)?5:0;
+   if(issue){if(!asc_atomic_cas(ctl+8,0U,issue)){ctl[9]=orig;ctl[10]=dst;ctl[11]=src;}asc_atomic_or(ctl,1U);}}
   asc_syncthreads();if(ctl[0])return;
   uint32_t out=tid<n&&!contains(m+SRCSET,pd[tid]),freed=tid<n&&!contains(m+DSTSET,ps[tid]);
 
