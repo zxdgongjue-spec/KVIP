@@ -2,6 +2,7 @@
 // Final TopK UB-side classification. One independent bitmap per query;
 // the staged resolver merges all four before selecting any victim.
 #pragma once
+#include "compact_misses.h"
 namespace rotating {
 constexpr uint32_t kClassifyThreads=512;
 constexpr uint32_t kBitmapWords=512,kBitmapShards=8;
@@ -26,6 +27,9 @@ inline void ClassifyTopkHalf(uint32_t history,uint32_t resident,uint32_t batch,
         uint32_t slot=UINT32_MAX;
         if(inHalf && !inTail && (!hasValid || valid[token-halfBase]) &&
            (!hasReserved || reserved[token-halfBase]<0))slot=token;
+#if !V9_UBMEM
+        else if(inTail)slot=DirectTailSlot(token,resident,tailBegin,tailEnd,OutputStride(resident,ctx)-resident);
+#endif
         else if(used || hasTail)slot=ResolvePhysicalSlot(resident,lru,asc_ldcg(mapping+token));
         locations[i]=slot;
         if(slot<resident)asc_atomic_or(bitmap+(threadIdx.x%shards)*words+slot/32,1U<<(slot%32));
@@ -45,3 +49,67 @@ inline void MergeClassifyBitmap(__ubuf__ uint32_t* bitmap,uint32_t resident) {
     asc_syncthreads();
 }
 }
+#if !V9_UBMEM
+
+namespace rotating {
+__simt_vf__ __aicore__ LAUNCH_BOUND(512)
+inline void ClassifyPreparedLocations(uint32_t history,uint32_t resident,uint32_t batch,__gm__ Context* ctx,
+    uint32_t tailBegin,uint32_t tailSize,uint32_t ringStart,uint32_t capacity,
+    __ubuf__ uint32_t* indices,__ubuf__ uint32_t* locations,__ubuf__ uint32_t* bitmap,__ubuf__ uint32_t* error) {
+    const uint32_t words=(resident+31)/32,shards=4096/words<8?4096/words:8;
+    auto mapping=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+uint64_t(batch)*history;
+    auto lru=reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+batch*kLruSlots;
+    for(uint32_t i=threadIdx.x;i<kTop;i+=512){
+        uint32_t token=indices[i],slot=locations[i];
+        if(token==UINT32_MAX){locations[i]=UINT32_MAX;continue;}
+        if(token>=history){locations[i]=UINT32_MAX;asc_atomic_or(error,1U);continue;}
+        const uint32_t offset=token-tailBegin;
+        if(slot==UINT32_MAX && offset<tailSize){
+            uint64_t index=uint64_t(ringStart)+offset;
+            slot=resident+uint32_t(index>=capacity?index-capacity:index);
+        }
+        if(slot==UINT32_MAX)slot=ResolvePhysicalSlot(resident,lru,asc_ldcg(mapping+token));
+        locations[i]=slot;
+        if(slot<resident)asc_atomic_or(bitmap+(threadIdx.x%shards)*words+slot/32,1U<<(slot%32));
+    }
+    asc_syncthreads();
+}
+__simt_vf__ __aicore__ LAUNCH_BOUND(512)
+inline void ClassifyPreparedLocationsFlex(uint32_t history,uint32_t resident,uint32_t batch,__gm__ Context* ctx,
+    uint32_t tailBegin,uint32_t tailSize,uint32_t ringStart,uint32_t capacity,
+    __ubuf__ uint32_t* indices,__ubuf__ uint32_t* locations,__ubuf__ uint32_t* bitmap,__ubuf__ uint32_t* error,uint32_t shards) {
+    const uint32_t words=(resident+31)/32;
+    auto mapping=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+uint64_t(batch)*history;
+    auto lru=reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+batch*kLruSlots;
+    for(uint32_t i=threadIdx.x;i<kTop;i+=512){
+        uint32_t token=indices[i],slot=locations[i];
+        if(token==UINT32_MAX){locations[i]=UINT32_MAX;continue;}
+        if(token>=history){locations[i]=UINT32_MAX;asc_atomic_or(error,1U);continue;}
+        const uint32_t offset=token-tailBegin;
+        if(slot==UINT32_MAX && offset<tailSize){
+            uint64_t index=uint64_t(ringStart)+offset;
+            slot=resident+uint32_t(index>=capacity?index-capacity:index);
+        }
+        if(slot==UINT32_MAX)slot=ResolvePhysicalSlot(resident,lru,asc_ldcg(mapping+token));
+        locations[i]=slot;
+        if(slot<resident)asc_atomic_or(bitmap+(threadIdx.x%shards)*words+slot/32,1U<<(slot%32));
+    }
+    asc_syncthreads();
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(512)
+inline void MergeClassifyBitmapFlex(__ubuf__ uint32_t* bitmap,uint32_t resident,uint32_t shards,
+    __ubuf__ uint32_t* indices=nullptr,__ubuf__ uint32_t* locations=nullptr,
+    __gm__ uint32_t* entries=nullptr,__ubuf__ uint32_t* count=nullptr) {
+    const uint32_t words=(resident+31)/32;
+    for(uint32_t word=threadIdx.x;word<words;word+=512){
+        uint32_t value=bitmap[word];
+        for(uint32_t shard=1;shard<shards;++shard)value|=bitmap[shard*words+word];
+        bitmap[word]=value;
+    }
+    asc_syncthreads();
+    if(entries)ExportCompactMisses(indices,locations,bitmap+words,entries,count);
+}
+
+}
+#endif

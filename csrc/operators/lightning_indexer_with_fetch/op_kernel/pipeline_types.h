@@ -13,12 +13,15 @@ constexpr uint32_t kMaxFinal=8192, kMapSize=4096, kChunk=32;
 constexpr uint32_t kFlagWords=32, kFlagCount=KVIP_OUTPUT_WORKER?16:12;
 // Each flag is isolated to avoid stale reads/false sharing across AIVs.
 struct alignas(128) BatchFlag { uint32_t ready, count, error, reserved[29]; };
+constexpr uint32_t kBatchFlagPayloadBytes = 3 * sizeof(uint32_t);
 static_assert(sizeof(BatchFlag)==128,"one cache line per flag");
 struct alignas(128) Args {
  uint64_t context, keys, scales, addresses, logical, valid;
  uint64_t flags, eventsSrc, eventsDst, workerStatus, times;
  uint32_t history, resident, prefetchCount, maxEvents;
  uint64_t queryBitmaps, queryErrors, updateBindings, denseShadow, packedFetch;
+ uint64_t completedFlags, liveCount, completedRows, completedEvents; // Completed snapshots, separate from live URMA state.
+ uint64_t completedMapping, completedJournal;
 };
 }
 

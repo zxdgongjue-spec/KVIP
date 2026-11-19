@@ -21,6 +21,7 @@ class LIFetchBinding:
         history,
         resident,
         prefetch_limit=512,
+        prefetch_rank_start=1024,
         window_limit=None,
         li_tiling="auto",
         intermediate_fetches=32,
@@ -37,6 +38,11 @@ class LIFetchBinding:
         output_stride=None,
         scratch=None,
     ):
+        if not isinstance(prefetch_rank_start, int) or not 1 <= prefetch_rank_start <= 2048:
+            raise ValueError("prefetch_rank_start must be an integer in 1..2048")
+        self.prefetch_rank_start = prefetch_rank_start
+        if history >= (1 << 26):
+            raise ValueError("Ranked LIFetch history must fit the 26-bit progress counter")
         if resident > 131072:
             raise ValueError("LIFetch hot bitmap supports resident <= 131072")
         if not 1 <= batch <= 16:
@@ -69,7 +75,7 @@ class LIFetchBinding:
             ("final_replicated", int(final_strategy == "replicated")),
             ("final_workers", final_aivs(batch, li_tiling, aic_count, final_workers)),
             ("aic_count", aic_count),
-            ("abi_version", 11),
+            ("abi_version", 12),
             (
                 "service_lanes",
                 li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)["service_aivs_per_window"],
@@ -83,7 +89,7 @@ class LIFetchBinding:
             ("history", history),
             ("resident", resident),
             ("simulation", 0),
-            ("context_bytes", 320),
+            ("context_bytes", 352),
             ("row_bytes", 1024),
         ):
             fn = getattr(self.library, "v9_" + name)
@@ -112,6 +118,9 @@ class LIFetchBinding:
         )
         for name, (shape, dtype_name) in spec.items():
             dtype = getattr(torch, dtype_name)
+            if name == "mapping_journal" and scratch is not None and name not in scratch:
+                # Keep the sparse snapshot journal paired with its shared mapping.
+                scratch[name] = torch.zeros(shape, dtype=dtype, device=self.device)
             value = torch.zeros(shape, dtype=dtype, device=self.device) if scratch is None else scratch[name]
             if (
                 value.device != self.device
@@ -210,9 +219,16 @@ class LIFetchBinding:
                 np.array([self.change_slots.data_ptr(), self.change_count.data_ptr()], dtype="<u8").view("u1"),
             )
         )
+        covered_start = batch * (512 + 4 * 2048 * 6 + 1024)
+        covered_bytes = batch * ((history + 255) // 256) * 32
+        self.covered = self.window_topk_storage[covered_start:covered_start + covered_bytes]
+        self.rank_progress = self.window_topk_storage[-batch*4*32*8:].view(torch.int64).view(batch,4,32)
+        self.incremental = self.window_topk_storage[:batch*512].view(torch.int64).view(batch,4,16)
+        blob = np.concatenate((blob, np.array([self.incremental.data_ptr(), prefetch_rank_start,
+                               self.mapping_journal.data_ptr() if self.mapping_journal is not None else 0, 0], dtype="<u8").view("u1")))
         self.context = torch.from_numpy(blob.copy()).to(self.device)
         self.arguments = tuple(arguments) + (self.context,)
-        self.bindings = torch.tensor([x.data_ptr() for x in self.arguments], dtype=torch.uint64, device=self.device)
+        self.bindings = torch.tensor([x.data_ptr() for x in self.arguments] + [0], dtype=torch.uint64, device=self.device)
         self.functions = {}
         for name in ("init", "li"):
             fn = getattr(self.library, "v9_" + name)
@@ -222,6 +238,7 @@ class LIFetchBinding:
 
     def reset(self):
         for tensor in (
+            self.covered,
             self.progress,
             self.rows,
             self.events,
@@ -234,6 +251,8 @@ class LIFetchBinding:
             tensor.zero_()
         self.changes.fill_(-1)
         self.mapping.fill_(-1)
+        if self.mapping_journal is not None:
+            self.mapping_journal.zero_()
         self.locations.fill_(-1)
 
     def _call(self, name):

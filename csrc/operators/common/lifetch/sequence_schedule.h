@@ -8,17 +8,18 @@
 // Align halves to two tiles so neither shard loads its sibling's Key page.
 LIFETCH_SCHEDULE_DEVICE inline bool UseSequenceSplit(const RuntimeShape& s) {
     if (s.rounds <= 1 || s.history <= s.resident) return false;
-    uint32_t blocks=(s.history-s.resident)/512;
+    uint32_t halfPages=(s.history-s.resident)/256;
+    uint32_t blocks=(halfPages+1)/2;
     uint32_t halfBlocks=(blocks+s.rounds-2)/(s.rounds-1);
     // Both shards must have a final tile to drain their persistent pipelines.
-    return halfBlocks*(2*s.rounds-3)<2*blocks && s.splitQ && s.indexHeads == 32 && s.rounds > 1 && s.resident % 512 == 0 &&
-        s.history > s.resident && (s.history - s.resident) % 512 == 0 &&
+    return halfBlocks*(2*s.rounds-3)<halfPages && s.splitQ && s.indexHeads == 32 && s.rounds > 1 && s.resident % 512 == 0 &&
+        s.history > s.resident && (s.history - s.resident) % 256 == 0 &&
         (s.history - s.resident) >= 512 * (s.rounds - 1);
 }
 
 LIFETCH_SCHEDULE_DEVICE inline uint32_t SequenceHalfWindow(const RuntimeShape& s) {
     // Keep all shard starts tile-aligned; the last shard is clipped to history.
-    const uint32_t blocks = (s.history - s.resident) / 512;
+    const uint32_t blocks = (s.history - s.resident + 511) / 512;
     return ((blocks + s.rounds - 2) / (s.rounds - 1)) * 256;
 }
 
