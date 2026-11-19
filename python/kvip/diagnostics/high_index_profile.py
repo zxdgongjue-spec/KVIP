@@ -179,7 +179,8 @@ def validate_move_counts(profile, before, after, owners, *, two_cycle_moves=None
             if not np.array_equal(writes.sum(axis=0), 148 * np.array(counts)):
                 raise ValueError("Index field writes do not cover all persistent payload")
             profile["payload_writes"] = dict(field_rows=np.flatnonzero(field_rows).tolist(),
-                field_cycle_bytes=int(observed.sum()), total_bytes=int(writes.sum()), bytes_by_lane=writes.ravel().tolist())
+                field_cycle_bytes=int(observed.sum()), total_bytes=int(writes.sum()), bytes_by_lane=writes.ravel().tolist(),
+                tuple_bytes=148, traffic_scope="keys, scale, logical ID, address; writes only, excludes hot-valid, plan and padding")
             shared &= ~field_rows
         profile["row_gathers"] = int(np.count_nonzero(shared))
         profile["single_owner_rows"] = int(np.count_nonzero(eligible))
@@ -479,7 +480,15 @@ def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan
         result["row_partitions"] = dict(pairs=marks[:, 16].tolist(), singles=marks[:, 17].tolist(),
                                         invalidations=marks[:, 19].tolist(), single_owner=marker != "RQI1")
         if marker == "RQI8":
-            result["row_partitions"]["field_cycle_write_bytes"] = marks[:, 13].tolist()
+            local = result["row_partitions"]
+            local["field_cycle_write_bytes"] = marks[:, 13].tolist()
+            active_fields = marks[:, 13] > 0
+            field_ends = marks[active_fields, 12]
+            # The single VF records no separate gather endpoint; a zero must
+            # never be converted to a zero-duration gather.
+            local["field_gather_markers"] = ("no_field_rows" if not field_ends.size else
+                                            "unavailable" if not np.any(field_ends) else
+                                            "present" if np.all(field_ends) else "partial")
         schedule = overlap_schedule_timing(rows, marks, marker=marker)
         if marker == "RQI6":
             schedule["poll_work"] = final_poll_work(rows, marks)

@@ -296,7 +296,8 @@ def summarize(group, cases, baseline, candidate, high_overlap=False, schedule_fo
                     payload = high["payload_writes"]
                     print(f"G{group} INDEX_FIELDS {arm} field_rows={len(payload['field_rows'])}"
                           f" cycle_field_write_B={payload['field_cycle_bytes']} total_Index_payload_write_B={payload['total_bytes']}"
-                          f" max_lane_payload_write_B={max(payload['bytes_by_lane'])} metadata_included=true")
+                          f" max_lane_payload_write_B={max(payload['bytes_by_lane'])} tuple_B=148 hotvalid_excluded=true"
+                          f" field_gather_marker={high['row_partitions']['field_gather_markers']}")
                 if arm == "after" and "index_help" in metrics:
                     help_stats = metrics["index_help"]
                     print(f"G{group} INDEX_HELP after last_Index_row/pairs/singles={help_stats['last_index_row']}/"

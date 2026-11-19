@@ -427,6 +427,31 @@ def test_rqi8_field_bytes_are_not_full_tuple_move_credits():
     w = profile["payload_writes"]
     assert (w["field_rows"], w["field_cycle_bytes"], w["total_bytes"]) == ([1], 65*148, 128*148)
     assert w["bytes_by_lane"][1::16] == [2600, 2600, 2340, 2080]
+    assert w["tuple_bytes"] == 148 and "excludes hot-valid" in w["traffic_scope"]
     field[:, 1] = np.roll(field[:, 1], 1)  # Same total but wrong physical lane owner.
     with pytest.raises(ValueError, match="Field-owned"):
         validate_move_counts(profile, before, after, range(16), **kwargs)
+
+
+def test_rqi8_single_vf_has_no_timed_gather_endpoint():
+    from kvip.diagnostics.high_index_profile import decode_high_index
+    rows = np.zeros((64, 16), np.int64)
+    marks = np.zeros((64, 32), np.int64)
+    rows[:, 10], rows[:, 14] = 110, 2
+    rows[:, 5], rows[:, 8], rows[:, 9] = 230, 500, 700
+    rows[32:48, 4] = 250
+    rows[0, [1, 6, 7, 15]] = [1, 240, 252, 1]
+    marks[:, 0], marks[:, 1], marks[:, 2], marks[:, 3] = 100, 800, 0x52514938, 330
+    marks[0, 4], marks[0, 8] = 240, 1
+    marks[:, 20], marks[:, 21], marks[:, 23], marks[:, 30] = 210, 230, 310, 650
+    marks[:16, 22], marks[:16, 28], marks[:16, 29] = 260, 515, 550
+    marks[16:32, 24:28] = [180, 190, 200, 210]
+    marks[::16, 9], marks[::16, 10], marks[::16, 17] = 16, 16, 16
+    marks[::16, 13] = [2560, 2560, 2304, 2048]
+    def read():
+        return decode_high_index(rows, marks, wait_first=False, final_get=1,
+                                 work={}, schedule_timing=True)
+    assert read()["row_partitions"]["field_gather_markers"] == "unavailable"
+    assert "gather_join" not in read()
+    marks[::16, 12] = 450
+    assert read()["row_partitions"]["field_gather_markers"] == "present"
