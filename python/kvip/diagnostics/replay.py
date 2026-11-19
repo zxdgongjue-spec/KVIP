@@ -69,6 +69,7 @@ def arguments(argv=None):
         default=0,
         help="Separate instrumented fused graph replays after headline timing",
     )
+    p.add_argument("--final-get-detail", action="store_true", help="Calibrated final URMA Get intervals in a separate diagnostic replay")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--profile-dir", type=Path, help="Independent system traces, outside headline timing")
     p.add_argument("--profile-metrics", nargs="+", choices=PROFILE_METRICS, default=None)
@@ -83,6 +84,8 @@ def arguments(argv=None):
     args = p.parse_args(argv)
     if args.warmup < 0 or args.iterations < 1 or args.device < 0 or args.diagnostic_replays < 0:
         p.error("Require nonnegative device/warmup and positive iterations")
+    if args.final_get_detail and (args.transport != "urma" or args.mode != "fused" or not args.diagnostic_replays):
+        p.error("final-get-detail requires fused URMA with at least one diagnostic replay")
     if args.output.exists():
         p.error("Output already exists")
     if args.profile_metrics is not None and args.profile_dir is None:

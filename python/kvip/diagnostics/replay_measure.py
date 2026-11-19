@@ -406,6 +406,8 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None, archive=N
                 from kvip.diagnostics.ranked_port import window_diagnostics
 
                 diagnostic = window_diagnostics(torch, bundle.rotating, stream)
+            elif getattr(args, "final_get_detail", False):
+                diagnostic = {}
             else:
                 diagnostic = decode_profile(
                     cpu_array(torch, bundle.forward.times),
@@ -417,6 +419,12 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None, archive=N
                     and args.transport == "urma"
                     and getattr(bundle, "tuning", {}).get("recent_profile", True),
                 )
+            if getattr(args, "final_get_detail", False):
+                from kvip.diagnostics.ranked_port import counter_rate, final_get_times
+
+                rate = diagnostic.get("ticks_per_us") or counter_rate(torch, bundle.rotating, stream)
+                diagnostic["final_get"] = final_get_times(cpu_array(torch, bundle.forward.times),
+                                                          bundle.forward.batch, bundle.forward.q_workers, rate)
             diagnostic_samples.append(dict(**diagnostic, reads=diagnostic_reads))
             if getattr(bundle, "tuning", {}).get("window_probe"):
                 from kvip.diagnostics.window_probe import decode

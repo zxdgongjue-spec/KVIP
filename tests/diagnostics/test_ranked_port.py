@@ -91,3 +91,55 @@ def test_report_uses_both_repeats_and_actual_traffic(tmp_path, capsys):
     assert "conservative_mean/P50=-2.08/+2.09%" in out
     assert "51.2/12.8/32.0/96.1" in out
     assert "KERNEL_DELTA_US ranked-minus-reverse init/LI/resolve_update=-10.00/-10.00/-10.00" in out
+
+    for name in ("reverse", "ranked", "ranked-46924fb", "ranked-a92b7c8"):
+        path = tmp_path / f"g7-{name}-2.json"
+        data = json.loads((path if path.exists() else tmp_path / "g7-ranked-2.json").read_text())
+        case = data["cases"]["reverse"] if name == "reverse" else data
+        case["kvip_commit"] = name.split("-")[-1]
+        case["native_diagnostics"] = dict(samples=[dict(final_get=dict(
+            status="available", q_workers=8, p50_us=12 if name == "reverse" else 5,
+            max_us=18 if name == "reverse" else 11))])
+        path.write_text(json.dumps(data))
+    report(tmp_path, 7, history=True)
+    out = capsys.readouterr().out
+    assert "HISTORY_GRAPH_US ranked-46924fb" in out
+    assert "FINAL_GET_SAVED_US ranked vs_reverse Q_worker_P50/max=+7.00/+7.00" in out
+    assert "LI_added=-10.00 tail_saved=+10.00" in out
+
+
+def test_final_get_joins_phases_per_worker_before_taking_median():
+    from kvip.diagnostics.ranked_port import final_get_times
+
+    batch, workers = 4, 2
+    raw = np.zeros(batch * 256, dtype=np.uint64)
+    rows = raw[batch*128:].reshape(batch, 128)[:, :96].reshape(batch, 4, 24)
+    for b in range(batch):
+        for q in range(4):
+            start = 1000 + q
+            rows[b, q, [3, 4, 7, 8, 20]] = [start, start+10+q, start+50, start+53+b%2, 3]
+    result = final_get_times(raw, batch, workers, 2)
+    assert result["q_workers"] == 8
+    assert result["p50_us"] == 7.5
+    assert result["max_us"] == 8.5
+    rows[2, 0, 4] += 1
+    with pytest.raises(ValueError, match="Replicated"):
+        final_get_times(raw, batch, workers, 2)
+    rows[:, :, 20] = 4
+    rows[:, :, 21] = 32
+    assert final_get_times(raw, batch, workers, 2)["max_us"] == 16
+    rows[2, 0, 20] = 0
+    assert final_get_times(raw, batch, workers, 2)["status"] == "unavailable"
+
+
+def test_kernel_costs_falls_back_to_actual_profiler_export(tmp_path):
+    from kvip.diagnostics.ranked_port import kernel_costs
+
+    p = tmp_path / "kernel_details.csv"
+    p.write_text("Name,Start Time(us),Duration(us)\n"
+                 "v9_init_kernel_1,1000.01,12\n"
+                 "v9_li_kernel_0,1012.4,355\n"
+                 "v9_streaming_resolve_update_5,1369.05,215\n")
+    report = dict(metric="none", directory=str(tmp_path), timeline={"li": None},
+                  artifacts={"csv_files": [{"path": p.name}]})
+    assert kernel_costs({"system_profiles": {"passes": [report]}}) == [12, 355, 215]
