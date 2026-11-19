@@ -481,6 +481,32 @@ __simd_vf__ inline void MulWeightAndReduceSum(__ubuf__ uint32_t* out_,
     ReduceSumFinalize(regSum0, regSum1, regKScale, maskAllB32, fp32Ctx, out_);
 }
 
+// A split-history AIV scores two queries at once. Preserve the reduction
+// tree of the one-query replay for each row: even and odd heads accumulate
+// separately, then add once before applying the key scale and BF16 rounding.
+#if KVIP_RANKED_PORT || KVIP_G7_SCAN_CLOCK == 3
+template <typename QK_T>
+__simd_callee__ inline void ReduceCapturedPair(
+    MicroAPI::RegTensor<float> (&sum0)[2], MicroAPI::RegTensor<float> (&sum1)[2],
+    MicroAPI::RegTensor<float> (&weights)[2], MicroAPI::MaskReg& mask,
+    __ubuf__ QK_T* qk0, __ubuf__ QK_T* qk1, uint32_t stride, int heads)
+{
+    MicroAPI::RegTensor<float> qk[2], odd[2], weight;
+    MicroAPI::RegTensor<half> fp16[2];
+    MicroAPI::RegTensor<int32_t> i32[2];
+    DuplicateZero(odd, mask);
+    ReduceSumLoopBody<QK_T>(qk, fp16, i32, weight, weights[0], sum0, odd,
+                            mask, qk0, stride, heads);
+    MicroAPI::Add(sum0[0], sum0[0], odd[0], mask);
+    MicroAPI::Add(sum0[1], sum0[1], odd[1], mask);
+    DuplicateZero(odd, mask);
+    ReduceSumLoopBody<QK_T>(qk, fp16, i32, weight, weights[1], sum1, odd,
+                            mask, qk1, stride, heads);
+    MicroAPI::Add(sum1[0], sum1[0], odd[0], mask);
+    MicroAPI::Add(sum1[1], sum1[1], odd[1], mask);
+}
+#endif
+
 // 计算S1=2
 // float weight in uint16 out
 template <typename QK_T>
@@ -588,17 +614,24 @@ __simd_vf__ inline void MulWeightAndReduceSum2(__ubuf__ uint16_t* out0_,
     AscendC::MicroAPI::LoadAlign<float>(regQScale[1], qScale1_);
     AscendC::MicroAPI::Mul(regW[0], regW[0], regQScale[0], maskAllB32);
     AscendC::MicroAPI::Mul(regW[1], regW[1], regQScale[1], maskAllB32);
+
+#if !KVIP_RANKED_PORT && KVIP_G7_SCAN_CLOCK != 3
     // regW[0]与weight1混合使用
     AscendC::MicroAPI::StoreAlign<float, AscendC::MicroAPI::StoreDist::DIST_NORM>(weightFloat_, regW[1], maskAllB32);
     AscendC::MicroAPI::LocalMemBar<AscendC::MicroAPI::MemType::VEC_STORE, AscendC::MicroAPI::MemType::VEC_LOAD>();
+#endif
     DuplicateZero(regSum0, maskAllB32);
     DuplicateZero(regSum1, maskAllB32);
 
     MicroAPI::LoadAlign<float>(regKScale[0], kScale_);
     MicroAPI::LoadAlign<float>(regKScale[1], kScale_ + 64);
 
+#if KVIP_RANKED_PORT || KVIP_G7_SCAN_CLOCK == 3
+    ReduceCapturedPair(regSum0, regSum1, regW, maskAllB32, qk0_, qk1_, qkVLStride, gSize);
+#else
     ReduceSum2LoopBody<QK_T>(regQK0, regQK1, regQK0Half, regQK1Half, regQK0Int32, regQK1Int32, regwBrc, regW,
         regSum0, regSum1, maskAllB32, qk0_, qk1_, qkVLStride, weightFloat_, gSize);
+#endif
 
     ReduceSum2Finalize(regSum0, regSum1, regKScale, maskAllB32, bf16Ctx, maskAllB16, out0_, out1_);
 }
@@ -1032,17 +1065,24 @@ __simd_vf__ inline void ClassifyMulWeightAndReduceSum2(__ubuf__ uint16_t* out0_,
     AscendC::MicroAPI::LoadAlign<float>(regQScale[1], qScale1_);
     AscendC::MicroAPI::Mul(regW[0], regW[0], regQScale[0], maskAllB32);
     AscendC::MicroAPI::Mul(regW[1], regW[1], regQScale[1], maskAllB32);
+
+#if !KVIP_RANKED_PORT && KVIP_G7_SCAN_CLOCK != 3
     // regW[0]与weight1混合使用
     AscendC::MicroAPI::StoreAlign<float, AscendC::MicroAPI::StoreDist::DIST_NORM>(weightFloat_, regW[1], maskAllB32);
     AscendC::MicroAPI::LocalMemBar<AscendC::MicroAPI::MemType::VEC_STORE, AscendC::MicroAPI::MemType::VEC_LOAD>();
+#endif
     DuplicateZero(regSum0, maskAllB32);
     DuplicateZero(regSum1, maskAllB32);
 
     MicroAPI::LoadAlign<float>(regKScale[0], kScale_);
     MicroAPI::LoadAlign<float>(regKScale[1], kScale_ + 64);
 
+#if KVIP_RANKED_PORT || KVIP_G7_SCAN_CLOCK == 3
+    ReduceCapturedPair(regSum0, regSum1, regW, maskAllB32, qk0_, qk1_, qkVLStride, gSize);
+#else
     ReduceSum2LoopBody<QK_T>(regQK0, regQK1, regQK0Half, regQK1Half, regQK0Int32, regQK1Int32, regwBrc, regW,
         regSum0, regSum1, maskAllB32, qk0_, qk1_, qkVLStride, weightFloat_, gSize);
+#endif
 
     ReduceSum2FinalizeClassify(regSum0, regSum1, regKScale, maskAllB32, bf16Ctx, maskAllB16, out0_, out1_, threshold, hits, rolling, mask0, mask1, advance, compactValues, compactIds, compactOffset, compactMask);
 }
