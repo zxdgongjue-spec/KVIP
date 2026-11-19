@@ -24,6 +24,10 @@
 using namespace AscendC;
 namespace QLICommon {
 constexpr uint32_t KScaleTiles = KVIP_LI_SCALE_TILES ? KVIP_LI_SCALE_TILES : 16;
+// The 64-head MM banks leave less UB for scales and incremental TopK.
+__aicore__ inline uint32_t ScaleTiles(uint32_t heads) {
+    return heads == 64 ? 4U : KScaleTiles;
+}
 #if !V9_UBMEM
 #else
 

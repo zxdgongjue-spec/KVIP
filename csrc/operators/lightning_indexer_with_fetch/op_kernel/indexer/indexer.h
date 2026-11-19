@@ -680,7 +680,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
     tempLoopInfo.s2LoopEnd = end - 1;
     tempLoopInfo.validS2Len = end * S2_BASE_SIZE;
     for (uint32_t tile = begin; tile < end; ++tile, ++loop) {
-        if ((tile - begin) % QLICommon::KScaleTiles == 0) ++scaleLoop;
+        if ((tile - begin) % QLICommon::ScaleTiles(constInfo.gSize) == 0) ++scaleLoop;
         QLICommon::RunInfo info;
         CalcRunInfo(loop, tile, info, 0, scaleLoop);
 #if !V9_UBMEM
@@ -726,7 +726,7 @@ __aicore__ inline bool QuantLightningIndexerKernel<QLIT>::ScoreRecent(
     tempLoopInfo.validS2Len = tiles.end * S2_BASE_SIZE;
     uint32_t scaleLoop = 0;
     for (uint32_t tile = tiles.begin; tile < tiles.end; ++tile, ++loop) {
-        if ((tile - tiles.begin) % QLICommon::KScaleTiles == 0) ++scaleLoop;
+        if ((tile - tiles.begin) % QLICommon::ScaleTiles(constInfo.gSize) == 0) ++scaleLoop;
         QLICommon::RunInfo info;
         CalcRunInfo(loop, tile, info, qScaleLoop, scaleLoop);
         if (reuseRetained) {
@@ -870,7 +870,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()
 #endif
             uint32_t kScaleLoop = 0;
             for (int s2LoopIdx = splitCoreInfo.s2Start; s2LoopIdx <= tempLoopInfo.s2LoopEnd; s2LoopIdx++) {
-                if ((s2LoopIdx - splitCoreInfo.s2Start) % QLICommon::KScaleTiles == 0) {
+                if ((s2LoopIdx - splitCoreInfo.s2Start) % QLICommon::ScaleTiles(constInfo.gSize) == 0) {
                     ++kScaleLoop;
                 }
 #if !V9_UBMEM

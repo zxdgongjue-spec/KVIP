@@ -396,7 +396,7 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe, bool topkOnly)
         weightUB_ = weightBuf_.Get<W_T>();
         pipe->InitBuffer(weightFloatBuf_, 2 * CeilDiv(s1BaseSize_, 2) * UB_BANK_DEPTH_STRIDE);
         weightFloatUB_ = weightFloatBuf_.Get<float>();
-        pipe->InitBuffer(kScaleBuf_, 2 * s2BaseSize_ * QLICommon::KScaleTiles * sizeof(SCALE_T));
+        pipe->InitBuffer(kScaleBuf_, 2 * s2BaseSize_ * QLICommon::ScaleTiles(constInfo_.gSize) * sizeof(SCALE_T));
         kScaleUB_ = kScaleBuf_.Get<SCALE_T>();
         pipe->InitBuffer(qScaleBuf_, 2 * CeilDiv(s1BaseSize_, 2) * UB_BANK_DEPTH_STRIDE);
         qScaleUB_ = qScaleBuf_.Get<SCALE_T>();
@@ -441,12 +441,12 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe, bool topkOnly)
     incrementalOld_ = (topkOnly && streamingWorkspace_) ? streamingOutput_ : incrementalNew_[trunkLen_].template ReinterpretCast<uint32_t>();
     incrementalMetadata_ = incrementalNew_[trunkLen_ + ((topkOnly && streamingWorkspace_) ? 0 : 4096)].template ReinterpretCast<uint64_t>();
     if (!topkOnly) {
-        uint32_t used=2*CeilDiv(constInfo_.mBaseSize,2)*s2BaseSize_*sizeof(QK_T)+1536+6*CeilDiv(s1BaseSize_,2)*UB_BANK_DEPTH_STRIDE+2*s2BaseSize_*QLICommon::KScaleTiles*sizeof(SCALE_T)+2*CeilDiv(s1BaseSize_,2)*s2BaseSize_*sizeof(SCORE_T)+(topkCountAlign256_+trunkLen_)*sizeof(SCORE_T)+(topkCountAlign256_+64)*4+topkCountAlign256_*sizeof(SCORE_T)+topkSharedTmpSize+trunkLen_*2+8192+1024;
+        uint32_t used=2*CeilDiv(constInfo_.mBaseSize,2)*s2BaseSize_*sizeof(QK_T)+1536+6*CeilDiv(s1BaseSize_,2)*UB_BANK_DEPTH_STRIDE+2*s2BaseSize_*QLICommon::ScaleTiles(constInfo_.gSize)*sizeof(SCALE_T)+2*CeilDiv(s1BaseSize_,2)*s2BaseSize_*sizeof(SCORE_T)+(topkCountAlign256_+trunkLen_)*sizeof(SCORE_T)+(topkCountAlign256_+64)*4+topkCountAlign256_*sizeof(SCORE_T)+topkSharedTmpSize+trunkLen_*2+8192+1024;
         incrementalPipeline_=used+kIncrementalInputBytes<=223232;
         if(incrementalPipeline_){pipe->InitBuffer(incrementalInputBuf_,kIncrementalInputBytes);incrementalInput_=incrementalInputBuf_.Get<uint16_t>();}
     }
 #endif
-    if (!topkOnly) Duplicate(kScaleUB_, static_cast<SCALE_T>(0), 2 * s2BaseSize_ * QLICommon::KScaleTiles);
+    if (!topkOnly) Duplicate(kScaleUB_, static_cast<SCALE_T>(0), 2 * s2BaseSize_ * QLICommon::ScaleTiles(constInfo_.gSize));
 }
 
 template <typename QLIT>
@@ -469,7 +469,8 @@ __aicore__ inline void QLIVector<QLIT>::InitParams(const struct QLICommon::Const
     if constexpr (std::is_same_v<SCORE_T, uint32_t>) {
         trunkLen_ = TRUNK_LEN_6K;
     } else {
-        trunkLen_ = (s1BaseSize_ == 2 || topkOnly) ? TRUNK_LEN_16K : 8192;
+        trunkLen_ = (s1BaseSize_ == 2 || topkOnly) ? TRUNK_LEN_16K :
+            (constInfo_.gSize == 64 ? 6144 : 8192);
     }
     topkCount_ = constInfo.sparseCount;
     topkOp_.Init(topkCount_, trunkLen_);
@@ -565,7 +566,7 @@ __aicore__ inline void QLIVector<QLIT>::GetKeyScale(const QLICommon::RunInfo &ru
             int32_t blockId = blockTableGm.GetValue(blockTableBatchOffset + startBlockTableIdx);
             SetFlag<HardEvent::S_MTE2>(KSCALE_S_MTE2_EVENT);
             WaitFlag<HardEvent::S_MTE2>(KSCALE_S_MTE2_EVENT);
-            AscendC::DataCopyPad(kScaleUB[QLICommon::KScaleTiles * (runInfo.kScaleLoop % 2) * s2BaseSize_], kScaleGm[blockId *
+            AscendC::DataCopyPad(kScaleUB[QLICommon::ScaleTiles(constInfo_.gSize) * (runInfo.kScaleLoop % 2) * s2BaseSize_], kScaleGm[blockId *
                                 constInfo_.keyDequantScaleStride0 + startBlockTableOffset], copyInParams, padParams);
             startBlockTableIdx++;
             getLen = getLen - firstPartLen;
@@ -585,7 +586,7 @@ __aicore__ inline void QLIVector<QLIT>::GetKeyScale(const QLICommon::RunInfo &ru
             copyInParams.blockLen = (stop - i * kCacheBlockSize_) * sizeof(SCALE_T);
             SetFlag<HardEvent::S_MTE2>(KSCALE_S_MTE2_EVENT);
             WaitFlag<HardEvent::S_MTE2>(KSCALE_S_MTE2_EVENT);
-            AscendC::DataCopyPad(kScaleUB[QLICommon::KScaleTiles * (runInfo.kScaleLoop % 2) * s2BaseSize_ +
+            AscendC::DataCopyPad(kScaleUB[QLICommon::ScaleTiles(constInfo_.gSize) * (runInfo.kScaleLoop % 2) * s2BaseSize_ +
                                                resUbBaseOffset + i * kCacheBlockSize_],
                                  kScaleGm[blockId * constInfo_.keyDequantScaleStride0],
                                  copyInParams, padParams);
@@ -597,7 +598,7 @@ __aicore__ inline void QLIVector<QLIT>::GetKeyScale(const QLICommon::RunInfo &ru
         copyInParams.srcStride = 0;
         copyInParams.dstStride = 0;
         copyInParams.rsv = 0;
-        AscendC::DataCopyPad(kScaleUB[QLICommon::KScaleTiles * (runInfo.kScaleLoop % 2) * s2BaseSize_],
+        AscendC::DataCopyPad(kScaleUB[QLICommon::ScaleTiles(constInfo_.gSize) * (runInfo.kScaleLoop % 2) * s2BaseSize_],
                                             kScaleGm[runInfo.tensorKeyScaleOffset],
                                             copyInParams, padParams);
     }
@@ -656,11 +657,11 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         WaitFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT_QSCALE + qScalepingpong);
     }
 
-    if ((info.s2Idx - info.s2Start) % QLICommon::KScaleTiles == 0) {
+    if ((info.s2Idx - info.s2Start) % QLICommon::ScaleTiles(constInfo_.gSize) == 0) {
         WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_KSCALE + kScalepingpong);
-        uint32_t getLen = QLICommon::KScaleTiles * s2BaseSize_ > (info.validS2Len - info.s2Idx * s2BaseSize_)
+        uint32_t getLen = QLICommon::ScaleTiles(constInfo_.gSize) * s2BaseSize_ > (info.validS2Len - info.s2Idx * s2BaseSize_)
                                            ? info.validS2Len - info.s2Idx * s2BaseSize_
-                                           : QLICommon::KScaleTiles * s2BaseSize_;
+                                           : QLICommon::ScaleTiles(constInfo_.gSize) * s2BaseSize_;
         //kScaleGm  -->  kScaleUB_
         GetKeyScale(info, kScaleUB_, info.bIdx, curS2Idx, getLen);
         SetFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT_KSCALE + kScalepingpong);
@@ -679,7 +680,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     auto weightBase = weightUB_[qScalepingpong * (UB_BANK_STRIDE / sizeof(W_T))];
     auto weightFloatBase = weightFloatUB_[qScalepingpong * (UB_BANK_STRIDE / sizeof(float))];
     auto qScaleBase = qScaleUB_[qScalepingpong * (UB_BANK_STRIDE / sizeof(SCALE_T))];
-    auto kScaleBase = kScaleUB_[kScalepingpong * QLICommon::KScaleTiles * s2BaseSize_ + ((info.s2Idx - info.s2Start) % QLICommon::KScaleTiles) * s2BaseSize_];
+    auto kScaleBase = kScaleUB_[kScalepingpong * QLICommon::ScaleTiles(constInfo_.gSize) * s2BaseSize_ + ((info.s2Idx - info.s2Start) % QLICommon::ScaleTiles(constInfo_.gSize)) * s2BaseSize_];
     auto qkBase = resMm1UB_[pingpong * (UB_BANK_STRIDE / sizeof(float))];
     auto qkVLstride = (UB_BANK_DEPTH_STRIDE / sizeof(float)) / 2 * constInfo_.mBaseSize;
 
@@ -715,7 +716,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     // Return the bank only after its last consumer, including a partial tail.
     // A sequence shard can end before the whole cold phase. Return its
     // partial bank too, before the next aligned shard reuses that bank.
-    if ((info.s2Idx - info.s2Start + 1) % QLICommon::KScaleTiles == 0 ||
+    if ((info.s2Idx - info.s2Start + 1) % QLICommon::ScaleTiles(constInfo_.gSize) == 0 ||
         (info.s2Idx + 1) * s2BaseSize_ >= info.validS2Len || info.isLastS2InnerLoop) {
         SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_KSCALE + kScalepingpong);
     }
