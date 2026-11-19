@@ -391,6 +391,8 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None, archive=N
             phase(retained, "diagnostic_reset", step)
             reset()
             bundle.forward.times.zero_()
+            if hasattr(bundle.forward, "cold_clock"):
+                bundle.forward.cold_clock.zero_()
             if getattr(getattr(bundle, "rotating", None), "fetch_packets_enabled", False):
                 # Diagnostic validity only. Production uses reset row cursors;
                 # headline timing does not clear or read the unused rank banks.
@@ -427,10 +429,16 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None, archive=N
                                                           bundle.forward.batch, bundle.forward.q_workers, rate)
                 from kvip.diagnostics.ranked_audit import decode as decode_li_audit
 
-                diagnostic["li_phase_audit"] = decode_li_audit(
-                    cpu_array(torch, bundle.forward.times), cpu_array(torch, bundle.rotating.events),
-                    bundle.forward.batch, rate, ranked=bool(getattr(args, "ranked_port", False)),
-                )
+                if hasattr(bundle.forward, "cold_clock"):
+                    from kvip.diagnostics.cold_window_compare import decode
+                    diagnostic["cold_window_clock"] = decode(
+                        cpu_array(torch, bundle.forward.cold_clock), rate, int(os.environ["KVIP_G7_SCAN_CLOCK"])
+                    )
+                if not hasattr(bundle.forward, "cold_clock") or os.environ.get("KVIP_G7_SCAN_CLOCK") == "1":
+                    diagnostic["li_phase_audit"] = decode_li_audit(
+                        cpu_array(torch, bundle.forward.times), cpu_array(torch, bundle.rotating.events),
+                        bundle.forward.batch, rate, ranked=bool(getattr(args, "ranked_port", False)),
+                    )
             diagnostic_samples.append(dict(**diagnostic, reads=diagnostic_reads))
             if getattr(bundle, "tuning", {}).get("window_probe"):
                 from kvip.diagnostics.window_probe import decode

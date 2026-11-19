@@ -27,7 +27,8 @@ case "$mode" in
     audit) groups=(7); audit=1; ranked_sha=aaa8d3429951464d0d62d70b10cbaaf7d3c2ed43 ;;
     donor-scan) groups=(7); prior=1; ranked_sha=9952fad5ed36ce4d2885b66399f6543b8c5a8e7d ;;
     donor-slots) groups=(7); prior=1; ranked_sha=3c3fa6486d470e4ddf020d7701691a4314fc5da0 ;;
-    *) echo "Usage: $0 [all|g7|audit|donor-scan|donor-slots]" >&2; exit 2 ;;
+    cold-align) groups=(7); prior=1; prior_sha=3c3fa6486d470e4ddf020d7701691a4314fc5da0; ranked_sha=6adedf322b6adc3fb2b825626331c8489438e64b ;;
+    *) echo "Usage: $0 [all|g7|audit|donor-scan|donor-slots|cold-align]" >&2; exit 2 ;;
 esac
 checkout() {
     local branch=$1 sha=$2 destination=$3
@@ -76,7 +77,7 @@ export PYTHONUNBUFFERED=1
 export KVAF_BATCH_GET_KERNEL="$build/bin/kvaf_execute_batch_get_kernels.o"
 export KVAF_BATCH_PUT_KERNEL="$build/bin/kvaf_execute_batch_put_kernels.o"
 export PYTHONPATH="$reader/python:$build/python${PYTHONPATH:+:$PYTHONPATH}"
-unset KVIP_FETCH_AB_CHECK
+unset KVIP_FETCH_AB_CHECK KVIP_G7_SCAN_CLOCK
 cd "$reader"
 result=$(mktemp -d "$work/host20-ranked-port-npu4.XXXXXX")
 printf 'CONFIG URMA NPU4 logical=0 BS16 Q4 656B cold_windows=8 Fetch_AIV_per_window=8 seed_is_not_window budgets=64/512\nCONTROL=%s\nRANKED=%s\nRESULT_ROOT=%s\n' \
@@ -84,17 +85,22 @@ printf 'CONFIG URMA NPU4 logical=0 BS16 Q4 656B cold_windows=8 Fetch_AIV_per_win
 if ((audit)); then echo MODE=LI_phase_audit_only_not_a_performance_candidate; fi
 if ((prior)); then
     scope=donor_scan_and_device_call_boundaries_same_rank_and_fetch
+    if [[ "$mode" == cold-align ]]; then scope=G7_reference_padded_shards_only; fi
     if [[ "$mode" == donor-slots ]]; then scope=final_TopK_tagged_slot_classification; fi
     printf 'PRIOR=%s\nDONOR=1d2486a76151ae37662c47aab835d06df50be866\nSCOPE=%s\n' "$prior_sha" "$scope"
 fi
 for group in "${groups[@]}"; do
-    python3 -B -m kvip.diagnostics.ranked_port cpu --snapshot "$inputs/g${group}-input"
+    if [[ "$mode" == cold-align ]]; then
+        python3 -B -m kvip.diagnostics.cold_window_compare --snapshot "$inputs/g${group}-input"
+    else
+        python3 -B -m kvip.diagnostics.ranked_port cpu --snapshot "$inputs/g${group}-input"
+    fi
 done
 echo BUILD_BEGIN
 if ! (
     python3 -B -m kvip.diagnostics.ranked_port build --root "$baseline" --revision "$baseline_sha" \
         --build-dir "$build" --soc Ascend950DT_9582 --baseline || exit $?
-    if ((prior)); then
+    if ((prior)) && [[ "$mode" != cold-align ]]; then
         python3 -B -m kvip.diagnostics.ranked_port build --root "$work/fused-scan-sources/native-$prior_sha" \
             --revision "$prior_sha" --build-dir "$build" --soc Ascend950DT_9582 --baseline || exit $?
     fi
@@ -135,6 +141,7 @@ if ((!ready)); then tail -n 15 "$result/.cpu.log" >&2; exit 1; fi
 echo REPLAY_CPU_READY
 run_case() {
     local group=$1 name=$2 repeat=$3 source="$baseline" sha="$baseline_sha" diagnostics=0
+    local warmup=5 iterations=10
     local extra=(--study scan-order --scan-variants "$name")
     local out="$result/g${group}-${name}-${repeat}.json" log="$result/.g${group}-${name}-${repeat}.log"
     if [[ "$name" == ranked* ]]; then
@@ -154,20 +161,41 @@ run_case() {
         source="$work/fused-scan-sources/native-$sha"
         extra=(--study scan-order --scan-variants reverse)
     fi
-    # One independent profiler replay after this process's headline samples.
-    if [[ "$repeat" == 2 && "$name" != forward  ]] && { ((${#history[@]} || audit || prior)) || [[ "${RANKED_TIMELINE:-1}" == 1 ]]; }; then
-        if ((${#history[@]} || audit || prior)); then
-            extra+=(--final-get-detail)
+    if [[ "$mode" == cold-align ]]; then
+        if [[ "$repeat" == 3 ]]; then
+            warmup=1; iterations=1
+            sha=$ranked_sha
+            source=$ranked
             diagnostics=1
+            case "$name" in
+                reverse-original) extra=(--study scan-order --scan-variants reverse) ;;
+                forward-original) extra=(--study scan-order --scan-variants forward) ;;
+                rank-original|rank-matched|rank-split) extra=(--study threshold --ranked-port) ;;
+                *) return 2 ;;
+            esac
+            extra+=(--final-get-detail)
+        else
+            diagnostics=0
+            if [[ "$repeat" == 2 ]]; then
+                extra+=(--profile-dir "$result/profiles/g${group}-$name" --profile-metrics none)
+            fi
         fi
-        extra+=(--profile-dir "$result/profiles/g${group}-$name" --profile-metrics none)
+    else
+        # One independent profiler replay after this process's headline samples.
+        if [[ "$repeat" == 2 && "$name" != forward  ]] && { ((${#history[@]} || audit || prior)) || [[ "${RANKED_TIMELINE:-1}" == 1 ]]; }; then
+            if ((${#history[@]} || audit || prior)); then
+                extra+=(--final-get-detail)
+                diagnostics=1
+            fi
+            extra+=(--profile-dir "$result/profiles/g${group}-$name" --profile-metrics none)
+        fi
     fi
     if ! python3 -B -X faulthandler -m kvip.diagnostics.replay \
         --snapshot "$inputs/g${group}-input" --build-dir "$build" --transport urma --mode fused \
         --threshold-policy recent "${extra[@]}" --cold-windows 8 \
         --upstream-root "$source" --upstream-revision "$sha" \
         --kvaf-server "127.0.0.1:$cpu_port" --device 0 --soc Ascend950DT_9582 \
-        --warmup 5 --iterations 10 --diagnostic-replays "$diagnostics" --quiet --output "$out" >"$log" 2>&1; then
+        --warmup "$warmup" --iterations "$iterations" --diagnostic-replays "$diagnostics" --quiet --output "$out" >"$log" 2>&1; then
         printf 'REPLAY_FAILED G%s variant=%s LOG=%s\n' "$group" "$name" "$log" >&2
         python3 -B -m kvip.diagnostics.console --result "$out" --log "$log" --returncode 70 >&2 || true
         tail -n 15 "$log" >&2
@@ -195,11 +223,23 @@ for group in "${groups[@]}"; do
         for name in ranked-46924fb ranked-a92b7c8; do run_case "$group" "$name" 2; done
     fi
     for name in "${last_order[@]}"; do run_case "$group" "$name" 2; done
+    if [[ "$mode" == cold-align ]]; then
+        for arm in reverse-original forward-original rank-original rank-matched rank-split; do
+            case "$arm" in
+                rank-matched) clock=2 ;;
+                rank-split) clock=3 ;;
+                *) clock=1 ;;
+            esac
+            KVIP_G7_SCAN_CLOCK="$clock" run_case "$group" "$arm" 3
+        done
+        python3 -B -m kvip.diagnostics.cold_window_compare --root "$result" | tee "$result/g${group}-summary.txt"
+        continue
+    fi
     if ((prior)); then run_case "$group" reverse-audit 2; fi
     report_flags=("${history[@]}")
     if ((prior)); then report_flags=(--prior); fi
     python3 -B -m kvip.diagnostics.ranked_port report --root "$result" --group "$group" "${report_flags[@]}" | tee "$result/g${group}-summary.txt"
 done
 (cd "$result" && tar -czf results.tar.gz g*.json g*-summary.txt)
-if ((audit)); then label=G7_AUDIT; elif [[ "$mode" == donor-slots ]]; then label=G7_DONOR_SLOTS; elif ((prior)); then label=G7_DONOR_SCAN; elif ((${#history[@]})); then label=G7; else label=G7_G2; fi
+if ((audit)); then label=G7_AUDIT; elif [[ "$mode" == cold-align ]]; then label=G7_COLD_ALIGN; elif [[ "$mode" == donor-slots ]]; then label=G7_DONOR_SLOTS; elif ((prior)); then label=G7_DONOR_SCAN; elif ((${#history[@]})); then label=G7; else label=G7_G2; fi
 printf '%s_COMPLETE RETURN_FILE=%s/results.tar.gz\n' "$label" "$result"
