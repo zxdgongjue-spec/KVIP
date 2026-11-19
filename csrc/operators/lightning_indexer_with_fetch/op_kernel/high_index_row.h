@@ -35,14 +35,11 @@ __aicore__ inline uint64_t ApplyRowIndex(__gm__ Args* a, __gm__ Context* ctx,
     Segment part{b,owner,pairs*lane/lanes,pairs*(lane+1)/lanes,
                  singles*lane/lanes,singles*(lane+1)/lanes,0};
     const uint32_t moves=2*pairs+singles;
-    // Swaps and longer cycles are disjoint in the composed permutation.
-    // When all long edges fit one lane's usual share and its UB, keep
-    // their originals together so the other three lanes need no gather join.
-    // Charge the owning lane for those moves when distributing pair swaps.
     // With a full field tile, each core can keep its own 32-byte key slice
     // on chip. Even when one core could hold every complete tuple, that
     // arrangement makes its gather/scatter a serial tail for the request.
     const bool ownedFields=lanes==4 && singles>=64 && singles<=4096;
+    // For a shorter list that fits one core's share, give that core fewer swaps.
     const bool privateCycles=!ownedFields && singles && singles<=kLocalTuples && singles*lanes<=moves;
     if (privateCycles) {
         const uint32_t first=moves*lane/(2*lanes);

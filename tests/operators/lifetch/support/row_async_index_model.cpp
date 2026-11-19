@@ -108,8 +108,8 @@ int main() {
     Args a{uint64_t(storage.data()),uint64_t(keys.data()),uint64_t(scales.data()),uint64_t(addresses.data()),
            uint64_t(logical.data()),resident,history};
     Context ctx{uint64_t(valid.data())};
-    std::array<unsigned,batch> pairs{0,1,4,14,0,35,1,117,0,19,843,1800,23,51,101,0};
-    std::array<unsigned,batch> singles{0,0,3,64,4097,63,65,108,4096,0,444,1025,3,17,0,21};
+    std::array<unsigned,batch> pairs{0,1,4,14,0,35,1,117,0,843,1700,1800,23,51,101,0};
+    std::array<unsigned,batch> singles{0,0,3,64,4097,63,65,108,4096,444,1024,1025,3,17,0,21};
     std::array<unsigned,batch> invalid{};
     std::array<Team,batch> teams;
     std::vector<unsigned> wanted(batch * history);
