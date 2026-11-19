@@ -141,7 +141,14 @@ def test_high_overlap_arms_reuse_public_completion_records(tmp_path, capsys, for
             summarize(7, cases, args.baseline, args.revision, True, formats, args.intermediate)
         cases["middle-end"]["kvip_commit"] = args.intermediate
     fixed = next(row for row in result.splitlines() if " FIXED_FUSED " in row)
-    assert "source=4cb3917d" in fixed
+    assert "source=4cb3917d" in fixed and "arm=after revision=bbbbbbbb" in fixed
+    fixed_lines = [row for row in result.splitlines() if " FIXED_FUSED " in row]
+    assert len(fixed_lines) == (2 if intermediate else 1)
+    if intermediate:
+        middle_fixed = fixed_lines[1]
+        assert "arm=middle revision=eeeeeeee" in middle_fixed
+        assert "reduction_pct_first/end_mean/p50=-1.400/-1.400,-2.209/-2.209" in middle_fixed
+        assert "all_brackets_reduction_pct_min/max_mean/p50=-2.209/-2.209,-1.400/-1.400" in middle_fixed
     assert "reduction_pct_first/end_mean/p50=-0.200/-0.200,-0.201/-0.201" in fixed
     assert "all_brackets_reduction_pct_min/max_mean/p50=-0.602/-0.602,0.200/0.200" in fixed
     assert "slower_pct_first/end_mean/p50=0.200/0.200,0.201/0.201" in fixed

@@ -196,15 +196,21 @@ def summarize(group, cases, baseline, candidate, high_overlap=False, schedule_fo
               + (two((mean(clean), median(clean))) if clean else "unavailable"))
         # Use same-side graphs for paired *brackets*. Individual samples
         # may have different speculative work; exact matches are above.
-        reductions = [tuple(100 * (b-c) / b for b, c in zip(times[ref], times[candidate_arm]))
-                      for ref in ("original", "original-end") for candidate_arm in ("after", "after-end")]
-        first, last = reductions[0], reductions[-1]
-        print(f"G{group} FIXED_FUSED source={FIXED_FUSED_REVISION[:8]} policy=original_per_row flag_high_post_index=0"
-              f" ref_first/end_mean/p50_us={two(times['original'])},{two(times['original-end'])}"
-              f" candidate_first/end_mean/p50_us={two(times['after'])},{two(times['after-end'])}"
-              f" reduction_pct_first/end_mean/p50={two(first)},{two(last)}"
-              f" all_brackets_reduction_pct_min/max_mean/p50={two(map(min, zip(*reductions)))},{two(map(max, zip(*reductions)))}"
-              f" slower_pct_first/end_mean/p50={two(0-v for v in first)},{two(0-v for v in last)}")
+        for name in (("after", "middle") if intermediate else ("after",)):
+            candidate_arms = (name, name + "-end")
+            reductions = [tuple(100 * (b-c) / b for b, c in zip(times[ref], times[arm]))
+                          for ref in ("original", "original-end") for arm in candidate_arms]
+            first, last = reductions[0], reductions[-1]
+            # Preserve the historical after field and first line for saved-report readers.
+            legacy = (f" slower_pct_first/end_mean/p50={two(0-v for v in first)},{two(0-v for v in last)}"
+                      if name == "after" else "")
+            print(f"G{group} FIXED_FUSED source={FIXED_FUSED_REVISION[:8]} policy=original_per_row flag_high_post_index=0"
+                  f" arm={name} revision={sources[name][:8]}"
+                  f" ref_first/end_mean/p50_us={two(times['original'])},{two(times['original-end'])}"
+                  f" candidate_first/end_mean/p50_us={two(times[name])},{two(times[name + '-end'])}"
+                  f" reduction_pct_first/end_mean/p50={two(first)},{two(last)}"
+                  f" all_brackets_reduction_pct_min/max_mean/p50={two(map(min, zip(*reductions)))},{two(map(max, zip(*reductions)))}"
+                  + legacy)
         if intermediate:
             middle_gain = [diff(b, m) for b in ("before", "before-end") for m in ("middle", "middle-end")]
             middle = [diff(b, a) for b in ("middle", "middle-end") for a in ("after", "after-end")]
