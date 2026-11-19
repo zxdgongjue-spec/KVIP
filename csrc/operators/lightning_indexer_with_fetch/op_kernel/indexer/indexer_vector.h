@@ -846,7 +846,12 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
         reserved=mrgValueLocal_.template ReinterpretCast<uint32_t>();
         result=topkSharedTmpLocal_;bitmap=topkSharedTmpLocal_[2048];
     }
-    constexpr uint32_t bitmapWords=rotating::kBitmapShards*rotating::kBitmapWords;
+    uint32_t bitmapWords=rotating::kBitmapShards*rotating::kBitmapWords;
+#if !V9_UBMEM
+    bool wideBitmap=streamingTopkOnly_ && taggedLocations_ && runtimeShape_.resident==16384 &&
+        (topkCountAlign256_+trunkLen_)*sizeof(SCORE_T)>=8200*sizeof(uint32_t);
+    if(wideBitmap) { bitmap=mrgValueLocal_.template ReinterpretCast<uint32_t>(); bitmapWords=8192; }
+#endif
     Duplicate(bitmap,uint32_t(0),bitmapWords+8);PipeBarrier<PIPE_V>();
     uint32_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
     auto row=reinterpret_cast<__gm__ rotating::Row*>(ctx->rows)+b;
@@ -856,15 +861,18 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     bool overlapSecond=false;
     if(taggedLocations_) {
         if(profile)liTicks[3]=GetSystemCycle();
+        const uint32_t words=(runtimeShape_.resident+31)/32;
+        const uint32_t shardLimit=wideBitmap ? 16 : 8;
+        const uint32_t shards=bitmapWords/words<shardLimit?bitmapWords/words:shardLimit;
         // All selected tokens for this Q share one ABC ring and its bounds.
         const uint32_t stride=uint32_t(ctx->outputStride);
         const uint32_t capacity=stride>runtimeShape_.resident?stride-runtimeShape_.resident:0;
         const uint32_t tailSize=tailEnd>tailBegin?Min(tailEnd-tailBegin,capacity):0;
         const uint32_t ringStart=tailSize?tailBegin%capacity:0;
-        Simt::VF_CALL<rotating::ClassifyPreparedLocations>(Simt::Dim3{512,1,1},runtimeShape_.history,runtimeShape_.resident,b,ctx,
+        Simt::VF_CALL<rotating::ClassifyPreparedLocationsFlex>(Simt::Dim3{512,1,1},runtimeShape_.history,runtimeShape_.resident,b,ctx,
             tailBegin,tailSize,ringStart,capacity,
             reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(result.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(bitmap[bitmapWords].GetPhyAddr()));
+            reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(bitmap[bitmapWords].GetPhyAddr()),shards);
         if(profile){SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);liTicks[4]=liTicks[5]=liTicks[6]=GetSystemCycle();}
         taggedLocations_=false;
     } else {
@@ -923,7 +931,18 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
 #endif
     }
     if(profile)liTicks[10]=GetSystemCycle();
+#if !V9_UBMEM
+    const uint32_t wordsForMerge=(runtimeShape_.resident+31)/32;
+    const uint32_t shardLimitForMerge=wideBitmap ? 16 : 8;
+    const uint32_t shardsForMerge=bitmapWords/wordsForMerge<shardLimitForMerge?bitmapWords/wordsForMerge:shardLimitForMerge;
+    Simt::VF_CALL<rotating::MergeClassifyBitmapFlex>(Simt::Dim3{512,1,1},reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()),runtimeShape_.resident,shardsForMerge,
+        reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(result.GetPhyAddr()),
+        ctx->sourceBlocks && ctx->reservedHot && wordsForMerge+16<=bitmapWords?
+            reinterpret_cast<__gm__ uint32_t*>(ctx->sourceBlocks)+uint64_t(query)*2048:nullptr,
+        reinterpret_cast<__ubuf__ uint32_t*>(bitmap[bitmapWords+1].GetPhyAddr()));
+#else
     Simt::VF_CALL<rotating::MergeClassifyBitmap>(Simt::Dim3{512,1,1},reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()),runtimeShape_.resident);
+#endif
     if(profile){SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);liTicks[11]=GetSystemCycle();}
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     GlobalTensor<uint32_t> output,bits;
@@ -932,7 +951,7 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     DataCopy(output,result,2048);DataCopy(bits,bitmap,(runtimeShape_.resident+31)/32);
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-    errors[query*32]=bitmap.GetValue(bitmapWords);kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);
+    errors[query*32+1]=bitmap.GetValue(bitmapWords+1);errors[query*32]=bitmap.GetValue(bitmapWords);kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);
     if(profile){liTicks[7]=GetSystemCycle();liTicks[8]=overlapSecond?1:0;liTicks[9]=streamingTopkOnly_?1:0;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(liTicks),128);}
 }

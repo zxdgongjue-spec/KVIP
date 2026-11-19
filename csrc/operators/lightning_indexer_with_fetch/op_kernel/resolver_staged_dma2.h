@@ -3,6 +3,10 @@
 #pragma once
 namespace rotating {
 using StagedContextPointer=__ubuf__ Context*;
+// Control words 0..7 hold counts, errors and the hash size.
+constexpr uint32_t kProtectionState = 8;
+constexpr uint32_t kProtectionActive = 1;
+constexpr uint32_t kReservationMismatch = 2;
 constexpr uint32_t kStagedRankTag = 0x80000000U;
 
 // Resolve the original prefetch mapping without modifying it.
@@ -103,7 +107,7 @@ __simt_callee__
 inline void StagedQuery(uint32_t query,uint32_t history,uint32_t resident,uint32_t bytes,
     uint32_t batch,uint32_t used,StagedContextPointer ctx,__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc,
     __ubuf__ uint32_t* keys,__ubuf__ uint32_t* ranks,__ubuf__ uint16_t* ids,__ubuf__ uint32_t* slots,
-    __ubuf__ uint32_t* scratch,__ubuf__ uint32_t* ctl) {
+    __ubuf__ uint32_t* scratch,__ubuf__ uint32_t* ctl,__gm__ uint32_t* deferredProtection=nullptr) {
     const uint32_t tid=threadIdx.x,owner=OwnerRow(ctx,batch),stride=OutputStride(resident,ctx);
     auto bitmap=ctl+1024;
     uint32_t buckets=ctl[7];
@@ -169,7 +173,37 @@ inline void StagedQuery(uint32_t query,uint32_t history,uint32_t resident,uint32
         }
         asc_syncthreads();
         uint32_t allocated=0;
-        if(added) for(uint32_t pass=0;pass<2;++pass){
+        if(deferredProtection && added && !ctl[kProtectionState]){
+            const uint32_t cursor=used+oldCount;
+            const uint32_t left=cursor<kLruSlots?kLruSlots-cursor:0;
+            allocated=added<left?added:left;
+            for(uint32_t i=tid;i<allocated;i+=512){
+                const uint32_t slot=lru[cursor+i];
+                if(slot>=resident){asc_atomic_or(ctl+1,4U);continue;}
+                // Bindings without a complete inverse LRU reservation can
+                // retain an ordinary hit in this slot. Use protected allocation.
+                if(asc_ldcg(reserved+slot)!=int32_t(cursor+i))
+                    asc_atomic_or(ctl+kProtectionState,kReservationMismatch);
+                slots[oldCount+i]=slot;
+            }
+            asc_syncthreads();
+            if(ctl[1])return;
+            if(ctl[kProtectionState]==kReservationMismatch)allocated=0;
+            if(allocated<added){
+                const uint32_t words=(resident+31)/32;
+                for(uint32_t i=tid;i<words;i+=512){
+                    bitmap[i]=asc_ldcg(deferredProtection+i)|asc_ldcg(deferredProtection+words+i)|
+                              asc_ldcg(deferredProtection+2*words+i)|asc_ldcg(deferredProtection+3*words+i);
+                }
+                asc_syncthreads();
+                for(uint32_t i=tid;i<oldCount+allocated;i+=512){
+                    uint32_t slot=slots[i];asc_atomic_or(bitmap+slot/32,1U<<(slot%32));
+                }
+                if(!tid)ctl[kProtectionState]=kProtectionActive;
+                asc_syncthreads();
+            }
+        }
+        if(allocated<added) for(uint32_t pass=0;pass<2;++pass){
             uint32_t available=0;
             for(uint32_t i=tid*4;i<(tid+1)*4;++i){
                 if((i<used)!=(pass==1))continue;
@@ -190,12 +224,12 @@ inline void StagedQuery(uint32_t query,uint32_t history,uint32_t resident,uint32
             asc_syncthreads();allocated+=n;
             if(allocated==added)break;
         }
-        for(uint32_t i=tid;i<allocated;i+=512){uint32_t slot=slots[oldCount+i];asc_atomic_or(bitmap+slot/32,1U<<(slot%32));}
+        if(!deferredProtection || ctl[kProtectionState])for(uint32_t i=tid;i<allocated;i+=512){uint32_t slot=slots[oldCount+i];asc_atomic_or(bitmap+slot/32,1U<<(slot%32));}
         asc_syncthreads();
         if(allocated<added){
             // Fallback scans beyond LRU candidates, including ordinary hits.
             // loc for future queries was populated by the protection prepass.
-            for(uint32_t i=tid;i<kSlots;i+=512){
+            if(!deferredProtection)for(uint32_t i=tid;i<kSlots;i+=512){
                 uint32_t slot=loc[i];
                 if(slot<resident)asc_atomic_or(bitmap+slot/32,1U<<(slot%32));
             }
