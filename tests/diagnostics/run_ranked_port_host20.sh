@@ -12,7 +12,7 @@ work=/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold
 inputs="$work/skip-results.po80Nw"
 build="$work/KVAF/build-npu"
 cpu="$work/KVAF/build-cpu/runtime/kvaf_cpu_service"
-ranked_sha=4814909f9b751ca3307440324641fab32fd1d80e
+ranked_sha=e749e42e802febe71deed1c513cc86b10c9c150b
 checkout() {
     local branch=$1 sha=$2 destination=$3
     git -C "$kvip" fetch --quiet origin "refs/heads/$branch"
