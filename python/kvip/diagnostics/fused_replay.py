@@ -81,6 +81,7 @@ def create_fused(
     scan_options=None,
     q_workers=2,
     topk_probe=False,
+    ranked_port=False,
 ):
     from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
     from kvip.operators.lifetch.binding import LIFetchBinding
@@ -170,6 +171,8 @@ def create_fused(
         build_options = validate_options(scan_options)
         effective.update(build_options)
     if admission is not None:
+        if ranked_port:
+            raise ValueError("Ranked port keeps the existing request admission budgets")
         if not upstream or scan_options is None or transport != "urma":
             raise ValueError("Admission experiment requires exact URMA production source")
         if tuple(admission) not in ((512, 64), (512, 128), (512, 480), (1024, 128)):
@@ -213,6 +216,11 @@ def create_fused(
         if ((ends // 2048) * 2048 <= ((r + 2047) // 2048) * 2048).any():
             raise ValueError("Snapshot has no full causal cold blocks to reverse")
     threshold_bounds = None
+    if ranked_port:
+        if not upstream or scan_options is not None or pipeline_options is not None or transport != "urma":
+            raise ValueError("Ranked integration must use its native builder without legacy flags")
+        effective["ranked_port"] = True
+        build_options["ranked_port"] = True
     if effective["recent_threshold"]:
         # Immutable per-replay bounds; all scoring/merging occurs inside forward.
         # Never substitute the current ABC start: that would omit retired pages.

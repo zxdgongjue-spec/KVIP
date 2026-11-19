@@ -208,7 +208,17 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
 
         logical = cpu_array(torch, update.logical_output)
         ordered = logical.reshape(expected.shape).astype("<i4")
-        if (
+        if bundle.tuning.get("ranked_port", False):
+            from kvip.diagnostics.selection import verify_fused_scores
+
+            # Ready frontiers can select different equal-Kth IDs. Prove every
+            # actual rank and the physical-to-logical output mapping each time;
+            # never accept an arbitrary changed set or reuse another run's misses.
+            current, selection = verify_fused_scores(archive, cpu_array(torch, rotating.arguments[9]))
+            if not np.array_equal(ordered, current.reshape(expected.shape)):
+                raise AssertionError("Ranked physical and logical TopK outputs disagree")
+            bundle.selection_comparison = selection
+        elif (
             array_digest(np.sort(ordered, axis=-1)) != bundle.selection_comparison["selected_set_sha256"]
             or array_digest(ordered) != bundle.selection_comparison["ordered_output_sha256"]
         ):
@@ -226,7 +236,7 @@ def prepare_fused_state(bundle, archive, restored, torch, device, transport):
         from kvip.diagnostics.selection import verify_fused_scores
 
         selected_expected, selection = verify_fused_scores(archive, cpu_array(torch, rotating.arguments[9]))
-        if bundle.selection_comparison and any(
+        if not bundle.tuning.get("ranked_port", False) and bundle.selection_comparison and any(
             selection[key] != bundle.selection_comparison[key]
             for key in ("selected_set_sha256", "ordered_output_sha256")
         ):
@@ -392,21 +402,22 @@ def measure(torch, kvaf, stream, bundle, args, retained, runtime=None, archive=N
             stream.synchronize()
             phase(retained, "diagnostic_verify", step)
             diagnostic_reads = verify()
-            diagnostic_samples.append(
-                dict(
-                    **decode_profile(
-                        cpu_array(torch, bundle.forward.times),
-                        batch=bundle.forward.batch,
-                        workers=bundle.forward.q_workers,
-                        resolver_cores=bundle.forward.resolver_cores,
-                        transport=args.transport,
-                        threshold_markers=not bool(getattr(args, "upstream_root", None))
-                        and args.transport == "urma"
-                        and getattr(bundle, "tuning", {}).get("recent_profile", True),
-                    ),
-                    reads=diagnostic_reads,
+            if getattr(args, "ranked_port", False):
+                from kvip.diagnostics.ranked_port import window_diagnostics
+
+                diagnostic = window_diagnostics(torch, bundle.rotating, stream)
+            else:
+                diagnostic = decode_profile(
+                    cpu_array(torch, bundle.forward.times),
+                    batch=bundle.forward.batch,
+                    workers=bundle.forward.q_workers,
+                    resolver_cores=bundle.forward.resolver_cores,
+                    transport=args.transport,
+                    threshold_markers=not bool(getattr(args, "upstream_root", None))
+                    and args.transport == "urma"
+                    and getattr(bundle, "tuning", {}).get("recent_profile", True),
                 )
-            )
+            diagnostic_samples.append(dict(**diagnostic, reads=diagnostic_reads))
             if getattr(bundle, "tuning", {}).get("window_probe"):
                 from kvip.diagnostics.window_probe import decode
 
@@ -568,6 +579,7 @@ def measure_case(args, archive, context, retained):
             scan_options=getattr(args, "scan_options", None),
             q_workers=getattr(args, "pipeline_q_workers", 2),
             topk_probe=getattr(args, "probe_only", False),
+            ranked_port=getattr(args, "ranked_port", False),
         )
         case_retained["bundle"] = bundle
         record_memory(torch, device, retained, "bundle_ready")

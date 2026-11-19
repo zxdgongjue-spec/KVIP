@@ -53,8 +53,10 @@ def arguments(argv=None):
         choices=tuple(VARIANTS),
     )
     p.add_argument("--scan-variants", nargs="+", choices=tuple(SCAN_VARIANTS))
+    p.add_argument("--ranked-port", action="store_true",
+                   help="Donor incremental Top2048 only, existing Fetch/resolve")
     p.add_argument("--cold-windows", type=int, choices=(8,),
-                   help="Eight cold windows plus the resident publication (9 native rounds)")
+                   help="Eight cold-only Fetch windows on a corrected native checkout")
     p.add_argument("--compare-layout", action="store_true",
                    help="Compare persistent post-state outside timing, including repeat drift")
     p.add_argument("--isolate-variants", action="store_true",
@@ -129,7 +131,12 @@ def arguments(argv=None):
         or not set(args.profile_variants) <= set(args.scan_variants)
     ):
         p.error("profile-variants requires profile-dir and a subset of scan-variants")
-    if (args.cold_windows is not None or args.compare_layout) and args.study != "scan-order":
+    if args.ranked_port and (
+        args.study != "threshold" or not args.upstream_root or args.mode != "fused"
+        or args.transport != "urma" or args.threshold_policy != "recent"
+    ):
+        p.error("ranked-port requires exact URMA fused recent threshold study")
+    if (args.cold_windows is not None or args.compare_layout) and args.study != "scan-order" and not args.ranked_port:
         p.error("cold-windows/compare-layout requires study=scan-order")
     if args.compare_layout and args.scan_variants != ["forward", "reverse", "reverse-end", "forward-end"]:
         p.error("compare-layout requires forward reverse reverse-end forward-end")

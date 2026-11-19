@@ -17,6 +17,18 @@ def configure_windows(archive, cold_windows):
 
     if cold_windows != 8:
         raise ValueError("This audit fixes eight cold windows")
+    import kvip.operators.lifetch.geometry as geometry
+    if getattr(geometry, "COLD_FETCH_ONLY", False):
+        original = archive.manifest["geometry"]
+        g = dict(original, requested_windows=8, rounds=8, service_lanes=8)
+        layout = li_geometry(g["batch"], "auto", 8, g["aic_count"])
+        boundaries = trigger_tokens(g["batch"], g["history"], g["resident"], "auto", 8, g["aic_count"])
+        if g["batch"] != 16 or layout["service_aivs_per_window"] != 8 or len(boundaries) != 8 or boundaries[0] <= g["resident"] or boundaries[-1] != g["history"]:
+            raise ValueError("Expected 8 cold-only Fetch windows with 8 AIVs each")
+        archive.manifest = dict(archive.manifest, geometry=g, layout_audit_schedule=dict(
+            source_requested_windows=original["requested_windows"], cold_windows=8,
+            resident_publications=0, native_rounds=8, service_lanes=8, boundaries=boundaries))
+        return
     original = archive.manifest["geometry"]
     g = dict(original, requested_windows=cold_windows + 1)
     layout = li_geometry(g["batch"], "auto", g["requested_windows"], g["aic_count"])

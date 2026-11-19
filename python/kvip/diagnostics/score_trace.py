@@ -31,6 +31,10 @@ def read_score_keys(torch, rotating):
     participates in timing. Reject core reuse, which would leave only the last
     request's scores in each core's workspace.
     """
+    if getattr(rotating, "ranked_port", False):
+        from kvip.diagnostics.ranked_port import score_keys
+
+        return score_keys(torch, rotating)
     shape = rotating.runtime_shape
     batch, history, split, cores = (int(getattr(shape, name)) for name in ("batch", "history", "splitQ", "liCores"))
     if split not in (0, 1) or not 1 <= batch <= 16 or history <= 0 or history % 256:
