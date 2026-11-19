@@ -82,7 +82,8 @@ def save_summary(directory, rows):
         writer.writeheader()
         writer.writerows(rows)
     temporary.replace(directory / 'results.csv')
-    batched = any(row.get('serial_timing_protocol') == 'one_profiled_graph' for row in rows)
+    batched = any(row.get(f'{path}_timing_protocol') == 'one_profiled_graph'
+                  for row in rows for path in ('serial', 'fused'))
     headers = ['#', 'Transport', 'BS', 'Miss%', 'Execution', 'Check',
                'Serial mean', 'Fused mean', 'Gain', 'Serial p50/p99', 'Fused p50/p99']
     if batched:
@@ -161,8 +162,9 @@ def collect_results(directory, config, exit_code):
         row = comparison_row(str(path.parent.relative_to(directory)), timing.get('native_chain'),
                              timing.get('prototype_with_update'), correct,
                              execution=report.get('execution', 'INCOMPLETE' if path.name == 'completed_timings.json' else 'COMPLETED'))
-        if report.get('serial_only') and getattr(config, 'serial_only', False) and timing.get('native_chain'):
-            row.update(timing='COMPLETE', accepted=(row['execution'] == 'COMPLETED' and correct == 'PASS'))
+        for flag, key in (('serial_only', 'native_chain'), ('fused_only', 'prototype_with_update')):
+            if report.get(flag) and getattr(config, flag, False) and timing.get(key):
+                row.update(timing='COMPLETE', accepted=(row['execution'] == 'COMPLETED' and correct == 'PASS'))
         row.update(batch=batch, transport=config.transport, mode=config.mode, report=str(path),
                    seed=getattr(config, 'seed', None), miss_percent=report.get('miss_percent', getattr(config, 'miss_percent', None)),
                    history=getattr(config, 'history', None), resident=getattr(config, 'resident', None),

@@ -393,7 +393,8 @@ def dispatch(config):
                         print(f'CHECK COVERAGE {name}: padding={phases.get("padding", "not_requested")} '
                               f'transfer={phases.get("transfer", [])}; source={source}', flush=True)
             stopped = not (directory / 'worker-result.json').is_file()
-            if job.mode == 'diagnose' and not getattr(job, 'serial_only', False):
+            if (job.mode == 'diagnose' and not getattr(job, 'serial_only', False)
+                    and not getattr(job, 'fused_only', False)):
                 from diagnostics import summarize
                 diagnostic = summarize(directory, job)
                 if diagnostic['trace'] != 'COMPLETE':
@@ -4153,17 +4154,20 @@ def run_real(config, directory):
         source_paths=[str(ref.manifest_path) for refs in sequence.rounds for ref in refs]))
     results = {}
     serial_only = getattr(config, 'serial_only', False)
-    for name in (('serial',) if serial_only else ('serial', 'fused')):
-        results[name] = run_path(config, directory / name, sequence, pages, fused=name == 'fused')
-        # Preserve completed serial timing even if the fused worker later fails.
-        report = dict(batch=initial.geometry['batch'], input='real', correctness='NOT_RUN',
-                      execution='INCOMPLETE', timing={'native_chain': results['serial']['all_rounds']})
-        if serial_only:
-            report.update(serial_only=True, execution='COMPLETED', correctness=results['serial']['correctness'])
-        elif 'fused' in results:
+    fused_only = getattr(config, 'fused_only', False)
+    paths = tuple(name for name, enabled in (('serial', not fused_only), ('fused', not serial_only)) if enabled)
+    report = dict(batch=initial.geometry['batch'], input='real', correctness='NOT_RUN',
+                  execution='INCOMPLETE', timing={})
+    if len(paths) == 1:
+        report[f'{paths[0]}_only'] = True
+    for name in paths:
+        fused = name == 'fused'
+        result = run_path(config, directory / name, sequence, pages, fused=fused)
+        results[name] = result
+        report['timing']['prototype_with_update' if fused else 'native_chain'] = result['all_rounds']
+        if name == paths[-1]:
             report.update(execution='COMPLETED',
                           correctness='PASS' if all(r['correctness'] == 'PASS' for r in results.values()) else 'FAIL')
-            report['timing']['prototype_with_update'] = results['fused']['all_rounds']
         atomic_json(directory / 'completed_timings.json', report)
     report['sequence'] = results
     atomic_json(directory / 'report.json', report)
