@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <latch>
 #include <memory>
+#include <mutex>
+#include <type_traits>
 #include <numeric>
 #include <random>
 #include <thread>
@@ -22,7 +24,8 @@ thread_local struct { unsigned x; } threadIdx;
 template<class T> T asc_ldcg(T *p) { return *p; }
 template<class T> void asc_stcg(T *p, T value) { *p = value; }
 void asc_threadfence() { std::atomic_thread_fence(std::memory_order_seq_cst); }
-void asc_syncthreads() {} // Transfer/CommitInvalidations use independent SIMD lanes.
+thread_local std::barrier<> *activeVFBarrier=nullptr;
+void asc_syncthreads() { if (activeVFBarrier) activeVFBarrier->arrive_and_wait(); }
 void asc_atomic_or(unsigned *p, unsigned bits) { std::atomic_ref<unsigned>(*p).fetch_or(bits); }
 enum class HardEvent { V_S };
 enum class TPosition { VECCALC };
@@ -42,10 +45,30 @@ struct TPipe {
     template<class B> void InitBuffer(B &buf, size_t bytes) { buf.words.resize((bytes + 7) / 8); }
     void Destroy() {}
 };
+namespace pipeline_ab::high_post_index {
+struct Edge;
+inline void TransferOwnedFields(Edge*,uint32_t,uint32_t,uint32_t,uint32_t,
+    uint64_t*,uint32_t*,uint64_t*,uint64_t*,uint64_t*);
+}
 namespace Simt {
 struct Dim3 { unsigned x, y, z; };
 template<auto Function, class... A> void VF_CALL(Dim3 shape, A... args) {
-    for (unsigned lane = 0; lane < shape.x; ++lane) { threadIdx.x = lane; Function(args...); }
+    // The owned-field VF contains one real block barrier. Bound the host
+    // resource requirement to a single 256-thread VF, while exercising the
+    // production entry point and its barrier. Other VFs have independent lanes.
+    if constexpr (std::is_same_v<decltype(Function),decltype(&pipeline_ab::high_post_index::TransferOwnedFields)>) {
+        static_assert(Function==&pipeline_ab::high_post_index::TransferOwnedFields);
+        static std::mutex runOneBlock;
+        std::lock_guard guard(runOneBlock);
+        std::barrier rendezvous(shape.x);
+        std::vector<std::thread> workers;
+        for (unsigned t=0;t<shape.x;++t) workers.emplace_back([&,t] {
+            threadIdx.x=t; activeVFBarrier=&rendezvous; Function(args...);
+        });
+        for (auto &worker:workers) worker.join();
+    } else {
+        for (unsigned lane=0;lane<shape.x;++lane) { threadIdx.x=lane; Function(args...); }
+    }
 }
 }
 namespace kvaf_device { constexpr uint64_t kInvalidArgs=9; }

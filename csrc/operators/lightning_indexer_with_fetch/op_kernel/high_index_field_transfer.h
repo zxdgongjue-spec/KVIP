@@ -5,8 +5,7 @@
 // four adjacent key words in every tuple, and at most one companion column.
 // Its private buffer therefore contains all originals of the fields it can overwrite.
 template<bool Scatter>
-__simt_vf__ __aicore__ LAUNCH_BOUND(256)
-inline void TransferOwnedFields(__gm__ Edge* edges, uint32_t p0, uint32_t p1, uint32_t singles,
+__simt_callee__ inline void TransferOwnedPhase(__gm__ Edge* edges, uint32_t p0, uint32_t p1, uint32_t singles,
         uint32_t lane, __gm__ uint64_t* keys, __gm__ uint32_t* scales, __gm__ uint64_t* addr,
         __gm__ uint64_t* logical, __ubuf__ uint64_t* saved) {
     if constexpr (!Scatter) TransferPairSlice(edges,p0,p1,keys,scales,addr,logical);
@@ -30,6 +29,18 @@ inline void TransferOwnedFields(__gm__ Edge* edges, uint32_t p0, uint32_t p1, ui
             else values[i]=asc_ldcg(scales+pos);
         }
     }
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(256)
+inline void TransferOwnedFields(__gm__ Edge* edges, uint32_t p0, uint32_t p1, uint32_t singles,
+        uint32_t lane, __gm__ uint64_t* keys, __gm__ uint32_t* scales, __gm__ uint64_t* addr,
+        __gm__ uint64_t* logical, __ubuf__ uint64_t* saved) {
+    TransferOwnedPhase<false>(edges,p0,p1,singles,lane,keys,scales,addr,logical,saved);
+    // A destination can be another thread's source. All 256 threads, even
+    // those without an edge, complete their own gather before any scatter.
+    asc_threadfence();
+    asc_syncthreads();
+    TransferOwnedPhase<true>(edges,p0,p1,singles,lane,keys,scales,addr,logical,saved);
     asc_threadfence();
 }
 
@@ -45,12 +56,10 @@ __aicore__ inline void ApplyOwnedFields(__gm__ Args* a,const Segment& part,uint3
     TBuf<TPosition::VECCALC> buf;
     pipe.InitBuffer(buf,(bytes+31U)&~31U);
     auto saved=reinterpret_cast<__ubuf__ uint64_t*>(buf.Get<uint32_t>().GetPhyAddr());
-    Simt::VF_CALL<TransferOwnedFields<false>>(Simt::Dim3{256,1,1},edges,part.p0,part.p1,singles,lane,
+    Simt::VF_CALL<TransferOwnedFields>(Simt::Dim3{256,1,1},edges,part.p0,part.p1,singles,lane,
         keys,scales,addr,logical,saved);
     SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
-    if (profile) { ticks[12]=GetSystemCycle(); ticks[13]=bytes; }
-    Simt::VF_CALL<TransferOwnedFields<true>>(Simt::Dim3{256,1,1},edges,part.p0,part.p1,singles,lane,
-        keys,scales,addr,logical,saved);
-    SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
+    // There is no separately timestamped scalar gather endpoint in this dispatch.
+    if (profile) { ticks[12]=0; ticks[13]=bytes; }
     pipe.Destroy();
 }
