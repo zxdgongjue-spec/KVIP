@@ -14,6 +14,13 @@ clean="$area/KVAF-de4fd37e"
 transport=a2857b460a74704114fd30a849ae38666cc2c372
 kvaf="$area/KVAF-${transport:0:8}"
 snapshot="$work/skip-results.po80Nw/g2-input"
+reuse=
+if [[ $# -eq 2 && $1 == --reuse-serial ]]; then
+    reuse=$(cd "$2/serial" && pwd -P)
+elif [[ $# -ne 0 ]]; then
+    echo 'Usage: host20_peer_fused.sh [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
+    exit 2
+fi
 mkdir -p "$area"
 out=$(mktemp -d "$area/fused.XXXXXX")
 printf 'RESULT_ROOT=%s\n' "$out"
@@ -52,8 +59,11 @@ export ASCEND_CUSTOM_OPP_PATH="${vendors[0]%/op_api/lib/libcust_opapi.so}${ASCEN
 export PYTHONPATH="$lidu/torch_extension:$root/python:$kvaf/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
 export KVAF_BATCH_GET_KERNEL="$kvaf/build-npu/bin/kvaf_execute_batch_get_kernels.o"
 export KVAF_BATCH_PUT_KERNEL="$kvaf/build-npu/bin/kvaf_execute_batch_put_kernels.o"
-if ! bash "$kvaf/build.sh" npu --without-aicpu --jobs 2 >"$out/build.log" 2>&1; then
-    tail -15 "$out/build.log" >&2; exit 1
+if [[ -z "$reuse" || ! -s "$KVAF_BATCH_GET_KERNEL" || ! -s "$KVAF_BATCH_PUT_KERNEL" ]] ||
+   ! compgen -G "$kvaf/build-npu/python/kvaf/_kvaf*.so" >/dev/null; then
+    if ! bash "$kvaf/build.sh" npu --without-aicpu --jobs 2 >"$out/build.log" 2>&1; then
+        tail -15 "$out/build.log" >&2; exit 1
+    fi
 fi
 cpu="$clean/build-cpu/runtime/kvaf_cpu_service"
 test -x "$cpu"
@@ -63,7 +73,7 @@ run_arm() (
     label=$1
     arm="$out/$label"; mkdir "$arm"
     port=$("$PYTHON" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
-    "$cpu" --listen 127.0.0.1 --port "$port" --memory-page-mode thp >"$arm/cpu.log" 2>&1 &
+    "${cpu_command[@]}" --listen 127.0.0.1 --port "$port" --memory-page-mode thp >"$arm/cpu.log" 2>&1 &
     pid=$!
     monitor=
     cleanup() {
@@ -109,5 +119,37 @@ run_arm() (
     "$PYTHON" -B "$tools/support/peer_delta.py" "$out" "$label"
 )
 cd "$root"
-for label in serial main before after before-end serial-end; do run_arm "$label"; done
+cpu_command=("$cpu")
+if [[ -n "$reuse" ]]; then
+    # Keep the original profile, timestamps and logs available in both reports.
+    ln -s "$reuse" "$out/serial"
+    "$PYTHON" -B "$tools/support/peer_delta.py" "$out" serial
+    printf 'REUSED serial=%s\n' "$reuse"
+else
+    run_arm serial
+fi
+node=$("$PYTHON" -B "$tools/support/peer_delta.py" "$out" --serial-node)
+policy=inherited
+if [[ -n "$node" ]]; then
+    if command -v numactl >/dev/null && numactl "--membind=$node" true >/dev/null 2>&1; then
+        cpu_command=(numactl "--membind=$node" "$cpu")
+        policy=membind
+    elif command -v taskset >/dev/null && [[ -r /sys/devices/system/node/node${node}/cpulist ]]; then
+        # Prefer local first touch if the container forbids set_mempolicy.
+        cpus=$(<"/sys/devices/system/node/node${node}/cpulist")
+        allowed=$("$PYTHON" -c 'import os,sys
+allowed = os.sched_getaffinity(0)
+ids = set()
+for item in sys.argv[1].split(","):
+    lo, _, hi = item.partition("-")
+    ids.update(range(int(lo), int(hi or lo) + 1))
+print(",".join(str(n) for n in sorted(ids & allowed)))' "$cpus")
+        if [[ -n "$allowed" ]] && taskset -c "$allowed" true >/dev/null 2>&1; then
+            cpu_command=(taskset -c "$allowed" "$cpu")
+            policy=local_first_touch
+        fi
+    fi
+fi
+printf 'CPU_PLACEMENT target_node=%s policy=%s actual=measured_per_arm\n' "${node:-unknown}" "$policy"
+for label in main before after before-end serial-end; do run_arm "$label"; done
 "$PYTHON" -B "$tools/support/peer_delta.py" "$out"

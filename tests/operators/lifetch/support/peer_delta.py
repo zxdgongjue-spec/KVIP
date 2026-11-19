@@ -79,9 +79,29 @@ def bridge_matches(timing):
                for v, ref in zip(scores(timing), refs))
 
 
-def placement_matches(thp):
-    return (thp['coverage_min_pct'] >= 99 and set(thp['numa_pages_overlapping_vmas']) == {'0'}
-            and thp['ub_device'] == 'udmac0d1e2')
+def transport_matches(thp):
+    return thp['coverage_min_pct'] >= 99 and thp['ub_device'] == 'udmac0d1e2'
+
+
+def single_numa_node(thp):
+    # numa_maps describes all pages of overlapping VMAs. Only a single observed
+    # node identifies their placement unambiguously; never equate two unknowns.
+    pages = thp['numa_pages_overlapping_vmas']
+    if len(pages) == 1:
+        node, count = next(iter(pages.items()))
+        if node.isdecimal() and count > 0:
+            return node
+    return None
+
+
+def pair_placement(left, right):
+    if not (transport_matches(left) and transport_matches(right)):
+        return 'thp_or_device_mismatch'
+    nodes = single_numa_node(left), single_numa_node(right)
+    if None in nodes:
+        return 'mixed_or_unknown_numa'
+    return 'matched' if nodes[0] == nodes[1] else 'different_numa'
+
 
 
 def compare(base, new):
@@ -105,15 +125,17 @@ def report(root):
         raise ValueError('necessary Get counts changed across the three candidate runs')
     metrics = {k: scores(v[0]) for k, v in rows.items()}
     bridge_ok = all(bridge_matches(rows[key][0]) for key in ('serial', 'serial-end'))
-    thp_ok = all(placement_matches(row[1]) for row in rows.values())
-    print(f'CHECK serial_within_5pct_of_clean_and_peer={bridge_ok} placement_matches_clean={thp_ok} '
+    placements = {label: pair_placement(row[1], rows['after'][1]) for label, row in rows.items()}
+    all_matched = all(value == 'matched' for value in placements.values())
+    print(f'CHECK serial_within_5pct_of_clean_and_peer={bridge_ok} all_arm_placements_match={all_matched} '
           'same_learned_route_and_necessary_Get=True units=us pairs=event_mean/span_p50')
     for name in ('serial', 'serial-end', 'main', 'before', 'before-end'):
-        print(f'GAIN after_vs_{name} {compare(metrics[name], metrics["after"])}')
-    print(f'REFERENCE after_vs_external_optimized {compare(PEER_FUSED, metrics["after"])}')
+        print(f'GAIN after_vs_{name} {compare(metrics[name], metrics["after"])} placement={placements[name]}')
+    print(f'REFERENCE after_vs_external_optimized {compare(PEER_FUSED, metrics["after"])} external_reference=true')
     for name in ('serial', 'before'):
         drifts = [b-a for a, b in zip(metrics[name], metrics[name+'-end'])]
-        print(f'DRIFT {name} end_minus_start_us={drifts[0]:+.3f}/{drifts[1]:+.3f}')
+        placement = pair_placement(rows[name][1], rows[name + '-end'][1])
+        print(f'DRIFT {name} end_minus_start_us={drifts[0]:+.3f}/{drifts[1]:+.3f} placement={placement}')
     # Historical device spans came from a different replay protocol, with the
     # same candidate kernel source. Do not subtract its unprofiled event time.
     for label in ('before', 'before-end'):
@@ -131,10 +153,12 @@ def report(root):
         pieces['overlap_adjustment'] = after['overlap_mean_us'] - before['overlap_mean_us']
         pieces['outside_spans'] = before['outside_invocations_mean_us'] - after['outside_invocations_mean_us']
         print(f'DELTA {label}_minus_after mean_us ' + ' '.join(f'{k}={v:+.3f}' for k, v in pieces.items())
-              + f' total={sum(pieces.values()):+.3f}')
+              + f' total={sum(pieces.values()):+.3f} placement={placements[label]}')
     brackets = all(c < b for label in ('before', 'before-end')
                    for c, b in zip(metrics['after'], metrics[label]))
-    print(f'OBSERVED both_metrics_beat_both_control_arms={brackets} matched_screen={bridge_ok and thp_ok}')
+    comparable = bridge_ok and all(placements[name] == 'matched' for name in ('before', 'before-end'))
+    verdict = str(brackets) if comparable else 'inconclusive'
+    print(f'OBSERVED both_metrics_beat_both_control_arms={verdict} matched_screen={bridge_ok and all_matched}')
     print(f'RESULT_ROOT={root}')
 
 
@@ -142,11 +166,19 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('root', type=Path)
     parser.add_argument('arm', nargs='?', choices=ARMS)
+    parser.add_argument('--serial-node', action='store_true',
+                        help='print a unique observed serial NUMA node for CPU memory binding')
     args = parser.parse_args()
-    if args.arm:
+    if args.serial_node:
+        if args.arm:
+            parser.error('select either --serial-node or an arm')
+        node = single_numa_node(read(args.root / 'serial' / 'thp.json'))
+        if node is not None:
+            print(node)
+    elif args.arm:
         row = load_arm(args.root, args.arm)
         arm_line(args.arm, row)
-        if args.arm == 'serial' and not (bridge_matches(row[0]) and placement_matches(row[1])):
-            raise SystemExit('BASELINE_RECHECK_FAILED: inspect the first ARM serial timing, THP, NUMA and device')
+        if args.arm == 'serial' and not (bridge_matches(row[0]) and transport_matches(row[1])):
+            raise SystemExit('BASELINE_RECHECK_FAILED: inspect the first ARM serial timing, THP and UB device')
     else:
         report(args.root)
