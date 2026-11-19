@@ -64,13 +64,7 @@ public:
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
         WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     }
-#if KVIP_RANKED_PORT
-    // Keep the one-shot rank/Post body out of the per-tile LI caller. This
-    // changes compilation boundaries only; no extra synchronization is added.
-    __attribute__((noinline)) __aicore__ void RotateFetch(uint32_t epoch, uint32_t sequenceHalfWindow = 0) {
-#else
     __aicore__ inline void RotateFetch(uint32_t epoch, uint32_t sequenceHalfWindow = 0) {
-#endif
 #if KVIP_RANKED_PORT
         AdvanceWindow(epoch,sequenceHalfWindow);
 #endif
@@ -148,11 +142,7 @@ public:
                                      bool publishShardEnd = false, bool scoreOnly = false);
     __aicore__ inline void PublishScoreProgress(const QLICommon::RunInfo &info,
                                                uint32_t progressShard = 0, bool publishShardEnd = false);
-#if KVIP_RANKED_PORT
-    __attribute__((noinline)) __aicore__ void ProcessTopK(const QLICommon::RunInfo &info, uint32_t queryRow = SIM_Q);
-#else
     __aicore__ inline void ProcessTopK(const QLICommon::RunInfo &info, uint32_t queryRow = SIM_Q);
-#endif
     __aicore__ inline void SetPrefixStorage(GM_ADDR output) { prefixOutput_ = output; }
 #if KVIP_STREAMING_LI
     __aicore__ inline void SetStreamingWorkspace(GM_ADDR workspace) { streamingWorkspace_ = workspace; }
@@ -966,9 +956,6 @@ __aicore__ inline void QLIVector<QLIT>::PublishScoreProgress(
     }
 }
 
-#if KVIP_RANKED_PORT
-#include "ranked_scan.h"
-#else
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &info, uint32_t progressShard,
                                                    bool publishShardEnd, bool scoreOnly)
@@ -1274,8 +1261,6 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);   //V核处理完，通知C核可以把mm1Res搬运到UB
 }
 
-#endif
-
 #if KVIP_STREAMING_LI
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::BeginFinalMetadata(uint32_t query)
@@ -1421,12 +1406,7 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
 #endif
 
 template <typename QLIT>
-#if KVIP_RANKED_PORT
-__attribute__((noinline)) __aicore__
-#else
-__aicore__ inline
-#endif
-void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &info, uint32_t queryRow)
+__aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &info, uint32_t queryRow)
 {
     SetFlag<HardEvent::MTE3_MTE2>(MTE3_MTE2_EVENT);
     WaitFlag<HardEvent::MTE3_MTE2>(MTE3_MTE2_EVENT);
