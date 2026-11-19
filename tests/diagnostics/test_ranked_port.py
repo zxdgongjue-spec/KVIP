@@ -14,6 +14,7 @@ def test_prefix_oracle_includes_retired_recent_and_boundary_ties():
     result = prefix_oracle(scores, ends, bounds)
     assert result["checks"] == 32
     assert result["timing"] == "NOT_SIMULATED"
+    assert result["unchanged"] + result["boundary_only"] + result["full_rank"] == result["checks"]
 
 
 def test_window_rank_timer_excludes_wait_but_open_timer_includes_it():
@@ -79,6 +80,9 @@ def test_report_uses_both_repeats_and_actual_traffic(tmp_path, capsys):
             # A slow second candidate run prevents a false positive gate.
             if name == "ranked" and run == 2:
                 case["timing"]["mean_us"] = 490
+            if run == 2 and name in ("reverse", "ranked"):
+                timeline = {key: dict(count=1, sum_us=time) for key in ("init", "li", "streaming")}
+                case["system_profiles"] = {"passes": [dict(metric="none", timeline=timeline)]}
             payload = dict(status="pass", cases={name: case}) if name != "ranked" else case
             (tmp_path / f"g7-{name}-{run}.json").write_text(json.dumps(payload))
     report(tmp_path, 7)
@@ -86,3 +90,4 @@ def test_report_uses_both_repeats_and_actual_traffic(tmp_path, capsys):
     assert "GATE ranked KEEP_BASELINES" in out
     assert "conservative_mean/P50=-2.08/+2.09%" in out
     assert "51.2/12.8/32.0/96.1" in out
+    assert "KERNEL_DELTA_US ranked-minus-reverse init/LI/resolve_update=-10.00/-10.00/-10.00" in out

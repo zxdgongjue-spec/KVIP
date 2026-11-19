@@ -12,7 +12,7 @@ work=/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold
 inputs="$work/skip-results.po80Nw"
 build="$work/KVAF/build-npu"
 cpu="$work/KVAF/build-cpu/runtime/kvaf_cpu_service"
-ranked_sha=46924fb8a71c5cafbbfa03c7de626f39464b63ff
+ranked_sha=a92b7c8cd9e72728817ad8455b01929fcafe924f
 checkout() {
     local branch=$1 sha=$2 destination=$3
     git -C "$kvip" fetch --quiet origin "refs/heads/$branch"
@@ -101,6 +101,10 @@ run_case() {
         source="$ranked"; sha="$ranked_sha"
         extra=(--study threshold --ranked-port)
         if [[ "$repeat" == 1 ]]; then diagnostics=1; fi
+    fi
+    # One independent profiler replay after this process's headline samples.
+    if [[ "$repeat" == 2 && "$name" != forward && "${RANKED_TIMELINE:-1}" == 1 ]]; then
+        extra+=(--profile-dir "$result/profiles/g${group}-$name" --profile-metrics none)
     fi
     if ! python3 -B -X faulthandler -m kvip.diagnostics.replay \
         --snapshot "$inputs/g${group}-input" --build-dir "$build" --transport urma --mode fused \

@@ -18,6 +18,7 @@ from kvip.diagnostics.archive import cpu_array, load_snapshot
 def prefix_oracle(scores, ends, bounds, resident=16384, *, skew=False):
     """Incremental strict-above-Kth selection must retain every required rank."""
     checks = candidates = delayed = 0
+    unchanged = boundary = reselect = 0
     history = scores.shape[-1]
     split = False  # Keep the current H131328 split-Q schedule.
     for row, q in np.ndindex(scores.shape[:2]):
@@ -30,7 +31,12 @@ def prefix_oracle(scores, ends, bounds, resident=16384, *, skew=False):
         ids = np.flatnonzero(seed)
         if len(ids) < 2048:
             raise ValueError("The frozen test requires at least 2048 seed scores")
-        selected = ids[np.argsort(-values[ids].astype(np.int32), kind="stable")[:2048]]
+        def native_list(population):
+            scores = values[population]
+            key = np.partition(scores, len(scores)-2048)[-2048]
+            return np.concatenate((population[scores > key], population[scores == key]))[:2048]
+
+        selected = native_list(ids)
         for epoch in range(1, 9):
             cap = resident + (history-resident)//128*epoch//8*128
             stop = min(end, cap)
@@ -46,7 +52,18 @@ def prefix_oracle(scores, ends, bounds, resident=16384, *, skew=False):
             cutoff = values[selected].min()
             offers = fresh[values[fresh] > cutoff]
             merged = np.concatenate((selected, offers))
-            selected = merged[np.argsort(-values[merged].astype(np.int32), kind="stable")[:2048]]
+            reference = native_list(merged)
+            strict = np.count_nonzero(values[selected] > cutoff)
+            if not len(offers):
+                unchanged += 1
+            elif len(offers) < 2048-strict:
+                boundary += 1
+                selected = np.concatenate((selected[:strict], offers, selected[strict:2048-len(offers)]))
+            else:
+                reselect += 1
+                selected = reference
+            if not np.array_equal(selected, reference):
+                raise AssertionError(f"Boundary shortcut changed ordered IDs row={row} q={q} epoch={epoch}")
             population = values[ready]
             kth = np.partition(population, len(population) - 2048)[-2048]
             if (len(np.unique(selected)) != 2048 or np.any(values[selected] < kth)
@@ -55,7 +72,8 @@ def prefix_oracle(scores, ends, bounds, resident=16384, *, skew=False):
             seen = ready
             candidates += len(offers)
             checks += 1
-    return dict(checks=checks, candidates=candidates, sequence_split=split, skew=skew, delayed_windows=delayed, timing="NOT_SIMULATED")
+    return dict(checks=checks, candidates=candidates, sequence_split=split, skew=skew, delayed_windows=delayed,
+                unchanged=unchanged, boundary_only=boundary, full_rank=reselect, timing="NOT_SIMULATED")
 
 
 def score_keys(torch, rotating):
@@ -200,6 +218,7 @@ def report(root, group):
     print(f"RESULT_BEGIN G{group}")
     print("CHECK full_scores_TopK_KV_Index=PASS seed_final_thresholds=IDENTICAL; BF16-tied IDs may differ")
     print("variant mean_us(first/last) P50_us(first/last) drift_mean/P50% miss% useful/waste/repair/total_KiB")
+    kernel_times = {}
     for name, pair in cases.items():
         times = [c["timing"] for c in pair]
         reads = [r for c in pair for r in c["reads_samples"]]
@@ -211,6 +230,18 @@ def report(root, group):
         print(f"{name:12} {times[0]['mean_us']:.2f}/{times[1]['mean_us']:.2f} "
               f"{times[0]['p50_us']:.2f}/{times[1]['p50_us']:.2f} {drift[0]:+.2f}/{drift[1]:+.2f} {miss:.4f} "
               + "/".join(f"{x:.1f}" for x in traffic))
+        for profile in pair[-1].get("system_profiles", {}).get("passes", []):
+            if profile.get("metric") != "none":
+                continue
+            timeline = profile.get("timeline") or {}
+            kernels = [timeline.get(key) for key in ("init", "li", "streaming")]
+            if all(stage and stage.get("count") == 1 for stage in kernels):
+                kernel_times[name] = [stage["sum_us"] for stage in kernels]
+                print(f"KERNEL_US {name} init/LI/resolve_update="
+                      + "/".join(f"{value:.2f}" for value in kernel_times[name])
+                      + " separate_profile=1")
+            else:
+                print(f"KERNEL_US {name} unavailable_or_multiple_kernels")
         samples = pair[0].get("native_diagnostics", {}).get("samples", [])
         if name == "ranked" and samples:
             windows = samples[0]["windows"]
@@ -224,6 +255,10 @@ def report(root, group):
                 value = windows[key]
                 fields.append(f"{key}={value['mean']:.2f}/{value['p50']:.2f}" if value["n"] else f"{key}=NA")
             print("WINDOW mean/P50_us " + " ".join(fields))
+    if "ranked" in kernel_times and "reverse" in kernel_times:
+        deltas = [a-b for a, b in zip(kernel_times["ranked"], kernel_times["reverse"])]
+        print("KERNEL_DELTA_US ranked-minus-reverse init/LI/resolve_update="
+              + "/".join(f"{value:+.2f}" for value in deltas) + " separate_profile=1")
     for name in names[2:]:
         gains = []
         for baseline in names[:2]:
