@@ -78,9 +78,11 @@ def summarize(values):
     return dict(n=len(values), mean=float(np.mean(values)), p50=float(np.median(values))) if values else dict(n=0)
 
 
-def decode_windows(raw, rounds, lanes, rate):
+def decode_windows(raw, rounds, lanes, rate, *, split=False):
     events = np.ascontiguousarray(raw).view("<u8").reshape(rounds, lanes, 16)
     buckets = {name: [] for name in ("predecessor_wait", "rank_update", "open_to_first_post", "open_to_return")}
+    if split:
+        buckets.update(post_wait=[], combined_wait=[], post_work=[])
     records = []
     for epoch in range(rounds):
         for lane in range(lanes):
@@ -92,6 +94,13 @@ def decode_windows(raw, rounds, lanes, rate):
                 raise ValueError(f"Invalid ranked window clocks epoch={epoch} lane={lane}")
             intervals = dict(predecessor_wait=begin_rank-opened, rank_update=end_rank-begin_rank,
                              open_to_return=end-opened)
+            if split:
+                # Ranked ABI 140 stores ordered-post wait cycles in word 8.
+                post_wait = int(event[8])
+                if post_wait > end-end_rank:
+                    raise ValueError("Post wait exceeds time after rank")
+                intervals.update(post_wait=post_wait, combined_wait=begin_rank-opened+post_wait,
+                                 post_work=end-end_rank-post_wait)
             if first:
                 if not end_rank <= first <= end:
                     raise ValueError("First doorbell is outside the completed ranked service")
@@ -99,6 +108,8 @@ def decode_windows(raw, rounds, lanes, rate):
             for name, cycles in intervals.items():
                 buckets[name].append(cycles/rate)
             records.append(dict(epoch=epoch, lane=lane, **{k: v/rate for k, v in intervals.items()}))
+    if split and len(records) != rounds*lanes:
+        raise ValueError(f"Missing ranked window markers: {len(records)} of {rounds*lanes}")
     if not records:
         raise ValueError("No ranked cold-window timestamps were captured")
     return dict(units="us", ticks_per_us=rate, windows={k: summarize(v) for k, v in buckets.items()},
@@ -129,7 +140,8 @@ def window_diagnostics(torch, rotating, stream):
         rates.append(cycles/elapsed)
     if np.ptp(rates)/np.median(rates) > .05:
         raise ValueError(f"Unstable ranked clock calibration: {rates}")
-    result = decode_windows(raw, rotating.rounds, rotating.service_lanes, float(np.median(rates)))
+    result = decode_windows(raw, rotating.rounds, rotating.service_lanes, float(np.median(rates)),
+                            split=hasattr(rotating, "ranked_offers"))
     headers = cpu_array(torch, rotating.ranked_state).view(np.uint64)
     result["pipeline"] = dict(
         queries=int(headers.shape[0]*headers.shape[1]),
@@ -206,7 +218,9 @@ def report(root, group):
             print(f"PIPELINE next_query_dma={pipeline['next_query_dma']}/{pipeline['queries']} "
                   f"staged_metadata={pipeline['staged_metadata']}/{pipeline['queries']} lanes={pipeline['lanes']}")
             fields = []
-            for key in ("rank_update", "predecessor_wait", "open_to_first_post", "open_to_return"):
+            for key in ("rank_update", "predecessor_wait", "post_wait", "combined_wait", "post_work", "open_to_first_post", "open_to_return"):
+                if key not in windows:
+                    continue
                 value = windows[key]
                 fields.append(f"{key}={value['mean']:.2f}/{value['p50']:.2f}" if value["n"] else f"{key}=NA")
             print("WINDOW mean/P50_us " + " ".join(fields))

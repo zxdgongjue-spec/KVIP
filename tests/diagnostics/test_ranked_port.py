@@ -24,6 +24,13 @@ def test_window_rank_timer_excludes_wait_but_open_timer_includes_it():
     assert result["windows"]["predecessor_wait"]["mean"] == 10
     assert result["windows"]["open_to_first_post"]["mean"] == 23
     assert result["windows"]["open_to_return"]["mean"] == 25
+    raw[0, 0, 8] = 30
+    split = decode_windows(raw[:1, :1], 1, 1, 10, split=True)["windows"]
+    assert split["post_wait"]["mean"] == 3
+    assert split["post_work"]["mean"] == 2
+    assert split["combined_wait"]["mean"] == 13
+    with pytest.raises(ValueError, match="Missing ranked window markers"):
+        decode_windows(raw, 8, 2, 10, split=True)
     raw[0, 0, 11] = 250
     with pytest.raises(ValueError, match="First doorbell"):
         decode_windows(raw, 8, 2, 10)
