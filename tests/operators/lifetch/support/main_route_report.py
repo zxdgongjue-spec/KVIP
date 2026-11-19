@@ -28,6 +28,13 @@ def read_result(root, label):
         raise ValueError(f'{label}: LI dispatch count changed within the measured graph')
     timing['li_dispatch_mean_us'] = [mean(end - start for start, end in one_dispatch)
                                       for one_dispatch in zip(*li_intervals)]
+    timing['stage_p50_us'] = {k: median(s['stages_us'][k] for s in profile['samples'])
+                              for k in timing['stage_mean_us']}
+    if label == 'serial':
+        timing['tail_p50_us'] = median(s['stages_us']['lidu_prepare'] + s['stages_us']['fetch']
+                                       for s in profile['samples'])
+    else:
+        timing['tail_p50_us'] = timing['stage_p50_us']['resolve_update']
     return timing, placement, detail
 
 
@@ -49,7 +56,8 @@ def print_arm(label, timing, detail):
     print(f"ARM {label} event_mean={timing['event_mean_us']:.3f} span_p50={timing['p50_us']:.3f} "
           f"span_mean={timing['profiler_mean_us']:.3f} "
           f"within_graph_last5_minus_first5_mean/p50={mean(last)-mean(first):+.3f}/{median(last)-median(first):+.3f}")
-    print('KERNEL '+label+' '+' '.join(f'{k}={v:.3f}' for k, v in timing['stage_mean_us'].items())
+    print('KERNEL '+label+' mean/p50 '+' '.join(f"{k}={v:.3f}/{timing['stage_p50_us'][k]:.3f}"
+                                                for k, v in timing['stage_mean_us'].items())
           + f" gap={timing['inter_kernel_gap_mean_us']:.3f} overlap={timing['overlap_mean_us']:.3f}"
             f" outside_calls={timing['outside_invocations_mean_us']:.3f}")
     if len(timing['li_dispatch_mean_us']) > 1:
@@ -60,6 +68,7 @@ def print_arm(label, timing, detail):
         if 'measured_route' in detail:
             observed = detail['measured_route']
             print(f"ROUTE {label} measured_low/high={observed['low']}/{observed['high']} "
+                  f"feedback_reads_p50={median(observed['feedback_demand_per_call']):g} "
                   f"diagnostic_plan_rows={detail['direct_plan_rows']}")
         print('TRAFFIC '+label+' '+' '.join(
             f"{k}={number(v['p50'])}[{number(v['min'])},{number(v['max'])}]"
@@ -69,6 +78,12 @@ def print_arm(label, timing, detail):
         groups = detail['diagnostic_final_get_submitted_groups']
         print(f'WINDOW {label} tokens_p50={window_counts} nonempty_requests_p50={active_requests} '
               f"final_Get_submitted_groups_p50={number(groups['p50'])}")
+        for window in detail['window_stages']:
+            if not window['service_us']['n']:
+                continue
+            print(f"WINDOW_TIME {label} epoch={window['epoch']} p50/max " +
+                  ' '.join(f"{k}={number(window[k]['p50_us'])}/{number(window[k]['max_us'])}"
+                           for k in ('service_us','scan_us','candidate_us','post_us','predecessor_wait_us')))
         stages = detail['stages']
         fields = []
         for name, metric in stages.items():
@@ -94,8 +109,10 @@ def report(root, *, gains_only=False):
             print(f"GAIN {name}_vs_{baseline} event_mean={saved(ref['event_mean_us'], current['event_mean_us'])} "
                   f"span_p50={saved(ref['p50_us'], current['p50_us'])} "
                   f"placement={pair_placement(placement, ref_place)}")
-            print(f"KERNEL_DELTA {name}_vs_{baseline} saved_li={other['li']-stages['li']:+.3f} "
-                  f"saved_tail={other_tail-stages['resolve_update']:+.3f} "
+            print(f"KERNEL_DELTA {name}_vs_{baseline} saved_li_mean/p50={other['li']-stages['li']:+.3f}/"
+                  f"{ref['stage_p50_us']['li']-current['stage_p50_us']['li']:+.3f} "
+                  f"saved_tail_mean/p50={other_tail-stages['resolve_update']:+.3f}/"
+                  f"{ref['tail_p50_us']-current['tail_p50_us']:+.3f} "
                   f"saved_gap={ref['inter_kernel_gap_mean_us']-current['inter_kernel_gap_mean_us']:+.3f} "
                   f"overlap_adjustment={current['overlap_mean_us']-ref['overlap_mean_us']:+.3f} "
                   f"saved_outside_calls={ref['outside_invocations_mean_us']-current['outside_invocations_mean_us']:+.3f}")
