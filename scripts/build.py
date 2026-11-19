@@ -140,8 +140,6 @@ def main():
         runtime_preflight()
     dependency = (args.kvaf_root or ROOT / "third_party/KVAF").resolve()
     prepare_dependency(dependency, args.transport)
-    if not applies(dependency, "kvaf-cq-failure", True):
-        apply_patch(dependency, "kvaf-cq-failure")
     (ROOT / "build").mkdir(exist_ok=True)
     build_dir = dependency / "build-npu"
     state = dict(kvaf=str(dependency), revision=REVISION, transport=args.transport, kvaf_build_dir=str(build_dir))

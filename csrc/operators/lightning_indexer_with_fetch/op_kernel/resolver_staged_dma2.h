@@ -245,10 +245,7 @@ inline void StagedQuery(uint32_t query,uint32_t history,uint32_t resident,uint32
             if(!tid && ctl[544+512/warpSize-1]<added-allocated)ctl[1]=4;
             for(uint32_t i=tid*per;i<(tid+1)*per && i<words;++i){offsets[i]=off;off+=counts[i];}
             asc_syncthreads();
-            // No slot list exists on allocation failure. All lanes have joined
-            // the capacity check above; exit before reading stale UB slot IDs.
-            if(ctl[1])return;
-            kvip_hot_slots::WriteAvailableBitmapSlotsBody(bitmap,counts,offsets,
+            if(!ctl[1])kvip_hot_slots::WriteAvailableBitmapSlotsBody(bitmap,counts,offsets,
                 reinterpret_cast<__ubuf__ int32_t*>(slots),resident,0,words,0,added-allocated,oldCount+allocated);
             asc_syncthreads();
             for(uint32_t i=tid+allocated;i<added;i+=512){uint32_t slot=slots[oldCount+i];asc_atomic_or(bitmap+slot/32,1U<<(slot%32));}

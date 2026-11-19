@@ -246,32 +246,16 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
  uint32_t inputError=0,upperMisses=0;bool bounded=true;
  if(!a->queryBitmaps || !a->queryErrors || !a->updateBindings || !a->packedFetch || !ctx->hotValid || !ctx->changeCount || row->slots>kPrefetch ||
     shape.history!=a->history || shape.resident!=a->resident || shape.resident>131072 || shape.finalWorkers!=4 || a->maxEvents<kPrefetch+kSlots)inputError=1;
- uint32_t badQuery=0,classifySite=0;
  if(!inputError){auto errors=reinterpret_cast<__gm__ uint32_t*>(a->queryErrors)+(b*4)*32;
-  for(uint32_t q=0;q<4;++q){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+q*32),128);if(!inputError && errors[q*32]){badQuery=q+1;classifySite=errors[q*32+2];}inputError|=errors[q*32];uint32_t n=errors[q*32+1]-1;
+  for(uint32_t q=0;q<4;++q){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+q*32),128);inputError|=errors[q*32];uint32_t n=errors[q*32+1]-1;
    if(n>kCompactMissLimit)bounded=false;else upperMisses+=n;}}
- if(inputError){
-  // Failure-only feedback: producer owns this row before the final join.
-  row->snapshot[15][0]=0x4c460000U+(badQuery?2U:1U);
-  uint32_t guard=!a->queryBitmaps?1:!a->queryErrors?2:!a->updateBindings?3:!a->packedFetch?4:
-      !ctx->hotValid?5:!ctx->changeCount?6:row->slots>kPrefetch?7:shape.history!=a->history?8:
-      shape.resident!=a->resident?9:shape.resident>131072?10:shape.finalWorkers!=4?11:12;
-  if(badQuery){
-   auto e=reinterpret_cast<__gm__ uint32_t*>(a->queryErrors)+(b*4+badQuery-1)*32;
-   row->snapshot[14][0]=e[3];row->snapshot[14][1]=e[4];row->snapshot[14][2]=shape.history;
-   if(classifySite==4){row->snapshot[13][0]=e[5];row->snapshot[13][1]=e[6];}
-   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->snapshot[13]),32);
-  }
-  row->snapshot[15][1]=badQuery;row->snapshot[15][2]=badQuery?classifySite:guard;
-  row->snapshot[15][3]=inputError;
-  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->snapshot[15]),16);
-  auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*32;status[0]=inputError;status[1]=0;
+ if(inputError){auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*32;status[0]=inputError;status[1]=0;
   if(ctx->changeCount){
    auto count=reinterpret_cast<__gm__ uint32_t*>(ctx->changeCount)+b;
    count[0]=kLruSlots;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(count),4);
   }
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),128);
-  for(uint32_t q=0;q<kFlagCount;++q){if((KVIP_OUTPUT_WORKER && q>=1 && q<=4) || q==6 || (q>=7 && q<12))continue;flags[q].count=0;flags[q].error=inputError;flags[q].ready=1;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+q),kBatchFlagPayloadBytes);}
+  for(uint32_t q=0;q<kFlagCount;++q){if(q==6 || (q>=7 && q<12))continue;flags[q].count=0;flags[q].error=inputError;flags[q].ready=1;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+q),kBatchFlagPayloadBytes);}
   return;}
  TPipe pipe;TBuf<TPosition::VECCALC> scratch;pipe.InitBuffer(scratch,kFinalScratchBytes);auto local=scratch.Get<uint32_t>();
  Simt::VF_CALL<PublishPrefetch>(Simt::Dim3{512,1,1},reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+b*10240,
@@ -423,8 +407,6 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
   SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
   }
   if(profile)ticks[14+q*5]=GetSystemCycle();
-  if(error){row->snapshot[15][0]=0x4c460003U;row->snapshot[15][1]=q+1;row->snapshot[15][2]=compact;row->snapshot[15][3]=error;
-   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->snapshot[15]),16);}
   uint32_t published=KVIP_OUTPUT_WORKER?kRawQueryFlag+q:q+1;
   flags[published].reserved[0]=compact && earlyFetch;flags[published].count=added;flags[published].error=error;flags[published].ready=1;
   if(profile)ticks[4+q]=GetSystemCycle();status[4+q]=added;status[8+q]=total;
@@ -661,15 +643,7 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
   }
   seen+=count;
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-  error=local.GetValue(CONTROL);
-  if(error){
-   auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
-   row->snapshot[4][0]=0x4c460005U;row->snapshot[4][1]=phase;
-   row->snapshot[4][2]=error==1?local.GetValue(CONTROL+8):6;row->snapshot[4][3]=error;
-   for(uint32_t j=0;j<3 && error==1;++j)row->snapshot[5][j]=local.GetValue(CONTROL+9+j);
-   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->snapshot[4]),32);
-  }
-  if(profile)ticks[13+2*phase]=GetSystemCycle();if(phase)total+=count;
+  error=local.GetValue(CONTROL);if(profile)ticks[13+2*phase]=GetSystemCycle();if(phase)total+=count;
  }
  if(!error){uint64_t start=GetSystemCycle();while(true){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+4),kBatchFlagPayloadBytes);if(flags[4].ready){error=flags[4].error;break;}if(GetSystemCycle()-start>5000000000ULL){error=8;break;}}}
  if(!error){auto update=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);uint64_t addressStride=update[7];if(profile)ticks[22]=GetSystemCycle();
@@ -747,7 +721,7 @@ inline void PublishStreamingResidency(uint32_t resident,uint32_t postOffset,__gm
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void PublishQueryCompletion(__gm__ Context* ctx,__gm__ BatchFlag* flags,
  uint32_t batch,uint32_t resident,uint32_t postOffset,uint32_t q,uint32_t lane,
- uint32_t workers,uint64_t error,uint32_t completed,bool deferredResidency,uint32_t getPhase) {
+ uint32_t workers,uint64_t error,uint32_t completed,bool deferredResidency) {
  // Each warp owns a request; eight requests no longer run serially in one VF.
  constexpr uint32_t lanesPerRequest=32,requestsPerWave=256/lanesPerRequest;
  for(uint32_t b=lane+(threadIdx.x/lanesPerRequest)*workers;b<batch;b+=requestsPerWave*workers){
@@ -771,7 +745,6 @@ inline void PublishQueryCompletion(__gm__ Context* ctx,__gm__ BatchFlag* flags,
  asc_threadfence();asc_syncthreads();
  for(uint32_t b=lane+threadIdx.x*workers;b<batch;b+=256*workers){
   auto flag=flags+b*kFlagCount+8+q;
-  if(error)asc_stcg(&flag->reserved[1],getPhase);
   asc_stcg(&flag->reserved[0],uint32_t(deferredResidency));asc_stcg(&flag->error,uint32_t(error));asc_threadfence();asc_stcg(&flag->ready,1U);
  }
  asc_threadfence();
@@ -898,7 +871,7 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
  if(!args.batch_get_max_inflight_total)args.batch_get_max_inflight_total=kBatchGetInflight;
  auto compactAddresses=reinterpret_cast<__gm__ uint64_t*>(packed);
  if(groupLayout){args.address_table=uint64_t(compactAddresses);args.table_capacity=stride;}
- uint64_t error=0;uint32_t completed=0,requested=0,getPhase=0;bool hasConflict=false;
+ uint64_t error=0;uint32_t completed=0,requested=0;bool hasConflict=false;
  for(uint32_t phase=0;phase<2 && !error;++phase){
   if(phase && skipEmptyConflict && !hasConflict)break;
   uint64_t prepareStart=profile?GetSystemCycle():0;
@@ -983,17 +956,13 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
    uint64_t oldProfile=0;
    if(profile){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),sizeof(*status));oldProfile=status->profile.magic;
     status->profile.magic=KVAF_AIV_BATCH_GET_PROFILE_MAGIC;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&status->profile),sizeof(status->profile));}
-   start=GetSystemCycle();kvaf_device::KvafBatchGetDevice(args,0,0,size,allFlags[lane*kFlagCount+8+q].reserved+2);end=GetSystemCycle();
+   start=GetSystemCycle();kvaf_device::KvafBatchGetDevice(args,0,0,size);end=GetSystemCycle();
    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),2*sizeof(*queue));
    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),sizeof(*status));
    if(profile){postCycles=status->profile.post_active_cycles;waitCycles=status->profile.drain_wait_cycles;groups=status->profile.submitted_group_count;
     status->profile.magic=oldProfile;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&status->profile),sizeof(status->profile));}
    error|=status->result;completed+=status->completed_batch_count;
-   // KVAF returns an enum. A failed Get can legitimately process fewer
-   // descriptors; preserve the transport result instead of OR-ing two enums.
-   if(status->magic!=KVAF_AIV_BATCH_GET_STATUS_MAGIC)error=kvaf_device::kInvalidArgs;
-   else if(status->result)getPhase=1+phase;
-   else if(status->processed_request_count!=size)error=kvaf_device::kInvalidArgs;
+   if(status->magic!=KVAF_AIV_BATCH_GET_STATUS_MAGIC || status->processed_request_count!=size)error|=kvaf_device::kInvalidArgs;
   }
 #else
   if(size)error|=kvaf_device::kInvalidArgs;
@@ -1025,7 +994,7 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
   }
   if(profile)trace[13]=GetSystemCycle();
   Simt::VF_CALL<PublishQueryCompletion>(Simt::Dim3{256,1,1},ctx,allFlags,shape.batch,
-      shape.resident,shape.finalPostOffset,q,lane,workers,error,completed,deferredResidency,getPhase);
+      shape.resident,shape.finalPostOffset,q,lane,workers,error,completed,deferredResidency);
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
   uint64_t published=profile?GetSystemCycle():0;
   if(profile){trace[14]=published;
@@ -1174,31 +1143,6 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
  if(profile)ft[2]=GetSystemCycle();
  info[0]|=uint32_t(error);info[3]=deferred?1:0;info[4]=completed;
  if(!error)row->finalPending=0;
-#if !V9_UBMEM
- if(error){
-  // Flags 8..11 have joined. Keep each Q's raw failure in the existing
-  // feedback copy, before retirement clears the live flags.
-  uint32_t codes=0;
-  for(uint32_t q=0;q<4;++q){
-   uint32_t code=flags[8+q].error;
-   if(code){
-    uint32_t phase=flags[8+q].reserved[1];
-    codes|=((phase<<6)|(code<63U?code:63U))<<(8*q);
-   }
-  }
-  row->finalQueryErrors=codes;
-  uint32_t workers=(a->prefetchCount>>16)&0xffU;
-  for(uint32_t q=0;q<4 && workers;++q){
-   auto completion=flags+8+q;
-   if(!completion->reserved[1] || (completion->error!=kvaf_device::kCqTimeout && completion->error!=kvaf_device::kCqError))continue;
-   auto groupFlag=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+(b%workers)*kFlagCount+8+q;
-   auto source=groupFlag->reserved+2;
-   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(source),16*4);
-   for(uint32_t i=0;i<16;++i)row->snapshot[16+4*q+i/4][i%4]=source[i];
-   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->snapshot[16+4*q]),64);
-  }
- }
-#endif
 #if V9_UBMEM
  auto status=UbmemStatusAt(ctx,b);status[0]=error|updateError;status[1]=row->requests;
  status[3]=total;status[4]=completed;status[5]=(status[2]+completed)*shape.tokenBytes;
