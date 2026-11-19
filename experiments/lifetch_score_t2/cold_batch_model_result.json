@@ -1,0 +1,45 @@
+{
+  "date": "2026-11-19",
+  "scope": "Actual ProcessPrecomputedVec1 Cold consumer; no Service, Final TopK, Fetch or Index commit",
+  "source_revision": "7345cc9d49a941bc043e1a6d13415fe77bc179d8",
+  "cann": "9.1.0",
+  "soc_compile": "Ascend950PR_9599",
+  "soc_model": "Ascend950PR_9589",
+  "geometry": {
+    "queries": 4,
+    "history": 32768,
+    "resident": 16384,
+    "history_owners_per_batch": 2
+  },
+  "input_pattern": "Every owner/Q has a distinct threshold; scores cover theta-5 through theta+5, including exact ties; consecutive tiles reuse ping-pong UB",
+  "host_binary_sha256": "8e68c0910531cb6b1f7b05bbf0a9f9a909124351993b29b85f763b56a8769466",
+  "device_library_sha256": "a32a9dc3d065fa637b1cd07090f63721ec15d5ab09b39262cac1cd716af7f615",
+  "cases": [
+    {
+      "batch": 1,
+      "aic": 2,
+      "aiv": 4,
+      "cold_keys": 65536,
+      "predicate_mismatches": 0,
+      "strict_gt_ties": true,
+      "threshold_input_guards": true,
+      "status": "PASS",
+      "process_exit": 0,
+      "log_sha256": "704a4e670a84be0e57a7abd25b9301d50f13021c60bfc2cd71108b7ec7971c1b"
+    },
+    {
+      "batch": 16,
+      "aic": 32,
+      "aiv": 64,
+      "cold_keys": 1048576,
+      "predicate_mismatches": 0,
+      "strict_gt_ties": true,
+      "threshold_input_guards": true,
+      "status": "PASS",
+      "process_exit": 0,
+      "log_sha256": "910d0e70b924842715d0760cde14b65d5fe9726e185c896256a1f95cc8aa053c"
+    }
+  ],
+  "full_a5_urma_candidate": "NOT_REVALIDATED",
+  "hardware_latency": "NOT_MEASURED"
+}
