@@ -227,6 +227,10 @@ def launch(config, directory):
               for key, value in vars(config).items()}
     atomic_json(directory / 'config.json', values)
     environment = worker_environment(config.kvaf_root, require_runtime=getattr(config, "operation", None) != "contract")
+    if getattr(config, 'candidate_root', None):
+        from peer_candidate import candidate_package
+        package, _ = candidate_package(config.candidate_root)
+        environment['PYTHONPATH'] = str(package) + os.pathsep + environment['PYTHONPATH']
     command = [sys.executable, '-u', '-X', 'faulthandler', str(Path(__file__).resolve()),
                str(directory / 'config.json')]
     return supervise(command, directory, timeout_seconds=config.timeout_seconds,
@@ -243,6 +247,11 @@ def run_config(path, shared_pool=None):
     config = SimpleNamespace(**json.loads(path.read_text()))
     config.kvaf_root = Path(config.kvaf_root).resolve()
     config.output = path.parent
+    if getattr(config, 'candidate_root', None):
+        from peer_candidate import candidate_package
+        package, config.candidate_revision = candidate_package(config.candidate_root)
+        if Path(kvip.__file__).resolve().parent != package / 'kvip':
+            raise RuntimeError(f'Worker imported unexpected KVIP package: {kvip.__file__}')
     use_pool = config.mode in ('bench', 'diagnose')
     if use_pool and config.input == 'synthetic' and shared_pool is None:
         pool = BenchPool(config)
@@ -3226,7 +3235,7 @@ class FusedReplayState:
     state must not have live graphs or unfinished device work.
     """
     def __init__(self, torch, runtime, table, library, initial, pages, addresses,
-                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None):
+                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None, candidate_bounds=None):
         from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
         from kvip.cache.index_storage import IndexCacheStorage
         from kvip.operators.lifetch.binding import LIFetchBinding
@@ -3274,11 +3283,15 @@ class FusedReplayState:
                                               prefetch_limit=prefetch_tokens, **binding)
             else:
                 owner = KvafQueueView(self.lease, output_rows, table.addresses, table.valid)
+                if candidate_bounds is None:
+                    binding['prefetch_rank_start'] = prefetch_rank_start
+                else:
+                    from peer_candidate import candidate_binding
+                    binding.update(candidate_binding(torch, library, device, candidate_bounds))
                 self.rotating = LIFetchBinding(
                     torch, library, self.workspace.arguments(self.storage), owner,
                     batch=self.batch, history=self.history, resident=self.resident,
                     intermediate_fetches=windows, prefetch_limit=prefetch_tokens,
-                    prefetch_rank_start=prefetch_rank_start,
                     aic_count=aics, token_bytes=self.token_bytes, **binding)
             update_type = UbmemIndexUpdate if ubmem else DirectIndexUpdate
             self.update = update_type(
@@ -3288,7 +3301,8 @@ class FusedReplayState:
                 query_inputs=self.workspace.inputs,
                 status=torch.zeros(self.batch, dtype=torch.int32, device=device),
                 outputs=torch.zeros((2, self.batch * 4, 1, 2048), dtype=torch.int32, device=device))
-            self.forward = StreamingForward(self.rotating, self.update, torch, prefetch_tokens)
+            self.forward = StreamingForward(self.rotating, self.update, torch, prefetch_tokens,
+                                            q_workers=4 if candidate_bounds is not None else 2)
             self.reset()
         except BaseException:
             if self.owns_lease:
@@ -3678,6 +3692,10 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             pending = False
     # Multi-round validation also advances the host LRU for the next input.
     compact = config.mode == "bench" and len(sequence.rounds) == 1
+    candidate = fused and getattr(config, 'candidate_root', None)
+    if candidate:
+        from peer_candidate import checked_routes, set_step
+        route_history = dict(warmup=[], source=config.candidate_revision)
 
     def validate_all(inputs, label):
         nonlocal pending
@@ -3733,10 +3751,14 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             for inputs in sequence:
                 for state in states:
                     state.prepare(inputs)
+                    if candidate:
+                        set_step(state.rotating.auto_route, warmup + 1)
                 stream.synchronize()
                 replay()
                 stream.synchronize()
                 validate_all(inputs, f'warmup{warmup}')
+                if candidate:
+                    route_history['warmup'].append(checked_routes(states, warmup + 1, low=warmup > 0))
         for state in states:
             state.reset()
         rounds = {}
@@ -3744,7 +3766,9 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             before = []
             for state in states:
                 state.prepare(inputs)
-                if fused and config.mode == 'diagnose':
+                if candidate:
+                    set_step(state.rotating.auto_route, config.warmup + 1)
+                elif fused and config.mode == 'diagnose':
                     initial = algorithm_before(state.rotating)
                     initial['logical_ids'] = state.input_layout.copy()
                     before.append(initial)
@@ -3753,6 +3777,8 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             measured = profile_graph_batch(torch, TrackedGraph(), calls=len(states), folder=folder,
                                            serial=not fused, transport=config.transport, stream=stream)
             validate_all(inputs, 'measured')
+            if candidate:
+                route_history['measured'] = checked_routes(states, config.warmup + 1, low=True)
             rounds[inputs.source_round] = measured['timing']
             samples = []
             for i, item in enumerate(measured['samples']):
@@ -3841,6 +3867,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                        overlap_mean_us=sum(t['overlap_mean_us'] for t in rounds.values())/len(rounds),
                        outside_invocations_mean_us=sum(t['outside_invocations_mean_us'] for t in rounds.values())/len(rounds))
         return dict(rounds=rounds, all_rounds=overall, correctness=checks.status,
+                    **({'auto_route': route_history} if candidate else {}),
                     failures=checks.failures, sequence_graph_sum=dict(
                         mean_us=sum(t['mean_us'] for t in rounds.values()), samples=1))
     except BaseException as error:
@@ -3923,8 +3950,15 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             aics = query_device_resources(cann, config.device)['effective_aic']
             page_addresses = expanded.addresses.cpu().numpy().view(np.uint64).reshape(g['batch'], -1)
             logical_addresses = (page_addresses[:, :, None] + np.arange(128) * width).reshape(g['batch'], -1)
+            candidate_bounds = None
             if config.transport == 'urma':
-                (library,) = build_libraries(cache_dir=build / 'lifetch', cann=cann, headers=headers, soc=soc)
+                options = {}
+                if getattr(config, 'candidate_root', None):
+                    from peer_candidate import OPTIONS, seed_bounds
+                    options = OPTIONS
+                    candidate_bounds = seed_bounds(config.candidate_snapshot, initial)
+                (library,) = build_libraries(cache_dir=build / 'lifetch', cann=cann, headers=headers, soc=soc,
+                                             **options)
             else:
                 from kvip.operators.lifetch_ubmem.build import UbmemGeometry, build_ubmem_library
                 shape = UbmemGeometry(g['batch'], g['history'], g['resident'], g['heads'], width,
@@ -3934,7 +3968,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 torch, runtime, view, library, initial, pages, logical_addresses,
                 transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                 prefetch_tokens=config.prefetch_tokens, soc=soc,
-                prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024))
+                prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024), candidate_bounds=candidate_bounds)
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
         if config.mode in ('bench', 'diagnose') and g.get('sparse_mode') == 0 and not fused:
@@ -3980,7 +4014,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                         torch, runtime, view, library, initial, pages, logical_addresses,
                         transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                         prefetch_tokens=config.prefetch_tokens, soc=soc,
-                        prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease)
+                        prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease,
+                        candidate_bounds=candidate_bounds)
                     replica.failure_directory = directory
                 else:
                     replica = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
@@ -3993,6 +4028,9 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             result.update(transport=config.transport, path='fused' if fused else 'serial',
                           runtime_workers=shared_pool.workers if borrowed else workers, geometry=g,
                           input_paths=[str(ref.manifest_path) for refs in sequence.rounds for ref in refs])
+            if getattr(config, 'candidate_root', None):
+                result['candidate_revision'] = config.candidate_revision
+                result['binary_sha256'] = hashlib.sha256(Path(library).read_bytes()).hexdigest()
             atomic_json(directory / 'path_result.json', result)
             return result
         state.reset()

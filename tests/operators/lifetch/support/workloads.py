@@ -144,6 +144,8 @@ def configuration(argv=None):
             path.add_argument('--fused-only', action='store_true',
                               help='measure only the complete fused chain on a real replay')
             command.add_argument('--level', type=int, choices=(1, 2, 3), default=1)
+            command.add_argument('--candidate-root', type=Path, help='G2 auto-route production checkout')
+            command.add_argument('--candidate-snapshot', type=Path, help='matching G2 predecessor bounds')
             command.add_argument('--stages', type=csv_values, default=('all',))
     converter = commands.add_parser('convert-trace', help='CPU-only legacy trace conversion')
     converter.add_argument('source', type=Path)
@@ -197,6 +199,15 @@ def configuration(argv=None):
     if args.mode == 'diagnose':
         if (args.serial_only or args.fused_only) and args.input != 'real':
             parser.error('standalone path measurements require --input real')
+        if bool(args.candidate_root) != bool(args.candidate_snapshot):
+            parser.error('--candidate-root and --candidate-snapshot are required together')
+        if args.candidate_root:
+            if (not getattr(args, 'fused_only', False) or args.input != 'real' or args.transport != 'urma'
+                    or args.group != 2 or args.round_range != (1, 1) or args.level != 1
+                    or args.warmup < 2 or (args.intermediate_fetches, args.prefetch_tokens) != (8, 512)):
+                parser.error('G2 candidate requires fused-only real URMA, round 1:1, level 1, warmup >= 2, 8 windows and 512 prefetch tokens')
+            args.candidate_root = args.candidate_root.resolve()
+            args.candidate_snapshot = args.candidate_snapshot.resolve()
         if 'all' in args.stages and len(args.stages) != 1:
             parser.error('stages all cannot be combined with individual stages')
         if set(args.stages) - {*STAGES, 'all'}:
