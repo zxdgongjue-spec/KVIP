@@ -109,7 +109,7 @@ public:
     __aicore__ inline void SetPrefixStorage(GM_ADDR output) { prefixOutput_ = output; }
 #if KVIP_STREAMING_LI
     __aicore__ inline void SetStreamingWorkspace(GM_ADDR workspace) { streamingWorkspace_ = workspace; }
-    __aicore__ inline bool EmitFinalClassification(uint32_t query, int32_t validLength);
+    __aicore__ inline void EmitFinalClassification(uint32_t query, int32_t validLength);
     __aicore__ inline void BeginFinalMetadata(uint32_t query);
 #endif
     __aicore__ inline void ProcessResidentTopK(QLICommon::RunInfo info, uint32_t queryRow = SIM_Q) {
@@ -795,9 +795,9 @@ __aicore__ inline void QLIVector<QLIT>::BeginFinalMetadata(uint32_t query)
 }
 
 template <typename QLIT>
-__aicore__ inline bool QLIVector<QLIT>::EmitFinalClassification(uint32_t query, int32_t validLength)
+__aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query, int32_t validLength)
 {
-    if (!streamingWorkspace_) return false;
+    if (!streamingWorkspace_) return;
     auto a=reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_);
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     auto errors=reinterpret_cast<__gm__ uint32_t*>(a->queryErrors);
@@ -805,7 +805,7 @@ __aicore__ inline bool QLIVector<QLIT>::EmitFinalClassification(uint32_t query, 
     if (b>=runtimeShape_.batch || runtimeShape_.resident>131072 ||
         !a->queryBitmaps || !a->queryErrors || !ctx->mapping || !ctx->lruSlots) {
         if (errors && b<runtimeShape_.batch) { errors[query*32+3]=runtimeShape_.resident>131072?1:!a->queryBitmaps?2:!ctx->mapping?3:4;errors[query*32+2]=1;errors[query*32]=1; kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128); }
-        return false;
+        return;
     }
     bool profile=(a->prefetchCount & 0x80000000U)!=0;
     auto liTicks=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(runtimeShape_.batch)*64+uint64_t(query)*16;
@@ -821,7 +821,7 @@ __aicore__ inline bool QLIVector<QLIT>::EmitFinalClassification(uint32_t query, 
                 kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(events+i),64);
                 if(events[i].complete)break;
                 if(GetSystemCycle()-started>5000000000ULL) {
-                    errors[query*32+2]=2;errors[query*32]=2;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);return false;
+                    errors[query*32+2]=2;errors[query*32]=2;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);return;
                 }
             }
         }
@@ -841,7 +841,7 @@ __aicore__ inline bool QLIVector<QLIT>::EmitFinalClassification(uint32_t query, 
         uint32_t bytes=2*CeilDiv(constInfo_.mBaseSize,2)*s2BaseSize_*sizeof(QK_T);
         uint32_t mergeBytes=(topkCountAlign256_+trunkLen_)*sizeof(SCORE_T);
         if(bytes<8192*sizeof(uint32_t) || mergeBytes<8192*sizeof(uint32_t)) chunkSize=4096;
-        if(bytes<chunkSize*sizeof(uint32_t) || mergeBytes<chunkSize*sizeof(uint32_t)) {errors[query*32+2]=3;errors[query*32]=4;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);return false;}
+        if(bytes<chunkSize*sizeof(uint32_t) || mergeBytes<chunkSize*sizeof(uint32_t)) {errors[query*32+2]=3;errors[query*32]=4;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);return;}
         valid=resMm1UB_.template ReinterpretCast<uint32_t>();
         reserved=mrgValueLocal_.template ReinterpretCast<uint32_t>();
         result=topkSharedTmpLocal_;bitmap=topkSharedTmpLocal_[2048];
@@ -954,8 +954,7 @@ __aicore__ inline bool QLIVector<QLIT>::EmitFinalClassification(uint32_t query, 
     DataCopy(output,result,2048);DataCopy(bits,bitmap,(runtimeShape_.resident+31)/32);
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-    const uint32_t classificationError=bitmap.GetValue(bitmapWords);
-    if(classificationError){
+    if(bitmap.GetValue(bitmapWords)){
         errors[query*32+2]=4;
         errors[query*32+5]=validLength>0?uint32_t(validLength):0;
         errors[query*32+6]=validLength==0?0:validLength<int32_t(topkCount_)?1:2;
@@ -967,14 +966,9 @@ __aicore__ inline bool QLIVector<QLIT>::EmitFinalClassification(uint32_t query, 
             if(token!=UINT32_MAX && token>=runtimeShape_.history){errors[query*32+3]=pos;errors[query*32+4]=token;break;}
         }
     }
-    errors[query*32+1]=bitmap.GetValue(bitmapWords+1);errors[query*32]=classificationError;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);
+    errors[query*32+1]=bitmap.GetValue(bitmapWords+1);errors[query*32]=bitmap.GetValue(bitmapWords);kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);
     if(profile){liTicks[7]=GetSystemCycle();liTicks[8]=overlapSecond?1:0;liTicks[9]=streamingTopkOnly_?1:0;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(liTicks),128);}
-#if !V9_UBMEM
-    return incremental && classificationError;
-#else
-    return false;
-#endif
 }
 #endif
 
@@ -1012,8 +1006,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
     }
 
     int32_t validS2Len = cuRealAcSeq;
-    bool recomputeFromScores = false;
-    for (uint32_t i = 0; i < curAivS1ProcNum;) {
+    for (uint32_t i = 0; i < curAivS1ProcNum; i++) {
         uint32_t rowIdx = queryRow < SIM_Q ? queryRow : blockId_ % 2 * CeilDiv(curS1ProcNum, 2) + i;
         uint32_t vecOffset = queryRow < SIM_Q ? queryRow : blockId_ % 2 * CeilDiv(s1BaseSize_, 2) + i;
 #if KVIP_STREAMING_LI
@@ -1062,7 +1055,6 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         if (!prefixActive_) EmitFinalClassification(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, validS2Len);
 #endif
 #endif
-            ++i;
             continue;
         }
 
@@ -1071,7 +1063,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
 
         AscendC::DataCopyPadExtParams<SCORE_T> padParams{true, 0, 0, 0};
 #if !V9_UBMEM
-        if (!recomputeFromScores && !prefixActive_ && validS2Len >= runtimeShape_.resident &&
+        if (!prefixActive_ && validS2Len >= runtimeShape_.resident &&
             (uint64_t(validS2Len)+127U)/128U*128U <= runtimeShape_.history) {
             FinalIncremental(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, validS2Len);
         } else if (validS2Len >= topkCount_) {
@@ -1206,17 +1198,8 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         }
         SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
 #if KVIP_STREAMING_LI
-        // Classification already checks IDs. A bad incremental prefix cannot
-        // be passed to Resolve. Rebuild this Q once from the completed scores,
-        // overwriting ID, location, bitmap and compact-miss publications.
-        if (!prefixActive_ && EmitFinalClassification(
-                info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, validS2Len) && !recomputeFromScores) {
-            recomputeFromScores = true;
-            continue;
-        }
+        if (!prefixActive_) EmitFinalClassification(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, validS2Len);
 #endif
-        recomputeFromScores = false;
-        ++i;
     }
 }
 }  // namespace QLIKernel
