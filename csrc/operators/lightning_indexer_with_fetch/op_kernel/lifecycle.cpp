@@ -45,6 +45,9 @@ __aicore__ inline void InitializeRound(uint32_t rt_batch,uint32_t rt_history,uin
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     FillRoundWords(ctx->rows+b*sizeof(Row),sizeof(Row)/4,local);
     FillRoundWords(ctx->progress+b*4*sizeof(Progress),4*sizeof(Progress)/4,local);
+#if KVIP_RANKED_PORT
+    FillRoundWords(ctx->rankedState+b*512,128,local);
+#endif
     FillRoundWords(ctx->owners+b*128,32,local);
     FillRoundWords(ctx->owners+rt_batch*128+b*rt_finalWorkers*kFinalStateWords*4,rt_finalWorkers*kFinalStateWords,local);
     FillRoundWords(ctx->owners+rt_finalPostOffset+b*rt_finalWorkers*sizeof(FinalPost),rt_finalWorkers*sizeof(FinalPost)/4,local);

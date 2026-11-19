@@ -1,6 +1,8 @@
 """Native Q4/Q2 geometry scaled to the active logical device's AIC budget."""
 
 
+COLD_FETCH_ONLY = True
+
 def prefetch_budget(prefetch_limit=512, window_limit=None, intermediate_fetches=8):
     """Limit speculative fetches only; final TopK repair has its own capacity."""
     if not isinstance(intermediate_fetches, int) or intermediate_fetches < 1:
@@ -47,12 +49,12 @@ def li_geometry(batch, tiling="auto", intermediate_fetches=32, aic_count=32, ser
 
 
 def trigger_tokens(batch, history, resident, tiling="auto", intermediate_fetches=32, aic_count=32):
-    """Hot-ready first window, followed by evenly spaced cold boundaries."""
+    """Fetch at eight cold boundaries; seed and final repair are separate."""
     rounds = li_geometry(batch, tiling, intermediate_fetches, aic_count)["intermediate_fetches"]
     cold_tiles = (history - resident) // 128
     if history % 256 or resident % 256 or resident < 2048 or cold_tiles <= rounds:
         raise ValueError("Requires aligned H>R>=2048 and more cold tiles than windows")
-    return [resident + 128 * (cold_tiles * e // max(1, rounds - 1)) for e in range(rounds)]
+    return [resident + 128 * (cold_tiles * (e + 1) // rounds) for e in range(rounds)]
 
 
 def final_aivs(batch, tiling="auto", aic_count=32, requested=0):

@@ -642,7 +642,7 @@ inline void PrepareCandidateWqes(uint32_t rt_resident,__ubuf__ uint32_t* ids,__u
     }
     asc_threadfence();
 }
-#if KVIP_INCREMENTAL_TOPK || KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
+#if KVIP_RANKED_PORT || KVIP_INCREMENTAL_TOPK || KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
 // Reserve only admitted IDs, before the next Q list is examined. This gives
 // Q4 deduplication with the existing map and no per-window hash table.
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
@@ -729,8 +729,8 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
     uint64_t scanBegin=0,candidateBegin=0,postBegin=0,begin=0;
     uint64_t firstDoorbell=0,secondDoorbell=0,lastDoorbell=0;
     auto ctx=reinterpret_cast<__gm__ Context*>(pointer);auto events=reinterpret_cast<__gm__ Event*>(ctx->events);
-    auto event=events+epoch*rt_serviceLanes+lane;event->core=core;event->epoch=epoch;V9_FETCH_PROFILE(event->waitBegin=GetSystemCycle();)
-    if(epoch) {
+    auto event=events+epoch*rt_serviceLanes+lane;event->core=core;event->epoch=epoch;V9_FETCH_PROFILE(if(!KVIP_RANKED_PORT)event->waitBegin=GetSystemCycle();)
+    if(epoch && !KVIP_RANKED_PORT) {
         auto previous=reinterpret_cast<__gm__ volatile Event*>(events)+(epoch-1)*rt_serviceLanes+lane;
         do { kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(events+(epoch-1)*rt_serviceLanes+lane),64); }
         while(!previous->complete);
@@ -749,6 +749,9 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
     auto cfg=work[4096];
     auto rowStorage=ids;
     if(rt_batchedRows)ids=scratch[23808/4];
+#if !KVIP_RANKED_PORT
+    // Dynamic TopK already froze and consumed the per-query progress. Its
+    // Fetch branch reads the committed rank, so a second progress DMA is dead.
     // Freeze every ready snapshot before doing any batch work. Cap to the
     // scheduled boundary so slow service cannot chase newly produced history.
     if(lane<rt_batch) {
@@ -784,6 +787,7 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
             cfg.SetValue(128+b*4+q,end<cap?end:cap);
         }
     }
+#endif
     GlobalTensor<uint32_t> allRows;allRows.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->rows));
     if(rt_batchedRows) {
         if(lane<rt_batch) {
@@ -852,7 +856,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
 #endif
         auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+b*rt_history;
         uint32_t count=0,missing=0;
-#if KVIP_REFILTER_REFILL || KVIP_COMPACT_OUT_OF_PLACE || KVIP_INCREMENTAL_TOPK || KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
+#if KVIP_RANKED_PORT || KVIP_REFILTER_REFILL || KVIP_COMPACT_OUT_OF_PLACE || KVIP_INCREMENTAL_TOPK || KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
         // Existing Q2/16K work tensor: cfg[1536:2016] is disjoint from
         // bitmap words, frozen Q4 progress, thresholds and batched post inputs.
         // Window allowance is validated <=480. No new UB/GM allocation.
@@ -860,7 +864,34 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
 #else
         auto selectedIds=ids;
 #endif
-#if KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
+#if KVIP_RANKED_PORT
+        const uint32_t allowance=PrefetchAllowance(slots,requests,state.GetValue(208),state.GetValue(209),state.GetValue(210),ctx->windowLimit);
+        for(uint32_t q=0;q<4 && count<allowance;++q) {
+            auto header=reinterpret_cast<__gm__ uint64_t*>(ctx->rankedState)+(b*4+q)*16;
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(header),128);
+            if(header[3]!=2048)continue; // This Q has not published a ranked list yet.
+            GlobalTensor<uint32_t> ranked;
+            ranked.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->rankedPrefix+b*(4*2048*6+1024)+4*2048*2)+q*2048);
+            SetFlag<HardEvent::V_MTE2>(EVENT_ID0);WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
+            DataCopy(ids,ranked,2048);
+            SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+            Simt::VF_CALL<GatherCandidateMap>(Simt::Dim3{256,1,1},
+                reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),map,2048,
+                static_cast<__gm__ uint32_t*>(nullptr),reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),rt_history);
+            PipeBarrier<PIPE_V>();
+            CompactMisses(reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),2048,allowance-count,
+                reinterpret_cast<__ubuf__ uint32_t*>(selectedIds[count].GetPhyAddr()));
+            SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            uint32_t found=cfg.GetValue(56),admitted=found<allowance-count?found:allowance-count;
+            missing+=found;
+            if(admitted) {
+                Simt::VF_CALL<ReserveIncremental>(Simt::Dim3{256,1,1},reinterpret_cast<__ubuf__ uint32_t*>(selectedIds[count].GetPhyAddr()),map,admitted,rt_resident+slots+count);
+                PipeBarrier<PIPE_V>();
+            }
+            count+=admitted;
+        }
+#elif KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
         // consumed[0] is the count of committed rank versions for this row.
         uint32_t versions=state.GetValue(12);
 #if KVIP_FETCH_PACKETS

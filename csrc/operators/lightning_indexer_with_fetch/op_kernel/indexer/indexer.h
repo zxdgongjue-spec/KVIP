@@ -762,10 +762,12 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
             if ASCEND_IS_AIV {
                 vectorService.LoadSequenceSplitThresholds(batch);
                 vectorService.PrepareRotationProgress();
+#if !KVIP_COLD_FETCH_ONLY
                 if (serviceEpoch == 0) vectorService.RotateFetch(0, halfTokens);
+#endif
             }
             uint32_t begin = resident_ / S2_BASE_SIZE + shard * half;
-            for (uint32_t epoch = 1; epoch < runtimeShape_.rounds; ++epoch, begin += 2 * half) {
+            for (uint32_t epoch = KVIP_COLD_FETCH_ONLY ? 0 : 1; epoch < runtimeShape_.rounds; ++epoch, begin += 2 * half) {
                 uint32_t end = begin + half;
                 if (end > runtimeShape_.history / S2_BASE_SIZE) end = runtimeShape_.history / S2_BASE_SIZE;
                 ScanSequenceHalf(begin, end, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);

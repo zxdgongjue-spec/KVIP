@@ -64,6 +64,11 @@ class LIFetchBinding:
             final_workers=final_workers,
             token_bytes=token_bytes,
         )
+        if self.library.kvip_cold_only_windows() != 1:
+            raise ValueError("Cold-only Fetch window ABI required")
+        self.ranked_port = bool(self.library.kvip_ranked_port())
+        if self.ranked_port and (batch != 16 or history != 131328 or resident != 16384 or intermediate_fetches != 8 or threshold_bounds is None or query_ends is None):
+            raise ValueError("Ranked port requires the validated BS16 Q4 eight-window frozen input")
         option = getattr(self.library, "kvip_incremental_topk", None)
         self.incremental_topk = bool(option()) if option is not None else False
         self.fetch_rank = any(bool(fn and fn()) for fn in
@@ -94,7 +99,7 @@ class LIFetchBinding:
             ("final_replicated", int(final_strategy == "replicated")),
             ("final_workers", final_aivs(batch, li_tiling, aic_count, final_workers)),
             ("aic_count", aic_count),
-            ("abi_version", 12 + 16*self.fetch_packets_enabled + 8*self.fetch_rank + self.incremental_topk + 2 * window_probe + 4 * seed_mask),
+            ("abi_version", 12 + 64*self.ranked_port + 16*self.fetch_packets_enabled + 8*self.fetch_rank + self.incremental_topk + 2 * window_probe + 4 * seed_mask),
             (
                 "service_lanes",
                 li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)["service_aivs_per_window"],
@@ -108,7 +113,7 @@ class LIFetchBinding:
             ("history", history),
             ("resident", resident),
             ("simulation", 0),
-            ("context_bytes", 328 + 16*self.fetch_rank + 8 * (self.incremental_topk + window_probe + seed_mask + self.fetch_packets_enabled)),
+            ("context_bytes", 328 + 16*self.ranked_port + 16*self.fetch_rank + 8 * (self.incremental_topk + window_probe + seed_mask + self.fetch_packets_enabled)),
             ("row_bytes", 1024),
         ):
             fn = getattr(self.library, "v9_" + name)
@@ -251,6 +256,9 @@ class LIFetchBinding:
                 ).view("u1"),
             )
         )
+        if self.ranked_port:
+            self.ranked_state = torch.empty((batch, 4, 16), dtype=torch.int64, device=self.device)
+            blob = np.r_[blob, np.array([self.ranked_state.data_ptr(), arguments[13].data_ptr()], dtype="<u8").view("u1")]
         if self.fetch_rank:
             self.fetch_ranks = torch.empty((batch, 4, self.rounds, 3104), dtype=torch.int32, device=self.device)
             self.fetch_audit = torch.empty((batch, self.rounds, 96), dtype=torch.int32, device=self.device)

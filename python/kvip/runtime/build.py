@@ -43,8 +43,10 @@ def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False,
                     compact_out_of_place=False, rolling_reuse_seed=False, rolling_fast_path=False, rolling_sparse=False, rolling_boundary=False, incremental_topk=False,
                     incremental_window=False, incremental_register=False, incremental_prefilter=False, incremental_direct=False, incremental_ties=False, incremental_light=False, incremental_inplace=False,
                     incremental_progress=False, incremental_segments=False, consumed_prefix=False, window_probe=False, seed_mask=False, seed_parallel=False, native_trunk=False, trunk_pruned=False,
-                    fetch_bitmap=False, fetch_dense=False, fetch_packets=False):
+                    fetch_bitmap=False, fetch_dense=False, fetch_packets=False, ranked_port=False):
     """Build one shape-independent binary per source/toolchain/SoC."""
+    if ranked_port and any((reverse_cold, incremental_topk, rolling_threshold, window_refilter, fetch_bitmap, fetch_dense, fetch_packets, seed_mask, seed_parallel)):
+        raise ValueError("Ranked port cannot combine earlier ranking/scan experiments")
     if fetch_packets and not fetch_bitmap:
         raise ValueError("Packed Fetch requires fetch_bitmap")
     if fetch_bitmap or fetch_dense:
@@ -111,6 +113,7 @@ def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False,
         KVIP_INCREMENTAL_PREFILTER="ON" if incremental_prefilter else "OFF",
         KVIP_INCREMENTAL_INPLACE="ON" if incremental_inplace else "OFF",
         KVIP_WINDOW_PROBE="ON" if window_probe else "OFF",
+        KVIP_RANKED_PORT="ON" if ranked_port else "OFF",
         KVIP_FETCH_BITMAP="ON" if fetch_bitmap else "OFF",
         KVIP_FETCH_DENSE="ON" if fetch_dense else "OFF",
         KVIP_FETCH_PACKETS="ON" if fetch_packets else "OFF",

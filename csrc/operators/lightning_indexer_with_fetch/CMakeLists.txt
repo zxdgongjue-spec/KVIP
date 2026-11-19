@@ -12,6 +12,7 @@ option(KVIP_INCREMENTAL_REGISTER "Register Kth for incremental window selection"
 option(KVIP_INCREMENTAL_PREFILTER "Fixed tile filtering and boundary-only sparse compaction" OFF)
 option(KVIP_INCREMENTAL_DIRECT "Materialize selected scores and physical IDs in one SIMD VF" OFF)
 option(KVIP_INCREMENTAL_INPLACE "Update only the boundary-tie suffix in place" OFF)
+option(KVIP_RANKED_PORT "Donor incremental TopK only; existing Fetch and resolver" OFF)
 option(KVIP_FETCH_BITMAP "Fetch-owned per-request ranking" OFF)
 option(KVIP_FETCH_DENSE "Fetch-owned per-request ranking" OFF)
 option(KVIP_FETCH_PACKETS "Producer-packed candidates and demand-driven Fetch ranking" OFF)
@@ -93,6 +94,11 @@ endif()
 if(KVIP_ROLLING_BATCHED AND KVIP_ROLLING_WINDOWED)
   message(FATAL_ERROR "Select either batch or window accumulation")
 endif()
+if(KVIP_RANKED_PORT AND (KVIP_INCREMENTAL_TOPK OR KVIP_REVERSE_COLD OR
+    KVIP_ROLLING_THRESHOLD OR KVIP_WINDOW_REFILTER OR KVIP_FETCH_BITMAP OR
+    KVIP_FETCH_DENSE OR KVIP_FETCH_PACKETS OR KVIP_SEED_MASK OR KVIP_SEED_PARALLEL))
+  message(FATAL_ERROR "Ranked port must not mix other experimental policies")
+endif()
 if(NOT EXISTS "${KVAF_INCLUDE}/kvaf_batch_get_device.h")
   message(FATAL_ERROR "Set KVAF_INCLUDE to the patched KVAF aiv_batch_get/include directory")
 endif()
@@ -112,6 +118,7 @@ ascendc_compile_options(v9_kernel PRIVATE -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WO
   -DKVIP_INCREMENTAL_REGISTER=$<BOOL:${KVIP_INCREMENTAL_REGISTER}>
   -DKVIP_INCREMENTAL_PREFILTER=$<BOOL:${KVIP_INCREMENTAL_PREFILTER}>
   -DKVIP_INCREMENTAL_INPLACE=$<BOOL:${KVIP_INCREMENTAL_INPLACE}>
+  -DKVIP_RANKED_PORT=$<BOOL:${KVIP_RANKED_PORT}>
   -DKVIP_FETCH_BITMAP=$<BOOL:${KVIP_FETCH_BITMAP}>
   -DKVIP_FETCH_DENSE=$<BOOL:${KVIP_FETCH_DENSE}>
   -DKVIP_FETCH_PACKETS=$<BOOL:${KVIP_FETCH_PACKETS}>
@@ -182,3 +189,5 @@ target_compile_definitions(v9_bridge PRIVATE KVIP_SEED_PARALLEL=$<BOOL:${KVIP_SE
 target_compile_definitions(v9_bridge PRIVATE KVIP_SEED_MASK=$<BOOL:${KVIP_SEED_MASK}>)
 target_compile_definitions(v9_bridge PRIVATE KVIP_CONSUMED_PREFIX=$<BOOL:${KVIP_CONSUMED_PREFIX}>)
 target_compile_definitions(v9_bridge PRIVATE KVIP_INCREMENTAL_SEGMENTS=$<BOOL:${KVIP_INCREMENTAL_SEGMENTS}>)
+
+target_compile_definitions(v9_bridge PRIVATE KVIP_RANKED_PORT=$<BOOL:${KVIP_RANKED_PORT}>)

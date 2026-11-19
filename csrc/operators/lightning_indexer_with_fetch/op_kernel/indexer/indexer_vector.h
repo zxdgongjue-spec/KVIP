@@ -29,6 +29,11 @@
 #include "indexer_score.h"
 #include "topk.h"
 #include "../../../common/lifetch/recent_index.h"
+#if KVIP_RANKED_PORT
+#include "ranked_helpers.h"
+#include "incremental_vector_helpers.h"
+#include "window_fast_vector.h"
+#endif
 
 namespace QLIKernel {
 using namespace QLICommon;
@@ -60,6 +65,9 @@ public:
         WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     }
     __aicore__ inline void RotateFetch(uint32_t epoch, uint32_t sequenceHalfWindow = 0) {
+#if KVIP_RANKED_PORT
+        AdvanceWindow(epoch,sequenceHalfWindow);
+#endif
 #if KVIP_STREAMING_LI && !V9_UBMEM
         bool stamp = streamingWorkspace_ &&
             (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U);
@@ -87,7 +95,7 @@ public:
             );
 #endif
 #if KVIP_STREAMING_LI && !V9_UBMEM
-        if(stamp) {
+        if(stamp && !KVIP_RANKED_PORT) {
             uint64_t returned=GetSystemCycle();
             auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
             uint32_t lane=rotating::ServiceLane(runtimeShape_.batch,runtimeShape_.splitQ,runtimeShape_.serviceAics,blockId_/2,blockId_%2);
@@ -121,6 +129,9 @@ public:
     using SCORE_T = typename QLIT::scoreType;
 
 #include "incremental_topk_methods.h"
+#if KVIP_RANKED_PORT
+#include "ranked_methods.h"
+#endif
 
     __aicore__ inline QLIVector(){};
     __aicore__ inline void ProcessVec1(const QLICommon::RunInfo &info, uint32_t progressShard = 0,
@@ -341,7 +352,16 @@ private:
 #if KVIP_WINDOW_PROBE
             auto seedStart = ProbeClock();
 #endif
-#if KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
+#if KVIP_RANKED_PORT
+            topkOp_(mrgValueLocal_, indicesOutLocal_, scoreOutLocal_, aligned, 0, 1, true);
+            PipeBarrier<PIPE_V>();
+            Simt::VF_CALL<kvip_recent_index::RemapUnified>(Simt::Dim3{512,1,1},
+                reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),residentCount,range.begin,recentCount);
+            PipeBarrier<PIPE_V>();
+            lifetch_incremental::Minimum(reinterpret_cast<__ubuf__ uint16_t*>(scoreOutLocal_.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(prefixThreshold_[(query%2)*128].GetPhyAddr()));
+            SetFlag<HardEvent::V_S>(EVENT_ID5);WaitFlag<HardEvent::V_S>(EVENT_ID5);
+#elif KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
             topkOp_(mrgValueLocal_, indicesOutLocal_, scoreOutLocal_, aligned, 0, 1, true);
             PipeBarrier<PIPE_V>();
             rotating::RemapFetchSeed(reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),
@@ -471,7 +491,7 @@ private:
         scores.SetGlobalBuffer((__gm__ uint16_t *)(prefixOutput_ + batch * rowBytes));
         indices.SetGlobalBuffer((__gm__ int32_t *)(prefixOutput_ + batch * rowBytes + count * 2));
         thresholds.SetGlobalBuffer((__gm__ uint16_t *)(prefixOutput_ + batch * rowBytes + count * 6));
-        if (!thresholdReady || KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE) {
+        if (!thresholdReady || KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE || KVIP_RANKED_PORT) {
             DataCopy(scores[q * 2048], scoreOutLocal_, 2048);
             DataCopy(indices[q * 2048], indicesOutLocal_.template ReinterpretCast<int32_t>(), 2048);
         }
@@ -526,6 +546,9 @@ private:
             DataCopyPad(bitmap, hitChunk.template ReinterpretCast<uint8_t>(), copy);
             SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
         }
+#if KVIP_RANKED_PORT
+        SeedIncremental(query,scoreRow);
+#endif
         if (publishProgress) {
             SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
             auto ready = reinterpret_cast<__gm__ uint32_t*>(context->progress)+query*32;
@@ -691,6 +714,17 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe, bool topkOnly)
     }
 #endif
 
+#if KVIP_RANKED_PORT
+    pipe->InitBuffer(incrementalIdsBuf_, trunkLen_*2 + ((topkOnly && streamingWorkspace_) ? 0 : 2048*4) + kRankedMetadataBytes);
+    incrementalNew_ = incrementalIdsBuf_.Get<uint16_t>();
+    incrementalOld_ = (topkOnly && streamingWorkspace_) ? streamingOutput_ : incrementalNew_[trunkLen_].template ReinterpretCast<uint32_t>();
+    incrementalMetadata_ = incrementalNew_[trunkLen_ + ((topkOnly && streamingWorkspace_) ? 0 : 4096)].template ReinterpretCast<uint64_t>();
+    if (!topkOnly) {
+        uint32_t used=2*CeilDiv(constInfo_.mBaseSize,2)*s2BaseSize_*sizeof(QK_T)+1536+6*CeilDiv(s1BaseSize_,2)*UB_BANK_DEPTH_STRIDE+2*s2BaseSize_*QLICommon::KScaleTiles*sizeof(SCALE_T)+2*CeilDiv(s1BaseSize_,2)*s2BaseSize_*sizeof(SCORE_T)+(topkCountAlign256_+trunkLen_)*sizeof(SCORE_T)+(topkCountAlign256_+64)*4+topkCountAlign256_*sizeof(SCORE_T)+topkSharedTmpSize+trunkLen_*2+8192+kRankedMetadataBytes;
+        incrementalPipeline_=used+kIncrementalInputBytes<=223232;
+        if(incrementalPipeline_){pipe->InitBuffer(incrementalInputBuf_,kIncrementalInputBytes);incrementalInput_=incrementalInputBuf_.Get<uint16_t>();}
+    }
+#endif
     if (!topkOnly) Duplicate(kScaleUB_, static_cast<SCALE_T>(0), 2 * s2BaseSize_ * QLICommon::KScaleTiles);
 }
 
@@ -1420,6 +1454,20 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
             SaveResident(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx,
                          vecOffset, queryRow == SIM_Q, recentEnd, true);
             SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
+            continue;
+        }
+#endif
+#if KVIP_RANKED_PORT
+        if(!prefixActive_) {
+            FinalIncremental(info.indiceOutOffset/topkCount_+curS1Idx+rowIdx,uint32_t(validS2Len));
+            SetFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);
+            SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
+            DataCopyPad(indiceOutGm[info.indiceOutOffset+(curS1Idx+rowIdx)*topkCount_],
+                indicesOutLocal_.template ReinterpretCast<int32_t>(),copyOutParams);
+            SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
+#if KVIP_STREAMING_LI
+            EmitFinalClassification(info.indiceOutOffset/topkCount_+curS1Idx+rowIdx);
+#endif
             continue;
         }
 #endif

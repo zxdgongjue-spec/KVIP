@@ -3,6 +3,7 @@
 #include "batch_get_abi.h"
 #include "runtime_shape.h"
 #include "incremental_topk.h"
+#define KVIP_COLD_FETCH_ONLY 1
 namespace rotating {
 constexpr uint32_t kTop=2048, kSlots=8192, kMaxRounds=32, kRowStatusWords=32;
 constexpr bool kFinalReplicated=true;
@@ -45,6 +46,9 @@ constexpr uint32_t kSeedMaskWords = kSeedMaskSlots / 8; // Native B32 predicate:
 #ifndef KVIP_FETCH_PACKETS
 #define KVIP_FETCH_PACKETS 0
 #endif
+#ifndef KVIP_RANKED_PORT
+#define KVIP_RANKED_PORT 0
+#endif
 struct Context {
     uint64_t progress, rows, mapping, locations, events, hits, selected, owners;
     uint64_t args, sourceBlocks, sourceOffsets, destinations, count, rowStatus, finalStatus;
@@ -61,6 +65,9 @@ struct Context {
 
     // Optional int32[B,2] Index-only seed range; independent of KV tailBounds.
     uint64_t thresholdBounds;
+#if KVIP_RANKED_PORT
+    uint64_t rankedState, rankedPrefix; // Q4 private cursors and current Top2048 IDs.
+#endif
 #if KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
     uint64_t fetchRanks, fetchAudit; // immutable per logical prefix; actual service version and IDs
 #if KVIP_FETCH_PACKETS
@@ -77,7 +84,7 @@ struct Context {
     uint64_t seedMask; // [active batch,kSeedMaskWords] immutable resident Get eligibility
 #endif
 };
-static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 328 + 16*(KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE) + 8*(KVIP_INCREMENTAL_TOPK + KVIP_WINDOW_PROBE + KVIP_SEED_MASK + KVIP_FETCH_PACKETS),
+static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 328 + 16*KVIP_RANKED_PORT + 16*(KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE) + 8*(KVIP_INCREMENTAL_TOPK + KVIP_WINDOW_PROBE + KVIP_SEED_MASK + KVIP_FETCH_PACKETS),
               "LIFetch runtime ABI layout changed");
 // Workload geometry is bound before capture and shared by host/device launches.
 #if defined(__CCE_AICORE__)
@@ -109,7 +116,7 @@ V9_DEVICE inline uint32_t Trigger(uint32_t rt_history,uint32_t rt_resident,uint3
     // Zero rounds disables service; keep this helper valid without division by zero.
     if (rt_rounds == 0) return rt_resident / 128;
     return rt_resident / 128 +
-        ((rt_history - rt_resident) / 128) * epoch / (rt_rounds > 1 ? rt_rounds - 1 : 1);
+        ((rt_history - rt_resident) / 128) * (epoch + 1) / rt_rounds;
 }
 V9_DEVICE inline bool IsTrigger(uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t tileEnd) {
     for (uint32_t e = 0; e < rt_rounds; ++e) if (Trigger(rt_history,rt_resident,rt_rounds,e) == tileEnd) return true;
