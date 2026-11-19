@@ -37,6 +37,14 @@ cannot re-enter later because the exact prefix Kth is monotone. Budget-deferred
 IDs stay in the persisted Top2048 and are reconsidered while still selected.
 Original slot reservation deduplicates Q4 admissions before posting.
 
+Ranked lists include resident hits, unlike the old prefiltered candidate bitmap.
+The existing map-gather launch therefore also applies the original hot-valid
+and reserved-victim predicate. A safe resident hit bypasses the DDR map lookup;
+an invalid or reserved hot entry still needs a transfer unless it was already
+submitted. ABC mappings remain authoritative. This does not initialize an extra
+map, launch a kernel, or move a valid hot token to another slot. A round-local
+`mapping == UINT32_MAX` alone means "not submitted", not "absent from hot cache".
+
 ## Avoiding migration overhead
 
 - Fetch reads persisted Top2048 IDs directly. There is no second full-list write
@@ -61,6 +69,14 @@ CANN checks execute the migrated update with the same eight-window geometry,
 two representative lanes (two requests each) and the same score inputs. They
 validate functional prefix ranks and the next-query pipeline.
 They do not simulate URMA transport or establish whole-graph performance.
+
+The admission regression executes the production SIMT body on CPU with distinct
+active-row/owner mappings, invalid hot entries, reserved victims, ABC entries and
+Q4 resubmission. CANN admission fixtures use real G7/G2 rank lists and residency
+metadata with production-style unmapped hot entries, sampling 256 IDs per query
+and window to check compact posted IDs and map updates under the 64/512 budgets.
+The samples cover two requests and all eight windows. Prefix-rank checks alone do not
+validate this cache integration boundary.
 
 CANN 9.2.0 builds both feature-off and feature-on binaries. Local model tests use
 Ascend950PR_9589; host20 is Ascend950DT_9582. This hardware/model difference and

@@ -609,6 +609,31 @@ inline void GatherCandidateMap(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* slots,
         slots[i]=slot;
     }
 }
+#if KVIP_RANKED_PORT
+// A TopK list contains hot hits as well as DDR candidates. The ordinary
+// bitmap scanner has already removed safe hot hits; ranked lists have not.
+// Keep that predicate here, in the existing map-gather launch. Never write
+// safe hot hits into mapping/changes or they may be moved by Index update.
+__simt_vf__ __aicore__ LAUNCH_BOUND(256)
+inline void GatherRankedCandidateMap(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* slots,
+    __gm__ uint32_t* map,uint32_t count,__gm__ Context* ctx,uint32_t batch,uint32_t resident) {
+    const uint32_t owner=OwnerRow(ctx,batch);
+    auto valid=reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid);
+    auto reserved=reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot);
+    uint32_t tailBegin=0,tailEnd=0;
+    if(ctx->tailBounds) {
+        auto bounds=reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds)+batch*2;
+        tailBegin=asc_ldcg(bounds);tailEnd=asc_ldcg(bounds+1);
+    }
+    for(uint32_t i=threadIdx.x;i<count;i+=256) {
+        const uint32_t token=ids[i];
+        const bool safeHot=token<resident && !(token>=tailBegin && token<tailEnd) &&
+            (!valid || asc_ldcg(valid+uint64_t(owner)*resident+token)) &&
+            (!reserved || asc_ldcg(reserved+uint64_t(batch)*resident+token)<0);
+        slots[i]=safeHot?token:asc_ldcg(map+token);
+    }
+}
+#endif
 __simd_vf__ inline void CompactMisses(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* slots,
     __ubuf__ uint32_t* cfg,uint32_t count,uint32_t available,
     __ubuf__ uint32_t* destination) {
@@ -875,9 +900,9 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
             SetFlag<HardEvent::V_MTE2>(EVENT_ID0);WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
             DataCopy(ids,ranked,2048);
             SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-            Simt::VF_CALL<GatherCandidateMap>(Simt::Dim3{256,1,1},
-                reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),map,2048,
-                static_cast<__gm__ uint32_t*>(nullptr),reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),rt_history);
+            Simt::VF_CALL<GatherRankedCandidateMap>(Simt::Dim3{256,1,1},
+                reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),map,2048,ctx,b,rt_resident);
             PipeBarrier<PIPE_V>();
             CompactMisses(reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),2048,allowance-count,
