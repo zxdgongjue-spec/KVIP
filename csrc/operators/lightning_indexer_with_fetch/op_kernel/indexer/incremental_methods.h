@@ -568,6 +568,49 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     }
     return true;
 }
+// Each AIV owns exactly one 128-byte query metadata line and one TopK prefix.
+// Request-wide Row, covered bitmap and admission jobs remain read-only here;
+// the following PostWindow kernel is their unique writer.
+__aicore__ inline void AdvanceQueryWindow(uint32_t query,uint32_t epoch,uint32_t half) {
+    auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+    const uint32_t b=query/4,lane=b%runtimeShape_.serviceLanes;
+    if(epoch) {
+        auto previous=reinterpret_cast<__gm__ volatile rotating::Event*>(ctx->events)+
+            (epoch-1)*runtimeShape_.serviceLanes+lane;
+        do {kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(
+            const_cast<__gm__ rotating::Event*>(previous)),64);}while(!previous->complete);
+    }
+    GlobalTensor<uint32_t> progress,rows;
+    GlobalTensor<uint64_t> metadata;
+    progress.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress)+query*32);
+    rows.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->rows)+b*256);
+    metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(rotating::TopKHeader(ctx))+query*16);
+    DataCopy(incrementalOld_,progress,32);
+    DataCopy(incrementalOld_[256],rows,16);
+    DataCopy(incrementalMetadata_,metadata,16);
+    SetFlag<HardEvent::MTE2_S>(EVENT_ID5);WaitFlag<HardEvent::MTE2_S>(EVENT_ID5);
+    const uint64_t ready=uint64_t(incrementalOld_.GetValue(0))|
+        (uint64_t(incrementalOld_.GetValue(16))<<32);
+    const uint32_t cap=rotating::SequenceWindowEnd(runtimeShape_.history,runtimeShape_.resident,half,epoch);
+    exportWindowCold_=true;rankedEpoch_=epoch;
+    rankTrace_=streamingWorkspace_ &&
+        (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U);
+    incrementalCalls_=0;incrementalScanned_=0;incrementalCandidates_=0;
+    incrementalMetadataActive_=true;incrementalMetadataIndex_=0;
+    incrementalMetadata_.SetValue(4,ready);
+    windowCoveredEmpty_=incrementalOld_.GetValue(256+9)==0;
+    rankReady_=ready;rankHalf_=half;incrementalHasNext_=false;
+    const uint32_t end0=Min(uint32_t(ready),cap),end1=Min(uint32_t(ready>>32),cap);
+    if(end0>=runtimeShape_.resident)AdvanceIncremental(query,end0,end1,half);
+    JoinColdOutput();
+    if(incrementalInputPending_) {WaitFlag<HardEvent::MTE2_V>(EVENT_ID6);incrementalInputPending_=false;}
+    if(incrementalOutputPending_) {WaitFlag<HardEvent::MTE3_V>(EVENT_ID6);incrementalOutputPending_=false;}
+    SetFlag<HardEvent::S_MTE3>(EVENT_ID5);WaitFlag<HardEvent::S_MTE3>(EVENT_ID5);
+    DataCopy(metadata,incrementalMetadata_,16);
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID5);WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
+    incrementalMetadataActive_=false;exportWindowCold_=false;
+    // No producer resumes in this kernel; its progress table need not be rebuilt.
+}
 __aicore__ inline void FinalIncremental(uint32_t query,uint32_t valid) {
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     if(runtimeShape_.rounds) {

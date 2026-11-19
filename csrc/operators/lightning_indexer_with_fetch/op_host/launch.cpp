@@ -115,7 +115,9 @@ extern "C" uint32_t kvip_lifetch_score_t2_forward(void* bindings,void* update,vo
 extern "C" uint32_t aclrtlaunch_kvip_transport_snapshot_kernel(uint32_t,void*,void*,void*,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_score_window_t2(uint32_t,void*,void*,uint32_t,uint32_t,uint32_t,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_li_window_service(uint32_t,void*,void*,uint32_t,uint32_t,uint32_t);
-extern "C" uint32_t kvip_lifetch_score_window_forward(void* bindings,void* update,void* workspace,void* stream,
+extern "C" uint32_t aclrtlaunch_v9_li_window_topk(uint32_t,void*,void*,uint32_t,uint32_t,uint32_t);
+extern "C" uint32_t aclrtlaunch_v9_li_window_post(uint32_t,void*,void*,uint32_t,uint32_t,uint32_t);
+template<bool QueryParallel> static uint32_t LaunchScoreWindow(void* bindings,void* update,void* workspace,void* stream,
     const rotating::RuntimeShape* shape,uint32_t workers,uint32_t parts) {
     if (!bindings || !update || !workspace || !stream || !shape || shape->finalWorkers!=4 ||
         shape->resident>131072 || !rotating::UseSequenceSplit(*shape) || shape->liCores!=2*shape->batch ||
@@ -129,14 +131,29 @@ extern "C" uint32_t kvip_lifetch_score_window_forward(void* bindings,void* updat
         result=aclrtlaunch_v9_li_kernel_score_window_t2(shape->batch*wave.parts,stream,bindings,
             wave.parts,wave.begin,wave.end,epoch!=0);
         if (!result && epoch==0) result=aclrtlaunch_v9_li_kernel_1(shape->liCores,stream,bindings);
-        if (!result) result=aclrtlaunch_v9_li_window_service(shape->serviceAics*2,stream,bindings,
-            epoch,wave.end0,wave.end1);
+        if constexpr (QueryParallel) {
+            if (!result) result=aclrtlaunch_v9_li_window_topk(shape->batch*4,stream,bindings,
+                epoch,wave.end0,wave.end1);
+            if (!result) result=aclrtlaunch_v9_li_window_post(shape->serviceAics*2,stream,bindings,
+                epoch,wave.end0,wave.end1);
+        } else {
+            if (!result) result=aclrtlaunch_v9_li_window_service(shape->serviceAics*2,stream,bindings,
+                epoch,wave.end0,wave.end1);
+        }
         if (result) return result;
     }
     result=aclrtlaunch_v9_li_kernel_3(shape->liCores,stream,bindings);
     if (!result) result=aclrtlaunch_v9_streaming_resolve_update(
         shape->batch*pipeline_ab::kResolveCores+4*workers,stream,workspace);
     return result;
+}
+extern "C" uint32_t kvip_lifetch_score_window_forward(void* bindings,void* update,void* workspace,void* stream,
+    const rotating::RuntimeShape* shape,uint32_t workers,uint32_t parts) {
+    return LaunchScoreWindow<false>(bindings,update,workspace,stream,shape,workers,parts);
+}
+extern "C" uint32_t kvip_lifetch_score_query_forward(void* bindings,void* update,void* workspace,void* stream,
+    const rotating::RuntimeShape* shape,uint32_t workers,uint32_t parts) {
+    return LaunchScoreWindow<true>(bindings,update,workspace,stream,shape,workers,parts);
 }
 
 extern "C" uint32_t kvip_transport_snapshot(void* source, void* destination, uint32_t bytes, void* stream) {

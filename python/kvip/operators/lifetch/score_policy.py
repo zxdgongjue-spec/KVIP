@@ -18,7 +18,7 @@ def validate_score_t2(shape, parts):
     return parts
 
 
-def score_window_schedule(shape, parts):
+def score_window_schedule(shape, parts, query_parallel=False):
     """Describe direct MR14 producers on the exact MR23 half-window geometry."""
     validate_score_t2(shape, parts)
     half = (((shape.history-shape.resident+511)//512+shape.rounds-2)//(shape.rounds-1))*256
@@ -31,7 +31,10 @@ def score_window_schedule(shape, parts):
                           predicate=epoch>0, score_aics=shape.batch*p, score_aivs=shape.batch*p*2,
                           ready_end0=min(shape.history, begin+half) if epoch else shape.resident,
                           ready_end1=end))
-    return dict(mode='window', score_post='direct', cold_predicate='producer',
-                service='mr23_ranked_window', half_window=half, waves=waves,
-                li_launches=shape.rounds*2+2, scatter_launches=0,
+    return dict(mode='window_query' if query_parallel else 'window', score_post='direct', cold_predicate='producer',
+                service='mr23_request_post' if query_parallel else 'mr23_ranked_window',
+                topk_aivs=(shape.batch*4 if query_parallel else
+                           min(shape.batch,shape.serviceLanes) if hasattr(shape,'serviceLanes') else None),
+                half_window=half, waves=waves,
+                li_launches=shape.rounds*(3 if query_parallel else 2)+2, scatter_launches=0,
                 final_topk='mr23_incremental', resolve_fetch='mr23')

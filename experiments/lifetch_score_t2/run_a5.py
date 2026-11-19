@@ -27,6 +27,7 @@ MR14 = 'c684d79f3a4f8432bf0915edeba392c7d54ba289'
 ROUTES = {
     'mr23': ('1,2,4,8,16', 0, 'original'),
     'window_budget': ('1,2,4,8,16', None, 'window'),
+    'query_budget': ('1,2,4,8,16', None, 'window_query'),
     'full_budget': ('1,2,4,8,16', None, 'full'),
     'window_p16': ('1', 16, 'window'),
     'window_p2': ('16', 2, 'window'),
@@ -74,7 +75,7 @@ def li_components(folder, mode, geometry):
     The known window launch contract identifies Hot as the first score launch
     inside each recorded invocation; no phase is inferred from its duration.
     """
-    if mode!='window':
+    if mode not in ('window','window_query'):
         return None
     profiles=sorted(folder.glob('diagnose/round-*/graph_profile.json'))
     if not profiles:
@@ -82,6 +83,8 @@ def li_components(folder, mode, geometry):
     totals=[]
     aliases={'score':'v9_li_kernel_score_window_t2', 'service':'v9_li_window_service',
              'theta':'v9_li_kernel_1', 'final':'v9_li_kernel_3'}
+    if mode=='window_query':
+        aliases.update(service='v9_li_window_post',query_topk='v9_li_window_topk')
     for path in profiles:
         profile=json.loads(path.read_text())
         trace=json.loads((path.parent/'trace.json').read_text())
@@ -104,12 +107,15 @@ def li_components(folder, mode, geometry):
                 if any(abs(start-a)<.01 and abs(start+duration-b)<.01 for a,b in intervals):
                     parts[key].append((start,duration))
             waves=len(geometry['waves'])
-            if {k:len(v) for k,v in parts.items()}!={'score':waves,'service':waves,'theta':1,'final':1}:
+            expected={'score':waves,'service':waves,'theta':1,'final':1}
+            if mode=='window_query':expected['query_topk']=waves
+            if {k:len(v) for k,v in parts.items()}!=expected:
                 raise RuntimeError(f'Incomplete/duplicate LI components: {path}, invocation {sample["invocation"]}')
             scores=sorted(parts['score'])
             item=dict(score_hot_us=scores[0][1],score_cold_us=sum(v for _,v in scores[1:]),
                       theta_us=parts['theta'][0][1],service_us=sum(v for _,v in parts['service']),
                       final_us=parts['final'][0][1])
+            if mode=='window_query':item['query_topk_us']=sum(v for _,v in parts['query_topk'])
             if abs(sum(item.values())-sample['stages_us']['li'])>.05:
                 raise RuntimeError('LI component sum disagrees with measured stage duration')
             per_call.append(item)
@@ -216,28 +222,28 @@ def summarize(output, jobs, measured_rounds):
             mode = job.get('mode','full')
             geometry = fused.get('score_geometry')
             schedule = fused.get('li_schedule')
-            if mode == 'window' and (not geometry or not schedule):
+            if mode in ('window','window_query') and (not geometry or not schedule):
                 raise RuntimeError(f'Missing actual window geometry/schedule: {path}')
             components = li_components(path.parent/'fused', mode, geometry)
             if components and abs(sum(components.values())-stage['li']) > .05:
                 raise RuntimeError('Component means disagree with all-round LI mean')
             native_stages = s['stage_mean_us']
-            peak = max(w['score_aics'] for w in geometry['waves']) if mode=='window' else report['batch']*(job['parts'] or 2)
+            peak = max(w['score_aics'] for w in geometry['waves']) if mode in ('window','window_query') else report['batch']*(job['parts'] or 2)
             # Kernel names are retained with invocation boundaries in raw trace.
             rows.append(dict(round=job['round'], case=job['case'], prefetch=job['pf'],
                 batch=report['batch'], miss_percent=report['miss_percent'], score_parts=job['parts'], score_mode=mode,
                 score_geometry=geometry, score_peak_aic=peak, score_peak_aiv=2*peak,
                 actual_windows=schedule['rounds'] if schedule else None,
                 service_aivs=schedule['serviceLanes'] if schedule else None,
-                li_kernel_launches=geometry['li_launches'] if mode=='window' else 4,
+                li_kernel_launches=geometry['li_launches'] if mode in ('window','window_query') else 4,
                 serial_event_us=s['event_mean_us'], fused_event_us=f['event_mean_us'],
                 serial_li_us=native_stages['li'], serial_lidu_prepare_us=native_stages['lidu_prepare'],
                 serial_fetch_us=native_stages['fetch'],
                 fused_profiler_p50_us=f['p50_us'], li_us=stage['li'],
                 resolve_fetch_us=stage['resolve_update'], gap_us=f['inter_kernel_gap_mean_us'],
                 other_and_edges_us=f['event_mean_us']-stage['li']-stage['resolve_update']-f['inter_kernel_gap_mean_us'],
-                **{key:components[key] if components else None for key in
-                   ('score_hot_us','score_cold_us','theta_us','service_us','final_us')},
+                **{key:components.get(key) if components else None for key in
+                   ('score_hot_us','score_cold_us','theta_us','service_us','final_us','query_topk_us')},
                 score_total_us=(components['score_hot_us']+components['score_cold_us']) if components else None,
                 effective_aic=fused.get('effective_aic', resources.get('effective_aic')),
                 effective_aiv=fused.get('effective_aiv', resources.get('effective_aiv')),
@@ -249,7 +255,7 @@ def summarize(output, jobs, measured_rounds):
         groups.setdefault((row['case'], row['prefetch'], row['batch'], row['miss_percent']), []).append(row)
     fields = ('serial_event_us', 'fused_event_us', 'fused_profiler_p50_us', 'li_us', 'resolve_fetch_us', 'gap_us',
               'other_and_edges_us','serial_li_us','serial_lidu_prepare_us','serial_fetch_us',
-              'score_hot_us','score_cold_us','score_total_us','theta_us','service_us','final_us')
+              'score_hot_us','score_cold_us','score_total_us','theta_us','service_us','final_us','query_topk_us')
     table = []
     for (case, pf, b, miss), samples in groups.items():
         if sorted(s['round'] for s in samples) != list(range(1, measured_rounds+1)):
@@ -277,6 +283,12 @@ def summarize(output, jobs, measured_rounds):
         if abs(sum(row[f'{k}_gain_vs_mr23_us'] for k in ('li','resolve_fetch','gap','other_and_edges'))-
                row['net_gain_vs_mr23_us'])>.05:
             raise RuntimeError('Full-chain gain decomposition is not additive')
+        window=groups.get(('window_budget',pf,b,miss))
+        old_window=sum(s['fused_event_us'] for s in window)/len(window) if window else None
+        row['over_window_budget']=row['fused_event_us']/old_window if old_window else None
+        row['net_gain_vs_window_us']=old_window-row['fused_event_us'] if old_window else None
+        row['per_round_over_window']=[s['fused_event_us']/next(r['fused_event_us'] for r in window
+            if r['round']==s['round']) for s in samples] if window else None
         table.append(row)
     with (output/'summary.csv').open('w', newline='') as f:
         writer = csv.DictWriter(f, list(table[0]))
@@ -287,10 +299,11 @@ def summarize(output, jobs, measured_rounds):
     print('case             pf  B  P miss% SerialBefore    Fused      LI Resolve/Get   /MR23   Gain us', flush=True)
     for r in table:
         print(f"{r['case']:16} {r['prefetch']:4} {r['batch']:2} {r['score_parts']:2} {r['miss_percent']:5g} {r['serial_event_us']:12.2f} {r['fused_event_us']:8.2f} {r['li_us']:7.2f} {r['resolve_fetch_us']:11.2f} {r['over_mr23']:7.3f} {r['net_gain_vs_mr23_us']:9.2f}")
-    print('Window components (us/call): case              pf  B miss%  HotScore ColdScore   theta Service   Final   LI launches', flush=True)
+    print('Window components (us/call): case              pf  B miss%  HotScore ColdScore   theta QueryTopK Service   Final   LI launches', flush=True)
     for r in table:
-        if r['score_mode']=='window':
-            print(f"{r['case']:16} {r['prefetch']:4} {r['batch']:2} {r['miss_percent']:5g} {r['score_hot_us']:9.2f} {r['score_cold_us']:9.2f} {r['theta_us']:7.2f} {r['service_us']:7.2f} {r['final_us']:7.2f} {r['li_kernel_launches']:13}")
+        if r['score_mode'] in ('window','window_query'):
+            q='inline' if r['query_topk_us'] is None else f"{r['query_topk_us']:.2f}"
+            print(f"{r['case']:16} {r['prefetch']:4} {r['batch']:2} {r['miss_percent']:5g} {r['score_hot_us']:9.2f} {r['score_cold_us']:9.2f} {r['theta_us']:7.2f} {q:>9} {r['service_us']:7.2f} {r['final_us']:7.2f} {r['li_kernel_launches']:13}")
     return table
 
 
@@ -338,6 +351,7 @@ def main(argv=None):
         output.mkdir(parents=True, exist_ok=False)
     output = output.resolve()
     print(f'Results directory: {output}', flush=True)
+    print(f'Source checkout: {ROOT}', flush=True)
     kvaf = a.kvaf_root.resolve()
     if a.prepare_kvaf and not a.dry_run:
         from prepare_kvaf import prepare_and_build

@@ -67,6 +67,11 @@ public:
 #if !V9_UBMEM
         AdvanceWindow(epoch,sequenceHalfWindow);
 #endif
+        PostWindow(epoch,sequenceHalfWindow);
+    }
+    // Query-parallel TopK has completed in the preceding same-stream kernel.
+    // Only the original request owner may perform union/admission/URMA posting.
+    __aicore__ inline void PostWindow(uint32_t epoch, uint32_t sequenceHalfWindow = 0) {
         // Join this producer's hit publication. Other producers remain free.
         PipeBarrier<PIPE_ALL>();
 #if defined(V9_UBMEM) && V9_UBMEM

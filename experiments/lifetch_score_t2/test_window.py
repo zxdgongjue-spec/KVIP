@@ -174,12 +174,13 @@ extern "C" void runtime(unsigned b,unsigned w,unsigned* out) {
                     main(['--kvaf-root',temp,'--dry-run','--output',str(output)]+extra)
                 self.assertFalse(output.exists())
 
-    def measured_trace(self, folder, waves=4):
+    def measured_trace(self, folder, waves=4, query_parallel=False):
         names=[]
         for epoch in range(waves):
             names.append('v9_li_kernel_score_window_t2_7_2')
             if epoch==0:names.append('v9_li_kernel_1_2')
-            names.append('v9_li_window_service_2')
+            if query_parallel:names.extend(['v9_li_window_topk_3','v9_li_window_post_2'])
+            else:names.append('v9_li_window_service_2')
         names += ['v9_li_kernel_3','v9_streaming_resolve_update']
         stride=6*len(names)+4
         origin=Decimal('1000000000000000.013')
@@ -244,6 +245,23 @@ extern "C" void runtime(unsigned b,unsigned w,unsigned* out) {
                 self.assertEqual(row['li_kernel_launches'],10)
                 self.assertEqual(row['net_gain_vs_mr23_us'],0)
             self.assertEqual(len(json.loads((output/'fixture_hashes.json').read_text())),2)
+
+    def test_query_parallel_cli_geometry_and_same_graph_accounting(self):
+        config=configuration(['bench','--batches','2','--li-score-parts','16','--li-score-mode','window_query'])
+        self.assertEqual(config.li_score_mode,'window_query')
+        shape=SimpleNamespace(batch=2,history=131072,resident=16384,rounds=4,indexHeads=32,
+                              splitQ=1,liCores=4,aicCount=32,serviceLanes=2)
+        old=score_window_schedule(shape,16);new=score_window_schedule(shape,16,True)
+        self.assertEqual(old['waves'],new['waves'])
+        self.assertEqual(new['topk_aivs'],8);self.assertEqual(new['li_launches'],14)
+        with tempfile.TemporaryDirectory() as temp:
+            folder=Path(temp);graph,_,_=self.measured_trace(folder,query_parallel=True)
+            components=li_components(folder,'window_query',new)
+            self.assertEqual(components['query_topk_us'],20)
+            self.assertEqual(components['service_us'],20)
+            self.assertEqual(sum(components.values()),graph['timing']['stage_mean_us']['li'])
+        with redirect_stderr(io.StringIO()),self.assertRaises(SystemExit):
+            configuration(['bench','--li-score-parts','16','--li-score-mode','window_query','--input','replay'])
 
 
 if __name__=='__main__':unittest.main()

@@ -162,9 +162,10 @@ class StreamingLIFetchForward:
         """
         from kvip.operators.lifetch.score_policy import validate_score_t2
         validate_score_t2(self.rotating.runtime_shape, parts)
-        if mode not in ('full', 'window'):
-            raise ValueError('score mode must be full or window')
-        name = 'kvip_lifetch_score_window_forward' if mode=='window' else 'kvip_lifetch_score_t2_forward'
+        if mode not in ('full', 'window', 'window_query'):
+            raise ValueError('score mode must be full, window or window_query')
+        name = {'full':'kvip_lifetch_score_t2_forward','window':'kvip_lifetch_score_window_forward',
+                'window_query':'kvip_lifetch_score_query_forward'}[mode]
         function = getattr(self.rotating.library, name, None)
         if function is None:
             raise ValueError('score_t2 requires a rebuilt URMA library with the experimental entry')
@@ -178,9 +179,9 @@ class StreamingLIFetchForward:
         function.restype = ctypes.c_uint32
         self.score_parts, self.function = parts, function
         self.score_mode = mode
-        if mode == 'window':
+        if mode in ('window', 'window_query'):
             from kvip.operators.lifetch.score_policy import score_window_schedule
-            self.score_geometry = score_window_schedule(self.rotating.runtime_shape, parts)
+            self.score_geometry = score_window_schedule(self.rotating.runtime_shape, parts, mode=='window_query')
 
     def __call__(self):
         stream = (
