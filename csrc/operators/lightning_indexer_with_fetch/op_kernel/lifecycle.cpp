@@ -186,7 +186,7 @@ extern "C" __global__ __aicore__ void v9_init_kernel(GM_ADDR bindings) {
         row->limit=kSlots;
         row->prefetchLimit=ctx->prefetchLimit;
         row->queueLimit=entity->sq_depth>1 ? entity->sq_depth-1 : 0;
-        row->error=queue->last_error;
+        row->error=queue->poisoned && queue->reserved[0] ? uint32_t(queue->reserved[0]) : uint32_t(queue->last_error);
         if(entity->sq_depth<2 || (entity->sq_depth&(entity->sq_depth-1)) || entity->cq_depth<2 ||
            !entity->sq_va || !entity->sq_db_va || ctx->prefetchLimit>kSlots ||
            ctx->windowLimit==0 || ctx->windowLimit>480)
@@ -236,6 +236,7 @@ __aicore__ inline void CompletePrefetch(__gm__ Context* ctx,uint32_t b) {
         row->error=uint32_t(error);
         if(!error) row->pending=0;
         if(error) queue->last_error=error;
+        if(error && !queue->reserved[0]) queue->reserved[0]=error;
         auto status=reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(args.core_status);
         kvaf_device::WriteStatus(status,error,row->requests,completed,queue->sq_producer_index,
             queue->cq_consumer_index,UINT64_MAX,0);
