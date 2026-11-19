@@ -114,71 +114,20 @@ __aicore__ inline uint64_t Post(
     return kvaf_device::kSuccess;
 }
 
-// KVAF exposes a blocking CQ poll but no try-poll. This is its CQE protocol
-// for the version pinned above. Only the time between unsuccessful probes
-// changes. The AIV owns this queue and is its sole CQ consumer.
-struct FinalPoll {
-    uint32_t probes = 0;
-    uint64_t pauseCycles = 0;
-    static constexpr uint32_t maxPauseCycles = 512000;
-};
-
-__aicore__ inline uint64_t WaitFinal(
-    __gm__ const KvafBatchGetDirectUrmaEntity* entity,
-    __gm__ KvafBatchGetQueueState* queue, FinalPoll& trace) {
-    const uint64_t cursor = queue->cq_consumer_index;
-    const uint32_t depth = entity->cq_depth;
-    const uint32_t expected = (cursor / depth) & 1U;
-    auto address = reinterpret_cast<__gm__ uint8_t*>(entity->cq_va) +
-                   (cursor % depth) * entity->cqe_size;
-    for (uint32_t poll = 1; poll <= kvaf_device::kMaxCqPolls; ++poll) {
-        kvaf_device::CleanCacheLines(address, kvaf_device::kCqeProbeBytes);
-        __asm__ __volatile__("");
-        const uint32_t word = *reinterpret_cast<__gm__ volatile uint32_t*>(address);
-        __asm__ __volatile__("");
-        if (((word >> 2U) & 1U) != expected) {
-            queue->cq_consumer_index = cursor + 1;
-            st_dev(static_cast<uint32_t>(cursor + 1) & kvaf_device::kCqConsumerMask,
-                   reinterpret_cast<__gm__ uint32_t*>(entity->cq_db_va), 0);
-            trace.probes += poll;
-            return (word >> 16U) ? kvaf_device::kCqError : kvaf_device::kSuccess;
-        }
-        // Completed CQEs take the fast branch above without reading a clock.
-        // Only the scalar system register is queried during a pause. The
-        // budget is shared by both checkpoints and any timeout retries.
-        if (poll >= 4 && poll != kvaf_device::kMaxCqPolls &&
-            trace.pauseCycles < FinalPoll::maxPauseCycles) {
-            uint32_t pause = poll < 8 ? 128 : (poll < 16 ? 256 : 512);
-            const uint32_t remaining = FinalPoll::maxPauseCycles - trace.pauseCycles;
-            if (pause > remaining) pause = remaining;
-            const uint64_t start = AscendC::GetSystemCycle();
-            uint64_t elapsed;
-            do {
-                elapsed = static_cast<uint64_t>(AscendC::GetSystemCycle()) - start;
-            } while (elapsed < pause);
-            trace.pauseCycles += elapsed;
-        }
-    }
-    trace.probes += kvaf_device::kMaxCqPolls;
-    return kvaf_device::kCqTimeout;
-}
-
 // Only a timeout leaves the native CQ consumer index unchanged. An error CQE
 // has still consumed its slot, so the next FIFO checkpoint may then be polled.
 template<bool RetryTimeout>
-__aicore__ inline uint64_t Retire(State& state, uint64_t previousError, FinalPoll* trace = nullptr) {
+__aicore__ inline uint64_t Retire(State& state, uint64_t previousError) {
     if (!state.pending) return state.error;
     auto entity = reinterpret_cast<__gm__ const KvafBatchGetDirectUrmaEntity*>(state.entity);
     auto queue = reinterpret_cast<__gm__ KvafBatchGetQueueState*>(state.queue);
     auto status = reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(state.status);
     uint32_t polls = 0;
-    uint64_t error;
-    if constexpr (RetryTimeout) error = WaitFinal(entity, queue, *trace);
-    else error = kvaf_device::WaitForCompletion(entity, queue, &polls);
+    const uint64_t error = kvaf_device::WaitForCompletion(entity, queue, &polls);
     uint64_t completion = error;
     if constexpr (RetryTimeout) {
         if (error == kvaf_device::kCqTimeout)
-            completion = WaitFinal(entity, queue, *trace);
+            completion = kvaf_device::WaitForCompletion(entity, queue, &polls);
     }
     if (!completion) { ++queue->completed_batch_count; state.completed = state.requests; }
     if (error) queue->poisoned = 1;
@@ -209,15 +158,10 @@ __aicore__ inline uint64_t Wait(State& state) {
 // Both states belong to one private FIFO. Retire an accepted suffix after a
 // consumed prefix error, but never charge a late prefix CQE to that suffix.
 // After two timeouts the queue must be torn down: its pending DMA is unknown.
-__aicore__ inline uint64_t RetirePair(State& first, State& second,
-                                     __gm__ uint64_t* statistics = nullptr) {
-    FinalPoll trace{};
-    const uint64_t prefixError = Retire<true>(first, 0, &trace);
-    const uint64_t suffixError = first.pending ? 0 : Retire<true>(second, prefixError, &trace);
-    if (statistics) {
-        const uint64_t ticks = trace.pauseCycles > UINT32_MAX ? UINT32_MAX : trace.pauseCycles;
-        *statistics = (ticks << 32U) | trace.probes;
-    }
+__aicore__ inline uint64_t RetirePair(State& first, State& second) {
+    const uint64_t prefixError = Retire<true>(first, 0);
+    if (first.pending) return prefixError;
+    const uint64_t suffixError = Retire<true>(second, prefixError);
     return prefixError ? prefixError : suffixError;
 }
 
