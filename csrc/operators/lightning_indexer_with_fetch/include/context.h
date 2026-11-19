@@ -29,9 +29,10 @@ struct alignas(128) Row {
     uint32_t limit, prefetchLimit, queueLimit, pending;
     uint64_t initialHead;
     uint32_t epochOrder[kMaxRounds], sequence;
-    uint32_t finalRequests, finalPending;
+    uint32_t finalRequests, finalPending, finalQueryErrors; // Word 249, previously alignment padding.
     uint64_t finalHead, finalBegin, finalEnd;
 };
+static_assert(__builtin_offsetof(Row, finalQueryErrors)==249*4 && sizeof(Row)==1024,"Serving feedback ABI");
 struct alignas(128) Event {
     uint64_t begin, end;
     uint32_t core, epoch, complete, skipped;

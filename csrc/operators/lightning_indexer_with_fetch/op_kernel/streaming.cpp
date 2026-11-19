@@ -962,7 +962,10 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
    if(profile){postCycles=status->profile.post_active_cycles;waitCycles=status->profile.drain_wait_cycles;groups=status->profile.submitted_group_count;
     status->profile.magic=oldProfile;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&status->profile),sizeof(status->profile));}
    error|=status->result;completed+=status->completed_batch_count;
-   if(status->magic!=KVAF_AIV_BATCH_GET_STATUS_MAGIC || status->processed_request_count!=size)error|=kvaf_device::kInvalidArgs;
+   // KVAF returns an enum. A failed Get can legitimately process fewer
+   // descriptors; preserve the transport result instead of OR-ing two enums.
+   if(status->magic!=KVAF_AIV_BATCH_GET_STATUS_MAGIC)error=kvaf_device::kInvalidArgs;
+   else if(!error && status->processed_request_count!=size)error=kvaf_device::kInvalidArgs;
   }
 #else
   if(size)error|=kvaf_device::kInvalidArgs;
@@ -1143,6 +1146,18 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
  if(profile)ft[2]=GetSystemCycle();
  info[0]|=uint32_t(error);info[3]=deferred?1:0;info[4]=completed;
  if(!error)row->finalPending=0;
+#if !V9_UBMEM
+ if(error){
+  // Flags 8..11 have joined. Keep each Q's raw failure in the existing
+  // feedback copy, before retirement clears the live flags.
+  uint32_t codes=0;
+  for(uint32_t q=0;q<4;++q){
+   uint32_t code=flags[8+q].error;
+   codes|=(code<255U?code:255U)<<(8*q);
+  }
+  row->finalQueryErrors=codes;
+ }
+#endif
 #if V9_UBMEM
  auto status=UbmemStatusAt(ctx,b);status[0]=error|updateError;status[1]=row->requests;
  status[3]=total;status[4]=completed;status[5]=(status[2]+completed)*shape.tokenBytes;
