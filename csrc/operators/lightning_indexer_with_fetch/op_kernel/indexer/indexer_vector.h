@@ -512,6 +512,9 @@ private:
         DataCopy(thresholds[q * 128], prefixThreshold_[(query % 2) * 128], 128);
         PipeBarrier<PIPE_ALL>();
         auto context = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+#if !KVIP_RANKED_PORT
+        // The unranked scanner consumes a predicate indexed by LRU victim
+        // ordinal. Ranked Fetch consumes the seed IDs and their residency tags.
         if (context->lruSlots) {
             // TopK scratch is dead after the resident result is saved. Reuse
             // 16KiB: 4KiB scores, 8KiB victim IDs, 4KiB predicate scratch.
@@ -560,6 +563,7 @@ private:
             DataCopyPad(bitmap, hitChunk.template ReinterpretCast<uint8_t>(), copy);
             SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
         }
+#endif
 #if KVIP_RANKED_PORT
         SeedIncremental(query,scoreRow,thresholdReady);
 #endif
@@ -1282,7 +1286,17 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     if (!streamingTopkOnly_) {
         auto events=reinterpret_cast<__gm__ rotating::Event*>(ctx->events);
         uint64_t started=GetSystemCycle();
-        for(uint32_t i=0;i<runtimeShape_.rounds*runtimeShape_.serviceLanes;++i) {
+        uint32_t begin=0, end=runtimeShape_.rounds*runtimeShape_.serviceLanes;
+#if KVIP_RANKED_PORT
+        // Every Fetch owner writes only rows congruent to its lane. complete
+        // is ordered across epochs for that lane. Only that row's mapping
+        // and reservation count are consumed by ClassifyTopkHalf below.
+        if(runtimeShape_.rounds) {
+            begin=(runtimeShape_.rounds-1)*runtimeShape_.serviceLanes+b%runtimeShape_.serviceLanes;
+            end=begin+1;
+        }
+#endif
+        for(uint32_t i=begin;i<end;++i) {
             while(true) {
                 kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(events+i),64);
                 if(events[i].complete)break;

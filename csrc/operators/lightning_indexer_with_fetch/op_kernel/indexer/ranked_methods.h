@@ -109,16 +109,16 @@ __aicore__ inline void FlushIncremental(uint32_t count,uint32_t base,bool clearC
     }
     PipeBarrier<PIPE_V>();
 }
-// All cold windows publish once. Finalization joins the last posting owner.
-__aicore__ inline bool PreviousServiceReady(uint32_t epoch,uint32_t lane) {
+// A committed rank is immutable until its next rank owner. Posting uses a
+// separate offer packet, never the prefix being consumed by the final query.
+__aicore__ inline void WaitForRank(uint32_t epoch,uint32_t lane) {
+    if(!epoch)return;
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
-    auto events=reinterpret_cast<__gm__ volatile rotating::Event*>(ctx->events);
-    if(epoch) {
-        auto previous=events+(epoch-1)*runtimeShape_.serviceLanes+lane;
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ rotating::Event*>(previous)),64);
-        return previous->complete!=0;
-    }
-    return true;
+    auto event=reinterpret_cast<__gm__ volatile rotating::Event*>(ctx->events)
+        +(epoch-1)*runtimeShape_.serviceLanes+lane;
+    do {
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ rotating::Event*>(event)),64);
+    } while(!event->rankReady);
 }
 // Snapshot the next Q before submitting any DMA. The owner of this service
 // lane is the only writer of these incremental states until the window ends.
@@ -163,7 +163,7 @@ __aicore__ inline void PreloadIncremental(uint32_t half) {
     incrementalInputQuery_=query;incrementalInputBase_=base;incrementalInputCount_=n;
     incrementalInputPending_=true;
 }
-__aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t end1,uint32_t half) {
+__aicore__ inline bool AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t end1,uint32_t half) {
     constexpr uint32_t prefixBytes=4*2048*6+1024;
     auto meta=IncrementalMeta(query);
     if(!incrementalMetadataActive_)kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(meta),128);
@@ -172,9 +172,9 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
     uint64_t cursor=incrementalMetadataActive_?incrementalMetadata_.GetValue(mi+1):meta[1];
     uint32_t prior[2]={uint32_t(cursor),uint32_t(cursor>>32)};
     uint32_t ends[2]={end0,end1};
-    if (!source) return;
+    if (!source) return false;
     const uint32_t savedOffer=exportWindowCold_ ? uint32_t(incrementalMetadata_.GetValue(mi+3)) : 0;
-    const uint32_t savedStrict=exportWindowCold_ ? uint32_t(incrementalMetadata_.GetValue(mi+5)) : 0;
+    const uint32_t savedStrict=exportWindowCold_ ? uint32_t(incrementalMetadata_.GetValue(mi+5)) : uint32_t(meta[5]);
     mappedExport_=false;
     if (end0<=prior[0] && (!half || end1<=prior[1])) {
         // The prior TopK is already persisted. Fetch can reuse it unchanged.
@@ -188,7 +188,7 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
             SetFlag<HardEvent::MTE2_V>(EVENT_ID5);WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);
             PublishWindowRank(query);
         }
-        return;
+        return false;
     }
     const uint32_t batch=query/4,q=query%4;
     mappedValid_=incrementalFinalValid_ ? Min(runtimeShape_.history,incrementalFinalValid_) : runtimeShape_.history;
@@ -372,11 +372,8 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
                 PublishWindowRank(query);
             }
             incrementalMetadata_.SetValue(mi+1,nextCursor);
-        } else {
-            meta[1]=nextCursor;
-            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(meta),128);
         }
-        return;
+        return false;
     }
 
     const uint32_t strict=savedStrict ? savedStrict-1 : 2048;
@@ -399,19 +396,21 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
             reinterpret_cast<__ubuf__ uint32_t*>(freshIds.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint16_t*>(mrgValueLocal_[2048].GetPhyAddr()),strict,packed);
         PipeBarrier<PIPE_V>();
+        if(!exportWindowCold_)return true;
         PublishWindowRank(query);
         incrementalMetadata_.SetValue(mi+5,strict+packed+1);
     } else {
         FlushIncremental(packed,packBase,false);
         PipeBarrier<PIPE_V>();
+        // This query's public output is the sole consumer of the final IDs.
+        // Leave the last committed window prefix and its metadata together.
+        if(!exportWindowCold_)return true;
         if(!mappedExport_)lifetch_incremental::Minimum(reinterpret_cast<__ubuf__ uint16_t*>(scoreOutLocal_.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(topkSharedTmpLocal_.GetPhyAddr()));
         SetFlag<HardEvent::V_S>(EVENT_ID5);WaitFlag<HardEvent::V_S>(EVENT_ID5);
         threshold=topkSharedTmpLocal_.template ReinterpretCast<uint16_t>().GetValue(0);
-        if(exportWindowCold_) {
-            PublishWindowRank(query,mappedExport_);
-            incrementalMetadata_.SetValue(mi+5,topkOp_.RankedStrictCount()+1);
-        }
+        PublishWindowRank(query,mappedExport_);
+        incrementalMetadata_.SetValue(mi+5,topkOp_.RankedStrictCount()+1);
     }
     SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
     DataCopy(stateScores[first],scoreOutLocal_[first],2048-first);
@@ -424,6 +423,7 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
         meta[1]=uint64_t(prior[0])|(uint64_t(prior[1])<<32);meta[2]=threshold;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(meta),128);
     }
+    return true;
 }
 __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
@@ -438,10 +438,7 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     }
     // Only the prefix writer must finish here. Ordered row/SQ ownership
     // is acquired by FastService after this window has frozen its offers.
-    if(epoch) {
-        auto previous=reinterpret_cast<__gm__ volatile rotating::Event*>(ctx->events)+(epoch-1)*runtimeShape_.serviceLanes+lane;
-        do {kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ rotating::Event*>(previous)),64);}while(!previous->rankReady);
-    }
+    WaitForRank(epoch,lane);
     uint64_t begin=trace?GetSystemCycle():0;
     rankedEpoch_=epoch;
     for(auto& count:rankedCounts_)count=0;
@@ -528,23 +525,20 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     return true;
 }
 __aicore__ inline void FinalIncremental(uint32_t query,uint32_t valid) {
-    auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
-    if(runtimeShape_.rounds) {
-        uint32_t lane=(query/4)%runtimeShape_.serviceLanes;
-        // Only the final consumer must join outstanding state; never spin in
-        // an optional intermediate window.
-        while(!PreviousServiceReady(runtimeShape_.rounds,lane)) {}
-    }
+    const uint32_t lane=(query/4)%runtimeShape_.serviceLanes;
+    WaitForRank(runtimeShape_.rounds,lane);
     uint32_t half=rotating::UseSequenceSplit(runtimeShape_)?rotating::SequenceHalfWindow(runtimeShape_):0;
     uint32_t alignedValid=(valid+127U)&~127U;
     incrementalFinalValid_=valid;
-    AdvanceIncremental(query,alignedValid,half?alignedValid:0,half);
+    const bool localIds=AdvanceIncremental(query,alignedValid,half?alignedValid:0,half);
     incrementalFinalValid_=0;
-    constexpr uint32_t prefixBytes=4*2048*6+1024;
-    GlobalTensor<uint32_t> ids;
-    ids.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(WindowTopkPrefix()+(query/4)*prefixBytes+4*2048*2)+(query%4)*2048);
-    PipeBarrier<PIPE_ALL>();DataCopy(indicesOutLocal_,ids,2048);
-    SetFlag<HardEvent::MTE2_V>(EVENT_ID5);WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);
+    if(!localIds) {
+        constexpr uint32_t prefixBytes=4*2048*6+1024;
+        GlobalTensor<uint32_t> ids;
+        ids.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(WindowTopkPrefix()+(query/4)*prefixBytes+4*2048*2)+(query%4)*2048);
+        PipeBarrier<PIPE_ALL>();DataCopy(indicesOutLocal_,ids,2048);
+        SetFlag<HardEvent::MTE2_V>(EVENT_ID5);WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);
+    }
     lifetch_ranked::DecodePublicIds(reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()));
     PipeBarrier<PIPE_V>();
 }
