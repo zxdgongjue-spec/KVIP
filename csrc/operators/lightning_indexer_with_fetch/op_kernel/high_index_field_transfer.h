@@ -4,31 +4,67 @@
 // Each request has four vector cores. For a long permutation a core owns
 // four adjacent key words in every tuple, and at most one companion column.
 // Its private buffer therefore contains all originals of the fields it can overwrite.
+template<bool Scatter, uint32_t Width>
+__simt_callee__ inline void CopyOwnedFieldGroup(__gm__ Edge* edges, uint32_t first, uint32_t singles,
+        uint32_t lane, uint32_t field, __gm__ uint64_t* keys, __gm__ uint32_t* scales,
+        __gm__ uint64_t* addr, __gm__ uint64_t* logical, __ubuf__ uint64_t* saved) {
+    uint32_t pos[Width];
+    uint64_t keysWord[Width];
+    auto metadata=saved+uint64_t(singles)*4;
+#pragma unroll
+    for (uint32_t j=0;j<Width;++j) {
+        auto edge=edges+kCapacity-1-first-j*64;
+        pos[j]=Scatter ? asc_ldcg(&edge->dst) : asc_ldcg(&edge->src);
+    }
+#pragma unroll
+    for (uint32_t j=0;j<Width;++j) {
+        if constexpr (Scatter) keysWord[j]=saved[uint64_t(first+j*64)*4+field];
+        else keysWord[j]=asc_ldcg(keys+uint64_t(pos[j])*16+4*lane+field);
+    }
+    if (!field && lane<2) {
+        auto data=(lane==0 ? addr : logical);
+        uint64_t values[Width];
+#pragma unroll
+        for (uint32_t j=0;j<Width;++j) {
+            if constexpr (Scatter) values[j]=metadata[first+j*64];
+            else values[j]=asc_ldcg(data+pos[j]);
+        }
+#pragma unroll
+        for (uint32_t j=0;j<Width;++j) {
+            if constexpr (Scatter) asc_stcg(data+pos[j],values[j]);
+            else metadata[first+j*64]=values[j];
+        }
+    } else if (!field && lane==2) {
+        auto scalesUB=reinterpret_cast<__ubuf__ uint32_t*>(metadata);
+        uint32_t values[Width];
+#pragma unroll
+        for (uint32_t j=0;j<Width;++j) {
+            if constexpr (Scatter) values[j]=scalesUB[first+j*64];
+            else values[j]=asc_ldcg(scales+pos[j]);
+        }
+#pragma unroll
+        for (uint32_t j=0;j<Width;++j) {
+            if constexpr (Scatter) asc_stcg(scales+pos[j],values[j]);
+            else scalesUB[first+j*64]=values[j];
+        }
+    }
+#pragma unroll
+    for (uint32_t j=0;j<Width;++j) {
+        if constexpr (Scatter) asc_stcg(keys+uint64_t(pos[j])*16+4*lane+field,keysWord[j]);
+        else saved[uint64_t(first+j*64)*4+field]=keysWord[j];
+    }
+}
+
 template<bool Scatter>
 __simt_callee__ inline void TransferOwnedPhase(__gm__ Edge* edges, uint32_t p0, uint32_t p1, uint32_t singles,
         uint32_t lane, __gm__ uint64_t* keys, __gm__ uint32_t* scales, __gm__ uint64_t* addr,
         __gm__ uint64_t* logical, __ubuf__ uint64_t* saved) {
     if constexpr (!Scatter) TransferPairSlice(edges,p0,p1,keys,scales,addr,logical);
     const uint32_t field=threadIdx.x%4;
-    auto metadata=saved+uint64_t(singles)*4;
-    for (uint32_t i=threadIdx.x/4; i<singles; i+=64) {
-        auto edge=edges+kCapacity-1-i;
-        uint32_t pos=Scatter ? asc_ldcg(&edge->dst) : asc_ldcg(&edge->src);
-        auto key=keys+uint64_t(pos)*16+4*lane+field;
-        auto word=saved+uint64_t(i)*4+field;
-        if constexpr (Scatter) asc_stcg(key,*word);
-        else *word=asc_ldcg(key);
-
-        if (!field && lane<2) {
-            auto data=(lane==0 ? addr : logical)+pos;
-            if constexpr (Scatter) asc_stcg(data,metadata[i]);
-            else metadata[i]=asc_ldcg(data);
-        } else if (!field && lane==2) {
-            auto values=reinterpret_cast<__ubuf__ uint32_t*>(metadata);
-            if constexpr (Scatter) asc_stcg(scales+pos,values[i]);
-            else values[i]=asc_ldcg(scales+pos);
-        }
-    }
+    uint32_t i=threadIdx.x/4;
+    for(;i+64<singles;i+=128)
+        CopyOwnedFieldGroup<Scatter,2>(edges,i,singles,lane,field,keys,scales,addr,logical,saved);
+    if(i<singles) CopyOwnedFieldGroup<Scatter,1>(edges,i,singles,lane,field,keys,scales,addr,logical,saved);
 }
 
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
