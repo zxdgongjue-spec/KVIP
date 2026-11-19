@@ -789,7 +789,7 @@ template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::BeginFinalMetadata(uint32_t query)
 {
 #if !V9_UBMEM
-    if (!streamingWorkspace_ || !streamingTopkOnly_ || runtimeShape_.resident!=16384) return;
+    if (adaptiveZero_ || !streamingWorkspace_ || !streamingTopkOnly_ || runtimeShape_.resident!=16384) return;
 #else
     if (!streamingWorkspace_ || !streamingTopkOnly_ || prefixActive_ || runtimeShape_.resident!=16384) return;
 #endif
@@ -1018,6 +1018,17 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
 #if KVIP_STREAMING_LI
         uint32_t streamingQuery = info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx;
         streamingPrefetched_ = false;
+#if !V9_UBMEM
+        __gm__ uint64_t* topkTicks = nullptr;
+        uint64_t topkStart = 0;
+        auto args = reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_);
+        if (!prefixActive_ && args && (args->prefetchCount & 0x80000000U)) {
+            topkTicks = reinterpret_cast<__gm__ uint64_t*>(args->times) +
+                        uint64_t(runtimeShape_.batch)*64 + uint64_t(streamingQuery)*16;
+            // A padded Q has no sort. Overwrite any previous sample in its slot.
+            topkTicks[14] = topkTicks[15] = 0;
+        }
+#endif
 #endif
 
         SCORE_T zero = 0;
@@ -1067,6 +1078,9 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         WaitFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);
         WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
 
+#if KVIP_STREAMING_LI && !V9_UBMEM
+        if (topkTicks) topkStart = GetSystemCycle();
+#endif
         AscendC::DataCopyPadExtParams<SCORE_T> padParams{true, 0, 0, 0};
 #if !V9_UBMEM
         if (!prefixActive_ && !adaptiveZero_ && validS2Len >= runtimeShape_.resident &&
@@ -1200,6 +1214,16 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         SetFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);
         SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
         WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
+#if KVIP_STREAMING_LI && !V9_UBMEM
+        if (topkTicks) {
+            // V->MTE3 orders the output DMA; GetSystemCycle reads on S. Add
+            // only the diagnostic V->S event to timestamp vector completion.
+            SetFlag<HardEvent::V_S>(EVENT_ID5);
+            WaitFlag<HardEvent::V_S>(EVENT_ID5);
+            topkTicks[14] = topkStart;
+            topkTicks[15] = GetSystemCycle();
+        }
+#endif
         if (prefixActive_) {
             if (validS2Len < topkCount_) Duplicate(scoreOutLocal_, uint16_t(0), topkCount_);
 #if !V9_UBMEM
