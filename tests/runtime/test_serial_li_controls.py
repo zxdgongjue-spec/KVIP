@@ -63,11 +63,13 @@ class SerialControls(unittest.TestCase):
 
     def test_three_way_plan_preserves_legacy(self):
         args = full_chain_compare.arguments(['--kvaf-server', 'example:28885'], serial=True)
+        self.assertEqual(args.miss_percent, (0, 3, 5, 10, 15, 20))
         jobs = list(serial_chain_compare.plan(args, Path('/tmp/plan')))
         self.assertEqual(len(jobs), 8)
         for job in jobs:
             config = configuration(job['argv'][2:])
             self.assertTrue(config.compare_optimized_serial)
+            self.assertEqual(config.miss_percent, args.miss_percent)
             self.assertEqual((config.score_route, config.score_post, config.score_service), ('legacy', 'separate', 'separate'))
         self.assertEqual(len(list(full_chain_compare.plan(args, Path('/tmp/old-plan')))), 24)
 

@@ -111,6 +111,9 @@ W2 避免 legacy B1 请求 W8 时实际降为 W2 的几何差异。`--q-workers`
 ### 原串行 / 优化后串行 / 库上 P2 融合三场景
 
 需要隔离 LI 优化对串行链的影响时，使用这个入口；上述 `history_direct` 不属于优化后串行链。
+脚本在 KVIP checkout 中执行，下面的 `wt-mr14` 是 KVIP 仓库目录。若 KVIP 安装在
+vLLM-DSA 的 `third_party/KVIP`，也应先进入该 KVIP 目录。三路默认 miss 为
+0/3/5/10/15/20%，可通过 `--miss-percent` 指定其他列表。
 
 ```bash
 cd /home/w00568585/wt-mr14
@@ -118,7 +121,7 @@ source /usr/local/Ascend/cann/set_env.sh
 source scripts/env.sh
 bash tests/operators/lifetch/run_serial_vs_fused_a5.sh \
   --device 5 --kvaf-root third_party/KVAF --kvaf-server 127.0.0.1:28885 \
-  --batches 1 --miss-percent 0,3,10,50,90,100 --prefetch 0,512 \
+  --batches 1,16 --miss-percent 0,3,5,10,15,20 --prefetch 0,512 \
   --rounds 3 --warmup 4 --iterations 50
 ```
 

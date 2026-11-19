@@ -41,7 +41,8 @@ def arguments(argv=None, *, serial=False):
     p.add_argument("--device", type=int, default=5)
     p.add_argument("--python", default=sys.executable)
     p.add_argument("--batches", type=lambda s: csv_numbers(s, int), default=(1, 16))
-    p.add_argument("--miss-percent", type=lambda s: csv_numbers(s, float), default=(0, 3, 10, 50, 90, 100))
+    p.add_argument("--miss-percent", type=lambda s: csv_numbers(s, float),
+                   default=(0, 3, 5, 10, 15, 20) if serial else (0, 3, 10, 50, 90, 100))
     p.add_argument("--prefetch", type=lambda s: csv_numbers(s, int), default=(0, 512))
     p.add_argument("--rounds", type=int, default=3, help="Measured rounds, in addition to discarded r0")
     p.add_argument("--warmup", type=int, default=4)
