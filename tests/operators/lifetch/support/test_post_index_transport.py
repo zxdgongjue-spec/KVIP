@@ -117,7 +117,8 @@ int main(){
     f.args.core_status=reinterpret_cast<uint64_t>(&status);
     CHECK(Post(f.args,0,5,first)==0 && Post(f.args,5,13,second)==0);
     aiv_model::status_base=f.args.core_status;
-    CHECK(RetirePair(first,second)==0);
+    uint64_t stats=UINT64_MAX;
+    CHECK(RetirePair(first,second,&stats)==0 && stats==2);
     aiv_model::status_base=0;
     CHECK(aiv_model::header_cleans==2 && aiv_model::profile_cleans==0);
     CHECK(std::memcmp(&oldProfile,&status.profile,sizeof(status.profile))==0);
@@ -133,7 +134,12 @@ int main(){
     aiv_model::inject_polls=fault==1 ? kMaxCqPolls : fault==2 ? 2*kMaxCqPolls : 0;
     aiv_model::inject_error=fault==3;
     const uint64_t expected=fault==0 ? kSuccess : fault==3 ? kCqError : kCqTimeout;
-    CHECK(RetirePair(first,second)==expected);
+    uint64_t statistics=0;
+    CHECK(RetirePair(first,second,&statistics)==expected);
+    CHECK((statistics>>32)==((fault==1 || fault==2) ? FinalPoll::maxPauseCycles : 0));
+    uint32_t expectedProbes=fault==1 ? kMaxCqPolls+2 :
+                            fault==2 ? 2*kMaxCqPolls+target : 2;
+    CHECK(uint32_t(statistics)==expectedProbes);
     CHECK(f.statuses[0].result==expected && f.queues[0].last_error==expected);
     CHECK(bool(f.queues[0].poisoned)==bool(fault));
     const uint64_t retired=fault==2 ? target : 2;
@@ -144,6 +150,33 @@ int main(){
     CHECK(first.completed==(retired>=1 && !(fault==3 && target==0) ? 5u : 0u));
     CHECK(second.completed==(retired==2 && !(fault==3 && target==1) ? 13u : 0u));
     bool blocking=false;CHECK(Preflight(f.args,0,1,blocking)==(fault ? kInvalidQueue : kSuccess));
+  }
+  // Deliver after an explicit number of empty probes, straddling the native
+  // doorbell wrap. Verify both paths consume exactly one real CQE each.
+  for(bool paced : {false,true}){
+    for(uint32_t misses : {0U,3U,4U,8U,17U,6000U}){
+      Fixture f(64,1,1,0); State state;
+      auto& queue=f.queues[0]; auto& hardware=aiv_model::hardware[0];
+      constexpr uint64_t cursor=(1ULL<<22)-1;
+      queue.magic=kQueueMagic;queue.initialized=1;
+      queue.cq_consumer_index=hardware.cq_producer=hardware.cq_consumer=cursor;
+      // Before the CQE arrives, owner still belongs to the previous epoch.
+      hardware.cq[(cursor%8)*16]=uint32_t((cursor/8)&1U)<<2;
+      aiv_model::inject_checkpoint=cursor;aiv_model::inject_polls=misses;aiv_model::inject_error=false;
+      CHECK(Post(f.args,0,2,state)==0);
+      const uint64_t cycleBefore=aiv_model::cycle;
+      if(paced){
+        uint64_t stats=UINT64_MAX;State empty{};
+        CHECK(RetirePair(state,empty,&stats)==0);
+        uint32_t delay=0;
+        for(uint32_t n=4;n<=misses;n++)delay+=n<8?128:n<16?256:512;
+        CHECK((stats>>32)==std::min(delay,FinalPoll::maxPauseCycles));
+        CHECK(uint32_t(stats)==misses+1);
+        if(misses<4)CHECK(aiv_model::cycle==cycleBefore);
+      }else CHECK(Wait(state)==0);
+      CHECK(hardware.cq_db==0 && hardware.cq_consumer==cursor+1 && queue.cq_consumer_index==cursor+1);
+      CHECK(state.completed==2 && !state.pending && !aiv_model::inject_polls);
+    }
   }
   aiv_model::inject_checkpoint=UINT64_MAX;
   {KvafExecuteBatchGetKernelArgs args{};State state;bool blocking=false;

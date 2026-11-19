@@ -87,7 +87,7 @@ uint32_t Wait(State& s){if(!s.seq)return 0;auto& q=sim->q[lane];assert(appliedTh
         sim->input.badPreflight>=0 || sim->input.badDescriptor>=0 || sim->input.badPost>=0);assert(++q.drained==s.seq);
     if(int(lane)==sim->input.badWait && s.seq==1)return 1;
     s.completed=s.count;return 0;}
-uint32_t RetirePair(State& a,State& b){uint32_t e=Wait(a);return e|Wait(b);}
+uint32_t RetirePair(State& a,State& b,uint64_t* stats){if(stats)*stats=0;uint32_t e=Wait(a);return e|Wait(b);}
 uint32_t GetBlocking(QueueArgs& args,unsigned begin,unsigned count,State& s){if(int(lane)==sim->input.badBlock)return 1;
     Post(args,begin,count,s);auto err=Wait(s);s.seq=0;return err;}
 }
@@ -151,7 +151,7 @@ void run(Input in){World world{in};sim=&world;world.e.cq_depth=in.cqDepth;
             assert(mark[30]>=rec.indexDone && mark[30]<=rec.cqDone);
             if(q)assert(mark[28]==0 && mark[29]==0);
             else assert(rec.indexDone<=mark[28] && mark[28]<=mark[29] && mark[29]<=mark[30]);
-            assert(mark[2]==0x52514935 && mark[20]<=mark[21] && mark[21]==rec.packDone);
+            assert(mark[2]==0x52514936 && mark[20]<=mark[21] && mark[21]==rec.packDone);
             assert(mark[21]<=mark[23] && mark[23]<=mark[3]);
             if(!q)assert(mark[21]<=mark[22] && mark[22]<=mark[23]);
             if(q==1)for(int n=24;n<28;++n)assert(mark[n]);
