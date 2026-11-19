@@ -167,11 +167,16 @@ inline void Resolve(__ubuf__ Args* a, StagedContextPointer ctx, uint32_t b,
     if (tid<4) {
         Group g=FetchGroup(a,batch,b,tid);
         uint32_t n=ctl[2+tid], offset=n ? asc_atomic_add(g.counters,n) : 0;
-        if (offset>stride || n>stride-offset) asc_atomic_or(ctl+1,16U);
+        // This flag must be distinct from the completed allocator error:
+        // other warps may still be checking ctl[1] before joining us.
+        if (offset>stride || n>stride-offset) asc_atomic_or(ctl+14,16U);
         ctl[28+tid]=offset;
     }
     asc_syncthreads();
-    if (ctl[1]) return;
+    if (ctl[14]) {
+        if (!tid) ctl[1]=16U;
+        return;
+    }
     for (uint32_t i=tid; i<span; i+=kThreads) {
         const uint32_t token=selected[i], handle=loc[i];
         if (token==UINT32_MAX || !(handle&kBucket)) continue;
