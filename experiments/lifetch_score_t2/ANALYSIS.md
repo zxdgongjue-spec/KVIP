@@ -86,3 +86,5 @@ A5 `r0_pf1024_score_t2_p2` 的 B1/B16 完成执行，均未通过正确性：B1 
 使用同一实际消费函数、相同 B1/Q4/H32768/R16384 输入的 CANN Model 对比：保留的修复前二进制有 **37236/65536 个 Cold predicate 错误**；修复后 **0 个错误，PASS**，strict greater-than ties、输入、阈值和 guard 检查通过。NPU/sim 目标共享该消费源文件；本次实际编译运行为 CANN 9.1 sim。详见 `cold_model_result.json`。另一个 H128K 的修复前 probe 也出现大量 predicate 错误；没有将不同几何数据作为同场景比值。
 
 该结果验证了消费路径同步修复，没有执行 Service、Final TopK、URMA 或 Index commit，也未测量 A5 修复后的性能。先运行 `run_cold_contract.sh --device 5 --batches 1,16`，再按原固定参数运行完整 `run_a5.sh`。所有正确性 PASS 后，才评估 P2/P16 的耗时和剩余瓶颈。
+
+补充同几何 H128K 的实际消费函数 Model 对照也已完成：相同 B1/Q4/H131072/R16384/T2 和不同 Q 阈值输入，修复前 252370/458752 个 Cold predicate 错误，修复后 0 个错误，ties 和 guard PASS。见 `CORRECTNESS.md`、`predicate_model_result.json`；单独入口为 `run_predicate.sh`。未将该 Model 的 271721 ticks 换算为 A5 时间，也没有据此声称完整 TopK/Service/Fetch 已正确。

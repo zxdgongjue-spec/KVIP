@@ -1,0 +1,34 @@
+{
+  "date": "2026-11-19",
+  "scope": "CANN Model actual precomputed Cold consumer only; no Service/TopK/Fetch",
+  "cann": "9.1.0",
+  "soc_compile": "Ascend950PR_9599",
+  "soc_model": "Ascend950PR_9589",
+  "geometry": {
+    "batch": 1,
+    "queries": 4,
+    "history": 131072,
+    "resident": 16384,
+    "aic": 2,
+    "aiv": 4,
+    "cold_keys": 458752
+  },
+  "input_pattern": "Distinct Q thresholds 15088/15236/32768/49152; full uint16 sortable-key range; every eleventh token ties its Q threshold",
+  "before": {
+    "status": "FAIL",
+    "predicate_mismatches": 252370,
+    "log_sha256": "c96f0eecf1038013c22832b922f4273ab05b2c38f4275f69e87906fba1fad491",
+    "consumer_sha256": "f7cd66157f184e0d0a5ec0bd414380ced5d23640b3dc3e16b16602f0ada4c826"
+  },
+  "after": {
+    "status": "PASS",
+    "predicate_mismatches": 0,
+    "strict_gt_ties": true,
+    "guards": true,
+    "whole_model_ticks": 271721,
+    "log_sha256": "4d14620f7adfa148aecc387472066d7f446a6c3c4286b898025f399886106809",
+    "consumer_sha256": "500c06932121b828ce30d7e70d2f005b89e0ca8d4507b0d2eadc2db84f7cbbeb"
+  },
+  "full_hardware_execution": "NOT_REVALIDATED",
+  "hardware_latency": "NOT_MEASURED"
+}

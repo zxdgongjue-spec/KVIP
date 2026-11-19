@@ -19,3 +19,7 @@ bash experiments/lifetch_score_t2/run_predicate.sh \
 该用例运行真实 `ProcessPrecomputedVec1`，固定 B1/Q4/H131072/R16384/T2，逐项检查 458752 个 Cold predicate、每 Q 不同 θ、等于 θ 的严格排除、连续多 tile/ping-pong 复用、输入和 guard。无 Service/TopK/Fetch，不需要 KVAF server；使用其 device headers。每次独立 fresh build。日志为 `configure.log`、`build.log`、`check.log`。本地 CANN Model 可加 `--mode sim --device 0`。
 
 该用例只能证明 Cold 消费组件的分类与发布，不替代完整 A5 B1/B16 的正确性验证。仍需完整 `run_a5.sh` PASS 后才能比较性能；之前的 r0 FAIL 数字不是候选性能结论。
+
+## H128K Model 结果
+
+本地 CANN 9.1 的上述同输入对照已经完成：修复前 252370/458752 个 Cold predicate 错误；增加 V→MTE2 同步后 0 个错误，strict greater-than ties、输入和 guard 检查 PASS。详见 `predicate_model_result.json`，保存输入模式、源文件及日志 SHA256。整次 Model 为 271721 ticks，不是 A5 延迟，也不作为单 kernel 精确 cycles。编译 SoC 为 Ascend950PR_9599，Model 返回 Ascend950PR_9589；完整目标 A5 路线仍需设备验证。
