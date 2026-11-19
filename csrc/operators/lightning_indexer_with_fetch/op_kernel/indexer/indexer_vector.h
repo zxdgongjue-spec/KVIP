@@ -109,7 +109,7 @@ public:
     __aicore__ inline void SetPrefixStorage(GM_ADDR output) { prefixOutput_ = output; }
 #if KVIP_STREAMING_LI
     __aicore__ inline void SetStreamingWorkspace(GM_ADDR workspace) { streamingWorkspace_ = workspace; }
-    __aicore__ inline void EmitFinalClassification(uint32_t query);
+    __aicore__ inline void EmitFinalClassification(uint32_t query, int32_t validLength);
     __aicore__ inline void BeginFinalMetadata(uint32_t query);
 #endif
     __aicore__ inline void ProcessResidentTopK(QLICommon::RunInfo info, uint32_t queryRow = SIM_Q) {
@@ -795,7 +795,7 @@ __aicore__ inline void QLIVector<QLIT>::BeginFinalMetadata(uint32_t query)
 }
 
 template <typename QLIT>
-__aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
+__aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query, int32_t validLength)
 {
     if (!streamingWorkspace_) return;
     auto a=reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_);
@@ -861,6 +861,7 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     if(ctx->tailBounds){auto tail=reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds)+b*2;tailBegin=tail[0];tailEnd=tail[1];}
 #if !V9_UBMEM
     bool overlapSecond=false;
+    const bool incremental = taggedLocations_;
     if(taggedLocations_) {
         if(profile)liTicks[3]=GetSystemCycle();
         const uint32_t words=(runtimeShape_.resident+31)/32;
@@ -955,6 +956,11 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
     if(bitmap.GetValue(bitmapWords)){
         errors[query*32+2]=4;
+        errors[query*32+5]=validLength>0?uint32_t(validLength):0;
+        errors[query*32+6]=validLength==0?0:validLength<int32_t(topkCount_)?1:2;
+#if !V9_UBMEM
+        if(incremental)errors[query*32+6]=3;
+#endif
         for(uint32_t pos=0;pos<2048;++pos){
             uint32_t token=indicesOutLocal_.GetValue(pos);
             if(token!=UINT32_MAX && token>=runtimeShape_.history){errors[query*32+3]=pos;errors[query*32+4]=token;break;}
@@ -1046,7 +1052,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
             SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
 #if KVIP_STREAMING_LI
     #if KVIP_STREAMING_LI
-        if (!prefixActive_) EmitFinalClassification(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx);
+        if (!prefixActive_) EmitFinalClassification(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, validS2Len);
 #endif
 #endif
             continue;
@@ -1169,20 +1175,12 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
                 }
             }
         } else {
-            AscendC::CreateVecIndex(indicesOutLocal_.ReinterpretCast<int32_t>(), (int32_t)zero, validS2Len);
-        }
-
-        if (validS2Len < topkCount_) {
-            uint64_t mask[1];
-            mask[0] = ~0;
-            mask[0] = mask[0] << (validS2Len % 8);
+            // Initialize the entire short row before writing its valid prefix.
+            // This also handles a partial last vector without a masked Duplicate.
+            auto ids = indicesOutLocal_.template ReinterpretCast<int32_t>();
+            Duplicate(ids, neg, topkCount_);
             PipeBarrier<PIPE_V>();
-            Duplicate(indicesOutLocal_.ReinterpretCast<int32_t>()[validS2Len / 8 * 8], neg, mask, 1, 1, 0);
-        }
-
-        if (validS2Len / 8 * 8 + 64 < topkCount_) {
-            PipeBarrier<PIPE_V>();
-            Duplicate(indicesOutLocal_.ReinterpretCast<int32_t>()[validS2Len / 8 * 8 + 64], neg, topkCount_ - (validS2Len / 8 * 8 + 64));
+            AscendC::CreateVecIndex(ids, int32_t(0), validS2Len);
         }
 
         SetFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);
@@ -1200,7 +1198,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         }
         SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
 #if KVIP_STREAMING_LI
-        if (!prefixActive_) EmitFinalClassification(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx);
+        if (!prefixActive_) EmitFinalClassification(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, validS2Len);
 #endif
     }
 }

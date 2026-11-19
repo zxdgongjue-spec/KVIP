@@ -259,6 +259,8 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b) {
   if(badQuery){
    auto e=reinterpret_cast<__gm__ uint32_t*>(a->queryErrors)+(b*4+badQuery-1)*32;
    row->snapshot[14][0]=e[3];row->snapshot[14][1]=e[4];row->snapshot[14][2]=shape.history;
+   if(classifySite==4){row->snapshot[13][0]=e[5];row->snapshot[13][1]=e[6];}
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->snapshot[13]),32);
   }
   row->snapshot[15][1]=badQuery;row->snapshot[15][2]=badQuery?classifySite:guard;
   row->snapshot[15][3]=inputError;
