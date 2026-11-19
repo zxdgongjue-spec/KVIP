@@ -88,7 +88,7 @@ def stage_report(states, profile, samples, mhz, policy, directory):
     buckets = defaultdict(list)
     eligible = defaultdict(int)
     direct = dict(compact=0, overflow=0, other=0)
-    raw_times, route_probes = [], []
+    raw_times, route_probes, group_counts = [], [], []
     for state in states:
         b = state.batch
         raw = state.forward.times.cpu().numpy().reshape(-1)
@@ -147,15 +147,18 @@ def stage_report(states, profile, samples, mhz, policy, directory):
                 buckets['index_apply_general'].append(sum(z-a for a, z in spans)/mhz)
         # The fetch-group stamps are replicated on every row in its lane.
         # Use just one row for each (query,worker), and exclude empty groups.
+        submitted_groups = 0
         for lane in range(min(workers, b)):
             for q in range(4):
                 f = fetch[lane, q*24:(q+1)*24]
                 for phase in range(2):
                     if int(f[16+phase]) <= 0:
                         continue
+                    submitted_groups += int(f[16+phase])
                     for name, off in (('final_get_post', 12), ('final_get_cq_wait', 13)):
                         eligible[name] += 1
                         buckets[name].append(int(f[off+2*phase])/mhz)
+        group_counts.append(submitted_groups)
     scopes = dict(planning='producer entry to completed per-row plan, includes waits',
                   routing_probe_aic='elapsed route choice per first-LI AIC, inside LI headline',
                   routing_probe_aiv='elapsed route choice per first-LI AIV, inside LI headline',
@@ -163,7 +166,7 @@ def stage_report(states, profile, samples, mhz, policy, directory):
                   consumer_final_get_overlap_upper='overlap of consumer including waits with its workers’ nonempty final Gets including Post, per eligible row; upper bound only',
                   index_apply_general='five instrumented general Index phase bodies, per row; disjoint path excluded',
                   index_active_work='nonempty row, measured Index work including attempts or rollback; excludes publication waits and final metadata',
-                  direct_plan_and_describe='candidate producer direct-plan and descriptor generation per marked row',
+                  direct_plan_and_describe='candidate direct resolver including descriptor generation, excludes input staging, per marked row',
                   index_metadata='per-row metadata interval after final selection',
                   finalize_including_waits='per-row finalizer entry through status publication, includes joins',
                   li_final_classification='per-query final classification including its waits',
@@ -190,6 +193,14 @@ def stage_report(states, profile, samples, mhz, policy, directory):
             occupied.append([0]*len(algorithm['window_posted']))
         else:
             requests = algorithm['requests']
+            if policy == 'early':
+                # Observations were copied with the headline sample, before
+                # the independent counter replay restored the fixture.
+                completed = sample['route_physical_reads']
+                if completed != [r['prefetch'] + r['final'] for r in requests]:
+                    raise ValueError('Early-route physical reads disagree with completed Get counters')
+                if any(w['posted'] for r in requests for epoch, w in enumerate(r['windows']) if epoch != 1):
+                    raise ValueError('Early route prefetched outside its first cold window')
             windows.append([sum(req['windows'][w]['posted'] for req in requests)
                             for w in range(len(requests[0]['windows']))])
             occupied.append([sum(req['windows'][w]['posted'] > 0 for req in requests)
@@ -200,6 +211,7 @@ def stage_report(states, profile, samples, mhz, policy, directory):
                         **({'route_probe': np.stack(route_probes)} if route_probes else {}))
     return dict(stages=stages, traffic=traffic, window_posted=[measured_range(col) for col in zip(*windows)],
                 window_nonempty_requests=[measured_range(col) for col in zip(*occupied)],
+                diagnostic_final_get_submitted_groups=measured_range(group_counts),
                 route_policy=policy, direct_plan_rows=direct, cycles_per_us=mhz,
                 measured_graph_calls=len(samples), diagnostic_graph_replays=1, diagnostic_graph_calls=len(states),
                 routing_init_us=None, topk_only_us=None, index_cq_hidden_us=None,

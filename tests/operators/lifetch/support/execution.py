@@ -3808,6 +3808,8 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                         sample['algorithm'] = zero_traffic(states[i], before[i])
                     else:
                         sample['algorithm'] = algorithm_after(states[i].rotating, before[i])
+                    if policy == 'early':
+                        sample['route_physical_reads'] = states[i].rotating.adaptive_route.demand.cpu().tolist()
                     totals = sample['algorithm'].get('totals', {})
                     sample.update(prefetch=totals.get('prefetch'), final=totals.get('final'))
                 samples.append(sample)
