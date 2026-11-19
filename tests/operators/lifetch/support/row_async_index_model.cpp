@@ -151,6 +151,10 @@ int main() {
             }
             assert(ticks[9]==2*p+s && ticks[16]==p && ticks[17]==s);
             assert(ticks[18]==(s>kLocalTuples ? s : 0));
+            const bool shared=singles[row] && (singles[row]>kLocalTuples || singles[row]*lanes>moves);
+            const bool fields=shared && singles[row]>=64 && singles[row]<=4096;
+            assert(ticks[13]==(fields ? singles[row]*(lane<2 ? 40u : lane==2 ? 36u : 32u) : 0));
+
             if (row==2) independent.count_down();
             if (row==12 && lane<lanes-1) privatePeers.count_down();
         });
@@ -159,7 +163,8 @@ int main() {
     for (unsigned row=0;row<batch;++row) {
         const unsigned moves=2*pairs[row]+singles[row];
         bool shared=singles[row] && (singles[row]>kLocalTuples || singles[row]*lanes>moves);
-        assert(teams[row].arrivals.load()==(shared ? lanes : 0u));
+        bool fields=shared && singles[row]>=64 && singles[row]<=4096;
+        assert(teams[row].arrivals.load()==(shared && !fields ? lanes : 0u));
     }
     for (unsigned owner=0;owner<batch;++owner) {
         for (unsigned pos=0;pos<history;++pos) {

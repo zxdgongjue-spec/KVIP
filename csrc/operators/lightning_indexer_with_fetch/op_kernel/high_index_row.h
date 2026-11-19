@@ -4,6 +4,8 @@
 // Included inside high_post_index after TransferSegments. All lanes see the
 // same immutable row plan. Each owns a separate slice of swaps, cycle edges,
 // and invalidations. Distinct active rows must have distinct physical owners.
+#include "high_index_field_transfer.h"
+
 template<class RowJoin>
 __aicore__ inline uint64_t TransferRow(__gm__ Args* a, const Segment& part,
         uint64_t stride, bool spill, __ubuf__ Tuple* local, bool sharedCycles,
@@ -57,8 +59,13 @@ __aicore__ inline uint64_t ApplyRowIndex(__gm__ Args* a, __gm__ Context* ctx,
     }
     uint32_t localCount=part.s1-part.s0;
     bool spill=localCount>kLocalTuples;
-    uint64_t error;
-    if (!localCount || spill) {
+    uint64_t error=0;
+    if(profile) ticks[13]=0;
+    // One full vector tile dispatches 64 tuples. The largest column footprint
+    // admitted here is 4,096 * 40 B, inside one vector core's private UB.
+    if (lanes==4 && sharedCycles && singles>=64 && singles<=4096) {
+        ApplyOwnedFields(a,part,singles,lane,addressStride,ticks,profile);
+    } else if (!localCount || spill) {
         // The spill specialization never forms an address from a null UB
         // pointer. Empty long lists do not allocate a dummy payload.
         error=TransferRow(a,part,addressStride,true,nullptr,sharedCycles,ticks,profile,join);

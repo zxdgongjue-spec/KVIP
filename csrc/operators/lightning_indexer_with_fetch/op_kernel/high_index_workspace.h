@@ -88,6 +88,34 @@ __simt_callee__ inline void ExchangeTwoPairs(__gm__ Edge* edges, uint32_t i, uin
     asc_stcg(ka, y); asc_stcg(kb, x); asc_stcg(kc, w); asc_stcg(kd, z);
 }
 
+__simt_callee__ inline void TransferPairSlice(__gm__ Edge* edges, uint32_t p0, uint32_t p1,
+        __gm__ uint64_t* keys, __gm__ uint32_t* scales, __gm__ uint64_t* addr, __gm__ uint64_t* logical) {
+    const uint32_t tuple=threadIdx.x/16, field=threadIdx.x%16;
+    uint32_t i = p0 + tuple;
+    for (; i + 16 < p1; i += 32)
+        ExchangeTwoPairs(edges, i, field, keys, scales, addr, logical);
+    if (i < p1) {
+        uint32_t a = asc_ldcg(&edges[i].src), b = asc_ldcg(&edges[i].dst);
+        auto ka = keys + uint64_t(a) * 16 + field;
+        auto kb = keys + uint64_t(b) * 16 + field;
+        uint64_t left = asc_ldcg(ka), right = asc_ldcg(kb);
+        // Keep one 16-lane group per key. Two lanes load the independent
+        // 64-bit columns together; the third exchanges the 32-bit scale.
+        auto column = field == 0 ? addr : logical;
+        if (field < 2) {
+            uint64_t x = asc_ldcg(column + a), y = asc_ldcg(column + b);
+            asc_stcg(column + a, y);
+            asc_stcg(column + b, x);
+        } else if (field == 2) {
+            uint32_t x = asc_ldcg(scales + a), y = asc_ldcg(scales + b);
+            asc_stcg(scales + a, y);
+            asc_stcg(scales + b, x);
+        }
+        asc_stcg(ka, right);
+        asc_stcg(kb, left);
+    }
+}
+
 template<bool Scatter, bool Spill>
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void Transfer(__gm__ Edge* edges, uint32_t p0, uint32_t p1, uint32_t s0, uint32_t s1,
@@ -95,31 +123,7 @@ inline void Transfer(__gm__ Edge* edges, uint32_t p0, uint32_t p1, uint32_t s0, 
                      __gm__ uint64_t* addr, __gm__ uint64_t* logical,
                      __gm__ Tuple* spill, __ubuf__ Tuple* local) {
     const uint32_t tuple = threadIdx.x / 16, field = threadIdx.x % 16;
-    if constexpr (!Scatter) {
-        uint32_t i = p0 + tuple;
-        for (; i + 16 < p1; i += 32)
-            ExchangeTwoPairs(edges, i, field, keys, scales, addr, logical);
-        if (i < p1) {
-            uint32_t a = asc_ldcg(&edges[i].src), b = asc_ldcg(&edges[i].dst);
-            auto ka = keys + uint64_t(a) * 16 + field;
-            auto kb = keys + uint64_t(b) * 16 + field;
-            uint64_t left = asc_ldcg(ka), right = asc_ldcg(kb);
-            // Keep one 16-lane group per key. Two lanes load the independent
-            // 64-bit columns together; the third exchanges the 32-bit scale.
-            auto column = field == 0 ? addr : logical;
-            if (field < 2) {
-                uint64_t x = asc_ldcg(column + a), y = asc_ldcg(column + b);
-                asc_stcg(column + a, y);
-                asc_stcg(column + b, x);
-            } else if (field == 2) {
-                uint32_t x = asc_ldcg(scales + a), y = asc_ldcg(scales + b);
-                asc_stcg(scales + a, y);
-                asc_stcg(scales + b, x);
-            }
-            asc_stcg(ka, right);
-            asc_stcg(kb, left);
-        }
-    }
+    if constexpr (!Scatter) TransferPairSlice(edges,p0,p1,keys,scales,addr,logical);
     for (uint32_t i = s0 + tuple; i < s1; i += 16) {
         auto edge = edges + kCapacity - 1 - i;
         uint32_t pos = Scatter ? asc_ldcg(&edge->dst) : asc_ldcg(&edge->src);
