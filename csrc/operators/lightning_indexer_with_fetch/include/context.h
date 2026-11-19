@@ -6,6 +6,12 @@ namespace rotating {
 constexpr uint32_t kTop=2048, kSlots=8192, kMaxRounds=32, kRowStatusWords=32;
 constexpr bool kFinalReplicated=true;
 constexpr uint32_t kFinalStateWords=288;
+// Previous-round mapping writes, indexed by the contiguous prefetch ordinal.
+struct alignas(128) MappingJournal {
+    uint32_t tokens[2048];
+    uint32_t tailBegin, tailEnd, count;
+};
+static_assert(sizeof(MappingJournal)==2080*sizeof(uint32_t),"mapping journal row ABI");
 struct alignas(128) FinalPost {
     uint32_t count, pending, error, deferred, descriptor;
     uint32_t nonconflicting; // Compact descriptor prefix safe before prefetch CQ.
@@ -44,11 +50,24 @@ struct Context {
     uint64_t rowOwners, tokenAddresses, addressStride, outputStride, tailBounds;
     RuntimeShape shape;
     uint64_t changeSlots, changeCount; // Extended direct-hot producer records, ABI 3.
+    uint64_t incremental; // Per-Q TopK prefixes, admission bitmap and diagnostics.
+    uint64_t prefetchRankStart; // Zero preserves the default rank 1024.
+    uint64_t mappingJournal, rowAddressBase; // Preserve 32-byte DMA alignment.
     // Optional serving layout: active row -> stable owner; addresses stay with
     // that owner's Index permutation. tailBounds[B,2] are [committed,write_end).
 
 };
-static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 320,
+#if defined(__CCE_AICORE__)
+// Fused requests keep live TopK headers immediately after their private rows.
+__aicore__ inline uint64_t TopKHeader(__gm__ Context* ctx){
+    return ctx->rowAddressBase ? ctx->rows+uint64_t(ctx->shape.batch)*sizeof(Row) : ctx->incremental;
+}
+__aicore__ inline uint64_t RequestAddressTable(__gm__ Context* ctx,uint32_t b,uint32_t owner,uint32_t history){
+    return ctx->tokenAddresses ? ctx->tokenAddresses+uint64_t(owner)*ctx->addressStride*8 :
+        ctx->rowAddressBase+uint64_t(b)*(uint64_t(history)*8+8192*64+512);
+}
+#endif
+static_assert(sizeof(Row) == 1024 && sizeof(Event) == 128 && sizeof(Context) == 352,
               "LIFetch runtime ABI layout changed");
 // Workload geometry is bound before capture and shared by host/device launches.
 #if defined(__CCE_AICORE__)

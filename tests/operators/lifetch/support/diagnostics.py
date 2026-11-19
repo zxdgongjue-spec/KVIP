@@ -90,7 +90,11 @@ def summarize(directory, config):
     for path in paths:
         content = json.loads(path.read_text())
         samples = content['samples'] if isinstance(content, dict) else content
-        capture = dict(source=str(path), samples=[], stage_summary={})
+        capture = dict(source=str(path), samples=[], stage_summary={},
+                       graph_accounting=content.get('graph_accounting') if isinstance(content, dict) else None,
+                       graph_calls=content.get('graph_calls') if isinstance(content, dict) else None)
+        detail_path = path.parent / 'detail_samples.json'
+        detail_samples = json.loads(detail_path.read_text()) if detail_path.exists() and config.level >= 2 else []
         stage_values = {}
         if len(samples) != config.iterations:
             result['missing'].append(f'{path}: expected {config.iterations} repeats, got {len(samples)}')
@@ -103,7 +107,7 @@ def summarize(directory, config):
                     result['missing'].append(f'{path} repeat={sample["round"]}: algorithm: {sample["algorithm"]["error"]}')
             else:
                 result['missing'].append(f'{path} repeat={sample["round"]}: algorithm counters')
-            for key in ('source_round', 'scheduler_round', 'identities', 'correctness', 'diagnostic_error'):
+            for key in ('source_round', 'scheduler_round', 'identities', 'correctness', 'diagnostic_error', 'rank_progress'):
                 if key in sample:
                     item[key] = sample[key]
             if sample.get('diagnostic_error'):
@@ -115,7 +119,14 @@ def summarize(directory, config):
                 if stage in config.stages or ('resolve_update' in stage and
                                                set(config.stages) & {'resolve', 'update', 'fetch', 'finalize'}):
                     stage_values.setdefault(stage, []).append(duration)
-            details = sample.get('streaming_cycles', sample.get('streaming', []))
+            detail_sample = next((row for row in detail_samples if row['round'] == sample['round']), None)
+            details = (detail_sample['streaming_cycles'] if detail_sample else
+                       sample.get('streaming_cycles', sample.get('streaming', [])))
+            if detail_sample:
+                item['detail_source'] = str(detail_path)
+                item['detail_repeat'] = detail_sample['round']
+                if 'rank_progress' in detail_sample:
+                    item['rank_progress'] = detail_sample['rank_progress']
             if details:
                 scope = details[0].get('prefetch_scope')
                 raw = details[0].get('core_timeline_raw')
@@ -131,11 +142,13 @@ def summarize(directory, config):
                         decode_timeline(raw)  # Validate core bounds and cross-core publication ordering before global spans.
                         item['final_get_bandwidth'] = final_transfer_scope(raw, details, config.transport)
                     except (KeyError, TypeError, ValueError) as error:
-                        item.pop('prefetch_bandwidth', None)
                         result['missing'].append(f'{path} repeat={sample["round"]}: final Get scope: {error}')
                     else:
                         final = item['final_get_bandwidth']
-                        if sample.get('final') is not None and final['entries'] != sample['final']:
+                        expected_final = (sum(row['total'] for request in details
+                                              for row in (request.get('final_counts') or []))
+                                          if detail_sample else sample.get('final'))
+                        if expected_final is not None and final['entries'] != expected_final:
                             result['missing'].append(f'{path}: final scope entries differ from device total')
                         if scope and mhz and final['entries'] and final['span_us']:
                             begin = min(scope['first_doorbell'], final['first_cycles'])
@@ -181,7 +194,9 @@ def summarize(directory, config):
     native_paths = sorted(directory.rglob('native_attribution.json'))
     for path in native_paths:
         content = json.loads(path.read_text())
-        capture = dict(source=str(path), path='serial', samples=content['samples'], stage_summary={})
+        capture = dict(source=str(path), path='serial', samples=content['samples'], stage_summary={},
+                       graph_accounting=content.get('graph_accounting') if isinstance(content, dict) else None,
+                       graph_calls=content.get('graph_calls') if isinstance(content, dict) else None)
         values = {}
         if len(content['samples']) != config.iterations:
             result['missing'].append(f'{path}: native repeat count differs from iterations')
@@ -243,7 +258,7 @@ def summarize(directory, config):
         result['trace'] = 'INCOMPLETE'
     atomic_json(directory / 'diagnostic.json', result)
     lines = [f"DIAG level={config.level} transport={config.transport} trace={result['trace']}",
-             'Separate profiled pass; times are not added across overlapping cores.',
+             'Event and profiler share the measured graph; detailed core stamps use an additional pass.',
              'Synthetic repeats restore the same state; they are not consecutive decode rounds.']
     for capture in result['captures']:
         lines.append(f"source={capture['source']}")
@@ -317,7 +332,7 @@ def summarize(directory, config):
 
 
 def algorithm_counts(mapping, selected, rows, posts, resident, windows, *,
-                     hot_valid=None, lru_slots=None, logical_ids=None, tail_bounds=None, token_bytes=656):
+                     hot_valid=None, lru_slots=None, reserved_hot=None, logical_ids=None, tail_bounds=None, token_bytes=656):
     """Reconcile existing admission records, not hypothetical transfer savings.
 
     The prefetch map stores resident+admission_ordinal; ABC uses a separate
@@ -393,6 +408,32 @@ def algorithm_counts(mapping, selected, rows, posts, resident, windows, *,
             slots = np.asarray(lru_slots)[row]
             slots = slots[(slots >= 0) & (slots < resident)]
             candidate_hot = int(np.isin(demand, np.intersect1d(local, logical_ids[row, slots])).sum())
+        # Preserve every admission identity outside graph timing. Physical IDs
+        # refer to the pre-call Index; hot validity and reservations must come
+        # from that same snapshot, before Index update changes ownership.
+        transfers = []
+        transfer_counts = dict(stable_hot=0, reserved_hot=0, cold=0, abc=0, repeated=0)
+        if hot_valid is not None and reserved_hot is not None:
+            reservations = np.asarray(reserved_hot)[row]
+            if reservations.shape != (resident,):
+                raise ValueError('Invalid initial reserved-hot shape')
+            window_ids = np.repeat(np.arange(1, windows + 1), epochs)
+            seen_tokens = set()
+            for ordinal, (position, token) in enumerate(zip(admitted, fetched_ids)):
+                position, token = int(position), int(token)
+                live = bool(position < resident and valid[position])
+                reserved = int(reservations[position]) if position < resident else -1
+                abc = tail_bounds is not None and begin_tail <= token < end_tail
+                category = ('abc' if abc else 'reserved_hot' if live and reserved >= 0
+                            else 'stable_hot' if live else 'cold')
+                repeated = token in seen_tokens
+                seen_tokens.add(token)
+                transfer_counts[category] += 1
+                transfer_counts['repeated'] += int(repeated)
+                transfers.append(dict(ordinal=ordinal, window=int(window_ids[ordinal]),
+                                      position=position, token=token, hot_valid=int(live),
+                                      reserved=reserved, category=category,
+                                      repeated=repeated, unused=bool(unused[ordinal])))
         requests.append(dict(request=row, selected_unique=len(demand), initial_cold=cold,
                              initial_hot_valid=None if local is None else initial_hot_count,
                              candidate_hot=candidate_hot, prefetch=posted, final=final,
@@ -400,7 +441,8 @@ def algorithm_counts(mapping, selected, rows, posts, resident, windows, *,
                              unused_prefetch=int(unused.sum()),
                              selected_prefetch=posted - int(unused.sum()),
                              useful=None, redundant=None, refetched=None,
-                             windows=window_rows, queries=query_rows))
+                             windows=window_rows, queries=query_rows,
+                             prefetch_transfers=transfers, prefetch_classes=transfer_counts))
     totals = {key: sum(item[key] for item in requests) for key in
               ('selected_unique', 'prefetch', 'final', 'KV_read_bytes', 'unused_prefetch', 'selected_prefetch')}
     totals['initial_cold'] = None if hot_valid is None else sum(item['initial_cold'] for item in requests)
@@ -419,19 +461,88 @@ def algorithm_before(rotating):
     if np.any(owners < 0) or np.any(owners >= len(validity)):
         raise ValueError('Diagnostic owner is outside hot validity storage')
     return dict(hot_valid=validity[owners].copy(), lru_slots=rotating.lru_slots.cpu().numpy().copy(),
+                reserved_hot=rotating.reserved_hot.cpu().numpy().copy(),
                 tail_bounds=None if rotating.tail_bounds is None else rotating.tail_bounds.cpu().numpy().copy())
+
+
+def prefetch_tag_audit(ids, before, resident):
+    """Check tags against the original residency, before Index exchanges."""
+    result = []
+    for row in range(ids.shape[0]):
+        queries = []
+        for query in range(4):
+            encoded = ids[row, query].astype(np.uint32)
+            raw = encoded & np.uint32(0x3fffffff)
+            bounded = raw < resident
+            safe = np.minimum(raw, resident - 1)
+            live = np.asarray(before['hot_valid'])[row, safe] != 0
+            reserved = np.asarray(before['reserved_hot'])[row, safe]
+            stable = bounded & live & (reserved < 0)
+            if before.get('tail_bounds') is not None:
+                begin, end = before['tail_bounds'][row]
+                stable &= ~((raw >= begin) & (raw < end))
+            missing = stable & ((encoded & np.uint32(0x80000000)) == 0)
+            queries.append(dict(query=query + 1, stable_hot=int(stable.sum()),
+                                missing_hot_tags=int(missing.sum()),
+                                missing_positions=raw[missing].astype(int).tolist()))
+        result.append(queries)
+    return result
 
 
 def algorithm_after(rotating, before):
     shape = rotating.runtime_shape
     try:
-        return algorithm_counts(
+        result = algorithm_counts(
             rotating.mapping.cpu().numpy(),
             rotating.arguments[9].cpu().numpy().view(np.int32).reshape(shape.batch, 4, 2048),
             rotating.rows.cpu().numpy().view(np.uint32), rotating.final_posts.cpu().numpy(),
             shape.resident, rotating.rounds, token_bytes=shape.tokenBytes, **before)
+        if hasattr(rotating, 'window_topk_storage'):
+            prefix_bytes = 4 * 2048 * 6 + 1024
+            # The public prefix is immutable after SaveResident; the private
+            # prefix retains tagged IDs after the final incremental merge.
+            public = rotating.arguments[13][:shape.batch * prefix_bytes].cpu().numpy().view(np.uint8)
+            private = rotating.window_topk_storage[shape.batch * 512:
+                       shape.batch * (512 + prefix_bytes)].cpu().numpy().view(np.uint8)
+            def decode_ids(buffer):
+                return np.stack([buffer[row * prefix_bytes + 4 * 2048 * 2:
+                                        row * prefix_bytes + 4 * 2048 * 6].copy().view(np.uint32).reshape(4, 2048)
+                                 for row in range(shape.batch)])
+            for name, buffer in (('prefix_tag_audit', public), ('final_tag_audit', private)):
+                audits = prefetch_tag_audit(decode_ids(buffer), before, shape.resident)
+                for request, audit in zip(result['requests'], audits):
+                    request[name] = audit
+        return result
     except ValueError as error:
         return {'error': str(error)}
+
+
+def same_replay_table(capture):
+    samples = capture['samples']
+    graph_accounting = capture.get('graph_accounting')
+    if graph_accounting:
+        samples = [dict(round=0, accounting=graph_accounting)]
+    names = list(dict.fromkeys(name for sample in samples
+                              for name in sample.get('accounting', {}).get('stages_us', {})))
+    rows = []
+    for sample in samples:
+        accounting = sample.get('accounting', {})
+        if not accounting or 'error' in accounting:
+            continue
+        stages = accounting['stages_us']
+        gap = accounting['inter_kernel_gap_us']
+        boundary = accounting['boundary_residual_us']
+        overlap = accounting.get('overlap_us',
+            sum(stages.values()) - (accounting['kernel_span_us'] - gap))
+        total = sum(stages.values()) - overlap + gap + boundary
+        event = accounting['event_us']
+        rows.append([sample.get('repeat', sample.get('round')), *[stages.get(name, 0.) for name in names],
+                     overlap, gap, boundary, total, event, total - event])
+    return diagnostic_table(
+        'Same-replay graph accounting (us): sum(stages) - overlap + gap + boundary = graph event. '
+        'Boundary is the event remainder, not attributed CPU time.' +
+        (f" Graph contains {capture['graph_calls']} independent invocations." if graph_accounting else ''),
+        ['Repeat', *names, 'Overlap', 'Gap', 'Boundary', 'Reconstructed', 'Graph event', 'Delta'], rows)
 
 
 def level_one_tables(result):
@@ -448,7 +559,7 @@ def level_one_tables(result):
                 *[line(row) for row in values[1:]], '']
 
     lines = [f"DIAG level=1 transport={result['transport']} trace={result['trace']}",
-             'Times: us. Separate profiled replays; synthetic repeats are not decode rounds.', '']
+             'Times: us. Event and profiler share one measured graph; invocation IDs are not decode rounds.', '']
     stages, counts, bandwidth = [], [], []
     scopes = {}
     for index, capture in enumerate(result['captures'], 1):
@@ -472,9 +583,11 @@ def level_one_tables(result):
     lines += ['ALGORITHM / KV TRAFFIC | per request, Q4 unique-demand basis.', '']
     lines += table('Per-request counts', ['Path', 'Repeat', 'Request', 'Hot', 'Demand', 'Cold',
                                           'Prefetch', 'Final', 'KV bytes'], counts)
-    lines += ['TIME BREAKDOWN | us; profiled passes are separate from performance samples.', '']
+    lines += ['TIME BREAKDOWN | us; graph and stages below share each profiled replay. Detailed stamps OFF. Event mean and profiler statistics come from this same measured graph.', '']
     lines += table('Stage distribution (overlapping stages must not be added)',
                    ['Path', 'Stage', 'Mean', 'p50', 'Min', 'Max', 'N'], stages)
+    for capture in result['captures']:
+        lines += [f"Graph: {capture.get('path', 'fused')} | {capture['source']}", same_replay_table(capture), '']
     lines += table('Effective bandwidth (decimal GB/s)',
                    ['Path', 'Repeat', 'Scope', 'Bytes', 'Span us', 'GB/s'], bandwidth)
     lines += [f'{name}: {note}' for name, note in scopes.items()]
@@ -513,14 +626,52 @@ def aggregate_diagnostic_rows(rows, identity_columns):
     return result
 
 
+def resolver_phase_rows(timeline):
+    """Partition each resolver core's existing stamps; never add other cores."""
+    rows = []
+    for core in timeline['cores']:
+        if not core['role'].startswith('resolver'):
+            continue
+        buckets = [0.] * 10
+        for stage in core['stages']:
+            name = stage['name']
+            if name in ('input_and_bitmap', 'initialize'):
+                index = 0
+            elif name.startswith('Q') and name.endswith('.resolve'):
+                index = 1
+            elif name.startswith('Q') and name.endswith(('.output', '.descriptor', '.publish')):
+                index = 2
+            elif name in ('prefetch_CQ_join', 'prefetch_completion_join'):
+                index = 3
+            elif name == 'wait.index_update':
+                index = 4
+            elif name == 'wait.prefetch_ready':
+                index = 5
+            elif name.startswith('wait.Q') and name.endswith('_fetch'):
+                index = 6
+            elif name in ('prefetch_residency', 'residency'):
+                index = 7
+            elif name == 'status':
+                index = 8
+            else:
+                # Includes bookkeeping between stamps; not assumed idle or CQ wait.
+                index = 9
+            buckets[index] += stage['duration_us']
+        rows.append([core['block'], *buckets, core['duration_us'],
+                     sum(buckets) - core['duration_us']])
+    return rows
+
+
 def level_two_tables(result):
     """Same-replay tables, with no summed-overlap or synthetic decode trend."""
-    lines = ['TIME BREAKDOWN | us; profiled passes are separate from performance samples.',
+    lines = ['TIME BREAKDOWN | us; graph and stages below share each profiled replay. Detailed stamps OFF. Event mean and profiler statistics come from this same measured graph.',
              'Logical block IDs, not physical core IDs. Waits include control/polling.']
     algorithm_lines = ['ALGORITHM / KV TRAFFIC | per request, Q4 unique-demand basis.',
         'Cold miss % = initial cold / unique demand; read amplification = (prefetch + final) / initial cold.',
         'Unused % = unused prefetch / prefetch. Zero denominator => N/A. Repeats are not decode rounds.']
+    lines.append('Kernel-stage tables: detailed device stamps OFF. Core/bandwidth details: separate instrumented replays; repeat IDs are local to that pass.')
     for capture in result['captures']:
+        lines.append(same_replay_table(capture))
         stage_rows = [[stage, values['mean_us'], values['p50_us'], values['min_us'], values['max_us']]
                       for stage, values in capture['stage_summary'].items()]
         lines.append(diagnostic_table(f"Stages: {capture.get('path', 'fused')} | {capture['source']}",
@@ -544,6 +695,18 @@ def level_two_tables(result):
             repeat = sample['repeat']
             if result.get('level', 2) >= 3:
                 lines.append(f"\nSource: {capture['source']} | repeat={repeat}")
+            if result.get('level', 2) >= 3 and sample.get('rank_progress'):
+                emit(algorithm_lines, 'Per-Q prefetch rank / progress',
+                     ['Request', 'Q', 'Window', 'Score ready %', 'TopK covered %', 'Rank'],
+                     sample['rank_progress'], 3)
+            bandwidth_rows = []
+            for key, label in (('prefetch_bandwidth', 'prefetch'),
+                               ('final_get_bandwidth', 'final Get'),
+                               ('combined_observed_bandwidth', 'combined')):
+                metric = sample.get(key, {})
+                bandwidth_rows.append([label, metric.get('bytes'), metric.get('span_us'), metric.get('GBps')])
+            emit(lines, 'Effective bandwidth (decimal GB/s; separate instrumented replays)',
+                 ['Scope', 'Bytes', 'Span us', 'GB/s'], bandwidth_rows, 1)
             timeline = sample.get('timeline')
             if timeline:
                 if result.get('level', 2) >= 3:
@@ -569,6 +732,10 @@ def level_two_tables(result):
                                        stage['end_cycles'] - stage['start_cycles']
                                        if 'end_cycles' in stage and 'start_cycles' in stage else None])
                 emit(lines, 'Active cores', ['Block', 'Role', 'Start', 'End', 'Duration', 'Last'], rows, 2)
+                emit(lines, 'Resolver phase breakdown (us; same core/replay; Other includes unstamped bookkeeping)',
+                     ['Block', 'Input/init', 'Q1-Q4 resolve', 'Q output/publish', 'Prefetch completion',
+                      'Wait update', 'Wait prefetch flag', 'Wait Q Fetch', 'Residency', 'Status',
+                      'Other/control', 'Total', 'Delta'], resolver_phase_rows(timeline), 1)
                 groups = sample.get('final_get_bandwidth', {}).get('groups', [])
                 rates = []
                 for group in groups:
@@ -605,8 +772,12 @@ def level_two_tables(result):
                 for event in services:
                     identity = [event['event'], event['core'], event['epoch'], event.get('lane')]
                     service_rows.append([*identity, event['bitmap_bytes'], event['candidate_count'], event['posted_count']])
-                    for label, key in (('scan', 'scan_cycles'), ('candidates', 'candidate_cycles'), ('submit/copy', 'post_cycles')):
-                        service_times.append([*identity, label, event[key], event[key] / mhz if mhz else None])
+                    for label, key in (('predecessor wait', 'predecessor_wait_cycles'),
+                                       ('incremental', 'incremental_cycles'), ('scan', 'scan_cycles'),
+                                       ('candidates', 'candidate_cycles'), ('submit/copy', 'post_cycles')):
+                        value = event.get(key)
+                        if value is not None:
+                            service_times.append([*identity, label, value, value / mhz if mhz else None])
                 if service_rows and result.get('level', 2) >= 3:
                     emit(algorithm_lines, 'Prefetch service work',
                         ['Event', 'Core pair', 'Epoch', 'Lane', 'Bitmap bytes', 'Candidates', 'Posted'], service_rows, 4)
@@ -762,6 +933,9 @@ def account(events, name, elapsed, *, full=False, fused_final=False):
         if not start <= timestamp or finish > end:
             continue
         groups[stage].append((timestamp, finish))
+    # Current URMA streaming starts with hot LI; older captures have Init.
+    if fused_final and 'resolve_update' in groups and not groups.get('init'):
+        groups.pop('init', None)
     if any(not value for value in groups.values()):
         return dict(
             error="Missing named device kernels; inspect raw trace, no ordinal guessing",
@@ -799,6 +973,51 @@ def decode_final_detail(owner_words, status_words):
     return detail
 
 
+def collect_details(torch, rotating, graph, reset, verify, rounds, folder, pipeline, *, ubmem=False):
+    """Separate instrumented replays; never contribute to kernel-stage timing."""
+    stream = torch.npu.current_stream(rotating.device)
+    pipeline.counter_clock_mhz = pipeline.calibrate_counter_mhz()
+    samples = []
+    try:
+        pipeline.set_diagnostics(True)
+        for step in range(rounds):
+            reset()
+            pipeline.times.zero_()
+            if hasattr(rotating, 'rank_progress'):
+                rotating.rank_progress.zero_()
+            stream.synchronize()
+            if ubmem:
+                graph.replay(stream)
+            else:
+                graph.replay()
+            stream.synchronize()
+            verify()
+            sample = dict(round=step, streaming_cycles=pipeline.diagnostic_cycles())
+            if hasattr(rotating, 'rank_progress'):
+                records = rotating.rank_progress.cpu().tolist()
+                bounds = rotating.query_ends.cpu().tolist()
+                sample['rank_progress'] = [
+                    [b, q + 1, epoch, *decode_rank_progress(word, bounds[b][q])]
+                    for b, queries in enumerate(records) for q, epochs in enumerate(queries)
+                    for epoch, word in enumerate(epochs[:rotating.rounds]) if word]
+            samples.append(sample)
+    finally:
+        pipeline.set_diagnostics(False)
+        stream.synchronize()
+    (folder / 'detail_samples.json').write_text(json.dumps(samples, indent=2))
+
+
+def decode_rank_progress(word, bound):
+    # Accept both the original 18-bit capture and extended long-history capture.
+    if word & (1 << 63):
+        mask = (1 << 26) - 1
+        ready, covered, rank = word & mask, (word >> 26) & mask, ((word >> 52) & 2047) + 1
+    else:
+        mask = (1 << 18) - 1
+        ready, covered, rank = word & mask, (word >> 18) & mask, (word >> 36) & 4095
+    return [100 * ready / max(bound, 1), 100 * covered / max(bound, 1), rank]
+
+
 def collect_core(torch, rotating, graph, reset, verify, rounds, folder, *, full=False, diagnostics=None, fused_final=False):
     """Profile the existing core graph separately from primary timing."""
     import torch_npu
@@ -815,6 +1034,8 @@ def collect_core(torch, rotating, graph, reset, verify, rounds, folder, *, full=
     with profile:
         for step in range(rounds):
             reset()
+            if diagnostics is not None and hasattr(rotating, "rank_progress"):
+                rotating.rank_progress.zero_()
             stream.synchronize()
             algorithm_initial = algorithm_before(rotating)
             begin, end = [torch.npu.Event(enable_timing=True) for _ in range(2)]
@@ -842,6 +1063,14 @@ def collect_core(torch, rotating, graph, reset, verify, rounds, folder, *, full=
                 )
             )
             samples[-1]["algorithm"] = algorithm_after(rotating, algorithm_initial)
+            if diagnostics is not None and hasattr(rotating, "rank_progress"):
+                records = rotating.rank_progress.cpu().tolist()
+                bounds = rotating.query_ends.cpu().tolist()
+                samples[-1]["rank_progress"] = [
+                    [b, q + 1, epoch, *decode_rank_progress(word, bounds[b][q])]
+                    for b, queries in enumerate(records) for q, epochs in enumerate(queries)
+                    for epoch, word in enumerate(epochs[:rotating.rounds]) if word
+                ]
             if diagnostics is not None:
                 samples[-1]["streaming_cycles"] = diagnostics()
     # Save events/counters before parsing, so collection never needs repeating
@@ -927,7 +1156,7 @@ def account_ubmem(events, name, elapsed):
             "note": "resolve includes inline fetch when fetch_separate is false; boundary includes measurement edges"}
 
 
-def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder, streaming=None):
+def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder, streaming=None, level=1):
     """Collect a separately profiled graph replay; never included in event timing."""
     import torch_npu
     from torch.profiler import record_function
@@ -943,8 +1172,7 @@ def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder, streami
         on_trace_ready=lambda profiler: profiler.export_chrome_trace(str(trace_path.resolve())),
     )
     if streaming is not None:
-        streaming.counter_clock_mhz = streaming.calibrate_counter_mhz()
-        streaming.set_diagnostics(True)
+        streaming.set_diagnostics(False)
     with profile:
         for step in range(rounds):
             reset()
@@ -964,8 +1192,6 @@ def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder, streami
                             "prefetch": int(rows[:, 9].astype(np.uint64).sum()),
                             "final": int(rows[:, 247].astype(np.uint64).sum())})
             samples[-1]["algorithm"] = algorithm_after(rotating, algorithm_initial)
-            if streaming is not None:
-                samples[-1]["streaming"] = streaming.diagnostic_cycles()
             profile.step()
     if streaming is not None:
         streaming.set_diagnostics(False)
@@ -978,6 +1204,8 @@ def collect_ubmem(torch, rotating, graph, reset, verify, rounds, folder, streami
         if "error" not in account and hasattr(rotating.library, "v9_fetch_workers") and not account["fetch_separate"] and not account["stages_us"].get("resolve_update_fetch"):
             account["error"] = "Separate fetch kernel expected but absent from trace"
     (folder / "attribution.json").write_text(json.dumps(samples, indent=2))
+    if streaming is not None and level >= 2:
+        collect_details(torch, rotating, graph, reset, verify, rounds, folder, streaming, ubmem=True)
     for sample in samples:
         account = sample["accounting"]
         if "error" in account:
@@ -1012,8 +1240,7 @@ def collect_replay(torch, state, graph, sequence, validate, config, folder):
             stream.synchronize()
             checks.check(f'warmup={repeat} source_round={inputs.source_round}',
                          lambda: validate(inputs))
-    pipeline.counter_clock_mhz = pipeline.calibrate_counter_mhz()
-    pipeline.set_diagnostics(True)
+    pipeline.set_diagnostics(False)
     trace_path = folder / 'trace.json'
     samples = []
     profile = torch_npu.profiler.profile(
@@ -1048,10 +1275,6 @@ def collect_replay(torch, state, graph, sequence, validate, config, folder):
                                   identities=inputs.identities, us=begin.elapsed_time(end) * 1000,
                                   correctness='PASS' if good else 'FAIL', algorithm=algorithm,
                                   prefetch=totals.get('prefetch'), final=totals.get('final'))
-                    try:
-                        sample['streaming_cycles'] = pipeline.diagnostic_cycles()
-                    except (ValueError, AssertionError) as error:
-                        sample['diagnostic_error'] = str(error)
                     samples.append(sample)
                     atomic_json(folder / 'samples.json', samples)
                     profile.step()
@@ -1063,9 +1286,31 @@ def collect_replay(torch, state, graph, sequence, validate, config, folder):
         sample['accounting'] = (account_ubmem(events, sample['name'], sample['us'])
                                if config.transport == 'ubmem' else
                                account(events, sample['name'], sample['us'], full=True, fused_final=True))
+    detail_samples = []
+    if config.level >= 2:
+        pipeline.counter_clock_mhz = pipeline.calibrate_counter_mhz()
+        try:
+            pipeline.set_diagnostics(True)
+            for repeat in range(config.iterations):
+                state.reset()
+                for inputs in sequence:
+                    state.prepare(inputs)
+                    pipeline.times.zero_()
+                    stream.synchronize()
+                    graph.replay()
+                    stream.synchronize()
+                    checks.check(f'detail={repeat} source={inputs.source_round}', lambda: validate(inputs))
+                    detail_samples.append(dict(round=repeat, source_round=inputs.source_round,
+                                               streaming_cycles=pipeline.diagnostic_cycles()))
+        finally:
+            pipeline.set_diagnostics(False)
+            stream.synchronize()
     # Each source round has its own repeat distribution. Never pool different
     # decode rounds under the same synthetic-case summary.
     for source_round in sorted({sample['source_round'] for sample in samples}):
+        if detail_samples:
+            atomic_json(folder / f'round-{source_round}' / 'detail_samples.json',
+                        [sample for sample in detail_samples if sample['source_round'] == source_round])
         atomic_json(folder / f'round-{source_round}' / 'full_attribution.json', dict(
             samples=[sample for sample in samples if sample['source_round'] == source_round]))
     return dict(correctness=checks.status, failures=checks.failures,

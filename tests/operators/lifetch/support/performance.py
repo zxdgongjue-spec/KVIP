@@ -15,6 +15,131 @@ TOKEN_BYTES = 656
 TOPK = 2048
 
 
+def profile_graph_batch(torch, graph, *, calls, folder, serial=False, transport='urma', stream=None):
+    """Measure one already-warmed graph once, with events and profiler together.
+
+    The caller owns independent mutable state for every captured invocation.
+    Input preparation, restoration, warmup and verification stay outside this
+    function. No detailed device instrumentation may be enabled here.
+    """
+    import json
+    from pathlib import Path
+    import torch_npu
+    from torch.profiler import record_function
+    from diagnostics import account, account_native, account_ubmem
+    from reporting import atomic_json
+
+    if calls < 1:
+        raise ValueError('A measured graph must contain at least one invocation')
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    stream = stream or torch.npu.current_stream()
+    stream.synchronize()
+    begin, end = [torch.npu.Event(enable_timing=True) for _ in range(2)]
+    name = 'lifetch_measured_graph'
+    trace_path = folder / 'trace.json'
+    profiler = torch_npu.profiler.profile(
+        activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
+        record_shapes=False, profile_memory=False, with_stack=False)
+    with profiler:
+        with record_function(name):
+            begin.record(stream)
+            graph.replay()
+            end.record(stream)
+            end.synchronize()
+            if hasattr(graph, 'completed'):
+                graph.completed()
+    elapsed = begin.elapsed_time(end) * 1000
+    atomic_json(folder / 'graph_event.json', dict(graph_event_us=elapsed, calls=calls,
+                                                 event_mean_us=elapsed / calls))
+    profiler.export_chrome_trace(str(trace_path.resolve()))
+    trace = json.loads(trace_path.read_text())
+    events = trace['traceEvents'] if isinstance(trace, dict) else trace
+    if serial:
+        accounting = account_native(events, name, elapsed)
+    elif transport == 'ubmem':
+        accounting = account_ubmem(events, name, elapsed)
+    else:
+        accounting = account(events, name, elapsed, full=True, fused_final=True)
+    accounting['event_us'] = elapsed
+    result = split_graph_invocations(accounting, calls, serial=serial)
+    result['trace'] = str(trace_path)
+    atomic_json(folder / 'graph_profile.json', result)
+    return result
+
+
+def split_graph_invocations(accounting, calls, *, serial=False):
+    """Partition named kernels at each LI/init, retaining internal gaps.
+
+    Graph edges and gaps *between* invocations remain graph-level overhead;
+    they are never charged to invented per-invocation event measurements.
+    """
+    if 'error' in accounting:
+        raise ValueError(f'Graph attribution failed: {accounting}')
+    groups = accounting['intervals_us']
+    resolver = 'resolve_update_fetch' if 'resolve_update_fetch' in groups else 'resolve_update'
+    if serial or 'init' in groups:
+        starts = sorted(start for start, _ in groups['li' if serial else 'init'])
+    else:
+        # All LI phases precede one resolver kernel for each invocation.
+        starts = []
+        last_end = float('-inf')
+        pending = sorted(groups['li'], reverse=True)
+        for resolve_start, resolve_end in sorted(groups.get(resolver, [])):
+            phases = []
+            while pending and pending[-1][0] < resolve_start:
+                start, end = pending.pop()
+                if start < last_end or end > resolve_start:
+                    raise ValueError('LI phase crosses a resolver boundary')
+                phases.append(start)
+            if not phases:
+                raise ValueError('Missing LI before resolver in measured graph')
+            starts.append(min(phases))
+            last_end = resolve_end
+        if pending:
+            raise ValueError('LI phase missing its resolver')
+    if len(starts) != calls:
+        raise ValueError(f'Expected {calls} invocation boundaries, found {len(starts)}')
+    samples = []
+    for index, start in enumerate(starts):
+        stop = starts[index + 1] if index + 1 < calls else float('inf')
+        intervals = {stage: sorted((a, b) for a, b in values if start <= a < stop)
+                     for stage, values in groups.items()}
+        required = {'li', 'lidu_prepare', 'fetch'} if serial else {'li', resolver}
+        if not serial and 'init' in groups:
+            required.add('init')
+        if any(not intervals.get(stage) for stage in required):
+            raise ValueError(f'Incomplete invocation {index}: {intervals}')
+        flat = sorted(pair for values in intervals.values() for pair in values)
+        finish = max(b for _, b in flat)
+        if finish > stop:
+            raise ValueError(f'Invocation {index} overlaps the next invocation')
+        from diagnostics import union
+        busy = sum(b - a for a, b in union(flat))
+        stages = {stage: sum(b - a for a, b in union(values))
+                  for stage, values in intervals.items() if values}
+        span = finish - start
+        samples.append(dict(invocation=index, start_us=start, end_us=finish,
+                            us=span, stages_us=stages, inter_kernel_gap_us=span-busy,
+                            overlap_us=sum(stages.values())-busy, intervals_us=intervals))
+    event = accounting['event_us']
+    if event < accounting['kernel_span_us'] - 2:
+        raise ValueError('Profiler device span exceeds the same graph event')
+    distribution = timing_summary([sample['us'] for sample in samples])
+    timing = dict(distribution, profiler_mean_us=distribution['mean_us'],
+                  mean_us=event/calls, event_mean_us=event/calls,
+                  graph_event_us=event, graph_calls=calls, measured_graphs=1,
+                  percentile_source='profiler invocation spans from the same graph',
+                  timing_protocol='one_profiled_graph',
+                  stage_mean_us={stage: sum(sample['stages_us'].get(stage, 0.) for sample in samples)/calls
+                                 for stage in groups},
+                  inter_kernel_gap_mean_us=sum(sample['inter_kernel_gap_us'] for sample in samples)/calls,
+                  overlap_mean_us=sum(sample['overlap_us'] for sample in samples)/calls,
+                  outside_invocations_mean_us=(event-sum(sample['us'] for sample in samples))/calls)
+    return dict(timing=timing, samples=samples, accounting=accounting,
+                outside_invocations_us=event-sum(sample['us'] for sample in samples))
+
+
 def measure_graph(torch, call, reset, validate, *, warmup, iterations, diagnose=None, validate_each=True):
     """Restore outside events; preserve completed samples on numerical failures.
 
