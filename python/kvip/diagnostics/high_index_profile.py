@@ -347,6 +347,29 @@ def early_post_timing(rows, marks):
                 nonempty_lanes=int(live.sum()))
 
 
+def q2_plan_timing(rows, marks, *, post_first):
+    """Follow the one Q2 planner per request; keep sender and local clocks distinct."""
+    q2 = rows[32:48]
+    plan_end = q2[:, 4]
+    if np.any(plan_end < q2[:, 10]):
+        raise ValueError("Q2 plan completed before local entry")
+    live = q2[:, 1] > 0
+    post = q2[live, 6]
+    ready = marks[16:32, 26][live]
+    # Publication is timestamped after flush, so the difference is signed.
+    lag = post.astype(np.int64) - ready.astype(np.int64)
+    result = dict(nonempty_lanes=int(live.sum()), published_to_first_post_p50=(float(np.median(lag)) if len(lag) else None),
+                  plan_end_from_entry_p50=float(np.median(plan_end-q2[:, 10])))
+    if post_first:
+        begin = marks[32:48, 31]
+        if (np.any(marks[:32, 31]) or np.any(marks[48:, 31])
+                or np.any(begin < marks[32:48, 21]) or np.any(begin > plan_end)):
+            raise ValueError("Invalid RQI7 Q2 planner interval")
+        result.update(post_before_plan=int(np.count_nonzero(post < begin[live])),
+                      plan_duration_p50=float(np.median(plan_end-begin)))
+    return result
+
+
 def retire_timing(rows, marks):
     """Bound software completion calls by their own lane clock."""
     begin, end = marks[:16, 28], marks[:16, 29]
@@ -430,7 +453,7 @@ def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan
     if detail.dtype != np.int64 or detail.shape != (len(rows), 32):
         raise ValueError("Unexpected HIGH timestamp layout")
     marks = detail.view(np.uint64)
-    row_markers = {0x52514931: "RQI1", 0x52514932: "RQI2", 0x52514933: "RQI3", 0x52514934: "RQI4", 0x52514935: "RQI5", 0x52514936: "RQI6"}
+    row_markers = {0x52514931: "RQI1", 0x52514932: "RQI2", 0x52514933: "RQI3", 0x52514934: "RQI4", 0x52514935: "RQI5", 0x52514936: "RQI6", 0x52514937: "RQI7"}
     marker = row_markers.get(int(marks[0, 2]))
     if marker is not None and np.all(marks[:, 2] == marks[0, 2]):
         if wait_first or not schedule_timing:
@@ -443,10 +466,11 @@ def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan
         schedule = overlap_schedule_timing(rows, marks, marker=marker)
         if marker == "RQI6":
             schedule["poll_work"] = final_poll_work(rows, marks)
-        if marker in ("RQI5", "RQI6"):
+        if marker in ("RQI5", "RQI6", "RQI7"):
             schedule["retire"] = retire_timing(rows, marks)
-        if marker in ("RQI4", "RQI5", "RQI6"):
+        if marker in ("RQI4", "RQI5", "RQI6", "RQI7"):
             schedule["early_post"] = early_post_timing(rows, marks)
+            schedule["q2_plan"] = q2_plan_timing(rows, marks, post_first=marker == "RQI7")
         if marker == "RQI3":
             schedule["get_reassignment"] = check_get_reassignment(rows[:, 1], marks, canonical_counts)
         # block=q*16+request. RQI4+ timestamps local descriptor validation

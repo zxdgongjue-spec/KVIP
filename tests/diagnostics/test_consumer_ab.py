@@ -258,7 +258,7 @@ def test_expected_format_follows_checked_out_dispatch_and_marker(tmp_path):
     (folder / "streaming.cpp").write_text("high_post_index::Run(a,block);")
     assert schedule_format(tmp_path) == "PIH1"
     (folder / "streaming.cpp").write_text("high_post_index::RunRow(a,block);")
-    for token, expected in (("0x52514931", "RQI1"), ("0x52514932", "RQI2"), ("0x52514933", "RQI3"), ("0x52514934", "RQI4"), ("0x52514935", "RQI5"), ("0x52514936", "RQI6")):
+    for token, expected in (("0x52514931", "RQI1"), ("0x52514932", "RQI2"), ("0x52514933", "RQI3"), ("0x52514934", "RQI4"), ("0x52514935", "RQI5"), ("0x52514936", "RQI6"), ("0x52514937", "RQI7")):
         (folder / "high_index_async.h").write_text(f"ticks[2]={token}U;")
         assert schedule_format(tmp_path) == expected
 
@@ -388,3 +388,20 @@ def test_rqi6_counts_real_final_reads_and_explicit_pacing_separately():
     m[60, 31] = 1
     with pytest.raises(ValueError, match="RQI6"):
         final_poll_work(r, m)
+
+def test_q2_published_to_post_respects_lane_order_and_planner_scope():
+    from kvip.diagnostics.high_index_profile import q2_plan_timing
+    r = np.zeros((64, 16), dtype=np.uint64)
+    m = np.zeros((64, 32), dtype=np.uint64)
+    q2 = r[32:48]
+    q2[:, 4], q2[:, 10] = 320, 100
+    q2[:3, 1], q2[:3, 6] = [7, 1, 5], [198, 204, 340]
+    m[16:32, 26], m[32:48, 21], m[32:48, 31] = 200, 180, 309
+    assert q2_plan_timing(r, m, post_first=True) == dict(
+        nonempty_lanes=3, published_to_first_post_p50=4., plan_end_from_entry_p50=220.,
+        post_before_plan=2, plan_duration_p50=11.)
+    m[32, 31] = 0
+    with pytest.raises(ValueError, match="RQI7"):
+        q2_plan_timing(r, m, post_first=True)
+    q2[:, 1] = 0
+    assert q2_plan_timing(r, m, post_first=False)["published_to_first_post_p50"] is None
