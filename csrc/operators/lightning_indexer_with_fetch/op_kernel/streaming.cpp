@@ -721,7 +721,7 @@ inline void PublishStreamingResidency(uint32_t resident,uint32_t postOffset,__gm
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void PublishQueryCompletion(__gm__ Context* ctx,__gm__ BatchFlag* flags,
  uint32_t batch,uint32_t resident,uint32_t postOffset,uint32_t q,uint32_t lane,
- uint32_t workers,uint64_t error,uint32_t completed,bool deferredResidency,uint32_t getPhase=0) {
+ uint32_t workers,uint64_t error,uint32_t completed,bool deferredResidency,uint32_t getPhase) {
  // Each warp owns a request; eight requests no longer run serially in one VF.
  constexpr uint32_t lanesPerRequest=32,requestsPerWave=256/lanesPerRequest;
  for(uint32_t b=lane+(threadIdx.x/lanesPerRequest)*workers;b<batch;b+=requestsPerWave*workers){
