@@ -332,6 +332,30 @@ def retire_timing(rows, marks):
                 last_lane=int(last), last_lane_final=int(rows[last, 9]-retire[last]))
 
 
+def final_poll_work(rows, marks):
+    """Count final CQ entry reads and explicit pacing on successful HIGH replays."""
+    probes = marks[:, 31] & np.uint64(0xffffffff)
+    paced = marks[:, 31] >> np.uint64(32)
+    live = rows[:, 1] != 0
+    calls = marks[:, 8]
+    async_only = (rows[:, 2] & 1) == 0
+    if (not np.any(live) or np.any((probes == 0) & (paced != 0))
+            or np.any(probes[~live]) or np.any(probes[live & async_only] < calls[live & async_only])):
+        raise ValueError("Invalid RQI6 final CQ probe totals for the submitted checkpoints")
+    sampled = probes != 0
+    # A fallback lane can contain both a blocking and an async Post. Its
+    # checkpoint count alone cannot say how many reads found an empty CQ.
+    exact_empty = int(probes.sum() - calls.sum()) if np.all(async_only[live]) else None
+    active = np.flatnonzero(live)
+    latest = active[np.argmax(rows[active, 9])]
+    return dict(latest_lane_probes=int(probes[latest]), latest_lane_paced_ticks=int(paced[latest]),
+                probes_total=int(probes.sum()), empty_probes=exact_empty,
+                polled_lanes=int(sampled.sum()), paced_lanes=int(np.count_nonzero(paced)),
+                probes_p50=float(np.median(probes[sampled])) if np.any(sampled) else 0.,
+                probes_max=int(probes.max()), paced_ticks_total=int(paced.sum()),
+                paced_ticks_max=int(paced.max()))
+
+
 def check_get_reassignment(counts, marks, canonical):
     """Reconcile every transport lane against the independent per-request Q descriptor counts."""
     if canonical is None or np.shape(canonical) != (16, 4):
@@ -374,7 +398,7 @@ def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan
     if detail.dtype != np.int64 or detail.shape != (len(rows), 32):
         raise ValueError("Unexpected HIGH timestamp layout")
     marks = detail.view(np.uint64)
-    row_markers = {0x52514931: "RQI1", 0x52514932: "RQI2", 0x52514933: "RQI3", 0x52514934: "RQI4", 0x52514935: "RQI5"}
+    row_markers = {0x52514931: "RQI1", 0x52514932: "RQI2", 0x52514933: "RQI3", 0x52514934: "RQI4", 0x52514935: "RQI5", 0x52514936: "RQI6"}
     marker = row_markers.get(int(marks[0, 2]))
     if marker is not None and np.all(marks[:, 2] == marks[0, 2]):
         if wait_first or not schedule_timing:
@@ -385,9 +409,11 @@ def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan
         result["row_partitions"] = dict(pairs=marks[:, 16].tolist(), singles=marks[:, 17].tolist(),
                                         invalidations=marks[:, 19].tolist(), single_owner=marker != "RQI1")
         schedule = overlap_schedule_timing(rows, marks, marker=marker)
-        if marker == "RQI5":
+        if marker == "RQI6":
+            schedule["poll_work"] = final_poll_work(rows, marks)
+        if marker in ("RQI5", "RQI6"):
             schedule["retire"] = retire_timing(rows, marks)
-        if marker in ("RQI4", "RQI5"):
+        if marker in ("RQI4", "RQI5", "RQI6"):
             schedule["early_post"] = early_post_timing(rows, marks)
         if marker == "RQI3":
             schedule["get_reassignment"] = check_get_reassignment(rows[:, 1], marks, canonical_counts)

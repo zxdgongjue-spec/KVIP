@@ -233,7 +233,7 @@ def test_expected_format_follows_checked_out_dispatch_and_marker(tmp_path):
     (folder / "streaming.cpp").write_text("high_post_index::Run(a,block);")
     assert schedule_format(tmp_path) == "PIH1"
     (folder / "streaming.cpp").write_text("high_post_index::RunRow(a,block);")
-    for token, expected in (("0x52514931", "RQI1"), ("0x52514932", "RQI2"), ("0x52514933", "RQI3"), ("0x52514934", "RQI4")):
+    for token, expected in (("0x52514931", "RQI1"), ("0x52514932", "RQI2"), ("0x52514933", "RQI3"), ("0x52514934", "RQI4"), ("0x52514935", "RQI5"), ("0x52514936", "RQI6")):
         (folder / "high_index_async.h").write_text(f"ticks[2]={token}U;")
         assert schedule_format(tmp_path) == expected
 
@@ -340,3 +340,26 @@ def test_rqi5_times_separate_prefetch_owners_from_nonempty_final_queues():
     m[16,29] = 1234
     with pytest.raises(ValueError, match="RQI5"):
         retire_timing(r,m)
+
+
+def test_rqi6_counts_real_final_reads_and_explicit_pacing_separately():
+    from kvip.diagnostics.high_index_profile import final_poll_work
+    r = np.zeros((64, 16), dtype=np.uint64)
+    m = np.zeros((64, 32), dtype=np.uint64)
+    r[[3, 45], 1], m[[3, 45], 8] = [1, 200], [1, 2]
+    r[[3, 45], 9] = [100, 200]
+    m[3, 31], m[45, 31] = 1, (4096 << 32) | 20
+    assert final_poll_work(r, m) == dict(
+        latest_lane_probes=20, latest_lane_paced_ticks=4096,
+        probes_total=21, empty_probes=18, polled_lanes=2, paced_lanes=1,
+        probes_p50=10.5, probes_max=20, paced_ticks_total=4096, paced_ticks_max=4096)
+    r[45, 2] = 1  # A fallback flag can cover both a blocking and a manual completion.
+    assert final_poll_work(r, m)["empty_probes"] is None
+    r[45, 2] = 0
+    m[45, 31] = 1
+    with pytest.raises(ValueError, match="RQI6"):
+        final_poll_work(r, m)
+    m[45, 31] = 2
+    m[60, 31] = 1
+    with pytest.raises(ValueError, match="RQI6"):
+        final_poll_work(r, m)

@@ -121,7 +121,7 @@ def schedule_format(source):
     if "high_post_index::RunRow(" not in (kernel/"streaming.cpp").read_text():
         return "PIH1"
     impl = (kernel/"high_index_async.h").read_text()
-    for tag, marker in (("0x52514935", "RQI5"), ("0x52514934", "RQI4"), ("0x52514933", "RQI3"), ("0x52514932", "RQI2"), ("0x52514931", "RQI1")):
+    for tag, marker in (("0x52514936", "RQI6"), ("0x52514935", "RQI5"), ("0x52514934", "RQI4"), ("0x52514933", "RQI3"), ("0x52514932", "RQI2"), ("0x52514931", "RQI1")):
         if tag in impl:
             return marker
     raise ValueError(f"Unrecognized row schedule diagnostic ABI at {source}")
@@ -266,15 +266,15 @@ def summarize(group, cases, baseline, candidate, high_overlap=False, schedule_fo
                 reassign = metrics.get("get_reassignment")
                 split_load = (f" helpers/Get_moved/max_Q_before={reassign['helpers']}/{reassign['transferred']}/"
                               f"{reassign['max_canonical_lane']}" if reassign else "")
-                role_stage = "descriptor_checked" if marker in ("RQI4", "RQI5") else "to_valid"
-                spread = "descriptor_check" if marker in ("RQI4", "RQI5") else "valid"
+                role_stage = "descriptor_checked" if marker in ("RQI4", "RQI5", "RQI6") else "to_valid"
+                spread = "descriptor_check" if marker in ("RQI4", "RQI5", "RQI6") else "valid"
                 print(f"G{group} LOAD {arm} role0/1/2/3_{role_stage}_p50_us={roles}"
                       f" max_row_{spread}_spread_us={metrics['validation_spread_max']/rate:.2f}"
                       f" lane_Index_us_p50/max={metrics['lane_index_p50']/rate:.2f}/{metrics['longest_lane_index']/rate:.2f}"
                       f" last_retire_to_row_exit_us_p50/max={metrics['row_retire_to_exit_p50']/rate:.2f}/{metrics['row_retire_to_exit_max']/rate:.2f}"
                       f" moves_total/max_row/max_lane={metrics['moved_total']}/{metrics['max_row_moves']}/{metrics['max_moves_per_lane']}"
                       f" rows_single_owner/gather={high['single_owner_rows']}/{high['row_gathers']}" + split_load)
-                if marker in ("RQI4", "RQI5"):
+                if marker in ("RQI4", "RQI5", "RQI6"):
                     early = metrics["early_post"]
                     def times_us(*keys):
                         return "/".join(f"{early[k]/rate:.2f}" for k in keys)
@@ -285,12 +285,19 @@ def summarize(group, cases, baseline, candidate, high_overlap=False, schedule_fo
                           f" lanes_firstPost_before_rowJoin={early['lanes_post_before_row_join']}/{early['nonempty_lanes']}"
                           f" lanes_firstPost_before_row_plan_or_TND_done="
                           f"{early['lanes_post_before_row_plan_or_tnd']}/{early['nonempty_lanes']}")
-                if marker == "RQI5":
+                if marker in ("RQI5", "RQI6"):
                     cq = metrics["retire"]
+                    poll = metrics.get("poll_work")
+                    counts = (f" final_probes_total/empty={poll['probes_total']}/{poll['empty_probes']}"
+                              f" polled/paced_lanes={poll['polled_lanes']}/{poll['paced_lanes']}"
+                              f" probes_per_polled_lane_p50/max={poll['probes_p50']:g}/{poll['probes_max']}"
+                              f" paced_lane_us_sum/max={poll['paced_ticks_total']/rate:.2f}/{poll['paced_ticks_max']/rate:.2f}"
+                              f" last_lane_probes/paced_us={poll['latest_lane_probes']}/{poll['latest_lane_paced_ticks']/rate:.2f}"
+                              if poll else "")
                     print(f"G{group} POST_CQ {arm} software_wall_us"
                           f" prefetch_owner_p50/max={cq['prefetch_p50']/rate:.2f}/{cq['prefetch_max']/rate:.2f}"
                           f" final_nonempty_p50/max={cq['final_p50']/rate:.2f}/{cq['final_max']/rate:.2f}"
-                          f" last_lane={cq['last_lane']} last_lane_final={cq['last_lane_final']/rate:.2f}")
+                          f" last_lane={cq['last_lane']} last_lane_final={cq['last_lane_final']/rate:.2f}" + counts)
         print(f"G{group} CHECK real_Index_order/TopK/KV/lifecycle/submitted_completed=PASS", flush=True)
         return
     stages = []
