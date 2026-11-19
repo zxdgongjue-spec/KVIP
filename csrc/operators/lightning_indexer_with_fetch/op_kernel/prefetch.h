@@ -610,13 +610,11 @@ inline void GatherCandidateMap(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* slots,
     }
 }
 #if KVIP_RANKED_PORT
-// A TopK list contains hot hits as well as DDR candidates. The ordinary
-// bitmap scanner has already removed safe hot hits; ranked lists have not.
-// Keep that predicate here, in the existing map-gather launch. Never write
-// safe hot hits into mapping/changes or they may be moved by Index update.
+// Residency is stable through the LI kernel. Tag a private copy of seed IDs
+// once; subsequent merges preserve old IDs and add only cold-range positions.
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
-inline void GatherRankedCandidateMap(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* slots,
-    __gm__ uint32_t* map,uint32_t count,__gm__ Context* ctx,uint32_t batch,uint32_t resident) {
+inline void TagRankedSeed(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* tagged,
+    uint32_t count,__gm__ Context* ctx,uint32_t batch,uint32_t resident) {
     const uint32_t owner=OwnerRow(ctx,batch);
     auto valid=reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid);
     auto reserved=reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot);
@@ -630,7 +628,7 @@ inline void GatherRankedCandidateMap(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* s
         const bool safeHot=token<resident && !(token>=tailBegin && token<tailEnd) &&
             (!valid || asc_ldcg(valid+uint64_t(owner)*resident+token)) &&
             (!reserved || asc_ldcg(reserved+uint64_t(batch)*resident+token)<0);
-        slots[i]=safeHot?token:asc_ldcg(map+token);
+        tagged[i]=safeHot ? (token | 0x80000000U) : token;
     }
 }
 #endif
@@ -749,17 +747,24 @@ __aicore__ inline void FlushFetchBatch(uint32_t rt_batch,uint32_t rt_history,uin
 template<bool captureIo>
 __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer,uint32_t epoch,uint32_t core,uint32_t lane,
     LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids,
-    uint32_t sequenceHalfWindow, GM_ADDR rollingScores = nullptr) {
+    uint32_t sequenceHalfWindow, GM_ADDR rollingScores = nullptr, const uint32_t* rankedCounts = nullptr) {
     uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0;
     uint64_t scanBegin=0,candidateBegin=0,postBegin=0,begin=0;
     uint64_t firstDoorbell=0,secondDoorbell=0,lastDoorbell=0;
     auto ctx=reinterpret_cast<__gm__ Context*>(pointer);auto events=reinterpret_cast<__gm__ Event*>(ctx->events);
     auto event=events+epoch*rt_serviceLanes+lane;event->core=core;event->epoch=epoch;V9_FETCH_PROFILE(if(!KVIP_RANKED_PORT)event->waitBegin=GetSystemCycle();)
-    if(epoch && !KVIP_RANKED_PORT) {
+    uint64_t postWaitStart=0;
+#if KVIP_RANKED_PORT
+    if constexpr(captureIo)postWaitStart=GetSystemCycle();
+#endif
+    if(epoch) {
         auto previous=reinterpret_cast<__gm__ volatile Event*>(events)+(epoch-1)*rt_serviceLanes+lane;
         do { kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(events+(epoch-1)*rt_serviceLanes+lane),64); }
         while(!previous->complete);
     }
+#if KVIP_RANKED_PORT
+    if constexpr(captureIo)bitmapBytes=GetSystemCycle()-postWaitStart; // rankedPostWait, same event word
+#endif
     GlobalTensor<uint32_t> progressGm;
     progressGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress));
     auto work=flags.ReinterpretCast<uint32_t>();
@@ -892,20 +897,21 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
 #if KVIP_RANKED_PORT
         const uint32_t allowance=PrefetchAllowance(slots,requests,state.GetValue(208),state.GetValue(209),state.GetValue(210),ctx->windowLimit);
         for(uint32_t q=0;q<4 && count<allowance;++q) {
-            auto header=reinterpret_cast<__gm__ uint64_t*>(ctx->rankedState)+(b*4+q)*16;
-            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(header),128);
-            if(header[3]!=2048)continue; // This Q has not published a ranked list yet.
-            GlobalTensor<uint32_t> ranked;
-            ranked.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->rankedPrefix+b*(4*2048*6+1024)+4*2048*2)+q*2048);
+            const uint32_t n = rankedCounts[(b / rt_serviceLanes) * 4 + q];
+            if (!n) continue;
+            const uint64_t row = (uint64_t(epoch) * rt_batch + b) * 4 + q;
+            GlobalTensor<uint32_t> offers;
+            offers.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->rankedOffers) + row * kTop);
             SetFlag<HardEvent::V_MTE2>(EVENT_ID0);WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
-            DataCopy(ids,ranked,2048);
+            DataCopy(ids,offers,(n+7U)&~7U);
             SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-            Simt::VF_CALL<GatherRankedCandidateMap>(Simt::Dim3{256,1,1},
+            Simt::VF_CALL<GatherCandidateMap>(Simt::Dim3{256,1,1},
                 reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),map,2048,ctx,b,rt_resident);
+                reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),map,n,
+                static_cast<__gm__ uint32_t*>(nullptr),reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),rt_history);
             PipeBarrier<PIPE_V>();
             CompactMisses(reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),2048,allowance-count,
+                reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),n,allowance-count,
                 reinterpret_cast<__ubuf__ uint32_t*>(selectedIds[count].GetPhyAddr()));
             SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
             uint32_t found=cfg.GetValue(56),admitted=found<allowance-count?found:allowance-count;
@@ -1245,9 +1251,9 @@ if (rt_batchedRows) {
 namespace rotating {
 __aicore__ inline void Service(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_splitQ,uint32_t rt_rounds,uint32_t rt_serviceAics,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer, uint32_t epoch, uint32_t core,
     uint32_t lane, LocalTensor<uint32_t> scratch, LocalTensor<uint16_t> flags,
-    LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow = 0,bool captureIo = false, GM_ADDR rollingScores = nullptr) {
-    if(captureIo) FastService<true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow, rollingScores);
-    else FastService<false>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow, rollingScores);
+    LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow = 0,bool captureIo = false, GM_ADDR rollingScores = nullptr, const uint32_t* rankedCounts = nullptr) {
+    if(captureIo) FastService<true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow, rollingScores, rankedCounts);
+    else FastService<false>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow, rollingScores, rankedCounts);
 }
 }
 

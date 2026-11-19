@@ -103,7 +103,7 @@ class LIFetchBinding:
             ("final_replicated", int(final_strategy == "replicated")),
             ("final_workers", final_aivs(batch, li_tiling, aic_count, final_workers)),
             ("aic_count", aic_count),
-            ("abi_version", 12 + 64*self.ranked_port + 16*self.fetch_packets_enabled + 8*self.fetch_rank + self.incremental_topk + 2 * window_probe + 4 * seed_mask),
+            ("abi_version", 12 + 128*self.ranked_port + 16*self.fetch_packets_enabled + 8*self.fetch_rank + self.incremental_topk + 2 * window_probe + 4 * seed_mask),
             (
                 "service_lanes",
                 li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)["service_aivs_per_window"],
@@ -262,7 +262,8 @@ class LIFetchBinding:
         )
         if self.ranked_port:
             self.ranked_state = torch.empty((batch, 4, 16), dtype=torch.int64, device=self.device)
-            blob = np.r_[blob, np.array([self.ranked_state.data_ptr(), arguments[13].data_ptr()], dtype="<u8").view("u1")]
+            self.ranked_offers = torch.empty((self.rounds, batch, 4, 2048), dtype=torch.int32, device=self.device)
+            blob = np.r_[blob, np.array([self.ranked_state.data_ptr(), self.ranked_offers.data_ptr()], dtype="<u8").view("u1")]
         if self.fetch_rank:
             self.fetch_ranks = torch.empty((batch, 4, self.rounds, 3104), dtype=torch.int32, device=self.device)
             self.fetch_audit = torch.empty((batch, self.rounds, 96), dtype=torch.int32, device=self.device)

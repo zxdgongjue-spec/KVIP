@@ -84,6 +84,8 @@ public:
             topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow
 #if KVIP_WINDOW_REFILTER || KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
             , false, scoreStorage_
+#elif KVIP_RANKED_PORT
+            , false, nullptr, rankedCounts_
 #endif
             );
 #else
@@ -91,6 +93,8 @@ public:
             streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U)
 #if KVIP_WINDOW_REFILTER || KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
             , scoreStorage_
+#elif KVIP_RANKED_PORT
+            , nullptr, rankedCounts_
 #endif
             );
 #endif
@@ -493,7 +497,17 @@ private:
         thresholds.SetGlobalBuffer((__gm__ uint16_t *)(prefixOutput_ + batch * rowBytes + count * 6));
         if (!thresholdReady || KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE || KVIP_RANKED_PORT) {
             DataCopy(scores[q * 2048], scoreOutLocal_, 2048);
+#if KVIP_RANKED_PORT
+            auto tagged = topkSharedTmpLocal_;
+            Simt::VF_CALL<rotating::TagRankedSeed>(Simt::Dim3{256,1,1},
+                reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(tagged.GetPhyAddr()),2048,
+                reinterpret_cast<__gm__ rotating::Context*>(rotationContext_),batch,runtimeShape_.resident);
+            SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
+            DataCopy(indices[q * 2048], tagged.template ReinterpretCast<int32_t>(), 2048);
+#else
             DataCopy(indices[q * 2048], indicesOutLocal_.template ReinterpretCast<int32_t>(), 2048);
+#endif
         }
         DataCopy(thresholds[q * 128], prefixThreshold_[(query % 2) * 128], 128);
         PipeBarrier<PIPE_ALL>();

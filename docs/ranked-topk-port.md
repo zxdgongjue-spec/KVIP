@@ -37,19 +37,34 @@ cannot re-enter later because the exact prefix Kth is monotone. Budget-deferred
 IDs stay in the persisted Top2048 and are reconsidered while still selected.
 Original slot reservation deduplicates Q4 admissions before posting.
 
-Ranked lists include resident hits, unlike the old prefiltered candidate bitmap.
-The existing map-gather launch therefore also applies the original hot-valid
-and reserved-victim predicate. A safe resident hit bypasses the DDR map lookup;
-an invalid or reserved hot entry still needs a transfer unless it was already
-submitted. ABC mappings remain authoritative. This does not initialize an extra
-map, launch a kernel, or move a valid hot token to another slot. A round-local
-`mapping == UINT32_MAX` alone means "not submitted", not "absent from hot cache".
+## Rank and posting ownership
+
+In the host20 results for native 7e3f73b, the mean rank body was 27.92 us on
+G7 and 21.13 us on G2. Waiting for the previous service to finish accounted for
+188.95 and 193.04 us per lane/window respectively (diagnostic replay).
+Both that revision and donor 262bf7a joined the predecessor's complete event
+before ranking. The donor tags resident IDs at seed and exports compact offers
+with a score quota per query. The old port instead reclassified complete TopK
+lists after rank publication. Its 30-us rank timer excluded that work.
+
+The new producer tags only safe resident hits in its private seed ID copy.
+Cold updates never introduce resident positions. The usual ID-remap vector
+pass therefore packs untagged offers in order; a window reusing a prior rank
+packs the saved list. Victims and invalid hot entries remain eligible, and
+the map still handles ABC and prior admissions. Public output removes the
+private tag and preserves padding. A single request still shares the 64-ID
+window budget across its four queries.
+
+Each epoch owns a separate offer region (4 MiB capacity at BS16). Only the
+padded nonempty prefixes are written. Counts stay on the service AIV and a
+zero count suppresses reads, so the arena needs no clearing. After publishing
+rank state, the producer sets rankReady. The next owner can advance the rank
+while the previous owner prepares and posts its WQEs. Posting still waits for
+complete before consulting the mutable map, row or queue. Finalization joins
+the last complete post. Ranked ABI 140 identifies the new offer-buffer pointer.
 
 ## Avoiding migration overhead
 
-- Fetch reads persisted Top2048 IDs directly. There is no second full-list write
-  or separate ID allocation: this removes up to 8 KiB/query/window of duplicate
-  writes, not a measured latency claim.
 - Progress is captured once by ranking. Fetch does not read it again.
 - Rank state is only 128 bytes/query. All-ready Q4 headers use one 512-byte row
   write; only a partially ready row writes individual ready query headers.
@@ -70,13 +85,12 @@ two representative lanes (two requests each) and the same score inputs. They
 validate functional prefix ranks and the next-query pipeline.
 They do not simulate URMA transport or establish whole-graph performance.
 
-The admission regression executes the production SIMT body on CPU with distinct
-active-row/owner mappings, invalid hot entries, reserved victims, ABC entries and
-Q4 resubmission. CANN admission fixtures use real G7/G2 rank lists and residency
-metadata with production-style unmapped hot entries, sampling 256 IDs per query
-and window to check compact posted IDs and map updates under the 64/512 budgets.
-The samples cover two requests and all eight windows. Prefix-rank checks alone do not
-validate this cache integration boundary.
+The admission regression executes the native seed classifier on CPU. On frozen
+G7/G2 rank lists, producing all eight offer buffers before draining them in
+order reproduced all 512 ordered query/window admissions per group. Local CANN
+probes exercise seed tagging, remap-and-pack, fallback packing and public ID
+decoding on two full lists per group. Counts and ID order are checked against
+the CPU reference. These probes do not run the URMA queue or measure overlap.
 
 CANN 9.2.0 builds both feature-off and feature-on binaries. Local model tests use
 Ascend950PR_9589; host20 is Ascend950DT_9582. This hardware/model difference and
@@ -87,7 +101,8 @@ counted from each run's actual selection.
 
 Headline timing covers LI, seed/rank work, Fetch, repair and Index update. Warmup,
 restoration and diagnostic readback are excluded. Separate markers distinguish
-predecessor wait, rank work, open-to-first-Post and open-to-return. First Post is
+rank predecessor wait, rank work (including offer export), post predecessor
+wait, the sum of both waits, and the interval from open to the first Post or return. First Post is
 neither necessarily useful nor completed. The donor's approximately 30 us rank
 measurement must not be described as the complete window cost.
 

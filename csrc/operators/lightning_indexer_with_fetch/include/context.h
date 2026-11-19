@@ -30,7 +30,12 @@ struct alignas(128) Row {
 };
 struct alignas(128) Event {
     uint64_t begin, end;
-    uint32_t core, epoch, complete, skipped;
+    uint32_t core, epoch, complete;
+#if KVIP_RANKED_PORT
+    uint32_t rankReady; // Rank state committed. The URMA post may still be in flight.
+#else
+    uint32_t skipped;
+#endif
     uint64_t waitBegin;
     uint64_t scanTicks, candidateTicks, postTicks, bitmapBytes, candidateCount, postedCount;
     uint32_t pad[10];
@@ -66,7 +71,7 @@ struct Context {
     // Optional int32[B,2] Index-only seed range; independent of KV tailBounds.
     uint64_t thresholdBounds;
 #if KVIP_RANKED_PORT
-    uint64_t rankedState, rankedPrefix; // Q4 private cursors and current Top2048 IDs.
+    uint64_t rankedState, rankedOffers; // Private TopK cursors and immutable [epoch,B,Q,2048] offers.
 #endif
 #if KVIP_FETCH_BITMAP || KVIP_FETCH_DENSE
     uint64_t fetchRanks, fetchAudit; // immutable per logical prefix; actual service version and IDs

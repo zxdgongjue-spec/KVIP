@@ -31,3 +31,45 @@ __simd_vf__ inline void ExcludeSeeded(__ubuf__ uint16_t* bitmap,uint32_t base,ui
     }
 }
 }
+
+namespace lifetch_ranked {
+// Drop safe-hot tags and padding from the transport list, retaining TopK order.
+// Actual prior admissions and ABC mappings are checked later by the post owner.
+__simd_vf__ inline void PackOffers(__ubuf__ uint32_t* ids, __ubuf__ uint32_t* out,
+    __ubuf__ uint32_t* count, uint32_t validEnd) {
+    using namespace AscendC::MicroAPI;
+    auto all = CreateMask<uint32_t, MaskPattern::ALL>();
+    auto one = CreateMask<uint32_t, MaskPattern::VL1>();
+    RegTensor<uint32_t> id, packed, ones, sum, total;
+    MaskReg eligible;
+    UnalignRegForStore store;
+    Duplicate(sum, uint32_t(0));
+    ClearSpr<SpecialPurposeReg::AR>();
+    for (uint16_t i = 0; i < 2048; i += 64) {
+        LoadAlign(id, ids+i);
+        CompareScalar<uint32_t, CMPMODE::LT>(eligible, id, validEnd, all);
+        Duplicate<uint32_t, MaskMergeMode::ZEROING>(ones, uint32_t(1), eligible);
+        Add(sum, sum, ones, all);
+        Squeeze<uint32_t, AscendC::MicroAPI::GatherMaskMode::STORE_REG>(packed, id, eligible);
+        StoreUnAlign<uint32_t, PostLiteral::POST_MODE_UPDATE>(out, packed, store);
+    }
+    StoreUnAlignPost(out, store);
+    ReduceSum(total, sum, all);
+    StoreAlign(count, total, one);
+}
+
+__simd_vf__ inline void DecodePublicIds(__ubuf__ uint32_t* ids) {
+    using namespace AscendC::MicroAPI;
+    auto all = CreateMask<uint32_t, MaskPattern::ALL>();
+    RegTensor<uint32_t> id, mask, raw;
+    Duplicate(mask, uint32_t(0x7fffffff));
+    for (uint16_t i = 0; i < 2048; i += 64) {
+        MaskReg padding;
+        LoadAlign(id, ids+i);
+        CompareScalar<uint32_t, CMPMODE::EQ>(padding, id, UINT32_MAX, all);
+        And(raw, id, mask, all);
+        Select(raw, id, raw, padding);
+        StoreAlign(ids+i, raw, all);
+    }
+}
+}

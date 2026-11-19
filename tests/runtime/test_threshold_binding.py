@@ -118,7 +118,7 @@ def fixture(monkeypatch, batch=2, *, ranked=False, full_geometry=False):
             Mock(side_effect=lambda p, a=attribute: getattr(ctypes.cast(p, ctypes.POINTER(RuntimeShape)).contents, a)),
         )
     for name, value in {
-        "abi_version": 76 if ranked else 12,
+        "abi_version": 140 if ranked else 12,
         "context_bytes": 344 if ranked else 328,
         "row_bytes": 1024,
         "simulation": 0,
@@ -177,7 +177,8 @@ def test_ranked_context_constructs_and_preserves_pointer_offsets(monkeypatch, ra
     if ranked:
         assert bound.ranked_state.shape == (16, 4, 16)
         assert int.from_bytes(blob[328:336], "little") == bound.ranked_state.data_ptr()
-        assert int.from_bytes(blob[336:344], "little") == f.arguments[13].data_ptr()
+        assert bound.ranked_offers.shape == (8, 16, 4, 2048)
+        assert int.from_bytes(blob[336:344], "little") == bound.ranked_offers.data_ptr()
     else:
         assert not hasattr(bound, "ranked_state")
     f.library.v9_init.assert_not_called()
