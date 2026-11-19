@@ -65,6 +65,49 @@ python tests/operators/lifetch/test_lifetch.py bench \
 构建使用运行时 shape 缓存，不按 BS/miss 编译。每组独立恢复 Index/hot/LRU，恢复及校验在计时外。
 bench 不运行诊断打点或 check 的边界专项；资源准备、复用次数及墙钟成本保存在结果目录。
 
+### A5 三路线完整链对比
+
+在已构建 KVIP/KVAF、已启动 URMA CPU service 的容器中执行：
+
+```bash
+cd /home/w00568585/wt-mr14
+source /usr/local/Ascend/cann/set_env.sh
+source scripts/env.sh
+bash tests/operators/lifetch/run_full_chain_a5.sh \
+  --device 5 --kvaf-root third_party/KVAF \
+  --kvaf-server 127.0.0.1:28885
+```
+
+KVAF 目录和服务地址需替换为实际配置。脚本在当前 checkout 执行，不更新 Git、不调用 Docker。
+默认固定 Q4/H128K/resident16K/G32/seed43、AIC32/AIV64、W2/FetchWorkers2，
+扫描 B1/B16、miss=0/3/10/50/90/100、prefetch=0/512，交错运行三条路线：
+
+- `legacy`：P2 融合控制组。
+- `history_before`：history/separate/wave/separate。
+- `history_direct`：history/direct/phase/inline。
+
+每条路线通过 `test_lifetch.py bench` 配对测 SDK LI → LIDU → BatchGet 的 Serial 完整链。
+额外丢弃 r0，保留三轮测量，每轮 warmup4/iterations50。默认共 24 次 harness 调用、
+288 个 BS/miss 用例（含 r0），不是 24 个 kernel。可先跑小矩阵：
+
+```bash
+bash tests/operators/lifetch/run_full_chain_a5.sh \
+  --device 5 --kvaf-root third_party/KVAF --kvaf-server 127.0.0.1:28885 \
+  --batches 1 --miss-percent 10 --prefetch 0 --rounds 1 --iterations 20
+```
+
+`--plan` 只打印命令，不执行或创建文件。默认执行结果保存至
+`/home/w00568585/lifetch_full_chain_<timestamp>_<suffix>/`。
+`summary.csv`/`summary.log` 给出测量轮 p50 的均值及逐轮配对比值；
+`full_chain.csv` 保留 r0、mean/p50/p99、实际 score geometry、读取量和 report 路径。
+`fused_over_serial`、`fused_over_legacy`、`fused_over_history_before` 小于 1 表示更快。
+任一用例执行不完整或正确性非 PASS 时停止并保留已完成结果；不会生成成功汇总。
+
+W2 避免 legacy B1 请求 W8 时实际降为 W2 的几何差异。`--q-workers` 控制 Fetch 并发，
+不是 Q 切分。预算是请求上限，实际设备预算和调度以 report 为准。
+串行与融合的预取及缓存维护工作不同；本脚本比较可用整链，不隔离纯融合收益。
+`history_direct` 是 Cold canonical/predicate 候选，不是 LI 数值组件的 producer route=1。
+
 ## diagnose：算法与时间拆解
 
 ```bash
