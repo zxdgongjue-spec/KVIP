@@ -3701,11 +3701,14 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
     lean = policy in ('zero', 'early')
     candidate = fused and getattr(config, 'candidate_root', None) and not policy
     if lean:
-        from lean_replay import check_route as checked_routes, set_step
+        from lean_replay import check_route as checked_routes, request_step, set_step
         route_history = dict(warmup=[], source=config.candidate_revision, policy=policy)
     elif candidate:
         from peer_candidate import checked_routes, set_step
         route_history = dict(warmup=[], source=config.candidate_revision)
+
+    def route_step(ordinal):
+        return request_step(ordinal, config.warmup) if lean else dict(step=ordinal)
 
     def validate_all(inputs, label):
         nonlocal pending
@@ -3768,13 +3771,15 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                 for state in states:
                     state.prepare(inputs)
                     if lean or candidate:
-                        set_step(state.rotating.adaptive_route if lean else state.rotating.auto_route, warmup + 1)
+                        set_step(state.rotating.adaptive_route if lean else state.rotating.auto_route,
+                                 **route_step(warmup + 1))
                 stream.synchronize()
                 replay()
                 stream.synchronize()
                 validate_all(inputs, f'warmup{warmup}')
                 if candidate or lean:
-                    route_history['warmup'].append(checked_routes(states, warmup + 1, low=warmup > 0))
+                    point = route_step(warmup + 1)
+                    route_history['warmup'].append(checked_routes(states, **point, low=point['step'] > 1))
         for state in states:
             state.reset()
         rounds = {}
@@ -3783,7 +3788,8 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             for state in states:
                 state.prepare(inputs)
                 if lean or candidate:
-                    set_step(state.rotating.adaptive_route if lean else state.rotating.auto_route, config.warmup + 1)
+                    set_step(state.rotating.adaptive_route if lean else state.rotating.auto_route,
+                             **route_step(config.warmup + 1))
                 if not candidate and fused and config.mode == 'diagnose':
                     initial = algorithm_before(state.rotating)
                     initial['logical_ids'] = state.input_layout.copy()
@@ -3794,7 +3800,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                                            serial=not fused, transport=config.transport, stream=stream)
             validate_all(inputs, 'measured')
             if lean or candidate:
-                route_history['measured'] = checked_routes(states, config.warmup + 1, low=True)
+                route_history['measured'] = checked_routes(states, **route_step(config.warmup + 1), low=True)
             rounds[inputs.source_round] = measured['timing']
             samples = []
             for i, item in enumerate(measured['samples']):
@@ -3828,7 +3834,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                 for state in states:
                     state.prepare(inputs)
                     if lean:
-                        set_step(state.rotating.adaptive_route, config.warmup + 2)
+                        set_step(state.rotating.adaptive_route, **route_step(config.warmup + 2))
                     state.forward.times.zero_()
                     if hasattr(state.rotating, 'rank_progress'):
                         state.rotating.rank_progress.zero_()
@@ -3839,7 +3845,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                 if policy:
                     from lean_replay import stage_report
                     if lean:
-                        route_history['diagnostic'] = checked_routes(states, config.warmup + 2, low=True)
+                        route_history['diagnostic'] = checked_routes(states, **route_step(config.warmup + 2), low=True)
                     folder = directory / 'diagnose' / f'round-{inputs.source_round}'
                     atomic_json(folder / 'lean_stages.json',
                                 stage_report(states, measured, samples, clock_mhz, policy, folder))

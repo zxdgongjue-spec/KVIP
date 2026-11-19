@@ -7,15 +7,23 @@ from statistics import median
 import numpy as np
 
 
-def set_step(route, step):
+def request_step(ordinal, warmup):
+    """Change request generations within the existing warmup budget."""
+    first_generation = max(2, warmup - 2)
+    if warmup >= 3 and ordinal > first_generation:
+        return dict(generation=2, step=ordinal - first_generation)
+    return dict(generation=1, step=ordinal)
+
+
+def set_step(route, step, generation):
     count = route.requests.shape[0]
     rows = np.empty((count, 4), dtype=np.int64)
     rows[:, 0] = np.arange(1, count + 1)
-    rows[:, 1:] = [1, step, 4]
+    rows[:, 1:] = [generation, step, 4]
     route.set_requests(rows)
 
 
-def check_route(states, step, *, low):
+def check_route(states, step, generation, *, low):
     counts = []
     for state in states:
         route = state.rotating.adaptive_route
@@ -23,12 +31,12 @@ def check_route(states, step, *, low):
         feedback = route.feedback.cpu().numpy()[1:]
         demand = route.demand.cpu().numpy().reshape(-1)
         expected_mode = (2 if state.route_policy == 'early' else 1) if low else 0
-        if (mode != expected_mode or np.any(feedback[:, 0] != 1) or np.any(feedback[:, 1] != step)
+        if (mode != expected_mode or np.any(feedback[:, 0] != generation) or np.any(feedback[:, 1] != step)
                 or np.any(feedback[:, 3] != 4) or np.any(demand < 0)
                 or not np.array_equal(feedback[:, 2], demand)):
-            raise ValueError(f'Incorrect learned route or uncommitted request feedback at step {step}, mode={mode}')
+            raise ValueError(f'Incorrect route or uncommitted feedback at generation {generation}, step {step}, mode={mode}')
         counts.append(int(demand.sum()))
-    return dict(step=step, low=len(states) if low else 0, high=0 if low else len(states),
+    return dict(generation=generation, step=step, low=len(states) if low else 0, high=0 if low else len(states),
                 feedback_demand_per_call=counts)
 
 
