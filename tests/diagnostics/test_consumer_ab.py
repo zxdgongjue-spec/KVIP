@@ -464,6 +464,7 @@ def test_rqi8_single_vf_has_no_timed_gather_endpoint():
     assert read()["row_partitions"]["field_gather_markers"] == "present"
 
 def test_rqi9_medium_private_cycle_moves_to_fields_but_preserves_logical_counts():
+    from kvip.diagnostics.consumer_ab import field_row_coverage
     from kvip.diagnostics.high_index_profile import validate_move_counts
     # Real G7 row: under RQI8, Q3 owns all 444 non-pair positions alongside 843 swaps.
     p, s = 843, 444
@@ -480,7 +481,10 @@ def test_rqi9_medium_private_cycle_moves_to_fields_but_preserves_logical_counts(
     two = [0]*16
     two[12] = 2*p
     validate_move_counts(profile, before, after, range(16), two_cycle_moves=two, invalidations=[0]*16)
-    assert profile["payload_writes"]["field_rows"] == [12]
+    fields = profile["payload_writes"]["field_rows"]
+    assert fields == [12]
+    assert field_row_coverage(fields, 12) == "field_rows_mask=0x1000 last_index_row=12 last_index_row_field=true"
+    assert field_row_coverage(fields, 0) == "field_rows_mask=0x1000 last_index_row=0 last_index_row_field=false"
     assert profile["row_gathers"] == profile["single_owner_rows"] == 0
     profile["row_partitions"]["prefer_owned_fields"] = False
     with pytest.raises(ValueError, match="Row-local"):

@@ -127,6 +127,12 @@ def schedule_format(source):
     raise ValueError(f"Unrecognized row schedule diagnostic ABI at {source}")
 
 
+def field_row_coverage(rows, last_index_row):
+    mask = sum(1 << row for row in rows)
+    return (f"field_rows_mask=0x{mask:04x} last_index_row={last_index_row}"
+            f" last_index_row_field={str(last_index_row in rows).lower()}")
+
+
 def cycle_move_bins(histograms):
     """Count changed tuples, not cycles, in each length bucket after JSON round trip."""
     bins = [0] * 5
@@ -294,7 +300,8 @@ def summarize(group, cases, baseline, candidate, high_overlap=False, schedule_fo
                       f" rows_single_owner/gather={high['single_owner_rows']}/{high['row_gathers']}" + split_load)
                 if marker in ("RQI8", "RQI9"):
                     payload = high["payload_writes"]
-                    print(f"G{group} INDEX_FIELDS {arm} field_rows={len(payload['field_rows'])}"
+                    coverage = field_row_coverage(payload["field_rows"], metrics["index_help"]["last_index_row"])
+                    print(f"G{group} INDEX_FIELDS {arm} field_rows={len(payload['field_rows'])} {coverage}"
                           f" cycle_field_write_B={payload['field_cycle_bytes']} total_Index_payload_write_B={payload['total_bytes']}"
                           f" max_lane_payload_write_B={max(payload['bytes_by_lane'])} tuple_B=148 hotvalid_excluded=true"
                           f" field_gather_marker={high['row_partitions']['field_gather_markers']}")
