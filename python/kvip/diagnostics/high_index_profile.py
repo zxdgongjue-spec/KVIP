@@ -166,7 +166,22 @@ def validate_move_counts(profile, before, after, owners, *, two_cycle_moves=None
                 or not np.array_equal(local["invalidations"], partition(np.asarray(invalidations, dtype=np.int64)))
                 or not np.array_equal(moved, (2*expected_pairs + expected_singles).ravel())):
             raise ValueError("Row-local HIGH transfer or invalidation counters disagree with persistent Index oracle")
-        profile["row_gathers"] = int(np.count_nonzero((singles > 0) & ~eligible))
+        shared = (singles > 0) & ~eligible
+        if "field_cycle_write_bytes" in local:
+            field_rows = shared & (singles >= 64) & (singles <= 4096)
+            observed = np.asarray(local["field_cycle_write_bytes"], dtype=np.int64).reshape(4, batch)
+            # Four independent 32 B key stripes. Q0 also writes the address,
+            # Q1 the logical ID, Q2 the scale. All are payload on one side.
+            expected = np.array([40, 40, 36, 32])[:, None] * np.where(field_rows, singles, 0)
+            if not np.array_equal(observed, expected):
+                raise ValueError("Field-owned HIGH Index bytes disagree with verified cycle workload")
+            writes = observed + 148 * (2 * expected_pairs + np.where(field_rows, 0, expected_singles))
+            if not np.array_equal(writes.sum(axis=0), 148 * np.array(counts)):
+                raise ValueError("Index field writes do not cover all persistent payload")
+            profile["payload_writes"] = dict(field_rows=np.flatnonzero(field_rows).tolist(),
+                field_cycle_bytes=int(observed.sum()), total_bytes=int(writes.sum()), bytes_by_lane=writes.ravel().tolist())
+            shared &= ~field_rows
+        profile["row_gathers"] = int(np.count_nonzero(shared))
         profile["single_owner_rows"] = int(np.count_nonzero(eligible))
         profile["persistent_moves_checked"] = True
         return
@@ -453,7 +468,7 @@ def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan
     if detail.dtype != np.int64 or detail.shape != (len(rows), 32):
         raise ValueError("Unexpected HIGH timestamp layout")
     marks = detail.view(np.uint64)
-    row_markers = {0x52514931: "RQI1", 0x52514932: "RQI2", 0x52514933: "RQI3", 0x52514934: "RQI4", 0x52514935: "RQI5", 0x52514936: "RQI6", 0x52514937: "RQI7"}
+    row_markers = {0x52514931: "RQI1", 0x52514932: "RQI2", 0x52514933: "RQI3", 0x52514934: "RQI4", 0x52514935: "RQI5", 0x52514936: "RQI6", 0x52514937: "RQI7", 0x52514938: "RQI8"}
     marker = row_markers.get(int(marks[0, 2]))
     if marker is not None and np.all(marks[:, 2] == marks[0, 2]):
         if wait_first or not schedule_timing:
@@ -463,12 +478,14 @@ def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan
         result["moved"] = marks[:, 10].tolist()
         result["row_partitions"] = dict(pairs=marks[:, 16].tolist(), singles=marks[:, 17].tolist(),
                                         invalidations=marks[:, 19].tolist(), single_owner=marker != "RQI1")
+        if marker == "RQI8":
+            result["row_partitions"]["field_cycle_write_bytes"] = marks[:, 13].tolist()
         schedule = overlap_schedule_timing(rows, marks, marker=marker)
         if marker == "RQI6":
             schedule["poll_work"] = final_poll_work(rows, marks)
-        if marker in ("RQI5", "RQI6", "RQI7"):
+        if marker in ("RQI5", "RQI6", "RQI7", "RQI8"):
             schedule["retire"] = retire_timing(rows, marks)
-        if marker in ("RQI4", "RQI5", "RQI6", "RQI7"):
+        if marker in ("RQI4", "RQI5", "RQI6", "RQI7", "RQI8"):
             schedule["early_post"] = early_post_timing(rows, marks)
             schedule["q2_plan"] = q2_plan_timing(rows, marks, post_first=marker == "RQI7")
         if marker == "RQI3":

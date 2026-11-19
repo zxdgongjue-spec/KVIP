@@ -258,7 +258,7 @@ def test_expected_format_follows_checked_out_dispatch_and_marker(tmp_path):
     (folder / "streaming.cpp").write_text("high_post_index::Run(a,block);")
     assert schedule_format(tmp_path) == "PIH1"
     (folder / "streaming.cpp").write_text("high_post_index::RunRow(a,block);")
-    for token, expected in (("0x52514931", "RQI1"), ("0x52514932", "RQI2"), ("0x52514933", "RQI3"), ("0x52514934", "RQI4"), ("0x52514935", "RQI5"), ("0x52514936", "RQI6"), ("0x52514937", "RQI7")):
+    for token, expected in (("0x52514931", "RQI1"), ("0x52514932", "RQI2"), ("0x52514933", "RQI3"), ("0x52514934", "RQI4"), ("0x52514935", "RQI5"), ("0x52514936", "RQI6"), ("0x52514937", "RQI7"), ("0x52514938", "RQI8")):
         (folder / "high_index_async.h").write_text(f"ticks[2]={token}U;")
         assert schedule_format(tmp_path) == expected
 
@@ -405,3 +405,28 @@ def test_q2_published_to_post_respects_lane_order_and_planner_scope():
         q2_plan_timing(r, m, post_first=True)
     q2[:, 1] = 0
     assert q2_plan_timing(r, m, post_first=False)["published_to_first_post_p50"] is None
+
+def test_rqi8_field_bytes_are_not_full_tuple_move_credits():
+    from kvip.diagnostics.high_index_profile import validate_move_counts
+
+    # Single long cycle in row 1; row 0 is one slot below the threshold.
+    before = np.tile(np.arange(80), (16, 1))
+    after = before.copy()
+    counts = np.zeros(16, np.int64)
+    counts[:2] = [63, 65]
+    for row, count in enumerate(counts[:2]):
+        after[row, :count] = np.roll(before[row, :count], 1)
+    parts = np.diff(np.arange(5)[:, None] * counts // 4, axis=0)
+    field = np.zeros((4, 16), np.int64)
+    field[:, 1] = 65 * np.array([40, 40, 36, 32])
+    profile = dict(moved=parts.ravel(), row_partitions=dict(pairs=[0]*64, singles=parts.ravel(),
+                   invalidations=[0]*64, single_owner=True, field_cycle_write_bytes=field.ravel()))
+    kwargs = dict(two_cycle_moves=[0]*16, invalidations=[0]*16)
+    validate_move_counts(profile, before, after, range(16), **kwargs)
+    assert profile["row_gathers"] == 1
+    w = profile["payload_writes"]
+    assert (w["field_rows"], w["field_cycle_bytes"], w["total_bytes"]) == ([1], 65*148, 128*148)
+    assert w["bytes_by_lane"][1::16] == [2600, 2600, 2340, 2080]
+    field[:, 1] = np.roll(field[:, 1], 1)  # Same total but wrong physical lane owner.
+    with pytest.raises(ValueError, match="Field-owned"):
+        validate_move_counts(profile, before, after, range(16), **kwargs)
