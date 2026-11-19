@@ -12,6 +12,10 @@ option(KVIP_INCREMENTAL_REGISTER "Register Kth for incremental window selection"
 option(KVIP_INCREMENTAL_PREFILTER "Fixed tile filtering and boundary-only sparse compaction" OFF)
 option(KVIP_INCREMENTAL_DIRECT "Materialize selected scores and physical IDs in one SIMD VF" OFF)
 option(KVIP_INCREMENTAL_INPLACE "Update only the boundary-tie suffix in place" OFF)
+set(KVIP_G7_SCAN_CLOCK 0 CACHE STRING "Offline cold-scan clocks: 1 original flat, 2 matched flat, 3 reference shards")
+if(NOT KVIP_G7_SCAN_CLOCK MATCHES "^[0-3]$")
+  message(FATAL_ERROR "Invalid G7 cold-scan clock mode")
+endif()
 option(KVIP_RANKED_PORT "Donor incremental TopK only; existing Fetch and resolver" OFF)
 option(KVIP_FETCH_BITMAP "Fetch-owned per-request ranking" OFF)
 option(KVIP_FETCH_DENSE "Fetch-owned per-request ranking" OFF)
@@ -118,6 +122,7 @@ ascendc_compile_options(v9_kernel PRIVATE -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WO
   -DKVIP_INCREMENTAL_REGISTER=$<BOOL:${KVIP_INCREMENTAL_REGISTER}>
   -DKVIP_INCREMENTAL_PREFILTER=$<BOOL:${KVIP_INCREMENTAL_PREFILTER}>
   -DKVIP_INCREMENTAL_INPLACE=$<BOOL:${KVIP_INCREMENTAL_INPLACE}>
+  -DKVIP_G7_SCAN_CLOCK=${KVIP_G7_SCAN_CLOCK}
   -DKVIP_RANKED_PORT=$<BOOL:${KVIP_RANKED_PORT}>
   -DKVIP_FETCH_BITMAP=$<BOOL:${KVIP_FETCH_BITMAP}>
   -DKVIP_FETCH_DENSE=$<BOOL:${KVIP_FETCH_DENSE}>
@@ -190,4 +195,4 @@ target_compile_definitions(v9_bridge PRIVATE KVIP_SEED_MASK=$<BOOL:${KVIP_SEED_M
 target_compile_definitions(v9_bridge PRIVATE KVIP_CONSUMED_PREFIX=$<BOOL:${KVIP_CONSUMED_PREFIX}>)
 target_compile_definitions(v9_bridge PRIVATE KVIP_INCREMENTAL_SEGMENTS=$<BOOL:${KVIP_INCREMENTAL_SEGMENTS}>)
 
-target_compile_definitions(v9_bridge PRIVATE KVIP_RANKED_PORT=$<BOOL:${KVIP_RANKED_PORT}>)
+target_compile_definitions(v9_bridge PRIVATE KVIP_G7_SCAN_CLOCK=${KVIP_G7_SCAN_CLOCK} KVIP_RANKED_PORT=$<BOOL:${KVIP_RANKED_PORT}>)

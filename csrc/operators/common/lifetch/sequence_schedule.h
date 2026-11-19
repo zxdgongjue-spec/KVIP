@@ -12,22 +12,37 @@
 LIFETCH_SCHEDULE_DEVICE inline uint32_t ColdWindowCount(const RuntimeShape& s) {
     return KVIP_COLD_FETCH_ONLY ? s.rounds : (s.rounds ? s.rounds-1 : 0);
 }
+// The ranked G7 replay has 449 pairs of tiles. The reference gives the
+// final odd pair to one shard and clips the other at the end of history.
+LIFETCH_SCHEDULE_DEVICE inline uint32_t SequenceBlockPairs(uint32_t cold) {
+#if KVIP_RANKED_PORT && KVIP_G7_SCAN_CLOCK != 1 && KVIP_G7_SCAN_CLOCK != 2
+    return (cold / 256 + 1) / 2;
+#else
+    return cold / 512;
+#endif
+}
 // Each shard owns half of the resident range and half of every cold window.
 // Align halves to two tiles so neither shard loads its sibling's Key page.
 LIFETCH_SCHEDULE_DEVICE inline bool UseSequenceSplit(const RuntimeShape& s) {
     if (s.rounds <= 1 || s.history <= s.resident) return false;
     uint32_t windows=ColdWindowCount(s);
-    uint32_t blocks=(s.history-s.resident)/512;
+    uint32_t cold=s.history-s.resident;
+    uint32_t blocks=SequenceBlockPairs(cold);
     uint32_t halfBlocks=(blocks+windows-1)/windows;
     // Both shards must have a final tile to drain their persistent pipelines.
-    return halfBlocks*(2*windows-1)<2*blocks && s.splitQ && s.indexHeads == 32 && s.rounds > 1 && s.resident % 512 == 0 &&
-        s.history > s.resident && (s.history - s.resident) % 512 == 0 &&
+    return halfBlocks*(2*windows-1)<cold/256 && s.splitQ && s.indexHeads == 32 && s.rounds > 1 && s.resident % 512 == 0 &&
+        s.history > s.resident &&
+#if KVIP_RANKED_PORT && KVIP_G7_SCAN_CLOCK != 1 && KVIP_G7_SCAN_CLOCK != 2
+        cold % 256 == 0 &&
+#else
+        cold % 512 == 0 &&
+#endif
         (s.history - s.resident) >= 512 * windows;
 }
 
 LIFETCH_SCHEDULE_DEVICE inline uint32_t SequenceHalfWindow(const RuntimeShape& s) {
     // Keep all shard starts tile-aligned; the last shard is clipped to history.
-    const uint32_t blocks = (s.history - s.resident) / 512;
+    const uint32_t blocks = SequenceBlockPairs(s.history - s.resident);
     const uint32_t windows=ColdWindowCount(s);
     return ((blocks + windows - 1) / windows) * 256;
 }

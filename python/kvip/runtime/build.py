@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import os
 import subprocess
 from pathlib import Path
 
@@ -143,6 +144,7 @@ def build_libraries(*, cache_dir, cann, headers, soc, reverse_cold=False,
         KVIP_ROLLING_BATCHED="ON" if rolling_batched else "OFF",
         KVIP_WINDOW_REFILTER="ON" if window_refilter else "OFF",
     )
+    options["KVIP_G7_SCAN_CLOCK"] = os.environ.get("KVIP_G7_SCAN_CLOCK", "0")
     digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode())
     for relative in (
         "version.info",

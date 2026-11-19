@@ -121,8 +121,16 @@ V9_DEVICE inline uint32_t FinalQueue(uint32_t rt_batch,uint32_t rt_finalWorkers,
 V9_DEVICE inline uint32_t Trigger(uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t epoch) {
     // Zero rounds disables service; keep this helper valid without division by zero.
     if (rt_rounds == 0) return rt_resident / 128;
+#if KVIP_G7_SCAN_CLOCK == 2
+    // Diagnostic flat control uses the reference pair-of-shards boundaries.
+    uint32_t pairs = ((rt_history - rt_resident) / 256 + 1) / 2;
+    uint32_t halfTiles = ((pairs + rt_rounds - 1) / rt_rounds) * 2;
+    uint32_t end = rt_resident / 128 + 2 * halfTiles * (epoch + 1);
+    return end < rt_history / 128 ? end : rt_history / 128;
+#else
     return rt_resident / 128 +
         ((rt_history - rt_resident) / 128) * (epoch + 1) / rt_rounds;
+#endif
 }
 V9_DEVICE inline bool IsTrigger(uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t tileEnd) {
     for (uint32_t e = 0; e < rt_rounds; ++e) if (Trigger(rt_history,rt_resident,rt_rounds,e) == tileEnd) return true;

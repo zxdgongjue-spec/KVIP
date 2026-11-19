@@ -2,6 +2,7 @@
 """Streaming LIFetch workspace and launch, allocated before graph capture."""
 
 import ctypes
+import os
 
 import numpy as np
 
@@ -103,6 +104,11 @@ class StreamingLIFetchForward:
         )
         if len(blob) != 256:
             raise AssertionError(f"LIFetch workspace ABI size={len(blob)}, expected 256")
+        if os.environ.get("KVIP_G7_SCAN_CLOCK", "0") != "0":
+            if (b, shape.liCores, shape.rounds) != (16, 32, 8):
+                raise ValueError("Cold window clock requires the G7 BS16/32-AIC/eight-window replay")
+            self.cold_clock = allocate("cold_clock", (64, 8, 8), torch.int64, True)
+            blob[144:152] = np.asarray([self.cold_clock.data_ptr()], dtype="<u8").view("u1")
         self.workspace = torch.from_numpy(blob.copy()).to(device)
         rotating.bindings = torch.tensor(
             [x.data_ptr() for x in rotating.arguments] + [self.workspace.data_ptr()],

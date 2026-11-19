@@ -152,7 +152,11 @@ protected:
     __aicore__ inline void FinishBaseBlock(const QLICommon::RunInfo& runInfo);
     __aicore__ inline void ProcessBaseBlock(uint32_t loop, uint64_t s2LoopIdx,
                                             QLICommon::RunInfo runInfo, uint32_t qScaleLoop, uint32_t kScaleLoop,
-                                            bool reuseQuery = false);
+                                            bool reuseQuery = false
+#if KVIP_G7_SCAN_CLOCK
+                                            , int32_t closingEpoch = -1
+#endif
+                                            );
     __aicore__ inline void ProcessInvalid();
     // ================================Params Calc=====================================
     __aicore__ inline void CalcGS1LoopParams(uint32_t bN2Idx);
@@ -770,11 +774,23 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
             for (uint32_t epoch = KVIP_COLD_FETCH_ONLY ? 0 : 1; epoch < runtimeShape_.rounds; ++epoch, begin += 2 * half) {
                 uint32_t end = begin + half;
                 if (end > runtimeShape_.history / S2_BASE_SIZE) end = runtimeShape_.history / S2_BASE_SIZE;
+#if KVIP_G7_SCAN_CLOCK
+                if ASCEND_IS_AIV { vectorService.ColdStamp(epoch, 0); }
+#endif
                 ScanSequenceHalf(begin, end, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
+#if KVIP_G7_SCAN_CLOCK
+                if ASCEND_IS_AIV {
+                    vectorService.ColdStamp(epoch, 1);
+                    vectorService.ColdRange(epoch, begin, end);
+                }
+#endif
                 if ASCEND_IS_AIV {
                     if (serviceEpoch == epoch) vectorService.RotateFetch(epoch, halfTokens);
                 }
             }
+#if KVIP_G7_SCAN_CLOCK
+            if ASCEND_IS_AIV { vectorService.FlushColdClock(); }
+#endif
         }
 
         if ASCEND_IS_AIV {
@@ -826,6 +842,30 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()
 #endif
             bool hadRecent = ScoreRecent(gloop, qScaleLoop);
             uint32_t kScaleLoop = 0;
+#if KVIP_G7_SCAN_CLOCK
+            // Put markers around whole ranges, not a timer predicate on every
+            // tile. FinishBaseBlock performs Fetch/final after the closing tick.
+            if ASCEND_IS_AIV {
+                uint32_t tile = splitCoreInfo.s2Start;
+                for (uint32_t seg = 0; seg <= runtimeShape_.rounds; ++seg) {
+                    uint32_t stop = seg ? rotating::Trigger(runtimeShape_.history, resident_,
+                        runtimeShape_.rounds, seg-1) : resident_/128;
+                    uint32_t begin = tile;
+                    if (seg) vectorService.ColdStamp(seg-1, 0);
+                    for (; tile + 1 < stop; ++tile, ++gloop) {
+                        if ((tile - splitCoreInfo.s2Start) % QLICommon::KScaleTiles == 0) ++kScaleLoop;
+                        ProcessBaseBlock(gloop, tile, runInfo, qScaleLoop, kScaleLoop,
+                                         hadRecent && tile == splitCoreInfo.s2Start);
+                    }
+                    if ((tile - splitCoreInfo.s2Start) % QLICommon::KScaleTiles == 0) ++kScaleLoop;
+                    ProcessBaseBlock(gloop, tile, runInfo, qScaleLoop, kScaleLoop, false, int32_t(seg)-1);
+                    if (seg) vectorService.ColdRange(seg-1, begin, stop);
+                    ++tile;
+                    ++gloop;
+                }
+                vectorService.FlushColdClock();
+            } else
+#endif
             for (int s2LoopIdx = splitCoreInfo.s2Start; s2LoopIdx <= tempLoopInfo.s2LoopEnd; s2LoopIdx++) {
                 if ((s2LoopIdx - splitCoreInfo.s2Start) % QLICommon::KScaleTiles == 0) {
                     ++kScaleLoop;
@@ -855,7 +895,11 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()
 template <typename QLIT>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessBaseBlock(uint32_t loop, uint64_t s2LoopIdx,
                                                           QLICommon::RunInfo runInfo, uint32_t qScaleLoop,
-                                                          uint32_t kScaleLoop, bool reuseQuery)
+                                                          uint32_t kScaleLoop, bool reuseQuery
+#if KVIP_G7_SCAN_CLOCK
+                                                          , int32_t closingEpoch
+#endif
+                                                          )
 {
     CalcRunInfo(loop, s2LoopIdx, runInfo, qScaleLoop, kScaleLoop);
 #if KVIP_REVERSE_COLD
@@ -872,6 +916,11 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessBaseBlock(uint3
     } else {
         vectorService.ProcessVec1(runInfo);
     }
+#if KVIP_G7_SCAN_CLOCK
+    if ASCEND_IS_AIV {
+        if (closingEpoch >= 0) vectorService.ColdStamp(uint32_t(closingEpoch), 1);
+    }
+#endif
     FinishBaseBlock(runInfo);
 }
 

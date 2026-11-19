@@ -528,7 +528,9 @@ __aicore__ inline void FinalIncremental(uint32_t query,uint32_t valid) {
     const uint32_t lane=(query/4)%runtimeShape_.serviceLanes;
     WaitForRank(runtimeShape_.rounds,lane);
     AuditRankPhase(query, 15);
-    uint32_t half=rotating::UseSequenceSplit(runtimeShape_)?rotating::SequenceHalfWindow(runtimeShape_):0;
+    // A dedicated Final launch has two sequence shards. A single-launch
+    // fallback (including nonuniform operand lengths) has one producer.
+    uint32_t half=streamingTopkOnly_?rotating::SequenceHalfWindow(runtimeShape_):0;
     uint32_t alignedValid=(valid+127U)&~127U;
     incrementalFinalValid_=valid;
     const bool localIds=AdvanceIncremental(query,alignedValid,half?alignedValid:0,half);

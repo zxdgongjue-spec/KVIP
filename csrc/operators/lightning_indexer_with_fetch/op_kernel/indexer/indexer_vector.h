@@ -65,6 +65,9 @@ public:
         WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     }
     __aicore__ inline void RotateFetch(uint32_t epoch, uint32_t sequenceHalfWindow = 0) {
+#if KVIP_G7_SCAN_CLOCK
+        ColdStamp(epoch, 2);
+#endif
 #if KVIP_RANKED_PORT
         AdvanceWindow(epoch,sequenceHalfWindow);
 #endif
@@ -109,6 +112,9 @@ public:
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event),sizeof(rotating::Event));
         }
 #endif
+#if KVIP_G7_SCAN_CLOCK
+        ColdStamp(epoch, 3);
+#endif
     }
     __aicore__ inline void LoadSequenceSplitThresholds(uint32_t batch) {
         constexpr uint32_t count = SIM_Q * 2048;
@@ -145,7 +151,31 @@ public:
     __aicore__ inline void ProcessTopK(const QLICommon::RunInfo &info, uint32_t queryRow = SIM_Q);
     __aicore__ inline void SetPrefixStorage(GM_ADDR output) { prefixOutput_ = output; }
 #if KVIP_STREAMING_LI
-    __aicore__ inline void SetStreamingWorkspace(GM_ADDR workspace) { streamingWorkspace_ = workspace; }
+    __aicore__ inline void SetStreamingWorkspace(GM_ADDR workspace) {
+        streamingWorkspace_ = workspace;
+#if KVIP_G7_SCAN_CLOCK
+        // Diagnostic build only. Each physical AIV owns a disjoint clock and tile-range record.
+        if (workspace) {
+            uint64_t address = reinterpret_cast<__gm__ uint64_t*>(workspace)[18];
+            if (address) coldClock_ = reinterpret_cast<__gm__ uint64_t*>(address) + GetBlockIdx() * 64;
+        }
+#endif
+    }
+#if KVIP_G7_SCAN_CLOCK
+    __gm__ uint64_t* coldClock_ = nullptr;
+    __aicore__ inline void ColdStamp(uint32_t epoch, uint32_t field) {
+        if (coldClock_) coldClock_[epoch * 8 + field] = GetSystemCycle();
+    }
+    __aicore__ inline void ColdRange(uint32_t epoch, uint32_t begin, uint32_t end) {
+        if (coldClock_) {
+            coldClock_[epoch * 8 + 4] = begin;
+            coldClock_[epoch * 8 + 5] = end;
+        }
+    }
+    __aicore__ inline void FlushColdClock() {
+        if (coldClock_) kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(coldClock_), 512);
+    }
+#endif
     template<bool PreparedSlots = false>
     __aicore__ inline void EmitFinalClassification(uint32_t query);
     __aicore__ inline void BeginFinalMetadata(uint32_t query);
