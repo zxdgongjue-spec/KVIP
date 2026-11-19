@@ -153,7 +153,7 @@ class StreamingLIFetchForward:
         self.function.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_uint32]
         self.function.restype = ctypes.c_uint32
 
-    def set_score_t2(self, parts):
+    def set_score_t2(self, parts, mode='full'):
         """Select the experimental URMA entry before graph capture.
 
         The actual input rows/lengths remain real. History producers write the
@@ -162,7 +162,10 @@ class StreamingLIFetchForward:
         """
         from kvip.operators.lifetch.score_policy import validate_score_t2
         validate_score_t2(self.rotating.runtime_shape, parts)
-        function = getattr(self.rotating.library, 'kvip_lifetch_score_t2_forward', None)
+        if mode not in ('full', 'window'):
+            raise ValueError('score mode must be full or window')
+        name = 'kvip_lifetch_score_window_forward' if mode=='window' else 'kvip_lifetch_score_t2_forward'
+        function = getattr(self.rotating.library, name, None)
         if function is None:
             raise ValueError('score_t2 requires a rebuilt URMA library with the experimental entry')
         for index, expected in ((5, 4), (6, self.history)):
@@ -174,6 +177,10 @@ class StreamingLIFetchForward:
         function.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_uint32] * 2
         function.restype = ctypes.c_uint32
         self.score_parts, self.function = parts, function
+        self.score_mode = mode
+        if mode == 'window':
+            from kvip.operators.lifetch.score_policy import score_window_schedule
+            self.score_geometry = score_window_schedule(self.rotating.runtime_shape, parts)
 
     def __call__(self):
         stream = (

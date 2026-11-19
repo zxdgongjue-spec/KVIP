@@ -16,7 +16,7 @@ if(KVIP_OUTPUT_WORKER AND NOT KVIP_FUSE_QUERY_WORK)
   message(FATAL_ERROR "KVIP_OUTPUT_WORKER requires KVIP_FUSE_QUERY_WORK")
 endif()
 set(_base "${CMAKE_CURRENT_SOURCE_DIR}")
-ascendc_library(v9_kernel STATIC op_kernel/indexer.cpp op_kernel/lifecycle.cpp op_kernel/streaming.cpp)
+ascendc_library(v9_kernel STATIC op_kernel/indexer.cpp op_kernel/lifecycle.cpp op_kernel/streaming.cpp op_kernel/score_window_service.cpp)
 ascendc_include_directories(v9_kernel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel
   ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/indexer ${KVAF_INCLUDE}
   ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)

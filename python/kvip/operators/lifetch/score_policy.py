@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Startup-only checks for the experimental score producer + original T2 tail."""
+"""Startup checks and window metadata for direct score producers + MR23 T2 tail."""
 
 
 def validate_score_t2(shape, parts):
@@ -16,3 +16,22 @@ def validate_score_t2(shape, parts):
     if half_blocks*(2*w-3) >= half_pages:
         raise ValueError('T2 final window must contain a tile on both shards')
     return parts
+
+
+def score_window_schedule(shape, parts):
+    """Describe direct MR14 producers on the exact MR23 half-window geometry."""
+    validate_score_t2(shape, parts)
+    half = (((shape.history-shape.resident+511)//512+shape.rounds-2)//(shape.rounds-1))*256
+    waves = []
+    for epoch in range(shape.rounds):
+        begin = shape.resident+2*half*(epoch-1) if epoch else 0
+        end = min(shape.history, shape.resident+2*half*epoch) if epoch else shape.resident
+        p = min(parts, (end-begin)//256)
+        waves.append(dict(epoch=epoch, begin=begin, end=end, parts=p,
+                          predicate=epoch>0, score_aics=shape.batch*p, score_aivs=shape.batch*p*2,
+                          ready_end0=min(shape.history, begin+half) if epoch else shape.resident,
+                          ready_end1=end))
+    return dict(mode='window', score_post='direct', cold_predicate='producer',
+                service='mr23_ranked_window', half_window=half, waves=waves,
+                li_launches=shape.rounds*2+2, scatter_launches=0,
+                final_topk='mr23_incremental', resolve_fetch='mr23')

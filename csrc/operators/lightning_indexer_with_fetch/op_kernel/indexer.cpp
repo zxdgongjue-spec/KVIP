@@ -23,7 +23,8 @@ __aicore__ inline bool HasUniformLengths(const rotating::RuntimeShape& shape, GM
 }
 
 template <SequenceLiPhase Phase, bool ScoreOnly = false, bool Precomputed = false>
-__aicore__ inline void RunLi(GM_ADDR bindings, uint32_t scoreParts = 1) {
+__aicore__ inline void RunLi(GM_ADDR bindings, uint32_t scoreParts = 1,
+    uint32_t begin = 0, uint32_t end = 0, bool predicate = false) {
     using namespace AscendC; using namespace QLICommon;
     auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
 #define P(i) reinterpret_cast<GM_ADDR>(a[i])
@@ -42,6 +43,8 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t scoreParts = 1) {
     op.scoreOnly_ = ScoreOnly;
     op.scoreParts_ = scoreParts;
     op.precomputedScore_ = Precomputed;
+    op.scoreBegin_ = begin; op.scoreEnd_ = end;
+    op.producerPredicate_ = predicate;
 #endif
     op.sequenceSplit_ = splitSequence;
     op.sequenceTopKOnly_ = Phase == SequenceLiPhase::Threshold || Phase == SequenceLiPhase::Final;
@@ -107,6 +110,15 @@ extern "C" __global__ __aicore__ void v9_li_kernel_cold_t2(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     if ASCEND_IS_AIV { RunLi<SequenceLiPhase::Cold, false, true>(bindings); }
+#endif
+}
+// MR14 direct producer mechanics on real MR23 Q/owner inputs: score and Cold
+// predicate are written by the same history shard; Service publishes readiness.
+extern "C" __global__ __aicore__ void v9_li_kernel_score_window_t2(
+    GM_ADDR bindings, uint32_t parts, uint32_t begin, uint32_t end, uint32_t predicate) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    RunLi<SequenceLiPhase::Hot, true>(bindings, parts, begin, end, predicate != 0);
 #endif
 }
 #endif

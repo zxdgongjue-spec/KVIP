@@ -2,6 +2,7 @@
 #include "api.h"
 #include "context.h"
 #include "../../common/lifetch/score_partition.h"
+#include "../../common/lifetch/score_window_plan.h"
 extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) { return rotating::PrepareShape(shape); }
 extern "C" uint32_t aclrtlaunch_v9_init_kernel(uint32_t,void*,void*,uint32_t,void*,
     uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
@@ -112,6 +113,32 @@ extern "C" uint32_t kvip_lifetch_score_t2_forward(void* bindings,void* update,vo
 }
 
 extern "C" uint32_t aclrtlaunch_kvip_transport_snapshot_kernel(uint32_t,void*,void*,void*,uint32_t);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_score_window_t2(uint32_t,void*,void*,uint32_t,uint32_t,uint32_t,uint32_t);
+extern "C" uint32_t aclrtlaunch_v9_li_window_service(uint32_t,void*,void*,uint32_t,uint32_t,uint32_t);
+extern "C" uint32_t kvip_lifetch_score_window_forward(void* bindings,void* update,void* workspace,void* stream,
+    const rotating::RuntimeShape* shape,uint32_t workers,uint32_t parts) {
+    if (!bindings || !update || !workspace || !stream || !shape || shape->finalWorkers!=4 ||
+        shape->resident>131072 || !rotating::UseSequenceSplit(*shape) || shape->liCores!=2*shape->batch ||
+        !kvip_score_t2::Valid(shape->batch,shape->history,parts,shape->aicCount) ||
+        (workers!=1 && workers!=2 && workers!=4) ||
+        shape->batch*pipeline_ab::kResolveCores+4*workers>shape->aicCount*2) return 100000;
+    uint32_t result=0;
+    for(uint32_t epoch=0;epoch<shape->rounds;++epoch) {
+        const auto wave=kvip_score_t2::PlanWindow(*shape,epoch,parts);
+        if (!kvip_score_t2::ValidWindow(shape->batch,wave.begin,wave.end,wave.parts,shape->aicCount)) return 100000;
+        result=aclrtlaunch_v9_li_kernel_score_window_t2(shape->batch*wave.parts,stream,bindings,
+            wave.parts,wave.begin,wave.end,epoch!=0);
+        if (!result && epoch==0) result=aclrtlaunch_v9_li_kernel_1(shape->liCores,stream,bindings);
+        if (!result) result=aclrtlaunch_v9_li_window_service(shape->serviceAics*2,stream,bindings,
+            epoch,wave.end0,wave.end1);
+        if (result) return result;
+    }
+    result=aclrtlaunch_v9_li_kernel_3(shape->liCores,stream,bindings);
+    if (!result) result=aclrtlaunch_v9_streaming_resolve_update(
+        shape->batch*pipeline_ab::kResolveCores+4*workers,stream,workspace);
+    return result;
+}
+
 extern "C" uint32_t kvip_transport_snapshot(void* source, void* destination, uint32_t bytes, void* stream) {
     if (!source || !destination || !stream || !bytes || bytes % 32 ||
         reinterpret_cast<uintptr_t>(source) % 32 || bytes > 64U * 1024U * 1024U) return 100000;

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Exact MR23 source versus canonical split-score + original T2 postprocessing.
+"""MR14 direct window score/predicate producers + MR23 ranked T2/Fetch tail.
 
 No Git fetch or Docker command. Optional --prepare-kvaf builds a separate pinned
 checkout from local history. Both sources use the MR23 graph timing protocol.
@@ -21,6 +21,14 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 BASE = 'a56154c37bebb0928da4a4095e9670898e6b21c7'
 KVAF = '1c1310387ebfb6776a07316874e924265b209ada'
+MR14 = 'c684d79f3a4f8432bf0915edeba392c7d54ba289'
+ROUTES = {
+    'mr23': ('1,16', 0, 'original'),
+    'window_p16': ('1', 16, 'window'),
+    'window_p2': ('16', 2, 'window'),
+    'score_t2_p2': ('1,16', 2, 'full'),
+    'score_t2_p16': ('1', 16, 'full'),
+}
 
 
 def command(args, *, cwd=ROOT):
@@ -47,7 +55,7 @@ def baseline(output):
     archive = output / 'baseline.tar'
     with archive.open('wb') as f:
         subprocess.run(['git', 'archive', BASE], cwd=ROOT, stdout=f, check=True)
-    source = output / 'baseline-source'
+    source = (output / 'baseline-source').resolve()
     source.mkdir()
     with tarfile.open(archive) as tar:
         if 'filter' in inspect.signature(tar.extractall).parameters:
@@ -117,7 +125,8 @@ def summarize(output, jobs, measured_rounds):
             stage = f['stage_mean_us']
             # Kernel names are retained with invocation boundaries in raw trace.
             rows.append(dict(round=job['round'], case=job['case'], prefetch=job['pf'],
-                batch=report['batch'], miss_percent=report['miss_percent'], score_parts=job['parts'],
+                batch=report['batch'], miss_percent=report['miss_percent'], score_parts=job['parts'], score_mode=job.get('mode','full'),
+                score_geometry=fused.get('score_geometry'),
                 serial_event_us=s['event_mean_us'], fused_event_us=f['event_mean_us'],
                 fused_profiler_p50_us=f['p50_us'], li_us=stage['li'],
                 resolve_fetch_us=stage['resolve_update'], gap_us=f['inter_kernel_gap_mean_us'],
@@ -135,7 +144,8 @@ def summarize(output, jobs, measured_rounds):
         if sorted(s['round'] for s in samples) != list(range(1, measured_rounds+1)):
             raise RuntimeError('Missing or duplicated measured rounds')
         row = dict(case=case, prefetch=pf, batch=b, miss_percent=miss,
-                   score_parts=samples[0]['score_parts'], effective_aic=samples[0]['effective_aic'],
+                   score_parts=samples[0]['score_parts'], score_mode=samples[0]['score_mode'],
+                   score_geometry=samples[0]['score_geometry'], effective_aic=samples[0]['effective_aic'],
                    li_schedule=samples[0]['li_schedule'])
         row.update({f: sum(s[f] for s in samples)/len(samples) for f in fields})
         ref = groups[('mr23', pf, b, miss)]
@@ -158,6 +168,8 @@ def summarize(output, jobs, measured_rounds):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--device', type=int, default=5)
+    p.add_argument('--cases', default='mr23,window_p16,window_p2',
+                   help='comma-separated: '+','.join(ROUTES)+'; include mr23 as reference')
     p.add_argument('--kvaf-root', type=Path, required=True)
     p.add_argument('--prepare-kvaf', action='store_true',
                    help='use kvaf-root as local source; prepare/build a separate pinned dependency')
@@ -173,6 +185,9 @@ def main(argv=None):
     p.add_argument('--output', type=Path)
     p.add_argument('--dry-run', action='store_true')
     a = p.parse_args(argv)
+    selected=a.cases.split(',')
+    if 'mr23' not in selected or any(c not in ROUTES for c in selected) or len(set(selected))!=len(selected):
+        p.error('cases must include mr23 and contain distinct supported routes')
     if a.rounds < 1 or a.warmup < 1 or a.iterations < 1 or not 2 <= a.intermediate_fetches <= 32:
         p.error('rounds/warmup/iterations must be positive; T2 requires 2..32 windows')
     try:
@@ -203,8 +218,10 @@ def main(argv=None):
             raise
         finally:
             save(output/'dependency_preparation.json', preparation)
-    sources = {'mr23':baseline(output), 'score_t2_p2':ROOT, 'score_t2_p16':ROOT}
-    manifest = dict(status='PLANNED', baseline_commit=BASE, candidate_commit=command(['git','rev-parse','HEAD']),
+    sources = {case: baseline(output) if case=='mr23' else ROOT for case in selected}
+    manifest = dict(status='PLANNED', baseline_commit=BASE, mr14_reference=MR14,
+                    integration='adapted direct window producers; original MR23 ranked T2/Final/URMA tail',
+                    batch_isolation='One batch size per job; baseline/candidate use identical DDR pool capacity', candidate_commit=command(['git','rev-parse','HEAD']),
                     candidate_status=command(['git','status','--short']), configuration=vars(a).copy(),
                     baseline_build_override=json.loads((output/'baseline_build_override.json').read_text()),
                     effective_kvaf_root=str(kvaf),
@@ -213,12 +230,13 @@ def main(argv=None):
     save(output/'manifest.json', manifest)
     (output/'candidate.diff').write_text(command(['git','diff','HEAD']))
     jobs=[]
-    routes=[('mr23','1,16',0),('score_t2_p2','1,16',2),('score_t2_p16','1',16)]
+    routes=[(case,bs,parts,mode) for case in selected
+            for batches,parts,mode in [ROUTES[case]] for bs in batches.split(',')]
     for round_id in range(a.rounds+1):
-        order=[(case,bs,parts,pf) for pf in prefetches for case,bs,parts in routes]
+        order=[(case,bs,parts,mode,pf) for pf in prefetches for case,bs,parts,mode in routes]
         shift=round_id % len(order)
-        for case,bs,parts,pf in order[shift:]+order[:shift]:
-            name=f'r{round_id}_pf{pf}_{case}'
+        for case,bs,parts,mode,pf in order[shift:]+order[:shift]:
+            name=f'r{round_id}_pf{pf}_{case}_b{bs}'
             folder=output/name
             args=[sys.executable,'-u',str(sources[case]/'tests/operators/lifetch/test_lifetch.py'),'bench',
                 '--transport','urma','--device',str(a.device),'--kvaf-root',str(kvaf),
@@ -229,8 +247,8 @@ def main(argv=None):
                 '--iterations',str(a.iterations),'--timeout-seconds',str(a.timeout_seconds),
                 '--output',str(folder)]
             if parts:
-                args += ['--li-score-parts',str(parts)]
-            jobs.append(dict(name=name,case=case,parts=parts,pf=pf,round=round_id,
+                args += ['--li-score-parts',str(parts),'--li-score-mode',mode]
+            jobs.append(dict(name=name,case=case,batch=int(bs),parts=parts,mode=mode,pf=pf,round=round_id,
                              output=str(folder),log=str(output/(name+'.log')),args=args))
     save(output/'jobs.json', jobs)
     if a.dry_run:

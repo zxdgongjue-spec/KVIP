@@ -27,6 +27,7 @@
 #include "lib/matrix/matmul/tiling.h"
 #include "indexer_types.h"
 #include "indexer_score.h"
+#include "../../../common/lifetch/staged_post.h"
 #include "topk.h"
 #if !V9_UBMEM
 #include "recent_seed.h"
@@ -42,6 +43,8 @@ template <typename QLIT>
 class QLIVector {
 public:
     rotating::RuntimeShape runtimeShape_;
+    bool producerPredicate_ = false;
+    __aicore__ inline void SetServiceBlock(uint32_t block) { blockId_ = block; }
 #if !V9_UBMEM
 #include "incremental_methods.h"
 #endif
@@ -106,7 +109,8 @@ public:
                                      bool publishShardEnd = false);
 #endif
     __aicore__ inline void PublishColdTile(const QLICommon::RunInfo &info,
-        uint32_t curAivS1Idx, uint32_t curAivS1ProcNum, uint32_t progressShard, bool publishShardEnd);
+        uint32_t curAivS1Idx, uint32_t curAivS1ProcNum, uint32_t progressShard, bool publishShardEnd,
+        bool publishReady = true);
 #if !V9_UBMEM
     __aicore__ inline void ProcessPrecomputedVec1(const QLICommon::RunInfo &info,
         uint32_t progressShard, bool publishShardEnd);
@@ -690,7 +694,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     auto qkVLstride = (UB_BANK_DEPTH_STRIDE / sizeof(float)) / 2 * constInfo_.mBaseSize;
 
 #if !V9_UBMEM
-    if (!scoreOnly && curS2Idx >= runtimeShape_.resident) {
+    if ((!scoreOnly || producerPredicate_) && curS2Idx >= runtimeShape_.resident) {
 #else
     if (curS2Idx >= runtimeShape_.resident) {
 #endif
@@ -737,16 +741,18 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     copyOutParams.dstStride = (QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_) - s2BaseSize_) * sizeof(SCORE_T);
     DataCopyPad(scoreGm[vec1OutGmOffset], outBase, copyOutParams);
 #if !V9_UBMEM
-    if (!scoreOnly)
+    if (!scoreOnly || producerPredicate_)
 #endif
-        PublishColdTile(info, curAivS1Idx, curAivS1ProcNum, progressShard, publishShardEnd);
+        PublishColdTile(info, curAivS1Idx, curAivS1ProcNum, progressShard, publishShardEnd,
+            !producerPredicate_);
     SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
     CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);   //V核处理完，通知C核可以把mm1Res搬运到UB
 }
 
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::PublishColdTile(const QLICommon::RunInfo &info,
-    uint32_t curAivS1Idx, uint32_t curAivS1ProcNum, uint32_t progressShard, bool publishShardEnd)
+    uint32_t curAivS1Idx, uint32_t curAivS1ProcNum, uint32_t progressShard, bool publishShardEnd,
+    bool publishReady)
 {
     uint32_t pingpong = info.loop % 2, curS2Idx = info.s2Idx * s2BaseSize_;
 #if SIM_CAPTURE_HITS
@@ -759,12 +765,12 @@ __aicore__ inline void QLIVector<QLIT>::PublishColdTile(const QLICommon::RunInfo
         hitCopy.blockLen = 32;
         hitCopy.srcStride = 7; // classifyUB query stride is 256 bytes.
         hitCopy.dstStride = runtimeShape_.history / 4 - 32;
-        DataCopyPad(outputHits[(info.bIdx * SIM_Q + curAivS1Idx) * (runtimeShape_.history / 4) + curS2Idx / 4],
+        DataCopyPad(outputHits[kvip_staged_post::BitmapOffset(info.bIdx,curAivS1Idx,runtimeShape_.history,curS2Idx)],
                     classifyUB_[pingpong * 256].template ReinterpretCast<uint8_t>(), hitCopy);
     }
 #endif
 
-    if (curS2Idx >= runtimeShape_.resident && (publishShardEnd || (info.s2Idx + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
+    if (publishReady && curS2Idx >= runtimeShape_.resident && (publishShardEnd || (info.s2Idx + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
         rotating::IsTrigger(runtimeShape_.history,runtimeShape_.resident,runtimeShape_.rounds,info.s2Idx + 1))) {
         const uint32_t tableBase = (info.s2Idx / 64) * 64;
         if (tableBase != rotationProgressBase_) {

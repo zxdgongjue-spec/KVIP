@@ -95,6 +95,8 @@ public:
     bool scoreOnly_ = false;
     uint32_t scoreParts_ = 1;
     bool precomputedScore_ = false;
+    uint32_t scoreBegin_ = 0, scoreEnd_ = 0;
+    bool producerPredicate_ = false;
 #endif
 private:
     static constexpr uint32_t HEAD_DIM = 128;
@@ -465,7 +467,8 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Init(__gm__ uint8_t *q
     // 获取分核信息
 #if !V9_UBMEM
     if (scoreOnly_) {
-        const auto slice = kvip_score_t2::Partition(aiCoreIdx, scoreParts_, runtimeShape_.history);
+        const auto slice = kvip_score_t2::WindowPartition(aiCoreIdx, scoreParts_, scoreBegin_,
+            scoreEnd_ ? scoreEnd_ : runtimeShape_.history);
         splitCoreInfo.bN2Start = splitCoreInfo.bN2End = slice.owner;
         splitCoreInfo.s2Start = slice.beginTile;
         splitCoreInfo.s2End = slice.endTile - 1;
@@ -496,6 +499,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Init(__gm__ uint8_t *q
 
     if ASCEND_IS_AIV {
         vectorService.InitParams(constInfo, tiling, sequenceTopKOnly_);
+        vectorService.producerPredicate_ = producerPredicate_;
         indiceOutGm.SetGlobalBuffer((__gm__ int32_t *)sparseIndices);
         weightsGm.SetGlobalBuffer((__gm__ W_T *)weights);
         qScaleGm.SetGlobalBuffer((__gm__ SCALE_T *)queryScale);
@@ -892,6 +896,9 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()
         for (uint32_t gS1LoopIdx = splitCoreInfo.gS1Start; gS1LoopIdx <= tempLoopInfo.gS1LoopEnd; gS1LoopIdx++) {
             CalcS2LoopParams(bN2LoopIdx, gS1LoopIdx);
 #if !V9_UBMEM
+            if ASCEND_IS_AIV {
+                if (producerPredicate_) vectorService.LoadSequenceSplitThresholds(tempLoopInfo.bIdx);
+            }
             bool hadRecent = !scoreOnly_ && ScoreRecent(gloop, qScaleLoop);
 #endif
             uint32_t kScaleLoop = 0;

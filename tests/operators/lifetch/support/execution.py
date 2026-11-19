@@ -3226,7 +3226,7 @@ class FusedReplayState:
     """
     def __init__(self, torch, runtime, table, library, initial, pages, addresses,
                  *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None,
-                 score_parts=0):
+                 score_parts=0, score_mode='full'):
         from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
         from kvip.cache.index_storage import IndexCacheStorage
         from kvip.operators.lifetch.binding import LIFetchBinding
@@ -3290,7 +3290,7 @@ class FusedReplayState:
                 outputs=torch.zeros((2, self.batch * 4, 1, 2048), dtype=torch.int32, device=device))
             self.forward = StreamingForward(self.rotating, self.update, torch, prefetch_tokens)
             if score_parts:
-                self.forward.set_score_t2(score_parts)
+                self.forward.set_score_t2(score_parts, score_mode)
             self.reset()
         except BaseException:
             if self.owns_lease:
@@ -3937,7 +3937,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                 prefetch_tokens=config.prefetch_tokens, soc=soc,
                 prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024),
-                score_parts=getattr(config, 'li_score_parts', 0))
+                score_parts=getattr(config, 'li_score_parts', 0),
+                score_mode=getattr(config, 'li_score_mode', 'full'))
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
         if config.mode in ('bench', 'diagnose') and g.get('sparse_mode') == 0 and not fused:
@@ -3984,7 +3985,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                         transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                         prefetch_tokens=config.prefetch_tokens, soc=soc,
                         prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease,
-                        score_parts=getattr(config, 'li_score_parts', 0))
+                        score_parts=getattr(config, 'li_score_parts', 0),
+                        score_mode=getattr(config, 'li_score_mode', 'full'))
                     replica.failure_directory = directory
                 else:
                     replica = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
@@ -3996,6 +3998,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 result['failures'] = checks.failures + result['failures']
             result.update(transport=config.transport, path='fused' if fused else 'serial',
                           score_parts=getattr(config, 'li_score_parts', 0) if fused else 0,
+                          score_mode=getattr(config, 'li_score_mode', 'full') if fused else None,
+                          score_geometry=getattr(state.forward, 'score_geometry', None) if fused else None,
                           effective_aic=aics, effective_aiv=2*aics,
                           li_schedule=({name: int(getattr(state.rotating.runtime_shape, name)) for name in
                               ('liCores', 'rounds', 'serviceAics', 'serviceLanes', 'finalWorkers')}

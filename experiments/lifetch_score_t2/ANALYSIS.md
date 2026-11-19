@@ -1,3 +1,26 @@
+# 当前集成：MR14 分核 producer + MR23 T2 后处理
+
+最新默认候选是 `--li-score-mode window`，旧 `full` 候选保留为控制。两者不能混称 MR14 staged。
+
+| 项目 | 之前 full 候选 | 当前 window 候选 |
+| --- | --- | --- |
+| Hot | 完整 H score 之后才 θ | 先分核 resident，再原 θ |
+| Cold predicate | T2 AIV 从 GM 重读已算 score | 每个 score shard 在 UB 上融合分类，继承 P 的计算并行度 |
+| score 输出 | direct canonical | direct canonical，沿用 MR14 bitmap 地址契约 |
+| Service | Cold 消费 kernel 内循环 | 每窗口 score 完成后单独执行原 ranked Service，后续 Cube 可覆盖已提交 URMA |
+| LI kernel 数 | 4 | 2×实际 W+2；B1/W2=6，B16/W4=10 |
+| TopK | MR23 原 resident/增量/Final | 同一算法与 scratch/依赖；未扩展为 P 分片排序 |
+
+这是对 MR14 history/direct producer 机制的适配，保留 MR23 Context/lease/ABI、resident θ、增量 TopK 和 Resolve/Fetch/commit。没有移入 MR14 虚拟 fixture、旧 scratch/scatter、独立 Cold 再读或 sharded radix 五阶段。
+
+在 H128K/R16K/head32/Q4 下，B1/P16 的 Hot 每片1024 keys，Cold窗口每片7168 keys（实际W2），score/predicate用16 AIC/32 AIV。B16/P2/W4 的Hot每片8192 keys，Cold前两个窗口每片19200 keys，末窗口18944 keys；32 AIC/64 AIV与原MR23相同。因此B16不能靠“增加核数”加速，需看原score/Service相互停顿是否消除，以及额外启动和Q重新加载成本。
+
+窗口边界仍通过GM发布canonical/bitmap并由同stream完成汇合。Service只发布完整窗口的原T2两个ready cursor，不能用一个已完成分片的最大位置冒充全局连续ready。MR23跨Q去重、victim分配、mapping发布与URMA完成等待继续保留。TopK与Service没有全部继承P核数，不能宣称所有后处理并行度都已同步迁移。
+
+对比必须含原serial LI+LIDU+Fetch及精确MR23，记录同图event/calls与LI/Resolve/Get/gap。原失败P2 r0数据不是新window候选结果，也不是有效性能收益。当前没有A5新链正确性/性能数据；CANN编译和producer Model只验证它们对应的范围。
+
+## 以下为之前 full 候选的分析和历史证据
+
 # MR23 复现范围与 score → 原 T2 候选分析
 
 ## 基线确认

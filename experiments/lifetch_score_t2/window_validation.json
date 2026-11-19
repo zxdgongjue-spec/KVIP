@@ -1,0 +1,72 @@
+{
+  "date": "2026-11-19",
+  "mr14_reference": "c684d79f3a4f8432bf0915edeba392c7d54ba289",
+  "mr23_baseline": "a56154c37bebb0928da4a4095e9670898e6b21c7",
+  "mode": "window",
+  "cpu_tests": {
+    "experiment": 16,
+    "build_recovery": 3,
+    "status": "PASS"
+  },
+  "cann": {
+    "version": "9.1.0",
+    "compiled_soc": "Ascend950PR_9599",
+    "npu_bridge": "COMPILE_LINK_PASS",
+    "symbols": [
+      "kvip_lifetch_score_window_forward",
+      "aclrtlaunch_v9_li_kernel_score_window_t2",
+      "aclrtlaunch_v9_li_window_service"
+    ],
+    "bridge_sha256": "1a4e67139006fd15a4bbeb2bec4b5be2467c0175f33b8bdd1187e6d623a61c85",
+    "sim_producer": "COMPILE_LINK_PASS",
+    "source_snapshot_hashes_match": true
+  },
+  "model": {
+    "reported_soc": "Ascend950PR_9589",
+    "scope": "Hot and Cold history-partitioned score + producer predicate; no resident/Final TopK, Service or URMA",
+    "b1": {
+      "status": "PASS",
+      "batch": 1,
+      "queries": 4,
+      "history": 32768,
+      "resident": 16384,
+      "parts": 16,
+      "score_keys": 131072,
+      "predicate_keys": 65536,
+      "score_and_predicate_mismatches": 0,
+      "guards": true,
+      "per_query_weights_and_thresholds": true,
+      "ready_not_published": true,
+      "total_model_ticks": 28187,
+      "ticks_scope": "Whole Model run; not kernel latency or A5 speedup",
+      "log_sha256": "140d5bf95a71b9665e0e3a343cbfb8ab07f83b2962f99886c6c709b652efce18"
+    },
+    "b16": {
+      "status": "PASS",
+      "batch": 16,
+      "queries": 4,
+      "history": 4096,
+      "resident": 2048,
+      "parts": 2,
+      "score_keys": 262144,
+      "predicate_keys": 131072,
+      "score_and_predicate_mismatches": 0,
+      "guards": true,
+      "per_owner_keys_and_per_query_weights_and_thresholds": true,
+      "ready_not_published": true,
+      "total_model_ticks": 27733,
+      "ticks_scope": "Whole Model run; geometry differs from B1 and A5; not a latency comparison",
+      "log_sha256": "e825f71c85074bdbc2d5621944e80e77e557a5d4a4320ec7d12502dcb5123f10"
+    },
+    "b16_h32768": {
+      "status": "TERMINATED_WITHOUT_RESULT",
+      "reason": "Use a bounded multi-owner contract fixture; no algorithm correctness or timing conclusion from the interrupted run"
+    },
+    "instruction_dump_enabled": false
+  },
+  "full_chain_a5": {
+    "correctness": "NOT_REVALIDATED",
+    "latency": "NOT_MEASURED"
+  },
+  "serving_replay": "NOT_ADAPTED"
+}
