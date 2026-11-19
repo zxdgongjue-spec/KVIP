@@ -109,3 +109,54 @@ measurement must not be described as the complete window cost.
 Each variant runs in a fresh process; first/reverse-order repeats expose baseline
 drift. A candidate is kept only if both whole-graph mean and P50 beat both controls
 with margin. Functional success does not establish a positive performance result.
+
+## Targeted donor scan port and integration boundaries
+
+The host20 `dc9JdC` audit separated each query's own Fetch interval from its
+remaining scan. The latter increased from 218.43 to 361.73 us on average
+(+143.30 us); own Fetch increased by 40.45 us, and seed by 18.16 us. These
+are diagnostic intervals and include stalls. They are not proof that one
+instruction or a single Fetch window caused the entire LI regression.
+
+The ranked path now uses the `ProcessVec1` scan structure
+from donor `1d2486a76151ae37662c47aab835d06df50be866`. `ranked_scan.h` retains the
+URMA implementation and publishes progress using the row geometry already
+computed for the current tile. The existing score/reduction helper is retained:
+the isolated probe found no benefit from duplicating the donor helper.
+The scale bank is returned after its last consumer, including a partial range,
+as in the donor. Score, bitmap and progress ordering remains intact.
+
+This port deliberately leaves rank ownership, Top2048 selection, cold offer
+packing, Q4 deduplication, slot protection and final repair unchanged. It keeps
+8 cold windows, 8 Fetch AIVs/window, a 64-ID request/window limit and a 512-ID
+request limit. It does not import the donor's resident-window schedule,
+coverage-dependent rank policy, initialization or resolver changes. Feature-off
+controls still use the original scan implementation.
+
+The remote `donor-scan` comparison includes the old ranked native
+`aaa8d3429951464d0d62d70b10cbaaf7d3c2ed43` as a separate arm, in addition to the
+unchanged forward and reverse controls. Separate phase audits compare old/new
+ranked scans; whole-graph means and medians determine whether to adopt the port.
+A change in an isolated score helper, compiler code size or model timing cannot
+establish recovery of the 143.30 us hardware scan interval.
+
+The integration also keeps `RotateFetch` and `ProcessTopK` as non-inlined device
+calls in the ranked build. They execute at the existing service/selection
+boundaries, while the ordinary 128-token scan remains inline. No kernel launch,
+readiness check or synchronization is added. This is a local adaptation, not an
+attribute copied from the donor. With CANN 9.2.0/Ascend950DT_9582, the original
+ranked LI entry contains 307648 bytes of code versus 94284 bytes in the donor; the
+score-helper-only port did not reduce it. With the two call boundaries, the entry is 40384 bytes; the two phase bodies
+remain in separate functions. The purpose is to keep large one-shot bodies
+from inflating the frequent LI caller. Static
+code size and register references are evidence of a compilation difference,
+not measurements of the 143.30 us hardware scan gap.
+
+Local validation includes a CANN score/predicate equivalence probe (768 scores,
+one/two query cases and two cutoffs), production SoC compilation and CPU G7/G2
+prefix checks with independently delayed queries. The isolated score probe's
+model ticks were essentially unchanged (73415 versus 73419); it is explicitly
+not a performance justification for the score helper alone. The remote report
+therefore includes a phase-only reverse control, old/new ranked phase audits,
+and unchanged forward/reverse headline controls. It prints the remaining scan
+gap separately from whole-graph gains.
