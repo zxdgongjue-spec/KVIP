@@ -110,6 +110,36 @@ W2 避免 legacy B1 请求 W8 时实际降为 W2 的几何差异。`--q-workers`
 
 ### 原串行 / 优化后串行 / 库上 P2 融合三场景
 
+若 vLLM 中的 `third_party/KVIP/test_lifetch.py` 帮助仍没有 `bench` 子命令，它是旧安装，
+更新 `wt-mr14` 不会同时更新该依赖。使用下面的宿主机/容器两步更新完整源码和二进制。
+两侧使用现有 `/home/w00568585` 共享目录，不要求 Docker CLI 或容器连接 GitCode。
+
+宿主机（只更新代码，保留 `wt-mr14` 的当前工作树）：
+
+```bash
+git -C /home/w00568585/wt-mr14 fetch origin codex/split-core-unified-comparison
+git -C /home/w00568585/wt-mr14 show FETCH_HEAD:experiments/li_qk/update_shared_a5.sh \
+  > /home/w00568585/update_mr14_shared.sh
+bash /home/w00568585/update_mr14_shared.sh --no-proxy
+```
+
+容器内，在实际 vLLM-DSA 仓库根目录运行：
+
+```bash
+bash /home/w00568585/li_qk_shared/current/sync_vllm_mr14_a5.sh \
+  --vllm-root "$PWD" --device 0 --kvaf-server 127.0.0.1:28885 \
+  --batches 1,16 --miss-percent 0,3,5,10,15,20 --prefetch 512 \
+  --rounds 3 --warmup 4 --iterations 50
+```
+
+同步脚本验证 bundle hash/提交，创建全新 KVIP checkout，保留旧目录（包括编辑和构建产物），
+重编译 URMA KVAF、LIDU 和 LIFetch，检查实际 KVIP 导入路径后运行三路算子链。
+`--sync-only` 只更新源码；`--no-bench` 更新并编译；`--prefetch 0,512` 包含关闭预取的控制组。
+编译日志在新 KVIP 的 `build/vllm-sync-build.log`。KVAF 使用现有同级 `third_party/KVAF`，
+须符合当前 build.py 的固定提交和 URMA patch 条件；冲突会保留源码并报错。
+vLLM 的 `scripts/install_kvip.sh` 仍固定自己的 KVIP 提交，重跑会再次替换这个实验安装。
+更新后已有模型 worker 需重新启动才会加载新库；本脚本执行算子链，不启动模型端到端服务。
+
 需要隔离 LI 优化对串行链的影响时，使用这个入口；上述 `history_direct` 不属于优化后串行链。
 脚本在 KVIP checkout 中执行，下面的 `wt-mr14` 是 KVIP 仓库目录。若 KVIP 安装在
 vLLM-DSA 的 `third_party/KVIP`，也应先进入该 KVIP 目录。三路默认 miss 为

@@ -66,6 +66,10 @@ git --git-dir="$LI_REPO" bundle verify "$LI_RELEASE/li_qk_mr14_offline.bundle"
 printf '%s\n' "$LI_HEAD" > "$LI_RELEASE/SOURCE_COMMIT"
 git hash-object --no-filters "$LI_RELEASE/run_li_qk_a5.sh" > "$LI_RELEASE/SCRIPT_BLOB"
 git hash-object --no-filters "$LI_RELEASE/li_qk_mr14_offline.bundle" > "$LI_RELEASE/BUNDLE_BLOB"
+if git --git-dir="$LI_REPO" cat-file -e "$LI_HEAD:tests/operators/lifetch/sync_vllm_mr14_a5.sh" 2>/dev/null; then
+    git --git-dir="$LI_REPO" show "$LI_HEAD:tests/operators/lifetch/sync_vllm_mr14_a5.sh" > "$LI_RELEASE/sync_vllm_mr14_a5.sh"
+    bash -n "$LI_RELEASE/sync_vllm_mr14_a5.sh"
+fi
 # Older releases retain the original score-only launcher. Publish the new
 # post-score launcher when the frozen revision contains it.
 if git --git-dir="$LI_REPO" cat-file -e "$LI_HEAD:experiments/li_qk/run_tail_a5.sh" 2>/dev/null; then
@@ -131,6 +135,9 @@ mv "$LI_SHARE/run_tail_in_container.sh.pending" "$LI_SHARE/run_tail_in_container
 if [[ -e $LI_SHARE/current && ! -L $LI_SHARE/current ]]; then die 'current must be the updater release symlink; existing directory was preserved'; fi
 ln -sfn "releases/$(basename "$LI_RELEASE")" "$LI_SHARE/current"
 printf '\nHost code update complete: %s\nShared directory: %s\n' "$LI_HEAD" "$LI_SHARE"
+if [[ -s $LI_RELEASE/sync_vllm_mr14_a5.sh ]]; then
+    printf 'Inside the container, from vLLM-DSA root, synchronize its dependency, rebuild and compare three chains:\n  bash %q/current/sync_vllm_mr14_a5.sh --vllm-root "$PWD" --device 0\n' "$LI_SHARE"
+fi
 printf 'In the A5 container, verify the existing mapping:\n  bash %q/run_in_container.sh --verify-only\n' "$LI_SHARE"
 printf 'Then run the physical NPU experiment (default B1 eight points; --suite batch16 for B16/30-core):\n  bash %q/run_in_container.sh\n' "$LI_SHARE"
 if [[ -s $LI_RELEASE/run_tail_a5.sh ]]; then
