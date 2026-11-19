@@ -68,7 +68,7 @@ public:
 #if KVIP_RANKED_PORT
         AdvanceWindow(epoch,sequenceHalfWindow);
 #endif
-#if KVIP_STREAMING_LI && !V9_UBMEM
+#if KVIP_STREAMING_LI && !V9_UBMEM && !KVIP_RANKED_PORT
         bool stamp = streamingWorkspace_ &&
             (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U);
         uint64_t entry = stamp ? GetSystemCycle() : 0;
@@ -94,8 +94,8 @@ public:
 #endif
             );
 #endif
-#if KVIP_STREAMING_LI && !V9_UBMEM
-        if(stamp && !KVIP_RANKED_PORT) {
+#if KVIP_STREAMING_LI && !V9_UBMEM && !KVIP_RANKED_PORT
+        if(stamp) {
             uint64_t returned=GetSystemCycle();
             auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
             uint32_t lane=rotating::ServiceLane(runtimeShape_.batch,runtimeShape_.splitQ,runtimeShape_.serviceAics,blockId_/2,blockId_%2);
