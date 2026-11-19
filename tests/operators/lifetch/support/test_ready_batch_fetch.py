@@ -252,7 +252,7 @@ int main(){
 
 def test_candidate_disables_unconsumed_direct_layout_only_for_urma():
     source = (KERNEL / "output_worker.h").read_text()
-    begin = source.index("#if KVIP_READY_BATCH_FETCH && !V9_UBMEM")
+    begin = source.index("#if KVIP_READY_BATCH_FETCH && !V9_UBMEM", source.index("auto direct="))
     end = source.index("#endif", begin)
     assert "direct=nullptr;" in source[begin:end]
     assert "PackPublicationEvents" in source[end:]

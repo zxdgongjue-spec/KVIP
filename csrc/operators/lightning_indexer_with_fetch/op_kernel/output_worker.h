@@ -19,6 +19,54 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PackPublicationEvents(
  asc_syncthreads();
  PackStagedUrmaQuery(history,resident,bytes,b,q,used,0,count,ctx,tokens,ids,slots,ctl,direct,stride);
 }
+#if KVIP_READY_BATCH_FETCH && !V9_UBMEM
+// One source event per lane. No peer needs this lane's token or chosen slot;
+// only the stable partition rank crosses lanes.
+__simt_vf__ __aicore__ LAUNCH_BOUND(512)
+inline void PackSmallPublicationEvents(StagedContextPointer ctx,uint32_t history,
+        uint32_t resident,uint32_t bytes,uint32_t b,uint32_t q,uint32_t used,
+        uint32_t begin,uint32_t count,__gm__ uint32_t* source,__gm__ uint32_t* dest,
+        __ubuf__ uint32_t* ctl) {
+    const uint32_t tid=threadIdx.x;
+    uint32_t slot=0,token=0;
+    bool inRange=false,safe=false;
+    if(tid<count) {
+        slot=asc_ldcg(dest+begin+tid);
+        inRange=slot<resident;
+        if(inRange) {
+            token=asc_ldcg(source+begin+tid);
+            auto reserved=reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+b*resident;
+            int32_t ordinal=asc_ldcg(reserved+slot);
+            safe=ordinal<0 || uint32_t(ordinal)>=used;
+        } else {
+            asc_atomic_or(ctl+1,4U);
+        }
+    }
+    uint32_t before=StagedPrefix(uint32_t(safe),ctl);
+    uint32_t safeCount=ctl[544+512/warpSize-1];
+    if(inRange) {
+        if(token>=history) {
+            asc_atomic_or(ctl+1,1U);
+        } else {
+            uint32_t pos=b*kSlots+q*kTop+(safe ? before : safeCount+tid-before);
+            auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
+            auto addresses=reinterpret_cast<__gm__ uint64_t*>(row->addresses);
+            StoreFallbackSource(history,bytes,ctx,b,pos,token,asc_ldcg(addresses+token),
+                reinterpret_cast<__gm__ int32_t*>(ctx->sourceBlocks),
+                reinterpret_cast<__gm__ int32_t*>(ctx->sourceOffsets));
+            auto targets=reinterpret_cast<__gm__ int32_t*>(ctx->destinations);
+            asc_stcg(targets+pos,int32_t(OwnerRow(ctx,b)*OutputStride(resident,ctx)+slot));
+        }
+    }
+    asc_syncthreads();
+    if(!tid) {
+        ctl[16]=count; ctl[17]=safeCount;
+        if(!ctl[1]) asc_atomic_add(reinterpret_cast<__gm__ uint32_t*>(ctx->count),count);
+    }
+    asc_threadfence();
+    asc_syncthreads();
+}
+#endif
 __aicore__ inline uint32_t AwaitPublication(__gm__ BatchFlag* flag){
  uint64_t start=GetSystemCycle();
  while(true){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flag),sizeof(BatchFlag));
@@ -105,6 +153,12 @@ __aicore__ inline uint32_t OutputWorker(__gm__ Args* a,uint32_t b,__gm__ uint64_
     // The ready worker repacks only committed canonical ranges. An atomic
     // reservation in this whole-shard layout is not a publication boundary.
     direct=nullptr;
+#endif
+#if KVIP_READY_BATCH_FETCH && !V9_UBMEM
+    if(Role==OutputRole::Descriptors && count && count<=512) {
+     Simt::VF_CALL<PackSmallPublicationEvents>(Simt::Dim3{512,1,1},staged,shape.history,shape.resident,
+      shape.tokenBytes,b,q,row->slots,kPrefetch+total,count,source,dest,FinalPtr(ctl));
+    } else
 #endif
     Simt::VF_CALL<PackPublicationEvents>(Simt::Dim3{512,1,1},staged,shape.history,shape.resident,shape.tokenBytes,b,q,row->slots,kPrefetch+total,count,source,dest,FinalPtr(tokens),reinterpret_cast<__ubuf__ uint16_t*>(ids.GetPhyAddr()),FinalPtr(slots),FinalPtr(ctl),(a->prefetchCount&0x20000000U)?nullptr:direct,stride);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);error=ctl.GetValue(1);

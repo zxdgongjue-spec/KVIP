@@ -116,6 +116,11 @@ void PackPublicationEvents(Context*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t
  if(!splitOutput)assert(q==currentQuery);ctl[16]=count;ctl[17]=count;
  if(q==packErrorQuery)ctl[1]=16;
 }
+void PackSmallPublicationEvents(Context* c,uint32_t h,uint32_t r,uint32_t bytes,uint32_t b,uint32_t q,
+ uint32_t used,uint32_t begin,uint32_t count,uint32_t* source,uint32_t* dest,uint32_t* ctl){
+ assert(count && count<=512);
+ PackPublicationEvents(c,h,r,bytes,b,q,used,begin,count,source,dest,nullptr,nullptr,nullptr,ctl,nullptr,0);
+}
 void SyncFetchDescriptors(Context*,uint32_t begin,uint32_t){descriptorSynced[(begin%kSlots)/kTop]=true;}
 namespace kvaf_device {
 void CleanCacheLines(uint8_t* ptr,uint64_t){
