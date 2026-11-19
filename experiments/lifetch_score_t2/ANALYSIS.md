@@ -1,6 +1,6 @@
 # 当前集成：MR14 分核 producer + MR23 T2 后处理
 
-最新默认候选是 `--li-score-mode window`，旧 `full` 候选保留为控制。两者不能混称 MR14 staged。
+最新默认候选是 `--li-score-mode window`，旧 `full` 候选保留为控制。两者不能混称 MR14 staged。默认 runner 已扩展 B1/B2/B4/B8/B16，各 batch 分别比较固定 MR23 与 window，并各自测原 SDK 串行参考。
 
 | 项目 | 之前 full 候选 | 当前 window 候选 |
 | --- | --- | --- |
@@ -18,6 +18,50 @@
 窗口边界仍通过GM发布canonical/bitmap并由同stream完成汇合。Service只发布完整窗口的原T2两个ready cursor，不能用一个已完成分片的最大位置冒充全局连续ready。MR23跨Q去重、victim分配、mapping发布与URMA完成等待继续保留。TopK与Service没有全部继承P核数，不能宣称所有后处理并行度都已同步迁移。
 
 对比必须含原serial LI+LIDU+Fetch及精确MR23，记录同图event/calls与LI/Resolve/Get/gap。原失败P2 r0数据不是新window候选结果，也不是有效性能收益。当前没有A5新链正确性/性能数据；CANN编译和producer Model只验证它们对应的范围。
+
+## 五 batch 应该继承哪些收益
+
+| Batch | 默认 P | 原 MR23 score AIC | 候选 score AIC | 核数比（不是加速比） | 实际 W | 原/候选 LI launches |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 16 | 2 | 16 | 8 | 2 | 4/6 |
+| 2 | 16 | 4 | 32 | 8 | 4 | 4/10 |
+| 4 | 8 | 8 | 32 | 4 | 4 | 4/10 |
+| 8 | 4 | 16 | 32 | 2 | 4 | 4/10 |
+| 16 | 2 | 32 | 32 | 1 | 4 | 4/10 |
+
+MR14 的 history 并行、direct canonical 直写和 Cold predicate 在 producer UB 内计算已经适配。Cold predicate 跟随 score 使用2×B×P个 AIV，既不先规约分片，也不交回少量 AIV 全量重读分类。因此能继承的是这部分计算/数据流机制，而不是之前独立 LI 的整个52.14µs测量值。
+
+独立 MR14 `direct` 是“全 H score/direct → 一次原 TopK”，共2个 kernel；这条融合链还要 resident θ、多个窗口的增量 TopK/ranked admission、预取候选去重、Service、Final 和 Resolve/Fetch。新增边界没有分片 radix merge，但每个窗口仍需全部 P 完成后才能进入 Service，短 Hot 分片和每窗口重新加载 Q/scale 也可能降低每核效率。B1/P16 的Hot每核仅1024 keys；更高核数不是线性加速保证。
+
+B2/P16、B4/P8、B8/P4 分别让 score 核数提高8/4/2倍，测量应该检查这部分是否先下降，再检查整链。B16/P2 已经达到原 MR23 的32 AIC，不能期待仅凭核数复现 B1 的提升幅度；原路径内 score/Service 的相互停顿减少，才是它可能获得收益的来源。
+
+## 为什么仍可能慢于优化后的串行链
+
+1. **增量 TopK/Service 并行度不同。** W4时原shape的 `serviceAics=2B/4`、`serviceLanes=B`。一个有效 Service lane 循环处理同request的四个Q；最多B个AIV执行这部分。原Final为4B个AIV、每真实Q一个。window producer虽然用了2BP个AIV，Service没有自动变成2BP个AIV。B1实际W2，有2个Service lane但仅一个request有工作。`service_us`包含增量TopK、ranked admission等原算法，不能将它全称为URMA传输时间。
+2. **窗口边界和启动有净成本。** B1比MR23增加2次LI启动，B2/4/8/16增加6次；相对于独立direct的2次LI启动，差距更大。当前没有score scratch/scatter，仍要把原canonical/bitmap写到GM以便不同kernel和UB之间消费。这是数据依赖和调度成本，不是五阶段radix归并的退化。
+3. **B1可覆盖的Cold计算很少。** 原shape将W4收敛为W2。Service1开始时整个Cold窗口已完成，没有后续Cold score可以覆盖刚提交的Fetch；可能覆盖的是剩余Service/Final等工作。不能把名义pf1024解释成与整个score重叠1024次搬运。B≥2/W4才有后续Cold窗口可覆盖前窗口预取，仍需核查实际候选/描述符和CQ完成。
+4. **加速score会缩短重叠窗口。** 提前算完能降低LI时间，但也减少后续计算覆盖DMA的时长。低miss时原串行LIDU/Get本来较短，增加θ/Service/屏障的代价可能更大；B16时还要看带宽、去重/victim规划和末段等待。miss率/预取预算并不是实际有用传输量的证据。
+
+同场景、同计时协议下，融合要超过优化串行，必须满足：
+
+```text
+联合链 - 优化串行链
+ = (联合 LI - direct LI)
+ + (融合 Resolve/Get - 串行 LIDU/Get)
+ + (调用内 gap 与图边缘差)
+```
+
+这里的LI包含它实际执行的θ/Service/Final；融合早期URMA若已被计算覆盖，会反映在末段和整链关键路径，不应再从event中扣一次“预取收益”。省下的末段时间必须大于新增LI和边界成本。它是需要真机验证的条件，不能根据score核数直接宣布融合获胜。
+
+当前脚本 `SerialBefore` 仍为 SDK LI+LIDU+完成的BatchGet，**没有同场景SerialAfter适配**。之前约52.14µs独立LI、约75–97µs优化串行链和当前window用例有路径/预取/计时协议区别；不能直接拼接数值比较。此次可严格回答“相对MR23原融合及原串行有没有收益”，不能据此回答“是否超过优化串行”。若要最终决定路由，需在同KVAF/输入/独立状态整图协议下补充direct LI+相同LIDU/Get控制。
+
+## 如何用新的拆解定位退化
+
+`summary.csv` 的 `score_hot_us + score_cold_us + theta_us + service_us + final_us = li_us`。提取的是同一测量图每次调用的具名kernel，不混入detail replay，不按耗时猜Hot/Cold；每次检查W个score、W个Service和θ/Final各一次，缺失或重复停止汇总。绝对trace时间戳用Decimal先相减，避免大时间戳浮点精度损失。原MR23的Cold kernel混合了score/Service，没有可用内部边界时拆分列留空。
+
+`net_gain_vs_mr23_us = li_gain + resolve_fetch_gain + gap_gain + other_and_edges_gain`，全部使用基线减候选，正数为省时。score下降而LI没有下降，应先检查θ/Service/Final及窗口成本；LI下降而完整链未下降，检查Resolve/Get与gap/边缘。末段下降不能单独证明成功预取的bytes或首次DMA时间，还需raw trace/传输计数。配对轮次比值和SDK串行漂移用于判断波动，不取最好一轮作为结论。
+
+本轮20项CPU实验检查覆盖五batch实际C++分片、原PrepareShape收敛、页均分/cursor、预算拒绝、full控制及同图拆解；3项构建恢复检查通过。本轮只改实验脚本/分析，未重新编译或伪称补跑了A5。上一提交58aa570的producer编译/Model证据仍保持原范围。
 
 ## 以下为之前 full 候选的分析和历史证据
 

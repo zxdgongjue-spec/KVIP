@@ -177,10 +177,12 @@ extern "C" void slice(unsigned task,unsigned p,unsigned h,unsigned* out) {
                 save(folder/'report.json',dict(batch=1,miss_percent=10,correctness='PASS',execution='COMPLETED'))
                 for path,event in [('serial',120.),('fused',us)]:
                     (folder/path).mkdir()
+                    stages = dict(li=event/2,resolve_update=event/3) if path=='fused' else dict(
+                        li=event/2,lidu_prepare=event/12,fetch=event/4)
                     save(folder/path/'path_result.json',dict(all_rounds=dict(
                         timing_protocol='one_profiled_graph',event_mean_us=event,p50_us=event-5,
-                        stage_mean_us=dict(li=event/2,resolve_update=event/3),inter_kernel_gap_mean_us=1)))
-                jobs.append(dict(name=case,case=case,parts=parts,pf=1024,round=1,
+                        stage_mean_us=stages,inter_kernel_gap_mean_us=1)))
+                jobs.append(dict(name=case,case=case,batch=1,parts=parts,pf=1024,round=1,
                                  output=str(output/case),log='unit-test only'))
             from contextlib import redirect_stdout
             with redirect_stdout(io.StringIO()): table=summarize(output,jobs,1)
@@ -188,6 +190,11 @@ extern "C" void slice(unsigned task,unsigned p,unsigned h,unsigned* out) {
             self.assertEqual(optimized['over_mr23'],.8)
             self.assertEqual(optimized['effective_aic'],32)
             self.assertAlmostEqual(optimized['over_serial'],2/3)
+            self.assertEqual(optimized['serial_fetch_us'],30.)
+            self.assertIsNone(optimized['score_total_us'])
+            self.assertEqual(optimized['net_gain_vs_mr23_us'],20.)
+            self.assertAlmostEqual(sum(optimized[f'{k}_gain_vs_mr23_us'] for k in
+                ('li','resolve_fetch','gap','other_and_edges')),20.)
             (output/'score_t2_p16/miss10/fixture/arg0.bin').write_bytes(b'different')
             with self.assertRaisesRegex(RuntimeError,'Operand mismatch'):
                 summarize(output,jobs,1)

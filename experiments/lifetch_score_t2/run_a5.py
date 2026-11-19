@@ -7,10 +7,12 @@ checkout from local history. Both sources use the MR23 graph timing protocol.
 """
 import argparse
 import csv
+from decimal import Decimal
 import hashlib
 import inspect
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -23,12 +25,98 @@ BASE = 'a56154c37bebb0928da4a4095e9670898e6b21c7'
 KVAF = '1c1310387ebfb6776a07316874e924265b209ada'
 MR14 = 'c684d79f3a4f8432bf0915edeba392c7d54ba289'
 ROUTES = {
-    'mr23': ('1,16', 0, 'original'),
+    'mr23': ('1,2,4,8,16', 0, 'original'),
+    'window_budget': ('1,2,4,8,16', None, 'window'),
+    'full_budget': ('1,2,4,8,16', None, 'full'),
     'window_p16': ('1', 16, 'window'),
     'window_p2': ('16', 2, 'window'),
     'score_t2_p2': ('1,16', 2, 'full'),
     'score_t2_p16': ('1', 16, 'full'),
 }
+DEFAULT_PARTS = {1:16, 2:16, 4:8, 8:4, 16:2}
+
+
+def batch_configuration(batches_csv, parts_csv):
+    batches = [int(x) for x in batches_csv.split(',')]
+    entries = [tuple(int(v) for v in x.split(':')) for x in parts_csv.split(',')]
+    if (not batches or len(set(batches)) != len(batches) or
+            any(b not in DEFAULT_PARTS for b in batches)):
+        raise ValueError('batches must be distinct values from 1,2,4,8,16')
+    if any(len(e) != 2 for e in entries):
+        raise ValueError('parts-map must use B:P entries')
+    parts_map = dict(entries)
+    if (len(parts_map) != len(entries) or any(b not in DEFAULT_PARTS for b in parts_map) or
+            any(not 1 <= v <= 32 or b*v > 32 for b,v in parts_map.items()) or
+            any(b not in parts_map for b in batches)):
+        raise ValueError('parts-map must cover requested batches with distinct B:P entries, P=1..32 and B*P<=32')
+    return batches, parts_map
+
+
+def plan_routes(selected, batches, parts_map):
+    routes=[]
+    for case in selected:
+        allowed,fixed,mode=ROUTES[case]
+        for b in batches:
+            if str(b) not in allowed.split(','):
+                continue
+            parts=parts_map[b] if fixed is None else fixed
+            if parts and b*parts>32:
+                raise ValueError(f'{case}: B{b}/P{parts} exceeds 32 AIC')
+            routes.append((case,str(b),parts,mode))
+    if not routes or any(not any(r[0]==case for r in routes) for case in selected):
+        raise ValueError('Each selected route must support at least one requested batch')
+    return routes
+
+
+def li_components(folder, mode, geometry):
+    """Named kernels from the same measured graph, excluding detail replays.
+
+    The known window launch contract identifies Hot as the first score launch
+    inside each recorded invocation; no phase is inferred from its duration.
+    """
+    if mode!='window':
+        return None
+    profiles=sorted(folder.glob('diagnose/round-*/graph_profile.json'))
+    if not profiles:
+        raise RuntimeError(f'Missing same-graph component trace: {folder}')
+    totals=[]
+    aliases={'score':'v9_li_kernel_score_window_t2', 'service':'v9_li_window_service',
+             'theta':'v9_li_kernel_1', 'final':'v9_li_kernel_3'}
+    for path in profiles:
+        profile=json.loads(path.read_text())
+        trace=json.loads((path.parent/'trace.json').read_text())
+        events=trace['traceEvents'] if isinstance(trace,dict) else trace
+        scopes=[e for e in events if e.get('name')=='lifetch_measured_graph' and e.get('ph')=='X']
+        if len(scopes)!=1:
+            raise RuntimeError('Expected exactly one measured graph scope for component accounting')
+        origin=Decimal(str(scopes[0]['ts']))
+        per_call=[]
+        for sample in profile['samples']:
+            intervals=sample['intervals_us']['li']
+            parts={key:[] for key in aliases}
+            for event in events:
+                n=event.get('name','').lower();cat=(event.get('cat') or '').lower()
+                if event.get('ph')!='X' or (cat and 'kernel' not in cat):continue
+                key=next((key for key,prefix in aliases.items()
+                          if n==prefix or (n.startswith(prefix+'_') and re.fullmatch(r'(?:_\d+)+',n[len(prefix):]))),None)
+                if key is None:continue
+                start=float(Decimal(str(event['ts']))-origin);duration=float(event['dur'])
+                if any(abs(start-a)<.01 and abs(start+duration-b)<.01 for a,b in intervals):
+                    parts[key].append((start,duration))
+            waves=len(geometry['waves'])
+            if {k:len(v) for k,v in parts.items()}!={'score':waves,'service':waves,'theta':1,'final':1}:
+                raise RuntimeError(f'Incomplete/duplicate LI components: {path}, invocation {sample["invocation"]}')
+            scores=sorted(parts['score'])
+            item=dict(score_hot_us=scores[0][1],score_cold_us=sum(v for _,v in scores[1:]),
+                      theta_us=parts['theta'][0][1],service_us=sum(v for _,v in parts['service']),
+                      final_us=parts['final'][0][1])
+            if abs(sum(item.values())-sample['stages_us']['li'])>.05:
+                raise RuntimeError('LI component sum disagrees with measured stage duration')
+            per_call.append(item)
+        if not per_call:
+            raise RuntimeError(f'Empty measured graph: {path}')
+        totals.append({k:sum(s[k] for s in per_call)/len(per_call) for k in per_call[0]})
+    return {k:sum(s[k] for s in totals)/len(totals) for k in totals[0]}
 
 
 def command(args, *, cwd=ROOT):
@@ -106,7 +194,7 @@ def summarize(output, jobs, measured_rounds):
         # A run may retain additional fixture variants; compare per requested miss.
         for path in fixture_dirs:
             miss_dir = path.parent.parent.name
-            key = (job['pf'], miss_dir)
+            key = (job['pf'], job['batch'], miss_dir)
             digest = fixture_hashes(path.parent)
             if not digest:
                 raise RuntimeError(f'No fixture operand files: {path.parent}')
@@ -115,6 +203,8 @@ def summarize(output, jobs, measured_rounds):
             fixtures[key] = digest
         for path in reports:
             report = json.loads(path.read_text())
+            if report['batch'] != job['batch']:
+                raise RuntimeError(f'Unexpected batch in isolated job: {path}')
             if report.get('correctness') != 'PASS' or report.get('execution') != 'COMPLETED':
                 raise RuntimeError(f'Failed correctness/completion: {path}')
             serial, fused = [json.loads((path.parent / name / 'path_result.json').read_text())
@@ -123,13 +213,32 @@ def summarize(output, jobs, measured_rounds):
                 raise RuntimeError('Timing protocol changed; do not mix old p50 with graph-event means')
             s, f = serial['all_rounds'], fused['all_rounds']
             stage = f['stage_mean_us']
+            mode = job.get('mode','full')
+            geometry = fused.get('score_geometry')
+            schedule = fused.get('li_schedule')
+            if mode == 'window' and (not geometry or not schedule):
+                raise RuntimeError(f'Missing actual window geometry/schedule: {path}')
+            components = li_components(path.parent/'fused', mode, geometry)
+            if components and abs(sum(components.values())-stage['li']) > .05:
+                raise RuntimeError('Component means disagree with all-round LI mean')
+            native_stages = s['stage_mean_us']
+            peak = max(w['score_aics'] for w in geometry['waves']) if mode=='window' else report['batch']*(job['parts'] or 2)
             # Kernel names are retained with invocation boundaries in raw trace.
             rows.append(dict(round=job['round'], case=job['case'], prefetch=job['pf'],
-                batch=report['batch'], miss_percent=report['miss_percent'], score_parts=job['parts'], score_mode=job.get('mode','full'),
-                score_geometry=fused.get('score_geometry'),
+                batch=report['batch'], miss_percent=report['miss_percent'], score_parts=job['parts'], score_mode=mode,
+                score_geometry=geometry, score_peak_aic=peak, score_peak_aiv=2*peak,
+                actual_windows=schedule['rounds'] if schedule else None,
+                service_aivs=schedule['serviceLanes'] if schedule else None,
+                li_kernel_launches=geometry['li_launches'] if mode=='window' else 4,
                 serial_event_us=s['event_mean_us'], fused_event_us=f['event_mean_us'],
+                serial_li_us=native_stages['li'], serial_lidu_prepare_us=native_stages['lidu_prepare'],
+                serial_fetch_us=native_stages['fetch'],
                 fused_profiler_p50_us=f['p50_us'], li_us=stage['li'],
                 resolve_fetch_us=stage['resolve_update'], gap_us=f['inter_kernel_gap_mean_us'],
+                other_and_edges_us=f['event_mean_us']-stage['li']-stage['resolve_update']-f['inter_kernel_gap_mean_us'],
+                **{key:components[key] if components else None for key in
+                   ('score_hot_us','score_cold_us','theta_us','service_us','final_us')},
+                score_total_us=(components['score_hot_us']+components['score_cold_us']) if components else None,
                 effective_aic=fused.get('effective_aic', resources.get('effective_aic')),
                 effective_aiv=fused.get('effective_aiv', resources.get('effective_aiv')),
                 li_schedule=fused.get('li_schedule'),
@@ -138,7 +247,9 @@ def summarize(output, jobs, measured_rounds):
     groups = {}
     for row in rows:
         groups.setdefault((row['case'], row['prefetch'], row['batch'], row['miss_percent']), []).append(row)
-    fields = ('serial_event_us', 'fused_event_us', 'fused_profiler_p50_us', 'li_us', 'resolve_fetch_us', 'gap_us')
+    fields = ('serial_event_us', 'fused_event_us', 'fused_profiler_p50_us', 'li_us', 'resolve_fetch_us', 'gap_us',
+              'other_and_edges_us','serial_li_us','serial_lidu_prepare_us','serial_fetch_us',
+              'score_hot_us','score_cold_us','score_total_us','theta_us','service_us','final_us')
     table = []
     for (case, pf, b, miss), samples in groups.items():
         if sorted(s['round'] for s in samples) != list(range(1, measured_rounds+1)):
@@ -147,29 +258,50 @@ def summarize(output, jobs, measured_rounds):
                    score_parts=samples[0]['score_parts'], score_mode=samples[0]['score_mode'],
                    score_geometry=samples[0]['score_geometry'], effective_aic=samples[0]['effective_aic'],
                    li_schedule=samples[0]['li_schedule'])
-        row.update({f: sum(s[f] for s in samples)/len(samples) for f in fields})
+        for key in ('score_parts','score_mode','score_geometry','li_schedule','score_peak_aic','score_peak_aiv',
+                    'actual_windows','service_aivs','li_kernel_launches'):
+            if any(s[key]!=samples[0][key] for s in samples):
+                raise RuntimeError(f'Geometry changed across measured rounds: {key}')
+            row[key]=samples[0][key]
+        row.update({f: sum(s[f] for s in samples)/len(samples) if all(s[f] is not None for s in samples) else None
+                    for f in fields})
         ref = groups[('mr23', pf, b, miss)]
         old = sum(s['fused_event_us'] for s in ref)/len(ref)
         row.update(over_mr23=row['fused_event_us']/old,
                    over_serial=row['fused_event_us']/row['serial_event_us'],
                    serial_drift_over_mr23=row['serial_event_us']/(sum(s['serial_event_us'] for s in ref)/len(ref)),
                    per_round_over_mr23=[s['fused_event_us']/next(r['fused_event_us'] for r in ref if r['round']==s['round']) for s in samples])
+        row['net_gain_vs_mr23_us']=old-row['fused_event_us']
+        for key in ('li','resolve_fetch','gap','other_and_edges'):
+            row[f'{key}_gain_vs_mr23_us']=sum(s[key+'_us'] for s in ref)/len(ref)-row[key+'_us']
+        if abs(sum(row[f'{k}_gain_vs_mr23_us'] for k in ('li','resolve_fetch','gap','other_and_edges'))-
+               row['net_gain_vs_mr23_us'])>.05:
+            raise RuntimeError('Full-chain gain decomposition is not additive')
         table.append(row)
     with (output/'summary.csv').open('w', newline='') as f:
         writer = csv.DictWriter(f, list(table[0]))
         writer.writeheader(); writer.writerows(table)
-    save(output/'fixture_hashes.json', [{'prefetch':k[0], 'miss_directory':k[1], 'sha256':v} for k,v in fixtures.items()])
-    print('case             B miss%   Serial    Fused    LI    Resolve/Get   /MR23', flush=True)
+    save(output/'fixture_hashes.json', [{'prefetch':k[0], 'batch':k[1], 'miss_directory':k[2], 'sha256':v} for k,v in fixtures.items()])
+    print('us/call | same-graph event means | positive gain is faster', flush=True)
+    print('SerialBefore = SDK LI + LIDU + completed BatchGet; MR14 SerialAfter is not measured here.', flush=True)
+    print('case             pf  B  P miss% SerialBefore    Fused      LI Resolve/Get   /MR23   Gain us', flush=True)
     for r in table:
-        print(f"{r['case']:16} {r['batch']:2} {r['miss_percent']:5g} {r['serial_event_us']:8.2f} {r['fused_event_us']:8.2f} {r['li_us']:7.2f} {r['resolve_fetch_us']:11.2f} {r['over_mr23']:7.3f}")
+        print(f"{r['case']:16} {r['prefetch']:4} {r['batch']:2} {r['score_parts']:2} {r['miss_percent']:5g} {r['serial_event_us']:12.2f} {r['fused_event_us']:8.2f} {r['li_us']:7.2f} {r['resolve_fetch_us']:11.2f} {r['over_mr23']:7.3f} {r['net_gain_vs_mr23_us']:9.2f}")
+    print('Window components (us/call): case              pf  B miss%  HotScore ColdScore   theta Service   Final   LI launches', flush=True)
+    for r in table:
+        if r['score_mode']=='window':
+            print(f"{r['case']:16} {r['prefetch']:4} {r['batch']:2} {r['miss_percent']:5g} {r['score_hot_us']:9.2f} {r['score_cold_us']:9.2f} {r['theta_us']:7.2f} {r['service_us']:7.2f} {r['final_us']:7.2f} {r['li_kernel_launches']:13}")
     return table
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--device', type=int, default=5)
-    p.add_argument('--cases', default='mr23,window_p16,window_p2',
+    p.add_argument('--cases', default='mr23,window_budget',
                    help='comma-separated: '+','.join(ROUTES)+'; include mr23 as reference')
+    p.add_argument('--batches', default='1,2,4,8,16', help='distinct batch sizes, one batch per job')
+    p.add_argument('--parts-map', default=','.join(f'{b}:{v}' for b,v in DEFAULT_PARTS.items()),
+                   help='history P for budget routes; B:P CSV with B*P<=32, no implicit waves')
     p.add_argument('--kvaf-root', type=Path, required=True)
     p.add_argument('--prepare-kvaf', action='store_true',
                    help='use kvaf-root as local source; prepare/build a separate pinned dependency')
@@ -193,8 +325,10 @@ def main(argv=None):
     try:
         misses = [float(x) for x in a.miss_percent.split(',')]
         prefetches = [int(x) for x in a.prefetch.split(',')]
-    except ValueError:
-        p.error('invalid miss/prefetch CSV')
+        batches, parts_map = batch_configuration(a.batches, a.parts_map)
+        routes = plan_routes(selected, batches, parts_map)
+    except ValueError as error:
+        p.error(f'invalid experiment configuration: {error}')
     if (not misses or any(not 0 <= x <= 20 for x in misses) or len(set(misses)) != len(misses) or
             not prefetches or any(not 0 <= x <= 2048 or x % a.intermediate_fetches for x in prefetches) or
             len(set(prefetches)) != len(prefetches)):
@@ -221,6 +355,9 @@ def main(argv=None):
     sources = {case: baseline(output) if case=='mr23' else ROOT for case in selected}
     manifest = dict(status='PLANNED', baseline_commit=BASE, mr14_reference=MR14,
                     integration='adapted direct window producers; original MR23 ranked T2/Final/URMA tail',
+                    requested_batches=batches, budget_parts_map=parts_map,
+                    serial_reference='SerialBefore: SDK LI + LIDU + completed BatchGet; no MR14 SerialAfter adapter',
+                    score_budget='B*P<=32 AIC; no implicit oversubscribed waves',
                     batch_isolation='One batch size per job; baseline/candidate use identical DDR pool capacity', candidate_commit=command(['git','rev-parse','HEAD']),
                     candidate_status=command(['git','status','--short']), configuration=vars(a).copy(),
                     baseline_build_override=json.loads((output/'baseline_build_override.json').read_text()),
@@ -230,10 +367,10 @@ def main(argv=None):
     save(output/'manifest.json', manifest)
     (output/'candidate.diff').write_text(command(['git','diff','HEAD']))
     jobs=[]
-    routes=[(case,bs,parts,mode) for case in selected
-            for batches,parts,mode in [ROUTES[case]] for bs in batches.split(',')]
     for round_id in range(a.rounds+1):
-        order=[(case,bs,parts,mode,pf) for pf in prefetches for case,bs,parts,mode in routes]
+        ordered_routes = routes if round_id % 2 == 0 else list(reversed(routes))
+        order=[(case,bs,parts,mode,pf) for pf in prefetches for b in batches
+               for case,bs,parts,mode in ordered_routes if int(bs)==b]
         shift=round_id % len(order)
         for case,bs,parts,mode,pf in order[shift:]+order[:shift]:
             name=f'r{round_id}_pf{pf}_{case}_b{bs}'
@@ -279,8 +416,9 @@ def main(argv=None):
                                            env=probe_env, text=True)
     resources = json.loads(probe_output.splitlines()[-1])
     resources['effective_aiv'] = 2*resources['effective_aic']
-    if resources['effective_aic'] < 32:
-        raise RuntimeError(f'B16/P2 requires 32 effective AIC; measured {resources}')
+    required_aic = max(max(2*int(bs), int(bs)*parts) for _,bs,parts,_ in routes)
+    if resources['effective_aic'] < required_aic:
+        raise RuntimeError(f'Selected score/T2 routes require {required_aic} effective AIC; measured {resources}')
     manifest.update(status='RUNNING', kvaf_commit=KVAF,
         device_resources=resources,
         kvaf_get_sha256=checksum(kvaf/'build-npu/bin/kvaf_execute_batch_get_kernels.o'),
