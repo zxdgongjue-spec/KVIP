@@ -35,7 +35,21 @@ bash experiments/lifetch_score_t2/run_a5.sh \
 
 路径请替换为实际已更新的 KVIP 与已构建的固定 KVAF。需要原 SDK `torch_npu` QLI、已注册的 A5 LIDU/SFA vendor，以及 CANN/URMA 环境；沿用之前已正常执行 MR23 bench 的环境。脚本调用新版 `tests/operators/lifetch/test_lifetch.py bench`，不是旧的无子命令 `lifetch.py`。
 
-`run_a5.py` 本地 `git archive` 导出精确 MR23 基线，避免把未提交编辑或 build 软链接复制进去。两个 source 通过源文件摘要缓存分别编译 LIFetch。所有测试在同一个固定 KVAF 上执行，不替换 KVAF接口；native 串行参考会在每路测试中实际执行。
+如果现有 vLLM-DSA/KVAF 的 HEAD 不是 `1c131038`，给同一命令增加 `--prepare-kvaf` 即可：
+
+```bash
+bash experiments/lifetch_score_t2/run_a5.sh \
+  --device 5 --kvaf-root /home/w00568585/vLLM-DSA/third_party/KVAF \
+  --prepare-kvaf --kvaf-server 127.0.0.1:28885 \
+  --miss-percent 10 --prefetch 1024 --intermediate-fetches 4 \
+  --rounds 1 --warmup 4 --iterations 20
+```
+
+该选项把 `--kvaf-root` 当作本地 Git 来源，默认创建 `/home/w00568585/KVAF-score-t2-1c131038`，应用本 KVIP 的四个 URMA 补丁并构建，然后自动使用新目录运行对比。原 vLLM-DSA/KVAF 的 HEAD、编辑和构建产物保留。编译日志为结果目录中的 `dependency-build.log`，创建/补丁应用不联网；实际构建沿用服务 Python/CANN 环境，需要已安装的构建依赖。如果本地 Git 历史缺少该提交，脚本会给出宿主机 fetch 命令；如果找不到本地 UMDK，设置 `KVAF_UMDK_ROOT` 为含 `include/urma_api.h` 的现有目录再运行。UMDK 的新编译产物写入独立 KVAF 目录。
+
+准备完成后的实验可以直接指定 `--kvaf-root /home/w00568585/KVAF-score-t2-1c131038`，不再加 `--prepare-kvaf`。可用 `--pinned-kvaf-root` 自定义新目录。新 LIDU vendor 对两路测试共同使用，所选路径写入 manifest。脚本构建 CPU service 产物，但不会启动或重启已有的 KVAF server。
+
+`run_a5.py` 本地 `git archive` 导出精确 MR23 基线，避免把未提交编辑或 build 软链接复制进去。两个 source 通过源文件摘要缓存分别编译 LIFetch。所有测试在同一个固定 KVAF 上执行；native 串行参考会在每路测试中实际执行。不会直接把不同版本的 build-npu 二进制复制到固定版本目录，也不会跳过版本检查。
 
 默认交错运行：原 MR23（B1/B16）、score P2（B1/B16）、score P16（仅 B1），r0 丢弃，再测 r1/r2/r3。P2 的 B1 控制组用于判断全 score 屏障/Cold 再读的代价；B16/P2 已使用 32 AIC，没有凭空增加 score 并行度。若设备有效核数小于 32，B16/P2 会拒绝执行，禁止超预算隐式分波。
 

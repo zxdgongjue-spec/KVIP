@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exact MR23 source versus canonical split-score + original T2 postprocessing.
 
-No Git fetch, Docker command or dependency mutation. Both sources execute the
-new MR23 test_lifetch graph protocol, including real URMA Fetch completion.
+No Git fetch or Docker command. Optional --prepare-kvaf builds a separate pinned
+checkout from local history. Both sources use the MR23 graph timing protocol.
 """
 import argparse
 import csv
@@ -149,6 +149,9 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--device', type=int, default=5)
     p.add_argument('--kvaf-root', type=Path, required=True)
+    p.add_argument('--prepare-kvaf', action='store_true',
+                   help='use kvaf-root as local source; prepare/build a separate pinned dependency')
+    p.add_argument('--pinned-kvaf-root', type=Path, default=ROOT.parent/'KVAF-score-t2-1c131038')
     p.add_argument('--kvaf-server', default='127.0.0.1:28885')
     p.add_argument('--miss-percent', default='0,3,5,10,15,20')
     p.add_argument('--prefetch', default='1024', help='comma-separated budgets; add 0 as an overlap control')
@@ -177,9 +180,23 @@ def main(argv=None):
     output = output.resolve()
     print(f'Results directory: {output}', flush=True)
     kvaf = a.kvaf_root.resolve()
+    if a.prepare_kvaf and not a.dry_run:
+        from prepare_kvaf import prepare_and_build
+        preparation = dict(status='PREPARING', source=str(kvaf),
+                           destination=str(a.pinned_kvaf_root.resolve()))
+        save(output/'dependency_preparation.json', preparation)
+        try:
+            kvaf = prepare_and_build(kvaf, a.pinned_kvaf_root, log=output/'dependency-build.log')
+            preparation.update(status='READY', effective_kvaf_root=str(kvaf))
+        except BaseException as error:
+            preparation.update(status='FAILED', error=str(error))
+            raise
+        finally:
+            save(output/'dependency_preparation.json', preparation)
     sources = {'mr23':baseline(output), 'score_t2_p2':ROOT, 'score_t2_p16':ROOT}
     manifest = dict(status='PLANNED', baseline_commit=BASE, candidate_commit=command(['git','rev-parse','HEAD']),
                     candidate_status=command(['git','status','--short']), configuration=vars(a).copy(),
+                    effective_kvaf_root=str(kvaf),
                     completion='URMA Fetch + Index update + output slot validation; SFA checked outside timing')
     manifest['configuration'] = {k:str(v) if isinstance(v, Path) else v for k,v in manifest['configuration'].items()}
     save(output/'manifest.json', manifest)
@@ -208,8 +225,14 @@ def main(argv=None):
     if a.dry_run:
         print(f'Planned {len(jobs)} commands; no device or transport initialized. See jobs.json.')
         return
-    if command(['git','-C',str(kvaf),'rev-parse','HEAD']) != KVAF:
-        raise RuntimeError(f'Use a separate pinned KVAF @{KVAF}; this script leaves existing checkouts unchanged')
+    actual_kvaf = command(['git','-C',str(kvaf),'rev-parse','HEAD'])
+    if actual_kvaf != KVAF:
+        message = (f'KVAF version mismatch at {kvaf}: expected {KVAF}, found {actual_kvaf}. '
+                   f'Rerun the same command with --prepare-kvaf to clone/patch/build the pinned version '
+                   f'at {a.pinned_kvaf_root.resolve()} from local Git history; the source checkout is preserved.')
+        manifest.update(status='FAILED', actual_kvaf_commit=actual_kvaf, error=message)
+        save(output/'manifest.json', manifest)
+        raise RuntimeError(message)
     for file in ('bin/kvaf_execute_batch_get_kernels.o','bin/kvaf_execute_batch_put_kernels.o','CMakeCache.txt'):
         if not (kvaf/'build-npu'/file).is_file():
             raise RuntimeError(f'Missing built dependency: {kvaf/"build-npu"/file}')
@@ -233,6 +256,9 @@ def main(argv=None):
         device_resources=resources,
         kvaf_get_sha256=checksum(kvaf/'build-npu/bin/kvaf_execute_batch_get_kernels.o'),
         kvaf_put_sha256=checksum(kvaf/'build-npu/bin/kvaf_execute_batch_put_kernels.o'))
+    vendor_paths = sorted(str(p) for p in (ROOT/'csrc/operators/lidu/_custom_opp/vendors').glob('*')
+                          if (p/'op_api/lib/libcust_opapi.so').is_file())
+    manifest['shared_lidu_vendors'] = vendor_paths
     save(output/'manifest.json',manifest)
     try:
         for i,job in enumerate(jobs):
@@ -240,6 +266,9 @@ def main(argv=None):
             print('Log: '+job['log'],flush=True)
             env=dict(os.environ)
             env['PYTHONPATH']=os.pathsep.join([str(sources[job['case']]/'python'),str(kvaf/'build-npu/python'),env.get('PYTHONPATH','')])
+            if vendor_paths:
+                env['ASCEND_CUSTOM_OPP_PATH'] = os.pathsep.join(
+                    vendor_paths + list(filter(None, [env.get('ASCEND_CUSTOM_OPP_PATH')])))
             with open(job['log'],'w') as log:
                 result=subprocess.run(job['args'],cwd=sources[job['case']],env=env,stdout=log,stderr=subprocess.STDOUT)
             if result.returncode:
