@@ -108,6 +108,62 @@ W2 避免 legacy B1 请求 W8 时实际降为 W2 的几何差异。`--q-workers`
 串行与融合的预取及缓存维护工作不同；本脚本比较可用整链，不隔离纯融合收益。
 `history_direct` 是 Cold canonical/predicate 候选，不是 LI 数值组件的 producer route=1。
 
+### 原串行 / 优化后串行 / 库上 P2 融合三场景
+
+需要隔离 LI 优化对串行链的影响时，使用这个入口；上述 `history_direct` 不属于优化后串行链。
+
+```bash
+cd /home/w00568585/wt-mr14
+source /usr/local/Ascend/cann/set_env.sh
+source scripts/env.sh
+bash tests/operators/lifetch/run_serial_vs_fused_a5.sh \
+  --device 5 --kvaf-root third_party/KVAF --kvaf-server 127.0.0.1:28885 \
+  --batches 1 --miss-percent 0,3,10,50,90,100 --prefetch 0,512 \
+  --rounds 3 --warmup 4 --iterations 50
+```
+
+目录和服务地址需使用实际配置。同一用例内测三组：
+
+| 输出 | 实际执行链 |
+|---|---|
+| `SerialBefore` | SDK QLI → 原 NativeMtp LIDU → 原 KVAF BatchGet |
+| `SerialAfter` | 数值 direct LI（pack → 分核 score 直写 canonical → 原 TopK）→ **同一** LIDU → **同一** BatchGet |
+| `LegacyFused` | 当前 checkout 的 legacy/P2 LIFetch 完整链 |
+
+两条串行链使用相同 Q/K/weights/scales、初始缓存、队列和 KV 来源，恢复在计时外。
+优化后 LI 的 query/weight/scale/block-table 打包计入完整 LI 和串行整链时间，
+不会把组件脚本预打包后的 52.14µs 直接作为整链值。三组仅在传输完成后结束计时。
+TopK 以现有独立分数参考校验；串行实际 unique miss 数必须一致，否则比较失败并保留日志。
+边界相近分数可能产生不同 TopK 集合，实际读取量校验不能替代模型精度评估。
+report 同时保存逐 Q 的集合/顺序一致性，便于识别边界 tie 或描述符顺序差异。
+
+数值 LI 默认采用 Q4、均匀 history 分片，P 是不超过 `min(16, paired_score_capacity/B)`
+的最大 2 次幂，最小 P1。B1/C32 或 C28 默认 P16；B16/C32 默认 P2，B16/C28 默认 P1。
+可传 `--serial-history-parts 16` 固定 B1/P16，或 B16 用 `--serial-history-parts 2`。
+超出一轮容量时有多轮 score；实际 P、waves、核数和二进制 hash 写入 report。
+SDK 自行决定内部 tiling；预算参数约束候选和融合路线，默认采用整机上限。
+首次自动构建数值 LI 共享桥接库，后续使用源码/工具链/SoC 缓存；不会改动 SDK 或生产默认路由。
+
+默认三测量轮加丢弃 r0；两档 prefetch 共 8 次 harness 调用，每次包含三场景。
+prefetch 仅作用于 legacy 融合链，两条串行链均为 demand fetch。
+结果保存为 `/home/w00568585/li_serial_vs_fused_<timestamp>_<suffix>/`：
+
+- `summary.csv`/`summary.log`：三条完整链以及 `LI_before`/`LI_after` 独立组件计时。
+- `full_chain.csv`：各轮 mean/p50/p99、actual miss、实际分核几何、report 路径。
+- `serial_after_over_before`：LI 优化对串行整链的影响。
+- `serial_after_over_fused_legacy`：优化串行链与库上 P2 融合链的比较。
+
+比值小于 1 表示加速。LI 单独计时与整链分别采样，不能用差值冒充精确 LIDU/Fetch 阶段时长。
+现有公共入口也支持同一次测试：
+
+```bash
+python tests/operators/lifetch/test_lifetch.py bench \
+  --transport urma --device 5 --kvaf-root third_party/KVAF --kvaf-server 127.0.0.1:28885 \
+  --batches 1 --history 131072 --resident 16384 --queries 4 --index-heads 32 \
+  --miss-percent 0,3,10,50,90,100 --score-route legacy --intermediate-fetches 2 \
+  --compare-optimized-serial --serial-history-parts 16
+```
+
 ## diagnose：算法与时间拆解
 
 ```bash

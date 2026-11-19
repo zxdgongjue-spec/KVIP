@@ -84,6 +84,9 @@ def save_summary(directory, rows):
     temporary.replace(directory / 'results.csv')
     headers = ['#', 'Transport', 'BS', 'Miss%', 'Execution', 'Check',
                'Serial mean', 'Fused mean', 'Gain', 'Serial p50/p99', 'Fused p50/p99']
+    optimized = any('optimized_serial_p50_us' in row for row in rows)
+    if optimized:
+        headers += ['Optimized Serial mean', 'Optimized Serial p50/p99']
     cells = []
     for index, row in enumerate(rows, 1):
         def number(key):
@@ -98,6 +101,8 @@ def save_summary(directory, rows):
                       number('serial_mean_us'), number('fused_mean_us'),
                       '—' if reduction is None else f'{reduction:+.2%}',
                       percentiles('serial'), percentiles('fused')])
+        if optimized:
+            cells[-1] += [number('optimized_serial_mean_us'), percentiles('optimized_serial')]
     widths = [max(len(line[col]) for line in [headers, *cells]) for col in range(len(headers))]
     def formatted(line):
         return ' | '.join(value.ljust(width) if col in (1, 4, 5) else value.rjust(width)
@@ -133,6 +138,12 @@ def collect_results(directory, config, exit_code):
         row = comparison_row(str(path.parent.relative_to(directory)), timing.get('native_chain'),
                              timing.get('prototype_with_update'), correct,
                              execution=report.get('execution', 'INCOMPLETE' if path.name == 'completed_timings.json' else 'COMPLETED'))
+        if getattr(config, 'compare_optimized_serial', False):
+            opt = timing.get('optimized_native_chain') or {}
+            for metric in ('mean_us', 'p50_us', 'p99_us', 'samples'):
+                row[f'optimized_serial_{metric}'] = opt.get(metric)
+            if not opt:
+                row.update(accepted=False, timing='INCOMPLETE')
         row.update(batch=batch, transport=config.transport, mode=config.mode, report=str(path),
                    seed=getattr(config, 'seed', None), miss_percent=report.get('miss_percent', getattr(config, 'miss_percent', None)),
                    history=getattr(config, 'history', None), resident=getattr(config, 'resident', None),

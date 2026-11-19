@@ -1843,7 +1843,8 @@ def run_urma_case(
     correctness = CorrectnessRecorder()
     boundary_phases = {}
     completed_timings = {}
-    initial_selected = native_li(torch_npu, fixture).cpu().reshape(b, -1).numpy()
+    initial_selected_tensor = native_li(torch_npu, fixture)
+    initial_selected = initial_selected_tensor.cpu().reshape(b, -1).numpy()
     logical_scores = np.load(folder / "fixture/logical_scores.npy")
     physical_order = np.load(folder / "fixture/physical_to_logical.npy")
     scores = logical_scores[:, physical_order]
@@ -1997,6 +1998,51 @@ def run_urma_case(
     stream.synchronize()
     native_check()
     timings = {"native_chain": measure(native_call, native.reset, native_check, timing_name="native_chain")}
+    optimized_serial_geometry = None
+    optimized_serial_misses = None
+    optimized_serial_selection = None
+    if getattr(args, 'compare_optimized_serial', False):
+        from optimized_serial_li import OptimizedSerialLI, build_serial_library
+        progress(folder, 'build/load numeric direct LI for serial LIDU/Get comparison')
+        serial_library = build_serial_library(cache_dir=args.kvaf_root / 'build-npu/li-serial',
+            cann=args.cann, headers=find_headers(args.kvaf_root), soc=args.soc)
+        optimized_li = OptimizedSerialLI(torch, fixture, serial_library,
+            selected_shape=initial_selected_tensor.shape, batch=b, history=h, heads=args.index_heads,
+            aics=aics, aivs=getattr(args, 'aiv_budget', None) or 2*aics,
+            parts=getattr(args, 'serial_history_parts', 0))
+        optimized_serial_geometry = optimized_li.geometry
+        def optimized_native_call():
+            state['optimized_topk'] = optimized_li()
+            native.launch(state['optimized_topk'])
+        def optimized_native_check():
+            nonlocal optimized_serial_misses, optimized_serial_selection
+            selected = state['optimized_topk'].cpu().reshape(b, 4, 2048).numpy()
+            validate_topk(selected, compact_scores)
+            counts = native.verify(state['optimized_topk'])
+            selected_counts = [len(set(int(t) for t in row.reshape(-1) if t >= r)) for row in selected]
+            expected = [len(set(int(t) for t in row if t >= r)) for row in initial_selected]
+            if counts[:-1] != selected_counts or selected_counts != expected:
+                raise AssertionError(f'Optimized serial Get work differs from SDK control: {counts[:-1]} vs {expected}; check boundary ties')
+            optimized_serial_misses = counts[:-1]
+            sdk = initial_selected.reshape(b, 4, 2048)
+            optimized_serial_selection = dict(
+                query_sets_equal=(np.sort(selected, axis=-1) == np.sort(sdk, axis=-1)).all(-1).tolist(),
+                query_order_equal=(selected == sdk).all(-1).tolist())
+        timings['optimized_native_chain'] = measure(optimized_native_call, native.reset, optimized_native_check,
+                                                   timing_name='optimized_native_chain')
+        def li_only_call(call):
+            state['li_component'] = call()
+        def li_only_check():
+            validate_topk(state['li_component'].cpu().reshape(b, 4, 2048).numpy(), compact_scores)
+        timings['native_li_only'] = measure(lambda: li_only_call(lambda: native_li(torch_npu, fixture)),
+            native.reset, li_only_check, timing_name='native_li_only')
+        timings['optimized_li_only'] = measure(lambda: li_only_call(optimized_li),
+            native.reset, li_only_check, timing_name='optimized_li_only')
+        # Preserve the original native reference for all existing fusion checks.
+        native.reset()
+        native_call()
+        stream.synchronize()
+        native_check()
     # The previous native chain has prepared stable LIDU descriptors and maps.
     # Restore only the output so that the captured graph contains KVAF Get alone.
     if not bench_only:
@@ -2445,6 +2491,9 @@ def run_urma_case(
         boundary_coverage=boundary_phases,
         counter_clock_mhz=counter_clock_mhz,
         timing=timings, wall_costs=wall_costs,
+        optimized_serial_geometry=optimized_serial_geometry,
+        optimized_serial_misses_per_request=optimized_serial_misses,
+        optimized_serial_selection=optimized_serial_selection,
         full_trace=full_trace,
         fetch_only=fetch_only,
         read_samples=read_samples,

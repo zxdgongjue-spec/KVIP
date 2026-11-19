@@ -123,6 +123,10 @@ def configuration(argv=None):
         command.add_argument('--score-service', choices=('separate', 'inline'), default='separate')
         command.add_argument('--score-hot-partitions', type=int, default=0)
         command.add_argument('--score-cold-partitions', type=int, default=0)
+        command.add_argument('--compare-optimized-serial', action='store_true',
+                             help='Also measure numeric direct LI -> unchanged LIDU/Get (URMA synthetic bench)')
+        command.add_argument('--serial-history-parts', type=int, default=0,
+                             help='Numeric serial LI history shards: 0=auto, 1/2/4/8/16/32')
         if mode == 'check':
             command.add_argument('--suite', type=csv_values, default=('all',))
             command.add_argument('--cases', type=csv_values)
@@ -157,6 +161,12 @@ def configuration(argv=None):
         return args
     if args.device < 0 or args.timeout_seconds <= 0:
         parser.error('device must be nonnegative and timeout positive')
+    if args.serial_history_parts not in (0, 1, 2, 4, 8, 16, 32):
+        parser.error('serial-history-parts must be 0/1/2/4/8/16/32')
+    if args.serial_history_parts and not args.compare_optimized_serial:
+        parser.error('serial-history-parts requires --compare-optimized-serial')
+    if args.compare_optimized_serial and (args.mode != 'bench' or args.transport != 'urma' or args.score_route != 'legacy'):
+        parser.error('optimized serial comparison requires URMA bench with score-route=legacy')
     if not 0 <= args.aic_budget <= 32 or (args.aiv_budget is not None and not 2 <= args.aiv_budget <= 64):
         parser.error('AIC budget must be 0..32 and AIV budget 2..64')
     if any(not 0 <= x <= 32 for x in (args.score_hot_partitions, args.score_cold_partitions)):
@@ -182,6 +192,8 @@ def configuration(argv=None):
         if args.suite == ('all',):
             args.suite = CHECK_SUITES if args.snapshot else CHECK_SUITES[:-1]
     if args.mode in ('bench', 'diagnose'):
+        if args.compare_optimized_serial and (args.input != 'synthetic' or args.valid_history is not None):
+            parser.error('optimized serial comparison currently requires synthetic full valid history')
         synthetic = dict(miss_percent=10., queries=4, batches=DEFAULT_BATCHES, seed=43,
                          history=131072, resident=16384, index_heads=32)
         real = ('trace_root', 'group', 'round_range')

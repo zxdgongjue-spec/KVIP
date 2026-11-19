@@ -34,7 +34,7 @@ def csv_numbers(value, converter):
     return values
 
 
-def arguments(argv=None):
+def arguments(argv=None, *, serial=False):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--kvaf-server", required=True, help="Existing URMA CPU service HOST:PORT")
     p.add_argument("--kvaf-root", type=Path, default=ROOT / "third_party/KVAF")
@@ -53,6 +53,10 @@ def arguments(argv=None):
     p.add_argument("--timeout-seconds", type=int, default=3600, help="Timeout per public harness worker")
     p.add_argument("--output-root", type=Path, default=Path("/home/w00568585"))
     p.add_argument("--plan", action="store_true", help="Print commands without executing or creating files")
+    if serial:
+        p.description = "Compare original serial, numeric-direct optimized serial, and legacy fused full chains"
+        p.add_argument("--serial-history-parts", type=int, choices=(0, 1, 2, 4, 8, 16, 32), default=0,
+                       help="0=largest power of two <= min(16, paired score capacity/batch)")
     a = p.parse_args(argv)
     if (a.device < 0 or a.rounds < 1 or a.warmup < 1 or a.iterations < 1 or a.timeout_seconds <= 0
             or not 1 <= a.aic_budget <= 32 or not 2 <= a.aiv_budget <= 64):
@@ -176,10 +180,9 @@ def summarize(output, rows):
     print("\n".join(lines))
 
 
-def main(argv=None):
-    a = arguments(argv)
+def run_experiment(a, *, make_plan=plan, read=read_run, summary=summarize, prefix="lifetch_full_chain", note=None):
     if a.plan:
-        for job in plan(a, a.output_root / "PLAN_ONLY"):
+        for job in make_plan(a, a.output_root / "PLAN_ONLY"):
             print(job["name"] + ": " + shlex.join(job["argv"]))
         return 0
     if any(s in os.environ.get("LD_PRELOAD", "").lower() for s in ("camodel", "cmodel")):
@@ -190,11 +193,11 @@ def main(argv=None):
     if not (a.kvaf_root / "build-npu/python/kvaf").is_dir():
         raise RuntimeError(f"Missing built KVAF package: {a.kvaf_root}/build-npu/python/kvaf")
     a.output_root.mkdir(parents=True, exist_ok=True)
-    output = Path(tempfile.mkdtemp(prefix=time.strftime("lifetch_full_chain_%Y%m%d_%H%M%S_"), dir=a.output_root))
+    output = Path(tempfile.mkdtemp(prefix=time.strftime(prefix + "_%Y%m%d_%H%M%S_"), dir=a.output_root))
     print(f"Results directory: {output}\nSource checkout: {ROOT}", flush=True)
-    jobs = list(plan(a, output))
+    jobs = list(make_plan(a, output))
     metadata = dict(config={k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items()}, commands=jobs,
-                    note="Each run pairs SDK LI/LIDU/Get with one LIFetch route. r0 discarded. Same requested budgets; actual score geometry recorded. These paths do different cache/prefetch work.")
+                    note=note or "Each run pairs SDK LI/LIDU/Get with one LIFetch route. r0 discarded. Same requested budgets; actual score geometry recorded. These paths do different cache/prefetch work.")
     for command, label in ((["git", "rev-parse", "HEAD"], "head"), (["git", "status", "--porcelain"], "source_status"), (["npu-smi", "info"], "npu_smi")):
         result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
         metadata[label] = dict(exit_code=result.returncode, stdout=result.stdout, stderr=result.stderr)
@@ -213,9 +216,9 @@ def main(argv=None):
             if result.returncode:
                 print("\n".join(log.read_text(errors="replace").splitlines()[-40:]), file=sys.stderr)
                 raise RuntimeError(f"{job['name']} failed (exit {result.returncode}); see {log}")
-            rows.extend(read_run(output, job, a))
+            rows.extend(read(output, job, a))
             write_csv(output / "full_chain.csv", rows)
-        summarize(output, rows)
+        summary(output, rows)
     except Exception:
         (output / "exit-status.txt").write_text("1\n")
         print(f"Experiment stopped. Completed rows/logs retained in {output}", file=sys.stderr)
@@ -223,6 +226,10 @@ def main(argv=None):
     (output / "exit-status.txt").write_text("0\n")
     print(f"Completed. Summary: {output / 'summary.csv'}", flush=True)
     return 0
+
+
+def main(argv=None):
+    return run_experiment(arguments(argv))
 
 
 if __name__ == "__main__":
