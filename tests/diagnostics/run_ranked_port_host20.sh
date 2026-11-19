@@ -27,7 +27,7 @@ case "$mode" in
     audit) groups=(7); audit=1; ranked_sha=aaa8d3429951464d0d62d70b10cbaaf7d3c2ed43 ;;
     donor-scan) groups=(7); prior=1; ranked_sha=9952fad5ed36ce4d2885b66399f6543b8c5a8e7d ;;
     donor-slots) groups=(7); prior=1; ranked_sha=3c3fa6486d470e4ddf020d7701691a4314fc5da0 ;;
-    cold-align) groups=(7); prior=1; prior_sha=3c3fa6486d470e4ddf020d7701691a4314fc5da0; ranked_sha=e97d55b9bb8082f3080c113252e53e4695ef739e ;;
+    cold-align) groups=(7); ranked_sha=df424ce343c3c4f4341c67a402f7db17cadbc36c ;;
     *) echo "Usage: $0 [all|g7|audit|donor-scan|donor-slots|cold-align]" >&2; exit 2 ;;
 esac
 checkout() {
@@ -85,22 +85,19 @@ printf 'CONFIG URMA NPU4 logical=0 BS16 Q4 656B cold_windows=8 Fetch_AIV_per_win
 if ((audit)); then echo MODE=LI_phase_audit_only_not_a_performance_candidate; fi
 if ((prior)); then
     scope=donor_scan_and_device_call_boundaries_same_rank_and_fetch
-    if [[ "$mode" == cold-align ]]; then scope=G7_reference_padded_shards_only; fi
     if [[ "$mode" == donor-slots ]]; then scope=final_TopK_tagged_slot_classification; fi
     printf 'PRIOR=%s\nDONOR=1d2486a76151ae37662c47aab835d06df50be866\nSCOPE=%s\n' "$prior_sha" "$scope"
 fi
-for group in "${groups[@]}"; do
-    if [[ "$mode" == cold-align ]]; then
-        python3 -B -m kvip.diagnostics.cold_window_compare --snapshot "$inputs/g${group}-input"
-    else
+if [[ "$mode" != cold-align ]]; then
+    for group in "${groups[@]}"; do
         python3 -B -m kvip.diagnostics.ranked_port cpu --snapshot "$inputs/g${group}-input"
-    fi
-done
+    done
+fi
 echo BUILD_BEGIN
 if ! (
     python3 -B -m kvip.diagnostics.ranked_port build --root "$baseline" --revision "$baseline_sha" \
         --build-dir "$build" --soc Ascend950DT_9582 --baseline || exit $?
-    if ((prior)) && [[ "$mode" != cold-align ]]; then
+    if ((prior)); then
         python3 -B -m kvip.diagnostics.ranked_port build --root "$work/fused-scan-sources/native-$prior_sha" \
             --revision "$prior_sha" --build-dir "$build" --soc Ascend950DT_9582 --baseline || exit $?
     fi
@@ -176,7 +173,7 @@ run_case() {
             extra+=(--final-get-detail)
         else
             diagnostics=0
-            if [[ "$repeat" == 2 ]]; then
+            if [[ "$name" == reverse || "$name" == ranked ]]; then
                 extra+=(--profile-dir "$result/profiles/g${group}-$name" --profile-metrics none)
             fi
         fi
@@ -197,8 +194,16 @@ run_case() {
         --kvaf-server "127.0.0.1:$cpu_port" --device 0 --soc Ascend950DT_9582 \
         --warmup "$warmup" --iterations "$iterations" --diagnostic-replays "$diagnostics" --quiet --output "$out" >"$log" 2>&1; then
         printf 'REPLAY_FAILED G%s variant=%s LOG=%s\n' "$group" "$name" "$log" >&2
-        python3 -B -m kvip.diagnostics.console --result "$out" --log "$log" --returncode 70 >&2 || true
-        tail -n 15 "$log" >&2
+        if [[ "$mode" == cold-align ]]; then
+            python3 -B -m kvip.diagnostics.console --result "$out" --log "$log" --returncode 70 \
+                >"$log.failure" 2>&1 || true
+            if ! grep -m1 '^REPLAY_FAILED variant=' "$log.failure" >&2; then
+                tail -n 5 "$log" >&2
+            fi
+        else
+            python3 -B -m kvip.diagnostics.console --result "$out" --log "$log" --returncode 70 >&2 || true
+            tail -n 15 "$log" >&2
+        fi
         return 1
     fi
 }
@@ -211,6 +216,20 @@ for group in "${groups[@]}"; do
         continue
     fi
     echo "BEGIN G$group graph"
+    if [[ "$mode" == cold-align ]]; then
+        for name in ranked reverse forward; do run_case "$group" "$name" 1; done
+        python3 -B -m kvip.diagnostics.cold_window_compare --graph "$result" | tee "$result/g${group}-summary.txt"
+        for arm in reverse-original rank-original rank-matched rank-split; do
+            case "$arm" in
+                rank-matched) clock=2 ;;
+                rank-split) clock=3 ;;
+                *) clock=1 ;;
+            esac
+            KVIP_G7_SCAN_CLOCK="$clock" run_case "$group" "$arm" 3
+        done
+        python3 -B -m kvip.diagnostics.cold_window_compare --detail "$result" | tee -a "$result/g${group}-summary.txt"
+        continue
+    fi
     # Fail on candidate correctness before spending time on control timings.
     first_order=(ranked forward reverse)
     last_order=(reverse forward ranked)
@@ -223,18 +242,6 @@ for group in "${groups[@]}"; do
         for name in ranked-46924fb ranked-a92b7c8; do run_case "$group" "$name" 2; done
     fi
     for name in "${last_order[@]}"; do run_case "$group" "$name" 2; done
-    if [[ "$mode" == cold-align ]]; then
-        for arm in reverse-original forward-original rank-original forward-matched rank-matched forward-split rank-split; do
-            case "$arm" in
-                forward-matched|rank-matched) clock=2 ;;
-                forward-split|rank-split) clock=3 ;;
-                *) clock=1 ;;
-            esac
-            KVIP_G7_SCAN_CLOCK="$clock" run_case "$group" "$arm" 3
-        done
-        python3 -B -m kvip.diagnostics.cold_window_compare --root "$result" | tee "$result/g${group}-summary.txt"
-        continue
-    fi
     if ((prior)); then run_case "$group" reverse-audit 2; fi
     report_flags=("${history[@]}")
     if ((prior)); then report_flags=(--prior); fi

@@ -46,7 +46,7 @@ def test_streaming_readback_preserves_all_score_bits_and_rejects_any_causal_diff
     result = verify_score_keys(actual, expected, ends)
     assert result["compared_scores"] == 16 * 4 * 200
     actual[15, 3, 199] ^= np.uint16(1)  # One bit, last causal score: never tolerate.
-    with pytest.raises(AssertionError, match="score keys differ"):
+    with pytest.raises(AssertionError, match=r"row=15 query=3 positions=1 .*199:0x3fc7->0x3fc6"):
         verify_score_keys(actual, expected, ends)
     rotating.runtime_shape.liCores = 16
     with pytest.raises(ValueError, match="reuses a core"):

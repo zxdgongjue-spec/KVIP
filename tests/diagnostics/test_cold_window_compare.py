@@ -33,3 +33,34 @@ def test_swapped_or_omitted_shard_is_rejected():
     t = np.zeros((64, 8, 8), np.int64)
     with pytest.raises(ValueError, match="tile bounds"):
         decode(t, 1, 3)
+
+
+def test_one_run_gate_uses_both_halves_and_both_controls(tmp_path, capsys):
+    import json
+
+    from kvip.diagnostics.cold_window_compare import graph_report
+
+    def save(name, samples):
+        count = 4 if name == "ranked" else 1
+        timeline = dict(li=dict(count=count, span_us=200), streaming=dict(count=1, span_us=100))
+        case = dict(
+            status="pass",
+            snapshot_sha256="g7",
+            geometry=dict(rounds=8, service_lanes=8, token_bytes=656),
+            tuning=dict(window_limit=64, prefetch_limit=512),
+            score_comparison=dict(status="bit_exact"),
+            threshold_comparison=dict(initial_keys=[1], final_keys=[2]),
+            timing=dict(samples_us=samples),
+            reads_samples=[dict(unused_prefetch=2, final=5, transfers=10)],
+            system_profiles=dict(passes=[dict(timeline=timeline, metric="none")]),
+        )
+        (tmp_path / f"g7-{name}-1.json").write_text(json.dumps(case))
+
+    save("forward", [120] * 10)
+    save("reverse", [100] * 10)
+    save("ranked", [85] * 5 + [101] * 5)
+    graph_report(tmp_path)
+    assert "GATE KEEP_BASELINES" in capsys.readouterr().out
+    save("ranked", [85] * 5 + [95] * 5)
+    graph_report(tmp_path)
+    assert "GATE BOTH_BASELINES_BEATEN" in capsys.readouterr().out

@@ -277,7 +277,15 @@ def verify_score_keys(actual, expected, query_ends):
             raise AssertionError("Captured query end exceeds the LI score row")
         mismatch = np.count_nonzero(actual[row, query, :end] != expected[row, query, :end])
         if mismatch:
-            raise AssertionError(f"Real LI score keys differ: row={row} query={query} positions={mismatch}")
+            positions = np.flatnonzero(actual[row, query, :end] != expected[row, query, :end])[:4]
+            examples = ", ".join(
+                f"{pos}:0x{expected[row, query, pos]:04x}->0x{actual[row, query, pos]:04x}"
+                for pos in positions
+            )
+            raise AssertionError(
+                f"Real LI score keys differ: row={row} query={query} positions={mismatch} "
+                f"examples=position:expected->actual [{examples}]"
+            )
         compared += end
     return dict(status="bit_exact", compared_scores=compared, included_in_timing=False)
 

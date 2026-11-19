@@ -88,96 +88,97 @@ def decode(raw, rate, mode):
                 fetch_us=fetch.tolist(), physical_aivs=64, cold_windows=8, verified_tile_ends=cuts[1:])
 
 
-def report(root):
-    def case(name, repeat):
-        return load_case(root / f"g7-{name}-{repeat}.json")
-    controls = ("forward", "reverse", "ranked-prior", "ranked")
-    first = case("forward", 1)
-    def check(c):
-        if (c["geometry"] != first["geometry"] or c["snapshot_sha256"] != first["snapshot_sha256"]
-                or tuple(c["geometry"][k] for k in ("rounds", "service_lanes")) != (8, 8)
-                or tuple(c["tuning"][k] for k in ("window_limit", "prefetch_limit")) != (64, 512)
-                or any(c["threshold_comparison"][k] != first["threshold_comparison"][k]
-                       for k in ("initial_keys", "final_keys"))):
-            raise ValueError("Snapshot, thresholds, geometry or budget mismatch")
-    timing = {}
-    for name in controls:
-        cases = [case(name, r) for r in (1, 2)]
-        for c in cases:
-            check(c)
-        timing[name] = a = np.asarray([[c["timing"][k] for k in ("mean_us", "p50_us")] for c in cases])
-        print(f"GRAPH {name} mean/P50_us={a[0,0]:.2f}/{a[0,1]:.2f},{a[1,0]:.2f}/{a[1,1]:.2f} "
-              + "drift_pct=" + "/".join(f"{v:+.2f}" for v in 100*(a[1]/a[0]-1)))
-        # Count dispatches in the actual replay. The donor path launches
-        # hot, seed, cold, final in order, so report gaps as well as durations.
+def checked(root, name, number, reference):
+    c = load_case(root / f"g7-{name}-{number}.json")
+    if (c["snapshot_sha256"] != reference["snapshot_sha256"] or c["geometry"] != reference["geometry"]
+            or tuple(c["geometry"][k] for k in ("rounds", "service_lanes")) != (8, 8)
+            or tuple(c["tuning"][k] for k in ("window_limit", "prefetch_limit")) != (64, 512)
+            or c.get("score_comparison", {}).get("status") != "bit_exact"
+            or any(c["threshold_comparison"][k] != reference["threshold_comparison"][k]
+                   for k in ("initial_keys", "final_keys"))):
+        raise ValueError(f"{name}: score, threshold or workload mismatch")
+    return c
+
+
+def graph_report(root):
+    reference = load_case(root / "g7-forward-1.json")
+    times, halves, phases = {}, {}, {}
+    for name in ("forward", "reverse", "ranked"):
+        c = checked(root, name, 1, reference)
+        v = np.asarray(c["timing"]["samples_us"])
+        if v.shape != (10,) or not np.isfinite(v).all() or min(v) <= 0:
+            raise ValueError(f"{name}: incomplete timing")
+        times[name] = np.array([np.mean(v), np.median(v)])
+        halves[name] = np.array([[np.mean(h), np.median(h)] for h in np.array_split(v, 2)])
+        drift = 100 * (halves[name][1] / halves[name][0] - 1)
+        reads = c["reads_samples"]
+        width = c["geometry"]["token_bytes"] / 1024
+        traffic = [np.mean([r[k] for r in reads])*width for k in ("unused_prefetch", "final", "transfers")]
+        print(f"GRAPH {name} mean/P50_us={times[name][0]:.2f}/{times[name][1]:.2f} "
+              f"half_drift_pct={drift[0]:+.2f}/{drift[1]:+.2f} waste/repair/total_KiB="
+              + "/".join(f"{x:.1f}" for x in traffic))
+        if name == "forward":
+            continue
         from kvip.diagnostics.system_profile import _csv_timeline
-        profiles = [p for p in cases[-1]["system_profiles"]["passes"] if p["metric"] == "none"]
-        if len(profiles) != 1:
-            raise ValueError("Expected one profiler pass")
-        profile = profiles[0]
-        timeline = profile.get("timeline") or {}
-        expected = 4 if name == "ranked" else 1
-        if sum("v9_li_kernel" in r["name"] for r in timeline.get("kernels", [])) != expected:
-            timeline = _csv_timeline(Path(profile["directory"]), profile["artifacts"])
-        rows = sorted((r for r in timeline.get("kernels", []) if "v9_li_kernel" in r["name"]),
-                      key=lambda r: r["start_us"])
-        if len(rows) != expected:
-            raise ValueError(f"{name}: expected {expected} device LI tasks, saw {len(rows)}")
-        span = rows[-1]["start_us"] + rows[-1]["duration_us"] - rows[0]["start_us"]
-        phases = "hot/seed/cold/final" if expected == 4 else "single"
-        times = "/".join(f"{v['duration_us']:.2f}" for v in rows)
-        print(f"DEVICE_LI {name} {phases}_us={times} span_us={span:.2f}")
-    outside, scans, legacy = {}, {}, {}
-    expected_audit_commit = case("ranked", 1)["kvip_commit"]
-    for name in ("reverse-original", "forward-original", "rank-original", "forward-matched", "rank-matched", "forward-split", "rank-split"):
-        c = case(name, 3)
-        check(c)
-        if c["kvip_commit"] != expected_audit_commit:
-            raise ValueError(f"Unexpected diagnostic source for {name}")
-        sample = c["native_diagnostics"]["samples"][0]
+
+        prof, = c["system_profiles"]["passes"]
+        t = prof.get("timeline") or {}
+        n = 4 if name == "ranked" else 1
+        if (t.get("li") or {}).get("count") != n:
+            t = _csv_timeline(Path(prof["directory"]), prof["artifacts"])
+        if ((t.get("li") or {}).get("count") == n and (t.get("streaming") or {}).get("count") == 1):
+            phases[name] = np.array([t["li"]["span_us"], t["streaming"]["span_us"]])
+    if len(phases) == 2:
+        delta = phases["ranked"] - phases["reverse"]
+        print(f"KERNEL_DELTA_US vs_reverse LI_span={delta[0]:+.2f} resolve_update={delta[1]:+.2f}")
+    else:
+        print("KERNEL_DELTA_UNAVAILABLE see saved profiler tables")
+    passed = True
+    for base in ("forward", "reverse"):
+        delta = times[base] - times["ranked"]
+        conservative = halves[base].min(axis=0) - halves["ranked"].max(axis=0)
+        print(f"GRAPH_SAVED_US vs_{base} mean/P50={delta[0]:+.2f}/{delta[1]:+.2f} "
+              f"worst_half_mean/P50={conservative[0]:+.2f}/{conservative[1]:+.2f}")
+        passed &= bool((delta > 0).all() and (conservative > 0).all())
+    print("GATE " + ("BOTH_BASELINES_BEATEN" if passed else "KEEP_BASELINES"))
+
+
+def detail_report(root):
+    reference = load_case(root / "g7-ranked-1.json")
+    outside, scans, gaps, legacy = {}, {}, {}, {}
+    for name in ("reverse-original", "rank-original", "rank-matched", "rank-split"):
+        c = checked(root, name, 3, reference)
+        if c["kvip_commit"] != reference["kvip_commit"]:
+            raise ValueError(f"{name}: diagnostics use a different source")
+        sample, = c["native_diagnostics"]["samples"]
         d = sample["cold_window_clock"]
-        if name in ("rank-original", "reverse-original"):
-            legacy[name] = sample["li_phase_audit"]["phases"]["scan_excluding_own_fetch"]["mean"]
         scans[name] = np.mean(d["scan_us"], axis=0)
         outside[name] = float(np.mean(d["outside_us"]))
-        print(f"COLD {name} outside_mean/P50_us={outside[name]:.2f}/{np.median(d['outside_us']):.2f}"
-              f" inter_window_gap_mean_us={np.mean(d['gap_us']):.2f} scan_mean_us_by_window="
-              + "/".join(f"{v:.2f}" for v in scans[name]))
-    print("HARDWARE_WINDOW_RANGES_PASS physical_AIVs=64 epochs=8 "
-          "rank-matched/rank-split cover identical Q4 positions in every epoch")
-    original = outside["rank-original"] - outside["reverse-original"]
-    remain = outside["rank-split"] - outside["reverse-original"]
-    old_metric = legacy["rank-original"] - legacy["reverse-original"]
-    print(f"LEGACY_TO_COMMON historical_old_run_us=+143.62 this_run_old_edges_us={old_metric:+.2f} "
-          f"this_run_common_edges_us={original:+.2f} boundary_effect_us={old_metric-original:+.2f}")
-    print(f"SCAN_GAP_US original_common={original:+.2f} remaining={remain:+.2f} recovered={original-remain:+.2f}")
-    for before, after in (("reverse-original", "forward-original"), ("forward-original", "rank-original"),
-                          ("rank-original", "rank-matched"), ("rank-matched", "rank-split")):
-        print(f"CHANGE {before}->{after} outside_mean_us={outside[after]-outside[before]:+.2f}"
-              + " scan_delta_by_window=" + "/".join(f"{v:+.2f}" for v in scans[after]-scans[before]))
-    flat_cost = outside["rank-matched"] - outside["forward-matched"]
-    split_cost = outside["rank-split"] - outside["forward-split"]
-    print(f"RANK_COST_SAME_WINDOWS_US matched_flat={flat_cost:+.2f} matched_split={split_cost:+.2f} "
-          f"extra_rank_cost_recovered={flat_cost-split_cost:+.2f} "
-          f"plain_scan_saved={outside['forward-matched']-outside['forward-split']:+.2f}")
-    win = True
-    for base in controls[:2]:
-        delta = timing[base].min(axis=0) - timing["ranked"].max(axis=0)
-        print(f"GRAPH_SAVED_US vs_{base} mean/P50={delta[0]:+.2f}/{delta[1]:+.2f}")
-        win &= bool(np.all(delta > 0))
-    print("GATE " + ("BOTH_BASELINES_BEATEN" if win else "KEEP_BASELINES"))
-    print("SCOPE cold clocks by physical AIV, first cold tile to last cold tile/Fetch return; "
-          "graph uses independent uninstrumented repeats including all LI launches")
+        gaps[name] = float(np.mean(d["gap_us"]))
+        if name.endswith("-original"):
+            legacy[name] = sample["li_phase_audit"]["phases"]["scan_excluding_own_fetch"]["mean"]
+    old = outside["rank-original"] - outside["reverse-original"]
+    left = outside["rank-split"] - outside["reverse-original"]
+    print(f"SCAN_GAP_US legacy_this_run={legacy['rank-original']-legacy['reverse-original']:+.2f} "
+          f"common_before={old:+.2f} common_after={left:+.2f} recovered={old-left:+.2f}")
+    print(f"SCAN_SAVED_US change_window_edges={outside['rank-original']-outside['rank-matched']:+.2f} "
+          f"change_shard_schedule_at_same_edges={outside['rank-matched']-outside['rank-split']:+.2f}")
+    print("MATCHED_SCAN_SAVED_US w0..7="
+          + "/".join(f"{x:+.2f}" for x in scans["rank-matched"]-scans["rank-split"])
+          + f" inter_window={gaps['rank-matched']-gaps['rank-split']:+.2f}")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     arg = parser.add_mutually_exclusive_group(required=True)
-    arg.add_argument("--root", type=Path)
+    arg.add_argument("--graph", type=Path)
+    arg.add_argument("--detail", type=Path)
     arg.add_argument("--snapshot", type=Path)
     args = parser.parse_args()
-    if args.root:
-        report(args.root)
+    if args.graph:
+        graph_report(args.graph)
+    elif args.detail:
+        detail_report(args.detail)
     else:
         from kvip.diagnostics.archive import load_snapshot
         a = load_snapshot(args.snapshot)
