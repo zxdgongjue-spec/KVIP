@@ -27,7 +27,13 @@ def cpu_state(tmp_path):
         query_ends=torch.zeros(4, dtype=torch.int32)), tail_bounds=torch.zeros((1, 2), dtype=torch.int32))
     state.output = torch.zeros((2, 2176, 656), dtype=torch.uint8)
     state.rotating = SimpleNamespace(lru_slots=torch.empty((1, 2048), dtype=torch.int32),
-                                    reserved_hot=torch.empty((1, 2048), dtype=torch.int32))
+                                    reserved_hot=torch.empty((1, 2048), dtype=torch.int32),
+                                    row_status=torch.zeros((1, 32), dtype=torch.int32),
+                                    final_posts=torch.zeros((1, 4, 32), dtype=torch.int32))
+    state.forward = SimpleNamespace(flags=torch.zeros((1, 16, 32), dtype=torch.int32),
+                                    worker_status=torch.zeros((1, 32), dtype=torch.int32),
+                                    events_src=torch.zeros((1, 10240), dtype=torch.int32),
+                                    events_dst=torch.zeros((1, 10240), dtype=torch.int32), resolver_cores=3)
     state.policies = [SimpleNamespace(slots=np.arange(2048, dtype=np.int32)[None])]
     return state, inputs
 
@@ -123,6 +129,6 @@ def test_urma_replay_allocates_complete_scratch_before_binding(monkeypatch, tmp_
     with pytest.raises(BindingReached):
         FusedReplayState(torch, SimpleNamespace(transport='urma'),
                          SimpleNamespace(addresses=None, valid=None), None, initial, None, None,
-                         device=torch.device('cpu'), aics=24, windows=8,
+                         transport='urma', device=torch.device('cpu'), aics=24, windows=8,
                          prefetch_tokens=0, soc='Ascend950PR_9599')
     assert closed == [True]

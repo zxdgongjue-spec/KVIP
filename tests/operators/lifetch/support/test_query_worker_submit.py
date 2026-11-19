@@ -17,6 +17,8 @@ def test_query_worker_batches_kvaf_calls_and_preserves_conflicts(tmp_path):
 #define __gm__
 #define V9_SIMULATION 0
 constexpr uint32_t kResolveCores=3,kFlagCount=16,kTop=2048,kSlots=8192,kBatchGetInflight=2048;
+constexpr uint32_t kBatchFlagPayloadBytes=12,kFinalPostPayloadBytes=32;
+constexpr uint32_t kGroupSafeCountWord=0,kGroupConflictCountWord=8,kGroupReadyWord=16,kGroupErrorWord=17;
 constexpr uint64_t KVAF_AIV_BATCH_GET_STATUS_MAGIC=123,KVAF_AIV_BATCH_GET_PROFILE_MAGIC=456;
 struct BatchFlag {uint32_t ready=0,count=0,error=0,reserved[29]={};};
 struct FinalPost {uint32_t count=0,pending=0,error=0,deferred=0,descriptor=0,nonconflicting=0;};
@@ -27,7 +29,8 @@ struct DeviceArgs {uint64_t indices=0,offsets=0,output_indices=0,miss_count=0,ad
  uint32_t request_capacity=0,table_capacity=0,batch_get_max_inflight_total=0,jettys_per_core=1;};
 struct Context {uint64_t sourceBlocks,sourceOffsets,destinations,count,fallbackAddresses=0,fallbackValid=0;};
 struct Shape {uint32_t batch=4,finalWorkers=4,finalPostOffset=0,resident=16384;};
-struct Args {uint64_t context=0,flags=0,times=0,packedFetch=0;uint32_t prefetchCount=0,fetchJettysPerAiv=0;};
+struct Args {uint64_t context=0,flags=0,times=0,packedFetch=0;uint32_t prefetchCount=0,fetchJettysPerAiv=0;
+ uint64_t completedFlags=0,liveCount=0;};
 Shape LoadRuntimeShape(Context*){return {};}
 FinalPost posts[16];DeviceArgs deviceArgs[20];std::vector<std::vector<int32_t>> calls,offsetCalls,destCalls;
 KvafBatchGetQueueState queues[20];KvafBatchGetCoreStatus statuses[20];

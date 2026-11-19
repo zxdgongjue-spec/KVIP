@@ -1,6 +1,9 @@
 #include "kernel_operator.h"
 #if defined(__CCE_AICORE__)
 #include "context.h"
+#if !V9_UBMEM
+#include "round_prepare.h"
+#endif
 struct QLITilingData {
     uint32_t bSize,tSize,gSize,s1Size,s2Size,sparseCount,usedCoreNum,blockSize,maxBlockNumPerBatch,sparseMode;
     uint32_t keyStride0=16384,keyDequantScaleStride0=128;
@@ -34,6 +37,9 @@ __aicore__ inline void RunLi(GM_ADDR bindings) {
         bfloat16_t,float,float,uint16_t>;
     QLIKernel::QuantLightningIndexerKernel<Type> op;
     op.runtimeShape_ = shape;
+#if !V9_UBMEM
+    op.rotationContext_ = P(14);
+#endif
     op.sequenceSplit_ = splitSequence;
     op.sequenceTopKOnly_ = Phase == SequenceLiPhase::Threshold || Phase == SequenceLiPhase::Final;
     QLITilingData tiling{shape.batch,shape.batch*4,shape.indexHeads,4,shape.history,

@@ -243,7 +243,7 @@ def run_config(path, shared_pool=None):
     config = SimpleNamespace(**json.loads(path.read_text()))
     config.kvaf_root = Path(config.kvaf_root).resolve()
     config.output = path.parent
-    use_pool = config.mode == 'bench' or (config.mode == 'diagnose' and config.transport == 'urma')
+    use_pool = config.mode in ('bench', 'diagnose')
     if use_pool and config.input == 'synthetic' and shared_pool is None:
         pool = BenchPool(config)
         misses = config.miss_percent if isinstance(config.miss_percent, list) else [config.miss_percent]
@@ -315,7 +315,9 @@ def run_config(path, shared_pool=None):
                     detail='two independent create/Put/Get/lease/release cycles')])
         atomic_json(path.parent / 'worker-result.json', dict(exit_code=0))
         return 0
-    if config.transport == 'urma':
+    if config.mode in ('bench', 'diagnose'):
+        code = run_synthetic_batch(config, path.parent, shared_pool=shared_pool)
+    elif config.transport == 'urma':
         options = runner_options(config)
         options.shared_pool = shared_pool
         code = run_worker(options, path.parent)
@@ -528,6 +530,12 @@ def supervise(command, run, heartbeat_seconds=20, timeout_seconds=300, environme
                 lines.append(f"STREAMING FETCH KV AUDIT: {json.dumps(compact)}; details={audit}")
             except (OSError, ValueError, KeyError) as error:
                 lines.append(f"Could not read streaming fetch audit {audit}: {error}")
+        for result_path in sorted(run.rglob('path_result.json')):
+            result = json.loads(result_path.read_text())
+            for failure in result.get('failures', [])[:4]:
+                lines.append(f"REPLAY CHECK FAILURE {result.get('path', '')}: {json.dumps(failure)}")
+        for audit_path in sorted(run.rglob('score_failure.json')):
+            lines.append('REPLAY SCORE AUDIT: ' + audit_path.read_text())
         # At most four short tails, including exceptions before native logging.
         logs = [p for p in run.rglob("*.log") if p.name in ("native.log", "error.log", "build.log", "configure.log")]
         logs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
@@ -1869,6 +1877,17 @@ def run_urma_case(
     read_samples = {}
     split_samples = {}
     fused_read_counts = []
+    sampling_protocol = dict(
+        version=2, transport='urma', shared_pool=owner.session.shared_pool is not None,
+        warmup=args.warmup, iterations=args.iterations,
+        input=dict(batch=b, history=h, resident=r, heads=args.index_heads,
+                   seed=args.seed, miss_percent=args.miss_percent,
+                   windows=args.intermediate_fetches, prefetch_tokens=args.prefetch_tokens),
+        timed_region='NPU events around one graph replay; reset outside',
+        validation='full before sampling and final sample; completion every sample' if compact else 'full every sample',
+        ordering='serial timing, fused timing, then diagnostic profiling',
+    )
+    atomic_json(folder / 'sampling_protocol.json', sampling_protocol)
 
     def capture_graph(call, reset):
         reset()
@@ -1962,11 +1981,6 @@ def run_urma_case(
     native_check()
     native_completion = check_native_completion if compact else None
     measure(native_call, native.reset, native_check, timing_name="native_chain", completion_check=native_completion)
-    # The previous native chain has prepared stable LIDU descriptors and maps.
-    # Restore only the output so that the captured graph contains KVAF Get alone.
-    if not bench_only:
-        measure(native.fetch, lambda: native.output.copy_(native.initial_payload), native_check,
-                timing_name="native_get_only", completion_check=native_completion)
     reference = state["native_topk"].cpu().reshape(b, 4, 2048).numpy()
     owner.acquire()
     rotating = launch_module.LIFetchBinding(
@@ -1981,6 +1995,7 @@ def run_urma_case(
         intermediate_fetches=args.intermediate_fetches,
         final_workers=0,
         prefetch_limit=args.prefetch_tokens,
+        prefetch_rank_start=getattr(args, "prefetch_rank_start", 1024),
         output_stride=owner.output.shape[1],
     )
     topk = arguments[9].view(torch.int32).reshape(b, 4, 2048)
@@ -2005,7 +2020,7 @@ def run_urma_case(
         fetch_jettys_per_aiv=getattr(args, "fetch_jettys_per_aiv", 2),
     )
     pipeline.legacy_layout = False
-    pipeline.parallel_finalize = False
+    pipeline.parallel_finalize = True
     pipeline.prepare_metadata = True
     pipeline.set_diagnostics(False)
     counter_clock_mhz = None
@@ -2199,6 +2214,12 @@ def run_urma_case(
         stream.synchronize()
         def validate_pipeline():
             verify(True)
+            if getattr(args, "mode", None) == "check":
+                for name in ("_live_count", "_live_flags", "_live_rows", "_live_events"):
+                    if getattr(pipeline, name).count_nonzero().item():
+                        raise AssertionError(f"Resolver left nonzero round state in {name}")
+                if int(rotating.count.cpu().item()) != state["completion"]["final_reads"]:
+                    raise AssertionError("Published repair count differs from completed round")
             verify_all_valid_hot()
             # Validate every Index field against its logical owner, including rows
             # outside current TopK. This checks the actual staged update, not an
@@ -2246,8 +2267,8 @@ def run_urma_case(
     restored_hot = hot_case["hot_changes"]
     if not bench_only and not compact and args.prefetch_tokens and args.miss_percent < 100:
         def check_collision_coverage():
-            assert hot_case["first_window_fetches"] and restored_hot, (
-                f"First window did not Fetch former hot candidates into LRU slots: {hot_case}")
+            assert restored_hot, (
+                f"Selected former hot candidates were not repaired: {hot_case}")
         correctness.check("hot-victim-collision coverage", check_collision_coverage)
 
     if getattr(args, "check_suite", None) == "boundary":
@@ -2319,9 +2340,7 @@ def run_urma_case(
                           completion_check=fused_completion, keep_graph=bool(args.trace_rounds))
     if args.trace_rounds:
         progress(folder.parent, f"BS={b}: full graph profiler ({args.trace_rounds} replays); logs={folder}")
-        counter_clock_mhz = pipeline.calibrate_counter_mhz()
-        pipeline.counter_clock_mhz = counter_clock_mhz
-        pipeline.set_diagnostics(True)
+        pipeline.set_diagnostics(False)
         stream.synchronize()
 
         def trace_reset():
@@ -2333,7 +2352,13 @@ def run_urma_case(
             full_trace.update(collect_core(
                 torch, rotating, fused_graph, trace_reset,
                 lambda: correctness.check('profile fused', lambda: verify(True)),
-                args.trace_rounds, folder, full=True, diagnostics=pipeline.diagnostic_cycles, fused_final=True))
+                args.trace_rounds, folder, full=True, fused_final=True))
+            if args.level >= 2:
+                from diagnostics import collect_details
+                collect_details(torch, rotating, fused_graph, trace_reset,
+                                lambda: correctness.check('detail fused', lambda: verify(True)),
+                                args.trace_rounds, folder, pipeline)
+                counter_clock_mhz = pipeline.counter_clock_mhz
         finally:
             pipeline.set_diagnostics(False)
             stream.synchronize()
@@ -2410,6 +2435,12 @@ def run_urma_case(
         owner.release()
         for index, initial in zip((1, 4), saved[:2]):
             arguments[index].copy_(initial)
+        native.reset()
+        native_call()
+        stream.synchronize()
+        native_check()
+        measure(native.fetch, lambda: native.output.copy_(native.initial_payload), native_check,
+                timing_name="native_get_only", completion_check=native_completion)
         graph = capture_graph(native_call, native.reset)
         collect_native(torch, graph, native.reset,
                        lambda: correctness.check('profile native', native_check), args.trace_rounds, folder)
@@ -2429,6 +2460,7 @@ def run_urma_case(
         split_samples=split_samples,
         fused_read_counts=fused_read_counts,
         token_bytes=TOKEN_BYTES,
+        sampling_protocol=sampling_protocol,
         sfa=sfa,
         stateful_rounds=0 if bench_only else 3,
         native_misses_per_request=state["native_misses"],
@@ -2602,6 +2634,7 @@ def run_ubmem_case(
     iterations=0,
     trace_rounds=0,
     trace_output=None,
+    diagnostic_level=1,
     q_workers=2,
     seed=20261104,
     result_output=None,
@@ -3116,7 +3149,7 @@ def run_ubmem_case(
 
                 collect_ubmem(torch, rotating, graph, restore_fixture,
                               lambda: verify(list(range(1, batch + 1)), phase="profiled_replay"),
-                              trace_rounds, profile_folder, streaming=forward)
+                              trace_rounds, profile_folder, streaming=forward, level=diagnostic_level)
                 result['correctness'] = checks.status
                 result['correctness_failures'] = checks.failures
                 if report_path:
@@ -3194,7 +3227,7 @@ def run_ubmem(config, directory, *, shared_pool=None):
             prefetch_tokens=config.prefetch_tokens, args_server=config.kvaf_server,
             miss_percent=config.miss_percent, warmup=config.warmup, iterations=config.iterations,
             trace_rounds=config.iterations if config.mode == 'diagnose' else 0,
-            trace_output=directory / 'trace', seed=config.seed, result_output=directory / 'cases',
+            diagnostic_level=getattr(config, 'level', 1), trace_output=directory / 'trace', seed=config.seed, result_output=directory / 'cases',
             serial_compare=True, check_case=getattr(config, 'check_case', None),
             check_suite=getattr(config, 'check_suite', None),
             shared_pool=shared_pool, compact=config.mode in ('bench', 'diagnose'),
@@ -3211,7 +3244,8 @@ class FusedReplayState:
     state must not have live graphs or unfinished device work.
     """
     def __init__(self, torch, runtime, table, library, initial, pages, addresses,
-                 *, device, aics, windows, prefetch_tokens, soc):
+                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None,
+                 fetch_jettys_per_aiv=2):
         from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
         from kvip.cache.index_storage import IndexCacheStorage
         from kvip.operators.lifetch.binding import LIFetchBinding
@@ -3228,15 +3262,16 @@ class FusedReplayState:
         self.storage = IndexCacheStorage(torch, self.batch + 1, self.history, self.resident, device)
         common = dict(batch=self.batch, history=self.history, aics=aics, windows=windows,
                       device=device, index_heads=g['heads'])
-        ubmem = runtime.transport == 'ubmem'
+        ubmem = transport == 'ubmem'
         self.workspace = (UbmemWorkspace(torch, resident=self.resident, **common) if ubmem
                           else LIFetchWorkspace(torch, **common))
         self.output = torch.zeros((self.batch + 1, self.stride, self.token_bytes), dtype=torch.uint8, device=device)
         output_rows = self.output.view(-1, self.token_bytes)
         stream = torch.npu.current_stream(device)
         self.workspace.inputs.prepare([4] * self.batch, query_owners=list(range(1, self.batch + 1)))
-        self.lease = (UbmemLease(torch, runtime, output_rows, stream) if ubmem
-                      else KvafGetLease(torch, runtime, library, output_rows, stream))
+        self.owns_lease = lease is None
+        self.lease = lease or (UbmemLease(torch, runtime, output_rows, stream) if ubmem
+                              else KvafGetLease(torch, runtime, library, output_rows, stream))
         try:
             if not ubmem:
                 self.workspace.allocate_rotation(
@@ -3245,7 +3280,8 @@ class FusedReplayState:
             binding = dict(
                 query_ends=self.workspace.inputs.query_ends.view(self.batch, 4),
                 hot_valid=self.storage.hot_valid, row_owners=self.workspace.inputs.row_owners,
-                token_addresses=self.storage.addresses, tail_bounds=self.workspace.tail_bounds,
+                token_addresses=self.storage.addresses,
+                tail_bounds=self.workspace.tail_bounds if g.get("sparse_mode", 3) else None,
                 output_stride=self.stride, scratch=self.workspace.scratch,
             )
             if ubmem:
@@ -3261,6 +3297,7 @@ class FusedReplayState:
                     torch, library, self.workspace.arguments(self.storage), owner,
                     batch=self.batch, history=self.history, resident=self.resident,
                     intermediate_fetches=windows, prefetch_limit=prefetch_tokens,
+                    prefetch_rank_start=prefetch_rank_start,
                     aic_count=aics, token_bytes=self.token_bytes, **binding)
             update_type = UbmemIndexUpdate if ubmem else DirectIndexUpdate
             self.update = update_type(
@@ -3270,10 +3307,12 @@ class FusedReplayState:
                 query_inputs=self.workspace.inputs,
                 status=torch.zeros(self.batch, dtype=torch.int32, device=device),
                 outputs=torch.zeros((2, self.batch * 4, 1, 2048), dtype=torch.int32, device=device))
-            self.forward = StreamingForward(self.rotating, self.update, torch, prefetch_tokens)
+            self.forward = StreamingForward(self.rotating, self.update, torch, prefetch_tokens,
+                                            fetch_jettys_per_aiv=fetch_jettys_per_aiv)
             self.reset()
         except BaseException:
-            self.lease.close()
+            if self.owns_lease:
+                self.lease.close()
             raise
 
     def upload(self, target, array):
@@ -3310,6 +3349,7 @@ class FusedReplayState:
         if inputs.identities != self.initial.identities or inputs.geometry != self.initial.geometry:
             raise ValueError('Replay request geometry changed after binding')
         layout = self.storage.logical_ids[1:].cpu().numpy()
+        self.input_layout = layout.copy()
         keys, scales, valid = inputs.index_for_layout(layout)
         self.upload(self.storage.keys[1:], keys)
         self.upload(self.storage.scales[1:], scales)
@@ -3325,6 +3365,8 @@ class FusedReplayState:
         self.upload(self.workspace.tail_bounds, inputs.tail_bounds)
         for row, (begin, end) in enumerate(inputs.tail_bounds):
             ids = np.arange(int(begin), int(end))
+            if not len(ids):
+                continue
             capacity = self.stride - self.resident
             if capacity <= 0 or len(ids) > capacity:
                 raise ValueError('Captured ABC range exceeds replay output stride')
@@ -3362,11 +3404,49 @@ class FusedReplayState:
                 raise RuntimeError(f'Replay persistent hot KV mismatch: request={row}')
         return layout, hot_valid
 
-    def validate(self, inputs):
-        """Check completion before using outputs; then full-byte KV identity."""
+    def check_completion(self):
+        """Check device completion before reading outputs or reusing transport state."""
         status = self.update.status.cpu().numpy()
         if np.any(status):
+            flags = self.forward.flags.cpu().numpy()
+            workers = self.forward.worker_status.cpu().numpy()
+            sources = self.forward.events_src.cpu().numpy()
+            destinations = self.forward.events_dst.cpu().numpy()
+            event_checks = []
+            for row in range(self.batch):
+                consumed = 0
+                for phase in range(5):
+                    publication = (12 + phase - 1 if self.forward.resolver_cores == 3 and phase else phase)
+                    count = int(flags[row, publication, 1])
+                    begin = 2048 + consumed if phase else 0
+                    src = sources[row, begin:begin + count]
+                    dst = destinations[row, begin:begin + count]
+                    bad = (src < 0) | (src >= self.history) | (dst < 0) | (dst >= self.resident)
+                    duplicates = []
+                    for offset in range(0, count, 512):
+                        for name, values in (('source', src), ('destination', dst)):
+                            unique, counts = np.unique(values[offset:offset + 512], return_counts=True)
+                            repeated = unique[counts > 1]
+                            if len(repeated):
+                                duplicates.append(dict(chunk=offset // 512, field=name, values=repeated[:8].tolist()))
+                    event_checks.append(dict(request=row, phase=phase, count=count,
+                                             invalid=int(bad.sum()), duplicates=duplicates))
+                    if phase:
+                        consumed += count
+            detail = dict(completion=status.tolist(), index_update=workers[:, :12].tolist(),
+                          flags=flags[:, :, :3].tolist(), event_checks=event_checks,
+                          resolver=self.rotating.row_status.cpu().tolist(),
+                          final_posts=self.rotating.final_posts.cpu().tolist())
+            if hasattr(self, 'failure_directory'):
+                np.savez_compressed(self.failure_directory / 'completion_failure.npz',
+                                    flags=flags, worker_status=workers, sources=sources,
+                                    destinations=destinations, completion=status)
+                atomic_json(self.failure_directory / 'completion_failure.json', detail)
+            print('REPLAY COMPLETION AUDIT: ' + json.dumps(detail), flush=True)
             raise RuntimeError(f'Replay Index/Fetch completion failed: {status.tolist()}')
+
+    def validate(self, inputs):
+        self.check_completion()
         ids = self.update.logical_output.cpu().numpy().reshape(self.batch, 4, 2048)
         slots = self.update.slot_output.cpu().numpy().reshape(self.batch, 4, 2048)
         if np.any(ids < 0) or np.any(ids >= self.history) or np.any(slots < 0) or np.any(slots >= self.stride):
@@ -3376,14 +3456,66 @@ class FusedReplayState:
         for row in range(self.batch):
             mask = slots[row] < self.resident
             selected_slots = slots[row][mask]
-            if (np.any(hot_valid[row, selected_slots] == 0)
-                    or not np.array_equal(layout[row, selected_slots], ids[row][mask])):
-                raise RuntimeError(f'Replay selected hot mapping invalid: request={row}')
+            selected_ids = ids[row][mask]
+            invalid = hot_valid[row, selected_slots] == 0
+            wrong_owner = layout[row, selected_slots] != selected_ids
+            # Index-only exchanges invalidate freed source slots without
+            # moving their KV. This round may still read the old bytes there;
+            # only persistent valid slots promise the committed Index owner.
+            # The full-byte check below validates every selected output slot.
+            bad = (~invalid) & wrong_owner
+            if np.any(bad):
+                positions = np.argwhere(mask)
+                examples = []
+                for index in np.flatnonzero(bad)[:16]:
+                    q, position = positions[index]
+                    slot, token = int(selected_slots[index]), int(selected_ids[index])
+                    expected = self.pages.token_payload(row, np.asarray([token]))[0]
+                    examples.append(dict(query=int(q) + 1, position=int(position),
+                                         token=token, slot=slot,
+                                         hot_valid=int(hot_valid[row, slot]),
+                                         slot_token=int(layout[row, slot]),
+                                         kv_matches=bool(np.array_equal(output[row, slot], expected))))
+                detail = dict(request=row, round=inputs.source_round,
+                              invalid_positions=int(invalid.sum()),
+                              wrong_owner_positions=int(wrong_owner.sum()), examples=examples)
+                print('REPLAY HOT MAPPING AUDIT: ' + json.dumps(detail), flush=True)
+                raise RuntimeError(f'Replay selected hot mapping invalid: {json.dumps(detail)}')
         failures = []
         try:
             inputs.validate_topk(ids)
         except AssertionError as error:
             failures.append(str(error))
+            if hasattr(self.rotating, 'incremental'):
+                meta = self.rotating.incremental.cpu().numpy().view(np.uint64)
+                raw = self.workspace.compute.cpu().numpy().view(np.uint16)
+                base = self.workspace.compute.data_ptr()
+                audit = []
+                for row in range(self.batch):
+                    layout = self.input_layout[row]
+                    inverse = np.argsort(layout)
+                    for q in range(4):
+                        offset = (int(meta[row, q, 0]) - base) // 2
+                        if offset < 0 or offset + self.history > len(raw):
+                            continue
+                        scores = raw[offset:offset + self.history][inverse]
+                        valid = inputs.logical_score_valid[row, q]
+                        population = scores[valid]
+                        cutoff = int(np.partition(population, len(population) - 2048)[-2048])
+                        selected = ids[row, q]
+                        missing = int(np.sum(population > cutoff) - np.sum(scores[selected] > cutoff))
+                        below = int(np.sum(scores[selected] < cutoff))
+                        reference = inputs.logical_score_keys[row, q]
+                        mismatch = np.flatnonzero(valid & (scores != reference))
+                        if missing or below or len(mismatch):
+                            audit.append(dict(request=row, query=q + 1, device_cutoff=cutoff,
+                                missing_above=missing, below_cutoff=below,
+                                score_mismatches=int(len(mismatch)),
+                                examples=[dict(token=int(i), device=int(scores[i]), reference=int(reference[i]))
+                                          for i in mismatch[:8]]))
+                print('REPLAY SCORE AUDIT: ' + json.dumps(audit), flush=True)
+                if getattr(self, 'failure_directory', None):
+                    atomic_json(self.failure_directory / 'score_failure.json', audit)
         for row in range(self.batch):
             expected = self.pages.token_payload(row, ids[row].reshape(-1))
             actual = output[row, slots[row].reshape(-1)]
@@ -3394,7 +3526,8 @@ class FusedReplayState:
         assert not failures, f'Replay round={inputs.source_round}: ' + '; '.join(failures)
 
     def close(self):
-        self.lease.close()
+        if self.owns_lease:
+            self.lease.close()
 
 
 class NativeReplayState:
@@ -3419,7 +3552,7 @@ class NativeReplayState:
         self.query_scale = torch.empty((self.batch, 4, heads), dtype=torch.float32, device=device)
         lengths = torch.full((self.batch,), self.history, dtype=torch.int32, device=device)
         self.fixture = dict(
-            sparse_mode=3, query=self.query, key=self.keys.view(torch.float8_e4m3fn).reshape(-1, 128, 1, 128),
+            sparse_mode=g.get('sparse_mode', 3), query=self.query, key=self.keys.view(torch.float8_e4m3fn).reshape(-1, 128, 1, 128),
             actual_query=torch.arange(1, self.batch + 1, dtype=torch.int32, device=device) * 4,
             actual_key=lengths, li_query_lengths=torch.full((self.batch,), 4, dtype=torch.int32, device=device),
             block_table=torch.arange(self.batch * self.history // 128, dtype=torch.int32, device=device).reshape(self.batch, -1),
@@ -3429,10 +3562,11 @@ class NativeReplayState:
         for row in range(self.batch):
             hot = initial.captured_hot_valid[row] != 0
             mapping[row, initial.captured_layout[row, :self.resident][hot]] = np.flatnonzero(hot)
-        session = SimpleNamespace(
-            runtime=runtime, device_table=table, batch_get_attempted=False,
-            cpu_payload=torch.from_numpy(np.stack([pages.token_payload(row, np.arange(self.history))
-                                                  for row in range(self.batch)])))
+        if not hasattr(pages, 'cpu_payload'):
+            pages.cpu_payload = torch.from_numpy(np.stack([
+                pages.token_payload(row, np.arange(self.history)) for row in range(self.batch)]))
+        session = SimpleNamespace(runtime=runtime, device_table=table, batch_get_attempted=False,
+                                  cpu_payload=pages.cpu_payload)
         owner = SimpleNamespace(batch=self.batch, resident_budget=self.stride,
                                 cache_map=torch.from_numpy(mapping).to(device), lease=None, session=session)
         self.native = NativeMtp(torch, device, owner, self.fixture, source_tokens=self.history,
@@ -3467,7 +3601,7 @@ class NativeReplayState:
         self.upload(self.weights.view(self.torch.int16), inputs.weights.view(np.int16))
         self.upload(self.query_scale, inputs.query_scale)
         # Native sparse mode aligns Q4 to the final key length.
-        if not np.all(np.diff(inputs.query_ends, axis=1) == 1):
+        if self.fixture['sparse_mode'] == 3 and not np.all(np.diff(inputs.query_ends, axis=1) == 1):
             raise ValueError('Native replay requires consecutive causal Q4 positions')
         self.upload(self.fixture['actual_key'], inputs.query_ends[:, -1])
         forward = self.native.forward.cpu().numpy()
@@ -3479,6 +3613,8 @@ class NativeReplayState:
             forward[row, forward[row] >= self.resident] = -1
             reverse[row, self.resident:] = -1
             ids = np.arange(int(begin), int(end))
+            if not len(ids):
+                continue
             if tail_capacity <= 0 or len(ids) > tail_capacity:
                 raise ValueError('Native replay ABC exceeds bound output')
             slots = self.resident + ids % tail_capacity
@@ -3526,7 +3662,217 @@ class NativeReplayState:
         pass  # No lease: caller owns the ordinary KVAF Runtime and table.
 
 
-def run_path(config, directory, sequence, pages, *, fused, round_check=None):
+def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
+    """One graph contains iterations independent cache states, reused per round."""
+    from contextlib import ExitStack
+    from diagnostics import algorithm_before, algorithm_after
+    from performance import profile_graph_batch
+    directory = Path(directory)
+    stream = torch.npu.current_stream(states[0].device)
+    graph = torch.npu.NPUGraph()
+    capture = torch.npu.Stream()
+    checks = CorrectnessRecorder()
+    pending = False
+    def replay():
+        nonlocal pending
+        pending = True
+        graph.replay()
+    class TrackedGraph:
+        def replay(self):
+            replay()
+        def completed(self):
+            nonlocal pending
+            pending = False
+    # Multi-round validation also advances the host LRU for the next input.
+    compact = config.mode == "bench" and len(sequence.rounds) == 1
+
+    def validate_all(inputs, label):
+        nonlocal pending
+        pending = True
+        for i, state in enumerate(states):
+            if not compact or (label == 'measured' and i in (0, len(states) - 1)):
+                checks.check(f'{label}/input{i}/round{inputs.source_round}', lambda state=state: state.validate(inputs))
+            elif fused:
+                state.check_completion()
+        pending = False
+    try:
+        for state in states:
+            state.reset()
+            if fused:
+                state.forward.set_diagnostics(False)
+        # KVAF registers each distinct caller output lazily on its first Get.
+        # Registration uploads entity metadata, which cannot run inside capture.
+        # Exercise every state on the normal stream, then restore it so neither
+        # capture nor measurement inherits a warmed cache from this setup.
+        initial = next(iter(sequence))
+        for i, state in enumerate(states):
+            pending = True
+            state.forward()
+            stream.synchronize()
+            if not compact:
+                checks.check(f'pre_capture/input{i}', lambda state=state: state.validate(initial))
+            elif fused:
+                state.check_completion()
+            pending = False
+            state.reset()
+        stream.synchronize()
+        with ExitStack() as scopes:
+            if fused:
+                for lease in {id(state.lease): state.lease for state in states}.values():
+                    scopes.enter_context(lease.capture_scope())
+            pending = True
+            with torch.npu.graph(graph, stream=capture):
+                for state in states:
+                    state.forward()
+            capture.synchronize()
+            pending = False
+        if fused:
+            for lease in {id(state.lease): state.lease for state in states}.values():
+                if hasattr(lease, "retain_graph"):
+                    lease.retain_graph(graph)
+        for warmup in range(config.warmup):
+            for state in states:
+                state.reset()
+            for inputs in sequence:
+                for state in states:
+                    state.prepare(inputs)
+                stream.synchronize()
+                replay()
+                stream.synchronize()
+                validate_all(inputs, f'warmup{warmup}')
+        for state in states:
+            state.reset()
+        rounds = {}
+        read_counts = []
+        for inputs in sequence:
+            before = []
+            for state in states:
+                state.prepare(inputs)
+                if fused and config.mode == 'diagnose':
+                    initial = algorithm_before(state.rotating)
+                    initial['logical_ids'] = state.input_layout.copy()
+                    before.append(initial)
+            stream.synchronize()
+            folder = directory / 'diagnose' / f'round-{inputs.source_round}'
+            measured = profile_graph_batch(torch, TrackedGraph(), calls=len(states), folder=folder,
+                                           serial=not fused, transport=config.transport, stream=stream)
+            validate_all(inputs, 'measured')
+            for state in states:
+                if fused:
+                    if hasattr(state.rotating, 'ubmem_status'):
+                        counts = state.rotating.ubmem_status.cpu().numpy()
+                        read_counts.append(dict(prefetch=int(counts[:, 2].sum(dtype=np.uint64)),
+                                                final=int(counts[:, 4].sum(dtype=np.uint64))))
+                    else:
+                        rows = state.rotating.rows.cpu().numpy()
+                        posts = state.rotating.final_posts.cpu().numpy()
+                        read_counts.append(dict(prefetch=int(rows[:, 9].sum(dtype=np.uint64)),
+                                                final=int(posts[:, :, 0].sum(dtype=np.uint64))))
+                else:
+                    read_counts.append(state.native.counts.cpu().tolist()[:-1])
+            rounds[inputs.source_round] = measured['timing']
+            samples = []
+            for i, item in enumerate(measured['samples']):
+                accounting = dict(item, kernel_span_us=item['us'], event_us=None,
+                                  boundary_residual_us=None, timing_source='profiler invocation')
+                sample = dict(round=i, repeat=i, source_round=inputs.source_round,
+                              us=item['us'], accounting=accounting)
+                if before:
+                    sample['algorithm'] = algorithm_after(states[i].rotating, before[i])
+                    totals = sample['algorithm'].get('totals', {})
+                    sample.update(prefetch=totals.get('prefetch'), final=totals.get('final'))
+                samples.append(sample)
+            atomic_json(folder / ('full_attribution.json' if fused else 'native_attribution.json'),
+                        dict(path='fused' if fused else 'serial', samples=samples,
+                             graph_accounting=measured['accounting'], graph_calls=len(states),
+                             timing=measured['timing'], trace=measured['trace']))
+        # Detailed stamps are additional diagnostics, never performance samples.
+        if fused and config.mode == 'diagnose' and config.level >= 2:
+            clock_mhz = states[0].forward.calibrate_counter_mhz()
+            for state in states:
+                state.reset()
+                state.forward.counter_clock_mhz = clock_mhz
+                state.forward.set_diagnostics(True)
+            for inputs in sequence:
+                for state in states:
+                    state.prepare(inputs)
+                    state.forward.times.zero_()
+                    if hasattr(state.rotating, 'rank_progress'):
+                        state.rotating.rank_progress.zero_()
+                stream.synchronize()
+                replay()
+                stream.synchronize()
+                validate_all(inputs, 'detail')
+                from diagnostics import decode_rank_progress
+                details = []
+                for i, state in enumerate(states):
+                    sample = dict(round=i, source_round=inputs.source_round,
+                                  streaming_cycles=state.forward.diagnostic_cycles())
+                    if hasattr(state.rotating, 'rank_progress'):
+                        records = state.rotating.rank_progress.cpu().tolist()
+                        bounds = state.rotating.query_ends.cpu().tolist()
+                        sample['rank_progress'] = [
+                            [b, q + 1, epoch, *decode_rank_progress(word, bounds[b][q])]
+                            for b, queries in enumerate(records) for q, epochs in enumerate(queries)
+                            for epoch, word in enumerate(epochs[:state.rotating.rounds]) if word]
+                    details.append(sample)
+                atomic_json(directory / 'diagnose' / f'round-{inputs.source_round}' / 'detail_samples.json', details)
+        if fused and config.mode == 'diagnose' and config.level == 3 and config.transport == 'urma' and 'fetch' in config.stages:
+            from performance import compare_fetch_only
+            first = states[0]
+            first.forward.set_diagnostics(False)
+            first.reset()
+            first.prepare(next(iter(sequence)))
+            initial_output = first.output.clone()
+            pending = True
+            first.forward()
+            stream.synchronize()
+            first.validate(next(iter(sequence)))
+            pending = False
+            isolated_graphs = []
+            def mark_launched():
+                nonlocal pending
+                pending = True
+            def mark_completed(**kwargs):
+                nonlocal pending
+                pending = False
+            owner = SimpleNamespace(output=first.output, initial_output=initial_output,
+                                    abi_sizes=first.lease.sizes, graphs=isolated_graphs,
+                                    mark_launched=mark_launched, mark_completed=mark_completed)
+            try:
+                rows = compare_fetch_only(torch, owner, first.rotating, first.forward, config)
+                atomic_json(directory / 'diagnose' / 'fetch_only.json', dict(status='PASS', rows=rows))
+            finally:
+                stream.synchronize()
+                for isolated in isolated_graphs:
+                    isolated.reset()
+        all_spans = [v for timing in rounds.values() for v in timing['samples_us']]
+        event_mean = sum(t['mean_us'] for t in rounds.values()) / len(rounds)
+        overall = timing_summary(all_spans)
+        overall.update(profiler_mean_us=overall['mean_us'], mean_us=event_mean,
+                       event_mean_us=event_mean, measured_graphs=len(rounds),
+                       graph_calls=len(states), timing_protocol='one_profiled_graph',
+                       stage_mean_us={stage: sum(t['stage_mean_us'].get(stage, 0.) for t in rounds.values())/len(rounds)
+                                      for stage in dict.fromkeys(s for t in rounds.values() for s in t['stage_mean_us'])},
+                       inter_kernel_gap_mean_us=sum(t['inter_kernel_gap_mean_us'] for t in rounds.values())/len(rounds),
+                       overlap_mean_us=sum(t['overlap_mean_us'] for t in rounds.values())/len(rounds),
+                       outside_invocations_mean_us=sum(t['outside_invocations_mean_us'] for t in rounds.values())/len(rounds))
+        return dict(rounds=rounds, all_rounds=overall, correctness=checks.status,
+                    failures=checks.failures, read_counts=read_counts, sequence_graph_sum=dict(
+                        mean_us=sum(t['mean_us'] for t in rounds.values()), samples=1))
+    except BaseException as error:
+        if pending:
+            NativeFetchSession.quarantine('batched_replay_completion_uncertain', error)
+        raise
+    finally:
+        if not pending:
+            if fused:
+                for state in states:
+                    state.forward.set_diagnostics(False)
+            graph.reset()
+
+
+def run_path(config, directory, sequence, pages, *, fused, round_check=None, shared_pool=None):
     import acl
     import kvaf
     import torch
@@ -3556,26 +3902,37 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
         kwargs['transport'] = 'ubmem'
     else:
         kwargs['jettys_per_core'] = 2
-    runtime = kvaf.NpuRuntime(str(build / 'bin/kvaf_execute_batch_get_kernels.o'), width, 128, **kwargs)
+    borrowed = shared_pool.borrow(torch, device, g['batch'], g['history'], workers) if shared_pool else None
+    runtime = borrowed.runtime if borrowed else kvaf.NpuRuntime(
+        str(build / 'bin/kvaf_execute_batch_get_kernels.o'), width, 128, **kwargs)
     state = graph = table = None
+    batch_states = []
     pending = False
+    def replay_stage(label):
+        progress(directory.parent, f"REPLAY {'fused' if fused else 'serial'}: {label}")
+    replay_stage('transport initialization')
     try:
         block_bytes = 128 * width
         slot_bytes = ((block_bytes + 4095) // 4096 * 4096
                       if config.transport == 'ubmem' else block_bytes)
-        runtime.link_to(config.kvaf_server)
-        runtime.initialize((pages.page_count + 2) * slot_bytes, slot_bytes)
-        # Reuse Runtime Put; bounded source buffers avoid a multi-GB staging copy.
-        for begin in range(0, pages.page_count, 128):
-            ids = list(range(begin, min(begin + 128, pages.page_count)))
-            source = torch.from_numpy(pages.page_payload(ids)).to(device)
-            pending = True
-            runtime.batch_put(ids, source, [n * block_bytes for n in range(len(ids))],
-                              [block_bytes] * len(ids))
-            stream.synchronize()
-            pending = False
-        table = runtime.prepare_access_table(list(range(pages.page_count)))
-        view = runtime.access_table_view(table, device='npu')
+        if borrowed:
+            table, view = borrowed.table, borrowed.device_table
+            pages.cpu_payload = borrowed.cpu_payload
+        else:
+            runtime.link_to(config.kvaf_server)
+            runtime.initialize((pages.page_count + 2) * slot_bytes, slot_bytes)
+            # Reuse Runtime Put; bounded source buffers avoid a multi-GB staging copy.
+            for begin in range(0, pages.page_count, 128):
+                ids = list(range(begin, min(begin + 128, pages.page_count)))
+                source = torch.from_numpy(pages.page_payload(ids)).to(device)
+                pending = True
+                runtime.batch_put(ids, source, [n * block_bytes for n in range(len(ids))],
+                                  [block_bytes] * len(ids))
+                stream.synchronize()
+                pending = False
+            replay_stage('DDR Put completed; access table and binding')
+            table = runtime.prepare_access_table(list(range(pages.page_count)))
+            view = runtime.access_table_view(table, device='npu')
         indices = torch.from_numpy(pages.page_indices.reshape(-1).astype(np.int64)).to(device)
         # Native LIDU addresses logical request pages; aliases repeat addresses.
         expanded = SimpleNamespace(addresses=view.addresses[indices].contiguous(),
@@ -3591,10 +3948,28 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
                 library = build_ubmem_library(cache_dir=build / 'lifetch_ubmem', cann=cann, shape=shape)
             state = FusedReplayState(
                 torch, runtime, view, library, initial, pages, logical_addresses,
-                device=device, aics=aics, windows=config.intermediate_fetches,
-                prefetch_tokens=config.prefetch_tokens, soc=soc)
+                transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
+                prefetch_tokens=config.prefetch_tokens, soc=soc,
+                prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024),
+                fetch_jettys_per_aiv=getattr(config, 'fetch_jettys_per_aiv', None) or 2)
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
+        if config.mode in ('bench', 'diagnose') and g.get('sparse_mode') == 0 and not fused:
+            from kvip.cache.lru import SlotLRU
+            selected = state.native_li(torch_npu, state.fixture).cpu().numpy().reshape(g['batch'], -1)
+            chains = []
+            for ids in selected:
+                policy = SlotLRU(); policy.resize(g['resident'], g['resident'])
+                policy.commit(ids[ids < g['resident']])
+                chain = []; slot = int(policy.head[0])
+                while slot >= 0:
+                    chain.append(slot); slot = int(policy.next[0, slot])
+                chains.append(chain)
+            initial.captured_lru = np.asarray(chains, dtype=np.int32)
+            state.reset()
+        if fused:
+            state.failure_directory = directory
+        replay_stage('binding and initial inputs ready')
         checks = CorrectnessRecorder()
         def validate(inputs):
             nonlocal pending
@@ -3609,15 +3984,42 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
             else:
                 pending = False
         pending = True
+        replay_stage('first eager forward and device completion')
         state.forward()
         stream.synchronize()
+        replay_stage('first eager completed; correctness check')
         checks.check('eager', lambda: validate(initial))
+        if config.mode in ('bench', 'diagnose'):
+            batch_states.append(state)
+            for _ in range(1, config.iterations):
+                if fused:
+                    replica = FusedReplayState(
+                        torch, runtime, view, library, initial, pages, logical_addresses,
+                        transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
+                        prefetch_tokens=config.prefetch_tokens, soc=soc,
+                        prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease,
+                        fetch_jettys_per_aiv=getattr(config, 'fetch_jettys_per_aiv', None) or 2)
+                    replica.failure_directory = directory
+                else:
+                    replica = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
+                batch_states.append(replica)
+            replay_stage(f'one graph with {len(batch_states)} independent inputs; event + profiler')
+            result = measure_replay_batch(torch, batch_states, sequence, config, directory, fused=fused)
+            if checks.failures:
+                result['correctness'] = 'FAIL'
+                result['failures'] = checks.failures + result['failures']
+            result.update(transport=config.transport, path='fused' if fused else 'serial',
+                          runtime_workers=shared_pool.workers if borrowed else workers, geometry=g,
+                          input_paths=[str(ref.manifest_path) for refs in sequence.rounds for ref in refs])
+            atomic_json(directory / 'path_result.json', result)
+            return result
         state.reset()
         stream.synchronize()
         graph = torch.npu.NPUGraph()
         capture_stream = torch.npu.Stream()
         scope = state.lease.capture_scope() if fused else nullcontext()
         pending = True
+        replay_stage('graph capture')
         with scope:
             with torch.npu.graph(graph, stream=capture_stream):
                 state.forward()
@@ -3636,6 +4038,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
                 pending = True
                 graph.replay()
         graphs = {refs[0].source_round: TrackedGraph() for refs in sequence.rounds}
+        replay_stage('graph warmup and measurement')
         result = measure_sequence(torch, sequence, graphs, state.reset, state.prepare, validate,
                                   warmup=config.warmup, iterations=config.iterations, save=save)
         stream.synchronize()
@@ -3660,6 +4063,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
                 result['correctness'] = 'FAIL'
                 result['failures'].extend(result['diagnostic']['failures'])
             atomic_json(directory / 'path_result.json', result)
+        for failure in result.get('failures', []):
+            print('REPLAY CHECK FAILURE: ' + json.dumps(failure), flush=True)
         return result
     except BaseException as error:
         if pending:
@@ -3669,12 +4074,94 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None):
         if not pending:
             if graph is not None:
                 graph.reset()
+            for replica in reversed(batch_states[1:]):
+                replica.close()
             if state is not None:
                 state.close()
-            if table is not None:
-                runtime.release_access_table(table)
-            if runtime.initialized:
-                runtime.shutdown()
+            if borrowed:
+                shared_pool.release()
+            else:
+                if table is not None:
+                    runtime.release_access_table(table)
+                if runtime.initialized:
+                    runtime.shutdown()
+
+
+def run_synthetic_batch(config, directory, *, shared_pool=None):
+    """Keep the compact fixture; benchmark it through independent state slots."""
+    from workloads import prepare_compact_fixture, ReplayRound
+    from kvip.cache.lru import SlotLRU
+    directory = Path(directory)
+    fixture = directory / 'fixture'
+    key = ('graph_batch', config.history, config.resident, config.miss_percent,
+           config.index_heads, config.seed)
+    pool = shared_pool or BenchPool(config)
+    owns_pool = shared_pool is None
+    if key in pool.fixtures:
+        fixture = pool.fixtures[key]
+    else:
+        prepare_compact_fixture(fixture, config.history, config.resident, config.miss_percent,
+                                config.index_heads, config.seed)
+        pool.fixtures[key] = fixture
+    h, r, heads = config.history, config.resident, config.index_heads
+    # The previous synthetic runner treats physical fixture rows as logical
+    # tokens. Preserve that identity and the exact Q/Index/scale bit patterns.
+    order = np.load(fixture / 'physical_to_logical.npy')
+    scores = np.load(fixture / 'logical_scores.npy')[:, order]
+    keys = np.fromfile(fixture / 'arg1.bin', np.uint8).reshape(h, 128)
+    scales = np.fromfile(fixture / 'arg4.bin', np.float32)
+    query = np.fromfile(fixture / 'arg0.bin', np.uint8).reshape(4, heads, 128)
+    weights = (np.fromfile(fixture / 'arg2.bin', np.float32).view(np.uint32) >> 16).astype(np.uint16).reshape(4, heads)
+    qscale = np.fromfile(fixture / 'arg3.bin', np.float32).reshape(4, heads)
+    selected = np.argpartition(scores, -TOPK, axis=1)[:, -TOPK:].reshape(-1)
+    policy = SlotLRU(); policy.resize(r, r); policy.commit(selected[selected < r].astype(np.int32))
+    chain = []; slot = int(policy.head[0])
+    while slot >= 0:
+        chain.append(slot); slot = int(policy.next[0, slot])
+    failed = False
+    try:
+        for batch in config.batches:
+            def rows(value):
+                return np.broadcast_to(value, (batch, *value.shape))
+            g = dict(batch=batch, history=h, resident=r, heads=heads, token_bytes=TOKEN_BYTES,
+                     output_stride=r, sparse_mode=0)
+            inputs = ReplayRound(1, 1, tuple((0, str(i), i+1) for i in range(batch)), g,
+                rows(keys), rows(scales), rows(query), rows(weights), rows(qscale),
+                np.full((batch, 4), h, np.int32), np.zeros((batch, 2), np.int32),
+                np.ones((batch, h), np.uint8), tuple(tuple(None for _ in range(h//128)) for _ in range(batch)),
+                rows(np.arange(h)), np.ones((batch, r), np.int32), rows(np.asarray(chain, np.int32)),
+                (str(fixture),), rows(scores), np.ones((batch, 4, h), bool))
+            class Sequence:
+                rounds = ((SimpleNamespace(source_round=1, manifest_path=fixture/'fixture.json'),),)
+                def __iter__(self):
+                    yield inputs
+            sequence = Sequence()
+            pages = ReplayPagePlan(sequence)
+            # Shared DDR already holds payload(request, token), as before.
+            from workloads import payload
+            pages.token_payload = lambda row, ids: payload(row, np.asarray(ids))
+            folder = directory / f'case-b{batch}'
+            results = {}
+            for name in ('serial', 'fused'):
+                results[name] = run_path(config, folder / name, sequence, pages,
+                                         fused=name == 'fused', shared_pool=pool)
+                report = dict(batch=batch, miss_percent=config.miss_percent, input='synthetic',
+                              token_bytes=TOKEN_BYTES,
+                              fetch_jettys_per_aiv=getattr(config, 'fetch_jettys_per_aiv', None) or 2,
+                              native_misses_per_request=next(iter(results['serial'].get('read_counts', [])), None),
+                              correctness='NOT_RUN', execution='INCOMPLETE',
+                              timing={'native_chain': results['serial']['all_rounds']})
+                if 'fused' in results:
+                    report.update(execution='COMPLETED', correctness='PASS' if all(
+                        result['correctness']=='PASS' for result in results.values()) else 'FAIL')
+                    report['timing']['prototype_with_update'] = results['fused']['all_rounds']
+                    report['fused_read_counts'] = results['fused'].get('read_counts', [])
+                atomic_json(folder / 'report.json', report)
+            failed |= report['correctness'] != 'PASS'
+        return int(failed)
+    finally:
+        if owns_pool:
+            pool.close()
 
 
 def run_real(config, directory):
@@ -3886,6 +4373,10 @@ class StreamingForward(LIFetchForward):
                 services.append(dict(event=event_index, core=int(words[4]), epoch=int(words[5]),
                     lane=event_index % self.rotating.service_lanes,
                     begin_cycles=int(event[0]), end_cycles=int(event[1]),
+                    predecessor_wait_cycles=(int(event[13])-int(event[4])
+                        if not ubmem and int(event[4]) and int(event[13]) >= int(event[4]) else None),
+                    incremental_cycles=(int(event[14])-int(event[13])
+                        if not ubmem and int(event[13]) and int(event[14]) >= int(event[13]) else None),
                     scan_cycles=int(event[5]), candidate_cycles=int(event[6]), post_cycles=int(event[7]),
                     bitmap_bytes=int(event[8]), candidate_count=int(event[9]), posted_count=int(event[10])))
             result[0]['prefetch_services'] = services

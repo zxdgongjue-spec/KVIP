@@ -88,3 +88,22 @@ def test_invalid_cross_core_order_cannot_produce_global_bandwidth(tmp_path, monk
     result = summarize(tmp_path, config)
     assert result['trace'] == 'INCOMPLETE'
     assert 'final_get_bandwidth' not in result['captures'][0]['samples'][0]
+
+
+def test_detail_transfer_counts_remain_separate_from_measured_replay(tmp_path, monkeypatch):
+    monkeypatch.setattr('diagnostics.decode_timeline', lambda raw: dict(
+        cores=[], last_block=0, observed_span_us=99, clock_mhz=10))
+    raw, details = capture()
+    details[0]['core_timeline_raw'] = raw
+    details[0]['prefetch_scope'] = dict(bytes=656, first_doorbell=50,
+        last_cq_observed=150, interval_cycles=100)
+    atomic_json(tmp_path / 'full_attribution.json', dict(samples=[dict(
+        round=0, prefetch=2, final=11, algorithm=dict(totals={}, requests=[]),
+        accounting=dict(stages_us=dict(resolve_update=100)))]))
+    atomic_json(tmp_path / 'detail_samples.json', [dict(round=0, streaming_cycles=details)])
+    result = summarize(tmp_path, SimpleNamespace(iterations=1, level=2, stages=('fetch',), transport='urma'))
+    assert result['trace'] == 'COMPLETE'
+    sample = result['captures'][0]['samples'][0]
+    assert sample['prefetch'] == 2 and sample['final'] == 11
+    assert sample['prefetch_bandwidth']['bytes'] == 656
+    assert sample['final_get_bandwidth']['entries'] == 9

@@ -147,17 +147,17 @@ def test_synthetic_urma_worker_reuses_the_performance_pool(tmp_path, monkeypatch
     monkeypatch.setitem(sys.modules, 'kvaf', SimpleNamespace(__file__=str(build / 'python/kvaf/__init__.py')))
     workers = []
 
-    def run_worker(options, directory):
-        pool = options.shared_pool
+    def run_worker(options, directory, *, shared_pool):
+        pool = shared_pool
         assert isinstance(pool, execution.BenchPool)
         pool.workers = 40
         pool.borrows += 1
-        assert options.batches == '16'
-        assert options.trace_rounds == (2 if mode == 'diagnose' else 0)
+        assert options.batches == [16]
+        assert options.iterations == 2 and options.mode == mode
         workers.append((pool, options.miss_percent))
         return 0
 
-    monkeypatch.setattr(execution, 'run_worker', run_worker)
+    monkeypatch.setattr(execution, 'run_synthetic_batch', run_worker)
     miss = '5,12.5' if mode == 'bench' else '12.5'
     config = configuration([mode, '--transport', 'urma', '--kvaf-root', str(tmp_path),
                             '--batches', '16', '--miss-percent', miss, '--iterations', '2'])

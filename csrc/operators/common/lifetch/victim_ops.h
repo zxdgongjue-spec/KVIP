@@ -11,6 +11,20 @@ inline void GatherVictimScores(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* output,
     }
 }
 
+// Resident TopK scores can be reused from UB when the caller has kept them.
+// A zero resident count and out-of-range victims use the original GM lookup.
+__simt_vf__ __aicore__ LAUNCH_BOUND(256)
+inline void GatherVictimScoresUb(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* output,
+    const __ubuf__ uint16_t* local,const __gm__ uint32_t* scores,uint32_t resident) {
+    auto input=const_cast<__gm__ uint32_t*>(scores);
+    for(uint32_t i=threadIdx.x;i<1024;i+=256) {
+        uint32_t a=ids[2*i],b=ids[2*i+1];
+        uint32_t low=a<resident ? local[a] : ((asc_ldcg(input+a/2)>>((a%2)*16))&0xffffU);
+        uint32_t high=b<resident ? local[b] : ((asc_ldcg(input+b/2)>>((b%2)*16))&0xffffU);
+        output[i]=low|(high<<16);
+    }
+}
+
 // Shared LIFetch victim handling.
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void RestoreVictimTokens(__ubuf__ uint32_t* ids,__gm__ uint32_t* victims,uint32_t count) {

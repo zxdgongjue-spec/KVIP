@@ -8,6 +8,9 @@ ROOT = Path(__file__).resolve().parents[4]
 
 def test_classifier_partial_metadata_chunks_and_full_capacity(tmp_path):
     header = ROOT / "csrc/operators/lightning_indexer_with_fetch/op_kernel/staged_topk_classify.h"
+    prefetch = (header.parent / 'prefetch.h').read_text()
+    tail_slot = prefetch[prefetch.index('__simt_callee__ inline uint32_t DirectTailSlot(uint32_t'):
+                         prefetch.index('__simt_callee__ inline uint32_t DirectTailSlot(__gm__')]
     code = (
         r"""
 #include <cstdint>
@@ -15,6 +18,7 @@ def test_classifier_partial_metadata_chunks_and_full_capacity(tmp_path):
 #include <cassert>
 #include <algorithm>
 #define __simt_vf__
+#define __simt_callee__
 #define __aicore__
 #define __ubuf__
 #define __gm__
@@ -26,11 +30,13 @@ template<class T> T asc_ldcg(T* p){return *p;}
 namespace rotating {
 constexpr uint32_t kTop=2048,kLruSlots=2048;
 struct Context { uint64_t mapping,lruSlots; };
+uint32_t OutputStride(uint32_t resident,Context*){return resident+256;}
 uint32_t ResolvePhysicalSlot(uint32_t resident,uint32_t* lru,uint32_t slot){
  return uint32_t(slot-resident)<kLruSlots?lru[slot-resident]:slot;
 }
 }
 """
+        + 'namespace rotating {\n' + tail_slot + '}\n'
         + f'#include "{header}"\n'
         + r"""
 int main(){using namespace rotating;
@@ -60,6 +66,7 @@ int main(){using namespace rotating;
    uint32_t t=indices[i],want=UINT32_MAX;
    if(t!=UINT32_MAX){
     if(t<resident && !(t>=tailBegin&&t<tailEnd) && valid[t] && reserved[t]<0)want=t;
+    else if(t>=tailBegin && t<tailEnd)want=resident+t%256;
     else want=ResolvePhysicalSlot(resident,lru.data(),map[t]);
    }
    assert(loc[i]==want);

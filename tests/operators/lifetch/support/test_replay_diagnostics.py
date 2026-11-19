@@ -70,7 +70,7 @@ def test_profile_sequence_resets_only_at_sequence_boundaries(tmp_path, monkeypat
         return dict(totals=dict(prefetch=old, final=1), requests=[])
     monkeypatch.setattr('diagnostics.algorithm_after', algorithm_after)
     monkeypatch.setattr('diagnostics.account', lambda *args, **kwargs: dict(stages_us=dict(li=2)))
-    config = SimpleNamespace(warmup=1, iterations=2, transport='urma')
+    config = SimpleNamespace(warmup=1, iterations=2, transport='urma', level=1)
     result = collect_replay(torch, state, SimpleNamespace(replay=replay), Sequence(), validate, config, tmp_path)
     assert log.count('reset') == 3  # One warmup sequence, two profiled sequences.
     assert [item for item in log if isinstance(item, tuple) and item[0] == 'prepare'] == [

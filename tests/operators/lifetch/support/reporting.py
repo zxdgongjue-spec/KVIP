@@ -63,7 +63,7 @@ def comparison_row(case_id, serial, fused, correctness, execution='COMPLETED'):
     row = dict(case=case_id, execution=execution, correctness=correctness,
                timing='COMPLETE' if serial and fused else 'INCOMPLETE')
     for name, timing in [('serial', serial), ('fused', fused)]:
-        for metric in ('mean_us', 'p50_us', 'p99_us', 'samples'):
+        for metric in ('mean_us', 'profiler_mean_us', 'p50_us', 'p99_us', 'samples', 'timing_protocol', 'stage_mean_us', 'inter_kernel_gap_mean_us', 'overlap_mean_us', 'outside_invocations_mean_us'):
             row[f'{name}_{metric}'] = timing.get(metric) if timing else None
     if serial and fused:
         row['reduction'] = 1 - fused['mean_us'] / serial['mean_us']
@@ -86,8 +86,13 @@ def save_summary(directory, rows):
         writer.writeheader()
         writer.writerows(rows)
     temporary.replace(directory / 'results.csv')
+    batched = any(row.get('serial_timing_protocol') == 'one_profiled_graph' for row in rows)
     headers = ['#', 'Transport', 'BS', 'Miss%', 'Execution', 'Check',
                'Serial mean', 'Fused mean', 'Gain', 'Serial p50/p99', 'Fused p50/p99']
+    if batched:
+        headers[6:8] = ['Serial event mean', 'Fused event mean']
+        headers += ['Serial prof mean', 'Fused prof mean']
+        headers[9:11] = ['Serial prof p50/p99', 'Fused prof p50/p99']
     cells = []
     for index, row in enumerate(rows, 1):
         def number(key):
@@ -102,6 +107,8 @@ def save_summary(directory, rows):
                       number('serial_mean_us'), number('fused_mean_us'),
                       '—' if reduction is None else f'{reduction:+.2%}',
                       percentiles('serial'), percentiles('fused')])
+        if batched:
+            cells[-1] += [number('serial_profiler_mean_us'), number('fused_profiler_mean_us')]
     widths = [max(len(line[col]) for line in [headers, *cells]) for col in range(len(headers))]
     def formatted(line):
         return ' | '.join(value.ljust(width) if col in (1, 4, 5) else value.rjust(width)
@@ -111,6 +118,27 @@ def save_summary(directory, rows):
              formatted(headers), separator, *(formatted(line) for line in cells), separator,
              f"Completed: {sum(row['execution'] == 'COMPLETED' for row in rows)}/{len(rows)}; "
              f"correctness PASS: {sum(row['correctness'] == 'PASS' for row in rows)}/{len(rows)}"]
+    if batched:
+        stage_rows = []
+        for index, row in enumerate(rows, 1):
+            for path in ('serial', 'fused'):
+                for stage, value in (row.get(f'{path}_stage_mean_us') or {}).items():
+                    stage_rows.append([str(index), path, stage, f'{value:.2f}'])
+                value = row.get(f'{path}_inter_kernel_gap_mean_us')
+                if value is not None:
+                    stage_rows.append([str(index), path, 'within-call gaps', f'{value:.2f}'])
+                value = row.get(f'{path}_overlap_mean_us')
+                if value:
+                    stage_rows.append([str(index), path, 'subtract overlap', f'{-value:.2f}'])
+                value = row.get(f'{path}_outside_invocations_mean_us')
+                if value is not None:
+                    stage_rows.append([str(index), path, 'between calls + event edges', f'{value:.2f}'])
+        stage_headers = ['#', 'Path', 'Same-graph stage', 'Mean us/call']
+        stage_widths = [max(len(r[i]) for r in [stage_headers, *stage_rows]) for i in range(4)]
+        lines += ['', 'Profiler stages from the same measured graph; per-call spans include internal gaps.',
+                  ' | '.join(v.ljust(w) for v, w in zip(stage_headers, stage_widths)),
+                  '-+-'.join('-'*w for w in stage_widths)]
+        lines += [' | '.join(v.ljust(w) for v, w in zip(r, stage_widths)) for r in stage_rows]
     for index, row in enumerate(rows, 1):
         if row.get('mode') == 'check' or row['execution'] != 'COMPLETED' or row['correctness'] != 'PASS':
             lines.append(f"[{index}] {row['case']}" + (f": {row['reason']}" if row.get('reason') else ''))
@@ -163,6 +191,10 @@ def add_profile_metrics(rows, diagnostic):
                      fused=Path(row.get('fused_attribution', folder / 'full_attribution.json')))
         for path, source in paths.items():
             samples = captures.get(source.resolve())
+            if samples is None:
+                root = (folder / path / 'diagnose').resolve()
+                samples = [sample for capture, records in captures.items()
+                           if capture.is_relative_to(root) for sample in records]
             if not samples:
                 continue
             times = defaultdict(list)

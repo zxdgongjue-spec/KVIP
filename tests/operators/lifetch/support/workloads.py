@@ -132,11 +132,13 @@ def configuration(argv=None):
             command.add_argument('--group', type=int)
             command.add_argument('--round-range', type=round_range)
             command.add_argument('--prefetch-tokens', type=int, default=512)
+            command.add_argument('--prefetch-rank-start', type=int, default=1024,
+                                 help='URMA initial admission rank (1..2048); progresses to 2048 by per-Q coverage')
             command.add_argument('--intermediate-fetches', type=int, default=8)
             command.add_argument('--fetch-jettys-per-aiv', type=int, choices=(1, 2),
                                  help='Jettys per fused final Fetch AIV for synthetic URMA (default: 2)')
-            command.add_argument('--warmup', type=int, default=4)
-            command.add_argument('--iterations', type=int, default=20)
+            command.add_argument('--warmup', type=int, default=4, help='whole-graph warmup repetitions')
+            command.add_argument('--iterations', type=int, default=20, help='independent complete invocations captured in one measured graph')
         if mode == 'diagnose':
             command.add_argument('--level', type=int, choices=(1, 2, 3), default=1)
             command.add_argument('--stages', type=csv_values, default=('all',))
@@ -186,6 +188,10 @@ def configuration(argv=None):
                     or args.history <= args.resident + 4 or args.index_heads not in (32, 64)
                     or args.seed < 0):
                 parser.error('invalid synthetic geometry or seed')
+        if not 1 <= args.prefetch_rank_start <= 2048:
+            parser.error('prefetch-rank-start must be in 1..2048')
+        if args.transport != 'urma' and args.prefetch_rank_start != 1024:
+            parser.error('prefetch-rank-start requires the URMA ranked prefetch path')
         if (args.warmup < 0 or args.iterations <= 0 or not 1 <= args.intermediate_fetches <= 32
                 or not 0 <= args.prefetch_tokens <= 2048
                 or args.prefetch_tokens % args.intermediate_fetches):
@@ -781,7 +787,15 @@ class ReplayRound:
                 population = scores[valid]
                 cutoff = np.partition(population, len(population) - 2048)[-2048]
                 if np.min(scores[ids]) != cutoff or np.sum(scores[ids] > cutoff) != np.sum(population > cutoff):
-                    raise AssertionError(f'Replay TopK ranking differs: request={row} Q={query + 1}')
+                    chosen = np.zeros(len(scores), dtype=bool)
+                    chosen[ids] = True
+                    missing = np.flatnonzero(valid & ~chosen & (scores > cutoff))
+                    below = ids[scores[ids] < cutoff]
+                    detail = dict(cutoff=int(cutoff), selected_min=int(np.min(scores[ids])),
+                                  missing_above=int(len(missing)), below_cutoff=int(len(below)),
+                                  missing=[(int(i), int(scores[i])) for i in missing[:8]],
+                                  below=[(int(i), int(scores[i])) for i in below[:8]])
+                    raise AssertionError(f'Replay TopK ranking differs: request={row} Q={query + 1}; {detail}')
 
     def index_for_layout(self, layout):
         """Map real LI input to a path's current layout without resetting residency."""

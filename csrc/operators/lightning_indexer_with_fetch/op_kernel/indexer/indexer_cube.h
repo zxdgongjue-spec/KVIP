@@ -135,12 +135,8 @@ __aicore__ inline void QLIMatmul<QLIT>::InitBuffers(TPipe *pipe)
 
     pipe->InitBuffer(bufQL0_, L0_BUF_NUM * M_BASIC_BLOCK_L0 * D_BASIC_BLOCK_L0 * sizeof(Q_T));
     queryL0_ = bufQL0_.Get<Q_T>();
-#if KVIP_LI_SCALE_TILES
-    // Cover both slots: the second slot starts at L0AB_BUFFER_OFFSET.
+    // LoadKeyToL0b always uses L0AB_BUFFER_OFFSET, independently of scale tiling.
     pipe->InitBuffer(bufKeyL0_, L0_BUF_NUM * L0AB_BUFFER_OFFSET * sizeof(K_T));
-#else
-    pipe->InitBuffer(bufKeyL0_, L0_BUF_NUM * D_BASIC_BLOCK_L0 * S2_BASIC_BLOCK_L0 * sizeof(K_T));
-#endif
     keyL0_ = bufKeyL0_.Get<K_T>();
 
     pipe->InitBuffer(bufL0C_, L0_BUF_NUM * M_BASIC_BLOCK_L0 * S2_BASIC_BLOCK_L0 * sizeof(float));
@@ -185,7 +181,11 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
                                                         s1gProcessSize - s1gGmOffset :
                                                         constInfo_.mBaseSize;
                 uint64_t s1gL1SizeAlign2G = CeilAlign(s1gL1RealSize, 2 * constInfo_.gSize);
+#if !V9_UBMEM
+                if (runInfo.LoadQuery() && s2GmOffset == 0) {
+#else
                 if (runInfo.isFirstS2InnerLoop && s2GmOffset == 0) {
+#endif
                     queryL1Mte2BufIdx_++;
                     queryL1Mte1BufIdx_ = queryL1Mte2BufIdx_;
                     WaitFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT + queryL1Mte2BufIdx_ % QUERY_BUF_NUM);
@@ -221,7 +221,11 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
                         l0BufIdx_++;
                     }
                 }
+#if !V9_UBMEM
+                if (s2GmOffset + s2BasicBlock_ >= s2ProcessSize && runInfo.ReleaseQuery()) {
+#else
                 if (s2GmOffset + s2BasicBlock_ >= s2ProcessSize && runInfo.isLastS2InnerLoop) {
+#endif
                     SetFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT + queryL1Mte1BufIdx_ % QUERY_BUF_NUM);
                 }
             }
@@ -264,7 +268,11 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
                                            s1gProcessSize - s1gGmOffset :
                                            constInfo_.mBaseSize;
                 uint64_t s1gL1SizeAlign2G = CeilAlign(s1gL1RealSize, 2 * constInfo_.gSize);
+#if !V9_UBMEM
+                if (runInfo.LoadQuery() && s2GmOffset == 0) {
+#else
                 if (runInfo.isFirstS2InnerLoop && s2GmOffset == 0) {
+#endif
                     queryL1Mte2BufIdx_++;
                     queryL1Mte1BufIdx_ = queryL1Mte2BufIdx_;
                     WaitFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT + queryL1Mte2BufIdx_ % QUERY_BUF_NUM);
@@ -304,7 +312,11 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
                         l0BufIdx_++;
                     }
                 }
+#if !V9_UBMEM
+                if (s2GmOffset + s2BasicBlock_ >= s2ProcessSize && runInfo.ReleaseQuery()) {
+#else
                 if (s2GmOffset + s2BasicBlock_ >= s2ProcessSize && runInfo.isLastS2InnerLoop) {
+#endif
                     SetFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT + queryL1Mte1BufIdx_ % QUERY_BUF_NUM);
                 }
             }

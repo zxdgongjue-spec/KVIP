@@ -10,9 +10,9 @@ class LIFetchForward(StreamingLIFetchForward):
             rotating, update, rotating.torch, rotating.prefetch_limit, fused_final=True, q_workers=q_workers,
             fetch_jettys_per_aiv=fetch_jettys_per_aiv,
         )
-        # Prepare address/logical metadata as each Q arrives. Finalize ordering
-        # remains the measured baseline; transport-specific resources stay leased.
+        # Prepare metadata as each Q arrives and publish final residency on its
+        # Fetch workers. Transport-specific resources stay leased.
         self.prepare_metadata = True
         self.ubmem_overlap_fetch = hasattr(rotating, "lease")
-        self.parallel_finalize = self.ubmem_overlap_fetch
+        self.parallel_finalize = True
         self.set_options()

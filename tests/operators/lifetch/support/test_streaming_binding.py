@@ -21,11 +21,40 @@ class Tensor:
     def numel(self):
         return self.values.size
 
+    def element_size(self):
+        return self.values.itemsize
+
+    @property
+    def shape(self):
+        return self.values.shape
+
+    @property
+    def dtype(self):
+        return self.values.dtype
+
+    def clone(self):
+        return Tensor(self.values.copy())
+
+    def view(self, *shape):
+        if len(shape) == 1 and not isinstance(shape[0], int):
+            return Tensor(self.values.view(shape[0]))
+        return Tensor(self.values.reshape(*shape))
+
+    def fill_(self, value):
+        self.values.fill(value)
+        return self
+
+    def zero_(self):
+        return self.fill_(0)
+
     def to(self, device):
         return self
 
     def __getitem__(self, key):
         return Tensor(self.values[key])
+
+    def __setitem__(self, key, value):
+        self.values[key] = value
 
     def copy_(self, other):
         self.values[...] = other.values
@@ -34,6 +63,7 @@ class Tensor:
 def binding_fixture(transport="urma", batch=1, history=131072, resident=16384, heads=32):
     stream = SimpleNamespace(npu_stream=303)
     torch = SimpleNamespace(
+        uint8=np.uint8,
         int32=np.int32,
         int64=np.int64,
         uint64=np.uint64,
@@ -52,6 +82,10 @@ def binding_fixture(transport="urma", batch=1, history=131072, resident=16384, h
             batch=batch, history=history, resident=resident, indexHeads=heads, aicCount=32, finalWorkers=4
         ),
         context=Tensor(np.zeros(320, dtype=np.uint8)),
+        rows=Tensor(np.zeros((batch, 128), dtype=np.uint64)),
+        events=Tensor(np.zeros((32, 16), dtype=np.uint64)),
+        mapping=Tensor(np.full((batch, history), -1, dtype=np.int32)),
+        mapping_journal=Tensor(np.zeros((batch, 8192 + 32), dtype=np.uint32)),
         hot_valid=Tensor(np.zeros(32, dtype=np.int32)),
         arguments=[Tensor(np.zeros(32, dtype=np.uint8)) for _ in range(15)],
         library=SimpleNamespace(
@@ -79,7 +113,7 @@ def test_public_forward_only_launches_retained_workspace(transport):
     for _ in range(2):
         forward()
         args = rotating.library.kvip_lifetch_streaming_forward.call_args.args
-        assert args[:4] == (rotating.bindings.data_ptr(), update.bindings.data_ptr(), pointer, 303)
+        assert args[:4] == (forward.bindings.data_ptr(), update.bindings.data_ptr(), pointer, 303)
         assert args[5] == 2
         assert ctypes.cast(args[4], ctypes.POINTER(RuntimeShape)).contents.batch == 1
     assert allocations == (rotating.torch.zeros.call_count, rotating.torch.empty.call_count)
@@ -120,7 +154,11 @@ def test_single_jetty_workspace_survives_diagnostic_updates():
     forward = LIFetchForward(rotating, update, fetch_jettys_per_aiv=1)
     for diagnostics in (False, True, False):
         forward.set_options(diagnostics=diagnostics)
-        assert np.frombuffer(forward.workspace.values, dtype="<u4", count=1, offset=144)[0] == 1
+        assert np.frombuffer(forward.workspace.values, dtype="<u4", count=1, offset=192)[0] == 1
+        snapshots = np.frombuffer(forward.workspace.values, dtype="<u8", count=6, offset=144)
+        assert snapshots.tolist() == [forward.flags.data_ptr(), forward._live_count.data_ptr(),
+                                     rotating.rows.data_ptr(), rotating.events.data_ptr(),
+                                     rotating.mapping.data_ptr(), rotating.mapping_journal.data_ptr()]
         forward()
         assert rotating.library.kvip_lifetch_streaming_forward.call_args.args[5] == 2
 

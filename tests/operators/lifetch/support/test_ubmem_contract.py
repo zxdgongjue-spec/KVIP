@@ -142,8 +142,9 @@ def test_shared_workspace_keeps_ubmem_transport_specific_status():
         original = urma_spec(batch, 131072, 16384, final_aivs(batch, "auto", 32),
                              geometry["intermediate_fetches"], geometry["service_aivs_per_window"], 1216)
         ubmem = rotation_spec(batch, 131072, 16384, 32, 8)
-        assert set(original) - {"final_status"} == set(ubmem) - {"ubmem_status"}
-        assert all(ubmem[name] == spec for name, spec in original.items() if name != "final_status")
+        urma_only = {"final_status", "mapping_journal", "window_topk_storage"}
+        assert set(original) - urma_only == set(ubmem) - {"ubmem_status"}
+        assert all(ubmem[name] == spec for name, spec in original.items() if name not in urma_only)
         assert ubmem["ubmem_status"] == ((batch, 16), "int64")
 
 def test_ubmem_supports_sixteen_requests_and_many_windows():

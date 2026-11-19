@@ -2,12 +2,16 @@
 // Publish each Q directly in the descriptor layout consumed by KVAF.
 #pragma once
 namespace rotating {
+// The existing 64-word group control area is reset by round initialization.
+constexpr uint32_t kGroupSafeCountWord=0, kGroupConflictCountWord=8;
+constexpr uint32_t kGroupReadyWord=16, kGroupErrorWord=17;
+template<uint32_t Threads=512>
 __simt_callee__
 inline void PackStagedUrmaQuery(uint32_t history, uint32_t resident, uint32_t tokenBytes,
     uint32_t batch, uint32_t query, uint32_t used, uint32_t rangeBegin, uint32_t count,
     StagedContextPointer ctx, __ubuf__ uint32_t* selected, __ubuf__ uint16_t* ids,
     __ubuf__ uint32_t* slots, __ubuf__ uint32_t* ctl,
-    __gm__ int32_t* direct=nullptr,uint32_t directStride=0) {
+    __gm__ int32_t* direct=nullptr,uint32_t directStride=0,__gm__ uint64_t* compactAddresses=nullptr) {
     uint32_t tid=threadIdx.x;
     if(!count){
         if(!tid){ctl[16]=0;ctl[17]=0;ctl[18]=0;ctl[19]=0;}
@@ -23,15 +27,15 @@ inline void PackStagedUrmaQuery(uint32_t history, uint32_t resident, uint32_t to
     uint32_t ownerBase=OwnerRow(ctx,batch)*OutputStride(resident,ctx);
     for(uint32_t worker=0;worker<1;++worker){
         uint32_t begin=rangeBegin,end=begin+count;
-        uint32_t own=end-begin,per=(own+511)/512,localSafe=0;
+        uint32_t own=end-begin,per=(own+Threads-1)/Threads,localSafe=0;
         for(uint32_t i=tid*per;i<(tid+1)*per && i<own;++i){
             uint32_t slot=slots[begin+i];
             if(slot>=resident){asc_atomic_or(ctl+1,4U);continue;}
             int32_t ordinal=asc_ldcg(reserved+slot);
             localSafe+=!(ordinal>=0 && uint32_t(ordinal)<used);
         }
-        uint32_t safeBefore=StagedPrefix(localSafe,ctl);
-        uint32_t safeCount=ctl[544+512/warpSize-1];
+        uint32_t safeBefore=StagedPrefix<Threads>(localSafe,ctl);
+        uint32_t safeCount=ctl[544+Threads/warpSize-1];
         uint32_t conflictBefore=tid*per-safeBefore;
         // Reserve one contiguous range per phase, not one atomic per token.
         if(direct){
@@ -39,6 +43,7 @@ inline void PackStagedUrmaQuery(uint32_t history, uint32_t resident, uint32_t to
                 auto counters=reinterpret_cast<__gm__ uint32_t*>(direct+6*directStride);
                 ctl[18]=safeCount?asc_atomic_add(counters,safeCount):0;
                 ctl[19]=(own-safeCount)?asc_atomic_add(counters+8,own-safeCount):0;
+
                 if(ctl[18]+safeCount>directStride || ctl[19]+own-safeCount>directStride)asc_atomic_or(ctl+1,16U);
             }
             asc_syncthreads();
@@ -52,12 +57,17 @@ inline void PackStagedUrmaQuery(uint32_t history, uint32_t resident, uint32_t to
             uint32_t output=batch*kSlots+query*kTop+position;
             uint32_t token=selected[ids[rank%kTop]];
             if(token>=history){asc_atomic_or(ctl+1,1U);continue;}
-            StoreFallbackSource(history,tokenBytes,ctx,batch,output,token,asc_ldcg(addresses+token),blocks,offsets);
+            uint64_t address=asc_ldcg(addresses+token);
+            StoreFallbackSource(history,tokenBytes,ctx,batch,output,token,address,blocks,offsets);
             asc_stcg(destinations+output,int32_t(ownerBase+slot));
             if(direct && !ctl[1]){
                 uint32_t pos=(conflict?ctl[19]+position-safeCount:ctl[18]+position);
                 auto target=direct+(conflict?3*directStride:0);
-                asc_stcg(target+pos,ctx->fallbackAddresses?int32_t(output):int32_t(batch*(history/128)+token/128));
+                // Safe addresses grow from the head, conflicting addresses from the
+                // tail. Reuse the existing phase reservations; no third atomic.
+                uint32_t addressIndex=conflict?directStride-1-pos:pos;
+                if(compactAddresses)asc_stcg(compactAddresses+addressIndex,address);
+                asc_stcg(target+pos,compactAddresses?int32_t(addressIndex):(ctx->fallbackAddresses?int32_t(output):int32_t(batch*(history/128)+token/128)));
                 asc_stcg(target+directStride+pos,ctx->fallbackAddresses?0:int32_t((token%128)*tokenBytes));
                 asc_stcg(target+2*directStride+pos,int32_t(ownerBase+slot));
             }

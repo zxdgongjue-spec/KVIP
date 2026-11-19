@@ -82,7 +82,8 @@ def test_trace_failure_preserves_unprofiled_partial_record(tmp_path):
     assert rows[0]['execution'] == 'INCOMPLETE'
 
 
-def test_diagnose_csv_joins_stage_and_transfer_evidence_by_case(tmp_path, monkeypatch):
+@pytest.mark.parametrize('graph_batch', [False, True])
+def test_diagnose_csv_joins_stage_and_transfer_evidence_by_case(tmp_path, monkeypatch, graph_batch):
     from execution import dispatch
     from reporting import atomic_json
     from workloads import configuration
@@ -93,13 +94,17 @@ def test_diagnose_csv_joins_stage_and_transfer_evidence_by_case(tmp_path, monkey
             atomic_json(case / 'report.json', dict(
                 batch=batch, correctness='PASS', native_misses_per_request=[7] * batch,
                 fused_read_counts=[dict(prefetch=3 * batch, final=6 * batch), dict(prefetch=5 * batch, final=4 * batch)],
-                fused_attribution=f'../trace{batch}/attribution.json',
+                **({} if graph_batch else dict(fused_attribution=f'../trace{batch}/attribution.json')),
                 timing=dict(native_chain=timing_summary([110]), native_get_only=timing_summary([40]),
                             prototype_with_update=timing_summary([87]))))
-            atomic_json(case / 'native_attribution.json', dict(samples=[dict(
+            serial_source = (case / 'serial/diagnose/round-1/native_attribution.json' if graph_batch
+                             else case / 'native_attribution.json')
+            fused_source = (case / 'fused/diagnose/round-1/full_attribution.json' if graph_batch
+                            else directory / f'trace{batch}/attribution.json')
+            atomic_json(serial_source, dict(samples=[dict(
                 round=i, us=120, accounting=dict(stages_us=dict(li=20 * batch, lidu_prepare=10, fetch=45),
                                                 inter_kernel_gap_us=2)) for i in range(job.iterations)]))
-            atomic_json(directory / f'trace{batch}/attribution.json', [dict(
+            atomic_json(fused_source, [dict(
                 round=i, prefetch=0, final=0, algorithm=dict(totals={}, requests=[]), us=95,
                 accounting=dict(stages_us=dict(init=4, li=15 * batch, resolve_update_fetch=30)))
                 for i in range(job.iterations)])

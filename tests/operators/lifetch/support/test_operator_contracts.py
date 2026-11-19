@@ -19,13 +19,12 @@ namespace pipeline_ab { constexpr uint32_t kResolveCores=3; }
 int fail=0, count=0;
 void* stream_expected=(void*)3;
 uint32_t step(int n,void* a,void* stream) { assert(a==(void*)1);assert(stream==stream_expected);assert(++count==n);return fail==n?99:0; }
-uint32_t v9_init(void*a,void*s,const rotating::RuntimeShape*){return step(1,a,s);}
-uint32_t v9_li(void*a,void*s,const rotating::RuntimeShape*){return step(2,a,s);}
-extern "C" uint32_t aclrtlaunch_v9_streaming_resolve_update(uint32_t cores,void*s,void*a){assert(cores==56);return step(3,a,s);}
+uint32_t LaunchLi(void*a,void*s,const rotating::RuntimeShape*){return step(1,a,s);}
+extern "C" uint32_t aclrtlaunch_v9_streaming_resolve_update(uint32_t cores,void*s,void*a){assert(cores==56);return step(2,a,s);}
 """
     main = r"""
 int main(){rotating::RuntimeShape shape{};shape.batch=16;shape.finalWorkers=4;shape.aicCount=32;
-for(fail=0;fail<=3;++fail){count=0;assert(kvip_lifetch_streaming_forward((void*)1,(void*)2,(void*)1,stream_expected,&shape,2)==(fail?99:0));assert(count==(fail?fail:3));}
+for(fail=0;fail<=2;++fail){count=0;assert(kvip_lifetch_streaming_forward((void*)1,(void*)2,(void*)1,stream_expected,&shape,2)==(fail?99:0));assert(count==(fail?fail:2));}
 count=0;shape.batch=17;assert(kvip_lifetch_streaming_forward((void*)1,(void*)2,(void*)1,stream_expected,&shape,2)!=0);assert(count==0);return 0;}
 """
     path = tmp_path / "launch.cpp"
@@ -74,7 +73,7 @@ def test_runtime_tiling_matches_original_geometry(tmp_path):
     (tmp_path / "batch_get_abi.h").write_text("")
     source.write_text("""
 #include "context.h"
-static_assert(sizeof(rotating::Context)==320,"context ABI");
+static_assert(sizeof(rotating::Context)==352,"context ABI");
 extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* s){return rotating::PrepareShape(s);}
 extern "C" uint32_t trigger(rotating::RuntimeShape* s,uint32_t e){return rotating::Trigger(s->history,s->resident,s->rounds,e);}
 extern "C" uint32_t core(rotating::RuntimeShape* s,uint32_t e,uint32_t g){return rotating::ServiceCore(s->batch,s->splitQ,s->serviceAics,e,g);}
