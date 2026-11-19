@@ -94,6 +94,10 @@ class LIFetchBinding:
         if self.incremental_topk and (threshold_bounds is None or query_ends is None):
             raise ValueError("Incremental TopK requires a validated resident+recent seed")
         self.shape_pointer = ctypes.byref(self.runtime_shape)
+        context_bytes = (
+            328 + 16 * (self.ranked_port + self.fetch_rank)
+            + 8 * (self.incremental_topk + window_probe + seed_mask + self.fetch_packets_enabled)
+        )
         for name, expected in (
             ("token_bytes", token_bytes),
             ("final_replicated", int(final_strategy == "replicated")),
@@ -113,7 +117,7 @@ class LIFetchBinding:
             ("history", history),
             ("resident", resident),
             ("simulation", 0),
-            ("context_bytes", 328 + 16*self.ranked_port + 16*self.fetch_rank + 8 * (self.incremental_topk + window_probe + seed_mask + self.fetch_packets_enabled)),
+            ("context_bytes", context_bytes),
             ("row_bytes", 1024),
         ):
             fn = getattr(self.library, "v9_" + name)
@@ -277,8 +281,10 @@ class LIFetchBinding:
         if seed_mask:
             self.seed_mask = torch.empty((batch, 16384 // 8), dtype=torch.int32, device=self.device)
             blob = np.r_[blob, np.array([self.seed_mask.data_ptr()], dtype="<u8").view("u1")]
-        if blob.size != 328 + 16*self.fetch_rank + 8 * (self.incremental_topk + window_probe + seed_mask + self.fetch_packets_enabled):
-            raise AssertionError("LIFetch Context ABI changed")
+        if blob.size != context_bytes:
+            raise AssertionError(
+                f"LIFetch Context ABI changed: packed={blob.size}, expected={context_bytes}"
+            )
         self.context = torch.from_numpy(blob.copy()).to(self.device)
         self.arguments = tuple(arguments) + (self.context,)
         self.bindings = torch.tensor([x.data_ptr() for x in self.arguments], dtype=torch.uint64, device=self.device)

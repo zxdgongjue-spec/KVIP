@@ -65,8 +65,9 @@ class Tensor:
         return self.fill_(0)
 
 
-def fixture(monkeypatch, batch=2):
-    history, resident, heads = 4096, 2048, 32
+def fixture(monkeypatch, batch=2, *, ranked=False, full_geometry=False):
+    history, resident = (131328, 16384) if full_geometry else (4096, 2048)
+    heads = 32
     torch = SimpleNamespace(
         int32=np.int32,
         int64=np.int64,
@@ -75,6 +76,7 @@ def fixture(monkeypatch, batch=2):
         from_numpy=Tensor,
         tensor=lambda values, dtype, device: Tensor(np.asarray(values, dtype=dtype), device),
         zeros=Mock(side_effect=lambda size, dtype, device: Tensor(np.zeros(size, dtype=dtype), device)),
+        empty=lambda size, dtype, device: Tensor(np.empty(size, dtype=dtype), device),
         ones=lambda size, dtype, device: Tensor(np.ones(size, dtype=dtype), device),
         full=lambda size, value, dtype, device: Tensor(np.full(size, value, dtype=dtype), device),
     )
@@ -93,7 +95,11 @@ def fixture(monkeypatch, batch=2):
         s.postGroups, s.postThreads, s.postBank, s.batchedRows, s.scanTokens = 1, 512, 448, 1, 23808
         return 0
 
-    library = SimpleNamespace(kvip_prepare_shape=Mock(side_effect=prepare))
+    library = SimpleNamespace(
+        kvip_prepare_shape=Mock(side_effect=prepare),
+        kvip_cold_only_windows=Mock(return_value=1),
+        kvip_ranked_port=Mock(return_value=int(ranked)),
+    )
     properties = {
         "token_bytes": "tokenBytes",
         "final_workers": "finalWorkers",
@@ -112,8 +118,8 @@ def fixture(monkeypatch, batch=2):
             Mock(side_effect=lambda p, a=attribute: getattr(ctypes.cast(p, ctypes.POINTER(RuntimeShape)).contents, a)),
         )
     for name, value in {
-        "abi_version": 12,
-        "context_bytes": 328,
+        "abi_version": 76 if ranked else 12,
+        "context_bytes": 344 if ranked else 328,
         "row_bytes": 1024,
         "simulation": 0,
         "final_replicated": 1,
@@ -154,7 +160,36 @@ def fixture(monkeypatch, batch=2):
             **(metadata | overrides),
         )
 
-    return SimpleNamespace(construct=construct, metadata=metadata, library=library, torch=torch)
+    return SimpleNamespace(
+        construct=construct, metadata=metadata, library=library, torch=torch,
+        arguments=arguments,
+    )
+
+
+@pytest.mark.parametrize("ranked", [False, True])
+def test_ranked_context_constructs_and_preserves_pointer_offsets(monkeypatch, ranked):
+    f = fixture(monkeypatch, batch=16, ranked=ranked, full_geometry=True)
+    bound = f.construct(window_limit=64)
+    blob = bound.context.values.tobytes()
+    assert len(blob) == (344 if ranked else 328)
+    assert bound.rounds == 8 and bound.service_lanes == 8
+    assert int.from_bytes(blob[320:328], "little") == f.metadata["threshold_bounds"].data_ptr()
+    if ranked:
+        assert bound.ranked_state.shape == (16, 4, 16)
+        assert int.from_bytes(blob[328:336], "little") == bound.ranked_state.data_ptr()
+        assert int.from_bytes(blob[336:344], "little") == f.arguments[13].data_ptr()
+    else:
+        assert not hasattr(bound, "ranked_state")
+    f.library.v9_init.assert_not_called()
+    f.library.v9_li.assert_not_called()
+
+
+def test_ranked_context_rejects_old_native_layout_before_allocation(monkeypatch):
+    f = fixture(monkeypatch, batch=16, ranked=True, full_geometry=True)
+    f.library.v9_context_bytes.return_value = 328
+    with pytest.raises(ValueError, match="context_bytes"):
+        f.construct(window_limit=64)
+    f.torch.zeros.assert_not_called()
 
 
 @pytest.mark.parametrize("batch", [1, 2, 16])
