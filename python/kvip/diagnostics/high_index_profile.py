@@ -5,6 +5,8 @@ import hashlib
 
 import numpy as np
 
+from kvip.diagnostics.index_assistance import survey_index_helpers
+
 
 def event_work(flags, sources, destinations, *, history):
     """Fingerprint the exact ordered row/prefetch/Q event stream outside the timed graph."""
@@ -442,6 +444,7 @@ def decode_high_index(records, detail, *, wait_first, final_get, work, cold_plan
         schedule["max_moves_per_lane"] = int(moved.max())
         schedule["max_row_moves"] = int(moved.sum(axis=0).max())
         schedule["moved_total"] = int(moved.sum())
+        schedule["index_help"] = survey_index_helpers(rows, marks)
         result["schedule_timing"] = schedule
         return result
     if np.any(marks[:, 2] != 0x50494831):

@@ -274,6 +274,16 @@ def summarize(group, cases, baseline, candidate, high_overlap=False, schedule_fo
                       f" last_retire_to_row_exit_us_p50/max={metrics['row_retire_to_exit_p50']/rate:.2f}/{metrics['row_retire_to_exit_max']/rate:.2f}"
                       f" moves_total/max_row/max_lane={metrics['moved_total']}/{metrics['max_row_moves']}/{metrics['max_moves_per_lane']}"
                       f" rows_single_owner/gather={high['single_owner_rows']}/{high['row_gathers']}" + split_load)
+                if arm == "after" and "index_help" in metrics:
+                    help_stats = metrics["index_help"]
+                    print(f"G{group} INDEX_HELP after last_Index_row/pairs/singles={help_stats['last_index_row']}/"
+                          f"{help_stats['last_row_pairs']}/{help_stats['last_row_singles']}"
+                          f" heaviest_row/pairs/singles={help_stats['heaviest_row']}/"
+                          f"{help_stats['heaviest_pairs']}/{help_stats['heaviest_singles']}"
+                          f" foreign_exited_lanes={help_stats['freed_lanes']}"
+                          f" max_idle_window_us={help_stats['longest_free_window_ticks']/rate:.2f}"
+                          f" idle_capacity_core_us={help_stats['free_lane_ticks']/rate:.2f}"
+                          f" max_exit_gain_if_only_last_row_changes_us={help_stats['last_row_only_exit_gap_ticks']/rate:.2f}")
                 if marker in ("RQI4", "RQI5", "RQI6"):
                     early = metrics["early_post"]
                     def times_us(*keys):

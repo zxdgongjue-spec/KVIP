@@ -114,6 +114,9 @@ def test_high_overlap_arms_reuse_public_completion_records(tmp_path, capsys, for
                     validation_by_role_p50=[300, 500, 350, 10], validation_spread_max=490,
                     row_retire_to_exit_p50=30, row_retire_to_exit_max=60,
                     lane_index_p50=220, max_moves_per_lane=100, moved_total=1000, max_row_moves=256,
+                    index_help=dict(last_index_row=3, heaviest_row=4, last_row_pairs=512, last_row_singles=20,
+                                    heaviest_pairs=1024, heaviest_singles=25, freed_lanes=20, longest_free_window_ticks=7000,
+                                    free_lane_ticks=94000, last_row_only_exit_gap_ticks=0),
                     format=formats[roles.index(arm)-1])))
         else:
             del c["native_diagnostics"]
@@ -127,6 +130,9 @@ def test_high_overlap_arms_reuse_public_completion_records(tmp_path, capsys, for
     result = capsys.readouterr().out
     assert "ORIGINAL_per_row_vs_candidate_us saved_min=-3.000/-3.000 saved_max=1.000/1.000" in result
     assert "identical_work_pairs=18/18" in result and "real_Index_order/TopK/KV/lifecycle/submitted_completed=PASS" in result
+    assert result.count("INDEX_HELP") == 1
+    assert "INDEX_HELP after last_Index_row/pairs/singles=3/512/20" in result
+    assert "idle_capacity_core_us=94.00 max_exit_gain_if_only_last_row_changes_us=0.00" in result
     if intermediate:
         assert "VS_middle_us saved_min=6.000/6.000 saved_max=10.000/10.000" in result
         assert "middle=18/18,8.000/8.000" in result
@@ -184,7 +190,10 @@ def test_row_timeline_handles_split_submissions_and_excludes_idle_final_lanes():
                           last_wait_lane=0, last_wait_lane_get=3, last_wait_lane_post_return=226, max_lane_get=7, max_row_get=7,
                           validation_by_role_p50=[55,50,45,30], validation_spread_max=25, lane_index_p50=90,
                           row_retire_to_exit_p50=107.5, row_retire_to_exit_max=115,
-                          max_moves_per_lane=0, max_row_moves=0, moved_total=0)
+                          max_moves_per_lane=0, max_row_moves=0, moved_total=0,
+                          index_help=dict(last_index_row=0, heaviest_row=0, last_row_pairs=0, last_row_singles=0,
+                                          heaviest_pairs=0, heaviest_singles=0, freed_lanes=0,
+                                          longest_free_window_ticks=0, free_lane_ticks=0, last_row_only_exit_gap_ticks=0))
     marks[7, 1] = 9998
     with pytest.raises(ValueError, match="owner exit"):
         decode_high_index(rows, marks, wait_first=False, final_get=10, work={}, schedule_timing=True)
