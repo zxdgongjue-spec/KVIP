@@ -93,6 +93,38 @@ def batch_values(value):
     return batches
 
 
+def score_parts_map(value):
+    """Parse history parts by batch without silently replacing duplicate keys."""
+    mapping = {}
+    for item in csv_values(value):
+        try:
+            batch, parts = map(int, item.split(':'))
+        except ValueError as error:
+            raise argparse.ArgumentTypeError('li-score-parts-map requires integer B:P entries') from error
+        if batch in mapping or not 1 <= batch <= 16 or not 1 <= parts <= 32 or batch * parts > 32:
+            raise argparse.ArgumentTypeError('li-score-parts-map requires distinct B1..16:P1..32 with B*P<=32')
+        mapping[batch] = parts
+    return mapping
+
+
+def score_parts_for_batch(config, batch):
+    """Resolve actual P for a replay, including maps round-tripped through JSON."""
+    mapping = getattr(config, 'li_score_parts_map', None)
+    scalar = getattr(config, 'li_score_parts', 0)
+    if mapping is not None:
+        if scalar:
+            raise ValueError('li-score-parts and li-score-parts-map are mutually exclusive')
+        value = mapping.get(batch, mapping.get(str(batch)))
+        if value is None:
+            raise ValueError(f'li-score-parts-map is missing batch {batch}')
+    else:
+        value = scalar
+    if (not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 32
+            or (mapping is not None and value == 0) or batch * value > 32):
+        raise ValueError(f'Invalid history parts for batch {batch}: {value}; B*P must fit 32 AIC')
+    return value
+
+
 def round_range(value):
     try:
         start, end = map(int, value.split(':'))
@@ -136,11 +168,22 @@ def configuration(argv=None):
                                  help='URMA initial admission rank (1..2048); progresses to 2048 by per-Q coverage')
             command.add_argument('--li-score-parts', type=int, default=0,
                                  help='experimental URMA history score parts; 0 keeps the default')
+            command.add_argument('--li-score-parts-map', type=score_parts_map,
+                                 help='history parts per batch, e.g. 1:16,2:16,4:8,8:4,16:2; mutually exclusive with nonzero li-score-parts')
             command.add_argument('--li-score-mode', choices=('full', 'window', 'window_query', 'aligned'), default='full',
                                  help='window uses ranked Service; window_query splits Q TopK/post; aligned uses full-H TopK and requires prefetch 0')
             command.add_argument('--intermediate-fetches', type=int, default=8)
             command.add_argument('--warmup', type=int, default=4, help='whole-graph warmup repetitions')
             command.add_argument('--iterations', type=int, default=20, help='independent complete invocations captured in one measured graph')
+        if mode == 'bench':
+            command.add_argument('--compare-routes', type=csv_values,
+                                 help='compare mr23 with window_budget and/or aligned_budget using the same bench workload')
+            command.add_argument('--comparison-rounds', type=int, default=1,
+                                 help='outer measured comparison rounds; does not change iterations per graph')
+            command.add_argument('--comparison-discard-first', action='store_true',
+                                 help='run and discard an additional first outer comparison round')
+            command.add_argument('--comparison-dry-run', action='store_true',
+                                 help='write comparison plans without initializing NPU or transport')
         if mode == 'diagnose':
             command.add_argument('--level', type=int, choices=(1, 2, 3), default=1)
             command.add_argument('--stages', type=csv_values, default=('all',))
@@ -187,13 +230,40 @@ def configuration(argv=None):
                 parser.error('invalid synthetic geometry or seed')
         if not 1 <= args.prefetch_rank_start <= 2048:
             parser.error('prefetch-rank-start must be in 1..2048')
+        comparing = getattr(args, 'compare_routes', None) is not None
+        if comparing:
+            allowed = {'mr23', 'window_budget', 'aligned_budget'}
+            if (len(args.compare_routes) < 2 or 'mr23' not in args.compare_routes
+                    or set(args.compare_routes) - allowed):
+                parser.error('compare-routes must include mr23 and at least one window_budget/aligned_budget candidate')
+            if args.transport != 'urma' or args.input != 'synthetic' or args.index_heads != 32:
+                parser.error('route comparison requires bench URMA synthetic Q4/head32 inputs')
+            if 'aligned_budget' in args.compare_routes and args.prefetch_tokens:
+                parser.error('aligned_budget comparison requires prefetch-tokens=0')
+        elif (getattr(args, 'comparison_rounds', 1) != 1
+              or getattr(args, 'comparison_discard_first', False)
+              or getattr(args, 'comparison_dry_run', False)):
+            parser.error('comparison options require --compare-routes')
+        if getattr(args, 'comparison_rounds', 1) < 1:
+            parser.error('comparison-rounds must be positive')
         if not 0 <= args.li_score_parts <= 32 or (args.li_score_parts and args.transport != 'urma'):
             parser.error('li-score-parts must be 0..32; the experimental entry requires URMA')
-        if args.li_score_parts and args.input == 'synthetic' and args.index_heads != 32:
+        if args.li_score_parts_map is not None and args.li_score_parts:
+            parser.error('li-score-parts and li-score-parts-map are mutually exclusive')
+        if args.li_score_parts_map is not None and (args.transport != 'urma' or args.input != 'synthetic'):
+            parser.error('li-score-parts-map requires URMA synthetic inputs')
+        has_parts = args.li_score_parts or args.li_score_parts_map is not None
+        if has_parts and args.input == 'synthetic' and args.index_heads != 32:
             parser.error('the experimental T2 score entry requires 32 Index heads')
-        if args.li_score_mode in ('window', 'window_query') and (not args.li_score_parts or args.input != 'synthetic'):
+        if has_parts and args.input == 'synthetic':
+            try:
+                for batch in args.batches:
+                    score_parts_for_batch(args, batch)
+            except ValueError as error:
+                parser.error(str(error))
+        if args.li_score_mode in ('window', 'window_query') and ((not has_parts and not comparing) or args.input != 'synthetic'):
             parser.error('window score requires li-score-parts and synthetic Q4 inputs; serving replay is not validated')
-        if args.li_score_mode == 'aligned' and (not args.li_score_parts or args.input != 'synthetic' or args.prefetch_tokens):
+        if args.li_score_mode == 'aligned' and ((not has_parts and not comparing) or args.input != 'synthetic' or args.prefetch_tokens):
             parser.error('aligned score requires li-score-parts, synthetic Q4 inputs and prefetch-tokens=0')
         if args.transport != 'urma' and args.prefetch_rank_start != 1024:
             parser.error('prefetch-rank-start requires the URMA ranked prefetch path')

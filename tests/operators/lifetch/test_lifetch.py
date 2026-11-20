@@ -11,6 +11,9 @@ from workloads import configuration  # noqa: E402
 
 def main(argv=None):
     config = configuration(argv)
+    if getattr(config, 'compare_routes', None):
+        from route_comparison import run
+        return run(config)
     from execution import dispatch
 
     return dispatch(config)

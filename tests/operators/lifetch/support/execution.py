@@ -3866,6 +3866,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     from kvip.operators.lifetch_ubmem.build import UbmemGeometry, build_ubmem_library
     from kvip.runtime.build import build_libraries, kvaf_build_paths
     from kvip.runtime.device import query_device_resources
+    from workloads import score_parts_for_batch
 
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -3880,6 +3881,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     _, registration, _ = _load_native_operators('c8_offload')
     registration.require_a5_dsa_registration(('lidu_fused_batch_get_prepare_mtp_out',))
     g = initial.geometry
+    actual_score_parts = score_parts_for_batch(config, g['batch']) if fused else 0
     width = g['token_bytes']
     workers = 40 if fused and config.transport == 'urma' else 2
     kwargs = dict(device_id=config.device, npu_core_count=workers,
@@ -3937,7 +3939,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                 prefetch_tokens=config.prefetch_tokens, soc=soc,
                 prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024),
-                score_parts=getattr(config, 'li_score_parts', 0),
+                score_parts=actual_score_parts,
                 score_mode=getattr(config, 'li_score_mode', 'full'))
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
@@ -3985,7 +3987,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                         transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                         prefetch_tokens=config.prefetch_tokens, soc=soc,
                         prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease,
-                        score_parts=getattr(config, 'li_score_parts', 0),
+                        score_parts=actual_score_parts,
                         score_mode=getattr(config, 'li_score_mode', 'full'))
                     replica.failure_directory = directory
                 else:
@@ -3997,7 +3999,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 result['correctness'] = 'FAIL'
                 result['failures'] = checks.failures + result['failures']
             result.update(transport=config.transport, path='fused' if fused else 'serial',
-                          score_parts=getattr(config, 'li_score_parts', 0) if fused else 0,
+                          score_parts=actual_score_parts,
+                          requested_score_parts_map=getattr(config, 'li_score_parts_map', None),
                           score_mode=getattr(config, 'li_score_mode', 'full') if fused else None,
                           score_geometry=getattr(state.forward, 'score_geometry', None) if fused else None,
                           effective_aic=aics, effective_aiv=2*aics,
