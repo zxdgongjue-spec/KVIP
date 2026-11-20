@@ -31,9 +31,6 @@ def prepare(repo, destination):
     helper=stream_text[begin:end].replace('i<kPrefetch','i<pipeline_ab::kPrefetch')
     (destination/base/'op_kernel/terminal_prefetch_publish.h').write_text('#pragma once\n'+helper)
     stream_path.write_text(stream_text[:begin]+'#include "terminal_prefetch_publish.h"\n'+stream_text[end:])
-    # Export all final misses into the existing 2048-entry per-Q buffer.
-    patch(base+'op_kernel/compact_misses.h',
-          'if(scan[15]<=kCompactMissLimit){', 'if(scan[15]<=2048){')
     # Keep RunLi available inside the tail translation unit, without duplicate entry points.
     patch(base+'op_kernel/indexer.cpp','extern "C" __global__ __aicore__ void v9_li_kernel(GM_ADDR bindings) {',
           '#ifndef KVIP_FINAL_WINDOW_INCLUDE\nextern "C" __global__ __aicore__ void v9_li_kernel(GM_ADDR bindings) {')
@@ -50,16 +47,9 @@ def prepare(repo, destination):
     if tail.count(declaration)!=1:raise ValueError('Expected tail profiling declaration')
     text=text[:start]+tail.replace(declaration,'',1)
     phases='''  bool profile=(a->prefetchCount & 0x80000000U)!=0;
-  if(profile) StampTerminal(a,block,0);
-  if(block<2*shape.liCores) RunLi<SequenceLiPhase::Final>(bindings);
-  if(profile) StampTerminal(a,block,1);
+  if(block<shape.serviceLanes) RunSharedFinalWindow(a,block);
   AscendC::SyncAll<true>();
-  if(profile) StampTerminal(a,block,2);
-  if(block<shape.serviceLanes){
-    if(profile)RunTerminalService<true>(a,block);
-    else RunTerminalService<false>(a,block);
-  }
-  if(profile) StampTerminal(a,block,3);
+  if(block<shape.batch*4) PublishSavedTopK(a,block);
   AscendC::SyncAll<true>();
   if(profile) StampTerminal(a,block,4);
 '''
@@ -86,38 +76,16 @@ def prepare(repo, destination):
     text=text[:begin]+text[end:]
     path.write_text(text)
     shutil.copy2(Path(__file__).with_name('terminal.h'),destination/base/'op_kernel/terminal_window.h')
-    patch(base+'op_kernel/prefetch.h','template<bool captureIo, bool predecessorChecked=false>',
-          'template<bool captureIo, bool predecessorChecked=false, bool terminal=false>')
-    patch(base+'op_kernel/prefetch.h','    uint32_t sequenceHalfWindow) {',
-          '    uint32_t sequenceHalfWindow, uint64_t terminalErrors=0) {')
-    patch(base+'op_kernel/prefetch.h','        if (rt_batchedRows) postInput.SetValue(64,0);',
-          '''        if (rt_batchedRows) postInput.SetValue(64,0);
-        if constexpr(terminal){auto e=reinterpret_cast<__gm__ uint32_t*>(terminalErrors)+b*128;
-            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(e),128);
-            if(!e[2])continue;}''')
-    patch(base+'op_kernel/prefetch.h','        if(available>ctx->windowLimit)available=ctx->windowLimit;',
-          '''        if(available>ctx->windowLimit)available=ctx->windowLimit;
-        if constexpr(terminal)available=kLruSlots-slots;''')
-    patch(base+'op_kernel/prefetch.h','template<bool BuildSimt>', 'template<bool BuildSimt, bool terminal=false>')
-    patch(base+'op_kernel/prefetch.h','ctx->locations)+b*8192;','(terminal?ctx->sourceOffsets:ctx->locations))+b*8192;')
-    patch(base+'op_kernel/prefetch.h','__simt_vf__ __aicore__ LAUNCH_BOUND(256)\ninline void UnionColdTopk',
-          'template<bool packed=false>\n__simt_vf__ __aicore__ LAUNCH_BOUND(256)\ninline void UnionColdTopk')
-    patch(base+'op_kernel/prefetch.h','token=input[i];','token=packed?(input[i]>>11):input[i];')
-    patch(base+'op_kernel/prefetch.h','Simt::VF_CALL<UnionColdTopk>', 'Simt::VF_CALL<UnionColdTopk<terminal>>')
-    patch(base+'op_kernel/prefetch.h','ctx->locations)+b*8192);\n        DataCopy(cfg[128]',
-          '(terminal?ctx->sourceBlocks:ctx->locations))+b*8192);\n        DataCopy(cfg[128]')
-    patch(base+'op_kernel/prefetch.h','ctx->locations)+b*8192);\n                SetFlag',
-          '(terminal?ctx->sourceOffsets:ctx->locations))+b*8192);\n                SetFlag')
-    patch(base+'op_kernel/prefetch.h','BatchBuild<V9_BATCH_POST==1>', 'BatchBuild<V9_BATCH_POST==1,terminal>')
+    # One extra event plus a private Context copy per terminal service lane.
     patch('python/kvip/operators/lifetch/workspace.py','((max(1, rounds), lanes, 128), "uint8")',
-          '((max(1, rounds)+1, lanes, 128), "uint8")')
+          '((max(1, rounds)+4, lanes, 128), "uint8")')
     patch('csrc/operators/common/lifetch/li_launch.h',
           '    if (!result) result = LI_LAUNCH_3(shape->liCores, stream, bindings);','    // Final TopK runs inside the experimental tail.')
     patch(base+'op_host/launch.cpp','aclrtlaunch_v9_streaming_resolve_update(uint32_t,void*,void*);',
           'aclrtlaunch_v9_streaming_resolve_update(uint32_t,void*,void*,void*);')
     patch(base+'op_host/launch.cpp',
           'aclrtlaunch_v9_streaming_resolve_update(shape->batch*pipeline_ab::kResolveCores+4*workers,stream,workspace)',
-          'aclrtlaunch_v9_streaming_resolve_update(std::max(2*shape->liCores,shape->batch*pipeline_ab::kResolveCores+4*workers),stream,workspace,bindings)')
+          'aclrtlaunch_v9_streaming_resolve_update(std::max(4*shape->batch,shape->batch*pipeline_ab::kResolveCores+4*workers),stream,workspace,bindings)')
     patch(base+'op_host/launch.cpp','#include <cstdint>','#include <cstdint>\n#include <algorithm>')
 
 

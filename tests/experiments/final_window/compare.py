@@ -85,7 +85,7 @@ def main():
     shutil.copy2(Path(__file__).with_name('detail.py'), args.output/'detail.py')
     candidate=args.output/'candidate-source'
     prepare(repo,candidate)
-    print('A: original final TopK + tail. B: one kernel, terminal TopK/posting + Index/output/CQ completion; no original resolver.',flush=True)
+    print('A: original final TopK + tail. B: original RotateFetch window entry + existing output/Index/CQ completion; no original resolver.',flush=True)
     results={}
     for name,root in (('A',repo),('B',candidate)):
         output=args.output/name

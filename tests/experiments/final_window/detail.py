@@ -16,7 +16,8 @@ def save_detail(forward, rotating, valid, output, clock_mhz, terminal=False):
                 service_lanes=rotating.runtime_shape.serviceLanes,
                 windows=rotating.rounds, prefetch_tokens=rotating.prefetch_limit,
                 prefetch_rank_start=rotating.prefetch_rank_start,
-                active_rows=valid.any(dim=1).cpu().tolist(), terminal=terminal)
+                active_rows=valid.any(dim=1).cpu().tolist(), terminal=terminal,
+                terminal_mode='rotate_fetch' if terminal else 'baseline')
     path = Path(output) / 'level3.json'
     path.write_text(json.dumps(data))
     return path
@@ -87,19 +88,24 @@ def summarize(path):
         span(name,'core lifetime',c[0],c[1])
     if d['terminal']:
         records = [record for row in d['rank_progress'] for record in row]
-        for block, record in enumerate(records):
-            for start, end, phase in ((16,20,'TopK through service join'),(16,17,'TopK/classify'),(17,18,'wait TopK barrier'),
-                    (18,19,'service phase'),(19,20,'wait service barrier'),
-                    (25,26,'direct completion handoff'),(21,22,'admission'),(22,23,'service setup/post'),(23,24,'location patch')):
-                if start == 25 and (block >= b or not d['active_rows'][block]):
-                    continue
-                if start == 16 and not d['active_rows'][block//4]:
-                    continue
-                if start in (18,21,22,23) and not any(d['active_rows'][block::d['service_lanes']]):
-                    continue
-                if start in (18,21,22,23) and block >= d['service_lanes']:
-                    continue
-                span('terminal',phase,record[start],record[end])
+        if d.get('terminal_mode') == 'rotate_fetch':
+            for block, record in enumerate(records):
+                if block < d['service_lanes'] and any(d['active_rows'][block::d['service_lanes']]):
+                    span('terminal','shared window TopK + post',record[16],record[19])
+                    span('terminal','post end to output join',record[19],record[20])
+                if block < b*4 and d['active_rows'][block//4]:
+                    span('terminal','existing output adapter',record[17],record[18])
+                if block < b and d['active_rows'][block]:
+                    span('terminal','direct completion handoff',record[25],record[26])
+        else:
+            for block, record in enumerate(records):
+                for start, end, phase in ((16,20,'TopK through service join'),(16,17,'TopK/classify'),(17,18,'wait TopK barrier'),
+                        (18,19,'service phase'),(19,20,'wait service barrier'),
+                        (25,26,'direct completion handoff'),(21,22,'admission'),(22,23,'service setup/post'),(23,24,'location patch')):
+                    if start == 25 and (block >= b or not d['active_rows'][block]):continue
+                    if start == 16 and not d['active_rows'][block//4]:continue
+                    if start in (18,21,22,23) and (block>=d['service_lanes'] or not any(d['active_rows'][block::d['service_lanes']])):continue
+                    span('terminal',phase,record[start],record[end])
     lines = [f"Effective config: bound BS={b}; active={sum(d['active_rows'])}; windows={d['windows']}; prefetch={d['prefetch_tokens']}; rank start={d['prefetch_rank_start']}",
              'Final detail: one separate instrumented replay; mean/max over recorded cores or active rows, us.',
              'Nested and parallel intervals must not be summed.',
@@ -114,7 +120,8 @@ def summarize(path):
                 yield item
     raw = bytes(flatten(d['events']))
     windows = defaultdict(lambda: defaultdict(list))
-    for offset in range(0,len(raw),128):
+    event_count=(d['windows']+int(d['terminal']))*d['service_lanes']
+    for offset in range(0,min(len(raw),event_count*128),128):
         lane=(offset//128)%d['service_lanes']
         if not any(d['active_rows'][lane::d['service_lanes']]):
             continue
@@ -133,7 +140,8 @@ def summarize(path):
             windows[epoch][name].append(value)
     if not windows:
         raise ValueError(f'No executed window timestamps in {path}')
-    if d['terminal'] and not table.get(('terminal','service setup/post')):
+    service_phase='shared window TopK + post' if d.get('terminal_mode')=='rotate_fetch' else 'service setup/post'
+    if d['terminal'] and not table.get(('terminal',service_phase)):
         raise ValueError(f'Missing terminal service stamps in {path}')
     lines += ['Window detail: mean/max over executed lanes, us; posted is summed.',
               'Epoch | TopK through service | TopK | Service | Scan | Filter | Post | Posted']

@@ -1,52 +1,55 @@
-# Bounded final-window experiment (URMA)
+# Final window using the existing prefetch implementation
 
 Run `compare.py SNAPSHOT --kvaf-root KVAF --output NEW_DIRECTORY`.
-The snapshot is a single-group `lifetch_failure_v1` dump; this prototype accepts
-sequence-split LI and history up to 131328. Defaults: four windows, budget 1024,
-initial rank 1024, two warmups and three profiled graph replays per variant.
+The snapshot is a single-group `lifetch_failure_v1` dump. Defaults are four
+windows, budget 1024, rank start 1024, two warmups and three profiled replays.
 
-A uses the checked-out operator unchanged. B is built from an isolated copy:
+A uses the checked-out operator unchanged. B builds an isolated source copy:
 
-- Final TopK runs at the start of the streaming tail kernel; the separate final
-  TopK launch is removed. Existing incremental TopK and classification are reused.
-- A request qualifies if every Q has a valid compact miss list of at most 2048
-  entries and the sum fits the remaining 2048-entry LRU allocation. Duplicate
-  entries are included in this conservative capacity test.
-- The intermediate `FastService` union and WQE posting implementation handles
-  these misses, without the speculative rank or prefetch-budget cap. All selected
-  misses must be mapped after posting; missing mappings fail completion.
-- Index/output/CQ completion remains. B deletes the original resolver and its
-  compact-resolution helpers. Nonqualifying active requests report failure;
-  they never fall back to another resolver. Inactive padding rows complete empty.
-- Two all-AIV phase barriers remain: TopK publication and terminal service
-  completion. This prototype does not yet start Q1 transfers before Q2–Q4 TopK.
+- The tail calls the original `RotateFetch` once at the completed history
+  endpoint. Its TopK, candidate filtering, union, slot allocation and posting
+  code are unchanged. One service AIV processes its assigned requests and Qs.
+- The terminal call uses rank 2048 and a per-Q limit of 2048, with the existing
+  2048-slot LRU capacity. Intermediate windows retain the command-line settings.
+- Existing output-location helpers convert saved TopK IDs into public outputs.
+  Existing workers update Index, finish output publication, drain CQ and retire
+  state. Two phase barriers connect the window and output adapter to these workers.
+- The original resolver and separate final TopK launch are removed from B.
+  There is no second TopK, second Fetch or resolver fallback. Residual misses
+  after the bounded terminal window fail completion; this is an experiment,
+  not an unrestricted-capacity replacement.
 
-The terminal window replaces miss resolution and posting. Only publication,
-Index updates, output and CQ completion remain after it. The new transfers count as prefetch internally;
-`terminal_counts.json` distinguishes them from the intermediate-window traffic.
+The production prefetch, incremental TopK and ranked-candidate files are copied
+unchanged. Only the isolated B build is changed; serving libraries are untouched.
 
-The runner reuses the temporary snapshot utility from historical commit c239791
-(fetching its branch if necessary). It restores identical input state outside
-measurement and profiles original A and experimental B in separate processes.
-DDR payload is synthetic with captured address aliases; Q/Index and initial HBM
-come from the snapshot. Compare sorted logical TopK and selected KV bytes, plus
-completion/bounds checks. Timing is not accepted if either comparison fails.
-`total_us` is the sum of profiled device kernel means, not graph-event latency.
+## Hardware AB
 
-Outputs: `ab_summary.json`, per-variant profiler traces, correctness artifacts,
-terminal eligibility/post counts, and the complete isolated candidate source.
-Only the experimental copy is patched; no installed serving library is replaced.
+```bash
+python tests/experiments/final_window/compare.py SNAPSHOT \
+  --kvaf-root /path/to/KVAF --kvaf-server 127.0.0.1:28885 --device 4 \
+  --windows 4 --prefetch-tokens 1024 --prefetch-rank-start 1024 \
+  --warmup 2 --iterations 3 --output /tmp/lifetch-final-window-new
+```
 
-Terminal diagnostics: reason_bits 1=classifier error, 2=invalid count,
-4=sum exceeds candidate capacity, 8=insufficient remaining LRU. Empty rows
-do not count as eligible. Counts include every Q; direct_handoff records successful active-row publication.
-Only the experimental final classifier exports beyond 64 misses; the original A baseline remains unchanged.
+The runner restores identical captured inputs outside measurement. It checks
+completion, bounds, sorted logical TopK and selected KV equality between A/B.
+DDR payload is synthetic with captured address aliases. Performance is not
+accepted when correctness fails. `ab_summary.json` reports device kernel sums,
+not graph-event latency. The historical snapshot runner is loaded from c239791.
 
-## Local device-model comparison
+Separate diagnostic replays produce `level3.json`, `window_ticks.json` and
+`final_detail.log`. The terminal event is epoch `windows`; its TopK, service,
+scan, candidate and posting intervals use the existing window stamps. The output
+adapter and Index/CQ handoff are separate intervals, not charged to window TopK.
+Inactive rows are excluded from aggregate terminal timings.
 
-`model/run.py` builds the current experimental implementation and the previous
-`c2c0a7b` experiment, then runs CANN's Ascend950PR_9599 simulator. Source the CANN
-environment and put its simulator library directory on `LD_LIBRARY_PATH` first:
+## Local validation
+
+`reuse/run.py` compares the unmodified window alone on identical intermediate
+and terminal candidates. `model/run.py` checks the integrated window, output
+adapter and publication with the same 192 per-Q misses (146 unique), then an
+ABC/nonaligned-end case. It checks exact TopK, mappings, WQE addresses and output
+slots. Both require the CANN Ascend950PR_9599 simulator environment:
 
 ```bash
 python tests/experiments/final_window/model/run.py \
@@ -54,89 +57,10 @@ python tests/experiments/final_window/model/run.py \
   --output /tmp/lifetch-final-model-new
 ```
 
-All three cases use history 131328, resident 16384, four Q, the same seeded
-TopK and final 16384-score interval, miss counts `[11, 0, 94, 87]`, union 146,
-and 84 already allocated LRU slots. The middle case uses one AIV for four Q;
-final cases use four AIVs for TopK, then one AIV for posting, with a publication
-barrier. The model checks exact expected TopK sets, distinct token mappings,
-WQE source/destination addresses, posted counts, and final output locations.
+Local model timing excludes real NIC/CQ and downstream Index workers. Vendor
+profiler microseconds are not a prediction of hardware end-to-end performance.
 
-The measured scope ends after posting and location materialization. It excludes
-real NIC/CQ latency and the original downstream Index/output/completion workers,
-which remain in the actual A/B operator. Simulator microseconds are reported
-by the vendor profiler; they are not a conversion of device ticks or a prediction
-of end-to-end hardware time. The older per-component probes are not added to
-this combined-kernel measurement.
-
-The optimized terminal path consumes packed `(token, original_position)` entries
-directly, stages deduplicated posting IDs in the unused offsets buffer, and
-updates only miss locations. It does not overwrite, back up, or restore the full
-8192-position row. Admission metadata is computed once, not by all 256 threads.
-
-Local combined-kernel results (one active request, bound batch 1):
-
-| Path | Simulator duration, us | Posted | Check |
-| --- | ---: | ---: | --- |
-| Middle TopK + prefetch, detailed stamps off | 48.34 | 146 | PASS |
-| Terminal at c2c0a7b | 57.96 | 146 | PASS |
-| Terminal with scalar admission and hoisted miss counts | 50.25 | 146 | PASS |
-| Current terminal, combined miss-location patch | 48.89 | 146 | PASS |
-
-The terminal path saves 9.07 us (15.65%) versus c2c0a7b, leaving 0.55 us
-versus the middle path with detailed stamps disabled. The earlier 49.13 us
-middle measurement enabled service diagnostics and is superseded by 48.34 us
-for this comparison.
-
-The four miss counts and pointers are loaded once on the AIV. Admission no
-longer launches a single-thread SIMT function. Location patching distributes
-all four Q lists across the same thread group, instead of processing each Q
-in sequence. Its independent location and counter writers require no internal
-thread rendezvous: the final thread fence, VF completion and caller's all-core
-publication barrier still precede downstream consumers. Detailed stamping is
-compiled out of the normal service path.
-
-The current device model verifies expected TopK, mappings, WQE addresses,
-posted count and final locations (`mode=1 posted=146 bad=0`). The complete
-experimental operator also builds with CANN, including diagnostic and normal
-branches. These measurements exclude NIC/CQ and downstream completion, and do
-not establish the improvement of the padded-batch-16 hardware tail (85.34 us
-in the latest supplied trace). Rerun `compare.py` for that complete scope.
-
-## Detailed hardware evidence
-
-The A/B runner also captures a separate diagnostics-enabled graph after the
-uninstrumented performance samples. Each `A/graph-captured` and
-`B/graph-captured` directory retains `level3.json` (raw timing, flags, errors,
-window events, rank records, row state, final descriptors and locations),
-`window_events.bin`, `window_ticks.json`, and `final_detail.log`.
-
-The console aggregates timings over active requests and service lanes rather
-than dumping every core. Window rows show the combined TopK-through-service interval, TopK, service, scan, filter and post
-mean/max; final rows show classification, terminal admission/post/location
-patch, barriers, resolver, Index, output and Get phases. The counter rate is
-measured on the device. Detailed replay timings are not substituted into the
-uninstrumented A/B performance table. The extra terminal event is reported as
-epoch `windows`; the preceding epochs are the intermediate windows.
-
-Extra TopK cores still join completion barriers, but cannot write beyond the
-original tail core-timing allocation. Raw terminal phase stamps use reserved
-rank-record slots 16 through 26; window rank records remain unchanged.
-
-## Direct terminal completion
-
-B deletes `Producer`, `ResolveQueryWork`, `ResolveCompactBody`,
-`ResolveCompact`, `ResolveFirstCompactQuery` and the compact-parallel include
-from its generated streaming source. There is no resolver fallback call.
-After all terminal misses have locations, a small handoff publishes the
-existing change prefix for Index update and zero remaining per-Q Fetch counts.
-Output workers materialize outputs; completion workers drain the shared
-intermediate/terminal CQ and retire state.
-
-The local same-candidate model passes with `mode=2 posted=146 bad=0`:
-TopK + terminal posting + location patch + this handoff takes 55.83 us.
-The previously measured scope ending before handoff was 48.89 us; the added
-publication scope is 6.94 us. This still excludes downstream Index/output/CQ
-completion and is not a measured end-to-end hardware saving.
-Active empty-miss, inactive padding, and incomplete-terminal cases also pass
-(`handoff boundaries bad=0`), including consecutive reuse of publication flags.
-The full generated B operator builds successfully with CANN.
+The integrated local normal case passes (`mode=5 posted=146 bad=0`). Its
+vendor-profiled maximum core duration is 84.93 us, including the output adapter
+and handoff. This is a wider scope than the unchanged window-only measurement
+(52.71 us); it does not establish a faster complete tail on hardware.
