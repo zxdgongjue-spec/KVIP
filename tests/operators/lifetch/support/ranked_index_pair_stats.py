@@ -59,7 +59,13 @@ def stage_windows(raw, *, candidate):
                     or np.any(pieces < 1) or np.any(longest <= 0) or np.any(busy < longest)
                     or np.any(busy > b-a)):
                 raise ValueError('Partner read violates its slice budget or cycle accounting')
-            samples[-1].update(longest=longest, busy=busy)
+            # A second read can pause to serve the first row. Only charge
+            # time that MUST have been spent reading inside its observed wait.
+            own_end = spare[call, lane, 17]
+            own_scatter = spare[call, lane, 18]
+            common = np.maximum(0, np.minimum(b, own_scatter)-np.maximum(a, own_end))
+            covered = np.maximum(0, busy-((b-a)-common))
+            samples[-1].update(longest=longest, busy=busy, covered=covered)
     first = samples[0]
     out = dict(counts=dict(first_reads=first['calls']),
                p50_us=dict(first_read_to_scatter=quantile(first['after_read'],clock),
@@ -69,6 +75,7 @@ def stage_windows(raw, *, candidate):
         other = samples[1]
         out['counts'].update(second_reads=other['calls'], second_moves=other['moves'])
         out['p50_us'].update(second_busy_read=quantile(other['busy'],clock),
+                             second_read_in_first_wait_min=quantile(other['covered'],clock),
                              second_longest_slice=quantile(other['longest'],clock))
         out['p95_us']['second_ready_to_scatter'] = quantile(other['ready_delay'],clock,95)
     return out

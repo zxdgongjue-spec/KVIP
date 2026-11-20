@@ -160,6 +160,9 @@ def test_two_staged_prefixes_keep_separate_rows_and_waits():
     assert both['p50_us']['first_ready_to_scatter'] == 0
     assert both['p95_us']['second_ready_to_scatter'] == 3
     assert both['p50_us']['second_busy_read'] == 9
+    assert both['p50_us']['second_read_in_first_wait_min'] == 0
+    cores[0, 56, 18] = 194
+    assert stage_windows(raw, candidate=True)['p50_us']['second_read_in_first_wait_min'] == 9
     control = stage_windows(raw, candidate=False)
     assert control['counts'] == dict(first_reads=1)
     cores[0, 56, 26] = 257
