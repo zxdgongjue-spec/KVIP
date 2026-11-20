@@ -227,9 +227,9 @@ def launch(config, directory):
               for key, value in vars(config).items()}
     atomic_json(directory / 'config.json', values)
     environment = worker_environment(config.kvaf_root, require_runtime=getattr(config, "operation", None) != "contract")
-    if getattr(config, 'candidate_root', None):
-        from peer_candidate import candidate_package
-        package, _ = candidate_package(config.candidate_root, mainline=bool(getattr(config, 'route_policy', None)))
+    if getattr(config, 'production_root', None) or getattr(config, 'candidate_root', None):
+        from peer_candidate import worker_package
+        package, _ = worker_package(config)
         environment['PYTHONPATH'] = str(package) + os.pathsep + environment['PYTHONPATH']
     command = [sys.executable, '-u', '-X', 'faulthandler', str(Path(__file__).resolve()),
                str(directory / 'config.json')]
@@ -247,9 +247,13 @@ def run_config(path, shared_pool=None):
     config = SimpleNamespace(**json.loads(path.read_text()))
     config.kvaf_root = Path(config.kvaf_root).resolve()
     config.output = path.parent
-    if getattr(config, 'candidate_root', None):
-        from peer_candidate import candidate_package
-        package, config.candidate_revision = candidate_package(config.candidate_root, mainline=bool(getattr(config, 'route_policy', None)))
+    if getattr(config, 'production_root', None) or getattr(config, 'candidate_root', None):
+        from peer_candidate import worker_package
+        package, revision = worker_package(config)
+        if getattr(config, 'production_root', None):
+            config.production_revision = revision
+        else:
+            config.candidate_revision = revision
         if Path(kvip.__file__).resolve().parent != package / 'kvip':
             raise RuntimeError(f'Worker imported unexpected KVIP package: {kvip.__file__}')
     use_pool = config.mode in ('bench', 'diagnose')
@@ -3401,6 +3405,14 @@ class FusedReplayState:
             expected = self.pages.token_payload(row, layout[row, slots])
             if not np.array_equal(output[row, slots], expected):
                 raise RuntimeError(f'Replay persistent hot KV mismatch: request={row}')
+        if getattr(self, 'verify_ranked_events', False):
+            from ranked_five_report import verify_swaps
+            sources = self.forward.events_src.cpu().numpy()
+            destinations = self.forward.events_dst.cpu().numpy()
+            counts = self.forward.flags.cpu().numpy()[:, (0,12,13,14,15), 1]
+            for row in range(self.batch):
+                verify_swaps(self.input_layout[row], layout[row], inputs.captured_hot_valid[row],
+                             hot_valid[row], sources[row], destinations[row], counts[row])
         return layout, hot_valid
 
     def check_completion(self):
@@ -3465,6 +3477,8 @@ class FusedReplayState:
                 f'source={source} selected={selected} resolver_slot={raw_slot}')
         output = self.output[1:].cpu().numpy()
         layout, hot_valid = self.validate_index(inputs, output)
+        if getattr(self, 'verify_ranked_events', False):
+            self.topk_set_digest = hashlib.sha256(np.sort(ids, axis=-1).astype('<i8').tobytes()).hexdigest()
         for row in range(self.batch):
             mask = slots[row] < self.resident
             selected_slots = slots[row][mask]
@@ -3698,6 +3712,10 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
     # Multi-round validation also advances the host LRU for the next input.
     compact = config.mode == "bench" and len(sequence.rounds) == 1
     policy = getattr(config, 'route_policy', None)
+    ranked = bool(getattr(config, 'production_root', None))
+    if ranked:
+        for state in states:
+            state.verify_ranked_events = True
     lean = policy in ('zero', 'early')
     candidate = fused and getattr(config, 'candidate_root', None) and not policy
     if lean:
@@ -3714,7 +3732,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
         nonlocal pending
         pending = True
         for i, state in enumerate(states):
-            if policy and label != 'measured':
+            if (policy or ranked) and label != 'measured':
                 # A matched single-round arm is reset between calls. Check
                 # completion now, and verify every measured state after timing.
                 state.check_completion()
@@ -3741,7 +3759,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             pending = True
             state.forward()
             stream.synchronize()
-            if policy:
+            if policy or ranked:
                 state.check_completion()
             elif not compact:
                 checks.check(f'pre_capture/input{i}', lambda state=state: state.validate(initial))
@@ -3842,13 +3860,13 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                 replay()
                 stream.synchronize()
                 validate_all(inputs, 'detail')
-                if policy:
+                if policy or ranked:
                     from lean_replay import stage_report
                     if lean:
                         route_history['diagnostic'] = checked_routes(states, **route_step(config.warmup + 2), low=True)
                     folder = directory / 'diagnose' / f'round-{inputs.source_round}'
                     atomic_json(folder / 'lean_stages.json',
-                                stage_report(states, measured, samples, clock_mhz, policy, folder))
+                                stage_report(states, measured, samples, clock_mhz, policy or 'main', folder))
                     continue
                 from diagnostics import decode_rank_progress
                 details = []
@@ -3932,8 +3950,9 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     torch.npu.set_device(config.device)
     device = torch.device(f'npu:{config.device}')
     stream = torch.npu.current_stream(device)
-    _, registration, _ = _load_native_operators('c8_offload')
-    registration.require_a5_dsa_registration(('lidu_fused_batch_get_prepare_mtp_out',))
+    if not fused:
+        _, registration, _ = _load_native_operators('c8_offload')
+        registration.require_a5_dsa_registration(('lidu_fused_batch_get_prepare_mtp_out',))
     g = initial.geometry
     width = g['token_bytes']
     workers = 40 if fused and config.transport == 'urma' else 2
@@ -4068,7 +4087,11 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             result.update(transport=config.transport, path='fused' if fused else 'serial',
                           runtime_workers=shared_pool.workers if borrowed else workers, geometry=g,
                           input_paths=[str(ref.manifest_path) for refs in sequence.rounds for ref in refs])
-            if getattr(config, 'candidate_root', None):
+            if getattr(config, 'production_root', None):
+                result['topk_set_digests'] = [s.topk_set_digest for s in batch_states]
+                result['production_revision'] = config.production_revision
+                result['binary_sha256'] = hashlib.sha256(Path(library).read_bytes()).hexdigest()
+            elif getattr(config, 'candidate_root', None):
                 result['candidate_revision'] = config.candidate_revision
                 result['binary_sha256'] = hashlib.sha256(Path(library).read_bytes()).hexdigest()
             atomic_json(directory / 'path_result.json', result)

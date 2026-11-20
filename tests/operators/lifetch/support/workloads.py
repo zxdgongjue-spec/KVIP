@@ -146,6 +146,8 @@ def configuration(argv=None):
             command.add_argument('--level', type=int, choices=(1, 2, 3), default=1)
             command.add_argument('--route-policy', choices=('main', 'zero', 'early'),
                                  help='G2 mainline or learned low route with matched stage accounting')
+            command.add_argument('--production-root', type=Path,
+                                 help='clean ranked URMA checkout whose binding and kernels will run')
             command.add_argument('--candidate-root', type=Path, help='G2 auto-route production checkout')
             command.add_argument('--candidate-snapshot', type=Path, help='matching G2 predecessor bounds')
             command.add_argument('--stages', type=csv_values, default=('all',))
@@ -201,6 +203,12 @@ def configuration(argv=None):
     if args.mode == 'diagnose':
         if (args.serial_only or args.fused_only) and args.input != 'real':
             parser.error('standalone path measurements require --input real')
+        if args.production_root:
+            if (args.transport != 'urma' or not args.fused_only or args.input != 'real'
+                    or args.round_range[0] != args.round_range[1] or args.level != 2
+                    or args.candidate_root or args.candidate_snapshot or args.route_policy):
+                parser.error('--production-root requires a fused-only real single-round URMA level-2 replay')
+            args.production_root = args.production_root.resolve()
         if args.route_policy:
             if (args.transport != 'urma' or not args.fused_only or args.group != 2
                     or args.round_range != (1, 1) or args.level != 2 or args.warmup < 2

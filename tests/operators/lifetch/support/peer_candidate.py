@@ -17,10 +17,19 @@ OPTIONS = dict(selected_metadata=True, early_fetch_ready=True, ready_batch_fetch
                low_miss_direct_index=True, low_miss_post_index=True, adaptive_admission=True)
 
 
-def candidate_package(root, *, mainline=False):
+RANKED_BASE = '1d2486a76151ae37662c47aab835d06df50be866'
+
+
+def worker_package(config):
+    if getattr(config, 'production_root', None):
+        return candidate_package(config.production_root, base=RANKED_BASE)
+    return candidate_package(config.candidate_root, mainline=bool(getattr(config, 'route_policy', None)))
+
+
+def candidate_package(root, *, mainline=False, base=None):
     path = Path(root).resolve()
     revision = subprocess.check_output(['git', '-C', str(path), 'rev-parse', 'HEAD'], text=True).strip()
-    base = 'a56154c37bebb0928da4a4095e9670898e6b21c7' if mainline else REVISION
+    base = base or ('a56154c37bebb0928da4a4095e9670898e6b21c7' if mainline else REVISION)
     subprocess.run(['git', '-C', str(path), 'merge-base', '--is-ancestor', base, revision], check=True)
     subprocess.run(['git', '-C', str(path), 'diff', '--quiet', 'HEAD', '--', 'python', 'csrc'], check=True)
     return path / 'python', revision
