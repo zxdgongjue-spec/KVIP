@@ -310,7 +310,8 @@ def run_case(args, snap, output):
 
 def summarize_kernels(path, result):
     trace=json.loads(path.read_text())
-    for event in trace.get("traceEvents",[]):
+    events = trace if isinstance(trace, list) else trace["traceEvents"]
+    for event in events:
         if event.get("ph") != "X" or "kernel" not in event.get("cat","").lower():
             continue
         name=event.get("name","")
@@ -327,11 +328,29 @@ def main():
     p.add_argument("--device", type=int, default=4)
     p.add_argument("--iterations", type=int, default=3)
     p.add_argument("--timeout-seconds", type=int, default=600)
-    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--output", type=Path)
+    p.add_argument("--report-only", action="store_true",
+                   help="Read existing trace JSON files from the positional path; no NPU or snapshot load")
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--audit-only", action="store_true")
     p.add_argument("--case", choices=("eager-captured", "graph-captured", "eager-clean", "graph-clean"), help=argparse.SUPPRESS)
     args = p.parse_args()
+    if args.report_only:
+        paths = [args.snapshot] if args.snapshot.is_file() else sorted(args.snapshot.rglob("trace-*.json"))
+        if not paths:
+            p.error(f"No trace-*.json files under {args.snapshot}")
+        samples = {}
+        for path in paths:
+            summarize_kernels(path, samples)
+        if not samples:
+            p.error("No recognized device LI kernels in the existing traces")
+        print(f"Source: {args.snapshot}; traces={len(paths)}; profiling samples only")
+        print("Kernel | mean us | min us | max us | N")
+        for name, values in sorted(samples.items()):
+            print(f"{name} | {sum(values)/len(values):.2f} | {min(values):.2f} | {max(values):.2f} | {len(values)}")
+        return 0
+    if args.output is None:
+        p.error("--output is required for snapshot execution")
     if args.iterations < 1 or args.warmup < 0:
         p.error("iterations must be positive and warmup nonnegative")
     args.output.mkdir(parents=True, exist_ok=args.case is not None)
