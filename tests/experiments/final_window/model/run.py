@@ -25,7 +25,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--kvaf-include', required=True, type=Path)
-    parser.add_argument('--baseline-ref', default='44fd654')
+    parser.add_argument('--baseline-ref', default='c2c0a7b')
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)

@@ -29,7 +29,7 @@ extern "C" __global__ __aicore__ void test_service(GM_ADDR arg,uint32_t mode){
   if(mode)RunTerminalService(a,0);
   else {TPipe pipe;TBuf<TPosition::VECCALC> scratch,flags,ids;
    pipe.InitBuffer(scratch,65536);pipe.InitBuffer(flags,32768);pipe.InitBuffer(ids,8192);
-   rotating::FastService<true,true,false>(1,s.history,s.resident,4,1,656,256,240,1,23808,
+   rotating::FastService<false,true,false>(1,s.history,s.resident,4,1,656,256,240,1,23808,
     reinterpret_cast<GM_ADDR>(ctx),3,0,0,scratch.Get<uint32_t>(),flags.Get<uint16_t>(),ids.Get<uint32_t>(),rotating::SequenceHalfWindow(s),a->queryErrors);
    pipe.Destroy();}
  }

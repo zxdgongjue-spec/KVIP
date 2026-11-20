@@ -38,12 +38,33 @@ def prepare(repo, destination):
     text=text.replace(marker,'#include "terminal_window.h"\n'+marker.replace('(GM_ADDR arg)','(GM_ADDR arg, GM_ADDR bindings)'))
     start=text.index('extern "C" __global__ __aicore__ void v9_streaming_resolve_update')
     at=text.index('  uint32_t workers=',start)
-    phases='''  if(block<2*shape.liCores) RunLi<SequenceLiPhase::Final>(bindings);
+    tail=text[start:]
+    declaration='  bool profile=(a->prefetchCount & 0x80000000U)!=0;\n'
+    if tail.count(declaration)!=1:raise ValueError('Expected tail profiling declaration')
+    text=text[:start]+tail.replace(declaration,'',1)
+    phases='''  bool profile=(a->prefetchCount & 0x80000000U)!=0;
+  if(profile) StampTerminal(a,block,0);
+  if(block<2*shape.liCores) RunLi<SequenceLiPhase::Final>(bindings);
+  if(profile) StampTerminal(a,block,1);
   AscendC::SyncAll<true>();
-  if(block<shape.serviceLanes)RunTerminalService(a,block);
+  if(profile) StampTerminal(a,block,2);
+  if(block<shape.serviceLanes){
+    if(profile)RunTerminalService<true>(a,block);
+    else RunTerminalService<false>(a,block);
+  }
+  if(profile) StampTerminal(a,block,3);
   AscendC::SyncAll<true>();
+  if(profile) StampTerminal(a,block,4);
 '''
-    text=text[:at]+phases+text[at:];path.write_text(text)
+    text=text[:at]+phases+text[at:]
+    # Extra TopK cores must still join the tail's retirement barrier, but have
+    # no slots in the original per-core diagnostic allocation.
+    tail_start=text.index('extern "C" __global__ __aicore__ void v9_streaming_resolve_update')
+    head,tail=text[:tail_start],text[tail_start:]
+    trace_marker='  auto trace=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*256+uint64_t(block)*32;'
+    if tail.count(trace_marker)!=1:raise ValueError('Expected tail core trace allocation')
+    tail=tail.replace(trace_marker,'  profile=profile && block<shape.batch*kResolveCores+4*workers;\n'+trace_marker,1)
+    path.write_text(head+tail)
     shutil.copy2(Path(__file__).with_name('terminal.h'),destination/base/'op_kernel/terminal_window.h')
     patch(base+'op_kernel/prefetch.h','template<bool captureIo, bool predecessorChecked=false>',
           'template<bool captureIo, bool predecessorChecked=false, bool terminal=false>')

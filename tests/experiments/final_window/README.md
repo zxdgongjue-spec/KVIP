@@ -46,7 +46,7 @@ resolver fast-path bound remains unchanged.
 ## Local device-model comparison
 
 `model/run.py` builds the current experimental implementation and the previous
-`44fd654` experiment, then runs CANN's Ascend950PR_9599 simulator. Source the CANN
+`c2c0a7b` experiment, then runs CANN's Ascend950PR_9599 simulator. Source the CANN
 environment and put its simulator library directory on `LD_LIBRARY_PATH` first:
 
 ```bash
@@ -78,11 +78,47 @@ Local combined-kernel results (one active request, bound batch 1):
 
 | Path | Simulator duration, us | Posted | Check |
 | --- | ---: | ---: | --- |
-| Middle TopK + prefetch | 49.13 | 146 | PASS |
-| Previous terminal TopK + posting/location restore | 83.18 | 146 | PASS |
-| Optimized terminal TopK + posting/location patch | 57.96 | 146 | PASS |
+| Middle TopK + prefetch, detailed stamps off | 48.34 | 146 | PASS |
+| Terminal at c2c0a7b | 57.96 | 146 | PASS |
+| Terminal with scalar admission and hoisted miss counts | 50.25 | 146 | PASS |
+| Current terminal, combined miss-location patch | 48.89 | 146 | PASS |
 
-The terminal scope improves by 25.22 us (30.32%); its remaining difference
-from the middle path is 8.83 us. These are combined measurements, not sums of
-separate probes. They do not establish the improvement of the padded-batch-16
-hardware tail (97.61 us in the supplied trace); rerun `compare.py` for that.
+The terminal path saves 9.07 us (15.65%) versus c2c0a7b, leaving 0.55 us
+versus the middle path with detailed stamps disabled. The earlier 49.13 us
+middle measurement enabled service diagnostics and is superseded by 48.34 us
+for this comparison.
+
+The four miss counts and pointers are loaded once on the AIV. Admission no
+longer launches a single-thread SIMT function. Location patching distributes
+all four Q lists across the same thread group, instead of processing each Q
+in sequence. Its independent location and counter writers require no internal
+thread rendezvous: the final thread fence, VF completion and caller's all-core
+publication barrier still precede downstream consumers. Detailed stamping is
+compiled out of the normal service path.
+
+The current device model verifies expected TopK, mappings, WQE addresses,
+posted count and final locations (`mode=1 posted=146 bad=0`). The complete
+experimental operator also builds with CANN, including diagnostic and normal
+branches. These measurements exclude NIC/CQ and downstream completion, and do
+not establish the improvement of the padded-batch-16 hardware tail (85.34 us
+in the latest supplied trace). Rerun `compare.py` for that complete scope.
+
+## Detailed hardware evidence
+
+The A/B runner also captures a separate diagnostics-enabled graph after the
+uninstrumented performance samples. Each `A/graph-captured` and
+`B/graph-captured` directory retains `level3.json` (raw timing, flags, errors,
+window events, rank records, row state, final descriptors and locations),
+`window_events.bin`, `window_ticks.json`, and `final_detail.log`.
+
+The console aggregates timings over active requests and service lanes rather
+than dumping every core. Window rows show the combined TopK-through-service interval, TopK, service, scan, filter and post
+mean/max; final rows show classification, terminal admission/post/location
+patch, barriers, resolver, Index, output and Get phases. The counter rate is
+measured on the device. Detailed replay timings are not substituted into the
+uninstrumented A/B performance table. The extra terminal event is reported as
+epoch `windows`; the preceding epochs are the intermediate windows.
+
+Extra TopK cores still join completion barriers, but cannot write beyond the
+original tail core-timing allocation. Raw terminal phase stamps use reserved
+rank-record slots 16 through 24; window rank records remain unchanged.

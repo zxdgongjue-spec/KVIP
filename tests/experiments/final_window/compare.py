@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 
@@ -60,7 +61,27 @@ def main():
                     kv=payload.gather(1,order[:,:,None].expand(-1,-1,payload.shape[-1]))),output / "selected_kv.pt")
 '''
     if utility.count(marker)!=1:raise ValueError('Snapshot utility layout changed')
-    runner=args.output/'snapshot_runner.py';runner.write_text(utility.replace(marker,addition+marker))
+    utility = utility.replace(marker,addition+marker)
+    # The installed runner uses the original performance path, then a separate
+    # diagnostics-enabled graph. Keep all raw level-3 data for offline analysis.
+    support = repo / 'tests/operators/lifetch/support'
+    utility = utility.replace('    forward.set_options(diagnostics=True)',
+        f"    sys.path.insert(0, {str(support)!r})\n"
+        "    from execution import StreamingForward\n"
+        "    from detail import save_detail, summarize\n"
+        "    clock_mhz = StreamingForward.calibrate_counter_mhz(forward)\n"
+        "    forward.set_options(diagnostics=True)")
+    utility = utility.replace('    if any(status) or invalid:',
+        "    detail_path = save_detail(forward, rotating, valid, output, clock_mhz,\n"
+        "        terminal=(args.kvip_root / 'csrc/operators/lightning_indexer_with_fetch/op_kernel/terminal_window.h').exists())\n"
+        "    summarize(detail_path)\n"
+        "    if any(status) or invalid:")
+    utility = utility.replace('print((destination / "kernel_times.json").read_text(), flush=True)',
+                              'print("Kernel samples:", destination / "kernel_times.json", flush=True)')
+    utility = utility.replace('print_windows(json.loads((destination / "window_ticks.json").read_text()))',
+                              'print("Level3 records:", destination / "level3.json", flush=True)')
+    runner=args.output/'snapshot_runner.py';runner.write_text(utility)
+    shutil.copy2(Path(__file__).with_name('detail.py'), args.output/'detail.py')
     candidate=args.output/'candidate-source'
     prepare(repo,candidate)
     print('A: original final TopK + tail. B: one kernel, bounded terminal prefetch + original completion/fallback.',flush=True)
@@ -73,10 +94,12 @@ def main():
                  '--windows',str(args.windows),'--prefetch-tokens',str(args.prefetch_tokens),
                  '--prefetch-rank-start',str(args.prefetch_rank_start),
                  '--warmup',str(args.warmup),'--iterations',str(args.iterations),
-                 '--profile-only','--timeout-seconds','900']
+                 '--timeout-seconds','900']
         code=subprocess.run(command).returncode
         if code:raise SystemExit(f'{name} failed: {output}; no performance acceptance')
         folder=output/'graph-captured'
+        from detail import summarize
+        summarize(folder/'level3.json')
         values=json.loads((folder/'kernel_times.json').read_text())
         means={key:sum(v)/len(v) for key,v in values.items() if v}
         final=sum(v for k,v in means.items() if re.fullmatch(r'v9_li_kernel_3(?:_\d+)?',k))
