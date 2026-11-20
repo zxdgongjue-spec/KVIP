@@ -3,7 +3,7 @@
 #include "context.h"
 #if !V9_UBMEM
 #include "round_prepare.h"
-#include "adaptive_route.h"
+#include "adaptive_route_probe.h"
 #endif
 struct QLITilingData {
     uint32_t bSize,tSize,gSize,s1Size,s2Size,sparseCount,usedCoreNum,blockSize,maxBlockNumPerBatch,sparseMode;
@@ -29,7 +29,6 @@ __aicore__ inline void RunLi(GM_ADDR bindings) {
     auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
 #define P(i) reinterpret_cast<GM_ADDR>(a[i])
     auto shape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(a[14]));
-    bool splitSequence = rotating::UseSequenceSplit(shape) && HasUniformLengths(shape, P(5), P(6));
 #if !V9_UBMEM && KVIP_STREAMING_LI
     auto workspace = reinterpret_cast<__gm__ pipeline_ab::Args*>(a[15]);
     uint32_t mode = pipeline_ab::adaptive_route::High;
@@ -38,7 +37,7 @@ __aicore__ inline void RunLi(GM_ADDR bindings) {
             auto ctx = reinterpret_cast<__gm__ rotating::Context*>(a[14]);
             const bool profile = (workspace->prefetchCount & 0x80000000U) && shape.aicCount == 32;
             const uint64_t start = profile ? GetSystemCycle() : 0;
-            mode = pipeline_ab::adaptive_route::Choose(workspace, ctx, shape);
+            mode = pipeline_ab::adaptive_route::ChooseMixed(workspace, ctx, shape);
             if (profile) {
                 uint64_t elapsed = GetSystemCycle() - start;
                 uint32_t core = GetBlockIdx();
@@ -57,9 +56,15 @@ __aicore__ inline void RunLi(GM_ADDR bindings) {
         } else {
             mode = pipeline_ab::adaptive_route::Published(workspace);
         }
-        if (mode == pipeline_ab::adaptive_route::Zero) splitSequence = false;
+        // In zero-window mode the first launch scores both history shards.
+        // The existing final launch joins them before TopK; the threshold
+        // and cold-window launches have no work on this route.
+        if constexpr (Phase == SequenceLiPhase::Threshold || Phase == SequenceLiPhase::Cold) {
+            if (mode == pipeline_ab::adaptive_route::Zero) return;
+        }
     }
 #endif
+    const bool splitSequence = rotating::UseSequenceSplit(shape) && HasUniformLengths(shape, P(5), P(6));
     if constexpr (Phase != SequenceLiPhase::Hot) {
         if (!splitSequence) return;
     }

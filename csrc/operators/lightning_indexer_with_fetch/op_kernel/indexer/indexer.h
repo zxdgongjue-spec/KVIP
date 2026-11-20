@@ -148,7 +148,8 @@ protected:
     __aicore__ inline void ProcessMain();
     __aicore__ inline void ScanSequenceHalf(uint32_t begin, uint32_t end, uint32_t shard,
 #if !V9_UBMEM
-                                           uint32_t& loop, uint32_t& scaleLoop, bool last, bool newQuery = false);
+                                           uint32_t& loop, uint32_t& scaleLoop, bool last, bool newQuery = false,
+                                           bool scoreOnly = false);
     __aicore__ inline bool ScoreRecent(uint32_t& loop, uint32_t qScaleLoop,
                                       uint32_t shard = 0, uint32_t shards = 1, bool reuseRetained = false);
     __aicore__ inline void FinishBaseBlock(const QLICommon::RunInfo& runInfo);
@@ -672,7 +673,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessInvalid()
 template <typename QLIT>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
 #if !V9_UBMEM
-    uint32_t begin, uint32_t end, uint32_t shard, uint32_t& loop, uint32_t& scaleLoop, bool last, bool newQuery)
+    uint32_t begin, uint32_t end, uint32_t shard, uint32_t& loop, uint32_t& scaleLoop, bool last, bool newQuery, bool scoreOnly)
 #else
     uint32_t begin, uint32_t end, uint32_t shard, uint32_t& loop, uint32_t& scaleLoop, bool last)
 #endif
@@ -696,7 +697,11 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
         if ASCEND_IS_AIC {
             matmulService.ComputeMm1(info);
         } else {
+#if !V9_UBMEM
+            vectorService.ProcessVec1(info, shard, tile + 1 == end, scoreOnly);
+#else
             vectorService.ProcessVec1(info, shard, tile + 1 == end);
+#endif
         }
     }
 #if !V9_UBMEM
@@ -779,6 +784,16 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
         }
 
         uint32_t loop = 0, scaleLoop = 0;
+#if !V9_UBMEM
+        if (Phase == SequenceLiPhase::Hot && adaptiveZero_) {
+            // Two AICs cover disjoint whole Key pages of the same request.
+            // Each page supplies all four queries and is read by only one AIC.
+            const uint32_t tiles = tempLoopInfo.actS2Size / S2_BASE_SIZE;
+            const uint32_t middle = rotating::ZeroWindowSplitTile(tiles);
+            ScanSequenceHalf(shard ? middle : 0, shard ? tiles : middle, shard,
+                             loop, scaleLoop, true, false, true);
+        } else
+#endif
         if constexpr (Phase == SequenceLiPhase::Hot) {
 #if !V9_UBMEM
             auto ctxRecent = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);

@@ -16,7 +16,7 @@ inline void CleanCacheLines(uint8_t*, uint32_t) {}
 namespace rotating {
 struct Context { uint64_t rowOwners, queryEnds, reservedHot, fallbackAddresses, sourceBlocks; };
 }
-#include "adaptive_route.h"
+#include "adaptive_route_probe.h"
 
 int main() {
     using namespace pipeline_ab;
@@ -35,7 +35,7 @@ int main() {
     ends.fill(130048);
     rotating::RuntimeShape shape{};
     shape.batch=batch; shape.history=131328; shape.resident=16384;
-    shape.indexHeads=32; shape.splitQ=1; shape.tokenBytes=656;
+    shape.indexHeads=32; shape.splitQ=1; shape.tokenBytes=656; shape.aicCount=32; shape.liCores=32;
     rotating::Context ctx{reinterpret_cast<uint64_t>(owners.data()),
         reinterpret_cast<uint64_t>(ends.data()), 1, 1, 1};
     Args args{};
@@ -81,6 +81,20 @@ int main() {
     std::swap(owners[0],owners[3]); assert(choose()==High); std::swap(owners[0],owners[3]);
     ends[8]=0; assert(choose()==High); ends[8]=130048;
     assert(choose()==Zero);
+    // Every active warp lane, including the last, must veto a bad row.
+    for (unsigned b=0; b<batch; ++b) {
+        const auto selected = feedback[owners[b]][2];
+        feedback[owners[b]][2] = uint64_t{1} << 32;
+        assert(choose()==High);
+        feedback[owners[b]][2] = selected;
+        for (unsigned q=0; q<4; ++q) {
+            ends[4*b+q] = shape.history+1;
+            assert(choose()==High);
+            ends[4*b+q] = 130048;
+        }
+    }
+    shape.aicCount=33; assert(choose()==High); shape.aicCount=32;
+    shape.liCores=16; assert(choose()==High); shape.liCores=32;
     mode=choose(); assert(AdaptiveLow(&args));
     args.routePolicy=Early; assert(choose()==Early);
     args.routePolicy=9; assert(choose()==High);

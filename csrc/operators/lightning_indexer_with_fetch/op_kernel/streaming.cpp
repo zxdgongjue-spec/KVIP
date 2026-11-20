@@ -471,7 +471,7 @@ __aicore__ inline void Producer(__gm__ Args* a, uint32_t b, bool zero=false) {
 // Cold sources and distinct hot destinations form independent pairwise swaps.
 // Validate the complete plan before changing Index storage. Otherwise use the
 // permutation planner, which also handles chains and repeated physical rows.
-template<bool Restore=false>
+template<bool Restore=false,bool Allocated=false>
 __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void SwapColdIndexRows(
  __gm__ uint32_t* sources,__gm__ uint32_t* dest,uint32_t begin,uint32_t count,
  uint32_t resident,uint32_t history,__gm__ uint64_t* keys,__gm__ uint32_t* scales,
@@ -479,27 +479,34 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void SwapColdIndexRows(
  uint32_t t=threadIdx.x;
  if constexpr(!Restore){
  if(!t)m[CONTROL]=0;
- if(!begin)for(uint32_t i=t;i<2*SET;i+=THREADS)m[SRCSET+i]=EMPTY;
- asc_syncthreads();
+ if constexpr(!Allocated){
+  if(!begin)for(uint32_t i=t;i<2*SET;i+=THREADS)m[SRCSET+i]=EMPTY;
+  asc_syncthreads();
+ }
  if(t<count){
   uint32_t i=t;
   uint32_t src=asc_ldcg(sources+i),dst=asc_ldcg(dest+i);
   m[PLAN_SRC+begin+t]=src;m[PLAN_DST+begin+t]=dst;
-  if(src<resident || src>=history || dst>=resident ||
-     !insert(m+SRCSET,src) || !insert(m+DSTSET,dst))asc_atomic_or(m+CONTROL,1U);
+  if constexpr(!Allocated){
+   if(src<resident || src>=history || dst>=resident ||
+      !insert(m+SRCSET,src) || !insert(m+DSTSET,dst))asc_atomic_or(m+CONTROL,1U);
+  }
  }
  asc_syncthreads();
- if(m[CONTROL])return;
+ if constexpr(!Allocated){if(m[CONTROL])return;}
  }
  for(uint32_t i=t;i<count*16;i+=THREADS){
   uint32_t src=m[PLAN_SRC+begin+i/16],dst=m[PLAN_DST+begin+i/16],j=i%16;
+  if constexpr(Allocated){if(src==dst)continue;}
   auto x=asc_ldcg(keys+16ULL*src+j),y=asc_ldcg(keys+16ULL*dst+j);
   asc_stcg(keys+16ULL*src+j,y);asc_stcg(keys+16ULL*dst+j,x);
  }
  if(t<count){
   uint32_t src=m[PLAN_SRC+begin+t],dst=m[PLAN_DST+begin+t];
-  auto x=asc_ldcg(scales+src),y=asc_ldcg(scales+dst);
-  asc_stcg(scales+src,y);asc_stcg(scales+dst,x);
+  if(!Allocated || src!=dst){
+   auto x=asc_ldcg(scales+src),y=asc_ldcg(scales+dst);
+   asc_stcg(scales+src,y);asc_stcg(scales+dst,x);
+  }
  }
  asc_threadfence();
 }
@@ -570,7 +577,7 @@ inline void RetireSelection(__gm__ Args* a,uint32_t batch,uint32_t b){
 #include "index_team.h"
 #endif
 template<bool Team=false>
-__aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
+__aicore__ inline void Consumer(__gm__ Args* a, uint32_t b, bool zero=false) {
  auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;auto status=reinterpret_cast<__gm__ uint32_t*>(a->workerStatus)+b*32;
  // Producer and consumer must not write the same cache lines.
  auto ticks=reinterpret_cast<__gm__ uint64_t*>(a->times)+b*64+32;auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
@@ -592,7 +599,25 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
  auto prepared=reinterpret_cast<__gm__ uint64_t*>(dense+2*shape.history);
  bool disjoint=false;
 #if !V9_UBMEM && KVIP_OUTPUT_WORKER
- if(!Team && ctx->reservedHot && a->queryErrors && prepareMetadata){
+ if(zero && prepareMetadata){
+  auto q4=flags+kRawQueryFlag+3;
+  error=AwaitPublication(q4);
+  uint32_t count=q4->reserved[1];
+  if(!error && count<=CHUNK){
+   if(count){
+    if(profile)swapStart=GetSystemCycle();
+    Simt::VF_CALL<SwapColdIndexRows<false,true>>(Simt::Dim3{THREADS,1,1},
+     reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+b*a->maxEvents+kPrefetch,
+     reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+b*a->maxEvents+kPrefetch,0,count,
+     shape.resident,shape.history,
+     reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*a->history*16,
+     reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*shape.history,work);
+    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+    if(profile){applyTicks+=GetSystemCycle()-swapStart;++applyCalls;}
+   }
+   disjoint=true;total=seen=count;
+  }
+ }else if(!Team && ctx->reservedHot && a->queryErrors && prepareMetadata){
   auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
   auto headers=reinterpret_cast<__gm__ uint32_t*>(a->queryErrors)+b*4*32;
   uint32_t prefix=row->slots,upper=0;
@@ -951,8 +976,14 @@ struct FinalIndexPostTail {
  }
 };
 #endif
+__aicore__ inline void SnapshotGroup(__gm__ Args* a,uint32_t batch,uint32_t group,uint32_t groups){
+ for(uint32_t first=group;first<batch;first+=groups*2){
+  Simt::VF_CALL<SnapshotMappings>(Simt::Dim3{256,1,1},a,batch,first,groups);
+  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+ }
+}
 template<bool Team=false>
-__aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,uint32_t workers,bool skipEmptyConflict=true,bool standalone=false){
+__aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,uint32_t workers,bool skipEmptyConflict=true,bool standalone=false,bool separateSnapshot=false){
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  if(lane>=shape.batch)return;
  bool directLayout=skipEmptyConflict && !(a->prefetchCount & 0x20000000U);
@@ -967,13 +998,8 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
  // The first 2*batch views include the independent prefetch queues. The
  // following views are paired, exclusively owned by this Q worker.
  uint32_t pair=2*shape.batch+2*(q*workers+lane);
- if(!standalone && a->completedMapping && a->liveCount && shape.batch<=16){
-  uint32_t groups=4*workers;
-  for(uint32_t first=q*workers+lane;first<shape.batch;first+=groups*2){
-   Simt::VF_CALL<SnapshotMappings>(Simt::Dim3{256,1,1},a,shape.batch,first,groups);
-   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-  }
- }
+ if(!standalone && !separateSnapshot && a->completedMapping && a->liveCount && shape.batch<=16)
+  SnapshotGroup(a,shape.batch,q*workers+lane,4*workers);
  auto args=GetArgs(ctx,pair);args.jettys_per_core=2;
  args.indices=uint64_t(packed);args.offsets=uint64_t(packed+stride);args.output_indices=uint64_t(packed+2*stride);
  args.miss_count=(!standalone && a->liveCount)?a->liveCount:ctx->count;args.request_capacity=stride;
@@ -1394,7 +1420,7 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
     Producer(a,b,zero);
     if(team)FinalizeStreaming<true>(a,b);else FinalizeStreaming(a,b);
    }else if(role==1){
-    if(team)Consumer<true>(a,b);else Consumer(a,b);
+    if(team)Consumer<true>(a,b);else Consumer(a,b,zero);
    }else{
     OutputWorker(a,b);
 #if !V9_UBMEM
@@ -1429,13 +1455,24 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
 #endif
   }
   else {uint32_t lane=block-shape.batch*kResolveCores,q=lane/workers,part=lane%workers;
+#if !V9_UBMEM
+   // An all-core launch can have a spare AIV for each low-mode queue.
+   // Move its mapping snapshot off the submitter; the same per-row ready
+   // word still protects journal retirement.
+   bool separateSnapshot=zero && a->completedMapping && a->liveCount && shape.batch<=16 &&
+       GetBlockNum()>=shape.batch*kResolveCores+8*workers;
+#endif
    if(q<4 && part<workers){
 #if !V9_UBMEM
-    if(team)FetchQueryGroup<true>(a,q,part,workers);else
-#endif
+    if(team)FetchQueryGroup<true>(a,q,part,workers);
+    else FetchQueryGroup(a,q,part,workers,true,false,separateSnapshot);
+#else
     FetchQueryGroup(a,q,part,workers);
+#endif
    }
 #if !V9_UBMEM
+   else if(separateSnapshot && lane<8*workers)
+    SnapshotGroup(a,shape.batch,lane-4*workers,4*workers);
    else if(team && !index_team::CopySealedPrefix(a,block,shape.batch)){
     index_team::HelpBeforeHome(a,block,shape.batch);
     index_team::Copy(a,block,shape.batch);

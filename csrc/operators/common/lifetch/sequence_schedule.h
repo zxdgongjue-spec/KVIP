@@ -17,6 +17,13 @@ LIFETCH_SCHEDULE_DEVICE inline bool UseSequenceSplit(const RuntimeShape& s) {
         (s.history - s.resident) >= 512 * (s.rounds - 1);
 }
 
+// Use this split only when UseSequenceSplit holds. The tile count is even
+// and large enough for both halves. Round the midpoint to a 256-token Key
+// fetch boundary (two score tiles), so both shards read disjoint Key pages.
+LIFETCH_SCHEDULE_DEVICE inline uint32_t ZeroWindowSplitTile(uint32_t tiles) {
+    return (tiles / 2 + 1) & ~1U;
+}
+
 LIFETCH_SCHEDULE_DEVICE inline uint32_t SequenceHalfWindow(const RuntimeShape& s) {
     // Keep all shard starts tile-aligned; the last shard is clipped to history.
     const uint32_t blocks = (s.history - s.resident + 511) / 512;

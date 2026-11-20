@@ -10,7 +10,13 @@ constexpr uint32_t kThreads = 512;
 constexpr uint32_t kBucket = 0x80000000U;
 constexpr uint32_t kFirst = 0x40000000U;
 constexpr uint32_t kMask = kSlots - 1;
+// Fits every supported resident slot. The high bits carry the LRU ordinal
+// which selected it; the bitmap fallback has no ordinal.
+constexpr uint32_t kSlotBits = 17;
+constexpr uint32_t kSlotMask = (1U << kSlotBits) - 1;
 static_assert(kSlots == 8192 && kTop == 2048, "Q4 rank encoding");
+static_assert(kLruSlots % kThreads == 0 && kLruSlots/kThreads<=32, "LRU eligibility mask");
+static_assert(kLruSlots < (1U<<(32-kSlotBits)), "LRU ordinal must fit in a slot choice");
 
 struct Group {
     __gm__ int32_t* descriptors;
@@ -36,11 +42,14 @@ __simt_callee__ inline void AllocateSlots(uint32_t resident, uint32_t needed,
     if (!needed) return;
     const uint32_t tid = threadIdx.x, per = kLruSlots/kThreads;
     auto bitmap = ctl+1024, lru = scratch+4096;
-    uint32_t available = 0;
+    uint32_t eligible = 0, available = 0;
     for (uint32_t i=tid*per; i<(tid+1)*per; ++i) {
         const uint32_t slot = lru[i];
         if (slot >= resident) { asc_atomic_or(ctl+1,4U); continue; }
-        available += !(bitmap[slot/32] & (1U<<(slot%32)));
+        if (!(bitmap[slot/32] & (1U<<(slot%32)))) {
+            eligible |= 1U << (i - tid*per);
+            ++available;
+        }
     }
     uint32_t rank = StagedPrefix(available,ctl);
     if (ctl[1]) return;
@@ -48,15 +57,15 @@ __simt_callee__ inline void AllocateSlots(uint32_t resident, uint32_t needed,
     const uint32_t allocated = n < needed ? n : needed;
     for (uint32_t i=tid*per; i<(tid+1)*per; ++i) {
         const uint32_t slot = lru[i];
-        if (!(bitmap[slot/32] & (1U<<(slot%32)))) {
-            if (rank < allocated) slots[rank] = slot;
+        if (eligible & (1U << (i - tid*per))) {
+            if (rank < allocated) slots[rank] = slot | ((i+1) << kSlotBits);
             ++rank;
         }
     }
     asc_syncthreads();
     if (allocated == needed) return;
     for (uint32_t i=tid; i<allocated; i+=kThreads)
-        asc_atomic_or(bitmap+slots[i]/32,1U<<(slots[i]%32));
+        asc_atomic_or(bitmap+(slots[i]&kSlotMask)/32,1U<<(slots[i]%32));
     asc_syncthreads();
     const uint32_t words = (resident+31)/32, perThread = (words+kThreads-1)/kThreads;
     auto counts = reinterpret_cast<__ubuf__ int32_t*>(scratch), offsets = counts+words;
@@ -181,12 +190,18 @@ inline void Resolve(__ubuf__ Args* a, StagedContextPointer ctx, uint32_t b,
         const uint32_t token=selected[i], handle=loc[i];
         if (token==UINT32_MAX || !(handle&kBucket)) continue;
         const uint32_t pair=ranks[handle&kMask], rank=pair>>13;
-        const uint32_t slot=token<resident ? token : slots[pair&kMask];
+        const uint32_t choice=token<resident ? token : slots[pair&kMask];
+        const uint32_t slot=choice&kSlotMask;
         const uint32_t q=i/qWidth, inQ=rank-ctl[24+q];
         const uint32_t topPosition=Compact ? q*kTop+positions[i] : i;
         asc_stcg(locations+topPosition,slot);
         if (!(handle&kFirst)) continue;
         int32_t oldOrdinal=asc_ldcg(inverse+slot);
+        // The inverse has one ordinal per slot. Two different LRU entries
+        // naming the same slot cannot both pass. Fallback slots come from
+        // different bits outside the consumed LRU prefix. Refills stay put.
+        if (token>=resident && int32_t(choice>>kSlotBits)-1!=oldOrdinal)
+            asc_atomic_or(ctl+15,1U);
         uint32_t record=kLruSlots+rank;
         if (oldOrdinal>=0) {
             if (uint32_t(oldOrdinal)>=kLruSlots) {asc_atomic_or(ctl+1,4U);continue;}
@@ -208,8 +223,6 @@ inline void Resolve(__ubuf__ Args* a, StagedContextPointer ctx, uint32_t b,
         asc_stcg(g.descriptors+stride+pos,0);
         asc_stcg(g.descriptors+2*stride+pos,int32_t(ownerBase+slot));
     }
-    asc_threadfence(); asc_syncthreads();
-    if (ctl[1]) return;
     if (tid<32) {
         const uint32_t q=tid/8, field=tid%8, count=ctl[2+q];
         auto posts=reinterpret_cast<__gm__ FinalPost*>(ctx->owners+ctx->shape.finalPostOffset);
@@ -218,23 +231,41 @@ inline void Resolve(__ubuf__ Args* a, StagedContextPointer ctx, uint32_t b,
                    field==4 ? (b*4+q)*kTop : 0;
         asc_stcg(post+field,v);
     }
+    asc_threadfence(); asc_syncthreads();
+    if (ctl[1]) return;
+    if (ctl[15]) {
+        // Incomplete inverse metadata can still describe valid, distinct
+        // allocations. Check the actual chosen destinations before releasing
+        // any queue; two transfers targeting one KV slot cannot be repaired
+        // afterwards by the ordered Index planner.
+        for (uint32_t i=tid; i<words; i+=kThreads) bitmap[i]=0;
+        asc_syncthreads();
+        for (uint32_t i=tid; i<needed; i+=kThreads) {
+            const uint32_t slot=asc_ldcg(eventDst+i), bit=1U<<(slot%32);
+            if (asc_atomic_or(bitmap+slot/32,bit)&bit) asc_atomic_or(ctl+1,4U);
+        }
+        asc_syncthreads();
+        if (ctl[1]) return;
+    }
     auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount+kRawQueryFlag;
     if (tid<4) {
+        // KVAF uses the explicit group range. Descriptors, addresses and the
+        // row's FinalPost are authoritative now; Q4 output and Index metadata
+        // have their own ready flags and need not delay the queue owner.
+        Group g=FetchGroup(a,batch,b,tid);
+        asc_atomic_add(g.counters+kGroupReadyWord,1U);
         auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*32;
         asc_stcg(status+4+tid,ctl[2+tid]); asc_stcg(status+8+tid,ctl[24+tid]+ctl[2+tid]);
         asc_stcg(&flags[tid].reserved[0],1U); asc_stcg(&flags[tid].count,ctl[2+tid]);
         asc_stcg(&flags[tid].error,0U);
+        if (tid==3) asc_stcg(&flags[3].reserved[1],ctl[15] ? UINT32_MAX : needed);
     }
     if (!tid) {
         asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->changeCount)+b,kLruSlots+needed);
         if (needed) asc_atomic_add(reinterpret_cast<__gm__ uint32_t*>(a->liveCount?a->liveCount:ctx->count),needed);
     }
     asc_threadfence(); asc_syncthreads();
-    if (tid<4) {
-        Group g=FetchGroup(a,batch,b,tid);
-        asc_atomic_add(g.counters+kGroupReadyWord,1U);
-        if (tid<3) asc_stcg(&flags[tid].ready,1U);
-    }
+    if (tid<3) asc_stcg(&flags[tid].ready,1U);
     // Index/outputs acquire Q4 to consume the entire row.
     asc_threadfence(); asc_syncthreads();
     if (!tid) asc_stcg(&flags[3].ready,1U);

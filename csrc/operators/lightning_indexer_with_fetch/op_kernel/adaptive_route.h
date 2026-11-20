@@ -14,40 +14,16 @@ __aicore__ inline void Refresh(uint64_t address, uint32_t bytes) {
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(address), bytes);
 }
 
-// All cores of the first LI launch read the same immutable previous-round
-// feedback. Later graph nodes consume the single published mode.
-__aicore__ inline uint32_t Choose(__gm__ const Args* a, __gm__ rotating::Context* ctx,
-                                  const rotating::RuntimeShape& s) {
-    if (!a || !ctx || !a->routeRequests || !a->routeFeedback || !a->routeDemand ||
-        (a->routePolicy != Zero && a->routePolicy != Early) || !ctx->rowOwners || !ctx->queryEnds ||
-        !ctx->reservedHot || !ctx->fallbackAddresses || !ctx->sourceBlocks ||
-        !a->completedFlags || (a->prefetchCount & 0x20000000U) || !(a->prefetchCount & 0x10000000U) ||
-        !s.splitQ || s.batch != 16 || s.indexHeads != 32 || s.resident != 16384) return High;
-    auto owners = reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners);
-    auto ends = reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds);
-    auto requests = reinterpret_cast<__gm__ const uint64_t*>(a->routeRequests);
-    auto feedback = reinterpret_cast<__gm__ const uint64_t*>(a->routeFeedback);
-    Refresh(a->routeRequests, s.batch*kRequestWords*sizeof(uint64_t));
-    Refresh(ctx->rowOwners, s.batch*sizeof(uint32_t));
-    Refresh(ctx->queryEnds, s.batch*4*sizeof(uint32_t));
-    uint64_t bytes = 0, queryTokens = 0;
-    for (uint32_t b = 0; b < s.batch; ++b) {
-        auto r = requests + b*kRequestWords;
-        uint64_t owner = r[0], generation = r[1], step = r[2];
-        if (owner >= a->routeOwners || owner != owners[b] || !generation || step <= 1 || r[3] != 4) return High;
-        auto f = feedback + owner*kFeedbackWords;
-        Refresh(reinterpret_cast<uint64_t>(f), 4*sizeof(uint64_t));
-        if (f[0] != generation || f[1] != step-1 || f[3] != 4 || f[2] > kPrefetch+kMaxFinal) return High;
-        bytes += f[2]*s.tokenBytes;
-        for (uint32_t q = 0; q < 4; ++q) {
-            uint32_t end = ends[4*b+q];
-            if (end < s.resident || end > s.history) return High;
-            queryTokens += end;
-        }
-    }
-    // At 128K, Q4, 656 bytes/row this admits about 125 transfers/request.
-    // Shorter contexts or larger payloads reduce the admissible Get volume.
-    return bytes*32 <= queryTokens*5 ? a->routePolicy : High;
+// The decision is based on the last successful commit for each current
+// request. A change of owner, generation, step or query shape selects HIGH.
+__aicore__ inline bool Eligible(__gm__ const Args* a, __gm__ const rotating::Context* ctx,
+                               const rotating::RuntimeShape& s) {
+    return a && ctx && a->routeRequests && a->routeFeedback && a->routeDemand &&
+           (a->routePolicy == Zero || a->routePolicy == Early) && ctx->rowOwners && ctx->queryEnds &&
+           ctx->reservedHot && ctx->fallbackAddresses && ctx->sourceBlocks && a->completedFlags &&
+           !(a->prefetchCount & 0x20000000U) && (a->prefetchCount & 0x10000000U) &&
+           s.splitQ && s.batch == 16 && s.aicCount == 32 && s.liCores == 32 &&
+           s.indexHeads == 32 && s.resident == 16384;
 }
 
 __aicore__ inline uint32_t Published(__gm__ const Args* a) {
