@@ -17,7 +17,33 @@ snapshot="$work/skip-results.po80Nw/g2-input"
 ranked=
 ranked_sha=1d2486a76151ae37662c47aab835d06df50be866
 adaptive=
-if [[ ${1:-} == --ranked-index ]]; then
+help_reference=
+resume=
+anchor=
+has_anchor=false
+four_field=5072f2c907f0fbd3bf1c1fbe499dd979c8c1dfca
+if [[ ${1:-} == --ranked-help ]]; then
+    ranked=${2:?supply full helper candidate revision}
+    [[ $ranked =~ ^[0-9a-f]{40}$ && $ranked != "$four_field" ]] || { echo 'Expected the full helper candidate SHA' >&2; exit 2; }
+    help_reference="$area/fused.rs7TG7"
+    shift 2
+    while (( $# )); do
+        case "$1" in
+            --reference) help_reference=${2:?supply a completed ranked reference root} ;;
+            --resume) resume=${2:?supply the helper run root} ;;
+            --anchor) anchor=${2:?supply group number}
+                case "$anchor" in 7|2|10|4|17) ;; *) echo 'Unsupported anchor group' >&2; exit 2 ;; esac ;;
+            *) echo "Unknown ranked helper option: $1" >&2; exit 2 ;;
+        esac
+        shift 2
+    done
+    if [[ ! -s "$help_reference/baseline.txt" || ! -s "$help_reference/candidate.txt" ]] ||
+       [[ $(<"$help_reference/baseline.txt") != "$ranked_sha" || $(<"$help_reference/candidate.txt") != "$four_field" ]]; then
+        echo "Need the completed 1d2486a7 / 5072f2c9 run at $help_reference; use --reference PATH to select it." >&2
+        exit 1
+    fi
+    help_reference=$(cd "$help_reference" && pwd -P)
+elif [[ ${1:-} == --ranked-index ]]; then
     ranked=${2:?supply candidate commit}
     shift 2
 elif [[ ${1:-} == --main-adaptive ]]; then
@@ -35,11 +61,39 @@ if [[ -z "$ranked" && $# -eq 2 && $1 == --reuse-serial ]]; then
         exit 1
     fi
 elif [[ $# -ne 0 ]]; then
-    echo 'Usage: peer_fused.sh --ranked-index CANDIDATE_SHA | [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
+    echo 'Usage: peer_fused.sh --ranked-help FULL_SHA [--reference DIR] [--resume DIR] [--anchor GROUP] | --ranked-index CANDIDATE_SHA | [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
     exit 2
 fi
 mkdir -p "$area"
-out=$(mktemp -d "$area/fused.XXXXXX")
+if [[ -n "$help_reference" ]]; then
+    # Repeating the command resumes the same machine, harness and exact revisions.
+    harness=$(git -C "$root" rev-parse HEAD)
+    host_id=$(hostname)
+    boot_id=$(</proc/sys/kernel/random/boot_id)
+    run_key=$(printf '%s\n' "$ranked" "$help_reference" "$host_id" "$boot_id" "$harness" | sha256sum | cut -c1-20)
+    if [[ -n "$resume" ]]; then
+        out=$(cd "$resume" && pwd -P)
+        [[ -f "$out/run.key" && $(<"$out/run.key") == "$run_key" ]] || { echo "Incompatible --resume directory: $out" >&2; exit 1; }
+    else
+        out="$area/help-${ranked:0:8}-$run_key"
+        mkdir -p "$out"
+    fi
+    exec 9>"$out/run.lock"
+    flock -n 9 || { echo "A replay is already running in $out" >&2; exit 1; }
+    printf '%s\n' "$run_key" >"$out/run.key"
+    printf '%s\n' "$help_reference" >"$out/reference.txt"
+    printf '%s\n' "$harness" >"$out/harness.txt"
+    printf '%s\n' "$host_id" >"$out/host.txt"
+    if [[ -n "$anchor" ]]; then
+        mkdir -p "$out/g$anchor"
+        touch "$out/g$anchor/anchor.requested"
+    fi
+    for marker in "$out"/g*/anchor.requested; do
+        if [[ -f "$marker" ]]; then has_anchor=true; break; fi
+    done
+else
+    out=$(mktemp -d "$area/fused.XXXXXX")
+fi
 printf 'RESULT_ROOT=%s\n' "$out"
 export PATH=/usr/local/python3.12.13/bin:$PATH
 if [[ -r /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
@@ -67,11 +121,20 @@ if [[ -z "$ranked" ]]; then
     git -C "$root" diff --exit-code --quiet "$serial_revision" HEAD -- csrc/operators/lidu
 fi
 if [[ -n "$ranked" ]]; then
-    git -C "$root" fetch -q origin codex/lifetch-ranked-integration perf/ranked-all-aiv-index
+    if [[ -n "$help_reference" ]]; then
+        if ! git -C "$root" cat-file -e "$ranked^{commit}" 2>/dev/null; then
+            git -C "$root" fetch -q origin perf/ranked-index-help4
+        fi
+        git -C "$root" merge-base --is-ancestor "$four_field" "$ranked"
+        ranked_base="$src/ranked-${four_field:0:8}"
+        if "$has_anchor"; then pin "$root" "$ranked_base" "$four_field"; fi
+    else
+        git -C "$root" fetch -q origin codex/lifetch-ranked-integration perf/ranked-all-aiv-index
+        ranked_base="$src/ranked-${ranked_sha:0:8}"
+        pin "$root" "$ranked_base" "$ranked_sha"
+    fi
     git -C "$root" merge-base --is-ancestor "$ranked_sha" "$ranked"
-    ranked_base="$src/ranked-${ranked_sha:0:8}"
     ranked_candidate="$src/ranked-${ranked:0:8}"
-    pin "$root" "$ranked_base" "$ranked_sha"
     pin "$root" "$ranked_candidate" "$ranked"
     printf '%s\n' "$ranked_sha" >"$out/baseline.txt"
     printf '%s\n' "$ranked" >"$out/candidate.txt"
@@ -88,7 +151,9 @@ else
     pin "$root" "$src/auto-${old:0:8}" "$old"
     pin "$root" "$src/auto-${new:0:8}" "$new"
 fi
-git -C "$clean" fetch -q origin test/peer-main-urma-fused-context
+if ! git -C "$clean" cat-file -e "$transport^{commit}" 2>/dev/null; then
+    git -C "$clean" fetch -q origin test/peer-main-urma-fused-context
+fi
 pin "$clean" "$kvaf" "$transport"
 pin "$clean" "$clean" de4fd37e02fa86357f71fe4fcbbbecc3e75d1d58
 [[ -n "$ranked" || -n "$adaptive" || -s "$snapshot/manifest.json" ]] || { echo "Missing G2 snapshot $snapshot" >&2; exit 1; }
@@ -128,9 +193,15 @@ if [[ -n "$ranked" ]]; then
     printf 'CONFIG URMA NPU4 BS16 Q4 656B ranked=%.8s candidate=%.8s KVAF=%.8s\n' "$ranked_sha" "$ranked" "$transport"
     # Compile through the same cache key used by run_path. Fail before copying
     # five traces or running the baseline if the toolchain rejects either arm.
-    for source_root in "$ranked_base" "$ranked_candidate"; do
-        PYTHONPATH="$source_root/python:$PYTHONPATH" "$PYTHON" -B - "$source_root" "$kvaf/build-npu" "$SOC_VERSION" <<'BUILD'
+    if [[ -n "$help_reference" ]]; then
+        printf 'REFERENCE root=%s original=%.8s four_field=%.8s profile=4_warmup_20_calls\n' "$help_reference" "$ranked_sha" "$four_field"
+    fi
+    build_sources=("$ranked_candidate")
+    if [[ -z "$help_reference" ]] || "$has_anchor"; then build_sources+=("$ranked_base"); fi
+    for source_root in "${build_sources[@]}"; do
+        PYTHONPATH="$source_root/python:$PYTHONPATH" "$PYTHON" -B - "$source_root" "$kvaf/build-npu" "$SOC_VERSION" "$out" "$help_reference" <<'BUILD'
 from pathlib import Path
+import hashlib
 import sys
 from kvip.runtime import build
 
@@ -139,6 +210,10 @@ if not Path(build.__file__).resolve().is_relative_to(source.resolve()):
     raise RuntimeError(f"Unexpected build module: {build.__file__}")
 cann, headers = build.kvaf_build_paths(runtime)
 library, = build.build_libraries(cache_dir=runtime / 'lifetch', cann=cann, headers=headers, soc=sys.argv[3])
+if sys.argv[5]:
+    with library.open('rb') as handle:
+        digest = hashlib.file_digest(handle, 'sha256').hexdigest()
+    (Path(sys.argv[4]) / f'{source.name}.binary.sha256').write_text(digest + '\n')
 print(f"BUILD_READY source={source.name} cache={library.parent.name}", flush=True)
 BUILD
     done
@@ -176,7 +251,7 @@ run_arm() (
     monitor=$!
     level=1
     case "$label" in
-        baseline) mode=(--fused-only --production-root "$ranked_base"); level=2 ;;
+        baseline|anchor) mode=(--fused-only --production-root "$ranked_base"); level=2 ;;
         candidate) mode=(--fused-only --production-root "$ranked_candidate"); level=2 ;;
         serial*) mode=(--serial-only) ;;
         main) mode=(--fused-only)
@@ -238,7 +313,7 @@ print(",".join(str(n) for n in sorted(ids & allowed)))' "$cpus")
 }
 cd "$root"
 node=
-if "$local_baseline"; then
+if "$local_baseline" && [[ -z "$help_reference" ]]; then
     # Keep even the first arm on one NUMA node when the container allows it.
     node=$("$PYTHON" -c 'import ctypes
 from pathlib import Path
@@ -247,6 +322,11 @@ nodes = list(Path(f"/sys/devices/system/cpu/cpu{cpu}").glob("node[0-9]*"))
 print(nodes[0].name[4:] if len(nodes) == 1 else "")')
 fi
 bind_cpu_service "$node"
+if [[ -n "$help_reference" ]]; then
+    source "$tools/support/ranked_help_run.sh"
+    ranked_help_groups
+    exit 0
+fi
 if [[ -n "$ranked" ]]; then
     printf 'CPU_PLACEMENT target_node=%s policy=%s actual=measured_per_arm\n' "${node:-unknown}" "$policy"
     order=(baseline candidate)

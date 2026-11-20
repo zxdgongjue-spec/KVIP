@@ -3239,7 +3239,7 @@ class FusedReplayState:
     state must not have live graphs or unfinished device work.
     """
     def __init__(self, torch, runtime, table, library, initial, pages, addresses,
-                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None, candidate_bounds=None, route_policy=None):
+                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None, candidate_bounds=None, route_policy=None, fixed_reset=None):
         from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
         from kvip.cache.index_storage import IndexCacheStorage
         from kvip.operators.lifetch.binding import LIFetchBinding
@@ -3250,6 +3250,7 @@ class FusedReplayState:
 
         self.torch, self.device, self.pages, self.initial = torch, device, pages, initial
         self.logical_addresses = addresses
+        self.fixed_reset = fixed_reset
         g = initial.geometry
         self.batch, self.history, self.resident = g['batch'], g['history'], g['resident']
         self.stride, self.token_bytes = g['output_stride'], g['token_bytes']
@@ -3331,8 +3332,9 @@ class FusedReplayState:
         self.output.zero_()
         self.policies = []
         for row in range(self.batch):
-            self.upload(self.output[row + 1, :self.resident],
-                        self.pages.token_payload(row, initial.captured_layout[row, :self.resident]))
+            hot = (self.fixed_reset.hot[row] if self.fixed_reset is not None
+                   else self.pages.token_payload(row, initial.captured_layout[row, :self.resident]))
+            self.upload(self.output[row + 1, :self.resident], hot)
             policy = SlotLRU()
             policy.resize(self.resident, self.resident)
             # The capture exports 2048 oldest candidates, not a full LRU chain.
@@ -3345,21 +3347,24 @@ class FusedReplayState:
             policy.head[0], policy.tail[0] = chain[0], chain[-1]
             policy._select()
             self.policies.append(policy)
-        self.prepare(initial)
+        self.prepare(initial, fixed_reset=self.fixed_reset)
 
-    def prepare(self, inputs):
+    def prepare(self, inputs, *, fixed_reset=None):
         """Import real inputs while retaining this path's latest cache layout."""
         if inputs.identities != self.initial.identities or inputs.geometry != self.initial.geometry:
             raise ValueError('Replay request geometry changed after binding')
-        layout = self.storage.logical_ids[1:].cpu().numpy()
-        self.input_layout = layout.copy()
-        keys, scales, valid = inputs.index_for_layout(layout)
+        if fixed_reset is None:
+            layout = self.storage.logical_ids[1:].cpu().numpy()
+            self.input_layout = layout.copy()
+            keys, scales, valid = inputs.index_for_layout(layout)
+            addresses = self.logical_addresses[np.arange(self.batch)[:, None], layout].astype(np.int64)
+            addresses[valid == 0] = 0
+        else:
+            self.input_layout = inputs.captured_layout
+            keys, scales, addresses = fixed_reset.keys, fixed_reset.scales, fixed_reset.addresses
         self.upload(self.storage.keys[1:], keys)
         self.upload(self.storage.scales[1:], scales)
-        rows = np.arange(self.batch)[:, None]
-        addresses = self.logical_addresses[rows, layout].copy()
-        addresses[valid == 0] = 0
-        self.upload(self.storage.addresses[1:], addresses.astype(np.int64))
+        self.upload(self.storage.addresses[1:], addresses)
         self.upload(self.workspace.inputs.query.view(self.torch.uint8), inputs.query)
         # Reinterpret captured BF16 bits; numeric conversion changes the weights.
         self.upload(self.workspace.inputs.weights.view(self.torch.int16), inputs.weights.view(np.int16))
@@ -3478,7 +3483,8 @@ class FusedReplayState:
         output = self.output[1:].cpu().numpy()
         layout, hot_valid = self.validate_index(inputs, output)
         if getattr(self, 'verify_ranked_events', False):
-            self.topk_set_digest = hashlib.sha256(np.sort(ids, axis=-1).astype('<i8').tobytes()).hexdigest()
+            from correctness import topk_fingerprint
+            self.topk_set_digest = topk_fingerprint(ids)
         for row in range(self.batch):
             mask = slots[row] < self.resident
             selected_slots = slots[row][mask]
@@ -3713,6 +3719,8 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
     compact = config.mode == "bench" and len(sequence.rounds) == 1
     policy = getattr(config, 'route_policy', None)
     ranked = bool(getattr(config, 'production_root', None))
+    # reset() has already restored both the cache and the only round's inputs.
+    fixed_round = fused and getattr(sequence, 'cached_ranked_round', None) is not None
     if ranked:
         for state in states:
             state.verify_ranked_events = True
@@ -3787,7 +3795,8 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                 state.reset()
             for inputs in sequence:
                 for state in states:
-                    state.prepare(inputs)
+                    if not fixed_round:
+                        state.prepare(inputs)
                     if lean or candidate:
                         set_step(state.rotating.adaptive_route if lean else state.rotating.auto_route,
                                  **route_step(warmup + 1))
@@ -3804,7 +3813,8 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
         for inputs in sequence:
             before = []
             for state in states:
-                state.prepare(inputs)
+                if not fixed_round:
+                    state.prepare(inputs)
                 if lean or candidate:
                     set_step(state.rotating.adaptive_route if lean else state.rotating.auto_route,
                              **route_step(config.warmup + 1))
@@ -3850,7 +3860,8 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                 state.forward.set_diagnostics(True)
             for inputs in sequence:
                 for state in states:
-                    state.prepare(inputs)
+                    if not fixed_round:
+                        state.prepare(inputs)
                     if lean:
                         set_step(state.rotating.adaptive_route, **route_step(config.warmup + 2))
                     state.forward.times.zero_()
@@ -4021,12 +4032,24 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 shape = UbmemGeometry(g['batch'], g['history'], g['resident'], g['heads'], width,
                                       aics, config.intermediate_fetches, soc)
                 library = build_ubmem_library(cache_dir=build / 'lifetch_ubmem', cann=cann, shape=shape)
+            fixed_reset = None
+            if getattr(sequence, 'cached_ranked_round', None) is not None:
+                # All independent states own separate device buffers. Build the
+                # immutable host bytes once instead of regenerating 16 rows of
+                # deterministic C8 data and gathering the same Index each reset.
+                layout = initial.captured_layout
+                keys, scales, valid = initial.index_for_layout(layout)
+                addresses = logical_addresses[np.arange(g['batch'])[:, None], layout].astype(np.int64)
+                addresses[valid == 0] = 0
+                hot = [pages.token_payload(r, row[:g['resident']]) for r, row in enumerate(layout)]
+                fixed_reset = SimpleNamespace(keys=keys, scales=scales, addresses=addresses, hot=hot)
+                del valid
             state = FusedReplayState(
                 torch, runtime, view, library, initial, pages, logical_addresses,
                 transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                 prefetch_tokens=config.prefetch_tokens, soc=soc,
                 prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024), candidate_bounds=candidate_bounds,
-                route_policy=getattr(config, 'route_policy', None))
+                route_policy=getattr(config, 'route_policy', None), fixed_reset=fixed_reset)
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
         if config.mode in ('bench', 'diagnose') and g.get('sparse_mode') == 0 and not fused:
@@ -4074,7 +4097,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                         prefetch_tokens=config.prefetch_tokens, soc=soc,
                         prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease,
                         candidate_bounds=candidate_bounds,
-                        route_policy=getattr(config, 'route_policy', None))
+                        route_policy=getattr(config, 'route_policy', None), fixed_reset=fixed_reset)
                     replica.failure_directory = directory
                 else:
                     replica = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
@@ -4246,6 +4269,8 @@ def run_synthetic_batch(config, directory, *, shared_pool=None):
 def run_real(config, directory):
     sequence = (ReplaySequence.from_snapshot(config.snapshot) if getattr(config, 'operation', None) == 'real'
                 else ReplaySequence(config.trace_root, config.group, config.round_range))
+    if getattr(config, 'production_root', None):
+        sequence.cache_ranked_round()
     pages = ReplayPagePlan(sequence)
     initial = next(iter(sequence))
     directory = Path(directory)

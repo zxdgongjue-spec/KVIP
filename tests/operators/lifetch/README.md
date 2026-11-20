@@ -118,3 +118,15 @@ python tests/operators/lifetch/test_lifetch.py bench --input real \
 ```
 
 每次运行结果由唯一目录保存，失败也保留已完成 case。
+
+## Ranked Index 单轮对照
+
+在已有 URMA 运行环境的节点，用新候选的完整 Git SHA 执行：
+
+```bash
+bash tests/operators/lifetch/peer_fused.sh --ranked-help "$candidate"
+```
+
+默认复用 `$PEER_G2_WORK/peer-baseline/fused.rs7TG7` 内 `1d2486a7` 和 `5072f2c9` 的逐组结果。可用 `--reference DIR` 选择同版本、同计时协议的另一份完整结果。脚本从历史配置找到本机采集目录，按 G7、G2、G10、G4、G17 运行，沿用每组四次预热、20 个独立状态的一次性能图和一次分段图。每组完成即输出对照并保存在 `gN/comparison.json`。
+
+同一机器、同次启动、同一测试与候选版本、同一参考目录重复执行会继续上次进度。脚本重新校验已完成组的二进制和结果文件，中断的半组保存在 `incomplete-*` 子目录。用 `--resume DIR` 可显式选择本次结果目录。附加 `--anchor 7` 会在 G7 额外复测一次 `5072f2c9`，供判断历史数据与当次环境的漂移。

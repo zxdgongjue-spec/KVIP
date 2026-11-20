@@ -940,7 +940,16 @@ class ReplaySequence:
         result.rounds = ((reference,),)
         return result
 
+    def cache_ranked_round(self):
+        # Production A/B replays restore the same one-round fixture before each
+        # graph. Only cache the read-only capture, never a device/transport state.
+        if len(self.rounds) == 1:
+            self.cached_ranked_round = assemble_round(self.rounds[0])
+
     def __iter__(self):
+        if getattr(self, 'cached_ranked_round', None) is not None:
+            yield self.cached_ranked_round
+            return
         previous = None
         for references in self.rounds:
             current = assemble_round(references)

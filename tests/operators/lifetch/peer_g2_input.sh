@@ -23,6 +23,8 @@ if [[ $group_id == 2 ]]; then
     raw=${PEER_G2_RAW:-$raw}
     existing=${PEER_G2_INPUT:-}
 fi
+# Prefer the exact prepared capture from the historical profile when still local.
+if [[ -n ${PEER_RANKED_INPUT:-} ]]; then existing=$PEER_RANKED_INPUT; fi
 dest="$work/peer-inputs/$case_dir"
 support=$(cd "$(dirname "$0")/support" && pwd)
 mkdir -p "$(dirname "$dest")"
@@ -168,6 +170,8 @@ if not existing or downloaded:
         if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST) or not (dest/'dp7/series.json').is_file():
             raise
 input_id = hashlib.sha256(json.dumps([group_id, source_round, ids, archives], separators=(',', ':')).encode()).hexdigest()
+if filename := os.environ.get('PEER_RANKED_HASH_FILE'):
+    Path(filename).write_text(input_id + '\n')
 print(f'INPUT G{group_id} source_round={source_round} replay_round=1 selected={selected} cold={cold} '
       f'Q4_BS16_token_bytes=656 sha256={input_id}', file=sys.stderr)
 print(root if existing and not downloaded else dest)
