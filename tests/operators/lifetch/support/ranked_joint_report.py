@@ -109,8 +109,18 @@ def early_index_stats(raw):
     if np.any(active & ((start < idle[..., 0]) | (start <= 0) | (end < start) |
                         (scatter < end) | (target < 1) | (target > 16))):
         raise ValueError('Invalid early Index read/scatter stamps')
+    calls, slots = np.nonzero(active)
+    row = target[active] - 1
+    plan = ticks[:, :1024].reshape(-1, 16, 64)[calls, row, 32+22]
+    fields = ticks[:, 6144:].reshape(-1, 64, 8)[calls, 48+row]
+    if np.any(plan <= 0) or np.any((fields[:, 2] >> 32) != 48+4*workers+slots) or np.any(fields[:, 3] < moves[active]):
+        raise ValueError('Early Index read differs from the committed field or lacks a plan stamp')
     mhz = float(raw['cycles_per_us'])
-    return dict(q_workers=workers, eligible_core_calls=int(active.size), hits=int(active.sum()),
+    # The planner timestamps its publication, and the reader timestamps its
+    # own work. The intersection measures scheduled overlap, not graph savings.
+    overlap = np.maximum(0, np.minimum(end[active], plan) - start[active]) / mhz
+    return dict(finished_by_plan=int(np.count_nonzero(end[active] <= plan)),
+                preplan_read_us=distribution(overlap), q_workers=workers, eligible_core_calls=int(active.size), hits=int(active.sum()),
                 moves=int(moves[active].sum()), reads_by_row=np.bincount(target[active]-1, minlength=16).tolist(),
                 entry_to_read_us=distribution((start-idle[..., 0])[active]/mhz),
                 read_us=distribution((end-start)[active]/mhz),
@@ -196,6 +206,7 @@ def run(root, reference, previous, group, *, joint_control=False):
         print(f'  EARLY_INDEX comm_cores={4 * early["q_workers"]} '
               f'used_spare_core_calls={early["hits"]}/{early["eligible_core_calls"]} copied_moves={early["moves"]} '
               f'entry_to_read_p50_us={fmt(early["entry_to_read_us"]["p50"])} early_read_p50_us={fmt(early["read_us"]["p50"])} '
+              f'finished_by_plan={early["finished_by_plan"]}/{early["hits"]} preplan_read_p50_us={fmt(early["preplan_read_us"]["p50"])} '
               f'wait_to_scatter_p50_us={fmt(early["wait_after_read_us"]["p50"])}')
     print('  DRIFT last5_minus_first5_span_mean/p50_us ' + ' '.join(f'{k}={v[0]:+.2f}/{v[1]:+.2f}' for k,v in drifts.items()))
     print('  TAIL auxiliary_p50_us_from_kernel_entry ' + ' '.join(f'{k}={fmt(ends[k]["p50"])}' for k in

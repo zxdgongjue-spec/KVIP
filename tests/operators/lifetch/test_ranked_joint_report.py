@@ -86,10 +86,13 @@ def test_final_queue_count_and_ticket_row_partition(workers):
 
 def test_early_reads_ignore_communication_core_fields_and_track_real_row():
     raw, cores, _, _ = sample()
-    cores[0, 63, 16:21] = [125, 140, 159, 50, 2]
+    cores[0, 63, 16:21] = [125, 140, 159, 20, 8]
+    raw['times'][:, :1024].reshape(1, 16, 64)[0, 7, 54] = 135
+    raw['times'][:, 6144:].reshape(1, 64, 8)[0, 48+7, 2] = (63 << 32) | 3
     early = early_index_stats(raw)
-    assert (early['hits'], early['eligible_core_calls'], early['moves']) == (1, 8, 50)
-    assert early['reads_by_row'][1] == 1
+    assert (early['hits'], early['eligible_core_calls'], early['moves']) == (1, 8, 20)
+    assert early['reads_by_row'][7] == 1
+    assert early['finished_by_plan'] == 0 and early['preplan_read_us']['p50'] == 5
     assert (early['entry_to_read_us']['p50'], early['read_us']['p50'], early['wait_after_read_us']['p50']) == (12.5, 7.5, 9.5)
     cores[0, 63, 18] = 119
     with pytest.raises(ValueError, match='early Index'):
