@@ -66,14 +66,14 @@ def load(root, group, label):
     kib = [mean(v[k] for v in traffic) * 656 / 1024 for k in ('unused_prefetch', 'final')]
     mib = mean(v['KV_read_bytes'] for v in traffic) / 2**20
     stages = timing['stage_mean_us']
-    drift = 100 * (mean(times[-5:]) / mean(times[:5]) - 1)
+    drift = [100 * (metric(times[-5:]) / metric(times[:5]) - 1) for metric in (mean, median)]
     m, p = timing['mean_us'], median(times)
     print(f'G{group} {label:<9s} full_mean/P50_us={m:.2f}/{p:.2f} '
           f'LI/tail_mean_us={stages["li"]:.2f}/{stages["resolve_update"]:.2f} '
-          f'span_drift_pct={drift:+.2f} miss_pct={miss:.3f} '
+          f'span_drift_mean/P50_pct={drift[0]:+.2f}/{drift[1]:+.2f} miss_pct={miss:.3f} '
           f'waste/repair_KiB={kib[0]:.1f}/{kib[1]:.1f} total_MiB={mib:.4f}', flush=True)
     thp = read(root / f'g{group}' / label / 'thp.json')
-    return inputs, set(out['topk_set_digests']), thp, m, p, out['binary_sha256']
+    return inputs, set(out['topk_set_digests']), thp, m, p, out['binary_sha256'], drift
 
 
 def main(root, group):
@@ -86,7 +86,10 @@ def main(root, group):
         print(f'G{group} NOT_COMPARABLE placement={placement} selected_ids_identical={same} owners=64/64')
         return
     gains = [100 * (1 - new[i] / old[i]) for i in (3, 4)]
-    verdict = 'BOTH_FASTER' if min(gains) > 0 else 'KEEP_BASELINE'
+    guard = [max(abs(old[6][i]), abs(new[6][i])) for i in range(2)]
+    verdict = 'KEEP_BASELINE'
+    if min(gains) > 0:
+        verdict = 'BOTH_FASTER' if all(g > d for g, d in zip(gains, guard)) else 'WITHIN_DRIFT'
     print(f'G{group} {verdict} gain_mean/P50_pct={gains[0]:+.2f}/{gains[1]:+.2f} owners=64/64', flush=True)
 
 
