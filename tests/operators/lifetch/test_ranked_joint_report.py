@@ -142,3 +142,30 @@ def test_archived_original_and_eight_core_control_use_candidate_only(tmp_path, m
     (current / 'physical_npu.txt').write_text('4')
     with pytest.raises(ValueError, match='physical device'):
         report.run(current, control, None, 2, joint_control=True)
+
+
+def test_two_staged_prefixes_keep_separate_rows_and_waits():
+    from ranked_index_pair_stats import stage_windows
+
+    raw, cores, _, stamp = sample()
+    # AIV 56 serves home row 8 and paired row 0. Its second read spans
+    # 40 ticks but only spends 18 of those ticks doing useful reads.
+    cores[0, 56, 16:30] = [110, 140, 165, 28, 9, 144, 184, 191, 26, 1, 16, 11, 2, 18]
+    plan = raw['times'][:, :1024].reshape(1, 16, 64)[..., 54]
+    plan[0, [0, 8]] = [180, 150]
+    cores[0, [2, 26], 27] = [185, 170]
+    stamp[0, [48, 56], 2] = (56 << 32) | 3
+    both = stage_windows(raw, candidate=True)
+    assert both['counts'] == dict(first_reads=1, second_reads=1, second_moves=26)
+    assert both['p50_us']['first_ready_to_scatter'] == 0
+    assert both['p95_us']['second_ready_to_scatter'] == 3
+    assert both['p50_us']['second_busy_read'] == 9
+    control = stage_windows(raw, candidate=False)
+    assert control['counts'] == dict(first_reads=1)
+    cores[0, 56, 26] = 257
+    with pytest.raises(ValueError, match='slice budget'):
+        stage_windows(raw, candidate=True)
+    cores[0, 56, 26] = 16
+    cores[0, 56, 25] = 9
+    with pytest.raises(ValueError, match='Repeated'):
+        stage_windows(raw, candidate=True)

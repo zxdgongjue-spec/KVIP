@@ -153,10 +153,10 @@ def report(root, reference, group):
         for candidate, arm in zip((False, True), arms):
             with np.load(arm['directory']/'lean_ticks.npz', allow_pickle=False) as ticks:
                 high.append(describe_high(ticks, candidate=candidate))
-        for kind in ('p50_us', 'counts'):
+        for kind in ('p50_us', 'p95_us', 'counts'):
             summaries = [h[kind] for h in high]
             print(f'G{group} HIGH_{kind.upper()} current/new '+' '.join(
-                f'{s}='+'/'.join(fmt(p.get(s)) if kind == 'p50_us' else str(p.get(s, 'NA')) for p in summaries)
+                f'{s}='+'/'.join(fmt(p.get(s)) if kind != 'counts' else str(p.get(s, 'NA')) for p in summaries)
                 for s in dict.fromkeys(k for st in summaries for k in st)))
     print(f'G{group} CHECK TopK/KV/ordered_Index/hot_valid=PASS')
     outcome = dict(revision=revision, control=CONTROL, current_source=placement,
