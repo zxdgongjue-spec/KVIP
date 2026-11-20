@@ -105,6 +105,7 @@ def report(root, reference, group):
                 controls[label+'_archive'] = arm
     comparisons = {label: comparison(arm, new) for label, arm in controls.items()}
     match = matched_samples(current, new)
+    original_match = matched_samples(controls['original_archive'], new)
     n = new['timing']['graph_calls']
     desired = 'low' if group == 2 else 'high'
     arms = [current, new]
@@ -138,6 +139,7 @@ def report(root, reference, group):
         print(f'G{group} vs_{label} event_mean/span_p50_us={pair(headline(arm))}->{pair(headline(new))} '
               f'saved_us={pair(delta["saved_us"],True)} gain_pct={pair(delta["gain_pct"],True)}')
     print(f'G{group} SAME_TOPK={match["n"]}/{n} span_p50_saved_us={fmt(matched)} '
+          f'original_pairs={original_match["n"]}/{n} original_span_p50_saved_us={fmt(original_match["span_p50_saved_us"])} '
           f'DRIFT last5-first5_span_mean/p50_us current={pair(means[0],True)} new={pair(means[1],True)}')
     timings = [a['timing']['stage_mean_us'] for a in arms]
     print(f'G{group} KERNEL_MEAN_SAVED_us '+' '.join(f'{s}={timings[0][s]-timings[1][s]:+.2f}' for s in timings[0]))
@@ -159,7 +161,7 @@ def report(root, reference, group):
     print(f'G{group} CHECK TopK/KV/ordered_Index/hot_valid=PASS')
     outcome = dict(revision=revision, control=CONTROL, current_source=placement,
                    route=counts, comparisons=comparisons, headline={k: headline(a) for k,a in {**controls, 'new':new}.items()},
-                   drift=means, matched=match, high_index=high, screen=screen)
+                   drift=means, matched=match, original_matched=original_match, high_index=high, screen=screen)
     (case/'index_comparison.json').write_text(json.dumps(outcome, indent=2, allow_nan=False)+'\n')
 
 
