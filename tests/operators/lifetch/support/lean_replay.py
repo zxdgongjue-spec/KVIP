@@ -147,8 +147,10 @@ def stage_report(states, profile, samples, mhz, policy, directory):
         li = raw[b*64:b*128].reshape(b, 4, 16)
         fetch = raw[b*128:b*256].reshape(b, 128)
         workers = state.forward.q_workers
-        if policy != 'main':
-            probe = state.rotating.adaptive_route.probe_ticks.cpu().numpy()
+        if getattr(rotating, 'adaptive_route', None) is not None:
+            # HIGH pays the choice cost too, even though all following stamps
+            # use the ranked team's native format.
+            probe = rotating.adaptive_route.probe_ticks.cpu().numpy()
             route_probes.append(probe)
             for name, cores in (('routing_probe_aic', probe[:32]), ('routing_probe_aiv', probe[32:])):
                 eligible[name] += len(cores)
