@@ -5,6 +5,8 @@ import argparse
 import hashlib
 import json
 import os
+import re
+from collections import Counter
 from pathlib import Path
 import subprocess
 import sys
@@ -309,14 +311,34 @@ def run_case(args, snap, output):
 
 
 def summarize_kernels(path, result):
-    trace=json.loads(path.read_text())
+    trace = json.loads(path.read_text())
     events = trace if isinstance(trace, list) else trace["traceEvents"]
+    observed = Counter()
     for event in events:
-        if event.get("ph") != "X" or "kernel" not in event.get("cat","").lower():
+        if event.get("ph") != "X":
             continue
-        name=event.get("name","")
-        if "v9_li_kernel" in name or "streaming" in name.lower():
-            result.setdefault(name,[]).append(float(event["dur"]))
+        name = event.get("name", "")
+        category = (event.get("cat") or "").lower()
+        observed[(name, category)] += 1
+        # Match the existing LIFetch diagnostics parser: CANN exports can omit
+        # cat. Exact kernel names and numeric dispatch suffixes remain usable;
+        # explicitly classified CPU scopes and launch wrappers are excluded.
+        if category and "kernel" not in category:
+            continue
+        if re.fullmatch(r"v9_(?:li_kernel|streaming_resolve_update)(?:_\d+)*", name.lower()):
+            result.setdefault(name, []).append(float(event["dur"]))
+    return observed
+
+
+def print_trace_inventory(observed):
+    print("Trace event inventory (not attributed kernel timings):")
+    print("Name | Category | Count")
+    # Prioritize LI-related names, then the most frequent remaining events.
+    ordered = sorted(observed.items(), key=lambda item: (
+        not any(word in item[0][0].lower() for word in ("li_kernel", "lightning", "streaming")),
+        -item[1], item[0]))
+    for (name, category), count in ordered[:20]:
+        print(f"{name} | {category or '(missing)'} | {count}")
 
 
 def main():
@@ -340,10 +362,12 @@ def main():
         if not paths:
             p.error(f"No trace-*.json files under {args.snapshot}")
         samples = {}
+        observed = Counter()
         for path in paths:
-            summarize_kernels(path, samples)
+            observed.update(summarize_kernels(path, samples))
         if not samples:
-            p.error("No recognized device LI kernels in the existing traces")
+            print_trace_inventory(observed)
+            p.error("No recognized device LI kernels; event names/categories are printed above")
         print(f"Source: {args.snapshot}; traces={len(paths)}; profiling samples only")
         print("Kernel | mean us | min us | max us | N")
         for name, values in sorted(samples.items()):
