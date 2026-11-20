@@ -532,6 +532,10 @@ inline void RetireSelection(__gm__ Args* a,uint32_t batch,uint32_t b){
   asc_threadfence();
 }
 #endif
+#if !V9_UBMEM
+#include "index_team.h"
+#endif
+template<bool Team=false>
 __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
  auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;auto status=reinterpret_cast<__gm__ uint32_t*>(a->workerStatus)+b*32;
  // Producer and consumer must not write the same cache lines.
@@ -550,7 +554,7 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
  auto prepared=reinterpret_cast<__gm__ uint64_t*>(dense+2*shape.history);
  bool disjoint=false;
 #if !V9_UBMEM && KVIP_OUTPUT_WORKER
- if(ctx->reservedHot && a->queryErrors && prepareMetadata){
+ if(!Team && ctx->reservedHot && a->queryErrors && prepareMetadata){
   auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
   auto headers=reinterpret_cast<__gm__ uint32_t*>(a->queryErrors)+b*4*32;
   uint32_t prefix=row->slots,upper=0;
@@ -627,13 +631,23 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
   // one Q1 exchange hundreds of microseconds slower than dense lookup.
   if(!denseMode && uint64_t(seen+count)*2>=MAP*3/4){
    if(!a->denseShadow){error=1;break;}
-   if(prepareMetadata){
+   if(!Team && prepareMetadata){
     Simt::VF_CALL<ExpandPreparedMetadata>(Simt::Dim3{THREADS,1,1},prepared,shape.history,work);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
    }
    Simt::VF_CALL<InitDenseShadow>(Simt::Dim3{THREADS,1,1},dense,shape.history,work);
    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);denseMode=true;
   }
+#if !V9_UBMEM
+  if constexpr(Team){
+   if(count>kTop || begin+count>a->maxEvents){error=1;break;}
+   auto moves=reinterpret_cast<__gm__ uint64_t*>(index_team::Moves(a,b));
+   __gm__ uint64_t* no64=nullptr;
+   __gm__ uint32_t* no32=nullptr;
+   if(denseMode)Simt::VF_CALL<ApplyDenseBatch<false,true>>(Simt::Dim3{THREADS,1,1},source,dest,begin,count,no64,no32,no32,shape.resident,dense,shape.history,work,no64,no64,moves);
+   else Simt::VF_CALL<ApplyBatch<false,true>>(Simt::Dim3{THREADS,1,1},source,dest,begin,count,no64,no32,no32,shape.resident,work,no64,no64,moves,shape.history);
+  }else
+#endif
   if(prepareMetadata){
   if(denseMode)Simt::VF_CALL<ApplyDenseBatch<true>>(Simt::Dim3{THREADS,1,1},source,dest,begin,count,reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*a->history*16,reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*a->history,reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*shape.resident,shape.resident,dense,shape.history,work,addresses,logical,prepared);
   else Simt::VF_CALL<ApplyBatch<true>>(Simt::Dim3{THREADS,1,1},source,dest,begin,count,reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*a->history*16,reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*a->history,reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*shape.resident,shape.resident,work,addresses,logical,prepared,shape.history);
@@ -645,6 +659,18 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
   error=local.GetValue(CONTROL);if(profile)ticks[13+2*phase]=GetSystemCycle();if(phase)total+=count;
  }
+ uint32_t chunks=seen && !disjoint?local.GetValue(CONTROL+4):0;
+#if !V9_UBMEM
+ if constexpr(Team){
+  // Free the planner's UB before allocating the field gather stage.
+  pipe.Destroy();
+  auto control=index_team::Control(a,b);
+  index_team::Publish(control,chunks,error);
+  index_team::Copy(a,GetBlockIdx(),shape.batch);
+  for(uint32_t i=0;i<4;++i)error|=AwaitPublication(control+1+i);
+ } else
+#endif
+ {
  if(!error){uint64_t start=GetSystemCycle();while(true){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+4),kBatchFlagPayloadBytes);if(flags[4].ready){error=flags[4].error;break;}if(GetSystemCycle()-start>5000000000ULL){error=8;break;}}}
  if(!error){auto update=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);uint64_t addressStride=update[7];if(profile)ticks[22]=GetSystemCycle();
   if(seen && !disjoint && prepareMetadata && !denseMode){
@@ -662,10 +688,12 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
   }
   if(profile)ticks[23]=GetSystemCycle();}
- status[0]=error;status[1]=total;status[2]=disjoint?uint32_t(seen!=0):(seen?local.GetValue(CONTROL+4):0);if(profile)ticks[24]=GetSystemCycle();
+ pipe.Destroy();
+ }
+ status[0]=error;status[1]=total;status[2]=disjoint?uint32_t(seen!=0):chunks;if(profile)ticks[24]=GetSystemCycle();
  if(a->updateBindings){auto u=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);Simt::VF_CALL<PublishStreamingUpdateStatus>(Simt::Dim3{32,1,1},reinterpret_cast<__gm__ uint32_t*>(u[6]),b,error);SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);}
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),128);
- if(profile)kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ticks),256);pipe.Destroy();
+ if(profile)kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ticks),256);
 #if !V9_UBMEM
  if(a->completedMapping){
   // Producer publishes flag 5 after its last live mapping lookup, including
@@ -842,6 +870,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(256) inline void SnapshotMappings(
  if(b<batch && !t)asc_stcg(reinterpret_cast<__gm__ uint32_t*>(a->liveCount)+3+b,1U);
  asc_threadfence();
 }
+template<bool Team=false>
 __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,uint32_t workers,bool skipEmptyConflict=true,bool standalone=false){
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  if(lane>=shape.batch)return;
@@ -980,6 +1009,7 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
   }
   }
  }
+ if constexpr(Team)index_team::Copy(a,GetBlockIdx(),shape.batch);
  if(a->prefetchCount & 0x10000000U){
   auto trace=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*256+
       uint64_t(kResolveCores*shape.batch+q*workers+lane)*32;
@@ -1037,6 +1067,7 @@ inline void CollectFinalPosts(__gm__ FinalPost* posts,__ubuf__ uint32_t* output)
 #if !V9_UBMEM
 #include "joined_final.h"
 #endif
+template<bool Team=false>
 __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
@@ -1057,6 +1088,9 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
 #endif
  if(profile){ft[4]=GetSystemCycle();ft[5]=polls;ft[6]=drain;ft[7]=arrival;}error|=row->error;flags[7].error=error;flags[7].ready=1;
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+7),kBatchFlagPayloadBytes);
+#if !V9_UBMEM
+ if constexpr(Team)index_team::Copy(a,GetBlockIdx(),shape.batch);
+#endif
  uint32_t deferredPrefix=0;
  for(uint32_t f=6;f<12;++f){uint64_t start=GetSystemCycle();if(profile)ft[8+2*(f-6)]=start;while(true){
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+f),kBatchFlagPayloadBytes);
@@ -1192,6 +1226,10 @@ inline void RetireRoundControl(__gm__ Args* a,uint32_t batch,uint32_t workers,ui
   asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->count),asc_ldcg(live));
   asc_stcg(live,0U);
  }
+ if(a->indexTeam && block<batch && t<5){
+  auto f=reinterpret_cast<__gm__ BatchFlag*>(a->indexTeam)+5*block+t;
+  asc_stcg(&f->ready,0U);
+ }
  if(block<batch && t<kFlagCount*3){
   uint32_t word=(block*kFlagCount+t/3)*kFlagWords+t%3;
   auto live=reinterpret_cast<__gm__ uint32_t*>(a->flags)+word;
@@ -1218,12 +1256,24 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
   bool profile=(a->prefetchCount & 0x80000000U)!=0;
   auto trace=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*256+uint64_t(block)*32;
   if(profile)trace[0]=GetSystemCycle();
+#if !V9_UBMEM
+  bool team=a->indexTeam && a->completedFlags && shape.batch==16 && shape.aicCount==32 &&
+      shape.history>=kIndexTeamMinHistory;
+#else
+  constexpr bool team=false;
+#endif
   if(block<shape.batch*kResolveCores){uint32_t b=block/kResolveCores,role=block%kResolveCores;
    if(role==0){
     Producer(a,b);
-    FinalizeStreaming(a,b);
-   }else if(role==1)Consumer(a,b);
-   else OutputWorker(a,b);
+    if(team)FinalizeStreaming<true>(a,b);else FinalizeStreaming(a,b);
+   }else if(role==1){
+    if(team)Consumer<true>(a,b);else Consumer(a,b);
+   }else{
+    OutputWorker(a,b);
+#if !V9_UBMEM
+    if(team)index_team::Copy(a,block,shape.batch);
+#endif
+   }
 #if !V9_UBMEM
    if(role==kResolveCores-1){
     // All score producers have joined and the final Fetch uses separate flags.
@@ -1253,8 +1303,15 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
   }
   else {uint32_t lane=block-shape.batch*kResolveCores,q=lane/workers,part=lane%workers;
    if(q<4 && part<workers){
+#if !V9_UBMEM
+    if(team)FetchQueryGroup<true>(a,q,part,workers);else
+#endif
     FetchQueryGroup(a,q,part,workers);
-   }}
+   }
+#if !V9_UBMEM
+   else if(team)index_team::Copy(a,block,shape.batch);
+#endif
+  }
 #if !V9_UBMEM
   if(a->completedFlags){
    AscendC::SyncAll<true>();

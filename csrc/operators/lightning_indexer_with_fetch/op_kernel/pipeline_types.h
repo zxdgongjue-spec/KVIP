@@ -1,6 +1,11 @@
 #pragma once
 #include <stdint.h>
 namespace pipeline_ab {
+constexpr uint32_t kIndexTeamLanes=4;
+constexpr uint32_t kIndexTeamMinHistory=10496; // Scratch after the two dense permutation maps.
+inline constexpr bool UseIndexTeam(uint32_t batch,uint32_t aic,uint32_t history) {
+ return batch==16 && 2*aic==kIndexTeamLanes*batch && history>=kIndexTeamMinHistory;
+}
 constexpr uint32_t kResolveCores=KVIP_OUTPUT_WORKER?3:2;
 constexpr uint32_t kRawQueryFlag=12;
 constexpr uint32_t kPrefetch=2048, kQueries=4;
@@ -22,6 +27,7 @@ struct alignas(128) Args {
  uint64_t queryBitmaps, queryErrors, updateBindings, denseShadow, packedFetch;
  uint64_t completedFlags, liveCount, completedRows, completedEvents; // Completed snapshots, separate from live URMA state.
  uint64_t completedMapping, completedJournal;
+ uint64_t indexTeam; // Optional zeroed row controls (one cache line per writer).
 };
 }
 

@@ -81,12 +81,25 @@ extern "C" uint32_t refactor_fetch_pack_args(void *output, uint32_t capacity,
 }
 
 extern "C" uint32_t aclrtlaunch_v9_streaming_resolve_update(uint32_t,void*,void*);
-extern "C" uint32_t kvip_lifetch_streaming_forward(void* bindings,void* update,void* workspace,void* stream,const rotating::RuntimeShape* shape,uint32_t workers) {
+static uint32_t LaunchStreaming(void* bindings,void* update,void* workspace,void* stream,
+                                const rotating::RuntimeShape* shape,uint32_t workers,bool team) {
     if(!bindings||!update||!workspace||!stream||!shape||shape->resident>131072||shape->batch<1||shape->batch>16||shape->finalWorkers!=4)return 100000;
     if((workers!=1 && workers!=2 && workers!=4) || shape->batch*pipeline_ab::kResolveCores+4*workers>shape->aicCount*2)return 100000;
+    uint32_t blocks=shape->batch*pipeline_ab::kResolveCores+4*workers;
+    if(team){
+        if(!pipeline_ab::UseIndexTeam(shape->batch,shape->aicCount,shape->history))return 100000;
+        blocks=2*shape->aicCount;
+    }
     uint32_t result=LaunchLi(bindings,stream,shape);
-    if(!result)result=aclrtlaunch_v9_streaming_resolve_update(shape->batch*pipeline_ab::kResolveCores+4*workers,stream,workspace);
+    if(!result)result=aclrtlaunch_v9_streaming_resolve_update(blocks,stream,workspace);
     return result;
+}
+
+extern "C" uint32_t kvip_lifetch_streaming_forward(void* bindings,void* update,void* workspace,void* stream,const rotating::RuntimeShape* shape,uint32_t workers) {
+    return LaunchStreaming(bindings,update,workspace,stream,shape,workers,false);
+}
+extern "C" uint32_t kvip_lifetch_streaming_index_team_forward(void* bindings,void* update,void* workspace,void* stream,const rotating::RuntimeShape* shape,uint32_t workers) {
+    return LaunchStreaming(bindings,update,workspace,stream,shape,workers,true);
 }
 
 extern "C" uint32_t aclrtlaunch_kvip_transport_snapshot_kernel(uint32_t,void*,void*,void*,uint32_t);
@@ -118,3 +131,7 @@ extern "C" uint32_t kvip_native_fetch_only(void* workspace,void* counts,void* st
 extern "C" uint32_t kvip_streaming_resolver_cores(){return pipeline_ab::kResolveCores;}
 
 extern "C" uint32_t kvip_streaming_flag_count(){return pipeline_ab::kFlagCount;}
+
+extern "C" uint32_t kvip_streaming_index_team(uint32_t batch,uint32_t aic,uint32_t history) {
+    return pipeline_ab::UseIndexTeam(batch,aic,history) ? 2*aic : 0;
+}

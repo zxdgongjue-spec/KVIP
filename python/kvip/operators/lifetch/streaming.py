@@ -67,7 +67,17 @@ class StreamingLIFetchForward:
         self.events_src = allocate("event_sources", (b, 10240), torch.int32)
         self.events_dst = allocate("event_destinations", (b, 10240), torch.int32)
         self.worker_status = allocate("worker_status", (b, 32), torch.int32, True)
-        self.times = allocate("times", (b * 256 + (self.resolver_cores * b + 4 * q_workers) * 32,), torch.int64, True)
+        team_geometry = getattr(rotating.library, "kvip_streaming_index_team", None)
+        self.index_team_cores = 0
+        if team_geometry is not None and not hasattr(rotating, "lease"):
+            team_geometry.argtypes = [ctypes.c_uint32] * 3
+            team_geometry.restype = ctypes.c_uint32
+            self.index_team_cores = int(team_geometry(b, shape.aicCount, self.history))
+        if self.index_team_cores:
+            self.function = rotating.library.kvip_lifetch_streaming_index_team_forward
+        blocks = self.index_team_cores or (self.resolver_cores * b + 4 * q_workers)
+        self.index_team = allocate("index_team", (b, 5, 32), torch.int32, True) if self.index_team_cores else None
+        self.times = allocate("times", (b * 256 + blocks * 32 + self.index_team_cores * 8,), torch.int64, True)
         self.query_bitmaps = allocate("query_bitmaps", (b, 4, (self.resident + 31) // 32), torch.int32)
         self.query_errors = allocate("query_errors", (b, 4, 32), torch.int32, True)
         self.dense_shadow = allocate("dense_shadow", (b, 3 * self.history), torch.int64)
@@ -129,7 +139,8 @@ class StreamingLIFetchForward:
             (
                 blob,
                 np.asarray([self.dense_shadow.data_ptr(), self.packed_fetch.data_ptr(), completed_flags, live_count, completed_rows, completed_events, completed_mapping, completed_journal], dtype="<u8").view("u1"),
-                np.zeros(64, dtype="u1"),
+                np.asarray([self.index_team.data_ptr() if self.index_team is not None else 0], dtype="<u8").view("u1"),
+                np.zeros(56, dtype="u1"),
             )
         )
         if len(blob) != 256:
