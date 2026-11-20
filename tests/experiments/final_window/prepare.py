@@ -5,10 +5,17 @@ from pathlib import Path
 import shutil
 
 
+def ignore_artifacts(directory, names):
+    # build.py and similarly named source files are required by the runner.
+    return [name for name in names
+            if name == '__pycache__' or name.endswith(('.so', '.o'))
+            or (name.startswith('build') and (Path(directory)/name).is_dir())]
+
+
 def prepare(repo, destination):
     for directory in ('csrc', 'python'):
         shutil.copytree(repo/directory,destination/directory,
-            ignore=shutil.ignore_patterns('build*','__pycache__','*.so','*.o'),symlinks=True)
+            ignore=ignore_artifacts,symlinks=True)
     def patch(relative, old, new):
         path=destination/relative
         text=path.read_text()
