@@ -136,12 +136,22 @@ class StreamingLIFetchForward:
                 np.asarray(trailing, dtype="<u8").view("u1"),
             )
         )
+        route = getattr(rotating, "adaptive_route", None)
+        route_args = np.zeros(7, dtype="<u8")
+        if route is not None:
+            if not completed_rows or route.batch != b or route.requests.device != keys.device:
+                raise ValueError("Adaptive route requires matching URMA inputs on the same device")
+            abi = getattr(rotating.library, "kvip_lifetch_adaptive_route_abi", None)
+            if abi is None or abi() != 1:
+                raise ValueError("Rebuild KVIP: the URMA library lacks the adaptive route ABI")
+            route_args[:4] = [t.data_ptr() for t in (route.requests, route.feedback, route.mode, route.demand)]
+            route_args.view("<u4")[8:10] = [route.owners, route.policy]
         blob = np.concatenate(
             (
                 blob,
                 np.asarray([self.dense_shadow.data_ptr(), self.packed_fetch.data_ptr(), completed_flags, live_count, completed_rows, completed_events, completed_mapping, completed_journal], dtype="<u8").view("u1"),
                 np.asarray([self.index_team.data_ptr() if self.index_team is not None else 0], dtype="<u8").view("u1"),
-                np.zeros(56, dtype="u1"),
+                route_args.view("u1"),
             )
         )
         if len(blob) != 256:

@@ -4,11 +4,58 @@ from unittest.mock import patch
 
 import torch
 from kvip.adapters.vllm.inputs import QueryInputs
-from kvip.operators.lifetch.workspace import LIFetchWorkspace
+from kvip.adapters.vllm.selector import VllmIndexSelector
+from kvip.operators.lifetch.adaptive_route import AdaptiveRoute
+from kvip.operators.lifetch.workspace import LIFetchWorkspace, UbmemWorkspace
 from kvip.adapters.vllm.index_import import VllmIndexCacheStorage as IndexCacheStorage
 
 
 class FusedInputsTest(unittest.TestCase):
+    @patch.dict("os.environ", {"KVIP_URMA_ROUTE_POLICY": "zero"})
+    def test_adaptive_identity_reorder_retry_and_recycle_share_metadata_upload(self):
+        inputs = LIFetchWorkspace._make_inputs(None, torch, 2, torch.device("cpu"), pin_memory=False)
+        requests = inputs.route_requests
+        self.assertEqual(requests.data_ptr(), inputs.metadata[5].data_ptr())
+
+        def prepare(ids, owners, positions):
+            plans = [NS(owner=o, request=r, start=s, begin=0, stop=4) for r, o, s in zip(ids, owners, positions)]
+            inputs.prepare([4] * len(plans), query_owners=owners, route_plans=plans)
+            return requests.tolist()
+
+        self.assertEqual(prepare(["a", "b"], [0, 1], [90, 10]), [[0, 1, 1, 4], [1, 2, 1, 4]])
+        self.assertEqual(prepare(["b", "a"], [1, 0], [11, 90]), [[1, 2, 2, 4], [0, 1, 1, 4]])
+        self.assertEqual(prepare(["c"], [1], [6]), [[1, 3, 1, 4], [0, 0, 0, 0]])
+        self.assertEqual(prepare(["c"], [1], [5]), [[1, 4, 1, 4], [0, 0, 0, 0]])
+
+        self.assertEqual(prepare(["c"], [1], [30]), [[1, 5, 1, 4], [0, 0, 0, 0]])
+        self.assertEqual(prepare([], [], []), [[0] * 4] * 2)
+        self.assertEqual(prepare(["c"], [1], [32]), [[1, 6, 1, 4], [0, 0, 0, 0]])
+
+    @patch.dict("os.environ", {"KVIP_URMA_ROUTE_POLICY": "zero"})
+    def test_group_feedback_is_private_and_request_upload_is_shared(self):
+        device = torch.device("cpu")
+        inputs = LIFetchWorkspace._make_inputs(None, torch, 2, device, pin_memory=False)
+        shared = inputs.route_requests
+        groups = [AdaptiveRoute(torch, device, 2, 3, requests=shared) for _ in range(2)]
+        selectors = [NS(inputs=inputs, row_owners=inputs.row_owners, storage=None,
+                        unique_active_owners=False) for _ in groups]
+        plans = [NS(owner=1, request="r", start=99, begin=0, stop=4, decode=True)]
+        for i, selector in enumerate(selectors):
+            VllmIndexSelector.prepare(selector, plans, prepare_inputs=(i == 0))
+        self.assertEqual(inputs.turn, 1)
+        self.assertEqual([g.requests[0].tolist() for g in groups], [[1, 1, 1, 4]] * 2)
+        self.assertEqual(groups[0].feedback.stride(), (16, 1))
+        self.assertEqual(groups[0].demand.stride(), (32,))
+        groups[0].feedback[1, 2] = 988
+        self.assertEqual(groups[1].feedback[1, 2].item(), 0)
+        plans[0].request = None
+        VllmIndexSelector.prepare(selectors[0], plans)
+        self.assertEqual(groups[0].requests.tolist(), [[0] * 4] * 2)
+
+        ubmem = UbmemWorkspace._make_inputs(None, torch, 2, device, pin_memory=False)
+        self.assertIsNone(ubmem.route_requests)
+        self.assertEqual(ubmem.metadata.shape[0], 5)
+
     def test_fp8_pack_uses_byte_gather_preserving_all_bit_patterns(self):
         native_select = torch.index_select
 

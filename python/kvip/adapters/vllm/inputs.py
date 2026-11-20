@@ -29,7 +29,7 @@ def committed_candidates(candidates, committed, resident):
 
 
 class QueryInputs:
-    def __init__(self, torch, batch, device, *, pin_memory=True, history=0, index_heads=64):
+    def __init__(self, torch, batch, device, *, pin_memory=True, history=0, index_heads=64, route_policy="off"):
         if index_heads not in (32, 64):
             raise ValueError("LIFetch supports 32 or 64 Indexer heads")
         self.index_heads = index_heads
@@ -37,8 +37,15 @@ class QueryInputs:
         capacity = batch * QUERIES_PER_REQUEST
         # Fields share one upload, including output padding validity. Graph
         # padding must not inherit the first real request's selected slots.
-        self.metadata = torch.zeros((5, capacity), dtype=torch.int64, device=device)
-        self.host = [torch.zeros((5, capacity), dtype=torch.int64, pin_memory=pin_memory) for _ in range(2)]
+        self.route_policy = route_policy
+        if self.route_policy not in ("off", "zero", "early"):
+            raise ValueError("KVIP_URMA_ROUTE_POLICY must be off, zero or early")
+        field_count = 5 if self.route_policy == "off" else 6
+        self._active_routes = {}
+        self._route_generation = 0
+        self.metadata = torch.zeros((field_count, capacity), dtype=torch.int64, device=device)
+        self.route_requests = self.metadata[5].view(batch, 4) if field_count == 6 else None
+        self.host = [torch.zeros((field_count, capacity), dtype=torch.int64, pin_memory=pin_memory) for _ in range(2)]
         self.host_events = [None, None]
         self.turn = 0
         self.gather_indices, self.query_valid, self.unpack_indices, self.output_valid = self.metadata[:4].unbind(0)
@@ -72,7 +79,37 @@ class QueryInputs:
             )
         )
 
-    def prepare(self, query_counts, *, query_starts=None, query_owners=None):
+    def _pack_route_requests(self, destination, plans, counts, owners):
+        # The scheduler already supplies request ID, owner and computed-token
+        # position. Keep identities by owner across reordering; conservatively
+        # start a new generation after absence, recycle or a rollback.
+        if plans is None:
+            self._active_routes = {}
+            return
+        plans = tuple(plans)
+        if tuple(int(plan.owner) for plan in plans) != owners or tuple(int(p.stop - p.begin) for p in plans) != counts:
+            raise ValueError("Route identities must match the Q rows and owners being uploaded")
+        current = {}
+        for row, (plan, owner, count) in enumerate(zip(plans, owners, counts)):
+            identity, position = plan.request, int(plan.start)
+            if not count or identity is None or position < 0:
+                continue
+            if owner in current:
+                raise ValueError("Adaptive routing requires distinct active owners")
+            previous = self._active_routes.get(owner)
+            if (previous is None or previous[0] != identity
+                    or not previous[1] <= position <= previous[1] + previous[4]):
+                self._route_generation += 1
+                generation, step = self._route_generation, 1
+            else:
+                generation, step = previous[2:4]
+                # A replay at the same position must not train the predictor twice.
+                step += int(position > previous[1])
+            current[owner] = (identity, position, generation, step, count)
+            destination[row] = (owner, generation, step, count)
+        self._active_routes = current
+
+    def prepare(self, query_counts, *, query_starts=None, query_owners=None, route_plans=None):
         """Input preparation, outside capture; no device-dependent branching.
 
         The caller invokes this after the previous forward has been enqueued on
@@ -95,6 +132,8 @@ class QueryInputs:
             event.synchronize()
         values = self.host[ring].numpy()
         values.fill(0)
+        if self.route_requests is not None:
+            self._pack_route_requests(values[5].reshape(self.batch, 4), route_plans, counts, owners)
         if owners is not None:
             self.host[ring][4].view(self.torch.int32)[: len(owners)].numpy()[...] = owners
         begin = 0

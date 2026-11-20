@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Graph-stable original LI work buffers shared by sequential layer groups."""
 
+import os
+
 import numpy as np
 
 from kvip.operators.lifetch import geometry as tiling_geometry
@@ -57,7 +59,7 @@ class LIFetchWorkspace:
         self.scratch = {}
 
     def _make_inputs(self, torch, batch, device, **kwargs):
-        return QueryInputs(torch, batch, device, **kwargs)
+        return QueryInputs(torch, batch, device, route_policy=os.environ.get("KVIP_URMA_ROUTE_POLICY", "off"), **kwargs)
 
     def allocate_rotation(self, torch, *, batch, history, resident, aics, windows, status_bytes=1216):
         """Reserve reusable resolver work memory before HBM profiling.
