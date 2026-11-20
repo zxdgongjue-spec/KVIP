@@ -240,7 +240,7 @@ if [[ -n "$ranked" ]]; then
         for label in "${order[@]}"; do
             run_arm "$label" "$group" "$case_dir"
         done
-        "$PYTHON" -B "$tools/support/ranked_five_report.py" "$out" --group "$group"
+        "$PYTHON" -B "$tools/support/ranked_five_report.py" "$out" --group "$group" | tee -a "$out/summary.txt"
         order=("${order[1]}" "${order[0]}")
     done
     printf 'REPLAY_COMPLETE RESULT_ROOT=%s\n' "$out"

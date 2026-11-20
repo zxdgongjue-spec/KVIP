@@ -145,16 +145,10 @@ def diagnostic_intervals(raw, detail, *, candidate):
         record['copy_team_envelope_us'] = percentiles([(end[i, active[i]].max()-begin[i, active[i]].min())/clock
                                                   for i in range(n)])
     else:
-        u = per_row[:, :, 32:]
-        flags = (u[..., 10] > 0) & (u[..., 24] >= u[..., 10])
-        measure('index_consumer_incl_wait', u[..., 10], u[..., 24])
-        ig = detail['stages']['index_apply_general']
-        intervals['index_general_body'] = ig['p50_us'], ig['max_us']
-        record['general_probe_rows'] = (ig['n'], ig['eligible'])
-        envelopes = [(u[i, mask, 24].max()-u[i, mask, 10].min())/clock
-                     for i, mask in enumerate(flags) if mask.any()]
-        intervals['index_team_plan_five_phases'] = ig['p50_us'], ig['max_us']
-        record['copy_team_envelope_us'] = percentiles(envelopes)
+        # On the baseline the same five phase counters include both planning
+        # and applying the exchange, so they cannot be subtracted from a
+        # candidate plan-only or field-lane measurement.
+        intervals['index_general_plan_and_apply'] = ig['p50_us'], ig['max_us']
     return intervals, record
 
 
@@ -231,9 +225,9 @@ def report(root, group):
         fields = [f'{name}={paired(*value)}' for name,value in data['phases'].items()]
         for i in range(0,len(fields),5):
             print('  COUNTERS p50/max_us', ' '.join(fields[i:i+5]))
-        windows = [f'{w["epoch"]}:{fmt(w["service_us"]["p50_us"])}/{fmt(w["active_post_us"]["p50_us"])}'
+        windows = [f'{w["epoch"]}:{fmt(w["service_us"]["p50_us"])}/{fmt(w["incremental_us"]["p50_us"])}/{fmt(w["active_post_us"]["p50_us"])}'
                    for w in data['windows']]
-        print('  WINDOW epoch:service/active_post_p50_us', ' '.join(windows))
+        print('  WINDOW epoch:service/incremental/active_post_p50_us', ' '.join(windows))
         print('  INDEX', ' '.join(f'{key}={paired(*value)}' for key,value in data['index'].items()))
         traffic = data['traffic']
         print('  READS', ' '.join(f'{key}={traffic[key]["p50"]:g}' for key in
