@@ -72,6 +72,7 @@ def _bind_selectors(torch, policy, config):
             resident=policy.history_capacity,
             intermediate_fetches=setup.windows,
             prefetch_limit=config.prefetch_tokens,
+            prefetch_rank_start=1024,
             window_limit=max(1, config.prefetch_tokens // setup.windows),
             aic_count=setup.aics,
             token_bytes=token_bytes,
