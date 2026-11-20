@@ -50,12 +50,14 @@ def delta(base, current):
     return 'NA' if base is None or current is None else f'{base-current:+.2f}'
 
 
-def print_arm(label, timing, detail):
+def print_arm(label, timing, placement, detail):
     spans = timing['samples_us']
     first, last = spans[:5], spans[-5:]
     print(f"ARM {label} event_mean={timing['event_mean_us']:.3f} span_p50={timing['p50_us']:.3f} "
           f"span_mean={timing['profiler_mean_us']:.3f} "
-          f"within_graph_last5_minus_first5_mean/p50={mean(last)-mean(first):+.3f}/{median(last)-median(first):+.3f}")
+          f"within_graph_last5_minus_first5_mean/p50={mean(last)-mean(first):+.3f}/{median(last)-median(first):+.3f} "
+          f"THP_min_pct={placement['coverage_min_pct']:.3f} ub_device={placement.get('ub_device')} "
+          f"NUMA_pages={placement['numa_pages_overlapping_vmas']}")
     print('KERNEL '+label+' mean/p50 '+' '.join(f"{k}={v:.3f}/{timing['stage_p50_us'][k]:.3f}"
                                                 for k, v in timing['stage_mean_us'].items())
           + f" gap={timing['inter_kernel_gap_mean_us']:.3f} overlap={timing['overlap_mean_us']:.3f}"
@@ -98,17 +100,23 @@ def print_arm(label, timing, detail):
 def report(root, *, gains_only=False):
     rows = {label: read_result(root, label) for label in LABELS}
     if not gains_only:
-        for label, (timing, _, detail) in rows.items():
-            print_arm(label, timing, detail)
+        for label, row in rows.items():
+            print_arm(label, *row)
+    matched = 0
     for name in ('zero', 'early'):
         current, placement, study = rows[name]
         for baseline in ('serial', 'main'):
             ref, ref_place, _ = rows[baseline]
+            pairing = pair_placement(placement, ref_place, local_baseline=True)
+            if pairing != 'matched':
+                print(f'GAIN {name}_vs_{baseline} event_mean=NA span_p50=NA placement={pairing}')
+                continue
+            matched += 1
             stages, other = current['stage_mean_us'], ref['stage_mean_us']
             other_tail = other['resolve_update'] if baseline == 'main' else other['lidu_prepare'] + other['fetch']
             print(f"GAIN {name}_vs_{baseline} event_mean={saved(ref['event_mean_us'], current['event_mean_us'])} "
                   f"span_p50={saved(ref['p50_us'], current['p50_us'])} "
-                  f"placement={pair_placement(placement, ref_place)}")
+                  f"placement={pairing}")
             print(f"KERNEL_DELTA {name}_vs_{baseline} saved_li_mean/p50={other['li']-stages['li']:+.3f}/"
                   f"{ref['stage_p50_us']['li']-current['stage_p50_us']['li']:+.3f} "
                   f"saved_tail_mean/p50={other_tail-stages['resolve_update']:+.3f}/"
@@ -116,6 +124,8 @@ def report(root, *, gains_only=False):
                   f"saved_gap={ref['inter_kernel_gap_mean_us']-current['inter_kernel_gap_mean_us']:+.3f} "
                   f"overlap_adjustment={current['overlap_mean_us']-ref['overlap_mean_us']:+.3f} "
                   f"saved_outside_calls={ref['outside_invocations_mean_us']-current['outside_invocations_mean_us']:+.3f}")
+        if pair_placement(placement, rows['main'][1], local_baseline=True) != 'matched':
+            continue
         main_detail = rows['main'][2]['stages']
         fields = []
         for k, v in study['stages'].items():
@@ -127,7 +137,7 @@ def report(root, *, gains_only=False):
             fields.append(f"{k}={delta(other['p50_us'], v['p50_us'])}/{delta(other['max_us'], v['max_us'])}")
         for start in range(0, len(fields), 5):
             print(f'DETAIL_DELTA {name}_vs_main '+' '.join(fields[start:start+5]))
-    print('CHECK output_KV_Index=PASS timing_reconciled=PASS')
+    print(f'CHECK output_KV_Index=PASS timing_reconciled=PASS local_placement_matched_pairs={matched}/4')
     print(f'RESULT_ROOT={root}')
 
 
@@ -139,7 +149,6 @@ if __name__ == '__main__':
     action.add_argument('--gains-only', action='store_true')
     args = parser.parse_args()
     if args.arm:
-        timing, _, detail = read_result(args.root, args.arm)
-        print_arm(args.arm, timing, detail)
+        print_arm(args.arm, *read_result(args.root, args.arm))
     else:
         report(args.root, gains_only=args.gains_only)

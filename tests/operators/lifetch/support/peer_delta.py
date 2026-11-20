@@ -94,8 +94,15 @@ def single_numa_node(thp):
     return None
 
 
-def pair_placement(left, right):
-    if not (transport_matches(left) and transport_matches(right)):
+def pair_placement(left, right, *, local_baseline=False):
+    if local_baseline:
+        if min(left['coverage_min_pct'], right['coverage_min_pct']) < 99:
+            return 'insufficient_thp_coverage'
+        if not left.get('ub_device') or not right.get('ub_device'):
+            return 'unknown_ub_device'
+        if left['ub_device'] != right['ub_device']:
+            return 'different_ub_device'
+    elif not (transport_matches(left) and transport_matches(right)):
         return 'thp_or_device_mismatch'
     nodes = single_numa_node(left), single_numa_node(right)
     if None in nodes:
@@ -168,7 +175,11 @@ if __name__ == '__main__':
     parser.add_argument('arm', nargs='?', choices=ARMS)
     parser.add_argument('--serial-node', action='store_true',
                         help='print a unique observed serial NUMA node for CPU memory binding')
+    parser.add_argument('--local-baseline', action='store_true',
+                        help='screen the local serial arm against its own measured placement')
     args = parser.parse_args()
+    if args.local_baseline and args.arm != 'serial':
+        parser.error('--local-baseline requires the serial arm')
     if args.serial_node:
         if args.arm:
             parser.error('select either --serial-node or an arm')
@@ -178,7 +189,10 @@ if __name__ == '__main__':
     elif args.arm:
         row = load_arm(args.root, args.arm)
         arm_line(args.arm, row)
-        if args.arm == 'serial' and not (bridge_matches(row[0]) and transport_matches(row[1])):
+        if args.local_baseline:
+            placement = pair_placement(row[1], row[1], local_baseline=True)
+            print(f'BASELINE_SCREEN reference=local placement={placement}')
+        elif args.arm == 'serial' and not (bridge_matches(row[0]) and transport_matches(row[1])):
             raise SystemExit('BASELINE_RECHECK_FAILED: inspect the first ARM serial timing, THP and UB device')
     else:
         report(args.root)
