@@ -58,8 +58,8 @@ PY
 
 ranked_help_groups() {
     local group params preferred trace_path trace hash_file arm revision case_dir saved started
-    local -a labels pending summaries=() paired_order=(baseline candidate)
-    for group in 7 2 10 4 17; do
+    local -a labels pending paired_order=(baseline candidate)
+    for group in "${ranked_groups[@]}"; do
         case_dir="$out/g$group"
         mkdir -p "$case_dir"
         if "$joint_local"; then
@@ -122,6 +122,9 @@ ranked_help_groups() {
         if "$joint_local"; then
             "$PYTHON" -B "$tools/support/ranked_joint_report.py" "$out" --reference "$out" \
                 --group "$group" | tee "$case_dir/summary.txt"
+        elif "$joint_archive"; then
+            "$PYTHON" -B "$tools/support/ranked_joint_report.py" "$out" --joint-control "$help_reference" \
+                --group "$group" | tee "$case_dir/summary.txt"
         elif "$joint"; then
             "$PYTHON" -B "$tools/support/ranked_joint_report.py" "$out" --reference "$help_reference" \
                 --previous "$joint_reference" --group "$group" | tee "$case_dir/summary.txt"
@@ -129,8 +132,10 @@ ranked_help_groups() {
             "$PYTHON" -B "$tools/support/ranked_help_report.py" "$out" \
                 --reference "$help_reference" --group "$group" | tee "$case_dir/summary.txt"
         fi
-        summaries+=("$case_dir/summary.txt")
-        cat "${summaries[@]}" >"$out/summary.tmp"
+        # Include completed groups from earlier invocations of the same run.
+        for saved in 7 2 10 4 17; do
+            if [[ -s "$out/g$saved/summary.txt" ]]; then cat "$out/g$saved/summary.txt"; fi
+        done >"$out/summary.tmp"
         mv "$out/summary.tmp" "$out/summary.txt"
     done
     printf 'REPLAY_COMPLETE RESULT_ROOT=%s\n' "$out"

@@ -3239,7 +3239,7 @@ class FusedReplayState:
     state must not have live graphs or unfinished device work.
     """
     def __init__(self, torch, runtime, table, library, initial, pages, addresses,
-                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None, candidate_bounds=None, route_policy=None, fixed_reset=None):
+                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None, candidate_bounds=None, route_policy=None, fixed_reset=None, ranked_q_workers=None):
         from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
         from kvip.cache.index_storage import IndexCacheStorage
         from kvip.operators.lifetch.binding import LIFetchBinding
@@ -3288,6 +3288,11 @@ class FusedReplayState:
                                               prefetch_limit=prefetch_tokens, **binding)
             else:
                 owner = KvafQueueView(self.lease, output_rows, table.addresses, table.valid)
+                if ranked_q_workers is not None:
+                    views = owner.context['worker_count'] * owner.context['jettys_per_core']
+                    required = 2 * self.batch + 8 * ranked_q_workers
+                    if views < required:
+                        raise ValueError(f'Ranked final Get needs {required} queue views, Runtime provides {views}')
                 if candidate_bounds is None:
                     binding['prefetch_rank_start'] = prefetch_rank_start
                 else:
@@ -3311,8 +3316,11 @@ class FusedReplayState:
                 query_inputs=self.workspace.inputs,
                 status=torch.zeros(self.batch, dtype=torch.int32, device=device),
                 outputs=torch.zeros((2, self.batch * 4, 1, 2048), dtype=torch.int32, device=device))
+            workers_per_query = 4 if candidate_bounds is not None else 2
+            if ranked_q_workers is not None:
+                workers_per_query = ranked_q_workers
             self.forward = StreamingForward(self.rotating, self.update, torch, prefetch_tokens,
-                                            q_workers=4 if candidate_bounds is not None else 2)
+                                            q_workers=workers_per_query)
             self.reset()
         except BaseException:
             if self.owns_lease:
@@ -4049,7 +4057,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                 prefetch_tokens=config.prefetch_tokens, soc=soc,
                 prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024), candidate_bounds=candidate_bounds,
-                route_policy=getattr(config, 'route_policy', None), fixed_reset=fixed_reset)
+                route_policy=getattr(config, 'route_policy', None), fixed_reset=fixed_reset,
+                ranked_q_workers=getattr(config, 'ranked_q_workers', None))
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
         if config.mode in ('bench', 'diagnose') and g.get('sparse_mode') == 0 and not fused:
@@ -4097,7 +4106,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                         prefetch_tokens=config.prefetch_tokens, soc=soc,
                         prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease,
                         candidate_bounds=candidate_bounds,
-                        route_policy=getattr(config, 'route_policy', None), fixed_reset=fixed_reset)
+                        route_policy=getattr(config, 'route_policy', None), fixed_reset=fixed_reset,
+                        ranked_q_workers=getattr(config, 'ranked_q_workers', None))
                     replica.failure_directory = directory
                 else:
                     replica = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)

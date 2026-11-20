@@ -10,11 +10,12 @@ import numpy as np
 
 from peer_candidate import RANKED_BASE
 from peer_delta import pair_placement
-from ranked_five_report import GROUPS, fmt, team_fields
+from ranked_five_report import GROUPS, final_q_workers, fmt, team_fields
 from ranked_help_report import compare, distribution, load, summary
 
 
 PREVIOUS = '56dcd74a1450db75ab3133ebf71a3b356e8b2928'
+JOINT_CONTROL = '772293d4f0ccb002a1d5210016619af534008e88'
 METRICS = ('event_mean_us', 'profiler_p50_us')
 STAGES = ('resolve_per_query', 'planning', 'descriptor', 'final_get_post', 'index_row_incl_wait',
           'final_get_cq_wait', 'finalizer_wait_index_flag')
@@ -25,12 +26,14 @@ def joint_endpoints(raw):
     ticks = np.asarray(raw['times'], dtype=np.int64)
     n, clock = len(ticks), float(raw['cycles_per_us'])
     cores = ticks[:, 4096:6144].reshape(n, 64, 32)
-    comm = cores[:, 48:56]
+    workers = final_q_workers(raw)
+    queues = 4*workers
+    comm = cores[:, 48:48+queues]
     entered = cores[..., 0].min(axis=1)
     first, post, cq, win_begin, win_end, probe, probe_end, row, prefix, total, resume, resumed = (
         comm[..., i] for i in range(16, 28))
     fetch = ticks[:, 2048:4096].reshape(n, 16, 128)
-    lanes = fetch[:, :2, :96].reshape(n, 2, 4, 24).transpose(0, 2, 1, 3).reshape(n, 8, 24)
+    lanes = fetch[:, :workers, :96].reshape(n, workers, 4, 24).transpose(0, 2, 1, 3).reshape(n, queues, 24)
     sent = (lanes[..., 16] + lanes[..., 17]) > 0
     tried, won, rest = probe > 0, row > 0, resume > 0
     if (np.any(entered <= 0) or np.any(sent != (first > 0)) or np.any(sent != (cq > 0))
@@ -42,11 +45,10 @@ def joint_endpoints(raw):
             or np.any(rest != (resumed > 0))
             or np.any(rest & (~won | (total <= prefix) | (cq > resume) | (resume > resumed)))):
         raise ValueError('Invalid final doorbell/Post/CQ or help interval')
-    owners, counts, *_ = team_fields(ticks[:, 6144:].reshape(n, 64, 8), flexible=False, joint=True)
+    owners, counts, *_ = team_fields(ticks[:, 6144:].reshape(n, 64, 8), flexible=False, joint=True, workers=workers)
     for call, lane in zip(*np.nonzero(won)):
         target = row[call, lane] - 1
-        queue_row = 4*(lane//2) + lane%2
-        if (target not in (queue_row, queue_row+2) or (row[call] == target+1).sum() != 1
+        if (target//4 != lane//workers or target%workers != lane%workers or (row[call] == target+1).sum() != 1
                 or counts[call, target, 3] != total[call, lane] or
                 ((prefix[call, lane] == total[call, lane] or rest[call, lane])
                  and owners[call, target, 3] != 48 + lane)):
@@ -66,7 +68,7 @@ def joint_endpoints(raw):
     cross_completions = (home != np.arange(16)) & (counts[..., 3] > 0)
     return dict(calls=n, nonempty_lanes=int(sent.sum()), max_groups_per_phase=int(lanes[..., 16:18].max()),
                 conflict_lane_calls=int((lanes[..., 17] > 0).sum()), attempts=int(tried.sum()), wins=int(won.sum()),
-                remote_wins=int((won & (row != np.arange(1, 9))).sum()),
+                remote_wins=int((won & (row != np.arange(1, queues+1))).sum()),
                 cross_row_completions=int(cross_completions.sum()),
                 precq_moves=int(prefix.sum()), unprocessed_by_prefix_moves=int((total-prefix).sum()),
                 native_suffix_moves=int((total-prefix)[rest].sum()),
@@ -96,19 +98,56 @@ def history(previous, group, original, candidate):
     return prev
 
 
-def run(root, reference, previous, group):
-    if previous is None and root.resolve() != reference.resolve():
+def early_index_stats(raw):
+    """Decode only the dedicated Index cores; communication cores reuse these words."""
+    workers = final_q_workers(raw)
+    ticks = np.asarray(raw['times'], dtype=np.int64)
+    cores = ticks[:, 4096:6144].reshape(-1, 64, 32)
+    idle = cores[:, 48 + 4 * workers:]
+    start, end, scatter, moves, target = (idle[..., i] for i in (16, 17, 18, 19, 20))
+    active = moves > 0
+    if np.any(active & ((start < idle[..., 0]) | (start <= 0) | (end < start) |
+                        (scatter < end) | (target < 1) | (target > 16))):
+        raise ValueError('Invalid early Index read/scatter stamps')
+    mhz = float(raw['cycles_per_us'])
+    return dict(q_workers=workers, eligible_core_calls=int(active.size), hits=int(active.sum()),
+                moves=int(moves[active].sum()), reads_by_row=np.bincount(target[active]-1, minlength=16).tolist(),
+                entry_to_read_us=distribution((start-idle[..., 0])[active]/mhz),
+                read_us=distribution((end-start)[active]/mhz),
+                wait_after_read_us=distribution((scatter-end)[active]/mhz))
+
+
+def run(root, reference, previous, group, *, joint_control=False):
+    if previous is None and not joint_control and root.resolve() != reference.resolve():
         raise ValueError('Local comparison requires the baseline and candidate in the same run directory')
     original = load(reference, group, 'baseline', RANKED_BASE, 'original')
     candidate = load(root, group, 'candidate', (root/'candidate.txt').read_text().strip(), 'joint')
+    if joint_control:
+        if ((reference/'baseline.txt').read_text().strip() != RANKED_BASE or
+                (reference/'candidate.txt').read_text().strip() != JOINT_CONTROL or
+                any((root/f).read_text().strip() != (reference/f).read_text().strip()
+                    for f in ('host.txt', 'physical_npu.txt'))):
+            raise ValueError('Wrong archived candidate, host or physical device')
+        prior = load(reference, group, 'candidate', JOINT_CONTROL, 'joint')
+        for arm, source in ((original, reference), (prior, reference), (candidate, root)):
+            digest = source / f'ranked-{arm["revision"][:8]}.binary.sha256'
+            if digest.read_text().strip() != arm['binary']:
+                raise ValueError('Recorded binary digest differs from the tested arm')
+        prior_comparison = compare(prior, candidate)
     match = compare(original, candidate)
+    if joint_control and any(c['placement'] != 'matched' or not c['same_capture_sha256']
+                             for c in (match, prior_comparison)):
+        raise ValueError('Current and archived runs require identical input bytes and matched THP/NUMA/UB device')
     if match['same_binary']:
         raise ValueError('Candidate binary matches original')
     with np.load(candidate['folder']/'lean_ticks.npz', allow_pickle=False) as raw:
         ends = joint_endpoints(raw)
+        early = early_index_stats(raw) if joint_control else None
     original, candidate = summary(original), summary(candidate)
     controls = {'original': original}
-    if previous is not None:
+    if joint_control:
+        controls['previous8'] = summary(prior)
+    elif previous is not None:
         controls['previous'] = history(previous, group, original, candidate)
     rows = {**controls, 'candidate': candidate}
     deltas = {}
@@ -124,11 +163,14 @@ def run(root, reference, previous, group):
         deltas[label] = dict(saved_us=gains, saved_pct=[100*g/baseline[k] for g,k in zip(gains, METRICS)],
                              kernel_mean_saved_us=kernel, auxiliary_p50_saved_us=stages, placement=place)
     drifts = {k: drift(v['span_us']) for k,v in rows.items()}
-    source = 'archived controls' if previous is not None else 'local baseline and candidate'
+    source = 'archived controls (cross-run drift unmeasured)' if previous is not None or joint_control else 'local baseline and candidate'
     result = dict(group=group, arms=rows, comparisons=deltas, within_graph_drift=drifts, joint_tail=ends,
                   original_topk_match=match['exact_topk_matched'],
                   protocol=f'One profiled graph per arm, {source}. Mean is graph event, p50 is per-invocation device span. '
                            'Within-graph drift is last five minus first five device spans. Stage diagnostics are a separate graph and overlap.')
+    if joint_control:
+        result['previous8_topk_match'] = prior_comparison['exact_topk_matched']
+        result['early_index'] = early
     path = root/f'g{group}/comparison.json'
     tmp = path.with_suffix('.json.tmp')
     tmp.write_text(json.dumps(result, indent=2, allow_nan=False)+'\n')
@@ -141,6 +183,20 @@ def run(root, reference, previous, group):
         print(f'  GAIN vs_{label} saved_us={pair(d["saved_us"])} saved_pct={pair(d["saved_pct"])} placement={d["placement"]}')
         print(f'  STAGE vs_{label} kernel_mean_saved_us ' + ' '.join(f'{k}={v:+.2f}' for k,v in d['kernel_mean_saved_us'].items())
               + ' auxiliary_p50_saved_us ' + ' '.join(f'{k}={fmt(v)}' for k,v in d['auxiliary_p50_saved_us'].items()))
+    if joint_control:
+        for name, comp in (('original', match), ('previous8', prior_comparison)):
+            m = comp['exact_topk_matched']
+            print(f'  MATCH vs_{name} pairs={m["n"]}/{m["before_calls"]} '
+                  f'span_p50_saved_us={fmt(m["span_p50_saved_us"])} archived=true')
+        print('  FOURTH previous8/current_us ' + ' '.join(
+            f'{label}=' + '/'.join(fmt(arm['tail'][key][q]) for arm in (controls['previous8'], candidate))
+            for label, key, q in (('fourth_minus_primary_p50', 'last_fourth_minus_last_primary_us', 'p50'),
+                                  ('row_handoff_p95', 'row_handoff_gap_us', 'p95'),
+                                  ('plan_to_fourth_start_p50', 'fourth_copy_start_minus_plan_us', 'p50'))))
+        print(f'  EARLY_INDEX comm_cores={4 * early["q_workers"]} '
+              f'used_spare_core_calls={early["hits"]}/{early["eligible_core_calls"]} copied_moves={early["moves"]} '
+              f'entry_to_read_p50_us={fmt(early["entry_to_read_us"]["p50"])} early_read_p50_us={fmt(early["read_us"]["p50"])} '
+              f'wait_to_scatter_p50_us={fmt(early["wait_after_read_us"]["p50"])}')
     print('  DRIFT last5_minus_first5_span_mean/p50_us ' + ' '.join(f'{k}={v[0]:+.2f}/{v[1]:+.2f}' for k,v in drifts.items()))
     print('  TAIL auxiliary_p50_us_from_kernel_entry ' + ' '.join(f'{k}={fmt(ends[k]["p50"])}' for k in
           ('first_doorbell','last_post','last_cq','last_index','last_status','last_index_minus_last_cq')))
@@ -154,7 +210,12 @@ if __name__ == '__main__':
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('root', type=Path)
     p.add_argument('--reference', type=Path, help='Baseline result root (defaults to this run)')
-    p.add_argument('--previous', type=Path, help='Previous archived candidate; omit for a local two-arm comparison')
+    history_type = p.add_mutually_exclusive_group()
+    history_type.add_argument('--joint-control', type=Path, help='Reuse the same-node 772293d4 and original arms')
+    history_type.add_argument('--previous', type=Path, help='Previous archived candidate; omit for a local two-arm comparison')
     p.add_argument('--group', type=int, required=True, choices=GROUPS)
     args = p.parse_args()
-    run(args.root, args.reference or args.root, args.previous, args.group)
+    if args.reference and args.joint_control:
+        p.error('select one reference directory')
+    run(args.root, args.joint_control or args.reference or args.root, args.previous, args.group,
+        joint_control=bool(args.joint_control))

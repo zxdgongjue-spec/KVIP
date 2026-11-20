@@ -148,6 +148,8 @@ def configuration(argv=None):
                                  help='G2 mainline or learned low route with matched stage accounting')
             command.add_argument('--production-root', type=Path,
                                  help='clean ranked URMA checkout whose binding and kernels will run')
+            command.add_argument('--ranked-q-workers', type=int, choices=(1, 2, 4),
+                                 help='final URMA Post/CQ workers per query position on a ranked replay')
             command.add_argument('--candidate-root', type=Path, help='G2 auto-route production checkout')
             command.add_argument('--candidate-snapshot', type=Path, help='matching G2 predecessor bounds')
             command.add_argument('--stages', type=csv_values, default=('all',))
@@ -203,6 +205,8 @@ def configuration(argv=None):
     if args.mode == 'diagnose':
         if (args.serial_only or args.fused_only) and args.input != 'real':
             parser.error('standalone path measurements require --input real')
+        if args.ranked_q_workers is not None and not args.production_root:
+            parser.error('--ranked-q-workers requires --production-root')
         if args.production_root:
             if (args.transport != 'urma' or not args.fused_only or args.input != 'real'
                     or args.round_range[0] != args.round_range[1] or args.level != 2

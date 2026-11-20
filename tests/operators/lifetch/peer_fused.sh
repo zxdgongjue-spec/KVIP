@@ -26,6 +26,9 @@ help_reference=
 joint_reference=
 joint=false
 joint_local=false
+joint_archive=false
+ranked_q_workers=${PEER_RANKED_Q_WORKERS:-2}
+ranked_groups=(7 2 10 4 17)
 resume=
 anchor=
 has_anchor=false
@@ -68,6 +71,29 @@ elif [[ ${1:-} == --ranked-joint-local ]]; then
     joint=true
     joint_local=true
     shift 2
+    if [[ ${1:-} == --reference ]]; then
+        help_reference=$(cd "${2:?supply the prior same-node ranked-joint-local run directory}" && pwd -P)
+        joint_local=false
+        joint_archive=true
+        shift 2
+        case "$ranked_q_workers" in 1|2|4) ;; *) echo 'PEER_RANKED_Q_WORKERS expects 1, 2 or 4' >&2; exit 2 ;; esac
+        if [[ -n ${PEER_RANKED_GROUPS:-} ]]; then
+            read -ra ranked_groups <<<"$PEER_RANKED_GROUPS"
+            (( ${#ranked_groups[@]} > 0 )) || { echo 'Empty group selection' >&2; exit 2; }
+            for g in "${ranked_groups[@]}"; do
+                case "$g" in 2|4|7|10|17) ;; *) echo "Unknown group: $g" >&2; exit 2 ;; esac
+            done
+        fi
+        joint_control=772293d4f0ccb002a1d5210016619af534008e88
+        if [[ $(<"$help_reference/baseline.txt") != "$ranked_sha" ||
+              $(<"$help_reference/candidate.txt") != "$joint_control" ||
+              $(<"$help_reference/physical_npu.txt") != "$peer_physical_npu" ||
+              $(<"$help_reference/host.txt") != "$(</proc/sys/kernel/hostname)" ]]; then
+            echo "Archived ranked joint control, host, or physical NPU mismatch: $help_reference" >&2
+            exit 1
+        fi
+        [[ $ranked != "$joint_control" ]] || { echo 'Candidate equals the archived control' >&2; exit 2; }
+    fi
 elif [[ ${1:-} == --ranked-index ]]; then
     ranked=${2:?supply candidate commit}
     shift 2
@@ -86,7 +112,7 @@ if [[ -z "$ranked" && $# -eq 2 && $1 == --reuse-serial ]]; then
         exit 1
     fi
 elif [[ $# -ne 0 ]]; then
-    echo 'Usage: peer_fused.sh --ranked-joint-local FULL_SHA | --ranked-joint FULL_SHA --previous DIR [--reference DIR] | --ranked-help FULL_SHA [--reference DIR] [--resume DIR] [--anchor GROUP] | --ranked-index CANDIDATE_SHA | [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
+    echo 'Usage: peer_fused.sh --ranked-joint-local FULL_SHA [--reference DIR] | --ranked-joint FULL_SHA --previous DIR [--reference DIR] | --ranked-help FULL_SHA [--reference DIR] [--resume DIR] [--anchor GROUP] | --ranked-index CANDIDATE_SHA | [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
     exit 2
 fi
 export PATH=/usr/local/python3.12.13/bin:$PATH
@@ -98,6 +124,7 @@ if [[ -n "$help_reference" ]] || "$joint_local"; then
     boot_id=$(</proc/sys/kernel/random/boot_id)
     key_parts=("$ranked" "$help_reference" "$host_id" "$boot_id" "$harness" "$peer_physical_npu")
     if "$joint"; then key_parts+=("$joint_reference"); fi
+    if "$joint_archive"; then key_parts+=("joint-control" "$ranked_q_workers"); fi
     run_key=$(printf '%s\n' "${key_parts[@]}" |
         python3 -B -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:20])')
     if [[ -n "$resume" ]]; then
@@ -167,6 +194,7 @@ if [[ -n "$ranked" ]]; then
         if ! git -C "$root" cat-file -e "$ranked^{commit}" 2>/dev/null; then
             if "$joint"; then git -C "$root" fetch -q origin perf/ranked-index-post-tail; else git -C "$root" fetch -q origin perf/ranked-index-help4; fi
         fi
+        if "$joint_archive"; then git -C "$root" merge-base --is-ancestor "$joint_control" "$ranked"; fi
         git -C "$root" merge-base --is-ancestor "$four_field" "$ranked"
         ranked_base="$src/ranked-${four_field:0:8}"
         if "$has_anchor"; then pin "$root" "$ranked_base" "$four_field"; fi
@@ -242,7 +270,7 @@ if [[ -n "$ranked" ]]; then
     # Compile through the same cache key used by run_path. Fail before copying
     # five traces or running the baseline if the toolchain rejects either arm.
     if [[ -n "$help_reference" ]]; then
-        printf 'REFERENCE root=%s original=%.8s four_field=%.8s profile=4_warmup_20_calls\n' "$help_reference" "$ranked_sha" "$four_field"
+        printf 'REFERENCE root=%s original=%.8s previous=%.8s profile=4_warmup_20_calls\n' "$help_reference" "$ranked_sha" "${joint_control:-$four_field}"
     fi
     build_sources=("$ranked_candidate")
     if [[ -z "$help_reference" ]] || "$has_anchor"; then build_sources+=("$ranked_base"); fi
@@ -299,7 +327,8 @@ run_arm() (
     level=1
     case "$label" in
         baseline|anchor) mode=(--fused-only --production-root "$ranked_base"); level=2 ;;
-        candidate) mode=(--fused-only --production-root "$ranked_candidate"); level=2 ;;
+        candidate) mode=(--fused-only --production-root "$ranked_candidate"); level=2
+                   if "$joint_archive"; then mode+=(--ranked-q-workers "$ranked_q_workers"); fi ;;
         serial*) mode=(--serial-only) ;;
         main) mode=(--fused-only)
               if [[ -n "$adaptive" ]]; then mode+=(--route-policy main); level=2; fi ;;

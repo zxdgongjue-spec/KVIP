@@ -269,6 +269,7 @@ def stage_report(states, profile, samples, mhz, policy, directory):
                ('prefetch', 'final', 'unused_prefetch', 'initial_cold', 'selected_unique', 'KV_read_bytes')}
     events = np.stack(completed_events)
     np.savez_compressed(directory / 'lean_ticks.npz', times=np.stack(raw_times), prefetch_events=events, cycles_per_us=mhz,
+                        q_workers=states[0].forward.q_workers,
                         **({'route_probe': np.stack(route_probes)} if route_probes else {}))
     return dict(stages=stages, traffic=traffic, diagnostic_topk_set_digests=diagnostic_fingerprints,
                 window_posted=[measured_range(col) for col in zip(*windows)],
