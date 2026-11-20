@@ -67,8 +67,14 @@ inline void ReduceRows(__gm__ uint64_t* requests, __gm__ uint64_t* feedback,
 // is local to a cube plus its two vector cores. Only AIV0 signals it.
 // The network's first MM uses flags 0..3 and streaming rotation uses 8.
 __aicore__ inline uint32_t ChooseMixed(__gm__ Args* a, __gm__ rotating::Context* ctx,
-                                      const rotating::RuntimeShape& shape) {
+                                      const rotating::RuntimeShape& shape, bool& usedBound) {
     using namespace AscendC;
+    if (a->routeBound && BoundGeometry(a->routeOwners)) {
+        Refresh(a->routeBound,sizeof(uint32_t));
+        const uint32_t bound = *reinterpret_cast<__gm__ volatile uint32_t*>(a->routeBound);
+        usedBound = ForcesHigh(bound,shape);
+        if (usedBound) return High;
+    }
     if (!Eligible(a, ctx, shape)) return High;
     const uint32_t block = GetBlockIdx();
     constexpr uint32_t flag = 9;

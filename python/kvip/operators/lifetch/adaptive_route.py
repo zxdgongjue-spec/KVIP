@@ -18,8 +18,15 @@ class AdaptiveRoute:
         # Timer words and per-request counts have independent device writers.
         observations = torch.zeros((97, 16), dtype=torch.int64, device=device)
         self.mode = observations[0].view(torch.int32)[:1]
+        self.used_high_bound = observations[0].view(torch.int32)[1:2]
         self.probe_ticks = observations[1:, 0]
+        # Retired read bound and optional timing have separate cache-line writers.
+        self.high_bound = torch.zeros((2, 16), dtype=torch.int64, device=device)
         self.demand = torch.zeros((batch, 32), dtype=torch.int32, device=device)[:, 0]
+
+    def invalidate_high_bound(self):
+        """Invalidate derived state before externally restoring or fault-injecting feedback on this stream."""
+        self.high_bound[0, :1].zero_()
 
     def set_requests(self, rows):
         """Stage [owner, generation, step, Q count] outside capture. Zero generation disables learning."""

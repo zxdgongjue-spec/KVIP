@@ -46,6 +46,12 @@ class FusedInputsTest(unittest.TestCase):
         self.assertEqual([g.requests[0].tolist() for g in groups], [[1, 1, 1, 4]] * 2)
         self.assertEqual(groups[0].feedback.stride(), (16, 1))
         self.assertEqual(groups[0].demand.stride(), (32,))
+        groups[0].high_bound.fill_(1000)
+        groups[0].used_high_bound.fill_(1)
+        groups[0].invalidate_high_bound()
+        self.assertEqual(groups[0].high_bound[0, 0].item(), 0)
+        self.assertEqual(groups[0].high_bound[1, 0].item(), 1000)
+        self.assertEqual(groups[0].mode.item(), 0)
         groups[0].feedback[1, 2] = 988
         self.assertEqual(groups[1].feedback[1, 2].item(), 0)
         plans[0].request = None

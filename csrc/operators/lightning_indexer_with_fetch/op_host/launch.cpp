@@ -133,6 +133,7 @@ extern "C" uint32_t kvip_streaming_resolver_cores(){return pipeline_ab::kResolve
 extern "C" uint32_t kvip_streaming_flag_count(){return pipeline_ab::kFlagCount;}
 
 extern "C" uint32_t kvip_lifetch_adaptive_route_abi(){return 1;}
+extern "C" uint32_t kvip_lifetch_route_bound_abi(){return 1;}
 
 extern "C" uint32_t kvip_streaming_index_team(uint32_t batch,uint32_t aic,uint32_t history) {
     return pipeline_ab::UseIndexTeam(batch,aic,history) ? 2*aic : 0;

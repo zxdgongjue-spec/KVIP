@@ -37,7 +37,8 @@ __aicore__ inline void RunLi(GM_ADDR bindings) {
             auto ctx = reinterpret_cast<__gm__ rotating::Context*>(a[14]);
             const bool profile = (workspace->prefetchCount & 0x80000000U) && shape.aicCount == 32;
             const uint64_t start = profile ? GetSystemCycle() : 0;
-            mode = pipeline_ab::adaptive_route::ChooseMixed(workspace, ctx, shape);
+            bool usedBound = false;
+            mode = pipeline_ab::adaptive_route::ChooseMixed(workspace, ctx, shape, usedBound);
             if (profile) {
                 uint64_t elapsed = GetSystemCycle() - start;
                 uint32_t core = GetBlockIdx();
@@ -50,6 +51,7 @@ __aicore__ inline void RunLi(GM_ADDR bindings) {
                 if (GetBlockIdx() == 0) {
                     auto value = reinterpret_cast<__gm__ uint32_t*>(workspace->routeResult);
                     *value = mode;
+                    if (workspace->routeBound) value[1] = uint32_t(usedBound);
                     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(value),128);
                 }
             }

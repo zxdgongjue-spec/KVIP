@@ -14,6 +14,33 @@ __aicore__ inline void Refresh(uint64_t address, uint32_t bytes) {
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(address), bytes);
 }
 
+// LOW needs 16 distinct, valid Q4 owners. An unusable record can be
+// assigned any conservative cost: selecting it already forces HIGH.
+__aicore__ inline bool BoundGeometry(uint32_t owners) {
+    return owners == 16 || owners == 17;
+}
+
+__aicore__ inline bool ForcesHigh(uint32_t reads, const rotating::RuntimeShape& s) {
+    const uint64_t maximumTokens = uint64_t(s.history) * 16 * 4;
+    return s.batch == 16 && uint64_t(reads) * s.tokenBytes * 32 > maximumTokens * 5;
+}
+
+#if defined(__CCE_AICORE__)
+__simt_callee__
+#endif
+inline uint32_t OwnerCost(uint64_t generation, uint64_t reads) {
+    // Without a committed generation the owner cannot make a valid LOW
+    // batch. Drop the unused (usually zero) owner before any valid one.
+    return generation && reads <= kPrefetch+kMaxFinal ? uint32_t(reads) : kPrefetch+kMaxFinal+1;
+}
+
+#if defined(__CCE_AICORE__)
+__simt_callee__
+#endif
+inline uint32_t MinimumBatchReads(uint32_t owners, uint32_t sum, uint32_t largest) {
+    return owners == 17 ? sum-largest : sum;
+}
+
 // The decision is based on the last successful commit for each current
 // request. A change of owner, generation, step or query shape selects HIGH.
 __aicore__ inline bool Eligible(__gm__ const Args* a, __gm__ const rotating::Context* ctx,

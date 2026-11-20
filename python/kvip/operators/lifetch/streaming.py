@@ -146,6 +146,9 @@ class StreamingLIFetchForward:
                 raise ValueError("Rebuild KVIP: the URMA library lacks the adaptive route ABI")
             route_args[:4] = [t.data_ptr() for t in (route.requests, route.feedback, route.mode, route.demand)]
             route_args.view("<u4")[8:10] = [route.owners, route.policy]
+            bound_abi = getattr(rotating.library, "kvip_lifetch_route_bound_abi", None)
+            if route.owners in (16, 17) and b == 16 and bound_abi is not None and bound_abi() == 1:
+                route_args[5] = route.high_bound.data_ptr()
         blob = np.concatenate(
             (
                 blob,

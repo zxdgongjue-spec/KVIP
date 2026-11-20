@@ -31,9 +31,10 @@ struct alignas(128) Args {
  uint64_t indexTeam; // Optional zeroed row controls (one cache line per writer).
  uint64_t routeRequests, routeFeedback, routeResult, routeDemand;
  uint32_t routeOwners, routePolicy;
+ uint64_t routeBound; // Optional ordered-stream certificate; zero in older bindings.
 };
 static_assert(offsetof(Args,indexTeam)==192 && offsetof(Args,routeRequests)==200 &&
-              offsetof(Args,routeOwners)==232,"streaming Index team and route offsets");
+              offsetof(Args,routeOwners)==232 && offsetof(Args,routeBound)==240,"streaming Index team and route offsets");
 static_assert(sizeof(Args)==256,"streaming Args ABI");
 }
 

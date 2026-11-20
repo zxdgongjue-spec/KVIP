@@ -93,6 +93,43 @@ int main() {
             ends[4*b+q] = 130048;
         }
     }
+    // A certified HIGH must agree with the complete policy for every
+    // 16-owner pack. In particular the seventeenth owner may be live.
+    static_assert(sizeof(Args) == 256 && offsetof(Args,routeBound) == 240);
+    uint32_t rng = 0x83c43dU;
+    auto next = [&] { return rng = rng*1664525U + 1013904223U; };
+    for (uint32_t count : {16U,17U}) {
+        assert(BoundGeometry(count));
+        args.routeOwners = count;
+        for (unsigned trial=0; trial<500; ++trial) {
+            uint32_t sum = 0, maximum = 0;
+            for (uint32_t owner=0; owner<count; ++owner) {
+                uint64_t reads = next()%512;
+                if (trial%17==0 && owner==0) reads = UINT64_MAX;
+                feedback[owner] = {trial%3 && owner==0 ? 0U : 13U, 30U, reads, 4U};
+                const uint32_t cost = OwnerCost(feedback[owner][0],reads);
+                sum += cost;
+                maximum = std::max(maximum,cost);
+            }
+            const uint32_t bound = MinimumBatchReads(count,sum,maximum);
+            for (unsigned skip=0; skip<(count==16 ? 1U : 17U); ++skip) {
+                for (unsigned b=0; b<16; ++b) {
+                    const unsigned owner=(b+skip+1)%count;
+                    owners[b]=owner;
+                    requests[b]={owner,13U,31U,4U};
+                    for (unsigned q=0;q<4;++q) ends[b*4+q] = shape.history-next()%2048;
+                }
+                if (ForcesHigh(bound,shape)) assert(choose()==High);
+            }
+        }
+    }
+    assert(!BoundGeometry(15) && !BoundGeometry(18));
+    for (unsigned b=0;b<batch;++b) {
+        owners[b]=b+1; requests[b]={b+1,13,31,4}; feedback[b+1]={13,30,1,4};
+    }
+    ends.fill(130048);
+    const uint32_t maximumBudget=uint64_t(shape.history)*64*5/(32*shape.tokenBytes);
+    assert(!ForcesHigh(maximumBudget,shape) && ForcesHigh(maximumBudget+1,shape));
     shape.aicCount=33; assert(choose()==High); shape.aicCount=32;
     shape.liCores=16; assert(choose()==High); shape.liCores=32;
     mode=choose(); assert(AdaptiveLow(&args));

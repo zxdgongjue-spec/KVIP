@@ -1351,6 +1351,47 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
 
 #endif
 #if defined(__CCE_AICORE__) && !V9_UBMEM
+namespace pipeline_ab { namespace adaptive_route {
+// At the existing end-of-round barrier all per-owner commits are visible.
+// An otherwise idle warp computes the least that any 16 distinct owners
+// could have read. Row order, new owners and current generation do not
+// enter this bound. Tighter budgets and invalid records can only force HIGH.
+__simt_vf__ __aicore__ LAUNCH_BOUND(32)
+inline void RetireOwnerBound(__gm__ uint64_t* feedback, uint32_t owners, __gm__ uint32_t* bound) {
+    const uint32_t lane = threadIdx.x;
+    uint32_t sum = 0;
+    if (lane < owners) {
+        auto f = feedback+lane*kFeedbackWords;
+        sum = OwnerCost(asc_ldcg(f),asc_ldcg(f+2));
+    }
+    uint32_t largest = sum;
+    for (unsigned d = 16; d; d >>= 1) {
+        sum += asc_shfl_down(sum,d);
+        const uint32_t other = asc_shfl_down(largest,d);
+        largest = largest > other ? largest : other;
+    }
+    if (!lane) {
+        asc_stcg(bound,MinimumBatchReads(owners,sum,largest));
+        asc_threadfence();
+    }
+}
+
+__aicore__ inline void RetireBound(__gm__ Args* a, bool profile) {
+    using namespace AscendC;
+    auto bound = reinterpret_cast<__gm__ uint32_t*>(a->routeBound);
+    const uint64_t start = profile ? GetSystemCycle() : 0;
+    Simt::VF_CALL<RetireOwnerBound>(Simt::Dim3{32,1,1},
+        reinterpret_cast<__gm__ uint64_t*>(a->routeFeedback), a->routeOwners, bound);
+    if (profile) {
+        SetFlag<HardEvent::V_S>(EVENT_ID0);
+        WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        auto time = reinterpret_cast<__gm__ uint64_t*>(a->routeBound+128);
+        *time = GetSystemCycle()-start;
+        Refresh(reinterpret_cast<uint64_t>(time),sizeof(uint64_t));
+    }
+}
+} } // namespace pipeline_ab::adaptive_route
+
 __simt_vf__ __aicore__ LAUNCH_BOUND(128)
 inline void RetireRoundControl(__gm__ Args* a,uint32_t batch,uint32_t workers,uint32_t block){
  uint32_t t=threadIdx.x;
@@ -1488,6 +1529,9 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
    AscendC::SyncAll<true>();
    if(block<shape.batch || block<4*workers)
     Simt::VF_CALL<RetireRoundControl>(Simt::Dim3{128,1,1},a,shape.batch,workers,block);
+   else if (a->routeBound && block == GetBlockNum()-1 && shape.batch == 16 &&
+            a->routeFeedback && adaptive_route::BoundGeometry(a->routeOwners))
+    adaptive_route::RetireBound(a,profile);
   }
 #endif
   if(profile){trace[1]=GetSystemCycle();kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(trace),32*8);}

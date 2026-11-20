@@ -7,6 +7,7 @@ extern "C" {
 uint32_t kvip_lifetch_streaming_forward(void* bindings, void* update, void* workspace, void* stream, const rotating::RuntimeShape* shape, uint32_t workers);
 
 uint32_t kvip_lifetch_adaptive_route_abi();
+uint32_t kvip_lifetch_route_bound_abi();
 uint32_t kvip_streaming_index_team(uint32_t batch, uint32_t aic, uint32_t history);
 uint32_t kvip_lifetch_streaming_index_team_forward(void* bindings, void* update, void* workspace,
     void* stream, const rotating::RuntimeShape* shape, uint32_t workers);
