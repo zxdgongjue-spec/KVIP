@@ -40,7 +40,7 @@ def main():
     results = {}
     for name, script, modes in (
         ('current_final', old / 'prepare.py', (1,)),
-        ('optimized', model.parent / 'prepare.py', (0, 1)),
+        ('optimized', model.parent / 'prepare.py', (0, 1, 2)),
     ):
         source = output / name
         load(script, name).prepare(repo, source)
@@ -50,7 +50,7 @@ def main():
         command(['cmake', '-S', str(source), '-B', str(source / 'build')], source / 'configure.log')
         command(['cmake', '--build', str(source / 'build'), '-j2'], source / 'build.log')
         for mode in modes:
-            case = 'middle' if mode == 0 else name
+            case = 'middle' if mode == 0 else 'terminal_handoff' if mode == 2 else name
             log = source / f'run-{mode}.log'
             print(f'Running {case}; log={log}', flush=True)
             command(['msprof', 'op', 'simulator',
@@ -65,6 +65,13 @@ def main():
                 raise RuntimeError(f'{case}: missing simulator core timing; {log}')
             results[case] = {'cores': cores, 'max_core_us': max(c[1] for c in cores),
                              'posted': 146, 'correctness': 'PASS', 'log': str(log)}
+        if name == 'optimized':
+            log = source / 'handoff-boundaries.log'
+            command(['msprof', 'op', 'simulator',
+                f'--application={source}/build/real_topk_sim 3',
+                f'--output={source}/profile-boundaries', '--soc-version=Ascend950PR_9599'], log)
+            if 'handoff boundaries bad=0' not in log.read_text():
+                raise RuntimeError(f'Terminal handoff boundary checks failed: {log}')
     (output / 'summary.json').write_text(json.dumps(results, indent=2))
     print('Path | simulator max-core us | Check')
     for name, row in results.items():

@@ -90,7 +90,9 @@ def summarize(path):
         for block, record in enumerate(records):
             for start, end, phase in ((16,20,'TopK through service join'),(16,17,'TopK/classify'),(17,18,'wait TopK barrier'),
                     (18,19,'service phase'),(19,20,'wait service barrier'),
-                    (21,22,'admission'),(22,23,'service setup/post'),(23,24,'location patch')):
+                    (25,26,'direct completion handoff'),(21,22,'admission'),(22,23,'service setup/post'),(23,24,'location patch')):
+                if start == 25 and (block >= b or not d['active_rows'][block]):
+                    continue
                 if start == 16 and not d['active_rows'][block//4]:
                     continue
                 if start in (18,21,22,23) and not any(d['active_rows'][block::d['service_lanes']]):

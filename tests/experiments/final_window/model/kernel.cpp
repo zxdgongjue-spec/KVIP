@@ -11,6 +11,9 @@ extern "C" __global__ __aicore__ void test_service(GM_ADDR arg,uint32_t mode){
  auto a=reinterpret_cast<__gm__ pipeline_ab::Args*>(arg);
  auto ctx=reinterpret_cast<__gm__ rotating::Context*>(a->context);
  auto s=rotating::LoadRuntimeShape(ctx);
+#ifdef KVIP_TERMINAL_HANDOFF
+ if(mode==3){if(!q)PublishTerminalReady(a,0);return;}
+#endif
  {
  TPipe pipe;
  using Type=QLICommon::QLIType<fp8_e4m3fn_t,fp8_e4m3fn_t,int32_t,true,QLICommon::LI_LAYOUT::BSND,QLICommon::LI_LAYOUT::PA_BSND,bfloat16_t,float,float,uint16_t>;
@@ -26,7 +29,13 @@ extern "C" __global__ __aicore__ void test_service(GM_ADDR arg,uint32_t mode){
  }
  AscendC::SyncAll<true>();
  if(q==0){
-  if(mode)RunTerminalService(a,0);
+  if(mode){RunTerminalService(a,0);
+#ifdef KVIP_TERMINAL_HANDOFF
+   if(mode==2){
+    PublishTerminalReady(a,0);
+   }
+#endif
+  }
   else {TPipe pipe;TBuf<TPosition::VECCALC> scratch,flags,ids;
    pipe.InitBuffer(scratch,65536);pipe.InitBuffer(flags,32768);pipe.InitBuffer(ids,8192);
    rotating::FastService<false,true,false>(1,s.history,s.resident,4,1,656,256,240,1,23808,

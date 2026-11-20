@@ -19,7 +19,7 @@ __aicore__ inline void PrepareTerminal(__gm__ pipeline_ab::Args* a,uint32_t b) {
  if(used>rotating::kLruSlots || total>rotating::kLruSlots-used)reason|=8;
  bool eligible=!reason && total>0;
  errors[2]=uint32_t(eligible);errors[3]=total;errors[4]=0;errors[5]=row->requests;
- errors[6]=reason;errors[7]=used;
+ errors[6]=reason;errors[7]=used;errors[12]=0;
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(a->queryErrors)+b*512,128);
  if(!eligible)return;
  auto metadata=reinterpret_cast<__gm__ volatile uint32_t*>(rotating::TopKHeader(ctx))+b*128;
@@ -47,7 +47,7 @@ inline void RestoreTerminal(uint32_t history,uint32_t resident,
   asc_stcg(errors+4,asc_ldcg(&row->requests)-asc_ldcg(errors+5));}
  asc_threadfence();
 }
-// Slots 16..24 are outside the window rank records (at most eight windows).
+// Slots 16..26 are outside the window rank records (at most eight windows).
 __aicore__ inline void StampTerminal(__gm__ pipeline_ab::Args* a,uint32_t block,uint32_t slot) {
  auto ctx=reinterpret_cast<__gm__ rotating::Context*>(a->context);auto s=rotating::LoadRuntimeShape(ctx);
  if(block>=s.batch*4)return;
@@ -92,6 +92,53 @@ __aicore__ inline void RunTerminalService(__gm__ pipeline_ab::Args* a,uint32_t l
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  }
  if constexpr(profile) StampTerminal(a,lane,8);
+}
+
+#define KVIP_TERMINAL_HANDOFF 1
+#include "terminal_prefetch_publish.h"
+// The terminal window already assigned every location and posted every miss.
+// Only publish the existing Index/output protocol; do not run Producer again.
+__aicore__ inline bool PublishTerminalReady(__gm__ pipeline_ab::Args* a,uint32_t b) {
+ auto ctx=reinterpret_cast<__gm__ rotating::Context*>(a->context);
+ auto e=reinterpret_cast<__gm__ uint32_t*>(a->queryErrors)+b*128;
+ kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(e),512);
+ auto ends=reinterpret_cast<__gm__ int32_t*>(ctx->queryEnds)+b*4;
+ bool active=false;
+ for(uint32_t q=0;q<4;++q)active=active || ends[q]>0;
+ uint32_t error=0;
+ if(active){
+  if(!e[2] && (e[6] || e[3]))error=16;
+  for(uint32_t q=0;q<4;++q)if(e[q*32] || e[q*32+1]!=1)error|=16;
+ }
+ auto row=reinterpret_cast<__gm__ rotating::Row*>(ctx->rows)+b;
+ kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),64);
+ error|=row->error;
+ bool profile=(a->prefetchCount&0x80000000U)!=0;
+ if(profile)StampTerminal(a,b,9);
+ auto flags=reinterpret_cast<__gm__ pipeline_ab::BatchFlag*>(a->flags)+b*pipeline_ab::kFlagCount;
+ Simt::VF_CALL<PublishPrefetch>(Simt::Dim3{512,1,1},
+  reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+b*10240,
+  reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*2048,
+  reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+b*a->maxEvents,
+  reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+b*a->maxEvents,row->slots);
+ SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+ auto status=reinterpret_cast<__gm__ uint32_t*>(ctx->rowStatus)+b*32;
+ for(uint32_t i=0;i<32;++i)status[i]=0;
+ status[0]=error;status[2]=b*8192;
+ row->finalBegin=0;row->finalRequests=0;row->finalHead=0;row->finalPending=0;row->finalEnd=GetSystemCycle();
+ kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row)+960,64);
+ kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),128);
+ flags[0].count=row->slots;flags[0].error=error;flags[0].ready=1;
+ kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags),pipeline_ab::kBatchFlagPayloadBytes);
+ for(uint32_t q=0;q<4;++q){auto f=flags+pipeline_ab::kRawQueryFlag+q;
+  f->count=0;f->error=error;f->reserved[0]=0;f->ready=1;
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(f),16);
+ }
+ flags[5].count=0;flags[5].error=error;flags[5].ready=1;
+ kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+5),pipeline_ab::kBatchFlagPayloadBytes);
+ e[12]=active && !error;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(e),128);
+ if(profile)StampTerminal(a,b,10);
+ return !error;
 }
 
 #endif

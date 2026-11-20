@@ -42,6 +42,30 @@ int main(int argc,char**argv){try{
  rotating::Row row{};row.slots=84;row.requests=84;row.addresses=put(addresses);c.rows=put(std::vector<rotating::Row>{row});
  KvafExecuteBatchGetKernelArgs args{};args.channel_entity=put(entity);args.queue_state=queue;args.output=0x120000000ULL;c.args=put(std::vector<KvafExecuteBatchGetKernelArgs>(2,args));
  pipeline_ab::Args a{};a.context=put(std::vector<rotating::Context>{c});a.queryErrors=put(std::vector<uint32_t>(128));a.queryBitmaps=put(std::vector<uint32_t>(2048));a.times=put(std::vector<uint64_t>(256));
+ c.rowStatus=put(std::vector<uint32_t>(32,0xdeadbeef));
+ a.context=put(std::vector<rotating::Context>{c});a.maxEvents=10240;
+ a.flags=put(std::vector<pipeline_ab::BatchFlag>(16));
+ a.eventsSrc=put(std::vector<uint32_t>(10240,0xdeadbeef));a.eventsDst=put(std::vector<uint32_t>(10240,0xdeadbeef));
+ if(mode==3){
+  size_t bad=0;
+  for(uint32_t scenario=0;scenario<3;++scenario){
+   std::vector<uint32_t> e(128);
+   // Active empty, inactive padding, then active incomplete terminal service.
+   if(scenario!=1)for(unsigned q=0;q<4;++q)e[q*32+1]=1;
+   if(scenario==2){e[3]=5;e[6]=8;e[1]=6;}
+   e[12]=0xdeadbeef;
+   a.queryErrors=put(e);c.queryEnds=put(std::vector<uint32_t>(4,scenario==1?0:H));
+   a.context=put(std::vector<rotating::Context>{c});
+   ck(aclrtlaunch_test_service(1,stream,(void*)put(std::vector<pipeline_ab::Args>{a}),3));
+   ck(aclrtSynchronizeStream(stream));
+   auto f=get<pipeline_ab::BatchFlag>(a.flags,16);auto st=get<uint32_t>(c.rowStatus,32);
+   auto out=get<uint32_t>(a.queryErrors,128);uint32_t expected=scenario==2?16:0;
+   bad+=st[0]!=expected || out[12]!=(scenario==0?1U:0U);
+   for(unsigned i:{0U,5U,12U,13U,14U,15U})bad+=f[i].ready!=1 || f[i].error!=expected;
+  }
+  printf("handoff boundaries bad=%zu\n",bad);fflush(stdout);
+  ck(aclrtDestroyStream(stream));ck(aclrtResetDevice(0));ck(aclFinalize());return bad?1:0;
+ }
  ck(aclrtlaunch_test_service(mode?4:1,stream,(void*)put(std::vector<pipeline_ab::Args>{a}),mode));ck(aclrtSynchronizeStream(stream));
  auto rows=get<rotating::Row>(c.rows,1);auto mapping=get<uint32_t>(c.mapping,H);auto slots=get<uint32_t>(c.locations,8192);auto wq=get<uint32_t>(sq,8192*16);auto t=get<uint64_t>(a.times,16);auto db=get<uint64_t>(doorbell,1);
  size_t bad=0;std::vector<bool> seen(146);
@@ -56,6 +80,16 @@ int main(int argc,char**argv){try{
   if(mode)for(uint32_t i=0;i<K;++i){uint32_t id=selected[q*K+i];if(id>=H){bad++;continue;}if(id>=R&&(mapping[id]<R||mapping[id]>=R+2048)){bad++;continue;}uint32_t dest=id<R?id:lru[mapping[id]-R];bad+=slots[q*K+i]!=dest;}
  }
  bad+=rows[0].requests!=230 || db[0]!=146;
+ if(mode==2){
+  auto flags=get<pipeline_ab::BatchFlag>(a.flags,16);auto st=get<uint32_t>(c.rowStatus,32);
+  auto es=get<uint32_t>(a.eventsSrc,10240),ed=get<uint32_t>(a.eventsDst,10240),changes=get<uint32_t>(c.changes,10240),errors=get<uint32_t>(a.queryErrors,128);
+  bad+=errors[12]!=1 || flags[0].ready!=1 || flags[0].count!=230 || flags[0].error || flags[5].ready!=1;
+  for(unsigned q=0;q<4;q++)bad+=flags[12+q].ready!=1 || flags[12+q].count || flags[12+q].error || flags[12+q].reserved[0];
+  for(unsigned i=0;i<230;i++)bad+=es[i]!=changes[i] || ed[i]!=lru[i];
+  for(unsigned i=230;i<2048;i++)bad+=changes[i]!=UINT32_MAX;
+  for(auto x:st)bad+=x!=0;
+  bad+=rows[0].finalRequests || rows[0].finalPending;
+ }
  printf("mode=%u posted=%u bad=%zu\n",mode,rows[0].requests-84,bad);fflush(stdout);
  ck(aclrtDestroyStream(stream));ck(aclrtResetDevice(0));ck(aclFinalize());return bad?1:0;
 }catch(const std::exception&e){fprintf(stderr,"FAIL %s\n",e.what());return 2;}}

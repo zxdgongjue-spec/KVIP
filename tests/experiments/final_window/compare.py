@@ -41,13 +41,14 @@ def main():
             write_json(output / "terminal_counts.json", dict(
                 eligible_rows=int(detail[valid.any(dim=1),0,2].sum()),
                 active_rows=int(valid.any(dim=1).sum()),
+                direct_handoff=int(detail[valid.any(dim=1),0,12].sum()),
                 compact_misses=int(detail[:,0,3].sum()),
                 terminal_posted=int(detail[:,0,4].sum()),
                 per_row=detail[:,0,2:5].tolist(),
                 active_details=[dict(row=i, eligible=int(detail[i,0,2]),
                     misses_per_q=detail[i,0,8:12].tolist(),
                     posted=int(detail[i,0,4]), reason_bits=int(detail[i,0,6]),
-                    used_lru=int(detail[i,0,7]))
+                    used_lru=int(detail[i,0,7]), direct_handoff=bool(detail[i,0,12]))
                     for i in range(shape["batch"]) if bool(valid[i].any())]))
             if iteration == args.warmup:
                 logical = update.logical_output.cpu().reshape(shape["batch"],4,2048)[valid]
@@ -84,7 +85,7 @@ def main():
     shutil.copy2(Path(__file__).with_name('detail.py'), args.output/'detail.py')
     candidate=args.output/'candidate-source'
     prepare(repo,candidate)
-    print('A: original final TopK + tail. B: one kernel, bounded terminal prefetch + original completion/fallback.',flush=True)
+    print('A: original final TopK + tail. B: one kernel, terminal TopK/posting + Index/output/CQ completion; no original resolver.',flush=True)
     results={}
     for name,root in (('A',repo),('B',candidate)):
         output=args.output/name

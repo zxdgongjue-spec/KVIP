@@ -15,14 +15,14 @@ A uses the checked-out operator unchanged. B is built from an isolated copy:
 - The intermediate `FastService` union and WQE posting implementation handles
   these misses, without the speculative rank or prefetch-budget cap. All selected
   misses must be mapped after posting; missing mappings fail completion.
-- The original Index/output/CQ completion path remains. Nonqualifying requests
-  retain the original resolver and Fetch implementation.
+- Index/output/CQ completion remains. B deletes the original resolver and its
+  compact-resolution helpers. Nonqualifying active requests report failure;
+  they never fall back to another resolver. Inactive padding rows complete empty.
 - Two all-AIV phase barriers remain: TopK publication and terminal service
   completion. This prototype does not yet start Q1 transfers before Q2–Q4 TopK.
 
-This is not a complete replacement of resolver. The experiment asks whether
-reusing intermediate posting plus eliminating the kernel handoff pays for the
-remaining publication work. The new transfers count as prefetch internally;
+The terminal window replaces miss resolution and posting. Only publication,
+Index updates, output and CQ completion remain after it. The new transfers count as prefetch internally;
 `terminal_counts.json` distinguishes them from the intermediate-window traffic.
 
 The runner reuses the temporary snapshot utility from historical commit c239791
@@ -39,9 +39,8 @@ Only the experimental copy is patched; no installed serving library is replaced.
 
 Terminal diagnostics: reason_bits 1=classifier error, 2=invalid count,
 4=sum exceeds candidate capacity, 8=insufficient remaining LRU. Empty rows
-do not count as eligible. Counts include every Q; fallback posted is zero.
-Only the experimental final classifier exports beyond 64 misses; the original
-resolver fast-path bound remains unchanged.
+do not count as eligible. Counts include every Q; direct_handoff records successful active-row publication.
+Only the experimental final classifier exports beyond 64 misses; the original A baseline remains unchanged.
 
 ## Local device-model comparison
 
@@ -121,4 +120,23 @@ epoch `windows`; the preceding epochs are the intermediate windows.
 
 Extra TopK cores still join completion barriers, but cannot write beyond the
 original tail core-timing allocation. Raw terminal phase stamps use reserved
-rank-record slots 16 through 24; window rank records remain unchanged.
+rank-record slots 16 through 26; window rank records remain unchanged.
+
+## Direct terminal completion
+
+B deletes `Producer`, `ResolveQueryWork`, `ResolveCompactBody`,
+`ResolveCompact`, `ResolveFirstCompactQuery` and the compact-parallel include
+from its generated streaming source. There is no resolver fallback call.
+After all terminal misses have locations, a small handoff publishes the
+existing change prefix for Index update and zero remaining per-Q Fetch counts.
+Output workers materialize outputs; completion workers drain the shared
+intermediate/terminal CQ and retire state.
+
+The local same-candidate model passes with `mode=2 posted=146 bad=0`:
+TopK + terminal posting + location patch + this handoff takes 55.83 us.
+The previously measured scope ending before handoff was 48.89 us; the added
+publication scope is 6.94 us. This still excludes downstream Index/output/CQ
+completion and is not a measured end-to-end hardware saving.
+Active empty-miss, inactive padding, and incomplete-terminal cases also pass
+(`handoff boundaries bad=0`), including consecutive reuse of publication flags.
+The full generated B operator builds successfully with CANN.

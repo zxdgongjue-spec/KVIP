@@ -23,8 +23,15 @@ def prepare(repo, destination):
             raise ValueError(f'Expected unique patch site: {relative}: {old[:80]}')
         path.write_text(text.replace(old,new))
     base='csrc/operators/lightning_indexer_with_fetch/'
+    # Reuse the existing prefix-event publisher in both the handoff and model.
+    stream_path=destination/base/'op_kernel/streaming.cpp'
+    stream_text=stream_path.read_text()
+    begin=stream_text.index('__simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PublishPrefetch(')
+    end=stream_text.index('// ctl[32:64]',begin)
+    helper=stream_text[begin:end].replace('i<kPrefetch','i<pipeline_ab::kPrefetch')
+    (destination/base/'op_kernel/terminal_prefetch_publish.h').write_text('#pragma once\n'+helper)
+    stream_path.write_text(stream_text[:begin]+'#include "terminal_prefetch_publish.h"\n'+stream_text[end:])
     # Export all final misses into the existing 2048-entry per-Q buffer.
-    # Leave the original resolver's 64-entry fast-path limit unchanged.
     patch(base+'op_kernel/compact_misses.h',
           'if(scan[15]<=kCompactMissLimit){', 'if(scan[15]<=2048){')
     # Keep RunLi available inside the tail translation unit, without duplicate entry points.
@@ -64,7 +71,20 @@ def prepare(repo, destination):
     trace_marker='  auto trace=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*256+uint64_t(block)*32;'
     if tail.count(trace_marker)!=1:raise ValueError('Expected tail core trace allocation')
     tail=tail.replace(trace_marker,'  profile=profile && block<shape.batch*kResolveCores+4*workers;\n'+trace_marker,1)
-    path.write_text(head+tail)
+    if tail.count('    Producer(a,b);')!=1:raise ValueError('Expected original resolver call')
+    tail=tail.replace('    Producer(a,b);','    PublishTerminalReady(a,b);',1)
+    text=head+tail
+    # B has no original resolver or resolver fallback, including unused helpers.
+    begin=text.index('__aicore__ inline void Producer(')
+    end=text.index('// Cold sources and distinct hot destinations',begin)
+    text=text[:begin]+text[end:]
+    begin=text.index('// Same operations and buffers as the separate VF calls')
+    end=text.index('__aicore__ inline void PublishQueryOutputs(',begin)
+    text=text[:begin]+text[end:]
+    begin=text.index('__simt_callee__\ninline void PublishQ(')
+    end=text.index('#include "terminal_prefetch_publish.h"',begin)
+    text=text[:begin]+text[end:]
+    path.write_text(text)
     shutil.copy2(Path(__file__).with_name('terminal.h'),destination/base/'op_kernel/terminal_window.h')
     patch(base+'op_kernel/prefetch.h','template<bool captureIo, bool predecessorChecked=false>',
           'template<bool captureIo, bool predecessorChecked=false, bool terminal=false>')
