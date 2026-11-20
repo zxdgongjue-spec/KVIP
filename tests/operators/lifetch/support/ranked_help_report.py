@@ -126,6 +126,10 @@ def load(root, group, label, revision, abi):
     arm = load_arm(root/f'g{group}', label, revision, field_abi=abi)
     with np.load(arm['folder']/'lean_ticks.npz', allow_pickle=False) as raw:
         arm['tail'] = tail_endpoints(raw, abi)
+    samples = arm['samples']
+    if ([v['invocation'] for v in samples] != list(range(len(samples))) or
+            not np.allclose([v['us'] for v in samples], arm['timing']['samples_us'], rtol=0, atol=.01)):
+        raise ValueError(f'{label}: profile sample order or timing differs from the headline graph')
     digests = arm['digests']
     aux = arm['detail'].get('diagnostic_topk_set_digests', [])
     if (len(digests) != len(arm['samples']) or any(not re.fullmatch('[a-f0-9]{64}', d) for d in digests+aux)
@@ -185,11 +189,16 @@ def compare(before, after):
         confidence = 'graph means include BF16 tie variants; exact-TopK profiler subset is descriptive'
     else:
         confidence = 'matched placement and final TopK; one graph per arm'
+    shared_stages = sorted(before['phases'].keys() & after['phases'].keys())
+    stage_saved = {}
+    for name in shared_stages:
+        left, right = before['phases'][name][0], after['phases'][name][0]
+        stage_saved[name] = None if left is None or right is None else left-right
     return dict(placement=place, same_capture_sha256=True if sha_a and sha_b else None,
                 topk_sets='identical' if identical else 'BF16_boundary_ties', confidence=confidence,
                 same_binary=before['binary'] == after['binary'], observed_saved_us=saved,
                 observed_saved_pct={k: 100*saved[k]/timing[0][k] for k in ('event_mean_us', 'p50_us')},
-                kernels_saved_us=kernels, exact_topk_matched=match)
+                kernels_saved_us=kernels, auxiliary_stage_p50_saved_us=stage_saved, exact_topk_matched=match)
 
 
 def summary(arm):
