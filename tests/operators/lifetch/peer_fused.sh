@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Replay the captured inputs with a single transport build and timing protocol.
 set -eo pipefail
+peer_physical_npu=${PEER_PHYSICAL_NPU-4}
+if [[ ! $peer_physical_npu =~ ^(0|[1-9][0-9]*)$ ]]; then
+    printf 'PEER_PHYSICAL_NPU must be a single physical device ordinal, got "%s"\n' "$peer_physical_npu" >&2
+    exit 2
+fi
 root=$(cd "$(dirname "$0")/../../.." && pwd)
 tools="$root/tests/operators/lifetch"
 work=${PEER_G2_WORK:-/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold}
@@ -20,6 +25,7 @@ adaptive=
 help_reference=
 joint_reference=
 joint=false
+joint_local=false
 resume=
 anchor=
 has_anchor=false
@@ -56,6 +62,12 @@ if [[ ${1:-} == --ranked-help || ${1:-} == --ranked-joint ]]; then
     elif [[ -n "$joint_reference" ]]; then
         echo '--previous requires --ranked-joint' >&2; exit 2
     fi
+elif [[ ${1:-} == --ranked-joint-local ]]; then
+    ranked=${2:?supply candidate commit}
+    [[ $ranked =~ ^[0-9a-f]{40}$ ]] || { echo 'Expected the full candidate SHA' >&2; exit 2; }
+    joint=true
+    joint_local=true
+    shift 2
 elif [[ ${1:-} == --ranked-index ]]; then
     ranked=${2:?supply candidate commit}
     shift 2
@@ -74,17 +86,17 @@ if [[ -z "$ranked" && $# -eq 2 && $1 == --reuse-serial ]]; then
         exit 1
     fi
 elif [[ $# -ne 0 ]]; then
-    echo 'Usage: peer_fused.sh --ranked-joint FULL_SHA --previous DIR [--reference DIR] | --ranked-help FULL_SHA [--reference DIR] [--resume DIR] [--anchor GROUP] | --ranked-index CANDIDATE_SHA | [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
+    echo 'Usage: peer_fused.sh --ranked-joint-local FULL_SHA | --ranked-joint FULL_SHA --previous DIR [--reference DIR] | --ranked-help FULL_SHA [--reference DIR] [--resume DIR] [--anchor GROUP] | --ranked-index CANDIDATE_SHA | [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
     exit 2
 fi
 export PATH=/usr/local/python3.12.13/bin:$PATH
 mkdir -p "$area"
-if [[ -n "$help_reference" ]]; then
+if [[ -n "$help_reference" ]] || "$joint_local"; then
     # Repeating the command resumes the same machine, harness and exact revisions.
     harness=$(git -C "$root" rev-parse HEAD)
     host_id=$(</proc/sys/kernel/hostname)
     boot_id=$(</proc/sys/kernel/random/boot_id)
-    key_parts=("$ranked" "$help_reference" "$host_id" "$boot_id" "$harness")
+    key_parts=("$ranked" "$help_reference" "$host_id" "$boot_id" "$harness" "$peer_physical_npu")
     if "$joint"; then key_parts+=("$joint_reference"); fi
     run_key=$(printf '%s\n' "${key_parts[@]}" |
         python3 -B -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:20])')
@@ -108,8 +120,8 @@ except BlockingIOError:
     sys.exit(f"A replay is already running in {sys.argv[1]}")
 LOCK
     printf '%s\n' "$run_key" >"$out/run.key"
-    printf '%s\n' "$help_reference" >"$out/reference.txt"
-    if "$joint"; then printf '%s\n' "$joint_reference" >"$out/previous.txt"; fi
+    if [[ -n "$help_reference" ]]; then printf '%s\n' "$help_reference" >"$out/reference.txt"; fi
+    if [[ -n "$joint_reference" ]]; then printf '%s\n' "$joint_reference" >"$out/previous.txt"; fi
     printf '%s\n' "$harness" >"$out/harness.txt"
     printf '%s\n' "$host_id" >"$out/host.txt"
     if [[ -n "$anchor" ]]; then
@@ -123,6 +135,9 @@ else
     out=$(mktemp -d "$area/fused.XXXXXX")
 fi
 printf 'RESULT_ROOT=%s\n' "$out"
+if [[ -n "$ranked" ]]; then
+    printf '%s\n' "$peer_physical_npu" >"$out/physical_npu.txt"
+fi
 if [[ -r /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
     source /usr/local/Ascend/ascend-toolkit/set_env.sh
 else
@@ -156,7 +171,13 @@ if [[ -n "$ranked" ]]; then
         ranked_base="$src/ranked-${four_field:0:8}"
         if "$has_anchor"; then pin "$root" "$ranked_base" "$four_field"; fi
     else
-        git -C "$root" fetch -q origin codex/lifetch-ranked-integration perf/ranked-all-aiv-index
+        if "$joint_local"; then
+            if ! git -C "$root" cat-file -e "$ranked^{commit}" 2>/dev/null; then
+                git -C "$root" fetch -q origin perf/ranked-index-post-tail
+            fi
+        else
+            git -C "$root" fetch -q origin codex/lifetch-ranked-integration perf/ranked-all-aiv-index
+        fi
         ranked_base="$src/ranked-${ranked_sha:0:8}"
         pin "$root" "$ranked_base" "$ranked_sha"
     fi
@@ -191,7 +212,7 @@ else
 fi
 test -d "$cann/include/acl"
 export ASCEND_HOME_PATH="$cann" ASCEND_CANN_PACKAGE_PATH="$cann"
-export ASCEND_RT_VISIBLE_DEVICES=4 SOC_VERSION=Ascend950DT_9582 ASCEND_LAUNCH_BLOCKING=0
+export ASCEND_RT_VISIBLE_DEVICES="$peer_physical_npu" SOC_VERSION=Ascend950DT_9582 ASCEND_LAUNCH_BLOCKING=0
 export MAX_JOBS=2 OMP_NUM_THREADS=1
 venv="$area/python-${serial_revision:0:8}"
 export PATH="$venv/bin:$PATH" PYTHON="$venv/bin/python"
@@ -217,7 +238,7 @@ fi
 cpu="$clean/build-cpu/runtime/kvaf_cpu_service"
 test -x "$cpu"
 if [[ -n "$ranked" ]]; then
-    printf 'CONFIG URMA NPU4 BS16 Q4 656B ranked=%.8s candidate=%.8s KVAF=%.8s\n' "$ranked_sha" "$ranked" "$transport"
+    printf 'CONFIG URMA physical_NPU=%s logical_device=0 BS16 Q4 656B ranked=%.8s candidate=%.8s KVAF=%.8s\n' "$peer_physical_npu" "$ranked_sha" "$ranked" "$transport"
     # Compile through the same cache key used by run_path. Fail before copying
     # five traces or running the baseline if the toolchain rejects either arm.
     if [[ -n "$help_reference" ]]; then
@@ -226,7 +247,7 @@ if [[ -n "$ranked" ]]; then
     build_sources=("$ranked_candidate")
     if [[ -z "$help_reference" ]] || "$has_anchor"; then build_sources+=("$ranked_base"); fi
     for source_root in "${build_sources[@]}"; do
-        PYTHONPATH="$source_root/python:$PYTHONPATH" "$PYTHON" -B - "$source_root" "$kvaf/build-npu" "$SOC_VERSION" "$out" "$help_reference" <<'BUILD'
+        PYTHONPATH="$source_root/python:$PYTHONPATH" "$PYTHON" -B - "$source_root" "$kvaf/build-npu" "$SOC_VERSION" "$out" <<'BUILD'
 from pathlib import Path
 import hashlib
 import sys
@@ -237,18 +258,17 @@ if not Path(build.__file__).resolve().is_relative_to(source.resolve()):
     raise RuntimeError(f"Unexpected build module: {build.__file__}")
 cann, headers = build.kvaf_build_paths(runtime)
 library, = build.build_libraries(cache_dir=runtime / 'lifetch', cann=cann, headers=headers, soc=sys.argv[3])
-if sys.argv[5]:
-    with library.open('rb') as handle:
-        digest = hashlib.file_digest(handle, 'sha256').hexdigest()
-    (Path(sys.argv[4]) / f'{source.name}.binary.sha256').write_text(digest + '\n')
+with library.open('rb') as handle:
+    digest = hashlib.file_digest(handle, 'sha256').hexdigest()
+(Path(sys.argv[4]) / f'{source.name}.binary.sha256').write_text(digest + '\n')
 print(f"BUILD_READY source={source.name} cache={library.parent.name}", flush=True)
 BUILD
     done
 elif [[ -n "$adaptive" ]]; then
-    printf 'CONFIG G2 NPU4 BS16 Q4 656B main=%.8s candidate=%.8s\n' "$main_sha" "$adaptive"
+    printf 'CONFIG G2 physical_NPU=%s logical_device=0 BS16 Q4 656B main=%.8s candidate=%.8s\n' "$peer_physical_npu" "$main_sha" "$adaptive"
     echo 'UNITS us  DETAIL=p50/max[observed/eligible] auxiliary=true  DRIFT=within_graph_last5_minus_first5'
 else
-    printf 'CONFIG G2 BS16 Q4 656B NPU4 after=%s before=%s main=a56154c3 KVAF=%s\n' "${new:0:8}" "${old:0:8}" "${transport:0:8}"
+    printf 'CONFIG G2 BS16 Q4 656B physical_NPU=%s logical_device=0 after=%s before=%s main=a56154c3 KVAF=%s\n' "$peer_physical_npu" "${new:0:8}" "${old:0:8}" "${transport:0:8}"
 fi
 run_arm() (
     set -euo pipefail
@@ -348,8 +368,15 @@ cpu = ctypes.CDLL(None).sched_getcpu()
 nodes = list(Path(f"/sys/devices/system/cpu/cpu{cpu}").glob("node[0-9]*"))
 print(nodes[0].name[4:] if len(nodes) == 1 else "")')
 fi
+if "$joint_local"; then
+    if [[ -f "$out/numa_target.txt" ]]; then
+        node=$(<"$out/numa_target.txt")
+    else
+        printf '%s\n' "$node" >"$out/numa_target.txt"
+    fi
+fi
 bind_cpu_service "$node"
-if [[ -n "$help_reference" ]]; then
+if [[ -n "$help_reference" ]] || "$joint_local"; then
     source "$tools/support/ranked_help_run.sh"
     ranked_help_groups
     exit 0

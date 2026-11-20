@@ -43,7 +43,7 @@ from pathlib import Path
 from ranked_help_report import load
 
 case, label, revision, group, binary, joint = sys.argv[1:]
-abi = 'joint' if joint == 'true' else ('fixed' if label == 'anchor' else 'flexible')
+abi = {'baseline': 'original', 'anchor': 'fixed', 'candidate': 'joint' if joint == 'true' else 'flexible'}[label]
 try:
     arm = load(Path(case).parent, int(group), label, revision, abi)
     cfg = arm['config']
@@ -58,20 +58,27 @@ PY
 
 ranked_help_groups() {
     local group params preferred trace_path trace hash_file arm revision case_dir saved started
-    local -a labels pending summaries=()
+    local -a labels pending summaries=() paired_order=(baseline candidate)
     for group in 7 2 10 4 17; do
         case_dir="$out/g$group"
         mkdir -p "$case_dir"
-        params=$(ranked_reference_case "$group")
-        # The first line can be empty when the original placement was mixed.
-        preferred=${params%%$'\n'*}
-        trace_path=${params#*$'\n'}
-        labels=(candidate)
-        if [[ -f "$case_dir/anchor.requested" ]]; then labels=(anchor candidate); fi
+        if "$joint_local"; then
+            preferred=$node
+            trace_path=
+            labels=("${paired_order[@]}")
+            paired_order=("${labels[1]}" "${labels[0]}")
+        else
+            params=$(ranked_reference_case "$group")
+            # The first line can be empty when the original placement was mixed.
+            preferred=${params%%$'\n'*}
+            trace_path=${params#*$'\n'}
+            labels=(candidate)
+            if [[ -f "$case_dir/anchor.requested" ]]; then labels=(anchor candidate); fi
+        fi
         pending=()
         for arm in "${labels[@]}"; do
             revision=$ranked
-            if [[ "$arm" == anchor ]]; then revision=$four_field; fi
+            case "$arm" in baseline) revision=$ranked_sha ;; anchor) revision=$four_field ;; esac
             if ranked_arm_complete "$group" "$arm" "$revision"; then
                 printf 'REUSED G%s %s %s\n' "$group" "$arm" "$case_dir/$arm"
             else
@@ -82,7 +89,7 @@ ranked_help_groups() {
             bind_cpu_service "$preferred"
             printf 'CPU_PLACEMENT G%s reference_node=%s policy=%s actual=measured_per_arm\n' \
                 "$group" "${preferred:-mixed_or_unknown}" "$policy"
-            if [[ ! -d "$trace_path" ]]; then
+            if [[ -n "$trace_path" && ! -d "$trace_path" ]]; then
                 echo "The G$group reference input is missing at $trace_path. Select a reference made with an available local capture." >&2
                 return 1
             fi
@@ -93,7 +100,7 @@ ranked_help_groups() {
                 echo "Changed capture in resumed G$group; previous results require the original input" >&2
                 return 1
             fi
-            if [[ -s "$help_reference/g$group/input.sha256" ]] && ! cmp -s "$hash_file" "$help_reference/g$group/input.sha256"; then
+            if [[ -n "$help_reference" && -s "$help_reference/g$group/input.sha256" ]] && ! cmp -s "$hash_file" "$help_reference/g$group/input.sha256"; then
                 echo "Current G$group input hash differs from the reference" >&2
                 return 1
             fi
@@ -108,11 +115,14 @@ ranked_help_groups() {
                 run_arm "$arm" "$group" "$case_dir"
                 printf 'CASE_COMPLETE G%s %s elapsed_s=%s\n' "$group" "$arm" "$(( SECONDS - started ))"
                 revision=$ranked
-                if [[ "$arm" == anchor ]]; then revision=$four_field; fi
+                case "$arm" in baseline) revision=$ranked_sha ;; anchor) revision=$four_field ;; esac
                 ranked_arm_complete "$group" "$arm" "$revision"
             done
         fi
-        if "$joint"; then
+        if "$joint_local"; then
+            "$PYTHON" -B "$tools/support/ranked_joint_report.py" "$out" --reference "$out" \
+                --group "$group" | tee "$case_dir/summary.txt"
+        elif "$joint"; then
             "$PYTHON" -B "$tools/support/ranked_joint_report.py" "$out" --reference "$help_reference" \
                 --previous "$joint_reference" --group "$group" | tee "$case_dir/summary.txt"
         else

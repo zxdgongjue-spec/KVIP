@@ -56,7 +56,7 @@ peer_prepare_node() {
         return 1
     fi
     export ASCEND_HOME_PATH="$cann" ASCEND_CANN_PACKAGE_PATH="$cann"
-    export ASCEND_RT_VISIBLE_DEVICES=4 SOC_VERSION=Ascend950DT_9582 ASCEND_LAUNCH_BLOCKING=0
+    export ASCEND_RT_VISIBLE_DEVICES="$peer_physical_npu" SOC_VERSION=Ascend950DT_9582 ASCEND_LAUNCH_BLOCKING=0
     export MAX_JOBS=2 OMP_NUM_THREADS=1 NANOVLLM_A5_OPS_BUILD_JOBS=2
 
     venv="$area/python-${serial_revision:0:8}"

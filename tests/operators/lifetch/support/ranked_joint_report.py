@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Compare the joint Post/Index/CQ schedule to both measured ranked controls."""
+"""Compare the joint Post/Index/CQ schedule against a local or archived ranked control."""
 
 import argparse
 import json
@@ -97,6 +97,8 @@ def history(previous, group, original, candidate):
 
 
 def run(root, reference, previous, group):
+    if previous is None and root.resolve() != reference.resolve():
+        raise ValueError('Local comparison requires the baseline and candidate in the same run directory')
     original = load(reference, group, 'baseline', RANKED_BASE, 'original')
     candidate = load(root, group, 'candidate', (root/'candidate.txt').read_text().strip(), 'joint')
     match = compare(original, candidate)
@@ -105,10 +107,12 @@ def run(root, reference, previous, group):
     with np.load(candidate['folder']/'lean_ticks.npz', allow_pickle=False) as raw:
         ends = joint_endpoints(raw)
     original, candidate = summary(original), summary(candidate)
-    prev = history(previous, group, original, candidate)
-    rows = dict(original=original, previous=prev, candidate=candidate)
+    controls = {'original': original}
+    if previous is not None:
+        controls['previous'] = history(previous, group, original, candidate)
+    rows = {**controls, 'candidate': candidate}
     deltas = {}
-    for label, baseline in [('original', original), ('previous', prev)]:
+    for label, baseline in controls.items():
         gains = [baseline[k]-candidate[k] for k in METRICS]
         stages = {}
         for stage in STAGES:
@@ -120,9 +124,10 @@ def run(root, reference, previous, group):
         deltas[label] = dict(saved_us=gains, saved_pct=[100*g/baseline[k] for g,k in zip(gains, METRICS)],
                              kernel_mean_saved_us=kernel, auxiliary_p50_saved_us=stages, placement=place)
     drifts = {k: drift(v['span_us']) for k,v in rows.items()}
+    source = 'archived controls' if previous is not None else 'local baseline and candidate'
     result = dict(group=group, arms=rows, comparisons=deltas, within_graph_drift=drifts, joint_tail=ends,
                   original_topk_match=match['exact_topk_matched'],
-                  protocol='One profiled graph per arm, controls archived. Mean is graph event, p50 is per-invocation device span. '
+                  protocol=f'One profiled graph per arm, {source}. Mean is graph event, p50 is per-invocation device span. '
                            'Within-graph drift is last five minus first five device spans. Stage diagnostics are a separate graph and overlap.')
     path = root/f'g{group}/comparison.json'
     tmp = path.with_suffix('.json.tmp')
@@ -148,8 +153,8 @@ def run(root, reference, previous, group):
 if __name__ == '__main__':
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('root', type=Path)
-    p.add_argument('--reference', type=Path, required=True)
-    p.add_argument('--previous', type=Path, required=True)
+    p.add_argument('--reference', type=Path, help='Baseline result root (defaults to this run)')
+    p.add_argument('--previous', type=Path, help='Previous archived candidate; omit for a local two-arm comparison')
     p.add_argument('--group', type=int, required=True, choices=GROUPS)
     args = p.parse_args()
-    run(args.root, args.reference, args.previous, args.group)
+    run(args.root, args.reference or args.root, args.previous, args.group)

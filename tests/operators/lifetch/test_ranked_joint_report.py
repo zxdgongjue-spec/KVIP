@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 
 from ranked_five_report import JOINT_MAGIC
-from ranked_joint_report import drift, joint_endpoints
+from ranked_joint_report import drift, joint_endpoints, run
 
 
 def sample():
@@ -44,6 +44,11 @@ def test_empty_get_and_no_help():
 
 def test_capture_drift_separates_mean_and_median():
     assert drift([1, 1, 1, 1, 1, 2, 2, 2, 2, 12]) == (3,1)
+
+
+def test_local_comparison_rejects_external_baseline(tmp_path):
+    with pytest.raises(ValueError, match='same run directory'):
+        run(tmp_path/'candidate-machine', tmp_path/'baseline-machine', None, 2)
 
 
 def test_idle_row_core_may_finish_its_assigned_remote_row():
