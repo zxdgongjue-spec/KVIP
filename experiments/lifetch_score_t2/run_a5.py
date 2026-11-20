@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""MR14 direct window score/predicate producers + MR23 ranked T2/Fetch tail.
+"""MR23 baseline versus MR23 fused operators with MR14 history score splitting.
 
 No Git fetch or Docker command. Optional --prepare-kvaf builds a separate pinned
 checkout from local history. Both sources use the MR23 graph timing protocol.
@@ -11,6 +11,7 @@ from decimal import Decimal
 import hashlib
 import inspect
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -36,6 +37,12 @@ ROUTES = {
     'score_t2_p16': ('1', 16, 'full'),
 }
 DEFAULT_PARTS = {1:16, 2:16, 4:8, 8:4, 16:2}
+DEFAULT_MISSES = '5,10,15,20,25,30'
+ROUTE_DESCRIPTIONS = {
+    'mr23': 'MR23 original fused LI + completed Resolve/Fetch/Index',
+    'window_budget': 'MR23 + MR14 strategy integration: window history score splitting; original Service/Final',
+    'aligned_budget': 'MR23 + MR14 strategy integration: full-history score splitting + full Top2048/classify',
+}
 
 
 def batch_configuration(batches_csv, parts_csv):
@@ -238,6 +245,7 @@ def summarize(output, jobs, measured_rounds):
             peak = max(w['score_aics'] for w in geometry['waves']) if geometry else report['batch']*(job['parts'] or 2)
             # Kernel names are retained with invocation boundaries in raw trace.
             rows.append(dict(round=job['round'], case=job['case'], prefetch=job['pf'],
+                route_description=ROUTE_DESCRIPTIONS.get(job['case'],job['case']),
                 batch=report['batch'], miss_percent=report['miss_percent'], score_parts=job['parts'], score_mode=mode,
                 score_geometry=geometry, score_peak_aic=peak, score_peak_aiv=2*peak,
                 actual_windows=0 if mode=='aligned' else schedule['rounds'] if schedule else None,
@@ -271,6 +279,7 @@ def summarize(output, jobs, measured_rounds):
         if sorted(s['round'] for s in samples) != list(range(1, measured_rounds+1)):
             raise RuntimeError('Missing or duplicated measured rounds')
         row = dict(case=case, prefetch=pf, batch=b, miss_percent=miss,
+                   route_description=ROUTE_DESCRIPTIONS.get(case,case),
                    score_parts=samples[0]['score_parts'], score_mode=samples[0]['score_mode'],
                    score_geometry=samples[0]['score_geometry'], effective_aic=samples[0]['effective_aic'],
                    li_schedule=samples[0]['li_schedule'])
@@ -305,7 +314,9 @@ def summarize(output, jobs, measured_rounds):
         writer.writeheader(); writer.writerows(table)
     save(output/'fixture_hashes.json', [{'prefetch':k[0], 'batch':k[1], 'miss_directory':k[2], 'sha256':v} for k,v in fixtures.items()])
     print('us/call | same-graph event means | positive gain is faster', flush=True)
-    print('SerialBefore = SDK LI + LIDU + completed BatchGet; MR14 SerialAfter is not measured here.', flush=True)
+    print('SerialBefore = SDK LI + LIDU + completed BatchGet.', flush=True)
+    print('MR23 + MR14 strategy-integrated candidate results are the Fused rows: window_budget = window history splitting + original Service/Final; '
+          'aligned_budget = full-history splitting/Top2048/classify. This aligns algorithms/scheduling, not the complete MR14 staged implementation.', flush=True)
     print('case             pf  B  P miss% SerialBefore    Fused      LI Resolve/Get   /MR23   Gain us', flush=True)
     for r in table:
         print(f"{r['case']:16} {r['prefetch']:4} {r['batch']:2} {r['score_parts']:2} {r['miss_percent']:5g} {r['serial_event_us']:12.2f} {r['fused_event_us']:8.2f} {r['li_us']:7.2f} {r['resolve_fetch_us']:11.2f} {r['over_mr23']:7.3f} {r['net_gain_vs_mr23_us']:9.2f}")
@@ -335,7 +346,8 @@ def main(argv=None):
                    help='use kvaf-root as local source; prepare/build a separate pinned dependency')
     p.add_argument('--pinned-kvaf-root', type=Path, default=ROOT.parent/'KVAF-score-t2-1c131038')
     p.add_argument('--kvaf-server', default='127.0.0.1:28885')
-    p.add_argument('--miss-percent', default='0,3,5,10,15,20')
+    p.add_argument('--miss-percent', default=DEFAULT_MISSES,
+                   help='distinct finite percentages in 0..100; default: '+DEFAULT_MISSES)
     p.add_argument('--prefetch', default='1024', help='comma-separated budgets; add 0 as an overlap control')
     p.add_argument('--intermediate-fetches', type=int, default=4)
     p.add_argument('--rounds', type=int, default=3)
@@ -357,10 +369,10 @@ def main(argv=None):
         routes = plan_routes(selected, batches, parts_map)
     except ValueError as error:
         p.error(f'invalid experiment configuration: {error}')
-    if (not misses or any(not 0 <= x <= 20 for x in misses) or len(set(misses)) != len(misses) or
+    if (not misses or any(not math.isfinite(x) or not 0 <= x <= 100 for x in misses) or len(set(misses)) != len(misses) or
             not prefetches or any(not 0 <= x <= 2048 or x % a.intermediate_fetches for x in prefetches) or
             len(set(prefetches)) != len(prefetches)):
-        p.error('miss values must be distinct in 0..20; prefetch must divide evenly into windows')
+        p.error('miss values must be distinct finite values in 0..100; prefetch must divide evenly into windows')
     if 'aligned_budget' in selected and prefetches != [0]:
         p.error('aligned_budget requires --prefetch 0; run prefetch overlap controls separately')
     output = a.output.resolve() if a.output else Path(tempfile.mkdtemp(prefix='lifetch_score_t2_'+time.strftime('%Y%m%d_%H%M%S')+'_', dir='/home/w00568585' if Path('/home/w00568585').is_dir() else None))
@@ -385,9 +397,10 @@ def main(argv=None):
             save(output/'dependency_preparation.json', preparation)
     sources = {case: baseline(output) if case=='mr23' else ROOT for case in selected}
     manifest = dict(status='PLANNED', baseline_commit=BASE, mr14_reference=MR14,
-                    integration='direct producers + window T2 or aligned full-H TopK/classify; original MR23 completed URMA tail',
+                    integration='MR23 + MR14 strategy integration (algorithm/schedule alignment, not a complete staged implementation copy); window T2 or aligned full-H TopK/classify; completed URMA tail',
+                    route_descriptions={case:ROUTE_DESCRIPTIONS.get(case,case) for case in selected},
                     requested_batches=batches, budget_parts_map=parts_map,
-                    serial_reference='SerialBefore: SDK LI + LIDU + completed BatchGet; no MR14 SerialAfter adapter',
+                    serial_reference='SerialBefore: SDK LI + LIDU + completed BatchGet; integrated MR14 candidates are Fused rows, not independent SerialAfter',
                     score_budget='B*P<=32 AIC; no implicit oversubscribed waves',
                     batch_isolation='One batch size per job; baseline/candidate use identical DDR pool capacity', candidate_commit=command(['git','rev-parse','HEAD']),
                     candidate_status=command(['git','status','--short']), configuration=vars(a).copy(),

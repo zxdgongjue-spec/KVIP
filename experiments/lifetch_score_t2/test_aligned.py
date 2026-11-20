@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 import io
 import json
+import os
+import subprocess
+import sys
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,10 +14,69 @@ from kvip.operators.lifetch.score_policy import score_aligned_schedule
 from workloads import configuration
 from diagnostics import account
 from performance import split_graph_invocations
-from run_a5 import li_components, plan_routes, DEFAULT_PARTS, summarize, save
+from run_a5 import li_components, plan_routes, DEFAULT_PARTS, DEFAULT_MISSES, ROUTE_DESCRIPTIONS, main, summarize, save
 
 
 class Aligned(unittest.TestCase):
+    def test_three_integrated_routes_plan_sixty_jobs_with_default_misses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output=Path(tmp)/'run'
+            with redirect_stdout(io.StringIO()):
+                main(['--kvaf-root',tmp,'--dry-run','--cases','mr23,window_budget,aligned_budget',
+                      '--prefetch','0','--output',str(output)])
+            jobs=json.loads((output/'jobs.json').read_text())
+            manifest=json.loads((output/'manifest.json').read_text())
+            self.assertEqual(len(jobs),60)
+            self.assertEqual(manifest['requested_batches'],[1,2,4,8,16])
+            self.assertEqual(manifest['configuration']['miss_percent'],'5,10,15,20,25,30')
+            self.assertEqual(set(manifest['route_descriptions']),{'mr23','window_budget','aligned_budget'})
+            self.assertIn('algorithm/schedule alignment',manifest['integration'])
+            self.assertIn('integrated MR14 candidates are Fused rows',manifest['serial_reference'])
+            for round_id in range(4):
+                round_jobs=[j for j in jobs if j['round']==round_id]
+                self.assertEqual(len(round_jobs),15)
+                self.assertEqual({(j['case'],j['batch']) for j in round_jobs},
+                                 {(case,b) for case in ROUTE_DESCRIPTIONS for b in DEFAULT_PARTS})
+            for job in jobs:
+                self.assertEqual(job['args'][job['args'].index('--miss-percent')+1],DEFAULT_MISSES)
+                self.assertEqual(job['args'][job['args'].index('--batches')+1],str(job['batch']))
+
+    def test_extended_miss_percentages_and_endpoints(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output=Path(tmp)/'run'
+            with redirect_stdout(io.StringIO()):
+                main(['--kvaf-root',tmp,'--dry-run','--cases','mr23','--batches','1',
+                      '--miss-percent','0,25,30,100','--rounds','1','--output',str(output)])
+            jobs=json.loads((output/'jobs.json').read_text())
+            self.assertEqual(len(jobs),2)
+            self.assertTrue(all(j['args'][j['args'].index('--miss-percent')+1]=='0,25,30,100' for j in jobs))
+
+    def test_invalid_miss_percentages_stop_before_output_creation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output=Path(tmp)/'run'
+            for misses in ['nan','inf','-inf','-1','101','5,5','5,5.0','']:
+                with self.subTest(misses=misses),redirect_stderr(io.StringIO()),self.assertRaises(SystemExit):
+                    main(['--kvaf-root',tmp,'--dry-run','--output',str(output),'--miss-percent='+misses])
+                self.assertFalse(output.exists())
+
+    def test_aligned_wrapper_defaults_remain_overrideable(self):
+        wrapper=ROOT/'experiments/lifetch_score_t2/run_aligned_a5.sh'
+        with tempfile.TemporaryDirectory() as tmp:
+            for name,extra,expected_batches,expected_misses,expected_count in [
+                ('defaults',[],[1,2,4,8,16],DEFAULT_MISSES,60),
+                ('override',['--batches','2,4','--miss-percent','0,10','--rounds','1'],[2,4],'0,10',12),
+            ]:
+                output=Path(tmp)/name
+                result=subprocess.run(['bash',str(wrapper),'--kvaf-root',tmp,'--dry-run','--output',str(output)]+extra,
+                                      env=dict(os.environ,PYTHON=sys.executable),capture_output=True,text=True)
+                self.assertEqual(result.returncode,0,result.stderr)
+                jobs=json.loads((output/'jobs.json').read_text())
+                manifest=json.loads((output/'manifest.json').read_text())
+                self.assertEqual(len(jobs),expected_count)
+                self.assertEqual(manifest['requested_batches'],expected_batches)
+                self.assertEqual(manifest['configuration']['miss_percent'],expected_misses)
+                self.assertEqual(manifest['configuration']['prefetch'],'0')
+
     def test_geometry_and_prefetch_guard(self):
         for b,p in DEFAULT_PARTS.items():
             s=SimpleNamespace(batch=b,history=131072,resident=16384,rounds=min(4,2*b),
@@ -82,6 +144,7 @@ class Aligned(unittest.TestCase):
                 jobs.append(dict(round=1,case=case,name=case,pf=0,batch=2,mode=mode,parts=parts,output=str(root/case),log='test'))
             with redirect_stdout(io.StringIO()):rows=summarize(root,jobs,1)
             row=next(r for r in rows if r['case']=='aligned_budget')
+            self.assertEqual(row['route_description'],ROUTE_DESCRIPTIONS['aligned_budget'])
             self.assertEqual(row['actual_windows'],0);self.assertEqual(row['service_aivs'],0)
             self.assertEqual(row['score_total_us'],5);self.assertEqual(row['full_topk_classify_us'],6)
             self.assertEqual(row['li_kernel_launches'],2);self.assertEqual(row['resolve_fetch_us'],7)
