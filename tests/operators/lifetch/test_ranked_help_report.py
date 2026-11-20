@@ -34,6 +34,7 @@ def test_fourth_field_owner_and_final_get_return():
     assert (tail['index_later'], tail['get_later']) == (1, 1)
     assert [call['index_minus_nonempty_get_us'] for call in tail['calls']] == [51., -49.]
     assert tail['fourth_owner_busy_rows'] == {'producer_finalizer': 32}
+    assert tail['row_handoff_gap_us'] == {'n': 32, 'p50': 5., 'p95': 5.}
     assert tail['join_minus_last_field_us']['p50'] == .5
     fields[0, 48, 2] = 3<<32 | 3
     with pytest.raises(ValueError, match='physical owner'):

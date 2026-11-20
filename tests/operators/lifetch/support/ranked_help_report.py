@@ -95,6 +95,12 @@ def tail_endpoints(raw, abi):
     fourth_end = np.where(active, end[..., 3], 0).max(axis=1)
     last_busy = np.maximum(primary_end, fourth_end)
     observed = has_fields & has_get
+    # A row only loses a handoff opportunity if the fourth field has not
+    # started when a sibling finishes. Include zero waits in the percentiles.
+    free_to_copy = np.maximum(work[..., 3] - end[..., :3].min(axis=2), 0)[active] / clock
+    result['row_handoff_gap_us'] = dict(n=int(free_to_copy.size),
+        p50=float(np.median(free_to_copy)) if free_to_copy.size else None,
+        p95=float(np.percentile(free_to_copy, 95)) if free_to_copy.size else None)
     result.update(last_fourth_minus_last_primary_us=distribution((fourth_end-primary_end)[has_fields]/clock),
                   last_busy_field_minus_nonempty_get_us=distribution((last_busy-get_end)[observed]/clock),
                   last_busy_field_blocks=dict(tail_blocks), last_busy_field_rows=dict(tail_rows),
@@ -270,6 +276,9 @@ def report(root, reference, group):
           ' '.join(f'{label}={row["within_graph_last_minus_first_p50_us"]:+.2f}'
                    for label, row in detail['arms'].items()))
     fixed, new = (arms[label]['tail'] for label in ('fixed', 'flexible'))
+    gaps = [v['row_handoff_gap_us'] for v in (fixed, new)]
+    print('  HANDOFF row_gap_p50/p95_us ' + ' '.join(
+        f'{label}={fmt(g["p50"])}/{fmt(g["p95"])}' for label, g in zip(('fixed', 'flexible'), gaps)))
     print(f'  fixed/flexible last_fourth_minus_last_primary_p50_us={fmt(fixed["last_fourth_minus_last_primary_us"]["p50"])}/'
           f'{fmt(new["last_fourth_minus_last_primary_us"]["p50"])} last_busy_field_minus_get_p50_us='
           f'{fmt(fixed["last_busy_field_minus_nonempty_get_us"]["p50"])}/{fmt(new["last_busy_field_minus_nonempty_get_us"]["p50"])}')
