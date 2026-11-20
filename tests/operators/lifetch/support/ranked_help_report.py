@@ -12,12 +12,11 @@ import numpy as np
 
 from peer_candidate import RANKED_BASE
 from peer_delta import pair_placement
-from ranked_five_report import GROUPS, fmt, load_arm, team_fields
+from ranked_five_report import GROUPS, final_q_workers, fmt, load_arm, team_fields
 
 
 FIXED_REVISION = '5072f2c907f0fbd3bf1c1fbe499dd979c8c1dfca'
 BATCH = 16
-WORKERS = 2
 
 
 def distribution(values):
@@ -27,10 +26,10 @@ def distribution(values):
     return dict(n=x.size, min=float(x.min()), p50=float(np.median(x)), max=float(x.max()))
 
 
-def owner_name(block):
+def owner_name(block, workers):
     if block < 48:
         return ('producer_finalizer', 'index_planner', 'output')[block % 3]
-    return 'get' if block < 56 else 'spare'
+    return 'get' if block < 48 + 4*workers else 'spare'
 
 
 def tail_endpoints(raw, abi):
@@ -40,13 +39,14 @@ def tail_endpoints(raw, abi):
     n = len(ticks)
     u = ticks[:, :BATCH*64].reshape(n, BATCH, 64)[:, :, 32:]
     fetch = ticks[:, BATCH*128:BATCH*256].reshape(n, BATCH, 128)
-    # A Get worker's aggregate return/group count is replicated over all eight rows it serves.
-    q = fetch[:, :WORKERS, :96].reshape(n, WORKERS, 4, 24)
+    workers = final_q_workers(raw)
+    # Each final lane replicates its queue counters across the rows it serves.
+    q = fetch[:, :workers, :96].reshape(n, workers, 4, 24)
     idx = u[..., 24]
     if (np.any(idx <= 0) or np.any(q[..., 9] <= 0) or np.any(fetch[..., 99] <= 0)
             or np.any(fetch[..., 104] <= 0) or np.any(fetch[..., 105] < fetch[..., 104])):
         raise ValueError('Incomplete Index, Get publication, or final-status endpoints')
-    get = np.zeros((n, WORKERS, 4), dtype=np.int64)
+    get = np.zeros((n, workers, 4), dtype=np.int64)
     for count, start, end in ((16, 3, 4), (17, 7, 8)):
         active = q[..., count] > 0
         if np.any(active & ((q[..., start] <= 0) | (q[..., end] < q[..., start]))):
@@ -70,7 +70,7 @@ def tail_endpoints(raw, abi):
         return result
 
     stamp = ticks[:, BATCH*256+64*32:].reshape(n, 64, 8)
-    owner, count, arrival, work, end = team_fields(stamp, flexible=abi == 'flexible', joint=abi == 'joint')
+    owner, count, arrival, work, end = team_fields(stamp, flexible=abi == 'flexible', joint=abi == 'joint', workers=workers)
     active = count[..., 0] > 0
     last_field = end.max(axis=2)
     owner_counts = Counter()
@@ -78,7 +78,7 @@ def tail_endpoints(raw, abi):
     tail_rows = Counter()
     for i, call in enumerate(calls):
         for block in owner[i, active[i], 3]:
-            owner_counts[owner_name(int(block))] += 1
+            owner_counts[owner_name(int(block), workers)] += 1
         # Include all exact ties and retain idle rows' join endpoints in the Index/Get comparison.
         if active[i].any():
             finish = end[i, active[i]].max()
@@ -89,7 +89,7 @@ def tail_endpoints(raw, abi):
                 tail_blocks[block] += 1
                 tail_rows[int(row)] += 1
                 call['last_busy_fields'].append(dict(row=int(row), field=int(field), physical_block=block,
-                                                     role=owner_name(block), moves=int(count[i, row, field])))
+                                                     role=owner_name(block, workers), moves=int(count[i, row, field])))
     has_fields = active.any(axis=1)
     primary_end = np.where(active, end[..., :3].max(axis=2), 0).max(axis=1)
     fourth_end = np.where(active, end[..., 3], 0).max(axis=1)

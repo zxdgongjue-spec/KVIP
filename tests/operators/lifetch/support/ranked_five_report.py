@@ -72,7 +72,15 @@ def verify_swaps(start_layout, layout, initial_valid, valid, source, dest, count
         raise ValueError('Committed hot-valid bitmap differs from actual promotions and evictions')
 
 
-def team_fields(stamp, *, flexible, joint=False):
+def final_q_workers(raw):
+    # Archived traces lack this field and were recorded with eight final AIVs.
+    workers = int(raw['q_workers']) if 'q_workers' in raw else 2
+    if workers not in (1, 2, 4):
+        raise ValueError(f'Invalid final workers per Q: {workers}')
+    return workers
+
+
+def team_fields(stamp, *, flexible, joint=False, workers=2):
     """Validate logical ownership and return [call,row,field] vectors for each trace word."""
     n = len(stamp)
     row = np.array([block//3 if block < 48 else block-48 for block in range(64)])
@@ -89,11 +97,13 @@ def team_fields(stamp, *, flexible, joint=False):
             # A completed field may belong to its original row, an idle
             # neighbour, or the final Get lane that ran its bounded prefix.
             lane = owner - 48
-            near = np.where(lane < 8, lane + 1, lane - 8)
-            queue_row = 4*(lane//2) + lane%2
+            queues = 4 * workers
+            near = np.where(lane < queues, lane + 1, lane - queues)
+            queue_row = (row//4 == lane//workers) & (row%workers == lane%workers)
             remote = np.where(owner < 48, row == (owner//3+1+5*(owner%3))%16,
                               (row == near%16) | (row == (near+1)%16)
-                              | ((lane < 8) & ((row == queue_row) | (row == queue_row+2))))
+                              | ((lane < queues) & queue_row)
+                              | ((lane >= queues) & (row == lane % queues)))
             legal_fourth |= (owner >= 0) & (owner < 64) & remote
         if (np.any(stamp[..., 1] != row) or np.any((packed & 0xffffffff) != field)
                 or np.any(np.where(field == 3, ~legal_fourth, owner != physical))):
@@ -124,7 +134,8 @@ def diagnostic_intervals(raw, detail, *, candidate, flexible=False, joint=False)
         raise ValueError('Invalid counter calibration')
     n, batch = len(ticks), 16
     base = batch * 256
-    old_cores = 3 * batch + 4 * 2
+    workers = final_q_workers(raw)
+    old_cores = 3 * batch + 4 * workers
     core_count = 64 if candidate else old_cores
     trailer = base + 64*32
     expected_words = trailer + 64*8 if candidate else base + old_cores*32
@@ -166,7 +177,7 @@ def diagnostic_intervals(raw, detail, *, candidate, flexible=False, joint=False)
               'five_phase_probed_total_rows': (ig['n'], ig['eligible'])}
     if candidate:
         stamp = ticks[:, trailer:].reshape(n, 64, 8)
-        owner, count, begin, work, end = team_fields(stamp, flexible=flexible, joint=joint)
+        owner, count, begin, work, end = team_fields(stamp, flexible=flexible, joint=joint, workers=workers)
         active = count > 0
         counts = active.sum(axis=(1, 2))
         if not np.all(counts):
@@ -223,6 +234,8 @@ def load_arm(case_dir, label, revision, *, field_abi=None):
         raise ValueError(f'{label}: device graph accounting does not reconcile')
     kernel = {k: (v, median(s['stages_us'][k] for s in profile['samples'])) for k, v in accounting.items()}
     with np.load(folder / 'lean_ticks.npz', allow_pickle=False) as raw:
+        if final_q_workers(raw) != int(config.get('ranked_q_workers') or 2):
+            raise ValueError(f'{label}: recorded final-worker geometry differs from config')
         if field_abi is None:
             field_abi = 'fixed' if label == 'candidate' else 'original'
         phases, index = diagnostic_intervals(raw, d, candidate=field_abi != 'original',
