@@ -4,12 +4,13 @@
 import numpy as np
 
 
-def expected_mode(previous, owners, ends, token_bytes, generation, step):
-    if generation == 0 or step <= 1 or previous is None:
+def expected_mode(previous, owners, ends, token_bytes, generation, step, *, resident=16384, history=131328):
+    if (generation == 0 or step <= 1 or previous is None or np.any(ends < resident)
+            or np.any(ends > history) or np.any(owners < 0) or np.any(owners >= len(previous))):
         return 0
     selected = previous[owners]
     if (np.any(selected[:, 0] != generation) or np.any(selected[:, 1] != step - 1)
-            or np.any(selected[:, 3] != 4)):
+            or np.any(selected[:, 3] != 4) or np.any(selected[:, 2] < 0) or np.any(selected[:, 2] > 2048+8192)):
         return 0
     return int(int(selected[:, 2].sum()) * int(token_bytes) * 32 <= int(ends.sum()) * 5)
 
@@ -27,7 +28,8 @@ class RouteAudit:
             route = state.rotating.adaptive_route
             owners = self.owners[i]
             mode = int(route.mode.cpu().item())
-            expected = expected_mode(self.previous[i], owners, self.ends[i], state.token_bytes, generation, step)
+            expected = expected_mode(self.previous[i], owners, self.ends[i], state.token_bytes, generation, step,
+                                     resident=state.resident, history=state.history)
             if mode != expected:
                 raise ValueError(f'Route mismatch at call {i}, generation {generation}, step {step}: {mode} vs {expected}')
             actual = route.feedback.cpu().numpy().copy()

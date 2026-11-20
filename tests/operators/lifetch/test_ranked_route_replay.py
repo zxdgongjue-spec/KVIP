@@ -30,3 +30,15 @@ def test_rejection_of_incomplete_predecessor_forces_whole_graph_high():
     feedback = np.tile([3, 12, 20, 4], (17, 1))
     feedback[2, 3] = 1
     assert expected_mode(feedback, owners, ends, 656, 3, 13) == 0
+
+
+
+def test_independent_policy_rejects_corrupt_demand_and_out_of_range_queries():
+    owners = np.arange(1, 17)
+    feedback = np.tile([3, 12, 20, 4], (17, 1))
+    ends = np.full((16, 4), 130048)
+    feedback[8, 2] = -1
+    assert expected_mode(feedback, owners, ends, 656, 3, 13) == 0
+    feedback[8, 2] = 20
+    ends[8, 2] = 131329
+    assert expected_mode(feedback, owners, ends, 656, 3, 13) == 0
