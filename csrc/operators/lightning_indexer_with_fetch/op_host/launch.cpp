@@ -1,4 +1,5 @@
-#include "../op_kernel/pipeline_types.h"
+#include <cstddef>
+#include "../op_kernel/query_owner_layout.h"
 #include "api.h"
 #include "context.h"
 extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) { return rotating::PrepareShape(shape); }
@@ -93,6 +94,13 @@ static uint32_t LaunchStreaming(void* bindings,void* update,void* workspace,void
     uint32_t result=LaunchLi(bindings,stream,shape);
     if(!result)result=aclrtlaunch_v9_streaming_resolve_update(blocks,stream,workspace);
     return result;
+}
+
+static_assert(offsetof(pipeline_ab::Args,queryOwnerScratch)==200 && sizeof(pipeline_ab::Args)==256,
+              "query-owner binding layout");
+static_assert(offsetof(rotating::FinalPost,ownerBlock)==32,"query-owner receipt layout");
+extern "C" uint32_t kvip_query_owner_row_bytes() {
+    return pipeline_ab::kQueryOwnerRowWords * sizeof(uint32_t);
 }
 
 extern "C" uint32_t kvip_lifetch_streaming_forward(void* bindings,void* update,void* workspace,void* stream,const rotating::RuntimeShape* shape,uint32_t workers) {

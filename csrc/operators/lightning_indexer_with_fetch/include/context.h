@@ -16,6 +16,7 @@ struct alignas(128) FinalPost {
     uint32_t count, pending, error, deferred, descriptor;
     uint32_t nonconflicting; // Compact descriptor prefix safe before prefetch CQ.
     uint64_t head;
+    uint32_t ownerBlock, queueView, processed; // Query-owner completion receipt; block is one-based.
 };
 static_assert(sizeof(FinalPost)==128,"Final post must own a cache line");
 struct alignas(128) Progress { uint32_t end[32]; };

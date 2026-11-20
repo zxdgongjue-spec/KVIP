@@ -113,6 +113,12 @@ class StreamingLIFetchForward:
             metadata = ((3 * b + 31) // 32) * 32
             direct = self.packed_fetch.view(-1)[groups * (3 * stride + metadata):].view(groups, -1)
             direct[:, -64:].zero_()
+        owner_scratch = 0
+        if b == 16 and self.index_team_cores == 64:
+            row_bytes = rotating.library.kvip_query_owner_row_bytes
+            row_bytes.argtypes, row_bytes.restype = [], ctypes.c_uint32
+            self.query_owner_scratch = allocate("query_owner_scratch", (b, row_bytes()), torch.uint8, True)
+            owner_scratch = self.query_owner_scratch.data_ptr()
         pointers = [
             self._context.data_ptr(),
             keys.data_ptr(),
@@ -141,7 +147,8 @@ class StreamingLIFetchForward:
                 blob,
                 np.asarray([self.dense_shadow.data_ptr(), self.packed_fetch.data_ptr(), completed_flags, live_count, completed_rows, completed_events, completed_mapping, completed_journal], dtype="<u8").view("u1"),
                 np.asarray([self.index_team.data_ptr() if self.index_team is not None else 0], dtype="<u8").view("u1"),
-                np.zeros(56, dtype="u1"),
+                np.asarray([owner_scratch], dtype="<u8").view("u1"),
+                np.zeros(48, dtype="u1"),
             )
         )
         if len(blob) != 256:

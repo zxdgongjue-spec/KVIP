@@ -1138,7 +1138,7 @@ inline void CollectFinalPosts(__gm__ FinalPost* posts,__ubuf__ uint32_t* output)
 #if !V9_UBMEM
 #include "joined_final.h"
 #endif
-template<bool Team=false>
+template<bool Team=false,bool QueryOwner=false>
 __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
@@ -1155,7 +1155,7 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
  if(row->pending || prefetchStatus[2]!=row->requests)row->error|=kUbmemIncomplete;
  arrival=GetSystemCycle();
 #else
- CompletePrefetch(ctx,b,true,profile?&polls:nullptr,profile?&drain:nullptr,profile?&arrival:nullptr);
+ if constexpr(!QueryOwner)CompletePrefetch(ctx,b,true,profile?&polls:nullptr,profile?&drain:nullptr,profile?&arrival:nullptr);
 #endif
  if(profile){ft[4]=GetSystemCycle();ft[5]=polls;ft[6]=drain;ft[7]=arrival;}error|=row->error;flags[7].error=error;flags[7].ready=1;
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+7),kBatchFlagPayloadBytes);
@@ -1186,7 +1186,7 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
  error|=AwaitPublication(flags+4);
 #endif
 #if !V9_UBMEM
- if(!profile && !error && (a->prefetchCount&0x10000000U) && shape.finalWorkers==4 && ctx->hotValid){
+ if(!QueryOwner && !profile && !error && (a->prefetchCount&0x10000000U) && shape.finalWorkers==4 && ctx->hotValid){
   TPipe pipe;TBuf<TPosition::VECCALC> storage;pipe.InitBuffer(storage,64);
   auto result=storage.Get<uint32_t>();
   Simt::VF_CALL<FinalizeJoinedRow>(Simt::Dim3{256,1,1},a,ctx,flags,b,shape.batch,shape.resident,
@@ -1226,7 +1226,7 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
  // Status exposes only the last Q queue; earlier snapshots were overwritten.
  if(shape.finalWorkers){
   uint32_t workers=(a->prefetchCount>>16)&0xffU;
-  uint32_t pair=2*shape.batch+2*((shape.finalWorkers-1)*workers+b%workers);
+  uint32_t pair=QueryOwner?FinalQueue(shape.batch,4,b,3):2*shape.batch+2*((shape.finalWorkers-1)*workers+b%workers);
   auto queueArgs=reinterpret_cast<__gm__ const KvafExecuteBatchGetKernelArgs*>(ctx->args)+pair;
   auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(queueArgs->queue_state);
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
@@ -1317,6 +1317,31 @@ inline void RetireRoundControl(__gm__ Args* a,uint32_t batch,uint32_t workers,ui
  asc_threadfence();
 }
 #endif
+#if defined(__CCE_AICORE__) && !V9_UBMEM
+__aicore__ inline void ClearRankProgress(__gm__ Context* ctx,uint32_t b){
+    const uint32_t words=(ctx->shape.history+255)/256*8;
+    constexpr uint32_t chunk=4096;
+    const uint32_t size=words<chunk?words:chunk;
+    constexpr uint32_t progressWords=4*sizeof(Progress)/sizeof(uint32_t);
+    const uint32_t clearWords=size>progressWords?size:progressWords;
+    TPipe pipe;TBuf<TPosition::VECCALC> storage;
+    pipe.InitBuffer(storage,clearWords*sizeof(uint32_t));
+    auto zero=storage.Get<uint32_t>();Duplicate(zero,0U,clearWords);
+    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    GlobalTensor<uint32_t> covered;
+    covered.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(kvip_prefetch_rank::CoveredAddress(ctx->incremental,ctx->shape.batch,ctx->shape.history,b)));
+    for(uint32_t offset=0;offset<words;offset+=size)
+        DataCopy(covered[offset],zero,words-offset<size?words-offset:size);
+    if(ctx->progress){
+        GlobalTensor<uint32_t> progress;
+        progress.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress)+b*progressWords);
+        DataCopy(progress,zero,progressWords);
+    }
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    pipe.Destroy();
+}
+#include "query_owner.h"
+#endif
 extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
 #if defined(__CCE_AICORE__)
  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
@@ -1334,6 +1359,14 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
 #else
   constexpr bool team=false;
 #endif
+#if !V9_UBMEM
+  if(team && a->queryOwnerScratch){
+   query_owner::Run(a,block/4,block%4);
+   AscendC::SyncAll<true>();
+   if(block<shape.batch)Simt::VF_CALL<RetireRoundControl>(Simt::Dim3{128,1,1},a,shape.batch,workers,block);
+   return;
+  }
+#endif
   if(block<shape.batch*kResolveCores){uint32_t b=block/kResolveCores,role=block%kResolveCores;
    if(role==0){
     Producer(a,b);
@@ -1347,30 +1380,7 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
 #endif
    }
 #if !V9_UBMEM
-   if(role==kResolveCores-1){
-    // All score producers have joined and the final Fetch uses separate flags.
-    auto ctx=reinterpret_cast<__gm__ Context*>(a->context);
-    const uint32_t words=(shape.history+255)/256*8;
-    constexpr uint32_t chunk=4096;
-    const uint32_t size=words<chunk?words:chunk;
-    constexpr uint32_t progressWords=4*sizeof(Progress)/sizeof(uint32_t);
-    const uint32_t clearWords=size>progressWords?size:progressWords;
-    TPipe pipe;TBuf<TPosition::VECCALC> storage;
-    pipe.InitBuffer(storage,clearWords*sizeof(uint32_t));
-    auto zero=storage.Get<uint32_t>();Duplicate(zero,0U,clearWords);
-    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-    GlobalTensor<uint32_t> covered;
-    covered.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(kvip_prefetch_rank::CoveredAddress(ctx->incremental,shape.batch,shape.history,b)));
-    for(uint32_t offset=0;offset<words;offset+=size)
-        DataCopy(covered[offset],zero,words-offset<size?words-offset:size);
-    if(ctx->progress){
-        GlobalTensor<uint32_t> progress;
-        progress.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress)+b*progressWords);
-        DataCopy(progress,zero,progressWords);
-    }
-    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
-    pipe.Destroy();
-   }
+   if(role==kResolveCores-1)ClearRankProgress(reinterpret_cast<__gm__ Context*>(a->context),b);
 #endif
   }
   else {uint32_t lane=block-shape.batch*kResolveCores,q=lane/workers,part=lane%workers;
