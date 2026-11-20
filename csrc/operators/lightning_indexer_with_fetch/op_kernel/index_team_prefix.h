@@ -236,6 +236,8 @@ __aicore__ __attribute__((noinline)) inline bool CopySealedPrefix(__gm__ Args* a
                 if(n && !BothReady(first)){
                     auto& second=rows[1];
                     second=BindStagedRow(a,other,n,work+kBufferWords);
+                    // Distinct packed rows can name the same storage owner.
+                    if(second.keys==first.keys){homeChecked=true;continue;}
                     SliceStats stats{};
                     ReadPeerSlice<true>(second,block,profile,stats);
                     if(local.GetValue(kBufferWords+kStagedOwner)){
