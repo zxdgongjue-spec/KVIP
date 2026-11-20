@@ -1,13 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+// Only thread zero elects one worker for this row. Preserve the owner until
+// the next invocation's planner opens a new claim.
+__simt_callee__ inline void TryFourthBody(__gm__ uint32_t* claim,uint32_t block,__ubuf__ uint32_t* won) {
+    if(threadIdx.x==0)*won=asc_atomic_cas(claim,0U,block+1)==0U;
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(32) inline void ClaimFourth(
+        __gm__ uint32_t* claim,uint32_t block,__ubuf__ uint32_t* won) {
+    TryFourthBody(claim,block,won);
+}
+
 // Lane 0 also owns DDR addresses, lane 1 logical IDs and lane 2 scales.
 // Invalidation applies to freed hot positions, exactly as in ApplyBatch.
 // A whole chunk fits in private UB even when its swaps include long cycles.
+template<bool Claim=false>
 __simt_vf__ __aicore__ LAUNCH_BOUND(256) inline void CopyFields(
     __gm__ uint32_t* edges,uint32_t chunks,uint32_t lane,
     __gm__ uint64_t* keys,__gm__ uint32_t* scales,__gm__ uint64_t* addr,
-    __gm__ uint64_t* logical,__gm__ uint32_t* valid,__ubuf__ uint64_t* saved) {
+    __gm__ uint64_t* logical,__gm__ uint32_t* valid,__ubuf__ uint64_t* saved,
+    __gm__ uint32_t* claim=nullptr,uint32_t block=0) {
     uint32_t tid=threadIdx.x,first=0;
     auto src=reinterpret_cast<__ubuf__ uint32_t*>(saved+5*kMaxMoves);
     auto dst=src+kMaxMoves;
@@ -42,4 +55,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(256) inline void CopyFields(
         // A later chunk may use a position written by this one.
         asc_threadfence(); asc_syncthreads(); first=end;
     }
+    // All threads finished the last scatter and no longer use the saved keys.
+    // Return the CAS result through that same UB allocation and V_S event.
+    if constexpr(Claim)TryFourthBody(claim,block,reinterpret_cast<__ubuf__ uint32_t*>(saved));
 }

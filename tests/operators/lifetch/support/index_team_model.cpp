@@ -22,6 +22,10 @@ thread_local struct { unsigned x; } threadIdx;
 thread_local std::barrier<>* rendezvous;
 void asc_syncthreads() { rendezvous->arrive_and_wait(); }
 void asc_threadfence() { std::atomic_thread_fence(std::memory_order_seq_cst); }
+uint32_t asc_atomic_cas(uint32_t* p,uint32_t expected,uint32_t desired) {
+    std::atomic_ref<uint32_t>(*p).compare_exchange_strong(expected,desired);
+    return expected;
+}
 template<class T> T asc_ldcg(T* address) { return *address; }
 template<class T> void asc_stcg(T* address,T value) { *address=value; }
 constexpr unsigned CHUNK=512,kPrefetch=2048,kMaxFinal=8192,THREADS=32,kMaxMoves=1024;
@@ -78,6 +82,7 @@ int main() {
     }
     // Independently delayed owners complete in reverse lane order. No
     // metadata, key word or scale can depend on a different lane's gather.
+    uint32_t claim=0;
     for(unsigned pass=0;pass<4;++pass) {
         unsigned lane=3-pass;
         std::vector<uint64_t> ub(kMaxMoves*6);
@@ -85,11 +90,15 @@ int main() {
         std::vector<std::thread> workers;
         for(unsigned t=0;t<256;++t) workers.emplace_back([&,t]{
             threadIdx.x=t;rendezvous=&sync;
-            CopyFields(plan.data(),chunks,lane,keys.data(),scales.data(),addresses.data(),
-                       ids.data(),valid.data(),ub.data());
+            if(lane<3)CopyFields<true>(plan.data(),chunks,lane,keys.data(),scales.data(),addresses.data(),
+                                      ids.data(),valid.data(),ub.data(),&claim,lane);
+            else CopyFields<false>(plan.data(),chunks,lane,keys.data(),scales.data(),addresses.data(),
+                                   ids.data(),valid.data(),ub.data());
         });
         for(auto& t:workers)t.join();
+        if(lane<3 && uint32_t(ub[0])!=unsigned(lane==2))return 3;
     }
+    if(claim!=3)return 4;
     for(unsigned i=0;i<history;++i){
         Row actual{{},addresses[i],ids[i],scales[i]};
         std::copy_n(keys.begin()+16*i,16,actual.key.begin());

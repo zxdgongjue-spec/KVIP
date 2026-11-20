@@ -665,9 +665,11 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
   // Free the planner's UB before allocating the field gather stage.
   pipe.Destroy();
   auto control=index_team::Control(a,b);
-  index_team::Publish(control,chunks,error);
+  index_team::PublishPlan(a,b,chunks,error);
+  if(profile)ticks[22]=GetSystemCycle();
   index_team::Copy(a,GetBlockIdx(),shape.batch);
   for(uint32_t i=0;i<4;++i)error|=AwaitPublication(control+1+i);
+  if(profile)ticks[23]=GetSystemCycle();
  } else
 #endif
  {
@@ -1009,7 +1011,6 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
   }
   }
  }
- if constexpr(Team)index_team::Copy(a,GetBlockIdx(),shape.batch);
  if(a->prefetchCount & 0x10000000U){
   auto trace=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*256+
       uint64_t(kResolveCores*shape.batch+q*workers+lane)*32;
@@ -1032,6 +1033,7 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
     auto ft=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*128+uint64_t(b)*128+q*24;
     ft[9]=published;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ft),24*8);}
    trace[15]=GetSystemCycle();}
+  if constexpr(Team)index_team::Copy(a,GetBlockIdx(),shape.batch);
   return;
  }
  for(uint32_t b=lane;b<shape.batch;b+=workers){
@@ -1044,6 +1046,7 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
   if(profile){auto ft=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*128+uint64_t(b)*128+q*24;
    ft[9]=GetSystemCycle();kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ft),24*8);}
  }
+ if constexpr(Team)index_team::Copy(a,GetBlockIdx(),shape.batch);
 }
 #endif
 #if !V9_UBMEM
