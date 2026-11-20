@@ -27,6 +27,11 @@ struct { uint32_t x; } threadIdx;
 void asc_syncthreads() {}
 void asc_atomic_or(uint32_t* p,uint32_t v){*p|=v;}
 template<class T> T asc_ldcg(T* p){return *p;}
+template<class T> void asc_stcg(T* p,T v){*p=v;}
+unsigned __popc(unsigned v){return __builtin_popcount(v);}
+// Warp scans are not executed by this serial classifier model.
+template<class T> T asc_shfl_up(T v,unsigned){assert(false);return v;}
+void asc_threadfence(){}
 namespace rotating {
 constexpr uint32_t kTop=2048,kLruSlots=2048;
 struct Context { uint64_t mapping,lruSlots; };

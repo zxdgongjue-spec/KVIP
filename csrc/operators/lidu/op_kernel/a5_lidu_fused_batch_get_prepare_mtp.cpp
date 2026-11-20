@@ -36,7 +36,7 @@ constexpr uint32_t MIN_QUERIES_PER_REQUEST = 1;
 constexpr uint32_t MAX_QUERIES_PER_REQUEST = 4;
 constexpr uint32_t MTP_MISS_CAPACITY =
     SPARSE_COUNT * MAX_QUERIES_PER_REQUEST;
-constexpr uint32_t MAX_SOURCE_CAPACITY = (1U << 18) + 32U;
+constexpr uint32_t MAX_SOURCE_CAPACITY = (1U << 20) + 20U * 128U;
 constexpr uint32_t MAX_CACHE_TOKENS = (1U << 17) + 20U * 128U;
 constexpr uint32_t MAX_CORES_PER_REQUEST = 8;
 constexpr uint32_t SIMT_THREADS = 512;
@@ -51,7 +51,7 @@ constexpr uint32_t MISS_BITMAP_WORDS =
 constexpr uint32_t MISS_BITMAP_STORAGE_WORDS =
     (MISS_BITMAP_WORDS + UB_BLOCK_WORDS - 1) /
     UB_BLOCK_WORDS * UB_BLOCK_WORDS;
-constexpr uint32_t SOURCE_BITMAP_WORDS = MAX_SOURCE_CAPACITY / 32;
+constexpr uint32_t SOURCE_BITMAP_WORDS = (1U << 18) / 32;
 constexpr uint32_t SLOT_SELECT_SCAN_PREFIX_OFFSET =
     (MISS_BITMAP_WORDS + 1 + UB_BLOCK_WORDS - 1) /
     UB_BLOCK_WORDS * UB_BLOCK_WORDS;
@@ -164,8 +164,7 @@ struct RequestTiming {
     uint64_t prefixTotal = 0;
 };
 
-static_assert(SOURCE_BITMAP_WORDS * 32 == MAX_SOURCE_CAPACITY,
-              "source bitmap must cover the complete source domain");
+constexpr uint32_t SOURCE_TILE_TOKENS = SOURCE_BITMAP_WORDS * BITMAP_WORD_BITS;
 static_assert(
     PROFILE_USED_FIELD_COUNT <=
         A5_LIDU_FUSED_BATCH_GET_PREPARE_MTP_PROFILE_FIELDS,
@@ -228,7 +227,7 @@ DeduplicateOneQuerySimt(
     __ubuf__ int32_t *uniqueSources,
     __ubuf__ int32_t *dedupControl,
     uint32_t missCount,
-    int32_t candidateLen)
+    int32_t candidateLen, uint32_t tileBegin)
 {
     const uint32_t threadIndex = Simt::GetThreadIdx();
     const uint32_t threadCount = Simt::GetThreadNum();
@@ -242,7 +241,10 @@ DeduplicateOneQuerySimt(
             continue;
         }
         const uint32_t token = static_cast<uint32_t>(tokenValue);
-        const uint32_t wordIndex = token >> 5;
+        if (token < tileBegin || token - tileBegin >= SOURCE_TILE_TOKENS) {
+            continue;
+        }
+        const uint32_t wordIndex = (token - tileBegin) >> 5;
         const uint32_t mask = 1U << (token & 31U);
         const uint32_t current = sourceMembership[wordIndex];
         if ((current & mask) != 0U) {
@@ -1465,12 +1467,12 @@ private:
         }
     }
 
-    __aicore__ inline void InitializeDedup(
-        int32_t candidateLen, RequestTiming &timing)
+    __aicore__ inline void InitializeDedupTile(
+        uint32_t tileLength, bool firstTile, RequestTiming &timing)
     {
         const uint64_t start = ProfileStart();
         const uint32_t sourceBitmapWords =
-            ((static_cast<uint32_t>(candidateLen) + 31U) / 32U +
+            ((tileLength + 31U) / 32U +
              UB_BLOCK_WORDS - 1U) /
             UB_BLOCK_WORDS * UB_BLOCK_WORDS;
         LocalTensor<uint32_t> sourceMembership =
@@ -1478,18 +1480,17 @@ private:
         LocalTensor<int32_t> control = controlBuf_.Get<int32_t>();
         Duplicate(sourceMembership, static_cast<uint32_t>(0),
                   sourceBitmapWords);
-        Duplicate(control, static_cast<int32_t>(0), REQUEST_CONTROL_WORDS);
+        if (firstTile) {
+            Duplicate(control, static_cast<int32_t>(0), REQUEST_CONTROL_WORDS);
+        }
         PipeBarrier<PIPE_V>();
-
-        control.SetValue(DEDUP_UNIQUE_COUNT, 0);
-        control.SetValue(DEDUP_STATUS, STATUS_OK);
         PipeBarrier<PIPE_ALL>();
         ProfileAdd(timing.dedup, start);
     }
 
     __aicore__ inline void DeduplicateCompactedQuery(
         LocalTensor<int32_t> compactedTokens, uint32_t missCount,
-        int32_t candidateLen, RequestTiming &timing)
+        int32_t candidateLen, uint32_t tileBegin, RequestTiming &timing)
     {
         const uint64_t start = ProfileStart();
         LocalTensor<uint32_t> sourceMembership =
@@ -1504,7 +1505,7 @@ private:
             (__ubuf__ int32_t *)uniqueSources.GetPhyAddr(),
             (__ubuf__ int32_t *)
                 control[DEDUP_UNIQUE_COUNT].GetPhyAddr(),
-            missCount, candidateLen);
+            missCount, candidateLen, tileBegin);
         PipeBarrier<PIPE_ALL>();
         ProfileAdd(timing.dedup, start);
     }
@@ -1986,25 +1987,35 @@ private:
         LocalTensor<int32_t> compactedTokens =
             outputTokensBuf_.Get<int32_t>();
         if (status == STATUS_OK) {
-            for (uint32_t localQuery = 0;
-                 localQuery < queryCount; ++localQuery) {
-                const uint32_t missCount = queryMissCounts[localQuery];
-                if (missCount > SPARSE_COUNT) {
-                    status = ERROR_COUNT_ACCOUNTING;
-                    break;
-                }
-                if (missCount > 0) {
-                    if (!dedupInitialized) {
-                        InitializeDedup(candidateLen, timing);
-                        dedupInitialized = true;
+            const uint32_t length = static_cast<uint32_t>(candidateLen);
+            for (uint32_t tileBegin = 0; tileBegin < length; tileBegin += SOURCE_TILE_TOKENS) {
+                const uint32_t remaining = length - tileBegin;
+                const uint32_t tileLength = remaining < SOURCE_TILE_TOKENS ? remaining : SOURCE_TILE_TOKENS;
+                bool tileInitialized = false;
+                for (uint32_t localQuery = 0;
+                     localQuery < queryCount; ++localQuery) {
+                    const uint32_t missCount = queryMissCounts[localQuery];
+                    if (missCount > SPARSE_COUNT) {
+                        status = ERROR_COUNT_ACCOUNTING;
+                        break;
                     }
-                    // The owning lane already published the compacted miss
-                    // prefix to GM. Only the miss prefix feeds dedup.
-                    LoadWorkspaceVector(
-                        CompactedTokenBase(row, localQuery),
-                        compactedTokens, missCount);
-                    DeduplicateCompactedQuery(
-                        compactedTokens, missCount, candidateLen, timing);
+                    if (missCount > 0) {
+                        if (!tileInitialized) {
+                            InitializeDedupTile(tileLength, tileBegin == 0, timing);
+                            tileInitialized = true;
+                            dedupInitialized = true;
+                        }
+                        // The owning lane already published the compacted miss
+                        // prefix to GM. Only the miss prefix feeds dedup.
+                        LoadWorkspaceVector(
+                            CompactedTokenBase(row, localQuery),
+                            compactedTokens, missCount);
+                        DeduplicateCompactedQuery(
+                            compactedTokens, missCount, candidateLen, tileBegin, timing);
+                    }
+                }
+                if (!tileInitialized || status != STATUS_OK) {
+                    break;
                 }
             }
         }

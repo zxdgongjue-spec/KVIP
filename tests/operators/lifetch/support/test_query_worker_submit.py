@@ -7,8 +7,8 @@ def test_query_worker_batches_kvaf_calls_and_preserves_conflicts(tmp_path):
     root = Path(__file__).resolve().parents[4]
     source = (root / 'csrc/operators/lightning_indexer_with_fetch/op_kernel/streaming.cpp').read_text()
     begin = source.index('__aicore__ inline void FetchQueryGroup(')
-    end = source.index('__aicore__ inline void FinalizeStreaming', begin)
-    body = source[begin:end].removesuffix("#endif\n")
+    end = source.index('\n}\n#endif', begin) + 2
+    body = source[begin:end]
     code = r'''
 #include <cstdint>
 #include <cassert>
@@ -16,7 +16,7 @@ def test_query_worker_batches_kvaf_calls_and_preserves_conflicts(tmp_path):
 #define __aicore__
 #define __gm__
 #define V9_SIMULATION 0
-constexpr uint32_t kResolveCores=3,kFlagCount=16,kTop=2048,kSlots=8192,kBatchGetInflight=2048;
+constexpr uint32_t kResolveCores=3,kFlagCount=16,kTop=2048,kSlots=8192,kBatchGetInflight=2048,CHUNK=512;
 constexpr uint32_t kBatchFlagPayloadBytes=12,kFinalPostPayloadBytes=32;
 constexpr uint32_t kGroupSafeCountWord=0,kGroupConflictCountWord=8,kGroupReadyWord=16,kGroupErrorWord=17;
 constexpr uint64_t KVAF_AIV_BATCH_GET_STATUS_MAGIC=123,KVAF_AIV_BATCH_GET_PROFILE_MAGIC=456;
@@ -30,7 +30,8 @@ struct DeviceArgs {uint64_t indices=0,offsets=0,output_indices=0,miss_count=0,ad
 struct Context {uint64_t sourceBlocks,sourceOffsets,destinations,count,fallbackAddresses=0,fallbackValid=0;};
 struct Shape {uint32_t batch=4,finalWorkers=4,finalPostOffset=0,resident=16384;};
 struct Args {uint64_t context=0,flags=0,times=0,packedFetch=0;uint32_t prefetchCount=0,fetchJettysPerAiv=0;
- uint64_t completedFlags=0,liveCount=0;};
+ uint64_t completedFlags=0,liveCount=0,completedMapping=0;};
+void SnapshotMappings(Args*,uint32_t,uint32_t,uint32_t){assert(false);}
 Shape LoadRuntimeShape(Context*){return {};}
 FinalPost posts[16];DeviceArgs deviceArgs[20];std::vector<std::vector<int32_t>> calls,offsetCalls,destCalls;
 KvafBatchGetQueueState queues[20];KvafBatchGetCoreStatus statuses[20];
@@ -44,7 +45,7 @@ enum class HardEvent {V_S};template<HardEvent>void SetFlag(int){} template<HardE
 void PackFetchRanges(Context* c,int32_t* p,uint32_t stride,uint32_t* ranges,uint32_t rows){
  for(unsigned r=0;r<rows;r++){auto begin=ranges[3*r],count=ranges[3*r+1],out=ranges[3*r+2];
  for(unsigned i=0;i<count;i++){p[out+i]=((int32_t*)c->sourceBlocks)[begin+i];p[stride+out+i]=((int32_t*)c->sourceOffsets)[begin+i];p[2*stride+out+i]=((int32_t*)c->destinations)[begin+i];}}}
-void PublishQueryCompletion(Context*,BatchFlag*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint64_t,uint32_t){}
+void PublishQueryCompletion(Context*,BatchFlag*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint64_t,uint32_t,bool){}
 namespace Simt {struct Dim3{int x,y,z;};template<auto f,class... T>void VF_CALL(Dim3,T... a){f(a...);}}
 namespace kvaf_device {
 constexpr uint64_t kCqTimeout=6,kInvalidArgs=1;

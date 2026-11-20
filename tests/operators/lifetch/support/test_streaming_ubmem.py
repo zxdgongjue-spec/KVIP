@@ -47,7 +47,8 @@ template<TPosition>struct TBuf {std::vector<uint32_t> data;template<class T>Loca
 enum class HardEvent {V_S};constexpr int EVENT_ID0=0;
 template<HardEvent>void SetFlag(int){} template<HardEvent>void WaitFlag(int){}
 void PublishQueryCompletion(Context*,BatchFlag* f,uint32_t batch,uint32_t,uint32_t,uint32_t q,
- uint32_t lane,uint32_t workers,uint64_t error,uint32_t){
+ uint32_t lane,uint32_t workers,uint64_t error,uint32_t,bool deferred){
+ assert(!deferred); // UBmem keeps completion/residency publication in this worker.
  for(unsigned b=lane;b<batch;b+=workers){f[b*kFlagCount+8+q].ready=1;f[b*kFlagCount+8+q].error=error;}}
 namespace Simt {struct Dim3 {int x,y,z;};template<auto f,class... A>void VF_CALL(Dim3,A... a){f(a...);}}
 namespace kvaf_device {
