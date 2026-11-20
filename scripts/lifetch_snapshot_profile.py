@@ -254,7 +254,7 @@ def run_case(args, snap, output):
         valid = inputs.query_valid.cpu().reshape(shape["batch"],4).bool()
         bad = ((topk < 0) | (topk >= shape["history"])) & valid[:, :, None]
         selected = topk[valid].contiguous().numpy().tobytes()
-        row = dict(iteration=iteration, inputs_match=True, status=status,
+        row = dict(iteration=iteration, phase="profiled" if measured else "warmup", inputs_match=True, status=status,
                    invalid_topk=int(bad.sum()), topk_sha256=hashlib.sha256(selected).hexdigest(),
                    equals_captured_output=bool(torch.equal(topk, snap.tensor("arguments.9", "after"))))
         samples.append(row)
@@ -374,6 +374,9 @@ def main():
                 code = 124
         result = destination / "result.json"
         row = {"case": case, "exit": code, "result": json.loads(result.read_text()) if result.exists() else None}
+        error_path = destination / "error.json"
+        if error_path.exists():
+            row["error"] = json.loads(error_path.read_text())
         rows.append(row)
         write_json(args.output / "summary.json", rows)
         if (destination / "kernel_times.json").exists():
@@ -385,11 +388,16 @@ def main():
                 print(window["epoch"], *[max((v[k] for v in lanes),default=0) for k in ("wait_ticks","incremental_ticks","service_ticks")],
                       *[sum(v[k] for v in lanes) for k in ("topk_calls","candidates","posted")], sep=" | ", flush=True)
         print(f"{case}: exit={code}; samples={len((row['result'] or {}).get('samples', []))}", flush=True)
+        if code:
+            print("FAIL:", row.get("error", {"exit": code}), flush=True)
+            print("--- worker.log tail ---", flush=True)
+            print("\n".join((destination / "worker.log").read_text(errors="replace").splitlines()[-40:]), flush=True)
         if code == 124:
             print("Timed out; stopping remaining device cases.", flush=True)
             break
     print(f"Results: {args.output.resolve()}")
+    return 1 if any(row["exit"] for row in rows) else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
