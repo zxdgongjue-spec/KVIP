@@ -158,6 +158,63 @@ def rebind_rows(value, batch, queue_args, owners, address_base, address_stride, 
     return raw.view(value.dtype).reshape(value.shape)
 
 
+def resize_snapshot(snap, active, bound, windows):
+    """Replicate one real request into independent owners for paired padding AB."""
+    import torch
+    from kvip.operators.lifetch.workspace import LIFetchWorkspace
+    reader = SimpleNamespace(meta=snap.meta, payload=snap.payload)
+    original = lambda name, phase="before": Snapshot.tensor(reader, name, phase)
+    shape = snap.meta["shape"]
+    valid = original("inputs.query_valid").reshape(-1,4)
+    source = next(i for i, row in enumerate(valid) if bool(row.any()))
+    owner = int(original("inputs.row_owners")[source])
+    workspace = LIFetchWorkspace(torch, batch=bound, history=shape["history"], aics=shape["aicCount"],
+        windows=windows, device=torch.device("cpu"), pin_memory=False, index_heads=shape["indexHeads"])
+    inp = workspace.inputs
+    counts = [int(valid[source].sum())]*active
+    inp.prepare(counts, query_owners=list(range(1,active+1)))
+    for name in ("query", "weights", "scale", "query_ends"):
+        target = getattr(inp,name)
+        target.zero_()
+        row = original("inputs."+name)[source*4:source*4+4]
+        for b in range(active):
+            target[b*4:b*4+4].copy_(row)
+    inp.position_scratch.zero_()
+    overrides = {"inputs."+name: value for name,value in vars(inp).items() if isinstance(value,torch.Tensor)}
+    for name in ("keys", "scales", "addresses", "logical_ids", "hot_valid"):
+        value = original("index."+name)
+        # Owner zero remains the dummy; every active copy has independent writable Index storage.
+        copied = value[:bound+1].clone()
+        for b in range(active):
+            copied[b+1].copy_(value[owner])
+        overrides["index."+name] = copied
+    storage = SimpleNamespace(history=shape["history"], **{n:overrides["index."+n] for n in ("keys","scales")})
+    for i,value in enumerate(workspace.arguments(storage)):
+        overrides[f"arguments.{i}"] = value
+    for name in ("lru_slots", "reserved_hot", "tail_bounds"):
+        value = original("rotating."+name)
+        target = torch.zeros((bound,*value.shape[1:]),dtype=value.dtype)
+        for b in range(active):
+            target[b].copy_(value[source])
+        overrides["rotating."+name] = target
+    stride=snap.meta["output_stride"]
+    value=original("owner.output")
+    copied=value.clone()
+    for b in range(active):
+        copied[(b+1)*stride:(b+2)*stride].copy_(value[owner*stride:(owner+1)*stride])
+    overrides["owner.output"]=copied
+    for name, target in (("query_ends",inp.query_ends.reshape(bound,4)),("row_owners",inp.row_owners),
+                         ("hot_valid",overrides["index.hot_valid"]),("token_addresses",overrides["index.addresses"])):
+        overrides["rotating."+name]=target
+    snap.tensor=lambda name,phase="before": overrides[name] if phase=="before" and name in overrides else original(name,phase)
+    snap.meta=dict(snap.meta,shape=dict(shape,batch=bound),aliases={})
+    digest=hashlib.sha256()
+    for name in ("query","weights","scale","query_ends"):
+        digest.update(overrides["inputs."+name][:active*4].contiguous().view(torch.uint8).numpy().tobytes())
+    return dict(active=active,bound=bound,source_row=source,source_owner=owner,
+                workload="replicated captured request; independent writable owners",input_sha256=digest.hexdigest())
+
+
 def run_case(args, snap, output):
     import numpy as np
     import torch
@@ -170,6 +227,9 @@ def run_case(args, snap, output):
     from kvip.operators.lifetch.index_update import DirectIndexUpdate
     from kvip.runtime.build import build_libraries, kvaf_build_paths
 
+    if args.active_bs:
+        info=resize_snapshot(snap,args.active_bs,args.bound_bs,args.windows or snap.meta["shape"]["rounds"])
+        write_json(output / "padding_input.json",info)
     torch.npu.set_device(args.device)
     device = torch.device(f"npu:{args.device}")
     stream = torch.npu.Stream(device=device)
@@ -476,6 +536,9 @@ def main():
     p.add_argument("--output", type=Path)
     p.add_argument("--report-only", action="store_true",
                    help="Read existing trace JSON files from the positional path; no NPU or snapshot load")
+    p.add_argument("--ab-padding", action="store_true", help="Replicate one active request; compare BS1/2/4/8/16 against bound BS16")
+    p.add_argument("--active-bs", type=int, choices=(1,2,4,8,16))
+    p.add_argument("--bound-bs", type=int, choices=(1,2,4,8,16))
     p.add_argument("--ab-windows", action="store_true", help="Same snapshot: 4/8 windows, original profiling plus private instrumented graph")
     p.add_argument("--windows", type=int, choices=(4,8))
     p.add_argument("--prefetch-tokens", type=int)
@@ -541,14 +604,20 @@ def main():
         return
     rows = []
     jobs = [(w, mode) for w in (4,8) for mode in ("profile", "detail")] if args.ab_windows else [(args.windows, "detail" if args.detail_only else "profile" if args.profile_only else "both")]
+    if args.ab_padding:
+        jobs=[(args.windows or audit["shape"]["rounds"],f"bs{b}-{kind}") for b in (1,2,4,8,16) for kind in ("actual","padded")]
     for window, mode in jobs:
         case = "graph-captured"
-        destination = args.output / (f"windows-{window}-{mode}" if args.ab_windows else case)
+        destination = args.output / (f"windows-{window}-{mode}" if args.ab_windows or args.ab_padding else case)
         destination.mkdir(exist_ok=True)
         command = [sys.executable, str(Path(__file__).resolve()), str(args.snapshot), "--case", case,
                    "--output", str(destination), "--device", str(args.device), "--kvaf-root", str(args.kvaf_root),
                    "--kvip-root", str(args.kvip_root), "--kvaf-server", args.kvaf_server,
                    "--iterations", str(args.iterations), "--warmup", str(args.warmup)]
+        if args.ab_padding:
+            active=int(mode.split("-")[0][2:])
+            bound=active if mode.endswith("actual") else 16
+            command.extend(["--active-bs",str(active),"--bound-bs",str(bound),"--profile-only"])
         if mode == "detail":
             command.append("--detail-only")
         elif mode == "profile":
@@ -585,6 +654,26 @@ def main():
         if code == 124:
             print("Timed out; stopping remaining device cases.", flush=True)
             break
+    if args.ab_padding:
+        print("Padding AB | profiler kernel means, us | replicated real request")
+        print("Active BS | Actual bound kernel2 / total | Padded16 kernel2 / total | Total delta")
+        for b in (1,2,4,8,16):
+            timings=[]
+            hashes=[]
+            for kind in ("actual","padded"):
+                directory=args.output / f"windows-{args.windows or audit['shape']['rounds']}-bs{b}-{kind}"
+                kp=directory/"kernel_times.json"
+                if not kp.exists():
+                    timings.append(None);continue
+                means={k:sum(v)/len(v) for k,v in json.loads(kp.read_text()).items() if v}
+                cold=sum(v for k,v in means.items() if re.fullmatch(r"v9_li_kernel_2(?:_\d+)?",k))
+                timings.append((cold,sum(means.values())))
+                hashes.append(json.loads((directory/"padding_input.json").read_text())["input_sha256"])
+            if len(set(hashes))>1:
+                raise ValueError(f"BS{b}: paired effective inputs differ")
+            if all(timings):
+                a,c=timings
+                print(f"{b} | {a[0]:.2f} / {a[1]:.2f} | {c[0]:.2f} / {c[1]:.2f} | {c[1]-a[1]:+.2f}")
     if args.ab_windows:
         print("AB kernel 2, original build; same snapshot, separate detailed graph passes")
         print("Windows | Mean us | Min us | Max us | N")
