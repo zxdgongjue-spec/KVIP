@@ -3729,7 +3729,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
     policy = 'zero' if adaptive_ranked else getattr(config, 'route_policy', None)
     ranked = bool(getattr(config, 'production_root', None))
     # reset() has already restored both the cache and the only round's inputs.
-    fixed_round = fused and getattr(sequence, 'cached_ranked_round', None) is not None
+    fixed_round = getattr(sequence, 'cached_ranked_round', None) is not None
     if ranked:
         for state in states:
             state.verify_ranked_events = True
@@ -4308,7 +4308,9 @@ def run_synthetic_batch(config, directory, *, shared_pool=None):
 def run_real(config, directory):
     sequence = (ReplaySequence.from_snapshot(config.snapshot) if getattr(config, 'operation', None) == 'real'
                 else ReplaySequence(config.trace_root, config.group, config.round_range))
-    if getattr(config, 'production_root', None):
+    if (getattr(config, 'production_root', None)
+            or (config.mode == 'diagnose' and getattr(config, 'serial_only', False))):
+        # Native reset, like ranked reset, already uploads the complete fixture.
         sequence.cache_ranked_round()
     pages = ReplayPagePlan(sequence)
     initial = next(iter(sequence))
