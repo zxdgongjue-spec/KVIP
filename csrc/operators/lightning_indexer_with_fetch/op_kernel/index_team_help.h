@@ -118,6 +118,29 @@ __aicore__ inline void FinishFourth(__gm__ Args* a,uint32_t block,uint32_t batch
     Publish(Control(a,row)+4,0,0);
 }
 
+// Complete at most one nonempty planner chunk and publish its ordered suffix.
+__aicore__ inline bool HelpOneChunk(__gm__ Args* a,uint32_t block,uint32_t batch,
+                                   const ReadyFourth& target,TailTicket& ticket) {
+    if(!target.moves)return false;
+    auto edges=Moves(a,target.row);
+    uint32_t c=Cursor(target.claim);
+    const uint32_t alreadyCopied=c?edges[c-1]:0U;
+    while(c<target.chunks && edges[c]==alreadyCopied)++c;
+    if(c==target.chunks)return false;
+    const uint32_t busy=kFourthPrefixBusy|(block+1);
+    uint64_t begin=(a->prefetchCount&0x80000000U)?GetSystemCycle():0;
+    RunFourthRange<true>(a,target.row,c,c+1,target.claim,busy);
+    auto claim=edges+kClaimOffset;
+    if(ReadClaim(claim)!=busy)return false;
+    uint32_t firstMoves=edges[c];
+    ticket={target.row,target.chunks,c+1,firstMoves,target.moves};
+    // Later chunks can be empty. If all moves are complete, publish now.
+    if(firstMoves==target.moves)ticket.nextChunk=target.chunks;
+    ReleaseClaim(claim,ticket.nextChunk==ticket.chunks?block+1:(kFourthSuffixReady|ticket.nextChunk));
+    if(ticket.nextChunk==ticket.chunks)FinishFourth(a,block,batch,target.row,target.moves,begin);
+    return true;
+}
+
 // Called exactly once for a final queue after all its Posts. No waiting on
 // another owner. One successful probe executes at most one planner chunk.
 __aicore__ __attribute__((noinline)) inline bool TryBeforeCq(
@@ -137,23 +160,7 @@ __aicore__ __attribute__((noinline)) inline bool TryBeforeCq(
         target=right.remaining>left.remaining?right:left;
     }else if(workers==4)target=ProbeFourth(a,queue,true);
     else return false;
-    if(!target.moves)return false;
-    auto edges=Moves(a,target.row);
-    uint32_t c=0;
-    while(c<target.chunks && !edges[c])++c;
-    if(c==target.chunks)return false;
-    const uint32_t busy=kFourthPrefixBusy|(block+1);
-    uint64_t begin=(a->prefetchCount&0x80000000U)?GetSystemCycle():0;
-    RunFourthRange<true>(a,target.row,c,c+1,0,busy);
-    auto claim=edges+kClaimOffset;
-    if(ReadClaim(claim)!=busy)return false;
-    uint32_t firstMoves=edges[c];
-    ticket={target.row,target.chunks,c+1,firstMoves,target.moves};
-    // Later chunks can be empty. If all moves are complete, publish now.
-    if(firstMoves==target.moves)ticket.nextChunk=target.chunks;
-    ReleaseClaim(claim,ticket.nextChunk==ticket.chunks?block+1:(kFourthSuffixReady|ticket.nextChunk));
-    if(ticket.nextChunk==ticket.chunks)FinishFourth(a,block,batch,target.row,target.moves,begin);
-    return true;
+    return HelpOneChunk(a,block,batch,target,ticket);
 }
 
 __aicore__ __attribute__((noinline)) inline bool FinishAfterCq(

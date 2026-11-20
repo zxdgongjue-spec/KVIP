@@ -21,10 +21,20 @@ __aicore__ inline void Publish(__gm__ BatchFlag* flag,uint32_t count,uint32_t er
     flag->count=count; flag->error=error; flag->ready=1;
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flag),sizeof(*flag));
 }
-__aicore__ inline void PublishPlan(__gm__ Args* a,uint32_t row,uint32_t chunks,uint32_t error) {
+__aicore__ inline void ResetClaim(__gm__ Args* a,uint32_t row) {
     auto claim=Moves(a,row)+kClaimOffset;
     *claim=0;
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(claim),sizeof(*claim));
+}
+__aicore__ inline void PublishPrefix(__gm__ Args* a,uint32_t row) {
+    ResetClaim(a,row);
+    auto control=Control(a,row);
+    control->reserved[0]=1;
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(control),sizeof(*control));
+}
+__aicore__ inline void PublishPlan(__gm__ Args* a,uint32_t row,uint32_t chunks,uint32_t error,
+                                  bool prefixPublished=false) {
+    if(!prefixPublished)ResetClaim(a,row);
     Publish(Control(a,row),chunks,error);
 }
 
@@ -61,6 +71,7 @@ __aicore__ inline void RunField(__gm__ Args* a,uint32_t row,uint32_t chunks,uint
 }
 
 #include "index_team_help.h"
+#include "index_team_prefix.h"
 
 __aicore__ __attribute__((noinline)) inline void Copy(__gm__ Args* a,uint32_t block,uint32_t batch) {
     uint32_t row,lane;

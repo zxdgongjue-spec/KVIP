@@ -18,8 +18,8 @@
 #define __gm__
 #define __ubuf__
 constexpr unsigned CHUNK=512,kIndexEdgesOffset=32,kPrefetch=2048,kMaxFinal=8192,
-                   kIndexTeamMinHistory=10496,kFlagCount=16;
-struct BatchFlag {std::atomic<uint32_t> ready{0};uint32_t count{},error{};};
+                   kIndexTeamMinHistory=10496,kFlagCount=16,kBatchFlagPayloadBytes=12;
+struct BatchFlag {std::atomic<uint32_t> ready{0};uint32_t count{},error{};std::array<std::atomic<uint32_t>,29> reserved{};};
 struct Args {
     uintptr_t indexTeam,denseShadow,times,flags,context,updateBindings,keys,scales,addresses,logical;
     uint32_t history,resident,prefetchCount;
@@ -40,7 +40,8 @@ uint64_t GetSystemCycle(){static std::atomic<uint64_t> clock{1};return clock++;}
 namespace kvaf_device {void CleanCacheLines(uint8_t*,size_t){}}
 uint32_t AwaitPublication(BatchFlag* flag){
     // Inputs are always published before entry; a losing Get must never wait for the winner.
-    assert(flag->ready.load());
+    auto end=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+    while(!flag->ready.load()){assert(std::chrono::steady_clock::now()<end);std::this_thread::yield();}
     return flag->error;
 }
 enum class TPosition {VECCALC};
@@ -78,11 +79,12 @@ void SimulatedCopy(uint32_t*,uint32_t,uint32_t field,uint64_t*,uint32_t*,uint64_
     }
     if(claim)index_team::TryFourthBody(claim,block,reinterpret_cast<uint32_t*>(saved));
 }
+std::atomic<unsigned> stagesDone{};
 namespace Simt {
 struct Dim3 {unsigned x,y,z;};
 template<auto Function,class... A> void VF_CALL(Dim3,A... args){
     if constexpr(sizeof...(A)==3)Function(args...); // Actual device claim.
-    else if constexpr(sizeof...(A)==7){
+    else if constexpr(sizeof...(A)==7 || sizeof...(A)==5){
         // Run the actual fourth-field handoff with device-width barriers.
         std::barrier wave(256);
         std::vector<std::thread> threads;
@@ -90,6 +92,7 @@ template<auto Function,class... A> void VF_CALL(Dim3,A... args){
             threadIdx.x=t;waveBarrier=&wave;Function(args...);
         });
         for(auto& thread:threads)thread.join();
+        if constexpr(sizeof...(A)==5)++stagesDone;
     }else SimulatedCopy(args...);
 }
 }
@@ -221,8 +224,66 @@ int main(){
         assert(ctrl[4].ready && ctrl[4].error==0);
         for(unsigned i=0;i<width;++i)for(unsigned w=0;w<4;++w)assert(keys[16*i+12+w]==expected[i][w]);
     }
+    // The standby may read a sealed chunk while the row plan or Q4 is
+    // pending. A later chunk reads a position overwritten by the first.
+    const unsigned standby=56,home=8,peer=0;
+    auto deadline=[](const auto& check) {
+        auto end=std::chrono::steady_clock::now()+std::chrono::seconds(15);
+        while(!check()){assert(std::chrono::steady_clock::now()<end);std::this_thread::yield();}
+    };
+    for(unsigned mode=0;mode<5;++mode){
+        auto target=mode==4?home:peer;
+        for(auto& f:team){f.ready=0;f.reserved[0]=0;}
+        for(auto& f:flags)f.ready=0;
+        for(auto r:{home,peer}){
+            auto e=index_team::Moves(&a,r);
+            e[0]=2;e[1]=3;
+            const std::array<unsigned,6> srcDst{0,1,1,0,1,2};
+            std::copy(srcDst.begin(),srcDst.end(),e+kIndexEdgesOffset);
+            for(unsigned k=0;k<3;++k)for(unsigned w=0;w<16;++w)
+                keys[(uint64_t(r)*history+k)*16+w]=1000*r+100*k+w;
+        }
+        auto localKeys=[&](unsigned r,unsigned k,unsigned w){
+            return keys[(uint64_t(r)*history+k)*16+w];
+        };
+        bool terminal=false;
+        auto field=index_team::Control(&a,target);
+        stagesDone=0;
+        index_team::PublishPrefix(&a,target);
+        std::thread helper([&]{terminal=index_team::CopySealedPrefix(&a,standby,batch);});
+        deadline([&]{return stagesDone.load()==1;});
+        assert(!field[4].ready && localKeys(target,0,12)==1000*target+12);
+        // Pre-read made no GM writes. Competing post-CQ and primary helpers
+        // cannot double-claim the peer. If home becomes ready first, it can
+        // finish while its peer is still waiting on the Q4 snapshots.
+        if(mode==0){
+            index_team::PublishPlan(&a,home,2,0);
+            index_team::Publish(flags.data()+home*kFlagCount+4,0,0);
+            auto homeClaim=index_team::Moves(&a,home)+index_team::kClaimOffset;
+            deadline([&]{return index_team::ReadClaim(homeClaim)==(index_team::kFourthSuffixReady|1U);});
+            assert(localKeys(home,0,12)==1000*home+112 && !field[4].ready);
+            index_team::HelpReadyFourth(&a,57,batch,index_team::ProbeFourth(&a,home,false));
+            assert(index_team::Control(&a,home)[4].ready && localKeys(home,2,12)==1000*home+12);
+        }
+        index_team::PublishPlan(&a,target,2,mode==2?4:0,true);
+        assert(index_team::ReadClaim(index_team::Moves(&a,target)+index_team::kClaimOffset)==standby+1);
+        index_team::TailTicket race{};
+        if(mode!=4)assert(!index_team::TryBeforeCq(&a,48,batch,race));
+        index_team::Publish(flags.data()+target*kFlagCount+4,0,mode==3?8:0);
+        helper.join();
+        assert(terminal==(target==home));
+        assert(field[4].ready && field[4].error==(mode==2?4:mode==3?8:0));
+        for(unsigned k=0;k<3;++k)for(unsigned w=0;w<16;++w){
+            unsigned src=(w<12 || mode==2 || mode==3)?k:k==0?1:0;
+            assert(localKeys(target,k,w)==1000*target+100*src+w);
+        }
+        auto timeslot=times.data()+batch*256+32*standby;
+        assert(timeslot[16]<=timeslot[17] && timeslot[17]<=timeslot[18]);
+        assert(timeslot[19]==2 && timeslot[20]==target+1);
+    }
+    std::cout<<"SEALED_PREFIX_PASS pending_plan_and_Q4=1 failed_plan_and_Q4=1 "
+                "dependent_suffix=1 paired_home_progress=1 no_early_writes=1 fields_exact=1\n";
     std::cout<<"INDEX_CQ_PREFIX_PASS full_chunk=1024 suffix_owner=comm,local_index,nominal_fourth,remote_index exactly_once=true\n";
-    const unsigned home=8,standby=3*batch+home;
     auto homeControl=index_team::Control(&a,home);
     auto homeEdges=index_team::Moves(&a,home);
     auto homeSnapshot=flags.data()+home*kFlagCount+4;

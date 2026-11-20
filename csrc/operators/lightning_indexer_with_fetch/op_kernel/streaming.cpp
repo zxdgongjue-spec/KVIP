@@ -546,6 +546,9 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
  uint32_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
  if(profile)ticks[10]=GetSystemCycle();
  uint32_t total=0,error=0,seen=0;bool denseMode=false;
+#if !V9_UBMEM
+ bool prefixPublished=false;
+#endif
  auto dense=reinterpret_cast<__gm__ uint32_t*>(a->denseShadow)+uint64_t(b)*shape.history*6;
  bool prepareMetadata=(a->prefetchCount & 0x08000000U)!=0;
  auto update=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);
@@ -658,6 +661,17 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
   seen+=count;
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
   error=local.GetValue(CONTROL);if(profile)ticks[13+2*phase]=GetSystemCycle();if(phase)total+=count;
+#if !V9_UBMEM
+  if constexpr(Team){
+   // This phase has checked every position and committed its chunk edges.
+   // A dedicated non-queue AIV owns or is paired with each eligible row.
+   const uint32_t queues=4*((a->prefetchCount>>16)&0xffU);
+   if(!phase && !error && queues<shape.batch){
+    index_team::PublishPrefix(a,b);
+    prefixPublished=true;
+   }
+  }
+#endif
  }
  uint32_t chunks=seen && !disjoint?local.GetValue(CONTROL+4):0;
 #if !V9_UBMEM
@@ -665,7 +679,7 @@ __aicore__ inline void Consumer(__gm__ Args* a, uint32_t b) {
   // Free the planner's UB before allocating the field gather stage.
   pipe.Destroy();
   auto control=index_team::Control(a,b);
-  index_team::PublishPlan(a,b,chunks,error);
+  index_team::PublishPlan(a,b,chunks,error,prefixPublished);
   if(profile)ticks[22]=GetSystemCycle();
   index_team::Copy(a,GetBlockIdx(),shape.batch);
   for(uint32_t i=0;i<4;++i)error|=AwaitPublication(control+1+i);
@@ -1286,6 +1300,7 @@ inline void RetireRoundControl(__gm__ Args* a,uint32_t batch,uint32_t workers,ui
  if((a->prefetchCount & kIndexTeamOption) && a->indexTeam && block<batch && t<5){
   auto f=reinterpret_cast<__gm__ BatchFlag*>(a->indexTeam)+5*block+t;
   asc_stcg(&f->ready,0U);
+  if(!t)asc_stcg(&f->reserved[0],0U);
  }
  if(block<batch && t<kFlagCount*3){
   uint32_t word=(block*kFlagCount+t/3)*kFlagWords+t%3;
@@ -1366,7 +1381,7 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
     FetchQueryGroup(a,q,part,workers);
    }
 #if !V9_UBMEM
-   else if(team){
+   else if(team && !index_team::CopySealedPrefix(a,block,shape.batch)){
     index_team::HelpBeforeHome(a,block,shape.batch);
     index_team::Copy(a,block,shape.batch);
    }
