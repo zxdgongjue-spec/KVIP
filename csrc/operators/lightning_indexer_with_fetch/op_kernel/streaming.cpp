@@ -1366,7 +1366,10 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
     FetchQueryGroup(a,q,part,workers);
    }
 #if !V9_UBMEM
-   else if(team)index_team::Copy(a,block,shape.batch);
+   else if(team){
+    if(workers==2)index_team::HelpBeforeHome(a,block,shape.batch);
+    index_team::Copy(a,block,shape.batch);
+   }
 #endif
   }
 #if !V9_UBMEM

@@ -159,6 +159,38 @@ __aicore__ __attribute__((noinline)) inline bool FinishAfterCq(
     return true;
 }
 
+__aicore__ inline void HelpReadyFourth(__gm__ Args* a,uint32_t block,uint32_t batch,const ReadyFourth& target) {
+    if(!target.moves)return;
+    auto claim=Moves(a,target.row)+kClaimOffset;
+    uint32_t cursor=Cursor(target.claim);
+    uint64_t begin=(a->prefetchCount&0x80000000U)?GetSystemCycle():0;
+    RunFourthRange<true>(a,target.row,cursor,target.chunks,target.claim,block+1);
+    if(ReadClaim(claim)==block+1)FinishFourth(a,block,batch,target.row,target.moves,begin);
+}
+
+__aicore__ inline bool FourthInputsPublished(__gm__ Args* a,uint32_t row) {
+    auto plan=Control(a,row);
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(plan),sizeof(*plan));
+    if(!plan->ready)return false;
+    if(plan->error || !plan->count)return true;
+    auto snapshot=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+row*kFlagCount+4;
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(snapshot),sizeof(*snapshot));
+    return snapshot->ready!=0;
+}
+
+// Only the eight non-communication fourth-field owners wait here. While waiting
+// for their home row, they can start the paired queue owner's row instead.
+__aicore__ __attribute__((noinline)) inline void HelpBeforeHome(__gm__ Args* a,uint32_t block,uint32_t batch) {
+    uint32_t home=block-3*batch,peer=home-batch/2;
+    uint64_t start=GetSystemCycle();
+    while(!FourthInputsPublished(a,home) && !FourthInputsPublished(a,peer)){
+        if(GetSystemCycle()-start>5000000000ULL)return;
+    }
+    auto target=PickFourth(a,home,peer,false);
+    if(target.row==peer)HelpReadyFourth(a,block,batch,target);
+    // The caller always visits home, including empty/error rows and lost races.
+}
+
 // Called only after the owner has discharged its own queue or row duties.
 // The 48 row workers probe one candidate each immediately before retirement;
 // the other 16 can probe two. No worker waits for a remote plan or for a win.
@@ -176,10 +208,5 @@ __aicore__ __attribute__((noinline)) inline void HelpAfterLocalWork(__gm__ Args*
         const uint32_t first=lane<8?(lane+1)%batch:lane-8;
         target=PickFourth(a,first,(first+1)%batch,false);
     }
-    if(!target.moves)return;
-    auto claim=Moves(a,target.row)+kClaimOffset;
-    uint32_t cursor=Cursor(target.claim);
-    uint64_t begin=(a->prefetchCount&0x80000000U)?GetSystemCycle():0;
-    RunFourthRange<true>(a,target.row,cursor,target.chunks,target.claim,block+1);
-    if(ReadClaim(claim)==block+1)FinishFourth(a,block,batch,target.row,target.moves,begin);
+    HelpReadyFourth(a,block,batch,target);
 }

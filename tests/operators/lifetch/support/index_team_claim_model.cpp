@@ -222,5 +222,38 @@ int main(){
         for(unsigned i=0;i<width;++i)for(unsigned w=0;w<4;++w)assert(keys[16*i+12+w]==expected[i][w]);
     }
     std::cout<<"INDEX_CQ_PREFIX_PASS full_chunk=1024 suffix_owner=comm,local_index,nominal_fourth,remote_index exactly_once=true\n";
+    const unsigned home=8,standby=3*batch+home;
+    auto homeControl=index_team::Control(&a,home);
+    auto homeEdges=index_team::Moves(&a,home);
+    auto homeSnapshot=flags.data()+home*kFlagCount+4;
+    // The standby is paired with row 0. Test early peer arrival, relative
+    // workloads, a missing Q4 snapshot and the error/empty home fallback.
+    for(unsigned schedule=0;schedule<6;++schedule){
+        for(auto& flag:team)flag.ready=0;
+        snapshot->ready=0;homeSnapshot->ready=0;
+        edges[0]=2;
+        edges[kIndexEdgesOffset]=0;edges[kIndexEdgesOffset+1]=1;
+        edges[kIndexEdgesOffset+2]=1;edges[kIndexEdgesOffset+3]=0;
+        for(unsigned i=0;i<2;++i)for(unsigned w=0;w<4;++w)keys[16*i+12+w]=initial[i][w];
+        index_team::PublishPlan(&a,target,1,0);
+        if(schedule!=3)index_team::Publish(snapshot,0,0);
+        homeEdges[0]=schedule==1?1:2;
+        unsigned homeChunks=schedule==5?0:1,homeError=schedule==4?4:0;
+        index_team::PublishPlan(&a,home,homeChunks,homeError);
+        if(schedule!=0)index_team::Publish(homeSnapshot,0,0);
+        index_team::HelpBeforeHome(&a,standby,batch);
+        bool peerFirst=schedule==0 || schedule==1 || homeError || !homeChunks;
+        assert(bool(ctrl[4].ready)==peerFirst);
+        assert(!homeControl[4].ready);
+        if(peerFirst){
+            assert(edges[index_team::kClaimOffset]==standby+1);
+            for(unsigned i=0;i<2;++i)for(unsigned w=0;w<4;++w)
+                assert(keys[16*i+12+w]==initial[1-i][w]);
+        }
+        index_team::Publish(homeSnapshot,0,0);
+        index_team::Copy(&a,standby,batch);
+        assert(homeControl[4].ready && homeControl[4].error==homeError);
+    }
+    std::cout<<"INDEX_STANDBY_PAIR_PASS earlier_ready=1 larger_ready=1 ties_home=1 unpublished_q4=1 error_empty_fallback=1\n";
     std::cout<<"INDEX_TEAM_CLAIM_CPU_PASS rounds=40 forced_owners=4 simultaneous_claims=4 failed_plan_and_snapshot=1 reuse=1\n";
 }
