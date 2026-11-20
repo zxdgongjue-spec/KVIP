@@ -28,6 +28,8 @@ joint=false
 joint_local=false
 joint_archive=false
 ranked_auto=false
+index_ab=false
+fresh_control=false
 current_fixed=6bca602ad9e548e9f12c0142fea25f2bc5c6877d
 ranked_q_workers=${PEER_RANKED_Q_WORKERS:-2}
 ranked_groups=(7 2 10 4 17)
@@ -67,15 +69,19 @@ if [[ ${1:-} == --ranked-help || ${1:-} == --ranked-joint ]]; then
     elif [[ -n "$joint_reference" ]]; then
         echo '--previous requires --ranked-joint' >&2; exit 2
     fi
-elif [[ ${1:-} == --ranked-auto ]]; then
+elif [[ ${1:-} == --ranked-auto || ${1:-} == --ranked-auto-index ]]; then
     ranked_auto=true
-    ranked_groups=(2 7 10 4 17)
+    if [[ $1 == --ranked-auto-index ]]; then
+        index_ab=true
+        current_fixed=96211844163f00d2fedda95712c78aa6649980ba
+    fi
     ranked=${2:?supply full adaptive candidate commit}
     [[ $ranked =~ ^[0-9a-f]{40}$ && $ranked != "$current_fixed" ]] || { echo 'Expected the adaptive candidate SHA' >&2; exit 2; }
     ranked_groups=(2 7 10 17 4)
     help_reference="$area/help-772293d4-fecf79e510598355a1ee"
     shift 2
     if [[ ${1:-} == --reference ]]; then help_reference=${2:?supply same-node ranked reference}; shift 2; fi
+    if "$index_ab" && [[ ${1:-} == --fresh-control ]]; then fresh_control=true; shift; fi
     help_reference=$(cd "$help_reference" && pwd -P)
     if [[ $(<"$help_reference/baseline.txt") != "$ranked_sha" ||
           $(<"$help_reference/physical_npu.txt") != "$peer_physical_npu" ||
@@ -129,7 +135,7 @@ if [[ -z "$ranked" && $# -eq 2 && $1 == --reuse-serial ]]; then
         exit 1
     fi
 elif [[ $# -ne 0 ]]; then
-    echo 'Usage: peer_fused.sh --ranked-auto FULL_SHA [--reference DIR] | --ranked-joint-local FULL_SHA [--reference DIR] | --ranked-joint FULL_SHA --previous DIR [--reference DIR] | --ranked-help FULL_SHA [--reference DIR] [--resume DIR] [--anchor GROUP] | --ranked-index CANDIDATE_SHA | [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
+    echo 'Usage: peer_fused.sh --ranked-auto-index FULL_SHA [--reference DIR] [--fresh-control] | --ranked-auto FULL_SHA [--reference DIR] | --ranked-joint-local FULL_SHA [--reference DIR] | --ranked-joint FULL_SHA --previous DIR [--reference DIR] | --ranked-help FULL_SHA [--reference DIR] [--resume DIR] [--anchor GROUP] | --ranked-index CANDIDATE_SHA | [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
     exit 2
 fi
 export PATH=/usr/local/python3.12.13/bin:$PATH
@@ -140,6 +146,7 @@ if [[ -n "$help_reference" ]] || "$joint_local"; then
     host_id=$(</proc/sys/kernel/hostname)
     boot_id=$(</proc/sys/kernel/random/boot_id)
     key_parts=("$ranked" "$help_reference" "$host_id" "$boot_id" "$harness" "$peer_physical_npu")
+    if "$index_ab"; then key_parts+=("routed-index" "$fresh_control"); fi
     if "$joint"; then key_parts+=("$joint_reference"); fi
     if "$joint_archive"; then key_parts+=("joint-control" "$ranked_q_workers"); fi
     run_key=$(printf '%s\n' "${key_parts[@]}" |
@@ -201,7 +208,7 @@ if [[ -n "$ranked" || ( -n "$adaptive" && -z "$reuse" ) ]]; then
     local_baseline=true
     source "$tools/support/peer_node_prepare.sh"
     preparation=${ranked:+fused-only}
-    if "$ranked_auto"; then preparation=full; fi
+    if "$ranked_auto" && ! "$index_ab"; then preparation=full; fi
     peer_prepare_node "$root" "$baseline" "$clean" "$work" "$out" "$preparation"
 fi
 if [[ -z "$ranked" ]]; then
@@ -271,7 +278,7 @@ export PATH="$venv/bin:$PATH" PYTHON="$venv/bin/python"
 test -x "$PYTHON"
 lidu="$baseline/csrc/operators/lidu"
 export PYTHONPATH="$root/python:$kvaf/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
-if [[ -z "$ranked" ]] || "$ranked_auto"; then
+if [[ -z "$ranked" ]] || { "$ranked_auto" && ! "$index_ab"; }; then
     vendors=("$lidu"/_custom_opp/vendors/*/op_api/lib/libcust_opapi.so)
     [[ ${#vendors[@]} == 1 && -f ${vendors[0]} ]]
     export ASCEND_CUSTOM_OPP_PATH="${vendors[0]%/op_api/lib/libcust_opapi.so}${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
@@ -293,7 +300,9 @@ if [[ -n "$ranked" ]]; then
     printf 'CONFIG URMA physical_NPU=%s logical_device=0 BS16 Q4 656B ranked=%.8s candidate=%.8s KVAF=%.8s\n' "$peer_physical_npu" "$ranked_sha" "$ranked" "$transport"
     # Compile through the same cache key used by run_path. Fail before copying
     # five traces or running the baseline if the toolchain rejects either arm.
-    if "$ranked_auto"; then
+    if "$index_ab"; then
+        printf 'CONTROLS routed_control=%.8s routed_candidate=%.8s original=%.8s final_communication_cores=8\n' "$current_fixed" "$ranked" "$ranked_sha"
+    elif "$ranked_auto"; then
         printf 'CONTROLS current_fixed=%.8s original=%.8s G2_native_workers=2,32 final_communication_cores=8\n' "$current_fixed" "$ranked_sha"
     elif [[ -n "$help_reference" ]]; then
         printf 'REFERENCE root=%s original=%.8s previous=%.8s profile=4_warmup_20_calls\n' "$help_reference" "$ranked_sha" "${joint_control:-$four_field}"
@@ -352,6 +361,7 @@ run_arm() (
     monitor=$!
     level=1
     case "$label" in
+        current) mode=(--fused-only --production-root "$ranked_base" --ranked-q-workers 2 --ranked-auto-route); level=2 ;;
         fixed) mode=(--fused-only --production-root "$ranked_base" --ranked-q-workers 2); level=2 ;;
         auto) mode=(--fused-only --production-root "$ranked_candidate" --ranked-q-workers 2 --ranked-auto-route); level=2 ;;
         serial2|serial32) mode=(--serial-only --serial-workers "${label#serial}") ;;
@@ -438,6 +448,7 @@ if [[ -n "$help_reference" ]] || "$joint_local"; then
     source "$tools/support/ranked_help_run.sh"
     if "$ranked_auto"; then
         auto_order=(fixed auto)
+        if "$index_ab"; then auto_order=(current auto); fi
         for group in "${ranked_groups[@]}"; do
             case_dir="$out/g$group"
             mkdir -p "$case_dir"
@@ -450,7 +461,16 @@ if [[ -n "$help_reference" ]] || "$joint_local"; then
                 bash "$tools/peer_g2_input.sh" "$work" "$group")
             cmp -s "$case_dir/input.sha256" "$help_reference/g$group/input.sha256" || { echo "Changed G$group input" >&2; exit 1; }
             arms=("${auto_order[@]}")
-            if [[ $group == 2 ]]; then arms=(serial2 "${arms[@]}" serial32); fi
+            if "$index_ab"; then
+                report="$tools/support/ranked_index_report.py"
+                archive_args=()
+                if "$fresh_control"; then archive_args+=(--fresh-control); fi
+                "$PYTHON" -B "$report" "$out" --reference "$help_reference" --group "$group" --choose-control "${archive_args[@]}"
+                if [[ -s "$case_dir/reuse-auto.txt" ]]; then arms=(auto); fi
+            else
+                report="$tools/support/ranked_auto_report.py"
+                if [[ $group == 2 ]]; then arms=(serial2 "${arms[@]}" serial32); fi
+            fi
             for arm in "${arms[@]}"; do
                 if [[ ! -f "$case_dir/$arm/pass" ]]; then
                     if [[ -e "$case_dir/$arm" ]]; then
@@ -461,7 +481,7 @@ if [[ -n "$help_reference" ]] || "$joint_local"; then
                     touch "$case_dir/$arm/pass"
                 fi
             done
-            "$PYTHON" -B "$tools/support/ranked_auto_report.py" "$out" --reference "$help_reference" --group "$group" >"$case_dir/summary.tmp"
+            "$PYTHON" -B "$report" "$out" --reference "$help_reference" --group "$group" >"$case_dir/summary.tmp"
             mv "$case_dir/summary.tmp" "$case_dir/summary.txt"
             cat "$case_dir/summary.txt"
             auto_order=("${auto_order[1]}" "${auto_order[0]}")
