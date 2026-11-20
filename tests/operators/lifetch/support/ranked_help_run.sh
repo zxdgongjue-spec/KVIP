@@ -2,13 +2,18 @@
 # Called by peer_fused.sh after preparing the URMA runtime and its build cache.
 
 ranked_reference_case() {
-    "$PYTHON" -B - "$help_reference" "$1" <<'PY'
+    "$PYTHON" -B - "$help_reference" "$1" "$joint_reference" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 root, group = Path(sys.argv[1]), int(sys.argv[2])
 case = root / f'g{group}'
+if sys.argv[3]:
+    prior = json.loads((Path(sys.argv[3])/f'g{group}/comparison.json').read_text())
+    if (prior['group'] != group or prior['arms']['flexible']['revision'] != '56dcd74a1450db75ab3133ebf71a3b356e8b2928'
+            or prior['arms']['original']['revision'] != (root/'baseline.txt').read_text().strip()):
+        raise ValueError(f'Wrong previous comparison for G{group}')
 for label in ('baseline', 'candidate'):
     arm = case / label
     result, = (arm / 'results').glob('**/fused/path_result.json')
@@ -32,14 +37,15 @@ ranked_arm_complete() {
     local case_dir="$out/g$group"
     [[ -s "$case_dir/$label/thp.json" ]] || return 1
     PYTHONPATH="$tools/support${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" -B - \
-        "$case_dir" "$label" "$revision" "$group" "$out/$source_name.binary.sha256" <<'PY'
+        "$case_dir" "$label" "$revision" "$group" "$out/$source_name.binary.sha256" "$joint" <<'PY'
 import sys
 from pathlib import Path
 from ranked_help_report import load
 
-case, label, revision, group, binary = sys.argv[1:]
+case, label, revision, group, binary, joint = sys.argv[1:]
+abi = 'joint' if joint == 'true' else ('fixed' if label == 'anchor' else 'flexible')
 try:
-    arm = load(Path(case).parent, int(group), label, revision, 'fixed' if label == 'anchor' else 'flexible')
+    arm = load(Path(case).parent, int(group), label, revision, abi)
     cfg = arm['config']
     if (arm['binary'] != Path(binary).read_text().strip() or cfg['group'] != int(group)
             or (cfg['warmup'], cfg['iterations']) != (4, 20)):
@@ -106,8 +112,13 @@ ranked_help_groups() {
                 ranked_arm_complete "$group" "$arm" "$revision"
             done
         fi
-        "$PYTHON" -B "$tools/support/ranked_help_report.py" "$out" \
-            --reference "$help_reference" --group "$group" | tee "$case_dir/summary.txt"
+        if "$joint"; then
+            "$PYTHON" -B "$tools/support/ranked_joint_report.py" "$out" --reference "$help_reference" \
+                --previous "$joint_reference" --group "$group" | tee "$case_dir/summary.txt"
+        else
+            "$PYTHON" -B "$tools/support/ranked_help_report.py" "$out" \
+                --reference "$help_reference" --group "$group" | tee "$case_dir/summary.txt"
+        fi
         summaries+=("$case_dir/summary.txt")
         cat "${summaries[@]}" >"$out/summary.tmp"
         mv "$out/summary.tmp" "$out/summary.txt"

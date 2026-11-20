@@ -18,17 +18,21 @@ ranked=
 ranked_sha=1d2486a76151ae37662c47aab835d06df50be866
 adaptive=
 help_reference=
+joint_reference=
+joint=false
 resume=
 anchor=
 has_anchor=false
 four_field=5072f2c907f0fbd3bf1c1fbe499dd979c8c1dfca
-if [[ ${1:-} == --ranked-help ]]; then
+if [[ ${1:-} == --ranked-help || ${1:-} == --ranked-joint ]]; then
+    if [[ $1 == --ranked-joint ]]; then joint=true; fi
     ranked=${2:?supply full helper candidate revision}
     [[ $ranked =~ ^[0-9a-f]{40}$ && $ranked != "$four_field" ]] || { echo 'Expected the full helper candidate SHA' >&2; exit 2; }
     help_reference="$area/fused.rs7TG7"
     shift 2
     while (( $# )); do
         case "$1" in
+            --previous) joint_reference=${2:?supply the completed 56dcd74a reference root} ;;
             --reference) help_reference=${2:?supply a completed ranked reference root} ;;
             --resume) resume=${2:?supply the helper run root} ;;
             --anchor) anchor=${2:?supply group number}
@@ -43,6 +47,15 @@ if [[ ${1:-} == --ranked-help ]]; then
         exit 1
     fi
     help_reference=$(cd "$help_reference" && pwd -P)
+    if "$joint"; then
+        [[ -n "$joint_reference" && -z "$anchor" ]] || { echo '--ranked-joint requires --previous DIR and uses archived controls' >&2; exit 2; }
+        joint_reference=$(cd "$joint_reference" && pwd -P)
+        for g in 2 7 10 17 4; do
+            test -s "$joint_reference/g$g/comparison.json" || { echo "Missing previous G$g result in $joint_reference" >&2; exit 1; }
+        done
+    elif [[ -n "$joint_reference" ]]; then
+        echo '--previous requires --ranked-joint' >&2; exit 2
+    fi
 elif [[ ${1:-} == --ranked-index ]]; then
     ranked=${2:?supply candidate commit}
     shift 2
@@ -61,7 +74,7 @@ if [[ -z "$ranked" && $# -eq 2 && $1 == --reuse-serial ]]; then
         exit 1
     fi
 elif [[ $# -ne 0 ]]; then
-    echo 'Usage: peer_fused.sh --ranked-help FULL_SHA [--reference DIR] [--resume DIR] [--anchor GROUP] | --ranked-index CANDIDATE_SHA | [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
+    echo 'Usage: peer_fused.sh --ranked-joint FULL_SHA --previous DIR [--reference DIR] | --ranked-help FULL_SHA [--reference DIR] [--resume DIR] [--anchor GROUP] | --ranked-index CANDIDATE_SHA | [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
     exit 2
 fi
 export PATH=/usr/local/python3.12.13/bin:$PATH
@@ -71,7 +84,9 @@ if [[ -n "$help_reference" ]]; then
     harness=$(git -C "$root" rev-parse HEAD)
     host_id=$(</proc/sys/kernel/hostname)
     boot_id=$(</proc/sys/kernel/random/boot_id)
-    run_key=$(printf '%s\n' "$ranked" "$help_reference" "$host_id" "$boot_id" "$harness" |
+    key_parts=("$ranked" "$help_reference" "$host_id" "$boot_id" "$harness")
+    if "$joint"; then key_parts+=("$joint_reference"); fi
+    run_key=$(printf '%s\n' "${key_parts[@]}" |
         python3 -B -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:20])')
     if [[ -n "$resume" ]]; then
         out=$(cd "$resume" && pwd -P)
@@ -94,6 +109,7 @@ except BlockingIOError:
 LOCK
     printf '%s\n' "$run_key" >"$out/run.key"
     printf '%s\n' "$help_reference" >"$out/reference.txt"
+    if "$joint"; then printf '%s\n' "$joint_reference" >"$out/previous.txt"; fi
     printf '%s\n' "$harness" >"$out/harness.txt"
     printf '%s\n' "$host_id" >"$out/host.txt"
     if [[ -n "$anchor" ]]; then
@@ -134,7 +150,7 @@ fi
 if [[ -n "$ranked" ]]; then
     if [[ -n "$help_reference" ]]; then
         if ! git -C "$root" cat-file -e "$ranked^{commit}" 2>/dev/null; then
-            git -C "$root" fetch -q origin perf/ranked-index-help4
+            if "$joint"; then git -C "$root" fetch -q origin perf/ranked-index-post-tail; else git -C "$root" fetch -q origin perf/ranked-index-help4; fi
         fi
         git -C "$root" merge-base --is-ancestor "$four_field" "$ranked"
         ranked_base="$src/ranked-${four_field:0:8}"

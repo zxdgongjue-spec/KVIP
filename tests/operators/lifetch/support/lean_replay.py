@@ -134,7 +134,7 @@ def stage_report(states, profile, samples, mhz, policy, directory):
         if getattr(state, 'verify_ranked_events', False):
             from correctness import topk_fingerprint
             trailer = b*256 + 64*32
-            flexible = raw.size == trailer + 64*8 and raw[trailer] == 0x49445835
+            flexible = raw.size == trailer + 64*8 and raw[trailer] in (0x49445835, 0x49445836)
             ids = state.update.logical_output.cpu().numpy().reshape(b, 4, 2048)
             diagnostic_fingerprints.append(topk_fingerprint(ids))
         rotating = state.rotating

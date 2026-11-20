@@ -14,6 +14,7 @@ from peer_candidate import RANKED_BASE
 
 MAGIC = 0x49445834
 FLEXIBLE_MAGIC = 0x49445835
+JOINT_MAGIC = 0x49445836
 GROUPS = (2, 7, 10, 17, 4)
 
 
@@ -71,18 +72,29 @@ def verify_swaps(start_layout, layout, initial_valid, valid, source, dest, count
         raise ValueError('Committed hot-valid bitmap differs from actual promotions and evictions')
 
 
-def team_fields(stamp, *, flexible):
+def team_fields(stamp, *, flexible, joint=False):
     """Validate logical ownership and return [call,row,field] vectors for each trace word."""
     n = len(stamp)
     row = np.array([block//3 if block < 48 else block-48 for block in range(64)])
     field = np.array([block%3 if block < 48 else 3 for block in range(64)])
-    if stamp.shape != (n, 64, 8) or np.any(stamp[..., 0] != (FLEXIBLE_MAGIC if flexible else MAGIC)):
+    magic = JOINT_MAGIC if joint else (FLEXIBLE_MAGIC if flexible else MAGIC)
+    if stamp.shape != (n, 64, 8) or np.any(stamp[..., 0] != magic):
         raise ValueError('Unexpected Index field trace format')
     packed = stamp[..., 2]
     physical = np.arange(64)
-    if flexible:
+    if flexible or joint:
         owner = packed >> 32
         legal_fourth = (owner == 3*row) | (owner == 3*row+1) | (owner == 3*row+2) | (owner == physical)
+        if joint:
+            # A completed field may belong to its original row, an idle
+            # neighbour, or the final Get lane that ran its bounded prefix.
+            lane = owner - 48
+            near = np.where(lane < 8, lane + 1, lane - 8)
+            queue_row = 4*(lane//2) + lane%2
+            remote = np.where(owner < 48, row == (owner//3+1+5*(owner%3))%16,
+                              (row == near%16) | (row == (near+1)%16)
+                              | ((lane < 8) & ((row == queue_row) | (row == queue_row+2))))
+            legal_fourth |= (owner >= 0) & (owner < 64) & remote
         if (np.any(stamp[..., 1] != row) or np.any((packed & 0xffffffff) != field)
                 or np.any(np.where(field == 3, ~legal_fourth, owner != physical))):
             raise ValueError('Invalid Index row, field, or physical owner')
@@ -104,7 +116,7 @@ def team_fields(stamp, *, flexible):
     return rows(owner), count, begin, work, end
 
 
-def diagnostic_intervals(raw, detail, *, candidate, flexible=False):
+def diagnostic_intervals(raw, detail, *, candidate, flexible=False, joint=False):
     """Eligible intervals from an auxiliary replay. Roles overlap in device time."""
     clock = float(raw['cycles_per_us'])
     ticks = raw['times']
@@ -154,7 +166,7 @@ def diagnostic_intervals(raw, detail, *, candidate, flexible=False):
               'five_phase_probed_total_rows': (ig['n'], ig['eligible'])}
     if candidate:
         stamp = ticks[:, trailer:].reshape(n, 64, 8)
-        owner, count, begin, work, end = team_fields(stamp, flexible=flexible)
+        owner, count, begin, work, end = team_fields(stamp, flexible=flexible, joint=joint)
         active = count > 0
         counts = active.sum(axis=(1, 2))
         if not np.all(counts):
@@ -214,7 +226,7 @@ def load_arm(case_dir, label, revision, *, field_abi=None):
         if field_abi is None:
             field_abi = 'fixed' if label == 'candidate' else 'original'
         phases, index = diagnostic_intervals(raw, d, candidate=field_abi != 'original',
-                                             flexible=field_abi == 'flexible')
+                                             flexible=field_abi == 'flexible', joint=field_abi == 'joint')
     return dict(config=config, inputs=inputs, placement=thp, timing=timing, kernel=kernel,
                 phases=phases, index=index, traffic=d['traffic'], windows=d['window_stages'],
                 digests=result['topk_set_digests'], binary=result['binary_sha256'], folder=folder,

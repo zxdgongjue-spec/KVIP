@@ -70,7 +70,7 @@ def tail_endpoints(raw, abi):
         return result
 
     stamp = ticks[:, BATCH*256+64*32:].reshape(n, 64, 8)
-    owner, count, arrival, work, end = team_fields(stamp, flexible=abi == 'flexible')
+    owner, count, arrival, work, end = team_fields(stamp, flexible=abi == 'flexible', joint=abi == 'joint')
     active = count[..., 0] > 0
     last_field = end.max(axis=2)
     owner_counts = Counter()
@@ -113,7 +113,7 @@ def tail_endpoints(raw, abi):
                                 fourth_owners=dict(Counter(int(v) for v in owner[:, r, 3])),
                                 fourth_finish_minus_last_primary_us=distribution((end[:, r, 3]-end[:, r, :3].max(axis=1))[active[:, r]]/clock))
                            for r in range(BATCH)])
-    if abi == 'flexible':
+    if abi in ('flexible', 'joint'):
         plan, joined = u[..., 22], u[..., 23]
         if np.any(plan <= 0) or np.any(joined < plan) or np.any(idx < joined):
             raise ValueError('Incomplete planner publication/join stamps')
@@ -139,7 +139,7 @@ def load(root, group, label, revision, abi):
     digests = arm['digests']
     aux = arm['detail'].get('diagnostic_topk_set_digests', [])
     if (len(digests) != len(arm['samples']) or any(not re.fullmatch('[a-f0-9]{64}', d) for d in digests+aux)
-            or (aux and len(aux) != len(digests)) or (abi == 'flexible' and len(aux) != len(digests))):
+            or (aux and len(aux) != len(digests)) or (abi in ('flexible', 'joint') and len(aux) != len(digests))):
         raise ValueError(f'{label}: incomplete TopK fingerprint coverage')
     if arm['config']['group'] != group or arm['detail']['diagnostic_graph_calls'] != len(digests):
         raise ValueError(f'{label}: wrong group or incomplete auxiliary replay')
