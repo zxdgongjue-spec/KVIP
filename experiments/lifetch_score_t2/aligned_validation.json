@@ -1,0 +1,156 @@
+{
+  "status": "LOCAL_CONTRACT_PASS_A5_NOT_RUN",
+  "implementation_commit": "2af049bcef8a1f9418b494fc5670e92d55f059a2",
+  "cpu_tests": {
+    "experiment": 26,
+    "build_recovery": 3,
+    "status": "PASS"
+  },
+  "npu": {
+    "status": "COMPILE_LINK_SYMBOL_PASS",
+    "compiled_soc": "Ascend950PR_9599",
+    "cann": "9.1.0",
+    "bridge_sha256": "a7a94d728b3b966af3ec95835d842928aab584e54558e37b67c4dee9ef3bc5c7",
+    "build_log_sha256": "b43980cba10e6fcbedec57e2edd4784c907ea875a70403e73e44a2fb405a749c",
+    "symbols": [
+      "kvip_lifetch_score_aligned_forward",
+      "aclrtlaunch_v9_li_full_topk",
+      "aclrtlaunch_v9_li_kernel_score_aligned"
+    ]
+  },
+  "model_scope": "Numerical/state contracts only; no completed URMA Fetch or A5 full-chain timing. TopK B2/B4 H32768/R16384; real FP8 producer B2/P2 H8192/R2048.",
+  "model": [
+    {
+      "route": "numeric",
+      "H": 32768,
+      "R": 16384,
+      "selected": 16384,
+      "hash": 17245255230732273261,
+      "work_span_cycles": 1704,
+      "guards": "true",
+      "no_service": "true",
+      "batch": 2,
+      "log": "experiments/lifetch_score_t2/evidence/aligned_li/b2-numeric.log",
+      "sha256": "bf5f1e450302824ee61f2997d36b8b446156be1321319806e03b60ef715bb099"
+    },
+    {
+      "route": "classify",
+      "H": 32768,
+      "R": 16384,
+      "selected": 16384,
+      "hash": 17245255230732273261,
+      "work_span_cycles": 25794,
+      "guards": "true",
+      "no_service": "true",
+      "batch": 2,
+      "log": "experiments/lifetch_score_t2/evidence/aligned_li/b2-classify.log",
+      "sha256": "400dd0defeadff4e3350150231531412d1df7ee5e706fbb11ec2e5e3ce74cbe8"
+    },
+    {
+      "route": "classify",
+      "H": 32768,
+      "R": 16384,
+      "selected": 32768,
+      "hash": 11864487151976117887,
+      "work_span_cycles": 25757,
+      "guards": "true",
+      "no_service": "true",
+      "batch": 4,
+      "log": "experiments/lifetch_score_t2/evidence/aligned_li/b4-classify.log",
+      "sha256": "b8aefadb9434746147d4d379a98e8fcdd7c9d21195701bd2a666f2f6b277b01b"
+    },
+    {
+      "route": "score",
+      "H": 8192,
+      "R": 2048,
+      "parts": 2,
+      "selected": 16384,
+      "hash": 3006529230523652995,
+      "work_span_cycles": 12159,
+      "guards": "true",
+      "no_service": "true",
+      "batch": 2,
+      "log": "experiments/lifetch_score_t2/evidence/aligned_li/b2-score-p2.log",
+      "sha256": "438a900feb2c78eb7e19bd6a374ec6f8277a904e5dc98d91eeb6fad835ff10ed"
+    }
+  ],
+  "source_hashes": {
+    "csrc/operators/lightning_indexer_with_fetch/CMakeLists.txt": "73416f2e178c1baa031d0ceff43a2a041c576715fe8d8219b75bed8dc711cb95",
+    "csrc/operators/lightning_indexer_with_fetch/op_host/launch.cpp": "37a76ae75fe0f8df6076c3849c5b686d1cf01405a2609a785ac843e1497a3484",
+    "csrc/operators/lightning_indexer_with_fetch/include/context.h": "44e3c67b3f691a6e70a8095ebe91be332932dcf97dd5d0914616113cae8f9db7",
+    "csrc/operators/lightning_indexer_with_fetch/include/api.h": "8d155c477c4b9dd7d09a2dc331e552949a892ef870a5adf80b20787a33dd1589",
+    "csrc/operators/lightning_indexer_with_fetch/include/runtime_shape.h": "cdf09fc43d38ea4e370d253af0f914b493e19a485de83c5426f78c35f600289e",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer.cpp": "2f83f0572a1d05ac3aafac03949d397a7bceac4d1a70fba1b7f5262269c7c6ab",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/prefetch.h": "afce0bc4468faceebed5056a4f7734e1eff79081e55de63ffd3cfc2600e61d8d",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/staged_fetch_worker.h": "d5c2a2c34ea0ce17560b2c0ac584189d5ab602d6dc331d34c8fdca4441988ef7",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/index_cache_update.h": "09988d22fbc9014abbac90377176dd957fada97910b9973c3735eb69d833faf1",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/compact_parallel.h": "b2ac1c1a6c049a0c7a065459e54ba85128df1c7f4e083c946e8194b935449262",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/joined_final.h": "dac1a50d4318486861f00b5987a323586a8a59e524e1da1210c30bea4f87220b",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/output_worker.h": "f57be291977a6219f6d451ca5b1ab80fcc29acc70b27fe501bc2ace8ea0e33f9",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/staged_topk_classify.h": "fe5f2e399e4fb5ce706805d23d1470a54ac121f933ae84640088f24723b2d8e6",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/compact_misses.h": "9bb71167f4321f5b5e9e17d7d18c90b10def9781c3f5d1dadb8afde57717a616",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/lifecycle.cpp": "e2674dbec3291364fe0b73209c77997779a332ffefe28a7c9c300da0b8dce4b8",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/pipeline_types.h": "fa4414313e44e0ad39f422b188fc919aad8558999167f7e9bd1e8bce5d631cc0",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/staged_outputs.h": "6fadceef181e9991d27f0a378a1fec5aa4f868a87bab3b33e94d13e2c11d2ae2",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/streaming.cpp": "5430e871f5a3666915f628e47a2f6c7bc407e7949c678b1a876ef393a341e666",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/resolver.h": "f5a8b6db69baa0a554a0efc9a128df73600f82f1c48ac0ddeca1f14302f04708",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/shadow_exchange_parallel.h": "828d5ba92298b86c9525806f44bdc03aabe9efbcbeb791ebb1c05deddba4045a",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/round_prepare.h": "e217d69c52978cce6032db93327dae7c99e7a892c807b307ce4b8561f8b1934f",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/staged_urma_pack.h": "56874fdb4f4b2416f5537a052ebed00ca62a7731e158634919a697c84fb5676e",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/staged_ubmem_fetch.h": "f50b5cbda9daa8c1333a51c4265086d0409a47bd13fc3ec4acdd989fc7dda942",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/score_window_service.cpp": "16985afe03af911dcf298da878c7914b803abc2ea95883d6b08a4c9b3ff7c906",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/resolver_staged_dma2.h": "84f7b8ba230cc8adcea63884fe5a8b5b7d813261f954d646413356f87989d470",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/topk.h": "82367d9610dec3ac2e4659dd621823674ca3cab2437b374e8dd96d7c549251ab",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/incremental_vector_helpers.h": "5cbab2bcda2e0fef83fb0d08fb1058d9ccb05aa0927cd4a461dbbb05880b3a11",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/ranked_candidates.h": "ca6ff500ad115e1bfce0857359670bdd33eb85dd76c905b6e15dee20d53d5c94",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_cube.h": "c1099639246aa4d05930979448ff9bc5a5b067eaa78651dc8332d3c28f3ba472",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_types.h": "ddaed16345a6c9a587ada4ccd56bf7c8a995615db006409f086f4fc4032e03ae",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_score.h": "ad19e55905b9a61fc905be58997ec38db3d1038933842141650085f64d0cc665",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_vector.h": "62dd0c6009314162ae41e6a35a6d6fc8cb4f475c6f95d1df20202d16a99b74a5",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/topk_common.h": "2c02a2a0b06bec14bca760c8fc912cce837d59ce198c449988e81e889d10860d",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer.h": "6e1ba1a2f3ddd7c22f5048792d7e952b63ce43872e2566dc370de9a9cd56a72f",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/recent_seed.h": "16a6278ae2de3d685717e769608cb52219624a90ed744315f2e44c03f9517202",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/rank_threshold.h": "ce587c063c2b594e2310cb5ea245e3d674e7eadff49e908a652733d42d13749a",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/li_types.h": "3bcfe5694f3b83eae8ead1a43bd6e45c059c47da8654a3f9086562ef5a931e96",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/window_fast_vector.h": "09ea46d22028210b68cf17c493681de1e9270cb4753697249728b1d0375f3769",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/incremental_methods.h": "71b2a8894f696ad3cb1355834e26dbd45aa9957926a5742fb719a37c110513f7",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/coverage_rank.h": "8e4d4071b5f321f32bcea344a9e16db107ccb0c3bcf3876f76e6629a50f1f12a",
+    "csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/score_common.h": "a7804b5f5de6155f8a129c79b832062b199383831e7d242c9fe807f629c9ad99",
+    "csrc/operators/common/lifetch/prefetch_budget.h": "f79e5c0b0c4f267f70d2e232cff6320045a3737ad2305beeeadd36fe4e141339",
+    "csrc/operators/common/lifetch/sequence_schedule.h": "c50591c24c91f6d7ee61c067472bc731f8a86e83d83660516a7f1d416fc77292",
+    "csrc/operators/common/lifetch/final_post.h": "82e77605e626139e70d6af67fbb369ff89f2e5a08eea13460996975fc7e70eb8",
+    "csrc/operators/common/lifetch/li_launch.h": "a72bf9a771a00fb996589e6cf50c714bc14b2962ce155c54ceaa67bda0231093",
+    "csrc/operators/common/lifetch/incremental_compact.h": "affc5f43bbac2fbf1d1dbf1f7f0a82e891b40d5582e0ce3e051c7594154ee88e",
+    "csrc/operators/common/lifetch/score_window_plan.h": "12aa7c1c6a8df2c3b24ef2e2d215bb4686aeea6b41dd2d4908d03700667d3594",
+    "csrc/operators/common/lifetch/sequence_candidates.h": "771415e2f08bd064f4bbde08e5f163365daab850a27c52ae3f2c9bb410adb740",
+    "csrc/operators/common/lifetch/victim_ops.h": "37f217e32a8521e84d7a68ccfa0255181e47a0eb3732ab8254bdbc21ada8cd50",
+    "csrc/operators/common/lifetch/staged_post.h": "671d0f64a3b3465ee397ecf81527608d1180b5d1299a18b863be0fbdf30c76ec",
+    "csrc/operators/common/lifetch/cache_metadata.h": "cf12e14ace38445480f88b023c9ced41c62ea35438a5856e0146c74867b85958",
+    "csrc/operators/common/lifetch/window_candidates.h": "3ca52d8eede0ac2e731492d7579f37f01d72414fd49205368f4920d2ca2858b3",
+    "csrc/operators/common/lifetch/score_partition.h": "c81608c7eaaeaee48cd6c9a4e9e8551ac172c1893165079f892d66454166acfb"
+  },
+  "a5": {
+    "status": "NOT_RUN",
+    "command": "bash experiments/lifetch_score_t2/run_aligned_a5.sh --device 5 --kvaf-root /home/w00568585/KVAF-score-t2-1c131038 --kvaf-server 127.0.0.1:28885 --batches 1,2,4,8,16 --miss-percent 0,3,5,10,15,20 --rounds 3 --warmup 4 --iterations 20"
+  },
+  "model_resource_limits": {
+    "b2_p16": "NOT_VALIDATED: Model exceeded Docker VM memory budget; exited 137, no numerical PASS",
+    "b2_p2": "PASS on the same actual producer; A5 defaults unchanged",
+    "attempts": [
+      {
+        "log": "output/lifetch-score-t2/aligned-score-b2.log",
+        "sha256": "9a33f8f7c25ba49c6866e75e6aaa7dc99e8e64e5074d92e611a25ca5282908de",
+        "exit_code": 137
+      },
+      {
+        "log": "output/lifetch-score-t2/aligned-score-b2-02.log",
+        "sha256": "c942eff1f010f57a908fe7c64eb679233ff55f4add5631147e7632150cddf69a",
+        "exit_code": 137
+      }
+    ]
+  },
+  "model_binaries": {
+    "topk_sha256": "17e63961a887cb570c1cbf0a4d6d6df51bfa04846472128a3f692eb090f20e6b",
+    "score_sha256": "61d975af366e9c8c0551e92b362a8e26f802b0497a5ae3b17572c07480028a07"
+  }
+}

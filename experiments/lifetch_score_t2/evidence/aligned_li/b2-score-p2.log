@@ -1,0 +1,256 @@
+[DRVSTUB_LOG] driver_api.c:2393 halGetSocVersion:halGetSocVersion len:50 soc_version:Ascend950PR_9589
+[DRVSTUB_LOG] driver_api.c:2393 halGetSocVersion:halGetSocVersion len:50 soc_version:Ascend950PR_9589
+soc version: Ascend950PR
+[camodel_config] Using config from SO dir: /usr/local/Ascend/cann/tools/simulator/Ascend950PR_9599/camodel/camodel_v100.json
+[camodel_config] Alias: sysconf -> soc_mp.cfg
+[camodel_config] Loaded config from: /usr/local/Ascend/cann/tools/simulator/Ascend950PR_9599/camodel/camodel_v100.json (1 sections)
+[camodel_config] Override esl_top_thread_cnt = 32 (in soc_mp.cfg)
+chip type: 0 
+core count: 8
+thread count: 4
+rankId: 0 chipNum: 1
+rankId: 1 chipNum: 1
+rankId: 0 chipId Base: 0
+rankId: 1 chipId Base: 1
+rankId: 0 threadNum: 10
+rankId: 1 threadNum: 10
+DDR load checkpoint start, please specify the "DDR_offset_addr", "DDR_CheckPoint_Raw" and "DDR_CheckPoint_Guide"  in confgiuration file: 0xaaab7749b4e0
+ DIE0 HA TOP: 0xaaab0ae04710
+== Loading public model file './parameter/public.ini' ==
+== Loading system model file './parameter/bailusystem.ini' ==
+== Loading device model file './parameter/lpddr5_6400M_bailu.ini' ==
+== lpddr5 1900 Mbps, 1 Channels, 1 Ranks, Gbuf false, IECC false ==
+[CORE_WRAPPER] [INFO] [0000000000] init_new_core_cfg (268):: CoreWrapper [DvcCore0] init, mode=CA, core ver=5, config file=./etc/1982_cloud_config.toml
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore0] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore1] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore2] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore3] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore4] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore5] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore6] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore7] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore8] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore9] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore10] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore11] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore12] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore13] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore14] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore15] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+Module STARS_ChiWrapper_0_0_SCHE_Chn0 allocate thread Id : 0
+CONFIG STARS SIM_CFG: 1981_sim_ffts_plus.toml
+CONFIG STARS LOG_PATH: ./log_ca
+[INFO] [0000000000] sim_cfg: 1981_sim_ffts_plus.toml
+[INFO] [0000000000] model_cfg: 1981_model.toml
+[INFO] [0000000000] stars_cfg: 1981_stars_ffts_plus.toml
+[INFO] [0000000000] ffts_cfg: 1981_ffts.toml
+[TmSim]: Run in parallel esl_sim mode, concurrency num is: 32
+[TmSim]: Top module clk0 is assigned to thread 0
+[TmSim]: Top module core0 is assigned to thread 0
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore0] build, esl_idx=0, log_path=./log_ca
+[TmSim]: Top module clk1 is assigned to thread 1
+[TmSim]: Top module core1 is assigned to thread 1
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore1] build, esl_idx=1, log_path=./log_ca
+[TmSim]: Top module clk2 is assigned to thread 2
+[TmSim]: Top module core2 is assigned to thread 2
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore2] build, esl_idx=2, log_path=./log_ca
+[TmSim]: Top module clk3 is assigned to thread 3
+[TmSim]: Top module core3 is assigned to thread 3
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore3] build, esl_idx=3, log_path=./log_ca
+[TmSim]: Top module clk4 is assigned to thread 4
+[TmSim]: Top module core4 is assigned to thread 4
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore4] build, esl_idx=4, log_path=./log_ca
+[TmSim]: Top module clk5 is assigned to thread 5
+[TmSim]: Top module core5 is assigned to thread 5
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore5] build, esl_idx=5, log_path=./log_ca
+[TmSim]: Top module clk6 is assigned to thread 6
+[TmSim]: Top module core6 is assigned to thread 6
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore6] build, esl_idx=6, log_path=./log_ca
+[TmSim]: Top module clk7 is assigned to thread 7
+[TmSim]: Top module core7 is assigned to thread 7
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore7] build, esl_idx=7, log_path=./log_ca
+[TmSim]: Top module clk8 is assigned to thread 8
+[TmSim]: Top module core8 is assigned to thread 8
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore8] build, esl_idx=8, log_path=./log_ca
+[TmSim]: Top module clk9 is assigned to thread 9
+[TmSim]: Top module core9 is assigned to thread 9
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore9] build, esl_idx=9, log_path=./log_ca
+[TmSim]: Top module clk10 is assigned to thread 10
+[TmSim]: Top module core10 is assigned to thread 10
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore10] build, esl_idx=10, log_path=./log_ca
+[TmSim]: Top module clk11 is assigned to thread 11
+[TmSim]: Top module core11 is assigned to thread 11
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore11] build, esl_idx=11, log_path=./log_ca
+[TmSim]: Top module clk12 is assigned to thread 12
+[TmSim]: Top module core12 is assigned to thread 12
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore12] build, esl_idx=12, log_path=./log_ca
+[TmSim]: Top module clk13 is assigned to thread 13
+[TmSim]: Top module core13 is assigned to thread 13
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore13] build, esl_idx=13, log_path=./log_ca
+[TmSim]: Top module clk14 is assigned to thread 14
+[TmSim]: Top module core14 is assigned to thread 14
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore14] build, esl_idx=14, log_path=./log_ca
+[TmSim]: Top module clk15 is assigned to thread 15
+[TmSim]: Top module core15 is assigned to thread 15
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore15] build, esl_idx=15, log_path=./log_ca
+Start to build SMMU Page !
+SMMU Page build finished!
+Start simulation with m_socCycle: 0
+SoC unit rank0_chip0_die0 Created
+DDR load checkpoint start, please specify the "DDR_offset_addr", "DDR_CheckPoint_Raw" and "DDR_CheckPoint_Guide"  in confgiuration file: 0xaaac276097f0
+ DIE1 HA TOP: 0xaaabbaf71940
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore16] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore17] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore18] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore19] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore20] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore21] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore22] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore23] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore24] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore25] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore26] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore27] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore28] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore29] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore30] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+[CORE_WRAPPER] [INFO] [0000000000]         init (113):: CoreWrapper [DvcCore31] init, cube_subcore=1, vec_subccore=2, eff_cube_subcore=0, ref_period=0.40, self_period=0.61, debug_flags=1
+Module STARS_ChiWrapper_0_1_SCHE_Chn0 allocate thread Id : 1
+CONFIG STARS SIM_CFG: 1981_sim_ffts_plus.toml
+CONFIG STARS LOG_PATH: ./log_ca
+[TmSim]: Top module clk16 is assigned to thread 16
+[TmSim]: Top module core16 is assigned to thread 16
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore16] build, esl_idx=17, log_path=./log_ca
+[TmSim]: Top module clk17 is assigned to thread 17
+[TmSim]: Top module core17 is assigned to thread 17
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore17] build, esl_idx=18, log_path=./log_ca
+[TmSim]: Top module clk18 is assigned to thread 18
+[TmSim]: Top module core18 is assigned to thread 18
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore18] build, esl_idx=19, log_path=./log_ca
+[TmSim]: Top module clk19 is assigned to thread 19
+[TmSim]: Top module core19 is assigned to thread 19
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore19] build, esl_idx=20, log_path=./log_ca
+[TmSim]: Top module clk20 is assigned to thread 20
+[TmSim]: Top module core20 is assigned to thread 20
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore20] build, esl_idx=21, log_path=./log_ca
+[TmSim]: Top module clk21 is assigned to thread 21
+[TmSim]: Top module core21 is assigned to thread 21
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore21] build, esl_idx=22, log_path=./log_ca
+[TmSim]: Top module clk22 is assigned to thread 22
+[TmSim]: Top module core22 is assigned to thread 22
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore22] build, esl_idx=23, log_path=./log_ca
+[TmSim]: Top module clk23 is assigned to thread 23
+[TmSim]: Top module core23 is assigned to thread 23
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore23] build, esl_idx=24, log_path=./log_ca
+[TmSim]: Top module clk24 is assigned to thread 24
+[TmSim]: Top module core24 is assigned to thread 24
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore24] build, esl_idx=25, log_path=./log_ca
+[TmSim]: Top module clk25 is assigned to thread 25
+[TmSim]: Top module core25 is assigned to thread 25
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore25] build, esl_idx=26, log_path=./log_ca
+[TmSim]: Top module clk26 is assigned to thread 26
+[TmSim]: Top module core26 is assigned to thread 26
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore26] build, esl_idx=27, log_path=./log_ca
+[TmSim]: Top module clk27 is assigned to thread 27
+[TmSim]: Top module core27 is assigned to thread 27
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore27] build, esl_idx=28, log_path=./log_ca
+[TmSim]: Top module clk28 is assigned to thread 28
+[TmSim]: Top module core28 is assigned to thread 28
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore28] build, esl_idx=29, log_path=./log_ca
+[TmSim]: Top module clk29 is assigned to thread 29
+[TmSim]: Top module core29 is assigned to thread 29
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore29] build, esl_idx=30, log_path=./log_ca
+[TmSim]: Top module clk30 is assigned to thread 30
+[TmSim]: Top module core30 is assigned to thread 30
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore30] build, esl_idx=31, log_path=./log_ca
+[TmSim]: Top module clk31 is assigned to thread 31
+[TmSim]: Top module core31 is assigned to thread 31
+[CORE_WRAPPER] [INFO] [0000000000]        build (159):: CoreWrapper [DvcCore31] build, esl_idx=32, log_path=./log_ca
+Start to build SMMU Page !
+SMMU Page build finished!
+Start simulation with m_socCycle: 0
+SoC unit rank0_chip0_die1 Created
+can not find accessable port: 9 in chip: 0, die: 2
+Start simulation with m_socCycle: 0
+SoC unit rank0_chip0_die2 Created
+can not find accessable port: 9 in chip: 0, die: 3
+Start simulation with m_socCycle: 0
+SoC unit rank0_chip0_die3 Created
+Multi SoC in one chip Created
+SLLC CONNECT : 600 +++++  10609
+SLLC CONNECT : 601 +++++  10608
+SLLC CONNECT : 602 +++++  10607
+SLLC CONNECT : 604 +++++  10605
+SLLC CONNECT : 605 +++++  10604
+SLLC CONNECT : 607 +++++  10602
+SLLC CONNECT : 608 +++++  10601
+SLLC CONNECT : 609 +++++  10600
+SLLC CONNECT : 60a +++++  2060c
+SLLC CONNECT : 60b +++++  2060b
+SLLC CONNECT : 60c +++++  2060a
+SLLC CONNECT : 1060a +++++  3060c
+SLLC CONNECT : 1060b +++++  3060b
+SLLC CONNECT : 1060c +++++  3060a
+rank0_chip0 created!
+All Chip In Rank0 created!
+[Esl Top] Number of concurrent threads: 4
+[DRVSTUB_LOG] driver_api.c:601 sendSwapBuf:swapbuf_base_addr:9000000000
+[DRVSTUB_LOG] driver_api.c:602 sendSwapBuf:sq:0 swapbuf_addr:9000000000
+[DRVSTUB_LOG] driver_api.c:601 sendSwapBuf:swapbuf_base_addr:9000000000
+[DRVSTUB_LOG] driver_api.c:602 sendSwapBuf:sq:1 swapbuf_addr:9000000080
+[DRVSTUB_LOG] driver_api.c:2393 halGetSocVersion:halGetSocVersion len:50 soc_version:Ascend950PR_9589
+[DRVSTUB_LOG] driver_api.c:2393 halGetSocVersion:halGetSocVersion len:50 soc_version:Ascend950PR_9589
+[DRVSTUB_LOG] driver_api.c:601 sendSwapBuf:swapbuf_base_addr:9000000000
+[DRVSTUB_LOG] driver_api.c:602 sendSwapBuf:sq:2 swapbuf_addr:9000000100
+[DRVSTUB_LOG] driver_api.c:2393 halGetSocVersion:halGetSocVersion len:50 soc_version:Ascend950PR_9589
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[0]: 0x40000
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[1]: 0x0
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[2]: 0x20002
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[3]: 0x3fd0000
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[4]: 0x4df2d200
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[5]: 0x91
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[6]: 0x10c90800
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[7]: 0x2120000
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[8]: 0xd136b4
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[9]: 0xd64f78
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[10]: 0x900090
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[11]: 0x38000
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[12]: 0x22c000
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[13]: 0x90
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[14]: 0x22c000
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[15]: 0x90
+[DRVSTUB_LOG] driver_queue.c:120 sendStarsSQE:sq_addr: 9154b4d800
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[0]: 0x80001
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[1]: 0x1
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[2]: 0x40002
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[3]: 0x5fd0000
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[4]: 0x4df2d200
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[5]: 0x91
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[6]: 0x30000000
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[7]: 0x1120000
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[8]: 0x0
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[9]: 0xd72000
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[10]: 0x900000
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[11]: 0x38000
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[12]: 0x0
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[13]: 0x0
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[14]: 0x22d840
+[DRVSTUB_LOG] driver_queue.c:118 sendStarsSQE:RTSQ_2 sqe_payload[15]: 0x90
+[DRVSTUB_LOG] driver_queue.c:120 sendStarsSQE:sq_addr: 9154b4d840
+SoC sub 0 1 all tasks are finished!
+[Hardware] parallel simulation finish. sim time: 4.724718s, cycle: 248, speed: 0.052490KHz
+SoC sub 0 2 all tasks are finished!
+[Hardware] parallel simulation finish. sim time: 1.832321s, cycle: 420, speed: 0.229217KHz
+SoC sub 0 3 all tasks are finished!
+[Hardware] parallel simulation finish. sim time: 1.582076s, cycle: 420, speed: 0.265474KHz
+[info] [0000000400] [TASK_BEGIN] RTSQ_2 ACSQ_0 stream_id:0, task_id:0 full_task_id:0 BEGIN
+[info] [0000015812] [TASK_DONE] RTSQ_2 ACSQ_0 stream_id:0, task_id:0 TASK_DONE
+[info] [0000015814] [TASK_BEGIN] RTSQ_2 ACSQ_0 stream_id:1, task_id:0 full_task_id:1 BEGIN
+[info] [0000025521] [TASK_DONE] RTSQ_2 ACSQ_0 stream_id:1, task_id:0 TASK_DONE
+ALIGNED_PASS B2 route=score H=8192 R=2048 parts=2 selected=16384 hash=3006529230523652995 work_span_cycles=12159 guards=true no_service=true
+Parallel Simulation: All threads are joined.
+ESL_TOP: parallel threads joined
+ESL_TOP: system destructed
+[INFO] Model stopped successfully.
+ALIGNED_CLEANUP_PASS
+ALIGNED_MODEL_EXIT skip_duplicate_atexit=true

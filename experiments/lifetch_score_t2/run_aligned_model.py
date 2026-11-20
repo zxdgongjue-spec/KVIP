@@ -22,6 +22,7 @@ def parse_result(log):
     result=dict(re.findall(r'(\w+)=([^ ]+)',lines[0]))
     result['batch']=int(re.search(r'\bB(\d+) ',lines[0]).group(1))
     for key in ('H','R','selected','hash','work_span_cycles'):result[key]=int(result[key])
+    if 'parts' in result:result['parts']=int(result['parts'])
     return result
 
 
@@ -33,6 +34,7 @@ def main():
     p.add_argument('--mode',choices=('sim','npu'),default='sim')
     p.add_argument('--batches',default='2,4')
     p.add_argument('--routes',default='numeric,classify')
+    p.add_argument('--score-parts',type=int,default=0,help='Model-only score P; 0 uses the A5 budget map')
     p.add_argument('--output',type=Path)
     p.add_argument('--timeout-seconds',type=int,default=900)
     a=p.parse_args();batches=[int(x) for x in a.batches.split(',')];routes=a.routes.split(',')
@@ -40,6 +42,8 @@ def main():
         p.error('Use distinct B1/2/4/8/16')
     if any(r not in ('numeric','classify','score') for r in routes) or len(set(routes))!=len(routes) or not routes:
         p.error('Use distinct numeric/classify/score routes')
+    if not 0<=a.score_parts<=32 or (a.score_parts and any(b*a.score_parts>32 for b in batches)):
+        p.error('score-parts must fit B*P<=32')
     include=a.kvaf_root.resolve()/'access_operator/demo/aiv_batch_get/include'
     if not (include/'kvaf_batch_get_device.h').is_file():p.error('Patched pinned KVAF headers required')
     out=a.output.resolve() if a.output else Path(tempfile.mkdtemp(prefix='aligned_model_'))
@@ -70,7 +74,9 @@ def main():
                 name=f'b{b}-{route}';model=out/name;model.mkdir();env['CAMODEL_LOG_PATH']=str(model)
                 path=out/(name+'.log');print('Running '+name,flush=True)
                 with path.open('w') as log:
-                    result=subprocess.run([str(build/'aligned_smoke'),str(b),route],env=env,
+                    args=[str(build/'aligned_smoke'),str(b),route]
+                    if route=='score' and a.score_parts:args.append(str(a.score_parts))
+                    result=subprocess.run(args,env=env,
                         stdout=log,stderr=subprocess.STDOUT,timeout=a.timeout_seconds)
                 if result.returncode:raise RuntimeError(f'{name} exit {result.returncode}; inspect {path}')
                 contents=path.read_text(errors='replace');row=parse_result(contents)

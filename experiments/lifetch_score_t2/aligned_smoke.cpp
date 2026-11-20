@@ -25,11 +25,13 @@ struct Memory {
     ~Memory(){for(auto p:buffers)aclrtFree(p);}
 };
 int main(int argc,char** argv){try{
-    if(argc!=3)throw std::runtime_error("aligned_smoke BATCH numeric|classify|score");
+    if(argc!=3&&argc!=4)throw std::runtime_error("aligned_smoke BATCH numeric|classify|score [SCORE_PARTS]");
     uint32_t b=std::stoul(argv[1]);std::string route=argv[2];
     if((b!=1&&b!=2&&b!=4&&b!=8&&b!=16)||(route!="numeric"&&route!="classify"&&route!="score"))throw std::runtime_error("invalid B/route");
     const bool scoreProducer=route=="score",classify=route!="numeric";
     const uint32_t h=scoreProducer?8192:32768,r=scoreProducer?2048:16384,k=2048,guard=128;
+    const uint32_t parts=scoreProducer?(argc==4?std::stoul(argv[3]):b==1?16:32/b):0;
+    if(scoreProducer&&(!parts||b*parts>32||h/256<parts))throw std::runtime_error("invalid score parts");
     rotating::Context ctx{};auto& s=ctx.shape;s.batch=b;s.history=h;s.resident=r;s.indexHeads=32;
     s.aicCount=32;s.splitQ=1;s.rounds=2;s.tokenBytes=656;Check(rotating::PrepareShape(&s));
     Check(aclInit(nullptr));Check(aclrtSetDevice(0));aclrtStream stream=nullptr;Check(aclrtCreateStream(&stream));
@@ -69,7 +71,7 @@ int main(int argc,char** argv){try{
     args[14]=memory.Put(std::vector<rotating::Context>{ctx});auto bindings=memory.Put(args);
     if(scoreProducer){
 #if ALIGNED_SCORE_MODEL
-        uint32_t p=b==1?16:32/b;Check(aclrtlaunch_v9_li_kernel_score_aligned(b*p,stream,(void*)bindings,p));
+        Check(aclrtlaunch_v9_li_kernel_score_aligned(b*parts,stream,(void*)bindings,parts));
 #else
         throw std::runtime_error("Compile ALIGNED_SCORE_MODEL=ON for score route");
 #endif
@@ -105,7 +107,7 @@ int main(int argc,char** argv){try{
     auto clocks=memory.Get<uint64_t>(args[11],b*4*16);uint64_t first=UINT64_MAX,last=0;
     for(uint32_t q=0;q<b*4;++q){first=std::min(first,clocks[q*16]);last=std::max(last,clocks[q*16+1]);}
     if(last<=first)throw std::runtime_error("invalid clocks");
-    std::cout<<"ALIGNED_PASS B"<<b<<" route="<<route<<" H="<<h<<" R="<<r<<" selected="<<b*4*k<<" hash="<<hash<<" work_span_cycles="<<last-first<<" guards=true no_service=true\n";
+    std::cout<<"ALIGNED_PASS B"<<b<<" route="<<route<<" H="<<h<<" R="<<r<<" parts="<<parts<<" selected="<<b*4*k<<" hash="<<hash<<" work_span_cycles="<<last-first<<" guards=true no_service=true\n";
     }
     Check(aclrtDestroyStream(stream));Check(aclrtResetDevice(0));Check(aclFinalize());
     std::cout<<"ALIGNED_CLEANUP_PASS\n"<<std::flush;

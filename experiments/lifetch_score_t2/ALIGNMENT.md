@@ -41,3 +41,7 @@ python3 experiments/lifetch_score_t2/run_aligned_model.py \
 ```
 
 Model numeric/classify在相同H32768/R16384、四Q sortable scores上检查Top2048的值、ID唯一性、输出hash一致、slot分类和protection bitmap，并检查guard及不改写Row/Event。score路线另用H8192/R2048验证真实FP8全history分片生产者和TopK/classify。周期跨度是TopK局部工作，不含Score、kernel启动、Fetch或完整链；不将其换算为A5收益。
+
+本轮已通过：B2 numeric/classify的选中hash一致；B4 classify的标量oracle/slot/bitmap检查通过；B2/P2 score→TopK/classify通过，检查全部65536个canonical score和16384个选中ID。完整NPU库以CANN9.1/9599编译、链接和新增入口符号检查通过，53个设备源码文件与编译快照hash一致。26项CPU实验检查和3项构建恢复检查通过。
+
+B2/P16的Model尝试受本地Docker虚拟机内存限制被OOM终止，未获得正确性或性能结果；不将其计作算子校验失败。用同一生产者P2覆盖跨request寻址与数值，A5默认P16/16/8/4/2保持原设定。复跑该小规模生产者检查可增加`--routes score --score-parts 2 --batches 2`。详见[aligned_validation.json](aligned_validation.json)与[evidence/aligned_li](evidence/aligned_li)。尚未测新增路线的完整A5链，也未证明优于MR14 SerialAfter。
