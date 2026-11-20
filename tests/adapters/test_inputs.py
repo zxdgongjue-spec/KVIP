@@ -46,6 +46,13 @@ class FusedInputsTest(unittest.TestCase):
         self.assertEqual([g.requests[0].tolist() for g in groups], [[1, 1, 1, 4]] * 2)
         self.assertEqual(groups[0].feedback.stride(), (16, 1))
         self.assertEqual(groups[0].demand.stride(), (32,))
+        self.assertFalse(groups[0].distinct_active_owners)
+        self.assertTrue(AdaptiveRoute(torch, device, 2, 3).distinct_active_owners)
+        opted_in = AdaptiveRoute(torch, device, 2, 3, requests=shared,
+                                 distinct_active_owners=inputs.distinct_active_route_owners)
+        self.assertTrue(opted_in.distinct_active_owners)
+        with self.assertRaisesRegex(ValueError, "distinct active owners"):
+            inputs.prepare([4, 4], query_owners=[1, 1], route_plans=plans*2)
         groups[0].high_bound.fill_(1000)
         groups[0].used_high_bound.fill_(1)
         groups[0].invalidate_high_bound()

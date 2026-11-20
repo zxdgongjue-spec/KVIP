@@ -29,6 +29,9 @@ def committed_candidates(candidates, committed, resident):
 
 
 class QueryInputs:
+    # _pack_route_requests checks this before the shared metadata upload.
+    distinct_active_route_owners = True
+
     def __init__(self, torch, batch, device, *, pin_memory=True, history=0, index_heads=64, route_policy="off"):
         if index_heads not in (32, 64):
             raise ValueError("LIFetch supports 32 or 64 Indexer heads")

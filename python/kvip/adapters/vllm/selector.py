@@ -39,6 +39,7 @@ def bind_group_selector(torch, policy, workspace, setup, group, storage, rotatin
         rotating.adaptive_route = AdaptiveRoute(
             torch, rotating.device, setup.batch, storage.logical_ids.shape[0],
             policy=workspace.inputs.route_policy, requests=workspace.inputs.route_requests,
+            distinct_active_owners=getattr(workspace.inputs, "distinct_active_route_owners", False),
         )
     selector = VllmIndexSelector(
         torch, inputs=workspace.inputs, rotating=rotating, update=update,

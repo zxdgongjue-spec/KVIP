@@ -3,11 +3,14 @@
 
 
 class AdaptiveRoute:
-    def __init__(self, torch, device, batch, owners, *, policy="zero", requests=None):
+    def __init__(self, torch, device, batch, owners, *, policy="zero", requests=None, distinct_active_owners=False):
         if policy not in ("zero", "early") or not 1 <= batch <= 16 or owners < batch:
             raise ValueError("Adaptive URMA requires zero/early policy and enough owners for each row")
         self.torch, self.device, self.batch, self.owners = torch, device, batch, owners
         self.policy = 1 if policy == "zero" else 2
+        # set_requests and opted-in producers reject repeated active owners.
+        # Arbitrary pre-existing external tensors retain the exact row probe.
+        self.distinct_active_owners = requests is None or distinct_active_owners
         self.requests = requests if requests is not None else torch.zeros((batch, 4), dtype=torch.int64, device=device)
         if (tuple(self.requests.shape) != (batch, 4) or self.requests.dtype != torch.int64
                 or self.requests.device != torch.device(device) or not self.requests.is_contiguous()):
