@@ -27,6 +27,8 @@ joint_reference=
 joint=false
 joint_local=false
 joint_archive=false
+ranked_auto=false
+current_fixed=6bca602ad9e548e9f12c0142fea25f2bc5c6877d
 ranked_q_workers=${PEER_RANKED_Q_WORKERS:-2}
 ranked_groups=(7 2 10 4 17)
 resume=
@@ -64,6 +66,20 @@ if [[ ${1:-} == --ranked-help || ${1:-} == --ranked-joint ]]; then
         done
     elif [[ -n "$joint_reference" ]]; then
         echo '--previous requires --ranked-joint' >&2; exit 2
+    fi
+elif [[ ${1:-} == --ranked-auto ]]; then
+    ranked_auto=true
+    ranked=${2:?supply full adaptive candidate commit}
+    [[ $ranked =~ ^[0-9a-f]{40}$ && $ranked != "$current_fixed" ]] || { echo 'Expected the adaptive candidate SHA' >&2; exit 2; }
+    ranked_groups=(2 7 10 17 4)
+    help_reference="$area/help-772293d4-fecf79e510598355a1ee"
+    shift 2
+    if [[ ${1:-} == --reference ]]; then help_reference=${2:?supply same-node ranked reference}; shift 2; fi
+    help_reference=$(cd "$help_reference" && pwd -P)
+    if [[ $(<"$help_reference/baseline.txt") != "$ranked_sha" ||
+          $(<"$help_reference/physical_npu.txt") != "$peer_physical_npu" ||
+          $(<"$help_reference/host.txt") != "$(</proc/sys/kernel/hostname)" ]]; then
+        echo "Archived original revision, host or NPU differs: $help_reference" >&2; exit 1
     fi
 elif [[ ${1:-} == --ranked-joint-local ]]; then
     ranked=${2:?supply candidate commit}
@@ -112,7 +128,7 @@ if [[ -z "$ranked" && $# -eq 2 && $1 == --reuse-serial ]]; then
         exit 1
     fi
 elif [[ $# -ne 0 ]]; then
-    echo 'Usage: peer_fused.sh --ranked-joint-local FULL_SHA [--reference DIR] | --ranked-joint FULL_SHA --previous DIR [--reference DIR] | --ranked-help FULL_SHA [--reference DIR] [--resume DIR] [--anchor GROUP] | --ranked-index CANDIDATE_SHA | [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
+    echo 'Usage: peer_fused.sh --ranked-auto FULL_SHA [--reference DIR] | --ranked-joint-local FULL_SHA [--reference DIR] | --ranked-joint FULL_SHA --previous DIR [--reference DIR] | --ranked-help FULL_SHA [--reference DIR] [--resume DIR] [--anchor GROUP] | --ranked-index CANDIDATE_SHA | [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
     exit 2
 fi
 export PATH=/usr/local/python3.12.13/bin:$PATH
@@ -183,14 +199,20 @@ local_baseline=false
 if [[ -n "$ranked" || ( -n "$adaptive" && -z "$reuse" ) ]]; then
     local_baseline=true
     source "$tools/support/peer_node_prepare.sh"
-    peer_prepare_node "$root" "$baseline" "$clean" "$work" "$out" "${ranked:+fused-only}"
+    preparation=${ranked:+fused-only}
+    if "$ranked_auto"; then preparation=full; fi
+    peer_prepare_node "$root" "$baseline" "$clean" "$work" "$out" "$preparation"
 fi
 if [[ -z "$ranked" ]]; then
     pin "$root" "$baseline" "$serial_revision"
     git -C "$root" diff --exit-code --quiet "$serial_revision" HEAD -- csrc/operators/lidu
 fi
 if [[ -n "$ranked" ]]; then
-    if [[ -n "$help_reference" ]]; then
+    if "$ranked_auto"; then
+        git -C "$root" merge-base --is-ancestor "$current_fixed" "$ranked"
+        ranked_base="$src/ranked-${current_fixed:0:8}"
+        pin "$root" "$ranked_base" "$current_fixed"
+    elif [[ -n "$help_reference" ]]; then
         if ! git -C "$root" cat-file -e "$ranked^{commit}" 2>/dev/null; then
             if "$joint"; then git -C "$root" fetch -q origin perf/ranked-index-post-tail; else git -C "$root" fetch -q origin perf/ranked-index-help4; fi
         fi
@@ -213,6 +235,7 @@ if [[ -n "$ranked" ]]; then
     ranked_candidate="$src/ranked-${ranked:0:8}"
     pin "$root" "$ranked_candidate" "$ranked"
     printf '%s\n' "$ranked_sha" >"$out/baseline.txt"
+    if "$ranked_auto"; then printf '%s\n' "$current_fixed" >"$out/fixed.txt"; fi
     printf '%s\n' "$ranked" >"$out/candidate.txt"
 elif [[ -n "$adaptive" ]]; then
     main_sha=a56154c37bebb0928da4a4095e9670898e6b21c7
@@ -247,7 +270,7 @@ export PATH="$venv/bin:$PATH" PYTHON="$venv/bin/python"
 test -x "$PYTHON"
 lidu="$baseline/csrc/operators/lidu"
 export PYTHONPATH="$root/python:$kvaf/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
-if [[ -z "$ranked" ]]; then
+if [[ -z "$ranked" ]] || "$ranked_auto"; then
     vendors=("$lidu"/_custom_opp/vendors/*/op_api/lib/libcust_opapi.so)
     [[ ${#vendors[@]} == 1 && -f ${vendors[0]} ]]
     export ASCEND_CUSTOM_OPP_PATH="${vendors[0]%/op_api/lib/libcust_opapi.so}${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
@@ -269,11 +292,13 @@ if [[ -n "$ranked" ]]; then
     printf 'CONFIG URMA physical_NPU=%s logical_device=0 BS16 Q4 656B ranked=%.8s candidate=%.8s KVAF=%.8s\n' "$peer_physical_npu" "$ranked_sha" "$ranked" "$transport"
     # Compile through the same cache key used by run_path. Fail before copying
     # five traces or running the baseline if the toolchain rejects either arm.
-    if [[ -n "$help_reference" ]]; then
+    if "$ranked_auto"; then
+        printf 'CONTROLS current_fixed=%.8s original=%.8s G2_native_workers=2,32 final_communication_cores=8\n' "$current_fixed" "$ranked_sha"
+    elif [[ -n "$help_reference" ]]; then
         printf 'REFERENCE root=%s original=%.8s previous=%.8s profile=4_warmup_20_calls\n' "$help_reference" "$ranked_sha" "${joint_control:-$four_field}"
     fi
     build_sources=("$ranked_candidate")
-    if [[ -z "$help_reference" ]] || "$has_anchor"; then build_sources+=("$ranked_base"); fi
+    if [[ -z "$help_reference" ]] || "$has_anchor" || "$ranked_auto"; then build_sources+=("$ranked_base"); fi
     for source_root in "${build_sources[@]}"; do
         PYTHONPATH="$source_root/python:$PYTHONPATH" "$PYTHON" -B - "$source_root" "$kvaf/build-npu" "$SOC_VERSION" "$out" <<'BUILD'
 from pathlib import Path
@@ -326,6 +351,9 @@ run_arm() (
     monitor=$!
     level=1
     case "$label" in
+        fixed) mode=(--fused-only --production-root "$ranked_base" --ranked-q-workers 2); level=2 ;;
+        auto) mode=(--fused-only --production-root "$ranked_candidate" --ranked-q-workers 2 --ranked-auto-route); level=2 ;;
+        serial2|serial32) mode=(--serial-only --serial-workers "${label#serial}") ;;
         baseline|anchor) mode=(--fused-only --production-root "$ranked_base"); level=2 ;;
         candidate) mode=(--fused-only --production-root "$ranked_candidate"); level=2
                    if "$joint_archive"; then mode+=(--ranked-q-workers "$ranked_q_workers"); fi ;;
@@ -407,7 +435,40 @@ fi
 bind_cpu_service "$node"
 if [[ -n "$help_reference" ]] || "$joint_local"; then
     source "$tools/support/ranked_help_run.sh"
-    ranked_help_groups
+    if "$ranked_auto"; then
+        auto_order=(fixed auto)
+        for group in "${ranked_groups[@]}"; do
+            case_dir="$out/g$group"
+            mkdir -p "$case_dir"
+            if [[ -s "$case_dir/summary.txt" ]]; then cat "$case_dir/summary.txt"; continue; fi
+            params=$(ranked_reference_case "$group")
+            preferred=${params%%$'\n'*}
+            reference_trace=${params#*$'\n'}
+            bind_cpu_service "$preferred"
+            trace=$(PEER_RANKED_INPUT="$reference_trace" PEER_RANKED_HASH_FILE="$case_dir/input.sha256" \
+                bash "$tools/peer_g2_input.sh" "$work" "$group")
+            cmp -s "$case_dir/input.sha256" "$help_reference/g$group/input.sha256" || { echo "Changed G$group input" >&2; exit 1; }
+            arms=("${auto_order[@]}")
+            if [[ $group == 2 ]]; then arms=(serial2 "${arms[@]}" serial32); fi
+            for arm in "${arms[@]}"; do
+                if [[ ! -f "$case_dir/$arm/pass" ]]; then
+                    if [[ -e "$case_dir/$arm" ]]; then
+                        prior=$(mktemp -d "$case_dir/interrupted.XXXXXX")
+                        mv "$case_dir/$arm" "$prior/"
+                    fi
+                    run_arm "$arm" "$group" "$case_dir"
+                    touch "$case_dir/$arm/pass"
+                fi
+            done
+            "$PYTHON" -B "$tools/support/ranked_auto_report.py" "$out" --reference "$help_reference" --group "$group" >"$case_dir/summary.tmp"
+            mv "$case_dir/summary.tmp" "$case_dir/summary.txt"
+            cat "$case_dir/summary.txt"
+            auto_order=("${auto_order[1]}" "${auto_order[0]}")
+        done
+        echo "REPLAY_COMPLETE RESULT_ROOT=$out"
+    else
+        ranked_help_groups
+    fi
     exit 0
 fi
 if [[ -n "$ranked" ]]; then

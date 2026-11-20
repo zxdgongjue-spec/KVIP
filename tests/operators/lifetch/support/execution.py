@@ -3725,7 +3725,8 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             pending = False
     # Multi-round validation also advances the host LRU for the next input.
     compact = config.mode == "bench" and len(sequence.rounds) == 1
-    policy = getattr(config, 'route_policy', None)
+    adaptive_ranked = bool(getattr(config, 'ranked_auto_route', False))
+    policy = 'zero' if adaptive_ranked else getattr(config, 'route_policy', None)
     ranked = bool(getattr(config, 'production_root', None))
     # reset() has already restored both the cache and the only round's inputs.
     fixed_round = fused and getattr(sequence, 'cached_ranked_round', None) is not None
@@ -3736,7 +3737,12 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
     candidate = fused and getattr(config, 'candidate_root', None) and not policy
     if lean:
         from lean_replay import check_route as checked_routes, request_step, set_step
-        route_history = dict(warmup=[], source=config.candidate_revision, policy=policy)
+        revision = config.production_revision if adaptive_ranked else config.candidate_revision
+        route_history = dict(warmup=[], source=revision, policy=policy)
+        if adaptive_ranked:
+            from ranked_route_replay import RouteAudit
+            route_audit = RouteAudit(states)
+            checked_routes = route_audit.check
     elif candidate:
         from peer_candidate import checked_routes, set_step
         route_history = dict(warmup=[], source=config.candidate_revision)
@@ -3809,8 +3815,16 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                         set_step(state.rotating.adaptive_route if lean else state.rotating.auto_route,
                                  **route_step(warmup + 1))
                 stream.synchronize()
+                if adaptive_ranked and warmup == 0:
+                    begin = torch.npu.Event(enable_timing=True)
+                    end = torch.npu.Event(enable_timing=True)
+                    begin.record(stream)
                 replay()
+                if adaptive_ranked and warmup == 0:
+                    end.record(stream)
                 stream.synchronize()
+                if adaptive_ranked and warmup == 0:
+                    route_history['cold_event_mean_us'] = begin.elapsed_time(end) * 1000 / len(states)
                 validate_all(inputs, f'warmup{warmup}')
                 if candidate or lean:
                     point = route_step(warmup + 1)
@@ -3845,11 +3859,17 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                 sample = dict(round=i, repeat=i, source_round=inputs.source_round,
                               us=item['us'], accounting=accounting)
                 if before:
-                    if policy == 'zero':
+                    adaptive_low = adaptive_ranked and route_history['measured']['modes'][i] == 1
+                    if adaptive_low or (policy == 'zero' and not adaptive_ranked):
                         from lean_replay import zero_traffic
                         sample['algorithm'] = zero_traffic(states[i], before[i])
                     else:
                         sample['algorithm'] = algorithm_after(states[i].rotating, before[i])
+                    if adaptive_ranked and not adaptive_low:
+                        physical = states[i].rotating.adaptive_route.demand.cpu().tolist()
+                        requests = sample['algorithm']['requests']
+                        if physical != [row['prefetch'] + row['final'] for row in requests]:
+                            raise ValueError(f'Ranked high feedback disagrees with completed Get counts, call {i}')
                     if policy == 'early':
                         sample['route_physical_reads'] = states[i].rotating.adaptive_route.demand.cpu().tolist()
                     totals = sample['algorithm'].get('totals', {})
@@ -3884,8 +3904,13 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                     if lean:
                         route_history['diagnostic'] = checked_routes(states, **route_step(config.warmup + 2), low=True)
                     folder = directory / 'diagnose' / f'round-{inputs.source_round}'
+                    if adaptive_ranked and route_history['diagnostic']['high']:
+                        # HIGH produces the current ranked team's trace format.
+                        detail_policy = 'main'
+                    else:
+                        detail_policy = policy or 'main'
                     atomic_json(folder / 'lean_stages.json',
-                                stage_report(states, measured, samples, clock_mhz, policy or 'main', folder))
+                                stage_report(states, measured, samples, clock_mhz, detail_policy, folder))
                     continue
                 from diagnostics import decode_rank_progress
                 details = []
@@ -3930,6 +3955,10 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                 stream.synchronize()
                 for isolated in isolated_graphs:
                     isolated.reset()
+        if adaptive_ranked and config.group in (2, 7):
+            # Extra correctness checks reuse this graph outside all reported timing.
+            route_history['lifecycle'] = route_audit.lifecycle(
+                inputs, route_step(config.warmup + 2), TrackedGraph(), stream, config.group)
         all_spans = [v for timing in rounds.values() for v in timing['samples_us']]
         event_mean = sum(t['mean_us'] for t in rounds.values()) / len(rounds)
         overall = timing_summary(all_spans)
@@ -3974,7 +4003,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
         registration.require_a5_dsa_registration(('lidu_fused_batch_get_prepare_mtp_out',))
     g = initial.geometry
     width = g['token_bytes']
-    workers = 40 if fused and config.transport == 'urma' else 2
+    workers = 40 if fused and config.transport == 'urma' else getattr(config, 'serial_workers', 2)
     kwargs = dict(device_id=config.device, npu_core_count=workers,
                   batch_put_kernel_object_path=str(build / 'bin/kvaf_execute_batch_put_kernels.o'))
     if config.transport == 'ubmem':
@@ -4057,7 +4086,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                 prefetch_tokens=config.prefetch_tokens, soc=soc,
                 prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024), candidate_bounds=candidate_bounds,
-                route_policy=getattr(config, 'route_policy', None), fixed_reset=fixed_reset,
+                route_policy='zero' if getattr(config, 'ranked_auto_route', False) else getattr(config, 'route_policy', None), fixed_reset=fixed_reset,
                 ranked_q_workers=getattr(config, 'ranked_q_workers', None))
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
@@ -4106,7 +4135,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                         prefetch_tokens=config.prefetch_tokens, soc=soc,
                         prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease,
                         candidate_bounds=candidate_bounds,
-                        route_policy=getattr(config, 'route_policy', None), fixed_reset=fixed_reset,
+                        route_policy='zero' if getattr(config, 'ranked_auto_route', False) else getattr(config, 'route_policy', None), fixed_reset=fixed_reset,
                         ranked_q_workers=getattr(config, 'ranked_q_workers', None))
                     replica.failure_directory = directory
                 else:

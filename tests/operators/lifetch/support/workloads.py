@@ -141,6 +141,8 @@ def configuration(argv=None):
             path = command.add_mutually_exclusive_group()
             path.add_argument('--serial-only', action='store_true',
                               help='measure the native serial chain alone on a real replay')
+            command.add_argument('--serial-workers', type=int, choices=(2, 32), default=2,
+                                 help='URMA Get core count for the standalone native serial replay')
             path.add_argument('--fused-only', action='store_true',
                               help='measure only the complete fused chain on a real replay')
             command.add_argument('--level', type=int, choices=(1, 2, 3), default=1)
@@ -148,6 +150,8 @@ def configuration(argv=None):
                                  help='G2 mainline or learned low route with matched stage accounting')
             command.add_argument('--production-root', type=Path,
                                  help='clean ranked URMA checkout whose binding and kernels will run')
+            command.add_argument('--ranked-auto-route', action='store_true',
+                                 help='learn the route from previous successful device feedback')
             command.add_argument('--ranked-q-workers', type=int, choices=(1, 2, 4),
                                  help='final URMA Post/CQ workers per query position on a ranked replay')
             command.add_argument('--candidate-root', type=Path, help='G2 auto-route production checkout')
@@ -203,8 +207,12 @@ def configuration(argv=None):
                 or args.prefetch_tokens % args.intermediate_fetches):
             parser.error('invalid timing or prefetch configuration')
     if args.mode == 'diagnose':
+        if args.serial_workers != 2 and (not args.serial_only or args.transport != 'urma'):
+            parser.error('--serial-workers 32 requires --serial-only --transport urma')
         if (args.serial_only or args.fused_only) and args.input != 'real':
             parser.error('standalone path measurements require --input real')
+        if args.ranked_auto_route and (not args.production_root or args.warmup != 4):
+            parser.error('--ranked-auto-route requires --production-root and four lifecycle warmups')
         if args.ranked_q_workers is not None and not args.production_root:
             parser.error('--ranked-q-workers requires --production-root')
         if args.production_root:
