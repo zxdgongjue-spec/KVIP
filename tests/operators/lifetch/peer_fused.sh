@@ -64,13 +64,15 @@ elif [[ $# -ne 0 ]]; then
     echo 'Usage: peer_fused.sh --ranked-help FULL_SHA [--reference DIR] [--resume DIR] [--anchor GROUP] | --ranked-index CANDIDATE_SHA | [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
     exit 2
 fi
+export PATH=/usr/local/python3.12.13/bin:$PATH
 mkdir -p "$area"
 if [[ -n "$help_reference" ]]; then
     # Repeating the command resumes the same machine, harness and exact revisions.
     harness=$(git -C "$root" rev-parse HEAD)
-    host_id=$(hostname)
+    host_id=$(</proc/sys/kernel/hostname)
     boot_id=$(</proc/sys/kernel/random/boot_id)
-    run_key=$(printf '%s\n' "$ranked" "$help_reference" "$host_id" "$boot_id" "$harness" | sha256sum | cut -c1-20)
+    run_key=$(printf '%s\n' "$ranked" "$help_reference" "$host_id" "$boot_id" "$harness" |
+        python3 -B -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:20])')
     if [[ -n "$resume" ]]; then
         out=$(cd "$resume" && pwd -P)
         [[ -f "$out/run.key" && $(<"$out/run.key") == "$run_key" ]] || { echo "Incompatible --resume directory: $out" >&2; exit 1; }
@@ -79,7 +81,17 @@ if [[ -n "$help_reference" ]]; then
         mkdir -p "$out"
     fi
     exec 9>"$out/run.lock"
-    flock -n 9 || { echo "A replay is already running in $out" >&2; exit 1; }
+    # FD 9 shares the shell's open file description, which holds the lock
+    # through all groups after this Python process exits.
+    python3 -B - "$out" <<'LOCK'
+import fcntl
+import sys
+
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    sys.exit(f"A replay is already running in {sys.argv[1]}")
+LOCK
     printf '%s\n' "$run_key" >"$out/run.key"
     printf '%s\n' "$help_reference" >"$out/reference.txt"
     printf '%s\n' "$harness" >"$out/harness.txt"
@@ -95,7 +107,6 @@ else
     out=$(mktemp -d "$area/fused.XXXXXX")
 fi
 printf 'RESULT_ROOT=%s\n' "$out"
-export PATH=/usr/local/python3.12.13/bin:$PATH
 if [[ -r /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
     source /usr/local/Ascend/ascend-toolkit/set_env.sh
 else
