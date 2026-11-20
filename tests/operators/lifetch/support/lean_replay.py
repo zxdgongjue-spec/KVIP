@@ -152,6 +152,12 @@ def stage_report(states, profile, samples, mhz, policy, directory):
             # use the ranked team's native format.
             probe = rotating.adaptive_route.probe_ticks.cpu().numpy()
             route_probes.append(probe)
+            route = rotating.adaptive_route
+            if hasattr(route, 'high_bound'):
+                ticks = int(route.high_bound[1, 0].item())
+                eligible['route_bound_retire'] += 1
+                if ticks > 0:
+                    buckets['route_bound_retire'].append(ticks / mhz)
             for name, cores in (('routing_probe_aic', probe[:32]), ('routing_probe_aiv', probe[32:])):
                 eligible[name] += len(cores)
                 buckets[name].extend(int(c)/mhz for c in cores if c > 0)
@@ -220,6 +226,7 @@ def stage_report(states, profile, samples, mhz, policy, directory):
                         buckets[name].append(int(f[off+2*phase])/mhz)
         group_counts.append(submitted_groups)
     scopes = dict(planning='producer entry to completed per-row plan, includes waits',
+                  route_bound_retire='one device retirement reduction per graph call, time in the instrumented tail',
                   routing_probe_aic='elapsed route choice per first-LI AIC, inside LI headline',
                   routing_probe_aiv='elapsed route choice per first-LI AIV, inside LI headline',
                   consumer_including_waits='Index consumer entry to metadata publication, per row',

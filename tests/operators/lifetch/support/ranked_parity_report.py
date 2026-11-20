@@ -98,12 +98,24 @@ def report(root, reference, previous, group):
     probes = auto['detail']['stages']
     print(f'G{group} ROUTE_TIMERS candidate_nonzero/eligible ' + ' '.join(
         f'{k}={probes[k]["n"]}/{probes[k]["eligible"]}' for k in ('routing_probe_aiv', 'routing_probe_aic')))
+    bound_hits = {}
+    for phase in ('measured', 'diagnostic'):
+        observed = auto['route'][phase].get('high_bound_hits', [])
+        bounds = auto['route'][phase].get('retired_read_bounds', [])
+        if len(observed) != n or len(bounds) != n:
+            raise ValueError(f'Missing HIGH certificate evidence in {phase}')
+        bound_hits[phase] = sum(observed)
+    bounds = route['retired_read_bounds']
+    retire = probes['route_bound_retire']
+    print(f'G{group} HIGH_CERT hit_measured/diagnostic={bound_hits["measured"]}/{n},{bound_hits["diagnostic"]}/{n} '
+          f'retired_reads_min/max={min(bounds)}/{max(bounds)} retirement_p50/max_us={fmt(retire["p50_us"])}/{fmt(retire["max_us"])} '
+          f'timed_retirements={retire["n"]}/{retire["eligible"]}')
     traffic = auto['detail']['traffic']
     lifecycle = 'PASS' if group in (2, 7) else 'covered_by_G2_G7'
     print(f'G{group} CHECK TopK/KV/ordered_Index/hot_valid=PASS lifecycle={lifecycle} '
           f'prefetch/final/unused_p50={pair(traffic[k]["p50"] for k in ("prefetch", "final", "unused_prefetch"))}')
     result = dict(revision=revision, target=label, headline={name: headline(a) for name, a in {**controls, 'auto': auto}.items()},
-                  comparisons=deltas, matched=matches, drifts=drifts, auxiliary_us=aux, route=route, screen=verdict)
+                  comparisons=deltas, matched=matches, drifts=drifts, auxiliary_us=aux, route=route, high_bound_hits=bound_hits, retirement=retire, screen=verdict)
     (case/'parity.json').write_text(json.dumps(result, indent=2, allow_nan=False)+'\n')
 
 

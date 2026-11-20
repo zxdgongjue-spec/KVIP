@@ -42,3 +42,52 @@ def test_independent_policy_rejects_corrupt_demand_and_out_of_range_queries():
     feedback[8, 2] = 20
     ends[8, 2] = 131329
     assert expected_mode(feedback, owners, ends, 656, 3, 13) == 0
+
+def test_fault_injection_invalidates_high_certificate_before_replay():
+    from types import SimpleNamespace
+    from ranked_route_replay import RouteAudit
+
+    class Buffer(np.ndarray):
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return np.asarray(self)
+
+        def fill_(self, value):
+            self.fill(value)
+
+    def buffer(a):
+        return np.asarray(a, dtype=np.int64).view(Buffer)
+
+    owners = buffer(np.arange(1, 17))
+    ends = buffer(np.full((16, 4), 131072))
+    route = SimpleNamespace(requests=buffer(np.zeros((16, 4))),
+                            feedback=buffer(np.tile([2, 6, 512, 4], (17, 1))),
+                            demand=buffer(np.full(16, 512)), mode=buffer(0),
+                            used_high_bound=buffer(0), high_bound=buffer([[8192], [0]]))
+    route.set_requests = lambda rows: np.copyto(route.requests, rows)
+    route.invalidate_high_bound = lambda: route.high_bound[0].fill(0)
+    noop = lambda *args: None
+    state = SimpleNamespace(rotating=SimpleNamespace(adaptive_route=route, query_ends=ends, row_owners=owners),
+                            batch=16, resident=16384, history=131328, token_bytes=656,
+                            forward=SimpleNamespace(set_diagnostics=noop), reset=noop,
+                            check_completion=noop, validate=noop, topk_set_digest='measured')
+    used = []
+
+    def replay():
+        generation, step = route.requests[0, 1:3]
+        hit = bool(route.high_bound[0, 0] * 656 * 32 > ends.sum() * 5)
+        used.append(hit)
+        route.used_high_bound.fill(hit)
+        route.mode.fill(0 if hit else expected_mode(route.feedback, owners, ends, 656, generation, step))
+        if generation:
+            route.feedback[owners] = [generation, step, 512, 4]
+            route.high_bound[0, 0] = 8192
+
+    audit = RouteAudit([state])
+    audit.previous = [route.feedback.numpy().copy()]
+    graph = SimpleNamespace(replay=replay, completed=noop)
+    result = audit.lifecycle(None, dict(generation=2, step=6), graph, SimpleNamespace(synchronize=noop), group=7)
+    assert used == [True, False, True]
+    assert result['injected_modes'] == [1] and result['recovered_modes'] == [0]

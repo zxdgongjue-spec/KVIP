@@ -24,6 +24,7 @@ class RouteAudit:
 
     def check(self, states, step, generation, *, low=None):
         modes, counts = [], []
+        bound_hits, retired_bounds = [], []
         for i, state in enumerate(states):
             route = state.rotating.adaptive_route
             owners = self.owners[i]
@@ -39,11 +40,20 @@ class RouteAudit:
                     or np.any(committed[:, 3] != 4) or np.any(reads < 0)
                     or not np.array_equal(reads, committed[:, 2])):
                 raise ValueError(f'Uncommitted device demand at call {i}, generation {generation}, step {step}')
+            if hasattr(route, 'high_bound'):
+                hit = int(route.used_high_bound.item())
+                bound = int(route.high_bound[0, 0].item())
+                if hit not in (0, 1) or (hit and mode != 0) or not 0 <= bound <= int(reads.sum()):
+                    raise ValueError(f'Invalid HIGH certificate at call {i}: hit={hit} mode={mode} '
+                                     f'retired_bound={bound}, reads={int(reads.sum())}')
+                bound_hits.append(hit)
+                retired_bounds.append(bound)
             self.previous[i] = actual
             modes.append(mode)
             counts.append(int(reads.sum()))
         return dict(generation=generation, step=step, low=modes.count(1), high=modes.count(0),
-                    modes=modes, feedback_demand_per_call=counts)
+                    modes=modes, feedback_demand_per_call=counts,
+                    **(dict(high_bound_hits=bound_hits, retired_read_bounds=retired_bounds) if bound_hits else {}))
 
     def lifecycle(self, inputs, point, graph, stream, group):
         from lean_replay import set_step
@@ -73,7 +83,11 @@ class RouteAudit:
         # the completed Get count from the mistaken round at the same addresses.
         false_reads = 512 if group == 2 else 0
         for i, state in enumerate(states):
-            state.rotating.adaptive_route.feedback[1:, 2].fill_(false_reads)
+            route = state.rotating.adaptive_route
+            if hasattr(route, 'high_bound'):
+                # The injected write bypasses the device's paired feedback/bound commit.
+                route.invalidate_high_bound()
+            route.feedback[1:, 2].fill_(false_reads)
             self.previous[i][1:, 2] = false_reads
         observed = []
         measured_digest = states[0].topk_set_digest
