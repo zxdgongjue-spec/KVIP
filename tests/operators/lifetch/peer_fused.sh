@@ -69,6 +69,7 @@ if [[ ${1:-} == --ranked-help || ${1:-} == --ranked-joint ]]; then
     fi
 elif [[ ${1:-} == --ranked-auto ]]; then
     ranked_auto=true
+    ranked_groups=(2 7 10 4 17)
     ranked=${2:?supply full adaptive candidate commit}
     [[ $ranked =~ ^[0-9a-f]{40}$ && $ranked != "$current_fixed" ]] || { echo 'Expected the adaptive candidate SHA' >&2; exit 2; }
     ranked_groups=(2 7 10 17 4)

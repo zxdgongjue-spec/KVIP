@@ -7,10 +7,12 @@ import re
 from pathlib import Path
 from statistics import median
 
+import numpy as np
+
 from peer_candidate import RANKED_BASE
 from peer_delta import pair_placement, read
 from ranked_help_report import matched_samples
-from ranked_joint_report import drift
+from ranked_joint_report import drift, early_index_stats, joint_endpoints
 
 FIXED = '6bca602ad9e548e9f12c0142fea25f2bc5c6877d'
 GROUPS = (2, 7, 10, 17, 4)
@@ -56,13 +58,15 @@ def load(root, group, label, revision=None):
     if not native and (result['production_revision'] != revision or len(result['binary_sha256']) != 64
                        or len(digests) != counts or not all(re.fullmatch('[0-9a-f]{64}', x) for x in digests)):
         raise ValueError(f'{label}: wrong fused source or incomplete TopK verification')
-    detail = {} if native else read(path.parent / 'diagnose/round-1/lean_stages.json')
+    diagnostic_dir = path.parent / 'diagnose/round-1'
+    detail = {} if native else read(diagnostic_dir / 'lean_stages.json')
     return dict(inputs=inp, config=cfg, timing=timing, samples=samples, digests=digests, placement=place,
-                detail=detail, route=result.get('auto_route'), binary=result.get('binary_sha256'))
+                detail=detail, directory=diagnostic_dir, route=result.get('auto_route'), binary=result.get('binary_sha256'))
 
 
 def verify_pair(left, right):
-    keys = ('group', 'device', 'transport', 'warmup', 'iterations', 'round_range', 'kvaf_root')
+    keys = ('group', 'device', 'transport', 'warmup', 'iterations', 'round_range', 'kvaf_root',
+            'prefetch_rank_start', 'intermediate_fetches', 'prefetch_tokens')
     if left['inputs'] != right['inputs'] or any(left['config'][k] != right['config'][k] for k in keys):
         raise ValueError('Different captured requests, geometry, KVAF, or timing protocol')
     if pair_placement(left['placement'], right['placement'], local_baseline=True) != 'matched':
@@ -94,6 +98,10 @@ def main(root, reference, group):
     if not re.fullmatch('[0-9a-f]{64}', digest) or digest != (reference/f'g{group}/input.sha256').read_text().strip():
         raise ValueError('Capture bytes differ from original')
     fixed, auto = load(root, group, 'fixed', FIXED), load(root, group, 'auto', sha)
+    for arm, revision in ((fixed, FIXED), (auto, sha)):
+        compiled = (root/f'ranked-{revision[:8]}.binary.sha256').read_text().strip()
+        if arm['binary'] != compiled:
+            raise ValueError('Loaded library differs from preflight build')
     if fixed['binary'] == auto['binary'] or any((a['config'].get('ranked_q_workers') or 2) != 2 for a in (fixed, auto)):
         raise ValueError('Unexpected binary or final communication width')
     controls = {'fixed':fixed, 'original_archive':load(reference, group, 'baseline', RANKED_BASE)}
@@ -132,12 +140,17 @@ def main(root, reference, group):
     lifecycle = route.get('lifecycle') or {}
     if group in (2, 7) and not (lifecycle.get('misprediction_recovered') and lifecycle.get('invalid_identity_preserved')):
         raise ValueError('Missing route lifecycle checks')
-    print(f'G{group} ROUTE cold_high={cold["high"]}/{n} steady_low/high={measured["low"]}/{measured["high"]} '
+    print(f'G{group} ROUTE cold_high={cold["high"]}/{n} cold_event_mean_us={route["cold_event_mean_us"]:.2f} '
+          f'steady_low/high={measured["low"]}/{measured["high"]} '
           f'Get_p50={median(measured["feedback_demand_per_call"]):g} screen={verdict}')
     for label, arm in controls.items():
         delta = comparisons[label]
         print(f'G{group} {label}->auto event_mean/span_p50_us={pair(headline(arm))}->{pair(headline(auto))} '
               f'saved_us={pair(delta["saved_us"], True)} gain_pct={pair(delta["gain_pct"],True)}')
+    if group == 2:
+        threshold = [min(x) for x in zip(headline(controls['serial2']), headline(controls['serial32']))]
+        parity = all(value <= bound for value, bound in zip(headline(auto), threshold))
+        print(f'G2 SERIAL_PARITY mean_and_p50_vs_both={parity}')
     print(f'G{group} SAME_TOPK={match["n"]}/{n} paired_span_p50_saved_us={exact if exact is None else round(exact,2)} '
           f'DRIFT last5-first5_span_mean/p50_us fixed={pair(within["fixed"],True)} auto={pair(within["auto"],True)}')
     stages = fixed['timing']['stage_mean_us']
@@ -147,10 +160,22 @@ def main(root, reference, group):
         value = arm['detail']['stages'].get(name, {}).get('p50_us')
         return 'NA' if value is None else f'{value:.2f}'
     print(f'G{group} STAGE_P50_us fixed/auto ' + ' '.join(
-        f'{s}={aux(fixed,s)}/{aux(auto,s)}' for s in ('planning', 'direct_plan_and_describe', 'final_get_post',
+        f'{s}={aux(fixed,s)}/{aux(auto,s)}' for s in ('routing_probe_aiv', 'planning', 'direct_plan_and_describe', 'final_get_post',
                                                       'index_active_work', 'final_get_cq_wait')))
+    high = {}
+    for label, arm in (('fixed', fixed), ('auto', auto)):
+        if label == 'auto' and route['diagnostic']['high'] != n:
+            continue
+        with np.load(arm['directory']/'lean_ticks.npz', allow_pickle=False) as ticks:
+            team = joint_endpoints(ticks)
+            early = early_index_stats(ticks)
+        high[label] = dict(early_reads=early['hits'], early_moves=early['moves'],
+                           last_index_minus_CQ_p50_us=team['last_index_minus_last_cq']['p50'])
+    if 'auto' in high:
+        print(f'G{group} HIGH_INDEX fixed/auto early_reads={high["fixed"]["early_reads"]}/{high["auto"]["early_reads"]} '
+              f'last_Index_minus_CQ_p50_us={high["fixed"]["last_index_minus_CQ_p50_us"]}/{high["auto"]["last_index_minus_CQ_p50_us"]}')
     print(f'G{group} CHECK TopK/KV/Index=PASS lifecycle={"PASS" if lifecycle else "covered_by_G2_G7"}')
-    result = dict(comparisons=comparisons, route=route, matched=match, drift=within, screen=verdict,
+    result = dict(comparisons=comparisons, route=route, matched=match, drift=within, high_index=high, screen=verdict,
                   headline={k:headline(a) for k,a in {**controls,'auto':auto}.items()})
     (root/f'g{group}/auto_comparison.json').write_text(json.dumps(result, indent=2, allow_nan=False)+'\n')
 
