@@ -28,6 +28,8 @@ joint=false
 joint_local=false
 joint_archive=false
 ranked_auto=false
+parity=false
+parity_previous=
 index_ab=false
 fresh_control=false
 current_fixed=6bca602ad9e548e9f12c0142fea25f2bc5c6877d
@@ -69,7 +71,8 @@ if [[ ${1:-} == --ranked-help || ${1:-} == --ranked-joint ]]; then
     elif [[ -n "$joint_reference" ]]; then
         echo '--previous requires --ranked-joint' >&2; exit 2
     fi
-elif [[ ${1:-} == --ranked-auto || ${1:-} == --ranked-auto-index ]]; then
+elif [[ ${1:-} == --ranked-auto || ${1:-} == --ranked-auto-index || ${1:-} == --ranked-parity ]]; then
+    if [[ $1 == --ranked-parity ]]; then parity=true; fi
     ranked_auto=true
     if [[ $1 == --ranked-auto-index ]]; then
         index_ab=true
@@ -81,6 +84,15 @@ elif [[ ${1:-} == --ranked-auto || ${1:-} == --ranked-auto-index ]]; then
     help_reference="$area/help-772293d4-fecf79e510598355a1ee"
     shift 2
     if [[ ${1:-} == --reference ]]; then help_reference=${2:?supply same-node ranked reference}; shift 2; fi
+    if "$parity"; then
+        [[ ${1:-} == --previous ]] || { echo '--ranked-parity requires --previous DIR for the completed 91c0271c run' >&2; exit 2; }
+        parity_previous=$(cd "${2:?supply previous routed comparison root}" && pwd -P)
+        shift 2
+        for file in host.txt physical_npu.txt baseline.txt; do
+            cmp -s "$help_reference/$file" "$parity_previous/$file" || { echo "Previous run differs: $file" >&2; exit 1; }
+        done
+        [[ $(<"$parity_previous/candidate.txt") == 91c0271ce98c19a50bab59530d76a9f82de07b00 ]] || { echo 'Previous run must use 91c0271c' >&2; exit 1; }
+    fi
     if "$index_ab" && [[ ${1:-} == --fresh-control ]]; then fresh_control=true; shift; fi
     help_reference=$(cd "$help_reference" && pwd -P)
     if [[ $(<"$help_reference/baseline.txt") != "$ranked_sha" ||
@@ -135,7 +147,7 @@ if [[ -z "$ranked" && $# -eq 2 && $1 == --reuse-serial ]]; then
         exit 1
     fi
 elif [[ $# -ne 0 ]]; then
-    echo 'Usage: peer_fused.sh --ranked-auto-index FULL_SHA [--reference DIR] [--fresh-control] | --ranked-auto FULL_SHA [--reference DIR] | --ranked-joint-local FULL_SHA [--reference DIR] | --ranked-joint FULL_SHA --previous DIR [--reference DIR] | --ranked-help FULL_SHA [--reference DIR] [--resume DIR] [--anchor GROUP] | --ranked-index CANDIDATE_SHA | [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
+    echo 'Usage: peer_fused.sh --ranked-parity FULL_SHA [--reference DIR] --previous DIR | --ranked-auto-index FULL_SHA [--reference DIR] [--fresh-control] | --ranked-auto FULL_SHA [--reference DIR] | --ranked-joint-local FULL_SHA [--reference DIR] | --ranked-joint FULL_SHA --previous DIR [--reference DIR] | --ranked-help FULL_SHA [--reference DIR] [--resume DIR] [--anchor GROUP] | --ranked-index CANDIDATE_SHA | [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
     exit 2
 fi
 export PATH=/usr/local/python3.12.13/bin:$PATH
@@ -146,6 +158,7 @@ if [[ -n "$help_reference" ]] || "$joint_local"; then
     host_id=$(</proc/sys/kernel/hostname)
     boot_id=$(</proc/sys/kernel/random/boot_id)
     key_parts=("$ranked" "$help_reference" "$host_id" "$boot_id" "$harness" "$peer_physical_npu")
+    if "$parity"; then key_parts+=("fixed-native-parity" "$parity_previous"); fi
     if "$index_ab"; then key_parts+=("routed-index" "$fresh_control"); fi
     if "$joint"; then key_parts+=("$joint_reference"); fi
     if "$joint_archive"; then key_parts+=("joint-control" "$ranked_q_workers"); fi
@@ -300,7 +313,9 @@ if [[ -n "$ranked" ]]; then
     printf 'CONFIG URMA physical_NPU=%s logical_device=0 BS16 Q4 656B ranked=%.8s candidate=%.8s KVAF=%.8s\n' "$peer_physical_npu" "$ranked_sha" "$ranked" "$transport"
     # Compile through the same cache key used by run_path. Fail before copying
     # five traces or running the baseline if the toolchain rejects either arm.
-    if "$index_ab"; then
+    if "$parity"; then
+        printf 'CONTROLS fresh=G2:serial32,high:fixed_%.8s original_archive=%.8s previous_archive=91c0271c\n' "$current_fixed" "$ranked_sha"
+    elif "$index_ab"; then
         printf 'CONTROLS routed_control=%.8s routed_candidate=%.8s original=%.8s final_communication_cores=8\n' "$current_fixed" "$ranked" "$ranked_sha"
     elif "$ranked_auto"; then
         printf 'CONTROLS current_fixed=%.8s original=%.8s G2_native_workers=2,32 final_communication_cores=8\n' "$current_fixed" "$ranked_sha"
@@ -461,7 +476,12 @@ if [[ -n "$help_reference" ]] || "$joint_local"; then
                 bash "$tools/peer_g2_input.sh" "$work" "$group")
             cmp -s "$case_dir/input.sha256" "$help_reference/g$group/input.sha256" || { echo "Changed G$group input" >&2; exit 1; }
             arms=("${auto_order[@]}")
-            if "$index_ab"; then
+            report_args=(--reference "$help_reference" --group "$group")
+            if "$parity"; then
+                report="$tools/support/ranked_parity_report.py"
+                report_args+=(--previous "$parity_previous")
+                if [[ $group == 2 ]]; then arms=(serial32 auto); fi
+            elif "$index_ab"; then
                 report="$tools/support/ranked_index_report.py"
                 archive_args=()
                 if "$fresh_control"; then archive_args+=(--fresh-control); fi
@@ -481,7 +501,7 @@ if [[ -n "$help_reference" ]] || "$joint_local"; then
                     touch "$case_dir/$arm/pass"
                 fi
             done
-            "$PYTHON" -B "$report" "$out" --reference "$help_reference" --group "$group" >"$case_dir/summary.tmp"
+            "$PYTHON" -B "$report" "$out" "${report_args[@]}" >"$case_dir/summary.tmp"
             mv "$case_dir/summary.tmp" "$case_dir/summary.txt"
             cat "$case_dir/summary.txt"
             auto_order=("${auto_order[1]}" "${auto_order[0]}")
