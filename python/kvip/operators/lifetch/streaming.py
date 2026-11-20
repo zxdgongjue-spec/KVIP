@@ -126,7 +126,8 @@ class StreamingLIFetchForward:
             self.worker_status.data_ptr(),
             self.times.data_ptr(),
         ]
-        geometry = [self.history, self.resident, prefetch_limit | ((q_workers or 0) << 16), 2048 + 8192]
+        self._index_team_option = 0x01000000 if self.index_team_cores else 0
+        geometry = [self.history, self.resident, prefetch_limit | (q_workers << 16) | self._index_team_option, 2048 + 8192]
         trailing = [self.query_bitmaps.data_ptr(), self.query_errors.data_ptr(), update.bindings.data_ptr()]
         blob = np.concatenate(
             (
@@ -185,6 +186,7 @@ class StreamingLIFetchForward:
         """Startup/profile-only update; forward never allocates or copies."""
         value = (
             self.prefetch_limit
+            | self._index_team_option
             | ((self.q_workers or 0) << 16)
             | (0x20000000 if self.legacy_layout else 0)
             | (0x10000000 if self.parallel_finalize else 0)

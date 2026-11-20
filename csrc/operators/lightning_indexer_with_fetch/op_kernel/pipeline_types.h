@@ -1,7 +1,7 @@
 #pragma once
 #include <stdint.h>
 namespace pipeline_ab {
-constexpr uint32_t kIndexTeamLanes=4;
+constexpr uint32_t kIndexTeamLanes=4, kIndexTeamOption=0x01000000U;
 constexpr uint32_t kIndexTeamMinHistory=10496; // Scratch after the two dense permutation maps.
 inline constexpr bool UseIndexTeam(uint32_t batch,uint32_t aic,uint32_t history) {
  return batch==16 && 2*aic==kIndexTeamLanes*batch && history>=kIndexTeamMinHistory;

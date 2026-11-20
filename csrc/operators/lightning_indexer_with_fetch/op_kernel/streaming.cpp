@@ -1226,7 +1226,7 @@ inline void RetireRoundControl(__gm__ Args* a,uint32_t batch,uint32_t workers,ui
   asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->count),asc_ldcg(live));
   asc_stcg(live,0U);
  }
- if(a->indexTeam && block<batch && t<5){
+ if((a->prefetchCount & kIndexTeamOption) && a->indexTeam && block<batch && t<5){
   auto f=reinterpret_cast<__gm__ BatchFlag*>(a->indexTeam)+5*block+t;
   asc_stcg(&f->ready,0U);
  }
@@ -1257,7 +1257,7 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
   auto trace=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*256+uint64_t(block)*32;
   if(profile)trace[0]=GetSystemCycle();
 #if !V9_UBMEM
-  bool team=a->indexTeam && a->completedFlags && shape.batch==16 && shape.aicCount==32 &&
+  bool team=(a->prefetchCount & kIndexTeamOption) && a->indexTeam && a->completedFlags && shape.batch==16 && shape.aicCount==32 &&
       shape.history>=kIndexTeamMinHistory;
 #else
   constexpr bool team=false;
