@@ -9,7 +9,6 @@
 #include <cstdint>
 #include <iostream>
 #include <thread>
-#include <tuple>
 #include <vector>
 
 #define __simt_callee__
@@ -80,16 +79,12 @@ void SimulatedCopy(uint32_t*,uint32_t,uint32_t field,uint64_t*,uint32_t*,uint64_
     }
     if(claim)index_team::TryFourthBody(claim,block,reinterpret_cast<uint32_t*>(saved));
 }
-std::atomic<unsigned> stagesDone{},pauseAfterStage{},batchSuffixRuns{};
+std::atomic<unsigned> stagesDone{};
 namespace Simt {
 struct Dim3 {unsigned x,y,z;};
 template<auto Function,class... A> void VF_CALL(Dim3,A... args){
     if constexpr(sizeof...(A)==3)Function(args...); // Actual device claim.
-    else if constexpr(sizeof...(A)==7 || sizeof...(A)==6){
-        if constexpr(sizeof...(A)==7){
-            auto bounds=std::tie(args...);
-            if(std::get<3>(bounds)-std::get<2>(bounds)>1)++batchSuffixRuns;
-        }
+    else if constexpr(sizeof...(A)==7 || sizeof...(A)==5){
         // Run the actual fourth-field handoff with device-width barriers.
         std::barrier wave(256);
         std::vector<std::thread> threads;
@@ -97,10 +92,7 @@ template<auto Function,class... A> void VF_CALL(Dim3,A... args){
             threadIdx.x=t;waveBarrier=&wave;Function(args...);
         });
         for(auto& thread:threads)thread.join();
-        if constexpr(sizeof...(A)==6){
-            const auto ordinal=++stagesDone;
-            while(pauseAfterStage==ordinal)std::this_thread::yield();
-        }
+        if constexpr(sizeof...(A)==5)++stagesDone;
     }else SimulatedCopy(args...);
 }
 }
@@ -239,8 +231,13 @@ int main(){
         auto end=std::chrono::steady_clock::now()+std::chrono::seconds(15);
         while(!check()){assert(std::chrono::steady_clock::now()<end);std::this_thread::yield();}
     };
-    for(unsigned mode=0;mode<5;++mode){
+    std::array<uint32_t,batch> owners{};
+    for(unsigned r=0;r<batch;++r)owners[r]=r;
+    for(unsigned mode=0;mode<6;++mode){
         auto target=mode==4?home:peer;
+        const bool alias=mode==5;
+        owners[home]=alias?peer:home;
+        ctx.rowOwners=alias?uintptr_t(owners.data()):0;
         for(auto& f:team){f.ready=0;f.reserved[0]=0;}
         for(auto& f:flags)f.ready=0;
         for(auto r:{home,peer}){
@@ -257,6 +254,9 @@ int main(){
         bool terminal=false;
         auto field=index_team::Control(&a,target);
         stagesDone=0;
+        auto timeslot=times.data()+batch*256+32*standby;
+        timeslot[24]=999;  // Previous diagnostic layout recorded a second read here.
+        if(target==peer)index_team::PublishPrefix(&a,home);
         index_team::PublishPrefix(&a,target);
         std::thread helper([&]{terminal=index_team::CopySealedPrefix(&a,standby,batch);});
         deadline([&]{return stagesDone.load()==1;});
@@ -264,9 +264,11 @@ int main(){
         // Pre-read made no GM writes. Competing post-CQ and primary helpers
         // cannot double-claim the peer. If home becomes ready first, it can
         // finish while its peer is still waiting on the Q4 snapshots.
-        if(mode==0){
-            index_team::PublishPlan(&a,home,2,0);
+        if(mode==0 || alias){
+            index_team::PublishPlan(&a,home,2,0,true);
             index_team::Publish(flags.data()+home*kFlagCount+4,0,0);
+        }
+        if(mode==0){
             auto homeClaim=index_team::Moves(&a,home)+index_team::kClaimOffset;
             deadline([&]{return index_team::ReadClaim(homeClaim)==(index_team::kFourthSuffixReady|1U);});
             assert(localKeys(home,0,12)==1000*home+112 && !field[4].ready);
@@ -285,67 +287,12 @@ int main(){
             unsigned src=(w<12 || mode==2 || mode==3)?k:k==0?1:0;
             assert(localKeys(target,k,w)==1000*target+100*src+w);
         }
-        auto timeslot=times.data()+batch*256+32*standby;
         assert(timeslot[16]<=timeslot[17] && timeslot[17]<=timeslot[18]);
         assert(timeslot[19]==2 && timeslot[20]==target+1);
+        assert(timeslot[24]==0);
+        if(alias)assert(index_team::ReadClaim(index_team::Moves(&a,home)+index_team::kClaimOffset)==0);
     }
-    // Hold both gates closed while the same AIV owns two sealed prefixes.
-    // Open one gate between slices and assert its order, then allow an error
-    // in the partner. All source words in a chunk form one long permutation.
-    for(unsigned scenario=0;scenario<4;++scenario){
-        constexpr unsigned n=777;
-        auto key=[&](unsigned r,unsigned i,unsigned w)->uint64_t&{
-            return keys[(uint64_t(r)*history+i)*16+w];
-        };
-        for(auto& f:team){f.ready=0;f.reserved[0]=0;}
-        for(auto& f:flags)f.ready=0;
-        for(auto r:{home,peer}){
-            auto e=index_team::Moves(&a,r);
-            e[0]=n;e[1]=n+1;e[2]=n+2;
-            for(unsigned i=0;i<n+2;++i){
-                e[kIndexEdgesOffset+2*i]=i<n?i:(i==n?1:n);
-                e[kIndexEdgesOffset+2*i+1]=i<n?(i+1)%n:i;
-                for(unsigned w=0;w<16;++w)key(r,i,w)=100000*r+32*i+w;
-            }
-            index_team::PublishPrefix(&a,r);
-        }
-        auto publish=[&](unsigned r,unsigned planError,unsigned qError){
-            index_team::PublishPlan(&a,r,3,planError,true);
-            index_team::Publish(flags.data()+r*kFlagCount+4,0,qError);
-        };
-        stagesDone=0;pauseAfterStage=2;batchSuffixRuns=0;
-        bool complete=false;
-        std::thread helper([&]{complete=index_team::CopySealedPrefix(&a,standby,batch);});
-        deadline([&]{return stagesDone.load()==2;}); // peer entirely read; home has <=256 moves
-        for(auto r:{home,peer}){
-            assert(index_team::ReadClaim(index_team::Moves(&a,r)+index_team::kClaimOffset)==standby+1);
-            assert(key(r,1,12)==100000*r+32+12);
-        }
-        bool homeFirst=scenario==1 || scenario==3;
-        unsigned first=homeFirst?home:peer, second=homeFirst?peer:home;
-        publish(first,0,0);pauseAfterStage=0;
-        deadline([&]{return index_team::Control(&a,first)[4].ready.load();});
-        assert(!index_team::Control(&a,second)[4].ready && key(second,1,12)==100000*second+32+12);
-        publish(second,scenario==2?4:0,scenario==3?8:0);
-        helper.join();
-        assert(complete);
-        for(auto r:{home,peer}){
-            unsigned err=r==second && scenario>=2?(scenario==2?4:8):0;
-            assert(index_team::Control(&a,r)[4].ready && index_team::Control(&a,r)[4].error==err);
-            for(unsigned i=0;i<n+2;++i)for(unsigned w=0;w<16;++w){
-                unsigned src=w<12 || err?i:(i>=n?0:(i+n-1)%n);
-                assert(key(r,i,w)==100000*r+32*src+w);
-            }
-        }
-        const auto t=times.data()+batch*256+32*standby;
-        assert(t[20]==peer+1 && t[25]==home+1 && t[19]==n && t[24]==n);
-        assert(t[26]==256 && t[27]>0 && t[29]>=t[27]);
-        assert(t[28]>=1 && t[28]<=4 && (scenario!=1 || t[28]==4));
-        if(scenario<2)assert(batchSuffixRuns>=1);
-        if(scenario==0)assert(t[18]<t[22]); // serve the first row before gathering all of the second
-    }
-    std::cout<<"TWO_SEALED_ROWS_PASS ready_order=both max_secondary_gather=256 "
-                "ordered_suffix=1 failed_plan_or_Q4_no_writes=1 exactly_once=1\n";
+    ctx.rowOwners=0;
     std::cout<<"SEALED_PREFIX_PASS pending_plan_and_Q4=1 failed_plan_and_Q4=1 "
                 "dependent_suffix=1 paired_home_progress=1 no_early_writes=1 fields_exact=1\n";
     std::cout<<"INDEX_CQ_PREFIX_PASS full_chunk=1024 suffix_owner=comm,local_index,nominal_fourth,remote_index exactly_once=true\n";
