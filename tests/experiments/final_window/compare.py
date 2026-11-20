@@ -42,7 +42,12 @@ def main():
                 active_rows=int(valid.any(dim=1).sum()),
                 compact_misses=int(detail[:,0,3].sum()),
                 terminal_posted=int(detail[:,0,4].sum()),
-                per_row=detail[:,0,2:5].tolist()))
+                per_row=detail[:,0,2:5].tolist(),
+                active_details=[dict(row=i, eligible=int(detail[i,0,2]),
+                    misses_per_q=detail[i,0,8:12].tolist(),
+                    posted=int(detail[i,0,4]), reason_bits=int(detail[i,0,6]),
+                    used_lru=int(detail[i,0,7]))
+                    for i in range(shape["batch"]) if bool(valid[i].any())]))
             if iteration == args.warmup:
                 logical = update.logical_output.cpu().reshape(shape["batch"],4,2048)[valid]
                 slots = update.slot_output.cpu().reshape(shape["batch"],4,2048)[valid].long()

@@ -7,11 +7,22 @@ inline void PrepareTerminal(__gm__ pipeline_ab::Args* a,uint32_t b) {
  auto shape=rotating::LoadRuntimeShape(ctx);
  auto errors=reinterpret_cast<__gm__ uint32_t*>(a->queryErrors)+b*128;
  auto row=reinterpret_cast<__gm__ rotating::Row*>(ctx->rows)+b;
- uint32_t total=0;bool eligible=true;
+ uint32_t total=0,reason=0;
  for(uint32_t q=0;q<4;++q){uint32_t n=asc_ldcg(errors+q*32+1);
-  if(asc_ldcg(errors+q*32) || !n || n>65)eligible=false;else total+=n-1;}
- eligible=eligible && total<=256 && asc_ldcg(&row->slots)+total<=rotating::kLruSlots;
- if(!threadIdx.x){asc_stcg(errors+2,uint32_t(eligible));asc_stcg(errors+3,total);asc_stcg(errors+4,asc_ldcg(&row->requests));}
+  if(asc_ldcg(errors+q*32))reason|=1;
+  if(!n || n>2049)reason|=2;
+  if(n && n<=2049)total+=n-1;
+  if(!threadIdx.x)asc_stcg(errors+8+q,n?n-1:UINT32_MAX);
+ }
+ uint32_t used=asc_ldcg(&row->slots);
+ if(total>rotating::kCandidateCapacity)reason|=4;
+ if(used>rotating::kLruSlots || total>rotating::kLruSlots-used)reason|=8;
+ bool eligible=!reason && total>0;
+ if(!threadIdx.x){
+  asc_stcg(errors+2,uint32_t(eligible));asc_stcg(errors+3,total);
+  asc_stcg(errors+4,0U);asc_stcg(errors+5,asc_ldcg(&row->requests));
+  asc_stcg(errors+6,reason);asc_stcg(errors+7,used);
+ }
  if(!eligible)return;
  auto loc=reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*8192;
  auto backup=reinterpret_cast<__gm__ uint32_t*>(ctx->sourceOffsets)+b*8192;
@@ -44,7 +55,7 @@ inline void RestoreTerminal(__gm__ pipeline_ab::Args* a,uint32_t b) {
  }
  for(uint32_t q=threadIdx.x;q<4;q+=256)asc_stcg(errors+q*32+1,1U);
  if(!threadIdx.x){auto row=reinterpret_cast<__gm__ rotating::Row*>(ctx->rows)+b;
-  asc_stcg(errors+4,asc_ldcg(&row->requests)-asc_ldcg(errors+4));}
+  asc_stcg(errors+4,asc_ldcg(&row->requests)-asc_ldcg(errors+5));}
  asc_threadfence();
 }
 __aicore__ inline void RunTerminalService(__gm__ pipeline_ab::Args* a,uint32_t lane) {

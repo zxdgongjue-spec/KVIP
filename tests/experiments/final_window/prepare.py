@@ -23,6 +23,10 @@ def prepare(repo, destination):
             raise ValueError(f'Expected unique patch site: {relative}: {old[:80]}')
         path.write_text(text.replace(old,new))
     base='csrc/operators/lightning_indexer_with_fetch/'
+    # Export all final misses into the existing 2048-entry per-Q buffer.
+    # Leave the original resolver's 64-entry fast-path limit unchanged.
+    patch(base+'op_kernel/compact_misses.h',
+          'if(scan[15]<=kCompactMissLimit){', 'if(scan[15]<=2048){')
     # Keep RunLi available inside the tail translation unit, without duplicate entry points.
     patch(base+'op_kernel/indexer.cpp','extern "C" __global__ __aicore__ void v9_li_kernel(GM_ADDR bindings) {',
           '#ifndef KVIP_FINAL_WINDOW_INCLUDE\nextern "C" __global__ __aicore__ void v9_li_kernel(GM_ADDR bindings) {')

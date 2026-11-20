@@ -9,7 +9,7 @@ A uses the checked-out operator unchanged. B is built from an isolated copy:
 
 - Final TopK runs at the start of the streaming tail kernel; the separate final
   TopK launch is removed. Existing incremental TopK and classification are reused.
-- A request qualifies if every Q has a valid compact miss list of at most 64
+- A request qualifies if every Q has a valid compact miss list of at most 2048
   entries and the sum fits the remaining 2048-entry LRU allocation. Duplicate
   entries are included in this conservative capacity test.
 - The intermediate `FastService` union and WQE posting implementation handles
@@ -36,3 +36,9 @@ completion/bounds checks. Timing is not accepted if either comparison fails.
 Outputs: `ab_summary.json`, per-variant profiler traces, correctness artifacts,
 terminal eligibility/post counts, and the complete isolated candidate source.
 Only the experimental copy is patched; no installed serving library is replaced.
+
+Terminal diagnostics: reason_bits 1=classifier error, 2=invalid count,
+4=sum exceeds candidate capacity, 8=insufficient remaining LRU. Empty rows
+do not count as eligible. Counts include every Q; fallback posted is zero.
+Only the experimental final classifier exports beyond 64 misses; the original
+resolver fast-path bound remains unchanged.
