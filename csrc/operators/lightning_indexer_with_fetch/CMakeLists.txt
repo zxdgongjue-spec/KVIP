@@ -9,6 +9,22 @@ set(KVAF_INCLUDE "" CACHE PATH "KVAF device interface headers")
 if(NOT EXISTS "${KVAF_INCLUDE}/kvaf_batch_get_device.h")
   message(FATAL_ERROR "Set KVAF_INCLUDE to the patched KVAF aiv_batch_get/include directory")
 endif()
+# The inline device Get is compiled into this operator. Leave the native KVAF
+# checkout and the header used by other libraries untouched.
+find_package(Git REQUIRED)
+set(_kvaf_private "${CMAKE_CURRENT_BINARY_DIR}/kvaf-private")
+set(_tail_patch "${CMAKE_CURRENT_SOURCE_DIR}/kvaf_post_tail.patch")
+file(MAKE_DIRECTORY "${_kvaf_private}")
+configure_file("${KVAF_INCLUDE}/kvaf_batch_get_device.h" "${_kvaf_private}/kvaf_batch_get_device.h" COPYONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_tail_patch}")
+execute_process(
+  COMMAND "${CMAKE_COMMAND}" -E env "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}"
+          "${GIT_EXECUTABLE}" apply --no-index --whitespace=error "${_tail_patch}"
+  WORKING_DIRECTORY "${_kvaf_private}"
+  RESULT_VARIABLE _patch_result ERROR_VARIABLE _patch_error)
+if(NOT _patch_result EQUAL 0)
+  message(FATAL_ERROR "Unsupported KVAF device Get header at ${KVAF_INCLUDE}: ${_patch_error}")
+endif()
 set(KVIP_FUSE_QUERY_WORK ON)
 include(${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
 set(KVIP_OUTPUT_WORKER ON)
@@ -18,7 +34,7 @@ endif()
 set(_base "${CMAKE_CURRENT_SOURCE_DIR}")
 ascendc_library(v9_kernel STATIC op_kernel/indexer.cpp op_kernel/lifecycle.cpp op_kernel/streaming.cpp)
 ascendc_include_directories(v9_kernel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel
-  ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/indexer ${KVAF_INCLUDE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/indexer ${_kvaf_private} ${KVAF_INCLUDE}
   ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)
 ascendc_compile_options(v9_kernel PRIVATE -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WORKER=$<BOOL:${KVIP_OUTPUT_WORKER}> -DKVIP_FUSE_QUERY_WORK=$<BOOL:${KVIP_FUSE_QUERY_WORK}> -O2 -g --cce-auto-sync=off
   -mllvm -user-reserved-ub-size=223232 -DV9_USER_UB_BYTES=223232

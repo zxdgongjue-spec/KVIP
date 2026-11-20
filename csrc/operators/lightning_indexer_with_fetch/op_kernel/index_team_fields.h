@@ -1,10 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-// Only thread zero elects one worker for this row. Preserve the owner until
-// the next invocation's planner opens a new claim.
+// A normal winner owns the field through publication. A communication
+// helper may instead publish the first uncopied chunk for any later winner.
+constexpr uint32_t kFourthPrefixBusy=0x40000000U;
+constexpr uint32_t kFourthSuffixReady=0x80000000U;
 __simt_callee__ inline void TryFourthBody(__gm__ uint32_t* claim,uint32_t block,__ubuf__ uint32_t* won) {
-    if(threadIdx.x==0)*won=asc_atomic_cas(claim,0U,block+1)==0U;
+    if(threadIdx.x!=0)return;
+    uint32_t prior=asc_atomic_cas(claim,0U,block+1);
+    uint32_t cursor=0;
+    if(!prior)cursor=1;
+    else if((prior&kFourthSuffixReady) && asc_atomic_cas(claim,prior,block+1)==prior)
+        cursor=1+(prior&~kFourthSuffixReady);
+    *won=cursor; // Zero lost, one starts at chunk zero, N+1 resumes at N.
 }
 
 __simt_vf__ __aicore__ LAUNCH_BOUND(32) inline void ClaimFourth(

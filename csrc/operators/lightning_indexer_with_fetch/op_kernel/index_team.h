@@ -3,7 +3,7 @@
 
 namespace index_team {
 constexpr uint32_t kWidth=4, kMaxMoves=2*CHUNK;
-constexpr uint32_t kTraceMagic=0x49445835U;
+constexpr uint32_t kTraceMagic=0x49445836U;
 // The claim occupies its own cache line beyond every legal plan. Only the
 // planner initializes it, before publishing this replay's chunk directory.
 constexpr uint32_t kClaimOffset=kIndexEdgesOffset+4*(kPrefetch+kMaxFinal);
@@ -39,10 +39,10 @@ __aicore__ inline void TraceField(__gm__ uint64_t* base,uint32_t batch,uint32_t 
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(trace),8*sizeof(uint64_t));
 }
 
-__aicore__ inline bool TryFourth(__gm__ uint32_t* claim,uint32_t block,LocalTensor<uint32_t> result) {
+__aicore__ inline uint32_t TryFourth(__gm__ uint32_t* claim,uint32_t block,LocalTensor<uint32_t> result) {
     Simt::VF_CALL<ClaimFourth>(Simt::Dim3{32,1,1},claim,block,reinterpret_cast<__ubuf__ uint32_t*>(result.GetPhyAddr()));
     SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
-    return result.GetValue(0)!=0;
+    return result.GetValue(0);
 }
 
 template<bool Claim>
@@ -59,6 +59,8 @@ __aicore__ inline void RunField(__gm__ Args* a,uint32_t row,uint32_t chunks,uint
         reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*a->resident,local,claim,block);
     SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
 }
+
+#include "index_team_help.h"
 
 __aicore__ __attribute__((noinline)) inline void Copy(__gm__ Args* a,uint32_t block,uint32_t batch) {
     uint32_t row,lane;
@@ -77,12 +79,16 @@ __aicore__ __attribute__((noinline)) inline void Copy(__gm__ Args* a,uint32_t bl
     pipe.InitBuffer(buffer,kMaxMoves*(5*sizeof(uint64_t)+2*sizeof(uint32_t)));
     auto local=reinterpret_cast<__ubuf__ uint64_t*>(buffer.Get<uint64_t>().GetPhyAddr());
     uint64_t attempt=profile?GetSystemCycle():0;
-    bool won=false;
+    uint32_t won=0;
     if(lane==3){
         // The Get worker has already published its completion. A losing CAS
         // returns even while the winner is still copying.
-        won=planReady && TryFourth(claim,block,buffer.Get<uint32_t>());
-        if(!won){pipe.Destroy();return;}
+        won=planReady?TryFourth(claim,block,buffer.Get<uint32_t>()):0;
+        if(!won){
+            pipe.Destroy();
+            HelpAfterLocalWork(a,block,batch);
+            return;
+        }
     }
     // All changes to the four fields still follow the Q4 descriptor snapshot.
     auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+row*kFlagCount;
@@ -96,7 +102,7 @@ __aicore__ __attribute__((noinline)) inline void Copy(__gm__ Args* a,uint32_t bl
     if(lane<3){
         if(!error && chunks){
             RunField<true>(a,row,chunks,lane,local,claim,block);
-            won=buffer.Get<uint32_t>().GetValue(0)!=0;
+            won=buffer.Get<uint32_t>().GetValue(0);
         }else if(planReady){
             won=TryFourth(claim,block,buffer.Get<uint32_t>());
         }
@@ -106,10 +112,14 @@ __aicore__ __attribute__((noinline)) inline void Copy(__gm__ Args* a,uint32_t bl
     }
     if(won){
         start=profile?GetSystemCycle():0;
-        if(!error && chunks)RunField<false>(a,row,chunks,3,local,nullptr,block);
+        if(!error && chunks){
+            if(won==1)RunField<false>(a,row,chunks,3,local,nullptr,block);
+            else CopyOwnedFourth(a,row,won-1,chunks);
+        }
         if(profile)TraceField(trace,batch,row,3,block,moves,attempt,start,GetSystemCycle(),error);
         Publish(control+4,0,error);
     }
     pipe.Destroy();
+    if(lane==3)HelpAfterLocalWork(a,block,batch);
 }
 } // namespace index_team

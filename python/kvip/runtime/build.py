@@ -58,7 +58,7 @@ def build_libraries(*, cache_dir, cann, headers, soc):
             digest.update(f"{tool.resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode())
     for directory in (root / "lightning_indexer_with_fetch", root / "common", Path(headers)):
         for path in sorted(directory.rglob("*")):
-            if path.is_file() and (path.suffix in (".h", ".cpp", ".py") or path.name == "CMakeLists.txt"):
+            if path.is_file() and (path.suffix in (".h", ".cpp", ".py", ".patch") or path.name == "CMakeLists.txt"):
                 digest.update(str(path.relative_to(directory)).encode())
                 digest.update(path.read_bytes())
     shared_selector = root / "lidu/op_kernel/hot_slot_selection.h"

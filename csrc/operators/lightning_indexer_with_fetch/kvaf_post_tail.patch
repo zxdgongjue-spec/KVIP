@@ -1,0 +1,37 @@
+--- a/kvaf_batch_get_device.h
++++ b/kvaf_batch_get_device.h
+@@ -588,8 +588,9 @@
+ // An explicit range belongs exclusively to this caller's leased queue.
+ // UINT32_MAX retains the standalone kernel's original prefix partitioning.
+-__aicore__ inline void KvafBatchGetDevice(
++template <class PostTail>
++__aicore__ inline void KvafBatchGetDeviceWithPostTail(
+     KvafExecuteBatchGetKernelArgs args, uint32_t core,
+-    uint32_t request_begin = 0U, uint32_t request_count = UINT32_MAX) {
++    uint32_t request_begin, uint32_t request_count, PostTail& post_tail) {
+   const uint32_t jettys_per_core =
+       args.jettys_per_core == 0U ? 1U : args.jettys_per_core;
+   if (args.block_count == 0U || core >= args.block_count ||
+@@ -787,6 +788,9 @@
+         profile_post_done_cycle = static_cast<uint64_t>(AscendC::GetSystemCycle());
+         counters.post_active_cycles += profile_post_done_cycle - post_start_cycle;
+       }
++      if (schedule.cursor == schedule.end) {
++        post_tail.Run();
++      }
+     } else {
+       const kvaf_batch_get::Group group = schedule.groups[schedule.oldest];
+       const uint64_t drain_start_cycle =
+@@ -857 +861,12 @@
++struct NoPostTail {
++  __aicore__ inline void Run() {}
++};
++
++__aicore__ inline void KvafBatchGetDevice(
++    KvafExecuteBatchGetKernelArgs args, uint32_t core,
++    uint32_t request_begin = 0U, uint32_t request_count = UINT32_MAX) {
++  NoPostTail tail;
++  KvafBatchGetDeviceWithPostTail(args, core, request_begin, request_count, tail);
++}
++
+ }  // namespace kvaf_device

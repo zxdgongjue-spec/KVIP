@@ -872,6 +872,28 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(256) inline void SnapshotMappings(
  if(b<batch && !t)asc_stcg(reinterpret_cast<__gm__ uint32_t*>(a->liveCount)+3+b,1U);
  asc_threadfence();
 }
+#if !V9_SIMULATION
+// KVAF invokes Run in the queue owner after its last doorbell and before
+// the terminal CQ drain. Its native success and error paths stay in charge.
+struct FinalIndexPostTail {
+ __gm__ Args* args;
+ uint32_t block, batch;
+ bool profile, enabled;
+ index_team::TailTicket ticket{};
+ uint64_t tryBegin=0, tryEnd=0, resumeBegin=0, resumeEnd=0;
+ uint32_t helpedRow=0, firstMoves=0, totalMoves=0;
+
+ __aicore__ inline void Run() {
+  if(!enabled)return;
+  if(profile)tryBegin=GetSystemCycle();
+  bool helped=index_team::TryBeforeCq(args,block,batch,ticket);
+  if(profile){
+   tryEnd=GetSystemCycle();
+   if(helped){helpedRow=ticket.row+1;firstMoves=ticket.firstMoves;totalMoves=ticket.moves;}
+  }
+ }
+};
+#endif
 template<bool Team=false>
 __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,uint32_t workers,bool skipEmptyConflict=true,bool standalone=false){
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
@@ -903,6 +925,10 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
  auto compactAddresses=reinterpret_cast<__gm__ uint64_t*>(packed);
  if(groupLayout){args.address_table=uint64_t(compactAddresses);args.table_capacity=stride;}
  uint64_t error=0;uint32_t completed=0,requested=0;bool hasConflict=false;
+ uint64_t firstDoorbell=0,lastPost=0,lastCompletion=0;
+#if !V9_SIMULATION
+ FinalIndexPostTail tail{a,uint32_t(GetBlockIdx()),shape.batch,profile,false};
+#endif
  for(uint32_t phase=0;phase<2 && !error;++phase){
   if(phase && skipEmptyConflict && !hasConflict)break;
   uint64_t prepareStart=profile?GetSystemCycle():0;
@@ -987,13 +1013,32 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
    uint64_t oldProfile=0;
    if(profile){kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),sizeof(*status));oldProfile=status->profile.magic;
     status->profile.magic=KVAF_AIV_BATCH_GET_PROFILE_MAGIC;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&status->profile),sizeof(status->profile));}
-   start=GetSystemCycle();kvaf_device::KvafBatchGetDevice(args,0,0,size);end=GetSystemCycle();
+   start=GetSystemCycle();
+   if constexpr(Team){
+    tail.enabled=workers==2 && (phase || !hasConflict);
+    kvaf_device::KvafBatchGetDeviceWithPostTail(args,0,0,size,tail);
+   }else kvaf_device::KvafBatchGetDevice(args,0,0,size);
+   end=GetSystemCycle();
    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),2*sizeof(*queue));
    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),sizeof(*status));
    if(profile){postCycles=status->profile.post_active_cycles;waitCycles=status->profile.drain_wait_cycles;groups=status->profile.submitted_group_count;
+    if constexpr(Team){
+     if(!firstDoorbell)firstDoorbell=status->profile.first_doorbell_cycle;
+     lastPost=status->profile.post_done_cycle;lastCompletion=status->profile.completion_done_cycle;
+    }
     status->profile.magic=oldProfile;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&status->profile),sizeof(status->profile));}
    error|=status->result;completed+=status->completed_batch_count;
    if(status->magic!=KVAF_AIV_BATCH_GET_STATUS_MAGIC || status->processed_request_count!=size)error|=kvaf_device::kInvalidArgs;
+   // A row may be waiting for this field before it publishes its Index
+   // status. Complete our ownership even on a transport error before that wait.
+   if constexpr(Team){
+    if(tail.ticket.nextChunk<tail.ticket.chunks){
+     const uint64_t resumeBegin=profile?GetSystemCycle():0;
+     if(index_team::FinishAfterCq(a,tail.block,shape.batch,tail.ticket) && profile){
+      tail.resumeBegin=resumeBegin;tail.resumeEnd=GetSystemCycle();
+     }
+    }
+   }
   }
 #else
   if(size)error|=kvaf_device::kInvalidArgs;
@@ -1011,9 +1056,18 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
   }
   }
  }
+ auto trace=profile?reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*256+
+     uint64_t(kResolveCores*shape.batch+q*workers+lane)*32:nullptr;
+ if(Team && profile){
+  trace[16]=firstDoorbell;trace[17]=lastPost;trace[18]=lastCompletion;
+#if !V9_SIMULATION
+  trace[19]=tail.helpedRow?tail.tryBegin:0;trace[20]=tail.helpedRow?tail.tryEnd:0;
+  trace[21]=tail.tryBegin;trace[22]=tail.tryEnd;trace[23]=tail.helpedRow;
+  trace[24]=tail.firstMoves;trace[25]=tail.totalMoves;
+  trace[26]=tail.resumeBegin;trace[27]=tail.resumeEnd;
+#endif
+ }
  if(a->prefetchCount & 0x10000000U){
-  auto trace=reinterpret_cast<__gm__ uint64_t*>(a->times)+uint64_t(shape.batch)*256+
-      uint64_t(kResolveCores*shape.batch+q*workers+lane)*32;
   if(profile)trace[12]=GetSystemCycle();
   // Update may invalidate displaced hot slots. Publish only after it finishes.
   bool deferredResidency=requested<=CHUNK;
@@ -1316,6 +1370,10 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
 #endif
   }
 #if !V9_UBMEM
+  // A row core may assist one ready remote field only after completing all
+  // its own publications and cleanup. Keep the original retirement barrier.
+  if(team && workers==2 && block<shape.batch*kResolveCores)
+   index_team::HelpAfterLocalWork(a,block,shape.batch);
   if(a->completedFlags){
    AscendC::SyncAll<true>();
    if(block<shape.batch || block<4*workers)

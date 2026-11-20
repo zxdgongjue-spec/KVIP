@@ -25,11 +25,13 @@ struct Args {
     uint32_t history,resident,prefetchCount;
 };
 struct Context {uintptr_t rowOwners{},hotValid;};
-struct {unsigned x=0;} threadIdx;
+thread_local struct {unsigned x=0;} threadIdx;
+thread_local std::barrier<>* waveBarrier=nullptr;
 template<class T> T asc_ldcg(T* p){return *p;}
+uint32_t asc_ldcg(uint32_t* p){return std::atomic_ref<uint32_t>(*p).load();}
 template<class T> void asc_stcg(T* p,T value){*p=value;}
-void asc_syncthreads(){}
-void asc_threadfence(){}
+void asc_syncthreads(){if(waveBarrier)waveBarrier->arrive_and_wait();}
+void asc_threadfence(){std::atomic_thread_fence(std::memory_order_seq_cst);}
 uint32_t asc_atomic_cas(uint32_t* p,uint32_t expected,uint32_t desired){
     std::atomic_ref<uint32_t>(*p).compare_exchange_strong(expected,desired);
     return expected;
@@ -46,6 +48,12 @@ enum class HardEvent {V_S};
 constexpr int EVENT_ID0=0;
 template<HardEvent> void SetFlag(int){}
 template<HardEvent> void WaitFlag(int){}
+template<class T> struct GlobalTensor {
+    T* p;
+    void SetGlobalBuffer(T* data,size_t){p=data;}
+    T GetValue(size_t i){return std::atomic_ref<T>(p[i]).load();}
+    void SetValue(size_t i,T value){std::atomic_ref<T>(p[i]).store(value);}
+};
 template<class T> struct LocalTensor {
     T* p;
     T* GetPhyAddr(){return p;}
@@ -61,19 +69,28 @@ struct TPipe {
 };
 std::array<std::atomic<unsigned>,4> copies{};
 std::atomic<bool> pauseFourth,enteredFourth;
+namespace index_team { void TryFourthBody(uint32_t*,uint32_t,uint32_t*); }
 void SimulatedCopy(uint32_t*,uint32_t,uint32_t field,uint64_t*,uint32_t*,uint64_t*,uint64_t*,uint32_t*,uint64_t* saved,uint32_t* claim,uint32_t block) {
     ++copies[field];
     if(field==3){
         enteredFourth=true;
         while(pauseFourth.load())std::this_thread::yield();
     }
-    if(claim)*reinterpret_cast<uint32_t*>(saved)=asc_atomic_cas(claim,0,block+1)==0;
+    if(claim)index_team::TryFourthBody(claim,block,reinterpret_cast<uint32_t*>(saved));
 }
 namespace Simt {
 struct Dim3 {unsigned x,y,z;};
 template<auto Function,class... A> void VF_CALL(Dim3,A... args){
     if constexpr(sizeof...(A)==3)Function(args...); // Actual device claim.
-    else SimulatedCopy(args...);
+    else if constexpr(sizeof...(A)==7){
+        // Run the actual fourth-field handoff with device-width barriers.
+        std::barrier wave(256);
+        std::vector<std::thread> threads;
+        for(unsigned t=0;t<256;++t)threads.emplace_back([&,t]{
+            threadIdx.x=t;waveBarrier=&wave;Function(args...);
+        });
+        for(auto& thread:threads)thread.join();
+    }else SimulatedCopy(args...);
 }
 }
 #include "index_team.h"
@@ -147,5 +164,63 @@ int main(){
         }
         assert(joinedError==error);
     }
+    // The first nonempty chunk is a 1024-position cycle. The second reads
+    // from positions changed by the first. Repeating or omitting either
+    // chunk corrupts the reference keys even if the move count matches.
+    const unsigned target=0, comm=3*batch;
+    auto edges=index_team::Moves(&a,target);
+    auto ctrl=index_team::Control(&a,target);
+    auto snapshot=flags.data()+target*kFlagCount+4;
+    for(auto& f:team)f.ready=0;
+    a.prefetchCount|=2U<<16;
+    const unsigned width=1024,tailCount=37;
+    std::array<std::array<uint64_t,4>,width> initial{};
+    for(unsigned i=0;i<width;++i)for(unsigned w=0;w<4;++w)initial[i][w]=uint64_t(i)*4+w+1;
+    for(unsigned mode=0;mode<5;++mode){
+        const bool oneChunk=mode==3;
+        for(unsigned i=0;i<width;++i)for(unsigned w=0;w<4;++w)keys[16*i+12+w]=initial[i][w];
+        auto expected=initial;
+        edges[0]=0;edges[1]=width;edges[2]=oneChunk?width:width+tailCount;
+        auto rotate=[&](unsigned offset,unsigned count){
+            auto prior=expected;
+            for(unsigned i=0;i<count;++i){
+                unsigned dst=(i+1)%count;
+                edges[kIndexEdgesOffset+2*(offset+i)]=i;
+                edges[kIndexEdgesOffset+2*(offset+i)+1]=dst;
+                expected[dst]=prior[i];
+            }
+        };
+        rotate(0,width);
+        if(!oneChunk)rotate(width,tailCount);
+        for(unsigned f=0;f<5;++f)ctrl[f].ready=0;
+        snapshot->ready=0;
+        index_team::TailTicket ticket{}, other{};
+        assert(!index_team::TryBeforeCq(&a,comm,batch,ticket));
+        index_team::PublishPlan(&a,target,3,0);
+        assert(!index_team::TryBeforeCq(&a,comm,batch,ticket));
+        index_team::Publish(snapshot,0,1);
+        assert(!index_team::TryBeforeCq(&a,comm,batch,ticket));
+        index_team::Publish(snapshot,0,0);
+        assert(index_team::TryBeforeCq(&a,comm,batch,ticket));
+        assert(ticket.row==target && ticket.firstMoves==width && ticket.moves==edges[2]);
+        assert(!index_team::TryBeforeCq(&a,comm,batch,other));
+        if(oneChunk){
+            assert(ctrl[4].ready);
+        }else{
+            assert(!ctrl[4].ready && ticket.nextChunk==2);
+            if(mode==0)assert(index_team::FinishAfterCq(&a,comm,batch,ticket));
+            else if(mode!=4)index_team::Copy(&a,mode==1?3*target:comm+target,batch);
+            else {
+                // Row 15's first core has published its own result. It can
+                // finish row 0 while the original ticket holder is in CQ.
+                index_team::HelpAfterLocalWork(&a,45,batch);
+                assert(edges[index_team::kClaimOffset]==46);
+            }
+        }
+        assert(!index_team::FinishAfterCq(&a,comm,batch,ticket));
+        assert(ctrl[4].ready && ctrl[4].error==0);
+        for(unsigned i=0;i<width;++i)for(unsigned w=0;w<4;++w)assert(keys[16*i+12+w]==expected[i][w]);
+    }
+    std::cout<<"INDEX_CQ_PREFIX_PASS full_chunk=1024 suffix_owner=comm,local_index,nominal_fourth,remote_index exactly_once=true\n";
     std::cout<<"INDEX_TEAM_CLAIM_CPU_PASS rounds=40 forced_owners=4 simultaneous_claims=4 failed_plan_and_snapshot=1 reuse=1\n";
 }

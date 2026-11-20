@@ -66,6 +66,8 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
     selector.write_text("// shared LIDU selector\n")
     kernel = source / "prefetch.h"
     kernel.write_text("// baseline kernel\n", encoding="utf-8")
+    patch = source / "kvaf_post_tail.patch"
+    patch.write_text("fixture v1\n")
     headers = tmp_path / "kvaf-headers"
     headers.mkdir()
     header = headers / "kvaf_batch_get_device.h"
@@ -99,11 +101,17 @@ def test_build_cache_reuses_and_rebuilds_current_sources(tmp_path, monkeypatch):
     assert len(commands) == 6
 
     selector.write_text("// updated shared LIDU selector\n")
-    assert build.build_libraries(**options) != updated
+    shared = build.build_libraries(**options)
+    assert shared != updated
     assert len(commands) == 8
+
+    patch.write_text("fixture v2\n")
+    assert build.build_libraries(**options) != shared
+    assert len(commands) == 10
 
 
 def test_actual_operator_cmake_resolves_relocated_sources(tmp_path):
+    import shutil
     import subprocess
 
     cann = tmp_path / "cann"
@@ -117,8 +125,15 @@ def test_actual_operator_cmake_resolves_relocated_sources(tmp_path):
     )
     headers = tmp_path / "headers"
     headers.mkdir()
-    (headers / "kvaf_batch_get_device.h").touch()
-    source = ROOT / "csrc/operators/lightning_indexer_with_fetch"
+    header = headers / "kvaf_batch_get_device.h"
+    header.write_text("// fixture device header\n")
+    source = shutil.copytree(ROOT / "csrc/operators/lightning_indexer_with_fetch", tmp_path / "operator")
+    (source / "kvaf_post_tail.patch").write_text(
+        "--- a/kvaf_batch_get_device.h\n+++ b/kvaf_batch_get_device.h\n"
+        "@@ -1 +1 @@\n-// fixture device header\n+// fixture private hook\n"
+    )
+    # In production the build directory can itself be inside a Git checkout.
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
     subprocess.run(
         [
             "cmake",
@@ -132,6 +147,8 @@ def test_actual_operator_cmake_resolves_relocated_sources(tmp_path):
         check=True,
         capture_output=True,
     )
+    assert header.read_text() == "// fixture device header\n"
+    assert (tmp_path / "build/kvaf-private" / header.name).read_text() == "// fixture private hook\n"
     includes = [
         source / "include",
         source / "op_kernel",
