@@ -260,6 +260,15 @@ def report(root, reference, group):
               f'LI/resolve_update_mean={kernel["li"]["mean"]:+.2f}/{kernel["resolve_update"]["mean"]:+.2f} '
               f'exact_TopK_p50={fmt(m["span_p50_saved_us"])}(pairs={m["n"]} of {m["before_calls"]}/{m["after_calls"]}) '
               f'TopK={comparison["topk_sets"]} placement={comparison["placement"]}')
+    # These intervals overlap. Print them individually so a shorter wait can be
+    # distinguished from work moving to another part of the same graph.
+    stages = results['original_minus_flexible']['auxiliary_stage_p50_saved_us']
+    focus = ('planning', 'index_row_incl_wait', 'final_get_cq_wait', 'finalizer_wait_index_flag')
+    print('  STAGE original_minus_flexible p50_us ' +
+          ' '.join(f'{key}={fmt(stages.get(key))}' for key in focus))
+    print('  DRIFT within_graph_last5_minus_first5_p50_us ' +
+          ' '.join(f'{label}={row["within_graph_last_minus_first_p50_us"]:+.2f}'
+                   for label, row in detail['arms'].items()))
     fixed, new = (arms[label]['tail'] for label in ('fixed', 'flexible'))
     print(f'  fixed/flexible last_fourth_minus_last_primary_p50_us={fmt(fixed["last_fourth_minus_last_primary_us"]["p50"])}/'
           f'{fmt(new["last_fourth_minus_last_primary_us"]["p50"])} last_busy_field_minus_get_p50_us='
