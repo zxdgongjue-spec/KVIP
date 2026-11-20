@@ -2,6 +2,7 @@
 """Numerical oracles, invariants and fixed check coverage."""
 from __future__ import annotations
 
+import hashlib
 from types import SimpleNamespace
 
 import numpy as np
@@ -17,6 +18,10 @@ FIXED_CASES = {
 
 
 TOPK, BLOCK_TOKENS, TOKEN_BYTES = 2048, 128, 656
+
+
+def topk_fingerprint(ids):
+    return hashlib.sha256(np.sort(ids, axis=-1).astype('<i8').tobytes()).hexdigest()
 
 
 def validate_topk(ids, scores):

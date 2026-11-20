@@ -13,6 +13,7 @@ from peer_candidate import RANKED_BASE
 
 
 MAGIC = 0x49445834
+FLEXIBLE_MAGIC = 0x49445835
 GROUPS = (2, 7, 10, 17, 4)
 
 
@@ -70,7 +71,40 @@ def verify_swaps(start_layout, layout, initial_valid, valid, source, dest, count
         raise ValueError('Committed hot-valid bitmap differs from actual promotions and evictions')
 
 
-def diagnostic_intervals(raw, detail, *, candidate):
+def team_fields(stamp, *, flexible):
+    """Validate logical ownership and return [call,row,field] vectors for each trace word."""
+    n = len(stamp)
+    row = np.array([block//3 if block < 48 else block-48 for block in range(64)])
+    field = np.array([block%3 if block < 48 else 3 for block in range(64)])
+    if stamp.shape != (n, 64, 8) or np.any(stamp[..., 0] != (FLEXIBLE_MAGIC if flexible else MAGIC)):
+        raise ValueError('Unexpected Index field trace format')
+    packed = stamp[..., 2]
+    physical = np.arange(64)
+    if flexible:
+        owner = packed >> 32
+        legal_fourth = (owner == 3*row) | (owner == 3*row+1) | (owner == 3*row+2) | (owner == physical)
+        if (np.any(stamp[..., 1] != row) or np.any((packed & 0xffffffff) != field)
+                or np.any(np.where(field == 3, ~legal_fourth, owner != physical))):
+            raise ValueError('Invalid Index row, field, or physical owner')
+    else:
+        row, field = stamp[..., 1], packed
+        if np.any(row < 0) or np.any(row >= 16) or np.any(field < 0) or np.any(field >= 4):
+            raise ValueError('Invalid fixed Index row or field')
+        owner = np.where(field == 3, 48+row, 3*row+field)
+    if np.any(stamp[..., 7]) or np.any(np.sort(row*4+field, axis=-1) != np.arange(64)):
+        raise ValueError('Failed, missing, or duplicate Index field')
+    order = np.broadcast_to(np.argsort(row*4+field, axis=-1), (n, 64))
+    def rows(a):
+        return np.take_along_axis(a, order, axis=1).reshape(n, 16, 4)
+    count, begin, end, work = (rows(stamp[..., k]) for k in (3, 4, 5, 6))
+    if np.any(count != count[..., :1]) or np.any(count < 0):
+        raise ValueError('Index fields disagree on ordered moves')
+    if np.any(begin <= 0) or np.any(work < begin) or np.any(end < work):
+        raise ValueError('Invalid Index field counter interval')
+    return rows(owner), count, begin, work, end
+
+
+def diagnostic_intervals(raw, detail, *, candidate, flexible=False):
     """Eligible intervals from an auxiliary replay. Roles overlap in device time."""
     clock = float(raw['cycles_per_us'])
     ticks = raw['times']
@@ -120,30 +154,20 @@ def diagnostic_intervals(raw, detail, *, candidate):
               'five_phase_probed_total_rows': (ig['n'], ig['eligible'])}
     if candidate:
         stamp = ticks[:, trailer:].reshape(n, 64, 8)
-        row, lane = stamp[..., 1], stamp[..., 2]
-        for call in stamp:
-            if (np.any(call[:, 0] != MAGIC) or np.any(call[:, 7] != 0) or
-                    sorted(map(tuple, call[:, 1:3].tolist())) != [(r, l) for r in range(batch) for l in range(4)]):
-                raise ValueError('Missing or duplicate full-AIV Index diagnostics')
-        count = stamp[..., 3]
-        begin, end, work = stamp[..., 4], stamp[..., 5], stamp[..., 6]
+        owner, count, begin, work, end = team_fields(stamp, flexible=flexible)
         active = count > 0
-        if not np.all(active.any(axis=1)) or np.any(active & ((begin == 0) | (work < begin) | (end < work))):
-            raise ValueError('Invalid Index workload/counter spans')
-        # Each row is split across four AIV lanes, one lane per set of fields.
-        # They must traverse the same ordered moves. Count each move once.
-        for i in range(n):
-            for r in range(batch):
-                if len(set(count[i, row[i] == r].tolist())) != 1:
-                    raise ValueError(f'Index lanes disagree on move count, call={i} row={r}')
-        record['active_AIV_min_max'] = (int(active.sum(axis=1).min()), int(active.sum(axis=1).max()))
-        tuples = [sum(int(x) for x in count[i, lane[i] == 0]) for i in range(n)]
-        record['moved_p50_max'] = percentiles(tuples)
+        counts = active.sum(axis=(1, 2))
+        if not np.all(counts):
+            raise ValueError('Missing nonempty Index work on a real ranked capture')
+        # A helper may handle two fields. Count distinct physical AIVs.
+        busy = [len(np.unique(owner[i, active[i]])) for i in range(n)]
+        record['active_AIV_min_max'] = min(busy), max(busy)
+        record['moved_p50_max'] = percentiles(count[..., 0].sum(axis=1).tolist())
         measure('index_lane_wait', begin[active], work[active])
         measure('index_lane_body', work[active], end[active])
         intervals['index_team_plan_five_phases'] = ig['p50_us'], ig['max_us']
         record['copy_team_envelope_us'] = percentiles([(end[i, active[i]].max()-begin[i, active[i]].min())/clock
-                                                  for i in range(n)])
+                                                      for i in range(n)])
     else:
         # On the baseline the same five phase counters include both planning
         # and applying the exchange, so they cannot be subtracted from a
@@ -152,7 +176,7 @@ def diagnostic_intervals(raw, detail, *, candidate):
     return intervals, record
 
 
-def load_arm(case_dir, label, revision):
+def load_arm(case_dir, label, revision, *, field_abi=None):
     path, = (case_dir / label / 'results').glob('**/fused/path_result.json')
     config = read(path.parents[1] / 'config.json')
     inputs = read(path.parents[1] / 'replay_input.json')
@@ -187,10 +211,14 @@ def load_arm(case_dir, label, revision):
         raise ValueError(f'{label}: device graph accounting does not reconcile')
     kernel = {k: (v, median(s['stages_us'][k] for s in profile['samples'])) for k, v in accounting.items()}
     with np.load(folder / 'lean_ticks.npz', allow_pickle=False) as raw:
-        phases, index = diagnostic_intervals(raw, d, candidate=label=='candidate')
+        if field_abi is None:
+            field_abi = 'fixed' if label == 'candidate' else 'original'
+        phases, index = diagnostic_intervals(raw, d, candidate=field_abi != 'original',
+                                             flexible=field_abi == 'flexible')
     return dict(config=config, inputs=inputs, placement=thp, timing=timing, kernel=kernel,
                 phases=phases, index=index, traffic=d['traffic'], windows=d['window_stages'],
-                digests=result['topk_set_digests'], binary=result['binary_sha256'])
+                digests=result['topk_set_digests'], binary=result['binary_sha256'], folder=folder,
+                samples=profile['samples'], detail=d, revision=revision)
 
 
 def report(root, group):

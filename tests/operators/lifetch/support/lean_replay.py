@@ -125,10 +125,18 @@ def stage_report(states, profile, samples, mhz, policy, directory):
     eligible = defaultdict(int)
     direct = dict(compact=0, overflow=0, other=0)
     raw_times, completed_events, route_probes, group_counts = [], [], [], []
+    diagnostic_fingerprints = []
     for state in states:
         b = state.batch
         raw = state.forward.times.cpu().numpy().reshape(-1)
         raw_times.append(raw)
+        flexible = False
+        if getattr(state, 'verify_ranked_events', False):
+            from correctness import topk_fingerprint
+            trailer = b*256 + 64*32
+            flexible = raw.size == trailer + 64*8 and raw[trailer] == 0x49445835
+            ids = state.update.logical_output.cpu().numpy().reshape(b, 4, 2048)
+            diagnostic_fingerprints.append(topk_fingerprint(ids))
         rotating = state.rotating
         event_bytes = rotating.events.cpu().numpy().view(np.uint8)
         event_count = rotating.rounds*rotating.service_lanes
@@ -154,7 +162,8 @@ def stage_report(states, profile, samples, mhz, policy, directory):
                     buckets[name].append((last-first) / mhz)
             bracket('planning', p, 1, 8)
             bracket('consumer_including_waits', u, 10, 24)
-            bracket('index_metadata', u, 22, 23)
+            if not flexible:
+                bracket('index_metadata', u, 22, 23)
             if policy != 'main':
                 mark = int(p[9])
                 key = {1: 'compact', 2: 'overflow'}.get(mark, 'other')
@@ -261,7 +270,8 @@ def stage_report(states, profile, samples, mhz, policy, directory):
     events = np.stack(completed_events)
     np.savez_compressed(directory / 'lean_ticks.npz', times=np.stack(raw_times), prefetch_events=events, cycles_per_us=mhz,
                         **({'route_probe': np.stack(route_probes)} if route_probes else {}))
-    return dict(stages=stages, traffic=traffic, window_posted=[measured_range(col) for col in zip(*windows)],
+    return dict(stages=stages, traffic=traffic, diagnostic_topk_set_digests=diagnostic_fingerprints,
+                window_posted=[measured_range(col) for col in zip(*windows)],
                 window_nonempty_requests=[measured_range(col) for col in zip(*occupied)],
                 diagnostic_final_get_submitted_groups=measured_range(group_counts),
                 route_policy=policy, direct_plan_rows=direct, cycles_per_us=mhz,
