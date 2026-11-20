@@ -123,10 +123,20 @@ __aicore__ inline void FinishFourth(__gm__ Args* a,uint32_t block,uint32_t batch
 __aicore__ __attribute__((noinline)) inline bool TryBeforeCq(
         __gm__ Args* a,uint32_t block,uint32_t batch,TailTicket& ticket) {
     const uint32_t queue=block-3*batch;
-    if(((a->prefetchCount>>16)&0xffU)!=2 || batch!=16 || queue>=8)return false;
-    // Own Q, same row parity. The eight pairs partition all sixteen rows.
-    const uint32_t first=4*(queue/2)+queue%2;
-    auto target=PickFourth(a,first,first+2,true);
+    const uint32_t workers=(a->prefetchCount>>16)&0xffU;
+    if(batch!=16 || queue>=4*workers)return false;
+    // Each Q owns four candidate rows, striped across its final queue owners.
+    ReadyFourth target;
+    if(workers==2){
+        const uint32_t first=4*(queue/2)+queue%2;
+        target=PickFourth(a,first,first+2,true);
+    }else if(workers==1){
+        const uint32_t first=4*queue;
+        auto left=PickFourth(a,first,first+1,true);
+        auto right=PickFourth(a,first+2,first+3,true);
+        target=right.remaining>left.remaining?right:left;
+    }else if(workers==4)target=ProbeFourth(a,queue,true);
+    else return false;
     if(!target.moves)return false;
     auto edges=Moves(a,target.row);
     uint32_t c=0;
@@ -178,10 +188,11 @@ __aicore__ inline bool FourthInputsPublished(__gm__ Args* a,uint32_t row) {
     return snapshot->ready!=0;
 }
 
-// Only the eight non-communication fourth-field owners wait here. While waiting
-// for their home row, they can start the paired queue owner's row instead.
+// Each spare fourth-field owner can start a row whose nominal worker runs a
+// final queue. The mapping folds the spare lanes across those queue owners.
 __aicore__ __attribute__((noinline)) inline void HelpBeforeHome(__gm__ Args* a,uint32_t block,uint32_t batch) {
-    uint32_t home=block-3*batch,peer=home-batch/2;
+    const uint32_t queues=4*((a->prefetchCount>>16)&0xffU);
+    uint32_t home=block-3*batch,peer=home&(queues-1);
     uint64_t start=GetSystemCycle();
     while(!FourthInputsPublished(a,home) && !FourthInputsPublished(a,peer)){
         if(GetSystemCycle()-start>5000000000ULL)return;
@@ -195,7 +206,9 @@ __aicore__ __attribute__((noinline)) inline void HelpBeforeHome(__gm__ Args* a,u
 // The 48 row workers probe one candidate each immediately before retirement;
 // the other 16 can probe two. No worker waits for a remote plan or for a win.
 __aicore__ __attribute__((noinline)) inline void HelpAfterLocalWork(__gm__ Args* a,uint32_t block,uint32_t batch) {
-    if(((a->prefetchCount>>16)&0xffU)!=2 || batch!=16)return;
+    const uint32_t workers=(a->prefetchCount>>16)&0xffU;
+    if((workers!=1 && workers!=2 && workers!=4) || batch!=16)return;
+    const uint32_t queues=4*workers;
     ReadyFourth target{};
     if(block<3*batch){
         const uint32_t row=(block/3+1+5*(block%3))%batch;
@@ -205,7 +218,7 @@ __aicore__ __attribute__((noinline)) inline void HelpAfterLocalWork(__gm__ Args*
         target=ProbeFourth(a,row,false);
     }else{
         const uint32_t lane=block-3*batch;
-        const uint32_t first=lane<8?(lane+1)%batch:lane-8;
+        const uint32_t first=lane<queues?(lane+1)%batch:lane-queues;
         target=PickFourth(a,first,(first+1)%batch,false);
     }
     HelpReadyFourth(a,block,batch,target);

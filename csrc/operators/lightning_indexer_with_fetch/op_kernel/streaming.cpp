@@ -1015,7 +1015,7 @@ __aicore__ inline void FetchQueryGroup(__gm__ Args* a,uint32_t q,uint32_t lane,u
     status->profile.magic=KVAF_AIV_BATCH_GET_PROFILE_MAGIC;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&status->profile),sizeof(status->profile));}
    start=GetSystemCycle();
    if constexpr(Team){
-    tail.enabled=workers==2 && (phase || !hasConflict);
+    tail.enabled=phase || !hasConflict;
     kvaf_device::KvafBatchGetDeviceWithPostTail(args,0,0,size,tail);
    }else kvaf_device::KvafBatchGetDevice(args,0,0,size);
    end=GetSystemCycle();
@@ -1367,7 +1367,7 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
    }
 #if !V9_UBMEM
    else if(team){
-    if(workers==2)index_team::HelpBeforeHome(a,block,shape.batch);
+    index_team::HelpBeforeHome(a,block,shape.batch);
     index_team::Copy(a,block,shape.batch);
    }
 #endif
@@ -1375,7 +1375,7 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
 #if !V9_UBMEM
   // A row core may assist one ready remote field only after completing all
   // its own publications and cleanup. Keep the original retirement barrier.
-  if(team && workers==2 && block<shape.batch*kResolveCores)
+  if(team && block<shape.batch*kResolveCores)
    index_team::HelpAfterLocalWork(a,block,shape.batch);
   if(a->completedFlags){
    AscendC::SyncAll<true>();

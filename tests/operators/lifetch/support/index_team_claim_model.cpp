@@ -255,5 +255,24 @@ int main(){
         assert(homeControl[4].ready && homeControl[4].error==homeError);
     }
     std::cout<<"INDEX_STANDBY_PAIR_PASS earlier_ready=1 larger_ready=1 ties_home=1 unpublished_q4=1 error_empty_fallback=1\n";
+    // All sixteen rows must be reachable by exactly one prefix queue under
+    // each width, including the fourth request group owned by a single lane.
+    for(unsigned w:{1U,2U,4U}){
+        a.prefetchCount=0x80000000U|(w<<16);
+        for(unsigned r=0;r<batch;++r){
+            for(auto& flag:team)flag.ready=0;
+            auto e=index_team::Moves(&a,r);
+            e[0]=1;e[kIndexEdgesOffset]=0;e[kIndexEdgesOffset+1]=0;
+            index_team::PublishPlan(&a,r,1,0);
+            index_team::Publish(flags.data()+r*kFlagCount+4,0,0);
+            const unsigned expected=r/4*w+r%w;
+            index_team::TailTicket t{};
+            for(unsigned queue=0;queue<4*w;++queue)if(queue!=expected)
+                assert(!index_team::TryBeforeCq(&a,comm+queue,batch,t));
+            assert(index_team::TryBeforeCq(&a,comm+expected,batch,t));
+            assert(t.row==r && index_team::Control(&a,r)[4].ready);
+        }
+    }
+    std::cout<<"INDEX_COMM_WIDTH_PASS workers_per_q=1,2,4 prefix_partition=exact rows=16 each=true\n";
     std::cout<<"INDEX_TEAM_CLAIM_CPU_PASS rounds=40 forced_owners=4 simultaneous_claims=4 failed_plan_and_snapshot=1 reuse=1\n";
 }
