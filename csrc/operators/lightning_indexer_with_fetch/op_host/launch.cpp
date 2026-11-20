@@ -93,6 +93,24 @@ extern "C" uint32_t kvip_lifetch_streaming_forward(void* bindings,void* update,v
 
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_score_t2(uint32_t,void*,void*,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_t2(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_li_full_topk(uint32_t,void*,void*,uint32_t);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_score_aligned(uint32_t,void*,void*,uint32_t);
+// Full numerical MR14 schedule followed by the original completed MR23 tail.
+// The caller must bind prefetchLimit=0: this route never runs window Service.
+extern "C" uint32_t kvip_lifetch_score_aligned_forward(void* bindings,void* update,void* workspace,void* stream,
+    const rotating::RuntimeShape* shape,uint32_t workers,uint32_t parts) {
+    if (!bindings || !update || !workspace || !stream || !shape || shape->finalWorkers!=4 ||
+        shape->indexHeads!=32 || shape->resident>131072 ||
+        !kvip_score_t2::Valid(shape->batch,shape->history,parts,shape->aicCount) ||
+        shape->batch*4>shape->aicCount*2 ||
+        (workers!=1 && workers!=2 && workers!=4) ||
+        shape->batch*pipeline_ab::kResolveCores+4*workers>shape->aicCount*2) return 100000;
+    uint32_t result=aclrtlaunch_v9_li_kernel_score_aligned(shape->batch*parts,stream,bindings,parts);
+    if (!result) result=aclrtlaunch_v9_li_full_topk(shape->batch*4,stream,bindings,1);
+    if (!result) result=aclrtlaunch_v9_streaming_resolve_update(
+        shape->batch*pipeline_ab::kResolveCores+4*workers,stream,workspace);
+    return result;
+}
 // Experimental URMA entry. Score partitioning is independent of the original
 // two-history-owner schedule, Service roles and final Fetch worker budget.
 // Full score completion replaces the original Hot completion boundary.

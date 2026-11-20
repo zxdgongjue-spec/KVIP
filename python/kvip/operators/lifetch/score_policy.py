@@ -38,3 +38,19 @@ def score_window_schedule(shape, parts, query_parallel=False):
                 half_window=half, waves=waves,
                 li_launches=shape.rounds*(3 if query_parallel else 2)+2, scatter_launches=0,
                 final_topk='mr23_incremental', resolve_fetch='mr23')
+
+
+def score_aligned_schedule(shape, parts, prefetch_limit):
+    """One full-H direct producer + one full-H radix TopK per Q, no Service."""
+    validate_score_t2(shape, parts)
+    if prefetch_limit != 0:
+        raise ValueError('aligned score requires prefetch-tokens=0; no window Service is executed')
+    if shape.batch*4 > shape.aicCount*2:
+        raise ValueError('aligned TopK requires four concurrently resident AIVs per request')
+    return dict(mode='aligned', score_post='direct', cold_predicate='none',
+                service='none', topk_aivs=shape.batch*4, half_window=0,
+                waves=[dict(epoch=0, begin=0, end=shape.history, parts=parts,
+                            predicate=False, score_aics=shape.batch*parts, score_aivs=shape.batch*parts*2)],
+                actual_windows=0, li_launches=2, scatter_launches=0,
+                final_topk='full_history_radix', classify='original_mr23_in_topk_aiv',
+                resolve_fetch='mr23_completed', effective_prefetch=0)

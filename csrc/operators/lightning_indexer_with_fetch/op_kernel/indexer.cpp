@@ -22,7 +22,7 @@ __aicore__ inline bool HasUniformLengths(const rotating::RuntimeShape& shape, GM
     return true;
 }
 
-template <SequenceLiPhase Phase, bool ScoreOnly = false, bool Precomputed = false>
+template <SequenceLiPhase Phase, bool ScoreOnly = false, bool Precomputed = false, bool AlignedScore = false>
 __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t scoreParts = 1,
     uint32_t begin = 0, uint32_t end = 0, bool predicate = false) {
     using namespace AscendC; using namespace QLICommon;
@@ -37,6 +37,8 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t scoreParts = 1,
     using Type=QLIType<fp8_e4m3fn_t,fp8_e4m3fn_t,int32_t,true,LI_LAYOUT::BSND,LI_LAYOUT::PA_BSND,
         bfloat16_t,float,float,uint16_t>;
     QLIKernel::QuantLightningIndexerKernel<Type> op;
+    // The aligned numeric producer needs no incremental TopK/rank scratch.
+    if ASCEND_IS_AIV { op.vectorService.fullHistoryTopk_ = AlignedScore; }
     op.runtimeShape_ = shape;
 #if !V9_UBMEM
     op.rotationContext_ = P(14);
@@ -104,6 +106,12 @@ extern "C" __global__ __aicore__ void v9_li_kernel_score_t2(GM_ADDR bindings, ui
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     RunLi<SequenceLiPhase::Hot, true>(bindings, parts);
+#endif
+}
+extern "C" __global__ __aicore__ void v9_li_kernel_score_aligned(GM_ADDR bindings, uint32_t parts) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    RunLi<SequenceLiPhase::Hot, true, false, true>(bindings, parts);
 #endif
 }
 extern "C" __global__ __aicore__ void v9_li_kernel_cold_t2(GM_ADDR bindings) {

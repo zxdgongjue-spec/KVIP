@@ -65,6 +65,51 @@ template<uint32_t Mode> __aicore__ inline void WindowService(
 }
 }
 #endif
+// MR14 direct numerical tail on the real packed MR23 score rows. Every AIV
+// owns one Q and writes its classification records before the original
+// streaming resolver starts. No history-local TopK, candidate merge or post.
+extern "C" __global__ __aicore__ void v9_li_full_topk(
+    GM_ADDR bindings, uint32_t classify) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV {
+        using namespace AscendC; using namespace QLICommon;
+        auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
+        auto s=rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(a[14]));
+        const uint32_t query=GetBlockIdx(), owner=query/4, q=query%4;
+        if (owner>=s.batch) return;
+        TPipe pipe;
+        using Type=QLIType<fp8_e4m3fn_t,fp8_e4m3fn_t,int32_t,true,LI_LAYOUT::BSND,LI_LAYOUT::PA_BSND,bfloat16_t,float,float,uint16_t>;
+        QLIKernel::QLIVector<Type> op;
+        ConstInfo c{};c.batchSize=s.batch;c.tSize=s.batch*4;c.qSeqSize=c.s1BaseSize=4;
+        c.s2BaseSize=128;c.qHeadNum=c.gSize=s.indexHeads;c.kHeadNum=1;c.kSeqSize=s.history;
+        c.sparseCount=2048;c.kCacheBlockSize=128;c.maxBlockNumPerBatch=s.history/128;
+        c.headDim=128;c.mBaseSize=4*s.indexHeads;
+        QLITilingData tiling{};op.InitParams(c,&tiling,true);
+        op.fullHistoryTopk_=true;
+        GlobalTensor<uint16_t> scores; GlobalTensor<int32_t> output,pages;
+        GlobalTensor<bfloat16_t> weights; GlobalTensor<float> qs,ks;
+        scores.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(a[12])+uint64_t(owner)*4*s.history);
+        output.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(a[9]));
+        op.InitVecInputTensor(weights,qs,ks,output,pages);op.InitVecWorkspaceTensor(scores);
+        op.SetRotationContext(reinterpret_cast<GM_ADDR>(a[14]));
+        if (classify) op.SetStreamingWorkspace(reinterpret_cast<GM_ADDR>(a[15]));
+        op.InitBuffers(&pipe,true);
+        RunInfo info{};info.bIdx=owner;info.actS1Size=4;
+        info.actS2Size=info.actS2SizeOrig=info.validS2Len=s.history;
+        info.indiceOutOffset=uint64_t(owner)*4*2048;
+#if defined(KVIP_ALIGNED_TOPK_PROBE) && KVIP_ALIGNED_TOPK_PROBE
+        auto clocks=reinterpret_cast<__gm__ uint64_t*>(a[11])+query*16;
+        clocks[0]=GetSystemCycle();
+#endif
+        op.AllocEventID();op.ProcessTopK(info,q);op.FreeEventID();
+#if defined(KVIP_ALIGNED_TOPK_PROBE) && KVIP_ALIGNED_TOPK_PROBE
+        clocks[1]=GetSystemCycle();kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(clocks),16);
+#endif
+        pipe.Destroy();
+    }
+#endif
+}
 extern "C" __global__ __aicore__ void v9_li_window_service(
     GM_ADDR bindings,uint32_t epoch,uint32_t end0,uint32_t end1) {
 #if defined(__CCE_AICORE__)

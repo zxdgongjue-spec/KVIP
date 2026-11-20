@@ -44,6 +44,9 @@ class QLIVector {
 public:
     rotating::RuntimeShape runtimeShape_;
     bool producerPredicate_ = false;
+    // Opt-in MR14 numerical path: full-H radix TopK, without resident seeding
+    // or incremental window state. Default MR23/UBmem behavior is unchanged.
+    bool fullHistoryTopk_ = false;
     __aicore__ inline void SetServiceBlock(uint32_t block) { blockId_ = block; }
 #if !V9_UBMEM
 #include "incremental_methods.h"
@@ -451,6 +454,7 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe, bool topkOnly)
 #endif
 
 #if !V9_UBMEM
+    if (!fullHistoryTopk_) {
     pipe->InitBuffer(incrementalIdsBuf_, trunkLen_*2 + ((topkOnly && streamingWorkspace_) ? 0 : 2048*4) + 1024);
     incrementalNew_ = incrementalIdsBuf_.Get<uint16_t>();
     incrementalOld_ = (topkOnly && streamingWorkspace_) ? streamingOutput_ : incrementalNew_[trunkLen_].template ReinterpretCast<uint32_t>();
@@ -459,6 +463,7 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe, bool topkOnly)
         uint32_t used=2*CeilDiv(constInfo_.mBaseSize,2)*s2BaseSize_*sizeof(QK_T)+1536+6*CeilDiv(s1BaseSize_,2)*UB_BANK_DEPTH_STRIDE+2*s2BaseSize_*QLICommon::KScaleTiles*sizeof(SCALE_T)+2*CeilDiv(s1BaseSize_,2)*s2BaseSize_*sizeof(SCORE_T)+(topkCountAlign256_+trunkLen_)*sizeof(SCORE_T)+(topkCountAlign256_+64)*4+topkCountAlign256_*sizeof(SCORE_T)+topkSharedTmpSize+trunkLen_*2+8192+1024;
         incrementalPipeline_=used+kIncrementalInputBytes<=223232;
         if(incrementalPipeline_){pipe->InitBuffer(incrementalInputBuf_,kIncrementalInputBytes);incrementalInput_=incrementalInputBuf_.Get<uint16_t>();}
+    }
     }
 #endif
     if (!topkOnly) Duplicate(kScaleUB_, static_cast<SCALE_T>(0), 2 * s2BaseSize_ * QLICommon::KScaleTiles);
@@ -1110,7 +1115,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
 
         AscendC::DataCopyPadExtParams<SCORE_T> padParams{true, 0, 0, 0};
 #if !V9_UBMEM
-        if (!prefixActive_ && validS2Len >= runtimeShape_.resident &&
+        if (!fullHistoryTopk_ && !prefixActive_ && validS2Len >= runtimeShape_.resident &&
             (uint64_t(validS2Len)+127U)/128U*128U <= runtimeShape_.history) {
             FinalIncremental(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, validS2Len);
         } else if (validS2Len >= topkCount_) {

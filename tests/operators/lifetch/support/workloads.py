@@ -136,8 +136,8 @@ def configuration(argv=None):
                                  help='URMA initial admission rank (1..2048); progresses to 2048 by per-Q coverage')
             command.add_argument('--li-score-parts', type=int, default=0,
                                  help='experimental URMA history score parts; 0 keeps the default')
-            command.add_argument('--li-score-mode', choices=('full', 'window', 'window_query'), default='full',
-                                 help='window uses MR23 ranked Service; window_query separates per-Q TopK from request posting')
+            command.add_argument('--li-score-mode', choices=('full', 'window', 'window_query', 'aligned'), default='full',
+                                 help='window uses ranked Service; window_query splits Q TopK/post; aligned uses full-H TopK and requires prefetch 0')
             command.add_argument('--intermediate-fetches', type=int, default=8)
             command.add_argument('--warmup', type=int, default=4, help='whole-graph warmup repetitions')
             command.add_argument('--iterations', type=int, default=20, help='independent complete invocations captured in one measured graph')
@@ -193,6 +193,8 @@ def configuration(argv=None):
             parser.error('the experimental T2 score entry requires 32 Index heads')
         if args.li_score_mode in ('window', 'window_query') and (not args.li_score_parts or args.input != 'synthetic'):
             parser.error('window score requires li-score-parts and synthetic Q4 inputs; serving replay is not validated')
+        if args.li_score_mode == 'aligned' and (not args.li_score_parts or args.input != 'synthetic' or args.prefetch_tokens):
+            parser.error('aligned score requires li-score-parts, synthetic Q4 inputs and prefetch-tokens=0')
         if args.transport != 'urma' and args.prefetch_rank_start != 1024:
             parser.error('prefetch-rank-start requires the URMA ranked prefetch path')
         if (args.warmup < 0 or args.iterations <= 0 or not 1 <= args.intermediate_fetches <= 32
