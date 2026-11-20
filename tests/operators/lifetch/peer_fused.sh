@@ -126,6 +126,22 @@ cpu="$clean/build-cpu/runtime/kvaf_cpu_service"
 test -x "$cpu"
 if [[ -n "$ranked" ]]; then
     printf 'CONFIG URMA NPU4 BS16 Q4 656B ranked=%.8s candidate=%.8s KVAF=%.8s\n' "$ranked_sha" "$ranked" "$transport"
+    # Compile through the same cache key used by run_path. Fail before copying
+    # five traces or running the baseline if the toolchain rejects either arm.
+    for source_root in "$ranked_base" "$ranked_candidate"; do
+        PYTHONPATH="$source_root/python:$PYTHONPATH" "$PYTHON" -B - "$source_root" "$kvaf/build-npu" "$SOC_VERSION" <<'BUILD'
+from pathlib import Path
+import sys
+from kvip.runtime import build
+
+source, runtime = map(Path, sys.argv[1:3])
+if not Path(build.__file__).resolve().is_relative_to(source.resolve()):
+    raise RuntimeError(f"Unexpected build module: {build.__file__}")
+cann, headers = build.kvaf_build_paths(runtime)
+library, = build.build_libraries(cache_dir=runtime / 'lifetch', cann=cann, headers=headers, soc=sys.argv[3])
+print(f"BUILD_READY source={source.name} cache={library.parent.name}", flush=True)
+BUILD
+    done
 elif [[ -n "$adaptive" ]]; then
     printf 'CONFIG G2 NPU4 BS16 Q4 656B main=%.8s candidate=%.8s\n' "$main_sha" "$adaptive"
     echo 'UNITS us  DETAIL=p50/max[observed/eligible] auxiliary=true  DRIFT=within_graph_last5_minus_first5'
