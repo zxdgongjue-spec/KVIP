@@ -3,6 +3,7 @@
 // Experimental bounded final window. The original tail owns completion/Index updates.
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void PrepareTerminal(__gm__ pipeline_ab::Args* a,uint32_t b) {
+ if(threadIdx.x)return;
  auto ctx=reinterpret_cast<__gm__ rotating::Context*>(a->context);
  auto shape=rotating::LoadRuntimeShape(ctx);
  auto errors=reinterpret_cast<__gm__ uint32_t*>(a->queryErrors)+b*128;
@@ -24,14 +25,9 @@ inline void PrepareTerminal(__gm__ pipeline_ab::Args* a,uint32_t b) {
   asc_stcg(errors+6,reason);asc_stcg(errors+7,used);
  }
  if(!eligible)return;
- auto loc=reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*8192;
- auto backup=reinterpret_cast<__gm__ uint32_t*>(ctx->sourceOffsets)+b*8192;
- for(uint32_t i=threadIdx.x;i<8192;i+=256)asc_stcg(backup+i,asc_ldcg(loc+i));
- asc_threadfence();asc_syncthreads();
- auto packed=reinterpret_cast<__gm__ uint32_t*>(ctx->sourceBlocks)+b*8192;
  auto metadata=reinterpret_cast<__gm__ uint32_t*>(rotating::TopKHeader(ctx))+b*128;
  for(uint32_t q=0;q<4;++q){uint32_t n=asc_ldcg(errors+q*32+1)-1;
-  for(uint32_t i=threadIdx.x;i<n;i+=256)asc_stcg(loc+q*2048+i,asc_ldcg(packed+q*2048+i)>>11);
+
   if(!threadIdx.x)asc_stcg(metadata+q*32+6,n);
  }
  asc_threadfence();
@@ -41,18 +37,18 @@ inline void RestoreTerminal(__gm__ pipeline_ab::Args* a,uint32_t b) {
  auto ctx=reinterpret_cast<__gm__ rotating::Context*>(a->context);auto shape=rotating::LoadRuntimeShape(ctx);
  auto errors=reinterpret_cast<__gm__ uint32_t*>(a->queryErrors)+b*128;
  if(!asc_ldcg(errors+2))return;
- auto selected=reinterpret_cast<__gm__ uint32_t*>(ctx->selected)+b*8192;
  auto loc=reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*8192;
- auto backup=reinterpret_cast<__gm__ uint32_t*>(ctx->sourceOffsets)+b*8192;
+ auto packed=reinterpret_cast<__gm__ uint32_t*>(ctx->sourceBlocks)+b*8192;
  auto map=reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+uint64_t(b)*shape.history;
  auto lru=reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+b*2048;
- for(uint32_t i=threadIdx.x;i<8192;i+=256){uint32_t slot=asc_ldcg(backup+i),token=asc_ldcg(selected+i);
-  if(slot==UINT32_MAX && token!=UINT32_MAX){
-   if(token<shape.history)slot=rotating::ResolvePhysicalSlot(shape.resident,lru,asc_ldcg(map+token));
-   if(slot==UINT32_MAX)asc_atomic_or(errors+(i/2048)*32,8U);
+ for(uint32_t q=0;q<4;++q){uint32_t n=asc_ldcg(errors+8+q);
+  for(uint32_t i=threadIdx.x;i<n;i+=256){uint32_t entry=asc_ldcg(packed+q*2048+i),token=entry>>11;
+   uint32_t slot=token<shape.history?rotating::ResolvePhysicalSlot(shape.resident,lru,asc_ldcg(map+token)):UINT32_MAX;
+   if(slot==UINT32_MAX)asc_atomic_or(errors+q*32,8U);
+   asc_stcg(loc+q*2048+(entry&2047),slot);
   }
-  asc_stcg(loc+i,slot);
  }
+ asc_threadfence();asc_syncthreads();
  for(uint32_t q=threadIdx.x;q<4;q+=256)asc_stcg(errors+q*32+1,1U);
  if(!threadIdx.x){auto row=reinterpret_cast<__gm__ rotating::Row*>(ctx->rows)+b;
   asc_stcg(errors+4,asc_ldcg(&row->requests)-asc_ldcg(errors+5));}

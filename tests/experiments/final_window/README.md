@@ -42,3 +42,47 @@ Terminal diagnostics: reason_bits 1=classifier error, 2=invalid count,
 do not count as eligible. Counts include every Q; fallback posted is zero.
 Only the experimental final classifier exports beyond 64 misses; the original
 resolver fast-path bound remains unchanged.
+
+## Local device-model comparison
+
+`model/run.py` builds the current experimental implementation and the previous
+`44fd654` experiment, then runs CANN's Ascend950PR_9599 simulator. Source the CANN
+environment and put its simulator library directory on `LD_LIBRARY_PATH` first:
+
+```bash
+python tests/experiments/final_window/model/run.py \
+  --kvaf-include /path/to/KVAF/access_operator/demo/aiv_batch_get/include \
+  --output /tmp/lifetch-final-model-new
+```
+
+All three cases use history 131328, resident 16384, four Q, the same seeded
+TopK and final 16384-score interval, miss counts `[11, 0, 94, 87]`, union 146,
+and 84 already allocated LRU slots. The middle case uses one AIV for four Q;
+final cases use four AIVs for TopK, then one AIV for posting, with a publication
+barrier. The model checks exact expected TopK sets, distinct token mappings,
+WQE source/destination addresses, posted counts, and final output locations.
+
+The measured scope ends after posting and location materialization. It excludes
+real NIC/CQ latency and the original downstream Index/output/completion workers,
+which remain in the actual A/B operator. Simulator microseconds are reported
+by the vendor profiler; they are not a conversion of device ticks or a prediction
+of end-to-end hardware time. The older per-component probes are not added to
+this combined-kernel measurement.
+
+The optimized terminal path consumes packed `(token, original_position)` entries
+directly, stages deduplicated posting IDs in the unused offsets buffer, and
+updates only miss locations. It does not overwrite, back up, or restore the full
+8192-position row. Admission metadata is computed once, not by all 256 threads.
+
+Local combined-kernel results (one active request, bound batch 1):
+
+| Path | Simulator duration, us | Posted | Check |
+| --- | ---: | ---: | --- |
+| Middle TopK + prefetch | 49.13 | 146 | PASS |
+| Previous terminal TopK + posting/location restore | 83.18 | 146 | PASS |
+| Optimized terminal TopK + posting/location patch | 57.96 | 146 | PASS |
+
+The terminal scope improves by 25.22 us (30.32%); its remaining difference
+from the middle path is 8.83 us. These are combined measurements, not sums of
+separate probes. They do not establish the improvement of the padded-batch-16
+hardware tail (97.61 us in the supplied trace); rerun `compare.py` for that.

@@ -57,6 +57,17 @@ def prepare(repo, destination):
     patch(base+'op_kernel/prefetch.h','        if(available>ctx->windowLimit)available=ctx->windowLimit;',
           '''        if(available>ctx->windowLimit)available=ctx->windowLimit;
         if constexpr(terminal)available=kLruSlots-slots;''')
+    patch(base+'op_kernel/prefetch.h','template<bool BuildSimt>', 'template<bool BuildSimt, bool terminal=false>')
+    patch(base+'op_kernel/prefetch.h','ctx->locations)+b*8192;','(terminal?ctx->sourceOffsets:ctx->locations))+b*8192;')
+    patch(base+'op_kernel/prefetch.h','__simt_vf__ __aicore__ LAUNCH_BOUND(256)\ninline void UnionColdTopk',
+          'template<bool packed=false>\n__simt_vf__ __aicore__ LAUNCH_BOUND(256)\ninline void UnionColdTopk')
+    patch(base+'op_kernel/prefetch.h','token=input[i];','token=packed?(input[i]>>11):input[i];')
+    patch(base+'op_kernel/prefetch.h','Simt::VF_CALL<UnionColdTopk>', 'Simt::VF_CALL<UnionColdTopk<terminal>>')
+    patch(base+'op_kernel/prefetch.h','ctx->locations)+b*8192);\n        DataCopy(cfg[128]',
+          '(terminal?ctx->sourceBlocks:ctx->locations))+b*8192);\n        DataCopy(cfg[128]')
+    patch(base+'op_kernel/prefetch.h','ctx->locations)+b*8192);\n                SetFlag',
+          '(terminal?ctx->sourceOffsets:ctx->locations))+b*8192);\n                SetFlag')
+    patch(base+'op_kernel/prefetch.h','BatchBuild<V9_BATCH_POST==1>', 'BatchBuild<V9_BATCH_POST==1,terminal>')
     patch('python/kvip/operators/lifetch/workspace.py','((max(1, rounds), lanes, 128), "uint8")',
           '((max(1, rounds)+1, lanes, 128), "uint8")')
     patch('csrc/operators/common/lifetch/li_launch.h',
