@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <iostream>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #define __simt_callee__
@@ -79,12 +80,16 @@ void SimulatedCopy(uint32_t*,uint32_t,uint32_t field,uint64_t*,uint32_t*,uint64_
     }
     if(claim)index_team::TryFourthBody(claim,block,reinterpret_cast<uint32_t*>(saved));
 }
-std::atomic<unsigned> stagesDone{};
+std::atomic<unsigned> stagesDone{},pauseAfterStage{},batchSuffixRuns{};
 namespace Simt {
 struct Dim3 {unsigned x,y,z;};
 template<auto Function,class... A> void VF_CALL(Dim3,A... args){
     if constexpr(sizeof...(A)==3)Function(args...); // Actual device claim.
-    else if constexpr(sizeof...(A)==7 || sizeof...(A)==5){
+    else if constexpr(sizeof...(A)==7 || sizeof...(A)==6){
+        if constexpr(sizeof...(A)==7){
+            auto bounds=std::tie(args...);
+            if(std::get<3>(bounds)-std::get<2>(bounds)>1)++batchSuffixRuns;
+        }
         // Run the actual fourth-field handoff with device-width barriers.
         std::barrier wave(256);
         std::vector<std::thread> threads;
@@ -92,7 +97,10 @@ template<auto Function,class... A> void VF_CALL(Dim3,A... args){
             threadIdx.x=t;waveBarrier=&wave;Function(args...);
         });
         for(auto& thread:threads)thread.join();
-        if constexpr(sizeof...(A)==5)++stagesDone;
+        if constexpr(sizeof...(A)==6){
+            const auto ordinal=++stagesDone;
+            while(pauseAfterStage==ordinal)std::this_thread::yield();
+        }
     }else SimulatedCopy(args...);
 }
 }
@@ -281,6 +289,63 @@ int main(){
         assert(timeslot[16]<=timeslot[17] && timeslot[17]<=timeslot[18]);
         assert(timeslot[19]==2 && timeslot[20]==target+1);
     }
+    // Hold both gates closed while the same AIV owns two sealed prefixes.
+    // Open one gate between slices and assert its order, then allow an error
+    // in the partner. All source words in a chunk form one long permutation.
+    for(unsigned scenario=0;scenario<4;++scenario){
+        constexpr unsigned n=777;
+        auto key=[&](unsigned r,unsigned i,unsigned w)->uint64_t&{
+            return keys[(uint64_t(r)*history+i)*16+w];
+        };
+        for(auto& f:team){f.ready=0;f.reserved[0]=0;}
+        for(auto& f:flags)f.ready=0;
+        for(auto r:{home,peer}){
+            auto e=index_team::Moves(&a,r);
+            e[0]=n;e[1]=n+1;e[2]=n+2;
+            for(unsigned i=0;i<n+2;++i){
+                e[kIndexEdgesOffset+2*i]=i<n?i:(i==n?1:n);
+                e[kIndexEdgesOffset+2*i+1]=i<n?(i+1)%n:i;
+                for(unsigned w=0;w<16;++w)key(r,i,w)=100000*r+32*i+w;
+            }
+            index_team::PublishPrefix(&a,r);
+        }
+        auto publish=[&](unsigned r,unsigned planError,unsigned qError){
+            index_team::PublishPlan(&a,r,3,planError,true);
+            index_team::Publish(flags.data()+r*kFlagCount+4,0,qError);
+        };
+        stagesDone=0;pauseAfterStage=2;batchSuffixRuns=0;
+        bool complete=false;
+        std::thread helper([&]{complete=index_team::CopySealedPrefix(&a,standby,batch);});
+        deadline([&]{return stagesDone.load()==2;}); // peer entirely read; home has <=256 moves
+        for(auto r:{home,peer}){
+            assert(index_team::ReadClaim(index_team::Moves(&a,r)+index_team::kClaimOffset)==standby+1);
+            assert(key(r,1,12)==100000*r+32+12);
+        }
+        bool homeFirst=scenario==1 || scenario==3;
+        unsigned first=homeFirst?home:peer, second=homeFirst?peer:home;
+        publish(first,0,0);pauseAfterStage=0;
+        deadline([&]{return index_team::Control(&a,first)[4].ready.load();});
+        assert(!index_team::Control(&a,second)[4].ready && key(second,1,12)==100000*second+32+12);
+        publish(second,scenario==2?4:0,scenario==3?8:0);
+        helper.join();
+        assert(complete);
+        for(auto r:{home,peer}){
+            unsigned err=r==second && scenario>=2?(scenario==2?4:8):0;
+            assert(index_team::Control(&a,r)[4].ready && index_team::Control(&a,r)[4].error==err);
+            for(unsigned i=0;i<n+2;++i)for(unsigned w=0;w<16;++w){
+                unsigned src=w<12 || err?i:(i>=n?0:(i+n-1)%n);
+                assert(key(r,i,w)==100000*r+32*src+w);
+            }
+        }
+        const auto t=times.data()+batch*256+32*standby;
+        assert(t[20]==peer+1 && t[25]==home+1 && t[19]==n && t[24]==n);
+        assert(t[26]==256 && t[27]>0 && t[29]>=t[27]);
+        assert(t[28]>=1 && t[28]<=4 && (scenario!=1 || t[28]==4));
+        if(scenario<2)assert(batchSuffixRuns>=1);
+        if(scenario==0)assert(t[18]<t[22]); // serve the first row before gathering all of the second
+    }
+    std::cout<<"TWO_SEALED_ROWS_PASS ready_order=both max_secondary_gather=256 "
+                "ordered_suffix=1 failed_plan_or_Q4_no_writes=1 exactly_once=1\n";
     std::cout<<"SEALED_PREFIX_PASS pending_plan_and_Q4=1 failed_plan_and_Q4=1 "
                 "dependent_suffix=1 paired_home_progress=1 no_early_writes=1 fields_exact=1\n";
     std::cout<<"INDEX_CQ_PREFIX_PASS full_chunk=1024 suffix_owner=comm,local_index,nominal_fourth,remote_index exactly_once=true\n";
