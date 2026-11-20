@@ -87,6 +87,7 @@ public:
     uint32_t resident_=0;
 public:
     rotating::RuntimeShape runtimeShape_;
+    bool adaptiveZero_ = false;
     bool sequenceSplit_ = false;
     bool sequenceTopKOnly_ = false;
 #if !V9_UBMEM
@@ -866,7 +867,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()
         for (uint32_t gS1LoopIdx = splitCoreInfo.gS1Start; gS1LoopIdx <= tempLoopInfo.gS1LoopEnd; gS1LoopIdx++) {
             CalcS2LoopParams(bN2LoopIdx, gS1LoopIdx);
 #if !V9_UBMEM
-            bool hadRecent = ScoreRecent(gloop, qScaleLoop);
+            bool hadRecent = !adaptiveZero_ && ScoreRecent(gloop, qScaleLoop);
 #endif
             uint32_t kScaleLoop = 0;
             for (int s2LoopIdx = splitCoreInfo.s2Start; s2LoopIdx <= tempLoopInfo.s2LoopEnd; s2LoopIdx++) {
@@ -916,7 +917,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessBaseBlock(uint3
         matmulService.ComputeMm1(runInfo);
 #if !V9_UBMEM
     } else {
-        vectorService.ProcessVec1(runInfo);
+        vectorService.ProcessVec1(runInfo, 0, false, adaptiveZero_);
     }
     FinishBaseBlock(runInfo);
 }
@@ -927,7 +928,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::FinishBaseBlock(const 
     uint32_t s2LoopIdx = runInfo.s2Idx;
     if ASCEND_IS_AIC {
 #endif
-        if (!rotationServed_ && rotating::EpochAt(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.splitQ,runtimeShape_.rounds,runtimeShape_.serviceAics,s2LoopIdx + 1, aiCoreIdx) >= 0) {
+        if (!adaptiveZero_ && !rotationServed_ && rotating::EpochAt(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.splitQ,runtimeShape_.rounds,runtimeShape_.serviceAics,s2LoopIdx + 1, aiCoreIdx) >= 0) {
             CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(8);
             rotationServed_ = true;
         }
@@ -936,11 +937,11 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::FinishBaseBlock(const 
 #else
         vectorService.ProcessVec1(runInfo);
 #endif
-        if ((runInfo.s2Idx + 1) * 128 == resident_) {
+        if (!adaptiveZero_ && (runInfo.s2Idx + 1) * 128 == resident_) {
             vectorService.ProcessResidentTopK(runInfo);
             vectorService.PrepareRotationProgress();
         }
-        if (!rotationServed_ && rotating::EpochAt(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.splitQ,runtimeShape_.rounds,runtimeShape_.serviceAics,s2LoopIdx + 1, aiCoreIdx) >= 0) {
+        if (!adaptiveZero_ && !rotationServed_ && rotating::EpochAt(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.splitQ,runtimeShape_.rounds,runtimeShape_.serviceAics,s2LoopIdx + 1, aiCoreIdx) >= 0) {
             vectorService.RotateFetch(rotating::EpochAt(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.splitQ,runtimeShape_.rounds,runtimeShape_.serviceAics,s2LoopIdx + 1, aiCoreIdx));
             CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(8);
             rotationServed_ = true;

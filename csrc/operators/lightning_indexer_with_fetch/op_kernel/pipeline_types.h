@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
 namespace pipeline_ab {
 constexpr uint32_t kIndexTeamLanes=4, kIndexTeamOption=0x01000000U;
 constexpr uint32_t kIndexTeamMinHistory=10496; // Scratch after the two dense permutation maps.
@@ -28,7 +29,12 @@ struct alignas(128) Args {
  uint64_t completedFlags, liveCount, completedRows, completedEvents; // Completed snapshots, separate from live URMA state.
  uint64_t completedMapping, completedJournal;
  uint64_t indexTeam; // Optional zeroed row controls (one cache line per writer).
+ uint64_t routeRequests, routeFeedback, routeResult, routeDemand;
+ uint32_t routeOwners, routePolicy;
 };
+static_assert(offsetof(Args,indexTeam)==192 && offsetof(Args,routeRequests)==200 &&
+              offsetof(Args,routeOwners)==232,"streaming Index team and route offsets");
+static_assert(sizeof(Args)==256,"streaming Args ABI");
 }
 
 namespace rotating {

@@ -244,7 +244,7 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
     mappedExport_=false;
     if (end0<=prior[0] && (!half || end1<=prior[1])) {
         JoinColdOutput();
-        if(exportWindowCold_) {
+        if (exportWindowCold_ && (!earlyOnly_ || rankedEpoch_ == 1)) {
             GlobalTensor<uint32_t> saved; saved.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(WindowTopkPrefix()+uint64_t(query/4)*prefixBytes+4*2048*2)+(query%4)*2048);
             GlobalTensor<uint16_t> savedScores;
             savedScores.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(WindowTopkPrefix()+uint64_t(query/4)*prefixBytes)+(query%4)*2048);
@@ -442,7 +442,9 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
         threshold=topkSharedTmpLocal_.template ReinterpretCast<uint16_t>().GetValue(0);
     }
     rankEnd0_=prior[0];rankEnd1_=prior[1];
-    if(exportWindowCold_)ExportWindowCold(query);
+    // Closed EARLY windows still advance their exact TopK prefix. No Get
+    // consumer reads a candidate list from them, so skip its export as well.
+    if (exportWindowCold_ && (!earlyOnly_ || rankedEpoch_ == 1)) ExportWindowCold(query);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
     if(incrementalPipeline_ && incrementalMetadataActive_) {
         if(incrementalOutputPending_) {

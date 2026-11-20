@@ -52,6 +52,28 @@ inline void MergeClassifyBitmap(__ubuf__ uint32_t* bitmap,uint32_t resident) {
 #if !V9_UBMEM
 
 namespace rotating {
+// Zero speculative writes: a valid resident hit stays in place, including
+// victim candidates. Protect hits across all Qs before assigning actual misses.
+__simt_vf__ __aicore__ LAUNCH_BOUND(512)
+inline void ClassifyExactLocations(uint32_t history,uint32_t resident,uint32_t owner,__gm__ Context* ctx,
+    uint32_t tailBegin,uint32_t tailEnd,__ubuf__ uint32_t* indices,__ubuf__ uint32_t* locations,
+    __ubuf__ uint32_t* bitmap,__ubuf__ uint32_t* error) {
+    const uint32_t words=(resident+31)/32, shards=4096/words<8?4096/words:8;
+    auto valid=reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid);
+    for (uint32_t i=threadIdx.x;i<kTop;i+=512) {
+        uint32_t token=indices[i],slot=UINT32_MAX;
+        if (token<history) {
+            if (token>=tailBegin && token<tailEnd)
+                slot=DirectTailSlot(token,resident,tailBegin,tailEnd,OutputStride(resident,ctx)-resident);
+            else if (token<resident && (!valid || asc_ldcg(valid+uint64_t(owner)*resident+token)))
+                slot=token;
+        } else if (token!=UINT32_MAX) asc_atomic_or(error,1U);
+        locations[i]=slot;
+        if (slot<resident) asc_atomic_or(bitmap+(threadIdx.x%shards)*words+slot/32,1U<<(slot%32));
+    }
+    asc_syncthreads();
+}
+
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
 inline void ClassifyPreparedLocations(uint32_t history,uint32_t resident,uint32_t batch,__gm__ Context* ctx,
     uint32_t tailBegin,uint32_t tailSize,uint32_t ringStart,uint32_t capacity,
