@@ -34,7 +34,9 @@ peer_prepare_node() {
     local kvaf_revision=de4fd37e02fa86357f71fe4fcbbbecc3e75d1d58
     local area=${clean%/*} repo cann cache headers lib prefix cpu_cache venv lidu
     mkdir -p "$area" || return
-    peer_node_pin "$root" "$baseline" "$serial_revision" test/host20-peer-serial-only || return
+    if [[ ${6:-} != fused-only ]]; then
+        peer_node_pin "$root" "$baseline" "$serial_revision" test/host20-peer-serial-only || return
+    fi
     if [[ ! -e "$clean" ]]; then
         repo="$work/KVAF"
         if [[ $(git -C "$repo" remote get-url origin 2>/dev/null) == *CacheOS/KVAF* ]]; then
@@ -57,7 +59,7 @@ peer_prepare_node() {
     export ASCEND_RT_VISIBLE_DEVICES=4 SOC_VERSION=Ascend950DT_9582 ASCEND_LAUNCH_BLOCKING=0
     export MAX_JOBS=2 OMP_NUM_THREADS=1 NANOVLLM_A5_OPS_BUILD_JOBS=2
 
-    venv="$area/python-$(git -C "$baseline" rev-parse --short=8 HEAD)"
+    venv="$area/python-${serial_revision:0:8}"
     if [[ ! -x "$venv/bin/python" ]]; then
         peer_node_logged "$out/venv.log" /usr/local/python3.12.13/bin/python3 -m venv --system-site-packages "$venv" || return
     fi
@@ -89,10 +91,15 @@ peer_prepare_node() {
         peer_node_logged "$out/build-cpu.log" bash "$clean/build.sh" cpu --jobs 2 || return
     fi
 
+    if [[ ${6:-} == fused-only ]]; then
+        printf 'LOCAL_DEPS_READY clean_KVAF=%.8s CANN=%s\n' "$kvaf_revision" "$cann"
+        return
+    fi
     lidu="$baseline/csrc/operators/lidu"
     (
         export PYTHONPATH="$lidu/torch_extension${PYTHONPATH:+:$PYTHONPATH}"
-        if ! "$PYTHON" -c 'from pathlib import Path; import sys; import nanovllm_dsa_lidu_fused_batch_get_prepare_mtp as m; assert Path(m.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve()); m.lidu_fused_batch_get_prepare_mtp_out' "$lidu" >"$out/lidu-import.log" 2>&1; then
+        local vendors=("$lidu"/_custom_opp/vendors/*/op_api/lib/libcust_opapi.so)
+        if [[ ${#vendors[@]} != 1 || ! -s ${vendors[0]} ]] || ! "$PYTHON" -c 'from pathlib import Path; import sys; import nanovllm_dsa_lidu_fused_batch_get_prepare_mtp as m; assert Path(m.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve()); m.lidu_fused_batch_get_prepare_mtp_out' "$lidu" >"$out/lidu-import.log" 2>&1; then
             peer_node_logged "$out/build-lidu.log" bash "$lidu/build_lidu_fused_batch_get_prepare_mtp.sh" || exit
         fi
     ) || return
