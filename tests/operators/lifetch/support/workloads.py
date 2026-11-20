@@ -152,6 +152,8 @@ def configuration(argv=None):
                                  help='clean ranked URMA checkout whose binding and kernels will run')
             command.add_argument('--ranked-auto-route', action='store_true',
                                  help='learn the route from previous successful device feedback')
+            command.add_argument('--query-owner-arm', choices=('baseline', 'candidate'),
+                                 help='matched BS16 Q4 ownership test, seed plus eight cold windows')
             command.add_argument('--ranked-q-workers', type=int, choices=(1, 2, 4),
                                  help='final URMA Post/CQ workers per query position on a ranked replay')
             command.add_argument('--candidate-root', type=Path, help='G2 auto-route production checkout')
@@ -202,9 +204,16 @@ def configuration(argv=None):
             parser.error('prefetch-rank-start must be in 1..2048')
         if args.transport != 'urma' and args.prefetch_rank_start != 1024:
             parser.error('prefetch-rank-start requires the URMA ranked prefetch path')
+        query_owner = getattr(args, 'query_owner_arm', None)
+        if query_owner:
+            if not (args.production_root and args.fused_only and args.transport == 'urma'
+                    and args.level == 1 and not args.ranked_auto_route
+                    and (args.intermediate_fetches, args.prefetch_tokens) == (9, 512)):
+                parser.error('query-owner comparison requires fused-only production URMA, level 1 and 9 boundaries/512 tokens')
+            args.window_limit = 64
         if (args.warmup < 0 or args.iterations <= 0 or not 1 <= args.intermediate_fetches <= 32
                 or not 0 <= args.prefetch_tokens <= 2048
-                or args.prefetch_tokens % args.intermediate_fetches):
+                or (not query_owner and args.prefetch_tokens % args.intermediate_fetches)):
             parser.error('invalid timing or prefetch configuration')
     if args.mode == 'diagnose':
         if args.serial_workers != 2 and (not args.serial_only or args.transport != 'urma'):
@@ -217,9 +226,9 @@ def configuration(argv=None):
             parser.error('--ranked-q-workers requires --production-root')
         if args.production_root:
             if (args.transport != 'urma' or not args.fused_only or args.input != 'real'
-                    or args.round_range[0] != args.round_range[1] or args.level != 2
+                    or args.round_range[0] != args.round_range[1] or args.level != (1 if query_owner else 2)
                     or args.candidate_root or args.candidate_snapshot or args.route_policy):
-                parser.error('--production-root requires a fused-only real single-round URMA level-2 replay')
+                parser.error('--production-root requires fused-only real single-round URMA and the configured diagnostic level')
             args.production_root = args.production_root.resolve()
         if args.route_policy:
             if (args.transport != 'urma' or not args.fused_only or args.group != 2

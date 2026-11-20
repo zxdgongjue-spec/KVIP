@@ -28,6 +28,7 @@ joint=false
 joint_local=false
 joint_archive=false
 ranked_auto=false
+query_owner=false
 current_fixed=6bca602ad9e548e9f12c0142fea25f2bc5c6877d
 ranked_q_workers=${PEER_RANKED_Q_WORKERS:-2}
 ranked_groups=(7 2 10 4 17)
@@ -67,6 +68,12 @@ if [[ ${1:-} == --ranked-help || ${1:-} == --ranked-joint ]]; then
     elif [[ -n "$joint_reference" ]]; then
         echo '--previous requires --ranked-joint' >&2; exit 2
     fi
+elif [[ ${1:-} == --query-owner ]]; then
+    query_owner=true
+    ranked=${2:?supply query-owner commit}
+    [[ $ranked =~ ^[0-9a-f]{40}$ && $ranked != "$current_fixed" ]] || exit 2
+    ranked_sha=$current_fixed
+    shift 2
 elif [[ ${1:-} == --ranked-auto ]]; then
     ranked_auto=true
     ranked_groups=(2 7 10 4 17)
@@ -209,7 +216,13 @@ if [[ -z "$ranked" ]]; then
     git -C "$root" diff --exit-code --quiet "$serial_revision" HEAD -- csrc/operators/lidu
 fi
 if [[ -n "$ranked" ]]; then
-    if "$ranked_auto"; then
+    if "$query_owner"; then
+        if ! git -C "$root" cat-file -e "$ranked^{commit}" 2>/dev/null; then
+            git -C "$root" fetch -q origin refs/heads/perf/urma-q4-query-owner
+        fi
+        ranked_base="$src/ranked-${ranked_sha:0:8}"
+        pin "$root" "$ranked_base" "$ranked_sha"
+    elif "$ranked_auto"; then
         git -C "$root" merge-base --is-ancestor "$current_fixed" "$ranked"
         ranked_base="$src/ranked-${current_fixed:0:8}"
         pin "$root" "$ranked_base" "$current_fixed"
@@ -291,6 +304,9 @@ cpu="$clean/build-cpu/runtime/kvaf_cpu_service"
 test -x "$cpu"
 if [[ -n "$ranked" ]]; then
     printf 'CONFIG URMA physical_NPU=%s logical_device=0 BS16 Q4 656B ranked=%.8s candidate=%.8s KVAF=%.8s\n' "$peer_physical_npu" "$ranked_sha" "$ranked" "$transport"
+    if "$query_owner"; then
+        echo 'CONFIG final_owners=16x4 prefetch_seed=1 cold_windows=8 window_budget=64 total_budget=512 warmup=4 samples=20'
+    fi
     # Compile through the same cache key used by run_path. Fail before copying
     # five traces or running the baseline if the toolchain rejects either arm.
     if "$ranked_auto"; then
@@ -366,6 +382,12 @@ run_arm() (
         after) candidate=$new ;;
     esac
     limits=(--prefetch-tokens 1024 --intermediate-fetches 4)
+    if "$query_owner"; then
+        # The first boundary is resident-ready. The other eight end cold scans.
+        limits=(--prefetch-tokens 512 --intermediate-fetches 9)
+        mode+=(--ranked-q-workers 2 --query-owner-arm "$label")
+        level=1
+    fi
     if [[ "$label" == before* || "$label" == after ]]; then
         limits=(--prefetch-tokens 512 --intermediate-fetches 8)
         mode=(--fused-only --candidate-root "$src/auto-${candidate:0:8}" --candidate-snapshot "$snapshot")
@@ -481,7 +503,11 @@ if [[ -n "$ranked" ]]; then
         for label in "${order[@]}"; do
             run_arm "$label" "$group" "$case_dir"
         done
-        "$PYTHON" -B "$tools/support/ranked_five_report.py" "$out" --group "$group" | tee -a "$out/summary.txt"
+        if "$query_owner"; then
+            "$PYTHON" -B "$tools/support/query_owner_report.py" "$out" "$group" | tee -a "$out/summary.txt"
+        else
+            "$PYTHON" -B "$tools/support/ranked_five_report.py" "$out" --group "$group" | tee -a "$out/summary.txt"
+        fi
         order=("${order[1]}" "${order[0]}")
     done
     printf 'REPLAY_COMPLETE RESULT_ROOT=%s\n' "$out"

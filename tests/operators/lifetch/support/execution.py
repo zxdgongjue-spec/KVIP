@@ -3239,7 +3239,7 @@ class FusedReplayState:
     state must not have live graphs or unfinished device work.
     """
     def __init__(self, torch, runtime, table, library, initial, pages, addresses,
-                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None, candidate_bounds=None, route_policy=None, fixed_reset=None, ranked_q_workers=None):
+                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None, candidate_bounds=None, route_policy=None, fixed_reset=None, ranked_q_workers=None, query_owner_arm=None, window_limit=None):
         from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
         from kvip.cache.index_storage import IndexCacheStorage
         from kvip.operators.lifetch.binding import LIFetchBinding
@@ -3250,6 +3250,7 @@ class FusedReplayState:
 
         self.torch, self.device, self.pages, self.initial = torch, device, pages, initial
         self.logical_addresses = addresses
+        self.query_owner_arm = query_owner_arm
         self.fixed_reset = fixed_reset
         g = initial.geometry
         self.batch, self.history, self.resident = g['batch'], g['history'], g['resident']
@@ -3295,6 +3296,8 @@ class FusedReplayState:
                         raise ValueError(f'Ranked final Get needs {required} queue views, Runtime provides {views}')
                 if candidate_bounds is None:
                     binding['prefetch_rank_start'] = prefetch_rank_start
+                    if window_limit is not None:
+                        binding['window_limit'] = window_limit
                 else:
                     from peer_candidate import candidate_binding
                     binding.update(candidate_binding(torch, library, device, candidate_bounds))
@@ -3471,6 +3474,14 @@ class FusedReplayState:
 
     def validate(self, inputs):
         self.check_completion()
+        arm = self.query_owner_arm
+        if arm in ('baseline', 'candidate'):
+            from query_owner_report import owner_receipts
+            active = hasattr(self.forward, 'query_owner_scratch')
+            if active != (arm == 'candidate'):
+                raise RuntimeError(f'{arm}: query-owner binding active={active}')
+            if active:
+                self.query_owners = owner_receipts(self.rotating.final_posts.cpu().numpy())
         ids = self.update.logical_output.cpu().numpy().reshape(self.batch, 4, 2048)
         slots = self.update.slot_output.cpu().numpy().reshape(self.batch, 4, 2048)
         invalid = (ids < 0) | (ids >= self.history) | (slots < 0) | (slots >= self.stride)
@@ -4087,7 +4098,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 prefetch_tokens=config.prefetch_tokens, soc=soc,
                 prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024), candidate_bounds=candidate_bounds,
                 route_policy='zero' if getattr(config, 'ranked_auto_route', False) else getattr(config, 'route_policy', None), fixed_reset=fixed_reset,
-                ranked_q_workers=getattr(config, 'ranked_q_workers', None))
+                ranked_q_workers=getattr(config, 'ranked_q_workers', None),
+                query_owner_arm=getattr(config, 'query_owner_arm', None), window_limit=getattr(config, 'window_limit', None))
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
         if config.mode in ('bench', 'diagnose') and g.get('sparse_mode') == 0 and not fused:
@@ -4136,7 +4148,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                         prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease,
                         candidate_bounds=candidate_bounds,
                         route_policy='zero' if getattr(config, 'ranked_auto_route', False) else getattr(config, 'route_policy', None), fixed_reset=fixed_reset,
-                        ranked_q_workers=getattr(config, 'ranked_q_workers', None))
+                        ranked_q_workers=getattr(config, 'ranked_q_workers', None),
+                        query_owner_arm=getattr(config, 'query_owner_arm', None), window_limit=getattr(config, 'window_limit', None))
                     replica.failure_directory = directory
                 else:
                     replica = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
@@ -4151,6 +4164,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                           input_paths=[str(ref.manifest_path) for refs in sequence.rounds for ref in refs])
             if getattr(config, 'production_root', None):
                 result['topk_set_digests'] = [s.topk_set_digest for s in batch_states]
+                if hasattr(batch_states[0], 'query_owners'):
+                    result['query_owners'] = [s.query_owners for s in batch_states]
                 result['production_revision'] = config.production_revision
                 result['binary_sha256'] = hashlib.sha256(Path(library).read_bytes()).hexdigest()
             elif getattr(config, 'candidate_root', None):
