@@ -171,6 +171,51 @@ class DirectScoreParts(unittest.TestCase):
         self.assertEqual(c.compare_routes, ('mr23', 'aligned_budget'))
         self.assertEqual(c.prefetch_tokens, 0)
 
+    def test_three_small_batch_routes_keep_user_prefetch_and_graph_configuration(self):
+        c = configuration([*USER_ARGS, '--batches', '1,2,4',
+            '--compare-routes', 'mr23,window_budget,query_budget',
+            '--li-score-parts-map', '1:16,2:16,4:8', '--comparison-dry-run'])
+        self.assertEqual(c.batches, (1,2,4))
+        self.assertEqual(c.compare_routes, ('mr23','window_budget','query_budget'))
+        self.assertEqual((c.prefetch_tokens,c.intermediate_fetches,c.warmup,c.iterations), (512,4,2,10))
+        self.assertEqual([score_parts_for_batch(c,b) for b in c.batches], [16,16,8])
+        self.assertEqual(c.li_score_mode, 'full')
+        for b in c.batches:
+            g = li_geometry(b, intermediate_fetches=c.intermediate_fetches, aic_count=32)
+            shape = SimpleNamespace(batch=b, history=c.history, resident=c.resident,
+                rounds=g['intermediate_fetches'], indexHeads=c.index_heads, splitQ=1,
+                liCores=2*b, aicCount=32, serviceLanes=g['service_aivs_per_window'])
+            query = score_window_schedule(shape, score_parts_for_batch(c,b), query_parallel=True)
+            self.assertEqual(query['mode'], 'window_query')
+            self.assertEqual(query['topk_aivs'], 4*b)
+            self.assertEqual(query['li_launches'], 3*shape.rounds+2)
+
+    def test_mr23_and_query_only_comparison_does_not_require_window_route(self):
+        c = configuration([*USER_ARGS, '--batches', '1,2,4',
+            '--compare-routes', 'mr23,query_budget'])
+        self.assertEqual(c.compare_routes, ('mr23','query_budget'))
+        self.assertEqual((c.prefetch_tokens,c.intermediate_fetches,c.warmup,c.iterations), (512,4,2,10))
+        self.assertEqual(c.li_score_parts, 0)
+        self.assertIsNone(c.li_score_parts_map)
+
+    def test_query_zero_prefetch_ablation_is_valid(self):
+        c = configuration([*USER_ARGS, '--batches','1,2,4',
+            '--compare-routes','mr23,window_budget,query_budget', '--prefetch-tokens','0'])
+        self.assertEqual(c.compare_routes, ('mr23','window_budget','query_budget'))
+        self.assertEqual(c.prefetch_tokens, 0)
+        self.assertEqual((c.intermediate_fetches,c.warmup,c.iterations), (4,2,10))
+
+    def test_query_comparison_requires_the_same_supported_input_scope(self):
+        for extra in [['--transport','ubmem'],
+                      ['--index-heads','64'], ['--queries','2']]:
+            with self.subTest(extra=extra):
+                self.reject(['--compare-routes','mr23,query_budget',*extra])
+        self.reject(['--compare-routes','query_budget'])
+        self.reject(['--compare-routes','mr23,query_budget,query_budget'])
+        self.reject(['--compare-routes','mr23,query_budget'], base=['bench','--input','real',
+                    '--trace-root','/trace','--group','0','--round-range','1:1'])
+        self.reject(['--compare-routes','mr23,query_budget'], base=['diagnose'])
+
 
 if __name__ == '__main__':
     unittest.main()

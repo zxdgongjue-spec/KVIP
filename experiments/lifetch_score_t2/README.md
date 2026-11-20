@@ -2,7 +2,7 @@
 
 MR14 参考提交为 `c684d79f3a4f8432bf0915edeba392c7d54ba289`，MR23 基线固定为 `a56154c37bebb0928da4a4095e9670898e6b21c7`。这里将 MR14 的 history 分核、真实 canonical 地址直写和 producer predicate 机制融合到 MR23。该适配属于算法/调度对齐，不是 MR14 staged adapter 的 Context/lease/ABI 整包复制。
 
-当前统一入口是 `python tests/operators/lifetch/test_lifetch.py bench`，在原参数后追加 `--compare-routes mr23,window_budget` 即可对比固定MR23与MR14窗口分核候选。两路保持用户指定的五batch共享池、预取512、请求窗口4、warmup2、iterations10和timeout3600；默认一轮不额外丢弃r0。完整命令、分核map、依赖要求和输出见 [DIRECT_BENCH.md](DIRECT_BENCH.md)。
+当前统一入口是 `python tests/operators/lifetch/test_lifetch.py bench`，本轮用 `--batches 1,2,4 --compare-routes mr23,window_budget,query_budget` 对比固定MR23、窗口分核与Q并行窗口TopK/post候选。三路保持三个batch的共享池、预取512、请求窗口4、warmup2、iterations10和timeout3600；默认一轮不额外丢弃r0。20机参数包装为 `run_b124_a5.sh`，仍调用统一bench；当前使用逻辑device0、server28985及既有pinned KVAF。完整命令、分核map、同图组件、请求计数和输出见 [DIRECT_BENCH.md](DIRECT_BENCH.md)。
 
 历史三路pf0对比入口为 `run_aligned_a5.sh`：`mr23` 是原融合基线；`window_budget` 是 MR23＋MR14 窗口分核 Score，保留原 Service/Final；`aligned_budget` 是 MR23＋MR14 全 history 分核 Score＋全量 Top2048/classify，接原完成 Fetch/Index。两种 MR14 策略融合后的结果均为 `Fused` 行。包装脚本默认 B1/2/4/8/16、miss5/10/15/20/25/30、pf0、r0＋3个测量轮，共60个任务，每个任务运行全部6种 miss。命令行末尾参数可覆盖默认值。miss 支持互不重复的有限0..100百分比。完整配置、最新B1/B2初测和限制见 [ALIGNMENT.md](ALIGNMENT.md)。
 

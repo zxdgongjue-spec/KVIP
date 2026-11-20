@@ -3743,6 +3743,10 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
         for state in states:
             state.reset()
         rounds = {}
+        pipeline_counts = None
+        if fused:
+            from pipeline_counts import collect_pipeline_counts, new_pipeline_count_report
+            pipeline_counts = new_pipeline_count_report()
         for inputs in sequence:
             before = []
             for state in states:
@@ -3756,6 +3760,8 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             measured = profile_graph_batch(torch, TrackedGraph(), calls=len(states), folder=folder,
                                            serial=not fused, transport=config.transport, stream=stream)
             validate_all(inputs, 'measured')
+            if fused:
+                pipeline_counts['records'].extend(collect_pipeline_counts(states, inputs.source_round))
             rounds[inputs.source_round] = measured['timing']
             samples = []
             for i, item in enumerate(measured['samples']):
@@ -3844,7 +3850,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                        overlap_mean_us=sum(t['overlap_mean_us'] for t in rounds.values())/len(rounds),
                        outside_invocations_mean_us=sum(t['outside_invocations_mean_us'] for t in rounds.values())/len(rounds))
         return dict(rounds=rounds, all_rounds=overall, correctness=checks.status,
-                    failures=checks.failures, sequence_graph_sum=dict(
+                    failures=checks.failures, pipeline_counts=pipeline_counts, sequence_graph_sum=dict(
                         mean_us=sum(t['mean_us'] for t in rounds.values()), samples=1))
     except BaseException as error:
         if pending:

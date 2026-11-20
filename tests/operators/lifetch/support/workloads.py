@@ -177,7 +177,7 @@ def configuration(argv=None):
             command.add_argument('--iterations', type=int, default=20, help='independent complete invocations captured in one measured graph')
         if mode == 'bench':
             command.add_argument('--compare-routes', type=csv_values,
-                                 help='compare mr23 with window_budget and/or aligned_budget using the same bench workload')
+                                 help='compare mr23 with window_budget, query_budget and/or aligned_budget using the same bench workload')
             command.add_argument('--comparison-rounds', type=int, default=1,
                                  help='outer measured comparison rounds; does not change iterations per graph')
             command.add_argument('--comparison-discard-first', action='store_true',
@@ -232,10 +232,10 @@ def configuration(argv=None):
             parser.error('prefetch-rank-start must be in 1..2048')
         comparing = getattr(args, 'compare_routes', None) is not None
         if comparing:
-            allowed = {'mr23', 'window_budget', 'aligned_budget'}
+            allowed = {'mr23', 'window_budget', 'query_budget', 'aligned_budget'}
             if (len(args.compare_routes) < 2 or 'mr23' not in args.compare_routes
                     or set(args.compare_routes) - allowed):
-                parser.error('compare-routes must include mr23 and at least one window_budget/aligned_budget candidate')
+                parser.error('compare-routes must include mr23 and at least one window_budget/query_budget/aligned_budget candidate')
             if args.transport != 'urma' or args.input != 'synthetic' or args.index_heads != 32:
                 parser.error('route comparison requires bench URMA synthetic Q4/head32 inputs')
             if 'aligned_budget' in args.compare_routes and args.prefetch_tokens:
