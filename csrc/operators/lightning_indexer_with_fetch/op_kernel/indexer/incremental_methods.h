@@ -568,6 +568,38 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     }
     return true;
 }
+__aicore__ inline bool LogicalCutoffEnabled() {
+    auto args = reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_);
+    return streamingTopkOnly_ && trunkLen_ == 16384 && args && args->queryOwnerScratch && args->logical;
+}
+
+__aicore__ inline void RepairLogicalCutoff(uint32_t query, uint32_t valid, __gm__ uint16_t* rawAddress, bool tagged) {
+    auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+    auto args = reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_);
+    uint32_t b = query / 4;
+    uint32_t owner = ctx->rowOwners ? reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b] : b;
+    lifetch_incremental::Minimum(reinterpret_cast<__ubuf__ uint16_t*>(scoreOutLocal_.GetPhyAddr()),
+        reinterpret_cast<__ubuf__ uint32_t*>(topkSharedTmpLocal_.GetPhyAddr()));
+    SetFlag<HardEvent::V_S>(EVENT_ID5);WaitFlag<HardEvent::V_S>(EVENT_ID5);
+    uint16_t cutoff = topkSharedTmpLocal_.template ReinterpretCast<uint16_t>().GetValue(0);
+    GlobalTensor<uint16_t> raw;
+    GlobalTensor<uint64_t> logical;
+    raw.SetGlobalBuffer(rawAddress);
+    logical.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(args->logical) + uint64_t(owner)*runtimeShape_.history);
+    uint32_t resident = tagged ? runtimeShape_.resident : 0;
+    auto hot = tagged && ctx->hotValid ? reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*resident : nullptr;
+    auto reserved = tagged && ctx->reservedHot ? reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+uint64_t(b)*resident : nullptr;
+    uint32_t tailBegin = 0, tailEnd = 0;
+    if (tagged && ctx->tailBounds) {
+        auto bounds = reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds)+2*b;
+        tailBegin = bounds[0];
+        uint32_t capacity = ctx->outputStride > resident ? ctx->outputStride-resident : 0;
+        tailEnd = Min(bounds[1], uint32_t(Min(uint64_t(tailBegin)+capacity,uint64_t(runtimeShape_.history))));
+    }
+    kvip_logical_cutoff::Repair(raw,logical,scoreOutLocal_,indicesOutLocal_,mrgValueLocal_,topkSharedTmpLocal_,
+        valid,runtimeShape_.history,cutoff,resident,hot,reserved,tailBegin,tailEnd);
+}
+
 __aicore__ inline void FinalIncremental(uint32_t query,uint32_t valid) {
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     if(runtimeShape_.rounds) {
@@ -586,6 +618,14 @@ __aicore__ inline void FinalIncremental(uint32_t query,uint32_t valid) {
     ids.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(WindowTopkPrefix()+(query/4)*prefixBytes+4*2048*2)+(query%4)*2048);
     PipeBarrier<PIPE_ALL>();DataCopy(indicesOutLocal_,ids,2048);
     SetFlag<HardEvent::MTE2_V>(EVENT_ID5);WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);
+    if (LogicalCutoffEnabled()) {
+        // A fully serviced row can exit AdvanceIncremental before loading either paired array.
+        GlobalTensor<uint16_t> finalScores;
+        finalScores.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(WindowTopkPrefix()+(query/4)*prefixBytes)+(query%4)*2048);
+        DataCopy(scoreOutLocal_,finalScores,2048);
+        SetFlag<HardEvent::MTE2_V>(EVENT_ID5);WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);
+        RepairLogicalCutoff(query,valid,reinterpret_cast<__gm__ uint16_t*>(IncrementalMeta(query)[0]),true);
+    }
     auto initial=streamingTopkOnly_?streamingOutput_:topkSharedTmpLocal_;
     kvip_prefetch_rank::RestorePublicIds(reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),
         reinterpret_cast<__ubuf__ uint32_t*>(initial.GetPhyAddr()),runtimeShape_.resident);
