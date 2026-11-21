@@ -98,24 +98,12 @@ __aicore__ __attribute__((noinline)) inline void PlanRequest(__gm__ Args *a, uin
     SetFlag<HardEvent::S_V>(EVENT_ID0);
     WaitFlag<HardEvent::S_V>(EVENT_ID0);
     InputReady();
-    auto saved = Scratch(a, b);
-    uint32_t protection = 0;
     uint32_t begin = 0;
     for (uint32_t q = 0; q < 4; ++q) {
         Slice s{begin, 0, 0, error};
         const uint32_t encoded = headers[32 * q + 1];
         if (begin > kSlots - kTop) s.error |= 4;
         if (!s.error && (q == 0 || encoded != 1)) {
-            if (q) {
-                FromGm(keys, saved, buckets);
-                FromGm(ranks, saved + kSlots, buckets);
-                FromGm(slots, saved + 2 * kSlots, begin);
-                FromGm(ctl, saved + 3 * kSlots, 32);
-                if (protection) FromGm(ctl[1024], saved + 3 * kSlots + 32, (a->resident + 31) / 32);
-                InputReady();
-                SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
-                WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-            }
             bool compact = encoded && encoded <= kCompactMissLimit + 1 &&
                            row->slots + s.begin + encoded - 1 <= kLruSlots && !ctl.GetValue(kProtectionState);
             if (compact) {
@@ -151,18 +139,6 @@ __aicore__ __attribute__((noinline)) inline void PlanRequest(__gm__ Args *a, uin
                 if (!compact) {
                     BeforeStore();
                     ToGm(locations + q * kTop, loc[q * kTop], kTop);
-                    StoreDone();
-                    SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
-                    WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
-                }
-                if (q < 3) {
-                    protection = ctl.GetValue(kProtectionState);
-                    BeforeStore();
-                    ToGm(saved, keys, buckets);
-                    ToGm(saved + kSlots, ranks, buckets);
-                    ToGm(saved + 2 * kSlots, slots, begin + s.count);
-                    ToGm(saved + 3 * kSlots, ctl, 32);
-                    if (protection) ToGm(saved + 3 * kSlots + 32, ctl[1024], (a->resident + 31) / 32);
                     StoreDone();
                     SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
                     WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
