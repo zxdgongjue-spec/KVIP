@@ -236,23 +236,33 @@ def report_resolver(root, group):
               f'gain_pct={gains[0]:+.2f}/{gains[1]:+.2f} drift_guard_pct={drift[0]:.2f}/{drift[1]:.2f} {gate}')
 
 
+def checked_layout_plan(rows, states, name):
+    """Return the 16 ordered row plan hashes and check their committed Index states."""
+    if len(rows) != 16:
+        raise ValueError(f'Incomplete layout receipts for {name}')
+    plans = []
+    for request, (plan, state) in enumerate(rows):
+        if not SHA256.fullmatch(plan) or not SHA256.fullmatch(state):
+            raise ValueError(f'Invalid layout receipt for {name}, request {request}')
+        if states.setdefault((request, plan), state) != state:
+            raise ValueError(f'Different physical Index for identical events, request {request}')
+        plans.append(plan)
+    return tuple(plans)
+
+
 def compare_layout_receipts(arms, candidate):
     """Compare exact physical Index for identical ordered events on the same request."""
     states = {}
     arms_by_plan = defaultdict(set)
     calls_by_arm = {}
     for name, calls in arms.items():
-        if len(calls) != 20 or any(len(rows) != 16 for rows in calls):
+        if len(calls) != 20:
             raise ValueError(f'Incomplete layout receipts for {name}')
-        calls_by_arm[name] = Counter(tuple(plan for plan, _ in rows) for rows in calls)
-        for rows in calls:
-            for request, (plan, state) in enumerate(rows):
-                if not SHA256.fullmatch(plan) or not SHA256.fullmatch(state):
-                    raise ValueError(f'Invalid layout receipt for {name}, request {request}')
-                key = request, plan
-                if states.setdefault(key, state) != state:
-                    raise ValueError(f'Different physical Index for identical events, request {request}')
-                arms_by_plan[key].add(name)
+        signatures = [checked_layout_plan(rows, states, name) for rows in calls]
+        calls_by_arm[name] = Counter(signatures)
+        for plans in signatures:
+            for request, plan in enumerate(plans):
+                arms_by_plan[request, plan].add(name)
     candidate_calls = calls_by_arm[candidate]
     return {
         name: (sum(name in arms_by_plan[request, plan]

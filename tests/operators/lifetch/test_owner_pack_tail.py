@@ -68,3 +68,29 @@ def test_single_state_ordered_capture_and_off_on_pairs(tmp_path):
     failure = json.loads((tmp_path/'owner_tail_order_failure.json').read_text())
     assert failure['rank'] == 3
     assert (tmp_path/'owner_tail_topk.npz').exists()
+
+
+def test_archived_coverage_and_same_repeat_pairs():
+    from copy import deepcopy
+    from owner_pack_tail import match_plans
+
+    def receipt(plan):
+        return (f'{plan:064x}', f'{plan+10:064x}')
+    base = [receipt(0)] * 16
+    altered = [receipt(1), *base[1:]]
+    other = [receipt(2), *base[1:]]
+    samples = [
+        dict(layout_receipts=on, off_layout_receipts=off, event_on_us=11+i, event_off_us=10)
+        for i, (on, off) in enumerate([(base, base), (base, altered), (altered, altered),
+                                       (base, other), (altered, base)])
+    ]
+    archive = [base] * 20
+    assert match_plans(samples, archive) == dict(
+        archive_rows=78, archive_calls=3, on_off_rows=77, on_off_calls=2, matched_on_minus_off_p50_us=2)
+    # All runs still have valid semantics if the event plans never repeat.
+    mismatch = [dict(s, off_layout_receipts=other) for s in samples]
+    assert match_plans(mismatch, archive)['matched_on_minus_off_p50_us'] is None
+    corrupted = deepcopy(samples)
+    corrupted[1]['off_layout_receipts'] = [(receipt(0)[0], 'a' * 64), *base[1:]]
+    with pytest.raises(ValueError, match='Different physical Index for identical events, request 0'):
+        match_plans(corrupted, archive)

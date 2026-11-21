@@ -2,12 +2,13 @@
 import argparse
 import hashlib
 import json
+from statistics import median
 from math import isfinite
 from pathlib import Path
 
 import numpy as np
 
-from query_owner_report import compare_layout_receipts, load
+from query_owner_report import checked_layout_plan, compare_layout_receipts, load
 from reporting import atomic_json
 
 REPEATS = 5
@@ -83,7 +84,9 @@ def capture(state, inputs, config, directory, ticks_per_us, replay_and_time):
                 raise AssertionError(f'Owner-pack ordered logical token mismatch: {detail}')
             state.validate(inputs)
             checked += 1
-            if enabled:
+            if not enabled:
+                sample['off_layout_receipts'] = state.layout_receipts
+            else:
                 sequences.append(actual)
                 ticks = state.forward.query_owner_trace.cpu().numpy()
                 if ticks.shape != (64, 848) or np.any(ticks[:, 16] <= 0):
@@ -107,12 +110,33 @@ def reference(root, group):
     compare_layout_receipts({'owner-pack': summary[11]}, 'owner-pack')
     if len(set(summary[1])) != 1:
         raise ValueError('Archived TopK changes between invocations')
-    return summary[0], summary[1][0]
+    return summary[0], summary[1][0], summary[11]
+
+
+def match_plans(samples, archive):
+    if len(samples) != REPEATS or len(archive) != 20:
+        raise ValueError('Expected five paired diagnostics and twenty archived invocations')
+    states = {}
+    archived_plans = {checked_layout_plan(rows, states, 'archive') for rows in archive}
+    archived_rows = {entry for call in archived_plans for entry in enumerate(call)}
+    archive_rows = archive_calls = on_off_rows = 0
+    matched_deltas = []
+    for sample in samples:
+        on = checked_layout_plan(sample['layout_receipts'], states, 'trace-on')
+        off = checked_layout_plan(sample['off_layout_receipts'], states, 'trace-off')
+        archive_rows += sum(entry in archived_rows for entry in enumerate(on))
+        archive_calls += int(on in archived_plans)
+        on_off_rows += sum(a == b for a, b in zip(on, off))
+        if on == off:
+            matched_deltas.append(sample['event_on_us'] - sample['event_off_us'])
+    return dict(archive_rows=archive_rows, archive_calls=archive_calls, on_off_rows=on_off_rows,
+                on_off_calls=len(matched_deltas),
+                matched_on_minus_off_p50_us=median(matched_deltas) if matched_deltas else None)
 
 
 def verify(root, group):
     base = Path((root / 'owner-tail-reference.txt').read_text().strip())
-    inputs, digest = reference(base, group)
+    inputs, digest, archive = reference(base, group)
     directory = root / f'g{group}'
     paths = list((directory / 'owner-pack/results').glob('*/cases/diagnose/fused/owner_tail.json'))
     if len(paths) != 1:
@@ -132,6 +156,8 @@ def verify(root, group):
             or any(s['topk_set_digest'] != digest or s['ordered_queries'] != 64 for s in samples)
             or len({s['topk_order_digest'] for s in samples}) != 1):
         raise ValueError(f'G{group}: diagnostic TopK or input count differs from the reference')
+    data['plan_match'] = match_plans(samples, archive)
+    atomic_json(path, data)
     for name in ('owner_tail.json', 'owner_tail_topk.npz'):
         target = path.parent / name
         if not target.is_file():

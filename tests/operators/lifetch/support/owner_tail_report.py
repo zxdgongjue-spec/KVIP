@@ -162,7 +162,15 @@ def describe(path):
           f'ticks_per_us={mhz:.2f} longest_local_prebarrier_us={",".join(max_local)}')
     print(f'G{g} diagnostic_pairs={len(paired)} graph_event_off/on_mean_us='
           f'{mean(s["event_off_us"] for s in samples):.2f}/{mean(s["event_on_us"] for s in samples):.2f} '
-          f'on_minus_off_mean/P50_us={mean(paired):+.2f}/{median(paired):+.2f}')
+          f'all_calls_unadjusted_on_minus_off_mean/P50_us={mean(paired):+.2f}/{median(paired):+.2f}')
+    match = data.get('plan_match')
+    if match is not None:
+        calls = len(samples)
+        delta = match['matched_on_minus_off_p50_us']
+        value = 'NA' if delta is None else f'{delta:+.2f}'
+        print(f'G{g} plan_match archive_rows={match["archive_rows"]}/{16*calls} '
+              f'archive_calls={match["archive_calls"]}/{calls} on_off_rows={match["on_off_rows"]}/{16*calls} '
+              f'on_off_calls={match["on_off_calls"]}/{calls} matched_on_minus_off_P50_us={value}')
     columns = (
         'resolver_handoff', 'resolver_except_handoff', 'resolver_launch', 'resolver_save',
         'conflict_wait', 'desc_sync', 'sq_active', 'adapt', 'index_handoff', 'index',
