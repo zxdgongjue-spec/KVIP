@@ -58,13 +58,14 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
     auto locations = reinterpret_cast<__gm__ uint32_t *>(ctx->locations) + b * kSlots;
     auto lru = reinterpret_cast<__gm__ uint32_t *>(ctx->lruSlots) + b * kLruSlots;
     auto headers = reinterpret_cast<__gm__ uint32_t *>(a->queryErrors) + 128 * b;
-    uint32_t upper = 0;
+    uint32_t upper = 0, prefixUpper = 0;
     Slice s;
     for (uint32_t j = 0; j < 4; ++j) {
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(headers + 32 * j), 64);
         s.error |= headers[32 * j];
         uint32_t n = headers[32 * j + 1];
         upper += n && n <= kCompactMissLimit + 1 ? n - 1 : kTop;
+        if (j == q) prefixUpper = upper;
     }
     if (row->slots > kPrefetch) {
         s.error |= 4;
@@ -87,7 +88,16 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
     auto slots = ub[kStagedSlotsOffset], work = ub[kStagedPositionsOffset], ctl = ub[kStagedControlOffset];
     auto staged = reinterpret_cast<__ubuf__ Context *>(ctl[128].GetPhyAddr());
     FromGm(ctl[128], reinterpret_cast<__gm__ uint32_t *>(ctx), sizeof(Context) / 4);
-    FromGm(work[4096], lru, kLruSlots);
+    // The final classifier bounds new slots through this Q before its predecessor
+    // publishes the exact deduplicated prefix. Keep the DMA ahead of that wait.
+    const uint32_t used = row->slots;
+    const bool shortLru = prefixUpper < kTop && used <= kLruSlots - prefixUpper;
+    if (!shortLru) {
+        FromGm(work[4096], lru, kLruSlots);
+    } else if (prefixUpper) {
+        const uint32_t lo = used & ~7U;
+        FromGm(work[4096 + lo], lru + lo, used + prefixUpper - lo);
+    }
     if (!q) {
         if (ctx->rowAddressBase) {
             uint32_t owner = ctx->rowOwners ? reinterpret_cast<__gm__ uint32_t *>(ctx->rowOwners)[b] : b;
@@ -144,6 +154,8 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
             compact = !ctl.GetValue(16);
         }
         if (!compact) {
+            // The protected allocator can inspect any ordinal in the original table.
+            if (shortLru) FromGm(work[4096], lru, kLruSlots);
             FromGm(ub[q * kTop], positions + q * kTop, kTop);
             FromGm(loc[q * kTop], locations + q * kTop, kTop);
             if (q >= 2) {
