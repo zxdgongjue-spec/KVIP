@@ -476,9 +476,7 @@ if [[ -n "$ranked" ]]; then
     if "$owner_tail"; then
         printf '%s\n' "$owner_tail_reference" >"$out/owner-tail-reference.txt"
         echo "CONFIG diagnostic=owner-pack-tail fixed_route boundaries=4 budget=256/1024 warmup=4 independent_states=1 sequential_samples=5"
-        for group in "${offset_groups[@]}"; do
-            "$PYTHON" -B "$tools/support/owner_pack_tail.py" reference "$owner_tail_reference" "$group"
-        done
+        "$PYTHON" -B "$tools/support/owner_archive_report.py" report "$owner_tail_reference" | tee "$out/owner-archive.txt"
     elif "$candidate_only"; then
         echo "CONFIG arms=$plan_candidate query_owners=16x4 boundaries=4 budget=256/1024 fixed_route warmup=4 measured=20"
     elif "$row_deps"; then
@@ -746,7 +744,7 @@ if [[ -n "$ranked" ]]; then
         order=("${order[@]:1}" "${order[0]}")
     done
     if "$owner_tail"; then
-        entries=(summary.txt owner-tail-reference.txt owner-pack.txt physical_npu.txt)
+        entries=(summary.txt owner-archive.txt owner-tail-reference.txt owner-pack.txt physical_npu.txt)
         for group in "${groups[@]}"; do entries+=("g$group/owner_tail.json"); done
         tar -C "$out" -czhf "$out/owner-tail.tar.gz" "${entries[@]}"
         printf 'RETURN_FILE=%s/owner-tail.tar.gz\n' "$out"
