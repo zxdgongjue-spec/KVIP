@@ -1,6 +1,9 @@
 """One comparison per real G group. Readbacks run after graph timing."""
+import hashlib
+import re
 import sys
 from collections import Counter, defaultdict, deque
+from math import isclose, isfinite
 from pathlib import Path
 from statistics import mean, median
 
@@ -8,6 +11,8 @@ import numpy as np
 
 from peer_delta import pair_placement, read
 
+ROW_DEPENDENCY_ARMS = ('fixed-order', 'offset', 'row-deps')
+SHA256 = re.compile(r'[0-9a-f]{64}')
 
 def check_cutoff_ids(inputs, layout, ids):
     """The ordinary score oracle checks the Kth value. Also verify the physical tie break."""
@@ -90,8 +95,25 @@ def check_offset_plan(events_src, events_dst, counts, posts, candidates, selecte
     return dict(extended_slots=extended_slots, independent_rows=int(posts[:, 0, 12].sum()))
 
 
-def load(root, group, label):
-    path, = (root / f'g{group}' / label / 'results').glob('**/fused/path_result.json')
+def check_layout_receipt(start_layout, layout, initial_valid, valid, sources, destinations, counts):
+    from ranked_five_report import verify_swaps
+
+    verify_swaps(start_layout, layout, initial_valid, valid, sources, destinations, counts)
+    prefetch, final = int(counts[0]), int(sum(counts[1:]))
+    plan = hashlib.sha256(counts.tobytes())
+    for events in (sources, destinations):
+        plan.update(events[:prefetch].tobytes())
+        plan.update(events[2048:2048 + final].tobytes())
+    state = hashlib.sha256(layout.tobytes())
+    state.update(valid.tobytes())
+    return plan.hexdigest(), state.hexdigest()
+
+
+def load(root, group, label, *, row_dependencies=False):
+    paths = list((root / f'g{group}' / label / 'results').glob('**/fused/path_result.json'))
+    if len(paths) != 1:
+        raise ValueError(f'G{group} {label}: expected one fused path result, found {len(paths)}')
+    path = paths[0]
     out = read(path)
     cfg = read(path.parents[1] / 'config.json')
     inputs = read(path.parents[1] / 'replay_input.json')
@@ -137,19 +159,33 @@ def load(root, group, label):
     stages = timing['stage_mean_us']
     drift = [100 * (metric(times[-5:]) / metric(times[:5]) - 1) for metric in (mean, median)]
     m, p = timing['mean_us'], median(times)
-    print(f'G{group} {label:<9s} full_mean/P50_us={m:.2f}/{p:.2f} '
-          f'LI/tail_mean_us={stages["li"]:.2f}/{stages["resolve_update"]:.2f} '
-          f'span_drift_mean/P50_pct={drift[0]:+.2f}/{drift[1]:+.2f} miss_pct={miss:.3f} '
-          f'waste/repair_KiB={kib[0]:.1f}/{kib[1]:.1f} total_MiB={mib:.4f}', flush=True)
+    if not row_dependencies:
+        print(f'G{group} {label:<9s} full_mean/P50_us={m:.2f}/{p:.2f} '
+              f'LI/tail_mean_us={stages["li"]:.2f}/{stages["resolve_update"]:.2f} '
+              f'span_drift_mean/P50_pct={drift[0]:+.2f}/{drift[1]:+.2f} miss_pct={miss:.3f} '
+              f'waste/repair_KiB={kib[0]:.1f}/{kib[1]:.1f} total_MiB={mib:.4f}', flush=True)
     thp = read(root / f'g{group}' / label / 'thp.json')
-    if label == 'offset':
+    if label in ('offset', 'row-deps'):
         receipts = out['offset_checks']
         if len(receipts) != 20:
             raise ValueError('Missing post-timing slot checks')
-        print(f"G{group} OFFSET_CHECK calls=20/20 prefetch_slot_reuse=0 "
-              f"hot_slots_selected_beyond_list={sum(r['extended_slots'] for r in receipts)} "
-              f"independent_Index_rows={sum(r['independent_rows'] for r in receipts)}/320", flush=True)
-    return inputs, out['topk_set_digests'], thp, m, p, out['binary_sha256'], drift, times, stages['resolve_update'], mean(v['final'] for v in traffic)
+        if not row_dependencies:
+            print(f"G{group} OFFSET_CHECK calls=20/20 prefetch_slot_reuse=0 "
+                  f"hot_slots_selected_beyond_list={sum(r['extended_slots'] for r in receipts)} "
+                  f"independent_Index_rows={sum(r['independent_rows'] for r in receipts)}/320", flush=True)
+    result = (inputs, out['topk_set_digests'], thp, m, p, out['binary_sha256'], drift, times,
+              stages['resolve_update'], mean(v['final'] for v in traffic))
+    if not row_dependencies:
+        return result
+    if any(sample['accounting']['invocation'] != i or sample['us'] != times[i]
+           for i, sample in enumerate(rows)):
+        raise ValueError(f'G{group} {label}: graph samples do not match per-invocation attribution')
+    tail = [sample['accounting']['stages_us']['resolve_update'] for sample in rows]
+    if (not all(isfinite(t) and 0 < t <= span for t, span in zip(tail, times))
+            or not isclose(mean(tail), stages['resolve_update'])
+            or not isfinite(m) or m <= 0):
+        raise ValueError(f'G{group} {label}: invalid resolver timing')
+    return (*result, median(tail), out['layout_receipts'])
 
 
 def report_resolver(root, group):
@@ -185,7 +221,72 @@ def report_resolver(root, group):
               f'gain_pct={gains[0]:+.2f}/{gains[1]:+.2f} drift_guard_pct={drift[0]:.2f}/{drift[1]:.2f} {gate}')
 
 
+def compare_layout_receipts(arms):
+    """Compare exact physical Index for identical ordered events on the same request."""
+    states = {}
+    arms_by_plan = defaultdict(set)
+    calls_by_arm = {}
+    for name, calls in arms.items():
+        if len(calls) != 20 or any(len(rows) != 16 for rows in calls):
+            raise ValueError(f'Incomplete layout receipts for {name}')
+        calls_by_arm[name] = Counter(tuple(plan for plan, _ in rows) for rows in calls)
+        for rows in calls:
+            for request, (plan, state) in enumerate(rows):
+                if not SHA256.fullmatch(plan) or not SHA256.fullmatch(state):
+                    raise ValueError(f'Invalid layout receipt for {name}, request {request}')
+                key = request, plan
+                if states.setdefault(key, state) != state:
+                    raise ValueError(f'Different physical Index for identical events, request {request}')
+                arms_by_plan[key].add(name)
+    candidate_calls = calls_by_arm['row-deps']
+    return {
+        name: (sum(name in arms_by_plan[request, plan]
+                   for rows in arms['row-deps'] for request, (plan, _) in enumerate(rows)),
+               sum((candidate_calls & calls_by_arm[name]).values()))
+        for name in ROW_DEPENDENCY_ARMS[:-1]
+    }
+
+
+def report_row_dependencies(root, group):
+    arms = {name: load(root, group, name, row_dependencies=True) for name in ROW_DEPENDENCY_ARMS}
+    new = arms['row-deps']
+    if len({v[5] for v in arms.values()}) != 3 or any(v[0] != new[0] for v in arms.values()):
+        raise ValueError('Controls must use identical inputs and distinct verified binaries')
+    digests = [digest for value in arms.values() for digest in value[1]]
+    if len(digests) != 60 or len(set(digests)) != 1 or not SHA256.fullmatch(digests[0]):
+        raise ValueError('Different TopK IDs on identical real inputs')
+    compared = compare_layout_receipts({name: value[11] for name, value in arms.items()})
+    print(f'G{group} CHECK TopK=PASS same_TopK=20/20 KV=PASS ordered_Index=PASS per_arm=320/320')
+    for name in ROW_DEPENDENCY_ARMS:
+        v = arms[name]
+        print(f'G{group} {name} graph_mean/P50_us={v[3]:.2f}/{v[4]:.2f} tail_mean/P50_us={v[8]:.2f}/{v[10]:.2f}')
+    for name in ROW_DEPENDENCY_ARMS[:-1]:
+        old = arms[name]
+        gain = [100 * (1 - new[i] / old[i]) for i in (3, 4)]
+        drift = [max(abs(x), abs(y)) for x, y in zip(old[6], new[6])]
+        tail = [old[i] - new[i] for i in (8, 10)]
+        placement = pair_placement(old[2], new[2], local_baseline=True)
+        same_rows, same_calls = compared[name]
+        if placement != 'matched':
+            gate = 'PLACEMENT_MISMATCH'
+        elif not same_rows:
+            gate = 'NO_SHARED_INDEX_EVENTS'
+        elif same_calls != 20:
+            gate = 'PARTIAL_INDEX_EVENT_COVERAGE'
+        elif all(g > d for g, d in zip(gain, drift)) and min(tail) > 0:
+            gate = 'POSITIVE'
+        elif min(gain) > 0:
+            gate = 'INCONCLUSIVE'
+        else:
+            gate = 'KEEP_CONTROL'
+        print(f'G{group} vs_{name} graph_saved_mean/P50_us={old[3]-new[3]:+.2f}/{old[4]-new[4]:+.2f} '
+              f'tail_saved_mean/P50_us={tail[0]:+.2f}/{tail[1]:+.2f} '
+              f'same_event_layout_rows={same_rows}/320 same_event_calls={same_calls}/20 placement={placement} {gate}')
+
+
 def main(root, group):
+    if (root / 'row-deps.txt').is_file():
+        return report_row_dependencies(root, group)
     if (root / 'local.txt').is_file() or (root / 'offset.txt').is_file():
         return report_resolver(root, group)
     old, new = [load(root, group, name) for name in ('baseline', 'candidate')]

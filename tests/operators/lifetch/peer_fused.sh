@@ -31,6 +31,7 @@ ranked_auto=false
 query_owner=false
 local_resolver=false
 offset_resolver=false
+row_deps=false
 current_fixed=6bca602ad9e548e9f12c0142fea25f2bc5c6877d
 ranked_q_workers=${PEER_RANKED_Q_WORKERS:-2}
 ranked_groups=(7 2 10 4 17)
@@ -70,12 +71,17 @@ if [[ ${1:-} == --ranked-help || ${1:-} == --ranked-joint ]]; then
     elif [[ -n "$joint_reference" ]]; then
         echo '--previous requires --ranked-joint' >&2; exit 2
     fi
-elif [[ ${1:-} == --offset-resolver ]]; then
-    [[ $# -ge 2 && $2 =~ ^[0-9a-f]{40}$ ]] || { echo 'Usage: peer_fused.sh --offset-resolver NATIVE_SHA [GROUP ...]' >&2; exit 2; }
+elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps ]]; then
+    [[ $# -ge 2 && $2 =~ ^[0-9a-f]{40}$ ]] || { echo "Usage: peer_fused.sh $1 NATIVE_SHA [GROUP ...]" >&2; exit 2; }
     query_owner=true
     offset_resolver=true
     ranked_sha=f8b185e3d042a18b24fe695c0a49a7d969ca487d
     fixed_order_rev=7b60f0dddab91a4b154043e78088842d7856cba6
+    if [[ $1 == --row-deps ]]; then
+        row_deps=true
+        ranked_sha=2942155cad43d9876087c817e38a87275f1a9b5b
+        [[ $2 != "$ranked_sha" ]] || { echo 'Supply a row-dependency candidate distinct from the offset control' >&2; exit 2; }
+    fi
     ranked=$2
     unset KVIP_URMA_ROUTE_POLICY
     export PEER_LOCAL_ONLY=1
@@ -171,7 +177,7 @@ if [[ -z "$ranked" && $# -eq 2 && $1 == --reuse-serial ]]; then
         exit 1
     fi
 elif [[ $# -ne 0 ]]; then
-    echo 'Usage: peer_fused.sh --ranked-auto FULL_SHA [--reference DIR] | --ranked-joint-local FULL_SHA [--reference DIR] | --ranked-joint FULL_SHA --previous DIR [--reference DIR] | --ranked-help FULL_SHA [--reference DIR] [--resume DIR] [--anchor GROUP] | --ranked-index CANDIDATE_SHA | [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
+    echo 'Usage: peer_fused.sh --row-deps NATIVE_SHA [GROUP ...] | --offset-resolver NATIVE_SHA [GROUP ...] | --ranked-auto FULL_SHA [--reference DIR] | --ranked-joint-local FULL_SHA [--reference DIR] | --ranked-joint FULL_SHA --previous DIR [--reference DIR] | --ranked-help FULL_SHA [--reference DIR] [--resume DIR] [--anchor GROUP] | --ranked-index CANDIDATE_SHA | [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
     exit 2
 fi
 export PATH=/usr/local/python3.12.13/bin:$PATH
@@ -265,7 +271,8 @@ fi
 if [[ -n "$ranked" ]]; then
     if "$query_owner"; then
         if ! git -C "$root" cat-file -e "$ranked^{commit}" 2>/dev/null; then
-            if "$offset_resolver"; then git -C "$root" fetch -q origin refs/heads/perf/urma-q4-offset-slots
+            if "$row_deps"; then git -C "$root" fetch -q origin refs/heads/perf/urma-q4-row-deps
+            elif "$offset_resolver"; then git -C "$root" fetch -q origin refs/heads/perf/urma-q4-offset-slots
             elif "$local_resolver"; then git -C "$root" fetch -q origin refs/heads/perf/urma-q4-local-resolver
             else git -C "$root" fetch -q origin refs/heads/perf/urma-q4-query-owner; fi
         fi
@@ -277,16 +284,23 @@ if [[ -n "$ranked" ]]; then
                 git -C "$root" fetch -q origin refs/heads/perf/urma-q4-tie-control
             fi
             pin "$root" "$ranked_fixed_order" "$fixed_order_rev"
-            git -C "$root" diff --quiet "$fixed_order_rev" "$ranked" -- csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer
+            compare_rev=$ranked
+            if "$row_deps"; then compare_rev=$ranked_sha; fi
+            git -C "$root" diff --quiet "$fixed_order_rev" "$compare_rev" -- csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer
             printf '%s\n' "$fixed_order_rev" >"$out/fixed-order.txt"
-            printf '%s\n' "$ranked_sha" >"$out/chain.txt"
-            if "$offset_resolver"; then
-                printf '%s\n' "$ranked" >"$out/offset.txt"
+            if "$row_deps"; then
+                printf '%s\n' "$ranked_sha" >"$out/offset.txt"
+                printf '%s\n' "$ranked" >"$out/row-deps.txt"
             else
-                ranked_spill="$src/ranked-${spill_rev:0:8}"
-                pin "$root" "$ranked_spill" "$spill_rev"
-                printf '%s\n' "$spill_rev" >"$out/spill.txt"
-                printf '%s\n' "$ranked" >"$out/local.txt"
+                printf '%s\n' "$ranked_sha" >"$out/chain.txt"
+                if "$offset_resolver"; then
+                    printf '%s\n' "$ranked" >"$out/offset.txt"
+                else
+                    ranked_spill="$src/ranked-${spill_rev:0:8}"
+                    pin "$root" "$ranked_spill" "$spill_rev"
+                    printf '%s\n' "$spill_rev" >"$out/spill.txt"
+                    printf '%s\n' "$ranked" >"$out/local.txt"
+                fi
             fi
         fi
     elif "$ranked_auto"; then
@@ -370,14 +384,20 @@ fi
 cpu="$clean/build-cpu/runtime/kvaf_cpu_service"
 test -x "$cpu"
 if "$query_owner"; then
+    allowed=()
+    if "$row_deps"; then
+        allowed+=(':(exclude)csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_vector.h')
+    fi
     git -C "$ranked_candidate" diff --exit-code --quiet "$ranked_sha" HEAD -- \
         csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer \
         csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer.cpp \
-        csrc/operators/common/lifetch
+        csrc/operators/common/lifetch "${allowed[@]}"
 fi
 if [[ -n "$ranked" ]]; then
     printf 'CONFIG URMA physical_NPU=%s logical_device=0 BS16 Q4 656B ranked=%.8s candidate=%.8s KVAF=%.8s\n' "$peer_physical_npu" "$ranked_sha" "$ranked" "$transport"
-    if "$offset_resolver"; then
+    if "$row_deps"; then
+        echo 'CONFIG arms=fixed-order,offset,row-deps query_owners=16x4 on=offset,row-deps boundaries=4 budget=256/1024 fixed_route warmup=4 measured=20'
+    elif "$offset_resolver"; then
         echo 'CONFIG arms=fixed-order,chain,offset owners=16x4 boundaries=4 budget=256/1024 fixed_route warmup=4 measured=20'
     elif "$local_resolver"; then
         echo 'CONFIG arms=chain,spill,local owners=16x4 boundaries=4 budget=256/1024 fixed_route warmup=4 measured=20 final_tie=ascending_physical_position'
@@ -450,7 +470,9 @@ run_arm() (
         fixed-order) mode=(--fused-only --production-root "$ranked_fixed_order") ;;
         chain) mode=(--fused-only --production-root "$ranked_base") ;;
         spill) mode=(--fused-only --production-root "$ranked_spill") ;;
-        local|offset) mode=(--fused-only --production-root "$ranked_candidate") ;;
+        offset) if "$row_deps"; then mode=(--fused-only --production-root "$ranked_base")
+                else mode=(--fused-only --production-root "$ranked_candidate"); fi ;;
+        local|row-deps) mode=(--fused-only --production-root "$ranked_candidate") ;;
         fixed) mode=(--fused-only --production-root "$ranked_base" --ranked-q-workers 2); level=2 ;;
         auto) mode=(--fused-only --production-root "$ranked_candidate" --ranked-q-workers 2 --ranked-auto-route); level=2 ;;
         serial2|serial32) mode=(--serial-only --serial-workers "${label#serial}") ;;
@@ -595,6 +617,7 @@ if [[ -n "$ranked" ]]; then
     order=(baseline candidate)
     groups=(2 7 10 17 4)
     if "$offset_resolver"; then order=(chain offset fixed-order); groups=("${offset_groups[@]}"); fi
+    if "$row_deps"; then order=(offset row-deps fixed-order); fi
     if "$local_resolver"; then order=(chain spill local); groups=(7 2 10 17 4); fi
     for group in "${groups[@]}"; do
         case_dir="$out/g$group"

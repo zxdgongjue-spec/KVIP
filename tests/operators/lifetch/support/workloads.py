@@ -152,7 +152,7 @@ def configuration(argv=None):
                                  help='clean ranked URMA checkout whose binding and kernels will run')
             command.add_argument('--ranked-auto-route', action='store_true',
                                  help='learn the route from previous successful device feedback')
-            command.add_argument('--query-owner-arm', choices=('baseline', 'candidate', 'fixed-order', 'chain', 'spill', 'local', 'offset'),
+            command.add_argument('--query-owner-arm', choices=('baseline', 'candidate', 'fixed-order', 'chain', 'spill', 'local', 'offset', 'row-deps'),
                                  help='matched BS16 Q4 ownership test, fixed ranked prefetch configuration')
             command.add_argument('--ranked-q-workers', type=int, choices=(1, 2, 4),
                                  help='final URMA Post/CQ workers per query position on a ranked replay')
