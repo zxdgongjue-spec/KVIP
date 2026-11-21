@@ -61,6 +61,19 @@ def compare(group, label, reference, candidate):
           detail, f'physical_plans={plans}')
 
 
+def g7_tail_summary(samples):
+    tails = [s['accounting']['stages_us']['resolve_update'] for s in samples]
+    q4 = [q for s in samples for r in s['algorithm']['requests']
+          for q in r['queries'] if q['query'] == 4]
+    if len(tails) != 20 or len(q4) != 320:
+        raise ValueError('Expected 20 G7 calls and 320 Q4 descriptor slices')
+    # 300 us lies in the gap between the two observed 24c619b9 tail ranges.
+    above = sum(t > 300 for t in tails)
+    conflicts = sum(q['final_safe'] < q['final_posted'] for q in q4)
+    return (f'tail_P95_us={np.percentile(tails, 95):.2f} tail_gt_300us_calls={above}/20 '
+            f'Q4_rows_with_prefetch_conflict={conflicts}/320')
+
+
 def report(root, group):
     archive = Path((root / 'early-handoff-reference.txt').read_text().strip())
     previous_ref = root / 'previous-handoff-reference.txt'
@@ -95,6 +108,9 @@ def report(root, group):
     label = 'prefetch-cq-overlap' if previous_ref.exists() else 'early-index-handoff'
     for name, run in [*references, (label, candidate)]:
         print(f'G{group} {name}', *(f'{k}_mean/P50_us={stats(v)}' for k, v in run.times.items()))
+        if group == 7 and previous_ref.exists():
+            profile = read(run.path.parent / 'diagnose/round-1/full_attribution.json')
+            print(f'G7 {name}', g7_tail_summary(profile['samples']))
     for name, run in reversed(references):
         compare(group, name, run, candidate)
     return 0

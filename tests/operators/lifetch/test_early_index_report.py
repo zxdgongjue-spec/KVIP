@@ -14,6 +14,15 @@ import owner_pack_tail as tail
 from correctness import topk_fingerprint
 
 
+def test_g7_tail_counts_calls_and_only_conflicting_q4_rows():
+    requests = [{'queries': [dict(query=q, final_safe=0, final_posted=int(q in (2, 4) and row == 0))
+                             for q in range(1, 5)]} for row in range(16)]
+    samples = [dict(algorithm=dict(requests=requests), accounting=dict(stages_us=dict(resolve_update=us)))
+               for us in [290] * 11 + [300] + [360] * 8]
+    assert report.g7_tail_summary(samples) == (
+        'tail_P95_us=360.00 tail_gt_300us_calls=8/20 Q4_rows_with_prefetch_conflict=20/320')
+
+
 def test_archived_oracle_and_level1_savings(tmp_path, monkeypatch, capsys):
     archive = tmp_path / 'fused.m3IizR'
     new = tmp_path / 'candidate'
