@@ -4057,8 +4057,14 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
         if not (fused and config.query_owner_arm == 'owner-pack' and config.production_root
                 and config.iterations == 20 and len(sequence.rounds) == 1):
             raise ValueError('Native LI reference requires one fixed owner-pack round with 20 measured calls')
-        from native_li_reference import get_reference
-        native_reference = get_reference(initial, torch, torch_npu, device, native_li, directory)
+        if os.environ.get('KVIP_Q4_EARLY_HANDOFF') == '1':
+            from native_li_reference import identities
+            from owner_pack_tail import archived_references
+            native_reference = archived_references(Path(os.environ['KVIP_Q4_TAIL_REFERENCE']), config.group,
+                                                    identities(initial, torch, torch_npu, device))
+        else:
+            from native_li_reference import get_reference
+            native_reference = get_reference(initial, torch, torch_npu, device, native_li, directory)
     if not fused:
         _, registration, _ = _load_native_operators('c8_offload')
         registration.require_a5_dsa_registration(('lidu_fused_batch_get_prepare_mtp_out',))

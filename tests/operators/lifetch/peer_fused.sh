@@ -34,8 +34,9 @@ offset_resolver=false
 row_deps=false
 candidate_only=false
 owner_tail=false
+early_handoff=false
 arm_iterations=20
-unset KVIP_Q4_OWNER_TAIL KVIP_Q4_TAIL_REFERENCE
+unset KVIP_Q4_OWNER_TAIL KVIP_Q4_TAIL_REFERENCE KVIP_Q4_EARLY_HANDOFF
 plan_candidate=
 packet_reference=
 plan_control=
@@ -78,19 +79,23 @@ if [[ ${1:-} == --ranked-help || ${1:-} == --ranked-joint ]]; then
     elif [[ -n "$joint_reference" ]]; then
         echo '--previous requires --ranked-joint' >&2; exit 2
     fi
-elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-packets || ${1:-} == --short-lru || ${1:-} == --owner-pack || ${1:-} == --li-restore || ${1:-} == --logical-ties || ${1:-} == --cutoff-tail ]]; then
+elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-packets || ${1:-} == --short-lru || ${1:-} == --owner-pack || ${1:-} == --li-restore || ${1:-} == --logical-ties || ${1:-} == --cutoff-tail || ${1:-} == --early-index-handoff ]]; then
     [[ $# -ge 2 && $2 =~ ^[0-9a-f]{40}$ ]] || { echo "Usage: peer_fused.sh $1 NATIVE_SHA [GROUP ...]" >&2; exit 2; }
     query_owner=true
     offset_resolver=true
     ranked_sha=f8b185e3d042a18b24fe695c0a49a7d969ca487d
     fixed_order_rev=7b60f0dddab91a4b154043e78088842d7856cba6
-    if [[ $1 == --short-lru || $1 == --owner-pack || $1 == --li-restore || $1 == --logical-ties || $1 == --cutoff-tail ]]; then
+    if [[ $1 == --short-lru || $1 == --owner-pack || $1 == --li-restore || $1 == --logical-ties || $1 == --cutoff-tail || $1 == --early-index-handoff ]]; then
         candidate_only=true
         offset_resolver=false
         plan_candidate=${1#--}
         if [[ $plan_candidate == cutoff-tail ]]; then
             owner_tail=true
             arm_iterations=1
+            plan_candidate=logical-ties
+        elif [[ $plan_candidate == early-index-handoff ]]; then
+            [[ $2 == 67b49a2748fde8f8779c4551410416596b35cf76 ]] || { echo "Unexpected handoff candidate: $2" >&2; exit 2; }
+            early_handoff=true
             plan_candidate=logical-ties
         fi
         if [[ $plan_candidate == owner-pack ]]; then ranked_sha=367565634aa5d9ef713239c33c4a281227032e31; fi
@@ -119,7 +124,7 @@ elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-pa
     unset KVIP_URMA_ROUTE_POLICY
     export PEER_LOCAL_ONLY=1
     shift 2
-    if "$owner_tail"; then
+    if "$owner_tail" || "$early_handoff"; then
         ranked_sha=24c619b9581aad43fd53c815928def26a1e19560
         [[ ${1:-} == --reference && -d ${2:-} ]] || { echo 'Supply --reference for the completed logical-ties run' >&2; exit 2; }
         KVIP_Q4_TAIL_REFERENCE=$(cd "$2" && pwd -P)
@@ -128,10 +133,13 @@ elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-pa
               $(<"$KVIP_Q4_TAIL_REFERENCE/physical_npu.txt") != "$peer_physical_npu" ]]; then
             echo "Incompatible reference $KVIP_Q4_TAIL_REFERENCE" >&2; exit 1
         fi
-        export KVIP_Q4_TAIL_REFERENCE KVIP_Q4_OWNER_TAIL=1
+        export KVIP_Q4_TAIL_REFERENCE
+        if "$early_handoff"; then export KVIP_Q4_EARLY_HANDOFF=1; else export KVIP_Q4_OWNER_TAIL=1; fi
     fi
     offset_groups=(7 2 10 17 4)
-    if [[ $plan_candidate == owner-pack || $plan_candidate == li-restore || $plan_candidate == logical-ties ]]; then
+    if "$early_handoff"; then
+        offset_groups=(10 4 17 7)
+    elif [[ $plan_candidate == owner-pack || $plan_candidate == li-restore || $plan_candidate == logical-ties ]]; then
         offset_groups=(7 10 17 4)
     elif "$candidate_only"; then
         offset_groups=(10 7 2)
@@ -355,6 +363,7 @@ if [[ -n "$ranked" ]]; then
     if "$query_owner"; then
         if ! git -C "$root" cat-file -e "$ranked^{commit}" 2>/dev/null; then
             if "$owner_tail"; then git -C "$root" fetch -q origin refs/heads/diag/urma-q4-cutoff-tail
+            elif "$early_handoff"; then git -C "$root" fetch -q origin refs/heads/perf/urma-q4-early-index-handoff
             elif "$row_deps" || "$candidate_only"; then git -C "$root" fetch -q origin "refs/heads/perf/urma-q4-$plan_candidate"
             elif "$offset_resolver"; then git -C "$root" fetch -q origin refs/heads/perf/urma-q4-offset-slots
             elif "$local_resolver"; then git -C "$root" fetch -q origin refs/heads/perf/urma-q4-local-resolver
@@ -488,7 +497,11 @@ if "$query_owner"; then
     if "$row_deps"; then
         allowed+=(':(exclude)csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_vector.h')
     fi
-    if "$owner_tail"; then
+    if "$early_handoff"; then
+        [[ $(git -C "$ranked_candidate" rev-parse HEAD^) == "$ranked_sha" ]] || { echo 'Expected a direct 24c619b9 candidate' >&2; exit 1; }
+        git -C "$ranked_candidate" diff --exit-code --quiet "$ranked_sha" HEAD -- . \
+            ':(exclude)csrc/operators/lightning_indexer_with_fetch/op_kernel/query_owner.h'
+    elif "$owner_tail"; then
         git -C "$ranked_candidate" diff --exit-code --quiet "$ranked_sha" HEAD -- \
             csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer \
             csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer.cpp
@@ -504,7 +517,10 @@ if "$query_owner"; then
 fi
 if [[ -n "$ranked" ]]; then
     printf 'CONFIG URMA physical_NPU=%s logical_device=0 BS16 Q4 656B ranked=%.8s candidate=%.8s KVAF=%.8s\n' "$peer_physical_npu" "$ranked_sha" "$ranked" "$transport"
-    if "$owner_tail"; then
+    if "$early_handoff"; then
+        printf '%s\n' "$KVIP_Q4_TAIL_REFERENCE" >"$out/early-handoff-reference.txt"
+        echo "CONFIG measured=early-index-handoff reference=archived-24c619b9 serial_sets=archive level=1 warmup=4 calls=20"
+    elif "$owner_tail"; then
         printf '%s\n' "$KVIP_Q4_TAIL_REFERENCE" >"$out/owner-tail-reference.txt"
         echo "CONFIG diagnostic=cutoff-tail archived=24c619b9 level=1 warmup=4 independent_states=1 on_off_pairs=5"
     elif "$candidate_only"; then
@@ -615,7 +631,9 @@ run_arm() (
         limits=(--prefetch-tokens 512 --intermediate-fetches 8)
         mode=(--fused-only --candidate-root "$src/auto-${candidate:0:8}" --candidate-snapshot "$snapshot")
     fi
-    printf 'CASE_BEGIN G%s %s\n' "$group" "$label"
+    local display_label=$label
+    if "$early_handoff"; then display_label=early-index-handoff; fi
+    printf 'CASE_BEGIN G%s %s\n' "$group" "$display_label"
     if ! "$PYTHON" -B "$tools/test_lifetch.py" diagnose "${mode[@]}" "${limits[@]}" \
         --transport urma --input real --trace-root "$trace" --group "$group" --round-range 1:1 \
         --device 0 --kvaf-root "$kvaf" --kvaf-server "127.0.0.1:$port" \
@@ -764,7 +782,7 @@ if [[ -n "$ranked" ]]; then
         case_dir="$out/g$group"
         if "$query_owner"; then trace=${owner_traces[$group]}
         else trace=$(bash "$tools/peer_g2_input.sh" "$work" "$group"); fi
-        if "$owner_tail"; then
+        if "$owner_tail" || "$early_handoff"; then
             # Preserve reference NUMA placement when the original was observable.
             previous_node=$("$PYTHON" -B "$tools/support/owner_pack_tail.py" numa "$KVIP_Q4_TAIL_REFERENCE" "$group")
             bind_cpu_service "${previous_node:-$node}"
@@ -776,7 +794,9 @@ if [[ -n "$ranked" ]]; then
         for label in "${order[@]}"; do
             run_arm "$label" "$group" "$case_dir"
         done
-        if "$owner_tail"; then
+        if "$early_handoff"; then
+            "$PYTHON" -B "$tools/support/early_index_report.py" "$out" "$group" | tee -a "$out/summary.txt"
+        elif "$owner_tail"; then
             "$PYTHON" -B "$tools/support/owner_pack_tail.py" verify "$out" "$group" | tee -a "$out/summary.txt"
             "$PYTHON" -B "$tools/support/owner_tail_report.py" "$case_dir/owner_tail.json" | tee -a "$out/summary.txt"
         elif [[ $plan_candidate == li-restore || $plan_candidate == logical-ties ]]; then

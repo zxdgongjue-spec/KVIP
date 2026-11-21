@@ -16,7 +16,7 @@ from reporting import atomic_json
 REPEATS = 5
 
 
-def archived_serial(root, group, identity=None):
+def archived_references(root, group, identity=None):
     _, digest, _, _ = reference(root, group)
     path, = (root / f'g{group}/logical-ties/results').glob('*/cases/diagnose/fused/native_li_compare.json')
     comparison = read(path)
@@ -34,7 +34,17 @@ def archived_serial(root, group, identity=None):
     checked = read_sets(path.parent, comparison, 20, [digest] * 20)
     if not checked[4]:
         raise ValueError(f'G{group}: archived strong-serial token sets are unstable or different')
-    return np.sort(checked[-1], axis=-1)
+    with np.load(path.parent / comparison['raw_ids'], allow_pickle=False) as raw:
+        refs = {name: raw[name] for name in ('strong_serial', 'strong_serial_repeat', 'same_layout_native')}
+    metadata = dict(comparison['native_reference'], origin='completed-archive', archive_path=str(path))
+    if identity is not None:
+        metadata['replay_identity'] = identity
+    return refs, metadata
+
+
+def archived_serial(root, group, identity=None):
+    refs, _ = archived_references(root, group, identity)
+    return np.sort(refs['strong_serial'], axis=-1)
 
 
 def check_serial(state, expected):
