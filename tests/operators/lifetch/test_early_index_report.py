@@ -60,4 +60,12 @@ def test_archived_oracle_and_level1_savings(tmp_path, monkeypatch, capsys):
     runs[new][2]['ub_device'] = 'other'
     assert report.report(new, 10) == 0
     output = capsys.readouterr().out
-    assert 'UNCOMPARABLE placement=different_ub_device' in output and 'graph_saved' not in output
+    assert 'observed_only graph_archive_minus_candidate_mean/P50_us=+3.00/+1.00' in output
+    assert 'placement=different_ub_device' in output and 'graph_saved' not in output
+    runs[new][2]['ub_device'] = 'urma0'
+    new_receipts = [[('c' * 64, 'd' * 64)] * 16] + receipts[1:]
+    runs[new] = (*runs[new][:11], new_receipts, *runs[new][12:])
+    assert report.report(new, 10) == 0
+    output = capsys.readouterr().out
+    assert 'observed_only graph_archive_minus_candidate_mean/P50_us=+3.00/+1.00' in output
+    assert 'same_event_calls=19/20 physical_plans=differ' in output

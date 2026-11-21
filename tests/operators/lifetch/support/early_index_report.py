@@ -60,11 +60,13 @@ def report(root, group):
         print(f'G{group} {label}', *(f'{k}_mean/P50_us={stats(v)}' for k, v in times.items()))
     detail = (f'placement={placement} runtime_identity_diff={",".join(changed) or "none"} '
               f'same_event_layout_rows={matched_rows}/320 same_event_calls={matched_calls}/20')
-    if placement != 'matched' or changed:
-        print(f'G{group} vs_24c619b9_archive UNCOMPARABLE {detail}')
-    else:
-        print(f'G{group} vs_24c619b9_archive historical_unpaired',
-              *(f'{k}_saved_mean/P50_us={saved(old_times[k], new_times[k])}' for k in old_times), detail)
+    comparable = placement == 'matched' and not changed and matched_calls == 20
+    status = 'historical_unpaired' if comparable else 'observed_only'
+    metric = 'saved' if comparable else 'archive_minus_candidate'
+    plans = 'matched' if matched_calls == 20 else 'differ'
+    print(f'G{group} vs_24c619b9_archive {status}',
+          *(f'{k}_{metric}_mean/P50_us={saved(old_times[k], new_times[k])}' for k in old_times),
+          detail, f'physical_plans={plans}')
     return 0
 
 
