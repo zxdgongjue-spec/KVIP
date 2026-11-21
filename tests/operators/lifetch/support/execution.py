@@ -3553,7 +3553,8 @@ class FusedReplayState:
         failures = []
         try:
             inputs.validate_topk(ids)
-            if arm in ('short-lru', 'owner-pack', 'fixed-order', 'chain', 'spill', 'local', 'offset', 'row-deps', 'li-packets'):
+            restore_li = arm == 'owner-pack' and os.environ.get('KVIP_Q4_LI_RESTORE') == '1'
+            if not restore_li and arm in ('short-lru', 'owner-pack', 'fixed-order', 'chain', 'spill', 'local', 'offset', 'row-deps', 'li-packets'):
                 from query_owner_report import check_cutoff_ids
                 check_cutoff_ids(inputs, self.input_layout, ids)
         except AssertionError as error:
@@ -3608,28 +3609,20 @@ class NativeReplayState:
 
     def __init__(self, torch, torch_npu, runtime, table, initial, pages, *, device):
         from types import SimpleNamespace
+        from native_li_reference import NativeReplayLI
 
         self.torch, self.torch_npu, self.device = torch, torch_npu, device
         self.initial, self.pages, self.native_li = initial, pages, native_li
         g = initial.geometry
         self.batch, self.history, self.resident, self.stride = (
             g[name] for name in ('batch', 'history', 'resident', 'output_stride'))
-        heads, width = g['heads'], g['token_bytes']
+        width = g['token_bytes']
         if self.stride % 128:
             raise ValueError('Native replay output stride must align to a KV block')
-        self.query = torch.empty((self.batch, 4, heads, 128), dtype=torch.float8_e4m3fn, device=device)
-        self.keys = torch.empty((self.batch, self.history, 128), dtype=torch.uint8, device=device)
-        self.scales = torch.empty((self.batch, self.history), dtype=torch.float32, device=device)
-        self.weights = torch.empty((self.batch, 4, heads), dtype=torch.bfloat16, device=device)
-        self.query_scale = torch.empty((self.batch, 4, heads), dtype=torch.float32, device=device)
-        lengths = torch.full((self.batch,), self.history, dtype=torch.int32, device=device)
-        self.fixture = dict(
-            sparse_mode=g.get('sparse_mode', 3), query=self.query, key=self.keys.view(torch.float8_e4m3fn).reshape(-1, 128, 1, 128),
-            actual_query=torch.arange(1, self.batch + 1, dtype=torch.int32, device=device) * 4,
-            actual_key=lengths, li_query_lengths=torch.full((self.batch,), 4, dtype=torch.int32, device=device),
-            block_table=torch.arange(self.batch * self.history // 128, dtype=torch.int32, device=device).reshape(self.batch, -1),
-            native_inputs=dict(weights=self.weights, query_scale=self.query_scale,
-                               key_scale=self.scales.reshape(-1, 128, 1)))
+        self.li_operands = NativeReplayLI(torch, device, g)
+        self.fixture = self.li_operands.fixture
+        self.query, self.keys, self.scales = self.li_operands.query, self.li_operands.keys, self.li_operands.scales
+        self.weights, self.query_scale = self.li_operands.weights, self.li_operands.query_scale
         mapping = np.full((self.batch, self.history), -1, dtype=np.int32)
         for row in range(self.batch):
             hot = initial.captured_hot_valid[row] != 0
@@ -3667,15 +3660,7 @@ class NativeReplayState:
     def prepare(self, inputs):
         if inputs.identities != self.initial.identities or inputs.geometry != self.initial.geometry:
             raise ValueError('Native replay request geometry changed')
-        self.upload(self.query.view(self.torch.uint8), inputs.query)
-        self.upload(self.keys, inputs.logical_keys)
-        self.upload(self.scales, inputs.logical_scales)
-        self.upload(self.weights.view(self.torch.int16), inputs.weights.view(np.int16))
-        self.upload(self.query_scale, inputs.query_scale)
-        # Native sparse mode aligns Q4 to the final key length.
-        if self.fixture['sparse_mode'] == 3 and not np.all(np.diff(inputs.query_ends, axis=1) == 1):
-            raise ValueError('Native replay requires consecutive causal Q4 positions')
-        self.upload(self.fixture['actual_key'], inputs.query_ends[:, -1])
+        self.li_operands.prepare(inputs)
         forward = self.native.forward.cpu().numpy()
         reverse = self.native.reverse.cpu().numpy()
         output = self.native.output.view(self.batch, self.stride, -1)
@@ -3734,7 +3719,7 @@ class NativeReplayState:
         pass  # No lease: caller owns the ordinary KVAF Runtime and table.
 
 
-def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
+def measure_replay_batch(torch, states, sequence, config, directory, *, fused, native_reference=None):
     """One graph contains iterations independent cache states, reused per round."""
     from contextlib import ExitStack
     from diagnostics import algorithm_before, algorithm_after
@@ -3881,6 +3866,11 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             measured = profile_graph_batch(torch, TrackedGraph(), calls=len(states), folder=folder,
                                            serial=not fused, transport=config.transport, stream=stream)
             validate_all(inputs, 'measured')
+            if native_reference is not None:
+                from native_li_reference import fused_li_output, write_comparison
+                refs, identity = native_reference
+                outputs = [fused_li_output(state) for state in states]
+                write_comparison(directory, config.group, inputs, refs, identity, outputs)
             if lean or candidate:
                 route_history['measured'] = checked_routes(states, **route_step(config.warmup + 1), low=True)
             rounds[inputs.source_round] = measured['timing']
@@ -4031,6 +4021,13 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     torch.npu.set_device(config.device)
     device = torch.device(f'npu:{config.device}')
     stream = torch.npu.current_stream(device)
+    native_reference = None
+    if os.environ.get('KVIP_Q4_LI_RESTORE') == '1':
+        if not (fused and config.query_owner_arm == 'owner-pack' and config.production_root
+                and config.iterations == 20 and len(sequence.rounds) == 1):
+            raise ValueError('Native LI reference requires one fixed owner-pack round with 20 measured calls')
+        from native_li_reference import get_reference
+        native_reference = get_reference(initial, torch, torch_npu, device, native_li, directory)
     if not fused:
         _, registration, _ = _load_native_operators('c8_offload')
         registration.require_a5_dsa_registration(('lidu_fused_batch_get_prepare_mtp_out',))
@@ -4182,7 +4179,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                     replica = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
                 batch_states.append(replica)
             replay_stage(f'one graph with {len(batch_states)} independent inputs; event + profiler')
-            result = measure_replay_batch(torch, batch_states, sequence, config, directory, fused=fused)
+            result = measure_replay_batch(torch, batch_states, sequence, config, directory, fused=fused,
+                                          native_reference=native_reference)
             if checks.failures:
                 result['correctness'] = 'FAIL'
                 result['failures'] = checks.failures + result['failures']
