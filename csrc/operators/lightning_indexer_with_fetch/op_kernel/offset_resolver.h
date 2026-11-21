@@ -129,13 +129,19 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
     auto headers = reinterpret_cast<__gm__ uint32_t *>(a->queryErrors) + (4 * b + q) * 32;
     uint32_t used = row->slots;
     Slice s;
-    uint32_t possibleAlias = 0;
+    uint32_t possibleAlias = 0, sizes[4] = {};
+    bool packetsReady = true;
     s.error = used > kLruSlots ? 4U : 0U;
     for (uint32_t j = 0; j < 4; ++j) {
         auto hdr = reinterpret_cast<__gm__ uint32_t *>(a->queryErrors) + (4 * b + j) * 32;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(hdr), 64);
         s.error |= hdr[0];
         possibleAlias |= hdr[kQueryAliasWord];
+        uint32_t encoded = hdr[kOwnerPacketCountWord];
+        if (encoded > kTop + 1)
+            s.error |= 4U;
+        packetsReady = packetsReady && encoded != 0;
+        sizes[j] = encoded ? encoded - 1 : 0;
     }
     auto lru = reinterpret_cast<__gm__ uint32_t *>(ctx->lruSlots) + b * kLruSlots;
     TPipe pipe;
@@ -169,27 +175,34 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
         flags->reserved[0] = check;
         Signal(flags, used, s.error);
     }
-    uint32_t own = 0;
-    if (!s.error) {
-        Simt::VF_CALL<GatherMisses>(Simt::Dim3{512, 1, 1}, ctx, 4 * b + q, headers[1], FinalPtr(table[q * kTop]),
-                                    FinalPtr(positions), ptr);
-        VectorDone();
-        own = ctl.GetValue(0);
+    const uint32_t last = a->resident < kSlots + kLruSlots ? 3 : q;
+    if (!packetsReady) {
+        // All owners see the same four LI headers. If a packet is missing,
+        // every owner uses the original resolver and may reuse its own bank.
+        uint32_t own = 0;
+        if (!s.error) {
+            Simt::VF_CALL<GatherMisses>(Simt::Dim3{512, 1, 1}, ctx, 4 * b + q, headers[1],
+                                        FinalPtr(table[q * kTop]), FinalPtr(positions), ptr);
+            VectorDone();
+            own = ctl.GetValue(0);
+        }
+        if (q < 3 || a->resident < kSlots + kLruSlots) {
+            BeforeStore();
+            ToGm(lists + q * kTop, table[q * kTop], own);
+            StoreDone();
+        }
+        Signal(ready + q, own, s.error);
+        for (uint32_t j = 0; j <= last; ++j) {
+            if (j != q)
+                s.error |= AwaitPublication(ready + j);
+            sizes[j] = j == q ? own : ready[j].count;
+            if (sizes[j] > kTop)
+                s.error |= 4U;
+        }
     }
-    if (q < 3 || a->resident < kSlots + kLruSlots) {
-        BeforeStore();
-        ToGm(lists + q * kTop, table[q * kTop], own);
-        StoreDone();
-    }
-    Signal(ready + q, own, s.error);
-    uint32_t sizes[4] = {}, begin = 0, n = 0;
-    uint32_t last = a->resident < kSlots + kLruSlots ? 3 : q;
+    const uint32_t own = sizes[q];
+    uint32_t begin = 0, n = 0;
     for (uint32_t j = 0; j <= last; ++j) {
-        if (j != q)
-            s.error |= AwaitPublication(ready + j);
-        sizes[j] = j == q ? own : ready[j].count;
-        if (sizes[j] > kTop)
-            s.error |= 4;
         if (j < q)
             begin += sizes[j];
         n += sizes[j];
@@ -197,15 +210,20 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
     if (q)
         s.error |= AwaitPublication(flags);
     if (!s.error) {
-        // DMA to aligned banks, then concatenate in UB. GM list packets can be
-        // odd-sized. The actual exchange never includes hash keys or ranks.
-        for (uint32_t j = 0; j <= last; ++j)
-            if (j != q)
-                FromGm(table[j * kTop], lists + j * kTop, sizes[j]);
+        if (!packetsReady) {
+            for (uint32_t j = 0; j <= last; ++j)
+                if (j != q)
+                    FromGm(table[j * kTop], lists + j * kTop, sizes[j]);
+        }
         FromGm(victims, lru, kLruSlots);
         InputReady();
-        Simt::VF_CALL<JoinLists>(Simt::Dim3{512, 1, 1}, FinalPtr(ids), FinalPtr(table), last, sizes[0], sizes[1],
-                                 sizes[2], sizes[3]);
+        if (packetsReady) {
+            Simt::VF_CALL<LoadOwnerMissPackets>(Simt::Dim3{512, 1, 1}, lists, FinalPtr(ids), FinalPtr(positions),
+                                                q, last, sizes[0], sizes[1], sizes[2], sizes[3]);
+        } else {
+            Simt::VF_CALL<JoinLists>(Simt::Dim3{512, 1, 1}, FinalPtr(ids), FinalPtr(table), last,
+                                     sizes[0], sizes[1], sizes[2], sizes[3]);
+        }
         VectorDone();
         uint32_t buckets = 8;
         while (buckets < n * 2)

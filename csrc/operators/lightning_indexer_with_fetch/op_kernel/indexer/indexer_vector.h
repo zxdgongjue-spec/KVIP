@@ -802,6 +802,7 @@ __aicore__ inline void PublishClassificationError(__gm__ uint32_t *header, uint3
     header[0] = error;
     header[1] = 0;
     header[2] = 0;
+    header[3] = 0;
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(header), 128);
 }
 
@@ -964,11 +965,20 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
             reinterpret_cast<__ubuf__ uint32_t *>(result.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t *>(bitmap[bitmapWords + 2].GetPhyAddr()));
     }
+    const bool scanSpace = wordsForMerge + 16 <= bitmapWords;
+    const bool ownerPacket = a->queryOwnerScratch && scanSpace &&
+        runtimeShape_.history <= (1U << (32 - rotating::kPositionBits));
+    __gm__ uint32_t *entries = nullptr;
+    if (ownerPacket) {
+        entries = reinterpret_cast<__gm__ uint32_t *>(a->queryOwnerScratch) +
+            uint64_t(b) * pipeline_ab::kQueryOwnerRowWords + (query % SIM_Q) * rotating::kTop;
+    } else if (scanSpace && ctx->sourceBlocks && ctx->reservedHot) {
+        entries = reinterpret_cast<__gm__ uint32_t *>(ctx->sourceBlocks) + uint64_t(query) * rotating::kTop;
+    }
     Simt::VF_CALL<rotating::MergeClassifyBitmapFlex>(Simt::Dim3{512,1,1},reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()),runtimeShape_.resident,shardsForMerge,
         reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(result.GetPhyAddr()),
-        ctx->sourceBlocks && ctx->reservedHot && wordsForMerge+16<=bitmapWords?
-            reinterpret_cast<__gm__ uint32_t*>(ctx->sourceBlocks)+uint64_t(query)*2048:nullptr,
-        reinterpret_cast<__ubuf__ uint32_t*>(bitmap[bitmapWords+1].GetPhyAddr()));
+        entries, reinterpret_cast<__ubuf__ uint32_t*>(bitmap[bitmapWords+1].GetPhyAddr()),
+        ownerPacket ? rotating::kTop : rotating::kCompactMissLimit);
 #else
     Simt::VF_CALL<rotating::MergeClassifyBitmap>(Simt::Dim3{512,1,1},reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()),runtimeShape_.resident);
 #endif
@@ -981,9 +991,17 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
 #if !V9_UBMEM
-    if (a->queryOwnerScratch) errors[query * 32 + pipeline_ab::kQueryAliasWord] = bitmap.GetValue(bitmapWords + 2);
+    const uint32_t encodedMissCount = bitmap.GetValue(bitmapWords + 1);
+    if (a->queryOwnerScratch) {
+        errors[query * 32 + pipeline_ab::kQueryAliasWord] = bitmap.GetValue(bitmapWords + 2);
+        errors[query * 32 + pipeline_ab::kOwnerPacketCountWord] = ownerPacket ? encodedMissCount : 0;
+    }
+    // Word 1 advertises only the legacy compact entries living in sourceBlocks.
+    errors[query * 32 + 1] = ownerPacket ? 0 : encodedMissCount;
+#else
+    errors[query * 32 + 1] = bitmap.GetValue(bitmapWords + 1);
 #endif
-    errors[query*32+1]=bitmap.GetValue(bitmapWords+1);errors[query*32]=bitmap.GetValue(bitmapWords);kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);
+    errors[query*32]=bitmap.GetValue(bitmapWords);kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);
     if(profile){liTicks[7]=GetSystemCycle();liTicks[8]=overlapSecond?1:0;liTicks[9]=streamingTopkOnly_?1:0;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(liTicks),128);}
 }

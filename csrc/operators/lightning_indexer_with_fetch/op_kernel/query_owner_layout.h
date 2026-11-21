@@ -12,6 +12,6 @@ constexpr uint32_t kOldAddresses = kOwnerResolverWords + kOwnerIndexWords + 4 * 
 constexpr uint32_t kChunkFlags = kOldAddresses + 2 * kMaxFinal;
 constexpr uint32_t kEdgeDeps = kChunkFlags + kOwnerChunkLimit * kFlagWords;
 constexpr uint32_t kQueryOwnerRowWords = kEdgeDeps + 2 * (kPrefetch + kMaxFinal);
-constexpr uint32_t kQueryAliasWord = 2;
+constexpr uint32_t kQueryAliasWord = 2, kOwnerPacketCountWord = 3;
 constexpr uint32_t kOwnerPlanEnd = 1, kOwnerPlanEdges = 2, kOwnerPlanFirst = 3;
 }

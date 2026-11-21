@@ -100,7 +100,7 @@ inline void ClassifyPreparedLocationsFlex(uint32_t history,uint32_t resident,uin
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
 inline void MergeClassifyBitmapFlex(__ubuf__ uint32_t* bitmap,uint32_t resident,uint32_t shards,
     __ubuf__ uint32_t* indices=nullptr,__ubuf__ uint32_t* locations=nullptr,
-    __gm__ uint32_t* entries=nullptr,__ubuf__ uint32_t* count=nullptr) {
+    __gm__ uint32_t* entries=nullptr,__ubuf__ uint32_t* count=nullptr,uint32_t capacity=kCompactMissLimit) {
     const uint32_t words=(resident+31)/32;
     for(uint32_t word=threadIdx.x;word<words;word+=512){
         uint32_t value=bitmap[word];
@@ -108,7 +108,7 @@ inline void MergeClassifyBitmapFlex(__ubuf__ uint32_t* bitmap,uint32_t resident,
         bitmap[word]=value;
     }
     asc_syncthreads();
-    if(entries)ExportCompactMisses(indices,locations,bitmap+words,entries,count);
+    if(entries)ExportCompactMisses(indices,locations,bitmap+words,entries,count,capacity);
 }
 
 }

@@ -1380,8 +1380,11 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
     }
    }
    auto listFlag = reinterpret_cast<__gm__ BatchFlag *>(scratch + query_owner::kListFlags) + q;
-   listFlag->ready=0;
-   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(listFlag),sizeof(BatchFlag));
+   // Only fallback list producers set ready. Its sole writer is this owner.
+   if (listFlag->ready) {
+    listFlag->ready = 0;
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(listFlag), sizeof(BatchFlag));
+   }
    if(block<shape.batch)Simt::VF_CALL<RetireRoundControl>(Simt::Dim3{128,1,1},a,shape.batch,workers,block);
    return;
   }
