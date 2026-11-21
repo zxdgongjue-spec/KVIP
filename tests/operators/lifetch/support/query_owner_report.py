@@ -313,7 +313,21 @@ def report_row_dependencies(root, group):
               f'placement={placement} timing_scope={"archived_control" if reference else "same_run"} {gate}')
 
 
+def report_short_lru(root, group):
+    label = 'short-lru'
+    data = load(root, group, label, row_dependencies=True)
+    digests = data[1]
+    if len(set(digests)) != 1 or not SHA256.fullmatch(digests[0]):
+        raise ValueError(f'G{group}: final TopK differs between candidate invocations')
+    compare_layout_receipts({label: data[11]}, label)
+    print(f'G{group} CHECK TopK=PASS calls=20/20 KV=PASS ordered_Index=PASS rows=320/320')
+    print(f'G{group} {label} graph_mean/P50_us={data[3]:.2f}/{data[4]:.2f} '
+          f'tail_mean/P50_us={data[8]:.2f}/{data[10]:.2f}')
+
+
 def main(root, group):
+    if (root / 'short-lru.txt').is_file():
+        return report_short_lru(root, group)
     if (root / 'row-deps.txt').is_file():
         return report_row_dependencies(root, group)
     if (root / 'local.txt').is_file() or (root / 'offset.txt').is_file():

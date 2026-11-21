@@ -32,6 +32,7 @@ query_owner=false
 local_resolver=false
 offset_resolver=false
 row_deps=false
+short_lru=false
 plan_candidate=
 packet_reference=
 plan_control=
@@ -74,13 +75,18 @@ if [[ ${1:-} == --ranked-help || ${1:-} == --ranked-joint ]]; then
     elif [[ -n "$joint_reference" ]]; then
         echo '--previous requires --ranked-joint' >&2; exit 2
     fi
-elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-packets ]]; then
+elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-packets || ${1:-} == --short-lru ]]; then
     [[ $# -ge 2 && $2 =~ ^[0-9a-f]{40}$ ]] || { echo "Usage: peer_fused.sh $1 NATIVE_SHA [GROUP ...]" >&2; exit 2; }
     query_owner=true
     offset_resolver=true
     ranked_sha=f8b185e3d042a18b24fe695c0a49a7d969ca487d
     fixed_order_rev=7b60f0dddab91a4b154043e78088842d7856cba6
-    if [[ $1 != --offset-resolver ]]; then
+    if [[ $1 == --short-lru ]]; then
+        short_lru=true
+        offset_resolver=false
+        plan_candidate=short-lru
+        [[ $2 != "$ranked_sha" ]] || { echo "Supply a short-LRU candidate based on $ranked_sha" >&2; exit 2; }
+    elif [[ $1 != --offset-resolver ]]; then
         row_deps=true
         plan_candidate=${1#--}
         if [[ $plan_candidate == li-packets ]]; then
@@ -97,7 +103,9 @@ elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-pa
     export PEER_LOCAL_ONLY=1
     shift 2
     offset_groups=(7 2 10 17 4)
-    if [[ $plan_candidate == li-packets ]]; then
+    if "$short_lru"; then
+        offset_groups=(10 7 2)
+    elif [[ $plan_candidate == li-packets ]]; then
         offset_groups=(7 2)
         if [[ ${1:-} == --reference ]]; then
             packet_reference=$(cd "${2:?missing prior row-deps result directory}" && pwd -P)
@@ -202,7 +210,7 @@ if [[ -z "$ranked" && $# -eq 2 && $1 == --reuse-serial ]]; then
         exit 1
     fi
 elif [[ $# -ne 0 ]]; then
-    echo 'Usage: peer_fused.sh --li-packets NATIVE_SHA [--reference DIR] [GROUP ...] | --row-deps NATIVE_SHA [GROUP ...] | --offset-resolver NATIVE_SHA [GROUP ...] | --ranked-auto FULL_SHA [--reference DIR] | --ranked-joint-local FULL_SHA [--reference DIR] | --ranked-joint FULL_SHA --previous DIR [--reference DIR] | --ranked-help FULL_SHA [--reference DIR] [--resume DIR] [--anchor GROUP] | --ranked-index CANDIDATE_SHA | [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
+    echo 'Usage: peer_fused.sh --short-lru NATIVE_SHA [GROUP ...] | --li-packets NATIVE_SHA [--reference DIR] [GROUP ...] | --row-deps NATIVE_SHA [GROUP ...] | --offset-resolver NATIVE_SHA [GROUP ...] | --ranked-auto FULL_SHA [--reference DIR] | --ranked-joint-local FULL_SHA [--reference DIR] | --ranked-joint FULL_SHA --previous DIR [--reference DIR] | --ranked-help FULL_SHA [--reference DIR] [--resume DIR] [--anchor GROUP] | --ranked-index CANDIDATE_SHA | [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
     exit 2
 fi
 export PATH=/usr/local/python3.12.13/bin:$PATH
@@ -271,7 +279,7 @@ if "$query_owner"; then
     fi
     declare -A owner_traces
     input_groups=(2 7 10 17 4)
-    if "$offset_resolver"; then input_groups=("${offset_groups[@]}"); fi
+    if "$offset_resolver" || "$short_lru"; then input_groups=("${offset_groups[@]}"); fi
     for group in "${input_groups[@]}"; do
         owner_traces[$group]=$(bash "$tools/peer_g2_input.sh" "$work" "$group")
     done
@@ -306,13 +314,17 @@ fi
 if [[ -n "$ranked" ]]; then
     if "$query_owner"; then
         if ! git -C "$root" cat-file -e "$ranked^{commit}" 2>/dev/null; then
-            if "$row_deps"; then git -C "$root" fetch -q origin "refs/heads/perf/urma-q4-$plan_candidate"
+            if "$row_deps" || "$short_lru"; then git -C "$root" fetch -q origin "refs/heads/perf/urma-q4-$plan_candidate"
             elif "$offset_resolver"; then git -C "$root" fetch -q origin refs/heads/perf/urma-q4-offset-slots
             elif "$local_resolver"; then git -C "$root" fetch -q origin refs/heads/perf/urma-q4-local-resolver
             else git -C "$root" fetch -q origin refs/heads/perf/urma-q4-query-owner; fi
         fi
         ranked_base="$src/ranked-${ranked_sha:0:8}"
-        pin "$root" "$ranked_base" "$ranked_sha"
+        if "$short_lru"; then
+            printf '%s\n' "$ranked" >"$out/short-lru.txt"
+        else
+            pin "$root" "$ranked_base" "$ranked_sha"
+        fi
         if "$local_resolver" || "$offset_resolver"; then
             ranked_fixed_order="$src/ranked-${fixed_order_rev:0:8}"
             if ! git -C "$root" cat-file -e "$fixed_order_rev^{commit}" 2>/dev/null; then
@@ -436,7 +448,9 @@ if "$query_owner"; then
 fi
 if [[ -n "$ranked" ]]; then
     printf 'CONFIG URMA physical_NPU=%s logical_device=0 BS16 Q4 656B ranked=%.8s candidate=%.8s KVAF=%.8s\n' "$peer_physical_npu" "$ranked_sha" "$ranked" "$transport"
-    if "$row_deps"; then
+    if "$short_lru"; then
+        echo 'CONFIG arms=short-lru query_owners=16x4 boundaries=4 budget=256/1024 fixed_route warmup=4 measured=20'
+    elif "$row_deps"; then
         echo "CONFIG arms=fixed-order,$plan_control,$plan_candidate query_owners=16x4 on=$plan_control,$plan_candidate boundaries=4 budget=256/1024 fixed_route warmup=4 measured=20"
     elif "$offset_resolver"; then
         echo 'CONFIG arms=fixed-order,chain,offset owners=16x4 boundaries=4 budget=256/1024 fixed_route warmup=4 measured=20'
@@ -453,7 +467,7 @@ if [[ -n "$ranked" ]]; then
         printf 'REFERENCE root=%s original=%.8s previous=%.8s profile=4_warmup_20_calls\n' "$help_reference" "$ranked_sha" "${joint_control:-$four_field}"
     fi
     build_sources=("$ranked_candidate")
-    if [[ -z "$packet_reference" ]]; then
+    if [[ -z "$packet_reference" ]] && ! "$short_lru"; then
         if [[ -z "$help_reference" ]] || "$has_anchor" || "$ranked_auto"; then build_sources+=("$ranked_base"); fi
         if "$offset_resolver"; then build_sources+=("$ranked_fixed_order"); fi
     fi
@@ -517,7 +531,7 @@ run_arm() (
             source_root=$ranked_candidate
             if [[ $label == "$plan_control" ]]; then source_root=$ranked_base; fi
             mode=(--fused-only --production-root "$source_root") ;;
-        local) mode=(--fused-only --production-root "$ranked_candidate") ;;
+        local|short-lru) mode=(--fused-only --production-root "$ranked_candidate") ;;
         fixed) mode=(--fused-only --production-root "$ranked_base" --ranked-q-workers 2); level=2 ;;
         auto) mode=(--fused-only --production-root "$ranked_candidate" --ranked-q-workers 2 --ranked-auto-route); level=2 ;;
         serial2|serial32) mode=(--serial-only --serial-workers "${label#serial}") ;;
@@ -672,6 +686,7 @@ if [[ -n "$ranked" ]]; then
     order=(baseline candidate)
     groups=(2 7 10 17 4)
     if "$offset_resolver"; then order=(chain offset fixed-order); groups=("${offset_groups[@]}"); fi
+    if "$short_lru"; then order=(short-lru); groups=("${offset_groups[@]}"); fi
     if "$row_deps"; then order=("$plan_control" "$plan_candidate" fixed-order); fi
     if [[ -n "$packet_reference" ]]; then
         order=("$plan_candidate")

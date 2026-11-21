@@ -30,7 +30,8 @@ class Array:
 
 @pytest.mark.parametrize('fault', (None, 'keys', 'kv', 'layout', 'valid'))
 @pytest.mark.parametrize('final_q', [0, 1])
-def test_ordered_layout_with_a_displaced_final_source(fault, final_q):
+@pytest.mark.parametrize('arm', ['row-deps', 'short-lru'])
+def test_ordered_layout_with_a_displaced_final_source(fault, final_q, arm):
     # Prefetch swaps 4 into slot 0. Q1 selects the token displaced from 0;
     # its current source is now 4, so the final swap moves it from 4 to 2.
     layout = np.array([[4, 1, 0, 3, 2, 5]])
@@ -56,7 +57,7 @@ def test_ordered_layout_with_a_displaced_final_source(fault, final_q):
     state = object.__new__(FusedReplayState)
     state.batch = 1
     state.verify_ranked_events = True
-    state.query_owner_arm = 'row-deps'
+    state.query_owner_arm = arm
     state.input_layout = pre
     state.logical_addresses = addresses
     state.pages = SimpleNamespace(token_payload=lambda row, ids: ids[:, None] + 200)
@@ -72,7 +73,7 @@ def test_ordered_layout_with_a_displaced_final_source(fault, final_q):
     )
     if fault is None:
         state.validate_index(inputs, values)
-        assert state.cross_q_overlap_requests == int(final_q != 0)
+        assert state.cross_q_overlap_requests == int(arm == 'row-deps' and final_q != 0)
         assert len(state.layout_receipts) == 1
         assert all(len(digest) == 64 for digest in state.layout_receipts[0])
         return

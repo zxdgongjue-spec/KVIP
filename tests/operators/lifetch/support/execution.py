@@ -3428,7 +3428,7 @@ class FusedReplayState:
             destinations = self.forward.events_dst.cpu().numpy()
             counts = self.forward.flags.cpu().numpy()[:, (0,12,13,14,15), 1]
             self.layout_receipts = []
-            compare_layout = self.query_owner_arm in ('fixed-order', 'offset', 'row-deps', 'li-packets')
+            compare_layout = self.query_owner_arm in ('short-lru', 'fixed-order', 'offset', 'row-deps', 'li-packets')
             track_cross_q = self.query_owner_arm in ('offset', 'row-deps', 'li-packets')
             self.cross_q_overlap_requests = 0
             for row in range(self.batch):
@@ -3553,7 +3553,7 @@ class FusedReplayState:
         failures = []
         try:
             inputs.validate_topk(ids)
-            if arm in ('fixed-order', 'chain', 'spill', 'local', 'offset', 'row-deps', 'li-packets'):
+            if arm in ('short-lru', 'fixed-order', 'chain', 'spill', 'local', 'offset', 'row-deps', 'li-packets'):
                 from query_owner_report import check_cutoff_ids
                 check_cutoff_ids(inputs, self.input_layout, ids)
         except AssertionError as error:
