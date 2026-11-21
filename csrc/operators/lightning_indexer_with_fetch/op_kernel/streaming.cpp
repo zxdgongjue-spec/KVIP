@@ -1176,8 +1176,9 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
 #else
  if constexpr(!QueryOwner)CompletePrefetch(ctx,b,true,profile?&polls:nullptr,profile?&drain:nullptr,profile?&arrival:nullptr);
 #endif
- if(profile){ft[4]=GetSystemCycle();ft[5]=polls;ft[6]=drain;ft[7]=arrival;}error|=row->error;
+ if(profile){ft[4]=GetSystemCycle();ft[5]=polls;ft[6]=drain;ft[7]=arrival;}
  if constexpr(!QueryOwner){
+  error|=row->error;
   flags[7].error=error;flags[7].ready=1;
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+7),kBatchFlagPayloadBytes);
  }
@@ -1226,7 +1227,9 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(updateStatus),sizeof(uint32_t));
  uint32_t updateError=*updateStatus,total=0,completed=0,deferred=0;
  uint64_t lastHead=0,lastCq=0;
- error|=row->error;error|=info[0]?kvaf_device::kInvalidArgs:0;
+ // The query-owner branch receives the prefetch error from Q1 via flags[7].
+ if constexpr(!QueryOwner)error|=row->error;
+ error|=info[0]?kvaf_device::kInvalidArgs:0;
 #if !V9_UBMEM
  if(shape.finalWorkers==4){
   TPipe pipe;TBuf<TPosition::VECCALC> storage;pipe.InitBuffer(storage,32);
@@ -1257,6 +1260,9 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
   lastHead=queue->sq_producer_index;lastCq=queue->cq_consumer_index;
  }
 #endif
+ // Q1 cleared pending on another core. The joined fast path uses asc_ldcg.
+ if constexpr(QueryOwner)
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&row->pending),sizeof(row->pending));
  if(row->pending || total!=info[1])error|=kvaf_device::kInvalidArgs;
  if(profile)ft[1]=GetSystemCycle();
  if(!error && !updateError && !(a->prefetchCount & 0x10000000U)){
