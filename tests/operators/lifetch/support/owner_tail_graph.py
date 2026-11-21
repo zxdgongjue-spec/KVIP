@@ -253,8 +253,18 @@ def summarize(data, ticks, archived_calls):
 
 
 def verify(root, group):
-    base = Path((root/'owner-tail-reference.txt').read_text().strip())
-    inputs, digest, plans, old_thp = reference(base, group)
+    serial_base = Path((root/'owner-tail-reference.txt').read_text().strip())
+    inputs, digest, plans, old_thp = reference(serial_base, group)
+    measured_file = root/'cq-measured-reference.txt'
+    base = serial_base
+    if measured_file.is_file():
+        from cutoff_tail_archive import Q1_CQ_REVISION
+        base = Path(measured_file.read_text().strip())
+        if Path((base/'early-handoff-reference.txt').read_text().strip()).resolve() != serial_base.resolve():
+            raise ValueError('当前版本的强串行参考目录与诊断不一致')
+        measured_inputs, measured_digest, plans, old_thp = reference(base, group, Q1_CQ_REVISION)
+        if measured_inputs != inputs or measured_digest != digest:
+            raise ValueError('当前版本与原始融合版的输入或 TopK 集合不一致')
     archive = read(root/'archive-calls.json')
     calls = archive['groups'][str(group)]
     if (Path(archive['root']).resolve() != base.resolve() or
@@ -281,7 +291,17 @@ def verify(root, group):
     data['placement'] = pair_placement(old_thp, read(group_dir/'logical-ties/thp.json'), local_baseline=True)
     tick_path = path.parent/'owner_graph_ticks.npz'
     with np.load(tick_path, allow_pickle=False) as raw:
-        lines = summarize(data, raw['ticks'], calls)
+        if measured_file.is_file():
+            from prefetch_cq_graph_report import summarize as cq_summary
+            comparison, = (base/f'g{group}/logical-ties/results').glob('*/cases/diagnose/fused/native_li_compare.json')
+            previous = read(comparison)['native_reference']['replay_identity']
+            current = read(path.parent/'cq_replay_identity.json')
+            changed = sorted(k for k in previous.keys() | current.keys() if previous.get(k) != current.get(k))
+            data['runtime_identity_diff'] = changed
+            lines = [f'G{group} 诊断与本版本实测归档的内存放置={data["placement"]}，运行环境差异字段={",".join(changed) or "无"}',
+                     *cq_summary(data, raw['ticks'], calls)]
+        else:
+            lines = summarize(data, raw['ticks'], calls)
     atomic_json(path, data)
     for src in (path, tick_path):
         dest = group_dir/src.name

@@ -4083,8 +4083,10 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     if os.environ.get('KVIP_Q4_OWNER_TAIL') == '1':
         from native_li_reference import identities
         from owner_pack_tail import archived_serial
-        native_reference = archived_serial(Path(os.environ['KVIP_Q4_TAIL_REFERENCE']), config.group,
-                                           identities(initial, torch, torch_npu, device))
+        identity = identities(initial, torch, torch_npu, device)
+        native_reference = archived_serial(Path(os.environ['KVIP_Q4_TAIL_REFERENCE']), config.group, identity)
+        if os.environ.get('KVIP_Q4_CQ_PROOF') == '1':
+            atomic_json(Path(directory) / 'cq_replay_identity.json', identity)
     elif os.environ.get('KVIP_Q4_LI_RESTORE') == '1':
         if not (fused and config.query_owner_arm == 'owner-pack' and config.production_root
                 and config.iterations == 20 and len(sequence.rounds) == 1):

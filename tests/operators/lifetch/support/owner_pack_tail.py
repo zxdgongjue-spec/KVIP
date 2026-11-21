@@ -110,8 +110,8 @@ def capture(state, inputs, config, directory, ticks_per_us, replay_and_time, exp
     return checked
 
 
-def reference(root, group):
-    if (root/'logical-ties.txt').read_text().strip() != '24c619b9581aad43fd53c815928def26a1e19560':
+def reference(root, group, revision='24c619b9581aad43fd53c815928def26a1e19560'):
+    if (root/'logical-ties.txt').read_text().strip() != revision:
         raise ValueError('Unexpected uninstrumented cutoff revision')
     summary = load(root, group, 'logical-ties', row_dependencies=True)
     compare_layout_receipts({'logical-ties': summary[11]}, 'logical-ties')

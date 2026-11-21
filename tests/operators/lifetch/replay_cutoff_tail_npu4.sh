@@ -5,6 +5,10 @@ repo=${1:?expected KVIP repository}
 reader=${2:?expected full reader revision}
 mode=${3:-single}
 native=3f24b6ff66153da3605f0f6f24dacf69ce4b66c4
+if [[ $mode == g7-prefetch-cq ]]; then
+    native=b4f73163e63629e9b8f66cd6221e84dcb9ceccc7
+    [[ ${4:-$native} == "$native" ]] || { echo '需要与此回放脚本配套的预取回执诊断算子' >&2; exit 2; }
+fi
 work=${PEER_G2_WORK:-/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold}
 ref="$work/peer-baseline/fused.m3IizR"
 runner="$work/fused-scan-sources/reader-$reader"
@@ -24,10 +28,13 @@ unset PEER_RANKED_INPUT PEER_RANKED_HASH_FILE KVIP_Q4_NATIVE_LI_CACHE
 tools="$runner/tests/operators/lifetch"
 case "$mode" in
     single) args=(--cutoff-tail "$native" --reference "$ref" 17 4 10 7) ;;
+    g7-prefetch-cq) args=(--prefetch-cq-proof "$native" --reference "$ref" --measured "$work/peer-baseline/fused.Cmp6BN" 7) ;;
     g7-graph) args=(--cutoff-tail-graph "$native" --reference "$ref" 7) ;;
     *) echo "Unknown capture mode: $mode" >&2; exit 2 ;;
 esac
-log=$(mktemp "$work/host24-npu4-cutoff-tail.XXXXXX")
+prefix=host24-npu4-cutoff-tail
+if [[ $mode == g7-prefetch-cq ]]; then prefix=host24-npu4-g7-prefetch-cq-trace; fi
+log=$(mktemp "$work/$prefix.XXXXXX")
 echo "LOG=$log"
 prior="$work/peer-baseline/fused.WvlohG"
 if [[ "$mode" == g7-graph && -f "$prior/owner-tail.tar.gz" ]]; then

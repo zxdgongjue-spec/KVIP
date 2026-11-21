@@ -162,16 +162,20 @@ def plan_spread(group, receipts, rows):
             f'fast_call={low["call"]}@{low["tail"]:.2f} slow_call={high["call"]}@{high["tail"]:.2f}')
 
 
-def report(root, details=None):
+Q1_CQ_REVISION = '7f75960b903be1b2474c87cba89f28ce877593f6'
+
+
+def report(root, details=None, *, q1_cq=False):
+    revision = Q1_CQ_REVISION if q1_cq else REVISION
     if ((root / 'physical_npu.txt').read_text().strip() != '4'
-            or (root / 'logical-ties.txt').read_text().strip() != REVISION):
-        raise ValueError('Expected physical NPU4 and logical-ties ' + REVISION)
-    output = [f'ARCHIVE root={root} physical_NPU=4 native={REVISION}',
+            or (root / 'logical-ties.txt').read_text().strip() != revision):
+        raise ValueError('Expected physical NPU4 and matching native source at ' + str(root))
+    output = [f'ARCHIVE root={root} physical_NPU=4 native={revision}',
               'Q_COUNTS mean/P50/P95/max across 20 calls; each Q sums 16 rows. '
               'empty_rows=rows with zero final posts; crossQ_dups=unique IDs also selected by earlier Qs. '
               'Call/Q are 1-based; R is 0-based.']
     groups = {}
-    for group in (17, 4, 10, 7):
+    for group in ((7,) if q1_cq else (17, 4, 10, 7)):
         case = root / f'g{group}'
         matches = list((case / 'logical-ties/results').glob('*/cases/diagnose/fused/diagnose/round-1/full_attribution.json'))
         if len(matches) != 1:
@@ -182,7 +186,7 @@ def report(root, details=None):
         out = read_json(fused / 'path_result.json')
         checks = read_json(fused / 'native_li_compare.json')
         strong = checks['comparisons']['strong_serial']
-        if (out['production_revision'] != REVISION or out['correctness'] != 'PASS' or out['failures']
+        if (out['production_revision'] != revision or out['correctness'] != 'PASS' or out['failures']
                 or (checks['group'], checks['phase'], checks['measured_calls'], checks['queries_per_call'])
                     != (group,'measured',20,64)
                 or (strong['matched_calls'], strong['matched_queries'], strong['total_queries']) != (20,1280,1280)
@@ -194,10 +198,13 @@ def report(root, details=None):
                 receipt != dict(owners=64, queues=64, processed=row['final'])
                 for row, receipt in zip(rows,receipts)):
             raise ValueError(f'G{group}: final Get/CQ receipt count mismatch')
-        archived = (case / 'li-summary.txt').read_text().splitlines()
+        archived = (root / 'summary.txt' if q1_cq else case / 'li-summary.txt').read_text().splitlines()
         check = (f'G{group} CHECK TopK_set_vs_strong_serial=PASS calls=20/20 queries=1280/1280 '
                  'serial_repeat_queries=64/64 KV=PASS ordered_Index=PASS rows=320/320')
         timing_line = f'G{group} logical-ties ' + ' '.join(f'{k}_mean/P50_us={v}' for k, v in pairs.items())
+        if q1_cq:
+            timing_line = f'G{group} prefetch-cq-overlap ' + ' '.join(
+                f'{k}_mean/P50_us={pairs[k]}' for k in ('graph', 'tail', 'LI'))
         if archived.count(check) != 1 or archived.count(timing_line) != 1:
             raise ValueError(f'G{group}: li-summary.txt and attribution/correctness receipts disagree')
         output.extend([check, timing_line, *lines, plan_spread(group, out['layout_receipts'], rows)])
@@ -213,16 +220,19 @@ def report(root, details=None):
                                             for r in sample['algorithm']['requests']]))
             groups[str(group)] = calls
     if details is not None:
-        details.write_text(json.dumps(dict(native=REVISION, root=str(root), physical_npu=4,
+        details.write_text(json.dumps(dict(native=revision, root=str(root), physical_npu=4,
                                            query_columns=['final_posted','final_safe','cross_q_duplicate'],
                                            groups=groups), separators=(',', ':')) + '\n')
+    if q1_cq:
+        return [f'已核对 Q1 接手预取回执版 G7 的 20 次归档计时、搬移计划及正确性，来源 {root}']
     return output
 
 
 if __name__ == '__main__':
-    if len(sys.argv) not in (2, 3):
+    q1_cq = len(sys.argv) == 4 and sys.argv[3] == '--q1-cq'
+    if not q1_cq and len(sys.argv) not in (2, 3):
         raise SystemExit('usage: python3 ' + Path(__file__).name + ' <archive-root> [compact-json-output]')
     try:
-        print('\n'.join(report(Path(sys.argv[1]), Path(sys.argv[2]) if len(sys.argv) == 3 else None)))
+        print('\n'.join(report(Path(sys.argv[1]), Path(sys.argv[2]) if len(sys.argv) >= 3 else None, q1_cq=q1_cq)))
     except (ValueError, KeyError, OSError, TypeError) as e:
         raise SystemExit(f'ARCHIVE_ERROR {e}')

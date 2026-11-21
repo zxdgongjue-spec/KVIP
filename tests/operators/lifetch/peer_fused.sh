@@ -35,8 +35,10 @@ row_deps=false
 candidate_only=false
 owner_tail=false
 owner_graph=false
+cq_proof=false
+cq_reference=
 arm_iterations=20
-unset KVIP_Q4_OWNER_TAIL KVIP_Q4_TAIL_REFERENCE KVIP_Q4_OWNER_GRAPH
+unset KVIP_Q4_OWNER_TAIL KVIP_Q4_TAIL_REFERENCE KVIP_Q4_OWNER_GRAPH KVIP_Q4_CQ_PROOF
 plan_candidate=
 packet_reference=
 plan_control=
@@ -79,19 +81,20 @@ if [[ ${1:-} == --ranked-help || ${1:-} == --ranked-joint ]]; then
     elif [[ -n "$joint_reference" ]]; then
         echo '--previous requires --ranked-joint' >&2; exit 2
     fi
-elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-packets || ${1:-} == --short-lru || ${1:-} == --owner-pack || ${1:-} == --li-restore || ${1:-} == --logical-ties || ${1:-} == --cutoff-tail || ${1:-} == --cutoff-tail-graph ]]; then
+elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-packets || ${1:-} == --short-lru || ${1:-} == --owner-pack || ${1:-} == --li-restore || ${1:-} == --logical-ties || ${1:-} == --cutoff-tail || ${1:-} == --cutoff-tail-graph || ${1:-} == --prefetch-cq-proof ]]; then
     [[ $# -ge 2 && $2 =~ ^[0-9a-f]{40}$ ]] || { echo "Usage: peer_fused.sh $1 NATIVE_SHA [GROUP ...]" >&2; exit 2; }
     query_owner=true
     offset_resolver=true
     ranked_sha=f8b185e3d042a18b24fe695c0a49a7d969ca487d
     fixed_order_rev=7b60f0dddab91a4b154043e78088842d7856cba6
-    if [[ $1 == --short-lru || $1 == --owner-pack || $1 == --li-restore || $1 == --logical-ties || $1 == --cutoff-tail || $1 == --cutoff-tail-graph ]]; then
+    if [[ $1 == --short-lru || $1 == --owner-pack || $1 == --li-restore || $1 == --logical-ties || $1 == --cutoff-tail || $1 == --cutoff-tail-graph || $1 == --prefetch-cq-proof ]]; then
         candidate_only=true
         offset_resolver=false
         plan_candidate=${1#--}
-        if [[ $plan_candidate == cutoff-tail || $plan_candidate == cutoff-tail-graph ]]; then
+        if [[ $plan_candidate == cutoff-tail || $plan_candidate == cutoff-tail-graph || $plan_candidate == prefetch-cq-proof ]]; then
             owner_tail=true
-            if [[ $plan_candidate == cutoff-tail-graph ]]; then
+            if [[ $plan_candidate == prefetch-cq-proof ]]; then cq_proof=true; fi
+            if [[ $plan_candidate == cutoff-tail-graph || $plan_candidate == prefetch-cq-proof ]]; then
                 owner_graph=true
                 export KVIP_Q4_OWNER_GRAPH=1
             else
@@ -133,6 +136,14 @@ elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-pa
         if [[ $(<"$KVIP_Q4_TAIL_REFERENCE/logical-ties.txt") != "$ranked_sha" ||
               $(<"$KVIP_Q4_TAIL_REFERENCE/physical_npu.txt") != "$peer_physical_npu" ]]; then
             echo "Incompatible reference $KVIP_Q4_TAIL_REFERENCE" >&2; exit 1
+        fi
+        if "$cq_proof"; then
+            [[ $peer_physical_npu == 4 && ${1:-} == --measured && -d ${2:-} ]] || { echo '需要 NPU4 上已完成的「Q1 接手预取回执版」G7 归档' >&2; exit 2; }
+            cq_reference=$(cd "$2" && pwd -P)
+            export KVIP_Q4_CQ_PROOF=1
+            shift 2
+            ranked_sha=7f75960b903be1b2474c87cba89f28ce877593f6
+            [[ $(<"$cq_reference/logical-ties.txt") == "$ranked_sha" && $(<"$cq_reference/physical_npu.txt") == 4 ]] || { echo "归档算子或设备不匹配: $cq_reference" >&2; exit 1; }
         fi
         export KVIP_Q4_TAIL_REFERENCE KVIP_Q4_OWNER_TAIL=1
     fi
@@ -314,7 +325,11 @@ fi
 if [[ -n "$ranked" ]]; then
     printf '%s\n' "$peer_physical_npu" >"$out/physical_npu.txt"
 fi
-if "$owner_tail"; then
+if "$cq_proof"; then
+    printf '%s\n' "$cq_reference" >"$out/cq-measured-reference.txt"
+    python3 -B "$tools/support/g7_archive_split.py" "$area" | tee "$out/G7归档统计.txt"
+    python3 -B "$tools/support/cutoff_tail_archive.py" "$cq_reference" "$out/archive-calls.json" --q1-cq | tee "$out/archive-tail.txt"
+elif "$owner_tail"; then
     python3 -B "$tools/support/cutoff_tail_archive.py" "$KVIP_Q4_TAIL_REFERENCE" "$out/archive-calls.json" | tee "$out/archive-tail.txt"
 fi
 if "$query_owner"; then
@@ -361,7 +376,8 @@ fi
 if [[ -n "$ranked" ]]; then
     if "$query_owner"; then
         if ! git -C "$root" cat-file -e "$ranked^{commit}" 2>/dev/null; then
-            if "$owner_tail"; then git -C "$root" fetch -q origin refs/heads/diag/urma-q4-cutoff-tail
+            if "$cq_proof"; then git -C "$root" fetch -q origin refs/heads/diag/urma-q4-prefetch-cq-proof
+            elif "$owner_tail"; then git -C "$root" fetch -q origin refs/heads/diag/urma-q4-cutoff-tail
             elif "$row_deps" || "$candidate_only"; then git -C "$root" fetch -q origin "refs/heads/perf/urma-q4-$plan_candidate"
             elif "$offset_resolver"; then git -C "$root" fetch -q origin refs/heads/perf/urma-q4-offset-slots
             elif "$local_resolver"; then git -C "$root" fetch -q origin refs/heads/perf/urma-q4-local-resolver
@@ -496,6 +512,7 @@ if "$query_owner"; then
         allowed+=(':(exclude)csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_vector.h')
     fi
     if "$owner_tail"; then
+        if "$cq_proof"; then git -C "$ranked_candidate" merge-base --is-ancestor "$ranked_sha" HEAD; fi
         git -C "$ranked_candidate" diff --exit-code --quiet "$ranked_sha" HEAD -- \
             csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer \
             csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer.cpp
@@ -513,7 +530,9 @@ if [[ -n "$ranked" ]]; then
     printf 'CONFIG URMA physical_NPU=%s logical_device=0 BS16 Q4 656B ranked=%.8s candidate=%.8s KVAF=%.8s\n' "$peer_physical_npu" "$ranked_sha" "$ranked" "$transport"
     if "$owner_tail"; then
         printf '%s\n' "$KVIP_Q4_TAIL_REFERENCE" >"$out/owner-tail-reference.txt"
-        if "$owner_graph"; then
+        if "$cq_proof"; then
+            echo "CONFIG G7 Q1接手预取回执版分核诊断；20个独立状态，预热4遍，采集顺序为全关、奇数开、偶数开、全关"
+        elif "$owner_graph"; then
             echo "CONFIG diagnostic=cutoff-tail-graph archived=24c619b9 level=1 warmup=4 independent_states=20 graph_passes=4 trace_masks=off,alternating,complement,off"
         else
             echo "CONFIG diagnostic=cutoff-tail archived=24c619b9 level=1 warmup=4 independent_states=1 on_off_pairs=5"
@@ -626,7 +645,9 @@ run_arm() (
         limits=(--prefetch-tokens 512 --intermediate-fetches 8)
         mode=(--fused-only --candidate-root "$src/auto-${candidate:0:8}" --candidate-snapshot "$snapshot")
     fi
-    printf 'CASE_BEGIN G%s %s\n' "$group" "$label"
+    local display_label=$label
+    if "$cq_proof"; then display_label=Q1接手预取回执版分核诊断; fi
+    printf 'CASE_BEGIN G%s %s\n' "$group" "$display_label"
     if ! "$PYTHON" -B "$tools/test_lifetch.py" diagnose "${mode[@]}" "${limits[@]}" \
         --transport urma --input real --trace-root "$trace" --group "$group" --round-range 1:1 \
         --device 0 --kvaf-root "$kvaf" --kvaf-server "127.0.0.1:$port" \
@@ -777,7 +798,7 @@ if [[ -n "$ranked" ]]; then
         else trace=$(bash "$tools/peer_g2_input.sh" "$work" "$group"); fi
         if "$owner_tail"; then
             # Preserve reference NUMA placement when the original was observable.
-            previous_node=$("$PYTHON" -B "$tools/support/owner_pack_tail.py" numa "$KVIP_Q4_TAIL_REFERENCE" "$group")
+            previous_node=$("$PYTHON" -B "$tools/support/owner_pack_tail.py" numa "${cq_reference:-$KVIP_Q4_TAIL_REFERENCE}" "$group")
             bind_cpu_service "${previous_node:-$node}"
         fi
         # The two historically ambiguous groups also check the fixed fused tail.
@@ -812,6 +833,7 @@ if [[ -n "$ranked" ]]; then
         entries=(summary.txt archive-tail.txt archive-calls.json owner-tail-reference.txt logical-ties.txt physical_npu.txt)
         if "$owner_graph"; then
             bundle="$out/owner-graph.tar.gz"
+            if "$cq_proof"; then entries+=(cq-measured-reference.txt G7归档统计.txt); bundle="$out/预取回执分核计时.tar.gz"; fi
             for group in "${groups[@]}"; do entries+=("g$group/owner_graph.json" "g$group/owner_graph_ticks.npz"); done
         else
             bundle="$out/owner-tail.tar.gz"
