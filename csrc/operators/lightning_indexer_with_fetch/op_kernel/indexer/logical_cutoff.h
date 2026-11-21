@@ -158,12 +158,92 @@ __simt_callee__ inline void WideLogical(__gm__ uint64_t* logical, __ubuf__ uint3
     asc_syncthreads();
 }
 
+// A compact list of nonempty bitmap words lets sparse rows read each logical key once.
+__simd_vf__ inline void CompactWords(__ubuf__ uint32_t* marks, __ubuf__ uint32_t* output,
+                                      __ubuf__ uint32_t* count, uint16_t words) {
+    using namespace MicroAPI;
+    auto all = CreateMask<uint32_t, MaskPattern::ALL>();
+    auto first = CreateMask<uint32_t, MaskPattern::VL1>();
+    RegTensor<uint32_t> bits, packed, ones, sums, total;
+    RegTensor<int32_t> index;
+    MaskReg take;
+    UnalignRegForStore store;
+    uint32_t left = words;
+    Duplicate(sums, 0U);
+    ClearSpr<SpecialPurposeReg::AR>();
+    for (uint16_t w = 0; w < words; w += 64) {
+        MaskReg valid = UpdateMask<uint32_t>(left);
+        LoadAlign(bits, marks + w);
+        CompareScalar<uint32_t, CMPMODE::NE>(take, bits, 0U, valid);
+        Arange(index, int32_t(w));
+        Squeeze<uint32_t, MicroAPI::GatherMaskMode::STORE_REG>(
+            packed, reinterpret_cast<RegTensor<uint32_t>&>(index), take);
+        StoreUnAlign<uint32_t, PostLiteral::POST_MODE_UPDATE>(output, packed, store);
+        Duplicate<uint32_t, MaskMergeMode::ZEROING>(ones, 1U, take);
+        Add(sums, sums, ones, all);
+    }
+    StoreUnAlignPost(output, store);
+    ReduceSum(total, sums, all);
+    StoreAlign(count, total, first);
+}
+
+__simt_callee__ inline bool SparseLogical(__gm__ uint64_t* logical, __ubuf__ uint32_t* marks,
+        uint32_t history, __ubuf__ uint16_t* slots, uint32_t quota, __ubuf__ uint32_t* ids,
+        __ubuf__ uint32_t* work, uint32_t nonempty, uint32_t resident, __gm__ uint32_t* hot,
+        __gm__ int32_t* reserved, uint32_t tailBegin, uint32_t tailEnd) {
+    if (nonempty > kThreads) return false;
+    const uint32_t tid = threadIdx.x;
+    uint32_t w = tid < nonempty ? work[tid] : 0;
+    uint32_t bits = tid < nonempty ? marks[w] : 0;
+    const uint32_t logicalWords = (history+31)/32;
+    auto prefix = work + logicalWords;
+    auto ctl = prefix + kThreads;
+    // The fallback owns ctl[32] and can start on an earlier warp.
+    auto sparseFallback = ctl + 33;
+    uint32_t slot = Exclusive(__popc(bits), ctl);
+    uint32_t size = ctl[kThreads/32-1];
+    if (size == quota) return true;
+    if (size > kThreads) return false;
+
+    for (; bits; bits &= bits-1) prefix[slot++] = 32*w + __builtin_ctz(bits);
+    asc_syncthreads();
+    uint32_t physical = tid < size ? prefix[tid] : 0;
+    uint64_t key = tid < size ? asc_ldcg(logical+physical) : 0;
+    for (uint32_t i=tid; i<logicalWords; i+=kThreads) work[i] = 0;
+    if (!tid) *sparseFallback = 0;
+    asc_syncthreads();
+    if (tid < size) {
+        if (key < history) {
+            uint32_t bit = 1U << (uint32_t(key) % 32);
+            if (asc_atomic_or(work + uint32_t(key)/32,bit) & bit) asc_atomic_or(sparseFallback,1U);
+        } else asc_atomic_or(sparseFallback,1U);
+    }
+    asc_syncthreads();
+    if (*sparseFallback) return false;
+    const uint32_t span = (logicalWords+kThreads-1)/kThreads;
+    uint32_t n = 0;
+    for (uint32_t i=tid*span; i<(tid+1)*span && i<logicalWords; ++i) n+=__popc(work[i]);
+    prefix[tid] = Exclusive(n,ctl);
+    asc_syncthreads();
+    if (tid < size) {
+        const uint32_t word = uint32_t(key)/32, group = word/span;
+        uint32_t rank = prefix[group];
+        if (rank < quota) {
+            for (uint32_t i=group*span; i<word; ++i) rank+=__popc(work[i]);
+            rank+=__popc(work[word] & ((1U<<(uint32_t(key)%32))-1));
+            if (rank < quota) ids[slots[rank]] = Tagged(physical,resident,hot,reserved,tailBegin,tailEnd);
+        }
+    }
+    asc_syncthreads();
+    return true;
+}
 __simt_vf__ __aicore__ LAUNCH_BOUND(kThreads) inline void Select(
         __gm__ uint64_t* logical, __ubuf__ uint32_t* marks, uint32_t words, uint32_t history,
         __ubuf__ uint16_t* slots, __ubuf__ uint32_t* count, __ubuf__ uint32_t* ids, __ubuf__ uint32_t* work,
         uint32_t resident, __gm__ uint32_t* hot, __gm__ int32_t* reserved, uint32_t tailBegin, uint32_t tailEnd) {
     uint32_t tid = threadIdx.x, quota = count[0];
     if (!quota) return;
+    if (SparseLogical(logical,marks,history,slots,quota,ids,work,count[8],resident,hot,reserved,tailBegin,tailEnd)) return;
     const uint32_t logicalWords = (history+31)/32;
     auto prefix = work + logicalWords;
     auto ctl = prefix + kThreads;
@@ -232,6 +312,10 @@ __aicore__ inline void Repair(GlobalTensor<uint16_t> raw, GlobalTensor<uint64_t>
     }
     if (valid) WaitFlag<HardEvent::V_MTE2>(EVENT_ID5);
     if (valid > kTile) WaitFlag<HardEvent::V_MTE2>(EVENT_ID3);
+    PipeBarrier<PIPE_ALL>();
+    CompactWords(reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),
+                 reinterpret_cast<__ubuf__ uint32_t*>(tile.GetPhyAddr()),
+                 reinterpret_cast<__ubuf__ uint32_t*>(count[8].GetPhyAddr()), uint16_t(words));
     PipeBarrier<PIPE_ALL>();
     Simt::VF_CALL<Select>(Simt::Dim3{kThreads,1,1},const_cast<__gm__ uint64_t*>(logical.GetPhyAddr()),
         reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),words,history,
