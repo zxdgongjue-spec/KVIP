@@ -1186,11 +1186,13 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
  error|=AwaitPublication(flags+4);
 #endif
 #if !V9_UBMEM
- if(!QueryOwner && !profile && !error && (a->prefetchCount&0x10000000U) && shape.finalWorkers==4 && ctx->hotValid){
+ if(!profile && !error && (a->prefetchCount&0x10000000U) && shape.finalWorkers==4 && ctx->hotValid){
   TPipe pipe;TBuf<TPosition::VECCALC> storage;pipe.InitBuffer(storage,64);
   auto result=storage.Get<uint32_t>();
-  Simt::VF_CALL<FinalizeJoinedRow>(Simt::Dim3{256,1,1},a,ctx,flags,b,shape.batch,shape.resident,
-   shape.finalPostOffset,(a->prefetchCount>>16)&0xffU,deferredPrefix,FinalPtr(result));
+  const uint32_t workers=(a->prefetchCount>>16)&0xffU;
+  const uint32_t lastQueue=QueryOwner?FinalQueue(shape.batch,4,b,3):2*shape.batch+2*(3*workers+b%workers);
+  Simt::VF_CALL<FinalizeJoinedRow>(Simt::Dim3{256,1,1},a,ctx,flags,b,shape.resident,
+   shape.finalPostOffset,lastQueue,deferredPrefix,FinalPtr(result));
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
   uint32_t done=result.GetValue(12);pipe.Destroy();if(done)return;
  }

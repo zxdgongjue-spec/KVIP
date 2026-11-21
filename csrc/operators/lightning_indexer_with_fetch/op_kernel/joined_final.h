@@ -1,8 +1,8 @@
 // All publishers, Fetch acknowledgements and the Index update have joined.
 // Validate every row first so the original error path can still consume it.
 __simt_vf__ __aicore__ LAUNCH_BOUND(256) inline void FinalizeJoinedRow(
- __gm__ Args* a,__gm__ Context* ctx,__gm__ BatchFlag* flags,uint32_t b,uint32_t batch,
- uint32_t resident,uint32_t postOffset,uint32_t workers,uint32_t prefix,__ubuf__ uint32_t* scratch){
+ __gm__ Args* a,__gm__ Context* ctx,__gm__ BatchFlag* flags,uint32_t b,
+ uint32_t resident,uint32_t postOffset,uint32_t lastQueue,uint32_t prefix,__ubuf__ uint32_t* scratch){
  uint32_t t=threadIdx.x,q=t/64,l=t%64;
  auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
  auto post=reinterpret_cast<__gm__ FinalPost*>(ctx->owners+postOffset)+b*4+q;
@@ -44,8 +44,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(256) inline void FinalizeJoinedRow(
    case 1:if(t<8)value=scratch[13];break;
    case 3:if(t<8)value=scratch[14];break;
    case 4:case 5:if(t<8){
-    uint32_t pair=2*batch+2*(3*workers+b%workers);
-    auto args=reinterpret_cast<__gm__ KvafExecuteBatchGetKernelArgs*>(ctx->args)+pair;
+    auto args=reinterpret_cast<__gm__ KvafExecuteBatchGetKernelArgs*>(ctx->args)+lastQueue;
     auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(asc_ldcg(&args->queue_state));
     value=t==4?asc_ldcg(&queue->sq_producer_index):asc_ldcg(&queue->cq_consumer_index);
    }break;
