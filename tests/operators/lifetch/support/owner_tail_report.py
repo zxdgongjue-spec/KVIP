@@ -120,6 +120,36 @@ def summarize(values):
     return f'{median(values):.2f}/{percent(values, .95):.2f}'
 
 
+def print_owner_path(group, sample, block, durations, selected_by):
+    # All intervals in this partition belong to a single AIV. Apply/commit
+    # are nested in Index, and post-Index polls are nested in the CQ calls.
+    parts = {
+        'prefetch': durations['prefetch_flag'] + durations['prefetch_complete'],
+        'resolve_work': durations['resolver_except_handoff'],
+        'allocator_wait': durations['resolver_handoff'],
+        'unsafe_wait': durations['conflict_wait'],
+        'descriptor_sync': durations['desc_sync'],
+        'post': durations['sq_active'],
+        'adapt': durations['adapt'],
+        'index_wait': durations['index_handoff'],
+        'index': durations['index'],
+        'cq_calls': durations['cq_call'],
+        'finalize': durations['row_finalize'],
+    }
+    parts['other'] = durations['owner_to_barrier'] - sum(parts.values())
+    if parts['other'] < -0.01:
+        raise ValueError(f'G{group} block {block}: pre-barrier intervals overlap')
+    row, q = divmod(block, 4)
+    owner = sample['requests'][row]['queries'][q]
+    match = sample['plan_match']
+    print(f'G{group} LOCAL_PATH pair={sample["repeat"]+1} selected_by={selected_by} owner=R{row}Q{q+1} '
+          f'final/safe={owner["final_posted"]}/{owner["final_safe"]} '
+          f'archive_plan_rows={match["archive_on_rows"]}/16 on_off_plan_rows={match["on_off_rows"]}/16 '
+          f'prebarrier_us={durations["owner_to_barrier"]:.2f} '
+          + ' '.join(f'{k}={v:.2f}' for k, v in parts.items())
+          + f' barrier_wait_us={durations["barrier"]:.2f}')
+
+
 def describe(path):
     data = json.loads(path.read_text())
     g = int(data['group'])
@@ -155,6 +185,15 @@ def describe(path):
                 by_q[b%4][label].append(v)
             measured.append(durations)
         slow = max(range(64), key=lambda b: measured[b]['owner_to_barrier'])
+        # SyncAll returns only after all 64 owners have arrived. The recorded
+        # wait bounds how much earlier this owner could have entered than the
+        # last arrival. This argument needs no cross-AIV timestamp subtraction.
+        near_last = min(range(64), key=lambda b: measured[b]['barrier'])
+        if slow == near_last:
+            print_owner_path(g, s, slow, measured[slow], 'longest_work+shortest_barrier')
+        else:
+            print_owner_path(g, s, slow, measured[slow], 'longest_work')
+            print_owner_path(g, s, near_last, measured[near_last], 'shortest_barrier')
         for k, v in measured[slow].items():
             longest[k].append(v)
         max_local.append(f'r{slow//4}Q{slow%4+1}@{measured[slow]["owner_to_barrier"]:.2f}')

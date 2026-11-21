@@ -307,6 +307,9 @@ fi
 if [[ -n "$ranked" ]]; then
     printf '%s\n' "$peer_physical_npu" >"$out/physical_npu.txt"
 fi
+if "$owner_tail"; then
+    python3 -B "$tools/support/cutoff_tail_archive.py" "$KVIP_Q4_TAIL_REFERENCE" "$out/archive-calls.json" | tee "$out/archive-tail.txt"
+fi
 if "$query_owner"; then
     if [[ $plan_candidate == logical-ties && -x /usr/local/python3.12.13/bin/python3 ]]; then
         export PATH="/usr/local/python3.12.13/bin:$PATH"
@@ -793,7 +796,7 @@ if [[ -n "$ranked" ]]; then
         order=("${order[@]:1}" "${order[0]}")
     done
     if "$owner_tail"; then
-        entries=(summary.txt owner-tail-reference.txt logical-ties.txt physical_npu.txt)
+        entries=(summary.txt archive-tail.txt archive-calls.json owner-tail-reference.txt logical-ties.txt physical_npu.txt)
         for group in "${groups[@]}"; do entries+=("g$group/owner_tail.json"); done
         tar -C "$out" -czhf "$out/owner-tail.tar.gz" "${entries[@]}"
         printf 'RETURN_FILE=%s/owner-tail.tar.gz\n' "$out"

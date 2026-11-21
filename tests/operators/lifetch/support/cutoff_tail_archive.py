@@ -162,7 +162,7 @@ def plan_spread(group, receipts, rows):
             f'fast_call={low["call"]}@{low["tail"]:.2f} slow_call={high["call"]}@{high["tail"]:.2f}')
 
 
-def report(root):
+def report(root, details=None):
     if ((root / 'physical_npu.txt').read_text().strip() != '4'
             or (root / 'logical-ties.txt').read_text().strip() != REVISION):
         raise ValueError('Expected physical NPU4 and logical-ties ' + REVISION)
@@ -170,6 +170,7 @@ def report(root):
               'Q_COUNTS mean/P50/P95/max across 20 calls; each Q sums 16 rows. '
               'empty_rows=rows with zero final posts; crossQ_dups=unique IDs also selected by earlier Qs. '
               'Call/Q are 1-based; R is 0-based.']
+    groups = {}
     for group in (17, 4, 10, 7):
         case = root / f'g{group}'
         matches = list((case / 'logical-ties/results').glob('*/cases/diagnose/fused/diagnose/round-1/full_attribution.json'))
@@ -200,13 +201,28 @@ def report(root):
         if archived.count(check) != 1 or archived.count(timing_line) != 1:
             raise ValueError(f'G{group}: li-summary.txt and attribution/correctness receipts disagree')
         output.extend([check, timing_line, *lines, plan_spread(group, out['layout_receipts'], rows)])
+        if details is not None:
+            calls = []
+            for row, sample, plans in zip(rows, archive['samples'], out['layout_receipts']):
+                calls.append(dict(call=row['call'], tail_us=row['tail'], li_us=row['li'],
+                                  invocation_span_us=row['span'], launch_gap_us=row['launch_gap'],
+                                  layout_receipts=plans, totals=sample['algorithm']['totals'],
+                                  requests=[dict(row=r['request'], prefetch=r['prefetch'], final=r['final'],
+                                                 queries=[[q['final_posted'], q['final_safe'], q['cross_q_duplicate']]
+                                                          for q in r['queries']])
+                                            for r in sample['algorithm']['requests']]))
+            groups[str(group)] = calls
+    if details is not None:
+        details.write_text(json.dumps(dict(native=REVISION, root=str(root), physical_npu=4,
+                                           query_columns=['final_posted','final_safe','cross_q_duplicate'],
+                                           groups=groups), separators=(',', ':')) + '\n')
     return output
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 2:
-        raise SystemExit('usage: python3 ' + Path(__file__).name + ' <archive-root>')
+    if len(sys.argv) not in (2, 3):
+        raise SystemExit('usage: python3 ' + Path(__file__).name + ' <archive-root> [compact-json-output]')
     try:
-        print('\n'.join(report(Path(sys.argv[1]))))
+        print('\n'.join(report(Path(sys.argv[1]), Path(sys.argv[2]) if len(sys.argv) == 3 else None)))
     except (ValueError, KeyError, OSError, TypeError) as e:
         raise SystemExit(f'ARCHIVE_ERROR {e}')
