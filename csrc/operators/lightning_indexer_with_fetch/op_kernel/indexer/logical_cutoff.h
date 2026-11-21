@@ -20,7 +20,16 @@ __simd_vf__ inline void MarkEqual(__ubuf__ uint16_t* scores, __ubuf__ uint32_t* 
     MaskReg even, odd, lo, hi, valid;
     RegTensor<uint16_t> value;
     RegTensor<int16_t> index;
-    for (uint16_t i = 0; i < count; i += 256) {
+    for (uint16_t i = 0; i + 256 <= count; i += 256) {
+        LoadAlign(value,scores+i);
+        CompareScalar<uint16_t, CMPMODE::EQ>(lo,value,cutoff,all);
+        LoadAlign(value,scores+i+128);
+        CompareScalar<uint16_t, CMPMODE::EQ>(hi,value,cutoff,all);
+        MaskDeInterleave<uint8_t>(even,odd,lo,hi);
+        StoreAlign(words+i/32,even);
+    }
+    if (count % 256) {
+        const uint16_t i=count/256*256;
         Arange(index, int16_t(i));
         CompareScalar<uint16_t, CMPMODE::LT>(valid, reinterpret_cast<RegTensor<uint16_t>&>(index), count, all);
         LoadAlign(value, scores + i);
