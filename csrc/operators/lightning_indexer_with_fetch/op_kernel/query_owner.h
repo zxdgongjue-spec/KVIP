@@ -272,6 +272,17 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(256) inline void Adapt(__gm__ Args *a, uint3
     asc_threadfence();
 }
 
+// Q1 exclusively consumes the row's even prefetch CQ. All four final Gets
+// have their own queue and private status, including Q1's odd queue.
+__aicore__ __attribute__((noinline)) inline uint32_t DrainOwnerPrefetch(
+        __gm__ Context *ctx, uint32_t b, __gm__ BatchFlag *flags) {
+    CompletePrefetch(ctx, b, true);
+    auto row = reinterpret_cast<__gm__ Row *>(ctx->rows) + b;
+    const uint32_t error = flags->error | row->error;
+    Signal(flags + 7, 0, error);
+    return error;
+}
+
 struct IndexTail {
     __gm__ Args *a;
     uint32_t b, q;
@@ -288,7 +299,8 @@ struct IndexTail {
         }
         ran = true;
         auto ctx = reinterpret_cast<__gm__ Context *>(a->context);
-        auto outputs = reinterpret_cast<__gm__ BatchFlag *>(a->flags) + b * kFlagCount + 1;
+        auto flags = reinterpret_cast<__gm__ BatchFlag *>(a->flags) + b * kFlagCount;
+        auto outputs = flags + 1;
         const bool validOutput = !s.error;
         if (q && validOutput) {
             WriteOutput();
@@ -361,6 +373,11 @@ struct IndexTail {
             // Q2/Q3 read the old mapping before their Index handoff; Q1 reads it afterwards.
             s.error |= AwaitPublication(outputs);
         }
+        if (q == 3 && s.safe >= s.count) {
+            // The safe Get was posted before this callback. Join the prefetch
+            // before committing the row, also when this query is empty or failed.
+            s.error |= AwaitPublication(flags + 7);
+        }
         if (!s.error) {
             if (q < 3 && !isDense && seen) {
                 BeforeStore();
@@ -392,6 +409,10 @@ struct IndexTail {
         Signal(outputs + q, s.count, s.error);
         if (q) {
             Signal(chain + q, s.count, s.error);
+        } else if (s.safe >= s.count) {
+            // Both Q1 handoffs are visible while its final Get and the other
+            // queries progress. Empty and failed Gets also execute this tail.
+            s.error |= DrainOwnerPrefetch(ctx, b, flags);
         }
     }
 };
@@ -401,13 +422,6 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args *a, uint32_t b,
     const uint32_t batch = ctx->shape.batch;
     auto flags = reinterpret_cast<__gm__ BatchFlag *>(a->flags) + b * kFlagCount;
     auto row = reinterpret_cast<__gm__ Row *>(ctx->rows) + b;
-    // The spare odd prefetch status is separate from every private final Get status.
-    if (q == 3) {
-        // Q1 publishes row->addresses in the same cache line that the CQ owner cleans.
-        auto error = AwaitPublication(flags);
-        CompletePrefetch(ctx, b, true);
-        Signal(flags + 7, 0, error | row->error);
-    }
     Slice s = Resolve(a, b, q);
     // The next allocator needs the slots and captured descriptor addresses;
     // this query alone owns its subsequent SQ post and CQ.
@@ -418,7 +432,9 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args *a, uint32_t b,
     auto post = FinalPostAt(ctx->shape.finalPostOffset, ctx, b * 4 + q);
     PrepareFinalFetch(4, ctx->shape.finalPostOffset, ctx, b, q, s.count, first, s.error, s.safe);
     if (s.safe < s.count) {
-        s.error |= AwaitPublication(flags + 7);
+        // Conflicting writes must follow prefetch completion. Q1 is the
+        // consumer, so it drains here instead of waiting on its own flag.
+        s.error |= q ? AwaitPublication(flags + 7) : DrainOwnerPrefetch(ctx, b, flags);
     }
     const uint32_t view = FinalQueue(batch, 4, b, q);
     auto native = GetArgs(ctx, view);

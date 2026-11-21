@@ -1176,8 +1176,11 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
 #else
  if constexpr(!QueryOwner)CompletePrefetch(ctx,b,true,profile?&polls:nullptr,profile?&drain:nullptr,profile?&arrival:nullptr);
 #endif
- if(profile){ft[4]=GetSystemCycle();ft[5]=polls;ft[6]=drain;ft[7]=arrival;}error|=row->error;flags[7].error=error;flags[7].ready=1;
- kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+7),kBatchFlagPayloadBytes);
+ if(profile){ft[4]=GetSystemCycle();ft[5]=polls;ft[6]=drain;ft[7]=arrival;}error|=row->error;
+ if constexpr(!QueryOwner){
+  flags[7].error=error;flags[7].ready=1;
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+7),kBatchFlagPayloadBytes);
+ }
 #if !V9_UBMEM
  if constexpr(Team)index_team::Copy(a,GetBlockIdx(),shape.batch);
 #endif
