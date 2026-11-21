@@ -1050,16 +1050,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
 
         AscendC::DataCopyPadExtParams<SCORE_T> padParams{true, 0, 0, 0};
 #if !V9_UBMEM
-        // For the BS16 fixed-route comparison, break final cutoff ties by
-        // physical position. The existing trunk merge visits the old prefix
-        // before the next consecutive trunk and gathers equal keys in order.
-        // Speculative windows may still consume whichever tiles are ready.
-        const bool orderedFinal = !prefixActive_ && rotationContext_ && runtimeShape_.batch == 16;
-        if (orderedFinal && runtimeShape_.rounds) {
-            const uint32_t query = info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx;
-            while (!PreviousServiceReady(runtimeShape_.rounds, (query / SIM_Q) % runtimeShape_.serviceLanes)) {}
-        }
-        if (!orderedFinal && !prefixActive_ && validS2Len >= runtimeShape_.resident &&
+        if (!prefixActive_ && validS2Len >= runtimeShape_.resident &&
             (uint64_t(validS2Len)+127U)/128U*128U <= runtimeShape_.history) {
             FinalIncremental(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, validS2Len);
         } else if (validS2Len >= topkCount_) {
