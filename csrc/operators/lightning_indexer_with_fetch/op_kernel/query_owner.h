@@ -48,18 +48,15 @@ __aicore__ inline __gm__ uint32_t *Scratch(__gm__ Args *a, uint32_t b) {
 
 #include "offset_resolver.h"
 
-// Emit only rows consuming this query, including unpack fanout and masked rows.
-// The physical-to-logical table stays immutable until all four outputs are saved.
-__simt_vf__ __aicore__ LAUNCH_BOUND(256) inline void Adapt(__gm__ Args *a, uint32_t b, uint32_t q) {
+// Slot assignment becomes final in Resolve. Logical IDs were already emitted by LI.
+__simt_vf__ __aicore__ LAUNCH_BOUND(256) inline void AdaptSlots(__gm__ Args *a, uint32_t b, uint32_t q) {
     auto ctx = reinterpret_cast<__gm__ Context *>(a->context);
     auto u = reinterpret_cast<__gm__ uint64_t *>(a->updateBindings);
     if (!u[20] || !u[21] || !u[22] || !u[23]) {
         return;
     }
     auto packed = reinterpret_cast<__gm__ int64_t *>(u[20]), valid = reinterpret_cast<__gm__ int64_t *>(u[21]);
-    auto ids = reinterpret_cast<__gm__ uint32_t *>(ctx->selected) + (4 * b + q) * kTop;
     auto loc = reinterpret_cast<__gm__ uint32_t *>(ctx->locations) + (4 * b + q) * kTop;
-    auto logical = reinterpret_cast<__gm__ int64_t *>(u[3]) + uint64_t(OwnerRow(ctx, b)) * u[24];
     // One coalesced ballot per 32 output rows. Support repeated unpack
     // indices and inactive rows with the same semantics as the ordinary output worker.
     for (uint32_t base = 0; base < ctx->shape.batch * 4; base += 32) {
@@ -70,12 +67,9 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(256) inline void Adapt(__gm__ Args *a, uint3
         while (targets) {
             const uint32_t bit = __builtin_ctz(targets);
             const uint32_t offset = (base + bit) * kTop;
-            auto out = reinterpret_cast<__gm__ uint32_t *>(u[22]) + offset;
             auto slot = reinterpret_cast<__gm__ uint32_t *>(u[23]) + offset;
             const bool copy = (activeMask >> bit) & 1U;
             for (uint32_t i = threadIdx.x; i < kTop; i += 256) {
-                uint32_t index = copy ? asc_ldcg(ids + i) : UINT32_MAX;
-                asc_stcg(out + i, index < a->history ? uint32_t(asc_ldcg(logical + index)) : UINT32_MAX);
                 asc_stcg(slot + i, copy ? asc_ldcg(loc + i) : UINT32_MAX);
             }
             targets &= targets - 1;
@@ -85,7 +79,6 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(256) inline void Adapt(__gm__ Args *a, uint3
 }
 
 // Unique cold sources and exclusive hot destinations form disjoint swaps.
-// All owners must finish reading the old logical layout before these writes.
 __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void SwapDisjoint(__gm__ Args *a, uint32_t b, uint32_t begin,
                                                                   uint32_t count) {
     auto ctx = reinterpret_cast<__gm__ Context *>(a->context);
@@ -117,6 +110,18 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void SwapDisjoint(__gm__ Args *a
     asc_threadfence();
 }
 
+#include "query_owner_rows.h"
+
+__aicore__ inline void PublishIndexCompletion(__gm__ BatchFlag *chain, uint32_t q, Slice &slice) {
+    Signal(chain + q, slice.count, slice.error);
+    // The final owner joins Index completion before retiring the request.
+    if (q == 3) {
+        for (uint32_t j = 0; j < q; ++j) {
+            slice.error |= AwaitPublication(chain + j);
+        }
+    }
+}
+
 struct IndexTail {
     __gm__ Args *a;
     uint32_t b, q;
@@ -129,52 +134,51 @@ struct IndexTail {
         }
         ran = true;
         auto ctx = reinterpret_cast<__gm__ Context *>(a->context);
-        // Read the pre-update logical mapping in parallel across the four
-        // owners before publishing that it is safe to change metadata.
+        // LI already saved the old logical IDs and DDR addresses. Each owner
+        // can publish its final slots without reading another owner's Index.
         if (!s.error) {
-            Simt::VF_CALL<Adapt>(Simt::Dim3{256, 1, 1}, a, b, q);
+            Simt::VF_CALL<AdaptSlots>(Simt::Dim3{256, 1, 1}, a, b, q);
             VectorDone();
         }
         auto chain = index_team::Control(a, b);
         auto outputs = reinterpret_cast<__gm__ BatchFlag *>(a->flags) + b * kFlagCount + 1;
-        outputs[q].reserved[0] = uint32_t(s.disjoint);
-        Signal(outputs + q, s.count, s.error);
-        bool independent = s.disjoint;
-        for (uint32_t j = 0; j < 4; ++j) {
-            if (j == q)
-                continue;
-            s.error |= AwaitPublication(outputs + j);
-            independent = independent && outputs[j].reserved[0] != 0;
-        }
         auto row = reinterpret_cast<__gm__ Row *>(ctx->rows) + b;
-        s.disjoint = independent;
-        if (independent && !s.error) {
-            if (!q && row->slots)
+        if (s.disjoint) {
+            outputs[q].reserved[kOwnerPlanFirst] = 0;
+            outputs[q].reserved[kOwnerPlanEnd] = 0;
+            outputs[q].reserved[kOwnerPlanEdges] = 0;
+            Signal(outputs + q, s.count, s.error);
+            if (!s.error && !q && row->slots) {
                 Simt::VF_CALL<SwapDisjoint>(Simt::Dim3{512, 1, 1}, a, b, 0, row->slots);
-            if (s.count)
+            }
+            if (!s.error && s.count) {
                 Simt::VF_CALL<SwapDisjoint>(Simt::Dim3{512, 1, 1}, a, b, kPrefetch + s.begin, s.count);
+            }
             VectorDone();
-            Signal(chain + q, s.count, 0);
-            if (q == 3)
-                for (uint32_t j = 0; j < 3; ++j)
-                    s.error |= AwaitPublication(chain + j);
+            PublishIndexCompletion(chain, q, s);
             return;
         }
-        if (q)
-            s.error |= AwaitPublication(chain + q - 1);
-        // No swaps to apply and no final metadata commit on a middle owner.
-        // Its successor can consume the very same saved permutation.
-        if ((q == 1 || q == 2) && !s.count) {
-            Signal(chain + q, 0, s.error);
+        // Only the permutation planner consumes its predecessor's map.
+        // The next query may plan while this query copies the rows.
+        uint32_t first = 0, edges = 0;
+        if (q && !s.error) {
+            auto predecessor = outputs + q - 1;
+            s.error |= AwaitPublication(predecessor);
+            if (!s.error) {
+                first = predecessor->reserved[kOwnerPlanEnd];
+                edges = predecessor->reserved[kOwnerPlanEdges];
+            }
+        }
+        if (s.error) {
+            outputs[q].reserved[kOwnerPlanFirst] = 0;
+            outputs[q].reserved[kOwnerPlanEnd] = 0;
+            outputs[q].reserved[kOwnerPlanEdges] = 0;
+            Signal(outputs + q, s.count, s.error);
+            PublishIndexCompletion(chain, q, s);
             return;
         }
         auto saved = Scratch(a, b) + kOwnerResolverWords;
         auto dense = reinterpret_cast<__gm__ uint32_t *>(a->denseShadow) + uint64_t(b) * a->history * 6;
-        auto u = reinterpret_cast<__gm__ uint64_t *>(a->updateBindings);
-        uint32_t owner = ctx->rowOwners ? reinterpret_cast<__gm__ uint32_t *>(ctx->rowOwners)[b] : b;
-        auto keys = reinterpret_cast<__gm__ uint64_t *>(a->keys) + uint64_t(owner) * a->history * 16;
-        auto scales = reinterpret_cast<__gm__ uint32_t *>(a->scales) + uint64_t(owner) * a->history;
-        auto valid = reinterpret_cast<__gm__ uint32_t *>(a->valid) + uint64_t(owner) * a->resident;
         auto src = reinterpret_cast<__gm__ uint32_t *>(a->eventsSrc) + b * a->maxEvents;
         auto dst = reinterpret_cast<__gm__ uint32_t *>(a->eventsDst) + b * a->maxEvents;
         TPipe pipe;
@@ -184,7 +188,7 @@ struct IndexTail {
         auto m = FinalPtr(mem);
         const uint32_t prior = q ? row->slots + s.begin : 0;
         bool isDense = q && prior * 2 >= MAP * 3 / 4;
-        if (!s.error && !isDense) {
+        if (!isDense) {
             if (!prior) {
                 Simt::VF_CALL<InitShadow>(Simt::Dim3{THREADS, 1, 1}, m);
                 VectorDone();
@@ -197,6 +201,14 @@ struct IndexTail {
             Duplicate(mem[CONTROL], 0U, 32);
             VectorDone();
         }
+        auto plan = index_team::Moves(a, b);
+        auto moves = reinterpret_cast<__gm__ uint64_t *>(plan);
+        auto deps = Scratch(a, b) + kEdgeDeps;
+        auto completed = reinterpret_cast<__gm__ BatchFlag *>(Scratch(a, b) + kChunkFlags);
+        auto last = LastWriters(a, ctx->shape.batch, b);
+        mem.SetValue(CONTROL + 4, first);
+        mem.SetValue(CONTROL + 5, edges);
+        PipeBarrier<PIPE_ALL>();
         uint32_t seen = prior;
         for (uint32_t part = q ? 1 : 0; part < 2 && !s.error; ++part) {
             uint32_t n = part ? s.count : row->slots, begin = part ? kPrefetch + s.begin : 0;
@@ -209,39 +221,39 @@ struct IndexTail {
                 isDense = true;
             }
             if (isDense) {
-                Simt::VF_CALL<ApplyDenseBatch<false>>(Simt::Dim3{THREADS, 1, 1}, src, dst, begin, n, keys, scales,
-                                                      valid, a->resident, dense, a->history, m, nullptr, nullptr,
-                                                      nullptr);
+                Simt::VF_CALL<ApplyDenseBatch<false, true>>(Simt::Dim3{THREADS, 1, 1}, src, dst, begin, n, nullptr,
+                    nullptr, nullptr, a->resident, dense, a->history, m, nullptr, nullptr, moves);
             } else {
-                Simt::VF_CALL<ApplyBatch<false>>(Simt::Dim3{THREADS, 1, 1}, src, dst, begin, n, keys, scales,
-                                                 valid, a->resident, m, nullptr, nullptr, nullptr, a->history);
+                Simt::VF_CALL<ApplyBatch<false, true>>(Simt::Dim3{THREADS, 1, 1}, src, dst, begin, n, nullptr,
+                    nullptr, nullptr, a->resident, m, nullptr, nullptr, moves, a->history);
             }
             VectorDone();
             s.error |= mem.GetValue(CONTROL);
             seen += n;
         }
+        if (!s.error && q < 3 && !isDense && seen) {
+            BeforeStore();
+            ToGm(saved, mem, 4 * MAP);
+            ToGm(saved + 4 * MAP, mem[CONTROL], 32);
+            StoreDone();
+        }
+        uint32_t end = s.error ? first : mem.GetValue(CONTROL + 4);
+        if (!s.error && end > first) {
+            Simt::VF_CALL<StampDependencies>(Simt::Dim3{512, 1, 1}, plan, deps, last, first, end);
+            VectorDone();
+        }
         if (!s.error) {
-            if (q < 3 && !isDense && seen) {
-                BeforeStore();
-                ToGm(saved, mem, 4 * MAP);
-                ToGm(saved + 4 * MAP, mem[CONTROL], 32);
-                StoreDone();
-            }
-            if (q == 3 && seen) {
-                auto addr = reinterpret_cast<__gm__ uint64_t *>(a->addresses) + uint64_t(owner) * u[7];
-                auto logical = reinterpret_cast<__gm__ uint64_t *>(a->logical) + uint64_t(owner) * a->history;
-                if (isDense) {
-                    Simt::VF_CALL<CommitDenseMetadata>(Simt::Dim3{THREADS, 1, 1}, addr, logical, dense,
-                                                       reinterpret_cast<__gm__ uint64_t *>(dense + 2 * a->history),
-                                                       a->history);
-                } else {
-                    Simt::VF_CALL<CommitMetadata>(Simt::Dim3{THREADS, 1, 1}, addr, logical, m);
-                }
-                VectorDone();
-            }
+            edges = mem.GetValue(CONTROL + 5);
         }
         pipe.Destroy();
-        Signal(chain + q, s.count, s.error);
+        outputs[q].reserved[kOwnerPlanFirst] = first;
+        outputs[q].reserved[kOwnerPlanEnd] = end;
+        outputs[q].reserved[kOwnerPlanEdges] = edges;
+        Signal(outputs + q, s.count, s.error);
+        if (end > first) {
+            s.error |= CopyChunks(a,b,first,end,plan,deps,completed);
+        }
+        PublishIndexCompletion(chain, q, s);
     }
 };
 

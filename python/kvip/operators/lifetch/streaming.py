@@ -80,7 +80,10 @@ class StreamingLIFetchForward:
         self.times = allocate("times", (b * 256 + blocks * 32 + self.index_team_cores * 8,), torch.int64, True)
         self.query_bitmaps = allocate("query_bitmaps", (b, 4, (self.resident + 31) // 32), torch.int32)
         self.query_errors = allocate("query_errors", (b, 4, 32), torch.int32, True)
-        self.dense_shadow = allocate("dense_shadow", (b, 3 * self.history), torch.int64)
+        # Row-owner replay appends a physical-row writer directory for aliasing batches.
+        query_owned = b == 16 and self.index_team_cores == 64
+        shadow_words = (7 if query_owned else 6) * self.history
+        self.dense_shadow = allocate("dense_shadow", (b, (shadow_words + 1) // 2), torch.int64, query_owned)
         self.packed_fetch = allocate(
             "packed_fetch", (4 * q_workers, 9 * b * 2048 + ((3 * b + 31) // 32) * 32 + 64), torch.int32
         )
@@ -114,7 +117,7 @@ class StreamingLIFetchForward:
             direct = self.packed_fetch.view(-1)[groups * (3 * stride + metadata):].view(groups, -1)
             direct[:, -64:].zero_()
         owner_scratch = 0
-        if b == 16 and self.index_team_cores == 64:
+        if query_owned:
             row_bytes = rotating.library.kvip_query_owner_row_bytes
             row_bytes.argtypes, row_bytes.restype = [], ctypes.c_uint32
             self.query_owner_scratch = allocate("query_owner_scratch", (b, row_bytes()), torch.uint8, True)

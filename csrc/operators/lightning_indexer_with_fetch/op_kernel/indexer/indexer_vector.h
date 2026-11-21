@@ -2,6 +2,9 @@
 #if KVIP_STREAMING_LI
 #include "pipeline_types.h"
 #include "staged_topk_classify.h"
+#if !V9_UBMEM
+#include "query_owner_inputs.h"
+#endif
 #endif
 /**
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
@@ -794,6 +797,14 @@ __aicore__ inline void QLIVector<QLIT>::BeginFinalMetadata(uint32_t query)
     streamingPrefetched_=true;
 }
 
+__aicore__ inline void PublishClassificationError(__gm__ uint32_t *header, uint32_t error)
+{
+    header[0] = error;
+    header[1] = 0;
+    header[2] = 0;
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(header), 128);
+}
+
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
 {
@@ -804,7 +815,7 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     uint32_t b=query/SIM_Q;
     if (b>=runtimeShape_.batch || runtimeShape_.resident>131072 ||
         !a->queryBitmaps || !a->queryErrors || !ctx->mapping || !ctx->lruSlots) {
-        if (errors && b<runtimeShape_.batch) { errors[query*32]=1; kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128); }
+        if (errors && b < runtimeShape_.batch) PublishClassificationError(errors + query * 32, 1);
         return;
     }
     bool profile=(a->prefetchCount & 0x80000000U)!=0;
@@ -821,7 +832,8 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
                 kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(events+i),64);
                 if(events[i].complete)break;
                 if(GetSystemCycle()-started>5000000000ULL) {
-                    errors[query*32]=2;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);return;
+                    PublishClassificationError(errors + query * 32, 2);
+                    return;
                 }
             }
         }
@@ -841,7 +853,10 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
         uint32_t bytes=2*CeilDiv(constInfo_.mBaseSize,2)*s2BaseSize_*sizeof(QK_T);
         uint32_t mergeBytes=(topkCountAlign256_+trunkLen_)*sizeof(SCORE_T);
         if(bytes<8192*sizeof(uint32_t) || mergeBytes<8192*sizeof(uint32_t)) chunkSize=4096;
-        if(bytes<chunkSize*sizeof(uint32_t) || mergeBytes<chunkSize*sizeof(uint32_t)) {errors[query*32]=4;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);return;}
+        if (bytes < chunkSize * sizeof(uint32_t) || mergeBytes < chunkSize * sizeof(uint32_t)) {
+            PublishClassificationError(errors + query * 32, 4);
+            return;
+        }
         valid=resMm1UB_.template ReinterpretCast<uint32_t>();
         reserved=mrgValueLocal_.template ReinterpretCast<uint32_t>();
         result=topkSharedTmpLocal_;bitmap=topkSharedTmpLocal_[2048];
@@ -937,6 +952,18 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     const uint32_t wordsForMerge=(runtimeShape_.resident+31)/32;
     const uint32_t shardLimitForMerge=wideBitmap ? 16 : 8;
     const uint32_t shardsForMerge=bitmapWords/wordsForMerge<shardLimitForMerge?bitmapWords/wordsForMerge:shardLimitForMerge;
+    if (a->queryOwnerScratch) {
+        // Snapshot exactly the DDR values the resolver would read after LI.
+        uint64_t addresses = 0;
+        if (ctx->fallbackAddresses) {
+            addresses = ctx->rowAddressBase ? rotating::RequestAddressTable(ctx, b, owner, a->history) : row->addresses;
+        }
+        Simt::VF_CALL<rotating::SaveOldQueryInputs>(
+            Simt::Dim3{256, 1, 1}, a, ctx, query, reinterpret_cast<__gm__ uint64_t *>(addresses),
+            reinterpret_cast<__ubuf__ uint32_t *>(indicesOutLocal_.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t *>(result.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t *>(bitmap[bitmapWords + 2].GetPhyAddr()));
+    }
     Simt::VF_CALL<rotating::MergeClassifyBitmapFlex>(Simt::Dim3{512,1,1},reinterpret_cast<__ubuf__ uint32_t*>(bitmap.GetPhyAddr()),runtimeShape_.resident,shardsForMerge,
         reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(result.GetPhyAddr()),
         ctx->sourceBlocks && ctx->reservedHot && wordsForMerge+16<=bitmapWords?
@@ -953,6 +980,9 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     DataCopy(output,result,2048);DataCopy(bits,bitmap,(runtimeShape_.resident+31)/32);
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+#if !V9_UBMEM
+    if (a->queryOwnerScratch) errors[query * 32 + pipeline_ab::kQueryAliasWord] = bitmap.GetValue(bitmapWords + 2);
+#endif
     errors[query*32+1]=bitmap.GetValue(bitmapWords+1);errors[query*32]=bitmap.GetValue(bitmapWords);kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(errors+query*32),128);
     if(profile){liTicks[7]=GetSystemCycle();liTicks[8]=overlapSecond?1:0;liTicks[9]=streamingTopkOnly_?1:0;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(liTicks),128);}

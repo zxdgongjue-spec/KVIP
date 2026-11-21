@@ -48,10 +48,9 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void EmitOffsetPlan(
     __ubuf__ uint32_t *ids, __ubuf__ uint32_t *positions, __ubuf__ uint32_t *rank, __ubuf__ uint32_t *slots,
     __ubuf__ uint32_t *ctl) {
     uint32_t t = threadIdx.x, group = (4 * b + q) * kTop, base = OwnerRow(ctx, b) * OutputStride(a->resident, ctx);
-    auto row = reinterpret_cast<__gm__ Row *>(ctx->rows) + b;
-    auto addr = reinterpret_cast<__gm__ uint64_t *>(row->addresses);
+    auto scratch = reinterpret_cast<__gm__ uint32_t *>(a->queryOwnerScratch) + b * kQueryOwnerRowWords;
+    auto oldAddresses = reinterpret_cast<__gm__ uint64_t *>(scratch + kOldAddresses) + q * kTop;
     auto inv = reinterpret_cast<__gm__ int32_t *>(ctx->reservedHot) + b * a->resident;
-    auto mapping = reinterpret_cast<__gm__ uint32_t *>(ctx->mapping) + uint64_t(b) * a->history;
     auto changes = reinterpret_cast<__gm__ uint32_t *>(ctx->changes) + b * kChangeCapacity;
     auto changeSlots = reinterpret_cast<__gm__ uint32_t *>(ctx->changeSlots) + b * kChangeCapacity;
     auto events = reinterpret_cast<__gm__ uint32_t *>(a->eventsSrc) + b * a->maxEvents;
@@ -74,12 +73,11 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void EmitOffsetPlan(
         asc_stcg(changeSlots + record, slot);
         asc_stcg(events + kPrefetch + order, token);
         asc_stcg(dest + kPrefetch + order, slot);
-        StoreFallbackSource(a->history, ctx->shape.tokenBytes, ctx, b, out, token, asc_ldcg(addr + token),
+        uint64_t remote = ctx->fallbackAddresses ? asc_ldcg(oldAddresses + positions[i - begin]) : 0;
+        StoreFallbackSource(a->history, ctx->shape.tokenBytes, ctx, b, out, token, remote,
                             reinterpret_cast<__gm__ int32_t *>(ctx->sourceBlocks),
                             reinterpret_cast<__gm__ int32_t *>(ctx->sourceOffsets));
         asc_stcg(reinterpret_cast<__gm__ int32_t *>(ctx->destinations) + out, int32_t(base + slot));
-        if (token < a->resident || asc_ldcg(mapping + token) != UINT32_MAX)
-            asc_atomic_or(ctl + 6, 1U);
     }
     if (!t) {
         if (q == 3)
@@ -131,11 +129,13 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
     auto headers = reinterpret_cast<__gm__ uint32_t *>(a->queryErrors) + (4 * b + q) * 32;
     uint32_t used = row->slots;
     Slice s;
+    uint32_t possibleAlias = 0;
     s.error = used > kLruSlots ? 4U : 0U;
     for (uint32_t j = 0; j < 4; ++j) {
         auto hdr = reinterpret_cast<__gm__ uint32_t *>(a->queryErrors) + (4 * b + j) * 32;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(hdr), 64);
         s.error |= hdr[0];
+        possibleAlias |= hdr[kQueryAliasWord];
     }
     auto lru = reinterpret_cast<__gm__ uint32_t *>(ctx->lruSlots) + b * kLruSlots;
     TPipe pipe;
@@ -169,10 +169,13 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
         flags->reserved[0] = check;
         Signal(flags, used, s.error);
     }
-    Simt::VF_CALL<GatherMisses>(Simt::Dim3{512, 1, 1}, ctx, 4 * b + q, headers[1], FinalPtr(table[q * kTop]),
-                                FinalPtr(positions), ptr);
-    VectorDone();
-    uint32_t own = ctl.GetValue(0);
+    uint32_t own = 0;
+    if (!s.error) {
+        Simt::VF_CALL<GatherMisses>(Simt::Dim3{512, 1, 1}, ctx, 4 * b + q, headers[1], FinalPtr(table[q * kTop]),
+                                    FinalPtr(positions), ptr);
+        VectorDone();
+        own = ctl.GetValue(0);
+    }
     if (q < 3 || a->resident < kSlots + kLruSlots) {
         BeforeStore();
         ToGm(lists + q * kTop, table[q * kTop], own);
@@ -224,10 +227,10 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
             s.begin = ctl.GetValue(2);
             s.count = ctl.GetValue(3) - s.begin;
             s.safe = s.count;
-            s.disjoint = ctl.GetValue(6) == 0 && flags->reserved[0] == 0;
             s.escape = ctl.GetValue(5) != 0;
         }
     }
+    s.disjoint = possibleAlias == 0 && flags->reserved[0] == 0;
     pipe.Destroy();
     return s;
 }

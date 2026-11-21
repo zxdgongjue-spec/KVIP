@@ -1365,8 +1365,21 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
   if(team && a->queryOwnerScratch){
    query_owner::Run(a,block/4,block%4);
    AscendC::SyncAll<true>();
-   // After the existing all-AIV join, no reader can observe a next-round list.
-   auto listFlag=reinterpret_cast<__gm__ BatchFlag*>(query_owner::Scratch(a,block/4)+query_owner::kListFlags)+block%4;
+   // All readers have left. Retire only the chunks this owner published.
+   uint32_t b = block / 4, q = block % 4;
+   auto scratch = query_owner::Scratch(a, b);
+   auto receipt = reinterpret_cast<__gm__ BatchFlag *>(a->flags) + b * kFlagCount + 1 + q;
+   auto chunkFlags = reinterpret_cast<__gm__ BatchFlag *>(scratch + kChunkFlags);
+   uint32_t first = receipt->reserved[kOwnerPlanFirst], end = receipt->reserved[kOwnerPlanEnd];
+   if (end > first) {
+    Simt::VF_CALL<query_owner::RetireWriters>(Simt::Dim3{512, 1, 1}, a, b, first, end);
+    query_owner::VectorDone();
+    for (uint32_t i = first; i < end; ++i) {
+     chunkFlags[i].ready = 0;
+     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(chunkFlags + i), sizeof(BatchFlag));
+    }
+   }
+   auto listFlag = reinterpret_cast<__gm__ BatchFlag *>(scratch + query_owner::kListFlags) + q;
    listFlag->ready=0;
    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(listFlag),sizeof(BatchFlag));
    if(block<shape.batch)Simt::VF_CALL<RetireRoundControl>(Simt::Dim3{128,1,1},a,shape.batch,workers,block);
