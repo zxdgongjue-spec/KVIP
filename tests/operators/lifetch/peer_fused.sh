@@ -75,13 +75,13 @@ if [[ ${1:-} == --ranked-help || ${1:-} == --ranked-joint ]]; then
     elif [[ -n "$joint_reference" ]]; then
         echo '--previous requires --ranked-joint' >&2; exit 2
     fi
-elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-packets || ${1:-} == --short-lru || ${1:-} == --owner-pack || ${1:-} == --li-restore ]]; then
+elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-packets || ${1:-} == --short-lru || ${1:-} == --owner-pack || ${1:-} == --li-restore || ${1:-} == --logical-ties ]]; then
     [[ $# -ge 2 && $2 =~ ^[0-9a-f]{40}$ ]] || { echo "Usage: peer_fused.sh $1 NATIVE_SHA [GROUP ...]" >&2; exit 2; }
     query_owner=true
     offset_resolver=true
     ranked_sha=f8b185e3d042a18b24fe695c0a49a7d969ca487d
     fixed_order_rev=7b60f0dddab91a4b154043e78088842d7856cba6
-    if [[ $1 == --short-lru || $1 == --owner-pack || $1 == --li-restore ]]; then
+    if [[ $1 == --short-lru || $1 == --owner-pack || $1 == --li-restore || $1 == --logical-ties ]]; then
         candidate_only=true
         offset_resolver=false
         plan_candidate=${1#--}
@@ -89,6 +89,10 @@ elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-pa
         if [[ $plan_candidate == li-restore ]]; then
             ranked_sha=36d92c3e663e5164af54e7761187f3204e76fe05
             export KVIP_Q4_LI_RESTORE=1
+        fi
+        if [[ $plan_candidate == logical-ties ]]; then
+            ranked_sha=9518e6f015d5af26d0ce5d1b474a840cd787a4e8
+            export KVIP_Q4_LI_RESTORE=1 KVIP_Q4_LOGICAL_TIES=1
         fi
         [[ $2 != "$ranked_sha" ]] || { echo "Supply a $plan_candidate candidate based on $ranked_sha" >&2; exit 2; }
     elif [[ $1 != --offset-resolver ]]; then
@@ -108,7 +112,7 @@ elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-pa
     export PEER_LOCAL_ONLY=1
     shift 2
     offset_groups=(7 2 10 17 4)
-    if [[ $plan_candidate == owner-pack || $plan_candidate == li-restore ]]; then
+    if [[ $plan_candidate == owner-pack || $plan_candidate == li-restore || $plan_candidate == logical-ties ]]; then
         offset_groups=(7 10 17 4)
     elif "$candidate_only"; then
         offset_groups=(10 7 2)
@@ -129,7 +133,7 @@ elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-pa
     fi
     if (($#)); then
         allowed_groups=(7 2 10 17 4)
-        if [[ $plan_candidate == owner-pack || $plan_candidate == li-restore ]]; then allowed_groups=("${offset_groups[@]}"); fi
+        if [[ $plan_candidate == owner-pack || $plan_candidate == li-restore || $plan_candidate == logical-ties ]]; then allowed_groups=("${offset_groups[@]}"); fi
         offset_groups=()
         for group in "$@"; do
             [[ " ${allowed_groups[*]} " == *" $group "* && $group =~ ^[0-9]+$ ]] || {
@@ -285,6 +289,9 @@ if [[ -n "$ranked" ]]; then
     printf '%s\n' "$peer_physical_npu" >"$out/physical_npu.txt"
 fi
 if "$query_owner"; then
+    if [[ $plan_candidate == logical-ties && -x /usr/local/python3.12.13/bin/python3 ]]; then
+        export PATH="/usr/local/python3.12.13/bin:$PATH"
+    fi
     if [[ -x "$area/python-${serial_revision:0:8}/bin/python3" ]]; then
         export PATH="$area/python-${serial_revision:0:8}/bin:$PATH"
     fi
@@ -458,10 +465,15 @@ if "$query_owner"; then
     if "$row_deps"; then
         allowed+=(':(exclude)csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_vector.h')
     fi
-    git -C "$ranked_candidate" diff --exit-code --quiet "$indexer_revision" HEAD -- \
-        csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer \
-        csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer.cpp \
-        csrc/operators/common/lifetch "${allowed[@]}"
+    if [[ $plan_candidate == logical-ties ]]; then
+        git -C "$ranked_candidate" diff --exit-code --quiet "$ranked_sha" HEAD -- . \
+            ':(exclude)csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/**'
+    else
+        git -C "$ranked_candidate" diff --exit-code --quiet "$indexer_revision" HEAD -- \
+            csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer \
+            csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer.cpp \
+            csrc/operators/common/lifetch "${allowed[@]}"
+    fi
 fi
 if [[ -n "$ranked" ]]; then
     printf 'CONFIG URMA physical_NPU=%s logical_device=0 BS16 Q4 656B ranked=%.8s candidate=%.8s KVAF=%.8s\n' "$peer_physical_npu" "$ranked_sha" "$ranked" "$transport"
@@ -548,7 +560,7 @@ run_arm() (
             source_root=$ranked_candidate
             if [[ $label == "$plan_control" ]]; then source_root=$ranked_base; fi
             mode=(--fused-only --production-root "$source_root") ;;
-        local|short-lru|owner-pack|li-restore) mode=(--fused-only --production-root "$ranked_candidate") ;;
+        local|short-lru|owner-pack|li-restore|logical-ties) mode=(--fused-only --production-root "$ranked_candidate") ;;
         fixed) mode=(--fused-only --production-root "$ranked_base" --ranked-q-workers 2); level=2 ;;
         auto) mode=(--fused-only --production-root "$ranked_candidate" --ranked-q-workers 2 --ranked-auto-route); level=2 ;;
         serial2|serial32) mode=(--serial-only --serial-workers "${label#serial}") ;;
@@ -565,7 +577,7 @@ run_arm() (
     limits=(--prefetch-tokens 1024 --intermediate-fetches 4)
     if "$query_owner"; then
         owner_arm=$label
-        if [[ $label == li-restore ]]; then owner_arm=owner-pack; fi
+        if [[ $label == li-restore || $label == logical-ties ]]; then owner_arm=owner-pack; fi
         mode+=(--ranked-q-workers 2 --query-owner-arm "$owner_arm")
         level=1
     fi
@@ -579,6 +591,11 @@ run_arm() (
         --device 0 --kvaf-root "$kvaf" --kvaf-server "127.0.0.1:$port" \
         --prefetch-rank-start 1024 --warmup 4 --iterations 20 --level "$level" \
         --output "$arm/results" --timeout-seconds 1800 >"$arm/replay.log" 2>&1; then
+        if [[ $label == logical-ties ]] && "$PYTHON" -B "$tools/support/li_restore_report.py" --eager-failed "$arm/results"; then
+            # Only an explicitly completed numerical mismatch follows this path.
+            # The post-group reporter checks and prints its raw IDs.
+            exit 0
+        fi
         if "$query_owner"; then
             tail -5 "$arm/replay.log" >&2
             printf 'FAILED_ARM=G%s/%s WORKER_DIR=%s\n' "$group" "$label" "$arm/results" >&2
@@ -724,9 +741,9 @@ if [[ -n "$ranked" ]]; then
         for label in "${order[@]}"; do
             run_arm "$label" "$group" "$case_dir"
         done
-        if [[ $plan_candidate == li-restore ]]; then
+        if [[ $plan_candidate == li-restore || $plan_candidate == logical-ties ]]; then
             status=0
-            "$PYTHON" -B "$tools/support/li_restore_report.py" "$out" "$group" >"$case_dir/li-summary.txt" || status=$?
+            "$PYTHON" -B "$tools/support/li_restore_report.py" "$out" "$group" "$plan_candidate" >"$case_dir/li-summary.txt" || status=$?
             tee -a "$out/summary.txt" <"$case_dir/li-summary.txt"
             case $status in
                 0) ;;

@@ -151,3 +151,18 @@ def test_raw_fused_topk_uses_preupdate_layout_and_unpack_map():
     state.update.logical_output = tensor(np.zeros_like(positions))
     with pytest.raises(ValueError, match='Raw fused LI and the final output'):
         ref.fused_li_output(state)
+
+
+def test_logical_priority_is_only_a_diagnostic_and_eager_has_no_timings(tmp_path):
+    inputs = fixture()
+    ids = np.tile(np.arange(2048, dtype=np.int32), (1, 4, 1))
+    ids[0, 2, 0] = 2051
+    rule = ref.native_priority(inputs, ids)
+    assert rule['matched_queries'] == 3 and rule['split_cutoff_queries'] == 4
+    assert rule['mismatches'][0]['native_only'] == [2051]
+    refs = {mode: ids for mode in ref.MODES}
+    fused = ids.copy()
+    fused[0, 0, 0] = 2050
+    out = ref.write_comparison(tmp_path, 17, inputs, refs, {}, [fused], eager=True)
+    assert out['phase'] == 'eager' and out['measured_calls'] == 0
+    assert out['comparisons']['strong_serial']['matched_queries'] == 3

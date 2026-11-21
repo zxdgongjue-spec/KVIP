@@ -218,10 +218,36 @@ def cause(ids, keys, valid, cutoff):
                           for t in ids[:8]])
 
 
-def write_comparison(directory, group, inputs, refs, metadata, outputs):
+def native_priority(inputs, reference):
+    """Check the logical-ID cutoff rule against the independent native result."""
+    reference = np.sort(reference, axis=-1)
+    mismatches = []
+    competing = 0
+    for row, query in np.ndindex(reference.shape[:2]):
+        ids = np.flatnonzero(inputs.logical_score_valid[row, query])
+        scores = inputs.logical_score_keys[row, query, ids]
+        k = reference.shape[-1]
+        cutoff = np.partition(scores, len(scores) - k)[-k]
+        above, equal = ids[scores > cutoff], ids[scores == cutoff]
+        take = k - len(above)
+        competing += int(len(equal) > take)
+        expected = np.sort(np.concatenate((above, equal[:take])))
+        actual = reference[row, query]
+        if not np.array_equal(actual, expected):
+            mismatches.append(dict(row=int(row), query=int(query+1), cutoff_key=int(cutoff),
+                                   competing=int(len(equal)), needed=int(take),
+                                   native_only=np.setdiff1d(actual, expected, assume_unique=True)[:16].tolist(),
+                                   logical_first_only=np.setdiff1d(expected, actual, assume_unique=True)[:16].tolist()))
+    total = reference.shape[0] * reference.shape[1]
+    return dict(total_queries=total, matched_queries=total-len(mismatches),
+                split_cutoff_queries=competing, mismatches=mismatches)
+
+
+def write_comparison(directory, group, inputs, refs, metadata, outputs, *, eager=False):
     actual = np.asarray(outputs)
-    if actual.shape != (20, inputs.geometry['batch'], 4, 2048) or actual.dtype.kind not in 'iu':
-        raise ValueError('Expected 20 complete measured Q4 TopK outputs')
+    expected_calls = 1 if eager else 20
+    if actual.shape != (expected_calls, inputs.geometry['batch'], 4, 2048) or actual.dtype.kind not in 'iu':
+        raise ValueError(f'Expected {expected_calls} complete Q4 TopK outputs')
     # Verify range before indexing the captured per-token score arrays.
     if np.any(actual < 0) or np.any(actual >= inputs.geometry['history']):
         raise ValueError('Fused output contains an out-of-bounds logical token')
@@ -257,7 +283,8 @@ def write_comparison(directory, group, inputs, refs, metadata, outputs):
     np.savez_compressed(directory / 'native_li_ids.npz', fused=actual, **refs)
     stability = serial_stability(refs['strong_serial'], refs['strong_serial_repeat'])
     primary_match = comparisons['strong_serial']['matched_calls'] == len(outputs)
-    result = dict(group=group, measured_calls=len(outputs), queries_per_call=cutoff.size,
+    result = dict(group=group, phase='eager' if eager else 'measured',
+                  measured_calls=0 if eager else len(outputs), queries_per_call=cutoff.size,
                   primary_serial_sets_match=primary_match, serial_reference_stability=stability,
                   all_serial_sets_match=primary_match and not stability['unstable'],
                   all_same_layout_sets_match=comparisons['same_layout_native']['matched_calls'] == len(outputs),

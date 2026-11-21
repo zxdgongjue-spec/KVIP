@@ -4160,6 +4160,23 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             validate(initial)
         else:
             checks.check('eager', lambda: validate(initial))
+        if os.environ.get('KVIP_Q4_LOGICAL_TIES') == '1':
+            from native_li_reference import fused_li_output, native_priority, write_comparison
+            refs, identity = native_reference
+            identity['logical_first_vs_native'] = native_priority(initial, refs['strong_serial'])
+            ids = fused_li_output(state)
+            eager_match = np.array_equal(np.sort(ids, axis=-1), np.sort(refs['strong_serial'], axis=-1))
+            stable = np.array_equal(np.sort(refs['strong_serial_repeat'], axis=-1),
+                                    np.sort(refs['strong_serial'], axis=-1))
+            if not (eager_match and stable):
+                eager = directory / 'eager'
+                eager.mkdir()
+                write_comparison(eager, config.group, initial, refs, identity, [ids], eager=True)
+                if checks.failures:
+                    raise ValueError(f'Eager replay checks also failed: {checks.failures}')
+                return dict(correctness='FAIL', eager_native_mismatch=True,
+                            production_revision=config.production_revision,
+                            binary_sha256=hashlib.sha256(Path(library).read_bytes()).hexdigest())
         if config.mode in ('bench', 'diagnose'):
             batch_states.append(state)
             for index in range(1, config.iterations):
@@ -4375,6 +4392,9 @@ def run_real(config, directory):
     for name in paths:
         fused = name == 'fused'
         result = run_path(config, directory / name, sequence, pages, fused=fused)
+        if result.get('eager_native_mismatch'):
+            atomic_json(directory / name / 'eager' / 'rejected.json', result)
+            return 3
         results[name] = result
         report['timing']['prototype_with_update' if fused else 'native_chain'] = result['all_rounds']
         if name == paths[-1]:

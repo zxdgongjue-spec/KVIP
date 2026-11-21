@@ -114,7 +114,7 @@ def load(root, group, label, *, row_dependencies=False):
     cfg = read(path.parents[1] / 'config.json')
     inputs = read(path.parents[1] / 'replay_input.json')
     revision = (root / f'{label}.txt').read_text().strip()
-    owner_arm = 'owner-pack' if label == 'li-restore' else label
+    owner_arm = 'owner-pack' if label in ('li-restore', 'logical-ties') else label
     expected = dict(batch=16, token_bytes=656, history=131328, resident=16384)
     if (out['production_revision'] != revision or out['correctness'] != 'PASS' or out['failures']
             or out['transport'] != 'urma' or out['runtime_workers'] != 40 or cfg['device'] != 0
