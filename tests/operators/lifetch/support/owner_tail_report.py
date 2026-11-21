@@ -78,21 +78,28 @@ def owner(ticks, block, mhz):
         raise ValueError(f'Get activity on empty owner {block}')
     values.update(sq_active=ticks[67], cq_call=ticks[68])
     exposed = 0
+    group_spans = []
     if n:
         interval('get_start', 'get_end')
         door_ticks = ticks[80:80+2*doors:2]
         if door_ticks != sorted(door_ticks) or not t['get_start'] <= door_ticks[0] <= door_ticks[-1] <= t['get_end']:
             raise ValueError(f'bad doorbell timeline at block {block}')
+        door_by_group = dict(zip(ticks[81:81+2*doors:2], door_ticks))
         end_prev = t['get_start']
         for j in range(cq):
             begin, observed, group, polls = ticks[336+4*j:340+4*j]
             if not end_prev <= begin <= observed <= t['get_end']:
                 raise ValueError(f'bad CQ poll at block {block}, CQ {j}')
             exposed += max(0, observed-max(begin, t['index_end']))
+            if not overflow:
+                if group not in door_by_group or door_by_group[group] > observed:
+                    raise ValueError(f'unmatched doorbell/CQ group on block {block}: {group}')
+                group_spans.append(observed-door_by_group[group])
             end_prev = observed
     if not overflow:
         values['cq_after_index'] = exposed
         if n:
+            values['longest_group_to_observation'] = max(group_spans)
             values['to_first_doorbell'] = door_ticks[0]-t['tail_start']
             values['to_last_doorbell'] = door_ticks[-1]-t['tail_start']
     if any(v < 0 for v in values.values()):
@@ -169,9 +176,9 @@ def describe(path):
              'join_flag8','join_flag9','join_flag10','join_flag11']
     print(f'G{g} Q4_P50/P95_us ' + ' '.join(f'{k}={summarize(metrics[k])}' for k in extra))
     for q, m in enumerate(by_q, 1):
-        print(f'G{g} Q{q}_nonempty={busy_owners[q-1]} capped={capped_owners[q-1]} to_first/last_doorbell_P50_us=' +
+        print(f'G{g} Q{q}_nonempty={busy_owners[q-1]} capped={capped_owners[q-1]} to_first/last_doorbell/max_group_doorbell_to_CQobs_P50_us=' +
               '/'.join(f'{median(m[k]):.2f}' if m[k] else 'NA'
-                       for k in ('to_first_doorbell','to_last_doorbell')))
+                       for k in ('to_first_doorbell','to_last_doorbell','longest_group_to_observation')))
     key_parts = ['resolver_handoff','resolver_except_handoff','conflict_wait','sq_active','adapt',
                  'index_handoff','index','cq_after_index','row_finalize','barrier']
     print(f'G{g} longest_local_owner_P50_us ' +
