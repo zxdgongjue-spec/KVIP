@@ -44,7 +44,9 @@ __aicore__ inline void TagResident(uint32_t query) {
 // Optimized B window path; A retains methods.h for the fixed comparison.
 bool incrementalIdsPending_=false;
 bool coldOutputPending_=false;
-__aicore__ inline void JoinColdOutput(){if(coldOutputPending_){WaitFlag<HardEvent::MTE3_V>(EVENT_ID7);coldOutputPending_=false;}}
+// MTE3_V 7 carries the outstanding TopK output credit until FreeEventID.
+static constexpr uint32_t kColdListWriteDone = EVENT_ID1;
+__aicore__ inline void JoinColdOutput(){if(coldOutputPending_){WaitFlag<HardEvent::MTE3_V>(kColdListWriteDone);coldOutputPending_=false;}}
 bool mappedExport_=false;uint32_t mappedValid_=0;
 // QLIVector member: called after ID recovery while the complete Q is in UB.
 bool exportWindowCold_=false;bool rankTrace_=false;
@@ -97,7 +99,7 @@ __aicore__ inline void ExportWindowCold(uint32_t query) {
         GlobalTensor<uint32_t> jobs;jobs.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+query*2048);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
         DataCopy(jobs,compact,(count+7)/8*8);
-        if(mappedExport_){SetFlag<HardEvent::MTE3_V>(EVENT_ID7);coldOutputPending_=true;}
+        if(mappedExport_){SetFlag<HardEvent::MTE3_V>(kColdListWriteDone);coldOutputPending_=true;}
         else {SetFlag<HardEvent::MTE3_V>(EVENT_ID5);WaitFlag<HardEvent::MTE3_V>(EVENT_ID5);}
     }
 }
@@ -220,7 +222,8 @@ __aicore__ inline void PreloadIncremental(uint32_t half) {
     raw.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(source));
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     mask.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(ctx->hits)+uint64_t(query)*runtimeShape_.history/8);
-    SetFlag<HardEvent::V_MTE2>(EVENT_ID6);WaitFlag<HardEvent::V_MTE2>(EVENT_ID6);
+    // The query-scale ping-pong buffers own V_MTE2 6 and 7.
+    SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
     DataCopy(incrementalInput_,scores,2048);
 
     DataCopy(incrementalInput_[2048],raw[base],n);

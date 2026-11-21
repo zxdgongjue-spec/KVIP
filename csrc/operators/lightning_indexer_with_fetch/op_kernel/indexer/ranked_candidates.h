@@ -174,7 +174,8 @@ __aicore__ inline uint32_t SelectBitmap(LocalTensor<uint32_t> ids,LocalTensor<ui
             DataCopy(scratch,bits[base/32],(size+255)/256*8);
             SetFlag<HardEvent::MTE2_V>(EVENT_ID4);WaitFlag<HardEvent::MTE2_V>(EVENT_ID4);
             GatherCoveredChunk(id,p,out,base,base+size);
-            SetFlag<HardEvent::V_MTE2>(EVENT_ID4);WaitFlag<HardEvent::V_MTE2>(EVENT_ID4);
+            // V_MTE2 4 is TopK's live input credit. Use the transient scratch fence.
+            SetFlag<HardEvent::V_MTE2>(EVENT_ID5);WaitFlag<HardEvent::V_MTE2>(EVENT_ID5);
         }
         SetFlag<HardEvent::V_S>(EVENT_ID4);WaitFlag<HardEvent::V_S>(EVENT_ID4);
         PackUncovered<true>(id,score,out,out,p+4096,p+6144,valid);
