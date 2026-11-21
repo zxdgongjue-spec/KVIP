@@ -277,6 +277,10 @@ struct IndexTail {
     uint32_t b, q;
     Slice s;
     bool ran = false;
+    __aicore__ inline void WriteOutput() {
+        Simt::VF_CALL<Adapt>(Simt::Dim3{256, 1, 1}, a, b, q);
+        VectorDone();
+    }
     // Invoked by this query's own KVAF submission after its last SQ doorbell.
     __aicore__ __attribute__((noinline)) inline void Run() {
         if (ran) {
@@ -284,11 +288,10 @@ struct IndexTail {
         }
         ran = true;
         auto ctx = reinterpret_cast<__gm__ Context *>(a->context);
-        // Read the pre-update logical mapping in parallel across the four
-        // owners. The last commit is ordered after all four owner handoffs.
-        if (!s.error) {
-            Simt::VF_CALL<Adapt>(Simt::Dim3{256, 1, 1}, a, b, q);
-            VectorDone();
+        auto outputs = reinterpret_cast<__gm__ BatchFlag *>(a->flags) + b * kFlagCount + 1;
+        const bool validOutput = !s.error;
+        if (q && validOutput) {
+            WriteOutput();
         }
         auto chain = index_team::Control(a, b);
         if (q) {
@@ -298,7 +301,7 @@ struct IndexTail {
         // No swaps to apply and no final metadata commit on a middle owner.
         // Its successor can consume the very same saved permutation.
         if ((q == 1 || q == 2) && !s.count) {
-            Signal(reinterpret_cast<__gm__ BatchFlag *>(a->flags) + b * kFlagCount + q + 1, 0, s.error);
+            Signal(outputs + q, 0, s.error);
             Signal(chain + q, 0, s.error);
             return;
         }
@@ -354,6 +357,10 @@ struct IndexTail {
             s.error |= mem.GetValue(CONTROL);
             seen += n;
         }
+        if (q == 3 && seen && !s.error) {
+            // Q2/Q3 read the old mapping before their Index handoff; Q1 reads it afterwards.
+            s.error |= AwaitPublication(outputs);
+        }
         if (!s.error) {
             if (q < 3 && !isDense && seen) {
                 BeforeStore();
@@ -375,8 +382,17 @@ struct IndexTail {
             }
         }
         pipe.Destroy();
-        Signal(reinterpret_cast<__gm__ BatchFlag *>(a->flags) + b * kFlagCount + q + 1, s.count, s.error);
-        Signal(chain + q, s.count, s.error);
+        if (!q) {
+            // The Index shadow is available to Q2 while Q1 saves its output.
+            Signal(chain, s.count, s.error);
+            if (validOutput) {
+                WriteOutput();
+            }
+        }
+        Signal(outputs + q, s.count, s.error);
+        if (q) {
+            Signal(chain + q, s.count, s.error);
+        }
     }
 };
 
