@@ -75,17 +75,21 @@ if [[ ${1:-} == --ranked-help || ${1:-} == --ranked-joint ]]; then
     elif [[ -n "$joint_reference" ]]; then
         echo '--previous requires --ranked-joint' >&2; exit 2
     fi
-elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-packets || ${1:-} == --short-lru || ${1:-} == --owner-pack ]]; then
+elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-packets || ${1:-} == --short-lru || ${1:-} == --owner-pack || ${1:-} == --li-restore ]]; then
     [[ $# -ge 2 && $2 =~ ^[0-9a-f]{40}$ ]] || { echo "Usage: peer_fused.sh $1 NATIVE_SHA [GROUP ...]" >&2; exit 2; }
     query_owner=true
     offset_resolver=true
     ranked_sha=f8b185e3d042a18b24fe695c0a49a7d969ca487d
     fixed_order_rev=7b60f0dddab91a4b154043e78088842d7856cba6
-    if [[ $1 == --short-lru || $1 == --owner-pack ]]; then
+    if [[ $1 == --short-lru || $1 == --owner-pack || $1 == --li-restore ]]; then
         candidate_only=true
         offset_resolver=false
         plan_candidate=${1#--}
         if [[ $plan_candidate == owner-pack ]]; then ranked_sha=367565634aa5d9ef713239c33c4a281227032e31; fi
+        if [[ $plan_candidate == li-restore ]]; then
+            ranked_sha=36d92c3e663e5164af54e7761187f3204e76fe05
+            export KVIP_Q4_LI_RESTORE=1
+        fi
         [[ $2 != "$ranked_sha" ]] || { echo "Supply a $plan_candidate candidate based on $ranked_sha" >&2; exit 2; }
     elif [[ $1 != --offset-resolver ]]; then
         row_deps=true
@@ -104,7 +108,7 @@ elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-pa
     export PEER_LOCAL_ONLY=1
     shift 2
     offset_groups=(7 2 10 17 4)
-    if [[ $plan_candidate == owner-pack ]]; then
+    if [[ $plan_candidate == owner-pack || $plan_candidate == li-restore ]]; then
         offset_groups=(7 10 17 4)
     elif "$candidate_only"; then
         offset_groups=(10 7 2)
@@ -125,7 +129,7 @@ elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-pa
     fi
     if (($#)); then
         allowed_groups=(7 2 10 17 4)
-        if [[ $plan_candidate == owner-pack ]]; then allowed_groups=("${offset_groups[@]}"); fi
+        if [[ $plan_candidate == owner-pack || $plan_candidate == li-restore ]]; then allowed_groups=("${offset_groups[@]}"); fi
         offset_groups=()
         for group in "$@"; do
             [[ " ${allowed_groups[*]} " == *" $group "* && $group =~ ^[0-9]+$ ]] || {
@@ -444,11 +448,17 @@ fi
 cpu="$clean/build-cpu/runtime/kvaf_cpu_service"
 test -x "$cpu"
 if "$query_owner"; then
+    indexer_revision=$ranked_sha
+    if [[ $plan_candidate == li-restore ]]; then
+        indexer_revision=$current_fixed
+        git -C "$ranked_candidate" diff --exit-code --quiet "$ranked_sha" HEAD -- . \
+            ':(exclude)csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_vector.h'
+    fi
     allowed=()
     if "$row_deps"; then
         allowed+=(':(exclude)csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_vector.h')
     fi
-    git -C "$ranked_candidate" diff --exit-code --quiet "$ranked_sha" HEAD -- \
+    git -C "$ranked_candidate" diff --exit-code --quiet "$indexer_revision" HEAD -- \
         csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer \
         csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer.cpp \
         csrc/operators/common/lifetch "${allowed[@]}"
@@ -538,7 +548,7 @@ run_arm() (
             source_root=$ranked_candidate
             if [[ $label == "$plan_control" ]]; then source_root=$ranked_base; fi
             mode=(--fused-only --production-root "$source_root") ;;
-        local|short-lru|owner-pack) mode=(--fused-only --production-root "$ranked_candidate") ;;
+        local|short-lru|owner-pack|li-restore) mode=(--fused-only --production-root "$ranked_candidate") ;;
         fixed) mode=(--fused-only --production-root "$ranked_base" --ranked-q-workers 2); level=2 ;;
         auto) mode=(--fused-only --production-root "$ranked_candidate" --ranked-q-workers 2 --ranked-auto-route); level=2 ;;
         serial2|serial32) mode=(--serial-only --serial-workers "${label#serial}") ;;
@@ -554,7 +564,9 @@ run_arm() (
     esac
     limits=(--prefetch-tokens 1024 --intermediate-fetches 4)
     if "$query_owner"; then
-        mode+=(--ranked-q-workers 2 --query-owner-arm "$label")
+        owner_arm=$label
+        if [[ $label == li-restore ]]; then owner_arm=owner-pack; fi
+        mode+=(--ranked-q-workers 2 --query-owner-arm "$owner_arm")
         level=1
     fi
     if [[ "$label" == before* || "$label" == after ]]; then
@@ -691,6 +703,7 @@ fi
 if [[ -n "$ranked" ]]; then
     printf 'CPU_PLACEMENT target_node=%s policy=%s actual=measured_per_arm\n' "${node:-unknown}" "$policy"
     order=(baseline candidate)
+    set_mismatches=0
     groups=(2 7 10 17 4)
     if "$offset_resolver"; then order=(chain offset fixed-order); groups=("${offset_groups[@]}"); fi
     if "$candidate_only"; then order=("$plan_candidate"); groups=("${offset_groups[@]}"); fi
@@ -711,13 +724,26 @@ if [[ -n "$ranked" ]]; then
         for label in "${order[@]}"; do
             run_arm "$label" "$group" "$case_dir"
         done
-        if "$query_owner"; then
+        if [[ $plan_candidate == li-restore ]]; then
+            status=0
+            "$PYTHON" -B "$tools/support/li_restore_report.py" "$out" "$group" >"$case_dir/li-summary.txt" || status=$?
+            tee -a "$out/summary.txt" <"$case_dir/li-summary.txt"
+            case $status in
+                0) ;;
+                3) set_mismatches=$((set_mismatches + 1)) ;;
+                *) exit "$status" ;;
+            esac
+        elif "$query_owner"; then
             "$PYTHON" -B "$tools/support/query_owner_report.py" "$out" "$group" | tee -a "$out/summary.txt"
         else
             "$PYTHON" -B "$tools/support/ranked_five_report.py" "$out" --group "$group" | tee -a "$out/summary.txt"
         fi
         order=("${order[@]:1}" "${order[0]}")
     done
+    if (( set_mismatches )); then
+        printf 'TOPK_MISMATCH groups=%s RESULT_ROOT=%s\n' "$set_mismatches" "$out" >&2
+        exit 3
+    fi
     printf 'REPLAY_COMPLETE RESULT_ROOT=%s\n' "$out"
     exit 0
 fi

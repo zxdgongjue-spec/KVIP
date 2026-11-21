@@ -114,10 +114,11 @@ def load(root, group, label, *, row_dependencies=False):
     cfg = read(path.parents[1] / 'config.json')
     inputs = read(path.parents[1] / 'replay_input.json')
     revision = (root / f'{label}.txt').read_text().strip()
+    owner_arm = 'owner-pack' if label == 'li-restore' else label
     expected = dict(batch=16, token_bytes=656, history=131328, resident=16384)
     if (out['production_revision'] != revision or out['correctness'] != 'PASS' or out['failures']
             or out['transport'] != 'urma' or out['runtime_workers'] != 40 or cfg['device'] != 0
-            or cfg['window_limit'] != 256 or cfg['query_owner_arm'] != label or cfg['group'] != group or cfg['intermediate_fetches'] != 4 or cfg['prefetch_tokens'] != 1024
+            or cfg['window_limit'] != 256 or cfg['query_owner_arm'] != owner_arm or cfg['group'] != group or cfg['intermediate_fetches'] != 4 or cfg['prefetch_tokens'] != 1024
             or cfg.get('ranked_auto_route') or cfg.get('route_policy') or out.get('auto_route')
             or cfg.get('prefetch_rank_start') != 1024 or cfg.get('ranked_q_workers') != 2
             or cfg['level'] != 1 or cfg['warmup'] != 4 or cfg['iterations'] != 20
@@ -142,7 +143,7 @@ def load(root, group, label, *, row_dependencies=False):
                                       or any(w['posted'] > 256 for w in r['windows'])
                                       for r in requests):
             raise ValueError(f'{label}: observed window count or prefetch budget differs')
-        if label == 'owner-pack':
+        if owner_arm == 'owner-pack':
             for request in requests:
                 queries = request['queries']
                 if (len(queries) != 4 or sum(q['final_posted'] for q in queries) != request['final']
