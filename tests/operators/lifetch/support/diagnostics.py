@@ -332,7 +332,8 @@ def summarize(directory, config):
 
 
 def algorithm_counts(mapping, selected, rows, posts, resident, windows, *,
-                     hot_valid=None, lru_slots=None, reserved_hot=None, logical_ids=None, tail_bounds=None, token_bytes=656):
+                     hot_valid=None, lru_slots=None, reserved_hot=None, logical_ids=None, tail_bounds=None, token_bytes=656,
+                     record_final_safe=False):
     """Reconcile existing admission records, not hypothetical transfer savings.
 
     The prefetch map stores resident+admission_ordinal; ABC uses a separate
@@ -401,6 +402,11 @@ def algorithm_counts(mapping, selected, rows, posts, resident, windows, *,
                                    cross_q_duplicate=len(unique & seen), new_unique=len(added),
                                    initial_local=None if local is None else int(np.isin(added, local).sum()),
                                    final_posted=int(final_counts[query])))
+            if record_final_safe:
+                safe = int(posts[row, query, 5])
+                if not 0 <= safe <= int(final_counts[query]):
+                    raise ValueError(f'Invalid safe final descriptor count at request {row}, Q{query+1}')
+                query_rows[-1]['final_safe'] = safe
             seen.update(unique)
         cold = None if local is None else int((~np.isin(demand, local)).sum())
         candidate_hot = None
@@ -489,14 +495,14 @@ def prefetch_tag_audit(ids, before, resident):
     return result
 
 
-def algorithm_after(rotating, before):
+def algorithm_after(rotating, before, *, record_final_safe=False):
     shape = rotating.runtime_shape
     try:
         result = algorithm_counts(
             rotating.mapping.cpu().numpy(),
             rotating.arguments[9].cpu().numpy().view(np.int32).reshape(shape.batch, 4, 2048),
             rotating.rows.cpu().numpy().view(np.uint32), rotating.final_posts.cpu().numpy(),
-            shape.resident, rotating.rounds, token_bytes=shape.tokenBytes, **before)
+            shape.resident, rotating.rounds, token_bytes=shape.tokenBytes, record_final_safe=record_final_safe, **before)
         if hasattr(rotating, 'window_topk_storage'):
             prefix_bytes = 4 * 2048 * 6 + 1024
             # The public prefix is immutable after SaveResident; the private

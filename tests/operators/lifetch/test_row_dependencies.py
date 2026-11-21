@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent / 'support'))
+from diagnostics import algorithm_counts
 from execution import FusedReplayState
 from query_owner_report import report_row_dependencies
 
@@ -30,7 +31,7 @@ class Array:
 
 @pytest.mark.parametrize('fault', (None, 'keys', 'kv', 'layout', 'valid'))
 @pytest.mark.parametrize('final_q', [0, 1])
-@pytest.mark.parametrize('arm', ['row-deps', 'short-lru'])
+@pytest.mark.parametrize('arm', ['row-deps', 'short-lru', 'owner-pack'])
 def test_ordered_layout_with_a_displaced_final_source(fault, final_q, arm):
     # Prefetch swaps 4 into slot 0. Q1 selects the token displaced from 0;
     # its current source is now 4, so the final swap moves it from 4 to 2.
@@ -178,3 +179,22 @@ def test_report_gates_and_measures_graph_and_resolver(tmp_path, capsys, fault, m
                 'partial': f'319/320 identical_full_call_plans=19/20 placement=matched timing_scope={timing} PARTIAL_IDENTICAL_CALL_PLANS',
                 'uneven': f'320/320 identical_full_call_plans=19/20 placement=matched timing_scope={timing} PARTIAL_IDENTICAL_CALL_PLANS'}
     assert f'identical_ordered_request_plans={coverage[fault]}' in report
+
+
+@pytest.mark.parametrize('invalid', [None, -1, 3])
+def test_final_safe_prefix_uses_per_query_final_post(invalid):
+    rows = np.zeros((2, 256), dtype=np.int32)
+    posts = np.zeros((2, 4, 32), dtype=np.int32)
+    posts[:, :, 0] = [[2, 0, 4, 1], [3, 1, 0, 2]]
+    posts[:, :, 5] = [[2, 0, 1, 0], [0, 1, 0, 2]]
+    rows[:, 247] = posts[:, :, 0].sum(axis=1)
+    args = (np.full((2, 2048), -1), np.zeros((2, 4, 2048), dtype=np.int32), rows, posts, 128, 4)
+    if invalid is not None:
+        posts[0, 0, 5] = invalid
+        with pytest.raises(ValueError, match='safe final descriptor count'):
+            algorithm_counts(*args, record_final_safe=True)
+        return
+    result = algorithm_counts(*args, record_final_safe=True)
+    for i, request in enumerate(result['requests']):
+        for j, query in enumerate(request['queries']):
+            assert (query['final_posted'], query['final_safe']) == tuple(posts[i, j, [0, 5]])

@@ -142,6 +142,12 @@ def load(root, group, label, *, row_dependencies=False):
                                       or any(w['posted'] > 256 for w in r['windows'])
                                       for r in requests):
             raise ValueError(f'{label}: observed window count or prefetch budget differs')
+        if label == 'owner-pack':
+            for request in requests:
+                queries = request['queries']
+                if (len(queries) != 4 or sum(q['final_posted'] for q in queries) != request['final']
+                        or any(not 0 <= q['final_safe'] <= q['final_posted'] for q in queries)):
+                    raise ValueError('Per-Q safe/count does not match the final descriptors')
     traffic = [v['algorithm']['totals'] for v in rows]
     if any(v['KV_read_bytes'] != 656 * (v['final'] + v['prefetch']) for v in traffic):
         raise ValueError(f'{label}: inconsistent physical Get bytes')
@@ -313,8 +319,7 @@ def report_row_dependencies(root, group):
               f'placement={placement} timing_scope={"archived_control" if reference else "same_run"} {gate}')
 
 
-def report_short_lru(root, group):
-    label = 'short-lru'
+def report_owner_candidate(root, group, label):
     data = load(root, group, label, row_dependencies=True)
     digests = data[1]
     if len(set(digests)) != 1 or not SHA256.fullmatch(digests[0]):
@@ -326,8 +331,9 @@ def report_short_lru(root, group):
 
 
 def main(root, group):
-    if (root / 'short-lru.txt').is_file():
-        return report_short_lru(root, group)
+    for arm in ('short-lru', 'owner-pack'):
+        if (root / f'{arm}.txt').is_file():
+            return report_owner_candidate(root, group, arm)
     if (root / 'row-deps.txt').is_file():
         return report_row_dependencies(root, group)
     if (root / 'local.txt').is_file() or (root / 'offset.txt').is_file():
