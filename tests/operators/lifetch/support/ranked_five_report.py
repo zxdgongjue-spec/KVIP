@@ -30,7 +30,7 @@ def paired(a, b):
     return f'{fmt(a)}/{fmt(b)}'
 
 
-def verify_swaps(start_layout, layout, initial_valid, valid, source, dest, counts):
+def verify_swaps(start_layout, layout, initial_valid, valid, source, dest, counts, *, track_cross_q=False):
     """Replay the five ordered event phases, including overlapping 512-event chunks."""
     history = len(layout)
     resident = len(valid)
@@ -38,6 +38,10 @@ def verify_swaps(start_layout, layout, initial_valid, valid, source, dest, count
     positions = np.arange(history)
     owners = positions.copy()
     successful = []
+    # Each chunk is a closed permutation: all destinations are also the
+    # physical rows read by that chunk, including displaced victims.
+    last_query = np.full(history, -1, dtype=np.int8) if track_cross_q else None
+    cross_q = False
     suffix = 2048
     for phase, count in enumerate(counts):
         begin = suffix if phase else 0
@@ -58,6 +62,11 @@ def verify_swaps(start_layout, layout, initial_valid, valid, source, dest, count
             displaced = dst[~np.isin(dst, src, assume_unique=True)]
             freed = src[~np.isin(src, dst, assume_unique=True)]
             all_dest = np.r_[dst, freed]
+            if track_cross_q and not cross_q:
+                query = max(0, phase - 1)  # Q0 also applies the prefetch events.
+                previous = last_query[all_dest]
+                cross_q = bool(np.any((previous >= 0) & (previous != query)))
+                last_query[all_dest] = query
             next_owners = owners[np.r_[src, displaced]]
             owners[all_dest] = next_owners
             positions[next_owners] = all_dest
@@ -70,6 +79,7 @@ def verify_swaps(start_layout, layout, initial_valid, valid, source, dest, count
         raise ValueError('Committed Index does not implement ordered Get/eviction events')
     if not np.array_equal(valid, expected_valid):
         raise ValueError('Committed hot-valid bitmap differs from actual promotions and evictions')
+    return cross_q
 
 
 def final_q_workers(raw):

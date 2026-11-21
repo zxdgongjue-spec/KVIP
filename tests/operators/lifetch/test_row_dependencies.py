@@ -29,7 +29,8 @@ class Array:
 
 
 @pytest.mark.parametrize('fault', (None, 'keys', 'kv', 'layout', 'valid'))
-def test_ordered_layout_with_a_displaced_final_source(fault):
+@pytest.mark.parametrize('final_q', [0, 1])
+def test_ordered_layout_with_a_displaced_final_source(fault, final_q):
     # Prefetch swaps 4 into slot 0. Q1 selects the token displaced from 0;
     # its current source is now 4, so the final swap moves it from 4 to 2.
     layout = np.array([[4, 1, 0, 3, 2, 5]])
@@ -45,7 +46,7 @@ def test_ordered_layout_with_a_displaced_final_source(fault):
     candidates[0, 0], destinations[0, 0] = 4, 0
     candidates[0, 2048], destinations[0, 2048] = 0, 2
     flags = np.zeros((1, 16, 2), dtype=np.int32)
-    flags[0, [0, 12], 1] = 1
+    flags[0, [0, 12 + final_q], 1] = 1
     keys = layout + 10
     if fault == 'keys':
         keys[0, 2] += 1
@@ -71,6 +72,7 @@ def test_ordered_layout_with_a_displaced_final_source(fault):
     )
     if fault is None:
         state.validate_index(inputs, values)
+        assert state.cross_q_overlap_requests == int(final_q != 0)
         assert len(state.layout_receipts) == 1
         assert all(len(digest) == 64 for digest in state.layout_receipts[0])
         return
@@ -86,22 +88,33 @@ def test_ordered_layout_with_a_displaced_final_source(fault):
 
 @pytest.mark.parametrize('fault', (None, 'topk', 'layout', 'kv', 'tail', 'sample_order',
                                    'unmatched', 'partial', 'uneven'))
-def test_report_gates_and_measures_graph_and_resolver(tmp_path, capsys, fault):
+@pytest.mark.parametrize('mode', ['row', 'packets', 'reference'])
+def test_report_gates_and_measures_graph_and_resolver(tmp_path, capsys, fault, mode):
     def write(path, value):
         path.write_text(json.dumps(value))
 
+    packets = mode != 'row'
+    reference = tmp_path / 'archive' if mode == 'reference' else tmp_path
+    if mode == 'reference':
+        reference.mkdir()
+        (tmp_path / 'packet-reference.txt').write_text(str(reference))
+        for folder in (tmp_path, reference):
+            (folder / 'physical_npu.txt').write_text('4')
+    control_arm, new_arm = ('row-deps', 'li-packets') if packets else ('offset', 'row-deps')
     for arm, revision, full, tail in (('fixed-order', '1', 70, 31),
-                                      ('offset', '2', 60, 25),
-                                      ('row-deps', '3', 50, 20)):
-        candidate = arm == 'row-deps'
-        fused = tmp_path / 'g7' / arm / 'results' / 'case' / 'fused'
+                                      (control_arm, '2', 60, 25),
+                                      (new_arm, '3', 50, 20)):
+        candidate = arm == new_arm
+        source = tmp_path if candidate else reference
+        fused = source / 'g7' / arm / 'results' / 'case' / 'fused'
         details = fused / 'diagnose' / 'round-1'
         details.mkdir(parents=True)
         digest = revision * 64
         sha = revision * 40
         (tmp_path / f'{arm}.txt').write_text(sha)
-        (tmp_path / f'ranked-{sha[:8]}.binary.sha256').write_text(digest)
-        cfg = dict(device=0, window_limit=256, query_owner_arm=arm, group=7, intermediate_fetches=4,
+        (source / f'{arm}.txt').write_text(sha)
+        (source / f'ranked-{sha[:8]}.binary.sha256').write_text(digest)
+        cfg = dict(device=0, kvaf_root='/peer/KVAF-a2857b46', ranked_q_workers=2, prefetch_rank_start=1024, window_limit=256, query_owner_arm=arm, group=7, intermediate_fetches=4,
                    prefetch_tokens=1024, level=1, warmup=4, iterations=20)
         write(fused.parent / 'config.json', cfg)
         inputs = dict(geometry=dict(batch=16, token_bytes=656, history=131328, resident=16384),
@@ -116,8 +129,10 @@ def test_report_gates_and_measures_graph_and_resolver(tmp_path, capsys, fault):
                    input_paths=['trace'], all_rounds=timing, binary_sha256=digest,
                    topk_set_digests=['a' * 64] * 20,
                    query_owners=[dict(owners=64, queues=64, processed=16)] * 20,
-                   offset_checks=[dict(extended_slots=0, independent_rows=16)] * 20,
+                   offset_checks=[dict(extended_slots=0, independent_rows=12)] * 20,
                    layout_receipts=[[['b' * 64, 'c' * 64] for _ in range(16)] for _ in range(20)])
+        if mode == 'packets' or (mode == 'reference' and candidate):
+            out['cross_q_overlap_requests'] = [2] * 20
         if candidate and fault == 'topk':
             out['topk_set_digests'][-1] = 'd' * 64
         if candidate and fault == 'layout':
@@ -151,8 +166,14 @@ def test_report_gates_and_measures_graph_and_resolver(tmp_path, capsys, fault):
     report = capsys.readouterr().out
     assert 'same_TopK=20/20 KV=PASS ordered_Index=PASS per_arm=320/320' in report
     assert 'graph_saved_mean/P50_us=+10.00/+10.00 tail_saved_mean/P50_us=+5.00/+5.00' in report
-    coverage = {None: '320/320 same_event_calls=20/20 placement=matched POSITIVE',
-                'unmatched': '0/320 same_event_calls=0/20 placement=matched NO_SHARED_INDEX_EVENTS',
-                'partial': '319/320 same_event_calls=19/20 placement=matched PARTIAL_INDEX_EVENT_COVERAGE',
-                'uneven': '320/320 same_event_calls=19/20 placement=matched PARTIAL_INDEX_EVENT_COVERAGE'}
-    assert f'same_event_layout_rows={coverage[fault]}' in report
+    assert f'{new_arm} disjoint_fast_requests=240/320 general_requests=80/320' in report
+    assert ('cross_Q_physical_row_reuse_requests=40/320' in report) == packets
+    timing = 'archived_control' if mode == 'reference' else 'same_run'
+    positive = 'CROSS_RUN_GAIN' if mode == 'reference' else 'POSITIVE'
+    if mode == 'reference':
+        assert 'cross_Q_physical_row_reuse_requests=unavailable' in report and 'POSITIVE' not in report
+    coverage = {None: f'320/320 identical_full_call_plans=20/20 placement=matched timing_scope={timing} {positive}',
+                'unmatched': f'0/320 identical_full_call_plans=0/20 placement=matched timing_scope={timing} NO_IDENTICAL_REQUEST_PLANS',
+                'partial': f'319/320 identical_full_call_plans=19/20 placement=matched timing_scope={timing} PARTIAL_IDENTICAL_CALL_PLANS',
+                'uneven': f'320/320 identical_full_call_plans=19/20 placement=matched timing_scope={timing} PARTIAL_IDENTICAL_CALL_PLANS'}
+    assert f'identical_ordered_request_plans={coverage[fault]}' in report

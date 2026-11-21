@@ -11,7 +11,6 @@ import numpy as np
 
 from peer_delta import pair_placement, read
 
-ROW_DEPENDENCY_ARMS = ('fixed-order', 'offset', 'row-deps')
 SHA256 = re.compile(r'[0-9a-f]{64}')
 
 def check_cutoff_ids(inputs, layout, ids):
@@ -95,10 +94,7 @@ def check_offset_plan(events_src, events_dst, counts, posts, candidates, selecte
     return dict(extended_slots=extended_slots, independent_rows=int(posts[:, 0, 12].sum()))
 
 
-def check_layout_receipt(start_layout, layout, initial_valid, valid, sources, destinations, counts):
-    from ranked_five_report import verify_swaps
-
-    verify_swaps(start_layout, layout, initial_valid, valid, sources, destinations, counts)
+def layout_receipt(layout, valid, sources, destinations, counts):
     prefetch, final = int(counts[0]), int(sum(counts[1:]))
     plan = hashlib.sha256(counts.tobytes())
     for events in (sources, destinations):
@@ -123,6 +119,7 @@ def load(root, group, label, *, row_dependencies=False):
             or out['transport'] != 'urma' or out['runtime_workers'] != 40 or cfg['device'] != 0
             or cfg['window_limit'] != 256 or cfg['query_owner_arm'] != label or cfg['group'] != group or cfg['intermediate_fetches'] != 4 or cfg['prefetch_tokens'] != 1024
             or cfg.get('ranked_auto_route') or cfg.get('route_policy') or out.get('auto_route')
+            or cfg.get('prefetch_rank_start') != 1024 or cfg.get('ranked_q_workers') != 2
             or cfg['level'] != 1 or cfg['warmup'] != 4 or cfg['iterations'] != 20
             or any(inputs['geometry'][k] != v for k, v in expected.items())
             or inputs['rounds'] != 1 or out['input_paths'] != inputs['source_paths']
@@ -165,10 +162,22 @@ def load(root, group, label, *, row_dependencies=False):
               f'span_drift_mean/P50_pct={drift[0]:+.2f}/{drift[1]:+.2f} miss_pct={miss:.3f} '
               f'waste/repair_KiB={kib[0]:.1f}/{kib[1]:.1f} total_MiB={mib:.4f}', flush=True)
     thp = read(root / f'g{group}' / label / 'thp.json')
-    if label in ('offset', 'row-deps'):
+    branch_counts = None
+    if label in ('offset', 'row-deps', 'li-packets'):
         receipts = out['offset_checks']
         if len(receipts) != 20:
             raise ValueError('Missing post-timing slot checks')
+        independent = [r['independent_rows'] for r in receipts]
+        if any(type(n) != int or not 0 <= n <= 16 for n in independent):
+            raise ValueError('Invalid disjoint request count')
+        # Archived runs retain native branch counts but only the new runner
+        # reconstructs physical row reuse across Qs after each measured call.
+        overlap = out.get('cross_q_overlap_requests')
+        if overlap is not None and (
+                len(overlap) != 20 or any(type(n) != int or not 0 <= n <= 16 - fast
+                                          for n, fast in zip(overlap, independent))):
+            raise ValueError('Invalid cross-query physical row reuse count')
+        branch_counts = (sum(independent), None if overlap is None else sum(overlap))
         if not row_dependencies:
             print(f"G{group} OFFSET_CHECK calls=20/20 prefetch_slot_reuse=0 "
                   f"hot_slots_selected_beyond_list={sum(r['extended_slots'] for r in receipts)} "
@@ -185,7 +194,7 @@ def load(root, group, label, *, row_dependencies=False):
             or not isclose(mean(tail), stages['resolve_update'])
             or not isfinite(m) or m <= 0):
         raise ValueError(f'G{group} {label}: invalid resolver timing')
-    return (*result, median(tail), out['layout_receipts'])
+    return (*result, median(tail), out['layout_receipts'], branch_counts, stages['li'], cfg['kvaf_root'])
 
 
 def report_resolver(root, group):
@@ -221,7 +230,7 @@ def report_resolver(root, group):
               f'gain_pct={gains[0]:+.2f}/{gains[1]:+.2f} drift_guard_pct={drift[0]:.2f}/{drift[1]:.2f} {gate}')
 
 
-def compare_layout_receipts(arms):
+def compare_layout_receipts(arms, candidate):
     """Compare exact physical Index for identical ordered events on the same request."""
     states = {}
     arms_by_plan = defaultdict(set)
@@ -238,29 +247,48 @@ def compare_layout_receipts(arms):
                 if states.setdefault(key, state) != state:
                     raise ValueError(f'Different physical Index for identical events, request {request}')
                 arms_by_plan[key].add(name)
-    candidate_calls = calls_by_arm['row-deps']
+    candidate_calls = calls_by_arm[candidate]
     return {
         name: (sum(name in arms_by_plan[request, plan]
-                   for rows in arms['row-deps'] for request, (plan, _) in enumerate(rows)),
+                   for rows in arms[candidate] for request, (plan, _) in enumerate(rows)),
                sum((candidate_calls & calls_by_arm[name]).values()))
-        for name in ROW_DEPENDENCY_ARMS[:-1]
+        for name in arms if name != candidate
     }
 
 
 def report_row_dependencies(root, group):
-    arms = {name: load(root, group, name, row_dependencies=True) for name in ROW_DEPENDENCY_ARMS}
-    new = arms['row-deps']
+    packets = (root / 'li-packets.txt').is_file()
+    candidate = 'li-packets' if packets else 'row-deps'
+    controls = ('fixed-order', 'row-deps' if packets else 'offset')
+    marker = root / 'packet-reference.txt'
+    reference = Path(marker.read_text().strip()) if marker.exists() else None
+    controls_root = reference or root
+    if reference:
+        for key in ('row-deps.txt', 'fixed-order.txt', 'physical_npu.txt'):
+            if (reference / key).read_text().strip() != (root / key).read_text().strip():
+                raise ValueError(f'Archived control identity differs: {key}')
+    arms = {name: load(controls_root, group, name, row_dependencies=True) for name in controls}
+    arms[candidate] = load(root, group, candidate, row_dependencies=True)
+    new = arms[candidate]
     if len({v[5] for v in arms.values()}) != 3 or any(v[0] != new[0] for v in arms.values()):
         raise ValueError('Controls must use identical inputs and distinct verified binaries')
     digests = [digest for value in arms.values() for digest in value[1]]
     if len(digests) != 60 or len(set(digests)) != 1 or not SHA256.fullmatch(digests[0]):
         raise ValueError('Different TopK IDs on identical real inputs')
-    compared = compare_layout_receipts({name: value[11] for name, value in arms.items()})
+    if any(v[14] != new[14] for v in arms.values()):
+        raise ValueError('Different KVAF runtime checkout in compared arms')
+    compared = compare_layout_receipts({name: value[11] for name, value in arms.items()}, candidate)
+    if packets and (new[12][1] is None or (not reference and arms['row-deps'][12][1] is None)):
+        raise ValueError('Missing per-query physical row reuse readback')
     print(f'G{group} CHECK TopK=PASS same_TopK=20/20 KV=PASS ordered_Index=PASS per_arm=320/320')
-    for name in ROW_DEPENDENCY_ARMS:
-        v = arms[name]
-        print(f'G{group} {name} graph_mean/P50_us={v[3]:.2f}/{v[4]:.2f} tail_mean/P50_us={v[8]:.2f}/{v[10]:.2f}')
-    for name in ROW_DEPENDENCY_ARMS[:-1]:
+    for name, v in arms.items():
+        print(f'G{group} {name} graph_mean/P50_us={v[3]:.2f}/{v[4]:.2f} '
+              f'tail_mean/P50_us={v[8]:.2f}/{v[10]:.2f} LI_mean_us={v[13]:.2f}')
+        if v[12] is not None:
+            fast, overlap = v[12]
+            reuse = ' cross_Q_physical_row_reuse_requests=' + ('unavailable' if overlap is None else f'{overlap}/320')
+            print(f'G{group} {name} disjoint_fast_requests={fast}/320 general_requests={320-fast}/320{reuse}')
+    for name in controls:
         old = arms[name]
         gain = [100 * (1 - new[i] / old[i]) for i in (3, 4)]
         drift = [max(abs(x), abs(y)) for x, y in zip(old[6], new[6])]
@@ -270,18 +298,19 @@ def report_row_dependencies(root, group):
         if placement != 'matched':
             gate = 'PLACEMENT_MISMATCH'
         elif not same_rows:
-            gate = 'NO_SHARED_INDEX_EVENTS'
+            gate = 'NO_IDENTICAL_REQUEST_PLANS'
         elif same_calls != 20:
-            gate = 'PARTIAL_INDEX_EVENT_COVERAGE'
+            gate = 'PARTIAL_IDENTICAL_CALL_PLANS'
         elif all(g > d for g, d in zip(gain, drift)) and min(tail) > 0:
-            gate = 'POSITIVE'
+            gate = 'CROSS_RUN_GAIN' if reference else 'POSITIVE'
         elif min(gain) > 0:
             gate = 'INCONCLUSIVE'
         else:
             gate = 'KEEP_CONTROL'
         print(f'G{group} vs_{name} graph_saved_mean/P50_us={old[3]-new[3]:+.2f}/{old[4]-new[4]:+.2f} '
               f'tail_saved_mean/P50_us={tail[0]:+.2f}/{tail[1]:+.2f} '
-              f'same_event_layout_rows={same_rows}/320 same_event_calls={same_calls}/20 placement={placement} {gate}')
+              f'identical_ordered_request_plans={same_rows}/320 identical_full_call_plans={same_calls}/20 '
+              f'placement={placement} timing_scope={"archived_control" if reference else "same_run"} {gate}')
 
 
 def main(root, group):

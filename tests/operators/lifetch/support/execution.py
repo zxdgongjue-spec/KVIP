@@ -3423,19 +3423,21 @@ class FusedReplayState:
                 raise RuntimeError(f'Replay persistent hot KV mismatch: request={row}')
         if getattr(self, 'verify_ranked_events', False):
             from ranked_five_report import verify_swaps
-            from query_owner_report import check_layout_receipt
+            from query_owner_report import layout_receipt
             sources = self.forward.events_src.cpu().numpy()
             destinations = self.forward.events_dst.cpu().numpy()
             counts = self.forward.flags.cpu().numpy()[:, (0,12,13,14,15), 1]
             self.layout_receipts = []
-            compare_layout = self.query_owner_arm in ('fixed-order', 'offset', 'row-deps')
+            compare_layout = self.query_owner_arm in ('fixed-order', 'offset', 'row-deps', 'li-packets')
+            track_cross_q = self.query_owner_arm in ('offset', 'row-deps', 'li-packets')
+            self.cross_q_overlap_requests = 0
             for row in range(self.batch):
-                args = (self.input_layout[row], layout[row], inputs.captured_hot_valid[row],
-                        hot_valid[row], sources[row], destinations[row], counts[row])
+                moved = (sources[row], destinations[row], counts[row])
+                self.cross_q_overlap_requests += verify_swaps(
+                    self.input_layout[row], layout[row], inputs.captured_hot_valid[row],
+                    hot_valid[row], *moved, track_cross_q=track_cross_q)
                 if compare_layout:
-                    self.layout_receipts.append(check_layout_receipt(*args))
-                else:
-                    verify_swaps(*args)
+                    self.layout_receipts.append(layout_receipt(layout[row], hot_valid[row], *moved))
         return layout, hot_valid
 
     def check_completion(self):
@@ -3508,7 +3510,7 @@ class FusedReplayState:
                 f'source={source} selected={selected} resolver_slot={raw_slot}')
         output = self.output[1:].cpu().numpy()
         layout, hot_valid = self.validate_index(inputs, output)
-        if arm in ('offset', 'row-deps'):
+        if arm in ('offset', 'row-deps', 'li-packets'):
             from query_owner_report import check_offset_plan
             self.offset_check = check_offset_plan(
                 self.forward.events_src.cpu().numpy(), self.forward.events_dst.cpu().numpy(),
@@ -3551,7 +3553,7 @@ class FusedReplayState:
         failures = []
         try:
             inputs.validate_topk(ids)
-            if arm in ('fixed-order', 'chain', 'spill', 'local', 'offset', 'row-deps'):
+            if arm in ('fixed-order', 'chain', 'spill', 'local', 'offset', 'row-deps', 'li-packets'):
                 from query_owner_report import check_cutoff_ids
                 check_cutoff_ids(inputs, self.input_layout, ids)
         except AssertionError as error:
@@ -4155,7 +4157,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
         state.forward()
         stream.synchronize()
         replay_stage('first eager completed; correctness check')
-        if getattr(config, 'query_owner_arm', None) == 'row-deps':
+        if getattr(config, 'query_owner_arm', None) in ('row-deps', 'li-packets'):
             state.verify_ranked_events = True
             validate(initial)
         else:
@@ -4193,6 +4195,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                     result['layout_receipts'] = [s.layout_receipts for s in batch_states]
                 if hasattr(batch_states[0], 'offset_check'):
                     result['offset_checks'] = [s.offset_check for s in batch_states]
+                    result['cross_q_overlap_requests'] = [s.cross_q_overlap_requests for s in batch_states]
                 result['production_revision'] = config.production_revision
                 result['binary_sha256'] = hashlib.sha256(Path(library).read_bytes()).hexdigest()
             elif getattr(config, 'candidate_root', None):
