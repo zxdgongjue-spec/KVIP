@@ -3501,6 +3501,15 @@ class FusedReplayState:
                 f'source={source} selected={selected} resolver_slot={raw_slot}')
         output = self.output[1:].cpu().numpy()
         layout, hot_valid = self.validate_index(inputs, output)
+        if arm == 'offset':
+            from query_owner_report import check_offset_plan
+            self.offset_check = check_offset_plan(
+                self.forward.events_src.cpu().numpy(), self.forward.events_dst.cpu().numpy(),
+                self.forward.flags.cpu().numpy()[:, (0, 12, 13, 14, 15), 1],
+                self.rotating.final_posts.cpu().numpy(), self.rotating.lru_slots.cpu().numpy(),
+                self.workspace.topk.cpu().numpy().reshape(self.batch, 4, 2048),
+                self.rotating.locations.cpu().numpy().reshape(self.batch, 4, 2048),
+                self.rotating.reserved_hot.cpu().numpy().reshape(self.batch, self.resident))
         if getattr(self, 'verify_ranked_events', False):
             from correctness import topk_fingerprint
             self.topk_set_digest = topk_fingerprint(ids)
@@ -3535,7 +3544,7 @@ class FusedReplayState:
         failures = []
         try:
             inputs.validate_topk(ids)
-            if arm in ('fixed-order', 'chain', 'spill', 'local'):
+            if arm in ('fixed-order', 'chain', 'spill', 'local', 'offset'):
                 from query_owner_report import check_cutoff_ids
                 check_cutoff_ids(inputs, self.input_layout, ids)
         except AssertionError as error:
@@ -4169,6 +4178,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 result['topk_set_digests'] = [s.topk_set_digest for s in batch_states]
                 if hasattr(batch_states[0], 'query_owners'):
                     result['query_owners'] = [s.query_owners for s in batch_states]
+                if hasattr(batch_states[0], 'offset_check'):
+                    result['offset_checks'] = [s.offset_check for s in batch_states]
                 result['production_revision'] = config.production_revision
                 result['binary_sha256'] = hashlib.sha256(Path(library).read_bytes()).hexdigest()
             elif getattr(config, 'candidate_root', None):

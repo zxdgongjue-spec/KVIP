@@ -40,6 +40,56 @@ def owner_receipts(posts):
     return dict(owners=64, queues=int(np.unique(view).size), processed=int(posts[:, :, 10].sum()))
 
 
+def check_offset_plan(events_src, events_dst, counts, posts, candidates, selected, slots, reserved):
+    """Check publication order, prefetch exclusion and victim choice after timing."""
+    if np.any(posts[:, :, 5] != posts[:, :, 0]) or np.any(posts[:, :, 11:13] > 1):
+        raise ValueError('Unsafe final Get or invalid offset-path receipt')
+    if np.any(posts[:, :, 12] != posts[:, :1, 12]):
+        raise ValueError('Index owners disagreed on the row plan')
+    extended_slots = 0
+    for row, (used, *per_q) in enumerate(counts):
+        used = int(used)
+        if not 0 <= used <= len(candidates[row]) or list(posts[row, :, 0]) != per_q:
+            raise ValueError('Prefetch or per-query counts differ')
+        total = sum(per_q)
+        final_src = events_src[row, 2048:2048+total]
+        final_dst = events_dst[row, 2048:2048+total]
+        lru = candidates[row]
+        if (len(set(final_dst)) != total or len(set(final_src)) != total or
+                not np.array_equal(lru[:used], events_dst[row, :used]) or
+                np.intersect1d(lru[:used], final_dst).size):
+            raise ValueError(f'Genuine prefetch/final destination overlap or duplicate on row {row}')
+        missing = set(final_src.tolist())
+        assigned = dict(zip(final_src.tolist(), final_dst.tolist()))
+        seen = set()
+        cursor = 0
+        for q, amount in enumerate(per_q):
+            ordered = []
+            for token, slot in zip(selected[row, q], slots[row, q]):
+                if token in assigned and slot != assigned[token]:
+                    raise ValueError(f'Final token maps to the wrong physical slot on row {row} Q{q+1}')
+                if token in missing and token not in seen:
+                    ordered.append(token)
+                    seen.add(token)
+            if not np.array_equal(ordered, final_src[cursor:cursor+amount]):
+                raise ValueError(f'Wrong unique miss owner or order on row {row} Q{q+1}')
+            cursor += amount
+        known = slots[row][~np.isin(selected[row], final_src)]
+        protected = set(known.tolist())
+        inverse = reserved[row]
+        taken = set(lru[:used])
+        order = [slot for i, slot in enumerate(lru) if i >= used and 0 <= slot < len(inverse) and inverse[slot] == i
+                 and slot not in protected and slot not in taken]
+        if len(order) < total:
+            extended_slots += total - len(order)
+            # All ordinary ordinals follow the LRU suffix in physical order.
+            occupied = protected.union(taken, order)
+            order.extend(slot for slot in range(len(inverse)) if slot not in occupied)
+        if not np.array_equal(order[:total], final_dst):
+            raise ValueError(f'Wrong exclusive-prefix allocation on request {row}')
+    return dict(extended_slots=extended_slots, independent_rows=int(posts[:, 0, 12].sum()))
+
+
 def load(root, group, label):
     path, = (root / f'g{group}' / label / 'results').glob('**/fused/path_result.json')
     out = read(path)
@@ -92,13 +142,22 @@ def load(root, group, label):
           f'span_drift_mean/P50_pct={drift[0]:+.2f}/{drift[1]:+.2f} miss_pct={miss:.3f} '
           f'waste/repair_KiB={kib[0]:.1f}/{kib[1]:.1f} total_MiB={mib:.4f}', flush=True)
     thp = read(root / f'g{group}' / label / 'thp.json')
+    if label == 'offset':
+        receipts = out['offset_checks']
+        if len(receipts) != 20:
+            raise ValueError('Missing post-timing slot checks')
+        print(f"G{group} OFFSET_CHECK calls=20/20 prefetch_slot_reuse=0 "
+              f"hot_slots_selected_beyond_list={sum(r['extended_slots'] for r in receipts)} "
+              f"independent_Index_rows={sum(r['independent_rows'] for r in receipts)}/320", flush=True)
     return inputs, out['topk_set_digests'], thp, m, p, out['binary_sha256'], drift, times, stages['resolve_update'], mean(v['final'] for v in traffic)
 
 
 def report_resolver(root, group):
-    arms = {arm: load(root, group, arm) for arm in ('chain', 'spill', 'local')}
-    pairs = [('spill', 'local'), ('chain', 'local')]
-    if group in (7, 4):
+    offset = (root / 'offset.txt').is_file()
+    names = ('chain', 'offset', 'fixed-order') if offset else ('chain', 'spill', 'local')
+    arms = {arm: load(root, group, arm) for arm in names}
+    pairs = [('chain', 'offset'), ('fixed-order', 'offset')] if offset else [('spill', 'local'), ('chain', 'local')]
+    if not offset and group in (7, 4):
         arms['fixed-order'] = load(root, group, 'fixed-order')
         pairs.append(('fixed-order', 'local'))
     original = arms['chain']
@@ -127,7 +186,7 @@ def report_resolver(root, group):
 
 
 def main(root, group):
-    if (root / 'local.txt').is_file():
+    if (root / 'local.txt').is_file() or (root / 'offset.txt').is_file():
         return report_resolver(root, group)
     old, new = [load(root, group, name) for name in ('baseline', 'candidate')]
     if old[0] != new[0] or old[5] == new[5]:
