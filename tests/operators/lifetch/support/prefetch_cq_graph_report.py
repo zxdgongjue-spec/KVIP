@@ -289,7 +289,7 @@ def summarize(data, ticks, archived_calls):
             f"近末核={owner_name(near)} 到达滞后上界={near['barrier']:.2f} 近末核工作={near['work']:.2f} "
             f"整批预取/补取数={sum(r['prefetch'] for r in traffic)}/{sum(r['final'] for r in traffic)} "
             f"该行Q1/Q4补取数={row['queries'][0]['final_posted']}/{row['queries'][3]['final_posted']} "
-            f"近末核分配/输出适配/应用Index交换={joined(near['resolve'], near['adapt'], near['apply'])} "
+            f"近末核分配/输出适配/等Index/应用Index交换={joined(near['resolve'], near['adapt'], near['index_wait'], near['apply'])} "
             f"近末核最终回执早批/回调后={joined(near['early'], near['late'])} "
             f"该行Q1交接/读完旧映射/开始收预取/发布预取={joined(q1['index_release'], q1['output'], q1['pref_begin'], q1['pref_publish'])} "
             f"Q1排预取={q1['drain']:.2f} 预取回执数/探测次数={q1['pending']}/{q1['polls']} "

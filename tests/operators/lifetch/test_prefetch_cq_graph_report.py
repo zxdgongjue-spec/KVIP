@@ -118,7 +118,12 @@ def test_private_cq_on_both_sides_of_callback_and_independent_clocks():
     assert (q1["drain"], q4["gate"], q4["old"], q4["early"], q4["late"], capped) == (47, 11, 5, 4, 8, 0)
     assert q4["observed_lag"] == 120 and q4["retry_cqs"] == 1
     assert q4["finalize"] == 14 and q4["joins"] == [1] * 4
+    # Force Q3 to arrive closest to the barrier in one fast call.
+    ticks[2, 6, report.F["barrier_end"]] = ticks[2, 6, report.F["barrier_start"]]
+    data["ticks_sha256"] = report.counter_digest(ticks)
     lines = report.summarize(data, ticks, archive)
+    q3_line = next(line for line in lines if line.startswith("G7 调用3 "))
+    assert "近末核=R1Q3" in q3_line and "近末核分配/输出适配/等Index/应用Index交换=4.00/2.00/7.00/0.00" in q3_line
     assert len([s for s in lines if s.startswith("G7 调用")]) == 20
     assert any("超过300微秒的有打点调用=10/20 近末核=R0Q4×10" in s for s in lines)
     assert any("与同位置关闭计划相同=20/20" in s for s in lines)
