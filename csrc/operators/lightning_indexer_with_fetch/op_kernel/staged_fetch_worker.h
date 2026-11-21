@@ -6,10 +6,11 @@ namespace rotating {
 struct CqDrainResult { uint64_t error; uint32_t completed; uint64_t polls; };
 // Exclusive CQ consumer. Inspect every status; never infer success from the tail.
 // pending < depth ensures no CQ space must be reclaimed before the tail arrives.
-template<class Access>
+struct NoCqObservation { V9_CQ_INLINE void Observe() {} };
+template<class Access, class Observer=NoCqObservation>
 V9_CQ_INLINE CqDrainResult DrainCq(Access& access, uint64_t consumer,
     uint32_t depth, uint32_t pending, uint32_t maxPolls,
-    uint64_t invalid, uint64_t cqError, uint64_t timeout) {
+    uint64_t invalid, uint64_t cqError, uint64_t timeout, Observer observer={}) {
     CqDrainResult result{0,0,0};
     if (!pending) return result;
     if (depth < 2 || pending >= depth) { result.error=invalid; return result; }
@@ -20,6 +21,7 @@ V9_CQ_INLINE CqDrainResult DrainCq(Access& access, uint64_t consumer,
             uint32_t word=access.Read(uint32_t(consumer%depth));
             ++result.polls;
             if (((word>>2)&1U)==((consumer/depth)&1U)) continue;
+            observer.Observe();
             ready=true;
             ++consumer;
             if ((word>>16)!=0) result.error=cqError;
@@ -62,19 +64,24 @@ struct CqAccess {
         st_dev(uint32_t(consumer)&kvaf_device::kCqConsumerMask,doorbell,0);
     }
 };
+struct CqObservation {
+    __gm__ uint64_t* last;
+    __aicore__ inline void Observe() { *last=AscendC::GetSystemCycle(); }
+};
+template<class Observer=NoCqObservation>
 __aicore__ inline CqDrainResult DrainQueue(
     __gm__ const KvafBatchGetDirectUrmaEntity* entity,
-    __gm__ KvafBatchGetQueueState* queue,uint32_t pending) {
+    __gm__ KvafBatchGetQueueState* queue,uint32_t pending,Observer observer={}) {
     if (!pending) return {0,0,0};
     CqAccess access{reinterpret_cast<__gm__ uint8_t*>(entity->cq_va),entity->cqe_size,
         reinterpret_cast<__gm__ uint32_t*>(entity->cq_db_va),queue};
     auto result=DrainCq(access,queue->cq_consumer_index,entity->cq_depth,pending,
-        kvaf_device::kMaxCqPolls*kFusedCqPollMultiplier,kvaf_device::kInvalidArgs,kvaf_device::kCqError,kvaf_device::kCqTimeout);
+        kvaf_device::kMaxCqPolls*kFusedCqPollMultiplier,kvaf_device::kInvalidArgs,kvaf_device::kCqError,kvaf_device::kCqTimeout,observer);
     queue->completed_batch_count+=result.completed;
     return result;
 }
 __aicore__ inline void CompletePrefetch(__gm__ Context* ctx,uint32_t b,bool initializeSpare,
-    uint64_t* diagnosticPolls=nullptr,uint64_t* diagnosticDrain=nullptr,uint64_t* diagnosticArrival=nullptr) {
+    uint64_t* diagnosticPolls=nullptr,uint64_t* diagnosticDrain=nullptr,uint64_t* diagnosticArrival=nullptr, __gm__ uint64_t* ownerCq=nullptr) {
         auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
         // Only the first cache line and the pending field are read/written here.
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(row),64);
@@ -88,7 +95,9 @@ __aicore__ inline void CompletePrefetch(__gm__ Context* ctx,uint32_t b,bool init
 #if !V9_SIMULATION
         if(!error) {
             uint64_t start=diagnosticDrain?GetSystemCycle():0;
-            auto result=DrainQueue(entity,queue,row->pending);
+            auto result=ownerCq ? DrainQueue(entity,queue,row->pending,CqObservation{ownerCq})
+                                : DrainQueue(entity,queue,row->pending);
+            if(ownerCq){ownerCq[4]=row->pending;ownerCq[5]=result.completed;}
             if(diagnosticArrival)*diagnosticArrival=GetSystemCycle();
             if(diagnosticDrain)*diagnosticDrain=*diagnosticArrival-start;
             if(diagnosticPolls)*diagnosticPolls=result.polls;

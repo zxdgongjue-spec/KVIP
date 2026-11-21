@@ -147,8 +147,8 @@ class StreamingLIFetchForward:
                 blob,
                 np.asarray([self.dense_shadow.data_ptr(), self.packed_fetch.data_ptr(), completed_flags, live_count, completed_rows, completed_events, completed_mapping, completed_journal], dtype="<u8").view("u1"),
                 np.asarray([self.index_team.data_ptr() if self.index_team is not None else 0], dtype="<u8").view("u1"),
-                np.asarray([owner_scratch], dtype="<u8").view("u1"),
-                np.zeros(48, dtype="u1"),
+                np.asarray([owner_scratch, 0], dtype="<u8").view("u1"),
+                np.zeros(40, dtype="u1"),
             )
         )
         if len(blob) != 256:
@@ -188,6 +188,18 @@ class StreamingLIFetchForward:
         result = self.function(*args)
         if result:
             raise RuntimeError(f"streaming LIFetch launch failed: {result}")
+
+    def set_query_owner_capture(self, enabled=True):
+        """Attach a private trace to an offline replay. Initialize before capture."""
+        if not hasattr(self, "query_owner_scratch"):
+            raise ValueError("Query-owner capture requires the BS16 query-owner route")
+        if enabled and not hasattr(self, "query_owner_trace"):
+            self.query_owner_trace = self.torch.zeros(
+                (self.batch * 4, 848), dtype=self.torch.int64, device=self.rotating.device
+            )
+        address = self.query_owner_trace.data_ptr() if enabled else 0
+        encoded = np.asarray([address], dtype="<u8").view("u1")
+        self.workspace[208:216].copy_(self.torch.from_numpy(encoded.copy()))
 
     def set_options(self, *, diagnostics=False, deferred_fetch=False):
         """Startup/profile-only update; forward never allocates or copies."""
