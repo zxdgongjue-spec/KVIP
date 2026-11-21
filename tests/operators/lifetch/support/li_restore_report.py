@@ -3,13 +3,14 @@ import sys
 from math import isclose, isfinite
 from pathlib import Path
 from statistics import mean, median
+from zipfile import BadZipFile
 
 import numpy as np
 
 from correctness import topk_fingerprint
 from diagnostics import union
-from li_restore_archive import archive_lines
-from ranked_integration_sets import archived_integration_line
+from li_restore_archive import archive_lines, dp_capture_id
+from ranked_integration_sets import INPUT_AND_RESULTS, archived_integration_line
 from peer_delta import pair_placement, read
 from query_owner_report import compare_layout_receipts, load
 
@@ -46,6 +47,70 @@ RESTORED_HOST20 = {
 
 def saved(old, new):
     return '/'.join(f'{a-b:+.2f}' for a, b in zip(old, new))
+
+
+# User's 2-Get-worker serial RARs, device 4, one profiled graph, 20 samples.
+# Their replay_input.json equals the eight-rank capture bound by INPUT_AND_RESULTS.
+SERIAL_NPU4 = {7: (589.598798752, 575.597625), 17: (436.236286163, 426.187875),
+               4: (399.551296234, 391.969375)}
+FIRST_EXACT = '81e22933b1166685f82b7f0d8a44495c6e628a70'
+
+
+def serial_graph_line(group, inputs, graph):
+    prefix = f'G{group} vs_serial2_archive'
+    if group not in SERIAL_NPU4:
+        return f'{prefix} UNAVAILABLE missing_reference'
+    if dp_capture_id(group, inputs) != INPUT_AND_RESULTS[group][0]:
+        return f'{prefix} UNVERIFIED capture_identity_differs'
+    old = SERIAL_NPU4[group]
+    gain = '/'.join(f'{100*(a-b)/a:+.2f}' for a, b in zip(old, graph))
+    return (f'{prefix} historical_unpaired graph_saved_mean/P50_us={saved(old, graph)} '
+            f'gain_mean/P50_pct={gain} gap_to_35_mean/P50_us={saved(graph, [0.65*v for v in old])}')
+
+
+def exact_archive_line(root, group, data, measured, comparison):
+    prefix = f'G{group} vs_local_81e22933'
+    # Select the latest *completed compatible group* by result-file mtime. An
+    # interrupted four-group command can still supply its completed groups.
+    profiles = []
+    reason = 'missing_completed_reference'
+    for marker in root.parent.glob('fused.*/logical-ties.txt'):
+        previous = marker.parent
+        try:
+            if previous != root and marker.read_text().strip() == FIRST_EXACT:
+                results = previous / f'g{group}/logical-ties/results'
+                for path in results.glob('*/cases/diagnose/fused/path_result.json'):
+                    profiles.append((path.stat().st_mtime_ns, previous, path))
+        except OSError as error:
+            reason = f'{previous.name}:{error}'
+    for _, previous, path in sorted(profiles, reverse=True):
+        try:
+            if (previous / 'physical_npu.txt').read_text().strip() != (root / 'physical_npu.txt').read_text().strip():
+                raise ValueError('physical_NPU_differs')
+            archived = read(path.parent / 'native_li_compare.json')
+            before = archived['native_reference']['identity']
+            after = comparison['native_reference']['identity']
+            # The identity contains actual operand and layout SHA256s, host boot
+            # UUID, ordinal, device model and the loaded runtime/library versions.
+            if not before.get('boot') or not before.get('inputs') or before != after:
+                raise ValueError('host_boot_runtime_or_input_fingerprint_differs')
+            if (archived['group'], archived['measured_calls'], archived['queries_per_call']) != (group, 20, 64):
+                raise ValueError('reference_coverage_differs')
+            prior = load(previous, group, 'logical-ties', row_dependencies=True)
+            stable = read_sets(path.parent, archived, 20, prior[1])[4]
+            if not stable or prior[1] != data[1] or prior[0] != data[0]:
+                raise ValueError('reference_TopK_or_replay_input_differs')
+            placement = pair_placement(prior[2], data[2], local_baseline=True)
+            if placement != 'matched':
+                raise ValueError(placement)
+            li, final = li_times(read(path.parent / 'diagnose/round-1/full_attribution.json')['samples'])
+            return (f'{prefix} historical_unpaired source={previous.name} placement=matched '
+                    f'LI_saved_mean/P50_us={saved(li, measured[0])} LI4_saved_mean/P50_us={saved(final, measured[1])} '
+                    f'graph_saved_mean/P50_us={saved(prior[3:5], data[3:5])} '
+                    f'tail_saved_mean/P50_us={saved((prior[8], prior[10]), (data[8], data[10]))}')
+        except (OSError, KeyError, ValueError, IndexError, TypeError, BadZipFile) as error:
+            reason = f'{previous.name}:{error}'
+    return f'{prefix} UNAVAILABLE reason={reason}'
 
 
 def owner_delta(root, group, current, li_pair, li4_pair):
@@ -183,6 +248,12 @@ def report(root, group, label='li-restore'):
     if label == 'logical-ties':
         priority_line(group, comparison)
         print(archived_integration_line(group, data[0], serial_ids))
+        if ok:
+            print(exact_archive_line(root, group, data, (li_pair, li4_pair), comparison))
+            try:
+                print(serial_graph_line(group, data[0], data[3:5]))
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                print(f'G{group} vs_serial2_archive UNVERIFIED input_error={error}')
         prior_li, prior_li4, prior_graph = RESTORED_HOST20[group]
         print(f'G{group} vs_host20_NPU4_9518e6f0 historical_unpaired '
               f'LI_saved_mean/P50_us={saved(prior_li, li_pair)} LI4_saved_mean/P50_us={saved(prior_li4, li4_pair)} '

@@ -14,19 +14,18 @@ from peer_delta import read
 from ranked_auto_report import FIXED, load
 
 BASELINE_RUN = 'help-96211844-fcb8095d52d34b1c62be'
-# Published host20 NPU0 fixed-arm LI launch means, rounded separately to 0.01 us.
-PUBLISHED = {7: (29.20, 19.61, 211.86, 25.53), 10: (29.20, 19.47, 191.72, 25.51),
-             17: (29.24, 19.53, 194.13, 26.01), 4: (29.24, 19.52, 192.94, 25.74)}
+# Host20/NPU4 fused.b8TJ3b read these archive values directly from host20/NPU0
+# help-96211844-fcb8095d52d34b1c62be. Each pair is a measured mean and P50.
+PUBLISHED = {7: ((286.20, 285.87), (25.53, 25.60)), 10: ((265.90, 265.50), (25.51, 25.58)),
+             17: ((268.91, 268.77), (26.01, 25.98)), 4: ((267.45, 267.62), (25.74, 25.69))}
 SHA = re.compile(r'[a-f0-9]{64}')
 
 
 def published(group, reason, li_pair, li4_pair):
-    values = PUBLISHED[group]
+    li, final = PUBLISHED[group]
     return [f'G{group} 6bca602a_archive reason={reason} vs_strong_serial_set=UNVERIFIED '
-            f'published_host20_NPU0_LI_mean_approx_us={sum(values):.2f} '
-            f'published_LI4_mean_us={values[3]:.2f} published_LI/LI4_P50_us=unavailable '
-            f'current_minus_published_LI_mean_approx_us={li_pair[0] - sum(values):+.2f} '
-            f'current_minus_published_LI4_mean_us={li4_pair[0] - values[3]:+.2f}']
+            f'published_host20_NPU0 historical_unpaired LI_mean/P50_us={pair(li)} LI4_mean/P50_us={pair(final)} '
+            f'LI_saved_mean/P50_us={difference(li, li_pair)} LI4_saved_mean/P50_us={difference(final, li4_pair)}']
 
 
 def dp_capture_id(group, meta):
@@ -157,7 +156,6 @@ def archive_lines(root, group, input_meta, native_ids, li_pair, li4_pair):
                 f'same_64Q_sets_calls={matches}/20 distinct_64Q_sets={repeat_sets} '
                 f'native_reference=first_logical_strong_serial',
                 f'G{group} archived_6bca602a LI_mean/P50_us={pair(li)} LI4_mean/P50_us={pair(final)} '
-                f'current_minus_archive_LI_mean/P50_us={difference(li_pair, li)} '
-                f'current_minus_archive_LI4_mean/P50_us={difference(li4_pair, final)}']
+                f'LI_saved_mean/P50_us={difference(li, li_pair)} LI4_saved_mean/P50_us={difference(final, li4_pair)}']
     except (OSError, ValueError, KeyError, IndexError, TypeError, BadZipFile) as exc:
         return published(group, f'unverified:{exc}', li_pair, li4_pair)
