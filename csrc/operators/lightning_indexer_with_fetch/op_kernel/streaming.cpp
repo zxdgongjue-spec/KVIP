@@ -77,6 +77,7 @@ __simt_callee__ inline void PublishPreparedQueryBody(ContextPointer,__gm__ Batch
  uint32_t,uint32_t,uint32_t,uint32_t,__gm__ uint32_t*);
 // One warp pair handles sparse rows. Preserve the dense resolver's hash ABI
 // and first-position ordering so a later query can take either path.
+template<bool OwnerDescriptors = false>
 __simt_callee__ inline void ResolveCompactBody(
     StagedContextPointer ctx,uint32_t b,uint32_t q,uint32_t resident,uint32_t used,uint32_t count,
     __gm__ uint32_t* entries,__ubuf__ uint32_t* keys,__ubuf__ uint32_t* ranks,
@@ -87,6 +88,7 @@ __simt_callee__ inline void ResolveCompactBody(
     if(!count){
         if(!tid){
             ctl[2+q]=0;
+            if constexpr(OwnerDescriptors)ctl[17]=0;
             asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->changeCount)+b,kLruSlots+old);
         }
         if(direct)PublishPreparedQueryBody(ctx,static_cast<__gm__ BatchFlag*>(nullptr),b,q,
@@ -128,8 +130,12 @@ __simt_callee__ inline void ResolveCompactBody(
         auto changes=reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+b*kChangeCapacity;
         auto changedSlots=reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+b*kChangeCapacity;
         asc_stcg(changes+kLruSlots+rank,UINT32_MAX);asc_stcg(changes+ordinal,token);asc_stcg(changedSlots+ordinal,slot);
-        if(direct){
-            // Every destination was verified in the unused LRU suffix above.
+        if constexpr(OwnerDescriptors){
+            // All lanes have consumed their compact entries before reusing this Q's bank.
+            uint32_t output=(b*4+q)*kTop+(rank-old);
+            uint32_t ownerBase=OwnerRow(ctx,b)*OutputStride(resident,ctx);
+            StoreOwnerFinalDescriptor(ctx,b,output,token,slot,ownerBase,ctl);
+        }else if(direct){
             uint32_t inQ=rank-old,pos=ctl[19]+inQ,output=(b*4+q)*kTop+inQ;
             uint32_t dstSlot=OwnerRow(ctx,b)*OutputStride(resident,ctx)+slot;
             auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;
@@ -144,7 +150,12 @@ __simt_callee__ inline void ResolveCompactBody(
     }
     asc_syncthreads();
     if(tid<count)asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+(b*4+q)*kTop+(entry&kPositionMask),slots[ranks[h]&~kStagedRankTag]);
-    if(!tid){if(direct && added)asc_atomic_add(liveCount,added);
+    if(!tid){
+        if constexpr(OwnerDescriptors){
+            // Compact preflight proved every new destination is in the unused LRU suffix.
+            ctl[17]=added;
+            if(added && !ctl[1])asc_atomic_add(liveCount,added);
+        }else if(direct && added)asc_atomic_add(liveCount,added);
         ctl[2+q]=added;ctl[0]=old+added;
         asc_stcg(reinterpret_cast<__gm__ uint32_t*>(ctx->changeCount)+b,kLruSlots+old+added);}
     asc_threadfence();asc_syncthreads();
@@ -157,6 +168,14 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(64) inline void ResolveCompact(
     __ubuf__ uint32_t* slots,__ubuf__ uint32_t* lru,__ubuf__ uint32_t* ctl,
     __gm__ uint32_t* source,__gm__ uint32_t* dest,__gm__ int32_t* direct,
     __gm__ uint64_t* addressList,uint32_t stride,__gm__ uint32_t* liveCount){ResolveCompactBody(ctx,b,q,resident,used,count,entries,keys,ranks,slots,lru,ctl,source,dest,direct,addressList,stride,liveCount);}
+__simt_vf__ __aicore__ LAUNCH_BOUND(64) inline void ResolveOwnerCompact(
+    StagedContextPointer ctx,uint32_t b,uint32_t q,uint32_t resident,uint32_t used,uint32_t count,
+    __gm__ uint32_t* entries,__ubuf__ uint32_t* keys,__ubuf__ uint32_t* ranks,
+    __ubuf__ uint32_t* slots,__ubuf__ uint32_t* lru,__ubuf__ uint32_t* ctl,
+    __gm__ uint32_t* source,__gm__ uint32_t* dest,__gm__ uint32_t* liveCount){
+    ResolveCompactBody<true>(ctx,b,q,resident,used,count,entries,keys,ranks,slots,lru,ctl,
+                             source,dest,nullptr,nullptr,0,liveCount);
+}
 // Publish Q1 before starting the remaining queries. Its tagged ranks survive
 // both parallel suffix resolution and the protected allocator fallback.
 __simt_vf__ __aicore__ LAUNCH_BOUND(64) inline void ResolveFirstCompactQuery(

@@ -5,6 +5,23 @@ namespace rotating {
 // The existing 64-word group control area is reset by round initialization.
 constexpr uint32_t kGroupSafeCountWord=0, kGroupConflictCountWord=8;
 constexpr uint32_t kGroupReadyWord=16, kGroupErrorWord=17;
+// A Q owner writes straight into its private KVAF input. Capture the old DDR
+// address while the current Index still names the selected token.
+__simt_callee__ inline void StoreOwnerFinalDescriptor(StagedContextPointer ctx, uint32_t b, uint32_t output,
+    uint32_t token, uint32_t slot, uint32_t ownerBase, __ubuf__ uint32_t* ctl) {
+    if (token >= ctx->shape.history) {
+        asc_atomic_or(ctl + 1, 1U);
+        return;
+    }
+    uint64_t address = 0;
+    if (ctx->fallbackAddresses) {
+        auto row = reinterpret_cast<__gm__ Row*>(ctx->rows) + b;
+        address = asc_ldcg(reinterpret_cast<__gm__ uint64_t*>(row->addresses) + token);
+    }
+    StoreFallbackSource(ctx->shape.history, ctx->shape.tokenBytes, ctx, b, output, token, address,
+        reinterpret_cast<__gm__ int32_t*>(ctx->sourceBlocks), reinterpret_cast<__gm__ int32_t*>(ctx->sourceOffsets));
+    asc_stcg(reinterpret_cast<__gm__ int32_t*>(ctx->destinations) + output, int32_t(ownerBase + slot));
+}
 template<uint32_t Threads=512>
 __simt_callee__
 inline void PackStagedUrmaQuery(uint32_t history, uint32_t resident, uint32_t tokenBytes,

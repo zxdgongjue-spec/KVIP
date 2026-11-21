@@ -45,6 +45,47 @@ __aicore__ inline __gm__ uint32_t *Scratch(__gm__ Args *a, uint32_t b) {
     return reinterpret_cast<__gm__ uint32_t *>(a->queryOwnerScratch) + b * kQueryOwnerRowWords;
 }
 
+// Keep the Index event order independent of the safe/conflict order in the private SQ input.
+__simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void ResolveOwnerQuery(StagedContextPointer ctx,
+    uint32_t history, uint32_t resident, uint32_t b, uint32_t q, uint32_t used,
+    __gm__ uint32_t *src, __gm__ uint32_t *dst, __ubuf__ uint32_t *selected, __ubuf__ uint32_t *loc,
+    __ubuf__ uint32_t *keys, __ubuf__ uint32_t *ranks, __ubuf__ uint16_t *ids, __ubuf__ uint32_t *slots,
+    __ubuf__ uint32_t *work, __ubuf__ uint32_t *ctl, __gm__ uint32_t *protect, __gm__ uint32_t *liveCount) {
+    StagedQuery(q, history, resident, ctx->shape.tokenBytes, b, used, ctx, selected, loc,
+                keys, ranks, ids, slots, work, ctl, protect);
+    if (ctl[1]) return;
+    const uint32_t count = ctl[2 + q], begin = ctl[0] - count;
+    if (count && (!protect || ctl[kProtectionState])) {
+        // The protected allocator may have reused prefetch slots. Preserve the
+        // original stable two-phase packing, consuming the resolver's UB values.
+        if (!threadIdx.x) ctx->count = reinterpret_cast<uint64_t>(liveCount);
+        PublishQ(selected, ids, slots, src, dst, begin, begin + count);
+        PackStagedUrmaQuery<512>(history, resident, ctx->shape.tokenBytes, b, q, used, begin, count,
+                                ctx, selected, ids, slots, ctl);
+        return;
+    }
+    // StagedQuery verified the inverse LRU ordinal of every unprotected
+    // destination against the unused suffix. All of these Gets are safe.
+    if (count) {
+        const uint32_t ownerBase = OwnerRow(ctx, b) * OutputStride(resident, ctx);
+        const uint32_t output = (4 * b + q) * kTop;
+        for (uint32_t i = threadIdx.x; i < count; i += 512) {
+            const uint32_t rank = begin + i, token = selected[ids[rank % kTop]], slot = slots[rank];
+            asc_stcg(src + kPrefetch + rank, token);
+            asc_stcg(dst + kPrefetch + rank, slot);
+            StoreOwnerFinalDescriptor(ctx, b, output + i, token, slot, ownerBase, ctl);
+        }
+        asc_threadfence();
+        asc_syncthreads();
+    }
+    if (!threadIdx.x) {
+        ctl[17] = count;
+        if (count && !ctl[1]) asc_atomic_add(liveCount, count);
+    }
+    asc_threadfence();
+    asc_syncthreads();
+}
+
 // The first resolver's prefix and later query suffixes use the same protected
 // allocator as the fixed graph, including ordinary hits outside the LRU list.
 __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32_t b, uint32_t q) {
@@ -147,9 +188,9 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
             SetFlag<HardEvent::S_V>(EVENT_ID0);
             WaitFlag<HardEvent::S_V>(EVENT_ID0);
             auto entries = reinterpret_cast<__gm__ uint32_t *>(ctx->sourceBlocks) + (4 * b + q) * kTop;
-            Simt::VF_CALL<ResolveCompact>(Simt::Dim3{64, 1, 1}, staged, b, q, a->resident, row->slots,
+            Simt::VF_CALL<ResolveOwnerCompact>(Simt::Dim3{64, 1, 1}, staged, b, q, a->resident, row->slots,
                 encoded - 1, entries, FinalPtr(keys), FinalPtr(ranks), FinalPtr(slots), FinalPtr(work[4096]),
-                FinalPtr(ctl), src, dst, nullptr, nullptr, 0, nullptr);
+                FinalPtr(ctl), src, dst, reinterpret_cast<__gm__ uint32_t*>(a->liveCount));
             VectorDone();
             compact = !ctl.GetValue(16);
         }
@@ -164,16 +205,17 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
             }
             InputReady();
             auto protect = reinterpret_cast<__gm__ uint32_t *>(a->queryBitmaps) + b * 4 * ((a->resident + 31) / 32);
-            Simt::VF_CALL<ResolveQueryWork>(
-                Simt::Dim3{512, 1, 1}, staged, a->history, a->resident, ctx->shape.tokenBytes, row->slots,
-                ctx->shape.batch, b, q, nullptr, nullptr, nullptr, src, dst, FinalPtr(ub), FinalPtr(loc),
+            Simt::VF_CALL<ResolveOwnerQuery>(
+                Simt::Dim3{512, 1, 1}, staged, a->history, a->resident, b, q, row->slots,
+                src, dst, FinalPtr(ub), FinalPtr(loc),
                 FinalPtr(keys), FinalPtr(ranks), reinterpret_cast<__ubuf__ uint16_t *>(ids.GetPhyAddr()),
-                FinalPtr(slots), FinalPtr(work), FinalPtr(ctl), nullptr, 0, protect);
+                FinalPtr(slots), FinalPtr(work), FinalPtr(ctl), protect, reinterpret_cast<__gm__ uint32_t*>(a->liveCount));
             VectorDone();
         }
         s.error = ctl.GetValue(1);
         if (!s.error) {
             s.count = ctl.GetValue(2 + q);
+            s.safe = ctl.GetValue(17);
             const uint32_t protection = ctl.GetValue(kProtectionState);
             flags[kRawQueryFlag + q].reserved[1] = protection;
             BeforeStore();
@@ -188,25 +230,6 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
                 }
             }
             StoreDone();
-            SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
-            WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
-            // Pack records with the request/query's own array base, before any Index
-            // metadata is committed. StoreFallbackSource snapshots flat DDR addresses.
-            if (!s.count) {
-                pipe.Destroy();
-                return s;
-            }
-            staged->count = a->liveCount;
-            SetFlag<HardEvent::S_V>(EVENT_ID0);
-            WaitFlag<HardEvent::S_V>(EVENT_ID0);
-            Simt::VF_CALL<PackPublicationEvents<512>>(Simt::Dim3{512, 1, 1}, staged, a->history, a->resident,
-                                                      ctx->shape.tokenBytes, b, q, row->slots,
-                                                      kPrefetch + s.begin, s.count, src, dst, FinalPtr(keys),
-                                                      reinterpret_cast<__ubuf__ uint16_t *>(ids.GetPhyAddr()),
-                                                      FinalPtr(work), FinalPtr(ctl), nullptr, 0, nullptr);
-            VectorDone();
-            s.error = ctl.GetValue(1);
-            s.safe = ctl.GetValue(17);
         }
     }
     pipe.Destroy();
