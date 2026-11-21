@@ -638,7 +638,15 @@ __aicore__ inline void FinalIncremental(uint32_t query,uint32_t valid) {
         WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);
     }
     if (exact) {
-        RepairLogicalCutoff(query,valid,reinterpret_cast<__gm__ uint16_t*>(IncrementalMeta(query)[0]),true,cutoff);
+        auto header = IncrementalMeta(query);
+        if (cutoff == UINT32_MAX) {
+            // A completed window published its cutoff together with the pair.
+            // SaveResident initializes this field to zero before the first
+            // window. In that case reduce the loaded scores to find the cutoff.
+            const uint16_t published = uint16_t(header[2]);
+            if (published) cutoff = published;
+        }
+        RepairLogicalCutoff(query,valid,reinterpret_cast<__gm__ uint16_t*>(header[0]),true,cutoff);
     }
     auto initial=streamingTopkOnly_?streamingOutput_:topkSharedTmpLocal_;
     kvip_prefetch_rank::RestorePublicIds(reinterpret_cast<__ubuf__ uint32_t*>(indicesOutLocal_.GetPhyAddr()),
