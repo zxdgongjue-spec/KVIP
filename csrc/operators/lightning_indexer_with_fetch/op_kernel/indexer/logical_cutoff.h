@@ -243,7 +243,8 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(kThreads) inline void Select(
         uint32_t resident, __gm__ uint32_t* hot, __gm__ int32_t* reserved, uint32_t tailBegin, uint32_t tailEnd) {
     uint32_t tid = threadIdx.x, quota = count[0];
     if (!quota) return;
-    if (SparseLogical(logical,marks,history,slots,quota,ids,work,count[8],resident,hot,reserved,tailBegin,tailEnd)) return;
+    if (words > kTile/32 &&
+        SparseLogical(logical,marks,history,slots,quota,ids,work,count[8],resident,hot,reserved,tailBegin,tailEnd)) return;
     const uint32_t logicalWords = (history+31)/32;
     auto prefix = work + logicalWords;
     auto ctl = prefix + kThreads;
@@ -313,10 +314,14 @@ __aicore__ inline void Repair(GlobalTensor<uint16_t> raw, GlobalTensor<uint64_t>
     if (valid) WaitFlag<HardEvent::V_MTE2>(EVENT_ID5);
     if (valid > kTile) WaitFlag<HardEvent::V_MTE2>(EVENT_ID3);
     PipeBarrier<PIPE_ALL>();
-    CompactWords(reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),
-                 reinterpret_cast<__ubuf__ uint32_t*>(tile.GetPhyAddr()),
-                 reinterpret_cast<__ubuf__ uint32_t*>(count[8].GetPhyAddr()), uint16_t(words));
-    PipeBarrier<PIPE_ALL>();
+    // A single score tile already fits the direct bitmap traversal. Compacting
+    // its word indices costs another vector pass and synchronization.
+    if (words > kTile/32) {
+        CompactWords(reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),
+                     reinterpret_cast<__ubuf__ uint32_t*>(tile.GetPhyAddr()),
+                     reinterpret_cast<__ubuf__ uint32_t*>(count[8].GetPhyAddr()), uint16_t(words));
+        PipeBarrier<PIPE_ALL>();
+    }
     Simt::VF_CALL<Select>(Simt::Dim3{kThreads,1,1},const_cast<__gm__ uint64_t*>(logical.GetPhyAddr()),
         reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),words,history,
         reinterpret_cast<__ubuf__ uint16_t*>(slots.GetPhyAddr()),
