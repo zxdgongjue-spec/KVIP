@@ -433,6 +433,15 @@ __aicore__ inline uint32_t AdvanceIncremental(uint32_t query,uint32_t end0,uint3
     PreloadIncremental(half);
     FlushIncremental(packed,packBase,false);
     PipeBarrier<PIPE_V>();
+    if (incrementalFinalValid_ && cutoff && incrementalCalls_ == callsBefore &&
+        !incrementalMetadataActive_ && !incrementalPipeline_) {
+        // Final advanced the cursors, but every score was rejected. The loaded
+        // pair and its published nonzero cutoff still describe this query.
+        rankEnd0_=prior[0];rankEnd1_=prior[1];
+        meta[1]=uint64_t(prior[0])|(uint64_t(prior[1])<<32);
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(meta),128);
+        return cutoff;
+    }
     // A nonzero cutoff already describes the unchanged TopK when this
     // window did not flush any candidates. Final TopK keeps its old path.
     uint32_t threshold=cutoff;
