@@ -3745,6 +3745,11 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
     capture = torch.npu.Stream()
     checks = CorrectnessRecorder()
     pending = False
+    owner_tail = os.environ.get('KVIP_Q4_OWNER_TAIL') == '1'
+    if owner_tail and not (fused and len(states) == len(sequence.rounds) == 1
+                           and config.query_owner_arm == 'owner-pack' and config.warmup == 4
+                           and config.mode == 'diagnose' and config.level == 1):
+        raise ValueError('Owner-tail capture requires one owner-pack state and one input round')
     def replay():
         nonlocal pending
         pending = True
@@ -3821,6 +3826,9 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                 state.check_completion()
             pending = False
             state.reset()
+        if owner_tail:
+            states[0].forward.set_query_owner_capture(True)
+            ticks_per_us = states[0].forward.calibrate_counter_mhz()
         stream.synchronize()
         with ExitStack() as scopes:
             if fused:
@@ -3861,6 +3869,24 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                 if candidate or lean:
                     point = route_step(warmup + 1)
                     route_history['warmup'].append(checked_routes(states, **point, low=point['step'] > 1))
+        if owner_tail:
+            from owner_pack_tail import capture as capture_tail
+            state = states[0]
+            def replay_and_time():
+                nonlocal pending
+                start = torch.npu.Event(enable_timing=True)
+                end = torch.npu.Event(enable_timing=True)
+                stream.synchronize()
+                start.record(stream)
+                replay()
+                end.record(stream)
+                end.synchronize()
+                pending = False
+                return start.elapsed_time(end) * 1000
+            checks.checked += capture_tail(state, initial, config, directory, ticks_per_us, replay_and_time)
+            pending = False
+            return dict(all_rounds={}, correctness=checks.status, failures=checks.failures,
+                        owner_tail_diagnostic='owner_tail.json')
         for state in states:
             state.reset()
         rounds = {}
@@ -4385,7 +4411,10 @@ def run_real(config, directory):
         atomic_json(directory / 'completed_timings.json', report)
     report['sequence'] = results
     atomic_json(directory / 'report.json', report)
-    if config.mode == 'check':
+    if results.get('fused', {}).get('owner_tail_diagnostic'):
+        atomic_json(directory / 'checks.json', [dict(case='owner-pack-tail',
+                    correctness=report['correctness'], detail='single-state diagnostic with paired trace on/off')])
+    elif config.mode == 'check':
         atomic_json(directory / 'checks.json', [dict(case='real', correctness=report['correctness'],
                     detail='real Q/Index; deterministic C8 KV; serial and fused graph replay')])
     return int(report['correctness'] != 'PASS')

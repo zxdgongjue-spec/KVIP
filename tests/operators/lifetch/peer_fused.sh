@@ -33,6 +33,10 @@ local_resolver=false
 offset_resolver=false
 row_deps=false
 candidate_only=false
+owner_tail=false
+owner_tail_reference=
+arm_iterations=20
+unset KVIP_Q4_OWNER_TAIL
 plan_candidate=
 packet_reference=
 plan_control=
@@ -75,16 +79,22 @@ if [[ ${1:-} == --ranked-help || ${1:-} == --ranked-joint ]]; then
     elif [[ -n "$joint_reference" ]]; then
         echo '--previous requires --ranked-joint' >&2; exit 2
     fi
-elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-packets || ${1:-} == --short-lru || ${1:-} == --owner-pack ]]; then
+elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-packets || ${1:-} == --short-lru || ${1:-} == --owner-pack || ${1:-} == --owner-pack-tail ]]; then
     [[ $# -ge 2 && $2 =~ ^[0-9a-f]{40}$ ]] || { echo "Usage: peer_fused.sh $1 NATIVE_SHA [GROUP ...]" >&2; exit 2; }
     query_owner=true
     offset_resolver=true
     ranked_sha=f8b185e3d042a18b24fe695c0a49a7d969ca487d
     fixed_order_rev=7b60f0dddab91a4b154043e78088842d7856cba6
-    if [[ $1 == --short-lru || $1 == --owner-pack ]]; then
+    if [[ $1 == --short-lru || $1 == --owner-pack || $1 == --owner-pack-tail ]]; then
         candidate_only=true
         offset_resolver=false
         plan_candidate=${1#--}
+        if [[ $plan_candidate == owner-pack-tail ]]; then
+            owner_tail=true
+            plan_candidate=owner-pack
+            arm_iterations=1
+            export KVIP_Q4_OWNER_TAIL=1
+        fi
         if [[ $plan_candidate == owner-pack ]]; then ranked_sha=367565634aa5d9ef713239c33c4a281227032e31; fi
         [[ $2 != "$ranked_sha" ]] || { echo "Supply a $plan_candidate candidate based on $ranked_sha" >&2; exit 2; }
     elif [[ $1 != --offset-resolver ]]; then
@@ -103,6 +113,13 @@ elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-pa
     unset KVIP_URMA_ROUTE_POLICY
     export PEER_LOCAL_ONLY=1
     shift 2
+    if "$owner_tail"; then
+        [[ ${1:-} == --reference && -d ${2:-} ]] || { echo 'Supply --reference DIR for the original four-group owner-pack run' >&2; exit 2; }
+        owner_tail_reference=$(cd "$2" && pwd -P)
+        shift 2
+        [[ $(<"$owner_tail_reference/owner-pack.txt") == 36d92c3e663e5164af54e7761187f3204e76fe05 &&
+           $(<"$owner_tail_reference/physical_npu.txt") == "$peer_physical_npu" ]] || { echo "Incompatible owner-pack reference: $owner_tail_reference" >&2; exit 1; }
+    fi
     offset_groups=(7 2 10 17 4)
     if [[ $plan_candidate == owner-pack ]]; then
         offset_groups=(7 10 17 4)
@@ -217,7 +234,7 @@ if [[ -z "$ranked" && $# -eq 2 && $1 == --reuse-serial ]]; then
         exit 1
     fi
 elif [[ $# -ne 0 ]]; then
-    echo 'Usage: peer_fused.sh --owner-pack NATIVE_SHA [GROUP ...] | --short-lru NATIVE_SHA [GROUP ...] | --li-packets NATIVE_SHA [--reference DIR] [GROUP ...] | --row-deps NATIVE_SHA [GROUP ...] | --offset-resolver NATIVE_SHA [GROUP ...] | --ranked-auto FULL_SHA [--reference DIR] | --ranked-joint-local FULL_SHA [--reference DIR] | --ranked-joint FULL_SHA --previous DIR [--reference DIR] | --ranked-help FULL_SHA [--reference DIR] [--resume DIR] [--anchor GROUP] | --ranked-index CANDIDATE_SHA | [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
+    echo 'Usage: peer_fused.sh --owner-pack-tail NATIVE_SHA --reference LEVEL1_DIR [GROUP ...] | --owner-pack NATIVE_SHA [GROUP ...] | --short-lru NATIVE_SHA [GROUP ...] | --li-packets NATIVE_SHA [--reference DIR] [GROUP ...] | --row-deps NATIVE_SHA [GROUP ...] | --offset-resolver NATIVE_SHA [GROUP ...] | --ranked-auto FULL_SHA [--reference DIR] | --ranked-joint-local FULL_SHA [--reference DIR] | --ranked-joint FULL_SHA --previous DIR [--reference DIR] | --ranked-help FULL_SHA [--reference DIR] [--resume DIR] [--anchor GROUP] | --ranked-index CANDIDATE_SHA | [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
     exit 2
 fi
 export PATH=/usr/local/python3.12.13/bin:$PATH
@@ -321,7 +338,8 @@ fi
 if [[ -n "$ranked" ]]; then
     if "$query_owner"; then
         if ! git -C "$root" cat-file -e "$ranked^{commit}" 2>/dev/null; then
-            if "$row_deps" || "$candidate_only"; then git -C "$root" fetch -q origin "refs/heads/perf/urma-q4-$plan_candidate"
+            if "$owner_tail"; then git -C "$root" fetch -q origin refs/heads/diag/urma-q4-owner-pack-tail
+            elif "$row_deps" || "$candidate_only"; then git -C "$root" fetch -q origin "refs/heads/perf/urma-q4-$plan_candidate"
             elif "$offset_resolver"; then git -C "$root" fetch -q origin refs/heads/perf/urma-q4-offset-slots
             elif "$local_resolver"; then git -C "$root" fetch -q origin refs/heads/perf/urma-q4-local-resolver
             else git -C "$root" fetch -q origin refs/heads/perf/urma-q4-query-owner; fi
@@ -455,7 +473,13 @@ if "$query_owner"; then
 fi
 if [[ -n "$ranked" ]]; then
     printf 'CONFIG URMA physical_NPU=%s logical_device=0 BS16 Q4 656B ranked=%.8s candidate=%.8s KVAF=%.8s\n' "$peer_physical_npu" "$ranked_sha" "$ranked" "$transport"
-    if "$candidate_only"; then
+    if "$owner_tail"; then
+        printf '%s\n' "$owner_tail_reference" >"$out/owner-tail-reference.txt"
+        echo "CONFIG diagnostic=owner-pack-tail fixed_route boundaries=4 budget=256/1024 warmup=4 independent_states=1 sequential_samples=5"
+        for group in "${offset_groups[@]}"; do
+            "$PYTHON" -B "$tools/support/owner_pack_tail.py" reference "$owner_tail_reference" "$group"
+        done
+    elif "$candidate_only"; then
         echo "CONFIG arms=$plan_candidate query_owners=16x4 boundaries=4 budget=256/1024 fixed_route warmup=4 measured=20"
     elif "$row_deps"; then
         echo "CONFIG arms=fixed-order,$plan_control,$plan_candidate query_owners=16x4 on=$plan_control,$plan_candidate boundaries=4 budget=256/1024 fixed_route warmup=4 measured=20"
@@ -565,7 +589,7 @@ run_arm() (
     if ! "$PYTHON" -B "$tools/test_lifetch.py" diagnose "${mode[@]}" "${limits[@]}" \
         --transport urma --input real --trace-root "$trace" --group "$group" --round-range 1:1 \
         --device 0 --kvaf-root "$kvaf" --kvaf-server "127.0.0.1:$port" \
-        --prefetch-rank-start 1024 --warmup 4 --iterations 20 --level "$level" \
+        --prefetch-rank-start 1024 --warmup 4 --iterations "$arm_iterations" --level "$level" \
         --output "$arm/results" --timeout-seconds 1800 >"$arm/replay.log" 2>&1; then
         if "$query_owner"; then
             tail -5 "$arm/replay.log" >&2
@@ -711,13 +735,22 @@ if [[ -n "$ranked" ]]; then
         for label in "${order[@]}"; do
             run_arm "$label" "$group" "$case_dir"
         done
-        if "$query_owner"; then
+        if "$owner_tail"; then
+            "$PYTHON" -B "$tools/support/owner_pack_tail.py" verify "$out" "$group" | tee -a "$out/summary.txt"
+            "$PYTHON" -B "$tools/support/owner_tail_report.py" "$case_dir/owner_tail.json" | tee -a "$out/summary.txt"
+        elif "$query_owner"; then
             "$PYTHON" -B "$tools/support/query_owner_report.py" "$out" "$group" | tee -a "$out/summary.txt"
         else
             "$PYTHON" -B "$tools/support/ranked_five_report.py" "$out" --group "$group" | tee -a "$out/summary.txt"
         fi
         order=("${order[@]:1}" "${order[0]}")
     done
+    if "$owner_tail"; then
+        entries=(summary.txt owner-tail-reference.txt owner-pack.txt physical_npu.txt)
+        for group in "${groups[@]}"; do entries+=("g$group/owner_tail.json"); done
+        tar -C "$out" -czhf "$out/owner-tail.tar.gz" "${entries[@]}"
+        printf 'RETURN_FILE=%s/owner-tail.tar.gz\n' "$out"
+    fi
     printf 'REPLAY_COMPLETE RESULT_ROOT=%s\n' "$out"
     exit 0
 fi
