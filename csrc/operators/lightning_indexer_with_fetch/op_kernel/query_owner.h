@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Four resident AIVs per request. A query owns its descriptor slice and its SQ/CQ.
-// Two independent handoffs preserve first-occurrence slot order and Index permutation order.
+// The request-local allocator and the ordered Index commits both follow Q1 through Q4.
 #pragma once
 #include "query_owner_layout.h"
 namespace query_owner {
@@ -45,13 +45,12 @@ __aicore__ inline __gm__ uint32_t *Scratch(__gm__ Args *a, uint32_t b) {
     return reinterpret_cast<__gm__ uint32_t *>(a->queryOwnerScratch) + b * kQueryOwnerRowWords;
 }
 
-// The first resolver's prefix and later query suffixes use the same protected
-// allocator as the fixed graph, including ordinary hits outside the LRU list.
-__aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32_t b, uint32_t q) {
+// Q4 owns the allocator for one request. Publish each descriptor slice as
+// soon as it is ready so the first three query owners can post independently.
+__aicore__ __attribute__((noinline)) inline void PlanRequest(__gm__ Args *a, uint32_t b) {
     auto ctx = reinterpret_cast<__gm__ Context *>(a->context);
     auto row = reinterpret_cast<__gm__ Row *>(ctx->rows) + b;
     auto flags = reinterpret_cast<__gm__ BatchFlag *>(a->flags) + b * kFlagCount;
-    auto saved = Scratch(a, b);
     auto src = reinterpret_cast<__gm__ uint32_t *>(a->eventsSrc) + b * a->maxEvents;
     auto dst = reinterpret_cast<__gm__ uint32_t *>(a->eventsDst) + b * a->maxEvents;
     auto positions = reinterpret_cast<__gm__ uint32_t *>(ctx->selected) + b * kSlots;
@@ -59,24 +58,15 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
     auto lru = reinterpret_cast<__gm__ uint32_t *>(ctx->lruSlots) + b * kLruSlots;
     auto headers = reinterpret_cast<__gm__ uint32_t *>(a->queryErrors) + 128 * b;
     uint32_t upper = 0;
-    Slice s;
+    uint32_t error = 0;
     for (uint32_t j = 0; j < 4; ++j) {
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(headers + 32 * j), 64);
-        s.error |= headers[32 * j];
+        error |= headers[32 * j];
         uint32_t n = headers[32 * j + 1];
         upper += n && n <= kCompactMissLimit + 1 ? n - 1 : kTop;
     }
     if (row->slots > kPrefetch) {
-        s.error |= 4;
-    }
-    if (q && headers[32 * q + 1] == 1) {
-        // The classifier already filled every location. Leave the allocator
-        // handoff in place; later queries must still see its protected slots.
-        auto prior = flags + kRawQueryFlag + q - 1;
-        s.error |= AwaitPublication(prior);
-        s.begin = prior->reserved[0];
-        flags[kRawQueryFlag + q].reserved[1] = prior->reserved[1];
-        return s;
+        error |= 4;
     }
     uint32_t buckets = upper <= 256 ? 512U : (upper <= 1024 ? 2048U : (upper <= 2048 ? 4096U : kSlots));
     TPipe pipe;
@@ -88,117 +78,120 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
     auto staged = reinterpret_cast<__ubuf__ Context *>(ctl[128].GetPhyAddr());
     FromGm(ctl[128], reinterpret_cast<__gm__ uint32_t *>(ctx), sizeof(Context) / 4);
     FromGm(work[4096], lru, kLruSlots);
-    if (!q) {
-        if (ctx->rowAddressBase) {
-            uint32_t owner = ctx->rowOwners ? reinterpret_cast<__gm__ uint32_t *>(ctx->rowOwners)[b] : b;
-            row->addresses = RequestAddressTable(ctx, b, owner, a->history);
-            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(row), 64);
-        }
-        if (!s.error) {
-            Simt::VF_CALL<PublishPrefetch>(
-                Simt::Dim3{512, 1, 1}, reinterpret_cast<__gm__ uint32_t *>(ctx->changes) + b * kChangeCapacity,
-                lru, src, dst, row->slots);
-            VectorDone();
-        }
-        Signal(flags, row->slots, s.error);
-        Duplicate(keys, UINT32_MAX, buckets);
-        Duplicate(ranks, UINT32_MAX, buckets);
-        Duplicate(ctl, 0U, 32);
-        VectorDone();
-        ctl.SetValue(7, buckets);
-        SetFlag<HardEvent::S_V>(EVENT_ID0);
-        WaitFlag<HardEvent::S_V>(EVENT_ID0);
-    } else {
-        s.error |= AwaitPublication(flags + kRawQueryFlag + q - 1);
-        auto f = flags + kRawQueryFlag + q - 1;
-        s.begin = f->reserved[0];
-        if (s.begin > kSlots - kTop) {
-            s.error |= 4;
-        }
-        if (!s.error) {
-            FromGm(keys, saved, buckets);
-            FromGm(ranks, saved + kSlots, buckets);
-            FromGm(slots, saved + 2 * kSlots, s.begin);
-            FromGm(ctl, saved + 3 * kSlots, 32);
-            if (f->reserved[1]) {
-                FromGm(ctl[1024], saved + 3 * kSlots + 32, (a->resident + 31) / 32);
-            }
-        }
+    if (ctx->rowAddressBase) {
+        uint32_t owner = ctx->rowOwners ? reinterpret_cast<__gm__ uint32_t *>(ctx->rowOwners)[b] : b;
+        row->addresses = RequestAddressTable(ctx, b, owner, a->history);
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(row), 64);
     }
+    if (!error) {
+        Simt::VF_CALL<PublishPrefetch>(
+            Simt::Dim3{512, 1, 1}, reinterpret_cast<__gm__ uint32_t *>(ctx->changes) + b * kChangeCapacity,
+            lru, src, dst, row->slots);
+        VectorDone();
+    }
+    Signal(flags, row->slots, error);
+    Duplicate(keys, UINT32_MAX, buckets);
+    Duplicate(ranks, UINT32_MAX, buckets);
+    Duplicate(ctl, 0U, 32);
+    VectorDone();
+    ctl.SetValue(7, buckets);
+    SetFlag<HardEvent::S_V>(EVENT_ID0);
+    WaitFlag<HardEvent::S_V>(EVENT_ID0);
     InputReady();
-    if (!s.error) {
-        // LI already identified the unresolved positions. Reuse the production
-        // resolver, which checks the unused LRU suffix before changing any slot.
+    auto saved = Scratch(a, b);
+    uint32_t protection = 0;
+    uint32_t begin = 0;
+    for (uint32_t q = 0; q < 4; ++q) {
+        Slice s{begin, 0, 0, error};
         const uint32_t encoded = headers[32 * q + 1];
-        bool compact = encoded && encoded <= kCompactMissLimit + 1 &&
-                       row->slots + s.begin + encoded - 1 <= kLruSlots && !ctl.GetValue(kProtectionState);
-        if (compact) {
-            ctl.SetValue(16, 0);
-            SetFlag<HardEvent::S_V>(EVENT_ID0);
-            WaitFlag<HardEvent::S_V>(EVENT_ID0);
-            auto entries = reinterpret_cast<__gm__ uint32_t *>(ctx->sourceBlocks) + (4 * b + q) * kTop;
-            Simt::VF_CALL<ResolveCompact>(Simt::Dim3{64, 1, 1}, staged, b, q, a->resident, row->slots,
-                encoded - 1, entries, FinalPtr(keys), FinalPtr(ranks), FinalPtr(slots), FinalPtr(work[4096]),
-                FinalPtr(ctl), src, dst, nullptr, nullptr, 0, nullptr);
-            VectorDone();
-            compact = !ctl.GetValue(16);
-        }
-        if (!compact) {
-            FromGm(ub[q * kTop], positions + q * kTop, kTop);
-            FromGm(loc[q * kTop], locations + q * kTop, kTop);
-            if (q >= 2) {
-                FromGm(ub[(q - 2) * kTop], positions + (q - 2) * kTop, kTop);
-                FromGm(loc[(q - 2) * kTop], locations + (q - 2) * kTop, kTop);
+        if (begin > kSlots - kTop) s.error |= 4;
+        if (!s.error && (q == 0 || encoded != 1)) {
+            if (q) {
+                FromGm(keys, saved, buckets);
+                FromGm(ranks, saved + kSlots, buckets);
+                FromGm(slots, saved + 2 * kSlots, begin);
+                FromGm(ctl, saved + 3 * kSlots, 32);
+                if (protection) FromGm(ctl[1024], saved + 3 * kSlots + 32, (a->resident + 31) / 32);
+                InputReady();
+                SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+                WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
             }
-            InputReady();
-            auto protect = reinterpret_cast<__gm__ uint32_t *>(a->queryBitmaps) + b * 4 * ((a->resident + 31) / 32);
-            Simt::VF_CALL<ResolveQueryWork>(
-                Simt::Dim3{512, 1, 1}, staged, a->history, a->resident, ctx->shape.tokenBytes, row->slots,
-                ctx->shape.batch, b, q, nullptr, nullptr, nullptr, src, dst, FinalPtr(ub), FinalPtr(loc),
-                FinalPtr(keys), FinalPtr(ranks), reinterpret_cast<__ubuf__ uint16_t *>(ids.GetPhyAddr()),
-                FinalPtr(slots), FinalPtr(work), FinalPtr(ctl), nullptr, 0, protect);
-            VectorDone();
-        }
-        s.error = ctl.GetValue(1);
-        if (!s.error) {
-            s.count = ctl.GetValue(2 + q);
-            const uint32_t protection = ctl.GetValue(kProtectionState);
-            flags[kRawQueryFlag + q].reserved[1] = protection;
-            BeforeStore();
-            if (!compact) ToGm(locations + q * kTop, loc[q * kTop], kTop);
-            if (q < 3) {
-                ToGm(saved, keys, buckets);
-                ToGm(saved + kSlots, ranks, buckets);
-                ToGm(saved + 2 * kSlots, slots, s.begin + s.count);
-                ToGm(saved + 3 * kSlots, ctl, 32);
-                if (protection) {
-                    ToGm(saved + 3 * kSlots + 32, ctl[1024], (a->resident + 31) / 32);
+            bool compact = encoded && encoded <= kCompactMissLimit + 1 &&
+                           row->slots + s.begin + encoded - 1 <= kLruSlots && !ctl.GetValue(kProtectionState);
+            if (compact) {
+                ctl.SetValue(16, 0);
+                SetFlag<HardEvent::S_V>(EVENT_ID0);
+                WaitFlag<HardEvent::S_V>(EVENT_ID0);
+                auto entries = reinterpret_cast<__gm__ uint32_t *>(ctx->sourceBlocks) + (4 * b + q) * kTop;
+                Simt::VF_CALL<ResolveCompact>(Simt::Dim3{64, 1, 1}, staged, b, q, a->resident, row->slots,
+                    encoded - 1, entries, FinalPtr(keys), FinalPtr(ranks), FinalPtr(slots), FinalPtr(work[4096]),
+                    FinalPtr(ctl), src, dst, nullptr, nullptr, 0, nullptr);
+                VectorDone();
+                compact = !ctl.GetValue(16);
+            }
+            if (!compact) {
+                FromGm(ub[q * kTop], positions + q * kTop, kTop);
+                FromGm(loc[q * kTop], locations + q * kTop, kTop);
+                if (q >= 2) {
+                    FromGm(ub[(q - 2) * kTop], positions + (q - 2) * kTop, kTop);
+                    FromGm(loc[(q - 2) * kTop], locations + (q - 2) * kTop, kTop);
+                }
+                InputReady();
+                auto protect = reinterpret_cast<__gm__ uint32_t *>(a->queryBitmaps) + b * 4 * ((a->resident + 31) / 32);
+                Simt::VF_CALL<ResolveQueryWork>(
+                    Simt::Dim3{512, 1, 1}, staged, a->history, a->resident, ctx->shape.tokenBytes, row->slots,
+                    ctx->shape.batch, b, q, nullptr, nullptr, nullptr, src, dst, FinalPtr(ub), FinalPtr(loc),
+                    FinalPtr(keys), FinalPtr(ranks), reinterpret_cast<__ubuf__ uint16_t *>(ids.GetPhyAddr()),
+                    FinalPtr(slots), FinalPtr(work), FinalPtr(ctl), nullptr, 0, protect);
+                VectorDone();
+            }
+            s.error = ctl.GetValue(1);
+            if (!s.error) {
+                s.count = ctl.GetValue(2 + q);
+                if (!compact) {
+                    BeforeStore();
+                    ToGm(locations + q * kTop, loc[q * kTop], kTop);
+                    StoreDone();
+                    SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
+                    WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+                }
+                if (q < 3) {
+                    protection = ctl.GetValue(kProtectionState);
+                    BeforeStore();
+                    ToGm(saved, keys, buckets);
+                    ToGm(saved + kSlots, ranks, buckets);
+                    ToGm(saved + 2 * kSlots, slots, begin + s.count);
+                    ToGm(saved + 3 * kSlots, ctl, 32);
+                    if (protection) ToGm(saved + 3 * kSlots + 32, ctl[1024], (a->resident + 31) / 32);
+                    StoreDone();
+                    SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
+                    WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+                }
+                if (s.count) {
+                    // This query's input positions are dead until the explicit
+                    // q-2 reload. Keep keys, ranks, slots and protection intact.
+                    staged->count = a->liveCount;
+                    SetFlag<HardEvent::S_V>(EVENT_ID0);
+                    WaitFlag<HardEvent::S_V>(EVENT_ID0);
+                    Simt::VF_CALL<PackPublicationEvents<512>>(Simt::Dim3{512, 1, 1}, staged, a->history, a->resident,
+                                                              ctx->shape.tokenBytes, b, q, row->slots,
+                                                              kPrefetch + s.begin, s.count, src, dst, FinalPtr(ub[q * kTop]),
+                                                              reinterpret_cast<__ubuf__ uint16_t *>(ids.GetPhyAddr()),
+                                                              FinalPtr(work), FinalPtr(ctl), nullptr, 0, nullptr);
+                    VectorDone();
+                    s.error = ctl.GetValue(1);
+                    s.safe = ctl.GetValue(17);
                 }
             }
-            StoreDone();
-            SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
-            WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
-            // Pack records with the request/query's own array base, before any Index
-            // metadata is committed. StoreFallbackSource snapshots flat DDR addresses.
-            if (!s.count) {
-                pipe.Destroy();
-                return s;
-            }
-            staged->count = a->liveCount;
-            SetFlag<HardEvent::S_V>(EVENT_ID0);
-            WaitFlag<HardEvent::S_V>(EVENT_ID0);
-            Simt::VF_CALL<PackPublicationEvents<512>>(Simt::Dim3{512, 1, 1}, staged, a->history, a->resident,
-                                                      ctx->shape.tokenBytes, b, q, row->slots,
-                                                      kPrefetch + s.begin, s.count, src, dst, FinalPtr(keys),
-                                                      reinterpret_cast<__ubuf__ uint16_t *>(ids.GetPhyAddr()),
-                                                      FinalPtr(work), FinalPtr(ctl), nullptr, 0, nullptr);
-            VectorDone();
-            s.error = ctl.GetValue(1);
-            s.safe = ctl.GetValue(17);
         }
+        auto raw = flags + kRawQueryFlag + q;
+        raw->reserved[0] = begin;
+        raw->reserved[1] = s.safe;
+        Signal(raw, s.count, s.error);
+        begin += s.count;
+        error = s.error;
     }
     pipe.Destroy();
-    return s;
 }
 
 // Emit only rows consuming this query, including unpack fanout and masked rows.
@@ -350,19 +343,21 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args *a, uint32_t b,
     const uint32_t batch = ctx->shape.batch;
     auto flags = reinterpret_cast<__gm__ BatchFlag *>(a->flags) + b * kFlagCount;
     auto row = reinterpret_cast<__gm__ Row *>(ctx->rows) + b;
-    // The spare odd prefetch status is separate from every private final Get status.
+    // Q3 can drain the independent prefetch CQ while Q4 plans. The
+    // prefetch queue is addressed by request; final CQs remain Q-owned.
     if (q == 3) {
-        // Q1 publishes row->addresses in the same cache line that the CQ owner cleans.
+        PlanRequest(a, b);
+    } else if (q == 2) {
         auto error = AwaitPublication(flags);
         CompletePrefetch(ctx, b, true);
         Signal(flags + 7, 0, error | row->error);
     }
-    Slice s = Resolve(a, b, q);
-    // The next allocator needs the slots and captured descriptor addresses;
-    // this query alone owns its subsequent SQ post and CQ.
     auto raw = flags + kRawQueryFlag + q;
-    raw->reserved[0] = s.begin + s.count;
-    Signal(raw, s.count, s.error);
+    Slice s;
+    s.error = AwaitPublication(raw);
+    s.begin = raw->reserved[0];
+    s.count = raw->count;
+    s.safe = raw->reserved[1];
     uint32_t first = (b * 4 + q) * kTop;
     auto post = FinalPostAt(ctx->shape.finalPostOffset, ctx, b * 4 + q);
     PrepareFinalFetch(4, ctx->shape.finalPostOffset, ctx, b, q, s.count, first, s.error, s.safe);
