@@ -96,7 +96,7 @@ static uint32_t LaunchStreaming(void* bindings,void* update,void* workspace,void
     return result;
 }
 
-static_assert(offsetof(pipeline_ab::Args,queryOwnerScratch)==200 && sizeof(pipeline_ab::Args)==256,
+static_assert(offsetof(pipeline_ab::Args,queryOwnerScratch)==200 && offsetof(pipeline_ab::Args,queryOwnerTrace)==208 && sizeof(pipeline_ab::Args)==256,
               "query-owner binding layout");
 static_assert(offsetof(rotating::FinalPost,ownerBlock)==32,"query-owner receipt layout");
 extern "C" uint32_t kvip_query_owner_row_bytes() {

@@ -99,6 +99,7 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
     auto locations = reinterpret_cast<__gm__ uint32_t *>(ctx->locations) + b * kSlots;
     auto lru = reinterpret_cast<__gm__ uint32_t *>(ctx->lruSlots) + b * kLruSlots;
     auto headers = reinterpret_cast<__gm__ uint32_t *>(a->queryErrors) + 128 * b;
+    auto trace = owner_timer::Row(a, b*4 + q);
     uint32_t upper = 0, prefixUpper = 0;
     Slice s;
     for (uint32_t j = 0; j < 4; ++j) {
@@ -115,7 +116,9 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
         // The classifier already filled every location. Leave the allocator
         // handoff in place; later queries must still see its protected slots.
         auto prior = flags + kRawQueryFlag + q - 1;
+        owner_timer::Mark(trace, owner_timer::RawWait);
         s.error |= AwaitPublication(prior);
+        owner_timer::Mark(trace, owner_timer::RawReady);
         s.begin = prior->reserved[0];
         flags[kRawQueryFlag + q].reserved[1] = prior->reserved[1];
         return s;
@@ -160,7 +163,9 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
         SetFlag<HardEvent::S_V>(EVENT_ID0);
         WaitFlag<HardEvent::S_V>(EVENT_ID0);
     } else {
+        owner_timer::Mark(trace, owner_timer::RawWait);
         s.error |= AwaitPublication(flags + kRawQueryFlag + q - 1);
+        owner_timer::Mark(trace, owner_timer::RawReady);
         auto f = flags + kRawQueryFlag + q - 1;
         s.begin = f->reserved[0];
         if (s.begin > kSlots - kTop) {
@@ -188,10 +193,12 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
             SetFlag<HardEvent::S_V>(EVENT_ID0);
             WaitFlag<HardEvent::S_V>(EVENT_ID0);
             auto entries = reinterpret_cast<__gm__ uint32_t *>(ctx->sourceBlocks) + (4 * b + q) * kTop;
+            owner_timer::Mark(trace, owner_timer::CompactBegin);
             Simt::VF_CALL<ResolveOwnerCompact>(Simt::Dim3{64, 1, 1}, staged, b, q, a->resident, row->slots,
                 encoded - 1, entries, FinalPtr(keys), FinalPtr(ranks), FinalPtr(slots), FinalPtr(work[4096]),
                 FinalPtr(ctl), src, dst, reinterpret_cast<__gm__ uint32_t*>(a->liveCount));
             VectorDone();
+            owner_timer::Mark(trace, owner_timer::CompactEnd);
             compact = !ctl.GetValue(16);
         }
         if (!compact) {
@@ -205,12 +212,14 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
             }
             InputReady();
             auto protect = reinterpret_cast<__gm__ uint32_t *>(a->queryBitmaps) + b * 4 * ((a->resident + 31) / 32);
+            owner_timer::Mark(trace, owner_timer::DenseResolveBegin);
             Simt::VF_CALL<ResolveOwnerQuery>(
                 Simt::Dim3{512, 1, 1}, staged, a->history, a->resident, b, q, row->slots,
                 src, dst, FinalPtr(ub), FinalPtr(loc),
                 FinalPtr(keys), FinalPtr(ranks), reinterpret_cast<__ubuf__ uint16_t *>(ids.GetPhyAddr()),
                 FinalPtr(slots), FinalPtr(work), FinalPtr(ctl), protect, reinterpret_cast<__gm__ uint32_t*>(a->liveCount));
             VectorDone();
+            owner_timer::Mark(trace, owner_timer::DenseResolveEnd);
         }
         s.error = ctl.GetValue(1);
         if (!s.error) {
@@ -218,6 +227,7 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
             s.safe = ctl.GetValue(17);
             const uint32_t protection = ctl.GetValue(kProtectionState);
             flags[kRawQueryFlag + q].reserved[1] = protection;
+            owner_timer::Mark(trace, owner_timer::SaveStateBegin);
             BeforeStore();
             if (!compact) ToGm(locations + q * kTop, loc[q * kTop], kTop);
             if (q < 3) {
@@ -230,6 +240,7 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
                 }
             }
             StoreDone();
+            owner_timer::Mark(trace, owner_timer::SaveStateEnd);
         }
     }
     pipe.Destroy();
@@ -283,23 +294,31 @@ struct IndexTail {
             return;
         }
         ran = true;
+        auto trace = owner_timer::Row(a, b*4 + q);
         auto ctx = reinterpret_cast<__gm__ Context *>(a->context);
         // Read the pre-update logical mapping in parallel across the four
         // owners. The last commit is ordered after all four owner handoffs.
         if (!s.error) {
+            owner_timer::Mark(trace, owner_timer::AdaptBegin);
             Simt::VF_CALL<Adapt>(Simt::Dim3{256, 1, 1}, a, b, q);
             VectorDone();
+            owner_timer::Mark(trace, owner_timer::AdaptEnd);
         }
         auto chain = index_team::Control(a, b);
         if (q) {
+            owner_timer::Mark(trace, owner_timer::IndexWait);
             s.error |= AwaitPublication(chain + q - 1);
+            owner_timer::Mark(trace, owner_timer::IndexReady);
         }
         auto row = reinterpret_cast<__gm__ Row *>(ctx->rows) + b;
+        owner_timer::Mark(trace, owner_timer::IndexBegin);
         // No swaps to apply and no final metadata commit on a middle owner.
         // Its successor can consume the very same saved permutation.
         if ((q == 1 || q == 2) && !s.count) {
             Signal(reinterpret_cast<__gm__ BatchFlag *>(a->flags) + b * kFlagCount + q + 1, 0, s.error);
+            owner_timer::Mark(trace, owner_timer::IndexRelease);
             Signal(chain + q, 0, s.error);
+            owner_timer::Mark(trace, owner_timer::IndexEnd);
             return;
         }
         auto saved = Scratch(a, b) + kOwnerResolverWords;
@@ -332,6 +351,7 @@ struct IndexTail {
             VectorDone();
         }
         uint32_t seen = prior;
+        owner_timer::Mark(trace, owner_timer::ApplyBegin);
         for (uint32_t part = q ? 1 : 0; part < 2 && !s.error; ++part) {
             uint32_t n = part ? s.count : row->slots, begin = part ? kPrefetch + s.begin : 0;
             if (!n) {
@@ -354,6 +374,7 @@ struct IndexTail {
             s.error |= mem.GetValue(CONTROL);
             seen += n;
         }
+        owner_timer::Mark(trace, owner_timer::ApplyEnd);
         if (!s.error) {
             if (q < 3 && !isDense && seen) {
                 BeforeStore();
@@ -362,6 +383,7 @@ struct IndexTail {
                 StoreDone();
             }
             if (q == 3 && seen) {
+                owner_timer::Mark(trace, owner_timer::MetadataBegin);
                 auto addr = reinterpret_cast<__gm__ uint64_t *>(a->addresses) + uint64_t(owner) * u[7];
                 auto logical = reinterpret_cast<__gm__ uint64_t *>(a->logical) + uint64_t(owner) * a->history;
                 if (isDense) {
@@ -372,37 +394,57 @@ struct IndexTail {
                     Simt::VF_CALL<CommitMetadata>(Simt::Dim3{THREADS, 1, 1}, addr, logical, m);
                 }
                 VectorDone();
+                owner_timer::Mark(trace, owner_timer::MetadataEnd);
             }
         }
         pipe.Destroy();
         Signal(reinterpret_cast<__gm__ BatchFlag *>(a->flags) + b * kFlagCount + q + 1, s.count, s.error);
+        owner_timer::Mark(trace, owner_timer::IndexRelease);
         Signal(chain + q, s.count, s.error);
+        owner_timer::Mark(trace, owner_timer::IndexEnd);
     }
 };
 
 __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args *a, uint32_t b, uint32_t q) {
     auto ctx = reinterpret_cast<__gm__ Context *>(a->context);
     const uint32_t batch = ctx->shape.batch;
+    auto trace = owner_timer::Row(a, 4*b+q);
     auto flags = reinterpret_cast<__gm__ BatchFlag *>(a->flags) + b * kFlagCount;
     auto row = reinterpret_cast<__gm__ Row *>(ctx->rows) + b;
     // The spare odd prefetch status is separate from every private final Get status.
     if (q == 3) {
         // Q1 publishes row->addresses in the same cache line that the CQ owner cleans.
+        owner_timer::Mark(trace, owner_timer::PrefetchWait);
         auto error = AwaitPublication(flags);
-        CompletePrefetch(ctx, b, true);
+        owner_timer::Mark(trace, owner_timer::PrefetchReady);
+        if (trace) {
+            uint64_t polls=0, elapsed=0, drainReturn=0;
+            CompletePrefetch(ctx, b, true, &polls, &elapsed, &drainReturn, trace + owner_timer::PrefetchCqObserved);
+            trace[owner_timer::PrefetchPolls]=polls;
+            trace[owner_timer::PrefetchDrainCycles]=elapsed;
+            trace[owner_timer::PrefetchDrainReturn]=drainReturn;
+        } else {
+            CompletePrefetch(ctx, b, true);
+        }
+        owner_timer::Mark(trace, owner_timer::PrefetchEnd);
         Signal(flags + 7, 0, error | row->error);
     }
+    owner_timer::Mark(trace, owner_timer::ResolveBegin);
     Slice s = Resolve(a, b, q);
+    owner_timer::Mark(trace, owner_timer::ResolveEnd);
     // The next allocator needs the slots and captured descriptor addresses;
     // this query alone owns its subsequent SQ post and CQ.
     auto raw = flags + kRawQueryFlag + q;
     raw->reserved[0] = s.begin + s.count;
+    owner_timer::Mark(trace, owner_timer::RawRelease);
     Signal(raw, s.count, s.error);
     uint32_t first = (b * 4 + q) * kTop;
     auto post = FinalPostAt(ctx->shape.finalPostOffset, ctx, b * 4 + q);
     PrepareFinalFetch(4, ctx->shape.finalPostOffset, ctx, b, q, s.count, first, s.error, s.safe);
     if (s.safe < s.count) {
+        owner_timer::Mark(trace, owner_timer::ConflictWait);
         s.error |= AwaitPublication(flags + 7);
+        owner_timer::Mark(trace, owner_timer::ConflictReady);
     }
     const uint32_t view = FinalQueue(batch, 4, b, q);
     auto native = GetArgs(ctx, view);
@@ -424,12 +466,16 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args *a, uint32_t b,
     IndexTail tail{a, b, q, s};
     uint32_t completed = 0, processed = 0;
     if (!s.error && s.count) {
+        owner_timer::Mark(trace, owner_timer::DescriptorSyncBegin);
         SyncFetchDescriptors(ctx, first, s.count);
+        owner_timer::Mark(trace, owner_timer::DescriptorSyncEnd);
         auto queue = reinterpret_cast<__gm__ uint8_t *>(native.queue_state);
         kvaf_device::CleanCacheLines(queue, sizeof(KvafBatchGetQueueState));
         kvaf_device::WriteStatus(status, kvaf_device::kInvalidArgs, 0, 0, 0, 0, UINT64_MAX, 0);
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(status), sizeof(*status));
-        kvaf_device::KvafBatchGetDeviceWithPostTail(native, 0, first, s.count, tail);
+        owner_timer::Mark(trace, owner_timer::GetBegin);
+        kvaf_device::KvafBatchGetDeviceWithPostTail(native, 0, first, s.count, tail, trace ? trace+64 : nullptr);
+        owner_timer::Mark(trace, owner_timer::GetEnd);
         kvaf_device::CleanCacheLines(queue, sizeof(KvafBatchGetQueueState));
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(status), sizeof(*status));
         s.error |= status->result;
@@ -451,8 +497,15 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args *a, uint32_t b,
     post->ownerBlock = GetBlockIdx() + 1;
     post->queueView = view;
     post->processed = processed;
+    if (trace) {
+        trace[owner_timer::Count]=s.count;
+        trace[owner_timer::Processed]=processed;
+        trace[owner_timer::Safe]=s.safe;
+        trace[owner_timer::Queue]=view;
+    }
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(post), sizeof(*post));
     flags[8 + q].reserved[0] = 1;
+    owner_timer::Mark(trace, owner_timer::DoneRelease);
     Signal(flags + 8 + q, 0, s.error);
     if (q == 3) {
         uint32_t total = s.begin + s.count;
@@ -472,8 +525,11 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args *a, uint32_t b,
         Simt::VF_CALL<RetireSelection>(Simt::Dim3{128, 1, 1}, a, batch, b);
         VectorDone();
         Signal(flags + 6, 0, s.error);
+        owner_timer::Mark(trace, owner_timer::FinalizeBegin);
         FinalizeStreaming<false, true>(a, b);
+        owner_timer::Mark(trace, owner_timer::FinalizeEnd);
         ClearRankProgress(ctx, b);
+        owner_timer::Mark(trace, owner_timer::CleanupEnd);
     }
 }
 } // namespace query_owner

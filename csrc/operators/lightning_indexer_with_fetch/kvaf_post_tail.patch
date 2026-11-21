@@ -1,6 +1,72 @@
 --- a/kvaf_batch_get_device.h
 +++ b/kvaf_batch_get_device.h
-@@ -588,8 +588,9 @@
+@@ -459,6 +459,14 @@
+          reinterpret_cast<__gm__ uint32_t *>(pending->sq_db_address), 0);
+ }
+
++// Diagnostic layout: 16 header words, 128 doorbells, 128 completion observations.
++__aicore__ inline void TraceDoorbell(__gm__ uint64_t *trace, uint32_t i, uint32_t group) {
++  if (!trace) return;
++  if (i >= 128U) { trace[2] = 1U; return; }
++  trace[16U + 2U*i] = AscendC::GetSystemCycle();
++  trace[17U + 2U*i] = group;
++  trace[0] = i+1;
++}
+ __aicore__ inline void PostDirectRequests(
+     __gm__ const int32_t *indices,
+     __gm__ const int32_t *output_indices,
+@@ -468,7 +476,8 @@
+     uint32_t token_bytes, uint32_t jettys_per_core,
+     __gm__ const KvafBatchGetDirectUrmaEntity *entities,
+     __gm__ KvafBatchGetQueueState *queues, uint32_t profile_enabled,
+-    uint64_t *first_doorbell_cycle, uint64_t *last_wqe) {
++    uint64_t *first_doorbell_cycle, uint64_t *last_wqe, __gm__ uint64_t *trace = nullptr,
++    uint32_t post_base = 0, uint32_t group_index = 0) {
+   PreparedPost prepared_posts[kWqeBankCount];
+   PendingPost pending_posts[kWqeBankCount];
+   uint64_t current_heads[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE];
+@@ -521,6 +530,7 @@
+       const uint32_t commit_bank =
+           (post_index - kWqeBankCount) % kWqeBankCount;
+       CommitPostScalarStage(&pending_posts[commit_bank]);
++      TraceDoorbell(trace, post_base + post_index - kWqeBankCount, group_index);
+       if (profile_enabled != 0U && *first_doorbell_cycle == 0U) {
+         *first_doorbell_cycle =
+             static_cast<uint64_t>(AscendC::GetSystemCycle());
+@@ -537,12 +547,14 @@
+       const uint32_t penultimate_bank =
+           (total_posts - 2U) % kWqeBankCount;
+       CommitPostScalarStage(&pending_posts[penultimate_bank]);
++      TraceDoorbell(trace, post_base + total_posts - 2U, group_index);
+       if (profile_enabled != 0U && *first_doorbell_cycle == 0U) {
+         *first_doorbell_cycle =
+             static_cast<uint64_t>(AscendC::GetSystemCycle());
+       }
+     }
+     CommitPostScalarStage(&pending_posts[final_bank]);
++    TraceDoorbell(trace, post_base + total_posts - 1U, group_index);
+     if (profile_enabled != 0U && *first_doorbell_cycle == 0U) {
+       *first_doorbell_cycle =
+           static_cast<uint64_t>(AscendC::GetSystemCycle());
+@@ -552,7 +564,7 @@
+
+ __aicore__ inline uint64_t WaitForCompletion(
+     __gm__ const KvafBatchGetDirectUrmaEntity *entity,
+-    __gm__ KvafBatchGetQueueState *queue, uint32_t *poll_count) {
++    __gm__ KvafBatchGetQueueState *queue, uint32_t *poll_count, uint64_t *observed = nullptr) {
+   const uint32_t slot =
+       static_cast<uint32_t>(queue->cq_consumer_index % entity->cq_depth);
+   __gm__ uint8_t *const cqe_address =
+@@ -570,6 +582,7 @@
+     if ((owner ^ expected) == 0U) {
+       continue;
+     }
++    if (observed) *observed = AscendC::GetSystemCycle();
+     const uint8_t sub_status =
+         static_cast<uint8_t>((cqe_word >> 16U) & 0xffU);
+     const uint8_t status =
+@@ -587,9 +600,10 @@
+
  // An explicit range belongs exclusively to this caller's leased queue.
  // UINT32_MAX retains the standalone kernel's original prefix partitioning.
 -__aicore__ inline void KvafBatchGetDevice(
@@ -8,21 +74,81 @@
 +__aicore__ inline void KvafBatchGetDeviceWithPostTail(
      KvafExecuteBatchGetKernelArgs args, uint32_t core,
 -    uint32_t request_begin = 0U, uint32_t request_count = UINT32_MAX) {
-+    uint32_t request_begin, uint32_t request_count, PostTail& post_tail) {
++    uint32_t request_begin, uint32_t request_count, PostTail& post_tail, __gm__ uint64_t *trace = nullptr) {
    const uint32_t jettys_per_core =
        args.jettys_per_core == 0U ? 1U : args.jettys_per_core;
    if (args.block_count == 0U || core >= args.block_count ||
-@@ -787,6 +788,9 @@
+@@ -743,7 +757,7 @@
+     if (schedule.CanPost()) {
+       const kvaf_batch_get::Group group = schedule.Next();
+       const uint64_t post_start_cycle =
+-          profile_enabled ? static_cast<uint64_t>(AscendC::GetSystemCycle()) : 0U;
++          (profile_enabled || trace) ? static_cast<uint64_t>(AscendC::GetSystemCycle()) : 0U;
+       // A drained checkpoint retires precisely its group's assignment on
+       // every Jetty. SQ PI and CQ CI have different units: never subtract them.
+       for (uint32_t jetty = 0U; jetty < jettys_per_core; ++jetty) {
+@@ -766,7 +780,7 @@
+                          group.begin, group.count, group.first_jetty,
+                          args.token_bytes, jettys_per_core, entities,
+                          queues, static_cast<uint32_t>(profile_enabled),
+-                         &first_doorbell_cycle, &last_wqe);
++                         &first_doorbell_cycle, &last_wqe, trace, total_posts, counters.submitted_group_count);
+       const uint64_t outstanding = group.count +
+           (schedule.pending == 0U ? 0ULL :
+            static_cast<uint64_t>(schedule.groups[schedule.oldest].count));
+@@ -786,6 +800,10 @@
+       if (profile_enabled) {
          profile_post_done_cycle = static_cast<uint64_t>(AscendC::GetSystemCycle());
          counters.post_active_cycles += profile_post_done_cycle - post_start_cycle;
-       }
++      }
++      if (trace) trace[3] += AscendC::GetSystemCycle() - post_start_cycle;
 +      if (schedule.cursor == schedule.end) {
 +        post_tail.Run();
-+      }
+       }
      } else {
        const kvaf_batch_get::Group group = schedule.groups[schedule.oldest];
-       const uint64_t drain_start_cycle =
-@@ -857 +861,12 @@
+@@ -798,8 +816,24 @@
+         const uint64_t wait_start_cycle =
+             profile_enabled ? static_cast<uint64_t>(AscendC::GetSystemCycle()) : 0U;
+         uint32_t polls = 0U;
++        uint64_t observed = 0;
++        const uint64_t poll_begin = trace ? AscendC::GetSystemCycle() : 0U;
+         const uint64_t completion_result =
+-            WaitForCompletion(entities + jetty, queues + jetty, &polls);
++            WaitForCompletion(entities + jetty, queues + jetty, &polls, trace ? &observed : nullptr);
++        if (trace) {
++          trace[4] += AscendC::GetSystemCycle() - poll_begin;
++          ++trace[6];
++          const uint32_t n = counters.completion_count;
++          if (n < 128U) {
++            trace[272U+4U*n] = poll_begin;
++            trace[273U+4U*n] = observed;
++            trace[274U+4U*n] = counters.completed_group_count;
++            trace[275U+4U*n] = polls;
++            trace[1] = n+1;
++          } else {
++            trace[2] = 1U;
++          }
++        }
+         completion_polls[jetty] += polls;
+         if (completion_result != kCqTimeout) {
+           ++counters.completion_count;
+@@ -842,6 +876,11 @@
+   WriteStatus(status, result, active_count, queues[0].completed_batch_count,
+               queues[0].sq_producer_index, queues[0].cq_consumer_index,
+               failed_request, last_wqe);
++  if (trace) {
++    trace[5] = total_posts;
++    trace[7] = counters.submitted_group_count;
++    trace[8] = counters.completed_group_count;
++  }
+   if (profile_enabled) {
+     const uint64_t profile_finish_cycle =
+         static_cast<uint64_t>(AscendC::GetSystemCycle());
+@@ -854,4 +893,15 @@
+ }
+
+
 +struct NoPostTail {
 +  __aicore__ inline void Run() {}
 +};

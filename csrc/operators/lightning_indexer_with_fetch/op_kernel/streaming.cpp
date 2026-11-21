@@ -9,6 +9,9 @@
 #include "staged_urma_pack.h"
 #include "staged_outputs.h"
 #include "pipeline_types.h"
+#if !V9_UBMEM
+#include "query_owner_timer.h"
+#endif
 #include "shadow_exchange_parallel.h"
 #include "index_cache_update.h"
 using namespace AscendC;
@@ -1182,11 +1185,21 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
  if constexpr(Team)index_team::Copy(a,GetBlockIdx(),shape.batch);
 #endif
  uint32_t deferredPrefix=0;
- for(uint32_t f=6;f<12;++f){uint64_t start=GetSystemCycle();if(profile)ft[8+2*(f-6)]=start;while(true){
+#if !V9_UBMEM
+ auto ownerTrace=QueryOwner?owner_timer::Row(a,4*b+3):nullptr;
+#endif
+ for(uint32_t f=6;f<12;++f){uint64_t start=GetSystemCycle();if(profile)ft[8+2*(f-6)]=start;
+#if !V9_UBMEM
+  if(ownerTrace)ownerTrace[2*(f-6)]=start;
+#endif
+  while(true){
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+f),kBatchFlagPayloadBytes);
   if(flags[f].ready){error|=flags[f].error;break;}
   if(GetSystemCycle()-start>5000000000ULL){error|=kvaf_device::kCqTimeout;break;}}
   if(profile)ft[9+2*(f-6)]=GetSystemCycle();
+#if !V9_UBMEM
+  if(ownerTrace)ownerTrace[2*(f-6)+1]=GetSystemCycle();
+#endif
   if(f==6 && (a->prefetchCount & 0x10000000U)){
    if(profile)ft[20]=GetSystemCycle();
 #if !V9_UBMEM
@@ -1382,9 +1395,20 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
 #endif
 #if !V9_UBMEM
   if(team && a->queryOwnerScratch){
+   auto trace=owner_timer::Row(a,block);
+   if(trace) trace[owner_timer::TailBlock]=block+1;
+   owner_timer::Mark(trace,owner_timer::TailBegin);
    query_owner::Run(a,block/4,block%4);
+   owner_timer::Mark(trace,owner_timer::BarrierBegin);
    AscendC::SyncAll<true>();
+   owner_timer::Mark(trace,owner_timer::BarrierEnd);
    if(block<shape.batch)Simt::VF_CALL<RetireRoundControl>(Simt::Dim3{128,1,1},a,shape.batch,workers,block);
+   owner_timer::Mark(trace,owner_timer::RetireIssued);
+   if(trace){
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(trace),80*8);
+    if(trace[64])kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(trace+80),2*8*(trace[64]<128 ? trace[64] : 128));
+    if(trace[65])kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(trace+336),4*8*(trace[65]<128 ? trace[65] : 128));
+   }
    return;
   }
 #endif
