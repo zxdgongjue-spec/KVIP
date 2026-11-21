@@ -3731,10 +3731,12 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused, n
     checks = CorrectnessRecorder()
     pending = False
     owner_tail = os.environ.get('KVIP_Q4_OWNER_TAIL') == '1'
-    if owner_tail and not (fused and len(states) == len(sequence.rounds) == 1
+    owner_graph = owner_tail and os.environ.get('KVIP_Q4_OWNER_GRAPH') == '1'
+    expected_states = 20 if owner_graph else 1
+    if owner_tail and not (fused and len(states) == expected_states and len(sequence.rounds) == 1
                            and config.query_owner_arm == 'owner-pack' and config.warmup == 4
                            and config.mode == 'diagnose' and config.level == 1):
-        raise ValueError('Owner-tail capture requires one owner-pack state and one input round')
+        raise ValueError(f'Owner-tail capture requires {expected_states} owner-pack states and one fixed input round')
     def replay():
         nonlocal pending
         pending = True
@@ -3812,7 +3814,13 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused, n
             pending = False
             state.reset()
         if owner_tail:
-            states[0].forward.set_query_owner_capture(True)
+            for state in states:
+                state.forward.set_query_owner_capture(True)
+                if owner_graph:
+                    state.forward.set_query_owner_capture(False)
+            if owner_graph and (len({s.forward.query_owner_trace.data_ptr() for s in states}) != len(states)
+                                or len({s.forward.workspace.data_ptr() for s in states}) != len(states)):
+                raise ValueError('Captured calls must have distinct argument and trace buffers')
             ticks_per_us = states[0].forward.calibrate_counter_mhz()
         stream.synchronize()
         with ExitStack() as scopes:
@@ -3854,6 +3862,30 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused, n
                 if candidate or lean:
                     point = route_step(warmup + 1)
                     route_history['warmup'].append(checked_routes(states, **point, low=point['step'] > 1))
+        if owner_graph:
+            from owner_tail_graph import capture as capture_owner_graph
+
+            def profile_pass(folder):
+                # Mirror the level-1 pre-replay residency snapshots and verify
+                # the traffic on the same invocations as the device intervals.
+                snapshots = []
+                for state in states:
+                    snapshot = algorithm_before(state.rotating)
+                    snapshot['logical_ids'] = state.input_layout.copy()
+                    snapshots.append(snapshot)
+                measured = profile_graph_batch(torch, TrackedGraph(), calls=len(states), folder=folder,
+                                               transport=config.transport, stream=stream, owner_trace_diagnostic=True)
+                for state, snapshot, sample in zip(states, snapshots, measured['samples'], strict=True):
+                    stats = algorithm_after(state.rotating, snapshot, record_final_safe=True)
+                    if 'error' in stats:
+                        raise ValueError(f'Invalid same-call Get accounting: {stats["error"]}')
+                    sample['work_totals'] = stats['totals']
+                return measured
+
+            checks.checked += capture_owner_graph(states, initial, config, directory, ticks_per_us,
+                                                  profile_pass, native_reference)
+            return dict(all_rounds={}, correctness=checks.status, failures=checks.failures,
+                        owner_tail_diagnostic='owner_graph.json')
         if owner_tail:
             from owner_pack_tail import capture as capture_tail
             state = states[0]
@@ -4438,8 +4470,11 @@ def run_real(config, directory):
     report['sequence'] = results
     atomic_json(directory / 'report.json', report)
     if results.get('fused', {}).get('owner_tail_diagnostic'):
-        atomic_json(directory / 'checks.json', [dict(case='cutoff-tail',
-                    correctness=report['correctness'], detail='single-state diagnostic with paired trace on/off')])
+        graph_trace = results['fused']['owner_tail_diagnostic'] == 'owner_graph.json'
+        detail = ('20-state profiler and owner trace, checked on each of four graphs' if graph_trace
+                  else 'single-state diagnostic with paired trace on/off')
+        atomic_json(directory / 'checks.json', [dict(case='cutoff-tail-graph' if graph_trace else 'cutoff-tail',
+                                                     correctness=report['correctness'], detail=detail)])
     elif config.mode == 'check':
         atomic_json(directory / 'checks.json', [dict(case='real', correctness=report['correctness'],
                     detail='real Q/Index; deterministic C8 KV; serial and fused graph replay')])

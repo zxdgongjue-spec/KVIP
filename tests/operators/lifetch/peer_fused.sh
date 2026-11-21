@@ -34,8 +34,9 @@ offset_resolver=false
 row_deps=false
 candidate_only=false
 owner_tail=false
+owner_graph=false
 arm_iterations=20
-unset KVIP_Q4_OWNER_TAIL KVIP_Q4_TAIL_REFERENCE
+unset KVIP_Q4_OWNER_TAIL KVIP_Q4_TAIL_REFERENCE KVIP_Q4_OWNER_GRAPH
 plan_candidate=
 packet_reference=
 plan_control=
@@ -78,19 +79,24 @@ if [[ ${1:-} == --ranked-help || ${1:-} == --ranked-joint ]]; then
     elif [[ -n "$joint_reference" ]]; then
         echo '--previous requires --ranked-joint' >&2; exit 2
     fi
-elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-packets || ${1:-} == --short-lru || ${1:-} == --owner-pack || ${1:-} == --li-restore || ${1:-} == --logical-ties || ${1:-} == --cutoff-tail ]]; then
+elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-packets || ${1:-} == --short-lru || ${1:-} == --owner-pack || ${1:-} == --li-restore || ${1:-} == --logical-ties || ${1:-} == --cutoff-tail || ${1:-} == --cutoff-tail-graph ]]; then
     [[ $# -ge 2 && $2 =~ ^[0-9a-f]{40}$ ]] || { echo "Usage: peer_fused.sh $1 NATIVE_SHA [GROUP ...]" >&2; exit 2; }
     query_owner=true
     offset_resolver=true
     ranked_sha=f8b185e3d042a18b24fe695c0a49a7d969ca487d
     fixed_order_rev=7b60f0dddab91a4b154043e78088842d7856cba6
-    if [[ $1 == --short-lru || $1 == --owner-pack || $1 == --li-restore || $1 == --logical-ties || $1 == --cutoff-tail ]]; then
+    if [[ $1 == --short-lru || $1 == --owner-pack || $1 == --li-restore || $1 == --logical-ties || $1 == --cutoff-tail || $1 == --cutoff-tail-graph ]]; then
         candidate_only=true
         offset_resolver=false
         plan_candidate=${1#--}
-        if [[ $plan_candidate == cutoff-tail ]]; then
+        if [[ $plan_candidate == cutoff-tail || $plan_candidate == cutoff-tail-graph ]]; then
             owner_tail=true
-            arm_iterations=1
+            if [[ $plan_candidate == cutoff-tail-graph ]]; then
+                owner_graph=true
+                export KVIP_Q4_OWNER_GRAPH=1
+            else
+                arm_iterations=1
+            fi
             plan_candidate=logical-ties
         fi
         if [[ $plan_candidate == owner-pack ]]; then ranked_sha=367565634aa5d9ef713239c33c4a281227032e31; fi
@@ -150,6 +156,7 @@ elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-pa
             fi
         fi
     fi
+    if "$owner_graph"; then offset_groups=(7); fi
     if (($#)); then
         allowed_groups=(7 2 10 17 4)
         if [[ $plan_candidate == owner-pack || $plan_candidate == li-restore || $plan_candidate == logical-ties ]]; then allowed_groups=("${offset_groups[@]}"); fi
@@ -244,7 +251,7 @@ if [[ -z "$ranked" && $# -eq 2 && $1 == --reuse-serial ]]; then
         exit 1
     fi
 elif [[ $# -ne 0 ]]; then
-    echo 'Usage: peer_fused.sh --cutoff-tail NATIVE_SHA --reference LEVEL1_DIR [GROUP ...] | --owner-pack NATIVE_SHA [GROUP ...] | --short-lru NATIVE_SHA [GROUP ...] | --li-packets NATIVE_SHA [--reference DIR] [GROUP ...] | --row-deps NATIVE_SHA [GROUP ...] | --offset-resolver NATIVE_SHA [GROUP ...] | --ranked-auto FULL_SHA [--reference DIR] | --ranked-joint-local FULL_SHA [--reference DIR] | --ranked-joint FULL_SHA --previous DIR [--reference DIR] | --ranked-help FULL_SHA [--reference DIR] [--resume DIR] [--anchor GROUP] | --ranked-index CANDIDATE_SHA | [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
+    echo 'Usage: peer_fused.sh --cutoff-tail-graph NATIVE_SHA --reference LEVEL1_DIR [7] | --cutoff-tail NATIVE_SHA --reference LEVEL1_DIR [GROUP ...] | --owner-pack NATIVE_SHA [GROUP ...] | --short-lru NATIVE_SHA [GROUP ...] | --li-packets NATIVE_SHA [--reference DIR] [GROUP ...] | --row-deps NATIVE_SHA [GROUP ...] | --offset-resolver NATIVE_SHA [GROUP ...] | --ranked-auto FULL_SHA [--reference DIR] | --ranked-joint-local FULL_SHA [--reference DIR] | --ranked-joint FULL_SHA --previous DIR [--reference DIR] | --ranked-help FULL_SHA [--reference DIR] [--resume DIR] [--anchor GROUP] | --ranked-index CANDIDATE_SHA | [--main-adaptive CANDIDATE_SHA] [--reuse-serial PREVIOUS_RESULT_ROOT]' >&2
     exit 2
 fi
 export PATH=/usr/local/python3.12.13/bin:$PATH
@@ -506,7 +513,11 @@ if [[ -n "$ranked" ]]; then
     printf 'CONFIG URMA physical_NPU=%s logical_device=0 BS16 Q4 656B ranked=%.8s candidate=%.8s KVAF=%.8s\n' "$peer_physical_npu" "$ranked_sha" "$ranked" "$transport"
     if "$owner_tail"; then
         printf '%s\n' "$KVIP_Q4_TAIL_REFERENCE" >"$out/owner-tail-reference.txt"
-        echo "CONFIG diagnostic=cutoff-tail archived=24c619b9 level=1 warmup=4 independent_states=1 on_off_pairs=5"
+        if "$owner_graph"; then
+            echo "CONFIG diagnostic=cutoff-tail-graph archived=24c619b9 level=1 warmup=4 independent_states=20 graph_passes=4 trace_masks=off,alternating,complement,off"
+        else
+            echo "CONFIG diagnostic=cutoff-tail archived=24c619b9 level=1 warmup=4 independent_states=1 on_off_pairs=5"
+        fi
     elif "$candidate_only"; then
         echo "CONFIG arms=$plan_candidate query_owners=16x4 boundaries=4 budget=256/1024 fixed_route warmup=4 measured=20"
     elif "$row_deps"; then
@@ -776,7 +787,9 @@ if [[ -n "$ranked" ]]; then
         for label in "${order[@]}"; do
             run_arm "$label" "$group" "$case_dir"
         done
-        if "$owner_tail"; then
+        if "$owner_graph"; then
+            "$PYTHON" -B "$tools/support/owner_tail_graph.py" verify "$out" "$group" | tee -a "$out/summary.txt"
+        elif "$owner_tail"; then
             "$PYTHON" -B "$tools/support/owner_pack_tail.py" verify "$out" "$group" | tee -a "$out/summary.txt"
             "$PYTHON" -B "$tools/support/owner_tail_report.py" "$case_dir/owner_tail.json" | tee -a "$out/summary.txt"
         elif [[ $plan_candidate == li-restore || $plan_candidate == logical-ties ]]; then
@@ -797,9 +810,15 @@ if [[ -n "$ranked" ]]; then
     done
     if "$owner_tail"; then
         entries=(summary.txt archive-tail.txt archive-calls.json owner-tail-reference.txt logical-ties.txt physical_npu.txt)
-        for group in "${groups[@]}"; do entries+=("g$group/owner_tail.json"); done
-        tar -C "$out" -czhf "$out/owner-tail.tar.gz" "${entries[@]}"
-        printf 'RETURN_FILE=%s/owner-tail.tar.gz\n' "$out"
+        if "$owner_graph"; then
+            bundle="$out/owner-graph.tar.gz"
+            for group in "${groups[@]}"; do entries+=("g$group/owner_graph.json" "g$group/owner_graph_ticks.npz"); done
+        else
+            bundle="$out/owner-tail.tar.gz"
+            for group in "${groups[@]}"; do entries+=("g$group/owner_tail.json"); done
+        fi
+        tar -C "$out" -czhf "$bundle" "${entries[@]}"
+        printf 'RETURN_FILE=%s\n' "$bundle"
     fi
     if (( set_mismatches )); then
         printf 'TOPK_MISMATCH groups=%s RESULT_ROOT=%s\n' "$set_mismatches" "$out" >&2

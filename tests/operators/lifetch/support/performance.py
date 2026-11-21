@@ -15,12 +15,14 @@ TOKEN_BYTES = 656
 TOPK = 2048
 
 
-def profile_graph_batch(torch, graph, *, calls, folder, serial=False, transport='urma', stream=None):
+def profile_graph_batch(torch, graph, *, calls, folder, serial=False, transport='urma', stream=None,
+                        owner_trace_diagnostic=False):
     """Measure one already-warmed graph once, with events and profiler together.
 
     The caller owns independent mutable state for every captured invocation.
     Input preparation, restoration, warmup and verification stay outside this
-    function. No detailed device instrumentation may be enabled here.
+    function. Set owner_trace_diagnostic for the separate profiling protocol
+    that reads the owner buffers after the timed graph.
     """
     import json
     from pathlib import Path
@@ -63,6 +65,8 @@ def profile_graph_batch(torch, graph, *, calls, folder, serial=False, transport=
         accounting = account(events, name, elapsed, full=True, fused_final=True)
     accounting['event_us'] = elapsed
     result = split_graph_invocations(accounting, calls, serial=serial)
+    if owner_trace_diagnostic:
+        result['timing']['diagnostic'] = 'owner_trace_graph'
     result['trace'] = str(trace_path)
     atomic_json(folder / 'graph_profile.json', result)
     return result
