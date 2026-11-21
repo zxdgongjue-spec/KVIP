@@ -9,6 +9,24 @@ import numpy as np
 from peer_delta import pair_placement, read
 
 
+def check_cutoff_ids(inputs, layout, ids):
+    """The ordinary score oracle checks the Kth value. Also verify the physical tie break."""
+    for b, row in enumerate(layout):
+        for q, actual in enumerate(ids[b]):
+            valid = inputs.logical_score_valid[b, q, row]
+            tokens = row[valid]
+            keys = inputs.logical_score_keys[b, q, tokens]
+            k = actual.size
+            cutoff = np.partition(keys, len(keys) - k)[-k]
+            above = tokens[keys > cutoff]
+            expected = np.concatenate((above, tokens[keys == cutoff][:k - len(above)]))
+            if not np.array_equal(np.sort(actual), np.sort(expected)):
+                missing = np.setdiff1d(expected, actual)[:6].tolist()
+                extra = np.setdiff1d(actual, expected)[:6].tolist()
+                raise AssertionError(f'Physical cutoff tie rule: request={b} Q={q+1} '
+                                     f'cutoff={int(cutoff)} missing={missing} extra={extra}')
+
+
 def owner_receipts(posts):
     if posts.shape != (16, 4, 32):
         raise ValueError(f"Unexpected FinalPost shape {posts.shape}")
@@ -58,7 +76,7 @@ def load(root, group, label):
     traffic = [v['algorithm']['totals'] for v in rows]
     if any(v['KV_read_bytes'] != 656 * (v['final'] + v['prefetch']) for v in traffic):
         raise ValueError(f'{label}: inconsistent physical Get bytes')
-    if label == 'candidate':
+    if label not in ('baseline', 'fixed-order'):
         receipts = out['query_owners']
         if len(receipts) != len(rows) or any(r != dict(owners=64, queues=64, processed=v['final'])
                                               for r, v in zip(receipts, traffic)):
@@ -74,10 +92,43 @@ def load(root, group, label):
           f'span_drift_mean/P50_pct={drift[0]:+.2f}/{drift[1]:+.2f} miss_pct={miss:.3f} '
           f'waste/repair_KiB={kib[0]:.1f}/{kib[1]:.1f} total_MiB={mib:.4f}', flush=True)
     thp = read(root / f'g{group}' / label / 'thp.json')
-    return inputs, out['topk_set_digests'], thp, m, p, out['binary_sha256'], drift, times
+    return inputs, out['topk_set_digests'], thp, m, p, out['binary_sha256'], drift, times, stages['resolve_update'], mean(v['final'] for v in traffic)
+
+
+def report_resolver(root, group):
+    arms = {arm: load(root, group, arm) for arm in ('chain', 'spill', 'local')}
+    pairs = [('spill', 'local'), ('chain', 'local')]
+    if group in (7, 4):
+        arms['fixed-order'] = load(root, group, 'fixed-order')
+        pairs.append(('fixed-order', 'local'))
+    original = arms['chain']
+    if len({v[5] for v in arms.values()}) != len(arms) or any(v[0] != original[0] for v in arms.values()):
+        raise ValueError('Expected distinct binaries and identical captured inputs')
+    digests = [d for v in arms.values() for d in v[1]]
+    if len(digests) != 20 * len(arms) or len(set(digests)) != 1:
+        raise ValueError('Final TopK differs between invocations or arms')
+    print(f'G{group} EXACT_ID oracle_per_arm=20/20 queries_per_call=64 owners=64/64')
+    for before, after in pairs:
+        a, b = arms[before], arms[after]
+        gains = [100 * (1 - b[i] / a[i]) for i in (3, 4)]
+        drift = [max(abs(x), abs(y)) for x, y in zip(a[6], b[6])]
+        place = pair_placement(a[2], b[2], local_baseline=True)
+        if place != 'matched':
+            gate = 'PLACEMENT_MISMATCH'
+        elif all(g > d for g, d in zip(gains, drift)) and b[8] < a[8]:
+            gate = 'POSITIVE'
+        elif min(gains) > 0:
+            gate = 'INCONCLUSIVE'
+        else:
+            gate = 'KEEP_CONTROL'
+        print(f'G{group} {before}->{after} graph_saved_mean/P50_us={a[3]-b[3]:+.2f}/{a[4]-b[4]:+.2f} '
+              f'tail_saved_mean_us={a[8]-b[8]:+.2f} repair_delta_KiB={(b[9]-a[9])*656/1024:+.1f} '
+              f'gain_pct={gains[0]:+.2f}/{gains[1]:+.2f} drift_guard_pct={drift[0]:.2f}/{drift[1]:.2f} {gate}')
 
 
 def main(root, group):
+    if (root / 'local.txt').is_file():
+        return report_resolver(root, group)
     old, new = [load(root, group, name) for name in ('baseline', 'candidate')]
     if old[0] != new[0] or old[5] == new[5]:
         raise ValueError('Expected identical inputs and distinct binaries')

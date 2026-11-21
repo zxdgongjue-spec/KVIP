@@ -3291,7 +3291,7 @@ class FusedReplayState:
                 owner = KvafQueueView(self.lease, output_rows, table.addresses, table.valid)
                 if ranked_q_workers is not None:
                     views = owner.context['worker_count'] * owner.context['jettys_per_core']
-                    required = 5 * self.batch if query_owner_arm == 'candidate' else 2 * self.batch + 8 * ranked_q_workers
+                    required = 5 * self.batch if query_owner_arm not in (None, 'baseline', 'fixed-order') else 2 * self.batch + 8 * ranked_q_workers
                     if views < required:
                         raise ValueError(f'Ranked final Get needs {required} queue views, Runtime provides {views}')
                 if candidate_bounds is None:
@@ -3475,10 +3475,10 @@ class FusedReplayState:
     def validate(self, inputs):
         self.check_completion()
         arm = self.query_owner_arm
-        if arm in ('baseline', 'candidate'):
+        if arm is not None:
             from query_owner_report import owner_receipts
             active = hasattr(self.forward, 'query_owner_scratch')
-            if active != (arm == 'candidate'):
+            if active != (arm not in ('baseline', 'fixed-order')):
                 raise RuntimeError(f'{arm}: query-owner binding active={active}')
             if active:
                 self.query_owners = owner_receipts(self.rotating.final_posts.cpu().numpy())
@@ -3535,6 +3535,9 @@ class FusedReplayState:
         failures = []
         try:
             inputs.validate_topk(ids)
+            if arm in ('fixed-order', 'chain', 'spill', 'local'):
+                from query_owner_report import check_cutoff_ids
+                check_cutoff_ids(inputs, self.input_layout, ids)
         except AssertionError as error:
             failures.append(str(error))
             if hasattr(self.rotating, 'incremental'):

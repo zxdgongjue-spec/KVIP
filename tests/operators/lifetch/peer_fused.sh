@@ -29,6 +29,7 @@ joint_local=false
 joint_archive=false
 ranked_auto=false
 query_owner=false
+local_resolver=false
 current_fixed=6bca602ad9e548e9f12c0142fea25f2bc5c6877d
 ranked_q_workers=${PEER_RANKED_Q_WORKERS:-2}
 ranked_groups=(7 2 10 4 17)
@@ -68,6 +69,17 @@ if [[ ${1:-} == --ranked-help || ${1:-} == --ranked-joint ]]; then
     elif [[ -n "$joint_reference" ]]; then
         echo '--previous requires --ranked-joint' >&2; exit 2
     fi
+elif [[ ${1:-} == --local-resolver ]]; then
+    [[ $# == 1 ]] || { echo 'Usage: peer_fused.sh --local-resolver' >&2; exit 2; }
+    query_owner=true
+    local_resolver=true
+    ranked_sha=f8b185e3d042a18b24fe695c0a49a7d969ca487d
+    fixed_order_rev=7b60f0dddab91a4b154043e78088842d7856cba6
+    spill_rev=b0404c2760f82049920a0d43571e8a7aac904d6e
+    ranked=99b4d02b1b451117a73356e0099ee79276635a6a
+    unset KVIP_URMA_ROUTE_POLICY
+    export PEER_LOCAL_ONLY=1
+    shift
 elif [[ ${1:-} == --query-owner ]]; then
     query_owner=true
     ranked=${2:?supply query-owner commit}
@@ -230,10 +242,25 @@ fi
 if [[ -n "$ranked" ]]; then
     if "$query_owner"; then
         if ! git -C "$root" cat-file -e "$ranked^{commit}" 2>/dev/null; then
-            git -C "$root" fetch -q origin refs/heads/perf/urma-q4-query-owner
+            if "$local_resolver"; then git -C "$root" fetch -q origin refs/heads/perf/urma-q4-local-resolver
+            else git -C "$root" fetch -q origin refs/heads/perf/urma-q4-query-owner; fi
         fi
         ranked_base="$src/ranked-${ranked_sha:0:8}"
         pin "$root" "$ranked_base" "$ranked_sha"
+        if "$local_resolver"; then
+            ranked_fixed_order="$src/ranked-${fixed_order_rev:0:8}"
+            if ! git -C "$root" cat-file -e "$fixed_order_rev^{commit}" 2>/dev/null; then
+                git -C "$root" fetch -q origin refs/heads/perf/urma-q4-tie-control
+            fi
+            pin "$root" "$ranked_fixed_order" "$fixed_order_rev"
+            git -C "$root" diff --quiet "$fixed_order_rev" "$ranked" -- csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer
+            printf '%s\n' "$fixed_order_rev" >"$out/fixed-order.txt"
+            ranked_spill="$src/ranked-${spill_rev:0:8}"
+            pin "$root" "$ranked_spill" "$spill_rev"
+            printf '%s\n' "$ranked_sha" >"$out/chain.txt"
+            printf '%s\n' "$spill_rev" >"$out/spill.txt"
+            printf '%s\n' "$ranked" >"$out/local.txt"
+        fi
     elif "$ranked_auto"; then
         git -C "$root" merge-base --is-ancestor "$current_fixed" "$ranked"
         ranked_base="$src/ranked-${current_fixed:0:8}"
@@ -322,7 +349,9 @@ if "$query_owner"; then
 fi
 if [[ -n "$ranked" ]]; then
     printf 'CONFIG URMA physical_NPU=%s logical_device=0 BS16 Q4 656B ranked=%.8s candidate=%.8s KVAF=%.8s\n' "$peer_physical_npu" "$ranked_sha" "$ranked" "$transport"
-    if "$query_owner"; then
+    if "$local_resolver"; then
+        echo 'CONFIG arms=chain,spill,local owners=16x4 boundaries=4 budget=256/1024 fixed_route warmup=4 measured=20 final_tie=ascending_physical_position'
+    elif "$query_owner"; then
         echo 'CONFIG baseline=main_thread_fixed candidate_final_owners=16x4 prefetch_boundaries=4 window_budget=256 total_budget=1024 route=fixed warmup=4 samples=20'
     fi
     # Compile through the same cache key used by run_path. Fail before copying
@@ -334,6 +363,7 @@ if [[ -n "$ranked" ]]; then
     fi
     build_sources=("$ranked_candidate")
     if [[ -z "$help_reference" ]] || "$has_anchor" || "$ranked_auto"; then build_sources+=("$ranked_base"); fi
+    if "$local_resolver"; then build_sources+=("$ranked_spill" "$ranked_fixed_order"); fi
     for source_root in "${build_sources[@]}"; do
         PYTHONPATH="$source_root/python:$PYTHONPATH" "$PYTHON" -B - "$source_root" "$kvaf/build-npu" "$SOC_VERSION" "$out" <<'BUILD'
 from pathlib import Path
@@ -386,6 +416,10 @@ run_arm() (
     monitor=$!
     level=1
     case "$label" in
+        fixed-order) mode=(--fused-only --production-root "$ranked_fixed_order") ;;
+        chain) mode=(--fused-only --production-root "$ranked_base") ;;
+        spill) mode=(--fused-only --production-root "$ranked_spill") ;;
+        local) mode=(--fused-only --production-root "$ranked_candidate") ;;
         fixed) mode=(--fused-only --production-root "$ranked_base" --ranked-q-workers 2); level=2 ;;
         auto) mode=(--fused-only --production-root "$ranked_candidate" --ranked-q-workers 2 --ranked-auto-route); level=2 ;;
         serial2|serial32) mode=(--serial-only --serial-workers "${label#serial}") ;;
@@ -419,7 +453,7 @@ run_arm() (
             find "$arm/results" -name worker.log -exec awk '
                 /^EAGER_STAGE / {stage=$0}
                 /^DEVICE_FAILURE / {failure=$0}
-                /fault kernel|faultKernel|kernel_name|507014/ && ++n<=3 {print substr($0,1,600)}
+                /fault kernel|faultKernel|kernel_name|507014|Physical cutoff tie rule|Replay TopK ranking differs/ && ++n<=3 {print substr($0,1,600)}
                 END {if(stage) print stage; if(failure) print failure}
             ' {} \; >&2
             tail -5 "$arm/replay.log" >&2
@@ -524,10 +558,16 @@ fi
 if [[ -n "$ranked" ]]; then
     printf 'CPU_PLACEMENT target_node=%s policy=%s actual=measured_per_arm\n' "${node:-unknown}" "$policy"
     order=(baseline candidate)
-    for group in 2 7 10 17 4; do
+    groups=(2 7 10 17 4)
+    if "$local_resolver"; then order=(chain spill local); groups=(7 2 10 17 4); fi
+    for group in "${groups[@]}"; do
         case_dir="$out/g$group"
         if "$query_owner"; then trace=${owner_traces[$group]}
         else trace=$(bash "$tools/peer_g2_input.sh" "$work" "$group"); fi
+        # The two historically ambiguous groups also check the fixed fused tail.
+        if "$local_resolver" && [[ $group == 7 || $group == 4 ]]; then
+            run_arm fixed-order "$group" "$case_dir"
+        fi
         for label in "${order[@]}"; do
             run_arm "$label" "$group" "$case_dir"
         done
@@ -536,7 +576,7 @@ if [[ -n "$ranked" ]]; then
         else
             "$PYTHON" -B "$tools/support/ranked_five_report.py" "$out" --group "$group" | tee -a "$out/summary.txt"
         fi
-        order=("${order[1]}" "${order[0]}")
+        order=("${order[@]:1}" "${order[0]}")
     done
     printf 'REPLAY_COMPLETE RESULT_ROOT=%s\n' "$out"
     exit 0
