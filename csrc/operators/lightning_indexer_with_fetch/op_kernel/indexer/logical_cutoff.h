@@ -237,14 +237,16 @@ __simt_callee__ inline bool SparseLogical(__gm__ uint64_t* logical, __ubuf__ uin
     asc_syncthreads();
     return true;
 }
+template<bool Compact>
 __simt_vf__ __aicore__ LAUNCH_BOUND(kThreads) inline void Select(
         __gm__ uint64_t* logical, __ubuf__ uint32_t* marks, uint32_t words, uint32_t history,
         __ubuf__ uint16_t* slots, __ubuf__ uint32_t* count, __ubuf__ uint32_t* ids, __ubuf__ uint32_t* work,
         uint32_t resident, __gm__ uint32_t* hot, __gm__ int32_t* reserved, uint32_t tailBegin, uint32_t tailEnd) {
     uint32_t tid = threadIdx.x, quota = count[0];
     if (!quota) return;
-    if (words > kTile/32 &&
-        SparseLogical(logical,marks,history,slots,quota,ids,work,count[8],resident,hot,reserved,tailBegin,tailEnd)) return;
+    if constexpr (Compact) {
+        if (SparseLogical(logical,marks,history,slots,quota,ids,work,count[8],resident,hot,reserved,tailBegin,tailEnd)) return;
+    }
     const uint32_t logicalWords = (history+31)/32;
     auto prefix = work + logicalWords;
     auto ctl = prefix + kThreads;
@@ -285,7 +287,8 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(kThreads) inline void Select(
     asc_syncthreads();
 }
 
-__aicore__ inline void Repair(GlobalTensor<uint16_t> raw, GlobalTensor<uint64_t> logical,
+template<bool Compact>
+__aicore__ inline void RepairRow(GlobalTensor<uint16_t> raw, GlobalTensor<uint64_t> logical,
         LocalTensor<uint16_t> chosenScores, LocalTensor<uint32_t> taggedIds,
         LocalTensor<uint16_t> tile, LocalTensor<uint32_t> scratch, uint32_t valid, uint32_t history,
         uint16_t cutoff, uint32_t resident, __gm__ uint32_t* hot, __gm__ int32_t* reserved,
@@ -316,17 +319,30 @@ __aicore__ inline void Repair(GlobalTensor<uint16_t> raw, GlobalTensor<uint64_t>
     PipeBarrier<PIPE_ALL>();
     // A single score tile already fits the direct bitmap traversal. Compacting
     // its word indices costs another vector pass and synchronization.
-    if (words > kTile/32) {
+    if constexpr (Compact) {
         CompactWords(reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),
                      reinterpret_cast<__ubuf__ uint32_t*>(tile.GetPhyAddr()),
                      reinterpret_cast<__ubuf__ uint32_t*>(count[8].GetPhyAddr()), uint16_t(words));
         PipeBarrier<PIPE_ALL>();
     }
-    Simt::VF_CALL<Select>(Simt::Dim3{kThreads,1,1},const_cast<__gm__ uint64_t*>(logical.GetPhyAddr()),
+    Simt::VF_CALL<Select<Compact>>(Simt::Dim3{kThreads,1,1},const_cast<__gm__ uint64_t*>(logical.GetPhyAddr()),
         reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),words,history,
         reinterpret_cast<__ubuf__ uint16_t*>(slots.GetPhyAddr()),
         reinterpret_cast<__ubuf__ uint32_t*>(count.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(taggedIds.GetPhyAddr()),
         reinterpret_cast<__ubuf__ uint32_t*>(tile.GetPhyAddr()),resident,hot,reserved,tailBegin,tailEnd);
     PipeBarrier<PIPE_ALL>();
+}
+__aicore__ inline void Repair(GlobalTensor<uint16_t> raw, GlobalTensor<uint64_t> logical,
+        LocalTensor<uint16_t> chosenScores, LocalTensor<uint32_t> taggedIds,
+        LocalTensor<uint16_t> tile, LocalTensor<uint32_t> scratch, uint32_t valid, uint32_t history,
+        uint16_t cutoff, uint32_t resident, __gm__ uint32_t* hot, __gm__ int32_t* reserved,
+        uint32_t tailBegin, uint32_t tailEnd) {
+    if (valid <= kTile) {
+        RepairRow<false>(raw,logical,chosenScores,taggedIds,tile,scratch,valid,history,cutoff,
+            resident,hot,reserved,tailBegin,tailEnd);
+    } else {
+        RepairRow<true>(raw,logical,chosenScores,taggedIds,tile,scratch,valid,history,cutoff,
+            resident,hot,reserved,tailBegin,tailEnd);
+    }
 }
 } // namespace kvip_logical_cutoff
