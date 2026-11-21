@@ -3291,7 +3291,7 @@ class FusedReplayState:
                 owner = KvafQueueView(self.lease, output_rows, table.addresses, table.valid)
                 if ranked_q_workers is not None:
                     views = owner.context['worker_count'] * owner.context['jettys_per_core']
-                    required = 2 * self.batch + 8 * ranked_q_workers
+                    required = 5 * self.batch if query_owner_arm == 'candidate' else 2 * self.batch + 8 * ranked_q_workers
                     if views < required:
                         raise ValueError(f'Ranked final Get needs {required} queue views, Runtime provides {views}')
                 if candidate_bounds is None:
@@ -4133,8 +4133,12 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 pending = False
         pending = True
         replay_stage('first eager forward and device completion')
-        state.forward()
-        stream.synchronize()
+        if getattr(config, 'query_owner_arm', None) and config.group == 2:
+            from query_owner_report import first_eager
+            first_eager(state.forward, stream)
+        else:
+            state.forward()
+            stream.synchronize()
         replay_stage('first eager completed; correctness check')
         checks.check('eager', lambda: validate(initial))
         if config.mode in ('bench', 'diagnose'):

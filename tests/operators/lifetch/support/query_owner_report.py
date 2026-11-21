@@ -1,4 +1,5 @@
 """One comparison per real G group. Readbacks run after graph timing."""
+import ctypes
 import sys
 from collections import Counter
 from pathlib import Path
@@ -7,6 +8,40 @@ from statistics import mean, median
 import numpy as np
 
 from peer_delta import pair_placement, read
+
+
+def first_eager(forward, stream):
+    """Run the fixed G2 eager check a kernel at a time, before graph capture."""
+    binding = forward.rotating
+    shape = binding.runtime_shape
+    if ((shape.batch, shape.history, shape.resident, shape.indexHeads, shape.splitQ,
+         shape.rounds, shape.liCores, shape.serviceLanes, forward.index_team_cores)
+            != (16, 131328, 16384, 32, 1, 9, 32, 6, 64)):
+        raise ValueError("Unexpected geometry for the Q4 eager check")
+    stage = 'prepare'
+    try:
+        print(f'EAGER_STAGE {stage}', flush=True)
+        stream.synchronize()
+        # Same launch symbols, stream, device pointers and grid as LaunchStreaming.
+        # This fixture sets all LI lengths to Q4/full history; causal ends are separate.
+        for stage, symbol, blocks, arg in (
+                ('resident', 'v9_li_kernel', shape.liCores, forward.bindings),
+                ('threshold', 'v9_li_kernel_1', shape.liCores, forward.bindings),
+                ('cold', 'v9_li_kernel_2', shape.liCores, forward.bindings),
+                ('final_topk', 'v9_li_kernel_3', shape.liCores, forward.bindings),
+                ('resolve_update', 'v9_streaming_resolve_update', forward.index_team_cores, forward.workspace)):
+            print(f'EAGER_STAGE {stage}', flush=True)
+            launch = getattr(binding.library, 'aclrtlaunch_' + symbol)
+            launch.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p]
+            launch.restype = ctypes.c_uint32
+            rc = launch(blocks, stream.npu_stream, arg.data_ptr())
+            if rc:
+                raise RuntimeError(f'{symbol} returned {rc}')
+            stream.synchronize()
+    except Exception as exc:
+        print(f'DEVICE_FAILURE stage={stage} error={type(exc).__name__}', flush=True)
+        print(str(exc), flush=True)
+        raise
 
 
 def owner_receipts(posts):

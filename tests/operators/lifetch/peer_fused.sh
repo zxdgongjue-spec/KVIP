@@ -71,8 +71,8 @@ if [[ ${1:-} == --ranked-help || ${1:-} == --ranked-joint ]]; then
 elif [[ ${1:-} == --query-owner ]]; then
     query_owner=true
     ranked=${2:?supply query-owner commit}
-    [[ $ranked =~ ^[0-9a-f]{40}$ && $ranked != "$current_fixed" ]] || exit 2
-    ranked_sha=$current_fixed
+    ranked_sha=a5bad885e123d0d4bcde0064927d9c4ce88326f9
+    [[ $ranked =~ ^[0-9a-f]{40}$ && $ranked != "$ranked_sha" ]] || exit 2
     shift 2
 elif [[ ${1:-} == --ranked-auto ]]; then
     ranked_auto=true
@@ -305,7 +305,7 @@ test -x "$cpu"
 if [[ -n "$ranked" ]]; then
     printf 'CONFIG URMA physical_NPU=%s logical_device=0 BS16 Q4 656B ranked=%.8s candidate=%.8s KVAF=%.8s\n' "$peer_physical_npu" "$ranked_sha" "$ranked" "$transport"
     if "$query_owner"; then
-        echo 'CONFIG final_owners=16x4 prefetch_seed=1 cold_windows=8 window_budget=64 total_budget=512 warmup=4 samples=20'
+        echo 'CONFIG final_owners=16x4 prefetch_seed=1 cold_windows=8 prefetch_AIVs_per_boundary=6 window_budget=64 total_budget=512 warmup=4 samples=20'
     fi
     # Compile through the same cache key used by run_path. Fail before copying
     # five traces or running the baseline if the toolchain rejects either arm.
@@ -398,8 +398,19 @@ run_arm() (
         --device 0 --kvaf-root "$kvaf" --kvaf-server "127.0.0.1:$port" \
         --prefetch-rank-start 1024 --warmup 4 --iterations 20 --level "$level" \
         --output "$arm/results" --timeout-seconds 1800 >"$arm/replay.log" 2>&1; then
-        tail -5 "$arm/replay.log" >&2
-        find "$arm/results" -name worker.log -exec tail -10 {} \; >&2
+        if "$query_owner"; then
+            printf 'FAILED_ARM=G%s/%s WORKER_DIR=%s\n' "$group" "$label" "$arm/results" >&2
+            find "$arm/results" -name worker.log -exec awk '
+                /^EAGER_STAGE / {stage=$0}
+                /^DEVICE_FAILURE / {failure=$0}
+                /fault kernel|faultKernel|kernel_name|507014/ && ++n<=3 {print substr($0,1,600)}
+                END {if(stage) print stage; if(failure) print failure}
+            ' {} \; >&2
+            tail -5 "$arm/replay.log" >&2
+        else
+            tail -5 "$arm/replay.log" >&2
+            find "$arm/results" -name worker.log -exec tail -10 {} \; >&2
+        fi
         exit 1
     fi
     if ! wait "$monitor"; then cat "$arm/thp.log" >&2; exit 1; fi
