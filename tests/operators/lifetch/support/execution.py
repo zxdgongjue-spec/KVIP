@@ -4164,7 +4164,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             checks.check('eager', lambda: validate(initial))
         if config.mode in ('bench', 'diagnose'):
             batch_states.append(state)
-            for _ in range(1, config.iterations):
+            for index in range(1, config.iterations):
+                replay_stage(f'preparing independent input {index + 1}/{config.iterations} after eager check')
                 if fused:
                     replica = FusedReplayState(
                         torch, runtime, view, library, initial, pages, logical_addresses,

@@ -547,18 +547,28 @@ run_arm() (
         --prefetch-rank-start 1024 --warmup 4 --iterations 20 --level "$level" \
         --output "$arm/results" --timeout-seconds 1800 >"$arm/replay.log" 2>&1; then
         if "$query_owner"; then
+            tail -5 "$arm/replay.log" >&2
             printf 'FAILED_ARM=G%s/%s WORKER_DIR=%s\n' "$group" "$label" "$arm/results" >&2
             awk '/^FAIL:|^REPLAY CHECK FAILURE|^STREAMING FETCH KV AUDIT:/ {
                 print substr($0,1,700); if (++n == 4) exit
             }' "$arm/replay.log" >&2
             find "$arm/results" -name worker.log -exec awk '
-                /^EAGER_STAGE / {stage=$0}
-                /^DEVICE_FAILURE / {failure=$0}
-                /^(AssertionError|ValueError|RuntimeError|IndexError|KeyError|TypeError):/ {exception=$0}
-                /fault kernel|faultKernel|kernel_name|507014|Physical cutoff tie rule|Replay TopK ranking differs/ && ++n<=3 {print substr($0,1,600)}
-                END {if(stage) print stage; if(failure) print failure; if(exception) print substr(exception,1,700)}
+                NF {tail[count++ % 6] = substr($0,1,700)}
+                /^(EAGER_STAGE |REPLAY fused:)/ {stage=$0}
+                /^DEVICE_FAILURE |stage=fetch_quarantine|fault kernel|faultKernel|507014/ {failure=substr($0,1,700)}
+                /Traceback \(most recent call last\):/ {trace=1; frame=""}
+                trace && /^[[:space:]]+File "/ {frame=$0}
+                trace && /^[[:alpha:]_][[:alnum:]_.]*(:|$)/ {
+                    exception=substr($0,1,700); location=frame; trace=0
+                }
+                END {
+                    print "WORKER_LOG=" FILENAME
+                    if(stage) print stage
+                    if(failure) print failure
+                    if(exception) {if(location) print location; print exception}
+                    else for(i=(count>6 ? count-6 : 0); i<count; ++i) print tail[i % 6]
+                }
             ' {} \; >&2
-            tail -5 "$arm/replay.log" >&2
         else
             tail -5 "$arm/replay.log" >&2
             find "$arm/results" -name worker.log -exec tail -10 {} \; >&2
