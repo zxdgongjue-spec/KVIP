@@ -1365,6 +1365,10 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
   if(team && a->queryOwnerScratch){
    query_owner::Run(a,block/4,block%4);
    AscendC::SyncAll<true>();
+   // After the existing all-AIV join, no reader can observe a next-round list.
+   auto listFlag=reinterpret_cast<__gm__ BatchFlag*>(query_owner::Scratch(a,block/4)+query_owner::kListFlags)+block%4;
+   listFlag->ready=0;
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(listFlag),sizeof(BatchFlag));
    if(block<shape.batch)Simt::VF_CALL<RetireRoundControl>(Simt::Dim3{128,1,1},a,shape.batch,workers,block);
    return;
   }
