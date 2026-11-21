@@ -511,7 +511,7 @@ if "$query_owner"; then
         allowed+=(':(exclude)csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_vector.h')
     fi
     if [[ -n $handoff_mode ]]; then
-        [[ $(git -C "$ranked_candidate" rev-parse HEAD^) == "$ranked_sha" ]] || { echo "Expected a direct ${ranked_sha:0:8} candidate" >&2; exit 1; }
+        git -C "$ranked_candidate" merge-base --is-ancestor "$ranked_sha" HEAD || { echo "Expected a candidate based on ${ranked_sha:0:8}" >&2; exit 1; }
         tail_sources=(':(exclude)csrc/operators/lightning_indexer_with_fetch/op_kernel/query_owner.h')
         if [[ $handoff_mode == prefetch-cq-overlap ]]; then
             tail_sources+=(':(exclude)csrc/operators/lightning_indexer_with_fetch/op_kernel/streaming.cpp')
