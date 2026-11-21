@@ -2,12 +2,25 @@
 import sys
 from math import isclose
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 
 from li_restore_report import eager_failure, li_times, read_sets, report as report_li, saved, stats
 from peer_delta import pair_placement, read
 from query_owner_report import compare_layout_receipts, load
+
+
+class Measurement(NamedTuple):
+    data: tuple
+    times: dict
+    metadata: dict
+    counts: dict
+    stable_queries: int
+    ok: bool
+    verdict: str
+    serial: np.ndarray
+    path: Path
 
 
 def measurement(root, group):
@@ -23,50 +36,67 @@ def measurement(root, group):
     li, _ = li_times(samples)
     if not isclose(li[0], data[13], abs_tol=0.025):
         raise ValueError(f'G{group}: LI mean differs from the four measured intervals')
-    return data, dict(graph=data[3:5], tail=(data[8], data[10]), LI=li), comparison['native_reference'], (
-        counts, stability, ok, verdict, serial), path
+    times = dict(graph=data[3:5], tail=(data[8], data[10]), LI=li)
+    return Measurement(data, times, comparison['native_reference'], counts, stability, ok, verdict, serial, path)
 
 
-def report(root, group):
-    archive = Path((root / 'early-handoff-reference.txt').read_text().strip())
-    if (archive / 'logical-ties.txt').read_text().strip() != '24c619b9581aad43fd53c815928def26a1e19560':
-        raise ValueError('Expected the completed 24c619b9 reference')
-    if any((r / 'physical_npu.txt').read_text().strip() != '4' for r in (archive, root)):
-        raise ValueError('Expected two measurements on physical NPU4')
-    if eager_failure(root / f'g{group}/logical-ties/results'):
-        return report_li(root, group, 'logical-ties')
-
-    old, old_times, archive_meta, archive_check, path = measurement(archive, group)
-    new, new_times, meta, check, candidate_path = measurement(root, group)
-    counts, stability, ok, verdict, serial = check
-    if (meta['origin'] != 'completed-archive' or Path(meta['archive_path']).resolve() != path.resolve()
-            or meta['identity'] != archive_meta['identity'] or not archive_check[2]
-            or not np.array_equal(archive_check[4], serial)):
-        raise ValueError(f'G{group}: saved strong-serial reference differs from {path}')
-    print(f'G{group} CHECK TopK_set_vs_strong_serial={verdict} calls={counts["matched_calls"]}/20 '
-          f'queries={counts["matched_queries"]}/1280 serial_repeat_queries={stability}/64 '
-          'KV=PASS ordered_Index=PASS rows=320/320')
-    if not ok:
-        print(f'G{group} TOPK_MISMATCH details={candidate_path}')
-        return 3
-
+def compare(group, label, reference, candidate):
+    old, new = reference.data, candidate.data
     if old[0] != new[0] or old[1] != new[1] or old[14] != new[14] or old[5] == new[5]:
-        raise ValueError(f'G{group}: replay inputs, TopK digests, KVAF root or binary identity incompatible')
+        raise ValueError(f'G{group}: {label} replay inputs, TopK digests, KVAF root or binary identity incompatible')
     matched_rows, matched_calls = compare_layout_receipts(
         {'archive': old[11], 'candidate': new[11]}, 'candidate')['archive']
     placement = pair_placement(old[2], new[2], local_baseline=True)
-    changed = sorted(key for key in meta['identity'] if meta['identity'][key] != meta['replay_identity'].get(key))
-    for label, times in [('24c619b9_archive', old_times), ('early-index-handoff', new_times)]:
-        print(f'G{group} {label}', *(f'{k}_mean/P50_us={stats(v)}' for k, v in times.items()))
+    previous = reference.metadata.get('replay_identity', reference.metadata['identity'])
+    current = candidate.metadata['replay_identity']
+    changed = sorted(key for key in previous.keys() | current.keys() if previous.get(key) != current.get(key))
     detail = (f'placement={placement} runtime_identity_diff={",".join(changed) or "none"} '
               f'same_event_layout_rows={matched_rows}/320 same_event_calls={matched_calls}/20')
     comparable = placement == 'matched' and not changed and matched_calls == 20
     status = 'historical_unpaired' if comparable else 'observed_only'
     metric = 'saved' if comparable else 'archive_minus_candidate'
     plans = 'matched' if matched_calls == 20 else 'differ'
-    print(f'G{group} vs_24c619b9_archive {status}',
-          *(f'{k}_{metric}_mean/P50_us={saved(old_times[k], new_times[k])}' for k in old_times),
+    print(f'G{group} vs_{label} {status}',
+          *(f'{k}_{metric}_mean/P50_us={saved(reference.times[k], candidate.times[k])}' for k in reference.times),
           detail, f'physical_plans={plans}')
+
+
+def report(root, group):
+    archive = Path((root / 'early-handoff-reference.txt').read_text().strip())
+    previous_ref = root / 'previous-handoff-reference.txt'
+    archives = [(archive, '24c619b9581aad43fd53c815928def26a1e19560')]
+    if previous_ref.exists():
+        archives.append((Path(previous_ref.read_text().strip()), '67b49a2748fde8f8779c4551410416596b35cf76'))
+    for folder, revision in archives:
+        if (folder / 'logical-ties.txt').read_text().strip() != revision:
+            raise ValueError(f'Expected reference {revision[:8]} at {folder}')
+    if any((r / 'physical_npu.txt').read_text().strip() != '4' for r in [root] + [r for r, _ in archives]):
+        raise ValueError('Expected measurements on physical NPU4')
+    if eager_failure(root / f'g{group}/logical-ties/results'):
+        return report_li(root, group, 'logical-ties')
+
+    references = [(rev[:8] + '_archive', measurement(folder, group)) for folder, rev in archives]
+    origin = references[0][1]
+    candidate = measurement(root, group)
+    for run in [r for _, r in references[1:]] + [candidate]:
+        meta = run.metadata
+        if (meta['origin'] != 'completed-archive' or Path(meta['archive_path']).resolve() != origin.path.resolve()
+                or meta['identity'] != origin.metadata['identity'] or not np.array_equal(origin.serial, run.serial)):
+            raise ValueError(f'G{group}: saved strong-serial reference differs from {origin.path}')
+    if any(not run.ok for _, run in references):
+        raise ValueError(f'G{group}: a reference run did not match the strong-serial sets')
+    print(f'G{group} CHECK TopK_set_vs_strong_serial={candidate.verdict} calls={candidate.counts["matched_calls"]}/20 '
+          f'queries={candidate.counts["matched_queries"]}/1280 serial_repeat_queries={candidate.stable_queries}/64 '
+          'KV=PASS ordered_Index=PASS rows=320/320')
+    if not candidate.ok:
+        print(f'G{group} TOPK_MISMATCH details={candidate.path}')
+        return 3
+
+    label = 'prefetch-cq-overlap' if previous_ref.exists() else 'early-index-handoff'
+    for name, run in [*references, (label, candidate)]:
+        print(f'G{group} {name}', *(f'{k}_mean/P50_us={stats(v)}' for k, v in run.times.items()))
+    for name, run in reversed(references):
+        compare(group, name, run, candidate)
     return 0
 
 

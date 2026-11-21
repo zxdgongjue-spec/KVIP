@@ -1,5 +1,7 @@
 """Candidate-only replay consumes the archived oracle and rejects incomparable runs."""
 import json
+import os
+import subprocess
 from pathlib import Path
 import sys
 
@@ -69,3 +71,38 @@ def test_archived_oracle_and_level1_savings(tmp_path, monkeypatch, capsys):
     output = capsys.readouterr().out
     assert 'observed_only graph_archive_minus_candidate_mean/P50_us=+3.00/+1.00' in output
     assert 'same_event_calls=19/20 physical_plans=differ' in output
+
+    # The second candidate reuses the original oracle and compares two actual
+    # uninstrumented archives with different event means, spans and plans.
+    next_root = tmp_path / 'cq-candidate'
+    next_root.mkdir()
+    (new / 'logical-ties.txt').write_text('67b49a2748fde8f8779c4551410416596b35cf76')
+    (next_root / 'physical_npu.txt').write_text('4')
+    (next_root / 'early-handoff-reference.txt').write_text(str(archive))
+    (next_root / 'previous-handoff-reference.txt').write_text(str(new))
+    write(next_root, reused, metadata, 397, 395, 275, 114)
+    assert report.report(next_root, 10) == 0
+    output = capsys.readouterr().out
+    assert 'G10 prefetch-cq-overlap graph_mean/P50_us=397.00/395.00' in output
+    assert 'G10 vs_67b49a27_archive observed_only graph_archive_minus_candidate_mean/P50_us=+1.00/+4.00' in output
+    assert 'G10 vs_24c619b9_archive historical_unpaired graph_saved_mean/P50_us=+4.00/+5.00' in output
+    assert 'queries=1280/1280' in output
+
+def test_overlap_replay_accepts_only_published_inputs_and_four_groups(tmp_path):
+    archive = tmp_path / 'original'
+    previous = tmp_path / 'handoff'
+    for path, rev in [(archive, '24c619b9581aad43fd53c815928def26a1e19560'),
+                      (previous, '67b49a2748fde8f8779c4551410416596b35cf76')]:
+        path.mkdir()
+        (path / 'logical-ties.txt').write_text(rev)
+        (path / 'physical_npu.txt').write_text('4')
+    runner = Path(__file__).parent / 'peer_fused.sh'
+    cmd = ['bash', str(runner), '--prefetch-cq-overlap', 'a'*40, '--reference', str(archive),
+           '--previous', str(previous), '2']
+    options = dict(env=dict(os.environ, PEER_PHYSICAL_NPU='4', PEER_G2_WORK=str(tmp_path)),
+                   capture_output=True, text=True)
+    rejected = subprocess.run(cmd, **options)
+    assert rejected.returncode == 2 and 'Unsupported group: 2 (allowed: 10 4 17 7)' in rejected.stderr
+    (previous / 'physical_npu.txt').write_text('0')
+    rejected = subprocess.run(cmd, **options)
+    assert rejected.returncode == 1 and 'Incompatible previous run' in rejected.stderr
