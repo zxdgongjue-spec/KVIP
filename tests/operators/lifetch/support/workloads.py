@@ -153,7 +153,7 @@ def configuration(argv=None):
             command.add_argument('--ranked-auto-route', action='store_true',
                                  help='learn the route from previous successful device feedback')
             command.add_argument('--query-owner-arm', choices=('baseline', 'candidate'),
-                                 help='matched BS16 Q4 ownership test, seed plus eight cold windows')
+                                 help='matched BS16 Q4 ownership test, fixed ranked prefetch configuration')
             command.add_argument('--ranked-q-workers', type=int, choices=(1, 2, 4),
                                  help='final URMA Post/CQ workers per query position on a ranked replay')
             command.add_argument('--candidate-root', type=Path, help='G2 auto-route production checkout')
@@ -208,9 +208,9 @@ def configuration(argv=None):
         if query_owner:
             if not (args.production_root and args.fused_only and args.transport == 'urma'
                     and args.level == 1 and not args.ranked_auto_route
-                    and (args.intermediate_fetches, args.prefetch_tokens) == (9, 512)):
-                parser.error('query-owner comparison requires fused-only production URMA, level 1 and 9 boundaries/512 tokens')
-            args.window_limit = 64
+                    and (args.intermediate_fetches, args.prefetch_tokens) == (4, 1024)):
+                parser.error('query-owner comparison requires fused-only production URMA, level 1 and 4 boundaries/1024 tokens')
+            args.window_limit = 256
         if (args.warmup < 0 or args.iterations <= 0 or not 1 <= args.intermediate_fetches <= 32
                 or not 0 <= args.prefetch_tokens <= 2048
                 or (not query_owner and args.prefetch_tokens % args.intermediate_fetches)):
@@ -860,7 +860,7 @@ class ReplayRound:
                 self.logical_address_valid[rows, layout])
 
 
-def assemble_round(references):
+def assemble_round(references, *, captures=None):
     """Merge selected DPs; retain page aliasing within DP, separate DP arenas."""
     if not references:
         raise ValueError('Cannot assemble an empty replay round')
@@ -877,7 +877,7 @@ def assemble_round(references):
         if ref.dp_rank in seen_ranks:
             raise ValueError('Duplicate DP in a replay round')
         seen_ranks.add(ref.dp_rank)
-        capture = load_score_capture(ref.manifest_path)
+        capture = load_score_capture(ref.manifest_path) if captures is None else captures[ref.dp_rank]
         arrays, source_geometry = capture.arrays, capture.manifest['geometry']
         current = {name: source_geometry[name] for name in
                    ('history', 'resident', 'heads', 'token_bytes', 'output_stride')}
@@ -938,6 +938,16 @@ class ReplaySequence:
     """Lazy complete-sequence loader, repeatable without retaining every Q/Index."""
     def __init__(self, root, group, round_range):
         snapshot = Path(root) / 'manifest.json'
+        self.merged = False
+        if snapshot.is_file():
+            manifest = json.loads(snapshot.read_text())
+            if manifest.get('content') == 'real_li_synthetic_kv':
+                from query_owner_input import merged_refs
+                if tuple(round_range) != (1, 1):
+                    raise ValueError('Merged single-round replay requires 1:1')
+                self.rounds = (tuple(merged_refs(snapshot.resolve(), manifest, group)),)
+                self.merged = True
+                return
         if snapshot.is_file() and json.loads(snapshot.read_text()).get('kind') == 'lifetch_legacy_replay_snapshot':
             if tuple(round_range) != (1, 1):
                 raise ValueError('Legacy snapshots are independent: use --round-range 1:1')
@@ -964,8 +974,8 @@ class ReplaySequence:
     def cache_ranked_round(self):
         # Production A/B replays restore the same one-round fixture before each
         # graph. Only cache the read-only capture, never a device/transport state.
-        if len(self.rounds) == 1:
-            self.cached_ranked_round = assemble_round(self.rounds[0])
+        if len(self.rounds) == 1 and not hasattr(self, 'cached_ranked_round'):
+            self.cached_ranked_round = next(iter(self))
 
     def __iter__(self):
         if getattr(self, 'cached_ranked_round', None) is not None:
@@ -973,7 +983,11 @@ class ReplaySequence:
             return
         previous = None
         for references in self.rounds:
-            current = assemble_round(references)
+            if getattr(self, 'merged', False):
+                from query_owner_input import merged_round
+                current = merged_round(references)
+            else:
+                current = assemble_round(references)
             if previous is not None:
                 if current.identities != previous.identities or current.geometry != previous.geometry:
                     raise ValueError('Request identity/geometry changed within replay sequence')

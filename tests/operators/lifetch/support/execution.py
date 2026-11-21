@@ -4133,12 +4133,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 pending = False
         pending = True
         replay_stage('first eager forward and device completion')
-        if getattr(config, 'query_owner_arm', None) and config.group == 2:
-            from query_owner_report import first_eager
-            first_eager(state.forward, stream)
-        else:
-            state.forward()
-            stream.synchronize()
+        state.forward()
+        stream.synchronize()
         replay_stage('first eager completed; correctness check')
         checks.check('eager', lambda: validate(initial))
         if config.mode in ('bench', 'diagnose'):

@@ -71,7 +71,9 @@ if [[ ${1:-} == --ranked-help || ${1:-} == --ranked-joint ]]; then
 elif [[ ${1:-} == --query-owner ]]; then
     query_owner=true
     ranked=${2:?supply query-owner commit}
-    ranked_sha=a5bad885e123d0d4bcde0064927d9c4ce88326f9
+    ranked_sha=$current_fixed
+    unset KVIP_URMA_ROUTE_POLICY
+    export PEER_LOCAL_ONLY=1
     [[ $ranked =~ ^[0-9a-f]{40}$ && $ranked != "$ranked_sha" ]] || exit 2
     shift 2
 elif [[ ${1:-} == --ranked-auto ]]; then
@@ -189,6 +191,16 @@ printf 'RESULT_ROOT=%s\n' "$out"
 if [[ -n "$ranked" ]]; then
     printf '%s\n' "$peer_physical_npu" >"$out/physical_npu.txt"
 fi
+if "$query_owner"; then
+    if [[ -x "$area/python-${serial_revision:0:8}/bin/python3" ]]; then
+        export PATH="$area/python-${serial_revision:0:8}/bin:$PATH"
+    fi
+    declare -A owner_traces
+    for group in 2 7 10 17 4; do
+        owner_traces[$group]=$(bash "$tools/peer_g2_input.sh" "$work" "$group")
+    done
+    echo 'INPUTS_READY local_groups=G2,G7,G10,G17,G4'
+fi
 if [[ -r /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
     source /usr/local/Ascend/ascend-toolkit/set_env.sh
 else
@@ -302,10 +314,16 @@ if [[ ! -s "$KVAF_BATCH_GET_KERNEL" || ! -s "$KVAF_BATCH_PUT_KERNEL" ||
 fi
 cpu="$clean/build-cpu/runtime/kvaf_cpu_service"
 test -x "$cpu"
+if "$query_owner"; then
+    git -C "$ranked_candidate" diff --exit-code --quiet "$ranked_sha" HEAD -- \
+        csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer \
+        csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer.cpp \
+        csrc/operators/common/lifetch
+fi
 if [[ -n "$ranked" ]]; then
     printf 'CONFIG URMA physical_NPU=%s logical_device=0 BS16 Q4 656B ranked=%.8s candidate=%.8s KVAF=%.8s\n' "$peer_physical_npu" "$ranked_sha" "$ranked" "$transport"
     if "$query_owner"; then
-        echo 'CONFIG final_owners=16x4 prefetch_seed=1 cold_windows=8 prefetch_AIVs_per_boundary=6 window_budget=64 total_budget=512 warmup=4 samples=20'
+        echo 'CONFIG baseline=main_thread_fixed candidate_final_owners=16x4 prefetch_boundaries=4 window_budget=256 total_budget=1024 route=fixed warmup=4 samples=20'
     fi
     # Compile through the same cache key used by run_path. Fail before copying
     # five traces or running the baseline if the toolchain rejects either arm.
@@ -383,8 +401,6 @@ run_arm() (
     esac
     limits=(--prefetch-tokens 1024 --intermediate-fetches 4)
     if "$query_owner"; then
-        # The first boundary is resident-ready. The other eight end cold scans.
-        limits=(--prefetch-tokens 512 --intermediate-fetches 9)
         mode+=(--ranked-q-workers 2 --query-owner-arm "$label")
         level=1
     fi
@@ -510,7 +526,8 @@ if [[ -n "$ranked" ]]; then
     order=(baseline candidate)
     for group in 2 7 10 17 4; do
         case_dir="$out/g$group"
-        trace=$(bash "$tools/peer_g2_input.sh" "$work" "$group")
+        if "$query_owner"; then trace=${owner_traces[$group]}
+        else trace=$(bash "$tools/peer_g2_input.sh" "$work" "$group"); fi
         for label in "${order[@]}"; do
             run_arm "$label" "$group" "$case_dir"
         done

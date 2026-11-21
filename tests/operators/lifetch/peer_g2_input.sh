@@ -45,8 +45,20 @@ if [[ -z "$existing" ]]; then
         if complete_input "$p" round0001; then existing=$p; break; fi
     done
 fi
+if [[ ${PEER_LOCAL_ONLY:-0} == 1 && -z "$existing" ]] && ! complete_input "$raw" "$raw_round"; then
+    located=$(python3 -B "$support/query_owner_input.py" "$work" "$group_id")
+    kind=${located%%$'\n'*}
+    local_root=${located#*$'\n'}
+    case $kind in
+        merged) echo "INPUT G$group_id local_merged=$local_root" >&2; echo "$local_root"; exit 0 ;;
+        prepared) existing=$local_root ;;
+        raw) raw=$local_root ;;
+        *) echo "Unknown local input kind: $kind" >&2; exit 1 ;;
+    esac
+fi
 if [[ -z "$existing" ]] && ! complete_input "$raw" "$raw_round"; then
     if [[ $group_id == 2 && -n ${PEER_G2_RAW:-} ]]; then echo "Incomplete PEER_G2_RAW=$raw" >&2; exit 1; fi
+    if [[ ${PEER_LOCAL_ONLY:-0} == 1 ]]; then echo "Incomplete local input G$group_id" >&2; exit 1; fi
     host=${PEER_TRACE_SOURCE_HOST:-root@141.62.38.24}
     if [[ $group_id == 2 ]]; then host=${PEER_G2_SOURCE_HOST:-$host}; fi
     command -v ssh >/dev/null || { echo "Need ssh or a local 8-DP input under PEER_SUITE_ROOT" >&2; exit 1; }

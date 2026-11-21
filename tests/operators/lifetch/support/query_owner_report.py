@@ -1,47 +1,12 @@
 """One comparison per real G group. Readbacks run after graph timing."""
-import ctypes
 import sys
-from collections import Counter
+from collections import Counter, defaultdict, deque
 from pathlib import Path
 from statistics import mean, median
 
 import numpy as np
 
 from peer_delta import pair_placement, read
-
-
-def first_eager(forward, stream):
-    """Run the fixed G2 eager check a kernel at a time, before graph capture."""
-    binding = forward.rotating
-    shape = binding.runtime_shape
-    if ((shape.batch, shape.history, shape.resident, shape.indexHeads, shape.splitQ,
-         shape.rounds, shape.liCores, shape.serviceLanes, forward.index_team_cores)
-            != (16, 131328, 16384, 32, 1, 9, 32, 6, 64)):
-        raise ValueError("Unexpected geometry for the Q4 eager check")
-    stage = 'prepare'
-    try:
-        print(f'EAGER_STAGE {stage}', flush=True)
-        stream.synchronize()
-        # Same launch symbols, stream, device pointers and grid as LaunchStreaming.
-        # This fixture sets all LI lengths to Q4/full history; causal ends are separate.
-        for stage, symbol, blocks, arg in (
-                ('resident', 'v9_li_kernel', shape.liCores, forward.bindings),
-                ('threshold', 'v9_li_kernel_1', shape.liCores, forward.bindings),
-                ('cold', 'v9_li_kernel_2', shape.liCores, forward.bindings),
-                ('final_topk', 'v9_li_kernel_3', shape.liCores, forward.bindings),
-                ('resolve_update', 'v9_streaming_resolve_update', forward.index_team_cores, forward.workspace)):
-            print(f'EAGER_STAGE {stage}', flush=True)
-            launch = getattr(binding.library, 'aclrtlaunch_' + symbol)
-            launch.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p]
-            launch.restype = ctypes.c_uint32
-            rc = launch(blocks, stream.npu_stream, arg.data_ptr())
-            if rc:
-                raise RuntimeError(f'{symbol} returned {rc}')
-            stream.synchronize()
-    except Exception as exc:
-        print(f'DEVICE_FAILURE stage={stage} error={type(exc).__name__}', flush=True)
-        print(str(exc), flush=True)
-        raise
 
 
 def owner_receipts(posts):
@@ -66,7 +31,8 @@ def load(root, group, label):
     expected = dict(batch=16, token_bytes=656, history=131328, resident=16384)
     if (out['production_revision'] != revision or out['correctness'] != 'PASS' or out['failures']
             or out['transport'] != 'urma' or out['runtime_workers'] != 40 or cfg['device'] != 0
-            or cfg['window_limit'] != 64 or cfg['query_owner_arm'] != label or cfg['group'] != group or cfg['intermediate_fetches'] != 9 or cfg['prefetch_tokens'] != 512
+            or cfg['window_limit'] != 256 or cfg['query_owner_arm'] != label or cfg['group'] != group or cfg['intermediate_fetches'] != 4 or cfg['prefetch_tokens'] != 1024
+            or cfg.get('ranked_auto_route') or cfg.get('route_policy') or out.get('auto_route')
             or cfg['level'] != 1 or cfg['warmup'] != 4 or cfg['iterations'] != 20
             or any(inputs['geometry'][k] != v for k, v in expected.items())
             or inputs['rounds'] != 1 or out['input_paths'] != inputs['source_paths']
@@ -85,8 +51,8 @@ def load(root, group, label):
         raise ValueError(f'{label}: replay loaded a different native library')
     for sample in rows:
         requests = sample['algorithm']['requests']
-        if len(requests) != 16 or any(len(r['windows']) != 9 or r['prefetch'] > 512
-                                      or any(w['posted'] > 64 for w in r['windows'])
+        if len(requests) != 16 or any(len(r['windows']) != 4 or r['prefetch'] > 1024
+                                      or any(w['posted'] > 256 for w in r['windows'])
                                       for r in requests):
             raise ValueError(f'{label}: observed window count or prefetch budget differs')
     traffic = [v['algorithm']['totals'] for v in rows]
@@ -108,7 +74,7 @@ def load(root, group, label):
           f'span_drift_mean/P50_pct={drift[0]:+.2f}/{drift[1]:+.2f} miss_pct={miss:.3f} '
           f'waste/repair_KiB={kib[0]:.1f}/{kib[1]:.1f} total_MiB={mib:.4f}', flush=True)
     thp = read(root / f'g{group}' / label / 'thp.json')
-    return inputs, set(out['topk_set_digests']), thp, m, p, out['binary_sha256'], drift
+    return inputs, out['topk_set_digests'], thp, m, p, out['binary_sha256'], drift, times
 
 
 def main(root, group):
@@ -116,16 +82,22 @@ def main(root, group):
     if old[0] != new[0] or old[5] == new[5]:
         raise ValueError('Expected identical inputs and distinct binaries')
     placement = pair_placement(old[2], new[2], local_baseline=True)
-    same = len(old[1] | new[1]) == 1
-    if placement != 'matched' or not same:
-        print(f'G{group} NOT_COMPARABLE placement={placement} selected_ids_identical={same} owners=64/64')
-        return
+    spans = defaultdict(deque)
+    for digest, value in zip(old[1], old[7]):
+        spans[digest].append(value)
+    paired = [spans[digest].popleft() - value for digest, value in zip(new[1], new[7]) if spans[digest]]
+    paired_saving = median(paired) if paired else float('nan')
+    same = len(paired) == len(new[1])
     gains = [100 * (1 - new[i] / old[i]) for i in (3, 4)]
     guard = [max(abs(old[6][i]), abs(new[6][i])) for i in range(2)]
     verdict = 'KEEP_BASELINE'
     if min(gains) > 0:
         verdict = 'BOTH_FASTER' if all(g > d for g, d in zip(gains, guard)) else 'WITHIN_DRIFT'
-    print(f'G{group} {verdict} gain_mean/P50_pct={gains[0]:+.2f}/{gains[1]:+.2f} owners=64/64', flush=True)
+    if placement != 'matched' or not same:
+        verdict = 'NOT_COMPARABLE'
+    print(f'G{group} {verdict} gain_mean/P50_pct={gains[0]:+.2f}/{gains[1]:+.2f} '
+          f'same_TopK={len(paired)}/20 paired_P50_saved_us={paired_saving:+.2f} '
+          f'placement={placement} owners=64/64', flush=True)
 
 
 if __name__ == '__main__':
