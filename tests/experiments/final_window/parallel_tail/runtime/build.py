@@ -9,6 +9,22 @@ from prepare_native import generate
 from prepare_prefix import prepare_prefix
 
 
+def run_logged(command, log):
+    """Keep full build output and surface compiler diagnostics on failure."""
+    try:
+        subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
+    except subprocess.CalledProcessError as error:
+        log.flush()
+        lines = Path(log.name).read_text(errors='replace').splitlines()
+        # Preserve the first actual compiler errors even if the make tail is long.
+        indices = set(range(max(0, len(lines)-100), len(lines)))
+        for i, line in enumerate(lines):
+            if 'error:' in line.lower() or 'undefined symbol' in line.lower():
+                indices.update(range(max(0, i-2), min(len(lines), i+8)))
+        detail = '\n'.join(lines[i] for i in sorted(indices))
+        raise RuntimeError(f'Build failed: {command}\nLog: {log.name}\n{detail}') from error
+
+
 def build(output, headers, cann, soc, jobs=2):
     output = Path(output).resolve()
     headers, cann = Path(headers).resolve(), Path(cann).resolve()
@@ -28,11 +44,11 @@ def build(output, headers, cann, soc, jobs=2):
     ):
         build_dir = directory / 'build'
         with (directory / 'build.log').open('w') as log:
-            subprocess.run(['cmake', '-S', str(source), '-B', str(build_dir),
+            run_logged(['cmake', '-S', str(source), '-B', str(build_dir),
                             f'-DKVAF_INCLUDE={headers}', f'-DASCEND_CANN_PACKAGE_PATH={cann}',
-                            f'-DSOC_VERSION={soc}'], stdout=log, stderr=subprocess.STDOUT, check=True)
-            subprocess.run(['cmake', '--build', str(build_dir), '-j', str(jobs)],
-                           stdout=log, stderr=subprocess.STDOUT, check=True)
+                            f'-DSOC_VERSION={soc}'], log=log)
+            run_logged(['cmake', '--build', str(build_dir), '-j', str(jobs)],
+                           log=log)
         library = build_dir / filename
         if not library.is_file():
             raise RuntimeError(f'Missing native library: {library}')

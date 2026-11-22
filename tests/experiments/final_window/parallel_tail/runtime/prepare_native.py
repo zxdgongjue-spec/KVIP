@@ -172,6 +172,12 @@ namespace rotating {
         ' SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);',
         ' DataCopy(slots,postScratch,2048);\n'
         ' PublishTerminalOutputs(update,s.batch,query,ids,postScratch,postScratch[bitmapWords+9],ctx->locations+uint64_t(query)*2048*4);')
+    # AIV-only task metadata does not exclude the body from the AIC compiler.
+    # Match the production vector entry's compile-time core guard.
+    text = replace_once(text,
+        ' KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);',
+        ' KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);\n if ASCEND_IS_AIV {')
+    text = replace_once(text, '\n#endif\n}\n', '\n } // ASCEND_IS_AIV\n#endif\n}\n')
     path.write_text(text)
     cmake = destination / 'CMakeLists.txt'
     text = cmake.read_text().replace('-DV9_SIMULATION=1', '-DV9_SIMULATION=0')
