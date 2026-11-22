@@ -21,3 +21,18 @@ class FailureReportTest(unittest.TestCase):
 
     def test_success(self):
         self.assertEqual(module.decode([[[0]*32]*4], [0]), [])
+
+    def test_sentinel_is_not_all_index_errors(self):
+        record = [0] * 32
+        record[12:17] = [-1] * 5
+        q = module.decode([[record] * 4], [16])[0]['queries'][0]
+        self.assertEqual(q['index_reasons'], [])
+        record[3] = 1
+        q = module.decode([[record] * 4], [16])[0]['queries'][0]
+        self.assertEqual(q['index_reasons'], [])
+
+    def test_explicit_index_reasons(self):
+        record = [0] * 32
+        record[3], record[13] = 1, 10
+        q = module.decode([[record] * 4], [16])[0]['queries'][0]
+        self.assertEqual(q['index_reasons'], ['source_outside_history', 'duplicate_source'])

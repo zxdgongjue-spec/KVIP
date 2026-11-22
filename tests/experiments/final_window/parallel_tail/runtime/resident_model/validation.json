@@ -1,0 +1,32 @@
+{
+  "baseline_commit": "32823c0",
+  "environment": "CANN 9.1 Ascend950PR_9599 simulator; native NPU library build also passed",
+  "fixture": "constructed 84 prior + 146 terminal changes, software CQ 5us; no real NIC",
+  "results": [
+    {
+      "case": "baseline cold",
+      "us": 33.74,
+      "correct": true
+    },
+    {
+      "case": "patched cold",
+      "us": 34.72,
+      "correct": true
+    },
+    {
+      "case": "reported resident source 5732 -> 4820",
+      "us": 34.56,
+      "correct": true
+    },
+    {
+      "case": "resident cycle 5732 -> 4820 -> 5732",
+      "us": 64.49,
+      "correct": true
+    }
+  ],
+  "checks": "two launches per case with persistent generation flags; TopK, routed logical and slot outputs, Index keys/scales/addresses/logical IDs, hot validity, retirement, WQEs, transport status",
+  "cold_delta_us": 0.98,
+  "cold_delta_percent": 2.904564315352697,
+  "hardware_verified": false,
+  "performance_note": "Not zero overhead. User requested committing this candidate for hardware verification."
+}

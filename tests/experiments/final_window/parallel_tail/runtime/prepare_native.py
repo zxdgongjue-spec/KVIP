@@ -195,6 +195,8 @@ target_link_libraries(parallel_terminal PRIVATE real_topk_kernel host_intf_pub a
     adapt_index_split(destination)
     from failure_codegen import add_failure_records
     add_failure_records(destination)
+    from resident_codegen import adapt_resident_update
+    adapt_resident_update(destination)
     return destination
 
 
