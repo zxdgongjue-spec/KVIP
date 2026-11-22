@@ -193,6 +193,8 @@ target_link_libraries(parallel_terminal PRIVATE real_topk_kernel host_intf_pub a
     cmake.write_text(text)
     adapt_pack_layout(destination)
     adapt_index_split(destination)
+    from failure_codegen import add_failure_records
+    add_failure_records(destination)
     return destination
 
 

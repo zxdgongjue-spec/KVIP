@@ -51,6 +51,21 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void FinishTerminalRow(
     }
     asc_syncthreads();
     uint32_t error=control[0];
+    // Publish through the same SIMT store path as the authoritative summary.
+    // Detailed per-Q records are copied only on a failed request.
+    auto queryError=reinterpret_cast<__gm__ uint32_t*>(a->queryErrors)+(b*4+q)*32;
+    if(error && t<32){
+        uint32_t value=0;
+        bool failed=asc_ldcg(flags+(28+q)*32)!=0;
+        if(t<12)value=failed?asc_ldcg(flags+(28+q)*32+t):0;
+        else if(t<=16){
+            bool indexFailure=failed && asc_ldcg(flags+(28+q)*32+3)!=0 && asc_ldcg(flags+(28+q)*32+8)!=0;
+            value=indexFailure?asc_ldcg(flags+(12+q)*32+t):UINT32_MAX;
+        }
+        asc_stcg(queryError+t,value);
+    }
+    else if(!t)asc_stcg(queryError,0U);
+
     auto dst=reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+uint64_t(b)*rotating::kChangeCapacity;
     auto valid=reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*resident;
     for(uint32_t i=t;i<count;i+=512){

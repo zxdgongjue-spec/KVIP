@@ -33,6 +33,11 @@ def runner_source(source, candidate, output):
 '''
         source = replace_once(source, '    forward = LIFetchForward(rotating, update)',
                               '    forward = LIFetchForward(rotating, update)' + injection)
+    if candidate:
+        source = replace_once(source, '        if any(status) or row["invalid_topk"]:',
+            '        if any(status) or row["invalid_topk"]:\n'
+            '            from failure_report import save_failure\n'
+            '            save_failure(output, forward, rotating, status)')
     marker = '        selected = topk[valid].contiguous().numpy().tobytes()'
     audit = '''        if measured and not any(status) and not int(bad.sum()):
             logical = update.logical_output.cpu().reshape(shape["batch"],4,2048)[valid]
