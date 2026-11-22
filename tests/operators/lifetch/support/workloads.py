@@ -118,6 +118,9 @@ def configuration(argv=None):
             command.add_argument('--suite', type=csv_values, default=('all',))
             command.add_argument('--cases', type=csv_values)
             command.add_argument('--snapshot', type=Path)
+        if mode == 'bench':
+            command.add_argument('--terminal', choices=('legacy', 'parallel'), default='legacy',
+                                 help='URMA fused tail implementation (parallel includes final TopK)')
         if mode in ('bench', 'diagnose'):
             command.add_argument('--input', choices=('synthetic', 'real'), default='synthetic')
             # None distinguishes absent arguments from explicitly supplied defaults on real input.
@@ -148,6 +151,8 @@ def configuration(argv=None):
         return args
     if args.device < 0 or args.timeout_seconds <= 0:
         parser.error('device must be nonnegative and timeout positive')
+    if getattr(args, 'terminal', 'legacy') == 'parallel' and args.transport != 'urma':
+        parser.error('--terminal parallel requires --transport urma')
     if args.mode == 'check':
         if 'all' in args.suite and len(args.suite) != 1:
             parser.error('suite all cannot be combined with individual suites')

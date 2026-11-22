@@ -77,7 +77,8 @@ def split_graph_invocations(accounting, calls, *, serial=False):
     if 'error' in accounting:
         raise ValueError(f'Graph attribution failed: {accounting}')
     groups = accounting['intervals_us']
-    resolver = 'resolve_update_fetch' if 'resolve_update_fetch' in groups else 'resolve_update'
+    resolver = next((key for key in ('terminal_topk_update_fetch', 'resolve_update_fetch')
+                     if key in groups), 'resolve_update')
     if serial or 'init' in groups:
         starts = sorted(start for start, _ in groups['li' if serial else 'init'])
     else:
@@ -92,6 +93,8 @@ def split_graph_invocations(accounting, calls, *, serial=False):
                 if start < last_end or end > resolve_start:
                     raise ValueError('LI phase crosses a resolver boundary')
                 phases.append(start)
+            if resolver == 'terminal_topk_update_fetch' and len(phases) != 3:
+                raise ValueError(f'Parallel terminal requires three prefix LI phases, found {len(phases)}')
             if not phases:
                 raise ValueError('Missing LI before resolver in measured graph')
             starts.append(min(phases))

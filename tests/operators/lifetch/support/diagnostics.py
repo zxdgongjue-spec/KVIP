@@ -912,6 +912,15 @@ def account(events, name, elapsed, *, full=False, fused_final=False):
             kernels["fetch"] = "v9_fetch_update_kernel"
     if any(e.get("name", "").lower().startswith("v9_early_fetch_kernel") for e in events):
         kernels["early_fetch"] = "v9_early_fetch_kernel"
+    if full and any(e.get('ph') == 'X' and
+                    e.get('name', '').startswith('v9_parallel_terminal') and
+                    (not e.get('cat') or 'kernel' in e['cat'].lower()) for e in events):
+        if any(e.get('ph') == 'X' and
+               (not e.get('cat') or 'kernel' in e['cat'].lower()) and
+               (e.get('name', '').startswith('v9_streaming_resolve_update') or
+                re.fullmatch(r'v9_li_kernel_3(?:_\d+)*', e.get('name', ''))) for e in events):
+            return dict(error='Mixed legacy and parallel terminal kernels in measured graph')
+        kernels = dict(li='v9_li_kernel', terminal_topk_update_fetch='v9_parallel_terminal')
     groups = {stage: [] for stage in kernels}
     for event in events:
         n = event.get("name", "").lower()

@@ -45,6 +45,9 @@ class ParallelTerminalForward:
         # Snapshot collection continues to use the original public buffers.
         return getattr(self.original, name)
 
+    def set_diagnostics(self, enabled):
+        self.set_options(diagnostics=enabled)
+
     def set_options(self, *, diagnostics=False, deferred_fetch=False):
         if deferred_fetch:
             raise ValueError('Private terminal owns its CQ completion; no deferred-fetch mode')

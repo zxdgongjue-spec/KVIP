@@ -3225,7 +3225,7 @@ class FusedReplayState:
     state must not have live graphs or unfinished device work.
     """
     def __init__(self, torch, runtime, table, library, initial, pages, addresses,
-                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None):
+                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None, terminal_factory=None):
         from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
         from kvip.cache.index_storage import IndexCacheStorage
         from kvip.operators.lifetch.binding import LIFetchBinding
@@ -3289,6 +3289,8 @@ class FusedReplayState:
                 outputs=torch.zeros((2, self.batch * 4, 1, 2048), dtype=torch.int32, device=device))
             self.forward = StreamingForward(self.rotating, self.update, torch, prefetch_tokens)
             self.reset()
+            if terminal_factory is not None:
+                terminal_factory.attach(self)
         except BaseException:
             if self.owns_lease:
                 self.lease.close()
@@ -3387,6 +3389,10 @@ class FusedReplayState:
         """Check device completion before reading outputs or reusing transport state."""
         status = self.update.status.cpu().numpy()
         if np.any(status):
+            if hasattr(self, 'terminal_factory'):
+                self.terminal_factory.save_failure(self.failure_directory, self.forward,
+                                                   self.rotating, status.tolist())
+                raise RuntimeError(f'Parallel terminal failed: {status.tolist()}; see failure_details.json')
             flags = self.forward.flags.cpu().numpy()
             workers = self.forward.worker_status.cpu().numpy()
             sources = self.forward.events_src.cpu().numpy()
@@ -3921,7 +3927,10 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                                    valid=view.valid[indices].contiguous())
         page_addresses = expanded.addresses.cpu().numpy().view(np.uint64).reshape(g['batch'], -1)
         logical_addresses = (page_addresses[:, :, None] + np.arange(128) * width).reshape(g['batch'], -1)
+        terminal_factory = None
         if fused:
+            from parallel_terminal import prepare_terminal
+            terminal_factory = prepare_terminal(config, directory, headers, cann, soc, shared_pool)
             if config.transport == 'urma':
                 (library,) = build_libraries(cache_dir=build / 'lifetch', cann=cann, headers=headers, soc=soc)
             else:
@@ -3932,7 +3941,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 torch, runtime, view, library, initial, pages, logical_addresses,
                 transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                 prefetch_tokens=config.prefetch_tokens, soc=soc,
-                prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024))
+                prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024),
+                terminal_factory=terminal_factory)
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
         if config.mode in ('bench', 'diagnose') and g.get('sparse_mode') == 0 and not fused:
@@ -3978,7 +3988,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                         torch, runtime, view, library, initial, pages, logical_addresses,
                         transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                         prefetch_tokens=config.prefetch_tokens, soc=soc,
-                        prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease)
+                        prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease,
+                        terminal_factory=terminal_factory)
                     replica.failure_directory = directory
                 else:
                     replica = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
@@ -3991,6 +4002,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             result.update(transport=config.transport, path='fused' if fused else 'serial',
                           runtime_workers=shared_pool.workers if borrowed else workers, geometry=g,
                           input_paths=[str(ref.manifest_path) for refs in sequence.rounds for ref in refs])
+            result['terminal'] = (terminal_factory.metadata if terminal_factory is not None
+                                  else dict(implementation='legacy' if fused else 'serial'))
             atomic_json(directory / 'path_result.json', result)
             return result
         state.reset()
@@ -4126,6 +4139,7 @@ def run_synthetic_batch(config, directory, *, shared_pool=None):
                 results[name] = run_path(config, folder / name, sequence, pages,
                                          fused=name == 'fused', shared_pool=pool)
                 report = dict(batch=batch, miss_percent=config.miss_percent, input='synthetic',
+                              terminal=getattr(config, 'terminal', 'legacy'),
                               correctness='NOT_RUN', execution='INCOMPLETE',
                               timing={'native_chain': results['serial']['all_rounds']})
                 if 'fused' in results:
@@ -4155,6 +4169,7 @@ def run_real(config, directory):
         results[name] = run_path(config, directory / name, sequence, pages, fused=name == 'fused')
         # Preserve completed serial timing even if the fused worker later fails.
         report = dict(batch=initial.geometry['batch'], input='real', correctness='NOT_RUN',
+                      terminal=getattr(config, 'terminal', 'legacy'),
                       execution='INCOMPLETE', timing={'native_chain': results['serial']['all_rounds']})
         if 'fused' in results:
             report.update(execution='COMPLETED',

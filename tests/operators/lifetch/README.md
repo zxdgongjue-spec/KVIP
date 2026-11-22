@@ -118,3 +118,31 @@ python tests/operators/lifetch/test_lifetch.py bench --input real \
 ```
 
 每次运行结果由唯一目录保存，失败也保留已完成 case。
+
+### Experimental parallel terminal in normal bench
+
+Add `--terminal parallel` to `bench --transport urma` for either
+`--input synthetic` or `--input real`. `--terminal legacy` (the default)
+retains the original final TopK and resolver for comparison. The serial path
+is unchanged. This option is not a production binding switch or a diagnose
+option.
+
+The parallel path builds isolated prefix/terminal libraries before capture,
+using the capacity and overlapping-exchange implementation from
+`tests/experiments/final_window/parallel_tail/runtime`. Synthetic cases sharing
+a worker reuse the compiled libraries. Every independent graph input receives
+its own private terminal buffers and output-specific queue bindings; queues
+remain shared and calls execute serially in the graph.
+
+Timing remains one graph containing `iterations` complete invocations, warmed
+up `warmup` times, then measured once with event and profiler together.
+`terminal_topk_update_fetch` includes final TopK, updates, Fetch and completion;
+it must not be added to another final TopK measurement. Reports record
+`terminal`, and fused `path_result.json` includes library paths and hashes.
+Compiler errors and terminal failures are printed directly; full failure
+records are saved beside that result.
+
+Current native limits: BS 1–16, 32 Index heads, sequence-split LI and at least
+four AIV blocks per request. Existing correctness checks remain enabled.
+The broader synthetic/real matrix still requires hardware validation; previous
+snapshot AB results do not establish its performance or correctness.
