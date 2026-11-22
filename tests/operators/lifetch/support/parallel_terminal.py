@@ -1,26 +1,40 @@
 """Opt-in experimental terminal for both formal bench input sources."""
+from contextlib import contextmanager
 import ctypes
 import importlib.util
 from pathlib import Path
 import sys
 
 
-def load_runtime_module(name):
+@contextmanager
+def runtime_import_path():
     directory = Path(__file__).resolve().parents[3] / 'experiments/final_window/parallel_tail/runtime'
-    spec = importlib.util.spec_from_file_location('lifetch_terminal_' + name, directory / (name + '.py'))
-    module = importlib.util.module_from_spec(spec)
-    # Generators use sibling imports. Restore the search path after startup.
+    previous = sys.path[:]
     sys.path.insert(0, str(directory))
     try:
-        spec.loader.exec_module(module)
+        yield directory
     finally:
-        sys.path.remove(str(directory))
+        sys.path[:] = previous
+
+
+def load_runtime_module(name):
+    with runtime_import_path() as directory:
+        spec = importlib.util.spec_from_file_location('lifetch_terminal_' + name, directory / (name + '.py'))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
     return module
+
+
+def build_runtime(directory, headers, cann, soc):
+    # generate() also imports sibling code generators lazily. Keep the path
+    # available through the entire build, not only module initialization.
+    with runtime_import_path():
+        return load_runtime_module('build').build(directory, headers, cann, soc)
 
 
 class TerminalFactory:
     def __init__(self, directory, headers, cann, soc):
-        products = load_runtime_module('build').build(directory, headers, cann, soc)
+        products = build_runtime(directory, headers, cann, soc)
         self.metadata = dict(implementation='parallel', libraries=products)
         self.prefix = ctypes.CDLL(products['prefix']['path'])
         self.terminal = ctypes.CDLL(products['terminal']['path'])

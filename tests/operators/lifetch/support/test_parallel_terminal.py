@@ -3,6 +3,7 @@ import contextlib
 import io
 from pathlib import Path
 import sys
+import subprocess
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -26,6 +27,53 @@ class ParallelBenchTests(unittest.TestCase):
     def test_runtime_imports(self):
         self.assertTrue(callable(load_runtime_module('build').build))
         self.assertTrue(callable(load_runtime_module('native_forward').ParallelTerminalForward))
+
+    def test_full_generation_with_delayed_imports(self):
+        # Fresh process: cached imports from other tests must not hide this bug.
+        script = r"""
+import sys
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+from parallel_terminal import build_runtime, runtime_import_path
+before = sys.path[:]
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    headers = root / 'headers'
+    headers.mkdir()
+    (headers / 'kvaf_batch_get_device.h').touch()
+    # Execute the real generators and adapters; only the external CANN build
+    # is replaced on CPU. Its expected products permit manifest validation.
+    def fake_compile(command, log):
+        if command[1] == '--build':
+            output = Path(command[2])
+            output.mkdir(parents=True, exist_ok=True)
+            name = 'libv9_bridge.so' if output.parent.name == 'prefix' else 'libparallel_terminal.so'
+            (output / name).write_bytes(b'CPU test placeholder')
+    import parallel_terminal
+    original_load = parallel_terminal.load_runtime_module
+    def load(name):
+        module = original_load(name)
+        if name == 'build':
+            module.run_logged = fake_compile
+        return module
+    with patch.object(parallel_terminal, 'load_runtime_module', side_effect=load):
+        products = build_runtime(root / 'native', headers, root / 'cann', 'test')
+    assert (root / 'native/terminal/kernel.cpp').is_file()
+    assert (root / 'native/terminal/capacity.h').is_file()
+    assert (root / 'native/terminal/overlap_update.h').is_file()
+    assert products['terminal']['sha256']
+assert sys.path == before
+try:
+    with runtime_import_path():
+        raise RuntimeError('test cleanup')
+except RuntimeError:
+    pass
+assert sys.path == before
+"""
+        result = subprocess.run([sys.executable, '-c', script], cwd=Path(__file__).resolve().parent,
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_shared_build_independent_wrappers(self):
         config = SimpleNamespace(terminal='parallel', mode='bench', transport='urma')
