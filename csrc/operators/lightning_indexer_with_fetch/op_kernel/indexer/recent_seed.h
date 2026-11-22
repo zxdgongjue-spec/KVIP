@@ -45,8 +45,15 @@ inline void RemapJoined(__ubuf__ uint32_t* indices, uint32_t resident,
 __simd_vf__ inline void ExcludeSeeded(__ubuf__ uint16_t* bitmap,uint32_t base,uint32_t n,uint32_t begin,uint32_t end) {
     using namespace AscendC::MicroAPI;
     auto all=CreateMask<uint16_t,MaskPattern::ALL>();
+#if KVIP_PARALLEL_TERMINAL
+    if(begin>=end || begin>=base+n || end<=base)return;
+    uint32_t first=begin>base?((begin-base)/128)*128:0;
+    uint32_t stop=end<base+n?end-base:n;
+    for(uint32_t i=first;i<stop;i+=128) {
+#else
     for(uint32_t i=0;i<n;i+=128) {
         if(base+i>=end || base+i+128<=begin)continue;
+#endif
         RegTensor<int16_t> sequence;RegTensor<uint16_t> offsets;
         Arange(sequence,int16_t(0));offsets=reinterpret_cast<RegTensor<uint16_t>&>(sequence);
         MaskReg selected,before,after,keep;

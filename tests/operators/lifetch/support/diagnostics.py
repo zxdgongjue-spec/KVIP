@@ -163,9 +163,9 @@ def summarize(directory, config):
                 if config.level >= 2:
                     # Counts/durations retain their request and query association.
                     item['requests'] = details
-                    if raw:
+                    if raw or details[0].get('terminal_timeline'):
                         try:
-                            decoded = decode_timeline(raw)
+                            decoded = details[0].get('terminal_timeline') or decode_timeline(raw)
                         except ValueError as error:
                             result['missing'].append(f'{path} repeat={sample["round"]}: {error}')
                         else:
@@ -222,6 +222,10 @@ def summarize(directory, config):
     if config.level == 1:
         result['unavailable'] = [value for value in result['unavailable']
                                  if not value.startswith(('useful/', 'window candidates/'))]
+    parallel_terminal = any('topk_resolve_update' in sample.get('accounting', {}).get('stages_us', {})
+                            for capture in result['captures'] for sample in capture['samples'])
+    if parallel_terminal:
+        result['unavailable'].append('Parallel terminal: old Fetch-only descriptors and bandwidth scopes are not produced; use terminal per-core phases')
     if 'fetch' in config.stages:
         for capture in result['captures']:
             if capture.get('path') == 'serial':
@@ -237,10 +241,10 @@ def summarize(directory, config):
                             or (metric == 'final_get_bandwidth' and sample.get('final') == 0)
                             or (metric == 'combined_observed_bandwidth' and sample.get('prefetch') == 0 and sample.get('final') == 0)):
                         sample[metric] = dict(bytes=0, span_us=None, GBps=None, note='No transfers; bandwidth N/A')
-                    if metric not in sample:
+                    if metric not in sample and 'topk_resolve_update' not in sample.get('accounting', {}).get('stages_us', {}):
                         result['missing'].append(
                             f"{capture['source']} repeat={sample['repeat']}: {metric} unavailable")
-    if config.level == 3 and 'fetch' in config.stages:
+    if config.level == 3 and 'fetch' in config.stages and not parallel_terminal:
         fetch_paths = sorted(directory.rglob('fetch_only.json'))
         result['fetch_only'] = [dict(source=str(path), **json.loads(path.read_text()))
                                 for path in fetch_paths]
@@ -332,7 +336,7 @@ def summarize(directory, config):
 
 
 def algorithm_counts(mapping, selected, rows, posts, resident, windows, *,
-                     hot_valid=None, lru_slots=None, reserved_hot=None, logical_ids=None, tail_bounds=None, token_bytes=656):
+                     hot_valid=None, lru_slots=None, reserved_hot=None, logical_ids=None, tail_bounds=None, token_bytes=656, admission_records=True):
     """Reconcile existing admission records, not hypothetical transfer savings.
 
     The prefetch map stores resident+admission_ordinal; ABC uses a separate
@@ -360,7 +364,7 @@ def algorithm_counts(mapping, selected, rows, posts, resident, windows, *,
         admitted = np.flatnonzero((mapping[row] >= resident) & (mapping[row] < resident + 2048))
         ordinals = mapping[row, admitted] - resident
         posted = int(rows[row, 9])
-        if len(admitted) != posted or not np.array_equal(np.sort(ordinals), np.arange(posted)):
+        if admission_records and (len(admitted) != posted or not np.array_equal(np.sort(ordinals), np.arange(posted))):
             raise ValueError('Prefetch identity records do not match posted counter')
         epochs = rows[row, 16:16 + windows].astype(np.int64)
         if np.any(epochs < 0) or int(epochs.sum()) != posted:
@@ -375,11 +379,11 @@ def algorithm_counts(mapping, selected, rows, posts, resident, windows, *,
         window_rows, begin = [], 0
         for epoch, count in enumerate(epochs):
             end = begin + int(count)
-            unused_count = int(unused[begin:end].sum())
+            unused_count = int(unused[begin:end].sum()) if admission_records else None
             window_rows.append(dict(window=epoch + 1, posted=int(count),
                                     bytes=int(count) * token_bytes, unused=unused_count,
-                                    selected_members=int(count) - unused_count,
-                                    cumulative_posted=end, cumulative_unused=int(unused[:end].sum())))
+                                    selected_members=int(count) - unused_count if admission_records else None,
+                                    cumulative_posted=end, cumulative_unused=int(unused[:end].sum()) if admission_records else None))
             begin = end
         local = None
         if hot_valid is not None:
@@ -413,7 +417,7 @@ def algorithm_counts(mapping, selected, rows, posts, resident, windows, *,
         # from that same snapshot, before Index update changes ownership.
         transfers = []
         transfer_counts = dict(stable_hot=0, reserved_hot=0, cold=0, abc=0, repeated=0)
-        if hot_valid is not None and reserved_hot is not None:
+        if admission_records and hot_valid is not None and reserved_hot is not None:
             reservations = np.asarray(reserved_hot)[row]
             if reservations.shape != (resident,):
                 raise ValueError('Invalid initial reserved-hot shape')
@@ -438,18 +442,19 @@ def algorithm_counts(mapping, selected, rows, posts, resident, windows, *,
                              initial_hot_valid=None if local is None else initial_hot_count,
                              candidate_hot=candidate_hot, prefetch=posted, final=final,
                              KV_read_bytes=(posted + final) * token_bytes,
-                             unused_prefetch=int(unused.sum()),
-                             selected_prefetch=posted - int(unused.sum()),
+                             unused_prefetch=int(unused.sum()) if admission_records else None,
+                             selected_prefetch=posted - int(unused.sum()) if admission_records else None,
                              useful=None, redundant=None, refetched=None,
                              windows=window_rows, queries=query_rows,
                              prefetch_transfers=transfers, prefetch_classes=transfer_counts))
-    totals = {key: sum(item[key] for item in requests) for key in
+    totals = {key: (sum(item[key] for item in requests) if all(item[key] is not None for item in requests) else None) for key in
               ('selected_unique', 'prefetch', 'final', 'KV_read_bytes', 'unused_prefetch', 'selected_prefetch')}
     totals['initial_cold'] = None if hot_valid is None else sum(item['initial_cold'] for item in requests)
     totals['cold_miss_rate'] = (None if totals['initial_cold'] is None or not totals['selected_unique']
                                else totals['initial_cold'] / totals['selected_unique'])
     return dict(requests=requests, totals=totals,
-                attribution='unused is exact membership; useful/redundant/refetched lack consumption identity')
+                attribution=('unused is exact membership; useful/redundant/refetched lack consumption identity' if admission_records else
+                             'Parallel terminal retires admission identities; unused/conflict classification is unavailable'))
 
 
 def algorithm_before(rotating):
@@ -496,7 +501,8 @@ def algorithm_after(rotating, before):
             rotating.mapping.cpu().numpy(),
             rotating.arguments[9].cpu().numpy().view(np.int32).reshape(shape.batch, 4, 2048),
             rotating.rows.cpu().numpy().view(np.uint32), rotating.final_posts.cpu().numpy(),
-            shape.resident, rotating.rounds, token_bytes=shape.tokenBytes, **before)
+            shape.resident, rotating.rounds, token_bytes=shape.tokenBytes,
+            admission_records=not hasattr(rotating, "parallel_terminal"), **before)
         if hasattr(rotating, 'window_topk_storage'):
             prefix_bytes = 4 * 2048 * 6 + 1024
             # The public prefix is immutable after SaveResident; the private
@@ -837,6 +843,9 @@ def level_two_tables(result):
                 'Seen in earlier Qs', 'New demand', 'New: already local', 'New: initially cold', 'Final reads', 'Conflict reads'], queries, 2)
         for title, (target, headers, rows, identity_columns) in tables.items():
             target.append(diagnostic_table(title, headers, aggregate_diagnostic_rows(rows, identity_columns)))
+    if any('Parallel terminal' in sample.get('algorithm', {}).get('attribution', '')
+           for capture in result['captures'] for sample in capture['samples']):
+        algorithm_lines.append('Parallel terminal: retired admission identities and legacy conflict/Get groups are N/A; actual per-Q reads and terminal phases are retained.')
     algorithm_lines.append('Demand: Unique = Seen in earlier Qs + New demand; New demand = already local + initially cold. Final reads are actual repairs, not initially cold minus prefetch counts.')
     return '\n\n'.join([f"DIAG level={result.get('level', 2)} transport={result['transport']} trace={result['trace']}",
                            *algorithm_lines, *lines])
@@ -910,6 +919,8 @@ def account(events, name, elapsed, *, full=False, fused_final=False):
                        resolve_update="v9_streaming_resolve_update")
         if not fused_final:
             kernels["fetch"] = "v9_fetch_update_kernel"
+    if full and any(e.get("name", "").lower().startswith("v9_parallel_terminal") for e in events):
+        kernels = dict(li="v9_li_kernel", topk_resolve_update="v9_parallel_terminal")
     if any(e.get("name", "").lower().startswith("v9_early_fetch_kernel") for e in events):
         kernels["early_fetch"] = "v9_early_fetch_kernel"
     groups = {stage: [] for stage in kernels}
@@ -2124,3 +2135,39 @@ def summarize_transport_tail(root, transport):
                         for field in ('safe_entries', 'conflict_entries', 'safe_calls', 'conflict_calls'):
                             print(f'      {field}=' + str(sum(d['fetch']['ubmem_queries'][q][field] for d in details)))
     return result
+
+
+def decode_terminal_timeline(rows, clock_mhz):
+    """Decode the four-core terminal's own stamps, without inventing old stages."""
+    if clock_mhz <= 0:
+        raise ValueError('Invalid terminal counter frequency')
+    active = [(b, q, t) for b, queries in enumerate(rows) for q, t in enumerate(queries) if t[10]]
+    if not active:
+        raise ValueError('Missing terminal timestamps')
+    origin = min(t[0] for _, _, t in active)
+    phases = (('initialize', 0, 1), ('TopK', 1, 2), ('publish.TopK', 2, 3),
+              ('deduplicate_and_slots', 3, 11), ('output', 11, 7),
+              ('WQE_and_publish', 7, 4), ('release_scratch', 4, 5),
+              ('index_update_and_join', 8, 16), ('CQ_join', 16, 17), ('retire', 17, 10))
+    cores = []
+    for b, q, t in active:
+        stages = []
+        cursor = t[0]
+        for name, a, z in phases:
+            begin, end = t[a], t[z]
+            if begin < cursor or end < begin:
+                raise ValueError(f'Invalid terminal stamp: request={b} Q={q+1} phase={name}')
+            if begin > cursor:
+                stages.append(dict(name='control_gap', start_cycles=cursor, end_cycles=begin,
+                    start_us=(cursor-origin)/clock_mhz, end_us=(begin-origin)/clock_mhz,
+                    duration_us=(begin-cursor)/clock_mhz))
+            stages.append(dict(name=name, start_cycles=begin, end_cycles=end,
+                start_us=(begin-origin)/clock_mhz, end_us=(end-origin)/clock_mhz,
+                duration_us=(end-begin)/clock_mhz))
+            cursor = end
+        cores.append(dict(block=b*4+q, role=f'terminal b{b} Q{q+1}',
+            start_us=(t[0]-origin)/clock_mhz, end_us=(t[10]-origin)/clock_mhz,
+            duration_us=(t[10]-t[0])/clock_mhz, stages=stages))
+    last = max(cores, key=lambda core: core['end_us'])
+    return dict(clock_mhz=clock_mhz, cores=cores, last_block=last['block'],
+                observed_span_us=last['end_us'])

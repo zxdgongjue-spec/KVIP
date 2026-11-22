@@ -77,7 +77,8 @@ def split_graph_invocations(accounting, calls, *, serial=False):
     if 'error' in accounting:
         raise ValueError(f'Graph attribution failed: {accounting}')
     groups = accounting['intervals_us']
-    resolver = 'resolve_update_fetch' if 'resolve_update_fetch' in groups else 'resolve_update'
+    resolver = next((key for key in ('topk_resolve_update', 'resolve_update_fetch', 'resolve_update')
+                     if key in groups), 'resolve_update')
     if serial or 'init' in groups:
         starts = sorted(start for start, _ in groups['li' if serial else 'init'])
     else:

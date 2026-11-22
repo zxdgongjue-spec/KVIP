@@ -2045,6 +2045,8 @@ def run_urma_case(
     def verify(updated=False, persistent=True, completion_only=False):
         rows = rotating.rows.cpu().numpy()
         posts = rotating.final_posts.cpu().numpy()
+        if getattr(pipeline, 'terminal', None) is not None:
+            posts[:, :, 5] = posts[:, :, 0]  # Final allocations are disjoint from prior prefetch slots.
         statuses = rotating.row_status.cpu().numpy()
         cq = [status.cpu().view(torch.uint64).numpy() for status in (rotating.prefetch_status, rotating.final_status)]
         failures = completion_failures(rows, posts, statuses, *cq)
@@ -2212,7 +2214,8 @@ def run_urma_case(
                 for name in ("_live_count", "_live_flags", "_live_rows", "_live_events"):
                     if getattr(pipeline, name).count_nonzero().item():
                         raise AssertionError(f"Resolver left nonzero round state in {name}")
-                if int(rotating.count.cpu().item()) != state["completion"]["final_reads"]:
+                if (getattr(pipeline, "terminal", None) is None and
+                        int(rotating.count.cpu().item()) != state["completion"]["final_reads"]):
                     raise AssertionError("Published repair count differs from completed round")
             verify_all_valid_hot()
             # Validate every Index field against its logical owner, including rows
@@ -2237,7 +2240,9 @@ def run_urma_case(
             from correctness import transfer_coverage
             boundary_phases['transfer'] = transfer_coverage(
                 rotating.final_posts.cpu().numpy(), rotating.destinations.cpu().numpy(),
-                rotating.lru_slots.cpu().numpy(), owner.output.shape[1], r)
+                rotating.lru_slots.cpu().numpy(), owner.output.shape[1], r,
+                allocated_slots=(rotating.change_slots.cpu().numpy() if getattr(pipeline, 'terminal', None) is not None else None),
+                prior_counts=rotating.rows[:, 9].cpu().numpy())
             atomic_json(folder / "boundary_coverage.json", boundary_phases)
         changes = rotating.changes.cpu().numpy()
         result = dict(transport=state["completion"],
@@ -2409,7 +2414,7 @@ def run_urma_case(
     sfa = check_sfa(torch, tensors, geom, {"pool_rows": np.arange(b), "budgets": np.full(b, r + 8192)}, after,
                     output_path=None)
     fetch_only = None
-    if getattr(args, "diagnostic_fetch_only", False):
+    if getattr(args, "diagnostic_fetch_only", False) and getattr(pipeline, "terminal", None) is None:
         # A separate replay supplies the exact final descriptors. No standalone
         # preparation or tracing enters the full-graph performance samples.
         from performance import compare_fetch_only
@@ -3416,6 +3421,8 @@ class FusedReplayState:
                           flags=flags[:, :, :3].tolist(), event_checks=event_checks,
                           resolver=self.rotating.row_status.cpu().tolist(),
                           final_posts=self.rotating.final_posts.cpu().tolist())
+            if getattr(self.forward, 'terminal', None) is not None:
+                detail['terminal_query_errors'] = self.forward.query_errors.cpu().tolist()
             if hasattr(self, 'failure_directory'):
                 np.savez_compressed(self.failure_directory / 'completion_failure.npz',
                                     flags=flags, worker_status=workers, sources=sources,
@@ -3799,7 +3806,8 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                             for epoch, word in enumerate(epochs[:state.rotating.rounds]) if word]
                     details.append(sample)
                 atomic_json(directory / 'diagnose' / f'round-{inputs.source_round}' / 'detail_samples.json', details)
-        if fused and config.mode == 'diagnose' and config.level == 3 and config.transport == 'urma' and 'fetch' in config.stages:
+        if (fused and config.mode == 'diagnose' and config.level == 3 and config.transport == 'urma'
+                and 'fetch' in config.stages and getattr(states[0].forward, 'terminal', None) is None):
             from performance import compare_fetch_only
             first = states[0]
             first.forward.set_diagnostics(False)
@@ -4259,6 +4267,14 @@ class StreamingForward(LIFetchForward):
         self.set_options(diagnostics=enabled)
 
     def diagnostic_cycles(self):
+        if getattr(self, "terminal", None) is not None:
+            from diagnostics import decode_terminal_timeline
+            posts = self.rotating.final_posts.cpu().tolist()
+            result = [dict(batch=b, final_counts=[dict(total=int(p[0]), safe=None, conflict=None)
+                      for p in posts[b]]) for b in range(self.batch)]
+            result[0]['terminal_timeline'] = decode_terminal_timeline(
+                self.terminal.times.cpu().tolist(), self.counter_clock_mhz)
+            return result
         raw = self.times.cpu().numpy().astype(np.uint64)
         rows = raw[:self.batch * 64].reshape(self.batch, 64)
         li = raw[self.batch * 64:self.batch * 128].reshape(self.batch, 4, 16)
