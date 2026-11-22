@@ -1,0 +1,125 @@
+{
+  "state": "local_validation_complete_hardware_pending",
+  "environment": "CANN 9.1 Ascend950PR_9599 simulator; software CQ; input restored before each launch",
+  "baseline_commit": "bf9cf3f",
+  "ordinary_delta_us": 2.2,
+  "ordinary_delta_percent": 6.3,
+  "hardware_verified": false,
+  "results": [
+    {
+      "case": "baseline_230",
+      "verified_launches": 2,
+      "audit_bad": 0,
+      "per_core_us": {
+        "0.0": 34.92,
+        "0.1": 33.99,
+        "1.0": 33.6,
+        "1.1": 33.68
+      },
+      "duration_us": 34.92,
+      "hardware_measurement": false,
+      "log_sha256": "29f34643f8b26ce12377b9e21d66f1f0b7e50a2b107fa1338ee473f51ec22b66",
+      "local_log": "/tmp/lifetch-capacity-base-230/run9.log"
+    },
+    {
+      "case": "candidate_230",
+      "verified_launches": 2,
+      "audit_bad": 0,
+      "per_core_us": {
+        "0.0": 37.12,
+        "0.1": 35.95,
+        "1.0": 35.93,
+        "1.1": 35.84
+      },
+      "duration_us": 37.12,
+      "hardware_measurement": false,
+      "log_sha256": "e898ecf10f02e2913b8ae56e231bea4bd3658aee2b0446a143b1075cef9a9d5a",
+      "local_log": "/tmp/lifetch-capacity-static-230/run9.log"
+    },
+    {
+      "case": "candidate_2048",
+      "verified_launches": 2,
+      "audit_bad": 0,
+      "per_core_us": {
+        "0.0": 55.38,
+        "0.1": 54.6,
+        "1.0": 54.39,
+        "1.1": 54.42
+      },
+      "duration_us": 55.38,
+      "hardware_measurement": false,
+      "log_sha256": "c7a21c024dab55705cae7bbaf6c2cac9ef996289817f8c10eca8690cba7ee459",
+      "local_log": "/tmp/lifetch-capacity-static-2048/run9.log"
+    },
+    {
+      "case": "candidate_2049",
+      "verified_launches": 2,
+      "audit_bad": 0,
+      "per_core_us": {
+        "0.0": 67.09,
+        "0.1": 66.12,
+        "1.0": 66.04,
+        "1.1": 66.15
+      },
+      "duration_us": 67.09,
+      "hardware_measurement": false,
+      "log_sha256": "749ef659c74c654811e8be26ddf23f21d900bbb5291f63975f55750290a7e6b6",
+      "local_log": "/tmp/lifetch-capacity-static-2049/run9.log"
+    },
+    {
+      "case": "candidate_4000",
+      "verified_launches": 2,
+      "audit_bad": 0,
+      "per_core_us": {
+        "0.0": 91.99,
+        "0.1": 91.62,
+        "1.0": 91.6,
+        "1.1": 91.2
+      },
+      "duration_us": 91.99,
+      "hardware_measurement": false,
+      "log_sha256": "245386dae50cf4ab5bddd406d5b6448efaf3e21e04b543c367b39b54d02596b4",
+      "local_log": "/tmp/lifetch-capacity-static-4000/run9.log"
+    },
+    {
+      "case": "candidate_cross_worker_cycle",
+      "verified_launches": 2,
+      "audit_bad": 0,
+      "per_core_us": {
+        "0.0": 44.55,
+        "0.1": 43.45,
+        "1.0": 43.49,
+        "1.1": 43.45
+      },
+      "duration_us": 44.55,
+      "hardware_measurement": false,
+      "log_sha256": "eed2c56cf14d754733d5d3f96ee02436b5692be0d8cb5bef3f2c6acf58d0c36c",
+      "local_log": "/tmp/lifetch-capacity-static-cycle/run9.log"
+    }
+  ],
+  "retained_device_sha256": {
+    "kernel.cpp": "0eb34bd4e731b49859256fd257f13ad2d35ecb7bc942f7773ff3bad126bcd5f3",
+    "helpers.h": "61e3341c1d1d653348297c2bb5ff58bccc132285dae1497974bfeda3b15f15de",
+    "parallel_post.h": "5c4225ffc9e18e400315022d96c4681b546bd831301c7f69611f9c1864b06d61",
+    "terminal_finish.h": "9e71898bf7049ba8a520b2dacc97c4b553e91422552cc20aafb9118f66d27c9f",
+    "capacity.h": "7fffd93ab441a2988297943595298a14c11f741e4f9c3006a3c2b243f93c5d04",
+    "overlap_update.h": "765ae14a55cf9a8d69110c101304a188090c26c5bb170106fe74bf576b78b0b8"
+  },
+  "host_tests": 23,
+  "native_npu_library_build": "PASS (CANN 9.1; no hardware execution)",
+  "fixed_matrix_sources_identical": true,
+  "fixture_driver_sha256": {
+    "230": "68543a96e4b52c144f79dab1cae8f183cc4741783105342ebadc3aa0b3677644",
+    "2048": "54046b3bd890073f8b1fb0c323d3c3e471ff9b5483b5a7f25eecd91c9cd8dbd2",
+    "2049": "bb81197edf00749e3d1933ac3e2b8ddc02bfebad7ecd492017470db373d9d959",
+    "4000": "8e3dcf5f156c37860602e3112c53d9d19383db406559cabb650a8a124d958e02",
+    "cycle": "226b726e98ea9742717109630f76b6615420036b85cfbe4ea07c02a606e256cb"
+  },
+  "scope": "Experimental snapshot AB build only; production operator and synthetic/real bench dispatch are unchanged.",
+  "limitations": [
+    "Ordinary workload retains +2.20 us (6.3%) versus original terminal; not zero regression.",
+    "4000 fixture has more final traffic; its delta is not allocator overhead alone.",
+    "Large overlapping permutations remain limited by bounded general-update UB capacity.",
+    "Input is restored before both launches; this is not an evolving decode sequence."
+  ]
+}

@@ -22,9 +22,9 @@ def generate(output, pattern="isolated"):
                         ' lru[1]=4820;restore(c.lruSlots,lru);\n std::vector<uint32_t> inverse(R,UINT32_MAX);for(uint32_t i=0;i<lru.size();++i)inverse[lru[i]]=i;restore(c.reservedHot,inverse);')
     text = replace_once(text, ' printf("audit_index=%zu\\n",bad-checkpoint);checkpoint=bad;',
                         ' bad+=get<uint32_t>(c.hotValid,R)[5732]!=0;\n printf("audit_index=%zu\\n",bad-checkpoint);checkpoint=bad;')
-    if pattern in ("chain", "cycle"):
+    if pattern in ("chain", "cycle", "cross_cycle"):
         text = replace_once(text, 'i==1?5732:H-596+i', 'i==1?5732:i==2?4820:H-596+i')
-        if pattern == "cycle":
+        if pattern in ("cycle", "cross_cycle"):
             text = replace_once(text, 'lru[1]=4820;', 'lru[1]=4820;lru[2]=5732;')
         start = text.index(' for(uint32_t token=prior;token<prior+146;++token){if(mapping[token]<R')
         end = text.index(' printf("audit_index=', start)
@@ -49,12 +49,27 @@ def generate(output, pattern="isolated"):
  auto validity=get<uint32_t>(c.hotValid,R);
  for(uint32_t dst=0;dst<R;++dst){bool freedHot=std::find(freed.begin(),freed.end(),dst)!=freed.end();bad+=validity[dst]!=uint32_t(!freedHot);}
 """ + text[end:]
+    # Modes 8/9 put a prior-prefetched token into the saved TopK. Keep it in
+    # sync with the injected journal source; otherwise the test invents new
+    # misses and fails its fixed posted-count oracle before checking Index.
+    injected = ('(q==1?5732:q==2?4820:H-596+q)' if pattern in ('chain', 'cycle')
+                else '(q==1?5732:H-596+q)')
+    text = text.replace('H-596+q', injected)
+    text = replace_once(text,
+        'else if((mode==8 || mode==9) && token>=H-596 && token<H-512)physical=lru[token-(H-596)];',
+        'else if(initialMapping[token]!=UINT32_MAX)physical=lru[initialMapping[token]-R];')
+    if pattern == "cross_cycle":
+        # The 230 records partition at 57/115/172. Put the second half of
+        # the cycle at ordinal 80 so two different workers own the cycle.
+        text = replace_once(text, 'i==1?5732:i==2?4820:H-596+i',
+                            'i==1?5732:i==80?4820:H-596+i')
+        text = replace_once(text, 'lru[2]=5732;', 'lru[80]=5732;')
     driver.write_text(text)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path)
-    parser.add_argument('--pattern', choices=('isolated', 'chain', 'cycle'), default='isolated')
+    parser.add_argument('--pattern', choices=('isolated', 'chain', 'cycle', 'cross_cycle'), default='isolated')
     args=parser.parse_args()
     generate(args.output.resolve(), args.pattern)

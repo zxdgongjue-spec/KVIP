@@ -6,6 +6,8 @@ from pathlib import Path
 import subprocess
 
 from prepare_native import generate
+from capacity_codegen import adapt_capacity
+from overlap_codegen import adapt_parallel_overlap
 from prepare_prefix import prepare_prefix
 
 
@@ -36,6 +38,8 @@ def build(output, headers, cann, soc, jobs=2):
     prefix = output / 'prefix'
     prefix_source = prepare_prefix(prefix)
     terminal = generate(output / 'terminal')
+    adapt_capacity(terminal)
+    adapt_parallel_overlap(terminal)
     (terminal / 'kvaf-include').symlink_to(headers, target_is_directory=True)
     products = {}
     for name, source, directory, filename in (

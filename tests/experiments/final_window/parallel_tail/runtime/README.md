@@ -35,8 +35,7 @@ implementation; do not label its B results as this four-core terminal.
 
 Kernel sums exclude graph gaps. These results measure the snapshot operator
 chain, not vLLM throughput. The script does not establish complete Index/state
-correctness on hardware merely from matching selected KV. Detailed diagnostic
-mapping/header snapshots and general capacity handling still require work.
+correctness on hardware merely from matching selected KV. Broader hardware qualification still requires work.
 
 ## Integration
 
@@ -55,17 +54,29 @@ mapping/header snapshots and general capacity handling still require work.
 
 ## Validation and current limits
 
-The retained Index-split/status-warp implementation measured **33.49 us** in
-its software-CQ model with detailed stamps off, and **34.41 us** with stamps on.
-Posting/output synchronization in the instrumented run was **11.634445 us**.
-These are simulator results, not real URMA timings; the 10/28-us targets have
-not been met. Two repeated full state audits passed, including final status.
-Native compilation passed. Host tests passed (10 tests, 19 subtests).
+The retained capacity/exchange implementation and its source hashes are recorded
+in `capacity_model/validation.json`. The ordinary 230-change fixture measured
+**37.12 us**, compared with **34.92 us** for the unchanged terminal: **+2.20 us
+(6.3%)** remains. The initial capacity candidate took 41.47 us; do not describe
+the retained version as having zero regression. Host checks passed (23 tests)
+and the real NPU-mode shared library compiled and linked under CANN 9.1.
+Hardware acceptance of this revision remains outstanding.
 
 The model assumes CQ readiness after 5 us and does not model NIC KV traffic.
-The direct LRU range is limited to 2048 slots; larger requirements report an
-error. Detailed mapping/header snapshots and broader hardware qualification
-remain outstanding. Source fixtures under `evidence/v537` are required by the
+The terminal retains the original 2048-slot LRU prefix. When more slots are
+needed, it extends that list using resident slots absent from all four final
+hot-hit sets. The allocation and protection workspace belongs to the capture
+binding; it is allocated before capture. Ordinary requests perform their
+capacity probe inside the existing pack task. Exact cross-Q counting and
+extension run only at the capacity boundary.
+
+Overlapping Index exchanges snapshot their payload before any worker writes,
+then distribute the updates across four workers. The scratch-capacity check
+remains: very large overlapping permutations that do not fit its bounded UB
+workspace fail rather than silently corrupting Index. The 4000-record test is
+an independent-exchange workload, not proof that every 4000-record overlapping
+permutation is supported. Synthetic/real operator bench integration is separate
+from this snapshot AB entry. Source fixtures under `evidence/v537` are required by the
 checked generator and are not performance results for the retained integration.
 
 ## Extract a compact result
@@ -76,3 +87,30 @@ python tests/experiments/final_window/parallel_tail/runtime/brief.py "$run"
 
 This prints configuration, per-kernel means, tail and total differences, and
 per-replay logical/KV equality. Failed runs print only the relevant log tail.
+
+
+## Reproduce the capacity regression model
+
+Generate a candidate with the same capacity and exchange adapters used by the
+native AB build (run from the repository root):
+
+```bash
+python tests/experiments/final_window/parallel_tail/runtime/capacity_model/prepare.py   /tmp/lifetch-capacity-model --changes 230 --candidate
+```
+
+Supported fixture sizes are 230, 2048 through 2100, and 4000. Omit `--candidate`
+for the unchanged terminal baseline; that baseline cannot handle overflow.
+The generated CMake project is for the CANN simulator. Run its
+`native_tail_sim 9` application with `msprof op simulator` and the matching SoC.
+Mode 9 performs two launches, restores the same input before each, and preserves
+publication generations. It does not represent two evolving decode rounds.
+The oracle checks WQEs, TopK, counts, output slots and logical IDs, all Index
+payload/metadata, validity, retirement and transport status.
+
+```bash
+python tests/experiments/final_window/parallel_tail/runtime/capacity_model/report.py run9.log
+```
+
+The report rejects partial runs or failed audits. Its timings are simulator
+wall-time estimates, not real URMA measurements. Use the snapshot AB command
+above for hardware acceptance.
