@@ -155,7 +155,7 @@ def main():
         "--main-batch-get", action="store_true", help="build unified Runtime and LIDU for native BatchGet"
     )
     main_mode.add_argument(
-        "--main-ubmem-fused", action="store_true", help="build unified Runtime with the UBmem LIFetch lease"
+        "--main-fused", action="store_true", help="build unified Runtime with the selected LIFetch lease"
     )
     parser.add_argument("--prepare-main-device", action="store_true", help="prepare unified Runtime fusion patch sources")
     parser.add_argument("--prepare-only", action="store_true", help="prepare pinned source, without CANN builds")
@@ -176,17 +176,15 @@ def main():
     if not args.prepare_only:
         runtime_preflight()
     dependency = (args.kvaf_root or ROOT / "third_party/KVAF").resolve()
-    main_runtime = args.main_batch_get or args.main_ubmem_fused
+    main_runtime = args.main_batch_get or args.main_fused
     revision = MAIN_REVISION if main_runtime else REVISION
-    if args.main_ubmem_fused and args.transport != "ubmem":
-        parser.error("--main-ubmem-fused requires --transport ubmem")
     if main_runtime:
         if args.kvaf_root is None:
             parser.error("unified Runtime builds require an explicit --kvaf-root")
         head = subprocess.check_output(["git", "-C", str(dependency), "rev-parse", "HEAD"], text=True).strip()
         if head != revision:
             raise RuntimeError(f"Expected KVAF {revision}, found {head}; existing checkout left unchanged")
-        if args.main_ubmem_fused:
+        if args.main_fused:
             prepare_main_device_sources(dependency, args.transport)
     else:
         prepare_dependency(dependency, args.transport)
@@ -228,12 +226,13 @@ def main():
         package = build_dir / "python/kvaf"
         if not (package / "__init__.py").is_file() or not list(package.glob("*.so")):
             raise RuntimeError(f"Unified KVAF Python extension missing: {package}")
-        if args.main_ubmem_fused:
+        if args.main_fused:
+            binding = "get_graph_mapped_base" if args.transport == "ubmem" else "get_graph_urma_resources"
             call(
                 [sys.executable, "-I", "-c",
                  "import sys; sys.path.insert(0, sys.argv[1]); import kvaf; "
-                 "getattr(kvaf.NpuRuntime, 'get_graph_mapped_base')",
-                 build_dir / "python"],
+                 "getattr(kvaf.NpuRuntime, sys.argv[2])",
+                 build_dir / "python", binding],
                 env=env,
             )
         verifier = dependency / "bindings/verify_python_binding.py"
