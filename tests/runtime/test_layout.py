@@ -222,11 +222,11 @@ def test_parallel_terminal_same_graph_accounting():
     result = split_graph_invocations(accounting, 2)
     assert len(result["samples"]) == 2
     t = [0] * 32
-    for index, slot in enumerate((0, 1, 2, 3, 11, 7, 4, 5, 8, 16, 17, 10), 1):
+    for index, slot in enumerate((0, 1, 2, 3, 11, 7, 4, 5, 8, 26, 16, 24, 17, 10), 1):
         t[slot] = index * 1000
     timeline = decode_terminal_timeline([[t, t, t, t]], 1000)
     assert len(timeline["cores"]) == 4
-    assert timeline["observed_span_us"] == 11
+    assert timeline["observed_span_us"] == 13
     for core in timeline["cores"]:
         assert sum(s["duration_us"] for s in core["stages"]) == core["duration_us"]
 
@@ -273,3 +273,75 @@ def test_terminal_counts_do_not_invent_retired_admission_identities():
     slots = np.array([[1, 2, 2048, 2049, 2050]])
     coverage = transfer_coverage(posts, [], np.arange(2048)[None], 8192, 4096, allocated_slots=slots, prior_counts=[2])
     assert coverage[0]["final"] == 3 and coverage[0]["fallback_slots"] == 3
+
+
+def test_terminal_admission_snapshot_restores_unused_without_stale_entries():
+    from types import SimpleNamespace
+    import numpy as np
+    import torch
+    from diagnostics import algorithm_after
+
+    rows = torch.zeros((1, 256), dtype=torch.int32)
+    rows[0, 9] = 2
+    rows[0, 16:18] = 1
+    rotating = SimpleNamespace(
+        runtime_shape=SimpleNamespace(batch=1, history=4096, resident=2048, tokenBytes=656),
+        mapping=torch.full((1, 4096), -1, dtype=torch.int32),
+        rows=rows,
+        final_posts=torch.zeros((1, 4, 32), dtype=torch.int32),
+        rounds=4,
+        arguments=[None] * 9 + [torch.arange(2048, dtype=torch.int32).repeat(1, 4, 1)],
+        parallel_terminal=True,
+    )
+    before = dict(
+        hot_valid=np.ones((1, 2048), dtype=np.int32),
+        reserved_hot=np.full((1, 2048), -1),
+        lru_slots=np.arange(2048)[None],
+    )
+    admissions = np.array([[1, 3000]], dtype=np.int32)
+    result = algorithm_after(rotating, before, admissions=admissions)
+    assert result["totals"]["unused_prefetch"] == 1
+    assert [w["unused"] for w in result["requests"][0]["windows"]][:2] == [0, 1]
+    rows[0, 9] = 1
+    rows[0, 17] = 0
+    assert algorithm_after(rotating, before, admissions=admissions)["totals"]["unused_prefetch"] == 0
+    rows[0, 9] = 2
+    assert "error" in algorithm_after(rotating, before, admissions=np.array([[1, 1]]))
+
+
+def test_terminal_transfer_scopes_use_separate_final_and_prefetch_completion():
+    import pytest
+    import numpy as np
+    from diagnostics import terminal_diagnostics
+
+    t = [0] * 32
+    for index, slot in enumerate((0, 1, 2, 3, 11, 7, 15, 4, 5, 8, 26, 16, 24, 17, 10), 10):
+        t[slot] = index * 1000
+    stamps = [[t.copy() for _ in range(4)]]
+    stamps[0][0][20] = 2
+    stamps[0][0][22] = 2
+    rows = np.zeros((1, 256), dtype=np.int32)
+    rows[0, 8:10] = [4, 2]
+    posts = np.zeros((1, 4, 32), dtype=np.int32)
+    posts[0, 0, 0] = 2
+    event = np.zeros((1, 16), dtype=np.uint64)
+    event[0, 0:2] = [1000, 2000]
+    event[0, 10:12] = [2, 1500]
+    dest = np.array([[10, 11, 12, 13]])
+    result = terminal_diagnostics(stamps, rows, posts, event.view(np.uint8), dest, 1, 656, 1000)[0]
+    assert result["final_get_bandwidth"]["bytes"] == 1312
+    assert result["final_get_bandwidth"]["span_us"] == (t[24] - t[15]) / 1000
+    assert result["prefetch_bandwidth"]["last_cycles"] == t[17]
+    assert result["prefetch_services"][0]["posted_count"] == 2
+    assert result["final_counts"][0]["conflict"] == 0
+    dest[0, 2] = 10
+    with pytest.raises(ValueError, match="overlap"):
+        terminal_diagnostics(stamps, rows, posts, event.view(np.uint8), dest, 1, 656, 1000)
+
+    rows.fill(0)
+    posts.fill(0)
+    stamps[0][0][20] = 0
+    event.fill(0)
+    empty = terminal_diagnostics(stamps, rows, posts, event.view(np.uint8), dest, 1, 656, 1000)[0]
+    for scope in ("prefetch_bandwidth", "final_get_bandwidth", "combined_observed_bandwidth"):
+        assert empty[scope]["bytes"] == 0 and empty[scope]["GBps"] is None

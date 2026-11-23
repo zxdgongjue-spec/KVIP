@@ -3783,8 +3783,14 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                 state.forward.counter_clock_mhz = clock_mhz
                 state.forward.set_diagnostics(True)
             for inputs in sequence:
+                detail_before = []
                 for state in states:
                     state.prepare(inputs)
+                    initial = None
+                    if getattr(state.forward, 'terminal', None) is not None:
+                        initial = algorithm_before(state.rotating)
+                        initial['logical_ids'] = state.input_layout.copy()
+                    detail_before.append(initial)
                     state.forward.times.zero_()
                     if hasattr(state.rotating, 'rank_progress'):
                         state.rotating.rank_progress.zero_()
@@ -3797,6 +3803,9 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                 for i, state in enumerate(states):
                     sample = dict(round=i, source_round=inputs.source_round,
                                   streaming_cycles=state.forward.diagnostic_cycles())
+                    if getattr(state.forward, 'terminal', None) is not None:
+                        sample['algorithm'] = algorithm_after(state.rotating, detail_before[i],
+                            admissions=state.forward.events_src.cpu().numpy())
                     if hasattr(state.rotating, 'rank_progress'):
                         records = state.rotating.rank_progress.cpu().tolist()
                         bounds = state.rotating.query_ends.cpu().tolist()
@@ -4268,13 +4277,11 @@ class StreamingForward(LIFetchForward):
 
     def diagnostic_cycles(self):
         if getattr(self, "terminal", None) is not None:
-            from diagnostics import decode_terminal_timeline
-            posts = self.rotating.final_posts.cpu().tolist()
-            result = [dict(batch=b, final_counts=[dict(total=int(p[0]), safe=None, conflict=None)
-                      for p in posts[b]]) for b in range(self.batch)]
-            result[0]['terminal_timeline'] = decode_terminal_timeline(
-                self.terminal.times.cpu().tolist(), self.counter_clock_mhz)
-            return result
+            from diagnostics import terminal_diagnostics
+            return terminal_diagnostics(self.terminal.times.cpu().tolist(),
+                self.rotating.rows.cpu().numpy(), self.rotating.final_posts.cpu().numpy(),
+                self.rotating.events.cpu().numpy(), self.events_dst.cpu().numpy(),
+                self.rotating.service_lanes, self.rotating.runtime_shape.tokenBytes, self.counter_clock_mhz)
         raw = self.times.cpu().numpy().astype(np.uint64)
         rows = raw[:self.batch * 64].reshape(self.batch, 64)
         li = raw[self.batch * 64:self.batch * 128].reshape(self.batch, 4, 16)

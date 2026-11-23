@@ -125,12 +125,22 @@ def summarize(directory, config):
             if detail_sample:
                 item['detail_source'] = str(detail_path)
                 item['detail_repeat'] = detail_sample['round']
+                if 'algorithm' in detail_sample:
+                    item['algorithm'] = detail_sample['algorithm']
+                    item['algorithm_source'] = str(detail_path)
+                    totals = item['algorithm'].get('totals', {})
+                    item.update(prefetch=totals.get('prefetch'), final=totals.get('final'))
+                    if 'error' in item['algorithm']:
+                        result['missing'].append(f'{detail_path}: {item["algorithm"]["error"]}')
                 if 'rank_progress' in detail_sample:
                     item['rank_progress'] = detail_sample['rank_progress']
             if details:
                 scope = details[0].get('prefetch_scope')
                 raw = details[0].get('core_timeline_raw')
-                mhz = raw.get('clock_mhz') if raw else None
+                mhz = raw.get('clock_mhz') if raw else details[0].get('terminal_timeline', {}).get('clock_mhz')
+                for metric in ('prefetch_bandwidth', 'final_get_bandwidth', 'combined_observed_bandwidth'):
+                    if metric in details[0]:
+                        item[metric] = details[0][metric]
                 if scope and mhz and scope.get('interval_cycles', 0) > 0:
                     span = scope['interval_cycles'] / mhz
                     item['prefetch_bandwidth'] = dict(bytes=scope['bytes'], span_us=span,
@@ -225,7 +235,7 @@ def summarize(directory, config):
     parallel_terminal = any('topk_resolve_update' in sample.get('accounting', {}).get('stages_us', {})
                             for capture in result['captures'] for sample in capture['samples'])
     if parallel_terminal:
-        result['unavailable'].append('Parallel terminal: old Fetch-only descriptors and bandwidth scopes are not produced; use terminal per-core phases')
+        result['unavailable'].append('Parallel terminal: legacy standalone Fetch-only comparison is not applicable; transfer scopes use submission-to-CQ observation')
     if 'fetch' in config.stages:
         for capture in result['captures']:
             if capture.get('path') == 'serial':
@@ -241,7 +251,7 @@ def summarize(directory, config):
                             or (metric == 'final_get_bandwidth' and sample.get('final') == 0)
                             or (metric == 'combined_observed_bandwidth' and sample.get('prefetch') == 0 and sample.get('final') == 0)):
                         sample[metric] = dict(bytes=0, span_us=None, GBps=None, note='No transfers; bandwidth N/A')
-                    if metric not in sample and 'topk_resolve_update' not in sample.get('accounting', {}).get('stages_us', {}):
+                    if metric not in sample and (config.level >= 2 or 'topk_resolve_update' not in sample.get('accounting', {}).get('stages_us', {})):
                         result['missing'].append(
                             f"{capture['source']} repeat={sample['repeat']}: {metric} unavailable")
     if config.level == 3 and 'fetch' in config.stages and not parallel_terminal:
@@ -494,15 +504,24 @@ def prefetch_tag_audit(ids, before, resident):
     return result
 
 
-def algorithm_after(rotating, before):
+def algorithm_after(rotating, before, *, admissions=None):
     shape = rotating.runtime_shape
     try:
+        mapping = rotating.mapping.cpu().numpy()
+        if admissions is not None:
+            mapping = np.full_like(mapping, -1)
+            counts = rotating.rows[:, 9].cpu().tolist()
+            for b, count in enumerate(counts):
+                ids = np.asarray(admissions[b, :count], dtype=np.int64)
+                if not 0 <= count <= 2048 or np.any(ids < 0) or np.any(ids >= shape.history) or len(np.unique(ids)) != count:
+                    raise ValueError('Invalid terminal prefetch identity snapshot')
+                mapping[b, ids] = shape.resident + np.arange(count)
         result = algorithm_counts(
-            rotating.mapping.cpu().numpy(),
+            mapping,
             rotating.arguments[9].cpu().numpy().view(np.int32).reshape(shape.batch, 4, 2048),
             rotating.rows.cpu().numpy().view(np.uint32), rotating.final_posts.cpu().numpy(),
             shape.resident, rotating.rounds, token_bytes=shape.tokenBytes,
-            admission_records=not hasattr(rotating, "parallel_terminal"), **before)
+            admission_records=admissions is not None or not hasattr(rotating, "parallel_terminal"), **before)
         if hasattr(rotating, 'window_topk_storage'):
             prefix_bytes = 4 * 2048 * 6 + 1024
             # The public prefix is immutable after SaveResident; the private
@@ -697,6 +716,10 @@ def level_two_tables(result):
         if result.get('level', 2) == 2:
             lines.append(label)
         algorithm_lines.append(label)
+        detail_sources = sorted({s['algorithm_source'] for s in capture['samples'] if 'algorithm_source' in s})
+        if detail_sources:
+            algorithm_lines.append('Algorithm counts: same instrumented replay as transfer/core details; source=' + ', '.join(detail_sources))
+            lines.append('Terminal bandwidth spans submission to software-observed CQ completion, including overlapped Index/output work; it is not isolated Get latency.')
         for sample in capture['samples']:
             repeat = sample['repeat']
             if result.get('level', 2) >= 3:
@@ -750,13 +773,13 @@ def level_two_tables(result):
                         continue
                     spans = [stage for stage in core['stages'] if stage['name'].endswith('.KVAF_Get')
                              and stage['duration_us'] > 0]
-                    duration = (max(stage['end_us'] for stage in spans) - min(stage['start_us'] for stage in spans)
+                    duration = group.get('span_us') or (max(stage['end_us'] for stage in spans) - min(stage['start_us'] for stage in spans)
                                 if spans and group['entries'] else None)
                     rates.append([group['block'], group['query'], group['lane'], group['entries'], group['bytes'],
                                   duration, group['bytes'] / duration / 1000 if duration else None])
                 if rates:
-                    emit(lines, 'Per-Fetch-block effective bandwidth (Get call span, not link peak)',
-                        ['Block', 'Q', 'Lane', 'Reads', 'Bytes', 'Get span us', 'GB/s'], rates, 3)
+                    emit(lines, 'Per-block effective bandwidth (Get span or terminal submission-to-CQ scope, not link peak)',
+                        ['Block', 'Q', 'Lane', 'Reads', 'Bytes', 'Span us', 'GB/s'], rates, 3)
                 if result.get('level', 2) >= 3:
                     lines.append(diagnostic_table('Core work / wait intervals', ['Block', 'Phase', 'Start us', 'End us', 'Duration us', 'Cycles'], phases))
                     if result['transport'] == 'urma':
@@ -772,7 +795,7 @@ def level_two_tables(result):
             requests = sample.get('requests', [])
             if requests:
                 raw = requests[0].get('core_timeline_raw', {})
-                mhz = raw.get('clock_mhz')
+                mhz = raw.get('clock_mhz') or requests[0].get('terminal_timeline', {}).get('clock_mhz')
                 services = requests[0].get('prefetch_services', [])
                 service_rows, service_times = [], []
                 for event in services:
@@ -994,6 +1017,7 @@ def collect_details(torch, rotating, graph, reset, verify, rounds, folder, pipel
         for step in range(rounds):
             reset()
             pipeline.times.zero_()
+            initial = algorithm_before(rotating) if getattr(pipeline, 'terminal', None) is not None else None
             if hasattr(rotating, 'rank_progress'):
                 rotating.rank_progress.zero_()
             stream.synchronize()
@@ -1004,6 +1028,8 @@ def collect_details(torch, rotating, graph, reset, verify, rounds, folder, pipel
             stream.synchronize()
             verify()
             sample = dict(round=step, streaming_cycles=pipeline.diagnostic_cycles())
+            if initial is not None:
+                sample['algorithm'] = algorithm_after(rotating, initial, admissions=pipeline.events_src.cpu().numpy())
             if hasattr(rotating, 'rank_progress'):
                 records = rotating.rank_progress.cpu().tolist()
                 bounds = rotating.query_ends.cpu().tolist()
@@ -1307,12 +1333,19 @@ def collect_replay(torch, state, graph, sequence, validate, config, folder):
                 for inputs in sequence:
                     state.prepare(inputs)
                     pipeline.times.zero_()
+                    initial = None
+                    if getattr(pipeline, 'terminal', None) is not None:
+                        initial = algorithm_before(rotating)
+                        initial['logical_ids'] = state.storage.logical_ids[1:].cpu().numpy().copy()
                     stream.synchronize()
                     graph.replay()
                     stream.synchronize()
                     checks.check(f'detail={repeat} source={inputs.source_round}', lambda: validate(inputs))
-                    detail_samples.append(dict(round=repeat, source_round=inputs.source_round,
-                                               streaming_cycles=pipeline.diagnostic_cycles()))
+                    detail = dict(round=repeat, source_round=inputs.source_round,
+                                  streaming_cycles=pipeline.diagnostic_cycles())
+                    if getattr(pipeline, 'terminal', None) is not None:
+                        detail['algorithm'] = algorithm_after(rotating, initial, admissions=pipeline.events_src.cpu().numpy())
+                    detail_samples.append(detail)
         finally:
             pipeline.set_diagnostics(False)
             stream.synchronize()
@@ -2148,7 +2181,8 @@ def decode_terminal_timeline(rows, clock_mhz):
     phases = (('initialize', 0, 1), ('TopK', 1, 2), ('publish.TopK', 2, 3),
               ('deduplicate_and_slots', 3, 11), ('output', 11, 7),
               ('WQE_and_publish', 7, 4), ('release_scratch', 4, 5),
-              ('index_update_and_join', 8, 16), ('CQ_join', 16, 17), ('retire', 17, 10))
+              ('diagnostic_snapshot', 8, 26), ('index_update_and_join', 26, 16),
+              ('final_CQ_join', 16, 24), ('prefetch_CQ_join', 24, 17), ('retire', 17, 10))
     cores = []
     for b, q, t in active:
         stages = []
@@ -2171,3 +2205,73 @@ def decode_terminal_timeline(rows, clock_mhz):
     last = max(cores, key=lambda core: core['end_us'])
     return dict(clock_mhz=clock_mhz, cores=cores, last_block=last['block'],
                 observed_span_us=last['end_us'])
+
+
+def terminal_diagnostics(stamps, rows, posts, events, destinations, service_lanes, token_bytes, clock_mhz):
+    """All counts and scopes here belong to this instrumented replay only."""
+    timeline = decode_terminal_timeline(stamps, clock_mhz)
+    result, groups = [], []
+    for b, queries in enumerate(stamps):
+        prior = int(rows[b, 9])
+        total = int(rows[b, 8])
+        prefix_slots = set(map(int, destinations[b, :prior]))
+        counts = []
+        for q, t in enumerate(queries):
+            count, start = int(posts[b, q, 0]), int(t[22])
+            if count != t[20] or (count and (start < prior or start + count > total)):
+                raise ValueError(f'Terminal assignment count mismatch: request={b} Q={q+1}')
+            slots = destinations[b, start:start+count]
+            conflict = sum(int(slot) in prefix_slots for slot in slots)
+            if conflict:
+                raise ValueError('Terminal final allocations overlap prior prefetch destinations')
+            counts.append(dict(total=count, safe=count, conflict=conflict))
+            if count:
+                if not 0 < t[15] <= t[4] <= t[24]:
+                    raise ValueError('Missing terminal submission/CQ timestamps')
+                groups.append(dict(block=b*4+q, query=q+1, lane=b, entries=count,
+                    bytes=count*token_bytes, first_cycles=t[15], last_cycles=t[24],
+                    span_us=(t[24]-t[15])/clock_mhz))
+        result.append(dict(batch=b, final_counts=counts))
+    head = result[0]
+    head['terminal_timeline'] = timeline
+    events = np.asarray(events).reshape(-1, 128).copy().view('<u8')
+    services = []
+    for index, event in enumerate(events):
+        if not event[0] or event[1] < event[0]:
+            continue
+        words = event.view('<u4')
+        services.append(dict(event=index, core=int(words[4]), epoch=int(words[5]), lane=index % service_lanes,
+            begin_cycles=int(event[0]), end_cycles=int(event[1]),
+            predecessor_wait_cycles=int(event[13])-int(event[4]) if event[4] and event[13] >= event[4] else None,
+            incremental_cycles=int(event[14])-int(event[13]) if event[13] and event[14] >= event[13] else None,
+            scan_cycles=int(event[5]), candidate_cycles=int(event[6]), post_cycles=int(event[7]),
+            bitmap_bytes=int(event[8]), candidate_count=int(event[9]), posted_count=int(event[10])))
+    head['prefetch_services'] = services
+
+    def scope(entries, begin, end, note):
+        if entries and not 0 < begin < end:
+            raise ValueError(f'Invalid transfer scope: {note}')
+        span = (end-begin)/clock_mhz if entries else None
+        return dict(entries=entries, bytes=entries*token_bytes, span_us=span,
+                    GBps=entries*token_bytes/span/1000 if span else None,
+                    first_cycles=begin, last_cycles=end, note=note)
+
+    final_count = sum(g['entries'] for g in groups)
+    head['final_get_bandwidth'] = scope(final_count,
+        min((g['first_cycles'] for g in groups), default=0),
+        max((g['last_cycles'] for g in groups), default=0),
+        'Terminal submission to CQ observation; includes overlapped Index/output work, not isolated Get latency')
+    head['final_get_bandwidth']['groups'] = groups
+    prior_count = int(rows[:, 9].astype(np.uint64).sum())
+    starts = [int(e[11]) for e in events if e[11]]
+    fallback = not starts
+    if fallback:
+        starts = [int(e[0]) for e in events if e[0]]
+    head['prefetch_bandwidth'] = scope(prior_count, min(starts, default=0),
+        max((stamps[b][1][17] for b in range(len(stamps)) if rows[b, 9]), default=0),
+        'Prefetch service entry to CQ join return' if fallback else 'Prefetch first doorbell to CQ join return')
+    nonempty = [head[k] for k in ('prefetch_bandwidth', 'final_get_bandwidth') if head[k]['entries']]
+    head['combined_observed_bandwidth'] = scope(prior_count+final_count,
+        min((s['first_cycles'] for s in nonempty), default=0), max((s['last_cycles'] for s in nonempty), default=0),
+        'Union envelope of prefetch and terminal submissions through software-observed completion')
+    return result

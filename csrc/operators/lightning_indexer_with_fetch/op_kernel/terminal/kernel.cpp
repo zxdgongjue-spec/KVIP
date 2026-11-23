@@ -22,6 +22,16 @@ __aicore__ inline void Signal(__gm__ uint32_t* flags,uint32_t n,uint32_t generat
 __aicore__ inline void Await(__gm__ uint32_t* flags,uint32_t n,uint32_t generation){auto p=reinterpret_cast<__gm__ volatile uint32_t*>(flags+n*32);do{kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+n*32),128);}while(*p<generation);}
 // Simulation-only CQ latency. SYS_CNT-to-trace calibration is verified in report.
 constexpr uint64_t kSimCqDelayTicks=9000;
+// Diagnostic pass only: preserve the assignment partition before its owner retires it.
+__simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void CaptureTerminalAssignments(
+ __gm__ uint32_t* sources,__gm__ uint32_t* destinations,__gm__ uint32_t* savedSources,
+ __gm__ uint32_t* savedDestinations,uint32_t first,uint32_t count){
+ for(uint32_t i=threadIdx.x;i<count;i+=512){
+  asc_stcg(savedSources+first+i,asc_ldcg(sources+i));
+  asc_stcg(savedDestinations+first+i,asc_ldcg(destinations+i));
+ }
+ asc_threadfence();
+}
 __simt_callee__ inline void RetireShared(
  __gm__ rotating::Context* ctx,uint32_t begin,uint32_t count,uint32_t history,uint32_t b){
  auto changes=(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+uint64_t(b)*rotating::kChangeCapacity);
@@ -156,7 +166,7 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  if(profile)ts[11]=GetSystemCycle();
  uint32_t own=postScratch.GetValue(bitmapWords);
  uint32_t slotBase=postScratch.GetValue(bitmapWords+1),all=own,offset=0;
- if(profile){ts[20]=own;ts[21]=all;ts[22]=offset;}
+ if(profile){ts[20]=own;ts[21]=all;ts[22]=slotBase;}
  if(profile)ts[12]=GetSystemCycle();
  auto ids=op.TerminalIds();
  GlobalTensor<uint32_t> output,slots;
@@ -192,6 +202,13 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  // Include the actual prior-prefetch Index work, after all output readers join.
  uint32_t first=total*q/4,last=total*(q+1)/4,n=total<=rotating::kChangeCapacity?last-first:0;
  auto src=(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+uint64_t(b)*rotating::kChangeCapacity)+first;auto dst=(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+uint64_t(b)*rotating::kChangeCapacity)+first;
+ if(profile){
+  Simt::VF_CALL<CaptureTerminalAssignments>(Simt::Dim3{512,1,1},src,dst,
+   reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+uint64_t(b)*rotating::kChangeCapacity,
+   reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+uint64_t(b)*rotating::kChangeCapacity,first,n);
+  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+ }
+ if(profile)ts[26]=GetSystemCycle();
  uint32_t indexError=0;
  Simt::VF_CALL<UpdateIndex>(Simt::Dim3{512,1,1},src,dst,n,s.resident,s.history,(reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*s.history*16),(reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*s.history),(reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(owner)*addressStride),(reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*s.history),work,ctx,total,q,first,reinterpret_cast<__gm__ uint32_t*>(rotating::TopKHeader(ctx))+query*32,reinterpret_cast<__gm__ uint32_t*>(ctx->progress)+query*32,priorJournalCount,b,flags+(12+q)*32,false);
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
@@ -227,6 +244,7 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  ownError|=(indexError<<4);
  if(profile)ts[16]=GetSystemCycle();
  uint64_t cqError=rotating::CompleteTerminalPost(args,post);
+ if(profile)ts[24]=GetSystemCycle();
  if(q==1)rotating::CompleteTerminalPrefetch(ctx,b);
  ownError|=uint32_t(cqError);
  if(profile)ts[17]=GetSystemCycle();
