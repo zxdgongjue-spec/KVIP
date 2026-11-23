@@ -30,7 +30,6 @@
 #include "topk.h"
 #if !V9_UBMEM
 #include "recent_seed.h"
-#include "logical_cutoff.h"
 #include "incremental_vector_helpers.h"
 #include "window_fast_vector.h"
 #endif
@@ -1058,11 +1057,6 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
 #else
         if (validS2Len >= topkCount_) {
 #endif
-            bool returnScores = prefixActive_;
-#if !V9_UBMEM && KVIP_STREAMING_LI
-            const bool logicalFinal = !prefixActive_ && validS2Len > topkCount_ && LogicalCutoffEnabled();
-            returnScores = returnScores || logicalFinal;
-#endif
             uint32_t s2LoopNum = (validS2Len + trunkLen_ - 1) / trunkLen_;
             if (s2LoopNum == 1) {
                 uint32_t validS2LenAlign = QLICommon::Align(validS2Len, (int32_t)256);
@@ -1110,7 +1104,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
 #if KVIP_STREAMING_LI
                 BeginFinalMetadata(streamingQuery);
 #endif
-                topkOp_(mrgValueLocal_, indicesOutLocal_, scoreOutLocal_, validS2LenAlign, 0, 1, returnScores);
+                topkOp_(mrgValueLocal_, indicesOutLocal_, scoreOutLocal_, validS2LenAlign, 0, 1, prefixActive_);
 #if !V9_UBMEM && KVIP_STREAMING_LI
                 if (recentMerged) {
                     SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);
@@ -1167,16 +1161,6 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
                     SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT1);
                 }
             }
-#if !V9_UBMEM && KVIP_STREAMING_LI
-            if (logicalFinal) {
-                // Resident-only rows return public physical indices directly. Preserve the existing
-                // later classifier and its dedicated prefetched metadata banks.
-                PipeBarrier<PIPE_ALL>();
-                auto row = vecOffset * QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_);
-                RepairLogicalCutoff(streamingQuery,validS2Len,reinterpret_cast<__gm__ uint16_t*>(
-                    const_cast<__gm__ SCORE_T*>(scoreGm.GetPhyAddr()))+row,false);
-            }
-#endif
         } else {
             AscendC::CreateVecIndex(indicesOutLocal_.ReinterpretCast<int32_t>(), (int32_t)zero, validS2Len);
         }
