@@ -100,20 +100,14 @@ def main_times(folder, timing):
                 final_topk_through_tail=(mean(after), median(after)))
 
 
-def measured_parallel(root, group, arm, revision, owner, native, old_receipt, archived_inputs, *, verify_library):
-    from li_restore_archive import check_snapshot
-    from ranked_integration_sets import INPUT_AND_RESULTS
-    from score_equivalence_report import measured_sets
-
+def measured_artifacts(root, group, arm, revision, *, verify_library, physical_npu=4):
     folder = case_folder(root, group, arm)
     out = read(folder / 'path_result.json')
     config = read(folder.parent / 'config.json')
     inputs = read(folder.parent / 'replay_input.json')
-    if inputs != archived_inputs:
-        check_snapshot(group, INPUT_AND_RESULTS[group][0], archived_inputs, inputs)
     if out['input_paths'] != inputs['source_paths'] or inputs['geometry'] != out['geometry']:
         raise ValueError(f'G{group}: output capture metadata mismatch')
-    expected = dict(group=group, transport='urma', input='real', device=0, physical_npu=4, warmup=4,
+    expected = dict(group=group, transport='urma', input='real', device=0, physical_npu=physical_npu, warmup=4,
                     iterations=20, intermediate_fetches=4, prefetch_tokens=1024, prefetch_rank_start=1024,
                     fused_only=True, production_revision=revision)
     differences = [name for name, value in expected.items() if config.get(name) != value]
@@ -138,6 +132,23 @@ def measured_parallel(root, group, arm, revision, owner, native, old_receipt, ar
                 digest.update(block)
         if digest.hexdigest() != sha:
             raise ValueError(f'G{group}: loaded binary differs from the recorded build')
+    new_times = main_times(folder, out['all_rounds'])
+    thp = read(root / f'g{group}/{arm}/thp.json')
+    if (thp.get('status') != 'measured' or thp.get('page_mode') != 'thp'
+            or thp['bytes'] <= 0):
+        raise ValueError(f'G{group}: THP or registered DDR range differs from the candidate archive')
+    return folder, inputs, out, new_times, thp, proof, config
+
+
+def measured_parallel(root, group, arm, revision, owner, native, old_receipt, archived_inputs, *, verify_library):
+    from li_restore_archive import check_snapshot
+    from ranked_integration_sets import INPUT_AND_RESULTS
+    from score_equivalence_report import measured_sets
+
+    folder, inputs, out, new_times, thp, proof, config = measured_artifacts(
+        root, group, arm, revision, verify_library=verify_library)
+    if inputs != archived_inputs:
+        check_snapshot(group, INPUT_AND_RESULTS[group][0], archived_inputs, inputs)
     receipt = read(folder / 'score_topk_check.json')
     source = receipt['native_reference']
     if (source['origin'] != 'completed-owner-archive' or Path(source['archive_path']).resolve() != owner.resolve()
@@ -146,11 +157,6 @@ def measured_parallel(root, group, arm, revision, owner, native, old_receipt, ar
     if proof['capture_operand_hashes'] != source['identity']['inputs']:
         raise ValueError(f'G{group}: measured input differs from the archived native operands')
     exact = measured_sets(folder, group, (inputs, out['topk_set_digests']), native, receipt)
-    new_times = main_times(folder, out['all_rounds'])
-    thp = read(root / f'g{group}/{arm}/thp.json')
-    if (thp.get('status') != 'measured' or thp.get('page_mode') != 'thp'
-            or thp['bytes'] <= 0):
-        raise ValueError(f'G{group}: THP or registered DDR range differs from the candidate archive')
     return new_times, exact, thp, proof, config
 
 

@@ -81,6 +81,25 @@ def penultimate_worker_counts(calls):
     return histogram
 
 
+def report_workers(candidate_folder, group):
+    workers = critical_window_workers(candidate_folder)
+    if workers:
+        from statistics import median
+        columns = ('arrival_after_snapshot','handoff','query_compute')
+        print(f'G{group} last_finishing_row_and_Q diagnostic', *(
+            f'{name}_mean/P50_us={mean(values):.2f}/{median(values):.2f}'
+            for name, values in zip(columns, workers['timings'])))
+        print(f'G{group} last_finishing_counts diagnostic',
+              'row0_to_15=' + '/'.join(map(str, workers['last_rows'])),
+              'Q1_to_Q4=' + '/'.join(map(str, workers['last_queries'])),
+              f'tied_rows={workers["tied_rows"]}/20 tied_Qs={workers["tied_queries"]}/20 tie_pick=lowest_id')
+    early = candidate_folder/'penultimate_workers.json'
+    if early.is_file():
+        none, one, two = penultimate_worker_counts(read(early)['calls'])
+        print(f'G{group} penultimate_window diagnostic rows_with_0/1/2_helpers={none}/{one}/{two} '
+              f'assigned_and_completed_queries={one+2*two}/640')
+
+
 def compare(root, group, owner, ref):
     if (Path((root/'reference.txt').read_text().strip()).resolve() != ref.resolve()
             or any((x/'main.txt').read_text().strip() != MAIN or (x/'kvaf.txt').read_text().strip() != KVAF
@@ -127,22 +146,7 @@ def compare(root, group, owner, ref):
     graph_gain = [100 * (a-b) / a for a, b in zip(old['graph'], new['graph'])]
     print(f'G{group} vs_mainline_archive', *(f'{k}_saved_mean/P50_us={saved(old[k], v)}' for k, v in new.items()),
           f'graph_gain_mean/P50_pct={graph_gain[0]:+.2f}/{graph_gain[1]:+.2f} placement={placement}')
-    workers = critical_window_workers(candidate_folder)
-    if workers:
-        from statistics import median
-        columns = ('arrival_after_snapshot','handoff','query_compute')
-        print(f'G{group} last_finishing_row_and_Q diagnostic', *(
-            f'{name}_mean/P50_us={mean(values):.2f}/{median(values):.2f}'
-            for name, values in zip(columns, workers['timings'])))
-        print(f'G{group} last_finishing_counts diagnostic',
-              'row0_to_15=' + '/'.join(map(str, workers['last_rows'])),
-              'Q1_to_Q4=' + '/'.join(map(str, workers['last_queries'])),
-              f'tied_rows={workers["tied_rows"]}/20 tied_Qs={workers["tied_queries"]}/20 tie_pick=lowest_id')
-    early = candidate_folder/'penultimate_workers.json'
-    if early.is_file():
-        none, one, two = penultimate_worker_counts(read(early)['calls'])
-        print(f'G{group} penultimate_window diagnostic rows_with_0/1/2_helpers={none}/{one}/{two} '
-              f'assigned_and_completed_queries={one+2*two}/640')
+    report_workers(candidate_folder, group)
     from li_restore_report import serial_graph_line
     from strong_serial_g10 import comparison_line
     print(comparison_line(owner.parent, inputs, new['graph']) if group == 10 else serial_graph_line(group, inputs, new['graph']))

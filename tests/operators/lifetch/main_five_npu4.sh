@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# B24: replay upstream main and compare with the on-host production archives.
+# B24 uses on-host reference archives. B20 measures only a candidate on local inputs.
 set -eo pipefail
 repo=${1:?supply the local KVIP repository}
 reader=${2:?supply the full replay reader revision}
 main_rev=609fa26fd715f9409bbe74e1b2d3685c58dfb0cf
 native=${3-$main_rev}
-if (( $# > 3 )) || [[ $# == 3 && ( -z "$native" || "$native" == "$main_rev" ) ]]; then
-    echo 'Expected REPO READER [NEW_CANDIDATE_SHA]; supply an independent candidate to compare with the main archive' >&2
+mode=${4-b24}
+if (( $# > 4 )) || { (( $# == 4 )) && [[ $mode != b20 ]]; } ||
+    { (( $# >= 3 )) && [[ -z $native || $native == "$main_rev" ]]; }; then
+    echo 'Usage: REPO READER [NEW_CANDIDATE_SHA [b20]]; supply an independent candidate when passing NEW_CANDIDATE_SHA' >&2
     exit 2
 fi
 label=mainline
@@ -15,7 +17,8 @@ owner_rev=888db6b1603d22f4142bd2ccffe0518611856a31
 transport=a2857b460a74704114fd30a849ae38666cc2c372
 serial=da318bdb81344672b5d9013e04d517669d3eb142
 peer_physical_npu=4
-export PEER_PHYSICAL_NPU=4 ASCEND_RT_VISIBLE_DEVICES=4 PEER_LOCAL_ONLY=1
+if [[ $mode == b20 ]]; then peer_physical_npu=0; fi
+export PEER_PHYSICAL_NPU="$peer_physical_npu" ASCEND_RT_VISIBLE_DEVICES="$peer_physical_npu" PEER_LOCAL_ONLY=1
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 export PATH="/usr/local/python3.12.13/bin:$PATH"
 unset PEER_RANKED_INPUT PEER_RANKED_HASH_FILE
@@ -33,11 +36,13 @@ if [[ $native != "$main_rev" ]]; then
     label=li-window
     arm_label=li_windows
     prefix=li-window-five
-    [[ -r "$reference/main.txt" && $(<"$reference/main.txt") == "$main_rev" &&
-       -r "$reference/physical_npu.txt" && $(<"$reference/physical_npu.txt") == 4 ]] || {
+    if [[ $mode == b20 ]]; then
+        prefix=b20-li-window-five
+    elif [[ ! -r "$reference/main.txt" || $(<"$reference/main.txt") != "$main_rev" ||
+            ! -r "$reference/physical_npu.txt" || $(<"$reference/physical_npu.txt") != 4 ]]; then
         echo "Expected measured upstream on physical NPU4 at $reference" >&2
         exit 1
-    }
+    fi
 fi
 out=$(mktemp -d "$area/$prefix.XXXXXX")
 echo "RESULT_ROOT=$out"
@@ -65,33 +70,35 @@ support="$reader_src/tests/operators/lifetch/support"
 printf '%s\n' "$main_rev" >"$out/main.txt"
 if [[ $native != "$main_rev" ]]; then
     printf '%s\n' "$native" >"$out/candidate.txt"
-    printf '%s\n' "$reference" >"$out/reference.txt"
+    if [[ $mode == b24 ]]; then printf '%s\n' "$reference" >"$out/reference.txt"; fi
 fi
 printf '%s\n' "$reader" >"$out/reader.txt"
 printf '%s\n' "$transport" >"$out/kvaf.txt"
-printf '4\n' >"$out/physical_npu.txt"
+printf '%s\n' "$peer_physical_npu" >"$out/physical_npu.txt"
 cat /proc/sys/kernel/hostname >"$out/host.txt"
 cat /proc/sys/kernel/random/boot_id >"$out/boot_id.txt"
 if [[ -r /etc/machine-id ]]; then cat /etc/machine-id >"$out/machine_id.txt"; fi
-echo "CONFIG measured=$native main=$main_rev reader=$reader NPU=4 transport=urma BS=16 Q=4 token_bytes=656 warmup=4 calls=20"
+echo "CONFIG measured=$native main=$main_rev reader=$reader NPU=$peer_physical_npu logical_device=0 host_mode=$mode transport=urma BS=16 Q=4 token_bytes=656 warmup=4 calls=20"
 groups=(10 4 17 7 2)
 archive_for() {
     if [[ $1 == 2 ]]; then printf '%s\n' "$area/fused.gbxKC9"
     else printf '%s\n' "$area/fused.N7n8ZP"; fi
 }
-for group in "${groups[@]}"; do
-    archive=$(archive_for "$group")
-    if [[ $native != "$main_rev" && ! -s "$reference/g$group/mainline/thp.json" ]]; then
-        echo "Missing upstream G$group archive at $reference" >&2
-        exit 1
-    fi
-    if [[ ! -r "$archive/logical-ties.txt" || $(<"$archive/logical-ties.txt") != "$owner_rev" ||
-          ! -r "$archive/physical_npu.txt" || $(<"$archive/physical_npu.txt") != 4 ||
-          ! -s "$archive/g$group/logical-ties/thp.json" ]]; then
-        echo "Archived B24 owner TopK result missing or incompatible: G$group $archive" >&2
-        exit 1
-    fi
-done
+if [[ $mode == b24 ]]; then
+    for group in "${groups[@]}"; do
+        archive=$(archive_for "$group")
+        if [[ $native != "$main_rev" && ! -s "$reference/g$group/mainline/thp.json" ]]; then
+            echo "Missing upstream G$group archive at $reference" >&2
+            exit 1
+        fi
+        if [[ ! -r "$archive/logical-ties.txt" || $(<"$archive/logical-ties.txt") != "$owner_rev" ||
+              ! -r "$archive/physical_npu.txt" || $(<"$archive/physical_npu.txt") != 4 ||
+              ! -s "$archive/g$group/logical-ties/thp.json" ]]; then
+            echo "Archived B24 owner TopK result missing or incompatible: G$group $archive" >&2
+            exit 1
+        fi
+    done
+fi
 if [[ -r /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
     source /usr/local/Ascend/ascend-toolkit/set_env.sh
 else
@@ -124,14 +131,19 @@ cpu="$clean/build-cpu/runtime/kvaf_cpu_service"
 run_group() (
     set -euo pipefail
     group=$1
-    archive=$(archive_for "$group")
     arm="$out/g$group/$label"
     mkdir -p "$arm"
     trace=$(bash "$reader_src/tests/operators/lifetch/peer_g2_input.sh" "$work" "$group")
-    if [[ $native == "$main_rev" ]]; then
-        node=$("$PYTHON" -B "$support/owner_pack_tail.py" numa "$archive" "$group")
-    else
-        node=$("$PYTHON" -B "$support/li_window_report.py" numa "$reference/g$group/mainline/thp.json")
+    node=
+    oracle_args=(--portable-oracle --physical-npu "$peer_physical_npu")
+    if [[ $mode == b24 ]]; then
+        archive=$(archive_for "$group")
+        oracle_args=(--owner-archive "$archive")
+        if [[ $native == "$main_rev" ]]; then
+            node=$("$PYTHON" -B "$support/owner_pack_tail.py" numa "$archive" "$group")
+        else
+            node=$("$PYTHON" -B "$support/li_window_report.py" numa "$reference/g$group/mainline/thp.json")
+        fi
     fi
     command=("$cpu")
     if [[ -n "$node" ]]; then
@@ -164,7 +176,7 @@ run_group() (
     monitor=$!
     echo "CASE_BEGIN G$group $arm_label"
     if ! (cd "$arm" && timeout 1800 "$PYTHON" -B "$support/main_five_run.py" \
-        --main "$main_src" --revision "$native" --trace "$trace" --group "$group" --owner-archive "$archive" \
+        --main "$main_src" --revision "$native" --trace "$trace" --group "$group" "${oracle_args[@]}" \
         --kvaf-root "$kvaf" --kvaf-server "127.0.0.1:$port" --output "$arm") >"$arm/worker.log" 2>&1; then
         echo "FAILED_ARM=G$group/$label WORKER_LOG=$arm/worker.log" >&2
         tail -30 "$arm/worker.log" >&2
@@ -172,7 +184,9 @@ run_group() (
     fi
     if ! wait "$monitor"; then cat "$arm/thp.log" >&2; exit 1; fi
     monitor=
-    if [[ $native == "$main_rev" ]]; then
+    if [[ $mode == b20 ]]; then
+        "$PYTHON" -B "$support/b20_window_report.py" group "$out" "$group" | tee -a "$out/summary.txt"
+    elif [[ $native == "$main_rev" ]]; then
         "$PYTHON" -B "$support/main_five_report.py" "$out" "$group" "$archive" | tee -a "$out/summary.txt"
     else
         "$PYTHON" -B "$support/li_window_report.py" group "$out" "$group" "$archive" "$reference" | tee -a "$out/summary.txt"
@@ -198,7 +212,9 @@ if (( ${#failed[@]} )); then
     echo "REPLAY_INCOMPLETE groups=${failed[*]} RESULT_ROOT=$out" >&2
     exit 1
 fi
-if [[ $native != "$main_rev" ]]; then
+if [[ $mode == b20 ]]; then
+    "$PYTHON" -B "$support/b20_window_report.py" summary "$out" | tee -a "$out/summary.txt"
+elif [[ $native != "$main_rev" ]]; then
     "$PYTHON" -B "$support/li_window_report.py" summary "$out" | tee -a "$out/summary.txt"
 fi
 echo "REPLAY_COMPLETE RESULT_ROOT=$out"
