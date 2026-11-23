@@ -130,6 +130,9 @@ __simd_vf__ inline void PrepareProgress(__ubuf__ uint32_t* table, uint32_t baseT
 #define V9_FETCH_PROFILE(...) if constexpr (captureIo) { __VA_ARGS__ }
 
 #include "kvaf_batch_get_device.h"
+#ifdef KVIP_KVAF_URMA_REGISTERED_BASE
+#include <stddef.h>
+#endif
 
 // Imported from final_submit.h
 
@@ -137,6 +140,15 @@ __simd_vf__ inline void PrepareProgress(__ubuf__ uint32_t* table, uint32_t baseT
 // Only the address gather and destination slots differ: long histories do not
 // fit in UB, and final repair may safely recycle unreferenced speculative slots.
 namespace rotating {
+#ifdef KVIP_KVAF_URMA_REGISTERED_BASE
+constexpr uint32_t kUrmaRegisteredBaseWord =
+    offsetof(KvafBatchGetDirectUrmaEntity, registered_base) / sizeof(uint64_t);
+constexpr uint32_t kUrmaCanonicalBaseWord =
+    offsetof(KvafBatchGetDirectUrmaEntity, remote_host_ddr_address) / sizeof(uint64_t);
+static_assert(kUrmaRegisteredBaseWord < 24 && kUrmaCanonicalBaseWord < 24,
+              "URMA bases must be in the staged entity words");
+#endif
+
 __simd_vf__ inline void FinalBuild(uint32_t rt_tokenBytes,__ubuf__ uint32_t* remoteLow, __ubuf__ uint32_t* remoteHigh, __ubuf__ uint32_t* slots, __ubuf__ uint32_t* words,
     __ubuf__ uint32_t* config, uint32_t begin, uint32_t count, uint32_t total) {
     using namespace MicroAPI;
@@ -283,7 +295,7 @@ __aicore__ inline bool SubmitWqesAt(uint32_t rt_tokenBytes,uint64_t entityAddres
     for(uint32_t j=0;j<4;++j)cfg.SetValue(4+j,meta.GetValue(22+j));
     cfg.SetValue(8,meta.GetValue(7));cfg.SetValue(9,0);
 #ifdef KVIP_KVAF_URMA_REGISTERED_BASE
-    const uint64_t remoteDelta=meta64.GetValue(17)-meta64.GetValue(1);
+    const uint64_t remoteDelta=meta64.GetValue(kUrmaRegisteredBaseWord)-meta64.GetValue(kUrmaCanonicalBaseWord);
     cfg.ReinterpretCast<uint64_t>().SetValue(5,remoteDelta);
 #endif
     cfg.SetValue(12,rt_tokenBytes);cfg.SetValue(13,meta.GetValue(12));
@@ -424,7 +436,7 @@ inline void BatchBuild(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_residen
                 uint32_t physical=PhysicalSlot(rt_resident,ctx,b,slot);
                 uint64_t address=asc_ldcg(addresses+token);
 #ifdef KVIP_KVAF_URMA_REGISTERED_BASE
-                address+=input64[17]-input64[1];
+                address+=input64[kUrmaRegisteredBaseWord]-input64[kUrmaCanonicalBaseWord];
 #endif
                 if constexpr(BuildSimt)remote[g*rt_postBank+i]=address;
                 else {
