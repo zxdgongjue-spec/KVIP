@@ -17,6 +17,7 @@ from strong_serial_g10 import from_this_host, serial_measurement
 
 MAIN = '609fa26fd715f9409bbe74e1b2d3685c58dfb0cf'
 PACED = '6d7f257b3d664a8b4991cfd3ebd12da4f2038d04'
+CREDIT_TRACE = '957f59ace1520d3da8ef839a4d341902f62f8f66'
 GROUPS = (10, 4, 17, 7, 2)
 B24_MAIN = {10: (297.10, 289.57), 4: (315.79, 304.59), 17: (327.49, 314.24),
             7: (580.87, 587.58), 2: (284.11, 276.89)}
@@ -120,8 +121,10 @@ def report(root, group):
     receipt = read(folder/'score_topk_check.json')
     result = read(folder/'path_result.json')
     inputs = read(folder.parent/'replay_input.json')
-    if ((root/'candidate.txt').read_text().strip() != PACED or cfg['production_revision'] != PACED
-            or proof['production_revision'] != PACED or cfg['physical_npu'] != int(physical) or cfg['device'] != 0
+    expected = (root/'candidate.txt').read_text().strip()
+    allowed = (PACED, CREDIT_TRACE) if group == 7 and physical == '5' else (PACED,)
+    if (expected not in allowed or cfg['production_revision'] != expected
+            or proof['production_revision'] != expected or cfg['physical_npu'] != int(physical) or cfg['device'] != 0
             or proof['runtime']['visible'] != physical or result['correctness'] != 'PASS' or result['failures']
             or not proof['production_terminal'] or proof['profiled_terminal_kernel'] != 'v9_parallel_terminal'
             or [proof[k] for k in ('measured_calls','measured_kv_index_rows','ordered_diagnostic_calls','ordered_diagnostic_rows')]
@@ -144,6 +147,8 @@ def report(root, group):
         raise ValueError('missing measured DDR placement')
     print(f'G{group} CHECK TopK_score_vs_strong_serial=PASS calls=20/20 queries=1280/1280 '
           f'exact_ID_sets={int(exact.sum())}/1280 KV=PASS ordered_Index=PASS rows=320/320 oracle={source["origin"]}')
+    if expected == CREDIT_TRACE:
+        return
     print(f'G{group} paced-tail graph_mean/P50_us={stats(times["graph"])} '
           f'LI_mean/P50_us={stats(times["LI1_to_LI3"])} tail_mean/P50_us={stats(times["final_topk_through_tail"])}')
     local = {}

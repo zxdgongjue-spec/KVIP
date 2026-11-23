@@ -5,7 +5,15 @@ repo=${1:?supply the local KVIP repository}
 reader=${2:?supply the full replay reader revision}
 main_rev=609fa26fd715f9409bbe74e1b2d3685c58dfb0cf
 native=${3-$main_rev}
-if (( $# > 3 )) || [[ $# == 3 && ( -z "$native" || "$native" == "$main_rev" ) ]]; then
+credit_group=
+if [[ $# == 4 ]]; then
+    case "${PEER_PHYSICAL_NPU:-4}/$4/$native" in
+        5/g7-credit/957f59ace1520d3da8ef839a4d341902f62f8f66) credit_group=7 ;;
+        5/g10-four-batch/6d7f257b3d664a8b4991cfd3ebd12da4f2038d04) credit_group=10 ;;
+        *) echo 'Unknown device, revision or data collection case' >&2; exit 2 ;;
+    esac
+fi
+if (( $# > 4 )) || [[ $# == 3 && ( -z "$native" || "$native" == "$main_rev" ) ]]; then
     echo 'Expected REPO READER [NEW_CANDIDATE_SHA]; supply an independent candidate to compare with the main archive' >&2
     exit 2
 fi
@@ -17,7 +25,7 @@ serial=da318bdb81344672b5d9013e04d517669d3eb142
 # Existing mainline/LI readers default to B24. NPU0 and NPU5 use the B20 paced-tail candidate.
 peer_physical_npu=${PEER_PHYSICAL_NPU:-4}
 case "$peer_physical_npu" in
-    0|5) [[ "$native" == 6d7f257b3d664a8b4991cfd3ebd12da4f2038d04 ]] || { echo "Expected the paced-tail candidate on NPU$peer_physical_npu" >&2; exit 2; } ;;
+    0|5) [[ -n "$credit_group" || "$native" == 6d7f257b3d664a8b4991cfd3ebd12da4f2038d04 ]] || { echo "Expected the paced-tail candidate on NPU$peer_physical_npu" >&2; exit 2; } ;;
     4) ;;
     *) echo "Unsupported physical NPU: $peer_physical_npu" >&2; exit 2 ;;
 esac
@@ -52,6 +60,7 @@ if [[ $native != "$main_rev" ]]; then
         }
     fi
 fi
+if [[ $credit_group == 7 ]]; then prefix=host20-npu5-credit-g7; fi
 out=$(mktemp -d "$area/$prefix.XXXXXX")
 echo "RESULT_ROOT=$out"
 if [[ $peer_physical_npu != 4 ]]; then echo "LOG=$out/run.log"; fi
@@ -89,6 +98,7 @@ cat /proc/sys/kernel/random/boot_id >"$out/boot_id.txt"
 if [[ -r /etc/machine-id ]]; then cat /etc/machine-id >"$out/machine_id.txt"; fi
 echo "CONFIG measured=$native main=$main_rev reader=$reader physical_NPU=$peer_physical_npu logical_device=0 transport=urma BS=16 Q=4 token_bytes=656 warmup=4 calls=20"
 groups=(10 4 17 7 2)
+if [[ -n "$credit_group" ]]; then groups=("$credit_group"); fi
 archive_for() {
     if [[ $1 == 2 ]]; then printf '%s\n' "$area/fused.gbxKC9"
     else printf '%s\n' "$area/fused.N7n8ZP"; fi
@@ -222,7 +232,9 @@ if (( ${#failed[@]} )); then
     echo "REPLAY_INCOMPLETE groups=${failed[*]} RESULT_ROOT=$out" >&2
     exit 1
 fi
-if [[ $peer_physical_npu != 4 ]]; then
+if [[ -n "$credit_group" ]]; then
+    "$PYTHON" -B "$support/credit_collection.py" "$out" "$credit_group" | tee -a "$out/summary.txt"
+elif [[ $peer_physical_npu != 4 ]]; then
     "$PYTHON" -B "$support/paced_host20.py" summary "$out" | tee -a "$out/summary.txt"
 elif [[ $native != "$main_rev" ]]; then
     "$PYTHON" -B "$support/li_window_report.py" summary "$out" | tee -a "$out/summary.txt"
