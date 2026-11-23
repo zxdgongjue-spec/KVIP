@@ -26,7 +26,9 @@ static std::vector<uint32_t> load(const std::string& file) {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 2 && (argc != 3 || std::string(argv[2]) != "--once")) return 2;
+    if (argc < 2 || argc > 3) return 2;
+    const std::string mode = argc == 3 ? argv[2] : "--abba";
+    if (mode != "--abba" && mode != "--once" && mode != "--only-old" && mode != "--only-new") return 2;
     try {
         auto inputs = load(std::string(argv[1]) + ".bin");
         auto expected = load(std::string(argv[1]) + ".want");
@@ -43,8 +45,9 @@ int main(int argc, char** argv) {
         check(aclrtMemcpy(deviceInputs, inputs.size()*4, inputs.data(), inputs.size()*4, ACL_MEMCPY_HOST_TO_DEVICE));
         std::vector<uint32_t> actual(expected.size());
         const int order[] = {0,1,0,1,1,0};
-        const unsigned passes = argc == 3 ? 2 : 6;
-        for (unsigned pass=0; pass<passes; ++pass) {
+        const unsigned first = mode == "--only-new" ? 1 : 0;
+        const unsigned limit = mode == "--only-old" ? 1 : (mode == "--abba" ? 6 : 2);
+        for (unsigned pass=first; pass<limit; ++pass) {
             const int variant=order[pass];
             check(ACLRT_LAUNCH_KERNEL(window_rank_probe)(1U,stream,deviceInputs,deviceOutputs,calls,variant));
             check(aclrtSynchronizeStream(stream));
