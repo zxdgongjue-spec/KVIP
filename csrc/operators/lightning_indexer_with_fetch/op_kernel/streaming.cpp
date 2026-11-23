@@ -12,6 +12,7 @@
 #include "staged_urma_pack.h"
 #include "staged_outputs.h"
 #include "pipeline_types.h"
+#include "joined_owner_trace.h"
 #include "shadow_exchange_parallel.h"
 #include "index_cache_update.h"
 using namespace AscendC;
@@ -1161,7 +1162,7 @@ inline void CollectFinalPosts(__gm__ FinalPost* posts,__ubuf__ uint32_t* output)
 #include "joined_final.h"
 #endif
 template<bool Team=false,bool QueryOwner=false>
-__aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
+__aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b, joined_trace::Record ownerTrace=nullptr){
  auto ctx=reinterpret_cast<__gm__ Context*>(a->context);auto shape=LoadRuntimeShape(ctx);
  auto flags=reinterpret_cast<__gm__ BatchFlag*>(a->flags)+b*kFlagCount;
  auto row=reinterpret_cast<__gm__ Row*>(ctx->rows)+b;uint64_t error=0;
@@ -1185,10 +1186,13 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
  if constexpr(Team)index_team::Copy(a,GetBlockIdx(),shape.batch);
 #endif
  uint32_t deferredPrefix=0;
- for(uint32_t f=6;f<12;++f){uint64_t start=GetSystemCycle();if(profile)ft[8+2*(f-6)]=start;while(true){
+ for(uint32_t f=6;f<12;++f){uint64_t start=GetSystemCycle();if(profile)ft[8+2*(f-6)]=start;
+  if constexpr(QueryOwner) { if(ownerTrace)ownerTrace[joined_trace::FinalFlag6Wait+2*(f-6)]=start; }
+  while(true){
   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+f),kBatchFlagPayloadBytes);
   if(flags[f].ready){error|=flags[f].error;break;}
   if(GetSystemCycle()-start>5000000000ULL){error|=kvaf_device::kCqTimeout;break;}}
+  if constexpr(QueryOwner) { if(ownerTrace)ownerTrace[joined_trace::FinalFlag6Ready+2*(f-6)]=GetSystemCycle(); }
   if(profile)ft[9+2*(f-6)]=GetSystemCycle();
   if(f==6 && (a->prefetchCount & 0x10000000U)){
    if(profile)ft[20]=GetSystemCycle();
@@ -1205,7 +1209,9 @@ __aicore__ inline void FinalizeStreaming(__gm__ Args* a,uint32_t b){
 #if !V9_UBMEM && KVIP_OUTPUT_WORKER
  // Output owns flags 1..4. Join after CQ and update work so the output row
  // can finish concurrently; retain its error even if the updater exited early.
+ if constexpr(QueryOwner)joined_trace::Mark(ownerTrace,joined_trace::FinalOutputWait);
  error|=AwaitPublication(flags+4);
+ if constexpr(QueryOwner)joined_trace::Mark(ownerTrace,joined_trace::FinalOutputReady);
 #endif
 #if !V9_UBMEM
  if(!profile && !error && (a->prefetchCount&0x10000000U) && shape.finalWorkers==4 && ctx->hotValid){
@@ -1444,22 +1450,32 @@ extern "C" __global__ __aicore__ void v9_owner_topk_resolve_update(GM_ADDR bindi
     if ASCEND_IS_AIV {
         auto a = reinterpret_cast<__gm__ Args *>(arg);
         const uint32_t block = GetBlockIdx(), b = block / 4, q = block % 4;
+        auto trace = joined_trace::Row(a, block);
+        joined_trace::Mark(trace, joined_trace::Entry);
         lifetch_li::RunLi<QLIKernel::SequenceLiPhase::Final>(bindings);
         PipeBarrier<PIPE_ALL>();
+        joined_trace::Mark(trace, joined_trace::TopkEnd);
         auto header = reinterpret_cast<__gm__ uint32_t *>(a->queryErrors) + block * 32;
         auto ready = query_owner::ClassificationFlags(a, b) + q;
         // Nonuniform rows can have been finalized by Hot on a different AIV.
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(header), 2 * sizeof(uint32_t));
         query_owner::Signal(ready, header[1], header[0]);
         // Publish even for Q4 before it awaits Q1's address-table handoff.
-        query_owner::Run<true>(a, b, q);
+        joined_trace::Mark(trace, joined_trace::ClassPublished);
+        query_owner::Run<true>(a, b, q, trace);
+        joined_trace::Mark(trace, joined_trace::BarrierEnter);
         AscendC::SyncAll<true>();
+        joined_trace::Mark(trace, joined_trace::BarrierExit);
         ready->ready = 0;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(ready), kBatchFlagPayloadBytes);
         const uint32_t batch = reinterpret_cast<__gm__ Context *>(a->context)->shape.batch;
         const uint32_t workers = (a->prefetchCount >> 16) & 0xffU;
         if (block < batch) {
             Simt::VF_CALL<RetireRoundControl>(Simt::Dim3{128, 1, 1}, a, batch, workers, block);
+        }
+        if (trace) {
+            joined_trace::Mark(trace, joined_trace::RetireIssued);
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(trace), joined_trace::FieldCount*sizeof(uint64_t));
         }
     }
 #endif

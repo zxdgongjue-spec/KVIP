@@ -4,6 +4,7 @@
 #pragma once
 #include "query_owner_layout.h"
 namespace query_owner {
+namespace timer = joined_trace;
 static_assert(sizeof(KvafBatchGetCoreStatus) <= kOwnerStatusWords * 4, "Get status storage");
 __aicore__ inline void FromGm(LocalTensor<uint32_t> to, __gm__ uint32_t *from, uint32_t words) {
     if (words) {
@@ -119,7 +120,7 @@ __aicore__ inline void RunDense(__gm__ Args *a, StagedContextPointer staged,
 // The first resolver's prefix and later query suffixes use the same protected
 // allocator as the fixed graph, including ordinary hits outside the LRU list.
 template<bool Joined>
-__aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32_t b, uint32_t q) {
+__aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32_t b, uint32_t q, timer::Record trace) {
     auto ctx = reinterpret_cast<__gm__ Context *>(a->context);
     auto row = reinterpret_cast<__gm__ Row *>(ctx->rows) + b;
     auto flags = reinterpret_cast<__gm__ BatchFlag *>(a->flags) + b * kFlagCount;
@@ -153,6 +154,12 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
         upper += n && n <= limit + 1 ? n - 1 : kTop;
         if (j == q) prefixUpper = upper;
     }
+    if (trace) {
+        trace[timer::PeerMapsReady] = peerMapsReady;
+        const uint32_t encoded = headers[32 * q + 1];
+        trace[timer::ClassMissCount] = encoded ? encoded - 1 : UINT32_MAX;
+        trace[timer::QueryPrefixUpper] = prefixUpper;
+    }
     if constexpr (Joined) s.rowClassified = peerMapsReady;
     if (row->slots > kPrefetch) {
         s.error |= 4;
@@ -161,7 +168,9 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
         // The classifier already filled every location. Leave the allocator
         // handoff in place; later queries must still see its protected slots.
         auto prior = flags + kRawQueryFlag + q - 1;
+        timer::Mark(trace, timer::RawWait);
         s.error |= AwaitPublication(prior);
+        timer::Mark(trace, timer::RawReady);
         s.begin = prior->reserved[0];
         flags[kRawQueryFlag + q].reserved[1] = prior->reserved[1];
         if constexpr (Joined) flags[kRawQueryFlag + q].reserved[2] = prior->reserved[2];
@@ -180,6 +189,8 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
     // publishes the exact deduplicated prefix. Keep the DMA ahead of that wait.
     const uint32_t used = row->slots;
     const bool shortLru = prefixUpper < kTop && used <= kLruSlots - prefixUpper;
+    if (trace) trace[timer::LruInputBytes] = timer::DmaBytes(!shortLru ? kLruSlots :
+        (prefixUpper ? used + prefixUpper - (used & ~7U) : 0));
     if (!shortLru) {
         FromGm(work[4096], lru, kLruSlots);
     } else if (prefixUpper) {
@@ -199,6 +210,7 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
             VectorDone();
         }
         Signal(flags, row->slots, s.error);
+        timer::Mark(trace, timer::PrefetchPublish);
         Duplicate(keys, UINT32_MAX, buckets);
         Duplicate(ranks, UINT32_MAX, buckets);
         Duplicate(ctl, 0U, 32);
@@ -207,7 +219,9 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
         SetFlag<HardEvent::S_V>(EVENT_ID0);
         WaitFlag<HardEvent::S_V>(EVENT_ID0);
     } else {
+        timer::Mark(trace, timer::RawWait);
         s.error |= AwaitPublication(flags + kRawQueryFlag + q - 1);
+        timer::Mark(trace, timer::RawReady);
         auto f = flags + kRawQueryFlag + q - 1;
         s.begin = f->reserved[0];
         if constexpr (Joined) buckets = f->reserved[2];
@@ -215,6 +229,9 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
             s.error |= 4;
         }
         if (!s.error) {
+            if (trace) trace[timer::ResolverRestoreBytes] =
+                timer::ResolverBytes(buckets, s.begin, f->reserved[1] ? (a->resident + 31)/32 : 0);
+            timer::Mark(trace, timer::ResolverRestoreBegin);
             FromGm(keys, saved, buckets);
             FromGm(ranks, saved + kSlots, buckets);
             FromGm(slots, saved + 2 * kSlots, s.begin);
@@ -225,6 +242,7 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
         }
     }
     InputReady();
+    if (q && !s.error) timer::Mark(trace, timer::ResolverRestoreEnd);
     if (!s.error) {
         // LI already identified the unresolved positions. Reuse the production
         // resolver, which checks the unused LRU suffix before changing any slot.
@@ -236,15 +254,21 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
             SetFlag<HardEvent::S_V>(EVENT_ID0);
             WaitFlag<HardEvent::S_V>(EVENT_ID0);
             auto entries = reinterpret_cast<__gm__ uint32_t *>(ctx->sourceBlocks) + (4 * b + q) * kTop;
+            timer::Mark(trace, timer::CompactBegin);
             Simt::VF_CALL<ResolveOwnerCompact>(Simt::Dim3{64, 1, 1}, staged, b, q, a->resident, row->slots,
                 encoded - 1, entries, FinalPtr(keys), FinalPtr(ranks), FinalPtr(slots), FinalPtr(work[4096]),
                 FinalPtr(ctl), src, dst, reinterpret_cast<__gm__ uint32_t*>(a->liveCount));
             VectorDone();
             compact = !ctl.GetValue(16);
+            timer::Mark(trace, timer::CompactEnd);
         }
         if (!compact) {
             // The protected allocator can inspect any ordinal in the original table.
-            if (shortLru) FromGm(work[4096], lru, kLruSlots);
+            timer::Mark(trace, timer::DenseBegin);
+            if (shortLru) {
+                FromGm(work[4096], lru, kLruSlots);
+                if (trace) trace[timer::LruInputBytes] += timer::DmaBytes(kLruSlots);
+            }
             FromGm(ub[q * kTop], positions + q * kTop, kTop);
             FromGm(loc[q * kTop], locations + q * kTop, kTop);
             if (q >= 2) {
@@ -259,7 +283,9 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
                 if (!peerMapsReady && !ctl.GetValue(1) && ctl.GetValue(kPendingAdded)) {
                     // The hash and candidate slots are already in UB. Only an
                     // actual read of the row's four hit maps needs the join.
+                    timer::Mark(trace, timer::BitmapWait);
                     s.error |= AwaitRowClassifications(a, b);
+                    timer::Mark(trace, timer::BitmapReady);
                     s.rowClassified = true;
                     if (s.error) {
                         pipe.Destroy();
@@ -269,14 +295,25 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
                         ub, loc, keys, ranks, ids, slots, work, ctl, protect, true);
                 }
             }
+            timer::Mark(trace, timer::DenseEnd);
         }
         s.error = ctl.GetValue(1);
         if (!s.error) {
             s.count = ctl.GetValue(2 + q);
             s.safe = ctl.GetValue(17);
             const uint32_t protection = ctl.GetValue(kProtectionState);
+            if (trace) {
+                trace[timer::BucketWords] = buckets;
+                trace[timer::Protection] = protection;
+                trace[timer::CompactSuccess] = compact;
+                trace[timer::ShortLru] = shortLru;
+                trace[timer::ResolverSaveBytes] = q < 3 ?
+                    timer::ResolverBytes(buckets, s.begin + s.count, protection ? (a->resident + 31)/32 : 0) : 0;
+                trace[timer::LocationsSaveBytes] = compact ? 0 : timer::DmaBytes(kTop);
+            }
             flags[kRawQueryFlag + q].reserved[1] = protection;
             if constexpr (Joined) flags[kRawQueryFlag + q].reserved[2] = buckets;
+            timer::Mark(trace, timer::SaveBegin);
             BeforeStore();
             if (!compact) ToGm(locations + q * kTop, loc[q * kTop], kTop);
             if (q < 3) {
@@ -289,6 +326,7 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
                 }
             }
             StoreDone();
+            timer::Mark(trace, timer::SaveEnd);
         }
     }
     pipe.Destroy();
@@ -336,10 +374,13 @@ struct IndexTail {
     __gm__ Args *a;
     uint32_t b, q;
     Slice s;
+    timer::Record trace;
     bool ran = false;
     __aicore__ inline void WriteOutput() {
+        timer::Mark(trace, timer::AdaptBegin);
         Simt::VF_CALL<Adapt>(Simt::Dim3{256, 1, 1}, a, b, q);
         VectorDone();
+        timer::Mark(trace, timer::AdaptEnd);
     }
     // Invoked by this query's own KVAF submission after its last SQ doorbell.
     __aicore__ __attribute__((noinline)) inline void Run() {
@@ -347,11 +388,13 @@ struct IndexTail {
             return;
         }
         ran = true;
+        timer::Mark(trace, timer::CallbackBegin);
         // The first SQ can be posted as soon as its allocation is safe. Keep
         // old residency/Index data readable until all four classifiers finish.
         auto ctx = reinterpret_cast<__gm__ Context *>(a->context);
         if constexpr (Joined) {
             if (!q) {
+                timer::Mark(trace, timer::ClassificationWait);
                 if (!s.rowClassified) s.error |= AwaitRowClassifications(a, b);
                 // Padding can map several batch rows to one physical owner.
                 // Wait for those readers too before changing their old Index.
@@ -362,6 +405,7 @@ struct IndexTail {
                         if (row != b && owners[row] == owner) s.error |= AwaitRowClassifications(a, row);
                     }
                 }
+                timer::Mark(trace, timer::ClassificationReady);
             }
         }
         auto outputs = reinterpret_cast<__gm__ BatchFlag *>(a->flags) + b * kFlagCount + 1;
@@ -371,14 +415,19 @@ struct IndexTail {
         }
         auto chain = index_team::Control(a, b);
         if (q) {
+            timer::Mark(trace, timer::IndexWait);
             s.error |= AwaitPublication(chain + q - 1);
+            timer::Mark(trace, timer::IndexReady);
         }
         auto row = reinterpret_cast<__gm__ Row *>(ctx->rows) + b;
+        timer::Mark(trace, timer::IndexBegin);
         // No swaps to apply and no final metadata commit on a middle owner.
         // Its successor can consume the very same saved permutation.
         if ((q == 1 || q == 2) && !s.count) {
             Signal(outputs + q, 0, s.error);
             Signal(chain + q, 0, s.error);
+            timer::Mark(trace, timer::IndexRelease);
+            timer::Mark(trace, timer::CallbackEnd);
             return;
         }
         auto saved = Scratch(a, b) + kOwnerResolverWords;
@@ -402,14 +451,18 @@ struct IndexTail {
                 Simt::VF_CALL<InitShadow>(Simt::Dim3{THREADS, 1, 1}, m);
                 VectorDone();
             } else {
+                if (trace) trace[timer::IndexRestoreBytes] = timer::DmaBytes(4*MAP) + timer::DmaBytes(32);
+                timer::Mark(trace, timer::IndexRestoreBegin);
                 FromGm(mem, saved, 4 * MAP);
                 FromGm(mem[CONTROL], saved + 4 * MAP, 32);
                 InputReady();
+                timer::Mark(trace, timer::IndexRestoreEnd);
             }
         } else {
             Duplicate(mem[CONTROL], 0U, 32);
             VectorDone();
         }
+        timer::Mark(trace, timer::ApplyBegin);
         uint32_t seen = prior;
         for (uint32_t part = q ? 1 : 0; part < 2 && !s.error; ++part) {
             uint32_t n = part ? s.count : row->slots, begin = part ? kPrefetch + s.begin : 0;
@@ -417,8 +470,10 @@ struct IndexTail {
                 continue;
             }
             if (!isDense && (seen + n) * 2 >= MAP * 3 / 4) {
+                timer::Mark(trace, timer::DenseInitBegin);
                 Simt::VF_CALL<InitDenseShadow>(Simt::Dim3{THREADS, 1, 1}, dense, a->history, m);
                 VectorDone();
+                timer::Mark(trace, timer::DenseInitEnd);
                 isDense = true;
             }
             if (isDense) {
@@ -433,18 +488,25 @@ struct IndexTail {
             s.error |= mem.GetValue(CONTROL);
             seen += n;
         }
+        timer::Mark(trace, timer::ApplyEnd);
         if (q == 3 && seen && !s.error) {
             // Q2/Q3 read the old mapping before their Index handoff; Q1 reads it afterwards.
+            timer::Mark(trace, timer::Q1ReadWait);
             s.error |= AwaitPublication(outputs);
+            timer::Mark(trace, timer::Q1ReadReady);
         }
         if (!s.error) {
             if (q < 3 && !isDense && seen) {
+                if (trace) trace[timer::IndexSaveBytes] = timer::DmaBytes(4*MAP) + timer::DmaBytes(32);
+                timer::Mark(trace, timer::IndexSaveBegin);
                 BeforeStore();
                 ToGm(saved, mem, 4 * MAP);
                 ToGm(saved + 4 * MAP, mem[CONTROL], 32);
                 StoreDone();
+                timer::Mark(trace, timer::IndexSaveEnd);
             }
             if (q == 3 && seen) {
+                timer::Mark(trace, timer::CommitBegin);
                 auto addr = reinterpret_cast<__gm__ uint64_t *>(a->addresses) + uint64_t(owner) * u[7];
                 auto logical = reinterpret_cast<__gm__ uint64_t *>(a->logical) + uint64_t(owner) * a->history;
                 if (isDense) {
@@ -455,12 +517,15 @@ struct IndexTail {
                     Simt::VF_CALL<CommitMetadata>(Simt::Dim3{THREADS, 1, 1}, addr, logical, m);
                 }
                 VectorDone();
+                timer::Mark(trace, timer::CommitEnd);
             }
         }
+        if (trace) trace[timer::DenseIndex] = isDense;
         pipe.Destroy();
         if (!q) {
             // The Index shadow is available to Q2 while Q1 saves its output.
             Signal(chain, s.count, s.error);
+            timer::Mark(trace, timer::IndexRelease);
             if (validOutput) {
                 WriteOutput();
             }
@@ -468,12 +533,14 @@ struct IndexTail {
         Signal(outputs + q, s.count, s.error);
         if (q) {
             Signal(chain + q, s.count, s.error);
+            timer::Mark(trace, timer::IndexRelease);
         }
+        timer::Mark(trace, timer::CallbackEnd);
     }
 };
 
 template<bool Joined = false>
-__aicore__ __attribute__((noinline)) inline void Run(__gm__ Args *a, uint32_t b, uint32_t q) {
+__aicore__ __attribute__((noinline)) inline void Run(__gm__ Args *a, uint32_t b, uint32_t q, timer::Record trace = nullptr) {
     auto ctx = reinterpret_cast<__gm__ Context *>(a->context);
     const uint32_t batch = ctx->shape.batch;
     auto flags = reinterpret_cast<__gm__ BatchFlag *>(a->flags) + b * kFlagCount;
@@ -482,20 +549,34 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args *a, uint32_t b,
     if (q == 3) {
         // Q1 publishes row->addresses in the same cache line that the CQ owner cleans.
         auto error = AwaitPublication(flags);
-        CompletePrefetch(ctx, b, true);
+        timer::Mark(trace, timer::PrefetchReady);
+        if (trace) {
+            uint64_t polls = 0, drain = 0, arrival = 0;
+            CompletePrefetch(ctx, b, true, &polls, &drain, &arrival);
+            trace[timer::Q4PrefetchPolls] = polls;
+            trace[timer::Q4PrefetchWaitCycles] = drain;
+        } else {
+            CompletePrefetch(ctx, b, true);
+        }
+        timer::Mark(trace, timer::PrefetchEnd);
         Signal(flags + 7, 0, error | row->error);
     }
-    Slice s = Resolve<Joined>(a, b, q);
+    timer::Mark(trace, timer::ResolveBegin);
+    Slice s = Resolve<Joined>(a, b, q, trace);
+    timer::Mark(trace, timer::ResolveEnd);
     // The next allocator needs the slots and captured descriptor addresses;
     // this query alone owns its subsequent SQ post and CQ.
     auto raw = flags + kRawQueryFlag + q;
     raw->reserved[0] = s.begin + s.count;
     Signal(raw, s.count, s.error);
+    timer::Mark(trace, timer::RawRelease);
     uint32_t first = (b * 4 + q) * kTop;
     auto post = FinalPostAt(ctx->shape.finalPostOffset, ctx, b * 4 + q);
     PrepareFinalFetch(4, ctx->shape.finalPostOffset, ctx, b, q, s.count, first, s.error, s.safe);
     if (s.safe < s.count) {
+        timer::Mark(trace, timer::ConflictWait);
         s.error |= AwaitPublication(flags + 7);
+        timer::Mark(trace, timer::ConflictReady);
     }
     const uint32_t view = FinalQueue(batch, 4, b, q);
     auto native = GetArgs(ctx, view);
@@ -514,17 +595,40 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args *a, uint32_t b,
         native.valid_table = ctx->fallbackValid;
         native.table_capacity = batch * kSlots;
     }
-    IndexTail<Joined> tail{a, b, q, s};
+    IndexTail<Joined> tail{a, b, q, s, trace};
+    if (trace) {
+        trace[timer::MissCount] = s.count;
+        trace[timer::SafeCount] = s.safe;
+        trace[timer::PrefixCount] = s.begin;
+        trace[timer::Prefetched] = row->slots;
+    }
     uint32_t completed = 0, processed = 0;
     if (!s.error && s.count) {
+        timer::Mark(trace, timer::DescriptorSyncBegin);
         SyncFetchDescriptors(ctx, first, s.count);
+        timer::Mark(trace, timer::DescriptorSyncEnd);
         auto queue = reinterpret_cast<__gm__ uint8_t *>(native.queue_state);
         kvaf_device::CleanCacheLines(queue, sizeof(KvafBatchGetQueueState));
+        if (trace) status->profile.magic = KVAF_AIV_BATCH_GET_PROFILE_MAGIC;
         kvaf_device::WriteStatus(status, kvaf_device::kInvalidArgs, 0, 0, 0, 0, UINT64_MAX, 0);
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(status), sizeof(*status));
+        timer::Mark(trace, timer::GetBegin);
         kvaf_device::KvafBatchGetDeviceWithPostTail(native, 0, first, s.count, tail);
+        timer::Mark(trace, timer::GetEnd);
         kvaf_device::CleanCacheLines(queue, sizeof(KvafBatchGetQueueState));
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(status), sizeof(*status));
+        if (trace) {
+            auto &p = status->profile;
+            trace[timer::FirstDoorbell] = p.first_doorbell_cycle;
+            trace[timer::LastPost] = p.post_done_cycle;
+            trace[timer::CompletionDone] = p.completion_done_cycle;
+            trace[timer::PostActiveCycles] = p.post_active_cycles;
+            trace[timer::CqDrainCycles] = p.drain_wait_cycles;
+            trace[timer::FinalPosts] = p.total_posts;
+            trace[timer::FinalCqEvents] = p.completion_count;
+            p.magic = 0;
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(&p.magic), sizeof(p.magic));
+        }
         s.error |= status->result;
         if (status->magic != KVAF_AIV_BATCH_GET_STATUS_MAGIC || status->processed_request_count != s.count) {
             s.error |= kvaf_device::kInvalidArgs;
@@ -547,6 +651,7 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args *a, uint32_t b,
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(post), sizeof(*post));
     flags[8 + q].reserved[0] = 1;
     Signal(flags + 8 + q, 0, s.error);
+    timer::Mark(trace, timer::DoneRelease);
     if (q == 3) {
         uint32_t total = s.begin + s.count;
         auto info = reinterpret_cast<__gm__ uint32_t *>(ctx->rowStatus) + b * kRowStatusWords;
@@ -565,7 +670,9 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args *a, uint32_t b,
         Simt::VF_CALL<RetireSelection>(Simt::Dim3{128, 1, 1}, a, batch, b);
         VectorDone();
         Signal(flags + 6, 0, s.error);
-        FinalizeStreaming<false, true>(a, b);
+        timer::Mark(trace, timer::FinalizeBegin);
+        FinalizeStreaming<false, true>(a, b, trace);
+        timer::Mark(trace, timer::FinalizeEnd);
         ClearRankProgress(ctx, b);
     }
 }

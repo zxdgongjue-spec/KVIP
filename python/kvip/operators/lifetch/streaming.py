@@ -148,8 +148,8 @@ class StreamingLIFetchForward:
                 blob,
                 np.asarray([self.dense_shadow.data_ptr(), self.packed_fetch.data_ptr(), completed_flags, live_count, completed_rows, completed_events, completed_mapping, completed_journal], dtype="<u8").view("u1"),
                 np.asarray([self.index_team.data_ptr() if self.index_team is not None else 0], dtype="<u8").view("u1"),
-                np.asarray([owner_scratch], dtype="<u8").view("u1"),
-                np.zeros(48, dtype="u1"),
+                np.asarray([owner_scratch, 0], dtype="<u8").view("u1"),
+                np.zeros(40, dtype="u1"),
             )
         )
         if len(blob) != 256:
@@ -189,6 +189,38 @@ class StreamingLIFetchForward:
         result = self.function(*args)
         if result:
             raise RuntimeError(f"streaming LIFetch launch failed: {result}")
+
+    query_owner_trace_fields = tuple((
+        "entry topk_end class_published prefetch_ready prefetch_end resolve_begin raw_wait "
+        "raw_ready compact_begin compact_end dense_begin bitmap_wait bitmap_ready dense_end "
+        "save_begin save_end resolve_end raw_release conflict_wait conflict_ready get_begin "
+        "callback_begin classification_wait classification_ready adapt_begin adapt_end index_wait index_ready "
+        "index_begin apply_begin apply_end q1_read_wait q1_read_ready commit_begin commit_end "
+        "index_release callback_end get_end done_release finalize_begin finalize_end barrier_enter "
+        "barrier_exit retire_issued miss_count safe_count bucket_words prefix_count protection "
+        "compact_success first_doorbell last_post completion_done post_active_cycles cq_drain_cycles final_posts "
+        "final_cq_events prefetched q4_prefetch_polls q4_prefetch_wait_cycles descriptor_sync_begin descriptor_sync_end dense_index "
+        "short_lru resolver_restore_begin resolver_restore_end index_restore_begin index_restore_end "
+        "index_save_begin index_save_end resolver_restore_bytes resolver_save_bytes index_restore_bytes "
+        "index_save_bytes locations_save_bytes peer_maps_ready class_miss_count lru_input_bytes "
+        "prefetch_publish final_flag6_wait final_flag6_ready final_flag7_wait final_flag7_ready "
+        "final_flag8_wait final_flag8_ready final_flag9_wait final_flag9_ready final_flag10_wait "
+        "final_flag10_ready final_flag11_wait final_flag11_ready final_output_wait final_output_ready "
+        "dense_init_begin dense_init_end query_prefix_upper "
+    ).split())
+
+    def set_query_owner_capture(self, enabled=True):
+        """Attach a per-AIV timing buffer to the joined URMA tail before replay capture."""
+        if not hasattr(self, "query_owner_scratch"):
+            raise ValueError("Joined-owner capture requires the BS16 query-owner route")
+        if enabled and not hasattr(self, "query_owner_trace"):
+            self.query_owner_trace = self.torch.zeros(
+                (4 * self.batch, len(self.query_owner_trace_fields)), dtype=self.torch.int64,
+                device=self.rotating.device,
+            )
+        address = self.query_owner_trace.data_ptr() if enabled else 0
+        encoded = np.asarray([address], dtype="<u8").view("u1")
+        self.workspace[208:216].copy_(self.torch.from_numpy(encoded.copy()))
 
     def set_options(self, *, diagnostics=False, deferred_fetch=False):
         """Startup/profile-only update; forward never allocates or copies."""

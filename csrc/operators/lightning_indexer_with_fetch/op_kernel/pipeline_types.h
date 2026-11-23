@@ -29,6 +29,7 @@ struct alignas(128) Args {
  uint64_t completedMapping, completedJournal;
  uint64_t indexTeam; // Optional zeroed row controls (one cache line per writer).
  uint64_t queryOwnerScratch;
+ uint64_t queryOwnerTrace; // Optional joined-owner timing rows.
 };
 }
 
