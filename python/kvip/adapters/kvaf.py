@@ -103,7 +103,7 @@ class KvafGetLease(StreamLease):
     """
 
     def __init__(self, torch, runtime, library, output, stream):
-        self.unified = callable(getattr(runtime, "get_graph_urma_resources", None))
+        self.unified = callable(getattr(type(runtime), "get_graph_urma_resources", None))
         if not self.unified:
             _require_fused_runtime(
                 runtime, "URMA",
@@ -299,7 +299,7 @@ class UbmemLease(StreamLease):
     capture_scope_name = "UBmem"
 
     def __init__(self, torch, runtime, output, stream):
-        self.unified = callable(getattr(runtime, "get_graph_mapped_base", None))
+        self.unified = callable(getattr(type(runtime), "get_graph_mapped_base", None))
         self.torch, self.runtime, self.device, self.stream = torch, runtime, output.device, stream
         if self.unified:
             import kvaf

@@ -1,11 +1,12 @@
 import ctypes
 import struct
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
-from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, LeasedRuntime
+from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, LeasedRuntime, UbmemLease
 
 
 class Function:
@@ -62,6 +63,57 @@ class TransportTest(unittest.TestCase):
             patch("kvip.adapters.kvaf.load_native_get", return_value=(object(), self.native_get)),
         ):
             self.owner = KvafGetLease(self.torch, self.runtime, "test", self.output, self.stream)
+
+    def test_unified_urma_keeps_each_output_lease_until_close(self):
+        class Runtime(Mock):
+            def get_graph_urma_resources(self, lease):
+                return dict(self.resources, device_channel_entity=lease * 100)
+
+        runtime = Runtime()
+        runtime.resources = self.context
+        runtime.batch_get_token_bytes = 656
+        runtime.batch_get_tokens_per_block = 128
+        runtime.begin_get_graph.side_effect = [1, 2]
+        self.npu.synchronize = Mock()
+        sdk = SimpleNamespace(GetExecutionConfig=Mock(return_value="urma-get"))
+        with (
+            patch.dict(sys.modules, {"kvaf": sdk}),
+            patch("kvip.adapters.kvaf.load_lifetch_library", return_value=self.library),
+            patch("kvip.adapters.kvaf.load_native_get", return_value=(object(), self.native_get)),
+        ):
+            owner = KvafGetLease(self.torch, runtime, "test", self.output, self.stream)
+            other = self.output.clone()
+            self.assertEqual(owner.register_output(other)["device_channel_entity"], 200)
+            owner.register_output(other)
+        self.assertEqual(runtime.begin_get_graph.call_count, 2)
+        owner.close()
+        self.assertEqual(
+            [call.args[0] for call in runtime.end_get_graph.call_args_list], [2, 1]
+        )
+        self.npu.synchronize.assert_called_once_with(self.output.device)
+
+    def test_unified_ubmem_reuses_one_mapping_for_multiple_outputs(self):
+        class Runtime(Mock):
+            def get_graph_mapped_base(self, lease):
+                return 8192
+
+        runtime = Runtime()
+        runtime.device_id = self.output.device.index
+        runtime.remote_region = dict(base=4096, length=131072, slot_size=131072)
+        runtime.batch_get_token_bytes = 656
+        runtime.batch_get_tokens_per_block = 128
+        runtime.begin_get_graph.return_value = 17
+        self.npu.synchronize = Mock()
+        sdk = SimpleNamespace(GetExecutionConfig=Mock(return_value="ubmem-get"))
+        with patch.dict(sys.modules, {"kvaf": sdk}):
+            owner = UbmemLease(self.torch, runtime, self.output, self.stream)
+            other = self.output.clone()
+            view = owner.register_output(other)
+            self.assertEqual(view["output_address"], other.data_ptr())
+            self.assertEqual(view["mapped_base"], 8192)
+        runtime.begin_get_graph.assert_called_once_with("ubmem-get", self.output, 1, self.stream)
+        owner.close()
+        runtime.end_get_graph.assert_called_once_with(17, self.stream, discard_result=True)
 
     def inputs(self):
         return (
