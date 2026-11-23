@@ -122,7 +122,11 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query) {
             topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow);
 #else
             topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow,
-            streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U));
+            streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U)
+#if !V9_UBMEM
+            ,localWindowLists_?&windowLists_:nullptr
+#endif
+            );
 #endif
     }
     __aicore__ inline void LoadSequenceSplitThresholds(uint32_t batch) {
@@ -491,6 +495,17 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe, bool topkOnly)
         uint32_t used=2*CeilDiv(constInfo_.mBaseSize,2)*s2BaseSize_*sizeof(QK_T)+1536+6*CeilDiv(s1BaseSize_,2)*UB_BANK_DEPTH_STRIDE+2*s2BaseSize_*QLICommon::KScaleTiles*sizeof(SCALE_T)+2*CeilDiv(s1BaseSize_,2)*s2BaseSize_*sizeof(SCORE_T)+(topkCountAlign256_+trunkLen_)*sizeof(SCORE_T)+(topkCountAlign256_+64)*4+topkCountAlign256_*sizeof(SCORE_T)+topkSharedTmpSize+trunkLen_*2+8192+1024;
         incrementalPipeline_=used+kIncrementalInputBytes<=223232;
         if(incrementalPipeline_){pipe->InitBuffer(incrementalInputBuf_,kIncrementalInputBytes);incrementalInput_=incrementalInputBuf_.Get<uint16_t>();}
+#if KVIP_STREAMING_LI && !KVIP_PARALLEL_TERMINAL
+        // Reserve only spare capacity, after preserving the next-Q preload.
+        uint32_t allocated=used+(incrementalPipeline_?kIncrementalInputBytes:0);
+        constexpr uint32_t rowBytes=kvip_window::kRowWords*sizeof(uint32_t);
+        windowListRows_=allocated<=223232?Min(uint32_t(2),(223232-allocated)/rowBytes):0;
+        if(windowListRows_) {
+            pipe->InitBuffer(windowListsBuf_,windowListRows_*rowBytes);
+            windowLists_.ids=windowListsBuf_.Get<uint32_t>();
+            windowLists_.metadata=incrementalMetadata_;
+        }
+#endif
     }
 #endif
     if (!topkOnly) Duplicate(kScaleUB_, static_cast<SCALE_T>(0), 2 * s2BaseSize_ * QLICommon::KScaleTiles);

@@ -57,6 +57,10 @@ __aicore__ inline void JoinColdOutput() {
 }
 bool mappedExport_=false;uint32_t mappedValid_=0;
 // QLIVector member: called after ID recovery while the complete Q is in UB.
+TBuf<TPosition::VECCALC> windowListsBuf_;
+kvip_window::Lists windowLists_;
+uint32_t windowListRows_=0;
+bool localWindowLists_=false;
 bool exportWindowCold_=false;bool rankTrace_=false;
 uint32_t rankedEpoch_=0;bool windowCoveredEmpty_=false;
 __aicore__ inline void ExportWindowCold(uint32_t query) {
@@ -122,8 +126,11 @@ __aicore__ inline void ExportWindowCold(uint32_t query) {
     if(count) {
         GlobalTensor<uint32_t> jobs;jobs.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+query*2048);
 #endif
-        SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
-        DataCopy(jobs,compact,(count+7)/8*8);
+        if(localWindowLists_) {
+            kvip_window::SaveLocalList(windowLists_,incrementalMetadataIndex_,compact,count);
+            return;
+        }
+        kvip_window::SaveGlobalList(jobs,compact,count);
         if(mappedExport_){SetFlag<HardEvent::MTE3_V>(WINDOW_COLD_OUTPUT_EVENT);coldOutputPending_=true;}
         else {SetFlag<HardEvent::MTE3_V>(EVENT_ID5);WaitFlag<HardEvent::MTE3_V>(EVENT_ID5);}
     }
@@ -537,12 +544,18 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
         SetFlag<HardEvent::MTE2_S>(EVENT_ID5);WaitFlag<HardEvent::MTE2_S>(EVENT_ID5);
     }
     uint32_t ownedQueries=lane<runtimeShape_.batch?((runtimeShape_.batch-1-lane)/runtimeShape_.serviceLanes+1)*4:0;
+    localWindowLists_ = half && ownedQueries && ownedQueries<=windowListRows_*4 &&
+                        ctx->windowLimit/4<=kvip_window::kListWidth && incrementalMetadataActive_;
     uint32_t requests0=0,requests1=0;
     if(incrementalMetadataActive_) {
         if(ownedQueries>0)requests0=incrementalOld_.GetValue(256+9);
         if(ownedQueries>4)requests1=incrementalOld_.GetValue(256+16+9);
-        for(uint32_t i=0;i<ownedQueries;++i)
-            incrementalMetadata_.SetValue(i*16+4,uint64_t(incrementalOld_.GetValue(i*32))|(uint64_t(incrementalOld_.GetValue(i*32+16))<<32));
+        for(uint32_t i=0;i<ownedQueries;++i) {
+            uint32_t first=incrementalOld_.GetValue(i*32);
+            incrementalMetadata_.SetValue(i*16+4,uint64_t(first)|(uint64_t(incrementalOld_.GetValue(i*32+16))<<32));
+            if(localWindowLists_ && (first<runtimeShape_.resident || !incrementalMetadata_.GetValue(i*16)))
+                localWindowLists_=false;
+        }
     }
     uint32_t cap=half?rotating::SequenceWindowEnd(runtimeShape_.history,runtimeShape_.resident,half,epoch):
         rotating::Trigger(runtimeShape_.history,runtimeShape_.resident,runtimeShape_.rounds,epoch)*128;
