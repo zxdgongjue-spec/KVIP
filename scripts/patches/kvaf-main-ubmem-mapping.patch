@@ -1,0 +1,127 @@
+diff --git a/access_operator/include/access_operator.h b/access_operator/include/access_operator.h
+index 7c8444c1..59d90202 100644
+--- a/access_operator/include/access_operator.h
++++ b/access_operator/include/access_operator.h
+@@ -147,6 +147,12 @@ class AccessOperator {
+   virtual Status BeginGetGraph(GetExecutionConfig, const GetGraphOptions&, std::uint64_t*) {
+     return Status::NotImplemented("graph leases require execution dispatcher");
+   }
++  virtual Status GetGraphMappedBase(std::uint64_t, std::uint64_t*) {
++    return Status::NotImplemented("provider does not expose a mapped graph region");
++  }
++  virtual Status GetPreparedGraphMappedBase(std::uint64_t*) {
++    return Status::NotImplemented("provider does not expose a mapped graph region");
++  }
+   virtual Status EndGetGraph(std::uint64_t, void*, bool) {
+     return Status::NotImplemented("graph leases require execution dispatcher");
+   }
+diff --git a/access_operator/include/ubmem/access_operator.h b/access_operator/include/ubmem/access_operator.h
+index 0f170af6..c8033164 100644
+--- a/access_operator/include/ubmem/access_operator.h
++++ b/access_operator/include/ubmem/access_operator.h
+@@ -19,6 +19,7 @@ class AccessOperator final : public kvaf::AccessOperator {
+   Status Shutdown() override;
+   Status DrainGet() override;
+   Status Warmup(const ExecutionWarmup&) override;
++  Status GetPreparedGraphMappedBase(std::uint64_t*) override;
+   Status PrepareGetGraph(const GetGraphOptions&) override;
+   Status FinishGetGraph(void*, bool) override;
+   Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
+diff --git a/access_operator/providers/ubmem_aiv/access_operator.cc b/access_operator/providers/ubmem_aiv/access_operator.cc
+index f137aa3d..80b9a3e0 100644
+--- a/access_operator/providers/ubmem_aiv/access_operator.cc
++++ b/access_operator/providers/ubmem_aiv/access_operator.cc
+@@ -167,6 +167,14 @@ Status AccessOperator::PrepareGetGraph(const GetGraphOptions& options) {
+   resources_->invocation->graph_recorded = false;
+   return Status::OK();
+ }
++Status AccessOperator::GetPreparedGraphMappedBase(std::uint64_t* base) {
++  std::lock_guard<std::mutex> lock(resources_->mutex);
++  if (!base) return Status::InvalidArgument("null mapped base output");
++  if (!resources_->invocation->graph_active || !resources_->mapping)
++    return Status::InvalidState("UBmem graph mapping is not prepared");
++  *base = resources_->mapping->address();
++  return Status::OK();
++}
+ Status AccessOperator::FinishGetGraph(void* stream, bool discard) {
+   std::lock_guard<std::mutex> lock(resources_->mutex);
+   if (!resources_->invocation->graph_active) return Status::NotFound("UBMEM graph lease not found");
+diff --git a/bindings/src/npu_python_runtime.cc b/bindings/src/npu_python_runtime.cc
+index 5c868270..07bef81b 100644
+--- a/bindings/src/npu_python_runtime.cc
++++ b/bindings/src/npu_python_runtime.cc
+@@ -1131,6 +1131,17 @@ class NpuPythonRuntime final {
+     ThrowIfError(status);
+     return id;
+   }
++  std::uint64_t GetGraphMappedBase(std::uint64_t id) {
++    std::uint64_t base = 0;
++    Status status;
++    {
++      py::gil_scoped_release release;
++      std::lock_guard<std::mutex> lock(get_mutex_);
++      status = native_->core().GetGraphMappedBase(id, &base);
++    }
++    ThrowIfError(status);
++    return base;
++  }
+   void EndGetGraph(std::uint64_t id, const py::object& stream, bool discard) {
+     const auto native_stream = ResolveStream(stream);
+     Status status;
+@@ -1669,6 +1680,8 @@ void BindNpuPythonRuntime(py::module_& module) {
+            "Drain pending Get and unregister its reusable output; failure retains the binding.")
+       .def("begin_get_graph", &NpuPythonRuntime::BeginGetGraph, py::arg("execution"),
+            py::arg("output"), py::arg("request_capacity"), py::arg("stream") = py::none())
++      .def("get_graph_mapped_base", &NpuPythonRuntime::GetGraphMappedBase, py::arg("lease"),
++           "Borrow the UBmem mapped base for the lifetime of the prepared graph lease.")
+       .def("end_get_graph", &NpuPythonRuntime::EndGetGraph, py::arg("lease"),
+            py::arg("stream") = py::none(), py::kw_only(), py::arg("discard_result") = false)
+       .def("warmup", &NpuPythonRuntime::WarmupPut, py::arg("execution"), py::kw_only(),
+diff --git a/runtime/execution/execution_dispatcher.cc b/runtime/execution/execution_dispatcher.cc
+index 4e4b1ea6..4259826c 100644
+--- a/runtime/execution/execution_dispatcher.cc
++++ b/runtime/execution/execution_dispatcher.cc
+@@ -868,6 +868,17 @@ Status ExecutionDispatcher::BeginGetGraph(GetExecutionConfig c, const GetGraphOp
+   *id = next_graph_id_++;
+   return Status::OK();
+ }
++Status ExecutionDispatcher::GetGraphMappedBase(std::uint64_t id, std::uint64_t* base) {
++  std::shared_lock<std::shared_mutex> life(lifecycle_);
++  std::lock_guard<std::mutex> lock(get_mutex_);
++  GetGraphNode* node = nullptr;
++  auto status = FindGraphNode(nullptr, id, &node);
++  if (!status.ok()) return status;
++  if (!node) return Status::InvalidArgument("a live Get graph lease is required");
++  return WithGraphNode(*node, [&](GetResourceView view) {
++    return view.operation()->GetPreparedGraphMappedBase(base);
++  });
++}
+ Status ExecutionDispatcher::EndGetGraph(std::uint64_t id, void* stream, bool discard) {
+   std::shared_lock<std::shared_mutex> life(lifecycle_);
+   std::lock_guard<std::mutex> lock(get_mutex_);
+diff --git a/runtime/include/execution_dispatcher.h b/runtime/include/execution_dispatcher.h
+index bd790b90..79431622 100644
+--- a/runtime/include/execution_dispatcher.h
++++ b/runtime/include/execution_dispatcher.h
+@@ -32,6 +32,7 @@ class ExecutionDispatcher final : public AccessOperator {
+   Status Warmup(PutExecutionConfig, const ExecutionWarmup& = {});
+   Status Warmup(GetExecutionConfig, const ExecutionWarmup& = {});
+   Status BeginGetGraph(GetExecutionConfig, const GetGraphOptions&, std::uint64_t*) override;
++  Status GetGraphMappedBase(std::uint64_t, std::uint64_t*) override;
+   Status EndGetGraph(std::uint64_t, void*, bool) override;
+   Status BeginGetOutput(GetExecutionConfig, const GetOutputOptions&, std::uint64_t*) override;
+   Status EndGetOutput(std::uint64_t) override;
+diff --git a/runtime/include/runtime.h b/runtime/include/runtime.h
+index d6da9acb..fba7e56c 100644
+--- a/runtime/include/runtime.h
++++ b/runtime/include/runtime.h
+@@ -139,6 +139,9 @@ class RuntimeCore {
+   Status RecoverPut(PutExecutionConfig);
+   bool HasPendingPut() const;
+   Status BeginGetGraph(GetExecutionConfig, const GetGraphOptions&, std::uint64_t*);
++  Status GetGraphMappedBase(std::uint64_t id, std::uint64_t* base) {
++    return access_operator_.GetGraphMappedBase(id, base);
++  }
+   Status EndGetGraph(std::uint64_t, void* stream, bool discard_result = false);
+   Status BeginGetOutput(GetExecutionConfig, const GetOutputOptions&, std::uint64_t*);
+   Status EndGetOutput(std::uint64_t);

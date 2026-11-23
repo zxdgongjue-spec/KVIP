@@ -131,7 +131,10 @@ def prepare_main_device_sources(root, transport):
         raise RuntimeError(f"Expected KVAF main revision {MAIN_REVISION}, found {head}")
     patches = [(ROOT / "scripts/patches/kvaf-main-fused-device.patch", ())]
     if transport == "ubmem":
-        patches.append((patch_path(UBMEM_DEVICE_PATCH), ("--include=access_operator/include/ubmem/*",)))
+        patches.extend((
+            (patch_path(UBMEM_DEVICE_PATCH), ("--include=access_operator/include/ubmem/*",)),
+            (ROOT / "scripts/patches/kvaf-main-ubmem-mapping.patch", ()),
+        ))
     pending = []
     for path, options in patches:
         command = ["git", "-C", str(root), "apply", *options]
@@ -150,7 +153,7 @@ def main():
     parser.add_argument(
         "--main-batch-get", action="store_true", help="build unified Runtime and LIDU for native BatchGet"
     )
-    parser.add_argument("--prepare-main-device", action="store_true", help="prepare unified Runtime device headers only")
+    parser.add_argument("--prepare-main-device", action="store_true", help="prepare unified Runtime fusion patch sources")
     parser.add_argument("--prepare-only", action="store_true", help="prepare pinned source, without CANN builds")
     parser.add_argument("--skip-kvaf-build", action="store_true", help="use an already rebuilt KVAF")
     parser.add_argument("--skip-lidu-build", action="store_true", help="reuse existing LIDU vendor/Python libraries")
