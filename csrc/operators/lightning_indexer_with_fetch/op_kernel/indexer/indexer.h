@@ -814,6 +814,9 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
             uint32_t serviceEpoch = rotating::ServiceRank(runtimeShape_.batch, runtimeShape_.splitQ,
                                                           aiCoreIdx) / runtimeShape_.serviceAics;
             if ASCEND_IS_AIV {
+#if KVIP_WINDOW_READY_TRACE
+                vectorService.InitReadyTrace();
+#endif
                 vectorService.LoadSequenceSplitThresholds(batch);
                 vectorService.PrepareRotationProgress();
                 if (serviceEpoch == 0) vectorService.RotateFetch(0, halfTokens);
@@ -824,6 +827,9 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
                 if (end > runtimeShape_.history / S2_BASE_SIZE) end = runtimeShape_.history / S2_BASE_SIZE;
                 ScanSequenceHalf(begin, end, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
                 if ASCEND_IS_AIV {
+#if KVIP_WINDOW_READY_TRACE
+                    if (epoch + 1 == runtimeShape_.rounds) vectorService.MarkColdScoreEnd();
+#endif
                     if (serviceEpoch == epoch) vectorService.RotateFetch(epoch, halfTokens);
                 }
             }
@@ -831,6 +837,9 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
 
         if ASCEND_IS_AIV {
             vectorService.FreeEventID();
+#if KVIP_WINDOW_READY_TRACE
+            if constexpr (Phase == SequenceLiPhase::Cold) vectorService.WriteReadyTrace();
+#endif
         } else {
             matmulService.FreeEventID();
             CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT);

@@ -1,5 +1,6 @@
 #if !V9_UBMEM && KVIP_STREAMING_LI
 #define KVIP_DUAL_WINDOW_RANK 1
+#define KVIP_WINDOW_READY_TRACE 1
 #endif
 #include "kernel_operator.h"
 #if defined(__CCE_AICORE__)
