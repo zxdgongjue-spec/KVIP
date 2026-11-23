@@ -13,6 +13,8 @@ Use a final argument of `2` for two consecutive replays on the same device addre
 
 The fixture runs the actual resident scoring, resident threshold and cold scoring device entries. Four Cube cores and eight Vector cores process two rows with four queries each, 2,048 resident tokens, 5,120 total tokens and four service windows. The two initial hot-valid masks use 4 and 103 missing positions, the median per-query eligible counts in the archived G2 and G7 rank fixtures. Synthetic signed Q, K and weight values make all 40,960 scores independently checkable. Actual input capture, workload distribution and overall graph performance require the NPU replay.
 
+To exercise adjacent BF16 cutoffs, set `KVIP_MODEL_SCORE_FIXTURE=adjacent-cutoff` for both the reference and the candidate. The first row starts with resident scores of 128 and 129, and has cold scores of 129, 130 and 132. The second starts with 128 and 131, and has cold scores of 131, 132 and 134. A single active dot product of 128 and an exact FP32 scale per token give an independent expected score for every position. Use the default input to measure a larger cutoff jump separately.
+
 Window service writes its normal WQEs into simulator memory. The verifier checks the resident scores, seed IDs, thresholds, uniqueness of each source, destination addresses and the resulting Index entries. It prints per-window prefetch membership and order changes separately. Communication completions and final TopK/KV processing are outside these three launches. The combined span covers the earliest resident-task start through the latest cold-task completion across all twelve cores.
 
 

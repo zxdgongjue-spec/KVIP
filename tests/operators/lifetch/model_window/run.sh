@@ -10,6 +10,7 @@ kvaf=$(realpath "$3")
 out=$(realpath -m "$4")
 replays=${5:-1}
 mode=${KVIP_MODEL_MODE:-timing}
+fixture=${KVIP_MODEL_SCORE_FIXTURE:-default}
 if [[ "$mode" != timing && "$mode" != fast ]]; then
     echo "KVIP_MODEL_MODE must be timing or fast" >&2
     exit 2
@@ -24,6 +25,7 @@ sim="$toolkit/tools/simulator/dav_3510/lib"
 mkdir "$out"
 mkdir "$out/model" "$out/sim-runtime" "$out/config"
 printf '%s\n' "$mode" > "$out/mode.txt"
+printf '%s\n' "$fixture" > "$out/score_fixture.txt"
 cp "$model_root/config.json" "$model_root/config_stars.json" "$out/config/"
 if [[ "$mode" == fast ]]; then
     python3 - "$out/config" <<'CONFIG'

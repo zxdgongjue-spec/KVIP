@@ -116,6 +116,8 @@ def inspect(folder):
     check(mode in ("fast", "timing"), f"Unknown chip-model mode in {folder}")
     spans = task_spans(folder, replays) if mode == "timing" else None
 
+    fixture_path = folder / "score_fixture.txt"
+    fixture = fixture_path.read_text().strip() if fixture_path.exists() else "default"
     results = []
     for replay in range(replays):
         name = "scores.bin" if replay == 0 else f"scores.bin.r{replay}"
@@ -157,7 +159,7 @@ def inspect(folder):
             hot, seed, cold = spans[3 * replay:3 * replay + 3]
             timing = dict(hot_cycles=hot[1] - hot[0], seed_cycles=seed[1] - seed[0],
                           cold_cycles=cold[1] - cold[0], three_li_cycles=cold[1] - hot[0])
-        results.append(dict(**timing, mode=mode, helpers=helper_state, incremental_winners_checked=checked_winners,
+        results.append(dict(**timing, mode=mode, fixture=fixture, helpers=helper_state, incremental_winners_checked=checked_winners,
                             scores_sha=hashlib.sha256(scores.tobytes()).hexdigest(),
                             seed_sha=hashlib.sha256(seeds).hexdigest(),
                             frontier=meta[:, :, 4].tolist(), tokens=tokens_by_window))
@@ -176,6 +178,7 @@ def main():
         runs = baseline if folder == args.reference else inspect(folder)
         report = []
         for result in runs:
+            check(result["fixture"] == reference["fixture"], f"Different input score fixtures in {folder}")
             same_scores = result["scores_sha"] == reference["scores_sha"]
             same_seeds = result["seed_sha"] == reference["seed_sha"]
             check(same_scores and same_seeds, f"Changed token scores or resident seeds in {folder}")
@@ -188,7 +191,7 @@ def main():
                 timings["three_li_saved_pct"] = 100 * (1 - result["three_li_cycles"] / reference["three_li_cycles"])
             else:
                 timings["timing_comparison"] = "unavailable; fast mode has no per-core timing"
-            report.append(dict(**timings, mode=result["mode"], helpers=result["helpers"], incremental_winners_checked=result["incremental_winners_checked"],
+            report.append(dict(**timings, mode=result["mode"], fixture=result["fixture"], helpers=result["helpers"], incremental_winners_checked=result["incremental_winners_checked"],
                                posts_by_window=[[len(w) for w in row] for row in result["tokens"]],
                                same_frontiers=result["frontier"] == reference["frontier"],
                                same_prefetch_token_sets=membership, same_prefetch_order=order))

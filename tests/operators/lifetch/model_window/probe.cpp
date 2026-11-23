@@ -4,11 +4,13 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 using namespace rotating;
 void check(uint32_t code, const char *what) {
@@ -63,23 +65,44 @@ int main(int argc, char **argv) {
     std::vector<uint8_t> q(Q * Heads * D), k(B * H * D);
     std::vector<uint16_t> w(Q * Heads);
     std::vector<float> qs(Q * Heads);
-    auto querySign = [](unsigned query, unsigned h) {
+    const char *fixtureOption = std::getenv("KVIP_MODEL_SCORE_FIXTURE");
+    const std::string fixture = fixtureOption ? fixtureOption : "default";
+    if (fixture != "default" && fixture != "adjacent-cutoff")
+      throw std::runtime_error("unknown score fixture: " + fixture);
+    const bool closeScores = fixture == "adjacent-cutoff";
+    auto querySign = [closeScores](unsigned query, unsigned h) {
+      if (closeScores)
+        return h == query % Heads ? 1 : -1;
       return (h + query) % 3 == 0 ? -1 : 1;
     };
-    auto keySign = [](unsigned t) { return t % 3 == 0 ? -1 : 1; };
-    auto weightSign = [](unsigned query, unsigned h) {
+    auto keySign = [closeScores](unsigned t) { return !closeScores && t % 3 == 0 ? -1 : 1; };
+    auto weightSign = [closeScores](unsigned query, unsigned h) {
+      if (closeScores && h == query % Heads)
+        return 1;
       return (query + 2 * h) % 5 < 2 ? -1 : 1;
     };
-    auto magnitude = [](unsigned t) { return 1 + unsigned(t >= R); };
+    auto magnitude = [closeScores](unsigned t) { return 1 + unsigned(!closeScores && t >= R); };
     for (unsigned query = 0; query < Q; query++)
       for (unsigned h = 0; h < Heads; h++) {
         std::fill_n(&q[(query * Heads + h) * D], D,
                     querySign(query, h) < 0 ? 0xb8 : 0x38);
         w[query * Heads + h] = weightSign(query, h) < 0 ? 0xbf80 : 0x3f80;
-        qs[query * Heads + h] = 1 + (h % 3);
+        qs[query * Heads + h] = closeScores ? 1 : 1 + (h % 3);
       }
+    std::vector<float> keyScales(B * H, 1.0f);
     for (unsigned row = 0; row < B; row++)
       for (unsigned t = 0; t < H; t++) {
+        if (closeScores) {
+          // The sole active head gives an exact dot product of 128. Each
+          // integer in [128, 136] is one BF16 step from the next integer.
+          unsigned high = row == 0 ? 129 : 131;
+          unsigned target = t % 8 == 0 ? 128 : high;
+          if (t >= R) {
+            unsigned slab = (t - R) / 512;
+            target = high + (slab == 0 ? 0 : slab < 3 ? 1 : 3);
+          }
+          keyScales[row * H + t] = float(target) / 128.0f;
+        }
         uint8_t value = magnitude(t) == 1 ? 0x38 : 0x40;
         if (keySign(t) < 0)
           value |= 0x80;
@@ -107,7 +130,7 @@ int main(int argc, char **argv) {
     a[1] = m.vec(k);
     a[2] = m.vec(w);
     a[3] = m.vec(qs);
-    a[4] = m.vec(std::vector<float>(B * H, 1));
+    a[4] = m.vec(keyScales);
     a[5] = m.vec(std::vector<int32_t>(B, 4));
     a[6] = m.vec(std::vector<int32_t>(B, H));
     a[7] = m.vec(blocks);
@@ -293,6 +316,7 @@ int main(int argc, char **argv) {
             val += weightSign(qi, h) * qs[qi * Heads + h] *
                    std::max(0, querySign(qi, h) * keySign(t) *
                                    int(D * magnitude(t)));
+          val *= keyScales[(qi / 4) * H + t];
           uint32_t u;
           std::memcpy(&u, &val, 4);
           uint16_t bits = u >> 16;
