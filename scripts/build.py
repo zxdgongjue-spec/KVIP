@@ -129,12 +129,12 @@ def prepare_main_device_sources(root, transport):
     head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
     if head != MAIN_REVISION:
         raise RuntimeError(f"Expected KVAF main revision {MAIN_REVISION}, found {head}")
-    patches = [(ROOT / "scripts/patches/kvaf-main-fused-device.patch", ())]
+    patches = [
+        (ROOT / "scripts/patches/kvaf-main-fused-device.patch", ()),
+        (ROOT / "scripts/patches/kvaf-main-fused-resources.patch", ()),
+    ]
     if transport == "ubmem":
-        patches.extend((
-            (patch_path(UBMEM_DEVICE_PATCH), ("--include=access_operator/include/ubmem/*",)),
-            (ROOT / "scripts/patches/kvaf-main-ubmem-mapping.patch", ()),
-        ))
+        patches.append((patch_path(UBMEM_DEVICE_PATCH), ("--include=access_operator/include/ubmem/*",)))
     pending = []
     for path, options in patches:
         command = ["git", "-C", str(root), "apply", *options]

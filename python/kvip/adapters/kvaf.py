@@ -103,7 +103,12 @@ class KvafGetLease(StreamLease):
     """
 
     def __init__(self, torch, runtime, library, output, stream):
-        _require_fused_runtime(runtime, 'URMA', ('acquire_fused_batch_get_context', 'register_fused_batch_get_output', 'release_fused_batch_get_context'))
+        self.unified = callable(getattr(runtime, "get_graph_urma_resources", None))
+        if not self.unified:
+            _require_fused_runtime(
+                runtime, "URMA",
+                ("acquire_fused_batch_get_context", "register_fused_batch_get_output", "release_fused_batch_get_context"),
+            )
         self.torch, self.runtime, self.stream = torch, runtime, stream
         self.library = load_lifetch_library(library)
         self.sizes = {}
@@ -115,13 +120,33 @@ class KvafGetLease(StreamLease):
         self.pack.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint32]
         self.pack.restype = ctypes.c_uint32
         self.native_library, self.get = load_native_get(runtime)
-        self.context = runtime.acquire_fused_batch_get_context(output, stream)
+        self.context = (
+            self._bind_unified_output(output)
+            if self.unified else runtime.acquire_fused_batch_get_context(output, stream)
+        )
         self.device = output.device
         self.outputs = {self.output_key(output): (output, self.context)}
         self.plans = []
         self.closed = False
         self.capturing_startup = False
         self.capture_fence_failed = False
+
+    def _bind_unified_output(self, output):
+        import kvaf
+
+        execution = kvaf.GetExecutionConfig("urma", "aiv", "direct")
+        lease_id = self.runtime.begin_get_graph(execution, output, 1, self.stream)
+        try:
+            view = self.runtime.get_graph_urma_resources(lease_id)
+            return dict(
+                view, lease_id=lease_id,
+                output_bytes=self.output_key(output)[1],
+                token_bytes=self.runtime.batch_get_token_bytes,
+                tokens_per_block=self.runtime.batch_get_tokens_per_block,
+            )
+        except Exception:
+            self.runtime.end_get_graph(lease_id, self.stream, discard_result=True)
+            raise
 
     def check_stream(self):
         if self.closed:
@@ -135,7 +160,10 @@ class KvafGetLease(StreamLease):
         self.check_stream()
         key = self.output_key(output)
         if key not in self.outputs:
-            view = self.runtime.register_fused_batch_get_output(self.context, output)
+            view = (
+                self._bind_unified_output(output) if self.unified
+                else self.runtime.register_fused_batch_get_output(self.context, output)
+            )
             self.outputs[key] = output, view
         return self.outputs[key][1]
 
@@ -193,7 +221,15 @@ class KvafGetLease(StreamLease):
                 raise RuntimeError("Fused capture stream completion failed; transport remains retained")
             # Native release fences this stream and validates persistent queue
             # status. On failure keep every tensor and registration alive.
-            self.runtime.release_fused_batch_get_context(self.context, self.stream)
+            if self.unified:
+                self.torch.npu.synchronize(self.device)
+                while self.outputs:
+                    key = next(reversed(self.outputs))
+                    _, context = self.outputs[key]
+                    self.runtime.end_get_graph(context["lease_id"], self.stream, discard_result=True)
+                    del self.outputs[key]
+            else:
+                self.runtime.release_fused_batch_get_context(self.context, self.stream)
             self.closed = True
             self.plans.clear()
             self.outputs.clear()
