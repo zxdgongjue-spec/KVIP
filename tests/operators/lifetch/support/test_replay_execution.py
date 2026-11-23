@@ -31,11 +31,14 @@ def test_real_pair_saves_serial_before_fused_failure(tmp_path, monkeypatch):
             assert persisted['execution'] == 'INCOMPLETE'
             assert persisted['timing']['native_chain']['mean_us'] == 20
             raise RuntimeError('fused failed')
-        return {'all_rounds': timing_summary([20, 20]), 'correctness': 'PASS'}
+        return {'all_rounds': timing_summary([20, 20]), 'get_only': timing_summary([7, 9]),
+                'correctness': 'PASS'}
     monkeypatch.setattr(execution, 'run_path', run)
     with pytest.raises(RuntimeError, match='fused failed'):
         execution.run_real(config, tmp_path)
     assert calls == [False, True]
+    persisted = json.loads((tmp_path / 'completed_timings.json').read_text())
+    assert persisted['timing']['native_get_only']['mean_us'] == 8
     assert not (tmp_path / 'report.json').exists()
 
 
@@ -72,6 +75,9 @@ def test_existing_native_mtp_supports_group_payload_width(monkeypatch, width):
     native.fetch()
     assert len(calls) == 1 and torch.all(calls[0][3] == width)
     assert calls[0][6].shape == (128, width)
+    for _ in range(3):
+        native.fetch(scale_offsets=False)
+        assert torch.all(native.offsets == width)
 
 
 def test_native_li_keeps_synthetic_contract_and_supports_real_causal_q4():

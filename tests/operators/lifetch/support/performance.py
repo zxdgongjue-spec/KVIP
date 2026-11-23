@@ -184,6 +184,39 @@ def measure_graph(torch, call, reset, validate, *, warmup, iterations, diagnose=
         graph.reset()
 
 
+def measure_serial_get(torch, state, *, warmup, iterations):
+    """Time only BatchGet using completed LI/LIDU descriptors from this round.
+
+    Keep live maps and descriptors intact. Restore hot data and corrupt the
+    fetched destinations outside events so validation detects missing copies.
+    Offsets have already been scaled by the preceding complete native chain.
+    """
+    native = state.native
+    baseline = native.output.clone()
+    count = int(native.total.cpu().item())
+    destinations = native.outputs[:count].long()
+    corrupted = baseline[destinations].bitwise_xor(255)
+
+    def reset():
+        native.output.copy_(baseline)
+        native.output.index_copy_(0, destinations, corrupted)
+
+    def validate():
+        try:
+            native.verify(state.selected)
+        except ValueError as error:
+            if str(error).startswith(('native_mtp_payload_mismatch:', 'native_mtp_exported_slots_mismatch:')):
+                raise AssertionError(str(error)) from error
+            raise
+
+    result = measure_graph(torch, lambda: native.fetch(scale_offsets=False), reset, validate,
+                           warmup=warmup, iterations=iterations)
+    # Restore only after known completion. Unsafe errors propagate to quarantine.
+    native.output.copy_(baseline)
+    result['timing']['timing_protocol'] = 'independent_get_graph_events'
+    return result
+
+
 def measure_ubmem_serial(torch, torch_npu, runtime, device_table, workspace, storage,
                          source_cpu, *, batch, history, resident, heads, warmup, iterations, trace_rounds=0, trace_folder=None, reference=None, bench_only=False):
     """Use NativeMtp and KVAF BatchGet before acquiring the fused UBmem lease.

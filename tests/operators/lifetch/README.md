@@ -102,6 +102,8 @@ URMA 合成负载支持 Fetch-only；UBmem 和真实回放仍使用完整图诊�
 - `fused_profiled_*` 给出 Init、LI 和 Resolve/Update/Fetch 所在的融合 kernel 时间。`resolver_span`、`output_pack_span`、`index_apply_span` 和 `finalize_span` 取各阶段首尾标记的全局区间，可能互相重叠。预取、最终 Get 和二者合并区间例如 `fused_profiled_final_get_span_p50_us`。
 - 整图有效带宽用 `serial_read_bytes / serial_mean_us / 1000` 或 `fused_total_bytes_mean / fused_mean_us / 1000`。分段传输的 `GBps_p50` 先用同一轮的字节数除以该轮区间，再取各轮中位数。零条传输的带宽留空，缺少打点的阶段也留空。
 
+当前批量图入口在串行路径每个源轮次完成后，使用第一个独立状态的已准备描述符，额外采样只含 BatchGet 的图；`--warmup` 和 `--iterations` 分别控制该图的预热和计时回放次数。输出恢复及校验在计时外执行，待读取的目标位置会先被破坏以验证实际拷贝。结果保存为 `serial/diagnose/round-*/serial_get_only.json`，在各级诊断 summary 中显示 `SERIAL-GET`，并在总 `summary.log` 显示 `Serial Get mean`、`Serial Get p50/p99`。这些数值与整图 profiler 的 Get 阶段耗时分别保留。
+
 `--stages` 筛选诊断文本展示。CSV 保留已捕获的各个阶段。真实回放的分阶段记录按源轮次保存在 `diagnostic.json`。
 
 ### URMA BatchGet 单算子 A/B

@@ -276,6 +276,16 @@ def summarize(directory, config):
                 result['missing'].append(f"{comparison['source']}: incomplete Fetch-only comparison")
     if result['missing']:
         result['trace'] = 'INCOMPLETE'
+    result['serial_get_only'] = [dict(source=str(path), **json.loads(path.read_text()))
+                                 for path in sorted(directory.rglob('serial_get_only.json'))]
+    get_lines = []
+    for sample in result['serial_get_only']:
+        timing = sample['timing']
+        get_lines.append(
+            f"SERIAL-GET source_round={sample['source_round']} "
+            f"mean/p50/p99_us={timing['mean_us']:.2f}/{timing['p50_us']:.2f}/{timing['p99_us']:.2f} "
+            f"samples={timing['samples']} correctness={sample['correctness']} "
+            f"scope=independent_Get_graph_events source={sample['source']}")
     atomic_json(directory / 'diagnostic.json', result)
     lines = [f"DIAG level={config.level} transport={config.transport} trace={result['trace']}",
              'Event and profiler share the measured graph; detailed core stamps use an additional pass.',
@@ -328,6 +338,7 @@ def summarize(directory, config):
                          f"entries={row['count']} bytes={row['bytes']} "
                          f"mean/p50/p99_us={row['mean_us']:.2f}/{row['p50_us']:.2f}/{row['p99_us']:.2f} "
                          f"GB/s={format_metric(row['effective_GBps'])}")
+    lines.extend(get_lines)
     lines.extend('INCOMPLETE: ' + value for value in result['missing'])
     lines.extend('N/A: ' + value for value in result['unavailable'])
     (directory / 'diagnostic_summary.log').write_text('\n'.join(lines) + '\n')
@@ -338,10 +349,14 @@ def summarize(directory, config):
             writer.writerows(timeline_rows)
     if config.level == 1:
         rendered = level_one_tables(result)
+        if get_lines:
+            rendered += '\n' + '\n'.join(get_lines)
         (directory / 'level1_summary.log').write_text(rendered + '\n')
         print(rendered, flush=True)
     elif config.level >= 2:
         rendered = level_two_tables(result)
+        if get_lines:
+            rendered += '\n' + '\n'.join(get_lines)
         if config.level == 3:
             rendered += '\n' + '\n'.join(line for line in lines if line.startswith('FETCH-ONLY'))
         (directory / f'level{config.level}_summary.log').write_text(rendered + '\n')

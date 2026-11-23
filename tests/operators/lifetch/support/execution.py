@@ -1467,11 +1467,11 @@ class NativeMtp:
             self.padded_tokens // 128,
         )
 
-    def fetch(self):
+    def fetch(self, *, scale_offsets=True):
         if self.owner.lease is not None:
             raise ValueError("native_mtp_requires_unleased_batch_get_queues")
         self.owner.session.batch_get_attempted = True
-        if self.token_bytes != TOKEN_BYTES:
+        if scale_offsets and self.token_bytes != TOKEN_BYTES:
             # Unchanged LIDU writes offsets in single-layer C8 bytes.
             self.offsets.mul_(self.token_bytes // TOKEN_BYTES)
         self.owner.session.runtime.batch_get(
@@ -3679,7 +3679,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
     """One graph contains iterations independent cache states, reused per round."""
     from contextlib import ExitStack
     from diagnostics import algorithm_before, algorithm_after
-    from performance import profile_graph_batch
+    from performance import measure_serial_get, profile_graph_batch
     directory = Path(directory)
     stream = torch.npu.current_stream(states[0].device)
     graph = torch.npu.NPUGraph()
@@ -3760,6 +3760,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
         for state in states:
             state.reset()
         rounds = {}
+        get_samples = []
         read_counts = []
         for inputs in sequence:
             before = []
@@ -3803,6 +3804,18 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                         dict(path='fused' if fused else 'serial', samples=samples,
                              graph_accounting=measured['accounting'], graph_calls=len(states),
                              timing=measured['timing'], trace=measured['trace']))
+            if not fused:
+                pending = True
+                get_result = measure_serial_get(torch, states[0], warmup=config.warmup,
+                                                iterations=config.iterations)
+                pending = False
+                atomic_json(folder / 'serial_get_only.json', dict(
+                    get_result, source_round=inputs.source_round,
+                    note='Independent BatchGet graph events; output restore and validation outside timing'))
+                get_samples.extend(get_result['timing']['samples_us'])
+                checks.checked += int(get_result['correctness'] != 'NOT_RUN')
+                checks.failures.extend(dict(failure, check=f"serial_get/round{inputs.source_round}/{failure['check']}")
+                                       for failure in get_result['failures'])
         # Detailed stamps are additional diagnostics, never performance samples.
         if fused and config.mode == 'diagnose' and config.level >= 2:
             clock_mhz = states[0].forward.calibrate_counter_mhz()
@@ -3874,7 +3887,9 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                        inter_kernel_gap_mean_us=sum(t['inter_kernel_gap_mean_us'] for t in rounds.values())/len(rounds),
                        overlap_mean_us=sum(t['overlap_mean_us'] for t in rounds.values())/len(rounds),
                        outside_invocations_mean_us=sum(t['outside_invocations_mean_us'] for t in rounds.values())/len(rounds))
-        return dict(rounds=rounds, all_rounds=overall, correctness=checks.status,
+        get_only = (dict(timing_summary(get_samples), timing_protocol='independent_get_graph_events')
+                    if get_samples else None)
+        return dict(rounds=rounds, all_rounds=overall, get_only=get_only, correctness=checks.status,
                     failures=checks.failures, read_counts=read_counts, sequence_graph_sum=dict(
                         mean_us=sum(t['mean_us'] for t in rounds.values()), samples=1))
     except BaseException as error:
@@ -4168,6 +4183,8 @@ def run_synthetic_batch(config, directory, *, shared_pool=None):
                               native_misses_per_request=next(iter(results['serial'].get('read_counts', [])), None),
                               correctness='NOT_RUN', execution='INCOMPLETE',
                               timing={'native_chain': results['serial']['all_rounds']})
+                if results['serial'].get('get_only'):
+                    report['timing']['native_get_only'] = results['serial']['get_only']
                 if 'fused' in results:
                     report.update(execution='COMPLETED', correctness='PASS' if all(
                         result['correctness']=='PASS' for result in results.values()) else 'FAIL')
@@ -4197,6 +4214,8 @@ def run_real(config, directory):
         # Preserve completed serial timing even if the fused worker later fails.
         report = dict(batch=initial.geometry['batch'], input='real', correctness='NOT_RUN',
                       execution='INCOMPLETE', timing={'native_chain': results['serial']['all_rounds']})
+        if results['serial'].get('get_only'):
+            report['timing']['native_get_only'] = results['serial']['get_only']
         if 'fused' in results:
             report.update(execution='COMPLETED',
                           correctness='PASS' if all(r['correctness'] == 'PASS' for r in results.values()) else 'FAIL')

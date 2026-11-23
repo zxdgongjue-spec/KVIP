@@ -93,6 +93,9 @@ def save_summary(directory, rows):
         headers[6:8] = ['Serial event mean', 'Fused event mean']
         headers += ['Serial prof mean', 'Fused prof mean']
         headers[9:11] = ['Serial prof p50/p99', 'Fused prof p50/p99']
+    get_only = any(row.get('serial_get_only_mean_us') is not None for row in rows)
+    if get_only:
+        headers += ['Serial Get mean', 'Serial Get p50/p99']
     cells = []
     for index, row in enumerate(rows, 1):
         def number(key):
@@ -109,6 +112,8 @@ def save_summary(directory, rows):
                       percentiles('serial'), percentiles('fused')])
         if batched:
             cells[-1] += [number('serial_profiler_mean_us'), number('fused_profiler_mean_us')]
+        if get_only:
+            cells[-1] += [number('serial_get_only_mean_us'), percentiles('serial_get_only')]
     widths = [max(len(line[col]) for line in [headers, *cells]) for col in range(len(headers))]
     def formatted(line):
         return ' | '.join(value.ljust(width) if col in (1, 4, 5) else value.rjust(width)
