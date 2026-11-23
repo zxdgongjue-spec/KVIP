@@ -111,7 +111,10 @@ def inspect(folder):
     replays = len(scores_checked)
     rows = ROW_REPORT.findall(lines)
     check(len(rows) == replays * BATCH, f"Incomplete per-window report in {folder}")
-    spans = task_spans(folder, replays)
+    marker = folder / "mode.txt"
+    mode = marker.read_text().strip() if marker.exists() else "timing"
+    check(mode in ("fast", "timing"), f"Unknown chip-model mode in {folder}")
+    spans = task_spans(folder, replays) if mode == "timing" else None
 
     results = []
     for replay in range(replays):
@@ -123,6 +126,7 @@ def inspect(folder):
         layout = np.fromfile(folder / (name + ".map"), "<u4").reshape(BATCH, HISTORY)
         meta = np.fromfile(folder / (name + ".meta"), "<u8").reshape(BATCH, QUERIES, 16)
         window = folder / (name + ".window")
+        check(window.is_file() or not marker.exists(), f"Missing persistent window TopK in {folder}")
         checked_winners = validate_window_topk(window.read_bytes(), scores, meta) if window.exists() else None
         tokens_by_window = []
         for b in range(BATCH):
@@ -140,9 +144,12 @@ def inspect(folder):
                 windows.append(tokens[position:position + count])
                 position += count
             tokens_by_window.append(windows)
-        hot, seed, cold = spans[3 * replay:3 * replay + 3]
-        results.append(dict(incremental_winners_checked=checked_winners, hot_cycles=hot[1]-hot[0], seed_cycles=seed[1]-seed[0],
-                            cold_cycles=cold[1]-cold[0], three_li_cycles=cold[1]-hot[0],
+        timing = {}
+        if spans is not None:
+            hot, seed, cold = spans[3 * replay:3 * replay + 3]
+            timing = dict(hot_cycles=hot[1] - hot[0], seed_cycles=seed[1] - seed[0],
+                          cold_cycles=cold[1] - cold[0], three_li_cycles=cold[1] - hot[0])
+        results.append(dict(**timing, mode=mode, incremental_winners_checked=checked_winners,
                             scores_sha=hashlib.sha256(scores.tobytes()).hexdigest(),
                             seed_sha=hashlib.sha256(seeds).hexdigest(),
                             frontier=meta[:, :, 4].tolist(), tokens=tokens_by_window))
@@ -169,7 +176,11 @@ def main():
                 order.append([a == b for a, b in zip(arow, brow)])
                 membership.append([set(a) == set(b) for a, b in zip(arow, brow)])
             timings = {name: value for name, value in result.items() if name.endswith("_cycles")}
-            report.append(dict(**timings, incremental_winners_checked=result["incremental_winners_checked"], three_li_saved_pct=100*(1-result["three_li_cycles"]/reference["three_li_cycles"]),
+            if reference["mode"] == result["mode"] == "timing":
+                timings["three_li_saved_pct"] = 100 * (1 - result["three_li_cycles"] / reference["three_li_cycles"])
+            else:
+                timings["timing_comparison"] = "unavailable; fast mode has no per-core timing"
+            report.append(dict(**timings, mode=result["mode"], incremental_winners_checked=result["incremental_winners_checked"],
                                posts_by_window=[[len(w) for w in row] for row in result["tokens"]],
                                same_frontiers=result["frontier"] == reference["frontier"],
                                same_prefetch_token_sets=membership, same_prefetch_order=order))

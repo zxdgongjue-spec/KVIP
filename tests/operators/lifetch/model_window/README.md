@@ -1,6 +1,6 @@
 # Four-window production LI chip-model replay
 
-On an AArch64 Linux machine with CANN 9.2, build the production LIFetch bridge for the Ascend950DT_9582 target. Use the same toolkit, KVAF headers and compiler settings for the reference and candidate. The launcher selects the CANN DAV3510 PEM CPU simulator. Each run requires a new output directory and preserves its detailed instruction trace and library hashes.
+On an AArch64 Linux machine with CANN 9.2, build the production LIFetch bridge for the Ascend950DT_9582 target. Use the same toolkit, KVAF headers and compiler settings for the reference and candidate. The launcher selects the CANN DAV3510 PEM CPU simulator. Use a new directory on the Linux VM filesystem, such as a directory under `/tmp`. The default timing mode saves per-core traces and library/configuration hashes.
 
 ```bash
 testdir=tests/operators/lifetch/model_window
@@ -14,3 +14,6 @@ Use a final argument of `2` for two consecutive replays on the same device addre
 The fixture runs the actual resident scoring, resident threshold and cold scoring device entries. Four Cube cores and eight Vector cores process two rows with four queries each, 2,048 resident tokens, 5,120 total tokens and four service windows. The two initial hot-valid masks use 4 and 103 missing positions, the median per-query eligible counts in the archived G2 and G7 rank fixtures. Synthetic signed Q, K and weight values make all 40,960 scores independently checkable. Actual input capture, workload distribution and overall graph performance require the NPU replay.
 
 Window service writes its normal WQEs into simulator memory. The verifier checks the resident scores, seed IDs, thresholds, uniqueness of each source, destination addresses and the resulting Index entries. It prints per-window prefetch membership and order changes separately. Communication completions and final TopK/KV processing are outside these three launches. The combined span covers the earliest resident-task start through the latest cold-task completion across all twelve cores.
+
+
+For a fast correctness run, set `KVIP_MODEL_MODE=fast`. The launcher uses four host simulator threads and disables per-core instruction dumps. It still checks all scores, private window winners, source requests, destination slots and Index entries. Compare its result with a timing-mode directory to check each window's token membership. Latency percentages require both directories to use the timing mode. The current mode and the actual configuration are preserved in the run directory.
